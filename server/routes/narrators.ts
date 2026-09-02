@@ -3,7 +3,8 @@ import { mkdirSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { formatOriginLabel } from "@shared/message-origin";
 import {
-	MAX_EDIT_ATTACHMENTS_PER_TYPE,
+	MAX_EDIT_IMAGES_PER_MESSAGE,
+	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 } from "@shared/text-file-types";
 import {
@@ -400,12 +401,14 @@ export async function parseMessageRequest(
 		const rawMessage = formData.get("message");
 		const message = typeof rawMessage === "string" ? rawMessage : "";
 		const imageFiles = formData.getAll("images") as File[];
-		if (imageFiles.length > 10) {
-			throw new ValidationError("Maximum 10 images per message");
+		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
+			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 		}
 		const textFileEntries = formData.getAll("textFiles") as File[];
-		if (textFileEntries.length > 10) {
-			throw new ValidationError("Maximum 10 text files per message");
+		if (textFileEntries.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
+			throw new ValidationError(
+				`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`,
+			);
 		}
 		// An attachment carries the turn on its own: images (and text files, whose
 		// paths are injected as an <attached_files> hint) are meaningful content even
@@ -2296,16 +2299,18 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 			);
 		}
 		const imageFiles = formData.getAll("images") as File[];
-		if (imageFiles.length > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
-			throw new ValidationError("Maximum 10 images per message");
+		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
+			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 		}
 		for (const file of imageFiles) {
 			validateUploadedImage(file);
 			newImages.push(file);
 		}
 		const textFileEntries = formData.getAll("textFiles") as File[];
-		if (textFileEntries.length > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
-			throw new ValidationError("Maximum 10 text files per message");
+		if (textFileEntries.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
+			throw new ValidationError(
+				`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`,
+			);
 		}
 		for (const file of textFileEntries) {
 			validateTextFile(file);
@@ -2626,11 +2631,11 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		keepTextFiles,
 	);
 
-	if (keptImages.length + newImageFiles.length > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
-		throw new ValidationError("Maximum 10 images per message");
+	if (keptImages.length + newImageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
+		throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 	}
-	if (keptTextFileIndexes.length + newTextFiles.length > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
-		throw new ValidationError("Maximum 10 text files per message");
+	if (keptTextFileIndexes.length + newTextFiles.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
+		throw new ValidationError(`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`);
 	}
 	const finalImageCount = keptImages.length + newImageFiles.length;
 	const finalTextFileCount = keptTextFileIndexes.length + newTextFiles.length;

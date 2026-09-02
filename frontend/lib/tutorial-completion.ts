@@ -15,16 +15,65 @@
 
 import type { TutorialCompletion, TutorialStep } from "@shared/tutorial/lessons";
 
+/**
+ * WS frame types a step may be judged on.
+ *
+ * Lives here rather than in the hook because it is not a subscription detail: the
+ * manager filters by type, so a frame missing from this list never reaches the
+ * predicates below and its step can never tick. Keeping the list beside the
+ * predicates is what lets a test assert the two agree — the original split let
+ * three types go missing, and each one silently disabled a lesson:
+ *
+ * - `user_message` is the user's own turn (`message` carries assistant rows), so
+ *   without it `userSentMessage` never becomes true, which also blocks every
+ *   `narratorIdle` step.
+ * - `subagent_started` is the only frame reporting a spawn on the PARENT narrator.
+ * - `plan_reflection_resolved` is what the plan gate emits instead of
+ *   `permission_resolved`.
+ */
+export const TUTORIAL_FRAME_TYPES = [
+	"status_change",
+	"tool_completed",
+	"permission_resolved",
+	"plan_reflection_resolved",
+	"subagent_started",
+	"message",
+	"user_message",
+] as const;
+
+/**
+ * Frame types each completion kind reads, for the guard test.
+ *
+ * Kinds judged on polled state rather than frames map to an empty list.
+ */
+export const COMPLETION_FRAME_TYPES: Record<TutorialCompletion["kind"], readonly string[]> = {
+	manual: [],
+	userSentMessage: ["user_message"],
+	narratorIdle: ["status_change", "user_message"],
+	permissionResolved: ["permission_resolved", "plan_reflection_resolved"],
+	toolCompleted: ["tool_completed"],
+	subagentSpawned: ["subagent_started"],
+	chapterForked: [],
+	chapterMerged: [],
+	specTaskWritten: [],
+};
+
 /** The subset of a narrator WS frame these predicates read. */
 export interface TutorialObservedFrame {
 	type: string;
 	narratorId?: string;
-	/** `permission_resolved` */
-	decision?: "allow" | "deny";
+	/**
+	 * `permission_resolved` / `plan_reflection_resolved`.
+	 *
+	 * The plan gate can also report `"aborted"` (the turn ended before the user
+	 * answered), which is why this is not just allow/deny: a step pinned to one
+	 * decision must not treat an abort as that decision.
+	 */
+	decision?: "allow" | "deny" | "aborted";
 	/** `tool_completed` */
 	toolName?: string;
 	status?: string;
-	/** Present on frames a subagent produced. */
+	/** Set on `subagent_started`, whose `narratorId` is the PARENT. */
 	subagentNarratorId?: string;
 }
 
@@ -84,7 +133,16 @@ export function isCompletionSatisfied(
 			return hasReturnedToIdle(observations);
 		case "permissionResolved":
 			return framesForLesson(observations).some((frame) => {
-				if (frame.type !== "permission_resolved") return false;
+				// Two frames mean "the user decided". A tool permission emits
+				// `permission_resolved`; the plan gate emits `plan_reflection_resolved` and
+				// never the former, so the plan-mode lesson would wait forever on a
+				// decision the user already made.
+				if (frame.type !== "permission_resolved" && frame.type !== "plan_reflection_resolved") {
+					return false;
+				}
+				// `aborted` is not a decision — the request went away before the user
+				// answered — so it must not tick a step that asks them to decide.
+				if (frame.decision === "aborted") return false;
 				// An unpinned step accepts either decision: "deny" is a legitimate thing
 				// to learn, and demanding "allow" would trap a user who denied on purpose.
 				if (!completion.decision) return true;

@@ -21,6 +21,7 @@ import {
 	getTutorialLessonSummaries,
 	getTutorialScript,
 	getTutorialScripts,
+	resolveTutorialTurn,
 	TUTORIAL_MODEL,
 	TUTORIAL_PROVIDER_PREFIX,
 	TUTORIAL_TRACKS,
@@ -338,12 +339,133 @@ describe("tool-call safety: the predicate rejects known-bad input", () => {
 		});
 	}
 
+	test("rejects an unsafe path hiding in localizedInput", () => {
+		// `localizedInput` is merged into `input` before execution, so a scan that
+		// only walked `input` would leave it entirely unchecked — and a bad path in
+		// one locale branch is precisely what review overlooks.
+		expect(
+			findToolUseViolations({
+				name: "Write",
+				input: { mode: "inline" },
+				localizedInput: { body: { en: "safe.md", "zh-CN": "/etc/passwd" } },
+			}).length,
+		).toBeGreaterThan(0);
+	});
+
+	test("rejects a forbidden command hiding in a Bash localizedInput", () => {
+		// The gap this closes: the path scan already walked `localizedInput`, but the
+		// forbidden-command scan read `input.command` alone. A per-locale `command` is
+		// merged into the executed input all the same, so it reached the real shell —
+		// running with the user's own privileges — while passing review.
+		expect(
+			findToolUseViolations({
+				name: "Bash",
+				input: { description: "list files" },
+				localizedInput: { command: { en: "ls", "zh-CN": "sudo rm -rf /" } },
+			}).length,
+		).toBeGreaterThan(0);
+	});
+
+	test("accepts an ordinary Bash command", () => {
+		// The other half of a scan being trustworthy: it must not reject normal content.
+		// Without this, widening the command scan to every input string could quietly
+		// start failing legitimate lessons and look like correct strictness.
+		expect(
+			findToolUseViolations({
+				name: "Bash",
+				input: { command: "bun test src/a.test.ts", description: "run the tests" },
+			}),
+		).toEqual([]);
+	});
+
+	test("rejects an unserialisable localizedInput", () => {
+		// `localizedInput` is merged into the input that gets JSON round-tripped, so a
+		// value that does not survive it makes the tool run with different arguments
+		// than the script declares. A cycle is used rather than an `undefined` field
+		// because `JSON.stringify` drops the latter symmetrically — it round-trips
+		// stably and so is genuinely not the failure this check is about.
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
+		expect(
+			findToolUseViolations({
+				name: "Write",
+				input: { path: "a.md" },
+				// biome-ignore lint/suspicious/noExplicitAny: deliberately malformed input
+				localizedInput: cyclic as any,
+			}).length,
+		).toBeGreaterThan(0);
+	});
+
 	test("isSandboxEscapingPath treats spec:// as in-sandbox", () => {
 		// spec:// is a virtual Dynamic Spec URI scoped to the narrator, not a
 		// filesystem path. Treating it as absolute would ban the Dynamic Spec lesson.
 		expect(isSandboxEscapingPath("spec://tasks.json")).toBe(false);
 		expect(isSandboxEscapingPath("/etc/passwd")).toBe(true);
 		expect(isSandboxEscapingPath("src/a.ts")).toBe(false);
+	});
+});
+
+describe("localized tool input", () => {
+	// `localizedInput` exists because a few tool arguments are copy the USER reads
+	// (`ExitPlanMode`'s plan document), while the rest are machine-facing. Both
+	// failure modes here are silent: a missing locale falls back to English, and a
+	// broken merge drops the field from the executed call entirely.
+	test("every localizedInput field is translated into every locale", () => {
+		for (const { lessonId, toolUse } of allScriptToolUses()) {
+			for (const [field, value] of Object.entries(toolUse.localizedInput ?? {})) {
+				for (const locale of SUPPORTED_LOCALES) {
+					expect(
+						value[locale]?.trim().length,
+						`${lessonId}/${toolUse.name}.${field} missing ${locale}`,
+					).toBeGreaterThan(0);
+				}
+			}
+		}
+	});
+
+	test("a localized field never also sits in the static input", () => {
+		// Both present means the merge silently wins and the static value is dead
+		// content that still reads as authoritative in review.
+		for (const { lessonId, toolUse } of allScriptToolUses()) {
+			for (const field of Object.keys(toolUse.localizedInput ?? {})) {
+				expect(field in toolUse.input, `${lessonId}/${toolUse.name}.${field} declared twice`).toBe(
+					false,
+				);
+			}
+		}
+	});
+
+	/** The plan-mode turn that scripts `ExitPlanMode`. */
+	function planTurn(): TutorialScriptTurn {
+		const turn = getTutorialScript("plan-mode")?.turns.find((entry) =>
+			(entry.toolUses ?? []).some((toolUse) => toolUse.name === "ExitPlanMode"),
+		);
+		expect(turn, "plan-mode no longer scripts ExitPlanMode").toBeDefined();
+		return turn as TutorialScriptTurn;
+	}
+
+	function resolvedPlan(locale: string): string | undefined {
+		const call = resolveTutorialTurn(planTurn(), locale).toolUses.find(
+			(toolUse) => toolUse.name === "ExitPlanMode",
+		);
+		expect(call?.localizedInput, "localizedInput should not survive resolution").toBeUndefined();
+		const plan = call?.input.inline_plan;
+		return typeof plan === "string" ? plan : undefined;
+	}
+
+	test("resolving a turn merges localizedInput into input", () => {
+		// The provider reads `input` only, so a regressed merge would hand
+		// `ExitPlanMode` an empty plan — a plan card with nothing to approve.
+		for (const locale of SUPPORTED_LOCALES) {
+			const plan = resolvedPlan(locale);
+			expect(plan?.length, `inline_plan missing for ${locale}`).toBeGreaterThan(0);
+		}
+	});
+
+	test("resolved plan text differs per locale", () => {
+		// Guards against the merge picking one branch for every locale, which would
+		// pass the check above while still showing English to a zh-CN learner.
+		expect(resolvedPlan("en")).not.toBe(resolvedPlan("zh-CN"));
 	});
 });
 

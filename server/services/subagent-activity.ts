@@ -34,6 +34,7 @@ export interface SubagentToolActivityHints {
 	remotePath?: unknown;
 	questionHeader?: unknown;
 	resourceId?: unknown;
+	taskName?: unknown;
 }
 
 function boundedJsonText(path: string) {
@@ -129,6 +130,10 @@ export function summarizeSubagentToolCall(
 			return asCompactText(hints.questionHeader) || undefined;
 		case "ShareFile":
 			return filePath || undefined;
+		case "ScheduledTask":
+			// taskName over the id: an id is a nanoid and says nothing about what was
+			// scheduled. Only id-based actions (get/enable/delete/…) fall back to it.
+			return joinParts(action || undefined, asCompactText(hints.taskName, 48) || target);
 		case "SwitchDevice":
 			return asCompactText(hints.device, 48) || undefined;
 		case "TransferFile": {
@@ -189,6 +194,9 @@ export async function getRecentSubagentToolActivity(
 			remotePath: boundedJsonText("$.remotePath"),
 			questionHeader: boundedJsonText("$.questions[0].header"),
 			resourceId: boundedJsonText("$.entryId"),
+			// ScheduledTask's create/update carry the human-readable name here. Bounded
+			// like every other field; the prompt body is never selected.
+			taskName: boundedJsonText("$.task.name"),
 		})
 		.from(narratorToolCalls)
 		.where(eq(narratorToolCalls.narratorId, narratorId))

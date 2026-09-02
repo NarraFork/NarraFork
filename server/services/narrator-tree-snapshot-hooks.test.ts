@@ -11,6 +11,7 @@ import {
 	narratorToolCalls,
 	worktreeTreeSnapshots,
 } from "../db/schema";
+import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
@@ -557,5 +558,139 @@ describe("attribution in a shared worktree", () => {
 		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 
 		expect(result.changedFiles).toEqual(["shared.txt"]);
+	});
+});
+
+/**
+ * The workspace change feed a file tree patches from.
+ *
+ * This exists because the tempting mistake is silent: the hook computes both a raw
+ * delta and a narrower `owned` set, and broadcasting `owned` would look correct in
+ * every single-narrator test. In a shared worktree it would omit a neighbour's writes,
+ * so the tree would keep rendering files that are no longer on disk — with nothing
+ * anywhere reporting a problem.
+ */
+describe("workspace path change broadcast", () => {
+	/** Collect `workspace_paths_changed` frames emitted during `run`. */
+	async function captureBroadcasts(
+		run: () => Promise<void>,
+	): Promise<
+		{ narratorId: string; changes: { path: string; kind: string }[]; truncated: boolean }[]
+	> {
+		const frames: {
+			narratorId: string;
+			changes: { path: string; kind: string }[];
+			truncated: boolean;
+		}[] = [];
+		const handler = (event: NarraForkEvent) => {
+			if (event.type !== "narrator:ws_broadcast") return;
+			const message = event.message as {
+				type?: string;
+				changes?: { path: string; kind: string }[];
+				truncated?: boolean;
+			};
+			if (message.type !== "workspace_paths_changed") return;
+			frames.push({
+				narratorId: event.narratorId,
+				changes: message.changes ?? [],
+				truncated: message.truncated === true,
+			});
+		};
+		eventBus.on("narrator:ws_broadcast", handler);
+		try {
+			await run();
+		} finally {
+			eventBus.off("narrator:ws_broadcast", handler);
+		}
+		return frames;
+	}
+
+	test("announces the whole workspace delta, not just the acting call's owned set", async () => {
+		const repo = await createRepo("nf-hook-broadcast-delta-");
+		const narratorId = await createNarrator(repo);
+		const neighbourId = await createNarrator(repo);
+		const session = makeSession(repo);
+		const neighbour = makeSession(repo);
+		writeFileSync(join(repo, "mine.txt"), "mine-v1\n");
+		writeFileSync(join(repo, "theirs.txt"), "theirs-v1\n");
+
+		const { toolUseId } = await seedToolCall(narratorId, "Edit", 1);
+		await recordTreeSnapshotBefore(session, narratorId, toolUseId, declare(repo, "mine.txt"));
+		await recordTreeSnapshotBefore(neighbour, neighbourId, "neighbour-tool", ["theirs.txt"]);
+		writeFileSync(join(repo, "mine.txt"), "mine-v2\n");
+		writeFileSync(join(repo, "theirs.txt"), "theirs-v2\n");
+		session._lastTreeHash = undefined;
+
+		let result: Awaited<ReturnType<typeof recordTreeSnapshotAfter>> | undefined;
+		const frames = await captureBroadcasts(async () => {
+			result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+		});
+
+		// Attribution correctly narrows to the declared target...
+		expect(result?.changedFiles).toEqual(["mine.txt"]);
+		// ...but the tree must hear about both, because both are on disk now.
+		expect(frames.length).toBeGreaterThan(0);
+		const paths = frames[0]?.changes.map((entry) => entry.path).sort();
+		expect(paths).toEqual(["mine.txt", "theirs.txt"]);
+	});
+
+	test("carries the change kind for each path", async () => {
+		const repo = await createRepo("nf-hook-broadcast-kind-");
+		const narratorId = await createNarrator(repo);
+		const session = makeSession(repo);
+		writeFileSync(join(repo, "gone.txt"), "bye\n");
+
+		const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
+		await recordTreeSnapshotBefore(session, narratorId, toolUseId, null);
+		rmSync(join(repo, "gone.txt"));
+		writeFileSync(join(repo, "fresh.txt"), "new\n");
+		session._lastTreeHash = undefined;
+
+		const frames = await captureBroadcasts(async () => {
+			await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+		});
+
+		const byPath = new Map(frames[0]?.changes.map((entry) => [entry.path, entry.kind]));
+		// A tree cannot patch itself from paths alone: it has to know whether a row
+		// appears or disappears.
+		expect(byPath.get("fresh.txt")).toBe("added");
+		expect(byPath.get("gone.txt")).toBe("deleted");
+	});
+
+	test("reaches the acting narrator even with no watcher registered", async () => {
+		// The tool path must not depend on the filesystem watcher being active — that is
+		// the whole reason this source exists (the native watcher is opt-in).
+		const repo = await createRepo("nf-hook-broadcast-nowatcher-");
+		const narratorId = await createNarrator(repo);
+		const session = makeSession(repo);
+
+		const { toolUseId } = await seedToolCall(narratorId, "Edit", 1);
+		await recordTreeSnapshotBefore(session, narratorId, toolUseId, declare(repo, "a.txt"));
+		writeFileSync(join(repo, "a.txt"), "one\n");
+		session._lastTreeHash = undefined;
+
+		const frames = await captureBroadcasts(async () => {
+			await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+		});
+
+		expect(frames.map((frame) => frame.narratorId)).toEqual([narratorId]);
+	});
+
+	test("stays silent when the tool changed nothing", async () => {
+		// Every no-op tool call would otherwise wake every attached tree.
+		const repo = await createRepo("nf-hook-broadcast-noop-");
+		const narratorId = await createNarrator(repo);
+		const session = makeSession(repo);
+		writeFileSync(join(repo, "a.txt"), "one\n");
+
+		const { toolUseId } = await seedToolCall(narratorId, "Read", 1);
+		await recordTreeSnapshotBefore(session, narratorId, toolUseId, []);
+		session._lastTreeHash = undefined;
+
+		const frames = await captureBroadcasts(async () => {
+			await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+		});
+
+		expect(frames).toEqual([]);
 	});
 });

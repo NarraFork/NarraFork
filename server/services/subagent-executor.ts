@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters } from "../db/schema";
@@ -1483,6 +1483,8 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 	// Read conclusion file for explore/plan subagents.
 	// If the subagent wrote to the designated conclusion file, use its content as finalText.
+	// The file itself is KEPT on disk (like plan files): some workflows depend on the
+	// subagent leaving a durable markdown artifact behind, and deleting it here breaks them.
 	if (conclusionFileId) {
 		const conclusionPath = resolveConclusionFilePath(cwd, conclusionFileId);
 		deleteConclusionFileId(narratorId);
@@ -1492,11 +1494,9 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				if (content && !hasError) {
 					finalText = content;
 				}
-				// Clean up the temporary conclusion file
-				rmSync(conclusionPath, { force: true });
 			}
 		} catch (err) {
-			logger.warn("Failed to read/cleanup conclusion file", {
+			logger.warn("Failed to read conclusion file", {
 				narratorId,
 				conclusionPath,
 				error: err instanceof Error ? err.message : String(err),

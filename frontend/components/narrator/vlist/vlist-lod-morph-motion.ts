@@ -1,9 +1,12 @@
 /**
- * vlist-lod-morph-motion.ts — Plays the LOD-switch morphs planned by
- * `vlist-lod-morph.ts` onto the committed (new-level) nodes.
+ * vlist-lod-morph-motion.ts — Keyframes for the LOD-switch morphs planned by
+ * `vlist-lod-morph.ts`.
  *
- * Thin DOM/WAAPI edge, split from the pure planner so the geometry is unit-testable.
- * Lives in the shell layer, NOT on the measure path.
+ * Thin builder, split from the pure planner so the geometry stays unit-testable. It
+ * holds NO animation handles and decides no timing — the single owner of both is
+ * `vlist-motion-scheduler.ts`, which also carries the LOD switch's longer duration
+ * (`LOD_MOTION_DURATION_MS`) next to the shared base so that the deviation is stated
+ * in one place instead of drifting between modules.
  *
  * ## How an LOD morph reads
  *
@@ -27,32 +30,10 @@
  * and merely end up somewhere else. Fading those makes unchanged prose blink once per
  * zoom step, which reads as a glitch rather than as a transition. See
  * `LodMorphPlan.fade`.
- *
- * ## Multi-activity controller
- *
- * All paired morphs start in the SAME frame (no stagger), keyed per `unitId`:
- * replaying the SAME unitId (a rapid re-zoom) cancels that element's stale
- * animation, while other elements run undisturbed. `fill: "none"` throughout, so a
- * cancelled or finished morph reads the committed style.
  */
 
+import { DRILL_MORPH_X_OFFSET } from "./vlist-drill-morph";
 import type { LodMorphPlan } from "./vlist-lod-morph";
-
-/** Easing matches the fold transition (Mantine `<Collapse>` default). */
-const MORPH_EASING = "ease";
-
-/** The subset of Element the morph needs; keeps it testable without a real DOM. */
-export interface LodMorphNode {
-	animate?: (
-		keyframes: Keyframe[],
-		options: KeyframeAnimationOptions,
-	) => { cancel: () => void } | undefined;
-}
-
-/** A running morph animation. */
-export interface LodMorphHandle {
-	cancel: () => void;
-}
 
 /**
  * Keyframes: appear at the OLD position (`deltaY`) and slide to the committed spot,
@@ -64,88 +45,85 @@ export interface LodMorphHandle {
  * So there are three real shapes — slide only, slide + fade, and fade in place
  * (`deltaY: 0`, which the planner emits for a re-theme whose travel was dropped).
  */
-function morphKeyframes(deltaY: number, fade: boolean): Keyframe[] {
-	const slides = deltaY !== 0;
-	if (!fade) {
+export function lodMorphKeyframes(plan: LodMorphPlan): Keyframe[] {
+	const slides = plan.deltaY !== 0;
+	if (!plan.fade) {
 		return [
-			{ offset: 0, transform: `translateY(${deltaY}px)` },
+			{ offset: 0, transform: `translateY(${plan.deltaY}px)` },
 			{ offset: 1, transform: "translateY(0px)" },
 		];
 	}
+	// A FADING morph is a re-theme, i.e. exactly the trace-row ↔ tool-call pair a drill
+	// morph handles — so it needs the same HORIZONTAL compensation. The two forms start
+	// their content at different offsets (a row leads with a chevron slot; a card leads
+	// with its border + padding), so a Y-only morph slid the line vertically while its
+	// icon and text jumped `DRILL_MORPH_X_OFFSET` sideways in one frame.
+	//
+	// Sign follows the direction: `deltaY > 0` means the new node starts BELOW its home,
+	// i.e. content moved up the document — the row→card direction, whose start is the
+	// row's lane. The reverse starts at the card's.
+	const x = plan.deltaY >= 0 ? DRILL_MORPH_X_OFFSET : -DRILL_MORPH_X_OFFSET;
 	if (!slides) {
+		// Fade in place: the planner dropped the travel (clipped element), so there is no
+		// direction to compensate along either — moving X alone would be a sideways drift
+		// with nothing to justify it.
 		return [
 			{ offset: 0, opacity: 0 },
 			{ offset: 1, opacity: 1 },
 		];
 	}
 	return [
-		{ offset: 0, opacity: 0, transform: `translateY(${deltaY}px)` },
-		{ offset: 1, opacity: 1, transform: "translateY(0px)" },
+		{ offset: 0, opacity: 0, transform: `translate(${x}px, ${plan.deltaY}px)` },
+		{ offset: 1, opacity: 1, transform: "translate(0px, 0px)" },
 	];
 }
 
 /**
- * Play one planned morph on its (new-level) node, returning the handle or null when
- * the environment has no Web Animations support — the committed geometry then stands
- * on its own. Never throws.
+ * LOD morph keyframes that RESUME from an interrupted one.
+ *
+ * A level switch can be re-triggered mid-flight (holding a zoom shortcut, or a pinch that
+ * crosses two thresholds), and with `fill: "none"` the replacement otherwise starts from
+ * the committed geometry the cancelled animation snapped back to — a visible jump, the same
+ * one the drill morph had before it learned to resume.
+ *
+ * `previous` is the scheduler's sample of the motion being replaced (null when the scope was
+ * idle or the environment exposes no timing).
  */
-export function playLodMorph(
+export function lodMorphKeyframesFrom(
 	plan: LodMorphPlan,
-	node: LodMorphNode | null | undefined,
-): LodMorphHandle | null {
-	if (!node || typeof node.animate !== "function") return null;
-	try {
-		const animation = node.animate(morphKeyframes(plan.deltaY, plan.fade), {
-			duration: plan.durationMs,
-			easing: MORPH_EASING,
-			fill: "none",
-		});
-		return animation ? { cancel: () => animation.cancel() } : null;
-	} catch {
-		return null;
+	previous: { progress: number } | null,
+): Keyframe[] {
+	const frames = lodMorphKeyframes(plan);
+	if (!previous) return frames;
+	const first = frames[0];
+	if (!first) return frames;
+	// The outgoing motion travelled `start → 0`, so its un-run remainder is what the node
+	// still visually holds. Its own start is unknown here (it was a different plan), but the
+	// only thing that re-plays this scope is another switch of the SAME element, whose start
+	// is this plan's endpoint mirrored — so this plan's own start, scaled by the remainder,
+	// is the correct resume point.
+	const remaining = 1 - easeApprox(previous.progress);
+	const heldY = plan.deltaY * remaining;
+	const resumed: Keyframe = { ...first };
+	if (first.transform !== undefined) {
+		const x = (plan.deltaY >= 0 ? DRILL_MORPH_X_OFFSET : -DRILL_MORPH_X_OFFSET) * remaining;
+		resumed.transform = plan.deltaY !== 0 ? `translate(${x}px, ${heldY}px)` : "translate(0px, 0px)";
 	}
-}
-
-/** Resolve a plan's unitId to its mounted new-level node (or null when not mounted). */
-export type LodMorphNodeResolver = (unitId: string) => LodMorphNode | null | undefined;
-
-/**
- * A per-unitId morph controller. `playAll` starts every planned morph in one frame,
- * cancelling only the SAME unitId's previous animation; `cancel()` stops all.
- */
-export function createLodMorphController(): {
-	playAll: (plans: readonly LodMorphPlan[], resolve: LodMorphNodeResolver) => void;
-	cancel: () => void;
-} {
-	const active = new Map<string, LodMorphHandle>();
-	const cancelOne = (unitId: string) => {
-		active.get(unitId)?.cancel();
-		active.delete(unitId);
-	};
-	return {
-		playAll: (plans, resolve) => {
-			for (const plan of plans) {
-				cancelOne(plan.unitId);
-				const handle = playLodMorph(plan, resolve(plan.unitId));
-				if (handle) active.set(plan.unitId, handle);
-			}
-		},
-		cancel: () => {
-			for (const handle of active.values()) handle.cancel();
-			active.clear();
-		},
-	};
+	if (first.opacity !== undefined) {
+		// Opacity ran 0 → 1, so the remainder is how much brightness is still missing.
+		resumed.opacity = 1 - remaining;
+	}
+	return [resumed, ...frames.slice(1)];
 }
 
 /**
- * True when the environment asks for reduced motion, in which case the level switch
- * applies instantly. Read at play time, not cached.
+ * Smoothstep approximation of `MOTION_EASING` (`ease`), identical to the drill morph's.
+ *
+ * Duplicated rather than shared because these two modules are deliberately independent
+ * (the drill morph must not import the LOD planner or vice versa); the function is four
+ * tokens and its correctness is pinned by tests on both sides.
  */
-export function prefersReducedMotion(): boolean {
-	if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
-	try {
-		return window.matchMedia("(prefers-reduced-motion: reduce)").matches === true;
-	} catch {
-		return false;
-	}
+function easeApprox(p: number): number {
+	const t = p < 0 ? 0 : p > 1 ? 1 : p;
+	return t * t * (3 - 2 * t);
 }

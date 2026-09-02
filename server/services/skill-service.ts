@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import {
 	access,
 	lstat,
@@ -20,8 +21,8 @@ import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { hotTimer } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { getNarraforkHome } from "../lib/narrafork-home";
 import { isInsidePath } from "../lib/platform-path";
-import { narraforkDir } from "../lib/settings";
 
 export type SkillSource = "global" | "project" | "workspace";
 
@@ -274,8 +275,8 @@ async function walkForSkills(dir: string, skills: SkillInfo[], depth: number): P
 
 /**
  * Scan directories for SKILL.md files (recursively).
- * Searches: .narrafork/skills/, .claude/skills/, .agents/skills/ under basePath,
- * walking sub-directories up to {@link MAX_WALK_DEPTH} levels deep.
+ * Searches every directory {@link getSkillSearchDirs} lists for `basePath`, walking
+ * sub-directories up to {@link MAX_WALK_DEPTH} levels deep.
  */
 async function scanSkillDirs(basePath: string): Promise<SkillInfo[]> {
 	const skills: SkillInfo[] = [];
@@ -288,9 +289,26 @@ async function scanSkillDirs(basePath: string): Promise<SkillInfo[]> {
 	return skills;
 }
 
+/**
+ * The physical path `path` names, or the lexically resolved path when it cannot be
+ * resolved (it may not exist yet).
+ *
+ * Needed because the home root arrives here already realpath'd — `resolveSkillRootsForContext`
+ * normalizes every root — while `homedir()` and `NARRAFORK_HOME` are raw. On a system where
+ * `/home/u` is a symlink to `/mnt/data/u`, comparing the two forms makes the home root look
+ * like an ordinary directory, and the user-level search dirs below silently drop out.
+ */
+function canonical(path: string): string {
+	try {
+		return realpathSync(resolve(path));
+	} catch {
+		return resolve(path);
+	}
+}
+
 let cachedHomeDir: string | null = null;
 function getHomeDir(): string {
-	if (cachedHomeDir === null) cachedHomeDir = resolve(homedir());
+	if (cachedHomeDir === null) cachedHomeDir = canonical(homedir());
 	return cachedHomeDir;
 }
 
@@ -305,8 +323,19 @@ function getSkillSearchDirs(basePath: string): string[] {
 		join(basePath, ".codex", "skills"),
 	];
 
-	// Support a custom CODEX_HOME (e.g. not `~/.codex`) when scanning the home root.
-	if (resolve(basePath) === getHomeDir()) {
+	// User-level roots that are NOT derived from `basePath`. Only meaningful when this
+	// call is scanning the home directory: for a project or workspace root, appending
+	// them would scan the same user-level directories once per project.
+	if (canonical(basePath) === getHomeDir()) {
+		// `$NARRAFORK_HOME/skills`. This is where `createGlobalSkill` and routine
+		// materialization WRITE, so leaving it out of the read path meant a custom
+		// NARRAFORK_HOME made every global skill invisible the moment it was created —
+		// no error, just a skill that never appears. With the default home the path is
+		// `~/.narrafork/skills`, already covered above, hence deduped rather than added.
+		const narraforkSkills = join(getNarraforkHome(), "skills");
+		if (!dirs.includes(narraforkSkills)) dirs.push(narraforkSkills);
+
+		// Support a custom CODEX_HOME (e.g. not `~/.codex`).
 		const codexHome = process.env.CODEX_HOME?.trim();
 		if (codexHome) {
 			const codexSkills = join(resolve(codexHome), "skills");
@@ -954,7 +983,9 @@ export async function loadProjectSkillByName(
 }
 
 /**
- * Load global skills from ~/  (scans ~/.narrafork/skills/, ~/.claude/skills/, ~/.agents/skills/).
+ * Load global (user-level) skills: the home-rooted directories plus the
+ * `basePath`-independent ones (`$NARRAFORK_HOME/skills`, `$CODEX_HOME/skills`).
+ * See {@link getSkillSearchDirs}.
  */
 export async function loadGlobalSkills(): Promise<SkillInfo[]> {
 	const skillMap = new Map<string, SkillInfo>();
@@ -968,7 +999,8 @@ export async function loadGlobalSkills(): Promise<SkillInfo[]> {
  *
  * Priority chain (low → high):
  *   ~/.narrafork/skills < ~/.narrafork/skill < ~/.claude/skills < ~/.agents/skills
- *   < <project>/.narrafork/skills < ... < <project>/.agents/skills
+ *   < ~/.codex/skills < $NARRAFORK_HOME/skills < $CODEX_HOME/skills
+ *   < <project>/.narrafork/skills < ... < <project>/.codex/skills
  */
 export async function loadAllSkills(projectGitPath: string | null): Promise<SkillInfo[]> {
 	const skillMap = new Map<string, SkillInfo>();
@@ -1076,9 +1108,17 @@ export function startSkillCacheCleanupTimer(): ReturnType<typeof setInterval> {
 	);
 }
 
-// === Global skill CRUD (writes to ~/.narrafork/skills/) ===
+// === Global skill CRUD (writes to $NARRAFORK_HOME/skills/, default ~/.narrafork/skills/) ===
 
-const globalSkillsDir = join(narraforkDir, "skills");
+/**
+ * Resolved per call rather than at module load so a `NARRAFORK_HOME` set after this
+ * module is imported (test preloads, embedded runtimes) still lands in the same
+ * directory {@link getSkillSearchDirs} reads back.
+ */
+function getGlobalSkillsDir(): string {
+	return join(getNarraforkHome(), "skills");
+}
+
 const projectSkillsRelativeDir = join(".narrafork", "skills");
 
 async function assertPathInsideProject(projectGitPath: string, targetPath: string): Promise<void> {
@@ -1148,7 +1188,7 @@ export async function createGlobalSkill(
 	const dirName = sanitizeSkillDirName(name);
 	if (!dirName) throw new ValidationError("Invalid skill name");
 
-	const skillDir = join(globalSkillsDir, dirName);
+	const skillDir = join(getGlobalSkillsDir(), dirName);
 	const skillFile = join(skillDir, "SKILL.md");
 
 	// Check if directory already exists

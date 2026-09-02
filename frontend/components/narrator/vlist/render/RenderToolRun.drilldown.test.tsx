@@ -227,7 +227,9 @@ describe("RenderToolRun — a subagent row drills into the agent card", () => {
 		// Recent calls read as trace rows (`Tool · summary`), the subagent card's
 		// signature region — a tool card has no such thing.
 		expect(root.textContent).toContain("Recent calls");
-		expect(root.textContent).toContain("Read · loop.ts");
+		// Bold name, no separator glyph: the gap is a flat margin, so the text is
+		// contiguous — see RenderSubagent.traceparity.test.tsx.
+		expect(root.textContent).toContain("Readloop.ts");
 		// The prompt is behind its own fold row, not dumped as an input JSON blob.
 		expect(root.textContent).toContain("Prompt");
 		expect(root.textContent).not.toContain("look at the fold");

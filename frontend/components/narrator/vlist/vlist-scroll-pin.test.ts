@@ -109,10 +109,13 @@ describe("processScrollFrame answers content growth in the same frame", () => {
 			source.indexOf("const onScroll = useCallback("),
 		);
 		expect(frame).toContain("isBottomLostToContentGrowth(");
-		// The re-glue routes through the smooth-follow chase: growth beneath a pinned
-		// reader is precisely the "content jumps up" case the chase glides over, and
-		// its gate reproduces the old instant write for loads/switches/shrinks.
-		expect(frame).toContain("if (grewBeneathReader) getSmoothFollower().ensure();");
+		// The re-glue SNAPS: what reaches it is a row settling its post-paint height,
+		// not content arriving. It only stands down for an active chase so it cannot
+		// cut a streaming glide short. (See the settle-vs-arrival group below.)
+		expect(frame).toContain(
+			"if (grewBeneathReader && smoothFollowerRef.current?.isActive() !== true)",
+		);
+		expect(frame).toContain("writeScrollTop(getScrollBottomTarget(node));");
 		// The mounted window must come from where the viewport now is, not from the
 		// pre-re-glue reading.
 		expect(frame).toContain("const settledTop = scrollTopRef.current;");
@@ -156,18 +159,40 @@ describe("smooth bottom-follow wiring (vlist-smooth-follow)", () => {
 		return Bun.file(new URL("./PretextExactMessageList.tsx", import.meta.url).pathname).text();
 	}
 
-	it("routes all three bottom-follow writers through the chase", async () => {
+	/**
+	 * ONE writer glides, and that is the whole point.
+	 *
+	 * "Content ARRIVED for a reader who is watching" is the only thing worth
+	 * animating. The other bottom writers answer a document being ESTABLISHED or
+	 * SETTLING — a fresh load, a narrator switch, a prepend re-pin, a row reporting
+	 * its post-paint height, a footer resolving, a resize — and every one of those is
+	 * a small delta, so routing them through the same gate made the list animate its
+	 * own mount: opening a narrator visibly scrolled DOWN into place instead of
+	 * opening at the bottom. That was a shipped regression, twice removed from
+	 * anything a test on the pure gate could have caught.
+	 */
+	it("glides ONLY the stamped tail-growth correction", async () => {
 		const source = await shell();
-		// 1. The streaming commit's bottom correction (only when the coordinator
-		//    stamped it smooth, i.e. tail growth).
+		// The one glide entry point: a bottom correction the coordinator stamped as
+		// tail growth (streaming row / appended message / live patch at the tail).
 		expect(source).toContain('anchorKind === "bottom" && smoothFollow === true');
-		// 2. The geometry-revision pin effect.
+		expect(source).toContain("getSmoothFollower().ensure();");
+		// And it is the ONLY one. `ensure()` anywhere else is how the mount animation
+		// came back.
+		expect(source.match(/getSmoothFollower\(\)\.ensure\(\)/g)?.length).toBe(1);
+	});
+
+	it("the pin effect SNAPS, standing down only for an active chase", async () => {
+		const source = await shell();
 		const pinEffect = source.slice(
 			source.indexOf("const scrollGeometryRevision ="),
-			source.indexOf("const scrollGeometryRevision =") + 900,
+			source.indexOf("const scrollGeometryRevision =") + 1800,
 		);
-		expect(pinEffect).toContain("getSmoothFollower().ensure();");
-		// 3. The same-frame re-glue (asserted in its own group above).
+		// Yields to a chase (an unconditional write would land at the bottom on the
+		// next frame and cut every streaming glide short)…
+		expect(pinEffect).toContain("if (smoothFollowerRef.current?.isActive() === true) return;");
+		// …otherwise snaps, exactly as it did before any of this work.
+		expect(pinEffect).toContain("writeScrollTop(getScrollBottomTarget(viewportRef.current));");
 	});
 
 	it("non-glide corrections still land instantly and kill any chase in flight", async () => {

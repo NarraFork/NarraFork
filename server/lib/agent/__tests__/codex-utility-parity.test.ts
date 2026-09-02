@@ -134,7 +134,8 @@ describe.each([
 		const metadata = req.body.client_metadata as Record<string, string>;
 
 		expect(req.body.tool_choice).toBe("auto");
-		expect(req.body.parallel_tool_calls).toBe(false);
+		// Parallel tool calls stay on outside the responses-lite contract.
+		expect(req.body.parallel_tool_calls).toBe(true);
 		// No reasoning.context — real non-lite requests omit it (lite-only field).
 		expect(req.body.reasoning).toEqual({ effort: "high", summary: "auto" });
 		expect(req.body.include).toEqual(["reasoning.encrypted_content"]);

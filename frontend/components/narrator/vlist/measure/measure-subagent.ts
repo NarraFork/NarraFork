@@ -147,6 +147,42 @@ export const RECENT_TITLE_MARGIN_BOTTOM = 4;
  * different heights depending on which surface showed it.
  */
 export const RECENT_ROW_HEIGHT = BARE_ROW_HEIGHT; // 18.8
+
+// ── File changes (`+N -N` per path) ──────────────────────────────────────────
+//
+// Reuses the recent-call row geometry: same xs mono line, same flush stacking, so a
+// file row and an activity row sit on the same rhythm and neither needs its own
+// metric. The rows are single-line and truncating, so only their COUNT drives height.
+
+/**
+ * Visible file rows before the reader expands the list.
+ *
+ * Mirrors the server's `CARD_FILE_LIST_MAX`. Kept small on purpose: this list is
+ * MEASURED, so an uncapped one would let a single card (220 files in real data) eat
+ * the viewport. The rest stays one click away.
+ */
+export const FILE_CHANGE_MAX_ROWS = 5;
+
+/** Height of one file row (identical to a recent-call row). */
+export const FILE_CHANGE_ROW_HEIGHT = BARE_ROW_HEIGHT;
+
+/** Gap between stacked file rows (flush, like recent calls). */
+export const FILE_CHANGE_STACK_GAP = 0;
+
+/** Structural mirror of the server's `SubagentFileChanges` (height-relevant fields). */
+export interface SubagentFileChangesData {
+	files: {
+		filePath: string;
+		linesAdded: number | null;
+		linesRemoved: number | null;
+		editCount: number;
+		outsideParentWorkspace?: boolean;
+	}[];
+	totalFiles: number;
+	totalUnmeasured: number;
+	bashTouchedCount: number;
+	countsTruncated: boolean;
+}
 /** Trace rows sit flush; the old 4px seam belonged to the tinted-button look. */
 export const RECENT_STACK_GAP = 0;
 /** At most 3 recent calls are shown (slice(-3)). */
@@ -271,6 +307,17 @@ export interface SubagentCardData {
 	 * fetch — never read for layout.
 	 */
 	toolUseId?: string;
+	/**
+	 * Files this subagent changed on disk (`+N -N` per path).
+	 *
+	 * HEIGHT-AFFECTING, unlike the tool card's `diffStats`: this is a LIST of rows, so
+	 * every visible entry makes the card taller. That is why the visible count is
+	 * capped ({@link FILE_CHANGE_MAX_ROWS}) and the remainder hides behind an expand
+	 * row — one parent in real data aggregated 220 changed files.
+	 */
+	fileChanges?: SubagentFileChangesData;
+	/** The reader expanded the file list (shows all rows instead of the capped head). */
+	fileChangesExpanded?: boolean;
 	/** Result text — drives the result preview line + expanded result block. */
 	resultText?: string;
 	/** Whether the tool call is in a terminal status (gates the result preview). */
@@ -391,6 +438,12 @@ export interface MeasuredSubagent extends MeasuredElement {
 	resultMeasured: MeasuredElement | null;
 	/** Result block height (min(content,300) + padding); 0 when absent. */
 	resultBlockHeight: number;
+	/** File-changes block height (title + rows + overflow row); 0 when absent. */
+	fileChangesHeight: number;
+	/** How many file rows are DRAWN (capped unless the reader expanded the list). */
+	fileChangeRowCount: number;
+	/** Whether the trailing "N more / N touched by shell" row is drawn. */
+	hasFileChangeOverflowRow: boolean;
 	/** Self-permission InlinePermission measure (P11); null when absent. */
 	selfPermissionMeasured: MeasuredInlinePermission | null;
 	/** Self-permission block height (perm + bottom margin); 0 when absent. */
@@ -488,6 +541,12 @@ export interface SubagentExpandInput {
 	isRecent: boolean;
 	opened: boolean;
 	lodUserOverride?: boolean;
+	/**
+	 * The reader EXPLICITLY folded this card (a stored preference), as opposed to
+	 * `opened === false` merely being the derived default. Only the former may
+	 * collapse a card at L5 — see the note in `resolveSubagentExpanded`.
+	 */
+	userCollapsed?: boolean;
 }
 
 /**
@@ -497,7 +556,11 @@ export interface SubagentExpandInput {
 export function resolveSubagentExpanded(lod: RenderLod, input: SubagentExpandInput): boolean {
 	const lodExempt = input.isActive || input.hasSelfPermission || input.pendingPermissionCount > 0;
 	if (lodExempt || input.lodUserOverride) return true;
-	if (lod >= 5) return true;
+	// Same contract as the tool card's `resolveToolCallOpened`: L5 keeps an
+	// UNTOUCHED card expanded, but an explicit fold is honoured. A bare `true` made
+	// this card's header chevron dead at L5 too — the shell writes the click into
+	// the `expanded` map, which this branch never read.
+	if (lod >= 5) return !input.userCollapsed;
 	if (lod === 4) return input.isRecent ? input.opened : false;
 	if (lod === 3) return false;
 	// L1/L2 follow the upstream gate / user-opened state.
@@ -537,6 +600,10 @@ export function measureSubagentCard(
 		isRecent,
 		opened,
 		lodUserOverride: opts.lodUserOverride,
+		// Distinct from `opened === false`, which is also the DEFAULT here (`?? false`)
+		// and therefore says nothing about the reader's intent. Only a stored
+		// preference may fold an L5 card.
+		userCollapsed: opts.opened === false,
 	});
 
 	// ── Header (always shown) ──────────────────────────────────────────────────
@@ -555,6 +622,25 @@ export function measureSubagentCard(
 		DESC_MARGIN_TOP +
 		descriptionHeight +
 		(hasResultPreview ? RESULT_PREVIEW_MARGIN_TOP + typographyMetrics().line.xs : 0);
+
+	// ── File changes (expanded only; row COUNT is the whole height model) ───────
+	const fileChangeTotal = data.fileChanges?.files.length ?? 0;
+	// Expanded shows every row; collapsed shows the capped head. Both are bounded —
+	// the expanded case by the server's own aggregate cap.
+	const fileChangeRowCount =
+		data.fileChangesExpanded === true
+			? fileChangeTotal
+			: Math.min(fileChangeTotal, FILE_CHANGE_MAX_ROWS);
+	// The overflow row is what makes the hidden files reachable, so it must be
+	// reserved whenever anything is hidden. It also carries the shell-touched and
+	// unmeasured tallies, which is why a fully-listed set can still need it.
+	const hasFileChangeOverflowRow =
+		fileChangeRowCount > 0 &&
+		(fileChangeRowCount < fileChangeTotal ||
+			(data.fileChanges?.bashTouchedCount ?? 0) > 0 ||
+			(data.fileChanges?.totalUnmeasured ?? 0) > 0 ||
+			data.fileChanges?.countsTruncated === true);
+	let fileChangesHeight = 0;
 
 	// ── Recent Calls (always shown when there are activity calls) ───────────────
 	const recentRowCount = Math.min(Math.max(0, data.recentCallCount ?? 0), RECENT_MAX_ROWS);
@@ -636,6 +722,19 @@ export function measureSubagentCard(
 			expandedHeight += resolveOverrideHeight;
 		}
 
+		// File changes: a title row + up to FILE_CHANGE_MAX_ROWS file rows (+ one
+		// "N more" row when capped). Every row is single-line and truncating, so the
+		// count alone decides the height.
+		if (fileChangeRowCount > 0) {
+			fileChangesHeight =
+				FILE_CHANGE_ROW_HEIGHT + // title row ("changed N files")
+				fileChangeRowCount * FILE_CHANGE_ROW_HEIGHT +
+				(fileChangeRowCount - 1) * FILE_CHANGE_STACK_GAP +
+				(hasFileChangeOverflowRow ? FILE_CHANGE_ROW_HEIGHT : 0) +
+				BLOCK_PADDING_BOTTOM;
+			expandedHeight += fileChangesHeight;
+		}
+
 		// resultText (ContentViewer maxHeight:300, markdown).
 		if (data.resultText) {
 			const resultInnerWidth = Math.max(
@@ -684,6 +783,9 @@ export function measureSubagentCard(
 		toolUseId: data.toolUseId ?? null,
 		resultMeasured,
 		resultBlockHeight,
+		fileChangesHeight,
+		fileChangeRowCount,
+		hasFileChangeOverflowRow,
 		selfPermissionMeasured,
 		selfPermissionBlockHeight,
 		pendingBlockHeight,

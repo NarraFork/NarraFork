@@ -12,9 +12,11 @@ import { describe, expect, test } from "bun:test";
 import type { TutorialCompletion, TutorialStep } from "@shared/tutorial/lessons";
 import {
 	activeStepId,
+	COMPLETION_FRAME_TYPES,
 	isCompletionSatisfied,
 	isLessonComplete,
 	satisfiedStepIds,
+	TUTORIAL_FRAME_TYPES,
 	type TutorialObservations,
 } from "./tutorial-completion";
 
@@ -27,6 +29,39 @@ function observations(overrides: Partial<TutorialObservations> = {}): TutorialOb
 function step(id: string, completion: TutorialCompletion): TutorialStep {
 	return { id, instruction: id, completion };
 }
+
+describe("subscribed frame types cover every completion kind", () => {
+	// The bug this catches has no error and no visible symptom other than a step
+	// that refuses to advance: the manager filters by type, so a frame missing from
+	// TUTORIAL_FRAME_TYPES never reaches the predicates at all. Three were missing
+	// at once, disabling the plan-mode gate, every subagent step, and — via
+	// `userSentMessage` — every "wait for the turn to finish" step.
+	test("every frame a predicate reads is subscribed", () => {
+		const subscribed = new Set<string>(TUTORIAL_FRAME_TYPES);
+		for (const [kind, types] of Object.entries(COMPLETION_FRAME_TYPES)) {
+			for (const type of types) {
+				expect(subscribed.has(type), `${kind} reads unsubscribed frame "${type}"`).toBe(true);
+			}
+		}
+	});
+
+	test("every completion kind declares what it reads", () => {
+		// A new kind added to the union without an entry here would be invisible to the
+		// check above, which is how the original gap survived review.
+		const kinds: Array<TutorialCompletion["kind"]> = [
+			"manual",
+			"userSentMessage",
+			"narratorIdle",
+			"permissionResolved",
+			"toolCompleted",
+			"subagentSpawned",
+			"chapterForked",
+			"chapterMerged",
+			"specTaskWritten",
+		];
+		expect(Object.keys(COMPLETION_FRAME_TYPES).sort()).toEqual([...kinds].sort());
+	});
+});
 
 describe("userSentMessage", () => {
 	const completion: TutorialCompletion = { kind: "userSentMessage" };
@@ -105,6 +140,35 @@ describe("permissionResolved", () => {
 				{ kind: "permissionResolved" },
 				observations({
 					frames: [{ type: "permission_resolved", narratorId: "someone-else", decision: "allow" }],
+				}),
+			),
+		).toBe(false);
+	});
+
+	test("the plan gate's own frame counts as a decision", () => {
+		// Approving or returning a plan emits `plan_reflection_resolved` and never
+		// `permission_resolved`. Matching only the latter left the plan-mode lesson
+		// waiting on a decision the user had already made.
+		for (const decision of ["allow", "deny"] as const) {
+			expect(
+				isCompletionSatisfied(
+					{ kind: "permissionResolved" },
+					observations({
+						frames: [{ type: "plan_reflection_resolved", narratorId: NARRATOR, decision }],
+					}),
+				),
+			).toBe(true);
+		}
+	});
+
+	test("an aborted request is not a decision", () => {
+		// The plan gate reports `aborted` when the turn ended before the user answered.
+		// Ticking the step there would credit them with a choice they never made.
+		expect(
+			isCompletionSatisfied(
+				{ kind: "permissionResolved" },
+				observations({
+					frames: [{ type: "plan_reflection_resolved", narratorId: NARRATOR, decision: "aborted" }],
 				}),
 			),
 		).toBe(false);

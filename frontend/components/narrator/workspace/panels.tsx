@@ -20,6 +20,7 @@ import {
 	BrowserDockPanel as BrowserToolAdapter,
 	DetailsDockPanel as DetailsToolAdapter,
 	FileModDockPanel as FileModToolAdapter,
+	FileTreeDockPanel as FileTreeToolAdapter,
 	FileDockPanel as FileViewerAdapter,
 	GitDockPanel as GitToolAdapter,
 	KnowledgeDockPanel as KnowledgePanelAdapter,
@@ -210,6 +211,9 @@ function NarratorToolDockPanel(props: IDockviewPanelProps<NarratorToolPanelParam
 			break;
 		case "userchat":
 			inner = <UserChatToolAdapter {...toolProps} />;
+			break;
+		case "filetree":
+			inner = <FileTreeToolAdapter {...toolProps} />;
 			break;
 		default:
 			inner = null;

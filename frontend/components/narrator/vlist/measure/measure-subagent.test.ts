@@ -71,6 +71,36 @@ describe("resolveSubagentExpanded — LOD / exemption main switch", () => {
 			}),
 		).toBe(true);
 	});
+
+	// L5 used to return a bare `true`, making this card's header chevron dead there
+	// (same defect the tool card had): the shell writes the click into the `expanded`
+	// map, which that branch never read. `userCollapsed` is deliberately separate
+	// from `opened === false` — the latter is also this measure's DEFAULT, so reading
+	// it at L5 would collapse every untouched card.
+	it("L5 honours an explicit fold but ignores a derived `opened: false`", async () => {
+		const { resolveSubagentExpanded } = await import("./measure-subagent");
+		const inert = { isActive: false, hasSelfPermission: false, pendingPermissionCount: 0 };
+		expect(
+			resolveSubagentExpanded(5, {
+				...inert,
+				isRecent: true,
+				opened: false,
+				userCollapsed: true,
+			}),
+		).toBe(false);
+		expect(resolveSubagentExpanded(5, { ...inert, isRecent: true, opened: false })).toBe(true);
+		// An exempt card (active / awaiting permission) cannot be folded away: its
+		// permission form would have nowhere to live.
+		expect(
+			resolveSubagentExpanded(5, {
+				...inert,
+				isActive: true,
+				isRecent: true,
+				opened: false,
+				userCollapsed: true,
+			}),
+		).toBe(true);
+	});
 });
 
 describe("measureSubagentCard — collapsed header (55-75px)", () => {
@@ -451,5 +481,128 @@ describe("measureSubagentCard — width sensitivity + reusable measurer", () => 
 		expect(collapsed.effectiveExpanded).toBe(false);
 		expect(expanded.effectiveExpanded).toBe(true);
 		expect(expanded.height).toBeGreaterThan(collapsed.height);
+	});
+});
+
+/**
+ * File changes are the one subagent-card field that is HEIGHT-AFFECTING rather than a
+ * height-neutral passthrough: it is a row LIST, so each visible entry makes the card
+ * taller. That is why the visible count is capped — one parent in real data
+ * aggregated 220 changed files, which uncapped would let a single card fill the
+ * viewport.
+ */
+describe("measureSubagent — file changes", () => {
+	/** Minimal terminal card; the file block only exists in the expanded region. */
+	const baseCard = () => ({
+		agentType: "general",
+		description: "do the thing",
+		isTerminal: true,
+	});
+	const file = (filePath: string, over: Record<string, unknown> = {}) => ({
+		filePath,
+		linesAdded: 1,
+		linesRemoved: 0,
+		editCount: 1,
+		...over,
+	});
+	const changes = (count: number, over: Record<string, unknown> = {}) => ({
+		files: Array.from({ length: count }, (_, i) => file(`f${i}.ts`)),
+		totalFiles: count,
+		totalUnmeasured: 0,
+		bashTouchedCount: 0,
+		countsTruncated: false,
+		...over,
+	});
+
+	it("adds no height when the subagent changed nothing", async () => {
+		const { measureSubagentCard } = await import("./measure-subagent");
+		const bare = measureSubagentCard(baseCard(), 600, 5);
+		const withEmpty = measureSubagentCard({ ...baseCard(), fileChanges: changes(0) }, 600, 5);
+		expect(withEmpty.height).toBe(bare.height);
+		expect(withEmpty.fileChangesHeight).toBe(0);
+	});
+
+	it("grows with each visible file row", async () => {
+		const { measureSubagentCard } = await import("./measure-subagent");
+		const one = measureSubagentCard({ ...baseCard(), fileChanges: changes(1) }, 600, 5);
+		const three = measureSubagentCard({ ...baseCard(), fileChanges: changes(3) }, 600, 5);
+		expect(three.height).toBeGreaterThan(one.height);
+		expect(three.fileChangeRowCount).toBe(3);
+	});
+
+	it("caps the visible rows so a 220-file aggregate cannot fill the viewport", async () => {
+		const { measureSubagentCard, FILE_CHANGE_MAX_ROWS, FILE_CHANGE_ROW_HEIGHT } = await import(
+			"./measure-subagent"
+		);
+		const capped = measureSubagentCard({ ...baseCard(), fileChanges: changes(220) }, 600, 5);
+		expect(capped.fileChangeRowCount).toBe(FILE_CHANGE_MAX_ROWS);
+		// It is taller than an exactly-at-cap card by precisely ONE row — the overflow
+		// row, which the at-cap card does not need because it hides nothing. Anything
+		// more would mean the hidden 215 files are still costing height.
+		const atCap = measureSubagentCard(
+			{ ...baseCard(), fileChanges: changes(FILE_CHANGE_MAX_ROWS) },
+			600,
+			5,
+		);
+		expect(atCap.hasFileChangeOverflowRow).toBe(false);
+		expect(capped.height - atCap.height).toBeCloseTo(FILE_CHANGE_ROW_HEIGHT, 5);
+		// The real invariant: 220 files cost the same as 20 do.
+		const many = measureSubagentCard({ ...baseCard(), fileChanges: changes(20) }, 600, 5);
+		expect(capped.height).toBe(many.height);
+	});
+
+	it("draws every row once the reader expands the list", async () => {
+		const { measureSubagentCard, FILE_CHANGE_MAX_ROWS } = await import("./measure-subagent");
+		const collapsed = measureSubagentCard({ ...baseCard(), fileChanges: changes(12) }, 600, 5);
+		const expanded = measureSubagentCard(
+			{ ...baseCard(), fileChanges: changes(12), fileChangesExpanded: true },
+			600,
+			5,
+		);
+		expect(collapsed.fileChangeRowCount).toBe(FILE_CHANGE_MAX_ROWS);
+		expect(expanded.fileChangeRowCount).toBe(12);
+		expect(expanded.height).toBeGreaterThan(collapsed.height);
+	});
+
+	it("reserves the overflow row whenever anything is hidden or unmeasured", async () => {
+		const { measureSubagentCard } = await import("./measure-subagent");
+		// Hidden files.
+		expect(
+			measureSubagentCard({ ...baseCard(), fileChanges: changes(12) }, 600, 5)
+				.hasFileChangeOverflowRow,
+		).toBe(true);
+		// Nothing hidden, but shell-touched files must still be disclosed.
+		expect(
+			measureSubagentCard(
+				{ ...baseCard(), fileChanges: changes(1, { bashTouchedCount: 4 }) },
+				600,
+				5,
+			).hasFileChangeOverflowRow,
+		).toBe(true);
+		// Nothing hidden, but an unmeasured tally must not vanish.
+		expect(
+			measureSubagentCard(
+				{ ...baseCard(), fileChanges: changes(1, { totalUnmeasured: 2 }) },
+				600,
+				5,
+			).hasFileChangeOverflowRow,
+		).toBe(true);
+		// Fully listed, fully measured → no overflow row.
+		expect(
+			measureSubagentCard({ ...baseCard(), fileChanges: changes(2) }, 600, 5)
+				.hasFileChangeOverflowRow,
+		).toBe(false);
+	});
+
+	it("costs nothing while the card is folded", async () => {
+		// The block lives in the EXPANDED region, so a folded card must be unaffected.
+		// L3 folds unconditionally (`resolveSubagentExpanded`), which is why the LOD —
+		// not an `expanded` option — is what selects the folded shape here.
+		const { measureSubagentCard } = await import("./measure-subagent");
+		const bare = measureSubagentCard(baseCard(), 600, 3);
+		const withFiles = measureSubagentCard({ ...baseCard(), fileChanges: changes(20) }, 600, 3);
+		expect(withFiles.effectiveExpanded).toBe(false);
+		expect(withFiles.height).toBe(bare.height);
+		expect(withFiles.fileChangesHeight).toBe(0);
 	});
 });

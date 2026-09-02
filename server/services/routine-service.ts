@@ -3,7 +3,8 @@
  *
  * When a routine is enabled:
  *   - command → written into user_preferences.commands (global) or project chapterSettings.commands (project)
- *   - skill   → written as SKILL.md into ~/.narrafork/skills/ (global) or <project>/.narrafork/skills/ (project)
+ *   - skill   → written as SKILL.md into $NARRAFORK_HOME/skills/ (global, default
+ *               ~/.narrafork/skills/) or <project>/.narrafork/skills/ (project)
  *
  * When disabled, the corresponding file/command entry is removed.
  */
@@ -21,7 +22,8 @@ import {
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { narraforkDir, settings } from "../lib/settings";
+import { getNarraforkHome } from "../lib/narrafork-home";
+import { settings } from "../lib/settings";
 import type { Command } from "./chapter-service";
 
 // ---------------------------------------------------------------------------
@@ -41,7 +43,16 @@ function isRoutineCommand(cmd: Command, routineId: string): boolean {
 // Skill file helpers
 // ---------------------------------------------------------------------------
 
-const globalSkillsDir = join(narraforkDir, "skills");
+/**
+ * Where routine-materialized global skills live: `$NARRAFORK_HOME/skills`.
+ *
+ * Resolved per call, and deliberately the same expression `skill-service` uses for both
+ * writing and scanning — a routine skill written to a directory the scanner does not read
+ * shows as "enabled" in the UI while the model never sees it.
+ */
+function getGlobalSkillsDir(): string {
+	return join(getNarraforkHome(), "skills");
+}
 
 function routineSkillDirName(routineId: string): string {
 	return `_routine-${routineId}`;
@@ -460,7 +471,7 @@ async function addGlobalSkill(routine: BuiltinRoutine): Promise<void> {
 	const skill = routine.skill;
 	if (!skill) return;
 	const dirName = routineSkillDirName(routine.id);
-	const skillDir = join(globalSkillsDir, dirName);
+	const skillDir = join(getGlobalSkillsDir(), dirName);
 	const skillFile = join(skillDir, "SKILL.md");
 
 	await mkdir(skillDir, { recursive: true });
@@ -469,7 +480,7 @@ async function addGlobalSkill(routine: BuiltinRoutine): Promise<void> {
 
 async function removeGlobalSkill(routine: BuiltinRoutine): Promise<void> {
 	const dirName = routineSkillDirName(routine.id);
-	const skillDir = join(globalSkillsDir, dirName);
+	const skillDir = join(getGlobalSkillsDir(), dirName);
 	try {
 		await access(skillDir);
 		await rm(skillDir, { recursive: true, force: true });

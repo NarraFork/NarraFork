@@ -12,7 +12,7 @@
 |---|---|---|
 | provider prefix | `cline` | `cline-ext` |
 | 凭据存储 | `~/.narrafork/cline-credentials.json` | 宿主 secret vault |
-| OAuth 登录 | `/api/cline/auth/*` + ClineSection（React，674 行） | 插件自己的 iframe（原生 DOM） |
+| OAuth 登录 | `/api/cline/auth/*` + ClineSection（React，749 行） | 插件自己的 iframe（原生 DOM） |
 | 登录路径 | 浏览器回调 + 粘贴回调 URL | 两条都有 |
 | 模型池 | `~/.narrafork/cline-models.json` | 插件数据目录缓存 |
 | 已启用模型 | `settings.clineProviders[].enabledModels` | vault secret（见「决策 A」） |
@@ -115,23 +115,70 @@ present-but-empty 的 hostHints**，缺失是它表达「无代理」的唯一�
 后果是真实 bug：用过一次代理后，从宿主设置里删除代理，插件会在整个进程生命周期内继续把
 上游流量走那个已删除的代理。这正是它自己注释描述的失败，却守在不可能到达的分支上。
 
+## UI 对齐：iframe 承担什么，宿主承担什么
+
+内置 `ClineSection.tsx`（749 行 React/Mantine）的职责在插件形态下被拆成两半，**不是全部由 iframe 复刻**：
+
+| 能力 | 内置 | 插件形态 | 位置 |
+|---|---|---|---|
+| 登录/登出/粘贴回调 | ClineSection | iframe | `src/ui/provider-settings.ts` |
+| 余额 | ClineSection | iframe | 同上 |
+| 推荐/免费模型、模型池搜索 | ClineSection | iframe | 同上 |
+| 已启用模型选择 | ClineSection | iframe | 同上 |
+| **出站代理覆盖** | ClineSection | **宿主** | `PluginProviderSection` → `PluginProviderProxy` |
+| **模型隐藏/上下文窗口/模型测试** | ClineSection | **宿主** | `PluginProviderSection` → `PluginProviderModels`（复用 `ModelList` + `InlineCustomModels`） |
+| **模型目录刷新** | ClineSection | **宿主** | 同上 |
+
+后三项**不能**放进 iframe：它们写 `settings.agent.hiddenModels` / `modelContextWindows`，而 iframe 的 CSP 是 `connect-src 'none'`，够不到宿主 API。`PluginProviderSection` 的注释已说明这点，且它渲染的是与内置**同一个组件树**，所以这部分天然对齐，无需插件侧工作。
+
+### iframe 侧的交互对齐（本轮补齐）
+
+原实现功能点齐全但交互全靠手动触发，与内置的自动行为有落差。已补齐的部分：
+
+| 行为 | 内置做法 | 插件现在 |
+|---|---|---|
+| 登录轮询 | `refetchInterval: 2000`（仅 `pendingAuth` 时） | `SIGN_IN_POLL_MS = 2000`，仅 `signInPending` 时 |
+| 搜索 | `useDebouncedValue(300)` + `>=2` 字符 | `SEARCH_DEBOUNCE_MS = 300` + `MIN_SEARCH_LENGTH = 2` |
+| 余额 | `authenticated` 时自动查 | 每次登录自动查一次 |
+| 授权 URL 复制 | `navigator.clipboard` + 通知 | 复制按钮 + `execCommand` 回退 |
+| 搜索结果标记已启用 | 行高亮 | `· enabled` 后缀 |
+| 结果总数提示 | `+N more` | `N of M shown · refine the query` |
+
+**轮询只在 `signInPending` 期间跑**，因为浏览器回调是唯一由文档外部导致的状态变化，其余转换都跟在点击之后。常开的 2s 轮询会变成无人察觉的常驻流量，这也是 `status` 命令刻意不刷新 token 的原因。
+
+### 补齐过程中发现并修掉的三个真实缺陷
+
+都不是"体验不够好"，是功能坏的：
+
+**1. 授权 URL 一闪即消。** `auth.browser` 成功后 `showAuthorizeUrl()` 把 URL 插进 `signIn` 容器，但 `run()` 紧接着调用 `refresh()` → `renderSignIn()` → `signIn.replaceChildren()`。整个登录流程唯一依赖的那个 URL 在出现几毫秒后被自己的刷新删掉。改为由 `status.authorizeUrl` 渲染，顺带解决了 panel 中途重挂载后 URL 无处可寻（只能等 5 分钟超时）的问题。
+
+**2. 勾选搜索结果不进"已启用"列表。** `modelRow` 的 change 处理器只调 `renderSelectionSummary()`，计数器变了但上方列表不变，页面自我矛盾。
+
+**3. 轮询会放大成上游风暴。** `renderRecommended()` / `renderSearch()` 原本从 `renderModels()` 里调用，而后者每次 refresh 都 `replaceChildren()`。在只有点击才触发 refresh 时这仅仅是浪费；一旦 refresh 上了 2s 定时器，就会**每两秒打一次 `recommended-models` 上游接口**，并且清掉用户正在输入的查询。改为建在独立容器里、只建一次，复选框状态由 `syncModelRowChecks()` 单独同步。
+
+第 3 条是引入轮询**造成**的，不是既有 bug——它说明这类"每次重建整个区域"的渲染结构在加入定时刷新时必须重新审视，而不能假定原样可用。
+
 ## 已验证（自动化）
 
-8 个测试文件，168 项，全部绿：
+8 个测试文件，183 项，全部绿：
 
 | 文件 | 项数 | 覆盖 |
 |---|---|---|
 | `cline-external-history.test.ts` | 31 | 规范格式 → OpenAI messages：文本/图片/工具调用配对/reasoning 丢弃/`"."` 续跑标记/空 assistant 跳过 |
 | `cline-external-event-mapping.test.ts` | 33 | SSE → PluginStreamEvent，**每个事件都对宿主真实 `providerStreamEventSchema` 校验**（`.strict()`，能挡住臆造字段）；跨 chunk 的 JSON 转义、usage-only chunk、finish_reason 各分支、错误分类 |
-| `cline-external-auth.test.ts` | 22 | 回调 URL 解析（含尾部签名）、过期判定、两个 base URL 的区分、EADDRINUSE 识别 |
+| `cline-external-auth.test.ts` | 24 | 回调 URL 解析（含尾部签名）、缺 scheme 的粘贴补全**且只对 loopback 补全**、过期判定、两个 base URL 的区分、EADDRINUSE 识别 |
 | `cline-external-credentials.test.ts` | 22 | 凭据解析、config 注入、刷新的 invalid/failed 语义、refresh token 轮换采纳 |
 | `cline-external-models.test.ts` | 14 | 决策 B：只返回已启用集、不带 `nextCursor`、`buildCatalog` **完全不打网络**、截断阈值与 manifest 一致 |
 | `cline-external-enabled-models.test.ts` | 11 | 决策 A 全链路，全部用宿主真实服务 |
 | `cline-external-commands.e2e.test.ts` | 20 | 真实子进程 + 真实 `PluginHostDispatcher`，命令走 `secrets.get`；`browserAuth` 三态；探测不占用端口 |
-| `cline-external-ui-contract.test.ts` | 15 | 读**构建产物**断言 iframe/后端字段名一致：命令 id、`browserAuth` 三值、无 `browserAuthAvailable`、UI 不含 `secrets.*` |
+| `cline-external-ui-contract.test.ts` | 20 | 读**构建产物**断言 iframe/后端字段名一致：命令 id、`browserAuth` 三值、无 `browserAuthAvailable`、UI 不含 `secrets.*`；另钉住轮询契约（`authorizeUrl`/`signInPending` 双侧存在、定时器与 `pagehide` 清理）与「轮询不放大上游调用」的结构性质 |
 
 `cline-external-ui-contract.test.ts` 是为这类错误专设的：iframe 边界两侧都是 `unknown`，
 字段名错位类型检查抓不到，只会表现为「按钮永远不出现」。
+
+「轮询不放大上游调用」那两项**断言源码而非 bundle**，因为它是渲染函数的结构性质
+（`renderModels` 不得调用 `renderRecommended`/`renderSearch`），打包后没有任何可观测差异。
+已实测该断言在把两个调用挪回 `renderModels` 后确实失败——否则它只是一句看起来在检查什么的空话。
 
 **自动化测试期间发现并修掉的真实缺陷**：manifest 的 `configSchema` 写成了完整 JSON Schema
 文档（带 `type`/`properties` 外层）。`parseManifest` 接受它，但
@@ -148,19 +195,24 @@ present-but-empty 的 hostHints**，缺失是它表达「无代理」的唯一�
 ### 需要手工验证
 
 1. 设置页出现 `Cline (External)` 供应商，badge 为 `plugin`
-2. 「浏览器登录」跳转 Cline 授权页，回调后 iframe 显示登录态；内置 Cline 已占 19876 时
-   显示端口占用提示而非静默失败
-3. 「粘贴回调 URL」路径同样能登录成功
-4. 「余额」返回真实美元数字
-5. 推荐/免费模型列表加载；搜索框能在全量池里搜到模型；选中若干模型保存后
-   `cline-ext:<model>` 出现在模型选择器（这条同时验证决策 A 在真实宿主里闭环）
-6. 完成一次真实对话，含工具调用与多轮
-7. 对话中 token 用量与上下文占用在前端可见
-8. 图片输入可用
-9. 中断对话（interrupt）能正确取消
-10. 重启后凭据与已选模型仍生效
-11. 登出后 provider 显示为未配置，重新登录恢复
-12. 内置 `cline` 供应商行为完全不变
+2. 「浏览器登录」显示授权 URL；**授权 URL 不会一闪即消**，且授权完成后 iframe
+   **在约 2 秒内自动变为登录态，无需手工点任何按钮**（这条覆盖轮询与上面的缺陷 1）；
+   内置 Cline 已占 19876 时显示端口占用提示而非静默失败
+3. 「复制 URL」能复制成功；若沙箱阻止剪贴板，显示「select the URL above instead」而非静默失败
+4. 「粘贴回调 URL」路径同样能登录成功；**粘贴不带 `http://` 的 URL 也能成功**
+5. 登录后余额**自动出现**（不必点按钮），「刷新余额」也能重新拉取
+6. 推荐/免费模型列表加载；**在搜索框输入即自动搜索**（约 300ms 后），
+   已启用的模型在搜索结果里标注 `enabled`；勾选搜索结果后**立刻出现在上方「Enabled」列表**；
+   选中若干模型保存后 `cline-ext:<model>` 出现在模型选择器（这条同时验证决策 A 在真实宿主里闭环）
+7. 长时间停留在待登录状态时，观察不到重复的上游调用（缺陷 3 的回归确认）
+8. 宿主侧（iframe 之外）代理覆盖、模型隐藏、上下文窗口、模型测试均可用
+9. 完成一次真实对话，含工具调用与多轮
+10. 对话中 token 用量与上下文占用在前端可见
+11. 图片输入可用
+12. 中断对话（interrupt）能正确取消
+13. 重启后凭据与已选模型仍生效
+14. 登出后 provider 显示为未配置（**余额随之清空，不残留上一个账号的数字**），重新登录恢复
+15. 内置 `cline` 供应商行为完全不变
 
 ## 已知差距与风险
 
@@ -191,6 +243,35 @@ OpenRouter 也不要求回传。内置实现同样丢弃（`ClineMessage._reason
 **6. 不做 web 搜索贡献。** Cline 没有对应的托管搜索能力，内置也没有 `cline:*` 搜索通道。
 
 **7. 全量模型池只在插件 iframe 内可见**（决策 B 的结果），不进宿主模型选择器。
+
+**8. iframe 内是原生 DOM，没有 Mantine 组件。** 交互行为已对齐（见「UI 对齐」），
+**配色与字体现在跟随宿主**（用 `--nf-*` token，见下），但没有 Mantine 的控件样式、
+通知气泡和 Tooltip：状态反馈走面板底部的单行状态区，而内置用 `notifications.show()` 弹出。
+iframe 是独立 document，复刻一套组件库不在本插件范围内。
+
+**9. 授权 URL 无法自动打开浏览器。** iframe sandbox 未给 `allow-popups`，`window.open` 被阻止。
+内置有「打开」按钮，插件只能显示 URL + 提供复制（复制在剪贴板 API 不可用时回退到
+`execCommand`，失败则提示手动选中）。这是沙箱硬约束，不是实现选择。
+
+## 主题与 i18n：已改为使用宿主平台能力
+
+原先这两项各自是缺口（硬编码 8 个十六进制色值、只有英文），
+现已由宿主的 `--nf-*` token 与 `narrafork.i18n` SDK 提供，见
+`05-ui-bridge-and-dockview.md` §7.5b。本插件侧的落地：
+
+- **配色/字体** 全部改为 `var(--nf-color-*, <原值>)` / `var(--nf-font*, <原值>)`。
+  保留 fallback 是为了让老宿主（不注入 token）仍渲染成原来的样子。
+  切换主题、开 OLED、启用插件主题都会流到面板，**无需本插件任何代码**。
+- **文案** 双语表（`STRINGS`）留在插件里，语言与回退规则交给 `sdk.i18n.t()`。
+  面板订阅 `i18n.onChange` 后重渲染——文本不像 CSS 变量那样能自动跟随。
+- 语言切换时会重建推荐区与搜索区（它们的标签是译文），
+  但**未保存的模型勾选不丢**：`refresh()` 只在已保存列表真的变化时才采纳它。
+
+措辞照抄宿主 `settings` 命名空间，是为了与内置面板对同一个按钮的说法一致；
+这是一次性人工核对，不是运行时依赖宿主翻译键。
+
+`cline-external-ui-contract.test.ts` 断言产物中**不存在 `var()` 之外的裸十六进制色值**，
+以及面板不自行读 `navigator.language`（那是浏览器语言，会覆盖用户在应用内的显式选择）。
 
 ## 构建
 

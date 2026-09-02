@@ -34,7 +34,9 @@ import {
 import {
 	computeDiffCached,
 	diffLineNoWidth as computeDiffLineNoWidth,
+	countDiffLineStats,
 	type DiffLine,
+	type DiffLineStats,
 } from "./diff-core";
 import { hasTruncatedLeaf, readLeafText, stringifyForDisplay } from "./tool-io-projection";
 
@@ -592,6 +594,77 @@ export function countLines(str: string): number {
 
 function asObject(val: unknown): Record<string, unknown> | null {
 	return typeof val === "object" && val !== null ? (val as Record<string, unknown>) : null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `+N -N` line statistics for a file tool's header / folded row.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** File tools whose header can carry a `+N -N` figure. */
+const DIFF_STATS_TOOLS = new Set(["Write", "Edit"]);
+
+/**
+ * Added / removed line counts for a Write or Edit, or undefined when unknown.
+ *
+ * Two sources, in this order:
+ *
+ *  1. `metadata.linesAdded` / `linesRemoved`, written by the TOOL at execution
+ *     time. Authoritative: only the server holds both complete sides.
+ *  2. A local diff of `old_string` vs `new_string` — **Edit only**, and only when
+ *     neither side was truncated.
+ *
+ * ⚠️ A WRITE WITHOUT METADATA RESOLVES TO UNDEFINED, and must. Its input carries
+ * only `content`; the file's previous state is never sent. A local computation
+ * could therefore only ever conclude "every line is new", which would render a
+ * rewrite that changed 3 lines as `+240 -0`. The client also cannot tell whether
+ * that Write created the file or replaced one, so there is no safe reading of the
+ * absence either. Every Write persisted before this feature existed falls here, so
+ * this is the common path, not an edge case.
+ *
+ * Truncated Edit payloads resolve to undefined for the same reason: an 8KB prefix
+ * of a longer string yields a smaller count with nothing marking it as partial.
+ * Showing no figure is recoverable; showing a wrong one is not.
+ */
+export function resolveFileDiffStats(
+	toolName: string,
+	inputJson: unknown,
+	metadata: Record<string, unknown> | null | undefined,
+): DiffLineStats | undefined {
+	if (!DIFF_STATS_TOOLS.has(toolName)) return undefined;
+	const fromMetadata = readLineStatsMetadata(metadata);
+	// `!== undefined`, not a truthy test. A measured `{added: 0, removed: 0}` is a real
+	// answer — the file was rewritten with identical content — and this whole module
+	// rests on absent meaning "unknown" rather than "no change". The truthy form
+	// happens to work because objects are truthy, which makes it correct by accident
+	// in the one place the distinction matters most.
+	if (fromMetadata !== undefined) return fromMetadata;
+	// Local fallback: Edit only (see the warning above).
+	if (toolName !== "Edit") return undefined;
+	const input = asObject(inputJson);
+	if (!input) return undefined;
+	// The overwrite mode (`old_string: ""`) is a whole-file replacement, so it has
+	// the same missing-baseline problem a Write does.
+	if (!("old_string" in input) || !("new_string" in input)) return undefined;
+	if (hasTruncatedLeaf(input.old_string) || hasTruncatedLeaf(input.new_string)) return undefined;
+	const oldStr = readLeafText(input.old_string);
+	const newStr = readLeafText(input.new_string);
+	if (oldStr === undefined || newStr === undefined || oldStr === "") return undefined;
+	return countDiffLineStats(oldStr, newStr) ?? undefined;
+}
+
+/** Read the tool-written `linesAdded` / `linesRemoved` pair, when both are present. */
+function readLineStatsMetadata(
+	metadata: Record<string, unknown> | null | undefined,
+): DiffLineStats | undefined {
+	if (!metadata) return undefined;
+	const added = metadata.linesAdded;
+	const removed = metadata.linesRemoved;
+	// BOTH must be present and finite. A half-written pair would silently read the
+	// missing half as zero, understating one direction of the change.
+	if (typeof added !== "number" || typeof removed !== "number") return undefined;
+	if (!Number.isFinite(added) || !Number.isFinite(removed)) return undefined;
+	if (added < 0 || removed < 0) return undefined;
+	return { added, removed };
 }
 
 /** Best-effort parse of a value that may be a JSON string. */

@@ -66,6 +66,13 @@ export interface VListInteractionState {
 	 * is what gates the on-demand fetch of a truncated prompt.
 	 */
 	promptOpen: ReadonlySet<string>;
+	/**
+	 * Subagent cards whose FILE-CHANGE list the reader expanded.
+	 *
+	 * Separate from `promptOpen` so the two folds stay independent (see
+	 * `toggleVListFileChangesOpen`).
+	 */
+	fileChangesOpen: ReadonlySet<string>;
 }
 
 export function createVListInteractionState(lod: RenderLod): VListInteractionState {
@@ -79,6 +86,7 @@ export function createVListInteractionState(lod: RenderLod): VListInteractionSta
 		showOriginal: new Set(),
 		fullPayloadRequested: new Set(),
 		promptOpen: new Set(),
+		fileChangesOpen: new Set(),
 	};
 }
 
@@ -98,6 +106,8 @@ export function resetVListInteractionStateForLod(
 		// Survives an LOD change for the same reason `expanded` does: the reader
 		// asked to see this prompt, and an LOD step is not a request to re-fold it.
 		promptOpen: state.promptOpen,
+		// Survives an LOD change like every other reader-owned fold state.
+		fileChangesOpen: state.fileChangesOpen,
 	};
 }
 
@@ -189,6 +199,28 @@ export function toggleVListPromptOpen(
 /** True when this subagent card's prompt body is open. */
 export function isPromptOpenRow(state: VListInteractionState, key: string): boolean {
 	return state.promptOpen.has(key);
+}
+
+/**
+ * Expand / collapse a subagent card's FILE-CHANGE list.
+ *
+ * A separate set from `promptOpen`, because the two folds are independent: a reader
+ * who opens the prompt has not asked to see 220 file rows, and sharing one key would
+ * couple them. Height-affecting — the expanded list draws every row.
+ */
+export function toggleVListFileChangesOpen(
+	state: VListInteractionState,
+	key: string,
+): VListInteractionState {
+	const next = new Set(state.fileChangesOpen);
+	if (next.has(key)) next.delete(key);
+	else next.add(key);
+	return { ...state, fileChangesOpen: next };
+}
+
+/** True when this subagent card's file-change list is expanded. */
+export function isFileChangesOpenRow(state: VListInteractionState, key: string): boolean {
+	return state.fileChangesOpen.has(key);
 }
 
 export function toggleVListRow(

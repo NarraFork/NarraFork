@@ -13,6 +13,10 @@ import { narraforkDir } from "../lib/settings";
  * writable, otherwise falls back to `~/.narrafork/conclusions/` so that
  * subagents exploring read-only directories can still write conclusions.
  *
+ * The file is KEPT after the run ends (like plan files): its content is read
+ * once as the subagent's finalText, but the file itself stays on disk because
+ * some workflows rely on the subagent leaving a durable markdown artifact.
+ *
  * Set by narrator-subagent.ts at subagent start, queried by
  * narrator-permission.ts in handlePermission.
  */

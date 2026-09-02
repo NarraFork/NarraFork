@@ -89,6 +89,8 @@ export type RevertWarning =
 			otherActorCount: number;
 			externalCount: number;
 			unserializedCount: number;
+			/** Edits a person made through NarraFork's own editor inside the window. */
+			humanCount: number;
 			sampleFilePaths: string[];
 	  }
 	| {
@@ -849,6 +851,11 @@ export async function buildImpreciseRevertWarnings(
 				otherActorCount: report.otherActorCount,
 				externalCount: report.externalCount,
 				unserializedCount: report.unserializedCount,
+				// Must be threaded through: `hasImprecise` already counts human edits, so
+				// omitting the number here would produce an advisory whose every category is
+				// zero — the renderer names only non-zero parts, so the warning would appear
+				// as an empty sentence and the user would be told nothing at all.
+				humanCount: report.humanCount,
 				sampleFilePaths: report.sampleFilePaths,
 			},
 		];

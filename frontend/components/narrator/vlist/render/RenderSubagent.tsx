@@ -54,6 +54,7 @@ import {
 	CHEVRON_SIZE,
 	DESC_LEFT,
 	DESC_MARGIN_TOP,
+	FILE_CHANGE_ROW_HEIGHT,
 	type MeasuredSubagent,
 	PENDING_CARD_BORDER,
 	PROMPT_BODY_MARGIN_TOP,
@@ -65,9 +66,10 @@ import {
 	RESULT_MD_PADDING_INLINE,
 	SELF_PERMISSION_MARGIN_X,
 	STATUS_ICON_SIZE,
+	type SubagentFileChangesData,
 	THEME_ICON_SIZE,
 } from "../measure/measure-subagent";
-import type { ToolCategory } from "../measure/measure-tool-call";
+import { HEADER_CELL_GAP, type ToolCategory } from "../measure/measure-tool-call";
 // The recent-call rows ARE trace rows, so their lane geometry comes from the trace
 // height model rather than a second set of numbers.
 import { TRACE_CHEVRON, TRACE_ROW_GAP, TRACE_ROW_ICON } from "../measure/measure-tool-run";
@@ -80,6 +82,7 @@ import {
 	type VListViewTarget,
 } from "../vlist-content-view-target";
 import { categoryIcon } from "./category-icons";
+import { DiffStatsText } from "./diff-stats-text";
 import { swallowSelectionClick } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { RenderInlinePermission } from "./RenderPermission";
@@ -110,6 +113,19 @@ export interface SubagentLabels {
 	backgroundBadge?: string;
 	/** "Taken over by user" badge label. */
 	takenOverBadge?: string;
+	/** File-changes section title ("Changed files"). */
+	fileChanges?: string;
+	/** Suffix for a file whose line counts are unknown. */
+	linesNotMeasured?: string;
+	/**
+	 * Marker for a file the parent's revert will NOT restore (the subagent ran with a
+	 * different `workdir`, so the change landed in another worktree).
+	 */
+	outsideWorkspace?: string;
+	/** Overflow row: `{count}` more files. */
+	moreFiles?: string;
+	/** Overflow row: `{count}` files touched by shell commands. */
+	shellTouched?: string;
 	/**
 	 * Timing popover strings for the header + recent-call rows. Absent → the render
 	 * layer's English fallbacks. Height-neutral (portaled popover / fixed rows).
@@ -126,7 +142,42 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing">> = {
 	waitingBadge: "Awaiting permission",
 	backgroundBadge: "Background",
 	takenOverBadge: "Taken over by user",
+	fileChanges: "Changed files",
+	linesNotMeasured: "lines not measured",
+	moreFiles: "{count} more files",
+	shellTouched: "{count} touched by shell",
+	outsideWorkspace: "outside this workspace",
 };
+
+/**
+ * The single trailing row under a file list: hidden files, shell-touched files, and
+ * the unmeasured tally, joined with `·`.
+ *
+ * One row rather than one per fact, because the row is MEASURED — each additional
+ * line would make every such card taller. The tallies must still all appear: a list
+ * that silently omits its unmeasured count reads as complete (see the NULL contract
+ * in `subagent-file-changes.ts`).
+ */
+function overflowSummary(
+	changes: { totalUnmeasured: number; bashTouchedCount: number; countsTruncated: boolean },
+	hidden: number,
+	labels: { moreFiles: string; shellTouched: string },
+): string {
+	// The label may arrive with either interpolation form: i18next writes `{{count}}`,
+	// while this module's own English fallbacks use `{count}`. Substituting both keeps
+	// the row correct whichever bundle supplied it — a missed placeholder would print
+	// the literal braces to the reader.
+	const withCount = (template: string, count: number) =>
+		template.replace("{{count}}", String(count)).replace("{count}", String(count));
+	const parts: string[] = [];
+	if (hidden > 0) parts.push(withCount(labels.moreFiles, hidden));
+	if (changes.bashTouchedCount > 0) {
+		parts.push(withCount(labels.shellTouched, changes.bashTouchedCount));
+	}
+	if (changes.totalUnmeasured > 0) parts.push(`${changes.totalUnmeasured} not measured`);
+	if (changes.countsTruncated) parts.push("counts truncated");
+	return parts.join(" · ");
+}
 
 /**
  * Labels after merging the defaults: every string is present, while `timing` stays
@@ -159,6 +210,13 @@ interface RenderSubagentProps {
 	promptText?: string;
 	/** Recent activity call tool names (≤3 drawn). */
 	recentCallNames?: string[];
+	/**
+	 * Files the child changed, with `+N -N` per path. Absent → no file block.
+	 *
+	 * Passed alongside `measured` rather than read out of it because the measure layer
+	 * keeps only what decides height (the row COUNT); the row contents live here.
+	 */
+	fileChanges?: SubagentFileChangesData;
 	/** Header status: active shows a Loader, else a status glyph (per `status`). */
 	isActive?: boolean;
 	/** Raw terminal status for the glyph (success/fail/cancelled). Render-only. */
@@ -168,6 +226,8 @@ interface RenderSubagentProps {
 	onToggle?: () => void;
 	/** Prompt toggle click. */
 	onTogglePrompt?: () => void;
+	/** Expand/collapse the file-change list (its trailing overflow row). */
+	onToggleFileChanges?: () => void;
 	/** "Open full session" click. */
 	onOpenSession?: () => void;
 	/** Resolve-override click. */
@@ -245,12 +305,22 @@ const RECENT_TITLE_MAX_CHARS = 80;
  *
  * Height-neutral: the result is painted on a single truncating line.
  */
-function recentCallTitle(toolName: string, summary: string | null): string {
+function recentCallTitle(
+	toolName: string,
+	summary: string | null,
+): { name: string; detail: string } {
 	const name = toolName === "Task" ? "Agent" : toolName;
-	const text = summary ? `${name} · ${summary}` : name;
-	return text.length > RECENT_TITLE_MAX_CHARS
-		? `${text.slice(0, RECENT_TITLE_MAX_CHARS - 3)}…`
-		: text;
+	// The name is BOLD and carries no separator (see the trace row, whose wording this
+	// mirrors), but the truncation budget is still the whole visible label — otherwise a
+	// long summary would clip at a different point in the two forms.
+	const text = summary ? `${name} ${summary}` : name;
+	const clipped =
+		text.length > RECENT_TITLE_MAX_CHARS ? `${text.slice(0, RECENT_TITLE_MAX_CHARS - 3)}…` : text;
+	// Split the (possibly clipped) label back into its bold head and the rest. A clip that
+	// ate into the name itself leaves no detail, which is correct: there is nothing left of
+	// the summary to show.
+	if (!clipped.startsWith(name)) return { name: clipped, detail: "" };
+	return { name, detail: clipped.slice(name.length).trimStart() };
 }
 
 /**
@@ -379,11 +449,13 @@ function SubagentInner({
 	resultPreview,
 	promptText,
 	recentCallNames = [],
+	fileChanges,
 	isActive,
 	status,
 	labels,
 	onToggle,
 	onTogglePrompt,
+	onToggleFileChanges,
 	onOpenSession,
 	onResolveOverride,
 	viewTargets,
@@ -583,7 +655,23 @@ function SubagentInner({
 									truncate
 									style={{ flex: "0 1 auto", minWidth: 0 }}
 								>
-									{recentCallTitle(name, measured.recentCallSummaries[i] ?? null)}
+									{(() => {
+										const label = recentCallTitle(name, measured.recentCallSummaries[i] ?? null);
+										return (
+											<>
+												{/* Flat gap, not a space character — see the trace row's TraceRowTitle. */}
+												<span
+													style={{
+														fontWeight: 600,
+														...(label.detail ? { marginRight: HEADER_CELL_GAP } : {}),
+													}}
+												>
+													{label.name}
+												</span>
+												{label.detail || null}
+											</>
+										);
+									})()}
 								</Text>
 								{/* Only DEVIATION is marked (in flight / failed / cancelled); a
 								    successful call draws nothing, so the slot is absent rather than
@@ -626,7 +714,9 @@ function SubagentInner({
 					measured={measured}
 					labels={labels}
 					promptText={promptText}
+					fileChanges={fileChanges}
 					onTogglePrompt={onTogglePrompt}
+					onToggleFileChanges={onToggleFileChanges}
 					onResolveOverride={onResolveOverride}
 					viewTargets={viewTargets}
 					viewControls={viewControls}
@@ -667,7 +757,9 @@ function SubagentBody({
 	measured,
 	labels,
 	promptText,
+	fileChanges,
 	onTogglePrompt,
+	onToggleFileChanges,
 	onResolveOverride,
 	viewTargets,
 	viewControls,
@@ -675,7 +767,9 @@ function SubagentBody({
 	measured: MeasuredSubagent;
 	labels: ResolvedSubagentLabels;
 	promptText?: string;
+	fileChanges?: SubagentFileChangesData;
 	onTogglePrompt?: () => void;
+	onToggleFileChanges?: () => void;
 	onResolveOverride?: () => void;
 	/** The card's viewer bodies (prompt / result) + the shell's view controls. */
 	viewTargets?: readonly VListViewTarget[];
@@ -841,6 +935,98 @@ function SubagentBody({
 			</div>,
 		);
 		top += measured.resolveOverrideHeight;
+	}
+
+	// File changes: what the child wrote to disk. Rows reuse the recent-call geometry
+	// (one truncating xs mono line each), so the measured height is row count × line.
+	if (measured.fileChangesHeight > 0 && fileChanges) {
+		const rows = fileChanges.files.slice(0, measured.fileChangeRowCount);
+		const hidden = fileChanges.totalFiles - rows.length;
+		parts.push(
+			<div
+				key="file-changes"
+				style={{
+					position: "absolute",
+					top,
+					left: 0,
+					right: 0,
+					height: measured.fileChangesHeight,
+					paddingLeft: BLOCK_PADDING_X,
+					paddingRight: BLOCK_PADDING_X,
+					paddingBottom: BLOCK_PADDING_X,
+					boxSizing: "border-box",
+				}}
+			>
+				<Text size="xs" c="dimmed" fw={500} style={{ height: FILE_CHANGE_ROW_HEIGHT }}>
+					{labels.fileChanges ?? "Changed files"} · {fileChanges.totalFiles}
+				</Text>
+				{rows.map((file) => (
+					<Group
+						key={file.filePath}
+						gap={6}
+						wrap="nowrap"
+						style={{ height: FILE_CHANGE_ROW_HEIGHT }}
+					>
+						<Text
+							size="xs"
+							c="dimmed"
+							truncate
+							ff="monospace"
+							style={{ flex: "0 1 auto", minWidth: 0 }}
+							title={file.filePath}
+						>
+							{file.filePath}
+						</Text>
+						{/* Same green/red plain text the tool cards use, so one file reads
+						    identically wherever it appears. */}
+						<DiffStatsText
+							stats={
+								file.linesAdded === null || file.linesRemoved === null
+									? null
+									: { added: file.linesAdded, removed: file.linesRemoved }
+							}
+						/>
+						{/* The churn qualifier: without it `+42 -3` reads as "this file is now
+						    42 lines longer", which these figures do not measure. */}
+						{file.editCount > 1 ? (
+							<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+								· {file.editCount} edits
+							</Text>
+						) : null}
+						{file.linesAdded === null ? (
+							<Text size="xs" c="dimmed" style={{ flexShrink: 0, opacity: 0.7 }}>
+								{labels.linesNotMeasured ?? "lines not measured"}
+							</Text>
+						) : null}
+						{/* A revert restores only this workspace, so a change made elsewhere
+						    survives it. The injected text warns the model about exactly these
+						    files; without the marker the card contradicted it, and the card is
+						    what the reader sees. Height-neutral: the row is a fixed
+						    FILE_CHANGE_ROW_HEIGHT with `wrap="nowrap"`, so this cannot alter
+						    what the measure layer reserved. */}
+						{file.outsideParentWorkspace ? (
+							<Text size="xs" c="yellow" style={{ flexShrink: 0 }} title={file.filePath}>
+								· {labels.outsideWorkspace ?? "outside this workspace"}
+							</Text>
+						) : null}
+					</Group>
+				))}
+				{measured.hasFileChangeOverflowRow ? (
+					<UnstyledButton
+						onClick={(e: React.MouseEvent) => {
+							e.stopPropagation();
+							onToggleFileChanges?.();
+						}}
+						style={{ height: FILE_CHANGE_ROW_HEIGHT, display: "block", width: "100%" }}
+					>
+						<Text size="xs" c="dimmed" truncate>
+							{overflowSummary(fileChanges, hidden, labels)}
+						</Text>
+					</UnstyledButton>
+				) : null}
+			</div>,
+		);
+		top += measured.fileChangesHeight;
 	}
 
 	// resultText (ContentViewer maxHeight:300 markdown).

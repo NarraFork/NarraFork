@@ -1090,6 +1090,23 @@ export const miscApi = {
 		 * save. Always pass through what the load returned.
 		 */
 		encoding?: string;
+		/**
+		 * Acknowledge a target outside the narrator's workspace and every declared
+		 * writable directory.
+		 *
+		 * Only meaningful after the server refused once with 409 `NEEDS_CONFIRMATION`
+		 * and named the resolved physical path — sending it upfront would be consent to
+		 * a destination nobody has seen. Never overrides a credential-path, git-directory
+		 * or symlink-escape refusal.
+		 */
+		confirmOutsideRoots?: boolean;
+		/**
+		 * Tell the narrator that a person edited this file.
+		 *
+		 * Without it the agent's next turn reads a file it believes it last wrote, and
+		 * the watcher classifies the save as an anonymous `external` change.
+		 */
+		notifyAgent?: boolean;
 	}) =>
 		request<{
 			ok: true;
@@ -1097,6 +1114,8 @@ export const miscApi = {
 			hash: string;
 			bytesWritten: number;
 			encoding: string;
+			/** How the notification reached the narrator, when `notifyAgent` was set. */
+			notified?: "interjected" | "queued";
 		}>("/fs/write", {
 			method: "POST",
 			body: JSON.stringify(input),

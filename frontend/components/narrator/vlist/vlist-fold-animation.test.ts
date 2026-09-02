@@ -6,6 +6,8 @@ import {
 	isFoldCaptureUsable,
 	planFoldFrameMotion,
 	planFoldMotion,
+	planFoldNestedRowMotion,
+	planFoldNestedRowResize,
 	visualShift,
 } from "./vlist-fold-animation";
 
@@ -56,9 +58,19 @@ describe("planFoldMotion", () => {
 		expect(byKey.get("c")).toEqual({ key: "c", kind: "shift", fromOffset: -200 });
 	});
 
-	it("collapses by sliding the rows below up, with no reveal on the card", () => {
-		// The expanded body is already unmounted when this plan runs, so there is
-		// nothing left to clip away — the closing gap IS the animation.
+	/**
+	 * THE CLICK-TIME TRUNCATION BUG.
+	 *
+	 * A non-dynamic row's content box is painted at `height: <committed>` with
+	 * `overflow: hidden`. When a fold shrinks the element, React commits the short height
+	 * in the very first frame, so the box crops everything past its new bottom edge to
+	 * blank AT THE MOMENT OF THE CLICK — the reader then watches it reappear as the rows
+	 * below slide up. Nothing done to those rows can fix it, because the clip is above
+	 * them.
+	 *
+	 * So a shrinking element animates its own height, and the crop advances gradually.
+	 */
+	it("animates the shrinking element's own height, not just the rows below", () => {
 		const before = geometry([
 			["card", 0, 240],
 			["b", 244, 60],
@@ -68,18 +80,45 @@ describe("planFoldMotion", () => {
 			["b", 44, 60],
 		]);
 		const motions = planFoldMotion({ ...still(before, after), toggledKey: "card" });
-		const byKey = new Map(motions.map((m) => [m.key, m]));
-		expect(byKey.has("card")).toBe(false);
-		expect(byKey.get("b")).toEqual({ key: "b", kind: "shift", fromOffset: 200 });
+		expect(motions).toEqual([
+			{ key: "card", kind: "resize", fromHeight: 240, toHeight: 40 },
+			{ key: "b", kind: "shift", fromOffset: 200 },
+		]);
+	});
+
+	/**
+	 * REGRESSION: a collapse must not FADE the toggled row.
+	 *
+	 * A cross-fade masks a component SWAP (§4.7). Collapsing a card swaps nothing — the
+	 * header is the same component, in the same place, with the same content on both
+	 * sides of the toggle; only the body below it unmounts. A fade therefore made the one
+	 * part that never changed blink, once per collapse. The height animation is the
+	 * correct treatment; opacity is not involved either way.
+	 */
+	it("uses a height resize rather than any opacity motion when collapsing", () => {
+		const before = geometry([["card", 0, 240]]);
+		const after = geometry([["card", 0, 40]]);
+		const motions = planFoldMotion({ ...still(before, after), toggledKey: "card" });
+		expect(motions).toEqual([{ key: "card", kind: "resize", fromHeight: 240, toHeight: 40 }]);
+		// Growing stays a reveal; the two directions never both apply.
+		const grow = planFoldMotion({
+			...still(geometry([["card", 0, 40]]), geometry([["card", 0, 240]])),
+			toggledKey: "card",
+		});
+		expect(grow.map((m) => m.kind)).toEqual(["reveal"]);
 	});
 
 	it("slides the toggled row itself when a fold above it moved it on screen", () => {
-		// It shrank (no reveal) AND moved: it must still travel with its neighbours
-		// rather than being the one row that teleports.
+		// It shrank AND moved: it must travel with its neighbours rather than being the one
+		// row that teleports, while its own box closes. The two compose — `height` on the
+		// inner content box, `transform` on the outer row box.
 		const before = geometry([["card", 300, 240]]);
 		const after = geometry([["card", 100, 40]]);
 		const motions = planFoldMotion({ ...still(before, after), toggledKey: "card" });
-		expect(motions).toEqual([{ key: "card", kind: "shift", fromOffset: 200 }]);
+		expect(motions).toEqual([
+			{ key: "card", kind: "resize", fromHeight: 240, toHeight: 40 },
+			{ key: "card", kind: "shift", fromOffset: 200 },
+		]);
 	});
 
 	it("gives the toggled row BOTH a reveal and a shift when expanding at the bottom", () => {
@@ -207,7 +246,9 @@ describe("planFoldMotion", () => {
 		]);
 		const after = geometry([["card", 0, 40]]);
 		const motions = planFoldMotion({ ...still(before, after), toggledKey: "card" });
-		expect(motions).toEqual([]);
+		// `gone` has no counterpart, so it contributes nothing; the toggled card still
+		// closes its own box.
+		expect(motions).toEqual([{ key: "card", kind: "resize", fromHeight: 240, toHeight: 40 }]);
 	});
 
 	it("skips a toggled row whose own height did not change", () => {
@@ -249,6 +290,263 @@ describe("planFoldMotion", () => {
 			["b", 104, 60],
 		]);
 		expect(planFoldMotion({ ...still(before, after), toggledKey: "a" })).toEqual([]);
+	});
+});
+
+/**
+ * Rows nested inside a trace element (L1/L2 activity runs).
+ *
+ * At L1/L2 a whole run is ONE list item whose tool rows are absolutely positioned
+ * blocks inside it, so drilling one open moves its siblings without moving any
+ * top-level item. Measured on a 3-row activity trace at 860px: drilling the middle row
+ * grows the element 81.2 → 103.4px and moves the row below it from top 60.4 → 82.6px.
+ * The top-level plan animates the element and cannot express the sibling, which is why
+ * those rows teleported while everything below the run slid correctly.
+ */
+describe("planFoldNestedRowMotion", () => {
+	/** Rows are `[key, top]`; each is a plain 18.8px summary block unless stated. */
+	function nested(
+		entries: Array<[string, Array<[string, number] | [string, number, number]>]>,
+	): Map<string, { rows: Map<string, { top: number; height: number }> }> {
+		return new Map(
+			entries.map(([key, rows]) => [
+				key,
+				{
+					rows: new Map(
+						rows.map((r) => [r[0], { top: r[1], height: r.length > 2 ? (r[2] as number) : 18.8 }]),
+					),
+				},
+			]),
+		);
+	}
+
+	it("shifts the rows below a drilled row, using the measured local tops", () => {
+		// The real numbers from the probe above.
+		const before = nested([
+			[
+				"act1",
+				[
+					["r0", 22.8],
+					["r1", 41.6],
+					["r2", 60.4],
+				],
+			],
+		]);
+		const after = nested([
+			[
+				"act1",
+				[
+					["r0", 22.8],
+					["r1", 41.6],
+					["r2", 82.6],
+				],
+			],
+		]);
+		const motions = planFoldNestedRowMotion({ before, after });
+		expect(motions).toEqual([{ traceKey: "act1", rowKey: "r2", fromOffset: 60.4 - 82.6 }]);
+	});
+
+	it("uses LOCAL offsets, so a row carried by its own moving run animates once", () => {
+		// The trace element's displacement is already carried by its element `shift`.
+		// Local tops are unchanged here, so this plan must contribute nothing —
+		// otherwise the rows inside a run that merely moved would animate twice.
+		const rows: Array<[string, Array<[string, number]>]> = [
+			[
+				"act1",
+				[
+					["r0", 22.8],
+					["r1", 41.6],
+				],
+			],
+		];
+		expect(planFoldNestedRowMotion({ before: nested(rows), after: nested(rows) })).toEqual([]);
+	});
+
+	it("ignores a trace present in only one snapshot", () => {
+		// The run itself appeared or vanished; its rows have no previous screen position.
+		const before = nested([["act1", [["r0", 22.8]]]]);
+		const after = nested([["act2", [["r0", 40]]]]);
+		expect(planFoldNestedRowMotion({ before, after })).toEqual([]);
+	});
+
+	it("ignores a row present in only one snapshot", () => {
+		const before = nested([["act1", [["r0", 22.8]]]]);
+		const after = nested([
+			[
+				"act1",
+				[
+					["r0", 22.8],
+					["r1", 41.6],
+				],
+			],
+		]);
+		expect(planFoldNestedRowMotion({ before, after })).toEqual([]);
+	});
+
+	it("drops a displacement too large to read, like every other motion", () => {
+		const before = nested([["act1", [["r0", 0]]]]);
+		const after = nested([["act1", [["r0", FOLD_MAX_SHIFT_PX + 500]]]]);
+		expect(planFoldNestedRowMotion({ before, after })).toEqual([]);
+	});
+
+	/**
+	 * REGRESSION: un-drill must move the whole group, with no per-row clip verdict.
+	 *
+	 * An earlier version rejected a row whose start box fell outside the trace's committed
+	 * (post-fold) height, by analogy with the L3→L2 LOD morph. That tore the group apart:
+	 * with a second card still drilled below the one being closed, the drilled card
+	 * animated while the plain row under it snapped to its final offset, so the two
+	 * OVERLAPPED for the duration.
+	 *
+	 * These are the real measured numbers for that case (4-row trace at 860px, rows 0 and
+	 * 2 drilled, row 0 then closed): the box shrinks 144.4 → 122.2 and every row below
+	 * moves by the same 22.2px. All of them must animate.
+	 */
+	it("moves every row below the closed one together, including past the new bottom edge", () => {
+		const before = nested([
+			[
+				"act1",
+				[
+					["row-0", 22.8],
+					["row-1", 63.8],
+					["row-2", 82.6],
+					["row-3", 123.6],
+				],
+			],
+		]);
+		const after = nested([
+			[
+				"act1",
+				[
+					["row-0", 22.8],
+					["row-1", 41.6],
+					["row-2", 60.4],
+					["row-3", 101.4],
+				],
+			],
+		]);
+		const motions = planFoldNestedRowMotion({ before, after });
+		// row-0 held still; every row below the closed one is present. `row-3` is the one
+		// the old clip gate rejected (its start box began past the new bottom edge), which
+		// is what left it jumping while `row-2` glided.
+		expect(motions.map((m) => m.rowKey)).toEqual(["row-1", "row-2", "row-3"]);
+		// The point of the group rule: ONE uniform displacement, no row left behind.
+		// Compared at 0.1px (the offsets are float sums of 18.8px row heights).
+		const offsets = motions.map((m) => Math.round(m.fromOffset * 10) / 10);
+		expect(offsets).toEqual([22.2, 22.2, 22.2]);
+	});
+
+	/**
+	 * THE GLUE INVARIANT: the rows below travel by exactly the height the block above
+	 * them gave up.
+	 *
+	 * This is what makes the transition read as one movement. If the block's height were
+	 * not animated (React commits the short value in frame one), the card would vanish
+	 * instantly and these rows would slide up from outside the already-shortened box —
+	 * "emerging from a clip line and never catching up".
+	 *
+	 * Real measured numbers: 4-row trace at 860px, rows 0 and 2 drilled, row 0 closed.
+	 * Block 0 shrinks 41.0 → 18.8 (−22.2) and every row below moves 22.2.
+	 */
+	it("moves the rows below by exactly the height the shrinking block gave up", () => {
+		const before = nested([
+			[
+				"act1",
+				[
+					["row-0", 22.8, 41.0],
+					["row-1", 63.8],
+					["row-2", 82.6, 41.0],
+					["row-3", 123.6],
+				],
+			],
+		]);
+		const after = nested([
+			[
+				"act1",
+				[
+					["row-0", 22.8, 18.8],
+					["row-1", 41.6],
+					["row-2", 60.4, 41.0],
+					["row-3", 101.4],
+				],
+			],
+		]);
+		const resizes = planFoldNestedRowResize({ before, after });
+		const shifts = planFoldNestedRowMotion({ before, after });
+		// Only the closed row's block resizes; the still-drilled one keeps its height.
+		expect(resizes).toEqual([
+			{ traceKey: "act1", rowKey: "row-0", fromHeight: 41.0, toHeight: 18.8 },
+		]);
+		const lost = resizes.reduce((a, r) => a + (r.fromHeight - r.toHeight), 0);
+		for (const shift of shifts) {
+			expect(Math.round(shift.fromOffset * 10)).toBe(Math.round(lost * 10));
+		}
+		expect(shifts.length).toBe(3);
+	});
+
+	it("disqualifies the WHOLE trace when any one row moved too far to read", () => {
+		// Internal consistency either way: a group that cannot animate uniformly appears
+		// at its committed offsets rather than half-animating.
+		const before = nested([
+			[
+				"act1",
+				[
+					["r0", 0],
+					["r1", 100],
+				],
+			],
+		]);
+		const after = nested([
+			[
+				"act1",
+				[
+					["r0", 20],
+					["r1", 100 + FOLD_MAX_SHIFT_PX + 500],
+				],
+			],
+		]);
+		expect(planFoldNestedRowMotion({ before, after })).toEqual([]);
+	});
+
+	it("does not let a sub-pixel row disqualify its group", () => {
+		// It simply did not move; the rows that did must still animate.
+		const before = nested([
+			[
+				"act1",
+				[
+					["r0", 22.8],
+					["r1", 41.6],
+				],
+			],
+		]);
+		const after = nested([
+			[
+				"act1",
+				[
+					["r0", 22.8000001],
+					["r1", 60.4],
+				],
+			],
+		]);
+		expect(planFoldNestedRowMotion({ before, after })).toEqual([
+			{ traceKey: "act1", rowKey: "r1", fromOffset: 41.6 - 60.4 },
+		]);
+	});
+
+	it("plans every trace independently (stacked runs in one window)", () => {
+		const before = nested([
+			["act1", [["r1", 40]]],
+			["act2", [["r1", 40]]],
+		]);
+		const after = nested([
+			["act1", [["r1", 60]]],
+			["act2", [["r1", 90]]],
+		]);
+		const motions = planFoldNestedRowMotion({ before, after });
+		expect(motions).toEqual([
+			{ traceKey: "act1", rowKey: "r1", fromOffset: -20 },
+			{ traceKey: "act2", rowKey: "r1", fromOffset: -50 },
+		]);
 	});
 });
 

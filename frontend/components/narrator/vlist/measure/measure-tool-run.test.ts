@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import type { PreparedFixedBlock } from "../prepared-block";
 import type { MeasuredSubagent } from "./measure-subagent";
 import type { MeasuredToolCall } from "./measure-tool-call";
 import { installCanvasStub } from "./test-canvas-stub";
@@ -191,15 +192,22 @@ describe("measureReasoningCountLine (L1/L2) — single fixed row", () => {
 });
 
 describe("measureActivityTrace (L1/L2)", () => {
-	it("L2 (default) → header + min(N,10) rows", async () => {
-		const { measureActivityTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
+	it("L2 (default) → min(N,10) rows and NO header band", async () => {
+		// The band is dropped once the rows are on screen: "Activity · 0 reasoning · 4
+		// tools" above four rows that each name their own tool is a fixed per-turn cost
+		// buying nothing. Only the outer padding remains above the first row.
+		const { measureActivityTrace, TRACE_OUTER_PADDING_Y, TRACE_ROW_HEIGHT } = await import(
 			"./measure-tool-run"
 		);
 		const r = measureActivityTrace(toolRows(4), 600);
 		expect(r.variant).toBe("activity");
 		expect(r.collapsedToHeader).toBe(false);
 		expect(r.rows).toHaveLength(4);
-		expect(r.height).toBeCloseTo(TRACE_HEADER_BAND_HEIGHT + 4 * TRACE_ROW_HEIGHT, 5);
+		expect(r.header.visible).toBe(false);
+		expect(r.header.height).toBe(0);
+		expect(r.height).toBeCloseTo(TRACE_OUTER_PADDING_Y * 2 + 4 * TRACE_ROW_HEIGHT, 5);
+		// The first row starts right after the outer top padding — nothing above it.
+		expect(r.rows[0]?.top).toBeCloseTo(TRACE_OUTER_PADDING_Y, 5);
 	});
 
 	it("L1 (collapsed) → header band only (≈24.8)", async () => {
@@ -207,8 +215,24 @@ describe("measureActivityTrace (L1/L2)", () => {
 		const r = measureActivityTrace(toolRows(9), 600, { collapsed: true });
 		expect(r.collapsedToHeader).toBe(true);
 		expect(r.rows).toHaveLength(0);
+		// The band survives here because it IS the fold toggle: without it the whole
+		// run sits behind nothing clickable.
+		expect(r.header.visible).toBe(true);
 		expect(r.header.hasChevron).toBe(true);
 		expect(r.height).toBeCloseTo(TRACE_HEADER_BAND_HEIGHT, 5);
+	});
+
+	it("keeps the band once a collapsed fold is OPENED (its only way back)", async () => {
+		// `collapseItems && itemsOpened` is the reader's own expansion of an L1 fold.
+		// Dropping the band there would remove the control they just used, so it stays —
+		// unlike the L2 default, which never had a fold to begin with.
+		const { measureActivityTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
+			"./measure-tool-run"
+		);
+		const r = measureActivityTrace(toolRows(3), 600, { collapsed: true, itemsOpened: true });
+		expect(r.header.visible).toBe(true);
+		expect(r.header.opened).toBe(true);
+		expect(r.height).toBeCloseTo(TRACE_HEADER_BAND_HEIGHT + 3 * TRACE_ROW_HEIGHT, 5);
 	});
 
 	it("caps at 10 visible rows with a toggle when N>10", async () => {
@@ -216,6 +240,59 @@ describe("measureActivityTrace (L1/L2)", () => {
 		const r = measureActivityTrace(toolRows(14), 600);
 		expect(r.rows).toHaveLength(10);
 		expect(r.toggle?.hiddenCount).toBe(4);
+	});
+
+	it("the 'show earlier' toggle sits at the top when there is no band", async () => {
+		// The toggle row follows the header block in the stack, so a zero-height band
+		// must leave it at the outer padding rather than 20.8px down (which would open
+		// a gap the trace's own height never accounted for).
+		const { measureActivityTrace, TRACE_OUTER_PADDING_Y, TRACE_ROW_HEIGHT } = await import(
+			"./measure-tool-run"
+		);
+		const r = measureActivityTrace(toolRows(14), 600);
+		expect(r.toggle?.top).toBeCloseTo(TRACE_OUTER_PADDING_Y, 5);
+		expect(r.height).toBeCloseTo(TRACE_OUTER_PADDING_Y * 2 + 11 * TRACE_ROW_HEIGHT, 5);
+	});
+});
+
+/**
+ * The band is dropped for exactly one shape — an activity fold showing its rows —
+ * and that scoping is the whole safety argument. `reasoning-steps` keeps it because
+ * "Reasoning · 5 steps" is the only thing identifying that list, and a collapsed
+ * activity fold keeps it because it is the fold's only control.
+ */
+describe("header band visibility is scoped to the activity fold", () => {
+	it("reasoning-steps always keeps its labelled band", async () => {
+		const { measureReasoningStepsTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
+			"./measure-tool-run"
+		);
+		const r = measureReasoningStepsTrace(stepRows(3), 600);
+		expect(r.header.visible).toBe(true);
+		expect(r.height).toBeCloseTo(TRACE_HEADER_BAND_HEIGHT + 3 * TRACE_ROW_HEIGHT, 5);
+	});
+
+	it("the generic collapsible variant keeps its band too", async () => {
+		const { measureCollapsibleTrace, TRACE_HEADER_BAND_HEIGHT, TRACE_ROW_HEIGHT } = await import(
+			"./measure-tool-run"
+		);
+		const r = measureCollapsibleTrace({ items: toolRows(2), maxVisible: 10 }, 600);
+		expect(r.header.visible).toBe(true);
+		expect(r.height).toBeCloseTo(TRACE_HEADER_BAND_HEIGHT + 2 * TRACE_ROW_HEIGHT, 5);
+	});
+
+	it("a hidden band is a zero-height block, still the FIRST block in the stack", async () => {
+		// Kept in the stack rather than removed: it owns the outer top padding, and
+		// `frame.blocks[0]` is read directly as the header.
+		const { measureActivityTrace, TRACE_OUTER_PADDING_Y } = await import("./measure-tool-run");
+		const r = measureActivityTrace(toolRows(2), 600);
+		const first = r.blocks[0];
+		expect(first?.kind).toBe("fixed");
+		const headerBlock = first as PreparedFixedBlock | undefined;
+		expect(headerBlock?.tag).toBe("trace-header");
+		expect(headerBlock?.height).toBe(0);
+		expect(r.header.top).toBeCloseTo(TRACE_OUTER_PADDING_Y, 5);
+		// header + 2 rows + pad, exactly as before — no block was dropped.
+		expect(r.blocks).toHaveLength(4);
 	});
 });
 
@@ -493,6 +570,42 @@ describe("row status + timing are height-neutral", () => {
 		expect(withGate.rows[0]?.reflectionStatus).toBe("running");
 		const without = measureCollapsibleTrace({ items: [base], maxVisible: 10 }, 512);
 		expect(without.rows[0]?.reflectionStatus).toBeUndefined();
+	});
+
+	it("a row's `+N -N` line counts are height-neutral", async () => {
+		// `diffStats` is a pure renderer passthrough in the same lane as `status` and
+		// `timing`: one nowrap span inside the row's fixed 18.8px line. If it ever
+		// reached the height math, every Write/Edit row in a fold would be a different
+		// height from its neighbours.
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const base = toolRows(1)[0];
+		const heights = new Set<number>();
+		for (const diffStats of [
+			null,
+			{ added: 0, removed: 0 },
+			{ added: 1, removed: 1 },
+			// A four-digit pair is the widest realistic figure; it must not wrap the row.
+			{ added: 4820, removed: 3910 },
+		]) {
+			const r = measureCollapsibleTrace({ items: [{ ...base, diffStats }], maxVisible: 10 }, 512);
+			heights.add(r.height);
+			expect(r.rows[0]?.blockHeight).toBeCloseTo(18.8, 5);
+		}
+		expect(heights.size).toBe(1);
+	});
+
+	it("passes `+N -N` through to the measured row, defaulting to null", async () => {
+		// The renderer reads this off the measured payload, so it has to arrive intact.
+		// Null (not `{0,0}`) is the "unknown" encoding — see `resolveFileDiffStats`.
+		const { measureCollapsibleTrace } = await import("./measure-tool-run");
+		const base = toolRows(1)[0];
+		const withStats = measureCollapsibleTrace(
+			{ items: [{ ...base, diffStats: { added: 12, removed: 3 } }], maxVisible: 10 },
+			512,
+		);
+		expect(withStats.rows[0]?.diffStats).toEqual({ added: 12, removed: 3 });
+		const without = measureCollapsibleTrace({ items: [base], maxVisible: 10 }, 512);
+		expect(without.rows[0]?.diffStats).toBeNull();
 	});
 
 	it("the five-state SHIMMER cannot move the row either", async () => {

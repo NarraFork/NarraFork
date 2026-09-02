@@ -50,11 +50,29 @@ export function CodexQuotaOverview({
 }) {
 	const { t } = useTranslation("settings");
 	const displayTierOrder = getCodexDisplayTierOrder(tierOrder);
-	const [selectedTierValues, setSelectedTierValues] = useState<string[]>(displayTierOrder);
-	const selectedTiers = displayTierOrder.filter((tier) => selectedTierValues.includes(tier));
 	const summaryByTier = (summary.byTier ?? {}) as Partial<
 		Record<CodexPlanTier, CodexUsageTierStats>
 	>;
+	const tiersWithAccounts = displayTierOrder.filter(
+		(tier) => (summaryByTier[tier]?.accountCount ?? 0) > 0,
+	);
+	/**
+	 * `null` means "the user has not touched the filter", in which case the
+	 * selection follows the tiers that actually have accounts. A tier with zero
+	 * accounts only renders a card full of "unknown", so defaulting to every tier
+	 * spends a screenful of space saying nothing.
+	 *
+	 * Following the data until the first interaction also means a tier that gains
+	 * its first account shows up on its own; hard-coding the default at mount
+	 * would hide it until the panel remounted.
+	 */
+	const [userSelectedTiers, setUserSelectedTiers] = useState<string[] | null>(null);
+	const selectedTierValues = userSelectedTiers ?? tiersWithAccounts;
+	const selectedTiers = displayTierOrder.filter((tier) => selectedTierValues.includes(tier));
+	const emptySelectionMessage =
+		tiersWithAccounts.length === 0
+			? t("codexQuotaNoTierWithAccounts")
+			: t("codexQuotaNoTierSelected");
 	const hasSummaryCoverage =
 		summary.totalModeledUsageAccounts !== undefined &&
 		summary.totalUnmodeledUsageAccounts !== undefined;
@@ -98,7 +116,7 @@ export function CodexQuotaOverview({
 					<Text size="xs" c="dimmed">
 						{t("codexQuotaVisibleTiers")}
 					</Text>
-					<Checkbox.Group value={selectedTierValues} onChange={setSelectedTierValues}>
+					<Checkbox.Group value={selectedTierValues} onChange={setUserSelectedTiers}>
 						<Group gap="xs" wrap="wrap">
 							{displayTierOrder.map((tier) => (
 								<Checkbox
@@ -116,7 +134,7 @@ export function CodexQuotaOverview({
 				{selectedTiers.length === 0 ? (
 					<Paper withBorder p="sm">
 						<Text size="xs" c="dimmed" ta="center">
-							{t("codexQuotaNoTierSelected")}
+							{emptySelectionMessage}
 						</Text>
 					</Paper>
 				) : (
@@ -218,7 +236,11 @@ export function CodexQuotaOverview({
 							{t("codexQuotaTrendUnit")}
 						</Text>
 					</Group>
-					<CodexQuotaTrendChart trend={trend} selectedTiers={selectedTiers} />
+					<CodexQuotaTrendChart
+						trend={trend}
+						selectedTiers={selectedTiers}
+						emptySelectionMessage={emptySelectionMessage}
+					/>
 				</Stack>
 			</Stack>
 		</Paper>

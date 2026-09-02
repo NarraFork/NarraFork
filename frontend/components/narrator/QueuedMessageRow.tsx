@@ -57,8 +57,11 @@ import {
 import {
 	buildQueuedEditPayload,
 	canSubmitQueuedEdit,
+	MAX_QUEUED_IMAGES,
+	MAX_QUEUED_TEXT_FILES,
 	type QueuedEditPayload,
-	remainingAttachmentRoom,
+	remainingImageRoom,
+	remainingTextFileRoom,
 	seedQueuedEditAttachments,
 } from "./queued-attachment-edit";
 
@@ -206,9 +209,12 @@ export function QueuedMessageRow({
 				}
 			}
 			setNewImages((prev) => {
-				const room = remainingAttachmentRoom(keptImageCountRef.current, prev.length);
+				const room = remainingImageRoom(keptImageCountRef.current, prev.length);
 				if (processed.length > room) {
-					notifications.show({ color: "yellow", message: t("editTooManyImages") });
+					notifications.show({
+						color: "yellow",
+						message: t("editTooManyImages", { max: MAX_QUEUED_IMAGES }),
+					});
 				}
 				return [...prev, ...processed.slice(0, room)];
 			});
@@ -240,9 +246,12 @@ export function QueuedMessageRow({
 			}
 			if (valid.length === 0) return;
 			setNewTextFiles((prev) => {
-				const room = remainingAttachmentRoom(keptTextFiles.length, prev.length);
+				const room = remainingTextFileRoom(keptTextFiles.length, prev.length);
 				if (valid.length > room) {
-					notifications.show({ color: "yellow", message: t("editTooManyFiles") });
+					notifications.show({
+						color: "yellow",
+						message: t("editTooManyFiles", { max: MAX_QUEUED_TEXT_FILES }),
+					});
 				}
 				return [...prev, ...valid.slice(0, room)];
 			});

@@ -27,6 +27,7 @@ import {
 	resolveDirectoryDropTarget,
 	sameRecentTabOrder,
 } from "@frontend/hooks/recent-tab-directory-groups";
+import { isLoopbackBrowserOrigin } from "@frontend/lib/local-origin";
 import {
 	getEffectiveNarratorDisplay,
 	type StatusShape,
@@ -1327,12 +1328,20 @@ export function RecentTabList({
 	);
 
 	const fsRevealCapability = useFsRevealCapability();
+	/**
+	 * Reveal opens a file manager window on the *server* host, so it is only offered when
+	 * the browser is on that same machine. Remote users would get a silent success (or a
+	 * window on someone else's desktop), which is worse than not seeing the option.
+	 * The origin cannot change without a page load, so this is computed once.
+	 */
+	const canRevealFromThisBrowser = useMemo(() => isLoopbackBrowserOrigin(), []);
+	const revealAvailable = fsRevealCapability.supported && canRevealFromThisBrowser;
 
 	const handleReveal = useCallback(async () => {
 		if (!ctxMenu) return;
 		const { tab } = ctxMenu;
 		setCtxMenu(null);
-		if (!fsRevealCapability.supported) return;
+		if (!revealAvailable) return;
 		try {
 			if (tab.type === "chapter") {
 				const chapter = await api.getChapter(tab.id);
@@ -1348,7 +1357,7 @@ export function RecentTabList({
 		} catch {
 			// ignore
 		}
-	}, [ctxMenu, fsRevealCapability.supported]);
+	}, [ctxMenu, revealAvailable]);
 
 	/** 复制工作目录到剪贴板（chapter/narrator/subagent） */
 	const handleCopyCwd = useCallback(async () => {
@@ -2145,7 +2154,7 @@ export function RecentTabList({
 					isPinned={!!ctxMenu.tab.pinned}
 					onRemove={handleCtxClose}
 					onReveal={handleReveal}
-					canReveal={fsRevealCapability.supported && ctxMenu.tab.type !== "project"}
+					canReveal={revealAvailable && ctxMenu.tab.type !== "project"}
 					onNewNarratorHere={handleNewNarratorHere}
 					canNewNarratorHere={
 						ctxMenu.tab.type === "chapter" ||

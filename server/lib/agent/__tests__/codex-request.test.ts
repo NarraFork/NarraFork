@@ -71,7 +71,9 @@ describe("applyCodexStableRequestFields", () => {
 
 		expect(body.prompt_cache_key).toBe("conv-1");
 		expect(body.tool_choice).toBe("auto");
-		expect(body.parallel_tool_calls).toBe(false);
+		// Parallel tool calls must stay enabled: `false` is a responses-lite-only
+		// field, and NarraFork does not send the lite header.
+		expect(body.parallel_tool_calls).toBe(true);
 		// context is a responses-lite-only field; the non-lite contract omits it.
 		expect(body.reasoning).toEqual({ effort: "high", summary: "auto" });
 		expect(body.include).toEqual(["reasoning.encrypted_content"]);
@@ -97,8 +99,8 @@ describe("applyCodexStableRequestFields", () => {
 			model: "gpt-5.3-codex",
 			instructions: "caller instructions",
 			input: [{ role: "user", content: "hi" }],
-			// A legacy caller value that the contract must normalize away.
-			parallel_tool_calls: true,
+			// A stray caller value that the contract must normalize away.
+			parallel_tool_calls: false,
 		};
 
 		applyCodexStableRequestFields(body, {
@@ -109,7 +111,7 @@ describe("applyCodexStableRequestFields", () => {
 		expect(body.model).toBe("gpt-5.3-codex");
 		expect(body.instructions).toBe("caller instructions");
 		expect(body.input).toEqual([{ role: "user", content: "hi" }]);
-		expect(body.parallel_tool_calls).toBe(false);
+		expect(body.parallel_tool_calls).toBe(true);
 	});
 
 	test("never emits volatile per-turn tracking fields", () => {

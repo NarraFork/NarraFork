@@ -291,6 +291,31 @@ async function runGitPaths(
 	};
 }
 
+/**
+ * Pair up `git diff-tree --name-status -z` output.
+ *
+ * The stream is `STATUS\0PATH\0…`, so fields alternate. Parsed defensively because
+ * a malformed pair must not shift every subsequent path onto the wrong status —
+ * silently relabelling a delete as an add would make a file tree drop the wrong
+ * directory. An unrecognised status is treated as `updated`: re-reading a parent is
+ * always safe, whereas guessing `deleted` evicts loaded state.
+ */
+function parseNameStatusFields(
+	fields: readonly string[],
+): { path: string; kind: "added" | "updated" | "deleted" }[] {
+	const out: { path: string; kind: "added" | "updated" | "deleted" }[] = [];
+	for (let i = 0; i + 1 < fields.length; i += 2) {
+		const status = fields[i];
+		const path = fields[i + 1];
+		if (!status || !path) continue;
+		// Status is a letter, optionally followed by a similarity score (`R100`).
+		const letter = status[0];
+		const kind = letter === "A" ? "added" : letter === "D" ? "deleted" : "updated";
+		out.push({ path, kind });
+	}
+	return out;
+}
+
 function assertLocal(deviceId: string): void {
 	if (deviceId !== LOCAL_DEVICE_ID) {
 		throw new TreeSnapshotError(
@@ -2264,6 +2289,39 @@ export const worktreeTreeSnapshot = {
 			throw new TreeSnapshotError(`snapshot diff-tree failed: ${result.stderr}`);
 		}
 		return result.paths;
+	},
+
+	/**
+	 * Like {@link diffPaths}, but reporting HOW each path changed.
+	 *
+	 * A separate method rather than a flag on `diffPaths`: that one's `string[]`
+	 * return feeds attribution and rollback, which only ever ask "which paths", and
+	 * widening it would make every caller destructure a shape it does not use.
+	 *
+	 * `--name-status -z` emits `STATUS\0PATH\0` pairs, so unlike the `--name-only`
+	 * form the field count is doubled and a rename emits TWO paths after its status.
+	 * Renames are not requested (`-M` is absent), so git reports them as a delete
+	 * plus an add — which is what a file tree wants anyway, since both directories
+	 * must be re-read.
+	 */
+	async diffPathStatuses(
+		worktreePath: string,
+		fromTree: string,
+		toTree: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+	): Promise<{ path: string; kind: "added" | "updated" | "deleted" }[]> {
+		assertLocal(deviceId);
+		const dir = shadowDir(deviceId, worktreePath);
+		const result = await runGitPaths(
+			["diff-tree", "-r", "--name-status", "--no-commit-id", "-z", fromTree, toTree],
+			dir,
+			worktreePath,
+			{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
+		);
+		if (result.exitCode !== 0) {
+			throw new TreeSnapshotError(`snapshot diff-tree failed: ${result.stderr}`);
+		}
+		return parseNameStatusFields(result.paths);
 	},
 
 	/**

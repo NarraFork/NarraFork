@@ -117,10 +117,22 @@ export type FoldBoxGeometry = FoldRowGeometry;
  * `kind: "reveal"` — the toggled row grew. Play
  * `clip-path: inset(0 0 <fromInsetBottom>px 0) → inset(0)`, so the box holds its
  * final height while the new content is uncovered.
+ *
+ * `kind: "resize"` — the toggled element SHRANK. Its content box is painted at the
+ * committed height with `overflow: hidden`, so without this it crops everything past the
+ * new bottom edge to blank in the first frame ("the whole thing truncates the moment I
+ * click"). Animate `height: fromHeight → toHeight` so the crop advances gradually. See
+ * the note in `planFoldMotion` for why a fade is not the answer.
  */
 export type FoldRowMotion =
 	| { readonly key: string; readonly kind: "shift"; readonly fromOffset: number }
-	| { readonly key: string; readonly kind: "reveal"; readonly fromInsetBottom: number };
+	| { readonly key: string; readonly kind: "reveal"; readonly fromInsetBottom: number }
+	| {
+			readonly key: string;
+			readonly kind: "resize";
+			readonly fromHeight: number;
+			readonly toHeight: number;
+	  };
 
 /**
  * The visual instruction for one decorative TOOL-RUN FRAME.
@@ -202,10 +214,29 @@ export function planFoldMotion(input: FoldMotionPlanInput): FoldRowMotion[] {
 		if (!prev) continue;
 		if (key === toggledKey) {
 			const grew = next.height - prev.height;
-			// Only expansion gets a reveal; on collapse there is nothing left to
-			// uncover (see the module note).
+			// Expansion uncovers the newly added region inside the already-final box.
 			if (grew > 0 && isAnimatableShift(grew)) {
 				out.push({ key, kind: "reveal", fromInsetBottom: grew });
+			}
+			// CONTRACTION animates the element's OWN BOX, or everything past the new bottom
+			// edge is cropped to blank in the very first frame.
+			//
+			// The shell paints a non-dynamic row's content box at `height: <committed>` with
+			// `overflow: hidden`. When a fold SHRINKS the element — collapsing a card, or
+			// closing a drill-down inside a trace — React commits the short height
+			// immediately, so the box crops its own contents at once and the reader sees the
+			// whole lower part of the element blank out on click, then reappear as the rows
+			// below slide up. Nothing done to those rows can fix it: the clip is ABOVE them.
+			//
+			// So the toggled element holds its OLD height and travels to the committed one;
+			// `overflow: hidden` then crops progressively instead of instantly.
+			//
+			// A cross-fade is NOT the answer here and was tried: it masks a component SWAP
+			// (§4.7), and a collapse swaps nothing — the header is the same component in the
+			// same place, so fading made the one part that never changed blink. Reversing the
+			// reveal is also unavailable, since the expanded body is already unmounted.
+			if (grew < 0 && isAnimatableShift(grew)) {
+				out.push({ key, kind: "resize", fromHeight: prev.height, toHeight: next.height });
 			}
 			// NO `continue`: the toggled row can need BOTH. Expanding a card while
 			// pinned to the bottom answers the growth with a scrollTop write, so the
@@ -310,6 +341,193 @@ export function isAnimatableShift(delta: number): boolean {
 	if (!Number.isFinite(delta)) return false;
 	const magnitude = Math.abs(delta);
 	return magnitude >= FOLD_MIN_SHIFT_PX && magnitude <= FOLD_MAX_SHIFT_PX;
+}
+
+/**
+ * The visual instruction for one row NESTED INSIDE a trace element.
+ *
+ * ## Why nested rows need their own plan
+ *
+ * At L1/L2 a whole activity run is ONE list item, and its individual tool rows are
+ * absolutely positioned blocks INSIDE it (`measured.rows[i].top`, painted with
+ * `data-nf-trace-row`). `planFoldMotion` only sees top-level items, so drilling a row
+ * open produced this: the trace element itself grew, everything BELOW the whole run
+ * slid correctly — and the rows below the drilled one, inside the same run, teleported.
+ *
+ * Measured on a 3-row activity trace at 860px: drilling the middle row grows the
+ * element 81.2 → 103.4px and moves the row below it from top 60.4 → 82.6px. The
+ * top-level plan animates the former and has no way to express the latter.
+ *
+ * ## Coordinates are LOCAL to the trace element
+ *
+ * A nested row's `top` is relative to its own trace, and the trace's own displacement is
+ * already carried by that element's `shift`. Subtracting the two would double-count, so
+ * the delta here is purely `prevLocalTop - nextLocalTop` — no scrollTop, no element top.
+ * A row that only moved because its whole run moved therefore yields 0 and is dropped,
+ * which is correct: its parent is already animating it.
+ */
+export interface FoldNestedRowMotion {
+	/** The trace element's `spec.key` — its `data-nf-row-key`. */
+	readonly traceKey: string;
+	/** The row's own key within that trace — its `data-nf-trace-row`. */
+	readonly rowKey: string;
+	/** `translateY(fromOffset)` → `translateY(0)`. */
+	readonly fromOffset: number;
+}
+
+/**
+ * The visual instruction for one nested row's own BLOCK, which changed size.
+ *
+ * ## Why a nested row needs a height animation and a top-level card does not
+ *
+ * A drilled-in row's block IS the card: the measure layer reserves
+ * `blockHeight === card.height` and `RenderToolRun` paints the box at exactly that
+ * height. So un-drilling does not merely unmount a body inside a stable frame (what a
+ * top-level card fold does) — it replaces a 200px block with an 18.8px one. React
+ * commits the short height in the very first frame, so:
+ *
+ *  - the card, its header included, VANISHES instantly rather than closing;
+ *  - the rows below start their slide from outside the now-short box and appear to
+ *    emerge from a clip line, never catching up to the content above them.
+ *
+ * Both symptoms are one cause, and the cure is to animate the block's `height` from the
+ * card's to the row's. Then the card visibly closes, and the rows below — which travel
+ * by exactly the height that was lost, over the same duration and easing — stay glued to
+ * its bottom edge for the whole transition.
+ *
+ * ## Why animating `height` here is allowed
+ *
+ * CONTRACT §0 rule 2 forbids a `height` write that could feed back into the measured
+ * model. This one cannot: the block is `position: absolute` inside its trace, so it has
+ * no in-flow siblings; every sibling row is positioned by the pure layout's own `top`,
+ * not by this box's size; and nothing reads the box back (the layout derives all of it
+ * arithmetically). It is the same exemption the decorative tool-run frame already has,
+ * for the same reason — and unlike a frame, `scaleY` is not an option here because it
+ * would squash the card's text.
+ */
+export interface FoldNestedRowResize {
+	readonly traceKey: string;
+	readonly rowKey: string;
+	readonly fromHeight: number;
+	readonly toHeight: number;
+}
+
+/** One trace's nested rows at a committed frame, keyed by the trace's spec key. */
+export interface FoldNestedRowsSnapshot {
+	/** Row key → its geometry LOCAL to the trace element. */
+	readonly rows: ReadonlyMap<string, { readonly top: number; readonly height: number }>;
+}
+
+/**
+ * Plan the movement of rows nested inside trace elements (see FoldNestedRowMotion).
+ *
+ * Mirrors `planFoldMotion`'s admission rules — present in BOTH snapshots, displacement
+ * readable and bounded — with two differences that follow from the coordinate space:
+ *
+ *  - the delta is LOCAL (see the type note), so an unmoved row inside a moved run is
+ *    correctly dropped rather than animated twice;
+ *  - a trace present in only one snapshot contributes nothing: at that point the run
+ *    itself appeared or vanished, and its rows have no previous position on screen.
+ *
+ * ## Everything below the toggled row moves TOGETHER, or not at all
+ *
+ * ⚠️ There is deliberately NO per-row clip gate here, and an earlier version's was a
+ * BUG. It rejected a row whose start box fell outside the trace's committed (post-fold)
+ * height, by analogy with the L3→L2 LOD morph (§4.7). Two things are wrong with that:
+ *
+ *  1. **The analogy does not hold.** The LOD case rejects a node that would spend the
+ *     animation hiding UNDER a clip and then pop into view. On un-drill these rows slide
+ *     UP into a shrinking box: they are ARRIVING at a position inside it, visible for
+ *     essentially the whole travel. Testing the start edge against the final height
+ *     rejects exactly the rows that are moving correctly.
+ *  2. **A per-row verdict tears the group apart.** These rows are not independent
+ *     objects; they are one column of content whose top edge moved. Admitting some and
+ *     rejecting others makes the survivors glide while their neighbours snap to the
+ *     final offset — measured on a 4-row trace with a second card still drilled: the
+ *     drilled card animated while the plain row below it jumped, so the two OVERLAPPED
+ *     for the duration. That is strictly worse than the uniform jump it replaced.
+ *
+ * So admission is per-TRACE and all-or-nothing: every moved row in one trace animates
+ * with the same duration and easing, or none of them does. The only gate is the shared
+ * readable-distance bound, and one row exceeding it disqualifies the WHOLE trace — if any
+ * part of the group moved too far to read as motion, the group appears at its committed
+ * offsets, which keeps it internally consistent either way. (A sub-pixel row is not a
+ * disqualification, it simply did not move.)
+ *
+ * Clipping is not a problem worth gating on: the rows travel at most the height the box
+ * just lost, so a row's transient overhang is bounded by that same amount and is hidden
+ * by the very `overflow: hidden` that would otherwise be the concern. Nothing escapes
+ * the trace, and nothing paints over a neighbour.
+ */
+export function planFoldNestedRowMotion(input: {
+	readonly before: ReadonlyMap<string, FoldNestedRowsSnapshot>;
+	readonly after: ReadonlyMap<string, FoldNestedRowsSnapshot>;
+}): FoldNestedRowMotion[] {
+	const out: FoldNestedRowMotion[] = [];
+	for (const [traceKey, afterTrace] of input.after) {
+		const beforeTrace = input.before.get(traceKey);
+		if (!beforeTrace) continue;
+		// Collect this trace's moved rows first, so the decision can be made for the
+		// GROUP. A per-row verdict is what let a drilled card animate while the plain row
+		// below it jumped, overlapping it mid-flight.
+		const moved: FoldNestedRowMotion[] = [];
+		let unreadable = false;
+		for (const [rowKey, next] of afterTrace.rows) {
+			const prev = beforeTrace.rows.get(rowKey);
+			if (prev === undefined) continue;
+			const delta = prev.top - next.top;
+			if (!Number.isFinite(delta)) {
+				unreadable = true;
+				break;
+			}
+			const magnitude = Math.abs(delta);
+			// Sub-pixel: invisible, and animating it only costs a composited layer. Not a
+			// reason to disqualify the group — those rows simply did not move.
+			if (magnitude < 1) continue;
+			if (magnitude > FOLD_MAX_SHIFT_PX) {
+				unreadable = true;
+				break;
+			}
+			moved.push({ traceKey, rowKey, fromOffset: delta });
+		}
+		// One verdict for the whole trace: all of its moved rows, or none.
+		if (unreadable || moved.length === 0) continue;
+		for (const motion of moved) out.push(motion);
+	}
+	return out;
+}
+
+/**
+ * Plan the height change of nested row BLOCKS whose size moved (see
+ * `FoldNestedRowResize`).
+ *
+ * This is the half that makes a drill-down close instead of vanish. Drilling a row open
+ * or shut swaps an 18.8px summary block for a full card block (or back), and React
+ * commits the new height immediately — so without this the card disappeared in one frame
+ * while the rows below slid up from outside the shortened box.
+ *
+ * Bounded by the same readable-distance rule as everything else, and admitted per ROW
+ * rather than per trace: a resize is confined to its own block (it moves no sibling — the
+ * layout positions those by their own `top`, which `planFoldNestedRowMotion` handles), so
+ * one row declining to animate cannot tear a group apart the way a dropped SHIFT does.
+ */
+export function planFoldNestedRowResize(input: {
+	readonly before: ReadonlyMap<string, FoldNestedRowsSnapshot>;
+	readonly after: ReadonlyMap<string, FoldNestedRowsSnapshot>;
+}): FoldNestedRowResize[] {
+	const out: FoldNestedRowResize[] = [];
+	for (const [traceKey, afterTrace] of input.after) {
+		const beforeTrace = input.before.get(traceKey);
+		if (!beforeTrace) continue;
+		for (const [rowKey, next] of afterTrace.rows) {
+			const prev = beforeTrace.rows.get(rowKey);
+			if (prev === undefined) continue;
+			const delta = prev.height - next.height;
+			if (!isAnimatableShift(delta)) continue;
+			out.push({ traceKey, rowKey, fromHeight: prev.height, toHeight: next.height });
+		}
+	}
+	return out;
 }
 
 /**

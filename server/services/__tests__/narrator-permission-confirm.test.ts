@@ -1560,6 +1560,94 @@ describe("OAuth remote runtime permission constraints", () => {
 			}),
 		).toBe("allow");
 	});
+
+	test("ScheduledTask reads are allowed in every mode", () => {
+		for (const action of ["list", "get", "runs"]) {
+			for (const permMode of [
+				"readOnly",
+				"dontAsk",
+				"default",
+				"acceptEdits",
+				"bypassPermissions",
+			] as const) {
+				expect(
+					resolvePermissionDecision({
+						toolName: "ScheduledTask",
+						input: { action, id: "task-1" },
+						permMode,
+						cwd: "/workspace",
+					}),
+				).toBe("allow");
+			}
+		}
+	});
+
+	/**
+	 * The point of the per-action rule: bypassPermissions is exactly the mode an
+	 * unattended or power-user session runs in, and it auto-allows every unclassified
+	 * tool. Installing a recurring unattended run is a larger grant than any single
+	 * call in this session, so it must still be asked.
+	 */
+	test("ScheduledTask mutations are asked even under bypassPermissions", () => {
+		for (const action of ["create", "update", "enable", "disable", "delete", "run_now"]) {
+			expect(
+				resolvePermissionDecision({
+					toolName: "ScheduledTask",
+					input: { action, id: "task-1" },
+					permMode: "bypassPermissions",
+					cwd: "/workspace",
+				}),
+			).toBe("ask");
+		}
+	});
+
+	test("ScheduledTask mutations are denied in readOnly mode", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "ScheduledTask",
+				input: { action: "create", task: { name: "x" } },
+				permMode: "readOnly",
+				cwd: "/workspace",
+			}),
+		).toBe("deny");
+	});
+
+	test("an unclassified ScheduledTask action is treated as a mutation", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "ScheduledTask",
+				input: { action: "purge", id: "task-1" },
+				permMode: "bypassPermissions",
+				cwd: "/workspace",
+			}),
+		).toBe("ask");
+		expect(
+			resolvePermissionDecision({
+				toolName: "ScheduledTask",
+				// A missing action must not fall through to the read branch.
+				input: { id: "task-1" },
+				permMode: "bypassPermissions",
+				cwd: "/workspace",
+			}),
+		).toBe("ask");
+	});
+
+	/**
+	 * Plan mode collapses to readOnly unless relaxed, so a plan-mode session cannot
+	 * install a schedule as a side effect of "planning".
+	 */
+	test("ScheduledTask mutations are denied in strict plan mode", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "ScheduledTask",
+				input: { action: "create", task: { name: "x" } },
+				permMode: "bypassPermissions",
+				cwd: "/workspace",
+				planMode: true,
+				relaxedPlan: false,
+			}),
+		).toBe("deny");
+	});
 });
 
 describe("subagent permission routing identity", () => {

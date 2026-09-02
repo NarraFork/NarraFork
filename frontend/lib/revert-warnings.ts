@@ -44,6 +44,12 @@ export function formatRevertWarning(t: Translate, warning: RevertWarning): strin
 	if (warning.unserializedCount > 0) {
 		parts.push(t("revertWarnPartShell", { count: warning.unserializedCount }));
 	}
+	// Named first among the categories a reader cares about? No — but it must be named
+	// at all: this is the user's OWN saved work, the one category they can neither
+	// reproduce from a transcript nor blame on an agent.
+	if ((warning.humanCount ?? 0) > 0) {
+		parts.push(t("revertWarnPartHuman", { count: warning.humanCount }));
+	}
 	if (parts.length === 0) return "";
 	return (
 		t("revertWarnWorkspaceDiscards", { parts: parts.join(t("revertWarnPartSeparator")) }) +

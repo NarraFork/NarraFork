@@ -35,6 +35,7 @@ import {
 	RECENT_ROW_HEIGHT,
 	type SubagentCardData,
 } from "../measure/measure-subagent";
+import { HEADER_CELL_GAP } from "../measure/measure-tool-call";
 import { measureActivityTrace, TRACE_ROW_HEIGHT } from "../measure/measure-tool-run";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 import { RenderSubagent } from "./RenderSubagent";
@@ -232,12 +233,59 @@ describe("recent-call rows ARE trace rows", () => {
 		expect(subagent).toEqual(["circle-x", "loader-2"]);
 	});
 
-	it("word the label the same way (`Tool · summary`)", async () => {
+	it("word the label the same way (bold `Tool` then summary, no separator)", async () => {
 		// The subagent row used to print the bare tool name. Same shape has to mean the
 		// same wording, or the reader still sees two different things.
+		//
+		// The middle dot is gone on BOTH sides: the tool name is distinguished by WEIGHT,
+		// which is what the card header already did. A separator spent a glyph and a gap
+		// saying what the weight says, and having it in the row but not the card meant the
+		// morph had to make it appear out of nothing.
+		// No space character between the two cells either: the name and the summary are
+		// separated by a flat `HEADER_CELL_GAP` margin, matching the card header's
+		// `Group gap={4}`. A space would be the font's space advance (~7.2px in the mono
+		// face at xs, and it scales with the reader's font size), which made the identical
+		// label look differently spaced in the two forms. So `textContent` is contiguous —
+		// the separation is visual, not textual.
 		const subagent = rowTitles(subagentRows(CALLS));
-		expect(subagent).toEqual(["Read · loop.ts", "Bash · bun test", "Grep · recentCall"]);
+		expect(subagent).toEqual(["Readloop.ts", "Bashbun test", "GreprecentCall"]);
 		expect(subagent).toEqual(rowTitles(traceRows(CALLS)));
+	});
+
+	it("separate name from summary with a flat gap, not a space glyph", async () => {
+		for (const root of [subagentRows(CALLS), traceRows(CALLS)]) {
+			const bold = Array.from(root.querySelectorAll("span")).filter((el) =>
+				((el as unknown as HTMLElement).getAttribute("style") ?? "")
+					.replace(/\s/g, "")
+					.includes("font-weight:600"),
+			);
+			expect(bold.length).toBeGreaterThanOrEqual(CALLS.length);
+			for (const el of bold.slice(0, CALLS.length)) {
+				const style = ((el as unknown as HTMLElement).getAttribute("style") ?? "").replace(
+					/\s/g,
+					"",
+				);
+				expect(style).toContain(`margin-right:${HEADER_CELL_GAP}px`);
+			}
+		}
+	});
+
+	it("bold the tool name in both, so weight is what marks it", async () => {
+		for (const root of [subagentRows(CALLS), traceRows(CALLS)]) {
+			const bold = Array.from(root.querySelectorAll("span")).filter((el) =>
+				// Static markup emits CSS unspaced (`font-weight:600`).
+				((el as unknown as HTMLElement).getAttribute("style") ?? "")
+					.replace(/\s/g, "")
+					.includes("font-weight:600"),
+			);
+			// One per row: the name, and nothing else in the label.
+			expect(bold.length).toBeGreaterThanOrEqual(CALLS.length);
+			expect(bold.slice(0, CALLS.length).map((el) => el.textContent)).toEqual([
+				"Read",
+				"Bash",
+				"Grep",
+			]);
+		}
 	});
 
 	it("keep the status + duration ADJACENT to the label, not right-aligned", async () => {

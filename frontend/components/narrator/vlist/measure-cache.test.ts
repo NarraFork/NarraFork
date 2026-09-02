@@ -186,6 +186,38 @@ describe("extractDataRevision", () => {
 	});
 
 	/**
+	 * `+N -N` is height-NEUTRAL but PAINTED from the cached payload, which is exactly
+	 * the combination CONTRACT.md §4.5 constraint 3 warns about: the cache stores the
+	 * whole `MeasuredElement`, including values the renderer merely draws. The counts
+	 * can appear or be corrected while `spec.key`, `messageVersion` and every
+	 * height-bearing field stay put (a payload fetch resolving a truncated Edit; a
+	 * live patch landing the tool's metadata on an already-terminal status), so
+	 * without keying them a rebuild would keep painting the previous numbers — which
+	 * look every bit as authoritative as correct ones.
+	 */
+	it("keys a card's `+N -N` counts, so a corrected figure cannot hit the old entry", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const card = (diffStats: unknown) => ({ status: "success", diffStats });
+
+		// Appearing at all must move the key: same status, previously no figure.
+		const none = extractDataRevision(card(undefined));
+		const some = extractDataRevision(card({ added: 12, removed: 3 }));
+		expect(some).not.toBe(none);
+		expect(some).toContain("df:12/3");
+
+		// A CORRECTED figure must move it too — presence alone is not enough.
+		expect(extractDataRevision(card({ added: 40, removed: 3 }))).not.toBe(some);
+		expect(extractDataRevision(card({ added: 12, removed: 9 }))).not.toBe(some);
+
+		// A real zero is distinguishable from absent, matching the data contract.
+		expect(extractDataRevision(card({ added: 0, removed: 0 }))).toContain("df:0/0");
+
+		// A malformed pair contributes nothing rather than a partial key.
+		expect(extractDataRevision(card({ added: "12" }))).toBe(none);
+		expect(extractDataRevision(card(null))).toBe(none);
+	});
+
+	/**
 	 * A system card's OWN body text is height-affecting: `system-text` paints
 	 * `data.text` as pre-wrap, so the height is a function of how it wraps.
 	 * `detailTextRevision` only reaches `data.detail`, which a system card has none
@@ -446,6 +478,25 @@ describe("extractDataRevision", () => {
 			status: "success",
 			detail: { kind: "capped", cap: "code", text: "line1\nline2" },
 			...over,
+		});
+
+		/**
+		 * The per-ROW counterpart of the card-level `df:` key above. A folded row paints
+		 * its own `+N -N`, and a fold's key is minted from its FIRST member — so a row
+		 * gaining or correcting its counts moves nothing else in the key.
+		 */
+		it("keys each row's `+N -N` counts", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			const rowWith = (diffStats?: unknown) => ({
+				headerCount: "1 call",
+				items: [{ key: "tool-tu-1", title: "Edit · a.ts", diffStats }],
+			});
+			const none = extractDataRevision(rowWith());
+			const some = extractDataRevision(rowWith({ added: 12, removed: 3 }));
+			expect(some).not.toBe(none);
+			expect(some).toContain("df:12/3");
+			// A corrected count re-keys as well.
+			expect(extractDataRevision(rowWith({ added: 40, removed: 3 }))).not.toBe(some);
 		});
 
 		it("a collapsed fold pays nothing (no card → no card component)", async () => {

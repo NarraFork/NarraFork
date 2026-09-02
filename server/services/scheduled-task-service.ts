@@ -21,6 +21,22 @@ type ScheduledTaskRun = typeof scheduledTaskRuns.$inferSelect;
 const RUNS_PAGE_MAX = 200;
 const RUNS_PAGE_DEFAULT = 50;
 
+/**
+ * Ceiling on rows one `list()` returns.
+ *
+ * Tasks are created by people in the UI and by the `ScheduledTask` tool, so the row
+ * count is not bounded by anything a human curates — a model in a retry loop can add
+ * rows as fast as it can call the tool. An unbounded `findMany` on the request path is
+ * what the repo's main-thread rule forbids, and the tool then serialises whatever comes
+ * back straight into the model's context, where the cost is paid a second time.
+ *
+ * Deliberately high: this is a safety ceiling, not a paging window. Nobody legitimately
+ * schedules 500 tasks, so a truncated list means something is wrong — hence the
+ * `truncated` flag rather than a silent slice, so a caller can say so instead of
+ * presenting a partial list as complete.
+ */
+const LIST_MAX = 500;
+
 export interface CreateScheduledTaskInput {
 	name: string;
 	cronExpr: string;
@@ -95,10 +111,25 @@ async function principalForTask(task: ScheduledTask): Promise<NarratorPrincipal>
 }
 
 export const scheduledTaskService = {
-	async list(): Promise<ScheduledTask[]> {
-		return db.query.scheduledTasks.findMany({
+	/**
+	 * Every task, up to {@link LIST_MAX}.
+	 *
+	 * `truncated` reports whether rows were left behind, which is the part callers must
+	 * not drop: a list that is silently short reads as "these are all the tasks", and
+	 * the thing it hides is a schedule the user believes is armed.
+	 */
+	async list(): Promise<{ tasks: ScheduledTask[]; truncated: boolean }> {
+		// `LIMIT n + 1` rather than a separate COUNT: one extra row answers "is there
+		// more" without a second scan of the table.
+		const rows = await db.query.scheduledTasks.findMany({
 			orderBy: (t) => [asc(t.createdAt)],
+			limit: LIST_MAX + 1,
 		});
+		if (rows.length > LIST_MAX) {
+			logger.warn("scheduled task list truncated", { limit: LIST_MAX });
+			return { tasks: rows.slice(0, LIST_MAX), truncated: true };
+		}
+		return { tasks: rows, truncated: false };
 	},
 
 	async get(id: string): Promise<ScheduledTask | undefined> {

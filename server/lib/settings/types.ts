@@ -531,7 +531,15 @@ export interface NarraForkSettings {
 		 */
 		iconColor?: string;
 	};
-	paths: { defaultProjectDir: string };
+	paths: {
+		defaultProjectDir: string;
+		/**
+		 * Extra absolute directories the in-browser editor may write into, beyond a
+		 * narrator's own worktree. Empty by default; every entry widens the write
+		 * allow-list. See `fs-write-boundary.ts` for what is still refused inside one.
+		 */
+		extraWritableDirs: string[];
+	};
 	/** Knowledge base: how knowledge is auto-injected into agent context. */
 	knowledge: {
 		/** "summary" = inject matched entry summaries; "off" = disable passive injection. */

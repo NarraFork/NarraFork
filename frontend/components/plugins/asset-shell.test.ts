@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { createPluginAssetShell, createPluginNonce, isAllowedPluginAssetUrl } from "./asset-shell";
 
 describe("host-controlled plugin asset shell", () => {
@@ -12,11 +13,36 @@ describe("host-controlled plugin asset shell", () => {
 			entryUrl: "/api/plugin-assets/com.example.review/1/hash/entry.js",
 			styleUrl: "/api/plugin-assets/com.example.review/1/hash/style.css",
 		});
-		expect(shell).toContain("sandbox allow-scripts");
 		expect(shell).not.toContain("allow-same-origin");
 		expect(shell).toContain("connect-src 'none'");
 		expect(shell).toContain("entry.js");
 		expect(shell).not.toContain("narrafork_token");
+	});
+
+	/**
+	 * The sandbox is the IFRAME ATTRIBUTE's job, not the shell's.
+	 *
+	 * A `sandbox` directive in a `<meta>` CSP is ignored by the browser (it is header-only),
+	 * so asserting the shell contains one tested a string that enforced nothing — and would
+	 * have kept passing if the real attribute were ever dropped. Pinned here as a source
+	 * check on the component that actually renders the frame.
+	 */
+	test("the sandbox is declared on the iframe, and the shell does not restate it", () => {
+		const shell = createPluginAssetShell({
+			nonce: createPluginNonce(),
+			pluginId: "com.example.review",
+			contributionId: "dashboard",
+			panelInstanceId: "pui_review",
+			entryUrl: "/api/plugin-assets/com.example.review/1/hash/entry.js",
+		});
+		expect(shell).not.toContain("sandbox");
+
+		const provider = readFileSync(
+			new URL("./PluginUiRuntimeProvider.tsx", import.meta.url).pathname,
+			"utf8",
+		);
+		expect(provider).toContain('sandbox="allow-scripts"');
+		expect(provider).not.toContain("allow-same-origin");
 	});
 
 	test("fails closed when the entry URL is empty", () => {

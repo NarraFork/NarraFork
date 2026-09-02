@@ -31,6 +31,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { isNativeWatcherEnabled, ParcelRecursiveWatcher } from "../lib/watcher/parcel-watcher";
+import { FileChangeType } from "../lib/watcher/types";
 import { advanceChapterSnapshot } from "./chapter-snapshot-ref";
 import { commitSyncService } from "./commit-sync-service";
 import { recordAttributions, wasRecentlyAttributed } from "./file-attribution-service";
@@ -40,6 +41,16 @@ import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 /** Debounce interval for file change events (ms). */
 const DEBOUNCE_MS = 1500;
+
+/** How a watched path changed, in the vocabulary a file tree can act on. */
+export type WatchedChangeKind = "added" | "updated" | "deleted";
+
+/** Map `@parcel/watcher`'s numeric change type onto the wire vocabulary. */
+function toChangeKind(type: FileChangeType): WatchedChangeKind {
+	if (type === FileChangeType.ADDED) return "added";
+	if (type === FileChangeType.DELETED) return "deleted";
+	return "updated";
+}
 
 // ── Rate limiter ────────────────────────────────────────────────────────────
 
@@ -69,8 +80,16 @@ interface WatcherEntry {
 	processing: boolean;
 	pendingProcess: boolean;
 	rateLimit: RateLimitState;
-	/** Paths reported by the native watcher during the current debounce window. */
-	pendingPaths?: Set<string>;
+	/**
+	 * Paths reported by the native watcher during the current debounce window,
+	 * mapped to the kind of change last seen for each.
+	 *
+	 * A map rather than a set because a file tree cannot patch itself from paths
+	 * alone: "this path changed" does not say whether a row should appear, be
+	 * refreshed, or be removed. Attribution only ever needed the keys, which is why
+	 * this used to be a `Set`.
+	 */
+	pendingPaths?: Map<string, WatchedChangeKind>;
 	/** True when more paths changed than {@link MAX_PENDING_PATHS} allows. */
 	pendingPathsTruncated?: boolean;
 	/**
@@ -176,10 +195,14 @@ const parcelWatcher = hotSafe<ParcelRecursiveWatcher>(
 			(rootPath, events) => {
 				// Events from parcel are already coalesced and throttled.
 				// We just need to trigger the debounced git-status flow.
+				//
+				// The change kind is carried through rather than flattened to a path list:
+				// the file tree needs to know whether a row appeared, changed or went away,
+				// and that information exists only here.
 				worktreeWatcher._onFileChange(
 					rootPath,
 					events.length,
-					events.map((event) => event.path),
+					events.map((event) => ({ path: event.path, kind: toChangeKind(event.type) })),
 				);
 			},
 			(reason) => {
@@ -198,6 +221,19 @@ export const worktreeWatcher = {
 
 	getActiveCount(): number {
 		return this._entries.size;
+	},
+
+	/**
+	 * Narrators attached to a worktree, or empty when nothing watches it.
+	 *
+	 * Exposed so the tool-boundary path can fan a workspace change out to every
+	 * session viewing that directory without querying the database on the tool
+	 * execution hot path. Returns a copy: the caller must not be able to mutate the
+	 * watcher's live membership set.
+	 */
+	getAttachedNarratorIds(worktreePath: string): string[] {
+		const entry = this._entries.get(worktreePath);
+		return entry ? [...entry.narratorIds] : [];
 	},
 
 	getActivePaths(): Array<{ path: string; chapterId: string; narratorCount: number }> {
@@ -326,7 +362,11 @@ export const worktreeWatcher = {
 	},
 
 	/** Internal: debounced handler for file change events with rate limiting. */
-	_onFileChange(worktreePath: string, eventCount = 1, changedPaths?: readonly string[]): void {
+	_onFileChange(
+		worktreePath: string,
+		eventCount = 1,
+		changedPaths?: readonly { path: string; kind: WatchedChangeKind }[],
+	): void {
 		const entry = this._entries.get(worktreePath);
 		if (!entry) return;
 
@@ -334,17 +374,20 @@ export const worktreeWatcher = {
 		// attribute them. Bounded, because a runaway writer must not grow this set
 		// without limit — beyond the cap the flush falls back to a git-status diff.
 		if (changedPaths?.length) {
-			if (!entry.pendingPaths) entry.pendingPaths = new Set();
-			if (entry.pendingPaths.size < MAX_PENDING_PATHS) {
-				for (const path of changedPaths) {
-					entry.pendingPaths.add(path);
-					if (entry.pendingPaths.size >= MAX_PENDING_PATHS) {
-						entry.pendingPathsTruncated = true;
-						break;
-					}
+			if (!entry.pendingPaths) entry.pendingPaths = new Map();
+			for (const change of changedPaths) {
+				// An already-tracked path is updated in place rather than counted again:
+				// re-seeing a path is not new information about the batch's size, and
+				// letting it trip the cap would truncate a window that fit.
+				if (entry.pendingPaths.size >= MAX_PENDING_PATHS && !entry.pendingPaths.has(change.path)) {
+					entry.pendingPathsTruncated = true;
+					break;
 				}
-			} else {
-				entry.pendingPathsTruncated = true;
+				// Last kind wins. The coalescer upstream has already resolved the
+				// interesting sequences (add-then-delete cancels, delete-then-add becomes
+				// an update) within its own window; across windows, the latest observation
+				// is the best available answer.
+				entry.pendingPaths.set(change.path, change.kind);
 			}
 		}
 
@@ -455,6 +498,17 @@ export const worktreeWatcher = {
 		const pathsTruncated = entry.pendingPathsTruncated === true;
 		entry.pendingPaths = undefined;
 		entry.pendingPathsTruncated = false;
+
+		// Announce the individual paths BEFORE the git-status query, and independently of
+		// whether the status signature moved.
+		//
+		// Both halves of that matter for a file tree. Firing first means the tree updates
+		// without waiting on git subprocesses that tell it nothing it needs. Firing
+		// unconditionally is what makes it correct at all: the tree shows every file,
+		// including ones git never reports — `.gitignore`d build output, untracked
+		// scratch files, and anything in a directory git considers clean. Gating this on
+		// `statusChanged` would have made those rows silently permanent.
+		this._emitPathChanges(worktreePath, entry, changedPaths, pathsTruncated);
 
 		// Files changed on disk → the cached status is stale. Invalidate then
 		// read through the shared cache so concurrent narrators reuse one query.
@@ -582,6 +636,61 @@ export const worktreeWatcher = {
 	},
 
 	/**
+	 * Internal: publish the individual paths seen in this window to attached narrators.
+	 *
+	 * Paths are made worktree-RELATIVE before they leave the server. The tree already
+	 * knows its own root, and the absolute form would leak the host's directory layout
+	 * (including the OS account name) to every subscriber of a narrator.
+	 *
+	 * Nothing is emitted when the window carried no paths, which is the normal case:
+	 * the native watcher is opt-in (`NARRAFORK_ENABLE_NATIVE_WATCHER`), so the default
+	 * path is git-status polling, which observes no paths at all. A subscriber must
+	 * therefore treat this event as an accelerator and not as its only route to
+	 * freshness — see `truncated` for the other case where the list is not the whole
+	 * truth.
+	 */
+	_emitPathChanges(
+		worktreePath: string,
+		entry: WatcherEntry,
+		changedPaths: Map<string, WatchedChangeKind> | undefined,
+		truncated: boolean,
+	): void {
+		if (entry.narratorIds.size === 0) return;
+		if (!changedPaths?.size && !truncated) return;
+
+		const changes: { path: string; kind: WatchedChangeKind }[] = [];
+		for (const [absolutePath, kind] of changedPaths ?? []) {
+			const relPath = relative(worktreePath, absolutePath);
+			// Outside the root: nothing a tree rooted here can place.
+			if (!relPath || relPath.startsWith("..")) continue;
+			changes.push({ path: relPath, kind });
+		}
+		if (changes.length === 0 && !truncated) return;
+
+		// Delivered per narrator over the WS only.
+		//
+		// There is deliberately no parallel `eventBus` broadcast: this payload is
+		// narrator-scoped, every consumer reaches it through the socket, and a bus event
+		// nothing subscribes to is worse than absent — the next reader assumes some other
+		// path depends on it and preserves it through refactors that should have dropped it.
+		// `chapter:files_changed` above remains the pathless, graph-facing signal.
+		for (const narratorId of entry.narratorIds) {
+			eventBus.emit({
+				type: "narrator:ws_broadcast",
+				narratorId,
+				message: {
+					type: "workspace_paths_changed",
+					narratorId,
+					chapterId: entry.chapterId,
+					toolUseId: "",
+					changes,
+					truncated,
+				},
+			});
+		}
+	},
+
+	/**
 	 * Internal: attribute changes this watcher saw that no tool claimed, and record a
 	 * workspace boundary for them.
 	 *
@@ -597,7 +706,7 @@ export const worktreeWatcher = {
 	async _recordExternalChanges(
 		worktreePath: string,
 		entry: WatcherEntry,
-		changedPaths: Set<string> | undefined,
+		changedPaths: Map<string, WatchedChangeKind> | undefined,
 		truncated: boolean,
 		options?: { skipSnapshot?: boolean },
 	): Promise<void> {
@@ -608,7 +717,7 @@ export const worktreeWatcher = {
 
 		if (changedPaths?.size) {
 			const unclaimed: string[] = [];
-			for (const absolutePath of changedPaths) {
+			for (const absolutePath of changedPaths.keys()) {
 				const relPath = relative(worktreePath, absolutePath);
 				if (!relPath || relPath.startsWith("..")) continue;
 				if (wasRecentlyAttributed(worktreePath, relPath)) continue;

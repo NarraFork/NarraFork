@@ -70,6 +70,8 @@ export interface ComputeLayoutOptions {
 	showOriginal?: (key: string) => boolean;
 	/** Resolve whether a subagent card's prompt body is open. */
 	isPromptOpen?: (key: string) => boolean;
+	/** Reader expanded a subagent card's file-change list (its own fold). */
+	isFileChangesOpen?: (key: string) => boolean;
 	/** L5 recency window for tool/subagent cards. */
 	recentMessageIds?: ReadonlySet<string>;
 	/** Viewport height for isPlan tool-call cap (0.85×). */
@@ -169,6 +171,7 @@ export function computePretextVListLayout(
 		isRowExpanded: opts.isRowExpanded,
 		showOriginal: opts.showOriginal,
 		isPromptOpen: opts.isPromptOpen,
+		isFileChangesOpen: opts.isFileChangesOpen,
 		recentMessageIds: opts.recentMessageIds,
 		viewportHeight: opts.viewportHeight,
 		labels: opts.labels,

@@ -231,6 +231,7 @@
 	"tpToolDescTerminal": "Interactive terminal tool for long-running processes.",
 	"tpToolDescBrowser": "Browser automation tool for browser sessions and page inspection.",
 	"tpToolDescRecall": "Search past conversations for relevant context.",
+	"tpToolDescScheduledTask": "Manage cron-driven scheduled tasks. Reads are auto-allowed; creating, editing, deleting or triggering one requires approval.",
 	"tpWfAllowAll": "Allow all URLs",
 	"tpWfAllowAllDesc": "When enabled, all WebFetch requests are auto-allowed without user approval.",
 	"tpWfWhitelist": "URL Whitelist",

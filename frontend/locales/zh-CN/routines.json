@@ -231,6 +231,7 @@
 	"tpToolDescTerminal": "用于长时间运行进程的交互式终端工具。",
 	"tpToolDescBrowser": "用于浏览器会话和页面检查的浏览器自动化工具。",
 	"tpToolDescRecall": "搜索过去的对话获取相关上下文。",
+	"tpToolDescScheduledTask": "管理 cron 定时任务。查看类操作自动允许；创建、编辑、删除或立即触发需要用户批准。",
 	"tpWfAllowAll": "允许所有 URL",
 	"tpWfAllowAllDesc": "启用后，所有 WebFetch 请求将自动允许，无需用户批准。",
 	"tpWfWhitelist": "URL 白名单",

@@ -20,6 +20,7 @@ import {
 	SMOOTH_FOLLOW_DELTA_MIN_PX,
 	SMOOTH_FOLLOW_DELTA_VIEWPORT_FACTOR,
 	SMOOTH_FOLLOW_MAX_VELOCITY_PX_PER_MS,
+	SMOOTH_FOLLOW_MIN_STEP_PX,
 	SMOOTH_FOLLOW_SETTLE_EPSILON_PX,
 	SMOOTH_FOLLOW_TAU_MS,
 	shouldSmoothFollow,
@@ -87,8 +88,61 @@ describe("resolveSmoothFollowStep — convergence without overshoot", () => {
 			if (step.settled) break;
 		}
 		expect(current).toBe(target); // landed exactly, in finite frames
-		// ~tau*ln(delta/epsilon): 100ms * ln(100/0.5) ≈ 530ms ≈ 32 frames at 60Hz.
-		expect(seen.length).toBeLessThan(60);
+		// The step floor also SHORTENS the glide: the exponential tail used to creep
+		// sub-pixel for a dozen frames (~32 frames total), now the last few px are
+		// covered at 1px/frame.
+		expect(seen.length).toBeLessThan(30);
+	});
+
+	/**
+	 * THE STUTTER REGRESSION. A pure exponential shrinks its step with the remaining
+	 * distance, so the tail of every glide advanced by fractions of a pixel — which
+	 * does not move the RENDERED position (device-pixel snapping). The picture froze
+	 * for several frames, then lurched a whole pixel: juddering at the end of every
+	 * single glide, i.e. the part the reader looks at most.
+	 */
+	it("never plans a sub-pixel frame (no still frames, no 1px lurch)", () => {
+		for (const target of [1003, 1020, 1100, 1480]) {
+			let current = 1000;
+			for (let frame = 0; frame < 600; frame++) {
+				const step = resolveSmoothFollowStep({ current, target, dtMs: 16.7 });
+				const advanced = step.next - current;
+				if (step.settled) break;
+				// Every non-settling frame must move at least a whole device pixel.
+				expect(advanced).toBeGreaterThanOrEqual(1 - 1e-9);
+				current = step.next;
+			}
+		}
+	});
+
+	it("the floor still cannot overshoot the target", () => {
+		// A remaining distance below the floor must be clamped to the remainder, never
+		// stepped a full pixel past the bottom. Exercised with a custom epsilon so the
+		// settle branch does not answer first.
+		const step = resolveSmoothFollowStep({
+			current: 1000,
+			target: 1000.4,
+			dtMs: 16.7,
+			settleEpsilonPx: 0.1,
+		});
+		expect(step.next).toBeLessThanOrEqual(1000.4);
+	});
+
+	it("keeps the 1px/frame run short (no long invisible tail)", () => {
+		// The floor removes sub-pixel stalls but replaces them with constant 1px
+		// frames; without a matching settle epsilon that run was ~6 frames of motion
+		// nobody can see, appended to every glide.
+		for (const target of [1020, 1060, 1200]) {
+			let current = 1000;
+			let onePxFrames = 0;
+			for (let frame = 0; frame < 600; frame++) {
+				const step = resolveSmoothFollowStep({ current, target, dtMs: 16.7 });
+				if (step.settled) break;
+				if (step.next - current <= 1 + 1e-9) onePxFrames++;
+				current = step.next;
+			}
+			expect(onePxFrames).toBeLessThanOrEqual(3);
+		}
 	});
 
 	it("caps velocity for large landings", () => {
@@ -97,9 +151,10 @@ describe("resolveSmoothFollowStep — convergence without overshoot", () => {
 		expect(step.settled).toBe(false);
 	});
 
-	it("is dt-aware: two half-steps match one full step", () => {
-		// Delta kept small so the velocity cap never binds on either path — the cap
-		// deliberately breaks exact dt-equivalence when it engages (that is its job).
+	it("is dt-aware over the bulk of the travel: two half-steps match one full step", () => {
+		// Delta kept large enough that the exponential term dominates: both the
+		// velocity cap and the step FLOOR deliberately break exact dt-equivalence when
+		// they engage (the cap bounds speed, the floor beats per-frame pixel snapping).
 		const full = resolveSmoothFollowStep({ current: 0, target: 200, dtMs: 33.4 });
 		const halfA = resolveSmoothFollowStep({ current: 0, target: 200, dtMs: 16.7 });
 		const halfB = resolveSmoothFollowStep({ current: halfA.next, target: 200, dtMs: 16.7 });
@@ -107,6 +162,8 @@ describe("resolveSmoothFollowStep — convergence without overshoot", () => {
 	});
 
 	it("does not move on a zero-length frame", () => {
+		// The step floor must not turn "no time passed" into a 1px teleport — that
+		// would also break the dt-equivalence above.
 		const step = resolveSmoothFollowStep({ current: 100, target: 500, dtMs: 0 });
 		expect(step).toEqual({ next: 100, settled: false });
 	});
@@ -302,6 +359,21 @@ describe("constants stay coherent", () => {
 	it("tau and velocity are the documented defaults", () => {
 		expect(SMOOTH_FOLLOW_TAU_MS).toBe(100);
 		expect(SMOOTH_FOLLOW_MAX_VELOCITY_PX_PER_MS).toBe(4);
-		expect(SMOOTH_FOLLOW_SETTLE_EPSILON_PX).toBe(0.5);
+	});
+
+	it("settles a few px out rather than creeping to zero", () => {
+		// The exponential tail is infinitely long, so the epsilon is what decides when
+		// to stop caring. Measured on a real 20px growth, dropping this to 1px added
+		// ~6 frames of 1px/frame motion nobody can see. The shell already reads
+		// anything within 1px (BOTTOM_DISTANCE_EPSILON) as "at the bottom", and the
+		// final write is the exact target either way.
+		expect(SMOOTH_FOLLOW_SETTLE_EPSILON_PX).toBe(3);
+	});
+
+	it("floors the step at one device pixel, at or below the settle epsilon", () => {
+		// A floor ABOVE the epsilon could step past the settle band, making the last
+		// frame jump rather than land.
+		expect(SMOOTH_FOLLOW_MIN_STEP_PX).toBe(1);
+		expect(SMOOTH_FOLLOW_MIN_STEP_PX).toBeLessThanOrEqual(SMOOTH_FOLLOW_SETTLE_EPSILON_PX);
 	});
 });

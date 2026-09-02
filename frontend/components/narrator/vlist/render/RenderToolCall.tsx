@@ -89,6 +89,7 @@ import { AutoFollowScroll } from "../../AutoFollowScroll";
 import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
 import { OPTION_CONTROL_SIZE } from "../measure/measure-permission";
 import {
+	CARD_HEADER_INNER_ICON,
 	CARD_PADDING,
 	cappedUsefulLines,
 	DETAIL_BOX_PADDING_X,
@@ -102,6 +103,8 @@ import {
 	GROUP_BODY_BORDER_LEFT,
 	GROUP_BODY_MARGIN_TOP,
 	GROUP_BODY_PADDING_LEFT,
+	HEADER_CATEGORY_ICON,
+	HEADER_CELL_GAP,
 	HEADER_ROW_HEIGHT,
 	isRunningStatus,
 	type MeasuredToolCall,
@@ -132,6 +135,7 @@ import {
 	type VListViewTarget,
 } from "../vlist-content-view-target";
 import { categoryIcon } from "./category-icons";
+import { DiffStatsText, type DiffStatsValue } from "./diff-stats-text";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
 import { FragmentGap, LineFragments } from "./line-fragments";
 import { RenderMarkdown } from "./RenderMarkdown";
@@ -434,6 +438,8 @@ interface ToolHeaderRowProps {
 	summary: string;
 	category: ToolCategory;
 	status: ToolCallStatus;
+	/** Write/Edit line counts (`+12 -3`); null → nothing is drawn. */
+	diffStats: DiffStatsValue | null;
 	isRemoteTarget: boolean;
 	/** Localized remote-execution badge label. */
 	remoteLabel: string;
@@ -468,6 +474,7 @@ function ToolHeaderRow({
 	summary,
 	category,
 	status,
+	diffStats,
 	isRemoteTarget,
 	remoteLabel,
 	isTakenOver,
@@ -494,7 +501,7 @@ function ToolHeaderRow({
 			// must reach the row's selection wrapper (which ignores role="button"
 			// targets) instead of being treated as an interactive island.
 			{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
-			gap={4}
+			gap={HEADER_CELL_GAP}
 			wrap="nowrap"
 			align="center"
 			// A keyboard and a screen reader cannot use a bare `onClick` on a div. That
@@ -516,9 +523,12 @@ function ToolHeaderRow({
 		>
 			<span
 				style={{
-					width: 16,
-					height: 16,
-					minWidth: 16,
+					// The SAME tile size a folded trace row uses, so drilling in or out does not
+					// resize the chip mid-morph. Height-neutral: the header's 19px text line
+					// dominates `max(icon, text)` at this size.
+					width: HEADER_CATEGORY_ICON,
+					height: HEADER_CATEGORY_ICON,
+					minWidth: HEADER_CATEGORY_ICON,
 					display: "inline-flex",
 					alignItems: "center",
 					justifyContent: "center",
@@ -527,7 +537,9 @@ function ToolHeaderRow({
 					color: cssColor(color, 6),
 				}}
 			>
-				<Icon size={10} />
+				{/* Same glyph size a folded row's chip uses, so the icon does not change size
+				    across the morph now that both tiles are the same 14px lane. */}
+				<Icon size={CARD_HEADER_INNER_ICON} />
 			</span>
 			<span
 				style={{
@@ -543,6 +555,17 @@ function ToolHeaderRow({
 			</span>
 			<span
 				style={{
+					// `flex: 1` — the summary claims the header's slack, which pushes the diff
+					// stats and the duration to the card's RIGHT edge. That is the card's
+					// intended layout: a card is a wide, self-contained box where a right-hand
+					// column of figures reads as a column, and there is no neighbouring row to
+					// confuse it with.
+					//
+					// ⚠️ Do NOT change this to `0 1 auto` to make the drill morph easier. That
+					// was tried: it does put those cells in the same place in both forms, but it
+					// does so by breaking the card's own layout, which is backwards — the static
+					// appearance is the requirement and the transition serves it. The morph
+					// handles the difference itself (see `DRILL_MORPH_TAIL_*`).
 					flex: 1,
 					minWidth: 0,
 					fontSize: "var(--mantine-font-size-xs)",
@@ -557,54 +580,83 @@ function ToolHeaderRow({
 			>
 				{summary}
 			</span>
-			{isRemoteTarget ? (
-				<Badge
-					size="xs"
-					variant="light"
-					color="indigo"
-					leftSection={<IconDevices size={10} />}
-					style={{ flexShrink: 0 }}
-				>
-					{remoteLabel}
-				</Badge>
-			) : null}
-			{/* An in-flight Await whose target got taken over never returns, and the
-			    header would otherwise show nothing but a ticking timer. Grape matches
-			    the `taken_over` substatus colour in status-registry.ts. */}
-			{isTakenOver ? (
-				<Badge
-					data-testid="tool-taken-over"
-					size="xs"
-					variant="light"
-					color="grape"
-					style={{ flexShrink: 0 }}
-				>
-					{takenOverLabel}
-				</Badge>
-			) : null}
+			{/* `+N -N` for a Write/Edit. Placed right after the path so the two read as
+			    one phrase ("this file, this much"), and before the badges so a remote
+			    marker cannot separate the figure from what it describes. Height-neutral:
+			    one nowrap span in this already-fixed row. */}
+			{/* One wrapper around the whole tail cluster, marked for the drill morph.
+			    These cells sit at the card's RIGHT edge but hug the title in a folded row,
+			    and the distance between those two places depends on the rendered title
+			    width — which the measure layer never computes. So the morph cross-fades
+			    this node instead of moving it (see `drillTailKeyframes`), and a fade needs
+			    ONE element: fading each cell separately would let them dissolve at
+			    slightly different times.
+
+			    ⚠️ NOT `display: contents`, which would leave the cells as direct flex
+			    participants but generate NO BOX for the wrapper — and `opacity` on a
+			    box-less element does nothing, so the fade would silently never appear. An
+			    `inline-flex` carrying the header's own gap reproduces the same spacing and
+			    alignment while being a real, fadeable box. `flexShrink: 0` keeps the
+			    cluster intact when a long summary claims the slack. */}
 			<span
+				data-nf-card-tail
 				style={{
 					display: "inline-flex",
 					alignItems: "center",
-					color: cssColor(statusColor, 6),
+					gap: HEADER_CELL_GAP,
 					flexShrink: 0,
 				}}
 			>
-				<StatusGlyph status={status} color={statusColor} />
-			</span>
-			{/* Timing lives INSIDE the existing single header row (height-neutral):
+				<DiffStatsText stats={diffStats} />
+				{isRemoteTarget ? (
+					<Badge
+						size="xs"
+						variant="light"
+						color="indigo"
+						leftSection={<IconDevices size={10} />}
+						style={{ flexShrink: 0 }}
+					>
+						{remoteLabel}
+					</Badge>
+				) : null}
+				{/* An in-flight Await whose target got taken over never returns, and the
+			    header would otherwise show nothing but a ticking timer. Grape matches
+			    the `taken_over` substatus colour in status-registry.ts. */}
+				{isTakenOver ? (
+					<Badge
+						data-testid="tool-taken-over"
+						size="xs"
+						variant="light"
+						color="grape"
+						style={{ flexShrink: 0 }}
+					>
+						{takenOverLabel}
+					</Badge>
+				) : null}
+				<span
+					style={{
+						display: "inline-flex",
+						alignItems: "center",
+						color: cssColor(statusColor, 6),
+						flexShrink: 0,
+					}}
+				>
+					<StatusGlyph status={status} color={statusColor} />
+				</span>
+				{/* Timing lives INSIDE the existing single header row (height-neutral):
 			    a live elapsed counter while running, else the final duration. The
 			    breakdown popover and the timeout editor are portaled, so neither can
 			    change the measured header height. */}
-			<ToolTimingArea
-				running={running}
-				startedAt={startedAt}
-				durationMs={durationMs}
-				timeoutMs={timeoutMs}
-				timing={timing}
-				labels={timingLabels}
-				onUpdateTimeout={onUpdateTimeout}
-			/>
+				<ToolTimingArea
+					running={running}
+					startedAt={startedAt}
+					durationMs={durationMs}
+					timeoutMs={timeoutMs}
+					timing={timing}
+					labels={timingLabels}
+					onUpdateTimeout={onUpdateTimeout}
+				/>
+			</span>
 			{running && onTerminate ? (
 				<Tooltip label={terminateLabel} position="top" withArrow fz="xs">
 					<UnstyledButton
@@ -3036,6 +3088,7 @@ export function RenderToolCall({
 				summary={measured.summary}
 				category={category}
 				status={status}
+				diffStats={measured.diffStats}
 				isRemoteTarget={measured.isRemoteTarget}
 				remoteLabel={merged.remote}
 				isTakenOver={measured.isTakenOver}
@@ -3119,6 +3172,10 @@ export function RenderToolCall({
 	// Standalone: bordered Paper.
 	return (
 		<Paper
+			// The drill morph fades this element's BORDER COLOUR (a folded row has no border,
+			// so it has to arrive and leave rather than travel). Marked rather than found by
+			// tag so the fade cannot silently retarget if the card's markup changes.
+			data-nf-card-surface
 			withBorder={hasBorder}
 			radius="sm"
 			p="xs"

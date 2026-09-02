@@ -37,11 +37,18 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
-/** The body of the shell's fold-play layout effect. */
+/**
+ * The body of the shell's fold-play layout effect.
+ *
+ * Ends at the push of the effect's ops into the shared motion scheduler, which
+ * replaced the fold's own controller (see vlist-motion-scheduler.ts): the fold, its
+ * decorative frames and the drill morph that rides along with it are ONE visual event
+ * and must share one cancel boundary and one time base.
+ */
 function playEffect(): string {
 	const start = SHELL.indexOf("const capture = foldCaptureRef.current;");
 	expect(start).toBeGreaterThan(0);
-	const end = SHELL.indexOf("foldMotionRef.current.play(", start);
+	const end = SHELL.indexOf("motionRef.current.push(ops)", start);
 	expect(end).toBeGreaterThan(start);
 	// The effect ends at the first `});` at ANY indentation after the play call;
 	// a hardcoded one-tab sentinel silently over-ran when the shell was re-indented.
@@ -66,6 +73,9 @@ describe("fold transition: capture happens on the user's click", () => {
 			"onToggleEarlier:",
 			"onToggleRow:",
 			"onTogglePrompt:",
+			// Flips a translated body back to the original. See the dedicated test below
+			// for why this one belongs here despite not being a fold by name.
+			"onToggleTranslation:",
 		]) {
 			const handlerStart = block.indexOf(handler);
 			expect(handlerStart, `${handler} is missing from the toggles`).toBeGreaterThan(0);
@@ -78,12 +88,36 @@ describe("fold transition: capture happens on the user's click", () => {
 		}
 	});
 
-	it("does not capture for a height-neutral toggle", () => {
-		// The translation flip re-measures the body but is not a fold; giving it a
-		// capture would animate a content swap as if it were an expand.
-		const start = SHELL.indexOf("onToggleTranslation:");
-		const body = SHELL.slice(start, SHELL.indexOf("},", start));
-		expect(body).not.toContain("captureFoldBefore");
+	/**
+	 * The translation flip IS height-affecting, and this test exists because an earlier
+	 * version of this file asserted the opposite.
+	 *
+	 * It used to require that `onToggleTranslation` must NOT capture, on the stated
+	 * grounds that the flip is "height-neutral". That is false: `measureReasoning`
+	 * measures `resolveReasoningDisplayText(...)`, which returns the ORIGINAL text under
+	 * `showOriginal`, and `registry.ts` folds `showOriginal` into the measure cache key
+	 * precisely because the two texts wrap to different line counts at one width.
+	 * Measured directly against `measureReasoning` at 860px wide: an expanded run is
+	 * 70px showing its translation and 90px showing its original.
+	 *
+	 * The consequence of the wrong assertion was the artifact the fold transition exists
+	 * to remove: flipping a translation resized a committed row and teleported every row
+	 * below it, while every other toggle in the same list eased. So the toggle is now in
+	 * the capture list above, and this test pins the REASON so the "tidy-up" that removes
+	 * it again has to argue with a number.
+	 */
+	it("captures for the translation flip, because it resizes the row", async () => {
+		const { measureReasoning } = await import("./measure/measure-reasoning");
+		// `text` is the original; `translatedText` is what is shown by default.
+		const data = {
+			text: "This is the untranslated original, which is considerably longer than its translation and therefore wraps onto a very different number of lines at the same width, so the box it needs is taller.",
+			translatedText: "短译文。",
+			charCount: 4,
+			stepCount: 1,
+		} as never;
+		const translated = measureReasoning(data, 860, 5, { expanded: true });
+		const original = measureReasoning(data, 860, 5, { expanded: true, showOriginal: true });
+		expect(original.height).toBeGreaterThan(translated.height);
 	});
 
 	it("reads the layout, never the DOM, when capturing", () => {
@@ -121,12 +155,10 @@ describe("fold transition: play happens before paint", () => {
 		// Consuming the capture on that first (geometry-unchanged) commit is what made
 		// an earlier version never animate at all.
 		const body = playEffect();
-		const emptyGuard = body.indexOf(
-			"if (motions.length === 0 && frameMotions.length === 0) return;",
-		);
+		const emptyGuard = body.indexOf("nestedResizes.length === 0");
 		// Indentation-independent: the point is that the capture is cleared right
 		// before the play call, not how deeply the effect happens to be nested.
-		const consume = body.search(/foldCaptureRef\.current = null;\s*foldMotionRef/);
+		const consume = body.search(/foldCaptureRef\.current = null;\s*const ops/);
 		expect(emptyGuard).toBeGreaterThan(-1);
 		expect(consume).toBeGreaterThan(emptyGuard);
 	});
@@ -233,7 +265,44 @@ describe("fold transition: play happens before paint", () => {
 	it("resolves a planned row by its spec-key attribute", () => {
 		expect(SHELL).toContain("data-nf-row-key={item.spec.key}");
 		// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the shell's selector source verbatim
-		expect(SHELL).toContain('[data-nf-row-key="${cssAttrEscape(key)}"]');
+		expect(SHELL).toContain('[data-nf-row-key="${cssAttrEscape(motion.key)}"]');
+	});
+
+	/**
+	 * A `clip-path` inset is measured from the bottom of the node it plays ON, so a
+	 * reveal MUST target the row's inner content box — the only box that is the layout's
+	 * `height` tall.
+	 *
+	 * The outer row box is `hitHeight` (its own height PLUS the gap to the next row, see
+	 * `resolveRowHitHeight`). Playing the clip there starts it a gap's worth of pixels
+	 * below the card's real bottom edge, so the first frame uncovers content that should
+	 * still be hidden — and the inner box has its own `overflow: hidden`, so the two
+	 * clips disagree about where the card ends. Silent: the fold still animates, it just
+	 * flashes a sliver of the body at the wrong moment.
+	 */
+	it("plays the reveal clip on the row's INNER body box, not the padded hit box", () => {
+		expect(SHELL).toContain("data-nf-row-body={item.spec.key}");
+		const body = playEffect();
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the shell's selector source verbatim
+		expect(body).toContain('[data-nf-row-body="${cssAttrEscape(motion.key)}"]');
+		// The choice must be driven by the motion kind, not applied to both: only a `shift`
+		// translates the whole row and belongs on the outer hit box. A `reveal` (clip) and a
+		// `resize` (height) both act on the inner box that carries `overflow: hidden`.
+		expect(body).toContain('motion.kind === "shift"');
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the shell's selector source verbatim
+		expect(body).toContain('[data-nf-row-key="${cssAttrEscape(motion.key)}"]');
+	});
+
+	/**
+	 * Expanding while pinned to the bottom plans BOTH a reveal and a shift for the
+	 * toggled row (the header travels up as the body unrolls). They now land on two
+	 * different nodes and two different properties, so they must not share a cancel
+	 * scope — the scheduler cancels a scope before starting it, so one scope for both
+	 * would have the second op cancel the first before it ever ran.
+	 */
+	it("gives the toggled row's reveal and shift distinct cancel scopes", () => {
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the shell's scope expression verbatim
+		expect(playEffect()).toContain("`${rowScope(motion.key)}:${motion.kind}`");
 	});
 
 	it("resolves a planned grouping frame by its own key attribute", () => {
@@ -243,7 +312,7 @@ describe("fold transition: play happens before paint", () => {
 		// its committed box while the cards inside it animate.
 		expect(SHELL).toContain("data-tool-run-frame={run.key}");
 		// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the shell's selector source verbatim
-		expect(SHELL).toContain('[data-tool-run-frame="${cssAttrEscape(key)}"]');
+		expect(SHELL).toContain('[data-tool-run-frame="${cssAttrEscape(frameMotion.key)}"]');
 	});
 
 	it("keys a frame by content, not by item index", () => {
@@ -259,14 +328,78 @@ describe("fold transition: play happens before paint", () => {
 	it("plans frames from the SAME snapshot and scroll pair as the rows", () => {
 		// Two snapshots taken at different moments is how a border ends up animating
 		// from a box its contents never occupied.
-		const body = playEffect();
+		const body = SHELL.slice(
+			SHELL.indexOf("const capture = foldCaptureRef.current;"),
+			SHELL.indexOf("motionRef.current.push(ops)"),
+		);
 		expect(body).toContain("planFoldFrameMotion({");
 		expect(body).toContain("before: capture.frames");
 		expect(body).toContain("after: read.frames");
 		// One read call serves both plans.
 		expect(body).toContain("const read = readFoldGeometryRef.current?.();");
-		// The frame plan must not be gated away by the row plan being empty.
-		expect(body).toContain("if (motions.length === 0 && frameMotions.length === 0) return;");
+		// No plan may be gated away by another being empty. A nested plan genuinely can be
+		// the only non-empty one: drilling a row inside the document's LAST trace moves
+		// nothing at the top level at all.
+		for (const plan of [
+			"motions.length === 0",
+			"frameMotions.length === 0",
+			"nestedMotions.length === 0",
+			"nestedResizes.length === 0",
+		]) {
+			expect(body, `${plan} must take part in the empty check`).toContain(plan);
+		}
+	});
+
+	/**
+	 * Rows nested INSIDE a trace element must animate too.
+	 *
+	 * At L1/L2 a whole activity run is ONE list item whose tool rows are absolutely
+	 * positioned blocks inside it. Drilling one open moves that row's siblings without
+	 * moving any top-level item, so the row plan cannot reach them: the run itself grew
+	 * and everything BELOW the run slid correctly, while the siblings inside it teleported.
+	 *
+	 * Silent by nature — the fold still animates, just not the rows the reader was looking
+	 * at — so it is pinned here at the source.
+	 */
+	it("plans and plays the rows nested inside a trace element", () => {
+		const body = playEffect();
+		expect(body).toContain("planFoldNestedRowMotion({");
+		expect(body).toContain("before: capture.nested");
+		expect(body).toContain("after: read.nested");
+		// Resolved two levels deep: the trace by its row key, then the row within it. A
+		// trace-level query alone returns the FIRST row (the row-above bug).
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the shell's selector source verbatim
+		expect(body).toContain('[data-nf-trace-row="${cssAttrEscape(nestedMotion.rowKey)}"]');
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the shell's selector source verbatim
+		expect(body).toContain('[data-nf-row-key="${cssAttrEscape(nestedMotion.traceKey)}"]');
+	});
+
+	/**
+	 * The nested rows carry LOCAL offsets, so their plan takes no scroll pair.
+	 *
+	 * The trace element's own displacement is already animated as that element's `shift`;
+	 * feeding a document-space delta here would animate those rows twice — once via their
+	 * parent and once on their own — which reads as the rows sliding further than the box
+	 * that contains them.
+	 */
+	it("plans nested rows WITHOUT a scroll pair (local coordinates)", () => {
+		const start = playEffect().indexOf("planFoldNestedRowMotion({");
+		const body = playEffect().slice(start, playEffect().indexOf("});", start));
+		expect(body).not.toContain("ScrollTop");
+	});
+
+	/**
+	 * A nested row's scope must be disjoint from its trace's own.
+	 *
+	 * Both animate in the same event — the trace grew, the row moved inside it — on
+	 * different nodes by different amounts. Sharing a scope would make the scheduler
+	 * cancel one before starting the other (it cancels a scope before playing it).
+	 */
+	it("scopes a nested row apart from its trace element", () => {
+		expect(playEffect()).toContain(
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the shell's scope expression verbatim
+			"`${rowScope(nestedMotion.traceKey)}:nested:${nestedMotion.rowKey}`",
+		);
 	});
 
 	it("captures row and frame geometry in one snapshot", () => {
@@ -280,15 +413,41 @@ describe("fold transition: play happens before paint", () => {
 		if (body === null) throw new Error("readFoldGeometryRef.current assignment not found");
 		expect(body).toContain("captureFoldGeometry(");
 		expect(body).toContain("captureFoldFrameGeometry(");
+		// The nested rows come from the SAME read, so a trace and the rows inside it can
+		// never be planned from geometry taken at different moments.
+		expect(body).toContain("captureFoldNestedRows(");
 		// Derived from the layout, never measured off the border element itself.
 		expect(body).not.toContain("getBoundingClientRect");
 	});
 
 	it("cancels in-flight animations on unmount", () => {
-		// A fold outlives its click: the reader can scroll away or switch narrator.
-		const start = SHELL.indexOf("const controller = foldMotionRef.current;");
+		// A fold outlives its click: the reader can scroll away or switch narrator. One
+		// scheduler owns every decorative animation, so one teardown covers all of them.
+		const start = SHELL.indexOf("const scheduler = motionRef.current;");
 		expect(start).toBeGreaterThan(0);
-		expect(SHELL.slice(start, start + 200)).toContain("controller.cancel()");
+		expect(SHELL.slice(start, start + 200)).toContain("scheduler.cancel()");
+	});
+
+	/**
+	 * The three motion effects PUSH their ops; a fourth effect starts them. Layout
+	 * effects within one component run in declaration order, so the flush must be
+	 * declared last — above any of them, that effect's ops would land in the next event
+	 * or never. Silent: the plans are still produced and only the timing comes apart.
+	 */
+	it("flushes the batch from a layout effect declared AFTER every planner", () => {
+		const flush = SHELL.indexOf("motionRef.current.flush()");
+		expect(flush, "the motion flush effect is missing").toBeGreaterThan(0);
+		for (const marker of [
+			"const capture = foldCaptureRef.current;", // fold
+			"buildDrillSnapshots(", // drill morph
+			"buildLodSnapshots(", // LOD morph
+		]) {
+			const at = SHELL.indexOf(marker);
+			expect(at, `${marker} is missing`).toBeGreaterThan(0);
+			expect(at, `the flush must be declared after ${marker}`).toBeLessThan(flush);
+		}
+		// Stated at the source, so the next reader does not have to rediscover it here.
+		expect(SHELL).toContain("MOTION FLUSH");
 	});
 });
 
@@ -337,9 +496,18 @@ describe("fold transition: stays out of the height model", () => {
 		// decoration, and would make a visual concern part of the render that produces
 		// the geometry being animated.
 		expect(SHELL).toContain("const foldCaptureRef = useRef<");
-		expect(SHELL).toContain("const foldMotionRef = useRef(createFoldMotionController())");
+		expect(SHELL).toContain("const motionRef = useRef(createMotionScheduler())");
 		expect(SHELL).not.toContain("setFoldCapture");
-		expect(SHELL).not.toContain("useState(createFoldMotionController");
+		expect(SHELL).not.toContain("useState(createMotionScheduler");
+	});
+
+	it("keeps the row-BODY attribute height-neutral too", () => {
+		// Same rule as data-nf-row-key: a data attribute cannot affect layout, and it
+		// must NOT be threaded through spec.opts (the measure cache key).
+		const at = SHELL.indexOf("data-nf-row-body={item.spec.key}");
+		expect(at).toBeGreaterThan(0);
+		const style = SHELL.indexOf("style={{", at);
+		expect(SHELL.slice(at, style)).not.toContain("spec.opts");
 	});
 
 	it("keeps the row-key attribute height-neutral", () => {

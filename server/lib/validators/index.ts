@@ -80,6 +80,7 @@ export {
 	createExplorationGroupSchema,
 	updateExplorationGroupSchema,
 } from "./explorations";
+export { type FsWriteInput, fsWriteSchema } from "./fs";
 export {
 	gitCommitSchema,
 	gitDiffQuerySchema,

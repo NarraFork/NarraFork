@@ -55,7 +55,7 @@ import {
 	isLiveStreamingRun,
 	STREAMING_MESSAGE_ID,
 } from "./streaming-live-blocks";
-import { classifyToolDetail, isTruncated } from "./tool-detail";
+import { classifyToolDetail, isTruncated, resolveFileDiffStats } from "./tool-detail";
 import { collectTruncatedLeaves, hasTruncatedLeaf, readLeafText } from "./tool-io-projection";
 import { resolveTurnUsageLines, type TurnUsageJson, type UsageNumberFormatter } from "./turn-usage";
 
@@ -206,6 +206,12 @@ export interface AdapterToolItem {
 			 * compact-xs row), exactly like SubagentCard gates it.
 			 */
 			subagentNarratorId?: string | null;
+			/**
+			 * Files the child changed on disk, aggregated once per page by the server.
+			 * Height-affecting on the card (a row list), so it is keyed in
+			 * `subagentRevision`.
+			 */
+			fileChanges?: unknown;
 			/**
 			 * The child is currently taken over by the user. Reaches the card through
 			 * the reconnect catch-up snapshot (the live path writes `_takenOver` on the
@@ -442,6 +448,17 @@ interface AdapterTraceItem {
 	/** Resolved header summary (kept for parity/debugging; height-neutral). */
 	summary?: string;
 	/**
+	 * Added / removed line counts for a Write or Edit row (`+12 -3`).
+	 *
+	 * Height-neutral — one nowrap span sharing the row's fixed line, like the status
+	 * glyph and the duration beside it. But it IS painted from the cached payload,
+	 * so `traceRevision` keys it: the counts can change while `key`, `status` and
+	 * every height-bearing field stay put (a payload fetch resolving a truncated
+	 * Edit, a live patch landing the tool's metadata), and a stale entry would keep
+	 * drawing the previous numbers.
+	 */
+	diffStats?: { added: number; removed: number };
+	/**
 	 * Raw tool status. Height-neutral (a fixed 12px glyph slot inside the row's
 	 * existing content lane), and part of the measure cache's `traceRevision` so a
 	 * status transition on a folded row re-keys the trace.
@@ -556,6 +573,27 @@ export interface ElementSpec {
 	 * needs to pair the two renderings. Height-neutral; surfaced as `data-nf-unit`.
 	 */
 	unitId?: string;
+	/**
+	 * LOD-INDEPENDENT identity of the ACTIVITY GROUP this element belongs to.
+	 *
+	 * The morph admission window judges a group's members on the GROUP's box, because
+	 * the two forms differ enormously: folded, a 12-tool group is one ~228px trace;
+	 * expanded, it is 12 cards spanning ~4800px. Judged on their own boxes, the later
+	 * cards fall outside the window that the folded rows all sit inside, so they pair
+	 * with nothing and teleport while their neighbours ease.
+	 *
+	 * That box used to be derived from `unitStart`, which fails at exactly the level it
+	 * is needed: at L3+ grouping is off, so every spec starts its own render unit, the
+	 * flag is true for all of them, and the "group" box collapses to each element's own
+	 * box. This id is instead assigned from the activity grouping that would apply at a
+	 * LOW lod, computed at every level, so one group's members share it on both sides.
+	 *
+	 * Absent for anything outside an activity group — a markdown body, a bubble, a
+	 * divider, a lone call — whose two forms are the same element and which is
+	 * correctly judged on its own box. Height-neutral; assigned after the manifest,
+	 * read only by the morph layer.
+	 */
+	morphGroupId?: string;
 }
 
 export interface AdapterContext {
@@ -609,6 +647,15 @@ export interface AdapterContext {
 	 * resolved here like every other interaction state.
 	 */
 	isPromptOpen?: (key: string) => boolean;
+	/**
+	 * Reader expanded a subagent card's FILE-CHANGE list.
+	 *
+	 * Independent of `isPromptOpen` for the same reason that one is independent of
+	 * `isExpanded`: a reader who wants the prompt does not necessarily want 220 file
+	 * rows, and sharing a key would tie the two. Height-affecting — the expanded list
+	 * draws every row instead of the capped head.
+	 */
+	isFileChangesOpen?: (key: string) => boolean;
 	/** L4 recency window. Undefined preserves the old "all recent" fallback. */
 	recentMessageIds?: ReadonlySet<string>;
 	/** Viewport height for isPlan tool-call cap (0.85×). */
@@ -862,17 +909,60 @@ function markdownData(block: AdapterContentBlock): string {
 	return resolveAssistantTextDisplay(text, block.citations ?? undefined).display;
 }
 
-function reasoningData(blocks: AdapterContentBlock[], isStreaming: boolean) {
-	const text = blocks
-		.map((block) => block.thinking ?? block.text ?? "")
-		.filter((value) => value.length > 0)
-		.join("\n\n");
+/**
+ * The CANONICAL text of one reasoning run — the single string both levels parse.
+ *
+ * The two levels used to disagree structurally: `adaptContentBlocks` (L3+) joins a
+ * run's blocks and parses the concatenation, while the activity fold pushed blocks
+ * one by one and parsed each alone. For a run whose `**title**` is split across a
+ * block boundary the two see different step counts (measured: 1 step joined vs 2
+ * parsed separately), so step `sN` on one side can be a different step than `sN` on
+ * the other. That is why the cross-level identity was gated to single-block runs.
+ *
+ * Routing both sides through this function removes the disagreement at its source
+ * instead of declining to animate: parse the same string, get the same steps, and
+ * the gate becomes unnecessary. The separator must stay `\n\n` — a run's blocks are
+ * consecutive paragraphs of one thought, and joining them with a single newline
+ * would let a title absorb the following paragraph.
+ */
+export function canonicalReasoningRunText(blocks: readonly AdapterContentBlock[]): string {
+	return joinRunText(blocks.map((block) => block.thinking ?? block.text ?? ""));
+}
+
+/** Join one run's per-block strings. Blank blocks drop out; see the separator note. */
+function joinRunText(parts: readonly string[]): string {
+	return parts.filter((value) => value.length > 0).join("\n\n");
+}
+
+/**
+ * A run's translation, or null when it is not fully translated.
+ *
+ * All-or-nothing on purpose: a partially translated run would otherwise render some
+ * steps in one language and some in another. The denominator counts only NON-EMPTY
+ * blocks, matching what `joinRunText` keeps.
+ */
+function canonicalReasoningRunTranslation(blocks: readonly AdapterContentBlock[]): string | null {
 	const translatedParts = blocks.map((block) => block.translatedText).filter(Boolean) as string[];
-	const translatedText =
-		translatedParts.length ===
-		blocks.filter((block) => (block.thinking ?? block.text ?? "").length > 0).length
-			? translatedParts.join("\n\n")
-			: null;
+	const nonEmpty = blocks.filter((block) => (block.thinking ?? block.text ?? "").length > 0).length;
+	return translatedParts.length === nonEmpty && nonEmpty > 0 ? joinRunText(translatedParts) : null;
+}
+
+/**
+ * The exact string a run's STEPS are parsed from, at every level.
+ *
+ * A translated run displays its translation, and translation can change the step
+ * structure (measured: a 2-step original whose translation parses to 3 steps). L3+
+ * has always parsed `translatedText ?? text`; the fold parsed the raw original, so
+ * `s1` addressed a different step on each side — a silent mis-pair that would morph
+ * one step into an unrelated one. Both sides now resolve the text here.
+ */
+export function reasoningRunDisplayText(blocks: readonly AdapterContentBlock[]): string {
+	return canonicalReasoningRunTranslation(blocks) ?? canonicalReasoningRunText(blocks);
+}
+
+function reasoningData(blocks: AdapterContentBlock[], isStreaming: boolean) {
+	const text = canonicalReasoningRunText(blocks);
+	const translatedText = canonicalReasoningRunTranslation(blocks);
 	const displayText = translatedText ?? text;
 	return {
 		text,
@@ -1270,12 +1360,16 @@ function adaptMessage(
 						parsed,
 						streaming,
 						ctx,
-						// Cross-level step identity, on the SAME two conditions the L1/L2 side
-						// applies: a persisted message (a streaming id changes at the hand-off)
-						// and a single-block run (the activity fold parses each block alone,
-						// so a multi-block run's step boundaries need not line up). `bi` is the
-						// run's first block index — the loop advances `position` past the rest.
-						msg.id && msg.id !== STREAMING_MESSAGE_ID && reasoningBlocks.length === 1
+						// Cross-level step identity, on the SAME condition the L1/L2 side applies:
+						// a persisted message, since a streaming id changes at the hand-off and
+						// would leave the identity addressing a different row.
+						//
+						// The single-block restriction is gone from both sides: the fold now
+						// parses `canonicalReasoningRunText` for the whole run, which is the
+						// string `reasoningData` built here, so the step boundaries agree for a
+						// multi-block run too. `bi` is the run's first block index — the loop
+						// advances `position` past the rest.
+						msg.id && msg.id !== STREAMING_MESSAGE_ID
 							? { messageId: msg.id, runStartBlockIndex: bi }
 							: undefined,
 					),
@@ -2954,6 +3048,14 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 		// Still a preview → the shell may fetch the real body while it is open.
 		...(promptTruncated ? { promptTruncated: true } : {}),
 		isBackground,
+		// Files the child wrote. Absent when it changed nothing, so a card with no
+		// file list keeps the payload (and the height) it had before.
+		...(activity?.fileChanges ? { fileChanges: activity.fileChanges } : {}),
+		// The reader's own expand state for that list, keyed by the SAME
+		// `tool-<toolUseId>` the prompt fold uses, so it survives an LOD change.
+		...(activity?.fileChanges && ctx.isFileChangesOpen?.(key) === true
+			? { fileChangesExpanded: true }
+			: {}),
 		recentCallCount: recentCallNames.length,
 		recentCallNames,
 		recentCallSummaries,
@@ -3016,6 +3118,10 @@ function buildToolCardData(
 		summary: toolSummary(item.tc, ctx),
 		status: item.tc.status ?? "success",
 		isStreaming,
+		// `+N -N` for a settled Write/Edit. Height-neutral (one nowrap span in the
+		// fixed header row) but PAINTED from the cached payload, so it is keyed in
+		// `extractDataRevision` — see CONTRACT.md §4.5 constraint 3.
+		...toolDiffStatsFields(item, isStreaming, metadata),
 		inRun: runContext.inRun,
 		isLast: runContext.isLast,
 		category,
@@ -3067,6 +3173,29 @@ function buildToolCardData(
 			...(ctx.labels ? { labels: ctx.labels } : {}),
 		}),
 	};
+}
+
+/**
+ * `{ diffStats }` for a Write/Edit whose line counts are known, else `{}`.
+ *
+ * Suppressed WHILE STREAMING: an Edit's `old_string` and `new_string` arrive
+ * progressively, so a figure derived mid-stream changes with every chunk — the
+ * header would show a counter racing upward and settling on a different number,
+ * which reads as a bug rather than as progress. A folded trace row only ever holds
+ * settled calls, so this only matters for the standalone card.
+ */
+function toolDiffStatsFields(
+	item: AdapterToolItem,
+	isStreaming: boolean,
+	metadata: unknown,
+): { diffStats?: { added: number; removed: number } } {
+	if (isStreaming) return {};
+	const stats = resolveFileDiffStats(
+		item.tc.toolName,
+		item.tc.inputJson,
+		metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>) : null,
+	);
+	return stats ? { diffStats: stats } : {};
 }
 
 /** Chunk parity: Bash falls back to a 120s deadline (ToolCallCard.tsx:1327). */
@@ -3386,6 +3515,9 @@ function toolTraceItem(
 		key: toolItemKey(item),
 		summary,
 		status: item.tc.status ?? null,
+		// `+N -N` for a Write/Edit row. Same lane as `status` / `timing`: painted
+		// inside the row's fixed line, height-neutral, and keyed in `traceRevision`.
+		...toolDiffStatsFields(item, isStreamingToolItem(item), resolveToolMetadata(item.tc)),
 		// A live reflection gate's status, so a folded row can show the PURPLE
 		// "deliberating" shimmer instead of reading its tool's `pending` as something
 		// else. Render-only and height-neutral — same lane as `status`.
@@ -3627,10 +3759,35 @@ function adaptActivityItems(
 	//    down by one and a stored index starts addressing a different tool. See
 	//    `AdapterContext.isRowExpanded`.
 	const expandedIndices: number[] = [];
-	for (const item of items) {
+	// Blocks of ONE reasoning run that were already consumed by the run that started
+	// at an earlier item. The fold receives a run block-by-block (the grouper pushes
+	// them individually, sharing `stableKeyBase`), but the steps must come from the
+	// run's WHOLE text so they match the L3+ parse of the same run — see
+	// `canonicalReasoningRunText`. The first block of a run therefore emits every row
+	// for it, and its followers are skipped rather than re-parsed.
+	const consumedReasoningBlocks = new Set<number>();
+	for (const [itemIndex, item] of items.entries()) {
 		if (item.kind === "reasoning") {
-			const block = item.block;
-			const text = block?.thinking ?? block?.text ?? "";
+			if (consumedReasoningBlocks.has(itemIndex)) continue;
+			// Collect this run's remaining blocks: the grouper gives every block of one
+			// run the same `stableKeyBase` with sequential offsets, so a run is a maximal
+			// stretch of adjacent reasoning items sharing that base. Absent bases (older
+			// callers) degrade to a single-block run, which is the previous behaviour.
+			const runItems: Extract<AdapterActivityInput, { kind: "reasoning" }>[] = [item];
+			if (item.stableKeyBase) {
+				for (let next = itemIndex + 1; next < items.length; next++) {
+					const candidate = items[next];
+					if (candidate?.kind !== "reasoning") break;
+					if (candidate.stableKeyBase !== item.stableKeyBase) break;
+					consumedReasoningBlocks.add(next);
+					runItems.push(candidate);
+				}
+			}
+			// Resolves the translation exactly as L3+ does, so both sides parse the same
+			// string and step `sN` means the same step. See reasoningRunDisplayText.
+			const text = reasoningRunDisplayText(
+				runItems.map((runItem) => runItem.block).filter((b): b is AdapterContentBlock => !!b),
+			);
 			// The LIVE row is re-adapted on every stream delta (that is the cost of
 			// folding live content into the trace — see render-units.ts), and the plain
 			// parser is O(len), so a long reasoning stream would be O(len²) over the
@@ -3696,20 +3853,21 @@ function adaptActivityItems(
 					shimmer: streaming && isLast,
 					identity,
 					// Cross-level identity, so this folded step can morph into the
-					// `reasoning-steps` row it becomes at L3+. Derived from the identity the
-					// row already carries — which is absent for a streaming message (its id
-					// changes at the hand-off) — and only for a SINGLE-BLOCK run, where the two
-					// levels' parses provably see the same text. See reasoningStepUnitId.
+					// `reasoning-steps` row it becomes at L3+. See reasoningStepUnitId.
 					//
-					// Falls back to the run-ordinal form otherwise: still unique per row (the
-					// value is painted as `data-nf-unit`), simply without a counterpart to pair.
-					// `blockIndices` is optional on the type, so an ABSENT list must not read as
-					// a single-block run: without knowing the run's extent there is no proof the
-					// two levels parse the same text, which is the whole precondition.
-					unitId:
-						identity && identity.blockIndices?.length === 1
-							? reasoningStepUnitId(identity.messageId, identity.blockIndex, index)
-							: `reason-${keyBase}-${index}`,
+					// No longer gated to a single-block run: the rows above are parsed from
+					// `canonicalReasoningRunText(runItems)`, the same string L3+ parses for
+					// this run, so `index` counts the same steps on both sides by construction.
+					// Before that, a multi-block run's steps could not be paired at all —
+					// which is why an interleaved run showed no animation.
+					//
+					// Still absent for a STREAMING message: its id changes at the hand-off, so
+					// an id-derived identity would address a different row afterwards. Falls
+					// back to the run-ordinal form, unique per row (painted as `data-nf-unit`)
+					// but with no counterpart to pair.
+					unitId: identity
+						? reasoningStepUnitId(identity.messageId, identity.blockIndex, index)
+						: `reason-${keyBase}-${index}`,
 					...(bodyText != null ? { bodyText } : {}),
 					...(liveTail && isLast ? { liveTail } : {}),
 				});

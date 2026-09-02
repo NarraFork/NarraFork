@@ -31,10 +31,12 @@ import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages, narratorToolCalls } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { advanceChapterSnapshot } from "./chapter-snapshot-ref";
 import { specVfsService } from "./spec-vfs-service";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
+import { worktreeWatcher } from "./worktree-watcher";
 import {
 	closeClaim,
 	foreignDeclaredPaths,
@@ -262,17 +264,33 @@ export async function recordTreeSnapshotAfter(
 	}
 
 	let workspaceDelta: string[] = [];
+	let deltaStatuses: { path: string; kind: "added" | "updated" | "deleted" }[] = [];
 	if (before && after && before !== after) {
 		try {
-			workspaceDelta = await worktreeTreeSnapshot.diffPaths(
+			// Statuses rather than bare paths: the same diff answers both questions, and
+			// the file tree cannot patch itself from paths alone (a path that changed does
+			// not say whether a row should appear, refresh, or be removed).
+			deltaStatuses = await worktreeTreeSnapshot.diffPathStatuses(
 				session.cwd,
 				before,
 				after,
 				LOCAL_DEVICE_ID,
 			);
+			workspaceDelta = deltaStatuses.map((entry) => entry.path);
 		} catch (err) {
 			logger.debug("Tree snapshot diff failed", { narratorId, toolUseId, error: String(err) });
 		}
+	}
+
+	// Announce the delta to anything rendering this workspace.
+	//
+	// The WHOLE delta, not the narrower `owned` set computed below: `owned` answers
+	// "who is accountable for this write" (for attribution and rollback), while a file
+	// tree only asks "what does the directory look like now". A neighbour's concurrent
+	// write is not this call's responsibility but it IS on disk, so filtering it out
+	// would leave the tree showing a state that no longer exists.
+	if (deltaStatuses.length > 0) {
+		emitWorkspacePathChanges(session.cwd, narratorId, deltaStatuses);
 	}
 
 	const owned = resolveOwnedPaths(session.cwd, narratorId, toolUseId, workspaceDelta);
@@ -334,6 +352,84 @@ export async function recordTreeSnapshotAfter(
 
 	return { before, after, changedFiles: owned, workspaceDelta };
 }
+
+/**
+ * Publish a tool call's workspace delta to everyone viewing that workspace.
+ *
+ * ## Why this is the good event source
+ *
+ * Unlike the filesystem watcher, this fires from the code that just performed the
+ * write, so it needs no native watcher (which is opt-in — the default deployment
+ * polls git status and observes no paths at all), it has no ignore list to disagree
+ * with, and its paths come from a real `diff-tree` between two boundaries rather
+ * than from OS notifications. It is also inherently deduplicated and coalesced: one
+ * event per tool call, describing the net effect of that call.
+ *
+ * What it does NOT cover, and why the watcher path stays: writes from the user's own
+ * editor, an external build, or a terminal command that ran outside the tool path.
+ * Those have no tool boundary, so only a watcher can see them. The two sources are
+ * complementary and the tree treats both as the same kind of hint.
+ *
+ * ## Fan-out
+ *
+ * Delivered to every narrator attached to the worktree, not just the one that wrote:
+ * a shared worktree can have several sessions open beside each other, and a tree in
+ * any of them is showing the same directory. The attached set is read from the
+ * watcher's registry, which already maintains exactly this mapping — querying the
+ * database for it would put a lookup on the tool-execution hot path.
+ *
+ * Never throws: a failed broadcast must not fail the tool call that succeeded.
+ */
+function emitWorkspacePathChanges(
+	worktreePath: string,
+	actingNarratorId: string,
+	changes: readonly { path: string; kind: "added" | "updated" | "deleted" }[],
+): void {
+	try {
+		// Paths from `diff-tree` are already worktree-relative and `/`-separated, which
+		// is exactly the shape the client keys its cache by — no conversion, and
+		// deliberately no absolute form (that would disclose the host's directory layout
+		// to every subscriber).
+		const bounded = changes.slice(0, MAX_BROADCAST_PATHS);
+		const truncated = bounded.length < changes.length;
+		const attached = worktreeWatcher.getAttachedNarratorIds(worktreePath);
+		// The acting narrator is always a recipient, even when no watcher is registered
+		// for its worktree (a chapterless session, or one whose watcher was torn down):
+		// it is the surface most likely to be showing this tree right now.
+		const recipients = new Set<string>(attached);
+		recipients.add(actingNarratorId);
+
+		for (const narratorId of recipients) {
+			eventBus.emit({
+				type: "narrator:ws_broadcast",
+				narratorId,
+				message: {
+					type: "workspace_paths_changed",
+					narratorId,
+					chapterId: "",
+					toolUseId: "",
+					changes: bounded,
+					truncated,
+				},
+			});
+		}
+	} catch (err) {
+		logger.debug("Failed to broadcast workspace path changes", {
+			worktreePath,
+			error: String(err),
+		});
+	}
+}
+
+/**
+ * Upper bound on paths carried by one broadcast.
+ *
+ * A single tool call can legitimately touch a great many files (a formatter over a
+ * repository, a dependency install). Past this the client is told `truncated` and
+ * revalidates what it has loaded, which is both smaller and more correct than a
+ * enormous path list — see the same trade in the watcher's `MAX_PENDING_PATHS`.
+ */
+const MAX_BROADCAST_PATHS = 500;
 
 /**
  * Narrow a workspace delta to the paths one tool call is attributable for.

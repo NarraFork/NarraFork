@@ -27,6 +27,7 @@ import {
 	Stack,
 	Switch,
 	Table,
+	Tabs,
 	Text,
 	Textarea,
 	TextInput,
@@ -39,10 +40,13 @@ import {
 	IconArchive,
 	IconArchiveOff,
 	IconCheck,
+	IconCpu,
 	IconDeviceFloppy,
+	IconGauge,
 	IconGripVertical,
 	IconPencil,
 	IconRefresh,
+	IconSettings,
 	IconTrash,
 	IconX,
 } from "@tabler/icons-react";
@@ -1139,605 +1143,642 @@ export const CodexSection = React.memo(function CodexSection({
 				</Alert>
 			)}
 
-			{/* Global settings */}
-			<Stack gap="xs">
-				<Group justify="space-between">
-					<Stack gap={2}>
-						<Text size="sm" fw={500}>
-							{t("codexGlobalSettings")}
-						</Text>
-						<Text size="xs" c="dimmed">
-							{t("codexStickySessionsCount", { count: stickySessionCount })}
-						</Text>
-					</Stack>
-					<SegmentedControl
-						size="xs"
-						value={loadBalancingMode}
-						disabled={!canSetLoadBalancingMode}
-						onChange={(v) =>
-							canSetLoadBalancingMode && lbModeMut.mutate(v as CodexLoadBalancingMode)
-						}
-						data={[
-							{ label: t("codexModePriority"), value: "priority" },
-							{ label: t("codexModeBalanced"), value: "balanced" },
-							{ label: t("codexModeTierBalanced"), value: "tier-balanced" },
-						]}
-					/>
-				</Group>
-				<Stack gap={4}>
-					<Group justify="space-between" align="flex-end">
-						<Stack gap={2}>
-							<Text size="xs" fw={500}>
-								{t("codexTierOrder")}
-							</Text>
-							<Text size="xs" c="dimmed">
-								{t("codexTierOrderDesc")}
-							</Text>
-						</Stack>
-						<Button
-							size="compact-xs"
-							variant="subtle"
-							onClick={handleResetTierOrder}
-							loading={tierOrderMut.isPending}
-							disabled={!canSetTierOrder}
-							title={!canSetTierOrder ? providerRouteUnsupportedReason : undefined}
-						>
-							{t("codexTierOrderReset")}
-						</Button>
-					</Group>
-					<DndContext
-						sensors={tierOrderSensors}
-						collisionDetection={closestCenter}
-						onDragEnd={handleTierOrderDragEnd}
-					>
-						<SortableContext items={tierOrder} strategy={rectSortingStrategy}>
-							<Group gap="xs" wrap="wrap">
-								{tierOrder.map((tier) => (
-									<SortableTierChip key={tier} tier={tier} label={getCodexTierLabel(t, tier)} />
-								))}
-							</Group>
-						</SortableContext>
-					</DndContext>
-				</Stack>
-				<ProxyOverrideField
-					value={codexProxy}
-					onChange={(next) => codexProxyMut.mutate(next)}
-					disabled={codexProxyMut.isPending}
-				/>
-				<Group align="flex-end">
-					<Stack gap={4} style={{ flex: 1 }}>
-						<Group gap="xs">
-							<Text size="xs" fw={500}>
-								{t("codexUseWebSocket")}
-							</Text>
-							<Badge size="xs" color="orange" variant="light">
-								{t("codexExperimental")}
-							</Badge>
-						</Group>
-						<Text size="xs" c="dimmed">
-							{t("codexUseWebSocketDesc")}
-						</Text>
-					</Stack>
-					<Switch
-						size="sm"
-						checked={useWebSocket}
-						onChange={(e) => setUseWebSocket(e.currentTarget.checked)}
-						disabled={!canSetUseWebSocket}
-					/>
-					<Button
-						size="xs"
-						onClick={() => canSetUseWebSocket && useWebSocketMut.mutate(useWebSocket)}
-						loading={useWebSocketMut.isPending}
-						disabled={!canSetUseWebSocket}
-						title={!canSetUseWebSocket ? providerRouteUnsupportedReason : undefined}
-					>
-						{t("codexSave")}
-					</Button>
-				</Group>
-				<Group align="flex-end">
-					<Stack gap={4} style={{ flex: 1 }}>
-						<Text size="xs" fw={500}>
-							{t("codexUseWebSearch")}
-						</Text>
-						<Text size="xs" c="dimmed">
-							{t("codexUseWebSearchDesc")}
-						</Text>
-					</Stack>
-					<Switch
-						size="sm"
-						checked={useWebSearch}
-						onChange={(e) => setUseWebSearch(e.currentTarget.checked)}
-						disabled={!canSetUseWebSearch}
-					/>
-					<Button
-						size="xs"
-						onClick={() => canSetUseWebSearch && useWebSearchMut.mutate(useWebSearch)}
-						loading={useWebSearchMut.isPending}
-						disabled={!canSetUseWebSearch}
-						title={!canSetUseWebSearch ? providerRouteUnsupportedReason : undefined}
-					>
-						{t("codexSave")}
-					</Button>
-				</Group>
-				<Group align="flex-end">
-					<Stack gap={4} style={{ flex: 1 }}>
-						<Text size="xs" fw={500}>
-							{t("codexUseImageGeneration")}
-						</Text>
-						<Text size="xs" c="dimmed">
-							{t("codexUseImageGenerationDesc")}
-						</Text>
-					</Stack>
-					<Switch
-						size="sm"
-						checked={useImageGeneration}
-						onChange={(e) => setUseImageGeneration(e.currentTarget.checked)}
-						disabled={!canSetUseImageGeneration}
-					/>
-					<Button
-						size="xs"
-						onClick={() =>
-							canSetUseImageGeneration && useImageGenerationMut.mutate(useImageGeneration)
-						}
-						loading={useImageGenerationMut.isPending}
-						disabled={!canSetUseImageGeneration}
-						title={!canSetUseImageGeneration ? providerRouteUnsupportedReason : undefined}
-					>
-						{t("codexSave")}
-					</Button>
-				</Group>
-			</Stack>
+			<Tabs defaultValue="overview" keepMounted={false}>
+				<Tabs.List>
+					<Tabs.Tab value="overview" leftSection={<IconGauge size={14} />}>
+						{t("codexTabOverview")}
+					</Tabs.Tab>
+					<Tabs.Tab value="settings" leftSection={<IconSettings size={14} />}>
+						{t("codexTabSettings")}
+					</Tabs.Tab>
+					<Tabs.Tab value="models" leftSection={<IconCpu size={14} />}>
+						{t("codexTabModels")}
+					</Tabs.Tab>
+				</Tabs.List>
 
-			{/* Client fingerprint */}
-			<Stack gap="xs">
-				<Group gap="xs">
-					<Text size="sm" fw={500}>
-						{t("fingerprintTitle")}
-					</Text>
-				</Group>
-				<Text size="xs" c="dimmed">
-					{t("fingerprintDesc")}
-				</Text>
-				<ClientFingerprintFields
-					value={fingerprint}
-					showInstallationId
-					installationId={fingerprintData?.installationId}
-					disabled={!canSetFingerprint}
-					regenerating={regenerateInstallationIdMut.isPending}
-					onRegenerateInstallationId={() => regenerateInstallationIdMut.mutate()}
-					onChange={(next) => setFingerprint((prev) => ({ ...prev, ...next }))}
-				/>
-				<Group justify="flex-end">
-					<Button
-						size="xs"
-						onClick={() => canSetFingerprint && fingerprintMut.mutate(fingerprint)}
-						loading={fingerprintMut.isPending}
-						disabled={!canSetFingerprint}
-						title={!canSetFingerprint ? providerRouteUnsupportedReason : undefined}
-					>
-						{t("codexSave")}
-					</Button>
-				</Group>
-			</Stack>
-
-			{/* Add credentials */}
-			<Stack gap="xs">
-				<Text size="sm" fw={500}>
-					{t("codexAddCredentials")}
-				</Text>
-				{browserAuthPending ? (
-					<Paper withBorder p="sm" bg="blue.0">
-						<Stack gap="xs">
-							<Group gap="xs">
-								<Text size="sm" c="blue">
-									{t("codexBrowserAuthWaiting")}
-								</Text>
-							</Group>
-							{/* Manual callback URL: the redirect targets localhost on the
-							    user's machine, which never reaches a remote NarraFork host. */}
-							<Text size="xs" c="dimmed">
-								{t("codexBrowserCallbackDesc", {
-									redirectUri: browserRedirectUri ?? "http://localhost:1455/auth/callback",
-								})}
-							</Text>
-							<Textarea
-								size="xs"
-								placeholder={t("codexBrowserCallbackPlaceholder")}
-								value={browserCallbackUrl}
-								onChange={(e) => setBrowserCallbackUrl(e.currentTarget.value)}
-								minRows={2}
-								maxRows={4}
-								autosize
-								disabled={!canImportBrowserCallback}
-							/>
-							<Group gap="xs">
-								<Button
-									size="xs"
-									onClick={handleImportBrowserCallback}
-									loading={importBrowserCallbackMut.isPending}
-									disabled={!browserCallbackUrl.trim() || !canImportBrowserCallback}
-									title={!canImportBrowserCallback ? providerRouteUnsupportedReason : undefined}
-								>
-									{t("codexBrowserCallbackSubmit")}
-								</Button>
-								<Button
-									size="xs"
-									variant="light"
-									color="orange"
-									onClick={handleCancelBrowserAuth}
-									disabled={!canCancelBrowserAuth}
-									title={!canCancelBrowserAuth ? providerRouteUnsupportedReason : undefined}
-								>
-									{t("codexBrowserAuthCancel")}
-								</Button>
-							</Group>
-						</Stack>
-					</Paper>
-				) : (
-					<Group>
-						<Button
-							size="xs"
-							onClick={handleBrowserAuth}
-							loading={browserAuthLoading}
-							disabled={!canStartBrowserAuth}
-							title={!canStartBrowserAuth ? providerRouteUnsupportedReason : undefined}
-						>
-							{t("codexAddBrowser")}
-						</Button>
-						<Button
-							size="xs"
-							variant="light"
-							onClick={handleDeviceAuth}
-							disabled={!canRunDeviceAuth}
-							title={!canRunDeviceAuth ? providerRouteUnsupportedReason : undefined}
-						>
-							{t("codexAddDevice")}
-						</Button>
-					</Group>
-				)}
-			</Stack>
-
-			{/* Import credentials */}
-			<Stack gap="xs">
-				<Text size="sm" fw={500}>
-					{t("codexImportTitle")}
-				</Text>
-				<Text size="xs" c="dimmed">
-					{t("codexImportDesc")}
-				</Text>
-				<Textarea
-					size="xs"
-					placeholder={t("codexImportPlaceholder")}
-					value={importJson}
-					onChange={(e) => setImportJson(e.target.value)}
-					minRows={4}
-					maxRows={8}
-				/>
-				{importError && (
-					<Text size="xs" c="red">
-						{importError}
-					</Text>
-				)}
-				{importResult && (
-					<Text size="xs" c="green">
-						{importResult}
-					</Text>
-				)}
-				<Group>
-					<Button
-						size="xs"
-						onClick={handleImport}
-						loading={importMut.isPending}
-						disabled={!importJson.trim() || !canImportCredentials}
-						title={!canImportCredentials ? providerRouteUnsupportedReason : undefined}
-					>
-						{t("codexImport")}
-					</Button>
-					<Button
-						size="xs"
-						variant="subtle"
-						onClick={() => {
-							setImportJson("");
-							setImportError(null);
-							setImportResult(null);
-						}}
-					>
-						{t("codexClear")}
-					</Button>
-				</Group>
-			</Stack>
-
-			{/* Usage fetch queue progress */}
-			{status?.usageQueue && status.usageQueue.items.length > 0 && (
-				<Paper withBorder p="sm">
-					<Stack gap="xs">
-						<Group justify="space-between">
-							<Text size="sm" fw={500}>
-								{t("codexUsageQueueTitle")}
-							</Text>
-							<Button
-								size="compact-xs"
-								variant="subtle"
-								onClick={() => canClearUsageQueue && usageQueueClearMut.mutate()}
-								loading={usageQueueClearMut.isPending}
-								disabled={!canClearUsageQueue}
-								title={
-									!canClearUsageQueue
-										? usageQueueClearSupported
-											? providerRouteUnsupportedReason
-											: t("codexUsageQueueClearUnsupported")
-										: undefined
-								}
-							>
-								{t("codexUsageQueueClear")}
-							</Button>
-						</Group>
-						{(() => {
-							const items = status?.usageQueue?.items ?? [];
-							const total = items.length;
-							const done = items.filter((i) => i.status === "done").length;
-							const failed = items.filter((i) => i.status === "failed").length;
-							const pending = items.filter(
-								(i) => i.status === "pending" || i.status === "processing",
-							).length;
-							const pct = total > 0 ? ((done + failed) / total) * 100 : 0;
-							return (
-								<>
-									<Progress
-										value={pct}
-										size="sm"
-										color={failed > 0 ? "orange" : "indigo"}
-										animated={status?.usageQueue?.isRunning ?? false}
-									/>
-									<Text size="xs" c="dimmed">
-										{pending > 0
-											? t("codexUsageQueueProgress", {
-													done,
-													total,
-													pending,
-													failed,
-												})
-											: t("codexUsageQueueDone")}
-									</Text>
-								</>
-							);
-						})()}
-					</Stack>
-				</Paper>
-			)}
-
-			{status?.usageSummary && status?.usageForecast && status?.usageScheduler && (
-				<CodexQuotaOverview
-					summary={status.usageSummary}
-					trend={status.usageForecast}
-					scheduler={status.usageScheduler}
-					tierOrder={tierOrder}
-				/>
-			)}
-
-			{/* Credentials list (responsive: cards on mobile, table on desktop) */}
-			{(status?.total ?? 0) > 0 && (
-				<Stack gap="xs">
-					<Group justify="space-between" align="center">
-						<Group gap="xs">
-							<Text size="sm" fw={500}>
-								{t("codexCredentials")}
-							</Text>
-							<Badge size="sm" color={availableTotal > 0 ? "green" : "red"}>
-								{availableTotal} / {status?.total ?? 0}
-							</Badge>
-						</Group>
-						<Group gap="xs">
-							{selectedIds.size > 0 && (
-								<Button
-									size="compact-xs"
-									color="red"
-									variant="light"
-									leftSection={<IconTrash size={14} />}
-									onClick={handleBatchDelete}
-									loading={batchDeleteMut.isPending}
-									disabled={!canBatchDeleteCredentials}
-									title={!canBatchDeleteCredentials ? providerRouteUnsupportedReason : undefined}
-								>
-									{t("credentialBatchDelete")} ({selectedIds.size})
-								</Button>
-							)}
-							<Button
-								size="compact-xs"
-								color="red"
-								variant="outline"
-								leftSection={<IconTrash size={14} />}
-								onClick={handleDeleteUnhealthy}
-								loading={deleteUnhealthyMut.isPending}
-								disabled={!canDeleteUnhealthyCredentials || unhealthyTotal === 0}
-								title={!canDeleteUnhealthyCredentials ? providerRouteUnsupportedReason : undefined}
-							>
-								{t("credentialDeleteUnhealthy")} ({unhealthyTotal})
-							</Button>
-						</Group>
-					</Group>
-					{availableTotal > 0 && (
-						<Stack gap="xs">
-							<Group justify="space-between">
-								<Text size="sm" fw={500}>
-									{t("codexCredentialsAvailable")}
-								</Text>
-								<Badge size="sm" color="green">
-									{availableTotal}
-								</Badge>
-							</Group>
-							<CredentialList
-								entries={availableEntries}
-								totalEntries={availableTotal}
-								page={availablePage}
-								pageSize={PAGE_SIZE}
-								onPageChange={setAvailablePage}
-								currentId={status?.currentId}
-								usageCache={usageCache}
-								lifetimeTotals={lifetimeTotals}
-								editingId={editingId}
-								editForm={editForm}
-								onEdit={handleEdit}
-								onSaveEdit={handleSaveEdit}
-								onCancelEdit={() => setEditingId(null)}
-								onEditFormChange={setEditForm}
-								usageMut={usageMut}
-								enableMut={enableMut}
-								disableMut={disableMut}
-								resetMut={resetMut}
-								deleteMut={deleteMut}
-								archiveMut={archiveMut}
-								unarchiveMut={unarchiveMut}
-								selectedIds={selectedIds}
-								onToggleSelect={toggleSelect}
-								onToggleSelectAll={toggleSelectAll}
-								t={t}
-								canQueryCredentialUsage={canQueryCredentialUsage}
-								canEnableCredential={canEnableCredential}
-								canDisableCredential={canDisableCredential}
-								canResetCredential={canResetCredential}
-								canUpdateCredential={canUpdateCredential}
-								canDeleteCredential={canDeleteCredential}
-								canArchiveCredential={canArchiveCredential}
-								credentialRouteUnsupportedReason={providerRouteUnsupportedReason}
-							/>
-						</Stack>
-					)}
-
-					{unavailableTotal > 0 && (
-						<Stack gap="xs">
-							<Group justify="space-between">
-								<Text size="sm" fw={500}>
-									{t("codexCredentialsUnavailable")}
-								</Text>
-								<Badge size="sm" color="red">
-									{unavailableTotal}
-								</Badge>
-							</Group>
-							<CredentialList
-								entries={unavailableEntries}
-								totalEntries={unavailableTotal}
-								page={unavailablePage}
-								pageSize={PAGE_SIZE}
-								onPageChange={setUnavailablePage}
-								currentId={status?.currentId}
-								usageCache={usageCache}
-								lifetimeTotals={lifetimeTotals}
-								editingId={editingId}
-								editForm={editForm}
-								onEdit={handleEdit}
-								onSaveEdit={handleSaveEdit}
-								onCancelEdit={() => setEditingId(null)}
-								onEditFormChange={setEditForm}
-								usageMut={usageMut}
-								enableMut={enableMut}
-								disableMut={disableMut}
-								resetMut={resetMut}
-								deleteMut={deleteMut}
-								archiveMut={archiveMut}
-								unarchiveMut={unarchiveMut}
-								selectedIds={selectedIds}
-								onToggleSelect={toggleSelect}
-								onToggleSelectAll={toggleSelectAll}
-								t={t}
-								canQueryCredentialUsage={canQueryCredentialUsage}
-								canEnableCredential={canEnableCredential}
-								canDisableCredential={canDisableCredential}
-								canResetCredential={canResetCredential}
-								canUpdateCredential={canUpdateCredential}
-								canDeleteCredential={canDeleteCredential}
-								canArchiveCredential={canArchiveCredential}
-								credentialRouteUnsupportedReason={providerRouteUnsupportedReason}
-							/>
-						</Stack>
-					)}
-
-					{archivedTotal > 0 && (
+				{/* Settings tab: request behaviour + client fingerprint */}
+				<Tabs.Panel value="settings" pt="md">
+					<Stack gap="md">
+						{/* Global settings */}
 						<Stack gap="xs">
 							<Group justify="space-between">
 								<Stack gap={2}>
 									<Text size="sm" fw={500}>
-										{t("codexCredentialsArchived")}
+										{t("codexGlobalSettings")}
 									</Text>
 									<Text size="xs" c="dimmed">
-										{t("codexCredentialsArchivedDesc")}
+										{t("codexStickySessionsCount", { count: stickySessionCount })}
 									</Text>
 								</Stack>
-								<Badge size="sm" color="gray">
-									{archivedTotal}
-								</Badge>
+								<SegmentedControl
+									size="xs"
+									value={loadBalancingMode}
+									disabled={!canSetLoadBalancingMode}
+									onChange={(v) =>
+										canSetLoadBalancingMode && lbModeMut.mutate(v as CodexLoadBalancingMode)
+									}
+									data={[
+										{ label: t("codexModePriority"), value: "priority" },
+										{ label: t("codexModeBalanced"), value: "balanced" },
+										{ label: t("codexModeTierBalanced"), value: "tier-balanced" },
+									]}
+								/>
 							</Group>
-							<CredentialList
-								entries={archivedEntries}
-								totalEntries={archivedTotal}
-								page={archivedPage}
-								pageSize={PAGE_SIZE}
-								onPageChange={setArchivedPage}
-								currentId={status?.currentId}
-								usageCache={usageCache}
-								lifetimeTotals={lifetimeTotals}
-								editingId={editingId}
-								editForm={editForm}
-								onEdit={handleEdit}
-								onSaveEdit={handleSaveEdit}
-								onCancelEdit={() => setEditingId(null)}
-								onEditFormChange={setEditForm}
-								usageMut={usageMut}
-								enableMut={enableMut}
-								disableMut={disableMut}
-								resetMut={resetMut}
-								deleteMut={deleteMut}
-								archiveMut={archiveMut}
-								unarchiveMut={unarchiveMut}
-								selectedIds={selectedIds}
-								onToggleSelect={toggleSelect}
-								onToggleSelectAll={toggleSelectAll}
-								t={t}
-								canQueryCredentialUsage={canQueryCredentialUsage}
-								canEnableCredential={canEnableCredential}
-								canDisableCredential={canDisableCredential}
-								canResetCredential={canResetCredential}
-								canUpdateCredential={canUpdateCredential}
-								canDeleteCredential={canDeleteCredential}
-								canArchiveCredential={canArchiveCredential}
-								credentialRouteUnsupportedReason={providerRouteUnsupportedReason}
+							<Stack gap={4}>
+								<Group justify="space-between" align="flex-end">
+									<Stack gap={2}>
+										<Text size="xs" fw={500}>
+											{t("codexTierOrder")}
+										</Text>
+										<Text size="xs" c="dimmed">
+											{t("codexTierOrderDesc")}
+										</Text>
+									</Stack>
+									<Button
+										size="compact-xs"
+										variant="subtle"
+										onClick={handleResetTierOrder}
+										loading={tierOrderMut.isPending}
+										disabled={!canSetTierOrder}
+										title={!canSetTierOrder ? providerRouteUnsupportedReason : undefined}
+									>
+										{t("codexTierOrderReset")}
+									</Button>
+								</Group>
+								<DndContext
+									sensors={tierOrderSensors}
+									collisionDetection={closestCenter}
+									onDragEnd={handleTierOrderDragEnd}
+								>
+									<SortableContext items={tierOrder} strategy={rectSortingStrategy}>
+										<Group gap="xs" wrap="wrap">
+											{tierOrder.map((tier) => (
+												<SortableTierChip
+													key={tier}
+													tier={tier}
+													label={getCodexTierLabel(t, tier)}
+												/>
+											))}
+										</Group>
+									</SortableContext>
+								</DndContext>
+							</Stack>
+							<ProxyOverrideField
+								value={codexProxy}
+								onChange={(next) => codexProxyMut.mutate(next)}
+								disabled={codexProxyMut.isPending}
 							/>
+							<Group align="flex-end">
+								<Stack gap={4} style={{ flex: 1 }}>
+									<Group gap="xs">
+										<Text size="xs" fw={500}>
+											{t("codexUseWebSocket")}
+										</Text>
+										<Badge size="xs" color="orange" variant="light">
+											{t("codexExperimental")}
+										</Badge>
+									</Group>
+									<Text size="xs" c="dimmed">
+										{t("codexUseWebSocketDesc")}
+									</Text>
+								</Stack>
+								<Switch
+									size="sm"
+									checked={useWebSocket}
+									onChange={(e) => setUseWebSocket(e.currentTarget.checked)}
+									disabled={!canSetUseWebSocket}
+								/>
+								<Button
+									size="xs"
+									onClick={() => canSetUseWebSocket && useWebSocketMut.mutate(useWebSocket)}
+									loading={useWebSocketMut.isPending}
+									disabled={!canSetUseWebSocket}
+									title={!canSetUseWebSocket ? providerRouteUnsupportedReason : undefined}
+								>
+									{t("codexSave")}
+								</Button>
+							</Group>
+							<Group align="flex-end">
+								<Stack gap={4} style={{ flex: 1 }}>
+									<Text size="xs" fw={500}>
+										{t("codexUseWebSearch")}
+									</Text>
+									<Text size="xs" c="dimmed">
+										{t("codexUseWebSearchDesc")}
+									</Text>
+								</Stack>
+								<Switch
+									size="sm"
+									checked={useWebSearch}
+									onChange={(e) => setUseWebSearch(e.currentTarget.checked)}
+									disabled={!canSetUseWebSearch}
+								/>
+								<Button
+									size="xs"
+									onClick={() => canSetUseWebSearch && useWebSearchMut.mutate(useWebSearch)}
+									loading={useWebSearchMut.isPending}
+									disabled={!canSetUseWebSearch}
+									title={!canSetUseWebSearch ? providerRouteUnsupportedReason : undefined}
+								>
+									{t("codexSave")}
+								</Button>
+							</Group>
+							<Group align="flex-end">
+								<Stack gap={4} style={{ flex: 1 }}>
+									<Text size="xs" fw={500}>
+										{t("codexUseImageGeneration")}
+									</Text>
+									<Text size="xs" c="dimmed">
+										{t("codexUseImageGenerationDesc")}
+									</Text>
+								</Stack>
+								<Switch
+									size="sm"
+									checked={useImageGeneration}
+									onChange={(e) => setUseImageGeneration(e.currentTarget.checked)}
+									disabled={!canSetUseImageGeneration}
+								/>
+								<Button
+									size="xs"
+									onClick={() =>
+										canSetUseImageGeneration && useImageGenerationMut.mutate(useImageGeneration)
+									}
+									loading={useImageGenerationMut.isPending}
+									disabled={!canSetUseImageGeneration}
+									title={!canSetUseImageGeneration ? providerRouteUnsupportedReason : undefined}
+								>
+									{t("codexSave")}
+								</Button>
+							</Group>
 						</Stack>
-					)}
-				</Stack>
-			)}
 
-			{/* Models section */}
-			<Stack gap="xs">
-				<Text size="sm" fw={500}>
-					{t("codexModels")}
-				</Text>
-				<Text size="xs" c="dimmed">
-					{t("codexModelsDesc")}
-				</Text>
-				{codexModelIds.length > 0 && (
-					<ModelList
-						models={codexModelIds.map((id) => ({ value: `codex:${id}`, label: id }))}
-						hiddenModels={hiddenModels}
-						onToggleHidden={onToggleHidden}
-						modelContextWindows={modelContextWindows}
-						defaultContextWindows={builtinContextWindows}
-						onContextWindowChange={onContextWindowChange}
-						onTestModel={onTestModel}
-						showContextWindow
-					/>
-				)}
-				<InlineCustomModels
-					prefix="codex"
-					customModels={customModels}
-					onCustomModelsChange={onCustomModelsChange}
-					hiddenModels={hiddenModels}
-					onToggleHidden={onToggleHidden}
-					modelContextWindows={modelContextWindows}
-					onContextWindowChange={onContextWindowChange}
-					onTestModel={onTestModel}
-				/>
-			</Stack>
+						{/* Client fingerprint */}
+						<Stack gap="xs">
+							<Group gap="xs">
+								<Text size="sm" fw={500}>
+									{t("fingerprintTitle")}
+								</Text>
+							</Group>
+							<Text size="xs" c="dimmed">
+								{t("fingerprintDesc")}
+							</Text>
+							<ClientFingerprintFields
+								value={fingerprint}
+								showInstallationId
+								installationId={fingerprintData?.installationId}
+								disabled={!canSetFingerprint}
+								regenerating={regenerateInstallationIdMut.isPending}
+								onRegenerateInstallationId={() => regenerateInstallationIdMut.mutate()}
+								onChange={(next) => setFingerprint((prev) => ({ ...prev, ...next }))}
+							/>
+							<Group justify="flex-end">
+								<Button
+									size="xs"
+									onClick={() => canSetFingerprint && fingerprintMut.mutate(fingerprint)}
+									loading={fingerprintMut.isPending}
+									disabled={!canSetFingerprint}
+									title={!canSetFingerprint ? providerRouteUnsupportedReason : undefined}
+								>
+									{t("codexSave")}
+								</Button>
+							</Group>
+						</Stack>
+					</Stack>
+				</Tabs.Panel>
+
+				{/* Overview tab (default): quota overview + account management */}
+				<Tabs.Panel value="overview" pt="md">
+					<Stack gap="md">
+						{/* Add credentials */}
+						<Stack gap="xs">
+							<Text size="sm" fw={500}>
+								{t("codexAddCredentials")}
+							</Text>
+							{browserAuthPending ? (
+								<Paper withBorder p="sm" bg="blue.0">
+									<Stack gap="xs">
+										<Group gap="xs">
+											<Text size="sm" c="blue">
+												{t("codexBrowserAuthWaiting")}
+											</Text>
+										</Group>
+										{/* Manual callback URL: the redirect targets localhost on the
+							    user's machine, which never reaches a remote NarraFork host. */}
+										<Text size="xs" c="dimmed">
+											{t("codexBrowserCallbackDesc", {
+												redirectUri: browserRedirectUri ?? "http://localhost:1455/auth/callback",
+											})}
+										</Text>
+										<Textarea
+											size="xs"
+											placeholder={t("codexBrowserCallbackPlaceholder")}
+											value={browserCallbackUrl}
+											onChange={(e) => setBrowserCallbackUrl(e.currentTarget.value)}
+											minRows={2}
+											maxRows={4}
+											autosize
+											disabled={!canImportBrowserCallback}
+										/>
+										<Group gap="xs">
+											<Button
+												size="xs"
+												onClick={handleImportBrowserCallback}
+												loading={importBrowserCallbackMut.isPending}
+												disabled={!browserCallbackUrl.trim() || !canImportBrowserCallback}
+												title={
+													!canImportBrowserCallback ? providerRouteUnsupportedReason : undefined
+												}
+											>
+												{t("codexBrowserCallbackSubmit")}
+											</Button>
+											<Button
+												size="xs"
+												variant="light"
+												color="orange"
+												onClick={handleCancelBrowserAuth}
+												disabled={!canCancelBrowserAuth}
+												title={!canCancelBrowserAuth ? providerRouteUnsupportedReason : undefined}
+											>
+												{t("codexBrowserAuthCancel")}
+											</Button>
+										</Group>
+									</Stack>
+								</Paper>
+							) : (
+								<Group>
+									<Button
+										size="xs"
+										onClick={handleBrowserAuth}
+										loading={browserAuthLoading}
+										disabled={!canStartBrowserAuth}
+										title={!canStartBrowserAuth ? providerRouteUnsupportedReason : undefined}
+									>
+										{t("codexAddBrowser")}
+									</Button>
+									<Button
+										size="xs"
+										variant="light"
+										onClick={handleDeviceAuth}
+										disabled={!canRunDeviceAuth}
+										title={!canRunDeviceAuth ? providerRouteUnsupportedReason : undefined}
+									>
+										{t("codexAddDevice")}
+									</Button>
+								</Group>
+							)}
+						</Stack>
+
+						{/* Import credentials */}
+						<Stack gap="xs">
+							<Text size="sm" fw={500}>
+								{t("codexImportTitle")}
+							</Text>
+							<Text size="xs" c="dimmed">
+								{t("codexImportDesc")}
+							</Text>
+							<Textarea
+								size="xs"
+								placeholder={t("codexImportPlaceholder")}
+								value={importJson}
+								onChange={(e) => setImportJson(e.target.value)}
+								minRows={4}
+								maxRows={8}
+							/>
+							{importError && (
+								<Text size="xs" c="red">
+									{importError}
+								</Text>
+							)}
+							{importResult && (
+								<Text size="xs" c="green">
+									{importResult}
+								</Text>
+							)}
+							<Group>
+								<Button
+									size="xs"
+									onClick={handleImport}
+									loading={importMut.isPending}
+									disabled={!importJson.trim() || !canImportCredentials}
+									title={!canImportCredentials ? providerRouteUnsupportedReason : undefined}
+								>
+									{t("codexImport")}
+								</Button>
+								<Button
+									size="xs"
+									variant="subtle"
+									onClick={() => {
+										setImportJson("");
+										setImportError(null);
+										setImportResult(null);
+									}}
+								>
+									{t("codexClear")}
+								</Button>
+							</Group>
+						</Stack>
+
+						{/* Usage fetch queue progress */}
+						{status?.usageQueue && status.usageQueue.items.length > 0 && (
+							<Paper withBorder p="sm">
+								<Stack gap="xs">
+									<Group justify="space-between">
+										<Text size="sm" fw={500}>
+											{t("codexUsageQueueTitle")}
+										</Text>
+										<Button
+											size="compact-xs"
+											variant="subtle"
+											onClick={() => canClearUsageQueue && usageQueueClearMut.mutate()}
+											loading={usageQueueClearMut.isPending}
+											disabled={!canClearUsageQueue}
+											title={
+												!canClearUsageQueue
+													? usageQueueClearSupported
+														? providerRouteUnsupportedReason
+														: t("codexUsageQueueClearUnsupported")
+													: undefined
+											}
+										>
+											{t("codexUsageQueueClear")}
+										</Button>
+									</Group>
+									{(() => {
+										const items = status?.usageQueue?.items ?? [];
+										const total = items.length;
+										const done = items.filter((i) => i.status === "done").length;
+										const failed = items.filter((i) => i.status === "failed").length;
+										const pending = items.filter(
+											(i) => i.status === "pending" || i.status === "processing",
+										).length;
+										const pct = total > 0 ? ((done + failed) / total) * 100 : 0;
+										return (
+											<>
+												<Progress
+													value={pct}
+													size="sm"
+													color={failed > 0 ? "orange" : "indigo"}
+													animated={status?.usageQueue?.isRunning ?? false}
+												/>
+												<Text size="xs" c="dimmed">
+													{pending > 0
+														? t("codexUsageQueueProgress", {
+																done,
+																total,
+																pending,
+																failed,
+															})
+														: t("codexUsageQueueDone")}
+												</Text>
+											</>
+										);
+									})()}
+								</Stack>
+							</Paper>
+						)}
+
+						{status?.usageSummary && status?.usageForecast && status?.usageScheduler && (
+							<CodexQuotaOverview
+								summary={status.usageSummary}
+								trend={status.usageForecast}
+								scheduler={status.usageScheduler}
+								tierOrder={tierOrder}
+							/>
+						)}
+
+						{/* Credentials list (responsive: cards on mobile, table on desktop) */}
+						{(status?.total ?? 0) > 0 && (
+							<Stack gap="xs">
+								<Group justify="space-between" align="center">
+									<Group gap="xs">
+										<Text size="sm" fw={500}>
+											{t("codexCredentials")}
+										</Text>
+										<Badge size="sm" color={availableTotal > 0 ? "green" : "red"}>
+											{availableTotal} / {status?.total ?? 0}
+										</Badge>
+									</Group>
+									<Group gap="xs">
+										{selectedIds.size > 0 && (
+											<Button
+												size="compact-xs"
+												color="red"
+												variant="light"
+												leftSection={<IconTrash size={14} />}
+												onClick={handleBatchDelete}
+												loading={batchDeleteMut.isPending}
+												disabled={!canBatchDeleteCredentials}
+												title={
+													!canBatchDeleteCredentials ? providerRouteUnsupportedReason : undefined
+												}
+											>
+												{t("credentialBatchDelete")} ({selectedIds.size})
+											</Button>
+										)}
+										<Button
+											size="compact-xs"
+											color="red"
+											variant="outline"
+											leftSection={<IconTrash size={14} />}
+											onClick={handleDeleteUnhealthy}
+											loading={deleteUnhealthyMut.isPending}
+											disabled={!canDeleteUnhealthyCredentials || unhealthyTotal === 0}
+											title={
+												!canDeleteUnhealthyCredentials ? providerRouteUnsupportedReason : undefined
+											}
+										>
+											{t("credentialDeleteUnhealthy")} ({unhealthyTotal})
+										</Button>
+									</Group>
+								</Group>
+								{availableTotal > 0 && (
+									<Stack gap="xs">
+										<Group justify="space-between">
+											<Text size="sm" fw={500}>
+												{t("codexCredentialsAvailable")}
+											</Text>
+											<Badge size="sm" color="green">
+												{availableTotal}
+											</Badge>
+										</Group>
+										<CredentialList
+											entries={availableEntries}
+											totalEntries={availableTotal}
+											page={availablePage}
+											pageSize={PAGE_SIZE}
+											onPageChange={setAvailablePage}
+											currentId={status?.currentId}
+											usageCache={usageCache}
+											lifetimeTotals={lifetimeTotals}
+											editingId={editingId}
+											editForm={editForm}
+											onEdit={handleEdit}
+											onSaveEdit={handleSaveEdit}
+											onCancelEdit={() => setEditingId(null)}
+											onEditFormChange={setEditForm}
+											usageMut={usageMut}
+											enableMut={enableMut}
+											disableMut={disableMut}
+											resetMut={resetMut}
+											deleteMut={deleteMut}
+											archiveMut={archiveMut}
+											unarchiveMut={unarchiveMut}
+											selectedIds={selectedIds}
+											onToggleSelect={toggleSelect}
+											onToggleSelectAll={toggleSelectAll}
+											t={t}
+											canQueryCredentialUsage={canQueryCredentialUsage}
+											canEnableCredential={canEnableCredential}
+											canDisableCredential={canDisableCredential}
+											canResetCredential={canResetCredential}
+											canUpdateCredential={canUpdateCredential}
+											canDeleteCredential={canDeleteCredential}
+											canArchiveCredential={canArchiveCredential}
+											credentialRouteUnsupportedReason={providerRouteUnsupportedReason}
+										/>
+									</Stack>
+								)}
+
+								{unavailableTotal > 0 && (
+									<Stack gap="xs">
+										<Group justify="space-between">
+											<Text size="sm" fw={500}>
+												{t("codexCredentialsUnavailable")}
+											</Text>
+											<Badge size="sm" color="red">
+												{unavailableTotal}
+											</Badge>
+										</Group>
+										<CredentialList
+											entries={unavailableEntries}
+											totalEntries={unavailableTotal}
+											page={unavailablePage}
+											pageSize={PAGE_SIZE}
+											onPageChange={setUnavailablePage}
+											currentId={status?.currentId}
+											usageCache={usageCache}
+											lifetimeTotals={lifetimeTotals}
+											editingId={editingId}
+											editForm={editForm}
+											onEdit={handleEdit}
+											onSaveEdit={handleSaveEdit}
+											onCancelEdit={() => setEditingId(null)}
+											onEditFormChange={setEditForm}
+											usageMut={usageMut}
+											enableMut={enableMut}
+											disableMut={disableMut}
+											resetMut={resetMut}
+											deleteMut={deleteMut}
+											archiveMut={archiveMut}
+											unarchiveMut={unarchiveMut}
+											selectedIds={selectedIds}
+											onToggleSelect={toggleSelect}
+											onToggleSelectAll={toggleSelectAll}
+											t={t}
+											canQueryCredentialUsage={canQueryCredentialUsage}
+											canEnableCredential={canEnableCredential}
+											canDisableCredential={canDisableCredential}
+											canResetCredential={canResetCredential}
+											canUpdateCredential={canUpdateCredential}
+											canDeleteCredential={canDeleteCredential}
+											canArchiveCredential={canArchiveCredential}
+											credentialRouteUnsupportedReason={providerRouteUnsupportedReason}
+										/>
+									</Stack>
+								)}
+
+								{archivedTotal > 0 && (
+									<Stack gap="xs">
+										<Group justify="space-between">
+											<Stack gap={2}>
+												<Text size="sm" fw={500}>
+													{t("codexCredentialsArchived")}
+												</Text>
+												<Text size="xs" c="dimmed">
+													{t("codexCredentialsArchivedDesc")}
+												</Text>
+											</Stack>
+											<Badge size="sm" color="gray">
+												{archivedTotal}
+											</Badge>
+										</Group>
+										<CredentialList
+											entries={archivedEntries}
+											totalEntries={archivedTotal}
+											page={archivedPage}
+											pageSize={PAGE_SIZE}
+											onPageChange={setArchivedPage}
+											currentId={status?.currentId}
+											usageCache={usageCache}
+											lifetimeTotals={lifetimeTotals}
+											editingId={editingId}
+											editForm={editForm}
+											onEdit={handleEdit}
+											onSaveEdit={handleSaveEdit}
+											onCancelEdit={() => setEditingId(null)}
+											onEditFormChange={setEditForm}
+											usageMut={usageMut}
+											enableMut={enableMut}
+											disableMut={disableMut}
+											resetMut={resetMut}
+											deleteMut={deleteMut}
+											archiveMut={archiveMut}
+											unarchiveMut={unarchiveMut}
+											selectedIds={selectedIds}
+											onToggleSelect={toggleSelect}
+											onToggleSelectAll={toggleSelectAll}
+											t={t}
+											canQueryCredentialUsage={canQueryCredentialUsage}
+											canEnableCredential={canEnableCredential}
+											canDisableCredential={canDisableCredential}
+											canResetCredential={canResetCredential}
+											canUpdateCredential={canUpdateCredential}
+											canDeleteCredential={canDeleteCredential}
+											canArchiveCredential={canArchiveCredential}
+											credentialRouteUnsupportedReason={providerRouteUnsupportedReason}
+										/>
+									</Stack>
+								)}
+							</Stack>
+						)}
+					</Stack>
+				</Tabs.Panel>
+
+				{/* Models tab */}
+				<Tabs.Panel value="models" pt="md">
+					{/* Models section */}
+					<Stack gap="xs">
+						<Text size="sm" fw={500}>
+							{t("codexModels")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("codexModelsDesc")}
+						</Text>
+						{codexModelIds.length > 0 && (
+							<ModelList
+								models={codexModelIds.map((id) => ({ value: `codex:${id}`, label: id }))}
+								hiddenModels={hiddenModels}
+								onToggleHidden={onToggleHidden}
+								modelContextWindows={modelContextWindows}
+								defaultContextWindows={builtinContextWindows}
+								onContextWindowChange={onContextWindowChange}
+								onTestModel={onTestModel}
+								showContextWindow
+							/>
+						)}
+						<InlineCustomModels
+							prefix="codex"
+							customModels={customModels}
+							onCustomModelsChange={onCustomModelsChange}
+							hiddenModels={hiddenModels}
+							onToggleHidden={onToggleHidden}
+							modelContextWindows={modelContextWindows}
+							onContextWindowChange={onContextWindowChange}
+							onTestModel={onTestModel}
+						/>
+					</Stack>
+				</Tabs.Panel>
+			</Tabs>
 
 			{/* Device auth modal */}
 			<Modal
@@ -2202,15 +2243,18 @@ function CodexCredentialStatusBadge({
 		);
 	}
 	if (entry.disabled) {
+		// The server's reason is preferred when there is one — it says WHY, which the
+		// generic label cannot. The fallback is translated because it is the string a
+		// Chinese user sees whenever no reason was recorded.
 		return (
 			<Badge size="sm" color="red">
-				{entry.disabledReason || "Disabled"}
+				{entry.disabledReason || t("codexCredentialDisabled")}
 			</Badge>
 		);
 	}
 	return (
 		<Badge size="sm" color="green">
-			Active
+			{t("codexCredentialActive")}
 		</Badge>
 	);
 }

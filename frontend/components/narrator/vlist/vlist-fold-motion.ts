@@ -1,62 +1,34 @@
 /**
- * vlist-fold-motion.ts — Plays the fold transition planned by
- * `vlist-fold-animation.ts` onto real row nodes.
+ * vlist-fold-motion.ts — Keyframes and geometry capture for the fold transition
+ * planned by `vlist-fold-animation.ts`.
  *
  * Split from the planner on purpose: the arithmetic is pure and unit-tested, this
- * file is the thin DOM/WAAPI edge. It lives in the shell layer (like
- * `vlist-highlight.ts`), NOT on the measure path — every write targets an element that
- * has ALREADY been committed at its final geometry, so no measured height, cached
- * measurement or layout index is touched. CONTRACT §0 rule 2 is unaffected: nothing is
- * read back.
+ * file turns a plan into WAAPI keyframes and reshapes committed layout geometry for
+ * the capture. It holds NO animation handles and decides no timing — the single owner
+ * of both is `vlist-motion-scheduler.ts`, because a fold, the decorative frames it
+ * moves and the drill morph that rides along with it are ONE visual event and must
+ * share one cancel boundary and one time base.
  *
- * ROWS are written with composited `transform` / `clip-path` only: dozens animate at
- * once, and a `height` write on a row could feed back into the measured height model.
- * The decorative tool-run FRAMES are the one deliberate exception — they animate `top`
+ * It lives in the shell layer (like `vlist-highlight.ts`), NOT on the measure path:
+ * every keyframe targets an element that has ALREADY been committed at its final
+ * geometry, so no measured height, cached measurement or layout index is touched.
+ * CONTRACT §0 rule 2 is unaffected — nothing is read back.
+ *
+ * ROWS get composited `transform` / `clip-path` only: dozens animate at once, and a
+ * `height` write on a row could feed back into the measured height model. The
+ * decorative tool-run FRAMES are the one deliberate exception — they animate `top`
  * and `height`, because `scaleY` on a box whose visible substance is a 1px border
  * smears that border and its radius. A frame is absolutely positioned, pointer-events
  * -none decoration with no in-flow siblings and no measured height, so animating its
  * layout properties cannot reflow or perturb anything (see `FoldFrameMotion`).
  *
- * Two hard requirements shaped the design:
- *
- *  - **The animation must never be able to leave a residue.** Every animation runs
- *    with `fill: "none"` and no final keyframe worth retaining, so if it is
- *    cancelled mid-flight (the reader toggles again, scrolls the row out, switches
- *    narrator) the node instantly reads its committed style. There is no cleanup
- *    that can be missed.
- *  - **A row leaving the window must not keep an animation alive.** The controller
- *    owns every handle it started and cancels them on the next play or on teardown,
- *    so a fold followed by a scroll cannot accumulate animations on detached nodes.
+ * Because the scheduler runs every animation with `fill: "none"`, an interrupted fold
+ * instantly reads its committed style: there is no residue and no cleanup that can be
+ * missed. The frame builder's final keyframe restates the COMMITTED geometry for the
+ * same reason — a cancelled frame animation lands exactly where React put it.
  */
 
-import {
-	FOLD_DURATION_MS,
-	type FoldFrameMotion,
-	type FoldRowGeometry,
-	type FoldRowMotion,
-} from "./vlist-fold-animation";
-
-/**
- * Easing for both motions. `ease` is what Mantine `<Collapse>` uses by default, so
- * a folded card in the exact list and one in the chunked list decelerate alike.
- */
-const FOLD_EASING = "ease";
-
-/** The subset of Element this module needs; keeps it testable without a real DOM. */
-export interface FoldMotionTarget {
-	animate?: (
-		keyframes: Keyframe[],
-		options: KeyframeAnimationOptions,
-	) => { cancel: () => void } | undefined;
-}
-
-/** A running fold animation. */
-export interface FoldMotionHandle {
-	cancel: () => void;
-}
-
-/** Resolve a row key to its currently mounted node (or null when it is not mounted). */
-export type FoldMotionNodeResolver = (key: string) => FoldMotionTarget | null | undefined;
+import type { FoldFrameMotion, FoldRowGeometry, FoldRowMotion } from "./vlist-fold-animation";
 
 /**
  * Keyframes for a row that only MOVED: start displaced by the offset it used to be
@@ -66,7 +38,7 @@ export type FoldMotionNodeResolver = (key: string) => FoldMotionTarget | null | 
  * mounted rows costs no layout work per frame. It also composes with nothing else
  * the rows use, so there is no inline transform to preserve.
  */
-function shiftKeyframes(fromOffset: number): Keyframe[] {
+export function shiftKeyframes(fromOffset: number): Keyframe[] {
 	return [
 		{ offset: 0, transform: `translateY(${fromOffset}px)` },
 		{ offset: 1, transform: "translateY(0px)" },
@@ -81,16 +53,44 @@ function shiftKeyframes(fromOffset: number): Keyframe[] {
  * the DOM by this point, so there is nothing to clip — the motion is carried by the
  * rows below sliding up (see the note in vlist-fold-animation.ts).
  *
- * Because the row's own box already has its final height, the rows below it are
- * correct throughout, which is what lets their `translateY` and this clip compose
- * into one coherent movement.
+ * ⚠️ The inset is measured from the bottom of the node this plays ON, so that node
+ * must be the row's INNER content box — the one whose height is the layout's
+ * `height`. The outer row box is `hitHeight` tall (its own height plus the gap to the
+ * next row, see `resolveRowHitHeight`), so playing this there starts the clip a gap's
+ * worth of pixels below the card's real bottom edge and the first frame uncovers
+ * content that should still be hidden. The shell resolves `data-nf-row-body` for
+ * exactly this reason.
  */
-function revealKeyframes(fromInsetBottom: number): Keyframe[] {
+export function revealKeyframes(fromInsetBottom: number): Keyframe[] {
 	return [
 		{ offset: 0, clipPath: `inset(0px 0px ${fromInsetBottom}px 0px)` },
 		{ offset: 1, clipPath: "inset(0px 0px 0px 0px)" },
 	];
 }
+
+/**
+ * ⚠️ THERE IS NO COLLAPSE BUILDER, and that is a decision rather than a gap.
+ *
+ * Two shapes were tried and both are wrong:
+ *
+ *  - **Reversing the reveal** (`inset(0)` → `inset(0 0 Δ 0)`) needs the expanded body to
+ *    still be in the DOM. It is not: React has already re-rendered the row from the
+ *    FOLDED measurement, so there is nothing left to clip and the animation is a no-op
+ *    on a box that is already short. Keeping the body mounted one extra frame would mean
+ *    rendering from the previous `measured` while the layout has committed the new
+ *    geometry — stale measurement data on the render path, the coupling CONTRACT §0
+ *    rule 2 exists to prevent.
+ *  - **Fading the row's content in** (`opacity: 0 → 1`) SHIPPED BRIEFLY AND WAS A BUG.
+ *    A cross-fade masks a COMPONENT SWAP (§4.7: "只有换了组件才淡入"), and a collapse
+ *    swaps nothing — the header is the same component, in the same place, with the same
+ *    content on both sides of the toggle; only the body below it is unmounted. So the
+ *    fade made the one part that never changed blink, on every single collapse.
+ *
+ * A collapse is carried by the rows BELOW sliding up while the toggled row's header
+ * holds still. The header being motionless is not a shortcoming of that design, it is
+ * what makes it legible: it is the fixed reference against which the closing gap is
+ * read.
+ */
 
 /**
  * Keyframes for a decorative TOOL-RUN FRAME: travel from the box the reader last saw
@@ -100,11 +100,8 @@ function revealKeyframes(fromInsetBottom: number): Keyframe[] {
  * where that is the correct choice — see `FoldFrameMotion` for the full reasoning
  * (`scaleY` would smear the 1px border and its radius; the frame is absolutely
  * positioned decoration with no in-flow siblings and no measured height to perturb).
- *
- * The final keyframe restates the COMMITTED geometry, so together with `fill: "none"`
- * a cancelled frame animation lands exactly where React already put the element.
  */
-function frameKeyframes(motion: FoldFrameMotion): Keyframe[] {
+export function frameKeyframes(motion: FoldFrameMotion): Keyframe[] {
 	return [
 		{ offset: 0, top: `${motion.from.top}px`, height: `${motion.from.height}px` },
 		{ offset: 1, top: `${motion.to.top}px`, height: `${motion.to.height}px` },
@@ -112,123 +109,35 @@ function frameKeyframes(motion: FoldFrameMotion): Keyframe[] {
 }
 
 /**
- * Start one row animation, returning its handle or null when the environment has no
- * Web Animations support (older WebViews, the linkedom test DOM) — in which case
- * the fold still works and only the transition is skipped. Never throws.
+ * Keyframes for a nested row BLOCK that changed size: close (or open) the block itself.
+ *
+ * This is what makes a drill-down CLOSE instead of vanish. A drilled row's block IS the
+ * card (`blockHeight === card.height`), so React commits the 18.8px summary height in the
+ * first frame and the card — header included — disappears instantly, while the rows below
+ * slide up from outside the already-short box and appear to emerge from a clip line.
+ * Animating the block's height fixes both at once: the card visibly closes, and the rows
+ * below stay glued to its bottom edge because they travel exactly the height it lost, over
+ * the same duration and easing.
+ *
+ * `height` is a layout property, and animating it here is the documented exemption (see
+ * `FoldNestedRowResize`): the block is absolutely positioned inside its trace with no
+ * in-flow siblings, every sibling row is placed by the pure layout's own `top`, and
+ * nothing reads this box back. `scaleY` is NOT usable — it would squash the card's text.
  */
-export function playFoldMotion(
-	node: FoldMotionTarget | null | undefined,
-	motion: FoldRowMotion,
-	durationMs: number = FOLD_DURATION_MS,
-): FoldMotionHandle | null {
-	if (!node || typeof node.animate !== "function") return null;
-	const keyframes =
-		motion.kind === "shift"
-			? shiftKeyframes(motion.fromOffset)
-			: revealKeyframes(motion.fromInsetBottom);
-	return startAnimation(node, keyframes, durationMs);
+export function nestedResizeKeyframes(fromHeight: number, toHeight: number): Keyframe[] {
+	return [
+		{ offset: 0, height: `${fromHeight}px` },
+		{ offset: 1, height: `${toHeight}px` },
+	];
 }
 
-/**
- * Start one decorative FRAME animation. Same degradation contract as
- * `playFoldMotion`: null when there is no node or no WAAPI, never throws, so a
- * frame that cannot animate simply appears at its committed box.
- */
-export function playFoldFrameMotion(
-	node: FoldMotionTarget | null | undefined,
-	motion: FoldFrameMotion,
-	durationMs: number = FOLD_DURATION_MS,
-): FoldMotionHandle | null {
-	if (!node || typeof node.animate !== "function") return null;
-	return startAnimation(node, frameKeyframes(motion), durationMs);
-}
-
-/** The single WAAPI call both players share, so their options cannot drift apart. */
-function startAnimation(
-	node: FoldMotionTarget,
-	keyframes: Keyframe[],
-	durationMs: number,
-): FoldMotionHandle | null {
-	if (typeof node.animate !== "function") return null;
-	try {
-		const animation = node.animate(keyframes, {
-			duration: durationMs,
-			easing: FOLD_EASING,
-			// No fill: the committed style is the truth the moment the animation ends
-			// or is cancelled, so an interrupted fold can never leave a stale transform
-			// or a clip that hides half a card.
-			fill: "none",
-		});
-		return animation ? { cancel: () => animation.cancel() } : null;
-	} catch {
-		return null;
+/** Turn one planned row motion into its keyframes. */
+export function foldRowKeyframes(motion: FoldRowMotion): Keyframe[] {
+	if (motion.kind === "shift") return shiftKeyframes(motion.fromOffset);
+	if (motion.kind === "resize") {
+		return nestedResizeKeyframes(motion.fromHeight, motion.toHeight);
 	}
-}
-
-/**
- * A one-fold-at-a-time controller.
- *
- * A second toggle while the first is still playing cancels every handle from the
- * first: those rows snap to their committed style (correct by construction) and
- * immediately start the new transition from the geometry they are actually at. The
- * alternative — letting both run — would have two animations writing the same
- * `transform` on one node, with the later one winning at an arbitrary offset.
- *
- * Rows and decorative frames are played through the SAME controller call, because they
- * are two halves of one visual event: a border that keeps animating after its contents
- * were cancelled (or vice versa) is exactly the detachment this transition exists to
- * remove. One `play` means one cancel boundary for both.
- */
-export function createFoldMotionController(): {
-	play: (
-		motions: readonly FoldRowMotion[],
-		resolveNode: FoldMotionNodeResolver,
-		durationMs?: number,
-		frames?: readonly FoldFrameMotion[],
-		resolveFrameNode?: FoldMotionNodeResolver,
-	) => void;
-	cancel: () => void;
-} {
-	let active: FoldMotionHandle[] = [];
-	const cancel = () => {
-		for (const handle of active) handle.cancel();
-		active = [];
-	};
-	return {
-		play: (motions, resolveNode, durationMs, frames, resolveFrameNode) => {
-			cancel();
-			const started: FoldMotionHandle[] = [];
-			for (const motion of motions) {
-				const handle = playFoldMotion(resolveNode(motion.key), motion, durationMs);
-				if (handle) started.push(handle);
-			}
-			if (frames && resolveFrameNode) {
-				for (const frame of frames) {
-					const handle = playFoldFrameMotion(resolveFrameNode(frame.key), frame, durationMs);
-					if (handle) started.push(handle);
-				}
-			}
-			active = started;
-		},
-		cancel,
-	};
-}
-
-/**
- * True when the environment asks for reduced motion, in which case the fold is
- * applied instantly (the committed geometry, no transition).
- *
- * Read at play time rather than cached: the OS setting can change mid-session and
- * this is one `matchMedia` call per toggle, not per frame. Falls back to `false`
- * where `matchMedia` is unavailable so a test DOM behaves like a normal browser.
- */
-export function prefersReducedMotion(): boolean {
-	if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
-	try {
-		return window.matchMedia("(prefers-reduced-motion: reduce)").matches === true;
-	} catch {
-		return false;
-	}
+	return revealKeyframes(motion.fromInsetBottom);
 }
 
 /**
@@ -277,6 +186,41 @@ export function captureFoldGeometry(
  * still be mounted and visible. Frames are counted in single digits, so capturing all
  * of them costs nothing.
  */
+/**
+ * Snapshot the LOCAL tops of the rows nested inside each mounted trace element.
+ *
+ * At L1/L2 a whole activity run is one list item whose tool rows are absolutely
+ * positioned blocks inside it, so drilling one open moves its siblings without moving
+ * any top-level item. Those rows are invisible to `captureFoldGeometry`, which is why
+ * they used to teleport while everything below the run slid correctly.
+ *
+ * Local (not document) offsets on purpose: the trace's own displacement is already
+ * carried by that element's `shift`, so adding it here would animate those rows twice.
+ * See `FoldNestedRowMotion`.
+ *
+ * Reads the measured payload the layout already produced — never the DOM.
+ */
+export function captureFoldNestedRows(
+	keys: readonly string[],
+	rowsAt: (key: string) => readonly { key: string; top: number; blockHeight: number }[] | undefined,
+): Map<string, { rows: Map<string, { top: number; height: number }> }> {
+	const out = new Map<string, { rows: Map<string, { top: number; height: number }> }>();
+	for (const key of keys) {
+		const rows = rowsAt(key);
+		if (!rows || rows.length === 0) continue;
+		const map = new Map<string, { top: number; height: number }>();
+		for (const row of rows) {
+			if (typeof row?.key !== "string" || !Number.isFinite(row.top)) continue;
+			// The block's own height, so a drill-down can be animated CLOSED rather than
+			// unmounted in one frame (see nestedResizeKeyframes).
+			if (!Number.isFinite(row.blockHeight)) continue;
+			map.set(row.key, { top: row.top, height: row.blockHeight });
+		}
+		if (map.size > 0) out.set(key, { rows: map });
+	}
+	return out;
+}
+
 export function captureFoldFrameGeometry(
 	frames: readonly { key: string; start: number; end: number }[],
 	geometryAt: (index: number) => { top: number; bottom: number } | undefined,

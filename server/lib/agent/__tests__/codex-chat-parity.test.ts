@@ -120,7 +120,8 @@ describe("codex HTTP chat request parity", () => {
 		const req = await captureChat();
 
 		expect(req.body.tool_choice).toBe("auto");
-		expect(req.body.parallel_tool_calls).toBe(false);
+		// Parallel tool calls stay on outside the responses-lite contract.
+		expect(req.body.parallel_tool_calls).toBe(true);
 		// No reasoning.context: the real client only sends it in responses-lite
 		// mode; the non-lite shape omits it so the server default applies.
 		expect(req.body.reasoning).toEqual({ effort: "high", summary: "auto" });

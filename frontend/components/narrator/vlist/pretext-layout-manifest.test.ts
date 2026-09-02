@@ -104,6 +104,95 @@ describe("pretext layout manifest deduplication", () => {
 		// No #dup suffixes when all keys are unique
 		expect(keys.every((k) => !k.includes("#dup"))).toBe(true);
 	});
+
+	/**
+	 * A retry's two cards must not both claim the same `unitId`.
+	 *
+	 * `unitId` is the cross-level morph identity (`unitId ?? key`, see
+	 * vlist-lod-morph.ts) and the planner keys on a Map, so two elements sharing one
+	 * identity collapse to a single entry and the retry's SECOND call silently loses
+	 * its animation. The low-LOD side already disambiguates via `dedupeSuffix`
+	 * (rows `tool-x` / `tool-x#1`), so the card side has to match — and match that
+	 * exact spelling, since equal strings are what makes the two renderings pair.
+	 */
+	it("suffixes a duplicated unitId so both renderings stay morph-pairable", () => {
+		const toolCall = (toolUseId: string) => ({
+			toolUseId,
+			toolName: "Read",
+			status: "success",
+			inputJson: { file_path: "/retry.ts" },
+			outputJson: { _text: "line\n" },
+		});
+		const retryMessage = (id: string, seq: number): NarratorMsg =>
+			({
+				id,
+				seq,
+				role: "assistant",
+				contentJson: [
+					{ type: "tool_use", id: "tu-retry", name: "Read", input: { file_path: "/retry.ts" } },
+				],
+				toolCalls: [toolCall("tu-retry")],
+				children: [],
+				parentToolUseId: null,
+				createdAt: "2026-07-23T00:00:00.000Z",
+			}) as unknown as NarratorMsg;
+
+		const messages = [retryMessage("m0", 1), retryMessage("m1", 2)];
+		// L5: no activity fold, so both calls render as their own `tool-call` card —
+		// the level where the collision actually happened.
+		const renderUnits = segmentMessages(messages).map((seg) => ({
+			kind: "segment" as const,
+			seg,
+		})) as unknown as AdapterRenderUnit[];
+
+		const built = buildPretextLayoutManifest({
+			layoutRevision: "layout-1",
+			documentRevision: 1,
+			lod: 5,
+			widthBucket: "860",
+			renderUnits,
+			contentWidth: 860,
+			viewportHeight: 720,
+			resolveSource: () => ({ firstSeq: 0, lastSeq: 0, sourceMessageIds: ["m0"] }),
+		});
+
+		const cards = built.items.filter((item) => item.spec.unitId?.startsWith("tool-tu-retry"));
+		expect(cards).toHaveLength(2);
+		const unitIds = cards.map((item) => item.spec.unitId);
+		// Distinct identities, and the suffix matches the fold's `#<n>` spelling
+		// (NOT `#dup1`, which the row side never produces).
+		expect(unitIds).toEqual(["tool-tu-retry", "tool-tu-retry#1"]);
+		expect(new Set(unitIds).size).toBe(2);
+	});
+
+	it("leaves an absent unitId absent so bodies keep pairing on key", () => {
+		// Two same-id messages collide on the BUBBLE key, which carries no unitId.
+		// Minting one here would be wrong: the planner falls back to `key` for
+		// document bodies, and that key is already level-invariant.
+		const msg1 = message("m0", "assistant", "first");
+		const msg2 = message("m0", "assistant", "second");
+		(msg2 as { seq: number }).seq = 2;
+		const renderUnits = [msg1, msg2].map((item) => ({
+			kind: "segment" as const,
+			seg: { kind: "message" as const, msg: item },
+		})) as unknown as AdapterRenderUnit[];
+
+		const built = buildPretextLayoutManifest({
+			layoutRevision: "layout-1",
+			documentRevision: 1,
+			lod: 5,
+			widthBucket: "860",
+			renderUnits,
+			contentWidth: 860,
+			viewportHeight: 720,
+			resolveSource: () => ({ firstSeq: 0, lastSeq: 0, sourceMessageIds: ["m0"] }),
+		});
+
+		expect(built.items).toHaveLength(2);
+		for (const item of built.items) expect(item.spec.unitId).toBeUndefined();
+		// The keys still disambiguate, so the two bodies remain distinguishable.
+		expect(built.items[1].spec.key).toBe(`${built.items[0].spec.key}#dup1`);
+	});
 });
 
 describe("pretext layout manifest integration", () => {

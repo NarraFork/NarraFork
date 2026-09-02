@@ -23,8 +23,11 @@
  * fixed or aspect-ratio derived.
  */
 
+import { measureNaturalWidth } from "@chenglou/pretext";
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
 import { fitImageBox, readImageIntrinsicSize } from "@shared/pretext-layout/image-fit";
+import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
+import { formatFileSize } from "@shared/text-file-types";
 import {
 	accumulateFrame,
 	type BlockFrame,
@@ -187,20 +190,54 @@ export interface MeasureTextFileInput {
 }
 
 /**
+ * Natural (unwrapped) width of the icon + filename + size row.
+ *
+ * The row is reserved at a FIXED single-line height, so the render layer must
+ * never wrap the filename — it truncates instead (see `TextFileRow`). That makes
+ * the row's painted width a pure function of its data, which this computes so a
+ * shrink-wrap container (the user bubble) can grow around it. Without it a long
+ * filename was squeezed into whatever width the caption text happened to need,
+ * and the row overflowed the box the measure layer had already committed to.
+ *
+ * Zero DOM: pretext's canvas text metrics only, same as every other measure here.
+ */
+export function textFileRowNaturalWidth(data: MeasureTextFileInput): number {
+	const metrics = typographyMetrics();
+	const filename = data.filename ?? "";
+	const nameWidth =
+		filename.length > 0
+			? measureNaturalWidth(getPreparedTextWithSegments(filename, metrics.font.bodyMedium))
+			: 0;
+	const sizeText = typeof data.size === "number" ? `(${formatFileSize(data.size)})` : "";
+	const sizeWidth =
+		sizeText.length > 0
+			? measureNaturalWidth(getPreparedTextWithSegments(sizeText, metrics.font.xs)) +
+				IMGGEN_GROUP_GAP
+			: 0;
+	// icon + gap + name (+ gap + size). Ceil so a fractional advance never leaves
+	// the last glyph a sub-pixel outside the reserved box.
+	return Math.ceil(TEXT_FILE_ICON_SIZE + IMGGEN_GROUP_GAP + nameWidth + sizeWidth);
+}
+
+/**
  * Measure a text-file attachment chip: a single row (icon + filename + size).
- * Fixed height regardless of width — the filename is not wrapped in the list
- * view. Zero measurement.
+ * Fixed height regardless of width — the filename TRUNCATES rather than wraps,
+ * so a long name cannot push the row past the reserved single line. Zero DOM.
  */
 export function measureTextFile(
 	data: MeasureTextFileInput,
 	contentWidth: number,
 	_lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredElement {
+	const natural = textFileRowNaturalWidth(data);
 	const block: PreparedFixedBlock = {
 		...FLAT_BASE,
 		kind: "fixed",
 		height: TEXT_FILE_HEIGHT,
 		tag: "text_file",
+		// Capped at the column: a name longer than the frame truncates, so the row
+		// never claims more space than exists.
+		displayWidth: Math.min(contentWidth, natural),
 		data: {
 			filename: data.filename ?? null,
 			size: typeof data.size === "number" ? data.size : null,

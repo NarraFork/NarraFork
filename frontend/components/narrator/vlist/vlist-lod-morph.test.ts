@@ -4,6 +4,7 @@ import {
 	clipFor,
 	diffLodSnapshots,
 	LOD_MORPH_DURATION_MS,
+	LOD_MORPH_MAX_GROUP_MEMBERS,
 	LOD_MORPH_MAX_SHIFT_PX,
 	type LodElementSource,
 } from "./vlist-lod-morph";
@@ -158,6 +159,7 @@ describe("diffLodSnapshots", () => {
 			unitId: "tool-a",
 			deltaY: -200, // before 100 − after 300 → slides down 200 into place
 			fade: false, // same kind at both levels: nothing was swapped
+			toKind: "tool-call",
 			durationMs: LOD_MORPH_DURATION_MS,
 		});
 	});
@@ -234,7 +236,13 @@ describe("diffLodSnapshots", () => {
 		const prev = buildLodSnapshots([unit("tool-a", 100, 400, "tool-call")], 0, 800);
 		const next = buildLodSnapshots([unit("tool-a", 100, 19, "trace-row")], 0, 800);
 		expect(diffLodSnapshots(prev, next)).toEqual([
-			{ unitId: "tool-a", deltaY: 0, fade: true, durationMs: LOD_MORPH_DURATION_MS },
+			{
+				unitId: "tool-a",
+				deltaY: 0,
+				fade: true,
+				toKind: "trace-row",
+				durationMs: LOD_MORPH_DURATION_MS,
+			},
 		]);
 	});
 
@@ -246,7 +254,13 @@ describe("diffLodSnapshots", () => {
 			100_000,
 		);
 		expect(diffLodSnapshots(prev, next)).toEqual([
-			{ unitId: "tool-a", deltaY: 0, fade: true, durationMs: LOD_MORPH_DURATION_MS },
+			{
+				unitId: "tool-a",
+				deltaY: 0,
+				fade: true,
+				toKind: "trace-row",
+				durationMs: LOD_MORPH_DURATION_MS,
+			},
 		]);
 	});
 });
@@ -318,6 +332,7 @@ describe("diffLodSnapshots — the L2/L3 row ↔ card boundary", () => {
 			unitId: "tool-a",
 			deltaY: 0,
 			fade: true,
+			toKind: "trace-row",
 			durationMs: LOD_MORPH_DURATION_MS,
 		});
 	});
@@ -342,5 +357,167 @@ describe("diffLodSnapshots — the L2/L3 row ↔ card boundary", () => {
 		const before = buildLodSnapshots([], 0, 800);
 		const after = buildLodSnapshots([unit("tool-a", 300, 400, "tool-call")], 0, 800);
 		expect(diffLodSnapshots(before, after)).toHaveLength(0);
+	});
+});
+
+/**
+ * EVERY MEMBER of an activity group must morph, not just the group.
+ *
+ * At L1/L2 a group's members are NESTED trace rows; at L3+ each becomes its own top-level
+ * card. They pair on `unitId` (a row key is trace-scoped and unusable across levels), so if
+ * the shell stopped feeding nested rows the intersection would be empty exactly at the
+ * switch that changes the most — and nothing would animate, silently, because the planner
+ * still returns cleanly.
+ */
+describe("activity group members each morph", () => {
+	const nested = (id: string, top: number, height: number, kind: string): LodElementSource => ({
+		unitId: id,
+		key: id,
+		kind,
+		top,
+		height,
+		nested: true,
+		clip: { top: 0, bottom: 4000 },
+	});
+
+	it("plans one morph per member, each marked as a re-theme", () => {
+		const prev = buildLodSnapshots(
+			[
+				nested("t1", 100, 19, "trace-row"),
+				nested("t2", 120, 19, "trace-row"),
+				nested("t3", 140, 19, "trace-row"),
+			],
+			0,
+			800,
+		);
+		const next = buildLodSnapshots(
+			[
+				nested("t1", 200, 400, "tool-call"),
+				nested("t2", 620, 400, "tool-call"),
+				nested("t3", 1040, 400, "tool-call"),
+			],
+			0,
+			800,
+		);
+		const plans = diffLodSnapshots(prev, next);
+		expect(plans.map((p) => p.unitId).sort()).toEqual(["t1", "t2", "t3"]);
+		// Each is a component swap, so each fades; and each carries the direction.
+		for (const p of plans) {
+			expect(p.fade).toBe(true);
+			expect(p.toKind).toBe("tool-call");
+		}
+		// Distinct travel per member: they do not share one displacement.
+		expect(new Set(plans.map((p) => p.deltaY)).size).toBe(3);
+	});
+
+	it("carries the reverse direction when collapsing back to rows", () => {
+		const prev = buildLodSnapshots([nested("t1", 200, 400, "tool-call")], 0, 800);
+		const next = buildLodSnapshots([nested("t1", 100, 19, "trace-row")], 0, 800);
+		const plans = diffLodSnapshots(prev, next);
+		expect(plans).toHaveLength(1);
+		// `fade` alone cannot tell the two directions apart — `toKind` is what lets the
+		// border and tail fade OUT here rather than in.
+		expect(plans[0]?.toKind).toBe("trace-row");
+	});
+
+	it("still morphs a member whose identity is missing at one level", () => {
+		// An unpaired identity has nothing to morph between and must simply appear, without
+		// dragging its neighbours' plans down with it.
+		const prev = buildLodSnapshots([nested("t1", 100, 19, "trace-row")], 0, 800);
+		const next = buildLodSnapshots(
+			[nested("t1", 200, 400, "tool-call"), nested("t9", 700, 400, "tool-call")],
+			0,
+			800,
+		);
+		const plans = diffLodSnapshots(prev, next);
+		expect(plans.map((p) => p.unitId)).toEqual(["t1"]);
+	});
+});
+
+/**
+ * A LARGE activity group must animate every member, not just its first few.
+ *
+ * The admission window is `scrollTop − vh … scrollTop + 2·vh`, and one group's content
+ * occupies wildly different extents at the two levels:
+ *
+ *   folded:   10 rows  × ~19px  =  190px  → every row inside the window
+ *   expanded: 10 cards × ~400px = 4000px → only the first few inside it
+ *
+ * Judged on their own boxes the later members were absent from the EXPANDED frame, so the
+ * diff found no counterpart and planned nothing for them — silently. The reader saw the
+ * first rows animate while the rest teleported. Anchoring every member to its unit's box
+ * admits the whole group or none of it.
+ */
+describe("group-anchored admission", () => {
+	const VH = 800;
+	const folded = (n: number, groupBox: { top: number; height: number }): LodElementSource[] =>
+		[...Array(n)].map((_, i) => ({
+			unitId: `t${i}`,
+			key: `t${i}`,
+			kind: "trace-row",
+			top: groupBox.top + i * 19,
+			height: 19,
+			nested: true,
+			groupBox,
+		}));
+	const expanded = (n: number, unitBox: { top: number; height: number }): LodElementSource[] =>
+		[...Array(n)].map((_, i) => ({
+			unitId: `t${i}`,
+			key: `t${i}`,
+			kind: "tool-call",
+			top: unitBox.top + i * 400,
+			height: 400,
+			groupBox: unitBox,
+			unitAnchored: true,
+		}));
+
+	it("plans a morph for EVERY member of a group whose expanded form overflows the window", () => {
+		const prev = buildLodSnapshots(folded(10, { top: 0, height: 190 }), 0, VH);
+		const next = buildLodSnapshots(expanded(10, { top: 0, height: 4000 }), 0, VH);
+		const plans = diffLodSnapshots(prev, next);
+		// Was 4 of 10 before the anchor: cards past ~1600px pruned themselves.
+		expect(plans).toHaveLength(10);
+		expect(plans.map((p) => p.unitId).sort()).toEqual([...Array(10)].map((_, i) => `t${i}`).sort());
+	});
+
+	it("anchors the EXPANDED side too, since a pair needs both frames", () => {
+		// Fixing only the folded side changes nothing: a card is top-level with its own tall
+		// box, so it would still be missing from the expanded snapshot.
+		const withoutAnchor = expanded(10, { top: 0, height: 4000 }).map(
+			({ unitAnchored: _unused, ...rest }) => rest,
+		);
+		const next = buildLodSnapshots(withoutAnchor, 0, VH);
+		expect(next.size).toBeLessThan(10);
+	});
+
+	it("caps one group so a pathological document cannot animate hundreds of nodes", () => {
+		const prev = buildLodSnapshots(folded(50, { top: 0, height: 950 }), 0, VH);
+		const next = buildLodSnapshots(expanded(50, { top: 0, height: 20_000 }), 0, VH);
+		expect(diffLodSnapshots(prev, next)).toHaveLength(LOD_MORPH_MAX_GROUP_MEMBERS);
+	});
+
+	it("counts the cap PER GROUP, not globally", () => {
+		// A global budget would let an early group starve a later one for no perceptible
+		// reason. Two groups of 20 must both be fully admitted.
+		const a = folded(20, { top: 0, height: 380 });
+		const b = folded(20, { top: 400, height: 380 }).map((el) => ({
+			...el,
+			unitId: `b-${el.unitId}`,
+			key: `b-${el.key}`,
+		}));
+		expect(buildLodSnapshots([...a, ...b], 0, VH).size).toBe(40);
+	});
+
+	it("still crops a group that is nowhere near the viewport", () => {
+		// The anchor widens WHICH box is consulted; it must not disable the window.
+		expect(buildLodSnapshots(folded(5, { top: 50_000, height: 190 }), 0, VH).size).toBe(0);
+	});
+
+	it("leaves an element without a groupBox judged on its own box", () => {
+		const plain: LodElementSource[] = [
+			{ unitId: "p1", key: "p1", kind: "markdown", top: 100, height: 40 },
+			{ unitId: "p2", key: "p2", kind: "markdown", top: 9000, height: 40 },
+		];
+		expect([...buildLodSnapshots(plain, 0, VH).keys()]).toEqual(["p1"]);
 	});
 });

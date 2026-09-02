@@ -20,6 +20,7 @@ export type ToolCategory =
 	| "skill"
 	| "browser"
 	| "knowledge"
+	| "schedule"
 	| "generic";
 
 const READ_TOOLS = new Set(["Read"]);
@@ -67,6 +68,7 @@ const TERMINAL_TOOLS = new Set(["Terminal"]);
 const SHARE_TOOLS = new Set(["ShareFile"]);
 const TRANSFER_TOOLS = new Set(["TransferFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
+const SCHEDULE_TOOLS = new Set(["ScheduledTask"]);
 const SKILL_TOOLS = new Set(["Skill"]);
 const BROWSER_TOOLS = new Set(["Browser"]);
 const KNOWLEDGE_TOOLS = new Set([
@@ -99,6 +101,7 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (SHARE_TOOLS.has(name)) return "share";
 	if (TRANSFER_TOOLS.has(name)) return "transfer";
 	if (RECALL_TOOLS.has(name)) return "recall";
+	if (SCHEDULE_TOOLS.has(name)) return "schedule";
 	if (SKILL_TOOLS.has(name)) return "skill";
 	if (BROWSER_TOOLS.has(name)) return "browser";
 	if (KNOWLEDGE_TOOLS.has(name)) return "knowledge";
@@ -164,6 +167,12 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 			return "yellow";
 		case "recall":
 			return "cyan";
+		// Shares terminal's yellow rather than taking a new hue. The palette's unused
+		// slot is red, which reads as failure on a row that succeeded. Terminal and
+		// ScheduledTask calls rarely sit next to each other, and the glyph plus the
+		// `ScheduledTask · …` title disambiguate when they do.
+		case "schedule":
+			return "yellow";
 		default:
 			return "gray";
 	}
@@ -209,6 +218,18 @@ import {
 	subagentSummaryToPartialInput,
 } from "@shared/subagent-tool-summary";
 import { agentTargetDisplay, formatAgentIdForDisplay } from "./agent-id-display";
+
+/**
+ * The `task.name` field of a ScheduledTask call, if the nested object survived
+ * field-level projection. Returns "" when the payload is truncated at any level —
+ * the caller then falls back to the task id.
+ */
+function readTaskFieldName(input: unknown): string {
+	if (!input || isTruncated(input) || typeof input !== "object") return "";
+	const task = (input as Record<string, unknown>).task;
+	if (!task || isTruncated(task) || typeof task !== "object") return "";
+	return readLeafText((task as Record<string, unknown>).name) ?? "";
+}
 
 function extractStringArrayField(val: unknown, key: string): string[] {
 	if (!val || isTruncated(val) || typeof val !== "object") return [];
@@ -482,6 +503,17 @@ export function getSummary(
 		}
 		case "knowledge":
 			return knowledgeSummary(toolName, input, metadata);
+		case "schedule": {
+			const action = extractField(input, "action");
+			// The task NAME is the only useful identifier here; a bare nanoid id tells the
+			// reader nothing. `create`/`update` carry it in `task.name`, the id-based actions
+			// do not, so those fall back to a short id rather than showing nothing.
+			const taskName = readTaskFieldName(input);
+			const taskId = extractField(input, "id");
+			const label = taskName || (taskId ? `${taskId.slice(0, 8)}…` : "");
+			if (!action) return label ? `Schedule: ${label}` : "Schedule";
+			return label ? short(`${action}: ${label}`, 60) : action;
+		}
 		default:
 			return toolName;
 	}

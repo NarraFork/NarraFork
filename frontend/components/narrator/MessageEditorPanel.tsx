@@ -24,7 +24,12 @@
 import { useEditRegeneratePreview } from "@frontend/hooks/useNarrator";
 import { ActionIcon, Button, Group, Paper, Stack, Text, Textarea, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { isTextFile, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
+import {
+	isTextFile,
+	MAX_EDIT_IMAGES_PER_MESSAGE,
+	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
+	MAX_TEXT_FILE_SIZE,
+} from "@shared/text-file-types";
 import { IconPaperclip } from "@tabler/icons-react";
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -42,8 +47,13 @@ import {
 } from "./narrator-panel-types";
 import { RevertScopeConfirmModal } from "./RevertScopeConfirmModal";
 
-/** Maximum attachments (images / text files) an edit may carry. */
-const MAX_EDIT_ATTACHMENTS = 10;
+/**
+ * Maximum attachments an edit may carry, per type. Images allow far more than
+ * text files (a message may legitimately carry many screenshots); both mirror
+ * the server's own bounds so the composer never accepts what the API rejects.
+ */
+const MAX_EDIT_IMAGES = MAX_EDIT_IMAGES_PER_MESSAGE;
+const MAX_EDIT_TEXT_FILES = MAX_EDIT_TEXT_FILES_PER_MESSAGE;
 
 // The pure text helpers live in their own module so callers that only decide
 // whether editing is possible need not import this component (and its graph).
@@ -214,9 +224,12 @@ export function MessageEditorPanel({
 			}
 			if (valid.length === 0) return;
 			setEditNewTextFiles((prev) => {
-				const room = Math.max(0, MAX_EDIT_ATTACHMENTS - editKeptTextFiles.length - prev.length);
+				const room = Math.max(0, MAX_EDIT_TEXT_FILES - editKeptTextFiles.length - prev.length);
 				if (valid.length > room) {
-					notifications.show({ color: "yellow", message: t("editTooManyFiles") });
+					notifications.show({
+						color: "yellow",
+						message: t("editTooManyFiles", { max: MAX_EDIT_TEXT_FILES }),
+					});
 				}
 				return [...prev, ...valid.slice(0, room)];
 			});
@@ -246,9 +259,12 @@ export function MessageEditorPanel({
 			setEditNewImages((prev) => {
 				// Read the kept count from the ref so a removal during the await above
 				// is reflected here rather than using the stale closure value.
-				const room = Math.max(0, MAX_EDIT_ATTACHMENTS - editKeptCountRef.current - prev.length);
+				const room = Math.max(0, MAX_EDIT_IMAGES - editKeptCountRef.current - prev.length);
 				if (processed.length > room) {
-					notifications.show({ color: "yellow", message: t("editTooManyImages") });
+					notifications.show({
+						color: "yellow",
+						message: t("editTooManyImages", { max: MAX_EDIT_IMAGES }),
+					});
 				}
 				return [...prev, ...processed.slice(0, room)];
 			});

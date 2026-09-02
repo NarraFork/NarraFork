@@ -27,6 +27,7 @@ import { extractPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { readTool } from "./read";
 import { recallTool } from "./recall";
+import { scheduledTaskTool } from "./scheduled-task";
 import { sendTool } from "./send";
 import { shareFileTool } from "./share-file";
 import { skillTool } from "./skill";
@@ -53,6 +54,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Recall", recallTool],
 	["Browser", browserTool],
 	["ForkNarrator", forkNarratorTool],
+	["ScheduledTask", scheduledTaskTool],
 	["NarraForkAdmin", narraforkAdminTool],
 	["PackList", packListTool],
 	["PackActivate", packActivateTool],

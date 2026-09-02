@@ -19,12 +19,15 @@ import {
 	buildDiffHighlightSource,
 	computeDiff,
 	computeDiffCached,
+	countDiffLineStats,
+	countTextLines,
 	type DiffLine,
 	diffCacheStats,
 	diffLineMarker,
 	diffLineNoWidth,
 	formatDiffGutter,
 	formatDiffLineNumber,
+	MAX_DIFF_INPUT_CHARS,
 	MAX_DIFF_LINES,
 	normalizeDiffLineEndings,
 	resetDiffCache,
@@ -425,5 +428,95 @@ describe("computeDiffCached", () => {
 		for (let i = 0; i < 50; i++) computeDiffCached(oldStr, newStr, 1);
 		// 50 uncached calls on this input take seconds; 50 hits are sub-millisecond.
 		expect(performance.now() - started).toBeLessThan(50);
+	});
+});
+
+describe("countDiffLineStats", () => {
+	it("counts a modified line as one added and one removed", () => {
+		expect(countDiffLineStats("a\nb\nc", "a\nB\nc")).toEqual({ added: 1, removed: 1 });
+	});
+
+	it("counts pure insertions and pure deletions", () => {
+		expect(countDiffLineStats("a\n", "a\nb\nc\n")).toEqual({ added: 2, removed: 0 });
+		expect(countDiffLineStats("a\nb\nc\n", "a\n")).toEqual({ added: 0, removed: 2 });
+	});
+
+	it("counts a new file's every line as an addition", () => {
+		expect(countDiffLineStats("", "x\ny\nz")).toEqual({ added: 3, removed: 0 });
+	});
+
+	it("reports zero changes for identical text", () => {
+		expect(countDiffLineStats("a\nb", "a\nb")).toEqual({ added: 0, removed: 0 });
+	});
+
+	/**
+	 * A CRLF→LF conversion is not an edit to every line. Without normalization the
+	 * whole file would be reported as rewritten, which is exactly the kind of
+	 * confidently-wrong figure this feature must not produce.
+	 */
+	it("ignores a pure line-ending difference", () => {
+		expect(countDiffLineStats("a\r\nb\r\n", "a\nb\n")).toEqual({ added: 0, removed: 0 });
+	});
+
+	/**
+	 * `null` is "no data", never zero. Two sources, both asserted here, because a
+	 * caller that mistook either for `{added: 0, removed: 0}` would render a large
+	 * rewrite as having changed nothing.
+	 */
+	it("returns null when the input exceeds the shared ceiling", () => {
+		const huge = "x".repeat(MAX_DIFF_INPUT_CHARS);
+		expect(countDiffLineStats(huge, `${huge}y`)).toBeNull();
+	});
+
+	it("returns null when the input exceeds a caller's smaller ceiling", () => {
+		expect(countDiffLineStats("aaaa", "bbbb", { maxInputChars: 4 })).toBeNull();
+		// The caller's bound only ever TIGHTENS: it cannot raise the shared ceiling.
+		const huge = "x".repeat(MAX_DIFF_INPUT_CHARS);
+		expect(
+			countDiffLineStats(huge, `${huge}y`, { maxInputChars: Number.MAX_SAFE_INTEGER }),
+		).toBeNull();
+	});
+
+	/**
+	 * The computation budget must be REACHABLE, or it is decoration — and on the
+	 * server's single JS thread an unbounded Myers run is the failure this whole
+	 * mechanism exists to prevent.
+	 *
+	 * Two fully-disjoint 11k-line texts fit well inside the input ceiling (the
+	 * premise is asserted, so a null here cannot come from the size bound) yet need
+	 * an edit distance of ~22k — above `maxEditLength`, and expensive enough to also
+	 * trip `timeout`. Which arm fires first is machine-dependent, which is precisely
+	 * why both exist; the contract is that the call ABORTS rather than running to
+	 * completion, so the elapsed time is bounded too.
+	 */
+	it("returns null when the computation budget is exhausted", () => {
+		const oldStr = Array.from({ length: 11_000 }, (_, i) => `o${i}`).join("\n");
+		const newStr = Array.from({ length: 11_000 }, (_, i) => `w${i}`).join("\n");
+		expect(oldStr.length + newStr.length).toBeLessThanOrEqual(MAX_DIFF_INPUT_CHARS);
+		const started = performance.now();
+		expect(countDiffLineStats(oldStr, newStr)).toBeNull();
+		// Generous vs. the 150ms budget (CI is slow) but far below the seconds an
+		// unbounded run on this input would take.
+		expect(performance.now() - started).toBeLessThan(2_000);
+	});
+
+	/** Bounded runtime is the whole point on the server's single thread. */
+	it("stays fast on a large but tractable input", () => {
+		const oldStr = Array.from({ length: 2_000 }, (_, i) => `line ${i}`).join("\n");
+		const newStr = Array.from({ length: 2_000 }, (_, i) =>
+			i === 900 ? "changed" : `line ${i}`,
+		).join("\n");
+		const started = performance.now();
+		expect(countDiffLineStats(oldStr, newStr)).toEqual({ added: 1, removed: 1 });
+		expect(performance.now() - started).toBeLessThan(300);
+	});
+});
+
+describe("countTextLines", () => {
+	it("counts lines without inventing one for a trailing newline", () => {
+		expect(countTextLines("")).toBe(0);
+		expect(countTextLines("a")).toBe(1);
+		expect(countTextLines("a\nb")).toBe(2);
+		expect(countTextLines("a\nb\n")).toBe(2);
 	});
 });

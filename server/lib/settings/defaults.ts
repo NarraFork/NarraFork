@@ -11,7 +11,12 @@ import type { FieldDoc, NarraForkSettings } from "./types";
 export const DEFAULTS: NarraForkSettings = {
 	server: { port: 7778, host: "localhost", openBrowser: "browser", allowedOrigins: [] },
 	proxy: { mode: "direct" },
-	paths: { defaultProjectDir: resolve(homedir(), "projects") },
+	paths: {
+		defaultProjectDir: resolve(homedir(), "projects"),
+		// Empty by default, and that is the safe zero value: with no entry here the
+		// in-browser editor can only write inside a narrator's own worktree.
+		extraWritableDirs: [] as string[],
+	},
 	knowledge: {
 		injectMode: "summary",
 		maxInjectedEntries: 3,
@@ -266,6 +271,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"paths.defaultProjectDir": {
 		desc: "默认项目目录。新建项目时的默认父目录。",
 		type: "string",
+	},
+	"paths.extraWritableDirs": {
+		desc: "浏览器内编辑器额外允许写入的目录（绝对路径）。默认只允许写入叙述者自己的 worktree；此处每一项都会扩大写入范围，请只填确实需要编辑的目录。符号链接会被解析后再校验，凭据文件（settings.json、数据库、~/.ssh 等）即使在允许目录内也仍然拒绝写入。",
+		type: "string[]",
 	},
 
 	// ── knowledge ───────────────────────────────────────────────────────

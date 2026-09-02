@@ -16,6 +16,8 @@ import {
 	IconCheck,
 	IconChevronDown,
 	IconChevronRight,
+	IconFilter,
+	IconFilterOff,
 	IconFolder,
 	IconFolderOpen,
 	IconHelpCircle,
@@ -36,11 +38,18 @@ import {
 	useGitUnstage,
 } from "../../hooks/useGit";
 import { useGitFolderPrefs } from "../../hooks/useGitFolderPrefs";
+import { useGitStatusFilter } from "../../hooks/useGitStatusFilter";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { buildAttributionBadge } from "./attribution-label";
 import { GitFileDiff } from "./GitFileDiff";
 import { type GitFileSection, gitFileBadgeChar } from "./git-file-status";
 import { buildGitFileTree, compactGitFileTree, type GitFileTreeNode } from "./git-file-tree";
+import {
+	countBadgeChars,
+	filterFilesByStatus,
+	type GitStatusFilterChar,
+	visibleFilterChars,
+} from "./git-status-filter";
 
 /** Max files to render per section to avoid UI freeze. */
 const MAX_DISPLAY_FILES = 80;
@@ -116,6 +125,9 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	const [message, setMessage] = useState("");
 	const [diffFile, setDiffFile] = useState<string | null>(null);
 	const [diffStaged, setDiffStaged] = useState(false);
+	// Which status letters the user wants to see. Empty = unfiltered; see
+	// `git-status-filter.ts` for why that is the empty representation.
+	const statusFilter = useGitStatusFilter(chapterId);
 	// Folders start COLLAPSED and remember what the user opened across reloads.
 	// Keyed per chapter and per section, because `src/` under Staged and under
 	// Changes are independent rows.
@@ -165,14 +177,35 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 			displayLinesRemoved: f.unstagedLinesRemoved,
 		}));
 
+	// Chip counts come from the UNFILTERED lists, so an unselected chip still says
+	// how many rows it would reveal instead of collapsing to zero the moment any
+	// filter is on.
+	const badgeCounts = countBadgeChars([
+		{ section: "staged", files: stagedFiles },
+		{ section: "unstaged", files: unstagedFiles },
+	]);
+	const filterChars = visibleFilterChars(badgeCounts, statusFilter.selected);
+
+	// Filter BEFORE the row cap: capping first would spend the 80-row budget on
+	// rows the filter then removes, so a filter on a large change set could show
+	// nothing while claiming "+N more".
+	const matchedStaged = filterFilesByStatus(stagedFiles, "staged", statusFilter.selected);
+	const matchedUnstaged = filterFilesByStatus(unstagedFiles, "unstaged", statusFilter.selected);
+
 	// Cap displayed files to avoid rendering thousands of rows
-	const displayStaged = stagedFiles.slice(0, MAX_DISPLAY_FILES);
-	const displayUnstaged = unstagedFiles.slice(0, MAX_DISPLAY_FILES);
-	const hiddenStaged = stagedFiles.length - displayStaged.length;
-	const hiddenUnstaged = unstagedFiles.length - displayUnstaged.length;
+	const displayStaged = matchedStaged.slice(0, MAX_DISPLAY_FILES);
+	const displayUnstaged = matchedUnstaged.slice(0, MAX_DISPLAY_FILES);
+	const hiddenStaged = matchedStaged.length - displayStaged.length;
+	const hiddenUnstaged = matchedUnstaged.length - displayUnstaged.length;
 	// Server may have capped the files array too
 	const totalFiles = status.totalFiles ?? status.files.length;
 	const serverCapped = totalFiles > status.files.length;
+	const filterActive = statusFilter.selected.size > 0;
+	// A filter that matches nothing must say so. Both sections would otherwise
+	// simply not render, leaving a panel that reads as "working tree clean" while
+	// there are uncommitted changes.
+	const filterHidesEverything =
+		filterActive && matchedStaged.length === 0 && matchedUnstaged.length === 0;
 
 	const stagedTree = compactGitFileTree(buildGitFileTree(displayStaged));
 	const unstagedTree = compactGitFileTree(buildGitFileTree(displayUnstaged));
@@ -206,10 +239,26 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 		});
 	}
 
+	/**
+	 * Discard, scoped to whatever the filter currently shows.
+	 *
+	 * This is the one action where the filter scope is a correctness requirement
+	 * rather than a nicety: `all: true` runs `checkout HEAD -- .` plus `clean -fd`,
+	 * which would destroy uncommitted work the filter had hidden from view. The
+	 * confirmation text names the scope for the same reason — "all uncommitted
+	 * changes" is a false statement once a filter is on.
+	 */
 	async function handleDiscardAll() {
-		if (await confirm({ message: t("discardConfirm") })) {
-			discard.mutate({ all: true });
+		const files = filterActive ? matchedUnstaged.map((f) => f.path) : null;
+		const confirmMessage = files
+			? t("filter.discardMatchedConfirm", { count: files.length })
+			: t("discardConfirm");
+		if (!(await confirm({ message: confirmMessage }))) return;
+		if (files) {
+			if (files.length > 0) discard.mutate({ files });
+			return;
 		}
+		discard.mutate({ all: true });
 	}
 
 	return (
@@ -219,6 +268,21 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 			 * reachable no matter how many files changed — inside the scroller it sat
 			 * below hundreds of rows and looked missing.
 			 */}
+			{/*
+			 * Filter chips sit ABOVE the scroller, like the commit box sits below it: a
+			 * control that decides what the list contains must stay reachable when the
+			 * list is long, and inside the scroller it would scroll away exactly when
+			 * the user needs it most.
+			 */}
+			<StatusFilterBar
+				chars={filterChars}
+				counts={badgeCounts}
+				selected={statusFilter.selected}
+				onToggle={statusFilter.toggle}
+				onClear={statusFilter.clear}
+				t={t}
+			/>
+
 			<ScrollArea style={{ flex: 1, minHeight: 0 }}>
 				<Stack gap="xs" pb="xs">
 					{/*
@@ -232,20 +296,47 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 						</Text>
 					)}
 
+					{/*
+					 * An active filter that matches nothing has to be named. Without this the
+					 * two sections just do not render, and the panel reads as a clean working
+					 * tree while uncommitted changes are merely hidden.
+					 */}
+					{filterHidesEverything && (
+						<Stack gap={4} py="md" align="center">
+							<Text size="sm" c="dimmed">
+								{t("filter.noMatches")}
+							</Text>
+							<Button size="compact-xs" variant="subtle" onClick={statusFilter.clear}>
+								{t("filter.clear")}
+							</Button>
+						</Stack>
+					)}
+
 					{/* Staged section */}
-					{stagedFiles.length > 0 && (
+					{matchedStaged.length > 0 && (
 						<Stack gap={4}>
 							<Group gap="xs" justify="space-between">
 								<Text size="xs" fw={600}>
-									{t("staged")} ({status.staged})
+									{t("staged")} (
+									{filterActive ? `${matchedStaged.length}/${stagedFiles.length}` : status.staged})
 								</Text>
+								{/*
+								 * Scoped to what the filter shows. "All" while a filter hides rows would
+								 * act on files the user cannot see — harmless for unstage, but the same
+								 * shape as Discard below, where it destroys work that was filtered out.
+								 * The label changes with the scope so the button never lies about it.
+								 */}
 								<Button
 									size="compact-xs"
 									variant="subtle"
-									onClick={() => unstage.mutate({ all: true })}
+									onClick={() =>
+										filterActive
+											? unstage.mutate({ files: matchedStaged.map((f) => f.path) })
+											: unstage.mutate({ all: true })
+									}
 									loading={unstage.isPending}
 								>
-									{t("unstageAll")}
+									{filterActive ? t("filter.unstageMatched") : t("unstageAll")}
 								</Button>
 							</Group>
 							<TreeNodes
@@ -275,20 +366,28 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 					)}
 
 					{/* Unstaged / untracked section */}
-					{unstagedFiles.length > 0 && (
+					{matchedUnstaged.length > 0 && (
 						<Stack gap={4}>
 							<Group gap="xs" justify="space-between">
 								<Text size="xs" fw={600}>
-									{t("unstaged")} ({status.unstaged + status.untracked})
+									{t("unstaged")} (
+									{filterActive
+										? `${matchedUnstaged.length}/${unstagedFiles.length}`
+										: status.unstaged + status.untracked}
+									)
 								</Text>
 								<Group gap={4}>
 									<Button
 										size="compact-xs"
 										variant="subtle"
-										onClick={() => stage.mutate({ all: true })}
+										onClick={() =>
+											filterActive
+												? stage.mutate({ files: matchedUnstaged.map((f) => f.path) })
+												: stage.mutate({ all: true })
+										}
 										loading={stage.isPending}
 									>
-										{t("stageAll")}
+										{filterActive ? t("filter.stageMatched") : t("stageAll")}
 									</Button>
 									<Button
 										size="compact-xs"
@@ -297,7 +396,7 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 										onClick={handleDiscardAll}
 										loading={discard.isPending}
 									>
-										{t("discardAll")}
+										{filterActive ? t("filter.discardMatched") : t("discardAll")}
 									</Button>
 								</Group>
 							</Group>
@@ -379,6 +478,99 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 				onClose={() => setDiffFile(null)}
 			/>
 		</Box>
+	);
+}
+
+/**
+ * Status filter chips: one per kind of change present in the working tree.
+ *
+ * ── Why chips and not a Select ───────────────────────────────────────────────
+ * The question is "which kinds do I want to see", which is multi-select and has
+ * at most six answers. A dropdown hides both the current selection and the
+ * per-kind counts behind a click; six toggles show them at a glance and cost one
+ * click each. They also reuse the exact letter and colour the file rows already
+ * render, so the chip and the badge it filters on are visibly the same thing.
+ *
+ * Renders nothing when there is only one kind of change: a filter that can only
+ * show everything or nothing is noise, and it would take a row of height away
+ * from the file list in the common single-kind case.
+ */
+function StatusFilterBar({
+	chars,
+	counts,
+	selected,
+	onToggle,
+	onClear,
+	t,
+}: {
+	chars: readonly GitStatusFilterChar[];
+	counts: ReadonlyMap<GitStatusFilterChar, number>;
+	selected: ReadonlySet<GitStatusFilterChar>;
+	onToggle: (char: GitStatusFilterChar) => void;
+	onClear: () => void;
+	t: Translate;
+}) {
+	const { t: tCommon } = useTranslation("common");
+	if (chars.length < 2) return null;
+	const active = selected.size > 0;
+
+	return (
+		<Group
+			gap={4}
+			wrap="wrap"
+			px="xs"
+			pb="xs"
+			style={{ flexShrink: 0 }}
+			role="group"
+			aria-label={t("filter.label")}
+		>
+			<IconFilter
+				size={12}
+				style={{ flexShrink: 0, opacity: 0.6 }}
+				color={active ? "var(--mantine-color-indigo-4)" : undefined}
+			/>
+			{chars.map((char) => {
+				const entry = statusRegistry.gitFileStatus(char);
+				const on = selected.has(char);
+				const count = counts.get(char) ?? 0;
+				// The chip names the KIND ("Modified"), not just the letter: the letter is
+				// the compact form the rows use, but a filter control has room to say what
+				// it means, and `C` / `R` are not guessable.
+				const name = entry.i18nKey ? tCommon(entry.i18nKey) : char;
+				return (
+					<Badge
+						key={char}
+						size="sm"
+						variant={on ? "filled" : "outline"}
+						color={entry.color}
+						component="button"
+						type="button"
+						// `aria-pressed` rather than a checkbox role: these are toggle buttons,
+						// and it is also the only way a test (or a screen reader) can read the
+						// selection without inspecting Mantine's variant classes.
+						aria-pressed={on}
+						aria-label={t("filter.toggle", { name, count })}
+						onClick={() => onToggle(char)}
+						style={{ cursor: "pointer", textTransform: "none" }}
+					>
+						{char} {count}
+					</Badge>
+				);
+			})}
+			{active && (
+				<Tooltip label={t("filter.clear")}>
+					<ActionIcon
+						size="sm"
+						variant="subtle"
+						aria-label={t("filter.clear")}
+						onClick={onClear}
+						style={{ flexShrink: 0 }}
+					>
+						<IconFilterOff size={12} />
+					</ActionIcon>
+				</Tooltip>
+			)}
+		</Group>
 	);
 }
 

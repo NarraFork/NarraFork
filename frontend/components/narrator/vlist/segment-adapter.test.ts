@@ -2753,6 +2753,97 @@ describe("adaptSegment — tool-call header summary", () => {
 	});
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// `+N -N` line counts on a tool card / folded row.
+//
+// The adapter is where the figure is RESOLVED (metadata vs. a local Edit diff) and
+// where the streaming suppression lives. Both matter: a figure derived mid-stream
+// races upward and settles on a different number, which reads as a bug.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("adaptSegment — tool-call `+N -N` line counts", () => {
+	const FILE_CTX: AdapterContext = { lod: 5, resolveToolCategory: () => "file" };
+
+	function fileSeg(
+		toolName: string,
+		inputJson: unknown,
+		over: Record<string, unknown> = {},
+	): AdapterSegment {
+		return {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: { toolName, toolUseId: "tu-d", status: "success", inputJson, ...over },
+				},
+			],
+		};
+	}
+
+	function statsOf(seg: AdapterSegment, ctx: AdapterContext = FILE_CTX): unknown {
+		const spec = adaptSegment(seg, ctx).find((s) => s.key === "tool-tu-d");
+		return (spec?.data as { diffStats?: unknown } | undefined)?.diffStats;
+	}
+
+	it("carries the counts a tool wrote as metadata", () => {
+		const seg = fileSeg(
+			"Write",
+			{ file_path: "/a.ts", content: "x" },
+			{
+				outputJson: { _text: "ok", _metadata: { linesAdded: 240, linesRemoved: 0 } },
+			},
+		);
+		expect(statsOf(seg)).toEqual({ added: 240, removed: 0 });
+	});
+
+	it("falls back to a local diff for a complete Edit input", () => {
+		const seg = fileSeg("Edit", {
+			file_path: "/a.ts",
+			old_string: "a\nb\nc",
+			new_string: "a\nB\nc",
+		});
+		expect(statsOf(seg)).toEqual({ added: 1, removed: 1 });
+	});
+
+	it("omits the field for a Write with no metadata (no baseline to diff against)", () => {
+		// The case every pre-feature Write row hits. Guessing here would render a
+		// 3-line rewrite as `+240 -0`.
+		expect(statsOf(fileSeg("Write", { file_path: "/a.ts", content: "a\nb\nc" }))).toBeUndefined();
+	});
+
+	it("omits the field for a non-file tool", () => {
+		const bashCtx: AdapterContext = { lod: 5, resolveToolCategory: () => "bash" };
+		expect(statsOf(fileSeg("Bash", { command: "ls" }), bashCtx)).toBeUndefined();
+	});
+
+	/**
+	 * While the input streams, `old_string`/`new_string` are still arriving, so any
+	 * figure would change with every chunk. It appears once the call settles.
+	 */
+	it("suppresses the figure while the input is still streaming", () => {
+		// Streaming-ness is carried by the `_streamingChars` MARKER, not by the status:
+		// a partially-arrived input has it, and the persisted payload that replaces it
+		// does not. So the marker is what must gate the figure.
+		const partial = {
+			file_path: "/a.ts",
+			old_string: "a\nb\nc",
+			new_string: "a\nB\nc",
+			_streamingChars: 42,
+		};
+		expect(statsOf(fileSeg("Edit", partial, { status: "streaming" }))).toBeUndefined();
+		// Even a marker on an otherwise-terminal row suppresses it: the input is still
+		// the in-flight one, so its counts are provisional.
+		expect(statsOf(fileSeg("Edit", partial, { status: "success" }))).toBeUndefined();
+		// The settled payload — same edit, marker gone — does carry the figure.
+		const { _streamingChars: _drop, ...settled } = partial;
+		expect(statsOf(fileSeg("Edit", settled, { status: "success" }))).toEqual({
+			added: 1,
+			removed: 1,
+		});
+	});
+});
+
 describe("adaptSegment — per-turn usage rows", () => {
 	const USAGE = { input_tokens: 100, output_tokens: 20 };
 	const assistantSeg = (extra: Record<string, unknown> = {}): AdapterSegment => ({
@@ -2944,21 +3035,78 @@ describe("reasoning steps: one identity across the L2/L3 boundary", () => {
 	});
 
 	/**
-	 * The two levels GROUP reasoning differently: the activity fold pushes blocks one by
-	 * one and parses each alone, while L3+ joins a run's adjacent blocks and parses the
-	 * concatenation. So for a multi-block run `s2` on one side need not be the same step
-	 * as `s2` on the other, and pairing them would morph one step into an unrelated one —
-	 * worse than not morphing, because it looks intentional.
+	 * A MULTI-BLOCK run pairs too, because both levels now parse one canonical string.
+	 *
+	 * This used to be withheld: the fold parsed each block alone while L3+ parsed the
+	 * concatenation, so `s2` need not have been the same step on both sides. The fold
+	 * now reconstructs the run (blocks of one run share `stableKeyBase`) and parses
+	 * `reasoningRunDisplayText`, the same string L3+ parses — so the steps agree by
+	 * construction and withholding the identity would only cost an animation.
+	 *
+	 * Interleaved runs were the largest remaining morph gap, so this is the case that
+	 * closes it rather than an incidental extra.
 	 */
-	it("withholds it for a multi-block run, where the two parses can disagree", async () => {
+	it("pairs a multi-block run, whose two parses now agree by construction", async () => {
 		const multiBlock = twoStepMessage("real-msg", [
 			{ type: "reasoning", text: "**第一步**\n\n分析正文。" },
 			{ type: "reasoning", text: "**第二步**\n\n继续分析。" },
 		]);
-		const expanded = await stepUnitIdsAt(3, multiBlock);
-		expect(expanded).toEqual([]);
 		const folded = await stepUnitIdsAt(2, multiBlock);
-		expect(folded.every((id) => !/^reason-real-msg-b\d+-s\d+$/.test(id))).toBe(true);
+		const expanded = await stepUnitIdsAt(3, multiBlock);
+		expect(folded).toEqual(["reason-real-msg-b0-s0", "reason-real-msg-b0-s1"]);
+		expect(expanded).toEqual(folded);
+	});
+
+	/**
+	 * A TRANSLATED run must be parsed from its translation on both sides.
+	 *
+	 * L3+ has always displayed (and parsed) `translatedText ?? text`. The fold read the
+	 * raw original, and translation can change the step structure — this fixture's
+	 * 2-step original translates to 3 steps — so `s1` addressed a different step on each
+	 * side. That is a MIS-pair rather than a missed one: it morphs a step into an
+	 * unrelated step, which looks deliberate. Nothing surfaced it, since both sides
+	 * emitted a plausible-looking id.
+	 */
+	it("parses a translated run from the same text on both sides", async () => {
+		const translated = twoStepMessage("real-msg", [
+			{
+				type: "reasoning",
+				text: "**第一步**\n\n分析正文。",
+				translatedText: "**Step 1**\n\nAnalysis.\n\n**Step 1b**\n\nMore analysis.",
+			},
+			{
+				type: "reasoning",
+				text: "**第二步**\n\n继续分析。",
+				translatedText: "**Step 2**\n\nGoes on.",
+			},
+		]);
+		const folded = await stepUnitIdsAt(2, translated);
+		const expanded = await stepUnitIdsAt(3, translated);
+		// Three steps, because the TRANSLATION has three — not the original's two.
+		expect(expanded).toHaveLength(3);
+		expect(folded).toEqual(expanded);
+	});
+
+	/**
+	 * A run translated only in part falls back to the original on both sides.
+	 *
+	 * Rendering half a run in each language would be worse than leaving it untranslated,
+	 * so the translation is all-or-nothing — and the two levels have to agree on that
+	 * verdict, or they are back to parsing different strings.
+	 */
+	it("falls back to the original when a run is only partly translated", async () => {
+		const partial = twoStepMessage("real-msg", [
+			{
+				type: "reasoning",
+				text: "**第一步**\n\n分析正文。",
+				translatedText: "**Step 1**\n\nOnly this.",
+			},
+			{ type: "reasoning", text: "**第二步**\n\n继续分析。" },
+		]);
+		const folded = await stepUnitIdsAt(2, partial);
+		const expanded = await stepUnitIdsAt(3, partial);
+		expect(folded).toEqual(["reason-real-msg-b0-s0", "reason-real-msg-b0-s1"]);
+		expect(expanded).toEqual(folded);
 	});
 
 	it("keeps the identity height-neutral at both levels", async () => {
@@ -3206,5 +3354,80 @@ describe("adaptSegment — a concluded review", () => {
 		});
 		const height = VLIST_REGISTRY["review-card"].measure(huge as never, 800, 5).height;
 		expect(height).toBeLessThan(600);
+	});
+});
+
+/**
+ * The file-change fold must reach the ADAPTER, not just the interaction state.
+ *
+ * The resolver travels shell → usePretextDocument → layout pipeline → AdapterContext.
+ * Every hop is a plain field forward, so a missed one type-checks and simply leaves
+ * the list permanently collapsed — the click would appear to do nothing.
+ */
+describe("adaptSegment — subagent file-change fold", () => {
+	const CTX_BASE: AdapterContext = { lod: 5, resolveToolCategory: () => "agent" };
+
+	function agentSeg(fileChanges: unknown): AdapterSegment {
+		return {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: true,
+					tc: {
+						toolName: "Task",
+						toolUseId: "tu-fc",
+						status: "success",
+						inputJson: { subagent_type: "general", description: "work" },
+						_subagentActivity: {
+							subagentNarratorId: "sub-1",
+							latestToolCalls: [],
+							fileChanges,
+						},
+					},
+				},
+			],
+		};
+	}
+
+	const CHANGES = {
+		files: [{ filePath: "a.ts", linesAdded: 3, linesRemoved: 1, editCount: 1 }],
+		totalFiles: 1,
+		totalUnmeasured: 0,
+		bashTouchedCount: 0,
+		countsTruncated: false,
+	};
+
+	function cardData(seg: AdapterSegment, ctx: AdapterContext): Record<string, unknown> {
+		const spec = adaptSegment(seg, ctx).find((s) => s.key === "tool-tu-fc");
+		return (spec?.data ?? {}) as Record<string, unknown>;
+	}
+
+	it("passes the aggregate through to the card", () => {
+		expect(cardData(agentSeg(CHANGES), CTX_BASE).fileChanges).toEqual(CHANGES);
+	});
+
+	it("omits the field entirely when the child changed nothing", () => {
+		expect("fileChanges" in cardData(agentSeg(undefined), CTX_BASE)).toBe(false);
+	});
+
+	it("reflects the reader's expand state, keyed by the card's own key", () => {
+		const collapsed = cardData(agentSeg(CHANGES), CTX_BASE);
+		expect("fileChangesExpanded" in collapsed).toBe(false);
+
+		const expanded = cardData(agentSeg(CHANGES), {
+			...CTX_BASE,
+			isFileChangesOpen: (key) => key === "tool-tu-fc",
+		});
+		expect(expanded.fileChangesExpanded).toBe(true);
+	});
+
+	it("does not expand when the resolver names a different card", () => {
+		const other = cardData(agentSeg(CHANGES), {
+			...CTX_BASE,
+			isFileChangesOpen: (key) => key === "tool-someone-else",
+		});
+		expect("fileChangesExpanded" in other).toBe(false);
 	});
 });

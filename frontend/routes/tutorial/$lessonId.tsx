@@ -48,6 +48,7 @@ import { useTranslation } from "react-i18next";
 import {
 	useResetTutorialLesson,
 	useSandboxEdgeKinds,
+	useSandboxSpecTaskCount,
 	useStartTutorialLesson,
 	useTutorialIndex,
 	useTutorialLesson,
@@ -100,11 +101,21 @@ function TutorialLessonPage() {
 	// there is nothing to watch and the query stays disabled.
 	const chapterEdgeKinds = useSandboxEdgeKinds(projectId, lesson?.track === "chapters");
 
+	// Same reasoning for the Dynamic Spec step, and gated on the lesson actually
+	// having one: asking every lesson for a task count would poll an endpoint whose
+	// answer nothing reads. Derived from the steps rather than hardcoding a lesson
+	// id, so a second lesson using the condition works without touching this line.
+	const needsSpecTaskCount = !!lesson?.steps.some(
+		(step) => step.completion.kind === "specTaskWritten",
+	);
+	const specTaskCount = useSandboxSpecTaskCount(narratorId, needsSpecTaskCount);
+
 	const steps = useTutorialSteps({
 		lesson,
 		narratorId,
 		recordedStepIds,
 		chapterEdgeKinds,
+		specTaskCount,
 	});
 
 	const start = useCallback(() => {

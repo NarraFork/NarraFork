@@ -9,9 +9,28 @@ import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 import { consumeBehaviorFenceEditGrant, isBehaviorFencePath } from "./behavior-fence-grant";
 import { decodeFileBytes, encodeFileBytes, looksBinary } from "./encoding";
+import { lineStatsMetadata, wholeFileLineStats } from "./file-diff-stats";
 import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
 import { withWorkspaceWriteLock } from "./write-serialization";
+
+/**
+ * A spec file's current content, or null when it does not exist yet.
+ *
+ * Best-effort by design: `readSpecFile` throws for a path with no revision and no
+ * builtin default, and that is the ordinary "creating it now" case rather than an
+ * error. Any other failure also resolves to null — a missing line count costs the
+ * header one figure, whereas letting this throw would fail a write that would
+ * otherwise have succeeded.
+ */
+async function readSpecContentForStats(narratorId: string, uri: string): Promise<string | null> {
+	try {
+		const current = await specVfsService.readSpecFile(narratorId, uri);
+		return current.content;
+	} catch {
+		return null;
+	}
+}
 
 export const writeTool: ToolDefinition = {
 	name: "Write",
@@ -77,12 +96,18 @@ export const writeTool: ToolDefinition = {
 				const allowFenceMutation = isBehaviorFencePath(file_path)
 					? consumeBehaviorFenceEditGrant(ctx.narratorId)
 					: false;
+				// Baseline for the `+N -N` figure, read BEFORE the write replaces it. A
+				// spec file that does not exist yet reads as null (every line is then an
+				// addition); the read is best-effort because failing to produce a line
+				// count must never fail the write itself.
+				const previousContent = await readSpecContentForStats(ctx.narratorId, file_path);
 				const file = await specVfsService.writeSpecFile(ctx.narratorId, file_path, content, {
 					sourceToolUseId: ctx.currentToolUseId ?? null,
 					allowProtectedTaskMutation: taskReflectionGranted,
 					allowFenceMutation,
 				});
 				broadcastSpecChanged(ctx.narratorId, file, "tool");
+				const diffStats = wholeFileLineStats(previousContent, content);
 				let tasks: unknown;
 				if (file_path === "spec://tasks.json") {
 					try {
@@ -94,10 +119,14 @@ export const writeTool: ToolDefinition = {
 						// ignore parse error — the card falls back to the file content view
 					}
 				}
+				const specMetadata = {
+					...(tasks !== undefined && { tasks }),
+					...lineStatsMetadata(diffStats),
+				};
 				return {
 					output: `Wrote ${content.length} bytes to ${file.uri}`,
 					title: file.uri,
-					...(tasks !== undefined && { metadata: { tasks } }),
+					...(Object.keys(specMetadata).length > 0 && { metadata: specMetadata }),
 				};
 			} catch (err) {
 				return {
@@ -150,8 +179,22 @@ export const writeTool: ToolDefinition = {
 				await backend.writeFileBytes(resolvedPath, encodeFileBytes(content, existingEncoding), {
 					expectedResolvedPath: canonicalPath,
 				});
-				await trackFileChange(ctx, ioPath, "write", backend);
-				return { output: `Wrote ${content.length} bytes to ${file_path}`, title: file_path };
+				// `existingContent` is null exactly when the file did not exist, which is
+				// the distinction the client cannot make: a Write's input carries only the
+				// NEW content, so nothing downstream can tell a fresh file from a rewrite.
+				// A binary baseline is skipped — a line count over binary bytes is noise.
+				//
+				// Computed BEFORE the attribution call so ONE value feeds both the result
+				// metadata (the card header) and the persisted attribution row (the
+				// parent-facing aggregate). Two separate computations could disagree, and a
+				// header contradicting the summary is unresolvable for the reader.
+				const diffStats = existingIsBinary ? null : wholeFileLineStats(existingContent, content);
+				await trackFileChange(ctx, ioPath, "write", backend, diffStats);
+				return {
+					output: `Wrote ${content.length} bytes to ${file_path}`,
+					title: file_path,
+					...(diffStats ? { metadata: lineStatsMetadata(diffStats) } : {}),
+				};
 			});
 		} catch (err) {
 			return {

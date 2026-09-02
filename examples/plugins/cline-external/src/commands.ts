@@ -167,6 +167,13 @@ async function status(_input: unknown, context: CommandContext): Promise<Command
 			// Field name is `browserAuth` everywhere: the settings view reads this exact key.
 			browserAuth,
 			signInPending: pending !== undefined,
+			// Re-reported on every poll so the view can show the URL again after a remount.
+			// The panel is a plugin iframe whose session the host may rebuild at any time, and
+			// the URL only ever came back in the `auth.browser` response — without this, a
+			// remount mid-flow leaves a pending sign-in the user can no longer reach the
+			// authorization page for, and the only way out is to wait five minutes for the
+			// timeout. Not a credential: it is the page the user must visit to produce one.
+			...(pending ? { authorizeUrl: pending.authorizeUrl } : {}),
 			chatBaseUrl: chatBase(context),
 		},
 	};

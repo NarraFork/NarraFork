@@ -201,11 +201,14 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
   - 无论普通 capped 正文（`cappedBodyHeight`）还是 markdown 正文（`measureMarkdownDetail`），只要正文是服务端前缀就把盒高钉在 `cap`，**不测前缀**。测前缀会让高度取决于服务端预算切在哪里（更宽的布局把前缀折成更少行 → 盒子变矮，剩余可滚内容无处安放）；cap 永不裁切，因为盒子本身 `overflow:auto`。
   - **没有"内容已截断"提示行**：完整 payload 由读者在正文盒内滚过一半时自动取（`VListContentViewHost` 的 capture 阶段 scroll 监听），或打开全屏查看器时取。两条路都经同一个 `fullPayloadRequested` 门控，所以仍是用户动作；又因为盒高已钉在 cap，落地的完整正文测得 `min(exact, cap)` —— 对任何溢出盒子的正文（每个服务端前缀都溢出）逐像素相同。
   - `truncatedLeafCount` / `truncatedTotalBytes` 因此是**纯 payload 完整性信号**，不带几何：shell 用它判断哪些行可以取数、哪些请求在飞，measure cache 用它做 `|tp:` revision（payload 落地时唯一会动的字段）。
-- **effectiveOpened**：lodExempt(running/streaming/pendingPermission)恒展开；**最近一次 `spec://tasks.json` 调用的卡（latestSpecTasksToolUseId）恒展开**（`opts.forceExpanded`，由 adapter 从 shell 注入的 `resolveLatestSpecTasksToolUseId` 派生，任务板是叙述者的实时工作状态）；L5 全展开；L4 近卡随 opened、旧卡折叠；L3 全折叠 header；L1/L2 上游 gate 处理。
+- **effectiveOpened**：lodExempt(running/streaming/pendingPermission)恒展开；**最近一次 `spec://tasks.json` 调用的卡（latestSpecTasksToolUseId）恒展开**（`opts.forceExpanded`，由 adapter 从 shell 注入的 `resolveLatestSpecTasksToolUseId` 派生，任务板是叙述者的实时工作状态）；**L5 默认展开，但读者显式折叠（`userCollapsed`）时折叠**；L4 近卡随 opened、旧卡折叠；L3 全折叠 header；L1/L2 上游 gate 处理。
+  - **⚠️ L5 不是"恒展开"**：早先这里 `return true`，于是 L5 的表头 chevron 是**死的**——shell 的 toggle 把 `!effectiveOpened` 写进 `expanded`，而该分支从不读这个通道，点击存进了没人读的状态，卡片高度毫无变化且没有任何反馈。最难受的正是最需要折叠的卡：被拒的 ExitPlanMode 实测 ~1200px（`0.85×视口`的 plan 正文 + 反思通知），超过一屏却收不起来。
+  - **`userCollapsed` 必须与"派生出的 `opened === false`"区分**。后者来自 `computeDefaultOpen`，不代表读者的意图；在 L5 读它会把所有非自动展开类别的卡全部折叠。因此只有 shell 存有该 key 的偏好时才算显式折叠。
+  - **`lodExempt` 优先于显式折叠**：待审批的卡折叠后权限表单无处可去。`resolveSubagentExpanded` 同一套语义（同样的缺陷、同样的修法）。
 - **分组卡**：Paper p=xs + header(+×N badge) + 展开体(子 ToolCallCard 累加)。折叠 default=false。
 
 ### tool-run 折叠形态（全部基于 CollapsibleTrace，行高固定）
-- **CollapsibleTrace**：表头 ≈24.8px；每行 18.8px（title truncate 单行🟢）。maxVisible 超出+1 toggle 行。**reasoning step 行（独立 ReasoningStepsTrace 与 ActivityTrace 里的推理行都算）展开时有 markdown body🔴**；工具行展开是钻取整张卡（`card`，不是 `bodyText`），两条通道互斥。折叠靠 prop（`collapseItems`/`collapsed`/`expandedIndices`），不读 LOD。
+- **CollapsibleTrace**：表头 ≈24.8px（**条件渲染，见 `isTraceHeaderVisible`**）；每行 18.8px（title truncate 单行🟢）。maxVisible 超出+1 toggle 行。**reasoning step 行（独立 ReasoningStepsTrace 与 ActivityTrace 里的推理行都算）展开时有 markdown body🔴**；工具行展开是钻取整张卡（`card`，不是 `bodyText`），两条通道互斥。折叠靠 prop（`collapseItems`/`collapsed`/`expandedIndices`），不读 LOD。
   标题后紧跟**状态图标（12px 槽，仅在需要标记时渲染）+ 耗时**（`TraceItemData.status` / `.timing`，工具行才有；reasoning step 不带）。两者都落在行内容带 16.8px 之内（`TRACE_ROW_CONTENT` 由 xs 行盒决定），耗时是单行 nowrap、popover portaled，所以**不影响 18.8px 行高**（`measure-tool-run.test.ts` 有 height-neutral 断言）。它们是纯 passthrough，但会被画出来，因此必须进 `traceRevision`（`ts:` / `tm:`）。
   - **成功不画勾**：标记规则单源在 `@shared/tool-row-status`（chunk 与 vlist 共用）。只有"在飞 / 失败 / 取消"才画；`success`/`completed`、未识别状态、无生命周期的行**完全不渲染槽位**（不是空槽——每行留 12px 空隙和满列绿勾一样是噪音）。在飞状态是**显式枚举**而非"非终态"，否则拼写不认识的已完成调用会永远转圈。
   - **布局**：标题用 `flex: 0 1 auto`（可收缩以便 truncate，但不吸收剩余宽度），状态与耗时紧贴标题；行尾一个 `flex: 1` 的空 spacer 吃掉剩余宽度。耗时右对齐时读者需要横向跨过空隙回找本行，容易看成邻行的数字。
@@ -213,7 +216,9 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 - **Pinned tasks 卡不折叠**：L1/L2 的分组折叠把"最近一次 `spec://tasks.json` 调用"的卡与 active 工具同组处理（保持完整展开卡、留在原时间位置），与 `groupRenderUnits` 的 `keepToolUseIds` 豁免是同一根 pin——判定复用 spinner 的 `latestSpecTasksToolUseId` 规则（`vlist-spec-tasks-pin.ts`）。该卡仍计入 fold 数量（不从前缀 trace 的 items 移除，计数与 chunked 一致）。
   - **⚠️ 豁免按"工具条目"而非"整段 tool-run"**：`keepToolUseIds` 只把被 pin 的那一次调用拆出去，同段的其他调用照常折进 activity unit。早先按 message id 做段级豁免，整段 tool-run 会以普通 segment 抵达 adapter，L1/L2 于是把它的其他已完成调用压成 `tool-run-count`（唯一还会产生计数行的路径）——一条不含任何行、只有"工具调用 ×N"的计数行，那些调用在低档位下彻底不可寻址（现象：低 LOD "吞掉"了一次工具调用）。不变量：**任何档位下每次调用都必须可寻址**（自己的卡，或某个 trace 里的具名行）；计数行没有行，因此不得成为某次调用的唯一落点。permission 阻塞的调用同理只豁免自己。
   - **pin 的 id 只由 `buildPretextDocumentLayout` 推导，不接受 build option**：shell 另有一份（`LatestTodosToolUseIdCtx`，供 chunked 任务板 spinner 用），但那份扫的是 tail-meta 的消息列表，与 layout 实际布局的列表（persisted window + live streaming row）可能不一致；而一个"故意不进 build deps"的外部值一旦陈旧就永远无法自纠。就地推导保证 pin 始终与它所属的文档一致。
-- **ActivityTrace**（L1/L2）：表头 + min(N,10)×18.8🟢；collapsed(L1) → 仅表头 ≈24.8px。
+- **ActivityTrace**（L1/L2）：**行可见时不画表头**，高度 = 外层 py×2 + min(N,10)×18.8🟢；collapsed(L1) → 仅表头 ≈24.8px。
+  - **表头只在它还在干活时保留**。它有两个职责，行一出现就只剩一个：① 它是**折叠开关**——L1 折成一条表头，那个 chevron 是读者回到行列表的唯一入口，所以 `collapseItems` 恒保留（含读者自己展开后的 `itemsOpened`，否则等于抽走他刚用过的控件）；② 它**标注 trace**——`reasoning-steps` 需要（「推理 · 5 步」是唯一能识别这个列表的东西），但 activity 的标签是泛化的：「活动 · 0 步推理 · 4 次工具」压在四条本来就各自写着工具名的行上面，是每个 assistant 回合固定要付的一份垂直开销（单次工具调用的回合，标签比调用本身还高）。因此**只有"activity 变体且行可见"这一种形状**丢表头，其余变体与折叠态一律保留。
+  - **隐藏时是高度 0 的块，不是删块**：它仍持有外层 top padding，且 `frame.blocks[0]` 被直接当表头读。`header.visible` 把决定带到 render 层——**渲染层漏判就会画出一条测量层没预留高度的表头，压住第一行**。
   - **推理行可展开**：已落地（persisted）的结构化推理步骤带 `bodyText`，点击行展开该步 markdown🔴（高度按 `18.8 + 2*bodyPadY + markdownHeight`）。展开状态走 **row-KEY 通道**（`ctx.isRowExpanded`，与工具行钻取同一通道）——activity trace 的行序在流式过程中会被新步骤挤动，index 存不住。
   - **流式推理行不带 body**：live 行走 `parseStreamingReasoningTitles`（body 截首行），因此不可展开。原因是每帧重新 adapt 时返回完整 body 会重建整篇回复大小的字符串（实测占单帧 97.8%）；读者不吃亏，因为 live 行本身已有 `liveTail` 显示最新字符，且行 key 跨 hand-off 稳定，落地瞬间同一行长出 chevron。
 - **ReasoningCountLine**（L1/L2）：单行 ≈20.8px🟢。
@@ -224,7 +229,7 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 - Recent Calls：≤3 行 × **18.8px（= `TRACE_ROW_HEIGHT`）🟢，行间无缝**（`RECENT_STACK_GAP = 0`）。这些行就是 trace 行：dot + 14px 类别 chip + 单行 `Tool · summary` + 状态槽 + 耗时，高度直接引用 `measure-tool-run` 而不是自己再算一遍；成功不画勾与"耗时紧贴标题"的规则同上，两条渲染路径的一致性由 `RenderSubagent.traceparity.test.tsx` 逐项比对守住。
   `recentCallSummaries` / `recentCallCategories` 是 render-only（切到 `recentRowCount`），summary 由 shell 注入的 `resolveSubagentRecentSummary` 从 header 的 `inputSummary` 得出；两者都进 `subagentRevision`（`gs:` / `gc:`），因为流式补全 `inputSummary` 时行数/名字/状态都不动，它们是唯一增量。
 - 展开体：prompt ContentViewer **maxHeight:200🟡**、result ContentViewer **maxHeight:300🟡**、permission 子块。
-- effectiveExpanded：lodExempt 恒展开；L5 展开；L4 近卡随 opened、旧卡折叠；L3 折叠。
+- effectiveExpanded：lodExempt 恒展开；**L5 默认展开、显式折叠（`userCollapsed`）时折叠**（与 `effectiveOpened` 同一语义，见 §4 那条 ⚠️）；L4 近卡随 opened、旧卡折叠；L3 折叠。
 
 ### 其它列表级元素
 - prune-divider（Divider + label）🟢
@@ -325,16 +330,63 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 
 chunked 路径靠 Mantine `<Collapse>`：正文在正常流里，浏览器补间 `height`，下面的内容自然跟着滑。精确画布做不到——每行绝对定位在纯算术给出的 `top`，所以一次展开就是"重建 → 写新 top → 整列瞬移一帧"。正确但生硬。
 
-实现是 FLIP（`vlist-fold-animation.ts` 纯算 + `vlist-fold-motion.ts` 播放 + shell 接线），三条设计约束：
+实现是 FLIP（`vlist-fold-animation.ts` 纯算 + `vlist-fold-motion.ts` 出关键帧 + `vlist-motion-scheduler.ts` 播放 + shell 接线），三条设计约束：
 
 1. **不能用 CSS transition 直接补间 `top`/`height`。** 行会随窗口挂载/卸载，新进窗口的行没有"上一个值"可补间，会从浏览器上次见到该 key 的位置飞进来；而且 `top`/`height` 是布局属性，几十行同时补间等于每帧一次全画布布局。更关键的是，全局 transition 会把**所有**几何变化都变成可见位移，包括 live patch、翻页、宽度沉降——那些重建之所以要锚定，正是为了让它们不可见。所以动画必须按用户动作逐次 opt-in。
 2. **必须在视口坐标系里计算，不是文档坐标系。** 折叠重建是锚定的（`captureCoordinatorAnchor` → `restorePretextLayoutAnchor`），展开视口上方的卡片会用 +Δ 的 `scrollTop` 写入抵消 +Δ 的文档位移——屏幕上那些行根本没动。用原始 `top` 差值会给"看起来没动的行"编造 Δ 像素滑动，正是锚点要消除的伪影。两侧各减自己的 scrollTop 后，这种情况自然坍缩成"不动画"。
-3. **展开与折叠不对称，这是刻意的。** 展开时新正文已在 commit 后的 DOM 里，所以被点的那行保持**最终盒高**（下方各行因此已经正确），用 `clip-path` 揭开新增区域，读起来就是正文在固定框里展开。折叠时展开态正文**已经被 React 卸载**，没有东西可裁，动画由下方各行从原位上滑承担（卡片头部不动，让出的空隙在 200ms 内闭合）。备选方案是 `cloneNode` 深拷贝旧子树——在 click handler 里同步克隆一张 400px 的卡片，不值得。
+3. **展开与折叠不对称，这是刻意的。** 展开时新正文已在 commit 后的 DOM 里，所以被点的那行保持**最终盒高**（下方各行因此已经正确），用 `clip-path` 揭开新增区域，读起来就是正文在固定框里展开。折叠时展开态正文**已经被 React 卸载**，没有东西可裁，动画由下方各行从原位上滑承担（卡片头部不动，让出的空隙在 200ms 内闭合）。
+
+   ⚠️ **不要给折叠补"自己的"过渡。** 三个方案都试过，都是错的：
+   - **反向播放 reveal**（`inset(0)` → `inset(0 0 Δ 0)`）需要展开体还在 DOM 里，但它已经被卸载，动画落在一个本来就很短的盒子上，是 no-op。
+     - **让展开体多挂一帧再卸载**：对**顶层卡片折叠**不划算——展开体是元件自己的正文，多挂一帧要让 `RenderToolCall` 按旧 `measured` 画正文，而它的高度模型与该 measured 强耦合。（⚠️ 注意这条只针对顶层卡片。**下钻卡片的收起恰恰必须这样做**，而且不违反铁律 2，见第 4 条。早期版本在这里笼统写成"违反铁律 2"，那是错的。）
+   - **给被折叠行淡入**（`opacity: 0 → 1`）—— **短暂上线过，是 bug**。cross-fade 的作用是遮掩**组件替换**（见 §4.7「只有换了组件才淡入」），而折叠什么都没替换：卡片头部在开合两侧是同一个组件、同一位置、同一内容，卸载的只是它下面的正文体。于是淡入让**唯一没变的那部分**每次折叠都闪一下——正是那条规则要防的伪影。
+   - 备选里还有 `cloneNode` 深拷贝旧子树（在 click handler 里同步克隆一张 400px 卡片），成本不值得。
+
+   **头部不动不是这个设计的缺点，而是它能被读懂的原因**：它是那条正在闭合的空隙所依据的固定参照。
+
+4. **trace 元素内部的行要单独规划（嵌套 FLIP）。** 低档位下**整段 activity run 是一个列表项**，它的工具行是这个项内部的绝对定位块（`measured.rows[i].top`，画成 `data-nf-trace-row`）。`planFoldMotion` 只看顶层项，所以下钻一行时：run 自己变高了、整段 run **下方**的内容正确滑动，而**同一个 run 内、被下钻行下方的兄弟行直接瞬移**。这正是"只对整个 activity 组下方内容做了动画"的现象。
+   - 实测（860px、3 行 activity trace）：下钻中间行使元素 81.2 → 103.4px，其下方行 local top 60.4 → 82.6px。顶层 plan 能表达前者，无法表达后者。
+   - 由 `planFoldNestedRowMotion` + `captureFoldNestedRows` 承担，与行/边框**同一次快照**，避免两处几何不一致。
+   - **坐标是 trace 元素内的 local 值，不带 scrollTop、不带元素 top。** run 自身的位移已由该元素的 `shift` 承担，再叠加一次等于让这些行动两遍（看起来会比装着它们的盒子滑得更远）。因此"只是整段 run 移动了"的行 delta 为 0，自然被丢弃。
+   - **scope 与所属 trace 的 `row:` 互不相同**（`row:<traceKey>:nested:<rowKey>`）：元素本身也在动（它变高了），共用 scope 会让调度器在启动前取消掉另一个。
+   - ⚠️ **下钻行的"块高"必须动画，否则卡片是"瞬间消失"而不是"收起"。** 下钻行的块**就是卡片**（measure 层保留 `blockHeight === card.height`，`RenderToolRun` 按该高度画盒子），所以取消下钻不是"在稳定外框里卸载正文"（顶层卡片折叠才是那样），而是把 200px 的块换成 18.8px 的块。React 在**第一帧**就提交短高度，于是：
+     - 卡片连标题一起**瞬间消失**，没有收起过程；
+     - 下方各行从"已经变短的盒子"外面开始上滑，看起来是**从一条裁剪线里冒出来、而且追不上**上方内容。
+     两个症状同一个根因，对策有**两半，缺一不可**：
+     1. **块高动画**（`planFoldNestedRowResize` + `nestedResizeKeyframes`）：把块的 `height` 从卡片高动画到行高。下方各行位移**恰好等于它让出的高度**、时长与 easing 相同，因此全程**紧贴卡片底部**（"胶合不变量"有回归断言：实测块 41.0 → 18.8，下方三行各移 22.2）。
+     2. **延迟卸载卡片**（`closingRowKeys` + `MotionOp.onDone`）：⚠️ **只做第 1 半是无效的**——React 在同一帧就把卡片卸载了，动画于是作用在一个**空盒子**上，观感仍是"瞬间消失"。所以 shell 在 toggle 时把该行标进 `closingRows`，渲染层继续画**上一帧的卡片节点**（钉在它原有高度上，由块的 `overflow: hidden` 逐步裁短 —— 是"整体被裁短"，内容不缩放、文字不变形），动画结束由调度器的 `onDone` 释放。
+        - **这不违反 §0 铁律 2**：块盒的高度仍然精确等于布局刚提交的 `row.blockHeight`，全程不测 DOM、不读 measure 缓存、不碰布局索引；多画的那 200ms 是纯装饰，和 fold 的 `clip-path` 同类。
+        - `MotionOp.onDone` 因此必须**恰好调用一次**，且覆盖全部退出路径（自然结束 / 被同 scope 重播取消 / `cancel()` 拆除 / 压根没启动 / resolver 抛错）：漏调会让一张卡片**永久留在屏幕上**，重复调用会清掉下一次交互的状态。调度器用 `once()` 包装并对每条路径都有测试。
+        - **不用影子节点**（`cloneNode`）：那会引入一条 `fill:"none"` 刻意消灭的清理路径，且克隆一张 400px 卡片是同步深拷贝。延迟卸载让 React 继续拥有那棵子树，没有任何需要手工移除的东西。
+     - 这里动画 `height`（布局属性）是**受控例外**，与装饰边框同理：块是 trace 内的绝对定位盒，没有流内兄弟，每个兄弟行都由纯布局自己的 `top` 定位，且没人回读这个盒子。**不能用 `scaleY`** —— 那会把卡片文字压扁。
+     - 块盒因此必须 `overflow: hidden`，让收起过程中的卡片被逐步遮住而不是挂在外面。swipe / 右键菜单都走 portal（`position: fixed`），不受影响。
+   - ⚠️ **下钻 morph 不得淡入。** `drillMorphKeyframes` 曾写 `opacity: 0 → 1`，逐帧慢放就是"标题 blur in"。按 §4.7 的规则 cross-fade 只用于遮掩**组件替换**，而摘要行与卡片头部承载同一行 `Name · summary`、位置相同，这里要的是**无缝替换 + 位移**，不是溶解；淡入还会和块的高度动画打架，两者叠起来就是"一团模糊"而不是"一次干脆的移动"。
+   - ⚠️ **准入是"按 trace 全有或全无"，绝不逐行裁决。** 这些行不是各自独立的对象，而是**一列内容的整体上移**；放行一部分、拒绝另一部分，就会让通过的行缓动、被拒的行瞬移。
+     - 曾经照搬 §4.7 的 L3→L2 裁剪判据（起始盒落在 trace 提交后高度之外就拒），**那是一个 bug**。两条都不成立：
+       1. **类比不成立。** LOD 那条拒绝的是"整段动画躲在裁剪之下、末尾才弹出"的节点；而取消下钻时这些行是**从下方滑上来进入**盒子的，全程基本可见——用起始边去比最终高度，恰好拒掉了那些正确移动的行。
+       2. **逐行裁决会把整组撕开。** 实测（860px、4 行 trace，行 0 与行 2 都下钻，随后关闭行 0）：盒子 144.4 → 122.2，下方三行都该移动 22.2px，但 `row-3` 起始底边 142.4 > 122.2 被拒 → 仍下钻的 `row-2` 缓动、紧邻的普通行 `row-3` 瞬移，两者在动画期间**重叠**。这比原来"整组一起瞬移"更差。
+     - 现在同一 trace 内所有移动过的行共享同一时长与 easing，一起动或都不动。唯一的门是共享的可读距离上限，且**任一行超限即整组不动画**（亚像素行不算超限，它只是没动）。
+     - 裁剪本身不值得设门：这些行的位移最多等于盒子刚缩掉的高度，因此瞬时溢出也被同一个 `overflow: hidden` 挡住——不会溢出 trace，也不会画到邻居身上。
+
+### 铁律：一次视觉事件 = 一个调度器 = 一个取消边界
+
+画布上有**四样**东西会动：fold 的行、fold 的装饰边框、下钻表头 morph、LOD 切档 morph。它们**不是相互独立的事件**——`onToggleRow` 一次点击同时产生 fold（捕获几何）和 drill 翻转，所以这两者必然同帧播放。
+
+改造前每样各有自己的 controller 和取消边界，后果是**一次视觉事件会被拆散**：再点一次时 fold 的 controller 把自己启动过的全部取消，而 drill 的 controller 只取消同一 `rowUid`，于是一半停住、另一半继续跑到不同的结束时间。时长也已经漂移（fold 200ms、drill 引用 200ms、LOD 250ms）——LOD 长一点是合理的，其余的相等只是巧合，而三个模块里没有任何一处能表达这个区别。
+
+现在统一由 `vlist-motion-scheduler.ts` 持有全部 WAAPI 句柄、决定时长与 easing、拥有唯一取消边界。三个 planner **不合并**（输入语义和坐标系各不相同，且它们是这套系统正确的部分），只统一执行：
+
+- **scope 取消**：取消域是字符串（`row:<key>` / `frame:<key>` / `drill:<uid>` / `lod:<unitId>`）。重播一个 scope 只取消它自己——多行同时下钻时再点其中一行，其余行不受影响（保留了原 drill controller 的行为）；而一次 fold 重播能连带取消该行的 row/frame/drill 三个 scope（原来任何 controller 都表达不了）。
+  ⚠️ 被点的行**同时**会有 reveal 与 shift（钉底展开），落在两个节点两种属性上，所以它们的 scope 必须不同（`row:<key>:reveal` / `:shift`）：调度器在启动前先取消同 scope，共用一个 scope 会让后者把前者取消在启动之前。
+- **一次 commit 一次 flush**：三个 effect 各自 `begin()` + `push()`，由一个**声明在它们之后**的 layout effect 统一 `flush()`。层内 effect 按声明顺序执行，这与 §4.6 里 `usePretextDocument` 必须在 fold play 之前是同一机制。把 flush 挪到任何一个 planner 之前，那个 effect 的 op 就会落到下一个事件或永远不播——**静默失败**：plan 照样产出，只是时序散了。
+- **时长单点**：`MOTION_DURATION_MS`（200）为共享基准，`LOD_MOTION_DURATION_MS`（250）是唯一的刻意偏离，且作为**事件级**覆盖施加到该次切档的每个 op（逐 op 覆盖会让配对元素在不同时刻落定）。
+- `prefers-reduced-motion` 的三份重复判定合并为调度器一处。
 
 铁律层面的位置：
 - **不属于高度模型。** 只写 `transform` / `clip-path`，都是合成属性、不参与布局、不回读。`height` 会反馈进布局并可能扰动已测高度，`top` 会和布局拥有的绝对定位打架，两者都禁止（`vlist-fold-wiring.test.ts` 按关键帧构造函数逐个断言）。
 - **不进 React state、不进测量缓存。** 和 `vlist-highlight.ts` 同一范式：用 ref 持有，直接写行节点。进 state 会为一个装饰让全窗口 memo 失效，还会把视觉关注点塞进"产生被动画几何"的那次 render。
 - 行上新增 `data-nf-row-key`（data 属性，height-neutral）供控制器定位节点；`id` 不能用，它是**消息** id，一条消息的多行共享它。
+- 行的**内层**内容盒另有 `data-nf-row-body`（同样 height-neutral，同样不得进 `spec.opts`），**只供 reveal 使用**。`clip-path` 的 inset 是从**它所作用节点的底边**量起的，而只有内层盒的高度等于布局的 `height`；外层行盒是 `hitHeight`（自身高 + 到下一行的间隙，见 `resolveRowHitHeight`）。把 reveal 打在外层，裁剪起点就比卡片真实下边缘低了一个 gap，首帧会露出本该还藏着的内容，而且内层盒自己还有一层 `overflow: hidden`，两层裁剪对"卡片在哪结束"的判断不一致。`shift` 平移整行，仍落在外层盒。
 
 两个易错点（都有守卫）：
 - **捕获必须在 click handler 里、`setInteraction` 之前。** 放在 effect 里读到的是重建后的几何，差值恒为 0。
@@ -344,7 +396,7 @@ chunked 路径靠 Mantine `<Collapse>`：正文在正常流里，浏览器补间
 
 ## 4.7 LOD 切档过渡（元素级 diff，纯装饰层）
 
-切档和折叠是两件不同的事：折叠改一处高度，切档**重排整篇文档**。所以它不用 click 时捕获，而是**声明式 diff**——每次 commit 后快照视口×3 窗口，与上一帧配对，让已提交的新节点从旧屏幕位置滑回原位（`vlist-lod-morph.ts` 纯算 + `vlist-lod-morph-motion.ts` 播放 + shell 接线）。
+切档和折叠是两件不同的事：折叠改一处高度，切档**重排整篇文档**。所以它不用 click 时捕获，而是**声明式 diff**——每次 commit 后快照视口×3 窗口，与上一帧配对，让已提交的新节点从旧屏幕位置滑回原位（`vlist-lod-morph.ts` 纯算 + `vlist-lod-morph-motion.ts` 出关键帧 + `vlist-motion-scheduler.ts` 播放 + shell 接线）。
 
 - **配对身份是 `unitId ?? key`。** 被重新主题化的元素（工具卡/子代理卡）逐档换 key（折叠批次以首个成员命名为 `toolrun-count-tool-<id>`），靠 adapter 挂的 LOD 无关 `unitId` 配对；**其余全部元素**（markdown 正文、user 气泡、system 卡、turn-usage、divider）没有 `unitId`，但它们的 `spec.key` 本身就与档位无关（`${msgId}-b{n}` / `${msgId}-bubble` / `${idBase}-sys` / `${idBase}-usage-*`），所以 `key` 就是它们的跨档身份，不需要新造 id。早期只配对前者，结果是切档"一半平滑"——卡片缓动到位，承载它们的文档主体瞬移。
   - 两个命名空间不会撞：adapter 设 `unitId` 时一律设成该元素**自己的 `key`**，所以 `unitId` 绝不会是别的元素的 `key`。单档独占的 key（`toolrun-count-*`、`activity-*`）在另一档不存在，只会"配不上"（直接出现），不会"配错"。
@@ -383,7 +435,7 @@ chunked 路径靠 Mantine `<Collapse>`：正文在正常流里，浏览器补间
 
 **`reasoning-steps` 容器元素不配对，这是正确的。** 那才是真正的 1:N：L2 侧不存在"每个 run 一个容器"，一段里所有 run 和工具都并进同一个 `activity-trace`，N 个容器映射到 1 个元素；而且两侧 chrome 是不同的东西（「推理 · N 步」表头 vs 「活动」表头）。身份由行承载，容器只是外壳。
 
-**三个控制器的 `transform` 争用（两条互斥条件，都必须在）。** 折叠靠 `data-nf-row-key` 定位、LOD morph 靠 `data-nf-unit` 或 `data-nf-row-key`，两者落在**同一个节点**上，而 cancel 边界各自独立。互斥靠：
+**折叠与 LOD morph 的 `transform` 争用（两条互斥条件，都必须在）。** 折叠靠 `data-nf-row-key` 定位、LOD morph 靠 `data-nf-unit` 或 `data-nf-row-key`，两者落在**同一个节点的同一个属性**上。现在两者共用一个调度器（见 §4.6 末），所以不再存在"两个 cancel 边界互不知情"的问题；但**同一属性上两个动画仍然会互相覆盖**，所以下面两条互斥条件依然必须成立——scope 分离只保证取消语义正确，不会把两个 plan 合成一个：
 1. **折叠自己那次重建不动档位。** `toggleVListLodUserOverride` 只改 `lodUserOverrides`（作为 per-card opt 抵达 build），`manifest.lod` 来自 `useRenderLod()`，只有缩放手势能动它。所以 LOD morph 的 gate（revision 不变 **且** lod 移动）拒绝它。
 2. **后续重建不能复活折叠的 capture。** 切档和折叠一样**不推进 documentRevision**，所以"折叠后 400ms 内立刻捏合"会同时通过 revision 与年龄两道校验 —— capture 因此额外记录自己的档位，`isFoldCaptureUsable` 一旦发现档位移动就判定失效（语义上也对：capture 拍的是另一套主题下的几何）。
 
@@ -391,12 +443,41 @@ chunked 路径靠 Mantine `<Collapse>`：正文在正常流里，浏览器补间
 
 §4.6/§4.7 处理"高度怎么看起来在动"，这一节处理**视口怎么到达新底部**。钉底跟随流式输出时，每条新行/新 toolcall/卡高落地都曾把 `scrollTop` 瞬时写到新底部——相对视口，所有已提交行在一帧内上跳一个增量。现在这些写入走**追赶式平滑跟随**（`vlist-smooth-follow.ts`：纯算步进/门控 + rAF 控制器，与 fold-animation/fold-motion 同一分层范式）：提交帧画面保持不动，随后视口指数趋近（TAU=100ms，速度上限 4000px/s）滑行到**每帧重读的实时底部**，新内容从底部滑入。移动目标无需重启动画，无速度突变。
 
-**只钉底跟随写入平滑，其他一切写入保持瞬时。** 三条底部写入路径统一经 `follower.ensure()` 路由（门控失败时内部回退到与改造前逐字节相同的瞬时写）：流式 bottom 锚点修正（`onScrollTopCorrection`）、几何 revision pin effect、`processScrollFrame` 的 re-glue。item 锚点修正、marker 跳转、reveal 跳转、`scrollToBottom(instant)` 保持瞬时——锚定修正的全部意义在于不可见，导航跳转是读者的显式动作。
+### 判据：只有"读者在场时内容到达"才 glide
 
-**门控是一条纯算术规则**：`delta = 实时底部 − 当前 scrollTop`，仅当 `0 < delta <= smoothFollowMaxDelta(viewport)`（= clamp(1.5×vh, 480, 2000)）且非 reduced-motion 才滑行。这一条自动区分：流式增量（小 delta → 滑行）vs 首次加载/切换叙述者/prepend 重吸附/巨型落地（大 delta → 瞬时）、回退缩文档（delta ≤ 0 → 瞬时）。**但它不单独够用**：fold/LOD 重建也能产生小 delta，而它们各自拥有 FLIP/morph 几何。所以另有两道配合：
+⚠️ **这是本节最容易做错的一条，且做错不会报错、只会让列表动画化自己的挂载过程。**
+
+底部写入有三个入口，但**只有一个**该 glide：
+
+| 入口 | 语义 | 行为 |
+|------|------|------|
+| 流式 bottom 锚点修正（`onScrollTopCorrection` + 成因标记） | 读者在看，内容到达 | **glide**（唯一） |
+| 几何 revision pin effect | 文档**建立/沉降** | 瞬时贴底 |
+| `processScrollFrame` 的 re-glue | 行 paint 后**落定高度** | 瞬时贴底 |
+
+后两者是**兜底路径**，接住的是一切几何变化：首次加载、切换叙述者（restore 提交后台 reload 再替换窗口）、prepend 重吸附、行上报真实高度（权限表单 textarea / 图片 / reflection notice）、footer 解析、视口 resize。这些增量**个个都很小**，所以一旦路由到同一个门控就会逐个通过并开始滑行——**症状是切换叙述者时列表从上方一路滚下来，而不是直接贴底打开**（已实际发生过）。纯函数门控测试抓不到这类问题：门控本身完全正确，错的是"谁有资格问它"。
+
+**但后两者也不能无条件瞬时写**：那会在下一帧覆盖写到底，把流式修正刚启动的追赶整段截断。所以它们的规则是**追赶在跑时让位**（`smoothFollowerRef.current?.isActive()`）——追赶每帧重读实时底部，它们要答的那次增长已经在追赶的目标里了。
+
+item 锚点修正、marker 跳转、reveal 跳转、`scrollToBottom` 一律瞬时并 cancel 追赶——锚定修正的全部意义在于不可见，导航跳转是读者的显式动作。
+
+守卫断言 `ensure()` 在整个 shell 里**只出现一次**（多出一处就是这个 regression 回来了）。
+
+**门控是一条纯算术规则**：`delta = 实时底部 − 当前 scrollTop`，仅当 `0 < delta <= smoothFollowMaxDelta(viewport)`（= clamp(1.5×vh, 480, 2000)）且非 reduced-motion 才滑行。它挡掉的是**巨型位移**：整页加载、切换后窗口替换、回退缩文档（delta ≤ 0）。
+
+**但门控只是最后一道，不是主判据。** 它按 delta 大小工作，而"文档沉降"与"内容到达"在几何上完全可以同样小——上面那张表才是主判据（谁有资格 glide），门控只负责在有资格的那条路上再挡掉过大的位移。另有两道配合：
 
 1. **成因标记 `scrollTopSmoothFollow`**（coordinator 快照 → `usePretextDocument` → `onScrollTopCorrection` 第三参）。只有 `setStreamingMessage` / `appendMessage` / `applyLivePatch` 三个**尾部增长**提交携带它；rebuild/remove/insert/replace/trim/restore/prepend 一律不携带。没有标记的 bottom 修正（如钉底下的 prepend 重吸附）几何上与流式增量不可区分——钉底时两者的 delta 都是"距新底部一小段"——所以成因必须由协调器盖章，shell 不得嗅探。契约测试在 `pretext-layout-coordinator.test.ts` 的 stamping 组。
 2. **几何占有转换前吸附**：`captureFoldBefore` 与 LOD 的 `emit`/`prepareLodChange` 先调 `snapToTarget()`（无追赶时为空操作）。钉底下的 fold FLIP 按 `getScrollBottomTarget` **预测** afterScrollTop，追赶滞后会毁掉视口坐标 delta。
+
+### 末段必须有步长下限与提前落定（两者缺一都会顿挫）
+
+指数趋近的步长与剩余距离成正比，所以**尾部天然会退化**，而尾部正是读者盯着看的部分。两个效应叠加，各需一条对策，方向相反不可互换：
+
+- **亚像素步长 → 画面完全不动，攒够 1px 才跳一下。** TAU=100ms@60Hz 每帧走剩余的 ~15%，残差 3px 时每帧 0.46px、0.39px、0.33px……写进 `scrollTop` 也不改变**渲染**位置（设备像素对齐），于是连续几帧静止再突然位移一像素——这就是"好几帧动一下"的顿挫。对策：`SMOOTH_FOLLOW_MIN_STEP_PX`=1，步长低于它就抬到它（并始终 clamp 到剩余距离，故不会越过目标）。
+- **1px/帧 匀速尾巴 → 动画迟迟不落定。** 下限消除了静止帧，但把尾部变成一串 1px 帧。实测 20px 增长会附加约 6 帧（~100ms）看不见的运动。对策：`SMOOTH_FOLLOW_SETTLE_EPSILON_PX`=**3**（不是"尽可能小"），把该串压到最多 2-3 帧。
+
+⚠️ **两个常量都不要"优化"**：把 epsilon 调回 1px 或去掉步长下限，都会让顿挫原样回来，而单元测试断言的正是这两件事（无亚像素帧 + 1px 帧数 ≤3）。3px 的收尾跳变是安全的——shell 本来就把 1px 内视作"已在底部"，且最后一次写入是**精确目标**；epsilon 只决定"最后两三个像素跳过去还是爬过去"，而在一段减速动画的末尾，≤3px 的跳变低于可察觉阈值（这也正是爬过去不值 100ms 的原因）。
 
 **追赶期间的三条不变量**（都有守卫断言，见 `vlist-scroll-pin.test.ts` 的 smooth-follow 组）：
 
@@ -406,7 +487,9 @@ chunked 路径靠 Mantine `<Collapse>`：正文在正常流里，浏览器补间
 
 **为什么不用 CSS `scroll-behavior: smooth`**：逐帧写会不断重启浏览器补间（移动目标下永远追不上或攒延迟）、无法控制速度/阈值、且会污染锚定修正等必须瞬时的写入（该属性是容器级的，按写切换它会把时序复杂度搬回 shell）。
 
-`prefers-reduced-motion: reduce` 下 `ensure()` 恒走瞬时写——行为与改造前完全一致，且这不是可选优化而是可达性契约（复用 vlist-fold-motion 的 `prefersReducedMotion()`）。
+`prefers-reduced-motion: reduce` 下 `ensure()` 恒走瞬时写——行为与改造前完全一致，且这不是可选优化而是可达性契约（复用 vlist-motion-scheduler 的 `prefersReducedMotion()`）。
+
+> **试过 transform 反向位移，已回退。** 曾把 glide 改成"`scrollTop` 瞬时到底 + 画布 `translateY(+delta)` 动画回 0"，目的是让插值跑在合成器线程。理论收益成立（零 scroll 事件/零窗口重算），但**实测看不到任何滚动动画，只有瞬间抖动**：真实的流式提交里，同一帧既写 `scrollTop` 又装位移动画，而画布本身正在被 React 重建（`totalHeight` 变化、行挂载/卸载），位移被反复清除或从错误基线起算。这条路要走通得先解决"位移与文档重建的时序归属"，成本远超收益。追赶方案虽然占用主线程，但它与既有的锚定/窗口/pin 机械是同一套坐标系，行为可预测。
 
 ## 5. 测试约定
 

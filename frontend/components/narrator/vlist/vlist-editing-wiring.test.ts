@@ -115,10 +115,34 @@ describe("vlist inline editing wiring", () => {
  */
 describe("vlist reasoning translation toggle wiring", () => {
 	it("binds the row's language toggle onto reasoning cards", () => {
-		expect(SHELL).toContain("onToggleTranslation: () => setInteraction((prev) =>");
+		// The handler dispatches the flip…
+		expect(SHELL).toContain("setInteraction((prev) => toggleVListShowOriginal(prev, key))");
+		// …and the row actually receives it.
 		expect(SHELL).toMatch(
 			/if \(kind === "reasoning"\) \{\s*\n\s*extra\.onToggleTranslation = toggles\.onToggleTranslation;/,
 		);
+	});
+
+	/**
+	 * The flip is height-affecting, so it captures the pre-fold geometry like every
+	 * other resizing toggle.
+	 *
+	 * The two texts wrap to different line counts at one width (`measureReasoning`
+	 * measures the resolved display text, and `showOriginal` is part of the measure cache
+	 * key). Measured at 860px wide: an expanded run is 70px showing its translation and
+	 * 90px showing its original. Without a capture this was the one resizing toggle with
+	 * no transition — it teleported every row below it while the rest of the list eased.
+	 */
+	it("captures the pre-flip geometry, because the flip resizes the row", () => {
+		const start = SHELL.indexOf("onToggleTranslation: () => {");
+		expect(start, "the translation handler is missing").toBeGreaterThan(0);
+		const body = SHELL.slice(start, SHELL.indexOf("},", start));
+		const captureAt = body.indexOf("captureFoldBefore(key)");
+		const setAt = body.indexOf("setInteraction(");
+		expect(captureAt, "the flip must capture the pre-fold geometry").toBeGreaterThan(-1);
+		// A capture taken after the state change reads the geometry the flip already
+		// invalidated, so the delta would always be zero.
+		expect(captureAt).toBeLessThan(setAt);
 	});
 
 	it("feeds the show-original resolver into the document layout", () => {

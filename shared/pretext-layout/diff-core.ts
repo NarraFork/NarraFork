@@ -346,6 +346,87 @@ export function computeDiffCached(oldStr: string, newStr: string, startLine = 1)
 	return lines;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Line-count statistics (`+N -N`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Added / removed line totals for one edit. */
+export interface DiffLineStats {
+	added: number;
+	removed: number;
+}
+
+/**
+ * Wall-clock budget (ms) for ONE statistics diff.
+ *
+ * `MAX_DIFF_INPUT_CHARS` bounds the input SIZE but says nothing about the cost:
+ * Myers is O(N·D), and a whole-file rewrite is precisely the shape where D is
+ * largest. This runs on the server's single JS thread (the one carrying the agent
+ * loop), so an unbounded run would show up as "every request hangs" with no
+ * signal pointing here.
+ */
+const DIFF_STATS_TIMEOUT_MS = 150;
+
+/**
+ * Edit-distance ceiling for one statistics diff.
+ *
+ * A second, deterministic bound beside the timeout: a slow machine must reach the
+ * same verdict as a fast one, or the same payload would show line counts on one
+ * host and none on another.
+ */
+const DIFF_STATS_MAX_EDIT_LENGTH = 20_000;
+
+/**
+ * Added / removed line counts between two texts, or null.
+ *
+ * ⚠️ `null` means "NO DATA", never "zero changes". It has two sources, and every
+ * caller must treat both the same way — by omitting the figure entirely:
+ *   1. the input exceeds `MAX_DIFF_INPUT_CHARS` (or the caller's smaller
+ *      `maxInputChars`)
+ *   2. the computation exceeded its budget (`timeout` / `maxEditLength` above,
+ *      which make `diffLines` return `undefined`)
+ *
+ * Rendering `+0 -0` for either case would state that the call changed nothing,
+ * which is a worse error than saying nothing at all.
+ *
+ * Cheaper than `computeDiff` on purpose: it accumulates the per-change `count`
+ * and never runs the (quadratic) word diff, because nothing here needs to know
+ * WHICH parts of a line changed.
+ *
+ * Line endings are normalized first, so a CRLF→LF conversion is not reported as
+ * an edit to every line in the file.
+ */
+export function countDiffLineStats(
+	oldStr: string,
+	newStr: string,
+	opts: { maxInputChars?: number } = {},
+): DiffLineStats | null {
+	const normalizedOld = normalizeDiffLineEndings(oldStr);
+	const normalizedNew = normalizeDiffLineEndings(newStr);
+	const limit = Math.min(opts.maxInputChars ?? MAX_DIFF_INPUT_CHARS, MAX_DIFF_INPUT_CHARS);
+	if (normalizedOld.length + normalizedNew.length > limit) return null;
+	if (normalizedOld === normalizedNew) return { added: 0, removed: 0 };
+	const changes = computeLineDiff(normalizedOld, normalizedNew, {
+		timeout: DIFF_STATS_TIMEOUT_MS,
+		maxEditLength: DIFF_STATS_MAX_EDIT_LENGTH,
+	});
+	// Both abort paths surface as `undefined` — the budget was exceeded.
+	if (!changes) return null;
+	let added = 0;
+	let removed = 0;
+	for (const change of changes) {
+		if (change.added) added += change.count;
+		else if (change.removed) removed += change.count;
+	}
+	return { added, removed };
+}
+
+/** Line count of a standalone text (a newly created file is all additions). */
+export function countTextLines(value: string): number {
+	if (!value) return 0;
+	return splitIntoLines(normalizeDiffLineEndings(value)).length;
+}
+
 /** Test hook: forget every memoized diff. */
 export function resetDiffCache() {
 	diffCache.clear();

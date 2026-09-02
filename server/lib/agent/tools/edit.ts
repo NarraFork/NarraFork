@@ -9,6 +9,12 @@ import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 import { consumeBehaviorFenceEditGrant, isBehaviorFencePath } from "./behavior-fence-grant";
 import { decodeFileBytes, encodeFileBytes, looksBinary } from "./encoding";
+import {
+	countOccurrences,
+	lineStatsMetadata,
+	replacementLineStats,
+	wholeFileLineStats,
+} from "./file-diff-stats";
 import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
 import { withWorkspaceWriteLock } from "./write-serialization";
@@ -336,6 +342,18 @@ export interface ReplaceResult {
 	content: string;
 	/** 1-based line number where the first replacement occurred */
 	startLine: number;
+	/**
+	 * The text that was ACTUALLY replaced.
+	 *
+	 * Not necessarily `oldString`: the replacer chain falls back to line-trimmed,
+	 * whitespace-normalized and block-anchor matching, so the substring taken out of
+	 * the file can differ from what the model typed. Line statistics must be
+	 * computed against this — diffing the model's `old_string` against `new_string`
+	 * would report indentation the file never had.
+	 */
+	matchedText: string;
+	/** How many occurrences were substituted (always 1 unless `replaceAll`). */
+	occurrences: number;
 }
 
 export function findReplaceMatch(
@@ -380,7 +398,15 @@ export function replace(
 
 	const match = findReplaceMatch(content, oldString, replaceAll);
 	if (replaceAll) {
-		return { content: content.replaceAll(match.search, newString), startLine: match.startLine };
+		return {
+			content: content.replaceAll(match.search, newString),
+			startLine: match.startLine,
+			matchedText: match.search,
+			// Counted BEFORE the substitution, against the text being modified: this is
+			// the only point where the real number of affected sites is known, and a
+			// 30-site rename reported as one occurrence understates it 30-fold.
+			occurrences: countOccurrences(content, match.search),
+		};
 	}
 	return {
 		content:
@@ -388,6 +414,8 @@ export function replace(
 			newString +
 			content.substring(match.index + match.search.length),
 		startLine: match.startLine,
+		matchedText: match.search,
+		occurrences: 1,
 	};
 }
 
@@ -485,9 +513,9 @@ export const editTool: ToolDefinition = {
 				const content = normalizeLineEndings(rawContent);
 				const normalizedOld = normalizeLineEndings(old_string);
 				const normalizedNew = normalizeLineEndings(new_string);
-				const result =
+				const result: ReplaceResult =
 					old_string === ""
-						? { content: normalizedNew, startLine: 1 }
+						? { content: normalizedNew, startLine: 1, matchedText: "", occurrences: 1 }
 						: replace(content, normalizedOld, normalizedNew, replace_all);
 				const taskReflectionGranted = consumeTaskReflectionGrant(
 					ctx.narratorId,
@@ -509,6 +537,14 @@ export const editTool: ToolDefinition = {
 				broadcastSpecChanged(ctx.narratorId, written, "tool");
 				const oldLines = normalizedOld.split("\n").length;
 				const newLines = normalizedNew.split("\n").length;
+				// `+N -N` for the header. The overwrite mode (`old_string === ""`) rewrote
+				// the whole file, so it is diffed against the previous content rather than
+				// against an empty string — otherwise a one-line change to an existing spec
+				// file would report every line as new.
+				const diffStats =
+					old_string === ""
+						? wholeFileLineStats(current === null ? null : content, result.content)
+						: replacementLineStats(result.matchedText, normalizedNew, result.occurrences);
 				let tasks: unknown;
 				if (file_path === "spec://tasks.json") {
 					try {
@@ -530,6 +566,7 @@ export const editTool: ToolDefinition = {
 						newEndLine: result.startLine + newLines - 1,
 						specPath: written.path,
 						tasks,
+						...lineStatsMetadata(diffStats),
 					},
 				};
 			} catch (err) {
@@ -600,10 +637,21 @@ export const editTool: ToolDefinition = {
 						encodeFileBytes(new_string, decoded.encoding),
 						{ expectedResolvedPath: canonicalPath },
 					);
-					await trackFileChange(ctx, ioPath, "edit", backend);
+					// This mode OVERWRITES an existing file as readily as it creates a new
+					// one, so the previous content (when there was any) is the baseline. A
+					// missing file has none, and every line then counts as an addition.
+					//
+					// Computed before the attribution call so ONE value feeds both the result
+					// metadata and the persisted row (see write.ts for the full rationale).
+					const overwriteStats = wholeFileLineStats(
+						existingBytes ? normalizeLineEndings(decoded.text) : null,
+						normalizeLineEndings(new_string),
+					);
+					await trackFileChange(ctx, ioPath, "edit", backend, overwriteStats);
 					return {
 						output: `Created/overwritten ${file_path}`,
 						title: file_path,
+						...(overwriteStats ? { metadata: lineStatsMetadata(overwriteStats) } : {}),
 					};
 				}
 
@@ -616,7 +664,16 @@ export const editTool: ToolDefinition = {
 				await backend.writeFileBytes(resolvedPath, encodeFileBytes(result.content, encoding), {
 					expectedResolvedPath: canonicalPath,
 				});
-				await trackFileChange(ctx, ioPath, "edit", backend);
+				// Diffed against the text actually matched (not the model's `old_string`) and
+				// scaled by the replacement count — see `ReplaceResult.matchedText` /
+				// `replacementLineStats`. Computed once, then shared by the result metadata
+				// and the attribution row.
+				const editStats = replacementLineStats(
+					result.matchedText,
+					normalizedNew,
+					result.occurrences,
+				);
+				await trackFileChange(ctx, ioPath, "edit", backend, editStats);
 				const oldLines = normalizedOld.split("\n").length;
 				const newLines = normalizedNew.split("\n").length;
 				return {
@@ -626,6 +683,7 @@ export const editTool: ToolDefinition = {
 						startLine: result.startLine,
 						endLine: result.startLine + oldLines - 1,
 						newEndLine: result.startLine + newLines - 1,
+						...lineStatsMetadata(editStats),
 					},
 				};
 			});

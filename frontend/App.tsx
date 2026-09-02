@@ -48,7 +48,13 @@ import {
 import { useBranding } from "@frontend/hooks/useBranding";
 import { usePluginContributions } from "@frontend/hooks/usePluginContributions";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
-import { Center, Loader, MantineProvider, v8CssVariablesResolver } from "@mantine/core";
+import {
+	Center,
+	Loader,
+	MantineProvider,
+	useComputedColorScheme,
+	v8CssVariablesResolver,
+} from "@mantine/core";
 import { DatesProvider } from "@mantine/dates";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createRouter, type RouterHistory, RouterProvider } from "@tanstack/react-router";
@@ -170,10 +176,18 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 		return () => narratorWSManager.removeListener(listener);
 	}, []);
 
-	const colorScheme =
-		typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: light)").matches
-			? ("light" as const)
-			: ("dark" as const);
+	/*
+	 * The scheme the app is ACTUALLY rendering in, not the one the OS prefers.
+	 *
+	 * This read used to be `matchMedia("(prefers-color-scheme: light)")`, which ignores the
+	 * user's own choice: `MantineProvider` runs with `defaultColorScheme="auto"` and
+	 * `ThemeSwitcher` lets them pin light or dark. Someone on a light OS who picks dark was
+	 * therefore told `colorScheme: "light"` — the opposite of what they were looking at.
+	 *
+	 * `useComputedColorScheme` resolves `"auto"` to the value in effect, so the two always
+	 * agree. No plugin consumed the field yet, which is exactly why the error had no symptom.
+	 */
+	const colorScheme = useComputedColorScheme("dark");
 
 	const getContext = React.useCallback(
 		(

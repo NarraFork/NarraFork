@@ -100,6 +100,53 @@ describe("measureTextFile", () => {
 			expect(block.data?.size).toBe(512);
 		}
 	});
+
+	// The row is reserved at ONE line, so the render layer truncates the filename
+	// instead of wrapping it — which needs a bounded box. `displayWidth` IS that
+	// box: without it the row was unbounded inside its absolutely positioned host,
+	// a long filename wrapped, and it overflowed the height measure committed to.
+	it("reserves the row's natural width so the filename can be truncated", async () => {
+		const { measureTextFile, textFileRowNaturalWidth } = await import("./measure-media");
+		const data = {
+			filename: "api-request-2026-09-01T17-58-20-793Z-WsKWNTpwoGGUne6.json",
+			size: 855_450,
+		};
+		const r = measureTextFile(data, 600);
+		const block = r.blocks[0]!;
+		expect(block.kind).toBe("fixed");
+		if (block.kind === "fixed") {
+			expect(block.displayWidth).toBe(textFileRowNaturalWidth(data));
+			// A long name must claim more room than a short one, or the shrink-wrap
+			// container has nothing to grow around.
+			const short = measureTextFile({ filename: "a.md", size: 512 }, 600);
+			if (short.blocks[0]!.kind === "fixed") {
+				expect(block.displayWidth!).toBeGreaterThan(short.blocks[0]!.displayWidth!);
+			}
+		}
+	});
+
+	it("never reserves more width than the column offers", async () => {
+		const { measureTextFile } = await import("./measure-media");
+		const r = measureTextFile({ filename: "x".repeat(400), size: 1024 }, 200);
+		const block = r.blocks[0]!;
+		if (block.kind === "fixed") expect(block.displayWidth).toBe(200);
+	});
+
+	// The reserved width is measured from the SAME "(835.4 KB)" string the row
+	// paints. Two implementations of that formatting would reserve one width and
+	// paint another, silently reintroducing the overflow this width prevents.
+	it("measures the size text the render layer actually paints", async () => {
+		const { textFileRowNaturalWidth } = await import("./measure-media");
+		const { formatFileSize } = await import("../render/vlist-text-file-row");
+		const shared = await import("@shared/text-file-types");
+		expect(formatFileSize).toBe(shared.formatFileSize);
+		// A wider size string must widen the reservation: proof the size participates.
+		const withBigSize = textFileRowNaturalWidth({ filename: "a.md", size: 855_450 });
+		const withSmallSize = textFileRowNaturalWidth({ filename: "a.md", size: 1 });
+		expect(withBigSize).toBeGreaterThan(withSmallSize);
+		// No size at all → no size text, no gap for it.
+		expect(textFileRowNaturalWidth({ filename: "a.md" })).toBeLessThan(withSmallSize);
+	});
 });
 
 describe("measureImageGeneration", () => {

@@ -75,6 +75,7 @@ import {
 	readImageIntrinsicSize,
 } from "@shared/pretext-layout/image-fit";
 import type { ReflectionNoticeData } from "@shared/pretext-layout/reflection";
+import { BARE_ROW_GAP, BARE_ROW_ICON } from "@shared/pretext-layout/row-metrics";
 import { scaleFontSize } from "@shared/pretext-layout/typography";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import {
@@ -179,8 +180,52 @@ export const CARD_BORDER = 1;
 /** In-run `<Divider size={1}>` under a non-last card. */
 export const CARD_DIVIDER = 1;
 
-/** Header category-icon lane (`.headerCategoryIcon { width/height: 16px }`). */
-export const HEADER_CATEGORY_ICON = 16;
+/**
+ * Header category-icon lane (`.headerCategoryIcon { width/height }`).
+ *
+ * Deliberately `BARE_ROW_ICON` — the SAME 14px tile a folded trace row uses. The header
+ * was 16px, so drilling in or out resized the chip mid-morph; the two forms are one line
+ * in two states, and the row's size won because it is the one that appears in a dense
+ * column where the tile competes with its neighbours.
+ *
+ * Height-neutral: `HEADER_ROW_HEIGHT` is `max(icon, text line 19)`, and the text line
+ * dominates at both 14 and 16 — so no measured height changes (asserted in
+ * `measure-tool-call.test.ts`).
+ */
+export const HEADER_CATEGORY_ICON = BARE_ROW_ICON;
+
+/**
+ * Gap between the header's cells, notably between the BOLD tool name and the summary.
+ *
+ * Deliberately `BARE_ROW_GAP` — the SAME gap a folded trace row uses between its cells.
+ *
+ * ⚠️ This is load-bearing for the morph, and NOT merely cosmetic. The whole line is moved
+ * by ONE `translate`, so every cell in it must need the SAME displacement. That holds only
+ * when the two forms agree on the total width of everything preceding the text:
+ *
+ *     row:  chevron 12 + gap 6 + icon 14 + gap 6   → text at 38
+ *     card: border 1 + padding 10 + icon + gap     → text at 11 + icon + gap
+ *
+ * With `icon + gap` equal on both sides (14 + 6 = 20), the icon and the text both need
+ * 7px and one translate serves both. It used to be 16 + 4 = 20 — the same total by
+ * coincidence, which is why the text did not jump even though neither number matched the
+ * row. Unifying the ICON alone broke that accident (14 + 4 = 18): the text then needed 9px
+ * while the icon needed 7, and a single translate could not satisfy both, so the text
+ * jumped 2px mid-morph. Changing one of these two constants without the other reintroduces
+ * exactly that.
+ *
+ * Width-only: never part of any height computation.
+ */
+export const HEADER_CELL_GAP = BARE_ROW_GAP;
+
+/**
+ * Glyph size INSIDE a category chip, shared by the card header and a folded trace row.
+ *
+ * Both tiles are now the same 14px lane ({@link HEADER_CATEGORY_ICON}); a different inner
+ * glyph would still resize the icon across the morph, which is what unifying the tile was
+ * meant to stop. Render-only — the glyph sits inside the tile and cannot affect height.
+ */
+export const CARD_HEADER_INNER_ICON = 9;
 /**
  * Header text line box. `.headerText` uses `line-height: var(--mantine-line-
  * height)` (the BASE 1.55, NOT xs 1.4), at font-size xs (12): 12×1.55 = 18.6 → 19.
@@ -781,6 +826,16 @@ export interface ToolCallData {
 	status: ToolCallStatus;
 	/** True while the tool input is still streaming (lodExempt, no fold). */
 	isStreaming?: boolean;
+	/**
+	 * Added / removed line counts for a settled Write/Edit (`+12 -3`).
+	 *
+	 * HEIGHT-NEUTRAL: one nowrap span inside the already-fixed header row, exactly
+	 * like the status glyph and the duration it sits next to. Keyed in
+	 * `extractDataRevision` all the same, because it is PAINTED from the cached
+	 * payload and can appear while nothing height-bearing moves (a fetched payload
+	 * resolving a truncated Edit, or metadata landing on a live patch).
+	 */
+	diffStats?: { added: number; removed: number };
 	/** Remote execution → header badge (same row → height-neutral). */
 	isRemoteTarget?: boolean;
 	/**
@@ -1120,6 +1175,14 @@ export interface MeasuredToolCall extends MeasuredElement {
 	status: ToolCallStatus;
 	toolName: string;
 	summary: string;
+	/**
+	 * Added / removed line counts for a Write/Edit (`+12 -3`), else null.
+	 *
+	 * Null means UNKNOWN and draws nothing. `{ added: 0, removed: 0 }` is a real
+	 * measurement (the call changed no lines) and also draws nothing — the two look
+	 * alike on screen but must not be conflated upstream.
+	 */
+	diffStats: { added: number; removed: number } | null;
 	isRemoteTarget: boolean;
 	/** See `ToolCallData.isTakenOver` — a header badge, painted from this payload. */
 	isTakenOver: boolean;
@@ -1247,10 +1310,27 @@ export function computeDefaultOpen(data: ToolCallData, pendingPermission: boolea
  */
 export function resolveToolCallOpened(
 	lod: RenderLod,
-	opts: { lodExempt: boolean; isRecent: boolean; opened: boolean; lodUserOverride?: boolean },
+	opts: {
+		lodExempt: boolean;
+		isRecent: boolean;
+		opened: boolean;
+		lodUserOverride?: boolean;
+		userCollapsed?: boolean;
+	},
 ): boolean {
 	if (opts.lodExempt || opts.lodUserOverride) return true;
-	if (lod >= 5) return true;
+	// L5 is the most detailed level, so an UNTOUCHED card is expanded — but the
+	// reader may still fold one, and `userCollapsed` is the only input that can say
+	// so. Returning a bare `true` here made the header chevron dead at L5: the
+	// shell's toggle writes `!effectiveOpened` into the `expanded` map, so the click
+	// stored `false` into a channel this branch never read, and the card kept its
+	// height with no feedback. Worst on a card that badly needs folding — a denied
+	// ExitPlanMode measures ~1200px (a 0.85×viewport plan body plus its reflection
+	// notice), i.e. more than a screen the reader could not put away.
+	//
+	// Only an EXPLICIT fold counts, so the default shape of every other L5 card is
+	// unchanged (see the `userCollapsed` field doc).
+	if (lod >= 5) return !opts.userCollapsed;
 	if (lod === 4) return opts.isRecent ? opts.opened : false;
 	if (lod === 3) return false;
 	// L1/L2: the upstream tool-run gate owns these levels; a card shown here is
@@ -2295,8 +2375,16 @@ export function measureToolCall(
 	const lodExempt = isRunningStatus(data.status) || isStreaming || forceExpanded;
 	const isRecent = opts.isRecent ?? true;
 	const opened = opts.opened ?? computeDefaultOpen(data, forceExpanded);
+	// An EXPLICIT fold, as opposed to `opened === false` derived from
+	// `computeDefaultOpen`. The two must stay distinct: at L5 the derived default is
+	// not a decision the reader made, so honouring it there would collapse every
+	// card whose category is not auto-open — while the reader's own click must be
+	// honoured. `opts.opened` is supplied ONLY when the shell holds a stored
+	// preference for this key, which is exactly what makes it the reader's voice.
+	const userCollapsed = opts.opened === false;
 	const effectiveOpened = resolveToolCallOpened(lod, {
 		lodExempt,
+		userCollapsed,
 		isRecent,
 		opened,
 		lodUserOverride: opts.lodUserOverride,
@@ -2392,6 +2480,7 @@ export function measureToolCall(
 		status: data.status,
 		toolName: data.toolName,
 		summary: data.summary,
+		diffStats: data.diffStats ?? null,
 		isRemoteTarget: data.isRemoteTarget === true,
 		isTakenOver: data.isTakenOver === true,
 		// Bash prefers pure execution time (mirrors the chunked getBashExecDurationMs).

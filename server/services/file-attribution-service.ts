@@ -16,7 +16,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { normalizeWorkspacePath } from "./git-workspace";
 
-export type AttributionAction = "write" | "edit" | "bash" | "external";
+export type AttributionAction = "write" | "edit" | "bash" | "external" | "human";
 
 export interface RecordAttributionInput {
 	/** Target device. Omitted only by legacy/local callers. */
@@ -27,11 +27,27 @@ export interface RecordAttributionInput {
 	filePath: string;
 	/** Narrator that made the change; omit for external edits. */
 	narratorId?: string | null;
+	/**
+	 * User who made the change. Set only for `action: "human"`.
+	 *
+	 * A human edit carries no `narratorId` (a person is not a session), so without this
+	 * a shared worktree cannot tell two people's saves apart.
+	 */
+	userId?: string | null;
 	/** Subagent type, if known (avoids an extra lookup). */
 	subagentType?: string | null;
 	action: AttributionAction;
 	toolName?: string | null;
 	toolUseId?: string | null;
+	/**
+	 * Lines added / removed by this change, when the tool measured them.
+	 *
+	 * Omit (or pass null) when unknown — Bash cannot attribute a line delta per
+	 * file, a binary write has none, and a diff may exceed its compute budget. The
+	 * column then stays NULL, which readers report as "not measured" rather than
+	 * folding into a total as zero. Never pass 0 to mean "unknown".
+	 */
+	lineStats?: { added: number; removed: number } | null;
 }
 
 // ── Recently AI-attributed paths (in-memory) ─────────────────────────────────
@@ -213,10 +229,13 @@ export async function recordAttribution(input: RecordAttributionInput): Promise<
 			workspacePath,
 			filePath: input.filePath,
 			narratorId: input.narratorId ?? null,
+			userId: input.userId ?? null,
 			subagentType,
 			action: input.action,
 			toolName: input.toolName ?? null,
 			toolUseId: input.toolUseId ?? null,
+			linesAdded: input.lineStats?.added ?? null,
+			linesRemoved: input.lineStats?.removed ?? null,
 			changedAt: new Date().toISOString(),
 		});
 
@@ -273,6 +292,12 @@ export async function recordAttributions(
 			action: base.action,
 			toolName: base.toolName ?? null,
 			toolUseId: base.toolUseId ?? null,
+			// A batch shares ONE line-stat value, which in practice means null: the only
+			// batch caller is Bash (it touched several files and cannot attribute a line
+			// delta to any single one). Threaded through rather than hard-coded null so a
+			// future caller that does know per-batch figures is not silently dropped.
+			linesAdded: base.lineStats?.added ?? null,
+			linesRemoved: base.lineStats?.removed ?? null,
 			changedAt: now,
 		}));
 

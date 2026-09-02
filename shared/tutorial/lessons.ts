@@ -180,6 +180,19 @@ export interface TutorialScriptToolUse {
 	/** Must match a registered tool name (`lessons.guard.test.ts` asserts this). */
 	name: string;
 	input: Record<string, unknown>;
+	/**
+	 * Input fields whose value is copy the USER reads, keyed by field name.
+	 *
+	 * Needed because most tool arguments are machine-facing (a path, a pattern) and
+	 * correctly stay untranslated, while a few are prose the lesson is teaching
+	 * through: `ExitPlanMode`'s `inline_plan` is a document the user reads and
+	 * approves. Leaving it in `input` would show a zh-CN learner an English plan
+	 * inside an otherwise-Chinese lesson, with nothing to report the mismatch.
+	 *
+	 * Resolved into `input` by `resolveTutorialTurn`, so nothing downstream needs to
+	 * know this field exists.
+	 */
+	localizedInput?: Record<string, LocalizedText>;
 }
 
 export interface TutorialScriptTurn {
@@ -267,20 +280,23 @@ const lessons: TutorialLessonSource[] = [
 		id: "first-turn",
 		track: "conversation",
 		order: 1,
-		title: { en: "Your first turn", "zh-CN": "第一次对话" },
+		title: {
+			en: "Your first turn",
+			"zh-CN": "第一次对话",
+		},
 		summary: {
-			en: "Send a message and watch a narrator work: private reasoning, streamed answer, and the return to idle that means the turn is over.",
+			en: "Send a message and watch the narrator go through reasoning, answer, then idle. No API is called — the tutorial narrator runs from a script.",
 			"zh-CN":
-				"发出一条消息，观察叙述者如何工作：私有推理、流式输出，以及回到空闲状态代表这一轮结束。",
+				"发一条消息，看叙述者依次完成推理、回答、回到空闲。不调用任何 API，教程叙述者按剧本运行。",
 		},
 		needs: { narrator: "standalone" },
 		steps: [
 			{
 				id: "send",
 				instruction: {
-					en: "Type anything into the composer and send it. The tutorial narrator answers from a script, so no AI API is called and nothing is billed.",
+					en: "Type anything and send it. The tutorial narrator answers from a script — no AI API is called and nothing is billed.",
 					"zh-CN":
-						"在输入框里随便打点什么并发送。教程叙述者按剧本回复，不会调用任何 AI API，也不消耗额度。",
+						"在输入框里随便输点什么并发送。教程叙述者按剧本回复，不调用任何 AI API，也不消耗额度。",
 				},
 				hint: {
 					en: "Enter sends; Shift+Enter adds a newline.",
@@ -291,9 +307,8 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "observe",
 				instruction: {
-					en: "Watch the reasoning block appear before the answer. Reasoning is the model's private thinking — it is stored and replayable, but it is not the answer.",
-					"zh-CN":
-						"注意回答之前出现的推理块。推理是模型的私有思考过程，它会被保存下来可供回看，但它不是答案。",
+					en: "A reasoning block appears before the answer. Reasoning is the model's private thinking — stored and replayable, but not the answer itself.",
+					"zh-CN": "回答之前会出现推理块。推理是模型的私有思考过程，可保存回看，但它本身不是答案。",
 				},
 				hint: {
 					en: "Reasoning blocks can be collapsed; there is a global preference for whether they start expanded.",
@@ -304,9 +319,8 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "idle",
 				instruction: {
-					en: "Wait for the status to return to idle. A narrator is a session, not a request: it stays available with its full history for the next turn.",
-					"zh-CN":
-						"等待状态回到空闲。叙述者是一个会话而不是一次请求：它会带着完整历史一直在那里，等你的下一轮。",
+					en: "Wait for the status to return to idle. A narrator is a session, not a request — it keeps its full history ready for the next turn.",
+					"zh-CN": "等状态回到空闲。叙述者是一个会话，不是一次请求，它带着完整历史等待下一轮。",
 				},
 				completion: { kind: "narratorIdle" },
 			},
@@ -316,11 +330,14 @@ const lessons: TutorialLessonSource[] = [
 		id: "tool-calls",
 		track: "conversation",
 		order: 2,
-		title: { en: "How tool calls read", "zh-CN": "读懂工具调用" },
+		title: {
+			en: "How tool calls read",
+			"zh-CN": "读懂工具调用",
+		},
 		summary: {
-			en: "A tool card has phases, and the confusing one is before execution: the model is still writing the arguments. Watch three real reads happen in the sandbox.",
+			en: "A tool card has phases. The earliest one means the model is still writing the arguments — nothing has run yet. Watch Glob, Read, and Grep produce three different card shapes.",
 			"zh-CN":
-				"工具卡片是分阶段的，最容易看不懂的是执行之前那一段：模型还在写参数。在沙盒里观察三次真实的读取。",
+				"工具卡片分阶段。最早出现的阶段表示模型还在写参数，还没执行。观察 Glob、Read、Grep 产生三种不同形态的卡片。",
 		},
 		recommendedAfter: ["first-turn"],
 		needs: { project: true, narrator: "chapter" },
@@ -328,47 +345,46 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "ask",
 				instruction: {
-					en: "Send anything to start the turn. This lesson runs in the tutorial sandbox repository, so the files being read are real files on disk.",
+					en: "Send any message to start the turn. The sandbox files are real files on disk — the tool output you will see is not simulated.",
 					"zh-CN":
-						"随便发一条消息开始这一轮。本课在教程沙盒仓库里进行，所以被读取的文件是磁盘上真实存在的文件。",
+						"发一条消息开始这一轮。沙盒里的文件是磁盘上真实存在的，你看到的工具输出不是模拟的。",
 				},
 				completion: { kind: "userSentMessage" },
 			},
 			{
 				id: "watch-arguments",
 				instruction: {
-					en: "Watch a card appear with its tool name before its arguments are complete. That phase means the model is still writing the call — it has not run yet, and nothing has touched your files.",
+					en: "Watch a card appear with only the tool name visible — the arguments are not filled in yet. The model is still writing the call and nothing has executed.",
 					"zh-CN":
-						"注意卡片会先带着工具名出现，参数还没写完。这个阶段表示模型还在书写这次调用——它还没有执行，也还没有碰到任何文件。",
+						"注意卡片会先只显示工具名，参数尚未填入。此时模型还在书写这次调用，还没有执行任何操作。",
 				},
 				hint: {
-					en: "The phase after it is 'executing', which is when the work actually happens.",
-					"zh-CN": "紧随其后的阶段才是「执行中」，那时才真正开始干活。",
+					en: "The next phase is 'executing', which is when the tool actually runs.",
+					"zh-CN": "紧接着的阶段才是「执行中」，工具才真正开始运行。",
 				},
 				completion: { kind: "manual" },
 			},
 			{
 				id: "read-ran",
 				instruction: {
-					en: "Wait for the Read call to finish. Click the card to expand it: the output you see is what the model saw, which is how you check its reasoning against reality.",
-					"zh-CN":
-						"等待 Read 调用完成。点开卡片：你看到的输出就是模型看到的内容——这正是你用来核对它的判断是否符合事实的依据。",
+					en: "Wait for the Read call to finish, then click the card to expand it. The output shown is exactly what the model saw.",
+					"zh-CN": "等 Read 调用完成后，点开卡片。里面显示的输出就是模型看到的内容。",
 				},
 				completion: { kind: "toolCompleted", toolName: "Read" },
 			},
 			{
 				id: "grep-ran",
 				instruction: {
-					en: "Wait for the Grep call. Search results are a list of real matches; a tool card is evidence, not a claim.",
-					"zh-CN": "等待 Grep 调用完成。搜索结果是一份真实的命中列表；工具卡片是证据，不是断言。",
+					en: "Wait for the Grep call to finish. The results are real matched lines from the file — a tool card is evidence, not a claim.",
+					"zh-CN": "等 Grep 调用完成。结果是文件里真实命中的行，工具卡片是证据，不是模型的断言。",
 				},
 				completion: { kind: "toolCompleted", toolName: "Grep" },
 			},
 			{
 				id: "turn-done",
 				instruction: {
-					en: "Wait for the turn to finish. Multiple tools can run in one turn — the narrator only becomes idle once all of them have settled.",
-					"zh-CN": "等待这一轮结束。一轮里可以跑多个工具——只有全部落定之后，叙述者才会回到空闲。",
+					en: "Wait for the turn to finish. Multiple tools can run in one turn — the narrator goes idle only after all of them complete.",
+					"zh-CN": "等这一轮结束。一轮可以跑多个工具，所有工具都完成后叙述者才回到空闲。",
 				},
 				completion: { kind: "narratorIdle" },
 			},
@@ -378,11 +394,13 @@ const lessons: TutorialLessonSource[] = [
 		id: "permissions",
 		track: "conversation",
 		order: 3,
-		title: { en: "Approving and refusing", "zh-CN": "批准与拒绝" },
+		title: {
+			en: "Approving and refusing",
+			"zh-CN": "批准与拒绝",
+		},
 		summary: {
-			en: "Anything that changes your machine stops and asks. Approve one write, refuse another, and see that refusing is a normal answer rather than an error.",
-			"zh-CN":
-				"任何会改动你机器的操作都会停下来征求同意。批准一次写入、拒绝另一次，并看到「拒绝」是一个正常答复而不是错误。",
+			en: "Write operations stop and ask for approval; read-only calls run silently. Approve or refuse, and see that a refusal is fed back as the tool result.",
+			"zh-CN": "写操作会停下来等你批准，只读操作直接运行。批准或拒绝后，看叙述者如何处理你的决定。",
 		},
 		recommendedAfter: ["tool-calls"],
 		needs: { project: true, narrator: "chapter" },
@@ -390,40 +408,38 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "ask",
 				instruction: {
-					en: "Send anything to start the turn. The narrator is in the default permission mode — the one that asks before every change.",
-					"zh-CN":
-						"随便发一条消息开始这一轮。叙述者处于默认权限模式——也就是每次改动前都会询问的那种。",
+					en: "Send any message to start the turn. The narrator is in `default` permission mode, which asks before every change.",
+					"zh-CN": "随便发一条消息开始这一轮。叙述者处于 `default` 权限模式，每次改动前都会询问。",
 				},
 				completion: { kind: "userSentMessage" },
 			},
 			{
 				id: "decide",
 				instruction: {
-					en: "A Write call stops for approval. Read what it intends to write, then decide. Either answer moves the lesson on: refusing is a legitimate choice, not a mistake.",
-					"zh-CN":
-						"一次 Write 调用会停下来等你批准。先读清楚它打算写什么，再做决定。两种答复都会让本课继续：拒绝是正当选择，不是操作失误。",
+					en: "A Write call stops for your approval. Read what it plans to write, then approve or refuse.",
+					"zh-CN": "一次 Write 调用会停下来等你决定。先看清它要写什么，再批准或拒绝。",
 				},
 				hint: {
-					en: "Refusing sends your reason back to the model, so it can propose something else instead of retrying blindly.",
-					"zh-CN": "拒绝时你的理由会回传给模型，它就能换个做法，而不是盲目重试。",
+					en: "If you refuse, your reason is sent back to the model as the tool result — it can then try a different approach.",
+					"zh-CN": "拒绝时你给的理由会作为工具结果回传给模型，它可以据此换个做法。",
 				},
 				completion: { kind: "permissionResolved" },
 			},
 			{
 				id: "aftermath",
 				instruction: {
-					en: "Watch what the narrator does with your decision. An approval executes; a refusal is fed back as the tool's result and the turn continues from there.",
+					en: "Watch what the narrator does next. Approve → the call executes. Refuse → your refusal becomes the tool result and the turn continues.",
 					"zh-CN":
-						"看看叙述者如何处理你的决定。批准会执行；拒绝会作为该工具的结果回传，这一轮从那里继续。",
+						"观察叙述者接下来的动作。批准则执行；拒绝则把你的理由作为工具结果，这一轮从那里继续。",
 				},
 				completion: { kind: "manual" },
 			},
 			{
 				id: "turn-done",
 				instruction: {
-					en: "Wait for the turn to finish. Permission modes exist for later: 'default' asks every time, and looser modes trade approvals for autonomy.",
+					en: "Wait for the turn to finish. `default` mode asks every time; looser permission modes reduce interruptions but give the model more autonomy.",
 					"zh-CN":
-						"等待这一轮结束。权限模式是为之后准备的：default 每次都问，更宽松的模式用审批换自主性。",
+						"等待这一轮结束。`default` 模式每次都问；更宽松的权限模式减少询问，但模型会更自主。",
 				},
 				completion: { kind: "narratorIdle" },
 			},
@@ -433,11 +449,13 @@ const lessons: TutorialLessonSource[] = [
 		id: "interrupt-and-queue",
 		track: "conversation",
 		order: 4,
-		title: { en: "Interrupting a turn", "zh-CN": "打断一轮工作" },
+		title: {
+			en: "Interrupting a turn",
+			"zh-CN": "打断一轮工作",
+		},
 		summary: {
-			en: "You do not have to wait for a turn you no longer want. Interrupt a running command and see that the work done so far is kept, not discarded.",
-			"zh-CN":
-				"你不必等一轮已经不想要的工作跑完。中断一条正在运行的命令，并看到此前已完成的工作被保留而不是丢弃。",
+			en: "You can stop a running turn at any time. Output produced so far is kept, the narrator returns to idle, and the session history stays intact.",
+			"zh-CN": "可以随时停掉正在运行的那一轮。已产生的输出保留在记录里，叙述者回到空闲状态。",
 		},
 		recommendedAfter: ["tool-calls"],
 		needs: { project: true, narrator: "chapter" },
@@ -445,31 +463,28 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "ask",
 				instruction: {
-					en: "Send anything to start the turn. It runs a deliberately slow command so there is something to interrupt.",
-					"zh-CN": "随便发一条消息开始这一轮。它会执行一条故意放慢的命令，好让你有东西可以中断。",
+					en: "Send any message to start the turn. It runs a slow command on purpose so you have time to interrupt.",
+					"zh-CN": "发一条消息开始这一轮。它会故意跑一条慢命令，给你时间去中断。",
 				},
 				completion: { kind: "userSentMessage" },
 			},
 			{
 				id: "interrupt",
 				instruction: {
-					en: "While the command is running, press the stop button in the header. Interrupting is not an error state — the narrator returns to idle and everything already produced stays in the transcript.",
-					"zh-CN":
-						"命令运行期间，按下头部的停止按钮。中断不是错误状态——叙述者会回到空闲，此前产出的一切都留在对话记录里。",
+					en: "While the command is running, press the stop button in the header. The narrator returns to idle and everything already produced stays in the transcript.",
+					"zh-CN": "命令运行期间，按下头部的停止按钮。叙述者会回到空闲，已产生的输出保留在记录里。",
 				},
 				hint: {
-					en: "You can also just type: sending while it works queues your message for the next safe boundary instead of throwing away the turn.",
-					"zh-CN":
-						"你也可以直接输入：在它工作时发送会把消息排到下一个安全边界，而不是把这一轮丢掉。",
+					en: "You can also just type: your message will be queued and delivered at the next safe boundary instead of cutting the turn short.",
+					"zh-CN": "也可以直接输入：消息会排队，在下一个安全边界送达，不会砍断这一轮。",
 				},
 				completion: { kind: "narratorIdle" },
 			},
 			{
 				id: "inspect",
 				instruction: {
-					en: "Scroll back through what survived. This is why a narrator is a session: the history is the record, and an interrupted turn is part of it.",
-					"zh-CN":
-						"往上翻看保留下来的内容。这正是「叙述者是会话」的意义：历史就是记录，被中断的那一轮也是其中一部分。",
+					en: "Scroll up to see what survived. An interrupted turn is part of the session history, not an error.",
+					"zh-CN": "往上翻看保留下来的内容。被中断的那一轮是会话历史的一部分，不是错误。",
 				},
 				completion: { kind: "manual" },
 			},
@@ -479,11 +494,13 @@ const lessons: TutorialLessonSource[] = [
 		id: "plan-mode",
 		track: "conversation",
 		order: 5,
-		title: { en: "Plan before code", "zh-CN": "先计划再动手" },
+		title: {
+			en: "Plan before code",
+			"zh-CN": "先计划再动手",
+		},
 		summary: {
-			en: "For anything non-trivial, the narrator can investigate read-only first and hand you a plan to approve before it changes a single file.",
-			"zh-CN":
-				"对任何不那么简单的任务，叙述者可以先只读地调查，然后把一份计划交给你批准，之后才动第一个文件。",
+			en: "The narrator can investigate read-only first, then hand you a plan to approve before touching any file.",
+			"zh-CN": "叙述者可以先只读地调查，再交出一份计划让你审批，之后才改第一个文件。",
 		},
 		recommendedAfter: ["permissions"],
 		needs: { project: true, narrator: "chapter" },
@@ -491,38 +508,37 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "ask",
 				instruction: {
-					en: "Send anything to start the turn. The narrator enters plan mode, where it can read and search but not modify.",
-					"zh-CN": "随便发一条消息开始这一轮。叙述者会进入计划模式：可以读取和搜索，但不能修改。",
+					en: "Send any message to start the turn. The narrator enters plan mode — it can read and search, but write tools are unavailable.",
+					"zh-CN": "发一条消息开始这一轮。叙述者会进入计划模式：可以读取和搜索，写入工具不可用。",
 				},
 				completion: { kind: "userSentMessage" },
 			},
 			{
 				id: "investigating",
 				instruction: {
-					en: "Watch it investigate before proposing anything. Plan mode is what stops an agent from confidently editing code it has not read.",
-					"zh-CN":
-						"注意它在提出任何方案之前先去调查。计划模式的作用，就是阻止 agent 自信地去改它根本没读过的代码。",
+					en: "Watch it investigate before proposing anything. In plan mode, writing is blocked at the tool level, not by a promise.",
+					"zh-CN": "注意它在提出方案之前先去调查。计划模式下写入被工具层拦截，不是靠约定。",
 				},
 				completion: { kind: "toolCompleted", toolName: "Grep" },
 			},
 			{
 				id: "review-plan",
 				instruction: {
-					en: "Read the plan it hands you and approve or send it back. This is the cheapest place to disagree — before any file changed.",
+					en: "Read the plan and approve or send it back. No file has changed yet — this is the lowest-cost point to disagree.",
 					"zh-CN":
-						"读一读它交上来的计划，然后批准或者打回。这里是提出异议成本最低的地方——此时还没有任何文件被改动。",
+						"读一读这份计划，然后批准或打回。此时还没有任何文件被改动，是提出异议成本最低的地方。",
 				},
 				hint: {
-					en: "Sending it back with a reason is usually better than approving a plan you half agree with.",
-					"zh-CN": "带上理由打回，通常比批准一份你只同意一半的计划更好。",
+					en: "Sending it back with a reason is better than approving a plan you only half agree with.",
+					"zh-CN": "带上理由打回，比批准一份你只同意一半的计划更好。",
 				},
 				completion: { kind: "permissionResolved" },
 			},
 			{
 				id: "turn-done",
 				instruction: {
-					en: "Wait for the turn to finish. Approving a plan leaves plan mode; the narrator can then make the changes it described.",
-					"zh-CN": "等待这一轮结束。批准计划后就退出计划模式，叙述者随后可以执行它描述过的改动。",
+					en: "Wait for the turn to finish. Approving exits plan mode; the narrator can then make the changes it described.",
+					"zh-CN": "等这一轮结束。批准计划后退出计划模式，叙述者随后可以执行它描述过的改动。",
 				},
 				completion: { kind: "narratorIdle" },
 			},
@@ -532,11 +548,14 @@ const lessons: TutorialLessonSource[] = [
 		id: "spec-tasks",
 		track: "conversation",
 		order: 6,
-		title: { en: "The task queue", "zh-CN": "任务队列" },
+		title: {
+			en: "The task queue",
+			"zh-CN": "任务队列",
+		},
 		summary: {
-			en: "Long work needs a memory that survives a compacted conversation. Dynamic Spec is a small task list the narrator keeps and is reminded of.",
+			en: "Long conversations get compacted, and things only said earlier can be lost. spec://tasks.json survives compaction and keeps unfinished tasks in front of the narrator.",
 			"zh-CN":
-				"长线工作需要一份能在对话被压缩后依然存活的记忆。Dynamic Spec 就是叙述者自己维护、并会被反复提醒的小型任务清单。",
+				"长对话会被压缩，只靠「之前说过」的内容可能丢失。spec://tasks.json 在压缩后仍然存在，未完成的任务会被反复提醒。",
 		},
 		recommendedAfter: ["tool-calls"],
 		needs: { project: true, narrator: "chapter" },
@@ -544,17 +563,17 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "ask",
 				instruction: {
-					en: "Send anything to start the turn.",
-					"zh-CN": "随便发一条消息开始这一轮。",
+					en: "Send any message to start the turn.",
+					"zh-CN": "发一条消息，开始这一轮。",
 				},
 				completion: { kind: "userSentMessage" },
 			},
 			{
 				id: "tasks-written",
 				instruction: {
-					en: "Watch it write spec://tasks.json. That path is not a file in your repository — it is the narrator's own scratch space, and writing it needs no approval.",
+					en: "Watch it write spec://tasks.json. That path is not in your repository — it is the narrator's own scratch space, and writing it needs no approval.",
 					"zh-CN":
-						"注意它写入 spec://tasks.json。那个路径不是你仓库里的文件——它是叙述者自己的暂存空间，写入不需要审批。",
+						"观察它写入 spec://tasks.json。那个路径不在你的仓库里，是叙述者自己的暂存空间，写入不需要审批。",
 				},
 				completion: { kind: "specTaskWritten" },
 			},
@@ -563,11 +582,11 @@ const lessons: TutorialLessonSource[] = [
 				instruction: {
 					en: "Open the Spec panel from the header to see the same tasks as a board. Unfinished tasks are what a resumed or auto-continued session picks up from.",
 					"zh-CN":
-						"从头部打开 Spec 面板，用看板形式查看同一批任务。未完成的任务正是会话恢复或自动续跑时接着做的东西。",
+						"从头部打开 Spec 面板，以看板形式查看同一批任务。未完成的任务是会话恢复或自动续跑时接着做的起点。",
 				},
 				hint: {
-					en: "Only finite, checkable work belongs here. A standing rule with no end has no place in a queue.",
-					"zh-CN": "只有有限、可核验的工作才该放这里。没有终点的长期规则不属于队列。",
+					en: "Only finite, checkable work belongs here. A rule with no end condition has no place in a queue.",
+					"zh-CN": "队列里只放有限、可判断做完没做完的工作。没有终点的规则不属于这里。",
 				},
 				completion: { kind: "manual" },
 			},
@@ -575,7 +594,7 @@ const lessons: TutorialLessonSource[] = [
 				id: "turn-done",
 				instruction: {
 					en: "Wait for the turn to finish.",
-					"zh-CN": "等待这一轮结束。",
+					"zh-CN": "等这一轮结束。",
 				},
 				completion: { kind: "narratorIdle" },
 			},
@@ -588,11 +607,14 @@ const lessons: TutorialLessonSource[] = [
 		id: "project-and-chapter",
 		track: "chapters",
 		order: 1,
-		title: { en: "Repositories and chapters", "zh-CN": "仓库与章节" },
+		title: {
+			en: "Repositories and chapters",
+			"zh-CN": "仓库与章节",
+		},
 		summary: {
-			en: "The one idea that makes the rest make sense: a narraflow is a git repository, and a chapter is a worktree with its own session. Two chapters can hold different versions of the same file at the same time.",
+			en: "A narraflow is a git repository. A chapter is a worktree with its own branch and session. Two chapters can hold different versions of the same file at the same time.",
 			"zh-CN":
-				"理解其余一切的关键：一条叙事线就是一个 git 仓库，一个章节就是一个带独立会话的 worktree。两个章节可以同时持有同一个文件的不同版本。",
+				"一条叙事线就是一个 git 仓库。一个章节就是一个 worktree，有独立的分支和会话。两个章节可以同时持有同一个文件的不同版本。",
 		},
 		recommendedAfter: ["first-turn"],
 		needs: { project: true, narrator: "chapter" },
@@ -600,30 +622,28 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "ask",
 				instruction: {
-					en: "Send anything. This narrator is bound to a chapter, so its working directory is that chapter's worktree — not a shared checkout.",
-					"zh-CN":
-						"随便发一条消息。这个叙述者绑定在某个章节上，所以它的工作目录就是那个章节的 worktree——不是一份共享的检出。",
+					en: "Send any message. The narrator's working directory is this chapter's worktree, not a shared checkout.",
+					"zh-CN": "随便发一条消息。叙述者的工作目录是这个章节的 worktree，不是共享检出。",
 				},
 				completion: { kind: "userSentMessage" },
 			},
 			{
 				id: "see-worktree",
 				instruction: {
-					en: "Look at what the Bash call reports: a branch and a directory that belong to this chapter alone. Nothing it does here can surprise another chapter.",
-					"zh-CN":
-						"看看 Bash 调用报告的内容：一个只属于这个章节的分支和目录。它在这里做的任何事都不会波及其他章节。",
+					en: "Check the Bash output: a branch name and a directory that belong to this chapter alone.",
+					"zh-CN": "看 Bash 的输出：一个分支名和一个目录，都只属于这个章节。",
 				},
 				hint: {
-					en: "This is why parallel work does not need coordination: isolation is a directory, not a convention.",
-					"zh-CN": "这就是并行工作不需要相互协调的原因：隔离靠的是目录，而不是约定。",
+					en: "Two chapters don't share a directory, so they can't conflict over the same file.",
+					"zh-CN": "两个章节目录不同，不会争抢同一个文件。",
 				},
 				completion: { kind: "toolCompleted", toolName: "Bash" },
 			},
 			{
 				id: "history",
 				instruction: {
-					en: "The repository already has a few commits. Chapters branch from that history, which is what the next lesson uses.",
-					"zh-CN": "这个仓库里已经有若干提交。章节就是从这段历史上分叉出来的——下一课会用到它。",
+					en: "The sandbox repository already has 4 commits. The next lesson forks from this history.",
+					"zh-CN": "沙盒仓库已有 4 个提交。下一课会从这段历史分叉。",
 				},
 				completion: { kind: "manual" },
 			},
@@ -641,11 +661,13 @@ const lessons: TutorialLessonSource[] = [
 		id: "fork",
 		track: "chapters",
 		order: 2,
-		title: { en: "Forking a chapter", "zh-CN": "分叉一个章节" },
+		title: {
+			en: "Forking a chapter",
+			"zh-CN": "分叉一个章节",
+		},
 		summary: {
-			en: "Try an approach without betting the current one on it. Forking creates a second worktree and a second session, and you choose how much of the conversation it inherits.",
-			"zh-CN":
-				"在不押上当前进展的前提下试另一条路。分叉会创建第二个 worktree 和第二个会话，而你可以选择它继承多少对话上下文。",
+			en: "Fork creates a second branch, a second worktree, and a second session. You choose how much context the new chapter inherits.",
+			"zh-CN": "分叉会创建第二个分支、第二个 worktree 和第二个会话。你决定新章节继承多少上下文。",
 		},
 		recommendedAfter: ["project-and-chapter"],
 		needs: { project: true, narrator: "chapter" },
@@ -653,14 +675,13 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "open-fork",
 				instruction: {
-					en: "Fork this chapter from the graph or the chapter menu. You do not need to send a message first — forking is a structural action, not something you ask the narrator to do.",
-					"zh-CN":
-						"从图上或章节菜单里分叉这个章节。你不需要先发消息——分叉是一个结构性操作，不是请叙述者去做的事。",
+					en: "Fork this chapter from the graph or the chapter menu. Forking is a structural action — you do not need to send a message first.",
+					"zh-CN": "从图上或章节菜单里对本章节执行分叉。分叉是结构性操作，不需要先发消息。",
 				},
 				hint: {
-					en: "Context inheritance: 'full' carries the whole conversation, 'compressed' carries a summary, 'fresh' starts clean. Pick 'fresh' when the old context would only mislead.",
+					en: "full inherits the whole conversation, compressed inherits a summary, fresh starts clean. Pick fresh when the previous approach was wrong, so its reasoning is not inherited too.",
 					"zh-CN":
-						"上下文继承：full 带走完整对话，compressed 带走摘要，fresh 从零开始。当旧上下文只会误导时，选 fresh。",
+						"full 继承完整对话，compressed 继承摘要，fresh 从零开始。上一条路走错了就选 fresh，否则错误的推理会一起被继承过去。",
 				},
 				completion: { kind: "chapterForked" },
 			},
@@ -669,16 +690,15 @@ const lessons: TutorialLessonSource[] = [
 				instruction: {
 					en: "You now have two chapters on two branches, each with its own directory and session. Editing a file in one leaves the other untouched.",
 					"zh-CN":
-						"现在你有两个章节，位于两个分支上，各自拥有独立目录和会话。在其中一个里改文件，另一个毫无影响。",
+						"现在你有两个章节，各自在独立分支上，有独立目录和独立会话。在一个里改文件，另一个不受影响。",
 				},
 				completion: { kind: "manual" },
 			},
 			{
 				id: "why",
 				instruction: {
-					en: "This is the alternative to committing to one approach and hoping. Two forks can explore incompatible designs at once, and you decide afterwards which one earned the merge.",
-					"zh-CN":
-						"这是「先选定一条路然后祈祷」之外的另一种做法。两个分叉可以同时探索互不兼容的设计，之后由你决定哪一个值得被合并。",
+					en: "Two forks can explore incompatible designs at the same time. Afterwards you decide which one to merge.",
+					"zh-CN": "两个分叉可以同时探索互不兼容的方案。之后你再决定合并哪一个。",
 				},
 				completion: { kind: "manual" },
 			},
@@ -688,11 +708,14 @@ const lessons: TutorialLessonSource[] = [
 		id: "graph",
 		track: "chapters",
 		order: 3,
-		title: { en: "Reading the story network", "zh-CN": "读懂故事网络图" },
+		title: {
+			en: "Reading the story network",
+			"zh-CN": "读懂故事网络图",
+		},
 		summary: {
-			en: "The graph is the project's main view, not a diagram of it. Nodes are chapters you can open; edges are the relationships that actually happened.",
+			en: "The graph is the project's main view. Click a node to open that chapter's session. Edges record what actually happened; roles are visual labels only.",
 			"zh-CN":
-				"这张图是项目的主界面，而不是项目的示意图。节点是可以直接打开的章节；边是真实发生过的关系。",
+				"这张图是项目的主界面。点击节点直接打开该章节的会话。边记录已发生的关系，角色只是视觉标签。",
 		},
 		recommendedAfter: ["fork"],
 		needs: { project: true, narrator: "chapter" },
@@ -700,30 +723,30 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "open-graph",
 				instruction: {
-					en: "Open the narraflow view for this project. The fork you just made is an edge between two nodes.",
-					"zh-CN": "打开这个项目的叙事线视图。你刚才做的分叉，就是两个节点之间的一条边。",
+					en: "Open the narraflow view for this project. The fork you just made appears as an edge between two nodes.",
+					"zh-CN": "打开这个项目的叙事线视图。你刚才做的分叉，会显示为两个节点之间的一条边。",
 				},
 				completion: { kind: "manual" },
 			},
 			{
 				id: "roles",
 				instruction: {
-					en: "Node colour follows the chapter's role: trunk receives merges, branch is ordinary work, exploration is a candidate you may throw away, review is a code review. Roles are labels, not permissions — none of them restricts what you can do.",
+					en: "Node colour shows the chapter's role: trunk receives merges, branch is ordinary work, exploration is a candidate you can discard, review is a code review. Roles are labels, not permissions.",
 					"zh-CN":
-						"节点颜色对应章节角色：trunk 是接收合并的主线，branch 是普通工作分支，exploration 是可以丢弃的候选方案，review 是代码评审。角色只是标签而不是权限——它们都不限制你能做什么。",
+						"节点颜色对应章节角色：trunk 接收合并，branch 是普通工作分支，exploration 是可丢弃的候选方案，review 是代码评审。角色只是标签，不限制你的操作。",
 				},
 				completion: { kind: "manual" },
 			},
 			{
 				id: "edges",
 				instruction: {
-					en: "Edge types carry the history: fork, merge, dependency, cherry-pick, review. A dependency edge is the one you declare yourself — it tells the system to warn you when the upstream chapter moves.",
+					en: "Edge types: fork, merge, dependency, cherry_pick, review. All except dependency are records of past events. A dependency edge you declare yourself — it tells the system to warn you when the upstream chapter changes.",
 					"zh-CN":
-						"边的类型承载了历史：fork、merge、dependency、cherry_pick、review。dependency 是需要你自己声明的那种——它让系统在上游章节发生变化时提醒你。",
+						"边的类型有五种：fork、merge、dependency、cherry_pick、review。除 dependency 外，其余都是已发生事件的记录。dependency 由你自己声明，上游章节变化时系统会提醒你。",
 				},
 				hint: {
-					en: "Click a node to open its session; the graph is a navigation surface, not a read-only picture.",
-					"zh-CN": "点击节点即可打开它的会话；这张图是导航界面，而不是只能看的图片。",
+					en: "Click a node to open its session — the graph is a navigation surface, not a read-only picture.",
+					"zh-CN": "点击节点即可打开它的会话，这张图是导航界面，不是只读图片。",
 				},
 				completion: { kind: "manual" },
 			},
@@ -733,11 +756,13 @@ const lessons: TutorialLessonSource[] = [
 		id: "merge",
 		track: "chapters",
 		order: 4,
-		title: { en: "Merging and letting go", "zh-CN": "合并与放手" },
+		title: {
+			en: "Merging and letting go",
+			"zh-CN": "合并与放手",
+		},
 		summary: {
-			en: "Finish a branch by merging it back, and learn the two ways a chapter ends without merging: dormant keeps the branch and frees the disk, abandoned admits the approach lost.",
-			"zh-CN":
-				"通过合并回主线来结束一个分支；同时了解章节不经合并而结束的两种方式：休眠保留分支并释放磁盘，放弃则承认这条路没走通。",
+			en: "Merge a branch back into its parent. Learn the three ways a chapter ends and why none of them delete your conversation.",
+			"zh-CN": "把章节合并回父章节。了解章节结束的三种状态，以及为什么三种都不会删掉对话记录。",
 		},
 		recommendedAfter: ["fork"],
 		needs: { project: true, narrator: "chapter" },
@@ -745,31 +770,29 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "merge-back",
 				instruction: {
-					en: "Merge a chapter back into its parent. NarraFork checks for conflicts first and tells you before doing anything.",
-					"zh-CN": "把一个章节合并回它的父章节。NarraFork 会先做冲突检查，并在动手之前告诉你结果。",
+					en: "Merge a chapter back into its parent. NarraFork runs a conflict check first and reports the result before touching anything.",
+					"zh-CN": "把一个章节合并回它的父章节。NarraFork 会先做冲突检查，告知结果后再动手。",
 				},
 				hint: {
-					en: "On a conflict you can resolve it yourself or hand it to the narrator; either way the merge is not applied until it is resolved.",
-					"zh-CN":
-						"遇到冲突时，你可以自己解决，也可以交给叙述者；无论哪种，冲突解决之前合并都不会被应用。",
+					en: "If there are conflicts, resolve them yourself or hand them to the narrator. The merge is not applied until all conflicts are resolved.",
+					"zh-CN": "有冲突时，可以自己解决，也可以交给叙述者。冲突解决前合并不会被应用。",
 				},
 				completion: { kind: "chapterMerged" },
 			},
 			{
 				id: "merge-edge",
 				instruction: {
-					en: "A merge edge now records what happened. The merged chapter is not deleted — its history and conversation stay readable.",
+					en: "A merge edge now records the relationship. The merged chapter is not deleted — its history and conversation stay readable.",
 					"zh-CN":
-						"现在有一条 merge 边记录了这件事。被合并的章节不会被删除——它的历史和对话仍然可读。",
+						"合并完成后会留一条 merge 边记录这件事。被合并的章节不会被删除，历史和对话仍然可读。",
 				},
 				completion: { kind: "manual" },
 			},
 			{
 				id: "dormant",
 				instruction: {
-					en: "For a chapter you are done with but not finished with, dormant removes its worktree and keeps its branch. Waking it recreates the directory. This is the housekeeping that keeps a long-lived project from filling the disk.",
-					"zh-CN":
-						"对于「暂时不做但没有做完」的章节，休眠会移除它的 worktree 而保留分支。唤醒时目录会被重建。这正是让长期项目不至于占满磁盘的日常维护手段。",
+					en: "Mark a chapter dormant to remove its worktree and free disk space. The branch stays. Waking it recreates the directory.",
+					"zh-CN": "把章节标为休眠，会移除它的 worktree 并释放磁盘。分支保留，唤醒时目录会被重建。",
 				},
 				completion: { kind: "manual" },
 			},
@@ -782,11 +805,14 @@ const lessons: TutorialLessonSource[] = [
 		id: "subagent-types",
 		track: "subagents",
 		order: 1,
-		title: { en: "Delegating to subagents", "zh-CN": "委派给子代理" },
+		title: {
+			en: "Delegating to subagents",
+			"zh-CN": "委派给子代理",
+		},
 		summary: {
-			en: "A subagent is a separate session with its own context, spawned to keep a large search out of the main conversation. The type decides what it may do — explore cannot write.",
+			en: "A subagent is a real second narrator with its own context window. What returns to the main conversation is only a summary. The type sets what it can do — explore cannot write.",
 			"zh-CN":
-				"子代理是一个拥有独立上下文的单独会话，派生它的目的是把大范围搜索挡在主对话之外。类型决定它能做什么——explore 不能写入。",
+				"子代理是一个真实的第二个叙述者，有自己的上下文窗口。回到主对话的只是归纳，不是它读过的内容。类型决定它能做什么——explore 不能写入。",
 		},
 		recommendedAfter: ["tool-calls"],
 		needs: { project: true, narrator: "chapter" },
@@ -794,39 +820,39 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "ask",
 				instruction: {
-					en: "Send anything. The narrator will delegate part of the work instead of doing it inline.",
-					"zh-CN": "随便发一条消息。叙述者会把一部分工作委派出去，而不是自己在主线里做完。",
+					en: "Send any message. The narrator will delegate part of the work to a subagent instead of doing it inline.",
+					"zh-CN": "随便发一条消息。叙述者会把一部分工作委派给子代理，而不是自己在主线里做完。",
 				},
 				completion: { kind: "userSentMessage" },
 			},
 			{
 				id: "spawned",
 				instruction: {
-					en: "Watch an Agent card appear. That is a real second narrator with its own context window — which is the point: whatever it reads does not land in this conversation.",
+					en: "Watch the Agent card appear. That is a real second narrator with its own context window — what it reads does not come back here.",
 					"zh-CN":
-						"注意出现的 Agent 卡片。那是一个真实的第二个叙述者，拥有自己的上下文窗口——这正是意义所在：它读到的东西不会落进当前这段对话。",
+						"注意出现的 Agent 卡片。那是一个真实的第二个叙述者，有自己的上下文窗口。它读到的内容不会进入当前对话。",
 				},
 				hint: {
-					en: "Click through to open the subagent's own session and read its full transcript.",
-					"zh-CN": "点进去可以打开子代理自己的会话，读到它的完整记录。",
+					en: "Click the card to open the subagent's session and read its full transcript.",
+					"zh-CN": "点击卡片可以打开子代理的会话，看到它的完整记录。",
 				},
 				completion: { kind: "subagentSpawned" },
 			},
 			{
 				id: "result",
 				instruction: {
-					en: "Notice what came back: a summary, not the raw reading. A subagent that returned everything it saw would defeat its own purpose — the context it saved would land here anyway.",
+					en: "Look at what came back: a summary, not the raw content it read. If a subagent returned everything it saw, the context savings would be lost — it would all end up here anyway.",
 					"zh-CN":
-						"注意回传的是什么：一份归纳，而不是原始阅读内容。如果子代理把看到的一切都带回来，它就自我否定了——它省下的上下文最终还是会落到这里。",
+						"看回传的是什么：一份归纳，不是它读过的原始内容。子代理要是把看到的全部带回来，这些内容还是会落到主对话里，委派就白做了。",
 				},
 				completion: { kind: "manual" },
 			},
 			{
 				id: "types",
 				instruction: {
-					en: "Four types, differing in authority: explore is read-only, plan designs but does not implement, review inspects a diff, general can write. Pick the narrowest one that can do the job.",
+					en: "Four types, each with different authority: `explore` is read-only, `plan` designs but does not implement, `review` inspects a diff, `general` can write. Pick the narrowest one that can do the job.",
 					"zh-CN":
-						"四种类型，区别在权限：explore 只读，plan 只设计不实现，review 检查差异，general 可以写入。选择能完成任务的最小权限那一个。",
+						"四种类型，权限各不相同：`explore` 只读，`plan` 只设计不实现，`review` 检查差异，`general` 可以写入。选能完成任务的最小权限那个。",
 				},
 				completion: { kind: "narratorIdle" },
 			},
@@ -836,10 +862,14 @@ const lessons: TutorialLessonSource[] = [
 		id: "background-tasks",
 		track: "subagents",
 		order: 2,
-		title: { en: "Work that runs in the background", "zh-CN": "在后台运行的工作" },
+		title: {
+			en: "Work that runs in the background",
+			"zh-CN": "在后台运行的工作",
+		},
 		summary: {
-			en: "A long task does not have to hold your session hostage. Start it in the background, keep talking, and collect the result when you need it.",
-			"zh-CN": "长任务不必扣着你的会话不放。让它在后台启动，你继续对话，需要时再去取结果。",
+			en: "An Agent card with run_in_background returns a task id immediately. The turn is not blocked. Use Await to collect the result when you actually need it.",
+			"zh-CN":
+				"带 run_in_background 的 Agent 卡片立刻返回任务 id，这一轮不会被卡住。需要结果时再用 Await 来取。",
 		},
 		recommendedAfter: ["subagent-types"],
 		needs: { project: true, narrator: "chapter" },
@@ -847,39 +877,36 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "ask",
 				instruction: {
-					en: "Send anything. The narrator starts a subagent in the background rather than waiting for it.",
-					"zh-CN": "随便发一条消息。叙述者会在后台启动一个子代理，而不是等着它跑完。",
+					en: "Send any message. The narrator starts a subagent in the background instead of waiting for it to finish.",
+					"zh-CN": "发一条消息。叙述者在后台启动子代理，不等它跑完。",
 				},
 				completion: { kind: "userSentMessage" },
 			},
 			{
 				id: "backgrounded",
 				instruction: {
-					en: "The Agent card returns immediately with a task id instead of a result. The work is still running; the turn is not blocked on it.",
-					"zh-CN":
-						"Agent 卡片会立即返回一个任务 id 而不是结果。工作仍在进行，但这一轮没有被它阻塞。",
+					en: "The Agent card returns a task id, not a result. The subagent is still running; this turn is already done.",
+					"zh-CN": "Agent 卡片返回的是任务 id，不是结果。子代理还在跑，这一轮已经结束了。",
 				},
 				completion: { kind: "subagentSpawned" },
 			},
 			{
 				id: "drawer",
 				instruction: {
-					en: "Open the background tasks drawer from the header to see it running. This is where work you started and moved on from stays visible.",
-					"zh-CN":
-						"从头部打开后台任务抽屉，可以看到它正在运行。你启动后就转身去做别的事的工作，都在这里保持可见。",
+					en: "Open the background tasks drawer in the header to see the running task.",
+					"zh-CN": "从头部打开后台任务抽屉，可以看到这个任务还在运行。",
 				},
 				hint: {
-					en: "The narrator collects a finished task with Await; you do not have to poll it yourself.",
-					"zh-CN": "叙述者用 Await 收取已完成的任务；你不需要自己去轮询。",
+					en: "The narrator uses Await to collect a finished task. You do not need to poll it yourself.",
+					"zh-CN": "叙述者用 Await 收取完成的任务，不需要你自己轮询。",
 				},
 				completion: { kind: "manual" },
 			},
 			{
 				id: "turn-done",
 				instruction: {
-					en: "Wait for the turn to finish. A background task can outlive the turn that started it, which is the whole reason to background it.",
-					"zh-CN":
-						"等待这一轮结束。后台任务可以比启动它的那一轮活得更久——这正是把它放到后台的全部理由。",
+					en: "Wait for the turn to finish. A background task can outlive the turn that started it.",
+					"zh-CN": "等这一轮结束。后台任务可以比启动它的那一轮活得更久。",
 				},
 				completion: { kind: "narratorIdle" },
 			},
@@ -889,11 +916,13 @@ const lessons: TutorialLessonSource[] = [
 		id: "team-coordination",
 		track: "subagents",
 		order: 3,
-		title: { en: "Several agents at once", "zh-CN": "多个代理同时工作" },
+		title: {
+			en: "Several agents at once",
+			"zh-CN": "多个代理同时工作",
+		},
 		summary: {
-			en: "Independent work can run in parallel. The hard part is not starting agents — it is knowing when to wait and when leaving them alone is the right move.",
-			"zh-CN":
-				"相互独立的工作可以并行。难点不在于把代理启动起来，而在于判断什么时候该等，以及什么时候「不去打扰」才是正确的做法。",
+			en: "Independent tasks can run in parallel. Know when to wait quietly and when to interrupt.",
+			"zh-CN": "互不依赖的任务可以并行。知道什么时候等待，什么时候才该中断。",
 		},
 		recommendedAfter: ["background-tasks"],
 		needs: { project: true, narrator: "chapter" },
@@ -901,34 +930,34 @@ const lessons: TutorialLessonSource[] = [
 			{
 				id: "ask",
 				instruction: {
-					en: "Send anything. Two subagents are spawned in one turn because their work does not overlap.",
-					"zh-CN": "随便发一条消息。因为两份工作互不重叠，这一轮会同时派生两个子代理。",
+					en: "Send any message. Two subagents are spawned in the same turn because their files don't overlap.",
+					"zh-CN": "随便发一条消息。两个子代理会在同一轮派生，因为它们各看各的文件，互不干扰。",
 				},
 				completion: { kind: "userSentMessage" },
 			},
 			{
 				id: "parallel",
 				instruction: {
-					en: "Both cards appear together. Work is only safe to parallelise when neither half needs the other's answer — otherwise one of them is guessing.",
+					en: "Both subagent cards appear at the same time. Parallel is only safe when neither side needs the other's answer — if it does, one of them proceeds on a guess.",
 					"zh-CN":
-						"两张卡片会一起出现。只有当两半工作都不需要对方的答案时，并行才是安全的——否则其中一个只是在猜。",
+						"两张子代理卡片同时出现。只有两边都不需要对方的答案，并行才安全。有依赖还硬要并行，其中一个只能靠猜。",
 				},
 				completion: { kind: "subagentSpawned" },
 			},
 			{
 				id: "waiting",
 				instruction: {
-					en: "The narrator waits for both rather than chasing them. A timed-out wait means the wait ended, not that the agent is stuck — nudging a working agent mostly costs it context.",
+					en: "The narrator waits without nudging. A timed-out wait means the wait ended, not that the agent is stuck. Sending a status check costs the agent context and interrupts its work.",
 					"zh-CN":
-						"叙述者会等待两者，而不是去催。等待超时只表示这次等待结束了，并不表示代理卡住了——去催一个正在工作的代理，主要代价是浪费它的上下文。",
+						"叙述者只等待，不去催。等待超时只表示这次等待结束了，不代表代理卡住了。发一句「进展如何」会浪费它的上下文，还会打断它。",
 				},
 				completion: { kind: "manual" },
 			},
 			{
 				id: "turn-done",
 				instruction: {
-					en: "Wait for the turn to finish. Both results arrive as summaries, and the main conversation stays readable.",
-					"zh-CN": "等待这一轮结束。两份结果都以归纳形式回来，主对话依然保持可读。",
+					en: "Wait for the turn to finish. Both results come back as summaries and the main conversation stays readable.",
+					"zh-CN": "等这一轮结束。两份结果以归纳形式返回，主对话保持可读。",
 				},
 				completion: { kind: "narratorIdle" },
 			},
@@ -958,44 +987,46 @@ const scripts: Record<string, TutorialScript> = {
 		turns: [
 			{
 				reasoning: {
-					en: "The user is taking the tutorial, so this first turn should demonstrate the shape of a turn rather than solve a task. Keep it short: one reasoning block, one short answer, no tools — tools are the next lesson.",
+					en: "This is the first turn of the tutorial. I should show what a turn looks like, not solve a task. Short reasoning block, short answer, no tools.",
 					"zh-CN":
-						"用户正在做教程，所以这第一轮应该展示「一轮对话长什么样」，而不是去解决某个任务。保持简短：一个推理块、一段简短回答、不用工具——工具是下一课的内容。",
+						"这是教程的第一轮。我要展示一轮对话长什么样，而不是解决任务。推理块短，回答短，不用工具。",
 				},
 				text: {
 					en: [
-						"Got it. Three things just happened, and they are the whole shape of a turn:",
+						"Three things just happened:",
 						"",
-						"1. **Reasoning** streamed first. That block is my private thinking. It is persisted, so you can reopen this session tomorrow and read how I got here — but it is not the answer, and you should not treat it as a commitment.",
+						"1. **Reasoning** streamed first. That block is my private thinking — persisted and replayable, but not the answer.",
 						"2. **This text** streamed second. It is the answer, rendered as Markdown.",
-						"3. **The status** is about to go back to `idle`. That is the signal the turn finished. A narrator is a session, not a one-shot request: the next thing you send continues from here.",
+						"3. **The status** is returning to `idle`. That means the turn is finished. A narrator is a session: what you send next continues from here.",
 						"",
-						"One thing worth internalising early: I am a *scripted* narrator for this tutorial. No API was called, nothing was billed. Everything else you see — the message rows, the status transitions, the persistence — is the real product.",
+						"One more thing: I am a **scripted** narrator for this tutorial. No API was called, nothing was billed. Everything else — the message rows, the status transitions, the persistence — is the real product.",
 					].join("\n"),
 					"zh-CN": [
-						"收到。刚刚发生了三件事，它们构成了「一轮对话」的全貌：",
+						"刚刚发生了三件事：",
 						"",
-						"1. **推理**先流出来。那个块是我的私有思考。它会被持久化，所以你明天重新打开这个会话还能读到我是怎么想的——但它不是答案，也不该被当成承诺。",
-						"2. **这段正文**随后流出。它才是答案，按 Markdown 渲染。",
-						"3. **状态**即将回到 `idle`。这是这一轮结束的信号。叙述者是一个会话而不是一次性请求：你接下来发的内容会从这里继续。",
+						"1. **推理块**先流出来。这是我的私有思考，会被保存可供回看，但它不是答案。",
+						"2. **这段正文**随后流出。这才是答案，按 Markdown 渲染。",
+						"3. **状态**正在回到 `idle`。这代表这一轮结束。叙述者是一个会话：你接下来发的内容会从这里继续。",
 						"",
-						"有一点值得尽早记住：在这个教程里我是一个**按剧本走**的叙述者。没有调用任何 API，也没有产生费用。你看到的其余一切——消息行、状态变化、持久化——都是真实的产品行为。",
+						"还有一点：在这个教程里我是**按剧本走**的叙述者。没有调用任何 API，也没有产生费用。你看到的其余一切——消息行、状态变化、持久化——都是真实的产品行为。",
 					].join("\n"),
 				},
 			},
 		],
 		fallbackTurn: {
 			text: {
-				en: "This lesson's script is finished, so I do not have a scripted answer for that. Move on to the next lesson, or reset this one from the step panel to replay it.",
-				"zh-CN":
-					"这一课的剧本已经走完了，所以我没有对应的预置回复。可以进入下一课，或者从步骤面板重置本课重新走一遍。",
+				en: "This lesson's script is finished. Move on to the next lesson, or reset this one from the step panel to replay it.",
+				"zh-CN": "这一课的剧本已经走完了。可以进入下一课，或从步骤面板重置本课重新走一遍。",
 			},
 		},
 		generateResponses: {
-			title: { en: "Tutorial: your first turn", "zh-CN": "教程：第一次对话" },
+			title: {
+				en: "Tutorial: your first turn",
+				"zh-CN": "教程：第一次对话",
+			},
 			summary: {
 				en: "Tutorial session — nothing to summarise.",
-				"zh-CN": "教程会话 —— 没有需要总结的内容。",
+				"zh-CN": "教程会话，没有需要总结的内容。",
 			},
 		},
 	},
@@ -1005,13 +1036,13 @@ const scripts: Record<string, TutorialScript> = {
 		turns: [
 			{
 				reasoning: {
-					en: "Show the three read-only tools whose cards look different from each other: Glob (a path list), Read (a file with line numbers), Grep (a match list). All against the seeded sandbox files so the output is real.",
+					en: "Show three read-only tools with different card shapes: Glob (path list), Read (file with line numbers), Grep (match list). All against real sandbox files.",
 					"zh-CN":
-						"演示三个卡片形态各不相同的只读工具：Glob（路径列表）、Read（带行号的文件）、Grep（命中列表）。全部针对沙盒里预置的文件，这样输出是真实的。",
+						"演示三个卡片形态不同的只读工具：Glob（路径列表）、Read（带行号的文件）、Grep（命中列表）。全部针对沙盒真实文件。",
 				},
 				text: {
 					en: "Let me look at what is actually in this repository before saying anything about it.",
-					"zh-CN": "在对这个仓库下任何判断之前，我先看看它里面到底有什么。",
+					"zh-CN": "先看看这个仓库里实际有什么，再做判断。",
 				},
 				toolUses: [
 					{ name: "Glob", input: { pattern: "src/*.ts" } },
@@ -1021,40 +1052,42 @@ const scripts: Record<string, TutorialScript> = {
 			},
 			{
 				reasoning: {
-					en: "The reads confirmed the duplication. Report it as an observation backed by the cards above, not as a claim the user has to take on trust.",
-					"zh-CN":
-						"读取确认了重复。把它作为「有上面卡片作证的观察」来报告，而不是让用户只能选择相信的断言。",
+					en: "The reads confirmed the duplication. Report it as an observation backed by the cards, not a claim the user has to take on trust.",
+					"zh-CN": "读取确认了重复。把它作为有卡片为证的观察来报告，不是让用户凭信任接受的断言。",
 				},
 				text: {
 					en: [
-						"Three cards, three shapes — worth knowing which is which:",
+						"Three cards, three shapes:",
 						"",
-						"- **Glob** listed paths. It answers *what exists*, never *what is inside*.",
-						"- **Read** returned `src/greeting.ts` with line numbers. What you see in that card is exactly what I saw; if my conclusion below does not follow from it, trust the card.",
-						"- **Grep** returned matching lines. Two of them: `greet` and `greetLoudly` build the same template independently.",
+						"- **Glob** listed paths. It answers *what files exist*, not *what is inside them*.",
+						"- **Read** returned `src/greeting.ts` with line numbers. What you see in that card is exactly what I saw.",
+						"- **Grep** returned matching lines. Two hits: `greet` and `greetLoudly` both build the same template independently.",
 						"",
-						"That duplication is the kind of thing worth fixing, and the next lesson is where changing a file gets interesting — because changing anything stops and asks you first.",
+						"That duplication should be fixed. The next lesson covers what happens when a tool wants to change a file: it stops and asks you first.",
 					].join("\n"),
 					"zh-CN": [
-						"三张卡片、三种形态——值得分清：",
+						"三张卡片，三种形态：",
 						"",
-						"- **Glob** 列出了路径。它回答的是*有哪些文件*，从不回答*文件里有什么*。",
-						"- **Read** 返回了带行号的 `src/greeting.ts`。你在那张卡片里看到的，就是我看到的；如果我下面的结论推不出来，请以卡片为准。",
-						"- **Grep** 返回了命中行。有两处：`greet` 和 `greetLoudly` 各自拼了同样的模板。",
+						"- **Glob** 列出了路径，回答的是*有哪些文件*，不涉及文件内容。",
+						"- **Read** 返回了带行号的 `src/greeting.ts`，卡片里的内容就是我看到的原文。",
+						"- **Grep** 返回了命中行。两处：`greet` 和 `greetLoudly` 各自拼了同一个模板。",
 						"",
-						"这种重复是值得修的。而修改文件从下一课开始才真正有意思——因为任何改动都会先停下来问你。",
+						"这个重复应该修掉。下一课讲改文件时会发生什么：任何改动都会先停下来问你。",
 					].join("\n"),
 				},
 			},
 		],
 		fallbackTurn: {
 			text: {
-				en: "That is the end of this lesson's script. The next lesson covers what happens when a tool wants to CHANGE something instead of just reading it.",
-				"zh-CN": "本课剧本到此结束。下一课讲的是：当工具想要**改动**而不只是读取时会发生什么。",
+				en: "This lesson's script has ended. The next lesson covers what happens when a tool wants to change a file instead of just reading it.",
+				"zh-CN": "本课剧本到此结束。下一课讲的是工具想要修改文件时会发生什么。",
 			},
 		},
 		generateResponses: {
-			title: { en: "Tutorial: how tool calls read", "zh-CN": "教程：读懂工具调用" },
+			title: {
+				en: "Tutorial: how tool calls read",
+				"zh-CN": "教程：读懂工具调用",
+			},
 		},
 	},
 
@@ -1063,14 +1096,12 @@ const scripts: Record<string, TutorialScript> = {
 		turns: [
 			{
 				reasoning: {
-					en: "Write a NEW file rather than editing a seeded one: a create is easy to reason about when approving, and if the user refuses there is nothing half-changed to explain.",
-					"zh-CN":
-						"写一个**新**文件而不是改动预置文件：新建在审批时更容易判断，而且如果用户拒绝，也不会留下半改的状态需要解释。",
+					en: "I'll create a new file rather than edit an existing one — easier to evaluate when approving, and no half-changed state if refused.",
+					"zh-CN": "新建文件比修改现有文件更容易审批，拒绝后也不会留下半改的状态。",
 				},
 				text: {
-					en: "I would add a short note recording what I found. Creating a file changes your machine, so this needs your approval first.",
-					"zh-CN":
-						"我想加一份简短的记录，写下我发现的问题。创建文件会改动你的机器，所以这需要你先批准。",
+					en: "I want to add a short note recording what I found. Creating a file changes your machine, so I need your approval first.",
+					"zh-CN": "我想新建一个文件，记录我发现的问题。创建文件会改动你的机器，需要你先批准。",
 				},
 				toolUses: [
 					{
@@ -1091,26 +1122,26 @@ const scripts: Record<string, TutorialScript> = {
 			},
 			{
 				reasoning: {
-					en: "Whatever the user decided, treat it as the answer. If they refused, the refusal is the tool result and the right move is to accept it, not to retry the same call with different wording.",
+					en: "The user has decided. If refused, that refusal is the tool result — I should change approach, not retry the same call.",
 					"zh-CN":
-						"无论用户怎么决定，都把它当作答复。如果被拒绝，那次拒绝就是工具结果，正确的做法是接受，而不是换个说法重试同一次调用。",
+						"用户已经决定了。如果被拒绝，拒绝就是工具结果，我应该换思路，不该重试同一个调用。",
 				},
 				text: {
 					en: [
-						"Either way, that was the mechanism worth learning:",
+						"Here is what just happened:",
 						"",
-						"- **Approved** — the call executed and the result came back in the card.",
-						"- **Refused** — the refusal (and your reason, if you gave one) became the tool's result. I see it the way I would see any other outcome, so the right response is to change approach rather than ask again.",
+						"- **Approved** — the call executed and the result is in the card.",
+						"- **Refused** — your refusal (and reason, if given) became the tool result. I treat it like any other outcome and change approach instead of asking again.",
 						"",
-						"Two things to carry forward. Read-only calls do not ask — `Read`, `Grep` and `Glob` in the previous lesson ran without stopping. And the mode you are in decides how often you are asked: `default` asks every time, and the looser modes trade that away for autonomy. Pick deliberately.",
+						"A few things to note: read-only calls (`Read`, `Grep`, `Glob`) never ask — you saw that in the previous lesson. The `default` mode asks before every change; looser modes trade that for more autonomy. Choose based on how much you want to stay in the loop.",
 					].join("\n"),
 					"zh-CN": [
-						"无论哪种，这套机制才是要学的东西：",
+						"刚才发生了什么：",
 						"",
-						"- **批准** —— 调用执行，结果回到卡片里。",
-						"- **拒绝** —— 这次拒绝（以及你给出的理由，如果有）成为该工具的结果。我看到它和看到任何其他结果一样，所以正确的反应是换思路，而不是再问一遍。",
+						"- **批准** — 调用已执行，结果在卡片里。",
+						"- **拒绝** — 你的拒绝（以及理由，如果有）成为该工具的结果。我会换思路，不会再试同一个调用。",
 						"",
-						"有两点要带走。只读调用不会询问——上一课的 `Read`、`Grep`、`Glob` 都是直接跑完的。而你所处的模式决定了被询问的频率：`default` 每次都问，更宽松的模式则用它换取自主性。请有意识地选择。",
+						"几点说明：只读调用（`Read`、`Grep`、`Glob`）从不询问，上一课已经看到了。`default` 模式每次改动前都问；更宽松的权限模式减少询问，但模型更自主。根据自己想介入的程度来选。",
 					].join("\n"),
 				},
 			},
@@ -1131,9 +1162,9 @@ const scripts: Record<string, TutorialScript> = {
 		turns: [
 			{
 				reasoning: {
-					en: "Run something slow enough to interrupt, but harmless and bounded: a short sleep with progress output. It must finish on its own if the user does nothing, so a user who reads instead of clicking is not left stuck.",
+					en: "Run a slow but harmless command with visible progress. If the user does nothing, it finishes on its own — no one gets stuck.",
 					"zh-CN":
-						"跑一个慢到足以被中断、但无害且有界的东西：短暂 sleep 加进度输出。如果用户什么都不做，它必须能自己结束——这样只顾读说明、没去点按钮的用户不会被卡住。",
+						"跑一条慢但无害、有进度输出的命令。用户什么都不做，它会自己跑完，不会卡住任何人。",
 				},
 				text: {
 					en: "I will run something slow on purpose. Press the stop button in the header while it is going.",
@@ -1152,24 +1183,23 @@ const scripts: Record<string, TutorialScript> = {
 			},
 			{
 				reasoning: {
-					en: "Do not re-run the command. Whether it was interrupted or completed, re-running it would suggest interrupting achieved nothing — the opposite of the lesson.",
-					"zh-CN":
-						"不要重跑这条命令。无论它是被中断还是跑完了，重跑都会暗示「中断没有意义」——正好与本课的意图相反。",
+					en: "Don't re-run the command. Re-running would imply interrupting did nothing — the opposite of what this lesson demonstrates.",
+					"zh-CN": "不要重跑命令。重跑会暗示中断没有意义，与本课目的相反。",
 				},
 				text: {
 					en: [
-						"If you pressed stop, notice what did *not* happen: nothing was rolled back and nothing was lost. The output produced up to that point is still in the card above, the narrator went back to `idle`, and this session kept its whole history.",
+						"Whether you pressed stop or let it finish, notice what was kept: the output in the card above, the full session history, the narrator back at `idle`.",
 						"",
-						"That is why interrupting is cheap here. You are not cancelling a request and starting over — you are ending a turn early in a session that continues.",
+						"Interrupting ends a turn early — it does not roll anything back.",
 						"",
-						"You also did not have to interrupt at all: typing while I work queues your message, and it is delivered at the next safe boundary instead of cutting the turn short. Interrupt when the direction is wrong; queue when you just have more to add.",
+						"You also had another option: typing while I work queues your message for the next safe boundary. Interrupt when the direction is wrong; queue when you just have more to add.",
 					].join("\n"),
 					"zh-CN": [
-						"如果你按了停止，请注意**没有**发生的事：没有回滚，也没有丢东西。到那一刻为止产生的输出仍在上面的卡片里，叙述者回到了 `idle`，这个会话保留了全部历史。",
+						"不管你有没有按停止，看看保留了什么：上面卡片里的输出、完整的会话历史、叙述者回到 `idle`。",
 						"",
-						"这就是为什么在这里中断的代价很低。你不是在取消一个请求然后从头再来——你只是在一个会继续下去的会话里提前结束了一轮。",
+						"中断只是提前结束那一轮，不会回滚任何东西。",
 						"",
-						"其实你也完全可以不中断：我工作时你直接输入，消息会被排队，在下一个安全边界送达，而不是把这一轮砍断。方向错了就中断；只是还有话要补充，就排队。",
+						"还有另一个选择：我工作时直接输入，消息会排队，在下一个安全边界送达。方向错了就中断，只是还有话要补充就排队。",
 					].join("\n"),
 				},
 			},
@@ -1181,7 +1211,10 @@ const scripts: Record<string, TutorialScript> = {
 			},
 		},
 		generateResponses: {
-			title: { en: "Tutorial: interrupting a turn", "zh-CN": "教程：打断一轮工作" },
+			title: {
+				en: "Tutorial: interrupting a turn",
+				"zh-CN": "教程：打断一轮工作",
+			},
 		},
 	},
 
@@ -1190,24 +1223,24 @@ const scripts: Record<string, TutorialScript> = {
 		turns: [
 			{
 				reasoning: {
-					en: "Enter plan mode first, then investigate. Proposing before reading is exactly the failure plan mode exists to prevent, so the script must not model it.",
+					en: "Enter plan mode first, then investigate. Plan mode exists to prevent proposing before reading, so the script must not do it either.",
 					"zh-CN":
-						"先进入计划模式，再去调查。「先提方案后读代码」正是计划模式要防止的失误，所以剧本本身绝不能示范它。",
+						"先进入计划模式，再去调查。计划模式就是为了防止「没读代码就提方案」，剧本自己不能这么做。",
 				},
 				text: {
-					en: "This is worth planning before touching anything. Let me enter plan mode and look first.",
-					"zh-CN": "这件事值得先规划再动手。我先进入计划模式，去看一看。",
+					en: "Let me enter plan mode and look at the code before proposing anything.",
+					"zh-CN": "我先进入计划模式，读过代码再说。",
 				},
 				toolUses: [{ name: "EnterPlanMode", input: {} }],
 			},
 			{
 				reasoning: {
-					en: "Read-only investigation: find the duplication and check whether anything depends on the loud variant before proposing to change it.",
-					"zh-CN": "只读调查：找出重复，并在提出改动之前确认有没有别的地方依赖那个大写变体。",
+					en: "Read-only investigation: find the duplication and check whether anything outside the file depends on the second copy before proposing a change.",
+					"zh-CN": "只读调查：找出重复，并确认文件外是否有代码依赖第二处，再提改动建议。",
 				},
 				text: {
 					en: "Checking what exists and what depends on it.",
-					"zh-CN": "先确认存在什么，以及有什么依赖它。",
+					"zh-CN": "先确认代码现状，以及有什么依赖它。",
 				},
 				toolUses: [
 					{ name: "Grep", input: { pattern: "greetLoudly", output_mode: "content", "-n": true } },
@@ -1216,9 +1249,8 @@ const scripts: Record<string, TutorialScript> = {
 			},
 			{
 				reasoning: {
-					en: "Now there is enough to propose a concrete plan. Keep it small and reviewable: a plan the user cannot check is not a plan they can approve.",
-					"zh-CN":
-						"现在有足够依据提出具体计划了。保持小而可审：一份用户无法核对的计划，也就无法被真正批准。",
+					en: "Enough information to propose a concrete plan. Keep it small enough that the user can agree or disagree with a specific line.",
+					"zh-CN": "已有足够依据提出具体计划。保持计划足够小，让用户能针对某一条表态。",
 				},
 				text: {
 					en: "Here is what I would do.",
@@ -1227,58 +1259,83 @@ const scripts: Record<string, TutorialScript> = {
 				toolUses: [
 					{
 						name: "ExitPlanMode",
-						input: {
-							mode: "inline",
-							inline_plan: [
-								"## Remove the duplicated greeting template",
-								"",
-								"**What I found**",
-								"",
-								`\`src/greeting.ts\` builds \`\` \`Hello, ${literalInterpolation("name")}!\` \`\` twice: once in \`greet\`, once in \`greetLoudly\`. Grep shows nothing outside this file depends on the second copy.`,
-								"",
-								"**Change**",
-								"",
-								"1. Rewrite `greetLoudly` as `return greet(name).toUpperCase();` — one template, one place to change it.",
-								"2. Leave `greet` alone; it is already the single source of the wording.",
-								"",
-								"**Not doing**",
-								"",
-								"Renaming either function. Nothing asked for it, and a rename is a separate decision with its own callers to check.",
-								"",
-								"**Verification**",
-								"",
-								"Re-read the file after the edit. There is no test runner in this sandbox, so I will not claim tests passed.",
-							].join("\n"),
+						input: { mode: "inline" },
+						// The plan is a document the user READS and approves, so it has to
+						// follow the lesson's language. Every other field here (`mode`, paths,
+						// patterns) is machine-facing and correctly stays as-is.
+						localizedInput: {
+							inline_plan: {
+								en: [
+									"## Remove the duplicated greeting template",
+									"",
+									"**What I found**",
+									"",
+									`\`src/greeting.ts\` builds \`\` \`Hello, ${literalInterpolation("name")}!\` \`\` twice: once in \`greet\`, once in \`greetLoudly\`. Grep shows nothing outside this file depends on the second copy.`,
+									"",
+									"**Change**",
+									"",
+									"1. Rewrite `greetLoudly` as `return greet(name).toUpperCase();` so the template exists in one place.",
+									"2. Leave `greet` alone. It is already the only source of the wording.",
+									"",
+									"**Not doing**",
+									"",
+									"Renaming either function. Nobody asked for it, and a rename touches callers and needs its own review.",
+									"",
+									"**Verification**",
+									"",
+									"Re-read the file after the edit. This sandbox has no test runner, so I will not claim tests passed.",
+								].join("\n"),
+								"zh-CN": [
+									"## 移除重复的问候模板",
+									"",
+									"**发现了什么**",
+									"",
+									`\`src/greeting.ts\` 里有两处拼出 \`\` \`Hello, ${literalInterpolation("name")}!\` \`\`：一处在 \`greet\`，一处在 \`greetLoudly\`。Grep 显示文件外没有代码依赖第二处。`,
+									"",
+									"**要改的**",
+									"",
+									"1. 把 `greetLoudly` 改成 `return greet(name).toUpperCase();`，模板只留一处。",
+									"2. `greet` 不动，它已经是文案的唯一来源。",
+									"",
+									"**不改的**",
+									"",
+									"两个函数都不改名。没人要求改名，而改名会牵动调用方，要单独评审。",
+									"",
+									"**怎么验证**",
+									"",
+									"改完重新读一遍文件。这个沙盒里没有测试运行器，所以我不会声称测试通过。",
+								].join("\n"),
+							},
 						},
 					},
 				],
 			},
 			{
 				reasoning: {
-					en: "The plan was decided. Do not perform the edit: this lesson is about the planning gate, and a surprise write after the plan step would undercut the point that nothing changes until you approve.",
+					en: "The plan is decided. Do not perform the edit — this lesson is about the planning gate. Writing after the plan step would undercut the point that nothing changes until you approve.",
 					"zh-CN":
-						"计划已经有了结论。不要真的去改：本课讲的是「计划这道关卡」，在计划步骤之后突然写文件，会削弱「批准前什么都不会变」这个要点。",
+						"计划已有结论，不要真的去改。本课讲的是「计划这道关卡」，计划步骤后突然写文件会削弱「批准前什么都不变」这个要点。",
 				},
 				text: {
 					en: [
-						"That is the whole shape of plan mode:",
+						"Plan mode works in four steps:",
 						"",
-						"1. **Enter** — tools narrow to read-only. Not a promise to behave; the write path is actually unavailable.",
-						"2. **Investigate** — Grep and Read, so the plan rests on the file rather than on a guess.",
-						"3. **Propose** — a plan small enough that you can disagree with a specific line of it.",
-						"4. **Decide** — approving leaves plan mode; sending it back keeps the file untouched.",
+						"1. **Enter** — write tools become unavailable. Not a promise; the write path is actually blocked.",
+						"2. **Investigate** — Grep and Read, so the plan is based on the actual file, not a guess.",
+						"3. **Propose** — a plan small enough to disagree with a specific line.",
+						"4. **Decide** — approving exits plan mode; sending it back leaves every file untouched.",
 						"",
-						"Notice the ordering. The expensive mistake is not a bad plan — it is a confident edit to code nobody read. Plan mode makes disagreement cheap by putting it before the change instead of after.",
+						"The ordering matters. Edits to code nobody read are the expensive kind. Plan mode puts disagreement before the change, not after.",
 					].join("\n"),
 					"zh-CN": [
-						"这就是计划模式的全貌：",
+						"计划模式分四步：",
 						"",
-						"1. **进入** —— 工具收窄为只读。这不是「保证守规矩」，而是写入路径确实不可用。",
-						"2. **调查** —— Grep 与 Read，让计划立足于文件本身而不是猜测。",
-						"3. **提出** —— 计划要小到你能针对其中某一条提出异议。",
-						"4. **决定** —— 批准即退出计划模式；打回则文件毫发无损。",
+						"1. **进入** — 写入工具不可用。不是靠约定，是路径被实际拦截。",
+						"2. **调查** — 用 Grep 和 Read，让计划立足于文件本身而不是猜测。",
+						"3. **提出** — 计划要小，小到你能针对某一条提出异议。",
+						"4. **决定** — 批准即退出计划模式；打回则文件一字未动。",
 						"",
-						"注意这个次序。代价高的失误不是「计划不好」，而是「自信地改了没人读过的代码」。计划模式把异议放在改动之前而不是之后，从而让异议变得便宜。",
+						"次序很重要。改了没人读过的代码，代价才高。计划模式把异议放在改动之前。",
 					].join("\n"),
 				},
 			},
@@ -1290,7 +1347,10 @@ const scripts: Record<string, TutorialScript> = {
 			},
 		},
 		generateResponses: {
-			title: { en: "Tutorial: plan before code", "zh-CN": "教程：先计划再动手" },
+			title: {
+				en: "Tutorial: plan before code",
+				"zh-CN": "教程：先计划再动手",
+			},
 		},
 	},
 
@@ -1299,13 +1359,12 @@ const scripts: Record<string, TutorialScript> = {
 		turns: [
 			{
 				reasoning: {
-					en: 'Write a queue whose entries are finite and checkable. A standing rule ("never break X") has no completion condition and would be re-run forever, so it must not appear in the example.',
-					"zh-CN":
-						"写一份条目有限、可核验的队列。长期规则（「不得破坏 X」）没有完成条件，会被无限续跑，所以不能出现在示例里。",
+					en: "Write a queue with finite, checkable entries. Standing rules have no completion condition and must not appear in the example.",
+					"zh-CN": "写一份条目有限、可核验的队列。长期规则没有完成条件，不能出现在示例里。",
 				},
 				text: {
-					en: "This is multi-step, so let me write it down where it survives a compacted conversation.",
-					"zh-CN": "这件事是多步骤的，我把它记到一个能在对话被压缩后依然存活的地方。",
+					en: "This is multi-step, so I'll write it down where it survives a compacted conversation.",
+					"zh-CN": "这件事是多步骤的，我把它记到对话被压缩后也不会丢的地方。",
 				},
 				toolUses: [
 					{
@@ -1332,23 +1391,23 @@ const scripts: Record<string, TutorialScript> = {
 			},
 			{
 				reasoning: {
-					en: "Explain why the queue exists rather than restating its contents, which the user can already see in the panel.",
-					"zh-CN": "解释这份队列为什么存在，而不是复述内容——用户在面板里已经能看到了。",
+					en: "Explain why the queue exists, not what is in it — the user can already see that in the panel.",
+					"zh-CN": "解释队列为什么存在，不复述内容——用户在面板里已经能看到了。",
 				},
 				text: {
 					en: [
-						"Notice what that write did *not* do: it did not ask for approval, and it did not appear in your repository. `spec://` is my own scratch space, not a path on disk.",
+						"That write did not ask for approval, and it did not appear in your repository. `spec://` is my own scratch space, not a path on disk.",
 						"",
-						'Why keep a queue at all? A long conversation eventually gets compacted — earlier turns are replaced by a summary to stay inside the context window. Anything that only existed as "something I said earlier" can be lost that way. Tasks survive it, and I get reminded of the unfinished ones.',
+						"Why keep a queue? Long conversations get compacted — earlier turns are replaced by a summary to stay inside the context window. Anything that only existed as something said earlier can be lost. Tasks survive compaction, and I get reminded of unfinished ones on every continuation.",
 						"",
-						'That is also why each entry above is **finite and checkable** — you could tell me whether it is done. A standing rule like "never break the build" has no completion condition, so it would sit in the queue forever being re-attempted. Rules belong somewhere else; the queue is for work that ends.',
+						'Each entry above is **finite and checkable** — you can tell whether it is done. A rule like "never break the build" has no completion condition. It would sit in the queue forever. Rules belong somewhere else; the queue is for work that ends.',
 					].join("\n"),
 					"zh-CN": [
-						"注意那次写入**没有**做的事：它没有请求批准，也没有出现在你的仓库里。`spec://` 是我自己的暂存空间，不是磁盘上的路径。",
+						"那次写入没有请求审批，也没有出现在你的仓库里。`spec://` 是我自己的暂存空间，不是磁盘上的路径。",
 						"",
-						"为什么要有一份队列？长对话最终会被压缩——早期轮次会被摘要替换，以便留在上下文窗口内。任何只以「我早先说过」形式存在的东西，都可能就此丢失。任务能活下来，而且未完成的会被反复提醒。",
+						"为什么要有队列？长对话会被压缩——早期轮次被摘要替换以保持在上下文窗口内。只以「我之前说过」形式存在的东西可能就此丢失。任务能在压缩后存活，未完成的每次续跑都会被提醒。",
 						"",
-						"这也是为什么上面每一条都是**有限且可核验**的——你能判断它到底做完了没有。像「不得破坏构建」这样的长期规则没有完成条件，会永远待在队列里被反复尝试。规则应该放在别处；队列是给会结束的工作用的。",
+						"上面每一条都是**有限且可核验**的——你能判断它做完了没有。像「不得破坏构建」这样的规则没有完成条件，会永远待在队列里。规则应该放在别处；队列给会结束的工作用。",
 					].join("\n"),
 				},
 			},
@@ -1360,7 +1419,10 @@ const scripts: Record<string, TutorialScript> = {
 			},
 		},
 		generateResponses: {
-			title: { en: "Tutorial: the task queue", "zh-CN": "教程：任务队列" },
+			title: {
+				en: "Tutorial: the task queue",
+				"zh-CN": "教程：任务队列",
+			},
 		},
 	},
 
@@ -1376,13 +1438,12 @@ const scripts: Record<string, TutorialScript> = {
 		turns: [
 			{
 				reasoning: {
-					en: "Show, do not assert. `git rev-parse` and `pwd` prove the branch and directory belong to this chapter; a sentence claiming isolation would be exactly the kind of thing the user cannot check.",
-					"zh-CN":
-						"用证据而不是断言。`git rev-parse` 和 `pwd` 能证明分支和目录属于这个章节；只用一句话声称「已隔离」，恰恰是用户无法核对的那类说法。",
+					en: "Run git and pwd to prove isolation — a claim without output is unverifiable.",
+					"zh-CN": "跑 git 和 pwd 来证明隔离，光说「已隔离」用户没法核对。",
 				},
 				text: {
-					en: "Let me show you where this session actually lives rather than just telling you.",
-					"zh-CN": "我直接把这个会话所在的位置展示给你，而不是只用嘴说。",
+					en: "Let me show you where this session lives.",
+					"zh-CN": "我把这个会话所在的位置直接展示给你。",
 				},
 				toolUses: [
 					{
@@ -1397,41 +1458,34 @@ const scripts: Record<string, TutorialScript> = {
 			},
 			{
 				reasoning: {
-					en: "Connect the output to the model: worktree = isolation, branch = its own line of history, session = its own conversation. Then point at what the next lesson needs.",
-					"zh-CN":
-						"把输出与心智模型对应起来：worktree = 隔离，branch = 独立的历史线，session = 独立的对话。然后指向下一课需要的东西。",
+					en: "Map the three output lines to three concrete facts: branch, directory, commit count. Skip the abstraction.",
+					"zh-CN": "把三行输出对应三个具体事实：分支、目录、提交数。不要抽象化。",
 				},
 				text: {
 					en: [
-						"Three facts, and together they are the whole model:",
-						"",
-						"- **The branch** is this chapter's own. Commits I make here do not appear on any other chapter's branch until someone merges them.",
-						"- **The directory** is a git *worktree* — a second checkout of the same repository. This is why isolation needs no coordination: two chapters cannot fight over one file because they do not share one.",
-						"- **The commit count** is the history this chapter branched from. It is not empty, which matters for the next lesson: forking is only interesting when there is something to fork.",
-						"",
-						"The thing worth unlearning from other tools: a chapter is not a task or a ticket. It is a place — a directory, a branch and a conversation that keep existing after you look away.",
+						"- **Branch**: belongs to this chapter. My commits here won't appear on any other chapter's branch until someone merges them.",
+						"- **Directory**: a git *worktree* — a second checkout of the same repository. Two chapters can't conflict over one file because they don't share one.",
+						"- **Commit count**: the history this chapter branched from. The next lesson forks from it.",
 					].join("\n"),
 					"zh-CN": [
-						"三个事实，合起来就是完整的心智模型：",
-						"",
-						"- **分支**是这个章节自己的。我在这里产生的提交，在有人合并之前不会出现在任何其他章节的分支上。",
-						"- **目录**是一个 git *worktree*——同一个仓库的第二份检出。这就是为什么隔离不需要协调：两个章节不会争抢同一个文件，因为它们本来就不共用。",
-						"- **提交数**是这个章节分叉自的那段历史。它不是空的，这对下一课很重要：只有当有东西可分叉时，分叉才有意义。",
-						"",
-						"从其他工具那里需要「反学习」的一点：章节不是任务，也不是工单。它是一个**场所**——一个目录、一个分支和一段对话，在你不看它的时候依然存在。",
+						"- **分支**：只属于这个章节。我在这里产生的提交，合并之前不会出现在其他章节的分支上。",
+						"- **目录**：一个 git *worktree*，同一仓库的第二份检出。两个章节各有自己的目录，不会争抢同一个文件。",
+						"- **提交数**：这个章节分叉自的那段历史。下一课会用到它。",
 					].join("\n"),
 				},
 			},
 		],
 		fallbackTurn: {
 			text: {
-				en: "That is the end of this lesson's script. The next lesson forks this chapter, which is where having two worktrees starts to pay off.",
-				"zh-CN":
-					"本课剧本到此结束。下一课会分叉这个章节——那时「拥有两个 worktree」才开始体现价值。",
+				en: "End of this lesson's script. The next lesson forks this chapter.",
+				"zh-CN": "本课剧本结束。下一课会分叉这个章节。",
 			},
 		},
 		generateResponses: {
-			title: { en: "Tutorial: repositories and chapters", "zh-CN": "教程：仓库与章节" },
+			title: {
+				en: "Tutorial: repositories and chapters",
+				"zh-CN": "教程：仓库与章节",
+			},
 		},
 	},
 
@@ -1444,16 +1498,9 @@ const scripts: Record<string, TutorialScript> = {
 		turns: [],
 		fallbackTurn: {
 			text: {
-				en: [
-					"Forking is something you do to the chapter, not something you ask me to do — so there is nothing for me to run here.",
-					"",
-					"The choice worth thinking about is context inheritance. **Full** carries this whole conversation into the new chapter, which is right when the fork continues the same line of thought. **Compressed** carries a summary instead, which keeps the useful conclusions without re-paying for every intermediate step. **Fresh** starts with nothing, which is the right answer more often than it looks: if the previous approach was wrong, inheriting the reasoning that produced it mostly imports the mistake.",
-				].join("\n"),
-				"zh-CN": [
-					"分叉是你对章节做的操作，而不是让我去做的事——所以这里没有我需要执行的东西。",
-					"",
-					"真正值得思考的是上下文继承。**full** 把当前整段对话带进新章节，适合分叉是同一思路的延续。**compressed** 改为带走摘要，保留有用结论而不必为每个中间步骤重复付费。**fresh** 从零开始——它是正确答案的频率比看上去更高：如果之前那条路本来就错了，继承产生它的推理，多半只是把错误一起搬过去。",
-				].join("\n"),
+				en: "Forking is something you do to the chapter — there is nothing for me to run here.\n\nThe main choice is context inheritance:\n\n- **full** — carries this whole conversation into the new chapter. Use it when the fork continues the same line of work.\n- **compressed** — carries a summary instead. Keeps the useful conclusions without re-running every step.\n- **fresh** — starts with nothing. Use it when the previous approach was wrong: inheriting the reasoning that produced a mistake mostly copies the mistake.",
+				"zh-CN":
+					"分叉是你对章节做的操作，这里没有我需要执行的东西。\n\n主要选择是上下文继承：\n\n- **full** — 把当前完整对话带进新章节。分叉是同一思路的延续时使用。\n- **compressed** — 只带摘要。保留有用结论，不重复每个中间步骤。\n- **fresh** — 从零开始。之前那条路走错了就用这个：继承产生错误的推理，多半只是把错误一起搬过去。",
 			},
 		},
 		generateResponses: {
@@ -1466,16 +1513,9 @@ const scripts: Record<string, TutorialScript> = {
 		turns: [],
 		fallbackTurn: {
 			text: {
-				en: [
-					"This lesson is about reading the graph, so there is nothing for me to run.",
-					"",
-					"One distinction that matters: **roles** (trunk / branch / exploration / review) are labels. They change how a node looks and what it means to you; they do not restrict what you can do with it. **Edges** are different — they are records of things that actually happened, except for `dependency`, which you declare yourself so the system can warn you when the upstream chapter moves.",
-				].join("\n"),
-				"zh-CN": [
-					"本课讲的是如何读图，所以这里没有我需要执行的东西。",
-					"",
-					"有一个区别很重要：**角色**（trunk / branch / exploration / review）是标签。它们改变节点的外观和对你的语义，但不限制你能对它做什么。**边**则不同——它们是真实发生过的事情的记录，唯一的例外是 `dependency`：它由你自己声明，好让系统在上游章节变化时提醒你。",
-				].join("\n"),
+				en: "This lesson is about reading the graph, so there's nothing for me to run.\n\n**Roles** (trunk / branch / exploration / review) are labels. They change how a node looks; they don't restrict what you can do with it.\n\n**Edges** record things that actually happened — except `dependency`, which you declare yourself so the system warns you when the upstream chapter changes.",
+				"zh-CN":
+					"本课讲的是如何读图，没有我需要执行的操作。\n\n**角色**（trunk / branch / exploration / review）是标签，改变节点外观，不限制你能做什么。\n\n**边**记录已发生的事，唯一例外是 `dependency`：由你自己声明，上游章节变化时系统会提醒你。",
 			},
 		},
 		generateResponses: {
@@ -1488,20 +1528,9 @@ const scripts: Record<string, TutorialScript> = {
 		turns: [],
 		fallbackTurn: {
 			text: {
-				en: [
-					"Merging is a structural action too, so there is nothing for me to run here.",
-					"",
-					"Worth knowing about how a chapter ends. **Merged** means its work landed. **Dormant** removes the worktree and keeps the branch — it frees disk without deciding anything, and waking it recreates the directory. **Abandoned** records that the approach lost, and that is a real outcome rather than a failure: the whole point of forking cheaply is that some forks are supposed to be thrown away.",
-					"",
-					"None of these delete the conversation. A rejected approach is often the most useful thing to be able to re-read six months later.",
-				].join("\n"),
-				"zh-CN": [
-					"合并同样是结构性操作，所以这里没有我需要执行的东西。",
-					"",
-					"关于章节如何结束，有几点值得知道。**merged** 表示它的工作落地了。**dormant** 移除 worktree、保留分支——它只释放磁盘而不做任何决定，唤醒时目录会被重建。**abandoned** 记录这条路没走通，而这是一个真实的结果而非失败：低成本分叉的意义，本来就包含「有些分叉就该被丢掉」。",
-					"",
-					"这些都不会删除对话。半年后最值得回看的，往往正是那条被否掉的路。",
-				].join("\n"),
+				en: "Merging is a structural action, so there is nothing for me to run here.\n\nThree ways a chapter ends:\n\n- **merged** — its work landed in the parent.\n- **dormant** — worktree removed, branch kept. Waking it recreates the directory. Use this when you are pausing work, not closing it.\n- **abandoned** — records that the approach did not pan out. Not a failure; cheap forks exist so some can be thrown away.\n\nNone of these delete the conversation. A rejected approach is often useful to re-read later.",
+				"zh-CN":
+					"合并是结构性操作，这里没有我需要执行的东西。\n\n章节结束有三种状态：\n\n- **merged** — 工作已落地到父章节。\n- **dormant** — 移除 worktree，保留分支。唤醒时目录重建。用于暂停而非关闭。\n- **abandoned** — 记录这条路没走通。这是正常结果，低成本分叉本来就允许有些分叉被丢弃。\n\n三种状态都不会删掉对话记录。",
 			},
 		},
 		generateResponses: {
@@ -1522,14 +1551,12 @@ const scripts: Record<string, TutorialScript> = {
 		turns: [
 			{
 				reasoning: {
-					en: "Delegate the search rather than running it inline. The point of the lesson is the context boundary: whatever the subagent reads should not land in this conversation.",
-					"zh-CN":
-						"把搜索委派出去，而不是自己在主线里跑。本课的要点是上下文边界：子代理读到的东西不应落进当前这段对话。",
+					en: "Delegate the search so the reading stays out of the main conversation — that is the point of the lesson.",
+					"zh-CN": "把搜索委派出去，让阅读过程留在主对话之外——这就是本课的要点。",
 				},
 				text: {
-					en: "This needs a look around the repository. I will delegate it to an explore agent so the reading stays out of our conversation.",
-					"zh-CN":
-						"这需要在仓库里四处看看。我把它委派给一个 explore 代理，让阅读过程留在我们的对话之外。",
+					en: "I'll send an explore agent to look around the repository. Its reading won't land in our conversation.",
+					"zh-CN": "我派一个 explore 代理去查看仓库。它的阅读过程不会进入我们的对话。",
 				},
 				toolUses: [
 					{
@@ -1545,28 +1572,27 @@ const scripts: Record<string, TutorialScript> = {
 			},
 			{
 				reasoning: {
-					en: "Report the delegation model, not the findings again. Repeating what the subagent already returned is the mistake this whole mechanism exists to avoid.",
-					"zh-CN":
-						"讲清委派机制，而不是把结论再说一遍。重复子代理已经回传的内容，正是这套机制本身要避免的错误。",
+					en: "Explain the delegation mechanism. No need to repeat what the subagent already returned.",
+					"zh-CN": "讲清委派机制。子代理已经汇报过的结论不用重复。",
 				},
 				text: {
 					en: [
-						'Worth being precise about what just happened, because it is easy to read that card as "a tool ran":',
+						"Here is what actually happened:",
 						"",
-						"- A **second narrator** was created, with its own context window. You can open it and read every step it took.",
-						"- What came back here is its **summary**, not its reading. That is the whole economy of the thing: a subagent that returned everything it saw would have saved nothing, because the context would land here anyway.",
-						"- It was an **explore** agent, so it could not have written anything even if it decided to. That is authority, not etiquette.",
+						"- A **second narrator** was created with its own context window. You can open the card and read every step it took.",
+						"- What came back is its **summary**, not its reading. A subagent that returned everything it saw would save nothing — the context would land here anyway.",
+						"- It was an **explore** agent, so it had no write access at all.",
 						"",
-						"The four types differ in exactly that authority: `explore` reads, `plan` designs without implementing, `review` inspects a diff, `general` writes. Choose the narrowest one that can do the job — not because a wider one misbehaves, but because a narrow one cannot.",
+						"The four types differ in authority: `explore` reads, `plan` designs without implementing, `review` inspects a diff, `general` writes. Pick the narrowest one that fits the job.",
 					].join("\n"),
 					"zh-CN": [
-						"有必要把刚才发生的事说准确，因为那张卡片很容易被读成「跑了一个工具」：",
+						"刚才发生的事：",
 						"",
-						"- 一个**第二叙述者**被创建了，拥有自己的上下文窗口。你可以打开它，读到它走过的每一步。",
-						"- 回到这里的是它的**归纳**，而不是它的阅读内容。这就是整件事的经济性所在：如果子代理把看到的一切都带回来，它什么也没省下，因为上下文最终还是会落在这里。",
-						"- 它是一个 **explore** 代理，所以即便它想写，也写不了。这是权限，而不是礼节。",
+						"- 一个**第二叙述者**被创建了，有自己的上下文窗口。点开卡片可以看到它走过的每一步。",
+						"- 回到这里的是它的**归纳**，不是它的阅读内容。如果把看到的全部带回来，上下文一样会落在这里，什么也没省。",
+						"- 它是 **explore** 代理，没有任何写入权限。",
 						"",
-						"四种类型的区别正在于这份权限：`explore` 只读，`plan` 只设计不实现，`review` 检查差异，`general` 可以写入。选择能完成任务的最小权限那一个——不是因为权限更大的会乱来，而是因为权限小的做不到。",
+						"四种类型的区别在于权限：`explore` 只读，`plan` 只设计不实现，`review` 检查差异，`general` 可以写入。选能完成任务的最小权限那个。",
 					].join("\n"),
 				},
 			},
@@ -1575,13 +1601,12 @@ const scripts: Record<string, TutorialScript> = {
 			explore: [
 				{
 					reasoning: {
-						en: "Read-only survey. Answer in a few sentences and do not paste file contents back — returning everything would put the context right back into the parent conversation the delegation was meant to protect.",
-						"zh-CN":
-							"只读勘察。用几句话作答，不要把文件内容粘回去——全都带回去，会把上下文重新塞进这次委派本要保护的父对话里。",
+						en: "Read-only survey. Answer in a few sentences and do not return file contents — that would put the context back into the parent conversation.",
+						"zh-CN": "只读勘察。用几句话作答，不要把文件内容带回去——那会把上下文重新塞进父对话。",
 					},
 					text: {
-						en: "Looking around before answering.",
-						"zh-CN": "先四处看看再回答。",
+						en: "Looking around first.",
+						"zh-CN": "先看看再说。",
 					},
 					toolUses: [
 						{ name: "Glob", input: { pattern: "**/*.{ts,md}" } },
@@ -1594,16 +1619,16 @@ const scripts: Record<string, TutorialScript> = {
 				{
 					text: {
 						en: [
-							"Survey done. Four files: `README.md`, `notes.md`, `src/greeting.ts`, `src/tasks.ts`.",
+							"Four files: `README.md`, `notes.md`, `src/greeting.ts`, `src/tasks.ts`.",
 							"",
-							"One duplication worth reporting: `greet` and `greetLoudly` in `src/greeting.ts` build the same greeting template independently, so a change to the wording has to be made twice. `notes.md` already records it.",
+							"`greet` and `greetLoudly` in `src/greeting.ts` build the same greeting template independently — a wording change has to be made twice. `notes.md` already records this.",
 							"",
 							"`src/tasks.ts` has a single `countOpen` helper and no tests.",
 						].join("\n"),
 						"zh-CN": [
-							"勘察完成。四个文件：`README.md`、`notes.md`、`src/greeting.ts`、`src/tasks.ts`。",
+							"四个文件：`README.md`、`notes.md`、`src/greeting.ts`、`src/tasks.ts`。",
 							"",
-							"有一处重复值得报告：`src/greeting.ts` 里的 `greet` 和 `greetLoudly` 各自独立拼出同样的问候模板，所以改文案要改两遍。`notes.md` 里已经记下了这一点。",
+							"`src/greeting.ts` 里的 `greet` 和 `greetLoudly` 各自独立拼出同样的问候模板，改文案要改两遍。`notes.md` 已记录此事。",
 							"",
 							"`src/tasks.ts` 只有一个 `countOpen` 辅助函数，没有测试。",
 						].join("\n"),
@@ -1618,7 +1643,10 @@ const scripts: Record<string, TutorialScript> = {
 			},
 		},
 		generateResponses: {
-			title: { en: "Tutorial: delegating to subagents", "zh-CN": "教程：委派给子代理" },
+			title: {
+				en: "Tutorial: delegating to subagents",
+				"zh-CN": "教程：委派给子代理",
+			},
 		},
 	},
 
@@ -1627,12 +1655,12 @@ const scripts: Record<string, TutorialScript> = {
 		turns: [
 			{
 				reasoning: {
-					en: "Start it in the background so the turn is not held hostage. The whole point is that the card returns a handle rather than a result.",
-					"zh-CN": "放到后台启动，这一轮就不会被扣住。要点在于卡片返回的是一个句柄而不是结果。",
+					en: "Start it in the background so this turn returns immediately. The card gives back a handle, not a result.",
+					"zh-CN": "放后台启动，这一轮立刻结束。卡片返回的是句柄，不是结果。",
 				},
 				text: {
-					en: "This one takes a while, so I will start it in the background instead of making you wait.",
-					"zh-CN": "这件事要花些时间，所以我把它放到后台启动，不让你干等。",
+					en: "This will take a while, so I'm starting it in the background.",
+					"zh-CN": "这个要跑一会儿，我把它放到后台。",
 				},
 				toolUses: [
 					{
@@ -1649,24 +1677,29 @@ const scripts: Record<string, TutorialScript> = {
 			},
 			{
 				reasoning: {
-					en: "Do not Await it here. Waiting immediately after backgrounding it would make the background flag pointless and teach the opposite of the lesson.",
-					"zh-CN":
-						"这里不要 Await 它。刚放到后台就立刻等待，会让后台标记失去意义，教出与本课相反的东西。",
+					en: "Don't Await here. Waiting right after backgrounding defeats the point and teaches the wrong lesson.",
+					"zh-CN": "不能在这里 Await。刚放后台就等，完全没有意义。",
 				},
 				text: {
 					en: [
-						"Notice what the card returned: a task handle, not an answer. The agent is still working and this turn is already finishing.",
+						"The card returned a task id, not an answer. The agent is still working.",
 						"",
-						"That is the trade being made. A foreground agent gives you its answer inside the turn, at the cost of the turn lasting as long as the work. A background agent frees the turn, at the cost of you (or I) having to come back for the result — which is what `Await` is for, and why the background tasks drawer exists.",
+						"Two choices when running a subagent:",
 						"",
-						"Background is the right choice when the answer is not needed to decide the next thing. When it is, waiting is not inefficiency — it is the dependency being honest.",
+						"- **Foreground**: answer arrives in this turn, turn lasts as long as the work.",
+						"- **Background**: turn ends now, result collected later with `Await`.",
+						"",
+						"Use background when the next step does not depend on the answer. When it does, waiting is not inefficiency — it is the dependency.",
 					].join("\n"),
 					"zh-CN": [
-						"注意卡片返回的东西：一个任务句柄，而不是答案。代理还在工作，而这一轮已经要结束了。",
+						"卡片返回了任务 id，不是答案。子代理还在工作。",
 						"",
-						"这是一次权衡。前台代理在这一轮内就把答案给你，代价是这一轮要持续到工作做完。后台代理释放了这一轮，代价是你（或我）得回来取结果——这正是 `Await` 的用途，也是后台任务抽屉存在的原因。",
+						"启动子代理有两种方式：",
 						"",
-						"当「下一步怎么做」不依赖这个答案时，后台是对的选择。当它依赖时，等待并不是低效——那只是依赖关系本身如实呈现。",
+						"- **前台**：答案在这一轮里返回，这一轮持续到工作做完。",
+						"- **后台**：这一轮现在结束，之后用 `Await` 取结果。",
+						"",
+						"下一步不依赖这个答案时，选后台。依赖时，等就是对的，不是低效。",
 					].join("\n"),
 				},
 			},
@@ -1675,9 +1708,9 @@ const scripts: Record<string, TutorialScript> = {
 			explore: [
 				{
 					text: {
-						en: "Ran an audit. The one thing worth doing is removing the duplicated greeting template in `src/greeting.ts`; `src/tasks.ts` would benefit from a test for `countOpen` but is otherwise fine.",
+						en: "Done. One thing to fix: remove the duplicated greeting template in `src/greeting.ts`. `src/tasks.ts` is missing a test for `countOpen`; everything else is fine.",
 						"zh-CN":
-							"审查完成。真正值得做的是消除 `src/greeting.ts` 里重复的问候模板；`src/tasks.ts` 若能给 `countOpen` 补个测试会更好，但其余没有问题。",
+							"审查完成。要做的只有一件事：删掉 `src/greeting.ts` 里重复的问候模板。`src/tasks.ts` 的 `countOpen` 缺一个测试，其余没有问题。",
 					},
 				},
 			],
@@ -1701,13 +1734,13 @@ const scripts: Record<string, TutorialScript> = {
 		turns: [
 			{
 				reasoning: {
-					en: "Two agents in ONE turn, and they must be genuinely independent: one surveys the greeting code, the other the task code. If either needed the other's answer, parallelising would just make one of them guess.",
+					en: "Spawn two agents in one turn. They must be genuinely independent — one reads the greeting code, the other reads the task code. If either needed the other's answer, parallelising would make one of them guess.",
 					"zh-CN":
-						"在**同一轮**里派两个代理，而且它们必须真正独立：一个勘察问候代码，另一个勘察任务代码。如果其中任何一个需要对方的答案，并行只会让它去猜。",
+						"在同一轮派两个代理。它们必须真正独立：一个看问候代码，另一个看任务代码。如果其中一个需要对方的答案，并行就会让它去猜。",
 				},
 				text: {
-					en: "These two halves do not depend on each other, so they can run at the same time.",
-					"zh-CN": "这两半工作互不依赖，所以可以同时进行。",
+					en: "These two tasks don't depend on each other, so they can run at the same time.",
+					"zh-CN": "这两份工作互不依赖，所以可以同时进行。",
 				},
 				toolUses: [
 					{
@@ -1734,24 +1767,23 @@ const scripts: Record<string, TutorialScript> = {
 			},
 			{
 				reasoning: {
-					en: "Both came back. Say the thing that is easy to get wrong — that a slow agent is usually just working — rather than restating two short findings.",
-					"zh-CN":
-						"两边都回来了。说清最容易搞错的那一点——慢的代理通常只是在工作——而不是把两条简短结论再复述一遍。",
+					en: "Both came back. Explain the one thing people get wrong: a slow agent is usually still working, not stuck.",
+					"zh-CN": "两边都回来了。说清最容易搞错的那一点：慢的代理通常还在工作，不是卡住了。",
 				},
 				text: {
 					en: [
-						"Both agents ran at once and each reported on its own file.",
+						"Both agents ran at the same time and each reported on its own file.",
 						"",
-						"Parallelising was safe here for one reason only: neither half needed the other's answer. When work *is* dependent, running it in parallel does not make it faster — it makes one of the two proceed on a guess, and you find out later.",
+						"Parallel was safe here for one reason: neither side needed the other's answer. When tasks *are* dependent, running them in parallel makes one proceed on a guess.",
 						"",
-						'The other half of coordination is knowing when to leave an agent alone. A wait that times out means *the wait ended*, not that the agent is stuck. Sending it a "status?" message costs it context and interrupts what it was doing; the honest signals are whether it is still making tool calls and what it eventually returns. Interrupt when the direction is wrong — not because you are impatient.',
+						'The other part of coordination: know when to leave an agent alone. A timed-out wait means the wait ended, not that the agent is stuck. Sending a "how\'s it going?" costs it context and breaks its flow. The real signals are whether it is still making tool calls and what it eventually returns. Interrupt when the direction is wrong — not because you are impatient.',
 					].join("\n"),
 					"zh-CN": [
 						"两个代理同时运行，各自汇报了自己那份文件。",
 						"",
-						"在这里并行是安全的，原因只有一个：两半工作都不需要对方的答案。当工作**确实**存在依赖时，并行并不会更快——它只会让其中一个基于猜测继续往下走，而你事后才发现。",
+						"并行安全只有一个原因：两半工作都不需要对方的答案。有依赖时并行，其中一个只能基于猜测继续，你事后才发现。",
 						"",
-						"协作的另一半，是知道什么时候该别去打扰。等待超时意味着**这次等待结束了**，而不是代理卡住了。给它发一条「进展如何？」会浪费它的上下文并打断它正在做的事；真正可靠的信号是它是否还在调用工具，以及它最终返回了什么。方向错了才该中断——而不是因为你等得不耐烦。",
+						"协作的另一面：知道什么时候别去打扰。等待超时意味着这次等待结束了，不是代理卡住了。给它发「进展如何」会浪费它的上下文并打断它。真正可靠的信号是它是否还在调用工具，以及最终返回了什么。方向错了才该中断，不是因为等得不耐烦。",
 					].join("\n"),
 				},
 			},
@@ -1760,9 +1792,9 @@ const scripts: Record<string, TutorialScript> = {
 			explore: [
 				{
 					text: {
-						en: "Read the file I was pointed at. The clearest improvement is removing the duplicated greeting template so the wording lives in one place; nothing else stands out in a file this small.",
+						en: "Read the file I was assigned. The clearest improvement is removing the duplicated greeting template so the wording lives in one place. Nothing else stands out in a file this small.",
 						"zh-CN":
-							"读了指定给我的文件。最明确的改进是消除重复的问候模板，让文案只存在于一处；在这么小的文件里，其余没有特别突出的问题。",
+							"读了分配给我的文件。最明确的改进是消掉重复的问候模板，让文案只在一处维护。文件很小，没有其他突出问题。",
 					},
 				},
 			],
@@ -1774,7 +1806,10 @@ const scripts: Record<string, TutorialScript> = {
 			},
 		},
 		generateResponses: {
-			title: { en: "Tutorial: several agents at once", "zh-CN": "教程：多个代理同时工作" },
+			title: {
+				en: "Tutorial: several agents at once",
+				"zh-CN": "教程：多个代理同时工作",
+			},
 		},
 	},
 };
@@ -1856,6 +1891,26 @@ export interface ResolvedTutorialTurn {
 	toolUses: TutorialScriptToolUse[];
 }
 
+/**
+ * Fold `localizedInput` into `input` for one locale.
+ *
+ * Returns the same object when there is nothing to localize, so the common case
+ * allocates nothing and the identity the guard test inspects is unchanged.
+ */
+function resolveToolUse(
+	toolUse: TutorialScriptToolUse,
+	locale: Locale | string | null | undefined,
+): TutorialScriptToolUse {
+	if (!toolUse.localizedInput) return toolUse;
+	const input = { ...toolUse.input };
+	for (const [field, value] of Object.entries(toolUse.localizedInput)) {
+		input[field] = pickLocalizedValue(value, locale);
+	}
+	// `localizedInput` is dropped: what remains is a plain scripted call, and
+	// leaving the source field on it would let a consumer localize twice.
+	return { name: toolUse.name, input };
+}
+
 export function resolveTutorialTurn(
 	turn: TutorialScriptTurn,
 	locale: Locale | string | null | undefined,
@@ -1863,6 +1918,6 @@ export function resolveTutorialTurn(
 	return {
 		...(turn.reasoning ? { reasoning: pickLocalizedValue(turn.reasoning, locale) } : {}),
 		...(turn.text ? { text: pickLocalizedValue(turn.text, locale) } : {}),
-		toolUses: turn.toolUses ?? [],
+		toolUses: (turn.toolUses ?? []).map((toolUse) => resolveToolUse(toolUse, locale)),
 	};
 }

@@ -4,11 +4,15 @@ import {
 	allocateUniqueToolUseId,
 	applyToolUseIdRemap,
 	collectToolUseIdsFromHistory,
+	isWireSafeToolUseId,
 	remapToolResultIds,
 	reserveUniqueToolUseIds,
+	toWireSafeToolUseId,
 	uniquifyDbMessageToolUseIds,
 } from "../tool-use-id-dedup";
 import type { AgentToolUse } from "../types";
+
+const WIRE_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
 function assistantMessage(id: string, toolUseIds: string[]): DbMessage {
 	return {
@@ -111,6 +115,119 @@ describe("uniquifyDbMessageToolUseIds", () => {
 		const all = uniquifyDbMessageToolUseIds(messages).flatMap(toolUseIdsOf);
 		expect(all).toHaveLength(120);
 		expect(new Set(all).size).toBe(120);
+	});
+
+	test("每个候选都被占用时仍然返回，而不是死循环", () => {
+		// The allocator's fallback is a random tail, so its exit condition depends on
+		// `Math.random` missing a set. That loop runs SYNCHRONOUSLY on the server's only
+		// JS thread: unbounded, its worst case is a wedged event loop that takes every
+		// session down, and the symptom ("the whole app stopped responding") points
+		// nowhere near a tool-id naming helper.
+		//
+		// A Set that claims to contain EVERYTHING forces the pathological branch on the
+		// first probe, which no realistic history can do. Passing means the allocator
+		// degrades to a wider id; failing means this test never returns.
+		const everything: ReadonlySet<string> = {
+			has: () => true,
+			size: Number.MAX_SAFE_INTEGER,
+			// The allocator only calls `has`; the rest satisfies the type.
+			keys: () => [][Symbol.iterator](),
+			values: () => [][Symbol.iterator](),
+			entries: () => [][Symbol.iterator](),
+			forEach: () => {},
+			[Symbol.iterator]: () => [][Symbol.iterator](),
+		} as unknown as ReadonlySet<string>;
+
+		const id = allocateUniqueToolUseId("call_stuck", everything);
+
+		expect(id).toContain("_nfdup");
+		// Still wire-safe and still within the length gateways validate: degrading must
+		// not produce an id that the next request rejects.
+		expect(id).toMatch(WIRE_PATTERN);
+		expect(id.length).toBeLessThanOrEqual(56);
+	});
+
+	// --- character set ---
+
+	test("含冒号的 ID 即使不重复也被改写（Bash:0 回归）", () => {
+		// Real failure: a session whose early turns were produced by an upstream minting
+		// `Bash:0` / `Read:0`. Anthropic accepted them, so they reached the DB; NUG's
+		// `tool_use.id: String should match pattern '^[a-zA-Z0-9_-]+$'`.
+		const messages = [
+			assistantMessage("m1", ["Bash:0"]),
+			assistantMessage("m2", ["Edit:0"]),
+			assistantMessage("m3", ["toolu_01Normal"]),
+		];
+		const result = uniquifyDbMessageToolUseIds(messages);
+		const all = result.flatMap(toolUseIdsOf);
+
+		expect(all).toEqual(["Bash_0", "Edit_0", "toolu_01Normal"]);
+		for (const id of all) expect(id).toMatch(WIRE_PATTERN);
+		// contentJson must follow, or the provider drops the block when resolving it
+		// against the tool-call rows.
+		expect(result.flatMap(contentToolUseIdsOf)).toEqual(all);
+		// DB rows are untouched.
+		expect(messages.flatMap(toolUseIdsOf)).toEqual(["Bash:0", "Edit:0", "toolu_01Normal"]);
+	});
+
+	test("净化后撞车的两个不同 ID 仍各自唯一", () => {
+		// `a:0` and `a.0` both sanitize to `a_0`; checking uniqueness before sanitizing
+		// would let them collide on the wire.
+		const messages = [assistantMessage("m1", ["a:0"]), assistantMessage("m2", ["a.0"])];
+		const all = uniquifyDbMessageToolUseIds(messages).flatMap(toolUseIdsOf);
+
+		expect(new Set(all).size).toBe(2);
+		for (const id of all) expect(id).toMatch(WIRE_PATTERN);
+	});
+
+	test("净化与去重同时发生时结果既唯一又合法", () => {
+		const messages = [
+			assistantMessage("m1", ["Bash:0"]),
+			assistantMessage("m2", ["Bash:0"]),
+			assistantMessage("m3", ["Bash:0"]),
+		];
+		const all = uniquifyDbMessageToolUseIds(messages).flatMap(toolUseIdsOf);
+
+		expect(new Set(all).size).toBe(3);
+		for (const id of all) expect(id).toMatch(WIRE_PATTERN);
+	});
+
+	test("净化是确定性的，同一 ID 每次重建都得到同一替换", () => {
+		// Stability is what lets the DB keep the original id: nothing persists the mapping,
+		// so a differing replacement between rebuilds would break tool_use ↔ tool_result
+		// pairing across a restart.
+		const build = () => uniquifyDbMessageToolUseIds([assistantMessage("m1", ["Bash:0"])]);
+		expect(build().flatMap(toolUseIdsOf)).toEqual(build().flatMap(toolUseIdsOf));
+	});
+
+	test("已合法的历史保持同一数组引用（无额外拷贝）", () => {
+		const messages = [assistantMessage("m1", ["toolu_01a-b_c"]), assistantMessage("m2", ["x"])];
+		expect(uniquifyDbMessageToolUseIds(messages)).toBe(messages);
+	});
+});
+
+describe("toWireSafeToolUseId", () => {
+	test("合法 ID 原样返回", () => {
+		for (const id of ["toolu_01abc", "call-1", "A_b-9"]) {
+			expect(isWireSafeToolUseId(id)).toBe(true);
+			expect(toWireSafeToolUseId(id)).toBe(id);
+		}
+	});
+
+	test("非法字符被替换为下划线", () => {
+		expect(toWireSafeToolUseId("Bash:0")).toBe("Bash_0");
+		expect(toWireSafeToolUseId("tool.call:1")).toBe("tool_call_1");
+		expect(toWireSafeToolUseId("工具:0")).toBe("___0");
+	});
+
+	test("全部字符非法时回落到可用名字而非空串", () => {
+		// An empty id would be rejected by the same validator (`+` requires ≥1 char).
+		expect(toWireSafeToolUseId("")).toBe("tool");
+		expect(toWireSafeToolUseId(":::")).toMatch(WIRE_PATTERN);
+	});
+
+		expect(isWireSafeToolUseId("call.1")).toBe(false);
+		expect(toWireSafeToolUseId("call.1")).toMatch(WIRE_PATTERN);
 	});
 });
 
@@ -217,5 +334,33 @@ describe("reserveUniqueToolUseIds + remapToolResultIds", () => {
 		const results = [{ type: "tool_result", tool_use_id: "call_a", content: "ok" }];
 		expect(remapToolResultIds(results, new Map())).toBe(0);
 		expect(results[0].tool_use_id).toBe("call_a");
+	});
+
+	test("含非法字符的 ID 即使未与历史冲突也被改写", () => {
+		const used = new Set<string>();
+		const toolUses = [toolUse("Bash:0")];
+		const remap = reserveUniqueToolUseIds(toolUses, used);
+
+		expect(remap.get("Bash:0")).toBe("Bash_0");
+		expect(used.has("Bash_0")).toBe(true);
+		// Live objects keep the provider's id — persistence/UI/permissions key off it.
+		expect(toolUses[0].toolUseId).toBe("Bash:0");
+	});
+
+	test("净化后的 ID 与历史已有 ID 冲突时再改名", () => {
+		const used = new Set(["Bash_0"]);
+		const remap = reserveUniqueToolUseIds([toolUse("Bash:0")], used);
+		const next = remap.get("Bash:0") as string;
+
+		expect(next).not.toBe("Bash_0");
+		expect(next).toMatch(WIRE_PATTERN);
+	});
+
+	test("净化后的工具结果 ID 跟随改名，配对不断", () => {
+		const used = new Set<string>();
+		const remap = reserveUniqueToolUseIds([toolUse("Bash:0")], used);
+		const renamed = remap.get("Bash:0") as string;
+
+		expect(renamed).toMatch(WIRE_PATTERN);
 	});
 });

@@ -52,7 +52,11 @@ import {
 } from "@tabler/icons-react";
 import { useEffect, useRef, useState } from "react";
 import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
-import type { ToolCategory } from "../measure/measure-tool-call";
+import {
+	CARD_HEADER_INNER_ICON,
+	HEADER_CELL_GAP,
+	type ToolCategory,
+} from "../measure/measure-tool-call";
 import {
 	type MeasuredCollapsibleTrace,
 	type MeasuredTraceCountLine,
@@ -71,6 +75,7 @@ import {
 	traceMetrics,
 } from "../measure/measure-tool-run";
 import { categoryIcon } from "./category-icons";
+import { DiffStatsText } from "./diff-stats-text";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { CATEGORY_COLOR, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
@@ -82,8 +87,13 @@ import {
 } from "./trace-row-status";
 
 const CHEVRON_SLOT_WIDTH = 12;
-const HEADER_INNER_ICON = 10;
-const ROW_INNER_ICON = 9;
+/**
+ * Glyph inside a category chip — one value for BOTH forms, so the icon does not change
+ * size across the morph now that the tiles are the same 14px lane. Defined in the measure
+ * module so the card header can share it without an import cycle.
+ */
+const ROW_INNER_ICON = CARD_HEADER_INNER_ICON;
+const HEADER_INNER_ICON = ROW_INNER_ICON;
 const DIMMED = "var(--mantine-color-dimmed)";
 
 /** A row's chip tint from its category, via the vlist render layer's own table. */
@@ -221,8 +231,45 @@ interface RenderToolRunProps {
 	rowInteraction?: TraceRowInteractionSlot;
 	/** Renders a drilled-in row's nested tool card (see the type doc). */
 	rowCard?: TraceRowCardSlot;
+	/**
+	 * Row keys whose drill-down is CLOSING: keep painting the card for the duration of
+	 * the fold transition, even though the measured row no longer has one.
+	 *
+	 * Without this the card — its header included — is unmounted in the very frame the
+	 * fold commits, so it VANISHES instead of closing and the rows below appear to slide
+	 * up from behind a clip line. The shell adds a key here in the click handler, animates
+	 * the block's height down, and removes it when the scheduler reports the motion done
+	 * (`MotionOp.onDone`).
+	 *
+	 * ⚠️ Height-neutral by construction, and that is what keeps it out of the height
+	 * model: the block's box is still exactly `row.blockHeight` (the COLLAPSED value the
+	 * layout just committed) and the retained card is clipped by it. Nothing is measured,
+	 * no cached measurement or layout offset is consulted, and the extra paint disappears
+	 * on its own. This is the same class of purely visual retention as the fold's
+	 * `clip-path` — see CONTRACT §4.6.
+	 */
+	closingRowKeys?: ReadonlySet<string>;
 	/** Fresh live tails for streaming rows, by row key (see the type doc). */
 	rowLiveTails?: TraceRowLiveTails;
+	/**
+	 * Per-grapheme fade for the expanded body of a LIVE reasoning step.
+	 *
+	 * A titled reasoning run renders as `reasoning-steps` (this component), not as
+	 * the plain `reasoning` card — so without this the two shapes of the same content
+	 * behaved differently: an untitled run's body faded in, a titled one's did not.
+	 * Since a `**title**` is what the model normally emits, the shape that fades was
+	 * the rarer one.
+	 *
+	 * Only the expanded body participates. A collapsed row is one fixed truncating
+	 * line whose text is a settled title, and its live end is already shown by
+	 * `rowLiveTails` — a left-clipped scrolling window, where a per-grapheme fade has
+	 * no stable start or end position.
+	 */
+	animateStreaming?: boolean;
+	/** Stable per-element key base (the vlist item's spec.key) for anim memory. */
+	animKeyBase?: string;
+	/** The anim store's mount scope; see RenderMarkdown.animScope. */
+	animScope?: string;
 }
 
 /**
@@ -239,7 +286,11 @@ export function RenderToolRun({
 	onToggleRow,
 	rowInteraction,
 	rowCard,
+	closingRowKeys,
 	rowLiveTails,
+	animateStreaming,
+	animKeyBase,
+	animScope,
 }: RenderToolRunProps) {
 	if (measured.itemCount === 0) return null;
 	const { header, toggle, rows, variant } = measured;
@@ -247,50 +298,55 @@ export function RenderToolRun({
 
 	return (
 		<div style={{ position: "relative", width: measured.contentWidth, height: measured.height }}>
-			{/* ── Header band ── */}
-			<Group
-				gap={TRACE_ROW_GAP}
-				wrap="nowrap"
-				align="center"
-				py={TRACE_HEADER_PADDING_Y}
-				// Selectable surface: the row interaction wrapper ignores role="button"
-				// targets, so mark the header as part of the block's selection region.
-				{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
-				role={header.hasChevron ? "button" : undefined}
-				tabIndex={header.hasChevron ? 0 : undefined}
-				aria-expanded={header.hasChevron ? header.opened : undefined}
-				style={{
-					position: "absolute",
-					top: header.top,
-					left: 0,
-					right: 0,
-					height: header.height,
-					cursor: header.hasChevron ? "pointer" : "default",
-					userSelect: "none",
-				}}
-				// A modified click selects the block; only a plain click toggles the rows.
-				onClick={
-					header.hasChevron && onToggleItems ? swallowSelectionClick(onToggleItems) : undefined
-				}
-				onKeyDown={header.hasChevron && onToggleItems ? activateOnKey(onToggleItems) : undefined}
-			>
-				{header.hasChevron ? (
-					header.opened ? (
-						<IconChevronDown size={TRACE_CHEVRON} style={{ color: DIMMED }} />
-					) : (
-						<IconChevronRight size={TRACE_CHEVRON} style={{ color: DIMMED }} />
-					)
-				) : null}
-				<ThemeIcon size={TRACE_HEADER_ICON} variant="light" color={headerColor} radius="sm">
-					<VariantHeaderIcon variant={variant} />
-				</ThemeIcon>
-				<Text size="xs" c="dimmed" fw={500} style={{ flexShrink: 0 }}>
-					{header.label}
-				</Text>
-				<Text size="xs" c="dimmed" style={{ flexShrink: 0, opacity: 0.5 }}>
-					{header.count}
-				</Text>
-			</Group>
+			{/* ── Header band (omitted when the measure layer reserved no height) ──
+			    `header.visible` is false for an activity fold showing its rows: the band
+			    is decoration there, and the measure layer gave it height 0. Painting it
+			    anyway would overlap the first row. See `isTraceHeaderVisible`. */}
+			{header.visible ? (
+				<Group
+					gap={TRACE_ROW_GAP}
+					wrap="nowrap"
+					align="center"
+					py={TRACE_HEADER_PADDING_Y}
+					// Selectable surface: the row interaction wrapper ignores role="button"
+					// targets, so mark the header as part of the block's selection region.
+					{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
+					role={header.hasChevron ? "button" : undefined}
+					tabIndex={header.hasChevron ? 0 : undefined}
+					aria-expanded={header.hasChevron ? header.opened : undefined}
+					style={{
+						position: "absolute",
+						top: header.top,
+						left: 0,
+						right: 0,
+						height: header.height,
+						cursor: header.hasChevron ? "pointer" : "default",
+						userSelect: "none",
+					}}
+					// A modified click selects the block; only a plain click toggles the rows.
+					onClick={
+						header.hasChevron && onToggleItems ? swallowSelectionClick(onToggleItems) : undefined
+					}
+					onKeyDown={header.hasChevron && onToggleItems ? activateOnKey(onToggleItems) : undefined}
+				>
+					{header.hasChevron ? (
+						header.opened ? (
+							<IconChevronDown size={TRACE_CHEVRON} style={{ color: DIMMED }} />
+						) : (
+							<IconChevronRight size={TRACE_CHEVRON} style={{ color: DIMMED }} />
+						)
+					) : null}
+					<ThemeIcon size={TRACE_HEADER_ICON} variant="light" color={headerColor} radius="sm">
+						<VariantHeaderIcon variant={variant} />
+					</ThemeIcon>
+					<Text size="xs" c="dimmed" fw={500} style={{ flexShrink: 0 }}>
+						{header.label}
+					</Text>
+					<Text size="xs" c="dimmed" style={{ flexShrink: 0, opacity: 0.5 }}>
+						{header.count}
+					</Text>
+				</Group>
+			) : null}
 
 			{/* ── "Show earlier" toggle ── */}
 			{toggle ? (
@@ -336,10 +392,20 @@ export function RenderToolRun({
 					onToggleRow={onToggleRow}
 					rowInteraction={rowInteraction}
 					rowCard={rowCard}
+					closing={closingRowKeys?.has(row.key) === true}
 					timingLabels={labels.timing}
 					shimmerStateLabels={labels.shimmerState}
 					liveTail={rowLiveTails?.get(row.key)}
 					liveTailChars={labels.liveTailChars}
+					// Only the row still being written may fade. `row.shimmer` is the
+					// adapter's own live marker, so a run that the answer text or a tool
+					// call already followed settles here too — the same moment its shimmer
+					// stops, rather than when the turn eventually persists.
+					animateStreaming={animateStreaming === true && row.shimmer}
+					// Namespaced per ROW: sibling steps are different content, and a shared
+					// key would make step N+1's first frame read as a rewrite of step N.
+					animKeyBase={animKeyBase != null ? `${animKeyBase}:${row.key}` : undefined}
+					animScope={animScope}
 				/>
 			))}
 		</div>
@@ -434,17 +500,76 @@ function useTraceRowShimmerKind(row: MeasuredTraceRow): ToolShimmerKind | null {
  * module header).
  */
 function TraceRowTitle({ row, shimmerClass }: { row: MeasuredTraceRow; shimmerClass?: string }) {
+	const split = splitTraceRowTitle(row.title, row.toolName);
 	return (
 		<Text
 			size="xs"
 			c="dimmed"
 			truncate
 			className={shimmerClass}
-			style={{ flex: "0 1 auto", minWidth: 0 }}
+			style={{
+				flex: "0 1 auto",
+				minWidth: 0,
+				// Monospace, matching the card header's own title span. The two are the SAME
+				// line in two forms, so a font change between them cannot be masked by the
+				// morph's translate — the glyphs simply re-shape mid-flight. Height-neutral:
+				// the row's line box is `max(glyphs, xs line)` and both families share the xs
+				// size, so `measure-tool-run` is unaffected.
+				fontFamily: "var(--mantine-font-family-monospace)",
+			}}
 		>
-			{row.title || "…"}
+			{split ? (
+				<>
+					{/* BOLD name, no separator — the same device the card header uses (its own
+					    tool-name span is `fontWeight: 600`). A middle dot spends a glyph and a
+					    gap on saying what weight already says, and it had no counterpart in the
+					    card, so the morph had to make it appear from nothing. */}
+					{/* `marginRight` rather than a SPACE CHARACTER: a space is as wide as the
+					    font's space advance (~7.2px in the monospace face at xs, and it scales
+					    with the reader's font size), where the card header separates the same two
+					    cells with a flat `gap={4}`. The identical label therefore had visibly
+					    different spacing in the two forms. Width-only — no height effect. */}
+					<span
+						style={{
+							fontWeight: 600,
+							...(split.detail ? { marginRight: HEADER_CELL_GAP } : {}),
+						}}
+					>
+						{split.name}
+					</span>
+					{split.detail || null}
+				</>
+			) : (
+				row.title || "…"
+			)}
 		</Text>
 	);
+}
+
+/**
+ * Split a row title into its BOLD tool name and the rest.
+ *
+ * The adapter joins them as `"Name · summary"` (`toolTraceItem`), and the measured row
+ * carries `toolName` alongside, so the split is a prefix check rather than a parse of the
+ * separator — a summary containing its own `·` cannot confuse it.
+ *
+ * Returns null when the title is not that shape (a reasoning step, a caller-supplied
+ * `resolveToolTitle`, a truncated title whose name was cut), in which case the title is
+ * drawn verbatim. Height-neutral either way: same text, same single line.
+ */
+export function splitTraceRowTitle(
+	title: string | undefined,
+	toolName: string | undefined,
+): { name: string; detail: string } | null {
+	if (!title || !toolName) return null;
+	// `Task` is displayed as `Agent`, so match what the adapter actually wrote.
+	const displayName = toolName === "Task" ? "Agent" : toolName;
+	if (!title.startsWith(displayName)) return null;
+	const rest = title.slice(displayName.length);
+	if (rest.length === 0) return { name: displayName, detail: "" };
+	// The adapter's separator, and nothing else, may follow the name.
+	if (!rest.startsWith(" · ")) return null;
+	return { name: displayName, detail: rest.slice(3) };
 }
 
 /**
@@ -549,21 +674,59 @@ function TraceRowView({
 	onToggleRow,
 	rowInteraction,
 	rowCard,
+	closing = false,
 	timingLabels,
 	shimmerStateLabels,
 	liveTail,
 	liveTailChars,
+	animateStreaming,
+	animKeyBase,
+	animScope,
 }: {
 	row: MeasuredTraceRow;
 	rowIcon?: (row: MeasuredTraceRow) => React.ReactNode;
 	onToggleRow?: (itemIndex: number, rowKey: string) => void;
 	rowInteraction?: TraceRowInteractionSlot;
 	rowCard?: TraceRowCardSlot;
+	/** This row's drill-down is closing; keep painting its card (see closingRowKeys). */
+	closing?: boolean;
 	timingLabels?: ToolTimingLabels;
 	shimmerStateLabels?: TraceRenderLabels["shimmerState"];
 	liveTail?: { charCount: number; tail: string };
 	liveTailChars?: (formatted: string) => string;
+	/** This row is the live one AND the fade is enabled (see RenderToolRunProps). */
+	animateStreaming?: boolean;
+	animKeyBase?: string;
+	animScope?: string;
 }) {
+	/**
+	 * The card node from the last render that HAD one, kept so a closing drill-down can
+	 * be animated shut around it (see `closingRowKeys`).
+	 *
+	 * A ref, not state: retaining a node is a purely visual concern and must not trigger
+	 * a render of its own. It is only ever READ while `closing` is true, and the shell
+	 * clears that flag when the scheduler reports the motion done, so the retained node
+	 * cannot outlive the transition.
+	 *
+	 * ⚠️ No height is stored alongside it, deliberately. The wrapper stretches to the
+	 * animating block (`bottom: 0`) instead of holding the height the card used to have —
+	 * pinning that height is what let the shrinking block cut through the card's body and
+	 * slice its border off.
+	 */
+	const retainedCardRef = useRef<React.ReactNode>(null);
+	// Built ONCE per render: the slot does real work (payload resolution, render extras),
+	// so calling it again for the retention would double that cost on every drilled row.
+	const liveCard = row.expanded && row.cardMeasured ? (rowCard?.(row) ?? null) : null;
+	if (liveCard !== null) {
+		retainedCardRef.current = liveCard;
+	} else if (!closing) {
+		// Neither drilled nor closing: drop it, so a later close cannot resurrect a card
+		// belonging to a different interaction.
+		retainedCardRef.current = null;
+	}
+	// The live card while drilled; the previous frame's card while closing.
+	const cardToPaint = liveCard ?? (closing ? retainedCardRef.current : null);
+
 	// ONE call per row, deliberately above both label branches — see the module header
 	// on why calling it inside each branch loses a transition.
 	const shimmerKind = useTraceRowShimmerKind(row);
@@ -662,6 +825,10 @@ function TraceRowView({
 			    Both live inside the row's fixed 18.8px line — the glyph in a 12px slot,
 			    the duration as one nowrap span, popover portaled — so `measure-tool-run`
 			    needs no height change (asserted in its tests). */}
+			{/* `+N -N` for a Write/Edit row, in the same lane as the status glyph and
+			    duration beside it (fixed line, nowrap, height-neutral). Before the
+			    status so it stays adjacent to the path it describes. */}
+			<DiffStatsText stats={row.diffStats} />
 			{hasToolRowStatusMark(row.status) ? (
 				<Box data-testid="trace-row-status-slot" style={TRACE_ROW_STATUS_SLOT_STYLE}>
 					<TraceRowStatusGlyph status={row.status} />
@@ -702,12 +869,30 @@ function TraceRowView({
 	 * (and thus a containing block of its own) the moment a swipe starts.
 	 */
 	const rowBody = (
-		<div style={{ position: "relative", height: row.blockHeight }}>
+		// `overflow: hidden` so the drill-down can be animated CLOSED. The fold controller
+		// animates this block's `height` from the card's down to the summary row's (see
+		// nestedResizeKeyframes); without clipping, the card would simply hang out of the
+		// shrinking box instead of being progressively covered. Height-neutral: the box's
+		// own height is still exactly what the measure layer reserved, and every swipe /
+		// context menu overlay portals to the body rather than overflowing this box.
+		<div
+			// The node whose HEIGHT the fold animates when a drill-down closes. The outer
+			// Box cannot serve: it is the row's positioning box (the controller resolves it
+			// by `data-nf-trace-row` for the row's own translate), and animating height
+			// there would fight that transform's node. Height-neutral data attribute.
+			data-nf-trace-block={row.key}
+			style={{ position: "relative", height: row.blockHeight, overflow: "hidden" }}
+		>
 			{/* The summary title row is the card-header's morph SOURCE on drill-down:
 			    once the card is in, its own header occupies the same visual slot, so
 			    painting both would double the Name · summary line. Markdown bodies
-			    (reasoning steps) keep the row — there is no card to take it over. */}
-			{row.cardMeasured ? null : titleRow}
+			    (reasoning steps) keep the row — there is no card to take it over.
+
+			    While CLOSING, the retained card still occupies that slot, so the summary
+			    row stays hidden until the transition ends. Painting both would double the
+			    line for the duration — and the drill morph is already sliding the incoming
+			    line into exactly this position. */}
+			{cardToPaint ? null : titleRow}
 
 			{/* Expanded markdown body (left-bordered, indented). */}
 			{row.expanded && row.body ? (
@@ -723,24 +908,63 @@ function TraceRowView({
 						opacity: 0.75,
 					}}
 				>
-					<RenderMarkdown measured={row.body} />
+					<RenderMarkdown
+						measured={row.body}
+						animateStreaming={animateStreaming}
+						animKeyBase={animKeyBase}
+						animScope={animScope}
+					/>
 				</Box>
 			) : null}
 
 			{/* Drilled-in tool card. The card fills the WHOLE row block from its top
 			    (full row width, no indent rail): the summary row above is gone, and
 			    the card's own header morphs into its place. The measure layer reserved
-			    `blockHeight === card.height` for exactly this box. */}
-			{row.expanded && row.cardMeasured ? (
+			    `blockHeight === card.height` for exactly this box.
+
+			    `cardToPaint` is the previous frame's node while CLOSING, kept so the block
+			    can be animated shut around it (see closingRowKeys).
+
+			    ⚠️ While closing it is stretched to FILL the block (`inset: 0`), not pinned
+			    to the height it used to have. Pinning it meant the shrinking block cut
+			    straight through the card's body, so its rounded border was sliced off and
+			    the reader saw a raw truncated edge instead of a box closing. Filling makes
+			    the card's own bordered `Paper` shrink WITH the block, so all four edges stay
+			    joined for the whole transition. The card's inner content keeps its own
+			    height and is clipped by that Paper — cropped, never scaled, so no text
+			    deforms. */}
+			{cardToPaint ? (
 				<Box
 					style={{
 						position: "absolute",
 						top: 0,
 						left: 0,
 						right: 0,
+						...(liveCard
+							? {}
+							: {
+									// Stretch to the animating block so the CARD's OWN border shrinks
+									// with it (`height: 100%` on the card below). The card's `Paper`
+									// wraps its content and has no height of its own, so without this
+									// the shrinking block cut straight through the card body and sliced
+									// its border off.
+									//
+									// ⚠️ This wrapper must NOT paint a border of its own. It did
+									// briefly, to carry the shrinking outline, and the result was TWO
+									// visible outlines during every close — the retained card still
+									// renders its own `Paper withBorder`. Stretching the card is the
+									// fix; a second border is not.
+									bottom: 0,
+									overflow: "hidden",
+									// The card fills this box, so its own `Paper` (and therefore its
+									// own single border) is what shrinks. `> *` rather than a prop:
+									// the card arrives as an already-built node from the shell's slot.
+									display: "grid",
+									gridTemplateRows: "100%",
+								}),
 					}}
 				>
-					{rowCard?.(row) ?? null}
+					{cardToPaint}
 				</Box>
 			) : null}
 		</div>

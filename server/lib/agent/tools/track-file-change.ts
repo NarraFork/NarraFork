@@ -13,12 +13,18 @@ import type { ToolContext } from "../types";
  *
  * @param filePath  Absolute (resolved) path to the changed file.
  * @param action    Which tool produced the change ("write" | "edit" | "bash").
+ * @param lineStats Lines added/removed, when the caller measured them. Omit for
+ *                  Bash, binary writes, or a diff that exceeded its budget — the
+ *                  column then records "not measured" rather than zero. This is
+ *                  the SAME value the tool puts in its result metadata, passed
+ *                  through so the header figure and the aggregate cannot disagree.
  */
 export async function trackFileChange(
 	ctx: ToolContext,
 	filePath: string,
 	action: "write" | "edit" | "bash" = "edit",
 	backend: ExecutionBackend = localBackend,
+	lineStats?: { added: number; removed: number } | null,
 ): Promise<void> {
 	// Team file-change tracking (subagents only)
 	if (ctx.parentNarratorId) {
@@ -47,6 +53,7 @@ export async function trackFileChange(
 			action,
 			toolName: action === "write" ? "Write" : action === "bash" ? "Bash" : "Edit",
 			toolUseId: ctx.currentToolUseId ?? null,
+			...(lineStats ? { lineStats } : {}),
 		});
 	} catch {
 		// Non-fatal — attribution must never block tool execution.

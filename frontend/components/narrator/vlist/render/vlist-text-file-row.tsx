@@ -7,26 +7,42 @@
  * Pure presentation at a caller-supplied height; no DOM measurement, no fetch.
  */
 
+import { formatFileSize } from "@shared/text-file-types";
 import { IMGGEN_GROUP_GAP, TEXT_FILE_ICON_SIZE } from "../measure/measure-media";
 import { typographyMetrics } from "../pretext-fonts";
 
-/** Local copy of shared/text-file-types formatFileSize (keeps render self-contained). */
-export function formatFileSize(bytes: number): string {
-	if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-	if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-	return `${bytes} B`;
-}
+/**
+ * Re-exported for callers that used to get it from this module's own copy.
+ *
+ * It used to BE a local copy "to keep render self-contained". That is no longer
+ * safe: `measure-media.textFileRowNaturalWidth` now measures this exact string to
+ * reserve the row's width, so two implementations that drift would reserve one
+ * width and paint another — the row would overflow its committed single line with
+ * nothing to signal it.
+ */
+export { formatFileSize };
 
 export function TextFileRow({
 	filename,
 	size,
 	height,
+	width,
 	onOpen,
 	openLabel,
 }: {
 	filename: string;
 	size: number | null;
 	height: number;
+	/**
+	 * Exact painted width (px) the measure layer reserved for this row
+	 * (`block.displayWidth`). It is what turns "the filename truncates" from an
+	 * intention into a fact: `text-overflow: ellipsis` needs a bounded box, and
+	 * `fit-content` inside an absolutely positioned parent is unbounded, so a long
+	 * filename used to wrap — past the fixed single-line height the measure layer
+	 * committed to — and collide with whatever the bubble painted underneath.
+	 * Omitted → the row shrink-wraps its content (short names, unchanged).
+	 */
+	width?: number;
 	/**
 	 * Open this attachment in a read-only file panel. HEIGHT-NEUTRAL: it only adds
 	 * a cursor + role to the SAME row box, so the measured `height` is unchanged.
@@ -43,7 +59,12 @@ export function TextFileRow({
 				alignItems: "center",
 				gap: IMGGEN_GROUP_GAP,
 				cursor: onOpen ? "pointer" : undefined,
-				width: "fit-content",
+				width: width != null ? width : "fit-content",
+				maxWidth: "100%",
+				// Belt-and-braces with the per-part rules below: whatever the browser's
+				// text metrics disagree with pretext about, it stays inside the reserved
+				// single-line box rather than spilling onto the row beneath.
+				overflow: "hidden",
 			}}
 			{...(onOpen
 				? {
@@ -77,7 +98,19 @@ export function TextFileRow({
 				<FileGlyph />
 			</div>
 			<span
-				style={{ font: typographyMetrics().font.bodyMedium, color: "var(--mantine-color-text)" }}
+				// The filename is the ONLY part allowed to give way: the row is reserved
+				// at a fixed single-line height, so a wrapped name would overflow a box
+				// the measure layer already committed to (and paint over the next row).
+				// `minWidth: 0` is what lets a flex item shrink below its content width.
+				title={filename}
+				style={{
+					font: typographyMetrics().font.bodyMedium,
+					color: "var(--mantine-color-text)",
+					minWidth: 0,
+					overflow: "hidden",
+					whiteSpace: "nowrap",
+					textOverflow: "ellipsis",
+				}}
 			>
 				{filename}
 			</span>

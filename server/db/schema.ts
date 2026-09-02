@@ -3312,16 +3312,56 @@ export const fileAttributions = sqliteTable(
 		filePath: text("file_path").notNull(),
 		/** Narrator that performed the change. Null for purely external edits. */
 		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "set null" }),
+		/**
+		 * User who performed the change, for `action: "human"`.
+		 *
+		 * Null for every agent and external action — those have no human author, and
+		 * `narratorId` already identifies the session. Set ONLY for an edit a person made
+		 * through NarraFork's own editor, which is the one case where "who did this" is a
+		 * user rather than a narrator. Without it a shared worktree cannot tell two
+		 * people's edits apart, since a human edit carries no narratorId either.
+		 *
+		 * `set null` on delete, like `narratorId`: losing the author is preferable to
+		 * losing the record that the file changed at all.
+		 */
+		userId: text("user_id").references(() => users.id, { onDelete: "set null" }),
 		/** Subagent type if the narrator was a subagent (explore/plan/general/review/...). */
 		subagentType: text("subagent_type"),
-		/** How the change was made. */
+		/**
+		 * How the change was made.
+		 *
+		 * `human` is a person editing through NarraFork's own editor. It is deliberately
+		 * NOT `external`: external means "something outside this platform wrote here, and
+		 * we only inferred it from a tree diff", whereas a human edit is a request this
+		 * server served, with a known author, a known path and a known window. Collapsing
+		 * the two would render a user's own save as an anonymous foreign change.
+		 */
 		action: text("action", {
-			enum: ["write", "edit", "bash", "external"],
+			enum: ["write", "edit", "bash", "external", "human"],
 		}).notNull(),
 		/** Tool name that produced the change (Write/Edit/Bash), if any. */
 		toolName: text("tool_name"),
 		/** Tool-use id linking back to narrator_tool_calls, if any. */
 		toolUseId: text("tool_use_id"),
+		/**
+		 * Lines added / removed by THIS modification.
+		 *
+		 * ⚠️ NULL means UNMEASURED, never zero. Four sources of NULL:
+		 *   - the diff exceeded its compute budget (see `countDiffLineStats`)
+		 *   - the file is binary
+		 *   - the change came from Bash (a shell command's per-file line delta is
+		 *     not knowable from the tool input)
+		 *   - the row predates this column (~54.6k existing write/edit rows)
+		 *
+		 * Readers MUST count the NULLs and say so, rather than letting `SUM` quietly
+		 * skip them: a total that omits half its inputs looks exactly like a complete
+		 * one. `0` is reserved for a real measurement of "changed no lines".
+		 *
+		 * The figures are CUMULATIVE per row; summing rows for one file yields churn
+		 * across edits, not the net difference from the original content.
+		 */
+		linesAdded: integer("lines_added"),
+		linesRemoved: integer("lines_removed"),
 		changedAt: text("changed_at").notNull(),
 	},
 	(table) => [

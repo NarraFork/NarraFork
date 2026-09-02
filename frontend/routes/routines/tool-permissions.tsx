@@ -61,6 +61,7 @@ const BUILTIN_TOOLS: ToolMeta[] = [
 	{ name: "Terminal", descKey: "tpToolDescTerminal", category: "optional" },
 	{ name: "Browser", descKey: "tpToolDescBrowser", category: "optional" },
 	{ name: "Recall", descKey: "tpToolDescRecall", category: "optional" },
+	{ name: "ScheduledTask", descKey: "tpToolDescScheduledTask", category: "optional" },
 ];
 
 function categoryColor(cat: PermCategory | "mcp"): string {

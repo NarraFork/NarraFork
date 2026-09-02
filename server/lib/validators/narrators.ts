@@ -5,7 +5,10 @@ import {
 	MIN_HANDLE_LENGTH,
 } from "@shared/narrator-handle";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
-import { MAX_EDIT_ATTACHMENTS_PER_TYPE } from "@shared/text-file-types";
+import {
+	MAX_EDIT_IMAGES_PER_MESSAGE,
+	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
+} from "@shared/text-file-types";
 import { z } from "zod";
 import { permissionModeSchema } from "../permission-modes";
 import { legacyRuleDeviceScopeSchema, pathFlavorSchema, ruleTargetSelectorSchema } from "./common";
@@ -271,10 +274,10 @@ export const updateBlacklistCmdSchema = z.object({
  */
 export const updateBufferedMessageSchema = z.object({
 	text: z.string().max(100_000).optional(),
-	keepImageIds: z.array(z.string().min(1)).max(MAX_EDIT_ATTACHMENTS_PER_TYPE).optional(),
+	keepImageIds: z.array(z.string().min(1)).max(MAX_EDIT_IMAGES_PER_MESSAGE).optional(),
 	keepTextFiles: z
 		.array(z.object({ index: z.number().int().min(0), filename: z.string().min(1) }))
-		.max(MAX_EDIT_ATTACHMENTS_PER_TYPE)
+		.max(MAX_EDIT_TEXT_FILES_PER_MESSAGE)
 		.optional(),
 });
 

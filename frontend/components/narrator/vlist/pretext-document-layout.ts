@@ -1,4 +1,8 @@
 import type { PretextLayoutIndex, PretextLayoutManifest } from "@shared/pretext-layout";
+import {
+	type ContentBlockLike,
+	groupReasoningRuns,
+} from "@shared/pretext-layout/reasoning-segments";
 import { segmentMessages } from "../message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits, type RenderUnit } from "../render-units";
@@ -42,6 +46,8 @@ export interface BuildPretextDocumentLayoutOptions {
 	showOriginal?: (key: string) => boolean;
 	/** Resolve whether a subagent card's prompt body is open. */
 	isPromptOpen?: (key: string) => boolean;
+	/** Reader expanded a subagent card's file-change list (its own fold). */
+	isFileChangesOpen?: (key: string) => boolean;
 	recentMessageIds?: ReadonlySet<string>;
 	resolveRecentMessageIds?: (messages: readonly NarratorMsg[]) => ReadonlySet<string>;
 	labels?: Record<string, string>;
@@ -200,6 +206,66 @@ function buildSourceResolver(
 	};
 }
 
+/**
+ * First block index of the reasoning RUN containing this folded item.
+ *
+ * `reasoningStepUnitId` keys a step on its run's FIRST block, so a run's later blocks
+ * must resolve to that same index or their steps would be labelled under a group id
+ * nothing else uses. Mirrors `reasoningRowIdentity` in the adapter.
+ */
+function reasoningRunStartBlockIndex(item: {
+	msg?: { contentJson?: unknown } | null;
+	blockIndex?: number;
+}): number | null {
+	const blockIndex = item.blockIndex ?? 0;
+	const blocks = item.msg?.contentJson;
+	if (!Array.isArray(blocks) || blocks.length === 0) return blockIndex;
+	const { runs } = groupReasoningRuns(blocks as ContentBlockLike[]);
+	for (const run of runs) {
+		if (run.indices.includes(blockIndex)) return run.startIndex;
+	}
+	return blockIndex;
+}
+
+/**
+ * The activity group a spec's `unitId` belongs to, or undefined for none.
+ *
+ * Tool identities are registered whole; reasoning identities are registered per RUN
+ * (`reason-<msg>-b<run>`) because the step ordinal is not known when the map is built,
+ * so a step id has its `-s<n>` suffix stripped before the lookup. Anything not in the
+ * map — a body, a bubble, a lone call — correctly keeps its own box.
+ */
+function resolveMorphGroupId(
+	unitId: string | undefined,
+	groups: ReadonlyMap<string, string>,
+): string | undefined {
+	if (!unitId) return undefined;
+	const direct = groups.get(unitId);
+	if (direct) return direct;
+	const stepSuffix = unitId.lastIndexOf("-s");
+	if (stepSuffix > 0) return groups.get(unitId.slice(0, stepSuffix));
+	return undefined;
+}
+
+/**
+ * The group of a spec whose identities live on its nested STEP rows.
+ *
+ * Takes the first step that resolves: all steps of one run belong to the same run, so
+ * they share a group by construction, and reading one is enough.
+ */
+function resolveMorphGroupIdFromSteps(
+	data: unknown,
+	groups: ReadonlyMap<string, string>,
+): string | undefined {
+	const steps = (data as { steps?: { unitId?: string }[] } | undefined)?.steps;
+	if (!Array.isArray(steps)) return undefined;
+	for (const step of steps) {
+		const groupId = resolveMorphGroupId(step?.unitId, groups);
+		if (groupId) return groupId;
+	}
+	return undefined;
+}
+
 export function buildPretextDocumentLayout(
 	messages: readonly NarratorMsg[],
 	options: BuildPretextDocumentLayoutOptions,
@@ -241,6 +307,62 @@ export function buildPretextDocumentLayout(
 				}
 			: { kind: "segment", seg: unit.seg as unknown as AdapterSegment },
 	);
+	/**
+	 * Which activity group each morphable identity belongs to — computed at EVERY level.
+	 *
+	 * The morph window judges a group's members on the group's box, and that only works
+	 * if both levels agree on the membership. `renderUnits` above cannot answer it: at
+	 * L3+ it is deliberately ungrouped (`options.lod <= 2`), so nothing there records
+	 * that a stretch of cards is one group. Running the grouper a second time with
+	 * folding forced ON yields the same membership at every level — it is pure logic
+	 * over the same segments, and its output is used ONLY to label specs, never to
+	 * render.
+	 *
+	 * At L1/L2 this repeats work `renderUnits` already did. That is a small cost (the
+	 * grouper is a linear pass over segments, no measurement) paid to keep one code path
+	 * for both levels: deriving the labels from `renderUnits` when grouped and from this
+	 * when not would be two implementations that must agree, which is the shape of bug
+	 * this whole change exists to remove.
+	 */
+	const morphGroupIdByUnitId = new Map<string, string>();
+	{
+		const foldedUnits = groupRenderUnits(segments, true, {
+			keepToolUseIds:
+				latestSpecTasksToolUseId != null ? new Set([latestSpecTasksToolUseId]) : undefined,
+		});
+		for (const [index, unit] of foldedUnits.entries()) {
+			if (unit.kind !== "activity") continue;
+			// A group of one has nothing to co-admit, and labelling it would only make the
+			// element judged on a box identical to its own.
+			if (unit.items.length < 2) continue;
+			const groupId = `mg-${unit.sourceMessages[0]?.id ?? "unknown"}-${index}`;
+			for (const item of unit.items) {
+				if (item.kind === "tool") {
+					const toolUseId = item.tc?.toolUseId;
+					// Mirrors `toolItemKey`, including the retry disambiguator, so the label
+					// lands on the same identity the adapter emits as `unitId`.
+					if (toolUseId) {
+						morphGroupIdByUnitId.set(
+							item.dedupeSuffix ? `tool-${toolUseId}#${item.dedupeSuffix}` : `tool-${toolUseId}`,
+							groupId,
+						);
+					}
+					continue;
+				}
+				// Reasoning is addressed per STEP (`reason-<msg>-b<run>-s<step>`) and the step
+				// count is only known after parsing, so the RUN is registered instead and the
+				// step suffix is stripped when looking up. Runs are keyed by their first block
+				// index — the same value `reasoningStepUnitId` uses — so two runs in one
+				// message stay distinct.
+				const messageId = item.msg?.id;
+				if (!messageId) continue;
+				const runStart = reasoningRunStartBlockIndex(item);
+				if (runStart != null) {
+					morphGroupIdByUnitId.set(`reason-${messageId}-b${runStart}`, groupId);
+				}
+			}
+		}
+	}
 	const resolveSource = buildSourceResolver(renderUnits, sourceMessages);
 	const recentMessageIds =
 		options.recentMessageIds ??
@@ -252,17 +374,30 @@ export function buildPretextDocumentLayout(
 	const documentRevision = options.labelsRevision
 		? `${options.documentRevision}~l:${options.labelsRevision}`
 		: options.documentRevision;
-	return {
-		...buildPretextLayoutManifest({
-			...options,
-			documentRevision,
-			recentMessageIds,
-			// Frozen per build: the fold gates above already consumed this same id,
-			// so the adapter's per-card flag always agrees with the grouping.
-			resolveLatestSpecTasksToolUseId: () => latestSpecTasksToolUseId,
-			renderUnits: adapterUnits,
-			resolveSource,
-		}),
+	const built = buildPretextLayoutManifest({
+		...options,
+		documentRevision,
+		recentMessageIds,
+		// Frozen per build: the fold gates above already consumed this same id,
+		// so the adapter's per-card flag always agrees with the grouping.
+		resolveLatestSpecTasksToolUseId: () => latestSpecTasksToolUseId,
 		renderUnits: adapterUnits,
-	};
+		resolveSource,
+	});
+	// Label specs with their activity group AFTER the manifest, so the retry
+	// disambiguator it applies to `unitId` is already in place and the lookup keys
+	// match. Height-neutral: only the morph admission window reads this.
+	if (morphGroupIdByUnitId.size > 0) {
+		for (const item of built.items) {
+			const groupId =
+				resolveMorphGroupId(item.spec.unitId, morphGroupIdByUnitId) ??
+				// A `reasoning-steps` trace carries no `unitId` of its own — the identities
+				// live on its STEP rows — so the container has to be labelled from them or an
+				// interleaved run stays ungrouped while the tools around it are grouped, which
+				// is the split the group box exists to prevent.
+				resolveMorphGroupIdFromSteps(item.spec.data, morphGroupIdByUnitId);
+			if (groupId) item.spec.morphGroupId = groupId;
+		}
+	}
+	return { ...built, renderUnits: adapterUnits };
 }

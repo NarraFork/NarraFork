@@ -175,6 +175,15 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// rebuild serves the pre-takeover payload and the header stays silent about why
 	// the session stopped.
 	if (d.isTakenOver === true) rev += "|tv:1";
+	// `+N -N` line counts. Height-neutral (a nowrap span in the fixed header row),
+	// keyed for the same reason `timeoutMs` and `isTakenOver` are: it is PAINTED from
+	// the cached payload and can APPEAR while nothing else in the key moves. Two such
+	// moments exist — an on-demand payload fetch resolving a truncated Edit (which
+	// only moves `truncatedLeafCount`, and would be a hit-with-stale-figure if that
+	// were ever relaxed) and a live patch landing the tool's metadata on an
+	// already-terminal status. Omitting this would keep the previous numbers on
+	// screen, which is worse than showing none: they look authoritative.
+	rev += diffStatsRevision(d.diffStats);
 	// A system card's OWN body text (`system-text` and friends paint `data.text`
 	// as pre-wrap, so its height is a function of how it wraps). `detailTextRevision`
 	// below only reaches `data.detail`, which a system card does not have.
@@ -193,6 +202,21 @@ export function extractDataRevision(data: unknown): string | undefined {
 	rev += subagentRevision(d);
 	rev += traceRevision(d);
 	return rev || undefined;
+}
+
+/**
+ * Cache-key fragment for a `+N -N` figure, or "" when there is none.
+ *
+ * Shared by the card-level and row-level revisions so the two cannot disagree
+ * about what counts as a change. `added`/`removed` are keyed as VALUES rather than
+ * as a mere presence flag: a corrected count (a fetched payload replacing a
+ * locally-derived one) keeps the field present while changing what it says.
+ */
+function diffStatsRevision(value: unknown): string {
+	if (value == null || typeof value !== "object") return "";
+	const stats = value as { added?: unknown; removed?: unknown };
+	if (typeof stats.added !== "number" || typeof stats.removed !== "number") return "";
+	return `|df:${stats.added}/${stats.removed}`;
 }
 
 /**
@@ -247,6 +271,8 @@ function traceRevision(d: Record<string, unknown>): string {
 		// a gate resolving does not necessarily move the tool's own status, and a stale
 		// entry would keep a settled row purple.
 		if (typeof r.reflectionStatus === "string") rev += `|trs:${r.reflectionStatus}`;
+		// Per-row `+N -N`, keyed for the same reason the card-level one above is.
+		rev += diffStatsRevision(r.diffStats);
 		// The row's duration is height-neutral but PAINTED from the cached payload, so
 		// it needs the same treatment `timeoutMs` gets above. `status` normally moves
 		// with it (running → success arrives together with `durationMs`); this keys the
@@ -362,10 +388,57 @@ function subagentRevision(d: Record<string, unknown>): string {
 	if (typeof d.resultText === "string") rev += `|gr:${textSignature(d.resultText)}`;
 	if (typeof d.resultPreview === "string") rev += `|gv:${textSignature(d.resultPreview)}`;
 	if (d.hasResolveOverride === true) rev += "|gx:1";
+	// File changes. HEIGHT-AFFECTING (unlike the tool card's `diffStats`): this is a
+	// row list, so the count decides the block's height, and the expand flag changes
+	// how many rows are drawn. The per-row content is keyed too because the rows are
+	// painted from the cached payload — a corrected figure or a reordered list would
+	// otherwise keep drawing the previous numbers.
+	rev += subagentFileChangesRevision(d.fileChanges);
+	if (d.fileChangesExpanded === true) rev += "|gfx:1";
 	// Permission blocks force expansion and add their own bodies; presence + count
 	// is enough because the bodies themselves are keyed by the permission measure.
 	if (d.selfPermission != null) rev += "|gf:1";
 	if (Array.isArray(d.pendingPermissions)) rev += `|gz:${d.pendingPermissions.length}`;
+	return rev;
+}
+
+/**
+ * Cache-key fragment for a subagent card's file-change list.
+ *
+ * The row COUNT is height-bearing; the tallies and per-row figures are painted from
+ * the cached payload and so need keying for the same reason `recentCallSummaries`
+ * does. Bounded work: the list is already capped by the server's aggregate limit, and
+ * each row contributes a short path plus two integers.
+ */
+function subagentFileChangesRevision(value: unknown): string {
+	if (value == null || typeof value !== "object") return "";
+	const changes = value as {
+		files?: unknown;
+		totalFiles?: unknown;
+		totalUnmeasured?: unknown;
+		bashTouchedCount?: unknown;
+		countsTruncated?: unknown;
+	};
+	if (!Array.isArray(changes.files)) return "";
+	let rev = `|gfc:${changes.files.length}`;
+	if (typeof changes.totalFiles === "number") rev += `|gft:${changes.totalFiles}`;
+	if (typeof changes.totalUnmeasured === "number") rev += `|gfu:${changes.totalUnmeasured}`;
+	if (typeof changes.bashTouchedCount === "number") rev += `|gfb:${changes.bashTouchedCount}`;
+	if (changes.countsTruncated === true) rev += "|gfr:1";
+	for (const file of changes.files) {
+		if (file == null || typeof file !== "object") continue;
+		const f = file as {
+			filePath?: unknown;
+			linesAdded?: unknown;
+			linesRemoved?: unknown;
+			editCount?: unknown;
+		};
+		if (typeof f.filePath === "string") rev += `|gfp:${f.filePath}`;
+		// Written as `a/r` so a corrected figure moves the key; `null` (unmeasured) is
+		// deliberately distinct from `0`, matching the data contract.
+		rev += `|gfl:${String(f.linesAdded ?? "n")}/${String(f.linesRemoved ?? "n")}`;
+		if (typeof f.editCount === "number") rev += `|gfe:${f.editCount}`;
+	}
 	return rev;
 }
 

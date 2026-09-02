@@ -27,6 +27,17 @@ type Key =
 	// Ruler's deprecation notice has been acknowledged. Not per-project: the fact that
 	// the view is deprecated is global, so being told once is enough.
 	| "narrafork_ruler_deprecation_ack"
+	// Unified morph driver (visual-state + single rAF loop) instead of the keyframe
+	// planners. Now DEFAULT ON, after the browser comparison this gate existed for: the
+	// keyframe path loses a whole activity group's animation whenever the two levels'
+	// geometries disagree, which the unified path fixes structurally (identity-based
+	// pairing + group-anchored admission) rather than per-case.
+	//
+	// The switch stays so the old path remains reachable if a regression turns up in use;
+	// removing it is a separate, later step — see the rewrite plan's §4. Note that flipping
+	// this default only affects readers with NOTHING stored: anyone who toggled it by hand
+	// keeps their stored value either way.
+	| "narrafork_unified_morph"
 	// TEMPORARY debug surface — see components/narrator/mock/README-REMOVAL.md.
 	| "narrafork_mock_stream";
 
@@ -89,6 +100,9 @@ const DEFAULT_TRUE: ReadonlySet<Key> = new Set([
 	// The LOD gesture is existing behavior, so nothing-stored must keep it working;
 	// the switch exists to opt OUT.
 	"narrafork_lod_alt_gesture",
+	// The unified morph driver is now the intended path; the switch exists to opt OUT
+	// while the keyframe planners are still present. See the key's note above.
+	"narrafork_unified_morph",
 ]);
 
 /**

@@ -84,7 +84,7 @@ const PATHS_PER_SHARD = 50;
 const MAX_QUERY_PATHS = 400;
 
 /** How the change was made. */
-export type ModificationAction = "write" | "edit" | "bash" | "external";
+export type ModificationAction = "write" | "edit" | "bash" | "external" | "human";
 
 /**
  * Who made a change.
@@ -230,15 +230,18 @@ export interface WorkspaceModificationViewOptions {
 }
 
 /**
- * An action is precisely attributable only when the write window was serialized.
+ * An action is precisely attributable only when its writes were DECLARED up front.
  *
- * `write`/`edit` hold the workspace write lock for their whole window, so they are
- * always exact. `bash` is only serialized for short targeted commands, and that
- * decision is not stored per row, so it is treated as imprecise here rather than
- * claimed falsely. `external` has no actor at all.
+ * Precision comes from declaration, not from locking — there is no workspace write
+ * lock (see the module header of `worktree-write-claims.ts`). `write`/`edit` name
+ * their target path before executing, so the tree delta can be intersected with it;
+ * `human` likewise names exactly the one file the user saved. `bash` cannot enumerate
+ * its writes ahead of time, so its owned set is derived by subtracting neighbours'
+ * declarations and is treated as imprecise here rather than claimed falsely.
+ * `external` has no actor at all.
  */
 function isPreciseAction(action: ModificationAction): boolean {
-	return action === "write" || action === "edit";
+	return action === "write" || action === "edit" || action === "human";
 }
 
 /** Resolve post-change workspace boundaries for the tool calls in this window. */
@@ -502,7 +505,14 @@ export async function getWorkspaceModificationView(
 		if (action === "external") group.hasExternalChange = true;
 		if (!precise) group.hasImpreciseAttribution = true;
 		// A tool action with no narrator means the session was deleted and the FK nulled.
-		if (!row.narratorId && action !== "external") group.hasDeletedActor = true;
+		//
+		// `human` is excluded alongside `external` because it legitimately carries no
+		// narratorId — a person is not a session. Without this it would flag every human
+		// edit as "the actor was deleted", which is a warning about data loss that never
+		// happened.
+		if (!row.narratorId && action !== "external" && action !== "human") {
+			group.hasDeletedActor = true;
+		}
 		// An id that resolved to a missing row is the same situation, seen from a row
 		// that still carries the id.
 		if (row.narratorId && !actor.exists) group.hasDeletedActor = true;
@@ -537,6 +547,14 @@ export async function findImpreciseChanges(
 	externalCount: number;
 	otherActorCount: number;
 	unserializedCount: number;
+	/**
+	 * Human edits in the window, which a workspace rollback would also discard.
+	 *
+	 * Counted separately from `otherActorCount` because that one keys off `narratorId`
+	 * and a human edit carries none, so it would otherwise pass through this check
+	 * entirely — the user's own saved work would be reverted without a warning.
+	 */
+	humanCount: number;
 	sampleFilePaths: string[];
 }> {
 	const deviceId = options.deviceId ?? LOCAL_DEVICE_ID;
@@ -563,6 +581,7 @@ export async function findImpreciseChanges(
 	let externalCount = 0;
 	let otherActorCount = 0;
 	let unserializedCount = 0;
+	let humanCount = 0;
 	const samples = new Set<string>();
 
 	for (const row of rows) {
@@ -575,6 +594,13 @@ export async function findImpreciseChanges(
 			// Bash is only serialized for short targeted commands, and that is not
 			// recorded per row, so its change set is not provably its own.
 			unserializedCount++;
+			imprecise = true;
+		} else if (action === "human") {
+			// Precisely attributed (the user named the file) yet still a hazard HERE: this
+			// function answers "would a rollback of this window destroy work that is not the
+			// target's", and a person's own save is exactly that. The `excludeNarratorId`
+			// check below cannot catch it, since a human edit has no narratorId to compare.
+			humanCount++;
 			imprecise = true;
 		}
 		if (
@@ -589,10 +615,11 @@ export async function findImpreciseChanges(
 	}
 
 	return {
-		hasImprecise: externalCount + otherActorCount + unserializedCount > 0,
+		hasImprecise: externalCount + otherActorCount + unserializedCount + humanCount > 0,
 		externalCount,
 		otherActorCount,
 		unserializedCount,
+		humanCount,
 		sampleFilePaths: [...samples],
 	};
 }

@@ -500,6 +500,22 @@ interface NarratorWSCallbacks {
 		linesAdded: number;
 		linesRemoved: number;
 	}) => void;
+	/**
+	 * Individual worktree paths changed, so a file tree can patch the affected
+	 * directories instead of refetching.
+	 *
+	 * Paths are worktree-RELATIVE. Only delivered while the server's native watcher is
+	 * running (it is opt-in); the default polling fallback observes no paths, so a
+	 * consumer must treat this as an accelerator over its own on-demand fetching.
+	 *
+	 * `truncated` means the batch hit the watcher's cap and `changes` is a sample
+	 * rather than the whole set — invalidate broadly instead of applying it literally.
+	 */
+	onWorkspacePathsChanged?: (data: {
+		chapterId: string;
+		changes: { path: string; kind: "added" | "updated" | "deleted" }[];
+		truncated: boolean;
+	}) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
 	onQuotaBalance?: (quotaBalance: string | null, detailedQuotaBalance?: string | null) => void;
 	onPaymentRequired?: (info: {
@@ -1168,6 +1184,23 @@ export function useNarratorWS(
 							});
 						}
 						break;
+					case "workspace_paths_changed": {
+						// An empty `changes` with `truncated` set is meaningful (everything is
+						// suspect), so the array's emptiness is not a reason to skip the callback.
+						const rawChanges = Array.isArray(data.changes) ? data.changes : [];
+						const changes = rawChanges.flatMap((entry) => {
+							const item = entry as { path?: unknown; kind?: unknown };
+							if (typeof item.path !== "string" || !item.path) return [];
+							const kind = item.kind === "added" || item.kind === "deleted" ? item.kind : "updated";
+							return [{ path: item.path, kind } as const];
+						});
+						callbackOwner.callbacks.onWorkspacePathsChanged?.({
+							chapterId: (data.chapterId as string) ?? "",
+							changes,
+							truncated: data.truncated === true,
+						});
+						break;
+					}
 					case "metering":
 						if (!data.isSubagent) {
 							callbackOwner.callbacks.onMetering?.(

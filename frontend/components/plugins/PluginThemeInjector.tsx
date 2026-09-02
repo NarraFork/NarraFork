@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { pluginThemeKey, usePluginThemePref, usePluginThemes } from "../../hooks/usePluginThemes";
+import { notifyPluginThemeChanged } from "./host-presentation";
 
 /** The `<style>` element id that holds all enabled plugin theme rules. */
 export const PLUGIN_THEME_STYLE_ELEMENT_ID = "plugin-themes";
@@ -43,7 +44,14 @@ export function PluginThemeInjector() {
 			document.head.appendChild(style);
 		}
 		const css = themes.map((theme) => theme.css).join("\n");
-		if (style.textContent !== css) style.textContent = css;
+		if (style.textContent !== css) {
+			style.textContent = css;
+			// Plugin panels resolve their tokens from computed style, and this rewrite can change
+			// what those resolve to while `data-plugin-theme` keeps the same value — an attribute
+			// observer sees nothing. Announce it explicitly or open panels keep the old colours
+			// until some unrelated change happens to trigger a re-read.
+			notifyPluginThemeChanged();
+		}
 	}, [themes]);
 
 	// Apply / clear the active theme attribute, falling back when it vanishes.

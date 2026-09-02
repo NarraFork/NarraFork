@@ -96,13 +96,26 @@ export function buildPretextLayoutManifest(
 	// Deduplicate item keys: provider retries can produce identical tool_use IDs
 	// across adjacent assistant messages, leading to duplicate spec.key values.
 	// We disambiguate in-place so both sources[].itemKey and item.spec.key stay in sync.
+	//
+	// `unitId` is suffixed with the SAME index, because it is the cross-level morph
+	// identity (`unitId ?? key`, see vlist-lod-morph.ts) and the low-LOD side already
+	// disambiguates a retry on its own: the activity fold appends `#<n>` via
+	// `dedupeSuffix` (segment-adapter), giving rows `tool-x` and `tool-x#1`. Leaving
+	// the two cards here both claiming a bare `tool-x` made the retry's SECOND call
+	// unpairable — the planner keys on a Map, so the duplicate collapsed and one card
+	// silently lost its animation. Suffixing keeps the two sides symmetric.
+	//
+	// The suffix must match the fold's (`#1` for the second copy), not `#dup1`: these
+	// are two renderings of one call and the strings have to be equal to pair.
 	const keyCounts = new Map<string, number>();
 	for (const item of computed.items) {
 		const key = item.spec.key;
 		const prev = keyCounts.get(key) ?? 0;
 		if (prev > 0) {
-			const deduped = `${key}#dup${prev}`;
-			item.spec.key = deduped;
+			item.spec.key = `${key}#dup${prev}`;
+			// Only a spec that HAS a unitId gets one back; absent stays absent so the
+			// planner keeps falling back to `key` for bodies, bubbles and dividers.
+			if (item.spec.unitId) item.spec.unitId = `${item.spec.unitId}#${prev}`;
 		}
 		keyCounts.set(key, prev + 1);
 	}

@@ -121,12 +121,14 @@ import {
 import { installVListCopyHandler } from "./vlist-copy-text";
 import {
 	buildDrillSnapshots,
+	DRILL_MORPH_X_OFFSET,
 	type DrillRowSnapshot,
 	diffDrillSnapshots,
 } from "./vlist-drill-morph";
 import {
-	createDrillMorphController,
-	prefersReducedMotion as prefersReducedMotionDrill,
+	drillBorderKeyframesFrom,
+	drillMorphKeyframesFrom,
+	drillTailKeyframesFrom,
 } from "./vlist-drill-morph-motion";
 import {
 	hasEditableTextBlock,
@@ -141,15 +143,21 @@ import {
 	isFoldCaptureUsable,
 	planFoldFrameMotion,
 	planFoldMotion,
+	planFoldNestedRowMotion,
+	planFoldNestedRowResize,
 } from "./vlist-fold-animation";
 import {
 	captureFoldFrameGeometry,
 	captureFoldGeometry,
-	createFoldMotionController,
-	prefersReducedMotion,
+	captureFoldNestedRows,
+	foldRowKeyframes,
+	frameKeyframes,
+	nestedResizeKeyframes,
+	shiftKeyframes,
 } from "./vlist-fold-motion";
 import {
 	resolveHeadTrim,
+	resolveStreamingClearedTrimEdge,
 	retainKeysInPlace,
 	TRIM_FILL_COOLDOWN_MS,
 	trimClockNow,
@@ -167,12 +175,14 @@ import {
 import { type InjectionNavigation, injectInjectionBubbleChrome } from "./vlist-injection-header";
 import {
 	createVListInteractionState,
+	isFileChangesOpenRow,
 	isFullPayloadRequestedRow,
 	isPromptOpenRow,
 	isTraceRowExpanded,
 	markVListFullPayloadRequested,
 	resetVListInteractionStateForLod,
 	setVListExpanded,
+	toggleVListFileChangesOpen,
 	toggleVListLodUserOverride,
 	toggleVListPromptOpen,
 	toggleVListRow,
@@ -200,10 +210,24 @@ import {
 	type LodElementSnapshot,
 	type LodElementSource,
 } from "./vlist-lod-morph";
+import { lodMorphKeyframesFrom } from "./vlist-lod-morph-motion";
+import { createMorphDriver, type MorphDriver } from "./vlist-morph-driver";
 import {
-	createLodMorphController,
-	prefersReducedMotion as prefersReducedMotionLod,
-} from "./vlist-lod-morph-motion";
+	admitPair,
+	initialStateFor,
+	type MorphElement,
+	planMorphTargets,
+} from "./vlist-morph-plan";
+import {
+	createMotionScheduler,
+	drillScope,
+	frameScope,
+	LOD_MOTION_DURATION_MS,
+	lodScope,
+	type MotionOp,
+	prefersReducedMotion,
+	rowScope,
+} from "./vlist-motion-scheduler";
 import { usePermissionSlots } from "./vlist-permission-bridge";
 import type { VListItem } from "./vlist-pipeline";
 import { createPointerDragTracker } from "./vlist-pointer-drag";
@@ -245,7 +269,7 @@ import {
 	useSpecCarryoverActions,
 } from "./vlist-spec-carryover-actions";
 import { isSpecTaskLiveItem, resolveSpecTaskLiveGate } from "./vlist-spec-task-live";
-import { resolveStreamAnimExtra } from "./vlist-stream-anim-extra";
+import { nextStreamAnimEpoch, resolveStreamAnimExtra } from "./vlist-stream-anim-extra";
 import { resolveSwipeAnchorRowIndex } from "./vlist-swipe-anchor";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { buildToolMetaIndex, type VListToolMeta } from "./vlist-tool-meta";
@@ -261,6 +285,28 @@ import {
 	type VListUserMarker,
 } from "./vlist-user-markers";
 import { mergePinnedRowIndices, resolvePinnedRowIndices } from "./vlist-virtualization";
+import { createVisualStateStore } from "./vlist-visual-state";
+
+/**
+ * Reuse the keyframe path's element list for the unified planner.
+ *
+ * Only the unit-box field name differs (`groupBox` → `unitBox`); `MorphElement` needs no
+ * `unitAnchored` flag because it always prefers a unit box when one is present. Module-level
+ * so the per-frame roll-forward does not re-allocate a closure on every commit.
+ */
+function toMorphElements(src: readonly LodElementSource[]): MorphElement[] {
+	return src.map((el) => ({
+		unitId: el.unitId,
+		key: el.key,
+		kind: el.kind,
+		top: el.top,
+		height: el.height,
+		clip: el.clip ?? null,
+		nested: el.nested,
+		unitBox: el.groupBox ?? null,
+	}));
+}
+
 import {
 	bucketViewportHeight,
 	isExternalGeometryChange,
@@ -536,6 +582,23 @@ export function buildExactListLayout(
  * The returned value is never smaller than the row's own height, and the last row
  * extends to the bottom of the canvas (absorbing the trailing padding).
  */
+/**
+ * Memo term for one trace's closing rows (see `closingRows`).
+ *
+ * Sorted so the string is order-independent — a Set's iteration order follows insertion,
+ * and two identical closing sets built in different orders must not look like a change.
+ * Empty string when nothing in this trace is closing, which is the overwhelming majority
+ * of rows at any moment.
+ */
+export function closingRowSig(
+	closing: ReadonlyMap<string, ReadonlySet<string>>,
+	key: string,
+): string {
+	const rows = closing.get(key);
+	if (!rows || rows.size === 0) return "";
+	return [...rows].sort().join(",");
+}
+
 export function resolveRowHitHeight(
 	items: readonly LaidOutItem[],
 	index: number,
@@ -998,7 +1061,10 @@ export function rowInteractionSig(state: VListInteractionState, key: string): st
 	const traceRows = state.expandedTraceRows.get(key);
 	const traceRowsSig = traceRows && traceRows.size > 0 ? [...traceRows].sort().join(",") : "";
 	const promptOpen = state.promptOpen.has(key) ? 1 : 0;
-	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${promptOpen}`;
+	// The file-list fold changes how many rows are DRAWN, so it must move the opts
+	// signature — otherwise expanding it would not re-measure the card.
+	const fileChangesOpen = state.fileChangesOpen.has(key) ? 1 : 0;
+	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${promptOpen}:${fileChangesOpen}`;
 }
 
 /**
@@ -1083,6 +1149,8 @@ interface RowToggles {
 	 * inside the card (parity with the chunked SubagentCard's `showPrompt`).
 	 */
 	onTogglePrompt: () => void;
+	/** Expand / collapse a subagent card's file-change list (its own fold). */
+	onToggleFileChanges: () => void;
 }
 
 /**
@@ -1153,6 +1221,15 @@ interface ExactRowProps {
 	 * surface. Referentially stable per key so the memo below keeps skipping.
 	 */
 	rowInteraction?: TraceRowInteractionSlot;
+	/**
+	 * Row keys inside THIS trace whose drill-down is closing right now.
+	 *
+	 * Handed to the render layer so a closing card keeps painting until the block has
+	 * finished animating shut around it; without it React unmounts the card in the frame
+	 * the fold commits and it vanishes instead of closing. Changes are visible to the memo
+	 * through `interactionSig` (see `closingRowSig`).
+	 */
+	closingRowKeys?: ReadonlySet<string>;
 	/** Panel narrator id — injected into extra so media/tool details load images. */
 	narratorId: string;
 	/**
@@ -1302,6 +1379,14 @@ interface ExactRowProps {
 	 */
 	animateStreaming?: boolean;
 	/**
+	 * Generation of the current mount, for the fade's animation-store scope.
+	 *
+	 * Part of the row's memo signature by construction (it is a prop), which matters:
+	 * the epoch changes exactly once per mount / narrator switch, and the frame that
+	 * carries the new value is the one that must seal.
+	 */
+	streamAnimMountEpoch?: number;
+	/**
 	 * This row's Dynamic Spec task state is LIVE: it is the newest spec-task surface
 	 * in the document AND the narrator is running, so its `doing` row is describing
 	 * work in flight and may animate.
@@ -1331,6 +1416,7 @@ const ExactRow = memo(
 		renderLabels,
 		interaction,
 		rowInteraction,
+		closingRowKeys,
 		onOpenFilePanel,
 		openAttachmentLabel,
 		injectionNoteLabel,
@@ -1358,6 +1444,7 @@ const ExactRow = memo(
 		onOpenAskInPassingTarget,
 		viewControls,
 		animateStreaming,
+		streamAnimMountEpoch,
 		specTaskLive,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
@@ -1427,6 +1514,11 @@ const ExactRow = memo(
 				? toggles.onToggleRow
 				: (rowIndex: number) => toggles.onToggleRow(rowIndex);
 			extra.onToggleRow = toggleRow;
+			// Rows whose drill-down is closing right now: the render layer keeps painting
+			// their card so the block can be animated shut around it (see closingRowKeys).
+			// Absent for the overwhelmingly common case of no closing row, which keeps this
+			// out of every trace's props while nothing is closing.
+			if (closingRowKeys && closingRowKeys.size > 0) extra.closingRowKeys = closingRowKeys;
 			// Folded traces: give each ROW inside the trace its own menu / selection.
 			if (rowInteraction) extra.rowInteraction = rowInteraction;
 			// Drill-down: a row the reader opened nests a REAL tool card, dispatched
@@ -1624,6 +1716,7 @@ const ExactRow = memo(
 			kind,
 			specKey: item.spec.key,
 			narratorId,
+			...(streamAnimMountEpoch != null ? { mountEpoch: streamAnimMountEpoch } : {}),
 		});
 		if (streamAnim) Object.assign(extra, streamAnim);
 		// Subagent card's in-card "open full session" button. RenderSubagent has
@@ -1638,6 +1731,7 @@ const ExactRow = memo(
 			// nothing. It is a SEPARATE channel from onToggle (which folds the whole
 			// card), matching the chunked SubagentCard's own `showPrompt`.
 			extra.onTogglePrompt = toggles.onTogglePrompt;
+			extra.onToggleFileChanges = toggles.onToggleFileChanges;
 		}
 		// Long-running bash / MCP tools get the header terminate control (parity with
 		// the chunked InlineTerminateControl). Only cards that can actually be stopped
@@ -1798,6 +1892,14 @@ const ExactRow = memo(
 				}}
 			>
 				<div
+					// The row's INNER content box, addressable so the fold's `clip-path` can
+					// play on it. An inset is measured from the bottom of the node it plays on,
+					// and only this box is the layout's `height` tall; the outer row box is
+					// `hitHeight` (own height + the gap to the next row), so clipping there
+					// starts a gap's worth of pixels below the card's real bottom edge and
+					// uncovers content that should still be hidden. Height-neutral (a data
+					// attribute), and never threaded through spec.opts.
+					data-nf-row-body={item.spec.key}
 					style={{
 						width: contentWidth,
 						margin: "0 auto",
@@ -2022,6 +2124,12 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		// gates the streaming tail's per-grapheme fade-in. Reactive so toggling the
 		// setting takes effect without a reload.
 		const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
+		/**
+		 * Unified morph driver instead of the keyframe planners. Default OFF — see the key's
+		 * note in `useLocalPref.ts` on why this needs a real browser comparison before it
+		 * becomes the default.
+		 */
+		const [unifiedMorph] = useLocalPref("narrafork_unified_morph");
 		// Reading-width preference: OFF (default) lets the content column fill the
 		// viewport like the chunked path; ON caps it at a centered reading width.
 		const [centeredColumn] = useLocalPref("narrafork_narrator_centered_column");
@@ -2318,6 +2426,10 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			(key: string) => isPromptOpenRow(activeInteraction, key),
 			[activeInteraction],
 		);
+		const resolveFileChangesOpen = useCallback(
+			(key: string) => isFileChangesOpenRow(activeInteraction, key),
+			[activeInteraction],
+		);
 		const resolveExactToolColor = useCallback(
 			(toolName: string, input?: unknown) => getCategoryColor(getCategory(toolName, input)),
 			[],
@@ -2402,7 +2514,122 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		 * invalidate every row's memo and (worse) make a purely visual concern part of the
 		 * render that produces the geometry it animates.
 		 */
-		const foldMotionRef = useRef(createFoldMotionController());
+		/**
+		 * The ONE owner of every decorative animation on this canvas (see
+		 * vlist-motion-scheduler.ts).
+		 *
+		 * Four things animate here — the fold's rows, its decorative tool-run frames, the
+		 * drill-down header morph and the LOD-switch morph — and they are not independent
+		 * events: `onToggleRow` produces a fold AND a drill flip in one click. While each
+		 * had its own controller their lifetimes were independent, so a re-toggle could
+		 * cancel one half and leave the other running to a different finish time. All four
+		 * now push ops into the current frame and one flush effect starts them together.
+		 */
+		const motionRef = useRef(createMotionScheduler());
+		/**
+		 * UNIFIED MORPH (behind `narrafork_unified_morph`).
+		 *
+		 * The visual-state store is the single source of truth for where a morphing element
+		 * VISUALLY is, which is what makes interruption structural: a new LOD step just points
+		 * the store at a new target, and the element continues from wherever it currently is
+		 * rather than from a committed snapshot it had already snapped back to.
+		 *
+		 * The store outlives individual commits on purpose — that persistence IS the mechanism.
+		 * Reclamation is its own concern (`retain` + `sweep`), so a level switch churning
+		 * elements cannot leak.
+		 */
+		const visualStateRef = useRef(createVisualStateStore());
+		/** Identities the driver should write this frame; refreshed by the morph effect. */
+		const morphIdentitiesRef = useRef<Set<string>>(new Set());
+		/**
+		 * Previous admitted frame for the UNIFIED path.
+		 *
+		 * Deliberately separate from `lodMorphPrevRef`: while the flag can be toggled at
+		 * runtime, sharing one ref would let a frame recorded by one path be diffed by the
+		 * other, whose admission rules differ — a silent mispairing rather than an error.
+		 */
+		const unifiedPrevRef = useRef<MorphElement[] | null>(null);
+		/**
+		 * `scrollTop` of the frame `unifiedPrevRef` was captured in.
+		 *
+		 * Element geometry is DOCUMENT px, so turning it into screen space needs the scroll
+		 * origin of ITS OWN frame. A gesture-driven LOD switch rewrites `scrollTop` (the LOD
+		 * anchor keeps the pointed-at content at a fixed screen position), so using the new
+		 * frame's origin for the old frame's geometry charges the entire scroll correction to
+		 * every element as travel it never made — the anchored content is displaced by the
+		 * correction and animates back from it, which reads as the zoom being centred on the
+		 * wrong place.
+		 */
+		const unifiedPrevScrollTopRef = useRef(0);
+		/**
+		 * THE ONE TIMING OWNER for unified morphs.
+		 *
+		 * Created lazily and kept for the component's life. A single loop is not an
+		 * optimisation: `vlist-motion-scheduler.ts` records that fold and morph once held
+		 * separate controllers and "a re-toggle could cancel one half and leave the other
+		 * running to a different finish time", i.e. one visual event came apart. With one loop
+		 * advancing every element by the same dt from the same store, that cannot happen —
+		 * there is no per-element timeline to desynchronise.
+		 */
+		const morphDriverRef = useRef<MorphDriver | null>(null);
+		if (!morphDriverRef.current) {
+			morphDriverRef.current = createMorphDriver({
+				store: visualStateRef.current,
+				identities: () => morphIdentitiesRef.current,
+				resolve: (unitId) => {
+					const escaped = cssAttrEscape(unitId);
+					// `data-nf-unit` first, then `data-nf-row-key` — the SAME fallback the keyframe
+					// path uses. Without it every element paired on its `key` rather than a `unitId`
+					// resolved to null and simply never animated, which is silent: the plan exists,
+					// the state converges, and only the DOM write is missing.
+					const root =
+						viewportRef.current?.querySelector<HTMLElement>(`[data-nf-unit="${escaped}"]`) ??
+						viewportRef.current?.querySelector<HTMLElement>(`[data-nf-row-key="${escaped}"]`);
+					if (!root) return null;
+					return {
+						root,
+						// Present only in the CARD form; absent for a row, in which case the driver
+						// simply has no border or tail to fade.
+						surface: root.querySelector<HTMLElement>("[data-nf-card-surface]"),
+						tail: root.querySelector<HTMLElement>("[data-nf-card-tail]"),
+					};
+				},
+			});
+		}
+
+		// The rAF loop stops on its own only when every element has SETTLED, so an unmount
+		// mid-transition (switching narrator, closing the panel) is exactly the case it
+		// cannot end by itself: the loop keeps resolving identities against a viewport that
+		// no longer exists and writing nodes React has already reclaimed. Stopped explicitly
+		// for the same reason `motionRef` is — a decorative animation always outlives the
+		// click that started it.
+		useEffect(() => {
+			const driver = morphDriverRef.current;
+			return () => driver?.stop();
+		}, []);
+
+		// Turning the unified path OFF mid-flight hands the same nodes to the keyframe
+		// planner while this driver is still running: `morphIdentitiesRef` is only ever
+		// written inside the `unifiedMorph` branch, so it keeps naming the identities of
+		// the last switch and the loop keeps writing their `transform` — the exact
+		// "two owners of one property" failure `vlist-motion-scheduler.ts` was built to
+		// make impossible. Stopping also clears the inline styles the driver applied, so
+		// the keyframe path starts from a clean element rather than one frozen mid-morph.
+		//
+		// Runs on the flip in BOTH directions: switching the flag on while the keyframe
+		// path holds animations is handled by the scheduler's own scope cancellation, and
+		// clearing the identity set here means the driver cannot resume against a set
+		// recorded under the other path's admission rules.
+		useEffect(() => {
+			// Referenced only to declare the dependency: the flag is the TRIGGER, not an input
+			// the body reads. Same idiom as the narrator-switch reset effect below, and it is
+			// what stops the linter from "simplifying" the dep list to `[]` — which would make
+			// this run on mount only and miss every mid-session flip, i.e. the entire case.
+			void unifiedMorph;
+			morphIdentitiesRef.current = new Set();
+			morphDriverRef.current?.stop();
+		}, [unifiedMorph]);
+
 		const foldCaptureRef = useRef<{
 			toggledKey: string;
 			documentRevision: number;
@@ -2427,6 +2654,15 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			 * never occupied.
 			 */
 			frames: Map<string, FoldRowGeometry>;
+			/**
+			 * LOCAL tops of the rows nested inside each mounted trace element.
+			 *
+			 * At L1/L2 a whole activity run is ONE list item, so drilling one of its tool
+			 * rows open moves that row's siblings without moving any top-level item — the
+			 * row map above cannot see them, and they used to teleport while everything
+			 * below the run slid correctly. See `FoldNestedRowMotion`.
+			 */
+			nested: Map<string, { rows: Map<string, { top: number; height: number }> }>;
 		} | null>(null);
 		/**
 		 * Reads the geometry of the CURRENTLY mounted rows.
@@ -2440,6 +2676,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			| (() => {
 					geometry: Map<string, FoldRowGeometry>;
 					frames: Map<string, FoldRowGeometry>;
+					nested: Map<string, { rows: Map<string, { top: number; height: number }> }>;
 					documentRevision: number;
 					/**
 					 * The COMMITTED manifest's level, travelling with the geometry it belongs to.
@@ -2466,7 +2703,41 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		 * is keyed per-row — there is no single-slot capture to overwrite. Pure data in
 		 * the ref, never React state, never the measure cache.
 		 */
-		const drillMorphRef = useRef(createDrillMorphController());
+		/**
+		 * Trace rows whose drill-down is CLOSING, as `traceKey` → set of row keys.
+		 *
+		 * A closing card must keep painting for the duration of the fold, or React unmounts
+		 * it in the very frame the fold commits and it VANISHES instead of closing (see
+		 * `closingRowKeys` in RenderToolRun). The shell marks the row when the toggle fires
+		 * and clears it from `MotionOp.onDone`.
+		 *
+		 * State rather than a ref, because the RENDER layer consumes it — but scoped per
+		 * trace and compared by identity below, so only the traces that actually have a
+		 * closing row re-render.
+		 */
+		const [closingRows, setClosingRows] = useState<ReadonlyMap<string, ReadonlySet<string>>>(
+			new Map(),
+		);
+		/**
+		 * Read by `resolveRenderExtra`, which runs outside this component's render scope.
+		 * Assigned every render so the extras always describe the current closing set.
+		 */
+		const closingRowsRef = useRef(closingRows);
+		closingRowsRef.current = closingRows;
+		const releaseClosingRow = useCallback((traceKey: string, rowKey: string) => {
+			setClosingRows((prev) => {
+				const rows = prev.get(traceKey);
+				if (!rows?.has(rowKey)) return prev;
+				const nextRows = new Set(rows);
+				nextRows.delete(rowKey);
+				const next = new Map(prev);
+				// Drop the whole trace entry when its last closing row is released, so the
+				// map returns to being empty and every row keeps its memo identity.
+				if (nextRows.size === 0) next.delete(traceKey);
+				else next.set(traceKey, nextRows);
+				return next;
+			});
+		}, []);
 		const drillMorphPrevRef = useRef<Map<string, DrillRowSnapshot>>(new Map());
 		/**
 		 * The document revision the last snapshot was taken under. A morph only plays when
@@ -2481,7 +2752,6 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		 * rolls forward every commit so the next diff has a clean baseline; a morph only
 		 * plays when the document revision is unchanged AND the lod moved (pure re-theme).
 		 */
-		const lodMorphRef = useRef(createLodMorphController());
 		const lodMorphPrevRef = useRef<Map<string, LodElementSnapshot> | null>(null);
 		const lodMorphLodRef = useRef<number>(-1);
 		const lodMorphDocRevRef = useRef<number>(-1);
@@ -2514,6 +2784,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				scrollTop: scrollTopRef.current,
 				geometry: read.geometry,
 				frames: read.frames,
+				nested: read.nested,
 			};
 		}, []);
 		// Stable RowToggles per key (memoized) so unchanged rows keep referential props
@@ -2578,6 +2849,28 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 					},
 					onToggleRow: (rowIndex: number, rowKey?: string) => {
 						captureFoldBefore(key);
+						// CLOSING a drilled card: keep it painted for the transition, or React
+						// unmounts it in the frame the fold commits and it vanishes instead of
+						// closing. Marked here (while the card is still the committed state) and
+						// released from the resize op's `onDone`.
+						//
+						// Only when this row currently HAS a card: opening one, or toggling a
+						// reasoning body, has nothing to retain.
+						if (rowKey !== undefined) {
+							const measured = measuredByKeyRef.current.get(key) as
+								| { rows?: readonly { key: string; cardMeasured?: unknown }[] }
+								| undefined;
+							const row = measured?.rows?.find((r) => r.key === rowKey);
+							if (row?.cardMeasured != null) {
+								setClosingRows((prev) => {
+									const next = new Map(prev);
+									const rows = new Set(prev.get(key) ?? []);
+									rows.add(rowKey);
+									next.set(key, rows);
+									return next;
+								});
+							}
+						}
 						// The caller decides the channel by whether it passes a key, and the
 						// TRACE_KINDS binding picks that per element kind (traceRowFoldChannel).
 						// A key means the element folds a LIVE row list, where a reasoning step
@@ -2593,10 +2886,28 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 						}
 						setInteraction((prev) => toggleVListRow(prev, key, rowIndex));
 					},
-					onToggleTranslation: () => setInteraction((prev) => toggleVListShowOriginal(prev, key)),
+					onToggleTranslation: () => {
+						// A fold, despite the name. The two texts wrap to different line counts at
+						// the same width (`measureReasoning` measures `displayText`, and
+						// `showOriginal` is part of the measure cache key), so flipping to the
+						// original resizes the row and moves everything below it. Measured against
+						// `measureReasoning` at 860px wide: an expanded run is 70px showing its
+						// translation and 90px showing its original.
+						//
+						// This handler was the one height-affecting toggle with no capture, so the
+						// flip teleported the rest of the document while every other toggle eased.
+						// Growing to the original also plays the reveal, which reads correctly here:
+						// the box holds its final height while the taller text unrolls into it.
+						captureFoldBefore(key);
+						setInteraction((prev) => toggleVListShowOriginal(prev, key));
+					},
 					onTogglePrompt: () => {
 						captureFoldBefore(key);
 						setInteraction((prev) => toggleVListPromptOpen(prev, key));
+					},
+					onToggleFileChanges: () => {
+						captureFoldBefore(key);
+						setInteraction((prev) => toggleVListFileChangesOpen(prev, key));
 					},
 				};
 				togglesCacheRef.current.set(key, toggles);
@@ -2920,6 +3231,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			isRowExpanded: resolveTraceRowExpanded,
 			showOriginal: resolveShowOriginal,
 			isPromptOpen: resolvePromptOpen,
+			isFileChangesOpen: resolveFileChangesOpen,
 			resolveToolCategory: getCategory,
 			resolveToolColor: resolveExactToolColor,
 			resolveToolSummary: resolveExactToolSummary,
@@ -3006,6 +3318,12 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			unknownHeightReporterCacheRef.current.clear();
 			togglesCacheRef.current.clear();
 			reflectionTakeOverCacheRef.current.clear();
+			// Closing rows are released by `MotionOp.onDone`, which only runs for
+			// animations this shell still owns. A narrator switch is not an unmount, so
+			// `cancel()` does not fire and a fold interrupted by the switch leaves its
+			// entry behind — a retained card key belonging to a trace that no longer
+			// exists, kept alive for the rest of the session.
+			setClosingRows((prev) => (prev.size === 0 ? prev : new Map()));
 		}, [narratorId]);
 
 		const revisionSubscriptionId =
@@ -3264,8 +3582,22 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		// A subagent card's PROMPT is the same kind of request through a different
 		// affordance: unfolding the prompt IS the click that asks for those bytes, so
 		// `promptOpen` gates the fetch (never mere card expansion, and never a card the
-		// reader only scrolled past). The block reserves the full cap while truncated,
-		// so the row does not resize when the real prompt lands.
+		// reader only scrolled past).
+		//
+		// ⚠️ The landing payload DOES resize the row, and deliberately gets no fold
+		// transition. A truncated body reserves the whole cap (`cappedBodyHeight`), so a
+		// body whose real content is shorter than the cap shrinks when it lands —
+		// measured on a `plan` detail at 600px wide: 901px reserved, 123.9px once the
+		// real text arrived. (An earlier note here claimed the reservation meant "the row
+		// does not resize"; that is only true for the common case where the real body
+		// still overflows the cap.)
+		//
+		// It gets no capture for a structural reason rather than an oversight: the bytes
+		// land asynchronously, long past the fold capture's ~400ms age bound, so a
+		// capture taken at request time would always be rejected. The rebuild is ANCHORED
+		// instead (`usePretextDocument` captures before every rebuild), which is the
+		// correct treatment for a change the reader did not just click: the content they
+		// are looking at holds its screen position and nothing below it appears to move.
 		const truncatedExpandedToolUseIds = useMemo(() => {
 			const ids: string[] = [];
 			for (const item of renderItems) {
@@ -3516,6 +3848,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				return {
 					geometry: new Map<string, FoldRowGeometry>(),
 					frames: new Map<string, FoldRowGeometry>(),
+					nested: new Map<string, { rows: Map<string, { top: number; height: number }> }>(),
 					documentRevision: revision,
 					lod: committedLod,
 				};
@@ -3539,6 +3872,16 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				// geometry. Not window-bounded: a frame can span the whole window and still
 				// be mounted (see captureFoldFrameGeometry).
 				frames: captureFoldFrameGeometry(toolRunFramesRef.current, (index) => layout.items[index]),
+				// Rows nested INSIDE a trace element (L1/L2 activity runs). Drilling one open
+				// moves its siblings without moving any top-level item, so without this they
+				// teleported while everything below the run slid correctly. Same snapshot as
+				// the rows above, so the two can never disagree.
+				nested: captureFoldNestedRows(keys, (key) => {
+					const measured = measuredByKeyRef.current.get(key) as
+						| { rows?: readonly { key: string; top: number; blockHeight: number }[] }
+						| undefined;
+					return measured?.rows;
+				}),
 				documentRevision: revision,
 				lod: committedLod,
 			};
@@ -3639,25 +3982,129 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			// above rejects a capture whose document changed underneath it, and the age
 			// bound expires one whose rebuild never arrived.
 			//
-			// Both plans are consulted: a frame is derived from its rows, so in practice it
+			// Rows nested inside a trace element (L1/L2 activity runs), planned from the same
+			// snapshot pair. Local coordinates, so no scroll pair is involved — the trace's
+			// own displacement is already carried by its element `shift` and adding it here
+			// would animate these rows twice (see FoldNestedRowMotion).
+			const nestedMotions = planFoldNestedRowMotion({
+				before: capture.nested,
+				after: read.nested,
+			});
+			// The other half of a drill-down: the row's own BLOCK changed size (a drilled
+			// block IS the card, `blockHeight === card.height`). Without this React commits
+			// the short height in frame one, so the card vanished instead of closing and the
+			// rows below slid up from outside the already-shortened box — visible as content
+			// emerging from a clip line and never catching up. See FoldNestedRowResize.
+			const nestedResizes = planFoldNestedRowResize({
+				before: capture.nested,
+				after: read.nested,
+			});
+			// Every plan is consulted: a frame is derived from its rows, so in practice it
 			// cannot move alone — but gating on the rows only would make that an assumption
-			// this effect silently depends on.
-			if (motions.length === 0 && frameMotions.length === 0) return;
+			// this effect silently depends on. The nested plan genuinely CAN be the only
+			// non-empty one: drilling a row inside a trace that is the document's last item
+			// moves nothing at the top level at all.
+			if (
+				motions.length === 0 &&
+				frameMotions.length === 0 &&
+				nestedMotions.length === 0 &&
+				nestedResizes.length === 0
+			)
+				return;
 			foldCaptureRef.current = null;
-			foldMotionRef.current.play(
-				motions,
-				(key) => node.querySelector<HTMLElement>(`[data-nf-row-key="${cssAttrEscape(key)}"]`),
-				undefined,
-				frameMotions,
-				(key) => node.querySelector<HTMLElement>(`[data-tool-run-frame="${cssAttrEscape(key)}"]`),
-			);
+			const ops: MotionOp[] = [];
+			for (const motion of motions) {
+				// A `reveal` clips, and an inset is measured from the bottom of the node it
+				// plays on — so it MUST target the row's inner content box, whose height is
+				// the layout's `height`. The outer row box is `hitHeight` tall (its own
+				// height plus the gap to the next row, see resolveRowHitHeight), so playing
+				// the clip there starts it a gap's worth of pixels below the card's real
+				// bottom edge and the first frame uncovers content that should still be
+				// hidden. A `shift` translates the whole row and belongs on the outer box.
+				// A `reveal` CLIPS and a `resize` animates HEIGHT, so both must target the
+				// row's inner content box — the only box whose height is the layout's
+				// `height` and which carries the `overflow: hidden` that does the cropping.
+				// A `shift` translates the whole row and belongs on the outer box.
+				const selector =
+					motion.kind === "shift"
+						? `[data-nf-row-key="${cssAttrEscape(motion.key)}"]`
+						: `[data-nf-row-body="${cssAttrEscape(motion.key)}"]`;
+				ops.push({
+					// Reveal and shift can BOTH be planned for the toggled row (expanding while
+					// pinned to the bottom), on two different nodes and two different
+					// properties. They are one movement, so they must not share a scope — the
+					// scheduler cancels a scope before starting it, so the second would cancel
+					// the first before it ever ran.
+					scope: `${rowScope(motion.key)}:${motion.kind}`,
+					resolve: () => node.querySelector<HTMLElement>(selector),
+					keyframes: foldRowKeyframes(motion),
+				});
+			}
+			// Rows nested INSIDE a trace element. At L1/L2 a whole activity run is ONE list
+			// item, so drilling one of its tool rows open moves that row's siblings without
+			// moving any top-level item: the row plan above cannot express it, and those
+			// siblings teleported while everything below the run slid correctly.
+			for (const nestedMotion of nestedMotions) {
+				ops.push({
+					// Scoped per ROW, and disjoint from the trace's own `row:` scope: the trace
+					// element is itself animating (it grew), and cancelling one must not cancel
+					// the other — they are different nodes moving by different amounts.
+					scope: `${rowScope(nestedMotion.traceKey)}:nested:${nestedMotion.rowKey}`,
+					resolve: () =>
+						node
+							.querySelector<HTMLElement>(
+								`[data-nf-row-key="${cssAttrEscape(nestedMotion.traceKey)}"]`,
+							)
+							?.querySelector<HTMLElement>(
+								`[data-nf-trace-row="${cssAttrEscape(nestedMotion.rowKey)}"]`,
+							),
+					keyframes: shiftKeyframes(nestedMotion.fromOffset),
+				});
+			}
+			// Close (or open) the drilled block itself, so the card does not vanish in one
+			// frame and the rows below stay glued to its bottom edge.
+			for (const resize of nestedResizes) {
+				ops.push({
+					// Its own scope: this row is BOTH resizing and (usually) shifting, on the
+					// same node but different properties. Sharing a scope would cancel one
+					// before it started.
+					scope: `${rowScope(resize.traceKey)}:nested-size:${resize.rowKey}`,
+					// The BLOCK, not the row's positioning box: the latter carries the row's
+					// own translate, and two animations on one node fight over it. The block
+					// is also the box that clips the closing card.
+					resolve: () =>
+						node
+							.querySelector<HTMLElement>(`[data-nf-row-key="${cssAttrEscape(resize.traceKey)}"]`)
+							?.querySelector<HTMLElement>(
+								`[data-nf-trace-block="${cssAttrEscape(resize.rowKey)}"]`,
+							),
+					keyframes: nestedResizeKeyframes(resize.fromHeight, resize.toHeight),
+					// Release the retained card once the block has finished closing around
+					// it. Guaranteed exactly once on every exit path (finish, re-toggle,
+					// teardown, never-started) — see MotionOp.onDone.
+					onDone: () => releaseClosingRow(resize.traceKey, resize.rowKey),
+				});
+			}
+			for (const frameMotion of frameMotions) {
+				ops.push({
+					scope: frameScope(frameMotion.key),
+					resolve: () =>
+						node.querySelector<HTMLElement>(
+							`[data-tool-run-frame="${cssAttrEscape(frameMotion.key)}"]`,
+						),
+					keyframes: frameKeyframes(frameMotion),
+				});
+			}
+			motionRef.current.begin();
+			motionRef.current.push(ops);
 		});
 
-		// A fold animation outlives the click (the reader can scroll away or switch
-		// narrator mid-transition), so the controller is stopped explicitly on unmount.
+		// Every decorative animation outlives the click that started it (the reader can
+		// scroll away or switch narrator mid-transition), so the one scheduler that owns
+		// all of them is stopped explicitly on unmount.
 		useEffect(() => {
-			const controller = foldMotionRef.current;
-			return () => controller.cancel();
+			const scheduler = motionRef.current;
+			return () => scheduler.cancel();
 		}, []);
 
 		/**
@@ -3728,32 +4175,111 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				foldRevisionOf(foldDocumentRevision) === drillMorphRevisionRef.current;
 			drillMorphRevisionRef.current = foldRevisionOf(foldDocumentRevision);
 			drillMorphPrevRef.current = next;
-			if (!revisionUnchanged || prefersReducedMotionDrill()) return;
+			if (!revisionUnchanged || prefersReducedMotion()) return;
 			const plans = diffDrillSnapshots(prev, next);
 			if (plans.length === 0) return;
-			drillMorphRef.current.playAll(plans, (rowUid) => {
+			// Same frame as the fold: this morph rides along with one (`onToggleRow` does
+			// both), so its ops join the fold's batch instead of starting a second one.
+			motionRef.current.begin();
+			/**
+			 * The card whose header this plan morphs, or null.
+			 *
+			 * Shared by the header op and the two fades below so all three resolve against the
+			 * SAME card. Looking it up three times independently would let them disagree if the
+			 * DOM changed between calls, and a fade on a stale node is invisible rather than
+			 * wrong — the kind of failure nobody notices.
+			 */
+			const resolveDrillCard = (rowUid: string): HTMLElement | null => {
 				const sep = rowUid.indexOf("::");
 				const traceKey = rowUid.slice(0, sep);
 				const rowKey = rowUid.slice(sep + 2);
-				const plan = plans.find((p) => p.rowUid === rowUid);
 				const rowNode = node.querySelector<HTMLElement>(
 					`[data-nf-row-key="${cssAttrEscape(traceKey)}"]`,
 				);
-				const toggled = rowNode?.querySelector<HTMLElement>(
-					`[data-nf-trace-row="${cssAttrEscape(rowKey)}"]`,
+				return (
+					rowNode?.querySelector<HTMLElement>(`[data-nf-trace-row="${cssAttrEscape(rowKey)}"]`) ??
+					null
 				);
-				return toggled?.querySelector<HTMLElement>(
-					plan?.kind === "collapse" ? "[data-nf-trace-titlerow]" : "[data-nf-card-header]",
-				);
-			});
+			};
+			motionRef.current.push(
+				plans.map((plan) => ({
+					scope: drillScope(plan.rowUid),
+					resolve: () => {
+						const sep = plan.rowUid.indexOf("::");
+						const traceKey = plan.rowUid.slice(0, sep);
+						const rowKey = plan.rowUid.slice(sep + 2);
+						const rowNode = node.querySelector<HTMLElement>(
+							`[data-nf-row-key="${cssAttrEscape(traceKey)}"]`,
+						);
+						const toggled = rowNode?.querySelector<HTMLElement>(
+							`[data-nf-trace-row="${cssAttrEscape(rowKey)}"]`,
+						);
+						// ALWAYS the CARD's header, in both directions.
+						//
+						// The summary row is not a usable target on collapse: the card is retained
+						// for the duration of the close (see closingRowKeys), so `titleRow` is not
+						// rendered yet and this resolved to null — the header the reader is actually
+						// looking at then jumped to its new place with no transition at all.
+						//
+						// Moving the CARD's header is also the right thing semantically: it is the
+						// line that is on screen and must travel to where the summary line will be.
+						// The summary row takes over only after the card is released, already at the
+						// committed position, so it needs no motion of its own.
+						return toggled?.querySelector<HTMLElement>("[data-nf-card-header]");
+					},
+					// A builder, not an array: when this replaces a morph still in flight (the
+					// reader clicked the same row twice quickly) it resumes from where that
+					// motion visually got to. Without it `fill: "none"` snaps the line to its
+					// committed spot the instant the old animation is cancelled, and the second
+					// click starts with a visible jump.
+					keyframes: (previous) => drillMorphKeyframesFrom(plan, previous),
+					// COLLAPSE only: this animates the card header, and the card is unmounted by
+					// the same event that ends the motion (both are 200ms). With `fill: "none"`
+					// the transform is dropped on the final frame, so the header snaps back to
+					// its un-morphed position for exactly one frame before React removes it —
+					// the "one frame dislocated downward" flash. Holding the end state bridges
+					// that, and leaks nothing because the node is gone immediately after.
+					//
+					// An EXPAND must not hold: its node survives, and a retained transform there
+					// is exactly the residue `fill: "none"` exists to prevent.
+					holdEndState: plan.kind === "collapse",
+				})),
+			);
+			// The tail cluster and the border, each on their OWN scope so an interrupted
+			// transition replaces them independently of the header's travel.
+			//
+			// Both are cross-fades rather than movements, for different reasons: the cluster's
+			// travel distance is unknowable without measuring rendered text (see
+			// `drillTailKeyframes`), and the border exists only in the card form so it has
+			// nothing to travel between. Both are exact mirrors between expand and collapse,
+			// which is what makes a mid-flight flip reverse cleanly instead of restarting.
+			motionRef.current.push(
+				plans.flatMap((plan) => {
+					const card = resolveDrillCard(plan.rowUid);
+					if (!card) return [];
+					return [
+						{
+							scope: `${drillScope(plan.rowUid)}:tail`,
+							resolve: () => card.querySelector<HTMLElement>("[data-nf-card-tail]"),
+							keyframes: (previous: { progress: number } | null) =>
+								drillTailKeyframesFrom(plan.kind, previous),
+							// Same reason as the header's: on collapse this node is unmounted by the
+							// event that ends the fade, so dropping the final opacity would flash the
+							// cluster back to full for one frame.
+							holdEndState: plan.kind === "collapse",
+						},
+						{
+							scope: `${drillScope(plan.rowUid)}:border`,
+							// The card's own bordered `Paper` — the header's ancestor, not a child.
+							resolve: () => card.querySelector<HTMLElement>("[data-nf-card-surface]"),
+							keyframes: (previous: { progress: number } | null) =>
+								drillBorderKeyframesFrom(plan.kind, previous),
+							holdEndState: plan.kind === "collapse",
+						},
+					];
+				}),
+			);
 		});
-
-		// The morph outlives the click for the same reason the fold does; stop it on
-		// unmount so no animation outlives the list.
-		useEffect(() => {
-			const controller = drillMorphRef.current;
-			return () => controller.cancel();
-		}, []);
 
 		/**
 		 * Play LOD-switch morphs, driven by an element-level diff keyed by `unitId ?? key`.
@@ -3789,6 +4315,65 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			// whole committed document is read here (geometry is O(n) plain numbers, cheap);
 			// the viewport×3 crop happens inside buildLodSnapshots.
 			const elements: LodElementSource[] = [];
+			/**
+			 * Box of the render-UNIT each item belongs to, spanning all of its specs.
+			 *
+			 * The admission window has to judge one unit's content the same way at both levels,
+			 * and the two forms differ enormously: at L1/L2 an activity unit is a single short
+			 * fold, at L3+ it is a stack of full cards spanning thousands of pixels. Judged on
+			 * their own boxes, the unit's later CARDS fall outside the window in the expanded
+			 * frame while its ROWS all sit inside it in the folded one — so those members have
+			 * no counterpart and are planned nothing, silently.
+			 *
+			 * Grouping comes from `spec.morphGroupId`, which the layout assigns from the
+			 * activity grouping that applies at a low LOD — computed at every level, so both
+			 * sides agree on the membership. See the note on the loop below.
+			 */
+			const unitBoxes: Array<{ top: number; height: number } | null> = new Array(items.length).fill(
+				null,
+			);
+			{
+				// One SHARED, mutable box per unit: every index in a unit points at the same
+				// object, so growing it as later specs are seen retroactively widens the box the
+				// earlier ones already reference.
+				//
+				// ⚠️ Grouped by `spec.morphGroupId`, NOT by `spec.unitStart`.
+				//
+				// `unitStart` marks the first spec of each RENDER unit, and at L3+ grouping is
+				// off (`groupRenderUnits(segments, lod <= 2)`), so every spec starts its own
+				// unit and the flag is true for all of them. The box then degenerated to each
+				// element's OWN box — exactly what it exists to avoid. Measured on a 12-tool
+				// group at scrollTop 9500: 3 of 12 members paired with the degenerate box
+				// versus all 12 with the real group box.
+				//
+				// `morphGroupId` is computed from the activity grouping that would apply at a
+				// low LOD regardless of the current level (see buildPretextDocumentLayout), so
+				// the members of one group share it at BOTH levels and the box spans the whole
+				// group on each side. Specs outside any activity group have none and fall back
+				// to their own box, which is correct for them: their two forms are the same
+				// element.
+				const boxes = new Map<string, { top: number; height: number }>();
+				for (let i = 0; i < items.length; i++) {
+					const it = items[i];
+					const g = layout.items[i];
+					if (!it || !g) continue;
+					const groupId = it.spec.morphGroupId;
+					if (!groupId) {
+						unitBoxes[i] = { top: g.top, height: g.height };
+						continue;
+					}
+					const existing = boxes.get(groupId);
+					if (!existing) {
+						const box = { top: g.top, height: g.height };
+						boxes.set(groupId, box);
+						unitBoxes[i] = box;
+						continue;
+					}
+					// Mutated in place so the members already pointing at this box widen with it.
+					existing.height = Math.max(existing.height, g.top + g.height - existing.top);
+					unitBoxes[i] = existing;
+				}
+			}
 			for (let index = 0; index < items.length; index++) {
 				const item = items[index];
 				const geo = layout.items[index];
@@ -3803,6 +4388,13 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 					kind: item.spec.kind,
 					top: geo.top,
 					height: geo.height,
+					// Anchored to the whole unit, so a tool CARD at L3+ is admitted on the same
+					// basis as the folded ROW it pairs with at L1/L2. Without this the fix on the
+					// folded side alone changes nothing: the card is a top-level element with its
+					// own tall box, so the unit's later cards still prune themselves out of the
+					// expanded frame and still have no counterpart.
+					groupBox: unitBoxes[index],
+					unitAnchored: true,
 				});
 				// The L2/L3 boundary: a tool call is a summary ROW inside this trace at L1/L2
 				// and a top-level CARD at L3+, both carrying the same `unitId`. Without the
@@ -3834,6 +4426,13 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 						height: row.rowHeight,
 						clip,
 						nested: true,
+						// Admission is decided by the GROUP's box, not this row's. At L3+ the same
+						// content spans an order of magnitude more height (10 rows of 19px become
+						// 10 cards of ~400px), so judged on their own boxes the later members fall
+						// outside the ×3 window in the expanded frame only — no counterpart, no
+						// plan, and the reader sees the first few rows animate while the rest
+						// teleport. The group's box is short and stable at both levels.
+						groupBox: { top: geo.top, height: geo.height },
 					});
 				}
 			}
@@ -3852,33 +4451,180 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			lodMorphPrevRef.current = next;
 			lodMorphDocRevRef.current = docRev;
 			lodMorphLodRef.current = lod;
-			if (!isLodSwitch || prefersReducedMotionLod()) return;
+			/**
+			 * The unified baseline must roll forward on EVERY frame, exactly like the keyframe
+			 * path's `prev` above — and for the same reason.
+			 *
+			 * ⚠️ This was originally written inside the `unifiedMorph` branch below, i.e. AFTER the
+			 * `isLodSwitch` guard. That made the baseline unreachable on ordinary frames, so it
+			 * only ever recorded the layout of a frame that was ALREADY mid-switch: every switch
+			 * then diffed against a stale, one-step-late snapshot and most elements failed to pair
+			 * at all. The symptom was a large number of rows losing their animation — the very bug
+			 * the rewrite set out to remove, reintroduced by putting the roll-forward on the wrong
+			 * side of a `return`.
+			 *
+			 * Computed unconditionally rather than lazily: an admitted snapshot is plain numbers
+			 * over the already-built element list, and skipping it on non-switch frames is exactly
+			 * what broke it.
+			 */
+			// Raw element list, not an admitted snapshot: admission needs BOTH frames (see
+			// `admitPair`), so the decision cannot be taken until the next frame arrives.
+			const unifiedElements = toMorphElements(elements);
+			const unifiedPrev = unifiedPrevRef.current;
+			const unifiedPrevScrollTop = unifiedPrevScrollTopRef.current;
+			unifiedPrevRef.current = unifiedElements;
+			// Rolled forward with the elements it describes, on EVERY frame, or the pair would
+			// be converted with mismatched scroll origins (see the ref's note).
+			unifiedPrevScrollTopRef.current = scrollTop;
+			if (!isLodSwitch || prefersReducedMotion()) return;
+			if (unifiedMorph) {
+				// UNIFIED PATH. Targets, not keyframes: the element is already laid out at its new
+				// position, so it is handed the displacement it must travel back from and a resting
+				// target of zero. Nothing here names a START, which is precisely why an interrupted
+				// switch needs no special handling — the store already holds the visual position.
+				if (!unifiedPrev) return;
+				// Admitted as a PAIR: an element visible at either level is kept at both. Judging
+				// each frame on its own geometry drops whole units, because one level's unit box can
+				// miss the window entirely while the other's spans it.
+				const { before: unifiedBefore, after: unifiedAfter } = admitPair(
+					unifiedPrev,
+					unifiedElements,
+					scrollTop,
+					vh,
+					// The baseline frame's own scroll origin. A gesture-driven switch corrects
+					// `scrollTop` to hold the pointed-at content still, so passing only the current
+					// value would turn that correction into travel for every element.
+					unifiedPrevScrollTop,
+				);
+				const targets = planMorphTargets(
+					unifiedBefore,
+					unifiedAfter,
+					// A card is fully "cardness"; every folded form is not. This is the only place
+					// the kind vocabulary is interpreted, keeping the planner generic.
+					(kind) => (kind === "tool-call" || kind === "subagent-card" ? 1 : 0),
+					// The two forms start their content at different offsets; the drill morph already
+					// derives this from the shared row metrics and card padding.
+					() => DRILL_MORPH_X_OFFSET,
+				);
+				const store = visualStateRef.current;
+				const ids = new Set<string>();
+				for (const plan of targets) {
+					ids.add(plan.unitId);
+					// Seed the new displacement UNLESS the element is still moving.
+					//
+					// ⚠️ The predicate is `isMoving`, NOT "does the store know this element". A
+					// settled element is still retained, so keying on existence meant every switch
+					// after the first one applied no displacement at all and the element teleported —
+					// which is exactly the "most rows don't animate" report. It also explains why
+					// interrupting repeatedly appeared to help: an interrupted element IS still
+					// moving, so it happened to take the right branch.
+					//
+					//   moving  → retarget only, continuing from the current visual position;
+					//   settled → seed the fresh displacement, or there is nothing to animate.
+					if (store.isMoving(plan.unitId)) {
+						// Mid-flight: keep the visual position and only change where it is heading. This
+						// is the interruption property — the element continues from where it is.
+						store.setTarget(plan.unitId, plan.target);
+					} else {
+						// Settled (or new): displace it back to where it was and let it travel home.
+						// `startFrom` rather than `setTarget`, because the latter deliberately never
+						// moves an existing element — using it here left every switch after the first
+						// with no displacement at all, i.e. no animation.
+						store.startFrom(plan.unitId, initialStateFor(plan), plan.target);
+					}
+				}
+				morphIdentitiesRef.current = ids;
+				store.retain(ids);
+				morphDriverRef.current?.kick();
+				return;
+			}
 			const plans = diffLodSnapshots(prev, next);
 			if (plans.length === 0) return;
-			lodMorphRef.current.playAll(plans, (unitId) => {
-				const escaped = cssAttrEscape(unitId);
-				// `data-nf-unit` first, then `data-nf-row-key` — the only attribute an element
-				// paired on its `key` paints. Without the fallback every key-paired plan would
-				// resolve to null and the document body would go back to teleporting, silently:
-				// the plans are still produced, so nothing looks broken from the planner's side.
-				//
-				// One selector serves both forms of a tool call, because `data-nf-unit` is
-				// painted on the top-level card wrapper AND on the folded trace row, and the
-				// two never coexist: at L3+ only the card is mounted, at L1/L2 only the row.
-				// (A drilled-in card inside a row paints no `data-nf-unit` of its own, so it
-				// cannot shadow its row here.)
-				return (
-					node.querySelector<HTMLElement>(`[data-nf-unit="${escaped}"]`) ??
-					node.querySelector<HTMLElement>(`[data-nf-row-key="${escaped}"]`)
-				);
-			});
+			motionRef.current.begin();
+			motionRef.current.push(
+				plans.map((plan) => ({
+					scope: lodScope(plan.unitId),
+					resolve: () => {
+						const escaped = cssAttrEscape(plan.unitId);
+						// `data-nf-unit` first, then `data-nf-row-key` — the only attribute an
+						// element paired on its `key` paints. Without the fallback every
+						// key-paired plan would resolve to null and the document body would go
+						// back to teleporting, silently: the plans are still produced, so nothing
+						// looks broken from the planner's side.
+						//
+						// One selector serves both forms of a tool call, because `data-nf-unit` is
+						// painted on the top-level card wrapper AND on the folded trace row, and
+						// the two never coexist: at L3+ only the card is mounted, at L1/L2 only
+						// the row. (A drilled-in card inside a row paints no `data-nf-unit` of its
+						// own, so it cannot shadow its row here.)
+						return (
+							node.querySelector<HTMLElement>(`[data-nf-unit="${escaped}"]`) ??
+							node.querySelector<HTMLElement>(`[data-nf-row-key="${escaped}"]`)
+						);
+					},
+					// A builder, so a switch re-triggered mid-flight (holding a zoom shortcut, or a
+					// pinch crossing two thresholds) resumes from where the previous motion
+					// visually got to. With `fill: "none"` the plain array restarts from the
+					// committed geometry the cancelled animation snapped back to — a visible jump.
+					keyframes: (previous) => lodMorphKeyframesFrom(plan, previous),
+				})),
+				// A level switch re-themes the whole document at once, so it gets the longer
+				// base. The override is event-level, applied to every op in this batch.
+				LOD_MOTION_DURATION_MS,
+			);
+			// A RE-THEMED element (`plan.fade`) is the same trace-row ↔ tool-call pair a drill
+			// morph handles, so it gets the same two extra fades — the tail cluster, whose
+			// travel distance is unknowable without measuring rendered text, and the border,
+			// which exists in only one of the two forms.
+			//
+			// Only re-themes: an element that merely MOVED keeps its component, so its tail and
+			// border are already correct and animating them would make unchanged chrome blink
+			// once per zoom step.
+			motionRef.current.push(
+				plans.flatMap((plan) => {
+					if (!plan.fade) return [];
+					const escaped = cssAttrEscape(plan.unitId);
+					const host =
+						node.querySelector<HTMLElement>(`[data-nf-unit="${escaped}"]`) ??
+						node.querySelector<HTMLElement>(`[data-nf-row-key="${escaped}"]`);
+					if (!host) return [];
+					// The card form's kind: fade the border IN when arriving at it, OUT when
+					// leaving. `plan.fade` guarantees the two kinds differ.
+					const kind = plan.toKind === "tool-call" ? "expand" : "collapse";
+					return [
+						{
+							scope: `${lodScope(plan.unitId)}:tail`,
+							resolve: () => host.querySelector<HTMLElement>("[data-nf-card-tail]"),
+							keyframes: (previous: { progress: number } | null) =>
+								drillTailKeyframesFrom(kind, previous),
+						},
+						{
+							scope: `${lodScope(plan.unitId)}:border`,
+							resolve: () => host.querySelector<HTMLElement>("[data-nf-card-surface]"),
+							keyframes: (previous: { progress: number } | null) =>
+								drillBorderKeyframesFrom(kind, previous),
+						},
+					];
+				}),
+				LOD_MOTION_DURATION_MS,
+			);
 		});
 
-		// Stop LOD morphs on unmount, same discipline as the other controllers.
-		useEffect(() => {
-			const controller = lodMorphRef.current;
-			return () => controller.cancel();
-		}, []);
+		/**
+		 * MOTION FLUSH — must stay the LAST of the motion layout effects.
+		 *
+		 * The fold play, the drill diff and the LOD diff each push their ops into the
+		 * current frame rather than starting them. Layout effects within one component run
+		 * in DECLARATION order, so declaring this after all three is what makes one
+		 * commit's ops start in a single synchronous burst. Move it above any of them and
+		 * that effect's contribution lands in the NEXT event (or never), which is silent:
+		 * the plans are still produced and only the timing comes apart.
+		 *
+		 * Pinned by vlist-fold-wiring.test.ts.
+		 */
+		useLayoutEffect(() => {
+			motionRef.current.flush();
+		});
 
 		// Live streaming output is the document's LAST ROW, not an overlay.
 		//
@@ -3892,6 +4638,25 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		// Hand-off is structural: the row retires when the committed document already
 		// contains its content, so no timer can drop it while its replacement is missing.
 		const [streamingCharsSinceCommit, setStreamingCharsSinceCommit] = useState(0);
+		/**
+		 * Generation of THIS mount of the live row, for the streaming fade's store scope.
+		 *
+		 * A fresh epoch means the animation store cannot warm off the previous visit, so
+		 * the first frame after a narrator switch (or any remount) SEALS instead of
+		 * re-fading text the reader already watched. Advanced per narrator as well as per
+		 * mount, because the shell is deliberately NOT remounted per narrator (see the
+		 * cache-clearing effect keyed on `narratorId`) — without the switch case the
+		 * scope would stay warm across the very transition this exists for.
+		 *
+		 * `useState` + an effect rather than a ref assigned during render: minting inside
+		 * render runs twice under StrictMode and on any discarded render, so the epoch the
+		 * committed tree animates under would not be the one the store was warmed with.
+		 */
+		const [streamAnimMountEpoch, setStreamAnimMountEpoch] = useState(() => nextStreamAnimEpoch());
+		// biome-ignore lint/correctness/useExhaustiveDependencies: a narrator switch is a new mount for the fade
+		useEffect(() => {
+			setStreamAnimMountEpoch(nextStreamAnimEpoch());
+		}, [narratorId]);
 		const streamingSuperseded = useMemo(
 			() =>
 				isStreamingMessageSuperseded({
@@ -3923,6 +4688,16 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		// row. `resolveHeadTrim` also hard-rejects while streaming, so this is belt and
 		// braces; the timing is what makes a trim USEFUL (a turn's worth of new messages
 		// has just landed) rather than merely safe.
+		//
+		// "The live row cleared" is only a PROXY for "the turn ended", and it stopped
+		// being an exact one: the per-block hand-off (streaming-block-supersede.ts) also
+		// empties the row, mid-turn, the moment a catch-up delivers the partial message
+		// carrying blocks the row still held. That edge lands while the model is between
+		// steps — `resolveHeadTrim` sees `hasStreamingRow: false`, a pinned reader and a
+		// long window, so nothing else would decline it — and a trim there resets
+		// `charsSinceLastCommit` exactly as described above, endangering the output of the
+		// step that follows. So the intent is now stated directly instead of inferred:
+		// only trim while the narrator is NOT active.
 		const hadStreamingRowRef = useRef(false);
 		const trimHead = pretextDocument.trimHead;
 		// Latest-value refs: the effect must not re-run when these change (they change
@@ -3939,9 +4714,13 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		const pendingTrimSweepRef = useRef(false);
 		useEffect(() => {
 			const hasStreamingRow = streamingMsg != null;
-			const justCleared = hadStreamingRowRef.current && !hasStreamingRow;
-			hadStreamingRowRef.current = hasStreamingRow;
-			if (!justCleared) return;
+			const edge = resolveStreamingClearedTrimEdge({
+				hadStreamingRow: hadStreamingRowRef.current,
+				hasStreamingRow,
+				isActive,
+			});
+			hadStreamingRowRef.current = edge.nextHadStreamingRow;
+			if (!edge.fire) return;
 			const inputs = trimInputsRef.current;
 			const decision = resolveHeadTrim({
 				messages: inputs.messages as readonly { id?: unknown; seq?: unknown }[],
@@ -3958,7 +4737,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			});
 			if (!decision.trim) return;
 			if (trimHead(decision.dropCount)) pendingTrimSweepRef.current = true;
-		}, [streamingMsg, trimHead]);
+		}, [streamingMsg, trimHead, isActive]);
 		// Append animation applies to the live row only, and only while output is
 		// actually arriving (parity with the classic path's streaming fade-in).
 		const animateStreamingRows = isActive && advancedAnim;
@@ -4242,13 +5021,28 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			void scrollGeometryRevision;
 			if (!pinnedToBottom || !exactLayout) return;
 			const frame = requestAnimationFrame(() => {
-				// Route through the chase: streaming-sized growth glides, while a fresh
-				// load / narrator switch / prepend re-pin fails the gate and snaps exactly
-				// as the unconditional write did before.
-				getSmoothFollower().ensure();
+				// SNAPS, and must keep snapping. This effect is the catch-all for EVERY
+				// geometry change, so most of what reaches it is a document being
+				// ESTABLISHED or SETTLING rather than content arriving for a reader who is
+				// watching: a fresh load, a narrator switch (restore commits, then the
+				// background reload replaces the window), a prepend re-pin, a row reporting
+				// its real height after paint, a footer resolving, the viewport resizing.
+				//
+				// Routing this through the chase is what made a narrator switch scroll DOWN
+				// into place: each of those settle steps is a small delta, so it passed the
+				// glide gate and animated a journey the reader never took. The list is
+				// supposed to OPEN at the bottom.
+				//
+				// The one thing it must not do is fight a glide the correction path started:
+				// an unconditional write here would land at the bottom on the very next
+				// frame and cut every streaming glide short. While a chase is active this
+				// yields to it — the chase re-reads the live bottom every frame, so the
+				// growth this effect is answering is already part of its target.
+				if (smoothFollowerRef.current?.isActive() === true) return;
+				writeScrollTop(getScrollBottomTarget(viewportRef.current));
 			});
 			return () => cancelAnimationFrame(frame);
-		}, [exactLayout, pinnedToBottom, scrollGeometryRevision, getSmoothFollower]);
+		}, [exactLayout, pinnedToBottom, scrollGeometryRevision, writeScrollTop]);
 
 		// First-screen fill: the tail page alone may not cover the viewport (many
 		// short messages). While pinned at the bottom with more history available,
@@ -4358,10 +5152,15 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			// the real DOM box without changing the layout, so the effect would never run
 			// and the view would sit a form's height short of the bottom.
 			//
-			// Through the chase, not a bare write: the growth beneath a pinned reader is
-			// exactly the "pushed up" jump the smooth follow exists to remove, and the
-			// follower's gate reproduces the old instant write for every non-glide case.
-			if (grewBeneathReader) getSmoothFollower().ensure();
+			// SNAPS, for the same reason as the pin effect above: what reaches here is a
+			// row SETTLING its post-paint height (a permission form's textarea, an image,
+			// a reflection notice), not content arriving. Gliding those animated the list
+			// during mount/settle, which is how a narrator switch ended up scrolling down
+			// into place. Yields to an active chase so it cannot cut a streaming glide
+			// short (the chase's live target already covers this growth).
+			if (grewBeneathReader && smoothFollowerRef.current?.isActive() !== true) {
+				writeScrollTop(getScrollBottomTarget(node));
+			}
 			if (effectiveAtBottom) onUnreadCountChange?.(0);
 			onAtBottomChange?.(effectiveAtBottom);
 			maybeAutoLoadOlder(nextTop, effectiveAtBottom);
@@ -4386,6 +5185,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			onUnreadCountChange,
 			viewportHeight,
 			getSmoothFollower,
+			writeScrollTop,
 		]);
 
 		const onScroll = useCallback(() => {
@@ -5400,11 +6200,17 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 										// the tail is height-neutral. Without this term the memo skips the
 										// re-render and the newest characters never reach the DOM. Empty string
 										// for every settled row, so scroll-time memo hits are unaffected.
-										interactionSig={`${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}`}
+										// The closing set rides here too: it is read at DRAW time through a ref
+										// (so `measured` and the keys are unchanged), and without a term in
+										// this signature the memo would skip the re-render that mounts — and
+										// later unmounts — a closing card. Empty for every trace with nothing
+										// closing, so scroll-time memo hits are unaffected.
+										interactionSig={`${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}|${closingRowSig(closingRows, item.spec.key)}`}
 										toggles={getRowToggles(item.spec.key)}
 										renderLabels={renderLabels}
 										interaction={interactionsByKey.get(item.spec.key)}
 										rowInteraction={resolveRowInteraction(item)}
+										closingRowKeys={closingRows.get(item.spec.key)}
 										narratorId={narratorId}
 										onOpenFilePanel={rowHandlers?.onOpenFilePanel}
 										openAttachmentLabel={openAttachmentLabel}
@@ -5455,6 +6261,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 										onOpenAskInPassingTarget={askInPassing.openByKey.get(item.spec.key)}
 										viewControls={contentView.controls}
 										animateStreaming={animateStreamingRows && isStreamingRowKey(item.spec.key)}
+										streamAnimMountEpoch={streamAnimMountEpoch}
 										// The task spinner gate. Two identities, one flag: the newest
 										// framed task bubble (by spec key) and the newest task board (by
 										// tool-use id). Both are null unless the narrator is running.

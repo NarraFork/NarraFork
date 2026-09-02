@@ -397,6 +397,93 @@ describe("worktree tree snapshots", () => {
  * The previous cases all used `git init`, so nothing covered that indirection and the
  * exclude was in fact never mirrored in production.
  */
+/**
+ * `diffPathStatuses` — the per-tool-call change feed the file tree patches from.
+ *
+ * Run against real git rather than a parsed fixture because the risk being covered is
+ * a FORMAT assumption: `--name-status -z` emits `STATUS\0PATH\0` pairs, so its field
+ * count is doubled relative to the `--name-only` form this was derived from. Mis-pairing
+ * shifts every subsequent path onto the wrong status, which mislabels a delete as an add
+ * and makes a tree evict the wrong directory — with no error anywhere.
+ */
+describe("diffPathStatuses", () => {
+	test("reports added, modified and deleted paths with their own kinds", async () => {
+		const repo = await createRepo("nf-tree-diffstatus-");
+		writeFileSync(join(repo, "keep.txt"), "one\n");
+		writeFileSync(join(repo, "gone.txt"), "bye\n");
+		const before = await worktreeTreeSnapshot.capture(repo);
+
+		writeFileSync(join(repo, "keep.txt"), "two\n");
+		rmSync(join(repo, "gone.txt"));
+		writeFileSync(join(repo, "fresh.txt"), "new\n");
+		const after = await worktreeTreeSnapshot.capture(repo);
+
+		const statuses = await worktreeTreeSnapshot.diffPathStatuses(repo, before, after);
+		const byPath = new Map(statuses.map((entry) => [entry.path, entry.kind]));
+
+		expect(byPath.get("fresh.txt")).toBe("added");
+		expect(byPath.get("keep.txt")).toBe("updated");
+		expect(byPath.get("gone.txt")).toBe("deleted");
+		expect(statuses).toHaveLength(3);
+	});
+
+	test("agrees with diffPaths on which paths changed", async () => {
+		// The two methods must not drift: attribution uses one and the tree feed the
+		// other, and a path present in only one would mean the tree shows a state
+		// attribution never recorded (or the reverse).
+		const repo = await createRepo("nf-tree-diffstatus-agree-");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+		const before = await worktreeTreeSnapshot.capture(repo);
+		writeFileSync(join(repo, "a.txt"), "two\n");
+		writeFileSync(join(repo, "b.txt"), "new\n");
+		const after = await worktreeTreeSnapshot.capture(repo);
+
+		const paths = await worktreeTreeSnapshot.diffPaths(repo, before, after);
+		const statuses = await worktreeTreeSnapshot.diffPathStatuses(repo, before, after);
+
+		expect(statuses.map((entry) => entry.path).sort()).toEqual([...paths].sort());
+	});
+
+	test("handles paths containing spaces without splitting them", async () => {
+		// `-z` is what makes this safe; a space-separated format would break here.
+		const repo = await createRepo("nf-tree-diffstatus-space-");
+		const before = await worktreeTreeSnapshot.capture(repo);
+		writeFileSync(join(repo, "two words.txt"), "x\n");
+		const after = await worktreeTreeSnapshot.capture(repo);
+
+		const statuses = await worktreeTreeSnapshot.diffPathStatuses(repo, before, after);
+
+		expect(statuses).toEqual([{ path: "two words.txt", kind: "added" }]);
+	});
+
+	test("reports a rename as a delete plus an add", async () => {
+		// Rename detection is deliberately not requested, and both directories need
+		// re-reading anyway, so the split form is what the tree wants.
+		const repo = await createRepo("nf-tree-diffstatus-rename-");
+		mkdirSync(join(repo, "src"), { recursive: true });
+		writeFileSync(join(repo, "src", "old.txt"), "same bytes\n");
+		const before = await worktreeTreeSnapshot.capture(repo);
+
+		rmSync(join(repo, "src", "old.txt"));
+		writeFileSync(join(repo, "src", "new.txt"), "same bytes\n");
+		const after = await worktreeTreeSnapshot.capture(repo);
+
+		const statuses = await worktreeTreeSnapshot.diffPathStatuses(repo, before, after);
+		const byPath = new Map(statuses.map((entry) => [entry.path, entry.kind]));
+
+		expect(byPath.get("src/old.txt")).toBe("deleted");
+		expect(byPath.get("src/new.txt")).toBe("added");
+	});
+
+	test("returns nothing between identical trees", async () => {
+		const repo = await createRepo("nf-tree-diffstatus-same-");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+		const hash = await worktreeTreeSnapshot.capture(repo);
+
+		expect(await worktreeTreeSnapshot.diffPathStatuses(repo, hash, hash)).toEqual([]);
+	});
+});
+
 describe("linked worktrees", () => {
 	test("captures and restores a linked worktree", async () => {
 		const { worktree } = await createLinkedWorktree("nf-tree-linked-");

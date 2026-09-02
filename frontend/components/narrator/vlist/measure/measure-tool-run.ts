@@ -47,6 +47,15 @@
  *   trace row                            = 2 + max(14,12,16.8)     ≈ 18.8
  *   count line (Group py=2, no outer box)= 4 + max(16,16.8)        ≈ 20.8
  *
+ * ── The header band is CONDITIONAL (isTraceHeaderVisible) ────────────────────
+ * An `activity` trace showing its rows draws NO band: its label is generic while
+ * every row already names its own tool, so the ~20.8px was a fixed per-turn cost
+ * buying nothing. The band survives wherever it still does work — a collapsed
+ * activity fold (it is the only way back to the rows) and every other variant
+ * (`reasoning-steps` / `collapsible`, whose label identifies the list).
+ * `header.visible` carries the decision to the renderer; the block stays in the
+ * stack at height 0 so it keeps owning the outer top padding.
+ *
  * ── Expandable body (reasoning-step rows: standalone trace + activity fold) ──
  * A row's body is `Box pl="lg"(20) py={2} borderLeft:2px` wrapping MarkdownContent.
  * Like reasoning, the body renders at markdown `sm` (MarkdownContent.module.css
@@ -290,6 +299,14 @@ export interface TraceItemData {
 	 */
 	timing?: Partial<ToolTimingStamps> | null;
 	/**
+	 * Added / removed line counts for a Write/Edit row (`+12 -3`).
+	 *
+	 * HEIGHT-NEUTRAL for the same reason `status` and `timing` are: it is one nowrap
+	 * span sharing the row's fixed 18.8px line. Still keyed by `traceRevision`,
+	 * because the renderer paints it from the cached payload.
+	 */
+	diffStats?: { added: number; removed: number } | null;
+	/**
 	 * Selection / context-menu coordinates for this row (renderer only).
 	 *
 	 * Pure passthrough, exactly like `toolName` / `category` / `iconColor`: the
@@ -373,8 +390,20 @@ export interface TraceExpandState {
 export interface MeasuredTraceHeader {
 	/** Top offset (px) of the header Group (== outer top padding). */
 	top: number;
-	/** Header Group height (px) ≈ 20.8. */
+	/** Header Group height (px) ≈ 20.8, or 0 when the band is not drawn. */
 	height: number;
+	/**
+	 * Whether the header band is drawn at all.
+	 *
+	 * False only for an ACTIVITY trace whose rows are on screen (see
+	 * `isTraceHeaderVisible`): there the band is pure decoration — a generic
+	 * "Activity · N reasoning · N tools" line above rows that already name every
+	 * call — so it is dropped, and the ~20.8px it occupied goes to content.
+	 *
+	 * The renderer must skip the band when this is false, or it paints a header the
+	 * height model did not reserve and every row below it shifts.
+	 */
+	visible: boolean;
 	/** Whether a leading chevron is drawn (collapseItems). */
 	hasChevron: boolean;
 	/** Whether the folded list is currently open (itemsOpened). */
@@ -414,6 +443,12 @@ export interface MeasuredTraceRow {
 	 * Null when the row carried none, so the slot is skipped entirely.
 	 */
 	timing: ToolTimingStamps | null;
+	/**
+	 * Added / removed line counts for a Write/Edit row (renderer only;
+	 * height-neutral). Null when the row is not a file tool or the counts are
+	 * unknown — never `{ added: 0, removed: 0 }` for "unknown".
+	 */
+	diffStats: { added: number; removed: number } | null;
 	/** Tool name for picking the real category glyph (renderer only). */
 	toolName?: string;
 	/** Resolved tool category for the glyph (renderer only). */
@@ -491,7 +526,13 @@ export interface MeasuredTraceRow {
  */
 export interface MeasuredCollapsibleTrace extends MeasuredElement {
 	variant: TraceVariant;
-	/** Collapsed (header-only) band height (px) ≈ 24.8. */
+	/**
+	 * Collapsed (header-only) band height (px) ≈ 24.8.
+	 *
+	 * The height of the band WHEN IT IS DRAWN — it stays at the neutral 24.8 even for
+	 * a trace whose band is hidden (`header.visible === false`), because it is the
+	 * documented reference for the collapsed form, not a report of this measure.
+	 */
 	headerBandHeight: number;
 	/** True when the whole row list is folded → header only. */
 	collapsedToHeader: boolean;
@@ -545,6 +586,29 @@ function isExpandable(item: TraceItemData): boolean {
 	return typeof item.bodyText === "string" && item.bodyText.trim().length > 0;
 }
 
+/**
+ * Whether the header band earns its ~20.8px.
+ *
+ * The band has two jobs, and only one of them survives once the rows are visible:
+ *
+ *  - It is the FOLD TOGGLE. At L1 an activity unit collapses to the band alone, and
+ *    that band's chevron is the reader's only way back to the rows. Dropping it there
+ *    would strand the whole run behind nothing clickable, so `collapseItems` always
+ *    keeps it.
+ *  - It LABELS the trace. `reasoning-steps` needs that ("Reasoning · 5 steps" is the
+ *    only thing identifying the list), but the ACTIVITY fold's own label is generic —
+ *    "Activity · 0 reasoning · 4 tools" above rows that each already name their tool.
+ *    It is a fixed cost per assistant turn, and a turn with one tool call spent more
+ *    vertical space on the label than on the call.
+ *
+ * So the band is dropped for exactly one case: an `activity` trace with its rows on
+ * screen. Every other variant keeps it, and the collapsed activity fold keeps it too.
+ */
+function isTraceHeaderVisible(variant: TraceVariant, collapseItems: boolean): boolean {
+	if (collapseItems) return true;
+	return variant !== "activity";
+}
+
 function emptyTrace(
 	contentWidth: number,
 	variant: TraceVariant,
@@ -562,6 +626,7 @@ function emptyTrace(
 		header: {
 			top: 0,
 			height: 0,
+			visible: false,
 			hasChevron: false,
 			opened: false,
 			label: "",
@@ -616,14 +681,27 @@ export function measureCollapsibleTrace(
 	const blocks: PreparedBlock[] = [];
 
 	// Header carries the outer TOP padding as its marginTop.
+	//
+	// A hidden band is a ZERO-HEIGHT block rather than an absent one: it still owns
+	// the outer top padding, and keeping it in the stack keeps `blocks[0]` the header
+	// for every reader of the frame (the toggle/row indices below are derived, so they
+	// follow either way — but `frame.blocks[0]` is read directly).
+	const headerVisible = isTraceHeaderVisible(variant, collapseItems);
 	blocks.push(
-		fixedBlock("trace-header", traceMetrics().headerGroupHeight, TRACE_OUTER_PADDING_Y, 0, {
-			variant,
-			hasChevron: collapseItems,
-			opened: itemsOpened,
-			label: data.headerLabel ?? "",
-			count: data.headerCount ?? "",
-		}),
+		fixedBlock(
+			"trace-header",
+			headerVisible ? traceMetrics().headerGroupHeight : 0,
+			TRACE_OUTER_PADDING_Y,
+			0,
+			{
+				variant,
+				visible: headerVisible,
+				hasChevron: collapseItems,
+				opened: itemsOpened,
+				label: data.headerLabel ?? "",
+				count: data.headerCount ?? "",
+			},
+		),
 	);
 	const toggleBlockIndex = hasToggleRow ? blocks.length : -1;
 	if (hasToggleRow) {
@@ -702,6 +780,7 @@ export function measureCollapsibleTrace(
 	const header: MeasuredTraceHeader = {
 		top: headerFrame.top,
 		height: headerFrame.height,
+		visible: headerVisible,
 		hasChevron: collapseItems,
 		opened: itemsOpened,
 		label: data.headerLabel ?? "",
@@ -770,6 +849,7 @@ export function measureCollapsibleTrace(
 			// `recentCallTimings`.
 			status: item.status ?? null,
 			timing: item.timing ? resolveToolTimingStamps(item.timing) : null,
+			diffStats: item.diffStats ?? null,
 			shimmer: !!item.shimmer,
 			reflectionStatus: item.reflectionStatus,
 			expandable,

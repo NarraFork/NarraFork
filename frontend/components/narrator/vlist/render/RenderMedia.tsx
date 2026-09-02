@@ -200,8 +200,15 @@ function TextFileView({ block, frame }: { block: PreparedFixedBlock; frame: Bloc
 	const filename = typeof block.data?.filename === "string" ? block.data.filename : "";
 	const size = typeof block.data?.size === "number" ? block.data.size : null;
 	return (
-		<div style={{ position: "absolute", top: frame.top, left: 0 }}>
-			<TextFileRow filename={filename} size={size} height={block.height} />
+		<div style={{ position: "absolute", top: frame.top, left: 0, maxWidth: "100%" }}>
+			<TextFileRow
+				filename={filename}
+				size={size}
+				height={block.height}
+				// Reserved width from measure — bounds the filename so it truncates
+				// instead of wrapping out of the fixed single-line row.
+				width={block.displayWidth}
+			/>
 		</div>
 	);
 }

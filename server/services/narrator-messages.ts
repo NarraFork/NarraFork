@@ -70,6 +70,7 @@ import {
 } from "./snapshot-revert";
 // Pure in-memory state module (no imports of its own), so importing it here
 // cannot widen this file's already-delicate import cycle with narrator-service.
+import { getFileChangesBySubagent, type SubagentFileChanges } from "./subagent-file-changes";
 import { isTakenOver, listTakenOverSubagents } from "./subagent-takeover";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -1104,6 +1105,17 @@ export interface SubagentActivity {
 	reasoningEffort: string | null;
 	latestToolCalls: SubagentActivityToolCall[];
 	/**
+	 * Files this subagent changed, with cumulative line churn.
+	 *
+	 * A subagent has its own narrator record, so nothing else on the parent's card
+	 * could show what its child wrote to disk. Aggregated ONCE for every card on the
+	 * page (see `getFileChangesBySubagent`) rather than per card.
+	 *
+	 * Absent when the subagent changed nothing, so the common payload keeps its
+	 * previous size. Height-AFFECTING on the client: the card lists these rows.
+	 */
+	fileChanges?: SubagentFileChanges;
+	/**
 	 * The child is currently TAKEN OVER by the user, so the parent's tool call is
 	 * blocked until the user stops it (`subagent-takeover.ts`).
 	 *
@@ -1269,6 +1281,9 @@ async function buildSubagentActivities(
 	}
 	const narratorIds = [...new Set(owners.map((owner) => owner.subagentNarratorId))];
 	const toolCallsByNarrator = await loadLatestSubagentToolCalls(narratorIds);
+	// One aggregate for EVERY card on the page. A per-card query here would turn
+	// opening a session with a dozen Agent calls into a query storm on a list path.
+	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds);
 	for (const owner of owners) {
 		const effectiveReasoningEffort =
 			owner.reasoningEffort ??
@@ -1280,6 +1295,11 @@ async function buildSubagentActivities(
 			model: owner.model,
 			reasoningEffort: effectiveReasoningEffort ?? null,
 			latestToolCalls: toolCallsByNarrator.get(owner.subagentNarratorId) ?? [],
+			// Omitted (not an empty aggregate) when the child changed nothing, so a card
+			// that has no files to show carries no extra payload.
+			...(fileChangesByNarrator.has(owner.subagentNarratorId)
+				? { fileChanges: fileChangesByNarrator.get(owner.subagentNarratorId) }
+				: {}),
 			// Synchronous in-memory read (no query); omitted when false so the common
 			// snapshot stays the same size it was.
 			...(isTakenOver(owner.subagentNarratorId) ? { takenOver: true } : {}),

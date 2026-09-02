@@ -675,6 +675,30 @@ export type NarratorServerMessage =
 			linesRemoved?: number;
 	  }
 	| {
+			/**
+			 * Individual paths that changed under this narrator's worktree, so a file tree
+			 * can patch the affected directories rather than refetching.
+			 *
+			 * Paths are worktree-RELATIVE: the client knows its own root, and absolute
+			 * paths would disclose the host's directory layout to every subscriber.
+			 *
+			 * Only emitted while the native watcher is running
+			 * (`NARRAFORK_ENABLE_NATIVE_WATCHER=1`); the default polling fallback observes
+			 * no paths. A receiver must therefore treat this as an accelerator over its own
+			 * on-demand fetching, never as its only route to a fresh view.
+			 *
+			 * `truncated` says more changed than `changes` lists — the batch hit the
+			 * watcher's per-window cap. The list is then a sample, not the set, and the
+			 * receiver must invalidate broadly instead of applying it literally.
+			 */
+			type: "workspace_paths_changed";
+			narratorId: string;
+			chapterId: string;
+			toolUseId: string;
+			changes: readonly { path: string; kind: "added" | "updated" | "deleted" }[];
+			truncated: boolean;
+	  }
+	| {
 			type: "catch_up";
 			narratorId: string;
 			orphanChildren: unknown[];

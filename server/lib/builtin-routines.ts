@@ -122,6 +122,17 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		},
 	},
 	{
+		id: "scheduled_task",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "ScheduledTask",
+			descriptionEn:
+				"Scheduled task management — create, inspect, edit, enable/disable, delete and trigger cron tasks",
+			descriptionZh: "定时任务管理 — 创建、查看、编辑、启用/禁用、删除和立即触发 cron 任务",
+		},
+	},
+	{
 		id: "narrafork_admin",
 		type: "tool",
 		category: "tools",

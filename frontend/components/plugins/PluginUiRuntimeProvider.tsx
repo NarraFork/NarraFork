@@ -13,8 +13,6 @@ import {
 	type PluginUiPanelDelegate,
 	routePluginUiHostLocalRequest,
 } from "./host-local-router";
-import { pluginContributionStore, toPluginUiContribution } from "./PluginContributionStore";
-import type { PluginUiSessionContext } from "./PluginUiSurfaceContext";
 /*
  * The context, its record types, the two consumer hooks and `fallbackPluginUiContext` live
  * in `plugin-ui-runtime-context.ts`.
@@ -23,6 +21,9 @@ import type { PluginUiSessionContext } from "./PluginUiSurfaceContext";
  * provider is mounted in `App.tsx` — so the invalidation sat on the app shell's own
  * propagation path and turned shell edits into full page reloads. See that file's header.
  */
+import { readHostPresentation, subscribeHostPresentation } from "./host-presentation";
+import { pluginContributionStore, toPluginUiContribution } from "./PluginContributionStore";
+import type { PluginUiSessionContext } from "./PluginUiSurfaceContext";
 import {
 	fallbackPluginUiContext,
 	RuntimeContext,
@@ -290,6 +291,10 @@ export function PluginUiRuntimeProvider({
 							},
 							onNotification: (p, notification) => onNotificationRef.current?.(p, notification),
 							defaultTimeoutMs,
+							// Read at shell-build time, not captured here: a session can be rebuilt
+							// later (backend 401 recovery), and a value frozen now would rebuild the
+							// panel in whatever theme was active when it first opened.
+							getPresentation: readHostPresentation,
 							onStateChange: (snapshot) => {
 								const latest = sessionsRef.current.get(params.panelInstanceId);
 								if (latest?.controller !== controller) return;
@@ -334,6 +339,28 @@ export function PluginUiRuntimeProvider({
 			revokeSession,
 		],
 	);
+
+	/*
+	 * Push theme and language into every open panel when the host changes either.
+	 *
+	 * Both are sent on the same trigger because they share one observer, but they behave
+	 * differently on the far side: the shell applies the token CSS itself, while a locale change
+	 * only updates what `i18n.t()` returns and fires the plugin's `onChange`. A plugin that does
+	 * not subscribe therefore follows the theme but not the language — documented, not a defect.
+	 *
+	 * Every session is addressed, including ones still connecting; `sendNotification` drops the
+	 * message unless the port is ready, and those panels read the current values from their own
+	 * bootstrap anyway.
+	 */
+	useEffect(() => {
+		return subscribeHostPresentation(() => {
+			const presentation = readHostPresentation();
+			for (const record of sessionsRef.current.values()) {
+				record.controller?.setThemeTokens(presentation.tokenCss);
+				record.controller?.setLocale(presentation.locale, presentation.localeChain);
+			}
+		});
+	}, []);
 
 	const updateSessionParams = useCallback(
 		(panelInstanceId: string, params: PluginDockPanelParams) => {

@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import { BARE_ROW_CHEVRON, BARE_ROW_GAP, BARE_ROW_ICON } from "@shared/pretext-layout/row-metrics";
 import { installCanvasStub } from "./test-canvas-stub";
 
 // Install the deterministic canvas stub BEFORE importing any pretext-backed
@@ -33,7 +34,38 @@ describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () =>
 	it("header text line uses base line-height 1.55 → 19px; header row = 19", async () => {
 		const m = await mod();
 		expect(m.HEADER_TEXT_LINE_HEIGHT).toBe(19);
-		expect(m.HEADER_CATEGORY_ICON).toBe(16);
+		// The SAME tile a folded trace row uses (was 16, which resized the chip mid-morph).
+		expect(m.HEADER_CATEGORY_ICON).toBe(BARE_ROW_ICON);
+		expect(m.HEADER_CATEGORY_ICON).toBe(14);
+		// …and the swap is height-neutral, because the 19px text line dominates the `max`
+		// at both sizes. This is what let the icon be unified without touching any
+		// measured height.
+		expect(m.HEADER_ROW_HEIGHT).toBe(19);
+	});
+
+	/**
+	 * THE MORPH INVARIANT: the whole header line is moved by ONE `translate`, so every cell
+	 * in it must need the same displacement. That requires the two forms to agree on the
+	 * total width preceding the text — i.e. `icon + gap` must equal the row's.
+	 *
+	 * This held by ACCIDENT for a long time (card 16 + 4 = row 14 + 6 = 20) even though
+	 * neither number matched the row. Unifying the ICON alone broke the accident: the text
+	 * then needed 9px where the icon needed 7, and a single translate could not serve both,
+	 * so the text jumped 2px mid-morph. Asserted as a RELATIONSHIP rather than two
+	 * literals, because that is the property the morph actually depends on.
+	 */
+	it("keeps `icon + gap` identical to a folded row's, so one translate serves the line", async () => {
+		const m = await mod();
+		expect(m.HEADER_CATEGORY_ICON + m.HEADER_CELL_GAP).toBe(BARE_ROW_ICON + BARE_ROW_GAP);
+	});
+
+	it("needs the SAME shift for the icon and for the text", async () => {
+		const m = await mod();
+		const rowTextLeft = BARE_ROW_CHEVRON + BARE_ROW_GAP + BARE_ROW_ICON + BARE_ROW_GAP;
+		const cardTextLeft =
+			m.CARD_BORDER + m.CARD_PADDING + m.HEADER_CATEGORY_ICON + m.HEADER_CELL_GAP;
+		const iconShift = BARE_ROW_CHEVRON + BARE_ROW_GAP - (m.CARD_BORDER + m.CARD_PADDING);
+		expect(rowTextLeft - cardTextLeft).toBe(iconShift);
 		// The 19px text line is taller than the 16px icon lane.
 		expect(m.HEADER_ROW_HEIGHT).toBe(19);
 	});
@@ -861,11 +893,53 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 
 // ── LOD / effectiveOpened combinations ────────────────────────────────────────
 describe("resolveToolCallOpened — LOD gate mirrors ToolCallCard :5594", () => {
-	it("L5 always expands; L3 always collapses", async () => {
+	it("L5 expands an untouched card; L3 always collapses", async () => {
 		const { resolveToolCallOpened } = await mod();
 		const base = { lodExempt: false, isRecent: true, opened: true };
 		expect(resolveToolCallOpened(5, base)).toBe(true);
 		expect(resolveToolCallOpened(3, base)).toBe(false);
+	});
+
+	// L5 used to return a bare `true`, which made the header chevron DEAD there: the
+	// shell's toggle writes `!effectiveOpened` into the `expanded` map, so the click
+	// stored `false` into a channel this function never read and the card kept its
+	// height with no feedback at all. Worst on the cards that most need folding — a
+	// denied ExitPlanMode measures ~1200px (a 0.85×viewport plan body plus its
+	// reflection notice), i.e. more than a screenful the reader could not put away.
+	it("L5 honours an EXPLICIT fold", async () => {
+		const { resolveToolCallOpened } = await mod();
+		expect(
+			resolveToolCallOpened(5, {
+				lodExempt: false,
+				isRecent: true,
+				opened: false,
+				userCollapsed: true,
+			}),
+		).toBe(false);
+	});
+
+	// The distinction that keeps every other L5 card unchanged: `opened === false`
+	// derived from `computeDefaultOpen` is NOT a decision the reader made, so it must
+	// not collapse an L5 card. Only a stored preference (`userCollapsed`) may.
+	it("L5 ignores a merely-derived `opened: false`", async () => {
+		const { resolveToolCallOpened } = await mod();
+		expect(resolveToolCallOpened(5, { lodExempt: false, isRecent: true, opened: false })).toBe(
+			true,
+		);
+	});
+
+	// A folded approval form has nowhere to live, so the exemption must outrank an
+	// explicit fold rather than merely preceding it by luck of ordering.
+	it("lodExempt outranks an explicit fold at L5", async () => {
+		const { resolveToolCallOpened } = await mod();
+		expect(
+			resolveToolCallOpened(5, {
+				lodExempt: true,
+				isRecent: true,
+				opened: false,
+				userCollapsed: true,
+			}),
+		).toBe(true);
 	});
 
 	it("L4 follows `opened` for recent cards, collapses older cards", async () => {
@@ -915,6 +989,83 @@ describe("resolveToolCallOpened — LOD gate mirrors ToolCallCard :5594", () => 
 				lodUserOverride: true,
 			}),
 		).toBe(true);
+	});
+});
+
+// ── L5 folding, asserted through the MEASURE (what the reader actually sees) ───
+//
+// The unit assertions above pin `resolveToolCallOpened`, but this bug shipped
+// while a function-level test for L5 was passing: it asserted `true` for the
+// then-intended behaviour. What the reader experiences is a HEIGHT, and the way
+// they change it is the shell's toggle — which writes `!effectiveOpened` into the
+// stored preference. So this walks that exact loop and asserts the card's measured
+// height really moves, the one statement a dead chevron cannot satisfy.
+describe("measureToolCall — a card can be folded at L5", () => {
+	/** One click of the shell's header toggle, in shell semantics. */
+	function clickHeights(
+		measureToolCall: Awaited<ReturnType<typeof mod>>["measureToolCall"],
+		lod: 3 | 4 | 5,
+		isRecent: boolean,
+		clicks: number,
+	) {
+		const data = baseCard({
+			category: "plan",
+			status: "fail",
+			detail: {
+				kind: "capped",
+				cap: "plan",
+				contentLines: 40,
+				markdown: true,
+				text: "# Plan\n\n- one\n- two\n\n## Detail\n\nbody text\n",
+			},
+		});
+		// The shell routes to the override channel at exactly the levels where a card
+		// collapses by LOD; elsewhere it writes the `expanded` preference.
+		const collapsesByLod = lod === 3 || (lod === 4 && !isRecent);
+		const heights: number[] = [];
+		let opened: boolean | undefined;
+		let override = false;
+		for (let i = 0; i < clicks; i++) {
+			const m = measureToolCall(data, 600, lod, {
+				viewportHeight: 900,
+				isRecent,
+				...(opened === undefined ? {} : { opened }),
+				...(collapsesByLod ? { lodUserOverride: override } : {}),
+			});
+			heights.push(Math.round(m.height));
+			if (collapsesByLod) override = !override;
+			else opened = !m.effectiveOpened;
+		}
+		return heights;
+	}
+
+	it("folds and unfolds at L5, for a recent and an older card alike", async () => {
+		const { measureToolCall } = await mod();
+		for (const isRecent of [true, false]) {
+			const [first, second, third] = clickHeights(measureToolCall, 5, isRecent, 3);
+			// Starts expanded (L5 is the most detailed level), folds on the first click,
+			// and comes back on the second.
+			expect(second).toBeLessThan(first as number);
+			expect(third).toBe(first);
+		}
+	});
+
+	it("still opens expanded at L5 before any click", async () => {
+		const { measureToolCall } = await mod();
+		const [initial] = clickHeights(measureToolCall, 5, true, 1);
+		// A collapsed standalone card is 41px (CONTRACT §4); this must be the full card.
+		expect(initial).toBeGreaterThan(100);
+	});
+
+	it("leaves the L3 / older-L4 override channel working", async () => {
+		const { measureToolCall } = await mod();
+		for (const [lod, isRecent] of [
+			[3, true],
+			[4, false],
+		] as const) {
+			const [collapsed, expanded] = clickHeights(measureToolCall, lod, isRecent, 2);
+			expect(expanded).toBeGreaterThan(collapsed as number);
+		}
 	});
 });
 
@@ -1176,6 +1327,57 @@ describe("measureToolCall — lifecycle stamps reach the renderer", () => {
 			expect(timed.height).toBe(bare.height);
 			expect(timed.headerHeight).toBe(bare.headerHeight);
 			expect(timed.collapsedHeight).toBe(bare.collapsedHeight);
+		}
+	});
+});
+
+// ── `+N -N` line counts (height-neutral header passthrough) ───────────────────
+describe("measureToolCall — Write/Edit line counts", () => {
+	it("passes the counts through onto `diffStats`, defaulting to null", async () => {
+		// The renderer reads this off the measured payload, so it must arrive intact.
+		// Null (not `{0,0}`) is the "unknown" encoding — see `resolveFileDiffStats`.
+		const { measureToolCall } = await mod();
+		expect(
+			measureToolCall(baseCard({ diffStats: { added: 12, removed: 3 } }), 600, 4).diffStats,
+		).toEqual({ added: 12, removed: 3 });
+		expect(measureToolCall(baseCard(), 600, 4).diffStats).toBeNull();
+	});
+
+	it("is HEIGHT-NEUTRAL on a collapsed AND an expanded card", async () => {
+		// The figure rides the card's already-fixed header row as one nowrap span. If it
+		// ever reached the height math, a Write/Edit card would be a different height
+		// from every other card in the same run.
+		const { measureToolCall } = await mod();
+		const detail = { kind: "capped", cap: "term", contentLines: 4, text: "a\nb\nc\nd" } as const;
+		for (const opts of [{}, { opened: true }] as const) {
+			const bare = measureToolCall(baseCard({ detail }), 600, 4, opts);
+			for (const diffStats of [
+				{ added: 0, removed: 0 },
+				{ added: 1, removed: 1 },
+				// The widest realistic pair; it must not wrap the header.
+				{ added: 4820, removed: 3910 },
+			]) {
+				const counted = measureToolCall(baseCard({ detail, diffStats }), 600, 4, opts);
+				expect(counted.height).toBe(bare.height);
+				expect(counted.headerHeight).toBe(bare.headerHeight);
+				expect(counted.collapsedHeight).toBe(bare.collapsedHeight);
+			}
+		}
+	});
+
+	it("stays height-neutral at a narrow width, where the header is tightest", async () => {
+		// A phone-width card is where a non-shrinking figure could plausibly push the
+		// header into a second line; it must not.
+		const { measureToolCall } = await mod();
+		for (const width of [280, 360, 512]) {
+			const bare = measureToolCall(baseCard({ summary: "a".repeat(120) }), width, 4);
+			const counted = measureToolCall(
+				baseCard({ summary: "a".repeat(120), diffStats: { added: 4820, removed: 3910 } }),
+				width,
+				4,
+			);
+			expect(counted.height).toBe(bare.height);
+			expect(counted.headerHeight).toBe(bare.headerHeight);
 		}
 	});
 });

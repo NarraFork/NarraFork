@@ -1,3 +1,4 @@
+import { TOKEN_STYLE_ELEMENT_ID } from "./host-tokens";
 import type { JsonValue } from "./protocol";
 import {
 	createUiRequestId,
@@ -33,6 +34,19 @@ export interface PluginAssetShellOptions {
 	 */
 	runtimeUrl?: string;
 	runtimeStyleUrl?: string;
+	/**
+	 * Host presentation state for the panel's first frame.
+	 *
+	 * All optional so an omitting caller (tests, an older surface) produces the same shell as
+	 * before, minus the theme and language features. The defaults are inert: English, and no
+	 * token declarations at all — which leaves a plugin's `var(--nf-x, fallback)` on its
+	 * fallback rather than on an empty value.
+	 */
+	locale?: string;
+	/** Lookup order for translations, most specific first, always ending at `en`. */
+	localeChain?: readonly string[];
+	/** Pre-rendered `:root { --nf-*: … }` block; see `host-tokens.ts`. */
+	tokenCss?: string;
 }
 
 function escapeAttribute(value: string): string {
@@ -73,6 +87,22 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
 		runtimeUrl: options.runtimeUrl,
 		runtimeStyleUrl: options.runtimeStyleUrl,
 		timeout,
+		/*
+		 * Host presentation state, needed on the FIRST frame.
+		 *
+		 * Not fetched over `context.get`: that is an async RPC that cannot complete before the
+		 * plugin's first render, so a panel would paint unstyled and in the wrong language, then
+		 * correct itself. Both are pushed again later when the host changes them.
+		 *
+		 * `localeChain` is computed host-side and passed in rather than derived here. This file is
+		 * an inline string with no module loader, so it cannot import `@shared/i18n-locales`, and
+		 * reimplementing the alias/fallback rules inside it would create a second copy free to
+		 * drift from the one the rest of the app uses.
+		 */
+		locale: options.locale ?? "en",
+		localeChain: options.localeChain ?? ["en"],
+		tokenCss: options.tokenCss ?? "",
+		tokenStyleId: TOKEN_STYLE_ELEMENT_ID,
 	};
 	return `
 (() => {
@@ -126,6 +156,42 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
     post(message, ${PLUGIN_UI_REQUEST_MAX_BYTES});
   };
   const onNotification = (listener) => { notificationListeners.add(listener); return () => notificationListeners.delete(listener); };
+  // --- Host presentation state (theme tokens + language) ---
+  // Mutable: the host pushes replacements when the user changes either one.
+  let currentLocale = config.locale;
+  let currentChain = config.localeChain;
+  const localeListeners = new Set();
+  // Written into <head> by applyTokenCss. Styles must land before the plugin's first paint,
+  // so this runs during bootstrap rather than on the handshake.
+  let tokenStyle = null;
+  const applyTokenCss = (css) => {
+    if (!css) { if (tokenStyle) tokenStyle.textContent = ""; return; }
+    if (!tokenStyle) {
+      tokenStyle = document.createElement("style");
+      tokenStyle.id = config.tokenStyleId;
+      // Prepended so a plugin's own stylesheet can override a token if it needs to; a token
+      // that wins over the plugin's explicit CSS would make the panel unstyleable.
+      document.head.insertBefore(tokenStyle, document.head.firstChild);
+    }
+    tokenStyle.textContent = css;
+  };
+  applyTokenCss(config.tokenCss);
+  const translate = (tables, key, params) => {
+    if (!tables || typeof tables !== "object" || typeof key !== "string") return "";
+    let template;
+    for (const candidate of currentChain) {
+      const table = tables[candidate];
+      if (table && typeof table[key] === "string") { template = table[key]; break; }
+    }
+    // A key found nowhere yields the key itself: a button reading "signIn" is visibly a
+    // missing string, while an empty button looks like a rendering fault.
+    if (template === undefined) template = key;
+    if (!params) return template;
+    return template.replace(/\\{([a-zA-Z0-9_]+)\\}/g, (match, name) => {
+      const value = params[name];
+      return value === undefined ? match : String(value);
+    });
+  };
   const api = Object.freeze({
     request,
     notify,
@@ -166,6 +232,20 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
     }),
     notifications: Object.freeze({ show: (input) => request("notifications.show", input) }),
     ui: Object.freeze({ openExternal: (input) => request("ui.openExternal", input) }),
+    // Language. Theme needs no API at all: the host rewrites the token style element and the
+    // browser recalculates. Text cannot work that way -- a string already in the DOM can only
+    // be replaced by the plugin -- which is why this side needs an onChange hook.
+    i18n: Object.freeze({
+      // A getter, not a snapshot: freezing seals the descriptor, so the accessor keeps
+      // reporting the current value while the surface stays untamperable.
+      get locale() { return currentLocale; },
+      t: translate,
+      onChange: (listener) => {
+        if (typeof listener !== "function") return () => {};
+        localeListeners.add(listener);
+        return () => localeListeners.delete(listener);
+      },
+    }),
   });
   const validEnvelope = (message) => {
     if (!message || typeof message !== "object" || message.protocol !== config.protocol) return false;
@@ -183,6 +263,23 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
       clearTimeout(item.timer);
       if (message.error) item.reject(Object.assign(new Error(message.error.message), message.error));
       else item.resolve(message.result);
+      return;
+    }
+    // Presentation updates are handled here and NOT forwarded to plugin listeners: theme is
+    // applied by this shell, and language is delivered through the typed i18n.onChange
+    // channel. Passing them on as raw notifications too would give plugins a second, untyped
+    // way to observe the same thing.
+    if (message.method === "host.theme") {
+      applyTokenCss(typeof message.params?.tokenCss === "string" ? message.params.tokenCss : "");
+      return;
+    }
+    if (message.method === "host.locale") {
+      const next = message.params || {};
+      if (typeof next.locale === "string") currentLocale = next.locale;
+      if (Array.isArray(next.localeChain) && next.localeChain.length > 0) currentChain = next.localeChain;
+      // Listener failures are contained: one panel component throwing must not stop the rest
+      // of the panel from re-rendering in the new language.
+      for (const listener of localeListeners) { try { listener(currentLocale); } catch {} }
       return;
     }
     for (const listener of notificationListeners) listener(message);
@@ -284,7 +381,12 @@ export function createPluginAssetShell(options: PluginAssetShellOptions): string
 		.origin;
 	const csp = [
 		"default-src 'none'",
-		`sandbox allow-scripts`,
+		// ⚠️ NO `sandbox` directive here, deliberately: CSP's `sandbox` is header-only and is
+		// IGNORED in a `<meta>` tag (CSP Level 2 §3.3). Listing it read as the sandbox being
+		// declared twice for redundancy, when in fact only one declaration has ever done
+		// anything — the iframe's own `sandbox="allow-scripts"` attribute in
+		// `PluginUiRuntimeProvider`. Keeping the inert copy invites someone to "simplify" by
+		// deleting the attribute instead.
 		`script-src 'nonce-${escapeAttribute(options.nonce)}' ${assetOrigin}`,
 		`style-src ${assetOrigin} 'unsafe-inline'`,
 		`img-src ${assetOrigin} data: blob:`,

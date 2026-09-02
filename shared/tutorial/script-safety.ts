@@ -54,14 +54,50 @@ export interface ScriptSafetyViolation {
 	reason?: string;
 }
 
-/** Every string value inside a tool input, at any depth. */
-export function collectInputStrings(value: unknown, out: string[] = []): string[] {
-	if (typeof value === "string") out.push(value);
-	else if (Array.isArray(value)) for (const item of value) collectInputStrings(item, out);
-	else if (value && typeof value === "object") {
-		for (const item of Object.values(value)) collectInputStrings(item, out);
+/**
+ * Every string value inside a tool input, at any depth.
+ *
+ * `seen` guards against a cyclic object. Without it this recurses until the stack
+ * overflows, and it does so BEFORE the serialisability check below can report the
+ * cycle — so the one input shape that is guaranteed to break execution crashes the
+ * checker instead of being named by it. A safety predicate that throws on bad input
+ * cannot be used to reject bad input.
+ *
+ * A visited node is skipped rather than treated as a violation: this function only
+ * collects strings, and the cycle is diagnosed by
+ * {@link findToolUseViolations}'s round-trip check, which is where that verdict
+ * belongs.
+ */
+export function collectInputStrings(
+	value: unknown,
+	out: string[] = [],
+	seen: Set<object> = new Set(),
+): string[] {
+	if (typeof value === "string") {
+		out.push(value);
+		return out;
+	}
+	if (!value || typeof value !== "object") return out;
+	if (seen.has(value)) return out;
+	seen.add(value);
+	if (Array.isArray(value)) {
+		for (const item of value) collectInputStrings(item, out, seen);
+	} else {
+		for (const item of Object.values(value)) collectInputStrings(item, out, seen);
 	}
 	return out;
+}
+
+/**
+ * Every scripted value that can end up in an executed tool input.
+ *
+ * `localizedInput` is merged into `input` at resolution time, so scanning only
+ * `input` would leave a per-locale field completely unchecked — and a dangerous
+ * path in a zh-CN branch alone is exactly the kind of thing review misses.
+ */
+function scannableInputStrings(toolUse: TutorialScriptToolUse): string[] {
+	const out = collectInputStrings(toolUse.input);
+	return collectInputStrings(toolUse.localizedInput ?? {}, out);
 }
 
 function truncate(value: string): string {
@@ -86,7 +122,9 @@ export function isSandboxEscapingPath(value: string): boolean {
 export function findToolUseViolations(toolUse: TutorialScriptToolUse): ScriptSafetyViolation[] {
 	const violations: ScriptSafetyViolation[] = [];
 
-	for (const value of collectInputStrings(toolUse.input)) {
+	const scannable = scannableInputStrings(toolUse);
+
+	for (const value of scannable) {
 		if (value.startsWith("spec://")) continue;
 		if (ABSOLUTE_PATH.test(value)) {
 			violations.push({ kind: "absolutePath", value: truncate(value) });
@@ -96,10 +134,20 @@ export function findToolUseViolations(toolUse: TutorialScriptToolUse): ScriptSaf
 	}
 
 	if (toolUse.name === "Bash") {
-		const command = typeof toolUse.input.command === "string" ? toolUse.input.command : "";
-		for (const { pattern, reason } of FORBIDDEN_SHELL_PATTERNS) {
-			if (pattern.test(command)) {
-				violations.push({ kind: "forbiddenCommand", value: truncate(command), reason });
+		// Every scannable string, not `input.command` alone.
+		//
+		// `localizedInput` is merged into `input` before execution, so a per-locale
+		// `command` reaches the real shell while a check that reads only `input.command`
+		// never sees it — the same gap the path scan above already closes by scanning
+		// both. Over-scanning is the safe direction here: a forbidden pattern in any
+		// string of a Bash input is worth a review failure regardless of which field
+		// carried it, and these are authored scripts where a false positive costs a
+		// rewording.
+		for (const value of scannable) {
+			for (const { pattern, reason } of FORBIDDEN_SHELL_PATTERNS) {
+				if (pattern.test(value)) {
+					violations.push({ kind: "forbiddenCommand", value: truncate(value), reason });
+				}
 			}
 		}
 	}
@@ -108,13 +156,19 @@ export function findToolUseViolations(toolUse: TutorialScriptToolUse): ScriptSaf
 	// value that does not survive that round trip (undefined, a function, a cycle)
 	// silently disappears from the parsed input, so the tool runs with different
 	// arguments than the script declares.
-	try {
-		const raw = JSON.stringify(toolUse.input);
-		if (JSON.stringify(JSON.parse(raw)) !== raw) {
-			violations.push({ kind: "unserialisableInput", value: truncate(raw) });
+	//
+	// `localizedInput` is checked too: it is merged into the input that gets streamed,
+	// so an unserialisable value there fails in exactly the same way.
+	for (const candidate of [toolUse.input, toolUse.localizedInput]) {
+		if (candidate === undefined) continue;
+		try {
+			const raw = JSON.stringify(candidate);
+			if (JSON.stringify(JSON.parse(raw)) !== raw) {
+				violations.push({ kind: "unserialisableInput", value: truncate(raw) });
+			}
+		} catch {
+			violations.push({ kind: "unserialisableInput", value: "<not serialisable>" });
 		}
-	} catch {
-		violations.push({ kind: "unserialisableInput", value: "<not serialisable>" });
 	}
 
 	return violations;

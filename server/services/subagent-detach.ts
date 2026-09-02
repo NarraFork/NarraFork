@@ -9,6 +9,7 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
+import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import {
 	abandonManualOverride,
@@ -626,5 +627,9 @@ export async function attachSubagent(
 	}
 
 	const resultPrefix = agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId));
-	return resultPrefix + (result.finalText || "(no output)");
+	return appendSubagentFileChanges(
+		parentNarratorId,
+		null,
+		resultPrefix + (result.finalText || "(no output)"),
+	);
 }

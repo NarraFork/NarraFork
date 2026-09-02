@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { formatOriginLabel, type MessageOriginOptions } from "@shared/message-origin";
 import { isDanglingReasoningOnlyAssistantMessage } from "@shared/reasoning-content";
 import {
-	MAX_EDIT_ATTACHMENTS_PER_TYPE,
+	MAX_EDIT_IMAGES_PER_MESSAGE,
+	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 } from "@shared/text-file-types";
 import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
@@ -183,6 +184,7 @@ import {
 	getConclusionEntry,
 	setConclusionFileId,
 } from "./subagent-conclusion";
+import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import {
 	getConclusionWatcher,
@@ -4657,6 +4659,8 @@ export async function runAgentLoop(
 			if (narr && isSubagentVariant(narr.variant)) {
 				// For explore/plan subagents with a conclusion file, prefer reading
 				// the file content over extracting from the last assistant message.
+				// The file itself is KEPT on disk (like plan files): some workflows depend
+				// on the subagent leaving a durable markdown artifact behind.
 				let lastFinalText: string | undefined;
 				const concEntry = getConclusionEntry(narratorId);
 				if (concEntry) {
@@ -4666,10 +4670,9 @@ export async function runAgentLoop(
 							if (content && !loopHadError) {
 								lastFinalText = content;
 							}
-							rmSync(concEntry.absPath, { force: true });
 						}
 					} catch (err) {
-						logger.warn("Failed to read/cleanup takeover conclusion file", {
+						logger.warn("Failed to read takeover conclusion file", {
 							narratorId,
 							path: concEntry.absPath,
 							error: err instanceof Error ? err.message : String(err),
@@ -5269,7 +5272,11 @@ export async function updateToolCallConclusion(opts: {
 		refreshTiming = false,
 	} = opts;
 	const resultPrefix = agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId));
-	const output = resultPrefix + (finalText || "(no output)");
+	const output = await appendSubagentFileChanges(
+		parentNarratorId,
+		null,
+		resultPrefix + (finalText || "(no output)"),
+	);
 	const timing = refreshTiming
 		? resolveToolCallConclusionTiming(await narratorService.getToolCallByToolUseId(toolUseId))
 		: undefined;
@@ -6907,14 +6914,14 @@ async function editAndRegenerateUnlocked(
 	if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
 	}
-	if (keepImageIds.length + (opts?.newImages?.length ?? 0) > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
-		throw new ValidationError("Maximum 10 images per message");
+	if (keepImageIds.length + (opts?.newImages?.length ?? 0) > MAX_EDIT_IMAGES_PER_MESSAGE) {
+		throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 	}
 	if (
 		keepTextFilePaths.length + (opts?.newTextFiles?.length ?? 0) >
-		MAX_EDIT_ATTACHMENTS_PER_TYPE
+		MAX_EDIT_TEXT_FILES_PER_MESSAGE
 	) {
-		throw new ValidationError("Maximum 10 text files per message");
+		throw new ValidationError(`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`);
 	}
 	if (
 		!newContent.trim() &&

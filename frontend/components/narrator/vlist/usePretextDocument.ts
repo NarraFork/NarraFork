@@ -72,6 +72,8 @@ export interface UsePretextDocumentOptions {
 	showOriginal?: (key: string) => boolean;
 	/** Resolve whether a subagent card's prompt body is open. */
 	isPromptOpen?: (key: string) => boolean;
+	/** Reader expanded a subagent card's file-change list (its own fold). */
+	isFileChangesOpen?: (key: string) => boolean;
 	recentMessageIds?: ReadonlySet<string>;
 	resolveRecentMessageIds?: (messages: readonly NarratorMsg[]) => ReadonlySet<string>;
 	labels?: Record<string, string>;
@@ -337,6 +339,7 @@ export function usePretextDocument(
 			isRowExpanded: options.isRowExpanded,
 			showOriginal: options.showOriginal,
 			isPromptOpen: options.isPromptOpen,
+			isFileChangesOpen: options.isFileChangesOpen,
 			recentMessageIds: options.recentMessageIds,
 			resolveRecentMessageIds: options.resolveRecentMessageIds,
 			labels: options.labels,
@@ -423,6 +426,9 @@ export function usePretextDocument(
 			// applies: the resolver identity moves with the set or the card never
 			// unfolds.
 			options.isPromptOpen,
+			// Same contract: expanding a file list draws more rows, so the resolver
+			// identity must move with the set or the list never expands.
+			options.isFileChangesOpen,
 			options.topPadding,
 			options.viewportHeight,
 			options.widthBucket,

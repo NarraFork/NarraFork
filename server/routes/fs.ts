@@ -4,6 +4,7 @@ import {
 	type Dir,
 	type Dirent,
 	existsSync,
+	constants as fsConstants,
 	mkdirSync,
 	opendirSync,
 	readFileSync,
@@ -338,6 +339,17 @@ fsRoutes.get("/preview", async (c) => {
 const MAX_WRITE_BYTES = 1024 * 1024;
 
 /**
+ * Open flags for a human save: create/truncate as usual, but never follow a link at the
+ * final component.
+ *
+ * Numeric rather than the `"w"` string because `"w"` has no spelling that includes
+ * `O_NOFOLLOW`. See the write call for why this is needed at all (the boundary check and
+ * the write are separated by several awaits).
+ */
+const WRITE_FLAGS =
+	fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW;
+
+/**
  * `GET /api/fs/edit-source?path=...` — load a file FOR EDITING.
  *
  * ## Why the editor cannot just use `/preview`
@@ -475,8 +487,9 @@ fsRoutes.post("/write", async (c) => {
 
 	if (!decision.allowed) {
 		// Only `outside-allowed-roots` may be overridden by user confirmation.
-		// Secret-path and symlink-escape are hard refusals: `confirmable` is never
-		// set on them because `checkWriteBoundary` runs those checks first.
+		// Secret-path, git-internal and symlink-escape are hard refusals:
+		// `confirmable` is never set on them because `checkWriteBoundary` runs
+		// those checks first.
 		if (decision.confirmable && !body.confirmOutsideRoots) {
 			// 409 rather than 403: the write IS possible, it just needs the user to
 			// see the real physical path and consciously agree. The physical path is
@@ -569,7 +582,27 @@ fsRoutes.post("/write", async (c) => {
 		await mkdir(dirname(target), { recursive: true });
 		// The bytes encoded above, not the string: writing the string would re-encode it
 		// as UTF-8 and convert a legacy-charset file on every save.
-		await writeFile(target, outputBytes);
+		//
+		// ── Why the flags ────────────────────────────────────────────────
+		// `checkWriteBoundary` resolved this path minutes of event-loop time ago: the
+		// narrator lookup, the existence check, the decode and the hash comparison all
+		// awaited in between. A link planted in that window at the final component would
+		// be followed by a plain `writeFile`, sending the bytes somewhere the boundary
+		// never saw. `O_NOFOLLOW` makes the kernel refuse instead (ELOOP).
+		//
+		// Writing `target` — the RESOLVED path — is what keeps this compatible with the
+		// legitimate case: a symlink that stays inside the workspace was already followed
+		// during validation, so the final component here is the real file and the flag has
+		// nothing to object to. Only a link that appeared AFTER validation trips it.
+		//
+		// Not complete, and cannot be with this API: `O_NOFOLLOW` covers the last
+		// component only, so swapping an intermediate DIRECTORY for a link is still
+		// possible in principle (that needs `openat2`/`RESOLVE_NO_SYMLINKS`, which Node's
+		// fs does not expose). Both require local write access to the workspace, which in
+		// this deployment model already implies the server's own privileges — so this
+		// closes the cheap half and the remainder is bounded by the trust model, not left
+		// unnoticed.
+		await writeFile(target, outputBytes, { flag: WRITE_FLAGS });
 	} catch (err) {
 		// Sealed on the error path for the same reason the tool hooks do it: an unclosed
 		// claim is read as "still running" and would shadow every later window.
@@ -594,6 +627,49 @@ fsRoutes.post("/write", async (c) => {
 			action: "human",
 			lineStats: wholeFileLineStats(previousContent, body.content),
 		});
+
+		// ── Tree snapshot boundary for the save ──────────────────────────────
+		//
+		// Tree hashes are captured around agent TOOL calls, and a human save is not one,
+		// so without this the bytes land inside whatever window the next tool opens.
+		// Two consequences, both silent:
+		//
+		//   1. Reverting that tool call also reverts the person's edit, because the
+		//      window's `before` predates it.
+		//   2. Worse, `session._lastTreeHash` is reused as the next tool's `before`.
+		//      Segment planning decides "nothing else wrote in between" by testing
+		//      `previous.after === next.before`, so a stale `before` can MERGE two
+		//      segments that should have stayed split — reversing whatever landed in
+		//      between. See `invalidateWorkspaceTreeCache`.
+		//
+		// The watcher does eventually take a boundary, but not reliably soon: the
+		// default path is polling, and a same-size edit to an already-dirty file keeps
+		// the status signature byte-identical, so the boundary can wait for the
+		// `MAX_SKIPPED_POLLS` sweep (~1 minute). A save is a discrete event we are
+		// already inside, so it takes its own boundary instead of waiting to be noticed.
+		//
+		// Best-effort and ordered cache-first: the bytes are already on disk, so nothing
+		// here may fail the request, and dropping the cache matters more than recording
+		// the boundary (a missing boundary loses undo granularity, a stale one reverses
+		// someone else's work).
+		try {
+			const { invalidateWorkspaceTreeCache } = await import("../services/narrator-session-state");
+			invalidateWorkspaceTreeCache(cwd);
+			const { worktreeTreeSnapshot } = await import("../services/worktree-tree-snapshot");
+			const treeHash = await worktreeTreeSnapshot.tryCapture(cwd, LOCAL_DEVICE_ID);
+			if (treeHash) {
+				// Linked into the snapshot DAG for the same reason the watcher does it: a fork
+				// taken after this save must start from a state that includes it.
+				const { advanceChapterSnapshot } = await import("../services/chapter-snapshot-ref");
+				await advanceChapterSnapshot(cwd, treeHash, "human editor save");
+			}
+		} catch (err) {
+			logger.debug("Tree snapshot boundary failed after human save", {
+				narratorId,
+				path: claimPath,
+				error: String(err),
+			});
+		}
 	}
 
 	// ── Notify narrator (best-effort) ────────────────────────────────────

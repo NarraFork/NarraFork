@@ -9,9 +9,17 @@ import { scheduledTaskService } from "../services/scheduled-task-service";
 
 export const scheduledTaskRoutes = new Hono();
 
-/** List all scheduled tasks. */
+/**
+ * List scheduled tasks.
+ *
+ * Returns a bare array, which is the shape the UI has always consumed. The service's
+ * `truncated` flag is surfaced as a header rather than by wrapping the body in an
+ * object: changing the body shape would break every existing client for a signal that
+ * only fires above 500 tasks, and a header is readable by the ones that care.
+ */
 scheduledTaskRoutes.get("/", async (c) => {
-	const tasks = await scheduledTaskService.list();
+	const { tasks, truncated } = await scheduledTaskService.list();
+	if (truncated) c.header("X-NarraFork-Truncated", "1");
 	return c.json(tasks);
 });
 

@@ -13,14 +13,23 @@
  * identity there.
  */
 
+import {
+	MAX_EDIT_IMAGES_PER_MESSAGE,
+	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
+} from "@shared/text-file-types";
 import type {
 	BufferedImageSummary,
 	BufferedTextFileSummary,
 	BufferMessageSummary,
 } from "../../lib/api/types";
 
-/** Attachments (per type) a queued message may carry; mirrors the server limit. */
-export const MAX_QUEUED_ATTACHMENTS = 10;
+/**
+ * Attachments a queued message may carry, per type; mirrors the server limits.
+ * Images and text files differ: a message may legitimately carry many
+ * screenshots, while text files stay at the lower bound.
+ */
+export const MAX_QUEUED_IMAGES = MAX_EDIT_IMAGES_PER_MESSAGE;
+export const MAX_QUEUED_TEXT_FILES = MAX_EDIT_TEXT_FILES_PER_MESSAGE;
 
 export interface QueuedEditAttachmentState {
 	text: string;
@@ -54,9 +63,14 @@ export function seedQueuedEditAttachments(msg: BufferMessageSummary): {
 	};
 }
 
-/** How many more attachments of one type may still be added. */
-export function remainingAttachmentRoom(keptCount: number, newCount: number): number {
-	return Math.max(0, MAX_QUEUED_ATTACHMENTS - keptCount - newCount);
+/** How many more images may still be added. */
+export function remainingImageRoom(keptCount: number, newCount: number): number {
+	return Math.max(0, MAX_QUEUED_IMAGES - keptCount - newCount);
+}
+
+/** How many more text files may still be added. */
+export function remainingTextFileRoom(keptCount: number, newCount: number): number {
+	return Math.max(0, MAX_QUEUED_TEXT_FILES - keptCount - newCount);
 }
 
 /**

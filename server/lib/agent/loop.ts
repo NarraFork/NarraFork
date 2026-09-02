@@ -760,6 +760,11 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	"Terminal",
 	"ShareFile",
 	"NarraForkAdmin",
+	// ScheduledTask mutations self-gate via ctx.requestPermission and can launch a
+	// narrator (run_now). Eager mid-stream execution would open an approval prompt —
+	// or dispatch an unattended run — before the assistant message that requested it
+	// is even complete.
+	"ScheduledTask",
 	"ForkNarrator",
 	"EnterPlanMode",
 	...DANGER_REFLECTION_TOOLS,
@@ -5966,15 +5971,17 @@ export async function* agentLoop(
 			// and model-facing tool results consume the completed calls.
 			sortToolUsesByOutputOrder();
 
-			// Reserve this turn's tool_use identifiers against the ones already in history.
+			// Reserve this turn's tool_use identifiers against the ones already in history,
+			// and coerce them into the character set every channel accepts.
 			// Providers that mint a single id for every call (e.g. "call_go_0") would otherwise
 			// make the replayed history carry the same id in several assistant messages, which
-			// the API rejects with 400 "duplicate tool_use id". Only the model-facing history is
-			// renamed — the tool_use objects below keep the provider's original id, so
+			// the API rejects with 400 "duplicate tool_use id"; ids like "Bash:0" are accepted
+			// session the moment it is switched there. Only the model-facing history is
+			// rewritten — the tool_use objects below keep the provider's original id, so
 			// persistence, the UI, and permission/approval flows are unaffected.
 			const turnToolUseIdRemap = reserveUniqueToolUseIds(toolUses, historyToolUseIds);
 			if (turnToolUseIdRemap.size > 0) {
-				logger.warn("Renamed duplicate tool_use IDs for model history", {
+				logger.warn("Rewrote unusable tool_use IDs for model history", {
 					narratorId: config.narratorId,
 					provider: effectiveProvider,
 					model: effectiveModel,

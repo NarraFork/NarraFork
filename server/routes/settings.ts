@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import { Hono } from "hono";
@@ -352,7 +353,24 @@ export const updateSettingsSchema = z
 			})
 			.optional(),
 		paths: z
-			.object({ defaultProjectDir: z.string().min(1) })
+			.object({
+				defaultProjectDir: z.string().min(1),
+				/**
+				 * Extra roots the in-browser editor may write to.
+				 *
+				 * Absolute paths only, and rejected otherwise rather than resolved against
+				 * the server's cwd: a relative entry would name a directory the admin cannot
+				 * predict, and this list is a write allow-list. Bounded in length because it
+				 * is consulted on every save (each entry costs a `realpath` walk).
+				 *
+				 * Containment, symlink resolution and the credential deny-list are enforced
+				 * at write time by `checkWriteBoundary`, not here — an entry that looks
+				 * reasonable can still stop being safe once a link inside it changes.
+				 */
+				extraWritableDirs: z
+					.array(z.string().min(1).refine(isAbsolute, "must be an absolute path"))
+					.max(32),
+			})
 			.partial()
 			.optional(),
 		/**

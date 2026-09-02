@@ -177,6 +177,65 @@ describe("measureMessageBubble — user attachments", () => {
 		expect(withFile.height - plain.height).toBe(c.USER_TEXT_FILE_HEIGHT + c.USER_ATTACHMENT_GAP);
 	});
 
+	// The reported bug: a long attachment filename in a user bubble. The row is
+	// reserved at ONE line, so if the bubble shrink-wraps to the short caption the
+	// filename has nowhere to go — it wrapped, overflowed the reserved 26px, and
+	// collided with the text underneath. The bubble must widen around the row.
+	it("widens the bubble around a long attachment filename instead of the caption", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const longName = "api-request-2026-09-01T17-58-20-793Z-WsKWNTpwoGGUne6.json";
+		const short = measureMessageBubble(
+			{
+				role: "user",
+				text: "看一下",
+				attachments: [{ type: "text_file", filename: "a.md", size: 512 }],
+			},
+			1000,
+		);
+		const long = measureMessageBubble(
+			{
+				role: "user",
+				text: "看一下",
+				attachments: [{ type: "text_file", filename: longName, size: 855_450 }],
+			},
+			1000,
+		);
+		expect(long.usedWidth).toBeGreaterThan(short.usedWidth);
+		// The row's own reserved box must fit inside the bubble's content area.
+		const fixed = long.blocks.find((b) => b.kind === "fixed");
+		expect(fixed?.kind).toBe("fixed");
+		if (fixed?.kind === "fixed") {
+			expect(fixed.displayWidth).toBeGreaterThan(0);
+			expect(fixed.displayWidth!).toBeLessThanOrEqual(long.usedWidth - c.USER_BUBBLE_PADDING * 2);
+			// And it stays ONE line tall — widening must not have cost height.
+			expect(fixed.height).toBe(c.USER_TEXT_FILE_HEIGHT);
+		}
+	});
+
+	it("caps a filename longer than the column at the bubble's inner width", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		const r = measureMessageBubble(
+			{
+				role: "user",
+				text: "",
+				attachments: [{ type: "text_file", filename: "n".repeat(400), size: 1024 }],
+			},
+			400,
+		);
+		expect(r.usedWidth).toBeLessThanOrEqual(400);
+		const fixed = r.blocks.find((b) => b.kind === "fixed");
+		if (fixed?.kind === "fixed") {
+			expect(fixed.displayWidth).toBe(400 - c.USER_BUBBLE_PADDING * 2);
+			expect(fixed.height).toBe(c.USER_TEXT_FILE_HEIGHT);
+		}
+	});
+
 	// `filePath` rides along so the render layer can make the row clickable. It is
 	// a pure passthrough: the measurement cache does not key on attachment data, so
 	// if it EVER moved the height the vlist would serve stale geometry for every

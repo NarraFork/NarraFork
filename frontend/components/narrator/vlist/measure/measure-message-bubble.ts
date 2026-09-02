@@ -39,7 +39,12 @@ import {
 	typographyMetrics,
 } from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
-import { IMAGE_FIXED_HEIGHT, IMAGE_MAX_DISPLAY_HEIGHT, TEXT_FILE_HEIGHT } from "./measure-media";
+import {
+	IMAGE_FIXED_HEIGHT,
+	IMAGE_MAX_DISPLAY_HEIGHT,
+	TEXT_FILE_HEIGHT,
+	textFileRowNaturalWidth,
+} from "./measure-media";
 import { pretextLineMetrics } from "./pretext-metrics";
 
 // ── Chrome constants (px) — from CONTRACT.md §4 / Mantine defaults ───────────
@@ -275,12 +280,26 @@ function attachmentBlock(
 	if (!isImage && attachment.type !== "text_file") return null;
 	const natural = isImage ? readImageIntrinsicSize(attachment.width, attachment.height) : null;
 	const fit = natural ? fitImageBox(natural, innerWidth, IMAGE_MAX_DISPLAY_HEIGHT) : null;
+	// A text-file row is reserved at ONE line and truncates instead of wrapping, so
+	// its painted width is a pure function of its data. Reporting it lets the bubble
+	// widen around a long filename (up to the column) instead of shrink-wrapping to
+	// the caption and pushing the row outside the box measure already committed to.
+	const textFileWidth = isImage
+		? null
+		: Math.min(
+				innerWidth,
+				textFileRowNaturalWidth({
+					filename: attachment.filename ?? undefined,
+					size: typeof attachment.size === "number" ? attachment.size : undefined,
+				}),
+			);
+	const displayWidth = fit?.displayWidth ?? textFileWidth;
 	return {
 		kind: "fixed",
 		marginTop,
 		height: isImage ? (fit?.displayHeight ?? IMAGE_FIXED_HEIGHT) : TEXT_FILE_HEIGHT,
 		tag: isImage ? "user-image" : "user-text-file",
-		...(fit ? { displayWidth: fit.displayWidth } : {}),
+		...(displayWidth != null ? { displayWidth } : {}),
 		data: {
 			imageId: attachment.imageId ?? null,
 			previewUrl: attachment.previewUrl ?? null,

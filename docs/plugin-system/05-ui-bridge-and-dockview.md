@@ -391,6 +391,95 @@ interface ShowNotificationInput {
 - **[建议]** notification ID 是 session 级 opaque ID，插件只能 update/dismiss 自己创建的通知。
 - **[假设]** 需要持久通知时应委托服务端通知系统，而不是让 iframe 常驻维持；具体权限由事件/API 文档定义。
 
+### 7.5b 主题 token 与 i18n API（已实现）
+
+面板运行在独立 document 里，拿不到宿主的样式表和 i18n 实例。若不提供这两样，
+每个面板都会自己长出一套硬编码配色和一套语言检测——这已经发生过：
+`cline-external` 硬编码了 8 个十六进制色值且只有英文，
+
+#### 主题：CSS 变量，插件零代码
+
+宿主向 iframe 注入 `<style id="nf-tokens">`，内容是当前生效的 14 个语义 token：
+
+| 用途 | 变量 |
+|---|---|
+| 页面背景 / 正文 / 次要文字 | `--nf-color-body`、`--nf-color-text`、`--nf-color-dimmed` |
+| 面板底色 / 边框 | `--nf-color-surface`、`--nf-color-border` |
+| 主色 / 悬停 | `--nf-color-primary`、`--nf-color-primary-hover` |
+| 语义色 | `--nf-color-error`、`--nf-color-success`、`--nf-color-warning` |
+| 字体 | `--nf-font`、`--nf-font-mono` |
+| 圆角 / 间距 | `--nf-radius`、`--nf-spacing` |
+
+**用法：** `color: var(--nf-color-text, #e6e6e6)`。
+带 fallback 是必要的——老宿主不注入任何 token，此时 fallback 就是面板原本的样子。
+
+**值来自 `getComputedStyle(document.documentElement)`，不是一张映射表。**
+这是本能力的关键实现决定：OLED（`frontend/styles/oled.css`）和插件贡献主题
+（`theme-compiler.ts`）都是**覆写同一批 `--mantine-*` 变量**生效的，
+所以读取实际计算值能让两者自动流到面板；而硬编码「dark 就是 #1a1b1e」的表两者都拿不到，
+且症状只是颜色差一档，没人会报告。`host-tokens.test.ts` 专门钉住这一点。
+
+**主题切换无需插件参与**：宿主重写那个 `<style>` 的内容，浏览器自行重算。
+触发源有四个——Mantine colorScheme、OLED、插件主题（三者是 `<html>` 属性，
+由一个 `MutationObserver` 覆盖）以及插件主题**规则内容**变化
+（属性没动，由 `PluginThemeInjector` 显式调用 `notifyPluginThemeChanged()` 上报）。
+
+**token 集合刻意只有 14 个。** 每个名字都是插件可以永久引用的公开契约，
+导出整套 Mantine 变量会让任何内部重构变成第三方插件的破坏性变更。
+这与 `theme-compiler.ts` 只接受白名单 token（而非裸 CSS）是同一个取舍，方向相反。
+
+#### i18n：宿主给规则，插件给词表
+
+```ts
+interface PluginI18nApi {
+  /** 宿主当前语言（已归一化，如 `en`、`zh-CN`）。getter，随宿主切换变化。 */
+  readonly locale: string;
+  /** 查表 + 回退 + 插值。每次调用按当前 locale 现算。 */
+  t(
+    tables: { en: Record<string, string>; [locale: string]: Record<string, string> | undefined },
+    key: string,
+    params?: Record<string, string | number>,
+  ): string;
+  /** 语言变化时重渲染。返回退订函数。 */
+  onChange(listener: (locale: string) => void): () => void;
+}
+```
+
+**词表留在插件侧**，因为只有插件知道自己的文案；宿主提供的是对所有插件都一样的部分：
+当前语言是什么、缺翻译时怎么回退。
+
+**回退顺序**用宿主自己的 `getLocaleFallbackChain`：精确匹配 → 别名归一
+（`zh-Hans`/`zh-SG` → `zh-CN`）→ `en` → **返回 key 本身**。
+返回 key 而不是空串：按钮上显示 `signIn` 一眼看出是缺翻译，
+空按钮则与渲染故障无法区分，会被当成后者排查。
+`en` 表是必需的，因为它终结每条回退链。
+
+**插值** `{name}`，缺参数时保留原样占位符（同理，可见的 `{amount}` 比空白好排查）。
+单次替换，不递归——否则译文可以插值到调用方未打算暴露的参数。
+
+**⚠️ 语言跟随需要插件配合，主题不需要。** 这是两条通道的真实差异：
+CSS 变量一改浏览器自己重算，而**已经写进 DOM 的字符串只能由插件重写**。
+不订阅 `onChange` 的面板会在切语言后保持旧文案直到重挂载——
+这是插件的选择，不是平台缺陷。
+
+**不暴露宿主自己的翻译资源。** 宿主 `settings` 命名空间的键名随普通重构而变，
+目的是与内置面板无法区分），但那是一次性人工核对，不是运行时依赖。
+
+#### 首帧值与 `context.host` 的关系
+
+`locale`、`localeChain` 和 token CSS 都随 shell bootstrap 传入，因为
+`context.get` 是异步 RPC，无法在插件首帧前完成——否则面板会先无样式、错语言地画一遍再自我纠正。
+
+`context.host.locale` 与 `context.host.colorScheme` 仍然存在，但它们是**建立时的快照**
+（`context.subscribe` 尚未实现）。跟随语言用 `narrafork.i18n`，跟随主题用 CSS 变量；
+`context.host` 的这两个字段只适合做一次性判断。
+
+> 实现：`frontend/components/plugins/host-tokens.ts`（token 定义与读取）、
+> `host-presentation.ts`（变化侦测）、`asset-shell.ts`（注入与 SDK）、
+> `plugin-i18n.ts`（宿主侧查表）。
+> shell 内联了第二份查表实现（它是模板字符串，无法 import），
+> `asset-shell-presentation.test.ts` 用同一批输入比对两者，防止漂移。
+
 ### 7.6 Storage API
 
 ```ts

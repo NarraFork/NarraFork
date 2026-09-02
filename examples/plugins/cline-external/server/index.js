@@ -320,7 +320,7 @@ async function refreshAccessToken(credentials, apiBaseUrl, proxyUrl) {
 function parseCallbackUrl(callbackUrl) {
   let url;
   try {
-    url = new URL(callbackUrl.trim());
+    url = new URL(withCallbackScheme(callbackUrl.trim()));
   } catch {
     throw new AuthInputError("That does not look like a URL");
   }
@@ -357,6 +357,15 @@ function parseCallbackUrl(callbackUrl) {
     displayName: data.name || [data.firstName, data.lastName].filter(Boolean).join(" ") || "",
     startedAt: Date.now()
   };
+}
+function withCallbackScheme(value) {
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value))
+    return value;
+  const candidate = value.startsWith("//") ? value.slice(2) : value;
+  if (/^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$|\?)/i.test(candidate)) {
+    return `http://${candidate}`;
+  }
+  return value;
 }
 
 class AuthInputError extends Error {
@@ -937,6 +946,7 @@ async function status(_input, context) {
       poolModelCount: cachedModelPool().length,
       browserAuth,
       signInPending: pending !== undefined,
+      ...pending ? { authorizeUrl: pending.authorizeUrl } : {},
       chatBaseUrl: chatBase(context)
     }
   };

@@ -12,10 +12,12 @@ import type { BufferMessageSummary } from "../../lib/api/types";
 import {
 	buildQueuedEditPayload,
 	canSubmitQueuedEdit,
-	MAX_QUEUED_ATTACHMENTS,
+	MAX_QUEUED_IMAGES,
+	MAX_QUEUED_TEXT_FILES,
 	type QueuedEditAttachmentState,
 	queuedEditTouchesAttachments,
-	remainingAttachmentRoom,
+	remainingImageRoom,
+	remainingTextFileRoom,
 	seedQueuedEditAttachments,
 } from "./queued-attachment-edit";
 
@@ -92,15 +94,40 @@ describe("seedQueuedEditAttachments", () => {
 	});
 });
 
-describe("remainingAttachmentRoom", () => {
+describe("remainingImageRoom", () => {
 	test("counts kept and newly added against the same limit", () => {
-		expect(remainingAttachmentRoom(0, 0)).toBe(MAX_QUEUED_ATTACHMENTS);
-		expect(remainingAttachmentRoom(4, 3)).toBe(MAX_QUEUED_ATTACHMENTS - 7);
+		expect(remainingImageRoom(0, 0)).toBe(MAX_QUEUED_IMAGES);
+		expect(remainingImageRoom(4, 3)).toBe(MAX_QUEUED_IMAGES - 7);
 	});
 
 	test("never reports negative room once the limit is reached or exceeded", () => {
-		expect(remainingAttachmentRoom(MAX_QUEUED_ATTACHMENTS, 0)).toBe(0);
-		expect(remainingAttachmentRoom(MAX_QUEUED_ATTACHMENTS, 5)).toBe(0);
+		expect(remainingImageRoom(MAX_QUEUED_IMAGES, 0)).toBe(0);
+		expect(remainingImageRoom(MAX_QUEUED_IMAGES, 5)).toBe(0);
+	});
+});
+
+describe("remainingTextFileRoom", () => {
+	test("counts kept and newly added against the same limit", () => {
+		expect(remainingTextFileRoom(0, 0)).toBe(MAX_QUEUED_TEXT_FILES);
+		expect(remainingTextFileRoom(4, 3)).toBe(MAX_QUEUED_TEXT_FILES - 7);
+	});
+
+	test("never reports negative room once the limit is reached or exceeded", () => {
+		expect(remainingTextFileRoom(MAX_QUEUED_TEXT_FILES, 0)).toBe(0);
+		expect(remainingTextFileRoom(MAX_QUEUED_TEXT_FILES, 5)).toBe(0);
+	});
+});
+
+describe("image and text-file room are independent", () => {
+	// The two used to share one constant, so raising the image bound would have
+	// silently raised the text-file bound too.
+	test("images allow strictly more than text files", () => {
+		expect(MAX_QUEUED_IMAGES).toBeGreaterThan(MAX_QUEUED_TEXT_FILES);
+	});
+
+	test("a full text-file set leaves image room untouched", () => {
+		expect(remainingTextFileRoom(MAX_QUEUED_TEXT_FILES, 0)).toBe(0);
+		expect(remainingImageRoom(MAX_QUEUED_TEXT_FILES, 0)).toBeGreaterThan(0);
 	});
 });
 

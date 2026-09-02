@@ -450,11 +450,15 @@ function UserAttachmentView({
 		const filePath = str(data.filePath);
 		const openFile = filePath && onOpenAttachment ? () => onOpenAttachment(filePath) : undefined;
 		return (
-			<div style={{ position: "absolute", top, left, height: block.height }}>
+			<div style={{ position: "absolute", top, left, height: block.height, maxWidth: "100%" }}>
 				<TextFileRow
 					filename={str(data.filename) ?? ""}
 					size={typeof data.size === "number" ? data.size : null}
 					height={block.height}
+					// The exact box measure reserved. Without it the row is unbounded
+					// inside this absolutely positioned host, so a long filename wraps
+					// out of its single reserved line.
+					width={block.displayWidth}
 					onOpen={openFile}
 					openLabel={openAttachmentLabel}
 				/>

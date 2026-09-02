@@ -110,6 +110,11 @@ export type RevertWarning =
 			otherActorCount: number;
 			externalCount: number;
 			unserializedCount: number;
+			/**
+			 * Human edits in the window. Optional for wire compatibility with a server
+			 * that predates the field; absent is read as zero.
+			 */
+			humanCount?: number;
 			sampleFilePaths: string[];
 	  }
 	| {

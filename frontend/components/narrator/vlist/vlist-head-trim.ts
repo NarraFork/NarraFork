@@ -86,6 +86,42 @@ export function trimClockNow(): number {
 	return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
 
+/**
+ * Whether the "live row just cleared" edge may run a trim now, and what the edge
+ * bookkeeping should become.
+ *
+ * The shell evaluates trimming when the streaming row disappears, because that used
+ * to mean exactly one thing: the turn ended and the session is momentarily idle.
+ * It no longer does. The per-block hand-off (`streaming-block-supersede.ts`) also
+ * empties the row MID-turn — the moment a reconnect catch-up delivers the partial
+ * message whose blocks the row was still holding.
+ *
+ * A trim at that point is the failure mode {@link TrimRejection} `"streaming"` guards
+ * against, except invisible to it: by then the row is already gone, so
+ * `hasStreamingRow` is false, and with a pinned reader and a long window nothing else
+ * declines. The head removal moves `commitGrowthSignature`, the hand-off reads that as
+ * document growth and resets `charsSinceLastCommit`, and the output of the step that
+ * follows loses its protection.
+ *
+ * So the intent ("the turn ended") is stated directly via `isActive` instead of being
+ * inferred from the row. The pending edge is DEFERRED rather than consumed: a session
+ * whose rows always clear mid-turn must still trim eventually, so the caller keeps its
+ * "had a row" bookkeeping until an edge actually fires.
+ */
+export function resolveStreamingClearedTrimEdge(input: {
+	/** The caller's bookkeeping: a row was published on the previous evaluation. */
+	hadStreamingRow: boolean;
+	/** A row is published now. */
+	hasStreamingRow: boolean;
+	/** The narrator is working/waiting, i.e. the turn has NOT ended. */
+	isActive: boolean;
+}): { fire: boolean; nextHadStreamingRow: boolean } {
+	const justCleared = input.hadStreamingRow && !input.hasStreamingRow;
+	// Mid-turn clear: hold the edge open so a later evaluation (once idle) can use it.
+	if (justCleared && input.isActive) return { fire: false, nextHadStreamingRow: true };
+	return { fire: justCleared, nextHadStreamingRow: input.hasStreamingRow };
+}
+
 export type TrimRejection =
 	/** The reader has scrolled up; rows above the viewport are being read. */
 	| "not-pinned"

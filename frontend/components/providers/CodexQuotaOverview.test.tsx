@@ -199,6 +199,23 @@ describe("CodexQuotaOverview", () => {
 		expect(container.querySelector('[aria-label^="Team average remaining"]')).not.toBeNull();
 	});
 
+	test("only preselects tiers that actually have accounts", async () => {
+		await renderOverview(teamStats({}));
+		// Every other tier in the fixture has accountCount 0, so a default of "all
+		// tiers checked" would fill the grid with cards saying nothing but unknown.
+		expect(getTierCard("team")).toBeDefined();
+		for (const tier of ["free", "plus", "k12", "prolite", "pro"]) {
+			expect(container.querySelector(`[data-codex-tier="${tier}"]`)).toBeNull();
+		}
+	});
+
+	test("explains the empty grid when no tier has accounts", async () => {
+		await renderOverview(teamStats({ accountCount: 0, knownUsageCount: 0 }));
+		expect(container.querySelector("[data-codex-tier]")).toBeNull();
+		expect(container.textContent).toContain("No accounts yet");
+		expect(container.textContent).not.toContain("Select at least one tier");
+	});
+
 	test("shows modeled values and separate unknown coverage for mixed data", async () => {
 		await renderOverview(
 			teamStats({

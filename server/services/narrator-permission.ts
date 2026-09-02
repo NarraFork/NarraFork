@@ -38,6 +38,7 @@ import {
 	EXIT_PLAN_MODE_INLINE,
 	readDeclaredExitPlanMode,
 } from "../lib/agent/tools/plan-mode";
+import { isScheduledTaskReadAction } from "../lib/agent/tools/scheduled-task-actions";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import type { ToolExecutionTarget } from "../lib/agent/types";
 import {
@@ -633,6 +634,23 @@ export function resolvePermissionDecision(
 			return "ask";
 		}
 		return "allow";
+	}
+
+	// ScheduledTask: per-ACTION, because the same tool both reads the schedule and
+	// hands out recurring unattended execution. Inspecting tasks is as harmless as any
+	// other read; creating or editing one installs a prompt that keeps launching
+	// narrators (usually under bypassPermissions) long after this session ends, and
+	// run_now dispatches such a launch immediately.
+	//
+	// Deliberately ABOVE the bypassPermissions/dontAsk shortcuts, which is the whole
+	// point: bypass is exactly the mode an unattended or power-user session runs in, so
+	// below them a mutation would be auto-allowed and the classification would never
+	// run. An unclassified action is treated as mutating so a future action stays gated
+	// until it is listed as a read.
+	if (toolName === "ScheduledTask") {
+		if (isScheduledTaskReadAction(input.action)) return "allow";
+		if (effectiveMode === "readOnly" || effectiveMode === "dontAsk") return "deny";
+		return "ask";
 	}
 
 	if (effectiveMode === "bypassPermissions") return "allow";

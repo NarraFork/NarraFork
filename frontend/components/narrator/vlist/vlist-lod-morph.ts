@@ -113,6 +113,21 @@ export const LOD_MORPH_DURATION_MS = 250;
 export const LOD_MORPH_MAX_SHIFT_PX = 2000;
 
 /**
+ * Most members of ONE activity group that a level switch will animate.
+ *
+ * Anchoring members to their group's folded box (see `LodElementSource.groupBox`) is what
+ * stops a large group from losing animation on its later members, but it also means a group
+ * whose expanded form is enormous no longer prunes itself — so the count needs its own
+ * bound, or one switch could animate hundreds of nodes.
+ *
+ * 30 is chosen to sit far above what a reader can actually see at once: 30 folded rows is
+ * ~570px, most of a viewport, so in practice the cap is never reached and it functions as a
+ * guard against pathological documents rather than as a visible limit. Members past it
+ * simply appear, exactly like an element past `LOD_MORPH_MAX_SHIFT_PX`.
+ */
+export const LOD_MORPH_MAX_GROUP_MEMBERS = 30;
+
+/**
  * The vertical bounds a node is clipped to by its ancestor, in the same coordinate
  * space as the snapshot that carries it.
  *
@@ -172,6 +187,35 @@ export interface LodElementSource {
 	 * its trace, so pairing it on `key` could collide with a top-level element's.
 	 */
 	readonly nested?: boolean;
+	/**
+	 * For a NESTED member: the document-px box of the group it belongs to, which decides
+	 * whether the member is admitted to the snapshot instead of the member's own box.
+	 *
+	 * ⚠️ This is what keeps a large activity group from losing animation on its later
+	 * members, and the asymmetry it corrects is severe. The admission window is
+	 * `scrollTop − vh … scrollTop + 2·vh`, but one group's content occupies wildly
+	 * different extents at the two levels:
+	 *
+	 *   L1/L2 folded: 10 rows × ~19px  =  190px  → every row inside the window
+	 *   L3+ expanded: 10 cards × ~400px = 4000px → only the first few inside it
+	 *
+	 * Judged on their own boxes, the later members are absent from the EXPANDED frame, so
+	 * `diffLodSnapshots` finds no counterpart and silently plans nothing for them — the
+	 * reader sees the first few rows animate while the rest teleport. Anchoring every
+	 * member to its group's FOLDED box (which is short and stable) admits the whole group
+	 * or none of it, so a group animates as one thing.
+	 */
+	readonly groupBox?: { readonly top: number; readonly height: number } | null;
+	/**
+	 * Apply {@link groupBox} to this element even though it is TOP-LEVEL (not nested).
+	 *
+	 * Needed because the two forms of one activity unit live on opposite sides of that
+	 * distinction: folded, its members are nested rows; expanded, each is a top-level card.
+	 * Anchoring only the nested side would fix nothing — the expanded side's later cards
+	 * would still prune themselves out of the window on their own tall boxes, and a pair
+	 * needs BOTH frames to admit the member.
+	 */
+	readonly unitAnchored?: boolean;
 }
 
 /** What `diffLodSnapshots` produces for one paired element. */
@@ -193,6 +237,15 @@ export interface LodMorphPlan {
 	 * because the start box fell outside the new node's own clip.
 	 */
 	readonly fade: boolean;
+	/**
+	 * The kind the element became — the `after` frame's registry kind.
+	 *
+	 * Carried so a consumer can tell the two DIRECTIONS of a re-theme apart, which `fade`
+	 * alone cannot: it is true for both `row → card` and `card → row`. The card form owns a
+	 * border and a right-edge tail cluster that the row form has no counterpart for, so those
+	 * have to fade IN on the way to a card and OUT on the way from one.
+	 */
+	readonly toKind: string;
 	readonly durationMs: number;
 }
 
@@ -229,6 +282,11 @@ export function buildLodSnapshots(
 	const out = new Map<string, LodElementSnapshot>();
 	const minY = scrollTop - viewportHeight;
 	const maxY = scrollTop + viewportHeight * 2;
+	// Members admitted per group, so one enormous group cannot make a level switch animate
+	// hundreds of nodes at once. Counted per group rather than globally: the cap exists to
+	// bound ONE group's cost, and a global budget would let an early group starve a later
+	// one of animation for no reason the reader could perceive.
+	const groupAdmitted = new Map<string, number>();
 	for (const el of elements) {
 		// `unitId` wins where the adapter attached one (a re-themed tool call); every
 		// top-level element pairs on its already LOD-invariant `key`. A NESTED row has
@@ -236,8 +294,21 @@ export function buildLodSnapshots(
 		// could collide with an unrelated top-level element's.
 		const identity = el.nested ? el.unitId : el.unitId || el.key;
 		if (!identity) continue;
-		const bottom = el.top + el.height;
-		if (bottom <= minY || el.top >= maxY) continue;
+		// A nested member is judged by its GROUP's box, not its own: at L3+ the same content
+		// spans an order of magnitude more height, so its own box falls outside the window
+		// while the folded group's stays inside (see `LodElementSource.groupBox`).
+		const anchored = (el.nested || el.unitAnchored) && el.groupBox ? el.groupBox : null;
+		const admitTop = anchored ? anchored.top : el.top;
+		const admitHeight = anchored ? anchored.height : el.height;
+		const bottom = admitTop + admitHeight;
+		if (bottom <= minY || admitTop >= maxY) continue;
+		if (anchored) {
+			// Keyed on the group's own box, which is identical for all of its members.
+			const groupKey = `${anchored.top}:${anchored.height}`;
+			const seen = groupAdmitted.get(groupKey) ?? 0;
+			if (seen >= LOD_MORPH_MAX_GROUP_MEMBERS) continue;
+			groupAdmitted.set(groupKey, seen + 1);
+		}
 		// First occurrence wins: a duplicated identity (a degenerate double-render)
 		// morphs to its first instance; the rest simply appear.
 		if (out.has(identity)) continue;
@@ -280,13 +351,27 @@ export function diffLodSnapshots(
 		// A re-theme in place is the exception: the swap itself is worth fading even
 		// though nothing travelled (an activity fold re-themes at deltaY ≈ 0).
 		if (distance < 1) {
-			if (fade) out.push({ unitId, deltaY: 0, fade: true, durationMs: LOD_MORPH_DURATION_MS });
+			if (fade)
+				out.push({
+					unitId,
+					deltaY: 0,
+					fade: true,
+					toKind: after.kind,
+					durationMs: LOD_MORPH_DURATION_MS,
+				});
 			continue;
 		}
 		// Past the bound the slide is a blur, not a transition (see the constant). A
 		// re-theme still fades in place rather than losing the transition entirely.
 		if (distance > LOD_MORPH_MAX_SHIFT_PX) {
-			if (fade) out.push({ unitId, deltaY: 0, fade: true, durationMs: LOD_MORPH_DURATION_MS });
+			if (fade)
+				out.push({
+					unitId,
+					deltaY: 0,
+					fade: true,
+					toKind: after.kind,
+					durationMs: LOD_MORPH_DURATION_MS,
+				});
 			continue;
 		}
 		// Would the new node start outside its own clip? Then it would be invisible for
@@ -294,10 +379,17 @@ export function diffLodSnapshots(
 		// L3 → L2 direction: the new node is a nested row, its counterpart a card far
 		// outside the trace's box (see the module note on the asymmetry).
 		if (!clipFor(after.clip, after.viewportTop + deltaY, after.height)) {
-			if (fade) out.push({ unitId, deltaY: 0, fade: true, durationMs: LOD_MORPH_DURATION_MS });
+			if (fade)
+				out.push({
+					unitId,
+					deltaY: 0,
+					fade: true,
+					toKind: after.kind,
+					durationMs: LOD_MORPH_DURATION_MS,
+				});
 			continue;
 		}
-		out.push({ unitId, deltaY, fade, durationMs: LOD_MORPH_DURATION_MS });
+		out.push({ unitId, deltaY, fade, toKind: after.kind, durationMs: LOD_MORPH_DURATION_MS });
 	}
 	return out;
 }

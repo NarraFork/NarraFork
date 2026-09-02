@@ -24,10 +24,33 @@
  * no React state. The committed DOM is the truth; the snapshot is pure data.
  */
 
+import { BARE_ROW_CHEVRON, BARE_ROW_GAP } from "@shared/pretext-layout/row-metrics";
+import { CARD_BORDER, CARD_PADDING } from "./measure/measure-tool-call";
 import { FOLD_DURATION_MS } from "./vlist-fold-animation";
 
 /** How long a header morph lasts. Matches the fold transition (Mantine Collapse). */
 export const HEADER_MORPH_DURATION_MS = FOLD_DURATION_MS;
+
+/**
+ * Horizontal offset between where the two forms start their content, in px.
+ *
+ * Both ends have to be counted, and an earlier version counted only one — which put the
+ * morph's target 11px too far right:
+ *
+ *  - a folded trace row leads with a chevron slot (`BARE_ROW_CHEVRON` 12) plus the row's
+ *    cell gap (`BARE_ROW_GAP` 6), so its icon lane starts at **18** from the block edge;
+ *  - a card header does NOT start at 0: the card is a bordered, padded `Paper`, so its
+ *    header begins at `CARD_BORDER + CARD_PADDING` = **11**. (Its own chevron is at the
+ *    END of the line, which is why nothing precedes the icon.)
+ *
+ * The visible jump is therefore the DIFFERENCE, `18 − 11 = 7`, not the row's lane alone.
+ * This is the same pair of numbers `measure-tool-run` uses for `drillHeader.left`, so the
+ * compensation and the measured geometry cannot disagree.
+ *
+ * Derived from the shared constants rather than written as a literal, so a change to the
+ * chevron slot, the row gap, or the card's padding cannot silently leave it stale.
+ */
+export const DRILL_MORPH_X_OFFSET = BARE_ROW_CHEVRON + BARE_ROW_GAP - (CARD_BORDER + CARD_PADDING);
 
 /** The folded summary row's height (the morph's collapsed-state line). */
 export const DRILL_ROW_HEIGHT = 18.8;

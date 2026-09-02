@@ -23,6 +23,11 @@ describe("useLocalPref — defaults", () => {
 		// nothing stored (a fresh browser) keeps alt+wheel and the Alt-held
 		// indicator working; the switch exists to opt OUT.
 		expect(localPrefDefault("narrafork_lod_alt_gesture")).toBe(true);
+		// The unified morph driver is the intended LOD-transition path: a fresh browser
+		// must get identity-based pairing and group-anchored admission, not the keyframe
+		// planners that lose a whole group's animation when the two levels' geometries
+		// disagree. The switch remains only as an opt-OUT.
+		expect(localPrefDefault("narrafork_unified_morph")).toBe(true);
 	});
 });
 

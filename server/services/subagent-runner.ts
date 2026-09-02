@@ -56,6 +56,7 @@ import {
 	loadSubagentHistory,
 	type SubagentExecOptions,
 } from "./subagent-executor";
+import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentLabelFromNarrator, agentResultTag, resolveAgentLabel } from "./subagent-label";
 import { resumeManualOverride, waitForManualOverride } from "./subagent-manual-override";
 import {
@@ -1608,9 +1609,12 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 			executionTimeout?.dispose();
 			unregisterRunningExecution();
 			publishTerminal({
-				output:
+				output: await appendSubagentFileChanges(
+					parentNarratorId,
+					null,
 					agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId)) +
-					(finalText || "(no output)"),
+						(finalText || "(no output)"),
+				),
 				finalText: finalText || "(no output)",
 				hasError,
 				interrupted: wasInterrupted,
@@ -1624,7 +1628,16 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 	runLoop().catch(async (err) => {
 		const finalText = `Subagent error: ${err instanceof Error ? err.message : String(err)}`;
 		publishTerminal({
-			output: agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId)) + finalText,
+			// The CRASH outlet needs the file summary most: a subagent that died partway
+			// has very likely already written some of its files, and this is precisely the
+			// moment the parent would otherwise carry on against a stale view of the disk.
+			// `appendSubagentFileChanges` returns the text unchanged if aggregation fails,
+			// so the error message itself can never be lost to a failed summary.
+			output: await appendSubagentFileChanges(
+				parentNarratorId,
+				null,
+				agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId)) + finalText,
+			),
 			finalText,
 			hasError: true,
 			interrupted: false,
@@ -2085,7 +2098,14 @@ export async function startContinuedSubagent(
 		(original.backgroundStatus === "completed" || original.backgroundStatus === "failed")
 	) {
 		const resultPrefix = agentResultTag(agentLabelFromNarrator(original, parentNarratorId));
-		const completion = Promise.resolve(resultPrefix + (original.backgroundResult ?? "(no output)"));
+		// Replaying a finished background task's stored result. The summary is rebuilt
+		// from the attribution rows rather than taken from `backgroundResult`, so a
+		// replay reports the same changes the original completion did.
+		const completion = appendSubagentFileChanges(
+			parentNarratorId,
+			null,
+			resultPrefix + (original.backgroundResult ?? "(no output)"),
+		);
 		return {
 			runId: generateId(),
 			completion,

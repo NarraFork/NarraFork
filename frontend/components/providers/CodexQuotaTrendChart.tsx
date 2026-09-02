@@ -188,11 +188,18 @@ export function CodexQuotaTrendChart({
 	selectedTiers,
 	compact = false,
 	showLegend = true,
+	emptySelectionMessage,
 }: {
 	trend: TrendLike;
 	selectedTiers?: CodexPlanTier[];
 	compact?: boolean;
 	showLegend?: boolean;
+	/**
+	 * Overrides the "select a tier" placeholder. An empty selection can also mean
+	 * there is no tier to select yet, and telling the user to pick one then is
+	 * advice they cannot act on.
+	 */
+	emptySelectionMessage?: string;
 }) {
 	const { t } = useTranslation("settings");
 	const svgRef = useRef<SVGSVGElement>(null);
@@ -331,7 +338,7 @@ export function CodexQuotaTrendChart({
 		return (
 			<Paper withBorder p="sm">
 				<Text size={infoTextSize} c="dimmed" ta="center">
-					{t("codexQuotaNoTierSelected")}
+					{emptySelectionMessage ?? t("codexQuotaNoTierSelected")}
 				</Text>
 			</Paper>
 		);

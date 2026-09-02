@@ -39,7 +39,9 @@ function morphEffect(): string {
 	expect(buildIdx).toBeGreaterThan(0);
 	const start = SHELL.lastIndexOf("useLayoutEffect(() => {", buildIdx);
 	expect(start).toBeGreaterThan(0);
-	const end = SHELL.indexOf("lodMorphRef.current.playAll(", buildIdx);
+	// Ends at the push of this effect's ops into the shared motion scheduler, which
+	// replaced the per-feature controller (see vlist-motion-scheduler.ts).
+	const end = SHELL.indexOf("lodScope(", buildIdx);
 	expect(end).toBeGreaterThan(buildIdx);
 	return SHELL.slice(start, SHELL.indexOf("\t});", end));
 }
@@ -48,7 +50,8 @@ describe("LOD morph: diff-driven, keyed by unitId ?? key", () => {
 	it("builds snapshots and diffs them (no toggle-time capture)", () => {
 		expect(SHELL).toContain("buildLodSnapshots(");
 		expect(SHELL).toContain("diffLodSnapshots(");
-		expect(SHELL).toContain("lodMorphRef.current.playAll(");
+		// Played through the shared scheduler, under this feature's own cancel scope.
+		expect(SHELL).toContain("lodScope(");
 	});
 
 	/**
@@ -143,7 +146,7 @@ describe("LOD morph: the LOD-switch gate", () => {
 	});
 
 	it("honours prefers-reduced-motion (skips playing, still rolls the snapshot)", () => {
-		expect(morphEffect()).toContain("prefersReducedMotionLod()");
+		expect(morphEffect()).toContain("prefersReducedMotion()");
 	});
 });
 
@@ -160,13 +163,60 @@ describe("LOD morph: no DOM measurement, no detached ghost", () => {
 	});
 });
 
-describe("LOD morph: orthogonality with fold + drill morph", () => {
-	it("runs in its own layout effect with its own controller", () => {
-		expect(SHELL).toContain("lodMorphRef.current.playAll(");
-		// Separate controllers for the three channels.
-		expect(SHELL).toContain("createLodMorphController(");
-		// The LOD morph effect must not invoke the fold or drill planners.
+describe("LOD morph: own planner, shared scheduler", () => {
+	it("plans in its own layout effect, invoking neither the fold nor the drill planner", () => {
 		expect(morphEffect()).not.toContain("planFoldMotion");
 		expect(morphEffect()).not.toContain("diffDrillSnapshots");
+	});
+
+	it("plays through the shared scheduler under its own scope", () => {
+		expect(SHELL).toContain("motionRef.current.push(");
+		expect(SHELL).toContain("lodScope(");
+		expect(SHELL).not.toContain("createLodMorphController");
+		expect(SHELL).not.toContain("lodMorphRef");
+	});
+
+	/**
+	 * The LOD switch is the ONE legitimate deviation from the shared time base: it
+	 * re-themes the whole document at once, so the eye needs longer than a single card's
+	 * fold. It is applied as an EVENT-level override so every element of one switch
+	 * shares it — a per-op duration would let paired elements finish at different times.
+	 */
+	it("carries the longer LOD duration as an event-level override", () => {
+		expect(morphEffect()).toContain("LOD_MOTION_DURATION_MS");
+	});
+});
+
+/**
+ * The LOD switch reuses the drill morph's two fades for a RE-THEME.
+ *
+ * A re-theme is the same `trace-row ↔ tool-call` pair, so the tail cluster (whose travel
+ * distance is unknowable without measuring rendered text) and the border (which exists in
+ * only one of the two forms) need the same treatment there as in a drill.
+ */
+describe("LOD re-theme: tail + border fades", () => {
+	it("resumes an interrupted switch instead of restarting it", () => {
+		// Holding a zoom shortcut re-triggers the switch mid-flight; with `fill: "none"` a
+		// plain keyframe array would restart from the committed geometry.
+		expect(morphEffect()).toContain("lodMorphKeyframesFrom");
+	});
+
+	it("fades the tail and the border, on their own scopes", () => {
+		const effect = morphEffect();
+		expect(effect).toContain("drillTailKeyframesFrom");
+		expect(effect).toContain("drillBorderKeyframesFrom");
+		expect(effect).toContain(":tail`");
+		expect(effect).toContain(":border`");
+	});
+
+	it("only fades those for a RE-THEME, never for an element that merely moved", () => {
+		// Fading unchanged chrome would make it blink once per zoom step.
+		expect(morphEffect()).toContain("if (!plan.fade) return []");
+	});
+
+	it("derives the fade direction from toKind, not from `fade` alone", () => {
+		// `fade` is true in BOTH directions, so using it to pick the direction would fade the
+		// border in while collapsing to a row.
+		expect(morphEffect()).toContain('plan.toKind === "tool-call"');
 	});
 });

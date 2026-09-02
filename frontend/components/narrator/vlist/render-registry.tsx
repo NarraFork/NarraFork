@@ -190,6 +190,11 @@ export function resolveRenderExtra(spec: {
 			// to the drawn rows), so the renderer reads them there rather than through
 			// `extra` — nothing to forward here. `recentCallNames` remains an extra
 			// because the measure layer only needs the row COUNT.
+			//
+			// `fileChanges` is forwarded for the same reason: the measure layer keeps the
+			// row count that decides height, while the paths and figures the rows PAINT
+			// live on the card data.
+			if ("fileChanges" in data) extra.fileChanges = data.fileChanges;
 			if ("isActive" in data) extra.isActive = data.isActive;
 			if ("status" in data) extra.status = data.status;
 			break;
@@ -417,7 +422,20 @@ export function renderElement(
 					// needs, and spec.opts feeds the measure cache key — putting a React
 					// factory there would digest as `?function` and blur the key's meaning.
 					rowCard={extra.rowCard as TraceRowCardSlot | undefined}
+					// Rows whose drill-down is CLOSING: keep painting their card until the
+					// block has finished animating shut around it. Without this forwarding the
+					// card is unmounted in the frame the fold commits, so it VANISHES instead
+					// of closing — and the failure is silent, because everything else (the
+					// plan, the height animation, the release callback) still runs correctly
+					// against an empty box.
+					closingRowKeys={extra.closingRowKeys as ReadonlySet<string> | undefined}
 					rowLiveTails={extra.rowLiveTails as TraceRowLiveTails | undefined}
+					// A titled reasoning run renders HERE, not as the plain reasoning card,
+					// so without this the fade depended on whether the model happened to
+					// write a `**title**` — and it usually does.
+					animateStreaming={extra.animateStreaming as boolean | undefined}
+					animKeyBase={extra.animKeyBase as string | undefined}
+					animScope={extra.animScope as string | undefined}
 				/>
 			);
 		case "tool-run-count":
@@ -446,11 +464,13 @@ export function renderElement(
 					resultPreview={extra.resultPreview as string | undefined}
 					promptText={extra.promptText as string | undefined}
 					recentCallNames={extra.recentCallNames as string[] | undefined}
+					fileChanges={extra.fileChanges as never}
 					isActive={extra.isActive as boolean | undefined}
 					status={extra.status as string | undefined}
 					labels={extra.labels as never}
 					onToggle={extra.onToggle as (() => void) | undefined}
 					onTogglePrompt={extra.onTogglePrompt as (() => void) | undefined}
+					onToggleFileChanges={extra.onToggleFileChanges as (() => void) | undefined}
 					onOpenSession={extra.onOpenSession as (() => void) | undefined}
 					onResolveOverride={extra.onResolveOverride as (() => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}

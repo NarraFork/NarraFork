@@ -8,6 +8,7 @@ import {
 	isTruncated,
 	MEDIA_IMAGE_CONTENT_PX,
 	resolveDisplayText,
+	resolveFileDiffStats,
 	type ToolAskDetail,
 	type ToolCappedDetail,
 	type ToolDetailData,
@@ -1924,5 +1925,153 @@ describe("classifyToolDetail — render-only body text passthrough (Approach B)"
 		expect(media.media?.filename).toBe("pic.png");
 		expect(media.media?.sizeKB).toBe(12);
 		expect(media.media?.imageFormat).toBe("png");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resolveFileDiffStats — the `+N -N` figure's two sources, and the cases where it
+// must refuse to answer.
+//
+// The refusals are the point of these tests. A wrong line count looks exactly as
+// authoritative as a right one, so every path that cannot know the answer has to
+// return undefined rather than a plausible-looking number.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A truncated leaf as the server's field-level projection emits it. */
+const truncatedLeaf = (preview: string) => ({
+	_truncated: true as const,
+	preview,
+	fullLength: 99_999,
+});
+
+describe("resolveFileDiffStats — tool metadata (authoritative)", () => {
+	it("reads the counts the tool wrote, for both Write and Edit", () => {
+		expect(
+			resolveFileDiffStats(
+				"Edit",
+				{ old_string: "a", new_string: "b" },
+				{
+					linesAdded: 12,
+					linesRemoved: 3,
+				},
+			),
+		).toEqual({ added: 12, removed: 3 });
+		expect(
+			resolveFileDiffStats("Write", { content: "x" }, { linesAdded: 240, linesRemoved: 0 }),
+		).toEqual({ added: 240, removed: 0 });
+	});
+
+	it("prefers metadata over a local computation", () => {
+		// The local diff of these two strings would say 1/1; metadata wins because only
+		// the server saw the untruncated payload.
+		expect(
+			resolveFileDiffStats(
+				"Edit",
+				{ old_string: "a", new_string: "b" },
+				{
+					linesAdded: 7,
+					linesRemoved: 5,
+				},
+			),
+		).toEqual({ added: 7, removed: 5 });
+	});
+
+	it("keeps a genuine zero-change measurement", () => {
+		// Distinct from "unknown": the tool measured this and found no line changes.
+		expect(
+			resolveFileDiffStats("Write", { content: "x" }, { linesAdded: 0, linesRemoved: 0 }),
+		).toEqual({ added: 0, removed: 0 });
+	});
+
+	/**
+	 * A half-written pair is rejected rather than read with the missing half as zero,
+	 * which would understate one direction of the change without any signal.
+	 */
+	it("rejects a partial or malformed metadata pair", () => {
+		expect(resolveFileDiffStats("Write", { content: "x" }, { linesAdded: 5 })).toBeUndefined();
+		expect(resolveFileDiffStats("Write", { content: "x" }, { linesRemoved: 5 })).toBeUndefined();
+		expect(
+			resolveFileDiffStats("Write", { content: "x" }, { linesAdded: "5", linesRemoved: 0 }),
+		).toBeUndefined();
+		expect(
+			resolveFileDiffStats(
+				"Write",
+				{ content: "x" },
+				{
+					linesAdded: Number.NaN,
+					linesRemoved: 0,
+				},
+			),
+		).toBeUndefined();
+		expect(
+			resolveFileDiffStats("Write", { content: "x" }, { linesAdded: -1, linesRemoved: 0 }),
+		).toBeUndefined();
+	});
+});
+
+describe("resolveFileDiffStats — Edit local fallback", () => {
+	it("diffs old_string against new_string when both are complete", () => {
+		expect(
+			resolveFileDiffStats("Edit", { old_string: "a\nb\nc", new_string: "a\nB\nc" }, null),
+		).toEqual({ added: 1, removed: 1 });
+	});
+
+	/**
+	 * A truncated side is an 8KB PREFIX of a longer string. Diffing prefixes yields a
+	 * smaller count with nothing marking it as partial, so the figure is withheld.
+	 */
+	it("refuses when either side was truncated in transport", () => {
+		expect(
+			resolveFileDiffStats("Edit", { old_string: truncatedLeaf("a"), new_string: "b" }, null),
+		).toBeUndefined();
+		expect(
+			resolveFileDiffStats("Edit", { old_string: "a", new_string: truncatedLeaf("b") }, null),
+		).toBeUndefined();
+	});
+
+	/**
+	 * `old_string: ""` is Edit's whole-file OVERWRITE mode. It has the same missing
+	 * baseline a Write does — the previous content is not in the input — so the client
+	 * cannot tell a 3-line change from a wholesale replacement.
+	 */
+	it("refuses Edit's overwrite mode, which has no baseline in the input", () => {
+		expect(
+			resolveFileDiffStats("Edit", { old_string: "", new_string: "a\nb\nc" }, null),
+		).toBeUndefined();
+	});
+
+	it("refuses when the input lacks the fields entirely", () => {
+		expect(resolveFileDiffStats("Edit", { file_path: "/a.ts" }, null)).toBeUndefined();
+		expect(resolveFileDiffStats("Edit", truncatedLeaf("{"), null)).toBeUndefined();
+		expect(resolveFileDiffStats("Edit", null, null)).toBeUndefined();
+	});
+});
+
+describe("resolveFileDiffStats — Write has no local fallback", () => {
+	/**
+	 * THE case this guard exists for, and not an edge case: every Write persisted
+	 * before the tool started writing metadata lands here.
+	 *
+	 * A Write's input carries only `content`; the file's previous state is never sent.
+	 * Computing locally could only ever conclude "every line is new", rendering a
+	 * rewrite that changed 3 lines as `+240 -0`. The client also cannot tell whether
+	 * the Write created the file or replaced one, so there is no safe reading.
+	 */
+	it("returns undefined for a Write without metadata, however complete its content", () => {
+		expect(resolveFileDiffStats("Write", { content: "a\nb\nc" }, null)).toBeUndefined();
+		expect(resolveFileDiffStats("Write", { content: "a\nb\nc" }, {})).toBeUndefined();
+		expect(
+			resolveFileDiffStats("Write", { file_path: "/a.ts", content: "x".repeat(5_000) }, null),
+		).toBeUndefined();
+	});
+});
+
+describe("resolveFileDiffStats — non-file tools", () => {
+	it("never answers for a tool that does not change files", () => {
+		// Even carrying the metadata keys: a Bash call's header has no `+N -N` lane.
+		expect(
+			resolveFileDiffStats("Bash", { command: "ls" }, { linesAdded: 1, linesRemoved: 1 }),
+		).toBeUndefined();
+		expect(resolveFileDiffStats("Read", { file_path: "/a.ts" }, null)).toBeUndefined();
 	});
 });

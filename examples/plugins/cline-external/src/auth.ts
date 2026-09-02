@@ -231,7 +231,7 @@ export async function refreshAccessToken(
 export function parseCallbackUrl(callbackUrl: string): ClineCredentials {
 	let url: URL;
 	try {
-		url = new URL(callbackUrl.trim());
+		url = new URL(withCallbackScheme(callbackUrl.trim()));
 	} catch {
 		throw new AuthInputError("That does not look like a URL");
 	}
@@ -280,6 +280,31 @@ export function parseCallbackUrl(callbackUrl: string): ClineCredentials {
 		displayName: data.name || [data.firstName, data.lastName].filter(Boolean).join(" ") || "",
 		startedAt: Date.now(),
 	};
+}
+
+/**
+ * Add the scheme a pasted callback URL is missing.
+ *
+ * Browsers hide `http://` in the address bar, so a copied callback frequently arrives as
+ * `localhost:19876/auth/callback?code=…`. `new URL` rejects that, and the resulting "that does
+ * not look like a URL" is misleading advice for a value that is otherwise exactly right. The
+ * built-in front end normalizes with `frontend/lib/url.ts`; that module cannot be imported here
+ * (it is host code, and a plugin must not depend on it), and its full behaviour — IPv6
+ * bracketing, Windows path detection, https-for-public-hosts — is not wanted anyway.
+ *
+ * Deliberately narrower than the host util: this only ever completes a *loopback* callback, so
+ * anything not aimed at localhost is returned untouched and left for `new URL` to reject. That
+ * keeps the guess to the one case it is certain about instead of inventing a scheme for
+ * arbitrary input.
+ */
+function withCallbackScheme(value: string): string {
+	if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return value;
+	// A bare `//host/...` is protocol-relative; the rest must look like `host[:port]/...`.
+	const candidate = value.startsWith("//") ? value.slice(2) : value;
+	if (/^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$|\?)/i.test(candidate)) {
+		return `http://${candidate}`;
+	}
+	return value;
 }
 
 export class AuthInputError extends Error {
