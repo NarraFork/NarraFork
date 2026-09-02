@@ -8,6 +8,7 @@ import {
 	specProtectedTasks,
 } from "../db/schema";
 import { AsyncMutex } from "../lib/async-mutex";
+import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import {
 	analyzeSpecTasksCandidate,
@@ -91,8 +92,18 @@ export interface SpecWriteOptions {
 	 * Who is performing the write. `"agent"` (default) is subject to `agentReadonly`;
 	 * `"user"` (UI route) is subject to `uiEditable`.
 	 */
-	actor?: "agent" | "user";
+	actor?: SpecWriteActor;
 }
+
+/**
+ * Write actors recognised by the spec VFS policy checks.
+ *
+ * There is deliberately no `"plugin"` member: the policy axis here is "is this write
+ * subject to agentReadonly or to uiEditable", and a plugin dispatching work into a
+ * narrator's queue is on the agent side of that line. A plugin therefore writes as
+ * `"agent"` — it does not get the user's ability to mint protected tasks for free.
+ */
+export type SpecWriteActor = "agent" | "user";
 
 export interface SpecCandidateAnalysis {
 	path: string;
@@ -400,7 +411,16 @@ export async function writeSpecFile(
 			}
 		});
 
-		return readSpecFile(narratorId, toSpecUri(path));
+		const written = await readSpecFile(narratorId, toSpecUri(path));
+		eventBus.emit({
+			type: "spec:changed",
+			narratorId,
+			path,
+			uri: toSpecUri(path),
+			revisionId: written.revisionId ?? null,
+			updatedBy: actor,
+		});
+		return written;
 	});
 }
 
@@ -521,15 +541,26 @@ export async function readTasksFileForNarrator(narratorId: string): Promise<Spec
 }
 
 /**
- * Append a protected task to spec://tasks.json (used by the /goal command).
- * Idempotent: if a task with the same trimmed text already exists, it is left
- * untouched and no new task is added. Written as the user, so the protected-task
- * lock is created without requiring taskReflection.
+ * Append a task to spec://tasks.json on behalf of an external caller.
+ *
+ * Idempotent: if a task with the same trimmed text already exists, it is left untouched
+ * and no new task is added.
+ *
+ * `protected` is explicit because the two callers mean different things. The `/goal`
+ * command IS the user stating a commitment, so it asks for a protected task. A plugin
+ * dispatching work is not the user, so it gets an ordinary task unless it deliberately
+ * asks otherwise — a protected task drives auto-continuation and taskReflection and the
+ * narrator cannot retract it, which is far too much to hand out by default.
+ *
+ * The write is attributed to `actor` and needs `allowProtectedTaskMutation` only when it
+ * actually creates a protected task; an ordinary append must not carry a privilege it
+ * does not need.
  */
-export async function appendProtectedSpecTask(
+export async function appendSpecTaskForExternalActor(
 	narratorId: string,
 	objective: string,
-): Promise<{ added: boolean; written: SpecResolvedFile }> {
+	options: { protected: boolean; actor: SpecWriteActor },
+): Promise<{ added: boolean; protected: boolean; written: SpecResolvedFile }> {
 	const text = objective.trim();
 	if (!text) throw new Error("objective must not be empty");
 	const current = await readTasksFileForNarrator(narratorId);
@@ -537,18 +568,44 @@ export async function appendProtectedSpecTask(
 	const existing = document.tasks.find((task) => task.text.trim() === text);
 	if (existing) {
 		// A task with this text already exists — leave it as-is, don't duplicate.
-		return { added: false, written: current };
+		// Report the EXISTING task's protection, not the requested one: nothing changed,
+		// so claiming otherwise would misreport the queue's actual state.
+		return { added: false, protected: existing.protected === true, written: current };
 	}
 	const nextDocument: SpecTasksDocument = {
-		tasks: [...document.tasks, { text, status: "todo", protected: true }],
+		tasks: [
+			...document.tasks,
+			{ text, status: "todo", ...(options.protected ? { protected: true } : {}) },
+		],
 	};
 	const written = await writeSpecFile(
 		narratorId,
 		toSpecUri(SPEC_TASKS_PATH),
 		serializeSpecTasksDocument(nextDocument),
-		{ actor: "user", createdBy: "user", allowProtectedTaskMutation: true },
+		{
+			actor: options.actor,
+			// `createdBy` is revision authorship and has its own vocabulary: the write actor
+			// `"agent"` is recorded as `"assistant"`. They are not interchangeable strings.
+			createdBy: options.actor === "user" ? "user" : "assistant",
+			...(options.protected ? { allowProtectedTaskMutation: true } : {}),
+		},
 	);
-	return { added: true, written };
+	return { added: true, protected: options.protected, written };
+}
+
+/**
+ * Append a protected task as the user (the `/goal` command). The user asking for a goal
+ * IS the commitment, so the protected-task lock is created without taskReflection.
+ */
+export async function appendProtectedSpecTask(
+	narratorId: string,
+	objective: string,
+): Promise<{ added: boolean; written: SpecResolvedFile }> {
+	const { added, written } = await appendSpecTaskForExternalActor(narratorId, objective, {
+		protected: true,
+		actor: "user",
+	});
+	return { added, written };
 }
 
 export interface SpecTasksSummary {

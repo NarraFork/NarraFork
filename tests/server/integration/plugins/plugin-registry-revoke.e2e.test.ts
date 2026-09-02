@@ -128,6 +128,7 @@ async function createRevokeHarness(): Promise<RevokeHarness> {
 		version: pluginA.packageVersion,
 		hash: "a".repeat(64),
 		authorityInstallationId: pluginA.installationId,
+		installationId: "installation-a",
 		principalId: "user-1",
 		contributionId: pluginA.contributionId ?? "describe-selection",
 		panelInstanceId: "panel-a",
@@ -139,6 +140,7 @@ async function createRevokeHarness(): Promise<RevokeHarness> {
 		version: pluginB.packageVersion,
 		hash: "b".repeat(64),
 		authorityInstallationId: pluginB.installationId,
+		installationId: "installation-b",
 		principalId: "user-1",
 		contributionId: pluginB.contributionId ?? "describe-selection",
 		panelInstanceId: "panel-b",
@@ -157,10 +159,15 @@ async function createRevokeHarness(): Promise<RevokeHarness> {
 		await eventGateway.subscribe({
 			plugin: {
 				pluginId: pluginA.pluginId,
+				installationId: pluginA.installationId,
 				runtimeId: pluginA.runtimeId,
 				generation: pluginA.runtimeGeneration,
 				contributionId: pluginA.contributionId,
 				packageVersion: pluginA.packageVersion,
+				// The gateway requires a verifiable authority revision; the harness
+				// simulates the runtime principal explicitly instead of provisioning
+				// a real authority record.
+				grantRevision: 1,
 			},
 			topics: ["narrafork.plugin.lifecycle"],
 			mode: "live",
@@ -170,10 +177,12 @@ async function createRevokeHarness(): Promise<RevokeHarness> {
 		await eventGateway.subscribe({
 			plugin: {
 				pluginId: pluginB.pluginId,
+				installationId: pluginB.installationId,
 				runtimeId: pluginB.runtimeId,
 				generation: pluginB.runtimeGeneration,
 				contributionId: pluginB.contributionId,
 				packageVersion: pluginB.packageVersion,
+				grantRevision: 1,
 			},
 			topics: ["narrafork.plugin.lifecycle"],
 			mode: "live",

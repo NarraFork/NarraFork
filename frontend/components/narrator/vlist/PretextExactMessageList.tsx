@@ -2099,6 +2099,14 @@ export function buildExactCatchUpCursor(
 	return undefined;
 }
 
+export function buildExactMessageSnapshot(
+	messages: readonly { id?: unknown }[],
+	messageVersion: number | undefined,
+) {
+	if (messageVersion == null) return undefined;
+	return { cursor: buildExactCatchUpCursor(messages), messageVersion };
+}
+
 export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExactMessageListProps>(
 	function PretextExactMessageList(props, ref) {
 		const {
@@ -3328,9 +3336,13 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 
 		const revisionSubscriptionId =
 			pretextDocument.index && pretextDocument.status !== "loading" ? narratorId : undefined;
-		const exactCatchUpCursor = useMemo(
-			() => buildExactCatchUpCursor(pretextDocument.messages),
-			[pretextDocument.messages],
+		// Cursor AND version travel together: the server needs both to decide whether this
+		// subscriber is behind. Passing a bare cursor made `useNarratorWS` read `.cursor`
+		// off a `CatchUpCursor` and get `undefined`, silently disabling catch-up for this
+		// list while a shared panel subscription's newer coordinate won instead.
+		const exactMessageSnapshot = useMemo(
+			() => buildExactMessageSnapshot(pretextDocument.messages, pretextDocument.messageVersion),
+			[pretextDocument.messages, pretextDocument.messageVersion],
 		);
 		useEffect(() => {
 			if (!revisionSubscriptionId) return;
@@ -3494,7 +3506,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 					bumpMessageRevision();
 				},
 			},
-			exactCatchUpCursor,
+			exactMessageSnapshot,
 			{ kind: "messages" },
 		);
 		// Live LIFECYCLE updates (tool started/completed, reflection gates, permission

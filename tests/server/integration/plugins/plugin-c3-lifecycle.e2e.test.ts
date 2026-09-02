@@ -172,7 +172,7 @@ function principalFor(
 		return {
 			pluginId,
 			packageVersion: diagnostics.pluginVersion ?? state.current.version,
-			installationId: state.current.hash,
+			installationId: state.installationId ?? state.current.hash,
 			runtimeId: diagnostics.runtimeId,
 			runtimeGeneration: diagnostics.generation,
 			contributionId,

@@ -56,7 +56,12 @@ function canonicalPath(path: string): string {
  * correct even after a test preload repoints HOME at a temp directory.
  */
 function realNarraforkHome(): string {
-	return canonicalPath(resolve(homedir(), ".narrafork"));
+	// tests/preload.ts repoints HOME/USERPROFILE (which os.homedir() follows) at a
+	// temp dir, so the original home is preserved in NARRAFORK_ORIGINAL_HOME and
+	// used here — otherwise the real-database guard would treat the isolated test
+	// path as the production data dir and refuse every writable connection.
+	const originalHome = process.env.NARRAFORK_ORIGINAL_HOME?.trim();
+	return canonicalPath(resolve(originalHome ?? homedir(), ".narrafork"));
 }
 
 /**

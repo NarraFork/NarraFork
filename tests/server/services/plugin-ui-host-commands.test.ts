@@ -21,6 +21,7 @@ function makeSession(overrides: Partial<PluginUiSession> = {}): PluginUiSession 
 		version: "1.0.0",
 		hash: "c".repeat(64),
 		authorityInstallationId: "installation-ui-cmd",
+		installationId: "installation-commands",
 		principalId: "user-1",
 		contributionId: "settings",
 		panelInstanceId: "panel-1",

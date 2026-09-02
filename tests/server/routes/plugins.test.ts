@@ -213,6 +213,31 @@ describe("plugin routes", () => {
 		});
 	});
 
+	it("exposes declared manifest capabilities by name for the grants panel", async () => {
+		const manager = new MockPluginManager();
+		manager.detailResult = {
+			...(manager.detailResult as Record<string, unknown>),
+			manifest: {
+				permissions: {
+					host: ["query.read.projects", "command.narrator.send_message"],
+					secret: "do-not-return",
+				},
+			},
+		};
+		const app = createApp(manager);
+		const detail = await app.request("/com.example.demo");
+		expect(detail.status).toBe(200);
+		const body = (await detail.json()) as {
+			manifest?: { permissions?: { host?: string[] } };
+		};
+		expect(body.manifest?.permissions?.host).toEqual([
+			"query.read.projects",
+			"command.narrator.send_message",
+		]);
+		// Only the host capability names pass through — nothing else from the manifest.
+		expect(JSON.stringify(body)).not.toContain("do-not-return");
+	});
+
 	it("returns redacted and bounded diagnostics without paths or raw fields", async () => {
 		const app = createApp(new MockPluginManager());
 		const response = await app.request("/com.example.demo/diagnostics");

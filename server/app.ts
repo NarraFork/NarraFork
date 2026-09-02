@@ -206,9 +206,14 @@ app.get("/api/health", (c) => {
 	// Re-check git when it was previously unavailable so the frontend
 	// "recheck" button works without a server restart.
 	const gitOk = gitAvailable || recheckGit();
+	// Version is suffixed with the git commit so ANY rebuild produces a distinct
+	// value. The service worker compares this against its own build version on
+	// activation: when they differ it unregisters and pings the page to reload,
+	// preventing a stale precached index.html/bundle from being served forever.
+	const versionWithBuild = GIT_COMMIT ? `${APP_VERSION}+${GIT_COMMIT}` : APP_VERSION;
 	return c.json({
 		status: "ok",
-		version: APP_VERSION,
+		version: versionWithBuild,
 		commit: GIT_COMMIT,
 		platform:
 			process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",

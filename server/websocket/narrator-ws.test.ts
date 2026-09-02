@@ -1,10 +1,11 @@
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
+import { eq } from "drizzle-orm";
 import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	NARRATOR_WS_SUBSCRIPTION_LIMIT_ERROR_CODE,
 } from "../../shared/recent-tabs";
 import { cleanDb, getTestDb } from "../../tests/setup";
-import { chapters, narrators, projects } from "../db/schema";
+import { chapters, narratorMessageRefs, narratorMessages, narrators, projects } from "../db/schema";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../db")) };
@@ -132,6 +133,105 @@ afterEach(() => {
 afterAll(() => {
 	mock.module("../db", () => realDbModule);
 	sqlite.close();
+});
+
+describe("narrator WebSocket message snapshot subscribe", () => {
+	it("returns request-scoped sync_ok for a matching version-only empty snapshot", async () => {
+		seedNarrators();
+		const { ws, sent } = openFakeWs();
+
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "messages",
+			narratorIds: ["narrator-idle"],
+			version: 0,
+			requestId: "messages-empty-current",
+		});
+
+		expect(sent).toContainEqual({
+			type: "sync_ok",
+			narratorId: "narrator-idle",
+			version: 0,
+			subscriptionRequestId: "messages-empty-current",
+		});
+		expect(ws.data.subscribedNarrators.has("narrator-idle")).toBe(true);
+	});
+
+	it("forces a request-scoped reload when a version-only empty snapshot is stale", async () => {
+		seedNarrators();
+		db.update(narrators).set({ messageVersion: 1 }).where(eq(narrators.id, "narrator-idle")).run();
+		const { ws, sent } = openFakeWs();
+
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "messages",
+			narratorIds: ["narrator-idle"],
+			version: 0,
+			requestId: "messages-empty-stale",
+		});
+
+		expect(sent).toContainEqual({
+			type: "full_reload",
+			narratorId: "narrator-idle",
+			subscriptionRequestId: "messages-empty-stale",
+		});
+		expect(sent.some((message) => message.type === "sync_ok")).toBe(false);
+		expect(ws.data.subscribedNarrators.has("narrator-idle")).toBe(true);
+	});
+
+	it("catches up a stale snapshot cursor instead of accepting sync_ok", async () => {
+		seedNarrators();
+		const now = "2026-07-19T00:00:01.000Z";
+		db.insert(narratorMessages)
+			.values([
+				{
+					id: "message-1",
+					narratorId: "narrator-idle",
+					role: "user",
+					contentJson: [{ type: "text", text: "first" }],
+					contentText: "first",
+					createdAt: now,
+				},
+				{
+					id: "message-2",
+					narratorId: "narrator-idle",
+					role: "assistant",
+					contentJson: [{ type: "text", text: "second" }],
+					contentText: "second",
+					createdAt: now,
+				},
+			])
+			.run();
+		db.insert(narratorMessageRefs)
+			.values([
+				{ id: "ref-1", narratorId: "narrator-idle", messageId: "message-1", seq: 1 },
+				{ id: "ref-2", narratorId: "narrator-idle", messageId: "message-2", seq: 2 },
+			])
+			.run();
+		db.update(narrators).set({ messageVersion: 2 }).where(eq(narrators.id, "narrator-idle")).run();
+		const { ws, sent } = openFakeWs();
+
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "messages",
+			narratorIds: ["narrator-idle"],
+			catchUpCursor: { parentLastMessageId: "message-1" },
+			version: 1,
+			requestId: "messages-cursor-stale",
+		});
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		const catchUp = sent.find((message) => message.type === "catch_up");
+		expect(catchUp).toMatchObject({
+			narratorId: "narrator-idle",
+			messageVersion: 2,
+			subscriptionRequestId: "messages-cursor-stale",
+		});
+		expect(
+			(catchUp?.topLevel as Array<{ id?: string }> | undefined)?.map((message) => message.id),
+		).toEqual(["message-2"]);
+		expect(sent.some((message) => message.type === "sync_ok")).toBe(false);
+	});
 });
 
 describe("narrator WebSocket RecentTabs scaling", () => {

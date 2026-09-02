@@ -120,6 +120,13 @@ export interface PluginStateRecord {
 	current: PluginPackageReference | null;
 	/** Internal authority generation; package hash remains the immutable package identity. */
 	authorityInstallationId: string | null;
+	/**
+	 * Stable installation identity (UUID), independent of the package hash.
+	 * Created once on first permission use (lazy migration from the legacy
+	 * hash-as-identity model); survives upgrades so grants are inherited.
+	 * `null` means "legacy hash identity not yet migrated".
+	 */
+	installationId: string | null;
 	desiredState: DesiredState;
 	compatibility: CompatibilityState;
 	runtimeState: RuntimeState;
@@ -438,6 +445,10 @@ function parseStateRecord(
 			current,
 			pluginId,
 		),
+		installationId:
+			typeof value.installationId === "string" && value.installationId.length > 0
+				? value.installationId
+				: null,
 		desiredState: value.desiredState as DesiredState,
 		compatibility: value.compatibility as CompatibilityState,
 		runtimeState: value.runtimeState as RuntimeState,
@@ -739,6 +750,7 @@ export function createPluginStateRecord(
 		pluginId,
 		current: null,
 		authorityInstallationId: null,
+		installationId: null,
 		desiredState: "disabled",
 		compatibility: "unknown",
 		runtimeState: "inactive",
@@ -1051,6 +1063,14 @@ export class PluginStateStore {
 				updatedAt: summary.updatedAt ?? this.timestamp(),
 			},
 		});
+	}
+
+	/**
+	 * Persist the stable installation identity (UUID) for a plugin. Called once
+	 * during lazy migration from the legacy hash-as-identity model.
+	 */
+	async setInstallationId(pluginId: string, installationId: string): Promise<PluginStateRecord> {
+		return this.updateState(pluginId, { installationId });
 	}
 
 	async replaceStates(states: PluginStateRecord[]): Promise<void> {

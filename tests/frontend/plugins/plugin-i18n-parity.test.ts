@@ -32,7 +32,9 @@ describe("plugins admin i18n resources", () => {
 				string,
 				unknown
 			>;
-			expect(typeof grants.readOnlyMessage).toBe("string");
+			expect(typeof grants.manageTitle).toBe("string");
+			expect(typeof grants.revoke).toBe("string");
+			expect(typeof grants.add).toBe("string");
 		}
 	});
 });

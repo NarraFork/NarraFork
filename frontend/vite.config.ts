@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { TanStackRouterVite } from "@tanstack/router-plugin/vite";
@@ -42,7 +43,20 @@ function normalizeModulePath(path: string): string {
 }
 
 const pkg = JSON.parse(readFileSync(resolve(__dirname, "..", "package.json"), "utf-8"));
-const appVersion = pkg.version ?? "0.0.0";
+// Version string exposed to the frontend + service worker. The git commit is
+// appended so that ANY rebuilt frontend differs from the previously installed
+// service worker's APP_VERSION: the SW's activate-time health check then
+// detects the mismatch, unregisters itself and pings the page to reload — the
+// stale precached index.html/bundles are dropped instead of serving an old
+// build indefinitely. (Same-commit rebuilds still update through the normal
+// SW byte-diff install path.)
+let appVersion = pkg.version ?? "0.0.0";
+try {
+	const commit = execSync("git rev-parse --short HEAD", { timeout: 5000 }).toString().trim();
+	if (commit) appVersion = `${appVersion}+${commit}`;
+} catch {
+	// git not available — keep the plain package version
+}
 
 /**
  * Replace `lib/shiki-language-aliases.ts` with the precomputed alias map.

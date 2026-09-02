@@ -3,7 +3,13 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
 import { z } from "zod/v4";
-import { AppError, NotFoundError, ValidationError, zodValidationError } from "../lib/errors";
+import {
+	AppError,
+	formatZodError,
+	NotFoundError,
+	ValidationError,
+	zodValidationError,
+} from "../lib/errors";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { pluginIdSchema } from "../lib/plugins/manifest";
 import { permissionGrantSchema } from "../lib/plugins/permissions";
@@ -12,6 +18,7 @@ import { settings } from "../lib/settings";
 import type { ProxyOverride } from "../lib/settings/types";
 import { assertAdmin } from "../middleware/auth";
 import { pluginManager as corePluginManager } from "../services/plugin-manager";
+import type { PluginPermissionRequest } from "../services/plugin-permission-store";
 import { pluginPlatformServices } from "../services/plugin-platform-services";
 
 const MAX_DIAGNOSTIC_TEXT = 1_000;
@@ -32,6 +39,19 @@ export interface PluginManager {
 	getPermissions?(pluginId: string): Promise<unknown> | unknown;
 	replacePermissions?(pluginId: string, input: unknown): Promise<unknown> | unknown;
 	revokePermissions?(pluginId: string, input: unknown): Promise<unknown> | unknown;
+	listPendingPermissionRequests?(pluginId: string): Promise<PluginPermissionRequest[]>;
+	approvePermissionRequest?(
+		pluginId: string,
+		requestId: string,
+		grantedBy: string,
+	): Promise<unknown>;
+	denyPermissionRequest?(pluginId: string, requestId: string): Promise<boolean>;
+	/** Admin authorization-health report (read-only). */
+	inspectAuthorization?(pluginId: string): Promise<unknown>;
+	/** Admin repair of the canonical installation identity and mirror. */
+	repairAuthorization?(pluginId: string, options: { dryRun?: boolean }): Promise<unknown>;
+	/** Admin reset: revoke all authorities and allocate a fresh identity. */
+	resetAuthorization?(pluginId: string, options: { confirm: boolean }): Promise<unknown>;
 	install(source: string | File | Uint8Array): Promise<unknown>;
 	enable(pluginId: string): Promise<unknown>;
 	disable(pluginId: string): Promise<unknown>;
@@ -444,6 +464,25 @@ function sanitizeSummary(value: unknown): RouteResult {
 		result.lastError = sanitizeDiagnostic(item.lastError);
 	if (item.stderr !== undefined) result.stderrSummary = sanitizeText(item.stderr);
 	if (item.stderrSummary !== undefined) result.stderrSummary = sanitizeText(item.stderrSummary);
+	// The manifest's *declared* host capabilities are exposed by name only (bounded,
+	// same sensitivity as the contribution list). The grants panel uses them to show
+	// which declared capabilities still lack a grant and offer a one-click approval.
+	if (item.manifest && typeof item.manifest === "object" && !Array.isArray(item.manifest)) {
+		const manifest = item.manifest as Record<string, unknown>;
+		const permissions = manifest.permissions;
+		if (permissions && typeof permissions === "object" && !Array.isArray(permissions)) {
+			const host = (permissions as Record<string, unknown>).host;
+			if (Array.isArray(host)) {
+				const names = host
+					.filter(
+						(name): name is string =>
+							typeof name === "string" && name.length > 0 && name.length <= 256,
+					)
+					.slice(0, 200);
+				if (names.length > 0) result.manifest = { permissions: { host: names } };
+			}
+		}
+	}
 	return result;
 }
 
@@ -868,6 +907,134 @@ export function createPluginRoutes(
 				status: sanitizeSummary(result.status),
 				permissions: sanitizePermissionSet(result.permissions),
 			});
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.get("/:pluginId/grants/pending", admin, async (c) => {
+		try {
+			const pluginId = parsePluginId(c);
+			if (!manager.listPendingPermissionRequests) {
+				throw new AppError("Plugin permission management is unavailable", 501, "NOT_IMPLEMENTED");
+			}
+			const requests = await manager.listPendingPermissionRequests(pluginId);
+			return c.json({ requests });
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.post("/:pluginId/grants/requests/:requestId/approve", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			if (!manager.approvePermissionRequest) {
+				throw new AppError("Plugin permission management is unavailable", 501, "NOT_IMPLEMENTED");
+			}
+			const pluginId = parsePluginId(c);
+			const requestId = c.req.param("requestId");
+			const parsed = z.string().trim().min(1).max(256).safeParse(requestId);
+			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			const grantedBy = adminActor(c);
+			const mutation = await manager.approvePermissionRequest(pluginId, requestId, grantedBy);
+			if (!mutation || typeof mutation !== "object" || Array.isArray(mutation)) {
+				return c.json(sanitizeSummary(mutation));
+			}
+			const result = mutation as Record<string, unknown>;
+			return c.json({
+				status: sanitizeSummary(result.status),
+				permissions: sanitizePermissionSet(result.permissions),
+			});
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.post("/:pluginId/grants/requests/:requestId/deny", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			if (!manager.denyPermissionRequest) {
+				throw new AppError("Plugin permission management is unavailable", 501, "NOT_IMPLEMENTED");
+			}
+			const pluginId = parsePluginId(c);
+			const requestId = c.req.param("requestId");
+			const parsed = z.string().trim().min(1).max(256).safeParse(requestId);
+			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			const denied = await manager.denyPermissionRequest(pluginId, requestId);
+			if (!denied) {
+				throw new NotFoundError("Permission request", requestId);
+			}
+			return c.json({ denied: true });
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	// Authorization health / repair / reset are administrator-only because they
+	// reveal installation identities and can revoke or re-allocate authorities.
+	app.get("/:pluginId/authorization", admin, async (c) => {
+		try {
+			const pluginId = parsePluginId(c);
+			if (!manager.inspectAuthorization) {
+				throw new AppError(
+					"Plugin authorization inspection is unavailable",
+					501,
+					"NOT_IMPLEMENTED",
+				);
+			}
+			return c.json(await manager.inspectAuthorization(pluginId));
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.post("/:pluginId/authorization/repair", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			if (!manager.repairAuthorization) {
+				throw new AppError("Plugin authorization repair is unavailable", 501, "NOT_IMPLEMENTED");
+			}
+			const pluginId = parsePluginId(c);
+			let rawBody: unknown;
+			try {
+				rawBody = await c.req.json();
+			} catch {
+				rawBody = {};
+			}
+			const parsed = z.object({ dryRun: z.boolean().optional() }).strict().safeParse(rawBody);
+			if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+			return c.json(
+				await manager.repairAuthorization(pluginId, { dryRun: parsed.data.dryRun ?? false }),
+			);
+		} catch (error) {
+			return errorResponse(c, error);
+		}
+	});
+
+	app.post("/:pluginId/authorization/reset", admin, async (c) => {
+		try {
+			requirePluginsEnabled();
+			if (!manager.resetAuthorization) {
+				throw new AppError("Plugin authorization reset is unavailable", 501, "NOT_IMPLEMENTED");
+			}
+			const pluginId = parsePluginId(c);
+			let rawBody: unknown;
+			try {
+				rawBody = await c.req.json();
+			} catch {
+				rawBody = {};
+			}
+			const parsed = z
+				.object({ confirm: z.literal(true) })
+				.strict()
+				.safeParse(rawBody);
+			if (!parsed.success) {
+				throw new ValidationError("Authorization reset requires an explicit confirm: true");
+			}
+			const status = await manager.resetAuthorization(pluginId, {
+				confirm: parsed.data.confirm,
+			});
+			return c.json(sanitizeSummary(status));
 		} catch (error) {
 			return errorResponse(c, error);
 		}

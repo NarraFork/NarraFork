@@ -1,4 +1,5 @@
 import { generateShortId } from "@server/lib/id";
+import { logger } from "@server/lib/logger";
 import {
 	getContributionFullId,
 	type Manifest,
@@ -291,7 +292,12 @@ const toolPermissionSchema = z
 	.strict();
 
 function clone<T>(value: T): T {
-	return structuredClone(value);
+	return structuredClone(value) as T;
+}
+
+/** JSON round-trip: drops undefined fields and non-finite numbers → strict JsonValue. */
+function toStrictJson<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function deepFreeze<T>(value: T): T {
@@ -986,6 +992,51 @@ export class PluginToolRegistry {
 				responseBytes: 0,
 			});
 			if (!authorization.allowed) {
+				const denied = authorization.error;
+				logger.warn("plugin tool call denied by capability broker", {
+					tool: fullId,
+					capability,
+					methodId: `tools.invoke:${entry.descriptor.fullId}`,
+					invocation: invocation,
+					scope,
+					code: denied?.code,
+					reason: (denied as { reason?: unknown } | undefined)?.reason,
+					message:
+						denied && typeof denied === "object" && "message" in denied
+							? String((denied as { message: unknown }).message)
+							: undefined,
+					diagnosticId: (denied as { diagnosticId?: unknown } | undefined)?.diagnosticId,
+					contextKeys: host ? Object.keys(host) : undefined,
+				});
+				// CONTEXT_UNAVAILABLE / INVALID_CONTEXT means the broker could not
+				// resolve a runtime binding — the plugin process is not running
+				// (or its binding was torn down), NOT that a permission was
+				// denied. Reporting it as "capability denied" sends the user
+				// chasing grants that are perfectly fine. Surface the real cause
+				// and mark it retryable so the caller can re-activate and retry.
+				const contextUnavailable =
+					denied?.code === "CONTEXT_UNAVAILABLE" ||
+					(denied as { reason?: unknown } | undefined)?.reason === "INVALID_CONTEXT";
+				if (contextUnavailable) {
+					const runtime = this.resolveRuntime?.(
+						entry.descriptor.pluginId,
+						entry.descriptor.contributionId,
+					);
+					if (!runtime) {
+						throw new PluginToolRegistryError(
+							"HOST_UNAVAILABLE",
+							`Plugin runtime is not active for ${entry.descriptor.pluginId}; ` +
+								"the tool call was not authorized because no runtime binding exists",
+							true,
+						);
+					}
+					throw new PluginToolRegistryError(
+						"HOST_UNAVAILABLE",
+						`Plugin runtime binding is missing for ${entry.descriptor.pluginId} ` +
+							"even though the runtime is reported active; retry after re-activation",
+						true,
+					);
+				}
 				throw new PluginToolRegistryError(
 					authorization.error?.code ?? "PERMISSION_DENIED",
 					"Capability broker denied the plugin tool call",
@@ -1179,7 +1230,11 @@ export class PluginToolRegistry {
 			{
 				contributionId: entry.descriptor.contributionId,
 				input: clone(input),
-				context: {
+				// RPC params must be strictly JSON (jsonValueSchema): strip any
+				// undefined fields (e.g. deadlineAt when absent) that would fail
+				// the outbound envelope validation ("Cannot enqueue an invalid
+				// JSON-RPC envelope").
+				context: toStrictJson({
 					requestId: context.host.requestId,
 					correlationId: context.host.correlationId,
 					deadlineAt: context.host.deadlineAt,
@@ -1187,7 +1242,7 @@ export class PluginToolRegistry {
 					scope: clone(context.scope),
 					target: context.target ? clone(context.target) : null,
 					permission: clone(context.permission),
-				},
+				}),
 			},
 			{ signal: context.signal, timeoutMs },
 		);

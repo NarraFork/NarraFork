@@ -27,6 +27,7 @@ const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
 const { narratorService } = await import("../../../server/services/narrator-service");
+const { narratorMessageQueries } = await import("../../../server/services/narrator-messages");
 const { narratorContext } = await import("../../../server/services/narrator-context");
 const { recoverStaleCompactingMessages } = await import(
 	"../../../server/services/narrator-persistence"

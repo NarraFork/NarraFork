@@ -285,6 +285,19 @@ export interface CapabilityBrokerOptions {
 	/** Production final gate through the shared Integration Operation Executor. */
 	kernelEnforcement?: boolean;
 	now?: () => Date;
+	/** Callback invoked when authorisation is denied for an un-granted capability. Returns a pending request id so the RPC layer can surface it to the UI. */
+	onPermissionRequest?: (
+		input: PluginPermissionRequestInput,
+	) => Promise<{ requestId: string } | undefined> | { requestId: string } | undefined;
+}
+
+export interface PluginPermissionRequestInput {
+	pluginId: string;
+	installationId: string;
+	runtimeId: string;
+	runtimeGeneration: number;
+	capability: string;
+	scope: { type: string; id?: string };
 }
 
 export interface CapabilityAuthorizationRequest {
@@ -311,6 +324,7 @@ export interface AuthorizationSuccess {
 export interface AuthorizationFailure {
 	allowed: false;
 	error: CapabilityBrokerError;
+	pendingRequestId?: string;
 }
 
 export type AuthorizationResult = AuthorizationSuccess | AuthorizationFailure;
@@ -342,6 +356,7 @@ export type CapabilityBrokerErrorReason =
 export class CapabilityBrokerError extends AppError {
 	readonly reason: CapabilityBrokerErrorReason;
 	readonly diagnosticId: string;
+	pendingRequestId?: string;
 
 	constructor(
 		code: string,
@@ -498,6 +513,18 @@ function mergeScope(current: InvocationScope, requested: InvocationScope): Invoc
 	};
 }
 
+function deriveRequestScope(request: {
+	context: { scope: InvocationScope };
+	scope: InvocationScope;
+}): { type: string; id?: string } {
+	const merged: Record<string, unknown> = { ...request.context.scope, ...request.scope };
+	for (const [type, field] of Object.entries(scopeFieldByType)) {
+		const id = merged[field];
+		if (id !== undefined) return { type, id: String(id) };
+	}
+	return { type: "global" };
+}
+
 function scopeEntries(scope: InvocationScope): Array<[keyof InvocationScope, string]> {
 	return Object.entries(scope).filter((entry): entry is [keyof InvocationScope, string] => {
 		return typeof entry[1] === "string";
@@ -593,6 +620,7 @@ export class CapabilityBroker {
 	private readonly cacheTtlMs: number;
 	private readonly kernelEnforcement: boolean;
 	private readonly now: () => Date;
+	onPermissionRequest?: CapabilityBrokerOptions["onPermissionRequest"];
 	private readonly cache = new Map<string, CacheEntry>();
 	private readonly auditEntries: PluginAuditSummary[] = [];
 	private readonly revokedPlugins = new Set<string>();
@@ -646,6 +674,7 @@ export class CapabilityBroker {
 		this.cacheTtlMs = Math.max(0, Math.floor(options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS));
 		this.kernelEnforcement = options.kernelEnforcement ?? false;
 		this.now = options.now ?? (() => new Date());
+		this.onPermissionRequest = options.onPermissionRequest;
 	}
 
 	/** Replace the host-resolved binding for one running instance and invalidate old decisions. */
@@ -866,7 +895,7 @@ export class CapabilityBroker {
 			);
 			if (kernelError) {
 				await this.recordAudit(request, kernelError, startedAt, resolved.grantRevision);
-				return { allowed: false, error: kernelError };
+				return this.withPendingRequest(request, { allowed: false, error: kernelError });
 			}
 			await this.recordAudit(request, undefined, startedAt, resolved.grantRevision, "CACHE_HIT");
 			return result;
@@ -899,7 +928,7 @@ export class CapabilityBroker {
 				: "CAPABILITY_NOT_GRANTED";
 			const error = this.error(PLUGIN_ERROR_CODES.PERMISSION_DENIED, reason);
 			await this.recordAudit(request, error, startedAt, resolved.grantRevision);
-			return { allowed: false, error };
+			return this.withPendingRequest(request, { allowed: false, error });
 		}
 		const grantResult = await this.findMatchingGrant(validGrants, request);
 		if (grantResult.kind === "expired") {
@@ -970,7 +999,7 @@ export class CapabilityBroker {
 		);
 		if (kernelError) {
 			await this.recordAudit(request, kernelError, startedAt, resolved.grantRevision);
-			return { allowed: false, error: kernelError };
+			return this.withPendingRequest(request, { allowed: false, error: kernelError });
 		}
 
 		const result: AuthorizationSuccess = {
@@ -1730,6 +1759,43 @@ export class CapabilityBroker {
 				code: PLUGIN_ERROR_CODES.HOST_UNAVAILABLE,
 			});
 		}
+	}
+
+	private async withPendingRequest(
+		request: NormalizedRequest,
+		failure: AuthorizationFailure,
+	): Promise<AuthorizationFailure> {
+		if (!this.onPermissionRequest) return failure;
+		const { reason, code } = failure.error;
+		// Only fire for un-granted / not-requested capabilities; never for lifecycle
+		// denials (disabled, quarantined) or runtime-unavailable.
+		if (reason !== "CAPABILITY_NOT_GRANTED" && reason !== "CAPABILITY_NOT_REQUESTED") {
+			return failure;
+		}
+		if (
+			code === PLUGIN_ERROR_CODES.PLUGIN_DISABLED ||
+			code === PLUGIN_ERROR_CODES.HOST_UNAVAILABLE
+		) {
+			return failure;
+		}
+		try {
+			const scope = deriveRequestScope(request);
+			const result = await this.onPermissionRequest({
+				pluginId: request.context.plugin.pluginId,
+				installationId: request.context.plugin.installationId,
+				runtimeId: request.context.plugin.runtimeId,
+				runtimeGeneration: request.context.plugin.runtimeGeneration,
+				capability: request.capability,
+				scope,
+			});
+			if (result?.requestId) {
+				failure.pendingRequestId = result.requestId;
+				failure.error.pendingRequestId = result.requestId;
+			}
+		} catch {
+			// Silently ignore callback errors — the denial still stands.
+		}
+		return failure;
 	}
 
 	private error(

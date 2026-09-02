@@ -1487,9 +1487,9 @@ export const handleNarratorWS = {
 				const allowedIds = await authorizeReadableNarrators(ws, msg.narratorIds, requestId);
 				if (allowedIds.length === 0) break;
 
-				const catchUpAnchor =
-					kind === "messages" && allowedIds.length === 1 ? msg.catchUpCursor : undefined;
-				const catchUpNarratorId = catchUpAnchor ? allowedIds[0] : undefined;
+				const messageNarratorId =
+					kind === "messages" && allowedIds.length === 1 ? allowedIds[0] : undefined;
+				const catchUpAnchor = messageNarratorId ? msg.catchUpCursor : undefined;
 
 				// Reserve the full accepted set before any async snapshot/version work so
 				// concurrent subscribe frames cannot race past the per-connection limit.
@@ -1506,31 +1506,39 @@ export const handleNarratorWS = {
 					sendStreamingSnapshot(ws, allowedIds, requestId);
 				}
 
-				if (catchUpNarratorId && catchUpAnchor) {
-					// When the client reports a known messageVersion and it still matches
-					// the server, skip the full catch-up query entirely: nothing changed
-					// since the client last synced, so a single indexed version read +
-					// sync_ok is enough. This makes "switch away and back" cheap on the
-					// common path (version unchanged) and avoids the synchronous SQLite
-					// tree/hydrate/enrich work blocking the event loop for other narrators.
-					if (msg.version != null) {
-						const serverVersion = await narratorService
-							.getMessageVersion(catchUpNarratorId)
-							.catch(() => null);
-						if (serverVersion != null && serverVersion === msg.version) {
-							// Must subscribe so realtime frames still reach this connection.
-							ws.data.subscribedNarrators.add(catchUpNarratorId);
-							safeSend(
-								ws,
-								withSubscriptionRequestId(
-									{ type: "sync_ok", narratorId: catchUpNarratorId, version: serverVersion },
-									requestId,
-								),
-							);
-							break;
-						}
+				if (messageNarratorId && msg.version != null) {
+					// The version belongs to the REST snapshot used by THIS subscription,
+					// not necessarily the shared connection's latest optimistic state. Check
+					// it even for an empty snapshot with no cursor: if the first message
+					// landed between REST and subscribe, the body must reload rather than
+					// accepting a misleading sync_ok.
+					const serverVersion = await narratorService
+						.getMessageVersion(messageNarratorId)
+						.catch(() => null);
+					if (serverVersion != null && serverVersion === msg.version) {
+						safeSend(
+							ws,
+							withSubscriptionRequestId(
+								{ type: "sync_ok", narratorId: messageNarratorId, version: serverVersion },
+								requestId,
+							),
+						);
+						break;
 					}
-					sendCatchUpForAnchor(ws, catchUpNarratorId, catchUpAnchor, requestId).catch((err) => {
+					if (!catchUpAnchor) {
+						safeSend(
+							ws,
+							withSubscriptionRequestId(
+								{ type: "full_reload", narratorId: messageNarratorId },
+								requestId,
+							),
+						);
+						break;
+					}
+				}
+
+				if (messageNarratorId && catchUpAnchor) {
+					sendCatchUpForAnchor(ws, messageNarratorId, catchUpAnchor, requestId).catch((err) => {
 						logger.warn("Failed to send catch-up messages", { error: String(err) });
 					});
 				}

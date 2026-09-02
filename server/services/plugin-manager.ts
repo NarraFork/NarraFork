@@ -1,20 +1,28 @@
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { db } from "@server/db";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
-import { eventBus } from "@server/lib/event-bus";
+import { eventBus, type NarraForkEvent } from "@server/lib/event-bus";
 import { generateShortId } from "@server/lib/id";
 import { adaptPluginCapability } from "@server/lib/integrations/capability-adapters";
 import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { type Manifest, pluginIdSchema, safeParseManifest } from "@server/lib/plugins/manifest";
-import type { PermissionGrant } from "@server/lib/plugins/permissions";
+import {
+	type PermissionGrant,
+	type PermissionScope,
+	permissionScopeSchema,
+} from "@server/lib/plugins/permissions";
 import { markExtraSearchChannelsReady } from "@server/lib/search/plugin-source";
 import { normalizeSearchSettings } from "@server/lib/search/settings";
 import { saveSettings, settings } from "@server/lib/settings";
+import { PLUGIN_RUNTIME_WORKER_FLAG } from "../plugin-runtime-worker";
 import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
-import type { PluginPrincipal } from "./plugin-capability-broker";
+import type { PluginPermissionRequestInput, PluginPrincipal } from "./plugin-capability-broker";
 import {
 	PluginCatalog,
 	type PluginCatalogPlugin,
@@ -24,7 +32,10 @@ import {
 import { PluginContributionCoordinator } from "./plugin-contribution-coordinator";
 import { PluginContributionRegistry } from "./plugin-contribution-registry";
 import type { PluginHostRuntimeBindingInput, PluginHostServices } from "./plugin-host-services";
-import { PluginIntegrationAuthorityService } from "./plugin-integration-authority-service";
+import {
+	isStableInstallationId,
+	PluginIntegrationAuthorityService,
+} from "./plugin-integration-authority-service";
 import {
 	PluginLifecycleRevokeError,
 	type PluginLifecycleRevokeEvent,
@@ -41,6 +52,7 @@ import {
 import {
 	type PermissionGrantInput,
 	type PermissionMutationResult,
+	type PluginPermissionRequest,
 	type PluginPermissionSet,
 	PluginPermissionStore,
 	permissionSummary,
@@ -238,6 +250,7 @@ export interface PluginPermissionRevokeInput {
 	grantedBy: string;
 }
 
+/** Input the capability broker passes when escalating a capability denial into a permission prompt. */
 export interface PluginPermissionMutationResult {
 	status: PluginManagerStatus;
 	permissions: PluginPermissionSet;
@@ -315,7 +328,6 @@ export function seedGrantsFromManifest(
 	manifestRequested: readonly string[],
 	context?: { pluginId?: string },
 ): PluginGrantSummary {
-	if (summary.count > 0 || summary.capabilities.length > 0) return summary;
 	const declared = [...new Set(manifestRequested)];
 	if (declared.length === 0) return summary;
 	const capabilities = declared.filter((capability) => adaptPluginCapability(capability));
@@ -328,6 +340,12 @@ export function seedGrantsFromManifest(
 		});
 	}
 	if (capabilities.length === 0) return summary;
+	// An existing grant list owns itself: later edits (including revocation) are
+	// authoritative, so seeding never touches it. This is also what keeps an UPGRADE
+	// from widening access — the new manifest may declare more, but those extras are
+	// withheld here and raised as pending approval requests
+	// (`requestUndeclaredManifestCapabilities`) instead of being granted silently.
+	if (summary.count > 0 || summary.capabilities.length > 0) return summary;
 	return {
 		...summary,
 		count: capabilities.length,
@@ -426,7 +444,10 @@ async function resolveManagerToolPrincipal(
 	const diagnostics = runtime.getDiagnostics();
 	const state = await stateStore.getState(pluginId);
 	const packageVersion = diagnostics.pluginVersion ?? state?.current?.version;
-	const installationId = authorityInstallationId(state);
+	// Bindings use the stable UUID installation identity when available; older
+	// state files fall back through the authority generation and legacy package hash.
+	const installationId =
+		state?.installationId ?? authorityInstallationId(state) ?? state?.current?.hash;
 	if (!packageVersion || !installationId) return undefined;
 	return {
 		pluginId,
@@ -571,6 +592,15 @@ export class PluginManager {
 		this.removeInstalledPackage =
 			options.removeInstalledPackage ?? ((pluginId) => this.removePackageFromDisk(pluginId));
 		this.now = options.now ?? (() => new Date());
+
+		// Inject permission request handler into the capability broker so that
+		// unhandled capability denials can be escalated to an interactive prompt.
+		// The broker accepts onPermissionRequest in its constructor options but the
+		// default shared instance is created without one; we inject it here so the
+		// plugin-manager becomes the single owner of the permission-prompt flow.
+		this.hostServices.capabilityBroker.onPermissionRequest = (
+			input: PluginPermissionRequestInput,
+		) => this.handlePermissionRequest(input);
 	}
 
 	async initialize(): Promise<PluginManagerStatus[]> {
@@ -821,7 +851,158 @@ export class PluginManager {
 		});
 	}
 
-	/** Backwards-compatible summary API. New callers should use replacePermissions/revokePermissions. */
+	async listPendingPermissionRequests(pluginId: string): Promise<PluginPermissionRequest[]> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		const installationId = await this.currentInstallationId(pluginId);
+		await this.requireState(pluginId);
+		return this.permissionStore.listPendingRequests(pluginId, installationId);
+	}
+
+	async approvePermissionRequest(
+		pluginId: string,
+		requestId: string,
+		grantedBy: string,
+	): Promise<PluginPermissionMutationResult> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		if (typeof requestId !== "string" || !requestId.trim() || requestId.length > 256) {
+			throw new ValidationError("Invalid permission request id");
+		}
+		if (
+			typeof grantedBy !== "string" ||
+			!grantedBy.trim() ||
+			grantedBy.length > 256 ||
+			/[\0\r\n]/u.test(grantedBy)
+		) {
+			throw new ValidationError("Invalid permission actor");
+		}
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			await this.requireState(pluginId);
+			const installationId = await this.currentInstallationId(pluginId);
+			const pending = await this.permissionStore.listPendingRequests(pluginId, installationId);
+			const request = pending.find((req) => req.requestId === requestId);
+			if (!request) throw new NotFoundError("PluginPermissionRequest", requestId);
+			if (request.status !== "pending") {
+				throw new ValidationError(
+					`Permission request ${requestId} has already been ${request.status}`,
+				);
+			}
+
+			// The canonical grant lives in the DB authority. Write it there FIRST so a
+			// crash between the authority write and the compatibility-mirror write can
+			// never lose an approval; the mirror (and the pending request) is resolved
+			// afterwards. The grant id is derived from the request id so a retry after
+			// a crash re-approves the same request idempotently instead of widening the
+			// grant set again.
+			const current = await this.integrationAuthorityService.get(pluginId, installationId);
+			const grantId = `grant_perm_${createHash("sha256").update(requestId).digest("hex").slice(0, 20)}`;
+			const sameScope = (a: PermissionScope, b: PermissionScope): boolean =>
+				a.type === b.type && (a.id ?? null) === (b.id ?? null);
+			const alreadyGranted = current.grants.some(
+				(grant) =>
+					grant.grantId === grantId ||
+					(grant.capability === request.capability && sameScope(grant.scope, request.scope)),
+			);
+			if (!alreadyGranted) {
+				const mutation = await this.integrationAuthorityService.replace(
+					pluginId,
+					installationId,
+					[
+						...current.grants.map(
+							(grant): PermissionGrantInput => ({
+								capability: grant.capability,
+								scope: grant.scope,
+								...(grant.constraints === undefined ? {} : { constraints: grant.constraints }),
+								...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }),
+								grantId: grant.grantId,
+								grantedBy: grant.grantedBy,
+							}),
+						),
+						{
+							capability: request.capability,
+							scope: request.scope,
+							grantId,
+							grantedBy,
+						},
+					],
+					{ expectedRevision: current.revision, grantedBy },
+				);
+				await this.applyPermissionMutationLocked(pluginId, installationId, mutation);
+			} else {
+				// Retry of an already-approved request: reconcile the summary so the
+				// state mirror matches the canonical authority even if the earlier
+				// approval crashed between the authority write and the summary write.
+				const fresh = await this.integrationAuthorityService.get(pluginId, installationId);
+				await this.syncPermissionSummary(pluginId, fresh);
+			}
+
+			const resolved = await this.permissionStore.resolvePendingRequest(
+				pluginId,
+				installationId,
+				requestId,
+				"granted",
+			);
+			if (!resolved) throw new NotFoundError("PluginPermissionRequest", requestId);
+
+			eventBus.emit({
+				type: "plugin:permission_resolved",
+				pluginId,
+				requestId,
+				status: "granted",
+			} as NarraForkEvent);
+			await this.broadcastPluginEvent("plugin:permission_resolved", {
+				pluginId,
+				requestId,
+				status: "granted",
+			});
+
+			const permissions = await this.permissionStore.getSet(pluginId, installationId);
+			return {
+				status: await this.requireStatus(pluginId),
+				permissions,
+			};
+		});
+	}
+
+	async denyPermissionRequest(pluginId: string, requestId: string): Promise<boolean> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		if (typeof requestId !== "string" || !requestId.trim() || requestId.length > 256) {
+			throw new ValidationError("Invalid permission request id");
+		}
+		const installationId = await this.currentInstallationId(pluginId);
+		await this.requireState(pluginId);
+		const resolved = await this.permissionStore.resolvePendingRequest(
+			pluginId,
+			installationId,
+			requestId,
+			"denied",
+		);
+		if (!resolved) throw new NotFoundError("PluginPermissionRequest", requestId);
+
+		eventBus.emit({
+			type: "plugin:permission_resolved",
+			pluginId,
+			requestId,
+			status: "denied",
+		} as Record<string, unknown> as NarraForkEvent);
+		await this.broadcastPluginEvent("plugin:permission_resolved", {
+			pluginId,
+			requestId,
+			status: "denied",
+		});
+
+		return true;
+	}
+
+	/**
+	 * Backwards-compatible summary API. New callers should use replacePermissions/
+	 * revokePermissions. Existing grants are preserved verbatim (constraints,
+	 * expiry, grantor and scope); only capabilities the summary declares that are
+	 * NOT already granted are appended as legacy global grants. It never flattens
+	 * fine-grained scoped grants into global ones.
+	 */
 	async updateGrants(
 		pluginId: string,
 		grants: Omit<PluginGrantSummary, "revision"> & { revision?: number },
@@ -836,16 +1017,33 @@ export class PluginManager {
 				installationId,
 				state.grants,
 			);
-			const legacyGrants: PermissionGrantInput[] = grants.capabilities.map((capability) => ({
-				capability: capability as PermissionGrant["capability"],
-				scope: { type: "global" },
-				grantId: `legacy-${pluginId}-${capability}`.slice(0, 128),
-				grantedBy: "legacy-api",
-			}));
+			const missingCapabilities = grants.capabilities.filter(
+				(capability) => !current.grants.some((grant) => grant.capability === capability),
+			);
+			const nextGrants: PermissionGrantInput[] = [
+				...current.grants.map(
+					(grant): PermissionGrantInput => ({
+						capability: grant.capability,
+						scope: grant.scope,
+						...(grant.constraints === undefined ? {} : { constraints: grant.constraints }),
+						...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }),
+						grantId: grant.grantId,
+						grantedBy: grant.grantedBy,
+					}),
+				),
+				...missingCapabilities.map(
+					(capability): PermissionGrantInput => ({
+						capability: capability as PermissionGrant["capability"],
+						scope: { type: "global" },
+						grantId: `legacy-${pluginId}-${capability}`.slice(0, 128),
+						grantedBy: "legacy-api",
+					}),
+				),
+			];
 			const mutation = await this.integrationAuthorityService.replace(
 				pluginId,
 				installationId,
-				legacyGrants,
+				nextGrants,
 				{
 					expectedRevision: current.revision,
 					grantedBy: "legacy-api",
@@ -862,11 +1060,18 @@ export class PluginManager {
 		if (!Number.isSafeInteger(grantRevision) || grantRevision < 0) {
 			throw new ValidationError("Invalid grantRevision");
 		}
-		const state = await this.requireState(pluginId);
-		return this.updateGrants(pluginId, {
-			count: state.grants.count,
-			capabilities: state.grants.capabilities,
-			revision: grantRevision,
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			const state = await this.requireState(pluginId);
+			// Legacy API: only the summary revision is touched. The canonical DB
+			// authority and its grants are NOT rewritten (a rewrite here would
+			// flatten every scoped/constrained grant into legacy global grants).
+			await this.stateStore.updateGrantSummary(pluginId, {
+				count: state.grants.count,
+				capabilities: state.grants.capabilities,
+				revision: grantRevision,
+				updatedAt: this.timestamp(),
+			});
+			return this.requireStatus(pluginId);
 		});
 	}
 
@@ -955,6 +1160,141 @@ export class PluginManager {
 			catalog: this.catalogSnapshot?.diagnostics ?? [],
 			plugins,
 		};
+	}
+
+	/**
+	 * Admin diagnostic: authorization health for one plugin (authority rows,
+	 * canonical identity, and mirror drift). Read-only.
+	 */
+	async inspectAuthorization(
+		pluginId: string,
+	): Promise<Awaited<ReturnType<PluginIntegrationAuthorityService["inspectAuthorization"]>>> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		const state = await this.requireState(pluginId);
+		return this.integrationAuthorityService.inspectAuthorization(pluginId, {
+			installationId: state.installationId ?? undefined,
+			packageHash: state.current?.hash,
+		});
+	}
+
+	/**
+	 * Admin repair: converge the plugin onto a single canonical installation
+	 * identity and rebuild the compatibility mirror from the DB authority.
+	 *
+	 * dryRun reports the actions without mutating anything. apply is idempotent:
+	 * resolveInstallationContext restores/migrates the UUID and retires legacy
+	 * hash authorities, then the permission mirror is re-mirrored.
+	 */
+	async repairAuthorization(
+		pluginId: string,
+		options: { dryRun?: boolean } = {},
+	): Promise<{
+		inspection: Awaited<ReturnType<PluginIntegrationAuthorityService["inspectAuthorization"]>>;
+		actions: string[];
+	}> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		const state = await this.requireState(pluginId);
+		const inspection = await this.integrationAuthorityService.inspectAuthorization(pluginId, {
+			installationId: state.installationId ?? undefined,
+			packageHash: state.current?.hash,
+		});
+		const actions: string[] = [];
+		if (inspection.ambiguous) {
+			actions.push(
+				"REFUSE: multiple active installation identities cannot be merged automatically; " +
+					"run reset instead",
+			);
+			return { inspection, actions };
+		}
+		if (!inspection.canonicalInstallationId) {
+			actions.push("migrate: allocate a stable UUID and inherit the legacy grants");
+		} else if (state.installationId !== inspection.canonicalInstallationId) {
+			actions.push(`restore state installationId=${inspection.canonicalInstallationId}`);
+		}
+		const legacyActive = inspection.authorities.filter(
+			(authority) =>
+				authority.state === "active" &&
+				authority.installationId !== undefined &&
+				!isStableInstallationId(authority.installationId),
+		);
+		for (const authority of legacyActive) {
+			actions.push(`retire legacy authority ${authority.authorityId}`);
+		}
+		if (inspection.drift.authorityOnlyGrants.length > 0) {
+			actions.push("mirror: rebuild permissions.json from the DB authority");
+		}
+		if (options.dryRun) return { inspection, actions };
+		const { installationId, permissions } = await this.resolveInstallationContext(state);
+		await this.syncPermissionSummary(pluginId, permissions);
+		if (actions.some((action) => action.startsWith("restore state installationId"))) {
+			actions.push(`state installationId is now ${installationId}`);
+		}
+		const repairedState = await this.requireState(pluginId);
+		return {
+			inspection: await this.integrationAuthorityService.inspectAuthorization(pluginId, {
+				installationId: repairedState.installationId ?? installationId,
+				packageHash: repairedState.current?.hash,
+			}),
+			actions,
+		};
+	}
+
+	/**
+	 * Admin reset: revoke every authority for the plugin, clear the permission
+	 * mirror/pending requests and the grant summary, then allocate a fresh
+	 * installation UUID. The plugin package, provider configuration and secrets
+	 * are preserved — this is NOT an uninstall. Requires an explicit confirm.
+	 */
+	async resetAuthorization(
+		pluginId: string,
+		options: { confirm: boolean },
+	): Promise<PluginManagerStatus> {
+		await this.ensureInitialized();
+		assertPluginId(pluginId);
+		if (!options.confirm) {
+			throw new ValidationError("Plugin authorization reset requires explicit confirmation");
+		}
+		return this.lifecycleMutex.acquire(pluginId, async () => {
+			const state = await this.requireState(pluginId);
+			// Tear down UI sessions, bindings, subscriptions and tool grants for
+			// the current identity before the authorities are revoked.
+			await this.revokePluginLifecycle(pluginId, "disable", "manager-authorization-reset", {
+				grantRevision: state.grants.revision + 1,
+			});
+			await this.integrationAuthorityService.revokePlugin(
+				pluginId,
+				"Plugin authorization reset by administrator",
+			);
+			await this.permissionStore.clearPlugin(pluginId);
+			const installationId = randomUUID();
+			await this.stateStore.setInstallationId(pluginId, installationId);
+			await this.stateStore.updateGrantSummary(pluginId, {
+				count: 0,
+				capabilities: [],
+				revision: 1,
+				updatedAt: this.timestamp(),
+			});
+			// The runtime process still carries the old UUID; tear it down so the
+			// next activation starts with the fresh identity and fails closed
+			// until the administrator re-authorizes.
+			try {
+				await this.runtimeSupervisor.disable(pluginId);
+			} catch (error) {
+				this.runtimeSupervisor.quarantine(pluginId, "runtime reset shutdown failed");
+				logger.warn("Plugin runtime did not stop cleanly during authorization reset", {
+					pluginId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			await this.stateStore.updateState(pluginId, {
+				runtimeState: "inactive",
+				desiredState: "enabled",
+			});
+			logger.info("Plugin authorization reset", { pluginId, installationId });
+			return this.requireStatus(pluginId);
+		});
 	}
 
 	async retry(
@@ -1154,14 +1494,8 @@ export class PluginManager {
 		await this.refreshCatalog("initialize");
 		for (const state of reconciled) {
 			if (!state.current) continue;
-			const installationId = authorityInstallationId(state);
-			if (!installationId) continue;
 			try {
-				const permissions = await this.integrationAuthorityService.ensureInstallation(
-					state.pluginId,
-					installationId,
-					state.grants,
-				);
+				const { permissions } = await this.resolveInstallationContext(state);
 				await this.syncPermissionSummary(state.pluginId, permissions);
 			} catch (error) {
 				await this.stateStore.updateState(state.pluginId, {
@@ -1174,7 +1508,8 @@ export class PluginManager {
 				});
 				logger.warn("Plugin authority reconciliation failed; plugin isolated", {
 					pluginId: state.pluginId,
-					installationId,
+					installationId:
+						state.installationId ?? authorityInstallationId(state) ?? state.current.hash,
 					error: errorMessage(error),
 				});
 			}
@@ -1277,9 +1612,9 @@ export class PluginManager {
 			const previousState = await this.stateStore.getState(installed.pluginId);
 			const nextPackage = { version: installed.version, hash: installed.hash };
 			const samePackage = packagePointersEqual(previousState?.current, nextPackage);
-			const previousInstallationId = authorityInstallationId(previousState);
+			const previousAuthorityInstallationId = authorityInstallationId(previousState);
 			const requestedInstallationId = samePackage
-				? (previousInstallationId ?? installed.hash)
+				? (previousAuthorityInstallationId ?? installed.hash)
 				: installed.hash;
 			const isUpgrade =
 				previousState?.current !== null && previousState?.current !== undefined && !samePackage;
@@ -1322,19 +1657,59 @@ export class PluginManager {
 							),
 				updatedAt: this.timestamp(),
 			}));
+			// Authorization is keyed by the stable installation identity (UUID),
+			// the same id the permission/authority system and runtime UI sessions
+			// use — NOT the package hash, which would create a hash-keyed record
+			// that the runtime never consults. An upgrade keeps the persisted UUID;
+			// a first install (or a legacy state without one) allocates a fresh
+			// UUID right here, with the old hash's grants inherited through
+			// `sourceInstallationId` so upgrades never lose authorization.
+			//
+			// A first install seeds the manifest's capabilities: installing IS the trust
+			// decision. An UPGRADE does not. Because the installation identity is now a
+			// stable UUID, the new package inherits the old grants automatically — so a
+			// new manifest declaring MORE capabilities would silently widen the allow set
+			// under an identity the admin approved for a narrower manifest. Newly declared
+			// capabilities are therefore withheld and raised as pending approval requests
+			// below (fail-closed): the upgrade itself succeeds and every previously granted
+			// capability keeps working, only the added ones wait for a decision.
+			const previousInstallationId = previousState?.installationId;
+			const installationId = previousInstallationId ?? randomUUID();
 			const permissions = await this.integrationAuthorityService.ensureInstallation(
 				installed.pluginId,
-				requestedInstallationId,
+				installationId,
 				seedGrantsFromManifest(
 					previousState?.grants ??
 						createPluginStateRecord(installed.pluginId, this.timestamp()).grants,
 					installed.manifest.permissions.host,
 					{ pluginId: installed.pluginId },
 				),
-				isUpgrade ? previousInstallationId : undefined,
+				// Legacy states predate the stable UUID: inherit the old hash's
+				// grants. First installs have no legacy record at all.
+				previousState?.current?.hash,
 				{ replaceRevoked: true },
 			);
+			if (!previousInstallationId) {
+				await this.stateStore.setInstallationId(installed.pluginId, installationId);
+			}
 			await this.syncPermissionSummary(installed.pluginId, permissions);
+			// Queue approval requests for capabilities this package declares but that the
+			// installation does not hold. Best-effort by design: a failure here must not
+			// fail an otherwise complete install, and withholding the grant already keeps
+			// the capability unusable, so the worst case is a missing prompt rather than
+			// unapproved access.
+			await this.requestUndeclaredManifestCapabilities(
+				installed.pluginId,
+				installationId,
+				installed.manifest.permissions.host,
+				installed.version,
+				permissions,
+			).catch((error) => {
+				logger.warn("Failed to raise upgrade capability approval requests", {
+					pluginId: installed.pluginId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
 			await this.refreshCatalog("install");
 			await this.stateStore.updateOperation(journal.id, {
 				status: "succeeded",
@@ -1398,6 +1773,12 @@ export class PluginManager {
 		}
 		const existing = this.runtimeSupervisor.get(pluginId);
 		if (existing?.state === "active") {
+			// The runtime may report active while its host/broker binding was
+			// torn down (crash revocation, grant-revision/upgrade
+			// invalidation, out-of-order lifecycle events). Reconcile access
+			// instead of trusting the active marker, so tool/UI calls recover
+			// without a host restart.
+			await this.reconcileActiveRuntimeAccess(pluginId);
 			await this.refreshCatalog("activate");
 			return this.requireStatus(pluginId);
 		}
@@ -1448,12 +1829,19 @@ export class PluginManager {
 							503,
 						);
 					}
-					const runtime = existing
-						? await this.runtimeSupervisor.start(pluginId, options.signal)
-						: await this.runtimeSupervisor.start(runtimeOptions);
+					// Always start with the freshly built options. RuntimeSupervisor
+					// reuses an existing record only when the command matches; after
+					// an upgrade the command changed, so it replaces the record and
+					// the new package actually starts (the old behavior restarted
+					// the stale package binary while state reported the new one).
+					const runtime = await this.runtimeSupervisor.start(runtimeOptions);
 					const diagnostics = runtime.getDiagnostics();
 					if (runtimeOptions.runtimeId && packageSummary.hash) {
-						await this.bindRuntimeForRuntime(pluginId, packageSummary.hash, diagnostics);
+						await this.bindRuntimeForRuntime(
+							pluginId,
+							await this.currentInstallationId(pluginId),
+							diagnostics,
+						);
 					}
 					await this.stateStore.updateState(pluginId, (current) => ({
 						...current,
@@ -1545,10 +1933,16 @@ export class PluginManager {
 				) + 1;
 			await this.stateStore.updateState(state.pluginId, { runtimeGeneration: nextGeneration });
 			const binding = await this.bindRuntimeDescriptor(context, runtimeId, nextGeneration);
+			// The spawned plugin process must carry the same stable installation
+			// UUID as the broker binding, otherwise every host call fails identity
+			// validation (the dispatcher would otherwise fall back to a
+			// `runtime:<id>` pseudo-installation that no authority record covers).
+			const installationId = await this.currentInstallationId(state.pluginId);
 			runtimeOptions = {
 				...created,
 				runtimeId,
 				generation: nextGeneration - 1,
+				installationId,
 				dispatcher: binding.dispatcher,
 			};
 		}
@@ -1573,18 +1967,13 @@ export class PluginManager {
 		runtimeId: string,
 		runtimeGeneration: number,
 	): Promise<ReturnType<PluginHostServices["bindRuntime"]>> {
-		const installationId = authorityInstallationId(context.state);
-		if (!installationId) {
-			throw new PluginManagerError(
-				"Plugin authority installation is unavailable",
-				"PLUGIN_PACKAGE_UNAVAILABLE",
-				422,
-			);
-		}
+		const installationId = await this.currentInstallationId(context.pluginId);
 		const permissions = await this.integrationAuthorityService.ensureInstallation(
 			context.pluginId,
 			installationId,
-			context.state.grants,
+			seedGrantsFromManifest(context.state.grants, context.manifest.permissions.host, {
+				pluginId: context.pluginId,
+			}),
 		);
 		await this.syncPermissionSummary(context.pluginId, permissions);
 		const input: PluginHostRuntimeBindingInput = {
@@ -1626,7 +2015,7 @@ export class PluginManager {
 		const permissions = await this.integrationAuthorityService.ensureInstallation(
 			pluginId,
 			installationId,
-			state.grants,
+			seedGrantsFromManifest(state.grants, manifest.permissions.host, { pluginId }),
 		);
 		await this.syncPermissionSummary(pluginId, permissions);
 		return this.hostServices.bindRuntime({
@@ -1645,6 +2034,112 @@ export class PluginManager {
 			packagePath: packageSummary.path,
 			getDiagnostics: () => this.runtimeSupervisor.get(pluginId)?.getDiagnostics(),
 		});
+	}
+
+	/**
+	 * Reconcile host/capability access for a runtime that reports active.
+	 *
+	 * A runtime can be marked active while its host binding is missing or the
+	 * plugin-level platform access is still revoked (crash revocation followed
+	 * by a failed restart, grant-revision/upgrade invalidation, out-of-order
+	 * lifecycle events). Rebuilding the binding from the current runtime
+	 * identity and restoring platform access makes tool/UI calls work again
+	 * without a host restart or manual re-activation.
+	 *
+	 * Security: access is restored only when the plugin is still enabled and
+	 * compatible and the runtime is active/degraded. Disabled, failed and
+	 * quarantined plugins keep their revocations.
+	 */
+	private async reconcileActiveRuntimeAccess(pluginId: string): Promise<void> {
+		const state = await this.requireState(pluginId);
+		if (state.desiredState !== "enabled" || state.compatibility !== "compatible") return;
+		if (!state.current?.hash) return;
+		const runtime = this.runtimeSupervisor.get(pluginId);
+		if (!runtime || !["active", "degraded"].includes(runtime.state)) return;
+		const diagnostics = runtime.getDiagnostics();
+		if (!diagnostics?.runtimeId) return;
+		const installationId = await this.currentInstallationId(pluginId);
+		const binding = this.hostServices.getRuntimeBinding(pluginId, diagnostics.runtimeId);
+		if (!binding || binding.plugin.installationId !== installationId) {
+			await this.bindRuntimeForRuntime(pluginId, installationId, diagnostics);
+		} else if (binding.plugin.runtimeGeneration !== diagnostics.generation) {
+			// A stale generation binding must not stay cached; replace it with
+			// the current generation before restoring platform access.
+			await this.bindRuntimeForRuntime(pluginId, installationId, diagnostics);
+		}
+		// Always restore platform-level access: an earlier revocation may have
+		// left the plugin in the broker/secret/tool revoked sets even when the
+		// binding itself survived. The restore is idempotent and only runs
+		// after the enabled/compatible/active gates above.
+		await this.restorePluginLifecycle(pluginId);
+	}
+
+	/**
+	 * Locate the Bun executable used to spawn `local-process` plugins whose
+	 * runtime is `bun`.
+	 *
+	 * In development the host itself runs under Bun, so `process.execPath` is
+	 * correct (it points at the real bun binary). A compiled single-file Windows
+	 * executable, however, embeds the host entrypoint — `process.execPath`
+	 * points at the host binary, which does NOT accept a script argument (it
+	 * ignores it and boots the app again, colliding with the instance lock and
+	 * exiting 1). In that case resolve a real bun from PATH; npm's `bun.cmd`
+	 * shim is not directly spawnable, so follow it to the underlying
+	 * `bun.exe` (typically node_modules/bun/bin/bun.exe).
+	 */
+	private resolveBunExecutable(): string {
+		// Explicit override wins: lets a user pin the plugin runtime to a specific
+		// bun install without relying on PATH resolution (which is unreliable
+		// inside compiled single-file binaries).
+		const explicit = process.env.NF_PLUGIN_BUN_PATH?.trim();
+		if (explicit) {
+			const resolved = resolve(explicit);
+			if (!existsSync(resolved)) {
+				throw new PluginManagerError(
+					`NF_PLUGIN_BUN_PATH points at a missing executable: ${explicit}`,
+					"PLUGIN_BUN_RUNTIME_NOT_FOUND",
+					500,
+				);
+			}
+			return resolved;
+		}
+		const execPath = process.execPath;
+		// dev（宿主本身由 bun 运行）：execPath 就是真实的 bun 二进制
+		if (execPath && /(^|[\\/])bun(\.exe)?$/i.test(execPath)) return execPath;
+		const candidates = [
+			typeof Bun !== "undefined" ? Bun.which("bun.exe") : undefined,
+			typeof Bun !== "undefined" ? Bun.which("bun") : undefined,
+		];
+		for (const candidate of candidates) {
+			if (!candidate) continue;
+			if (/\.exe$/i.test(candidate)) return candidate;
+			if (/\.cmd$/i.test(candidate)) {
+				// npm shim → real binary lives next to it as node_modules/bun/bin/bun.exe
+				const viaShim = resolve(dirname(candidate), "node_modules", "bun", "bin", "bun.exe");
+				if (existsSync(viaShim)) return viaShim;
+			}
+		}
+		// Compiled single-file binaries may not resolve Bun.which against the
+		// runtime PATH. Probe well-known install locations before giving up.
+		const known = [
+			process.env.BUN_INSTALL && join(process.env.BUN_INSTALL, "bin", "bun.exe"),
+			join(homedir(), ".bun", "bin", "bun.exe"),
+			process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "bun", "bin", "bun.exe"),
+		].filter((p): p is string => Boolean(p));
+		for (const candidate of known) {
+			if (existsSync(candidate)) return candidate;
+		}
+		// Fail closed: falling back to process.execPath would spawn the host
+		// binary itself, which collides with the instance lock and exits 1 —
+		// surfacing as a silent plugin crash and quarantine. A loud, actionable
+		// error is strictly better than another invisible restart loop.
+		throw new PluginManagerError(
+			"bun runtime required for local-process plugin but no bun executable was found. " +
+				"Install bun and add it to PATH, or set NF_PLUGIN_BUN_PATH to a bun binary " +
+				"(e.g. C:\\Users\\you\\.bun\\bin\\bun.exe).",
+			"PLUGIN_BUN_RUNTIME_NOT_FOUND",
+			500,
+		);
 	}
 
 	private async defaultRuntimeOptions(
@@ -1691,11 +2186,31 @@ export class PluginManager {
 		} else {
 			runner = new LocalProcessRunner({
 				allowedCwds: [context.packagePath, context.dataPath, context.tempPath],
+				// Windows has no rlimit equivalent in Bun.spawn and the default
+				// runner rejects unbounded local processes on win32; the official
+				// host behavior on Windows is to run without host resource limits
+				// (surfaced as a startup warning), so keep that contract here —
+				// otherwise every local plugin fails to spawn on Windows and lands
+				// in quarantine.
+				allowUnboundedResourceUsage: process.platform === "win32",
 			});
 			switch (context.manifest.engine.runtime) {
-				case "bun":
-					command = [process.execPath, entryPath, ...server.args];
+				case "bun": {
+					// Self-hosted plugin runtime: a compiled binary embeds the Bun
+					// runtime, so spawn *ourselves* in plugin-runtime-worker mode
+					// instead of requiring a system Bun (which is a recurring
+					// Windows pain point and previously fell back to spawning the
+					// host binary → instance lock conflict → QUARANTINED). Dev
+					// mode (host runs under Bun) keeps spawning bun directly.
+					const compiledBinary =
+						import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
+					if (compiledBinary) {
+						command = [process.execPath, PLUGIN_RUNTIME_WORKER_FLAG, entryPath, ...server.args];
+					} else {
+						command = [this.resolveBunExecutable(), entryPath, ...server.args];
+					}
 					break;
+				}
 				case "node":
 					command = ["node", entryPath, ...server.args];
 					break;
@@ -1729,6 +2244,7 @@ export class PluginManager {
 				NF_PLUGIN_DATA_DIR: context.dataPath,
 				NF_PLUGIN_TEMP_DIR: context.tempPath,
 				NF_PLUGIN_LOG_DIR: context.logPath,
+				NF_PLUGIN_PACKAGE_DIGEST: context.package.hash,
 			},
 			timeouts: {
 				handshakeMs: server.startupTimeoutMs,
@@ -2012,6 +2528,158 @@ export class PluginManager {
 		}
 	}
 
+	/**
+	 * Public alias of the stable installation identity (UUID) for the current
+	 * package. The plugin UI routes use it to key capability authorization, so
+	 * UI sessions authorize against the same authority record the permission
+	 * system maintains (keyed by installation id) instead of the package hash.
+	 */
+	async getCurrentInstallationId(pluginId: string): Promise<string> {
+		return this.currentInstallationId(pluginId);
+	}
+
+	/**
+	 * Resolve the single canonical installation identity for a plugin and make
+	 * sure its authority record exists and is active.
+	 *
+	 * This is the only place that decides which installationId to use for a
+	 * plugin (install, initialize, activation, UI sessions and runtime bindings
+	 * all converge here). Rules, in order:
+	 *
+	 * 1. state already carries a UUID → use it (upgrade keeps it).
+	 * 2. state has no UUID but exactly one active UUID-keyed authority exists in
+	 *    the DB → restore that UUID into state (host restart after a crashed
+	 *    write, or migration left state behind).
+	 * 3. several active UUID authorities → ambiguous: fail closed instead of
+	 *    guessing. An explicit repair/reset is required.
+	 * 4. only legacy package-hash authorities exist → allocate a fresh UUID,
+	 *    inherit the legacy grants (sourceInstallationId), then revoke the
+	 *    legacy authorities so the plugin never has two live identity roots.
+	 * 5. nothing exists at all → allocate a fresh UUID; the state summary is
+	 *    used as the legacy grant source.
+	 */
+	private async resolveInstallationContext(state: PluginStateRecord): Promise<{
+		installationId: string;
+		permissions: PluginPermissionSet;
+	}> {
+		const pluginId = state.pluginId;
+		if (state.installationId) {
+			const permissions = await this.integrationAuthorityService.ensureInstallation(
+				pluginId,
+				state.installationId,
+				state.grants,
+			);
+			// Best-effort hygiene: retires package-hash-keyed authorities that
+			// older host versions created for this plugin (every upgrade used to
+			// mint a new hash authority and none were revoked). The UUID is the
+			// canonical identity now; the hash rows must not remain active.
+			await this.retireLegacyAuthorities(
+				pluginId,
+				await this.integrationAuthorityService.listAuthorities(pluginId),
+			);
+			return { installationId: state.installationId, permissions };
+		}
+		const authorities = await this.integrationAuthorityService.listAuthorities(pluginId);
+		const active = authorities.filter((authority) => authority.state === "active");
+		const uuidActive = active.filter(
+			(authority) =>
+				authority.installationId !== undefined && isStableInstallationId(authority.installationId),
+		);
+		const legacyActive = active.filter(
+			(authority) =>
+				authority.installationId !== undefined && !isStableInstallationId(authority.installationId),
+		);
+		if (uuidActive.length > 1) {
+			throw new PluginManagerError(
+				`Plugin authorization is ambiguous: multiple active installation identities exist for ${pluginId}`,
+				"PLUGIN_AUTHORITY_AMBIGUOUS",
+				409,
+			);
+		}
+		if (uuidActive.length === 1) {
+			const installationId = uuidActive[0].installationId as string;
+			logger.info("Restored plugin stable installation identity from authority record", {
+				pluginId,
+				installationId,
+			});
+			await this.stateStore.setInstallationId(pluginId, installationId);
+			// Retire any stray legacy hash-keyed authorities so the identity root
+			// stays unique across restarts.
+			await this.retireLegacyAuthorities(pluginId, legacyActive);
+			const permissions = await this.integrationAuthorityService.ensureInstallation(
+				pluginId,
+				installationId,
+				state.grants,
+			);
+			return { installationId, permissions };
+		}
+		if (state.current && authorities.some((authority) => authority.state === "revoked")) {
+			throw new PluginManagerError(
+				`Plugin authorization is revoked for ${pluginId}; explicit reinstall or reset is required`,
+				"INTEGRATION_AUTHORITY_CONFLICT",
+				409,
+			);
+		}
+		const installationId = randomUUID();
+		const legacyInstallationId =
+			legacyActive.length === 1
+				? (legacyActive[0].installationId as string)
+				: (state.current?.hash ?? undefined);
+		logger.info("Allocated stable plugin installation identity", {
+			pluginId,
+			installationId,
+			legacyInstallationId: legacyInstallationId ?? null,
+		});
+		const permissions = await this.integrationAuthorityService.ensureInstallation(
+			pluginId,
+			installationId,
+			state.grants,
+			legacyInstallationId,
+		);
+		await this.stateStore.setInstallationId(pluginId, installationId);
+		await this.retireLegacyAuthorities(pluginId, legacyActive);
+		return { installationId, permissions };
+	}
+
+	/**
+	 * Revoke legacy package-hash-keyed authorities once their grants have been
+	 * migrated to the stable UUID identity. Prevents dual live identity roots.
+	 *
+	 * Defensively filters internally: only ACTIVE authorities whose metadata
+	 * installation id is NOT a stable UUID are retired — passing the full
+	 * authority list (or a stale one) is safe and never touches the canonical
+	 * UUID authority.
+	 */
+	private async retireLegacyAuthorities(
+		pluginId: string,
+		authorities: Awaited<ReturnType<PluginIntegrationAuthorityService["listAuthorities"]>>,
+	): Promise<void> {
+		const legacyActive = authorities.filter(
+			(authority) =>
+				authority.state === "active" &&
+				authority.installationId !== undefined &&
+				!isStableInstallationId(authority.installationId),
+		);
+		for (const authority of legacyActive) {
+			try {
+				await this.integrationAuthorityService.revokeAuthority(
+					authority.authorityId,
+					"migrated-to-stable-installation-id",
+				);
+				logger.info("Retired legacy plugin authority after identity migration", {
+					pluginId,
+					authorityId: authority.authorityId,
+				});
+			} catch (error) {
+				logger.warn("Unable to retire legacy plugin authority", {
+					pluginId,
+					authorityId: authority.authorityId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+	}
+
 	private async currentInstallationId(pluginId: string): Promise<string> {
 		const state = await this.requireState(pluginId);
 		const installationId = authorityInstallationId(state);
@@ -2022,7 +2690,7 @@ export class PluginManager {
 				422,
 			);
 		}
-		return installationId;
+		return (await this.resolveInstallationContext(state)).installationId;
 	}
 
 	private async syncPermissionSummary(
@@ -2122,25 +2790,26 @@ export class PluginManager {
 		const runtime = this.runtimeSupervisor.get(pluginId);
 		const diagnostics = runtime?.getDiagnostics();
 		try {
-			if (
-				runtimeState === "active" &&
-				diagnostics &&
-				(await this.isRuntimeGenerationChange(pluginId, diagnostics.generation))
-			) {
-				await this.revokePluginLifecycle(
-					pluginId,
-					"runtime_generation",
-					"runtime-generation-changed",
-					{
-						runtimeId: diagnostics.runtimeId,
-						runtimeGeneration: diagnostics.generation,
-					},
-				);
-				const state = await this.requireState(pluginId);
-				const installationId = authorityInstallationId(state);
-				if (state.current?.hash && installationId) {
-					await this.bindRuntimeForRuntime(pluginId, installationId, diagnostics);
+			if (runtimeState === "active" && diagnostics) {
+				if (await this.isRuntimeGenerationChange(pluginId, diagnostics.generation)) {
+					await this.revokePluginLifecycle(
+						pluginId,
+						"runtime_generation",
+						"runtime-generation-changed",
+						{
+							runtimeId: diagnostics.runtimeId,
+							runtimeGeneration: diagnostics.generation,
+						},
+					);
 				}
+				// Reconcile unconditionally: even when the generation did not
+				// change, an earlier revocation may have removed the host
+				// binding or left the plugin-level revoked state in place
+				// (crash followed by a failed restart, out-of-order state
+				// events). Rebuilding the binding with the current runtime
+				// identity and restoring platform access heals the stuck
+				// "active but unreachable" state.
+				await this.reconcileActiveRuntimeAccess(pluginId);
 				await this.restorePluginLifecycle(pluginId);
 			}
 			if (["crashed", "failed", "quarantine"].includes(runtimeState)) {
@@ -2267,12 +2936,171 @@ export class PluginManager {
 				revision: report.revision,
 				reason: operation,
 			});
+			await this.broadcastPluginEvent("plugin:contributions_changed", {
+				revision: report.revision,
+				reason: operation,
+			});
 		}
 		return this.catalogSnapshot;
 	}
 
 	private catalogPlugin(pluginId: string): PluginCatalogPlugin | undefined {
 		return this.catalogSnapshot?.plugins.find((plugin) => plugin.pluginId === pluginId);
+	}
+
+	/**
+	 * Raise approval requests for capabilities the installed manifest declares but that the
+	 * installation holds no grant for.
+	 *
+	 * This is the fail-closed half of the upgrade path. A stable installation identity means
+	 * a new package version inherits the previous grants; if its manifest declares more, the
+	 * extra capabilities must not ride in on that inheritance. They are surfaced here as
+	 * pending requests instead, so an admin makes the same explicit decision they made at
+	 * first install.
+	 *
+	 * Only capabilities with a canonical adapter can produce a request — the manifest schema
+	 * accepts free-form tokens, but an unmappable one can never be granted (and the broker
+	 * denies it anyway), so prompting for it would be an undecidable question.
+	 *
+	 * Scope is `global`, matching what the manifest expresses: a declaration carries no
+	 * scope, and the install-time seeding grants global too. Narrowing belongs to the
+	 * grants panel, where the admin can replace a grant with a scoped one.
+	 *
+	 * Returns the capabilities that are now awaiting approval (including ones already
+	 * queued), so callers can report the outcome.
+	 */
+	private async requestUndeclaredManifestCapabilities(
+		pluginId: string,
+		installationId: string,
+		manifestRequested: readonly string[],
+		version: string,
+		permissions: PluginPermissionSet,
+	): Promise<string[]> {
+		const declared = [...new Set(manifestRequested)];
+		if (declared.length === 0) return [];
+		// A grant may be stored under the plugin-facing token or its canonical id, so both
+		// spellings count as "already granted" — otherwise every upgrade would re-prompt
+		// for capabilities the admin already approved.
+		const granted = new Set<string>();
+		for (const grant of permissions.grants) {
+			granted.add(grant.capability);
+			const adapted = adaptPluginCapability(grant.capability);
+			if (adapted) granted.add(adapted.id);
+		}
+		const missing = declared.filter((capability) => {
+			const adapted = adaptPluginCapability(capability);
+			if (!adapted) return false;
+			return !granted.has(capability) && !granted.has(adapted.id);
+		});
+		if (missing.length === 0) return [];
+
+		const queued: string[] = [];
+		for (const capability of missing) {
+			try {
+				const request = await this.permissionStore.addPendingRequest(pluginId, installationId, {
+					capability,
+					scope: { type: "global" },
+					source: "upgrade",
+					requestedForVersion: version,
+				});
+				queued.push(capability);
+				eventBus.emit({
+					type: "plugin:permission_request",
+					pluginId,
+					requestId: request.requestId,
+					capability,
+				} as NarraForkEvent);
+				await this.broadcastPluginEvent("plugin:permission_request", {
+					pluginId,
+					requestId: request.requestId,
+					capability,
+					source: "upgrade",
+				});
+			} catch (error) {
+				// A full pending queue (or any single rejected row) must not abort the rest:
+				// the capability stays ungranted either way, and the remaining ones still
+				// deserve a prompt.
+				logger.warn("Could not queue an upgrade capability approval request", {
+					pluginId,
+					capability,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		if (queued.length > 0) {
+			logger.info("Upgraded plugin declares new capabilities; awaiting approval", {
+				pluginId,
+				version,
+				awaitingApproval: queued,
+			});
+		}
+		return queued;
+	}
+
+	/**
+	 * Callback injected into the capability broker. When the broker denies a capability
+	 * because no grant exists, it invokes this handler to create a permission prompt rather
+	 * than failing immediately. Returns the pending request id or undefined when the plugin
+	 * state does not permit prompting or the store rejects a duplicate.
+	 */
+	private async handlePermissionRequest(
+		input: PluginPermissionRequestInput,
+	): Promise<{ requestId: string } | undefined> {
+		try {
+			const state = await this.requireState(input.pluginId);
+			if (state.desiredState !== "enabled") return undefined;
+			if (state.runtimeState === "quarantine" || state.runtimeState === "failed") return undefined;
+
+			const parsedScope = permissionScopeSchema.safeParse(input.scope);
+			if (!parsedScope.success) return undefined;
+
+			const req = await this.permissionStore.addPendingRequest(
+				input.pluginId,
+				input.installationId,
+				{
+					capability: input.capability,
+					scope: parsedScope.data,
+					requestedByRuntimeId: input.runtimeId,
+				},
+			);
+
+			eventBus.emit({
+				type: "plugin:permission_request",
+				pluginId: input.pluginId,
+				requestId: req.requestId,
+				capability: input.capability,
+			} as NarraForkEvent);
+			await this.broadcastPluginEvent("plugin:permission_request", {
+				pluginId: input.pluginId,
+				requestId: req.requestId,
+				capability: input.capability,
+			});
+
+			return { requestId: req.requestId };
+		} catch (error) {
+			if (error instanceof ValidationError) return undefined;
+			throw error;
+		}
+	}
+
+	/**
+	 * Push a plugin lifecycle event to connected UI sessions so panels refresh
+	 * live (event-driven refresh on top of the foreground polling fallback).
+	 * Best-effort: a failure here never affects the operation itself.
+	 */
+	private async broadcastPluginEvent(
+		type:
+			| "plugin:permission_request"
+			| "plugin:permission_resolved"
+			| "plugin:contributions_changed",
+		payload: Record<string, unknown>,
+	): Promise<void> {
+		try {
+			const { broadcastToAll } = await import("../websocket/narrator-ws");
+			broadcastToAll({ type, ...payload });
+		} catch {
+			// Event push is best-effort; polling remains the fallback.
+		}
 	}
 
 	private async requireState(pluginId: string): Promise<PluginStateRecord> {

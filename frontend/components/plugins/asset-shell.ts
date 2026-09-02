@@ -21,6 +21,8 @@ export interface PluginAssetShellOptions {
 	panelInstanceId: string;
 	entryUrl: string;
 	styleUrl?: string;
+	/** Panel title shown by the built-in loading splash (before the plugin script takes over). */
+	title?: string;
 	defaultTimeoutMs?: number;
 	/**
 	 * Shared host runtime (React + Mantine) to load before the plugin entry.
@@ -51,6 +53,74 @@ export interface PluginAssetShellOptions {
 
 function escapeAttribute(value: string): string {
 	return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;");
+}
+
+/**
+ * Mantine tokens mirrored from the host document into the sandboxed iframe so
+ * plugin UIs can style themselves with the exact same design system (colors,
+ * radius, fonts, spacing) as the host — including light/dark scheme switches,
+ * because the srcdoc is rebuilt on theme change. Iframe documents do not
+ * inherit host CSS variables, so the shell copies the resolved values.
+ */
+const MANTINE_TOKEN_NAMES = [
+	"--mantine-color-body",
+	"--mantine-color-text",
+	"--mantine-color-dimmed",
+	"--mantine-color-default",
+	"--mantine-color-default-border",
+	"--mantine-color-default-hover",
+	"--mantine-color-black",
+	"--mantine-color-white",
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-gray-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-dark-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-blue-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-indigo-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-yellow-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-green-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-red-${i}`),
+	"--mantine-primary-color-0",
+	"--mantine-primary-color-1",
+	"--mantine-primary-color-2",
+	"--mantine-primary-color-3",
+	"--mantine-primary-color-4",
+	"--mantine-primary-color-5",
+	"--mantine-primary-color-6",
+	"--mantine-primary-color-7",
+	"--mantine-primary-color-8",
+	"--mantine-primary-color-9",
+	"--mantine-primary-color-filled",
+	"--mantine-primary-color-filled-hover",
+	"--mantine-primary-color-light",
+	"--mantine-primary-color-light-hover",
+	"--mantine-primary-color-contrast",
+	"--mantine-radius-xs",
+	"--mantine-radius-sm",
+	"--mantine-radius-md",
+	"--mantine-radius-lg",
+	"--mantine-spacing-xs",
+	"--mantine-spacing-sm",
+	"--mantine-spacing-md",
+	"--mantine-spacing-lg",
+	"--mantine-font-family",
+	"--mantine-font-family-monospace",
+	"--mantine-heading-font-family",
+	"--mantine-font-size-xs",
+	"--mantine-font-size-sm",
+	"--mantine-font-size-md",
+	"--mantine-font-size-lg",
+	"--mantine-line-height",
+];
+
+/** Read the host's live Mantine tokens. Safe to call during render (document is mounted). */
+export function readHostMantineTokens(): string {
+	if (typeof document === "undefined") return "";
+	const style = getComputedStyle(document.documentElement);
+	const parts: string[] = [];
+	for (const name of MANTINE_TOKEN_NAMES) {
+		const value = style.getPropertyValue(name).trim();
+		if (value) parts.push(`${name}:${value};`);
+	}
+	return parts.join("");
 }
 
 function escapeScriptJson(value: unknown): string {
@@ -401,7 +471,14 @@ export function createPluginAssetShell(options: PluginAssetShellOptions): string
 		"manifest-src 'none'",
 		"media-src 'none'",
 	].join("; ");
-	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}"></head><body><script nonce="${escapeAttribute(options.nonce)}">${createInlineBridge(options)}</script></body></html>`;
+	// The iframe body starts with a themed loading splash (spinner + panel
+	// title) so the frame is never a blank white rectangle while the bridge
+	// handshake and plugin script load. The plugin script takes over the body
+	// as soon as it runs (plugin UIs render their own content); the splash is
+	// deliberately inline/CSP-safe (style-src 'unsafe-inline').
+	const splashTitle = options.title ? escapeAttribute(options.title) : "Plugin panel";
+	const splash = `<div id="plugin-shell-splash" style="position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:var(--mantine-color-body,#1a1b1e);color:var(--mantine-color-dimmed,#909296);font-family:var(--mantine-font-family,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif);font-size:13px;"><div style="width:20px;height:20px;border:2px solid var(--mantine-color-default-border,#373a40);border-top-color:var(--mantine-primary-color-5,#4c6ef5);border-radius:50%;animation:plugin-shell-spin .9s linear infinite;"></div><div>${splashTitle}</div></div><style>@keyframes plugin-shell-spin{to{transform:rotate(360deg)}}</style>`;
+	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}"><style>:root{${readHostMantineTokens()}}</style></head><body>${splash}<script nonce="${escapeAttribute(options.nonce)}">${createInlineBridge(options)}</script></body></html>`;
 }
 
 export function createPluginNonce(): string {

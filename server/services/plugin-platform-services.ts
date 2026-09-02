@@ -143,6 +143,11 @@ function revokeOrClearUiSession(
 	services: Pick<PluginPlatformServices, "uiSession">,
 	context: PluginLifecycleRevokeContext,
 ): void {
+	// runtime_generation events carry no authorization change for the UI: the
+	// installation identity, authority and grants are unchanged, so UI sessions
+	// (bound to the stable UUID, not the runtime generation) survive an idle
+	// backend runtime restart. Only revoke/clear wipe them.
+	if (context.action === "invalidate") return;
 	services.uiSession.clearForPlugin(context.event.pluginId, lifecycleReason(context));
 }
 
@@ -340,7 +345,10 @@ async function resolvePluginToolPrincipal(
 	const diagnostics = runtime.getDiagnostics();
 	const state = await stateStore.getState(pluginId);
 	const packageVersion = diagnostics.pluginVersion ?? state?.current?.version;
-	const installationId = state?.authorityInstallationId ?? state?.current?.hash;
+	// Bindings use the stable UUID installation identity when available; older
+	// state files fall back through the authority generation and legacy package hash.
+	const installationId =
+		state?.installationId ?? state?.authorityInstallationId ?? state?.current?.hash;
 	if (!packageVersion || !installationId) return undefined;
 	return {
 		pluginId,

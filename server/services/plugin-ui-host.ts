@@ -343,19 +343,9 @@ export class PluginUiHost {
 		const fence = this.trackSessionRequest(input.session.sessionId);
 		try {
 			// SIZE FIRST, then shape — the same order `validateUiEnvelope` uses on the client.
-			//
-			// The reverse order made the size limit unreportable in its own terms. The
-			// envelope schema bounds any single string at `MAX_JSON_STRING_LENGTH` (1 MB),
-			// which is well below this 5 MB envelope ceiling, so a genuinely oversized payload
-			// failed `safeParse` first and came back as `INVALID_PARAMS` — telling the caller
-			// its message was malformed when the actual problem was that it was too big, and
-			// leaving `PAYLOAD_TOO_LARGE` reachable only by a payload assembled from many
-			// individually-legal strings.
-			//
-			// Judging size first is also the cheaper rejection: it is one `JSON.stringify` on
-			// a payload that is about to be refused, instead of a full recursive schema walk
-			// (node counting, cycle detection, prototype checks) over something oversized.
-			if (jsonBytes(input.request) > PLUGIN_UI_HOST_REQUEST_MAX_BYTES) {
+			// Judging size first also avoids a recursive schema walk over an oversized request.
+			const rawRequestBytes = jsonBytes(input.request);
+			if (rawRequestBytes > PLUGIN_UI_HOST_REQUEST_MAX_BYTES) {
 				return makeResponse(
 					isRecord(input.request) && typeof input.request.id === "string"
 						? input.request.id
@@ -530,7 +520,10 @@ export class PluginUiHost {
 			runtimeId: `ui:${input.session.sessionId}`,
 			runtimeGeneration: input.session.generation,
 			contributionId: input.session.contributionId,
-			installationId: input.session.authorityInstallationId,
+			// Stable installation identity, matching the authority record the
+			// permission system keys grants by. Fall back to the legacy authority
+			// field for sessions created before UUID migration completed.
+			installationId: input.session.installationId ?? input.session.authorityInstallationId,
 		};
 		const contextInput = {
 			requestId: input.request.id,
@@ -704,7 +697,7 @@ export class PluginUiHost {
 			throw new PluginUiHostError("INVALID_PARAMS", "Invalid event subscription parameters");
 		const principal: PluginEventPrincipal = {
 			pluginId: input.session.pluginId,
-			installationId: input.session.authorityInstallationId,
+			installationId: input.session.installationId ?? input.session.authorityInstallationId,
 			packageVersion: input.session.version,
 			runtimeId: `ui:${input.session.sessionId}`,
 			generation: input.session.generation,
@@ -721,6 +714,24 @@ export class PluginUiHost {
 		delete params.contributionId;
 		delete params.packageVersion;
 		delete params.currentScope;
+		// Normalize delivery to the gateway schema. The UI shell passes the
+		// transport (`poll`) which is part of the UI protocol but NOT part of
+		// the backend subscribe schema — passing it through would make the
+		// strict schema reject the whole subscription (INVALID_SUBSCRIPTION)
+		// and the panel would silently never receive events.
+		if (isRecord(params.delivery)) {
+			const delivery = params.delivery as Record<string, unknown>;
+			params.delivery = {
+				...(typeof delivery.maxRatePerSecond === "number"
+					? { maxRatePerSecond: delivery.maxRatePerSecond }
+					: {}),
+				...(typeof delivery.queueEvents === "number" ? { queueEvents: delivery.queueEvents } : {}),
+				...(typeof delivery.queueBytes === "number" ? { queueBytes: delivery.queueBytes } : {}),
+				...(typeof delivery.includeInitialState === "boolean"
+					? { includeInitialState: delivery.includeInitialState }
+					: {}),
+			};
+		}
 		this.assertSessionRequestActive(fence);
 		const subscribe = this.eventGateway.subscribe as unknown as (
 			request: Parameters<PluginEventGateway["subscribe"]>[0],
@@ -1024,6 +1035,8 @@ export class PluginUiHost {
 	}
 
 	private context(input: PluginUiHostRequest): JsonValue {
+		const scope = input.session.scope ?? {};
+		const narratorId = typeof scope.narratorId === "string" ? scope.narratorId : undefined;
 		return {
 			contextVersion: 1,
 			host: { appVersion: "unknown", locale: "unknown", colorScheme: "dark", platform: "unknown" },
@@ -1045,6 +1058,17 @@ export class PluginUiHost {
 				active: true,
 				visible: true,
 			},
+			// Mirror the frontend `toPluginUiContext` narrator block so a panel can
+			// tell which narrator it is attached to (surface scope "narrator").
+			...(narratorId
+				? {
+						narrator: {
+							id: narratorId,
+							...(typeof scope.chapterId === "string" ? { chapterId: scope.chapterId } : {}),
+							...(typeof scope.projectId === "string" ? { projectId: scope.projectId } : {}),
+						},
+					}
+				: {}),
 			route: { routeId: "plugin-ui" },
 		};
 	}

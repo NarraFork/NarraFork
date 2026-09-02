@@ -351,6 +351,7 @@ interface CreateSubagentInput {
 	cwd: string;
 	title?: string;
 	permissionMode?: string;
+	planReflectionAutoApproveOverride?: BooleanOverride;
 	model?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	systemPrompt?: string;
@@ -368,7 +369,14 @@ function formatAvailableOptionalToolIds(): string {
  * reviewers need not be admins, and per-action authority is enforced by the service
  * layer (canReview / canWriteMain) at execution time.
  */
-const ADMIN_ONLY_LOAD_TOOLS = new Set(["NarraForkAdmin", "KnowledgeAdmin"]);
+const ADMIN_ONLY_LOAD_TOOLS = new Set([
+	"NarraForkAdmin",
+	"KnowledgeAdmin",
+	"PluginInstall",
+	"McpAdmin",
+	"HookAdmin",
+	"ScheduledTaskAdmin",
+]);
 
 /**
  * Resolve a narrator's traits across the user/project/narrator layers.
@@ -1455,7 +1463,10 @@ export const narratorService = {
 				fastMode: legacyFastModeMirror(parent.fastModeOverride),
 				relaxedPlan: resolvedRelaxedPlan,
 				pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
-				planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
+				planReflectionAutoApproveOverride:
+					input.planReflectionAutoApproveOverride ??
+					parent.planReflectionAutoApproveOverride ??
+					"inherit",
 				dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
 				autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
 				behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,

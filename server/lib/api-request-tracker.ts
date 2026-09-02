@@ -31,6 +31,7 @@ export type ApiRequestKind =
 	| "git_summary"
 	/** Summarizing a selection of human chat messages before forwarding it. */
 	| "chat_summarize"
+	| "external"
 	| "internal";
 
 export interface ApiRequestStartOptions {

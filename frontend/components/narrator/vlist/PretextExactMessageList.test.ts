@@ -1,10 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { buildPretextLayoutIndex, type PretextLayoutManifest } from "@shared/pretext-layout";
+import { NarratorWSManager } from "../../../lib/narrator-ws-manager";
 import {
 	applyExactScrollCorrection,
 	buildExactCatchUpCursor,
 	buildExactListLayout,
+	buildExactMessageSnapshot,
 	computeToolRunFrames,
 	hasRenderableExactLayout,
 	isCompactMarkerMessage,
@@ -185,6 +187,45 @@ describe("PretextExactMessageList", () => {
 			parentLastMessageId: "m1",
 		});
 		expect(buildExactCatchUpCursor([])).toBeUndefined();
+	});
+
+	it("pairs exact document cursor and version, including empty snapshots", () => {
+		expect(buildExactMessageSnapshot([{ id: "m1" }, { id: "m2" }], 5)).toEqual({
+			cursor: { parentLastMessageId: "m2" },
+			messageVersion: 5,
+		});
+		expect(buildExactMessageSnapshot([], 0)).toEqual({
+			cursor: undefined,
+			messageVersion: 0,
+		});
+		expect(buildExactMessageSnapshot([{ id: "m1" }], undefined)).toBeUndefined();
+	});
+
+	it("sends the exact REST coordinate even after a shared panel subscription advances", () => {
+		const manager = new NarratorWSManager();
+		manager.subscribe(["n1"], { kind: "panel" });
+		manager.updateCatchUpCursor("n1", { parentLastMessageId: "panel-new" });
+		manager.updateMessageVersion("n1", 6);
+		const handle = manager.subscribe(["n1"], {
+			kind: "messages",
+			initialMessageSnapshot: buildExactMessageSnapshot([{ id: "exact-old" }], 5),
+		});
+		const sent: Array<Record<string, unknown>> = [];
+		const internals = manager as unknown as {
+			ws: { readyState: number; send: (payload: string) => void };
+			_sendSubscribe: (subscription: typeof handle, narratorIds: string[]) => void;
+		};
+		internals.ws = {
+			readyState: WebSocket.OPEN,
+			send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>),
+		};
+
+		internals._sendSubscribe(handle, ["n1"]);
+
+		expect(sent[0]).toMatchObject({
+			catchUpCursor: { parentLastMessageId: "exact-old" },
+			version: 5,
+		});
 	});
 
 	it("keeps the experimental shell independent from band geometry", () => {

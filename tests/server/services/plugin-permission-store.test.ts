@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
 	PluginPermissionConflictError,
 	PluginPermissionStore,
+	type PluginPermissionRequest,
 } from "@server/services/plugin-permission-store";
 import { PluginStateStore } from "@server/services/plugin-state-store";
 
@@ -223,5 +224,347 @@ describe("PluginPermissionStore", () => {
 		});
 		expect(await permissionStore.clearPlugin("com.example.permissions")).toBe(true);
 		expect(await permissionStore.listSets("com.example.permissions")).toEqual([]);
+	});
+
+	test("addPendingRequest creates a pending request with correct fields and persists to file", async () => {
+		const { root, permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+
+		const input = {
+			capability: "query.read.projects",
+			scope: { type: "project" as const, id: "project-1" },
+			requestedByRuntimeId: "runtime-abc",
+		};
+		const request = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			input,
+		);
+
+		expect(request).toMatchObject({
+			capability: "query.read.projects",
+			scope: { type: "project", id: "project-1" },
+			requestedByRuntimeId: "runtime-abc",
+			status: "pending",
+		});
+		expect(request.requestId).toBeString();
+		expect(request.requestId.length).toBeGreaterThanOrEqual(1);
+		expect(request.requestedAt).toBe("2026-07-18T12:00:00.000Z");
+		expect(request.resolvedAt).toBeUndefined();
+
+		// Verify via listPendingRequests
+		const pending = await permissionStore.listPendingRequests(
+			"com.example.permissions",
+			installationId,
+		);
+		expect(pending).toHaveLength(1);
+		expect(pending[0]).toEqual(request);
+
+		// Persisted to file → reload and verify
+		const reloaded = new PluginPermissionStore({ root });
+		const reloadedPending = await reloaded.listPendingRequests(
+			"com.example.permissions",
+			installationId,
+		);
+		expect(reloadedPending).toHaveLength(1);
+		expect(reloadedPending[0]).toEqual(request);
+	});
+
+	test("addPendingRequest is idempotent for same capability + scope with pending status", async () => {
+		const { permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+
+		const input = {
+			capability: "query.read.chapters",
+			scope: { type: "global" as const },
+		};
+		const first = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			input,
+		);
+		const second = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			input,
+		);
+
+		expect(second.requestId).toBe(first.requestId);
+		expect(second).toEqual(first);
+
+		const pending = await permissionStore.listPendingRequests(
+			"com.example.permissions",
+			installationId,
+		);
+		expect(pending).toHaveLength(1);
+	});
+
+	test("addPendingRequest throws ValidationError when pending count reaches 20", async () => {
+		const { permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+
+		// Add 20 pending requests with distinct capabilities
+		for (let i = 0; i < 20; i++) {
+			await permissionStore.addPendingRequest("com.example.permissions", installationId, {
+				capability: `test.capability.c${i}`,
+				scope: { type: "global" as const },
+			});
+		}
+
+		const pending = await permissionStore.listPendingRequests(
+			"com.example.permissions",
+			installationId,
+		);
+		expect(pending).toHaveLength(20);
+
+		// 21st should throw
+		await expect(
+			permissionStore.addPendingRequest("com.example.permissions", installationId, {
+				capability: "test.capability.overflow",
+				scope: { type: "global" as const },
+			}),
+		).rejects.toThrow("Too many pending permission requests");
+	});
+
+	test("resolvePendingRequest sets status and resolvedAt; resolved requests are excluded from list", async () => {
+		const { permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+
+		const input = {
+			capability: "query.read.projects",
+			scope: { type: "global" as const },
+		};
+		const request = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			input,
+		);
+
+		// Grant it
+		const granted = await permissionStore.resolvePendingRequest(
+			"com.example.permissions",
+			installationId,
+			request.requestId,
+			"granted",
+		);
+		expect(granted).not.toBeUndefined();
+		expect(granted!.status).toBe("granted");
+		expect(granted!.resolvedAt).toBe("2026-07-18T12:00:00.000Z");
+		expect(granted!.requestId).toBe(request.requestId);
+
+		// No longer returned by listPendingRequests
+		const pending = await permissionStore.listPendingRequests(
+			"com.example.permissions",
+			installationId,
+		);
+		expect(pending).toHaveLength(0);
+
+		// Add another and deny it
+		const request2 = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			{ capability: "query.read.chapters", scope: { type: "global" as const } },
+		);
+		const denied = await permissionStore.resolvePendingRequest(
+			"com.example.permissions",
+			installationId,
+			request2.requestId,
+			"denied",
+		);
+		expect(denied!.status).toBe("denied");
+		expect(denied!.resolvedAt).toBe("2026-07-18T12:00:00.000Z");
+
+		const pendingAfter = await permissionStore.listPendingRequests(
+			"com.example.permissions",
+			installationId,
+		);
+		expect(pendingAfter).toHaveLength(0);
+	});
+
+	test("resolvePendingRequest returns undefined for unknown requestId", async () => {
+		const { permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+
+		const result = await permissionStore.resolvePendingRequest(
+			"com.example.permissions",
+			installationId,
+			"nonexistent-id",
+			"granted",
+		);
+		expect(result).toBeUndefined();
+	});
+
+	test("resolvePendingRequest returns undefined for unknown installation", async () => {
+		const { permissionStore } = await makeStores();
+
+		const result = await permissionStore.resolvePendingRequest(
+			"com.example.permissions",
+			"nonexistent-installation",
+			"any-id",
+			"granted",
+		);
+		expect(result).toBeUndefined();
+	});
+
+	test("listPendingRequests returns [] for old-format document without pendingRequests field", async () => {
+		const { root } = await makeStores();
+		// Write an old-format permissions.json that lacks pendingRequests
+		const oldDoc = {
+			version: 1,
+			plugins: {
+				"com.example.permissions": {
+					[installationId]: {
+						pluginId: "com.example.permissions",
+						installationId,
+						revision: 1,
+						grants: [
+							{
+								grantId: "grant-legacy",
+								capability: "query.read.projects",
+								scope: { type: "global" },
+								grantedBy: "admin",
+								pluginId: "com.example.permissions",
+								installationId,
+								revision: 1,
+							},
+						],
+						updatedAt: "2026-07-18T12:00:00.000Z",
+					},
+				},
+			},
+			diagnostics: [],
+			updatedAt: "2026-07-18T12:00:00.000Z",
+		};
+		const { writeFile } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		await writeFile(join(root, "permissions.json"), JSON.stringify(oldDoc, null, 2), "utf8");
+
+		const permissionStore = new PluginPermissionStore({
+			root,
+			now: () => new Date("2026-07-18T12:00:00.000Z"),
+		});
+
+		const result = await permissionStore.listPendingRequests(
+			"com.example.permissions",
+			installationId,
+		);
+		expect(result).toEqual([]);
+
+		// Also non-existent plugin/installation returns []
+		const result2 = await permissionStore.listPendingRequests(
+			"com.example.nonexistent",
+			installationId,
+		);
+		expect(result2).toEqual([]);
+	});
+
+	test("addPendingRequest validates capability and scope via schemas", async () => {
+		const { permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+
+		// Invalid capability (empty)
+		await expect(
+			permissionStore.addPendingRequest("com.example.permissions", installationId, {
+				capability: "",
+				scope: { type: "global" as const },
+			}),
+		).rejects.toThrow("Invalid capability");
+
+		// Invalid scope (global with id)
+		await expect(
+			permissionStore.addPendingRequest("com.example.permissions", installationId, {
+				capability: "query.read.projects",
+				scope: { type: "global" as const, id: "should-not-have-id" },
+			}),
+		).rejects.toThrow("Invalid permission scope");
+
+		// Invalid scope (non-global without id)
+		await expect(
+			permissionStore.addPendingRequest("com.example.permissions", installationId, {
+				capability: "query.read.projects",
+				scope: { type: "project" as const },
+			}),
+		).rejects.toThrow("Invalid permission scope");
+	});
+
+	test("pending requests survive replace operations", async () => {
+		const { permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+
+		const request = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			{
+				capability: "query.read.projects",
+				scope: { type: "global" as const },
+			},
+		);
+
+		// Perform a replace (which should preserve pending requests)
+		await permissionStore.replace(
+			"com.example.permissions",
+			installationId,
+			[
+				{
+					grantId: "grant-new",
+					capability: "query.read.chapters",
+					scope: { type: "global" },
+					grantedBy: "admin",
+				},
+			],
+			{ expectedRevision: 0 },
+		);
+
+		const pending = await permissionStore.listPendingRequests(
+			"com.example.permissions",
+			installationId,
+		);
+		expect(pending).toHaveLength(1);
+		expect(pending[0]!.requestId).toBe(request.requestId);
+	});
+
+	test("idempotent add does not count duplicates toward limit", async () => {
+		const { permissionStore } = await makeStores();
+		await permissionStore.ensureInstallation("com.example.permissions", installationId);
+
+		const sharedInput = {
+			capability: "query.read.projects",
+			scope: { type: "global" as const },
+		};
+
+		// Add the first one
+		const first = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			sharedInput,
+		);
+
+		// Add 19 more unique pending requests (total 20)
+		for (let i = 0; i < 19; i++) {
+			await permissionStore.addPendingRequest("com.example.permissions", installationId, {
+				capability: `test.capability.c${i}`,
+				scope: { type: "global" as const },
+			});
+		}
+
+		const pending = await permissionStore.listPendingRequests(
+			"com.example.permissions",
+			installationId,
+		);
+		expect(pending).toHaveLength(20);
+
+		// Duplicate of the first one should succeed (idempotent, not a new request)
+		const dup = await permissionStore.addPendingRequest(
+			"com.example.permissions",
+			installationId,
+			sharedInput,
+		);
+		expect(dup.requestId).toBe(first.requestId);
+
+		const pendingAfter = await permissionStore.listPendingRequests(
+			"com.example.permissions",
+			installationId,
+		);
+		expect(pendingAfter).toHaveLength(20);
 	});
 });

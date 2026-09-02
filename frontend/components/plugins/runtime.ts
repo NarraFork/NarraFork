@@ -330,6 +330,7 @@ export class PluginUiSession {
 			panelInstanceId: this.params.panelInstanceId,
 			entryUrl: this.contribution.entryUrl,
 			styleUrl: this.contribution.styleUrl,
+			title: this.contribution.title,
 			...(usesHostRuntime
 				? {
 						/*

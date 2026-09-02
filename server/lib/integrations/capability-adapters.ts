@@ -80,6 +80,10 @@ export const PLUGIN_CAPABILITY_ADAPTER = {
 		descriptorId: "event.narrator.subscribe",
 		visibility: "integration",
 	},
+	"event.subscribe": {
+		descriptorId: "event.subscribe",
+		visibility: "integration",
+	},
 	"event.subscribe.permission": {
 		descriptorId: "event.permission.subscribe",
 		visibility: "integration",
@@ -106,6 +110,38 @@ export const PLUGIN_CAPABILITY_ADAPTER = {
 	},
 	"command.narrator.send_message": {
 		descriptorId: "narrator.send_message",
+		visibility: "integration",
+	},
+	"command.narrator.send_subagent_message": {
+		descriptorId: "narrator.send_subagent_message",
+		visibility: "integration",
+	},
+	"command.narrator.create": {
+		descriptorId: "narrator.create",
+		visibility: "integration",
+	},
+	"command.narrator.delete": {
+		descriptorId: "narrator.delete",
+		visibility: "integration",
+	},
+	"command.narrator.spec_tasks_get": {
+		descriptorId: "narrator.spec_tasks.get",
+		visibility: "integration",
+	},
+	"command.narrator.spec_task_add": {
+		descriptorId: "narrator.spec_task.add",
+		visibility: "integration",
+	},
+	"command.narrator.spec_behavior_fence_update": {
+		descriptorId: "narrator.spec_behavior_fence.update",
+		visibility: "integration",
+	},
+	"command.narrator.update_profile": {
+		descriptorId: "narrator.update_profile",
+		visibility: "integration",
+	},
+	"command.narrator.spec_write": {
+		descriptorId: "narrator.spec_write",
 		visibility: "integration",
 	},
 	"command.narrator.interrupt": {

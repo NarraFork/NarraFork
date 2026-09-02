@@ -41,14 +41,14 @@ const defaultPermissionSet = {
 };
 
 async function ensureUiIntegrationAuthority(): Promise<void> {
-	const authorityId = pluginInstallationAuthorityId(pluginId, hash);
+	const authorityId = pluginInstallationAuthorityId(pluginId, "installation-1");
 	if (await integrationAuthorityService.getSnapshot(authorityId)) return;
 	await integrationAuthorityService.create({
 		id: authorityId,
 		kind: "plugin_installation",
 		integrationId: pluginId,
 		initialRevision: defaultPermissionSet.revision,
-		metadataJson: { installationId: hash },
+		metadataJson: { installationId: "installation-1" },
 		grants: [
 			{
 				id: expectedGrant.grantId,
@@ -136,6 +136,7 @@ async function makeRoutes(
 				compatibility: "compatible",
 				current: { version, hash },
 			}),
+			getCurrentInstallationId: async () => "installation-1",
 			...(permissions ? { getPermissions: async () => permissions } : {}),
 		},
 		uiHost,
@@ -344,6 +345,13 @@ describe("plugin UI routes", () => {
 				},
 			},
 		];
+		const expectedCodes: Record<string, string> = {
+			empty: "PLUGIN_CAPABILITY_NOT_GRANTED",
+			expired: "PLUGIN_GRANT_EXPIRED",
+			// The grant carries `resourceIds: ["workspace-1"]`, so a request for
+			// workspace-2 fails the resource constraint first.
+			"scope-mismatch": "PLUGIN_CONSTRAINT_MISMATCH",
+		};
 		for (const testCase of cases) {
 			const routes = await makeRoutes({ enabled: true }, undefined, {
 				permissions: testCase.permissions,
@@ -363,7 +371,7 @@ describe("plugin UI routes", () => {
 				}),
 			});
 			expect(response.status).toBe(403);
-			expect(await response.json()).toMatchObject({ code: "PLUGIN_UI_PERMISSION_DENIED" });
+			expect(await response.json()).toMatchObject({ code: expectedCodes[testCase.name] });
 		}
 	});
 
@@ -628,6 +636,7 @@ describe("plugin UI routes", () => {
 			version,
 			hash,
 			authorityInstallationId: hash,
+			installationId: "installation-1",
 			principalId: "user-1",
 			contributionId: "panel",
 			panelInstanceId: "listener-test",

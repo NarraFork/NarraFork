@@ -73,3 +73,6 @@ vscode-extension/*.vsix
 # test directory (rather than /tmp) so the path stays within the working tree; each run
 # deletes its own, this covers an interrupted run.
 tests/vscode-extension/.tmp-settings-*.json
+
+# bun build cache
+.*.bun-build

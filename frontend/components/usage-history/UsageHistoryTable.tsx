@@ -41,6 +41,7 @@ import {
 	IconToggleRight,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
+import type { TFunction } from "i18next";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { CopyButton } from "../common/CopyButton";
@@ -183,11 +184,36 @@ function getProviderColor(provider: string | null) {
 	}
 }
 
+/**
+ * Whether a request record originates from an external agent (kind=external,
+ * or legacy rows written by external harnesses with kind=narrator but no
+ * narrator association, e.g. provider=dsh).
+ */
+function isExternalRequest(record: UsageHistoryRecord): boolean {
+	const kind = record.kind?.trim().toLowerCase();
+	return kind === "external" || kind === "dsh" || record.provider?.trim().toLowerCase() === "dsh";
+}
+
 function getKindLabel(
 	t: (key: string, options: { defaultValue: string }) => string,
 	kind: string,
 ): string {
-	return t(`usageHistoryKind_${kind}`, { defaultValue: kind });
+	const normalizedKind = kind.trim().toLowerCase() === "dsh" ? "external" : kind;
+	return t(`usageHistoryKind_${normalizedKind}`, { defaultValue: normalizedKind });
+}
+
+/**
+ * Narrator-cell label for a request with no narrator association. External
+ * agent requests (kind=external, or legacy dsh rows) default to
+ * "外部Agent请求" but prefer the agent-supplied label when the writing agent
+ * attached its own text; everything else falls back to the generic
+ * system-request label.
+ */
+function getNarratorLabel(t: TFunction, record: UsageHistoryRecord): string {
+	if (isExternalRequest(record)) {
+		return record.agentLabel?.trim() || t("usageHistoryExternalAgent");
+	}
+	return t("usageHistorySystemRequest");
 }
 
 function TokenAmount({
@@ -688,7 +714,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 											</Text>
 										) : (
 											<Text size="10px" c="dimmed">
-												{t("usageHistorySystemRequest")}
+												{getNarratorLabel(t, record)}
 											</Text>
 										)}
 									</Stack>
@@ -728,9 +754,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 										value={
 											showNarratorId
 												? (record.narratorId ?? "-")
-												: (record.narratorTitle ??
-													record.narratorId ??
-													t("usageHistorySystemRequest"))
+												: (record.narratorTitle ?? record.narratorId ?? getNarratorLabel(t, record))
 										}
 										monospace={showNarratorId}
 										compact
@@ -893,7 +917,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 												</Text>
 											) : (
 												<Text size="xs" c="dimmed">
-													{t("usageHistorySystemRequest")}
+													{getNarratorLabel(t, record)}
 												</Text>
 											)}
 										</Stack>
@@ -904,7 +928,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 												? (record.narratorId ?? "-")
 												: (record.narratorTitle ??
 													record.narratorId ??
-													t("usageHistorySystemRequest"))}
+													getNarratorLabel(t, record))}
 										</Text>
 									</Table.Td>
 									<Table.Td>

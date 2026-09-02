@@ -10,6 +10,13 @@ const editedMessageCalls: Array<Record<string, unknown>> = [];
 const deleteMessagesAfterCalls: Array<Record<string, unknown>> = [];
 const foregroundResolvers = new Map<string, (output: string) => void>();
 const terminalResolvers = new Map<string, (output: string) => void>();
+// Simulates the origin-resolution outcome: null means the subagent has never
+// been started by its parent (no originating Agent tool call exists), i.e. a
+// plugin-recruited team temp worker.
+let originResult: { parentToolUseId: string } | null = { parentToolUseId: originToolUseId };
+// Subagents whose narrator record reports a stale "working" status (created but
+// never actually run).
+const workingSubagentIds = new Set<string>();
 let loadedTrailingToolResults: unknown[] = [];
 let clearManualOverrideRuntimes: typeof import("../subagent-manual-override").clearManualOverrideRuntimes;
 let waitForManualOverride: typeof import("../subagent-manual-override").waitForManualOverride;
@@ -66,7 +73,7 @@ beforeAll(async () => {
 			...realDb.query.narratorMessages,
 			findFirst: mock(async (options?: { columns?: Record<string, boolean> }) =>
 				options?.columns?.parentToolUseId
-					? { parentToolUseId: originToolUseId }
+					? originResult
 					: realDb.query.narratorMessages.findFirst(options as never),
 			),
 		},
@@ -110,9 +117,12 @@ beforeAll(async () => {
 		...realNarratorServiceModule,
 		narratorService: {
 			...realNarratorService,
-			getById: mock(async (id: string) =>
-				isEditTestNarrator(id) ? realNarratorService.getById(id) : makeNarrator(id),
-			),
+			getById: mock(async (id: string) => {
+				if (isEditTestNarrator(id)) return realNarratorService.getById(id);
+				const narrator = makeNarrator(id);
+				if (workingSubagentIds.has(id)) narrator.status = "working";
+				return narrator;
+			}),
 			getModelHistorySinceLastCompact: mock(async (id: string) =>
 				isEditTestNarrator(id)
 					? realNarratorService.getModelHistorySinceLastCompact(id)
@@ -345,6 +355,8 @@ afterEach(async () => {
 	loadedTrailingToolResults = [];
 	reconcileCalls.length = 0;
 	statusOverrides.clear();
+	originResult = { parentToolUseId: originToolUseId };
+	workingSubagentIds.clear();
 	clearManualOverrideRuntimes();
 	foregroundResolvers.clear();
 	terminalResolvers.clear();
@@ -425,6 +437,41 @@ describe("resumeSubagent status reconciliation", () => {
 });
 
 describe("resumeSubagent", () => {
+	test("starts a never-started plugin temp worker despite its stale working status", async () => {
+		// A team temp worker recruited directly through the plugin API has no
+		// originating Agent tool call (resolveSubagentOriginToolUseId fails) and
+		// reports a stale "working" status. Resume must treat it as startable —
+		// synthesizing a standalone origin — instead of rejecting it with
+		// "already running" or stranding the message in the buffer.
+		originResult = null;
+		workingSubagentIds.add("temp-worker-1");
+		const result = await resumeSubagent({
+			subagentId: "temp-worker-1",
+			intent: "follow_up",
+			actor: "parent_agent",
+			prompt: "inspect the panel",
+			createdBy: null,
+			locale: "en",
+		});
+
+		expect(result.started).toBe(true);
+		expect(startCalls).toHaveLength(1);
+		expect(startCalls[0]).toMatchObject({
+			subagentId: "temp-worker-1",
+			prompt: "inspect the panel",
+			// The stale "working" status must be overridden via allowRunningRestart
+			// so the runner's status guard accepts the never-started subagent.
+			allowRunningRestart: true,
+		});
+		// The synthesized standalone origin is what gets persisted as the
+		// parent tool-use link — no real Agent tool call exists.
+		expect(String(startCalls[0].toolUseId ?? "")).toMatch(/^standalone-/);
+
+		await finishRun("temp-worker-1");
+		expect(hasActiveSubagentResumeRun("temp-worker-1")).toBe(false);
+		expect(conclusionCalls).toHaveLength(1);
+	});
+
 	test("serializes one active resumed run and delivers its conclusion once", async () => {
 		const subagentId = "resume-concurrency";
 		const first = await resumeSubagent({

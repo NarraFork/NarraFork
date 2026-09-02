@@ -3752,6 +3752,23 @@ export function NarratorPanel({
 		}) => {
 			const api = dockApiRef?.current;
 			if (!api) return;
+			// A plugin contribution is a singleton per narrator surface: re-picking it
+			// from the picker must focus the existing panel, not stack a second
+			// instance (each addPanel gets a fresh panelInstanceId).
+			const existingPlugin = api.panels.find((panel) => {
+				const params = panel.params as
+					| { panelType?: string; pluginId?: string; contributionId?: string }
+					| undefined;
+				return (
+					params?.panelType === "plugin" &&
+					params.pluginId === pick.pluginId &&
+					params.contributionId === pick.contributionId
+				);
+			});
+			if (existingPlugin) {
+				existingPlugin.api.setActive();
+				return;
+			}
 			// Stack into the cluster's secondary group when one exists, otherwise
 			// split right of the chat/narrator panel (mirrors openToolPanel).
 			const request = buildPluginDockPanelOpenRequest({
@@ -7200,6 +7217,7 @@ export function NarratorPanel({
 											<PluginContributionPicker
 												key={def.id}
 												onPick={openPluginPanel}
+												surface="focus"
 												trigger={
 													<Tooltip label={label}>
 														<ActionIcon size="sm" variant="subtle" color="gray" aria-label={label}>

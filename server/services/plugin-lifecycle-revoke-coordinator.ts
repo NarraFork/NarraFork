@@ -213,7 +213,10 @@ const ACTIONS_BY_KIND: Readonly<
 		provider_registry: "clear",
 	},
 	runtime_generation: {
-		ui_session: "revoke",
+		// UI sessions are bound to the stable installation UUID, NOT the runtime
+		// generation: an idle/backend runtime restart must not tear down open
+		// panels. "invalidate" is a no-op for the ui_session layer below.
+		ui_session: "invalidate",
 		capability_broker: "invalidate",
 		event_gateway: "invalidate",
 		scheduler: "revoke",

@@ -6,21 +6,27 @@ import {
 	Group,
 	Loader,
 	Paper,
+	Select,
 	Stack,
 	Table,
 	Tabs,
 	Text,
+	TextInput,
 	Title,
 } from "@mantine/core";
 import {
 	IconAlertCircle,
 	IconArrowLeft,
+	IconCheck,
 	IconPlayerPlay,
 	IconPlugConnected,
 	IconPlugConnectedX,
+	IconPlus,
 	IconRefresh,
 	IconTrash,
+	IconX,
 } from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -32,15 +38,19 @@ import { PluginSettingsSurfacePanel } from "../../components/plugins-admin/Plugi
 import { PluginStatusBadge } from "../../components/plugins-admin/PluginStatusBadge";
 
 import {
+	pluginKeys,
 	useActivatePlugin,
 	useDisablePlugin,
 	useEnablePlugin,
 	usePlugin,
 	usePluginDiagnostics,
+	usePluginGrants,
+	usePluginPermissionRequests,
 	useRetryPlugin,
 	useUninstallPlugin,
 } from "../../hooks/usePlugins";
 import type { PluginDetail } from "../../lib/api/plugins";
+import { pluginsApi } from "../../lib/api/plugins";
 import { formatLocaleDateTime } from "../../lib/intl-format";
 
 export const Route = createFileRoute("/settings/plugins/$pluginId")({
@@ -183,31 +193,281 @@ function ContributionsTab({ plugin }: { plugin: PluginDetail }) {
 
 function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 	const { t } = useTranslation("plugins");
-	const grants = plugin.grants;
-	const capabilities = grants?.capabilities ?? [];
+	const confirm = useConfirmDialog();
+	const queryClient = useQueryClient();
+	const [error, setError] = useState<string | null>(null);
+	const [busy, setBusy] = useState(false);
+	const [adding, setAdding] = useState(false);
+	const [newCapability, setNewCapability] = useState("");
+	const [newScopeType, setNewScopeType] = useState("global");
+	const [newScopeId, setNewScopeId] = useState("");
+
+	// Grants and pending requests are React Query-backed: they poll while the
+	// grants tab is mounted and are invalidated by pushed plugin events, so the
+	// panel stays live without manual refreshes.
+	const grantsQuery = usePluginGrants(plugin.pluginId);
+	const pendingQuery = usePluginPermissionRequests(plugin.pluginId);
+	const set = grantsQuery.data ?? null;
+	const pendingRequests = pendingQuery.data ?? [];
+
+	const invalidateGrants = () => {
+		void queryClient.invalidateQueries({ queryKey: pluginKeys.grants(plugin.pluginId) });
+		void queryClient.invalidateQueries({
+			queryKey: pluginKeys.permissionRequests(plugin.pluginId),
+		});
+	};
+
+	const revokeGrant = async (grantId: string, capability: string) => {
+		const ok = await confirm({
+			title: t("admin.detail.grants.revokeConfirmTitle"),
+			message: t("admin.detail.grants.revokeConfirmMessage", { capability }),
+			confirmLabel: t("admin.detail.grants.revoke"),
+		});
+		if (!ok || !set) return;
+		setBusy(true);
+		try {
+			await pluginsApi.revokeGrants(plugin.pluginId, {
+				expectedRevision: set.revision,
+				grantIds: [grantId],
+			});
+			invalidateGrants();
+		} catch (err) {
+			setError(localizePluginError(err, t));
+		} finally {
+			setBusy(false);
+		}
+	};
+
+	const addGrant = async () => {
+		const capability = newCapability.trim();
+		if (!capability || !set) return;
+		setBusy(true);
+		try {
+			const existing = set.grants.map((grant) => ({
+				capability: grant.capability,
+				scope: grant.scope,
+			}));
+			await pluginsApi.replaceGrants(plugin.pluginId, {
+				expectedRevision: set.revision,
+				grants: [
+					...existing,
+					{
+						capability,
+						scope: {
+							type: newScopeType,
+							id: newScopeType === "global" ? undefined : newScopeId.trim() || undefined,
+						},
+					},
+				],
+			});
+			setNewCapability("");
+			setNewScopeId("");
+			setAdding(false);
+			invalidateGrants();
+		} catch (err) {
+			setError(localizePluginError(err, t));
+		} finally {
+			setBusy(false);
+		}
+	};
+
+	const approvePending = async (requestId: string) => {
+		setBusy(true);
+		try {
+			await pluginsApi.approveGrantRequest(plugin.pluginId, requestId);
+			invalidateGrants();
+		} catch (err) {
+			setError(localizePluginError(err, t));
+		} finally {
+			setBusy(false);
+		}
+	};
+
+	const denyPending = async (requestId: string) => {
+		setBusy(true);
+		try {
+			await pluginsApi.denyGrantRequest(plugin.pluginId, requestId);
+			invalidateGrants();
+		} catch (err) {
+			setError(localizePluginError(err, t));
+		} finally {
+			setBusy(false);
+		}
+	};
+
+	// Declared manifest capabilities that still lack a grant — the visible approval
+	// channel for "plugin needs this capability" without waiting for a runtime request.
+	const declared = plugin.manifest?.permissions?.host ?? [];
+	const ungranted = Array.from(
+		new Set(declared.filter((capability) => !set?.grants.some((g) => g.capability === capability))),
+	);
+
+	const grantDeclaredCapability = async (capability: string) => {
+		if (!set) return;
+		setBusy(true);
+		try {
+			const existing = set.grants.map((grant) => ({
+				capability: grant.capability,
+				scope: grant.scope,
+			}));
+			await pluginsApi.replaceGrants(plugin.pluginId, {
+				expectedRevision: set.revision,
+				grants: [...existing, { capability, scope: { type: "global" } }],
+			});
+			invalidateGrants();
+		} catch (err) {
+			setError(localizePluginError(err, t));
+		} finally {
+			setBusy(false);
+		}
+	};
+
 	return (
 		<Stack gap="md">
-			<Alert color="blue" variant="light" title={t("admin.detail.grants.readOnlyTitle")}>
-				<Text size="sm">{t("admin.detail.grants.readOnlyMessage")}</Text>
-			</Alert>
-			{grants && (
+			{error && (
+				<Alert color="red" variant="light" title={t("common.error")}>
+					<Text size="sm">{error}</Text>
+				</Alert>
+			)}
+			<Group justify="space-between">
+				<Text fw={600} size="sm">
+					{t("admin.detail.grants.manageTitle")}
+				</Text>
+				<Group gap="xs">
+					<Button size="xs" variant="light" onClick={() => invalidateGrants()} disabled={busy}>
+						{t("admin.detail.grants.refresh")}
+					</Button>
+					<Button size="xs" variant="outline" onClick={() => setAdding((v) => !v)} disabled={busy}>
+						{t("admin.detail.grants.add")}
+					</Button>
+				</Group>
+			</Group>
+			{adding && (
 				<Paper withBorder p="md" radius="md">
 					<Stack gap="xs">
-						{grants.revision !== undefined && (
+						<Field label={t("admin.detail.grants.addCapability")}>
+							<TextInput
+								value={newCapability}
+								onChange={(event) => setNewCapability(event.currentTarget.value)}
+								placeholder="command.narrator.send_message"
+							/>
+						</Field>
+						<Group grow>
+							<Field label={t("admin.detail.grants.scopeType")}>
+								<Select
+									data={["global", "project", "chapter", "narrator", "workspace", "device"]}
+									value={newScopeType}
+									onChange={(value) => setNewScopeType(value ?? "global")}
+								/>
+							</Field>
+							<Field label={t("admin.detail.grants.scopeId")}>
+								<TextInput
+									value={newScopeId}
+									onChange={(event) => setNewScopeId(event.currentTarget.value)}
+									disabled={newScopeType === "global"}
+									placeholder={t("admin.detail.grants.scopeIdHint")}
+								/>
+							</Field>
+						</Group>
+						<Button
+							size="xs"
+							onClick={() => void addGrant()}
+							disabled={busy || !newCapability.trim()}
+						>
+							{t("admin.detail.grants.addSubmit")}
+						</Button>
+					</Stack>
+				</Paper>
+			)}
+			{pendingRequests.length > 0 && (
+				<Paper withBorder p="md" radius="md">
+					<Stack gap="xs">
+						<Group gap="xs" align="center">
+							<Text fw={600} size="sm">
+								{t("admin.detail.grants.pendingTitle")}
+							</Text>
+							<Badge color="orange" variant="filled" size="sm">
+								{pendingRequests.length}
+							</Badge>
+						</Group>
+						{/* An upgrade request is a different decision from a runtime prompt: the
+						    plugin did not ask for the capability, a NEW VERSION declared it and the
+						    host withheld it. Saying so is the whole point of the fail-closed
+						    upgrade path — an unlabelled row reads as "the plugin needs this", which
+						    is exactly the framing that makes silent widening feel acceptable. */}
+						{pendingRequests.some((req) => req.source === "upgrade") && (
+							<Text size="xs" c="dimmed">
+								{t("admin.detail.grants.pendingUpgradeHint")}
+							</Text>
+						)}
+						{pendingRequests.map((req) => (
+							<Paper key={req.requestId} withBorder p="xs" radius="md">
+								<Group justify="space-between" wrap="nowrap">
+									<Group gap="sm" wrap="wrap">
+										<Badge color="indigo" variant="light" size="sm">
+											{req.capability}
+										</Badge>
+										<Badge color="gray" variant="light" size="sm">
+											{req.scope.type}
+											{req.scope.id ? `:${req.scope.id}` : ""}
+										</Badge>
+										{req.source === "upgrade" && (
+											<Badge color="yellow" variant="light" size="sm">
+												{req.requestedForVersion
+													? t("admin.detail.grants.pendingSourceUpgradeVersion", {
+															version: req.requestedForVersion,
+														})
+													: t("admin.detail.grants.pendingSourceUpgrade")}
+											</Badge>
+										)}
+										<Text size="xs" c="dimmed">
+											{formatLocaleDateTime(req.requestedAt)}
+										</Text>
+									</Group>
+									<Group gap="xs" wrap="nowrap">
+										<Button
+											size="compact-xs"
+											variant="light"
+											color="green"
+											leftSection={<IconCheck size={14} />}
+											onClick={() => void approvePending(req.requestId)}
+											disabled={busy}
+										>
+											{t("admin.detail.grants.approve")}
+										</Button>
+										<Button
+											size="compact-xs"
+											variant="light"
+											color="red"
+											leftSection={<IconX size={14} />}
+											onClick={() => void denyPending(req.requestId)}
+											disabled={busy}
+										>
+											{t("admin.detail.grants.deny")}
+										</Button>
+									</Group>
+								</Group>
+							</Paper>
+						))}
+					</Stack>
+				</Paper>
+			)}
+			{set && (
+				<Paper withBorder p="md" radius="md">
+					<Stack gap="xs">
+						<Group gap="lg">
 							<Field label={t("admin.detail.grants.revision")}>
-								<Text size="sm">{grants.revision}</Text>
+								<Text size="sm">{set.revision}</Text>
 							</Field>
-						)}
-						{grants.count !== undefined && (
-							<Field label={t("admin.detail.grants.count")}>
-								<Text size="sm">{grants.count}</Text>
+							<Field label={t("admin.detail.grants.installationId")}>
+								<Text size="sm" style={{ wordBreak: "break-all" }}>
+									{set.installationId}
+								</Text>
 							</Field>
-						)}
-						{grants.updatedAt && (
 							<Field label={t("admin.detail.grants.updatedAt")}>
-								<Text size="sm">{formatLocaleDateTime(grants.updatedAt)}</Text>
+								<Text size="sm">{formatLocaleDateTime(set.updatedAt)}</Text>
 							</Field>
-						)}
+						</Group>
 					</Stack>
 				</Paper>
 			)}
@@ -215,20 +475,77 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 				<Text fw={600} size="sm" mb="xs">
 					{t("admin.detail.grants.capabilities")}
 				</Text>
-				{capabilities.length === 0 ? (
+				{!set ? (
+					<Text size="sm" c="dimmed">
+						{t("admin.detail.grants.loading")}
+					</Text>
+				) : set.grants.length === 0 ? (
 					<Text size="sm" c="dimmed">
 						{t("admin.detail.grants.empty")}
 					</Text>
 				) : (
-					<Group gap="xs" wrap="wrap">
-						{capabilities.map((capability) => (
-							<Badge key={capability} color="indigo" variant="light" size="sm">
-								{capability}
-							</Badge>
+					<Stack gap="xs">
+						{set.grants.map((grant) => (
+							<Paper key={grant.grantId} withBorder p="xs" radius="md">
+								<Group justify="space-between" wrap="nowrap">
+									<Group gap="sm" wrap="wrap">
+										<Badge color="indigo" variant="light" size="sm">
+											{grant.capability}
+										</Badge>
+										<Badge color="gray" variant="light" size="sm">
+											{grant.scope.type}
+											{grant.scope.id ? `:${grant.scope.id}` : ""}
+										</Badge>
+										{grant.grantedBy && (
+											<Text size="xs" c="dimmed">
+												{t("admin.detail.grants.grantedBy")}: {grant.grantedBy}
+											</Text>
+										)}
+									</Group>
+									<Button
+										size="compact-xs"
+										variant="subtle"
+										color="red"
+										leftSection={<IconTrash size={14} />}
+										onClick={() => void revokeGrant(grant.grantId, grant.capability)}
+										disabled={busy}
+									>
+										{t("admin.detail.grants.revoke")}
+									</Button>
+								</Group>
+							</Paper>
 						))}
-					</Group>
+					</Stack>
 				)}
 			</div>
+			{ungranted.length > 0 && (
+				<div>
+					<Text fw={600} size="sm" mb="xs">
+						{t("admin.detail.grants.ungrantedTitle")}
+					</Text>
+					<Stack gap="xs">
+						{ungranted.map((capability) => (
+							<Paper key={capability} withBorder p="xs" radius="md">
+								<Group justify="space-between" wrap="nowrap">
+									<Badge color="orange" variant="light" size="sm">
+										{capability}
+									</Badge>
+									<Button
+										size="compact-xs"
+										variant="light"
+										color="green"
+										leftSection={<IconPlus size={14} />}
+										disabled={busy}
+										onClick={() => void grantDeclaredCapability(capability)}
+									>
+										{t("admin.detail.grants.ungrantedGrant")}
+									</Button>
+								</Group>
+							</Paper>
+						))}
+					</Stack>
+				</div>
+			)}
 		</Stack>
 	);
 }

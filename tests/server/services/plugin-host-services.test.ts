@@ -126,6 +126,48 @@ describe("PluginHostServices", () => {
 		});
 	});
 
+	test("keeps admin-approved capabilities outside the manifest when binding", async () => {
+		const capabilityBroker = new CapabilityBroker();
+		const hostServices = new PluginHostServices({ capabilityBroker });
+		const approvedCapability = "query.read.audit_self";
+		const runtime = bind(hostServices, {
+			manifestRequested: ["diagnostics.readOwnLogs"],
+			grants: [grant("diagnostics.readOwnLogs"), grant(approvedCapability)],
+		});
+
+		// The binding snapshot keeps the admin-approved grant even though the manifest
+		// did not declare it — filtering it here would silently undo the approval and
+		// the plugin would keep re-raising the same pending request.
+		expect((runtime.binding.installationGrants ?? []).map((g) => g.capability)).toEqual([
+			"diagnostics.readOwnLogs",
+			approvedCapability,
+		]);
+		// The requested set is extended so reporting / denial reasons stay consistent.
+		expect(runtime.binding.manifestRequested).toContain(approvedCapability);
+		expect(runtime.binding.hostPolicy).toContain(approvedCapability);
+
+		// And the broker authorizes the approved capability on the next call.
+		const result = await capabilityBroker.authorize({
+			context: {
+				requestId: "request-approved-1",
+				correlationId: "correlation-approved-1",
+				deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+				plugin: {
+					pluginId,
+					packageVersion: "1.0.0",
+					runtimeId,
+					runtimeGeneration: 3,
+					installationId,
+				},
+				invocation: { kind: "user", userId: "user-1", userRole: "user", source: "ui" },
+				scope: { userId: "user-1", projectId: "project-1" },
+			},
+			capability: approvedCapability,
+			methodId: "audit.read",
+		});
+		expect(result.allowed).toBe(true);
+	});
+
 	test("uses the runtime-scoped read-only query handler instead of a global fallback", async () => {
 		const capabilityBroker = new CapabilityBroker();
 		const hostServices = new PluginHostServices({ capabilityBroker });
@@ -291,9 +333,13 @@ describe("PluginHostServices", () => {
 	test("fails closed after a runtime binding is revoked and excludes unrequested grants", async () => {
 		const capabilityBroker = new CapabilityBroker();
 		const hostServices = new PluginHostServices({ capabilityBroker });
+		// Neither declared by the manifest nor granted: the call must be denied. The
+		// grant list is the authoritative allow set — a manifest declaration alone is
+		// not enough (grants are seeded at install), and an admin-approved grant is
+		// enough even without a declaration.
 		const runtime = bind(hostServices, {
 			manifestRequested: [],
-			grants: [grant("diagnostics.readOwnLogs")],
+			grants: [],
 		});
 		const unrequested = await runtime.dispatcher.dispatch({
 			jsonrpc: "2.0",
@@ -360,8 +406,11 @@ describe("PluginHostServices", () => {
 		]);
 		expect(hostServices.hasRuntimeBinding(pluginId, runtimeId)).toBe(false);
 		expect(capabilityBroker.hasBinding(pluginId, runtimeId)).toBe(false);
+		// runtime_generation is a no-op for the ui_session layer (UI sessions are
+		// bound to the stable installation UUID, not the runtime generation), and
+		// the capability_broker layer revokes through the real broker (no
+		// recorder). The observed order therefore starts at the event gateway.
 		expect(observed).toEqual([
-			{ layer: "ui_session", bindingPresent: true },
 			{ layer: "event_gateway", bindingPresent: false },
 			{ layer: "scheduler", bindingPresent: false },
 			{ layer: "secret_broker", bindingPresent: false },

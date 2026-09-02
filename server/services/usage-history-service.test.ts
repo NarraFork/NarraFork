@@ -48,4 +48,34 @@ describe("UsageHistoryService cursor pagination", () => {
 		expect(page.total).toBe(3);
 		expect(page.records.map((record) => record.id)).toEqual(["request-c", "request-b"]);
 	});
+
+	test("surfaces the agent label and external kind for external-agent records", async () => {
+		db.insert(apiRequests)
+			.values([
+				{
+					id: "external-a",
+					kind: "external",
+					agentLabel: "DeepSeek Harness",
+					createdAt,
+				},
+				{
+					id: "external-b",
+					kind: "external",
+					agentLabel: null,
+					createdAt,
+				},
+			])
+			.run();
+
+		const page = await service.listUsageHistory({}, 1, 10);
+		const records = page.records.map((record) => ({
+			id: record.id,
+			kind: record.kind,
+			agentLabel: record.agentLabel ?? null,
+		}));
+		expect(records).toEqual([
+			{ id: "external-b", kind: "external", agentLabel: null },
+			{ id: "external-a", kind: "external", agentLabel: "DeepSeek Harness" },
+		]);
+	});
 });

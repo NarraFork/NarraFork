@@ -311,7 +311,19 @@ export class PluginAgentToolBridge {
 	): Promise<void> {
 		if (signal.aborted) throw new DOMException("Tool activation was cancelled", "AbortError");
 		if (this.runtimeActiveResolver && (await this.runtimeActiveResolver(binding.pluginId))) return;
-		if (!this.activationHandler) return;
+		if (!this.activationHandler) {
+			// Fail loud instead of silently continuing into an authorization that can
+			// only deny: with the runtime inactive the capability broker has no
+			// binding for it, so the call would surface as a misleading
+			// "capability denied" (CONTEXT_UNAVAILABLE) even though the permission
+			// grants are perfectly fine. A missing activation handler is a host
+			// wiring regression — name it explicitly so it is diagnosable.
+			throw new PluginAgentToolBridgeError(
+				"HOST_UNAVAILABLE",
+				`Plugin runtime is not active and no activation handler is wired for ${binding.pluginId}`,
+				true,
+			);
+		}
 		const existing = this.activationFlights.get(binding.pluginId);
 		if (existing) {
 			await existing;

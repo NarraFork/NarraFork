@@ -255,6 +255,7 @@ function SettingsUsagePage() {
 				"settings_test",
 				"git_summary",
 				"chat_summarize",
+				"external",
 				"internal",
 			].map((kind) => ({ value: kind, label: t(`usageHistoryKind_${kind}`, kind) })),
 		[t],

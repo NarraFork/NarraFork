@@ -61,7 +61,6 @@ import {
 	addTrait,
 	isKnowledgeStewardNarrator,
 	isPlanModeTrait,
-	isReadOnlySubagentVariant,
 	isSubagentVariant,
 	parseSubstatus,
 	parseTraits,
@@ -5054,27 +5053,17 @@ async function feedMessage(
 	// EXCEPTION — explicit takeover: while taken over, the parent intentionally
 	// stays blocked for the entire takeover. The user can send/interrupt/continue
 	// freely; the result is only handed back when the user stops takeover. So we
-	// do NOT resolve the override or register a watcher here. We still set up the
-	// conclusion file for explore/plan subagents so Write/Edit redirect works.
+	// do NOT resolve the override or register a watcher here.
 	const narrator = await narratorService.getById(narratorId);
 	if (isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
 		const currentSubstatus = parseSubstatus(narrator.substatus);
 		const takenOver = isTakenOver(narratorId);
 		if (takenOver) {
-			if (isReadOnlySubagentVariant(narrator.variant)) {
-				setConclusionFileId(narratorId, generateWordSlug(), active.cwd);
-			}
 			// Parent stays blocked — do not resolve, do not register a watcher.
 		} else if (currentSubstatus.includes("manual_override")) {
 			const overrideEntry = getManualOverrideMap().get(narratorId);
 			if (overrideEntry) {
 				const currentFinalText = await getSubagentFinalText(narratorId);
-
-				// Set up conclusion file for explore/plan subagents so that
-				// Write/Edit are properly redirected during the takeover run.
-				if (isReadOnlySubagentVariant(narrator.variant)) {
-					setConclusionFileId(narratorId, generateWordSlug(), active.cwd);
-				}
 
 				registerConclusionWatcher(
 					narratorId,
@@ -5358,6 +5347,345 @@ export async function sendMessage(
 		});
 	}
 	return userMsg;
+}
+
+export interface SendSubagentMessageInput {
+	subagentId: string;
+	message: string;
+	priority?: boolean;
+	locale?: Locale;
+	createdBy?: string | null;
+	signal?: AbortSignal;
+}
+
+export interface SendSubagentMessageResult {
+	delivered: "buffered" | "started";
+	messageId?: string;
+	bufferedAt?: string;
+	started?: boolean;
+	resumedSuspendedRunner?: boolean;
+}
+
+/**
+ * Deliver a message to a subagent narrator and get it to act on it.
+ *
+ * Subagents have no independent message channel: a running subagent consumes
+ * buffered messages at its next safe boundary (soft stop), while an idle
+ * subagent is resumed in-place with a follow-up turn. This is the counterpart
+ * of {@link sendMessage} for primary narrators — the REST layer already routes
+ * subagent messages through `resumeSubagent`; this function centralizes the
+ * same decision (running → buffer, idle → resume) behind one callable.
+ */
+export async function sendSubagentMessage(
+	input: SendSubagentMessageInput,
+): Promise<SendSubagentMessageResult> {
+	const narrator = await narratorService.getById(input.subagentId);
+	if (!isSubagentVariant(narrator.variant)) {
+		throw new ValidationError("Target narrator is not a subagent");
+	}
+	if (narrator.status === "archived") {
+		throw new ValidationError("Archived subagents cannot receive messages");
+	}
+	const { resumeSubagent, resolveSubagentOriginToolUseId } = await import("./subagent-resume");
+	// Never-started subagents (e.g. a team temp worker recruited directly through
+	// the plugin API) carry a stale "working" status but have no real runner —
+	// buffering would strand the message forever. Route them to resume instead,
+	// which synthesizes a standalone origin tool-use id and starts them in place.
+	const neverStarted = !(await resolveSubagentOriginToolUseId(input.subagentId).catch(() => null));
+	const running = narrator.status === "working" || narrator.status === "waiting";
+	if (running && !neverStarted) {
+		const { bufferSubagentUserMessage } = await import("./subagent-executor");
+		const { isTakenOver } = await import("./subagent-takeover");
+		const result = bufferSubagentUserMessage(input.subagentId, input.message, {
+			createdBy: input.createdBy ?? null,
+			priority: input.priority ?? false,
+			requestSoftStop: !isTakenOver(input.subagentId),
+		});
+		if (!result.ok) {
+			if (result.full) throw new ValidationError("Subagent message queue is full");
+			throw new ValidationError("Subagent is not running; it cannot be buffered right now");
+		}
+		return {
+			delivered: "buffered",
+			messageId: result.id,
+			bufferedAt: result.bufferedAt,
+		};
+	}
+	// Idle (or never-started) subagent: resume in-place with a follow-up turn.
+	// This requires the subagent to have been started at least once by its parent
+	// narrator (the originating Agent tool call is resolved internally); subagents
+	// that have never run get a standalone origin synthesized and still start.
+	const resumed = await resumeSubagent({
+		subagentId: input.subagentId,
+		intent: "follow_up",
+		actor: "parent_agent",
+		prompt: input.message,
+		locale: input.locale ?? "en",
+		createdBy: input.createdBy ?? null,
+		signal: input.signal,
+	});
+	return {
+		delivered: "started",
+		started: resumed.started,
+		resumedSuspendedRunner: resumed.resumedSuspendedRunner,
+		messageId: resumed.userMessage?.id ?? undefined,
+	};
+}
+
+export interface CreateNarratorForPluginInput {
+	title?: string;
+	model?: string;
+	cwd?: string;
+	chapterId?: string | null;
+	permissionMode?: string;
+	planReflectionAutoApproveOverride?: BooleanOverride;
+	/** "subagent" creates a team temp worker owned by `parentNarratorId`. */
+	type?: "primary" | "subagent";
+	subagentType?: string;
+	parentNarratorId?: string;
+}
+
+export interface CreateNarratorForPluginResult {
+	narratorId: string;
+	title: string | null;
+	variant: string;
+	type: "primary" | "subagent";
+	model: string | null;
+	cwd: string | null;
+	status: string;
+}
+
+/**
+ * Create a narrator for a plugin (team recruit flow): a primary narrator for
+ * team members, or a subagent temp worker owned by the recruiting narrator.
+ */
+export async function createNarratorForPlugin(
+	input: CreateNarratorForPluginInput,
+): Promise<CreateNarratorForPluginResult> {
+	if (input.type === "subagent") {
+		if (!input.parentNarratorId) {
+			throw new ValidationError("Subagent temp workers require a recruiting parent narrator");
+		}
+		const parent = await narratorService.getById(input.parentNarratorId);
+		const narrator = await narratorService.createSubagent({
+			parentNarratorId: input.parentNarratorId,
+			subagentType: input.subagentType ?? "general",
+			title: input.title,
+			model: input.model,
+			cwd: input.cwd ?? parent.cwd ?? ".",
+			permissionMode: input.permissionMode as
+				| "default"
+				| "acceptEdits"
+				| "bypassPermissions"
+				| "readOnly"
+				| "dontAsk"
+				| undefined,
+			planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
+		});
+		return {
+			narratorId: narrator.id,
+			title: narrator.title ?? null,
+			variant: narrator.variant,
+			type: "subagent",
+			model: narrator.model ?? null,
+			cwd: narrator.cwd ?? null,
+			status: narrator.status,
+		};
+	}
+	const narrator = await narratorService.create({
+		chapterId: input.chapterId ?? null,
+		title: input.title,
+		model: input.model,
+		cwd: input.cwd,
+		permissionMode: input.permissionMode,
+		planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
+	});
+	return {
+		narratorId: narrator.id,
+		title: narrator.title ?? null,
+		variant: narrator.variant,
+		type: "primary",
+		model: narrator.model ?? null,
+		cwd: narrator.cwd ?? null,
+		status: narrator.status,
+	};
+}
+
+/** Delete a narrator entirely (team fire flow: removes the worker narrator). */
+export async function deleteNarratorForPlugin(narratorId: string): Promise<void> {
+	await narratorService.remove(narratorId);
+}
+
+/**
+ * Read a narrator's Dynamic Spec tasks.json (compiled). Used by the team plugin
+ * to track the shared task queue it maintains for each member.
+ */
+export async function readSpecTasksForPlugin(narratorId: string) {
+	const { readTasksFileForNarrator } = await import("./spec-vfs-service");
+	const { parseSpecTasksDocument, compileSpecTasks } = await import("./spec-task-service");
+	const file = await readTasksFileForNarrator(narratorId);
+	const document = parseSpecTasksDocument(file.content);
+	const compiled = compileSpecTasks(document);
+	return {
+		content: file.content,
+		revisionId: file.revisionId ?? null,
+		document,
+		compiled,
+	};
+}
+
+/**
+ * Append a task to a narrator's spec://tasks.json on a plugin's behalf: dispatching a
+ * task enqueues it in the member's own queue and the member's loop picks it up.
+ * Idempotent: identical text is not appended twice (safe for redispatch).
+ *
+ * The task is ORDINARY unless the plugin explicitly asks for a protected one. It used to
+ * be protected unconditionally, and written as `actor: "user"` — so every dispatched
+ * task became a user commitment that auto-continues the narrator and that the narrator
+ * cannot retract. That let a plugin keep a narrator working for it indefinitely without
+ * anyone having asked for that guarantee. Plugins write as `"agent"`, which is what they
+ * are on the spec VFS policy axis.
+ */
+export async function addSpecTaskForPlugin(
+	narratorId: string,
+	text: string,
+	options: { protected?: boolean } = {},
+): Promise<{ added: boolean; taskText: string; protected: boolean; revisionId: string | null }> {
+	const { appendSpecTaskForExternalActor } = await import("./spec-vfs-service");
+	const objective = text.trim();
+	if (!objective) throw new ValidationError("task text is required");
+	const result = await appendSpecTaskForExternalActor(narratorId, objective, {
+		protected: options.protected === true,
+		actor: "agent",
+	});
+	return {
+		added: result.added,
+		taskText: objective,
+		protected: result.protected,
+		revisionId: result.written.revisionId ?? null,
+	};
+}
+
+/** Marker that scopes plugin-written team-SOP sections inside spec://behavior_fence. */
+const TEAM_SOP_MARKER = "team-sop:com.whisent.narrator-team";
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Upsert or clear a plugin-managed team-SOP section inside a narrator's
+ * `spec://behavior_fence`.
+ *
+ * The host merges the SOP section into the existing fence so the user's own
+ * behavior constraints are preserved; `clear` removes only the plugin's marked
+ * section. The fence is periodically injected by the host (`buildBehaviorFence
+ * Reminder` at the fence cadence), which is what keeps the SOP visible to a
+ * worker even after long runs / context compacts — the "remember to report
+ * back" problem this solves.
+ */
+export async function setSpecBehaviorFenceForPlugin(
+	narratorId: string,
+	text: string,
+	mode: "upsert" | "clear",
+): Promise<{ updated: boolean; revisionId: string | null }> {
+	const { readSpecFile, writeSpecFile } = await import("./spec-vfs-service");
+	let current = "";
+	try {
+		const file = await readSpecFile(narratorId, "spec://behavior_fence");
+		current = file.content ?? "";
+	} catch {
+		// Fence may not exist yet; treat as empty.
+	}
+	const openTag = `<!-- ${TEAM_SOP_MARKER} -->`;
+	const closeTag = `<!-- /${TEAM_SOP_MARKER} -->`;
+	const sopPattern = new RegExp(
+		`\\s*${escapeRegExp(openTag)}[\\s\\S]*?${escapeRegExp(closeTag)}\\s*`,
+	);
+	const withoutSop = current.replace(sopPattern, "").trim();
+	const body = text.trim();
+	let next: string;
+	if (mode === "clear" || !body) {
+		next = withoutSop;
+	} else {
+		const section = `${openTag}\n${body}\n${closeTag}`;
+		next = withoutSop ? `${withoutSop}\n\n${section}` : section;
+	}
+	const written = await writeSpecFile(narratorId, "spec://behavior_fence", next, {
+		actor: "agent",
+		allowFenceMutation: true,
+		createdBy: "assistant",
+	});
+	return { updated: true, revisionId: written.revisionId ?? null };
+}
+
+/**
+ * Update a narrator's title / model / reasoning effort from a plugin (team
+ * leader managing its members). Persists each provided field and applies the
+ * runtime sync so an already-running narrator picks the change up at its next
+ * model request. At least one field must be provided.
+ *
+ * @returns {Promise<{ updated: string[] }>} — the field names that were changed
+ */
+export async function updateNarratorProfileForPlugin(
+	narratorId: string,
+	input: {
+		title?: string;
+		model?: string;
+		reasoningEffort?: ReasoningEffort | null;
+		planReflectionAutoApproveOverride?: BooleanOverride;
+	},
+): Promise<{ updated: string[] }> {
+	const { persistTitle } = await import("./narrator-title");
+	const updated: string[] = [];
+	if (input.title !== undefined) {
+		const title = input.title.trim();
+		if (!title) throw new ValidationError("title must not be empty");
+		if (title.length > 200) throw new ValidationError("title must be at most 200 characters");
+		await persistTitle(narratorId, title);
+		updated.push("title");
+	}
+	if (input.model !== undefined) {
+		const model = input.model;
+		await narratorService.updateModel(narratorId, model);
+		updateNarratorModel(narratorId, model);
+		updated.push("model");
+	}
+	if (input.reasoningEffort !== undefined) {
+		await narratorService.updateReasoningEffort(narratorId, input.reasoningEffort);
+		updateNarratorReasoningEffort(narratorId, input.reasoningEffort);
+		updated.push("reasoningEffort");
+	}
+	if (input.planReflectionAutoApproveOverride !== undefined) {
+		await narratorService.updateReflectionOverrides(narratorId, {
+			planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
+		});
+		updated.push("planReflectionAutoApproveOverride");
+	}
+	return { updated };
+}
+
+/**
+ * Write (or replace) a whitelisted Dynamic Spec file for a narrator on behalf
+ * of a plugin (team leader managing its members). Only non-readonly spec files
+ * (currently `tasks.json` and `index.md`) are allowed; `behavior_fence` stays
+ * exclusive to the user / the dedicated team-SOP fence command.
+ */
+export async function writeSpecForPlugin(
+	narratorId: string,
+	uri: string,
+	content: string,
+): Promise<{ path: string; uri: string; revisionId: string | null }> {
+	const { writeSpecFile } = await import("./spec-vfs-service");
+	const written = await writeSpecFile(narratorId, uri, content, {
+		actor: "agent",
+		createdBy: "assistant",
+	});
+	return {
+		path: written.path,
+		uri: written.uri,
+		revisionId: written.revisionId ?? null,
+	};
 }
 
 /**

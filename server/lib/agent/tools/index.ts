@@ -16,18 +16,22 @@ import {
 import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
 import { grepTool } from "./grep";
+import { hookAdminTool } from "./hook-admin";
 import { knowledgeLibraryTool, knowledgeReadTool, knowledgeSearchTool } from "./knowledge";
 import { knowledgeAdminTool } from "./knowledge-admin";
 import { knowledgeCreateTool, knowledgeEditTool } from "./knowledge-edit";
 import { knowledgeReviewTool } from "./knowledge-review";
 import { learningGuideTool } from "./learning-guide";
+import { mcpAdminTool } from "./mcp-admin";
 import { narraforkAdminTool } from "./narrafork-admin";
 import { packActivateTool, packDeactivateTool, packListTool } from "./pack";
 import { extractPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
+import { pluginInstallTool } from "./plugin-install";
 import { readTool } from "./read";
 import { recallTool } from "./recall";
 import { scheduledTaskTool } from "./scheduled-task";
+import { scheduledTaskAdminTool } from "./scheduled-task-admin";
 import { sendTool } from "./send";
 import { shareFileTool } from "./share-file";
 import { skillTool } from "./skill";
@@ -59,6 +63,10 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["PackList", packListTool],
 	["PackActivate", packActivateTool],
 	["PackDeactivate", packDeactivateTool],
+	["PluginInstall", pluginInstallTool],
+	["McpAdmin", mcpAdminTool],
+	["HookAdmin", hookAdminTool],
+	["ScheduledTaskAdmin", scheduledTaskAdminTool],
 	["KnowledgeCreate", knowledgeCreateTool],
 	["KnowledgeEdit", knowledgeEditTool],
 	["KnowledgeAdmin", knowledgeAdminTool],

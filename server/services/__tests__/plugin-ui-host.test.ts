@@ -23,6 +23,7 @@ function makeSession(): PluginUiSession {
 		version: "1.0.0",
 		hash: "c".repeat(64),
 		authorityInstallationId: "installation-ui-host",
+		installationId: "installation-1",
 		principalId: "user-1",
 		contributionId: "panel",
 		panelInstanceId: "panel-1",
@@ -236,6 +237,65 @@ describe("PluginUiHost", () => {
 				userRole: "user",
 				request: request("subscribe", "events.subscribe", {
 					topics: ["narrafork.chapter.created"],
+					// The gateway requires a verifiable authority revision; this
+					// unit test focuses on the UI→gateway schema mapping, so it
+					// supplies the revision explicitly instead of provisioning a
+					// real authority record.
+					grantRevision: 1,
+				}),
+			});
+
+			expect(response).toMatchObject({
+				result: {
+					subscriptionId: expect.any(String),
+					mode: "live",
+				},
+			});
+			const [subscription] = gateway.getSubscriptionDiagnostics();
+			expect(subscription).toMatchObject({
+				pluginId: session.pluginId,
+				runtimeId: `ui:${session.sessionId}`,
+				generation: session.generation,
+			});
+		} finally {
+			gateway.close();
+		}
+	});
+
+	test("strips the UI-protocol transport from delivery before gateway subscription", async () => {
+		// The UI panel passes `delivery.transport: "poll"` (UI protocol field), but
+		// the backend subscribe schema is strict and would reject the unknown
+		// field with INVALID_SUBSCRIPTION — which previously made every UI-panel
+		// event subscription fail silently, so the panel never refreshed.
+		const gateway = new PluginEventGateway({
+			registerListener: false,
+			capabilityBroker: {
+				authorize: () => true,
+				isRuntimeActive: () => true,
+			},
+		});
+		try {
+			const host = new PluginUiHost({
+				capabilityBroker: {
+					authorize: async () => ({ allowed: true }) as never,
+				},
+				eventGateway: gateway,
+			});
+			const session = makeSession();
+			const response = await host.dispatch({
+				session,
+				principalId: "user-1",
+				userRole: "user",
+				request: request("subscribe", "events.subscribe", {
+					topics: ["narrafork.chapter.created"],
+					mode: "live",
+					grantRevision: 1,
+					delivery: {
+						transport: "poll",
+						maxRatePerSecond: 10,
+						queueEvents: 100,
+						queueBytes: 256 * 1024,
+					},
 				}),
 			});
 

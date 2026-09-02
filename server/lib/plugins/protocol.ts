@@ -1175,6 +1175,7 @@ export const PUBLIC_EVENT_TOPICS = [
 	"narrafork.narrator.lifecycle",
 	"narrafork.narrator.attention",
 	"narrafork.narrator.message.changed",
+	"narrafork.narrator.spec.changed",
 	"narrafork.narrator.tool.changed",
 	"narrafork.narrator.permission.changed",
 	"narrafork.background-task.changed",

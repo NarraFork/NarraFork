@@ -1,12 +1,28 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { and, desc, eq, inArray, lt, or, type SQL } from "drizzle-orm";
 import { z } from "zod";
-import { chapters } from "../db/schema";
+import { chapters, narratorMessages, narrators } from "../db/schema";
+import { BOOLEAN_OVERRIDE_VALUES, type BooleanOverride } from "../lib/boolean-override";
+import { NotFoundError, ValidationError } from "../lib/errors";
 import { RESOURCE_SCOPE_FIELD_BY_TYPE, scopeContains } from "../lib/integrations/resource-scope";
 import { pluginIdSchema } from "../lib/plugins/manifest";
 import type { Capability } from "../lib/plugins/permissions";
 import type { JsonValue, PublicErrorCode } from "../lib/plugins/protocol";
+import { EXTERNAL_V1_MAX_MESSAGE_CHARS } from "../lib/validators/external";
 import { listIntegrationProjects } from "./integration-resource-service";
+import { narratorService } from "./narrator-service";
+import {
+	addSpecTaskForPlugin as addSpecTaskForPluginSession,
+	createNarratorForPlugin as createNarratorForPluginSession,
+	deleteNarratorForPlugin as deleteNarratorForPluginSession,
+	interruptNarrator as interruptNarratorSession,
+	readSpecTasksForPlugin as readSpecTasksForPluginSession,
+	sendMessage as sendNarratorMessage,
+	sendSubagentMessage as sendSubagentMessageToSession,
+	setSpecBehaviorFenceForPlugin as setSpecBehaviorFenceForPluginSession,
+	updateNarratorProfileForPlugin as updateNarratorProfileForPluginSession,
+	writeSpecForPlugin as writeSpecForPluginSession,
+} from "./narrator-session";
 import {
 	type CapabilityAuthorizationRequest as BrokerAuthorizationRequest,
 	type AuthorizationResult as BrokerAuthorizationResult,
@@ -37,7 +53,10 @@ const DEFAULT_REQUEST_BYTES = 256 * 1024;
 const DEFAULT_RESPONSE_BYTES = 1024 * 1024;
 const DEFAULT_JSON_DEPTH = 12;
 const DEFAULT_ARRAY_LENGTH = 100;
-const DEFAULT_OBJECT_KEYS = 1_000;
+// Must comfortably exceed DEFAULT_ARRAY_LENGTH × typical row key count: a full
+// 100-row narrators.list page (14 keys/row) alone is 1400 keys — 1000 would
+// reject every full page (fire-and-forget "too many object keys" for plugins).
+const DEFAULT_OBJECT_KEYS = 8_192;
 const DEFAULT_STRING_BYTES = 64 * 1024;
 const DEFAULT_DIAGNOSTICS = 20;
 const DEFAULT_CURSOR_TTL_MS = 15 * 60 * 1000;
@@ -1196,11 +1215,161 @@ export interface PluginLifecycleAdapter {
 	): Promise<PluginListSource>;
 }
 
+/**
+ * Public narrator summary. A bounded projection of `narrators` joined with its
+ * chapter's project; never carries `systemPrompt`, `cwd` or raw JSON columns.
+ */
+export interface NarratorListSource {
+	id: string;
+	chapterId: string | null;
+	projectId: string | null;
+	title: string | null;
+	handle: string | null;
+	variant: string;
+	type: string;
+	status: string;
+	substatus: string[];
+	model: string | null;
+	permissionMode: string | null;
+	messageCount: number;
+	lastMessageAt: string | null;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface NarratorQueryAdapter {
+	list(input: {
+		limit: number;
+		after?: TimestampCursor;
+		projectId?: string;
+		chapterId?: string;
+		status?: Array<"idle" | "working" | "waiting" | "archived">;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<NarratorListSource[]>;
+	listMessages(input: {
+		narratorId: string;
+		limit: number;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<Array<{ id: string; role: string; text: string | null; createdAt: string }>>;
+}
+
+export interface NarratorCommandAdapter {
+	sendMessage(input: {
+		narratorId: string;
+		message: string;
+		locale?: "en" | "zh-CN";
+		replyInUserLanguage?: boolean;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ messageId: string }>;
+	sendSubagentMessage(input: {
+		narratorId: string;
+		message: string;
+		priority?: boolean;
+		locale?: "en" | "zh-CN";
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{
+		delivered: "buffered" | "started";
+		messageId?: string;
+		bufferedAt?: string;
+		started?: boolean;
+	}>;
+	createNarrator(input: {
+		title?: string;
+		model?: string;
+		cwd?: string;
+		chapterId?: string | null;
+		permissionMode?: string;
+		planReflectionAutoApproveOverride?: BooleanOverride;
+		type?: "primary" | "subagent";
+		subagentType?: string;
+		parentNarratorId?: string;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{
+		narratorId: string;
+		title: string | null;
+		variant: string;
+		type: "primary" | "subagent";
+		model: string | null;
+		cwd: string | null;
+		status: string;
+	}>;
+	deleteNarrator(input: {
+		narratorId: string;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ deleted: true }>;
+	specTasksGet(input: {
+		narratorId: string;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{
+		content: string;
+		revisionId: string | null;
+		compiled: {
+			tasks: Array<{ text: string; status: string; protected: boolean }>;
+			openCount: number;
+			protectedOpenCount: number;
+		};
+	}>;
+	specTaskAdd(input: {
+		narratorId: string;
+		text: string;
+		/** Protected tasks are a user commitment; plugins must ask for one explicitly. */
+		protected?: boolean;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ added: boolean; taskText: string; protected: boolean; revisionId: string | null }>;
+	specBehaviorFenceUpdate(input: {
+		narratorId: string;
+		mode: "upsert" | "clear";
+		text?: string;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ updated: boolean; revisionId: string | null }>;
+	updateProfile(input: {
+		narratorId: string;
+		title?: string;
+		model?: string;
+		reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+		planReflectionAutoApproveOverride?: BooleanOverride;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ updated: string[] }>;
+	specWrite(input: {
+		narratorId: string;
+		uri: string;
+		content: string;
+		pluginId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ path: string; uri: string; revisionId: string | null }>;
+	interrupt(input: {
+		narratorId: string;
+		context: HostCallContext;
+		signal: AbortSignal;
+	}): Promise<{ interrupted: boolean }>;
+}
+
 export interface PluginPublicApiAdapters {
 	plugins?: PluginQueryAdapter;
 	projects?: ProjectQueryAdapter;
 	chapters?: ChapterQueryAdapter;
 	pluginLifecycle?: PluginLifecycleAdapter;
+	narrators?: NarratorQueryAdapter;
+	narratorCommands?: NarratorCommandAdapter;
 }
 
 const listInputBase = {
@@ -1237,6 +1406,122 @@ export const chaptersListInputSchema = z
 	})
 	.strict();
 export const pluginLifecycleInputSchema = z.object({ pluginId: pluginIdSchema }).strict();
+export const narratorsListInputSchema = z
+	.object({
+		...listInputBase,
+		projectId: idSchema.optional(),
+		chapterId: idSchema.optional(),
+		status: z
+			.array(z.enum(["idle", "working", "waiting", "archived"]))
+			.min(1)
+			.max(4)
+			.optional(),
+	})
+	.strict();
+export const narratorSendMessageInputSchema = z
+	.object({
+		narratorId: idSchema,
+		message: z.string().trim().min(1).max(EXTERNAL_V1_MAX_MESSAGE_CHARS),
+		locale: z.enum(["en", "zh-CN"]).optional(),
+		replyInUserLanguage: z.boolean().optional(),
+	})
+	.strict();
+export const narratorSendSubagentMessageInputSchema = z
+	.object({
+		narratorId: idSchema,
+		message: z.string().trim().min(1).max(EXTERNAL_V1_MAX_MESSAGE_CHARS),
+		priority: z.boolean().optional(),
+		locale: z.enum(["en", "zh-CN"]).optional(),
+	})
+	.strict();
+export const narratorCreateInputSchema = z
+	.object({
+		title: z.string().min(1).max(200).optional(),
+		model: z.string().min(1).max(200).optional(),
+		cwd: z.string().min(1).max(4096).optional(),
+		chapterId: idSchema.nullish(),
+		permissionMode: z
+			.enum(["default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk"])
+			.optional(),
+		type: z.enum(["primary", "subagent"]).optional(),
+		subagentType: z.string().min(1).max(64).optional(),
+		parentNarratorId: idSchema.optional(),
+		planReflectionAutoApproveOverride: z.enum(BOOLEAN_OVERRIDE_VALUES).optional(),
+	})
+	.strict();
+export const narratorDeleteInputSchema = z.object({ narratorId: idSchema }).strict();
+export const narratorMessagesListInputSchema = z
+	.object({
+		narratorId: idSchema,
+		limit: z.number().int().min(1).max(50).optional(),
+	})
+	.strict();
+export const narratorSpecTasksGetInputSchema = z.object({ narratorId: idSchema }).strict();
+export const narratorSpecTaskAddInputSchema = z
+	.object({
+		narratorId: idSchema,
+		text: z.string().trim().min(1).max(1000),
+		/**
+		 * Opt in to a protected task. Defaults to false, and that default is the point:
+		 * a protected task is a *user commitment* — it drives auto-continuation and
+		 * taskReflection, and the narrator cannot retract it. Making it implicit let a
+		 * plugin conscript a narrator into working for it indefinitely without anyone
+		 * asking for that. A plugin that genuinely needs the guarantee must say so.
+		 */
+		protected: z.boolean().optional(),
+	})
+	.strict();
+export const narratorSpecBehaviorFenceUpdateInputSchema = z
+	.object({
+		narratorId: idSchema,
+		mode: z.enum(["upsert", "clear"]),
+		text: z.string().trim().max(2000).optional(),
+	})
+	.strict();
+export const narratorInterruptInputSchema = z.object({ narratorId: idSchema }).strict();
+
+/** Reasoning effort values accepted for narrator profile updates. */
+const narratorReasoningEffortSchema = z
+	.enum(["none", "low", "medium", "high", "xhigh", "max"])
+	.nullable()
+	.optional();
+
+/** Update a narrator's profile and reflection behavior (at least one field). */
+export const narratorUpdateProfileInputSchema = z
+	.object({
+		narratorId: idSchema,
+		title: z.string().trim().min(1).max(200).optional(),
+		model: z.union([z.literal("__default__"), z.string().trim().min(1).max(200)]).optional(),
+		reasoningEffort: narratorReasoningEffortSchema,
+		planReflectionAutoApproveOverride: z.enum(BOOLEAN_OVERRIDE_VALUES).optional(),
+	})
+	.strict()
+	.refine(
+		(data) =>
+			data.title !== undefined ||
+			data.model !== undefined ||
+			data.reasoningEffort !== undefined ||
+			data.planReflectionAutoApproveOverride !== undefined,
+		{
+			message:
+				"At least one of title, model, reasoningEffort or planReflectionAutoApproveOverride must be provided",
+		},
+	);
+
+/** Spec files a plugin may write through the public API (safety allowlist). */
+const SPEC_WRITE_WHITELIST = new Set(["tasks.json", "index.md"]);
+
+/** Write (or replace) a plugin-managed Dynamic Spec file for a narrator. */
+export const narratorSpecWriteInputSchema = z
+	.object({
+		narratorId: idSchema,
+		uri: z.string().trim().min(1).max(256),
+		content: z.string().max(256 * 1024),
+	})
+	.strict()
+	.refine((data) => SPEC_WRITE_WHITELIST.has(data.uri), {
+		message: `uri must be one of: ${[...SPEC_WRITE_WHITELIST].join(", ")}`,
+	});
 
 const pluginCursorSchema = z.object({ pluginId: pluginIdSchema }).strict();
 const timestampCursorSchema = z.object({ updatedAt: deadlineSchema, id: idSchema }).strict();
@@ -1309,6 +1594,38 @@ function mapChapterSummary(row: ChapterListSource): Record<string, JsonValue> {
 		status: row.status,
 		role: row.role,
 		commitCount: Math.max(0, Math.trunc(row.commitCount ?? 0)),
+		createdAt: row.createdAt,
+		updatedAt: row.updatedAt,
+	};
+}
+
+/** Parse the `substatus` JSON-array text column defensively; never throw. */
+function parseNarratorSubstatus(raw: string | null): string[] {
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		if (!Array.isArray(parsed)) return [];
+		return parsed.filter((item): item is string => typeof item === "string").slice(0, 10);
+	} catch {
+		return [];
+	}
+}
+
+function mapNarratorSummary(row: NarratorListSource): Record<string, JsonValue> {
+	return {
+		id: row.id,
+		chapterId: row.chapterId ?? null,
+		projectId: row.projectId ?? null,
+		title: boundedSummaryText(row.title ?? undefined, 1_024) ?? null,
+		handle: boundedSummaryText(row.handle ?? undefined, 256) ?? null,
+		variant: boundedSummaryText(row.variant, 64) ?? "primary",
+		type: boundedSummaryText(row.type, 64) ?? "primary",
+		status: boundedSummaryText(row.status, 64) ?? "idle",
+		substatus: Array.isArray(row.substatus) ? row.substatus.slice(0, 10) : [],
+		model: boundedSummaryText(row.model ?? undefined, 256) ?? null,
+		permissionMode: boundedSummaryText(row.permissionMode ?? undefined, 64) ?? null,
+		messageCount: Math.max(0, Math.trunc(row.messageCount ?? 0)),
+		lastMessageAt: row.lastMessageAt ?? null,
 		createdAt: row.createdAt,
 		updatedAt: row.updatedAt,
 	};
@@ -1557,6 +1874,325 @@ export class PluginPublicApi {
 					const adapter = requireAdapter(this.adapters.pluginLifecycle, "Plugin lifecycle");
 					const status = await adapter[action](input.pluginId, call.host, call.signal);
 					return { data: mapPluginSummary(status) };
+				},
+			});
+		}
+		if (!this.queries.has("narrafork.narrators.list")) {
+			this.queries.register({
+				queryId: "narrafork.narrators.list",
+				capability: "query.read.narrators",
+				inputSchema: narratorsListInputSchema,
+				redaction: "user_scoped",
+				paginated: true,
+				resource: (input, context) => {
+					const projectId = context.scope.projectId ?? input.projectId;
+					return projectId ? { type: "project", id: projectId } : undefined;
+				},
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narrators, "Narrator query");
+					const after = call.cursor ? timestampCursorSchema.parse(call.cursor) : undefined;
+					const requested = input.limit + 1;
+					// A project-scoped invocation must never list another project's narrators,
+					// even if the plugin supplies a different projectId. Mirror projects/chapters.
+					const projectId = call.host.scope.projectId ?? input.projectId;
+					const rows = boundedAdapterRows(
+						await adapter.list({
+							limit: requested,
+							after,
+							projectId,
+							chapterId: input.chapterId,
+							status: input.status,
+							context: call.host,
+							signal: call.signal,
+						}),
+						requested,
+					).map(mapNarratorSummary);
+					return pageResponse(rows, input.limit, (row) => ({
+						updatedAt: row.updatedAt,
+						id: row.id,
+					}));
+				},
+			});
+		}
+		if (!this.queries.has("narrafork.narrator.messages.list")) {
+			this.queries.register({
+				queryId: "narrafork.narrator.messages.list",
+				capability: "query.read.narrators",
+				inputSchema: narratorMessagesListInputSchema,
+				redaction: "user_scoped",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					// Reads back the narrator's recent messages (text + role only —
+					// no tool payloads / tokens / cost). Used by team plugins to show
+					// a member's latest replies to the leader without opening the
+					// chat page. Bounded text per message keeps responses small.
+					const adapter = requireAdapter(this.adapters.narrators, "Narrator query");
+					const limit = input.limit ?? 10;
+					const rows = await adapter.listMessages({
+						narratorId: input.narratorId,
+						limit,
+						context: call.host,
+						signal: call.signal,
+					});
+					return {
+						data: {
+							narratorId: input.narratorId,
+							items: rows.map((row) => ({
+								id: row.id,
+								role: row.role,
+								text:
+									row.text === null || row.text === undefined
+										? null
+										: (boundedSummaryText(row.text, 1000) ?? null),
+								createdAt: row.createdAt,
+							})),
+						},
+					};
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.send_message")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.send_message",
+				capability: "command.narrator.send_message",
+				inputSchema: narratorSendMessageInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const sent = await adapter.sendMessage({
+						narratorId: input.narratorId,
+						message: input.message,
+						locale: input.locale,
+						replyInUserLanguage: input.replyInUserLanguage,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: { accepted: true, messageId: sent.messageId } };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.send_subagent_message")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.send_subagent_message",
+				capability: "command.narrator.send_subagent_message",
+				inputSchema: narratorSendSubagentMessageInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const sent = await adapter.sendSubagentMessage({
+						narratorId: input.narratorId,
+						message: input.message,
+						priority: input.priority,
+						locale: input.locale,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return {
+						data: {
+							delivered: sent.delivered,
+							...(sent.messageId ? { messageId: sent.messageId } : {}),
+							...(sent.bufferedAt ? { bufferedAt: sent.bufferedAt } : {}),
+							...(typeof sent.started === "boolean" ? { started: sent.started } : {}),
+						},
+					};
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.create")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.create",
+				capability: "command.narrator.create",
+				inputSchema: narratorCreateInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				// The narrator does not exist yet; the capability grant is the gate.
+				resource: () => undefined,
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const created = await adapter.createNarrator({
+						title: input.title,
+						model: input.model,
+						cwd: input.cwd,
+						chapterId: input.chapterId,
+						permissionMode: input.permissionMode,
+						planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
+						type: input.type,
+						subagentType: input.subagentType,
+						parentNarratorId: input.parentNarratorId,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: created };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.delete")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.delete",
+				capability: "command.narrator.delete",
+				inputSchema: narratorDeleteInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					await adapter.deleteNarrator({
+						narratorId: input.narratorId,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: { deleted: true } };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.spec_tasks_get")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.spec_tasks_get",
+				capability: "command.narrator.spec_tasks_get",
+				inputSchema: narratorSpecTasksGetInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const result = await adapter.specTasksGet({
+						narratorId: input.narratorId,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: result };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.spec_task_add")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.spec_task_add",
+				capability: "command.narrator.spec_task_add",
+				inputSchema: narratorSpecTaskAddInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const result = await adapter.specTaskAdd({
+						narratorId: input.narratorId,
+						text: input.text,
+						protected: input.protected ?? false,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: result };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.spec_behavior_fence_update")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.spec_behavior_fence_update",
+				capability: "command.narrator.spec_behavior_fence_update",
+				inputSchema: narratorSpecBehaviorFenceUpdateInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const result = await adapter.specBehaviorFenceUpdate({
+						narratorId: input.narratorId,
+						mode: input.mode,
+						text: input.text,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: result };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.spec_write")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.spec_write",
+				capability: "command.narrator.spec_write",
+				inputSchema: narratorSpecWriteInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const result = await adapter.specWrite({
+						narratorId: input.narratorId,
+						uri: input.uri,
+						content: input.content,
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: result };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.update_profile")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.update_profile",
+				capability: "command.narrator.update_profile",
+				inputSchema: narratorUpdateProfileInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "non_idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const result = await adapter.updateProfile({
+						narratorId: input.narratorId,
+						...(input.title !== undefined ? { title: input.title } : {}),
+						...(input.model !== undefined ? { model: input.model } : {}),
+						...(input.reasoningEffort !== undefined
+							? { reasoningEffort: input.reasoningEffort }
+							: {}),
+						...(input.planReflectionAutoApproveOverride !== undefined
+							? { planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride }
+							: {}),
+						pluginId: call.host.plugin.pluginId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: result };
+				},
+			});
+		}
+		if (!this.commands.has("narrafork.narrator.interrupt")) {
+			this.commands.register({
+				commandId: "narrafork.narrator.interrupt",
+				capability: "command.narrator.interrupt",
+				inputSchema: narratorInterruptInputSchema,
+				redaction: "user_scoped",
+				sideEffect: "idempotent",
+				idempotency: "optional",
+				resource: (input) => ({ type: "narrator", id: input.narratorId }),
+				handler: async (input, call) => {
+					const adapter = requireAdapter(this.adapters.narratorCommands, "Narrator commands");
+					const result = await adapter.interrupt({
+						narratorId: input.narratorId,
+						context: call.host,
+						signal: call.signal,
+					});
+					return { data: { interrupted: result.interrupted } };
 				},
 			});
 		}
@@ -2369,6 +3005,50 @@ export function createCommandRequest<T>(
 type NarraForkDatabase = typeof import("../db")["db"];
 type PluginManagerPublicMethods = Pick<PluginManager, "list" | "getStatus" | "enable" | "disable">;
 
+/** Narrow facade over narrator services so tests can inject a fake. */
+export type NarratorSessionFacade = {
+	sendMessage: typeof sendNarratorMessage;
+	sendSubagentMessage: typeof sendSubagentMessageToSession;
+	createNarrator: typeof createNarratorForPluginSession;
+	deleteNarrator: typeof deleteNarratorForPluginSession;
+	specTasksGet: typeof readSpecTasksForPluginSession;
+	specTaskAdd: typeof addSpecTaskForPluginSession;
+	specBehaviorFenceUpdate: typeof setSpecBehaviorFenceForPluginSession;
+	updateProfile: typeof updateNarratorProfileForPluginSession;
+	specWrite: typeof writeSpecForPluginSession;
+	interruptNarrator: typeof interruptNarratorSession;
+	getById: typeof narratorService.getById;
+};
+
+/** Map core narrator errors to stable public error codes. */
+function mapNarratorCommandError(error: unknown): PluginPublicApiError {
+	if (error instanceof PluginPublicApiError) return error;
+	if (error instanceof NotFoundError) {
+		return new PluginPublicApiError("NOT_FOUND", "Narrator was not found");
+	}
+	if (error instanceof ValidationError) {
+		const message = error instanceof Error ? error.message : "";
+		if (message.includes("already running")) {
+			return new PluginPublicApiError("CONFLICT", "Narrator is busy", {
+				retryable: true,
+			});
+		}
+		if (message.includes("resumeSubagent")) {
+			return new PluginPublicApiError(
+				"INVALID_PARAMS",
+				"Subagent messages must be sent through the parent narrator",
+			);
+		}
+		// Keep the concrete validation reason (e.g. a subagent that has never
+		// been started by its parent) instead of a generic message.
+		return new PluginPublicApiError("INVALID_PARAMS", message || "Invalid narrator operation");
+	}
+	return new PluginPublicApiError(
+		"INTERNAL_ERROR",
+		"The narrator operation failed inside the host",
+	);
+}
+
 /**
  * Concrete limited adapters for core integration. DB queries select finite columns and use
  * `(updatedAt,id)` keyset predicates with `LIMIT n+1`; plugin lifecycle results are projected
@@ -2377,8 +3057,22 @@ type PluginManagerPublicMethods = Pick<PluginManager, "list" | "getStatus" | "en
 export function createCorePluginPublicApiAdapters(options: {
 	db: NarraForkDatabase;
 	pluginManager: PluginManagerPublicMethods;
+	narratorSession?: NarratorSessionFacade;
 }): PluginPublicApiAdapters {
 	const { db, pluginManager } = options;
+	const session = options.narratorSession ?? {
+		sendMessage: sendNarratorMessage,
+		sendSubagentMessage: sendSubagentMessageToSession,
+		createNarrator: createNarratorForPluginSession,
+		deleteNarrator: deleteNarratorForPluginSession,
+		specTasksGet: readSpecTasksForPluginSession,
+		specTaskAdd: addSpecTaskForPluginSession,
+		specBehaviorFenceUpdate: setSpecBehaviorFenceForPluginSession,
+		updateProfile: updateNarratorProfileForPluginSession,
+		specWrite: writeSpecForPluginSession,
+		interruptNarrator: interruptNarratorSession,
+		getById: narratorService.getById,
+	};
 	return {
 		plugins: {
 			async getOwn(input) {
@@ -2485,6 +3179,267 @@ export function createCorePluginPublicApiAdapters(options: {
 				return pluginStatusSource(await pluginManager.disable(pluginId));
 			},
 		},
+		narrators: {
+			async list(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Query was cancelled");
+				const predicates: SQL[] = [];
+				if (input.chapterId) predicates.push(eq(narrators.chapterId, input.chapterId));
+				if (input.status?.length) predicates.push(inArray(narrators.status, input.status));
+				if (input.after) {
+					const afterPredicate = or(
+						lt(narrators.updatedAt, input.after.updatedAt),
+						and(eq(narrators.updatedAt, input.after.updatedAt), lt(narrators.id, input.after.id)),
+					);
+					if (afterPredicate) predicates.push(afterPredicate);
+				}
+				if (input.projectId) predicates.push(eq(chapters.projectId, input.projectId));
+				const rows = await db
+					.select({
+						id: narrators.id,
+						chapterId: narrators.chapterId,
+						projectId: chapters.projectId,
+						title: narrators.title,
+						handle: narrators.handle,
+						variant: narrators.variant,
+						type: narrators.type,
+						status: narrators.status,
+						substatus: narrators.substatus,
+						model: narrators.model,
+						permissionMode: narrators.permissionMode,
+						reasoningEffort: narrators.reasoningEffort,
+						messageCount: narrators.messageCount,
+						lastMessageAt: narrators.lastMessageAt,
+						createdAt: narrators.createdAt,
+						updatedAt: narrators.updatedAt,
+					})
+					.from(narrators)
+					.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+					.where(predicates.length ? and(...predicates) : undefined)
+					.orderBy(desc(narrators.updatedAt), desc(narrators.id))
+					.limit(input.limit);
+				return rows.map((row) => ({
+					id: row.id,
+					chapterId: row.chapterId,
+					projectId: row.projectId ?? null,
+					title: row.title,
+					handle: row.handle,
+					variant: row.variant,
+					type: row.type,
+					status: row.status,
+					substatus: parseNarratorSubstatus(row.substatus),
+					model: row.model,
+					permissionMode: row.permissionMode,
+					reasoningEffort: row.reasoningEffort,
+					messageCount: row.messageCount ?? 0,
+					lastMessageAt: row.lastMessageAt,
+					createdAt: row.createdAt,
+					updatedAt: row.updatedAt,
+				}));
+			},
+			async listMessages(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Query was cancelled");
+				const rows = await db
+					.select({
+						id: narratorMessages.id,
+						role: narratorMessages.role,
+						contentText: narratorMessages.contentText,
+						createdAt: narratorMessages.createdAt,
+					})
+					.from(narratorMessages)
+					.where(eq(narratorMessages.narratorId, input.narratorId))
+					.orderBy(desc(narratorMessages.createdAt))
+					.limit(input.limit);
+				return rows.map((row) => ({
+					id: row.id,
+					role: row.role,
+					text: row.contentText ?? null,
+					createdAt: row.createdAt,
+				}));
+			},
+		},
+		narratorCommands: {
+			async sendMessage(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const sent = await session.sendMessage(
+						input.narratorId,
+						input.message,
+						undefined,
+						input.locale ?? "en",
+						input.replyInUserLanguage ?? false,
+						null,
+						null,
+						undefined,
+						null,
+						{ origin: "user", originLabel: `plugin:${input.pluginId}` },
+					);
+					return { messageId: sent.id };
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async sendSubagentMessage(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const result = await session.sendSubagentMessage({
+						subagentId: input.narratorId,
+						message: input.message,
+						priority: input.priority,
+						locale: input.locale,
+						createdBy: null,
+						signal: input.signal,
+					});
+					return {
+						delivered: result.delivered,
+						...(result.messageId ? { messageId: result.messageId } : {}),
+						...(result.bufferedAt ? { bufferedAt: result.bufferedAt } : {}),
+						...(typeof result.started === "boolean" ? { started: result.started } : {}),
+					};
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async createNarrator(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const result = await session.createNarrator({
+						title: input.title,
+						model: input.model,
+						cwd: input.cwd,
+						chapterId: input.chapterId,
+						permissionMode: input.permissionMode,
+						planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
+						type: input.type,
+						subagentType: input.subagentType,
+						parentNarratorId: input.parentNarratorId,
+					});
+					return result;
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async deleteNarrator(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					await session.deleteNarrator(input.narratorId);
+					return { deleted: true };
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async specTasksGet(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const result = await session.specTasksGet(input.narratorId);
+					return {
+						content: result.content,
+						revisionId: result.revisionId,
+						compiled: {
+							tasks: result.compiled.tasks.map((task) => ({
+								text: task.text,
+								status: task.status,
+								protected: task.protected ?? false,
+							})),
+							openCount: result.compiled.tasks.filter((task) => task.status !== "done").length,
+							protectedOpenCount: result.compiled.protectedOpenCount,
+						},
+					};
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async specTaskAdd(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const result = await session.specTaskAdd(input.narratorId, input.text, {
+						protected: input.protected === true,
+					});
+					return {
+						added: result.added,
+						taskText: result.taskText,
+						protected: result.protected,
+						revisionId: result.revisionId,
+					};
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async specBehaviorFenceUpdate(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					const result = await session.specBehaviorFenceUpdate(
+						input.narratorId,
+						input.text ?? "",
+						input.mode,
+					);
+					return {
+						updated: result.updated,
+						revisionId: result.revisionId,
+					};
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async updateProfile(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					// Resolve existence first so the caller gets a stable NOT_FOUND.
+					await session.getById(input.narratorId);
+					const result = await session.updateProfile(input.narratorId, {
+						...(input.title !== undefined ? { title: input.title } : {}),
+						...(input.model !== undefined ? { model: input.model } : {}),
+						...(input.reasoningEffort !== undefined
+							? { reasoningEffort: input.reasoningEffort }
+							: {}),
+						...(input.planReflectionAutoApproveOverride !== undefined
+							? { planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride }
+							: {}),
+					});
+					return { updated: result.updated };
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async specWrite(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				try {
+					// Resolve existence first so the caller gets a stable NOT_FOUND.
+					await session.getById(input.narratorId);
+					const result = await session.specWrite(input.narratorId, input.uri, input.content);
+					return {
+						path: result.path,
+						uri: result.uri,
+						revisionId: result.revisionId,
+					};
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+			},
+			async interrupt(input) {
+				if (input.signal.aborted)
+					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+				// `interruptNarrator` returns false for unknown ids; resolve existence first so
+				// the caller gets a stable NOT_FOUND instead of a silent no-op.
+				try {
+					await session.getById(input.narratorId);
+				} catch (error) {
+					throw mapNarratorCommandError(error);
+				}
+				const interrupted = session.interruptNarrator(input.narratorId);
+				return { interrupted };
+			},
+		},
 	};
 }
 
@@ -2493,11 +3448,22 @@ export const PUBLIC_QUERY_IDS = [
 	"narrafork.plugins.list",
 	"narrafork.projects.list",
 	"narrafork.chapters.list",
+	"narrafork.narrators.list",
 ] as const;
 
 export const PUBLIC_COMMAND_IDS = [
 	"narrafork.plugins.enable",
 	"narrafork.plugins.disable",
+	"narrafork.narrator.send_message",
+	"narrafork.narrator.send_subagent_message",
+	"narrafork.narrator.interrupt",
+	"narrafork.narrator.create",
+	"narrafork.narrator.delete",
+	"narrafork.narrator.spec_tasks_get",
+	"narrafork.narrator.spec_task_add",
+	"narrafork.narrator.spec_behavior_fence_update",
+	"narrafork.narrator.update_profile",
+	"narrafork.narrator.spec_write",
 ] as const;
 
 export type PublicQueryId = (typeof PUBLIC_QUERY_IDS)[number];

@@ -71,6 +71,8 @@ export interface PluginUiHostLocalRouterOptions {
 	openPanel?: (request: PluginUiPanelOpenRequest) => void;
 	/** Open an external URL. Only wired when a policy gate exists; otherwise NOT_SUPPORTED. */
 	openExternal?: (url: string) => void;
+	/** Navigate to an internal host route (e.g. a narrator chat page). */
+	navigate?: (to: string) => void;
 }
 
 export interface PluginUiNotificationInput {
@@ -151,6 +153,8 @@ function dispatchHostLocal(
 			return notificationsShow(request, options, method);
 		case "ui.openExternal":
 			return uiOpenExternal(request, options, method);
+		case "ui.navigate":
+			return uiNavigate(request, options, method);
 		case "panel.setBadge":
 		case "panel.setDirty":
 			throw notSupported(method);
@@ -277,5 +281,24 @@ function uiOpenExternal(
 	if (!url) throw invalidParams("ui.openExternal requires a url");
 	if (!/^https?:\/\//i.test(url)) throw invalidParams("ui.openExternal only allows http(s) URLs");
 	options.openExternal(url);
+	return { ok: true };
+}
+
+/** Internal route allow-list: only host-owned deep links may be navigated to. */
+const INTERNAL_NAVIGATION_PREFIXES = ["/narrators/", "/projects/", "/chapters/"];
+
+function uiNavigate(
+	request: UiRpcRequest,
+	options: PluginUiHostLocalRouterOptions,
+	method: string,
+): JsonValue {
+	if (!options.navigate) throw notSupported(method);
+	const to = isRecord(request.params) ? readString(request.params.to) : undefined;
+	if (!to) throw invalidParams("ui.navigate requires a to path");
+	const allowed = INTERNAL_NAVIGATION_PREFIXES.some((prefix) => to.startsWith(prefix));
+	if (!allowed || to.includes("\0") || to.includes("\\") || /[\s?#]/.test(to)) {
+		throw invalidParams("ui.navigate only allows internal host paths");
+	}
+	options.navigate(to);
 	return { ok: true };
 }

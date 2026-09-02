@@ -15,6 +15,7 @@ import { Database } from "bun:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { ensureColumns } from "../server/db/ensure-columns";
 import * as relations from "../server/db/relations";
 import * as schema from "../server/db/schema";
 
@@ -70,6 +71,7 @@ export function getTestDb() {
 	const sqlite = new Database(":memory:");
 	sqlite.run("PRAGMA foreign_keys = OFF");
 	applyMigrations(sqlite);
+	ensureColumns(sqlite);
 	sqlite.run("PRAGMA foreign_keys = ON");
 	const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 	return { db, sqlite };

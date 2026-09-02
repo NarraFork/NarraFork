@@ -73,6 +73,56 @@ export interface PluginGrantSummary {
 	updatedAt?: string;
 }
 
+export interface PluginGrantScope {
+	type: string;
+	id?: string;
+}
+
+export interface PluginStoredGrant {
+	grantId: string;
+	capability: string;
+	scope: PluginGrantScope;
+	grantedBy?: string;
+	revision?: number;
+}
+
+export interface PluginPermissionSet {
+	pluginId: string;
+	installationId: string;
+	revision: number;
+	grants: PluginStoredGrant[];
+	updatedAt: string;
+}
+
+export interface PluginGrantInput {
+	capability: string;
+	scope: PluginGrantScope;
+	grantId?: string;
+}
+
+export interface PluginPermissionMutationResponse {
+	status?: PluginPermissionSet | string;
+	permissions?: PluginPermissionSet;
+}
+
+export interface PluginPermissionRequestSummary {
+	requestId: string;
+	capability: string;
+	scope: { type: string; id?: string };
+	requestedAt: string;
+	requestedByRuntimeId?: string;
+	/**
+	 * `upgrade` means a newer package version declares this capability and it was
+	 * withheld pending approval; `runtime` means the running plugin called it.
+	 * Older servers omit the field — treat a missing value as `runtime`.
+	 */
+	source?: "runtime" | "upgrade";
+	/** Package version that introduced the declaration (`upgrade` requests only). */
+	requestedForVersion?: string;
+	status: "pending" | "granted" | "denied";
+	resolvedAt?: string;
+}
+
 export interface PluginRuntimeDiagnostics {
 	runtimeId?: string;
 	generation?: number;
@@ -121,6 +171,9 @@ export interface PluginDetail extends PluginSummary {
 	packages?: Array<PluginPackageRef & { status?: string; isCurrent?: boolean }>;
 	runtime?: PluginRuntimeDiagnostics;
 	generatedAt?: string;
+	/** Declared host capabilities (names only), used by the grants panel to show
+	 * which declared capabilities still lack a grant. */
+	manifest?: { permissions?: { host?: string[] } };
 }
 
 export interface PluginStatusEnvelope extends PluginDetail {
@@ -319,6 +372,40 @@ export const pluginsApi = {
 			method: "PUT",
 			body: JSON.stringify({ providerInstanceId, proxy }),
 		}),
+	/** Full permission set for an installation (admin). */
+	getGrants: (pluginId: string) => request<PluginPermissionSet>(`${pluginPath(pluginId)}/grants`),
+	/** Replace the full grant list (admin). */
+	replaceGrants: (
+		pluginId: string,
+		body: { expectedRevision: number; grants: PluginGrantInput[] },
+	) =>
+		request<PluginPermissionMutationResponse>(`${pluginPath(pluginId)}/grants`, {
+			method: "PUT",
+			body: JSON.stringify(body),
+		}),
+	/** Revoke specific grants by id (admin). */
+	revokeGrants: (pluginId: string, body: { expectedRevision: number; grantIds: string[] }) =>
+		request<PluginPermissionMutationResponse>(`${pluginPath(pluginId)}/grants/revoke`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	/** List pending runtime permission requests for a plugin (admin). */
+	listPendingGrants: (pluginId: string) =>
+		request<{ requests: PluginPermissionRequestSummary[] }>(
+			`${pluginPath(pluginId)}/grants/pending`,
+		),
+	/** Approve a pending runtime permission request (admin). */
+	approveGrantRequest: (pluginId: string, requestId: string) =>
+		request<unknown>(
+			`${pluginPath(pluginId)}/grants/requests/${encodeURIComponent(requestId)}/approve`,
+			{ method: "POST" },
+		),
+	/** Deny a pending runtime permission request (admin). */
+	denyGrantRequest: (pluginId: string, requestId: string) =>
+		request<{ denied: boolean }>(
+			`${pluginPath(pluginId)}/grants/requests/${encodeURIComponent(requestId)}/deny`,
+			{ method: "POST" },
+		),
 };
 
 /** Normalize the list payload (server may return a bare array or an envelope). */

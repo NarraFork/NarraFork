@@ -97,7 +97,10 @@ class FakeSupervisor implements PluginRuntimeSupervisorLike {
 
 	register(options: PluginRuntimeOptions): FakeRuntime {
 		const existing = this.runtimes.get(options.pluginId);
-		if (existing) return existing;
+		if (existing && existing.options.command.join("\u0000") === options.command.join("\u0000")) {
+			return existing;
+		}
+		if (existing) this.runtimes.delete(options.pluginId);
 		const runtime = new FakeRuntime(options);
 		this.runtimes.set(options.pluginId, runtime);
 		return runtime;
@@ -213,7 +216,13 @@ describe("PluginManager", () => {
 
 		const installed = await manager.install(source);
 		if (!installed.current) throw new Error("Installed plugin has no current package");
-		const authorityId = pluginInstallationAuthorityId(installed.pluginId, installed.current.hash);
+		// Authorization is keyed by the stable UUID identity, never the package
+		// hash (a hash-keyed record would never be consulted by the runtime).
+		const permissionSet = await manager.getPermissions(installed.pluginId);
+		const authorityId = pluginInstallationAuthorityId(
+			installed.pluginId,
+			permissionSet.installationId,
+		);
 		expect(installed.desiredState).toBe("disabled");
 		expect(installed.runtimeState).toBe("inactive");
 		expect(supervisor.startCount.size).toBe(0);
@@ -342,12 +351,15 @@ describe("PluginManager", () => {
 			],
 		});
 		expect(granted.permissions.revision).toBe(2);
-		await permissionStore.replace(pluginId, installed.current.hash, [], {
+		// replacePermissions already lazily migrated the identity to a stable UUID.
+		const migratedUuid = granted.permissions.installationId;
+		expect(migratedUuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+		await permissionStore.replace(pluginId, migratedUuid, [], {
 			expectedRevision: 2,
 			targetRevision: 3,
 			grantedBy: "legacy-file-editor",
 		});
-		expect((await permissionStore.getSet(pluginId, installed.current.hash)).grants).toEqual([]);
+		expect((await permissionStore.getSet(pluginId, migratedUuid)).grants).toEqual([]);
 
 		await manager.enable(pluginId);
 		const active = await manager.activate(pluginId);
@@ -361,7 +373,7 @@ describe("PluginManager", () => {
 		expect(binding).toMatchObject({
 			plugin: {
 				pluginId,
-				installationId: installed.current.hash,
+				installationId: migratedUuid,
 				runtimeId: runtime.runtimeId,
 				runtimeGeneration: 1,
 			},
@@ -575,7 +587,7 @@ describe("PluginManager", () => {
 		});
 		const installed = await manager.install(await makePackage(root, pluginId));
 		if (!installed.current) throw new Error("Installed plugin has no current package");
-		await manager.replacePermissions(pluginId, {
+		const granted = await manager.replacePermissions(pluginId, {
 			expectedRevision: 1,
 			grantedBy: "admin-user-1",
 			grants: [
@@ -589,6 +601,9 @@ describe("PluginManager", () => {
 				},
 			],
 		});
+		// Identity is a stable UUID from the first grant operation; upgrades never
+		// change it, so grants survive the package hash change below.
+		const stableUuid = granted.permissions.installationId;
 		const upgraded = await manager.install(
 			await makePackage(root, pluginId, (manifest) => {
 				manifest.version = "2.0.0";
@@ -598,7 +613,7 @@ describe("PluginManager", () => {
 		expect(upgraded.current.hash).not.toBe(installed.current.hash);
 		const permissions = await manager.getPermissions(pluginId);
 		expect(permissions).toMatchObject({
-			installationId: upgraded.current.hash,
+			installationId: stableUuid,
 			revision: 2,
 			grants: [
 				{
@@ -612,7 +627,189 @@ describe("PluginManager", () => {
 				},
 			],
 		});
-		expect(await manager.permissionStore.listSets(pluginId)).toHaveLength(2);
+		// The legacy hash set may linger for back-compat, but the active UUID set
+		// must carry the complete grants after the upgrade.
+		const sets = await manager.permissionStore.listSets(pluginId);
+		expect(sets.some((set) => set.installationId === stableUuid)).toBe(true);
+		expect(
+			sets.find((set) => set.installationId === stableUuid)?.grants.map((g) => g.capability),
+		).toContain("query.read.projects");
+	});
+
+	test("withholds newly-declared capabilities on upgrade and queues them for approval", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.upgrade-new-capability";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		const installed = await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+			}),
+		);
+		if (!installed.current) throw new Error("Installed plugin has no current package");
+		await manager.replacePermissions(pluginId, {
+			expectedRevision: 1,
+			grantedBy: "admin-user-1",
+			grants: [
+				{
+					grantId: "grant-logs",
+					capability: "diagnostics.readOwnLogs",
+					scope: { type: "global" },
+					grantedBy: "admin-user-1",
+				},
+			],
+		});
+		const before = await manager.getPermissions(pluginId);
+		const stableUuid = before.installationId;
+		expect(before.grants.map((g) => g.capability)).toEqual(["diagnostics.readOwnLogs"]);
+
+		// The new manifest declares a capability that was never granted. Because the
+		// installation identity is stable, the upgrade inherits the old grants — so the
+		// added capability must NOT ride in on that inheritance. It is withheld and
+		// queued for approval; the upgrade itself still succeeds.
+		const upgraded = await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				manifest.version = "2.0.0";
+				(manifest.permissions as Record<string, unknown>).host = [
+					"diagnostics.readOwnLogs",
+					"query.read.projects",
+				];
+			}),
+		);
+		if (!upgraded.current) throw new Error("Upgraded plugin has no current package");
+		expect(upgraded.current.version).toBe("2.0.0");
+
+		const after = await manager.getPermissions(pluginId);
+		expect(after.installationId).toBe(stableUuid);
+		// Only the previously approved capability is granted, with its grant identity
+		// intact — the upgrade neither widened nor rewrote it.
+		expect(after.grants.map((g) => g.capability)).toEqual(["diagnostics.readOwnLogs"]);
+		expect(after.grants.find((g) => g.capability === "diagnostics.readOwnLogs")?.grantId).toBe(
+			"grant-logs",
+		);
+
+		const pending = await manager.listPendingPermissionRequests(pluginId);
+		expect(pending.map((req) => req.capability)).toEqual(["query.read.projects"]);
+		const request = pending[0];
+		if (!request) throw new Error("Upgrade did not queue an approval request");
+		expect(request.source).toBe("upgrade");
+		expect(request.requestedForVersion).toBe("2.0.0");
+		expect(request.status).toBe("pending");
+
+		// Approving the request is what finally grants it, attributed to the admin who
+		// decided — not to "system".
+		await manager.approvePermissionRequest(pluginId, request.requestId, "admin-user-1");
+		const approved = await manager.getPermissions(pluginId);
+		expect(approved.grants.map((g) => g.capability).sort()).toEqual([
+			"diagnostics.readOwnLogs",
+			"query.read.projects",
+		]);
+		expect(approved.grants.find((g) => g.capability === "query.read.projects")?.grantedBy).toBe(
+			"admin-user-1",
+		);
+		expect(await manager.listPendingPermissionRequests(pluginId)).toHaveLength(0);
+	});
+
+	test("denying an upgrade capability leaves the upgrade in place without the grant", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.upgrade-denied-capability";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+			}),
+		);
+		const upgraded = await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				manifest.version = "2.0.0";
+				(manifest.permissions as Record<string, unknown>).host = [
+					"diagnostics.readOwnLogs",
+					"query.read.projects",
+				];
+			}),
+		);
+		const pending = await manager.listPendingPermissionRequests(pluginId);
+		expect(pending).toHaveLength(1);
+		const request = pending[0];
+		if (!request) throw new Error("Upgrade did not queue an approval request");
+
+		expect(await manager.denyPermissionRequest(pluginId, request.requestId)).toBeTruthy();
+
+		// The chosen semantics: a denial costs the plugin one capability, not the whole
+		// update. The new version stays installed and everything previously approved
+		// keeps working.
+		expect((await manager.getStatus(pluginId))?.current?.version).toBe("2.0.0");
+		expect(upgraded.current?.version).toBe("2.0.0");
+		const after = await manager.getPermissions(pluginId);
+		expect(after.grants.map((g) => g.capability)).toEqual(["diagnostics.readOwnLogs"]);
+		expect(await manager.listPendingPermissionRequests(pluginId)).toHaveLength(0);
+	});
+
+	test("re-running the same upgrade does not stack duplicate approval requests", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.upgrade-idempotent-request";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+			}),
+		);
+		const upgradeManifest = (manifest: Record<string, unknown>) => {
+			manifest.version = "2.0.0";
+			(manifest.permissions as Record<string, unknown>).host = [
+				"diagnostics.readOwnLogs",
+				"query.read.projects",
+			];
+		};
+		await manager.install(await makePackage(root, pluginId, upgradeManifest));
+		const first = await manager.listPendingPermissionRequests(pluginId);
+		expect(first).toHaveLength(1);
+
+		// Reinstalling the same version must not queue a second row for the same
+		// (capability, scope): the pending list is the admin's to-do list, and a
+		// re-install is not a new decision.
+		await manager.install(await makePackage(root, pluginId, upgradeManifest));
+		const second = await manager.listPendingPermissionRequests(pluginId);
+		expect(second).toHaveLength(1);
+		expect(second[0]?.requestId).toBe(first[0]?.requestId);
+	});
+
+	test("a first install still auto-grants its declared capabilities", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.first-install-seeds";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		// Installing is the trust decision, so a FIRST install is unchanged: declared
+		// capabilities are granted and nothing waits for approval. Only upgrades are
+		// fail-closed.
+		await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				(manifest.permissions as Record<string, unknown>).host = [
+					"diagnostics.readOwnLogs",
+					"query.read.projects",
+				];
+			}),
+		);
+		const permissions = await manager.getPermissions(pluginId);
+		expect(permissions.grants.map((g) => g.capability).sort()).toEqual([
+			"diagnostics.readOwnLogs",
+			"query.read.projects",
+		]);
+		expect(await manager.listPendingPermissionRequests(pluginId)).toHaveLength(0);
 	});
 
 	test("rejects enabling an incompatible package", async () => {
@@ -971,5 +1168,550 @@ describe("PluginManager", () => {
 		expect(order[0]).toBe("state-initialize");
 		expect(order).toContain("contribution-refresh");
 		expect(order.indexOf("state-initialize")).toBeLessThan(order.indexOf("contribution-refresh"));
+	});
+
+	test("migrates legacy hash identity to a stable UUID and keeps grants across upgrades", async () => {
+		const root = await makeTempRoot();
+		const storeRoot = join(root, "plugins");
+		const pluginId = "com.example.identity-migration";
+		const supervisor = new FakeSupervisor();
+		const stateStore = new PluginStateStore(storeRoot);
+		const permissionStore = new PluginPermissionStore({ root: storeRoot, stateStore });
+		const capabilityBroker = new CapabilityBroker();
+		const hostServices = new PluginHostServices({ capabilityBroker, permissionStore });
+		const migrationDispatcher = new PluginHostDispatcher({
+			identity: {
+				pluginId,
+				runtimeId: "migration-runtime",
+				runtimeGeneration: 0,
+			},
+			methods: {},
+		});
+		const platform = createPluginPlatformServices({
+			runtimeSupervisor: supervisor as never,
+			stateStore,
+			permissionStore,
+			capabilityBroker,
+			hostServices,
+		});
+		const manager = new PluginManager({
+			root: storeRoot,
+			disabled: false,
+			stateStore,
+			permissionStore,
+			hostServices,
+			runtimeSupervisor: supervisor,
+			runtimeOptionsFactory: async (context) => ({
+				pluginId: context.pluginId,
+				pluginVersion: context.manifest.version,
+				packageDigest: context.package.hash,
+				command: ["fake-runtime"],
+				cwd: context.packagePath,
+				dispatcher: migrationDispatcher,
+			}),
+			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
+			restorePluginLifecycle: platform.restorePlugin,
+		});
+		await manager.initialize();
+
+		// Install in the legacy hash-identity era and grant by hash. The first
+		// grant operation already lazily migrates the identity to a stable UUID.
+		const source = await makePackage(root, pluginId, (manifest) => {
+			(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+		});
+		const installed = await manager.install(source);
+		if (!installed.current) throw new Error("Installed plugin has no current package");
+		const legacyHash = installed.current.hash;
+		const granted = await manager.replacePermissions(pluginId, {
+			expectedRevision: 1,
+			grantedBy: "admin-user-1",
+			grants: [
+				{
+					grantId: "grant-identity",
+					capability: "diagnostics.readOwnLogs",
+					scope: { type: "global" },
+					grantedBy: "admin-user-1",
+				},
+			],
+		});
+		// Migrated to a stable UUID, distinct from the legacy package hash.
+		expect(granted.permissions.installationId).not.toBe(legacyHash);
+		expect(granted.permissions.installationId).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+		);
+		expect(granted.permissions.revision).toBe(2);
+		expect(granted.permissions.grants.map((g) => g.capability)).toContain(
+			"diagnostics.readOwnLogs",
+		);
+
+		// First permission read lazily migrates to a stable UUID, inheriting the
+		// legacy hash's grants via sourceInstallationId.
+		const migrated = await manager.getPermissions(pluginId);
+		expect(migrated.installationId).not.toBe(legacyHash);
+		expect(migrated.installationId).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+		);
+		expect(migrated.grants.map((g) => g.capability)).toContain("diagnostics.readOwnLogs");
+
+		// UUID is persisted and idempotent on subsequent reads.
+		const persisted = await stateStore.getState(pluginId);
+		expect(persisted?.installationId).toBe(migrated.installationId);
+		const again = await manager.getPermissions(pluginId);
+		expect(again.installationId).toBe(migrated.installationId);
+
+		// Simulate an upgrade (package hash changes): identity and grants survive.
+		await stateStore.updateState(pluginId, (current) => ({
+			...current,
+			current: { version: "9.9.9", hash: "aa".repeat(32) },
+		}));
+		const upgraded = await manager.getPermissions(pluginId);
+		expect(upgraded.installationId).toBe(migrated.installationId);
+		expect(upgraded.grants.map((g) => g.capability)).toContain("diagnostics.readOwnLogs");
+	});
+
+	test("re-seeds declared grants on enable when the persisted summary is empty", async () => {
+		const root = await makeTempRoot();
+		const storeRoot = join(root, "plugins");
+		const pluginId = "com.example.reseed-on-enable";
+		const supervisor = new FakeSupervisor();
+		const stateStore = new PluginStateStore(storeRoot);
+		const permissionStore = new PluginPermissionStore({ root: storeRoot, stateStore });
+		const capabilityBroker = new CapabilityBroker();
+		const hostServices = new PluginHostServices({ capabilityBroker, permissionStore });
+		const platform = createPluginPlatformServices({
+			runtimeSupervisor: supervisor as never,
+			stateStore,
+			permissionStore,
+			capabilityBroker,
+			hostServices,
+		});
+		const manager = new PluginManager({
+			root: storeRoot,
+			disabled: false,
+			stateStore,
+			permissionStore,
+			hostServices,
+			runtimeSupervisor: supervisor,
+			runtimeOptionsFactory: async (context) => ({
+				pluginId: context.pluginId,
+				pluginVersion: context.manifest.version,
+				packageDigest: context.package.hash,
+				command: ["fake-runtime"],
+				cwd: context.packagePath,
+				dispatcher: new PluginHostDispatcher({
+					identity: {
+						pluginId,
+						runtimeId: "reseed-runtime",
+						runtimeGeneration: 0,
+					},
+					methods: {},
+				}),
+			}),
+			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
+			restorePluginLifecycle: platform.restorePlugin,
+		});
+		await manager.initialize();
+		const source = await makePackage(root, pluginId, (manifest) => {
+			(manifest.permissions as Record<string, unknown>).host = [
+				"diagnostics.readOwnLogs",
+				"query.read.projects",
+			];
+		});
+		await manager.install(source);
+
+		// Simulate a legacy/restored state whose grant summary was lost: the
+		// enable path must re-seed the manifest-declared capabilities instead of
+		// binding an empty permission set.
+		await stateStore.updateState(pluginId, (current) => ({
+			...current,
+			grants: { count: 0, capabilities: [], revision: 0 },
+		}));
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+
+		const permissions = await manager.getPermissions(pluginId);
+		expect(permissions.grants.map((grant) => grant.capability).sort()).toEqual([
+			"diagnostics.readOwnLogs",
+			"query.read.projects",
+		]);
+	});
+
+	test("keeps the capability binding after an idle-style runtime restart (generation change)", async () => {
+		const root = await makeTempRoot();
+		const storeRoot = join(root, "plugins");
+		const pluginId = "com.example.idle-restart-binding";
+		const supervisor = new FakeSupervisor();
+		const stateStore = new PluginStateStore(storeRoot);
+		const permissionStore = new PluginPermissionStore({ root: storeRoot, stateStore });
+		const capabilityBroker = new CapabilityBroker();
+		const hostServices = new PluginHostServices({ capabilityBroker, permissionStore });
+		const unsafeDispatcher = new PluginHostDispatcher({
+			identity: { pluginId, runtimeId: "unsafe-runtime", runtimeGeneration: 0 },
+			methods: { unsafe: { method: "unsafe", handler: async () => ({ allowed: true }) } },
+		});
+		const platform = createPluginPlatformServices({
+			runtimeSupervisor: supervisor as never,
+			stateStore,
+			permissionStore,
+			capabilityBroker,
+			hostServices,
+		});
+		const manager = new PluginManager({
+			root: storeRoot,
+			disabled: false,
+			stateStore,
+			permissionStore,
+			hostServices,
+			runtimeSupervisor: supervisor,
+			runtimeOptionsFactory: async (context) => ({
+				pluginId: context.pluginId,
+				pluginVersion: context.manifest.version,
+				packageDigest: context.package.hash,
+				command: ["fake-runtime"],
+				cwd: context.packagePath,
+				dispatcher: unsafeDispatcher,
+			}),
+			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
+			restorePluginLifecycle: platform.restorePlugin,
+		});
+		const source = await makePackage(root, pluginId, (manifest) => {
+			(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+		});
+		await manager.install(source);
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+		const runtime = supervisor.get(pluginId);
+		if (!runtime) throw new Error("Runtime was not registered");
+		const runtimeId = runtime.runtimeId;
+		expect(hostServices.hasRuntimeBinding(pluginId, runtimeId)).toBe(true);
+		expect(capabilityBroker.hasBinding(pluginId, runtimeId)).toBe(true);
+
+		// Simulate the supervisor's idle-timeout restart: the same runtime object
+		// starts again, bumping the generation and emitting "active".
+		const generationBefore = runtime.generation;
+		await supervisor.start(pluginId);
+		expect(runtime.generation).toBe(generationBefore + 1);
+
+		// handleRuntimeStateChange is fire-and-forget from the onStateChange
+		// wrapper, so yield until the revoke+rebind settles.
+		await sleep(50);
+
+		// After the generation change the manager must have revoked the stale
+		// binding and re-registered it for the (still same) runtimeId.
+		expect(hostServices.hasRuntimeBinding(pluginId, runtimeId)).toBe(true);
+		expect(capabilityBroker.hasBinding(pluginId, runtimeId)).toBe(true);
+		const binding = hostServices.getRuntimeBinding(pluginId, runtimeId);
+		expect(binding?.plugin.runtimeGeneration).toBe(runtime.generation);
+	});
+
+	test("reconciles host access when an active runtime lost its binding", async () => {
+		const root = await makeTempRoot();
+		const storeRoot = join(root, "plugins");
+		const pluginId = "com.example.active-binding-heal";
+		const supervisor = new FakeSupervisor();
+		const stateStore = new PluginStateStore(storeRoot);
+		const permissionStore = new PluginPermissionStore({ root: storeRoot, stateStore });
+		const capabilityBroker = new CapabilityBroker();
+		const hostServices = new PluginHostServices({ capabilityBroker, permissionStore });
+		const unsafeDispatcher = new PluginHostDispatcher({
+			identity: { pluginId, runtimeId: "unsafe-runtime", runtimeGeneration: 0 },
+			methods: { unsafe: { method: "unsafe", handler: async () => ({ allowed: true }) } },
+		});
+		const platform = createPluginPlatformServices({
+			runtimeSupervisor: supervisor as never,
+			stateStore,
+			permissionStore,
+			capabilityBroker,
+			hostServices,
+		});
+		const manager = new PluginManager({
+			root: storeRoot,
+			disabled: false,
+			stateStore,
+			permissionStore,
+			hostServices,
+			runtimeSupervisor: supervisor,
+			runtimeOptionsFactory: async (context) => ({
+				pluginId: context.pluginId,
+				pluginVersion: context.manifest.version,
+				packageDigest: context.package.hash,
+				command: ["fake-runtime"],
+				cwd: context.packagePath,
+				dispatcher: unsafeDispatcher,
+			}),
+			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
+			restorePluginLifecycle: platform.restorePlugin,
+		});
+		const source = await makePackage(root, pluginId, (manifest) => {
+			(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+		});
+		await manager.install(source);
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+		const runtime = supervisor.get(pluginId);
+		if (!runtime) throw new Error("Runtime was not registered");
+		expect(hostServices.hasRuntimeBinding(pluginId, runtime.runtimeId)).toBe(true);
+
+		// Simulate a revocation that removed the host binding and plugin-level
+		// broker access while the runtime kept running (crash revoke followed
+		// by a failed restart leaves exactly this stuck state).
+		hostServices.revokeRuntime(pluginId, runtime.runtimeId);
+		capabilityBroker.revoke(pluginId);
+		expect(hostServices.hasRuntimeBinding(pluginId, runtime.runtimeId)).toBe(false);
+
+		// Re-activating while the runtime is already active must heal access.
+		const status = await manager.activate(pluginId);
+		expect(status.runtimeState).toBe("active");
+		expect(hostServices.hasRuntimeBinding(pluginId, runtime.runtimeId)).toBe(true);
+		const binding = hostServices.getRuntimeBinding(pluginId, runtime.runtimeId);
+		expect(binding?.plugin.runtimeGeneration).toBe(runtime.generation);
+		if (!binding) throw new Error("Runtime binding was not healed");
+		const allowed = await binding.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "healed-by-activate",
+			method: "diagnostics.getOwn",
+			params: {},
+		});
+		expect("result" in allowed).toBe(true);
+	});
+
+	test("heals a same-generation active event after the binding was torn down", async () => {
+		const root = await makeTempRoot();
+		const storeRoot = join(root, "plugins");
+		const pluginId = "com.example.active-event-heal";
+		const supervisor = new FakeSupervisor();
+		const stateStore = new PluginStateStore(storeRoot);
+		const permissionStore = new PluginPermissionStore({ root: storeRoot, stateStore });
+		const capabilityBroker = new CapabilityBroker();
+		const hostServices = new PluginHostServices({ capabilityBroker, permissionStore });
+		const unsafeDispatcher = new PluginHostDispatcher({
+			identity: { pluginId, runtimeId: "unsafe-runtime", runtimeGeneration: 0 },
+			methods: { unsafe: { method: "unsafe", handler: async () => ({ allowed: true }) } },
+		});
+		const platform = createPluginPlatformServices({
+			runtimeSupervisor: supervisor as never,
+			stateStore,
+			permissionStore,
+			capabilityBroker,
+			hostServices,
+		});
+		const manager = new PluginManager({
+			root: storeRoot,
+			disabled: false,
+			stateStore,
+			permissionStore,
+			hostServices,
+			runtimeSupervisor: supervisor,
+			runtimeOptionsFactory: async (context) => ({
+				pluginId: context.pluginId,
+				pluginVersion: context.manifest.version,
+				packageDigest: context.package.hash,
+				command: ["fake-runtime"],
+				cwd: context.packagePath,
+				dispatcher: unsafeDispatcher,
+			}),
+			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
+			restorePluginLifecycle: platform.restorePlugin,
+		});
+		const source = await makePackage(root, pluginId, (manifest) => {
+			(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+		});
+		await manager.install(source);
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+		const runtime = supervisor.get(pluginId);
+		if (!runtime) throw new Error("Runtime was not registered");
+		hostServices.revokeRuntime(pluginId, runtime.runtimeId);
+		capabilityBroker.revoke(pluginId);
+		expect(hostServices.hasRuntimeBinding(pluginId, runtime.runtimeId)).toBe(false);
+
+		// A same-generation "active" notification (no generation bump) must
+		// trigger reconciliation instead of being skipped: this is what the
+		// runtime emits after a restart whose generation persisted state
+		// already covered.
+		const beforeActive = runtime.state;
+		runtime.state = "active";
+		runtime.options.onStateChange?.("active", beforeActive);
+		await sleep(50);
+
+		expect(hostServices.hasRuntimeBinding(pluginId, runtime.runtimeId)).toBe(true);
+		const binding = hostServices.getRuntimeBinding(pluginId, runtime.runtimeId);
+		expect(binding?.plugin.runtimeGeneration).toBe(runtime.generation);
+		if (!binding) throw new Error("Runtime binding was not healed");
+		const allowed = await binding.dispatcher.dispatch({
+			jsonrpc: "2.0",
+			id: "healed-by-event",
+			method: "diagnostics.getOwn",
+			params: {},
+		});
+		expect("result" in allowed).toBe(true);
+	});
+
+	test("activate after an upgrade starts the new package command, not the stale record", async () => {
+		const root = await makeTempRoot();
+		const storeRoot = join(root, "plugins");
+		const pluginId = "com.example.upgrade-restart";
+		const supervisor = new FakeSupervisor();
+		const stateStore = new PluginStateStore(storeRoot);
+		const permissionStore = new PluginPermissionStore({ root: storeRoot, stateStore });
+		const capabilityBroker = new CapabilityBroker();
+		const hostServices = new PluginHostServices({ capabilityBroker, permissionStore });
+		const platform = createPluginPlatformServices({
+			runtimeSupervisor: supervisor as never,
+			stateStore,
+			permissionStore,
+			capabilityBroker,
+			hostServices,
+		});
+		const manager = new PluginManager({
+			root: storeRoot,
+			disabled: false,
+			stateStore,
+			permissionStore,
+			hostServices,
+			runtimeSupervisor: supervisor,
+			runtimeOptionsFactory: async (context) => ({
+				pluginId: context.pluginId,
+				pluginVersion: context.manifest.version,
+				packageDigest: context.package.hash,
+				command: ["fake-runtime", context.package.hash],
+				cwd: context.packagePath,
+			}),
+			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
+			restorePluginLifecycle: platform.restorePlugin,
+		});
+
+		// First install + activate (v1).
+		const v1Source = await makePackage(root, pluginId, (manifest) => {
+			manifest.version = "1.0.0";
+			(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+		});
+		await manager.install(v1Source);
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+		const v1Runtime = supervisor.get(pluginId);
+		if (!v1Runtime) throw new Error("Runtime was not registered after first activate");
+		expect(v1Runtime.options.command.join(" ")).toContain(v1Runtime.options.command[1]);
+
+		// Upgrade to v2: install a new package over the same pluginId, then activate.
+		const v2Source = await makePackage(root, pluginId, (manifest) => {
+			manifest.version = "2.0.0";
+			(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+		});
+		await manager.install(v2Source);
+		await manager.enable(pluginId);
+		await manager.activate(pluginId);
+
+		const v2Runtime = supervisor.get(pluginId);
+		if (!v2Runtime) throw new Error("Runtime was not registered after upgrade");
+		// The upgraded package must be the one running — the stale v1 record must
+		// have been replaced instead of restarted.
+		expect(v2Runtime.options.command.join(" ")).not.toContain(v1Runtime.options.command[1]);
+		expect(v2Runtime.options.command[1]).not.toBe(v1Runtime.options.command[1]);
+		const status = await manager.getStatus(pluginId);
+		expect(status?.current?.version).toBe("2.0.0");
+	});
+
+	test("approve writes the canonical grant to the DB authority, surviving a manager rebuild", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.approve-canonical";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+			}),
+		);
+		const installationId = await manager.getCurrentInstallationId(pluginId);
+		// Simulate a runtime capability request that surfaced as a pending request.
+		const pending = await manager["permissionStore"].addPendingRequest(pluginId, installationId, {
+			capability: "query.read.projects",
+			scope: { type: "global" },
+			requestedByRuntimeId: "rt-test",
+		});
+		await manager.approvePermissionRequest(pluginId, pending.requestId, "admin-approve");
+
+		// The canonical grant must live in the DB authority, not only the mirror.
+		const snapshot = await integrationAuthorityService.getSnapshot(
+			pluginInstallationAuthorityId(pluginId, installationId),
+		);
+		expect(snapshot?.grants.some((grant) => grant.capabilityId === "project.read")).toBe(true);
+
+		// A brand-new manager over the same root re-reads the authority and still
+		// sees the approved grant (a mirror-only grant would be lost here).
+		const rebuilt = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		const permissions = await rebuilt.getPermissions(pluginId);
+		expect(permissions.installationId).toBe(installationId);
+		expect(
+			permissions.grants.some(
+				(grant) =>
+					grant.capability === "query.read.projects" && grant.grantedBy === "admin-approve",
+			),
+		).toBe(true);
+	});
+
+	test("restores the stable UUID from the authority and retires legacy hash authorities on initialize", async () => {
+		const root = await makeTempRoot();
+		const pluginId = "com.example.legacy-restore";
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		const installed = await manager.install(
+			await makePackage(root, pluginId, (manifest) => {
+				(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
+			}),
+		);
+		const uuid = await manager.getCurrentInstallationId(pluginId);
+		const hash = installed.current?.hash;
+		if (!hash) throw new Error("Installed plugin has no package hash");
+
+		// Simulate a legacy state that lost its UUID (crash between authority
+		// write and state write, or a pre-UUID state file) while a legacy
+		// hash-keyed authority still exists.
+		const statePath = join(root, "plugins", "state.json");
+		const state = JSON.parse(await readFile(statePath, "utf8")) as {
+			plugins: Record<string, Record<string, unknown>>;
+		};
+		const pluginState = state.plugins[pluginId] as Record<string, unknown>;
+		delete pluginState.installationId;
+		await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`);
+		const legacyAuthorityId = pluginInstallationAuthorityId(pluginId, hash);
+		await integrationAuthorityService.create({
+			id: legacyAuthorityId,
+			kind: "plugin_installation",
+			integrationId: pluginId,
+			metadataJson: { installationId: hash },
+			grants: [
+				{
+					id: "legacy-grant",
+					capabilityId: "diagnostics.read",
+					scope: { type: "global" },
+					createdBy: { type: "system" },
+				},
+			],
+		});
+
+		const manager2 = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		await manager2.initialize();
+		// The UUID is restored from the existing authority instead of a new one.
+		expect(await manager2.getCurrentInstallationId(pluginId)).toBe(uuid);
+		// The legacy hash-keyed authority is retired so only one identity root lives on.
+		const legacy = await integrationAuthorityService.getSnapshot(legacyAuthorityId, {
+			includeExpired: true,
+		});
+		expect(legacy?.authority.state).toBe("revoked");
 	});
 });
