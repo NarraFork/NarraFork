@@ -164,6 +164,42 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(historyJson).toContain("Visible assistant reply");
 	});
 
+	test("buildHistory replays gateway-minted encrypted reasoning on relay models when the signature matches", async () => {
+		// deepseek classifies as a plain-text relay, but the stored reasoning carries
+		// an encrypted_content minted by this same gateway (Console Go-style Codex
+		// endpoints do this for relay models too). It must be replayed verbatim —
+		// degrading it to assistant text makes the gateway reject the turn with
+		// "reasoning_text in the thinking mode must be passed back".
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const dbMessages: DbMessage[] = [
+			makeAssistantMessage({
+				contentJson: [
+					{
+						type: "reasoning",
+						text: "Hidden reasoning",
+						providerMetadata: {
+							signatureSource: "openai", // matches TEST_PROVIDER.prefix
+							openai: {
+								itemId: "rs_relay_hist",
+								reasoningEncryptedContent: "enc_relay_hist",
+							},
+						},
+					},
+					{ type: "text", text: "Visible assistant reply" },
+				],
+				contentText: "Visible assistant reply",
+			}),
+		];
+
+		const result = await provider.buildHistory(dbMessages, "openai:deepseek-chat");
+		const historyJson = JSON.stringify(result.history);
+
+		expect(historyJson).toContain('"type":"reasoning"');
+		expect(historyJson).toContain('"id":"rs_relay_hist"');
+		expect(historyJson).toContain('"encrypted_content":"enc_relay_hist"');
+		expect(historyJson).toContain("Visible assistant reply");
+	});
+
 	test("buildHistory handles assistant message with reasoning but no text", async () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
 		const dbMessages: DbMessage[] = [
@@ -422,6 +458,39 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(JSON.stringify(history[0])).toContain("Fallback reasoning");
 		expect(JSON.stringify(history[0])).toContain("Visible reply");
 		expect(JSON.stringify(history[0])).not.toContain('"type":"reasoning"');
+	});
+
+	test("pushAssistantTurn replays gateway-minted encrypted reasoning verbatim on relay models", () => {
+		// Some Codex-compatible gateways (e.g. Console Go) mint encrypted_content even
+		// for model names that classify as plain-text relays (deepseek here). They
+		// reject a follow-up turn that degrades the reasoning to assistant text
+		// ("reasoning_text in the thinking mode must be passed back"), so the item
+		// must be replayed verbatim with its credential.
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		provider.noteActiveModel("openai:deepseek-chat");
+		const history: unknown[] = [];
+
+		provider.pushAssistantTurn(
+			history,
+			"Visible reply",
+			[],
+			[
+				{
+					text: "Hidden reasoning",
+					providerMetadata: {
+						openai: { itemId: "rs_relay_1", reasoningEncryptedContent: "enc_relay_1" },
+					},
+				},
+			],
+		);
+
+		expect(history).toHaveLength(2);
+		const json = JSON.stringify(history);
+		expect(json).toContain('"type":"reasoning"');
+		expect(json).toContain('"id":"rs_relay_1"');
+		expect(json).toContain('"encrypted_content":"enc_relay_1"');
+		expect(json).toContain('"summary_text"');
+		expect(json).toContain("Hidden reasoning");
 	});
 
 	test("buildHistory replays web_search as native responses items", async () => {
