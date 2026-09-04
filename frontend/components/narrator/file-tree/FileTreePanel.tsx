@@ -13,12 +13,13 @@
  */
 
 import { Center, Text } from "@mantine/core";
-import { useCallback, useRef } from "react";
+import { useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { useNarrator } from "../../../hooks/useNarrator";
+import { useFileTreeStatus, useNarrator } from "../../../hooks/useNarrator";
 import { useNarratorWS } from "../../../hooks/useNarratorWS";
 import { FileTreeContent } from "./FileTreeContent";
 import type { TreeChange } from "./tree-patch";
+import { buildTreeLineStats } from "./tree-store";
 
 export interface FileTreePanelProps {
 	narratorId: string;
@@ -33,6 +34,18 @@ export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: Fi
 	const { data: narrator } = useNarrator(narratorId);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator entity
 	const root = ((narrator as any)?.cwd as string | undefined)?.trim() ?? "";
+	const { data: fileTreeStatus, refetch: refetchFileTreeStatus } = useFileTreeStatus(
+		narratorId,
+		!!root,
+		root,
+	);
+	const lineStats = useMemo(
+		() => buildTreeLineStats(fileTreeStatus?.files ?? []),
+		[fileTreeStatus?.files],
+	);
+	const refreshLineStats = useCallback(() => {
+		void refetchFileTreeStatus();
+	}, [refetchFileTreeStatus]);
 
 	// The tree publishes its patch entry point here; held in a ref because the WS
 	// callback must not re-subscribe every time the tree re-renders.
@@ -51,7 +64,11 @@ export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: Fi
 			// Dropped when the tree has not mounted its store yet: there is nothing to
 			// patch, and the first read will see the current filesystem anyway.
 			ingestRef.current?.(changes, truncated);
+			refreshLineStats();
 		},
+		// Stage/unstage/commit can change the Git figures without changing file bytes,
+		// so the path feed alone is not enough to keep the annotations current.
+		onGitStatus: refreshLineStats,
 	});
 
 	if (!root) {
@@ -71,6 +88,9 @@ export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: Fi
 			key={root}
 			root={root}
 			showHidden={showHidden}
+			lineStats={lineStats}
+			lineStatsTruncated={fileTreeStatus?.truncated === true}
+			onRefreshLineStats={refreshLineStats}
 			onOpenFile={onOpenFile}
 			registerIngest={registerIngest}
 		/>

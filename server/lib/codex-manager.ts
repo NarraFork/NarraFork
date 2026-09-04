@@ -27,6 +27,7 @@ import { isCodexPersonalAccessToken } from "./codex-pat";
 import {
 	CodexUsageFetchError,
 	type CodexUsageResult,
+	consumeCodexResetCredit,
 	fetchCodexUsage,
 	isUnauthorizedCodexUsageError,
 } from "./codex-usage";
@@ -1940,16 +1941,40 @@ export class CodexManager {
 		entry.usageHistory = history;
 	}
 
-	private async refreshUsage(id: string): Promise<CodexUsageResult> {
-		const entry = this.entries.find((e) => e.id === id);
-		if (!entry) throw new Error(`Credential not found: ${id}`);
-
-		// Agent Identity credentials authenticate with a signed AgentAssertion header
-		// instead of a bearer token. sub2api queries the same usage endpoint for
-		// these accounts by swapping in the assertion, so we mirror that here
-		// rather than skipping usage tracking for them.
+	/**
+	 * Resolve the authentication inputs for a wham/* backend request (usage,
+	 * reset-credit consume): a bearer access token for OAuth/PAT credentials, or
+	 * a signed AgentAssertion authorization override for Agent Identity ones.
+	 * Ensures the OAuth token is refreshed and the agent task id registered.
+	 */
+	private async resolveUsageRequestAuth(
+		id: string,
+		entry: CodexCredential,
+	): Promise<{ accessToken: string; accountId: string; proxy?: string; authorization?: string }> {
 		if (getCodexAuthMode(entry) === "agent_identity") {
-			return this.refreshAgentIdentityUsage(id, entry);
+			const runtimeId = normalizeOptionalString(entry.agentRuntimeId);
+			const rawPrivateKey = normalizeOptionalString(entry.agentPrivateKey);
+			if (!runtimeId || !rawPrivateKey) {
+				throw new Error("Agent identity runtime id or private key is missing");
+			}
+			if (!entry.accountId) {
+				throw new Error("Account ID not available for this credential");
+			}
+
+			const privateKey = parseAgentPrivateKey(rawPrivateKey);
+			await this.ensureAgentIdentityTask(entry, runtimeId, privateKey);
+			const taskId = normalizeOptionalString(entry.taskId);
+			if (!taskId) {
+				throw new Error("Agent identity task id is unavailable");
+			}
+			const authorization = buildAgentAssertion({ runtimeId, privateKey, taskId });
+
+			const { resolveOverride } = await import("./net/proxy");
+			const { settings } = await import("./settings");
+			const proxy = resolveOverride(settings.codex?.proxy);
+			// `authorization` overrides the Authorization header entirely, so the
+			// accessToken positional arg is unused for Agent Identity — pass "".
+			return { accessToken: "", accountId: entry.accountId, proxy, authorization };
 		}
 
 		// Ensure we have a valid access token. Access-token-only imports never refresh;
@@ -1988,7 +2013,23 @@ export class CodexManager {
 			throw new Error("Access token not available");
 		}
 
-		const usage = await fetchCodexUsage(entry.accessToken, entry.accountId, proxy);
+		return { accessToken: entry.accessToken, accountId: entry.accountId, proxy };
+	}
+
+	private async refreshUsage(id: string): Promise<CodexUsageResult> {
+		const entry = this.entries.find((e) => e.id === id);
+		if (!entry) throw new Error(`Credential not found: ${id}`);
+
+		// Agent Identity credentials authenticate with a signed AgentAssertion header
+		// instead of a bearer token. sub2api queries the same usage endpoint for
+		// these accounts by swapping in the assertion, so we mirror that here
+		// rather than skipping usage tracking for them.
+		if (getCodexAuthMode(entry) === "agent_identity") {
+			return this.refreshAgentIdentityUsage(id, entry);
+		}
+
+		const auth = await this.resolveUsageRequestAuth(id, entry);
+		const usage = await fetchCodexUsage(auth.accessToken, auth.accountId, auth.proxy);
 		return this.applyUsageResult(id, entry, usage);
 	}
 
@@ -2002,35 +2043,14 @@ export class CodexManager {
 		id: string,
 		entry: CodexCredential,
 	): Promise<CodexUsageResult> {
-		const runtimeId = normalizeOptionalString(entry.agentRuntimeId);
-		const rawPrivateKey = normalizeOptionalString(entry.agentPrivateKey);
-		if (!runtimeId || !rawPrivateKey) {
-			throw new Error("Agent identity runtime id or private key is missing");
-		}
-		if (!entry.accountId) {
-			throw new Error("Account ID not available for this credential");
-		}
-
-		const privateKey = parseAgentPrivateKey(rawPrivateKey);
-		await this.ensureAgentIdentityTask(entry, runtimeId, privateKey);
-		const taskId = normalizeOptionalString(entry.taskId);
-		if (!taskId) {
-			throw new Error("Agent identity task id is unavailable");
-		}
-		const authorization = buildAgentAssertion({ runtimeId, privateKey, taskId });
-
-		const { resolveOverride } = await import("./net/proxy");
-		const { settings } = await import("./settings");
-		const proxy = resolveOverride(settings.codex?.proxy);
+		const auth = await this.resolveUsageRequestAuth(id, entry);
 
 		try {
-			// `authorization` overrides the Authorization header entirely, so the
-			// accessToken positional arg is unused for Agent Identity — pass "".
 			const usage = await fetchCodexUsage(
-				/* accessToken */ "",
-				entry.accountId,
-				proxy,
-				authorization,
+				auth.accessToken,
+				auth.accountId,
+				auth.proxy,
+				auth.authorization,
 			);
 			return this.applyUsageResult(id, entry, usage);
 		} catch (err) {
@@ -2045,22 +2065,18 @@ export class CodexManager {
 				(await this.recoverAgentIdentityTask(id, 401, recoveryBody));
 			if (!recovered) throw err;
 
-			const recoveredTaskId = normalizeOptionalString(entry.taskId);
-			if (!recoveredTaskId) throw err;
-			const recoveredAuthorization = buildAgentAssertion({
-				runtimeId,
-				privateKey,
-				taskId: recoveredTaskId,
-			});
+			// Recovery re-registered the task id on the entry; resolving again builds
+			// a fresh assertion with it.
+			const recoveredAuth = await this.resolveUsageRequestAuth(id, entry);
 			logger.info("Codex agent identity usage task recovered; retrying usage", {
 				credentialId: id,
 				accountId: entry.accountId,
 			});
 			const usage = await fetchCodexUsage(
-				/* accessToken */ "",
-				entry.accountId,
-				proxy,
-				recoveredAuthorization,
+				recoveredAuth.accessToken,
+				recoveredAuth.accountId,
+				recoveredAuth.proxy,
+				recoveredAuth.authorization,
 			);
 			return this.applyUsageResult(id, entry, usage);
 		}
@@ -2101,6 +2117,84 @@ export class CodexManager {
 
 	async getUsage(id: string): Promise<CodexUsageResult> {
 		return this.refreshUsageDeduplicated(id);
+	}
+
+	/**
+	 * Consume one rate-limit reset credit, immediately resetting the upstream
+	 * quota window(s). Afterwards refreshes usage (best-effort) so the persisted
+	 * snapshot reflects the reset windows and the remaining credit count.
+	 */
+	async consumeResetCredit(id: string): Promise<{
+		code: string;
+		windowsReset: number;
+		resetCreditsAvailable?: number;
+	}> {
+		const entry = this.entries.find((e) => e.id === id);
+		if (!entry) throw new Error(`Credential not found: ${id}`);
+
+		const result = await this.consumeResetCreditWithRecovery(id, entry);
+
+		let resetCreditsAvailable: number | undefined;
+		try {
+			// A usage fetch that started BEFORE the reset would resolve with the
+			// pre-reset snapshot — and the dedup map would hand it to us as the
+			// "fresh" state. Wait for any such in-flight refresh to settle, then
+			// fetch fresh: the later write wins, so the persisted snapshot and the
+			// value reported back to the UI both describe the reset windows.
+			const inFlight = this.usageRefreshPromises.get(id);
+			if (inFlight) await inFlight.catch(() => {});
+			const usage = await this.refreshUsageDeduplicated(id);
+			resetCreditsAvailable = usage.reset_credits_available;
+		} catch (err) {
+			logger.warn("Failed to refresh Codex usage after reset credit consume", {
+				credentialId: id,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+
+		return { code: result.code, windowsReset: result.windowsReset, resetCreditsAvailable };
+	}
+
+	/**
+	 * The consume call itself, with the same single retry on a stale agent-identity
+	 * task that {@link refreshAgentIdentityUsage} has: without it, an invalidated
+	 * task registration makes every reset fail 401 until the user happens to run a
+	 * usage query (the only other path that recovers the task).
+	 */
+	private async consumeResetCreditWithRecovery(
+		id: string,
+		entry: CodexCredential,
+	): Promise<{ code: string; windowsReset: number }> {
+		const auth = await this.resolveUsageRequestAuth(id, entry);
+		try {
+			return await consumeCodexResetCredit(
+				auth.accessToken,
+				auth.accountId,
+				auth.proxy,
+				auth.authorization,
+			);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			const recoveryBody =
+				err instanceof CodexUsageFetchError && err.responseBody ? err.responseBody : message;
+			const recovered =
+				getCodexAuthMode(entry) === "agent_identity" &&
+				isUnauthorizedCodexUsageError(err) &&
+				(await this.recoverAgentIdentityTask(id, 401, recoveryBody));
+			if (!recovered) throw err;
+
+			const recoveredAuth = await this.resolveUsageRequestAuth(id, entry);
+			logger.info("Codex agent identity task recovered; retrying reset credit consume", {
+				credentialId: id,
+				accountId: entry.accountId,
+			});
+			return consumeCodexResetCredit(
+				recoveredAuth.accessToken,
+				recoveredAuth.accountId,
+				recoveredAuth.proxy,
+				recoveredAuth.authorization,
+			);
+		}
 	}
 
 	/**

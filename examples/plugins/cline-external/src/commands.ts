@@ -67,9 +67,36 @@ export interface CommandSecretWrite {
 	value: string | null;
 }
 
+/**
+ * A JSON value, as the host's `jsonValueSchema` understands it.
+ *
+ * Defined locally rather than imported: this plugin shares no module with the host, so the
+ * shape is restated here and the host validates it again on receipt.
+ */
+export type JsonValue =
+	| string
+	| number
+	| boolean
+	| null
+	| JsonValue[]
+	| { [key: string]: JsonValue };
+
+/**
+ * A non-secret provider config mutation the host should persist. `null` clears the field.
+ *
+ * The host derives the writable namespace from what the plugin contributed and refuses keys
+ * that name a *secret* field, so the two channels stay disjoint rather than overlapping.
+ */
+export interface CommandConfigWrite {
+	key: string;
+	value: JsonValue | null;
+}
+
 export interface CommandOutcome {
 	output: unknown;
 	secretWrites?: CommandSecretWrite[];
+	/** Non-secret provider config the host should persist. */
+	configWrites?: CommandConfigWrite[];
 }
 
 export class CommandInputError extends Error {
@@ -370,6 +397,10 @@ async function setEnabledModels(input: unknown): Promise<CommandOutcome> {
 			// in the picker than were saved.
 			servedToAgent: Math.min(models.length, MAX_MODELS),
 			truncated: models.length > MAX_MODELS,
+			// The write below goes through the host, which refreshes this provider's catalog after
+			// applying it (`refreshCatalogsAfterCommandWrites`). Told to the view as metadata so it
+			// can explain a briefly stale model picker without seeing the write itself.
+			catalogSync: { requested: true },
 		},
 		secretWrites: [{ key: ENABLED_MODELS_KEY, value }],
 	};

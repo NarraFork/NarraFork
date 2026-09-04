@@ -11,6 +11,7 @@ import { describe, expect, it } from "bun:test";
 import { TREE_ROOT_KEY, type TreeChange } from "./tree-patch";
 import {
 	applyTreePatch,
+	buildTreeLineStats,
 	emptyTreeState,
 	ingestChanges,
 	loadedDirs,
@@ -43,6 +44,34 @@ function seeded(): TreeState {
 const changed = (path: string, kind: TreeChange["kind"] = "updated"): TreeChange[] => [
 	{ path, kind },
 ];
+
+describe("buildTreeLineStats", () => {
+	it("indexes files and aggregates every ancestor directory", () => {
+		const stats = buildTreeLineStats([
+			{ path: "src/a.ts", linesAdded: 3, linesRemoved: 1 },
+			{ path: "src/nested/b.ts", linesAdded: 2, linesRemoved: 4 },
+			{ path: "./docs/readme.md", linesAdded: 1, linesRemoved: 0 },
+		]);
+
+		expect(stats.get("src/a.ts")).toEqual({ added: 3, removed: 1 });
+		expect(stats.get("src/nested/b.ts")).toEqual({ added: 2, removed: 4 });
+		expect(stats.get("src/nested")).toEqual({ added: 2, removed: 4 });
+		expect(stats.get("src")).toEqual({ added: 5, removed: 5 });
+		expect(stats.get("docs/readme.md")).toEqual({ added: 1, removed: 0 });
+		expect(stats.get("docs")).toEqual({ added: 1, removed: 0 });
+	});
+
+	it("ignores paths outside the tree instead of attaching them to a parent", () => {
+		const stats = buildTreeLineStats([
+			{ path: "../outside.ts", linesAdded: 9, linesRemoved: 2 },
+			{ path: "/absolute.ts", linesAdded: 4, linesRemoved: 0 },
+		]);
+
+		expect(stats.has("../outside.ts")).toBe(false);
+		expect(stats.has("/absolute.ts")).toBe(false);
+		expect(stats.has("absolute.ts")).toBe(false);
+	});
+});
 
 describe("setDirEntries", () => {
 	it("records a listing as fresh", () => {
@@ -224,5 +253,23 @@ describe("staleDirs", () => {
 describe("loadedDirs", () => {
 	it("reports exactly the loaded keys, bounding any patch's work", () => {
 		expect([...loadedDirs(seeded())].sort()).toEqual([TREE_ROOT_KEY, "src", "src/a"]);
+	});
+});
+
+describe("file-tree line-stat wiring", () => {
+	it("fetches status for the narrator and refreshes it from both workspace signals", async () => {
+		const panel = await Bun.file(new URL("./FileTreePanel.tsx", import.meta.url)).text();
+		expect(panel).toContain("useFileTreeStatus(");
+		expect(panel).toContain("onWorkspacePathsChanged");
+		expect(panel).toContain("onGitStatus: refreshLineStats");
+		expect(panel).toContain("lineStats={lineStats}");
+	});
+
+	it("paints added and removed counts beside both file and directory rows", async () => {
+		const content = await Bun.file(new URL("./FileTreeContent.tsx", import.meta.url)).text();
+		expect(content).toContain("lineStats?.get(entry.path)");
+		expect(content).toContain("+{stats.added}");
+		expect(content).toContain("-{stats.removed}");
+		expect(content).toContain("entry.isDirectory && lineStatsTruncated");
 	});
 });

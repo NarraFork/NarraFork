@@ -176,8 +176,6 @@ function WorkspacePage() {
 	// layout save. Both are gone — `workspace-panel-service` now writes the panel row
 	// and its projection in one transaction.
 
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-	const serverUpdatedAt = (workspace as any)?.updatedAt as number | undefined;
 	const treeJson = workspace?.layout ?? workspace?.tree;
 	const panels = workspace?.panels ?? EMPTY_PANELS;
 	const layoutRevision = workspace?.layoutRevision ?? 0;
@@ -301,7 +299,6 @@ function WorkspacePage() {
 						panels={panels}
 						treeJson={treeJson}
 						layoutRevision={layoutRevision}
-						serverUpdatedAt={serverUpdatedAt}
 						directorControlRef={directorControlRef}
 						onMembershipChanged={handleMembershipChanged}
 						onPanelsChange={handlePanelsChange}

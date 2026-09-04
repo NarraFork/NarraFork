@@ -39,6 +39,7 @@ import { notifications } from "@mantine/notifications";
 import {
 	IconArchive,
 	IconArchiveOff,
+	IconBolt,
 	IconCheck,
 	IconCpu,
 	IconDeviceFloppy,
@@ -429,6 +430,7 @@ export const CodexSection = React.memo(function CodexSection({
 	const canSetFingerprint = isCodexRouteSupported("fingerprint");
 	const canSetTierOrder = isCodexRouteSupported("tierOrder");
 	const canQueryCredentialUsage = isCodexRouteSupported("credentialUsage");
+	const canConsumeResetCredit = isCodexRouteSupported("credentialResetCreditsConsume");
 	const canEnableCredential = isCodexRouteSupported("credentialEnable");
 	const canDisableCredential = isCodexRouteSupported("credentialDisable");
 	const canResetCredential = isCodexRouteSupported("credentialReset");
@@ -808,6 +810,22 @@ export const CodexSection = React.memo(function CodexSection({
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
 			notifications.show({ message: t("codexUsageSuccess"), color: "green" });
+		},
+		onError: (err: Error) => {
+			notifications.show({ message: err.message, color: "red" });
+		},
+	});
+	const consumeResetCreditMut = useMutation({
+		mutationFn: (id: string) => api.codexCredentialConsumeResetCredit(id),
+		onSuccess: (data) => {
+			qc.invalidateQueries({ queryKey: ["codex", "status"] });
+			notifications.show({
+				message: t("codexResetCreditConsumeSuccess", {
+					windowsReset: data.windowsReset,
+					remaining: data.resetCreditsAvailable ?? "?",
+				}),
+				color: "green",
+			});
 		},
 		onError: (err: Error) => {
 			notifications.show({ message: err.message, color: "red" });
@@ -1617,6 +1635,7 @@ export const CodexSection = React.memo(function CodexSection({
 											onCancelEdit={() => setEditingId(null)}
 											onEditFormChange={setEditForm}
 											usageMut={usageMut}
+											consumeResetCreditMut={consumeResetCreditMut}
 											enableMut={enableMut}
 											disableMut={disableMut}
 											resetMut={resetMut}
@@ -1628,6 +1647,7 @@ export const CodexSection = React.memo(function CodexSection({
 											onToggleSelectAll={toggleSelectAll}
 											t={t}
 											canQueryCredentialUsage={canQueryCredentialUsage}
+											canConsumeResetCredit={canConsumeResetCredit}
 											canEnableCredential={canEnableCredential}
 											canDisableCredential={canDisableCredential}
 											canResetCredential={canResetCredential}
@@ -1665,6 +1685,7 @@ export const CodexSection = React.memo(function CodexSection({
 											onCancelEdit={() => setEditingId(null)}
 											onEditFormChange={setEditForm}
 											usageMut={usageMut}
+											consumeResetCreditMut={consumeResetCreditMut}
 											enableMut={enableMut}
 											disableMut={disableMut}
 											resetMut={resetMut}
@@ -1676,6 +1697,7 @@ export const CodexSection = React.memo(function CodexSection({
 											onToggleSelectAll={toggleSelectAll}
 											t={t}
 											canQueryCredentialUsage={canQueryCredentialUsage}
+											canConsumeResetCredit={canConsumeResetCredit}
 											canEnableCredential={canEnableCredential}
 											canDisableCredential={canDisableCredential}
 											canResetCredential={canResetCredential}
@@ -1718,6 +1740,7 @@ export const CodexSection = React.memo(function CodexSection({
 											onCancelEdit={() => setEditingId(null)}
 											onEditFormChange={setEditForm}
 											usageMut={usageMut}
+											consumeResetCreditMut={consumeResetCreditMut}
 											enableMut={enableMut}
 											disableMut={disableMut}
 											resetMut={resetMut}
@@ -1729,6 +1752,7 @@ export const CodexSection = React.memo(function CodexSection({
 											onToggleSelectAll={toggleSelectAll}
 											t={t}
 											canQueryCredentialUsage={canQueryCredentialUsage}
+											canConsumeResetCredit={canConsumeResetCredit}
 											canEnableCredential={canEnableCredential}
 											canDisableCredential={canDisableCredential}
 											canResetCredential={canResetCredential}
@@ -1850,6 +1874,8 @@ interface CodexCredentialListProps {
 	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
 	usageMut: any;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
+	consumeResetCreditMut: any;
+	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
 	enableMut: any;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation types from react-query
 	disableMut: any;
@@ -1866,6 +1892,7 @@ interface CodexCredentialListProps {
 	onToggleSelectAll: (entryIds: string[]) => void;
 	t: (key: string) => string;
 	canQueryCredentialUsage: boolean;
+	canConsumeResetCredit: boolean;
 	canEnableCredential: boolean;
 	canDisableCredential: boolean;
 	canResetCredential: boolean;
@@ -1946,6 +1973,7 @@ function CredentialList(props: CodexCredentialListProps) {
 		onCancelEdit,
 		onEditFormChange,
 		usageMut,
+		consumeResetCreditMut,
 		enableMut,
 		disableMut,
 		resetMut,
@@ -1957,6 +1985,7 @@ function CredentialList(props: CodexCredentialListProps) {
 		onToggleSelectAll,
 		t,
 		canQueryCredentialUsage,
+		canConsumeResetCredit,
 		canEnableCredential,
 		canDisableCredential,
 		canResetCredential,
@@ -2126,6 +2155,35 @@ function CredentialList(props: CodexCredentialListProps) {
 														}
 													>
 														<IconRefresh size={16} />
+													</ActionIcon>
+												</Tooltip>
+												<Tooltip
+													label={tSettings("codexResetCreditConsumeTooltip", {
+														count: usage?.reset_credits_available ?? 0,
+													})}
+												>
+													<ActionIcon
+														size="sm"
+														color="violet"
+														onClick={async () => {
+															if (!canConsumeResetCredit) return;
+															if (await confirm({ message: t("codexResetCreditConsumeConfirm") })) {
+																consumeResetCreditMut.mutate(entry.id);
+															}
+														}}
+														loading={consumeResetCreditMut.isPending}
+														disabled={
+															!canConsumeResetCredit || (usage?.reset_credits_available ?? 0) <= 0
+														}
+														title={
+															!canConsumeResetCredit
+																? credentialRouteUnsupportedReason
+																: (usage?.reset_credits_available ?? 0) <= 0
+																	? t("codexResetCreditNoCredits")
+																	: undefined
+														}
+													>
+														<IconBolt size={16} />
 													</ActionIcon>
 												</Tooltip>
 												{entry.disabled ? (
@@ -2313,6 +2371,7 @@ function CredentialCards(props: CodexCredentialListProps) {
 		onCancelEdit,
 		onEditFormChange,
 		usageMut,
+		consumeResetCreditMut,
 		enableMut,
 		disableMut,
 		resetMut,
@@ -2323,6 +2382,7 @@ function CredentialCards(props: CodexCredentialListProps) {
 		onToggleSelect,
 		t,
 		canQueryCredentialUsage,
+		canConsumeResetCredit,
 		canEnableCredential,
 		canDisableCredential,
 		canResetCredential,
@@ -2498,6 +2558,32 @@ function CredentialCards(props: CodexCredentialListProps) {
 											}
 										>
 											{t("codexQueryUsage")}
+										</Button>
+										<Button
+											variant="subtle"
+											size="compact-xs"
+											color="violet"
+											onClick={async () => {
+												if (!canConsumeResetCredit) return;
+												if (await confirm({ message: t("codexResetCreditConsumeConfirm") })) {
+													consumeResetCreditMut.mutate(entry.id);
+												}
+											}}
+											loading={consumeResetCreditMut.isPending}
+											disabled={
+												!canConsumeResetCredit || (usage?.reset_credits_available ?? 0) <= 0
+											}
+											title={
+												!canConsumeResetCredit
+													? credentialRouteUnsupportedReason
+													: (usage?.reset_credits_available ?? 0) <= 0
+														? tSettings("codexResetCreditNoCredits")
+														: tSettings("codexResetCreditConsumeTooltip", {
+																count: usage?.reset_credits_available ?? 0,
+															})
+											}
+										>
+											{t("codexResetCreditConsume")}
 										</Button>
 										{entry.disabled ? (
 											<Button

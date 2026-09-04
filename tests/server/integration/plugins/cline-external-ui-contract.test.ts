@@ -88,6 +88,18 @@ describe("cline-external UI contract: commands", () => {
 			expect(command.handler, command.id).toBe("server");
 		}
 	});
+
+	test("baseUrl has no second persistence path through a plugin command", async () => {
+		// The host renders non-secret config (`baseUrl`) through its provider-config endpoint.
+		// A `config.setBaseUrl` command would give the same field two writers whose failure and
+		// validation semantics could drift.
+		const { manifest, backend, ui } = await artifacts();
+		expect(
+			manifest.contributes.commands.some((command) => command.id === "config.setBaseUrl"),
+		).toBe(false);
+		expect(backend).not.toContain("config.setBaseUrl");
+		expect(ui).not.toContain("config.setBaseUrl");
+	});
 });
 
 describe("cline-external UI contract: browserAuth", () => {
@@ -121,11 +133,18 @@ describe("cline-external UI contract: the view holds no credential authority", (
 		}
 	});
 
-	test("the view's only host method is commands.execute", async () => {
-		// A sandboxed iframe has `connect-src 'none'`, so this is also the only channel it has.
-		// Asserted so a future addition is a deliberate change rather than an accident.
+	test("the view's host methods are commands.execute plus the modelsChanged signal", async () => {
+		// A sandboxed iframe has `connect-src 'none'`, so the bridge is the only channel it has.
+		// `provider.modelsChanged` was added deliberately: after an add/remove the host must drop
+		// its settings caches or the model list below the view stays stale. Asserted as an
+		// explicit allowlist so any further addition is a deliberate change, not an accident.
 		const { ui } = await artifacts();
 		expect(ui).toContain("commands.execute");
+		expect(ui).toContain("provider.modelsChanged");
+		// The panel reports its own content height so the iframe can escape its fixed-height
+		// box; a typo here degrades to a clipped panel rather than a test failure, so the exact
+		// method name is asserted positively.
+		expect(ui).toContain("panel.setHeight");
 		for (const method of ["queries.execute", "storage.set", "config.get", "events.subscribe"]) {
 			expect(ui.includes(method), `view must not call ${method}`).toBe(false);
 		}
@@ -165,6 +184,45 @@ describe("cline-external UI contract: vault keys", () => {
 			expect(schema[field]?.writeOnly, field).toBe(true);
 			expect(schema[field]?.type, field).toBe("string");
 		}
+	});
+});
+
+describe("cline-external UI contract: host runtime and catalog sync", () => {
+	test("the provider-settings view declares the shared host React runtime", async () => {
+		const { manifest, ui } = await artifacts();
+		const view = manifest.contributes.views.find((item) => item.id === "cline-external-settings");
+		expect(view?.runtime).toBe("host-react");
+		// The built view reads the runtime from the global the shell injects; it must not carry
+		// its own React/Mantine bundle.
+		expect(ui).toContain("__nfPluginRuntime");
+	});
+
+	test("the view follows the host color scheme instead of forcing dark", async () => {
+		const { ui } = await artifacts();
+		expect(ui).not.toContain('forceColorScheme="dark"');
+		expect(ui).not.toContain("forceColorScheme: 'dark'");
+		expect(ui).not.toContain('forceColorScheme:"dark"');
+		// Overlay borders use the scheme-neutral default-border token rather than a dark palette
+		// shade, which is invisible on a light document.
+		expect(ui).toContain("--mantine-color-default-border");
+	});
+
+	test("saving enabled models asks the host to invalidate derived settings caches", async () => {
+		const { backend, ui } = await artifacts();
+		// Backend: marks the write as catalog-affecting. View: after the command resolves, the
+		// host has already applied the write and refreshed the catalog, so it is safe to drop
+		// React Query's derived settings caches.
+		expect(backend).toContain("catalogSync");
+		expect(ui).toContain("providerSettings.catalogInvalidated");
+	});
+});
+
+describe("cline-external UI contract: shell takeover", () => {
+	test("the built view clears the host splash before mounting its content", async () => {
+		// The shell splash is position:fixed and covers the entire iframe. Appending the real view
+		// below it produces a panel whose requests all succeed while the spinner remains forever.
+		const { ui } = await artifacts();
+		expect(ui).toContain("root.replaceChildren()");
 	});
 });
 

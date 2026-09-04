@@ -35,9 +35,23 @@ describe("resolveWorkspaceLayout", () => {
 		expect(resolveWorkspaceLayout(legacy).kind).toBe("none");
 	});
 
-	test("a seed envelope yields no arrangement (also server-backfilled)", () => {
-		const seed = serializeSeedEnvelope(twoNarratorWorkspaceSeed("a", "b", "right"));
-		expect(resolveWorkspaceLayout(seed).kind).toBe("none");
+	test("a seed envelope resolves to the seed branch, preserving specs and placement", () => {
+		// The seed carries PLACEMENT only (membership is server-backfilled): resolving
+		// it as "no arrangement" collapsed a freshly created workspace into one tab
+		// group, losing the split the user dragged at creation time.
+		const seedEnvelope = twoNarratorWorkspaceSeed("a", "b", "right");
+		const resolved = resolveWorkspaceLayout(serializeSeedEnvelope(seedEnvelope));
+		expect(resolved.kind).toBe("seed");
+		if (resolved.kind === "seed") {
+			expect(resolved.specs).toHaveLength(2);
+			expect(resolved.specs[0].placement).toEqual({ kind: "first" });
+			expect(resolved.specs[1].placement).toMatchObject({ kind: "relative", direction: "right" });
+			expect(resolved.director).toEqual({
+				mode: "grid",
+				primaryPanelId: null,
+				primaryRatio: DEFAULT_DIRECTOR_PRIMARY_RATIO,
+			});
+		}
 	});
 
 	test("dockview envelope → restored verbatim (legacy director without ratio → default)", () => {

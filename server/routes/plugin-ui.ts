@@ -48,6 +48,8 @@ interface PluginUiManagerLike {
 	}>;
 	/** Stable installation identity (UUID) for the plugin's current package. */
 	getCurrentInstallationId?(pluginId: string): Promise<string>;
+	/** Lazily start a server-backed plugin before its declared view begins dispatching calls. */
+	activate?(pluginId: string, options?: { reason?: string; automatic?: boolean }): Promise<unknown>;
 }
 
 export interface PluginUiRouteOptions {
@@ -514,6 +516,28 @@ function assertUiContribution(
 	return { entryPath: view.entry, ...(view.style ? { stylePath: view.style } : {}) };
 }
 
+/**
+ * Return the exact manifest event that authorizes lazy startup for this view.
+ *
+ * Creating a UI session alone does not start a plugin process. Server-backed views that call
+ * `handler: "server"` commands must therefore declare `onView`; otherwise the iframe loads but
+ * every backend call sees an inactive runtime. Both local and fully-qualified contribution IDs
+ * are accepted by the manifest contract, so the lookup mirrors the activation index aliases.
+ */
+function activationEventForView(
+	manifest: {
+		pluginId: string;
+		server?: unknown;
+		activationEvents?: readonly string[];
+	},
+	contributionId: string,
+): string | undefined {
+	if (!manifest.server) return undefined;
+	const local = `onView:${contributionId}`;
+	const qualified = `onView:${manifest.pluginId}/${contributionId}`;
+	return manifest.activationEvents?.find((event) => event === local || event === qualified);
+}
+
 export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 	const app = new Hono();
 	const auth = options.authMiddleware ?? requireSessionAuth;
@@ -824,6 +848,16 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 				user.role,
 				installationId,
 			);
+			const activationEvent = activationEventForView(pkg.manifest, body.data.contributionId);
+			if (activationEvent) {
+				if (!manager.activate) {
+					throw new AppError("Plugin runtime activation is unavailable", 503, "HOST_UNAVAILABLE");
+				}
+				await manager.activate(body.data.pluginId, {
+					automatic: true,
+					reason: activationEvent,
+				});
+			}
 			const created = sessions.create({
 				...body.data,
 				authorityInstallationId: permissions.installationId,

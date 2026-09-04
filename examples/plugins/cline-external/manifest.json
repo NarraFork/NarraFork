@@ -1,7 +1,7 @@
 {
 	"schemaVersion": 1,
 	"pluginId": "com.narrafork.cline-external",
-	"version": "0.1.0",
+	"version": "0.1.4",
 	"displayName": "Cline (External)",
 	"description": "Cline provider running as an out-of-process plugin, alongside the built-in adapter.",
 	"publisher": {
@@ -28,7 +28,7 @@
 		"startupTimeoutMs": 15000,
 		"activationTimeoutMs": 30000
 	},
-	"activationEvents": ["onProvider:cline"],
+	"activationEvents": ["onProvider:cline", "onView:cline-external-settings"],
 	"contributes": {
 		"providers": [
 			{
@@ -147,7 +147,8 @@
 				"surfaces": ["provider-settings"],
 				"scope": "global",
 				"instance": "singleton",
-				"providerId": "cline"
+				"providerId": "cline",
+				"runtime": "host-react"
 			}
 		]
 	},

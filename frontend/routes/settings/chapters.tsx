@@ -26,6 +26,8 @@ function SettingsChaptersPage() {
 				setAutoSave={is.setAutoSave}
 				dormantMinutes={is.dormantMinutes}
 				setDormantMinutes={is.setDormantMinutes}
+				treeSnapshots={is.treeSnapshots}
+				setTreeSnapshots={is.setTreeSnapshots}
 				portStart={is.portStart}
 				setPortStart={is.setPortStart}
 				portEnd={is.portEnd}

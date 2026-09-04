@@ -60,6 +60,8 @@ export interface PluginUiPresentation {
 	locale: string;
 	/** Translation lookup order, most specific first, always ending at `en`. */
 	localeChain: readonly string[];
+	/** Host Mantine color scheme, mirrored onto the iframe's `<html>`. */
+	colorScheme?: "light" | "dark";
 }
 
 type PendingRequest = {
@@ -89,12 +91,14 @@ function presentationShellOptions(presentation: PluginUiPresentation | undefined
 	locale?: string;
 	localeChain?: readonly string[];
 	tokenCss?: string;
+	colorScheme?: "light" | "dark";
 } {
 	if (!presentation) return {};
 	return {
 		...(presentation.tokenCss ? { tokenCss: presentation.tokenCss } : {}),
 		...(presentation.locale ? { locale: presentation.locale } : {}),
 		...(presentation.localeChain.length > 0 ? { localeChain: presentation.localeChain } : {}),
+		...(presentation.colorScheme ? { colorScheme: presentation.colorScheme } : {}),
 	};
 }
 
@@ -361,6 +365,16 @@ export class PluginUiSession {
 	 */
 	setThemeTokens(tokenCss: string): void {
 		this.sendNotification("host.theme", { tokenCss });
+	}
+
+	/**
+	 * Push the host color scheme into the panel.
+	 *
+	 * Token CSS alone is not enough for a host-React panel: Mantine's own components branch on
+	 * `data-mantine-color-scheme`, so the iframe's `<html>` has to mirror the host attribute.
+	 */
+	setColorScheme(colorScheme: "light" | "dark"): void {
+		this.sendNotification("host.theme", { colorScheme });
 	}
 
 	/**

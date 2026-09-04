@@ -8,7 +8,12 @@ import {
 	resolvePermissionDecision,
 	shouldTriggerDangerReflection,
 } from "../../../services/narrator-permission";
-import { analyzeBashCommand, analyzePowerShellCommand, type BashAnalysis } from "../bash-analyze";
+import {
+	analyzeBashCommand,
+	analyzePowerShellCommand,
+	type BashAnalysis,
+	isReviewReadOnlyBashAnalysis,
+} from "../bash-analyze";
 import {
 	posixPathSemantics,
 	specPathSemantics,
@@ -637,6 +642,14 @@ describe("git: destructive subcommands → block", () => {
 	test("merge", () => expectBlocked("git merge feature"));
 	test("filter-branch", () => expectBlocked("git filter-branch --all"));
 	test("reflog expire", () => expectBlocked("git reflog expire --expire=now --all"));
+	test("reflog expire behind global flag", () =>
+		expectBlocked("git -C . reflog expire --expire=now --all"));
+	test("reflog delete", () => expectBlocked("git reflog delete main@{1}"));
+	test("reflog drop", () => expectBlocked("git reflog drop stash@{0}"));
+	test("clean behind global flag", () => expectBlocked("git -C . clean -fdx"));
+	test("config injection flag -c", () => expectBlocked("git -c alias.l=!id log"));
+	test("config injection flag --git-dir", () => expectBlocked("git --git-dir=/tmp/x log"));
+	test("config injection flag --exec-path", () => expectBlocked("git --exec-path=/tmp log"));
 	test("gc --prune", () => expectBlocked("git gc --prune=now --aggressive"));
 	test("branch -D", () => expectBlocked("git branch -D main"));
 	test("branch -d", () => expectBlocked("git branch -d feature"));
@@ -763,6 +776,80 @@ describe("allReadOnly detection", () => {
 		expect(await readOnly("git push origin")).toBe(false);
 		expect(await readOnly("git checkout main")).toBe(false);
 		expect(await readOnly("git stash")).toBe(false);
+	});
+
+	test("review Bash requires Git first and permits only read-only processors", async () => {
+		const allowed = [
+			"git status",
+			"git log --oneline -5",
+			"git diff HEAD~1",
+			"git diff | head",
+			"git -C sub status",
+		];
+		for (const command of allowed) {
+			expect(isReviewReadOnlyBashAnalysis(await analyzeBashCommand(command, CWD))).toBe(true);
+		}
+		const denied = [
+			"ls -la",
+			"cat README.md",
+			"git add .",
+			"git commit -m 'x'",
+			"git ls-remote origin",
+			"git --work-tree=../outside status",
+			"git --namespace=outside status",
+			"git -C../outside status",
+			"git status && touch marker",
+			"git status && git diff",
+			"git diff > patch.diff",
+			"git log | awk '{print $1}'",
+			// 交互式分页器不在有界 formatter 集合内
+			"git log | less",
+			// 环境变量前缀对 token 分析不可见，任何前缀都整体拒绝
+			"GIT_DIR=/tmp/other git log",
+			"GIT_WORK_TREE=/tmp git status",
+			"GIT_EXTERNAL_DIFF='touch /tmp/pwned' git diff",
+			"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.log GIT_CONFIG_VALUE_0=!id git log",
+			"CUSTOM_VAR=1 git log",
+			// reflog expire/delete 销毁恢复点，-C 全局 flag 不得绕过子命令检查
+			"git -C . reflog expire --expire=now --all",
+			"git reflog delete main@{1}",
+			// 附着短选项：-o<file> 等价于 --output=<file>，任意文件写
+			"git diff -o/tmp/escape.txt",
+			"git hash-object -tw blob foo.txt",
+		];
+		for (const command of denied) {
+			expect(isReviewReadOnlyBashAnalysis(await analyzeBashCommand(command, CWD))).toBe(false);
+		}
+	});
+
+	test("dangerous git env prefixes defeat read-only", async () => {
+		const probes = [
+			"GIT_DIR=/tmp/other git log",
+			"GIT_WORK_TREE=/tmp git status",
+			"GIT_EXTERNAL_DIFF='touch /tmp/pwned' git diff",
+			"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.log GIT_CONFIG_VALUE_0=!id git log",
+			"GIT_PAGER=cat git log",
+		];
+		for (const command of probes) {
+			const analysis = await analyzeBashCommand(command, CWD);
+			expect(analysis.commandEnvVars.length).toBeGreaterThan(0);
+			expect(analysis.allReadOnly).toBe(false);
+		}
+	});
+
+	test("benign env prefix stays read-only generally but is rejected for review", async () => {
+		const analysis = await analyzeBashCommand("CUSTOM_VAR=1 git log", CWD);
+		expect(analysis.commandEnvVars).toContain("CUSTOM_VAR");
+		expect(analysis.allReadOnly).toBe(true);
+		expect(isReviewReadOnlyBashAnalysis(analysis)).toBe(false);
+	});
+
+	test("attached short-option write flags are not read-only", async () => {
+		expect(await readOnly("git diff -o/tmp/escape.txt")).toBe(false);
+		expect(await readOnly("git diff --output=/tmp/escape.txt")).toBe(false);
+		expect(await readOnly("git hash-object -tw blob foo.txt")).toBe(false);
+		// 正常只读短参数不受合并字符检查误伤
+		expect(await readOnly("git log -n5")).toBe(true);
 	});
 
 	test("check tools are read-only only without write flags", async () => {
@@ -962,6 +1049,29 @@ describe("allReadOnly detection", () => {
 		expect(analyzePowerShellCommand("Get-ChildItem > out.txt", CWD).allReadOnly).toBe(false);
 		expect(analyzePowerShellCommand("Invoke-Expression 'ls'", CWD).allReadOnly).toBe(false);
 	});
+
+	test("PowerShell git -C paths feed the path scope check", () => {
+		const analysis = analyzePowerShellCommand("git -C ../outside status", CWD);
+		expect(analysis.filePaths).toContain(resolve(CWD, "../outside"));
+		expect(analyzePowerShellCommand("git -C sub status", CWD).filePaths).toContain(
+			resolve(CWD, "sub"),
+		);
+	});
+
+	test("PowerShell command substitution is conservatively dangerous", () => {
+		const analysis = analyzePowerShellCommand("git log $(Remove-Item ./dist -Recurse)", CWD);
+		expect(
+			analysis.dangerousPatterns.some((pattern) => pattern.includes("command substitution")),
+		).toBe(true);
+		expect(analysis.allReadOnly).toBe(false);
+		expect(isReviewReadOnlyBashAnalysis(analysis)).toBe(false);
+	});
+
+	test("PowerShell $env assignments are recorded as command env vars", () => {
+		const analysis = analyzePowerShellCommand('$env:GIT_DIR="C:/other"; git log', CWD);
+		expect(analysis.commandEnvVars).toContain("GIT_DIR");
+		expect(isReviewReadOnlyBashAnalysis(analysis)).toBe(false);
+	});
 });
 
 // ══════════════════════════════════════════════════════════
@@ -978,6 +1088,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		nonWhitelisted: [],
 		dangerousPatterns: [],
 		hasEnvInjection: false,
+		commandEnvVars: [],
 		isCatastrophic: false,
 		gitBranchViolations: [],
 		gitBranchWarnings: [],
@@ -992,6 +1103,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		nonWhitelisted: [],
 		dangerousPatterns: [],
 		hasEnvInjection: false,
+		commandEnvVars: [],
 		isCatastrophic: false,
 		gitBranchViolations: [],
 		gitBranchWarnings: [],
@@ -1006,6 +1118,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		nonWhitelisted: ["rm"],
 		dangerousPatterns: [],
 		hasEnvInjection: false,
+		commandEnvVars: [],
 		isCatastrophic: false,
 		gitBranchViolations: [],
 		gitBranchWarnings: [],
@@ -1022,6 +1135,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		nonWhitelisted: [],
 		dangerousPatterns: [],
 		hasEnvInjection: false,
+		commandEnvVars: [],
 		isCatastrophic: false,
 		gitBranchViolations: [],
 		gitBranchWarnings: [],
@@ -1044,6 +1158,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		nonWhitelisted: ["find"],
 		dangerousPatterns: ["find with -exec"],
 		hasEnvInjection: false,
+		commandEnvVars: [],
 		isCatastrophic: false,
 		gitBranchViolations: [],
 		gitBranchWarnings: [],
@@ -1058,6 +1173,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		nonWhitelisted: ["(env injection)"],
 		dangerousPatterns: ["dangerous env var: LD_PRELOAD"],
 		hasEnvInjection: true,
+		commandEnvVars: [],
 		isCatastrophic: false,
 		gitBranchViolations: [],
 		gitBranchWarnings: [],
@@ -1075,6 +1191,65 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				bashAnalysis: allSafe,
 			}),
 		).toBe("allow");
+	});
+
+	test("reviewReadOnlyBash allows local Git inspection regardless of permission mode", () => {
+		for (const permMode of ["default", "readOnly", "acceptEdits", "bypassPermissions"]) {
+			expect(
+				resolvePermissionDecision({
+					toolName: "Bash",
+					input: { command: "git status" },
+					permMode,
+					cwd,
+					bashAnalysis: allSafe,
+					reviewReadOnlyBash: true,
+				}),
+			).toBe("allow");
+		}
+	});
+
+	test("reviewReadOnlyBash rejects non-Git, mutating, external, and control calls", () => {
+		const cases: Array<{ input: Record<string, unknown>; analysis?: BashAnalysis }> = [
+			{
+				input: { command: "ls" },
+				analysis: { ...allSafe, commands: [{ tokens: ["ls"], text: "ls", fullText: "ls" }] },
+			},
+			{ input: { command: "git commit -m x" }, analysis: { ...allSafe, allReadOnly: false } },
+			{ input: { command: "git status", run_in_background: true }, analysis: allSafe },
+			{ input: { stop: "task-1" } },
+			{
+				input: { command: "git status" },
+				analysis: { ...allSafe, filePaths: [resolve(cwd, "../outside")] },
+			},
+			{ input: { command: "git status" }, analysis: undefined },
+		];
+		for (const { input, analysis } of cases) {
+			expect(
+				resolvePermissionDecision({
+					toolName: "Bash",
+					input,
+					permMode: "bypassPermissions",
+					cwd,
+					bashAnalysis: analysis,
+					reviewReadOnlyBash: true,
+				}),
+			).toBe("deny");
+		}
+	});
+
+	test("reviewReadOnlyBash ignores command whitelists and denies remote targets", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git status" },
+				permMode: "bypassPermissions",
+				cwd,
+				bashAnalysis: allSafe,
+				reviewReadOnlyBash: true,
+				commandWhitelist: [{ pattern: "git status", enabled: true }],
+				executionTarget: { deviceId: "remote-1" } as never,
+			}),
+		).toBe("deny");
 	});
 
 	test("default + safe write inside worktree → ask (mutations still need approval)", () => {

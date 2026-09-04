@@ -7,7 +7,7 @@ import { db } from "../../../../db";
 import { narrators } from "../../../../db/schema";
 import type { ExecutionBackend } from "../../execution/backend";
 import { targetPathSemantics } from "../../execution/path-semantics";
-import type { ToolContext, ToolDefinition } from "../../types";
+import type { AgentConfig, ToolContext, ToolDefinition } from "../../types";
 import { askUserQuestionTool } from "../ask-user-question";
 import {
 	bashTool,
@@ -859,6 +859,31 @@ describe("Grep schema validation", () => {
 // ============================================================
 
 describe("Bash", () => {
+	test("exposes review-only Git guidance and forbidden control parameters", () => {
+		const reviewConfig = { reviewReadOnlyBash: true } as AgentConfig;
+		const description =
+			typeof bashTool.description === "function"
+				? bashTool.description(reviewConfig)
+				: bashTool.description;
+		const schema = bashTool.getRawJsonSchema?.(reviewConfig);
+		const properties = schema?.properties as Record<string, { description?: string }>;
+		expect(description).toContain("local Git inspection");
+		expect(properties.command.description).toContain("read-only git invocation");
+		expect(properties.command.description).toContain("exactly one git command");
+		expect(properties.command.description).toContain("environment variable assignments");
+		expect(properties.run_in_background.description).toContain("Forbidden");
+		expect(properties.stop.description).toContain("Forbidden");
+	});
+
+	test("keeps the normal Bash description for ordinary sessions", () => {
+		const normalConfig = {} as AgentConfig;
+		const description =
+			typeof bashTool.description === "function"
+				? bashTool.description(normalConfig)
+				: bashTool.description;
+		expect(description).toContain("Executes a given bash command");
+	});
+
 	test("executes simple command", async () => {
 		const result = await bashTool.execute({ command: "echo hello" }, makeCtx());
 		expect(result.isError).toBeFalsy();

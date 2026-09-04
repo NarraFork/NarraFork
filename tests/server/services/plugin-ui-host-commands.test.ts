@@ -10,9 +10,10 @@ import type { PluginUiSession } from "@server/services/plugin-ui-session";
  *
  *  1. **A host command always wins.** Plugin dispatch is a fallback, so a plugin cannot
  *     shadow host behaviour by picking a colliding command id.
- *  2. **Secret material never reaches this class.** The dispatcher applies `secretWrites`
- *     before returning, so the UI host has nothing to leak even by accident. The contract
- *     enforces this by shape: `PluginCommandDispatcher.invoke` returns only `output`.
+ *  2. **Persisted values never reach this class.** The dispatcher applies `secretWrites`
+ *     and `configWrites` before returning, so the UI host has nothing to leak even by
+ *     accident. The contract enforces this by shape: `PluginCommandDispatcher.invoke`
+ *     returns only `output` plus post-write catalog sync metadata.
  */
 
 function makeSession(overrides: Partial<PluginUiSession> = {}): PluginUiSession {
@@ -103,6 +104,30 @@ describe("plugin UI host: plugin command dispatch", () => {
 		expect(response).toMatchObject({
 			result: { status: "succeeded", output: { modelCount: 8 } },
 		});
+	});
+
+	test("forwards post-write catalog sync metadata without exposing writes", async () => {
+		const dispatcher: PluginCommandDispatcher = {
+			has: () => true,
+			invoke: async () => ({
+				output: { saved: true },
+				catalogSync: [
+					{ providerInstanceId: "com.example.commands/cline/1/hash", ok: true, modelCount: 2 },
+				],
+			}),
+		};
+		const response = await execute(hostWith(dispatcher), "verify-credential");
+		expect(response).toMatchObject({
+			result: {
+				status: "succeeded",
+				output: { saved: true },
+				catalogSync: [
+					{ providerInstanceId: "com.example.commands/cline/1/hash", ok: true, modelCount: 2 },
+				],
+			},
+		});
+		expect(JSON.stringify(response)).not.toContain("secretWrites");
+		expect(JSON.stringify(response)).not.toContain("configWrites");
 	});
 
 	test("forwards the command input", async () => {

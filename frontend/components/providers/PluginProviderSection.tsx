@@ -56,7 +56,7 @@ import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
 
-/** Height of an embedded plugin view. Fixed so the iframe has a stable box. */
+/** Initial height of an embedded plugin view, before the plugin reports its content size. */
 const SURFACE_HEIGHT = 560;
 
 export interface PluginProviderSectionProps {
@@ -123,12 +123,11 @@ export function PluginProviderSection({
 	 * So it is fetched once here and the instance id is passed down.
 	 */
 	const configQuery = usePluginProviderConfig(pluginId);
-	const providerInstanceId = configQuery.data?.providers.find(
+	const provider = configQuery.data?.providers.find(
 		(item) => item.contributionId === contributionId,
-	)?.providerInstanceId;
-	const storedProxy = configQuery.data?.providers.find(
-		(item) => item.contributionId === contributionId,
-	)?.proxy;
+	);
+	const providerInstanceId = provider?.providerInstanceId;
+	const storedProxy = provider?.proxy;
 
 	// Contribution snapshot tells us whether the plugin ships a provider-settings view.
 	const snapshot = useSyncExternalStore(
@@ -165,10 +164,15 @@ export function PluginProviderSection({
 				/>
 			)}
 			{providerInstanceId ? (
-				<PluginProviderProxy
+				<PluginProviderAdvanced
 					pluginId={pluginId}
+					provider={provider}
 					providerInstanceId={providerInstanceId}
 					storedProxy={storedProxy}
+					// The generated fallback already shows every schema field; rendering the
+					// non-secret subset again would duplicate it. With a custom view, this is the
+					// only place ordinary connection settings remain reachable.
+					showNonSecretConfig={views.length > 0}
 				/>
 			) : null}
 			{models ? (
@@ -182,34 +186,77 @@ export function PluginProviderSection({
 	);
 }
 
+function schemaWithOnly(
+	schema: SchemaNode | undefined,
+	keep: ReadonlySet<string>,
+): SchemaNode | undefined {
+	if (!schema || typeof schema === "boolean") return schema;
+	if (
+		!schema.properties ||
+		typeof schema.properties !== "object" ||
+		Array.isArray(schema.properties)
+	)
+		return schema;
+	const properties = Object.fromEntries(
+		Object.entries(schema.properties as Record<string, unknown>).filter(([name]) => keep.has(name)),
+	);
+	return { ...schema, properties } as SchemaNode;
+}
+
 /**
- * Outbound proxy override for a plugin provider.
+ * Connection settings for a plugin provider.
  *
- * Host-rendered for the same reason the model area is: the plugin's panel cannot reach the
- * host API, and the proxy is host policy about how the host reaches upstream rather than
- * something the plugin declares. Every built-in provider has had this control through
- * `settings.<provider>.proxy`; a plugin provider previously had none and could only follow the
- * global proxy.
- *
- * The plugin never learns the override itself — only the *resolved* URL, via `hostHints`.
+ * Non-secret schema fields (currently Cline's `baseUrl`) stay host-rendered even when the
+ * plugin ships a custom view. That keeps one persistence path — the provider config endpoint —
+ * and keeps credentials/selection secrets out of the iframe-facing form.
  */
-function PluginProviderProxy({
+function PluginProviderAdvanced({
 	pluginId,
+	provider,
 	providerInstanceId,
 	storedProxy,
+	showNonSecretConfig,
 }: {
 	pluginId: string;
+	provider?: PluginProviderConfigView;
 	providerInstanceId: string;
 	storedProxy?: { mode: string; url?: string };
+	showNonSecretConfig: boolean;
 }) {
+	const { t } = useTranslation("settings");
 	const { t: tp } = useTranslation("plugins");
 	const queryClient = useQueryClient();
-	const [saving, setSaving] = useState(false);
-	const [error, setError] = useState<string | undefined>();
+	const configMutation = useUpdatePluginProviderConfig(pluginId);
+	const [proxySaving, setProxySaving] = useState(false);
+	const [proxyError, setProxyError] = useState<string | undefined>();
+
+	const secretFields = useMemo(
+		() => new Set(provider?.secretFields ?? []),
+		[provider?.secretFields],
+	);
+	const nonSecretFields = useMemo(() => {
+		if (!provider || typeof provider.configSchema !== "object" || provider.configSchema === null)
+			return new Set<string>();
+		const properties = (
+			provider.configSchema as SchemaNode & {
+				properties?: Record<string, unknown>;
+			}
+		).properties;
+		if (!properties || typeof properties !== "object" || Array.isArray(properties))
+			return new Set<string>();
+		return new Set(Object.keys(properties).filter((name) => !secretFields.has(name)));
+	}, [provider, secretFields]);
+	const filteredSchema = useMemo(
+		() =>
+			provider && provider.configSchema !== null && typeof provider.configSchema !== "boolean"
+				? schemaWithOnly(provider.configSchema as SchemaNode, nonSecretFields)
+				: undefined,
+		[provider, nonSecretFields],
+	);
 
 	// The stored shape is validated server-side, so a mode the client does not know would be a
 	// newer host; treating it as "default" keeps the control usable instead of blank.
-	const value = storedProxy
+	const proxyValue = storedProxy
 		? ({
 				mode: (["default", "direct", "system", "custom"] as const).includes(
 					storedProxy.mode as ProxyOverride["mode"],
@@ -220,9 +267,9 @@ function PluginProviderProxy({
 			} satisfies ProxyOverride)
 		: undefined;
 
-	const handleChange = async (next: ProxyOverride | undefined) => {
-		setSaving(true);
-		setError(undefined);
+	const handleProxyChange = async (next: ProxyOverride | undefined) => {
+		setProxySaving(true);
+		setProxyError(undefined);
 		try {
 			await pluginsApi.updateProviderProxy(
 				pluginId,
@@ -237,24 +284,58 @@ function PluginProviderProxy({
 			// compile time and shows up only as a control that silently reverts.
 			await queryClient.invalidateQueries({ queryKey: pluginKeys.providerConfig(pluginId) });
 		} catch (caught) {
-			setError(errorText(caught, tp));
+			setProxyError(errorText(caught, tp));
 		} finally {
-			setSaving(false);
+			setProxySaving(false);
 		}
 	};
 
+	const showConfigForm = showNonSecretConfig && provider && nonSecretFields.size > 0;
+	const configView = useMemo(
+		() => ({
+			config: Object.fromEntries(
+				Object.entries(provider?.config ?? {}).filter(([name]) => nonSecretFields.has(name)),
+			) as Record<string, never>,
+			secretFields: [],
+			secretsSet: [],
+		}),
+		[provider?.config, nonSecretFields],
+	);
+
 	return (
-		<Stack gap="xs">
-			<ProxyOverrideField
-				value={value}
-				onChange={(next) => void handleChange(next)}
-				disabled={saving}
-			/>
-			{error ? (
-				<Text size="xs" c="red">
-					{error}
+		<Stack gap="md">
+			<Divider />
+			<Stack gap="xs">
+				<Text fw={500} size="sm">
+					{t("pluginProviderConnectionSection")}
 				</Text>
-			) : null}
+				{showConfigForm ? (
+					<>
+						<Text size="xs" c="dimmed">
+							{t("pluginProviderConnectionDesc")}
+						</Text>
+						<PluginConfigForm
+							schema={filteredSchema}
+							view={configView}
+							submitting={configMutation.isPending}
+							submitError={configMutation.isError ? errorText(configMutation.error, tp) : undefined}
+							onSubmit={async (config) => {
+								await configMutation.mutateAsync({ providerInstanceId, config });
+							}}
+						/>
+					</>
+				) : null}
+				<ProxyOverrideField
+					value={proxyValue}
+					onChange={(next) => void handleProxyChange(next)}
+					disabled={proxySaving}
+				/>
+				{proxyError ? (
+					<Text size="xs" c="red">
+						{proxyError}
+					</Text>
+				) : null}
+			</Stack>
 		</Stack>
 	);
 }
@@ -418,6 +499,16 @@ function PluginProviderFrame({
 	contributionId: string;
 }) {
 	const [title, setTitle] = useState<string | undefined>();
+	/**
+	 * Content height reported by the plugin through `panel.setHeight`.
+	 *
+	 * The iframe is sandboxed without `allow-same-origin`, so the host cannot measure
+	 * the document itself; the plugin observes its own content and reports. Until the
+	 * first report lands the frame keeps the fixed default, and a plugin on an older
+	 * host (NOT_SUPPORTED) simply keeps it too — the fixed box is the fallback, not a
+	 * failure mode.
+	 */
+	const [height, setHeight] = useState(SURFACE_HEIGHT);
 
 	// One stable instance id per mounted view: changing it would tear down and rebuild
 	// the backend session on every re-render.
@@ -439,6 +530,9 @@ function PluginProviderFrame({
 	// No dock chrome here, so the panel API is satisfied with local no-ops. `close` is
 	// inert on purpose: the panel is part of the page, and letting a plugin remove it
 	// would leave the provider unconfigurable with no way back.
+	//
+	// `setHeight` is the state setter, which is stable — so this memo still only rebuilds
+	// when the title changes, and a height report never re-registers the panel delegate.
 	const hostApi = useMemo<PluginDockPanelHostApi>(
 		() => ({
 			title,
@@ -447,13 +541,14 @@ function PluginProviderFrame({
 			updateParameters: () => {},
 			setActive: () => {},
 			close: () => {},
+			setHeight,
 		}),
 		[title],
 	);
 
 	return (
 		<PluginUiSurfaceProvider hostContext={{ surface: "provider-settings" }}>
-			<Paper withBorder radius="md" style={{ height: SURFACE_HEIGHT, overflow: "hidden" }}>
+			<Paper withBorder radius="md" style={{ height, overflow: "hidden" }}>
 				<PluginDockPanelView rawParams={params} hostApi={hostApi} />
 			</Paper>
 		</PluginUiSurfaceProvider>

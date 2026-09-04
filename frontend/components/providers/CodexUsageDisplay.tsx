@@ -45,6 +45,9 @@ export function CodexUsageDisplay({ usage }: { usage?: CodexUsageData }) {
 
 	const planTier = normalizeCodexPlanTier(usage.plan_type);
 	const windows = sortCodexUsageWindows(getCodexUsageWindows(usage));
+	const resetCreditsAvailable = usage.reset_credits_available;
+	const hasResetCredits =
+		typeof resetCreditsAvailable === "number" && Number.isFinite(resetCreditsAvailable);
 	const formatResetTime = (resetAt: number) => {
 		if (!Number.isFinite(resetAt) || resetAt <= 0) return t("codexUsageResetUnknown");
 		const timestamp = resetAt * 1000;
@@ -109,6 +112,10 @@ export function CodexUsageDisplay({ usage }: { usage?: CodexUsageData }) {
 						</Stack>
 					);
 				})
+			)}
+
+			{hasResetCredits && (
+				<Text size="xs">{t("codexUsageResetCredits", { count: resetCreditsAvailable })}</Text>
 			)}
 
 			<Text size="xs" c="dimmed">

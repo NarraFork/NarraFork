@@ -45,10 +45,17 @@ const listeners = new Set<() => void>();
  */
 export function readHostPresentation(): PluginUiPresentation {
 	const locale = normalizeLocale(i18n.language);
+	const colorScheme =
+		typeof document === "undefined"
+			? undefined
+			: document.documentElement.dataset.mantineColorScheme === "light"
+				? "light"
+				: "dark";
 	return {
 		tokenCss: renderTokenCss(readHostTokens()),
 		locale,
 		localeChain: getLocaleFallbackChain(locale),
+		...(colorScheme ? { colorScheme } : {}),
 	};
 }
 

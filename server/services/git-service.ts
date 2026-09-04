@@ -586,9 +586,17 @@ function parseNameStatusZ(output: string): Map<string, string> {
 	return statuses;
 }
 
-function buildLineStatsMap(output: string): Map<string, LineStats> {
+function stripGitPathPrefix(path: string, prefix: string): string {
+	if (!prefix) return path;
+	return path.startsWith(prefix) ? path.slice(prefix.length) : path;
+}
+
+function buildLineStatsMap(output: string, prefix = ""): Map<string, LineStats> {
 	return new Map(
-		parseNumstatZ(output).map(({ path, added, removed }) => [path, { added, removed }]),
+		parseNumstatZ(output).map(({ path, added, removed }) => [
+			stripGitPathPrefix(path, prefix),
+			{ added, removed },
+		]),
 	);
 }
 
@@ -705,6 +713,13 @@ export const gitService = {
 	async isGitRepo(path: string): Promise<boolean> {
 		const result = await execRead(["rev-parse", "--is-inside-work-tree"], path);
 		return result.exitCode === 0;
+	},
+
+	/** Resolve the repository root for a path, or null when it is not inside Git. */
+	async getRepositoryRoot(path: string): Promise<string | null> {
+		const result = await execRead(["rev-parse", "--show-toplevel"], path, true);
+		if (result.exitCode !== 0) return null;
+		return result.stdout.trim() || null;
 	},
 
 	/**
@@ -1141,6 +1156,7 @@ export const gitService = {
 
 	async getStatusSummary(worktreePath: string): Promise<GitStatusSummary> {
 		const [
+			prefixResult,
 			statusResult,
 			headResult,
 			branchResult,
@@ -1148,31 +1164,49 @@ export const gitService = {
 			unstagedNumstat,
 			untrackedResult,
 		] = await Promise.all([
-			execRead([...PORCELAIN_UNTRACKED_ALL, "-z"], worktreePath),
+			// `-z` output stays repository-root-relative even when Git runs below the
+			// root. `--show-prefix` supplies the exact Git path prefix to strip after
+			// parsing, so the result matches the caller's cwd-relative file tree.
+			execRead(["rev-parse", "--show-prefix"], worktreePath, true),
+			// Scope every path-producing command to the directory the caller named. Most
+			// callers pass the worktree root, but a narrator file tree may use a subdirectory.
+			execRead([...PORCELAIN_UNTRACKED_ALL, "-z", "--", "."], worktreePath),
 			execRead(["rev-parse", "HEAD"], worktreePath),
 			execRead(["rev-parse", "--abbrev-ref", "HEAD"], worktreePath),
-			execRead(["diff", "--cached", "--numstat", "-z"], worktreePath, true),
-			execRead(["diff", "--numstat", "-z"], worktreePath, true),
-			execRead(["ls-files", "--others", "--exclude-standard", "-z"], worktreePath, true),
+			execRead(["diff", "--cached", "--numstat", "-z", "--", "."], worktreePath, true),
+			execRead(["diff", "--numstat", "-z", "--", "."], worktreePath, true),
+			execRead(["ls-files", "--others", "--exclude-standard", "-z", "--", "."], worktreePath, true),
 		]);
+		const pathPrefix = prefixResult.exitCode === 0 ? prefixResult.stdout : "";
 
 		const stagedLineStats =
 			stagedNumstat.exitCode === 0
-				? buildLineStatsMap(stagedNumstat.stdout)
+				? buildLineStatsMap(stagedNumstat.stdout, pathPrefix)
 				: new Map<string, LineStats>();
 		const unstagedLineStats =
 			unstagedNumstat.exitCode === 0
-				? buildLineStatsMap(unstagedNumstat.stdout)
+				? buildLineStatsMap(unstagedNumstat.stdout, pathPrefix)
 				: new Map<string, LineStats>();
 		const untrackedPaths =
-			untrackedResult.exitCode === 0 ? parseNulSeparatedPaths(untrackedResult.stdout) : [];
+			untrackedResult.exitCode === 0
+				? // `ls-files --others` reports CWD-relative paths (unlike porcelain and
+					// numstat, which are root-relative and need the prefix stripped).
+					// Stripping here would corrupt a nested directory that shares the
+					// prefix's name (`sub/sub/x.txt` seen from `sub/` prints `sub/x.txt`,
+					// which stripping turns into the nonexistent `x.txt`).
+					parseNulSeparatedPaths(untrackedResult.stdout)
+				: [];
 		const untrackedLineStats = await getUntrackedLineStatsMap(worktreePath, untrackedPaths);
 
 		for (const [path, stats] of untrackedLineStats) {
 			unstagedLineStats.set(path, stats);
 		}
 
-		const entries = parsePorcelainStatusZ(statusResult.stdout);
+		const entries = parsePorcelainStatusZ(statusResult.stdout).map((entry) => ({
+			...entry,
+			path: stripGitPathPrefix(entry.path, pathPrefix),
+			...(entry.oldPath ? { oldPath: stripGitPathPrefix(entry.oldPath, pathPrefix) } : {}),
+		}));
 		let staged = 0;
 		let unstaged = 0;
 		let untracked = 0;

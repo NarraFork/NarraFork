@@ -186,10 +186,13 @@ export function PluginUiRuntimeProvider({
 				showNotification: hostLocalRef.current?.showNotification,
 				openPanel: hostLocalRef.current?.openPanel,
 				openExternal: hostLocalRef.current?.openExternal,
+				modelsChanged: hostLocalRef.current?.modelsChanged,
+				testModel: hostLocalRef.current?.testModel,
 				navigate:
-					// main.tsx injects the live-router navigate via hostLocal;
-					// fall back to a no-op-ish error so a missing bridge surfaces
-					// as an explicit rejection instead of a silent success.
+					// App.tsx's createAppPluginHostLocal only wires modelsChanged/testModel,
+					// so today every navigate call lands on this fallback. Kept as an explicit
+					// rejection rather than a silent success: a plugin told its navigation
+					// "worked" while nothing happened is the worse failure mode.
 					hostLocalRef.current?.navigate ??
 					((_to: string) => {
 						throw new Error("Plugin UI navigation bridge is not wired");
@@ -383,6 +386,7 @@ export function PluginUiRuntimeProvider({
 			const presentation = readHostPresentation();
 			for (const record of sessionsRef.current.values()) {
 				record.controller?.setThemeTokens(presentation.tokenCss);
+				if (presentation.colorScheme) record.controller?.setColorScheme(presentation.colorScheme);
 				record.controller?.setLocale(presentation.locale, presentation.localeChain);
 			}
 		});
@@ -411,7 +415,7 @@ export function PluginUiRuntimeProvider({
 			record.controller?.updateParams(parsed);
 			rerenderSoon();
 		},
-		[],
+		[rerenderSoon],
 	);
 
 	const getSessionSnapshot = useCallback(

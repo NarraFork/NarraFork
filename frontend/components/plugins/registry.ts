@@ -64,6 +64,7 @@ export function registerPluginUiContribution(contribution: PluginUiContribution)
 		entryPath: contribution.entryPath,
 		stylePath: contribution.stylePath,
 		scope: contribution.scope,
+		...(contribution.runtime ? { runtime: contribution.runtime } : {}),
 		entryUrl: contribution.entryUrl,
 		styleUrl: contribution.styleUrl,
 		availability: toAvailability(contribution.status),

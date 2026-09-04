@@ -550,6 +550,25 @@ codexRoutes.post("/credentials/:id/usage", async (c) => {
 });
 
 /**
+ * POST /api/codex/credentials/:id/reset-credits/consume
+ * Consume one rate-limit reset credit, immediately resetting the upstream
+ * quota window(s). Returns the upstream result plus the remaining credit
+ * count when the post-consume usage refresh succeeded.
+ */
+codexRoutes.post("/credentials/:id/reset-credits/consume", async (c) => {
+	const id = c.req.param("id");
+	const manager = getCodexManager();
+	try {
+		const result = await manager.consumeResetCredit(id);
+		return c.json(result);
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		logger.error("Failed to consume Codex reset credit", { error: msg, credentialId: id });
+		return c.json({ error: msg }, 400);
+	}
+});
+
+/**
  * POST /api/codex/load-balancing-mode
  * Set the load balancing mode.
  */

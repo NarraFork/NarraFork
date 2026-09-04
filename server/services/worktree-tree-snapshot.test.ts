@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
@@ -18,11 +18,13 @@ import { eq } from "drizzle-orm";
 import iconv from "iconv-lite";
 import { db } from "../db";
 import { worktreeTreeSnapshots } from "../db/schema";
+import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import {
 	planTreeRevertSegments,
+	resetHotPathCaptureStateForTests,
 	TreeRestoreError,
 	TreeSnapshotError,
 	treeSnapshotKey,
@@ -1265,5 +1267,232 @@ describe("unreadable files", () => {
 		} finally {
 			chmodSync(join(repo, "locked.txt"), 0o600);
 		}
+	});
+});
+
+/**
+ * The hot-path capture budget. Tool-boundary captures run *inside* the narrator's
+ * event consumer, so on a worktree whose full scan exceeds the budget (a huge
+ * tree on a slow filesystem — the Windows + modpack-directory failure this came
+ * from) the capture must step aside: null for the tool, a background warm-up for
+ * the index, and a cooldown instead of a scan loop when the warm-up fails.
+ */
+describe("hot-path capture budget", () => {
+	test("captures within the budget exactly like tryCapture", async () => {
+		resetHotPathCaptureStateForTests();
+		const repo = await createRepo("nf-tree-hot-fast-");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+
+		const tree = await worktreeTreeSnapshot.tryCaptureHot(repo);
+		expect(tree).toMatch(/^[0-9a-f]{40}$/);
+		expect(tree).toBe(await worktreeTreeSnapshot.capture(repo));
+	});
+
+	test("an over-budget capture returns null, then finishes warming in the background", async () => {
+		resetHotPathCaptureStateForTests();
+		const repo = await createRepo("nf-tree-hot-warmup-");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+
+		// A zero budget expires before the first git process can possibly exit, so
+		// the tool path gets its null and moves on...
+		const timedOut = await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, {
+			budgetMs: 0,
+		});
+		expect(timedOut).toBeNull();
+
+		// ...while the capture keeps running as the warm-up. A later call shares that
+		// scan instead of queueing a second one, and resolves with its hash.
+		const warmed = await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, {
+			budgetMs: 30_000,
+		});
+		expect(warmed).toMatch(/^[0-9a-f]{40}$/);
+		expect(warmed).toBe(await worktreeTreeSnapshot.capture(repo));
+	});
+
+	test("concurrent over-budget calls share one warm-up", async () => {
+		resetHotPathCaptureStateForTests();
+		const repo = await createRepo("nf-tree-hot-shared-");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+
+		const results = await Promise.all([
+			worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+			worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+			worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+		]);
+		expect(results).toEqual([null, null, null]);
+
+		// One warm-up completed underneath them all.
+		const warmed = await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, {
+			budgetMs: 30_000,
+		});
+		expect(warmed).toMatch(/^[0-9a-f]{40}$/);
+	});
+
+	test("a failed warm-up pauses hot-path captures until the cooldown expires", async () => {
+		resetHotPathCaptureStateForTests();
+		// A missing worktree fails every capture. The failure only starts the
+		// cooldown because it outlived the budget, i.e. it ran as the warm-up.
+		const dir = join(tmpdir(), `nf-tree-hot-cooldown-${Date.now()}`);
+		tempDirs.push(dir);
+		snapshotPaths.push(normalizePathForComparison(dir));
+
+		const timedOut = await worktreeTreeSnapshot.tryCaptureHot(dir, LOCAL_DEVICE_ID, {
+			budgetMs: 0,
+			cooldownMs: 1_000,
+		});
+		expect(timedOut).toBeNull();
+		// Sharing the warm-up to its conclusion guarantees the cooldown has engaged
+		// by the time this resolves (the cooldown window came from the first call).
+		expect(
+			await worktreeTreeSnapshot.tryCaptureHot(dir, LOCAL_DEVICE_ID, { budgetMs: 30_000 }),
+		).toBeNull();
+
+		// The workspace is now perfectly capturable, yet the cooldown must suppress
+		// even attempting a scan: null, without trying.
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "a.txt"), "one\n");
+		expect(await worktreeTreeSnapshot.tryCaptureHot(dir, LOCAL_DEVICE_ID)).toBeNull();
+
+		// Once the window passes, the next call captures normally again.
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_100));
+		const recovered = await worktreeTreeSnapshot.tryCaptureHot(dir, LOCAL_DEVICE_ID, {
+			budgetMs: 30_000,
+		});
+		expect(recovered).toMatch(/^[0-9a-f]{40}$/);
+	});
+
+	test("a fast failure keeps the retry-next-time behaviour (no cooldown)", async () => {
+		resetHotPathCaptureStateForTests();
+		const dir = join(tmpdir(), `nf-tree-hot-fastfail-${Date.now()}`);
+		tempDirs.push(dir);
+		snapshotPaths.push(normalizePathForComparison(dir));
+
+		// The capture fails *within* a generous budget (a vanished worktree), which
+		// is a transient shape — the dormant/wake cycle produces it — so no cooldown
+		// is recorded and the next call retries immediately.
+		expect(
+			await worktreeTreeSnapshot.tryCaptureHot(dir, LOCAL_DEVICE_ID, {
+				budgetMs: 30_000,
+				cooldownMs: 60_000,
+			}),
+		).toBeNull();
+
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "a.txt"), "one\n");
+		const retried = await worktreeTreeSnapshot.tryCaptureHot(dir, LOCAL_DEVICE_ID, {
+			budgetMs: 30_000,
+		});
+		expect(retried).toMatch(/^[0-9a-f]{40}$/);
+	});
+
+	test("a caller with a cutoff does not share a scan that started before it", async () => {
+		resetHotPathCaptureStateForTests();
+		const repo = await createRepo("nf-tree-hot-cutoff-");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+
+		// Promote a capture to the background warm-up.
+		expect(
+			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+		).toBeNull();
+
+		// A boundary measured *now* must not come from that older scan (its window
+		// may straddle the writes being measured): the call waits for the stale scan
+		// to settle, then re-captures — observable as exactly one more capture call.
+		const spy = spyOn(worktreeTreeSnapshot, "capture");
+		try {
+			const tree = await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, {
+				budgetMs: 30_000,
+				minStartedAt: Date.now(),
+			});
+			expect(tree).toMatch(/^[0-9a-f]{40}$/);
+			expect(spy).toHaveBeenCalledTimes(1);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("a caller with a cutoff in the past shares the in-flight scan", async () => {
+		resetHotPathCaptureStateForTests();
+		const repo = await createRepo("nf-tree-hot-share-");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+
+		expect(
+			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+		).toBeNull();
+
+		// The in-flight scan started after the cutoff, so its result is valid for the
+		// caller and no second scan is started.
+		const spy = spyOn(worktreeTreeSnapshot, "capture");
+		try {
+			const tree = await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, {
+				budgetMs: 30_000,
+				minStartedAt: 1,
+			});
+			expect(tree).toMatch(/^[0-9a-f]{40}$/);
+			expect(spy).not.toHaveBeenCalled();
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	/** A warm-up capture whose scan never finishes on its own, abortable via its signal. */
+	function mockHungCapture() {
+		const state = { capturedSignal: undefined as AbortSignal | undefined };
+		const spy = spyOn(worktreeTreeSnapshot, "capture").mockImplementation(
+			(_worktreePath, _deviceId, opts) =>
+				new Promise<string>((_resolve, reject) => {
+					state.capturedSignal = opts?.signal;
+					const timer = setTimeout(() => reject(new Error("warm-up outlived the test")), 60_000);
+					opts?.signal?.addEventListener(
+						"abort",
+						() => {
+							clearTimeout(timer);
+							reject(new Error("preempted"));
+						},
+						{ once: true },
+					);
+				}),
+		);
+		return { spy, state };
+	}
+
+	test("a structural capture preempts an in-flight warm-up instead of queueing behind it", async () => {
+		resetHotPathCaptureStateForTests();
+		const repo = await createRepo("nf-tree-hot-preempt-");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+
+		const { spy, state } = mockHungCapture();
+		// Promote the hung capture to the warm-up slot.
+		expect(
+			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+		).toBeNull();
+
+		// The structural path must kill the warm-up's scan rather than queue behind
+		// it for the full warm-up timeout.
+		spy.mockRestore();
+		const tree = await worktreeTreeSnapshot.capture(repo);
+		expect(tree).toMatch(/^[0-9a-f]{40}$/);
+		expect(state.capturedSignal?.aborted).toBe(true);
+
+		// Preemption is not a warm-up *failure*: no cooldown, the next hot call captures.
+		const warmed = await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, {
+			budgetMs: 30_000,
+		});
+		expect(warmed).toMatch(/^[0-9a-f]{40}$/);
+	});
+
+	test("destroy aborts an in-flight warm-up and drops its bookkeeping", async () => {
+		resetHotPathCaptureStateForTests();
+		const repo = await createRepo("nf-tree-hot-destroy-");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+
+		const { spy, state } = mockHungCapture();
+		expect(
+			await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+		).toBeNull();
+		spy.mockRestore();
+
+		expect(await worktreeTreeSnapshot.destroy(repo, LOCAL_DEVICE_ID, { force: true })).toBe(true);
+		expect(state.capturedSignal?.aborted).toBe(true);
 	});
 });

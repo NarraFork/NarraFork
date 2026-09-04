@@ -28,6 +28,7 @@ import {
 	createPluginProviderAdapterFactory,
 	type ProviderHostHintsContext,
 } from "./plugin-provider-adapter-factory";
+import type { ProviderCatalogRefreshResult } from "./plugin-provider-catalog-refresh";
 import { PluginProviderCatalogRefresher } from "./plugin-provider-catalog-refresh";
 import { PluginProviderClientPool, type ProviderRuntimeLike } from "./plugin-provider-client";
 import { PluginProviderConfigService } from "./plugin-provider-config-service";
@@ -360,6 +361,95 @@ async function resolvePluginToolPrincipal(
 	};
 }
 
+/** Narrow catalog refresher surface the command dispatcher needs. */
+export interface PluginProviderCatalogRefresherLike {
+	refresh(
+		providerInstanceId: string,
+		options?: { signal?: AbortSignal; force?: boolean },
+	): Promise<ProviderCatalogRefreshResult>;
+}
+
+interface AppliedCommandWrite {
+	contributionId: string;
+}
+
+function contributionIdFromProviderWriteKey(key: string): string | undefined {
+	const match = /^provider\.([^.]+)\..+$/.exec(key);
+	return match?.[1];
+}
+
+/**
+ * Refresh the provider catalogs affected by applied command writes.
+ *
+ * This runs after the writes themselves succeeded. A refresh failure must not roll back the
+ * user's persisted choice, so the outcome is returned for the caller to surface instead of
+ * thrown. Exported as a helper so the dispatcher's policy can be tested without constructing
+ * the whole platform composition.
+ */
+export async function refreshCatalogsAfterCommandWrites(input: {
+	pluginId: string;
+	appliedWrites: readonly AppliedCommandWrite[];
+	registry: Pick<PluginProviderRegistry, "list">;
+	refresher: PluginProviderCatalogRefresherLike;
+}): Promise<
+	Array<
+		| {
+				providerInstanceId: string;
+				ok: true;
+				modelCount: number;
+		  }
+		| {
+				providerInstanceId: string;
+				ok: false;
+				error: string;
+		  }
+	>
+> {
+	const { pluginId, appliedWrites, registry, refresher } = input;
+	if (appliedWrites.length === 0) return [];
+
+	const contributionIds = new Set<string>();
+	for (const write of appliedWrites) {
+		if (write.contributionId) contributionIds.add(write.contributionId);
+	}
+	const targets = new Map<string, string>();
+	for (const entry of registry.list()) {
+		if (entry.kind !== "executable-plugin" || entry.pluginId !== pluginId) continue;
+		if (!contributionIds.has(entry.localId)) continue;
+		targets.set(entry.providerInstanceId, entry.providerInstanceId);
+	}
+
+	const results: Awaited<ReturnType<typeof refreshCatalogsAfterCommandWrites>> = [];
+	for (const providerInstanceId of targets.keys()) {
+		try {
+			const refreshed = await refresher.refresh(providerInstanceId, { force: true });
+			// The real refresher reports an unreachable provider in-band ({ stale, error })
+			// rather than throwing — treating any settled promise as success would report
+			// ok: true with the pre-write model count, and the UI could never explain why
+			// the list did not change.
+			if (refreshed.error) {
+				logger.warn("Plugin provider catalog refresh failed after command write", {
+					pluginId,
+					providerInstanceId,
+					error: refreshed.error,
+				});
+				results.push({ providerInstanceId, ok: false, error: refreshed.error });
+			} else {
+				results.push({ providerInstanceId, ok: true, modelCount: refreshed.modelCount });
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			logger.warn("Plugin provider catalog refresh failed after command write", {
+				pluginId,
+				providerInstanceId,
+				error: message,
+			});
+			results.push({ providerInstanceId, ok: false, error: message });
+		}
+	}
+	return results;
+}
+
 /**
  * The production plugin platform composition root. Services without an existing singleton are
  * constructed here once, so PluginManager and future contribution hosts share the same state.
@@ -462,13 +552,18 @@ export function createPluginPlatformServices(
 		has: (commandId, pluginId) => pluginCommandRegistry.has(commandId, pluginId),
 		invoke: async (commandId, pluginId, input, context) => {
 			const result = await pluginCommandRegistry.invoke(commandId, pluginId, input, context);
+			const appliedWrites: AppliedCommandWrite[] = [];
 			if (result.secretWrites.length > 0) {
-				await applyCommandSecretWrites({
+				const applied = await applyCommandSecretWrites({
 					pluginId,
 					writes: result.secretWrites,
 					registry: providerRegistry,
 					sink: secretVault,
 				});
+				for (const key of [...applied.written, ...applied.deleted]) {
+					const contributionId = contributionIdFromProviderWriteKey(key);
+					if (contributionId) appliedWrites.push({ contributionId });
+				}
 			}
 			// Non-secret provider settings. Applied after secrets so a config write cannot land
 			// while the credential it describes failed to store, and routed through
@@ -476,15 +571,39 @@ export function createPluginPlatformServices(
 			// config form. `providerConfigService` is declared further down, hence the lazy read
 			// inside `invoke` — same reason `providerRegistry` is read here rather than captured.
 			if (result.configWrites.length > 0) {
-				await applyCommandConfigWrites({
+				const applied = await applyCommandConfigWrites({
 					pluginId,
 					writes: result.configWrites,
 					registry: providerRegistry,
 					sink: providerConfigService,
 				});
+				for (const key of [...applied.written, ...applied.cleared]) {
+					const contributionId = contributionIdFromProviderWriteKey(key);
+					if (contributionId) appliedWrites.push({ contributionId });
+				}
 			}
-			// Only `output` crosses back; the writes were consumed above.
-			return { output: result.output };
+			// Deliberately outside the command's deadline (the UI host's fence signal is not
+			// threaded here): a refresh that outlives it must still run to completion, because
+			// the writes above already persisted and the catalog is the only derived state that
+			// has to converge. The trade is that a slow provider makes the *command response*
+			// arrive after the client's TIMEOUT — the client sees a failure while the server
+			// finishes the sync, which is reported accurately through catalogSync on the next
+			// call. Moving the refresh off the response path entirely (fire-and-forget plus a
+			// catalogInvalidated push) is the alternative; it was rejected because the command's
+			// caller is exactly who needs the per-provider outcome.
+			const catalogSync = await refreshCatalogsAfterCommandWrites({
+				pluginId,
+				appliedWrites,
+				registry: providerRegistry,
+				refresher: providerCatalogRefresher,
+			});
+			// Only `output` crosses back; the writes were consumed above. Catalog sync is
+			// metadata, not credential material, so the UI can explain a stale list without
+			// seeing any write values.
+			return {
+				output: result.output,
+				...(catalogSync.length > 0 ? { catalogSync } : {}),
+			};
 		},
 	};
 

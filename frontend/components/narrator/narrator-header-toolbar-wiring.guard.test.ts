@@ -211,6 +211,26 @@ describe("self-contained controls are reachable from the overflow menu", () => {
 	});
 });
 
+describe("the file-tree toolbar entry is wired to Dockview", () => {
+	it("tracks the Dockview panel's active state", async () => {
+		const source = await narratorPanel();
+		const start = source.indexOf("const toolbarEntryActive");
+		const end = source.indexOf("/**\n\t * Activate an entry", start);
+		const body = source.slice(start, end);
+		expect(body).toContain('case "filetree":');
+		expect(body).toContain('dock?.openToolTypes.has("filetree")');
+	});
+
+	it("activates the file-tree panel instead of falling through", async () => {
+		const source = await narratorPanel();
+		const start = source.indexOf("const activateToolbarEntry");
+		const end = source.indexOf("/**\n\t * Options the overflow menu", start);
+		const body = source.slice(start, end);
+		expect(body).toContain('case "filetree":');
+		expect(body).toContain('dock?.toggleToolPanel("filetree")');
+	});
+});
+
 describe("the capacity hook observes only stable elements", () => {
 	it("never observes the entry wrappers it adds and removes", async () => {
 		const source = await capacityHook();

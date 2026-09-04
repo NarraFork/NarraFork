@@ -173,4 +173,15 @@ describe("CodexUsageDisplay", () => {
 		expect(container.textContent).toContain("Reset unknown");
 		expect(container.textContent).not.toContain("Invalid Date");
 	});
+
+	test("renders the reset credits count when reported, including zero", async () => {
+		await renderUsage(usage({ reset_credits_available: 3 }));
+		expect(container.textContent).toContain("Reset credits 3");
+
+		await renderUsage(usage({ reset_credits_available: 0 }));
+		expect(container.textContent).toContain("Reset credits 0");
+
+		await renderUsage(usage());
+		expect(container.textContent).not.toContain("Reset credits");
+	});
 });

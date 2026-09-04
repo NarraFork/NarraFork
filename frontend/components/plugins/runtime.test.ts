@@ -258,4 +258,40 @@ describe("PluginUiSession", () => {
 		expect(session.getSnapshot().status).not.toBe("ready");
 		session.dispose();
 	});
+
+	test("injects the shared runtime only for host-react contributions", () => {
+		const plain = new PluginUiSession({ params, contribution });
+		const plainShell = plain.getSrcdoc();
+		expect(plainShell).not.toContain("plugin-runtime/vendor.js");
+		expect(plainShell).not.toContain("plugin-runtime/vendor.css");
+		plain.dispose();
+
+		const hosted = new PluginUiSession({
+			params,
+			contribution: { ...contribution, runtime: "host-react" },
+		});
+		const hostedShell = hosted.getSrcdoc();
+		expect(hostedShell).toContain("plugin-runtime/vendor.js");
+		expect(hostedShell).toContain("plugin-runtime/vendor.css");
+		hosted.dispose();
+	});
+
+	test("mirrors the host color scheme into the shell", () => {
+		const light = new PluginUiSession({
+			params,
+			contribution,
+			getPresentation: () => ({
+				tokenCss: "",
+				locale: "en",
+				localeChain: ["en"],
+				colorScheme: "light",
+			}),
+		});
+		expect(light.getSrcdoc()).toContain('data-mantine-color-scheme="light"');
+		light.dispose();
+
+		const dark = new PluginUiSession({ params, contribution });
+		expect(dark.getSrcdoc()).toContain('data-mantine-color-scheme="dark"');
+		dark.dispose();
+	});
 });

@@ -583,6 +583,12 @@ export const miscApi = {
 		request<{ ok: boolean }>(`/codex/credentials/${id}/refresh`, { method: "POST" }),
 	codexCredentialGetUsage: (id: string) =>
 		request<CodexUsageData>(`/codex/credentials/${id}/usage`, { method: "POST" }),
+	/** Consume one rate-limit reset credit, immediately resetting the upstream quota window(s). */
+	codexCredentialConsumeResetCredit: (id: string) =>
+		request<{ code: string; windowsReset: number; resetCreditsAvailable?: number }>(
+			`/codex/credentials/${id}/reset-credits/consume`,
+			{ method: "POST" },
+		),
 	codexSetLoadBalancingMode: (mode: CodexLoadBalancingMode) =>
 		request<{ ok: boolean; mode: CodexLoadBalancingMode }>("/codex/load-balancing-mode", {
 			method: "POST",

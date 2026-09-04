@@ -27,11 +27,12 @@ const EXPLORE_PLAN_TOOLS = new Set([
 /** Tools available to search subagents. Native web_search is provider-side; WebFetch is for follow-up URLs. */
 const SEARCH_TOOLS = new Set(["WebFetch", "TeamStatus", "Await", "ContextAsk", "Send"]);
 
-/** Review is explicitly read-only: no shell, Write/Edit, Skill, or unclassified MCP mutations. */
+/** Review is explicitly read-only; Bash is constrained to local Git inspection by permission policy. */
 const REVIEW_TOOLS = new Set([
 	"Read",
 	"Glob",
 	"Grep",
+	SHELL_TOOL_NAME,
 	"WebSearch",
 	"WebFetch",
 	"TeamStatus",

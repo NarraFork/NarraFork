@@ -8,12 +8,18 @@
  * It records POSITIONS only. Which panels a workspace contains is membership, owned by
  * `workspace_panels` and delivered separately — so a blob that is missing, stale or
  * corrupt costs an arrangement and never a panel. Reading legacy shapes (split-tree,
- * seed envelope) to recover membership is the server's job, done once in
- * `recoverPanelsFromLayout`; this module no longer migrates them.
+ * seed envelope) to recover MEMBERSHIP is the server's job, done once in
+ * `recoverPanelsFromLayout`; this module only reads the seed envelope's PLACEMENT
+ * (created before any DockviewApi existed) so a freshly created workspace opens with
+ * the split the user dragged, and never migrates membership itself.
  */
 
 import type { Direction, DockviewApi, SerializedDockview } from "dockview-react";
-import type { SeedEnvelope, PanelSpec as SharedPanelSpec } from "../panels/layout-envelope";
+import {
+	isSeedEnvelope,
+	type SeedEnvelope,
+	type PanelSpec as SharedPanelSpec,
+} from "../panels/layout-envelope";
 import {
 	DEFAULT_DIRECTOR_PRIMARY_RATIO,
 	normalizeDirectorPrimaryRatio,
@@ -58,9 +64,14 @@ export type WorkspaceSeedEnvelope = SeedEnvelope<WorkspacePanelParams>;
  * authoritative input, so this outcome still renders every panel — just at default
  * positions. The old `panels` variant (a client-side legacy migration) is gone; see
  * `resolveWorkspaceLayout`.
+ *
+ * `seed` carries an api-free initial layout (written at workspace creation, before
+ * any DockviewApi existed): the caller materialises it via `addPanel` honouring each
+ * spec's `placement`, instead of collapsing every member into one tab group.
  */
 export type ResolvedLayout =
 	| { kind: "dockview"; layout: SerializedDockview; director: WorkspaceDirectorState }
+	| { kind: "seed"; specs: PanelSpec[]; director: WorkspaceDirectorState }
 	| { kind: "none"; director: WorkspaceDirectorState };
 
 // ── Seed construction ──
@@ -144,7 +155,11 @@ function isSerializedDockview(value: unknown): value is SerializedDockview {
  * Order of precedence:
  *   1. Dockview envelope (current format) → restore verbatim.
  *   2. Raw SerializedDockview (defensive) → wrap with default director state.
- *   3. Anything else (seed envelope, legacy split-tree, corrupt) → no arrangement;
+ *   3. Seed envelope (api-free initial layout from workspace creation) → carried
+ *      through as specs; the caller materialises the placement via `addPanel`.
+ *      Membership still comes from `workspace_panels` — the seed only says WHERE
+ *      the panels sit, matching the dockview branch's arrangement-only role.
+ *   4. Anything else (legacy split-tree, corrupt) → no arrangement;
  *      the caller places every member at a default position.
  */
 export function resolveWorkspaceLayout(treeJson: string | null | undefined): ResolvedLayout {
@@ -160,6 +175,13 @@ export function resolveWorkspaceLayout(treeJson: string | null | undefined): Res
 			}
 			if (isSerializedDockview(parsed)) {
 				return { kind: "dockview", layout: parsed, director: DEFAULT_DIRECTOR_STATE };
+			}
+			if (isSeedEnvelope(parsed)) {
+				return {
+					kind: "seed",
+					specs: (parsed as WorkspaceSeedEnvelope).seed,
+					director: DEFAULT_DIRECTOR_STATE,
+				};
 			}
 		} catch {
 			// fall through to "no arrangement"

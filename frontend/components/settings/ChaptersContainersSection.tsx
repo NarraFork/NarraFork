@@ -13,6 +13,8 @@ export interface ChaptersContainersSectionProps {
 	setAutoSave: (v: boolean) => void;
 	dormantMinutes: number;
 	setDormantMinutes: (v: number) => void;
+	treeSnapshots: boolean;
+	setTreeSnapshots: (v: boolean) => void;
 	portStart: number;
 	setPortStart: (v: number) => void;
 	portEnd: number;
@@ -85,6 +87,12 @@ export function ChaptersContainersSection(props: ChaptersContainersSectionProps)
 				label={t("autoSaveOnDormant")}
 				checked={props.autoSave}
 				onChange={(e) => props.setAutoSave(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("treeSnapshotsEnabled")}
+				description={t("treeSnapshotsEnabledDesc")}
+				checked={props.treeSnapshots}
+				onChange={(e) => props.setTreeSnapshots(e.currentTarget.checked)}
 			/>
 			<NumberInput
 				label={t("dormantAfterMinutes")}

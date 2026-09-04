@@ -12,7 +12,7 @@
 |---|---|---|
 | provider prefix | `cline` | `cline-ext` |
 | 凭据存储 | `~/.narrafork/cline-credentials.json` | 宿主 secret vault |
-| OAuth 登录 | `/api/cline/auth/*` + ClineSection（React，749 行） | 插件自己的 iframe（原生 DOM） |
+| OAuth 登录 | `/api/cline/auth/*` + ClineSection（React） | 插件自己的 iframe（宿主共享 React/Mantine runtime） |
 | 登录路径 | 浏览器回调 + 粘贴回调 URL | 两条都有 |
 | 模型池 | `~/.narrafork/cline-models.json` | 插件数据目录缓存 |
 | 已启用模型 | `settings.clineProviders[].enabledModels` | vault secret（见「决策 A」） |
@@ -121,28 +121,42 @@ present-but-empty 的 hostHints**，缺失是它表达「无代理」的唯一�
 
 | 能力 | 内置 | 插件形态 | 位置 |
 |---|---|---|---|
-| 登录/登出/粘贴回调 | ClineSection | iframe | `src/ui/provider-settings.ts` |
+| 登录/登出/粘贴回调 | ClineSection | iframe | `src/ui/provider-settings.tsx`（`runtime: "host-react"`） |
 | 余额 | ClineSection | iframe | 同上 |
 | 推荐/免费模型、模型池搜索 | ClineSection | iframe | 同上 |
 | 已启用模型选择 | ClineSection | iframe | 同上 |
-| **出站代理覆盖** | ClineSection | **宿主** | `PluginProviderSection` → `PluginProviderProxy` |
+| **API 地址（`baseUrl`）** | 内置无对应字段 | **宿主** | `PluginProviderSection` → `PluginProviderAdvanced`（过滤后的 `PluginConfigForm`，唯一持久化路径） |
+| **出站代理覆盖** | ClineSection | **宿主** | `PluginProviderSection` → `PluginProviderAdvanced` 内的代理控件 |
 | **模型隐藏/上下文窗口/模型测试** | ClineSection | **宿主** | `PluginProviderSection` → `PluginProviderModels`（复用 `ModelList` + `InlineCustomModels`） |
-| **模型目录刷新** | ClineSection | **宿主** | 同上 |
+| **模型目录刷新** | ClineSection | **宿主** | 命令写入后自动刷新 + `PluginProviderModels` 手动刷新按钮 |
 
-后三项**不能**放进 iframe：它们写 `settings.agent.hiddenModels` / `modelContextWindows`，而 iframe 的 CSP 是 `connect-src 'none'`，够不到宿主 API。`PluginProviderSection` 的注释已说明这点，且它渲染的是与内置**同一个组件树**，所以这部分天然对齐，无需插件侧工作。
+后几项**不能**放进 iframe：它们写 `settings.agent.hiddenModels` / `modelContextWindows` / provider config，而 iframe 的 CSP 是 `connect-src 'none'`，够不到宿主 API。`PluginProviderSection` 的注释已说明这点，且它渲染的是与内置**同一个组件树**，所以这部分天然对齐，无需插件侧工作。
 
-### iframe 侧的交互对齐（本轮补齐）
+`baseUrl` 特别说明：自定义 provider-settings view 会取代宿主按 schema 生成的 fallback 表单，但这**不**意味着该字段失去入口。宿主在 `PluginProviderAdvanced` 里单独渲染过滤后的非 secret schema 字段；`baseUrl` 只通过 provider-config endpoint 持久化，插件**不新增** `config.setBaseUrl` 命令，避免同一设置出现两条验证/失败语义可能漂移的写入路径。
+
+### 保存模型后的宿主同步
+
+iframe 点击保存仍只调用 `config.setEnabledModels`。真正的跨边界同步分两步，且都不把 iframe 当作可信写入方：
+
+1. **服务端 catalog**：`plugin-platform-services.ts` 的 command dispatcher 在 `secretWrites` / `configWrites` 成功应用后，只对受影响 contribution 对应的 provider 调 `providerCatalogRefresher.refresh(..., { force: true })`。refresh 失败不回滚已保存选择；结果以 `catalogSync` 元数据返回给 UI host，凭据值不会随响应返回。
+2. **前端缓存**：命令 resolve 后 iframe 才发出 `providerSettings.catalogInvalidated` 通知；`App.tsx` 的 plugin runtime notification handler 据此失效 `["settings"]` 与 `["admin", "settings"]` 查询。通知只影响即时性，不是保存成功的事实来源。
+
+因此保存后下方宿主模型区和全局模型选择器立即看到新的 `cline-ext:*` 列表，而不是等 `/api/settings` 查询的 staleTime 到期。
+
+### iframe 侧的视觉与交互对齐（本轮补齐）
 
 原实现功能点齐全但交互全靠手动触发，与内置的自动行为有落差。已补齐的部分：
 
 | 行为 | 内置做法 | 插件现在 |
 |---|---|---|
-| 登录轮询 | `refetchInterval: 2000`（仅 `pendingAuth` 时） | `SIGN_IN_POLL_MS = 2000`，仅 `signInPending` 时 |
-| 搜索 | `useDebouncedValue(300)` + `>=2` 字符 | `SEARCH_DEBOUNCE_MS = 300` + `MIN_SEARCH_LENGTH = 2` |
+| UI 组件与主题 | React + Mantine | `runtime: "host-react"`，从 `globalThis.__nfPluginRuntime` 读取宿主 React/Mantine/theme |
+| 登录轮询 | `refetchInterval: 2000`（仅 `pendingAuth` 时） | 2 秒 `setTimeout` 链，仅 `signInPending` 时 |
+| 搜索 | `useDebouncedValue(300)` + `>=2` 字符 | 300ms 防抖 + `>=2` 字符 + generation 防慢响应覆盖新查询 |
 | 余额 | `authenticated` 时自动查 | 每次登录自动查一次 |
 | 授权 URL 复制 | `navigator.clipboard` + 通知 | 复制按钮 + `execCommand` 回退 |
-| 搜索结果标记已启用 | 行高亮 | `· enabled` 后缀 |
+| 搜索结果标记已启用 | 行高亮 | 已保存启用列表驱动：行高亮 + Added 徽标 + +/− 即时切换（无复选框草稿） |
 | 结果总数提示 | `+N more` | `N of M shown · refine the query` |
+| 保存后宿主模型列表 | 同进程 React Query 更新 | 服务端 catalog refresh + `providerSettings.catalogInvalidated` 失效 settings 查询 |
 
 **轮询只在 `signInPending` 期间跑**，因为浏览器回调是唯一由文档外部导致的状态变化，其余转换都跟在点击之后。常开的 2s 轮询会变成无人察觉的常驻流量，这也是 `status` 命令刻意不刷新 token 的原因。
 
@@ -154,31 +168,27 @@ present-but-empty 的 hostHints**，缺失是它表达「无代理」的唯一�
 
 **2. 勾选搜索结果不进"已启用"列表。** `modelRow` 的 change 处理器只调 `renderSelectionSummary()`，计数器变了但上方列表不变，页面自我矛盾。
 
-**3. 轮询会放大成上游风暴。** `renderRecommended()` / `renderSearch()` 原本从 `renderModels()` 里调用，而后者每次 refresh 都 `replaceChildren()`。在只有点击才触发 refresh 时这仅仅是浪费；一旦 refresh 上了 2s 定时器，就会**每两秒打一次 `recommended-models` 上游接口**，并且清掉用户正在输入的查询。改为建在独立容器里、只建一次，复选框状态由 `syncModelRowChecks()` 单独同步。
+**3. 轮询会放大成上游风暴。** `renderRecommended()` / `renderSearch()` 原本从 `renderModels()` 里调用，而后者每次 refresh 都 `replaceChildren()`。在只有点击才触发 refresh 时这仅仅是浪费；一旦 refresh 上了 2s 定时器，就会**每两秒打一次 `recommended-models` 上游接口**，并且清掉用户正在输入的查询。改为建在独立容器里、只建一次，复选框状态由 `syncModelControls()` 单独同步。
 
 第 3 条是引入轮询**造成**的，不是既有 bug——它说明这类"每次重建整个区域"的渲染结构在加入定时刷新时必须重新审视，而不能假定原样可用。
 
 ## 已验证（自动化）
 
-8 个测试文件，183 项，全部绿：
+8 个测试文件，182 项，全部绿：
 
 | 文件 | 项数 | 覆盖 |
 |---|---|---|
 | `cline-external-history.test.ts` | 31 | 规范格式 → OpenAI messages：文本/图片/工具调用配对/reasoning 丢弃/`"."` 续跑标记/空 assistant 跳过 |
-| `cline-external-event-mapping.test.ts` | 33 | SSE → PluginStreamEvent，**每个事件都对宿主真实 `providerStreamEventSchema` 校验**（`.strict()`，能挡住臆造字段）；跨 chunk 的 JSON 转义、usage-only chunk、finish_reason 各分支、错误分类 |
-| `cline-external-auth.test.ts` | 24 | 回调 URL 解析（含尾部签名）、缺 scheme 的粘贴补全**且只对 loopback 补全**、过期判定、两个 base URL 的区分、EADDRINUSE 识别 |
+| `cline-external-event-mapping.test.ts` | 41 | SSE → PluginStreamEvent，**每个事件都对宿主真实 `providerStreamEventSchema` 校验**（`.strict()`，能挡住臆造字段）；跨 chunk 的 JSON 转义、usage-only chunk、finish_reason 各分支、错误分类 |
+| `cline-external-auth.test.ts` | 22 | 回调 URL 解析（含尾部签名）、缺 scheme 的粘贴补全**且只对 loopback 补全**、过期判定、两个 base URL 的区分、EADDRINUSE 识别 |
 | `cline-external-credentials.test.ts` | 22 | 凭据解析、config 注入、刷新的 invalid/failed 语义、refresh token 轮换采纳 |
 | `cline-external-models.test.ts` | 14 | 决策 B：只返回已启用集、不带 `nextCursor`、`buildCatalog` **完全不打网络**、截断阈值与 manifest 一致 |
 | `cline-external-enabled-models.test.ts` | 11 | 决策 A 全链路，全部用宿主真实服务 |
-| `cline-external-commands.e2e.test.ts` | 20 | 真实子进程 + 真实 `PluginHostDispatcher`，命令走 `secrets.get`；`browserAuth` 三态；探测不占用端口 |
-| `cline-external-ui-contract.test.ts` | 20 | 读**构建产物**断言 iframe/后端字段名一致：命令 id、`browserAuth` 三值、无 `browserAuthAvailable`、UI 不含 `secrets.*`；另钉住轮询契约（`authorizeUrl`/`signInPending` 双侧存在、定时器与 `pagehide` 清理）与「轮询不放大上游调用」的结构性质 |
+| `cline-external-commands.e2e.test.ts` | 21 | 真实子进程 + 真实 `PluginHostDispatcher`，命令走 `secrets.get`；`browserAuth` 三态；探测不占用端口；`catalogSync` 输出与 `config.setBaseUrl` 不存在的负向断言 |
+| `cline-external-ui-contract.test.ts` | 20 | 读**构建产物**断言 iframe/后端字段名一致：命令 id 双侧（view 调用的都在 manifest 声明、声明的都在后端实现）、`browserAuth` 三值、无 `browserAuthAvailable`、UI 不含 `secrets.*`、宿主方法白名单（`commands.execute` / `provider.modelsChanged` / `panel.setHeight` 正向钉住）、`runtime: "host-react"` 声明、catalog 失效通知、splash 接管、产物自包含 |
 
 `cline-external-ui-contract.test.ts` 是为这类错误专设的：iframe 边界两侧都是 `unknown`，
 字段名错位类型检查抓不到，只会表现为「按钮永远不出现」。
-
-「轮询不放大上游调用」那两项**断言源码而非 bundle**，因为它是渲染函数的结构性质
-（`renderModels` 不得调用 `renderRecommended`/`renderSearch`），打包后没有任何可观测差异。
-已实测该断言在把两个调用挪回 `renderModels` 后确实失败——否则它只是一句看起来在检查什么的空话。
 
 **自动化测试期间发现并修掉的真实缺陷**：manifest 的 `configSchema` 写成了完整 JSON Schema
 文档（带 `type`/`properties` 外层）。`parseManifest` 接受它，但
@@ -244,25 +254,24 @@ OpenRouter 也不要求回传。内置实现同样丢弃（`ClineMessage._reason
 
 **7. 全量模型池只在插件 iframe 内可见**（决策 B 的结果），不进宿主模型选择器。
 
-**8. iframe 内是原生 DOM，没有 Mantine 组件。** 交互行为已对齐（见「UI 对齐」），
-**配色与字体现在跟随宿主**（用 `--nf-*` token，见下），但没有 Mantine 的控件样式、
-通知气泡和 Tooltip：状态反馈走面板底部的单行状态区，而内置用 `notifications.show()` 弹出。
-iframe 是独立 document，复刻一套组件库不在本插件范围内。
-
-**9. 授权 URL 无法自动打开浏览器。** iframe sandbox 未给 `allow-popups`，`window.open` 被阻止。
+**8. 授权 URL 无法自动打开浏览器。** iframe sandbox 未给 `allow-popups`，`window.open` 被阻止。
 内置有「打开」按钮，插件只能显示 URL + 提供复制（复制在剪贴板 API 不可用时回退到
 `execCommand`，失败则提示手动选中）。这是沙箱硬约束，不是实现选择。
 
-## 主题与 i18n：已改为使用宿主平台能力
+## 主题与 i18n：使用宿主平台能力
 
-原先这两项各自是缺口（硬编码 8 个十六进制色值、只有英文），
-现已由宿主的 `--nf-*` token 与 `narrafork.i18n` SDK 提供，见
-`05-ui-bridge-and-dockview.md` §7.5b。本插件侧的落地：
+UI 现在通过 `runtime: "host-react"` 直接使用宿主构建的共享 runtime
+（`frontend/plugin-runtime/vendor.ts`）：React、ReactDOM、Mantine 和 `mantineTheme` 都由宿主注入
+`globalThis.__nfPluginRuntime`，插件 artifact 不打包第二份框架。配色/字体仍同时依赖 shell 注入的
+`--nf-*` token；语言由 `narrafork.i18n` SDK 提供。
 
-- **配色/字体** 全部改为 `var(--nf-color-*, <原值>)` / `var(--nf-font*, <原值>)`。
-  保留 fallback 是为了让老宿主（不注入 token）仍渲染成原来的样子。
+本插件侧的落地：
+
+- **运行时**：`src/ui/host-runtime.ts` 校验 runtime version；`shim/jsx-runtime.ts` 让 TSX 编译产物
+  使用宿主 React。运行时缺失或主版本不符会显示明确错误，而不是空白 iframe。
+- **配色/字体** 使用宿主 Mantine theme 与 `var(--nf-color-*, <原值>)` / `var(--nf-font*, <原值>)`。
   切换主题、开 OLED、启用插件主题都会流到面板，**无需本插件任何代码**。
-- **文案** 双语表（`STRINGS`）留在插件里，语言与回退规则交给 `sdk.i18n.t()`。
+- **文案** 双语表（`src/ui/strings.ts`）留在插件里，语言与回退规则交给 `sdk.i18n.t()`。
   面板订阅 `i18n.onChange` 后重渲染——文本不像 CSS 变量那样能自动跟随。
 - 语言切换时会重建推荐区与搜索区（它们的标签是译文），
   但**未保存的模型勾选不丢**：`refresh()` 只在已保存列表真的变化时才采纳它。
@@ -270,8 +279,8 @@ iframe 是独立 document，复刻一套组件库不在本插件范围内。
 措辞照抄宿主 `settings` 命名空间，是为了与内置面板对同一个按钮的说法一致；
 这是一次性人工核对，不是运行时依赖宿主翻译键。
 
-`cline-external-ui-contract.test.ts` 断言产物中**不存在 `var()` 之外的裸十六进制色值**，
-以及面板不自行读 `navigator.language`（那是浏览器语言，会覆盖用户在应用内的显式选择）。
+`cline-external-ui-contract.test.ts` 断言 manifest view 声明 `runtime: "host-react"`、
+构建产物读取 `__nfPluginRuntime`，以及保存模型后发出 `providerSettings.catalogInvalidated`。
 
 ## 构建
 

@@ -226,6 +226,8 @@ import {
 	rebuildDeviceFileStatesExcluding,
 	rebuildDeviceFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
+import { gitService } from "../services/git-service";
+import { getStatusSummaryCached } from "../services/git-status-cache";
 import { filterReadableNarrators, narratorReadableWhere } from "../services/narrator-acl";
 import {
 	deleteBufferedTextFile,
@@ -5254,6 +5256,37 @@ narratorRoutes.post("/:id/unrevert", async (c) => {
 	} catch (err) {
 		return c.json(fileHistoryConflictBody(err), 409);
 	}
+});
+
+/**
+ * Current uncommitted line counts for the narrator file tree.
+ *
+ * The tree may be rooted at a standalone narrator's cwd or at a subdirectory inside a
+ * chapter worktree, so this route is narrator-scoped rather than chapter-scoped. Git's
+ * status query is likewise scoped to that cwd; paths therefore match the tree's relative
+ * keys without the client guessing how the cwd relates to the repository root.
+ */
+narratorRoutes.get("/:id/file-tree-status", async (c) => {
+	const narratorId = c.req.param("id");
+	const cwd = await resolveNarratorCwd(narratorId);
+	if (!cwd || !(await gitService.getRepositoryRoot(cwd))) {
+		return c.json({ isGitRepo: false, files: [], totalFiles: 0, truncated: false });
+	}
+
+	// Share the same short-lived cache used by the Git panel. The watcher invalidates it
+	// before broadcasting file activity, and concurrent file-tree surfaces then reuse the
+	// one fresh Git query instead of each spawning their own set of processes.
+	const status = await getStatusSummaryCached(cwd);
+	return c.json({
+		isGitRepo: true,
+		files: status.files.map((file) => ({
+			path: file.path,
+			linesAdded: file.linesAdded,
+			linesRemoved: file.linesRemoved,
+		})),
+		totalFiles: status.totalFiles,
+		truncated: status.totalFiles > status.files.length,
+	});
 });
 
 /**

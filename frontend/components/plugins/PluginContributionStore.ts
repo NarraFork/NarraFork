@@ -252,6 +252,7 @@ export function toPluginUiContribution(
 		stylePath: record.stylePath,
 		scope: record.scope,
 		surfaces: record.surfaces,
+		...(record.runtime ? { runtime: record.runtime } : {}),
 		entryUrl: record.entryUrl ?? "",
 		styleUrl: record.styleUrl,
 		status: record.availability === "missing" ? "missing" : record.availability,
@@ -273,6 +274,7 @@ export function fromPluginUiContributionItem(
 		title: item.title,
 		entryPath: item.entryPath ?? item.entry,
 		stylePath: item.stylePath ?? item.style,
+		...(item.runtime === "host-react" ? { runtime: item.runtime } : {}),
 		availability: item.status === "available" ? "available" : "disabled",
 		unavailableReason: item.status === "available" ? undefined : "Plugin UI package is not enabled",
 	};

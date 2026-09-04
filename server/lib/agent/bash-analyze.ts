@@ -36,6 +36,15 @@ export interface BashAnalysis {
 	dangerousPatterns: string[];
 	/** 是否检测到环境变量注入 */
 	hasEnvInjection: boolean;
+	/**
+	 * 命令前缀环境变量的名字列表（`VAR=val cmd`）。
+	 *
+	 * token 提取刻意不含 variable_assignment 节点，因此这些赋值对逐命令的
+	 * 只读/白名单判定**不可见**——但 `GIT_DIR`、`GIT_EXTERNAL_DIFF`、
+	 * `GIT_CONFIG_COUNT` 等足以改变 git 的仓库指向或借外部命令执行任意代码。
+	 * 逐项列出让无人兜底的判定（如 review 只读放行）可以整体否决。
+	 */
+	commandEnvVars: string[];
 	/** 是否为灾难性命令 — 即使 bypassPermissions 也必须 deny + 终止 loop */
 	isCatastrophic: boolean;
 	/** 灾难性命令的原因描述 */
@@ -325,25 +334,13 @@ function hasReadOnlyDisqualifyingFlag(cmdName: string, tokens: string[]): boolea
 const READ_ONLY_SUBCOMMAND_CHECKS: Record<string, (tokens: string[]) => boolean> = {
 	// git：只有明确的只读 plumbing/porcelain 子命令算只读
 	git: (tokens) => {
-		let idx = 1;
-		// 跳过全局 flag；-C/--work-tree/--namespace 带值。
-		// 注意：能注入配置或改变可执行文件查找路径的全局 flag 一律否决只读，
+		// 能注入配置或改变可执行文件查找路径的全局 flag 一律否决只读，
 		// 因为它们让即使是 `git status` 这样的只读子命令也能执行任意命令
 		// （实测：`git -c core.fsmonitor='touch X' status` 会运行该命令，
 		// `git -c alias.foo='!cmd' foo`、`core.pager`、`core.sshCommand`、
 		// `protocol.ext.allow` 同理）。
-		while (idx < tokens.length) {
-			const t = tokens[idx];
-			if (!t.startsWith("-")) break;
-			const name = t.split("=")[0] ?? t;
-			if (GIT_CONFIG_INJECTION_FLAGS.has(name)) return false;
-			if ((t === "-C" || t === "--work-tree" || t === "--namespace") && idx + 1 < tokens.length) {
-				idx += 2;
-				continue;
-			}
-			idx++;
-		}
-		const sub = tokens[idx];
+		const { sub, index, injectionFlag } = gitSubcommandInfo(tokens);
+		if (injectionFlag) return false;
 		// 裸 `git` / `git --version` 只打印信息
 		if (!sub) return true;
 		if (!GIT_READONLY_SUBCOMMANDS.has(sub)) return false;
@@ -353,7 +350,7 @@ const READ_ONLY_SUBCOMMAND_CHECKS: Record<string, (tokens: string[]) => boolean>
 		// 只影响"是否免询问"，不影响原有白名单语义）。
 		if (GIT_NETWORK_SUBCOMMANDS.has(sub)) return false;
 		// 只读子命令自己的写参数（`git diff --output=patch`、`git hash-object -w`）
-		if (hasGitSubcommandWriteFlag(sub, tokens.slice(idx + 1))) return false;
+		if (hasGitSubcommandWriteFlag(sub, tokens.slice(index + 1))) return false;
 		// `git diff > patch` 之类的重定向由 redirect 检测单独否决，这里只看子命令
 		return true;
 	},
@@ -543,6 +540,37 @@ const GIT_CONFIG_INJECTION_FLAGS = new Set([
 ]);
 
 /**
+ * 跳过 git 全局 flag 定位子命令，供只读判定与危险模式检测共用。
+ *
+ * `-C`/`--work-tree`/`--namespace` 带值，连值一起跳过；附着形式（`-Cdir`、
+ * `--work-tree=dir`）按普通 flag 跳过。遇到 GIT_CONFIG_INJECTION_FLAGS 中的
+ * flag 时不返回子命令，而是以 `injectionFlag` 上报——这些 flag 让任何"只读"
+ * 子命令都能注入配置或改变可执行文件查找路径，调用方必须按自身语义否决/标记；
+ * 各自裸取 `tokens[1]` 会让 `git -C . reflog expire` 这类形式绕过全部子命令检查。
+ */
+function gitSubcommandInfo(tokens: string[]): {
+	sub: string | undefined;
+	index: number;
+	injectionFlag: string | undefined;
+} {
+	let idx = 1;
+	while (idx < tokens.length) {
+		const t = tokens[idx];
+		if (!t.startsWith("-")) break;
+		const name = t.split("=")[0] ?? t;
+		if (GIT_CONFIG_INJECTION_FLAGS.has(name)) {
+			return { sub: undefined, index: idx, injectionFlag: name };
+		}
+		if ((t === "-C" || t === "--work-tree" || t === "--namespace") && idx + 1 < tokens.length) {
+			idx += 2;
+			continue;
+		}
+		idx++;
+	}
+	return { sub: tokens[idx], index: idx, injectionFlag: undefined };
+}
+
+/**
  * 对本地仓库只读、但会发起出站网络连接的 git 子命令。
  *
  * `git ls-remote <url>` 可以连接任意主机（含内网地址），凭据由 credential helper
@@ -573,7 +601,19 @@ const GIT_SUBCOMMAND_WRITE_FLAGS: Record<string, ReadonlySet<string>> = {
 function hasGitSubcommandWriteFlag(sub: string, args: string[]): boolean {
 	const flags = GIT_SUBCOMMAND_WRITE_FLAGS[sub];
 	if (!flags) return false;
-	return args.some((arg) => arg.startsWith("-") && flags.has(arg.split("=")[0] ?? arg));
+	for (const arg of args) {
+		if (!arg.startsWith("-")) continue;
+		// `--output=path` / 独立 `-o` 的精确匹配
+		if (flags.has(arg.split("=")[0] ?? arg)) return true;
+		// 附着/合并短选项（`-o/tmp/x`、`-tw`）：git 的 parse-options 接受短 flag
+		// 直接附着值，精确匹配会漏掉；长 flag 不做字符拆分
+		if (!arg.startsWith("--")) {
+			for (const ch of arg.slice(1)) {
+				if (flags.has(`-${ch}`)) return true;
+			}
+		}
+	}
+	return false;
 }
 
 /** 检查/格式化工具的写参数前缀（`--write`、`--fix`、`--outDir=...` 等）。 */
@@ -626,6 +666,71 @@ function isReadOnlyCommand(tokens: string[]): boolean {
 	if (!READ_ONLY_COMMANDS.has(cmdName)) return false;
 	// 只读命令带上写/阻塞参数就不再只读（`sort -o out`、`date -s`、`tail -f`）。
 	return !hasReadOnlyDisqualifyingFlag(cmdName, tokens);
+}
+
+const REVIEW_READ_ONLY_POST_PROCESSORS = new Set([
+	"head",
+	"tail",
+	"cat",
+	"grep",
+	"rg",
+	"wc",
+	"cut",
+	"sort",
+	"uniq",
+	"tr",
+	"column",
+	"nl",
+]);
+
+const REVIEW_GIT_PATH_OVERRIDE_FLAGS = new Set(["--work-tree", "--namespace"]);
+
+function gitSubcommand(tokens: string[]): string | undefined {
+	let index = 1;
+	while (index < tokens.length) {
+		const token = tokens[index];
+		if (!token?.startsWith("-")) return token;
+		if (token === "-C") index++;
+		index++;
+	}
+	return undefined;
+}
+
+function hasReviewGitPathOverride(tokens: string[]): boolean {
+	return tokens.slice(1).some((token) => {
+		if (token.startsWith("-C") && token !== "-C" && !token.startsWith("--")) return true;
+		const flag = token.split("=", 1)[0];
+		return REVIEW_GIT_PATH_OVERRIDE_FLAGS.has(flag ?? token);
+	});
+}
+
+/**
+ * Whether an analyzed Bash command is safe for a review follow-up subagent.
+ *
+ * Review Bash is narrower than the general read-only verdict: it must start with a
+ * local, read-only Git query, and may only use a fixed set of read-only output
+ * processors afterward. The caller must still enforce the target path policy.
+ */
+export function isReviewReadOnlyBashAnalysis(analysis: BashAnalysis): boolean {
+	if (!analysis.allReadOnly || analysis.commands.length === 0) return false;
+	// 命令前缀环境变量对 token 分析不可见（`VAR=val cmd` 的 tokens 不含赋值），
+	// 而 GIT_DIR/GIT_EXTERNAL_DIFF/GIT_CONFIG_COUNT 等足以改变仓库指向或借外部
+	// 命令执行任意代码；review 路径无人兜底，任何前缀赋值都整体拒绝。
+	if (analysis.commandEnvVars.length > 0) return false;
+	const [first, ...rest] = analysis.commands;
+	if (first?.tokens[0] !== "git") return false;
+	const subcommand = gitSubcommand(first.tokens);
+	if (
+		!subcommand ||
+		GIT_NETWORK_SUBCOMMANDS.has(subcommand) ||
+		hasReviewGitPathOverride(first.tokens)
+	) {
+		return false;
+	}
+	if (!rest.every((command) => REVIEW_READ_ONLY_POST_PROCESSORS.has(command.tokens[0] ?? ""))) {
+		return false;
+	}
+	return true;
 }
 
 /** 始终需要用户确认的命令 */
@@ -1028,7 +1133,12 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 	{
 		// git — 大部分子命令安全，但部分写操作有破坏性
 		git: (tokens) => {
-			const sub = tokens[1];
+			// 与只读判定共用同一套全局 flag 跳过逻辑：裸取 tokens[1] 会让
+			// `git -C . reflog expire` / `git -C repo clean -fdx` 这类形式绕过检查。
+			const { sub, injectionFlag } = gitSubcommandInfo(tokens);
+			// 配置/可执行路径注入 flag 本身就是危险操作，与跟的是什么子命令无关
+			if (injectionFlag)
+				return `git ${injectionFlag} (global flag injects config or executable path — can run arbitrary commands)`;
 			if (!sub) return null;
 
 			// push --force / -f / --force-with-lease / --mirror / --delete
@@ -1058,9 +1168,9 @@ const CONDITIONAL_COMMANDS: Record<string, (tokens: string[], fullText: string) 
 			// filter-branch / filter-repo (mass history rewrite)
 			if (sub === "filter-branch" || sub === "filter-repo")
 				return `git ${sub} (mass history rewrite)`;
-			// reflog expire
-			if (sub === "reflog" && tokens.includes("expire"))
-				return "git reflog expire (destroys recovery points)";
+			// reflog expire / delete / drop — 销毁恢复点（delete/drop 不带 flag 也同样破坏）
+			if (sub === "reflog" && tokens.some((t) => t === "expire" || t === "delete" || t === "drop"))
+				return "git reflog expire/delete (destroys recovery points)";
 			// gc with aggressive prune
 			if (sub === "gc" && tokens.some((t) => t.startsWith("--prune")))
 				return "git gc --prune (permanently removes objects)";
@@ -1455,6 +1565,30 @@ const DANGEROUS_ENV_VARS = new Set([
 	"BASH_ENV",
 	"ENV",
 	"PROMPT_COMMAND",
+	// git：仓库/对象库指向（越界读写任意仓库）
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_NAMESPACE",
+	"GIT_INDEX_FILE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	// git：配置注入（等价于 `git -c key=val`，可设 alias/core.pager/core.fsmonitor 等）
+	"GIT_CONFIG_COUNT",
+	"GIT_CONFIG_PARAMETERS",
+	"GIT_CONFIG_GLOBAL",
+	"GIT_CONFIG_SYSTEM",
+	// git：外部命令执行（diff/pager/ssh/编辑器全部经 shell 启动）
+	"GIT_EXEC_PATH",
+	"GIT_EXTERNAL_DIFF",
+	"GIT_PAGER",
+	"GIT_EDITOR",
+	"GIT_SSH",
+	"GIT_SSH_COMMAND",
+	"GIT_ASKPASS",
+	"SSH_ASKPASS",
+	// git：trace 输出可写到任意文件
+	"GIT_TRACE",
+	"GIT_TRACE2",
 ]);
 
 /** Shell 命令名集合，用于检测 pipe-to-shell 模式 */
@@ -1753,6 +1887,13 @@ function extractGitPaths(
 		if (t === "-C" && subIdx + 1 < tokens.length) {
 			paths.push(semantics.resolve(cwd, tokens[subIdx + 1]));
 			subIdx += 2;
+			continue;
+		}
+		// 附着形式 `-C<dir>`：git 的短选项接受值直接附着，分离形式以外的
+		// 这一形态同样改变仓库指向，不提取就会绕过路径作用域检查。
+		if (t.startsWith("-C") && t.length > 2 && !t.startsWith("--")) {
+			paths.push(semantics.resolve(cwd, t.slice(2)));
+			subIdx++;
 			continue;
 		}
 		// 跳过其他全局 flag（--git-dir=, --work-tree= 等 = 形式自动跳过）
@@ -2401,6 +2542,7 @@ export async function analyzeBashCommand(
 	const filePaths: string[] = [];
 	const nonWhitelisted: string[] = [];
 	const dangerousPatterns: string[] = [];
+	const commandEnvVars: string[] = [];
 	let hasWriteOperation = false;
 	// 保守初值：空命令（解析不出任何 command 节点）不算只读
 	let allReadOnly = false;
@@ -2408,6 +2550,17 @@ export async function analyzeBashCommand(
 
 	for (const node of tree.rootNode.descendantsOfType("command")) {
 		if (!node) continue;
+
+		// 命令前缀环境变量（FOO=bar cmd）：token 提取刻意不含 variable_assignment
+		// 节点，但它们对执行语义有实质影响（GIT_DIR、GIT_EXTERNAL_DIFF 等），
+		// 单独记录下来供只读/评审判定否决。
+		for (let i = 0; i < node.childCount; i++) {
+			const child = node.child(i);
+			if (child?.type === "variable_assignment") {
+				const varName = child.text.split("=")[0];
+				if (varName && !commandEnvVars.includes(varName)) commandEnvVars.push(varName);
+			}
+		}
 
 		// 包含重定向的完整文本
 		const fullText = node.parent?.type === "redirected_statement" ? node.parent.text : node.text;
@@ -2583,6 +2736,7 @@ export async function analyzeBashCommand(
 		nonWhitelisted,
 		dangerousPatterns,
 		hasEnvInjection,
+		commandEnvVars,
 		isCatastrophic: catastrophicReason !== null,
 		catastrophicReason: catastrophicReason ?? undefined,
 		gitBranchViolations: gitBranchResult.violations,
@@ -3062,6 +3216,11 @@ export function analyzePowerShellCommand(
 						dangerousPatterns.push(danger);
 					}
 				}
+				// 与 bash 路径一致：-C/--git-dir 等全局 flag 指向的仓库路径必须进入
+				// filePaths，否则越界访问不会被路径作用域检查发现。
+				const gitResult = extractGitPaths(tokens, cwd, semantics);
+				filePaths.push(...gitResult.paths);
+				if (gitResult.isWrite) hasWriteOperation = true;
 				continue;
 			}
 
@@ -3133,12 +3292,30 @@ export function analyzePowerShellCommand(
 		}
 	}
 
+	// 命令替换检测（PowerShell 版本）：tokenizePowerShell 不解析 $(...) 内部，
+	// 其中的命令对上面的全部分析不可见（`git log $(Remove-Item …)` 只看到 git）。
+	// 与 bash AST 不同无法补救，只能保守标记为危险模式（同时否决只读结论）。
+	if (command.includes("$(")) {
+		dangerousPatterns.push("command substitution $(...) (contents not analyzed)");
+		if (!nonWhitelisted.includes("(command substitution)")) {
+			nonWhitelisted.push("(command substitution)");
+		}
+	}
+
 	// 环境变量注入检测（PowerShell 版本）
 	const hasEnvInjection = /\$env:(LD_PRELOAD|NODE_OPTIONS|BASH_ENV|PROMPT_COMMAND)\b/i.test(
 		command,
 	);
 	if (hasEnvInjection && nonWhitelisted.length === 0) {
 		nonWhitelisted.push("(env injection)");
+	}
+
+	// $env:VAR = ... 赋值段对逐命令分析不可见（赋值段本身不是受管命令），
+	// 与 bash 侧的 variable_assignment 前缀同理记录下来。
+	const commandEnvVars: string[] = [];
+	for (const match of command.matchAll(/\$env:([A-Za-z_]\w*)\s*=/gi)) {
+		const varName = match[1];
+		if (varName && !commandEnvVars.includes(varName)) commandEnvVars.push(varName);
 	}
 
 	// Chapter 模式下的 git 分支违规检测
@@ -3154,6 +3331,7 @@ export function analyzePowerShellCommand(
 		nonWhitelisted,
 		dangerousPatterns,
 		hasEnvInjection,
+		commandEnvVars,
 		isCatastrophic: catastrophicReason !== undefined,
 		catastrophicReason,
 		gitBranchViolations: gitBranchResult.violations,

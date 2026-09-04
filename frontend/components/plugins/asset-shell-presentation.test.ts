@@ -63,6 +63,7 @@ function runShell(overrides: Record<string, unknown> = {}) {
 	};
 	const documentStub = {
 		createElement: makeElement,
+		documentElement: { dataset: {} as Record<string, string> },
 		head: {
 			get firstChild() {
 				return head[0] ?? null;
@@ -131,7 +132,7 @@ function runShell(overrides: Record<string, unknown> = {}) {
 		handler({ data: { protocol: "narrafork.ui/1", kind: "notification", method, params } });
 	};
 
-	return { sdk, tokenStyle, head, push };
+	return { sdk, tokenStyle, head, push, documentElement: documentStub.documentElement };
 }
 
 describe("shell presentation: first frame", () => {
@@ -211,6 +212,28 @@ describe("shell presentation: live updates", () => {
 		expect(tokenStyle?.textContent).toContain("#000");
 		// Still one element, not a second one appended per push.
 		expect(head.filter((node) => node.id === TOKEN_STYLE_ELEMENT_ID).length).toBe(1);
+	});
+
+	test("a theme push mirrors the color scheme onto the iframe document", () => {
+		const { documentElement, push } = runShell();
+		push("host.theme", { colorScheme: "light" });
+		expect(documentElement.dataset.mantineColorScheme).toBe("light");
+		push("host.theme", { colorScheme: "dark" });
+		expect(documentElement.dataset.mantineColorScheme).toBe("dark");
+	});
+
+	test("a color-scheme-only push does not clear previously pushed token CSS", () => {
+		// The host sends tokenCss and colorScheme as two separate host.theme messages
+		// (setThemeTokens vs setColorScheme). Applying the missing tokenCss as "" used
+		// to wipe the live tokens on every theme/language change.
+		const { tokenStyle, push, documentElement } = runShell({
+			tokenCss: ":root { --nf-color-body: #fff; }",
+		});
+		push("host.theme", { tokenCss: ":root { --nf-color-body: #000; }" });
+		expect(tokenStyle?.textContent).toContain("#000");
+		push("host.theme", { colorScheme: "dark" });
+		expect(documentElement.dataset.mantineColorScheme).toBe("dark");
+		expect(tokenStyle?.textContent).toContain("#000");
 	});
 
 	test("a locale push updates the SDK and notifies the plugin", () => {

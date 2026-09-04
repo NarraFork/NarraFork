@@ -21,7 +21,8 @@
  */
 
 import { type WorkspacePanel, workspacePanelDomId } from "@shared/workspace-panels";
-import type { SerializedDockview } from "dockview-react";
+import type { Direction, SerializedDockview } from "dockview-react";
+import type { PanelSpec } from "./dockview-layout";
 
 /**
  * Identity of a member, used to match it to a layout entry or a live panel.
@@ -314,4 +315,123 @@ function readLayoutPanels(
 /** The dockview panel id a member should be added under. */
 export function panelDomId(panel: WorkspacePanel): string {
 	return workspacePanelDomId(panel);
+}
+
+// ── Seed materialisation ─────────────────────────────────────────────────────
+
+/**
+ * One step of a seed-envelope materialisation, in spec order.
+ *
+ * `position` is undefined for the first placed panel (it owns the empty surface);
+ * later steps carry the spec's `direction` with the reference resolved to the
+ * already-placed member's dom id.
+ */
+export interface SeedPlacementStep {
+	member: WorkspacePanel;
+	/** Dom id the panel should be added under (`panelDomId(member)`). */
+	domId: string;
+	position?: { direction: Direction; referenceDomId: string };
+}
+
+export interface SeedMaterialisationPlan {
+	steps: SeedPlacementStep[];
+	/** Members the seed does not mention; the caller places them at default positions. */
+	appended: WorkspacePanel[];
+}
+
+/**
+ * Turn a seed envelope's specs into an ordered placement plan against membership.
+ *
+ * The seed is written at workspace creation (a sidebar drag) before any DockviewApi
+ * exists, and its whole point is the `placement` — which half of the surface each of
+ * the two narrators gets. Resolving `relative.referenceId` needs a map from the
+ * seed's temporary `dvp_*` ids to the dom ids members are actually added under,
+ * which is built as the plan is walked in spec order.
+ *
+ * Matching is by identity, not position: a narrator spec names its member by
+ * `narratorId`. Non-narrator specs and specs naming a non-member are skipped, and
+ * every unmatched member lands in `appended` — the "every member is placed"
+ * invariant holds exactly as in the dockview restore path.
+ */
+export function planSeedMaterialisation(
+	specs: readonly PanelSpec[],
+	members: readonly WorkspacePanel[],
+): SeedMaterialisationPlan {
+	const sorted = [...members].sort((a, b) => a.sortOrder - b.sortOrder);
+	const placed = new Set<string>();
+	const domIdBySpecId = new Map<string, string>();
+	const steps: SeedPlacementStep[] = [];
+
+	for (const spec of specs) {
+		const member = memberForSpec(spec, sorted);
+		if (!member) continue;
+		const identity = memberIdentity(member);
+		if (placed.has(identity)) continue;
+		placed.add(identity);
+
+		const domId = panelDomId(member);
+		let position: SeedPlacementStep["position"];
+		if (spec.placement.kind === "relative") {
+			const referenceDomId = domIdBySpecId.get(spec.placement.referenceId);
+			// A dangling reference degrades to a default-position append rather than
+			// dropping the panel: position data is expendable, membership is not.
+			if (referenceDomId) {
+				position = { direction: spec.placement.direction, referenceDomId };
+			}
+		}
+		steps.push({ member, domId, position });
+		domIdBySpecId.set(spec.id, domId);
+	}
+
+	const appended = sorted.filter((member) => !placed.has(memberIdentity(member)));
+	return { steps, appended };
+}
+
+/**
+ * The member a seed spec refers to, or null when the spec cannot be honoured.
+ *
+ * Only narrator specs are resolvable: the seed's other kinds (if a future creator
+ * emits them) have no row id to match against, and inventing one here is exactly
+ * what `panelRowId` exists to prevent.
+ */
+function memberForSpec(spec: PanelSpec, members: readonly WorkspacePanel[]): WorkspacePanel | null {
+	const params = spec.params as { panelType?: unknown; narratorId?: unknown } | undefined;
+	if (params?.panelType !== "narrator" || typeof params.narratorId !== "string") return null;
+	return (
+		members.find(
+			(member) => member.kind === "narrator" && member.narratorId === params.narratorId,
+		) ?? null
+	);
+}
+
+// ── Stale-layout refresh decision ────────────────────────────────────────────
+
+export type SurfaceRefreshDecision = "rebuild" | "adopt-baseline" | "ignore";
+
+/**
+ * Decide what a mounted surface should do when the workspace query delivers a
+ * DIFFERENT layout than the one the surface was built from.
+ *
+ * This is the guard that was missing when the query cache went stale: a refetch
+ * can deliver a layout written by another session (or by this one before a
+ * cache-less save), and blindly honouring it would either clobber the user's
+ * in-progress arrangement or — worse — let the stale arrangement be persisted
+ * back over the newer one on the next layout change.
+ *
+ *   - "ignore": the incoming tree IS the surface's baseline (our own save echoed
+ *     back through the cache) — nothing to do.
+ *   - "adopt-baseline": the user has local edits; the surface keeps them and the
+ *     next persist will make the server agree. The baseline still advances so a
+ *     later identical refetch is "ignore".
+ *   - "rebuild": no local edits, so the server layout is strictly newer
+ *     information — rebuild the surface from it.
+ */
+export function decideSurfaceRefresh(input: {
+	localEdit: boolean;
+	builtTree: string | null;
+	incomingTree: string | null | undefined;
+}): SurfaceRefreshDecision {
+	const incoming = input.incomingTree ?? null;
+	if (incoming === input.builtTree) return "ignore";
+	return input.localEdit ? "adopt-baseline" : "rebuild";
 }

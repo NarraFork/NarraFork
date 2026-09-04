@@ -219,8 +219,102 @@ describe("routePluginUiHostLocalRequest", () => {
 		expect(opened).toEqual(["https://example.com/docs"]);
 	});
 
+	test("panel.setHeight resizes through the delegate, clamped to host bounds", async () => {
+		// Without a setHeight delegate (Dockview panels) the method is NOT_SUPPORTED, which is
+		// the plugin's signal to stop reporting.
+		expect((await expectError("panel.setHeight", {}, { height: 400 })).code).toBe("NOT_SUPPORTED");
+		const heights: number[] = [];
+		const options = {
+			getPanelDelegate: (): PluginUiPanelDelegate => ({
+				setHeight: (height) => heights.push(height),
+			}),
+		};
+		expect(await route("panel.setHeight", options, { height: 640 })).toEqual({
+			ok: true,
+			height: 640,
+		});
+		// Untrusted input is clamped and rounded host-side.
+		expect(await route("panel.setHeight", options, { height: 12 })).toEqual({
+			ok: true,
+			height: 120,
+		});
+		expect(await route("panel.setHeight", options, { height: 99_999 })).toEqual({
+			ok: true,
+			height: 5000,
+		});
+		expect(await route("panel.setHeight", options, { height: 640.6 })).toEqual({
+			ok: true,
+			height: 641,
+		});
+		expect(heights).toEqual([640, 120, 5000, 641]);
+	});
+
+	test("panel.setHeight validates its params before touching the delegate", async () => {
+		const options = {
+			getPanelDelegate: (): PluginUiPanelDelegate => ({ setHeight: () => {} }),
+		};
+		expect((await expectError("panel.setHeight", options)).code).toBe("INVALID_PARAMS");
+		expect((await expectError("panel.setHeight", options, {})).code).toBe("INVALID_PARAMS");
+		expect((await expectError("panel.setHeight", options, { height: "640" })).code).toBe(
+			"INVALID_PARAMS",
+		);
+		expect((await expectError("panel.setHeight", options, { height: Number.NaN })).code).toBe(
+			"INVALID_PARAMS",
+		);
+	});
+
 	test("panel.setBadge / panel.setDirty report explicit NOT_SUPPORTED", async () => {
 		expect((await expectError("panel.setBadge", {}, { text: "1" })).code).toBe("NOT_SUPPORTED");
 		expect((await expectError("panel.setDirty", {}, { dirty: true })).code).toBe("NOT_SUPPORTED");
+	});
+
+	test("provider.modelsChanged calls the host invalidation with the session's plugin id", async () => {
+		expect((await expectError("provider.modelsChanged", {})).code).toBe("NOT_SUPPORTED");
+		const invalidated: string[] = [];
+		const result = await route("provider.modelsChanged", {
+			modelsChanged: (pluginId) => {
+				invalidated.push(pluginId);
+			},
+		});
+		expect(result).toEqual({ ok: true });
+		expect(invalidated).toEqual([params.pluginId]);
+	});
+
+	test("models.test forwards model and prompt, scoped by the session's plugin id", async () => {
+		expect((await expectError("models.test", {}, { model: "p:m" })).code).toBe("NOT_SUPPORTED");
+		const calls: Array<{ pluginId: string; model: string; prompt?: string }> = [];
+		const options = {
+			testModel: (pluginId: string, model: string, prompt?: string) => {
+				calls.push({ pluginId, model, ...(prompt === undefined ? {} : { prompt }) });
+				return Promise.resolve({ ok: true, text: "hi", diagnosticId: null });
+			},
+		};
+		expect(await route("models.test", options, { model: "cline:x-ai/grok-4.5" })).toEqual({
+			ok: true,
+			text: "hi",
+			diagnosticId: null,
+		});
+		expect(await route("models.test", options, { model: "cline:m", prompt: "ping" })).toEqual({
+			ok: true,
+			text: "hi",
+			diagnosticId: null,
+		});
+		expect(calls).toEqual([
+			{ pluginId: params.pluginId, model: "cline:x-ai/grok-4.5" },
+			{ pluginId: params.pluginId, model: "cline:m", prompt: "ping" },
+		]);
+	});
+
+	test("models.test validates its params before touching the host implementation", async () => {
+		const options = { testModel: () => Promise.resolve({ ok: true }) };
+		expect((await expectError("models.test", options)).code).toBe("INVALID_PARAMS");
+		expect((await expectError("models.test", options, {})).code).toBe("INVALID_PARAMS");
+		expect((await expectError("models.test", options, { model: "" })).code).toBe("INVALID_PARAMS");
+		expect((await expectError("models.test", options, { model: "x".repeat(301) })).code).toBe(
+			"INVALID_PARAMS",
+		);
+		expect(
+			(await expectError("models.test", options, { model: "p:m", prompt: "x".repeat(4001) })).code,
+		).toBe("INVALID_PARAMS");
 	});
 });

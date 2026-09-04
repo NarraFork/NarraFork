@@ -9,10 +9,13 @@
 import { describe, expect, test } from "bun:test";
 import type { WorkspacePanel } from "@shared/workspace-panels";
 import type { SerializedDockview } from "dockview-react";
+import type { PanelSpec } from "./dockview-layout";
 import {
+	decideSurfaceRefresh,
 	livePanelIdentity,
 	memberIdentity,
 	panelDomId,
+	planSeedMaterialisation,
 	reconcileLayoutWithPanels,
 } from "./workspace-panel-set";
 
@@ -367,5 +370,162 @@ describe("identity is independent of the dockview panel id", () => {
 				"wtool_n1_git",
 			),
 		).toBeNull();
+	});
+});
+
+function narratorSpec(
+	specId: string,
+	narratorId: string,
+	placement: PanelSpec["placement"],
+): PanelSpec {
+	return {
+		id: specId,
+		params: { panelType: "narrator", narratorId },
+		title: "Narrator",
+		placement,
+	};
+}
+
+describe("planSeedMaterialisation", () => {
+	// THE CREATION-TIME BUG: a workspace created by a sidebar drag persisted a seed
+	// envelope whose whole point is the split direction — and the surface then
+	// ignored it, stacking both narrators into one tab group.
+	test("two-narrator seed places the second panel relative to the first", () => {
+		const members = [narratorMember("n1", 1000), narratorMember("n2", 2000)];
+		const specs: PanelSpec[] = [
+			narratorSpec("dvp_a_1", "n1", { kind: "first" }),
+			narratorSpec("dvp_a_2", "n2", {
+				kind: "relative",
+				referenceId: "dvp_a_1",
+				direction: "right",
+			}),
+		];
+
+		const plan = planSeedMaterialisation(specs, members);
+
+		expect(plan.appended).toEqual([]);
+		expect(plan.steps).toHaveLength(2);
+		expect(plan.steps[0].domId).toBe("n1");
+		expect(plan.steps[0].position).toBeUndefined();
+		expect(plan.steps[1].domId).toBe("n2");
+		// The reference is resolved to the first MEMBER's dom id, not the seed's
+		// temporary dvp_* id — dockview knows nothing about the latter.
+		expect(plan.steps[1].position).toEqual({ direction: "right", referenceDomId: "n1" });
+	});
+
+	test("a member the seed does not mention is appended, never dropped", () => {
+		const members = [narratorMember("n1", 1000), narratorMember("n2", 2000)];
+		const specs: PanelSpec[] = [narratorSpec("dvp_a_1", "n1", { kind: "first" })];
+
+		const plan = planSeedMaterialisation(specs, members);
+
+		expect(plan.steps.map((step) => step.member.narratorId)).toEqual(["n1"]);
+		expect(plan.appended.map((panel) => panel.narratorId)).toEqual(["n2"]);
+	});
+
+	test("a spec naming a non-member narrator is skipped", () => {
+		const members = [narratorMember("n1", 1000)];
+		const specs: PanelSpec[] = [
+			narratorSpec("dvp_a_1", "n1", { kind: "first" }),
+			narratorSpec("dvp_a_2", "gone", {
+				kind: "relative",
+				referenceId: "dvp_a_1",
+				direction: "below",
+			}),
+		];
+
+		const plan = planSeedMaterialisation(specs, members);
+
+		expect(plan.steps.map((step) => step.member.narratorId)).toEqual(["n1"]);
+		expect(plan.appended).toEqual([]);
+	});
+
+	test("a dangling reference degrades to a default position rather than dropping the panel", () => {
+		const members = [narratorMember("n1", 1000), narratorMember("n2", 2000)];
+		const specs: PanelSpec[] = [
+			narratorSpec("dvp_a_1", "n1", { kind: "first" }),
+			narratorSpec("dvp_a_2", "n2", {
+				kind: "relative",
+				referenceId: "dvp_nonexistent",
+				direction: "right",
+			}),
+		];
+
+		const plan = planSeedMaterialisation(specs, members);
+
+		expect(plan.steps).toHaveLength(2);
+		expect(plan.steps[1].position).toBeUndefined();
+	});
+
+	test("a non-narrator spec is skipped rather than inventing a row id", () => {
+		const members = [narratorMember("n1", 1000)];
+		const specs: PanelSpec[] = [
+			{
+				id: "dvp_t_1",
+				params: { panelType: "terminal", panelRowId: "row-t", terminalConfig: { cwd: "/x" } },
+				title: "Terminal",
+				placement: { kind: "first" },
+			},
+			narratorSpec("dvp_a_1", "n1", { kind: "first" }),
+		];
+
+		const plan = planSeedMaterialisation(specs, members);
+
+		expect(plan.steps.map((step) => step.member.narratorId)).toEqual(["n1"]);
+	});
+
+	test("a narrator repeated across specs is placed once", () => {
+		const members = [narratorMember("n1", 1000)];
+		const specs: PanelSpec[] = [
+			narratorSpec("dvp_a_1", "n1", { kind: "first" }),
+			narratorSpec("dvp_a_2", "n1", {
+				kind: "relative",
+				referenceId: "dvp_a_1",
+				direction: "right",
+			}),
+		];
+
+		const plan = planSeedMaterialisation(specs, members);
+
+		expect(plan.steps).toHaveLength(1);
+		expect(plan.appended).toEqual([]);
+	});
+});
+
+describe("decideSurfaceRefresh", () => {
+	// THE STALE-CACHE BUG: the surface was built from a cached tree while the server
+	// held a newer one, and nothing reconciled them — so the stale arrangement was
+	// what the next persist wrote back.
+	test("an incoming tree identical to the baseline is ignored", () => {
+		expect(
+			decideSurfaceRefresh({ localEdit: false, builtTree: "tree-a", incomingTree: "tree-a" }),
+		).toBe("ignore");
+	});
+
+	test("a different tree with no local edits rebuilds from the server layout", () => {
+		expect(
+			decideSurfaceRefresh({ localEdit: false, builtTree: "tree-a", incomingTree: "tree-b" }),
+		).toBe("rebuild");
+	});
+
+	test("a different tree WITH local edits keeps the surface and only advances the baseline", () => {
+		expect(
+			decideSurfaceRefresh({ localEdit: true, builtTree: "tree-a", incomingTree: "tree-b" }),
+		).toBe("adopt-baseline");
+	});
+
+	test("null/undefined incoming trees compare equal to a null baseline", () => {
+		expect(decideSurfaceRefresh({ localEdit: false, builtTree: null, incomingTree: null })).toBe(
+			"ignore",
+		);
+		expect(
+			decideSurfaceRefresh({ localEdit: false, builtTree: null, incomingTree: undefined }),
+		).toBe("ignore");
+	});
+
+	test("an empty baseline with a real incoming tree rebuilds", () => {
+		expect(
+			decideSurfaceRefresh({ localEdit: false, builtTree: null, incomingTree: "tree-a" }),
+		).toBe("rebuild");
 	});
 });

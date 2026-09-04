@@ -103,6 +103,7 @@ export interface InstanceSettingsState {
 	sizeWarning: number;
 	autoSave: boolean;
 	dormantMinutes: number;
+	treeSnapshots: boolean;
 	// Containers
 	portStart: number;
 	portEnd: number;
@@ -206,6 +207,7 @@ function makeDefaults(): InstanceSettingsState {
 		sizeWarning: 500,
 		autoSave: true,
 		dormantMinutes: 0,
+		treeSnapshots: true,
 		portStart: 10000,
 		portEnd: 20000,
 		proxyEnabled: false,
@@ -324,6 +326,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				sizeWarning: settings.chapters?.worktreeSizeWarningMb ?? 500,
 				autoSave: settings.chapters?.autoSaveOnDormant ?? true,
 				dormantMinutes: settings.chapters?.dormantAfterMinutes ?? 0,
+				treeSnapshots: settings.chapters?.treeSnapshotsEnabled ?? true,
 				portStart: settings.containers?.portRangeStart ?? 10000,
 				portEnd: settings.containers?.portRangeEnd ?? 20000,
 				proxyEnabled: settings.containers?.proxy?.enabled ?? false,
@@ -450,6 +453,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					worktreeSizeWarningMb: state.sizeWarning,
 					autoSaveOnDormant: state.autoSave,
 					dormantAfterMinutes: state.dormantMinutes,
+					treeSnapshotsEnabled: state.treeSnapshots,
 				},
 				containers: {
 					portRangeStart: state.portStart,

@@ -38,6 +38,7 @@ import type {
 	NarratorDetailsPanelExternalProps,
 } from "../narrator-panel-types";
 import {
+	type FilePanelParams,
 	type KnowledgeEntryScope,
 	type KnowledgePanelParams,
 	nextHighlightRequestId,
@@ -418,59 +419,81 @@ export function NarratorDockProvider({
 	// Same placement rule as the other secondary panels, but multi-instance: the
 	// panel id is derived from the path, so re-opening the same file focuses the
 	// existing viewer instead of stacking duplicates.
-	const openFilePanel = useCallback((filePath: string, fileName?: string) => {
-		const api = apiRef.current;
-		if (!api || !filePath) return;
-		const id = fileDockPanelId(filePath);
-		const existing = api.getPanel(id);
-		if (existing) {
-			existing.api.setActive();
-			return;
-		}
+	const openFilePanel = useCallback(
+		(filePath: string, fileName?: string) => {
+			const api = apiRef.current;
+			if (!api || !filePath) return;
+			const id = fileDockPanelId(filePath);
+			const existing = api.getPanel(id);
+			if (existing) {
+				// Layouts written before file editing carried no host identity. Repair the
+				// live panel when it is reopened so the edit action appears immediately and
+				// the corrected params are available to later drags / persistence. Guard the
+				// cast: corrupt persisted params are replaced wholesale — falling through to
+				// addPanel would throw on the duplicate id.
+				const current = existing.params as FilePanelParams | undefined;
+				if (current && typeof current.filePath === "string") {
+					if (current.hostNarratorId !== narratorId) {
+						existing.api.updateParameters({ ...current, hostNarratorId: narratorId });
+					}
+				} else {
+					existing.api.updateParameters({
+						panelType: "file",
+						hostNarratorId: narratorId,
+						filePath,
+						...(fileName ? { fileName } : {}),
+					});
+				}
+				existing.api.setActive();
+				return;
+			}
 
-		const existingSecondary = api.panels.find((panel) => {
-			const panelParams = panel.params as NarratorDockPanelParams | undefined;
-			return panelParams?.panelType !== "chat";
-		});
-		const chatPanel = api.getPanel(dockPanelId("chat"));
-		const params: NarratorDockPanelParams = {
-			panelType: "file",
-			filePath,
-			...(fileName ? { fileName } : {}),
-		};
-		const placement = resolveToolPlacement({
-			hasSecondaryGroup: !!existingSecondary?.group,
-			hasChatPanel: !!chatPanel,
-			surfaceWidth: api.width,
-		});
+			const existingSecondary = api.panels.find((panel) => {
+				const panelParams = panel.params as NarratorDockPanelParams | undefined;
+				return panelParams?.panelType !== "chat";
+			});
+			const chatPanel = api.getPanel(dockPanelId("chat"));
+			const params: NarratorDockPanelParams = {
+				panelType: "file",
+				hostNarratorId: narratorId,
+				filePath,
+				...(fileName ? { fileName } : {}),
+			};
+			const placement = resolveToolPlacement({
+				hasSecondaryGroup: !!existingSecondary?.group,
+				hasChatPanel: !!chatPanel,
+				surfaceWidth: api.width,
+			});
 
-		if (placement.mode === "within-secondary" && existingSecondary?.group) {
+			if (placement.mode === "within-secondary" && existingSecondary?.group) {
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT.file,
+					params,
+					position: { referenceGroup: existingSecondary.group },
+				});
+				return;
+			}
+
+			if (placement.mode === "split-right" && chatPanel) {
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT.file,
+					params,
+					initialWidth: placement.initialWidth,
+					position: { referencePanel: chatPanel.id, direction: "right" },
+				});
+				return;
+			}
+
 			api.addPanel<NarratorDockPanelParams>({
 				id,
 				component: NARRATOR_DOCK_COMPONENT.file,
 				params,
-				position: { referenceGroup: existingSecondary.group },
 			});
-			return;
-		}
-
-		if (placement.mode === "split-right" && chatPanel) {
-			api.addPanel<NarratorDockPanelParams>({
-				id,
-				component: NARRATOR_DOCK_COMPONENT.file,
-				params,
-				initialWidth: placement.initialWidth,
-				position: { referencePanel: chatPanel.id, direction: "right" },
-			});
-			return;
-		}
-
-		api.addPanel<NarratorDockPanelParams>({
-			id,
-			component: NARRATOR_DOCK_COMPONENT.file,
-			params,
-		});
-	}, []);
+		},
+		[narratorId],
+	);
 
 	// Same placement rule as the other multi-instance secondary panels (file,
 	// subagent). The panel id is derived from the entryId (a nanoid, safe as-is).

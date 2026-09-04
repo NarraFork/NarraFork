@@ -32,6 +32,7 @@ import { PluginSecretVault } from "@server/services/plugin-secret-vault";
 const PLUGIN_ROOT = resolve(import.meta.dir, "../../../../examples/plugins/cline-external");
 const CREDENTIALS_KEY = "provider.cline.credentials";
 const ENABLED_MODELS_KEY = "provider.cline.enabledModels";
+const PACKAGE_DIGEST = "a".repeat(64);
 
 const roots: string[] = [];
 
@@ -107,10 +108,12 @@ function createRuntime(
 	return new PluginRuntime({
 		pluginId: manifest.pluginId,
 		pluginVersion: manifest.version,
+		packageDigest: PACKAGE_DIGEST,
 		runtimeId: "runtime-cline-cmd-e2e",
 		generation: 1,
 		command: [process.execPath, join(PLUGIN_ROOT, manifest.server.entry)],
 		cwd: PLUGIN_ROOT,
+		env: { NF_PLUGIN_PACKAGE_DIGEST: PACKAGE_DIGEST },
 		rpcProtocol: manifest.server.protocol,
 		hostApiVersion: "1.0",
 		grantedCapabilities: manifest.permissions.host,
@@ -411,6 +414,9 @@ describe("cline-external commands: model selection", () => {
 			});
 			expect(output.count).toBe(2);
 			expect(output.truncated).toBe(false);
+			// The host-side dispatcher refreshes the provider catalog after applying this write;
+			// the command only reports that such a sync is expected.
+			expect(output.catalogSync).toEqual({ requested: true });
 			expect(applied).toEqual([ENABLED_MODELS_KEY]);
 			expect(await vault.getSecret({ pluginId, key: ENABLED_MODELS_KEY })).toBe(
 				'["anthropic/claude-sonnet-4.6","deepseek/deepseek-chat"]',
@@ -475,6 +481,18 @@ describe("cline-external commands: unknown commands", () => {
 	test("an unregistered command id is a not-found error", async () => {
 		await withPlugin({}, async ({ invoke }) => {
 			await expect(invoke("does.not.exist")).rejects.toThrow();
+		});
+	}, 60_000);
+
+	test("baseUrl has no plugin command, because the host owns that config field", async () => {
+		// A custom provider-settings view replaces the generated form, so it is tempting to add a
+		// `config.setBaseUrl` command. That would give one setting two persistence paths with
+		// different validation and failure semantics; the host's provider-config endpoint is the
+		// single writer instead.
+		await withPlugin({}, async ({ invoke }) => {
+			await expect(
+				invoke("config.setBaseUrl", { baseUrl: "https://example.invalid" }),
+			).rejects.toThrow();
 		});
 	}, 60_000);
 });

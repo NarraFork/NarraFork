@@ -41,10 +41,25 @@ export interface CodexUsageResult {
 	primary_window?: CodexUsageWindow;
 	secondary_window?: CodexUsageWindow;
 	code_review?: Omit<CodexUsageWindow, "window_type" | "limit_window_seconds">;
+	/**
+	 * Rate-limit reset credits available for immediate window resets, from the
+	 * `rate_limit_reset_credits.available_count` field of the same /wham/usage
+	 * response. Absent when the upstream payload omits the field.
+	 */
+	reset_credits_available?: number;
 	queriedAt: string;
 }
 
+export interface CodexResetCreditConsumeResult {
+	/** Upstream result code (e.g. "ok"), empty string when absent. */
+	code: string;
+	/** Number of rate-limit windows the upstream reset as a result. */
+	windowsReset: number;
+}
+
 const USAGE_API_URL = "https://chatgpt.com/backend-api/wham/usage";
+const RESET_CREDITS_CONSUME_API_URL =
+	"https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 const DEFAULT_USAGE_FETCH_TIMEOUT_MS = 20_000;
 const MAX_USAGE_RESPONSE_BYTES = 256 * 1024;
 const MONTHLY_WINDOW_MIN_SECONDS = 28 * 24 * 60 * 60;
@@ -200,6 +215,13 @@ export function parseCodexUsagePayload(
 		...(secondaryWindow ? { secondary_window: secondaryWindow } : {}),
 	};
 
+	if (isRecord(value.rate_limit_reset_credits)) {
+		const availableCount = finiteNumber(value.rate_limit_reset_credits.available_count);
+		if (availableCount !== undefined && availableCount >= 0) {
+			result.reset_credits_available = Math.floor(availableCount);
+		}
+	}
+
 	if (isRecord(value.code_review_rate_limit)) {
 		const codeReview = normalizeCodeReviewWindow(
 			value.code_review_rate_limit.primary_window,
@@ -330,6 +352,99 @@ export async function fetchCodexUsage(
 		return result;
 	} catch (err) {
 		logger.error("Failed to fetch Codex usage", {
+			error: err instanceof Error ? err.message : String(err),
+			accountId: accountId.slice(0, 8),
+		});
+		throw err;
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+/**
+ * Consume one rate-limit reset credit, immediately resetting the relevant
+ * upstream rate-limit window(s). A unique `redeem_request_id` is generated per
+ * call as the idempotency key, matching the Codex client behavior.
+ *
+ * Auth mirrors `fetchCodexUsage`: bearer token by default, or a full
+ * `authorization` override (e.g. Agent Identity's `AgentAssertion ...`).
+ */
+export async function consumeCodexResetCredit(
+	accessToken: string,
+	accountId: string,
+	proxy?: string,
+	authorization?: string,
+): Promise<CodexResetCreditConsumeResult> {
+	const headers = {
+		Authorization: authorization?.trim() || `Bearer ${accessToken}`,
+		"Content-Type": "application/json",
+		Accept: "application/json",
+		"User-Agent": "narrafork/1.0.0 (Bun)",
+		"Chatgpt-Account-Id": accountId,
+	};
+
+	const abortController = new AbortController();
+	const timeout = setTimeout(() => {
+		abortController.abort(
+			new Error(`Codex reset-credit consume timed out after ${DEFAULT_USAGE_FETCH_TIMEOUT_MS}ms`),
+		);
+	}, DEFAULT_USAGE_FETCH_TIMEOUT_MS);
+
+	const fetchOptions: RequestInit = {
+		method: "POST",
+		headers,
+		body: JSON.stringify({ redeem_request_id: crypto.randomUUID() }),
+		signal: abortController.signal,
+	};
+	if (proxy) {
+		// @ts-expect-error - Bun supports proxy option
+		fetchOptions.proxy = proxy;
+	}
+
+	try {
+		const response = await fetch(RESET_CREDITS_CONSUME_API_URL, fetchOptions);
+		if (!response.ok) {
+			let responseBody: string | undefined;
+			try {
+				responseBody = await readResponseTextWithLimit(response);
+			} catch {
+				// Preserve the HTTP status even when an oversized or unreadable error body is discarded.
+			}
+			throw new CodexUsageFetchError(
+				`Failed to consume reset credit: ${response.status} ${response.statusText}`,
+				response.status,
+				response.statusText,
+				responseBody,
+			);
+		}
+
+		const raw = await readResponseTextWithLimit(response);
+		let data: unknown;
+		try {
+			data = JSON.parse(raw);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			throw new Error(
+				`Codex reset-credit consume returned non-JSON payload: ${message}. body preview=${raw.slice(0, 500)}`,
+			);
+		}
+		if (!isRecord(data)) {
+			throw new Error("Codex reset-credit consume returned an invalid payload");
+		}
+		const code = typeof data.code === "string" ? data.code : "";
+		const windowsResetRaw = finiteNumber(data.windows_reset);
+		const result: CodexResetCreditConsumeResult = {
+			code,
+			windowsReset: windowsResetRaw !== undefined && windowsResetRaw >= 0 ? windowsResetRaw : 0,
+		};
+		logger.info("Consumed Codex reset credit", {
+			accountId: accountId.slice(0, 8),
+			code: result.code,
+			windowsReset: result.windowsReset,
+		});
+		return result;
+	} catch (err) {
+		logger.error("Failed to consume Codex reset credit", {
 			error: err instanceof Error ? err.message : String(err),
 			accountId: accountId.slice(0, 8),
 		});

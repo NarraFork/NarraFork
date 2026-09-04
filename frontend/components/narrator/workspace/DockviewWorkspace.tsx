@@ -21,6 +21,7 @@
 
 import { notifications } from "@mantine/notifications";
 import type { WorkspacePanel } from "@shared/workspace-panels";
+import { useQueryClient } from "@tanstack/react-query";
 import {
 	type DockviewApi,
 	type DockviewDidDropEvent,
@@ -29,6 +30,7 @@ import {
 } from "dockview-react";
 import { type RefObject, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
+import { workspaceQueryKey } from "../../../hooks/useWorkspace";
 import { api as apiClient, isWorkspaceLayoutConflict } from "../../../lib/api";
 import { isNarratorSubject, type PanelDragState } from "../../../lib/panel-drag";
 import { type DockviewDropTarget, DockviewSurface, intentToPosition } from "../../dockview";
@@ -46,9 +48,11 @@ import {
 import { type WorkspacePanelParams, workspacePanelComponents } from "./panels";
 import { createWorkspaceDockStore, WorkspaceDockProvider } from "./workspace-dock";
 import {
+	decideSurfaceRefresh,
 	livePanelIdentity,
 	memberIdentity,
 	panelDomId,
+	planSeedMaterialisation,
 	reconcileLayoutWithPanels,
 } from "./workspace-panel-set";
 
@@ -107,8 +111,6 @@ interface DockviewWorkspaceProps {
 	treeJson: string | null | undefined;
 	/** Optimistic-concurrency token for layout writes. */
 	layoutRevision: number;
-	/** Server updatedAt (ms) used to detect fresh refetches. */
-	serverUpdatedAt: number | undefined;
 	/** Notify parent when the live narrator id set changes (for recent-tab sync). */
 	onNarratorIdsChange?: (ids: string[]) => void;
 	/**
@@ -206,7 +208,6 @@ export function DockviewWorkspace({
 	panels,
 	treeJson,
 	layoutRevision,
-	serverUpdatedAt,
 	onNarratorIdsChange,
 	onMembershipChanged,
 	onPanelsChange,
@@ -215,6 +216,7 @@ export function DockviewWorkspace({
 	directorControlRef,
 }: DockviewWorkspaceProps) {
 	const { t } = useTranslation("narrators");
+	const qc = useQueryClient();
 	const apiRef = useRef<DockviewApi | null>(null);
 	// Per-workspace dock store (shards tool-panel coordination by narratorId).
 	// Created once, bound to this surface's api ref.
@@ -223,8 +225,34 @@ export function DockviewWorkspace({
 	const apiDisposablesRef = useRef<Array<{ dispose(): void }>>([]);
 	const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const directorRef = useRef<WorkspaceDirectorState>({ ...DEFAULT_DIRECTOR_STATE });
+	/**
+	 * Whether the user has edited the arrangement on THIS mount.
+	 *
+	 * This is the guard against a stale-query-cache clobber: when a refetch delivers
+	 * a layout that differs from what the surface shows, a local edit means "keep
+	 * the surface, the next persist makes the server agree", while no local edit
+	 * means the server layout is strictly newer and the surface rebuilds from it.
+	 * Local-first lasts only for this mount; remounting re-adopts server state.
+	 */
 	const localEditRef = useRef(false);
-	const loadedAtRef = useRef<number | null>(null);
+	/**
+	 * The tree string the surface was last built from (or saved as).
+	 *
+	 * Compared against the incoming `treeJson` prop so a refetch that delivers the
+	 * SAME layout (including our own save echoed through the query cache) does not
+	 * trigger a rebuild. String equality is sufficient: the tree is serialized
+	 * deterministically by `serializeWorkspaceLayout`.
+	 */
+	const builtTreeRef = useRef<string | null>(null);
+	/**
+	 * Suppresses the `onDidLayoutChange` handler while a rebuild is in flight.
+	 *
+	 * Rebuilding calls `fromJSON`, which fires layout-change events; without the
+	 * flag those would set `localEditRef` (making every later server-side change
+	 * invisible) and persist the rebuilt layout straight back (a pointless write
+	 * that also bumps the revision). Both handlers check this before doing work.
+	 */
+	const suppressLayoutEventsRef = useRef(false);
 	/** Narrator ids we have joined (via panels) and must leave on unmount. */
 	const joinedNarratorIdsRef = useRef<Set<string>>(new Set());
 	/** One save-failure notice per mount, so a failing debounce cannot spam. */
@@ -277,6 +305,35 @@ export function DockviewWorkspace({
 	);
 
 	/**
+	 * Reflect a successful layout save in the query cache.
+	 *
+	 * Without this the `["workspace", id]` entry keeps the tree from the last FETCH
+	 * while the server holds a newer one — and since the entry survives unmount for
+	 * `gcTime`, a quick leave-and-return mounts with the stale tree, restores the
+	 * stale arrangement, and persists it straight back over the newer one on the
+	 * next layout change. That round-trip is exactly how "my split layout never
+	 * survives reopening the workspace" happened. The cache entry mirrors what the
+	 * single-workspace GET returns (`layout` alongside `tree`).
+	 */
+	const commitSavedLayout = useCallback(
+		(serialized: string, revision: number) => {
+			layoutRevisionRef.current = revision;
+			builtTreeRef.current = serialized;
+			qc.setQueryData(workspaceQueryKey(workspaceId), (old: unknown) => {
+				if (!old || typeof old !== "object") return old;
+				return {
+					...(old as Record<string, unknown>),
+					tree: serialized,
+					layout: serialized,
+					layoutRevision: revision,
+					updatedAt: new Date().toISOString(),
+				};
+			});
+		},
+		[qc, workspaceId],
+	);
+
+	/**
 	 * Save the arrangement, rebasing once if another session saved first.
 	 *
 	 * A conflict is not an error worth showing: the layout carries positions only, so
@@ -293,7 +350,7 @@ export function DockviewWorkspace({
 					serialized,
 					layoutRevisionRef.current,
 				);
-				layoutRevisionRef.current = result.layoutRevision;
+				commitSavedLayout(serialized, result.layoutRevision);
 			} catch (error) {
 				if (isWorkspaceLayoutConflict(error)) {
 					layoutRevisionRef.current = error.data.currentRevision;
@@ -303,7 +360,7 @@ export function DockviewWorkspace({
 							serialized,
 							layoutRevisionRef.current,
 						);
-						layoutRevisionRef.current = retry.layoutRevision;
+						commitSavedLayout(serialized, retry.layoutRevision);
 					} catch (retryError) {
 						if (isWorkspaceLayoutConflict(retryError)) {
 							layoutRevisionRef.current = retryError.data.currentRevision;
@@ -316,7 +373,7 @@ export function DockviewWorkspace({
 				reportLayoutSaveFailure(workspaceId, serialized, error);
 			}
 		},
-		[workspaceId, reportLayoutSaveFailure],
+		[workspaceId, reportLayoutSaveFailure, commitSavedLayout],
 	);
 
 	const persist = useCallback(() => {
@@ -615,15 +672,65 @@ export function DockviewWorkspace({
 	 * set; when `fromJSON` threw it fell back to `resolveWorkspaceLayout(null)`, which
 	 * yields ZERO panels — a blank workspace, which is the symptom this redesign
 	 * removes. Here every failure path still ends with every member placed.
+	 *
+	 * Callers must ensure the surface is EMPTY first (initial mount, or
+	 * `rebuildSurface` having closed every panel): the seed branch's `addPanel`
+	 * calls do not dedupe against live panels.
 	 */
 	const buildSurface = useCallback(
 		(api: DockviewApi) => {
 			const members = panelsRef.current;
-			const resolved = resolveWorkspaceLayout(treeJsonRef.current);
+			const treeJson = treeJsonRef.current;
+			const resolved = resolveWorkspaceLayout(treeJson);
 			directorRef.current = resolved.director;
 			// Seed the store's director flag from the restored state so underlying
 			// panels start unmounted when a workspace reopens in director mode.
 			dockStoreRef.current?.setDirectorActive(resolved.director.mode === "director");
+			// Record the baseline the surface is being built from, so the stale-refresh
+			// effect can tell "a refetch delivered this same tree" (nothing to do)
+			// from "the server holds a different layout" (maybe rebuild).
+			builtTreeRef.current = treeJson ?? null;
+
+			if (resolved.kind === "seed") {
+				// A freshly created workspace (sidebar drag). The seed carries PLACEMENT
+				// only — honour it, or the two narrators collapse into one tab group
+				// and the split the user just dragged is lost on first open.
+				const seedPlan = planSeedMaterialisation(resolved.specs, members);
+				for (const step of seedPlan.steps) {
+					const params = paramsForMember(step.member);
+					if (!params) continue;
+					// The seed blob is persisted user data (it can arrive via a project-db
+					// import), so an individual placement may be malformed even though the
+					// plan builder sanitized references. One bad step must not abort the
+					// loop: buildSurface runs before the layout listeners are registered,
+					// so a throw here would leave a half-placed surface with no
+					// persistence, no membership detach and no drag acceptance.
+					try {
+						api.addPanel({
+							id: step.domId,
+							component: componentForParams(params),
+							params,
+							position: step.position
+								? {
+										direction: step.position.direction,
+										referencePanel: step.position.referenceDomId,
+									}
+								: undefined,
+						});
+					} catch (error) {
+						console.warn("[workspace] seed placement failed; appending member instead", {
+							workspaceId,
+							member: step.member,
+							error,
+						});
+						addMemberPanel(api, step.member);
+					}
+				}
+				for (const member of seedPlan.appended) {
+					addMemberPanel(api, member);
+				}
+				return;
+			}
 
 			const plan = reconcileLayoutWithPanels({
 				panels: members,
@@ -663,7 +770,6 @@ export function DockviewWorkspace({
 		(api: DockviewApi) => {
 			apiRef.current = api;
 			buildSurface(api);
-			loadedAtRef.current = serverUpdatedAt ?? null;
 
 			// Director mode is a pure overlay owned by the route; just report the
 			// restored state so the toolbar + overlay reflect it.
@@ -674,6 +780,9 @@ export function DockviewWorkspace({
 			// Persist on any structural layout change (debounced).
 			const disposables = [
 				api.onDidLayoutChange(() => {
+					// A rebuild (stale-refresh) runs `fromJSON`, which fires this event;
+					// the suppression flag keeps that from being misread as a user edit.
+					if (suppressLayoutEventsRef.current) return;
 					localEditRef.current = true;
 					persist();
 					syncNarratorIds();
@@ -700,8 +809,62 @@ export function DockviewWorkspace({
 			];
 			apiDisposablesRef.current = disposables;
 		},
-		[persist, serverUpdatedAt, syncNarratorIds, onApiReady, onDirectorStateChange, buildSurface],
+		[persist, syncNarratorIds, onApiReady, onDirectorStateChange, buildSurface],
 	);
+
+	/**
+	 * Rebuild the surface in place from the latest props.
+	 *
+	 * Used when a refetch delivers a different layout than the surface was built
+	 * from and the user has no local edits to protect. Every live panel is closed
+	 * through `closePanelInternally` so `onDidRemovePanel` does not detach the
+	 * panel from membership, and layout events are suppressed so the rebuild's
+	 * `fromJSON` is not misread as a user edit (which would set `localEditRef`
+	 * and persist the rebuilt layout straight back).
+	 */
+	const rebuildSurface = useCallback(
+		(api: DockviewApi) => {
+			suppressLayoutEventsRef.current = true;
+			try {
+				for (const panel of [...api.panels]) closePanelInternally(panel);
+				buildSurface(api);
+			} finally {
+				suppressLayoutEventsRef.current = false;
+			}
+			// The per-event syncs were suppressed above; reconcile once, explicitly.
+			syncNarratorIds();
+		},
+		[buildSurface, closePanelInternally, syncNarratorIds],
+	);
+
+	/**
+	 * Stale-cache guard: adopt a server-side layout delivered by a refetch.
+	 *
+	 * `buildSurface` runs once at mount against whatever the query cache held —
+	 * which, for a workspace revisited within `gcTime`, is the tree from the
+	 * PREVIOUS visit unless a save updated the cache in between. When the fresh
+	 * fetch lands with a different tree this effect decides what to do (see
+	 * `decideSurfaceRefresh`): without it the stale arrangement stayed on screen,
+	 * and the next layout change persisted it back over the newer one — the
+	 * round-trip that made split layouts "never survive reopening".
+	 */
+	useEffect(() => {
+		const api = apiRef.current;
+		if (!api) return;
+		const decision = decideSurfaceRefresh({
+			localEdit: localEditRef.current,
+			builtTree: builtTreeRef.current,
+			incomingTree: treeJson,
+		});
+		if (decision === "ignore") return;
+		if (decision === "adopt-baseline") {
+			// Local edits win on this mount; advance the baseline so a later
+			// identical refetch is recognised as "ignore".
+			builtTreeRef.current = treeJson ?? null;
+			return;
+		}
+		rebuildSurface(api);
+	}, [treeJson, rebuildSurface]);
 
 	/**
 	 * Reflect server-side membership changes onto a surface that is already mounted.
@@ -850,6 +1013,11 @@ export function DockviewWorkspace({
 					const serialized = serializeWorkspaceLayout(api, directorRef.current);
 					apiClient
 						.saveWorkspaceLayout(workspaceId, serialized, layoutRevisionRef.current)
+						.then((result) => {
+							// Keep the cache in step even on the way out: the entry survives
+							// unmount for `gcTime`, and a quick return mounts from it.
+							commitSavedLayout(serialized, result.layoutRevision);
+						})
 						.catch((error) => {
 							// A conflict here is expected and harmless: another session's
 							// arrangement simply wins, and no panel is lost either way.
@@ -878,7 +1046,7 @@ export function DockviewWorkspace({
 			}
 			for (const nId of ids) apiClient.leaveNarrator(nId).catch(() => {});
 		};
-	}, [workspaceId]);
+	}, [workspaceId, commitSavedLayout]);
 
 	return (
 		<WorkspaceDockProvider store={dockStoreRef.current} workspaceId={workspaceId}>

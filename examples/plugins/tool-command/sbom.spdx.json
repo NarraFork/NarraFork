@@ -8,7 +8,7 @@
 		{
 			"SPDXID": "SPDXRef-tool-command",
 			"name": "com.example.tool-command",
-			"versionInfo": "1.0.0",
+			"versionInfo": "1.0.1",
 			"licenseDeclared": "Apache-2.0",
 			"licenseConcluded": "Apache-2.0"
 		}

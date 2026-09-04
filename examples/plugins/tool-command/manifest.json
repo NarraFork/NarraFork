@@ -1,7 +1,7 @@
 {
 	"schemaVersion": 1,
 	"pluginId": "com.example.tool-command",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"displayName": "Example Tool and Command",
 	"description": "Minimal GA example exposing one server tool and command.",
 	"publisher": { "id": "com.example", "name": "Example Team" },

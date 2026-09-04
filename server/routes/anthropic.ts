@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { Hono } from "hono";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
+import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
 	type AnthropicProviderConfig,
 	anthropicProviderPrefix,
@@ -212,7 +213,11 @@ export async function fetchAnthropicModels(
 	for (const candidate of candidates) {
 		const candidateUrl = `${candidate.base}/models`;
 		try {
-			const resp = await fetch(candidateUrl, { headers });
+			// Honour the global outbound proxy policy and this provider's proxy
+			// override, same as chat requests (plain fetch would bypass both).
+			const proxy = resolveProxyForUrl(candidateUrl, config.proxy);
+			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
+			const resp = await fetch(candidateUrl, { headers, ...(proxy ? { proxy } : {}) } as any);
 			if (resp.ok) {
 				response = resp;
 				// candidates[0] is the configured base URL — no correction needed.

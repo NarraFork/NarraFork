@@ -15,6 +15,7 @@ import {
 } from "../lib/cline-auth";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
 	type ClineProviderConfig,
 	clineProviderPrefix,
@@ -237,12 +238,18 @@ registerClineModelLister(() => {
 });
 
 /** Fetch models from OpenRouter API (public endpoint, always from openrouter.ai). */
-async function fetchOpenRouterModels(_config: ClineProviderConfig): Promise<ClineModelInfo[]> {
+async function fetchOpenRouterModels(config: ClineProviderConfig): Promise<ClineModelInfo[]> {
 	const baseUrl = "https://openrouter.ai/api/v1";
 
-	const response = await fetch(`${baseUrl}/models`, {
+	const url = `${baseUrl}/models`;
+	// Honour the global outbound proxy policy and this provider's proxy
+	// override (plain fetch would bypass both).
+	const proxy = resolveProxyForUrl(url, config.proxy);
+	const response = await fetch(url, {
 		headers: buildOpenRouterHeaders(),
-	});
+		...(proxy ? { proxy } : {}),
+		// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
+	} as any);
 
 	if (!response.ok) {
 		const errText = await response.text().catch(() => "");
@@ -331,7 +338,11 @@ async function fetchRecommendedModels(): Promise<ClineRecommendedModelsData> {
 	}
 
 	try {
-		const response = await fetch(`${CLINE_API_BASE_URL}/api/v1/ai/cline/recommended-models`);
+		const recommendedUrl = `${CLINE_API_BASE_URL}/api/v1/ai/cline/recommended-models`;
+		// Global outbound proxy policy only — this endpoint is not tied to a provider.
+		const proxy = resolveProxyForUrl(recommendedUrl);
+		// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
+		const response = await fetch(recommendedUrl, proxy ? ({ proxy } as any) : undefined);
 		if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
 		const json = (await response.json()) as {

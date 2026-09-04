@@ -4,6 +4,7 @@ import { Hono } from "hono";
 import { buildOpencodeSessionHeader } from "../lib/agent/opencode-session";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
+import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
 	getBuiltinCodexModels,
 	type OpenAIProviderConfig,
@@ -268,7 +269,11 @@ export async function fetchOpenaiModels(
 	for (const candidate of candidates) {
 		const { url } = candidate;
 		try {
-			const response = await fetch(url, { headers });
+			// Honour the global outbound proxy policy and this provider's proxy
+			// override, same as chat requests (plain fetch would bypass both).
+			const proxy = resolveProxyForUrl(url, config.proxy);
+			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
+			const response = await fetch(url, { headers, ...(proxy ? { proxy } : {}) } as any);
 			if (response.status === 404) {
 				errors.push(`${url} → 404`);
 				continue;

@@ -559,6 +559,7 @@ export const updateSettingsSchema = z
 				worktreeSizeWarningMb: z.number().int().min(0),
 				autoSaveOnDormant: z.boolean(),
 				dormantAfterMinutes: z.number().int().min(0),
+				treeSnapshotsEnabled: z.boolean(),
 			})
 			.partial()
 			.optional(),

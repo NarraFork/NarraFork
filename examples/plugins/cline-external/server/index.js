@@ -1078,7 +1078,8 @@ async function setEnabledModels(input) {
     output: {
       count: models.length,
       servedToAgent: Math.min(models.length, MAX_MODELS),
-      truncated: models.length > MAX_MODELS
+      truncated: models.length > MAX_MODELS,
+      catalogSync: { requested: true }
     },
     secretWrites: [{ key: ENABLED_MODELS_KEY, value }]
   };
@@ -1654,7 +1655,8 @@ function withSystemPrompt(messages, systemPrompt) {
 
 // examples/plugins/cline-external/src/server.ts
 var PLUGIN_ID = "com.narrafork.cline-external";
-var PLUGIN_VERSION = "0.1.0";
+var PLUGIN_VERSION = "0.1.4";
+var PACKAGE_DIGEST = process.env.NF_PLUGIN_PACKAGE_DIGEST;
 var PROVIDER_PROTOCOL = "1.0";
 var LOCAL_ID = "cline";
 var initialized = false;
@@ -2010,7 +2012,8 @@ async function invokeCommand(id, params) {
     const result = await handler(input, { ...chatBaseUrl ? { chatBaseUrl } : {} });
     respond(id, {
       ...result.output === undefined ? {} : { output: result.output },
-      ...result.secretWrites && result.secretWrites.length > 0 ? { secretWrites: result.secretWrites } : {}
+      ...result.secretWrites && result.secretWrites.length > 0 ? { secretWrites: result.secretWrites } : {},
+      ...result.configWrites && result.configWrites.length > 0 ? { configWrites: result.configWrites } : {}
     });
   } catch (error) {
     if (error instanceof CommandInputError || error instanceof AuthInputError) {
@@ -2129,6 +2132,7 @@ send({
     pluginId: PLUGIN_ID,
     version: PLUGIN_VERSION,
     rpcProtocol: RPC_PROTOCOL,
+    ...PACKAGE_DIGEST ? { packageDigest: PACKAGE_DIGEST } : {},
     features: ["host_api.notifications", "rpc.cancel", "host_api.requests"]
   }
 });

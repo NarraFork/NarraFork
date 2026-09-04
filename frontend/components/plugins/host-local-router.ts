@@ -49,6 +49,14 @@ export interface PluginUiPanelDelegate {
 	focus?: () => void;
 	/** Close the panel. */
 	close?: () => void;
+	/**
+	 * Resize the panel's container to fit the plugin's content, in CSS pixels.
+	 *
+	 * Only surfaces whose container can grow implement this (provider-settings).
+	 * Dockview panels size themselves, so the method reports NOT_SUPPORTED there —
+	 * the plugin treats that as "stop reporting", not as a failure.
+	 */
+	setHeight?: (height: number) => void;
 }
 
 /** Host-side surface for opening a NEW plugin panel (used by `panel.open`). */
@@ -73,6 +81,19 @@ export interface PluginUiHostLocalRouterOptions {
 	openExternal?: (url: string) => void;
 	/** Navigate to an internal host route (e.g. a narrator chat page). */
 	navigate?: (to: string) => void;
+	/**
+	 * The calling plugin's provider model set changed at the catalog source
+	 * (a model was added or removed). The host invalidates its settings/model
+	 * caches so host-rendered model lists pick up the change. Only a cache
+	 * refresh — the plugin owns the server-side catalog update itself.
+	 */
+	modelsChanged?: (pluginId: string) => void | Promise<void>;
+	/**
+	 * Run the host's model tester for one model. The implementation MUST reject
+	 * any model outside the calling plugin's own provider prefixes — that check
+	 * cannot live here because the router does not know the plugin's providers.
+	 */
+	testModel?: (pluginId: string, model: string, prompt?: string) => Promise<JsonValue>;
 }
 
 export interface PluginUiNotificationInput {
@@ -147,6 +168,8 @@ function dispatchHostLocal(
 			return panelVoid(params, options, (delegate) => delegate.focus?.(), method);
 		case "panel.close":
 			return panelVoid(params, options, (delegate) => delegate.close?.(), method);
+		case "panel.setHeight":
+			return panelSetHeight(params, request, options);
 		case "panel.open":
 			return panelOpen(request, options, method);
 		case "notifications.show":
@@ -155,6 +178,10 @@ function dispatchHostLocal(
 			return uiOpenExternal(request, options, method);
 		case "ui.navigate":
 			return uiNavigate(request, options, method);
+		case "provider.modelsChanged":
+			return providerModelsChanged(params, options, method);
+		case "models.test":
+			return modelsTest(params, request, options, method);
 		case "panel.setBadge":
 		case "panel.setDirty":
 			throw notSupported(method);
@@ -229,6 +256,32 @@ function panelVoid(
 	return { ok: true };
 }
 
+/**
+ * Bounds for `panel.setHeight`, in CSS pixels.
+ *
+ * The floor keeps a glitching plugin from collapsing its own panel to zero; the ceiling
+ * keeps a runaway report from turning the settings page into an endless strip. Both are
+ * applied host-side because the plugin's idea of its content height is untrusted input.
+ */
+const PANEL_HEIGHT_MIN = 120;
+const PANEL_HEIGHT_MAX = 5_000;
+
+function panelSetHeight(
+	params: PluginDockPanelParams,
+	request: UiRpcRequest,
+	options: PluginUiHostLocalRouterOptions,
+): JsonValue {
+	const delegate = options.getPanelDelegate?.(params.panelInstanceId);
+	if (!delegate?.setHeight) throw notSupported(request.method);
+	const raw = isRecord(request.params) ? request.params.height : undefined;
+	if (typeof raw !== "number" || !Number.isFinite(raw)) {
+		throw invalidParams("panel.setHeight requires a finite height");
+	}
+	const height = Math.round(Math.min(PANEL_HEIGHT_MAX, Math.max(PANEL_HEIGHT_MIN, raw)));
+	delegate.setHeight(height);
+	return { ok: true, height };
+}
+
 function panelOpen(
 	request: UiRpcRequest,
 	options: PluginUiHostLocalRouterOptions,
@@ -301,4 +354,38 @@ function uiNavigate(
 	}
 	options.navigate(to);
 	return { ok: true };
+}
+
+async function providerModelsChanged(
+	params: PluginDockPanelParams,
+	options: PluginUiHostLocalRouterOptions,
+	method: string,
+): Promise<JsonValue> {
+	if (!options.modelsChanged) throw notSupported(method);
+	await options.modelsChanged(params.pluginId);
+	return { ok: true };
+}
+
+const MODELS_TEST_MODEL_MAX_CHARS = 300;
+const MODELS_TEST_PROMPT_MAX_CHARS = 4_000;
+
+function modelsTest(
+	params: PluginDockPanelParams,
+	request: UiRpcRequest,
+	options: PluginUiHostLocalRouterOptions,
+	method: string,
+): Promise<JsonValue> {
+	if (!options.testModel) throw notSupported(method);
+	if (!isRecord(request.params)) throw invalidParams("models.test requires an object");
+	const model = readString(request.params.model);
+	if (!model) throw invalidParams("models.test requires a model");
+	if (model.length > MODELS_TEST_MODEL_MAX_CHARS) {
+		throw invalidParams(`models.test model exceeds ${MODELS_TEST_MODEL_MAX_CHARS} characters`);
+	}
+	const prompt = readString(request.params.prompt);
+	if (prompt && prompt.length > MODELS_TEST_PROMPT_MAX_CHARS) {
+		throw invalidParams(`models.test prompt exceeds ${MODELS_TEST_PROMPT_MAX_CHARS} characters`);
+	}
+	// Prefix scoping is the implementation's job (see the options contract).
+	return options.testModel(params.pluginId, model, prompt);
 }

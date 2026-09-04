@@ -6,11 +6,12 @@
 	"documentNamespace": "https://narrafork.local/sbom/com.narrafork.cline-external",
 	"packages": [
 		{
-			"SPDXID": "SPDXRef-cline-external",
+			"SPDXID": "SPDXRef-com.narrafork.cline-external",
 			"name": "com.narrafork.cline-external",
-			"versionInfo": "0.1.0",
+			"versionInfo": "0.1.4",
 			"licenseDeclared": "Apache-2.0",
-			"licenseConcluded": "Apache-2.0"
+			"licenseConcluded": "Apache-2.0",
+			"supplier": "NarraFork"
 		}
 	]
 }

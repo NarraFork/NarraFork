@@ -819,6 +819,15 @@ export interface NarraForkSettings {
 		worktreeSizeWarningMb: number;
 		autoSaveOnDormant: boolean;
 		dormantAfterMinutes: number;
+		/**
+		 * Whether tool calls / external edits capture content-addressed whole-tree
+		 * snapshots of the workspace (the precise rollback boundary). When off, the
+		 * snapshot scan never runs on the tool path and rollback degrades to per-file
+		 * replay of recorded Write/Edit inputs. Structural captures (fork/merge/restore)
+		 * are unaffected. Default true; hot-path captures also degrade automatically
+		 * when a worktree proves too large to scan within the capture budget.
+		 */
+		treeSnapshotsEnabled: boolean;
 	};
 	containers: {
 		portRangeStart: number;

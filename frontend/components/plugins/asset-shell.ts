@@ -49,6 +49,8 @@ export interface PluginAssetShellOptions {
 	localeChain?: readonly string[];
 	/** Pre-rendered `:root { --nf-*: … }` block; see `host-tokens.ts`. */
 	tokenCss?: string;
+	/** Host Mantine scheme mirrored onto the iframe's `<html>`; absent means no opinion. */
+	colorScheme?: "light" | "dark";
 }
 
 function escapeAttribute(value: string): string {
@@ -115,6 +117,9 @@ const MANTINE_TOKEN_NAMES = [
 export function readHostMantineTokens(): string {
 	if (typeof document === "undefined") return "";
 	const style = getComputedStyle(document.documentElement);
+	// Test DOMs and very old embedded webviews may expose only a style-like object. Missing
+	// tokens are a presentation degradation, not a reason to crash the plugin shell.
+	if (typeof style.getPropertyValue !== "function") return "";
 	const parts: string[] = [];
 	for (const name of MANTINE_TOKEN_NAMES) {
 		const value = style.getPropertyValue(name).trim();
@@ -172,6 +177,8 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
 		locale: options.locale ?? "en",
 		localeChain: options.localeChain ?? ["en"],
 		tokenCss: options.tokenCss ?? "",
+		// colorScheme 不在此传递：初始值由 HTML 的 data-mantine-color-scheme 属性承担
+		// （见下方模板），更新走 host.theme 通知——bridge 内没有任何读取方。
 		tokenStyleId: TOKEN_STYLE_ELEMENT_ID,
 	};
 	return `
@@ -340,7 +347,14 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
     // channel. Passing them on as raw notifications too would give plugins a second, untyped
     // way to observe the same thing.
     if (message.method === "host.theme") {
-      applyTokenCss(typeof message.params?.tokenCss === "string" ? message.params.tokenCss : "");
+      // tokenCss 与 colorScheme 是两条独立的更新通道：setColorScheme 只发
+      // { colorScheme }，若在此处把缺失的 tokenCss 当作 "" 应用，会把上一次
+      // setThemeTokens 写入的实时 token 清空（主题/语言切换后面板配色错乱）。
+      // 只有显式携带 tokenCss 时才重写 token 样式。
+      if (typeof message.params?.tokenCss === "string") applyTokenCss(message.params.tokenCss);
+      if (message.params?.colorScheme === "light" || message.params?.colorScheme === "dark") {
+        document.documentElement.dataset.mantineColorScheme = message.params.colorScheme;
+      }
       return;
     }
     if (message.method === "host.locale") {
@@ -366,6 +380,10 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
     const script = document.createElement("script");
     script.src = config.entryUrl;
     script.async = false;
+    // The shell owns the splash, so the shell also owns clearing it. Requiring every plugin
+    // entry to know this private element id leaves a successfully loaded UI hidden forever when
+    // an author simply appends their root to document.body.
+    script.onload = () => document.getElementById("plugin-shell-splash")?.remove();
     script.onerror = () => notify("plugin.lifecycle", { state: "crashed", reason: "asset-load-failed" });
     document.head.appendChild(script);
   };
@@ -478,7 +496,7 @@ export function createPluginAssetShell(options: PluginAssetShellOptions): string
 	// deliberately inline/CSP-safe (style-src 'unsafe-inline').
 	const splashTitle = options.title ? escapeAttribute(options.title) : "Plugin panel";
 	const splash = `<div id="plugin-shell-splash" style="position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:var(--mantine-color-body,#1a1b1e);color:var(--mantine-color-dimmed,#909296);font-family:var(--mantine-font-family,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif);font-size:13px;"><div style="width:20px;height:20px;border:2px solid var(--mantine-color-default-border,#373a40);border-top-color:var(--mantine-primary-color-5,#4c6ef5);border-radius:50%;animation:plugin-shell-spin .9s linear infinite;"></div><div>${splashTitle}</div></div><style>@keyframes plugin-shell-spin{to{transform:rotate(360deg)}}</style>`;
-	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}"><style>:root{${readHostMantineTokens()}}</style></head><body>${splash}<script nonce="${escapeAttribute(options.nonce)}">${createInlineBridge(options)}</script></body></html>`;
+	return `<!doctype html><html data-mantine-color-scheme="${escapeAttribute(options.colorScheme ?? "dark")}"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}"><style>:root{${readHostMantineTokens()}}</style></head><body>${splash}<script nonce="${escapeAttribute(options.nonce)}">${createInlineBridge(options)}</script></body></html>`;
 }
 
 export function createPluginNonce(): string {

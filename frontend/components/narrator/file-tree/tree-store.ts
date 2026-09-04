@@ -39,6 +39,69 @@ export interface TreeEntry {
 	size?: number;
 }
 
+/** Added / removed lines for one file or the aggregate beneath one directory. */
+export interface TreeLineStats {
+	added: number;
+	removed: number;
+}
+
+/** One Git status record as consumed by the file tree. */
+export interface TreeFileLineChange {
+	path: string;
+	linesAdded: number;
+	linesRemoved: number;
+}
+
+/**
+ * Index file-level Git figures by tree path and roll them up into every ancestor.
+ *
+ * The Git endpoint and filesystem tree both use cwd-relative `/` keys. The small
+ * normalization below only accepts that contract; treating every backslash as a separator
+ * would corrupt a valid POSIX filename. Folder totals do not require descendants to be
+ * expanded or loaded.
+ */
+export function buildTreeLineStats(
+	changes: readonly TreeFileLineChange[],
+): ReadonlyMap<string, TreeLineStats> {
+	const files = new Map<string, TreeLineStats>();
+	for (const change of changes) {
+		const path = normalizeTreePath(change.path);
+		if (!path) continue;
+		files.set(path, {
+			added: Math.max(0, Math.floor(change.linesAdded)),
+			removed: Math.max(0, Math.floor(change.linesRemoved)),
+		});
+	}
+
+	const totals = new Map<string, TreeLineStats>(files);
+	for (const [filePath, stats] of files) {
+		let slash = filePath.lastIndexOf("/");
+		while (slash > 0) {
+			const dir = filePath.slice(0, slash);
+			const current = totals.get(dir) ?? { added: 0, removed: 0 };
+			totals.set(dir, {
+				added: current.added + stats.added,
+				removed: current.removed + stats.removed,
+			});
+			slash = dir.lastIndexOf("/");
+		}
+	}
+	return totals;
+}
+
+function normalizeTreePath(path: string): string {
+	const normalized = path.replace(/^\.\/+/, "").replace(/\/+$/g, "");
+	if (
+		!normalized ||
+		normalized.startsWith("/") ||
+		normalized === ".." ||
+		normalized.startsWith("../")
+	) {
+		return "";
+	}
+	return normalized;
+}
+
 /** A loaded directory listing. */
 export interface DirState {
 	entries: TreeEntry[];

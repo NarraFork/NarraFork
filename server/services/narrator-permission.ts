@@ -10,7 +10,12 @@ import type {
 	PermissionHandlerOptions,
 	PermissionResult,
 } from "../lib/agent";
-import { analyzeShellCommand, type BashAnalysis, classifyFind } from "../lib/agent/bash-analyze";
+import {
+	analyzeShellCommand,
+	type BashAnalysis,
+	classifyFind,
+	isReviewReadOnlyBashAnalysis,
+} from "../lib/agent/bash-analyze";
 import type { ExecutionBackend, TargetPathSemantics } from "../lib/agent/execution/backend";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { resolveBackendPath, toolBaseCwd } from "../lib/agent/execution/path-resolve";
@@ -453,6 +458,7 @@ export function resolvePermissionDecision(
 		executionBackend,
 		executionTarget,
 		executionContext,
+		reviewReadOnlyBash = false,
 	} = opts;
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
@@ -565,6 +571,33 @@ export function resolvePermissionDecision(
 	if (blacklistResult) {
 		if (meta) meta.blacklistReason = blacklistResult.reason;
 		return "deny";
+	}
+
+	// Review follow-up Bash is a hard, non-interactive capability ceiling. Keep this
+	// after command/path blacklists, but before command whitelists, bypassPermissions,
+	// and ordinary Bash read-only shortcuts.
+	if (reviewReadOnlyBash && isBashToolName(toolName)) {
+		const isControlOperation =
+			typeof input.command !== "string" ||
+			input.run_in_background === true ||
+			typeof input.stop === "string" ||
+			input.await != null;
+		const deviceId = executionContext?.target.deviceId ?? executionTarget?.deviceId;
+		const externalPaths = getShellScopePaths(cwd, input, bashAnalysis, context).filter(
+			(path) =>
+				!isInsideDecisionWorktree(cwd, path, context) &&
+				!isInsideDecisionTruncateDir(cwd, path, context),
+		);
+		if (
+			isControlOperation ||
+			(deviceId !== undefined && deviceId !== LOCAL_DEVICE_ID) ||
+			externalPaths.length > 0 ||
+			!bashAnalysis ||
+			!isReviewReadOnlyBashAnalysis(bashAnalysis)
+		) {
+			return "deny";
+		}
+		return "allow";
 	}
 
 	const chapterGitIssues = isChapter ? getChapterGitPermissionIssues(bashAnalysis) : [];
@@ -958,6 +991,8 @@ export interface PermissionDecisionOpts {
 	 */
 	planFilePath?: string;
 	planMode?: boolean;
+	/** Hard Bash policy for review follow-up subagents. */
+	reviewReadOnlyBash?: boolean;
 	conclusionFileId?: string;
 	whitelistDirs?: WhitelistDir[];
 	blacklistDirs?: BlacklistDir[];
@@ -3450,6 +3485,7 @@ export async function handlePermission(
 	options?: PermissionHandlerOptions,
 	parentToolUseId?: string,
 	runtimeConstraint?: RuntimePermissionConstraint,
+	reviewReadOnlyBash = false,
 ): Promise<PermissionResult> {
 	// Every routed permission starts from a complete frozen context. Missing backend/target,
 	// canonicalization failure, or backend identity drift is denied before policy loading.
@@ -3772,6 +3808,15 @@ export async function handlePermission(
 	const permMeta: PermissionDecisionMeta = {};
 	const conclusionFileId = getConclusionFileId(narratorId);
 
+	// Bash await/stop are pure control operations for ordinary sessions, but review
+	// follow-ups are limited to synchronous Git inspection and cannot use them.
+	if (reviewReadOnlyBash && isBashControlOp) {
+		return {
+			behavior: "deny",
+			message: "Review Bash only permits synchronous, read-only Git inspection commands.",
+		};
+	}
+
 	// Bash await/stop are pure control operations — skip full permission analysis
 	if (isBashControlOp) {
 		await db
@@ -3813,6 +3858,7 @@ export async function handlePermission(
 					planFilePath: designatedPlanFilePath,
 					planMode: isPlanMode,
 					conclusionFileId,
+					reviewReadOnlyBash,
 					compiledPolicy,
 					executionContext,
 					relaxedPlan: isRelaxedPlan,

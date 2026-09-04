@@ -191,6 +191,8 @@ export interface PluginUiContributionItem {
 	scope?: "workspace" | "narrator" | "project" | "global";
 	/** Surfaces this view may mount on. Absent means the server did not report any. */
 	surfaces?: PluginViewSurface[];
+	/** Shared host UI runtime this view opted into; absent means it ships its own DOM code. */
+	runtime?: "host-react";
 	/** Legacy aliases accepted from older plugin backends. */
 	entry?: string;
 	style?: string;

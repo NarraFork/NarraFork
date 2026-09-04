@@ -145,7 +145,6 @@ async function computePackageDigest(root: string): Promise<string> {
 		hash.update(relativePath);
 		hash.update("\0");
 		hash.update(await readFile(path));
-		hash.update("\0");
 	}
 	return hash.digest("hex");
 }
@@ -214,6 +213,7 @@ async function boundedCleanup(runtime: PluginRuntime): Promise<void> {
 async function validateRuntime(
 	packageRoot: string,
 	manifest: Manifest,
+	packageDigest: string,
 	mode: Exclude<PluginReleaseValidationMode, "static">,
 	timeoutMs: number,
 ): Promise<PluginReleaseRuntimeEvidence> {
@@ -239,6 +239,7 @@ async function validateRuntime(
 	const runtime = new PluginRuntime({
 		pluginId: manifest.pluginId,
 		pluginVersion: manifest.version,
+		packageDigest,
 		command: runtimeCommand(manifest, packageRoot),
 		cwd: packageRoot,
 		runner,
@@ -251,6 +252,7 @@ async function validateRuntime(
 			NF_PLUGIN_DATA_DIR: dataPath,
 			NF_PLUGIN_TEMP_DIR: tempPath,
 			NF_PLUGIN_LOG_DIR: runtimeRoot,
+			NF_PLUGIN_PACKAGE_DIGEST: packageDigest,
 		},
 		timeouts: {
 			handshakeMs: timeoutMs,
@@ -454,14 +456,22 @@ async function validatePackage(
 		errors.push(`SBOM: ${errorMessage(error)}`);
 	}
 
+	let packageDigest: string | undefined;
 	try {
-		summary.digest = await computePackageDigest(packageRoot);
+		packageDigest = await computePackageDigest(packageRoot);
+		summary.digest = packageDigest;
 	} catch (error) {
 		errors.push(`digest: ${errorMessage(error)}`);
 	}
 
-	if (errors.length === 0 && mode !== "static") {
-		summary.runtime = await validateRuntime(packageRoot, manifest, mode, runtimeTimeoutMs);
+	if (errors.length === 0 && mode !== "static" && packageDigest !== undefined) {
+		summary.runtime = await validateRuntime(
+			packageRoot,
+			manifest,
+			packageDigest,
+			mode,
+			runtimeTimeoutMs,
+		);
 		if (summary.runtime.status === "failed") {
 			errors.push(`runtime: ${summary.runtime.error ?? "validation failed"}`);
 		}

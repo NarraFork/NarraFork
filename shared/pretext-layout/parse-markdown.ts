@@ -401,6 +401,13 @@ function parseBlockTokens(tokens: readonly Token[], ctx: ParseContext): Prepared
 			case "space":
 			case "def":
 				continue;
+			case "checkbox":
+				// marked (gfm) unshifts a BLOCK-level checkbox token into a non-loose
+				// task item's tokens (loose items carry it inline instead — skipped in
+				// collectInlineLines). The box is already painted from item.task /
+				// item.checked as the list marker (☐/☑), so the token carries no
+				// content of its own; the default fallback would print its raw "[ ] ".
+				continue;
 			case "paragraph": {
 				// marked has no math extension, so `$$...$$` arrives inside a normal
 				// paragraph. Peel display formulas into their own blocks first.
@@ -854,6 +861,12 @@ function collectInlineLines(
 				}
 				case "br":
 					pushBreak();
+					continue;
+				case "checkbox":
+					// Loose task items carry the checkbox as the first INLINE token of
+					// their opening paragraph (non-loose items put it at block level —
+					// skipped in parseBlockTokens). The list marker already paints the
+					// box, so emitting the raw "[ ] " here would duplicate it.
 					continue;
 				case "html":
 					push(textPiece((token as Tokens.HTML).text, marks, variant));

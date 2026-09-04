@@ -3,6 +3,7 @@ import {
 	CodexUsageFetchError,
 	type CodexUsagePayload,
 	type CodexUsageResult,
+	consumeCodexResetCredit,
 	fetchCodexUsage,
 	getCodexUsageWindows,
 	identifyCodexUsageWindowType,
@@ -272,6 +273,147 @@ describe("Codex usage window parsing", () => {
 			})) as unknown as typeof fetch;
 		try {
 			await expect(fetchCodexUsage("token", "account")).rejects.toThrow("exceeded 262144 bytes");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+});
+
+describe("Codex reset credits", () => {
+	test("parses rate_limit_reset_credits into reset_credits_available", () => {
+		const parsed = parseCodexUsagePayload(
+			payload({
+				rate_limit_reset_credits: { available_count: 3 },
+			} as unknown as Partial<CodexUsagePayload>),
+			"2026-05-01T00:00:00.000Z",
+		);
+		expect(parsed.reset_credits_available).toBe(3);
+	});
+
+	test("floors the count and rejects negative or non-numeric values", () => {
+		const floored = parseCodexUsagePayload(
+			payload({
+				rate_limit_reset_credits: { available_count: 2.7 },
+			} as unknown as Partial<CodexUsagePayload>),
+			"2026-05-01T00:00:00.000Z",
+		);
+		expect(floored.reset_credits_available).toBe(2);
+
+		for (const availableCount of [-1, "many", null, Number.NaN]) {
+			const parsed = parseCodexUsagePayload(
+				payload({
+					rate_limit_reset_credits: { available_count: availableCount },
+				} as unknown as Partial<CodexUsagePayload>),
+				"2026-05-01T00:00:00.000Z",
+			);
+			expect(parsed.reset_credits_available).toBeUndefined();
+		}
+	});
+
+	test("a missing reset-credits object leaves the field absent", () => {
+		const parsed = parseCodexUsagePayload(payload(), "2026-05-01T00:00:00.000Z");
+		expect(parsed.reset_credits_available).toBeUndefined();
+	});
+
+	test("consume normalizes windows_reset and generates a redeem_request_id per call", async () => {
+		const bodies: string[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+			bodies.push(String(init?.body));
+			return new Response('{"code":"ok","windows_reset":2}', {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+		try {
+			const result = await consumeCodexResetCredit("token", "account");
+			expect(result).toEqual({ code: "ok", windowsReset: 2 });
+			expect(bodies).toHaveLength(1);
+			const first = JSON.parse(bodies[0]) as { redeem_request_id?: string };
+			expect(first.redeem_request_id).toMatch(/^[0-9a-f-]{36}$/);
+
+			await consumeCodexResetCredit("token", "account");
+			const second = JSON.parse(bodies[1]) as { redeem_request_id?: string };
+			// The idempotency key must differ per call: reusing one would let the
+			// upstream dedupe a second deliberate consume into a no-op.
+			expect(second.redeem_request_id).not.toBe(first.redeem_request_id);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test("consume clamps a negative or missing windows_reset to 0", async () => {
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response('{"code":"ok","windows_reset":-3}', {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			})) as unknown as typeof fetch;
+		try {
+			const negative = await consumeCodexResetCredit("token", "account");
+			expect(negative.windowsReset).toBe(0);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+
+		globalThis.fetch = (async () =>
+			new Response('{"code":"ok"}', {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			})) as unknown as typeof fetch;
+		try {
+			const missing = await consumeCodexResetCredit("token", "account");
+			expect(missing.windowsReset).toBe(0);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test("consume rejects a non-JSON payload instead of reporting success", async () => {
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response("<html>error</html>", {
+				status: 200,
+				headers: { "Content-Type": "text/html" },
+			})) as unknown as typeof fetch;
+		try {
+			await expect(consumeCodexResetCredit("token", "account")).rejects.toThrow("non-JSON");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test("consume rejects a non-record payload", async () => {
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response('["ok"]', {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			})) as unknown as typeof fetch;
+		try {
+			await expect(consumeCodexResetCredit("token", "account")).rejects.toThrow("invalid payload");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test("consume surfaces a 401 as CodexUsageFetchError for task recovery", async () => {
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response('{"code":"invalid_task_id"}', {
+				status: 401,
+				statusText: "Unauthorized",
+			})) as unknown as typeof fetch;
+		try {
+			const error = await consumeCodexResetCredit(
+				"",
+				"account",
+				undefined,
+				"AgentAssertion t",
+			).catch((err) => err);
+			expect(error).toBeInstanceOf(CodexUsageFetchError);
+			expect((error as CodexUsageFetchError).status).toBe(401);
+			expect((error as CodexUsageFetchError).responseBody).toBe('{"code":"invalid_task_id"}');
 		} finally {
 			globalThis.fetch = originalFetch;
 		}

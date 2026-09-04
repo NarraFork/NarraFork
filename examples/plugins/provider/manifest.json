@@ -1,7 +1,7 @@
 {
 	"schemaVersion": 1,
 	"pluginId": "com.example.provider",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"displayName": "Example Provider",
 	"description": "Minimal GA remote provider contribution.",
 	"publisher": {

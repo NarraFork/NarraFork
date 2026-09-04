@@ -109,6 +109,15 @@ describe("plugin UI contributions surfaces", () => {
 		expect(item.surfaces).toEqual(["workspace", "settings"]);
 	});
 
+	it("passes through the declared host runtime and drops unknown values", async () => {
+		const [hosted] = await fetchContributions(pluginStatus([view({ runtime: "host-react" })]));
+		expect(hosted.runtime).toBe("host-react");
+		for (const runtime of ["custom", true, 1, {}]) {
+			const [item] = await fetchContributions(pluginStatus([view({ runtime })]));
+			expect(item.runtime).toBeUndefined();
+		}
+	});
+
 	it("ignores non-view contributions", async () => {
 		const items = await fetchContributions(
 			pluginStatus([{ kind: "tool", id: "t", title: "Tool" }, view()]),

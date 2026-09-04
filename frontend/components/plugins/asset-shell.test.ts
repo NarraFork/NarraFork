@@ -37,12 +37,25 @@ describe("host-controlled plugin asset shell", () => {
 		});
 		expect(shell).not.toContain("sandbox");
 
-		const provider = readFileSync(
-			new URL("./PluginUiRuntimeProvider.tsx", import.meta.url).pathname,
+		const dockPanel = readFileSync(
+			new URL("./PluginDockPanel.tsx", import.meta.url).pathname,
 			"utf8",
 		);
-		expect(provider).toContain('sandbox="allow-scripts"');
-		expect(provider).not.toContain("allow-same-origin");
+		expect(dockPanel).toContain('sandbox="allow-scripts"');
+		expect(dockPanel).not.toContain("allow-same-origin");
+	});
+
+	test("removes the host-owned loading splash after the plugin entry loads", () => {
+		const shell = createPluginAssetShell({
+			nonce: createPluginNonce(),
+			pluginId: "com.example.review",
+			contributionId: "dashboard",
+			panelInstanceId: "pui_review",
+			entryUrl: "/api/plugin-assets/com.example.review/1/hash/entry.js",
+		});
+		expect(shell).toContain(
+			'script.onload = () => document.getElementById("plugin-shell-splash")?.remove()',
+		);
 	});
 
 	test("fails closed when the entry URL is empty", () => {

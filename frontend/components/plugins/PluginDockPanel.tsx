@@ -141,6 +141,14 @@ export interface PluginDockPanelHostApi {
 	updateParameters: (params: PluginDockPanelParams) => void;
 	setActive: () => void;
 	close: () => void;
+	/**
+	 * Grow the panel's container to the plugin's reported content height.
+	 *
+	 * Absent on Dockview surfaces (the dock owns panel geometry), which makes
+	 * `panel.setHeight` report NOT_SUPPORTED there; embedded surfaces like
+	 * provider-settings provide it to let the iframe escape its fixed box.
+	 */
+	setHeight?: (height: number) => void;
 }
 
 export function PluginDockPanelView({
@@ -239,6 +247,9 @@ export function PluginDockPanelView({
 			},
 			focus: hostApi.setActive,
 			close: hostApi.close,
+			// Deliberately omitted when the surface has no sizing channel: the router
+			// then reports NOT_SUPPORTED, which is the plugin's signal to stop reporting.
+			...(hostApi.setHeight ? { setHeight: hostApi.setHeight } : {}),
 		});
 	}, [params, runtime, hostApi]);
 

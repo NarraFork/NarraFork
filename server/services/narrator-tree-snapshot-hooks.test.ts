@@ -14,6 +14,7 @@ import {
 import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { normalizePathForComparison } from "../lib/platform-path";
+import { settings } from "../lib/settings";
 import { safeSpawn } from "../lib/spawn";
 import {
 	abandonSessionTreeSnapshots,
@@ -258,6 +259,39 @@ describe("narrator tree snapshot hooks", () => {
 		await recordTreeSnapshotBefore(session, narratorId, toolUseId);
 		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 		expect(result.changedFiles).toEqual([]);
+	});
+
+	test("the treeSnapshotsEnabled setting turns every capture into a null boundary", async () => {
+		const repo = await createRepo("nf-hook-setting-off-");
+		const narratorId = await createNarrator(repo);
+		const session = makeSession(repo);
+		writeFileSync(join(repo, "a.txt"), "one\n");
+
+		// The escape hatch for worktrees whose whole-tree scan is not viable: with
+		// the setting off, the tool path records no boundaries and never spawns git.
+		const previous = settings.chapters.treeSnapshotsEnabled;
+		settings.chapters.treeSnapshotsEnabled = false;
+		try {
+			const { toolUseId } = await seedToolCall(narratorId, "Write", 1);
+			await recordTreeSnapshotBefore(session, narratorId, toolUseId);
+			writeFileSync(join(repo, "a.txt"), "two\n");
+			const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+
+			expect(result.before).toBeNull();
+			expect(result.after).toBeNull();
+			expect(result.changedFiles).toEqual([]);
+			expect(session._lastTreeHash).toBeUndefined();
+		} finally {
+			settings.chapters.treeSnapshotsEnabled = previous;
+		}
+
+		// Re-enabled, the same session captures again (the cache was never poisoned
+		// by the disabled window).
+		const second = await seedToolCall(narratorId, "Write", 2);
+		await recordTreeSnapshotBefore(session, narratorId, second.toolUseId);
+		const result = await recordTreeSnapshotAfter(session, narratorId, second.toolUseId);
+		expect(result.before).toMatch(/^[0-9a-f]{40}$/);
+		expect(result.after).toMatch(/^[0-9a-f]{40}$/);
 	});
 });
 

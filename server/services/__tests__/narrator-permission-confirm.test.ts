@@ -1783,6 +1783,7 @@ describe("device-scoped permission rules", () => {
 					dangerousPatterns: [],
 					hasWriteOperation: false,
 					hasEnvInjection: false,
+					commandEnvVars: [],
 					isCatastrophic: false,
 					allWhitelisted: false,
 				} as unknown as Parameters<typeof resolvePermissionDecision>[0]["bashAnalysis"],

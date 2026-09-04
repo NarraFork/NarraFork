@@ -172,6 +172,23 @@ function configView(overrides: Record<string, unknown> = {}) {
 	};
 }
 
+function connectionConfigView(overrides: Record<string, unknown> = {}) {
+	return configView({
+		configSchema: {
+			type: "object",
+			properties: {
+				baseUrl: { type: "string", title: "API base URL" },
+				credentials: { type: "string", writeOnly: true, "x-narrafork-secret": true },
+				enabledModels: { type: "string", writeOnly: true, "x-narrafork-secret": true },
+			},
+		},
+		config: { baseUrl: "https://api.cline.bot/api/v1" },
+		secretFields: ["credentials", "enabledModels"],
+		secretsSet: ["credentials", "enabledModels"],
+		...overrides,
+	});
+}
+
 async function renderSection(
 	contributionId = "demo",
 	models?: Parameters<typeof PluginProviderSection>[0]["models"],
@@ -304,6 +321,25 @@ describe("PluginProviderSection rendering choice", () => {
 		};
 		await renderSection("demo");
 		expect(text()).toContain("admin.detail.config.empty");
+	});
+
+	test("renders only non-secret schema fields in the connection section for a custom view", async () => {
+		applyView();
+		configResponse = { pluginId: "com.example.demo", providers: [connectionConfigView()] };
+		await renderSection();
+		expect(text()).toContain("pluginProviderConnectionSection");
+		expect(text()).toContain("API base URL");
+		// Secret fields remain owned by the plugin view; they must not appear in a second,
+		// host-rendered form where their placeholder could be round-tripped.
+		expect(text()).not.toContain("credentials");
+		expect(text()).not.toContain("enabledModels");
+	});
+
+	test("does not duplicate schema fields when the generated fallback already shows them", async () => {
+		configResponse = { pluginId: "com.example.demo", providers: [configView()] };
+		await renderSection();
+		expect(text()).toContain("pluginProviderNoCustomUi");
+		expect(text()).not.toContain("pluginProviderConnectionDesc");
 	});
 });
 

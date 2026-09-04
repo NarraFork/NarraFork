@@ -110,6 +110,54 @@ describe("untracked directories are expanded to files", () => {
 		expect(summary.totalFiles).toBe(3);
 	});
 
+	test("scopes paths and line counts to a narrator cwd below the repository root", async () => {
+		const repo = await makeRepo();
+		const subdir = join(repo, "sub");
+		mkdirSync(subdir);
+		writeFileSync(join(subdir, "inside.txt"), "base\n");
+		writeFileSync(join(repo, "outside.txt"), "base\n");
+		await git(["add", "."], repo);
+		await git(["commit", "-q", "-m", "add scoped files"], repo);
+
+		writeFileSync(join(subdir, "inside.txt"), "base\ninside\n");
+		writeFileSync(join(subdir, "new.txt"), "one\ntwo\n");
+		writeFileSync(join(repo, "outside.txt"), "base\noutside\n");
+
+		const summary = await gitService.getStatusSummary(subdir);
+		const paths = summary.files.map((file) => file.path).sort();
+
+		expect(paths).toEqual(["inside.txt", "new.txt"]);
+		expect(summary.files.find((file) => file.path === "inside.txt")).toMatchObject({
+			linesAdded: 1,
+			linesRemoved: 0,
+		});
+		expect(summary.files.find((file) => file.path === "new.txt")).toMatchObject({
+			linesAdded: 2,
+			linesRemoved: 0,
+		});
+		expect(summary.totalFiles).toBe(2);
+	});
+
+	test("a nested directory sharing the cwd name keeps its correct relative path", async () => {
+		const repo = await makeRepo();
+		const subdir = join(repo, "sub");
+		mkdirSync(join(subdir, "sub"), { recursive: true });
+		writeFileSync(join(subdir, "sub", "x.txt"), "one\ntwo\n");
+		writeFileSync(join(subdir, "y.txt"), "three\n");
+
+		const summary = await gitService.getStatusSummary(subdir);
+		const paths = summary.files.map((file) => file.path).sort();
+
+		// `ls-files --others` already reports paths relative to the cwd; stripping the
+		// repo prefix off them would turn `sub/x.txt` into the nonexistent `x.txt`,
+		// dropping its line count and mismatching the status entry's key.
+		expect(paths).toEqual(["sub/x.txt", "y.txt"]);
+		expect(summary.files.find((file) => file.path === "sub/x.txt")).toMatchObject({
+			linesAdded: 2,
+			linesRemoved: 0,
+		});
+	});
+
 	test("still honours .gitignore, so expansion cannot leak ignored output", async () => {
 		const repo = await makeRepo();
 		writeNested(repo);

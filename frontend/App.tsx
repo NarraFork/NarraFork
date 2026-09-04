@@ -45,6 +45,8 @@ import {
 	resolvePluginUiContribution,
 	syncPluginUiContributions,
 } from "@frontend/components/plugins";
+import { createAppPluginHostLocal } from "@frontend/components/plugins/app-host-local";
+import { handlePluginUiNotification } from "@frontend/components/plugins/notifications";
 import { useBranding } from "@frontend/hooks/useBranding";
 import { usePluginContributions } from "@frontend/hooks/usePluginContributions";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
@@ -251,11 +253,19 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 		[colorScheme],
 	);
 
+	// Host-local provider services (modelsChanged / models.test). Stable identity:
+	// the object closes over the module-level queryClient and never changes.
+	const appPluginHostLocal = React.useMemo(() => createAppPluginHostLocal({ queryClient }), []);
+
 	return (
 		<PluginUiRuntimeProvider
 			resolveContribution={resolvePluginUiContribution}
 			getContext={getContext}
 			onBackendRequest={requestPluginUiBackend}
+			hostLocal={appPluginHostLocal}
+			onNotification={(_params, notification) =>
+				handlePluginUiNotification(notification, queryClient)
+			}
 		>
 			{children}
 		</PluginUiRuntimeProvider>

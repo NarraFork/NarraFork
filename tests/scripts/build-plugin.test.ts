@@ -88,4 +88,12 @@ describe("plugin artifact builds", () => {
 			expect(content.length).toBeGreaterThan(0);
 		}
 	});
+
+	test("cline-external builds its settings view from the host-react TSX source", () => {
+		const uiTarget = PLUGIN_BUILDS["cline-external"]?.targets.find((target) =>
+			target.outfile.endsWith(".iife.js"),
+		);
+		expect(uiTarget?.entry).toBe("src/ui/provider-settings.tsx");
+		expect(uiTarget?.format).toBe("iife");
+	});
 });

@@ -717,6 +717,20 @@ function SettingsProvidersPage() {
 
 	// ── Provider label for detail panel ──
 	/**
+	 * Plugin provider models for the detail area, keyed by prefix.
+	 *
+	 * `providerModelsMap` is openai-only, so feeding it to a plugin provider's section
+	 * always produced an empty list (`?? []`) — the overview cards read
+	 * `pluginProviderGroups` correctly, which is exactly why the card showed models while
+	 * the detail list below the iframe stayed empty.
+	 */
+	const pluginModelsByPrefix = useMemo(() => {
+		const map: Record<string, ModelOption[]> = {};
+		for (const group of pluginProviderGroups ?? []) map[group.prefix] = group.models;
+		return map;
+	}, [pluginProviderGroups]);
+
+	/**
 	 * Owning plugin for the selected provider, or undefined for builtins.
 	 *
 	 * A plugin provider is addressed by its prefix (it is single-instance, like the
@@ -863,6 +877,7 @@ function SettingsProvidersPage() {
 						state={state}
 						dispatchers={dispatchers}
 						providerModelsMap={providerModelsMap}
+						pluginModelsByPrefix={pluginModelsByPrefix}
 						anthropicModelsMap={anthropicModelsMap}
 						nugModelsMap={nugModelsMap}
 						geminiModelsMap={geminiModelsMap}
@@ -992,6 +1007,8 @@ interface ProviderSectionContentProps {
 	state: ProvidersState;
 	dispatchers: ReturnType<typeof useProvidersDispatch>;
 	providerModelsMap: Record<string, ModelOption[]>;
+	/** Plugin provider models keyed by prefix (the detail area's source for plugin providers). */
+	pluginModelsByPrefix: Record<string, ModelOption[]>;
 	anthropicModelsMap: Record<string, ModelOption[]>;
 	nugModelsMap: Record<string, ModelOption[]>;
 	geminiModelsMap: Record<string, ModelOption[]>;
@@ -1013,6 +1030,7 @@ function ProviderSectionContent({
 	state,
 	dispatchers,
 	providerModelsMap,
+	pluginModelsByPrefix,
 	anthropicModelsMap,
 	nugModelsMap,
 	geminiModelsMap,
@@ -1081,10 +1099,10 @@ function ProviderSectionContent({
 				// model, override a context window or run the model tester: those live behind
 				// `/api/settings`, which the plugin's sandboxed iframe cannot reach.
 				models={{
-					// `providerKey` is the provider's prefix for a plugin provider, which is also
-					// how `providerModelsMap` and every model value are keyed.
+					// `providerKey` is the provider's prefix for a plugin provider — the key of
+					// `pluginModelsByPrefix` and of every model value inside it.
 					prefix: providerKey,
-					models: providerModelsMap[providerKey] ?? [],
+					models: pluginModelsByPrefix[providerKey] ?? [],
 					hiddenModels: state.hiddenModels,
 					onToggleHidden: dispatchers.toggleHidden,
 					onBatchToggleHidden: dispatchers.batchToggleHidden,

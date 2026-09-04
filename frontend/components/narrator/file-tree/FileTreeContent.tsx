@@ -37,7 +37,7 @@ import {
 import { useCallback, useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { TREE_ROOT_KEY } from "./tree-patch";
-import type { TreeEntry, TreeState } from "./tree-store";
+import type { TreeEntry, TreeLineStats, TreeState } from "./tree-store";
 import { useFileTree } from "./useFileTree";
 
 /**
@@ -61,6 +61,12 @@ export interface FileTreeContentProps {
 	/** Absolute path of the tree root — the narrator's cwd. */
 	root: string;
 	showHidden: boolean;
+	/** File figures plus pre-aggregated directory figures, keyed by tree-relative path. */
+	lineStats?: ReadonlyMap<string, TreeLineStats>;
+	/** Git returned only a bounded prefix, so directory totals are lower bounds. */
+	lineStatsTruncated?: boolean;
+	/** Refresh the Git figures alongside a manual directory refresh. */
+	onRefreshLineStats?: () => void;
 	/** Open a file in the read-only viewer. Absolute path. */
 	onOpenFile: (absolutePath: string, fileName: string) => void;
 	/** Live patch feed registration; see `FileTreePanel` for the WS wiring. */
@@ -106,6 +112,9 @@ function buildNodes(
 export function FileTreeContent({
 	root,
 	showHidden,
+	lineStats,
+	lineStatsTruncated = false,
+	onRefreshLineStats,
 	onOpenFile,
 	registerIngest,
 }: FileTreeContentProps) {
@@ -154,12 +163,18 @@ export function FileTreeContent({
 				root={root}
 				loading={loading}
 				errors={errors}
+				lineStats={lineStats}
+				lineStatsTruncated={lineStatsTruncated}
 				onOpenFile={onOpenFile}
 				onReload={reload}
 			/>
 		),
-		[errors, loading, onOpenFile, reload, root],
+		[errors, lineStats, lineStatsTruncated, loading, onOpenFile, reload, root],
 	);
+	const refreshAll = useCallback(() => {
+		reloadAll();
+		onRefreshLineStats?.();
+	}, [onRefreshLineStats, reloadAll]);
 
 	if (!root) {
 		return (
@@ -201,7 +216,7 @@ export function FileTreeContent({
 		<Box style={{ height: "100%", overflow: "auto" }} p="xs">
 			<Group justify="flex-end" gap={4} mb={4}>
 				<Tooltip label={t("fileTree.refresh")} openDelay={200}>
-					<ActionIcon variant="subtle" color="gray" size="sm" onClick={reloadAll}>
+					<ActionIcon variant="subtle" color="gray" size="sm" onClick={refreshAll}>
 						<IconRefresh size={14} />
 					</ActionIcon>
 				</Tooltip>
@@ -232,11 +247,22 @@ interface FileTreeRowProps {
 	root: string;
 	loading: ReadonlySet<string>;
 	errors: ReadonlyMap<string, string>;
+	lineStats?: ReadonlyMap<string, TreeLineStats>;
+	lineStatsTruncated: boolean;
 	onOpenFile: (absolutePath: string, fileName: string) => void;
 	onReload: (dir: string) => Promise<void>;
 }
 
-function FileTreeRow({ payload, root, loading, errors, onOpenFile, onReload }: FileTreeRowProps) {
+function FileTreeRow({
+	payload,
+	root,
+	loading,
+	errors,
+	lineStats,
+	lineStatsTruncated,
+	onOpenFile,
+	onReload,
+}: FileTreeRowProps) {
 	const { t } = useTranslation("narrator");
 	const { node, expanded, elementProps, tree } = payload;
 	const props = node.nodeProps as { entry?: TreeEntry; truncatedCount?: number } | undefined;
@@ -258,6 +284,9 @@ function FileTreeRow({ payload, root, loading, errors, onOpenFile, onReload }: F
 
 	const isLoading = loading.has(entry.path);
 	const error = errors.get(entry.path);
+	const stats = lineStats?.get(entry.path);
+	const hasStats = !!stats && (stats.added > 0 || stats.removed > 0);
+	const statsAreLowerBound = entry.isDirectory && lineStatsTruncated;
 
 	const handleClick = () => {
 		if (entry.isDirectory) {
@@ -293,9 +322,43 @@ function FileTreeRow({ payload, root, loading, errors, onOpenFile, onReload }: F
 					<IconFile size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
 				</>
 			)}
-			<Text size="sm" truncate style={{ fontStyle: entry.isSymlink ? "italic" : undefined }}>
+			<Text
+				size="sm"
+				truncate
+				style={{
+					flex: 1,
+					minWidth: 0,
+					fontStyle: entry.isSymlink ? "italic" : undefined,
+				}}
+			>
 				{entry.name}
 			</Text>
+			{hasStats && stats && (
+				<Group
+					gap={4}
+					wrap="nowrap"
+					style={{ flexShrink: 0 }}
+					title={statsAreLowerBound ? t("fileTree.partialLineStats") : undefined}
+					role="note"
+					aria-label={`${statsAreLowerBound ? "≥ " : ""}+${stats.added} -${stats.removed}`}
+				>
+					{statsAreLowerBound && (
+						<Text span size="xs" c="dimmed" ff="monospace">
+							≥
+						</Text>
+					)}
+					{stats.added > 0 && (
+						<Text span size="xs" c="green" fw={600} ff="monospace">
+							+{stats.added}
+						</Text>
+					)}
+					{stats.removed > 0 && (
+						<Text span size="xs" c="red" fw={600} ff="monospace">
+							-{stats.removed}
+						</Text>
+					)}
+				</Group>
+			)}
 			{/* A failed read must be visible on its own node: rendering the directory as
 			    empty would be indistinguishable from it actually being empty. */}
 			{error && (

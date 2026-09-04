@@ -687,13 +687,17 @@ fsRoutes.post("/write", async (c) => {
 		try {
 			const { invalidateWorkspaceTreeCache } = await import("../services/narrator-session-state");
 			invalidateWorkspaceTreeCache(cwd);
-			const { worktreeTreeSnapshot } = await import("../services/worktree-tree-snapshot");
-			const treeHash = await worktreeTreeSnapshot.tryCapture(cwd, LOCAL_DEVICE_ID);
-			if (treeHash) {
-				// Linked into the snapshot DAG for the same reason the watcher does it: a fork
-				// taken after this save must start from a state that includes it.
-				const { advanceChapterSnapshot } = await import("../services/chapter-snapshot-ref");
-				await advanceChapterSnapshot(cwd, treeHash, "human editor save");
+			if (settings.chapters.treeSnapshotsEnabled) {
+				const { worktreeTreeSnapshot } = await import("../services/worktree-tree-snapshot");
+				// The hot-path variant: a save is a user-facing request and must not stall
+				// behind (or trigger) an unbounded full-tree scan on a huge worktree.
+				const treeHash = await worktreeTreeSnapshot.tryCaptureHot(cwd, LOCAL_DEVICE_ID);
+				if (treeHash) {
+					// Linked into the snapshot DAG for the same reason the watcher does it: a fork
+					// taken after this save must start from a state that includes it.
+					const { advanceChapterSnapshot } = await import("../services/chapter-snapshot-ref");
+					await advanceChapterSnapshot(cwd, treeHash, "human editor save");
+				}
 			}
 		} catch (err) {
 			logger.debug("Tree snapshot boundary failed after human save", {

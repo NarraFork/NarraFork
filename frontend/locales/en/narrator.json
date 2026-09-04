@@ -852,6 +852,7 @@
 	"fileTree.refresh": "Refresh",
 	"fileTree.retry": "Retry",
 	"fileTree.truncated": "{{count}} more entries not shown",
+	"fileTree.partialLineStats": "Git returned only part of the changed-file list; this folder total is a lower bound.",
 	"fileEditor.edit": "Edit",
 	"fileEditor.save": "Save",
 	"fileEditor.reload": "Reload from disk",

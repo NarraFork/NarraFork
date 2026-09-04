@@ -64,6 +64,47 @@ const SHADOW_ROOT = getNarraforkPath("tree-snapshots");
  */
 const GIT_TIMEOUT_MS = 15_000;
 
+/**
+ * Total budget a tool-boundary capture may spend on the hot path, including any
+ * time queued on the shadow lock.
+ *
+ * The capture sits *inside* the narrator's event consumer (`onSnapshotBefore` is
+ * awaited before `tool_started` is even broadcast), so an unbounded capture stalls
+ * the whole session: no permission prompt, no execution, no tool timeout. On a
+ * huge worktree on Windows (slow lstat + antivirus scanning) a cold `git add -A`
+ * routinely exceeds {@link GIT_TIMEOUT_MS}; worse, killing it before the index is
+ * written means *every* capture is a cold scan, so the stall never self-heals.
+ *
+ * Past this budget the capture is not killed — it keeps running in the background
+ * as the worktree's single warm-up attempt (see {@link WARMUP_GIT_TIMEOUT_MS}) so
+ * the index gets written once and later captures become cheap again. The hot path
+ * returns null and the tool proceeds without a precise boundary, degrading to the
+ * per-file replay path for that call.
+ */
+const HOT_PATH_CAPTURE_BUDGET_MS = 4_000;
+
+/**
+ * Per-git-invocation ceiling for a capture that may become a warm-up.
+ *
+ * Much larger than {@link GIT_TIMEOUT_MS} on purpose: the one thing a warm-up must
+ * achieve is a *completed* `add -A`, because the index is only written at the end
+ * of the scan. The 15 s kill was exactly what kept a huge worktree cold forever —
+ * every capture restarted the full hash and died before persisting anything.
+ * Bounded anyway so a genuinely wedged git cannot leak a process indefinitely.
+ */
+const WARMUP_GIT_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * How long hot-path captures are skipped after a warm-up attempt fails.
+ *
+ * Without a cooldown the next tool call would immediately launch another full
+ * background scan, turning a hopeless tree into a permanent scan loop that keeps
+ * the disk, CPU and antivirus busy forever. During the window the hot path returns
+ * null instantly; the in-memory maps reset on process restart, and the settings
+ * toggle (`chapters.treeSnapshotsEnabled`) is the manual escape hatch.
+ */
+const WARMUP_FAILURE_COOLDOWN_MS = 15 * 60_000;
+
 /** Cap on captured git output; tree hashes and status are tiny. */
 const GIT_MAX_OUTPUT_BYTES = 1024 * 1024;
 
@@ -137,6 +178,107 @@ const SLOW_CAPTURE_WARN_INTERVAL_MS = 60_000;
 /** Last capture-cost warning per shadow repo and severity, to keep the log bounded. */
 const captureWarnedAt = new Map<string, number>();
 
+/**
+ * The one in-flight warm-up capture per shadow repo.
+ *
+ * A hot-path capture that outlives {@link HOT_PATH_CAPTURE_BUDGET_MS} is not killed
+ * — killing it before `add -A` finishes would discard the index write that makes
+ * the *next* capture cheap, which is precisely the cycle that froze sessions on
+ * huge Windows worktrees. It is instead promoted to the worktree's single warm-up:
+ * later hot-path calls share its promise (with their own small budget) rather than
+ * queueing a second full scan on the shadow lock.
+ */
+interface WarmupEntry {
+	/** When the warm-up's scan started (its capture call was made). */
+	startedAt: number;
+	promise: Promise<string | null>;
+	/** Kills the warm-up's current git process; used by structural preemption. */
+	abort: AbortController;
+	/**
+	 * Set when a structural path claimed the shadow lock out from under the warm-up.
+	 * A preempted warm-up is not evidence of a pathological worktree, so its failure
+	 * must not start the failure cooldown.
+	 */
+	preempted: boolean;
+}
+
+const warmupInFlight = new Map<string, WarmupEntry>();
+
+/**
+ * Per-shadow-repo timestamp until which hot-path captures are skipped outright.
+ * Set when a warm-up fails; absent (or expired) means the next call may try again.
+ */
+const warmupCooldownUntil = new Map<string, number>();
+
+/**
+ * Abort the shadow repo's in-flight warm-up capture, if any. Returns whether one
+ * was preempted.
+ *
+ * A warm-up runs with the warm-up git timeout (minutes, not seconds) and holds the
+ * shadow lock for its whole capture chain, so an unlucky structural call — restore,
+ * merge, fork — would otherwise queue behind it for up to several git timeouts on
+ * exactly the worktrees where the user most wants to roll back. Killing its
+ * `add -A` is safe: git cleans up its own lock on SIGTERM, and the one hard-kill
+ * case (Windows) is covered by removing the leftover lock below, once the shadow
+ * lock itself proves no git can still be holding it.
+ */
+function preemptWarmCapture(dir: string): boolean {
+	const entry = warmupInFlight.get(dir);
+	if (!entry) return false;
+	entry.preempted = true;
+	entry.abort.abort();
+	return true;
+}
+
+/**
+ * Remove a shadow repo's leftover `index.lock` after a preemption.
+ *
+ * Only called while holding the shadow lock, which the preempted warm-up cannot
+ * release before its killed git process has fully exited — so no live git can own
+ * the lock file, and the age-based caution of {@link recoverStaleIndexLock} does
+ * not apply. (Windows `taskkill` gives git no chance to clean up on its own.)
+ */
+function removeLeftoverIndexLockAfterPreemption(dir: string): void {
+	try {
+		rmSync(resolve(dir, "index.lock"), { force: true });
+	} catch {
+		// best effort — the age-based recovery path remains as a fallback
+	}
+}
+
+/**
+ * Acquire the shadow lock for a structural operation, preempting any warm-up first.
+ *
+ * Structural paths (capture/restore/merge/fork/gc) must never wait minutes behind a
+ * background scan whose only purpose is to make *future* captures cheap.
+ */
+function acquireShadowStructural<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+	const preempted = preemptWarmCapture(dir);
+	return shadowLock.acquire(dir, async () => {
+		if (preempted) removeLeftoverIndexLockAfterPreemption(dir);
+		return fn();
+	});
+}
+
+/**
+ * Resolve `promise` if it settles within `budgetMs`, otherwise resolve `undefined`.
+ * The loser is left running — callers rely on that (a losing capture becomes the
+ * warm-up), so the timer is the only thing ever cancelled here.
+ */
+async function raceBudget<T>(promise: Promise<T>, budgetMs: number): Promise<T | undefined> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<undefined>((resolvePromise) => {
+				timer = setTimeout(() => resolvePromise(undefined), budgetMs);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 /** Serializes snapshot work per shadow repository. */
 const shadowLock = new AsyncMutex();
 
@@ -208,13 +350,14 @@ async function runGitRaw(
 	args: string[],
 	gitDir: string,
 	workTree: string,
-	opts?: { maxOutputBytes?: number },
+	opts?: { maxOutputBytes?: number; timeoutMs?: number; signal?: AbortSignal },
 ): Promise<GitResult & { stdoutTruncated?: boolean }> {
 	const result = await safeSpawn({
 		cmd: ["git", "--git-dir", gitDir, "--work-tree", workTree, ...args],
-		timeout: GIT_TIMEOUT_MS,
+		timeout: opts?.timeoutMs ?? GIT_TIMEOUT_MS,
 		maxOutputBytes: opts?.maxOutputBytes ?? GIT_MAX_OUTPUT_BYTES,
 		env: { ...process.env, ...SHADOW_CONFIG_ENV },
+		...(opts?.signal && { signal: opts.signal }),
 	});
 	return {
 		stdout: result.stdout,
@@ -225,8 +368,14 @@ async function runGitRaw(
 }
 
 /** Run one git command against the shadow repo with the real worktree attached. */
-async function runGit(args: string[], gitDir: string, workTree: string): Promise<GitResult> {
-	const result = await runGitRaw(args, gitDir, workTree);
+async function runGit(
+	args: string[],
+	gitDir: string,
+	workTree: string,
+	timeoutMs?: number,
+	signal?: AbortSignal,
+): Promise<GitResult> {
+	const result = await runGitRaw(args, gitDir, workTree, { timeoutMs, signal });
 	return {
 		stdout: result.stdout.trim(),
 		stderr: result.stderr.trim(),
@@ -708,6 +857,28 @@ const SHADOW_CONFIG_ENTRIES: ReadonlyArray<readonly [key: string, value: string]
 	["core.symlinks", "true"],
 	// `add -A` must not be talked out of recording a file mode change.
 	["core.fileMode", "true"],
+	// Cache the untracked-directory scan in the index. On a large worktree the
+	// untracked walk dominates a warm `add -A` (worst on Windows, where lstat and
+	// antivirus scanning make it minutes rather than milliseconds), and the index
+	// extension is what turns it back into an index read. This trusts directory
+	// mtimes exactly the way the index's own stat cache already does for tracked
+	// files, so it extends the existing trust model rather than adding a new one.
+	//
+	// Residual risk, kept deliberately: a file created within the same mtime tick
+	// as the previous scan on a filesystem with coarse or lazily-updated mtimes
+	// could be missed by one capture, and a rollback to that tree would then
+	// delete the file via removePathNotInTree. git mitigates this with the same
+	// racy-clean re-validation the index stat cache uses (entries at the tick
+	// boundary are re-scanned rather than trusted), which is why this is on;
+	// the knob to disable the whole scan path on a filesystem where it misbehaves
+	// is `chapters.treeSnapshotsEnabled`.
+	["core.untrackedCache", "true"],
+	// Never let `add` trigger a spontaneous `gc --auto`. Shadow repositories are
+	// repacked by gcAll() on a controlled maintenance path; an auto-gc firing in
+	// the middle of a capture on a large object store is itself a multi-minute
+	// stall (and on Windows spawns background children that outlive the timeout
+	// kill that was supposed to bound the capture).
+	["gc.auto", "0"],
 ];
 
 /**
@@ -927,6 +1098,18 @@ export async function supportsMergeTree(): Promise<boolean> {
 /** Test-only: drop the cached probe result so a fresh probe runs. */
 export function resetMergeTreeSupportCacheForTests(): void {
 	mergeTreeSupported = null;
+}
+
+/**
+ * Test-only: drop hot-path warm-up/cooldown state.
+ *
+ * Clearing the in-flight map does not cancel a capture that is actually running —
+ * it only detaches the bookkeeping, so tests must use worktrees whose captures
+ * complete on their own (any tmp repo qualifies).
+ */
+export function resetHotPathCaptureStateForTests(): void {
+	warmupInFlight.clear();
+	warmupCooldownUntil.clear();
 }
 
 /** Result of a three-way tree merge. */
@@ -1431,7 +1614,13 @@ async function planSegmentReversalUnlocked(
  * into "timed out" is always reported immediately rather than being swallowed by the
  * window a slow-capture warning just opened.
  */
-function reportCaptureCost(worktreePath: string, dir: string, elapsed: number, ok: boolean): void {
+function reportCaptureCost(
+	worktreePath: string,
+	dir: string,
+	elapsed: number,
+	ok: boolean,
+	timeoutMs: number = GIT_TIMEOUT_MS,
+): void {
 	if (ok && elapsed < SLOW_CAPTURE_WARN_MS) return;
 	const key = `${dir}\u0000${ok ? "slow" : "failed"}`;
 	const now = Date.now();
@@ -1442,7 +1631,7 @@ function reportCaptureCost(worktreePath: string, dir: string, elapsed: number, o
 		logger.warn("Workspace snapshot scan is slow", {
 			worktreePath,
 			elapsedMs: elapsed,
-			timeoutMs: GIT_TIMEOUT_MS,
+			timeoutMs,
 		});
 		return;
 	}
@@ -1451,8 +1640,8 @@ function reportCaptureCost(worktreePath: string, dir: string, elapsed: number, o
 	logger.warn("Workspace snapshot scan did not complete", {
 		worktreePath,
 		elapsedMs: elapsed,
-		timeoutMs: GIT_TIMEOUT_MS,
-		timedOut: elapsed >= GIT_TIMEOUT_MS,
+		timeoutMs,
+		timedOut: elapsed >= timeoutMs,
 	});
 }
 
@@ -1498,21 +1687,28 @@ async function captureUnlocked(
 	dir: string,
 	worktreePath: string,
 	deviceId: string,
+	opts?: { gitTimeoutMs?: number; signal?: AbortSignal },
 ): Promise<string> {
 	await ensureShadowRepo(dir, worktreePath);
 	const startedAt = Date.now();
-	let added = await addAllUnlocked(dir, worktreePath);
+	let added = await addAllUnlocked(dir, worktreePath, opts?.gitTimeoutMs, opts?.signal);
 	// A stale lock is indistinguishable from a live one by exit code alone, so the
 	// retry is gated on the lock file's own age. Done here rather than in `ensure`
 	// because the lock can also appear *between* two captures.
 	if (added.exitCode !== 0 && recoverStaleIndexLock(dir, worktreePath, added.stderr)) {
-		added = await addAllUnlocked(dir, worktreePath);
+		added = await addAllUnlocked(dir, worktreePath, opts?.gitTimeoutMs, opts?.signal);
 	}
-	reportCaptureCost(worktreePath, dir, Date.now() - startedAt, added.exitCode === 0);
+	reportCaptureCost(
+		worktreePath,
+		dir,
+		Date.now() - startedAt,
+		added.exitCode === 0,
+		opts?.gitTimeoutMs,
+	);
 	if (added.exitCode !== 0) {
 		throw new TreeSnapshotError(`snapshot add failed: ${added.stderr}`);
 	}
-	const written = await runGit(["write-tree"], dir, worktreePath);
+	const written = await runGit(["write-tree"], dir, worktreePath, opts?.gitTimeoutMs, opts?.signal);
 	if (written.exitCode !== 0 || !written.stdout) {
 		throw new TreeSnapshotError(`snapshot write-tree failed: ${written.stderr}`);
 	}
@@ -1555,10 +1751,15 @@ async function captureUnlocked(
  * `add -A` records its removal (verified), so the force-add is only ever needed to
  * *introduce* an entry.
  */
-async function addAllUnlocked(dir: string, worktreePath: string): Promise<GitResult> {
-	let added = await runGit(["add", "-A"], dir, worktreePath);
+async function addAllUnlocked(
+	dir: string,
+	worktreePath: string,
+	gitTimeoutMs?: number,
+	signal?: AbortSignal,
+): Promise<GitResult> {
+	let added = await runGit(["add", "-A"], dir, worktreePath, gitTimeoutMs, signal);
 	if (added.exitCode !== 0) {
-		const partial = await addAllIgnoringUnreadable(dir, worktreePath, added);
+		const partial = await addAllIgnoringUnreadable(dir, worktreePath, added, gitTimeoutMs, signal);
 		if (!partial) return added;
 		added = partial;
 	}
@@ -1576,6 +1777,8 @@ async function addAllUnlocked(dir: string, worktreePath: string): Promise<GitRes
 			["add", "-A", "--force", "--ignore-errors", "--", ...batch],
 			dir,
 			worktreePath,
+			gitTimeoutMs,
+			signal,
 		);
 		// Reported rather than fatal. The plain `add -A` already succeeded, so a tree
 		// missing these paths is still the pre-existing behaviour and strictly better
@@ -1620,12 +1823,20 @@ async function addAllIgnoringUnreadable(
 	dir: string,
 	worktreePath: string,
 	original: GitResult,
+	gitTimeoutMs?: number,
+	signal?: AbortSignal,
 ): Promise<GitResult | null> {
 	// The stderr wording is locale-dependent, so this is not gated on the message.
 	// Instead the *outcome* decides: a retry that also fails to make progress is
 	// discarded, and a stale lock is handled by its own dedicated path.
 	if (original.stderr.includes("index.lock")) return null;
-	const retried = await runGit(["add", "-A", "--ignore-errors"], dir, worktreePath);
+	const retried = await runGit(
+		["add", "-A", "--ignore-errors"],
+		dir,
+		worktreePath,
+		gitTimeoutMs,
+		signal,
+	);
 	if (retried.exitCode !== 0 && retried.exitCode !== 1) return null;
 	logger.warn("Snapshot captured without paths git could not read", {
 		worktreePath,
@@ -2157,10 +2368,24 @@ export const worktreeTreeSnapshot = {
 	 * index. Identical states yield the same hash, so repeated calls are cheap and
 	 * deduplicate naturally.
 	 */
-	async capture(worktreePath: string, deviceId: string = LOCAL_DEVICE_ID): Promise<string> {
+	async capture(
+		worktreePath: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+		opts?: { gitTimeoutMs?: number; signal?: AbortSignal },
+	): Promise<string> {
 		assertLocal(deviceId);
 		const dir = shadowDir(deviceId, worktreePath);
-		return shadowLock.acquire(dir, () => captureUnlocked(dir, worktreePath, deviceId));
+		// A caller carrying a signal is the warm-up itself (the thing that can BE
+		// preempted); everyone else is a structural path (fork/merge/restore flow
+		// through here) and must not queue behind a background scan for minutes.
+		const preempted = opts?.signal ? false : preemptWarmCapture(dir);
+		return shadowLock.acquire(dir, async () => {
+			if (preempted) removeLeftoverIndexLockAfterPreemption(dir);
+			return captureUnlocked(dir, worktreePath, deviceId, {
+				gitTimeoutMs: opts?.gitTimeoutMs,
+				signal: opts?.signal,
+			});
+		});
 	},
 
 	/**
@@ -2176,6 +2401,148 @@ export const worktreeTreeSnapshot = {
 			return await this.capture(worktreePath, deviceId);
 		} catch (error) {
 			logger.debug("Tree snapshot capture failed", {
+				worktreePath,
+				deviceId,
+				error: String(error),
+			});
+			return null;
+		}
+	},
+
+	/**
+	 * Capture with a hard wall-clock budget, for the tool-execution hot path.
+	 *
+	 * `onSnapshotBefore`/`onSnapshotAfter` are awaited inside the narrator's event
+	 * consumer, so an unbounded capture stalls the whole session: the tool never
+	 * reaches the permission gate, its timeout never starts, and every later event
+	 * queues behind it. On a huge worktree on Windows a cold `git add -A` exceeds
+	 * any budget a session can tolerate — and killing it before the index is
+	 * written makes *every* capture cold, which is the cycle this breaks.
+	 *
+	 * Behaviour, in order:
+	 *
+	 *   1. A recent warm-up failure → return null immediately (cooldown).
+	 *   2. A capture is already running → share its promise, bounded by the budget.
+	 *      Exception: a caller passing `minStartedAt` (the tool-result hook, whose
+	 *      boundary must describe the state *after* the tool finished) cannot share
+	 *      a scan that started before that cutoff — its window may straddle the
+	 *      tool's writes and produce a tree that never existed on disk. It waits
+	 *      for the stale scan to settle (which warms the index either way), then
+	 *      re-captures with the budget that remains.
+	 *   3. Otherwise start one with the warm-up ceiling ({@link WARMUP_GIT_TIMEOUT_MS},
+	 *      not {@link GIT_TIMEOUT_MS}). Finished within the budget → the hash, exactly
+	 *      like {@link tryCapture}. Still running at the budget → return null and let
+	 *      it finish in the background: a completed `add -A` writes the index that
+	 *      makes every later capture cheap, so the worktree self-heals.
+	 *
+	 * Only a failure that outlived the budget starts the cooldown — a fast failure
+	 * (a worktree removed mid-dormancy, a transient lock) keeps the retry-next-time
+	 * behaviour it has always had, as does a preemption by a structural path.
+	 *
+	 * Never throws, and never takes longer than the budget.
+	 */
+	async tryCaptureHot(
+		worktreePath: string,
+		deviceId: string = LOCAL_DEVICE_ID,
+		opts?: {
+			budgetMs?: number;
+			warmupGitTimeoutMs?: number;
+			cooldownMs?: number;
+			minStartedAt?: number;
+		},
+	): Promise<string | null> {
+		const budgetMs = opts?.budgetMs ?? HOT_PATH_CAPTURE_BUDGET_MS;
+		const warmupGitTimeoutMs = opts?.warmupGitTimeoutMs ?? WARMUP_GIT_TIMEOUT_MS;
+		const cooldownMs = opts?.cooldownMs ?? WARMUP_FAILURE_COOLDOWN_MS;
+		const minStartedAt = opts?.minStartedAt;
+		try {
+			assertLocal(deviceId);
+			const dir = shadowDir(deviceId, worktreePath);
+
+			const cooldownUntil = warmupCooldownUntil.get(dir);
+			if (cooldownUntil !== undefined) {
+				if (Date.now() < cooldownUntil) return null;
+				warmupCooldownUntil.delete(dir);
+			}
+
+			const deadline = Date.now() + budgetMs;
+			let remainingMs = budgetMs;
+			for (;;) {
+				const inFlight = warmupInFlight.get(dir);
+				if (!inFlight) break;
+				if (minStartedAt === undefined || inFlight.startedAt >= minStartedAt) {
+					return (await raceBudget(inFlight.promise, remainingMs)) ?? null;
+				}
+				// The shared scan started before the caller's cutoff: its tree may mix
+				// bytes from before and after the writes being measured — a state that
+				// never existed on disk, worthless (and misleading) as a boundary. Wait
+				// for it to settle — it warms the index either way — then loop to
+				// re-capture with what budget remains; a too-slow settle degrades to
+				// null (per-file replay), exactly like any other over-budget capture.
+				const staleSettled = await raceBudget(
+					inFlight.promise.then(
+						() => true,
+						() => true,
+					),
+					remainingMs,
+				);
+				if (!staleSettled) return null;
+				remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) return null;
+			}
+
+			const abort = new AbortController();
+			const entry: WarmupEntry = {
+				startedAt: Date.now(),
+				abort,
+				preempted: false,
+				promise: Promise.resolve(null),
+			};
+			const settled = this.capture(worktreePath, deviceId, {
+				gitTimeoutMs: warmupGitTimeoutMs,
+				signal: abort.signal,
+			}).then(
+				(hash) => ({ ok: true as const, hash }),
+				(error: unknown) => ({ ok: false as const, error }),
+			);
+
+			// Registered *before* the budget race resolves, so concurrent hot calls
+			// share this one scan instead of each queueing a full `add -A` of their own
+			// on the shadow lock.
+			let sawBudgetExpiry = false;
+			const shared: Promise<string | null> = settled.then((result) => {
+				warmupInFlight.delete(dir);
+				if (result.ok) return result.hash;
+				// A preempted warm-up was killed by a structural path, not by a
+				// pathological worktree — its failure must not pause future captures.
+				if (sawBudgetExpiry && !entry.preempted) {
+					warmupCooldownUntil.set(dir, Date.now() + cooldownMs);
+					logger.warn(
+						"Workspace snapshot warm-up failed; hot-path captures paused until cooldown expires",
+						{
+							worktreePath,
+							cooldownMs,
+							error: result.error instanceof Error ? result.error.message : String(result.error),
+						},
+					);
+				}
+				return null;
+			});
+			entry.promise = shared;
+			warmupInFlight.set(dir, entry);
+
+			const outcome = await raceBudget(settled, remainingMs);
+			if (outcome !== undefined) {
+				return outcome.ok ? outcome.hash : null;
+			}
+			sawBudgetExpiry = true;
+			logger.warn("Workspace snapshot exceeded the hot-path budget; continuing in background", {
+				worktreePath,
+				budgetMs,
+			});
+			return null;
+		} catch (error) {
+			logger.debug("Hot-path tree snapshot capture failed", {
 				worktreePath,
 				deviceId,
 				error: String(error),
@@ -2340,7 +2707,7 @@ export const worktreeTreeSnapshot = {
 	): Promise<string[]> {
 		assertLocal(deviceId);
 		const dir = shadowDir(deviceId, worktreePath);
-		return shadowLock.acquire(dir, () =>
+		return acquireShadowStructural(dir, () =>
 			restoreUnlocked(dir, worktreePath, treeHash, expectedCurrentTree),
 		);
 	},
@@ -2362,7 +2729,7 @@ export const worktreeTreeSnapshot = {
 	): Promise<SegmentReversalPlan> {
 		assertLocal(deviceId);
 		const dir = shadowDir(deviceId, worktreePath);
-		return shadowLock.acquire(dir, async () => {
+		return acquireShadowStructural(dir, async () => {
 			await ensureShadowRepo(dir, worktreePath);
 			const current = await captureUnlocked(dir, worktreePath, deviceId);
 			return planSegmentReversalUnlocked(dir, worktreePath, current, planTreeRevertSegments(pairs));
@@ -2392,7 +2759,7 @@ export const worktreeTreeSnapshot = {
 	}> {
 		assertLocal(deviceId);
 		const dir = shadowDir(deviceId, worktreePath);
-		return shadowLock.acquire(dir, async () => {
+		return acquireShadowStructural(dir, async () => {
 			await ensureShadowRepo(dir, worktreePath);
 			const current = await captureUnlocked(dir, worktreePath, deviceId);
 			const plan = await planSegmentReversalUnlocked(
@@ -2452,7 +2819,7 @@ export const worktreeTreeSnapshot = {
 		if (!existsSync(resolve(sourceDir, "HEAD"))) {
 			throw new TreeSnapshotError(`No snapshot repository for ${sourceWorktreePath}`);
 		}
-		await shadowLock.acquire(sourceDir, async () => {
+		await acquireShadowStructural(sourceDir, async () => {
 			// Hash the target as it is now, using a scratch index so the source repo's
 			// own index — which tracks the *source* worktree — is left alone.
 			//
@@ -2579,7 +2946,7 @@ export const worktreeTreeSnapshot = {
 	): Promise<string> {
 		assertLocal(deviceId);
 		const dir = shadowDir(deviceId, worktreePath);
-		return shadowLock.acquire(dir, async () => {
+		return acquireShadowStructural(dir, async () => {
 			await ensureShadowRepo(dir, worktreePath);
 			return commitSnapshotUnlocked(dir, worktreePath, treeHash, parents, message);
 		});
@@ -2605,7 +2972,7 @@ export const worktreeTreeSnapshot = {
 		try {
 			assertLocal(deviceId);
 			const dir = shadowDir(deviceId, worktreePath);
-			return await shadowLock.acquire(dir, async () => {
+			return await acquireShadowStructural(dir, async () => {
 				await ensureShadowRepo(dir, worktreePath);
 				const treeHash = await captureUnlocked(dir, worktreePath, deviceId);
 				return linkSnapshotUnlocked(dir, worktreePath, treeHash, message);
@@ -2642,7 +3009,7 @@ export const worktreeTreeSnapshot = {
 			assertLocal(deviceId);
 			assertObjectId(treeHash);
 			const dir = shadowDir(deviceId, worktreePath);
-			return await shadowLock.acquire(dir, async () => {
+			return await acquireShadowStructural(dir, async () => {
 				await ensureShadowRepo(dir, worktreePath);
 				return linkSnapshotUnlocked(dir, worktreePath, treeHash, message);
 			});
@@ -2667,7 +3034,7 @@ export const worktreeTreeSnapshot = {
 		assertSnapshotRef(ref);
 		assertObjectId(commitSha);
 		const dir = shadowDir(deviceId, worktreePath);
-		await shadowLock.acquire(dir, async () => {
+		await acquireShadowStructural(dir, async () => {
 			await ensureShadowRepo(dir, worktreePath);
 			const result = await runGit(["update-ref", ref, commitSha], dir, worktreePath);
 			if (result.exitCode !== 0) {
@@ -2713,7 +3080,7 @@ export const worktreeTreeSnapshot = {
 		// Probed before taking the lock: `ensureShadowRepo` would otherwise *create* a
 		// repository just to delete a ref that cannot exist in it.
 		if (!existsSync(resolve(dir, "HEAD"))) return;
-		await shadowLock.acquire(dir, async () => {
+		await acquireShadowStructural(dir, async () => {
 			const result = await runGit(["update-ref", "-d", ref], dir, worktreePath);
 			// `update-ref -d` on an absent ref succeeds, so a non-zero exit is a real
 			// failure. Logged rather than thrown: the caller is deleting something, and
@@ -2738,7 +3105,7 @@ export const worktreeTreeSnapshot = {
 		assertSnapshotRef(ref);
 		const dir = shadowDir(deviceId, worktreePath);
 		if (!existsSync(resolve(dir, "HEAD"))) return null;
-		return shadowLock.acquire(dir, () => getRefUnlocked(dir, worktreePath, ref));
+		return acquireShadowStructural(dir, () => getRefUnlocked(dir, worktreePath, ref));
 	},
 
 	/** The tree recorded by a snapshot commit, or null if it cannot be resolved. */
@@ -2751,7 +3118,7 @@ export const worktreeTreeSnapshot = {
 		assertObjectId(commitSha);
 		const dir = shadowDir(deviceId, worktreePath);
 		if (!existsSync(resolve(dir, "HEAD"))) return null;
-		return shadowLock.acquire(dir, async () => {
+		return acquireShadowStructural(dir, async () => {
 			const result = await runGit(
 				["rev-parse", "--verify", "--quiet", `${commitSha}^{tree}`],
 				dir,
@@ -2787,7 +3154,7 @@ export const worktreeTreeSnapshot = {
 		assertSnapshotRef(ref);
 		assertObjectId(commitSha);
 		const dir = shadowDir(deviceId, worktreePath);
-		return shadowLock.acquire(dir, async () => {
+		return acquireShadowStructural(dir, async () => {
 			await ensureShadowRepo(dir, worktreePath);
 			const result = await runGit(
 				["fetch", "--no-tags", "--quiet", repoPath, `+${commitSha}:${ref}`],
@@ -2856,13 +3223,13 @@ export const worktreeTreeSnapshot = {
 		// lineage within one repo is a legitimate call (aliasing a ref), so this is
 		// handled rather than rejected.
 		if (sourceDir === targetDir) {
-			return shadowLock.acquire(targetDir, runFetch);
+			return acquireShadowStructural(targetDir, runFetch);
 		}
 		// Locked in a canonical order (sorted by directory) because a fork and a merge
 		// can run in opposite directions between the same pair; locking in call order
 		// would let the two deadlock against each other.
 		const [first, second] = [sourceDir, targetDir].sort();
-		return shadowLock.acquire(first, () => shadowLock.acquire(second, runFetch));
+		return acquireShadowStructural(first, () => acquireShadowStructural(second, runFetch));
 	},
 
 	/**
@@ -2896,7 +3263,7 @@ export const worktreeTreeSnapshot = {
 		assertObjectId(theirs);
 		if (fallbackBase) assertObjectId(fallbackBase);
 		const dir = shadowDir(deviceId, worktreePath);
-		return shadowLock.acquire(dir, async () => {
+		return acquireShadowStructural(dir, async () => {
 			await ensureShadowRepo(dir, worktreePath);
 			const shared = await runGit(["merge-base", ours, theirs], dir, worktreePath);
 			if (shared.exitCode === 0 && shared.stdout) {
@@ -2958,7 +3325,7 @@ export const worktreeTreeSnapshot = {
 		assertObjectId(ours);
 		assertObjectId(theirs);
 		const dir = shadowDir(deviceId, worktreePath);
-		return shadowLock.acquire(dir, async () => {
+		return acquireShadowStructural(dir, async () => {
 			await ensureShadowRepo(dir, worktreePath);
 			return mergeTreeUnlocked(dir, worktreePath, base, ours, theirs);
 		});
@@ -2976,7 +3343,7 @@ export const worktreeTreeSnapshot = {
 		assertObjectId(current);
 		assertObjectId(beforeContribution);
 		const dir = shadowDir(deviceId, worktreePath);
-		return shadowLock.acquire(dir, async () => {
+		return acquireShadowStructural(dir, async () => {
 			await ensureShadowRepo(dir, worktreePath);
 			// The base is given explicitly here, unlike `mergeSnapshots`. Letting git
 			// derive it would find the common ancestor of the two sides, which is not the
@@ -3003,7 +3370,7 @@ export const worktreeTreeSnapshot = {
 		assertObjectId(b);
 		const dir = shadowDir(deviceId, worktreePath);
 		if (!existsSync(resolve(dir, "HEAD"))) return null;
-		return shadowLock.acquire(dir, async () => {
+		return acquireShadowStructural(dir, async () => {
 			const result = await runGit(["merge-base", a, b], dir, worktreePath);
 			// Exit 1 means "no common ancestor", which is a legitimate answer for two
 			// unrelated lineages rather than a failure.
@@ -3031,7 +3398,7 @@ export const worktreeTreeSnapshot = {
 		assertLocal(deviceId);
 		assertObjectId(treeHash);
 		const dir = shadowDir(deviceId, worktreePath);
-		return shadowLock.acquire(dir, () =>
+		return acquireShadowStructural(dir, () =>
 			restoreUnlocked(dir, worktreePath, treeHash, expectedCurrentTree),
 		);
 	},
@@ -3068,6 +3435,13 @@ export const worktreeTreeSnapshot = {
 			return false;
 		}
 		if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+		// A warm-up scanning the just-removed directory is pointless and its failure
+		// would otherwise start a cooldown a recreated worktree at this path inherits.
+		// Abort it, drop the in-flight entry so no caller shares a doomed scan, and
+		// clear any cooldown set before the destroy was decided.
+		preemptWarmCapture(dir);
+		warmupInFlight.delete(dir);
+		warmupCooldownUntil.delete(dir);
 		excludeMtimes.delete(dir);
 		// The force-add memo describes an index inside the directory just removed. A
 		// recreated worktree at the same path hashes to the same shadow dir, so a leftover
@@ -3121,7 +3495,7 @@ export const worktreeTreeSnapshot = {
 			// Serialized against captures: `gc` rewrites the object store, and a
 			// concurrent `add -A`/`write-tree` in the same repo can fail or race with
 			// the repack.
-			await shadowLock.acquire(dir, async () => {
+			await acquireShadowStructural(dir, async () => {
 				// `--no-prune` is the load-bearing flag. Repacking is the point; deleting
 				// unreachable objects is not, because "unreachable" is the normal state of
 				// a snapshot recorded before the DAG existed, and the database is the real

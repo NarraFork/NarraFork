@@ -802,6 +802,8 @@ export interface AgentConfig {
 	planMode?: boolean;
 	/** Current narrator permission mode; used for relaxed-plan safety checks. */
 	permissionMode?: string;
+	/** Review follow-up subagents may run only the constrained read-only Git Bash policy. */
+	reviewReadOnlyBash?: boolean;
 	/** Legacy permission mode snapshot from before entering plan mode; retained for migration/UI context. */
 	previousPermissionMode?: string;
 	/** When true, plan mode does NOT disable tool descriptions — tools remain fully available */

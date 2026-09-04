@@ -88,6 +88,7 @@ describe("registry resolvePluginUiContribution", () => {
 			stylePath: "ui/style.css",
 			entryUrl: "/api/plugin-assets/com.example.review/1/hash-1/entry.js",
 			styleUrl: "/api/plugin-assets/com.example.review/1/hash-1/style.css",
+			runtime: "host-react",
 			status: "available",
 		});
 		const contribution = resolvePluginUiContribution(params);
@@ -101,6 +102,7 @@ describe("registry resolvePluginUiContribution", () => {
 			packageHash: "hash-1",
 			entryPath: "ui/entry.js",
 			stylePath: "ui/style.css",
+			runtime: "host-react",
 			entryUrl: "/api/plugin-assets/com.example.review/1/hash-1/entry.js",
 			styleUrl: "/api/plugin-assets/com.example.review/1/hash-1/style.css",
 			status: "available",
@@ -222,6 +224,7 @@ describe("applyPluginUiContributionItems", () => {
 				title: "View 1",
 				entryPath: "e.js",
 				stylePath: "s.css",
+				runtime: "host-react",
 				status: "available",
 			},
 		]);
@@ -234,6 +237,9 @@ describe("applyPluginUiContributionItems", () => {
 			title: "View 1",
 			entryPath: "e.js",
 			stylePath: "s.css",
+			scope: undefined,
+			surfaces: undefined,
+			runtime: "host-react",
 			availability: "available",
 			unavailableReason: undefined,
 		});

@@ -7,6 +7,7 @@ import type { MiddlewareHandler } from "hono";
 import { uiBootstrapSchema } from "../../../frontend/components/plugins/protocol";
 import { db } from "../../db";
 import { userPluginThemes, users } from "../../db/schema";
+import { AppError } from "../../lib/errors";
 import { integrationAuthorityService } from "../../services/integration-authority-service";
 import { CapabilityBroker, capabilityBroker } from "../../services/plugin-capability-broker";
 import { PluginHealthRegistry } from "../../services/plugin-health";
@@ -69,11 +70,18 @@ async function makeRoutes(
 		permissions?: typeof defaultPermissionSet | null;
 		sessionService?: PluginUiSessionService;
 		capabilityBroker?: CapabilityBroker;
+		server?: boolean;
+		activationEvents?: string[];
+		activate?: (
+			pluginId: string,
+			options?: { reason?: string; automatic?: boolean },
+		) => Promise<unknown>;
 	} = {},
 ) {
 	await ensureUiIntegrationAuthority();
 	const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-ui-route-"));
-	const packagePath = join(root, "packages", pluginId, version, hash, "ui");
+	const packageRoot = join(root, "packages", pluginId, version, hash);
+	const packagePath = join(packageRoot, "ui");
 	await mkdir(packagePath, { recursive: true });
 	const manifest = {
 		schemaVersion: 1,
@@ -81,8 +89,19 @@ async function makeRoutes(
 		version,
 		displayName: "UI",
 		engine: { runtime: "bun", hostApi: ">=1.0 <2", rpc: "narrafork.rpc/1" },
+		...(options.server
+			? {
+					server: {
+						entry: "server/index.js",
+						transport: "stdio",
+						protocol: "narrafork.rpc/1",
+						args: [],
+						workingDirectory: "package",
+					},
+				}
+			: {}),
 		ui: { entry: "ui/index.js" },
-		activationEvents: ["onView:panel"],
+		activationEvents: options.activationEvents ?? ["onView:panel"],
 		contributes: {
 			views: [
 				{
@@ -118,6 +137,11 @@ async function makeRoutes(
 	await writeFile(join(packagePath, "index.js"), "window.pluginReady = true;");
 	await writeFile(join(packagePath, "quiet.js"), "window.quietPluginReady = true;");
 	await writeFile(join(packagePath, "quiet.css"), "body { color: blue; }");
+	if (options.server) {
+		const serverPath = join(packageRoot, "server");
+		await mkdir(serverPath, { recursive: true });
+		await writeFile(join(serverPath, "index.js"), "// server fixture\n");
+	}
 	const auth: MiddlewareHandler = async (c, next) => {
 		c.set("user", { sub: "user-1", role: "user", iat: 0, exp: 9_999_999_999 });
 		await next();
@@ -138,6 +162,7 @@ async function makeRoutes(
 			}),
 			getCurrentInstallationId: async () => "installation-1",
 			...(permissions ? { getPermissions: async () => permissions } : {}),
+			...(options.activate ? { activate: options.activate } : {}),
 		},
 		uiHost,
 		healthRegistry: new PluginHealthRegistry(),
@@ -218,6 +243,100 @@ describe("plugin UI routes", () => {
 			`http://localhost/ui/${pluginId}/${version}/${hash}/asset/${created.session.sessionId}/${"x".repeat(32)}/ui/index.js`,
 		);
 		expect(wrongAsset.status).toBe(401);
+	});
+
+	test("activates a server-backed view before creating its UI session", async () => {
+		const activations: Array<{
+			pluginId: string;
+			options?: { reason?: string; automatic?: boolean };
+		}> = [];
+		const routes = await makeRoutes({ enabled: true }, undefined, {
+			server: true,
+			activate: async (activatedPluginId, options) => {
+				activations.push({ pluginId: activatedPluginId, options });
+				return {};
+			},
+		});
+		const response = await routes.request("http://localhost/ui/sessions", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				pluginId,
+				version,
+				hash,
+				contributionId: "panel",
+				panelInstanceId: "panel-activation",
+				surface: "workspace",
+				surfaceScope: "workspace",
+				scope: { workspaceId: "workspace-1" },
+			}),
+		});
+
+		expect(response.status).toBe(200);
+		expect(activations).toEqual([
+			{
+				pluginId,
+				options: { automatic: true, reason: "onView:panel" },
+			},
+		]);
+	});
+
+	test("does not start a server-backed view without a matching onView event", async () => {
+		let activationCount = 0;
+		const routes = await makeRoutes({ enabled: true }, undefined, {
+			server: true,
+			activationEvents: [],
+			activate: async () => {
+				activationCount += 1;
+				return {};
+			},
+		});
+		const response = await routes.request("http://localhost/ui/sessions", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				pluginId,
+				version,
+				hash,
+				contributionId: "panel",
+				panelInstanceId: "panel-no-activation",
+				surface: "workspace",
+				surfaceScope: "workspace",
+				scope: { workspaceId: "workspace-1" },
+			}),
+		});
+
+		expect(response.status).toBe(200);
+		expect(activationCount).toBe(0);
+	});
+
+	test("does not create a UI session when declared view activation fails", async () => {
+		const sessionService = new PluginUiSessionService();
+		const routes = await makeRoutes({ enabled: true }, undefined, {
+			server: true,
+			sessionService,
+			activate: async () => {
+				throw new AppError("activation failed", 503, "PLUGIN_ACTIVATION_FAILED");
+			},
+		});
+		const response = await routes.request("http://localhost/ui/sessions", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				pluginId,
+				version,
+				hash,
+				contributionId: "panel",
+				panelInstanceId: "panel-failed-activation",
+				surface: "workspace",
+				surfaceScope: "workspace",
+				scope: { workspaceId: "workspace-1" },
+			}),
+		});
+
+		expect(response.status).toBe(503);
+		expect(await response.json()).toMatchObject({ code: "PLUGIN_ACTIVATION_FAILED" });
+		expect(sessionService.clearForPlugin(pluginId)).toBe(0);
 	});
 
 	test("serves the selected view assets instead of reusing manifest.ui", async () => {

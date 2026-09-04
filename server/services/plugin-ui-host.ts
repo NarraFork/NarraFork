@@ -121,9 +121,10 @@ export interface PluginUiHostOptions {
  * Narrower than `PluginCommandRegistry` on purpose: this host must not be able to register
  * or remove commands, only ask whether one exists and invoke it.
  *
- * Note `invoke` returns *only* `output`. Any `secretWrites` a command requested are
- * validated and applied by the dispatcher before it returns, so secret material never
- * reaches this class and therefore cannot be forwarded to an iframe even by mistake.
+ * Note `invoke` returns only `output` plus post-write catalog sync metadata. Any
+ * `secretWrites`/`configWrites` a command requested are validated and applied by the
+ * dispatcher before it returns, so persisted values never reach this class and therefore
+ * cannot be forwarded to an iframe even by mistake.
  */
 export interface PluginCommandDispatcher {
 	has(commandId: string, pluginId: string): boolean;
@@ -136,8 +137,16 @@ export interface PluginCommandDispatcher {
 			correlationId?: string;
 			idempotencyKey?: string;
 			signal?: AbortSignal;
+			timeoutMs?: number;
 		},
-	): Promise<{ output: JsonValue | undefined }>;
+	): Promise<{
+		output: JsonValue | undefined;
+		/** Post-write catalog refresh outcomes, safe to show to the owning plugin UI. */
+		catalogSync?: Array<
+			| { providerInstanceId: string; ok: true; modelCount: number }
+			| { providerInstanceId: string; ok: false; error: string }
+		>;
+	}>;
 }
 
 export class PluginUiHostError extends Error {
@@ -640,9 +649,10 @@ export class PluginUiHost {
 	/**
 	 * Run a plugin-declared command.
 	 *
-	 * The result is deliberately reduced to `{ output }`: the dispatcher has already applied
-	 * any `secretWrites`, and passing them further would put credential material on a path
-	 * that ends at an iframe.
+	 * The result is deliberately reduced to `{ output, catalogSync? }`: the dispatcher has
+	 * already applied any `secretWrites`/`configWrites`, and passing those further would put
+	 * credential material on a path that ends at an iframe. Catalog sync carries only counts,
+	 * provider instance ids and refresh errors.
 	 */
 	private async invokePluginCommand(
 		request: { commandId: string; input?: JsonValue; idempotencyKey?: string },
@@ -662,7 +672,11 @@ export class PluginUiHost {
 					signal,
 				},
 			);
-			return { status: "succeeded", output: result.output ?? null } as JsonValue;
+			return {
+				status: "succeeded",
+				output: result.output ?? null,
+				...(result.catalogSync ? { catalogSync: result.catalogSync } : {}),
+			} as JsonValue;
 		} catch (error) {
 			const code = (error as { code?: string }).code;
 			const message = error instanceof Error ? error.message : "Plugin command failed";

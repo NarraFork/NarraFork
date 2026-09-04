@@ -111,9 +111,17 @@ export const PLUGIN_UI_HOST_LOCAL_METHODS = [
 	"panel.focus",
 	"panel.close",
 	"panel.open",
+	// Optional sizing channel: only surfaces whose container can actually grow
+	// (provider-settings, not Dockview panels) wire a delegate for it; everywhere
+	// else it correctly reports NOT_SUPPORTED so the plugin stops reporting.
+	"panel.setHeight",
 	"notifications.show",
 	"ui.openExternal",
 	"ui.navigate",
+	// Provider-facing host services. Both are scoped host-side to the session's
+	// plugin id: a view cannot refresh or test another plugin's provider.
+	"provider.modelsChanged",
+	"models.test",
 ] as const;
 export type PluginUiHostLocalMethod = (typeof PLUGIN_UI_HOST_LOCAL_METHODS)[number];
 

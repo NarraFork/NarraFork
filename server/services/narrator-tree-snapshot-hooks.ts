@@ -33,6 +33,7 @@ import { narratorMessages, narratorToolCalls } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
+import { settings } from "../lib/settings";
 import { advanceChapterSnapshot } from "./chapter-snapshot-ref";
 import { specVfsService } from "./spec-vfs-service";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
@@ -105,16 +106,31 @@ export function declaredWorktreePaths(cwd: string, input: unknown): string[] {
  * since the last capture.
  *
  * Never throws. Returns null for a remote target, a non-git cwd, or a git error.
+ *
+ * Two deliberate degradation valves live here. The `chapters.treeSnapshotsEnabled`
+ * setting is the manual escape hatch for worktrees where the whole-tree scan is
+ * not viable at all; and the capture itself goes through `tryCaptureHot`, which
+ * bounds how long the narrator's event consumer may stall on it and lets an
+ * over-budget scan finish in the background instead of blocking the session
+ * (the cold-index cycle that froze huge Windows worktrees).
  */
 export async function captureSessionTree(
 	session: TreeSnapshotSession,
 	narratorId: string,
+	opts?: { minCaptureStartedAt?: number },
 ): Promise<string | null> {
+	// The gate comes before the cache: with the feature switched off mid-session a
+	// hash captured earlier must not surface as one side of a boundary pair.
+	if (!settings.chapters.treeSnapshotsEnabled) return null;
 	if (session._lastTreeHash) return session._lastTreeHash;
 	// Remote workspaces have no shadow repository yet; the per-file snapshot path
 	// still covers them.
 	if ((session._defaultDeviceId ?? LOCAL_DEVICE_ID) !== LOCAL_DEVICE_ID) return null;
-	const treeHash = await worktreeTreeSnapshot.tryCapture(session.cwd, LOCAL_DEVICE_ID);
+	const treeHash = await worktreeTreeSnapshot.tryCaptureHot(session.cwd, LOCAL_DEVICE_ID, {
+		...(opts?.minCaptureStartedAt !== undefined && {
+			minStartedAt: opts.minCaptureStartedAt,
+		}),
+	});
 	if (!treeHash) {
 		logger.debug("Workspace tree snapshot unavailable", { narratorId, cwd: session.cwd });
 		return null;
@@ -256,7 +272,16 @@ export async function recordTreeSnapshotAfter(
 	session._treeHashBefore?.delete(toolUseId);
 	// The tool just wrote, so any cached hash describes a stale state.
 	session._lastTreeHash = undefined;
-	const after = await captureSessionTree(session, narratorId);
+	// A shared in-flight capture is only usable as the *after* boundary when its
+	// scan started no earlier than the tool's completion: one started earlier
+	// (typically the pre-execution hook's own over-budget capture, promoted to a
+	// background warm-up) may have read some files before the tool wrote them,
+	// producing a tree that never existed on disk. Rolling back "to after this
+	// message" would then silently drop this call's own edits. The cutoff tells
+	// tryCaptureHot to wait out such a scan and re-capture instead of sharing it.
+	const after = await captureSessionTree(session, narratorId, {
+		minCaptureStartedAt: Date.now(),
+	});
 	if (!before && !after) {
 		// Nothing was measured, so there is no resolved set to close the claim with.
 		closeClaim(session.cwd, toolUseId, []);

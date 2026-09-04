@@ -851,6 +851,7 @@
 	"fileTree.refresh": "刷新",
 	"fileTree.retry": "重试",
 	"fileTree.truncated": "另有 {{count}} 个条目未显示",
+	"fileTree.partialLineStats": "Git 只返回了部分已修改文件，该文件夹行数是下限。",
 	"fileEditor.edit": "编辑",
 	"fileEditor.save": "保存",
 	"fileEditor.reload": "从磁盘重新加载",

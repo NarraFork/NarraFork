@@ -3,6 +3,7 @@ import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { validatePluginRelease } from "../../scripts/validate-plugin-release";
+import { PluginPackageStore } from "../../server/services/plugin-package-store";
 
 const examplesRoot = resolve(process.cwd(), "examples/plugins");
 
@@ -60,6 +61,47 @@ describe("plugin GA release validation", () => {
 			const summary = await validatePluginRelease(root);
 			expect(summary.valid).toBe(true);
 			expect(summary.packages[0]?.runtime.status).toBe("not-requested");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("computes the same package digest as the installer", async () => {
+		const releaseRoot = await mkdtemp(join(tmpdir(), "narrafork-plugin-digest-release-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "narrafork-plugin-digest-store-"));
+		try {
+			const packageRoot = join(releaseRoot, "cline-external");
+			await cp(join(examplesRoot, "cline-external"), packageRoot, { recursive: true });
+			const summary = await validatePluginRelease(releaseRoot);
+			const installed = await new PluginPackageStore(storeRoot).install(packageRoot);
+
+			expect(summary.valid).toBe(true);
+			expect(summary.packages[0]?.digest).toBe(installed.hash);
+		} finally {
+			await Promise.all([
+				rm(releaseRoot, { recursive: true, force: true }),
+				rm(storeRoot, { recursive: true, force: true }),
+			]);
+		}
+	});
+
+	test("rejects a runtime that omits the installer package digest", async () => {
+		const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-digest-hello-"));
+		try {
+			const packageRoot = join(root, "tool-command");
+			await cp(join(examplesRoot, "tool-command"), packageRoot, { recursive: true });
+			const entryPath = join(packageRoot, "server/index.js");
+			const entry = await readFile(entryPath, "utf8");
+			const digestField = "\t\t...(PACKAGE_DIGEST ? { packageDigest: PACKAGE_DIGEST } : {}),\n";
+			expect(entry).toContain(digestField);
+			await writeFile(entryPath, entry.replace(digestField, ""));
+
+			const summary = await validatePluginRelease(root, {
+				mode: "runtime",
+				runtimeTimeoutMs: 5_000,
+			});
+			expect(summary.valid).toBe(false);
+			expect(summary.errors.join("\n")).toMatch(/package digest mismatch/i);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

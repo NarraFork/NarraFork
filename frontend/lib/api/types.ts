@@ -996,6 +996,8 @@ export interface CodexUsageData {
 		reset_at: number;
 		reset_after_seconds: number;
 	};
+	/** Rate-limit reset credits available for immediate window resets, when reported upstream. */
+	reset_credits_available?: number;
 	queriedAt: string;
 }
 

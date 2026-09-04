@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { SHELL_TOOL_NAME } from "@server/lib/agent/tools/bash";
 import type { ToolDefinition } from "@server/lib/agent/types";
 import { settings } from "@server/lib/settings";
 import { z } from "zod";
@@ -94,9 +95,9 @@ describe("resolveToolFilter", () => {
 		expect(filter(readTool)).toBe(true);
 		expect(filter(grepTool)).toBe(true);
 		expect(filter(contextAskTool)).toBe(true);
+		expect(filter(makeTool(SHELL_TOOL_NAME))).toBe(true);
 		expect(filter(makeTool("Write"))).toBe(false);
 		expect(filter(makeTool("Edit"))).toBe(false);
-		expect(filter(makeTool("Bash"))).toBe(false);
 		expect(filter(mcpReadTool)).toBe(true);
 		expect(filter(mcpWriteTool)).toBe(false);
 	});

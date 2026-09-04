@@ -63,6 +63,7 @@ function makeBashAnalysis(partial: Partial<BashAnalysis> = {}): BashAnalysis {
 		nonWhitelisted: [],
 		dangerousPatterns: [],
 		hasEnvInjection: false,
+		commandEnvVars: [],
 		isCatastrophic: false,
 		gitBranchViolations: [],
 		gitBranchWarnings: [],

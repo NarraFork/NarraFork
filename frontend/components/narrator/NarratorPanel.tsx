@@ -6349,6 +6349,8 @@ export function NarratorPanel({
 					return dock ? dock.openToolTypes.has("browser") : mobileToolPanel === "browser";
 				case "userchat":
 					return dock ? dock.openToolTypes.has("userchat") : mobileToolPanel === "userchat";
+				case "filetree":
+					return dock?.openToolTypes.has("filetree") ?? false;
 				default:
 					return false;
 			}
@@ -6396,6 +6398,9 @@ export function NarratorPanel({
 				case "userchat":
 					if (dock) dock.toggleToolPanel(id);
 					else setMobileToolPanel((current) => (current === id ? null : id));
+					return;
+				case "filetree":
+					dock?.toggleToolPanel("filetree");
 					return;
 				// Dock-only (registry `hosts: ["dock"]`): the panel exists to sit beside the
 				// transcript while a slider moves, so there is no drawer fallback to offer.

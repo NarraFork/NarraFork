@@ -31,6 +31,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { toForwardSlash } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
+import { settings } from "../lib/settings";
 import { isNativeWatcherEnabled, ParcelRecursiveWatcher } from "../lib/watcher/parcel-watcher";
 import { FileChangeType } from "../lib/watcher/types";
 import { advanceChapterSnapshot } from "./chapter-snapshot-ref";
@@ -785,7 +786,10 @@ export const worktreeWatcher = {
 		// when something actually changed. See `_processChange` for why an unchanged git
 		// status is sufficient grounds to skip it.
 		if (options?.skipSnapshot) return;
-		const treeHash = await worktreeTreeSnapshot.tryCapture(worktreePath, LOCAL_DEVICE_ID);
+		if (!settings.chapters.treeSnapshotsEnabled) return;
+		// The hot-path variant: this capture shares the narrator tool path's shadow
+		// lock, so it must never queue an unbounded scan behind (or ahead of) one.
+		const treeHash = await worktreeTreeSnapshot.tryCaptureHot(worktreePath, LOCAL_DEVICE_ID);
 		if (treeHash) {
 			// Link it into the snapshot DAG with the tree just captured. Without this the
 			// lineage would only advance on narrator tool calls, so a fork taken after

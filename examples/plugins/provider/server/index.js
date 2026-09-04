@@ -1,5 +1,6 @@
 const PLUGIN_ID = "com.example.provider";
-const PLUGIN_VERSION = "1.0.0";
+const PLUGIN_VERSION = "1.0.1";
+const PACKAGE_DIGEST = process.env.NF_PLUGIN_PACKAGE_DIGEST;
 const RPC_PROTOCOL = "narrafork.rpc/1";
 const PROVIDER_PROTOCOL = "1.0";
 const MAX_HEADER_BYTES = 8 * 1024;
@@ -434,6 +435,7 @@ send({
 		pluginId: PLUGIN_ID,
 		version: PLUGIN_VERSION,
 		rpcProtocol: RPC_PROTOCOL,
+		...(PACKAGE_DIGEST ? { packageDigest: PACKAGE_DIGEST } : {}),
 		// A streaming provider must negotiate these: the host drops `provider.event`
 		// notifications from a plugin that did not declare `host_api.notifications`,
 		// and `rpc.cancel` is required to stop an in-flight stream.

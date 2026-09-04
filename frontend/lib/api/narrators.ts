@@ -1341,6 +1341,15 @@ export const narratorsApi = {
 			body: JSON.stringify({ summary }),
 		}),
 
+	// File tree — current uncommitted Git line counts, relative to this narrator's cwd.
+	getFileTreeStatus: (narratorId: string) =>
+		request<{
+			isGitRepo: boolean;
+			files: Array<{ path: string; linesAdded: number; linesRemoved: number }>;
+			totalFiles: number;
+			truncated: boolean;
+		}>(`/narrators/${narratorId}/file-tree-status`),
+
 	// File modifications
 	getFileModifications: (narratorId: string, upToMessageId?: string, fromMessageId?: string) => {
 		const params = new URLSearchParams();

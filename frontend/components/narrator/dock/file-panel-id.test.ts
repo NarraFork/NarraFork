@@ -66,6 +66,31 @@ describe("fileDockPanelId", () => {
 	});
 });
 
+describe("focus file panel editing ownership", () => {
+	it("stamps the owning narrator on new and already-open file panels", async () => {
+		const source = await Bun.file(new URL("./NarratorDockContext.tsx", import.meta.url)).text();
+		const start = source.indexOf("const openFilePanel");
+		const end = source.indexOf("const openKnowledgePanel", start);
+		const body = source.slice(start, end);
+
+		expect(body).toContain("hostNarratorId: narratorId");
+		expect(body).toContain(
+			"existing.api.updateParameters({ ...current, hostNarratorId: narratorId })",
+		);
+	});
+
+	it("hydrates restored focus panels from the live dock context", async () => {
+		const source = await Bun.file(new URL("./panels.tsx", import.meta.url)).text();
+		const start = source.indexOf("export function FileDockPanel");
+		const end = source.indexOf("// ── File tree", start);
+		const body = source.slice(start, end);
+
+		expect(body).toContain("dock?.narratorId ?? props.params.hostNarratorId");
+		expect(body).toContain("props.api.updateParameters({ ...props.params, hostNarratorId })");
+		expect(body).toContain("hostNarratorId ? (");
+	});
+});
+
 describe("workspaceFilePanelId", () => {
 	it("scopes the id to the host narrator", () => {
 		const path = "/repo/package.json";
