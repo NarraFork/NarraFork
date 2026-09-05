@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { Hono } from "hono";
+import { buildOpencodeSessionHeader } from "../lib/agent/opencode-session";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import {
@@ -243,6 +244,13 @@ async function fetchOpenaiModels(config: OpenAIProviderConfig): Promise<FetchOpe
 	}
 
 	const headers: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
+	// The catalog is a request to the same gateway as inference, and OpenCode
+	// announced that requests without a session header may start erroring — an
+	// empty model dropdown is how that would surface here.
+	Object.assign(
+		headers,
+		buildOpencodeSessionHeader({ baseUrl: config.baseUrl, extraHeaders: config.extraHeaders }),
+	);
 	if (config.apiMode === "codex") {
 		headers.originator = "narrafork";
 		if (config.codexAccountId && isOfficialCodexDomain(baseUrl)) {

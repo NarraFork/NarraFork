@@ -33,6 +33,7 @@ import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isConnectionClosedError, ProviderInvalidStateError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
+import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
 	ChatParams,
 	DbMessage,
@@ -1174,6 +1175,18 @@ export class AnthropicProvider implements ProviderAdapter {
 				headers["anthropic-beta"] = ANTHROPIC_EFFORT_BETA_FLAGS;
 			}
 		}
+		// OpenCode Go serves this protocol at /zen/go/v1/messages and reads session
+		// identity only from its own header, so it has to be added here rather than
+		// carried by the Anthropic wire format. Applied before extraHeaders so an
+		// operator override still wins.
+		Object.assign(
+			headers,
+			buildOpencodeSessionHeader({
+				baseUrl: this.config.baseUrl,
+				conversationId,
+				extraHeaders: this.config.extraHeaders,
+			}),
+		);
 		return this.applyExtraHeaders(headers);
 	}
 
