@@ -3084,10 +3084,14 @@ function buildResponsesPreludeItems(
 	for (const block of reasoningBlocks ?? []) {
 		const text = block.text?.trim() ?? "";
 		const metadata = block.providerMetadata?.openai;
-		if (strict && metadata?.reasoningEncryptedContent) {
-			// Credential-strict model: replay the reasoning item verbatim. These
-			// blocks come from the current in-memory turn, so the credential was
-			// minted by this same upstream — no source check is needed.
+		if (metadata?.reasoningEncryptedContent) {
+			// Credential-bound reasoning: replay the item verbatim. These blocks
+			// come from the current in-memory turn, so the credential was minted by
+			// this same upstream — no source check is needed. This applies even when
+			// the model name would classify as a plain-text relay: some Codex-style
+			// gateways (e.g. Console Go) mint encrypted_content for every model and
+			// reject a follow-up turn that drops the reasoning item
+			// ("reasoning_text in the thinking mode must be passed back").
 			entries.push({
 				item: {
 					type: "reasoning",
@@ -3099,8 +3103,8 @@ function buildResponsesPreludeItems(
 				sourceIndex: sourceIndex++,
 			});
 		} else if (!strict && text) {
-			// Relay model: encrypted_content is meaningless payload for a
-			// non-OpenAI upstream — degrade every block to plain text.
+			// Genuine plain-text relay (no credential protocol): degrade to text so
+			// the model still sees its own prior thoughts.
 			fallbackParts.push(text);
 		}
 		// Strict + no credential: dropped entirely (the official API rejects
@@ -3293,19 +3297,19 @@ function buildResponsesAssistantItemsFromStoredContent(
 			const reasoningBlock = block as Extract<StoredAssistantBlock, { type: "reasoning" }>;
 			const text = typeof reasoningBlock.text === "string" ? reasoningBlock.text.trim() : "";
 			const metadata = reasoningBlock.providerMetadata?.openai;
+			const canReplayEncrypted =
+				!!metadata?.reasoningEncryptedContent &&
+				signatureSourcesCompatible(
+					reasoningBlock.providerMetadata?.signatureSource,
+					options.currentSource,
+				);
 			if (options.strict) {
 				// Credential-bound model: replay the encrypted item only when we can
 				// prove the credential was minted by the upstream handling this
 				// request. Anything else is dropped — the official API rejects
 				// unsigned/foreign reasoning replay, and the block would wedge the
 				// conversation if echoed with a blanked credential.
-				if (
-					metadata?.reasoningEncryptedContent &&
-					signatureSourcesCompatible(
-						reasoningBlock.providerMetadata?.signatureSource,
-						options.currentSource,
-					)
-				) {
+				if (canReplayEncrypted) {
 					items.push({
 						type: "reasoning",
 						id: metadata.itemId,
@@ -3319,10 +3323,23 @@ function buildResponsesAssistantItemsFromStoredContent(
 						hasSource: !!reasoningBlock.providerMetadata?.signatureSource,
 					});
 				}
+			} else if (canReplayEncrypted) {
+				// Model name classifies as a plain-text relay, but the block carries an
+				// encrypted_content minted by this same gateway (e.g. Console Go-style
+				// Codex-compatible endpoints mint credentials for relay models too).
+				// Those gateways reject a follow-up turn that drops the reasoning item
+				// ("reasoning_text in the thinking mode must be passed back"), so the
+				// item must be replayed verbatim rather than degraded to assistant text.
+				items.push({
+					type: "reasoning",
+					id: metadata.itemId,
+					summary: text ? [{ type: "summary_text", text }] : [],
+					encrypted_content: metadata.reasoningEncryptedContent,
+				} as unknown as OAIMessage);
 			} else if (text) {
-				// Relay model: the reasoning is plain text; encrypted_content is dead
-				// weight for a non-OpenAI upstream — degrade it to an assistant
-				// message so the model still sees its own prior thoughts.
+				// Genuine plain-text relay (or foreign encrypted block we must not echo
+				// to this upstream): degrade to an assistant message so the model still
+				// sees its own prior thoughts.
 				const item = buildResponsesAssistantMessageItem(text, messageIdAvailable);
 				if (item) {
 					items.push(item);
