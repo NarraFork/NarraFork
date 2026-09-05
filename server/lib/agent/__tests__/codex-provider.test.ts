@@ -23,8 +23,8 @@ describe("CodexProvider Responses WebSocket handling", () => {
 		).toBe(false);
 	});
 
-	test("gpt-5.3-codex-spark is not allowed to use native image generation", () => {
-		expect(supportsCodexImageGeneration("codex:gpt-5.3-codex-spark")).toBe(false);
+	test("GPT-6 Astra supports native image generation", () => {
+		expect(supportsCodexImageGeneration("codex:gpt-6-astra")).toBe(true);
 	});
 
 	test("buildResponsesWebSocketRequest does not inject image_generation when disabled", () => {
@@ -48,7 +48,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 				}): { tools: unknown[] };
 			}
 		).buildResponsesWebSocketRequest({
-			model: "codex:gpt-5.3-codex",
+			model: "codex:gpt-5.5",
 			history: [],
 			toolResults: [],
 			content: "hello",
@@ -85,7 +85,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 				}): { tools: unknown[] };
 			}
 		).buildResponsesWebSocketRequest({
-			model: "codex:gpt-5.3-codex",
+			model: "codex:gpt-5.5",
 			history: [],
 			toolResults: [],
 			content: "hello",
@@ -109,7 +109,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 			prefix: "gateway",
 			apiKey: "token",
 			baseUrl: "https://chatgpt.com/backend-api/codex",
-			defaultModel: "gpt-5.3-codex",
+			defaultModel: "gpt-5.5",
 			apiMode: "codex",
 			codexImageGeneration: false,
 		});
@@ -132,7 +132,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 				}): { tools: unknown[] };
 			}
 		).buildCodexWebSocketRequest({
-			model: "gateway:gpt-5.3-codex",
+			model: "gateway:gpt-5.5",
 			history: [],
 			toolResults: [],
 			content: "hello",
@@ -155,7 +155,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 			prefix: "gateway",
 			apiKey: "token",
 			baseUrl: "https://chatgpt.com/backend-api/codex",
-			defaultModel: "gpt-5.3-codex",
+			defaultModel: "gpt-5.5",
 			apiMode: "codex",
 			codexWebSearch: false,
 		});
@@ -178,7 +178,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 				}): { tools: unknown[] };
 			}
 		).buildCodexWebSocketRequest({
-			model: "gateway:gpt-5.3-codex",
+			model: "gateway:gpt-5.5",
 			history: [],
 			toolResults: [],
 			content: "hello",
@@ -195,7 +195,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 		expect(toolsJson).toContain(`"partial_images":${CODEX_IMAGE_GENERATION_PARTIAL_IMAGES}`);
 	});
 
-	test("buildResponsesWebSocketRequest does not inject image_generation for spark", () => {
+	test("buildResponsesWebSocketRequest injects image_generation for Astra", () => {
 		const provider = new CodexProvider({ useWebSocket: true });
 		const request = (
 			provider as unknown as {
@@ -216,7 +216,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 				}): { tools: unknown[] };
 			}
 		).buildResponsesWebSocketRequest({
-			model: "codex:gpt-5.3-codex-spark",
+			model: "codex:gpt-6-astra",
 			history: [],
 			toolResults: [],
 			content: "hello",
@@ -229,7 +229,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 
 		const toolsJson = JSON.stringify(request.tools);
 		expect(toolsJson).toContain('"type":"web_search"');
-		expect(toolsJson).not.toContain('"type":"image_generation"');
+		expect(toolsJson).toContain('"type":"image_generation"');
 	});
 
 	test("buildResponsesWebSocketRequest emits tool result images as input_image items", () => {
@@ -261,7 +261,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 				}): { input: unknown[]; tools: unknown[] };
 			}
 		).buildResponsesWebSocketRequest({
-			model: "openai:gpt-5.3-codex",
+			model: "openai:gpt-5.5",
 			history: [],
 			toolResults: [toolResult],
 			content: "",

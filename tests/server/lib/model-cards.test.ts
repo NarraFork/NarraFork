@@ -133,15 +133,21 @@ describe("effort levels never carry none", () => {
 			"xhigh",
 			"max",
 		]);
-		expect(modelCardEffortLevels("gpt-5.1-codex-mini", [])).toEqual(["medium", "high"]);
+		expect(modelCardEffortLevels("gpt-6-astra", [])).toEqual([
+			"low",
+			"medium",
+			"high",
+			"xhigh",
+			"max",
+		]);
 	});
 });
 
 describe("merge overlays user deltas field by field", () => {
 	test("a delta carrying one field keeps the rest of the builtin card", () => {
-		const builtin = builtinCard("gpt-5.4-mini");
-		const { cards } = mergeModelCards([{ modelKey: "gpt-5.4-mini", contextWindow: 123_456 }]);
-		const merged = cards.find((c) => c.modelKey === "gpt-5.4-mini");
+		const builtin = builtinCard("gpt-5.5");
+		const { cards } = mergeModelCards([{ modelKey: "gpt-5.5", contextWindow: 123_456 }]);
+		const merged = cards.find((c) => c.modelKey === "gpt-5.5");
 		expect(merged?.contextWindow).toBe(123_456);
 		// Untouched fields must survive: a delta is not a replacement.
 		expect(merged?.maxCompletionTokens).toBe(builtin.maxCompletionTokens);
@@ -150,9 +156,9 @@ describe("merge overlays user deltas field by field", () => {
 	});
 
 	test("provenance distinguishes a user-set field from inherited ones", () => {
-		const { cards, provenance } = mergeModelCards([{ modelKey: "gpt-5.4-mini", contextWindow: 1 }]);
-		expect(provenance.get("gpt-5.4-mini")?.overriddenFields).toEqual(["contextWindow"]);
-		const merged = cards.find((c) => c.modelKey === "gpt-5.4-mini");
+		const { cards, provenance } = mergeModelCards([{ modelKey: "gpt-5.5", contextWindow: 1 }]);
+		expect(provenance.get("gpt-5.5")?.overriddenFields).toEqual(["contextWindow"]);
+		const merged = cards.find((c) => c.modelKey === "gpt-5.5");
 		expect(isUserSetField(merged, "contextWindow")).toBe(true);
 		expect(isUserSetField(merged, "maxCompletionTokens")).toBe(false);
 	});
@@ -160,8 +166,8 @@ describe("merge overlays user deltas field by field", () => {
 	test("the provenance marker is not serialized", () => {
 		// It must not reach settings.json or an API response — it is derived state,
 		// and persisting it would create data needing migration later.
-		const { cards } = mergeModelCards([{ modelKey: "gpt-5.4-mini", contextWindow: 1 }]);
-		const merged = cards.find((c) => c.modelKey === "gpt-5.4-mini");
+		const { cards } = mergeModelCards([{ modelKey: "gpt-5.5", contextWindow: 1 }]);
+		const merged = cards.find((c) => c.modelKey === "gpt-5.5");
 		expect(JSON.stringify(merged)).not.toContain("userFields");
 	});
 
@@ -176,8 +182,8 @@ describe("merge overlays user deltas field by field", () => {
 	});
 
 	test("a tombstone removes a builtin card", () => {
-		const { cards } = mergeModelCards([{ modelKey: "gpt-5.4-mini", deleted: true }]);
-		expect(cards.find((c) => c.modelKey === "gpt-5.4-mini")).toBeUndefined();
+		const { cards } = mergeModelCards([{ modelKey: "gpt-5.5", deleted: true }]);
+		expect(cards.find((c) => c.modelKey === "gpt-5.5")).toBeUndefined();
 	});
 });
 
@@ -189,37 +195,37 @@ describe("diff stores only what changed", () => {
 
 	test("one edited field yields a delta with only that field", () => {
 		const effective = getEffectiveModelCards([]).map((card) =>
-			card.modelKey === "gpt-5.4" ? { ...card, contextWindow: 999 } : card,
+			card.modelKey === "gpt-5.5" ? { ...card, contextWindow: 999 } : card,
 		);
 		const deltas = diffModelCards(effective);
-		expect(deltas).toEqual([{ modelKey: "gpt-5.4", contextWindow: 999 }]);
+		expect(deltas).toEqual([{ modelKey: "gpt-5.5", contextWindow: 999 }]);
 	});
 
 	test("editing a field back to the builtin value clears the delta", () => {
-		const builtin = builtinCard("gpt-5.4");
+		const builtin = builtinCard("gpt-5.5");
 		const edited = getEffectiveModelCards([]).map((card) =>
-			card.modelKey === "gpt-5.4" ? { ...card, contextWindow: 999 } : card,
+			card.modelKey === "gpt-5.5" ? { ...card, contextWindow: 999 } : card,
 		);
 		const restored = edited.map((card) =>
-			card.modelKey === "gpt-5.4" ? { ...card, contextWindow: builtin.contextWindow } : card,
+			card.modelKey === "gpt-5.5" ? { ...card, contextWindow: builtin.contextWindow } : card,
 		);
 		expect(diffModelCards(restored)).toEqual([]);
 	});
 
 	test("a round trip through diff and merge is lossless", () => {
 		const effective = getEffectiveModelCards([]).map((card) =>
-			card.modelKey === "gpt-5.4" ? { ...card, contextWindow: 555, notes: "hand tuned" } : card,
+			card.modelKey === "gpt-5.5" ? { ...card, contextWindow: 555, notes: "hand tuned" } : card,
 		);
 		const { cards: reMerged } = mergeModelCards(diffModelCards(effective));
-		const target = reMerged.find((c) => c.modelKey === "gpt-5.4");
+		const target = reMerged.find((c) => c.modelKey === "gpt-5.5");
 		expect(target?.contextWindow).toBe(555);
 		expect(target?.notes).toBe("hand tuned");
-		expect(target?.officialPricing).toEqual(builtinCard("gpt-5.4").officialPricing);
+		expect(target?.officialPricing).toEqual(builtinCard("gpt-5.5").officialPricing);
 	});
 
 	test("a removed builtin card becomes a tombstone", () => {
-		const effective = getEffectiveModelCards([]).filter((c) => c.modelKey !== "gpt-5.4");
-		expect(diffModelCards(effective)).toContainEqual({ modelKey: "gpt-5.4", deleted: true });
+		const effective = getEffectiveModelCards([]).filter((c) => c.modelKey !== "gpt-5.5");
+		expect(diffModelCards(effective)).toContainEqual({ modelKey: "gpt-5.5", deleted: true });
 	});
 
 	test("a cleared list is not stored as a change", () => {
@@ -227,7 +233,7 @@ describe("diff stores only what changed", () => {
 		// as different from "absent" would persist a no-op delta and then pin the
 		// field against future builtin updates.
 		const effective = getEffectiveModelCards([]).map((card) =>
-			card.modelKey === "gpt-5-codex" ? { ...card, aliases: [] } : card,
+			card.modelKey === "gpt-5.5" ? { ...card, aliases: [] } : card,
 		);
 		expect(diffModelCards(effective)).toEqual([]);
 	});
@@ -245,11 +251,17 @@ describe("diff stores only what changed", () => {
 describe("pricing resolution", () => {
 	test("a card with no non-zero price does not price the model", () => {
 		// Otherwise a capability-only card would report real usage as free rather
-		// than as unpriced. `gpt-5-codex` carries a window but no published price.
-		expect(modelCardPricing("gpt-5-codex", [])).toBeNull();
+		// than as unpriced.
+		expect(modelCardPricing("deepseek-chat", [])).toBeNull();
 	});
 
-	test("builtin prices resolve, including through an alias", () => {
+	test("builtin prices resolve, including Astra", () => {
+		expect(modelCardPricing("gpt-6-astra", [])).toMatchObject({
+			input: 10.0,
+			output: 50.0,
+			cacheRead: 1.0,
+			cacheWrite: 12.5,
+		});
 		expect(modelCardPricing("gpt-5.6-sol", [])).toMatchObject({ input: 5.0, output: 30.0 });
 		expect(modelCardPricing("gpt-5.6", [])).toMatchObject({ input: 5.0, output: 30.0 });
 	});
@@ -263,6 +275,24 @@ describe("pricing resolution", () => {
 });
 
 describe("builtin card data integrity", () => {
+	test("does not seed GPT/Codex models older than GPT-5.5", () => {
+		const keys = new Set(BUILTIN_MODEL_CARDS.map((card) => card.modelKey));
+		for (const retired of [
+			"gpt-5-codex",
+			"gpt-5.1-codex",
+			"gpt-5.1-codex-max",
+			"gpt-5.1-codex-mini",
+			"gpt-5.2",
+			"gpt-5.2-codex",
+			"gpt-5.3-codex",
+			"gpt-5.3-codex-spark",
+			"gpt-5.4",
+			"gpt-5.4-mini",
+		]) {
+			expect(keys.has(retired)).toBe(false);
+		}
+	});
+
 	test("model keys are unique and already normalized", () => {
 		const seen = new Set<string>();
 		for (const card of BUILTIN_MODEL_CARDS) {

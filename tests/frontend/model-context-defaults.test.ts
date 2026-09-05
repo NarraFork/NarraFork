@@ -44,6 +44,8 @@ describe("getModelDefaultContextWindow — Claude families", () => {
 		expect(getModelDefaultContextWindow("mimo-v2.5-pro")).toBe(1_048_576);
 		expect(getModelDefaultContextWindow("deepseek-v4-pro")).toBe(1_000_000);
 		expect(getModelDefaultContextWindow("gpt-5.4-mini")).toBe(272_000);
+		expect(getModelDefaultContextWindow("gpt-6-astra")).toBe(1_050_000);
+		expect(getModelDefaultContextWindow("gpt-6-astra-2026-09-03")).toBe(1_050_000);
 		expect(getModelDefaultContextWindow("gpt-4o")).toBeNull();
 	});
 });

@@ -67,7 +67,7 @@ describe("GET /api/model-cards", () => {
 		expect(status).toBe(200);
 		const cards = body.cards as Array<{ modelKey: string }>;
 		expect(cards.length).toBeGreaterThan(0);
-		expect(cards.some((c) => c.modelKey === "gpt-5.4-mini")).toBe(true);
+		expect(cards.some((c) => c.modelKey === "gpt-5.5")).toBe(true);
 	});
 
 	test("provenance is empty when nothing has been edited", async () => {
@@ -80,7 +80,7 @@ describe("PUT /api/model-cards/:key stores only the difference", () => {
 	test("a whole-card submission persists only the changed field", async () => {
 		const { body: before } = await getCards();
 		const original = (before.cards as Array<Record<string, unknown>>).find(
-			(c) => c.modelKey === "gpt-5.4-mini",
+			(c) => c.modelKey === "gpt-5.5",
 		);
 		expect(original).toBeDefined();
 
@@ -90,24 +90,24 @@ describe("PUT /api/model-cards/:key stores only the difference", () => {
 
 		// Only that one field may reach settings.json.
 		expect(settings.agent.modelCards).toEqual([
-			{ modelKey: "gpt-5.4-mini", contextWindow: 123_456 },
+			{ modelKey: "gpt-5.5", contextWindow: 123_456 },
 		]);
 	});
 
 	test("the edited value and the inherited ones both come back", async () => {
 		const { body: before } = await getCards();
 		const original = (before.cards as Array<Record<string, unknown>>).find(
-			(c) => c.modelKey === "gpt-5.4-mini",
+			(c) => c.modelKey === "gpt-5.5",
 		);
 		await putCard({ ...original, contextWindow: 123_456 });
 
 		const { body: after } = await getCards();
 		const card = (after.cards as Array<Record<string, unknown>>).find(
-			(c) => c.modelKey === "gpt-5.4-mini",
+			(c) => c.modelKey === "gpt-5.5",
 		);
 		expect(card?.contextWindow).toBe(123_456);
 		expect(card?.maxCompletionTokens).toBe(original?.maxCompletionTokens);
-		expect((after.provenance as Record<string, string[]>)["gpt-5.4-mini"]).toEqual([
+		expect((after.provenance as Record<string, string[]>)["gpt-5.5"]).toEqual([
 			"contextWindow",
 		]);
 	});
@@ -115,7 +115,7 @@ describe("PUT /api/model-cards/:key stores only the difference", () => {
 	test("submitting an unchanged card stores nothing", async () => {
 		const { body } = await getCards();
 		const original = (body.cards as Array<Record<string, unknown>>).find(
-			(c) => c.modelKey === "gpt-5.4",
+			(c) => c.modelKey === "gpt-5.5",
 		);
 		const { status } = await putCard({ ...original });
 		expect(status).toBe(200);
@@ -169,14 +169,14 @@ describe("PUT /api/model-cards/:key stores only the difference", () => {
 
 describe("DELETE /api/model-cards/:key", () => {
 	test("deleting a builtin card records a tombstone", async () => {
-		const res = await app().request("/api/model-cards/gpt-5.4-mini", { method: "DELETE" });
+		const res = await app().request("/api/model-cards/gpt-5.5", { method: "DELETE" });
 		expect(res.status).toBe(200);
-		expect(settings.agent.modelCards).toEqual([{ modelKey: "gpt-5.4-mini", deleted: true }]);
+		expect(settings.agent.modelCards).toEqual([{ modelKey: "gpt-5.5", deleted: true }]);
 
 		// And it must actually stay gone once merged back.
 		const { body } = await getCards();
 		const cards = body.cards as Array<{ modelKey: string }>;
-		expect(cards.some((c) => c.modelKey === "gpt-5.4-mini")).toBe(false);
+		expect(cards.some((c) => c.modelKey === "gpt-5.5")).toBe(false);
 	});
 
 	test("deleting an unknown key reports that nothing was deleted", async () => {
@@ -191,12 +191,12 @@ describe("POST /api/model-cards/:key/reset", () => {
 	test("reset removes the delta instead of writing builtin values back", async () => {
 		const { body } = await getCards();
 		const original = (body.cards as Array<Record<string, unknown>>).find(
-			(c) => c.modelKey === "gpt-5.4",
+			(c) => c.modelKey === "gpt-5.5",
 		);
 		await putCard({ ...original, contextWindow: 1 });
 		expect(settings.agent.modelCards).toHaveLength(1);
 
-		const res = await app().request("/api/model-cards/gpt-5.4/reset", { method: "POST" });
+		const res = await app().request("/api/model-cards/gpt-5.5/reset", { method: "POST" });
 		expect(res.status).toBe(200);
 		// An empty delta list is the point: storing the builtin values as a delta
 		// would pin them against future builtin updates.
@@ -206,13 +206,13 @@ describe("POST /api/model-cards/:key/reset", () => {
 	});
 
 	test("reset also lifts a tombstone", async () => {
-		await app().request("/api/model-cards/gpt-5.4/reset", { method: "POST" });
-		await app().request("/api/model-cards/gpt-5.4", { method: "DELETE" });
-		expect(settings.agent.modelCards).toEqual([{ modelKey: "gpt-5.4", deleted: true }]);
+		await app().request("/api/model-cards/gpt-5.5/reset", { method: "POST" });
+		await app().request("/api/model-cards/gpt-5.5", { method: "DELETE" });
+		expect(settings.agent.modelCards).toEqual([{ modelKey: "gpt-5.5", deleted: true }]);
 
-		await app().request("/api/model-cards/gpt-5.4/reset", { method: "POST" });
+		await app().request("/api/model-cards/gpt-5.5/reset", { method: "POST" });
 		const { body } = await getCards();
 		const cards = body.cards as Array<{ modelKey: string }>;
-		expect(cards.some((c) => c.modelKey === "gpt-5.4")).toBe(true);
+		expect(cards.some((c) => c.modelKey === "gpt-5.5")).toBe(true);
 	});
 });

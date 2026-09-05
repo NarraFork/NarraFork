@@ -143,14 +143,14 @@ describe("resolveProvider fallback order", () => {
 		expect(provider).toBe("anthropic");
 	});
 
-	test("builtin codex model 仍解析为 codex", () => {
-		const provider = resolveProvider("gpt-5.1-codex");
-		expect(provider).toBe("codex");
+	test("GPT-6 Astra 作为 builtin Codex 模型解析", () => {
+		expect(resolveProvider("gpt-6-astra")).toBe("codex");
 	});
 
-	test("builtin codex spark model 解析为 codex", () => {
-		const provider = resolveProvider("gpt-5.3-codex-spark");
-		expect(provider).toBe("codex");
+	test("已退役的内置 Codex 模型不再强制解析为 Codex", () => {
+		for (const model of ["gpt-5.1-codex", "gpt-5.3-codex-spark", "gpt-5.4"]) {
+			expect(resolveProvider(model)).not.toBe("codex");
+		}
 	});
 
 		const provider = resolveProvider("claude-sonnet");

@@ -109,14 +109,13 @@ function defaultBaseUrl(mode: OpenAIApiMode): string {
 }
 
 const CODEX_MODEL_REASONING_LEVELS: Record<string, readonly ReasoningEffort[]> = {
-	// Extracted from codex-reversed model catalog (supported_reasoning_levels).
-	// "none" is omitted — it disables reasoning entirely and is handled via
-	// early-return in normalizeCodexReasoningEffort before this table is consulted.
-	// The frontend counterpart (NarratorPanel CODEX_REASONING_OPTIONS_BY_MODEL)
-	// includes "none" because it drives UI dropdown options.
-	// gpt-5.6 family supports a real "max" tier (unlike earlier codex models).
+	// Extracted from the Codex model catalog (supported_reasoning_levels).
+	// "none" is omitted because it disables reasoning entirely. GPT-6 Astra
+	// explicitly rejects it, while older Codex models retain their existing
+	// compatibility behavior below.
 	// The upstream catalog also lists "ultra" for Sol/Terra, but NarraFork's UI
 	// enum stops at "max", so ultra is intentionally not surfaced here.
+	"gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
@@ -138,6 +137,7 @@ export const CODEX_IMAGE_GENERATION_PARTIAL_IMAGES = 2;
 const DEFAULT_CODEX_INPUT_MODALITIES: readonly CodexInputModality[] = ["text", "image"];
 
 const CODEX_MODEL_INPUT_MODALITIES: Record<string, readonly CodexInputModality[]> = {
+	"gpt-6-astra": ["text", "image"],
 	"gpt-5.6-sol": ["text", "image"],
 	"gpt-5.6-terra": ["text", "image"],
 	"gpt-5.6-luna": ["text", "image"],
@@ -225,16 +225,20 @@ const DEFAULT_CODEX_REASONING_LEVELS: readonly ReasoningEffort[] = [
 	"xhigh",
 ];
 
+/** Codex models whose upstream requires reasoning on every request. */
+const CODEX_MODELS_WITH_MANDATORY_REASONING = new Set(["gpt-6-astra"]);
+
 export function normalizeCodexReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): string | undefined {
 	if (!reasoningEffort) return undefined;
-	// "none" disables reasoning entirely and bypasses the tier table. Checked
-	// before any lookup, which is also why a card's tiers never include "none":
-	// as a clamp target it could turn a requested "low" into reasoning off.
-	if (reasoningEffort === "none") return "none";
 	const bareModel = parseModelId(model).model;
+	// Astra rejects `none`, including on internal title/summary requests that do
+	// not originate from the narrator UI. Route it to the lowest accepted tier.
+	if (reasoningEffort === "none") {
+		return CODEX_MODELS_WITH_MANDATORY_REASONING.has(bareModel) ? "low" : "none";
+	}
 	// Model cards first — they are what the hardcoded table became, and a user can
 	// correct a model's tiers there without waiting for a release.
 	const supported =

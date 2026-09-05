@@ -31,21 +31,12 @@ interface LegacyModelContextConfig {
 }
 
 const LEGACY_BUILTIN_CONTEXT_WINDOWS: Record<string, number | LegacyModelContextConfig> = {
-	// Codex models
+	// Builtin Codex models (GPT-5.5 and newer only)
+	"gpt-6-astra": { contextLength: 1_050_000, maxCompletionTokens: 128_000 },
 	"gpt-5.6-sol": { contextLength: 372_000, maxCompletionTokens: 128_000 },
 	"gpt-5.6-terra": { contextLength: 372_000, maxCompletionTokens: 128_000 },
 	"gpt-5.6-luna": { contextLength: 372_000, maxCompletionTokens: 128_000 },
-	"gpt-5-codex": { contextLength: 256_000, maxCompletionTokens: 128_000 },
-	"gpt-5.1-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	"gpt-5.1-codex-max": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	"gpt-5.1-codex-mini": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	"gpt-5.2-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	"gpt-5.2": { contextLength: 272_000, maxCompletionTokens: 128_000 },
 	"gpt-5.5": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	"gpt-5.4": { contextLength: 272_000, maxCompletionTokens: 128_000 },
-	"gpt-5.4-mini": { contextLength: 400_000, maxCompletionTokens: 128_000 },
-	"gpt-5.3-codex-spark": { contextLength: 128_000, maxCompletionTokens: 128_000 },
-	"gpt-5.3-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
 	// Common third-party models
 	"deepseek-chat": 64_000,
 	"deepseek-reasoner": 64_000,
@@ -154,14 +145,12 @@ const FUZZY_MATCHED_IDS = [
 	"claude-sonnet-4.6-thinking",
 	"claude-opus-4-5-thinking",
 	"claude-haiku-4-5-thinking",
-	"gpt-5.4-mini-2026-01-01",
-	"gpt-5.4-2026-01-01",
+	"gpt-6-astra-2026-09-03",
 	"gpt-5.6-sol-20260101",
 	"claude-sonnet-4-5-20260101",
 	"deepseek-chat-latest",
 	"deepseek-reasoner-preview",
 	"gemini-3-pro-preview-latest",
-	"gpt-5.1-codex-max-2026-01-01",
 	"claude-mythos-preview-20260101",
 ];
 
@@ -248,6 +237,12 @@ describe("model card context-window parity with the legacy builtin table", () =>
 				"gpt-4o",
 				"gpt-4",
 				"gpt-3.5-turbo",
+				"gpt-5-codex",
+				"gpt-5.1-codex",
+				"gpt-5.2-codex",
+				"gpt-5.3-codex",
+				"gpt-5.4",
+				"gpt-5.4-mini",
 				"o1",
 				"o1-mini",
 				"o3-mini",
@@ -266,13 +261,12 @@ describe("model card context-window parity with the legacy builtin table", () =>
 		});
 	});
 
-	test("a semantic variant never inherits its base model's window", () => {
+	test("Astra retains its 1.05M window for dated snapshots", () => {
 		withoutUserOverrides(() => {
-			// gpt-5.4-mini has its own 400k row; collapsing it onto gpt-5.4 would
-			// report 272k. Both directions are asserted so a mistake in either
-			// table entry is caught.
-			expect(resolveModelContextWindow("gpt-5.4-mini", "").contextWindow).toBe(400_000);
-			expect(resolveModelContextWindow("gpt-5.4", "").contextWindow).toBe(272_000);
+			expect(resolveModelContextWindow("gpt-6-astra", "").contextWindow).toBe(1_050_000);
+			expect(resolveModelContextWindow("gpt-6-astra-2026-09-03", "").contextWindow).toBe(
+				1_050_000,
+			);
 		});
 	});
 });

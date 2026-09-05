@@ -45,19 +45,11 @@ function s(): NarraForkSettings {
 	"claude-opus",
 ];
 const BUILTIN_CODEX_MODELS = [
+	"gpt-6-astra",
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
 	"gpt-5.5",
-	"gpt-5.4",
-	"gpt-5.4-mini",
-	"gpt-5.3-codex-spark",
-	"gpt-5.3-codex",
-	"gpt-5.2-codex",
-	"gpt-5.2",
-	"gpt-5.1-codex",
-	"gpt-5.1-codex-max",
-	"gpt-5.1-codex-mini",
 ];
 
 /** Built-in Codex model IDs (without provider prefix). */

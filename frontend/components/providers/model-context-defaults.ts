@@ -56,6 +56,9 @@ export function getModelDefaultContextWindow(idOrValue: string): number | null {
 	// deepseek v4 series (deepseek-v4, deepseek-v4-pro, deepseek-v4-flash, ...)
 	if (/deepseek[-_]?v4/.test(model)) return 1_000_000;
 
+	// gpt-6-astra → 1050000
+	if (/^gpt-6-astra(\b|[._-])/.test(model)) return 1_050_000;
+
 	// gpt-5 series (gpt-5, gpt-5.1, gpt-5-codex, gpt-5.4-mini, ...)
 	if (/^gpt-5(\b|[._-])/.test(model)) return 272_000;
 

@@ -1548,25 +1548,12 @@ const ANTHROPIC_XHIGH_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] 
 ];
 
 const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortValue[]> = {
-	// Extracted from codex-reversed model catalog (supported_reasoning_levels).
-	// Includes "none" for UI display (disables reasoning). The backend counterpart
-	// (openai-provider CODEX_MODEL_REASONING_LEVELS) omits "none" because it is
-	// handled separately before the table lookup.
-	// gpt-5.6 family supports a real "max" tier (ultra exists upstream for
-	// Sol/Terra but is not surfaced in NarraFork's UI enum).
+	// GPT-6 Astra requires reasoning, so it intentionally omits `none`.
+	"gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-sol": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-terra": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
-	"gpt-5.3-codex-spark": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.3-codex": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.2-codex": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.1-codex-max": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.1-codex": ["none", "low", "medium", "high"],
-	"gpt-5.1-codex-mini": ["none", "medium", "high"],
-	"gpt-5.2": ["none", "low", "medium", "high", "xhigh"],
 	"gpt-5.5": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.4": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.4-mini": ["none", "low", "medium", "high", "xhigh"],
 };
 
 function getBareModelForReasoning(model?: string, modelOption?: ModelOption): string {
@@ -1591,6 +1578,10 @@ function getCodexReasoningEffortOptions(
 ): readonly ReasoningEffortValue[] {
 	const bareModel = getBareModelForReasoning(model, modelOption);
 	return CODEX_REASONING_OPTIONS_BY_MODEL[bareModel] ?? DEFAULT_CODEX_REASONING_EFFORT_OPTIONS;
+}
+
+function codexModelSupportsReasoningDisabled(model?: string, modelOption?: ModelOption): boolean {
+	return getBareModelForReasoning(model, modelOption) !== "gpt-6-astra";
 }
 
 /**
@@ -2553,7 +2544,9 @@ export function NarratorPanel({
 				)
 			: undefined;
 		if (cardTiers?.length) {
-			return ["none", ...cardTiers] as readonly ReasoningEffortValue[];
+			return codexModelSupportsReasoningDisabled(resolvedModel, resolvedModelOption)
+				? (["none", ...cardTiers] as readonly ReasoningEffortValue[])
+				: (cardTiers as readonly ReasoningEffortValue[]);
 		}
 		const providerPrefix = resolvedModel.split(":")[0];
 		if (providerPrefix && (codexCapableProviders.has(providerPrefix) || isCodexChannelModel)) {

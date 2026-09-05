@@ -41,6 +41,12 @@ describe("model pricing table", () => {
 	});
 
 	test("GPT 与 Claude 关键行的价格与官方参考价一致", () => {
+		expect(resolveModelPricing("gpt-6-astra")).toMatchObject({
+			input: 10.0,
+			cacheWrite: 12.5,
+			cacheRead: 1.0,
+			output: 50.0,
+		});
 		expect(resolveModelPricing("gpt-5.6-sol")).toMatchObject({
 			input: 5.0,
 			cacheWrite: 6.25,
@@ -55,8 +61,6 @@ describe("model pricing table", () => {
 		});
 		expect(resolveModelPricing("gpt-5.6-luna")).toMatchObject({ input: 1.0, output: 6.0 });
 		expect(resolveModelPricing("gpt-5.5")).toMatchObject({ input: 5.0, output: 30.0 });
-		expect(resolveModelPricing("gpt-5.3-codex")).toMatchObject({ input: 1.75, output: 14.0 });
-		expect(resolveModelPricing("gpt-5.1-codex-mini")).toMatchObject({ input: 0.25, output: 2.0 });
 		expect(resolveModelPricing("claude-opus-4-6")).toMatchObject({ input: 5.0, output: 25.0 });
 		expect(resolveModelPricing("claude-sonnet-4-6")).toMatchObject({ input: 3.0, output: 15.0 });
 		expect(resolveModelPricing("claude-haiku-4-5")).toMatchObject({ input: 1.0, output: 5.0 });
@@ -104,25 +108,24 @@ describe("resolveModelPricing lookup rules", () => {
 		);
 	});
 
-	test("语义后缀永不剥离，便宜变体不会撞到基座价", () => {
-		// The bug this guards: substring/suffix-stripping matching would price
-		// gpt-5.4-mini at gpt-5.4 rates (3.3x the input price).
-		const mini = resolveModelPricing("gpt-5.4-mini");
-		const base = resolveModelPricing("gpt-5.4");
-		expect(mini?.modelKey).toBe("gpt-5.4-mini");
-		expect(mini?.input).toBe(0.75);
-		expect(base?.input).toBe(2.5);
-		expect(mini?.input).not.toBe(base?.input);
+	test("语义后缀永不剥离，变体不会撞到 Astra 的基座价", () => {
+		// A semantic variant is not a dated snapshot. Pricing it as Astra would
+		// silently fabricate a rate for a model the builtin catalog no longer lists.
+		expect(resolveModelPricing("gpt-6-astra-mini")).toBeNull();
+		expect(resolveModelPricing("gpt-6-astra-codex")).toBeNull();
+	});
 
-		const codexMini = resolveModelPricing("gpt-5.1-codex-mini");
-		const codexBase = resolveModelPricing("gpt-5.1-codex");
-		expect(codexMini?.modelKey).toBe("gpt-5.1-codex-mini");
-		expect(codexMini?.input).toBe(0.25);
-		expect(codexBase?.input).toBe(1.25);
-
-		// -codex must not reduce to a bare gpt-5.2 row via suffix stripping.
-		expect(resolveModelPricing("gpt-5.2-codex")?.modelKey).toBe("gpt-5.2-codex");
-		expect(resolveModelPricing("gpt-5.3-codex-spark")?.modelKey).toBe("gpt-5.3-codex-spark");
+	test("retired builtin GPT/Codex models are unpriced", () => {
+		for (const model of [
+			"gpt-5-codex",
+			"gpt-5.1-codex",
+			"gpt-5.2-codex",
+			"gpt-5.3-codex",
+			"gpt-5.4",
+			"gpt-5.4-mini",
+		]) {
+			expect(resolveModelPricing(model)).toBeNull();
+		}
 	});
 
 	test("未知模型返回 null 而不是 0 价格", () => {
