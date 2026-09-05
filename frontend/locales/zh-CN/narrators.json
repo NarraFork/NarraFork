@@ -73,6 +73,7 @@
 	"workspaceLayoutSaveFailedMessage": "当前排布（{{kb}} KB）保存失败。面板本身没有丢失 —— 重新打开该工作区时会恢复到上一次的排布。",
 	"workspaceEmpty": "该工作区暂无面板",
 	"workspaceRemovePanelFailed": "无法将该面板从工作区移除，它会重新出现",
+	"workspaceAddPanelFailed": "无法将该叙述者加入工作区",
 	"createdAtLabel": "创建于 {{time}}",
 	"lastMessageAtLabel": "最后消息 {{time}}",
 	"addWebview": "添加网页视图",

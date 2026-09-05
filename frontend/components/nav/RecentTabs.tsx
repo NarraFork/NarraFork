@@ -1402,11 +1402,16 @@ export function RecentTabList({
 			await api.updateNarratorTitle(renameTab.id, trimmed);
 			updateRecentTabLocal("narrator", renameTab.id, { title: trimmed });
 			qc.invalidateQueries({ queryKey: ["narrators"] });
+			setRenameTab(null);
+		} catch {
+			// Keep the dialog open. Closing it on failure was indistinguishable from
+			// success, so a rename that never happened looked like one the server had
+			// accepted and then ignored.
+			notifications.show({ message: tn("titleUpdateFailed"), color: "red", autoClose: 4000 });
 		} finally {
 			setRenaming(false);
-			setRenameTab(null);
 		}
-	}, [renameTab, renameValue, qc]);
+	}, [renameTab, renameValue, qc, tn]);
 
 	/** 打开归档确认 */
 	const handleArchive = useCallback(() => {
@@ -2185,7 +2190,8 @@ export function RecentTabList({
 					value={renameValue}
 					onChange={(e) => setRenameValue(e.currentTarget.value)}
 					onKeyDown={(e) => {
-						if (e.key === "Enter") void handleRenameSubmit();
+						// Enter while an IME candidate is open commits the word, not the rename.
+						if (e.key === "Enter" && !e.nativeEvent.isComposing) void handleRenameSubmit();
 						if (e.key === "Escape") setRenameTab(null);
 					}}
 					data-autofocus

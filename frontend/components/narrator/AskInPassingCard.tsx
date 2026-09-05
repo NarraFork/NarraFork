@@ -155,7 +155,9 @@ export function AskInPassingPendingCard({
 					value={value}
 					onChange={(e) => setValue(e.currentTarget.value)}
 					onKeyDown={(e) => {
-						if (e.key === "Enter" && !e.shiftKey && value.trim()) {
+						// isComposing: with a CJK IME the first Enter commits the candidate
+						// word. Submitting on it too sends the raw pinyin and closes the input.
+						if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && value.trim()) {
 							e.preventDefault();
 							handleSubmit();
 						}

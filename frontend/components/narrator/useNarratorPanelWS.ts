@@ -587,6 +587,34 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[bumpPermissionGeneration],
 	);
 
+	/**
+	 * Settle a decision that had to go over HTTP because the WebSocket was down.
+	 *
+	 * The card may only be removed once the request actually landed. Removing it
+	 * optimistically looks harmless — the narrator is the one waiting, not the UI —
+	 * but resolveAndRemovePerm also records the id as resolved, and that record is
+	 * what the 5s "waiting with no pending permission" poll consults before
+	 * restoring a card. So a dropped decision took out the recovery path with it:
+	 * the card vanished, the narrator stayed suspended, and nothing short of a
+	 * reload brought the prompt back.
+	 */
+	const settleViaHttp = useCallback(
+		(requestId: string, request: Promise<unknown>) => {
+			request
+				.then(() => {
+					resolveAndRemovePerm(requestId);
+				})
+				.catch(() => {
+					notifications.show({
+						message: t("permissionDecisionFailed"),
+						color: "red",
+						autoClose: 4000,
+					});
+				});
+		},
+		[resolveAndRemovePerm, t],
+	);
+
 	// --- Permission decision handlers ---
 	const handlePermissionDecision = useCallback(
 		(
@@ -614,15 +642,22 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					compactAfter,
 					updatedPlan: nextUpdatedPlan,
 				};
-				if (decision === "allow") {
-					api.approvePermission(requestId, payload).catch(() => {});
-				} else {
-					api.denyPermission(requestId, payload).catch(() => {});
-				}
+				settleViaHttp(
+					requestId,
+					decision === "allow"
+						? api.approvePermission(requestId, payload)
+						: api.denyPermission(requestId, payload),
+				);
+				return;
 			}
 			resolveAndRemovePerm(requestId);
 		},
-		[permissionDecisionsSupported, resolveAndRemovePerm, updatedPermissionInputSupported],
+		[
+			permissionDecisionsSupported,
+			resolveAndRemovePerm,
+			settleViaHttp,
+			updatedPermissionInputSupported,
+		],
 	);
 
 	const handleQuestionSubmit = useCallback(
@@ -630,11 +665,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			if (!permissionDecisionsSupported || !updatedPermissionInputSupported) return;
 			const wsSent = sendPermissionDecisionRef.current?.(requestId, "allow", undefined, answers);
 			if (!wsSent) {
-				api.approvePermission(requestId, { answers }).catch(() => {});
+				settleViaHttp(requestId, api.approvePermission(requestId, { answers }));
+				return;
 			}
 			resolveAndRemovePerm(requestId);
 		},
-		[permissionDecisionsSupported, resolveAndRemovePerm, updatedPermissionInputSupported],
+		[
+			permissionDecisionsSupported,
+			resolveAndRemovePerm,
+			settleViaHttp,
+			updatedPermissionInputSupported,
+		],
 	);
 
 	const handleQuestionReflect = useCallback(
@@ -660,11 +701,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			const message = "User skipped the question";
 			const wsSent = sendPermissionDecisionRef.current?.(requestId, "deny", message);
 			if (!wsSent) {
-				api.denyPermission(requestId, { message }).catch(() => {});
+				settleViaHttp(requestId, api.denyPermission(requestId, { message }));
+				return;
 			}
 			resolveAndRemovePerm(requestId);
 		},
-		[permissionDecisionsSupported, resolveAndRemovePerm],
+		[permissionDecisionsSupported, resolveAndRemovePerm, settleViaHttp],
 	);
 
 	// --- Stable permission callbacks ---

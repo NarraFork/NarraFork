@@ -945,9 +945,13 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	type LiveNarratorStatus = { status?: string; substatus?: string[] };
 	const liveStatusesRef = useRef(new Map<string, LiveNarratorStatus>());
 	const [liveStatusesTick, setLiveStatusesTick] = useState(0);
-	// Derive a stable snapshot for consumers — only changes when tick changes
+	// Snapshot the mutable ref for consumers. The copy is what makes this work:
+	// the ref holds one Map that is mutated in place, so handing it out directly
+	// produced a value that was `Object.is`-equal on every tick — and the memo that
+	// renders node status lists it as a dependency, so it never recomputed. Live
+	// status only reached the graph when the chapters query happened to refetch.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: liveStatusesTick is intentionally used to trigger re-read of the mutable ref
-	const liveStatuses = useMemo(() => liveStatusesRef.current, [liveStatusesTick]);
+	const liveStatuses = useMemo(() => new Map(liveStatusesRef.current), [liveStatusesTick]);
 
 	const handleNarratorWSUpdate = useCallback(
 		(narratorId: string, event: NarratorListWSEvent) => {
@@ -1870,8 +1874,11 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		[recomputeEdges],
 	);
 
+	// `async` so every exit — including the "neither branch matched" fallthrough —
+	// hands the draft node a promise to await. Returning a bare boolean from one
+	// path would throw there instead of re-enabling the button.
 	const handleDraftConfirm = useCallback(
-		(
+		async (
 			draftNodeId: string,
 			payload: {
 				title: string;
@@ -1892,7 +1899,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				const draftX = draftNode?.position?.x ?? 0;
 				const draftY = draftNode?.position?.y ?? 0;
 
-				api
+				return api
 					.forkChapter(
 						payload.parentChapterId,
 						buildDraftForkRequest({
@@ -1909,6 +1916,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 						queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 						queryClient.invalidateQueries({ queryKey: ["chapters"] });
 						queryClient.invalidateQueries({ queryKey: ["narrators"] });
+						return true;
 					})
 					.catch((err) => {
 						notifications.show({
@@ -1917,6 +1925,8 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 							}),
 							color: "red",
 						});
+						// The draft stays on the canvas, so it stays the user's to retry.
+						return false;
 					});
 			} else if (payload.mode === "merge" && payload.sourceChapterIds?.length) {
 				if (!batchMergeSupported) {
@@ -1924,7 +1934,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 						message: batchMergeCapability.reason ?? t("mergeDraft.unsupported"),
 						color: "yellow",
 					});
-					return;
+					return false;
 				}
 				// For merge-new: first source is base, rest are sources
 				// For merge-into: targetChapterId is base, all sourceChapterIds are sources
@@ -1936,7 +1946,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				// All chapters involved as sources (to collapse after merge)
 				const allSourceIds = payload.sourceChapterIds;
 
-				api
+				return api
 					.batchMerge({
 						baseChapterId: baseId,
 						sourceChapterIds: sourceIds,
@@ -1954,7 +1964,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 								color: "blue",
 							});
 							setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
-							return;
+							return true;
 						}
 						removeDraft(draftNodeId);
 						queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
@@ -1978,6 +1988,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 								return next;
 							});
 						}
+						return true;
 					})
 					.catch((err) => {
 						notifications.show({
@@ -1986,8 +1997,11 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 							}),
 							color: "red",
 						});
+						// The draft stays on the canvas, so it stays the user's to retry.
+						return false;
 					});
 			}
+			return false;
 		},
 		[batchMergeCapability.reason, batchMergeSupported, queryClient, t, removeDraft],
 	);

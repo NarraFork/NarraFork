@@ -25,6 +25,7 @@ import { parseErrorDiagnostics } from "./error-diagnostics";
 import { ProviderInvalidStateError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { buildImageGenerationSavedPathInstruction } from "./image-generation";
+import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
 	ChatParams,
 	DbMessage,
@@ -1371,6 +1372,17 @@ export class OpenAIProvider implements ProviderAdapter {
 				headers["ChatGPT-Account-Id"] = accountId;
 			}
 		}
+		// OpenCode Go serves both OpenAI shapes (/zen/go/v1/responses and
+		// /chat/completions) and reads session identity only from its own header,
+		// so it has to be added here rather than carried by the request body.
+		Object.assign(
+			headers,
+			buildOpencodeSessionHeader({
+				baseUrl: this.config.baseUrl,
+				conversationId,
+				extraHeaders: this.config.extraHeaders,
+			}),
+		);
 		// Emulated codex headers + user-configured extra headers (user wins).
 		Object.assign(headers, fingerprint.headers);
 		return headers;

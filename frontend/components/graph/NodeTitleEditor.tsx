@@ -13,6 +13,7 @@
  */
 
 import { ActionIcon, Group, Text, TextInput } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { IconPencil, IconSparkles } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -150,10 +151,12 @@ function EditableNodeTitle({
 			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["narraFlow"] });
+		} catch {
+			notifications.show({ message: t("generateTitleFailed"), color: "red", autoClose: 4000 });
 		} finally {
 			setGenerating(false);
 		}
-	}, [generating, narratorId, qc]);
+	}, [generating, narratorId, qc, t]);
 
 	if (editing) {
 		return (

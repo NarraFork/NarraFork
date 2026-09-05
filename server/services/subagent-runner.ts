@@ -1069,14 +1069,19 @@ export function waitForBackgroundTask(
 		}
 		signal?.addEventListener("abort", onAbort, { once: true });
 
-		// Check if already completed
+		// Subscribed BEFORE the status read, not inside its `.then`. A completion event
+		// emitted while that read was in flight had no listener, so awaiting a task that
+		// finished right then blocked for the full timeout and then reported "running"
+		// for a task that was already done. Subscribing first can only make both paths
+		// resolve, and a settled promise ignores the second.
+		eventBus.onAny(handler);
+
+		// Already finished before we started listening.
 		getBackgroundTaskStatus(taskNarratorId).then((s) => {
 			if (s && s.status !== "running") {
 				cleanup();
 				resolve({ status: s.status, result: s.result });
-				return;
 			}
-			eventBus.onAny(handler);
 		});
 	});
 }

@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
+import { reportMutationError } from "../lib/query-client";
 
 const MCP_SERVERS_QUERY_GC_TIME_MS = 60_000;
 
@@ -113,8 +114,11 @@ export function useUpdateMcpServer() {
 			);
 			return { previous };
 		},
-		onError: (_err, _variables, context) => {
+		onError: (err, _variables, context) => {
 			if (context?.previous) qc.setQueryData(["mcp-servers"], context.previous);
+			// See useFavoriteDirectories: the rollback alone left the switch flipping
+			// back on its own with nothing said.
+			reportMutationError(err);
 		},
 		onSuccess: (updated, variables) => {
 			qc.setQueryData<McpServersCache>(["mcp-servers"], (old) =>

@@ -358,6 +358,54 @@ export function clearBufferedMessages(narratorId: string): void {
 		.run();
 }
 
+/**
+ * Delete a consumed message's row but KEEP its attachment files on disk.
+ *
+ * For a dispatch that can still fail: the files are what a restore needs, and
+ * {@link dbConsumeBuffered} destroys them before delivery has been attempted.
+ * Pair with `cleanupBufferedTextFiles` once delivery succeeded, or with
+ * {@link restoreBufferedMessage} when it did not.
+ */
+export function dbConsumeBufferedRow(messageId: string): void {
+	db.delete(narratorBufferedMessages).where(eq(narratorBufferedMessages.id, messageId)).run();
+}
+
+/**
+ * Put a message back at the head of the queue after its delivery failed.
+ *
+ * Consumption happens before dispatch so the queue reads correctly while the
+ * message is in flight — but dispatch can throw (a loop already running, a failed
+ * attachment write, a persist error), and the row and its files were gone by then.
+ * The user's queued text was simply destroyed, with a generic error badge as the
+ * only trace. Restoring puts it back where they can see and resend it.
+ */
+export function restoreBufferedMessage(narratorId: string, msg: BufferedMessage): void {
+	const queue = bufferedMessages.get(narratorId) ?? [];
+	// A concurrent path may already have re-queued it; re-inserting would duplicate
+	// both the row and the card.
+	if (queue.some((m) => m.id === msg.id)) return;
+	queue.unshift(msg);
+	bufferedMessages.set(narratorId, queue);
+	dbInsertBuffered(
+		msg.id,
+		narratorId,
+		msg.text,
+		0,
+		msg.bufferedAt,
+		msg.images,
+		msg.commandText,
+		msg.createdBy,
+		msg.creator,
+		msg._savedFiles,
+		msg.priority ?? false,
+		msg.bashCommand,
+	);
+	dbRewriteSeqs(
+		narratorId,
+		queue.map((m) => m.id),
+	);
+}
+
 /** Delete a single consumed message from DB + cleanup its files. */
 export function dbConsumeBuffered(messageId: string): void {
 	db.delete(narratorBufferedMessages).where(eq(narratorBufferedMessages.id, messageId)).run();

@@ -16,10 +16,13 @@ import { basename, dirname, extname, join, relative, resolve, sep } from "node:p
 import { Hono } from "hono";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import {
+	applyLineEnding,
 	decodeFileBytesAs,
 	detectFileEncoding,
+	detectLineEnding,
 	encodeFileBytesAs,
 	looksBinary,
+	normalizeLineEndings,
 } from "../lib/agent/tools/encoding";
 import { wholeFileLineStats } from "../lib/agent/tools/file-diff-stats";
 import { buildAttachmentDisposition } from "../lib/content-disposition";
@@ -410,7 +413,11 @@ fsRoutes.get("/edit-source", async (c) => {
 	const encoding = detectFileEncoding(bytes);
 	const content = decodeFileBytesAs(bytes, encoding);
 	return c.json({
-		content,
+		// LF, because CodeMirror hands its document back LF-only: serving the raw CRLF
+		// text made the editor compare an LF buffer against a CRLF baseline, so a
+		// Windows file showed as modified the instant it was opened and the save button
+		// was live before anything had been typed.
+		content: normalizeLineEndings(content),
 		encoding,
 		// The lock token, computed here so the client cannot disagree with the server
 		// about which bytes it loaded — and so a browser without WebCrypto (plain HTTP
@@ -468,9 +475,10 @@ fsRoutes.post("/write", async (c) => {
 
 	// The byte length is what the cap is about, and it is not the string's length: the
 	// same 1 MB of code units is up to 3 MB of UTF-8, and re-encoding to a legacy
-	// charset changes it again. Measured against the bytes actually written below.
-	const outputBytes = encodeFileBytesAs(body.content, encoding);
-	if (outputBytes.byteLength > MAX_WRITE_BYTES) {
+	// charset changes it again. A cheap pre-check before any file access; the bytes
+	// actually written are recomputed below, once the target's line endings are known,
+	// and re-checked against the same cap.
+	if (encodeFileBytesAs(body.content, encoding).byteLength > MAX_WRITE_BYTES) {
 		throw new ValidationError("Content exceeds the maximum writable size");
 	}
 
@@ -547,7 +555,10 @@ fsRoutes.post("/write", async (c) => {
 					code: "STALE_WRITE",
 					currentHash,
 					expectedHash: body.baseHash,
-					currentContent: previousContent,
+					// LF for the same reason `/edit-source` normalizes: this becomes the
+					// editor's new baseline, and a CRLF baseline against its LF buffer would
+					// render the conflict as a whole-file diff.
+					currentContent: normalizeLineEndings(previousContent),
 				},
 				409,
 			);
@@ -560,12 +571,28 @@ fsRoutes.post("/write", async (c) => {
 					error: "The file already exists",
 					code: "STALE_WRITE",
 					currentHash,
-					currentContent: previousContent,
+					currentContent: normalizeLineEndings(previousContent),
 				},
 				409,
 			);
 		}
 	}
+
+	// The file's own line endings survive a save, the same way its encoding does. The
+	// editor's document is LF-only, so writing it verbatim converted every line of a
+	// CRLF file — one changed line, and `git diff` showed the whole file.
+	const lineEnding = detectLineEnding(previousContent ?? body.content);
+	const normalizedContent = normalizeLineEndings(body.content);
+	const outputBytes = encodeFileBytesAs(applyLineEnding(normalizedContent, lineEnding), encoding);
+	if (outputBytes.byteLength > MAX_WRITE_BYTES) {
+		throw new ValidationError("Content exceeds the maximum writable size");
+	}
+	// What a later read would decode, which is what the optimistic lock compares
+	// against. Hashing the REQUEST text instead made the lock disagree with the file
+	// whenever encoding or line endings changed the bytes: a character the charset
+	// cannot represent is written as "?", so the client's next save carried a hash the
+	// file could never have, and every save from then on came back 409 STALE_WRITE.
+	const persistedHash = sha256Hex(decodeFileBytesAs(outputBytes, encoding));
 
 	const relPath = relative(cwd, target);
 	// A path inside an extra writable dir is not inside the worktree, so it has no
@@ -625,7 +652,12 @@ fsRoutes.post("/write", async (c) => {
 			narratorId: null,
 			userId: c.get("user").sub,
 			action: "human",
-			lineStats: wholeFileLineStats(previousContent, body.content),
+			// Both sides LF: a CRLF baseline against LF input counted every line as
+			// replaced, so a one-line save was attributed as a whole-file rewrite.
+			lineStats: wholeFileLineStats(
+				previousContent === null ? null : normalizeLineEndings(previousContent),
+				normalizedContent,
+			),
 		});
 
 		// ── Tree snapshot boundary for the save ──────────────────────────────
@@ -679,7 +711,10 @@ fsRoutes.post("/write", async (c) => {
 	if (body.notifyAgent) {
 		try {
 			const { interjectFileEditAsUserMessage } = await import("../services/file-edit-interject");
-			const lineStats = wholeFileLineStats(previousContent, body.content);
+			const lineStats = wholeFileLineStats(
+				previousContent === null ? null : normalizeLineEndings(previousContent),
+				normalizedContent,
+			);
 			const result = await interjectFileEditAsUserMessage(narratorId, {
 				filePath: rawPath,
 				worktreePath: cwd,
@@ -702,7 +737,7 @@ fsRoutes.post("/write", async (c) => {
 	return c.json({
 		ok: true,
 		path: target,
-		hash: sha256Hex(body.content),
+		hash: persistedHash,
 		bytesWritten: outputBytes.byteLength,
 		// Echoed so a client can keep its round trip honest without having to remember
 		// what it sent — and so a save that fell back to UTF-8 for an unknown name says so.

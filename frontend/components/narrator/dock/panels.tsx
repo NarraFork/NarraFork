@@ -16,6 +16,7 @@
  */
 
 import { ActionIcon, Badge, Box, Center, Group, Loader, Text, Tooltip } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import {
 	IconFileCode,
 	IconFileText,
@@ -861,6 +862,22 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 	// Read-only is the default and is never persisted: reopening a saved layout must not
 	// silently put a file into an editable state the reader did not ask for.
 	const [editing, setEditing] = useState(false);
+	// Leaving edit mode unmounts the editor, and the buffer lives only there. The
+	// toggle used to drop typed-but-unsaved work with no warning at all.
+	const [editorDirty, setEditorDirty] = useState(false);
+	const toggleEditing = useCallback(() => {
+		setEditing((prev) => {
+			if (prev && editorDirty) {
+				notifications.show({
+					color: "yellow",
+					message: t("fileEditor.unsavedBlockExit"),
+					autoClose: 5000,
+				});
+				return prev;
+			}
+			return !prev;
+		});
+	}, [editorDirty, t]);
 
 	useLayoutEffect(() => {
 		if (title && title !== props.api.title) props.api.setTitle(title);
@@ -904,7 +921,7 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 							variant={editing ? "filled" : "subtle"}
 							color={editing ? "indigo" : "gray"}
 							size="sm"
-							onClick={() => setEditing((prev) => !prev)}
+							onClick={toggleEditing}
 						>
 							<IconPencil size={14} />
 						</ActionIcon>
@@ -918,6 +935,7 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 						key={`edit:${filePath}`}
 						filePath={filePath}
 						narratorId={hostNarratorId}
+						onDirtyChange={setEditorDirty}
 					/>
 				) : (
 					<FileViewerContent key={filePath} filePath={filePath} />

@@ -670,10 +670,10 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 	};
 
 	if (loading) {
-		return <Text c="dimmed">{t("loading", "加载中...")}</Text>;
+		return <Text c="dimmed">{t("usageHistoryTableLoading")}</Text>;
 	}
 	if (records.length === 0) {
-		return <Text c="dimmed">{t("noData", "暂无数据")}</Text>;
+		return <Text c="dimmed">{t("usageHistoryTableEmpty")}</Text>;
 	}
 
 	const toggleHint = (showId: boolean) =>

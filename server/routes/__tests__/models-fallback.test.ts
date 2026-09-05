@@ -23,9 +23,18 @@ type FetchAnthropicModels = (config: {
 	apiKey?: string;
 	officialApi?: boolean;
 }) => Promise<{ models: Array<{ id: string }>; resolvedBaseUrl?: string }>;
+type FetchOpenaiModels = (config: {
+	id: string;
+	name: string;
+	baseUrl?: string;
+	apiKey?: string;
+	apiMode?: string;
+	extraHeaders?: Record<string, string>;
+}) => Promise<{ models: Array<{ id: string }> }>;
 
 let buildModelsUrls: BuildModelsUrls;
 let fetchAnthropicModels: FetchAnthropicModels;
+let fetchOpenaiModels: FetchOpenaiModels;
 let testHome = "";
 let originalNarraforkHome: string | undefined;
 const originalFetch = globalThis.fetch;
@@ -42,6 +51,7 @@ beforeAll(async () => {
 
 	const openaiMod = await import("../openai");
 	buildModelsUrls = openaiMod.buildModelsUrls as unknown as BuildModelsUrls;
+	fetchOpenaiModels = openaiMod.fetchOpenaiModels as unknown as FetchOpenaiModels;
 	const anthropicMod = await import("../anthropic");
 	fetchAnthropicModels = anthropicMod.fetchAnthropicModels as unknown as FetchAnthropicModels;
 });
@@ -85,6 +95,55 @@ describe("buildModelsUrls (OpenAI) suggest-safety", () => {
 		const candidates = buildModelsUrls("https://api.openai.com/v1");
 		expect(candidates[0]).toEqual({ url: "https://api.openai.com/v1/models" });
 		expect(candidates.every((c) => c.suggestBaseUrl === undefined)).toBe(true);
+	});
+});
+
+describe("fetchOpenaiModels OpenCode session headers", () => {
+	test("adds a process-stable session header to the OpenCode model request", async () => {
+		let captured = new Headers();
+		globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+			captured = new Headers(init?.headers);
+			return new Response(JSON.stringify({ data: [{ id: "glm-5.3" }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+
+		await fetchOpenaiModels({
+			id: "opencode-default",
+			name: "OpenCode",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+			apiKey: "sk-test",
+		});
+
+		expect(captured.get("authorization")).toBe("Bearer sk-test");
+		expect(captured.get("x-opencode-session")).toMatch(
+			/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		);
+	});
+
+	test("sends an operator-provided session override exactly once", async () => {
+		let captured = new Headers();
+		globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+			captured = new Headers(init?.headers);
+			return new Response(JSON.stringify({ data: [{ id: "glm-5.3" }] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+
+		await fetchOpenaiModels({
+			id: "opencode-override",
+			name: "OpenCode",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+			apiKey: "sk-test",
+			extraHeaders: { "X-OpenCode-Session": "ses_operator" },
+		});
+
+		expect(captured.get("x-opencode-session")).toBe("ses_operator");
+		expect(
+			[...captured.keys()].filter((key) => key.toLowerCase() === "x-opencode-session"),
+		).toHaveLength(1);
 	});
 });
 

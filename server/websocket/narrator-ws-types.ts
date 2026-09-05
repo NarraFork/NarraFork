@@ -740,6 +740,23 @@ export type NarratorServerMessage =
 			timeoutMs: number;
 	  }
 	| { type: "commits_updated"; narratorId: string; chapterId: string; newCount: number }
+	/**
+	 * Background commit sync failed, so the commit list and Git panel are serving
+	 * cached rows. The client already had the handler for this (a warning toast plus
+	 * a refetch of the chapter's git state); nothing on the server ever sent it, so
+	 * a failed sync silently kept showing stale data.
+	 */
+	| {
+			type: "commit_sync_error";
+			narratorId: string;
+			chapterId: string;
+			code: string;
+			error: string;
+			/** Cached rows are still being served, so this is a degradation, not a stop. */
+			fallback: boolean;
+			/** Raised by a watcher tick rather than by something the user just asked for. */
+			backgroundSync: boolean;
+	  }
 	| {
 			type: "presence_update";
 			narratorId: string;

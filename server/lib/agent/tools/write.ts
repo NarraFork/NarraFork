@@ -8,7 +8,14 @@ import { backendDirname, resolveBackendPath, toolBaseCwd } from "../execution/pa
 import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 import { consumeBehaviorFenceEditGrant, isBehaviorFencePath } from "./behavior-fence-grant";
-import { decodeFileBytes, encodeFileBytes, looksBinary } from "./encoding";
+import {
+	applyLineEnding,
+	decodeFileBytes,
+	detectLineEnding,
+	encodeFileBytes,
+	looksBinary,
+	normalizeLineEndings,
+} from "./encoding";
 import { lineStatsMetadata, wholeFileLineStats } from "./file-diff-stats";
 import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
@@ -176,9 +183,17 @@ export const writeTool: ToolDefinition = {
 				);
 
 				await backend.mkdirp(backendDirname(backend, ioPath));
-				await backend.writeFileBytes(resolvedPath, encodeFileBytes(content, existingEncoding), {
-					expectedResolvedPath: canonicalPath,
-				});
+				// A rewrite keeps the file's own line endings, the same way it keeps its
+				// encoding: a model writes LF, so overwriting a CRLF file with the raw
+				// string converted the whole file and made `git diff` show every line as
+				// changed. A file that did not exist keeps whatever the model wrote.
+				const lineEnding = detectLineEnding(existingContent ?? content);
+				const normalizedContent = normalizeLineEndings(content);
+				await backend.writeFileBytes(
+					resolvedPath,
+					encodeFileBytes(applyLineEnding(normalizedContent, lineEnding), existingEncoding),
+					{ expectedResolvedPath: canonicalPath },
+				);
 				// `existingContent` is null exactly when the file did not exist, which is
 				// the distinction the client cannot make: a Write's input carries only the
 				// NEW content, so nothing downstream can tell a fresh file from a rewrite.
@@ -188,7 +203,14 @@ export const writeTool: ToolDefinition = {
 				// metadata (the card header) and the persisted attribution row (the
 				// parent-facing aggregate). Two separate computations could disagree, and a
 				// header contradicting the summary is unresolvable for the reader.
-				const diffStats = existingIsBinary ? null : wholeFileLineStats(existingContent, content);
+				// Both sides normalized, or a CRLF baseline against LF input reported every
+				// line as replaced — a one-line rewrite would have claimed the whole file.
+				const diffStats = existingIsBinary
+					? null
+					: wholeFileLineStats(
+							existingContent === null ? null : normalizeLineEndings(existingContent),
+							normalizedContent,
+						);
 				await trackFileChange(ctx, ioPath, "write", backend, diffStats);
 				return {
 					output: `Wrote ${content.length} bytes to ${file_path}`,

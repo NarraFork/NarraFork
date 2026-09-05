@@ -117,6 +117,7 @@
 			"authorizeBusy": "应用中…"
 		},
 		"detail": {
+			"errorTitle": "出错了",
 			"backToList": "返回插件列表",
 			"notFound": "未找到该插件。",
 			"loadError": "插件加载失败。",

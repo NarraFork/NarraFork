@@ -1,4 +1,5 @@
 import { Badge, Group, Modal, Stack, Text } from "@mantine/core";
+import { useTranslation } from "react-i18next";
 import type { ModelOption } from "../../lib/constants";
 import { formatLocaleNumber } from "../../lib/intl-format";
 import { Z } from "../../lib/z-index";
@@ -46,8 +47,11 @@ export function ModelPriceModal({
 	opened: boolean;
 	onClose: () => void;
 }) {
+	const { t } = useTranslation("narrator");
 	const pricing = model?.pricing;
-	const unit = pricing?.unitName ?? "元";
+	// Only the fallback is translated — a unitName the gateway reported is the
+	// billing currency and must be shown verbatim.
+	const unit = pricing?.unitName ?? t("modelPrice.unitFallback");
 	const tokenUnit = pricing?.tokenUnit;
 	const isCredit = pricing?.billingMode === "credit";
 	const usdRate = Number(model?.usdRate ?? 0);
@@ -73,14 +77,14 @@ export function ModelPriceModal({
 		<Modal
 			opened={opened}
 			onClose={onClose}
-			title={model?.label ?? "模型价格"}
+			title={model?.label ?? t("modelPrice.title")}
 			centered
 			size="md"
 			zIndex={Z.modal}
 		>
 			{!model || !pricing ? (
 				<Text size="sm" c="dimmed">
-					该模型暂无价格信息。
+					{t("modelPrice.unavailable")}
 				</Text>
 			) : (
 				<Stack gap="sm">
@@ -91,46 +95,65 @@ export function ModelPriceModal({
 							</Badge>
 						)}
 						<Badge variant="light" color={isCredit ? "violet" : "blue"}>
-							{isCredit ? "credit 计费" : "token 计费"}
+							{isCredit ? t("modelPrice.billingCredit") : t("modelPrice.billingToken")}
 						</Badge>
 						{model.contextWindow != null && model.contextWindow > 0 && (
 							<Text size="xs" c="dimmed">
-								上下文 {formatLocaleNumber(Math.trunc(model.contextWindow))} tokens
+								{t("modelPrice.context", {
+									tokens: formatLocaleNumber(Math.trunc(model.contextWindow)),
+								})}
 							</Text>
 						)}
 					</Group>
 
 					{isCredit ? (
-						<PriceRow label="Credit 单价" value={fmtPrice(pricing.credit, unit)} />
+						<PriceRow
+							label={t("modelPrice.creditUnitPrice")}
+							value={fmtPrice(pricing.credit, unit)}
+						/>
 					) : (
 						<Stack gap={4}>
 							<Text size="xs" c="dimmed">
-								单价（{unit} / {fmtTokenUnit(tokenUnit)} tokens）
+								{t("modelPrice.unitPriceHeading", {
+									unit,
+									tokenUnit: fmtTokenUnit(tokenUnit),
+								})}
 							</Text>
-							<PriceRow label="输入" value={fmtPrice(pricing.input, unit)} />
-							<PriceRow label="输出" value={fmtPrice(pricing.output, unit)} />
+							<PriceRow label={t("modelPrice.input")} value={fmtPrice(pricing.input, unit)} />
+							<PriceRow label={t("modelPrice.output")} value={fmtPrice(pricing.output, unit)} />
 							{Number(pricing.cacheCreationInput ?? 0) > 0 && (
-								<PriceRow label="缓存写入" value={fmtPrice(pricing.cacheCreationInput, unit)} />
+								<PriceRow
+									label={t("modelPrice.cacheWrite")}
+									value={fmtPrice(pricing.cacheCreationInput, unit)}
+								/>
 							)}
 							{Number(pricing.cacheReadInput ?? 0) > 0 && (
-								<PriceRow label="缓存读取" value={fmtPrice(pricing.cacheReadInput, unit)} />
+								<PriceRow
+									label={t("modelPrice.cacheRead")}
+									value={fmtPrice(pricing.cacheReadInput, unit)}
+								/>
 							)}
 							{Number(model.officialInputUsd ?? 0) > 0 && (
 								<PriceRow
-									label="官方价 (USD/1M)"
+									label={t("modelPrice.officialUsd")}
 									value={`$${Number(model.officialInputUsd ?? 0).toFixed(2)} / $${Number(model.officialOutputUsd ?? 0).toFixed(2)}`}
 								/>
 							)}
-							{usdRate > 0 && <PriceRow label="参考汇率" value={`1 USD = ${usdRate} ${unit}`} />}
-							{discount && <PriceRow label="实际优惠倍率" value={discount} />}
+							{usdRate > 0 && (
+								<PriceRow
+									label={t("modelPrice.referenceRate")}
+									value={`1 USD = ${usdRate} ${unit}`}
+								/>
+							)}
+							{discount && <PriceRow label={t("modelPrice.effectiveDiscount")} value={discount} />}
 							{circleMultiplier && (
-								<PriceRow label="圈子倍率（1 余额=1 美元）" value={circleMultiplier} />
+								<PriceRow label={t("modelPrice.circleMultiplier")} value={circleMultiplier} />
 							)}
 						</Stack>
 					)}
 
 					<Text size="xs" c="dimmed">
-						价格以 {unit} 计，按实际用量计费；官方美元价与优惠倍率仅供参考。
+						{t("modelPrice.footnote", { unit })}
 					</Text>
 				</Stack>
 			)}

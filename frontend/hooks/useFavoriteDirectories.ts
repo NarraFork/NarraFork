@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
+import { reportMutationError } from "../lib/query-client";
 
 const FAVORITE_DIRECTORIES_QUERY_GC_TIME_MS = 60_000;
 
@@ -46,10 +47,13 @@ export function useReorderFavoriteDirectories() {
 			});
 			return { previous };
 		},
-		onError: (_err, _ids, context) => {
+		onError: (err, _ids, context) => {
 			if (context?.previous) {
 				qc.setQueryData(["favoriteDirectories"], context.previous);
 			}
+			// Declaring onError replaced the global toast, so the list used to just snap
+			// back to its old order with no explanation.
+			reportMutationError(err);
 		},
 		onSettled: () => {
 			qc.invalidateQueries({ queryKey: ["favoriteDirectories"] });

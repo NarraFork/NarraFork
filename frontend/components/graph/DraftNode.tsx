@@ -39,7 +39,12 @@ export interface DraftNodeData {
 			sourceChapterIds?: string[];
 			targetChapterId?: string;
 		},
-	) => void;
+		/**
+		 * Resolves `false` when the request failed and this draft is still the
+		 * user's to retry; `true` once the parent has taken ownership of it (created
+		 * the chapter, or started a merge session that will remove the draft later).
+		 */
+	) => Promise<boolean>;
 	onCancel: (draftNodeId: string) => void;
 	[key: string]: unknown;
 }
@@ -78,7 +83,17 @@ function DraftNodeInner({ id, data }: NodeProps) {
 			parentChapterId: d.parentChapterId,
 			sourceChapterIds: d.sourceChapterIds,
 			targetChapterId: d.targetChapterId,
-		});
+		})
+			// A failed fork/merge leaves the draft on the canvas, so the button has to
+			// become clickable again. It used to latch on "…" forever: the toast said
+			// what went wrong, and the only way to act on it was to cancel the draft
+			// and redraw it from scratch.
+			.then((accepted) => {
+				if (!accepted) setLoading(false);
+			})
+			.catch(() => {
+				setLoading(false);
+			});
 	}, [id, d, title, description, inheritMode, worktreeSource, mode, loading]);
 
 	const handleCancel = useCallback(() => {
@@ -87,7 +102,9 @@ function DraftNodeInner({ id, data }: NodeProps) {
 
 	const handleKeyDown = useCallback(
 		(e: React.KeyboardEvent) => {
-			if (e.key === "Enter" && !e.shiftKey) {
+			// Enter with an IME candidate open picks the word; creating the fork on it
+			// named the chapter after the raw pinyin and closed the draft.
+			if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
 				e.preventDefault();
 				handleConfirm();
 			} else if (e.key === "Escape") {
