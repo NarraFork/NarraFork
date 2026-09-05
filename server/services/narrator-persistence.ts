@@ -742,6 +742,46 @@ export async function recoverStaleCompactingMessages(
 	return { preserved, deleted };
 }
 
+/**
+ * Where a message row sits in the narrator's message tree.
+ *
+ * ## Why this is an option object and not a positional argument
+ *
+ * `parentToolUseId` is the third thing a persisted row states, alongside "who is
+ * speaking" (`role`) and "what is said" (`contentJson`): WHICH tool_use subtree it
+ * belongs to. It was previously only expressible through a separate entry point
+ * (`persistSubagentUserMessage`), which is why structured injection —
+ * `deliverInjection`, whose only two writers are the two methods here — could not
+ * reach a subagent's subtree at all, no matter what it wanted to say.
+ *
+ * An object rather than a seventh positional parameter because both methods already
+ * take five optional positionals; a bare `string | null` in that queue is the kind of
+ * argument that gets passed in the wrong slot without a type error (`createdBy`,
+ * `commandText` and this are all nullable strings).
+ *
+ * ## The default is load-bearing
+ *
+ * Omitted means `null` means "top-level row", which is every primary-narrator call
+ * site and every pre-existing caller. A row with a `parentToolUseId` is invisible to
+ * `buildHistory` (every provider filters `!m.parentToolUseId`) and to a primary
+ * narrator's page loader (`isNull(parentToolUseId)`), so setting it by accident does
+ * not corrupt anything — it makes the row silently unreadable, which is worse. Only
+ * pass it when the recipient is a subagent whose page drops the filter.
+ */
+export interface MessagePlacementOptions {
+	/**
+	 * The `tool_use` id that owns this row — the Agent/Task call that spawned the
+	 * recipient subagent. Null/omitted writes a top-level row.
+	 */
+	parentToolUseId?: string | null;
+	/**
+	 * Commit related state in the SAME synchronous transaction as the message and ref.
+	 * Throwing rolls back all writes; the hook can run again after a SQLite busy retry.
+	 * No asynchronous work or external side effects are allowed here.
+	 */
+	onPersist?: (tx: DbTx, messageId: string) => undefined;
+}
+
 // ── narratorPersistence object ─────────────────────────────────────────────
 
 export const narratorPersistence = {
@@ -753,6 +793,10 @@ export const narratorPersistence = {
 	 * only resumes from user/assistant), so system- and AI-injected turns land
 	 * here too. Pass `origin` so the UI can attribute them correctly instead of
 	 * showing every such turn as if the human typed it.
+	 *
+	 * `parentToolUseId` places the row in a tool_use subtree — see
+	 * {@link MessagePlacementOptions}. Omitting it writes a top-level row, which is
+	 * every primary-narrator call site.
 	 */
 	async persistUserMessage(
 		narratorId: string,
@@ -762,17 +806,20 @@ export const narratorPersistence = {
 		commandText?: string | null,
 		createdBy?: string | null,
 		origin?: MessageOriginOptions,
+		placement?: MessagePlacementOptions,
 	) {
-		return withDbRetry(
+		const parentToolUseId = placement?.parentToolUseId ?? null;
+		const msgWithSeq = await withDbRetry(
 			async () => {
 				const id = generateId();
 				const now = new Date().toISOString();
-				const { msg, seq } = db.transaction((tx) => {
+				return db.transaction((tx) => {
 					const created = tx
 						.insert(narratorMessages)
 						.values({
 							id,
 							narratorId,
+							parentToolUseId,
 							role: "user",
 							contentJson: contentBlocks ?? [{ type: "text", text }],
 							contentText: text,
@@ -785,26 +832,44 @@ export const narratorPersistence = {
 						.returning()
 						.get();
 					const seq = appendMessageRefSync(tx, narratorId, id);
-					return { msg: created, seq };
+					placement?.onPersist?.(tx, id);
+					return { ...created, seq };
 				});
-
-				if (createdBy) {
-					const user = await db.query.users.findFirst({
-						where: eq(users.id, createdBy),
-						columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-					});
-					return { ...msg, seq, creator: user ?? null };
-				}
-				return { ...msg, seq, creator: null };
 			},
 			{ label: "persistUserMessage", maxRetries: 5 },
 		);
+
+		// A child row also changes what the PARENT's page shows (the tool card's
+		// activity snapshot), and the parent is a different narrator with its own
+		// messageVersion. Without this the parent's incremental sync reports "nothing
+		// changed" and its open panel keeps the stale card. No-op when there is no
+		// parentToolUseId, which is the whole primary-narrator path.
+		await bumpParentNarratorMessageVersion(parentToolUseId);
+
+		// NOTE: the creator row is returned whenever `createdBy` names an account, even
+		// for a non-human `origin`. That is DELIBERATELY left as it was: the subagent
+		// entry point withholds it for AI-authored text (see
+		// `persistSubagentUserMessage`), and applying the same rule here would change
+		// what several primary-narrator producers return (a scheduled task run carries
+		// its configurer's `createdBy` with `origin: "system"`). Widening it is a
+		// behaviour decision about the primary path, not part of opening this seam.
+		if (createdBy) {
+			const user = await db.query.users.findFirst({
+				where: eq(users.id, createdBy),
+				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+			});
+			return { ...msgWithSeq, creator: user ?? null };
+		}
+		return { ...msgWithSeq, creator: null };
 	},
 
 	/**
 	 * Persist a `role: "sys"` message: model-visible injected context that is not
 	 * a human turn. Defaults to `origin: "system"`; pass `origin` explicitly when
 	 * an AI or an identified human triggered the injection.
+	 *
+	 * `parentToolUseId` places the row in a tool_use subtree — see
+	 * {@link MessagePlacementOptions}.
 	 */
 	async persistSystemMessage(
 		narratorId: string,
@@ -813,18 +878,21 @@ export const narratorPersistence = {
 		contentBlocks?: any[],
 		createdBy?: string,
 		origin?: MessageOriginOptions,
+		placement?: MessagePlacementOptions,
 	) {
-		return withDbRetry(
+		const parentToolUseId = placement?.parentToolUseId ?? null;
+		const msg = await withDbRetry(
 			async () =>
 				db.transaction((tx) => {
 					const id = generateId();
 					const now = new Date().toISOString();
 					const blocks: unknown[] = [{ type: "text", text }, ...(contentBlocks ?? [])];
-					const msg = tx
+					const created = tx
 						.insert(narratorMessages)
 						.values({
 							id,
 							narratorId,
+							parentToolUseId,
 							role: "sys",
 							contentJson: blocks,
 							contentText: text,
@@ -837,10 +905,13 @@ export const narratorPersistence = {
 						.get();
 
 					const seq = appendMessageRefSync(tx, narratorId, id);
-					return { ...msg, seq };
+					placement?.onPersist?.(tx, id);
+					return { ...created, seq };
 				}),
 			{ label: "persistSystemMessage", maxRetries: 5 },
 		);
+		await bumpParentNarratorMessageVersion(parentToolUseId);
+		return msg;
 	},
 
 	async persistDisplayMessage(

@@ -402,6 +402,7 @@ describe("agent error handling", () => {
 			isRetryableError(
 				new Error(
 					"Network request failed [tls/UNKNOWN_CERTIFICATE_VERIFICATION_ERROR] after 15571 ms: " +
+						"POST https://nug.example.com/v1/chat via direct connection. " +
 						"The TLS handshake or certificate verification failed.",
 				),
 			),
@@ -758,6 +759,7 @@ describe("isModelUnavailableError", () => {
 		expect(isModelUnavailableError(new Error("NUG chat error 503: no available credentials"))).toBe(
 			true,
 		);
+		expect(isModelUnavailableError(new Error('channel "anthropic" has no healthy nodes'))).toBe(true);
 		expect(isModelUnavailableError(new Error("no available API keys: all disabled"))).toBe(true);
 		expect(isModelUnavailableError(new Error("model upstream unavailable"))).toBe(true);
 		expect(isModelUnavailableError(new Error("all credentials exhausted after retries: 401"))).toBe(

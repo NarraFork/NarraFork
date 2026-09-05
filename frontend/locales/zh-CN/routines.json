@@ -119,7 +119,6 @@
 	"mcpImportSkippedUnsupportedTransport": "已跳过 {{count}} 个使用非 stdio 不支持传输方式的服务器。",
 	"mcpImportError": "导入失败：{{error}}",
 	"mcpImportInvalidJson": "无效的 JSON 格式。",
-	"mcpBuiltinTools": "内置 MCP 工具",
 	"mcpEnv": "环境变量",
 	"mcpDefaultBehavior": "默认权限",
 	"mcpDefaultBehaviorDesc": "此服务器所有工具的默认权限行为。",

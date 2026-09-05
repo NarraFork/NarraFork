@@ -298,6 +298,10 @@ function traceRevision(d: Record<string, unknown>): string {
 		if (r.card != null && typeof r.card === "object") {
 			const card = r.card as Record<string, unknown>;
 			if (typeof card.status === "string") rev += `|tds:${card.status}`;
+			// A drilled-in card paints its deadline from the cached measured payload.
+			// `timeout_updated` changes only this field, so its trace must re-key even
+			// though the nested card's height is unchanged.
+			if (typeof card.timeoutMs === "number") rev += `|tdto:${card.timeoutMs}`;
 			if (typeof card.truncatedLeafCount === "number") rev += `|tdn:${card.truncatedLeafCount}`;
 			rev += detailTextRevision(card.detail);
 			rev += reflectionRevision(card.reflection);

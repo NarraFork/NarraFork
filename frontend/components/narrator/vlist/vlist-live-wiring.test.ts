@@ -663,6 +663,101 @@ describe("live event → patch field mapping", () => {
 		expect(result.messages).toBe(doc);
 	});
 
+	/**
+	 * The release path's real failure. The badge is an OR over TWO fields
+	 * (`resolveTakenOver`), and only one of them is in the frame:
+	 *
+	 *   tc._takenOver                  ← this patch
+	 *   tc._subagentActivity.takenOver ← stamped by the server on any page loaded
+	 *                                    mid-takeover, and deliberately carried
+	 *                                    across every child tool event by
+	 *                                    `upsertSubagentToolCallHeader`
+	 *
+	 * So writing `_takenOver: false` alone leaves the OR true and the badge lit
+	 * until an unrelated full reload — the user has stopped the takeover and the
+	 * card still claims they are driving. It only breaks in the RELEASE direction,
+	 * which is why the earlier single-field write looked correct.
+	 */
+	it("stopping a takeover also clears the activity summary's flag", async () => {
+		const { subagentTakeoverPatch } = await import("./vlist-live-events");
+		const { resolveToolItemTakenOver } = await import("@shared/pretext-layout/segment-adapter");
+		const doc = toolDoc("tu-1", "running");
+		(block(doc) as Record<string, unknown>)._subagentActivity = {
+			subagentNarratorId: "sub-9",
+			model: null,
+			latestToolCalls: [],
+			takenOver: true,
+		};
+		const released = subagentTakeoverPatch({ toolUseId: "tu-1", takenOver: false })(doc);
+		expect(released.changed).toBe(true);
+		const patched = block(released.messages);
+		expect(patched._takenOver).toBe(false);
+		// Absent, not `false`: matches how the server builds the snapshot, so both
+		// producers yield one shape.
+		expect((patched._subagentActivity as Record<string, unknown>).takenOver).toBeUndefined();
+		// The whole point — what the card actually paints.
+		expect(resolveToolItemTakenOver({ tc: patched } as never)).toBe(false);
+		// The rest of the summary survives (it is the card's model / recent calls).
+		expect((patched._subagentActivity as Record<string, unknown>).subagentNarratorId).toBe("sub-9");
+	});
+
+	it("the by-narrator route clears the activity flag too (both routes agree)", async () => {
+		const { patchSubagentTakeoverByNarrator } = await import("./vlist-live-patch");
+		const doc = toolDoc("tu-1", "running");
+		(block(doc) as Record<string, unknown>)._subagentActivity = {
+			subagentNarratorId: "sub-9",
+			model: null,
+			latestToolCalls: [],
+			takenOver: true,
+		};
+		const released = patchSubagentTakeoverByNarrator(doc, "sub-9", false);
+		expect(released.changed).toBe(true);
+		const patched = block(released.messages);
+		expect(patched._takenOver).toBe(false);
+		expect((patched._subagentActivity as Record<string, unknown>).takenOver).toBeUndefined();
+	});
+
+	/**
+	 * A card with NO summary must not gain a synthesized one: fabricating a partial
+	 * summary would erase the model / recent calls the adapter reads from it.
+	 */
+	it("does not synthesize an activity summary on a card that has none", async () => {
+		const { subagentTakeoverPatch } = await import("./vlist-live-events");
+		const released = subagentTakeoverPatch({ toolUseId: "tu-1", takenOver: true })(
+			toolDoc("tu-1", "running"),
+		);
+		expect(block(released.messages)._subagentActivity).toBeUndefined();
+	});
+
+	/**
+	 * The frame's `toolUseId` is the call that SPAWNED the child. A separate
+	 * in-flight `Await({type:"agent"})` on the same child is a DIFFERENT card that
+	 * only carries `_awaitAgentNarratorId`. Treating the id as exclusive (early
+	 * return) left that Await card lit forever after the release, because the
+	 * message-load path does flag it while no live frame ever cleared it.
+	 */
+	it("dispatches BOTH addressing routes so a separate Await card is released too", () => {
+		const enqueued: string[] = [];
+		const handler = (info: {
+			subagentNarratorId?: string;
+			toolUseId?: string;
+			takenOver: boolean;
+		}) => {
+			if (info.toolUseId) enqueued.push(`byTool:${info.toolUseId}`);
+			if (!info.subagentNarratorId) return;
+			enqueued.push(`byNarrator:${info.subagentNarratorId}`);
+		};
+		handler({ toolUseId: "tu-spawn", subagentNarratorId: "sub-9", takenOver: false });
+		expect(enqueued).toEqual(["byTool:tu-spawn", "byNarrator:sub-9"]);
+		// And the shipped handler must not early-return on the tool id.
+		const body = LIVE_HOOK.slice(
+			LIVE_HOOK.indexOf("onSubagentTakeoverChanged:"),
+			LIVE_HOOK.indexOf("onToolExecuting:"),
+		);
+		expect(body).toContain("if (toolUseId) enqueue(");
+		expect(body).not.toContain("return;\n\t\t\t\t}");
+	});
+
 	it("a resolved question gate leaves the tool answerable (pending, not fail)", async () => {
 		const { reflectionResolvedPatch } = await import("./vlist-live-events");
 		const result = reflectionResolvedPatch({

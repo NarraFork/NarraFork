@@ -16,6 +16,7 @@
  *   value, because plugin errors surface in diagnostics that admins can read.
  * - **Not encrypted at rest.** There is no key-management story to hang encryption on
  *   yet, and inventing one here would be security theatre: the decryption key would sit
+ *   beside the ciphertext. This matches how built-in provider adapters already store
  *   `credentials.json`, so it is not a regression — but it does mean the file must be
  *   treated as sensitive, hence the mode and the separate path.
  *

@@ -1997,22 +1997,63 @@ export const __TEST__DiffLines = DiffLines;
 export const __TEST__ToolTimingBreakdown = ToolTimingBreakdown;
 
 /**
+ * Which capped bodies follow their own tail, and whether they pin on mount.
+ *
+ * The follow is for bodies whose NEWEST content lands at the BOTTOM while they
+ * GROW: bash/terminal output (the classifier's literal `output` label AND a
+ * terminal-style cap), a streaming Write preview (`streaming` cap only ever
+ * comes out of `classifyStreamingInput`, so the tag alone proves liveness), and
+ * a streaming Edit diff (`diff` cap while the tool is still streaming).
+ *
+ * `followOnMount` splits those by freshness: a body that is streaming RIGHT NOW
+ * pins to the tail the moment its box mounts (its first frame may already
+ * overflow — a session opened mid-run, or output that arrived in one burst —
+ * and skipping that pass is exactly the "follow never engages" failure), while
+ * a SETTLED body (`term` cap on a finished command) still opens at its head so
+ * the truncated-body auto-fetch keeps gating on the reader's own scroll.
+ *
+ * Deliberately NOT followed: command boxes (`bash-cmd`, and `streaming-bash`
+ * WITHOUT the output label — the same tag paints the streaming command preview,
+ * which reads from the head), settled code/diff bodies, and generic
+ * input/output dumps.
+ */
+export function resolveTailFollow(opts: {
+	/** The section label (absent on the single-block path). */
+	label?: ToolSectionLabel;
+	/** The body block's tag (`detail-${cap}`). */
+	blockTag?: string;
+	/** The card's own streaming flag (measured.isStreaming). */
+	isStreaming: boolean;
+}): { follow: boolean; followOnMount: boolean } {
+	const { label, blockTag, isStreaming } = opts;
+	if (label === "output" && (blockTag === "detail-term" || blockTag === "detail-streaming-bash")) {
+		return { follow: true, followOnMount: blockTag === "detail-streaming-bash" };
+	}
+	if (blockTag === "detail-streaming") return { follow: true, followOnMount: true };
+	if (blockTag === "detail-diff" && isStreaming) return { follow: true, followOnMount: true };
+	return { follow: false, followOnMount: false };
+}
+
+/**
  * A capped body scroll box: the fixed-height, clamped container the measure layer
  * reserved. Shared by the single-block path and the per-section path so both keep
  * identical geometry.
  *
  * `tailFollow` turns on output-tail following for bodies whose NEWEST content is
- * at the BOTTOM (bash / terminal output). While the text grows the box stays
- * pinned to the tail; a reader scrolling up detaches it (AutoFollowScroll shows
- * a jump-to-bottom button). It deliberately does NOT pin on mount: a completed
- * body opens at its head exactly as before, so the truncated-body auto-fetch
- * (`useAutoLoadOnScroll`) still gates on the reader actually scrolling deep.
+ * at the BOTTOM (bash / terminal output, streaming Write previews, streaming Edit
+ * diffs — see resolveTailFollow). While the text grows the box stays pinned to
+ * the tail; a reader scrolling up detaches it (AutoFollowScroll shows a
+ * jump-to-bottom button). `followOnMount` pins the box to the tail the moment it
+ * mounts — right for a body that is streaming NOW, wrong for a settled one,
+ * whose truncated-body auto-fetch (`useAutoLoadOnScroll`) must keep gating on
+ * the reader actually scrolling deep.
  */
 function CappedBodyBox({
 	height,
 	cap,
 	wordWrap = true,
 	tailFollow = false,
+	followOnMount = false,
 	followDeps = [],
 	children,
 }: {
@@ -2026,6 +2067,8 @@ function CappedBodyBox({
 	wordWrap?: boolean;
 	/** Follow the output tail while `followDeps` change (streaming output). */
 	tailFollow?: boolean;
+	/** Pin to the tail on mount (a body streaming NOW). See resolveTailFollow. */
+	followOnMount?: boolean;
 	/** Content identity that drives follow attempts (the body text + wrap flag). */
 	followDeps?: readonly unknown[];
 	children: ReactNode;
@@ -2071,7 +2114,7 @@ function CappedBodyBox({
 	// asChild: the follow handlers land on the SAME div, so the wrapper adds only
 	// a position:relative box — height-neutral, like VListContentViewHost's own.
 	return (
-		<AutoFollowScroll asChild followOnMount={false} deps={followDeps}>
+		<AutoFollowScroll asChild followOnMount={followOnMount} deps={followDeps}>
 			{box}
 		</AutoFollowScroll>
 	);
@@ -2092,6 +2135,7 @@ function SectionsDetailBody({
 	viewTargets,
 	viewControls,
 	specTasksLive,
+	isStreaming,
 }: {
 	detail: MeasuredToolDetail;
 	availableWidth: number;
@@ -2101,6 +2145,8 @@ function SectionsDetailBody({
 	viewControls?: VListViewControls;
 	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
 	specTasksLive?: boolean;
+	/** The card is streaming NOW — feeds resolveTailFollow (a live diff follows its tail). */
+	isStreaming: boolean;
 }) {
 	// kind === "sections" guarantees the section list (the caller gates on it).
 	const sections = detail.sections ?? [];
@@ -2128,6 +2174,7 @@ function SectionsDetailBody({
 					viewTarget={findViewTarget(viewTargets, sectionSlot(sectionIndex))}
 					viewControls={viewControls}
 					specTasksLive={specTasksLive}
+					isStreaming={isStreaming}
 				/>
 			))}
 		</div>
@@ -2144,6 +2191,7 @@ function SectionView({
 	viewTarget,
 	viewControls,
 	specTasksLive,
+	isStreaming,
 }: {
 	detail: MeasuredToolDetail;
 	part: MeasuredToolDetailSection;
@@ -2154,6 +2202,8 @@ function SectionView({
 	viewControls?: VListViewControls;
 	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
 	specTasksLive?: boolean;
+	/** The card is streaming NOW — feeds resolveTailFollow (a live diff follows its tail). */
+	isStreaming: boolean;
 }) {
 	// The slice of blocks owned by this section (skipping its own label row).
 	const bodyStart = part.blockStart + (part.hasLabel ? 1 : 0);
@@ -2196,6 +2246,7 @@ function SectionView({
 					viewTarget={viewTarget}
 					viewControls={viewControls}
 					specTasksLive={specTasksLive}
+					isStreaming={isStreaming}
 				/>
 			</div>
 		</>
@@ -2217,6 +2268,7 @@ function SectionBody({
 	viewTarget,
 	viewControls,
 	specTasksLive,
+	isStreaming,
 }: {
 	part: MeasuredToolDetailSection;
 	blocks: MeasuredToolDetail["blocks"];
@@ -2228,6 +2280,8 @@ function SectionBody({
 	viewControls?: VListViewControls;
 	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
 	specTasksLive?: boolean;
+	/** The card is streaming NOW — feeds resolveTailFollow (a live diff follows its tail). */
+	isStreaming: boolean;
 }) {
 	// Section geometry is absolute within the region; shift it to a local origin.
 	const origin = frames[0]?.top ?? 0;
@@ -2298,15 +2352,11 @@ function SectionBody({
 		const blockData = block?.kind === "fixed" ? block.data : undefined;
 		const blockTag = block?.kind === "fixed" ? block.tag : undefined;
 		const wordWrap = viewTarget ? viewControls?.isWrapped(viewTarget) !== false : true;
-		// Output-tail following is for bodies whose newest content is at the BOTTOM:
-		// the classifier marks them with a literal "output" section label AND a
-		// terminal-style cap (bash output, terminal read/list). The same tags appear
-		// on INPUT previews (a streaming Write body is also `detail-streaming`, a
-		// streaming command `detail-streaming-bash`) but those never carry the
-		// "output" label, so gating on both keeps code / diff / previews head-anchored.
-		const tailFollow =
-			part.label === "output" &&
-			(blockTag === "detail-term" || blockTag === "detail-streaming-bash");
+		const { follow: tailFollow, followOnMount } = resolveTailFollow({
+			label: part.label,
+			blockTag,
+			isStreaming,
+		});
 		return (
 			<VListContentViewHost target={viewTarget} controls={viewControls}>
 				<CappedBodyBox
@@ -2314,6 +2364,7 @@ function SectionBody({
 					cap={part.appliedCap}
 					wordWrap={wordWrap}
 					tailFollow={tailFollow}
+					followOnMount={followOnMount}
 					followDeps={[text, wordWrap]}
 				>
 					{isDiff ? (
@@ -2734,6 +2785,7 @@ function DetailRegion({
 	viewTargets,
 	viewControls,
 	specTasksLive,
+	isStreaming,
 }: {
 	detail: MeasuredToolDetail;
 	availableWidth: number;
@@ -2743,6 +2795,8 @@ function DetailRegion({
 	viewControls?: VListViewControls;
 	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
 	specTasksLive?: boolean;
+	/** The card is streaming NOW — feeds resolveTailFollow (a live diff follows its tail). */
+	isStreaming: boolean;
 }) {
 	// Multi-part detail: the meta header + labelled body sections the classic card
 	// draws. This is the shape whose absence made whole blocks disappear.
@@ -2756,6 +2810,7 @@ function DetailRegion({
 				viewTargets={viewTargets}
 				viewControls={viewControls}
 				specTasksLive={specTasksLive}
+				isStreaming={isStreaming}
 			/>
 		);
 	}
@@ -2807,6 +2862,63 @@ function DetailRegion({
 					const bodyText = typeof block.data?.text === "string" ? block.data.text : null;
 					const isDiff = block.tag === "detail-diff";
 					const bodyLang = resolveDetailLang(block.data);
+					// Same tail-follow contract as the sectioned CappedBodyBox, minus the
+					// label dimension (the single-block path has no section labels). This is
+					// where a streaming Write/Edit preview lands while its path row is still
+					// absent — `sections()` collapses a lone unlabelled section into this
+					// branch (tool-detail.ts), so skipping the follow here left exactly the
+					// earliest streaming frames head-pinned.
+					const { follow: tailFollow, followOnMount } = resolveTailFollow({
+						blockTag: block.tag,
+						isStreaming,
+					});
+					const scrollBody = (
+						<div
+							style={{
+								maxHeight: typeof block.data?.cap === "number" ? block.data.cap : undefined,
+								// Axis policy of the chunked ContentViewer (see
+								// CappedBodyBox): a WRAPPED body never scrolls
+								// horizontally, so any overflow is a rendering artifact
+								// that must not summon a scrollbar; an UNWRAPPED body
+								// scrolls horizontally by definition.
+								overflowY: "auto",
+								overflowX: bodyWrapped ? "hidden" : "auto",
+								fontSize: detailBodyFontSize(),
+								// Integer line box, not the 1.4 ratio — see CappedBodyBox.
+								lineHeight: `${detailContentLineHeight()}px`,
+								fontFamily: "var(--mantine-font-family-monospace)",
+								// Scheme-aware — see CappedBodyBox.
+								background: "var(--vlist-detail-panel-bg)",
+								color: "var(--vlist-detail-panel-fg)",
+								borderRadius: 4,
+								padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
+								boxSizing: "border-box",
+								// Wrap is a reader preference; the box height is fixed either
+								// way, so switching it only changes the scroll axis.
+								...(bodyWrapped
+									? { whiteSpace: "pre-wrap", wordBreak: "break-word" }
+									: { whiteSpace: "pre" }),
+								// The scroll body fills the block minus the label chrome (the
+								// same amount `cappedBodyHeight` added for the label row).
+								height: bf.height - (hasLabel ? DETAIL_LABEL_CHROME_Y : 0),
+							}}
+						>
+							{/* Real body text (code/command/diff/output). Diffs get +/- line
+						    tinting plus syntax colours; other bodies get syntax colours
+						    when a language is known. Height-capped so content never
+						    shifts layout. */}
+							{isDiff ? (
+								<DiffLines
+									text={bodyText ?? ""}
+									lang={bodyLang}
+									data={block.data}
+									truncatedLabel={labels.diffTruncated}
+								/>
+							) : bodyText == null ? null : (
+								<HighlightedBody text={bodyText} lang={bodyLang} />
+							)}
+						</div>
+					);
 					return (
 						<div
 							// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
@@ -2833,51 +2945,17 @@ function DetailRegion({
 								/>
 							) : (
 								<VListContentViewHost target={viewTarget} controls={viewControls}>
-									<div
-										style={{
-											maxHeight: typeof block.data?.cap === "number" ? block.data.cap : undefined,
-											// Axis policy of the chunked ContentViewer (see
-											// CappedBodyBox): a WRAPPED body never scrolls
-											// horizontally, so any overflow is a rendering artifact
-											// that must not summon a scrollbar; an UNWRAPPED body
-											// scrolls horizontally by definition.
-											overflowY: "auto",
-											overflowX: bodyWrapped ? "hidden" : "auto",
-											fontSize: detailBodyFontSize(),
-											// Integer line box, not the 1.4 ratio — see CappedBodyBox.
-											lineHeight: `${detailContentLineHeight()}px`,
-											fontFamily: "var(--mantine-font-family-monospace)",
-											// Scheme-aware — see CappedBodyBox.
-											background: "var(--vlist-detail-panel-bg)",
-											color: "var(--vlist-detail-panel-fg)",
-											borderRadius: 4,
-											padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
-											boxSizing: "border-box",
-											// Wrap is a reader preference; the box height is fixed either
-											// way, so switching it only changes the scroll axis.
-											...(bodyWrapped
-												? { whiteSpace: "pre-wrap", wordBreak: "break-word" }
-												: { whiteSpace: "pre" }),
-											// The scroll body fills the block minus the label chrome (the
-											// same amount `cappedBodyHeight` added for the label row).
-											height: bf.height - (hasLabel ? DETAIL_LABEL_CHROME_Y : 0),
-										}}
-									>
-										{/* Real body text (code/command/diff/output). Diffs get +/- line
-										    tinting plus syntax colours; other bodies get syntax colours
-										    when a language is known. Height-capped so content never
-										    shifts layout. */}
-										{isDiff ? (
-											<DiffLines
-												text={bodyText ?? ""}
-												lang={bodyLang}
-												data={block.data}
-												truncatedLabel={labels.diffTruncated}
-											/>
-										) : bodyText == null ? null : (
-											<HighlightedBody text={bodyText} lang={bodyLang} />
-										)}
-									</div>
+									{tailFollow ? (
+										<AutoFollowScroll
+											asChild
+											followOnMount={followOnMount}
+											deps={[bodyText, bodyWrapped]}
+										>
+											{scrollBody}
+										</AutoFollowScroll>
+									) : (
+										scrollBody
+									)}
 								</VListContentViewHost>
 							)}
 						</div>
@@ -3120,6 +3198,7 @@ export function RenderToolCall({
 									viewTargets={viewTargets}
 									viewControls={viewControls}
 									specTasksLive={specTasksLive}
+									isStreaming={isStreaming}
 								/>
 							</div>
 						</Box>

@@ -138,6 +138,8 @@ export {
 export {
 	askInPassingSchema,
 	askInPassingStartSchema,
+	asyncQuestionAnswerSchema,
+	asyncQuestionListQuerySchema,
 	batchDeleteBlocksSchema,
 	browserInteractSchema,
 	codexBrowserCallbackSchema,

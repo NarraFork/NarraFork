@@ -296,7 +296,10 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	ExitPlanMode: { short: [], large: ["plan"] },
 	StartPipeline: { short: ["label", "maxPreviewChars", "maxUnusedToolCalls"], large: [] },
 	ExtractPipeline: { short: ["aliases", "format", "maxChars"], large: ["rule"] },
-	AskUserQuestion: { short: [], large: [] },
+	// `async` is extracted while the input streams so the UI can label the card as a
+	// deferred question before the call completes; `withdraw` so a maintenance-only
+	// call is not rendered as an empty question.
+	AskUserQuestion: { short: ["async", "withdraw"], large: [] },
 };
 
 function getToolWantedKeys(toolName: string): Set<string> {
@@ -2384,6 +2387,7 @@ export async function* agentLoop(
 		// In plan mode, override descriptions for forbidden tools so the model knows not to
 		// call them. Applied here rather than baked into `allTools` because a manual toggle
 		// can flip plan mode between turns, and `allTools` is built once per pass.
+		// Tool NAMES are preserved (required by some APIs for history consistency).
 		// When relaxedPlan is enabled, skip this — tools remain fully available.
 		if (planModeDisablesTools()) {
 			const disabledDesc = getToolMessage("planModeToolDisabled", locale);
@@ -3115,6 +3119,7 @@ export async function* agentLoop(
 			 *
 			 * Kept separate from `chatRetryCount` because this rejection is not a transient
 			 * transport fault and must not draw on (or be masked by) the ordinary retry budget:
+			 * observed rate is ~0.02% of upstream requests, and 39 of 40 recorded occurrences
 			 * recovered on their own with the request unchanged. Two replays convert that
 			 * self-healing window into a recovered turn; beyond that the failure is treated as
 			 * real, because a genuinely malformed body would repeat forever and retrying it
@@ -3275,6 +3280,7 @@ export async function* agentLoop(
 			}
 
 			// ── Transient-error retry loop ──
+			// For stateless providers (anthropic, openai-completions)
 			// we can safely retry the exact same provider.chat() call with identical
 			// history, content, and toolResults — no server-side state was mutated.
 			// Stateful providers (responses/codex) cannot retry here because the
@@ -3689,6 +3695,7 @@ export async function* agentLoop(
 				requestDiagnostics = undefined;
 
 				// Initialize request dump collector when explicitly enabled, OR when the provider
+				// may leak XML tool calls (NUG) so leaked-tool diagnostics always have a
 				// bounded raw dump to persist on detection. Providers write bodyText/events through
 				// the *WithLimit helpers, so collection stays bounded even when force-enabled here.
 				requestDump =
@@ -3821,6 +3828,7 @@ export async function* agentLoop(
 							// (order identity, TOOL_FIELD_CONFIG, registry lookup, persistence).
 							for (const tu of parsed.toolUses) tu.name = canonicalizeToolName(tu.name);
 							// ── Tool use dedup ──
+							// Some providers (notably NUG) may emit the same tool call
 							// via BOTH the non-streaming `parsed.toolUses` array AND the streaming
 							// `parsed.toolUseChunk` path. This commonly happens for tools with
 							// empty or very small parameters (e.g. EnterPlanMode). Without dedup,
@@ -3833,9 +3841,6 @@ export async function* agentLoop(
 							//    so the streaming stop handler doesn't re-process them.
 							// 3. Yield block_complete + tool_call + start eager execution here,
 							//    mirroring what the streaming stop path would have done.
-							// single aggregated leaked_tool_call(stream_captured) diagnostic can be
-							// emitted after the loop.
-							const streamCapturedLeaked: AgentToolUse[] = [];
 							for (const tu of parsed.toolUses) {
 								const identity = markCompletedToolUse(tu);
 								// Skip duplicates — the streaming path may have already
@@ -3849,7 +3854,6 @@ export async function* agentLoop(
 									continue;
 								}
 
-
 								if (tu.thoughtSignature && !tu.thoughtSignatureSource) {
 									tu.thoughtSignatureSource = provider.getActiveReasoningSource?.();
 								}
@@ -3857,6 +3861,7 @@ export async function* agentLoop(
 
 								// If this tool was also being streamed via toolUseChunk, remove it
 								// from the accumulator so it isn't flagged as orphaned.
+								// This happens with some providers (e.g. NUG) that send both a
 								// the same call — especially for tools with empty parameters.
 								const wasStreaming = toolUseAccum.has(tu.toolUseId);
 								if (wasStreaming) {
@@ -3908,19 +3913,6 @@ export async function* agentLoop(
 									toolUseId: tu.toolUseId,
 									toolName: tu.name,
 									input: tu.input,
-								};
-							}
-
-							// Diagnostic: surface XML-captured tool calls so the UI can mark them
-							// as recovered-from-stream (non-persisted notice). Emitted after the
-							// loop so a single event covers all leaked tools in this stream event.
-							if (streamCapturedLeaked.length > 0) {
-								yield {
-									type: "leaked_tool_call",
-									phase: "stream_captured",
-									requestId,
-									toolUseIds: streamCapturedLeaked.map((t) => t.toolUseId),
-									toolNames: streamCapturedLeaked.map((t) => t.name),
 								};
 							}
 						}
@@ -4435,6 +4427,7 @@ export async function* agentLoop(
 						}
 						if (parsed.contextUsagePercentage != null) {
 							receivedUsage = true;
+							// Some gateways report a context-window occupancy percentage instead of
 							// raw token counts. Derive the estimated prompt token count from
 							// percentage × context window (consistent with the percentage the
 							// UI shows), and estimate output tokens from the assistant text.
@@ -4613,6 +4606,7 @@ export async function* agentLoop(
 								model: parsed.invalidState.diagnostics?.model ?? effectiveModel,
 							});
 							// Opaque upstream "malformed request body" rejection delivered as a stream
+							// error event (NUG relays the upstream ValidationException this way). Capture
 							// the exact request before any classification path consumes the error.
 							if (
 								isMalformedRequestBodyError({ reason, message, diagnostics: requestDiagnostics })
@@ -5132,6 +5126,7 @@ export async function* agentLoop(
 						};
 						return;
 					}
+					// Detect upstream API context length exceeded (HTTP 400)
 					if (
 						err &&
 						typeof err === "object" &&
@@ -5888,70 +5883,6 @@ export async function* agentLoop(
 			// multiple times in one turn, collapse them before any drain/execution logic below.
 			dedupeToolUsesInPlace(toolUses, effectiveProvider, effectiveModel);
 
-			// lifts `<invoke>...</invoke>` blocks out of the text deltas as they stream, but if
-			// anything prevented that (mid-block retry, an event-shape edge case, or a buffer
-			// boundary the streaming parser couldn't reconcile), a complete block can still be
-			// sitting in the finished `assistantText`. Re-run the stateless parser on the full
-			// text so a closed block always becomes an executable tool call instead of leaking
-			// to the UI. This is idempotent: the streaming layer already stripped any block it
-			// successfully parsed, so only un-lifted blocks remain here.
-			if (assistantText.includes("<invoke")) {
-				if (recovered.toolUses.length > 0) {
-					logger.warn("Recovered leaked XML tool calls from assistant text", {
-						narratorId: config.narratorId,
-						provider: effectiveProvider,
-						model: effectiveModel,
-						requestId,
-						recoveredCount: recovered.toolUses.length,
-						toolNames: recovered.toolUses.map((tu) => tu.name).slice(0, 10),
-					});
-					assistantText = recovered.text;
-					const recoveredIds: string[] = [];
-					for (const tu of recovered.toolUses) {
-						tu.name = canonicalizeToolName(tu.name);
-						markCompletedToolUse(tu);
-						if (!toolUses.some((existing) => existing.toolUseId === tu.toolUseId)) {
-							toolUses.push(tu);
-							recoveredIds.push(tu.toolUseId);
-						}
-					}
-					// The raw block was already streamed to the UI as text; tell the frontend to
-					// discard the live streaming snapshot so the clean `block_complete` below
-					// (emitted by flushPartialContent) becomes the authoritative rendering.
-					yield { type: "stream_reset" };
-					// Force the raw SSE dump to persist so the recovery is downloadable, then emit
-					// a diagnostic so the UI can prompt the user to download the raw data.
-					forceDumpPersist = true;
-					yield {
-						type: "leaked_tool_call",
-						phase: "recovered",
-						requestId,
-						toolUseIds: recoveredIds,
-						toolNames: recovered.toolUses.map((tu) => tu.name),
-					};
-				} else {
-					// Leaked `<invoke` text remained but no complete block could be parsed — a
-					// closing tag may be missing or the block was malformed. The tool was NOT
-					// executed. Force-persist the dump and surface a diagnostic with a snippet.
-					const idx = assistantText.indexOf("<invoke");
-					const snippet = assistantText.slice(Math.max(0, idx - 40), idx + 200);
-					logger.warn("Unrecovered leaked XML in assistant text (no parseable tool call)", {
-						narratorId: config.narratorId,
-						provider: effectiveProvider,
-						model: effectiveModel,
-						requestId,
-						snippetLength: snippet.length,
-					});
-					forceDumpPersist = true;
-					yield {
-						type: "leaked_tool_call",
-						phase: "unrecovered",
-						requestId,
-						snippet,
-					};
-				}
-			}
-
 			// ── Finalize citations for this turn's assistant text ──
 			// Runs once, here, so the SAME cleaned text feeds token estimation, the
 			// `assistant_message` event, persistence and `pushAssistantTurn`. If the
@@ -5980,6 +5911,7 @@ export async function* agentLoop(
 			// Providers that mint a single id for every call (e.g. "call_go_0") would otherwise
 			// make the replayed history carry the same id in several assistant messages, which
 			// the API rejects with 400 "duplicate tool_use id"; ids like "Bash:0" are accepted
+			// by Anthropic but rejected outright by NUG's strict gateway, which would break the
 			// session the moment it is switched there. Only the model-facing history is
 			// rewritten — the tool_use objects below keep the provider's original id, so
 			// persistence, the UI, and permission/approval flows are unaffected.
@@ -5999,6 +5931,7 @@ export async function* agentLoop(
 				applyToolUseIdRemap(list, turnToolUseIdRemap);
 
 			// ── Estimate token usage when provider doesn't report it ──
+			// Some providers don't report token usage in their API responses.
 			// For these cases, we estimate based on text length to provide usage statistics.
 			if (!requestUsage) {
 				const historyText = JSON.stringify(history);
@@ -6205,7 +6138,7 @@ export async function* agentLoop(
 						earlyPromise ?? executeToolAfterReflections(tu, config, history, locale),
 					);
 					if (result.broken) brokenToolUseIds.add(tu.toolUseId);
-					// When the permission handler redirected the input (e.g. conclusion file),
+					// When the permission handler redirected the input (e.g. the plan file),
 					// update the in-memory tool_use so pushAssistantTurn writes the correct
 					// input into history — otherwise the model sees the original (wrong) path.
 					if (result.updatedInput) tu.input = result.updatedInput;

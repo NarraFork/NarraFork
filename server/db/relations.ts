@@ -28,6 +28,7 @@ import {
 	narratorGrants,
 	narratorMessageRefs,
 	narratorMessages,
+	narratorQuestions,
 	narrators,
 	narratorToolCalls,
 	narratorWhitelistCmds,
@@ -156,6 +157,7 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	messageRefs: many(narratorMessageRefs),
 	messages: many(narratorMessages),
 	toolCalls: many(narratorToolCalls),
+	questions: many(narratorQuestions),
 	fileSnapshots: many(narratorFileSnapshots),
 	terminals: many(terminals),
 	commits: many(chapterCommits),
@@ -297,6 +299,17 @@ export const narratorToolCallsRelations = relations(narratorToolCalls, ({ one })
 	message: one(narratorMessages, {
 		fields: [narratorToolCalls.messageId],
 		references: [narratorMessages.id],
+	}),
+}));
+
+export const narratorQuestionsRelations = relations(narratorQuestions, ({ one }) => ({
+	narrator: one(narrators, {
+		fields: [narratorQuestions.narratorId],
+		references: [narrators.id],
+	}),
+	toolCall: one(narratorToolCalls, {
+		fields: [narratorQuestions.toolCallId],
+		references: [narratorToolCalls.id],
 	}),
 }));
 

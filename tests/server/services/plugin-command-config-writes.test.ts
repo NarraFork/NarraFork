@@ -33,6 +33,8 @@ function harness(options?: { storedConfig?: Record<string, JsonValue> }) {
 			{
 				kind: "executable-plugin",
 				pluginId: "com.example.demo",
+				localId: "acme",
+				providerInstanceId: "com.example.demo/acme",
 				configSchema: CONFIG_SCHEMA,
 			},
 			// A second plugin's contribution, to prove the namespace check is real.
@@ -64,10 +66,13 @@ describe("applyCommandConfigWrites", () => {
 		const { registry, sink, updates } = harness();
 		const result = await applyCommandConfigWrites({
 			pluginId: "com.example.demo",
+			writes: [{ key: "provider.acme.loadBalancingMode", value: "balanced" }],
 			registry,
 			sink,
 		});
+		expect(result.written).toEqual(["provider.acme.loadBalancingMode"]);
 		expect(updates).toHaveLength(1);
+		expect(updates[0]?.providerInstanceId).toBe("com.example.demo/acme");
 		expect(updates[0]?.config.loadBalancingMode).toBe("balanced");
 	});
 
@@ -78,6 +83,7 @@ describe("applyCommandConfigWrites", () => {
 		});
 		await applyCommandConfigWrites({
 			pluginId: "com.example.demo",
+			writes: [{ key: "provider.acme.loadBalancingMode", value: "balanced" }],
 			registry,
 			sink,
 		});
@@ -90,9 +96,11 @@ describe("applyCommandConfigWrites", () => {
 		});
 		const result = await applyCommandConfigWrites({
 			pluginId: "com.example.demo",
+			writes: [{ key: "provider.acme.region", value: null }],
 			registry,
 			sink,
 		});
+		expect(result.cleared).toEqual(["provider.acme.region"]);
 		expect(updates[0]?.config).toEqual({ loadBalancingMode: "priority" });
 	});
 
@@ -101,6 +109,8 @@ describe("applyCommandConfigWrites", () => {
 		await applyCommandConfigWrites({
 			pluginId: "com.example.demo",
 			writes: [
+				{ key: "provider.acme.loadBalancingMode", value: "balanced" },
+				{ key: "provider.acme.region", value: "us-east-1" },
 			],
 			registry,
 			sink,
@@ -144,6 +154,7 @@ describe("applyCommandConfigWrites", () => {
 		await expect(
 			applyCommandConfigWrites({
 				pluginId: "com.example.demo",
+				writes: [{ key: "provider.acme.apiKey", value: "ksk_secret" }],
 				registry,
 				sink,
 			}),
@@ -156,6 +167,7 @@ describe("applyCommandConfigWrites", () => {
 		await expect(
 			applyCommandConfigWrites({
 				pluginId: "com.example.demo",
+				writes: [{ key: "provider.acme.undeclared", value: 1 }],
 				registry,
 				sink,
 			}),
@@ -167,6 +179,7 @@ describe("applyCommandConfigWrites", () => {
 		await expect(
 			applyCommandConfigWrites({
 				pluginId: "com.example.demo",
+				writes: [{ key: "provider.acme.region", value: "x".repeat(17 * 1024) }],
 				registry,
 				sink,
 			}),
@@ -181,6 +194,8 @@ describe("applyCommandConfigWrites", () => {
 			applyCommandConfigWrites({
 				pluginId: "com.example.demo",
 				writes: [
+					{ key: "provider.acme.loadBalancingMode", value: "balanced" },
+					{ key: "provider.acme.apiKey", value: "ksk_secret" },
 				],
 				registry,
 				sink,

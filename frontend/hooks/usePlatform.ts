@@ -59,7 +59,6 @@ export type ProviderCapabilityKey =
 	| "anthropic"
 	| "nug"
 	| "codex"
-	| "cline"
 	| "gemini";
 
 type ChapterContainerRoute =

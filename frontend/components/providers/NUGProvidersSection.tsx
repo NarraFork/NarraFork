@@ -1093,11 +1093,6 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 								value={p.proxy}
 								onChange={(next) => updateProvider(p.id, { proxy: next })}
 							/>
-							<Switch
-								size="xs"
-								onChange={(e) =>
-								}
-							/>
 							<Group gap="xs" align="flex-end">
 								<PasswordInput
 									size="xs"

@@ -4,6 +4,7 @@
  */
 
 import { brandNotificationIconUrl, getCurrentBranding } from "./branding";
+import { clearFaviconAlert, setFaviconAlert } from "./favicon";
 import { type NotificationSoundPrefs, playNotificationSound } from "./notification-sound";
 
 export interface NotificationPrefs extends NotificationSoundPrefs {
@@ -26,7 +27,10 @@ export interface NotificationPrefs extends NotificationSoundPrefs {
 const lastNotifiedAttention = new Map<string, string>();
 
 /** Build the dedup key: attention state + execution generation (if known). */
-function attentionKey(status: "unread" | "waiting", generation?: string): string {
+function attentionKey(
+	status: "unread" | "waiting" | "awaited_question",
+	generation?: string,
+): string {
 	return generation ? `${status}:${generation}` : status;
 }
 
@@ -41,6 +45,31 @@ export function clearNotifiedAttention(narratorId?: string): void {
 }
 
 /**
+ * Async-question attention is independent of narrator status and of other questions.
+ * A decision may arrive without await_ended, and must clear ONLY this question's
+ * favicon/dedup entry, never a concurrent permission, unread output or another wait.
+ */
+export function updateAsyncQuestionAttention(
+	narratorId: string,
+	questionId: string | undefined,
+	awaited: boolean,
+	narratorTitle?: string,
+	prefs?: NotificationPrefs,
+): void {
+	if (!questionId) return;
+	const attentionId = `async-question:${narratorId}:${questionId}`;
+	if (!awaited) {
+		clearNotifiedAttention(attentionId);
+		clearFaviconAlert(attentionId);
+		return;
+	}
+	setFaviconAlert(attentionId, "waiting");
+	if (prefs && narratorTitle) {
+		triggerNotification(attentionId, narratorTitle, "awaited_question", prefs, questionId);
+	}
+}
+
+/**
  * Trigger client-side notifications (PWA + sound) for a narrator status change.
  * Called from RecentTabsWSProvider when a subscribed narrator changes to done/waiting.
  *
@@ -51,7 +80,19 @@ export function clearNotifiedAttention(narratorId?: string): void {
 export function triggerNotification(
 	narratorId: string,
 	narratorTitle: string,
-	status: "unread" | "waiting",
+	/**
+	 * `awaited_question` is an async question the agent is now BLOCKED on via `Await`.
+	 *
+	 * It rides the `notifyOnWaiting` preference rather than one of its own: from the
+	 * user's side the situation is identical to a permission prompt (the session has
+	 * stopped and needs them), so somebody who turned that preference off has already
+	 * said they do not want to be alerted about a stalled session.
+	 *
+	 * It is a distinct value only because the notification BODY differs — "waiting for
+	 * permission" would misdescribe it, and the whole point of this channel is telling
+	 * the user what is wanted without opening the app.
+	 */
+	status: "unread" | "waiting" | "awaited_question",
 	prefs: NotificationPrefs,
 	generation?: string,
 ): void {
@@ -63,7 +104,7 @@ export function triggerNotification(
 
 	// Check per-status toggle
 	if (status === "unread" && !prefs.notifyOnDone) return;
-	if (status === "waiting" && !prefs.notifyOnWaiting) return;
+	if ((status === "waiting" || status === "awaited_question") && !prefs.notifyOnWaiting) return;
 
 	// Record only states we actually notify for, so a disabled toggle doesn't
 	// mask a later genuine transition once the toggle is re-enabled.
@@ -79,7 +120,9 @@ export function triggerNotification(
 		const body =
 			status === "unread"
 				? `${narratorTitle} has finished`
-				: `${narratorTitle} is waiting for permission`;
+				: status === "awaited_question"
+					? `${narratorTitle} stopped and is waiting for your answer`
+					: `${narratorTitle} is waiting for permission`;
 		try {
 			// Title and icon follow the instance branding. This matters more here than
 			// anywhere else in the app: a desktop notification fires precisely when the

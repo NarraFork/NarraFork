@@ -23,6 +23,7 @@ NarraFork 插件系统采用 **VS Code 风格的 Manifest / Contribution / Activ
 
 当前代码已经提供了重要基础，但还没有通用插件宿主：
 
+- `server/main.ts` 是后端组合根，负责 HTTP/WS、MCP、恢复、调度、Gateway、容器代理和优雅退出。
 - `server/lib/agent/provider.ts` 定义了较宽的进程内 `ProviderAdapter`；provider 解析仍集中在核心设置和 `createProviderByName()`。
 - `server/lib/event-bus.ts` 提供了丰富但内部化的类型事件；它不是带授权和持久化能力的公共事件日志。
 - `server/lib/mcp/manager.ts` 已经提供外部进程/远程连接、工具发现、取消、重连和 shutdown 的实现经验。

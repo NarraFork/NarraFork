@@ -41,6 +41,7 @@
 
 ### 2.1 后端与启动
 
+- **[事实]** `server/main.ts` 是组合根，负责 HTTP/WS、MCP、调度器、容器代理、恢复流程和优雅退出；非核心子系统已经采用“核心先启动、随后异步初始化”的风格。
 - **[事实]** `server/app.ts` 静态导入并挂载 Hono 路由，`requireAuth` 的全局门禁顺序由核心决定，目前没有第三方任意注册路由或 middleware 的稳定接口。
 - **[事实]** 现有优雅退出使用带硬超时的 `shutdownStep()`，并对终端、MCP、浏览器、Codex WebSocket 等子系统逐项清理。
 - **[建议]** Plugin Manager 接入同一启动/退出模式，但插件启动失败、超时或崩溃不得阻止核心健康检查、登录和管理页面。
@@ -48,6 +49,7 @@
 ### 2.2 Provider 与 Agent Loop
 
 - **[事实]** `server/lib/agent/provider.ts` 中的 `ProviderAdapter` 是进程内 TypeScript 接口，包含 history 转换、tool 格式化、流式 `chat`、多种 `generate`、usage、reasoning metadata、取消信号等宽协议面。
+- **[事实]** 当前 provider 解析由 settings、provider config getter、`createProviderByName()` 和 `resolveProviderAndModel()` 完成；已有 Codex、Anthropic、OpenAI、NUG、Gemini 等适配器。
 - **[事实]** `ParsedStreamEvent` 已包含文本、reasoning、tool call chunk、usage、错误状态、Web Search、图片生成和 provider-specific metadata 等字段。
 - **[事实]** `getVisibleModels()`、context window、aggregation、sticky provider 和 provider prefix migration 依赖现有 settings/registry 逻辑。
 - **[建议]** 插件 provider 不直接进入 Agent Loop；由 `ProviderRegistry` 与 `RemoteProviderAdapter` 在核心侧完成 canonical history、tool schema、`AbortSignal`、事件校验和错误映射。

@@ -1,4 +1,4 @@
-import type { PendingPermission } from "@frontend/types/narrator";
+import type { AsyncQuestion, PendingPermission } from "@frontend/types/narrator";
 import type { BackgroundTaskListDelta } from "@shared/background-task-list";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
@@ -23,6 +23,7 @@ import {
 	narratorWSManager,
 	type SubscriptionHandle,
 } from "../lib/narrator-ws-manager";
+import { useAsyncQuestionListChange } from "./useAsyncQuestions";
 
 function nonEmptyString(value: unknown): string | null {
 	if (typeof value !== "string") return null;
@@ -196,6 +197,10 @@ export interface CompactProgressEvent extends ProgressSnapshot {
 	messageId: string;
 	isSegment: boolean;
 	mode: "blocking" | "background";
+	/** 1-based ordinal of the retry now in flight (0 = not retrying). */
+	retryCount: number;
+	/** Error that triggered the current retry, when retryCount > 0. */
+	retryError?: string;
 }
 
 export function coerceCompactProgressEvent(
@@ -203,6 +208,10 @@ export function coerceCompactProgressEvent(
 ): CompactProgressEvent | null {
 	if (typeof data.messageId !== "string" || !data.messageId) return null;
 	if (typeof data.outputChars !== "number" || !Number.isFinite(data.outputChars)) return null;
+	const retryCount =
+		typeof data.retryCount === "number" && Number.isFinite(data.retryCount)
+			? Math.max(0, Math.floor(data.retryCount))
+			: 0;
 	return {
 		messageId: data.messageId,
 		// Payloads from an older server carry no phase/thinkingChars, which
@@ -210,6 +219,12 @@ export function coerceCompactProgressEvent(
 		...coerceProgressSnapshot(data),
 		isSegment: data.isSegment === true,
 		mode: data.mode === "background" ? "background" : "blocking",
+		// Older servers never broadcast retry state, which normalizes to "not
+		// retrying" — exactly their pre-existing behaviour.
+		retryCount,
+		...(retryCount > 0 && typeof data.retryError === "string" && data.retryError
+			? { retryError: data.retryError }
+			: {}),
 	};
 }
 
@@ -383,6 +398,14 @@ interface NarratorWSCallbacks {
 		data: PermissionRoutingFields & { requestId: string; toolUseId: string },
 	) => void;
 	/**
+	 * An asynchronous AskUserQuestion changed state. Carries the FULL row rather than a
+	 * delta, so a consumer that missed an event still converges on the correct state.
+	 */
+	onAsyncQuestionChanged?: (data: {
+		change: "opened" | "answered" | "dismissed" | "withdrawn" | "awaited" | "await_ended";
+		question: AsyncQuestion;
+	}) => void;
+	/**
 	 * Live progress of a running reflection gate. Fires on a throttled cadence, so
 	 * consumers must treat it as render-only state — routing it through a document
 	 * rebuild would re-layout the list several times per second.
@@ -484,6 +507,16 @@ interface NarratorWSCallbacks {
 		mode?: "blocking" | "background",
 		replacement?: MessageReplacementAliases,
 	) => void;
+	/**
+	 * Fired on a `compact_failed` event, BEFORE the folded `onCompactDone` call
+	 * (which still runs so consumers that only track lifecycle keep working).
+	 * `error` is the failure detail when the server provided one.
+	 */
+	onCompactFailed?: (
+		error: string | undefined,
+		mode: "blocking" | "background",
+		messageId: string | undefined,
+	) => void;
 	onSegmentCompactHide?: (hiddenMessageIds: string[]) => void;
 	onContextUsage?: (
 		percentage: number,
@@ -571,6 +604,7 @@ interface NarratorWSCallbacks {
 		 *  here is what forced retry toasts to show raw English provider text. */
 		diagnostics?: Record<string, unknown>;
 	}) => void;
+	/** Leaked XML tool-call diagnostic. Not persisted. */
 	onLeakedToolCall?: (info: {
 		phase: "stream_captured" | "recovered" | "unrecovered";
 		apiRequestId: string;
@@ -966,6 +1000,22 @@ export function useNarratorWS(
 							toolUseId: data.toolUseId as string,
 						});
 						break;
+					case "async_question_changed": {
+						const question = data.question as AsyncQuestion | undefined;
+						if (question?.id) {
+							callbackOwner.callbacks.onAsyncQuestionChanged?.({
+								change: data.change as
+									| "opened"
+									| "answered"
+									| "dismissed"
+									| "withdrawn"
+									| "awaited"
+									| "await_ended",
+								question,
+							});
+						}
+						break;
+					}
 					case "reflection_progress": {
 						const progress = coerceReflectionProgressEvent(data);
 						if (progress) callbackOwner.callbacks.onReflectionProgress?.(progress);
@@ -1145,7 +1195,19 @@ export function useNarratorWS(
 						break;
 					}
 					case "compact_done":
+						callbackOwner.callbacks.onCompactDone?.(
+							data.contextPercentAfter as number | undefined,
+							data.isSegment as boolean | undefined,
+							data.mode === "background" ? "background" : "blocking",
+							coerceMessageReplacementAliases(data),
+						);
+						break;
 					case "compact_failed":
+						callbackOwner.callbacks.onCompactFailed?.(
+							typeof data.error === "string" && data.error ? data.error : undefined,
+							data.mode === "background" ? "background" : "blocking",
+							typeof data.messageId === "string" && data.messageId ? data.messageId : undefined,
+						);
 						callbackOwner.callbacks.onCompactDone?.(
 							data.contextPercentAfter as number | undefined,
 							data.isSegment as boolean | undefined,
@@ -1668,7 +1730,18 @@ export interface NarratorListWSEvent {
 		| "presence"
 		| "terminalCount"
 		| "containerStatus"
-		| "draft";
+		| "draft"
+		/**
+		 * An agent started or stopped BLOCKING on an async question (`Await`).
+		 *
+		 * Carried on the list stream, not just the panel's, because the notification that
+		 * matters here fires while the user is looking at something else — the whole
+		 * reason they need telling. It is deliberately not folded into `status`: the
+		 * narrator's status does not change (see `awaitAsyncQuestion`), and writing
+		 * `waiting` here would make every consumer of that field believe a pending
+		 * permission exists.
+		 */
+		| "awaitedQuestion";
 	status?: string;
 	substatus?: string[];
 	/** Execution generation for the current/last turn — used to dedup notifications per turn. */
@@ -1684,6 +1757,10 @@ export interface NarratorListWSEvent {
 	activeTerminalCount?: number;
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 	hasDraft?: boolean;
+	/** `awaitedQuestion` only: true when an agent just started blocking on a question. */
+	awaited?: boolean;
+	/** `awaitedQuestion` only: dedup key, so a resubscribe replay does not re-alert. */
+	questionId?: string;
 }
 
 export function useNarratorsListWS(
@@ -1691,6 +1768,7 @@ export function useNarratorsListWS(
 	onUpdate: (narratorId: string, event: NarratorListWSEvent) => void,
 	onGlobalEvent?: (event: { type: string; [key: string]: unknown }) => void,
 ) {
+	const applyQuestionChange = useAsyncQuestionListChange();
 	const onUpdateRef = useRef(onUpdate);
 	onUpdateRef.current = onUpdate;
 	const onGlobalEventRef = useRef(onGlobalEvent);
@@ -1740,6 +1818,7 @@ export function useNarratorsListWS(
 					"title_updated",
 					"permission_mode_changed",
 					"presence_update",
+					"async_question_changed",
 				],
 			},
 			(data) => {
@@ -1771,12 +1850,15 @@ export function useNarratorsListWS(
 							type: "presence",
 							viewers: data.viewers as NarratorListWSEvent["viewers"],
 						});
+				} else if (data.type === "async_question_changed") {
+					const event = applyQuestionChange(data);
+					if (nId && event) onUpdateRef.current(nId, event);
 				}
 			},
 		);
 
 		// We don't return cleanup here — that's handled by the mount-only effect below
-	}, [idsKey]);
+	}, [idsKey, applyQuestionChange]);
 
 	// Mount-only: global event listener + connection tracking, cleanup on unmount
 	useEffect(() => {

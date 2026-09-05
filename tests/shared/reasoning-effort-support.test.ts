@@ -153,6 +153,7 @@ describe("bareModelForEffort", () => {
 		// The backend peels only ONE prefix off `nug:anthropic:GLM-5.1`, leaving the
 		// channel attached, while the frontend reads `GLM-5.1` from the catalog.
 		expect(bareModelForEffort("anthropic:GLM-5.1")).toBe("GLM-5.1");
+		expect(bareModelForEffort("anthropic:claude-opus-5")).toBe("claude-opus-5");
 		expect(bareModelForEffort("codex:gpt-5.5")).toBe("gpt-5.5");
 		expect(bareModelForEffort("responses:GLM-5.1")).toBe("GLM-5.1");
 		expect(bareModelForEffort("openai:GLM-5.1")).toBe("GLM-5.1");
@@ -202,6 +203,7 @@ describe("modelAcceptsReasoningEffort", () => {
 	test("applies the built-in Claude rule through a channel prefix too", () => {
 		// A pre-4.6 Claude routed through a channel must stay excluded, or the
 		// official API 400s on output_config.effort.
+		expect(modelAcceptsReasoningEffort("anthropic:claude-sonnet-4.5")).toBe(false);
 		expect(modelAcceptsReasoningEffort("anthropic:claude-sonnet-4.5")).toBe(false);
 		expect(modelAcceptsReasoningEffort("anthropic:claude-opus-4-6")).toBe(true);
 	});

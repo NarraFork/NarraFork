@@ -1,6 +1,8 @@
 /**
  * Re-export shim for bounded API error diagnostics.
  *
+ * The implementation moved to `@shared/agent-protocol/error-diagnostics` so the
+ * shared protocol layer — which bundled plugin code reuses — has no
  * `server/` imports. Host importers keep using this path unchanged.
  */
 export {
@@ -12,3 +14,6 @@ export {
 	normalizeApiRequestDiagnostics,
 	normalizeDiagnosticHeaders,
 	parseErrorDiagnostics,
+	parseUpstreamErrorEnvelope,
+	type UpstreamErrorEnvelope,
+} from "@shared/agent-protocol/error-diagnostics";

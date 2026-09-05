@@ -2,6 +2,7 @@ import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { getSubagentType, isSubagentVariant, parseSubstatus } from "@server/lib/narrator-utils";
 import type { Locale } from "@server/lib/prompt-i18n";
+import { claimAgentMessageOrigin, registerAgentMessageOrigin } from "./agent-message-origin";
 import {
 	type AgentReplyScope,
 	type AgentReplyWaitHandle,
@@ -1275,6 +1276,18 @@ async function sendSubagentMessageDetailedWithRun(
 				message,
 				input.locale as Locale,
 			);
+			// The prefix above is for the MODEL. The recipient's UI must not have to parse
+			// prose to learn who spoke, so the same identity is also registered
+			// STRUCTURALLY for the row persistence is about to write, keyed on the text
+			// exactly as delivered — see agent-message-origin.ts for why this is a registry
+			// rather than an argument threaded through the delivery routes.
+			const senderIdentity = {
+				id: scope.caller.id,
+				title: scope.caller.title,
+				label: agentLabelFromNarrator(scope.caller, scope.teamParentId),
+				type: scope.callerIsSubagent ? callerSubagentType(scope.caller) : null,
+				isParent: !scope.callerIsSubagent,
+			};
 
 			if (fresh.status === "working" || fresh.status === "waiting") {
 				const buffered = pushSubagentBufferedMessage(fresh.id, deliveredMessage, {
@@ -1286,6 +1299,10 @@ async function sendSubagentMessageDetailedWithRun(
 						buffered.full ? "Target message queue is full" : "Message was not buffered",
 					);
 				}
+				// Registered only once the message is actually queued: a rejected push never
+				// reaches persistence, and leaving attribution behind for it would hand a
+				// sender identity to whatever message claims that key next.
+				registerAgentMessageOrigin(fresh.id, deliveredMessage, senderIdentity);
 				let interruptNote = "";
 				let interrupted: boolean | undefined;
 				if (input.doInterrupt) {
@@ -1320,15 +1337,26 @@ async function sendSubagentMessageDetailedWithRun(
 			}
 
 			const bgAbort = new AbortController();
-			await resumeSubagent({
-				subagentId: fresh.id,
-				intent: "follow_up",
-				actor: "parent_agent",
-				prompt: deliveredMessage,
-				createdBy: input.userId ?? null,
-				signal: bgAbort.signal,
-				locale: input.locale as Locale,
-			});
+			// Registered BEFORE the resume, not after: `resumeSubagent` persists the prompt
+			// synchronously inside this call, so an attribution registered afterwards would
+			// arrive too late and the row would be written as an unattributed user turn.
+			registerAgentMessageOrigin(fresh.id, deliveredMessage, senderIdentity);
+			try {
+				await resumeSubagent({
+					subagentId: fresh.id,
+					intent: "follow_up",
+					actor: "parent_agent",
+					prompt: deliveredMessage,
+					createdBy: input.userId ?? null,
+					signal: bgAbort.signal,
+					locale: input.locale as Locale,
+				});
+			} catch (resumeError) {
+				// A resume that never persisted the prompt leaves the attribution unclaimed;
+				// drop it so it cannot be picked up by a later message with identical text.
+				claimAgentMessageOrigin(fresh.id, deliveredMessage);
+				throw resumeError;
+			}
 			if (replyHandle) {
 				const deliveryNote = `Sent to ${label}; subagent started asynchronously and a Send reply was requested.`;
 				replyHandle.updateSnapshot({ deliveryNote });

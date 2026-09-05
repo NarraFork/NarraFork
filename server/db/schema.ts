@@ -1532,6 +1532,7 @@ export const narratorToolCalls = sqliteTable(
 		cacheReadCost: real("cache_read_cost").notNull().default(0),
 		totalCost: real("total_cost").notNull().default(0),
 		// Provider and model info
+		provider: text("provider"), // anthropic, openai, codex, nug, gemini
 		model: text("model"), // claude-3-5-sonnet-20241022, gpt-4o, etc.
 		// Subagent result binding: points to the subagent's assistant message that produced the result
 		resultMessageId: text("result_message_id"),
@@ -1554,6 +1555,73 @@ export const narratorToolCalls = sqliteTable(
 		 * 3.8s for an unindexed `ORDER BY ... LIMIT 51` on the same data.
 		 */
 		index("idx_toolcalls_started_at").on(table.startedAt, table.id),
+	],
+);
+
+// === narrator_questions ===
+/**
+ * Asynchronous AskUserQuestion records — questions the agent asked WITHOUT stopping.
+ *
+ * ## Why a table and not `narrator_tool_calls`
+ *
+ * A synchronous AskUserQuestion never needs storage: the whole interaction lives
+ * inside one suspended promise in `pendingPermissions`, and the answer arrives before
+ * the tool has even executed. An asynchronous one inverts that — the tool call is
+ * already `success` and long gone by the time the user answers, so "this question is
+ * still open" has to survive independently. `narrator_tool_calls.status` cannot carry
+ * it: that enum belongs to the agent-loop lifecycle, where `success` means the call
+ * finished, which is exactly what happened.
+ *
+ * Being a row rather than in-memory state is also what makes the async path restart-safe
+ * for free: nothing about answering reads process memory, so no
+ * `narrator_tool_continuations` entry and no recovery path is needed.
+ *
+ * ## Grain
+ *
+ * One row per tool CALL, not per question — a single call carries 1-4 questions and
+ * `questions_json` holds them all, mirroring the tool's own input shape (and the
+ * `answers` map keyed by each question's `question` key). The unique index on
+ * `tool_call_id` is what makes creation idempotent: a retried or replayed tool
+ * execution cannot produce a second row for the same call.
+ */
+export const narratorQuestions = sqliteTable(
+	"narrator_questions",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		/** Idempotency anchor — see the unique index below. */
+		toolCallId: text("tool_call_id")
+			.notNull()
+			.references(() => narratorToolCalls.id, { onDelete: "cascade" }),
+		toolUseId: text("tool_use_id").notNull(),
+		/** Question definitions, same shape as AskUserQuestion's `questions` input. */
+		questionsJson: text("questions_json", { mode: "json" }).notNull(),
+		/** null while unanswered. Same shape as the synchronous path's `answers`. */
+		answersJson: text("answers_json", { mode: "json" }),
+		annotationsJson: text("annotations_json", { mode: "json" }),
+		status: text("status", {
+			enum: ["open", "answered", "dismissed", "withdrawn"],
+		})
+			.notNull()
+			.default("open"),
+		/**
+		 * `agent_async` — the agent chose to ask without blocking.
+		 * `user_deferred` — the user turned a blocking prompt into a deferred one.
+		 */
+		origin: text("origin", { enum: ["agent_async", "user_deferred"] })
+			.notNull()
+			.default("agent_async"),
+		/** The injected message row carrying the answer back, for provenance. */
+		answerMessageId: text("answer_message_id"),
+		decidedBy: text("decided_by"),
+		decidedAt: text("decided_at"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_narrator_questions_tool_call").on(table.toolCallId),
+		index("idx_narrator_questions_narrator_status").on(table.narratorId, table.status),
 	],
 );
 
@@ -2963,6 +3031,7 @@ export const apiRequests = sqliteTable(
 		costUsd: real("cost_usd"),
 		// 上下文使用率
 		contextPercent: real("context_percent"),
+		// Metering（NUG）
 		meterUsage: real("meter_usage"),
 		meterUnit: text("meter_unit"),
 		// 错误信息（请求失败时记录）
@@ -2998,6 +3067,7 @@ export const apiRequests = sqliteTable(
 // equivalent-consumption figure, not an amount actually billed.
 //
 // SCOPE — this is NOT a full ledger of the deployment's spend. Rows only exist
+// for providers that have credential management (codex). Anthropic and
 // OpenAI direct connections carry credentialId = null (see
 // usage-history-service.getCredentialName) and are deliberately not rolled up
 // here: a synthetic bucket would give every unrelated keyless provider one

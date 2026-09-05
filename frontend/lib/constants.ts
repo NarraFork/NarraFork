@@ -182,6 +182,7 @@ export function groupModelsByProvider(
 	for (const m of models) {
 		if (seen.has(m.value)) continue;
 		seen.add(m.value);
+		const prov = m.provider ?? "unknown";
 		if (!groups.has(prov)) groups.set(prov, []);
 		const suffix = m.rateMultiplier != null ? ` (×${m.rateMultiplier})` : "";
 		groups.get(prov)?.push({ value: m.value, label: `${m.label}${suffix}` });

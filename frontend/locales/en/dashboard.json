@@ -27,5 +27,6 @@
 	"terminalManagement": "Terminal Management",
 	"recentNarrators": "Recently Active Narrators",
 	"chapterSession": "Chapter session",
-	"standaloneSession": "Standalone session"
+	"standaloneSession": "Standalone session",
+	"pendingQuestions": "Questions waiting for you"
 }

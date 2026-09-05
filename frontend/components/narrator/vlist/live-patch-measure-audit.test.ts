@@ -753,6 +753,24 @@ describe("live-patch audit: fields that are height-NEUTRAL (single header row)",
 		expect(extractDataRevision({ status: "running" })).toBe("s:running");
 	});
 
+	it("a drilled-in card timeout is keyed even though its height is unchanged", async () => {
+		// Low LOD wraps the tool in a trace. Its expanded `card` is independently
+		// measured and cached, so this must key the nested timeout just like a
+		// standalone tool card; otherwise the server update lands but the drill-down
+		// keeps painting the old `/ timeout` suffix until a full refresh.
+		const { extractDataRevision } = await cacheMod();
+		const trace = (timeoutMs: number) => ({
+			items: [
+				{
+					key: "tool-tu-1",
+					status: "running",
+					card: { status: "running", timeoutMs },
+				},
+			],
+		});
+		expect(extractDataRevision(trace(120_000))).not.toBe(extractDataRevision(trace(1_200_000)));
+	});
+
 	it("a long header summary does not change the measured height (header truncates)", async () => {
 		// tool_completed may carry an updatedInput that lengthens the summary.
 		const { measureToolCall } = await measureMod();

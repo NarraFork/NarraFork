@@ -126,4 +126,81 @@ describe("summaryGenerate retry progress", () => {
 		expect(result.text).toBe("ok");
 		expect(generateAttempts).toBe(2);
 	});
+
+	test("onRetryScheduled fires only when a retry is actually scheduled", async () => {
+		const scheduled: Array<{
+			attempt: number;
+			maxRetries: number;
+			delayMs: number;
+			error: string;
+		}> = [];
+		generateImpl = async () => {
+			if (generateAttempts < 3) throw new Error("Provider overloaded, try again");
+			return { text: "late summary" };
+		};
+
+		const result = await summaryGenerate(
+			"text",
+			"system",
+			undefined,
+			undefined,
+			undefined,
+			"anthropic:claude-haiku",
+			undefined,
+			false,
+			undefined,
+			undefined,
+			(info) => scheduled.push(info),
+		);
+
+		expect(result.text).toBe("late summary");
+		expect(generateAttempts).toBe(3);
+		// Two failed attempts → two scheduled retries, with 1-based ordinals and the
+		// triggering error. The SUCCESSFUL third attempt never fires the callback.
+		expect(scheduled).toEqual([
+			{ attempt: 1, maxRetries: 3, delayMs: 1, error: "Provider overloaded, try again" },
+			{ attempt: 2, maxRetries: 3, delayMs: 1, error: "Provider overloaded, try again" },
+		]);
+	});
+
+	test("onRetryScheduled does not fire for a first-attempt success or a doomed chain", async () => {
+		const scheduled: number[] = [];
+		// Success on attempt 1: no retry is ever scheduled.
+		await summaryGenerate(
+			"text",
+			"system",
+			undefined,
+			undefined,
+			undefined,
+			"anthropic:claude-haiku",
+			undefined,
+			false,
+			undefined,
+			undefined,
+			(info) => scheduled.push(info.attempt),
+		);
+		expect(scheduled).toEqual([]);
+
+		// Every attempt fails: exactly maxRetries retries are scheduled, then the
+		// wrapper throws WITHOUT scheduling one more.
+		generateImpl = async () => {
+			throw new Error("Provider overloaded, try again");
+		};
+		await expect(
+			summaryGenerate(
+				"text",
+				"system",
+				undefined,
+				undefined,
+				undefined,
+				"anthropic:claude-haiku",
+				undefined,
+				false,
+				undefined,
+				undefined,
+				(info) => scheduled.push(info.attempt),
+			),
+		).rejects.toThrow(/overloaded/);
+		expect(scheduled).toEqual([1, 2, 3]);
+	});
 });

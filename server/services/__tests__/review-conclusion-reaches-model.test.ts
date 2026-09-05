@@ -7,7 +7,7 @@
  *
  * Every provider's history builder POPS the last top-level user row, on the contract
  * that the caller sends it as the current turn (`buildAnthropicHistory`, and the
- * identical three lines in openai/gemini/cline). An ordinary user message satisfies that
+ * identical three lines in openai/gemini). An ordinary user message satisfies that
  * contract because whoever wrote the row also passes its text into `runAgentLoop`. The
  * review card's "handle" button starts `runAgentLoop(active, "")` — deliberately, since
  * the row is supposed to already be in history — so the conclusion was popped as "the

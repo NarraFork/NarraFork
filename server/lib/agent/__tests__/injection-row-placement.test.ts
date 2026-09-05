@@ -12,6 +12,7 @@
  *
  *  1. The injected text is PRESENT and lands after the tool results it follows.
  *  2. `tool_use` ↔ `tool_result` pairing survives. A stray user turn inserted between
+ *     an assistant's tool_use and its result is a 400 from Anthropic, and on some
  *     triggers a synthetic assistant `"OK"` that pushes the real message out of place.
  *
  * These are asserted BEFORE the producers move, against the `sys` rows the existing
@@ -377,47 +378,4 @@ describe("OpenAI — an injected sys row", () => {
 	});
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
 
-	async function build(rows: Row[]) {
-		// `currentSource` is the 4th parameter; the runtime (image resolution, which these
-		// text-only rows never need) is the 5th.
-	}
-
-	test("mid-history: reaches the model once, and no synthetic OK is invented", async () => {
-		const { history } = await build(historyWithInjection());
-		expect(occurrences(history, INJECTION)).toBe(1);
-		// user→assistant alternation. A mid-history sys row is merged into the adjacent
-		// user turn instead, so no filler should appear.
-		expect(occurrences(history, "OK")).toBe(0);
-	});
-
-	test("mid-history: strict user→assistant alternation is preserved", async () => {
-		const { history } = await build(historyWithInjection());
-		const kinds = (history as unknown as Array<Record<string, unknown>>).map((entry) =>
-		);
-		for (let i = 1; i < kinds.length; i++) expect(kinds[i]).not.toBe(kinds[i - 1]);
-	});
-
-	test("mid-history: the tool result keeps its own id", async () => {
-		const { history } = await build(historyWithInjection());
-		const ids = (
-			history as Array<{
-				};
-			}>
-		expect(ids.map((r) => r.toolUseId)).toEqual(["tool_1"]);
-	});
-
-	test("trailing: an injection at the end becomes the current turn, not history", async () => {
-		// current message empty and force a synthetic "OK", so it is lifted into
-		// trailingUserText. Phase 3 relies on this, so it is pinned here.
-		const { trailingUserText, history } = await build([
-			userRow(),
-			assistantWithTool("a1", "tool_1"),
-			sysRow(),
-		]);
-		expect(trailingUserText).toContain(INJECTION);
-		expect(occurrences(history, INJECTION)).toBe(0);
-	});
-});

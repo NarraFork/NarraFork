@@ -2,10 +2,12 @@ import { describe, expect, it } from "bun:test";
 import { ensureNonEmptySchema } from "../../../../server/lib/agent/tool-registry";
 
 /**
+ * Some providers truncate a tool definition whose schema declares no required
  * parameter, so `ensureNonEmptySchema` has to mark SOMETHING required.
  *
  * It used to promote `Object.keys(properties)[0]`, which lied about the tool's
  * contract. The visible fallout: ExitPlanMode's first declared property was the
+ * advisory `allowedPrompts`, so on NUG it became the tool's ONLY required
  * parameter while `inline_plan` — the field that actually carries the plan —
  * stayed optional. Models fabricated permission declarations to fill it, and
  * that invented list showed up in the tool-call inspector.

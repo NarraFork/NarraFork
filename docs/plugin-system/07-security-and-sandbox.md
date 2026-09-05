@@ -23,6 +23,7 @@
 
 ### 1.1 核心进程和子进程
 
+- **[当前事实]** `server/main.ts` 在同一个 Bun 进程中承担 HTTP/WS、数据库、MCP、调度器、Gateway、容器代理和多种恢复任务；任意同步长任务或无限 JSON/日志都可能拖慢所有请求。
 - **[当前事实]** `server/lib/mcp/manager.ts` 已实现外部 MCP server 的连接状态、工具发现、断线重连、工具调用取消和 shutdown；MCP 是协议适配器，不是通用安全沙箱。
 - **[当前事实]** `server/lib/mcp/transports.ts` 的 stdio transport 当前会把 `process.env` 与配置环境合并传给 MCP 子进程，并使用 `stderr: "pipe"`；插件运行时不应照搬全部环境继承，因为其中可能有 provider key、JWT、代理和本机配置。
 - **[当前事实]** `server/lib/spawn.ts` 的 `safeSpawn` 使用参数数组启动进程，支持硬超时、AbortSignal、watchdog、stdout/stderr draining、每流最大捕获字节数和进程树清理；Windows 会使用 `taskkill /T /F`，Unix 可递归终止子进程。
@@ -31,6 +32,7 @@
 ### 1.2 配置、密钥与路径
 
 - **[当前事实]** settings 默认存放在 `~/.narrafork/settings.json`，根目录可以通过 `NARRAFORK_HOME` 覆盖；settings 保存时采用临时文件加原子 rename，并使用 `0600` 文件模式。
+- **[当前事实]** settings 内含 JWT secret、provider API keys、MCP env/headers、Codex 凭据路径、代理和其他敏感运行参数；这些内容都不应作为插件的默认环境变量或 UI bootstrap payload。
 - **[当前事实]** Agent/Bash/远程执行能力已经有工作目录、超时、输出大小和设备路由约束；项目文档明确说明路径 allowlist 不是 shell/PTY 的 OS sandbox。
 - **[设计建议]** 插件只能通过公共 Query/Command/Storage/Config/Secret API 获得脱敏 DTO，不能得到 `db`、Drizzle row、完整 `ToolContext`、内部 service、JWT、用户 Bearer token 或真实凭据文件路径。
 
@@ -160,6 +162,7 @@ effectiveCapabilities =
 
 ### 6.0 当前实现状态
 
+> **[当前事实]** 截至本文更新，`manifest.permissions.network` 字段**仅用于声明与审计，不是运行时强制的沙箱边界**。`local-process` runner 继承宿主完整网络栈，即使 manifest 声明了严格的域名 allowlist，也没有任何运行时机制过滤出站连接。
 >
 > 强制 allowlist 需要 Linux network namespace（netns + iptables owner-match）或 Podman runner 的 `--network` 隔离。这是独立的大型工程，不应依赖当前字段的存在而假设已有强制。
 >
@@ -205,17 +208,17 @@ effectiveCapabilities =
 `uninspectedPermissionSchema` 注释明确记录宿主没有任何 reader，插件进程的网络能力来自操作系统。
 因此插件在技术上**可以**监听本机端口，不会被运行时拦截。
 
-`examples/plugins/cline-external` 是第一个真正依赖这一点的插件，如实记录为已知例外：
+已有插件依赖这一点做 OAuth 回调接收，如实记录为已知例外：
 
-- **为什么需要**：Cline 的 OAuth 授权流把凭据回传到一个 `callback_url`。该 URL 随授权请求发往
+- **为什么需要**：OAuth 授权流把凭据回传到一个 `callback_url`。该 URL 随授权请求发往
   上游，必须与实际监听的地址端口一致，所以无法用宿主端点代收，也不能静默改端口。
-- **风险面收窄**：只绑 `127.0.0.1`（不是 `0.0.0.0`）；只在一次登录进行中开启；单一固定端口
-  19876；5 分钟超时后自动关闭；`deactivate` 与 `shutdown` 必须 `server.stop(true)`。
+- **风险面收窄**：只绑 `127.0.0.1`（不是 `0.0.0.0`）；只在一次登录进行中开启；固定端口；
+  超时后自动关闭；`deactivate` 与 `shutdown` 必须 `server.stop(true)`。
 - **不可用时如实上报**：Podman runner 下 loopback 不在宿主命名空间内，浏览器回调打不到。
-  插件的 `status` 命令返回三态 `browserAuth: "available" | "port_busy" | "unsupported"`，
+  插件应提供三态能力上报（如 `browserAuth: "available" | "port_busy" | "unsupported"`），
   UI 据此隐藏按钮并引导用户改用「粘贴回调 URL」路径——该路径不依赖任何监听端口，
   是远程部署与容器环境下的正式方案，不是降级兜底。
-- **端口冲突**：内置 Cline 适配器使用同一端口。冲突时返回明确的 `PORT_IN_USE`，
+- **端口冲突**：冲突时返回明确的 `PORT_IN_USE`，
   不静默换端口。
 
 **这条先例的代价**：后续插件可以引用它申请同类能力。若要真正约束，应当在 runner 层实现
@@ -240,6 +243,7 @@ effectiveCapabilities =
 - `filesystem.workspace.read`/`write` 必须绑定具体 project/chapter/worktree 和规范化相对路径；不要只授予“用户 home”。
 - 路径先 `resolve/realpath`，再做 containment；同时检查父目录、符号链接、junction、reparse point 和路径大小写等价。
 - 写入操作应使用宿主文件 API，由宿主检查目标 scope、大小、文件类型、覆盖策略和审计；不把真实 root path 当作权限证明。
+- 插件不能直接访问 `.narrafork/narrafork.db*`、`settings.json`、`tls/`、`codex-credentials.json`、uploads、shares、其他插件 data 或 Git 元数据目录，除非未来为某个具体公共 API 明确建模。
 - 归档解压、文件预览、哈希、sanitize 和大文件传输需要大小上限或流式路径，不在核心请求路径进行无界同步处理。
 
 ### 7.2 workspace 写权限

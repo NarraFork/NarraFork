@@ -26,6 +26,7 @@ const RESUMABLE_DIAGNOSTICS: ApiRequestDiagnostics = {
 	resumable: true,
 };
 
+const RESUMABLE_MESSAGE = "NUG 上游流读取失败: event stream ended unexpectedly: unexpected EOF";
 
 function resumableErrorEvent(): ParsedStreamEvent {
 	return {

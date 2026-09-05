@@ -17,7 +17,6 @@ import { localBackend, setRemoteBackendResolver } from "../../lib/agent/executio
 import type { ToolExecutionTarget } from "../../lib/agent/types";
 import type { ExecutionTargetContext } from "../execution-policy/types";
 import type { PendingDangerReflection, PendingExecutionTarget } from "../narrator-session-state";
-import { deleteConclusionFileId, setConclusionFileId } from "../subagent-conclusion";
 
 const { db, sqlite } = getTestDb();
 
@@ -74,8 +73,10 @@ mock.module("../narrator-service", () => ({
 }));
 
 const {
+	classifyDanger,
 	confirmDangerReflection,
 	createDangerFingerprint,
+	deferPendingQuestion,
 	handlePermission,
 	reprocessAllPendingPermissions,
 	resolvePermission,
@@ -887,7 +888,6 @@ describe("Dynamic Spec writes are never redirected to a filesystem path", () => 
 		specPath: string;
 		traits?: string[];
 		planFileId?: string;
-		conclusion?: boolean;
 	}): Promise<PermissionResult> {
 		const id = `spec-redirect-${input.label}`;
 		const toolUse = `spec-redirect-tool-use-${input.label}`;
@@ -906,24 +906,17 @@ describe("Dynamic Spec writes are never redirected to a filesystem path", () => 
 		if (input.planFileId) {
 			activeNarrators.set(id, { _planFileId: input.planFileId } as never);
 		}
-		if (input.conclusion) {
-			setConclusionFileId(id, `conclusion-${input.label}`, "/local/work");
-		}
-		try {
-			return await handlePermission(
-				id,
-				new AbortController().signal,
-				"Write",
-				toolInput,
-				toolUse,
-				"/local/work",
-				"en",
-				undefined,
-				{ executionBackend: localBackend, executionTarget: specTarget(input.specPath) },
-			);
-		} finally {
-			if (input.conclusion) deleteConclusionFileId(id);
-		}
+		return await handlePermission(
+			id,
+			new AbortController().signal,
+			"Write",
+			toolInput,
+			toolUse,
+			"/local/work",
+			"en",
+			undefined,
+			{ executionBackend: localBackend, executionTarget: specTarget(input.specPath) },
+		);
 	}
 
 	function expectAllowedPath(result: PermissionResult, path: string): void {
@@ -957,35 +950,26 @@ describe("Dynamic Spec writes are never redirected to a filesystem path", () => 
 		);
 	});
 
-	test("a conclusion-scoped subagent still writes its own spec:// files", async () => {
-		expectAllowedPath(
-			await writeSpec({
-				label: "conclusion-tasks",
-				specPath: "spec://tasks.json",
-				conclusion: true,
-			}),
-			"spec://tasks.json",
-		);
-	});
-
-	test("a conclusion-scoped subagent's filesystem write is still redirected", async () => {
-		const id = "spec-redirect-conclusion-fs";
-		const toolUse = "spec-redirect-conclusion-fs-tool-use";
+	// The subagent conclusion-file mechanism used to redirect a subagent's Write to a
+	// designated `.narrafork/conclusion-*.md`. It was retired along with Write/Edit
+	// access for explore/plan subagents (the only types it was ever allocated for), so
+	// a subagent filesystem write is now decided on its own merits with no rewriting.
+	test("a subagent filesystem write is no longer rewritten to a conclusion file", async () => {
+		const id = "spec-redirect-subagent-fs";
+		const toolUse = "spec-redirect-subagent-fs-tool-use";
 		const toolInput = { file_path: "docs/findings.md", content: "x" };
-		// A real writable cwd keeps the conclusion file inside the worktree; the
-		// ~/.narrafork/conclusions fallback would be an out-of-cwd write and pause for
-		// reflection, which would test the danger path rather than the redirect.
-		const cwd = mkdtempSync(join(tmpdir(), "narrafork-conclusion-redirect-"));
+		// A real writable cwd keeps this inside the worktree; an out-of-cwd write would
+		// pause for reflection and test the danger path rather than path resolution.
+		const cwd = mkdtempSync(join(tmpdir(), "narrafork-subagent-write-"));
 		await seedPermissionRequest({
 			narratorId: id,
-			messageId: "spec-redirect-conclusion-fs-message",
-			toolCallId: "spec-redirect-conclusion-fs-tool-call",
+			messageId: "spec-redirect-subagent-fs-message",
+			toolCallId: "spec-redirect-subagent-fs-tool-call",
 			toolUseId: toolUse,
 			toolName: "Write",
 			input: toolInput,
 			permissionMode: "bypassPermissions",
 		});
-		setConclusionFileId(id, "conclusion-fs", cwd);
 		try {
 			const result = await handlePermission(
 				id,
@@ -1006,10 +990,10 @@ describe("Dynamic Spec writes are never redirected to a filesystem path", () => 
 			);
 			expect(result.behavior).toBe("allow");
 			if (result.behavior === "allow") {
-				expect(result.updatedInput?.file_path).toBe(".narrafork/conclusion-conclusion-fs.md");
+				expect(result.updatedInput?.file_path).toBe("docs/findings.md");
+				expect(result.notice).toBeUndefined();
 			}
 		} finally {
-			deleteConclusionFileId(id);
 			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
@@ -1559,6 +1543,93 @@ describe("OAuth remote runtime permission constraints", () => {
 				planMode: true,
 			}),
 		).toBe("allow");
+	});
+
+	/**
+	 * An ASYNCHRONOUS AskUserQuestion must not reach the interactive wait — prompting
+	 * for it would recreate exactly the blocking the mode exists to avoid. The
+	 * `answers` case is the subtle one: after the user answers, the answers are merged
+	 * into the input and the call runs again, and that replay has to keep the ordinary
+	 * semantics rather than filing a duplicate question.
+	 */
+	test("an async AskUserQuestion is allowed in every mode, a blocking one still asks", () => {
+		const questions = [{ question: "cache", header: "Which cache?", options: [] }];
+		for (const permMode of [
+			"readOnly",
+			"dontAsk",
+			"default",
+			"acceptEdits",
+			"bypassPermissions",
+		] as const) {
+			expect(
+				resolvePermissionDecision({
+					toolName: "AskUserQuestion",
+					input: { questions, async: true },
+					permMode,
+					cwd: "/workspace",
+				}),
+			).toBe("allow");
+			expect(
+				resolvePermissionDecision({
+					toolName: "AskUserQuestion",
+					input: { questions },
+					permMode,
+					cwd: "/workspace",
+				}),
+			).toBe("ask");
+		}
+	});
+
+	test("an async question carrying answers goes back to the ordinary path", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "AskUserQuestion",
+				input: {
+					questions: [{ question: "cache", header: "Which cache?", options: [] }],
+					async: true,
+					answers: { cache: "Redis" },
+				},
+				permMode: "default",
+				cwd: "/workspace",
+			}),
+		).toBe("ask");
+	});
+
+	test("a withdraw-only AskUserQuestion needs no prompt", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "AskUserQuestion",
+				input: { withdraw: ["q1"] },
+				permMode: "default",
+				cwd: "/workspace",
+			}),
+		).toBe("allow");
+	});
+
+	test("deferring a question that is not pending reports not_found rather than approving", async () => {
+		// The guard lives in the service, not the route: reached through the generic
+		// resolve path, a deferral would resolve an arbitrary pending tool as ALLOW with a
+		// stray `async: true` — i.e. silently approve what the user was postponing.
+		expect(await deferPendingQuestion("no-such-request")).toEqual({
+			ok: false,
+			reason: "not_found",
+		});
+	});
+
+	test("an async question is not classified as dangerous, so bypass mode does not reflect on it", () => {
+		// The bypass path runs `classifyDanger` on auto-allowed calls; a non-null result
+		// there would route the question into a danger-reflection pause and block it after
+		// all.
+		expect(
+			classifyDanger(
+				"AskUserQuestion",
+				{
+					questions: [{ question: "cache", header: "Which cache?", options: [] }],
+					async: true,
+				},
+				"/workspace",
+			),
+		).toBeNull();
 	});
 
 	test("ScheduledTask reads are allowed in every mode", () => {

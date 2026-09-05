@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { JsonRpcNotification, ProviderStreamEvent } from "@server/lib/plugins/protocol";
 import {
 	PluginProviderRpcClient,
-	ProviderRpcError,
 	type ProviderRpcRequestOptions,
 	type ProviderRpcTransport,
 	type ProviderStreamWindow,
@@ -76,6 +75,8 @@ class MockTransport implements ProviderRpcTransport {
 	private closeHandler?: (error?: Error) => void;
 	private readonly pendingResponses = new Map<string, unknown>();
 	private operationResponse: "accepted" | "reject" = "accepted";
+	private operationResponseDeferred = false;
+	private acceptOperation?: () => void;
 
 	request<T = unknown>(
 		method: string,
@@ -97,6 +98,11 @@ class MockTransport implements ProviderRpcTransport {
 				return Promise.reject(new Error("not accepted"));
 			}
 			const operationId = getOperationId(params);
+			if (this.operationResponseDeferred) {
+				return new Promise<T>((resolve) => {
+					this.acceptOperation = () => resolve({ accepted: true, operationId } as T);
+				});
+			}
 			return Promise.resolve({ accepted: true, operationId } as T);
 		}
 		const response = this.pendingResponses.get(method);
@@ -136,6 +142,16 @@ class MockTransport implements ProviderRpcTransport {
 
 	setOperationResponse(response: "accepted" | "reject"): void {
 		this.operationResponse = response;
+	}
+
+	deferOperationAcceptance(): void {
+		this.operationResponseDeferred = true;
+	}
+
+	acceptOperationRequest(): void {
+		const accept = this.acceptOperation;
+		this.acceptOperation = undefined;
+		accept?.();
 	}
 }
 
@@ -390,6 +406,7 @@ describe("credit, cancellation, and late events", () => {
 		);
 		await stream.next();
 		transport.emit(notification(operation.operationId, 2, { type: "text.delta", text: "late" }));
+		await new Promise((resolve) => queueMicrotask(resolve));
 		expect(client.getDiagnostics().lateEvents).toBe(1);
 		await expect(stream.next()).resolves.toMatchObject({ done: true });
 	});
@@ -463,6 +480,7 @@ describe("operation limits and crash semantics", () => {
 				name: "echo",
 			}),
 		);
+		await new Promise((resolve) => queueMicrotask(resolve));
 		transport.crash();
 		await expect(stream.next()).resolves.toMatchObject({ value: { type: "tool_call.start" } });
 		await expect(stream.next()).rejects.toMatchObject({
@@ -473,14 +491,233 @@ describe("operation limits and crash semantics", () => {
 		});
 	});
 
-	it("fails accepted-before-event violations closed", async () => {
+	it("accepts an event received in the same input batch as the accepted response", async () => {
 		const { client, transport } = await setup();
 		clients.push(client);
+		transport.deferOperationAcceptance();
 		const operationPromise = client.chat(chatParams());
 		const request = transport.requests.find((item) => item.method === "provider.chat");
 		const operationId = getOperationId(request?.params);
-		transport.emit(notification(operationId, 1, { type: "text.delta", text: "early" }));
-		await expect(operationPromise).rejects.toBeInstanceOf(ProviderRpcError);
+
+		// The host receives the response frame and the first notification synchronously before
+		// either Promise continuation runs, which is exactly what one stdout chunk can produce.
+		transport.acceptOperationRequest();
+		transport.emit(notification(operationId, 1, { type: "text.delta", text: "first" }));
+		const operation = await operationPromise;
+		const stream = operation.events();
+		await expect(stream.next()).resolves.toMatchObject({
+			value: { type: "text.delta", text: "first" },
+		});
+		transport.emit(
+			notification(operationId, 2, {
+				type: "done",
+				status: "completed",
+				stopReason: "end_turn",
+			}),
+		);
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "done" } });
+	});
+
+	it.each([
+		1, 3, 32,
+	])("flushes %i early frames then consumes live frames and done", async (count) => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		transport.deferOperationAcceptance();
+		const operationPromise = client.chat(chatParams());
+		const request = transport.requests.find((item) => item.method === "provider.chat");
+		const operationId = getOperationId(request?.params);
+		for (let seq = 1; seq <= count; seq++) {
+			transport.emit(notification(operationId, seq, { type: "text.delta", text: `early-${seq}` }));
+		}
+		// Force the early frames into the buffer, not the same-batch microtask path.
+		await Promise.resolve();
+		expect(client.getDiagnostics().operations[0]?.state).toBe("accepting");
+		transport.acceptOperationRequest();
+		const operation = await operationPromise;
+		expect(client.getDiagnostics().operations[0]?.nextSeq).toBe(count + 1);
+		transport.emit(notification(operationId, count + 1, { type: "text.delta", text: "live" }));
+		transport.emit(
+			notification(operationId, count + 2, {
+				type: "done",
+				status: "completed",
+				stopReason: "end_turn",
+			}),
+		);
+		const events: ProviderStreamEvent[] = [];
+		for await (const event of operation.events()) events.push(event);
+		const expected: ProviderStreamEvent[] = [
+			...Array.from({ length: count }, (_, index) => ({
+				type: "text.delta" as const,
+				text: `early-${index + 1}`,
+			})),
+			{ type: "text.delta", text: "live" },
+			{ type: "done", status: "completed", stopReason: "end_turn" },
+		];
+		expect(events).toEqual(expected);
+		expect(
+			transport.notifications
+				.filter((item) => item.method === "provider.streamAck")
+				.map((item) => getRecord(item.params).throughSeq),
+		).toEqual(Array.from({ length: count + 1 }, (_, index) => index + 1));
+		expect(client.getDiagnostics()).toMatchObject({
+			activeOperations: 0,
+			queuedBytes: 0,
+			protocolErrors: 0,
+			lateEvents: 0,
+		});
+		expect(transport.killed).toHaveLength(0);
+	});
+
+	it("keeps buffered terminal reserve and drops frames after buffered done", async () => {
+		const { client, transport } = await setup({ window: { maxUnackedEvents: 1 } });
+		clients.push(client);
+		transport.deferOperationAcceptance();
+		const operationPromise = client.generate(generateParams());
+		const request = transport.requests.find((item) => item.method === "provider.generate");
+		const operationId = getOperationId(request?.params);
+		const expected: ProviderStreamEvent[] = [
+			{ type: "text.delta", text: "early" },
+			{ type: "error", error: { classification: "api", code: "UPSTREAM", message: "failed" } },
+			{ type: "done", status: "failed", stopReason: "error" },
+		];
+		for (const [index, event] of expected.entries()) {
+			transport.emit(notification(operationId, index + 1, event));
+		}
+		transport.emit(notification(operationId, 4, { type: "text.delta", text: "must not leak" }));
+		await Promise.resolve();
+		transport.acceptOperationRequest();
+		const operation = await operationPromise;
+		const events: ProviderStreamEvent[] = [];
+		for await (const event of operation.events()) events.push(event);
+		expect(events).toEqual(expected);
+		expect(client.getDiagnostics()).toMatchObject({
+			activeOperations: 0,
+			queuedBytes: 0,
+			protocolErrors: 0,
+			lateEvents: 1,
+		});
+		expect(transport.killed).toEqual([]);
+	});
+
+	it("preserves buffered cancelled done and its AbortError", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		transport.deferOperationAcceptance();
+		const operationPromise = client.generate(generateParams());
+		const operationId = getOperationId(transport.requests.at(-1)?.params);
+		transport.emit(
+			notification(operationId, 1, {
+				type: "done",
+				status: "cancelled",
+				stopReason: "cancelled",
+			}),
+		);
+		await Promise.resolve();
+		transport.acceptOperationRequest();
+		const stream = (await operationPromise).events();
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "done" } });
+		await expect(stream.next()).rejects.toMatchObject({ name: "AbortError" });
+		expect(transport.killed).toEqual([]);
+	});
+
+	it.each([
+		{ sequences: [2] },
+		{ sequences: [1, 1] },
+		{ sequences: [1, 3] },
+		{ sequences: [1, 2, 1] },
+	])("rejects invalid early sequences %j", async ({ sequences }) => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		transport.deferOperationAcceptance();
+		const operationPromise = client.chat(chatParams());
+		const operationId = getOperationId(transport.requests.at(-1)?.params);
+		for (const seq of sequences) {
+			transport.emit(notification(operationId, seq, { type: "text.delta", text: "early" }));
+		}
+		await Promise.resolve();
+		transport.acceptOperationRequest();
+		await expect(operationPromise).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
+		expect(client.getDiagnostics().activeOperations).toBe(0);
 		expect(transport.killed).toHaveLength(1);
+	});
+
+	it.each([
+		{ count: 33, bodyBytes: 128 },
+		{ count: 3, bodyBytes: 128 * 1024 },
+	])("bounds pre-accepted buffering: %j", async ({ count, bodyBytes }) => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		transport.deferOperationAcceptance();
+		const operationPromise = client.chat(chatParams());
+		const operationId = getOperationId(transport.requests.at(-1)?.params);
+		for (let seq = 1; seq <= count; seq++) {
+			transport.emit(
+				notification(operationId, seq, { type: "text.delta", text: "early" }),
+				bodyBytes,
+			);
+		}
+		await Promise.resolve();
+		transport.acceptOperationRequest();
+		await expect(operationPromise).rejects.toMatchObject({ code: "QUEUE_LIMIT" });
+		expect(client.getDiagnostics().activeOperations).toBe(0);
+		expect(transport.killed).toHaveLength(1);
+	});
+
+	it("still rejects failed done without error when flushing", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		transport.deferOperationAcceptance();
+		const operationPromise = client.chat(chatParams());
+		const operationId = getOperationId(transport.requests.at(-1)?.params);
+		transport.emit(
+			notification(operationId, 1, { type: "done", status: "failed", stopReason: "error" }),
+		);
+		await Promise.resolve();
+		transport.acceptOperationRequest();
+		const operation = await operationPromise;
+		await expect(operation.events().next()).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
+		expect(transport.killed).toHaveLength(1);
+	});
+
+	it("disposes crashed operations without replacing their unknown-result safety metadata", async () => {
+		const { client, transport } = await setup({ limits: { cancelGraceMs: 10 } });
+		clients.push(client);
+		const operation = await client.chat(chatParams());
+		transport.emit(
+			notification(operation.operationId, 1, {
+				type: "tool_call.start",
+				toolUseId: "tool-before-crash",
+				name: "echo",
+			}),
+		);
+		await Promise.resolve();
+		transport.crash();
+		await client.dispose();
+		await expect(operation.events().next()).rejects.toMatchObject({
+			code: "UNKNOWN_RESULT",
+			exposedToolCall: true,
+			retryable: false,
+			unknownResult: true,
+		});
+		expect(client.getDiagnostics()).toMatchObject({ activeOperations: 0, queuedBytes: 0 });
+		expect(transport.requests.some((item) => item.method === "provider.cancel")).toBe(false);
+		await Bun.sleep(20);
+		expect(transport.killed).toEqual([]);
+	});
+
+	it("disposes active operations without leaving a timer that can kill a reused runtime", async () => {
+		const { client, transport } = await setup({ limits: { cancelGraceMs: 10 } });
+		clients.push(client);
+		const operation = await client.chat(chatParams());
+		const stream = operation.events();
+		const pending = stream.next();
+		const rejected = pending.catch((error: unknown) => error);
+		await client.dispose();
+		expect(await rejected).toMatchObject({ code: "CANCELLED" });
+		expect(client.getDiagnostics().activeOperations).toBe(0);
+		expect(transport.requests.filter((item) => item.method === "provider.cancel")).toHaveLength(1);
+		await Bun.sleep(20);
+		expect(transport.killed).toEqual([]);
 	});
 });

@@ -134,6 +134,7 @@ const EXIT_PLAN_FILE_PATH_PARAM_DESCRIPTION =
  * also pre-authorized a set of commands. NarraFork never implemented that: the
  * only consumer was a line in the exitPlanMode reflection prompt, and no
  * permission was ever granted from it. Worse, being the first declared property
+ * made it the field `ensureNonEmptySchema` promoted to "required" on some gateways,
  * so models fabricated permission declarations to satisfy a field that did
  * nothing. It is no longer advertised to models; the Zod field remains optional
  * so historical `inputJson` and any model still sending it keep parsing.
@@ -296,6 +297,7 @@ function buildExitPlanModeSchema(config?: AgentConfig): Record<string, unknown> 
 		type: "object",
 		properties,
 		// `mode` is the tool's one genuinely required parameter. Declaring it also
+		// keeps `ensureNonEmptySchema` (some gateways need a required property) from
 		// having to inject a dummy here.
 		required: ["mode"],
 		additionalProperties: {},

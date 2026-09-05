@@ -3,18 +3,28 @@ import {
 	buildCodexResponsesWebSocketRequest,
 	buildCodexResponsesWebSocketUrl,
 	type CodexResponsesRequestBody,
+	CodexWebSocketRetryableError,
 	type CompletedResponseSnapshot,
 	clearCodexResponsesWebSocketSessions,
 	decidePrematureCodexReconnect,
+	extractTurnStateFromEvent,
 	hasRecentNarratorMessage,
 	isCodexExpected101StatusError,
 	isCodexResponsesWebSocketSessionExpired,
+	isCodexWebSocketConnectionExpiring,
 	isCodexWebSocketConnectionLimitError,
 	isCodexWebSocketIdleTimeoutError,
+	isCodexWebSocketPreviousResponseMissingError,
 	parseCodexWrappedError,
 	shouldTreatCodexStreamEventAsYielded,
 } from "../codex-websocket";
+import { isResumableError, isRetryableError } from "../error-handling";
 import type { OAIMessage } from "../openai-provider";
+
+/** The verbatim message upstream sends when it retires a connection at 60 minutes. */
+const CONNECTION_LIMIT_MESSAGE =
+	"Responses websocket connection limit reached (60 minutes). " +
+	"Create a new websocket connection to continue.";
 
 function makeUserMessage(text: string): OAIMessage {
 	return {
@@ -196,6 +206,109 @@ describe("Codex Responses WebSocket helpers", () => {
 				error: { code: "rate_limit_exceeded" },
 			}),
 		).toBe(false);
+	});
+
+	test("detects the connection limit from the observed upstream payload shape", () => {
+		// The shape upstream actually sends: `type` carries the generic
+		// invalid_request_error while `code` carries the real signal. Reading only one
+		// field misses it and the turn dies with a "non-retryable" transport error.
+		const wrapped = parseCodexWrappedError(
+			JSON.stringify({
+				type: "error",
+				status: 400,
+				error: {
+					type: "invalid_request_error",
+					code: "websocket_connection_limit_reached",
+					message:
+						"Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.",
+				},
+			}),
+		);
+
+		expect(wrapped).not.toBeNull();
+		expect(isCodexWebSocketConnectionLimitError(wrapped as never)).toBe(true);
+		expect(isCodexWebSocketPreviousResponseMissingError(wrapped as never)).toBe(false);
+	});
+
+	test("detects a forgotten previous response as its own recoverable case", () => {
+		expect(
+			isCodexWebSocketPreviousResponseMissingError({
+				type: "error",
+				status: 400,
+				error: { type: "invalid_request_error", code: "previous_response_not_found" },
+			}),
+		).toBe(true);
+		expect(
+			isCodexWebSocketPreviousResponseMissingError({
+				type: "error",
+				status: 400,
+				error: { code: "websocket_connection_limit_reached" },
+			}),
+		).toBe(false);
+	});
+
+	test("recycles a connection only once it nears the upstream 60-minute cap", () => {
+		const connectedAt = Date.parse("2026-01-01T00:00:00.000Z");
+		const at = (minutes: number) => connectedAt + minutes * 60_000;
+
+		expect(isCodexWebSocketConnectionExpiring(connectedAt, at(1))).toBe(false);
+		expect(isCodexWebSocketConnectionExpiring(connectedAt, at(54))).toBe(false);
+		// Recycled before the cap, so the replacement happens between requests rather
+		// than upstream tearing the socket down mid-response.
+		expect(isCodexWebSocketConnectionExpiring(connectedAt, at(55))).toBe(true);
+		expect(isCodexWebSocketConnectionExpiring(connectedAt, at(59))).toBe(true);
+	});
+
+	test("reads turn state from metadata events under either prefix and any header casing", () => {
+		expect(
+			extractTurnStateFromEvent({
+				type: "response.metadata",
+				headers: { "x-codex-turn-state": "ts-1" },
+			}),
+		).toBe("ts-1");
+		// The gateway prefixes the event; the direct backend does not.
+		expect(
+			extractTurnStateFromEvent({
+				type: "codex.response.metadata",
+				headers: { "X-Codex-Turn-State": "ts-2" },
+			}),
+		).toBe("ts-2");
+		expect(
+			extractTurnStateFromEvent({
+				type: "response.output_text.delta",
+				headers: { "x-codex-turn-state": "ts-3" },
+			}),
+		).toBeNull();
+		expect(extractTurnStateFromEvent({ type: "response.metadata" })).toBeNull();
+	});
+
+	test("the connection-limit message is only retryable when carried by the typed error", () => {
+		// The regression this guards: upstream's wording contains no "overload", no
+		// "try again", and no 5xx status, so the generic classifier reads it as a
+		// permanent failure. Codex is a stateful provider (in-loop retries are 0), so a
+		// non-retryable classification ends the turn instead of reconnecting — the exact
+		// opposite of what the message instructs.
+		expect(isRetryableError(new Error(CONNECTION_LIMIT_MESSAGE))).toBe(false);
+
+		const exhausted = new CodexWebSocketRetryableError(CONNECTION_LIMIT_MESSAGE, {
+			status: 400,
+			code: "websocket_connection_limit_reached",
+		});
+		expect(isRetryableError(exhausted)).toBe(true);
+		// Nothing was streamed, so the caller may replay the request outright.
+		expect(isResumableError(exhausted)).toBe(false);
+	});
+
+	test("a connection limit hit after output has streamed is resumable, not replayable", () => {
+		// Replaying here would duplicate output the user has already seen and that the
+		// caller has already persisted, so recovery must continue from the partial turn.
+		const afterOutput = new CodexWebSocketRetryableError(CONNECTION_LIMIT_MESSAGE, {
+			status: 400,
+			code: "websocket_connection_limit_reached",
+			resumable: true,
+		});
+		expect(isRetryableError(afterOutput)).toBe(true);
+		expect(isResumableError(afterOutput)).toBe(true);
 	});
 
 	test("parses detailed websocket close reasons as wrapped errors", () => {

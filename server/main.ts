@@ -30,7 +30,6 @@ import { isTrustedProxyAddress, resolveClientIp } from "./lib/client-ip";
 import { getCodexManager } from "./lib/codex-manager";
 import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
-import {
 import { logger } from "./lib/logger";
 import { mcpManager } from "./lib/mcp/manager";
 import { syncMcpTools } from "./lib/mcp/tool-bridge";
@@ -45,7 +44,7 @@ import {
 	registerRuntimeAddressGetter,
 	registerServerRestart,
 } from "./lib/server-restart";
-import { saveSettings, settings } from "./lib/settings";
+import { settings } from "./lib/settings";
 import { ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref } from "./lib/spa-base-href";
 import {
@@ -1226,41 +1225,6 @@ try {
 	void refreshAllKimiUsages().catch(() => {});
 } catch (err) {
 	logger.warn("Kimi usage startup refresh failed", { error: String(err) });
-}
-
-	if (configuredCredentialsPath) {
-		return {
-			credentialsPath: configuredCredentialsPath,
-			configPath:
-				configuredCredentialsPath.replace("credentials.json", "config.json"),
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		};
-	}
-
-	if (!existsSync(defaultCredentialsPath)) return null;
-
-		credentialsPath: defaultCredentialsPath,
-	};
-	saveSettings(settings);
-		credentialsPath: defaultCredentialsPath,
-	});
-
-	return {
-		credentialsPath: defaultCredentialsPath,
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	};
-}
-
-	try {
-		});
-			if (cached.length > 0) {
-			} else {
-					.then((models) =>
-					)
-			}
-		}
-	} catch (err) {
-	}
 }
 
 // Mark any stale terminals from a previous run as exited

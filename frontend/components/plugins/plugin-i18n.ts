@@ -5,8 +5,9 @@
  *
  * A panel runs in its own document and cannot reach the host's i18n instance. Left to
  * themselves, panels each grow a private string table plus a private notion of what the
- * `navigator.language` because a stale comment claimed the host locale was a placeholder.
- * Meanwhile `cline-external` simply stayed English.
+ * current language is — one early plugin shipped hundreds of lines of exactly that, keyed off
+ * `navigator.language` because a stale comment claimed the host locale was a placeholder,
+ * while another simply stayed English.
  *
  * The dictionaries stay with the plugin: only the plugin knows its own copy. What the host owns
  * is the part that is identical for everyone — which language is active, and how to fall back
@@ -16,8 +17,8 @@
  *
  * The host's own translation resources. Its `settings` namespace keys are internal and get
  * renamed by ordinary refactors; letting plugins read them would turn every such rename into a
- * broken third-party panel. Copying the host's *wording* into a plugin dictionary is fine and
- * dependency.
+ * broken third-party panel. Copying the host's *wording* into a plugin dictionary is fine —
+ * that is a one-time human decision, not a runtime dependency.
  */
 
 import { getLocaleFallbackChain, normalizeLocale } from "@shared/i18n-locales";

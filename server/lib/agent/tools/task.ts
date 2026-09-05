@@ -10,6 +10,7 @@ type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 const REASONING_EFFORT_VALUES = ["none", "low", "medium", "high", "xhigh", "max"] as const;
 const REASONING_EFFORT_DESCRIPTION =
 	'Reasoning/thinking effort for this subagent. Use "none" to disable thinking where supported. ' +
+	'Valid values: "none", "low", "medium", "high", "xhigh", "max" ("max" is only honored by some providers like DeepSeek; other providers clamp it down). ' +
 	"If the selected model/provider does not support configurable thinking intensity, this option is ignored.";
 
 // Use text import so the bundler inlines the file content at build time

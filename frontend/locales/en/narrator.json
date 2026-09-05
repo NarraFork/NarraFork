@@ -16,7 +16,8 @@
 			"gateway": "IM gateway",
 			"oauth": "External app",
 			"recovery": "Session recovery",
-			"planReflection": "Plan reflection"
+			"planReflection": "Plan reflection",
+			"agentMessage": "Agent message"
 		}
 	},
 	"narrator": "Narrator",
@@ -58,6 +59,7 @@
 	"compactOutputChars": "{{count}} chars",
 	"compactThinking": "thinking",
 	"compactThinkingChars": "{{count}} chars",
+	"compactRetrying": "retry #{{count}}",
 	"contextAskOutputChars": "{{count}} chars",
 	"viewingNow": "Viewing now",
 	"compacted": "Context compacted",
@@ -147,7 +149,27 @@
 	"typeCustomAnswer": "Or type a custom answer...",
 	"submitAnswer": "Submit",
 	"skipQuestion": "Skip",
+	"deferQuestion": "Answer later",
+	"deferQuestionFailed": "Could not move the question to the inbox",
 	"answered": "Answered",
+	"asyncQuestionInboxTitle": "Questions waiting for you",
+	"asyncQuestionInboxDesc": "The narrator asked these without pausing its work. Answer them when convenient; each answer is sent to the session right away.",
+	"asyncQuestionInboxEmpty": "No questions waiting.",
+	"asyncQuestionInboxLoading": "Loading questions...",
+	"asyncQuestionInboxBadge": "{{count}} question(s)",
+	"asyncQuestionInboxBadgeAwaited": "Waiting on you ({{count}})",
+	"asyncQuestionInboxOpen": "Open the question inbox ({{count}} waiting)",
+	"asyncQuestionAwaitedNotice": "The narrator has stopped and is waiting for this answer",
+	"globalInboxTitle": "Questions from all sessions",
+	"globalInboxDesc": "Open questions across every session you can see. Answering here reaches the session that asked.",
+	"globalInboxTooltip": "{{count}} question(s) waiting across your sessions",
+	"globalInboxTooltipAwaited": "{{count}} session(s) stopped and waiting for your answer",
+	"globalInboxOpen": "Open the global question inbox ({{count}} waiting)",
+	"asyncQuestionDismiss": "Let it decide",
+	"asyncQuestionBadgeDeferred": "Deferred question",
+	"asyncQuestionBadgeAnswered": "Deferred question · answered",
+	"asyncQuestionBadgeDismissed": "Deferred question · you let it decide",
+	"asyncQuestionBadgeWithdrawn": "Deferred question · withdrawn",
 	"askAnswerPrefix": "Answer:",
 	"askCustomAnswerPrefix": "Custom answer:",
 	"questionReflectionAnswer": "Answer with reflection",
@@ -506,6 +528,7 @@
 	"contextMenu_edit": "Edit message",
 	"contextMenu_jumpToSource": "Jump to source narrator",
 	"jumpToUserMessage": "Jump to message #{{ordinal}}",
+	"jumpToCompactMarker": "Jump to compact marker ({{status}})",
 	"contextMenu_viewFile": "View this file",
 	"contextMenu_openFilePanel": "Open in panel",
 	"contextMenu_copyFilePath": "Copy file path",
@@ -1199,6 +1222,8 @@
 			"messageFromUnknown": "unknown sender",
 			"messageBroadcast": "broadcast",
 			"specUpdatesHeading": "{{n}} spec file(s) you updated",
+			"asyncQuestionAnsweredHeading": "You answered {{n}} deferred question(s)",
+			"asyncQuestionDismissedHeading": "You skipped the deferred question(s)",
 			"proseFenceHeading": "Behavior fence",
 			"empty": "(empty)"
 		}
@@ -1415,5 +1440,9 @@
 		"effectiveDiscount": "Effective discount",
 		"circleMultiplier": "Circle multiplier (1 balance = 1 USD)",
 		"footnote": "Priced in {{unit}} and billed by actual usage; the official USD price and discount multipliers are for reference only."
-	}
+	},
+	"inboxBadgeSplit": "This session {{current}} · elsewhere {{others}}",
+	"inboxBadgeAwaitedSuffix": "· {{count}} waiting on you",
+	"inboxGroupCurrentSession": "This session",
+	"inboxGroupOtherSessions": "Other sessions"
 }

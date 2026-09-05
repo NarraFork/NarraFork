@@ -668,6 +668,7 @@ mcpRoutes.post("/servers/import", requireAdmin, async (c) => {
 	return c.json({ added: added.length, skipped });
 });
 
+/** List all MCP tools (from connected external servers). */
 mcpRoutes.get("/tools", (c) => {
 	const externalTools = mcpManager.getAvailableTools().map(({ serverId, serverName, tool }) => ({
 		name: tool.name,

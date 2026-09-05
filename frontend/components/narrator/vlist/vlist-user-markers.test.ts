@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import {
+	collectVListCompactMarkers,
 	collectVListUserMarkers,
 	resolveVListUserMarkerPreview,
 	resolveVListUserMarkerScrollTop,
@@ -146,6 +147,101 @@ describe("resolveVListUserMarkerPreview", () => {
 	});
 });
 
+describe("collectVListCompactMarkers", () => {
+	it("marks context and segment compact indicators with their live status", () => {
+		const items = [
+			row("system-simple", "c1-sys", {
+				kind: "compact",
+				status: "compacted",
+				text: "Context compacted",
+			}),
+			row("markdown", "m2-b0"),
+			row("system-simple", "c3-sys", {
+				kind: "segment_compact",
+				status: "compacting",
+				text: "Segment compacting… · retry #2",
+			}),
+		];
+		const layout = [{ top: 100 }, { top: 200 }, { top: 800 }];
+		expect(collectVListCompactMarkers(items, layout, 1000)).toEqual([
+			{
+				key: "c1-sys",
+				itemIndex: 0,
+				top: 100,
+				fraction: 0.1,
+				flavor: "context",
+				status: "compacted",
+				tooltip: "Context compacted",
+			},
+			{
+				key: "c3-sys",
+				itemIndex: 2,
+				top: 800,
+				fraction: 0.8,
+				flavor: "segment",
+				status: "compacting",
+				tooltip: "Segment compacting… · retry #2",
+			},
+		]);
+	});
+
+	it("marks a failed context compact as failed", () => {
+		const items = [
+			row("system-simple", "c1-sys", { kind: "compact", status: "failed", text: "Compact failed" }),
+		];
+		const markers = collectVListCompactMarkers(items, [{ top: 50 }], 500);
+		expect(markers[0]).toMatchObject({ flavor: "context", status: "failed" });
+	});
+
+	it("marks the failed SEGMENT card (system-text) by its title, not the error body", () => {
+		const items = [
+			row("system-text", "s2-sys", {
+				kind: "segment_compact_failed",
+				title: "Segment compact failed",
+				text: "a very long provider error body that must not become a tooltip",
+			}),
+		];
+		const markers = collectVListCompactMarkers(items, [{ top: 50 }], 500);
+		expect(markers[0]).toMatchObject({
+			flavor: "segment",
+			status: "failed",
+			tooltip: "Segment compact failed",
+		});
+	});
+
+	it("normalizes an unknown status to compacted and skips non-compact rows", () => {
+		const items = [
+			row("system-simple", "x1-sys", { kind: "merge_summary", text: "merged" }),
+			row("system-simple", "x2-sys", { kind: "compact", status: "weird", text: "?" }),
+			row("system-text", "x3-sys", { kind: "info", text: "note" }),
+			row("system-simple", "x4-sys", { kind: "spec_continuation" }),
+			bubble("m1-bubble", { role: "user", text: "hi" }),
+		];
+		const layout = items.map((_, index) => ({ top: index * 100 }));
+		const markers = collectVListCompactMarkers(items, layout, 1000);
+		expect(markers).toHaveLength(1);
+		expect(markers[0]).toMatchObject({ key: "x2-sys", status: "compacted", fraction: 0.1 });
+	});
+
+	it("skips rows without geometry instead of guessing a position", () => {
+		const items = [
+			row("system-simple", "c1-sys", { kind: "compact", status: "compacted", text: "a" }),
+			row("system-simple", "c2-sys", { kind: "compact", status: "compacted", text: "b" }),
+		];
+		const markers = collectVListCompactMarkers(items, [{ top: 10 }, undefined], 600);
+		expect(markers.map((marker) => marker.key)).toEqual(["c1-sys"]);
+	});
+
+	it("clamps fractions into 0..1 and tolerates a degenerate document height", () => {
+		const items = [
+			row("system-simple", "c1-sys", { kind: "compact", status: "compacted", text: "a" }),
+		];
+		expect(collectVListCompactMarkers(items, [{ top: 5000 }], 1000)[0]?.fraction).toBe(1);
+		expect(collectVListCompactMarkers(items, [{ top: 500 }], 0)[0]?.fraction).toBe(0);
+		expect(collectVListCompactMarkers(items, [{ top: -20 }], 1000)[0]?.top).toBe(0);
+	});
+});
+
 describe("resolveVListUserMarkerTop", () => {
 	it("keeps the last mark fully inside the track", () => {
 		// Percentage placement (the chunked path's `top: 100%`) would hang the newest
@@ -209,6 +305,15 @@ describe("exact list wiring", () => {
 		expect(source).toContain(
 			"collectVListUserMarkers(renderItems, exactLayout?.items ?? [], scrollableHeight)",
 		);
+		expect(source).toContain(
+			"collectVListCompactMarkers(renderItems, exactLayout?.items ?? [], scrollableHeight)",
+		);
+	});
+
+	it("passes the compact marks and their jump handler to the track", () => {
+		expect(source).toContain("compactMarkers={compactMarkers}");
+		expect(source).toContain("onJumpCompact={handleCompactMarkerJump}");
+		expect(source).toContain("resolveCompactLabel={resolveCompactMarkerLabel}");
 	});
 
 	it("unpins from the bottom when jumping so streaming cannot yank the reader back", () => {

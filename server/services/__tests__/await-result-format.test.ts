@@ -15,7 +15,7 @@ const { appendSendReplyRequest, formatAgentAwaitResult } = await import("../agen
 const { formatRecentSubagentActivity, summarizeSubagentToolCall } = await import(
 	"../subagent-activity"
 );
-const { formatResult } = await import("../../lib/agent/tools/await");
+const { formatQuestionResult, formatResult } = await import("../../lib/agent/tools/await");
 const {
 	backgroundTaskService,
 	getBackgroundTaskTerminalVersion,
@@ -204,6 +204,68 @@ describe("Await bash result wording", () => {
 		expect(text).toContain("execution time limit");
 		expect(text).toContain("was stopped");
 		expect(text).not.toContain("Await again");
+	});
+});
+
+/**
+ * Wording for `Await({ type: "question" })`.
+ *
+ * The answers also arrive as a message row, so this text is a restatement — but it is
+ * the ONLY copy the agent has at the moment the wait returns, before its next history
+ * rebuild. What each status must convey differs sharply: after a timeout the agent
+ * should feel free to continue, after a dismissal it must decide itself and stop asking.
+ */
+describe("Await question result wording", () => {
+	const QUESTION_ID = "q-abc";
+	const record = {
+		questions: [
+			{ question: "cache", header: "Which cache layer?" },
+			{ question: "retry", header: "Retry policy?" },
+		],
+		answers: { cache: "Redis", retry: "Exponential" },
+	};
+
+	test("an answer restates each question with what the user chose", () => {
+		const text = formatQuestionResult(QUESTION_ID, "answered", record);
+		expect(text).toContain("Which cache layer?");
+		expect(text).toContain("Redis");
+		expect(text).toContain("Retry policy?");
+		expect(text).toContain("Exponential");
+	});
+
+	test("a question with no recorded answer says so instead of rendering nothing", () => {
+		const text = formatQuestionResult(QUESTION_ID, "answered", {
+			questions: [{ question: "cache", header: "Which cache layer?" }],
+			answers: null,
+		});
+		expect(text).toContain("Which cache layer?");
+		expect(text).toContain("no answer recorded");
+	});
+
+	test("a timeout tells the agent the question is still open and it may proceed", () => {
+		const text = formatQuestionResult(QUESTION_ID, "timeout", record);
+		expect(text.toLowerCase()).toContain("still open");
+		// Both escape routes have to be spelled out, or the agent tends to re-await in a
+		// tight loop rather than continuing with its default.
+		expect(text.toLowerCase()).toContain("default");
+		expect(text).toContain("Await again");
+	});
+
+	test("a dismissal tells the agent to decide, and not to ask again", () => {
+		const text = formatQuestionResult(QUESTION_ID, "dismissed", record);
+		expect(text.toLowerCase()).toContain("own");
+		expect(text.toLowerCase()).toContain("do not ask again");
+	});
+
+	test("a withdrawal makes clear no answer is coming", () => {
+		const text = formatQuestionResult(QUESTION_ID, "withdrawn", record);
+		expect(text.toLowerCase()).toContain("no answer is coming");
+	});
+
+	test("an interrupted wait leaves the question open without inviting an immediate retry loop", () => {
+		const text = formatQuestionResult(QUESTION_ID, "aborted", record);
+		expect(text.toLowerCase()).toContain("still open");
+		expect(text.toLowerCase()).toContain("interrupted");
 	});
 });
 

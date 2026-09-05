@@ -511,6 +511,9 @@ interface QueuedEvent {
 	creditKind: "normal" | "terminal";
 }
 
+const MAX_PRE_ACCEPTED_EVENTS = 32;
+const MAX_PRE_ACCEPTED_BYTES = 256 * 1024;
+
 interface EventWaiter {
 	resolve: (result: IteratorResult<ProviderStreamEvent>) => void;
 	reject: (error: Error) => void;
@@ -530,6 +533,8 @@ interface OperationRecord {
 	state: ProviderOperationState;
 	accepted: boolean;
 	nextSeq: number;
+	preAcceptedEvents: QueuedEvent[];
+	preAcceptedBytes: number;
 	queue: QueuedEvent[];
 	queuedBytes: number;
 	waiter?: EventWaiter;
@@ -650,7 +655,11 @@ export class PluginProviderRpcClient {
 		this.idFactory = normalized.idFactory ?? ((prefix) => `${prefix}_${generateId(12)}`);
 		this.onProtocolViolation = normalized.onProtocolViolation;
 		this.unsubscribeNotification = this.transport.onNotification?.((message, bodyBytes) => {
-			this.handleNotification(message, bodyBytes);
+			// The plugin normally sends the accepted response before its first provider.event, but
+			// stdout scheduling can expose the frames to the host in separate tasks. Defer handling
+			// once so same-chunk responses settle first; handleNotification also keeps a bounded
+			// pre-accepted buffer for the remaining transport-level reordering window.
+			queueMicrotask(() => this.handleNotification(message, bodyBytes));
 		});
 		this.unsubscribeClose = this.transport.onClose?.((error) => {
 			this.handleTransportClose(error);
@@ -843,28 +852,15 @@ export class PluginProviderRpcClient {
 			this.recordLateEvent(operationId);
 			return true;
 		}
-		if (!record.accepted || record.state === "accepting") {
-			this.protocolViolation(record, "PROTOCOL_ERROR", "provider.event arrived before accepted");
+		if (record.state === "accepting" && !record.accepted) {
+			this.bufferPreAcceptedEvent(record, event, seq, bytes);
 			return true;
 		}
-		if (
-			record.state === "terminal_received" ||
-			record.state === "failed" ||
-			record.state === "closed"
-		) {
+		if (!record.accepted) {
 			this.recordLateEvent(operationId);
 			return true;
 		}
-		if (seq !== record.nextSeq) {
-			this.protocolViolation(
-				record,
-				"PROTOCOL_ERROR",
-				`provider.event seq ${seq} did not match expected ${record.nextSeq}`,
-			);
-			return true;
-		}
-		record.nextSeq += 1;
-		this.receiveEvent(record, event, seq, bytes);
+		this.receiveAcceptedEvent(record, event, seq, bytes);
 		return true;
 	}
 
@@ -925,15 +921,17 @@ export class PluginProviderRpcClient {
 		this.unsubscribeNotification?.();
 		this.unsubscribeClose?.();
 		for (const record of [...this.operations.values()]) {
-			void this.beginCancel(
-				record,
-				"shutdown",
-				undefined,
-				new ProviderRpcError("CANCELLED", "Provider RPC client disposed", {
+			if (record.state !== "failed" && record.state !== "terminal_received") {
+				const error = new ProviderRpcError("CANCELLED", "Provider RPC client disposed", {
 					operationId: record.operationId,
 					requestId: record.requestId,
-				}),
-			);
+				});
+				void this.beginCancel(record, "shutdown", undefined, error);
+				this.failOperation(record, error);
+			}
+			// Cancellation is best-effort once subscriptions are detached. No old client's
+			// grace/idle timer may quarantine a runtime reused by a replacement client.
+			this.finishOperation(record);
 		}
 	}
 
@@ -1023,6 +1021,8 @@ export class PluginProviderRpcClient {
 			state: "accepting",
 			accepted: false,
 			nextSeq: 1,
+			preAcceptedEvents: [],
+			preAcceptedBytes: 0,
 			queue: [],
 			queuedBytes: 0,
 			iteratorClaimed: false,
@@ -1085,6 +1085,7 @@ export class PluginProviderRpcClient {
 			record.accepted = accepted.accepted;
 			record.state = "streaming";
 			this.armIdleTimer(record);
+			this.flushPreAcceptedEvents(record);
 			return publicOperation;
 		} catch (error) {
 			const normalized =
@@ -1094,6 +1095,78 @@ export class PluginProviderRpcClient {
 			if (record.state === "accepting") this.failOperation(record, normalized);
 			throw normalized;
 		}
+	}
+
+	private bufferPreAcceptedEvent(
+		record: OperationRecord,
+		event: ProviderStreamEvent,
+		seq: number,
+		bodyBytes: number,
+	): void {
+		const expectedSeq = record.nextSeq + record.preAcceptedEvents.length;
+		if (seq !== expectedSeq) {
+			this.protocolViolation(
+				record,
+				"PROTOCOL_ERROR",
+				`provider.event seq ${seq} did not match expected ${expectedSeq}`,
+			);
+			return;
+		}
+		if (
+			record.preAcceptedEvents.length >= MAX_PRE_ACCEPTED_EVENTS ||
+			record.preAcceptedBytes + bodyBytes > MAX_PRE_ACCEPTED_BYTES
+		) {
+			this.protocolViolation(
+				record,
+				"QUEUE_LIMIT",
+				"Provider emitted too many events before accepted",
+			);
+			return;
+		}
+		record.preAcceptedEvents.push({
+			event,
+			seq,
+			bodyBytes,
+			creditKind: event.type === "error" || event.type === "done" ? "terminal" : "normal",
+		});
+		record.preAcceptedBytes += bodyBytes;
+	}
+
+	private flushPreAcceptedEvents(record: OperationRecord): void {
+		const events = record.preAcceptedEvents;
+		record.preAcceptedEvents = [];
+		record.preAcceptedBytes = 0;
+		for (const queued of events) {
+			if (record.state === "failed" || record.state === "closed") return;
+			this.receiveAcceptedEvent(record, queued.event, queued.seq, queued.bodyBytes);
+		}
+	}
+
+	/** Buffered and live frames share sequence advancement and terminal-state checks. */
+	private receiveAcceptedEvent(
+		record: OperationRecord,
+		event: ProviderStreamEvent,
+		seq: number,
+		bodyBytes: number,
+	): void {
+		if (
+			record.state === "terminal_received" ||
+			record.state === "failed" ||
+			record.state === "closed"
+		) {
+			this.recordLateEvent(record.operationId);
+			return;
+		}
+		if (seq !== record.nextSeq) {
+			this.protocolViolation(
+				record,
+				"PROTOCOL_ERROR",
+				`provider.event seq ${seq} did not match expected ${record.nextSeq}`,
+			);
+			return;
+		}
+		record.nextSeq += 1;
+		this.receiveEvent(record, event, seq, bodyBytes);
 	}
 
 	private receiveEvent(
@@ -1525,6 +1598,8 @@ export class PluginProviderRpcClient {
 		record.state = "closed";
 		record.removeAbort?.();
 		record.removeAbort = undefined;
+		record.preAcceptedEvents = [];
+		record.preAcceptedBytes = 0;
 		this.operations.delete(record.operationId);
 		this.requests.delete(record.requestId);
 		this.closedOperationIds.add(record.operationId);

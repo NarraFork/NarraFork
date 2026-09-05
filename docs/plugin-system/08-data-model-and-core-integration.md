@@ -365,6 +365,7 @@ plugin_provider_instances
 ```
 
 - **[设计建议]** 唯一索引 `provider_type_id`、`provider_prefix`（按大小写不敏感规则检查）、`(plugin_id, display_name)`；索引 `(plugin_id, disabled)`。
+- **[设计建议]** `provider_prefix` 与内置 `codex`、`__default__`、`__summary__`、聚合保留前缀共享唯一命名空间；即使内置 provider disabled，也不允许插件占用保留 prefix。
 - **[设计建议]** 现有 `settingsRoutes.patch` 已检查 custom provider prefix 冲突；Provider Registry 接入时应把核心 settings provider、compatible API provider 和 executable plugin provider 一并检查，禁止“谁后注册谁覆盖”。
 - **[设计建议]** provider instance config 通过 `plugin_configs + plugin_secrets` 解析；宿主每次 `RemoteProviderAdapter` 调用生成临时配置快照，插件不持有核心 settings singleton。
 
@@ -580,6 +581,7 @@ plugin/UI call
 **[设计建议]** Provider Registry 在核心内统一三种来源：
 
 ```text
+Builtin provider (Codex/...)
 Compatible API provider (settings custom/openai/anthropic/gemini/...)
 Executable plugin provider (plugin_provider_instances + RemoteProviderAdapter)
 ```

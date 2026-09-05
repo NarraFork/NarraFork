@@ -21,6 +21,7 @@ export interface CustomModelEntry {
 }
 
 interface InlineCustomModelsProps {
+	/** The provider prefix (e.g. "openai", "anthropic", "codex") */
 	prefix: string;
 	/** All custom models (component filters by prefix internally) */
 	customModels: CustomModelEntry[];

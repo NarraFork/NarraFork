@@ -1,5 +1,5 @@
 /**
- * Random word slug generator for plan / conclusion file IDs.
+ * Random word slug generator for plan file IDs.
  * Ported from claude-code (un/src/utils/words.ts).
  *
  * Format: "adjective-verb-noun"  (~10.7M combinations)

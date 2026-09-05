@@ -12,7 +12,6 @@ import { modelCardContextWindow, modelCardMaxCompletionTokens } from "../model-c
 import { resolveNugModelMeta } from "../nug-model-cache";
 import type {
 	AnthropicProviderConfig,
-	ClineProviderConfig,
 	GeminiProviderConfig,
 	ModelAggregation,
 	NarraForkSettings,
@@ -35,15 +34,6 @@ function s(): NarraForkSettings {
 // Built-in model lists
 // ---------------------------------------------------------------------------
 
-	"claude-haiku-4.5",
-	"claude-sonnet-4.5",
-	"claude-opus-4.5",
-	"claude-opus-4.6",
-	// Legacy short names (for resolveProvider backward compat)
-	"claude-haiku",
-	"claude-sonnet",
-	"claude-opus",
-];
 const BUILTIN_CODEX_MODELS = [
 	"gpt-6-astra",
 	"gpt-5.6-sol",
@@ -65,13 +55,11 @@ let openaiModelChecker: ((model: string) => boolean) | null = null;
 let anthropicModelChecker: ((model: string) => boolean) | null = null;
 let codexModelChecker: ((model: string) => boolean) | null = null;
 let nugModelChecker: ((model: string) => boolean) | null = null;
-let clineModelChecker: ((model: string) => boolean) | null = null;
 let geminiModelChecker: ((model: string) => string | undefined) | null = null;
 let openaiModelLister: (() => string[]) | null = null;
 let anthropicModelLister: (() => string[]) | null = null;
 let codexModelLister: (() => string[]) | null = null;
 let nugModelLister: (() => string[]) | null = null;
-let clineModelLister: (() => string[]) | null = null;
 let geminiModelLister: (() => string[]) | null = null;
 
 /**
@@ -138,10 +126,8 @@ registerCodexModelLister(() => BUILTIN_CODEX_MODELS.map((m) => `codex:${m}`));
 export function registerOpenaiModelChecker(checker: (model: string) => boolean): void {
 	openaiModelChecker = checker;
 }
-}
 export function registerOpenaiModelLister(lister: () => string[]): void {
 	openaiModelLister = lister;
-}
 }
 export function registerAnthropicModelChecker(checker: (model: string) => boolean): void {
 	anthropicModelChecker = checker;
@@ -160,12 +146,6 @@ export function registerNugModelChecker(checker: (model: string) => boolean): vo
 }
 export function registerNugModelLister(lister: () => string[]): void {
 	nugModelLister = lister;
-}
-export function registerClineModelChecker(checker: (model: string) => boolean): void {
-	clineModelChecker = checker;
-}
-export function registerClineModelLister(lister: () => string[]): void {
-	clineModelLister = lister;
 }
 export function registerGeminiModelChecker(checker: (model: string) => string | undefined): void {
 	geminiModelChecker = checker;
@@ -196,7 +176,9 @@ export const FOLLOW_SUMMARY_MODEL = "__summary__";
  *
  * There is deliberately NO hardcoded fallback model. A fallback looks harmless
  * but is actively misleading: it names a provider the user may never have
+ * configured, so the failure surfaces later as "provider X is not
  * configured" from a model the user never chose — during setup that arrives as
+ * a phantom model in a session the user asked to run on their own
  * provider. Failing here instead points at the real problem: no default model
  * is configured.
  *
@@ -270,7 +252,6 @@ function getDisabledProviderPrefixes(): Set<string> {
 		...(s().openaiProviders ?? []),
 		...(s().anthropicProviders ?? []),
 		...(s().nugProviders ?? []),
-		...(s().clineProviders ?? []),
 		...(s().geminiProviders ?? []),
 	]) {
 		if (provider.disabled && provider.prefix) disabled.add(provider.prefix);
@@ -582,7 +563,6 @@ export function getVisibleModels(): string[] {
 	const anthropic = anthropicModelLister?.() ?? [];
 	const codex = codexModelLister?.() ?? [];
 	const nug = nugModelLister?.() ?? [];
-	const cline = clineModelLister?.() ?? [];
 	const gemini = geminiModelLister?.() ?? [];
 	const custom = (s().agent.customModels ?? []).map((m) => {
 		const value = m.value ?? "";
@@ -598,7 +578,6 @@ export function getVisibleModels(): string[] {
 		...anthropic,
 		...codex,
 		...nug,
-		...cline,
 		...gemini,
 		...custom,
 		...extra,
@@ -720,21 +699,6 @@ export function nugProviderPrefix(config: NUGProviderConfig): string {
 	return config.prefix;
 }
 
-export function getClineProviderConfig(prefix?: string): ClineProviderConfig | undefined {
-	const providers = (s().clineProviders ?? []).filter((p) => !p.disabled);
-	if (!prefix) return providers[0];
-	return providers.find((p) => p.prefix === prefix);
-}
-
-export function clineProviderPrefix(config: ClineProviderConfig): string {
-	return config.prefix;
-}
-
-export function hasConfiguredClineProvider(): boolean {
-	const providers = s().clineProviders ?? [];
-	return providers.some((p) => !p.disabled && !!p.accessToken);
-}
-
 export function getGeminiProviderConfig(prefix?: string): GeminiProviderConfig | undefined {
 	const providers = (s().geminiProviders ?? []).filter((p) => !p.disabled);
 	if (!prefix) return providers[0];
@@ -758,8 +722,6 @@ function hasConfiguredOpenaiProvider(): boolean {
 function hasConfiguredAnthropicProvider(): boolean {
 	const providers = s().anthropicProviders ?? [];
 	return providers.some((p) => !p.disabled && !!p.apiKey);
-}
-
 }
 
 function hasConfiguredCodexProvider(): boolean {
@@ -804,12 +766,6 @@ function getConfiguredProviderCandidates(): string[] {
 			if (!p.disabled && p.apiKey && p.baseUrl) available.add(p.prefix || "nug");
 		}
 	}
-	}
-	if (hasConfiguredClineProvider()) {
-		for (const p of s().clineProviders ?? []) {
-			if (!p.disabled && p.accessToken) available.add(p.prefix || "cline");
-		}
-	}
 	if (hasConfiguredGeminiProvider()) {
 		for (const p of s().geminiProviders ?? []) {
 			if (!p.disabled && p.apiKey) available.add(p.prefix || "gemini");
@@ -829,8 +785,6 @@ function getConfiguredProviderCandidates(): string[] {
 
 	if (available.has("codex")) {
 		result.push("codex");
-	}
-
 	}
 
 	for (const provider of available) {
@@ -855,7 +809,6 @@ export function resolveProvider(model?: string): string {
 		if (anthropicModelChecker?.(bare)) return "anthropic";
 		if (codexModelChecker?.(bare)) return "codex";
 		if (nugModelChecker?.(bare)) return "nug";
-		if (clineModelChecker?.(bare)) return "cline";
 		const geminiPrefix = geminiModelChecker?.(bare);
 		if (geminiPrefix) return geminiPrefix;
 		// Consulted only after every builtin declined, so a plugin cannot shadow a
@@ -870,6 +823,7 @@ export function resolveProvider(model?: string): string {
 		return configured[0];
 	}
 
+	return "anthropic";
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,6 +1028,7 @@ export function resolveModelContextWindow(
 	if (nugContextWindow) return { contextWindow: nugContextWindow, source: "catalog" };
 
 	// 3. Check provider configuration
+	{
 		const oaiConfig = getOpenaiProviderConfig(provider);
 		if (oaiConfig?.defaultContextWindow) {
 			return { contextWindow: oaiConfig.defaultContextWindow, source: "provider" };
@@ -1112,10 +1067,12 @@ export const DEFAULT_MIN_PRUNE_RATIO = 30;
 
 /**
  * Resolve the summary model's effective context window (tokens).
+ * Uses the built-in card table when the provider has no explicit setting.
  */
 export function getSummaryModelContextWindow(modelOverride?: string): number {
 	const summaryModel = modelOverride?.trim() || s().agent.summaryModel;
 	const parsed = parseModelId(summaryModel);
+	const prov = parsed.provider ?? "anthropic";
 	return getModelContextWindow(parsed.model, prov) ?? 128_000;
 }
 

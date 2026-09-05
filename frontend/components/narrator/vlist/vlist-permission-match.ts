@@ -50,6 +50,18 @@ export function findPendingForKey(
 	return null;
 }
 
+/**
+ * May this row kind host an interactive permission / question form at all?
+ *
+ * The one owner of that rule. `decidePermissionSlot` is not the only caller any more:
+ * the bridge also offers the slot to an open ASYNC question when no permission claimed
+ * it, and deriving a tool_use id from the key without re-checking the kind would let a
+ * non-hosting row mount a form.
+ */
+export function isPermissionHostRow(specKind: string): boolean {
+	return PERMISSION_HOST_KINDS.has(specKind);
+}
+
 /** What (if anything) a row's permission area should host. */
 export type PermissionSlotKind = "reflection" | "permission" | "none";
 
@@ -91,7 +103,7 @@ export function decidePermissionSlot(
 	pendingPermissions: readonly PendingPermission[] | undefined,
 	reflections: ReadonlyMap<string, VListReflectionSource> | undefined,
 ): PermissionSlotDecision {
-	if (!PERMISSION_HOST_KINDS.has(specKind)) return NO_SLOT;
+	if (!isPermissionHostRow(specKind)) return NO_SLOT;
 	const toolUseId = toolUseIdFromSpecKey(specKey);
 	const pending = pendingPermissions ? findPendingForKey(specKey, pendingPermissions) : null;
 

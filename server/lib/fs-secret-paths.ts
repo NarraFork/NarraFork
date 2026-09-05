@@ -51,9 +51,15 @@ const SECRET_HOME_FILES: readonly string[] = [
 	"narrafork.lock",
 ];
 
-/** Home-relative directories that contain provider tokens. */
-const SECRET_HOME_DIRS: readonly string[] = [
-];
+/**
+ * Home-relative directories that contain provider tokens.
+ *
+ * Empty today: every current provider keeps its credentials in a single file
+ * covered by `SECRET_HOME_FILES`. Kept as an extension point because a token
+ * store's internal layout is the provider's business — a directory match covers
+ * files this list has never heard of.
+ */
+const SECRET_HOME_DIRS: readonly string[] = [];
 
 /** Home-relative prefixes: the database and every sidecar spelling of it. */
 const SECRET_HOME_PREFIXES: readonly string[] = ["narrafork.db"];

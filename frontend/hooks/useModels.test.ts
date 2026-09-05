@@ -47,22 +47,6 @@ describe("configured fallback models", () => {
 		expect(models.every((model) => model.provider === "gemini-live")).toBe(true);
 	});
 
-	test("requires both token and base URL for Cline fallback injection", () => {
-		const incomplete = getConfiguredFallbackModels({
-			clineProviders: [
-				{
-					id: "cline",
-					name: "Cline",
-					prefix: "cline-custom",
-					accessToken: "token",
-					baseUrl: "",
-					defaultModel: "model",
-				},
-			],
-			agent: { defaultModel: "cline-custom:model", summaryModel: "" },
-		});
-		expect(incomplete).toEqual([]);
-	});
 });
 
 describe("selectable provider prefixes", () => {

@@ -1,0 +1,32 @@
+/**
+ * vlist-markers.css — animation for the scrollbar quick-index marks.
+ *
+ * Only the RUNNING compact mark pulses: a finished or failed compact is a
+ * settled fact and draws no attention, whereas a compact in flight is the one
+ * the reader may want to watch (or cancel). Colour comes from the mark's
+ * inline style; this file owns motion only.
+ */
+
+@keyframes vlist-compact-marker-pulse {
+	0%,
+	100% {
+		opacity: 1;
+	}
+	50% {
+		opacity: 0.35;
+	}
+}
+
+.vlist-compact-marker--compacting {
+	animation: vlist-compact-marker-pulse 1.6s ease-in-out infinite;
+}
+
+/* Motion is information here, not decoration: without the pulse a running
+   compact must still read differently from a finished one, so dim it instead
+   of animating. */
+@media (prefers-reduced-motion: reduce) {
+	.vlist-compact-marker--compacting {
+		animation: none;
+		opacity: 0.75;
+	}
+}

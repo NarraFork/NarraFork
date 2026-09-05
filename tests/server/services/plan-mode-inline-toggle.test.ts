@@ -65,6 +65,7 @@ describe("ExitPlanMode inline-plan toggle", () => {
 		expect(desc).toContain("only the file-based plan flow is supported");
 	});
 
+	it("keeps mode required but never lets it be promoted away by NUG padding", () => {
 		// `ensureNonEmptySchema` only injects its dummy when nothing is required;
 		// a real `mode` means ExitPlanMode no longer needs that crutch.
 		const schema = exitPlanModeTool.getRawJsonSchema?.(makeConfig(true)) as {

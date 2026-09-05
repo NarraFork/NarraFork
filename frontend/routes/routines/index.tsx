@@ -68,7 +68,6 @@ import {
 	useMcpExternalServerManagementCapability,
 	useMcpServerSettingsStorageCapability,
 	useMcpTransportsCapability,
-	useProviderRouteCapability,
 } from "../../hooks/usePlatform";
 import { useProjects } from "../../hooks/useProjects";
 import {
@@ -1979,12 +1978,6 @@ function McpToolsTab() {
 	const [importError, setImportError] = useState<string | null>(null);
 	const [importResult, setImportResult] = useState<string | null>(null);
 
-	// biome-ignore lint/suspicious/noExplicitAny: MCP tool response structure varies
-		queryKey: ["mcp-tools"],
-		retry: false,
-	});
-	// biome-ignore lint/suspicious/noExplicitAny: MCP tool list structure
-
 	const handleImport = useCallback(() => {
 		if (!mcpServerImportSupported) return;
 		setImportError(null);
@@ -2432,30 +2425,6 @@ function McpToolsTab() {
 					</Paper>
 				);
 			})}
-
-				<>
-					<Text size="sm" fw={600} mt="md">
-						{t("mcpBuiltinTools")}
-					</Text>
-					<Text size="xs" c="dimmed">
-						{t("mcpBuiltinToolsDesc")}
-					</Text>
-						<Paper key={tool.name} withBorder p="sm">
-							<Text size="sm" fw={600}>
-								{tool.name}
-							</Text>
-							{tool.description && (
-								<Text size="xs" c="dimmed">
-									{formatRoutineTextPreview(
-										tool.description,
-										MAX_ROUTINE_DETAIL_TEXT_PREVIEW_CHARS,
-									)}
-								</Text>
-							)}
-						</Paper>
-					))}
-				</>
-			)}
 
 			{/* Create / Edit Modal */}
 			<Modal

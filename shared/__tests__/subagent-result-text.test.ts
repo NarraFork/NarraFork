@@ -83,6 +83,7 @@ describe("subagentResultText", () => {
 	it("extracts and strips in one step for the envelope form", () => {
 		expect(
 			subagentResultText({
+				_text: "<subagent_id>枚举-单例耦合点</subagent_id>\n\n# 结论\n\n正文",
 				_metadata: { execDurationMs: 12 },
 			}),
 		).toBe("# 结论\n\n正文");

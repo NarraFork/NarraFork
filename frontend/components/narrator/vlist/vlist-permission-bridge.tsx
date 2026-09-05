@@ -27,8 +27,16 @@
 import { type ReactNode, useMemo } from "react";
 import { AskUserQuestionBanner, coerceQuestions } from "../AskUserQuestionBanner";
 import { InlinePermission } from "../InlinePermission";
-import type { PendingPermission, PermissionCallbacks } from "../narrator-panel-types";
-import { decidePermissionSlot } from "./vlist-permission-match";
+import type {
+	AsyncQuestionSlot,
+	PendingPermission,
+	PermissionCallbacks,
+} from "../narrator-panel-types";
+import {
+	decidePermissionSlot,
+	isPermissionHostRow,
+	toolUseIdFromSpecKey,
+} from "./vlist-permission-match";
 import type { VListItem } from "./vlist-pipeline";
 import type { VListReflectionSource } from "./vlist-reflection-index";
 
@@ -39,7 +47,18 @@ interface UsePermissionSlotsArgs {
 	permCb?: PermissionCallbacks;
 	/** `toolUseId → reflection source`, derived from the loaded message tree. */
 	reflections?: ReadonlyMap<string, VListReflectionSource>;
+	/**
+	 * Open ASYNCHRONOUS questions, keyed by the tool_use id that asked them.
+	 *
+	 * A second, lower-precedence source for the same slot. Ranking it below a pending
+	 * permission is not a style choice: a permission means the session is stopped right
+	 * now, while an async question means it is not, and only one form fits in a row. The
+	 * asked-without-blocking case must never take the slot from the blocked one.
+	 */
+	asyncQuestions?: ReadonlyMap<string, AsyncQuestionSlot>;
 }
+
+export type { AsyncQuestionSlot } from "../narrator-panel-types";
 
 /**
  * Build a `spec.key → live permission node` map for the pending-permission tool /
@@ -62,18 +81,23 @@ export function usePermissionSlots({
 	renderItems,
 	permCb,
 	reflections,
+	asyncQuestions,
 }: UsePermissionSlotsArgs): Map<string, ReactNode> {
 	const pendingPermissions = permCb?.pendingPermissions;
 	const onPermissionDecision = permCb?.onPermissionDecision;
 	const onQuestionSubmit = permCb?.onQuestionSubmit;
 	const onQuestionReflect = permCb?.onQuestionReflect;
 	const onQuestionDeny = permCb?.onQuestionDeny;
+	const onQuestionDefer = permCb?.onQuestionDefer;
 
 	return useMemo(() => {
 		const map = new Map<string, ReactNode>();
-		// No pending request → nothing to mount. A row carrying only a reflection
-		// needs no slot at all now that the notice is measured.
-		if (!pendingPermissions || pendingPermissions.length === 0) return map;
+		const hasPending = !!pendingPermissions && pendingPermissions.length > 0;
+		const hasAsync = !!asyncQuestions && asyncQuestions.size > 0;
+		// Nothing waiting on either channel → every row renders with its normal
+		// zero-DOM body. A row carrying only a reflection needs no slot at all now
+		// that the notice is measured.
+		if (!hasPending && !hasAsync) return map;
 		for (const item of renderItems) {
 			if (!item) continue;
 			const decision = decidePermissionSlot(
@@ -84,27 +108,83 @@ export function usePermissionSlots({
 			);
 			// A "reflection" decision means the measured notice owns this row's
 			// permission area; mounting a form would double it up.
-			if (decision.kind !== "permission" || !decision.pending) continue;
-			map.set(
-				item.spec.key,
-				buildPermissionNode(decision.pending, {
-					onPermissionDecision,
-					onQuestionSubmit,
-					onQuestionReflect,
-					onQuestionDeny,
-				}),
-			);
+			if (decision.kind === "reflection") continue;
+			if (decision.kind === "permission" && decision.pending) {
+				map.set(
+					item.spec.key,
+					buildPermissionNode(decision.pending, {
+						onPermissionDecision,
+						onQuestionSubmit,
+						onQuestionReflect,
+						onQuestionDeny,
+						onQuestionDefer,
+					}),
+				);
+				continue;
+			}
+			// No permission claimed this row: an open async question may. The host-kind
+			// check is re-applied because `decidePermissionSlot` returns a bare "none" for
+			// a non-hosting row, without the toolUseId that would gate it here.
+			if (!isPermissionHostRow(item.spec.kind)) continue;
+			const toolUseId = decision.toolUseId ?? toolUseIdFromSpecKey(item.spec.key);
+			const asyncSlot = toolUseId ? asyncQuestions?.get(toolUseId) : undefined;
+			if (asyncSlot) {
+				map.set(item.spec.key, buildAsyncQuestionNode(asyncSlot));
+			}
 		}
 		return map;
 	}, [
 		renderItems,
 		pendingPermissions,
 		reflections,
+		asyncQuestions,
 		onPermissionDecision,
 		onQuestionSubmit,
 		onQuestionReflect,
 		onQuestionDeny,
+		onQuestionDefer,
 	]);
+}
+
+/**
+ * Mount the answer form for an open asynchronous question.
+ *
+ * No `onReflect` and no `reflectionDeadline`: an async question arms no automatic
+ * answer timer, so offering "let the model answer" here would advertise a mechanism
+ * that is not running.
+ */
+export function buildAsyncQuestionNode(slot: AsyncQuestionSlot): ReactNode {
+	if (slot.questions.length === 0) return null;
+	const banner = (
+		<AskUserQuestionBanner
+			requestId={slot.id}
+			draftId={slot.draftId}
+			questions={slot.questions}
+			busy={slot.busy}
+			denyLabel={slot.denyLabel}
+			onSubmit={(id, answers) => slot.onSubmit(id, answers)}
+			onDeny={(id) => slot.onDismiss(id)}
+		/>
+	);
+	if (!slot.awaited || !slot.awaitedLabel) return banner;
+	// An awaited question has stopped the session, so the card says so above the form.
+	// Both nodes are mounted in the SAME slot, whose height the shell measures after
+	// paint, so adding a line here needs no measure-path change.
+	return (
+		<div>
+			<div
+				style={{
+					fontSize: "var(--mantine-font-size-xs)",
+					color: "var(--mantine-color-yellow-6)",
+					fontWeight: 500,
+					marginBottom: 4,
+				}}
+			>
+				{slot.awaitedLabel}
+			</div>
+			{banner}
+		</div>
+	);
 }
 
 interface PermissionNodeHandlers {
@@ -112,6 +192,7 @@ interface PermissionNodeHandlers {
 	onQuestionSubmit?: PermissionCallbacks["onQuestionSubmit"];
 	onQuestionReflect?: PermissionCallbacks["onQuestionReflect"];
 	onQuestionDeny?: PermissionCallbacks["onQuestionDeny"];
+	onQuestionDefer?: PermissionCallbacks["onQuestionDefer"];
 }
 
 /**
@@ -135,6 +216,9 @@ export function buildPermissionNode(
 					onSubmit={(reqId, answers) => handlers.onQuestionSubmit?.(reqId, answers)}
 					onReflect={(reqId) => handlers.onQuestionReflect?.(reqId)}
 					onDeny={(reqId) => handlers.onQuestionDeny?.(reqId)}
+					{...(handlers.onQuestionDefer
+						? { onDefer: (reqId: string) => handlers.onQuestionDefer?.(reqId) }
+						: {})}
 				/>
 			);
 		}
@@ -146,6 +230,7 @@ export function buildPermissionNode(
 			onQuestionSubmit={handlers.onQuestionSubmit}
 			onQuestionReflect={handlers.onQuestionReflect}
 			onQuestionDeny={handlers.onQuestionDeny}
+			onQuestionDefer={handlers.onQuestionDefer}
 		/>
 	);
 }

@@ -30,6 +30,7 @@ const meta = {
 	narratorId: "n-1",
 	kind: "narrator",
 	provider: "nug2",
+	model: "nug2:anthropic:claude-opus-5",
 	credentialId: null,
 	errorMessage: "Improperly formed request.",
 	createdAt: "2026-08-19T10:47:10.832Z",
@@ -48,6 +49,7 @@ describe("writeRawDumpSpill", () => {
 		const body = { messages: [{ role: "user", content: "X".repeat(200_000) }] };
 		const dump = {
 			provider: "nug2",
+			request: { transport: "http", url: "https://example.invalid/v1/messages", body },
 			response: { status: 200, bodyText: '{"message":"Improperly formed request."}' },
 		};
 

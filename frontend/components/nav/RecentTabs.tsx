@@ -117,7 +117,11 @@ import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { copyTextToClipboard } from "../../lib/clipboard";
 import { clearFaviconAlert, setFaviconAlert } from "../../lib/favicon";
-import { clearNotifiedAttention, triggerNotification } from "../../lib/notification";
+import {
+	clearNotifiedAttention,
+	triggerNotification,
+	updateAsyncQuestionAttention,
+} from "../../lib/notification";
 import { endDrag, moveDrag, startDragManual, startPointerDrag } from "../../lib/panel-drag";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 
@@ -456,7 +460,19 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				patch.activeTerminalCount = event.activeTerminalCount;
 			} else if (event.type === "containerStatus") patch.containerStatus = event.containerStatus;
 			else if (event.type === "draft") patch.hasDraft = !!event.hasDraft;
-			else return;
+			else if (event.type === "awaitedQuestion") {
+				// The subscription reconciles caches for ALL changes before this callback.
+				// Attention is separate: no synthetic status patch or urgency-gated refetch.
+				const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
+				updateAsyncQuestionAttention(
+					narratorId,
+					event.questionId,
+					event.awaited === true,
+					tab?.title,
+					userPrefsRef.current,
+				);
+				return;
+			} else return;
 
 			// This WS event is now the freshest source for these fields. An older runtime
 			// response must not roll them back (icon colour / filled state lag).

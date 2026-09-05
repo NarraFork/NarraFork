@@ -133,11 +133,9 @@ export {
 // Takeover state
 export {
 	beginSubagentInterruptSuspension,
-	clearPendingTakeover,
 	clearTakenOver,
 	consumePendingBackgroundFinalize,
 	consumePendingStopTakeover,
-	consumePendingTakeover,
 	hydrateTakeoverState,
 	isBackgroundTakenOver,
 	isPendingStopTakeover,
@@ -145,10 +143,8 @@ export {
 	listTakenOverSubagents,
 	markPendingBackgroundFinalize,
 	markPendingStopTakeover,
-	markPendingTakeover,
 	markTakenOver,
 	preserveTakenOverSubstatus,
-	suspensionIsTakeover,
 	TAKEN_OVER_SUBSTATUS,
 } from "./subagent-takeover";
 // Team collaboration

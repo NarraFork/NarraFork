@@ -1,5 +1,6 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
+import type { MessageOriginOptions } from "@shared/message-origin";
 import {
 	isWriteAudienceAllowed,
 	type NarratorVisibility,
@@ -92,6 +93,7 @@ import {
 } from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { claimAgentMessageOrigin } from "./agent-message-origin";
 import type {
 	BlockAllSkillsResult,
 	BlockSkillResult,
@@ -112,11 +114,10 @@ import {
 	type NarratorAccessNeed,
 } from "./narrator-acl";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
-import {
-	appendMessageRef,
-	bumpParentNarratorMessageVersion,
-	narratorPersistence,
-} from "./narrator-persistence";
+// `bumpParentNarratorMessageVersion` is deliberately NOT imported any more: the bump
+// now happens inside `persistUserMessage`/`persistSystemMessage`, so every writer of a
+// child row gets it rather than only the subagent entry point that remembered to call it.
+import { appendMessageRef, narratorPersistence } from "./narrator-persistence";
 import { materializeChildrenOf } from "./narrator-refs-backfill";
 import { specVfsService } from "./spec-vfs-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
@@ -1608,6 +1609,36 @@ export const narratorService = {
 		};
 	},
 
+	/**
+	 * Persist a subagent's `role: "user"` turn.
+	 *
+	 * ## What is left here, and why it is not drift
+	 *
+	 * The WRITE itself is now `persistUserMessage` with a `parentToolUseId` placement —
+	 * there is one insert path for user rows again. Three things remain this method's
+	 * own, and each is a decision the generic entry point must NOT make:
+	 *
+	 * 1. **Registry attribution.** Three routes reach this method (the in-pass drain,
+	 *    the pass-restart drain, `resumeSubagent`) and any of them may carry either a
+	 *    human's typed message or a message another AGENT sent through `Send`. Those two
+	 *    are indistinguishable by the time they arrive — same text, same `createdBy` (the
+	 *    human whose session triggered the send) — so the delivery registry is consulted
+	 *    instead of trusting the row's shape. Claiming is consume-once and MUST happen on
+	 *    exactly the routes that deliver agent-to-agent messages; doing it inside
+	 *    `persistUserMessage` would let an unrelated primary-narrator turn with identical
+	 *    text claim a subagent's pending attribution.
+	 * 2. **Withholding the creator for AI-authored text.** `createdBy` stays audit data,
+	 *    but the creator ROW is what a bubble header renders as the author, so a machine's
+	 *    words must not be signed with a real person's avatar. The generic path keeps
+	 *    returning the creator whenever `createdBy` is set, because primary-narrator
+	 *    producers (a scheduled task run) legitimately pair an account with a non-human
+	 *    origin and their UI depends on it.
+	 * 3. **Attachment blocks + the empty-text placeholder.** Image/text-file blocks and
+	 *    the `[user sent image(s)]` fallback are a subagent-page input concern; the
+	 *    primary path builds its blocks in `feedMessage`.
+	 *
+	 * An explicit `origin` still wins, so a caller that knows better is never overridden.
+	 */
 	async persistSubagentUserMessage(
 		narratorId: string,
 		text: string,
@@ -1617,10 +1648,14 @@ export const narratorService = {
 			textFiles?: TextFileRef[];
 			commandText?: string | null;
 			createdBy?: string | null;
+			origin?: MessageOriginOptions;
 		},
 	) {
-		const id = generateId();
-		const now = new Date().toISOString();
+		// Claimed unconditionally: `claimAgentMessageOrigin` returns null for an
+		// ordinary human message, and claiming is consume-once so the attribution
+		// cannot leak onto a later message that repeats the same text.
+		const claimed = claimAgentMessageOrigin(narratorId, text);
+		const origin = options?.origin ?? claimed ?? undefined;
 		const contentJson: Array<
 			| { type: "text"; text: string }
 			| PersistedUserImageBlock
@@ -1641,30 +1676,20 @@ export const narratorService = {
 		const effectiveText =
 			(!text.trim() && (options?.images?.length ?? 0) > 0 ? "[user sent image(s)]" : text) +
 			buildAttachedFilesHint(options?.textFiles ?? []);
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				parentToolUseId,
-				role: "user",
-				contentJson,
-				contentText: effectiveText,
-				commandText: options?.commandText ?? null,
-				createdBy: options?.createdBy ?? null,
-				createdAt: now,
-			})
-			.returning();
-
-		const seq = await appendMessageRef(narratorId, id);
-		await bumpParentNarratorMessageVersion(parentToolUseId);
-		const creator = options?.createdBy
-			? ((await db.query.users.findFirst({
-					where: eq(users.id, options.createdBy),
-					columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-				})) ?? null)
-			: null;
-		return { ...msg, seq, creator };
+		const msg = await narratorPersistence.persistUserMessage(
+			narratorId,
+			effectiveText,
+			contentJson,
+			options?.commandText ?? null,
+			options?.createdBy ?? null,
+			origin,
+			{ parentToolUseId },
+		);
+		// See (2) above: withheld here rather than in the shared entry point, so the
+		// row's `created_by` survives as audit data while the rendered author does not
+		// claim a human wrote it.
+		const authoredByHuman = (origin?.origin ?? "user") === "user";
+		return authoredByHuman ? msg : { ...msg, creator: null };
 	},
 
 	/**

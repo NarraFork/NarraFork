@@ -108,6 +108,8 @@ function persistAskDraft(
 
 interface AskUserQuestionBannerProps {
 	requestId: string;
+	/** Stable local draft identity (the tool-call id survives deferral). Never used for API calls. */
+	draftId?: string;
 	questions: Question[];
 	/** Pre-filled answers — used for read-only display of completed questions */
 	answers?: Record<string, string>;
@@ -121,11 +123,30 @@ interface AskUserQuestionBannerProps {
 	reflectionDeadline?: number | null;
 	onSubmit?: (requestId: string, answers: Record<string, string>) => void;
 	onDeny?: (requestId: string) => void;
+	/**
+	 * Run the model's own answer instead. Omit for questions where that makes no sense
+	 * (asynchronous ones), which also hides the button — see the render note below.
+	 */
 	onReflect?: (requestId: string) => Promise<void> | void;
+	/**
+	 * Label for the decline action. Defaults to "skip". An asynchronous question passes
+	 * its own wording, because "skip" understates what happens there: the agent is told
+	 * to decide for itself and moves on permanently.
+	 */
+	denyLabel?: string;
+	/** Show the submit/decline buttons as busy while a request is in flight. */
+	busy?: boolean;
+	/**
+	 * Release the blocked session without answering, moving this question to the async
+	 * inbox. Offered only for a BLOCKING prompt — an async question is already deferred,
+	 * so the button would be a no-op there and is hidden when this is absent.
+	 */
+	onDefer?: (requestId: string) => Promise<void> | void;
 }
 
 export function AskUserQuestionBanner({
 	requestId,
+	draftId = requestId,
 	questions: rawQuestions,
 	answers: savedAnswers,
 	readOnly,
@@ -133,6 +154,9 @@ export function AskUserQuestionBanner({
 	onSubmit,
 	onDeny,
 	onReflect,
+	denyLabel,
+	busy,
+	onDefer,
 }: AskUserQuestionBannerProps) {
 	const { t } = useTranslation("narrator");
 	const { t: ts } = useTranslation("settings");
@@ -163,11 +187,15 @@ export function AskUserQuestionBanner({
 	};
 	// Defensive: questions may come from untyped JSON or as a stringified array
 	const questions = coerceQuestions(rawQuestions);
-	const draftKey = requestId;
+	const draftKey = draftId;
 	const storedDraftRef = useRef<AskDraft | null | undefined>(undefined);
 	const getStoredDraft = () => {
 		if (storedDraftRef.current === undefined) {
-			storedDraftRef.current = readOnly ? null : readAskDraft(draftKey);
+			// Existing async forms used the question/request id. Adopt that draft when
+			// no stable tool-call draft exists, without changing the API request identity.
+			storedDraftRef.current = readOnly
+				? null
+				: (readAskDraft(draftKey) ?? readAskDraft(requestId));
 		}
 		return storedDraftRef.current;
 	};
@@ -178,6 +206,7 @@ export function AskUserQuestionBanner({
 		() => getStoredDraft()?.customInputs ?? {},
 	);
 	const [reflecting, setReflecting] = useState(false);
+	const [deferring, setDeferring] = useState(false);
 
 	// --- Automatic-reflection countdown & disarm-on-interaction -----------------
 	// Local override so the countdown disappears the moment the user interacts,
@@ -227,7 +256,8 @@ export function AskUserQuestionBanner({
 		} else {
 			removeSession("ask-draft", draftKey);
 		}
-	}, [readOnly, draftKey, selections, customInputs]);
+		if (draftKey !== requestId) removeSession("ask-draft", requestId);
+	}, [readOnly, draftKey, requestId, selections, customInputs]);
 
 	// Custom input takes priority when non-empty
 	const getAnswer = (question: string) => {
@@ -309,7 +339,7 @@ export function AskUserQuestionBanner({
 															? isSavedOptionSelected(q, opt.label, savedAnswers, {
 																	allowSingleAnswerFallback,
 																})
-															: undefined
+															: (selections[q.question]?.split(", ").includes(opt.label) ?? false)
 													}
 													onChange={
 														readOnly
@@ -388,34 +418,70 @@ export function AskUserQuestionBanner({
 					)}
 					{!readOnly && (
 						<Group>
-							<Button size="xs" onClick={handleSubmit} disabled={!allAnswered}>
+							<Button
+								size="xs"
+								onClick={handleSubmit}
+								disabled={!allAnswered || busy}
+								loading={busy}
+							>
 								{t("submitAnswer")}
 							</Button>
-							<Group gap={4} wrap="nowrap">
-								<Button size="xs" variant="light" loading={reflecting} onClick={handleReflect}>
-									{reflecting ? t("questionReflecting") : t("questionReflectionAnswer")}
+							{/*
+							 * Reflection ("let the model answer for me") only exists for a BLOCKING
+							 * question, where it is the escape hatch from a stalled session. An
+							 * asynchronous question already stalls nothing, so a caller that passes
+							 * no `onReflect` gets no button — offering one would advertise a feature
+							 * that has no wiring behind it here.
+							 */}
+							{onReflect && (
+								<Group gap={4} wrap="nowrap">
+									<Button size="xs" variant="light" loading={reflecting} onClick={handleReflect}>
+										{reflecting ? t("questionReflecting") : t("questionReflectionAnswer")}
+									</Button>
+									<Tooltip label={t("questionReflectionSettings")}>
+										<ActionIcon
+											size="sm"
+											variant="subtle"
+											aria-label={t("questionReflectionSettings")}
+											onClick={() => setSettingsOpen(true)}
+										>
+											<IconSettings size={14} />
+										</ActionIcon>
+									</Tooltip>
+								</Group>
+							)}
+							{/* "Answer later" keeps the DRAFT: unlike skip, the user still intends to
+							    answer, so discarding what they had typed would be a data loss. */}
+							{onDefer && (
+								<Button
+									size="xs"
+									variant="subtle"
+									loading={deferring}
+									disabled={busy}
+									onClick={async () => {
+										if (deferring) return;
+										setDeferring(true);
+										try {
+											await onDefer(requestId);
+										} finally {
+											setDeferring(false);
+										}
+									}}
+								>
+									{t("deferQuestion")}
 								</Button>
-								<Tooltip label={t("questionReflectionSettings")}>
-									<ActionIcon
-										size="sm"
-										variant="subtle"
-										aria-label={t("questionReflectionSettings")}
-										onClick={() => setSettingsOpen(true)}
-									>
-										<IconSettings size={14} />
-									</ActionIcon>
-								</Tooltip>
-							</Group>
+							)}
 							<Button
 								size="xs"
 								color="red"
 								variant="light"
+								disabled={busy}
 								onClick={() => {
 									removeSession("ask-draft", draftKey);
 									onDeny?.(requestId);
 								}}
 							>
-								{t("skipQuestion")}
+								{denyLabel ?? t("skipQuestion")}
 							</Button>
 						</Group>
 					)}

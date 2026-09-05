@@ -2,12 +2,21 @@
  * RenderToolCall.tailfollow.test.tsx — which capped bodies get the
  * output-tail follow wrapper (AutoFollowScroll) and which must not.
  *
- * The follow is for bodies whose NEWEST content is at the BOTTOM — bash output,
- * terminal read/list output — so a streaming body scrolls itself while it
- * grows. The gate is the classifier's literal `output` section label AND a
- * terminal-style cap (`detail-term` / `detail-streaming-bash`): the same caps
- * also appear on INPUT previews (a streaming Write body, a streaming command),
- * which open at the head like any code body and must stay that way.
+ * The follow is for bodies whose NEWEST content is at the BOTTOM while they
+ * GROW — bash/terminal output, a streaming Write preview, a streaming Edit
+ * diff — so such a body scrolls itself (and pins on MOUNT: its first frame may
+ * already overflow). The gates:
+ *
+ *  - sections path: a literal `output` label AND a terminal-style cap
+ *    (`detail-term` / `detail-streaming-bash`), OR a `detail-streaming` body
+ *    (that cap only comes out of classifyStreamingInput), OR a `detail-diff`
+ *    body while the card is still streaming;
+ *  - single-block path (a lone unlabelled section collapses into it): the same
+ *    tag rules minus the label — this is where a streaming Write/Edit preview
+ *    lands before its path row exists;
+ *  - a streaming command box (`detail-streaming-bash` WITHOUT the output label)
+ *    and every settled code/diff body stay head-anchored: they read from the
+ *    head.
  *
  * Structure only: SSR paints no scroll handlers, so the assertion is whether
  * the scroll box's parent is AutoFollowScroll's `position:relative; min-width:0`
@@ -61,8 +70,9 @@ const LONG_BODY = Array.from({ length: 80 }, (_, i) => `line ${i}`).join("\n");
 /** One sections-kind card with a single capped body section. */
 function cardWithSection(opts: {
 	label?: "command" | "output";
-	cap: "bash-cmd" | "term" | "streaming-bash" | "code";
+	cap: "bash-cmd" | "term" | "streaming-bash" | "streaming" | "code" | "diff";
 	text: string;
+	isStreaming?: boolean;
 }) {
 	return measureToolCall(
 		{
@@ -71,6 +81,7 @@ function cardWithSection(opts: {
 			category: "bash",
 			status: "success",
 			toolUseId: "tu_1",
+			...(opts.isStreaming ? { isStreaming: true } : {}),
 			detail: {
 				kind: "sections",
 				sections: [
@@ -85,6 +96,38 @@ function cardWithSection(opts: {
 						},
 					},
 				],
+			},
+		},
+		WIDTH,
+		5,
+		{ opened: true },
+	);
+}
+
+/**
+ * One SINGLE-BLOCK capped card — what `sections()` collapses a lone unlabelled
+ * section into (tool-detail.ts). A streaming Write/Edit preview whose path row
+ * has not arrived yet renders through this branch.
+ */
+function cardWithSingleCap(opts: {
+	cap: "streaming-bash" | "streaming" | "diff" | "code";
+	text: string;
+	isStreaming?: boolean;
+}) {
+	return measureToolCall(
+		{
+			toolName: "Write",
+			summary: "file",
+			category: "file",
+			status: "success",
+			toolUseId: "tu_1",
+			...(opts.isStreaming ? { isStreaming: true } : {}),
+			detail: {
+				kind: "capped",
+				cap: opts.cap,
+				contentLines: 80,
+				hasLabel: false,
+				text: opts.text,
 			},
 		},
 		WIDTH,
@@ -150,5 +193,41 @@ describe("RenderToolCall — output-tail follow wrapper", () => {
 	it("does NOT wrap a term box without the output label (input previews)", () => {
 		const root = renderCard(cardWithSection({ cap: "term", text: LONG_BODY }));
 		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(false);
+	});
+
+	it("wraps a streaming Write preview (streaming cap, no label)", () => {
+		const root = renderCard(
+			cardWithSection({ cap: "streaming", text: LONG_BODY, isStreaming: true }),
+		);
+		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(true);
+	});
+
+	it("wraps a streaming Edit diff (diff cap while streaming)", () => {
+		const root = renderCard(cardWithSection({ cap: "diff", text: LONG_BODY, isStreaming: true }));
+		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(true);
+	});
+
+	it("does NOT wrap a settled diff — a finished edit reads from the head", () => {
+		const root = renderCard(cardWithSection({ cap: "diff", text: LONG_BODY }));
+		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(false);
+	});
+
+	it("wraps a streaming Write preview on the SINGLE-BLOCK path (no path row yet)", () => {
+		const root = renderCard(
+			cardWithSingleCap({ cap: "streaming", text: LONG_BODY, isStreaming: true }),
+		);
+		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(true);
+	});
+
+	it("wraps a streaming Edit diff on the SINGLE-BLOCK path", () => {
+		const root = renderCard(cardWithSingleCap({ cap: "diff", text: LONG_BODY, isStreaming: true }));
+		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(true);
+	});
+
+	it("does NOT wrap a single-block streaming-bash box — the command preview reads from the head", () => {
+		const root = renderCard(
+			cardWithSingleCap({ cap: "streaming-bash", text: "$ npm test", isStreaming: true }),
+		);
+		expect(isFollowWrapped(scrollBoxContaining(root, "$ npm test"))).toBe(false);
 	});
 });

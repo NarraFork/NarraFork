@@ -25,6 +25,7 @@
 - 合并 DB 失败返回 warning 而非 500
 - 离开叙述者重置 interrupted 状态
 - Plan mode deny 反馈（i18n）
+- 工具使用流式去重（内置网关适配器）
 
 ## [0.0.7] - 2026-03-10
 
@@ -227,6 +228,7 @@
 - 服务端消息树、i18n 提示词、终端 PTY
 - SDK Plan 模式支持
 - 自定义 Agent Loop 架构（替代 claude-agent-sdk）
+- 多提供商支持（Anthropic、OpenAI、内置网关）
 - WebSearch 工具
 - 多 Token 管理器、模型列表、结构化日志
 - 会话分支（conversation branches）→ 重构为 narrator_message_refs
@@ -252,6 +254,7 @@
 - sessions→narrators 路由迁移、容器管理重写（rootless podman）
 - 项目要求 git 仓库、项目数据库备份、快照系统改进
 - 斜杠命令系统（/command 自动补全，用户和项目级别）
+- 技能系统、WS 健壮性、企业环境检测、认证加固
 - 统一容器代理服务（基于子域名的反向代理）
 - Reasoning Effort、Anthropic 和 Codex 支持
 - 最近标签页实时状态指示器 + agent loop 网络重试增强

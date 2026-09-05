@@ -13,6 +13,7 @@ export const webSearchTool: ToolDefinition = {
 	description:
 		"\n- Allows the agent to search the web and use the results to inform responses\n" +
 		"- Provides up-to-date information for current events and recent data\n" +
+		"- Search routing is controlled by Settings → Web search: native model search, gateway-managed search, custom search APIs, and optional search subagents\n" +
 		"- Use this tool for accessing information beyond the model's knowledge cutoff\n" +
 		"\nCRITICAL REQUIREMENT - You MUST follow this:\n" +
 		'  - After answering the user\'s question, include a "Sources:" section when search results contain URLs\n' +

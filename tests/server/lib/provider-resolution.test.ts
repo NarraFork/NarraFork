@@ -36,7 +36,6 @@ function resetProviders(): void {
 	settings.openaiProviders = [];
 	settings.anthropicProviders = [];
 	settings.nugProviders = [];
-	settings.clineProviders = [];
 	settings.codex = undefined;
 	if (settings.agent) {
 		settings.agent.customModels = [];
@@ -102,8 +101,6 @@ describe("resolveProvider fallback order", () => {
 	});
 	afterEach(() => {
 		restoreFromSnapshot(snapshot);
-		} else {
-		}
 		__setCodexManagerForTests(undefined);
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
@@ -130,11 +127,9 @@ describe("resolveProvider fallback order", () => {
 		expect(provider).toBe("codex");
 	});
 
-		};
+	test("无任何 provider 配置时 fallback 到 anthropic", () => {
 		const provider = resolveProvider("unknown-model");
-	});
-
-		const provider = resolveProvider("unknown-model");
+		expect(provider).toBe("anthropic");
 	});
 
 	test("explicit provider prefix 保持优先", () => {
@@ -153,8 +148,6 @@ describe("resolveProvider fallback order", () => {
 		}
 	});
 
-		const provider = resolveProvider("claude-sonnet");
-	});
 });
 
 describe("getProvider fallback behavior", () => {
@@ -167,26 +160,14 @@ describe("getProvider fallback behavior", () => {
 	});
 	afterEach(() => {
 		restoreFromSnapshot(snapshot);
-		} else {
-		}
 		__setCodexManagerForTests(undefined);
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
-		addOpenaiProvider("deepseek");
-	});
-
-	});
-
 	test("unknown provider 直接报错而非静默回退", () => {
 		addOpenaiProvider("deepseek");
-		expect(() => getProvider("unknown-provider")).toThrow(
-			/Provider "unknown-provider" is not configured/,
-		);
-	});
-
 		expect(() => getProvider("unknown-provider")).toThrow(
 			/Provider "unknown-provider" is not configured/,
 		);
@@ -209,15 +190,16 @@ describe("resolveProviderAndModel behavior", () => {
 	});
 	afterEach(() => {
 		restoreFromSnapshot(snapshot);
-		} else {
-		}
 		__setCodexManagerForTests(undefined);
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
+	test("未配置的 provider 直接报错而非静默回退", () => {
 		addOpenaiProvider("deepseek");
+		expect(() => resolveProviderAndModel("acme:some-model")).toThrow(
+			/Provider "acme" is not configured/,
 		);
 	});
 
@@ -268,6 +250,8 @@ describe("resolveProviderAndModel behavior", () => {
 	});
 
 	// 这里刻意不做硬 fallback：回退会命名一个用户从未配置的 provider，
+	// 于是真正的问题（没有配置默认模型）被伪装成 provider 未配置错误，
+	// 在初始设置阶段表现为凭空出现的模型。直接报错才指向真实原因。
 	test("self-referential defaultModel 直接报错，不回退到硬编码模型", () => {
 		settings.agent.defaultModel = "__default__";
 
@@ -471,8 +455,6 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 	});
 	afterEach(() => {
 		restoreFromSnapshot(snapshot);
-		} else {
-		}
 		__setCodexManagerForTests(undefined);
 		deleteNugCachedModels("nug-id");
 		for (const dir of tempDirs.splice(0)) {
@@ -496,6 +478,7 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 				id: "antigravity:claude-opus-4-6-thinking",
 				model: "claude-opus-4-6-thinking",
 				channel: "antigravity",
+				channelType: "anthropic",
 				contextWindow: 1_000_000,
 			},
 		]);

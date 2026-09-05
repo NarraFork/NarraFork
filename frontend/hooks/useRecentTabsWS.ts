@@ -4,6 +4,7 @@ import {
 	narratorWSManager,
 	type SubscriptionHandle,
 } from "../lib/narrator-ws-manager";
+import { useAsyncQuestionListChange } from "./useAsyncQuestions";
 import type { NarratorListWSEvent } from "./useNarratorWS";
 
 export const RECENT_TABS_LIST_EVENT_TYPES = [
@@ -19,6 +20,7 @@ export const RECENT_TABS_LIST_EVENT_TYPES = [
 	"draft_changed",
 	"goals_set",
 	"list_state_snapshot",
+	"async_question_changed",
 ] as const;
 
 type RecentTabsWSUpdate = (narratorId: string, event: NarratorListWSEvent) => void;
@@ -95,6 +97,7 @@ export function useRecentTabsWS(
 	onGlobalEvent?: (event: { type: string; [key: string]: unknown }) => void,
 	onReconnect?: () => void,
 ) {
+	const applyQuestionChange = useAsyncQuestionListChange();
 	const onUpdateRef = useRef(onUpdate);
 	onUpdateRef.current = onUpdate;
 	const onGlobalEventRef = useRef(onGlobalEvent);
@@ -160,6 +163,9 @@ export function useRecentTabsWS(
 					});
 				} else if (data.type === "draft_changed") {
 					onUpdateRef.current(narratorId, { type: "draft", hasDraft: !!data.hasDraft });
+				} else if (data.type === "async_question_changed") {
+					const event = applyQuestionChange(data);
+					if (event) onUpdateRef.current(narratorId, event);
 				}
 			},
 		);
@@ -181,7 +187,7 @@ export function useRecentTabsWS(
 				subHandleRef.current = null;
 			}
 		};
-	}, []);
+	}, [applyQuestionChange]);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: idsKey is the stable serialization
 	useEffect(() => {

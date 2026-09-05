@@ -1015,9 +1015,7 @@ export function isRetryableError(
 	}
 
 	// Check for known retryable reason/code fields.
-	if (
-		obj.reason === "MODEL_TEMPORARILY_UNAVAILABLE" ||
-	) {
+	if (obj.reason === "MODEL_TEMPORARILY_UNAVAILABLE") {
 		return true;
 	}
 

@@ -700,6 +700,7 @@ export function createPluginPlatformServices(
 	 *
 	 * Concurrency budget is intentionally not populated: the only value the host could send
 	 * is the plugin's own declared maxConcurrentChat, which is noise. Real cross-path budget
+	 * sharing requires provider-specific state that doesn't belong in the generic plugin path.
 	 */
 	const resolveProviderHostHints = (
 		context?: ProviderHostHintsContext,

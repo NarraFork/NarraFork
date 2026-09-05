@@ -139,6 +139,7 @@ export function isPreEffortClaudeModel(model: string): boolean {
  * Restricted to the known channel names so a third-party id that happens to
  * contain a colon is left untouched.
  */
+const CHANNEL_PREFIX_PATTERN = /^(?:codex|openai|anthropic|responses):/i;
 
 /**
  * Reduce a request-path model id to the bare id both sides must agree on.

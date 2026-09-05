@@ -176,3 +176,120 @@ export function shouldShowVListUserMarkers(
 	if (trackHeight <= 0) return false;
 	return documentHeight > trackHeight;
 }
+
+// ── Compact markers ─────────────────────────────────────────────────────────
+
+/** Which compact flavour a scrollbar mark belongs to (drives its colour). */
+export type VListCompactMarkerFlavor = "context" | "segment";
+
+/** Lifecycle status a scrollbar mark renders (drives colour + pulse). */
+export type VListCompactMarkerStatus = "compacting" | "compacted" | "failed";
+
+export interface VListCompactMarker {
+	/** React key — the row's spec key (stable and unique per document). */
+	key: string;
+	/** Index into the exact layout item array. */
+	itemIndex: number;
+	/** Document offset (px) of the row's top edge — the jump target. */
+	top: number;
+	/** Position along the track, 0..1. */
+	fraction: number;
+	flavor: VListCompactMarkerFlavor;
+	status: VListCompactMarkerStatus;
+	/**
+	 * Single-line tooltip text. For live markers this is the adapter's ALREADY
+	 * LOCALIZED indicator line (e.g. "Compacting context… · retry #2"), so the
+	 * tooltip never drifts from what the row itself says; for the failed segment
+	 * card it is the card's title, not the (arbitrarily long) error body.
+	 */
+	tooltip: string;
+}
+
+interface CompactMarkerCandidate {
+	flavor: VListCompactMarkerFlavor;
+	status: VListCompactMarkerStatus;
+	tooltip: string;
+}
+
+/**
+ * Resolve a rendered row into a compact marker candidate, or null when the row
+ * is not a compact marker at all.
+ *
+ * Two row shapes carry compact state:
+ *   - `system-simple` with `data.kind === "compact" | "segment_compact"` — the
+ *     one-line indicator (all three statuses).
+ *   - `system-text` with `data.kind === "segment_compact_failed"` — the failed
+ *     segment compact, which routes to a full error card instead of the line.
+ *
+ * Reading the ADAPTED `spec.data` (not the raw message block) keeps this
+ * collector in parity with whatever the row displays: the indicator's `text`
+ * is composed from status by the adapter, so a row saying "retry #2" yields a
+ * tooltip saying the same.
+ */
+function resolveCompactMarkerCandidate(
+	item: VListUserMarkerItem | undefined,
+): CompactMarkerCandidate | null {
+	if (!item) return null;
+	const data = item.spec.data as
+		| { kind?: unknown; status?: unknown; text?: unknown; title?: unknown }
+		| null
+		| undefined;
+	if (!data || typeof data !== "object") return null;
+	if (item.spec.kind === "system-simple") {
+		const flavor: VListCompactMarkerFlavor | null =
+			data.kind === "compact" ? "context" : data.kind === "segment_compact" ? "segment" : null;
+		if (!flavor) return null;
+		const status: VListCompactMarkerStatus =
+			data.status === "compacting" || data.status === "failed" ? data.status : "compacted";
+		return {
+			flavor,
+			status,
+			tooltip: typeof data.text === "string" ? data.text : "",
+		};
+	}
+	if (item.spec.kind === "system-text" && data.kind === "segment_compact_failed") {
+		return {
+			flavor: "segment",
+			status: "failed",
+			tooltip:
+				typeof data.title === "string" && data.title
+					? data.title
+					: typeof data.text === "string"
+						? data.text
+						: "",
+		};
+	}
+	return null;
+}
+
+/**
+ * Collect one marker per compact indicator in the loaded document. Same
+ * geometry contract as {@link collectVListUserMarkers}: `items` and
+ * `layoutItems` are index-aligned, rows without geometry are skipped, and
+ * fractions are taken against the full scrollable height.
+ */
+export function collectVListCompactMarkers(
+	items: readonly (VListUserMarkerItem | undefined)[],
+	layoutItems: readonly (VListUserMarkerGeometry | undefined)[],
+	documentHeight: number,
+): VListCompactMarker[] {
+	const markers: VListCompactMarker[] = [];
+	const usable = Number.isFinite(documentHeight) && documentHeight > 0 ? documentHeight : 0;
+	for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
+		const candidate = resolveCompactMarkerCandidate(items[itemIndex]);
+		if (!candidate) continue;
+		const geometry = layoutItems[itemIndex];
+		if (!geometry || !Number.isFinite(geometry.top)) continue;
+		const top = Math.max(0, geometry.top);
+		markers.push({
+			key: items[itemIndex]?.spec.key ?? `compact-${itemIndex}`,
+			itemIndex,
+			top,
+			fraction: usable > 0 ? clamp01(top / usable) : 0,
+			flavor: candidate.flavor,
+			status: candidate.status,
+			tooltip: candidate.tooltip,
+		});
+	}
+	return markers;
+}

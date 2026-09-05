@@ -45,11 +45,13 @@ function createPassthroughSchema(inputSchema?: Tool["inputSchema"]): z.ZodType {
 
 /**
  * Clean an MCP inputSchema for use as rawJsonSchema sent to AI providers.
- * is known to accept, recursively cleaning nested schemas.
+ * Uses a whitelist approach: only keeps JSON Schema keywords that strict
+ * upstreams are known to accept, recursively cleaning nested schemas.
  */
 function cleanMcpSchema(inputSchema?: Tool["inputSchema"]): Record<string, unknown> | undefined {
 	if (!inputSchema) return undefined;
 
+	// Whitelist of JSON Schema keywords accepted by strict upstream ToolSpecification
 	const ALLOWED_KEYS = new Set([
 		"type",
 		"description",
@@ -123,6 +125,7 @@ function cleanMcpSchema(inputSchema?: Tool["inputSchema"]): Record<string, unkno
 	result.additionalProperties = false;
 
 	// Ensure the schema has at least a `properties` field — some providers
+	// (Anthropic, some gateways) reject tool definitions with an empty schema.
 	if (!result.properties) {
 		result.properties = {};
 	}

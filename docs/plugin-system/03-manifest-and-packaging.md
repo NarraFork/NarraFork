@@ -13,6 +13,7 @@
 
 ### 1.1 当前实现事实
 
+- **[当前事实]** `server/main.ts` 是运行时组合根：它启动 Bun HTTP/WS，异步初始化 MCP、调度器、Gateway、容器代理和多种恢复流程，并在退出时使用带硬超时的 `shutdownStep()` 清理子系统。
 - **[当前事实]** `McpManager` 从 `settings.mcpServers` 读取启用项，负责连接、工具发现、断线重连、工具列表变化通知和统一 shutdown；它支持 `stdio`、`streamable-http`、`sse` 三种 MCP transport。
 - **[当前事实]** MCP 的 stdio transport 当前会把进程环境合并到子进程环境；插件运行时不应直接复用这种“继承全部环境”的策略，因为其中可能包含密钥、代理和宿主内部配置。
 - **[当前事实]** `server/lib/spawn.ts` 的 `safeSpawn` 已提供参数数组启动、超时、AbortSignal、输出上限、watchdog、进程树清理和 Windows `taskkill /T` 兜底；它可作为插件 Runtime Supervisor 的实现参考，但不能替代插件专用协议监管。
@@ -394,11 +395,14 @@ cn.example.team.provider
 
 ### 3.5.7 `searchProviders`（web 搜索源，已实现）
 
+一个搜索贡献把插件注册成 `lib/search` 的一条搜索通道。宿主为它生成 `kind: "plugin"`、id 为 `plugin:<pluginId>:<contributionId>` 的 channel，用户可以在设置页排序、启停、单独测试，与内置的 native/nug-mcp/custom-api/subagent 通道并列。
 
 ```json
 "searchProviders": [
   {
     "id": "web-search",
+    "title": "Web search (plugin)",
+    "providerId": "acme",
     "requiresConfig": ["credentialsBundle"],
     "capabilities": { "maxResults": true },
     "limits": { "timeoutMs": 60000 }

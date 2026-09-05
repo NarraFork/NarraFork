@@ -18,7 +18,7 @@ export { DEFAULT_TIMEOUT_MS as DEFAULT_AWAIT_TIMEOUT_MS };
 // reloads don't lose references to in-flight timers.
 
 /** What an Await call is waiting on. */
-export type AwaitTargetType = "agent" | "bash" | "transfer";
+export type AwaitTargetType = "agent" | "bash" | "transfer" | "question";
 
 interface RunningAwaitEntry {
 	startedAt: number;
@@ -103,13 +103,18 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 		properties: {
 			type: {
 				description: subagent
-					? 'What to await: "bash" or "transfer" (subagents cannot await other agents).'
-					: 'What to await: "agent" (primary narrator only), "bash", or "transfer" (a background device file transfer).',
+					? 'What to await: "bash", "transfer", or "question" (subagents cannot await other agents).'
+					: 'What to await: "agent" (primary narrator only), "bash", "transfer" (a background device file transfer), or "question" (an async AskUserQuestion).',
 				type: "string",
-				enum: subagent ? ["bash", "transfer"] : ["agent", "bash", "transfer"],
+				// `question` is available to subagents too: a subagent can ask
+				// asynchronously, so it must be able to wait for its own answer. Only
+				// `agent` is withheld (a subagent awaiting a sibling is what deadlocks).
+				enum: subagent
+					? ["bash", "transfer", "question"]
+					: ["agent", "bash", "transfer", "question"],
 			},
 			id: {
-				description: "The task/subagent ID, alias, or accessible subagent name.",
+				description: "The task/subagent ID, alias, accessible subagent name, or async question id.",
 				type: "string",
 			},
 			timeout: {
@@ -135,6 +140,11 @@ export const awaitTool: ToolDefinition = {
 		'Use `type: "bash"` to await a background bash task. ' +
 		'Use `type: "transfer"` to await a background device file transfer; a paused transfer ' +
 		"returns immediately as paused rather than waiting, so you can decide whether to resume it. " +
+		'Use `type: "question"` with a question id to wait for an answer to a question you submitted ' +
+		"via `AskUserQuestion({ async: true })`. Do this when you have reached the point where the answer " +
+		"actually decides your next step: awaiting notifies the user that you are now blocked on them, so " +
+		"only await when you genuinely cannot continue. If the wait times out the question stays open and " +
+		"you may await again, or proceed with your default. An already-answered question returns immediately. " +
 		"If an agent wait times out, the result includes its recent timestamped tool activity. " +
 		"A timeout ends only the current wait, not the task: if activity is recent, keep waiting with " +
 		"Await and a meaningful timeout instead of sending status checks or interrupting the agent. " +
@@ -143,11 +153,13 @@ export const awaitTool: ToolDefinition = {
 		"tasks. For bash tasks, `wait_for_text` returns early once matching output appears.",
 	parameters: z.object({
 		type: z
-			.enum(["agent", "bash", "transfer"])
+			.enum(["agent", "bash", "transfer", "question"])
 			.describe(
-				'What to await: "agent" (primary narrator only), "bash", or "transfer" (a background device file transfer).',
+				'What to await: "agent" (primary narrator only), "bash", "transfer" (a background device file transfer), or "question" (an async AskUserQuestion).',
 			),
-		id: z.string().describe("The task/subagent ID, alias, or accessible subagent name."),
+		id: z
+			.string()
+			.describe("The task/subagent ID, alias, accessible subagent name, or async question id."),
 		timeout: looseNumber(AWAIT_TIMEOUT_DESCRIPTION),
 		wait_for_text: z
 			.string()
@@ -236,6 +248,38 @@ export const awaitTool: ToolDefinition = {
 						targetLabel: result.label,
 						resolvedId: result.id,
 						subagentId: result.id,
+						status: result.status,
+					},
+				};
+			}
+
+			if (type === "question") {
+				const { awaitAsyncQuestion } = await import("@server/services/narrator-question-service");
+				const result = await awaitAsyncQuestion({
+					questionId: id,
+					narratorId: ctx.narratorId,
+					// The reschedulable timeoutController owns the deadline (so the UI can
+					// extend the wait mid-flight); the primitive's own timer is left unarmed.
+					timeoutMs: 0,
+					signal: ctx.signal,
+					timeoutSignal: timeoutController.signal,
+				});
+				if (result.status === "not_found") {
+					return {
+						output:
+							`Error: "${id}" is not an async question belonging to this session. ` +
+							`Use the id returned by AskUserQuestion({ async: true }).`,
+						isError: true,
+					};
+				}
+				return {
+					output: formatQuestionResult(id, result.status, result.record),
+					metadata: {
+						kind: "await",
+						awaitType: "question",
+						targetId: id,
+						targetLabel: result.record.questions[0]?.header ?? id,
+						resolvedId: result.record.id,
 						status: result.status,
 					},
 				};
@@ -343,6 +387,56 @@ export const awaitTool: ToolDefinition = {
 		}
 	},
 };
+
+/**
+ * Wording for a `type: "question"` Await.
+ *
+ * The answers are ALSO delivered as a message row (that is how the async path works at
+ * all), so this text is deliberately a restatement rather than the only copy: an agent
+ * that awaited should not have to wait for its next history rebuild to see what it was
+ * told. The duplication is bounded — at most four question/answer pairs.
+ */
+export function formatQuestionResult(
+	questionId: string,
+	status: string,
+	record: {
+		questions: { question: string; header: string }[];
+		answers: Record<string, string> | null;
+	},
+): string {
+	switch (status) {
+		case "answered": {
+			const lines = record.questions.map((q) => {
+				const answer = record.answers?.[q.question];
+				return `- ${q.header}\n  ${answer ?? "(no answer recorded)"}`;
+			});
+			return `The user answered question ${questionId}:\n\n${lines.join("\n")}`;
+		}
+		case "dismissed":
+			return (
+				`The user declined to answer question ${questionId} — they want you to use your own ` +
+				`best judgement. Decide it yourself and continue; do not ask again.`
+			);
+		case "withdrawn":
+			return (
+				`Question ${questionId} was withdrawn, so no answer is coming. ` +
+				`Continue with your own judgement.`
+			);
+		case "timeout":
+			return (
+				`The wait for question ${questionId} timed out — only the wait ended, the question is ` +
+				`still open and the user may still answer it. Either continue with your default ` +
+				`(the answer will arrive as a message later) or call Await again with the same id.`
+			);
+		case "aborted":
+			return (
+				`The wait for question ${questionId} was interrupted. The question is still open. ` +
+				`Continue with your default, or await it again.`
+			);
+		default:
+			return `Question ${questionId} status: ${status}`;
+	}
+}
 
 /**
  * Wording for a bash Await. `taskId` is the readable handle the model should

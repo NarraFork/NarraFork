@@ -13,6 +13,7 @@
  * (`prepared-markdown-cache.ts`, `streaming-live-blocks.ts`,
  * `reasoning-live-tail.ts`, …) landed OUTSIDE the check. Reading the directory
  * makes a new module covered by default — the same approach
+ * the shared-core purity guards already take.
  *
  * Division of labour with `vlist/zero-dom-measure.guard.test.ts`: that guard
  * scans the vlist-side pure path, where the seven migrated modules are now only

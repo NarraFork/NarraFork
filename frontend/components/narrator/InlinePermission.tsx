@@ -163,6 +163,7 @@ export function InlinePermission({
 	onQuestionSubmit,
 	onQuestionReflect,
 	onQuestionDeny,
+	onQuestionDefer,
 	onPlanPreviewChange,
 }: {
 	permission: PendingPermission;
@@ -177,6 +178,8 @@ export function InlinePermission({
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionReflect?: (requestId: string) => Promise<void> | void;
 	onQuestionDeny?: (requestId: string) => void;
+	/** Release the blocked loop and move the question to the async inbox. */
+	onQuestionDefer?: (requestId: string) => Promise<void> | void;
 	onPlanPreviewChange?: (requestId: string, previewPlan: string | null) => void;
 }) {
 	const { t } = useTranslation("narrator");
@@ -277,6 +280,7 @@ export function InlinePermission({
 					onSubmit={(reqId, answers) => onQuestionSubmit?.(reqId, answers)}
 					onReflect={(reqId) => onQuestionReflect?.(reqId)}
 					onDeny={(reqId) => onQuestionDeny?.(reqId)}
+					{...(onQuestionDefer ? { onDefer: (reqId: string) => onQuestionDefer(reqId) } : {})}
 				/>
 			</Box>
 		);

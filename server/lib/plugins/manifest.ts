@@ -171,6 +171,7 @@ const contributionBaseSchema = z.object({
 });
 
 /**
+ * A user-facing provider prefix, i.e. the `acme` in `acme:claude-sonnet-4.5`.
  *
  * Mirrors the runtime rule enforced by `assertPrefix()` in
  * `plugin-provider-registry.ts`: 1–32 visible ASCII characters with no colon
@@ -944,6 +945,7 @@ const emptyContributes = () => ({
  *
  * Size rather than a key count: a key count bounds nothing, because a single key can hold a
  * megabyte-long string or a deeply nested array. 8K characters is far above any honest
+ * declaration (the largest in-tree example plugin's `network` block, is a few hundred)
  * and far below a size that matters on the main thread.
  *
  * This is a **B-class survival limit, not a trust limit** (see
@@ -966,6 +968,7 @@ const MAX_UNINSPECTED_PERMISSION_JSON_CHARS = 8 * 1024;
  *
  * Specifically for `permissions.network`: the `local-process` runner inherits the host's
  * full network stack. A manifest may declare a strict domain allowlist (e.g. the
+ * a plugin example's `allow: ["*.example.com", …]`), but no runtime mechanism
  * filters outbound connections against it. Enforcement requires network namespace isolation
  * (Linux netns, iptables owner-match, or the Podman runner), which is a separate feature.
  *

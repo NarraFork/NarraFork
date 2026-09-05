@@ -18,10 +18,6 @@ export function resolveCredentialDisplayName(
 	if (!provider || !credentialId) return null;
 
 	try {
-			if (!snapshot) return credentialId;
-			const cred = snapshot.entries.find((c) => c.id === credentialId);
-			return cred?.displayName || cred?.email || credentialId;
-		}
 		if (provider === "codex") {
 			const snapshot = getCodexManager().snapshot();
 			const cred = snapshot.entries.find((c) => c.id === credentialId);

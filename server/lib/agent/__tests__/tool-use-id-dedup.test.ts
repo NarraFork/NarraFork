@@ -12,6 +12,7 @@ import {
 } from "../tool-use-id-dedup";
 import type { AgentToolUse } from "../types";
 
+/** The pattern NUG validates tool ids against. */
 const WIRE_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
 function assistantMessage(id: string, toolUseIds: string[]): DbMessage {
@@ -151,7 +152,8 @@ describe("uniquifyDbMessageToolUseIds", () => {
 
 	test("含冒号的 ID 即使不重复也被改写（Bash:0 回归）", () => {
 		// Real failure: a session whose early turns were produced by an upstream minting
-		// `Bash:0` / `Read:0`. Anthropic accepted them, so they reached the DB; NUG's
+		// `Bash:0` / `Read:0`. Anthropic accepted them, so they reached the DB; NUG
+		// then rejected the whole replayed history with
 		// `tool_use.id: String should match pattern '^[a-zA-Z0-9_-]+$'`.
 		const messages = [
 			assistantMessage("m1", ["Bash:0"]),
@@ -226,6 +228,7 @@ describe("toWireSafeToolUseId", () => {
 		expect(toWireSafeToolUseId(":::")).toMatch(WIRE_PATTERN);
 	});
 
+	test("点号也被视为非法（NUG 通道不接受）", () => {
 		expect(isWireSafeToolUseId("call.1")).toBe(false);
 		expect(toWireSafeToolUseId("call.1")).toMatch(WIRE_PATTERN);
 	});
@@ -262,9 +265,11 @@ describe("collectToolUseIdsFromHistory", () => {
 		expect(collectToolUseIdsFromHistory(history)).toEqual(new Set(["call_a", "call_b"]));
 	});
 
+	test("识别嵌套形态", () => {
 		const history = [
 			{
 					content: "",
+					toolUses: [{ toolUseId: "call_nug", name: "Bash", input: {} }],
 				},
 			},
 			{
@@ -272,6 +277,7 @@ describe("collectToolUseIdsFromHistory", () => {
 				},
 			},
 		];
+		expect(collectToolUseIdsFromHistory(history)).toEqual(new Set(["call_nug"]));
 	});
 
 	test("普通消息 ID 不会被误认为工具 ID", () => {
@@ -320,14 +326,17 @@ describe("reserveUniqueToolUseIds + remapToolResultIds", () => {
 		const anthropicResults = [{ type: "tool_result", tool_use_id: "call_go_0", content: "ok" }];
 		const oaiResults = [{ role: "tool", tool_call_id: "call_go_0", content: "ok" }];
 		const responsesResults = [{ type: "function_call_output", call_id: "call_go_0", output: "ok" }];
+		const nestedResults = [{ toolUseId: "call_go_0", status: "success", content: [] }];
 
 		expect(remapToolResultIds(anthropicResults, remap)).toBe(1);
 		expect(remapToolResultIds(oaiResults, remap)).toBe(1);
 		expect(remapToolResultIds(responsesResults, remap)).toBe(1);
+		expect(remapToolResultIds(nestedResults, remap)).toBe(1);
 
 		expect(anthropicResults[0].tool_use_id).toBe(renamed);
 		expect(oaiResults[0].tool_call_id).toBe(renamed);
 		expect(responsesResults[0].call_id).toBe(renamed);
+		expect(nestedResults[0].toolUseId).toBe(renamed);
 	});
 
 	test("空 remap 时不触碰结果", () => {
@@ -361,6 +370,9 @@ describe("reserveUniqueToolUseIds + remapToolResultIds", () => {
 		const remap = reserveUniqueToolUseIds([toolUse("Bash:0")], used);
 		const renamed = remap.get("Bash:0") as string;
 
+		const nestedResults = [{ toolUseId: "Bash:0", status: "success", content: [] }];
+		expect(remapToolResultIds(nestedResults, remap)).toBe(1);
+		expect(nestedResults[0].toolUseId).toBe(renamed);
 		expect(renamed).toMatch(WIRE_PATTERN);
 	});
 });

@@ -188,6 +188,34 @@ export const permissionDecisionSchema = z.object({
 	updatedPlan: z.string().optional(),
 });
 
+/**
+ * Answers to an asynchronous AskUserQuestion.
+ *
+ * `answers` is required and non-empty: an "answer" with nothing in it is a dismissal,
+ * and that has its own endpoint. Accepting it here would record a question as answered
+ * while telling the agent nothing.
+ */
+export const asyncQuestionAnswerSchema = z.object({
+	answers: z
+		.record(z.string(), z.string().max(10_000))
+		.refine((value) => Object.keys(value).length > 0, "Provide at least one answer"),
+	annotations: z
+		.record(
+			z.string(),
+			z.object({
+				preview: z.string().max(10_000).optional(),
+				notes: z.string().max(10_000).optional(),
+			}),
+		)
+		.optional(),
+});
+
+export const asyncQuestionListQuerySchema = z.object({
+	status: z.enum(["open", "answered", "dismissed", "withdrawn"]).optional(),
+	cursor: z.string().max(200).optional(),
+	limit: z.coerce.number().int().min(1).max(100).optional(),
+});
+
 const ruleTargetFields = {
 	selector: ruleTargetSelectorSchema.optional(),
 	deviceScope: legacyRuleDeviceScopeSchema,

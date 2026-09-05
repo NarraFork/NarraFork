@@ -113,4 +113,41 @@ describe("compact progress reporter", () => {
 
 		expect(broadcasts).toHaveLength(0);
 	});
+
+	test("reportRetry broadcasts immediately with the current counts", async () => {
+		// A retry must not wait out the throttle window: the backoff sleep alone
+		// can be 15s, and "0 chars" for that whole span is the exact stall the
+		// retry broadcast exists to explain.
+		const reporter = makeReporter();
+		reporter.reportRetry(1, "provider overloaded");
+
+		expect(broadcasts).toHaveLength(1);
+		expect(broadcasts[0]).toMatchObject({
+			type: "compact_progress",
+			messageId: "compact-1",
+			phase: "thinking",
+			thinkingChars: 0,
+			outputChars: 0,
+			mode: "blocking",
+			retryCount: 1,
+			retryError: "provider overloaded",
+		});
+	});
+
+	test("reportRetry carries the counts streamed so far", async () => {
+		const reporter = makeReporter(true);
+		reporter.onTextDelta("partial summary");
+		reporter.finish();
+		broadcasts = [];
+
+		reporter.reportRetry(2, "rate limit exceeded");
+
+		expect(broadcasts).toHaveLength(1);
+		expect(broadcasts[0]).toMatchObject({
+			outputChars: 15,
+			isSegment: true,
+			retryCount: 2,
+			retryError: "rate limit exceeded",
+		});
+	});
 });

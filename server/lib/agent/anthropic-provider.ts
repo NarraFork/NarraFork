@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { outputToText } from "@shared/agent-protocol/tool-output";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
@@ -1066,12 +1067,6 @@ export class AnthropicProvider implements ProviderAdapter {
 	 * `nug:anthropic`) rather than a bare `anthropic`.
 	 */
 	private reasoningSourceOverride?: string;
-	/**
-	 * Whether to send the NUG-specific `X-Conversation-ID` header on chat
-	 * requests. See setSendConversationIdHeader.
-	 */
-	private sendConversationIdHeader = false;
-
 	constructor(config: AnthropicProviderConfig) {
 		this.config = config;
 		this.tlsRejectUnauthorized = config.tlsRejectUnauthorized !== false;
@@ -1080,23 +1075,6 @@ export class AnthropicProvider implements ProviderAdapter {
 	/** Override the reasoning-signature source identity (used by NUG delegates). */
 	setReasoningSourceOverride(source: string | undefined): void {
 		this.reasoningSourceOverride = source;
-	}
-
-	/**
-	 * Send `X-Conversation-ID` on chat requests.
-	 *
-	 * Off by default and opt-in per delegate, because this is a NUG gateway
-	 * header with no meaning to the Anthropic API or to third-party
-	 * Anthropic-compatible endpoints, and sending unknown headers to an
-	 * arbitrary upstream is a risk taken for no benefit.
-	 *
-	 * no conversation identity, so without this header the gateway has nothing
-	 * to key credential affinity on and mints a fresh id per request. Requests
-	 * still succeed (the whole history travels in the body every turn), but each
-	 * turn of one conversation may land on a different upstream credential.
-	 */
-	setSendConversationIdHeader(enabled: boolean): void {
-		this.sendConversationIdHeader = enabled;
 	}
 
 	/**
@@ -1799,11 +1777,6 @@ export class AnthropicProvider implements ProviderAdapter {
 			"application/json",
 			params.conversationId,
 		);
-		// Only on the chat path: the utility/generate paths are one-shot calls with
-		// no conversation identity to report.
-		if (this.sendConversationIdHeader && params.conversationId) {
-			reqHeaders["X-Conversation-ID"] = params.conversationId;
-		}
 
 		params.requestDump?.setRequest({
 			transport: "http",

@@ -253,6 +253,7 @@ describe("plugin provider credential resolver", () => {
  * have achieved it; the coupling had to be removed.
  */
 describe("config size is independent of credential count", () => {
+	/** A provider that declares only a small bookkeeping sentinel, as reference plugins do. */
 	const sentinelSchema = {
 		type: "object",
 		properties: {
@@ -313,6 +314,7 @@ describe("config size is independent of credential count", () => {
 
 		// Only the sentinel's own `count` differs, so the payload does not grow with the set.
 		expect(withMany).toBeLessThan(withOne + 16);
+		// Comfortably inside a reference provider's declared 16 KB config budget, which the old
 		// single-field design would have exceeded at roughly six credentials.
 		expect(withMany).toBeLessThan(16_384);
 	});

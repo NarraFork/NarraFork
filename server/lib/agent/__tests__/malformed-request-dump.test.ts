@@ -8,6 +8,7 @@ import {
 	MALFORMED_REQUEST_CAPTURE_REASON,
 	MALFORMED_REQUEST_DUMP_DIR,
 	MALFORMED_REQUEST_DUMP_SCHEMA,
+	summarizeRequestBody,
 	writeMalformedRequestDump,
 } from "../malformed-request-dump";
 import { ApiError } from "../types";
@@ -31,12 +32,15 @@ describe("isMalformedRequestBodyError", () => {
 		expect(isMalformedRequestBodyError(UPSTREAM_BODY)).toBe(true);
 	});
 
+	test("detects the error as thrown by the api client (message carries the body)", () => {
 		const err = new Error(`Error: ${UPSTREAM_BODY}`);
 		expect(isMalformedRequestBodyError(err)).toBe(true);
 	});
 
+	test("detects an ApiError-shaped object with the body in message", () => {
 		expect(
 			isMalformedRequestBodyError({
+				name: "ApiError",
 				code: "BAD_REQUEST",
 				statusCode: 400,
 				message: UPSTREAM_BODY,
@@ -73,7 +77,9 @@ describe("isMalformedRequestBodyError", () => {
 	});
 });
 
+describe("summarizeRequestBody", () => {
 	test("flags an orphaned toolResult and a toolUse without a result", () => {
+		const summary = summarizeRequestBody({
 				conversationId: "c1",
 				history: [
 					{
@@ -102,6 +108,7 @@ describe("isMalformedRequestBodyError", () => {
 	});
 
 	test("flags reasoning blocks without a signature and empty image bytes", () => {
+		const summary = summarizeRequestBody({
 				conversationId: "c2",
 				history: [
 					{
@@ -126,9 +133,13 @@ describe("isMalformedRequestBodyError", () => {
 		expect(summary?.notes).toContain("image with empty source.bytes present");
 	});
 
+	test("reports a non-conversational body instead of throwing", () => {
+		const summary = summarizeRequestBody({ messages: [] });
 	});
 
 	test("returns undefined for a non-object body", () => {
+		expect(summarizeRequestBody("not-a-body")).toBeUndefined();
+		expect(summarizeRequestBody(undefined)).toBeUndefined();
 	});
 });
 
@@ -137,9 +148,15 @@ describe("writeMalformedRequestDump", () => {
 		const filePath = await writeMalformedRequestDump({
 			narratorId: "n-malformed",
 			requestId: "req_test_malformed_1",
+			provider: "nug",
+			model: "nug:claude-sonnet-4.5",
 			errorMessage: `Error: ${UPSTREAM_BODY}`,
 			dump: {
+				provider: "nug",
+				model: "nug:claude-sonnet-4.5",
 				request: {
+					transport: "http",
+					url: "https://nug.example.test/v1/messages",
 					headers: { Authorization: "Bearer super-secret-token", "content-type": "app/json" },
 					body: {
 							conversationId: "c3",
@@ -257,9 +274,13 @@ describe("buildMalformedCaptureRecord", () => {
 		const bigContent = "x".repeat(200_000);
 		const record = buildMalformedCaptureRecord({
 			requestId: "req_test_record",
+			provider: "nug",
+			model: "nug:claude-sonnet-4.5",
 			filePath: "/home/user/.narrafork/malformed-request-dumps/dump.json",
 			dump: {
 				request: {
+					transport: "http",
+					url: "https://nug.example.test/v1/messages",
 					headers: { Authorization: "Bearer secret-value" },
 					body: {
 							conversationId: "c4",

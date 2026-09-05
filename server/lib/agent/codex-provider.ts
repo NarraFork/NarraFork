@@ -17,6 +17,7 @@ import { applyCodexStableRequestFields, createCodexRequestIdentity } from "./cod
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
+	CodexWebSocketRetryableError,
 	shouldTreatCodexStreamEventAsYielded,
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
@@ -605,6 +606,23 @@ export class CodexProvider implements ProviderAdapter {
 				return;
 			} catch (err) {
 				if (params.signal.aborted) {
+					throw err;
+				}
+
+				// The transport already exhausted its own reconnect budget for this error and
+				// classified it as retryable. Surface it unchanged: routing it through the
+				// failover path below would call reportFailure() and penalize a perfectly
+				// healthy credential for what is a connection-lifetime event, and could
+				// eventually disable it as "too_many_failures".
+				if (err instanceof CodexWebSocketRetryableError) {
+					logger.warn("Codex Responses WebSocket transport error is retryable upstream", {
+						credentialId: ctx.id,
+						status: err.status,
+						code: err.code,
+						resumable: err.resumable,
+						hasStreamedEvents,
+						error: err.message,
+					});
 					throw err;
 				}
 

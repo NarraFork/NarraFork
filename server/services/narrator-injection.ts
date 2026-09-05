@@ -34,7 +34,7 @@
  *
  *   `role`      what this content IS.
  *               `sys`  — a system fact (a container came up, a task finished). On
- *                        Anthropic official-API and Cline this becomes a真
+ *                        Anthropic official-API this becomes a真
  *                        mid-conversation `system` message; elsewhere it maps to
  *                        `user` (see each provider's buildHistory).
  *               `user` — content that speaks FOR the user. Costs more weight and it
@@ -61,7 +61,8 @@ import { formatOriginLabel, type MessageOriginSource } from "@shared/message-ori
 import type { SideCarBody } from "@shared/sidecar-body";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
-import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
+import type { MessagePlacementOptions } from "./narrator-persistence";
 import { narratorService } from "./narrator-service";
 
 /**
@@ -131,8 +132,55 @@ export type InjectionSchedule =
 	 * Write the row and, if the narrator is idle, start a turn. When it is busy this
 	 * degrades to `none`: the row is already in place and the running loop will pick
 	 * it up on its next pass.
+	 *
+	 * For a SUBAGENT recipient the turn is started through `resumeSubagent` rather
+	 * than a bare loop — see `startInjectionContinuationIfPossible`, which owns that
+	 * dispatch. Callers do not choose between the two.
 	 */
 	| "wakeIfIdle";
+
+/**
+ * Where the recipient sits, when it is a subagent.
+ *
+ * ## Why the caller states this instead of the module looking it up
+ *
+ * The origin tool_use id is not derivable from `narratorId` cheaply or unambiguously —
+ * `resolveSubagentOriginToolUseId` scans for the first linked user row and THROWS for a
+ * never-started subagent, while a running executor already holds the exact id for the
+ * call it is inside. A lookup here would be a second, weaker answer to a question the
+ * caller has already answered correctly, and getting it wrong writes the row under
+ * somebody else's tool card.
+ *
+ * ## What passing it changes
+ *
+ * Two things, and they are one decision:
+ *
+ *   - the row is written with `parentToolUseId`, so it belongs to that tool_use subtree.
+ *     The subagent's OWN page loads it (its loader drops the `isNull(parentToolUseId)`
+ *     filter and nulls the field for display), while the parent's page does not draw it
+ *     inline — subagent children are represented by a bounded activity snapshot.
+ *   - delivery becomes DUAL: the parent gets a copy addressed to the tool card, the
+ *     subagent gets a stripped copy addressed to itself. That is the existing convention
+ *     for every subagent row (`persistSubagentUserMessage`'s two broadcasts), and a
+ *     single broadcast would leave one of the two pages stale.
+ *
+ * Note the row still does NOT enter the model history through this field: every
+ * provider's `buildHistory` filters `!m.parentToolUseId`, and a subagent's own history
+ * is loaded through `loadSubagentHistory`, which clears the field first. So the field
+ * decides READERS, not what the model sees.
+ */
+export interface InjectionRecipientPlacement {
+	/** The Agent/Task `tool_use` id that owns the recipient subagent. */
+	parentToolUseId: string;
+	/**
+	 * The parent narrator, i.e. where the tool-card copy goes.
+	 *
+	 * Required rather than looked up for the same reason as above, and because a
+	 * broadcast to the wrong parent is silent: nothing errors, one page just never
+	 * updates.
+	 */
+	parentNarratorId: string;
+}
 
 export interface DeliverInjectionOptions {
 	/** Model-facing text. Stored verbatim as the row's first text block. */
@@ -153,6 +201,14 @@ export interface DeliverInjectionOptions {
 	originDetail?: string | null;
 	/** Human who triggered this, when there is one. */
 	createdBy?: string | null;
+	/**
+	 * Set when the recipient is a SUBAGENT — see {@link InjectionRecipientPlacement}.
+	 * Omitted means a primary narrator: a top-level row and a single broadcast, which
+	 * is what every pre-existing producer does.
+	 */
+	subagent?: InjectionRecipientPlacement;
+	/** Atomically commit related state with the message, before any broadcast or wake. */
+	onPersist?: MessagePlacementOptions["onPersist"];
 	/**
 	 * Extra content blocks appended after the injection block, for producers that
 	 * already have a richer card (`background_agents_completed`, `review_feedback`).
@@ -225,6 +281,14 @@ export async function deliverInjection(
 			: null,
 	};
 
+	const placement =
+		options.subagent || options.onPersist
+			? {
+					...(options.subagent ? { parentToolUseId: options.subagent.parentToolUseId } : {}),
+					...(options.onPersist ? { onPersist: options.onPersist } : {}),
+				}
+			: undefined;
+
 	const message =
 		role === "user"
 			? await narratorService.persistUserMessage(
@@ -236,6 +300,7 @@ export async function deliverInjection(
 					null,
 					options.createdBy ?? null,
 					origin,
+					placement,
 				)
 			: await narratorService.persistSystemMessage(
 					narratorId,
@@ -244,22 +309,35 @@ export async function deliverInjection(
 					blocks,
 					options.createdBy ?? undefined,
 					origin,
+					placement,
 				);
 
-	broadcastToNarrator(narratorId, {
-		type: "message",
-		narratorId,
-		message: {
-			id: message.id,
+	// One frame, addressed by the shared subagent convention: the parent copy keeps
+	// `parentToolUseId` so it attaches to the tool card, and the self copy is stripped
+	// so the subagent's page reads it as a top-level row. Degrades to a single
+	// broadcast for a primary narrator, which is what this used to do unconditionally.
+	dualBroadcastToNarrator(
+		{
 			narratorId,
-			role: message.role,
-			contentJson: message.contentJson,
-			contentText: message.contentText,
-			createdAt: message.createdAt,
-			seq: message.seq,
-			children: [],
+			broadcastTargetId: options.subagent?.parentNarratorId ?? narratorId,
+			parentToolUseId: options.subagent?.parentToolUseId,
 		},
-	});
+		{
+			type: "message",
+			narratorId,
+			message: {
+				id: message.id,
+				narratorId,
+				role: message.role,
+				contentJson: message.contentJson,
+				contentText: message.contentText,
+				createdAt: message.createdAt,
+				seq: message.seq,
+				parentToolUseId: options.subagent?.parentToolUseId ?? null,
+				children: [],
+			},
+		},
+	);
 
 	const result: DeliverInjectionResult = {
 		messageId: message.id,
@@ -271,6 +349,11 @@ export async function deliverInjection(
 	if (schedule === "interject") {
 		result.interjected = await requestSoftStop(narratorId);
 	} else if (schedule === "wakeIfIdle") {
+		// No recipient kind is passed: the scheduler resolves it and routes a subagent to
+		// `resumeSubagent` itself. Deciding it HERE would put a second copy of "what is a
+		// subagent, and what may start one" in a module that reaches the session layer only
+		// through a lazy import — and would leave the route-level caller of the same
+		// scheduler entry unprotected.
 		result.started = await wakeIfIdle(narratorId, locale);
 	}
 
@@ -347,7 +430,10 @@ async function requestSoftStop(narratorId: string): Promise<boolean> {
  *
  * Delegates to `startInjectionContinuationIfPossible`, which owns the gating (the
  * continuation lock, the idle check, the plan-mode check) so that this module never
- * holds a second, subtly different copy of those rules.
+ * holds a second, subtly different copy of those rules. That delegation now also
+ * covers the recipient KIND: a subagent is resumed through `resumeSubagent` there,
+ * which is the only way to start one safely (resume lock, origin tool_use id,
+ * conclusion publication back into the parent's open tool call).
  *
  * A failure here is logged, not thrown: the row is already persisted, so the content
  * is not lost — it simply waits for the next request instead of getting one now.

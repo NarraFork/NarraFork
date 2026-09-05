@@ -11,6 +11,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	formatOriginLabel,
 	isHumanOrigin,
+	type MessageOriginSource,
 	normalizeMessageOrigin,
 	parseOriginLabel,
 } from "../message-origin";
@@ -38,6 +39,50 @@ describe("isHumanOrigin", () => {
 		expect(isHumanOrigin("user")).toBe(true);
 		expect(isHumanOrigin("system")).toBe(false);
 		expect(isHumanOrigin("assistant")).toBe(false);
+	});
+});
+
+describe("source keys are renderable", () => {
+	/**
+	 * Every source key must be recognized by `parseOriginLabel` AND have copy in both
+	 * locales. A key present in the type but missing from the parser's set falls through
+	 * to `source: null`, and the header then shows the raw `sourceKey:detail` token —
+	 * i.e. an internal identifier where a name belongs. A key missing from a locale
+	 * renders as the untranslated i18n path instead.
+	 */
+	const SOURCES: MessageOriginSource[] = [
+		"autoContinuation",
+		"review",
+		"rebase",
+		"batchMerge",
+		"scheduledTask",
+		"forkNarrator",
+		"chatGroup",
+		"gateway",
+		"oauth",
+		"recovery",
+		"planReflection",
+		"agentMessage",
+	];
+
+	test("every source parses back to itself", () => {
+		for (const source of SOURCES) {
+			expect(parseOriginLabel(formatOriginLabel(source))?.source).toBe(source);
+			expect(parseOriginLabel(formatOriginLabel(source, "detail"))?.source).toBe(source);
+		}
+	});
+
+	test("every source has copy in both locales", async () => {
+		const en = (await import("../../frontend/locales/en/narrator.json")).default as {
+			origin: { source: Record<string, string> };
+		};
+		const zh = (await import("../../frontend/locales/zh-CN/narrator.json")).default as {
+			origin: { source: Record<string, string> };
+		};
+		for (const source of SOURCES) {
+			expect(en.origin.source[source], `en origin.source.${source}`).toBeTruthy();
+			expect(zh.origin.source[source], `zh-CN origin.source.${source}`).toBeTruthy();
+		}
 	});
 });
 

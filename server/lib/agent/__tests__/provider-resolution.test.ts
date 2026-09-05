@@ -9,19 +9,16 @@ class MockProvider {}
 // that need the real provider classes (e.g. anthropic-v1-fallback).
 const realProviderModules: Record<string, () => unknown> = {
 	"../anthropic-provider": () => realAnthropic,
-	"../cline-provider": () => realCline,
 	"../codex-provider": () => realCodex,
 	"../nug-provider": () => realNug,
 	"../openai-provider": () => realOpenai,
 };
 const realAnthropic = { ...(await import("../anthropic-provider")) };
-const realCline = { ...(await import("../cline-provider")) };
 const realCodex = { ...(await import("../codex-provider")) };
 const realNug = { ...(await import("../nug-provider")) };
 const realOpenai = { ...(await import("../openai-provider")) };
 
 mock.module("../anthropic-provider", () => ({ AnthropicProvider: MockProvider }));
-mock.module("../cline-provider", () => ({ ClineProvider: MockProvider }));
 mock.module("../codex-provider", () => ({ CodexProvider: MockProvider }));
 mock.module("../nug-provider", () => ({ NugProvider: MockProvider }));
 mock.module("../openai-provider", () => ({ OpenAIProvider: MockProvider }));
@@ -45,10 +42,6 @@ describe("resolveProviderAndModel", () => {
 			mock.module(specifier, factory);
 		}
 		mock.restore();
-	});
-
-
-		);
 	});
 
 	test("delegates unknown provider prefixes to the registered plugin resolver", () => {
@@ -87,6 +80,14 @@ describe("resolveProviderAndModel", () => {
 			return null;
 		});
 		try {
+			// codex is a builtin provider resolved before the external resolver hook.
+			// Asking for a codex model must never reach the plugin resolver — it may
+			// throw for other reasons (e.g. mocked class), but the resolver is skipped.
+			try {
+				resolveProviderAndModel("codex:gpt-5.5");
+			} catch {
+				// Construction may fail due to mocking — the point is the plugin resolver was skipped.
+			}
 			expect(pluginResolverCalls).toBe(0);
 
 			// An unknown prefix does fall through to the plugin resolver.

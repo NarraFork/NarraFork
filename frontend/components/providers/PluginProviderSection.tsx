@@ -206,7 +206,7 @@ function schemaWithOnly(
 /**
  * Connection settings for a plugin provider.
  *
- * Non-secret schema fields (currently Cline's `baseUrl`) stay host-rendered even when the
+ * Non-secret schema fields stay host-rendered even when the
  * plugin ships a custom view. That keeps one persistence path — the provider config endpoint —
  * and keeps credentials/selection secrets out of the iframe-facing form.
  */
@@ -343,9 +343,11 @@ function PluginProviderAdvanced({
 /**
  * Model area for a plugin provider.
  *
+ * Identical in structure to the builtin provider sections: the discovered model
  * list, then the user's own additions. Both are the host's components reading host state, so
  * hiding a model here has exactly the same effect as hiding a built-in provider's model.
  *
+ * `showContextWindow` is left on because a plugin
  * provider's catalog may or may not report `contextWindow`, and where it does not, a manual
  * override is the only way to give the model a sensible budget.
  */
@@ -389,7 +391,7 @@ function PluginProviderModels({
 			} else {
 				setOutcome({
 					tone: "success",
-					message: t("clineModelsCount", { count: result.modelCount }),
+					message: t("pluginModelsCount", { count: result.modelCount }),
 				});
 				// The model list is derived from `/api/settings`, so the catalog change is only
 				// visible after those queries refetch.
@@ -414,7 +416,7 @@ function PluginProviderModels({
 				</Text>
 				<Group gap="xs">
 					<Text size="xs" c="dimmed">
-						{t("clineModelsCount", { count: controls.models.length })}
+						{t("pluginModelsCount", { count: controls.models.length })}
 					</Text>
 					<Button
 						size="compact-xs"
@@ -425,6 +427,7 @@ function PluginProviderModels({
 						disabled={!providerInstanceId}
 						onClick={handleRefresh}
 					>
+						{t("pluginRefreshModels")}
 					</Button>
 				</Group>
 			</Group>

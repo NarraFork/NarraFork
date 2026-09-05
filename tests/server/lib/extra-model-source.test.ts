@@ -97,11 +97,13 @@ describe("extra model sources", () => {
 	});
 
 	test("cannot shadow a builtin model id", () => {
+		// `gpt-5.5` is a builtin Codex model; a plugin claiming it must lose.
 		register("test-hijack", {
 			listModels: () => [],
 			resolveProvider: () => "thijack",
 		});
 
+		expect(resolveProvider("gpt-5.5")).toBe("codex");
 	});
 
 	test("an explicit prefix always wins over source resolution", () => {

@@ -27,6 +27,7 @@ import {
 	type LivePatch,
 	patchReflection,
 	patchSubagentActivity,
+	patchSubagentTakeover,
 	patchToolCallFields,
 } from "./vlist-live-patch";
 
@@ -153,12 +154,16 @@ export function awaitAgentResolvedPatch(opts: {
  * Written on the block (never into `_metadata`): `classifyAwait` turns metadata
  * into extra detail rows, which would grow every Await card.
  *
+ * ⚠️ Delegates to `patchSubagentTakeover` rather than writing `_takenOver` alone.
+ * The badge is an OR over the block flag AND `_subagentActivity.takenOver`, and
+ * only the block flag is in this frame — see that function for why a
+ * single-field write cannot turn the badge OFF.
+ *
  * `status` is deliberately absent: a takeover says nothing about the tool's
  * lifecycle, and writing one would let a replayed frame regress a finished card.
  */
 export function subagentTakeoverPatch(opts: { toolUseId: string; takenOver: boolean }): LivePatch {
-	return (messages) =>
-		patchToolCallFields(messages, opts.toolUseId, { _takenOver: opts.takenOver });
+	return (messages) => patchSubagentTakeover(messages, opts.toolUseId, opts.takenOver);
 }
 
 /**

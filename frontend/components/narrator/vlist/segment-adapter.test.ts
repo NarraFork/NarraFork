@@ -814,6 +814,7 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 		compactOutputChars: "{count} 字符",
 		compactThinking: "思考中",
 		compactThinkingChars: "{count} 字符",
+		compactRetrying: "重试第 {count} 次",
 		segmentCompacting: "正在区段压缩...",
 		segmentCompacted: "区段已压缩（{count} 条消息）",
 	};
@@ -898,6 +899,42 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 		]);
 		expect(dataOf(spec).text).toBe("Segment compacting… · thinking · 90 chars");
 		expect(spec.opts?.phase).toBe("thinking");
+	});
+
+	it("a scheduled summary retry replaces the counts with 'retry #N'", () => {
+		// The whole point of the retry broadcast: "0 chars" alone reads as a stall
+		// while the summary model is actually failing and backing off.
+		const spec = compactSpec([
+			{ type: "compact", status: "compacting", outputChars: 0, retryCount: 2 },
+		]);
+		expect(dataOf(spec).text).toBe("Compacting context… · retry #2");
+	});
+
+	it("the retry label localizes and beats the thinking phase", () => {
+		const spec = compactSpec(
+			[
+				{
+					type: "compact",
+					status: "compacting",
+					progressPhase: "thinking",
+					thinkingChars: 240,
+					retryCount: 1,
+				},
+			],
+			{ lod: 5, labels: COMPACT_LABELS },
+		);
+		expect(dataOf(spec).text).toBe("压缩上下文中... · 重试第 1 次");
+	});
+
+	it("segment compacting reports the retry too, and retry joins the cache key", () => {
+		const spec = compactSpec([{ type: "segment_compact", status: "compacting", retryCount: 3 }]);
+		expect(dataOf(spec).text).toBe("Segment compacting… · retry #3");
+		expect(spec.opts?.retry).toBe(3);
+		// Leaving the retry (fresh output streaming again) must re-measure too.
+		const recovered = compactSpec([
+			{ type: "segment_compact", status: "compacting", outputChars: 9 },
+		]);
+		expect(recovered.opts?.retry).toBe(0);
 	});
 
 	it("context compact compacted → terse 'compacted' label, NOT the summary body", () => {

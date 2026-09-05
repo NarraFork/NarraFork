@@ -375,6 +375,7 @@ export class TutorialProvider implements ProviderAdapter {
 		// redirect. That is the exact silent-billing failure the tutorial is built to
 		// avoid, and it would only appear for the users who finished the most lessons.
 		//
+		// Zero is honest here in a way it is not for subscription providers: nothing is sent upstream, so
 		// there is no context window to occupy and no prompt to measure.
 		yield { contextUsagePercentage: 0 };
 

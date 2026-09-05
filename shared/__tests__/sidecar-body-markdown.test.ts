@@ -54,6 +54,8 @@ const L: SideCarLabels = {
 	messageFromUnknown: "unknown sender",
 	messageBroadcast: "broadcast",
 	specUpdatesHeading: "{n} spec files updated by you",
+	asyncQuestionAnsweredHeading: "You answered {n} deferred question(s)",
+	asyncQuestionDismissedHeading: "You skipped the deferred question(s)",
 	proseFenceHeading: "Behaviour fence",
 	empty: "(empty)",
 };
@@ -287,6 +289,35 @@ describe("sideCarBodyToMarkdown — the 7 body kinds", () => {
 		expect(out).toContain("spec://index.md");
 		expect(out).toContain("2 open");
 		expect(out).toContain("notes");
+	});
+
+	it("asyncQuestionAnswers: each question's header heads its own answer", () => {
+		const body: SideCarBody = {
+			kind: "asyncQuestionAnswers",
+			outcome: "answered",
+			items: [
+				{ header: "Which cache layer?", answer: "Redis" },
+				{ header: "Retry policy?", answer: "Exponential", notes: "cap at 30s" },
+			],
+		};
+		const out = md("async_question", body);
+		expect(out.startsWith("###### You answered 2 deferred question(s)")).toBe(true);
+		expect(out).toContain("###### Which cache layer?");
+		expect(out).toContain("Redis");
+		expect(out).toContain("###### Retry policy?");
+		expect(out).toContain("Exponential");
+		expect(out).toContain("cap at 30s");
+	});
+
+	it("asyncQuestionAnswers: a dismissal is the heading alone, with no empty answer lines", () => {
+		// The items carry empty answers for a dismissal (the questions still need naming
+		// for the MODEL), but printing them here would render blank body lines.
+		const body: SideCarBody = {
+			kind: "asyncQuestionAnswers",
+			outcome: "dismissed",
+			items: [{ header: "Which cache layer?", answer: "" }],
+		};
+		expect(md("async_question", body)).toBe("###### You skipped the deferred question(s)");
 	});
 });
 

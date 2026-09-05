@@ -20,8 +20,18 @@ type Translate = (key: string, options?: Record<string, unknown>) => string;
  * Thinking phase: a bare "thinking" until the count crosses the display
  * threshold, then "thinking · N chars" — a two-character count conveys nothing
  * and just makes the label flicker while the stream warms up.
+ *
+ * A retry in flight takes priority over the counts: the whole point of the
+ * retry broadcast is that "0 chars" alone reads as a stall while the summary
+ * model is actually failing and recovering.
  */
-export function compactProgressLabel(t: Translate, progress: ProgressSnapshot | null): string {
+export function compactProgressLabel(
+	t: Translate,
+	progress: (ProgressSnapshot & { retryCount?: number }) | null,
+): string {
+	if (progress?.retryCount && progress.retryCount > 0) {
+		return t("compactRetrying", { count: progress.retryCount });
+	}
 	if (!progress || progress.phase === "output") {
 		return t("compactOutputChars", { count: progress?.outputChars ?? 0 });
 	}

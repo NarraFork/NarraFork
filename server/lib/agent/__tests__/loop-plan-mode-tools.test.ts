@@ -10,6 +10,7 @@
  * Two things are pinned here, and the second is the one that breaks silently:
  *
  *   1. the descriptions do flip when `config.planMode` flips between turns;
+ *   2. the tool NAME SET never changes. NUG requires history consistency, so dropping
  *      or renaming a tool mid-conversation corrupts the replayed history rather than
  *      producing a clean error.
  */
@@ -186,6 +187,7 @@ describe("plan mode tool descriptions", () => {
 		expect(describedTool(before, FORBIDDEN_TOOL)).toBe(FORBIDDEN_DESCRIPTION);
 		expect(describedTool(after, FORBIDDEN_TOOL)).not.toBe(FORBIDDEN_DESCRIPTION);
 		// ⚠️ Load-bearing: names must be identical across the re-format. A changed name set
+		// corrupts the replayed history on NUG instead of failing loudly.
 		expect(after.map((tool) => tool.name).sort()).toEqual(before.map((tool) => tool.name).sort());
 	});
 

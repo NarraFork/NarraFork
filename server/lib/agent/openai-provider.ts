@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
+import { outputToText } from "@shared/agent-protocol/tool-output";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import { mapGenericReasoningEffort } from "@shared/reasoning-effort-support";
@@ -21,7 +23,7 @@ import {
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
-import { parseErrorDiagnostics } from "./error-diagnostics";
+import { parseErrorDiagnostics, parseUpstreamErrorEnvelope } from "./error-diagnostics";
 import { ProviderInvalidStateError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { buildImageGenerationSavedPathInstruction } from "./image-generation";
@@ -335,6 +337,7 @@ function applyGenerateReasoningOptions(
 
 // === OpenAI identity prompt ===
 // OpenAI models need an explicit identity and tool-use instruction in the system prompt.
+// Unlike Claude which receives tool definitions via protocol-level fields,
 // OpenAI models benefit from system-level guidance to actively use their tools.
 
 const OPENAI_IDENTITY: Record<string, string> = {
@@ -2017,7 +2020,37 @@ export function parseResponsesAPIEvent(
 	reasoningAccum: Map<number, ResponsesReasoningAccum>,
 ): ParsedStreamEvent[] {
 	const type = chunk.type;
-	if (!type) return [];
+	if (!type) {
+		// A frame with no `type` is not automatically meaningless: gateways relay bare
+		// `{"error":{"message":"..."}}` envelopes. Returning [] for those discarded the
+		// only explanation the user could have been given, and the turn was then
+		// reported as "the provider returned no content" — a local-configuration story
+		// for what is an upstream failure.
+		const envelope = parseUpstreamErrorEnvelope(chunk as unknown as Record<string, unknown>);
+		if (!envelope) return [];
+		const reason = envelope.code ?? "api_error";
+		return [
+			{
+				invalidState: {
+					reason,
+					message: envelope.message,
+					diagnostics: parseErrorDiagnostics(
+						{
+							...(chunk as unknown as Record<string, unknown>),
+							statusCode: envelope.statusCode,
+							message: envelope.message,
+						},
+						{
+							source: "provider",
+							phase: "sse_error",
+							reason,
+							message: envelope.message,
+						},
+					),
+				},
+			},
+		];
+	}
 
 	// ── Extract usage from any event (bob_cx and similar gateways may include it anywhere) ──
 	const results: ParsedStreamEvent[] = [];
@@ -2451,9 +2484,15 @@ export function parseResponsesAPIEvent(
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic error event shape
 		const c = chunk as any;
 		const nested = c.error;
+		// The envelope parser is consulted first because it also reads `detail` /
+		// `description` / a string-valued `error`. Without it those payloads fell
+		// through to the "Unknown API error" placeholder, which is strictly worse than
+		// the text upstream actually sent.
+		const envelope = parseUpstreamErrorEnvelope(c as Record<string, unknown>);
 		const errMsg =
 			(nested && typeof nested === "object" ? nested.message : undefined) ??
 			c.message ??
+			envelope?.message ??
 			"Unknown API error";
 		const reason =
 			String(
@@ -2619,8 +2658,12 @@ function parseSSELine(
 	// Handle error objects embedded in stream chunks
 	// (some providers send errors as {error: {message, type, code}} inside the SSE stream)
 	if (chunk.error) {
-		const msg = chunk.error.message || "Unknown OpenAI API error";
-		const reason = String(chunk.error.code ?? chunk.error.type ?? "api_error");
+		// `chunk.error.message` is absent when the payload used `detail`/`description`, or
+		// when `error` is itself the message string. Recovering the real text matters more
+		// than the shape it arrived in — the placeholder below tells the user nothing.
+		const envelope = parseUpstreamErrorEnvelope(data);
+		const msg = chunk.error.message || envelope?.message || "Unknown OpenAI API error";
+		const reason = String(chunk.error.code ?? chunk.error.type ?? envelope?.code ?? "api_error");
 		const statusCode =
 			chunk.error.statusCode ??
 			chunk.error.status_code ??

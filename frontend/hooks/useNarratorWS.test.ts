@@ -61,6 +61,7 @@ describe("coerceCompactProgressEvent", () => {
 			outputChars: 123,
 			isSegment: true,
 			mode: "background",
+			retryCount: 0,
 		});
 	});
 
@@ -76,6 +77,46 @@ describe("coerceCompactProgressEvent", () => {
 			outputChars: 42,
 			isSegment: false,
 			mode: "blocking",
+			retryCount: 0,
+		});
+	});
+
+	test("parses the retry state of an in-flight summary retry", () => {
+		expect(
+			coerceCompactProgressEvent({
+				messageId: "compact-1",
+				outputChars: 0,
+				retryCount: 2.9,
+				retryError: "provider overloaded",
+			}),
+		).toEqual({
+			messageId: "compact-1",
+			phase: "output",
+			thinkingChars: 0,
+			outputChars: 0,
+			isSegment: false,
+			mode: "blocking",
+			retryCount: 2,
+			retryError: "provider overloaded",
+		});
+	});
+
+	test("drops a blank retry error and a malformed retry count", () => {
+		expect(
+			coerceCompactProgressEvent({
+				messageId: "compact-1",
+				outputChars: 0,
+				retryCount: "3",
+				retryError: "",
+			}),
+		).toEqual({
+			messageId: "compact-1",
+			phase: "output",
+			thinkingChars: 0,
+			outputChars: 0,
+			isSegment: false,
+			mode: "blocking",
+			retryCount: 0,
 		});
 	});
 

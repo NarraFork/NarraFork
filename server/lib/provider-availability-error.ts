@@ -5,6 +5,8 @@
  * These errors come from `resolveProviderAndModel()` and mean the persisted
  * `provider:model` reference no longer maps to a usable provider:
  *   - `Provider "x" is not configured.`   — prefix removed from settings
+ *   - `<Provider> is not available.`   — provider present but unusable
+ *   - `<Provider> is disabled.`        — provider explicitly turned off
  *   - `DefaultModelNotConfiguredError`    — no default model has been chosen
  *
  * Retrying cannot fix any of them; the user has to pick a different model or

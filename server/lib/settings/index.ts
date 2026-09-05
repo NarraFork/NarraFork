@@ -42,7 +42,6 @@ export {
 	AGG_MODEL_PREFIX,
 	anthropicProviderPrefix,
 	buildAggModelValue,
-	clineProviderPrefix,
 	DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
 	DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD,
 	DEFAULT_CONTEXT_THRESHOLDS,
@@ -56,7 +55,6 @@ export {
 	getAutoCompactPruneThreshold,
 	getBuiltinCodexModels,
 	getBuiltinModelContextWindows,
-	getClineProviderConfig,
 	getContextThresholds,
 	getFirstNugProvider,
 	getGeminiProviderConfig,
@@ -68,7 +66,6 @@ export {
 	getReasoningEffortBlocklist,
 	getSummaryModelContextWindow,
 	getVisibleModels,
-	hasConfiguredClineProvider,
 	hasConfiguredGeminiProvider,
 	hasConfiguredNugProvider,
 	isAnthropicProvider,
@@ -82,8 +79,6 @@ export {
 	parseModelId,
 	registerAnthropicModelChecker,
 	registerAnthropicModelLister,
-	registerClineModelChecker,
-	registerClineModelLister,
 	registerCodexModelChecker,
 	registerCodexModelLister,
 	registerExtraModelSource,
@@ -396,12 +391,10 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	for (const prov of merged.nugProviders ?? []) {
 		if (prov.prefix) activePrefixes.add(prov.prefix);
 	}
-	for (const prov of merged.clineProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
 	for (const prov of merged.geminiProviders ?? []) {
 		if (prov.prefix) activePrefixes.add(prov.prefix);
 	}
+	for (const b of ["codex"]) activePrefixes.add(b);
 
 	if (purgeStaleAgentModelRefs(merged, (prefix) => !activePrefixes.has(prefix))) {
 		needsSave = true;
@@ -601,6 +594,7 @@ export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean
  * Migrate the legacy per-provider proxy fields to the unified `settings.proxy`
  * policy. Runs once when `raw.proxy` is absent, then clears the old fields.
  *
+ * Precedence for a custom URL: legacy WebFetch custom url →
  * codex.proxy → first Anthropic provider's proxy. When no URL is found, the
  * mode defaults to "direct" (no proxy) unless the legacy WebFetch mode was
  * explicitly "system" (follow the OS/env proxy), which is preserved.
@@ -651,8 +645,6 @@ export function migrateGlobalProxy(
 	// per-location ProxyOverride is an object ({ mode, url }); never delete it.
 	// biome-ignore lint/suspicious/noExplicitAny: probing deprecated field shape
 	const isLegacyStringProxy = (obj: any): boolean => typeof obj?.proxy === "string";
-		changed = true;
-	}
 	if (s.codex && isLegacyStringProxy(s.codex)) {
 		delete s.codex.proxy;
 		changed = true;

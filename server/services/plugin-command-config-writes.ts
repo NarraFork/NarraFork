@@ -9,6 +9,7 @@
  * `provider.chat` / `commands.invoke` call. A value written to the vault never reaches any of
  * that.
  *
+ * The concrete failure this closes: a provider panel's load-balancing switch called a command
  * that changed the live manager, but nothing persisted it, so the setting reverted on restart.
  * The switch worked and then quietly un-worked — worse than not offering it.
  *

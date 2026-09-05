@@ -112,7 +112,7 @@ describe("plugin UI host: plugin command dispatch", () => {
 			invoke: async () => ({
 				output: { saved: true },
 				catalogSync: [
-					{ providerInstanceId: "com.example.commands/cline/1/hash", ok: true, modelCount: 2 },
+					{ providerInstanceId: "com.example.commands/acme/1/hash", ok: true, modelCount: 2 },
 				],
 			}),
 		};
@@ -122,7 +122,7 @@ describe("plugin UI host: plugin command dispatch", () => {
 				status: "succeeded",
 				output: { saved: true },
 				catalogSync: [
-					{ providerInstanceId: "com.example.commands/cline/1/hash", ok: true, modelCount: 2 },
+					{ providerInstanceId: "com.example.commands/acme/1/hash", ok: true, modelCount: 2 },
 				],
 			},
 		});
@@ -248,6 +248,7 @@ describe("plugin UI host: secret isolation", () => {
 			// Deliberately returns more than the contract allows.
 			invoke: async () => ({
 				output: { ok: true },
+				secretWrites: [{ key: "provider.acme.bundle", value: "sk-leak" }],
 			}),
 		} as unknown as PluginCommandDispatcher;
 		const response = await execute(hostWith(dispatcher), "verify-credential");

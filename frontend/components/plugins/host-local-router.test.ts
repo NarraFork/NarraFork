@@ -289,19 +289,19 @@ describe("routePluginUiHostLocalRequest", () => {
 				return Promise.resolve({ ok: true, text: "hi", diagnosticId: null });
 			},
 		};
-		expect(await route("models.test", options, { model: "cline:x-ai/grok-4.5" })).toEqual({
+		expect(await route("models.test", options, { model: "acme:x-ai/grok-4.5" })).toEqual({
 			ok: true,
 			text: "hi",
 			diagnosticId: null,
 		});
-		expect(await route("models.test", options, { model: "cline:m", prompt: "ping" })).toEqual({
+		expect(await route("models.test", options, { model: "acme:m", prompt: "ping" })).toEqual({
 			ok: true,
 			text: "hi",
 			diagnosticId: null,
 		});
 		expect(calls).toEqual([
-			{ pluginId: params.pluginId, model: "cline:x-ai/grok-4.5" },
-			{ pluginId: params.pluginId, model: "cline:m", prompt: "ping" },
+			{ pluginId: params.pluginId, model: "acme:x-ai/grok-4.5" },
+			{ pluginId: params.pluginId, model: "acme:m", prompt: "ping" },
 		]);
 	});
 

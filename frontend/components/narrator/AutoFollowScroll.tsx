@@ -152,7 +152,12 @@ export function AutoFollowScroll({
 	const handleWheel = useCallback(
 		(event: React.WheelEvent<HTMLElement>) => {
 			onWheel?.(event as never);
-			registerUserIntent();
+			// Only an UPWARD scroll says "I want to read history" — detach. A downward
+			// wheel heads for the tail, where handleScroll's isAtBottom branch re-arms
+			// the follow anyway; treating it as detach intent meant a reader scrolling
+			// the conversation with the pointer resting over an output box silently
+			// disarmed its follow for the rest of the stream.
+			if (event.deltaY < 0) registerUserIntent();
 		},
 		[onWheel, registerUserIntent],
 	);

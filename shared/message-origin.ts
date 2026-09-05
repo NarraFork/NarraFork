@@ -40,7 +40,17 @@ export type MessageOriginSource =
 	| "gateway"
 	| "oauth"
 	| "recovery"
-	| "planReflection";
+	| "planReflection"
+	/**
+	 * One agent addressed another: a parent narrator or a sibling subagent sent a
+	 * message through `Send`.
+	 *
+	 * Such a turn is persisted as `role: "user"` because it IS the recipient's next
+	 * turn, and its `created_by` names the human whose session triggered the send —
+	 * which made the recipient's page attribute a machine's words to a real person.
+	 * The detail carries the SENDER's display name.
+	 */
+	| "agentMessage";
 
 /**
  * Build an `originLabel`. The stored format is `sourceKey` or
@@ -74,6 +84,7 @@ const ORIGIN_SOURCES = new Set<string>([
 	"oauth",
 	"recovery",
 	"planReflection",
+	"agentMessage",
 ]);
 
 /**

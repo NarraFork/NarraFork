@@ -50,6 +50,7 @@
 ### 背景
 
 - **[事实]** NarraFork 主进程同时承担 Bun HTTP/WS、SQLite、JSON 序列化、Agent Loop、事件分发和多个后台服务。
+- **[事实]** 内置 provider 适配器运行在核心进程，不能作为第三方插件安全模型。
 - **[建议]** 第三方插件的崩溃、死循环、内存泄漏、协议错误和恶意同步工作不能直接拖垮核心。
 
 ### 决策
@@ -300,6 +301,7 @@ manifestRequested
 
 ### 决策
 
+- **[事实]** 当前 provider resolution 直接创建进程内适配器，存在 builtin、compatible API、Codex/NUG 等多种来源。
 - **[建议]** 新增宿主 Provider Registry，统一条目：来源、providerInstanceId、prefix、模型目录、禁用状态、创建 adapter 的宿主代理。
 - **[建议]** 可执行插件通过 `RemoteProviderAdapter` 映射当前 `ProviderAdapter`；Agent Loop、历史、工具执行、权限和重试所有权留在核心。
 - **[建议]** provider type/contribution ID 使用统一格式，推荐 `${pluginId}/${localProviderId}`；最终以 Manifest 文档冻结为准。
@@ -343,6 +345,7 @@ manifestRequested
 - **[待决策]** v1 是否支持 web search/image generation 的完整实时事件；推荐先保留规范化 block，实时扩展后置。
 - **[待决策]** 动态 secret key 与前后端方法集拆分。当前插件只能写 `configSchema` 中**声明过**的
   secret 字段，因此「第 N 条凭据的 token」这类可变数量的 secret 只能整体塞进一个 bundle 字段
+  （受 64 KB 单值上限约束）。要支持真正的动态 key，需要给
   插件后端开放受限的 `secrets.set`/`delete`，而这要求把 `PLUGIN_TO_HOST_REQUEST_METHODS` 与
   iframe 的 `PLUGIN_UI_BACKEND_METHODS` 拆成两个清单（今天由 contract parity 断言强制相等）。
   在有第二个确实需要的消费方之前不做。
@@ -351,6 +354,7 @@ manifestRequested
   见 07 号文档 §13。
 - **[待决策]** 本地进程插件的出站网络阻断（07 号文档 §6.2 同项）。当前 `permissions.network` 只在 manifest 层校验，
   **没有运行时强制**：声明 `mode: "none"` 的本地进程插件实际仍可发起任意出站请求。
+  需要 owner 决定是实现本地策略层，还是把"需要网络隔离"
   的插件强制提升到 Podman。
 
 ---
@@ -528,6 +532,7 @@ manifestRequested
 
 ### 背景
 
+- **[事实]** 当前 provider 配置、Codex/NUG 等集成会处理 API key、access token、credentials path 等敏感数据。
 - **[事实]** UI 文档明确 iframe 不得持有 JWT、Cookie、provider secret 或后端 secret；Provider RPC 仍需要一种安全的上游凭据注入方式。
 
 ### 选项

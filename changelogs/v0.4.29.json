@@ -1,4 +1,6 @@
 {
 	"version": "0.4.29",
 	"date": "2026-06-24",
+	"en": "## Performance\n\n- Reduced narrator message component overhead to make long conversations scroll more smoothly and mount faster.\n- Reworked message layout wrappers with lighter native elements while preserving the existing visual spacing.\n\n## Bug Fixes\n\n- Improved chunked narrator realtime sync for streamed web search, image generation, interrupted runs, selection, and bottom-follow behavior.\n- Fixed built-in gateway goal-continuation turns and disabled-provider handling so the gateway adapter does not receive empty prompts or run after being turned off.\n- Made update downloads more reliable on Windows, including clearer zstd retry guidance, retry cache bypass, longer helper downloads, and hidden shell windows.\n- Raised the default first-token timeout to 5 minutes to reduce premature retries on slow provider responses.\n- Simplified NUG model labels so channel routing is easier to scan in model pickers.",
+	"zh-CN": "## 性能优化\n\n- 降低叙述者消息渲染的组件开销，让长对话滚动更顺畅、冷挂载更快。\n- 使用更轻量的原生元素重做消息布局容器，同时保持原有视觉间距。\n\n## 修复\n\n- 改进 chunk 化叙述者的实时同步，覆盖流式联网搜索、图片生成、中断清理、文本选择和底部跟随行为。\n- 修复内置网关适配器的目标延续轮次和禁用 provider 的处理，避免空提示词请求，并确保关闭后聊天与搜索都不会继续调用。\n- 提升 Windows 更新下载稳定性，包括更清晰的 zstd 重试提示、显式重试绕过失败缓存、延长辅助工具下载超时并隐藏命令窗口。\n- 将首 token 默认超时提高到 5 分钟，减少慢速模型响应被过早重试的问题。\n- 简化 NUG 模型标签，让模型选择器中的通道路由更容易辨认。"
 }

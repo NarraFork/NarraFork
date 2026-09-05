@@ -150,6 +150,7 @@ request dump 回答的是「我们到底发了什么、上游回了什么」，�
 - **禁止使用 `npx`** — 可能解析到错误或缺失的包，始终使用 `bunx` 代替
 - **后端：** Hono v4 运行于 Bun.serve()，SQLite 通过 `bun:sqlite`，Drizzle ORM
 - **前端：** React 19 + Mantine v7（暗色主题，indigo 主色），TanStack Router（基于文件），TanStack React Query，@xyflow/react（图可视化），xterm.js（终端），react-i18next（国际化）
+- **AI：** 自定义 Agent Loop 架构（`server/lib/agent/`），支持多提供商：Anthropic API、OpenAI API、Gemini、Codex、NUG（统一网关）；MCP 集成通过 `@modelcontextprotocol/sdk`
 - **校验：** Zod v4
 - **代码规范：** Biome v2（tab 缩进，100 字符行宽，推荐规则集）
 - **外部依赖：** git、可选 podman（容器）
@@ -205,6 +206,8 @@ server/
 
 **关键模式：**
 - **事件总线**（`lib/event-bus.ts`）解耦服务 → WebSocket 广播。所有跨服务通信通过类型化事件流转。
+- **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），支持多提供商（Anthropic、OpenAI、Gemini、Codex、NUG）。通过 HTTP SSE 流式传输 + 并行 WebSocket 广播。权限请求会暂停会话（Promise 挂起），由用户决策解除（5 分钟超时）。支持子代理（subagent）模式：explore（只读探索）、plan（架构规划）、general（通用写入）、review（代码评审）。
+- **多提供商 Agent 架构**（`server/lib/agent/`）：自定义 Agent Loop 支持 Anthropic、OpenAI、Gemini、Codex、NUG 五个提供商，统一的工具注册和执行框架，内置工具分为核心（bash、read、write、edit、glob、grep、web-search、web-fetch、task、continue-task、team-status、todo、ask-user-question、skill、plan-mode（enter/exit）共 16 个）、可选（terminal、share-file、recall、browser、fork-narrator、narrafork-admin）和 review 专用工具。支持可选工具机制（通过 `enabledTools` 字段控制可见性）。
 - **子代理（Subagent）**：叙述者支持派生子代理（explore/plan/general/review 四种类型），通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立的叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**有三种模式：`full`（延迟会话 fork）、`compressed`（Haiku 生成摘要注入 system prompt）、`fresh`（无上下文）。
 - **章节拆分（Split at Commit）**：从历史 commit 分叉时，将原章节拆为前序（prefix）和后续（continuation），新分叉成为前序的另一个 fork。前序章节的叙述者只保留拆分点之前的消息。
@@ -267,6 +270,7 @@ frontend/
   types/              — TypeScript 类型声明
 ```
 
+**路由结构：** `__root.tsx`（AppShell 布局）→ 仪表盘、项目（含图可视化）、章节、叙述者（含归档）、管理面板（providers/终端）、例程、设置、搜索、登录、许可证。
 
 **Vite 开发代理：** `/api/*` → `localhost:7779`，`/ws/*` → `ws://localhost:7779`。
 
@@ -294,56 +298,24 @@ frontend/
 - `/api/update` — 版本更新检查
 - `/api/project-db` — 项目数据库同步
 - `/api/git`、`/api/graph` — Git 操作和图数据
+- `/api/openai`、`/api/codex`、`/api/anthropic`、`/api/gemini`、`/api/nug` — AI 提供商集成
 
 **WebSocket：** `/ws/narrator?token=`（订阅/取消订阅模型），`/ws/terminal?terminalId=&token=`（stdin/stdout 管道）
 
+## Anthropic 历史构造的两处易错点
 
+`buildAnthropicHistory`（`server/lib/agent/anthropic-provider.ts`）有两处做错了不会报错、只会静默降低质量的地方：
 
+1. **尾部 `sys` 行必须提到当前轮**（`trailingUserText`）。Dynamic Spec 提醒、目标续跑这类注入若留在历史末尾，模型会当作背景而非「刚被问到的事」。做错**只表现为模型重视程度下降**，没有任何错误信号。
+   **只在 `officialApi: false` 时提取**：官方 API 路径把 `sys` 映射为 `role:"system"`（Claude Code 的刻意行为，本身已表达「常驻指令」），不可改写。
 
-### 端点选择：靠网关自报能力，不靠探测
-
-
-三条方向性约定，每条错了都不会报错、只会静默走另一条链：
-
-- **字段缺失 = 老网关 = 走原生路径。** 这是唯一安全的零值方向：猜「支持」会打到一个不存在的端点。
-- **每次拉取目录都会写入 capabilities，包括字段缺失时**（此时清空缓存）。这样把网关镜像回滚后，客户端会停止认为它有该端点。
-
-### 404 回落：复用 Codex 的 rebuild-history 重试
-
-
-做法是撤回该能力（后续每轮都走原生路径），然后抛 `CodexRebuildHistoryRetryError` 让外层从数据库重建历史再重试——与 Codex 配额切换复用同一机制，理由相同。
-
-
-### 两处必须在本侧补齐的缺口（不在 wire 上加字段）
-
-选 Anthropic 格式的代价是它并未解决 canonical 方案的前两个缺口，二者都在 `buildAnthropicHistory` 里补：
-
-1. **尾部 `sys` 行必须提到当前轮**（`trailingUserText`）。Dynamic Spec 提醒、目标续跑这类注入若留在历史末尾，模型会当作背景而非「刚被问到的事」。两条路径都会送达该文本，所以做错**只表现为模型重视程度下降**，没有任何错误信号。
-   **只在 `officialApi: false` 时提取**：官方 API 路径把 `sys` 映射为 `role:"system"`（Claude Code 的刻意行为，本身已表达「常驻指令」），不可改写。NUG delegate 恒为 `officialApi: false`，正好落在需要提取的一侧。
-
-2. **历史图片的 `imageId` 必须从磁盘还原。** 存储的消息只有 imageId，字节在上传者的目录下。`buildAnthropicHistory` 原本只读 text 块，**历史里的图片全部丢失**——追问一张早前的截图时，模型收到的请求里什么都没有。这是 anthropic 路径的既有缺陷（`openai-provider.ts:2928` 是另一条做对了的路径），修它顺带修好了直连 Anthropic 渠道，所以带了直连回归测试。
+2. **历史图片的 `imageId` 必须从磁盘还原。** 存储的消息只有 imageId，字节在上传者的目录下。该函数原本只读 text 块，**历史里的图片全部丢失**——追问一张早前的截图时，模型收到的请求里什么都没有（`openai-provider.ts` 是另一条做对了的路径）。
    失败一律跳过并记 WARN（文件被清理、读不出、owner 未知）：丢一张图不好，但为一张被清理的旧图让整轮失败更糟。
 
-### 图片去重的形状按 delegate 判定，不按渠道名
+## NUG 网关事件与图片去重
 
-
-### 会话身份必须靠 `X-Conversation-ID` 头带过去
-
-
-该头默认关闭，因为它是 NUG 私有头，对官方 Anthropic API 和第三方兼容端点都无意义。
-
-**漏掉它不会报错**：网关侧会 fallback 生成一个 UUID，请求照样成功（完整历史每轮都在 body 里，不丢上下文），代价只是失去凭据粘性——同一会话的每一轮可能落到不同上游凭据。这种损失没有任何信号，所以测试断言的是**真实 outgoing 请求的头**，而不是 provider 上的标志位；后者被设置但没序列化时，弱断言仍会通过。
-
-### gateway 事件
-
-
-`AnthropicProvider` 的 SSE 循环**已有泛化的 gateway 事件短路**（走 `isGatewayEventType`），因此新增两个名字无需改动它；`anthropic-nug-gateway-events.test.ts` 用真实混流验证了这一点，而不是假定。
-
-
-### 尚未做的事（删除 AWS 代码的两个阻塞前置）
-
-
-
+- **gateway 事件**：NUG 用自有事件名下发排队状态、配额余额、模型目录与图片缓存确认，在 `shared/agent-protocol/gateway-events.ts` 里解析。`AnthropicProvider` / `OpenAIProvider` 的 SSE 循环有泛化的 gateway 事件短路（走 `isGatewayEventType`），新增事件名无需改动它们。
+- **图片去重的形状按 delegate 判定，不按渠道名**：`chat()` 里的 `dedupHistory` 分派用 `delegate instanceof AnthropicProvider` 而非渠道名。按渠道名分派会让某些组合走错形状的遍历器，**找不到任何图片从而静默停用去重**，症状是每轮重传全部图片——看起来像网关问题。
 
 ## 代码风格
 

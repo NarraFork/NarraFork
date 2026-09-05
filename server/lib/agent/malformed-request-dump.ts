@@ -1,15 +1,18 @@
 /**
  * Special-case capture for upstream "malformed request" rejections.
  *
+ * Some streaming upstreams answer a structurally invalid body with an
  * opaque envelope that carries no field-level detail:
  *
  * ```json
+ * {"__type":"...#ValidationException",
  *  "message":"Improperly formed request.","reason":"REQUEST_BODY_INVALID"}
  * ```
  *
  * Nothing in that response says *which* part of the request was rejected, so the only way
  * to find the root cause is to keep the exact request body that produced it. This module
  * detects the marker and writes the full request/response to disk (outside SQLite, so the
+ * main-thread DB rules still hold) plus a bounded structural summary of the request payload
  * that usually points straight at the offender (orphaned toolResults, empty content,
  * malformed images, reasoning blocks without a signature).
  *
@@ -44,6 +47,7 @@ export const MALFORMED_REQUEST_DUMP_SCHEMA = "narrafork.malformed-request-dump.v
 export const MALFORMED_REQUEST_CAPTURE_REASON = "malformed_request_body" as const;
 /** Directory (under the NarraFork home) holding forced malformed-request dumps. */
 export const MALFORMED_REQUEST_DUMP_DIR = "malformed-request-dumps";
+/** Hard ceiling for a single dump file. Request bodies with inline images can be large. */
 export const MAX_MALFORMED_DUMP_FILE_BYTES = 32 * 1024 * 1024;
 /** Keep only the newest N dumps so a repeating failure cannot fill the disk. */
 export const MAX_MALFORMED_DUMP_FILES = 20;
@@ -158,8 +162,10 @@ function countImages(message: Record<string, unknown>, summary: MalformedRequest
 }
 
 /**
+ * Build a bounded structural summary of a chat request body. Purely descriptive —
  * it never mutates the body and never copies conversation content, only shapes/counts.
  */
+export function summarizeRequestBody(body: unknown): MalformedRequestBodySummary | undefined {
 	if (!isRecord(body)) return undefined;
 	const summary: MalformedRequestBodySummary = {};
 	const notes: string[] = [];
@@ -313,6 +319,7 @@ export interface MalformedRequestCaptureRecord {
 /**
  * Build the *small* record stored in `api_requests.raw_dump_json`.
  *
+ * The full request body only ever lives in the on-disk dump file: writing a multi-MB
  * body (inline images included) into a SQLite row would violate the main-thread/large-field
  * rules in CLAUDE.md. The DB row keeps the file path, the bounded structural summary, and
  * a short response snippet so the UI can point at the capture.
@@ -332,6 +339,7 @@ export function buildMalformedCaptureRecord(
 				? "Full request body saved to this file on the server (not stored in the database)."
 				: "Failed to write the dump file — see server logs for the failure reason.",
 			requestBodyChars: bodyChars,
+			summary: summarizeRequestBody(request?.body),
 		},
 		provider: input.provider ?? input.dump?.provider,
 		model: input.model ?? input.dump?.model,
@@ -358,6 +366,7 @@ export function buildMalformedCaptureRecord(
 function buildPayload(input: MalformedRequestDumpInput): Record<string, unknown> {
 	const request = input.dump?.request;
 	const bodyChars = request?.body != null ? (JSON.stringify(request.body)?.length ?? 0) : undefined;
+	const summary = summarizeRequestBody(request?.body);
 	return {
 		schema: MALFORMED_REQUEST_DUMP_SCHEMA,
 		trigger: MALFORMED_REQUEST_CAPTURE_REASON,

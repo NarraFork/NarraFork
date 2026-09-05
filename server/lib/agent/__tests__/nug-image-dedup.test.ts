@@ -58,57 +58,6 @@ describe("BoundedConfirmedRefSet", () => {
 	});
 });
 
-	test("unconfirmed ref keeps inline bytes, tags imageRef, reports present", () => {
-		const ref = expectedRef(PNG_B64);
-		const history = [
-			{
-					content: "hi",
-					images: [{ format: "png", source: { bytes: PNG_B64 } }],
-				},
-			},
-		];
-		// biome-ignore lint/suspicious/noExplicitAny: test introspection
-		expect(img.imageRef).toBe(ref);
-		expect(img.source.bytes).toBe(PNG_B64);
-		expect(result.stripped.size).toBe(0);
-		expect(result.present).toEqual([ref]);
-	});
-
-	test("confirmed ref strips bytes and records payload for restore", () => {
-		const ref = expectedRef(PNG_B64);
-		const history = [
-			{
-					content: "hi",
-					images: [{ format: "png", source: { bytes: PNG_B64 } }],
-				},
-			},
-		];
-		// biome-ignore lint/suspicious/noExplicitAny: test introspection
-		expect(img.imageRef).toBe(ref);
-		expect(img.source.bytes).toBe("");
-		expect(result.stripped.get(ref)).toBe(PNG_B64);
-		expect(result.present).toEqual([]);
-	});
-
-	test("restore puts the stripped bytes back", () => {
-		const ref = expectedRef(PNG_B64);
-		const history = [
-			{
-					content: "hi",
-					images: [{ format: "png", source: { bytes: PNG_B64 } }],
-				},
-			},
-		];
-		// biome-ignore lint/suspicious/noExplicitAny: test introspection
-		expect(img.source.bytes).toBe(PNG_B64);
-	});
-
-	test("no images is a no-op", () => {
-		expect(result.stripped.size).toBe(0);
-		expect(result.present).toEqual([]);
-	});
-});
-
 describe("dedupOpenAIHistoryImages", () => {
 	test("unconfirmed responses input_image keeps payload, tags ref", () => {
 		const uri = `data:image/png;base64,${PNG_B64}`;

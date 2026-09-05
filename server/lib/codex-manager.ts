@@ -359,6 +359,7 @@ function getStatsPath(baseDir?: string): string {
  * The Codex credential file holds refresh tokens, personal access tokens and
  * Agent Identity Ed25519 private keys. A plain writeFileSync lands on the umask
  * default (usually 0o644), i.e. world-readable — every other secret store in the
+ * repo (settings/index.ts, plugin-secret-vault.ts) pins 0o600,
  * so this matches.
  *
  * `mode` only applies when the file is created, so pre-existing files from

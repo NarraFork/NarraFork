@@ -87,6 +87,7 @@ const workspacePanelBodyLimit = bodyLimit({
  * When the request carries no `Content-Length`, `bodyLimit` enforces its cap by
  * ERRORING THE BODY STREAM, which arrives here as a failed read. Rethrowing that
  * specific error lets the middleware produce its 413 instead of it being reported
+ * as a generic malformed-body 400.
  */
 async function readWorkspaceJson(c: Context): Promise<unknown> {
 	try {

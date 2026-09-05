@@ -151,6 +151,7 @@ describe("plugin command secret writes: refused escapes", () => {
 		await expect(
 			applyCommandSecretWrites({
 				pluginId: PLUGIN_ID,
+				writes: [{ key: "acme.credentials", value: "x" }],
 				registry: registryWith(registration()),
 				sink,
 			}),

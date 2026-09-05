@@ -64,6 +64,11 @@ const MESSAGE_TABLE_KEYS = [
 	"specUpdateHeading",
 	"specUpdateEntry",
 	"specUpdatePreview",
+	// asyncQuestionAnswers
+	"asyncQuestionAnsweredHeading",
+	"asyncQuestionEntry",
+	"asyncQuestionNotes",
+	"asyncQuestionDismissedHeading",
 ] as const;
 
 const cache = new Map<Locale, SideCarModelTemplates>();

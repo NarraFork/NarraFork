@@ -206,6 +206,7 @@ Provider Registry 对上统一返回现有 `ProviderAdapter`。Agent Loop 不需
 
 | 层级 | 典型场景 | 执行位置 | 协议转换位置 | 风险与成本 |
 | --- | --- | --- | --- | --- |
+| 内置 provider | Codex 等核心集成 | NarraFork 进程 | 内置适配器 | 核心维护，权限最高 |
 | 兼容 API provider | OpenAI/Anthropic/Gemini 兼容端点 | NarraFork 进程 | 现有通用适配器 | 无额外可执行代码，优先选择 |
 | 可执行 provider 插件 | 专有 SDK、OAuth、私有流协议、本地推理桥 | 独立进程 | 插件进程 | 需安装、授权、隔离和进程管理 |
 
@@ -720,6 +721,7 @@ interface ProviderHostHints {
   `provider.event` 流事件、前端可见的任何响应 payload。
 - **缺失语义**：字段不存在 = 宿主无代理策略，插件使用自身默认值。
   空字符串永远不会被发送（协议约束 `min(1)`）。
+- **来源**：`getOutboundProxy()`——读取宿主的全局 proxy 设置，不含 provider 专有覆盖。
 
 #### `concurrency.maxConcurrentUpstream`
 
@@ -731,6 +733,7 @@ interface ProviderHostHints {
   - `maxConcurrentUpstream`（hostHints 中）= 建议插件自我节流的上游连接数。
 - **当前状态：宿主不下发此字段**。原因：宿主当前唯一可用的值就是插件自己在 manifest 中声明的
   `maxConcurrentChat`，将其回送给插件是纯噪音。真正有价值的场景是"插件与宿主内置路径共享同一
+  上游账号额度"——此时宿主需要知道内置路径正在消耗多少并发，而该信息来自 provider 专有的并发控制状态，
   不应注入通用插件协议。当跨路径并发预算协调机制实现后，此字段将成为下发载体。
 
 ### 10B.4 向后兼容

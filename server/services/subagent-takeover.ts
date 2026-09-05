@@ -2,16 +2,22 @@
  * Subagent takeover state.
  *
  * "Takeover" is an explicit, user-driven mode layered on top of the existing
- * manual_override mechanism. When the user clicks "Take over" on a running
- * subagent page:
- *   - Foreground subagent: the current turn is hard-interrupted, the parent
- *     tool call stays blocked in waitForManualOverride for the entire takeover,
- *     and the user operates the subagent like an independent narrator (send /
- *     interrupt / queue / continue) via the normal narrator-session engine.
- *   - Background subagent: the current turn is interrupted (without marking the
- *     task completed/failed), the task leaves background mode, and the user
- *     operates it directly. Await/Send/sidecar messages to the parent report
- *     "being taken over by the user" instead of completed/interrupted.
+ * manual_override mechanism. It is a claim on the RESULT, not on the current
+ * turn: clicking "Take over" does NOT stop what the subagent is doing. The turn
+ * in flight runs to its natural end, and only then — instead of handing the
+ * result back — the subagent parks in `idle[taken_over]` waiting for the user,
+ * who then operates it like an independent narrator (send / interrupt / queue /
+ * continue).
+ *   - Foreground subagent: the parent tool call stays blocked in
+ *     waitForManualOverride for the entire takeover.
+ *   - Background subagent: the task leaves background mode when its turn ends
+ *     (without being marked completed/failed) and the user operates it directly.
+ *     Await/Send/sidecar messages to the parent report "being taken over by the
+ *     user" instead of completed/interrupted.
+ *
+ * Stopping the current turn is a SEPARATE wish with its own button: Stop is soft
+ * during a takeover and keeps the hold (see the subagent branch of
+ * `POST /:id/interrupt`).
  *
  * Stopping takeover returns the result to the parent (foreground: resolve the
  * blocked Promise; background: restore the normal background completion flow).
@@ -45,19 +51,6 @@ function getTakenOverBackgroundSet(): Set<string> {
 }
 
 /**
- * Pending-takeover marker. Set by the takeover API immediately before hard-
- * interrupting a foreground subagent, consumed by runForegroundLoop when it
- * reaches the manual_override branch to decide whether the suspension is a
- * plain manual_override or an explicit takeover. This resolves the race between
- * the async hard interrupt and the loop entering the suspended state.
- */
-let _pendingTakeover: Set<string> | undefined;
-function getPendingTakeoverSet(): Set<string> {
-	if (!_pendingTakeover) _pendingTakeover = new Set();
-	return _pendingTakeover;
-}
-
-/**
  * Pending stop-takeover marker. Set by the stop-takeover API when the subagent
  * is still working (its independent loop is running). When the loop finishes,
  * the conclusion-watcher path uses this to resolve the parent's blocked Promise
@@ -80,24 +73,6 @@ let _pendingBackgroundFinalize: Set<string> | undefined;
 function getPendingBackgroundFinalizeSet(): Set<string> {
 	if (!_pendingBackgroundFinalize) _pendingBackgroundFinalize = new Set();
 	return _pendingBackgroundFinalize;
-}
-
-// === Pending takeover (enter-race resolution) ===
-
-export function markPendingTakeover(subagentId: string): void {
-	getPendingTakeoverSet().add(subagentId);
-}
-
-/** Atomically check-and-clear the pending-takeover marker. */
-export function consumePendingTakeover(subagentId: string): boolean {
-	const set = getPendingTakeoverSet();
-	if (!set.has(subagentId)) return false;
-	set.delete(subagentId);
-	return true;
-}
-
-export function clearPendingTakeover(subagentId: string): void {
-	getPendingTakeoverSet().delete(subagentId);
 }
 
 // === Pending stop-takeover (working → resolve on loop end) ===
@@ -146,7 +121,6 @@ export function markTakenOver(subagentId: string, options?: { background?: boole
 export function clearTakenOver(subagentId: string): void {
 	getTakenOverSet().delete(subagentId);
 	getTakenOverBackgroundSet().delete(subagentId);
-	getPendingTakeoverSet().delete(subagentId);
 	getPendingStopTakeoverSet().delete(subagentId);
 	getPendingBackgroundFinalizeSet().delete(subagentId);
 }
@@ -165,56 +139,21 @@ export function isBackgroundTakenOver(subagentId: string): boolean {
  * Whether a subagent-only interrupt should suspend as a takeover rather than as a
  * plain manual_override.
  *
- * Two distinct facts answer this, and using only the first is a real bug:
- * - `pendingTakeover` — this interrupt IS the takeover request (the very first one).
- * - `alreadyTakenOver` — the takeover is already established and the user just
- *   stopped a turn they were driving themselves. Every interrupt after the first
- *   falls here.
+ * There is exactly one fact to read — is a takeover already established? — because
+ * an interrupt is never itself the takeover request any more: `POST /:id/takeover`
+ * records the hold and leaves the turn running. Every interrupt that arrives during
+ * a takeover is the user stopping a turn they are driving themselves, and it must
+ * suspend as `taken_over`; otherwise the takeover UI vanishes while `isTakenOver`
+ * still holds and the parent stays blocked with no visible way to release it.
  *
- * Reading only the pending marker made the second Stop of a takeover suspend as
- * `manual_override`: the takeover UI disappears while `isTakenOver` still holds, so
- * the parent stays blocked with no visible way to release it, and the queue drain
- * that `feedQueuedMessageIntoSuspension` performs is attributed to the wrong state.
- */
-export function suspensionIsTakeover(flags: {
-	pendingTakeover: boolean;
-	alreadyTakenOver: boolean;
-}): boolean {
-	return flags.pendingTakeover || flags.alreadyTakenOver;
-}
-
-/**
- * Consume the pending-takeover marker AND decide the substatus, as one step.
- *
- * These two things were separate statements in the runner, and that is what made the
- * bug possible: `consumePendingTakeover` is destructive, so by the time a second
- * interrupt arrives the marker is gone and only `isTakenOver` still says the user is
- * driving. Reading them apart invites "check the flag I just consumed", which reads
- * correctly and is wrong from the second Stop onward.
- *
- * Keeping the order here — consume, promote to taken-over, then answer — means a test
- * can exercise the ACTUAL sequence a repeated interrupt performs, rather than
- * restating the boolean logic (a test that passes even if the runner reverts to
- * reading the consumed marker alone).
- *
- * Returns `startedTakeover` too, because the caller distinguishes "the takeover began
- * on this interrupt" for its settling-window handling.
+ * Kept as a named function (rather than inlining `isTakenOver` at the call site)
+ * because the answer decides which substatus the suspension is published under, and
+ * the runner should not have to restate that rule.
  */
 export function beginSubagentInterruptSuspension(subagentId: string): {
-	startedTakeover: boolean;
 	heldByTakeover: boolean;
 } {
-	const startedTakeover = consumePendingTakeover(subagentId);
-	if (startedTakeover) markTakenOver(subagentId);
-	return {
-		startedTakeover,
-		heldByTakeover: suspensionIsTakeover({
-			pendingTakeover: startedTakeover,
-			// Read AFTER the promotion above, so a takeover that just started reports
-			// consistently no matter which of the two facts the caller looks at.
-			alreadyTakenOver: isTakenOver(subagentId),
-		}),
-	};
+	return { heldByTakeover: isTakenOver(subagentId) };
 }
 
 /**
@@ -223,9 +162,45 @@ export function beginSubagentInterruptSuspension(subagentId: string): {
  * For batch callers (message loading) that would otherwise probe `isTakenOver`
  * once per candidate row. Synchronous and allocation-bounded by the number of
  * live takeovers (realistically 0-2), so it is safe on the main thread.
+ *
+ * ⚠️ This is the CONTROL-FLOW answer (who is still held), not the answer to
+ * "whose badge should be lit" — see {@link isTakeoverReleasePending}.
  */
 export function listTakenOverSubagents(): string[] {
 	return [...getTakenOverSet()];
+}
+
+/**
+ * The user has already pressed "Stop takeover", but the release cannot complete
+ * yet because the subagent's own loop is still running: the result handoff
+ * happens when that loop ends.
+ *
+ * Until then `isTakenOver` DELIBERATELY stays true — `clearTakenOver` wipes every
+ * takeover set including the pending-release marker the loop must still consume
+ * (see the deferred branches in the stop-takeover route). So the two questions
+ * genuinely have different answers in this window:
+ *
+ *   isTakenOver()              → yes, still held (control flow)
+ *   isTakeoverReleasePending() → yes, the USER has let go (display)
+ *
+ * Anything that PAINTS the takeover state must consult this too, otherwise a
+ * page loaded during that window re-lights a badge the user already dismissed
+ * and the card claims the session is waiting on a person who is not waiting.
+ */
+export function isTakeoverReleasePending(subagentId: string): boolean {
+	return (
+		getPendingStopTakeoverSet().has(subagentId) || getPendingBackgroundFinalizeSet().has(subagentId)
+	);
+}
+
+/** Taken over AND not already released by the user — the badge's condition. */
+export function isTakenOverForDisplay(subagentId: string): boolean {
+	return isTakenOver(subagentId) && !isTakeoverReleasePending(subagentId);
+}
+
+/** Batch form of {@link isTakenOverForDisplay}. */
+export function listDisplayTakenOverSubagents(): string[] {
+	return [...getTakenOverSet()].filter((id) => !isTakeoverReleasePending(id));
 }
 
 // === Substatus preservation ===

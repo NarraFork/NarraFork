@@ -1,4 +1,6 @@
 {
 	"version": "0.4.31",
 	"date": "2026-06-27",
+	"en": "## New Features\n\n- Subagent takeover: directly operate a running subagent while the parent tool call stays blocked, then hand the result back when you stop the takeover (works for both foreground and background subagents).\n- Rerun denied tool calls: re-allow and execute a tool call that was previously denied.\n\n## Bug Fixes\n\n- Fixed gateway adapter tool calls that were split across streaming deltas being dropped, so fragmented XML invoke blocks now execute correctly.\n- Fixed the reasoning-only retry counter not resetting after a successful turn, which could fatally terminate long sessions.\n\n## Performance\n\n- Added output limits and timeouts to grep, snapshot, and container operations, and avoided loading large fields on the main thread to keep the backend responsive.",
+	"zh-CN": "## 新功能\n\n- 子代理接管：可直接操作运行中的子代理，父工具调用保持阻塞，停止接管后回传结果（前台、后台两种子代理均支持）。\n- 重跑被拒绝的工具调用：对此前被拒绝的工具调用重新放行并执行。\n\n## 修复\n\n- 修复网关适配器跨流式分片的工具调用被漏执行的问题，分片的 XML 调用块现在能正确执行。\n- 修复 reasoning-only 重试计数器在成功回合后未重置，导致长会话可能被误判致命终止的问题。\n\n## 性能优化\n\n- 为 grep、快照、容器操作增加输出上限与超时，并避免在主线程加载大字段，提升后端响应稳定性。"
 }

@@ -13,10 +13,12 @@
 
 ### 1.1 当前扩展方式
 
+- **[当前事实]** `server/main.ts` 是后端组合根：它负责数据库初始化、HTTP/WS 启动、MCP、调度器、Gateway、容器代理、恢复流程和优雅退出。新增常驻能力通常需要在该文件增加静态导入和启动/停止代码。
 - **[当前事实]** `server/app.ts` 静态导入并挂载 Hono 路由，公共路由与全局 `requireAuth` 门禁顺序由核心代码决定；当前没有供外部代码任意注册 Hono middleware 或 route 的稳定接口。
 - **[当前事实]** `ProviderAdapter` 是进程内 TypeScript 接口，包含历史转换、工具格式化、流式聊天、生成、usage、取消信号等较宽的协议面；provider 解析目前由核心设置和 `createProviderByName()` 完成。
 - **[当前事实]** Agent 工具体系通过 `ToolDefinition`、`ToolContext` 和 `AbortSignal` 工作。`ToolContext` 含叙述者、项目、用户、权限处理、执行设备等敏感上下文，不适合原样交给第三方代码。
 - **[当前事实]** `McpManager` 已具备外部进程/远端连接、工具发现、调用取消、断线重连和工具列表变化通知，但 MCP 只覆盖工具协议，不是通用的 NarraFork 插件生命周期或宿主 API。
+- **[当前事实]** 内置 provider 通过适配器注册进核心进程、可访问核心模块；没有通用安装、授权、隔离、升级和崩溃治理。
 - **[当前事实]** 后端主线程同时承担 Bun HTTP/WS、SQLite、序列化和大量事件分发。项目规则明确要求长任务、无界输出和大数据处理不得阻塞该线程。
 
 ### 1.2 目标问题

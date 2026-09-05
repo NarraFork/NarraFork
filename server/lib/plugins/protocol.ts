@@ -997,6 +997,8 @@ export const providerConcurrencyBudgetSchema = z
 		 * declared — sending it back would be pure noise since the plugin already has it.
 		 *
 		 * Meaningful delivery requires the host to know how much of a shared upstream quota is
+		 * being consumed by OTHER paths (e.g. a built-in adapter sharing the same
+		 * account). That information lives in provider-specific concurrency-control state and should
 		 * not leak into the generic plugin protocol. When a cross-path budget coordination
 		 * mechanism exists, this field becomes the delivery vehicle.
 		 */

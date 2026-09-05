@@ -87,6 +87,12 @@ Result preview: {preview}`,
 		"[System] The user updated the following spec files via the Spec panel — align your plan accordingly:",
 	specUpdateEntry: "User updated {uri} via UI ({timestamp}).",
 	specUpdatePreview: "Content preview:",
+	asyncQuestionAnsweredHeading:
+		"[System] The user answered your asynchronous question(s). Adjust your work accordingly — do not ask again:",
+	asyncQuestionEntry: "Q: {header}\nA: {answer}",
+	asyncQuestionNotes: "Note: {notes}",
+	asyncQuestionDismissedHeading:
+		"[System] The user chose not to answer your asynchronous question(s) — use your own best judgement and continue. Do not ask again:",
 };
 
 const ZH: SideCarModelTemplates = {
@@ -121,6 +127,12 @@ const ZH: SideCarModelTemplates = {
 	specUpdateHeading: "[系统] 用户通过 Spec 面板更新了以下文件，请注意同步你的工作计划：",
 	specUpdateEntry: "用户通过 UI 更新了 {uri}（{timestamp}）。",
 	specUpdatePreview: "内容预览：",
+	asyncQuestionAnsweredHeading:
+		"[系统] 用户回答了你此前异步提交的问题。请据此调整工作，不要重复提问：",
+	asyncQuestionEntry: "问：{header}\n答：{answer}",
+	asyncQuestionNotes: "备注：{notes}",
+	asyncQuestionDismissedHeading:
+		"[系统] 用户选择不回答你此前异步提交的问题 —— 请按你自己的最佳判断继续，不要重复提问：",
 };
 
 const THRESHOLD = 30;
@@ -700,11 +712,17 @@ describe("coerceSideCarBody / readSideCarBody", () => {
 		expect(coerceSideCarBody({ kind: "tasks", variant: "emptyNever" })?.kind).toBe("tasks");
 		expect(coerceSideCarBody({ kind: "knowledge", hits: [] })?.kind).toBe("knowledge");
 		expect(coerceSideCarBody({ kind: "messages", items: [] })?.kind).toBe("messages");
+		expect(
+			coerceSideCarBody({ kind: "asyncQuestionAnswers", outcome: "answered", items: [] })?.kind,
+		).toBe("asyncQuestionAnswers");
 	});
 
 	it("rejects an unknown kind, a wrong-typed collection, and non-objects", () => {
 		expect(coerceSideCarBody({ kind: "whatever" })).toBeUndefined();
 		expect(coerceSideCarBody({ kind: "messages", items: "nope" })).toBeUndefined();
+		expect(
+			coerceSideCarBody({ kind: "asyncQuestionAnswers", outcome: "answered", items: "nope" }),
+		).toBeUndefined();
 		expect(coerceSideCarBody({ kind: "prose" })).toBeUndefined();
 		expect(coerceSideCarBody(null)).toBeUndefined();
 		expect(coerceSideCarBody("string")).toBeUndefined();

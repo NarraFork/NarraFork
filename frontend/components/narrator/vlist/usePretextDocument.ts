@@ -5,7 +5,6 @@ import type {
 	PretextLayoutManifest,
 } from "@shared/pretext-layout";
 import { onTypographyChange } from "@shared/pretext-layout/typography";
-import type { ProgressSnapshot } from "@shared/progress-phase";
 import {
 	useCallback,
 	useEffect,
@@ -20,6 +19,7 @@ import { onFontRevisionChange } from "./katex-runtime";
 import type { RenderLod } from "./prepared-block";
 import type { PretextDocumentLoadOptions } from "./pretext-document-loader";
 import {
+	type CompactProgressPatch,
 	captureCoordinatorAnchor,
 	type PretextLayoutBuildOptions,
 	PretextLayoutCoordinator,
@@ -207,7 +207,11 @@ export interface UsePretextDocumentResult {
 	 */
 	loadOlderAsync: () => Promise<number>;
 	/** Apply a live compact-progress tick to the loaded document (no refetch). */
-	applyCompactProgress: (messageId: string, progress: ProgressSnapshot, isSegment: boolean) => void;
+	applyCompactProgress: (
+		messageId: string,
+		progress: CompactProgressPatch,
+		isSegment: boolean,
+	) => void;
 	/**
 	 * Apply a live tool / reflection / subagent lifecycle patch to the loaded
 	 * document (no refetch, anchor-preserving). Returns true when it changed
@@ -656,7 +660,7 @@ export function usePretextDocument(
 		});
 	}, [coordinator, loadOlderAsync]);
 	const applyCompactProgress = useCallback(
-		(messageId: string, progress: ProgressSnapshot, isSegment: boolean) => {
+		(messageId: string, progress: CompactProgressPatch, isSegment: boolean) => {
 			coordinator?.applyCompactProgress(messageId, progress, isSegment);
 		},
 		[coordinator],

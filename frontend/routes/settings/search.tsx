@@ -111,7 +111,6 @@ function channelBadgeColor(kind: SearchChannelKind): string {
 	switch (kind) {
 		case "native":
 			return "violet";
-			return "blue";
 		case "nug-mcp":
 			return "green";
 		case "custom-api":

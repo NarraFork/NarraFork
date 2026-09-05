@@ -160,6 +160,7 @@ describe("plugin command registry: dispatch", () => {
 	test("returns secretWrites for the caller to validate", async () => {
 		const runtime = recordingRuntime({
 			output: { ok: true },
+			secretWrites: [{ key: "provider.acme.bundle", value: "payload" }],
 		});
 		const registry = registryWith(runtime);
 
@@ -167,6 +168,7 @@ describe("plugin command registry: dispatch", () => {
 
 		// The registry passes them through; the key whitelist lives in
 		// plugin-command-secret-writes so the policy has exactly one home.
+		expect(result.secretWrites).toEqual([{ key: "provider.acme.bundle", value: "payload" }]);
 	});
 
 	test("defaults secretWrites to an empty array", async () => {

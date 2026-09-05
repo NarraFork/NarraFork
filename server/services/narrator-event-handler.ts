@@ -30,6 +30,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { DEFAULT_CONTEXT_THRESHOLDS, LARGE_CONTEXT_BOUNDARY, settings } from "../lib/settings";
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
+import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import { bumpNarratorMessageVersion } from "./narrator-persistence";
 import type { EnterPlanModeToolResultCommit } from "./narrator-plan-mode";
@@ -75,6 +76,7 @@ export interface EventHandlerContext {
 	conversationId: string;
 	/** Locale for the narrator session (used for reasoning translation) */
 	locale?: string;
+	/** Provider prefix (e.g. "nug", "anthropic") for the current session */
 	providerPrefix?: string;
 	/** Resolved provider for the current turn */
 	provider?: string;
@@ -373,42 +375,17 @@ export function clearStreamingSnapshot(narratorId: string): void {
  * subagent's own narratorId so that clients viewing the subagent page
  * directly can receive streaming events.
  *
- * The self-copy replaces `narratorId` with the subagent's own ID and strips
- * subagent-specific linking fields so it looks like a normal narrator event.
+ * A thin adapter over {@link dualBroadcastToNarrator}: the stripping rules now live
+ * in the websocket layer so producers outside this event loop (structured injection)
+ * use the same ones instead of keeping a second copy. This wrapper exists only to
+ * keep the ~30 call sites below reading in terms of the context they already hold.
  */
 function dualBroadcast(
 	ctx: EventHandlerContext,
 	message: NarratorServerMessage,
 	parentMessage: NarratorServerMessage = message,
 ): void {
-	// Primary broadcast (to parent narrator's subscribers). Subagent callers may
-	// provide a deliberately reduced payload while the self copy remains complete.
-	broadcastToNarrator(ctx.broadcastTargetId, parentMessage);
-
-	// Self-broadcast for subagents: send to subagent's own narratorId
-	if (ctx.parentToolUseId && ctx.narratorId !== ctx.broadcastTargetId) {
-		// biome-ignore lint/suspicious/noExplicitAny: shallow clone with dynamic field overrides
-		const selfMsg: any = { ...message, narratorId: ctx.narratorId };
-		// Strip subagent linking fields from the nested event (if present)
-		if (selfMsg.event && typeof selfMsg.event === "object") {
-			const { subagentToolUseId, subagentNarratorId, ...cleanEvent } = selfMsg.event;
-			selfMsg.event = cleanEvent;
-		}
-		// Strip parentToolUseId from tool_use_chunk self-copy
-		if (selfMsg.parentToolUseId) {
-			delete selfMsg.parentToolUseId;
-		}
-		// Strip isSubagent flag from context_usage / metering self-copy
-		if (selfMsg.isSubagent) {
-			delete selfMsg.isSubagent;
-		}
-		// Strip parentToolUseId from the message payload so the subagent page
-		// treats it as a top-level message (not a child of some tool_use)
-		if (selfMsg.message?.parentToolUseId) {
-			selfMsg.message = { ...selfMsg.message, parentToolUseId: null };
-		}
-		broadcastToNarrator(ctx.narratorId, selfMsg);
-	}
+	dualBroadcastToNarrator(ctx, message, parentMessage);
 }
 
 function subagentToolRouting(ctx: EventHandlerContext, toolUseId: string) {
@@ -2169,11 +2146,6 @@ export async function processEvent(
 
 		case "metering": {
 			ctx.setMeterData(event.usage, event.unit);
-			if (event.credentialId) {
-				try {
-				} catch {
-				}
-			}
 			const isSubagent = !!ctx.parentToolUseId;
 			dualBroadcast(ctx, {
 				type: "metering",

@@ -324,13 +324,21 @@ export function useVListLivePatches(
 			// PERSON. Without the badge a suspended Agent card and an in-flight Await
 			// look exactly like ordinary running work, and a forgotten takeover stalls
 			// the session with nothing on screen explaining why.
+			//
+			// BOTH addressing routes run, they are not fallbacks for each other. The
+			// frame's `toolUseId` is the call that SPAWNED the child (resolved from its
+			// first user message), while a separate in-flight `Await({type:"agent"})`
+			// waiting on the same child is a DIFFERENT card that only carries the child's
+			// narrator id (`_awaitAgentNarratorId`, server-resolved). Treating the id as
+			// exclusive left the Await card lit forever after the user stopped the
+			// takeover, because the message-load path (`collectTakenOverToolUseIds`) does
+			// flag it while no live frame ever cleared it.
+			//
+			// Running both is safe: each patch reports `changed: false` when it matches
+			// nothing, and they write the same fields with the same value, so the card
+			// cannot end up in a mixed state.
 			onSubagentTakeoverChanged: ({ subagentNarratorId, toolUseId, takenOver }) => {
-				if (toolUseId) {
-					enqueue(subagentTakeoverPatch({ toolUseId, takenOver }));
-					return;
-				}
-				// No spawning tool_use resolved server-side — match the card by the child
-				// narrator id it already carries rather than dropping the indicator.
+				if (toolUseId) enqueue(subagentTakeoverPatch({ toolUseId, takenOver }));
 				if (!subagentNarratorId) return;
 				enqueue((messages) =>
 					patchSubagentTakeoverByNarrator(messages, subagentNarratorId, takenOver),

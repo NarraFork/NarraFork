@@ -5,8 +5,11 @@
  *  - a COMPLETED body still opens at its head (mount never pins it to the tail,
  *    so the truncated-body auto-fetch keeps gating on the reader's own scroll);
  *  - a GROWING (streaming) body follows its own growth to the tail;
- *  - a reader scrolling up detaches the follow and gets a jump-to-bottom button;
- *    scrolling back to the tail (or pressing it) re-arms the follow.
+ *  - a reader scrolling up (wheel deltaY < 0) detaches the follow and gets a
+ *    jump-to-bottom button; scrolling back to the tail (or pressing it) re-arms
+ *    the follow. A DOWNWARD wheel never detaches — it heads for the tail, and
+ *    direction-blind detachment used to disarm the follow whenever the pointer
+ *    happened to rest over an output box.
  *
  * linkedom has no layout, so scroll geometry is stubbed per element (or on the
  * HTMLElement prototype for the mount-time case, where the element does not
@@ -159,6 +162,19 @@ async function dispatch(box: HTMLElement, type: string): Promise<void> {
 	});
 }
 
+/**
+ * A wheel event carrying a deltaY. linkedom's `Event` has no deltaY, so it is
+ * defined onto the event object directly — the handler only reads the field.
+ * NEGATIVE deltaY = scrolling up (detach intent); POSITIVE = down (no intent).
+ */
+async function dispatchWheel(box: HTMLElement, deltaY: number): Promise<void> {
+	await act(async () => {
+		const event = new (globalThis.Event as typeof Event)("wheel", { bubbles: true });
+		Object.defineProperty(event, "deltaY", { configurable: true, value: deltaY });
+		box.dispatchEvent(event);
+	});
+}
+
 function resumeButton(): Element | null {
 	return container?.querySelector(`button[aria-label='${RESUME_LABEL}']`) ?? null;
 }
@@ -211,7 +227,7 @@ describe("AutoFollowScroll — followOnMount={false} growth following", () => {
 		await renderFollow({ dep: "a", followOnMount: false });
 		const box = scrollBox();
 		stubGeometry(box);
-		await dispatch(box, "wheel");
+		await dispatchWheel(box, -100);
 		setScrollTop(box, 100);
 		await dispatch(box, "scroll");
 		expect(resumeButton()).not.toBeNull();
@@ -220,11 +236,24 @@ describe("AutoFollowScroll — followOnMount={false} growth following", () => {
 		expect(scrollBox().scrollTop).toBe(100);
 	});
 
+	test("a DOWNWARD wheel does not detach the follow", async () => {
+		await renderFollow({ dep: "a", followOnMount: false });
+		const box = scrollBox();
+		stubGeometry(box);
+		// The pointer rests over the output box while the reader wheels the
+		// conversation DOWN: not a "show me history" gesture, so the follow must
+		// survive it. (Regression: direction-blind intent registration disarmed the
+		// follow for the rest of the stream.)
+		await dispatchWheel(box, 100);
+		await renderFollow({ dep: "ab", followOnMount: false });
+		expect(scrollBox().scrollTop).toBe(1000);
+	});
+
 	test("scrolling back to the tail re-arms the follow", async () => {
 		await renderFollow({ dep: "a", followOnMount: false });
 		const box = scrollBox();
 		stubGeometry(box);
-		await dispatch(box, "wheel");
+		await dispatchWheel(box, -100);
 		setScrollTop(box, 100);
 		await dispatch(box, "scroll");
 		expect(resumeButton()).not.toBeNull();
@@ -239,7 +268,7 @@ describe("AutoFollowScroll — followOnMount={false} growth following", () => {
 		await renderFollow({ dep: "a", followOnMount: false });
 		const box = scrollBox();
 		stubGeometry(box);
-		await dispatch(box, "wheel");
+		await dispatchWheel(box, -100);
 		setScrollTop(box, 100);
 		await dispatch(box, "scroll");
 		const button = resumeButton();

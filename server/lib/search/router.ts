@@ -1,3 +1,4 @@
+
 import { logger } from "../logger";
 import {
 	getAnthropicProviderConfig,
@@ -25,6 +26,21 @@ import {
 } from "./settings";
 import { isAbortError, withSearchTimeout } from "./timeout";
 import type { SearchChannelResult, SearchExecutionResult, SearchRequest } from "./types";
+
+/**
+ * JSON-RPC shape an MCP `tools/call` reply takes.
+ *
+ * Declared locally rather than imported: the only remaining MCP search channel
+ * speaks to the NUG gateway over plain HTTP, so there is no client library to
+ * borrow the type from.
+ */
+interface McpResponse {
+	error?: { message?: string };
+	result?: {
+		content?: Array<{ type?: string; text?: string }>;
+		isError?: boolean;
+	};
+}
 
 function textFromMcpResponse(response: McpResponse): { text: string; isError?: boolean } {
 	if (response.error) {
@@ -102,14 +118,6 @@ async function nugMcpSearch(
 	}
 	const mcp = (await response.json()) as McpResponse;
 	const parsed = textFromMcpResponse(mcp);
-	return { channelId: channel.id, channelLabel: channelLabel(channel), text: parsed.text };
-}
-
-	channel: SearchChannelConfig,
-	request: SearchRequest,
-	signal: AbortSignal,
-): Promise<SearchChannelResult> {
-	const parsed = textFromMcpResponse(response);
 	return { channelId: channel.id, channelLabel: channelLabel(channel), text: parsed.text };
 }
 
@@ -243,10 +251,6 @@ async function runChannel(
 	request: SearchRequest,
 ): Promise<SearchChannelResult> {
 	switch (channel.kind) {
-			return withSearchTimeout(
-				request.signal,
-				channelTimeout(channel),
-			);
 		case "nug-mcp":
 			return withSearchTimeout(
 				request.signal,

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { validatePluginRelease } from "../../scripts/validate-plugin-release";
@@ -24,17 +24,16 @@ async function waitForProcessesToExit(pids: number[], timeoutMs = 2_500): Promis
 }
 
 describe("plugin GA release validation", () => {
-	test("keeps static validation backward compatible across the supported matrix", async () => {
+	test("validates the remaining generic references across the supported matrix", async () => {
 		const summary = await validatePluginRelease(examplesRoot);
 		expect(summary.valid).toBe(true);
 		expect(summary.mode).toBe("static");
-		expect(summary.packageCount).toBe(11);
-		// 11 packages across the 6 os/arch combinations the release matrix supports.
-		expect(summary.matrixCombinationCount).toBe(66);
+		expect(summary.packageCount).toBe(9);
+		// 9 packages across the 6 os/arch combinations the release matrix supports.
+		expect(summary.matrixCombinationCount).toBe(54);
 		expect(summary.errors).toEqual([]);
 		// Discovery sorts by directory name, so this list is alphabetical.
 		expect(summary.packages.map((item) => item.kind)).toEqual([
-			"cline-external",
 			"provider",
 			"sandbox-ui-panel",
 			"theme-duo",
@@ -66,12 +65,12 @@ describe("plugin GA release validation", () => {
 		}
 	});
 
-	test("computes the same package digest as the installer", async () => {
+	test("computes the same generic provider package digest as the installer", async () => {
 		const releaseRoot = await mkdtemp(join(tmpdir(), "narrafork-plugin-digest-release-"));
 		const storeRoot = await mkdtemp(join(tmpdir(), "narrafork-plugin-digest-store-"));
 		try {
-			const packageRoot = join(releaseRoot, "cline-external");
-			await cp(join(examplesRoot, "cline-external"), packageRoot, { recursive: true });
+			const packageRoot = join(releaseRoot, "provider");
+			await cp(join(examplesRoot, "provider"), packageRoot, { recursive: true });
 			const summary = await validatePluginRelease(releaseRoot);
 			const installed = await new PluginPackageStore(storeRoot).install(packageRoot);
 
@@ -82,6 +81,80 @@ describe("plugin GA release validation", () => {
 				rm(releaseRoot, { recursive: true, force: true }),
 				rm(storeRoot, { recursive: true, force: true }),
 			]);
+		}
+	});
+
+	test("rejects empty release sets rather than skipping the gate", async () => {
+		const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-empty-release-"));
+		try {
+			expect(await validatePluginRelease(root, { mode: "ga" })).toMatchObject({
+				valid: false,
+				packageCount: 0,
+			});
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test.each([
+		"manifest.json",
+		"server/index.js",
+		"sbom.spdx.json",
+	])("fails closed before runtime validation when %s is missing", async (path) => {
+		const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-missing-release-"));
+		try {
+			const packageRoot = join(root, "tool-command");
+			await cp(join(examplesRoot, "tool-command"), packageRoot, { recursive: true });
+			await rm(join(packageRoot, path));
+			const summary = await validatePluginRelease(root, { mode: "ga" });
+			expect(summary.valid).toBe(false);
+			expect(summary.errors.length).toBeGreaterThan(0);
+			expect(summary.packages[0]?.runtime.status).toBe("not-requested");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test.each([
+		{ field: "license", value: "MIT", error: /SBOM package license/ },
+		{ field: "version", value: "9.0.0", error: /SBOM does not contain/ },
+		{ field: "engine.os", value: ["linux"], error: /release matrix does not support/ },
+		{ field: "server.entry", value: "../escape.js", error: /manifest server.entry/ },
+	])("keeps manifest, SBOM and matrix checks: %j", async ({ field, value, error }) => {
+		const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-invalid-release-"));
+		try {
+			const packageRoot = join(root, "tool-command");
+			await cp(join(examplesRoot, "tool-command"), packageRoot, { recursive: true });
+			const path = join(packageRoot, "manifest.json");
+			const manifest = JSON.parse(await readFile(path, "utf8"));
+			const [parent, child] = field.split(".");
+			if (child) manifest[parent][child] = value;
+			else manifest[parent] = value;
+			await writeFile(path, JSON.stringify(manifest));
+			const summary = await validatePluginRelease(root, { mode: "ga" });
+			expect(summary.valid).toBe(false);
+			expect(summary.errors.join("\n")).toMatch(error);
+			expect(summary.packages[0]?.runtime.status).toBe("not-requested");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects symlink entries without executing the linked server", async () => {
+		if (process.platform === "win32") return;
+		const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-symlink-release-"));
+		try {
+			const packageRoot = join(root, "tool-command");
+			await cp(join(examplesRoot, "tool-command"), packageRoot, { recursive: true });
+			const path = join(packageRoot, "server/index.js");
+			await rm(path);
+			await symlink(join(examplesRoot, "tool-command/server/index.js"), path);
+			const summary = await validatePluginRelease(root, { mode: "ga" });
+			expect(summary.valid).toBe(false);
+			expect(summary.errors.join("\n")).toMatch(/symlink is not allowed/);
+			expect(summary.packages[0]?.runtime.status).toBe("not-requested");
+		} finally {
+			await rm(root, { recursive: true, force: true });
 		}
 	});
 
@@ -107,7 +180,7 @@ describe("plugin GA release validation", () => {
 		}
 	});
 
-	test("starts real references and records handshake, tool, and provider evidence", async () => {
+	test("starts offline references and records handshake, tool, and provider evidence", async () => {
 		const summary = await validatePluginRelease(examplesRoot, {
 			mode: "ga",
 			runtimeTimeoutMs: 8_000,
@@ -115,6 +188,7 @@ describe("plugin GA release validation", () => {
 		expect(summary.valid).toBe(true);
 		expect(summary.mode).toBe("ga");
 		expect(summary.errors).toEqual([]);
+		expect(summary.packageCount).toBe(9);
 
 		const tool = summary.packages.find((item) => item.pluginId === "com.example.tool-command");
 		expect(tool?.runtime).toMatchObject({

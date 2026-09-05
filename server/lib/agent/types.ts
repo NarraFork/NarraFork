@@ -4,6 +4,7 @@ import type {
 	ApiRequestDiagnostics,
 	KnowledgeInjectionRecord,
 	ReasoningProviderMetadata,
+} from "@shared/agent-protocol/types";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
 import type { PathFlavor } from "./execution/backend";
@@ -11,6 +12,8 @@ import type { PathFlavor } from "./execution/backend";
 // === API error and bounded diagnostics ===
 
 /**
+ * Types shared with the protocol layer live in
+ * `@shared/agent-protocol/types` so bundled plugin code can use them without
  * importing anything under `server/`. Re-exported here so existing host import
  * paths keep working.
  */
@@ -489,7 +492,9 @@ export type AgentEvent =
 	  }
 	| {
 			/**
+			 * Diagnostic signal for leaked XML tool calls (NUG gateway).
 			 * - `stream_captured`: the streaming accumulator lifted a `<invoke>` block out of
+			 *   the text deltas successfully (xml_* tool calls were produced).
 			 * - `recovered`: the streaming layer missed it, but the post-turn stateless safety
 			 *   net extracted a complete block from the finished assistant text.
 			 * - `unrecovered`: leaked `<invoke` text remained that could not be parsed into a
@@ -998,6 +1003,7 @@ export interface AgentConfig {
 	getRuntimeSettingsOverride?: () => RuntimeSettingsOverride | null;
 	/**
 	 * Legacy model-only override hook. Prefer getRuntimeSettingsOverride for new callers.
+	 * Returns the new model string (e.g. "nug:claude-opus-4.6") or null to keep current.
 	 */
 	getModelOverride?: () => string | null;
 	/**

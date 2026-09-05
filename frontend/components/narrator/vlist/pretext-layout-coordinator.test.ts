@@ -295,6 +295,41 @@ describe("PretextLayoutCoordinator", () => {
 		expect(coordinator.getSnapshot()).toBe(baseline);
 	});
 
+	it("patches a scheduled retry onto the marker, then leaves it when output resumes", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("n1", compactBuildOptions, {
+			fetchPage: async () => compactPage("compacting", 0),
+		});
+		expect(compactMarkerText(coordinator.getSnapshot())).toContain("0 chars");
+
+		// The retry broadcast carries the CURRENT counts plus the retry ordinal.
+		coordinator.applyCompactProgress(
+			"compact-1",
+			{ phase: "output", thinkingChars: 0, outputChars: 0, retryCount: 2 },
+			false,
+		);
+		const retrying = coordinator.getSnapshot();
+		expect(compactMarkerText(retrying)).toContain("retry #2");
+
+		// A duplicate retry tick is a cheap no-op (same snapshot identity).
+		coordinator.applyCompactProgress(
+			"compact-1",
+			{ phase: "output", thinkingChars: 0, outputChars: 0, retryCount: 2 },
+			false,
+		);
+		expect(coordinator.getSnapshot()).toBe(retrying);
+
+		// Fresh output streams WITHOUT a retry ordinal → the label leaves "retry".
+		coordinator.applyCompactProgress(
+			"compact-1",
+			{ phase: "output", thinkingChars: 0, outputChars: 40 },
+			false,
+		);
+		const recovered = coordinator.getSnapshot();
+		expect(compactMarkerText(recovered)).toContain("40 chars");
+		expect(compactMarkerText(recovered)).not.toContain("retry");
+	});
+
 	/**
 	 * The compact-marker LIVE-PATCH channel (PretextExactMessageList's
 	 * `replaceOrReload`): a `message_updated` for a compact marker that

@@ -27,7 +27,7 @@
 
 | 值 | 语义 | provider 映射 |
 |---|---|---|
-| `sys`（默认） | 系统事实（容器起来了、任务完成了） | Anthropic 官方 API 和 Cline 上是**真正的**对话中 `system` 消息；其他 provider 映射成 `user` |
+| `sys`（默认） | 系统事实（容器起来了、任务完成了） | Anthropic 官方 API 上是**真正的**对话中 `system` 消息；其他 provider 映射成 `user` |
 | `user` | 代表用户说话 | 权重更高，而且理应如此 |
 
 `user` 的存在有具体理由：`taskReflection` 读父历史，只有当请求以 user turn 形式到达时，它才能识别出这是用户真正要求的任务。这是 `spec-edit-interject.ts` 存在的全部原因。
@@ -40,6 +40,10 @@
 | `onNextTurn` | 写行**并且**把内容送进**正在运行**的 loop 的下一个 turn | loop 只在 pass 开始时重建内存历史，turn 中途写的行在下一 pass 前是不可见的 |
 | `interject` | 写行并请求运行中的 loop 在下一个工具边界停下，让内容被及时取用 | 内容改变了叙述者**该做什么**（计划编辑），而不只是它知道什么 |
 | `wakeIfIdle` | 写行，如果叙述者空闲就起一个 turn；忙时退化为 `none` | 行已就位，运行中的 loop 下一 pass 会取到 |
+
+**`wakeIfIdle` 对子代理走 `resumeSubagent`，不是 `runAgentLoop`。** 分派在 `startInjectionContinuationIfPossible` 里（`narrator-session.ts`），调用方不需要选。理由是 `runAgentLoop` 跑子代理不只是「另一条路」，它绕过了让子代理运行合法的全部东西：resume 锁、origin tool_use id 解析、以及把结果写回父叙述者那个仍然打开的 Agent 工具调用的结论发布——这正是 `sendMessage`/`continueNarrator`/`retryLastMessage` 一律拒绝子代理并要求走 `resumeSubagent` 的原因。用的 intent 是 `continue_tool_results`（「内容已在历史里」），而不是 `follow_up`（后者要求 prompt，会再写一行「continue」，把注入行挤出 history builder 会提起的尾部位置）。
+
+这个分派**修的是既有隐患**，不是新增能力：`async_question` 早就在目标空闲时用 `wakeIfIdle`，而该入口原先没有 `isSubagentVariant` 守卫。失败模式是静默的——不会抛错，只会产生一个结果永远到不了父工具调用的 turn。
 
 **`onNextTurn` 不是双份投递**：当前 pass 读内存副本，之后的 pass 读那一行，两者永不作用于同一个请求。调用方拿到 `turnText` 追加进 loop 的 next-turn 缓冲；**无条件追加会导致重复投递**。
 
@@ -103,6 +107,10 @@ deliverInjection(narratorId, {
   originSource?: MessageOriginSource,  // 归属标签（review、autoContinuation…）
   originDetail?: string | null,
   createdBy?: string | null,
+  subagent?: {                  // 接收者是子代理时必须给（见 4.2）
+    parentToolUseId: string,
+    parentNarratorId: string,
+  },
   extraBlocks?: any[],          // 已有富卡片的生产者保留其 UI
 }): Promise<{
   messageId: string | null,     // 没写行时为 null
@@ -116,7 +124,22 @@ deliverInjection(narratorId, {
 
 `buildSystemInjectionBlock(source, body)` 单独导出，便于生产者构造 block 并断言而不碰数据库。
 
-### 4.1 调度接缝
+### 4.1 接收者是子代理
+
+给 `subagent` 就是一个决定的两个后果，不能只取其一：
+
+| | 不给（主叙述者） | 给（子代理） |
+|---|---|---|
+| 行的 `parent_tool_use_id` | null（顶层行） | 那个 Agent/Task 的 tool_use id |
+| 谁能加载 | 该叙述者页面 | **子代理自己的页面**（其 loader 刻意不加 `isNull(parentToolUseId)` 过滤，并在投影时把该字段置 null）；父页面不内联绘制它，子代理的子行由有界的活动快照代表 |
+| 广播 | 一次，发给自己 | **双通道**（复用 `server/websocket/narrator-dual-broadcast.ts`）：父副本保留 `parentToolUseId` 以挂到正确的工具卡片，子代理副本剥离该字段以被当作顶层行 |
+| 父叙述者的 `messageVersion` | 不动 | **bump**（父的工具卡片也变了；不 bump 则增量同步认为「无变化」，父页面一直停在旧卡片） |
+
+**这个字段决定的是读者，不是模型看到什么。** 每个 provider 的 `buildHistory` 都硬过滤 `!m.parentToolUseId`，而子代理自己的历史走 `loadSubagentHistory`，它在建历史前先把该字段清成 null —— 所以同一行「不作为子行进入模型历史」和「子代理自己读得到」同时为真，两者容易混淆但只有一个是 bug。
+
+`parentToolUseId` / `parentNarratorId` **由调用方给，模块不自己查**：`resolveSubagentOriginToolUseId` 是一次扫描且对从未启动过的子代理会抛错，而运行中的执行器本来就持有当前调用的准确 id；在这里查等于给一个调用方已经答对的问题一个更弱的答案，答错就把行写到别人的工具卡片下面。
+
+### 4.2 调度接缝
 
 ```ts
 setInjectionScheduler({ requestSoftStop, wakeIfIdle })
@@ -179,6 +202,8 @@ loop 自己抬起的提醒进 `pendingLoopInjections` 队列，在 turn 边界�
 | `team_message` | `messages` | `onNextTurn` |
 
 子代理的排队用户消息**不走** `deliverInjection`：行由 `persistSubagentUserMessage` 作为真正的 `role: "user"` turn 写入（它本来就是——用户打的字），再注入一次会重复。文本仍需要，因为 loop 在 pass 开始时就建好了内存历史。
+
+`persistSubagentUserMessage` 现在**共用** `persistUserMessage` 的 insert 路径（传 `{ parentToolUseId }` 落位），只保留三件通用入口不该做的决定：向投递注册表认领归属（`claimAgentMessageOrigin`，consume-once，只能在真正投递 agent-to-agent 消息的路由上做）、AI 撰写时扣留 creator（`createdBy` 仍作审计留在行里）、以及附件 block 与 `[user sent image(s)]` 占位。
 
 ### 5.4 cadence 抽象（`server/lib/injection-cadence.ts`）
 
@@ -313,6 +338,8 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 | 文件 | 覆盖 |
 |---|---|
 | `server/services/__tests__/narrator-injection.test.ts` | 持久化行、`role`、`schedule`、`role × schedule` 正交性、`buildSystemInjectionBlock` |
+| `server/services/__tests__/subagent-injection.test.ts` | 子代理接收者：行落在 tool_use 子树且属于子代理、ref 挂在子代理上、父 `messageVersion` 被 bump、子代理页面能加载且投影为顶层、**带 link 时不进模型历史 / loader 清 link 后进**、双通道两副本形状与内容一致、主叙述者路径不变（顶层行、单播、仍进模型历史） |
+| `server/services/__tests__/injection-wake-dispatch.test.ts` | `wakeIfIdle` 的引擎分派：子代理走 `resumeSubagent` 且 intent/actor 正确、plan 模式与在飞 resume 与无父子代理均为拒绝而非抛错、resume 抛错被降级为 `started: false`、主叙述者永不进入 resume 路径 |
 | `server/services/__tests__/background-completion-delivery.test.ts` | 忙/空闲两条路径的差异 |
 | `server/lib/__tests__/injection-cadence.test.ts` | cadence 的 tick 消费语义、interval 归一化 |
 | `frontend/components/narrator/vlist/system-injection-adapter.test.ts` | 路由（`origin_notice` vs `injection-bubble`）、拆气泡与 key 稳定性、读者向 body、标题标签回退、六种导航目标 + 三种刻意不给（`bg_bash` / 多文件 spec / 任务摘要）、缺 message id 仍可开、高度中性 |

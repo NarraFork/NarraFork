@@ -14,11 +14,13 @@ describe("isProviderUnavailableError", () => {
 		expect(
 			isProviderUnavailableError(
 				new Error(
+					"Provider is not available. Please check your provider connection and try again.",
 				),
 			),
 		).toBe(true);
 		expect(
 			isProviderUnavailableError(
+				new Error("Provider is disabled. Please choose a different model or enable it."),
 			),
 		).toBe(true);
 	});

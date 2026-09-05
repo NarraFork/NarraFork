@@ -56,6 +56,13 @@ export type NarratorWorkIndicatorPlan = {
 	 * its progress fragment appear at most once per row.
 	 */
 	showBackgroundCompactSuffix: boolean;
+	/**
+	 * Whether to append the red "compact failed" suffix. The failure state is
+	 * cleared the moment a new compact starts or succeeds, so the suffix can
+	 * never sit next to a live compact phrase — the state machine, not this
+	 * function, owns that exclusion.
+	 */
+	showCompactFailureSuffix: boolean;
 };
 
 /**
@@ -79,6 +86,8 @@ export function planNarratorWorkIndicator(input: {
 	hasSpecTask: boolean;
 	isWaiting: boolean;
 	isPlanning: boolean;
+	/** A compact failed and the failure has not been superseded yet. */
+	hasCompactFailure: boolean;
 }): NarratorWorkIndicatorPlan {
 	const primary: NarratorWorkIndicatorPrimary = input.isRetrying
 		? "retrying"
@@ -103,6 +112,11 @@ export function planNarratorWorkIndicator(input: {
 			// holding the turn up; a second compact line would just compete with it.
 			!input.isBlockingCompacting &&
 			primary !== "background_compact",
+		// The failure suffix reports the LAST run, so it must not dress up as
+		// progress on a CURRENT one: while any compact is live the state machine
+		// has already cleared the failure, making this guard a pure backstop.
+		showCompactFailureSuffix:
+			input.hasCompactFailure && !input.isBlockingCompacting && !input.isBackgroundCompacting,
 	};
 }
 

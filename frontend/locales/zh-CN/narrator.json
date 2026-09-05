@@ -16,7 +16,8 @@
 			"gateway": "IM 网关",
 			"oauth": "外部应用",
 			"recovery": "会话恢复",
-			"planReflection": "计划反思"
+			"planReflection": "计划反思",
+			"agentMessage": "代理消息"
 		}
 	},
 	"narrator": "叙述者",
@@ -58,6 +59,7 @@
 	"compactOutputChars": "{{count}} 字符",
 	"compactThinking": "思考中",
 	"compactThinkingChars": "{{count}} 字符",
+	"compactRetrying": "重试第 {{count}} 次",
 	"contextAskOutputChars": "{{count}} 字符",
 	"viewingNow": "正在查看",
 	"compacted": "上下文已压缩",
@@ -146,7 +148,27 @@
 	"typeCustomAnswer": "或输入自定义回答...",
 	"submitAnswer": "提交",
 	"skipQuestion": "跳过",
+	"deferQuestion": "稍后回答",
+	"deferQuestionFailed": "无法把问题移入收件箱",
 	"answered": "已回答",
+	"asyncQuestionInboxTitle": "待你回答的问题",
+	"asyncQuestionInboxDesc": "叙述者提交这些问题时没有停下工作。你方便时回答即可，每条回答会立即送达会话。",
+	"asyncQuestionInboxEmpty": "没有待回答的问题。",
+	"asyncQuestionInboxLoading": "正在加载问题...",
+	"asyncQuestionInboxBadge": "{{count}} 个问题",
+	"asyncQuestionInboxBadgeAwaited": "等你回答（{{count}}）",
+	"asyncQuestionInboxOpen": "打开问题收件箱（{{count}} 个待回答）",
+	"asyncQuestionAwaitedNotice": "叙述者已停下，正在等待这个答案",
+	"globalInboxTitle": "所有会话的问题",
+	"globalInboxDesc": "你可见的所有会话中待回答的问题。在这里回答会直接送达提问的会话。",
+	"globalInboxTooltip": "所有会话共有 {{count}} 个问题待回答",
+	"globalInboxTooltipAwaited": "{{count}} 个会话已停下，正在等你回答",
+	"globalInboxOpen": "打开全局问题收件箱（{{count}} 个待回答）",
+	"asyncQuestionDismiss": "由它自行决定",
+	"asyncQuestionBadgeDeferred": "稍后回答的问题",
+	"asyncQuestionBadgeAnswered": "稍后回答的问题 · 已回答",
+	"asyncQuestionBadgeDismissed": "稍后回答的问题 · 交由它决定",
+	"asyncQuestionBadgeWithdrawn": "稍后回答的问题 · 已撤回",
 	"askAnswerPrefix": "答案：",
 	"askCustomAnswerPrefix": "自定义回答：",
 	"questionReflectionAnswer": "Reflection 回答",
@@ -505,6 +527,7 @@
 	"contextMenu_edit": "编辑消息",
 	"contextMenu_jumpToSource": "跳转到来源叙述者",
 	"jumpToUserMessage": "跳转到第 {{ordinal}} 条消息",
+	"jumpToCompactMarker": "跳转到压缩标记（{{status}}）",
 	"contextMenu_viewFile": "查看该文件",
 	"contextMenu_openFilePanel": "在面板中查看",
 	"contextMenu_copyFilePath": "复制文件路径",
@@ -1198,6 +1221,8 @@
 			"messageFromUnknown": "未知发送者",
 			"messageBroadcast": "广播",
 			"specUpdatesHeading": "你更新了 {{n}} 个 spec 文件",
+			"asyncQuestionAnsweredHeading": "你回答了 {{n}} 个稍后回答的问题",
+			"asyncQuestionDismissedHeading": "你跳过了稍后回答的问题",
 			"proseFenceHeading": "行为护栏",
 			"empty": "（空）"
 		}
@@ -1414,5 +1439,9 @@
 		"effectiveDiscount": "实际优惠倍率",
 		"circleMultiplier": "圈子倍率（1 余额=1 美元）",
 		"footnote": "价格以 {{unit}} 计，按实际用量计费；官方美元价与优惠倍率仅供参考。"
-	}
+	},
+	"inboxBadgeSplit": "本会话 {{current}} · 其他会话 {{others}}",
+	"inboxBadgeAwaitedSuffix": "· {{count}} 个正等你",
+	"inboxGroupCurrentSession": "本会话",
+	"inboxGroupOtherSessions": "其他会话"
 }

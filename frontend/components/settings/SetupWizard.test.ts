@@ -99,13 +99,10 @@ describe("setup wizard provider readiness", () => {
 					},
 				],
 				nugProviders: [{ id: "nug", prefix: "nug", apiKey: "key", baseUrl: "https://nug.example" }],
-				clineProviders: [
-					{ id: "cline", prefix: "cline", accessToken: "token", baseUrl: "https://cline.example" },
-				],
 				codexAvailable: true,
 				agent: { disabledProviders: [] },
 			}),
-		).toBe(5);
+		).toBe(3);
 	});
 
 	test("ignores disabled or incomplete credentials", () => {
@@ -116,8 +113,8 @@ describe("setup wizard provider readiness", () => {
 					{ id: "empty", prefix: "openai", apiKey: "" },
 				],
 				nugProviders: [{ id: "nug", prefix: "nug", apiKey: "key", baseUrl: "" }],
-				clineProviders: [{ id: "cline", prefix: "cline", accessToken: "token", baseUrl: "" }],
 				codexAvailable: true,
+				agent: { disabledProviders: ["codex"] },
 			}),
 		).toBe(0);
 	});

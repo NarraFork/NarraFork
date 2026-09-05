@@ -60,7 +60,8 @@ export function buildUsageDataFromSnapshot(snapshot?: {
  * `cache_read_input_tokens` and `cache_creation_input_tokens`, so subtracting
  * would undercount.
  *
- * This set describes token *semantics*, not price coverage: `gemini`, `cline`,
+ * This set describes token *semantics*, not price coverage: `gemini` and
+ * `nug` are listed because that is how they report usage, even though
  * `model-pricing.ts` only ships rows for the gpt/claude families. Until an
  * operator adds overrides those requests resolve to no price at all and this
  * subtraction never runs for them — which is intended, not an oversight.
@@ -68,7 +69,6 @@ export function buildUsageDataFromSnapshot(snapshot?: {
 const PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT = new Set([
 	"openai",
 	"codex",
-	"cline",
 	"nug",
 	"gemini",
 ]);
@@ -79,6 +79,7 @@ const PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT = new Set([
  *
  * Returns null when the model has no known price, so callers can record "not
  * priced" rather than a misleading 0. For subscription-based access (Codex on a
+ * ChatGPT plan) the figure is what the same tokens would have
  * cost through the metered API, not an amount actually billed.
  */
 export function calculateCost(usage: UsageData, provider: string, model: string): CostData | null {

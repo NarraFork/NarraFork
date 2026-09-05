@@ -15,6 +15,7 @@ import type { DbMessage } from "../provider";
  * screenshot reached the model with nothing to look at, and nothing in the request
  * indicated an image had been lost.
  *
+ * This also covers the direct Anthropic provider, not just the NUG path: the
  * defect was in the shared history builder, so both were affected.
  */
 

@@ -372,6 +372,75 @@ export function patchSubagentIdentity(
 }
 
 /**
+ * Set (or clear) a card's takeover state by the id of the tool call that spawned
+ * the child.
+ *
+ * ⚠️ WRITES BOTH SOURCES, and that is the entire reason this function exists
+ * rather than a bare `patchToolCallFields(… { _takenOver })`. The adapter reads
+ * the flag as an OR over two channels (`resolveTakenOver` in segment-adapter.ts):
+ *
+ *   tc._takenOver                  ← message load + this live patch
+ *   tc._subagentActivity.takenOver ← message load + the reconnect catch-up snapshot
+ *
+ * Writing only the first one cannot RELEASE a badge: the server stamps
+ * `activity.takenOver` whenever a page is loaded mid-takeover, and
+ * `upsertSubagentToolCallHeader` deliberately carries it across every child tool
+ * event, so the summary keeps asserting `true` while the block says `false` and
+ * the OR keeps the badge lit until an unrelated full reload. That is precisely
+ * the "user already stopped the takeover, the card still says taken over" stall,
+ * and it is invisible in the release direction only — taking over works fine,
+ * which is what makes it easy to miss.
+ *
+ * The summary is corrected only when it EXISTS: an absent one is not a
+ * disagreement, and synthesizing a partial summary here would erase the
+ * card's known model / recent calls.
+ */
+export function patchSubagentTakeover(
+	messages: readonly TreeMessage[],
+	toolUseId: string,
+	takenOver: boolean,
+): LivePatchResult {
+	if (!toolUseId || !Array.isArray(messages) || messages.length === 0) return unchanged(messages);
+	const flagged = patchToolCallFields(messages, toolUseId, { _takenOver: takenOver });
+	const synced = syncActivityTakenOver(flagged.messages, toolUseId, takenOver);
+	if (!flagged.changed && !synced.changed) return unchanged(messages);
+	return { messages: synced.messages, changed: true };
+}
+
+/** Bring an existing `_subagentActivity.takenOver` in line with the block flag. */
+function syncActivityTakenOver(
+	messages: readonly TreeMessage[],
+	toolUseId: string,
+	takenOver: boolean,
+): LivePatchResult {
+	const result = updateSubagentActivityInMessages(
+		messages as TreeMessage[],
+		toolUseId,
+		(current) => {
+			if (!current) return current;
+			if ((current.takenOver === true) === takenOver) return current;
+			return withActivityTakenOver(current, takenOver);
+		},
+	);
+	return result.changed ? result : unchanged(messages);
+}
+
+/**
+ * `takenOver` is OMITTED rather than written as `false` when released, matching
+ * how the server builds the snapshot (`...(isTakenOver(id) ? { takenOver: true } : {})`)
+ * so both producers yield the same shape and no reader has to treat the two
+ * spellings of "not taken over" differently.
+ */
+function withActivityTakenOver(
+	activity: SubagentActivitySummary,
+	takenOver: boolean,
+): SubagentActivitySummary {
+	if (takenOver) return { ...activity, takenOver: true };
+	const { takenOver: _released, ...rest } = activity;
+	return rest;
+}
+
+/**
  * Mark every loaded card that waits on `subagentNarratorId` as taken over (or
  * released), WITHOUT knowing the parent tool use id.
  *
@@ -384,8 +453,11 @@ export function patchSubagentIdentity(
  *   - Agent/Task/Send → `_subagentActivity.subagentNarratorId`
  *   - running Await    → `_awaitAgentNarratorId` (server-resolved selector)
  *
- * Writes the same `_takenOver` field the id-addressed patch writes, so the two
- * paths cannot disagree about what the card reads.
+ * Writes the same TWO fields {@link patchSubagentTakeover} writes (block flag +
+ * an existing activity summary), so the two paths cannot disagree about what the
+ * card reads — and, more importantly, neither can leave a released card with a
+ * summary still asserting `takenOver: true`, which the adapter's OR would keep
+ * painting.
  */
 export function patchSubagentTakeoverByNarrator(
 	messages: readonly TreeMessage[],
@@ -396,6 +468,27 @@ export function patchSubagentTakeoverByNarrator(
 		return unchanged(messages);
 	const result = markTakenOverForNarrator(messages as TreeMessage[], subagentNarratorId, takenOver);
 	return result.changed ? result : unchanged(messages);
+}
+
+/**
+ * Apply the takeover fact to ONE block/row, covering both fields the adapter ORs
+ * together. Returns the SAME reference when nothing changed, so the walker's
+ * `changed` flag stays exact.
+ */
+function withTakenOverEntry(
+	entry: Record<string, unknown>,
+	takenOver: boolean,
+): Record<string, unknown> {
+	const activity = entry._subagentActivity as SubagentActivitySummary | null | undefined;
+	const activityStale = !!activity && (activity.takenOver === true) !== takenOver;
+	if (entry._takenOver === takenOver && !activityStale) return entry;
+	return {
+		...entry,
+		_takenOver: takenOver,
+		...(activityStale && activity
+			? { _subagentActivity: withActivityTakenOver(activity, takenOver) }
+			: {}),
+	};
 }
 
 /** Whether this tool block/row points at `subagentNarratorId`. */
@@ -418,16 +511,18 @@ function markTakenOverForNarrator(
 			if (block.type !== "tool_use") return block;
 			const record = block as unknown as Record<string, unknown>;
 			if (!ownsSubagent(record, subagentNarratorId)) return block;
-			if (record._takenOver === takenOver) return block;
+			const patched = withTakenOverEntry(record, takenOver);
+			if (patched === record) return block;
 			localChanged = true;
-			return { ...block, _takenOver: takenOver };
+			return patched as unknown as typeof block;
 		});
 		const nextCalls = (message.toolCalls ?? []).map((call) => {
 			const record = call as unknown as Record<string, unknown>;
 			if (!ownsSubagent(record, subagentNarratorId)) return call;
-			if (record._takenOver === takenOver) return call;
+			const patched = withTakenOverEntry(record, takenOver);
+			if (patched === record) return call;
 			localChanged = true;
-			return { ...call, _takenOver: takenOver };
+			return patched as unknown as typeof call;
 		});
 		if (localChanged) {
 			changed = true;

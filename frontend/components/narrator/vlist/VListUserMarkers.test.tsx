@@ -24,6 +24,7 @@ mock.module("react-i18next", () => ({
 
 const { VListUserMarkers } = await import("./VListUserMarkers");
 type VListUserMarker = import("./vlist-user-markers").VListUserMarker;
+type VListCompactMarker = import("./vlist-user-markers").VListCompactMarker;
 
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
@@ -108,9 +109,11 @@ const MARKERS = [marker(1, 0, 16), marker(2, 0.5, 2000), marker(3, 1, 4000)];
 async function renderMarkers(
 	overrides: {
 		markers?: readonly VListUserMarker[];
+		compactMarkers?: readonly VListCompactMarker[];
 		documentHeight?: number;
 		trackHeight?: number;
 		onJump?: (m: VListUserMarker) => void;
+		onJumpCompact?: (m: VListCompactMarker) => void;
 		scrollbarWidth?: number;
 	} = {},
 ): Promise<void> {
@@ -119,11 +122,14 @@ async function renderMarkers(
 		root?.render(
 			<VListUserMarkers
 				markers={overrides.markers ?? MARKERS}
+				compactMarkers={overrides.compactMarkers}
 				documentHeight={overrides.documentHeight ?? 4200}
 				trackHeight={overrides.trackHeight ?? 600}
 				onJump={overrides.onJump ?? (() => {})}
+				onJumpCompact={overrides.onJumpCompact}
 				viewportRef={viewportRef}
 				resolveLabel={(ordinal) => `jump-${ordinal}`}
+				resolveCompactLabel={(marker) => `jump-compact-${marker.status}`}
 			/>,
 		);
 	});
@@ -151,6 +157,76 @@ async function hover(mark: HTMLElement | undefined, direction: "enter" | "leave"
 		);
 	});
 }
+
+function compactMarkEls(): HTMLElement[] {
+	return Array.from(
+		container?.querySelectorAll("[data-vlist-compact-marker]") ?? [],
+	) as unknown as HTMLElement[];
+}
+
+function compactMarker(
+	key: string,
+	fraction: number,
+	top: number,
+	status: VListCompactMarker["status"],
+	flavor: VListCompactMarker["flavor"] = "context",
+	tooltip = "Compact marker",
+): VListCompactMarker {
+	return { key, itemIndex: 0, top, fraction, flavor, status, tooltip };
+}
+
+describe("VListUserMarkers compact marks", () => {
+	test("renders compact marks with status colours, after the user marks", async () => {
+		await renderMarkers({
+			compactMarkers: [
+				compactMarker("c1", 0.2, 800, "compacted", "context", "Context compacted"),
+				compactMarker("c2", 0.5, 2000, "compacting", "segment", "Segment compacting…"),
+				compactMarker("c3", 0.8, 3200, "failed", "context", "Compact failed"),
+			],
+		});
+		const marks = compactMarkEls();
+		expect(marks).toHaveLength(3);
+		expect(marks.map((mark) => mark.getAttribute("data-vlist-compact-marker"))).toEqual([
+			"compacted",
+			"compacting",
+			"failed",
+		]);
+		expect(marks[0]?.style.backgroundColor).toBe("var(--mantine-color-orange-4)");
+		expect(marks[1]?.style.backgroundColor).toBe("var(--mantine-color-teal-4)");
+		expect(marks[2]?.style.backgroundColor).toBe("var(--mantine-color-red-4)");
+		// Only the running mark pulses.
+		expect(marks[0]?.className).not.toContain("vlist-compact-marker--compacting");
+		expect(marks[1]?.className).toContain("vlist-compact-marker--compacting");
+		expect(marks[2]?.className).not.toContain("vlist-compact-marker--compacting");
+	});
+
+	test("compact marks alone (no user turns) still bring up the index", async () => {
+		await renderMarkers({
+			markers: [],
+			compactMarkers: [compactMarker("c1", 0.5, 2000, "failed", "context", "Compact failed")],
+		});
+		expect(overlayEl()).not.toBeNull();
+		expect(compactMarkEls()).toHaveLength(1);
+	});
+
+	test("clicking a compact mark reports it, hover shows its status line", async () => {
+		const jumped: VListCompactMarker[] = [];
+		await renderMarkers({
+			compactMarkers: [compactMarker("c1", 0.5, 2000, "failed", "context", "Compact failed")],
+			onJumpCompact: (m) => jumped.push(m),
+		});
+		const mark = compactMarkEls()[0];
+		expect(mark?.getAttribute("aria-label")).toBe("jump-compact-failed");
+		await hover(mark, "enter");
+		expect(tooltipEl()?.textContent).toBe("Compact failed");
+		await hover(mark, "leave");
+		await act(async () => {
+			mark?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+		});
+		expect(jumped).toHaveLength(1);
+		expect(jumped[0]?.top).toBe(2000);
+	});
+});
 
 describe("VListUserMarkers", () => {
 	test("renders one mark per user turn, in document order", async () => {

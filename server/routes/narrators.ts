@@ -140,6 +140,8 @@ import {
 import {
 	askInPassingSchema,
 	askInPassingStartSchema,
+	asyncQuestionAnswerSchema,
+	asyncQuestionListQuerySchema,
 	browserInteractSchema,
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
@@ -246,6 +248,7 @@ import {
 	countNarratorMessageRefsBatch,
 } from "../services/narrator-message-count";
 import {
+	deferPendingQuestion,
 	disarmQuestionReflection,
 	getQuestionReflectionDeadline,
 	reflectPendingAskUserQuestion,
@@ -254,6 +257,15 @@ import {
 	takeOverQuestionReflection,
 } from "../services/narrator-permission";
 import { enterNarratorPlanMode, exitNarratorPlanMode } from "../services/narrator-plan-mode";
+import {
+	answerAsyncQuestion,
+	countOpenAsyncQuestions,
+	dismissAsyncQuestion,
+	getAsyncQuestion,
+	listAllOpenAsyncQuestionsForPrincipal,
+	listAsyncQuestions,
+} from "../services/narrator-question-service";
+
 import { resolveLazyLineage } from "../services/narrator-refs-backfill";
 import {
 	previewNarratorScopedForToolUses,
@@ -370,6 +382,7 @@ import { broadcastSpecChanged } from "../services/spec-broadcast";
 import { appendProtectedSpecTask } from "../services/spec-vfs-service";
 import { resolveStandaloneNarratorCwd } from "../services/standalone-narrator-cwd";
 import { resumeSubagent, withSubagentResumeLock } from "../services/subagent-resume";
+import { TAKEN_OVER_SUBSTATUS } from "../services/subagent-takeover";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
 import { usageHistoryService } from "../services/usage-history-service";
 import { syncNarratorDraftToRecentTabs } from "../services/user-preferences-service";
@@ -501,6 +514,12 @@ const NARRATOR_ID_GATE_EXEMPT_SEGMENTS = new Set([
 	"broken-models",
 	"setup-assistant",
 	"permissions",
+	// The GLOBAL question inbox (`/questions/all`). Exempt because it spans narrators,
+	// so there is no single id to authorize against; the service filters each row by
+	// its own narrator's ACL instead. Note the per-narrator inbox lives at
+	// `/:id/questions` and is still gated normally — only this literal first segment
+	// is skipped.
+	"questions",
 	"whitelist-dirs",
 	"blacklist-dirs",
 	"cmd-whitelist",
@@ -1127,6 +1146,23 @@ narratorRoutes.get("/named", async (c) => {
 // Registered before "/:id" so these literal paths are not swallowed by the param route.
 // Admin-only: rewriting other users' narrator models is an instance-wide operation,
 // matching the rule that only admins may change the instance summary model.
+
+/**
+ * The GLOBAL async-question inbox: every open question the caller may see.
+ *
+ * Collection-level rather than per-narrator, because the problem it solves is
+ * cross-session: a user with several running narrators cannot be expected to open each
+ * one to discover it is waiting on them. Per-row ACL filtering happens in the service —
+ * a question is readable exactly when its narrator is.
+ */
+narratorRoutes.get("/questions/all", async (c) => {
+	const items = await listAllOpenAsyncQuestionsForPrincipal(narratorPrincipalOf(c));
+	return c.json({
+		items,
+		openCount: items.length,
+		awaitedCount: items.filter((q) => q.awaited).length,
+	});
+});
 
 narratorRoutes.get("/broken-models", requireAdmin, async (c) => {
 	const includeArchived = c.req.query("includeArchived") === "true";
@@ -3436,12 +3472,31 @@ narratorRoutes.post("/:id/detach", async (c) => {
 	});
 });
 
-// Take over a running subagent. The user assumes direct control of the subagent
-// (send/interrupt/queue/continue like an independent narrator) while the parent
-// tool call stays blocked ("user is operating"). For foreground subagents the
-// current turn is hard-interrupted into the takeover-flavored suspension; for
-// background subagents the loop is interrupted and the task leaves background
-// mode without being marked completed/failed.
+/**
+ * Take over a running subagent WITHOUT stopping what it is doing.
+ *
+ * Taking over is a claim on the RESULT, not on the current turn: the user says
+ * "this conclusion goes through me before it reaches the parent". The turn in
+ * flight is left alone and runs to its natural end; only then does the subagent
+ * park in `idle[taken_over]` awaiting the user instead of handing its result
+ * back. Every engine reaches that hold on its own (see the takeover branches in
+ * `subagent-runner`'s foreground loop, `executeBackgroundTask`, and
+ * narrator-session's post-turn handoff), so this route only has to record the
+ * claim and tell the UI.
+ *
+ * It used to abort the turn — the hold was only reachable from the runner's
+ * "subagent was interrupted" branch — which meant a user who wanted to inspect
+ * the work before it was handed over first had to destroy the turn producing it.
+ * Wanting to stop the turn is a separate wish with its own button: Stop is soft
+ * during a takeover and keeps the hold (`POST /:id/interrupt`).
+ *
+ * Consequences of not interrupting, all intended:
+ * - a background subagent stays in background mode until its turn ends, so the
+ *   task row is still `running` and the parent's Await still waits — correct,
+ *   nothing has been concluded yet.
+ * - the badge appears while the subagent is visibly still working. That IS the
+ *   state: taken over and mid-turn.
+ */
 narratorRoutes.post("/:id/takeover", async (c) => {
 	const id = c.req.param("id");
 	return withSubagentResumeLock(id, async () => {
@@ -3457,113 +3512,47 @@ narratorRoutes.post("/:id/takeover", async (c) => {
 			return c.json({ error: "Subagent is not running" }, 400);
 		}
 
-		const {
-			getForegroundAbortControllers,
-			getBackgroundAbortControllers,
-			interruptForegroundSubagent,
-			markPendingTakeover,
-			markTakenOver,
-		} = await import("../services/narrator-subagent");
+		const { getForegroundAbortControllers, getBackgroundAbortControllers, markTakenOver } =
+			await import("../services/narrator-subagent");
 
-		// Foreground subagent: soft-interrupt the current turn. A soft interrupt
-		// stops the turn at a safe boundary and lets runForegroundLoop fall through
-		// to the suspension branch, where it consumes the pending-takeover marker
-		// and enters the taken_over state while keeping the parent tool call blocked.
-		// (A hard interrupt would instead end the subagent immediately.)
-		if (getForegroundAbortControllers().has(id)) {
-			// Mark taken over immediately so isTakenOver() is visible to the frontend
-			// and stop-takeover even before the loop reaches the suspension branch.
-			// pendingTakeover tells runForegroundLoop to use the taken_over substatus.
-			markPendingTakeover(id);
-			markTakenOver(id);
-			const interrupted = interruptForegroundSubagent(id);
-			if (!interrupted) {
-				// Could not interrupt (race) — clear state to avoid a stale takeover.
-				const { clearPendingTakeover, clearTakenOver } = await import(
-					"../services/narrator-subagent"
-				);
-				clearPendingTakeover(id);
-				clearTakenOver(id);
-				return c.json({ error: "Failed to take over subagent" }, 400);
-			}
-			// Reflect the taken_over substatus immediately (the loop will also set it).
-			await narratorService.addSubstatus(id, "taken_over").catch(() => {});
-			broadcastToNarrator(narrator.parentNarratorId, {
-				type: "subagent_status_changed",
-				narratorId: narrator.parentNarratorId,
-				subagentNarratorId: id,
-				status: narrator.status,
-				substatus: [...parseSubstatus(narrator.substatus), "taken_over"],
-			});
-			// The blocked parent CARD is a separate consumer from the panel's status
-			// chip — without this the tool call keeps rendering as plain "running".
-			await broadcastSubagentTakeoverChanged({
-				parentNarratorId: narrator.parentNarratorId,
-				subagentNarratorId: id,
-				takenOver: true,
-			});
-			return c.json({ takenOver: true });
+		// Which engine is driving it decides only ONE thing here: whether the hold
+		// must be remembered as a background takeover (the parent holds a
+		// background_task_id rather than a blocked tool call, so stop-takeover has to
+		// finalize it as a background completion).
+		const background = narrator.isBackground && narrator.backgroundStatus === "running";
+		const running =
+			getForegroundAbortControllers().has(id) ||
+			(background && getBackgroundAbortControllers().has(id)) ||
+			isNarratorActive(id) ||
+			isLoopRunning(id);
+		if (!running) {
+			// The DB says working/waiting but no engine owns it: either a foreground
+			// subagent caught between turns, or a zombie row. Retry rather than
+			// recording a takeover nothing will ever honour.
+			return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
 		}
 
-		// Background subagent: interrupt the loop and let executeBackgroundTask
-		// transition it to the idle takeover state (without marking it completed).
-		if (narrator.isBackground && narrator.backgroundStatus === "running") {
-			markTakenOver(id, { background: true });
-			const ctrl = getBackgroundAbortControllers().get(id);
-			if (!ctrl) {
-				const { clearTakenOver } = await import("../services/narrator-subagent");
-				clearTakenOver(id);
-				return c.json({ error: "Background task is not running" }, 400);
-			}
-			ctrl.abort("Taken over by user");
-			// The background transition itself also broadcasts (see
-			// finalizeBackgroundSubagentTakeover); this covers the window before the
-			// aborted loop reaches that point, so the card flips immediately.
-			await broadcastSubagentTakeoverChanged({
-				parentNarratorId: narrator.parentNarratorId,
-				subagentNarratorId: id,
-				takenOver: true,
-			});
-			return c.json({ takenOver: true });
-		}
+		markTakenOver(id, background ? { background: true } : undefined);
 
-		// Session-engine driven subagent (e.g. continued from its page after a
-		// manual_override): its loop runs via narrator-session (activeNarrators),
-		// not the subagent foreground/background runner. Take over by interrupting
-		// the active loop. markTakenOver is set FIRST so the loop's post-turn
-		// takeover handoff sees isTakenOver and keeps the subagent held (rather than
-		// firing the conclusion watcher and returning the result to the parent).
-		if (isNarratorActive(id) || isLoopRunning(id)) {
-			markTakenOver(id);
-			const interrupted = interruptNarrator(id);
-			if (!interrupted) {
-				const { clearTakenOver } = await import("../services/narrator-subagent");
-				clearTakenOver(id);
-				return c.json({ error: "Failed to take over subagent" }, 400);
-			}
-			// finalizeInterruptedRun writes idle[interrupted]; preserveTakenOverSubstatus
-			// re-injects taken_over because markTakenOver already ran. Add the tag now so
-			// the frontend reflects the takeover immediately without waiting for the loop.
-			await narratorService.addSubstatus(id, "taken_over").catch(() => {});
-			broadcastToNarrator(narrator.parentNarratorId, {
-				type: "subagent_status_changed",
-				narratorId: narrator.parentNarratorId,
-				subagentNarratorId: id,
-				status: narrator.status,
-				substatus: [...parseSubstatus(narrator.substatus), "taken_over"],
-			});
-			await broadcastSubagentTakeoverChanged({
-				parentNarratorId: narrator.parentNarratorId,
-				subagentNarratorId: id,
-				takenOver: true,
-			});
-			return c.json({ takenOver: true });
-		}
-
-		// Genuine transient window: a foreground subagent caught between turns (its
-		// abort controller is momentarily absent while the loop decides what to do
-		// next). Ask the caller to retry shortly rather than failing hard.
-		return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
+		// The tag is written now, while the turn is still running, so the page and
+		// the parent's card both show "taken over" immediately. The status itself is
+		// left untouched: the subagent really is still working.
+		await narratorService.addSubstatus(id, TAKEN_OVER_SUBSTATUS).catch(() => {});
+		broadcastToNarrator(narrator.parentNarratorId, {
+			type: "subagent_status_changed",
+			narratorId: narrator.parentNarratorId,
+			subagentNarratorId: id,
+			status: narrator.status,
+			substatus: [...parseSubstatus(narrator.substatus), TAKEN_OVER_SUBSTATUS],
+		});
+		// The parent's Agent/Task CARD is a separate consumer from the panel status
+		// chip above — without this frame the call keeps rendering as plain "running".
+		await broadcastSubagentTakeoverChanged({
+			parentNarratorId: narrator.parentNarratorId,
+			subagentNarratorId: id,
+			takenOver: true,
+		});
+		return c.json({ takenOver: true });
 	});
 });
 
@@ -3601,8 +3590,22 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 		// Use the live in-memory loop presence (single-threaded JS = authoritative)
 		// rather than the DB status snapshot, which can go stale between read and the
 		// branch decision and strand the pending marker (loop ends seeing no marker).
+		//
+		// All THREE engines must be consulted, not just the session one. Taking over no
+		// longer stops the turn, so releasing during a turn the user never stopped is
+		// now an ordinary sequence rather than a narrow race — and a turn owned by the
+		// subagent foreground/background runner is invisible to `isNarratorActive`.
+		// Missing it takes the "idle" branch: a partial result is handed to the parent
+		// while the loop is still producing one, and the loop then concludes a second
+		// time.
 		const { getSubagentFinalText, isNarratorActive } = await import("../services/narrator-session");
-		const isRunning = isNarratorActive(id);
+		const { getForegroundAbortControllers, getBackgroundAbortControllers } = await import(
+			"../services/narrator-subagent"
+		);
+		const isRunning =
+			isNarratorActive(id) ||
+			getForegroundAbortControllers().has(id) ||
+			getBackgroundAbortControllers().has(id);
 
 		// Resolve the parent tool_use that originally spawned this subagent.
 		const firstMsg = await db.query.narratorMessages.findFirst({
@@ -4856,6 +4859,88 @@ narratorRoutes.get("/:id/permissions", async (c) => {
 	);
 });
 
+/**
+ * Asynchronous AskUserQuestion inbox.
+ *
+ * Separate from `/permissions` on purpose. A pending permission is a SUSPENDED loop:
+ * the row lives in memory, answering it resumes a promise, and the narrator sits in
+ * `waiting`. An async question is none of those things — it is a durable row, the loop
+ * moved on long ago, and answering it injects a message. Sharing the permission
+ * endpoints would mean every consumer of "pending permissions" (the composer send
+ * gate, the Enter-key binding, the attention notifications) inheriting behaviour that
+ * is wrong for a question nobody is blocked on.
+ */
+narratorRoutes.get("/:id/questions", async (c) => {
+	const id = c.req.param("id");
+	const parsed = asyncQuestionListQuerySchema.safeParse({
+		status: c.req.query("status"),
+		cursor: c.req.query("cursor"),
+		limit: c.req.query("limit"),
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { items, nextCursor } = await listAsyncQuestions({
+		narratorId: id,
+		status: parsed.data.status,
+		cursor: parsed.data.cursor,
+		limit: parsed.data.limit,
+	});
+	const openCount = await countOpenAsyncQuestions(id);
+	return c.json({ items, nextCursor, openCount });
+});
+
+narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
+	const narratorId = c.req.param("id");
+	const questionId = c.req.param("questionId");
+	const userId = c.get("user").sub;
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = asyncQuestionAnswerSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	// Ownership is checked against the question's own narrator rather than trusting the
+	// path: the `/:id/*` gate authorized `narratorId`, so a question belonging to a
+	// DIFFERENT narrator must not be reachable by naming an id the caller can access.
+	const existing = await getAsyncQuestion(questionId);
+	if (!existing || existing.narratorId !== narratorId) {
+		return c.json({ error: "Question not found" }, 404);
+	}
+
+	const locale = (await getUserLanguage(userId)) as Locale;
+	const result = await answerAsyncQuestion(questionId, {
+		answers: parsed.data.answers,
+		annotations: parsed.data.annotations ?? null,
+		userId,
+		locale,
+	});
+	if (!result.ok) {
+		return c.json(
+			{ error: result.reason === "stale" ? "Question already decided" : "Question not found" },
+			result.reason === "stale" ? 409 : 404,
+		);
+	}
+	return c.json({ ok: true, question: result.record });
+});
+
+narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
+	const narratorId = c.req.param("id");
+	const questionId = c.req.param("questionId");
+	const userId = c.get("user").sub;
+
+	const existing = await getAsyncQuestion(questionId);
+	if (!existing || existing.narratorId !== narratorId) {
+		return c.json({ error: "Question not found" }, 404);
+	}
+
+	const locale = (await getUserLanguage(userId)) as Locale;
+	const result = await dismissAsyncQuestion(questionId, { userId, locale });
+	if (!result.ok) {
+		return c.json(
+			{ error: result.reason === "stale" ? "Question already decided" : "Question not found" },
+			result.reason === "stale" ? 409 : 404,
+		);
+	}
+	return c.json({ ok: true, question: result.record });
+});
+
 // Approve permission
 narratorRoutes.post("/permissions/:requestId/approve", async (c) => {
 	const requestId = c.req.param("requestId");
@@ -4887,6 +4972,33 @@ narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 		decidedBy: "user",
 	});
 	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
+	return c.json({ ok: true });
+});
+
+/**
+ * "Answer later": release a blocking AskUserQuestion without deciding it.
+ *
+ * Resolved as ALLOW rather than deny. The distinction is not cosmetic: a denial tells
+ * the agent its call was refused, when in fact the question was accepted and merely
+ * moved to the inbox. The gate flips the tool input to `async`, so the tool files the
+ * question itself and returns the "carry on with a default" instruction — one code path
+ * for both ways a question becomes asynchronous.
+ */
+narratorRoutes.post("/permissions/:requestId/defer", async (c) => {
+	const requestId = c.req.param("requestId");
+	const userId = c.get("user").sub;
+	const result = await deferPendingQuestion(requestId, { userId });
+	if (!result.ok) {
+		return c.json(
+			{
+				error:
+					result.reason === "not_a_question"
+						? "Only an AskUserQuestion request can be deferred"
+						: "Permission request not found",
+			},
+			result.reason === "not_a_question" ? 400 : 404,
+		);
+	}
 	return c.json({ ok: true });
 });
 

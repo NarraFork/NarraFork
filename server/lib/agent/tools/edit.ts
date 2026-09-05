@@ -28,7 +28,7 @@ import { withWorkspaceWriteLock } from "./write-serialization";
 
 // ── Replacer types & implementations ────────────────────────────
 // Sourced from opencode's cascading replacer approach:
-// https://github.com/cline/cline  &  https://github.com/google-gemini/gemini-cli
+// https://github.com/sst/opencode  &  https://github.com/google-gemini/gemini-cli
 
 export type Replacer = (content: string, find: string) => Generator<string, void, unknown>;
 

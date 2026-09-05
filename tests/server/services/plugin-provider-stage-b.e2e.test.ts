@@ -111,6 +111,7 @@ describe("plugin provider stage B end-to-end", () => {
 			// A prefix-less plugin model still routes home.
 			expect(resolveProvider("example/offline")).toBe("example");
 			// ...but a builtin model id is never captured by a plugin.
+			expect(resolveProvider("claude-sonnet-4.5")).toBe("anthropic");
 		} finally {
 			dispose();
 		}

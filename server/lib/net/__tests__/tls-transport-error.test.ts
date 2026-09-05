@@ -50,6 +50,7 @@ describe("transient TLS handshake classification", () => {
 	test("detects the code inside a wrapped network error message", () => {
 		const message =
 			"Network request failed [tls/UNKNOWN_CERTIFICATE_VERIFICATION_ERROR] after 15571 ms: " +
+			"POST https://nug.example.com/v1/chat via direct connection.";
 		expect(isTransientTlsHandshakeMessage(message)).toBe(true);
 		expect(isTransientTlsHandshakeError(new Error(message))).toBe(true);
 		expect(isTransientTlsHandshakeError(message)).toBe(true);

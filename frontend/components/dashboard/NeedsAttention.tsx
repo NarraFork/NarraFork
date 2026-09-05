@@ -1,10 +1,16 @@
 import { Alert, Badge, Card, Group, Loader, Stack, Text, ThemeIcon, Title } from "@mantine/core";
-import { IconAlertCircle, IconExclamationMark } from "@tabler/icons-react";
+import {
+	IconAlertCircle,
+	IconClockPause,
+	IconExclamationMark,
+	IconInbox,
+} from "@tabler/icons-react";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+import { type GlobalQuestion, useGlobalAsyncQuestions } from "../narrator/GlobalQuestionInbox";
 
 const NEEDS_ATTENTION_QUERY_GC_TIME_MS = 30_000;
 const MAX_ITEMS = 5;
@@ -14,9 +20,18 @@ const ERROR_MESSAGE_MAX_LENGTH = 60;
 type NarratorEntity = any;
 
 interface AttentionItem {
+	/** Navigation target: the narrator this row opens. */
 	id: string;
+	/**
+	 * React key. Distinct from `id` because one narrator can contribute SEVERAL rows
+	 * (two open questions in one session), and keying those by narrator id would collide
+	 * — React would reuse one row's DOM for the other and drop the second silently.
+	 */
+	key: string;
 	title: string;
 	subtitle: string;
+	/** Question rows only: an agent has STOPPED waiting for this one. */
+	awaited?: boolean;
 }
 
 function truncate(text: string, maxLength: number): string {
@@ -27,6 +42,7 @@ function truncate(text: string, maxLength: number): string {
 function toAttentionItems(narrators: NarratorEntity[], subtitle: string): AttentionItem[] {
 	return narrators.map((n) => ({
 		id: n.id,
+		key: n.id,
 		title: n.title ?? n.id,
 		subtitle,
 	}));
@@ -88,6 +104,7 @@ export function NeedsAttention() {
 		const failed = (recentData?.items ?? []).filter((n: NarratorEntity) => n.errorMessage);
 		return failed.map((n: NarratorEntity) => ({
 			id: n.id,
+			key: n.id,
 			title: n.title ?? n.id,
 			subtitle: truncate(String(n.errorMessage), ERROR_MESSAGE_MAX_LENGTH),
 		}));
@@ -97,9 +114,36 @@ export function NeedsAttention() {
 	const isLoading =
 		waitingLoading || recentLoading || (waitingNarrators.length > 0 && permissionsLoading);
 
+	// Deferred questions belong in this card rather than a section of their own: it is
+	// already "what needs you", and an unanswered question is exactly that. Reuses the
+	// cross-session query the composer inbox holds, so opening the dashboard costs no
+	// extra request when that data is already warm.
+	const { data: questionData } = useGlobalAsyncQuestions();
+	const questionItems = useMemo<AttentionItem[]>(() => {
+		const items = (questionData?.items ?? []) as GlobalQuestion[];
+		return items.map((q) => ({
+			id: q.narratorId,
+			// The QUESTION id: a session with two open questions produces two rows.
+			key: q.id,
+			title: q.narratorTitle || q.narratorId,
+			// The question text itself, not a generic label: the point of showing it here is
+			// that the user can often decide whether it is worth opening at all.
+			subtitle: truncate(q.questions[0]?.header ?? "", ERROR_MESSAGE_MAX_LENGTH),
+			// An awaited question has STOPPED its session, so it is ranked with the
+			// permission prompts rather than the quiet backlog.
+			awaited: q.awaited === true,
+		}));
+	}, [questionData]);
+	// Blocked sessions first — the rest of this card is ordered by urgency too.
+	const sortedQuestionItems = useMemo(
+		() => [...questionItems].sort((a, b) => Number(b.awaited) - Number(a.awaited)),
+		[questionItems],
+	);
+
 	const waitingCount = waitingItems.length;
 	const failedCount = failedItems.length;
-	const allClear = waitingCount === 0 && failedCount === 0;
+	const questionCount = sortedQuestionItems.length;
+	const allClear = waitingCount === 0 && failedCount === 0 && questionCount === 0;
 
 	return (
 		<Card withBorder>
@@ -124,6 +168,26 @@ export function NeedsAttention() {
 							title={t("waitingPermission")}
 							count={waitingCount}
 							items={waitingItems}
+						/>
+					)}
+					{questionCount > 0 && (
+						<AttentionSection
+							icon={
+								<ThemeIcon
+									color={sortedQuestionItems[0]?.awaited ? "yellow" : "blue"}
+									variant="light"
+									size="lg"
+								>
+									{sortedQuestionItems[0]?.awaited ? (
+										<IconClockPause size={18} />
+									) : (
+										<IconInbox size={18} />
+									)}
+								</ThemeIcon>
+							}
+							title={t("pendingQuestions")}
+							count={questionCount}
+							items={sortedQuestionItems}
 						/>
 					)}
 					{failedCount > 0 && (
@@ -170,7 +234,7 @@ function AttentionSection({
 			<Stack gap={4}>
 				{visibleItems.map((item) => (
 					<Text
-						key={item.id}
+						key={item.key}
 						component={Link}
 						to="/narrators/$narratorId"
 						// biome-ignore lint/suspicious/noExplicitAny: dynamic route params

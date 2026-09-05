@@ -50,6 +50,9 @@ const SOURCE_ICONS: Record<MessageOriginSource, typeof IconRobot> = {
 	oauth: IconApi,
 	recovery: IconRepeat,
 	planReflection: IconBrain,
+	// Another agent addressed this session. Same icon as a `messages` side-car speaker:
+	// what arrived is somebody talking, not a platform event.
+	agentMessage: IconMessages,
 };
 
 const ORIGIN_FALLBACK_ICONS: Record<Exclude<MessageOrigin, "user">, typeof IconRobot> = {

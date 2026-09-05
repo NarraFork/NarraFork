@@ -12,6 +12,7 @@ import {
 	stripResponsesLiteHeader,
 } from "../user-agent";
 import { deriveCodexWindowId } from "./codex-request";
+import { parseUpstreamErrorEnvelope } from "./error-diagnostics";
 import { parseGatewayDataEvent } from "./gateway-events";
 import {
 	type OAIMessage,
@@ -27,12 +28,69 @@ const TURN_STATE_HEADER = "x-codex-turn-state";
 const TURN_METADATA_HEADER = "x-codex-turn-metadata";
 const CLIENT_REQUEST_ID_HEADER = "x-client-request-id";
 const OPENAI_BETA_HEADER = "OpenAI-Beta";
-const CONNECTION_IDLE_TIMEOUT_MS = 60_000;
+/**
+ * Idle budget once the response has started producing events.
+ *
+ * Matches codex-rs's `stream_idle_timeout` default (300s). The previous 60s was
+ * a local invention that fired on ordinary upstream queueing — and because each
+ * expiry costs a reconnect + full resend, a busy backend turned into a retry
+ * storm rather than a slow response.
+ */
+const CONNECTION_IDLE_TIMEOUT_MS = 300_000;
+/**
+ * Idle budget while still waiting for the FIRST frame of a response.
+ *
+ * Kept shorter than {@link CONNECTION_IDLE_TIMEOUT_MS} because silence before
+ * any event is the signature of a socket that was accepted and then abandoned,
+ * which only a reconnect can resolve. Once frames are flowing the longer budget
+ * applies: silence there means the model is working, not that the socket died.
+ */
+const FIRST_EVENT_IDLE_TIMEOUT_MS = 60_000;
+/** Upgrade handshake budget. Mirrors codex-rs `websocket_connect_timeout` (15s). */
+const HANDSHAKE_TIMEOUT_MS = 15_000;
+/**
+ * Bound on `ws.send()`.
+ *
+ * codex-rs wraps its send in the same idle timeout for a reason: a half-open TCP
+ * path accepts writes into a buffer that never drains, so an unbounded send
+ * parks the caller forever. On this transport that caller is the narrator event
+ * loop, so the session appears frozen with no error ever surfacing.
+ */
+const SEND_TIMEOUT_MS = 60_000;
+/**
+ * Proactive connection recycling threshold.
+ *
+ * Upstream closes a Responses WebSocket after 60 minutes and reports
+ * `websocket_connection_limit_reached`. Recovering from that mid-stream costs a
+ * reconnect and a full resend, so retire the socket while it is idle instead:
+ * rebuilding between requests is invisible, rebuilding mid-response is not.
+ */
+const CONNECTION_MAX_LIFETIME_MS = 55 * 60_000;
 const SESSION_IDLE_TTL_MS = 10 * 60_000;
 const SESSION_CLEANUP_INTERVAL_MS = 60_000;
 const MAX_SESSION_CACHE_SIZE = 100;
 const RECENT_NARRATOR_MESSAGE_WINDOW_MS = 5 * 60_000;
 const MAX_PREMATURE_CLOSE_RECONNECTS = 1;
+/**
+ * Reconnects granted after upstream explicitly says the connection is spent.
+ *
+ * Budgeted separately from {@link MAX_PREMATURE_CLOSE_RECONNECTS}: a silent close
+ * is a guess about a possibly-broken socket, while `websocket_connection_limit_reached`
+ * is an instruction ("Create a new websocket connection to continue"). Sharing one
+ * counter let a speculative reconnect earlier in the request consume the budget
+ * that this documented, always-recoverable case needs.
+ */
+const MAX_CONNECTION_LIMIT_RECONNECTS = 1;
+/**
+ * Full-request resends granted after `previous_response_not_found`.
+ *
+ * One is enough: the retry drops `previous_response_id` and resends everything, so
+ * a second attempt would send an identical payload and fail identically.
+ */
+const MAX_PREVIOUS_RESPONSE_RETRIES = 1;
+
+const CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached";
+const PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found";
 
 interface PrematureCloseRetryDecision {
 	shouldReconnect: boolean;
@@ -81,6 +139,21 @@ interface CachedSession {
 	lastUsedAt: number;
 }
 
+/**
+ * Whether a still-open connection is close enough to the upstream 60-minute cap
+ * that it should be replaced before dispatching another request.
+ *
+ * Exported for tests: getting this wrong is invisible until a long-lived
+ * narrator hits the cap mid-response an hour into a session.
+ */
+export function isCodexWebSocketConnectionExpiring(
+	connectedAt: number,
+	now = Date.now(),
+	maxLifetimeMs = CONNECTION_MAX_LIFETIME_MS,
+): boolean {
+	return now - connectedAt >= maxLifetimeMs;
+}
+
 export interface StreamCodexResponsesWebSocketOptions {
 	baseUrl: string;
 	apiKey: string;
@@ -125,6 +198,40 @@ export class CodexWebSocketFallbackError extends Error {
 		super(message);
 		this.name = "CodexWebSocketFallbackError";
 		this.status = status;
+	}
+}
+
+/**
+ * A transport fault upstream told us to recover from, raised only once this
+ * generator has run out of ways to recover on its own.
+ *
+ * The `retryable` field is the point of the class. `isRetryableError` reads a
+ * structured `retryable: true` before any keyword heuristic, and none of those
+ * heuristics match the wording upstream actually uses — "Responses websocket
+ * connection limit reached (60 minutes). Create a new websocket connection to
+ * continue." contains no "overload", no "try again", no 5xx status. Thrown as a
+ * plain Error it was classified NON-retryable and killed the turn, which is the
+ * exact opposite of what the message asks for.
+ *
+ * `resumable` marks the case where output already reached the client: replaying
+ * the request would duplicate it, so the agent loop must continue from the
+ * partial turn instead of re-sending.
+ */
+export class CodexWebSocketRetryableError extends Error {
+	readonly retryable = true;
+	readonly status?: number;
+	readonly code?: string;
+	readonly resumable: boolean;
+
+	constructor(
+		message: string,
+		options: { status?: number; code?: string; resumable?: boolean } = {},
+	) {
+		super(message);
+		this.name = "CodexWebSocketRetryableError";
+		this.status = options.status;
+		this.code = options.code;
+		this.resumable = options.resumable ?? false;
 	}
 }
 
@@ -238,10 +345,36 @@ export function isCodexExpected101StatusError(error: unknown): boolean {
 	return /Expected\s+101\s+status\s+code/i.test(message);
 }
 
-export function isCodexWebSocketConnectionLimitError(error: CodexWrappedErrorEvent): boolean {
+function wrappedErrorCodes(error: CodexWrappedErrorEvent): string[] {
 	const dynamicError = error as CodexWrappedErrorEvent & { code?: string };
-	const code = error.error?.code ?? error.error?.type ?? dynamicError.code;
-	return code === "websocket_connection_limit_reached";
+	return [error.error?.code, error.error?.type, dynamicError.code].filter(
+		(code): code is string => typeof code === "string" && code.length > 0,
+	);
+}
+
+/**
+ * Upstream retired this connection after its 60-minute lifetime.
+ *
+ * Reads `code` AND `type` (plus the flat `code`) because the observed payload puts
+ * `invalid_request_error` in `type` and the real signal in `code`; a single-field
+ * lookup silently misses it and the error becomes terminal. Always recoverable —
+ * upstream's own message says "Create a new websocket connection to continue."
+ */
+export function isCodexWebSocketConnectionLimitError(error: CodexWrappedErrorEvent): boolean {
+	return wrappedErrorCodes(error).includes(CONNECTION_LIMIT_REACHED_CODE);
+}
+
+/**
+ * Upstream no longer holds the response this request chained onto.
+ *
+ * Recoverable by dropping `previous_response_id` and resending the full input —
+ * the delta we sent references a baseline the server has forgotten, so the delta
+ * itself is meaningless but the conversation is not lost.
+ */
+export function isCodexWebSocketPreviousResponseMissingError(
+	error: CodexWrappedErrorEvent,
+): boolean {
+	return wrappedErrorCodes(error).includes(PREVIOUS_RESPONSE_NOT_FOUND_CODE);
 }
 
 export function decidePrematureCodexReconnect(
@@ -427,6 +560,30 @@ export function buildHandshakeHeaders(
 	return headers;
 }
 
+/**
+ * Read `x-codex-turn-state` out of a streamed metadata event.
+ *
+ * Both `response.metadata` and `codex.response.metadata` are accepted because the
+ * gateway and the direct backend disagree on the prefix, and the header lookup is
+ * case-insensitive — HTTP header names are, and matching only the lowercase form
+ * would drop the token silently, degrading sticky routing with no error anywhere.
+ *
+ * Exported for tests: a miss here is invisible until same-turn requests start
+ * landing on different backends.
+ */
+export function extractTurnStateFromEvent(chunk: Record<string, unknown>): string | null {
+	const type = chunk.type;
+	if (type !== "response.metadata" && type !== "codex.response.metadata") return null;
+	const headers = asRecord(chunk.headers);
+	if (!headers) return null;
+	for (const [name, value] of Object.entries(headers)) {
+		if (name.toLowerCase() !== TURN_STATE_HEADER) continue;
+		if (typeof value === "string" && value) return value;
+		if (typeof value === "number") return String(value);
+	}
+	return null;
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
 	return value && typeof value === "object" && !Array.isArray(value)
 		? (value as Record<string, unknown>)
@@ -451,7 +608,21 @@ function coerceWrappedError(value: unknown): CodexWrappedErrorEvent | null {
 
 	if (obj.type === "error") return obj as unknown as CodexWrappedErrorEvent;
 	if (hasStructuredError) return { ...(obj as object), type: "error" } as CodexWrappedErrorEvent;
-	if (!hasFlatError) return null;
+
+	if (!hasFlatError) {
+		// The checks above only look at `message`/`code`/`type`. Fall back to the shared
+		// envelope recognizer, which also reads `detail` / `description` and a
+		// string-valued `error`. Without it those payloads returned null here and the
+		// frame was treated as ordinary content — so the upstream explanation was
+		// dropped and the turn ended up reported as having produced nothing.
+		const envelope = parseUpstreamErrorEnvelope(obj);
+		if (!envelope) return null;
+		return {
+			type: "error",
+			status: envelope.statusCode,
+			error: { code: envelope.code, message: envelope.message },
+		};
+	}
 
 	return {
 		type: "error",
@@ -463,6 +634,29 @@ function coerceWrappedError(value: unknown): CodexWrappedErrorEvent | null {
 			message: typeof obj.message === "string" ? obj.message : undefined,
 		},
 	};
+}
+
+/**
+ * Recover a known recoverable error code from a close reason that could not be
+ * parsed as JSON.
+ *
+ * RFC 6455 caps a close reason at 123 bytes, and the payload upstream puts there
+ * is longer than that — the connection-limit JSON alone is ~230 bytes. So the
+ * reason arrives truncated mid-string, `JSON.parse` fails on every candidate, and
+ * a close-delivered connection limit is indistinguishable from an anonymous
+ * disconnect. It then took the "closed before response.completed" path and threw a
+ * plain, non-retryable Error.
+ *
+ * Substring matching is safe here precisely because these codes are the signal:
+ * they do not occur in prose, and the alternative is discarding the only
+ * identifying information the frame still carries.
+ */
+export function findCodexRecoverableCloseCode(
+	text: string,
+): typeof CONNECTION_LIMIT_REACHED_CODE | typeof PREVIOUS_RESPONSE_NOT_FOUND_CODE | null {
+	if (text.includes(CONNECTION_LIMIT_REACHED_CODE)) return CONNECTION_LIMIT_REACHED_CODE;
+	if (text.includes(PREVIOUS_RESPONSE_NOT_FOUND_CODE)) return PREVIOUS_RESPONSE_NOT_FOUND_CODE;
+	return null;
 }
 
 export function parseCodexWrappedError(text: string): CodexWrappedErrorEvent | null {
@@ -576,6 +770,22 @@ async function resetSession(session: CachedSession, disable = false): Promise<vo
 	session.disabled = disable;
 }
 
+/**
+ * Close the socket and forget the `previous_response_id` chain, keeping the
+ * session entry itself alive.
+ *
+ * Distinct from {@link resetSession} only in that `turnState` survives: the
+ * sticky-routing token belongs to the TURN, not to the connection, and upstream
+ * expects it replayed on every request of that turn — including the ones sent
+ * over a replacement socket after a reconnect. Clearing it on reconnect would
+ * silently drop same-turn backend affinity.
+ */
+async function discardResponseChain(session: CachedSession): Promise<void> {
+	await closeSessionConnection(session);
+	session.lastRequest = null;
+	session.lastCompleted = null;
+}
+
 function createCodexWebSocketAbortError(): Error {
 	return new Error("Codex WebSocket request aborted");
 }
@@ -589,6 +799,8 @@ class ReusableWebSocketConnection {
 	private queue: PendingFrame[] = [];
 	private waiters: Array<(frame: PendingFrame) => void> = [];
 	private open = false;
+	/** Wall-clock time the upgrade completed, for the 60-minute lifetime cap. */
+	private connectedAt = 0;
 
 	constructor(
 		private readonly url: string,
@@ -613,7 +825,18 @@ class ReusableWebSocketConnection {
 			const ws = new WebSocketImpl(this.url, wsOptions);
 			this.ws = ws;
 
+			// A TCP connect that neither completes nor errors (silent drop by a proxy or
+			// firewall) leaves `ws` emitting nothing at all. Without this timer the await
+			// below never settles and the caller — the narrator event loop — hangs with no
+			// error to report.
+			const handshakeTimer = setTimeout(() => {
+				finishReject(
+					new Error(`Codex WebSocket handshake timed out after ${HANDSHAKE_TIMEOUT_MS}ms`),
+				);
+			}, HANDSHAKE_TIMEOUT_MS);
+
 			const cleanup = () => {
+				clearTimeout(handshakeTimer);
 				signal.removeEventListener("abort", onAbort);
 			};
 			const finishReject = (error: Error) => {
@@ -623,6 +846,13 @@ class ReusableWebSocketConnection {
 				this.open = false;
 				if (this.ws === ws) {
 					this.ws = null;
+				}
+				// The socket may still be mid-handshake; leaving it dangling leaks an fd and,
+				// worse, counts against the upstream per-account connection budget.
+				try {
+					ws.terminate();
+				} catch {
+					// ignore: already dead, nothing to release
 				}
 				reject(error);
 			};
@@ -659,6 +889,7 @@ class ReusableWebSocketConnection {
 			});
 			ws.once("open", () => {
 				this.open = true;
+				this.connectedAt = Date.now();
 				finishResolve();
 			});
 			ws.on("error", (error) => {
@@ -700,12 +931,24 @@ class ReusableWebSocketConnection {
 		);
 	}
 
+	/** True once this socket is old enough that upstream may retire it mid-response. */
+	isExpiring(now = Date.now()): boolean {
+		return this.connectedAt > 0 && isCodexWebSocketConnectionExpiring(this.connectedAt, now);
+	}
+
 	async send(text: string): Promise<void> {
 		if (!this.ws || !this.open) {
 			throw new Error("Codex WebSocket connection is not open");
 		}
+		// Bounded, because a half-open path swallows writes without ever invoking the
+		// callback (see SEND_TIMEOUT_MS). The timeout is cleared on both outcomes so a
+		// completed send never leaves a stray timer holding the event loop.
 		await new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				reject(new Error(`Codex WebSocket send timed out after ${SEND_TIMEOUT_MS}ms`));
+			}, SEND_TIMEOUT_MS);
 			this.ws?.send(text, (error) => {
+				clearTimeout(timer);
 				if (error) reject(error);
 				else resolve();
 			});
@@ -775,10 +1018,16 @@ async function ensureConnection(
 	if (options.signal.aborted) {
 		throw createCodexWebSocketAbortError();
 	}
-	if (session.connection?.isOpen()) {
+	if (session.connection?.isOpen() && !session.connection.isExpiring()) {
 		return session.connection;
 	}
-	await closeSessionConnection(session);
+	// Any new socket invalidates the response chain. `previous_response_id` is
+	// connection-scoped upstream, which is precisely what `previous_response_not_found`
+	// reports — codex-rs draws the same line by calling `reset_websocket_session()`
+	// (clearing last_request/last_response) every time `websocket_connection()` decides
+	// it needs a new connection. Dropping the chain costs a full resend; keeping it
+	// costs a guaranteed round-trip failure first.
+	await discardResponseChain(session);
 	if (options.signal.aborted) {
 		throw createCodexWebSocketAbortError();
 	}
@@ -827,9 +1076,9 @@ export async function* streamCodexResponsesWebSocket(
 	let connection: ReusableWebSocketConnection | null = null;
 	let completed = false;
 	let responseId = "";
-	const itemsAdded: unknown[] = [];
-	const toolAccum = new Map<number, ResponsesToolAccum>();
-	const reasoningAccum = new Map<number, ResponsesReasoningAccum>();
+	let itemsAdded: unknown[] = [];
+	let toolAccum = new Map<number, ResponsesToolAccum>();
+	let reasoningAccum = new Map<number, ResponsesReasoningAccum>();
 	let requestDispatched = false;
 	const resetAbortedSessionIfNeeded = async () => {
 		if (!completed && options.signal.aborted && (requestDispatched || connection)) {
@@ -842,36 +1091,176 @@ export async function* streamCodexResponsesWebSocket(
 		if (options.resetSessionBeforeRequest) {
 			await resetSession(session, false);
 		}
-		const websocketRequest = buildCodexResponsesWebSocketRequest(
-			request,
-			session.lastRequest,
-			session.lastCompleted,
-		);
-		// Serialized per send, not once up front: the turn-state token is learned from
-		// a handshake response, which happens after the first serialization would have
-		// run, and every resend below is a "subsequent request in the turn" that must
-		// carry it. Injection stays after the continuation decision above, never before,
-		// because this key varies between turns.
-		const nextRequestText = (): string => {
-			applyTurnStateToRequest(websocketRequest, session.turnState);
-			return JSON.stringify(websocketRequest);
-		};
-		const handshakeHeaders = buildHandshakeHeaders(options);
-		options.onRequestPrepared?.({
-			url: buildCodexResponsesWebSocketUrl(options.baseUrl),
-			headers: handshakeHeaders,
-			body: websocketRequest,
-		});
 		let reconnectCount = 0;
+		let connectionLimitReconnects = 0;
+		let previousResponseRetries = 0;
 		let hasYieldedEvents = false;
+		const handshakeHeaders = buildHandshakeHeaders(options);
+		let requestReported = false;
+
+		/**
+		 * Serialize the request against the session's CURRENT chain state.
+		 *
+		 * Rebuilt per dispatch rather than captured once, because every reconnect path
+		 * below drops the chain: a cached delta still carrying `previous_response_id`
+		 * would reference a response the new socket has never heard of, so the resend
+		 * that was supposed to recover the turn fails with `previous_response_not_found`
+		 * instead. Turn state is injected last (see applyTurnStateToRequest) since it is
+		 * only learned after the first response and must ride every later request.
+		 */
+		const buildRequestFrame = (): { body: Record<string, unknown>; text: string } => {
+			const body = buildCodexResponsesWebSocketRequest(
+				request,
+				session.lastRequest,
+				session.lastCompleted,
+			);
+			applyTurnStateToRequest(body, session.turnState);
+			return { body, text: JSON.stringify(body) };
+		};
+
+		const dispatchRequest = async (): Promise<void> => {
+			const frame = buildRequestFrame();
+			// Only the first dispatch is reported: the dump records what we sent for this
+			// logical request, and overwriting it with a recovery resend would erase the
+			// payload that actually triggered the failure being diagnosed.
+			if (!requestReported) {
+				requestReported = true;
+				options.onRequestPrepared?.({
+					url: buildCodexResponsesWebSocketUrl(options.baseUrl),
+					headers: handshakeHeaders,
+					body: frame.body,
+				});
+			}
+			await connection?.send(frame.text);
+			requestDispatched = true;
+		};
+
+		/**
+		 * Rebuild the transport and resend, discarding anything the dead attempt left.
+		 *
+		 * Resetting the accumulators is not bookkeeping: `toolAccum` and `reasoningAccum`
+		 * are keyed by output index, so a half-written tool call from the abandoned
+		 * response would merge with the replacement response's index 0 and emit a tool
+		 * call whose arguments are two different JSON fragments concatenated.
+		 *
+		 * Returns false when the abort signal fired while reconnecting, so the caller
+		 * ends the stream instead of sending into a socket nobody is reading.
+		 */
+		const reconnectAndResend = async (): Promise<boolean> => {
+			await discardResponseChain(session);
+			connection = null;
+			responseId = "";
+			itemsAdded = [];
+			toolAccum = new Map();
+			reasoningAccum = new Map();
+			touchSession(session);
+			connection = await ensureConnection(session, options, handshakeHeaders);
+			if (options.signal.aborted) {
+				await resetSession(session, false);
+				return false;
+			}
+			await dispatchRequest();
+			return true;
+		};
+
+		/**
+		 * Recover from `websocket_connection_limit_reached`.
+		 *
+		 * Upstream retires a Responses WebSocket after 60 minutes and says so explicitly:
+		 * "Create a new websocket connection to continue." That instruction is always
+		 * actionable, so a reconnect is attempted regardless of whether output already
+		 * streamed — the previous code only reconnected when nothing had been yielded,
+		 * which meant the failure mode that actually happens in practice (the cap firing
+		 * mid-response on a long-lived narrator) was never recovered.
+		 *
+		 * When output DID already reach the client, the resend must not be silent: the
+		 * caller has persisted that partial turn, so recovery is surfaced as a resumable
+		 * error and the agent loop continues from the partial output rather than
+		 * duplicating it. Only a genuinely exhausted budget falls through to an error,
+		 * and that error is retryable so the loop still has a path forward.
+		 */
+		const handleConnectionLimitReached = async (detail: {
+			status?: number;
+			message: string;
+			closeCode?: number;
+		}): Promise<"reconnected" | "aborted"> => {
+			const canReconnect =
+				!hasYieldedEvents && connectionLimitReconnects < MAX_CONNECTION_LIMIT_RECONNECTS;
+			logger.warn("Codex WebSocket reached its connection lifetime limit", {
+				sessionKey: options.sessionKey,
+				narratorId: options.narratorId,
+				credentialId: options.credentialId,
+				model: options.model,
+				status: detail.status,
+				closeCode: detail.closeCode,
+				hasYieldedEvents,
+				connectionLimitReconnects,
+				canReconnect,
+			});
+			if (canReconnect) {
+				connectionLimitReconnects++;
+				if (await reconnectAndResend()) return "reconnected";
+				return "aborted";
+			}
+			// Drop the chain either way: this socket is gone, so a later request must not
+			// try to continue from a response it held.
+			await discardResponseChain(session);
+			connection = null;
+			throw new CodexWebSocketRetryableError(detail.message, {
+				status: detail.status,
+				code: CONNECTION_LIMIT_REACHED_CODE,
+				// Output already delivered means a replay would duplicate it; the loop
+				// resumes from the partial turn instead.
+				resumable: hasYieldedEvents,
+			});
+		};
+
+		/**
+		 * Recover from `previous_response_not_found`.
+		 *
+		 * The delta we sent chained onto a response upstream no longer holds. Clearing
+		 * the chain makes the rebuilt request a full resend (buildCodexResponsesWebSocketRequest
+		 * emits a plain `response.create` once lastCompleted is gone), which is exactly
+		 * the retry codex-rs performs for this code. One attempt only: a second would
+		 * rebuild the identical full request and fail identically.
+		 */
+		const handlePreviousResponseMissing = async (detail: {
+			status?: number;
+			message: string;
+			closeCode?: number;
+		}): Promise<"reconnected" | "aborted"> => {
+			const canRetry = !hasYieldedEvents && previousResponseRetries < MAX_PREVIOUS_RESPONSE_RETRIES;
+			logger.warn("Codex WebSocket previous response no longer available", {
+				sessionKey: options.sessionKey,
+				narratorId: options.narratorId,
+				credentialId: options.credentialId,
+				model: options.model,
+				status: detail.status,
+				closeCode: detail.closeCode,
+				hasYieldedEvents,
+				previousResponseRetries,
+				canRetry,
+			});
+			if (canRetry) {
+				previousResponseRetries++;
+				if (await reconnectAndResend()) return "reconnected";
+				return "aborted";
+			}
+			await discardResponseChain(session);
+			connection = null;
+			throw new CodexWebSocketRetryableError(detail.message, {
+				status: detail.status,
+				code: PREVIOUS_RESPONSE_NOT_FOUND_CODE,
+				resumable: hasYieldedEvents,
+			});
+		};
 
 		connection = await ensureConnection(session, options, handshakeHeaders);
 		if (options.signal.aborted) {
 			yield { silentDisconnect: true };
 			return;
 		}
-		await connection.send(nextRequestText());
-		requestDispatched = true;
+		await dispatchRequest();
 
 		while (true) {
 			if (options.signal.aborted) {
@@ -881,7 +1270,13 @@ export async function* streamCodexResponsesWebSocket(
 
 			let frame: PendingFrame;
 			try {
-				frame = await connection.nextFrame(CONNECTION_IDLE_TIMEOUT_MS, options.signal);
+				// Two budgets, because silence means different things before and after the
+				// first event: pre-first-event silence points at an abandoned socket, while
+				// mid-stream silence is usually the model working. See the constants.
+				frame = await connection.nextFrame(
+					hasYieldedEvents ? CONNECTION_IDLE_TIMEOUT_MS : FIRST_EVENT_IDLE_TIMEOUT_MS,
+					options.signal,
+				);
 			} catch (error) {
 				if (!isCodexWebSocketIdleTimeoutError(error)) {
 					throw error;
@@ -909,17 +1304,11 @@ export async function* streamCodexResponsesWebSocket(
 					reconnectCount,
 				});
 				if (decision.shouldReconnect) {
-					await closeSessionConnection(session);
-					connection = null;
 					reconnectCount++;
-					touchSession(session);
-					connection = await ensureConnection(session, options);
-					if (options.signal.aborted) {
-						await resetSession(session, false);
+					if (!(await reconnectAndResend())) {
 						yield { silentDisconnect: true };
 						return;
 					}
-					await connection.send(nextRequestText());
 					continue;
 				}
 				await resetSession(session, false);
@@ -948,41 +1337,30 @@ export async function* streamCodexResponsesWebSocket(
 					const errorCode = closeWrappedError.error?.code ?? closeWrappedError.error?.type;
 					const error = formatWrappedError(closeWrappedError);
 					if (isCodexWebSocketConnectionLimitError(closeWrappedError)) {
-						const shouldReconnect =
-							!hasYieldedEvents && reconnectCount < MAX_PREMATURE_CLOSE_RECONNECTS;
-						const shouldFallback = !hasYieldedEvents;
-						logger.warn("Codex WebSocket close reason reached connection lifetime limit", {
-							sessionKey: options.sessionKey,
-							narratorId: options.narratorId,
-							credentialId: options.credentialId,
-							model: options.model,
-							closeCode: frame.code,
+						const outcome = await handleConnectionLimitReached({
 							status,
-							shouldReconnect,
-							shouldFallback,
-							hasYieldedEvents,
-							reconnectCount,
+							message: error.message,
+							closeCode: frame.code,
 						});
-						if (shouldReconnect) {
-							await closeSessionConnection(session);
-							connection = null;
-							reconnectCount++;
-							touchSession(session);
-							connection = await ensureConnection(session, options);
-							if (options.signal.aborted) {
-								await resetSession(session, false);
-								yield { silentDisconnect: true };
-								return;
-							}
-							await connection.send(nextRequestText());
-							continue;
+						if (outcome === "reconnected") continue;
+						if (outcome === "aborted") {
+							yield { silentDisconnect: true };
+							return;
 						}
-						await resetSession(session, false);
-						connection = null;
-						if (shouldFallback) {
-							throw new CodexWebSocketFallbackError(error.message, status);
+						return;
+					}
+					if (isCodexWebSocketPreviousResponseMissingError(closeWrappedError)) {
+						const outcome = await handlePreviousResponseMissing({
+							status,
+							message: error.message,
+							closeCode: frame.code,
+						});
+						if (outcome === "reconnected") continue;
+						if (outcome === "aborted") {
+							yield { silentDisconnect: true };
+							return;
 						}
-						throw error;
+						return;
 					}
 					logger.warn("Codex WebSocket closed with error reason", {
 						sessionKey: options.sessionKey,
@@ -999,6 +1377,29 @@ export async function* streamCodexResponsesWebSocket(
 						throw new CodexWebSocketFallbackError(error.message, status);
 					}
 					throw error;
+				}
+
+				// The reason was not parseable JSON — most often because RFC 6455 truncated
+				// it at 123 bytes. Salvage the error code before treating this as an
+				// anonymous disconnect; see findCodexRecoverableCloseCode.
+				const truncatedCode = findCodexRecoverableCloseCode(frame.reason);
+				if (truncatedCode === CONNECTION_LIMIT_REACHED_CODE) {
+					const outcome = await handleConnectionLimitReached({
+						message: frame.reason.trim() || CONNECTION_LIMIT_REACHED_CODE,
+						closeCode: frame.code,
+					});
+					if (outcome === "reconnected") continue;
+					yield { silentDisconnect: true };
+					return;
+				}
+				if (truncatedCode === PREVIOUS_RESPONSE_NOT_FOUND_CODE) {
+					const outcome = await handlePreviousResponseMissing({
+						message: frame.reason.trim() || PREVIOUS_RESPONSE_NOT_FOUND_CODE,
+						closeCode: frame.code,
+					});
+					if (outcome === "reconnected") continue;
+					yield { silentDisconnect: true };
+					return;
 				}
 
 				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
@@ -1021,17 +1422,11 @@ export async function* streamCodexResponsesWebSocket(
 					reconnectCount,
 				});
 				if (decision.shouldReconnect) {
-					await closeSessionConnection(session);
-					connection = null;
 					reconnectCount++;
-					touchSession(session);
-					connection = await ensureConnection(session, options);
-					if (options.signal.aborted) {
-						await resetSession(session, false);
+					if (!(await reconnectAndResend())) {
 						yield { silentDisconnect: true };
 						return;
 					}
-					await connection.send(nextRequestText());
 					continue;
 				}
 				await resetSession(session, false);
@@ -1055,40 +1450,22 @@ export async function* streamCodexResponsesWebSocket(
 				const status = wrappedError.status ?? wrappedError.status_code;
 				const error = formatWrappedError(wrappedError);
 				if (isCodexWebSocketConnectionLimitError(wrappedError)) {
-					const shouldReconnect =
-						!hasYieldedEvents && reconnectCount < MAX_PREMATURE_CLOSE_RECONNECTS;
-					const shouldFallback = !hasYieldedEvents;
-					logger.warn("Codex WebSocket reached connection lifetime limit", {
-						sessionKey: options.sessionKey,
-						narratorId: options.narratorId,
-						credentialId: options.credentialId,
-						model: options.model,
+					const outcome = await handleConnectionLimitReached({
 						status,
-						shouldReconnect,
-						shouldFallback,
-						hasYieldedEvents,
-						reconnectCount,
+						message: error.message,
 					});
-					if (shouldReconnect) {
-						await closeSessionConnection(session);
-						connection = null;
-						reconnectCount++;
-						touchSession(session);
-						connection = await ensureConnection(session, options);
-						if (options.signal.aborted) {
-							await resetSession(session, false);
-							yield { silentDisconnect: true };
-							return;
-						}
-						await connection.send(nextRequestText());
-						continue;
-					}
-					await resetSession(session, false);
-					connection = null;
-					if (shouldFallback) {
-						throw new CodexWebSocketFallbackError(error.message, status);
-					}
-					throw error;
+					if (outcome === "reconnected") continue;
+					yield { silentDisconnect: true };
+					return;
+				}
+				if (isCodexWebSocketPreviousResponseMissingError(wrappedError)) {
+					const outcome = await handlePreviousResponseMissing({
+						status,
+						message: error.message,
+					});
+					if (outcome === "reconnected") continue;
+					yield { silentDisconnect: true };
+					return;
 				}
 				if (shouldDisableWebSocketForStatus(status)) {
 					await resetSession(session, true);
@@ -1111,6 +1488,15 @@ export async function* streamCodexResponsesWebSocket(
 				continue;
 			}
 
+			// Turn state arrives on a metadata EVENT, not only on the handshake response.
+			// The handshake header is the lesser source: it exists only on a brand-new
+			// connection, so a reused connection (the normal case for every request after
+			// the first in a turn) learned the token nowhere and dropped sticky routing.
+			const eventTurnState = extractTurnStateFromEvent(chunk as Record<string, unknown>);
+			if (eventTurnState) {
+				session.turnState = eventTurnState;
+			}
+
 			if (chunk.type === "response.created" && chunk.response?.id) {
 				responseId = String(chunk.response.id);
 			}
@@ -1131,7 +1517,16 @@ export async function* streamCodexResponsesWebSocket(
 				return;
 			}
 			if (chunk.type === "response.failed" || chunk.type === "response.incomplete") {
-				await resetSession(session, false);
+				// The chain is dead, but the CALLER must still learn why. `parseResponsesAPIEvent`
+				// has already turned this chunk into an `invalidState` event above, which carries
+				// the upstream code/message and lets the agent loop classify it (retryable
+				// server_error vs. terminal refusal vs. context overflow).
+				//
+				// Returning without that distinction — as this did — presented a failed response
+				// as a successful empty turn, so a transient upstream error looked like the model
+				// choosing to say nothing.
+				await discardResponseChain(session);
+				connection = null;
 				return;
 			}
 		}
@@ -1140,6 +1535,13 @@ export async function* streamCodexResponsesWebSocket(
 			throw error;
 		}
 		if (error instanceof CodexWebSocketFallbackError) {
+			throw error;
+		}
+		if (error instanceof CodexWebSocketRetryableError) {
+			// Recovery handlers already discarded the socket and response chain. Keep
+			// the turn's sticky token for the caller's next chat invocation, whether it
+			// resumes partial output or retries after exhausting the reconnect budget.
+			// The finally block still fully resets a request that was aborted.
 			throw error;
 		}
 		await resetSession(session, false);

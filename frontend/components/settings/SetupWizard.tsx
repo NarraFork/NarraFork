@@ -74,7 +74,6 @@ export function countConfiguredProviders(
 		addCredentialProviders("gemini", settings.geminiProviders ?? [], "apiKey");
 	}
 	addCredentialProviders("nug", settings.nugProviders ?? [], "apiKey", true);
-	addCredentialProviders("cline", settings.clineProviders ?? [], "accessToken", true);
 	if (settings.codexAvailable && !disabledPrefixes.has("codex")) configured.add("codex");
 	return configured.size;
 }

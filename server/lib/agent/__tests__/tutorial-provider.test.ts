@@ -14,6 +14,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import type { DbMessage } from "@shared/agent-protocol/types";
 import {
 	TUTORIAL_LESSON_BOUNDARY_BLOCK,
 	TUTORIAL_MODEL,

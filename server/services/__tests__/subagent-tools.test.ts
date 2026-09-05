@@ -1,7 +1,9 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { SHELL_TOOL_NAME } from "@server/lib/agent/tools/bash";
 import type { ToolDefinition } from "@server/lib/agent/types";
+import { type BuiltinSubagentType, getSubagentPrompt } from "@server/lib/prompts/subagents";
 import { settings } from "@server/lib/settings";
+import type { Locale } from "@shared/i18n-locales";
 import { z } from "zod";
 import type { CustomSubagentDef } from "../custom-subagent-service";
 import { resolveToolFilter } from "../subagent-tools";
@@ -148,5 +150,57 @@ describe("resolveToolFilter", () => {
 		expect(filter(mcpUnsetTool)).toBe(true);
 		expect(filter(mcpAskTool)).toBe(false);
 		expect(filter(mcpDeniedTool)).toBe(false);
+	});
+});
+
+/**
+ * The prompt and the tool whitelist are separate files, and they silently drifted
+ * once already: the whitelist dropped Write/Edit while the prompts still ordered
+ * explore/plan subagents to "use Write to output your findings to the conclusion
+ * file". Nothing failed — the subagent just burned turns calling a tool it did not
+ * have. These tests bind the two together, so removing a tool from the whitelist
+ * without fixing the prompt (or vice versa) fails here instead of in production.
+ */
+describe("explore/plan prompts match the read-only tool whitelist", () => {
+	const readOnlyTypes: BuiltinSubagentType[] = ["explore", "plan"];
+	const locales: Locale[] = ["en", "zh-CN"];
+
+	test("no prompt instructs the agent to write a conclusion file", () => {
+		for (const type of readOnlyTypes) {
+			for (const locale of locales) {
+				const prompt = getSubagentPrompt(type, locale);
+				expect(prompt).toBeTruthy();
+				const text = prompt as string;
+
+				// "conclusion file" as an output CHANNEL is gone in both languages.
+				// Plain "conclusion"/"结论" is still legitimate — it names the deliverable.
+				expect(text).not.toContain("conclusion file");
+				expect(text).not.toContain("结论文件");
+				// The prompt must not claim Write/Edit access nor promise redirection.
+				expect(text).not.toContain("use Write");
+				expect(text).not.toContain("使用 Write");
+				expect(text).not.toContain("automatically redirected");
+				expect(text).not.toContain("自动重定向");
+			}
+		}
+	});
+
+	test("every prompt states that the final response is the output channel", () => {
+		for (const type of readOnlyTypes) {
+			expect(getSubagentPrompt(type, "en")).toContain("final response");
+			expect(getSubagentPrompt(type, "zh-CN")).toContain("最终回复");
+		}
+	});
+
+	test("prompts deny Write/Edit access exactly as the filter does", () => {
+		for (const type of readOnlyTypes) {
+			const filter = getFilter(type);
+			// The claim the prompt makes...
+			expect(getSubagentPrompt(type, "en")).toContain("You do not have Write or Edit access");
+			expect(getSubagentPrompt(type, "zh-CN")).toContain("你没有 Write 或 Edit 权限");
+			// ...must be the truth the runtime enforces.
+			expect(filter(makeTool("Write"))).toBe(false);
+			expect(filter(makeTool("Edit"))).toBe(false);
+		}
 	});
 });

@@ -1,4 +1,4 @@
-import { summaryGenerate } from "../lib/agent";
+import { type SummaryRetryInfo, summaryGenerate } from "../lib/agent";
 import {
 	isContextOverflowMessage,
 	isContextWindowExceededError,
@@ -68,6 +68,15 @@ export type CompactSummaryReasoningDeltaHandler = (delta: string) => void | Prom
  * boundary so "slow but advancing" stays distinguishable from "stuck".
  */
 export type CompactSummaryProgressHandler = () => void;
+
+/**
+ * Fired each time a failed summary attempt is about to be retried (either the
+ * per-request backoff inside `summaryGenerate`, or this module's whole-chunk
+ * retry). Unlike {@link CompactSummaryProgressHandler} — a pure liveness beat —
+ * this carries the failure detail so a UI can show "retrying (N)" instead of an
+ * unexplained 0-char spinner.
+ */
+export type CompactSummaryRetryHandler = (info: SummaryRetryInfo) => void;
 
 const TODO_REMINDER_BLOCK_RE = /\n?\s*<todo_reminder>[\s\S]*?<\/todo_reminder>\s*/g;
 
@@ -236,6 +245,7 @@ export const narratorContext = {
 		onTextDelta?: CompactSummaryTextDeltaHandler,
 		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
 		onProgress?: CompactSummaryProgressHandler,
+		onRetryScheduled?: CompactSummaryRetryHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const messages =
 			providedMessages ?? (await narratorService.getModelHistorySinceLastCompact(narratorId));
@@ -317,6 +327,7 @@ export const narratorContext = {
 			onTextDelta,
 			onReasoningDelta,
 			onProgress,
+			onRetryScheduled,
 		);
 	},
 
@@ -334,6 +345,7 @@ export const narratorContext = {
 		onTextDelta?: CompactSummaryTextDeltaHandler,
 		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
 		onProgress?: CompactSummaryProgressHandler,
+		onRetryScheduled?: CompactSummaryRetryHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		let rollingSummary = initialSummary;
 		let lastContextPercent: number | undefined;
@@ -366,6 +378,7 @@ export const narratorContext = {
 				onTextDelta,
 				onReasoningDelta,
 				onProgress,
+				onRetryScheduled,
 			);
 
 			onProgress?.();
@@ -399,6 +412,7 @@ export const narratorContext = {
 		onTextDelta?: CompactSummaryTextDeltaHandler,
 		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
 		onProgress?: CompactSummaryProgressHandler,
+		onRetryScheduled?: CompactSummaryRetryHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		try {
 			return await this._summarizeChunk(
@@ -414,6 +428,7 @@ export const narratorContext = {
 				onTextDelta,
 				onReasoningDelta,
 				onProgress,
+				onRetryScheduled,
 			);
 		} catch (err) {
 			if (!isCompactContextOverflowError(err) || depth >= COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH) {
@@ -450,6 +465,7 @@ export const narratorContext = {
 				onTextDelta,
 				onReasoningDelta,
 				onProgress,
+				onRetryScheduled,
 			);
 		}
 	},
@@ -471,6 +487,7 @@ export const narratorContext = {
 		onTextDelta?: CompactSummaryTextDeltaHandler,
 		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
 		onProgress?: CompactSummaryProgressHandler,
+		onRetryScheduled?: CompactSummaryRetryHandler,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const previousSummaryPrefix = previousSummary
 			? `[Previous context summary]:\n${previousSummary}\n\n---\n\n`
@@ -587,6 +604,9 @@ export const narratorContext = {
 					// silent gap to an inactivity watchdog, which would abort a compact
 					// that is merely being rate-limited and recovering.
 					onProgress,
+					// Surface each scheduled retry so the UI can say "retrying (N)"
+					// instead of sitting on an unexplained 0-char spinner.
+					onRetryScheduled,
 				);
 				if (!result.text?.trim()) {
 					throw new Error("Compact summary model returned empty output");
@@ -622,6 +642,17 @@ export const narratorContext = {
 					maxRetries: COMPACT_MAX_RETRIES,
 					error: String(err),
 				});
+				// The whole-chunk retry sits on TOP of summaryGenerate's internal
+				// backoff chain — report it too, or this layer's retry window goes
+				// back to looking like an unexplained stall.
+				if (attempt < COMPACT_MAX_RETRIES) {
+					onRetryScheduled?.({
+						attempt,
+						maxRetries: COMPACT_MAX_RETRIES,
+						delayMs: 0,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
 			}
 		}
 

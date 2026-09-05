@@ -48,6 +48,7 @@ NarraFork 面向小团队私有部署。所有用户共享项目和 Chapter 数�
 | Hono | HTTP 框架 | >= 4.x |
 | SQLite | 数据库 | 内置于 Bun |
 | Drizzle ORM | 数据库抽象 | >= 0.38 |
+| 自定义 Agent Loop（`server/lib/agent/`） | AI 会话管理（多提供商：Anthropic/OpenAI/Codex/NUG） | — |
 | @modelcontextprotocol/sdk | MCP 工具暴露 | >= 1.x |
 | nanoid | ID 生成 | >= 5.x |
 
@@ -914,6 +915,7 @@ Compact 机制：
 
 #### 4.2.2 narrator-session.ts — AI 会话管理
 
+职责：封装 AI provider 的流式调用，管理会话的创建和上下文重建，以及消息缓冲和权限审批。使用自定义 Agent Loop（`server/lib/agent/loop.ts`），支持多提供商（Anthropic、OpenAI、Codex、NUG）。
 
 核心功能：
 - `startSession()` — 统一入口，根据 narrator 状态自动判断新建或恢复会话。传入 `cwd`、`model`、`permissionMode`。每次请求通过 `buildHistory()` 从 DB 消息重建完整对话历史，调用 Agent Loop 执行。
@@ -1785,7 +1787,9 @@ interface NarraForkSettings {
     apiKey?: string                 // OpenAI API Key
     baseUrl?: string                // 自定义 API 端点
   }
-  }
+  nug: {
+    enabled?: boolean               // 是否启用 NUG 网关集成
+    baseUrl?: string                // NUG 端点
   }
   mcp: {
     servers?: Record<string, {      // MCP 服务器配置
@@ -1828,6 +1832,7 @@ interface NarraForkSettings {
 - 终端管理（dtach + xterm.js）
 
 ### Phase 2: Narrator 核心 ✅
+- 自定义 Agent Loop 架构（多提供商：Anthropic/OpenAI/Codex/NUG）
 - Session 创建 / 恢复 / 消息流
 - 消息持久化 + 展示
 - Tool Call 参数和结果展示
@@ -2006,6 +2011,7 @@ interface NarraForkSettings {
 | 探索组 | 独立 exploration_groups 表 | 曾按此设计建表并保留 validator，但**没有落地**：没有服务方法、没有路由、图上也没有分组框。graph 接口原先每次请求都查这张表并返回，却无人渲染，该查询已移除 |
 | 章节拆分 | split at commit = 创建前序章节 + 原章节变后续 + 新 fork | 比简单的"从历史 commit fork"更精确地表达语义：历史被拆分为两条独立的演进路径 |
 | ~~frozen 状态~~ | **已移除**，前序章节改用 dormant | 原设计让拆分后的前序章节进入 frozen，但该状态没有出口（fork/wake/dormant 全拒绝它），且从无写入路径。"已确定的历史"由 merged 表达，后者有 unmerge 作为出口 |
+| 多提供商支持 | 自定义 Agent Loop + 统一工具注册框架 | 支持 Anthropic、OpenAI、Codex、NUG 等提供商，避免 SDK 锁定 |
 | 子代理系统 | narrator.type='subagent' + subagentType(explore/plan/general) | 叙述者可派生子任务代理，通过 parentToolUseId 关联消息树 |
 | 技能系统 | 项目级技能库（skill-service.ts） | 为叙述者提供领域特定指令和知识，提升 AI 输出质量 |
 | 例程系统 | 内置 + 自定义例程（routine-service.ts） | 自动化重复性任务，支持内置和用户自定义例程 |

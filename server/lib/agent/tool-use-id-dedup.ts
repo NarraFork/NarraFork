@@ -2,6 +2,7 @@
  * Tool-use ID uniqueness and character-set guard.
  *
  * Every tool-calling API (Anthropic Messages, OpenAI Chat Completions/Responses,
+ * NUG, Gemini) requires the `tool_use` identifiers inside one request to be unique,
  * and pairs each call with its result purely by that identifier. NarraFork stores the
  * identifier the provider minted, verbatim, and replays the full history on every turn.
  *
@@ -21,6 +22,7 @@
  *
  *  2. **Not wire-safe.** Some upstreams mint ids like `Bash:0` / `Read:0`. Anthropic
  *     accepts them, so the originating turns succeed and the ids land in the DB; but
+ *     NUG's strict gateway validates `^[a-zA-Z0-9_-]+$` and rejects the whole replayed
  *     history with a 400 the moment the session is switched to that channel:
  *
  *       `messages.1.content.1.tool_use.id: String should match pattern '^[a-zA-Z0-9_-]+$'`
@@ -78,6 +80,7 @@ const TOOL_ID_KEYS = new Set([
 
 /**
  * Bounds for the generic history scan so a huge payload cannot stall the event loop.
+ * The depth is generous on purpose: some gateways nest tool uses four levels down and missing an
  * id would reintroduce the duplicate, whereas scanning a little extra costs nothing.
  */
 const MAX_SCAN_DEPTH = 12;
@@ -86,6 +89,7 @@ const MAX_SCAN_NODES = 200_000;
 /**
  * The character set every tool-calling channel accepts.
  *
+ * This is deliberately the *intersection*, not the union: NUG's strict gateway validates
  * `^[a-zA-Z0-9_-]+$`, which is the narrowest of the channels we route to (Anthropic also
  * accepts `:` and `.`). A session can be switched between channels at any time and the
  * whole history is replayed on every turn, so an id is only safe to store if it satisfies

@@ -141,7 +141,9 @@ describe("Manifest/capability parity", () => {
 	 * Every Plugin→Host method a reference plugin actually calls must have its capability
 	 * declared in that plugin's `permissions.host`.
 	 *
-	 * from its token-writeback path while declaring no `secret.use_self`. Grants are seeded
+	 * This exists because of a bug it would have caught. A reference provider plugin called
+	 * `secrets.set` from its token-writeback path while declaring no `secret.use_self`.
+	 * Grants are seeded
 	 * strictly from `permissions.host` (`plugin-manager.ts` `seedGrantsFromManifest`), and the
 	 * broker treats an absent grant as a denial on purpose (`plugin-capability-broker.ts`:
 	 * "Deliberately still a denial") — so the call was rejected at runtime. Because the

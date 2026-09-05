@@ -33,8 +33,10 @@ import { memo, type RefObject, useEffect, useLayoutEffect, useRef, useState } fr
 import {
 	resolveVListUserMarkerTop,
 	shouldShowVListUserMarkers,
+	type VListCompactMarker,
 	type VListUserMarker,
 } from "./vlist-user-markers";
+import "./vlist-markers.css";
 
 /** Resting width (px) of one mark; hover widens it without moving the track. */
 const MARKER_WIDTH = 10;
@@ -65,16 +67,35 @@ interface HoveredMarkerTooltip {
 
 export interface VListUserMarkersProps {
 	markers: readonly VListUserMarker[];
+	/** Compact-indicator marks, drawn in the same track with status colours. */
+	compactMarkers?: readonly VListCompactMarker[];
 	/** Full scrollable height (canvas + footer) the fractions were derived from. */
 	documentHeight: number;
 	/** Viewport height — the track length, and the "is scrolling useful" test. */
 	trackHeight: number;
 	/** Scroll the list to a marker's document offset. */
 	onJump: (marker: VListUserMarker) => void;
+	/** Scroll the list to a compact marker's document offset. */
+	onJumpCompact?: (marker: VListCompactMarker) => void;
 	/** The scroll viewport, measured for its native scrollbar width. */
 	viewportRef: RefObject<HTMLElement | null>;
 	/** Localized aria-label builder ("Jump to message #3"). */
 	resolveLabel: (ordinal: number) => string;
+	/** Localized aria-label builder for compact marks ("Jump to compact marker"). */
+	resolveCompactLabel?: (marker: VListCompactMarker) => string;
+}
+
+/**
+ * Track colours for a compact mark. Failed always reads red — that is the
+ * whole point of the index (a failed compact stays visible no matter where the
+ * reader scrolls); live/finished marks carry their flavour's colour, matching
+ * the timeline indicator (context = orange, segment = teal).
+ */
+function compactMarkerColor(marker: VListCompactMarker): string {
+	if (marker.status === "failed") return "var(--mantine-color-red-4)";
+	return marker.flavor === "segment"
+		? "var(--mantine-color-teal-4)"
+		: "var(--mantine-color-orange-4)";
 }
 
 /**
@@ -85,11 +106,14 @@ export interface VListUserMarkersProps {
  */
 export const VListUserMarkers = memo(function VListUserMarkers({
 	markers,
+	compactMarkers = [],
 	documentHeight,
 	trackHeight,
 	onJump,
+	onJumpCompact,
 	viewportRef,
 	resolveLabel,
+	resolveCompactLabel,
 }: VListUserMarkersProps) {
 	const [scrollbarWidth, setScrollbarWidth] = useState(0);
 	const [hoveredTooltip, setHoveredTooltip] = useState<HoveredMarkerTooltip | null>(null);
@@ -121,7 +145,10 @@ export const VListUserMarkers = memo(function VListUserMarkers({
 		setTooltipHeight((previous) => (previous === height ? previous : height));
 	});
 
-	if (!shouldShowVListUserMarkers(markers.length, documentHeight, trackHeight)) return null;
+	if (
+		!shouldShowVListUserMarkers(markers.length + compactMarkers.length, documentHeight, trackHeight)
+	)
+		return null;
 
 	const tooltipHalf = tooltipHeight / 2;
 	const tooltipMinTop = TOOLTIP_EDGE_GAP + tooltipHalf;
@@ -184,6 +211,48 @@ export const VListUserMarkers = memo(function VListUserMarkers({
 								// pass would be paid to show one tooltip at a time.
 								const timeLabel = marker.createdAt ? formatShortMessageTime(marker.createdAt) : "";
 								setHoveredTooltip({ key: marker.key, label: tooltipLabel, timeLabel, top });
+							}}
+							onMouseLeave={(event) => {
+								event.currentTarget.style.width = `${MARKER_WIDTH}px`;
+								setHoveredTooltip((current) => (current?.key === marker.key ? null : current));
+							}}
+						/>
+					);
+				})}
+				{/* Compact marks share the track and render AFTER user marks, so a
+				    compact row that collides with a user turn wins the pixels (and the
+				    hover): its status is the more transient signal. */}
+				{compactMarkers.map((marker) => {
+					const top = resolveVListUserMarkerTop(marker.fraction, trackHeight, MARKER_HEIGHT);
+					const ariaLabel = resolveCompactLabel?.(marker) ?? marker.tooltip;
+					return (
+						<button
+							type="button"
+							key={marker.key}
+							tabIndex={-1}
+							aria-label={ariaLabel}
+							data-vlist-compact-marker={marker.status}
+							className={
+								marker.status === "compacting" ? "vlist-compact-marker--compacting" : undefined
+							}
+							onClick={() => onJumpCompact?.(marker)}
+							style={{
+								position: "absolute",
+								top,
+								right: 0,
+								width: MARKER_WIDTH,
+								height: MARKER_HEIGHT,
+								borderRadius: "3px 0 0 3px",
+								backgroundColor: compactMarkerColor(marker),
+								cursor: "pointer",
+								pointerEvents: "auto",
+								transition: "width 150ms ease",
+								border: "none",
+								padding: 0,
+							}}
+							onMouseEnter={(event) => {
+								event.currentTarget.style.width = `${MARKER_HOVER_WIDTH}px`;
+								setHoveredTooltip({ key: marker.key, label: marker.tooltip, timeLabel: "", top });
 							}}
 							onMouseLeave={(event) => {
 								event.currentTarget.style.width = `${MARKER_WIDTH}px`;

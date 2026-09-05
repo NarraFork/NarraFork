@@ -35,10 +35,12 @@ async function cleanup() {
 describe("plugin provider proxy persistence", () => {
 	it("stores and reads back a custom proxy", async () => {
 		const store = await makeStore();
+		await store.setProviderProxy("com.example.demo", "acme", {
 			mode: "custom",
 			url: "http://127.0.0.1:7890",
 		});
 		const record = await store.get("com.example.demo");
+		expect(record?.providerProxies.acme).toEqual({
 			mode: "custom",
 			url: "http://127.0.0.1:7890",
 		});
@@ -49,7 +51,9 @@ describe("plugin provider proxy persistence", () => {
 		// `direct` must survive as an explicit choice: collapsing it to "no entry" would make it
 		// indistinguishable from following the global proxy, which is the opposite intent.
 		const store = await makeStore();
+		await store.setProviderProxy("com.example.demo", "acme", { mode: "direct" });
 		const record = await store.get("com.example.demo");
+		expect(record?.providerProxies.acme).toEqual({ mode: "direct" });
 		await cleanup();
 	});
 
@@ -57,19 +61,26 @@ describe("plugin provider proxy persistence", () => {
 		// `default` *is* following the global policy, so storing a row for it would only add
 		// state that behaves exactly like no state.
 		const store = await makeStore();
+		await store.setProviderProxy("com.example.demo", "acme", { mode: "custom", url: "http://p" });
+		await store.setProviderProxy("com.example.demo", "acme", { mode: "default" });
 		const record = await store.get("com.example.demo");
+		expect(record?.providerProxies.acme).toBeUndefined();
 		await cleanup();
 	});
 
 	it("clears the override when passed null", async () => {
 		const store = await makeStore();
+		await store.setProviderProxy("com.example.demo", "acme", { mode: "custom", url: "http://p" });
+		await store.setProviderProxy("com.example.demo", "acme", null);
 		const record = await store.get("com.example.demo");
+		expect(record?.providerProxies.acme).toBeUndefined();
 		await cleanup();
 	});
 
 	it("rejects a custom proxy with no url", async () => {
 		const store = await makeStore();
 		await expect(
+			store.setProviderProxy("com.example.demo", "acme", { mode: "custom" }),
 		).rejects.toBeInstanceOf(ValidationError);
 		await cleanup();
 	});
@@ -79,6 +90,7 @@ describe("plugin provider proxy persistence", () => {
 		// request failure rather than a configuration error.
 		const store = await makeStore();
 		await expect(
+			store.setProviderProxy("com.example.demo", "acme", { mode: "custom", url: "not a url" }),
 		).rejects.toBeInstanceOf(ValidationError);
 		await cleanup();
 	});
@@ -86,6 +98,7 @@ describe("plugin provider proxy persistence", () => {
 	it("rejects a scheme an HTTP agent cannot use", async () => {
 		const store = await makeStore();
 		await expect(
+			store.setProviderProxy("com.example.demo", "acme", {
 				mode: "custom",
 				url: "ftp://proxy.example",
 			}),
@@ -95,21 +108,25 @@ describe("plugin provider proxy persistence", () => {
 
 	it("accepts a socks proxy", async () => {
 		const store = await makeStore();
+		await store.setProviderProxy("com.example.demo", "acme", {
 			mode: "custom",
 			url: "socks5://127.0.0.1:1080",
 		});
 		const record = await store.get("com.example.demo");
+		expect(record?.providerProxies.acme?.mode).toBe("custom");
 		await cleanup();
 	});
 
 	it("keeps overrides for different contributions independent", async () => {
 		// The whole point of a per-provider override: one provider proxied, another direct.
 		const store = await makeStore();
+		await store.setProviderProxy("com.example.demo", "acme", {
 			mode: "custom",
 			url: "http://127.0.0.1:7890",
 		});
 		await store.setProviderProxy("com.example.demo", "other", { mode: "direct" });
 		const record = await store.get("com.example.demo");
+		expect(record?.providerProxies.acme?.url).toBe("http://127.0.0.1:7890");
 		expect(record?.providerProxies.other).toEqual({ mode: "direct" });
 		await cleanup();
 	});
@@ -117,8 +134,11 @@ describe("plugin provider proxy persistence", () => {
 	it("drops overrides for contributions the plugin no longer declares", async () => {
 		// A leftover row would silently reapply if the contribution id ever came back.
 		const store = await makeStore();
+		await store.setProviderProxy("com.example.demo", "acme", { mode: "direct" });
 		await store.setProviderProxy("com.example.demo", "gone", { mode: "direct" });
+		await store.pruneProviderConfigs("com.example.demo", ["acme"]);
 		const record = await store.get("com.example.demo");
+		expect(record?.providerProxies.acme).toEqual({ mode: "direct" });
 		expect(record?.providerProxies.gone).toBeUndefined();
 		await cleanup();
 	});
@@ -127,6 +147,8 @@ describe("plugin provider proxy persistence", () => {
 		// The request path resolves the override synchronously; awaiting a load there would put
 		// file I/O in front of every chat call.
 		const store = await makeStore();
+		await store.setProviderProxy("com.example.demo", "acme", { mode: "direct" });
+		expect(store.getCachedState("com.example.demo")?.providerProxies.acme).toEqual({
 			mode: "direct",
 		});
 		await cleanup();
@@ -136,12 +158,14 @@ describe("plugin provider proxy persistence", () => {
 		const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-proxy-reload-"));
 		roots.push(root);
 		const first = new PluginStateStore({ root });
+		await first.setProviderProxy("com.example.demo", "acme", {
 			mode: "custom",
 			url: "http://127.0.0.1:7890",
 		});
 		// A fresh store over the same root reads the persisted document.
 		const second = new PluginStateStore({ root });
 		const record = await second.get("com.example.demo");
+		expect(record?.providerProxies.acme).toEqual({
 			mode: "custom",
 			url: "http://127.0.0.1:7890",
 		});

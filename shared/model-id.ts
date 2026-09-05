@@ -2,12 +2,14 @@
  * Model identifier parsing.
  *
  * A NarraFork model value is `${providerPrefix}:${modelId}` (e.g.
+ * `nug:claude-sonnet-4.5`). Splitting that string is pure text work with no
  * dependency on settings, the database or any other host state, so it lives in
  * `shared/` where both the host and bundled plugin code can use it.
  *
  * Keeping this out of `server/lib/settings/` matters for bundle purity: the
  * settings module graph reaches the Codex manager and the NUG model cache, so
  * importing `parseModelId` from there pulls ~370 modules into any bundle. See
+ * the shared-core purity guards.
  */
 
 /**
@@ -44,10 +46,12 @@ const FAMILY_DATE_SUFFIXES: readonly RegExp[] = [
  *
  * Steps:
  * 1. Strip all provider prefixes by taking the last colon-separated segment
+ *    (`nug2:channel:claude-opus-4.6` → `claude-opus-4.6`, `myprov:claude-opus-4-6` → `claude-opus-4-6`)
  * 2. Lower-case
  * 3. Normalize version separators: dots between digits → dashes (`claude-opus-4.6` → `claude-opus-4-6`)
  * 4. Strip volatile date suffixes (`claude-opus-4-6-20260514` → `claude-opus-4-6`)
  *
+ * `myprov:claude-opus-4-6` all normalize to `claude-opus-4-6`.
  */
 export function normalizeModelFamily(raw: string | null | undefined): string {
 	if (!raw) return "unknown";

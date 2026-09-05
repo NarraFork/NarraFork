@@ -315,53 +315,6 @@ export const miscApi = {
 			method: "DELETE",
 		}),
 
-		paidPage?: number;
-		enterprisePage?: number;
-		freePage?: number;
-		pageSize?: number;
-	}) => {
-		const qs = new URLSearchParams();
-		if (params?.paidPage) qs.set("paidPage", String(params.paidPage));
-		if (params?.enterprisePage) qs.set("enterprisePage", String(params.enterprisePage));
-		if (params?.freePage) qs.set("freePage", String(params.freePage));
-		if (params?.pageSize) qs.set("pageSize", String(params.pageSize));
-		const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
-	},
-			method: "DELETE",
-			body: JSON.stringify({ ids }),
-		}),
-		request<{
-			removed: string[];
-			reasons: Array<"too_many_failures" | "account_suspended">;
-			method: "POST",
-			body: JSON.stringify({ priority }),
-		}),
-			method: "POST",
-			body: JSON.stringify({ mode }),
-		}),
-			method: "PATCH",
-			body: JSON.stringify(fields),
-		}),
-			method: "POST",
-			body: JSON.stringify({ query }),
-		}),
-		// biome-ignore lint/suspicious/noExplicitAny: MCP tool response structure varies
-			method: "POST",
-			body: JSON.stringify({ credentials }),
-		}),
-		request<{ models: Array<Record<string, unknown>>; fromCache: boolean }>(
-		),
-		request<{
-			models: Array<Record<string, unknown>>;
-			credentialId?: string;
-			fromCache: boolean;
-			method: "POST",
-		}),
-
-			method: "POST",
-			body: JSON.stringify({ proxy }),
-		}),
-
 	// OpenAI-compatible models
 	openaiListModels: () =>
 		request<{ models: Array<{ id: string; owned_by?: string }>; fromCache: boolean }>(
@@ -862,85 +815,6 @@ export const miscApi = {
 		}>(`/nug/providers/${providerId}/models/refresh`, { method: "POST" }),
 	nugOAuthStart: (providerId: string) =>
 		request<{ authorizeUrl: string; state: string }>(`/nug/providers/${providerId}/oauth/start`),
-
-	// Cline
-	clineStatus: () =>
-		request<{
-			authenticated: boolean;
-			email?: string;
-			displayName?: string;
-			expiresAt?: number;
-			providers: Array<{ id: string; name: string; prefix: string; hasToken: boolean }>;
-			totalModels: number;
-			pendingAuth: boolean;
-			authorizeUrl?: string;
-		}>("/cline/status"),
-	clineBrowserAuth: (apiBaseUrl?: string) =>
-		request<{ authorizeUrl: string }>("/cline/auth/browser", {
-			method: "POST",
-			body: JSON.stringify(apiBaseUrl ? { apiBaseUrl } : {}),
-		}),
-	clineCancelAuth: () => request<{ ok: boolean }>("/cline/auth/cancel", { method: "POST" }),
-	clineImportCallback: (callbackUrl: string) =>
-		request<{ ok: boolean; email?: string; displayName?: string }>("/cline/auth/callback", {
-			method: "POST",
-			body: JSON.stringify({ callbackUrl }),
-		}),
-	clineLogout: () => request<{ ok: boolean }>("/cline/auth/logout", { method: "POST" }),
-	clineRefreshModels: () =>
-		request<{
-			results: Array<{
-				providerId: string;
-				name: string;
-				count: number;
-				error?: string;
-			}>;
-			models: Array<{ id: string; name?: string }>;
-			fromCache: boolean;
-		}>("/cline/models/refresh", { method: "POST" }),
-	clineRefreshProviderModels: (providerId: string) =>
-		request<{
-			count: number;
-			fromCache: boolean;
-		}>(`/cline/providers/${providerId}/models/refresh`, { method: "POST" }),
-	clineBalance: () => request<{ balance: number; userId: string }>("/cline/balance"),
-	clineRecommendedModels: () =>
-		request<{
-			recommended: Array<{
-				id: string;
-				name: string;
-				description?: string;
-				tags: string[];
-			}>;
-			free: Array<{ id: string; name: string; description?: string; tags: string[] }>;
-		}>("/cline/recommended-models"),
-	clineRefreshUserInfo: () =>
-		request<{
-			authenticated: boolean;
-			email?: string;
-			displayName?: string;
-			userId?: string;
-		}>("/cline/user-info/refresh", { method: "POST" }),
-	clinePoolSearch: (q: string, limit = 50) =>
-		request<{
-			models: Array<{
-				id: string;
-				name?: string;
-				contextLength?: number;
-				promptPrice?: string;
-				completionPrice?: string;
-			}>;
-			total: number;
-		}>(`/cline/pool/search?q=${encodeURIComponent(q)}&limit=${limit}`),
-	clinePoolCount: () => request<{ count: number }>("/cline/pool/count"),
-	clineSetEnabledModels: (models: string[]) =>
-		request<{ ok: boolean; count: number; modelContextWindows?: Record<string, number> }>(
-			"/cline/enabled-models",
-			{
-				method: "POST",
-				body: JSON.stringify({ models }),
-			},
-		),
 
 	// Gemini (Google Generative Language API) — per-provider model refresh.
 	// Gemini is configured via the unified custom-API protocol ("gemini-compatible");

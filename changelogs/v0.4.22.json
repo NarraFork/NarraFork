@@ -1,4 +1,6 @@
 {
 	"version": "0.4.22",
 	"date": "2026-06-12",
+	"en": "## New Features\n\n- Added NUG provider as a web search fallback, so search now tries multiple gateway channels in sequence.\n\n## Performance\n\n- Optimized narrator catch-up to use bounded reads that short-circuit to a full reload before loading large message payloads, reducing database load on reconnect.\n- Skipped a redundant refetch on the first catch-up after switching narrators, avoiding an extra round-trip and UI flicker.\n\n## Bug Fixes\n\n- Fixed recent tabs so opening a narrator reliably adds it to the list, and unpinned subagent tabs are trimmed first when the list is full.\n- Raised the persisted recent-tab title/subtitle length limit to match the frontend, so longer titles are no longer rejected.",
+	"zh-CN": "## 新功能\n\n- 新增 NUG provider 作为联网搜索的回退，搜索依次尝试多个网关渠道。\n\n## 性能优化\n\n- 优化叙述者消息追赶逻辑，改用有界读取并在加载大消息内容前短路为整页重载，降低重连时的数据库负载。\n- 切换叙述者后的首次追赶不再触发冗余刷新，避免额外往返和界面闪烁。\n\n## 修复\n\n- 修复最近标签：打开叙述者时能可靠加入列表，列表已满时优先清理未固定的子代理标签。\n- 提升最近标签标题/副标题的持久化长度上限以与前端一致，较长标题不再被拒绝。"
 }

@@ -260,6 +260,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── proxy ───────────────────────────────────────────────────────────
 	"proxy.mode": {
+		desc: '统一出站代理模式，作用于所有出站网络请求（Codex/Anthropic/OpenAI/NUG/WebFetch/浏览器）。默认 "direct" 直连不走代理，"system" 跟随系统代理（读取 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY 环境变量），"custom" 使用手动配置的 URL。本地/回环目标始终豁免。',
 		type: "string",
 		valid: '"direct" | "system" | "custom"',
 	},
@@ -846,6 +847,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── pricing ─────────────────────────────────────────────────────────
 	"pricing.overrides": {
+		desc: '官方参考价覆盖（USD / 1M tokens），用于修正内置价格表。键是裸模型 ID（如 "gpt-5.6-sol"，不带 provider 前缀），值可只填要覆盖的字段：{ input, output, cacheRead, cacheWrite }。未填字段沿用内置值；为内置表里没有的模型新增条目即可给它定价。订阅制渠道（Codex 等）算出的金额是"按官方 API 价折算的等价消耗"，不是实付金额。',
 		type: "object",
 	},
 

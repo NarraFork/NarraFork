@@ -71,7 +71,7 @@ import {
 // Pure in-memory state module (no imports of its own), so importing it here
 // cannot widen this file's already-delicate import cycle with narrator-service.
 import { getFileChangesBySubagent, type SubagentFileChanges } from "./subagent-file-changes";
-import { isTakenOver, listTakenOverSubagents } from "./subagent-takeover";
+import { isTakenOverForDisplay, listDisplayTakenOverSubagents } from "./subagent-takeover";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -999,6 +999,7 @@ export function stripRedundantToolCallRows(tree: any[]): any[] {
 /**
  * Drop `providerMetadata` from every content block for transport.
  *
+ * WHAT IT IS. `providerMetadata` (shared/agent-protocol/types.ts —
  * `ReasoningProviderMetadata`) is purely REPLAY state: every field exists so the
  * server can echo a reasoning block back to the upstream that minted it, and none
  * of them is displayable.
@@ -1010,6 +1011,7 @@ export function stripRedundantToolCallRows(tree: any[]): any[] {
  *   gemini.thoughtSignature           ditto, or the next turn 400s
  *   signatureSource                   which upstream minted the signature
  *
+ * `openai-provider.ts` is its only reader, and
  * they read it from the DATABASE when replaying history — never from anything the
  * browser sent back. The frontend has no API that returns a message body to the
  * server (edit / retry / fork all address messages by id), so removing it from a
@@ -1302,7 +1304,12 @@ async function buildSubagentActivities(
 				: {}),
 			// Synchronous in-memory read (no query); omitted when false so the common
 			// snapshot stays the same size it was.
-			...(isTakenOver(owner.subagentNarratorId) ? { takenOver: true } : {}),
+			//
+			// `…ForDisplay`, not `isTakenOver`: after the user stops a takeover on a
+			// still-working subagent the release is DEFERRED to its loop end, and the
+			// takeover set stays populated on purpose. Reading the raw set here re-lit
+			// the badge on every page load in that window.
+			...(isTakenOverForDisplay(owner.subagentNarratorId) ? { takenOver: true } : {}),
 		});
 	}
 	return activities;
@@ -1444,13 +1451,16 @@ async function buildTreeFromTopLevelRefs(
  * Takeover authority is the in-memory Set (`subagent-takeover.ts`), so the
  * membership test is synchronous. A finished Await needs no flag: its output
  * already states `taken_over` in words.
+ *
+ * Uses the DISPLAY list, which excludes subagents whose release is merely
+ * deferred to their loop end — see `isTakeoverReleasePending`.
  */
 function collectTakenOverToolUseIds(
 	activities: ReadonlyMap<string, SubagentActivity>,
 	awaitAgentIds: ReadonlyMap<string, string>,
 ): Set<string> {
 	const flagged = new Set<string>();
-	const takenOver = new Set(listTakenOverSubagents());
+	const takenOver = new Set(listDisplayTakenOverSubagents());
 	if (takenOver.size === 0) return flagged;
 	for (const [toolUseId, activity] of activities) {
 		const child = activity.subagentNarratorId;

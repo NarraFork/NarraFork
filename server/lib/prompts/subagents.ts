@@ -46,15 +46,11 @@ ${SH} restrictions — STRICTLY ENFORCED:
 - ❌ DO NOT attempt to Write/Edit \`.ts\`, \`.js\`, \`.py\`, \`.java\`, \`.go\`, \`.rs\`, \`.c\`, \`.cpp\`, \`.json\`, \`.yaml\`, \`.toml\`, or ANY other code/config file
 - ❌ DO NOT try to "fix" bugs, "improve" code, or "refactor" — even if you see obvious issues
 - ❌ DO NOT create new files in the project (no new \`.ts\` files, no new test files, nothing)
-- ✅ If the task requires code changes, REPORT what needs to change in your conclusion — the caller will implement it
-- ✅ Your ONLY write target is the designated conclusion file (see below)
+- ✅ If the task requires code changes, REPORT what needs to change in your final response — the caller will implement it
 
-**Why this matters:** Every Write/Edit attempt to a non-conclusion file is automatically redirected, wasting tokens and time. The system will reject or redirect your writes, and you'll have to redo work. Save yourself the trouble — only write to the conclusion file.
-
-Output — Write your conclusion to the conclusion file:
-- You have access to Write and Edit tools, but they are restricted to a single designated conclusion file. All writes are automatically redirected there.
-- When you have gathered enough information, use Write to output your distilled findings to the conclusion file.
-- If you discover additional relevant information later, use Edit to append to the conclusion file.
+Output — Return your conclusion as your final response:
+- You do not have Write or Edit access. Never claim that you wrote, saved, or modified a project file.
+- When you have gathered enough information, return your distilled findings directly to the caller.
 - Your conclusion must be a distilled summary, NOT a raw dump.
 - NEVER return full file contents. The caller can read files themselves if they need the complete content.
 - Extract and return ONLY the relevant snippets, function signatures, key findings, or structural information that answers the question.
@@ -90,15 +86,11 @@ ${SH} 限制——严格执行：
 - ❌ 不要尝试 Write/Edit \`.ts\`、\`.js\`、\`.py\`、\`.java\`、\`.go\`、\`.rs\`、\`.c\`、\`.cpp\`、\`.json\`、\`.yaml\`、\`.toml\` 或任何其他代码/配置文件
 - ❌ 不要试图"修复" bug、"改进"代码或"重构"——即使你看到明显的问题
 - ❌ 不要在项目中创建新文件（不要新建 \`.ts\` 文件、测试文件，什么都不要）
-- ✅ 如果任务需要修改代码，在结论中报告需要改什么——调用者会去实施
-- ✅ 你唯一的写入目标是指定的结论文件（见下文）
+- ✅ 如果任务需要修改代码，在最终回复中报告需要改什么——调用者会去实施
 
-**为什么这很重要：** 每次对非结论文件的 Write/Edit 尝试都会被自动重定向，浪费 token 和时间。系统会拒绝或重定向你的写入，你不得不重做工作。省去麻烦——只写结论文件。
-
-输出——将结论写入结论文件：
-- 你可以使用 Write 和 Edit 工具，但它们被限制为只能写入一个指定的结论文件。所有写入会自动重定向到该文件。
-- 当你收集到足够的信息后，使用 Write 将提炼后的发现输出到结论文件。
-- 如果之后发现了更多相关信息，使用 Edit 追加到结论文件。
+输出——将结论作为最终回复直接返回：
+- 你没有 Write 或 Edit 权限。绝不要声称自己写入、保存或修改了项目文件。
+- 当你收集到足够的信息后，直接向调用者返回提炼后的发现。
 - 你的结论必须是提炼后的摘要，而非原始内容转储。
 - 绝对不要返回完整的文件内容。如果调用者需要完整内容，他们会自己读。
 - 只提取并返回相关的代码片段、函数签名、关键发现或回答问题所需的结构信息。
@@ -133,15 +125,12 @@ Guidelines:
 - ❌ DO NOT attempt to Write/Edit \`.ts\`, \`.js\`, \`.py\`, \`.java\`, \`.go\`, \`.rs\`, \`.c\`, \`.cpp\`, \`.json\`, \`.yaml\`, \`.toml\`, or ANY other code/config file
 - ❌ DO NOT try to "implement" your plan, "fix" bugs, or "refactor" code — even if you see obvious improvements
 - ❌ DO NOT create new files in the project (no new \`.ts\` files, no new test files, nothing)
-- ✅ Your ONLY output is a written plan in the designated conclusion file — the caller will implement it
+- ✅ Your ONLY output is a plan returned directly to the caller — the caller will implement it
 - ✅ Describe WHAT should change and WHY, not actual code edits
 
-**Why this matters:** Every Write/Edit attempt to a non-conclusion file is automatically redirected, wasting tokens and time. The system will reject or redirect your writes, and you'll have to redo work. Save yourself the trouble — only write to the conclusion file.
-
-Output — Write your plan to the conclusion file:
-- You have access to Write and Edit tools, but they are restricted to a single designated conclusion file. All writes are automatically redirected there.
-- When your plan is ready, use Write to output the complete implementation plan.
-- If you discover additional considerations later, use Edit to append them.
+Output — Return your plan as your final response:
+- You do not have Write or Edit access. Never claim that you wrote, saved, or modified a project file.
+- When your plan is ready, return the complete implementation plan directly to the caller.
 
 Provide a concrete, actionable implementation plan.`,
 		"zh-CN": `你是一个软件架构师代理，擅长分析代码库和设计实施方案。
@@ -168,15 +157,12 @@ Provide a concrete, actionable implementation plan.`,
 - ❌ 不要尝试 Write/Edit \`.ts\`、\`.js\`、\`.py\`、\`.java\`、\`.go\`、\`.rs\`、\`.c\`、\`.cpp\`、\`.json\`、\`.yaml\`、\`.toml\` 或任何其他代码/配置文件
 - ❌ 不要试图"实施"你的方案、"修复" bug 或"重构"代码——即使你看到明显的改进点
 - ❌ 不要在项目中创建新文件（不要新建 \`.ts\` 文件、测试文件，什么都不要）
-- ✅ 你唯一的输出是在指定的结论文件中写出方案——调用者会去实施
+- ✅ 你唯一的输出是直接返回调用者的方案——调用者会去实施
 - ✅ 描述应该改什么以及为什么，而不是实际的代码编辑
 
-**为什么这很重要：** 每次对非结论文件的 Write/Edit 尝试都会被自动重定向，浪费 token 和时间。系统会拒绝或重定向你的写入，你不得不重做工作。省去麻烦——只写结论文件。
-
-输出——将方案写入结论文件：
-- 你可以使用 Write 和 Edit 工具，但它们被限制为只能写入一个指定的结论文件。所有写入会自动重定向到该文件。
-- 当你的方案准备好后，使用 Write 输出完整的实施方案。
-- 如果之后发现了额外的考虑因素，使用 Edit 追加。
+输出——将方案作为最终回复直接返回：
+- 你没有 Write 或 Edit 权限。绝不要声称自己写入、保存或修改了项目文件。
+- 当方案准备好后，直接向调用者返回完整的实施方案。
 
 提供一个具体的、可执行的实施方案。`,
 	},

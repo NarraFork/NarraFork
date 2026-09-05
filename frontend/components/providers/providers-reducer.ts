@@ -342,15 +342,12 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				oauthClientSecret: p.oauthClientSecret,
 				oauthDeviceId: p.oauthDeviceId,
 				proxy: p.proxy,
-				// This mapping is a whitelist, so a field omitted here is silently
-				// dropped when settings are loaded back — the control renders from the
-				// default and looks like the save failed.
 			}));
 
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			const agent: any = s.agent ?? {};
 			// Legacy migration: convert old-format hidden model names (without provider prefix)
-			// Safe to remove once all users have migrated to v0.2.0+ (when prefix format was introduced).
+			// to new prefixed format. Bare claude names resolve to the Anthropic provider.
 			const hidden = (agent.hiddenModels ?? []).map((v: string) => {
 				if (!v || v.includes(":")) return v;
 				if (
@@ -358,6 +355,10 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 						v,
 					)
 				)
+					return `anthropic:${v}`;
+				if (v === "claude-haiku") return "anthropic:claude-haiku-4.5";
+				if (v === "claude-sonnet") return "anthropic:claude-sonnet-4.5";
+				if (v === "claude-opus") return "anthropic:claude-opus-4.6";
 				return `openai:${v}`;
 			});
 

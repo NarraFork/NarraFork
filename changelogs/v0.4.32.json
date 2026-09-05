@@ -1,4 +1,6 @@
 {
 	"version": "0.4.32",
 	"date": "2026-06-27",
+	"en": "## New Features\n\n- Leaked tool-call diagnostics for gateway providers: tool calls extracted from leaked XML in the model's stream are now marked on the tool card, and when streaming capture fails a dialog lets you download the raw request/response SSE data (narrator-scoped, no admin required) to help debug.\n\n## Bug Fixes\n\n- Added a stateless safety net that recovers a complete leaked `<invoke>` block from the finished response text when streaming capture misses it, so the tool still executes instead of leaking as visible text.\n- Classified OpenAI 400 \"input token count exceeds the maximum\" errors as context-overflow so they trigger the correct recovery path instead of surfacing as a hard error.",
+	"zh-CN": "## 新功能\n\n- 网关提供商泄漏工具调用可观测性：从模型流式 XML 中提取的工具调用会在工具卡片上标注来源；当流式捕获失败时弹窗提示，并支持下载该次请求/回复的原始 SSE 数据（叙述者级权限，无需管理员）以便排查。\n\n## 修复\n\n- 新增无状态安全网：当流式捕获遗漏时，从完整回复文本中恢复完整的泄漏 `<invoke>` 块，保证工具仍被执行，而不是作为可见文本泄漏。\n- 将 OpenAI 400「输入 token 数超过上限」错误归类为上下文溢出，使其走正确的恢复流程，而不是直接报致命错误。"
 }

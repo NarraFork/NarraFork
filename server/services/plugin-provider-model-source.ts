@@ -8,6 +8,7 @@
  * - the settings API response, which the frontend model picker groups per provider.
  *
  * Rather than add an eighth hardcoded `registerXxxModelLister`, this registers one
+ * generic source backed by the provider registry. Any plugin provider
  * included, once it moves out — appears through the same path.
  *
  * Reads are synchronous and in-memory: the registry already holds the catalog that

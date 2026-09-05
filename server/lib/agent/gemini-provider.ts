@@ -1,3 +1,4 @@
+import { outputToText } from "@shared/agent-protocol/tool-output";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";

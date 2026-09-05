@@ -196,6 +196,33 @@ export type NarratorServerMessage =
 	  }
 	| {
 			/**
+			 * An asynchronous AskUserQuestion changed state (`narrator_questions`).
+			 *
+			 * One event for every transition rather than one per verb: the client keeps a
+			 * `Map<id, question>` and every change is either an upsert (`opened`) or a
+			 * removal from the open set, so a single carrier with the full row is all the
+			 * client needs to stay consistent — including after a missed event, because
+			 * the row is complete rather than a delta.
+			 *
+			 * Deliberately NOT a `permission_request`: an async question does not suspend
+			 * the loop, does not set the narrator to `waiting`, and must therefore not
+			 * reach the code paths that assume both (attention notifications, the composer
+			 * send gate, the Enter-key binding).
+			 */
+			type: "async_question_changed";
+			narratorId: string;
+			/**
+			 * `awaited` / `await_ended` are WAIT transitions, not status changes: the
+			 * question stays `open` while an agent blocks on it via `Await`, but it stops
+			 * being the "answer whenever convenient" kind — see `awaitAsyncQuestion`.
+			 */
+			change: "opened" | "answered" | "dismissed" | "withdrawn" | "awaited" | "await_ended";
+			question: unknown;
+			/** True while at least one `Await` call is blocked on this question. */
+			awaited?: boolean;
+	  }
+	| {
+			/**
 			 * Live two-phase progress for a RUNNING reflection gate (danger / plan /
 			 * task / question). Purely transient — like `compact_progress` it is never
 			 * persisted, because writing `narratorToolCalls` every throttle window
@@ -440,6 +467,15 @@ export type NarratorServerMessage =
 			outputChars: number;
 			isSegment?: boolean;
 			mode?: "blocking" | "background";
+			/**
+			 * 1-based ordinal of the retry now in flight, present only on the
+			 * immediate broadcast emitted when a failed summary attempt is
+			 * scheduled for retry. Absent (or 0 on the client) means "not
+			 * retrying" — regular throttled ticks never carry it.
+			 */
+			retryCount?: number;
+			/** Message of the error that triggered the retry (paired with retryCount). */
+			retryError?: string;
 	  }
 	| {
 			type: "compact_done";
@@ -461,6 +497,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			messageId: string;
 			mode?: "blocking" | "background";
+			/** Why the compact failed (also persisted on the failed marker message). */
+			error?: string;
 			/** COW compact retry replacement identity, when this is a retry. */
 			oldMessageId?: string;
 			replacedMessageId?: string;
@@ -719,6 +757,7 @@ export type NarratorServerMessage =
 	  }
 	| {
 			/**
+			 * Non-persisted diagnostic for leaked XML tool calls. The frontend
 			 * uses it to mark stream-captured tool calls and to prompt downloading the raw SSE
 			 * dump when capture failed. `apiRequestId` points at the persisted api_requests row
 			 * for the leaked-tool-dump download endpoint.

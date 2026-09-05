@@ -9,6 +9,7 @@
  * itself is deleted (archiving deliberately keeps it).
  *
  * Costs are USD at the vendors' official reference prices. For subscription
+ * access (Codex on a ChatGPT plan) that is an equivalent-
  * consumption figure, not an amount actually billed — `unpricedRequestCount`
  * records how many requests had no known price so the UI can qualify the total
  * instead of silently undercounting.

@@ -117,6 +117,11 @@ export interface AdapterContentBlock {
 	progressPhase?: ProgressPhase | null;
 	/** compact / segment_compact: live thinking-channel char count. */
 	thinkingChars?: number | null;
+	/**
+	 * compact / segment_compact: 1-based ordinal of the summary retry now in
+	 * flight (transient, patched by applyCompactProgress; absent = not retrying).
+	 */
+	retryCount?: number | null;
 	/** segment_compact: number of messages folded into the segment summary. */
 	messageCount?: number | null;
 	/** assistant text: source citations indexed against `text`. */
@@ -247,6 +252,18 @@ export interface AdapterToolItem {
 function resolveTakenOver(item: AdapterToolItem): boolean {
 	if (isTerminalStatus(item.tc.status)) return false;
 	return item.tc._takenOver === true || item.tc._subagentActivity?.takenOver === true;
+}
+
+/**
+ * {@link resolveTakenOver}, exported so the live-patch tests can assert what the
+ * card actually PAINTS rather than restating the OR.
+ *
+ * That distinction is the bug this guards: a release that writes only
+ * `_takenOver: false` passes any field-level assertion while this function still
+ * returns true, because the activity summary's copy of the flag is untouched.
+ */
+export function resolveToolItemTakenOver(item: AdapterToolItem): boolean {
+	return resolveTakenOver(item);
 }
 
 /**
@@ -1503,6 +1520,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	originSourceGateway: "IM gateway",
 	originSourceOauth: "External app",
 	originSourceRecovery: "Session recovery",
+	originSourceAgentMessage: "Agent message",
 	// Slash-command bubble fold control (a measured text row inside the bubble).
 	showExpandedPrompt: "Show expanded prompt",
 	hideExpandedPrompt: "Hide expanded prompt",
@@ -1533,6 +1551,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	compactOutputChars: "{count} chars",
 	compactThinking: "thinking",
 	compactThinkingChars: "{count} chars",
+	compactRetrying: "retry #{count}",
 	segmentCompacting: "Segment compacting…",
 	segmentCompacted: "Segment compacted ({count} messages)",
 	subagentRecoveryTitle: "Subagents stopped with an error",
@@ -1631,6 +1650,11 @@ const ORIGIN_SOURCE_LABEL_KEYS: Record<string, string> = {
 	gateway: "originSourceGateway",
 	oauth: "originSourceOauth",
 	recovery: "originSourceRecovery",
+	// A parent narrator or sibling subagent addressed this session through `Send`.
+	// The label's DETAIL carries the sender's name, which `originHeadingLabel`
+	// appends, so the heading reads "Agent message · explore-1" rather than naming
+	// the human whose session triggered the send.
+	agentMessage: "originSourceAgentMessage",
 };
 
 /**
@@ -1855,9 +1879,21 @@ function composeCompactText(
 		thinkingChars?: number | null;
 		outputChars?: number | null;
 		messageCount?: number | null;
+		retryCount?: number | null;
 	},
 ): string {
 	if (opts.status === "compacting") {
+		// A scheduled retry is the ONE thing a 0-char run must say: without it the
+		// marker sits on "0 chars" for minutes while the summary model fails and
+		// backs off, and the reader cannot tell a stall from a recovery.
+		if (typeof opts.retryCount === "number" && opts.retryCount > 0) {
+			const label = sysLabel(ctx, opts.isSegment ? "segmentCompacting" : "compacting");
+			const retryLabel = sysLabel(ctx, "compactRetrying").replace(
+				/\{count\}/g,
+				String(opts.retryCount),
+			);
+			return `${label} · ${retryLabel}`;
+		}
 		// Thinking phase: the summary model has not produced visible output yet, so
 		// feature the thinking count instead of a stuck "0 chars". A count below the
 		// display threshold shows the bare label (see `@shared/progress-phase`).
@@ -1903,16 +1939,19 @@ function compactProgressOpts(
 	outputChars?: number | null,
 	phase?: ProgressPhase | null,
 	thinkingChars?: number | null,
+	retryCount?: number | null,
 ): { opts?: Record<string, unknown> } {
 	if (status !== "compacting") return {};
 	// The phase and the thinking count belong in the digest for the same reason
 	// the output count does: they change the composed label while the height (a
-	// single clamped line) never moves.
+	// single clamped line) never moves. `retry` too: entering/leaving a retry
+	// swaps the whole label text.
 	return {
 		opts: {
 			progress: typeof outputChars === "number" ? outputChars : 0,
 			phase: phase === "thinking" ? "thinking" : "output",
 			thinking: typeof thinkingChars === "number" ? thinkingChars : 0,
+			retry: typeof retryCount === "number" ? retryCount : 0,
 		},
 	};
 }
@@ -2588,6 +2627,7 @@ function adaptSystemBlock(
 					thinkingChars: block.thinkingChars,
 					outputChars: block.outputChars,
 					messageCount: block.messageCount,
+					retryCount: block.retryCount,
 				}),
 				status: segStatus,
 				...(typeof block.outputChars === "number" ? { outputChars: block.outputChars } : {}),
@@ -2597,6 +2637,7 @@ function adaptSystemBlock(
 				block.outputChars,
 				block.progressPhase,
 				block.thinkingChars,
+				block.retryCount,
 			),
 		};
 	}
@@ -2612,6 +2653,7 @@ function adaptSystemBlock(
 						block.outputChars,
 						block.progressPhase,
 						block.thinkingChars,
+						block.retryCount,
 					)
 				: {}),
 		};
@@ -2657,6 +2699,7 @@ function adaptSystemSimpleData(
 					phase: block.progressPhase,
 					thinkingChars: block.thinkingChars,
 					outputChars: block.outputChars,
+					retryCount: block.retryCount,
 				}),
 				status: compactStatus,
 				...(typeof block.outputChars === "number" ? { outputChars: block.outputChars } : {}),

@@ -956,6 +956,7 @@ const docs: LearningDocSource[] = [
 	{
 		id: "providers-models-and-quotas",
 		category: "admin",
+		tags: ["providers", "models", "anthropic", "openai", "codex", "nug", "gemini", "quota"],
 		title: { en: "Providers, models, and quotas", "zh-CN": "提供商、模型与额度" },
 		summary: {
 			en: "Configure AI providers, select models, manage credentials, and monitor usage so narrator work is reliable and cost-aware.",

@@ -104,6 +104,7 @@ export const usageHistoryApi = {
 	 * 按凭据聚合的终生 token/成本累计。
 	 *
 	 * 数据来自 credential_usage_totals，不随叙述者删除而消失。注意该表只覆盖
+	 * 有凭据管理的 provider（如 codex）；Anthropic/OpenAI 直连没有 credentialId，
 	 * 不在此表内，因此这里的数字不是整个部署的总账。
 	 */
 	async getCredentialTotals(

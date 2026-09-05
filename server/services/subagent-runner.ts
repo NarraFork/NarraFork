@@ -62,8 +62,8 @@ import { resumeManualOverride, waitForManualOverride } from "./subagent-manual-o
 import {
 	beginSubagentInterruptSuspension,
 	clearTakenOver,
+	consumePendingBackgroundFinalize,
 	consumePendingStopTakeover,
-	consumePendingTakeover,
 	isBackgroundTakenOver,
 	isTakenOver,
 } from "./subagent-takeover";
@@ -851,17 +851,29 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 
 		if (await isBackgroundTaskCancelled(narratorId)) return;
 
-		// Background takeover: the loop was interrupted by a user takeover. Do not
+		// Background takeover: the user claimed this task's result. Do NOT
 		// finalize/notify as completed/failed — transition to the idle takeover
 		// state so the user can operate the subagent directly.
+		//
+		// Reached whether the turn ended normally or was aborted: taking over does
+		// not stop the turn, so the ordinary arrival here is a run that finished on
+		// its own while the hold was already recorded.
 		if (isBackgroundTakenOver(narratorId)) {
-			await transitionBackgroundTakenOverToIdle(
-				narratorId,
-				parentNarratorId,
-				toolUseId,
-				backgroundAbortController,
-			);
-			return;
+			// Unless the user already let go while this turn was running. Since taking
+			// over no longer stops the turn, that is an ordinary sequence (take over →
+			// watch it finish → release), and parking the subagent instead would strand
+			// the parent's Await forever with no badge left on screen to release it.
+			if (consumePendingBackgroundFinalize(narratorId)) {
+				clearTakenOver(narratorId);
+			} else {
+				await transitionBackgroundTakenOverToIdle(
+					narratorId,
+					parentNarratorId,
+					toolUseId,
+					backgroundAbortController,
+				);
+				return;
+			}
 		}
 
 		// Finalize the subagent narrator status
@@ -887,15 +899,20 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 	} catch (err) {
 		if (await isBackgroundTaskCancelled(narratorId)) return;
 
-		// Background takeover during execution — same as above.
+		// Background takeover during execution — same as above, including the
+		// already-released case.
 		if (isBackgroundTakenOver(narratorId)) {
-			await transitionBackgroundTakenOverToIdle(
-				narratorId,
-				parentNarratorId,
-				toolUseId,
-				backgroundAbortController,
-			);
-			return;
+			if (consumePendingBackgroundFinalize(narratorId)) {
+				clearTakenOver(narratorId);
+			} else {
+				await transitionBackgroundTakenOverToIdle(
+					narratorId,
+					parentNarratorId,
+					toolUseId,
+					backgroundAbortController,
+				);
+				return;
+			}
 		}
 
 		const caughtError = err instanceof Error ? err.message : String(err);
@@ -1443,25 +1460,18 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 				if (!hasError && fgAbort.signal.aborted && !signal.aborted) {
 					// --- Suspend: block until the user resolves (Update Conclusion)
 					// or, for an explicit takeover, until the user stops takeover. ---
-					// If this interrupt was triggered by a takeover request, mark the
-					// subagent taken over and use the taken_over substatus so the
-					// parent tool call stays running ("user is operating") instead of
-					// showing a plain manual_override suspension.
-					// One call, because the marker read here is destructive: it covers the
-					// interrupt that STARTS a takeover, and every later interrupt within
-					// one — the user stopping a turn they are driving themselves. Both must
-					// suspend as `taken_over`, or the second Stop of a takeover downgrades
-					// it to a plain `manual_override`, the takeover UI vanishes, and the
-					// parent stays blocked with no visible way to release it.
+					// An interrupt arriving inside a takeover is the user stopping a turn
+					// they are driving themselves, so it must suspend as `taken_over`; a
+					// plain `manual_override` here would make the takeover UI vanish while
+					// the hold is still in force, leaving the parent blocked with no
+					// visible way to release it.
 					const { heldByTakeover } = beginSubagentInterruptSuspension(subagentId);
 
-					// The user may have already clicked "Stop takeover" during the
-					// brief window between the takeover interrupt firing and the loop
-					// reaching this suspension branch (the "settling" window). The
-					// stop-takeover route records a pending marker instead of failing.
-					// Consume it here: skip the manual-override wait entirely and let
-					// the finalizer hand the current turn's result straight back to the
-					// blocked parent. clearTakenOver must run before finalizeSubagent so
+					// The user may have clicked "Stop takeover" while this turn was still
+					// running; the route records a pending marker rather than failing.
+					// Consume it here: skip the manual-override wait entirely and let the
+					// finalizer hand this turn's result straight back to the blocked
+					// parent. clearTakenOver must run before finalizeSubagent so
 					// preserveTakenOverSubstatus does not re-inject the taken_over tag.
 					if (heldByTakeover && consumePendingStopTakeover(subagentId)) {
 						clearTakenOver(subagentId);
@@ -1482,9 +1492,12 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 						hasError = false;
 					}
 				} else if (isTakenOver(subagentId) && !hasError && !signal.aborted) {
-					// A takeover may span multiple normal turns. Keep the original
-					// foreground runner alive and wait for another user command instead
-					// of switching to the generic narrator-session engine.
+					// A turn that ENDED NORMALLY while the subagent is taken over. This is
+					// the ordinary entry into the hold — taking over does not stop the turn,
+					// so the very first hold of a takeover arrives here, as does every later
+					// turn the user drives to completion themselves. Keep this foreground
+					// runner alive and wait for the next user command instead of handing the
+					// result to the parent or switching to the generic session engine.
 					if (consumePendingStopTakeover(subagentId)) {
 						clearTakenOver(subagentId);
 						break;
@@ -1495,8 +1508,10 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 						markTimedOut();
 					}
 					clearTakenOver(subagentId);
-				} else if (consumePendingTakeover(subagentId) || isTakenOver(subagentId)) {
-					// A takeover request that ends in an error cannot remain suspended.
+				} else if (isTakenOver(subagentId)) {
+					// Taken over, but this turn ended in an error or a parent abort: there is
+					// nothing left to hold, so release the takeover rather than parking the
+					// subagent in a state the user cannot act on.
 					clearTakenOver(subagentId);
 				}
 				break;

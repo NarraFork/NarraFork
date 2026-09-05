@@ -143,10 +143,6 @@ export function getConfiguredFallbackModels(
 	for (const provider of (settings.nugProviders ?? []) as Array<Record<string, unknown>>) {
 		registerProvider(provider, "nug", "apiKey", true);
 	}
-	for (const provider of (settings.clineProviders ?? []) as Array<Record<string, unknown>>) {
-		registerProvider(provider, "cline", "accessToken", true);
-	}
-	}
 	if (settings.codexAvailable && !disabledPrefixes.has("codex")) {
 		configuredPrefixes.set("codex", { name: "Codex", type: "codex" });
 	}
@@ -171,6 +167,7 @@ export function getConfiguredFallbackModels(
 /**
  * Central hook that builds the full model list from settings.
  * Replaces duplicated model-building logic across NarratorPanel,
+ * sessions/index and settings pages.
  */
 export function useAllModels() {
 	const qc = useQueryClient();
@@ -215,23 +212,10 @@ export function useAllModels() {
 		collectDisabledProviderPrefixes(settingsData?.openaiProviders);
 		collectDisabledProviderPrefixes(settingsData?.anthropicProviders);
 		collectDisabledProviderPrefixes(settingsData?.nugProviders);
-		collectDisabledProviderPrefixes(settingsData?.clineProviders);
 		collectDisabledProviderPrefixes(settingsData?.geminiProviders);
 		// Agent mode is supported for every provider: the capability that used to gate this
 		// had no signal behind it and always resolved to supported.
 		const providerAgentModeSupported = (_provider: ProviderCapabilityKey) => true;
-
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-					.map((m: any) => {
-						const id = String(m.model_id ?? m.modelId ?? "");
-						return {
-							label: String(
-								m.model_short_name ?? m.modelShortName ?? m.model_name ?? m.modelName ?? id,
-							),
-							rateMultiplier: m.rate_multiplier ?? m.rateMultiplier,
-						};
-					})
-			: [];
 
 		// --- OpenAI-compatible models (per-provider) ---
 		const openaiModelsGrouped: Array<{
@@ -316,37 +300,6 @@ export function useAllModels() {
 				fetchedAnthropicModels.push(opt);
 			}
 			anthropicByProvider.push({ prefix, name, models, agentProviderType: "anthropic" });
-		}
-
-		// --- Cline models (per-provider, OpenRouter-based) ---
-		const clineModelsGrouped: Array<{
-			providerId: string;
-			providerName: string;
-			models: Array<{ id: string; name?: string }>;
-		}> = settingsData?.clineModelsGrouped ?? [];
-
-		const serverClineProviders: Array<{ id: string; prefix?: string; name?: string }> =
-			settingsData?.clineProviders ?? [];
-
-		const fetchedClineModels: ModelOption[] = [];
-		const clineByProvider: ProviderModels[] = [];
-
-		for (const group of clineModelsGrouped) {
-			const cfg = serverClineProviders.find((p) => p.id === group.providerId);
-			const prefix = cfg?.prefix ?? "cline";
-			const name = group.providerName || cfg?.name || prefix;
-			providerLabels[prefix] = name;
-			const models: ModelOption[] = [];
-			for (const m of group.models) {
-				const opt: ModelOption = {
-					value: `${prefix}:${m.id}`,
-					label: m.name || m.id,
-					provider: prefix,
-				};
-				models.push(opt);
-				fetchedClineModels.push(opt);
-			}
-			clineByProvider.push({ prefix, name, models, agentProviderType: "cline" });
 		}
 
 		// --- Gemini models (per-provider, native Google API) ---
@@ -573,8 +526,6 @@ export function useAllModels() {
 			addGroup(group.prefix, group.models, group.agentProviderType);
 		for (const group of anthropicByProvider)
 			addGroup(group.prefix, group.models, group.agentProviderType);
-		for (const group of clineByProvider)
-			addGroup(group.prefix, group.models, group.agentProviderType);
 		for (const group of geminiByProvider)
 			addGroup(group.prefix, group.models, group.agentProviderType);
 		for (const group of nugByProvider)
@@ -751,8 +702,6 @@ export function useAllModels() {
 			openaiByProvider,
 			/** Anthropic models grouped by provider. */
 			anthropicByProvider,
-			/** Cline models grouped by provider. */
-			clineByProvider,
 			/** Gemini models grouped by provider. */
 			geminiByProvider,
 			/** NUG models grouped by provider. */

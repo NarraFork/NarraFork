@@ -280,8 +280,10 @@ import {
 	injectUserBubbleIsSelf,
 } from "./vlist-user-bubble-header";
 import {
+	collectVListCompactMarkers,
 	collectVListUserMarkers,
 	resolveVListUserMarkerScrollTop,
+	type VListCompactMarker,
 	type VListUserMarker,
 } from "./vlist-user-markers";
 import { mergePinnedRowIndices, resolvePinnedRowIndices } from "./vlist-virtualization";
@@ -3741,6 +3743,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			renderItems,
 			permCb,
 			reflections: reflectionIndex,
+			asyncQuestions: permCb?.asyncQuestions,
 		});
 
 		// Keys that currently host a dynamic (post-paint measured) body — rows carrying
@@ -5244,6 +5247,12 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			() => collectVListUserMarkers(renderItems, exactLayout?.items ?? [], scrollableHeight),
 			[renderItems, exactLayout?.items, scrollableHeight],
 		);
+		// Compact indicators ride the same track: a failed compact stays visible
+		// (red) even when the reader has scrolled far away from the marker row.
+		const compactMarkers = useMemo(
+			() => collectVListCompactMarkers(renderItems, exactLayout?.items ?? [], scrollableHeight),
+			[renderItems, exactLayout?.items, scrollableHeight],
+		);
 		const handleUserMarkerJump = useCallback(
 			(marker: VListUserMarker) => {
 				// A jump is an explicit reading action: unpin so streaming output cannot
@@ -5255,9 +5264,26 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			},
 			[getSmoothFollower, writeScrollTop],
 		);
+		const handleCompactMarkerJump = useCallback(
+			(marker: VListCompactMarker) => {
+				getSmoothFollower().cancel();
+				pinnedToBottomRef.current = false;
+				setPinnedToBottom(false);
+				writeScrollTop(resolveVListUserMarkerScrollTop(marker.top, VLIST_USER_MARKER_JUMP_LEAD));
+			},
+			[getSmoothFollower, writeScrollTop],
+		);
 		const resolveUserMarkerLabel = useCallback(
 			(ordinal: number) =>
 				t("jumpToUserMessage", { ordinal, defaultValue: `Jump to message #${ordinal}` }),
+			[t],
+		);
+		const resolveCompactMarkerLabel = useCallback(
+			(marker: VListCompactMarker) =>
+				t("jumpToCompactMarker", {
+					status: marker.tooltip,
+					defaultValue: "Jump to compact marker",
+				}),
 			[t],
 		);
 
@@ -6084,11 +6110,14 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			    BEFORE the canvas so its marks paint above the rows. */}
 				<VListUserMarkers
 					markers={userMarkers}
+					compactMarkers={compactMarkers}
 					documentHeight={scrollableHeight}
 					trackHeight={viewportHeight}
 					onJump={handleUserMarkerJump}
+					onJumpCompact={handleCompactMarkerJump}
 					viewportRef={viewportRef}
 					resolveLabel={resolveUserMarkerLabel}
+					resolveCompactLabel={resolveCompactMarkerLabel}
 				/>
 				{/* Full width on purpose: each row centers its own `contentWidth` column
 			    instead of relying on a narrow, centered parent. A centered parent

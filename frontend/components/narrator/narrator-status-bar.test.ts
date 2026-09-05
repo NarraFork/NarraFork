@@ -15,6 +15,7 @@ const WORK_INDICATOR_FLAGS = [
 	"hasSpecTask",
 	"isWaiting",
 	"isPlanning",
+	"hasCompactFailure",
 ] as const satisfies readonly (keyof WorkIndicatorInput)[];
 
 function workIndicatorInput(overrides: Partial<WorkIndicatorInput> = {}): WorkIndicatorInput {
@@ -26,11 +27,12 @@ function workIndicatorInput(overrides: Partial<WorkIndicatorInput> = {}): WorkIn
 		hasSpecTask: false,
 		isWaiting: false,
 		isPlanning: false,
+		hasCompactFailure: false,
 		...overrides,
 	};
 }
 
-/** Every combination of the seven booleans (2^7 = 128). */
+/** Every combination of the eight booleans (2^8 = 256). */
 function allWorkIndicatorInputs(): WorkIndicatorInput[] {
 	const inputs: WorkIndicatorInput[] = [];
 	for (let mask = 0; mask < 1 << WORK_INDICATOR_FLAGS.length; mask++) {
@@ -49,7 +51,11 @@ describe("planNarratorWorkIndicator", () => {
 		// so appending the short suffix repeated both the phrase and the progress
 		// fragment ("… · 256 chars · background compact · 256 chars").
 		expect(planNarratorWorkIndicator(workIndicatorInput({ isBackgroundCompacting: true }))).toEqual(
-			{ primary: "background_compact", showBackgroundCompactSuffix: false },
+			{
+				primary: "background_compact",
+				showBackgroundCompactSuffix: false,
+				showCompactFailureSuffix: false,
+			},
 		);
 	});
 
@@ -60,7 +66,11 @@ describe("planNarratorWorkIndicator", () => {
 			planNarratorWorkIndicator(
 				workIndicatorInput({ isBackgroundCompacting: true, hasSpecTask: true }),
 			),
-		).toEqual({ primary: "spec_task", showBackgroundCompactSuffix: true });
+		).toEqual({
+			primary: "spec_task",
+			showBackgroundCompactSuffix: true,
+			showCompactFailureSuffix: false,
+		});
 	});
 
 	test("blocking compaction owns the row and never gets a second compact line", () => {
@@ -68,7 +78,41 @@ describe("planNarratorWorkIndicator", () => {
 			planNarratorWorkIndicator(
 				workIndicatorInput({ isBlockingCompacting: true, isBackgroundCompacting: true }),
 			),
-		).toEqual({ primary: "blocking_compact", showBackgroundCompactSuffix: false });
+		).toEqual({
+			primary: "blocking_compact",
+			showBackgroundCompactSuffix: false,
+			showCompactFailureSuffix: false,
+		});
+	});
+
+	test("a compact failure gets the failure suffix regardless of the primary slot", () => {
+		expect(planNarratorWorkIndicator(workIndicatorInput({ hasCompactFailure: true }))).toEqual({
+			primary: "thinking",
+			showBackgroundCompactSuffix: false,
+			showCompactFailureSuffix: true,
+		});
+		expect(
+			planNarratorWorkIndicator(workIndicatorInput({ hasCompactFailure: true, hasSpecTask: true })),
+		).toEqual({
+			primary: "spec_task",
+			showBackgroundCompactSuffix: false,
+			showCompactFailureSuffix: true,
+		});
+	});
+
+	test("the failure suffix never sits next to a live compact", () => {
+		// The state machine clears the failure the moment a new compact starts, so
+		// these inputs "cannot happen" — the plan still refuses the combination, as
+		// a backstop against a future caller that wires the flag differently.
+		for (const input of allWorkIndicatorInputs()) {
+			const plan = planNarratorWorkIndicator(input);
+			if (input.isBlockingCompacting || input.isBackgroundCompacting) {
+				expect(plan.showCompactFailureSuffix).toBe(false);
+			}
+			if (plan.showCompactFailureSuffix) {
+				expect(input.hasCompactFailure).toBe(true);
+			}
+		}
 	});
 
 	test("background compaction is never announced twice in one row", () => {

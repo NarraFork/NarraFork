@@ -14,6 +14,7 @@ import type {
 	TreeMessage,
 } from "../../lib/api";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "../../lib/responsive";
+import type { Question } from "./ask-user-question-utils";
 
 // Inject highlight blink animation
 if (typeof document !== "undefined") {
@@ -65,6 +66,29 @@ import type { PendingPermission } from "@frontend/types/narrator";
 
 export type { PendingPermission } from "@frontend/types/narrator";
 
+/**
+ * Everything needed to mount an answer form for ONE open asynchronous question.
+ *
+ * A prepared slot rather than the raw record: the mounting layer (the vlist bridge)
+ * must not know how an answer is submitted, and the owner of the mutations
+ * (NarratorPanel) already does. This also keeps the banner's required `Question` shape
+ * conversion in one place.
+ */
+export interface AsyncQuestionSlot {
+	id: string;
+	/** Local draft identity; distinct from the async API record id. */
+	draftId?: string;
+	questions: Question[];
+	busy?: boolean;
+	denyLabel?: string;
+	/** The agent is blocked on this question via `Await` — render it as urgent. */
+	awaited?: boolean;
+	/** Copy for the awaited notice, resolved by the owner (the bridge has no i18n). */
+	awaitedLabel?: string;
+	onSubmit: (questionId: string, answers: Record<string, string>) => void;
+	onDismiss: (questionId: string) => void;
+}
+
 export interface PermissionCallbacks {
 	pendingPermission: PendingPermission | null;
 	/** Complete concurrent permission list, including multiple requests under one parent subagent. */
@@ -79,6 +103,18 @@ export interface PermissionCallbacks {
 	onQuestionSubmit: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionReflect: (requestId: string) => Promise<void> | void;
 	onQuestionDeny: (requestId: string) => void;
+	/** Release the blocked loop and move the question to the async inbox. */
+	onQuestionDefer?: (requestId: string) => Promise<void> | void;
+	/**
+	 * Open ASYNCHRONOUS questions, keyed by the tool_use id that asked them.
+	 *
+	 * Carried alongside the pending permissions rather than as a separate prop because
+	 * consumers need both to decide what a row's interaction area hosts, and a second
+	 * channel would let the two arrive out of step. It stays a DISTINCT field, though:
+	 * everything that means "the session is blocked" reads `pendingPermissions`, and an
+	 * async question must never register there.
+	 */
+	asyncQuestions?: ReadonlyMap<string, AsyncQuestionSlot>;
 }
 
 export interface NarratorPanelSnapshot {

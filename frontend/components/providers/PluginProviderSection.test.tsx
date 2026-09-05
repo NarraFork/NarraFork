@@ -182,7 +182,7 @@ function connectionConfigView(overrides: Record<string, unknown> = {}) {
 				enabledModels: { type: "string", writeOnly: true, "x-narrafork-secret": true },
 			},
 		},
-		config: { baseUrl: "https://api.cline.bot/api/v1" },
+		config: { baseUrl: "https://api.example.test/api/v1" },
 		secretFields: ["credentials", "enabledModels"],
 		secretsSet: ["credentials", "enabledModels"],
 		...overrides,

@@ -1,26 +1,17 @@
-import type {
 import { resolveProxyForUrl } from "../net/proxy";
 import {
-	dropNugCachedCapability,
 	getNugCachedModelHash,
-	nugSupportsCapability,
 	type ResolvedNugModelMeta,
 	resolveNugModelMeta,
 	setNugCachedCapabilities,
 } from "../nug-model-cache";
 import { applyNugModelCatalogUpdate } from "../nug-model-sync";
-import { getToolMessage, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
 import type { NUGProviderConfig } from "../settings";
-import { settings } from "../settings";
-import type { UsageData } from "../usage-tracking";
+
 import { AnthropicProvider } from "./anthropic-provider";
-import { CodexRebuildHistoryRetryError } from "./codex-errors";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
-import { normalizeApiRequestDiagnostics, parseErrorDiagnostics } from "./error-diagnostics";
-import {
-	extractImageFileName,
-	parseSSEStream,
+
 import { buildNugDelegateBaseConfig } from "./nug-delegate-config";
 import {
 	BoundedConfirmedRefSet,
@@ -42,9 +33,7 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
-import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
-import { resolveModel } from "./resolve-model";
-import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
+
 import {
 	type AgentToolUse,
 	ApiError,
@@ -55,45 +44,6 @@ import {
 /** Create an API error with bounded diagnostics for retry detection and persistence. */
 function httpError(message: string, status: number, diagnostics?: ApiRequestDiagnostics): Error {
 	return new ApiError(status, message, diagnostics);
-}
-
-function nugResponseDiagnostics(
-	response: Response,
-	bodyText: string,
-	defaults: Partial<ApiRequestDiagnostics> = {},
-): ApiRequestDiagnostics | undefined {
-	let payload: Record<string, unknown> = {};
-	try {
-		const parsed = JSON.parse(bodyText);
-		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-			payload = parsed as Record<string, unknown>;
-		}
-	} catch {
-		// Non-JSON upstream bodies are retained only as a bounded snippet below.
-	}
-	const parsed = parseErrorDiagnostics(payload, {
-		source: "gateway",
-		phase: "http_response",
-		statusCode: response.status,
-		requestId: response.headers.get("x-request-id") ?? undefined,
-		responseHeaders: sanitizeHeaders(response.headers),
-		responseSnippet: bodyText,
-		transport: "http",
-		...defaults,
-	});
-	return (
-		parsed ??
-		normalizeApiRequestDiagnostics({
-			source: "gateway",
-			phase: "http_response",
-			statusCode: response.status,
-			requestId: response.headers.get("x-request-id") ?? undefined,
-			responseHeaders: sanitizeHeaders(response.headers),
-			responseSnippet: bodyText,
-			transport: "http",
-			...defaults,
-		})
-	);
 }
 
 /**
@@ -113,19 +63,6 @@ function confirmedRefSetFor(key: string): ConfirmedRefSet {
 		confirmedImageRefsByGateway.set(key, set);
 	}
 	return set;
-}
-
-function toUsageData(usage: ParsedStreamEvent["usage"]): UsageData | undefined {
-	if (!usage) return undefined;
-	return {
-		inputTokens: usage.inputTokens ?? usage.promptTokens ?? 0,
-		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
-		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
-		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
-		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
-		reasoningTokens: usage.reasoningTokens ?? 0,
-	};
 }
 
 export interface NugUsageEvent {
@@ -209,12 +146,6 @@ export interface NugBillingOrderResponse {
 	pollIntervalMs?: number;
 }
 
-/**
- *
- * Must match the string the gateway publishes in `/v1/models`. The two sides have
- * request down the legacy path — which still works, and is therefore invisible.
- */
-
 const NUG_MODEL_HASH_HEADER = "X-NUG-Model-Hash";
 const NUG_UNKNOWN_MODEL_HASH = "none";
 const MAX_CONFIRMED_IMAGE_REFS_PER_GATEWAY = 4096;
@@ -222,8 +153,9 @@ const MAX_CONFIRMED_IMAGE_REFS_PER_GATEWAY = 4096;
 /**
  * NUG (Narrafork Unified Gateway) provider adapter.
  *
- * unified /v1/chat endpoint or channel-specific endpoints.
- *
+ * Communicates with a remote NUG service. For each supported channel type
+ * (anthropic, openai, codex, responses), creates a typed delegate that handles
+ * request building, history formatting, and SSE parsing.
  */
 export class NugProvider implements ProviderAdapter {
 	private config: NUGProviderConfig;
@@ -247,11 +179,11 @@ export class NugProvider implements ProviderAdapter {
 	}
 
 	/**
-	 * delegate handles the request (anthropic/openai/codex/responses) it uses native
-	 * tool-use fields, so leak diagnostics/recovery are unnecessary there.
+	 * All NUG channels use typed delegates with native tool-use fields, so XML
+	 * tool call leakage does not occur.
 	 */
 	get mayLeakXmlToolCalls(): boolean {
-		return this.activeDelegate == null;
+		return false;
 	}
 
 	private get baseUrl(): string {
@@ -267,21 +199,6 @@ export class NugProvider implements ProviderAdapter {
 
 	private modelHashHeaders(): Record<string, string> {
 		return { [NUG_MODEL_HASH_HEADER]: this.modelHashHeaderValue() };
-	}
-
-	private chatHeaders(conversationId?: string, effort?: string): Record<string, string> {
-		const h: Record<string, string> = {
-			"Content-Type": "application/json",
-			Authorization: `Bearer ${this.config.apiKey}`,
-			Accept: "text/event-stream",
-			...this.modelHashHeaders(),
-		};
-		if (conversationId) {
-			h["X-Conversation-ID"] = conversationId;
-		}
-		// additionalModelRequestFields based on this and the model's effort schema.
-		}
-		return h;
 	}
 
 	private resolveMeta(model: string): ResolvedNugModelMeta {
@@ -345,27 +262,6 @@ export class NugProvider implements ProviderAdapter {
 				delegate.setReasoningSourceOverride(this.reasoningSourceForMeta(meta));
 				return delegate;
 			}
-				// reuses the Anthropic request builder and SSE parser instead of
-				//
-				// Older gateways do not have that endpoint, so the capability has to be
-				// advertised first; without it the native path below still runs.
-				const delegate = new AnthropicProvider({
-					...delegateBase,
-					// Not the official API: the mid-conversation `system` role is
-					// unavailable here, which is what makes the history builder lift
-					// trailing sys rows into `trailingUserText` (see its comment) —
-					officialApi: false,
-				});
-				// Signatures minted by this channel are only valid against it, so they
-				// carry the channel identity rather than a generic anthropic one.
-				delegate.setReasoningSourceOverride(this.reasoningSourceForMeta(meta));
-				// The Anthropic Messages protocol has no conversation-id field, so this
-				// header is the only way the gateway can key credential affinity for a
-				// multi-turn conversation. Without it every turn may land on a different
-				// upstream credential.
-				delegate.setSendConversationIdHeader(true);
-				return delegate;
-			}
 			default:
 				return null;
 		}
@@ -390,50 +286,6 @@ export class NugProvider implements ProviderAdapter {
 			return `${this.config.prefix}:${meta.channel}`;
 		}
 		return undefined;
-	}
-
-	/**
-	 *
-	 * False for any gateway that has not advertised it, which covers every build
-	 * predating the endpoint as well as one whose advertisement was withdrawn after
-	 * so an old gateway is unaffected.
-	 */
-		// Two independent conditions, both required.
-		//
-		// The operator opt-in comes first because it is the one a human controls: a
-		// gateway that advertises the endpoint must still not change this client's
-		// behaviour until someone has verified it end to end. Turning the flag off
-		// is the rollback.
-	}
-
-	/**
-	 * Record that the endpoint is absent despite being advertised, and report
-	 * whether that is new information.
-	 *
-	 * The catalog and the served routes can disagree: rolling the gateway image
-	 * back leaves a cached catalog from the newer build, so the advertisement
-	 * outlives the endpoint. Without this the provider would keep targeting a 404
-	 * on every turn.
-	 */
-	}
-
-	/**
-	 *
-	 * Narrow on purpose. Three conditions must all hold:
-	 *
-	 *    404 from any other channel is somebody else's problem;
-	 *  - nothing was streamed yet, because a 404 mid-stream is not a routing
-	 *    problem and re-running the turn would duplicate delivered output;
-	 *  - the status is exactly 404. A 403/401 means the endpoint exists but the key
-	 *    is wrong, and withdrawing the capability there would hide an auth failure
-	 *    behind a silent protocol downgrade.
-	 */
-		err: unknown,
-		meta: ResolvedNugModelMeta,
-		yielded: boolean,
-	): boolean {
-		if (!(this.activeDelegate instanceof AnthropicProvider)) return false;
-		return err instanceof ApiError && err.status === 404;
 	}
 
 	private ensureDelegateForModel(model: string): ProviderAdapter | null {
@@ -494,12 +346,8 @@ export class NugProvider implements ProviderAdapter {
 					: tools;
 			return this.activeDelegate.formatTools(effectiveTools);
 		}
-		return tools.map((tool) => ({
-				name: tool.name,
-				description: tool.description,
-				inputSchema: { json: ensureNonEmptySchema(resolveToolJsonSchema(tool)) },
-			},
-		}));
+		// Unreachable: all supported channel types create a delegate.
+		return tools;
 	}
 
 	async buildHistory(
@@ -517,12 +365,8 @@ export class NugProvider implements ProviderAdapter {
 			// here.
 			return this.activeDelegate.buildHistory(dbMessages, this.modelForDelegate(meta), narratorId);
 		}
-			dbMessages,
-			meta.bareModel,
-			narratorId,
-			this.getActiveReasoningSource(),
-			hostHistoryRuntime(),
-		);
+		// Unreachable: all supported channel types create a delegate.
+		return { history: [], trailingToolResults: [] };
 	}
 
 	getActiveReasoningSource(): string | undefined {
@@ -546,21 +390,7 @@ export class NugProvider implements ProviderAdapter {
 				this.modelForDelegate(this.activeMeta),
 				locale,
 			);
-			return;
 		}
-		const modelId = this.activeMeta?.bareModel ?? resolveModel(model);
-		const ack = getToolMessage("systemPromptAck", (locale ?? "en") as Locale);
-		h.unshift(
-			{
-					content: systemPrompt,
-					modelId,
-				},
-			},
-			{
-					content: ack,
-				},
-			},
-		);
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
@@ -578,21 +408,19 @@ export class NugProvider implements ProviderAdapter {
 		// so any stripped payload is restored once this attempt finishes (success,
 		// failure, or early close) to avoid leaving the persistent history empty.
 		//
-		// The history shape depends on the channel: anthropic uses Messages-API
+		// The history shape depends on the delegate: anthropic uses Messages-API
+		// image parts, codex/openai use OpenAI image parts. Dispatching on the
+		// delegate type ensures the dedup walker matches the actual shape.
 		const history = Array.isArray(params.history) ? params.history : undefined;
 		const confirmed = this.confirmedImageRefs;
-		// The dedup walker has to match the shape the history actually holds, which
-		// reached through the Anthropic endpoint carries Messages-API image parts,
-		// alone would walk the wrong shape, find no images, and silently disable
-		// dedup — every turn would resend full payloads.
 		const usesAnthropicHistory = delegate instanceof AnthropicProvider;
 		const dedupHistory = (h: unknown[]): DedupResult => {
 			if (usesAnthropicHistory) return dedupAnthropicHistoryImages(h, confirmed);
-			if (delegate) return dedupOpenAIHistoryImages(h, confirmed);
+			return dedupOpenAIHistoryImages(h, confirmed);
 		};
 		const restoreHistory = (h: unknown[], p: ImagePayloadMap): void => {
 			if (usesAnthropicHistory) restoreAnthropicHistoryImages(h, p);
-			else if (delegate) restoreOpenAIHistoryImages(h, p);
+			else restoreOpenAIHistoryImages(h, p);
 		};
 		const dedup: DedupResult | undefined = history ? dedupHistory(history) : undefined;
 		let restored = false;
@@ -607,6 +435,9 @@ export class NugProvider implements ProviderAdapter {
 				? this.filterModelCatalogEvents(
 						delegate.chat({ ...params, model: this.modelForDelegate(meta) }),
 					)
+				: (async function* () {
+						// Unreachable: all supported channel types create a delegate.
+					})();
 
 		let yielded = false;
 		let cacheMiss = false;
@@ -617,17 +448,6 @@ export class NugProvider implements ProviderAdapter {
 			}
 			return;
 		} catch (err) {
-			// build without it while this client still holds the newer catalog.
-			//
-			// Retrying here is not possible — `params.history` was already built in
-			// the delegate's Anthropic shape, and the native path would hand that to
-			// later turn take the native path) and the outer loop is asked to rebuild
-			// history from the database and retry, reusing the mechanism Codex quota
-			// failover already uses for the same reason.
-				restore();
-				throw new CodexRebuildHistoryRetryError(
-				);
-			}
 			// A cache miss can only occur before any stream event (the gateway
 			// rejects during body resolution). If we already streamed events, or
 			// nothing was stripped, propagate the error.
@@ -649,77 +469,6 @@ export class NugProvider implements ProviderAdapter {
 		yield* runOnce();
 	}
 
-		params: ChatParams,
-		meta: ResolvedNugModelMeta,
-	): AsyncGenerator<ParsedStreamEvent> {
-			hostNormalizeRuntime(),
-		);
-
-		const body = { model: meta.routedModel, ...request };
-		const headers = this.chatHeaders(conversationId, params.reasoningEffort);
-		params.requestDump?.setRequest({
-			transport: "http",
-			headers: sanitizeHeaders(headers),
-			body,
-		});
-
-		const bodyText = JSON.stringify(body);
-		params.onRequestStart?.();
-			method: "POST",
-			headers,
-			body: bodyText,
-			signal: params.signal,
-		});
-		const responseTextPromise = params.requestDump
-			? response
-					.clone()
-					.text()
-					.catch((error) => {
-						params.requestDump?.setResponseError(error);
-						return "";
-					})
-			: undefined;
-		params.requestDump?.setResponseMeta({
-			status: response.status,
-			headers: sanitizeHeaders(response.headers),
-		});
-
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			params.requestDump?.setResponseBodyText(errText);
-			throw httpError(
-				`NUG chat error ${response.status}: ${errText}`,
-				response.status,
-				nugResponseDiagnostics(response, errText, {
-					model: meta.routedModel,
-				}),
-			);
-		}
-
-		if (!response.body) {
-			throw httpError(
-				"NUG returned no response body",
-				502,
-				nugResponseDiagnostics(response, "NUG returned no response body", {
-					phase: "response_body",
-					statusCode: 502,
-					model: meta.routedModel,
-				}),
-			);
-		}
-
-		yield* parseSSEStream(response.body, {
-			parseTextToolCalls: params.tools.length > 0,
-			model: meta.bareModel,
-		});
-		if (responseTextPromise) {
-			params.requestDump?.setResponseBodyTextWithLimit(
-				await responseTextPromise,
-				settings.agent?.requestDumpMaxSize ?? DEFAULT_DUMP_MAX_BYTES,
-			);
-		}
-	}
-
 	formatToolResult(
 		toolUseId: string,
 		output: string,
@@ -730,18 +479,8 @@ export class NugProvider implements ProviderAdapter {
 		if (this.activeDelegate) {
 			return this.activeDelegate.formatToolResult(toolUseId, output, isError, images, toolName);
 		}
-			toolUseId,
-			content: [{ text: output }],
-			status: isError ? "error" : "success",
-			isError,
-		};
-		if (images?.length) {
-			result._images = images.map((img) => ({
-				source: { bytes: img.base64 },
-			}));
-			result._imageLabel = extractImageFileName(output) ?? "image";
-		}
-		return result;
+		// Unreachable: all supported channel types create a delegate.
+		return { toolUseId, content: [{ text: output }], isError };
 	}
 
 	pushUserTurn(
@@ -760,17 +499,7 @@ export class NugProvider implements ProviderAdapter {
 				toolResults,
 				images,
 			);
-			return;
 		}
-		const modelId = this.activeMeta?.bareModel ?? resolveModel(model);
-			source: { bytes: img.base64 },
-		}));
-
-				content,
-				modelId,
-			},
-		};
-		h.push(userMsg);
 	}
 
 	pushAssistantTurn(
@@ -815,27 +544,7 @@ export class NugProvider implements ProviderAdapter {
 				textOutputIndex,
 				redactedThinkingBlocks,
 			);
-			return;
 		}
-		// not camelCase "reasoningContent".
-			reasoningBlocks,
-			redactedThinkingBlocks,
-			this.getActiveReasoningSource(),
-		);
-				content: text || "",
-				...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
-				...(toolUses.length > 0
-					? {
-							toolUses: toolUses.map((tu) => ({
-								toolUseId: tu.toolUseId,
-								name: tu.name,
-								input: tu.input,
-							})),
-						}
-					: {}),
-			},
-		};
-		h.push(assistantMsg);
 	}
 
 	async generate(text: string, model: string): Promise<string> {
@@ -861,67 +570,8 @@ export class NugProvider implements ProviderAdapter {
 				options,
 			);
 		}
-		const modelId = meta.bareModel;
-				conversationId: crypto.randomUUID(),
-				...(systemInstruction
-					? {
-							history: [
-								{
-										content: systemInstruction,
-										modelId,
-									},
-								},
-								{
-										content: "Understood.",
-									},
-								},
-						}
-					: {}),
-				currentMessage: {
-						content: text,
-						modelId,
-					},
-				},
-			},
-		};
-
-		const body = { model: meta.routedModel, ...request };
-			method: "POST",
-			body: JSON.stringify(body),
-			signal: options?.signal,
-		});
-
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			throw httpError(`NUG generate error ${response.status}: ${errText}`, response.status);
-		}
-
-		const chunks: string[] = [];
-		let contextPercent: number | undefined;
-		let usage: UsageData | undefined;
-		let credentialId: string | undefined;
-		let meterUsage: number | undefined;
-		let meterUnit: string | undefined;
-
-		if (response.body) {
-			for await (const evt of parseSSEStream(response.body)) {
-				if (this.consumeModelCatalogEvent(evt)) continue;
-				if (evt.text != null) {
-					chunks.push(evt.text);
-					await options?.onTextDelta?.(evt.text);
-				}
-				if (evt.reasoning) await options?.onReasoningDelta?.(evt.reasoning);
-				if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
-				if (evt.usage) usage = toUsageData(evt.usage);
-				if (evt.credentialId) credentialId = evt.credentialId;
-				if (evt.metering) {
-					meterUsage = evt.metering.usage;
-					meterUnit = evt.metering.unit;
-				}
-			}
-		}
-
-		return { text: chunks.join(""), contextPercent, usage, credentialId, meterUsage, meterUnit };
+		// Unreachable: all supported channel types create a delegate.
+		return { text: "" };
 	}
 
 	async generateWithHistory(
@@ -972,68 +622,8 @@ export class NugProvider implements ProviderAdapter {
 				),
 			};
 		}
-		const modelId = meta.bareModel;
-		const ack = getToolMessage("titleAck", (locale ?? "en") as Locale);
-		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
-
-				conversationId: crypto.randomUUID(),
-				history: [
-					{
-							content: systemInstruction,
-							modelId,
-						},
-					},
-					{
-							content: ack,
-						},
-					},
-				currentMessage: {
-						content: `${reminder}\n\n${content}`,
-						modelId,
-					},
-				},
-			},
-		};
-
-		const body = { model: meta.routedModel, ...request };
-			method: "POST",
-			body: JSON.stringify(body),
-			signal: options?.signal,
-		});
-
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			throw httpError(
-				`NUG generateWithHistory error ${response.status}: ${errText}`,
-				response.status,
-			);
-		}
-
-		const chunks: string[] = [];
-		let contextPercent: number | undefined;
-		let usage: UsageData | undefined;
-		let credentialId: string | undefined;
-		let meterUsage: number | undefined;
-		let meterUnit: string | undefined;
-		if (response.body) {
-			for await (const evt of parseSSEStream(response.body)) {
-				if (this.consumeModelCatalogEvent(evt)) continue;
-				if (evt.text != null) {
-					chunks.push(evt.text);
-					await options?.onTextDelta?.(evt.text);
-				}
-				if (evt.reasoning) await options?.onReasoningDelta?.(evt.reasoning);
-				if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
-				if (evt.usage) usage = toUsageData(evt.usage);
-				if (evt.credentialId) credentialId = evt.credentialId;
-				if (evt.metering) {
-					meterUsage = evt.metering.usage;
-					meterUnit = evt.metering.unit;
-				}
-			}
-		}
-
-		return { text: chunks.join(""), contextPercent, usage, credentialId, meterUsage, meterUnit };
+		// Unreachable: all supported channel types create a delegate.
+		return { text: "" };
 	}
 
 	// === NUG-specific methods (for frontend proxy routes) ===

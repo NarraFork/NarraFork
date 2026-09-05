@@ -176,8 +176,6 @@ export type {
 	ScheduledTaskRunContext,
 	ScheduledTaskRunsPage,
 } from "./scheduled-tasks";
-export {
-} from "./streams";
 export type {
 	ApiEntity,
 	BaseContentBlock,

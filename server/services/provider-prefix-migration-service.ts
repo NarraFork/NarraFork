@@ -180,7 +180,6 @@ function providerPrefixForId(config: NarraForkSettings, id: string): string | nu
 	for (const provider of [
 		...(config.customApiProviders ?? []),
 		...(config.nugProviders ?? []),
-		...(config.clineProviders ?? []),
 	]) {
 		if (provider.id === id) return provider.prefix ?? null;
 	}

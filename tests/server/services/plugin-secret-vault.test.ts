@@ -25,6 +25,10 @@ const pluginId = "com.example.secret";
 describe("plugin secret vault", () => {
 	test("round-trips a secret and lists keys without values", async () => {
 		await withVault(async (vault) => {
+			await vault.setSecret({ pluginId, key: "provider.acme.apiKey", value: "sk-abc" });
+			expect(await vault.getSecret({ pluginId, key: "provider.acme.apiKey" })).toBe("sk-abc");
+			expect(await vault.hasSecret({ pluginId, key: "provider.acme.apiKey" })).toBe(true);
+			expect(await vault.listKeys(pluginId)).toEqual(["provider.acme.apiKey"]);
 		});
 	});
 

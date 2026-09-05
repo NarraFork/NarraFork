@@ -14,6 +14,7 @@
  * `citeturn…` marker leak cannot reappear on one path but not another.
  */
 
+import type { ProviderTextCitation } from "@shared/agent-protocol/types";
 import {
 	normalizeTextCitations,
 	parseLegacyCitationMarkers,

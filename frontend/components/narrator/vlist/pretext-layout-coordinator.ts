@@ -417,7 +417,11 @@ export class PretextLayoutCoordinator {
 	 * target message is not loaded, its progress is unchanged, or no prior build
 	 * options exist yet.
 	 */
-	applyCompactProgress(messageId: string, progress: ProgressSnapshot, isSegment: boolean): void {
+	applyCompactProgress(
+		messageId: string,
+		progress: CompactProgressPatch,
+		isSegment: boolean,
+	): void {
 		if (!this.input || !this.lastBuildOptions) return;
 		const expectedType = isSegment ? "segment_compact" : "compact";
 		const patched = patchCompactProgress(this.input.messages, messageId, progress, expectedType);
@@ -1232,20 +1236,31 @@ export class PretextLayoutCoordinator {
  * duplicate output-phase tick would look like a change and force a pointless
  * rebuild on every event.
  */
-function sameCompactProgress(block: unknown, progress: ProgressSnapshot): boolean {
+function sameCompactProgress(block: unknown, progress: CompactProgressPatch): boolean {
 	const fields = (block ?? {}) as {
 		outputChars?: unknown;
 		thinkingChars?: unknown;
 		progressPhase?: unknown;
+		retryCount?: unknown;
 	};
 	const phase = fields.progressPhase === "thinking" ? "thinking" : "output";
 	const thinkingChars = typeof fields.thinkingChars === "number" ? fields.thinkingChars : 0;
+	const retryCount = typeof fields.retryCount === "number" ? fields.retryCount : 0;
 	return (
 		fields.outputChars === progress.outputChars &&
 		thinkingChars === progress.thinkingChars &&
-		phase === progress.phase
+		phase === progress.phase &&
+		retryCount === (progress.retryCount ?? 0)
 	);
 }
+
+/**
+ * A live compact-progress tick. `retryCount` rides along on the immediate
+ * broadcast emitted when a failed summary attempt is scheduled for retry;
+ * ordinary throttled ticks omit it, which the patch normalizes to 0 so the
+ * label leaves "retry #N" as soon as fresh output streams again.
+ */
+export type CompactProgressPatch = ProgressSnapshot & { retryCount?: number };
 
 /**
  * Immutably patch the two-phase progress of the running compact block on the
@@ -1258,7 +1273,7 @@ function sameCompactProgress(block: unknown, progress: ProgressSnapshot): boolea
 function patchCompactProgress(
 	messages: readonly TreeMessage[],
 	messageId: string,
-	progress: ProgressSnapshot,
+	progress: CompactProgressPatch,
 	expectedType: "compact" | "segment_compact",
 ): { messages: TreeMessage[]; changed: boolean } {
 	let changed = false;
@@ -1275,6 +1290,7 @@ function patchCompactProgress(
 					outputChars: progress.outputChars,
 					thinkingChars: progress.thinkingChars,
 					progressPhase: progress.phase,
+					retryCount: progress.retryCount ?? 0,
 				};
 			});
 			if (!blockChanged) return message;

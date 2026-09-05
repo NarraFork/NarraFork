@@ -3,6 +3,7 @@ import type { PendingPermission } from "../narrator-panel-types";
 import {
 	decidePermissionSlot,
 	findPendingForKey,
+	isPermissionHostRow,
 	toolUseIdFromSpecKey,
 } from "./vlist-permission-match";
 import type { VListReflectionSource } from "./vlist-reflection-index";
@@ -250,5 +251,24 @@ describe("decidePermissionSlot", () => {
 		expect(
 			decidePermissionSlot("tool-call", "msg-abc", pendings, reflections("confirmed")).kind,
 		).toBe("none");
+	});
+});
+
+/**
+ * The host-kind rule has a second caller now: the bridge offers a row's slot to an
+ * open ASYNC question when no permission claimed it, and it derives the tool_use id
+ * from the spec key directly. Without re-checking the kind there, a non-hosting row
+ * (a user bubble, an injection card) could mount an answer form.
+ */
+describe("isPermissionHostRow", () => {
+	it("accepts exactly the two card kinds that host an interaction area", () => {
+		expect(isPermissionHostRow("tool-call")).toBe(true);
+		expect(isPermissionHostRow("subagent-card")).toBe(true);
+	});
+
+	it("rejects every other row kind", () => {
+		for (const kind of ["markdown", "user-bubble", "injection-bubble", "origin_notice", ""]) {
+			expect(isPermissionHostRow(kind)).toBe(false);
+		}
 	});
 });

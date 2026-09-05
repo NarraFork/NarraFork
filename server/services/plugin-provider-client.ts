@@ -52,6 +52,8 @@ export interface ProviderClientHost {
 export class DeferredProviderClient {
 	private client?: PluginProviderRpcClient;
 	private pending?: Promise<PluginProviderRpcClient>;
+	private releaseClient?: () => void;
+	private generation = 0;
 
 	constructor(
 		private readonly pluginId: string,
@@ -71,22 +73,32 @@ export class DeferredProviderClient {
 		// Collapse concurrent first use into one activation + handshake. Cleared on
 		// settle so a failed activation can be retried (the plugin may have been
 		// mid-start), rather than latching the error forever.
-		this.pending ??= this.createClient().finally(() => {
-			this.pending = undefined;
-		});
+		if (!this.pending) {
+			const pending = this.createClient(++this.generation).finally(() => {
+				if (this.pending === pending) this.pending = undefined;
+			});
+			this.pending = pending;
+		}
 		return this.pending;
 	}
 
-	/** Forget the cached client so the next acquire re-activates. */
+	/** Release the cached or activating client so the next acquire re-activates. */
 	reset(): void {
+		this.generation += 1;
 		this.client = undefined;
 		this.pending = undefined;
+		const release = this.releaseClient;
+		this.releaseClient = undefined;
+		release?.();
 	}
 
-	private async createClient(): Promise<PluginProviderRpcClient> {
+	private async createClient(generation: number): Promise<PluginProviderRpcClient> {
 		const runtime = await this.resolveRuntime(this.pluginId, {
 			reason: `onProvider:${this.providerTypeId}`,
 		});
+		if (generation !== this.generation) {
+			throw new Error("Provider client activation was reset");
+		}
 		const subscribeNotifications = runtime.onNotification?.bind(runtime);
 		const subscribeClose = runtime.onClose?.bind(runtime);
 		const transport = new PluginRuntimeProviderTransport(runtime, {
@@ -98,15 +110,45 @@ export class DeferredProviderClient {
 			expectedPluginId: this.pluginId,
 			host: { name: this.host.name ?? "narrafork", version: this.host.version ?? "unknown" },
 		});
-		// `provider.describe` negotiates the provider protocol version and caches the
-		// descriptor the RPC client needs; chat/generate/listModels all reject without it.
-		await client.describe({});
-		this.client = client;
-		logger.debug("plugin provider client activated", {
-			pluginId: this.pluginId,
-			providerTypeId: this.providerTypeId,
-		});
-		return client;
+		let runtimeClosed = false;
+		let released = false;
+		let unsubscribeRuntimeClose: (() => void) | undefined;
+		const release = () => {
+			if (released) return;
+			released = true;
+			unsubscribeRuntimeClose?.();
+			// dispose detaches subscriptions synchronously, including notifications retained
+			// by PluginRuntime across restarts of the same runtime object.
+			void client.dispose().catch((error: unknown) => {
+				logger.warn("plugin provider client disposal failed", { pluginId: this.pluginId, error });
+			});
+		};
+		// Track the client before describe settles: reset/close must also release a pending
+		// activation. A stale close or handshake must never clear its replacement.
+		this.releaseClient = release;
+		try {
+			unsubscribeRuntimeClose = runtime.onClose?.(() => {
+				runtimeClosed = true;
+				release();
+				if (generation === this.generation) this.reset();
+			});
+			// `provider.describe` negotiates and caches the protocol required by all calls.
+			await client.describe({});
+			if (runtimeClosed) throw new Error("Provider runtime closed during activation");
+			if (generation !== this.generation) {
+				throw new Error("Provider client activation was reset");
+			}
+			this.client = client;
+			logger.debug("plugin provider client activated", {
+				pluginId: this.pluginId,
+				providerTypeId: this.providerTypeId,
+			});
+			return client;
+		} catch (error) {
+			release();
+			if (this.releaseClient === release) this.releaseClient = undefined;
+			throw error;
+		}
 	}
 }
 

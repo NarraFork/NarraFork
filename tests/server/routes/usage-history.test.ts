@@ -139,6 +139,7 @@ describe("usage history raw dump download", () => {
 		provider: "nug2",
 		credentialId: null,
 		credentialName: "work@example.invalid",
+		model: "nug2:anthropic:claude-opus-5",
 		errorMessage: "Improperly formed request.",
 		createdAt: "2026-08-19T10:47:10.832Z",
 	};

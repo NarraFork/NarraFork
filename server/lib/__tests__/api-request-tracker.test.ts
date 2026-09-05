@@ -369,6 +369,7 @@ describe("serializeRawDump", () => {
  * What decides that a dump goes to a file.
  *
  * This was wired to `agent.requestDumpMaxSize`, which made the whole spill store nearly
+ * unreachable: at the 32 MB default a 5 MB body (the common case once the history
  * carries inline images) was judged small enough and written straight into the SQLite row.
  * The row then WAS the dump, so "download" handed back a preview — the exact failure the
  * store exists to remove — while the row grew into the unbounded large field CLAUDE.md
@@ -566,6 +567,7 @@ function spillMeta(requestId: string) {
 		narratorId: null,
 		kind: "narrator",
 		provider: "nug2",
+		model: "nug2:anthropic:claude-opus-5",
 		credentialId: null,
 		errorMessage: "Improperly formed request.",
 		createdAt: "2026-08-19T10:47:10.832Z",

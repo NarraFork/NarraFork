@@ -3,9 +3,9 @@ import { AnthropicProvider } from "../anthropic-provider";
 import type { ChatParams, ParsedStreamEvent } from "../provider";
 
 /**
- * Anthropic Messages, but the stream also carries NUG's own events for credit
- * consumption and context-window occupancy — the Anthropic protocol has no field
- * for either.
+ * NUG injects its own gateway events (credit consumption, context-window
+ * occupancy) into an Anthropic Messages SSE stream — the Anthropic protocol has
+ * no field for either.
  *
  * These assert that `AnthropicProvider` consumes such a mixed stream: the gateway
  * events must be surfaced as `metering` / `contextUsagePercentage`, and the
@@ -56,6 +56,7 @@ async function collect(sse: string): Promise<ParsedStreamEvent[]> {
 	const provider = new AnthropicProvider({
 		id: "nugtest",
 		prefix: "nugtest",
+		baseUrl: "https://gateway.invalid/v1",
 		apiKey: "test-key",
 		officialApi: false,
 		models: [{ id: "claude-sonnet-4.5", name: "Sonnet" }],
@@ -68,7 +69,9 @@ async function collect(sse: string): Promise<ParsedStreamEvent[]> {
 	return events;
 }
 
+/** A stream shaped like what NUG's Anthropic-compatible endpoint actually emits. */
 const MIXED_SSE =
+	'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_nug_req1","role":"assistant","model":"claude-sonnet-4.5","content":[],"usage":{"input_tokens":0,"output_tokens":0}}}\n\n' +
 	'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
 	'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}\n\n' +
 	'event: meteringEvent\ndata: {"type":"meteringEvent","usage":12.5,"unit":"credit","unitPlural":"credits"}\n\n' +
@@ -78,6 +81,7 @@ const MIXED_SSE =
 	'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}\n\n' +
 	'event: message_stop\ndata: {"type":"message_stop"}\n\n';
 
+describe("anthropic provider consuming NUG gateway streams", () => {
 	test("surfaces metering and context usage from interleaved gateway events", async () => {
 		const events = await collect(MIXED_SSE);
 
@@ -101,6 +105,7 @@ const MIXED_SSE =
 			.trim();
 		expect(text).toBe("Hello world.");
 
+		expect(events.some((event) => event.messageId === "msg_nug_req1")).toBe(true);
 		expect(events.some((event) => event.stopReason === "end_turn")).toBe(true);
 	});
 
@@ -113,6 +118,8 @@ const MIXED_SSE =
 		}
 	});
 
+	test("does not report token usage from a credit-metered stream", async () => {
+		// NUG sends zeroed token counts when reporting credits instead of tokens.
 		// The loop treats a token count as a real measurement, so a zero must not be
 		// promoted into a usage event that would render as a free request with an
 		// empty prompt.

@@ -1,3 +1,4 @@
+import type { AsyncQuestion } from "@frontend/types/narrator";
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
 import type { BackgroundTaskListPage } from "@shared/background-task-list";
 import {
@@ -684,6 +685,47 @@ export const narratorsApi = {
 			body: JSON.stringify({ orderedIds }),
 		}),
 	getPendingPermissions: (id: string) => request<ApiEntity[]>(`/narrators/${id}/permissions`),
+	// Async AskUserQuestion inbox — separate from permissions because nothing is
+	// suspended waiting for these (see the AsyncQuestion type).
+	//
+	// The GLOBAL variant answers "is anything waiting on me anywhere", which the
+	// per-narrator one structurally cannot.
+	getAllAsyncQuestions: () =>
+		request<{
+			items: (AsyncQuestion & { narratorTitle: string | null; chapterId: string | null })[];
+			openCount: number;
+			awaitedCount: number;
+		}>("/narrators/questions/all"),
+	getAsyncQuestions: (
+		id: string,
+		params?: { status?: string; cursor?: string; limit?: number },
+	) => {
+		const query = new URLSearchParams();
+		if (params?.status) query.set("status", params.status);
+		if (params?.cursor) query.set("cursor", params.cursor);
+		if (params?.limit !== undefined) query.set("limit", String(params.limit));
+		const suffix = query.size > 0 ? `?${query.toString()}` : "";
+		return request<{ items: AsyncQuestion[]; nextCursor: string | null; openCount: number }>(
+			`/narrators/${id}/questions${suffix}`,
+		);
+	},
+	answerAsyncQuestion: (
+		narratorId: string,
+		questionId: string,
+		payload: {
+			answers: Record<string, string>;
+			annotations?: Record<string, { preview?: string; notes?: string }>;
+		},
+	) =>
+		request<{ ok: boolean; question: AsyncQuestion }>(
+			`/narrators/${narratorId}/questions/${questionId}/answer`,
+			{ method: "POST", body: JSON.stringify(payload) },
+		),
+	dismissAsyncQuestion: (narratorId: string, questionId: string) =>
+		request<{ ok: boolean; question: AsyncQuestion }>(
+			`/narrators/${narratorId}/questions/${questionId}/dismiss`,
+			{ method: "POST" },
+		),
 	approvePermission: (requestId: string, payload?: PermissionDecisionPayload) =>
 		request<ApiEntity>(`/narrators/permissions/${requestId}/approve`, {
 			method: "POST",
@@ -698,6 +740,10 @@ export const narratorsApi = {
 					: (messageOrPayload ?? {}),
 			),
 		}),
+	// "Answer later": release the loop without deciding, moving the question to the
+	// async inbox. Not a deny — the question is accepted, just postponed.
+	deferPermissionQuestion: (requestId: string) =>
+		request<{ ok: boolean }>(`/narrators/permissions/${requestId}/defer`, { method: "POST" }),
 	reflectQuestion: (requestId: string) =>
 		request<{ ok: boolean; answers: Record<string, string> }>(
 			`/narrators/permissions/${requestId}/reflect-question`,

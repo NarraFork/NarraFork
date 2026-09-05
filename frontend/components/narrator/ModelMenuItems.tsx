@@ -80,6 +80,7 @@ export function ModelMenuItems({
 	}, []);
 	const groups = new Map<string, ModelOption[]>();
 	for (const m of allModels) {
+		const prov = m.provider ?? "unknown";
 		if (!groups.has(prov)) groups.set(prov, []);
 		groups.get(prov)?.push(m);
 	}

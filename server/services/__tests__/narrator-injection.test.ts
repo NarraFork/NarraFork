@@ -149,6 +149,30 @@ afterAll(() => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("deliverInjection — the persisted row", () => {
+	for (const role of ["user", "sys"] as const) {
+		test(`${role} persistence hook rolls back the row/ref and never wakes on failure`, async () => {
+			const countBefore = rowCount();
+			await expect(
+				deliverInjection("n1", {
+					content: "This must not become visible",
+					source: "test",
+					role,
+					schedule: "wakeIfIdle",
+					onPersist: (tx, messageId) => {
+						expect(tx).toBeDefined();
+						expect(refCount(messageId)).toBe(1);
+						throw new Error("injected atomic commit failure");
+					},
+				}),
+			).rejects.toThrow("injected atomic commit failure");
+			expect(rowCount()).toBe(countBefore);
+			expect(sqlite.query("SELECT count(*) AS n FROM narrator_message_refs").get()).toEqual({
+				n: 0,
+			});
+			expect(wakes).toEqual([]);
+		});
+	}
+
 	test("writes a sys row whose FIRST block is the verbatim model-facing text", async () => {
 		const content = "Dynamic Spec reminder:\n- doing: migrate the queues";
 		const result = await deliverInjection("n1", {

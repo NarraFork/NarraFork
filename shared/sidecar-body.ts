@@ -46,6 +46,7 @@
  * server/frontend boundary.
  *
  * Zero DOM, zero React, no `server/` imports (this type is reachable from
+ * `shared/agent-protocol`, which bundled plugin code reuses).
  */
 
 import { knowledgeExcerpt } from "./knowledge-excerpt";
@@ -120,6 +121,21 @@ export interface SideCarInboundMessage {
 	text: string;
 }
 
+/**
+ * One answer to an asynchronous AskUserQuestion.
+ *
+ * `header` rather than the question KEY: the key is a machine identifier the model
+ * picked (`auth-method`), while the header is what the user was actually shown and
+ * answered. Both sides of the projection want the readable form.
+ */
+export interface SideCarAsyncQuestionAnswer {
+	header: string;
+	/** The user's answer, already flattened (multi-select joined) by the producer. */
+	answer: string;
+	/** Free-text notes the user attached to the selection. */
+	notes?: string | null;
+}
+
 /** One spec file the user changed through the UI. */
 export interface SideCarSpecUpdate {
 	uri: string;
@@ -173,7 +189,20 @@ export type SideCarBody =
 	/** Messages delivered from other narrators. */
 	| { kind: "messages"; items: SideCarInboundMessage[] }
 	/** Spec files the user edited through the UI. */
-	| { kind: "specUpdates"; items: SideCarSpecUpdate[] };
+	| { kind: "specUpdates"; items: SideCarSpecUpdate[] }
+	/**
+	 * Answers to questions the agent asked ASYNCHRONOUSLY (`AskUserQuestion` with
+	 * `async: true`), arriving long after the tool call finished.
+	 *
+	 * `dismissed` is a first-class outcome, not an empty answer list: "decide it
+	 * yourself" is a real instruction, and a row with no items would read to the model
+	 * as a delivery failure.
+	 */
+	| {
+			kind: "asyncQuestionAnswers";
+			outcome: "answered" | "dismissed";
+			items: SideCarAsyncQuestionAnswer[];
+	  };
 
 /** Every `kind` value, for runtime validation of persisted JSON. */
 const SIDECAR_BODY_KINDS = new Set([
@@ -184,6 +213,7 @@ const SIDECAR_BODY_KINDS = new Set([
 	"tasksDone",
 	"messages",
 	"specUpdates",
+	"asyncQuestionAnswers",
 ]);
 
 /**
@@ -207,6 +237,7 @@ export function coerceSideCarBody(value: unknown): SideCarBody | undefined {
 		case "tasksDone":
 		case "messages":
 		case "specUpdates":
+		case "asyncQuestionAnswers":
 			return Array.isArray(body.items) ? body : undefined;
 		case "tasks":
 			// `tasks` is optional (the empty/tooMany variants carry none), so only its
@@ -587,6 +618,27 @@ function projectSideCarBody(
 				lines,
 			};
 		}
+
+		case "asyncQuestionAnswers": {
+			if (body.outcome === "dismissed") {
+				// A dismissal has no answers to show, so the headline IS the whole content.
+				return { headline: label(labels, "asyncQuestionDismissedHeading"), lines: [] };
+			}
+			const lines: SideCarLine[] = [];
+			for (const item of body.items) {
+				if (remainingBudget(lines) <= 0) break;
+				lines.push({ kind: "heading", text: item.header });
+				lines.push(...proseLines(item.answer, remainingBudget(lines)));
+				const notes = item.notes?.trim();
+				if (notes && remainingBudget(lines) > 0) {
+					lines.push(...proseLines(notes, remainingBudget(lines)));
+				}
+			}
+			return {
+				headline: labelWith(labels, "asyncQuestionAnsweredHeading", { n: body.items.length }),
+				lines,
+			};
+		}
 	}
 }
 
@@ -730,6 +782,28 @@ export function renderSideCarBodyToText(
 				return head;
 			});
 			return `${tpl(templates, "specUpdateHeading")}\n\n${blocks.join("\n\n")}`;
+		}
+
+		case "asyncQuestionAnswers": {
+			if (body.outcome === "dismissed") {
+				// The dismissed heading is the whole instruction ("use your own judgement"),
+				// but the questions still have to be NAMED: by the time a dismissal lands the
+				// agent may have made dozens of calls, and "some question was dismissed" is
+				// not something it can act on.
+				const headers = body.items.map((item) => `- ${item.header}`).join("\n");
+				return headers
+					? `${tpl(templates, "asyncQuestionDismissedHeading")}\n\n${headers}`
+					: tpl(templates, "asyncQuestionDismissedHeading");
+			}
+			const blocks = body.items.map((item) => {
+				const head = tpl(templates, "asyncQuestionEntry", {
+					header: item.header,
+					answer: item.answer,
+				});
+				const notes = item.notes?.trim();
+				return notes ? `${head}\n${tpl(templates, "asyncQuestionNotes", { notes })}` : head;
+			});
+			return `${tpl(templates, "asyncQuestionAnsweredHeading")}\n\n${blocks.join("\n\n")}`;
 		}
 	}
 }

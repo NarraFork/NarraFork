@@ -300,6 +300,7 @@ function configuredDumpCeiling(options: ApiRequestFinishOptions): number {
  *
  * This is {@link RAW_DUMP_INLINE_MAX_BYTES}, NOT the configured ceiling. Deciding on the
  * configured ceiling instead was the defect that made this whole store almost unreachable:
+ * with the 32 MB default, a 5 MB request body — the common case once inline images are in the
  * history — was judged "small enough" and written straight into the SQLite row, which is
  * exactly the unbounded large field the main-thread rules in CLAUDE.md forbid, and the row
  * the download route then had to serve as if it were the whole dump.

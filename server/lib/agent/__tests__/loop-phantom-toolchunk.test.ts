@@ -23,6 +23,7 @@ const testProvider: ProviderAdapter = {
 
 		if (providerScenario === "phantom_then_text") {
 			if (providerAttempts === 1) {
+				// real-world NUG edge case: isMeaningfulStreamEvent() flips
 				// sawMeaningfulResponse=true, yet the loop never builds an accumulator
 				// (name is required) and never pushes to toolUses — leaving zero
 				// persistable output. The old empty-response guard (gated on

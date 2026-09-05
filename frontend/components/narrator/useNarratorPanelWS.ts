@@ -3,6 +3,7 @@ import type { ProgressSnapshot } from "@shared/progress-phase";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useApplyAsyncQuestionChange } from "../../hooks/useAsyncQuestions";
 import { invalidateWorkspaceQueries } from "../../hooks/useGit";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
@@ -129,6 +130,16 @@ interface InitialMessageStatus {
 	prunedPercent?: number | null;
 }
 
+/**
+ * Live compact progress as kept by the panel status reducer: the shared
+ * two-phase snapshot plus the retry state broadcast when a failed summary
+ * attempt is being retried (`retryCount` 0 = not retrying).
+ */
+export interface CompactProgressState extends ProgressSnapshot {
+	retryCount: number;
+	retryError?: string;
+}
+
 export interface UseNarratorPanelWSOptions {
 	narratorId: string;
 	narratorStatus?: string;
@@ -208,7 +219,15 @@ export interface UseNarratorPanelWSReturn {
 	activeCompactStart: number | null;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
-	compactProgress: ProgressSnapshot | null;
+	compactProgress: CompactProgressState | null;
+	/**
+	 * Last compact failure observed over WS, kept until the next compact starts,
+	 * a compact succeeds, a new message is sent, or the panel switches narrators.
+	 * Blocking failures also surface through the narrator's `error` substatus;
+	 * this state exists chiefly so a BACKGROUND failure is visible somewhere
+	 * besides the inline timeline marker.
+	 */
+	compactFailure: { error: string } | null;
 	quotaBalance: string | null;
 	detailedQuotaBalance: string | null;
 	// Browser sessions
@@ -244,7 +263,8 @@ interface StatusState {
 	activeCompactStart: number | null;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
-	compactProgress: ProgressSnapshot | null;
+	compactProgress: CompactProgressState | null;
+	compactFailure: { error: string } | null;
 }
 
 type StatusAction = { type: "patch"; payload: Partial<StatusState> };
@@ -358,6 +378,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		permissionGenerationRef.current += 1;
 	}, []);
 
+	// Writes pushed async-question transitions into the query cache that owns them.
+	const applyAsyncQuestionChange = useApplyAsyncQuestionChange(narratorId);
+
 	const upsertPendingPermission = useCallback(
 		(permission: PendingPermission) => {
 			if (resolvedPermissionIdsRef.current.has(permission.id)) return;
@@ -456,6 +479,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		pruneBoundaryMessageId: null,
 		prunedPercent: null,
 		compactProgress: null,
+		compactFailure: null,
 	});
 	const {
 		substatus,
@@ -469,6 +493,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		pruneBoundaryMessageId,
 		prunedPercent,
 		compactProgress,
+		compactFailure,
 	} = statusState;
 	const suppressMessageDerivedCompactingRef = useRef(false);
 
@@ -488,7 +513,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		suppressMessageDerivedCompactingRef.current = false;
 		dispatchStatus({
 			type: "patch",
-			payload: { substatus: [], compactProgress: null },
+			payload: { substatus: [], compactProgress: null, compactFailure: null },
 		});
 		// Reflection progress lives in a module store keyed by gate requestId, so it
 		// is outside this hook's state and outside the document's narrator scoping. A
@@ -709,6 +734,34 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[permissionDecisionsSupported, resolveAndRemovePerm, settleViaHttp],
 	);
 
+	/**
+	 * "Answer later": release the loop and move the question to the async inbox.
+	 *
+	 * HTTP-only, unlike submit/deny. Those have a WS path because they are the hot,
+	 * latency-sensitive actions; deferring is a rare deliberate choice, and the WS
+	 * `permission_decision` frame carries no field for it — adding one would mean a new
+	 * protocol member for an action that is fine at HTTP latency.
+	 *
+	 * The pending row is removed locally on success; the inbox picks the question up from
+	 * its own `async_question_changed` event.
+	 */
+	const handleQuestionDefer = useCallback(
+		async (requestId: string) => {
+			if (!permissionDecisionsSupported) return;
+			try {
+				await api.deferPermissionQuestion(requestId);
+				resolveAndRemovePerm(requestId);
+			} catch {
+				notifications.show({
+					message: t("deferQuestionFailed"),
+					color: "red",
+					autoClose: 3000,
+				});
+			}
+		},
+		[permissionDecisionsSupported, resolveAndRemovePerm, t],
+	);
+
 	// --- Stable permission callbacks ---
 	const permCbRef = useRef<PermissionCallbacks | null>(null);
 	permCbRef.current = {
@@ -718,6 +771,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		onQuestionSubmit: handleQuestionSubmit,
 		onQuestionReflect: handleQuestionReflect,
 		onQuestionDeny: handleQuestionDeny,
+		onQuestionDefer: handleQuestionDefer,
 	};
 	const stablePermCb = useMemo<PermissionCallbacks>(
 		() => ({
@@ -727,6 +781,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onQuestionSubmit: (...args) => permCbRef.current?.onQuestionSubmit(...args),
 			onQuestionReflect: (...args) => permCbRef.current?.onQuestionReflect(...args),
 			onQuestionDeny: (...args) => permCbRef.current?.onQuestionDeny(...args),
+			onQuestionDefer: (...args) => permCbRef.current?.onQuestionDefer?.(...args),
 		}),
 		[],
 	);
@@ -979,6 +1034,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					upsertPendingPermission({ ...existing, reflectionDeadline: undefined });
 				}
 			},
+			// Asynchronous questions live in the query cache rather than this hook's
+			// pending-permission map: nothing here is suspended waiting for them, and every
+			// consumer of `pendingPermissions` treats an entry as "the session is blocked".
+			onAsyncQuestionChanged: ({ change, question }) => {
+				applyAsyncQuestionChange(change, question);
+			},
 			onStatusChange: (status, turnStartedAt, eventSubstatus) => {
 				clearRetryIfActive();
 				const isNotWorking = status !== "working" && status !== "waiting";
@@ -993,6 +1054,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					suppressMessageDerivedCompactingRef.current = !hasCompact;
 					if (!hasCompact) patch.compactProgress = null;
 				}
+				// A fresh turn supersedes the previous turn's compact failure display.
+				if (status === "working") patch.compactFailure = null;
 				dispatchStatus({ type: "patch", payload: patch });
 				const narratorPatch: Record<string, unknown> = {
 					status,
@@ -1228,14 +1291,41 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				dispatchStatus({
 					type: "patch",
 					payload: {
-						compactProgress: { phase: "thinking", thinkingChars: 0, outputChars: 0 },
+						compactProgress: {
+							phase: "thinking",
+							thinkingChars: 0,
+							outputChars: 0,
+							retryCount: 0,
+						},
+						// A new compact run supersedes any earlier failure display.
+						compactFailure: null,
 					},
 				});
 			},
-			onCompactProgress: ({ phase, thinkingChars, outputChars }) => {
+			onCompactProgress: ({ phase, thinkingChars, outputChars, retryCount, retryError }) => {
 				dispatchStatus({
 					type: "patch",
-					payload: { compactProgress: { phase, thinkingChars, outputChars } },
+					payload: {
+						compactProgress: {
+							phase,
+							thinkingChars,
+							outputChars,
+							retryCount,
+							...(retryError ? { retryError } : {}),
+						},
+					},
+				});
+			},
+			onCompactFailed: (error) => {
+				dispatchStatus({
+					type: "patch",
+					payload: { compactFailure: { error: error ?? "" } },
+				});
+				notifications.show({
+					title: t("compactFailed"),
+					message: error || t("compactFailedDesc"),
+					color: "red",
+					autoClose: 6000,
 				});
 			},
 			onCompactDone: (
@@ -1253,6 +1343,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						prunedPercent: null,
 						contextStale: true,
 						compactProgress: null,
+						// A successful compact clears any earlier failure; a FAILED compact
+						// arrives here with no percent and must leave the just-set
+						// compactFailure (from onCompactFailed) untouched.
+						...(contextPercentAfter != null ? { compactFailure: null } : {}),
 					},
 				});
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -1519,6 +1613,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			pruneBoundaryMessageId,
 			prunedPercent,
 			compactProgress,
+			compactFailure,
 			quotaBalance,
 			detailedQuotaBalance,
 			browserSessionCount,
@@ -1556,6 +1651,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			pruneBoundaryMessageId,
 			prunedPercent,
 			compactProgress,
+			compactFailure,
 			quotaBalance,
 			detailedQuotaBalance,
 			browserSessionCount,

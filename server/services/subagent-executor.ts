@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters } from "../db/schema";
@@ -9,7 +8,11 @@ import {
 	type RuntimeSettingsOverride,
 	TODO_REMINDER_TOOL_INTERVAL,
 } from "../lib/agent";
-import { normalizeBooleanOverride } from "../lib/boolean-override";
+import {
+	normalizeAutoContinuationMode,
+	normalizeBooleanOverride,
+	resolveAutoContinuationMode,
+} from "../lib/boolean-override";
 import { resolveInjectedDevices } from "../lib/device-injection-trait";
 import { eventBus } from "../lib/event-bus";
 import { resolveFastModeForUser, resolveSubagentActingUserId } from "../lib/fast-mode";
@@ -26,13 +29,15 @@ import {
 	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
 	resolveProvider,
+	settings,
 	usesCodexModel,
 } from "../lib/settings";
 import { sideCarBodyWithText } from "../lib/sidecar-templates";
 import { type ImageRef, saveTextFileToWorktree, type TextFileRef } from "../lib/uploads";
-import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { CustomSubagentDef } from "./custom-subagent-service";
+import { gitService } from "./git-service";
+import { knowledgeService } from "./knowledge-service";
 import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "./narrator-executor";
 import { deliverInjection } from "./narrator-injection";
@@ -62,15 +67,33 @@ import {
 	registerActiveSubagent,
 	unregisterActiveSubagent,
 } from "./narrator-session-state";
-import { buildSpecTaskDigestBody } from "./spec-reminder";
 import {
-	deleteConclusionFileId,
-	resolveConclusionFilePath,
-	setConclusionFileId,
-} from "./subagent-conclusion";
+	abandonSessionTreeSnapshots,
+	type TreeSnapshotSession,
+} from "./narrator-tree-snapshot-hooks";
+import { buildSpecTaskDigestBody } from "./spec-reminder";
+import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
+import { specVfsService } from "./spec-vfs-service";
+import {
+	clearSubagentKnowledgeCycle,
+	getSubagentKnowledgeCycle,
+	scanSubagentTextForKnowledge,
+	syncSubagentKnowledgeCycle,
+} from "./subagent-knowledge-injection";
 import { clearTeamInbox, drainTeamInbox } from "./subagent-team";
 import { resolveToolFilter } from "./subagent-tools";
 import { resolveEffectiveTraits } from "./trait-layer-service";
+import { buildTreeSnapshotEventHooks } from "./tree-snapshot-loop-hooks";
+import {
+	buildSubagentContinuationPrompt,
+	createSubagentContinuationState,
+	interruptionContinuationLabel,
+	planSubagentContinuation,
+	planTurnInterruption,
+	type SubagentContinuationCause,
+	subagentContinuationStopNote,
+	type TurnInterruptionPlan,
+} from "./turn-continuation-decisions";
 import type { UpdateExecutionLease } from "./update-coordinator";
 
 // ---------------------------------------------------------------------------
@@ -229,24 +252,11 @@ export function subagentRetryRecoveredBroadcast(
 	};
 }
 
-export type SubagentInterruptionPlan =
-	| { action: "none"; retries: 0 }
-	| {
-			action: "stop";
-			retries: number;
-			reason: NonNullable<ExecuteLoopResult["interruptedReason"]>;
-	  }
-	| {
-			action: "replay";
-			retries: number;
-			reason: NonNullable<ExecuteLoopResult["interruptedReason"]>;
-	  }
-	| {
-			action: "prompt";
-			retries: number;
-			reason: NonNullable<ExecuteLoopResult["interruptedReason"]>;
-			promptKey: "interruptionContinue" | "resumeAfterTransientError";
-	  };
+/**
+ * @deprecated Alias of the shared {@link TurnInterruptionPlan}. Kept so existing importers
+ * keep compiling; new code should name the shared type directly.
+ */
+export type SubagentInterruptionPlan = TurnInterruptionPlan;
 
 export type SubagentCompactRestartDecision =
 	/** Rebuild history from the compact summary and drive another pass. */
@@ -276,8 +286,7 @@ export function planSubagentCompactRestart(input: {
 	// history must be retried regardless of the other signals.
 	if (result.contextLengthExceeded) return { action: "restart" };
 	// The model stopped calling tools: the subagent is done and another request
-	// could only produce a filler turn (and would overwrite finalText for subagent
-	// types that have no conclusion file).
+	// could only produce a filler turn that overwrites finalText.
 	if (result.completedNaturally) return { action: "finish", reason: "completed_naturally" };
 	// onBeforeTurn already rebuilt history inside the loop, so needsRestart is stale.
 	if (compactConsumedInLoop && !compactDoneFlag) {
@@ -286,7 +295,75 @@ export function planSubagentCompactRestart(input: {
 	return { action: "restart" };
 }
 
-/** Decide how a subagent should continue after a provider-interrupted partial turn. */
+/**
+ * What a subagent run does about an exhausted provider balance.
+ *
+ * Pure so the terminal-vs-retry decision is testable without standing up a loop.
+ *
+ * A primary narrator can park itself in a `payment_required` state and wait for the
+ * user to top up. A subagent cannot: it owes its parent a `tool_result`, and a
+ * parent blocked on a tool that never returns is a dead turn. So this is always
+ * terminal, and it always carries a reason — the failure mode it replaces is a
+ * refused request that produced no flags at all, fell through to the end-of-run
+ * finalText backfill, and handed the parent a STALE previous answer as though the
+ * work had completed.
+ *
+ * An abort wins: the run is already ending for a reason the caller owns, and the
+ * recharge prompt would be noise on a session nobody is waiting for.
+ */
+export function planSubagentPaymentRequired(
+	result: Pick<ExecuteLoopResult, "paymentRequired">,
+	aborted: boolean,
+): { action: "none" } | { action: "fail"; finalText: string; errorMessage: string } {
+	if (!result.paymentRequired || aborted) return { action: "none" };
+	return {
+		action: "fail",
+		finalText: `Error: ${result.paymentRequired.message}`,
+		// The shape the subagent's own panel parses to show a recharge prompt rather
+		// than a generic failure (see frontend error-localization).
+		errorMessage: JSON.stringify({ type: "payment_required", ...result.paymentRequired }),
+	};
+}
+
+/**
+ * What a subagent run does about a quietly-closed upstream socket.
+ *
+ * A silent disconnect yields no answer AND no error, so the pass is
+ * indistinguishable from an empty success unless it is handled: the previous
+ * behaviour cleaned up the partial message and let the run end, which delivered
+ * whatever text was lying around to the parent as the subagent's conclusion.
+ *
+ * `retries` is the shared transient counter, so the bound is the same one every
+ * other transient failure obeys. Kept pure to pin the two properties that matter:
+ * the counter ADVANCES on each disconnect (it must not be reset by the success
+ * path, or the bounded retry becomes an unbounded reconnect loop), and exhaustion
+ * ends the run with a stated error instead of a silent one.
+ */
+export function planSubagentSilentDisconnect(
+	result: Pick<ExecuteLoopResult, "silentDisconnect">,
+	previousRetries: number,
+	maxRetries: number,
+	aborted: boolean,
+): { action: "none" } | { action: "retry"; retries: number } | { action: "fail"; retries: number } {
+	if (!result.silentDisconnect || aborted) return { action: "none" };
+	const retries = previousRetries + 1;
+	// -1 means "no limit" for the transient path (Codex account failover), matching
+	// handleTransientError's own contract.
+	if (maxRetries !== -1 && retries > maxRetries) return { action: "fail", retries };
+	return { action: "retry", retries };
+}
+
+/** The error text a subagent reports when silent-disconnect retries are exhausted. */
+export const SUBAGENT_SILENT_DISCONNECT_ERROR = "Codex WebSocket silent disconnect";
+
+/**
+ * Decide how a subagent should continue after a provider-interrupted partial turn.
+ *
+ * Now a thin alias over the shared {@link planTurnInterruption}: the primary loop had this
+ * same decision written inline, and two copies of one rule is exactly the drift this
+ * refactor removes. Retained as a named export because it is the seam the subagent tests
+ * address, and because the subagent's bound is its own constant.
+ */
 export function planSubagentInterruption(
 	result: Pick<
 		ExecuteLoopResult,
@@ -294,17 +371,53 @@ export function planSubagentInterruption(
 	>,
 	previousRetries: number,
 ): SubagentInterruptionPlan {
-	if (!result.interrupted) return { action: "none", retries: 0 };
-	const reason = result.interruptedReason ?? "completion_limit";
-	const retries = previousRetries + 1;
-	if (retries > MAX_SUBAGENT_INTERRUPTION_RETRIES) return { action: "stop", retries, reason };
-	if (result.shouldReplayInterruptedToolResultTurn) return { action: "replay", retries, reason };
-	return {
-		action: "prompt",
-		retries,
-		reason,
-		promptKey: reason === "resumable_error" ? "resumeAfterTransientError" : "interruptionContinue",
-	};
+	return planTurnInterruption(result, previousRetries, {
+		maxRetries: MAX_SUBAGENT_INTERRUPTION_RETRIES,
+	});
+}
+
+/**
+ * Read the continuation-relevant state of a subagent's OWN Dynamic Spec.
+ *
+ * `narratorId` here must be the SUBAGENT's id, never its parent's. Spec files are
+ * keyed by narrator (`spec_namespaces.narratorId`), so passing the parent would
+ * silently continue a subagent for its parent's open tasks — which reads as a bug in
+ * the model rather than in this call, since the reminder text would name a task the
+ * subagent never had.
+ *
+ * Unlike the primary loop's `loadCompiledSpecForContinuation`, this does NOT promote a
+ * `todo` task to `doing`. A promotion is a write to the spec on the subagent's behalf,
+ * and it would let one run keep granting itself work it was never asked to start: the
+ * parent dispatched a task, and a queue of `todo` entries the subagent wrote for itself
+ * is planning, not an instruction to keep going. Only an explicit `doing` (or a
+ * `blocked`, which is a task that was started) continues a run.
+ *
+ * Errors are swallowed to a null task: a spec that cannot be read must not extend a run.
+ */
+export async function readSubagentSpecContinuationState(narratorId: string): Promise<{
+	openTask: { text: string; protected: boolean; status: "doing" | "blocked" } | null;
+	protectedOpenCount: number;
+}> {
+	try {
+		const file = await specVfsService.readTasksFileForNarrator(narratorId);
+		const compiled = compileSpecTasks(parseSpecTasksDocument(file.content));
+		const current = compiled.currentTask;
+		const blocked = compiled.tasks.find((task) => task.status === "blocked") ?? null;
+		// A `doing` task outranks a `blocked` one: it is the work in flight.
+		const chosen = current ?? blocked;
+		return {
+			openTask: chosen
+				? {
+						text: chosen.text,
+						protected: chosen.protected === true,
+						status: chosen === current ? "doing" : "blocked",
+					}
+				: null,
+			protectedOpenCount: compiled.protectedOpenCount,
+		};
+	} catch {
+		return { openTask: null, protectedOpenCount: 0 };
+	}
 }
 
 /**
@@ -505,6 +618,10 @@ export async function finalizeSubagent(
 	// Clean up any remaining buffered messages, post-tool stop, and team inbox.
 	clearSubagentBufferedMessages(subagentId);
 	clearTeamInbox(subagentId);
+	// The knowledge de-dup set has the same lifetime as the team inbox: it is per-run
+	// state, and the durable record of what was injected is the ledger table, which the
+	// next run reloads. Dropping it only keeps the map from growing.
+	clearSubagentKnowledgeCycle(subagentId);
 
 	// NOTE: file change records are intentionally NOT cleared here.
 	// They remain available for sibling subagents to query via TeamStatus.file_changes
@@ -580,6 +697,8 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 	provider: string;
 	cwd: string;
 	pruneBoundaryId?: string | null;
+	/** Locale for the knowledge hint this drain may write. Defaults to English. */
+	locale?: string;
 }): Promise<{
 	prompt: string;
 	history: unknown[];
@@ -632,18 +751,133 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 		messageId: buffered.id,
 		remaining,
 	});
+	// Point A for a message that could NOT be folded into the running pass (attachments, a
+	// pre-prompt command, or a different acting user). Scanned here rather than at the
+	// three call sites — the executor's pass restart, the runner's post-interrupt drain and
+	// its takeover suspension all funnel through this function, and a per-site scan is how
+	// one of them would end up forgotten.
+	//
+	// Write the hint BEFORE rebuilding. Some builders lift the trailing sys row out of
+	// history; the rebuilt current-turn text below must carry that extracted field too.
+	await deliverBufferedKnowledgeHint({
+		narratorId,
+		parentNarratorId,
+		toolUseId,
+		text: buffered.text,
+		turnUserId: buffered.createdBy,
+		locale: opts.locale,
+	});
+
 	if (pruneBoundaryId === undefined) {
 		const freshNarrator = await narratorService.getById(narratorId);
 		pruneBoundaryId = freshNarrator.pruneBoundaryMessageId ?? null;
 	}
 	const rebuilt = await loadSubagentHistory(narratorId, model, provider, pruneBoundaryId);
+	// Match the primary loop's currentTurnText: only prepend context the builder
+	// extracted. Official Anthropic keeps sys as system history, so replaying the
+	// persisted hint itself here would inject it twice.
+	const prompt = rebuilt.trailingUserText?.trim()
+		? buffered.text.trim()
+			? `${rebuilt.trailingUserText}\n\n${buffered.text}`
+			: rebuilt.trailingUserText
+		: buffered.text;
 	return {
-		prompt: buffered.text,
+		prompt,
 		history: rebuilt.history,
 		trailingToolResults: rebuilt.trailingToolResults,
 		userId: buffered.createdBy,
 		prePromptBashCommand: buffered.prePromptBashCommand,
 	};
+}
+
+/**
+ * Scan a drained buffered message for relevant knowledge and persist the hint as its own
+ * row, so the rebuilt request carries it.
+ *
+ * Unlike the in-pass drain, this path rebuilds history after writing the row. Its caller
+ * must consume both history and extracted trailingUserText as the resumed turn.
+ *
+ * `projectId` is resolved here rather than passed in: this function is reached from call
+ * sites that do not hold it, and the lookup is a single indexed read on a path that
+ * already does several.
+ */
+async function deliverBufferedKnowledgeHint(input: {
+	narratorId: string;
+	parentNarratorId: string;
+	toolUseId: string;
+	text: string;
+	turnUserId: string | null | undefined;
+	locale?: string;
+}): Promise<void> {
+	const { narratorId, parentNarratorId, toolUseId, text, turnUserId } = input;
+	try {
+		// A failed scope lookup must SKIP the scan, not proceed with an absent project:
+		// `resolveInjections` reads a missing projectId as "global + every project's
+		// collections", so treating the failure as null would widen the scope precisely
+		// when cross-project isolation could not be verified.
+		const scope = await resolveSubagentProjectId(narratorId);
+		if (!scope.ok) return;
+		const scan = await scanSubagentTextForKnowledge({
+			narratorId,
+			parentNarratorId,
+			text,
+			source: "buffered_message",
+			turnUserId,
+			projectId: scope.projectId,
+			cycle: getSubagentKnowledgeCycle(narratorId),
+			locale: (input.locale ?? "en") as Locale,
+		});
+		if (!scan) return;
+		const { messageId } = await deliverInjection(narratorId, {
+			content: scan.content,
+			body: scan.body,
+			source: "knowledge_base_hint",
+			// The caller rebuilds history right after this, so the row is picked up from the
+			// database; asking for `onNextTurn` text nobody would fold in would be a lie.
+			schedule: "none",
+			locale: (input.locale ?? "en") as Locale,
+			subagent: { parentToolUseId: toolUseId, parentNarratorId },
+		});
+		if (messageId) {
+			knowledgeService.recordInjectionEvents({
+				narratorId: scan.record.narratorId,
+				compactSeq: scan.record.compactSeq,
+				source: "user_message",
+				triggerMessageId: messageId,
+				hits: scan.record.hits,
+			});
+		}
+	} catch (err) {
+		logger.warn("Failed to deliver knowledge hint for a drained subagent message", {
+			narratorId,
+			error: String(err),
+		});
+	}
+}
+
+/**
+ * The project scope a subagent's knowledge scan is restricted to.
+ *
+ * `ok: false` means the scope could not be determined and the caller must not scan —
+ * distinct from `ok: true, projectId: null`, which is a genuinely chapterless subagent
+ * whose scope is the global collections only.
+ */
+async function resolveSubagentProjectId(
+	narratorId: string,
+): Promise<{ ok: true; projectId: string | null } | { ok: false }> {
+	try {
+		const narrator = await narratorService.getById(narratorId);
+		if (!narrator.chapterId) return { ok: true, projectId: null };
+		const chapter = await db.query.chapters.findFirst({
+			where: eq(chapters.id, narrator.chapterId),
+			columns: { projectId: true },
+		});
+		// A chapter row that cannot be read is not "no project": its entries may belong to a
+		// project whose isolation we would be dropping.
+		return chapter ? { ok: true, projectId: chapter.projectId } : { ok: false };
+	} catch {
+		return { ok: false };
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -659,6 +893,33 @@ export async function consumeNextBufferedSubagentMessage(opts: {
  * For explore/plan subagents: single-pass execution (no compact/prune).
  */
 export async function executeSubagent(opts: SubagentExecOptions): Promise<{
+	finalText: string;
+	hasError: boolean;
+	contextLengthExceeded?: boolean;
+	aborted?: boolean;
+}> {
+	// Snapshot session state is owned HERE, outside the loop, for the `finally`
+	// below: a claim opened by the pre-execution hook and never closed is read as
+	// "still running, so it extends to now", which makes its declared paths shadow
+	// every later window in this worktree — silently turning other narrators' real
+	// writes into unrevertable ones. The primary loop has the same backstop
+	// (narrator-session's `finally`), and it must not depend on the loop returning
+	// normally, so it cannot live inside the loop body.
+	//
+	// `_defaultDeviceId` is filled in by the loop once it has read the narrator row;
+	// nothing captures before then.
+	const treeSnapshotSession: TreeSnapshotSession = { cwd: opts.cwd };
+	try {
+		return await runSubagentLoop(opts, treeSnapshotSession);
+	} finally {
+		abandonSessionTreeSnapshots(treeSnapshotSession, opts.narratorId);
+	}
+}
+
+async function runSubagentLoop(
+	opts: SubagentExecOptions,
+	treeSnapshotSession: TreeSnapshotSession,
+): Promise<{
 	finalText: string;
 	hasError: boolean;
 	contextLengthExceeded?: boolean;
@@ -700,13 +961,18 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	// Consecutive completion-limit / resumable-error continuations.
 	let interruptionRetries = 0;
 
-	// Conclusion file for explore/plan subagents — Write/Edit are restricted to this file.
-	// The file content is read after the loop finishes and used as finalText.
-	const isReadOnlySubagent = subagentType === "explore" || subagentType === "plan";
-	const conclusionFileId = isReadOnlySubagent ? generateWordSlug() : undefined;
-	if (conclusionFileId) {
-		setConclusionFileId(narratorId, conclusionFileId, cwd);
-	}
+	// Self-continuation budget for this RUN.
+	//
+	// The primary narrator keeps the equivalent counters on its `ActiveNarrator`, which
+	// a subagent has no entry in. Run-local is not a workaround for that absence but the
+	// tighter scope: a subagent's run is exactly the window its parent is blocked for, so
+	// the budget should reset per dispatch and never leak across them. The bound itself
+	// is the shared `computeContinuationStallState` plus a per-run pass cap — see
+	// `planSubagentContinuation`.
+	const continuationState = createSubagentContinuationState();
+	// Set when the bound stopped a continuation, so the run's final text can say so.
+	// A parent that receives a partial answer with no explanation reads it as complete.
+	let continuationStopNote: string | null = null;
 
 	// Compact-done flag: set by onCompactDone, consumed by onBeforeTurn to
 	// rebuild history/systemPrompt within the same agent loop (inner path).
@@ -770,6 +1036,40 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		)
 		.catch(() => []);
 	const defaultDeviceId = initialNarrator.defaultDeviceId ?? null;
+
+	// --- Workspace tree snapshot boundaries ---
+	//
+	// A subagent writes to a real worktree with the same tools as its parent, so its
+	// tool calls need the same content-addressed boundaries: without them
+	// `narrator_tool_calls.treeHashBefore/After` stay null and a rollback of that call
+	// degrades to per-file replay (which cannot see Bash or external writes at all).
+	//
+	// The session object is owned by `executeSubagent` (per RUN, not per pass): the
+	// staged `before` hashes and the reused `_lastTreeHash` cache live on it and must
+	// survive a compact restart in the middle of a tool pair, and its `finally` needs
+	// it to seal leaked claims.
+	//
+	// A subagent has no `activeNarrators` entry, so the field the hooks read for the
+	// execution target is resolved from its own narrator row here — a remote-targeted
+	// subagent is then skipped exactly like a remote primary session.
+	treeSnapshotSession._defaultDeviceId = defaultDeviceId;
+	// Same rule as a primary session: a chapter always has a worktree; a chapterless
+	// subagent's cwd has to be probed once. Failure counts as "not a repo", which only
+	// costs snapshots rather than failing the run.
+	let subagentIsInGitRepo = !!initialNarrator.chapterId;
+	if (!initialNarrator.chapterId) {
+		try {
+			subagentIsInGitRepo = await gitService.isGitRepo(cwd);
+		} catch {
+			subagentIsInGitRepo = false;
+		}
+	}
+	const treeSnapshotHooks = buildTreeSnapshotEventHooks({
+		session: treeSnapshotSession,
+		narratorId,
+		isInGitRepo: subagentIsInGitRepo,
+	});
+
 	let narratorReasoningEffort = initialNarrator.reasoningEffort ?? undefined;
 	let narratorFastModeOverride = normalizeBooleanOverride(initialNarrator.fastModeOverride);
 	// Layered traits: the parent narrator is an upper layer relative to a subagent,
@@ -797,6 +1097,78 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	// updates from the UI are picked up via getRuntimeSettingsOverride.
 	registerActiveSubagent(narratorId, model, narratorReasoningEffort);
 
+	// Passive knowledge-injection de-dup, scoped to the current compact cycle and shared
+	// by both scan points: the tool-output scan inside the loop (point B) and the
+	// incoming-text scan below (point A). One set is what makes the two points de-dup
+	// against each other; a per-point set would inject the same entry twice for a message
+	// whose keyword also appears in the next tool's output.
+	//
+	// Keyed by narrator id rather than owned by this invocation: a subagent's turns are
+	// also driven by the runner's post-interrupt drain and by `resumeSubagent`, each of
+	// which re-enters `executeSubagent`, and a per-invocation set would re-inject
+	// everything on the next continuation. Re-aligned against the ledger by
+	// `syncSubagentKnowledgeCycle` whenever the compact boundary moves.
+	const knowledgeCycle = getSubagentKnowledgeCycle(narratorId);
+
+	/**
+	 * Scan one piece of incoming text for relevant knowledge and, if anything hit, write
+	 * the hint as its own row; returns the text to fold into this turn (or null).
+	 *
+	 * A row of its own rather than an addition to somebody else's: the hint is about the
+	 * incoming request, and appending it to the message's text would make a reader unable
+	 * to tell the sender's words from the platform's.
+	 *
+	 * The ledger write happens only after the row is durable, for the same reason point B
+	 * defers it — a record whose content never landed would suppress that entry for the
+	 * rest of the compact cycle.
+	 */
+	const deliverKnowledgeHint = async (
+		text: string,
+		source: "buffered_message" | "team_message",
+		turnUserId: string | null | undefined,
+	): Promise<string | null> => {
+		const scan = await scanSubagentTextForKnowledge({
+			narratorId,
+			parentNarratorId,
+			text,
+			source,
+			// A message with its own author is evaluated as that author; everything else
+			// falls back to the run's user and then the parent session's.
+			turnUserId: turnUserId ?? currentUserId,
+			projectId,
+			cycle: knowledgeCycle,
+			locale: locale as Locale,
+		});
+		if (!scan) return null;
+		try {
+			const { messageId, turnText } = await deliverInjection(narratorId, {
+				content: scan.content,
+				body: scan.body,
+				source: "knowledge_base_hint",
+				schedule: "onNextTurn",
+				locale: locale as Locale,
+				subagent: { parentToolUseId: toolUseId, parentNarratorId },
+			});
+			if (messageId) {
+				knowledgeService.recordInjectionEvents({
+					narratorId: scan.record.narratorId,
+					compactSeq: scan.record.compactSeq,
+					source: "user_message",
+					triggerMessageId: messageId,
+					hits: scan.record.hits,
+				});
+			}
+			return turnText ?? null;
+		} catch (err) {
+			logger.warn("Failed to deliver subagent knowledge hint", {
+				narratorId,
+				source,
+				error: String(err),
+			});
+			return null;
+		}
+	};
+
 	// Resolve tool filter for this subagent type using pre-loaded customDef
 	const baseToolFilter = resolveToolFilter(subagentType, opts.customDef);
 	const toolFilter = (tool: import("../lib/agent").ToolDefinition) =>
@@ -814,6 +1186,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		);
 
 		const hooks: EventHooks = {
+			...treeSnapshotHooks,
 			onContextUsage: ctxMgmt.onContextUsage,
 		};
 
@@ -842,6 +1215,11 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		const tasksCadence = new InjectionCadence(() => TODO_REMINDER_TOOL_INTERVAL);
 		const resetUpstreamSessionForThisLoop = resetUpstreamSessionOnNextRequest;
 		resetUpstreamSessionOnNextRequest = false;
+		// Align the de-dup set with this pass's compact cycle BEFORE the config captures the
+		// seq: a compact that landed during the previous pass invalidates the old set (its
+		// entries are now only in the summary), and the ledger seq the loop stamps its
+		// point-B records with has to be the same one the set was rebuilt for.
+		const knowledgeCycleSeq = await syncSubagentKnowledgeCycle(narratorId, knowledgeCycle);
 		const config: AgentConfig = {
 			narratorId,
 			conversationId: currentConversationId,
@@ -878,6 +1256,13 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
 			onExecutionPlanResolved: (resolvedToolUseId, plan) =>
 				narratorService.updateToolCallExecutionPlan(narratorId, resolvedToolUseId, plan),
+			// Share the compact-cycle de-dup set so the loop's tool-output scan (point B)
+			// de-dups against the incoming-text injections (point A) and vice versa — the
+			// same wiring the primary session does. Without these two fields the loop falls
+			// back to a per-call set and stamps its ledger rows with -1, so a subagent could
+			// be told about the same entry once per pass.
+			knowledgeInjectedEntryIds: knowledgeCycle.ids,
+			knowledgeInjectionCompactSeq: knowledgeCycleSeq,
 			deferEagerToolsForSafeStop: true,
 			shouldStop: () => shouldStopSubagentForBufferedMessage(narratorId),
 			permissionHandler: (toolName, permInput, permToolUseId, options) =>
@@ -917,13 +1302,35 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				todoReminderCompletedToolCount = count;
 			},
 			deliverInjectionRow: async (injection) => {
-				const { turnText } = await deliverInjection(narratorId, {
+				const { messageId, turnText } = await deliverInjection(narratorId, {
 					content: injection.content,
 					body: injection.body,
 					source: injection.source,
 					schedule: "onNextTurn",
 					locale: locale as Locale,
+					subagent: { parentToolUseId: toolUseId, parentNarratorId },
 				});
+				// Point-B hits are recorded only AFTER the row is durable, for the reason the
+				// primary session states: the de-dup key `(narratorId, compactSeq, entryId)`
+				// is reloaded from this table after a compact, so recording a hit whose
+				// content never landed would suppress that entry permanently.
+				if (messageId && injection.knowledgeInjection) {
+					const record = injection.knowledgeInjection;
+					try {
+						knowledgeService.recordInjectionEvents({
+							narratorId: record.narratorId,
+							compactSeq: record.compactSeq,
+							source: "tool_output",
+							triggerToolCallId: record.triggerToolCallId,
+							hits: record.hits,
+						});
+					} catch (err) {
+						logger.warn("Failed to record subagent knowledge injection events", {
+							narratorId,
+							error: String(err),
+						});
+					}
+				}
 				return turnText ?? "";
 			},
 			getAfterToolsInjections: async () => {
@@ -1022,6 +1429,12 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 						remaining,
 					});
 					parts.push(buf.text);
+					// Point A for a LIVE subagent: this text was typed on the subagent's own
+					// page or sent by the parent/a sibling, so nobody has scanned it. The ACL
+					// identity is the message's own `createdBy` when it has one, else the
+					// chain's acting user — never the sending agent.
+					const hint = await deliverKnowledgeHint(buf.text, "buffered_message", buf.createdBy);
+					if (hint) parts.push(hint);
 				}
 
 				// 2. Messages a sibling sent through TeamStatus, delivered as this subagent's
@@ -1069,6 +1482,13 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 						locale: locale as Locale,
 					});
 					if (turnText) parts.push(turnText);
+					// A sibling's words are new prose no point-A pass has seen: the sender was
+					// scanned on what it RECEIVED, not on what it wrote, so it can name a term
+					// it was never injected for. Resolved as the chain's acting user (a team
+					// message carries no user of its own), which cannot escalate — the parent's
+					// own point A already ran under that identity.
+					const teamHint = await deliverKnowledgeHint(m.text, "team_message", null);
+					if (teamHint) parts.push(teamHint);
 				}
 
 				return parts.join("\n\n");
@@ -1077,6 +1497,130 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 		needsRestart = false;
 		compactConsumedInLoop = false;
+
+		/**
+		 * Decide whether this pass should be followed by a self-continuation, and if so
+		 * inject the prompt for it.
+		 *
+		 * Serves BOTH end-of-pass causes (`spec-continuation` and
+		 * `max-turns-spec-continuation`): the decision, the bound and the counter writes
+		 * are identical, only the wording differs, and duplicating the branch is how the
+		 * two loops drifted in the first place.
+		 *
+		 * What it does NOT do, on purpose:
+		 *
+		 *  - It never parks. A primary narrator may sit idle waiting for an external
+		 *    condition; a subagent owes its parent a `tool_result`, so every path here
+		 *    either drives another pass or lets the run finish.
+		 *  - It never marks the run as an error. The bound stopping a run is not a
+		 *    failure — the work that happened is real, and `hasError` would discard an
+		 *    explore/plan subagent's conclusion file. The reason travels as text.
+		 *
+		 * ⚠️ Called at most ONCE per pass, and only from an end-of-pass branch. The
+		 * `grantedKind` handoff assumes it: it says "the pass that just ran was a
+		 * continuation of this kind", so calling it twice for one pass would judge that
+		 * pass twice and advance the stall counter at double rate. The two call sites are
+		 * mutually exclusive in practice (`maxTurnsExceeded` continues the loop, so the
+		 * spec branch below is not reached on that pass).
+		 *
+		 * @returns true when the caller should `continue` the loop.
+		 */
+		const maybeContinueForSpec = async (
+			cause: SubagentContinuationCause,
+			suppressed: boolean,
+		): Promise<boolean> => {
+			const spec = await readSubagentSpecContinuationState(narratorId);
+			// Re-read the row rather than reusing `initialNarrator`: the setting can be
+			// changed from the UI while a pass is in flight, and the primary loop applies
+			// such a change at the very next turn boundary (`maybeStartContinuation` does
+			// its own re-read for exactly this reason). A failed read degrades to the
+			// global default rather than to "continue anyway".
+			const freshOverride = await narratorService
+				.getById(narratorId)
+				.then((row) => row.autoContinuationOverride)
+				.catch(() => null);
+			const plan = planSubagentContinuation({
+				cause,
+				mode: resolveAutoContinuationMode(
+					freshOverride,
+					normalizeAutoContinuationMode(settings.agent.autoContinuationMode),
+				),
+				openTask: spec.openTask,
+				protectedOpenCount: spec.protectedOpenCount,
+				previous: continuationState,
+				result,
+				suppressed,
+			});
+			// Both fields are written back unconditionally, mirroring the primary loop: the
+			// stall classification is the whole bound, and `grantedKind` is what lets the NEXT
+			// pass be judged as a continuation (or, when absent, not judged at all).
+			continuationState.stall = plan.stall;
+			continuationState.grantedKind = plan.grantedKind;
+			if (plan.action === "none") return false;
+			if (plan.action === "stop") {
+				continuationStopNote = subagentContinuationStopNote(plan, locale as Locale);
+				logger.warn("Subagent self-continuation stopped by its bound", {
+					narratorId,
+					parentNarratorId,
+					cause: plan.cause,
+					reason: plan.reason,
+					passes: plan.passes,
+					stallCount: plan.stall.count,
+				});
+				return false;
+			}
+			continuationState.passes = plan.passes;
+
+			// A continuation that started is progress of its own kind: clear any note left
+			// by an earlier stop so a run that recovers does not report a stale reason.
+			continuationStopNote = null;
+
+			const content = buildSubagentContinuationPrompt({
+				cause: plan.cause,
+				task: plan.task,
+				passes: plan.passes,
+				locale: locale as Locale,
+			});
+			// `schedule: "none"`: this loop drives the pass itself. The sys row is either
+			// retained as system history or extracted as this pass's CURRENT turn text.
+			//
+			// `subagent: {...}` is what puts the row in the parent's tool-card subtree AND on
+			// the subagent's own page — without it the card would be a top-level row on the
+			// parent, attributed to nobody.
+			await deliverInjection(narratorId, {
+				content,
+				source: plan.task.status === "blocked" ? "spec_blocked_continuation" : "spec_continuation",
+				schedule: "none",
+				locale: locale as Locale,
+				originSource: "autoContinuation",
+				subagent: { parentToolUseId: toolUseId, parentNarratorId },
+			});
+
+			logger.info("Subagent self-continuation started", {
+				narratorId,
+				parentNarratorId,
+				cause: plan.cause,
+				passes: plan.passes,
+				taskStatus: plan.task.status,
+			});
+
+			// Start a fresh turn rather than replaying the dispatched prompt. Compatible
+			// Anthropic (including NUG delegates) extracts the trailing sys rows; official
+			// Anthropic retains them as system history and returns no trailing text.
+			const rebuilt = await loadSubagentHistory(
+				narratorId,
+				model,
+				resolvedProvider,
+				pruneBoundaryId,
+			);
+			history = rebuilt.history;
+			trailingToolResults = rebuilt.trailingToolResults;
+			prompt = rebuilt.trailingUserText ?? "";
+			hasError = false;
+			finalText = "";
+			await narratorService.updateStatus(narratorId, "working").catch(() => {});
+			return true;
+		};
 
 		/**
 		 * Suspend this subagent until a NUG model becomes available again, then
@@ -1200,7 +1744,74 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			// Don't mark as error yet — try transient retry below
 		}
 
+		// --- Payment required: the balance is exhausted, so stop with a real reason ---
+		//
+		// The provider refused the request outright; no amount of retrying or history
+		// rebuilding changes that, only the user topping up does. Handled explicitly
+		// because `paymentRequired` sets none of the other result flags: without this
+		// branch the pass looked like an ordinary empty completion, fell through to the
+		// finalText backfill at the end of the run, and delivered the subagent's
+		// PREVIOUS answer (or "(no output)") to the parent as if the work had finished.
+		//
+		// Unlike the primary narrator, this cannot merely park the session in a
+		// `payment_required` state and wait: a subagent owes its parent a tool_result,
+		// and a parent blocked on a tool that never returns is a dead turn. So the run
+		// ends as an error whose text names the cause — the parent can then decide (and
+		// can re-run the subagent once the balance is restored).
+		//
+		// The narrator row still carries the `payment_required` substatus + errorCode so
+		// the subagent's own panel shows the recharge prompt rather than a generic
+		// failure, while the parent-facing outcome is carried by finalText.
+		// `signal.aborted` is this loop's spelling of the abort-before-recovery rule: an
+		// already-stopped run must not spend a recovery branch on itself. Every branch below
+		// carries the same guard, which is why the marker sits here.
+		// [continuation-source: abort-before-recovery]
+		// [continuation-source: payment-required]
+		const paymentPlan = planSubagentPaymentRequired(result, signal.aborted);
+		if (paymentPlan.action === "fail" && result.paymentRequired) {
+			const partialId = eventContext.getPartialMessageId();
+			eventContext.setPartialMessageId(undefined);
+			if (partialId) {
+				await finalizeOrCleanupPartialMessage(partialId, narratorId);
+			}
+			await narratorService.updateStatus(narratorId, "idle", {
+				substatus: ["payment_required"],
+				errorCode: "payment_required",
+				errorMessage: paymentPlan.errorMessage,
+			});
+			// The subagent's own page renders this like a primary narrator's.
+			broadcastToNarrator(narratorId, {
+				type: "payment_required",
+				narratorId,
+				providerId: result.paymentRequired.providerId,
+				providerPrefix: result.paymentRequired.providerPrefix,
+				balance: result.paymentRequired.balance,
+				required: result.paymentRequired.required,
+				resumeAction: result.paymentRequired.resumeAction,
+			});
+			// Also surfaced on the parent's subagent card, which otherwise shows only a
+			// generic error and gives the user no idea a top-up would fix it.
+			broadcastToNarrator(parentNarratorId, {
+				type: "payment_required",
+				narratorId: parentNarratorId,
+				providerId: result.paymentRequired.providerId,
+				providerPrefix: result.paymentRequired.providerPrefix,
+				balance: result.paymentRequired.balance,
+				required: result.paymentRequired.required,
+				resumeAction: result.paymentRequired.resumeAction,
+			});
+			logger.warn("Subagent stopped: provider balance exhausted", {
+				narratorId,
+				parentNarratorId,
+				providerId: result.paymentRequired.providerId,
+			});
+			hasError = true;
+			finalText = paymentPlan.finalText;
+			break;
+		}
+
 		// --- Context length exceeded: aggressive prune (Codex) then compact/retry ---
+		// [continuation-source: context-overflow]
 		if (result.contextLengthExceeded) {
 			if (signal.aborted) {
 				aborted = true;
@@ -1266,6 +1877,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		// instance-level availability poller (only fetches the lightweight
 		// `/v1/models` list, no history). On recovery, rebuild history from the DB
 		// and resume with one fresh request.
+		// [continuation-source: model-unavailable]
 		if (result.modelUnavailable && !signal.aborted) {
 			const mu = result.modelUnavailable;
 			// Record the refusal before waiting: the poller decides recovery from
@@ -1283,6 +1895,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		}
 
 		// --- Transient API error: retry with exponential backoff ---
+		// [continuation-source: transient-error]
 		if (result.retryableError && !signal.aborted) {
 			transientRetries++;
 			const { shouldRetry } = await handleTransientError({
@@ -1332,6 +1945,79 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			break;
 		}
 
+		// --- Codex WebSocket silent disconnect: retry with the transient backoff ---
+		//
+		// The upstream socket closed quietly, so the turn produced no answer and no
+		// error either. This used to only clean up the partial message and fall through
+		// to the end of the run, which delivered whatever text happened to be lying
+		// around (or nothing) to the parent as the subagent's conclusion — a dropped
+		// connection silently became "the work is done".
+		//
+		// Same treatment as the primary loop: it counts against `transientRetries` and
+		// goes through `handleTransientError`, which applies the backoff and warns the
+		// parent panel. Placed BEFORE the success reset below, because that reset would
+		// otherwise zero the counter every pass and turn the bounded retry into an
+		// unbounded reconnect loop.
+		// [continuation-source: silent-disconnect]
+		const disconnectPlan = planSubagentSilentDisconnect(
+			result,
+			transientRetries,
+			getMaxTransientRetries(),
+			signal.aborted,
+		);
+		if (disconnectPlan.action !== "none") {
+			transientRetries = disconnectPlan.retries;
+			// Runs for both outcomes: it applies the backoff and warns the parent panel,
+			// and on the exhausted path it is what logs the final give-up.
+			const { shouldRetry } = await handleTransientError({
+				narratorId,
+				error: SUBAGENT_SILENT_DISCONNECT_ERROR,
+				retryCount: transientRetries,
+				maxRetries: getMaxTransientRetries(),
+				signal,
+			});
+
+			// The partial turn is finalized either way: on retry it becomes history the
+			// rebuilt request includes (so the model does not repeat executed tools), and
+			// on giving up it is the transcript of what did happen.
+			const partialId = eventContext.getPartialMessageId();
+			let keptPartial = false;
+			if (partialId) {
+				keptPartial = await finalizeOrCleanupPartialMessage(partialId, narratorId);
+				eventContext.setPartialMessageId(undefined);
+			}
+
+			// Aborted during the backoff sleep: not an error, the caller owns the status.
+			if (signal.aborted) {
+				aborted = true;
+				break;
+			}
+			if (shouldRetry && disconnectPlan.action === "retry") {
+				if (keptPartial) prompt = "";
+				const rebuilt = await loadSubagentHistory(
+					narratorId,
+					model,
+					resolvedProvider,
+					pruneBoundaryId,
+				);
+				history = rebuilt.history;
+				trailingToolResults = rebuilt.trailingToolResults;
+				currentConversationId = randomUUID();
+				resetUpstreamSessionOnNextRequest = true;
+				continue;
+			}
+			// Retries exhausted. The parent must be told the turn died rather than
+			// receiving a stale or empty conclusion as if it had succeeded.
+			logger.warn("Subagent stopped: upstream socket kept closing silently", {
+				narratorId,
+				parentNarratorId,
+				retries: transientRetries,
+			});
+			hasError = true;
+			finalText = `Error: ${SUBAGENT_SILENT_DISCONNECT_ERROR}`;
+			break;
+		}
+
 		// A successful pass right after transient retries: tell the parent panel
 		// the subagent has recovered (see subagentRetryRecoveredBroadcast).
 		const retryRecovered = subagentRetryRecoveredBroadcast(
@@ -1345,18 +2031,41 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		// Reset transient retry counter on success
 		transientRetries = 0;
 
+		// --- Turn budget spent while the spec still has open work ---
+		//
+		// A pass that exhausts `maxTurns` is not a failed pass: it did real work and was
+		// cut off by a per-pass budget. Treating it as terminal (which this loop used to
+		// do) means a subagent doing exactly what it was told loses its remaining work at
+		// an arbitrary boundary, and the parent receives "Error: max turns exceeded" as
+		// the answer.
+		//
+		// ⚠️ The bound CANNOT come from turn counts. Each continuation pass is granted a
+		// fresh budget, so "how many turns has this run used" is unbounded by construction.
+		// The only thing that bounds it is progress plus a per-run pass cap, which is what
+		// `planSubagentContinuation` applies — see its own note.
+		//
+		// Placed before the interruption branch (and thus before anything that would end
+		// the run) for the same reason as on the primary side: max-turns marks the result
+		// as an error, so a continuation attempt has to come first or the run ends instead.
+		// [continuation-source: max-turns-spec-continuation]
+		if (result.maxTurnsExceeded && !signal.aborted && !aborted) {
+			if (await maybeContinueForSpec("maxTurns", false)) continue;
+		}
+
 		// Completion-limit and resumable stream interruptions both leave a valid partial
 		// assistant turn in the DB. Rebuild history and continue instead of returning that
 		// partial text as the subagent's terminal result.
-		const interruptionPlan = signal.aborted
-			? ({ action: "none", retries: 0 } as const)
-			: planSubagentInterruption(result, interruptionRetries);
+		// [continuation-source: interruption-continuation]
+		const interruptionPlan = planTurnInterruption(result, interruptionRetries, {
+			suppressed: signal.aborted,
+			maxRetries: MAX_SUBAGENT_INTERRUPTION_RETRIES,
+		});
 		interruptionRetries = interruptionPlan.retries;
 		if (interruptionPlan.action !== "none") {
-			const continuationLogLabel =
-				interruptionPlan.reason === "resumable_error"
-					? "Subagent resumable-error continuation"
-					: "Subagent completion-limit continuation";
+			const continuationLogLabel = interruptionContinuationLabel(
+				interruptionPlan.reason,
+				"subagent",
+			);
 			if (interruptionPlan.action === "stop") {
 				logger.warn(`${continuationLogLabel}: max retries reached, stopping`, {
 					narratorId,
@@ -1405,6 +2114,10 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			}
 		}
 
+		// A silent disconnect on an ALREADY-ABORTED run: the retry branch above skips
+		// those (there is nothing to retry into), so the partial turn is finalized here
+		// instead. Retained rather than folded into that branch because an abort must
+		// not pay for a backoff sleep before its transcript is written.
 		if (result.silentDisconnect) {
 			const partialId = eventContext.getPartialMessageId();
 			eventContext.setPartialMessageId(undefined);
@@ -1414,6 +2127,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		}
 
 		// --- Check for buffered user message (sent from subagent page) ---
+		// [continuation-source: buffered-message]
 		if (!signal.aborted && !hasError) {
 			const consumedBuffered = await consumeNextBufferedSubagentMessage({
 				narratorId,
@@ -1423,6 +2137,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				provider: resolveProvider(model),
 				cwd,
 				pruneBoundaryId,
+				locale,
 			});
 			if (consumedBuffered) {
 				prompt = consumedBuffered.prompt;
@@ -1435,10 +2150,28 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			}
 		}
 
+		// --- The subagent's OWN Dynamic Spec still has open work ---
+		//
+		// The digest already reaches a subagent (`getAfterToolsInjections` builds it on a
+		// cadence), so it was being told about its open tasks and then the run ended with
+		// them still `doing`: the reminder existed, the loop that closes it did not.
+		//
+		// Deliberately AFTER the buffered-message consumer, matching the primary order:
+		// real input outranks the loop's own self-continuation. A message someone just sent
+		// this subagent is more current than a task it wrote for itself earlier.
+		//
+		// `hasError` suppresses it: a run already ending in a stated failure must not be
+		// extended, or the error text is replaced by whatever the extra pass produces.
+		// [continuation-source: spec-continuation]
+		if (!signal.aborted && !aborted && !hasError) {
+			if (await maybeContinueForSpec("spec", false)) continue;
+		}
+
 		if (!needsRestart || signal.aborted || hasError) break;
 
-		// Do not key this decision on finalText: explore/plan subagents may write
-		// their actual result to the conclusion file, which is read after the loop.
+		// Do not key this decision on finalText: it is filled in after the loop, so an
+		// empty value here does not mean the subagent produced nothing.
+		// [continuation-source: compact-restart]
 		const restartDecision = planSubagentCompactRestart({
 			result,
 			compactConsumedInLoop,
@@ -1484,29 +2217,6 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		trailingToolResults = rebuilt.trailingToolResults;
 	}
 
-	// Read conclusion file for explore/plan subagents.
-	// If the subagent wrote to the designated conclusion file, use its content as finalText.
-	// The file itself is KEPT on disk (like plan files): some workflows depend on the
-	// subagent leaving a durable markdown artifact behind, and deleting it here breaks them.
-	if (conclusionFileId) {
-		const conclusionPath = resolveConclusionFilePath(cwd, conclusionFileId);
-		deleteConclusionFileId(narratorId);
-		try {
-			if (existsSync(conclusionPath)) {
-				const content = readFileSync(conclusionPath, "utf-8").trim();
-				if (content && !hasError) {
-					finalText = content;
-				}
-			}
-		} catch (err) {
-			logger.warn("Failed to read conclusion file", {
-				narratorId,
-				conclusionPath,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
-	}
-
 	// Backfill an empty result when the run ended cleanly but left no in-memory
 	// final text. This happens when a compact completes and the restarted turn
 	// ends before producing a new assistant_message (the compact marker is now at
@@ -1522,6 +2232,20 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				.catch(() => null);
 			if (compactSummary?.summary.trim()) finalText = compactSummary.summary;
 		}
+	}
+
+	// The continuation bound stopped this run with spec work still open. Say so in the
+	// text the parent receives: the run ends normally (the work that happened is real,
+	// and flagging `hasError` would discard an explore/plan conclusion), so without this
+	// note a truncated answer is indistinguishable from a finished one.
+	//
+	// APPENDED rather than substituted, and only after the backfill above, so the
+	// subagent's own conclusion stays the primary content. An aborted run is skipped:
+	// its ending was decided by the abort, not by this bound.
+	if (continuationStopNote && !aborted && !signal.aborted) {
+		finalText = finalText.trim()
+			? `${finalText.trim()}\n\n${continuationStopNote}`
+			: continuationStopNote;
 	}
 
 	unregisterActiveSubagent(narratorId);

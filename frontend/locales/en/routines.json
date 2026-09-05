@@ -119,7 +119,6 @@
 	"mcpImportSkippedUnsupportedTransport": "Skipped {{count}} server(s) with unsupported non-stdio transport.",
 	"mcpImportError": "Import failed: {{error}}",
 	"mcpImportInvalidJson": "Invalid JSON format.",
-	"mcpBuiltinTools": "Built-in MCP Tools",
 	"mcpEnv": "Environment Variables",
 	"mcpDefaultBehavior": "Default Permission",
 	"mcpDefaultBehaviorDesc": "Default permission behavior for all tools from this server.",

@@ -17,7 +17,7 @@ describe("handlePluginUiNotification", () => {
 				protocol: "narrafork.ui/1",
 				kind: "notification",
 				method: "providerSettings.catalogInvalidated",
-				params: { providerId: "cline" },
+				params: { providerId: "acme" },
 			},
 			queryClient,
 		);
