@@ -790,6 +790,7 @@ function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void
 			first.createdBy,
 			first.textFiles,
 			first.bashCommand,
+			{ bufferedDelivery: true },
 		)
 			.then(({ userMsg, userBroadcasted }) => {
 				// Delivered: the attachments have been re-materialized into the turn, so the
@@ -4980,12 +4981,19 @@ async function feedMessage(
 	userId?: string | null,
 	rawTextFiles?: File[],
 	preBashCommand?: string | null,
-	internalOptions?: { preserveTurnStart?: boolean; turnStartedAt?: string },
+	internalOptions?: {
+		preserveTurnStart?: boolean;
+		turnStartedAt?: string;
+		/** A buffered message may be restored only before its user row is committed. */
+		bufferedDelivery?: boolean;
+	},
 	origin?: MessageOriginOptions,
 ): Promise<{
 	active: ActiveNarrator;
 	userMsg: typeof narratorMessages.$inferSelect;
 	userBroadcasted?: boolean;
+	/** The message is durable, but a later dispatch step failed and was reported. */
+	postCommitError?: unknown;
 }> {
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	// Final guard against a concurrent loop slipping past the route-level admission
@@ -5059,87 +5067,111 @@ async function feedMessage(
 		origin,
 	);
 
-	active._lastTokenUsage = undefined;
-	active._ttftMs = undefined;
-	active._turnStartedAt = internalOptions?.preserveTurnStart
-		? (internalOptions.turnStartedAt ?? new Date().toISOString())
-		: new Date().toISOString();
+	try {
+		active._lastTokenUsage = undefined;
+		active._ttftMs = undefined;
+		active._turnStartedAt = internalOptions?.preserveTurnStart
+			? (internalOptions.turnStartedAt ?? new Date().toISOString())
+			: new Date().toISOString();
 
-	// --- Resolve manual_override if active (legacy implicit path) ---
-	// When the user sends a message directly on a subagent page while the parent
-	// narrator is blocked in waitForManualOverride, we must resolve that Promise
-	// first. Otherwise the parent stays blocked forever while the subagent runs
-	// independently via narrator-session. We also register a ConclusionWatcher so
-	// the parent's tool_call result is updated when this independent run finishes.
-	//
-	// EXCEPTION — explicit takeover: while taken over, the parent intentionally
-	// stays blocked for the entire takeover. The user can send/interrupt/continue
-	// freely; the result is only handed back when the user stops takeover. So we
-	// do NOT resolve the override or register a watcher here.
-	const narrator = await narratorService.getById(narratorId);
-	if (isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
-		const currentSubstatus = parseSubstatus(narrator.substatus);
-		const takenOver = isTakenOver(narratorId);
-		if (takenOver) {
-			// Parent stays blocked — do not resolve, do not register a watcher.
-		} else if (currentSubstatus.includes("manual_override")) {
-			const overrideEntry = getManualOverrideMap().get(narratorId);
-			if (overrideEntry) {
-				const currentFinalText = await getSubagentFinalText(narratorId);
+		// --- Resolve manual_override if active (legacy implicit path) ---
+		// When the user sends a message directly on a subagent page while the parent
+		// narrator is blocked in waitForManualOverride, we must resolve that Promise
+		// first. Otherwise the parent stays blocked forever while the subagent runs
+		// independently via narrator-session. We also register a ConclusionWatcher so
+		// the parent's tool_call result is updated when this independent run finishes.
+		//
+		// EXCEPTION — explicit takeover: while taken over, the parent intentionally
+		// stays blocked for the entire takeover. The user can send/interrupt/continue
+		// freely; the result is only handed back when the user stops takeover. So we
+		// do NOT resolve the override or register a watcher here.
+		const narrator = await narratorService.getById(narratorId);
+		if (isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
+			const currentSubstatus = parseSubstatus(narrator.substatus);
+			const takenOver = isTakenOver(narratorId);
+			if (takenOver) {
+				// Parent stays blocked — do not resolve, do not register a watcher.
+			} else if (currentSubstatus.includes("manual_override")) {
+				const overrideEntry = getManualOverrideMap().get(narratorId);
+				if (overrideEntry) {
+					const currentFinalText = await getSubagentFinalText(narratorId);
 
-				registerConclusionWatcher(
-					narratorId,
-					overrideEntry.parentNarratorId,
-					overrideEntry.toolUseId,
-				);
-				resolveManualOverride(narratorId, currentFinalText, false);
+					registerConclusionWatcher(
+						narratorId,
+						overrideEntry.parentNarratorId,
+						overrideEntry.toolUseId,
+					);
+					resolveManualOverride(narratorId, currentFinalText, false);
+				}
 			}
 		}
-	}
 
-	await narratorService.updateStatus(
-		narratorId,
-		"working",
-		internalOptions?.preserveTurnStart
-			? {
-					turnStartedAt: active._turnStartedAt,
-					resumeTurn: true,
-				}
-			: { setTurnStart: true },
-	);
-	// The user message above is already persisted, so "first turn" means exactly one
-	// user message exists. `messageCount` cannot answer this any more — it now counts
-	// every message, not finished turns.
-	if (!narrator.title && (await isFirstUserTurn(narratorId))) {
-		active._provisionalTitle =
-			(await setProvisionalTitleFromUserMessage(narratorId, prompt)) ?? undefined;
-		generateQuickTitle(narratorId, prompt, locale).catch(() => {});
-	}
-
-	// runBashFirst flow: after persisting the user message, run the Bash command as
-	// an assistant tool card, then start the loop with empty text. buildHistory
-	// reconstructs the Bash tool_result as the current user turn, so the model sees
-	// the order: user prompt → Bash tool call/result → model reply.
-	if (preBashCommand) {
-		// Broadcast the persisted user message before Bash starts. In chunk mode the
-		// frontend renders directly from WS events (not the query optimistic cache),
-		// so delaying this until sendMessage() returns would show the Bash card first.
-		broadcastToNarrator(narratorId, {
-			type: "user_message",
+		await narratorService.updateStatus(
 			narratorId,
-			message: userMsg,
-		});
-		await handleBashCommand(
-			narratorId,
-			preBashCommand,
-			`/bash ${preBashCommand}`,
-			userId ?? undefined,
-			{
-				skipUserMessage: true,
-				signal: active.abortController.signal,
-			},
+			"working",
+			internalOptions?.preserveTurnStart
+				? {
+						turnStartedAt: active._turnStartedAt,
+						resumeTurn: true,
+					}
+				: { setTurnStart: true },
 		);
-		runAgentLoop(active, "", undefined).catch(async (err) => {
+		// The user message above is already persisted, so "first turn" means exactly one
+		// user message exists. `messageCount` cannot answer this any more — it now counts
+		// every message, not finished turns.
+		if (!narrator.title && (await isFirstUserTurn(narratorId))) {
+			active._provisionalTitle =
+				(await setProvisionalTitleFromUserMessage(narratorId, prompt)) ?? undefined;
+			generateQuickTitle(narratorId, prompt, locale).catch(() => {});
+		}
+
+		// runBashFirst flow: after persisting the user message, run the Bash command as
+		// an assistant tool card, then start the loop with empty text. buildHistory
+		// reconstructs the Bash tool_result as the current user turn, so the model sees
+		// the order: user prompt → Bash tool call/result → model reply.
+		if (preBashCommand) {
+			// Broadcast the persisted user message before Bash starts. In chunk mode the
+			// frontend renders directly from WS events (not the query optimistic cache),
+			// so delaying this until sendMessage() returns would show the Bash card first.
+			broadcastToNarrator(narratorId, {
+				type: "user_message",
+				narratorId,
+				message: userMsg,
+			});
+			await handleBashCommand(
+				narratorId,
+				preBashCommand,
+				`/bash ${preBashCommand}`,
+				userId ?? undefined,
+				{
+					skipUserMessage: true,
+					signal: active.abortController.signal,
+				},
+			);
+			runAgentLoop(active, "", undefined).catch(async (err) => {
+				const diagnostics = diagnosticsFromError(err);
+				logger.error("runAgentLoop unhandled error", {
+					narratorId,
+					error: String(err),
+					diagnostics,
+				});
+				await narratorService.updateStatus(narratorId, "idle", {
+					substatus: ["error"],
+					errorMessage: String(err),
+					diagnostics,
+				});
+				broadcastToNarrator(narratorId, {
+					type: "narrator_error",
+					narratorId,
+					error: String(err),
+					diagnostics,
+				});
+			});
+			return { active, userMsg, userBroadcasted: true };
+		}
+
+		// Start agent loop in background
+		runAgentLoop(active, effectivePrompt, images).catch(async (err) => {
 			const diagnostics = diagnosticsFromError(err);
 			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
 			await narratorService.updateStatus(narratorId, "idle", {
@@ -5154,27 +5186,20 @@ async function feedMessage(
 				diagnostics,
 			});
 		});
-		return { active, userMsg, userBroadcasted: true };
-	}
 
-	// Start agent loop in background
-	runAgentLoop(active, effectivePrompt, images).catch(async (err) => {
-		const diagnostics = diagnosticsFromError(err);
-		logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
-		await narratorService.updateStatus(narratorId, "idle", {
-			substatus: ["error"],
-			errorMessage: String(err),
-			diagnostics,
-		});
-		broadcastToNarrator(narratorId, {
-			type: "narrator_error",
+		return { active, userMsg };
+	} catch (error) {
+		if (!internalOptions?.bufferedDelivery) throw error;
+		logger.error("Buffered message committed but could not start", {
 			narratorId,
-			error: String(err),
-			diagnostics,
+			error: String(error),
 		});
-	});
-
-	return { active, userMsg };
+		await narratorService
+			.updateStatus(narratorId, "idle", { substatus: ["error"], errorMessage: String(error) })
+			.catch(() => {});
+		broadcastToNarrator(narratorId, { type: "narrator_error", narratorId, error: String(error) });
+		return { active, userMsg, postCommitError: error };
+	}
 }
 
 // === Subagent conclusion helpers ===
