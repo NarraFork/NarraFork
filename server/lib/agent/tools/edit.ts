@@ -8,7 +8,14 @@ import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 import { consumeBehaviorFenceEditGrant, isBehaviorFencePath } from "./behavior-fence-grant";
-import { decodeFileBytes, encodeFileBytes, looksBinary } from "./encoding";
+import {
+	applyLineEnding,
+	decodeFileBytes,
+	detectLineEnding,
+	encodeFileBytes,
+	looksBinary,
+	normalizeLineEndings,
+} from "./encoding";
 import {
 	countOccurrences,
 	lineStatsMetadata,
@@ -419,12 +426,6 @@ export function replace(
 	};
 }
 
-// ── Normalize CRLF ─────────────────────────────────────────────
-
-function normalizeLineEndings(text: string): string {
-	return text.replaceAll("\r\n", "\n");
-}
-
 // ── Tool definition ─────────────────────────────────────────────
 
 export const editTool: ToolDefinition = {
@@ -630,11 +631,17 @@ export const editTool: ToolDefinition = {
 					"required",
 				);
 
-				// Create-new-file mode: old_string is empty. Preserve an existing encoding.
+				// Create-new-file mode: old_string is empty. Preserve an existing file's
+				// encoding AND its line endings; a genuinely new file keeps whatever the
+				// model wrote, which is what detecting on `new_string` amounts to.
 				if (old_string === "") {
+					const overwriteEnding = detectLineEnding(existingBytes ? decoded.text : new_string);
 					await backend.writeFileBytes(
 						resolvedPath,
-						encodeFileBytes(new_string, decoded.encoding),
+						encodeFileBytes(
+							applyLineEnding(normalizeLineEndings(new_string), overwriteEnding),
+							decoded.encoding,
+						),
 						{ expectedResolvedPath: canonicalPath },
 					);
 					// This mode OVERWRITES an existing file as readily as it creates a new
@@ -657,13 +664,18 @@ export const editTool: ToolDefinition = {
 
 				const content = normalizeLineEndings(decoded.text);
 				const encoding = decoded.encoding;
+				// Matching happens on LF, writing happens on the file's own ending. Skipping
+				// the second half turned every edit of a CRLF file into a whole-file rewrite.
+				const lineEnding = detectLineEnding(decoded.text);
 				const normalizedOld = normalizeLineEndings(old_string);
 				const normalizedNew = normalizeLineEndings(new_string);
 
 				const result = replace(content, normalizedOld, normalizedNew, replace_all);
-				await backend.writeFileBytes(resolvedPath, encodeFileBytes(result.content, encoding), {
-					expectedResolvedPath: canonicalPath,
-				});
+				await backend.writeFileBytes(
+					resolvedPath,
+					encodeFileBytes(applyLineEnding(result.content, lineEnding), encoding),
+					{ expectedResolvedPath: canonicalPath },
+				);
 				// Diffed against the text actually matched (not the model's `old_string`) and
 				// scaled by the replacement count — see `ReplaceResult.matchedText` /
 				// `replacementLineStats`. Computed once, then shared by the result metadata

@@ -114,6 +114,50 @@ export function detectFileEncoding(bytes: Uint8Array): string {
 	return iconv.encodingExists(name) ? name : "utf-8";
 }
 
+/**
+ * Collapse CRLF to LF so text can be matched against model-authored strings.
+ *
+ * Always pair with {@link detectLineEnding} + {@link applyLineEnding} on the way
+ * back out; normalizing without restoring is what rewrote entire files.
+ */
+export function normalizeLineEndings(text: string): string {
+	return text.replaceAll("\r\n", "\n");
+}
+
+/** The two line endings a text file can be written with. */
+export type LineEnding = "\n" | "\r\n";
+
+/**
+ * The line ending a file already uses.
+ *
+ * Editing tools normalize to LF before matching, because a model writes LF in
+ * its `old_string` and a CRLF file would otherwise never match. What they then
+ * wrote back was the normalized text — so on Windows a one-line edit rewrote
+ * every line in the file, and `git diff` showed the whole thing as changed. That
+ * is not cosmetic: it destroys review and blame, and it overrides a repository's
+ * `.gitattributes eol=crlf`.
+ *
+ * Majority wins rather than "any CRLF": one stray CRLF inside an otherwise-LF
+ * file must not convert the whole file, and vice versa. A tie goes to CRLF,
+ * which can only happen when exactly half the lines already carry it.
+ */
+export function detectLineEnding(text: string): LineEnding {
+	const crlf = text.split("\r\n").length - 1;
+	if (crlf === 0) return "\n";
+	const total = text.split("\n").length - 1;
+	return crlf * 2 >= total ? "\r\n" : "\n";
+}
+
+/**
+ * Restore `ending` on LF-normalized text, immediately before it is encoded.
+ *
+ * The input must already be LF-only (the normalization every edit path performs),
+ * or a CRLF file would come back with a doubled carriage return.
+ */
+export function applyLineEnding(text: string, ending: LineEnding): string {
+	return ending === "\n" ? text : text.replaceAll("\n", "\r\n");
+}
+
 /** Bytes inspected when sniffing for binary content. */
 const BINARY_SNIFF_BYTES = 8000;
 
