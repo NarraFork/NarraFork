@@ -325,7 +325,7 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 	return (
 		<Stack gap="md">
 			{error && (
-				<Alert color="red" variant="light" title={t("common.error")}>
+				<Alert color="red" variant="light" title={t("admin.detail.errorTitle")}>
 					<Text size="sm">{error}</Text>
 				</Alert>
 			)}

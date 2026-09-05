@@ -104,6 +104,11 @@ export function MentionPopover({
 	const handleKeyDown = useCallback(
 		(e: KeyboardEvent) => {
 			if (!visible || filtered.length === 0) return;
+			// The listener is capture-phase, so it sees the keystroke before the IME
+			// candidate list does. While a CJK query is being composed, Enter/Tab pick
+			// a candidate and the arrows move through them — stealing those left the
+			// user unable to finish the word they were typing into the query.
+			if (e.isComposing) return;
 			if (e.key === "ArrowDown") {
 				e.preventDefault();
 				setSelectedIndex((i) => (i + 1) % filtered.length);

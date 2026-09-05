@@ -481,6 +481,8 @@
 	"usageHistoryStatCacheWrite": "缓存写入",
 	"usageHistoryChartTitle": "使用趋势",
 	"usageHistoryChartDescription": "按时间展示请求、Tokens、成本与错误趋势。",
+	"usageHistoryTableLoading": "正在加载记录...",
+	"usageHistoryTableEmpty": "当前筛选范围内暂无记录。",
 	"usageHistoryChartLoading": "正在加载趋势数据...",
 	"usageHistoryChartEmpty": "当前筛选范围内暂无趋势数据。",
 	"usageHistoryChartTruncated": "为控制资源消耗，仅展示 {{start}} 至 {{end}}（{{bucketCount}}/{{maxBuckets}} 个时间桶）。",

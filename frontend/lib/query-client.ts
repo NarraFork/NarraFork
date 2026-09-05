@@ -55,6 +55,20 @@ function showMutationError(error: unknown): void {
 }
 
 /**
+ * Show the global failure toast from a mutation that declares its own `onError`.
+ *
+ * TanStack REPLACES the default handler when a mutation supplies one, so an
+ * optimistic mutation that rolls back in `onError` silently opted out of the
+ * toast as well: the UI reverted the user's action and said nothing about why.
+ * Rollback handlers call this to opt back in; handlers that render the failure
+ * themselves must not.
+ */
+export function reportMutationError(error: unknown, meta?: { suppressErrorToast?: boolean }): void {
+	if (!shouldShowMutationErrorToast(error, meta)) return;
+	showMutationError(error);
+}
+
+/**
  * Whether a mutation failure deserves the global toast.
  *
  * Exported (and kept free of Mantine/i18n) so the three suppression rules can be asserted
@@ -98,8 +112,7 @@ export const queryClient = new QueryClient({
 		},
 		mutations: {
 			onError: (error, _variables, _onMutateResult, context) => {
-				if (!shouldShowMutationErrorToast(error, context?.meta)) return;
-				showMutationError(error);
+				reportMutationError(error, context?.meta);
 			},
 		},
 	},

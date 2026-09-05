@@ -117,6 +117,7 @@
 			"authorizeBusy": "Applying…"
 		},
 		"detail": {
+			"errorTitle": "Something went wrong",
 			"backToList": "Back to plugins",
 			"notFound": "Plugin not found.",
 			"loadError": "Failed to load the plugin.",

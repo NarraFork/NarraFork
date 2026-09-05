@@ -481,6 +481,8 @@
 	"usageHistoryStatCacheWrite": "Cache Write",
 	"usageHistoryChartTitle": "Usage Trend",
 	"usageHistoryChartDescription": "Shows request, token, cost, and error trends over time.",
+	"usageHistoryTableLoading": "Loading records...",
+	"usageHistoryTableEmpty": "No records for the current filters.",
 	"usageHistoryChartLoading": "Loading trend data...",
 	"usageHistoryChartEmpty": "No trend data for the current filters.",
 	"usageHistoryChartTruncated": "To limit resource usage, showing only {{start}} to {{end}} ({{bucketCount}}/{{maxBuckets}} buckets).",

@@ -4260,7 +4260,16 @@ export function NarratorPanel({
 		if (generatingTitle) return;
 		const trimmed = titleValue.trim();
 		if (trimmed && trimmed !== narrator?.title) {
-			await api.updateNarratorTitle(narratorId, trimmed);
+			try {
+				await api.updateNarratorTitle(narratorId, trimmed);
+			} catch {
+				// Stay in edit mode: the text the user typed is only in this input, and
+				// leaving it would drop it. Without this the failure was invisible AND
+				// unrecoverable — every click-away re-fired the blur handler and failed
+				// again, so the field looked stuck for no stated reason.
+				notifications.show({ message: t("titleUpdateFailed"), color: "red", autoClose: 4000 });
+				return;
+			}
 			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 		}
 		setEditingTitle(false);
@@ -4271,12 +4280,16 @@ export function NarratorPanel({
 			const { title } = await api.generateNarratorTitle(narratorId);
 			setTitleValue(title);
 			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
+		} catch {
+			notifications.show({ message: t("generateTitleFailed"), color: "red", autoClose: 4000 });
 		} finally {
 			setGeneratingTitle(false);
 		}
 	};
 	const handleTitleKeyDown = (e: React.KeyboardEvent) => {
-		if (e.key === "Enter") {
+		// See AskInPassingCard: Enter during IME composition is the candidate pick,
+		// not a submit.
+		if (e.key === "Enter" && !e.nativeEvent.isComposing) {
 			e.preventDefault();
 			saveTitle();
 		} else if (e.key === "Escape") {

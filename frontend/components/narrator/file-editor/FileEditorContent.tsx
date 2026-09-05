@@ -52,6 +52,13 @@ export interface FileEditorContentProps {
 	filePath: string;
 	/** Narrator whose workspace bounds the write. Required by the server. */
 	narratorId: string;
+	/**
+	 * Reports whether the buffer differs from disk.
+	 *
+	 * The buffer lives only in this component's state, so unmounting the editor
+	 * destroys it. The owner needs to know before it does that.
+	 */
+	onDirtyChange?: (dirty: boolean) => void;
 }
 
 /**
@@ -73,7 +80,7 @@ function describeLoadError(err: unknown, t: (key: string) => string): string {
 	return err instanceof Error ? err.message : String(err);
 }
 
-export function FileEditorContent({ filePath, narratorId }: FileEditorContentProps) {
+export function FileEditorContent({ filePath, narratorId, onDirtyChange }: FileEditorContentProps) {
 	const { t } = useTranslation("narrator");
 	const [state, setState] = useState<EditorState | null>(null);
 	const [loadError, setLoadError] = useState<string | null>(null);
@@ -207,6 +214,22 @@ export function FileEditorContent({ filePath, narratorId }: FileEditorContentPro
 		setState((prev) => (prev ? applyEdit(prev, buffer) : prev));
 	}, []);
 
+	// Computed before the early returns below so the hook order stays fixed; the
+	// render path re-reads it once `state` is known to be non-null.
+	const dirty = state ? isDirty(state) : false;
+	useEffect(() => {
+		onDirtyChange?.(dirty);
+	}, [dirty, onDirtyChange]);
+	useEffect(
+		() => () => {
+			// On unmount the buffer is gone, so nothing is dirty any more — leaving the
+			// flag set would keep the owner refusing an action there is no longer a
+			// reason to refuse.
+			onDirtyChange?.(false);
+		},
+		[onDirtyChange],
+	);
+
 	if (loadError) {
 		return (
 			<Center h="100%" p="md">
@@ -232,8 +255,6 @@ export function FileEditorContent({ filePath, narratorId }: FileEditorContentPro
 			</Center>
 		);
 	}
-
-	const dirty = isDirty(state);
 
 	return (
 		<Box style={{ height: "100%", display: "flex", flexDirection: "column" }}>

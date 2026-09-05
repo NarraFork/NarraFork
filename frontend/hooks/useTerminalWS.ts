@@ -92,7 +92,10 @@ class TerminalWSManager {
 		if (!token) {
 			// No token yet — retry after a short delay instead of connecting
 			// with empty credentials (which would waste reconnect attempts).
-			this.reconnectTimer = setTimeout(() => this.connect(), 1000);
+			this.reconnectTimer = setTimeout(() => {
+				this.reconnectTimer = undefined;
+				this.connect();
+			}, 1000);
 			return;
 		}
 
@@ -108,6 +111,9 @@ class TerminalWSManager {
 			this._connected = true;
 			this._disconnected = false;
 			this.reconnectAttempts = 0;
+			// Defensive: a live socket must not leave a retry armed behind it.
+			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = undefined;
 			this.notifyStatus();
 			this.syncGlobalStatus();
 			this.resetPingTimeout();
@@ -179,12 +185,20 @@ class TerminalWSManager {
 			RECONNECT_MAX_DELAY_MS,
 		);
 		this.reconnectAttempts++;
-		this.reconnectTimer = setTimeout(() => this.connect(), delay);
+		// Cleared as it fires. Leaving a stale handle here is what disabled
+		// _handleForeground's "retries exhausted" branch: clearTimeout does not
+		// falsify the handle, so `!this.reconnectTimer` was never true again after the
+		// first retry, and refocusing the tab stopped reviving a dead terminal.
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = undefined;
+			this.connect();
+		}, delay);
 	}
 
 	/** Reset retry counter and reconnect immediately. */
 	resetReconnect() {
 		clearTimeout(this.reconnectTimer);
+		this.reconnectTimer = undefined;
 		clearTimeout(this.pingTimeoutTimer);
 		this.reconnectAttempts = 0;
 		this._disconnected = false;
@@ -374,6 +388,7 @@ class TerminalWSManager {
 
 	releaseConnection() {
 		clearTimeout(this.reconnectTimer);
+		this.reconnectTimer = undefined;
 		clearTimeout(this.pingTimeoutTimer);
 		this._unlistenVisibility();
 		this.reconnectAttempts = 0;

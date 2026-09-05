@@ -73,6 +73,7 @@
 	"workspaceLayoutSaveFailedMessage": "The current arrangement ({{kb}} KB) could not be saved. No panel was lost — reopening this workspace will restore the previous arrangement.",
 	"workspaceEmpty": "This workspace has no panels",
 	"workspaceRemovePanelFailed": "Could not remove this panel from the workspace; it will reappear",
+	"workspaceAddPanelFailed": "Could not add this narrator to the workspace",
 	"createdAtLabel": "Created {{time}}",
 	"lastMessageAtLabel": "Last message {{time}}",
 	"addWebview": "Add webview",
