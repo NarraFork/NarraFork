@@ -338,10 +338,13 @@ function interruptPlannedUpdateRecovery(narratorId: string): {
 // === Imported from extracted modules ===
 
 import {
+	cleanupBufferedTextFiles,
 	dbClearAllBuffered,
 	dbConsumeBuffered,
+	dbConsumeBufferedRow,
 	getBufferedMessages,
 	loadBufferedTextFiles,
+	restoreBufferedMessage,
 	toBufferSummary,
 } from "./narrator-buffer";
 import {
@@ -714,7 +717,14 @@ function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void
 	const first = queue?.shift();
 	if (!queue || !first) return;
 	if (queue.length === 0) bufferedMessages.delete(narratorId);
-	dbConsumeBuffered(first.id);
+	// Parsed before consuming, because the two kinds of item are consumed
+	// differently: a terminal command owns its attachments from here on, while a
+	// plain message keeps its files on disk until delivery has actually succeeded —
+	// they are what a restore needs when it has not.
+	const newCommand = parseQueuedNewCommand(first.text, first.commandText);
+	const goalCommand = parseQueuedGoalCommand(first.text, first.commandText);
+	if (newCommand || goalCommand) dbConsumeBuffered(first.id);
+	else dbConsumeBufferedRow(first.id);
 	broadcastToNarrator(narratorId, {
 		type: "buffer_consumed",
 		narratorId,
@@ -743,8 +753,6 @@ function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void
 		broadcastToNarrator(narratorId, { type: "narrator_error", narratorId, error: String(err) });
 	};
 
-	const newCommand = parseQueuedNewCommand(first.text, first.commandText);
-	const goalCommand = parseQueuedGoalCommand(first.text, first.commandText);
 	if (newCommand) {
 		executeQueuedNewCommand(active, first, newCommand.initialMessage)
 			.then(async (newNarratorId) => {
@@ -784,11 +792,25 @@ function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void
 			first.bashCommand,
 		)
 			.then(({ userMsg, userBroadcasted }) => {
+				// Delivered: the attachments have been re-materialized into the turn, so the
+				// queued copies are finally safe to drop.
+				cleanupBufferedTextFiles(first.id);
 				if (!userBroadcasted) {
 					broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
 				}
 			})
-			.catch((err) => handleTerminalCommandError("auto-resume message", err));
+			.catch((err) => {
+				// Not delivered, so the message is still the user's. Put it back at the head
+				// of the queue with its attachments intact and tell the client, then report
+				// the failure as before.
+				restoreBufferedMessage(narratorId, first);
+				broadcastToNarrator(narratorId, {
+					type: "buffer_set",
+					narratorId,
+					messages: toBufferSummary(getBufferedMessages(narratorId)),
+				});
+				return handleTerminalCommandError("auto-resume message", err);
+			});
 	}
 }
 

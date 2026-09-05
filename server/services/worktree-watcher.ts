@@ -29,6 +29,7 @@ import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
+import { toForwardSlash } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
 import { isNativeWatcherEnabled, ParcelRecursiveWatcher } from "../lib/watcher/parcel-watcher";
 import { FileChangeType } from "../lib/watcher/types";
@@ -625,6 +626,23 @@ export const worktreeWatcher = {
 					chapterId,
 					error: String(err),
 				});
+				// Tell the client its commit list is now stale. Without this the panel kept
+				// showing cached rows with no indication that the last sync had failed.
+				for (const narratorId of narratorIds) {
+					eventBus.emit({
+						type: "narrator:ws_broadcast",
+						narratorId,
+						message: {
+							type: "commit_sync_error",
+							narratorId,
+							chapterId,
+							code: "WORKTREE_WATCHER_COMMIT_SYNC_FAILED",
+							error: String(err),
+							fallback: true,
+							backgroundSync: true,
+						},
+					});
+				}
 			}
 		} else if (currentHead && !previousHead) {
 			entry.lastHeadSha = currentHead;
@@ -660,7 +678,12 @@ export const worktreeWatcher = {
 
 		const changes: { path: string; kind: WatchedChangeKind }[] = [];
 		for (const [absolutePath, kind] of changedPaths ?? []) {
-			const relPath = relative(worktreePath, absolutePath);
+			// Forward slashes: the wire contract is a "/"-separated worktree-relative
+			// path, and the client's `parentPath()` splits on "/" only. A Windows path
+			// separated by backslashes therefore read as a root-level entry, so a file
+			// created or deleted inside a subdirectory invalidated the ROOT listing rather
+			// than that directory, and never appeared until the panel was remounted.
+			const relPath = toForwardSlash(relative(worktreePath, absolutePath));
 			// Outside the root: nothing a tree rooted here can place.
 			if (!relPath || relPath.startsWith("..")) continue;
 			changes.push({ path: relPath, kind });
@@ -718,7 +741,13 @@ export const worktreeWatcher = {
 		if (changedPaths?.size) {
 			const unclaimed: string[] = [];
 			for (const absolutePath of changedPaths.keys()) {
-				const relPath = relative(worktreePath, absolutePath);
+				// Forward slashes, because that is how the attribution shadow is keyed
+				// (`track-file-change.ts` and the fs route both normalize before recording).
+				// A backslash key never matched, so on Windows every agent Write/Edit was
+				// recorded a SECOND time as an external change: the same file listed twice
+				// under two spellings, an "external change" badge on the agent's own edit,
+				// and scoped revert warning about changes made outside the session.
+				const relPath = toForwardSlash(relative(worktreePath, absolutePath));
 				if (!relPath || relPath.startsWith("..")) continue;
 				if (wasRecentlyAttributed(worktreePath, relPath)) continue;
 				unclaimed.push(relPath);

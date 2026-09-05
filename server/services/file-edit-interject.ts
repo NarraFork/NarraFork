@@ -52,11 +52,29 @@ export interface FileEditNotification {
  * The still-unconsumed cut-in message per narrator — same purpose and lifecycle
  * as `specEditInterjectIds` in spec-edit-interject.ts. Rapid saves collapse
  * into one message at its original queue position rather than stacking in reverse.
+ *
+ * Keyed by narrator AND file. Keying by narrator alone collapsed saves of
+ * DIFFERENT files into one another: the queued message was rewritten with the
+ * latest file's text, so editing `a.ts` and then `b.ts` before the cut-in was
+ * consumed told the agent only about `b.ts` and left it working from a stale view
+ * of `a.ts`. Collapsing is only correct for repeated saves of the same file, which
+ * is the case it was written for.
  */
 const fileEditInterjectIds = hotSafe<Map<string, string>>(
 	"narrafork.fileEditInterjectIds",
 	() => new Map(),
 );
+
+/**
+ * Composite key for {@link fileEditInterjectIds}.
+ *
+ * Length-prefixed rather than joined by a separator: a file path may contain any
+ * character, so no delimiter is provably safe, while the prefix makes the split
+ * point unambiguous.
+ */
+function interjectKey(narratorId: string, filePath: string): string {
+	return `${narratorId.length}:${narratorId}${filePath}`;
+}
 
 /** Build the message text. First person: this IS the user's message. */
 export function formatFileEditInterjection(notification: FileEditNotification): string {
@@ -146,7 +164,8 @@ export async function interjectFileEditAsUserMessage(
 
 	// Collapse rapid saves: rewrite the previous cut-in when it is still queued,
 	// so the user's repeated Ctrl+S produces one message, not a reversed stack.
-	const trackedId = fileEditInterjectIds.get(narratorId);
+	const trackKey = interjectKey(narratorId, notification.filePath);
+	const trackedId = fileEditInterjectIds.get(trackKey);
 	if (trackedId && getBufferedMessages(narratorId).some((msg) => msg.id === trackedId)) {
 		if (updateBufferedMessage(narratorId, trackedId, text)) {
 			requestBufferedMessageSoftStop(narratorId);
@@ -169,7 +188,7 @@ export async function interjectFileEditAsUserMessage(
 	if (!result.ok) {
 		// Queue full or narrator not active in memory (subagent). Fall back to
 		// injection so nothing is lost.
-		fileEditInterjectIds.delete(narratorId);
+		fileEditInterjectIds.delete(trackKey);
 		await deliverInjection(narratorId, {
 			content: text,
 			source: "file_editor",
@@ -181,7 +200,7 @@ export async function interjectFileEditAsUserMessage(
 		return { delivered: "queued" };
 	}
 
-	fileEditInterjectIds.set(narratorId, result.id);
+	fileEditInterjectIds.set(trackKey, result.id);
 	requestBufferedMessageSoftStop(narratorId);
 	broadcastBufferSnapshot(narratorId);
 	return { delivered: "interjected" };
