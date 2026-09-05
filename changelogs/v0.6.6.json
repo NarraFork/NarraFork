@@ -1,6 +1,0 @@
-{
-  "version": "0.6.6",
-  "date": "2026-09-05",
-  "en": "## New Features\n\n- Added host-react plugin settings views and catalog synchronization metadata.\n- Added Codex quota reset-credit tracking for immediate recovery windows.\n- Added background warm capture for workspace snapshots when hot-path capture exceeds its time budget.\n\n## Bug Fixes\n\n- Hardened review-mode Bash restrictions against Git environment overrides, dangerous options, and PowerShell command substitutions.",
-  "zh-CN": "## 新功能\n\n- 插件设置页支持宿主共享 React 运行时，并补充目录同步元数据。\n- 新增 Codex 配额窗口重置次数，消耗额度后可立即恢复。\n- 工作区快照热路径超时后自动转入后台暖捕获，避免阻塞叙述者会话。\n\n## 修复\n\n- 加固评审只读 Bash，拦截 Git 环境覆盖、危险参数及 PowerShell 命令替换。"
-}
