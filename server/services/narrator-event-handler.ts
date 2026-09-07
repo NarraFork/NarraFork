@@ -318,6 +318,11 @@ export function clearStreamingSnapshot(narratorId: string): void {
 	streamingSnapshots.delete(narratorId);
 }
 
+function clearStreamingSnapshotsForContext(ctx: EventHandlerContext): void {
+	clearStreamingSnapshot(ctx.broadcastTargetId);
+	if (ctx.narratorId !== ctx.broadcastTargetId) clearStreamingSnapshot(ctx.narratorId);
+}
+
 // === Dual broadcast for subagent self-subscription ===
 
 /**
@@ -362,6 +367,72 @@ function dualBroadcast(
 		}
 		broadcastToNarrator(ctx.narratorId, selfMsg);
 	}
+}
+
+function hasImageGenerationArtifact(
+	block: Extract<SnapshotStreamingBlock, { type: "image_generation" }>,
+): boolean {
+	return !!(block.result || block.partialSavedPath || block.savedPath);
+}
+
+/**
+ * A caller-level retry starts a fresh provider request, so an unfinished native image call
+ * from the failed request can never complete. Remove only that transient progress while
+ * keeping every other live block and tool snapshot intact.
+ *
+ * Attached clients need a reset before the replacement snapshot because frontend snapshot
+ * application is deliberately additive (a late reconnect snapshot may not shrink live state).
+ * Reconnecting clients read the already-pruned server snapshot. For subagents the content
+ * snapshot belongs to the child narrator; the parent receives only the routed reset marker,
+ * while the rebuilt snapshot is sent to the child's own subscription.
+ */
+function discardRetryableImageGenerationProgress(ctx: EventHandlerContext): boolean {
+	const snap = streamingSnapshots.get(ctx.narratorId);
+	if (!snap) return false;
+
+	let changed = false;
+	const remainingBlocks: SnapshotStreamingBlock[] = [];
+	for (const block of snap.streamingBlocks) {
+		if (
+			block.type !== "image_generation" ||
+			(block.status !== "in_progress" && block.status !== "generating")
+		) {
+			remainingBlocks.push(block);
+			continue;
+		}
+
+		changed = true;
+		// A real partial/final artifact remains useful after the request dies. Freeze it as
+		// settled content so the retry backoff does not leave its old spinner running.
+		if (hasImageGenerationArtifact(block)) {
+			remainingBlocks.push({ ...block, status: "completed" });
+		}
+	}
+	if (!changed) return false;
+
+	snap.streamingBlocks = remainingBlocks;
+	const resetMessage: Extract<NarratorServerMessage, { type: "streaming_reset" }> = {
+		type: "streaming_reset",
+		narratorId: ctx.broadcastTargetId,
+		...(ctx.parentToolUseId ? { parentToolUseId: ctx.parentToolUseId } : {}),
+	};
+	dualBroadcast(ctx, resetMessage);
+
+	const snapshotData = {
+		streamingBlocks: snap.streamingBlocks,
+		toolChunks: [...snap.toolChunks.values()],
+	};
+	broadcastToNarrator(ctx.narratorId, {
+		type: "streaming_snapshot",
+		narratorId: ctx.narratorId,
+		...snapshotData,
+	});
+
+	// Main-narrator SSE has no reconnect snapshot request. Reset guarantees the abandoned
+	// image cannot survive there; snapshot-aware consumers can immediately restore survivors.
+	ctx.sseEmitter?.emit("event", { type: "streaming_reset" });
+	ctx.sseEmitter?.emit("event", { type: "streaming_snapshot", data: snapshotData });
+	return true;
 }
 
 function subagentToolRouting(ctx: EventHandlerContext, toolUseId: string) {
@@ -947,12 +1018,14 @@ export async function processEvent(
 
 		case "block_complete": {
 			const { block } = event;
+			const snapshotNarratorId = ctx.parentToolUseId ? narratorId : broadcastTargetId;
 
 			// Snapshot: remove the completed block from the ordered streaming blocks.
 			// The completed block will be served via the partial message from the
 			// database, so the snapshot should only contain blocks still being streamed.
-			if (!ctx.parentToolUseId) {
-				const snap = streamingSnapshots.get(broadcastTargetId);
+			// Subagent text/reasoning is not snapshotted, but native image progress is.
+			if (!ctx.parentToolUseId || block.type === "image_generation") {
+				const snap = streamingSnapshots.get(snapshotNarratorId);
 				if (snap) {
 					if (block.type === "text") {
 						// Remove the completed text block (prefer exact provider outputIndex).
@@ -1135,30 +1208,28 @@ export async function processEvent(
 					...(shouldPersistInlineResult && block.result ? { result: block.result } : {}),
 				});
 				if (savedPath) {
-					if (!ctx.parentToolUseId) {
-						const snap = getOrCreateSnapshot(broadcastTargetId);
-						const existingIdx = snap.streamingBlocks.findIndex(
-							(b) => b.type === "image_generation" && b.id === block.id,
+					const snap = getOrCreateSnapshot(snapshotNarratorId);
+					const existingIdx = snap.streamingBlocks.findIndex(
+						(b) => b.type === "image_generation" && b.id === block.id,
+					);
+					const finalBlock: SnapshotStreamingBlock = {
+						type: "image_generation",
+						id: block.id,
+						status: "completed",
+						revisedPrompt: block.revisedPrompt,
+						savedPath,
+						...(imageWidth != null && imageHeight != null
+							? { width: imageWidth, height: imageHeight }
+							: {}),
+						...(block.outputIndex != null ? { outputIndex: block.outputIndex } : {}),
+					};
+					if (existingIdx !== -1) snap.streamingBlocks[existingIdx] = finalBlock;
+					else {
+						snap.streamingBlocks.splice(
+							findOrderedSnapshotInsertIndex(snap.streamingBlocks, block.outputIndex),
+							0,
+							finalBlock,
 						);
-						const finalBlock: SnapshotStreamingBlock = {
-							type: "image_generation",
-							id: block.id,
-							status: "completed",
-							revisedPrompt: block.revisedPrompt,
-							savedPath,
-							...(imageWidth != null && imageHeight != null
-								? { width: imageWidth, height: imageHeight }
-								: {}),
-							...(block.outputIndex != null ? { outputIndex: block.outputIndex } : {}),
-						};
-						if (existingIdx !== -1) snap.streamingBlocks[existingIdx] = finalBlock;
-						else {
-							snap.streamingBlocks.splice(
-								findOrderedSnapshotInsertIndex(snap.streamingBlocks, block.outputIndex),
-								0,
-								finalBlock,
-							);
-						}
 					}
 					dualBroadcast(ctx, {
 						type: "image_generation",
@@ -1181,7 +1252,7 @@ export async function processEvent(
 
 		case "assistant_message": {
 			// Snapshot: clear streaming state — this turn's text + tools are done
-			clearStreamingSnapshot(broadcastTargetId);
+			clearStreamingSnapshotsForContext(ctx);
 
 			const tokenUsage = ctx.getTokenUsage();
 			const turnUsage = tokenUsage
@@ -1752,7 +1823,7 @@ export async function processEvent(
 
 		case "error": {
 			// Snapshot: clear streaming state on error
-			clearStreamingSnapshot(broadcastTargetId);
+			clearStreamingSnapshotsForContext(ctx);
 
 			if (hooks?.onErrorCleanup) {
 				await hooks.onErrorCleanup(event.message, event.diagnostics);
@@ -1765,7 +1836,10 @@ export async function processEvent(
 
 		case "retryable_error": {
 			// Transient errors are handled by the caller's retry logic —
-			// do NOT call onErrorCleanup (which would set status to "error").
+			// do NOT call onErrorCleanup (which would set status to "error"). The failed
+			// request's unfinished native image call cannot resume in the fresh request,
+			// so retract only that progress and rebuild the remaining live snapshot.
+			discardRetryableImageGenerationProgress(ctx);
 			logger.warn("Retryable API error", { narratorId, error: event.message });
 			return null;
 		}
@@ -1815,7 +1889,7 @@ export async function processEvent(
 			// A reasoning-only dead turn was discarded. Clear the streaming snapshot
 			// (which still holds the live reasoning that will not be persisted) and
 			// tell the frontend to drop the streaming blocks it is currently showing.
-			clearStreamingSnapshot(broadcastTargetId);
+			clearStreamingSnapshotsForContext(ctx);
 			dualBroadcast(ctx, {
 				type: "streaming_reset",
 				narratorId: broadcastTargetId,
@@ -2166,9 +2240,10 @@ export async function processEvent(
 				}
 			}
 
-			// Snapshot: track image_generation in provider order (top-level only)
-			if (!ctx.parentToolUseId) {
-				const snap = getOrCreateSnapshot(broadcastTargetId);
+			// Snapshot: image progress belongs to the narrator that produced it. For a
+			// subagent this is its own page, not the parent's broadcast target.
+			{
+				const snap = getOrCreateSnapshot(narratorId);
 				const existingIdx = snap.streamingBlocks.findIndex(
 					(b) => b.type === "image_generation" && b.id === event.id,
 				);
