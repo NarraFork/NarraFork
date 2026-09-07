@@ -230,6 +230,7 @@
 	"emptyResponseNamelessToolCall": "{{provider}} 声明了工具调用但没有给出工具名，导致无法执行。这是上游协议错误。",
 	"emptyResponseStopWithoutContent": "{{provider}} 以「{{stopReason}}」结束但没有产出内容。请求已经到达模型，属于上游问题，不需要改本地配置。",
 	"reasoningOnlyExhausted": "{{provider}} 多次只输出思考过程，没有给出回答或工具调用。这是模型行为问题，可尝试换模型或简化任务。",
+	"cyberPolicyViolation": "{{provider}} 以网络安全策略（cyber_policy）拒绝了本次请求。该轮已终止，未重试、未切换账号；继续发送同类内容可能导致上游账号被封。",
 	"errorRequestIdLabel": "请求 ID：{{requestId}}",
 	"bufferPreservedNotice": "排队消息已保留，重试成功后将自动继续发送。",
 	"narratorRetrying": "服务暂时不可用 — 正在重试",

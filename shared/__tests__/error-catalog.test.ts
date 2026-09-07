@@ -8,6 +8,7 @@ import {
 	readErrorPayload,
 	renderErrorMessage,
 	sanitizeErrorParams,
+	serializeCatalogErrorMessage,
 	templatePlaceholders,
 } from "../error-catalog";
 
@@ -110,6 +111,47 @@ describe("renderErrorMessage", () => {
 			id: "y".repeat(MAX_PARAM_VALUE_CHARS + 10),
 		});
 		expect(rendered.length).toBeLessThan(MAX_PARAM_VALUE_CHARS + 40);
+	});
+});
+
+describe("serializeCatalogErrorMessage", () => {
+	test("keeps a catalog key and readable prose together in a string-only carrier", () => {
+		const error = Object.assign(new Error(ERROR_CATALOG.TUTORIAL_REMOVED.en), {
+			messageCode: "TUTORIAL_REMOVED",
+			statusCode: 410,
+			code: "TUTORIAL_REMOVED",
+		});
+		expect(JSON.parse(serializeCatalogErrorMessage(error))).toEqual({
+			type: "catalog_error",
+			error: ERROR_CATALOG.TUTORIAL_REMOVED.en,
+			messageCode: "TUTORIAL_REMOVED",
+			messageParams: {},
+		});
+	});
+
+	test("reuses the catalog's parameter bounds and never serializes arbitrary error fields", () => {
+		const error = Object.assign(new Error("Readable fallback"), {
+			messageCode: "RESOURCE_NOT_FOUND",
+			messageParams: { id: "x".repeat(MAX_PARAM_VALUE_CHARS + 10), nested: { unused: true } },
+			unused: "not for display",
+		});
+		const serialized = JSON.parse(serializeCatalogErrorMessage(error));
+		expect(serialized.error).toBe("Readable fallback");
+		expect(serialized.messageParams).toEqual({ id: `${"x".repeat(MAX_PARAM_VALUE_CHARS)}…` });
+		expect(serialized.unused).toBeUndefined();
+		expect(serialized.stack).toBeUndefined();
+	});
+
+	test("non-catalog errors and thrown values retain the previous string behaviour", () => {
+		for (const value of [new Error("ordinary failure"), "failure", null, undefined, 42]) {
+			expect(serializeCatalogErrorMessage(value)).toBe(
+				value instanceof Error ? value.message : String(value),
+			);
+		}
+		for (const messageCode of [undefined, "FROM_A_NEWER_SERVER", "constructor"]) {
+			const error = Object.assign(new Error("unchanged"), { messageCode });
+			expect(serializeCatalogErrorMessage(error)).toBe("unchanged");
+		}
 	});
 });
 

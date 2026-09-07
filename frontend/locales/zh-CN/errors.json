@@ -3,6 +3,7 @@
 	"VALIDATION_FAILED": "请求校验失败：{{detail}}",
 	"FORBIDDEN_ACTION": "你没有权限执行此操作",
 	"INTERNAL_ERROR": "服务端发生内部错误",
+	"TUTORIAL_REMOVED": "上手教程已移除。已有会话和沙盒文件均保持不变，请改用学习指南。",
 	"GIT_NOT_INSTALLED": "未安装 Git。请安装 git 后重试此操作。",
 	"DEFAULT_MODEL_NOT_CONFIGURED": "尚未配置默认模型。请在「设置 → 模型」中选择一个后重试。",
 	"PODMAN_NOT_FOUND": "未安装 Podman",

@@ -8,6 +8,7 @@ import {
 	getAuxiliaryMaxRetries,
 	isContextWindowExceededError,
 	isModelUnavailableError,
+	isResumableError,
 	isRetryableError,
 	isRetryableInvalidStateReason,
 	ProviderInvalidStateError,
@@ -565,6 +566,61 @@ describe("unified invalidState classification", () => {
 			retryable: false,
 		});
 	});
+
+	test("classifies cyber_policy as a terminal content_filter violation", () => {
+		// The upstream cyber-policy hard block must never retry, resume, or fail
+		// over — replaying the violating prompt spreads ban risk across accounts.
+		expect(classifyInvalidState("cyber_policy", "Request blocked by cyber policy")).toMatchObject({
+			category: "content_filter",
+			retryable: false,
+			resumable: false,
+		});
+		// Separator/case variants of the same upstream code classify identically.
+		expect(classifyInvalidState("Cyber-Policy", "blocked")).toMatchObject({
+			category: "content_filter",
+			retryable: false,
+		});
+		// A provider-resumable hint must not override the violation veto.
+		expect(
+			classifyInvalidState("cyber_policy", "blocked", { statusCode: 400, resumable: true }),
+		).toMatchObject({ category: "content_filter", retryable: false, resumable: false });
+		// Unrelated reasons are untouched by the detector.
+		expect(classifyInvalidState("api_error", "upstream failed")).not.toMatchObject({
+			category: "content_filter",
+		});
+	});
+
+	test("policy violation force-disables retry even when a custom rule would match", () => {
+		// The veto outranks user-authored retry rules on purpose: replaying a
+		// violating prompt against another account is how upstream bans propagate.
+		const rules = [{ id: "r1", keyword: "cyber", enabled: true }];
+		const err = Object.assign(new Error("OpenAI API error 400: blocked by cyber policy"), {
+			status: 400,
+			diagnostics: { code: "cyber_policy", message: "blocked by cyber policy" },
+		});
+		expect(isRetryableError(err, rules)).toBe(false);
+	});
+
+	test("policy violation force-disables retry despite a provider retryable:true flag", () => {
+		const err = Object.assign(new Error("blocked"), {
+			code: "cyber_policy",
+			retryable: true,
+		});
+		expect(isRetryableError(err)).toBe(false);
+	});
+
+	test("policy violation force-disables resumability despite a resumable flag", () => {
+		const err = Object.assign(new Error("blocked"), {
+			resumable: true,
+			diagnostics: { code: "cyber_policy", resumable: true },
+		});
+		expect(isResumableError(err)).toBe(false);
+	});
+
+	test("non-violation errors still honor custom retry rules (veto does not overreach)", () => {
+		const rules = [{ id: "r1", keyword: "vendor busy", enabled: true }];
+		expect(isRetryableError(new Error("vendor busy right now"), rules)).toBe(true);
+	});
 });
 
 describe("plugin provider retryable classification", () => {
@@ -759,7 +815,9 @@ describe("isModelUnavailableError", () => {
 		expect(isModelUnavailableError(new Error("NUG chat error 503: no available credentials"))).toBe(
 			true,
 		);
-		expect(isModelUnavailableError(new Error('channel "anthropic" has no healthy nodes'))).toBe(true);
+		expect(isModelUnavailableError(new Error('channel "anthropic" has no healthy nodes'))).toBe(
+			true,
+		);
 		expect(isModelUnavailableError(new Error("no available API keys: all disabled"))).toBe(true);
 		expect(isModelUnavailableError(new Error("model upstream unavailable"))).toBe(true);
 		expect(isModelUnavailableError(new Error("all credentials exhausted after retries: 401"))).toBe(

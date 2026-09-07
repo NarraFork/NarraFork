@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
+import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { formatOriginLabel, type MessageOriginOptions } from "@shared/message-origin";
 import { isDanglingReasoningOnlyAssistantMessage } from "@shared/reasoning-content";
 import {
@@ -4559,8 +4560,11 @@ export async function runAgentLoop(
 			break;
 		}
 	} catch (err) {
-		const errorMsg = err instanceof Error ? err.message : String(err);
-		logger.error("Narrator loop error", { narratorId, error: errorMsg });
+		const errorMsg = serializeCatalogErrorMessage(err);
+		logger.error("Narrator loop error", {
+			narratorId,
+			error: err instanceof Error ? err.message : String(err),
+		});
 		try {
 			await withDbRetry(
 				() =>

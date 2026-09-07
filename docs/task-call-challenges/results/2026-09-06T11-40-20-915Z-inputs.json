@@ -1,0 +1,56 @@
+{
+  "interfaceVersion": "task-call-v3",
+  "api": "# 同步任务对象：实验接口\n\n你只有原生工具 Eval，输入 {\"code\":\"TypeScript 代码\"}；请实际调用，不要只在正文贴代码。\n\n## 先选流程，再写代码\n\n- 执行自己的工作：按要求操作并验证后 finish(summary)；自管任务 done，分派任务 submitted、等待负责人验收。测试失败则 block 实际错误，不重跑相同失败命令来取错误。\n- 验收他人的 submitted：在实际验收的同一次 Eval 中取得对象 t，t.read()，核对最新 acceptance/result 及所需证明材料，满足后 t.accept()。finish 不是验收；另一对象或上一 Eval 的 read 不算。\n- 只查询或列计划：读取/分页或 add 即可，不额外开始、完成或恢复任务；按要求返回结果，计划保持 todo。\n\n已确定的顺序操作放在同一次 Eval；需要理解新信息时才先返回。数据未变且目标已达成就结束，不重复测试、查询或提交。\n\n## 同步对象\n\n代码从上到下执行；可用变量、if、循环、map/forEach、try/catch，不使用 await/async/Promise/import 或宿主 API。每次 Eval 变量和对象重新创建，任务数据保留。\n\ntask 是宿主绑定的当前任务；只读属性 key/text/status/paused/archived。task.children 是支持 list/get/add 的子集合。不要手传 ref、直接赋值或编造方法。\n\n- tasks.list(options?)：返回一页 {items: Task[], hasMore, next()}，不是完整数组；需要全量命中时循环至 hasMore=false。options：scope: self|team 或 agent（互斥），relation: current|creator|participated，archived: exclude|include|only（默认 exclude），search。主代理默认 team，子代理默认自己的工作。\n- tasks.get(key, options?)：返回 Task；查看归档时 options 传 {archived: \"include\"}，无需 restore。读取他人任务不授予写权限。\n- tasks.add(text, options?)：创建并返回 todo Task；可带 {children: string[]} 一并创建子任务，不自动开始。主代理默认建根项，子代理默认在分派根下创建。\n- task.read()：刷新本对象，返回 {key,text,status,paused,archived,description,acceptance,result,workflow}。result 可为 null；workflow 仅提示当前角色/状态的可选动作，不是执行要求或授权。\n- task.start()：开始自己有权执行的 todo 任务；已 doing 不必重复开始。\n- task.finish(summary)：仅报告自己的执行结果，不用于验收别人。自管任务 done，分派任务 submitted。\n- task.block(reason)：记录实际受阻原因；已有错误可直接用其 message，不假报完成。\n\n## 工具、返回与帮助\n\n- tools.Read({file_path})：读取模拟文件，返回 {output: string}；不是原始字符串或真实宿主文件。\n- tools.Bash({command})：执行模拟命令，成功返回 {output: string}；失败抛出带 code/message 的 Error，可 try/catch。\n- help(\"task\") 查看目录，help(\"task.方法名\") 查用法；已给出用法无需再次查询。\n- 用 return 返回所需值，保留要求的形状（状态、数组或文本）；不返回无关详情。无 return 时显示最后一次调用的结果。\n- 错误不回滚此前成功的调用。目标变更时重新 read 核对新要求，不能用旧测试结果重试 finish；权限拒绝不强行覆盖。\n",
+  "evalTool": {
+    "name": "Eval",
+    "description": "执行同步 TypeScript 操作 task/tasks/tools；仅实际调用 Eval 才算执行，不支持 await/async/import。已确定的顺序操作放在同一次 Eval；需要理解新信息时才先返回。数据未变且目标已达成就结束，不重复测试、查询或提交。finish 报告自己的工作，accept 验收他人（同一 Eval 先 read 核对）。return 所需结果；失败不回滚此前成功的调用。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "同步 TypeScript；按已知流程串联调用，用 return 返回要求的最小结果"
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "contract": {
+    "version": "task-call-v3",
+    "flows": {
+      "sequence": "已确定的顺序操作放在同一次 Eval；需要理解新信息时才先返回。数据未变且目标已达成就结束，不重复测试、查询或提交。",
+      "execute": "执行自己的工作：按要求操作并验证后 finish(summary)；自管任务 done，分派任务 submitted、等待负责人验收。测试失败则 block 实际错误，不重跑相同失败命令来取错误。",
+      "review": "验收他人的 submitted：在实际验收的同一次 Eval 中取得对象 t，t.read()，核对最新 acceptance/result 及所需证明材料，满足后 t.accept()。finish 不是验收；另一对象或上一 Eval 的 read 不算。",
+      "query": "只查询或列计划：读取/分页或 add 即可，不额外开始、完成或恢复任务；按要求返回结果，计划保持 todo。"
+    },
+    "help": {
+      "task.read": "task.read()：刷新本对象，返回 {key,text,status,paused,archived,description,acceptance,result,workflow}。result 可为 null；workflow 仅提示当前角色/状态的可选动作，不是执行要求或授权。",
+      "task.start": "task.start()：开始自己有权执行的 todo 任务；已 doing 不必重复开始。",
+      "task.finish": "task.finish(summary)：仅报告自己的执行结果，不用于验收别人。自管任务 done，分派任务 submitted。",
+      "task.block": "task.block(reason)：记录实际受阻原因；已有错误可直接用其 message，不假报完成。",
+      "task.accept": "task.accept()：验收他人的 submitted：在实际验收的同一次 Eval 中取得对象 t，t.read()，核对最新 acceptance/result 及所需证明材料，满足后 t.accept()。finish 不是验收；另一对象或上一 Eval 的 read 不算。",
+      "task.archive": "task.archive()：负责人归档 done/cancelled；归档不删除，不结束未完成工作。",
+      "task.restore": "task.restore()：负责人先 get(key,{archived:\"include\"}) 再 restore；仅恢复可见性，仍暂停。查询历史无需恢复。",
+      "tasks.list": "tasks.list(options?)：返回一页 {items: Task[], hasMore, next()}，不是完整数组；需要全量命中时循环至 hasMore=false。options：scope: self|team 或 agent（互斥），relation: current|creator|participated，archived: exclude|include|only（默认 exclude），search。主代理默认 team，子代理默认自己的工作。",
+      "tasks.get": "tasks.get(key, options?)：返回 Task；查看归档时 options 传 {archived: \"include\"}，无需 restore。读取他人任务不授予写权限。",
+      "tasks.add": "tasks.add(text, options?)：创建并返回 todo Task；可带 {children: string[]} 一并创建子任务，不自动开始。主代理默认建根项，子代理默认在分派根下创建。",
+      "task.children.list": "task.children.list(options?)：查询子任务集合。返回一页 {items: Task[], hasMore, next()}，不是完整数组；需要全量命中时循环至 hasMore=false。options：scope: self|team 或 agent（互斥），relation: current|creator|participated，archived: exclude|include|only（默认 exclude），search。主代理默认 team，子代理默认自己的工作。",
+      "task.children.get": "task.children.get(key, options?)：返回 Task；查看归档时 options 传 {archived: \"include\"}，无需 restore。读取他人任务不授予写权限。",
+      "task.children.add": "task.children.add(text, options?)：在当前任务下拆分工作。创建并返回 todo Task；可带 {children: string[]} 一并创建子任务，不自动开始。",
+      "page.next": "page.next()：保留筛选和归档读取范围，取得下一 TaskPage；先检查 page.hasMore。",
+      "tools.Read": "tools.Read({file_path})：读取模拟文件，返回 {output: string}；不是原始字符串或真实宿主文件。",
+      "tools.Bash": "tools.Bash({command})：执行模拟命令，成功返回 {output: string}；失败抛出带 code/message 的 Error，可 try/catch。"
+    }
+  },
+  "challenges": {
+    "01-current-task.md": "# Challenge 01：当前分派任务\n\n你是执行子代理。当前 `task` 已经开始，任务由主代理分派给你。\n\n读取当前任务的验收要求，执行其中指定的测试命令；测试成功后报告结果。不要创建任务、归档任务或替主代理验收。\n\n通过 Eval 返回当前任务的最终 status。最后用一句话如实说明它是已完成还是待验收。\n",
+    "02-plan-tree.md": "# Challenge 02：一次建立计划\n\n你是主代理。建立一个名为“实现配置导入”的新根任务，并为它建立以下三个直接子任务：\n\n1. 解析配置\n2. 校验输入\n3. 回归测试\n\n这些是尚未开始的计划，一起建立，不执行测试，不开始或完成任何任务，也不要修改已有任务。\n\n通过 Eval 返回新根任务的 key。\n",
+    "03-archived-pages.md": "# Challenge 03：查阅另一个成员的历史\n\n你是执行子代理，默认视图不是团队全部历史。\n\n查出成员 `qa` 曾参与过的、已归档、标题包含“回归”的全部任务。结果可能有多页。\n\n只做查询，不恢复、不归档、不改动任何任务。通过 Eval 返回匹配任务的 key 数组，不要返回整份任务正文。\n",
+    "04-test-failure.md": "# Challenge 04：测试失败不能报完成\n\n当前 task 已经开始。读取验收要求并运行指定的测试。\n\n如果测试通过，报告完成；如果测试失败，把当前任务标为受阻并记录实际失败原因。不要创建替代任务，不要凭空声称通过。\n\n通过 Eval 返回当前任务的最终 status。\n",
+    "05-changed-contract.md": "# Challenge 05：结果被拒绝后的处理\n\n当前 task 已经开始。先读取验收要求，执行指定测试，并尝试报告结果。\n\n如果报告时宿主提示任务目标或验收条件已经改变，不要拿旧测试结果再次报告，不要取消或强行重开任务。重新读取任务，通过 Eval 返回最新的 acceptance 文本，然后停止本次工作，等待确认新的范围。\n",
+    "06-review-handoff.md": "# Challenge 06：主代理验收子代理的提交\n\n你是主代理。前端子代理提交了任务 `T21`，等待验收。\n\n查看其结果；只有结果明确说明“键盘可访问”与“对比度检查”两项均通过，才验收这次提交。不要用“我完成了”替代验收，不改派、不创建任务、不修改其他任务。未教过的动作可查询帮助。\n\n通过 Eval 返回 `T21` 的最终 status。\n"
+  }
+}

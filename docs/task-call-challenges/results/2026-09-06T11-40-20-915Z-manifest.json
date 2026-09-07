@@ -1,0 +1,48 @@
+{
+  "runId": "2026-09-06T11-40-20-915Z",
+  "limits": {
+    "responses": 5,
+    "evals": 6,
+    "requestMs": 120000,
+    "responseChars": 64000
+  },
+  "models": [
+    "nugjp:codex:gpt-5.6-luna",
+    "nug2:antigravity:gemini-3.7-flash"
+  ],
+  "effort": "low",
+  "image": "0d36aaa2c1ad7cccd2dc0cf7fba4efb11ea7193023cecb1c27a84463c9ba01aa",
+  "files": [
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-flash-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-luna-1.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-flash-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-luna-2.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-luna-3.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-flash-3.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-luna-4.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-flash-4.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-flash-5.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-luna-5.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-flash-6.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-luna-6.json"
+  ],
+  "interfaceVersion": "task-call-v3",
+  "apiHash": "1cae5eb4ed98cc83df55d82a617150f7f044dac451dda5d945bbd841288868a4",
+  "descriptionHash": "eeaa53c053ad10e08252913c6f3f47c87d0363d6047cba359ced0dd1ab0ad8df",
+  "contractHash": "10ce1d8d14553f15ed3a40d7afff140b731ac011bb5a925d269280f9a3a41a7e",
+  "simulatorHash": "c02816d9b7611dd4c1b170c6cc056a1e14990f849bc0ed3aaa7b8dda7bda78c5",
+  "graderHash": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398",
+  "sourceSnapshot": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-sources.json",
+  "inputSnapshot": "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T11-40-20-915Z-inputs.json",
+  "sourceHashes": {
+    "runner.ts": "c02816d9b7611dd4c1b170c6cc056a1e14990f849bc0ed3aaa7b8dda7bda78c5",
+    "fixtures.ts": "9dca713be6015bb951fbf903663d10dcf08025fdc15b94e5906a5144d91b9398",
+    "contract.ts": "e6118c6187950368924d607c55bdda8938b19e796aefa1f7ef5eacb6f5b1f431",
+    "run.ts": "a12a1d302f78e77c64456f24f04aee7f0a2c6e561dc5b8da287f38189db2fb44",
+    "client.ts": "f66f203b472a60deb0331f262e4edebcf11c8894b4534a9b563d6ba724fe953c",
+    "isolate.ts": "d504bee8647587d3da6bd563e395ad805dc53341f1a1277989c89b6312b1d365",
+    "analyze.ts": "7c9a849fa7256ed7fb091916ad207ead36c9c95867e9c347880dcb34dfac1cdc"
+  },
+  "status": "complete",
+  "sourceDrift": []
+}

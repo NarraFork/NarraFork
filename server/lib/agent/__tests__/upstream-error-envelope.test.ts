@@ -116,6 +116,31 @@ describe("Responses stream parser (SSE and WebSocket share this)", () => {
 		expect(events[0]?.invalidState?.reason).toBe("server_error");
 	});
 
+	test("carries cyber_policy from response.failed as the invalidState reason", () => {
+		// The Codex cyber-policy hard block arrives as a streamed response.failed
+		// whose machine code lives at response.error.code. The reason field is what
+		// the classifier and the UI key on, so it must survive verbatim.
+		const events = parseResponses({
+			type: "response.failed",
+			response: {
+				id: "resp-1",
+				status: "failed",
+				error: { code: "cyber_policy", message: "Request blocked by cyber safety policy" },
+			},
+		});
+		expect(events).toHaveLength(1);
+		expect(events[0]?.invalidState?.reason).toBe("cyber_policy");
+		expect(events[0]?.invalidState?.message).toBe("Request blocked by cyber safety policy");
+	});
+
+	test("carries cyber_policy from a bare error event as the invalidState reason", () => {
+		const events = parseResponses({
+			type: "error",
+			error: { code: "cyber_policy", message: "blocked" },
+		});
+		expect(events[0]?.invalidState?.reason).toBe("cyber_policy");
+	});
+
 	test("leaves content frames untouched", () => {
 		// Guards the same false-positive risk at the parser level, where a misread
 		// would surface as a failed turn rather than a dropped message.

@@ -2,6 +2,10 @@
 // Wraps OpenAIProvider with dynamic credential selection
 // Supports both HTTP (default) and Responses WebSocket modes
 
+import {
+	extractPolicyViolationCode,
+	isPolicyViolationCode,
+} from "@shared/agent-protocol/policy-violation";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { isAgentTaskInvalidMessage } from "../codex-agent-identity";
 import { type CallContext, getCodexManager } from "../codex-manager";
@@ -64,7 +68,17 @@ export function isCodexProviderExpected101WebSocketFailure(err: unknown): boolea
 
 function classifyCodexError(
 	err: unknown,
-): { type: "quota_exhausted"; message?: string; resetsAt?: number } | { type: "other" } {
+):
+	| { type: "quota_exhausted"; message?: string; resetsAt?: number }
+	| { type: "policy_violation"; code: string }
+	| { type: "other" } {
+	// A policy violation (cyber_policy) indicted the request content, not the
+	// credential — it must be recognized before any message-based bucket so it
+	// can skip failure reporting and failover entirely.
+	const violationCode = extractPolicyViolationCode(err);
+	if (violationCode) {
+		return { type: "policy_violation", code: violationCode };
+	}
 	const msg = getCodexProviderErrorMessage(err);
 	const lower = msg.toLowerCase();
 	if (
@@ -295,6 +309,18 @@ export class CodexProvider implements ProviderAdapter {
 		hasMore: boolean;
 	}> {
 		const classified = classifyCodexError(err);
+		if (classified.type === "policy_violation") {
+			// Content-level violation: the credential is healthy, so never count a
+			// failure (which would eventually disable it as too_many_failures) and
+			// never rotate — replaying the violating prompt against another account
+			// spreads the ban risk across the pool.
+			logger.warn("Codex request blocked by upstream policy violation", {
+				credentialId: ctx.id,
+				accountId: ctx.credential.accountId,
+				code: classified.code,
+			});
+			return { classified, hasMore: false };
+		}
 		const hasMore =
 			classified.type === "quota_exhausted"
 				? await this.manager.reportQuotaExhaustedAndRefreshUsage(ctx.id, classified.resetsAt)
@@ -497,14 +523,20 @@ export class CodexProvider implements ProviderAdapter {
 					params.onRequestStart?.({ credentialId: info?.credentialId ?? ctx.id }),
 			};
 			let hasStreamedEvents = false;
+			let sawPolicyViolation = false;
 
 			try {
 				for await (const event of provider.chat(chatParams)) {
 					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
+					// A policy-violation terminal event says nothing about credential
+					// health — count it as neither success nor failure.
+					sawPolicyViolation ||= isPolicyViolationCode(event.invalidState?.reason);
 					// Inject credentialId into the event
 					yield { ...event, credentialId: ctx.id };
 				}
-				this.manager.reportSuccess(ctx.id);
+				if (!sawPolicyViolation) {
+					this.manager.reportSuccess(ctx.id);
+				}
 				return;
 			} catch (err) {
 				if (params.signal.aborted) {
@@ -565,6 +597,7 @@ export class CodexProvider implements ProviderAdapter {
 					params.onRequestStart?.({ credentialId: info?.credentialId ?? ctx.id }),
 			};
 			let hasStreamedEvents = false;
+			let sawPolicyViolation = false;
 
 			try {
 				const request = this.buildResponsesWebSocketRequest(params);
@@ -596,13 +629,18 @@ export class CodexProvider implements ProviderAdapter {
 						}),
 				})) {
 					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
+					// Same neutrality rule as the SSE path: a policy violation is a
+					// content verdict, not a credential-health signal.
+					sawPolicyViolation ||= isPolicyViolationCode(event.invalidState?.reason);
 					// The WebSocket path bypasses OpenAIProvider.chat(), so tag encrypted
 					// reasoning credentials with the "codex" identity here — without it,
 					// the strict replay check on the next turn cannot prove ownership
 					// and would drop the credential.
 					yield { ...stampReasoningSource(event, "codex"), credentialId: ctx.id };
 				}
-				this.manager.reportSuccess(ctx.id);
+				if (!sawPolicyViolation) {
+					this.manager.reportSuccess(ctx.id);
+				}
 				return;
 			} catch (err) {
 				if (params.signal.aborted) {
@@ -631,9 +669,12 @@ export class CodexProvider implements ProviderAdapter {
 					try {
 						for await (const event of provider.chat(chatParams)) {
 							hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
+							sawPolicyViolation ||= isPolicyViolationCode(event.invalidState?.reason);
 							yield { ...event, credentialId: ctx.id };
 						}
-						this.manager.reportSuccess(ctx.id);
+						if (!sawPolicyViolation) {
+							this.manager.reportSuccess(ctx.id);
+						}
 						return;
 					} catch (fallbackErr) {
 						if (params.signal.aborted) throw fallbackErr;
@@ -679,9 +720,12 @@ export class CodexProvider implements ProviderAdapter {
 					try {
 						for await (const event of provider.chat(chatParams)) {
 							hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
+							sawPolicyViolation ||= isPolicyViolationCode(event.invalidState?.reason);
 							yield { ...event, credentialId: ctx.id };
 						}
-						this.manager.reportSuccess(ctx.id);
+						if (!sawPolicyViolation) {
+							this.manager.reportSuccess(ctx.id);
+						}
 						return;
 					} catch (fallbackErr) {
 						if (params.signal.aborted) throw fallbackErr;

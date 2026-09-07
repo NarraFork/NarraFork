@@ -1,3 +1,7 @@
+import { ApiError } from "@frontend/lib/api/client";
+import { describeApiError } from "@frontend/lib/api-error";
+import { extractPolicyViolationCode } from "@shared/agent-protocol/policy-violation";
+import { ERROR_CATALOG } from "@shared/error-catalog";
 import type { TFunction } from "i18next";
 
 const EMPTY_RESPONSE_RE =
@@ -6,12 +10,14 @@ const EMPTY_RESPONSE_RE =
 /** Leading `"<provider>: "` tag the agent loop prefixes onto its own messages. */
 const PROVIDER_PREFIX_RE = /^(?:Error:\s*)?([^:\s][^:]*): /;
 
-function isPaymentRequiredPayload(errorMessage: string): boolean {
+function parseErrorMessagePayload(errorMessage: string): Record<string, unknown> | undefined {
 	try {
-		const parsed = JSON.parse(errorMessage) as Record<string, unknown>;
-		return parsed.type === "payment_required";
+		const parsed: unknown = JSON.parse(errorMessage);
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+			? (parsed as Record<string, unknown>)
+			: undefined;
 	} catch {
-		return false;
+		return undefined;
 	}
 }
 
@@ -63,6 +69,16 @@ const CONTEXT_KEYS: Record<string, string> = {
 };
 
 /**
+ * Upstream policy-violation reason codes (e.g. Codex `cyber_policy`). These get
+ * their own copy because the follow-up action is unique: the turn was refused
+ * for its content, nothing was retried or failed over, and repeating the same
+ * prompt risks the upstream account.
+ */
+const POLICY_VIOLATION_KEYS: Record<string, string> = {
+	cyber_policy: "cyberPolicyViolation",
+};
+
+/**
  * Turn a narrator error/warning into user-facing text.
  *
  * `diagnostics` is preferred over the raw message: the server always ships a
@@ -77,14 +93,43 @@ export function localizeNarratorError(
 ): string | null | undefined {
 	if (!errorMessage) return errorMessage;
 
-	if (errorCode === "payment_required" || isPaymentRequiredPayload(errorMessage)) {
+	const payload = parseErrorMessagePayload(errorMessage);
+	if (errorCode === "payment_required" || payload?.type === "payment_required") {
 		return t("recharge.paymentRequired");
 	}
 
 	const contextKey = errorCode ? CONTEXT_KEYS[errorCode] : undefined;
 	if (contextKey) return t(contextKey);
 
-	// Prefer the explicit errorCode, then the structured diagnostics reason.
+	// errorMessage is the only persisted carrier available to the details panel.
+	// Reuse the catalog renderer (including unknown-key and English fallbacks).
+	if (payload?.type === "catalog_error" && typeof payload.error === "string") {
+		return describeApiError(new ApiError(payload.error, 0, payload), t).message;
+	}
+	// Old sessions saved only English. Match the complete known message, never
+	// arbitrary upstream prose which might quote or discuss tutorial retirement.
+	const legacyTutorialMessage = ERROR_CATALOG.TUTORIAL_REMOVED.en;
+	if (
+		errorCode === "TUTORIAL_REMOVED" ||
+		errorMessage === legacyTutorialMessage ||
+		errorMessage === `Error: ${legacyTutorialMessage}`
+	) {
+		return t("errors:TUTORIAL_REMOVED", { defaultValue: legacyTutorialMessage });
+	}
+
+	// Check each structured carrier independently: a generic HTTP error type in
+	// reason (or errorCode) must not hide diagnostics.code === "cyber_policy".
+	const violationCode = extractPolicyViolationCode({ code: errorCode, diagnostics });
+	const violationKey = violationCode ? POLICY_VIOLATION_KEYS[violationCode] : undefined;
+	const requestId = nonEmptyString(diagnostics?.requestId);
+	if (violationKey) {
+		const provider = resolveProvider(errorMessage, diagnostics);
+		const localized = t(violationKey, {
+			provider: provider ?? t("emptyResponseProviderFallback"),
+		});
+		return requestId ? `${localized} ${t("errorRequestIdLabel", { requestId })}` : localized;
+	}
+	// Preserve precedence for the existing empty-response sub-reasons.
 	const reason = errorCode ?? nonEmptyString(diagnostics?.reason);
 	const reasonKey = reason ? REASON_KEYS[reason] : undefined;
 	if (reasonKey) {
@@ -93,7 +138,6 @@ export function localizeNarratorError(
 			provider: provider ?? t("emptyResponseProviderFallback"),
 			stopReason: resolveStopReason(diagnostics) ?? "",
 		});
-		const requestId = nonEmptyString(diagnostics?.requestId);
 		// The request id is what makes a report actionable against upstream logs.
 		return requestId ? `${localized} ${t("errorRequestIdLabel", { requestId })}` : localized;
 	}

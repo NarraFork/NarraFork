@@ -3,6 +3,7 @@
 	"VALIDATION_FAILED": "Request validation failed: {{detail}}",
 	"FORBIDDEN_ACTION": "You are not allowed to perform this action",
 	"INTERNAL_ERROR": "The server ran into an internal error",
+	"TUTORIAL_REMOVED": "The interactive tutorial has been removed. Saved conversations and sandbox files are unchanged. Use the learning guide instead.",
 	"GIT_NOT_INSTALLED": "Git is not installed. Install git and retry this action.",
 	"DEFAULT_MODEL_NOT_CONFIGURED": "No default model is configured. Choose one in Settings → Models, then retry.",
 	"PODMAN_NOT_FOUND": "Podman is not installed",

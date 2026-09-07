@@ -1,0 +1,20 @@
+{
+  "runId": "2026-09-06T09-53-49-584Z",
+  "limits": {
+    "responses": 5,
+    "evals": 6,
+    "requestMs": 120000,
+    "responseChars": 64000
+  },
+  "models": [
+    "nugjp:codex:gpt-5.6-luna",
+    "nug2:antigravity:gemini-3.7-flash"
+  ],
+  "effort": "low",
+  "files": [
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-53-49-584Z-flash-4.json",
+    "/home/fulcrum/projects/narrafork/docs/task-call-challenges/results/2026-09-06T09-53-49-584Z-luna-4.json"
+  ],
+  "simulatorHash": "566ed8697e99322307497c125f5b056d6d294172d953f184b4c2a4a0411c698d",
+  "graderHash": "db7c3fc30f506a3750d3d722c36f50e1908c528b61e14937c3c61db23d34f21e"
+}

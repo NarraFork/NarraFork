@@ -1,3 +1,7 @@
+import {
+	extractPolicyViolationCode,
+	isPolicyViolationCode,
+} from "@shared/agent-protocol/policy-violation";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import {
 	isTransientTlsHandshakeError,
@@ -429,6 +433,16 @@ export function classifyInvalidState(
 	// safe to blindly continue past.
 	const providerResumable = diagnostics?.resumable === true;
 
+	// Upstream policy violations (e.g. Codex `cyber_policy`) are hard refusals of
+	// the request content itself. They must never retry, resume, or fail over to
+	// another credential — replaying the same prompt across the account pool is
+	// how upstream bans propagate. Bucketed as content_filter: the category only
+	// drives loop behaviour (terminal), while the exact reason code keeps flowing
+	// to the UI for precise wording.
+	if (isPolicyViolationCode(normalizedReason)) {
+		return { category: "content_filter", retryable: false, resumable: false, statusCode };
+	}
+
 	if (isCompletionLimitReason(normalizedReason)) {
 		return { category: "completion_limit", retryable: false, resumable: false, statusCode };
 	}
@@ -710,6 +724,9 @@ export function getPaymentRequiredErrorInfo(err: unknown): PaymentRequiredErrorI
  * from generic patterns is not safe here).
  */
 export function isResumableError(err: unknown): boolean {
+	// A policy violation vetoes resumability the same way it vetoes retryability:
+	// continuing from partial output would replay the violating prompt context.
+	if (extractPolicyViolationCode(err)) return false;
 	if (err instanceof ProviderInvalidStateError) return err.resumable;
 	if (!err || typeof err !== "object") return false;
 	const obj = err as Record<string, unknown>;
@@ -882,6 +899,11 @@ export function isRetryableError(
 	err: unknown,
 	customRetryRules = settings.agent.customRetryRules,
 ): boolean {
+	// An upstream policy violation (e.g. Codex `cyber_policy`) indicts the request
+	// content itself, so auto-retry is force-disabled here — ahead of EVERY other
+	// heuristic, including user-authored custom retry rules: replaying the prompt
+	// against the same or another account is how upstream bans propagate.
+	if (extractPolicyViolationCode(err)) return false;
 	// Stream stale timeout is always retryable
 	if (err instanceof StreamStaleError) return true;
 	if (err instanceof ProviderInvalidStateError) return err.retryable;

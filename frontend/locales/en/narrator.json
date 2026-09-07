@@ -231,6 +231,7 @@
 	"emptyResponseNamelessToolCall": "{{provider}} announced a tool call without a tool name, so nothing could run. This is an upstream protocol fault.",
 	"emptyResponseStopWithoutContent": "{{provider}} finished with \"{{stopReason}}\" but produced no content. The request reached the model, so this is an upstream problem, not a local configuration error.",
 	"reasoningOnlyExhausted": "{{provider}} kept returning reasoning without an answer or tool call. This is a model-behaviour problem — try a different model or simplify the task.",
+	"cyberPolicyViolation": "{{provider}} refused this request under its cyber-security policy (cyber_policy). The turn was terminated without retrying or switching accounts; sending similar content again may get the upstream account banned.",
 	"errorRequestIdLabel": "Request ID: {{requestId}}",
 	"bufferPreservedNotice": "Queued messages have been preserved. They will be sent automatically after a successful retry.",
 	"narratorRetrying": "Temporarily Unavailable — Retrying",

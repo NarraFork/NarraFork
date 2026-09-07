@@ -1,4 +1,8 @@
 import type { Agent as HttpAgent, IncomingMessage } from "node:http";
+import {
+	CYBER_POLICY_VIOLATION_CODE,
+	normalizePolicyViolationCode,
+} from "@shared/agent-protocol/policy-violation";
 import { eq, sql } from "drizzle-orm";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import type WebSocket from "ws";
@@ -12,7 +16,7 @@ import {
 	stripResponsesLiteHeader,
 } from "../user-agent";
 import { deriveCodexWindowId } from "./codex-request";
-import { parseUpstreamErrorEnvelope } from "./error-diagnostics";
+import { parseErrorDiagnostics, parseUpstreamErrorEnvelope } from "./error-diagnostics";
 import { parseGatewayDataEvent } from "./gateway-events";
 import {
 	type OAIMessage,
@@ -377,6 +381,43 @@ export function isCodexWebSocketPreviousResponseMissingError(
 	return wrappedErrorCodes(error).includes(PREVIOUS_RESPONSE_NOT_FOUND_CODE);
 }
 
+/**
+ * Recover the normalized policy-violation code (e.g. `cyber_policy`) carried by
+ * a wrapped upstream error, or null. Checks every code-bearing field because
+ * the observed payloads split the signal across `code` and `type`.
+ */
+function wrappedPolicyViolationCode(error: CodexWrappedErrorEvent): string | null {
+	for (const code of wrappedErrorCodes(error)) {
+		const violation = normalizePolicyViolationCode(code);
+		if (violation) return violation;
+	}
+	return null;
+}
+
+/**
+ * Build the terminal invalidState event for a policy violation, mirroring what
+ * `parseResponsesAPIEvent` produces for a streamed `response.failed`. The whole
+ * point of this shape is reuse: the agent loop's classifier reads
+ * `invalidState.reason`, so a violation emitted this way is terminal (never
+ * retried, resumed, or failed over) with no transport-specific handling.
+ */
+function buildPolicyViolationEvent(
+	code: string,
+	message: string,
+	status?: number,
+): ParsedStreamEvent {
+	return {
+		invalidState: {
+			reason: code,
+			message,
+			diagnostics: parseErrorDiagnostics(
+				{ code, statusCode: status, message },
+				{ source: "provider", phase: "policy_violation", reason: code, message },
+			),
+		},
+	};
+}
+
 export function decidePrematureCodexReconnect(
 	latestMessageCreatedAt: string | null,
 	hasYieldedEvents: boolean,
@@ -657,6 +698,17 @@ export function findCodexRecoverableCloseCode(
 	if (text.includes(CONNECTION_LIMIT_REACHED_CODE)) return CONNECTION_LIMIT_REACHED_CODE;
 	if (text.includes(PREVIOUS_RESPONSE_NOT_FOUND_CODE)) return PREVIOUS_RESPONSE_NOT_FOUND_CODE;
 	return null;
+}
+
+/**
+ * Salvage a policy-violation code from a truncated close reason. RFC 6455 caps
+ * close reasons at 123 bytes, so the JSON payload upstream writes there is
+ * usually cut mid-string and unparseable — but the machine code itself appears
+ * verbatim and never occurs in prose, which makes a substring check exact here
+ * (the same argument as {@link findCodexRecoverableCloseCode}).
+ */
+export function findCodexPolicyViolationCloseCode(text: string): string | null {
+	return text.includes(CYBER_POLICY_VIOLATION_CODE) ? CYBER_POLICY_VIOLATION_CODE : null;
 }
 
 export function parseCodexWrappedError(text: string): CodexWrappedErrorEvent | null {
@@ -1336,6 +1388,33 @@ export async function* streamCodexResponsesWebSocket(
 					const status = closeWrappedError.status ?? closeWrappedError.status_code;
 					const errorCode = closeWrappedError.error?.code ?? closeWrappedError.error?.type;
 					const error = formatWrappedError(closeWrappedError);
+					const closeViolation = wrappedPolicyViolationCode(closeWrappedError);
+					if (closeViolation) {
+						// A policy verdict delivered on the close frame is a content refusal,
+						// not a transport failure. Emit it as a terminal invalidState (the
+						// same channel a streamed response.failed takes) instead of
+						// throwing: a throw would strip the code into prose, penalize a
+						// healthy credential via reportFailure, and risk a replay of the
+						// violating prompt through the SSE fallback.
+						logger.warn("Codex WebSocket closed with a policy violation", {
+							sessionKey: options.sessionKey,
+							narratorId: options.narratorId,
+							credentialId: options.credentialId,
+							model: options.model,
+							closeCode: frame.code,
+							status,
+							code: closeViolation,
+						});
+						// The caller may return as soon as it receives invalidState.
+						await discardResponseChain(session);
+						connection = null;
+						yield buildPolicyViolationEvent(
+							closeViolation,
+							closeWrappedError.error?.message ?? error.message,
+							status,
+						);
+						return;
+					}
 					if (isCodexWebSocketConnectionLimitError(closeWrappedError)) {
 						const outcome = await handleConnectionLimitReached({
 							status,
@@ -1401,6 +1480,26 @@ export async function* streamCodexResponsesWebSocket(
 					yield { silentDisconnect: true };
 					return;
 				}
+				// A policy violation survives truncation the same way: the code token is
+				// verbatim in the reason even when the JSON around it is cut off.
+				const truncatedViolation = findCodexPolicyViolationCloseCode(frame.reason);
+				if (truncatedViolation) {
+					logger.warn("Codex WebSocket closed with a truncated policy violation reason", {
+						sessionKey: options.sessionKey,
+						narratorId: options.narratorId,
+						credentialId: options.credentialId,
+						model: options.model,
+						closeCode: frame.code,
+						code: truncatedViolation,
+					});
+					await discardResponseChain(session);
+					connection = null;
+					yield buildPolicyViolationEvent(
+						truncatedViolation,
+						"Upstream closed the connection with a policy violation (cyber_policy)",
+					);
+					return;
+				}
 
 				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
 				const decision = decidePrematureCodexReconnect(
@@ -1449,6 +1548,31 @@ export async function* streamCodexResponsesWebSocket(
 			if (wrappedError) {
 				const status = wrappedError.status ?? wrappedError.status_code;
 				const error = formatWrappedError(wrappedError);
+				const frameViolation = wrappedPolicyViolationCode(wrappedError);
+				if (frameViolation) {
+					// Same rule as the close-frame path: a policy verdict rides out as a
+					// terminal invalidState, never as a thrown error that retry
+					// classifiers (or the SSE fallback) could act on. The user-facing
+					// message is the upstream text without the diagnostic suffix.
+					logger.warn("Codex WebSocket received a policy violation error frame", {
+						sessionKey: options.sessionKey,
+						narratorId: options.narratorId,
+						credentialId: options.credentialId,
+						model: options.model,
+						status,
+						code: frameViolation,
+					});
+					// Do not leave an open socket or stale response chain behind if
+					// the consumer returns without advancing past this yield.
+					await discardResponseChain(session);
+					connection = null;
+					yield buildPolicyViolationEvent(
+						frameViolation,
+						wrappedError.error?.message ?? error.message,
+						status,
+					);
+					return;
+				}
 				if (isCodexWebSocketConnectionLimitError(wrappedError)) {
 					const outcome = await handleConnectionLimitReached({
 						status,
@@ -1504,6 +1628,16 @@ export async function* streamCodexResponsesWebSocket(
 				itemsAdded.push(cloneJson(chunk.item));
 			}
 
+			if (chunk.type === "response.failed" || chunk.type === "response.incomplete") {
+				// Discard the dead chain BEFORE exposing any terminal events: the
+				// consumer may stop iteration on invalidState and skip code after yield.
+				// Still yield the parsed events so the caller can classify the upstream reason.
+				await discardResponseChain(session);
+				connection = null;
+				yield* parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum);
+				return;
+			}
+
 			for (const event of parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum)) {
 				hasYieldedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 				yield event;
@@ -1514,19 +1648,6 @@ export async function* streamCodexResponsesWebSocket(
 				session.lastRequest = cloneJson(request);
 				session.lastCompleted = { responseId, itemsAdded: cloneJson(itemsAdded) };
 				touchSession(session);
-				return;
-			}
-			if (chunk.type === "response.failed" || chunk.type === "response.incomplete") {
-				// The chain is dead, but the CALLER must still learn why. `parseResponsesAPIEvent`
-				// has already turned this chunk into an `invalidState` event above, which carries
-				// the upstream code/message and lets the agent loop classify it (retryable
-				// server_error vs. terminal refusal vs. context overflow).
-				//
-				// Returning without that distinction — as this did — presented a failed response
-				// as a successful empty turn, so a transient upstream error looked like the model
-				// choosing to say nothing.
-				await discardResponseChain(session);
-				connection = null;
 				return;
 			}
 		}

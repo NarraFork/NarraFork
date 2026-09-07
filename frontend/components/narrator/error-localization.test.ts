@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import type { TFunction } from "i18next";
+import { catalogError } from "@server/lib/errors";
+import { parseErrorDiagnostics } from "@shared/agent-protocol/error-diagnostics";
+import { ERROR_CATALOG, serializeCatalogErrorMessage } from "@shared/error-catalog";
+import { createInstance, type TFunction } from "i18next";
+import enErrors from "../../locales/en/errors.json";
+import zhErrors from "../../locales/zh-CN/errors.json";
 import { localizeNarratorError } from "./error-localization";
 
 /**
@@ -64,11 +69,160 @@ describe("localizeNarratorError 结构化归因", () => {
 		expect(result).toBe("emptyResponseNoEvents(provider=kimi-2)");
 	});
 
+	test("cyber_policy 违规走专属文案，而非通用错误", () => {
+		const result = localizeNarratorError(
+			"codex: Request blocked by cyber safety policy",
+			t,
+			"cyber_policy",
+			{
+				reason: "cyber_policy",
+				provider: "codex",
+			},
+		);
+		expect(result).toBe("cyberPolicyViolation(provider=codex)");
+	});
+
+	test("cyber_policy 违规附带 requestId 便于对账上游日志", () => {
+		const result = localizeNarratorError("codex: blocked", t, undefined, {
+			reason: "cyber_policy",
+			provider: "codex",
+			requestId: "req-cyber-1",
+		});
+		expect(result).toBe(
+			"cyberPolicyViolation(provider=codex) errorRequestIdLabel(requestId=req-cyber-1)",
+		);
+	});
+
+	test("分隔符/大小写变体的违规码同样命中专属文案", () => {
+		const result = localizeNarratorError("codex: blocked", t, "Cyber-Policy", {
+			provider: "codex",
+		});
+		expect(result).toBe("cyberPolicyViolation(provider=codex)");
+	});
+
+	test("标准 HTTP 错误的通用 type 不遮住 cyber_policy code，并保留请求 ID", () => {
+		const body = {
+			error: {
+				type: "invalid_request_error",
+				code: "cyber_policy",
+				message: "Request blocked by cyber safety policy",
+			},
+			request_id: "req-http-policy",
+		};
+		const diagnostics = parseErrorDiagnostics(body, { provider: "codex:account" });
+		expect(diagnostics?.reason).toBe("invalid_request_error");
+		expect(diagnostics?.code).toBe("cyber_policy");
+		for (const errorCode of [undefined, "invalid_request_error"]) {
+			expect(localizeNarratorError(body.error.message, t, errorCode, { ...diagnostics })).toBe(
+				"cyberPolicyViolation(provider=codex:account) errorRequestIdLabel(requestId=req-http-policy)",
+			);
+		}
+	});
+
+	test("三个结构化载体独立识别策略码，通用错误码不能遮住 reason", () => {
+		for (const [errorCode, diagnostics] of [
+			["Cyber-Policy", { code: "invalid_request_error", reason: "invalid_request_error" }],
+			["invalid_request_error", { code: " Cyber Policy ", reason: "invalid_request_error" }],
+			["invalid_request_error", { code: "invalid_request_error", reason: "Cyber-Policy" }],
+		] as const) {
+			expect(localizeNarratorError("codex: blocked", t, errorCode, diagnostics)).toBe(
+				"cyberPolicyViolation(provider=codex)",
+			);
+		}
+	});
+
+	test("仅正文提及 cyber_policy 或未知近似码不会误触发策略文案", () => {
+		const message = "Provider could not load a document discussing cyber_policy";
+		for (const code of [undefined, 400, "cyber_policy_extra", "unknown_policy"]) {
+			expect(
+				localizeNarratorError(message, t, "invalid_request_error", {
+					code,
+					reason: "invalid_request_error",
+					responseSnippet: "cyber_policy",
+				}),
+			).toBe(message);
+		}
+	});
+
 	test("既无 diagnostics.provider 也无前缀时使用占位文案", () => {
 		const result = localizeNarratorError("nothing arrived at all", t, undefined, {
 			reason: "empty_response_no_events",
 		});
 		expect(result).toBe("emptyResponseNoEvents(provider=emptyResponseProviderFallback)");
+	});
+});
+
+describe("localizeNarratorError 教程下线", () => {
+	const legacy = ERROR_CATALOG.TUTORIAL_REMOVED.en;
+	const serialized = serializeCatalogErrorMessage(catalogError("TUTORIAL_REMOVED"));
+
+	test("目录错误经序列化后保留稳定标识和英文兜底", () => {
+		expect(JSON.parse(serialized)).toEqual({
+			type: "catalog_error",
+			error: legacy,
+			messageCode: "TUTORIAL_REMOVED",
+			messageParams: {},
+		});
+	});
+
+	for (const [locale, bundle] of [
+		["en", enErrors],
+		["zh-CN", zhErrors],
+	] as const) {
+		test(`${locale}：实时错误与刷新后仅有 errorMessage 的详情都使用已有翻译`, async () => {
+			const i18n = createInstance();
+			await i18n.init({
+				lng: locale,
+				defaultNS: "narrator",
+				resources: { [locale]: { errors: bundle } },
+			});
+			const translate = i18n.getFixedT(locale, "narrator") as TFunction;
+			const wire = JSON.parse(JSON.stringify({ error: serialized }));
+			const reloaded = JSON.parse(JSON.stringify({ errorMessage: serialized }));
+			expect(localizeNarratorError(wire.error, translate)).toBe(bundle.TUTORIAL_REMOVED);
+			expect(localizeNarratorError(reloaded.errorMessage, translate)).toBe(bundle.TUTORIAL_REMOVED);
+		});
+
+		test(`${locale}：确切的旧英文消息（含 Error 前缀）仍可本地化`, async () => {
+			const i18n = createInstance();
+			await i18n.init({
+				lng: locale,
+				defaultNS: "narrator",
+				resources: { [locale]: { errors: bundle } },
+			});
+			const translate = i18n.getFixedT(locale, "narrator") as TFunction;
+			for (const message of [legacy, `Error: ${legacy}`]) {
+				expect(localizeNarratorError(message, translate)).toBe(bundle.TUTORIAL_REMOVED);
+			}
+			expect(localizeNarratorError("retired", translate, "TUTORIAL_REMOVED")).toBe(
+				bundle.TUTORIAL_REMOVED,
+			);
+		});
+	}
+
+	test("旧消息兼容不匹配正文片段、引用、额外上下文或裸错误码", () => {
+		for (const message of [
+			`The upstream said: ${legacy}`,
+			`${legacy} Additional diagnostic detail`,
+			`"${legacy}"`,
+			"TUTORIAL_REMOVED",
+			JSON.stringify({ message: legacy }),
+		]) {
+			expect(localizeNarratorError(message, t)).toBe(message);
+		}
+	});
+
+	test("新版本目录码及缺少翻译时显示原始可读消息而非 JSON", async () => {
+		const i18n = createInstance();
+		await i18n.init({ lng: "en", defaultNS: "narrator", resources: {} });
+		const translate = i18n.getFixedT("en", "narrator") as TFunction;
+		expect(localizeNarratorError(serialized, translate)).toBe(legacy);
+		const future = JSON.stringify({
+			type: "catalog_error",
+			error: "Future server error",
+			messageCode: "FROM_A_NEWER_SERVER",
+		});
+		expect(localizeNarratorError(future, translate)).toBe("Future server error");
 	});
 });
 

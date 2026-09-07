@@ -89,6 +89,13 @@ export const ERROR_CATALOG = {
 		en: "Internal server error",
 	},
 
+	// --- retired features ------------------------------------------------------
+	TUTORIAL_REMOVED: {
+		status: 410,
+		code: "TUTORIAL_REMOVED",
+		en: "The interactive tutorial has been removed. Saved conversations and sandbox files are unchanged. Use the learning guide instead.",
+	},
+
 	// --- dependencies ----------------------------------------------------------
 	GIT_NOT_INSTALLED: {
 		status: 503,
@@ -289,4 +296,17 @@ export function readErrorPayload(data: Record<string, unknown> | null | undefine
 			? sanitizeErrorParams(rawParams as ErrorMessageParams)
 			: {};
 	return { messageCode, messageParams: params };
+}
+
+/**
+ * Preserve catalog metadata in string-only errorMessage storage and events.
+ * Plain errors keep their previous text; catalog errors keep readable English
+ * alongside the stable key and bounded params, without a schema change.
+ */
+export function serializeCatalogErrorMessage(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	if (!(error instanceof Error)) return message;
+	const metadata = readErrorPayload(error as unknown as Record<string, unknown>);
+	if (!metadata.messageCode) return message;
+	return JSON.stringify({ type: "catalog_error", error: message, ...metadata });
 }
