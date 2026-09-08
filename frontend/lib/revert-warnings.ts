@@ -25,6 +25,18 @@ function formatSamples(t: Translate, samplePaths: string[]): string {
 
 /** One advisory as a sentence in the active language. */
 export function formatRevertWarning(t: Translate, warning: RevertWarning): string {
+	if (warning.code === "WORKSPACE_SCOPE_EVIDENCE_UNCERTAIN") {
+		const parts = [t("revertWarnEvidenceUncertain")];
+		if (warning.legacyCount > 0) {
+			parts.push(t("revertWarnLegacyEvidence", { count: warning.legacyCount }));
+		}
+		if (warning.unknownCount > 0) {
+			parts.push(t("revertWarnUnknownEvidence", { count: warning.unknownCount }));
+		}
+		if (!warning.warningScanComplete) parts.push(t("revertWarnScanIncomplete"));
+		if (warning.countsLowerBound) parts.push(t("revertWarnCountsLowerBound"));
+		return parts.join(" ") + formatSamples(t, warning.sampleFilePaths);
+	}
 	if (warning.code === "SUBAGENT_CHANGES_REVERTED") {
 		return (
 			t("revertWarnSubagentReverted", { count: warning.changeCount }) +

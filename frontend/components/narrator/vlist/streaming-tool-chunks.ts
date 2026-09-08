@@ -26,7 +26,8 @@
 
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import {
-	getStreamingFieldPreview,
+	completeStreamingFieldRanges,
+	foldStreamingToolFields,
 	getToolOutputPreview,
 	type TopLevelStreamingChunk,
 } from "../narrator-message-helpers";
@@ -71,17 +72,7 @@ export function applyStreamingToolChunk(store: StreamingToolStore, event: ToolCh
 	// events below; a late argument chunk must not demote it back to "streaming".
 	if (existing?._started) return false;
 
-	let streamingFieldName = existing?.streamingFieldName;
-	let streamingFieldValue = existing?.streamingFieldValue;
-	if (event.streamingField) {
-		const sameField = streamingFieldName === event.streamingField.name;
-		streamingFieldName = event.streamingField.name;
-		streamingFieldValue = getStreamingFieldPreview(
-			sameField
-				? `${streamingFieldValue ?? ""}${event.streamingField.delta}`
-				: event.streamingField.delta,
-		);
-	}
+	const fields = foldStreamingToolFields(existing, event);
 
 	store.set(event.toolUseId, {
 		...existing,
@@ -94,10 +85,8 @@ export function applyStreamingToolChunk(store: StreamingToolStore, event: ToolCh
 		...(event.contentCharsReceived !== undefined
 			? { contentCharsReceived: event.contentCharsReceived }
 			: {}),
-		...(event.extractedFields !== undefined ? { extractedFields: event.extractedFields } : {}),
 		...(event.metadata !== undefined ? { metadata: event.metadata } : {}),
-		...(streamingFieldName !== undefined ? { streamingFieldName } : {}),
-		...(streamingFieldValue !== undefined ? { streamingFieldValue } : {}),
+		...fields,
 	});
 	return true;
 }
@@ -203,7 +192,12 @@ export function applyStreamingToolStarted(
 		_started: true,
 		// Field-scoped guard: everything else in this object still merges normally.
 		_status: resolveLiveToolStatus(existing?._status, "initializing"),
-		...(event.input ? { _input: event.input } : {}),
+		...(event.input
+			? {
+					_input: event.input,
+					streamingFieldRanges: completeStreamingFieldRanges(existing, event.input),
+				}
+			: {}),
 		...(event.streamStartedAt != null ? { _startedAt: event.streamStartedAt } : {}),
 		...(event.metadata ? { _metadata: event.metadata } : {}),
 	});
@@ -351,7 +345,12 @@ export function applyStreamingToolCompleted(
 		_status: event.status,
 		...(event.output !== undefined ? { _output: event.output } : {}),
 		...(event.durationMs != null ? { _durationMs: event.durationMs } : {}),
-		...(event.updatedInput ? { _input: event.updatedInput } : {}),
+		...(event.updatedInput
+			? {
+					_input: event.updatedInput,
+					streamingFieldRanges: completeStreamingFieldRanges(existing, event.updatedInput),
+				}
+			: {}),
 		...(event.metadata ? { _metadata: event.metadata } : {}),
 	});
 	return true;

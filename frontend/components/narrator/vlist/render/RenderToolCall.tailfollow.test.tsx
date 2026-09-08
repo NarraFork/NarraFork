@@ -1,233 +1,279 @@
-/**
- * RenderToolCall.tailfollow.test.tsx — which capped bodies get the
- * output-tail follow wrapper (AutoFollowScroll) and which must not.
- *
- * The follow is for bodies whose NEWEST content is at the BOTTOM while they
- * GROW — bash/terminal output, a streaming Write preview, a streaming Edit
- * diff — so such a body scrolls itself (and pins on MOUNT: its first frame may
- * already overflow). The gates:
- *
- *  - sections path: a literal `output` label AND a terminal-style cap
- *    (`detail-term` / `detail-streaming-bash`), OR a `detail-streaming` body
- *    (that cap only comes out of classifyStreamingInput), OR a `detail-diff`
- *    body while the card is still streaming;
- *  - single-block path (a lone unlabelled section collapses into it): the same
- *    tag rules minus the label — this is where a streaming Write/Edit preview
- *    lands before its path row exists;
- *  - a streaming command box (`detail-streaming-bash` WITHOUT the output label)
- *    and every settled code/diff body stay head-anchored: they read from the
- *    head.
- *
- * Structure only: SSR paints no scroll handlers, so the assertion is whether
- * the scroll box's parent is AutoFollowScroll's `position:relative; min-width:0`
- * wrapper. The follow BEHAVIOUR is pinned in AutoFollowScroll.test.tsx.
- */
-
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
-import i18next, { type i18n } from "i18next";
+import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
-import { renderToStaticMarkup } from "react-dom/server";
-import { I18nextProvider, initReactI18next } from "react-i18next";
-import narratorLocale from "../../../../locales/en/narrator.json";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { measureToolCall, type ToolCallStatus } from "../measure/measure-tool-call";
+import { installCanvasStub } from "../measure/test-canvas-stub";
+import type { VListViewControls } from "../VListContentViewHost";
+import { resolveToolDetailViewTargets } from "../vlist-content-view-target";
+import { RenderToolCall } from "./RenderToolCall";
 
-// A REAL i18n instance, not a module mock: bun shares one module registry
-// across every file of an invocation, so a `mock.module("react-i18next")`
-// leaks into later files that expect the real thing.
-let testI18n: i18n;
+let root: Root;
+let container: HTMLDivElement;
+let restore: () => void;
+let restoreCanvas: () => void;
+let clock = 0;
+const frames = new Map<number, FrameRequestCallback>();
+let frameId = 0;
 
-const { measureToolCall } = await import("../measure/measure-tool-call");
-const { installCanvasStub } = await import("../measure/test-canvas-stub");
-const { RenderToolCall } = await import("./RenderToolCall");
-
-const disposeCanvasStub = installCanvasStub();
-afterAll(() => disposeCanvasStub());
-
-let parse: (html: string) => Element;
-
-beforeAll(async () => {
-	testI18n = i18next.createInstance();
-	await testI18n.use(initReactI18next).init({
-		lng: "en",
-		fallbackLng: "en",
-		defaultNS: "narrator",
-		ns: ["narrator"],
-		resources: { en: { narrator: narratorLocale } },
-		interpolation: { escapeValue: false },
-		react: { useSuspense: false },
-	});
-	parse = (html: string) => {
-		const { document } = parseHTML(`<!doctype html><html><body><div id="r">${html}</div></body>`);
-		const root = document.getElementById("r");
-		if (!root) throw new Error("no root");
-		return root as unknown as Element;
+beforeEach(() => {
+	const { window } = parseHTML("<!doctype html><html><body></body></html>");
+	const values: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLDivElement: window.HTMLDivElement,
+		Element: window.Element,
+		Node: window.Node,
+		Event: window.Event,
+		IS_REACT_ACT_ENVIRONMENT: true,
+		getComputedStyle: () => ({ overflowY: "visible" }),
+		matchMedia: () => ({
+			matches: false,
+			addEventListener() {},
+			removeEventListener() {},
+			addListener() {},
+			removeListener() {},
+		}),
+		requestAnimationFrame: (fn: FrameRequestCallback) => {
+			frames.set(++frameId, fn);
+			return frameId;
+		},
+		cancelAnimationFrame: (id: number) => frames.delete(id),
+		ResizeObserver: class {
+			observe() {}
+			disconnect() {}
+		},
 	};
+	const previous = new Map(
+		Object.keys(values).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]),
+	);
+	for (const [key, value] of Object.entries(values))
+		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+	Object.defineProperties(window.HTMLElement.prototype, {
+		scrollTop: { configurable: true, writable: true, value: 0 },
+		clientHeight: {
+			configurable: true,
+			get() {
+				return 120;
+			},
+		},
+		clientWidth: {
+			configurable: true,
+			get() {
+				return 600;
+			},
+		},
+		scrollHeight: {
+			configurable: true,
+			get() {
+				return 2_000;
+			},
+		},
+	});
+	restore = () => {
+		for (const [key, descriptor] of previous) {
+			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+			else Reflect.deleteProperty(globalThis, key);
+		}
+	};
+	restoreCanvas = installCanvasStub();
+	frames.clear();
+	clock = 0;
+	container = document.createElement("div");
+	document.body.appendChild(container);
+	root = createRoot(container);
+});
+afterEach(async () => {
+	await act(async () => root.unmount());
+	expect(frames.size).toBe(0);
+	container.remove();
+	restoreCanvas();
+	restore();
 });
 
-const WIDTH = 700;
-const LONG_BODY = Array.from({ length: 80 }, (_, i) => `line ${i}`).join("\n");
-
-/** One sections-kind card with a single capped body section. */
-function cardWithSection(opts: {
-	label?: "command" | "output";
-	cap: "bash-cmd" | "term" | "streaming-bash" | "streaming" | "code" | "diff";
-	text: string;
+async function frame() {
+	await act(async () => {
+		clock += 16;
+		const queue = [...frames];
+		frames.clear();
+		for (const [, callback] of queue) callback(clock);
+	});
+}
+function card(opts: {
+	toolName?: string;
+	status?: ToolCallStatus;
 	isStreaming?: boolean;
+	inputJson?: unknown;
+	outputJson?: unknown;
+	metadata?: Record<string, unknown>;
 }) {
+	const toolName = opts.toolName ?? "Write";
+	const category = toolName === "Bash" ? "bash" : toolName === "ExitPlanMode" ? "plan" : "file";
+	const detail = classifyToolDetail({
+		toolUseId: "call-1",
+		category,
+		...opts,
+		status: opts.status ?? "running",
+		toolName,
+	});
 	return measureToolCall(
 		{
-			toolName: "Bash",
-			summary: "cmd",
-			category: "bash",
-			status: "success",
-			toolUseId: "tu_1",
-			...(opts.isStreaming ? { isStreaming: true } : {}),
-			detail: {
-				kind: "sections",
-				sections: [
-					{
-						...(opts.label !== undefined ? { label: opts.label } : {}),
-						body: {
-							kind: "capped",
-							cap: opts.cap,
-							contentLines: 80,
-							hasLabel: false,
-							text: opts.text,
-						},
-					},
-				],
-			},
+			toolUseId: "call-1",
+			toolName,
+			summary: "test",
+			category,
+			status: opts.status ?? "running",
+			isStreaming: opts.isStreaming,
+			detail,
 		},
-		WIDTH,
+		620,
 		5,
 		{ opened: true },
 	);
 }
-
-/**
- * One SINGLE-BLOCK capped card — what `sections()` collapses a lone unlabelled
- * section into (tool-detail.ts). A streaming Write/Edit preview whose path row
- * has not arrived yet renders through this branch.
- */
-function cardWithSingleCap(opts: {
-	cap: "streaming-bash" | "streaming" | "diff" | "code";
-	text: string;
-	isStreaming?: boolean;
-}) {
-	return measureToolCall(
-		{
-			toolName: "Write",
-			summary: "file",
-			category: "file",
-			status: "success",
-			toolUseId: "tu_1",
-			...(opts.isStreaming ? { isStreaming: true } : {}),
-			detail: {
-				kind: "capped",
-				cap: opts.cap,
-				contentLines: 80,
-				hasLabel: false,
-				text: opts.text,
-			},
-		},
-		WIDTH,
-		5,
-		{ opened: true },
-	);
-}
-
-function renderCard(measured: ReturnType<typeof measureToolCall>): Element {
-	return parse(
-		renderToStaticMarkup(
+async function render(measured: ReturnType<typeof card>, controls?: VListViewControls) {
+	await act(async () =>
+		root.render(
 			<MantineProvider>
-				<I18nextProvider i18n={testI18n}>
-					<RenderToolCall measured={measured} />
-				</I18nextProvider>
+				<RenderToolCall
+					measured={measured}
+					viewTargets={controls ? resolveToolDetailViewTargets("owner", measured) : undefined}
+					viewControls={controls}
+				/>
 			</MantineProvider>,
 		),
 	);
+	await frame();
 }
-
-/** The ONE capped scroll box carrying `needle`. */
-function scrollBoxContaining(root: Element, needle: string): Element {
-	const boxes = [...root.querySelectorAll("div")].filter((el) =>
-		(el.getAttribute("style") ?? "").replaceAll(" ", "").includes("overflow-y:auto"),
+function port(source: string): HTMLElement {
+	const found = [...container.querySelectorAll<HTMLElement>("[data-content-scrollport]")].find(
+		(node) => node.getAttribute("data-content-scrollport")?.includes(source),
 	);
-	const hits = boxes.filter((el) => el.textContent?.includes(needle));
-	if (hits.length !== 1)
-		throw new Error(`expected one scroll box with ${needle}, got ${hits.length}`);
-	const box = hits[0];
-	if (!box) throw new Error("unreachable");
-	return box;
+	if (!found) throw new Error(`missing body ${source}`);
+	return found;
 }
+const controls: VListViewControls = {
+	isWrapped: () => true,
+	isSourceShown: () => false,
+	toggleWrap() {},
+	toggleSource() {},
+	openFullscreen() {},
+};
 
-/** Is the box wrapped in AutoFollowScroll's relative shell (its only marker in SSR)? */
-function isFollowWrapped(box: Element): boolean {
-	const style = (box.parentElement?.getAttribute("style") ?? "").replaceAll(" ", "");
-	return style.includes("position:relative") && style.includes("min-width:0");
-}
-
-describe("RenderToolCall — output-tail follow wrapper", () => {
-	it("wraps a bash OUTPUT box (term cap)", () => {
-		const root = renderCard(cardWithSection({ label: "output", cap: "term", text: LONG_BODY }));
-		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(true);
-	});
-
-	it("wraps a streaming bash OUTPUT box (streaming-bash cap)", () => {
-		const root = renderCard(
-			cardWithSection({ label: "output", cap: "streaming-bash", text: LONG_BODY }),
+describe("tool bodies use one permanent viewport", () => {
+	it("keeps Write identity across empty content, late path, settled state and toolbar arrival", async () => {
+		await render(
+			card({
+				isStreaming: true,
+				inputJson: { _streamingFieldName: "content", _streamingFieldValue: "" },
+			}),
 		);
-		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(true);
-	});
-
-	it("does NOT wrap the command box — a command reads from the head", () => {
-		const root = renderCard(cardWithSection({ label: "command", cap: "bash-cmd", text: "$ top" }));
-		expect(isFollowWrapped(scrollBoxContaining(root, "$ top"))).toBe(false);
-	});
-
-	it("does NOT wrap an output-labelled CODE box — code reads from the head", () => {
-		const root = renderCard(cardWithSection({ label: "output", cap: "code", text: LONG_BODY }));
-		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(false);
-	});
-
-	it("does NOT wrap a term box without the output label (input previews)", () => {
-		const root = renderCard(cardWithSection({ cap: "term", text: LONG_BODY }));
-		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(false);
-	});
-
-	it("wraps a streaming Write preview (streaming cap, no label)", () => {
-		const root = renderCard(
-			cardWithSection({ cap: "streaming", text: LONG_BODY, isStreaming: true }),
+		const node = port("input.content");
+		await render(
+			card({
+				isStreaming: true,
+				inputJson: {
+					file_path: "late.ts",
+					_streamingFieldName: "content",
+					_streamingFieldValue: "line\n".repeat(80),
+				},
+			}),
+			controls,
 		);
-		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(true);
-	});
-
-	it("wraps a streaming Edit diff (diff cap while streaming)", () => {
-		const root = renderCard(cardWithSection({ cap: "diff", text: LONG_BODY, isStreaming: true }));
-		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(true);
-	});
-
-	it("does NOT wrap a settled diff — a finished edit reads from the head", () => {
-		const root = renderCard(cardWithSection({ cap: "diff", text: LONG_BODY }));
-		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(false);
-	});
-
-	it("wraps a streaming Write preview on the SINGLE-BLOCK path (no path row yet)", () => {
-		const root = renderCard(
-			cardWithSingleCap({ cap: "streaming", text: LONG_BODY, isStreaming: true }),
+		expect(port("input.content")).toBe(node);
+		await render(
+			card({ status: "success", inputJson: { file_path: "late.ts", content: "final" } }),
+			controls,
 		);
-		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(true);
+		expect(port("input.content")).toBe(node);
+		expect(node.textContent).toContain("final");
 	});
-
-	it("wraps a streaming Edit diff on the SINGLE-BLOCK path", () => {
-		const root = renderCard(cardWithSingleCap({ cap: "diff", text: LONG_BODY, isStreaming: true }));
-		expect(isFollowWrapped(scrollBoxContaining(root, "line 42"))).toBe(true);
-	});
-
-	it("does NOT wrap a single-block streaming-bash box — the command preview reads from the head", () => {
-		const root = renderCard(
-			cardWithSingleCap({ cap: "streaming-bash", text: "$ npm test", isStreaming: true }),
+	it("gives both streaming command and execution output their own semantic viewport", async () => {
+		await render(
+			card({
+				toolName: "Bash",
+				isStreaming: true,
+				inputJson: { _streamingFieldName: "command", _streamingFieldValue: "echo" },
+			}),
 		);
-		expect(isFollowWrapped(scrollBoxContaining(root, "$ npm test"))).toBe(false);
+		const command = port("input.command");
+		expect(command.getAttribute("data-following")).toBe("true");
+		await render(
+			card({
+				toolName: "Bash",
+				inputJson: { command: "echo hi" },
+				outputJson: "hi",
+				metadata: { _streamingOutput: true },
+			}),
+		);
+		expect(port("input.command")).toBe(command);
+		expect(port("output.main")).not.toBe(command);
+		expect(port("output.main").getAttribute("data-following")).toBe("true");
+	});
+	it("opens static history at the head despite leftover output-stream metadata", async () => {
+		await render(
+			card({
+				toolName: "Bash",
+				status: "success",
+				inputJson: { command: "echo hi", _streamingOutput: "stale" },
+				outputJson: "history",
+			}),
+		);
+		const output = port("output.main");
+		expect(output.getAttribute("data-following")).toBe("false");
+		expect(output.scrollTop).toBe(0);
+	});
+	it("keeps one dynamic Diff painter from matching through replacing and completion", async () => {
+		await render(
+			card({
+				toolName: "Edit",
+				isStreaming: true,
+				inputJson: { _streamingFieldName: "old_string", _streamingFieldValue: "one\ntwo" },
+			}),
+		);
+		const viewport = port("input.edit");
+		const diff = viewport.querySelector("[data-diff-content]");
+		expect(diff).not.toBeNull();
+		await render(
+			card({
+				toolName: "Edit",
+				isStreaming: true,
+				inputJson: {
+					_streamingFields: { old_string: "one\ntwo" },
+					_streamingFieldName: "new_string",
+					_streamingFieldValue: "one\nnew",
+				},
+			}),
+		);
+		expect(port("input.edit")).toBe(viewport);
+		expect(viewport.querySelector("[data-diff-content]")).toBe(diff);
+		expect(viewport.querySelectorAll("[data-diff-row=added]").length).toBeGreaterThan(0);
+		await render(
+			card({
+				toolName: "Edit",
+				status: "success",
+				inputJson: { file_path: "late.ts", old_string: "one\ntwo", new_string: "" },
+			}),
+		);
+		expect(port("input.edit")).toBe(viewport);
+		expect(viewport.querySelector("[data-diff-content]")).toBe(diff);
+		expect(viewport.querySelectorAll("[data-diff-row=removed]").length).toBeGreaterThan(0);
+	});
+	it("keeps the viewport when switching markdown between pretext and source", async () => {
+		const measured = card({
+			toolName: "ExitPlanMode",
+			status: "success",
+			inputJson: { plan: "# Plan\n\n- first" },
+		});
+		await render(measured, controls);
+		const viewport = port("input.plan");
+		expect(viewport.querySelector("[data-tool-markdown]")).not.toBeNull();
+		await render(measured, { ...controls, isSourceShown: () => true });
+		expect(port("input.plan")).toBe(viewport);
+		expect(viewport.textContent).toContain("# Plan");
 	});
 });

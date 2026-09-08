@@ -24,6 +24,47 @@ describe("narrators API", () => {
 		}
 	});
 
+	test("encodes raw tool row refs without treating the provider ID as a PK", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const urls: URL[] = [];
+		const signals: (AbortSignal | null | undefined)[] = [];
+		Object.defineProperty(g, "fetch", {
+			value: async (url: string, init?: RequestInit) => {
+				urls.push(new URL(url, "https://test.invalid"));
+				signals.push(init?.signal);
+				return Response.json({ id: "actual-pk", inputJson: "input", outputJson: "output" });
+			},
+			configurable: true,
+		});
+		const narratorId = "n/a ?#%汉";
+		const toolUseId = "provider/reused?&x=1#% +汉";
+		const ref = { toolCallId: "pk/?&messageId=wrong#% +汉", messageId: "msg/+#%&=" };
+		const signal = new AbortController().signal;
+		expect(await api.getToolCallDetail(narratorId, toolUseId, ref, signal)).toMatchObject({
+			id: "actual-pk",
+			inputJson: "input",
+			outputJson: "output",
+		});
+		expect(urls[0].pathname).toBe(
+			`/api/narrators/${encodeURIComponent(narratorId)}/tool-calls/${encodeURIComponent(toolUseId)}`,
+		);
+		expect(Object.fromEntries(urls[0].searchParams)).toEqual(ref);
+		expect(signals[0]).toBe(signal);
+		await api.getToolCallDetail(narratorId, toolUseId, { messageId: ref.messageId });
+		expect(Object.fromEntries(urls[1].searchParams)).toEqual({ messageId: ref.messageId });
+		await api.getToolCallDetail(narratorId, toolUseId);
+		expect(urls[2].search).toBe("");
+		await api.getToolEditPreview(narratorId, toolUseId, { ...ref, executionAttempt: 2 }, signal);
+		expect(urls[3].pathname).toBe(
+			`/api/narrators/${encodeURIComponent(narratorId)}/tool-calls/${encodeURIComponent(toolUseId)}/file-edit-preview`,
+		);
+		expect(Object.fromEntries(urls[3].searchParams)).toEqual(ref);
+		expect(signals[3]).toBe(signal);
+	});
+
 	test("keeps the edit draft unless the request explicitly succeeds", () => {
 		expect(shouldClearEditDraft(true)).toBe(true);
 		expect(shouldClearEditDraft(false)).toBe(false);
@@ -219,6 +260,108 @@ describe("narrators API", () => {
 			expect((err as Error).message).toBe("Narrator message is too long");
 			expect((err as ApiError).data?.code).toBe("NARRATOR_MESSAGE_TOO_LONG");
 		}
+	});
+
+	describe("file reference request fields", () => {
+		const reference = { id: "ref-1", deviceId: "RemoteCaseID", path: "/work/a.ts", label: "a.ts" };
+
+		test.each([
+			false,
+			true,
+		])("send/edit/queue agree on omitted, empty and populated refs (multipart=%s)", async (multipart) => {
+			Object.defineProperty(g, "localStorage", {
+				value: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+				configurable: true,
+			});
+			const requests: RequestInit[] = [];
+			Object.defineProperty(g, "fetch", {
+				value: async (_url: unknown, init: RequestInit) => {
+					requests.push(init);
+					return Response.json({ ok: true });
+				},
+				configurable: true,
+			});
+			const originalXHR = Object.getOwnPropertyDescriptor(globalThis, "XMLHttpRequest");
+			class TestXHR {
+				status = 200;
+				statusText = "OK";
+				responseText = '{"ok":true}';
+				onload: (() => void) | null = null;
+				open() {}
+				setRequestHeader() {}
+				getAllResponseHeaders() {
+					return "Content-Type: application/json";
+				}
+				send(body: FormData) {
+					requests.push({ method: "POST", body });
+					queueMicrotask(() => this.onload?.());
+				}
+			}
+			Object.defineProperty(globalThis, "XMLHttpRequest", { value: TestXHR, configurable: true });
+			try {
+				for (const fileReferences of [undefined, [], [reference]]) {
+					const uploads = multipart
+						? [new File(["x"], "a.txt", { type: "text/plain" })]
+						: undefined;
+					await api.sendNarratorMessage(
+						"n",
+						"",
+						undefined,
+						uploads,
+						true,
+						undefined,
+						undefined,
+						fileReferences,
+					);
+					await api.editAndRegenerate("n", "m", "", { newTextFiles: uploads, fileReferences });
+					await api.updateBufferedMessage("n", "q", "", { newTextFiles: uploads, fileReferences });
+					for (const request of requests.splice(0)) {
+						if (multipart) {
+							expect(request.body).toBeInstanceOf(FormData);
+							const form = request.body as FormData;
+							expect(form.has("fileReferences")).toBe(fileReferences !== undefined);
+							if (fileReferences !== undefined)
+								expect(JSON.parse(String(form.get("fileReferences")))).toEqual(fileReferences);
+						} else {
+							const body = JSON.parse(String(request.body));
+							expect("fileReferences" in body).toBe(fileReferences !== undefined);
+							expect(body.fileReferences).toEqual(fileReferences);
+						}
+					}
+				}
+			} finally {
+				if (originalXHR) Object.defineProperty(globalThis, "XMLHttpRequest", originalXHR);
+				else Reflect.deleteProperty(globalThis, "XMLHttpRequest");
+			}
+		});
+
+		test("reference-only drafts share the text CAS request", async () => {
+			Object.defineProperty(g, "localStorage", {
+				value: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+				configurable: true,
+			});
+			let sent: unknown;
+			Object.defineProperty(g, "fetch", {
+				value: async (_url: unknown, init: RequestInit) => {
+					sent = JSON.parse(String(init.body));
+					return Response.json({
+						hasDraft: true,
+						text: "",
+						fileReferences: [reference],
+						revision: 4,
+					});
+				},
+				configurable: true,
+			});
+			const result = await api.updateNarratorDraft("n", "", 3, "tab", [reference]);
+			expect(sent).toEqual({
+				text: "",
+				baseRevision: 3,
+				sourceId: "tab",
+				fileReferences: [reference],
+			});
+			expect(result.fileReferences).toEqual([reference]);
+		});
 	});
 
 	describe("transcript export", () => {

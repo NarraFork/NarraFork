@@ -17,6 +17,7 @@
 
 import { ActionIcon, Badge, Box, Center, Group, Loader, Text, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import type { FileReferenceEditorSelection, FileTarget } from "@shared/file-reference";
 import {
 	IconFileCode,
 	IconFileText,
@@ -26,7 +27,6 @@ import {
 	IconInfoCircle,
 	IconMessages,
 	IconNotebook,
-	IconPencil,
 	IconRobot,
 	IconSearch,
 	IconTerminal2,
@@ -43,13 +43,18 @@ import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
 import type { PluginDockPanelProps } from "../../plugins/types";
-import type {
-	FilePanelParams,
-	KnowledgePanelParams,
-	NarratorBoundPanelParams,
-	SubagentPanelParams,
+import { getFilePreviewType } from "../FilePreviewModal";
+import { FileReferenceScopeProvider } from "../FileReferenceScope";
+import {
+	type FilePanelParams,
+	filePanelBaseName,
+	filePanelResourceId,
+	type KnowledgePanelParams,
+	type NarratorBoundPanelParams,
+	type SubagentPanelParams,
 } from "../panels/panel-kind";
 import { usePanelCompact, usePanelHeaderDrag } from "../panels/shared";
+import { toolEditReferenceKey } from "../tool-edit-reference";
 import type { NarratorDockPanelType } from "./dock-panel-types";
 import { NarratorDockContext, useNarratorDockContext } from "./NarratorDockContext";
 
@@ -87,9 +92,12 @@ const GitPanel = lazy(() =>
 const FileTreePanel = lazy(() =>
 	import("../file-tree/FileTreePanel").then((m) => ({ default: m.FileTreePanel })),
 );
-// Lazy so a session that never edits does not pay for CodeMirror's module graph.
+// Lazy so sessions without an open text file do not load the editor module graph.
 const FileEditorContent = lazy(() =>
 	import("../file-editor/FileEditorContent").then((m) => ({ default: m.FileEditorContent })),
+);
+const ToolEditFileViewer = lazy(() =>
+	import("../ToolEditFileViewer").then((m) => ({ default: m.ToolEditFileViewer })),
 );
 const FileViewerContent = lazy(() =>
 	import("../file-viewer/FileViewerContent").then((m) => ({ default: m.FileViewerContent })),
@@ -203,6 +211,7 @@ function ToolPanelShell({
 	subjectId,
 	detachKind,
 	resourceId,
+	beforeDrag,
 	children,
 }: {
 	title: string;
@@ -221,6 +230,8 @@ function ToolPanelShell({
 	detachKind?: string;
 	/** Resource identity for multi-instance kinds (subagent id, file path). */
 	resourceId?: string;
+	/** Guard custom pointer drags before a different surface can recreate the panel. */
+	beforeDrag?: () => boolean;
 	children: React.ReactNode;
 }) {
 	const onPointerDown = usePanelHeaderDrag(
@@ -230,13 +241,20 @@ function ToolPanelShell({
 		detachKind ? { toolKind: detachKind, ...(resourceId ? { resourceId } : {}) } : undefined,
 	);
 	const close = useCallback(() => props.api.close(), [props.api]);
+	const guardedPointerDown = useCallback(
+		(event: React.PointerEvent) => {
+			if (beforeDrag && !beforeDrag()) return;
+			onPointerDown(event);
+		},
+		[beforeDrag, onPointerDown],
+	);
 	return (
 		<Box style={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
 			<ToolPanelHeader
 				title={title}
 				icon={icon}
 				actions={actions}
-				onPointerDown={onPointerDown}
+				onPointerDown={guardedPointerDown}
 				onClose={close}
 			/>
 			<Box style={{ flex: 1, minHeight: 0, overflow: "auto" }}>{children}</Box>
@@ -852,46 +870,143 @@ export function MockDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParam
 	);
 }
 
-// ── File viewer (multi-instance, one panel per path) ──
+/**
+ * Dockview exposes no cancellable panel-removal event: onWillMutateLayout is
+ * notification-only. Its tabs, keyboard close and our surfaces use api.close().
+ * Guard that shared entry point and restore it when the panel unmounts.
+ *
+ * Native dragstart capture is also required: onWillDrag* depends on Dockview's
+ * optional advanced DnD service. Cancel BEFORE Dockview installs transfer data
+ * and iframe shields (a canceled native drag does not emit dragend to clean up).
+ * Block at drag START, not at close after the destination already recreated it.
+ */
+export function bindFilePanelExitGuard(
+	{ api, containerApi }: Pick<IDockviewPanelProps<FilePanelParams>, "api" | "containerApi">,
+	canExit: () => boolean,
+): () => void {
+	const originalClose = api.close;
+	const guardedClose = () => {
+		if (canExit()) originalClose.call(api);
+	};
+	api.close = guardedClose;
+	const cancel = (event: Event) => {
+		if (event.defaultPrevented || canExit()) return;
+		event.preventDefault();
+		event.stopImmediatePropagation();
+	};
+	const panelDrag = containerApi.onWillDragPanel((event) => {
+		if (event.panel.id === api.id) cancel(event.nativeEvent);
+	});
+	const groupDrag = containerApi.onWillDragGroup((event) => {
+		if (event.group.id === api.group.id) cancel(event.nativeEvent);
+	});
+	const doc = api.getWindow().document;
+	const nativeDrag = (event: DragEvent) => {
+		const target = event.target as Element | null;
+		if (!target?.closest) return;
+		const tab = target.closest(".dv-tab");
+		if (tab) {
+			const ownTab = containerApi.getPanel(api.id)?.view.tab.element;
+			if (ownTab && tab.contains(ownTab)) cancel(event);
+			return;
+		}
+		// Empty header space / tab-group grips can move the entire group. Query
+		// this group's actual header so another surface's tabs remain draggable.
+		const header = api.group.element.querySelector(".dv-tabs-and-actions-container");
+		if (header?.contains(target)) cancel(event);
+	};
+	doc.addEventListener("dragstart", nativeDrag, true);
+	return () => {
+		if (api.close === guardedClose) api.close = originalClose;
+		panelDrag.dispose();
+		groupDrag.dispose();
+		doc.removeEventListener("dragstart", nativeDrag, true);
+	};
+}
+
+// Each mounted panel keeps its own last publication as its ownership token.
+// Metadata refreshes and cleanup may only replace that token, never another panel's.
+export function useFilePanelSelectionPublisher() {
+	const dock = useNarratorDockContext();
+	const dockRef = useRef(dock);
+	dockRef.current = dock;
+	const narratorId = dock?.narratorId;
+	const publishedSelectionRef = useRef<FileReferenceEditorSelection | null>(null);
+	return useCallback(
+		(next: FileReferenceEditorSelection | null, takeOwnership = false) => {
+			const current = dockRef.current;
+			if (current?.narratorId !== narratorId) return;
+			if (
+				(next && takeOwnership) ||
+				current?.fileReferenceSelection === publishedSelectionRef.current
+			) {
+				publishedSelectionRef.current = next;
+				current?.setFileReferenceSelection?.(next);
+			}
+		},
+		[narratorId],
+	);
+}
+
+// ── File editor / binary preview (multi-instance, one panel per path) ──
 export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
 	// File identity is a RESOURCE, so the path comes from params (several file panels
 	// coexist). Host identity is different: on a focus surface the live context is the
 	// source of truth, while workspace/detached surfaces carry it in params.
-	const { filePath, fileName } = props.params;
+	const {
+		filePath,
+		fileName,
+		deviceId = "local",
+		selection,
+		highlightRequestId,
+		referenceOrigin,
+		toolEdit,
+	} = props.params;
+	const openFilePanel = dock?.openFilePanel;
+	const openFileTarget = useCallback(
+		(target: FileTarget) =>
+			openFilePanel?.(target.path, undefined, { ...target, referenceOrigin: true }),
+		[openFilePanel],
+	);
+	const publishSelection = useFilePanelSelectionPublisher();
 	const hostNarratorId = dock?.narratorId ?? props.params.hostNarratorId;
-	const title = fileName?.trim() || filePath.split(/[/\\]/).pop() || t("fileViewer.title");
-	// Read-only is the default and is never persisted: reopening a saved layout must not
-	// silently put a file into an editable state the reader did not ask for.
-	const [editing, setEditing] = useState(false);
-	// Leaving edit mode unmounts the editor, and the buffer lives only there. The
-	// toggle used to drop typed-but-unsaved work with no warning at all.
+	const title = fileName?.trim() || filePanelBaseName(filePath) || t("fileViewer.title");
 	const [editorDirty, setEditorDirty] = useState(false);
-	const toggleEditing = useCallback(() => {
-		setEditing((prev) => {
-			if (prev && editorDirty) {
-				notifications.show({
-					color: "yellow",
-					message: t("fileEditor.unsavedBlockExit"),
-					autoClose: 5000,
-				});
-				return prev;
-			}
-			return !prev;
+	const dirtyRef = useRef(false);
+	const onDirtyChange = useCallback((dirty: boolean) => {
+		// Synchronous ref keeps close/drag guards current before React rerenders.
+		dirtyRef.current = dirty;
+		setEditorDirty(dirty);
+	}, []);
+	const canExit = useCallback(() => {
+		if (!dirtyRef.current) return true;
+		notifications.show({
+			color: "yellow",
+			message: t("fileEditor.unsavedBlockExit"),
+			autoClose: 5000,
 		});
-	}, [editorDirty, t]);
+		return false;
+	}, [t]);
+	useLayoutEffect(
+		() => bindFilePanelExitGuard({ api: props.api, containerApi: props.containerApi }, canExit),
+		[props.api, props.containerApi, canExit],
+	);
+	const displayTitle = toolEdit ? `${title} · Edit` : editorDirty ? `${title} *` : title;
+	// Text always uses CodeMirror; the editor itself enforces write capability.
+	const isText = getFilePreviewType(filePath ?? "") === "text";
 
 	useLayoutEffect(() => {
 		if (!hostNarratorId || props.params.hostNarratorId === hostNarratorId) return;
-		// Hydrate focus layouts saved before file editing recorded ownership. This makes
-		// the edit action available on restore and repairs the params for future drags.
+		// Hydrate focus layouts saved before file editing recorded ownership, so the
+		// editor has its workspace scope on restore and future drags retain it.
 		props.api.updateParameters({ ...props.params, hostNarratorId });
 	}, [hostNarratorId, props.api, props.params]);
 
 	useLayoutEffect(() => {
-		if (title && title !== props.api.title) props.api.setTitle(title);
-	}, [title, props.api]);
+		if (displayTitle !== props.api.title) props.api.setTitle(displayTitle);
+	}, [displayTitle, props.api]);
 
 	if (!filePath) {
 		return (
@@ -912,45 +1027,56 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 
 	return (
 		<ToolPanelShell
-			title={title}
+			title={displayTitle}
 			icon={<IconFileText size={16} color="var(--mantine-color-dimmed)" />}
 			props={props}
 			subjectId={`__file__:${filePath}`}
 			detachKind="file"
+			beforeDrag={canExit}
 			// Multi-instance: the path is what identifies WHICH file viewer this is, so
 			// a torn-out panel can be rebuilt pointing at the same file.
-			resourceId={filePath}
-			actions={
-				// Editing needs a workspace to be bounded by, so the toggle only appears when
-				// the panel knows which narrator owns it. A file opened from a context with no
-				// host (a platform file outside any workspace) stays read-only, which is
-				// correct rather than a limitation: there is no root to permit a write.
-				hostNarratorId ? (
-					<Tooltip label={t("fileEditor.edit")} openDelay={200}>
-						<ActionIcon
-							variant={editing ? "filled" : "subtle"}
-							color={editing ? "indigo" : "gray"}
-							size="sm"
-							onClick={toggleEditing}
-						>
-							<IconPencil size={14} />
-						</ActionIcon>
-					</Tooltip>
-				) : null
-			}
+			resourceId={filePanelResourceId(filePath, deviceId, referenceOrigin, toolEdit)}
 		>
-			<LazyPanelBoundary>
-				{editing && hostNarratorId ? (
-					<FileEditorContent
-						key={`edit:${filePath}`}
-						filePath={filePath}
-						narratorId={hostNarratorId}
-						onDirtyChange={setEditorDirty}
-					/>
-				) : (
-					<FileViewerContent key={filePath} filePath={filePath} />
-				)}
-			</LazyPanelBoundary>
+			<FileReferenceScopeProvider
+				value={{
+					narratorId: hostNarratorId,
+					openFile: openFilePanel ? openFileTarget : undefined,
+					addReference: dock?.addFileReference,
+					setSelection: publishSelection,
+				}}
+			>
+				<LazyPanelBoundary>
+					{toolEdit ? (
+						<ToolEditFileViewer
+							key={toolEditReferenceKey(toolEdit)}
+							reference={toolEdit}
+							filePath={filePath}
+							navigationRequestId={highlightRequestId}
+						/>
+					) : isText ? (
+						<FileEditorContent
+							key={`edit:${deviceId}:${filePath}`}
+							filePath={filePath}
+							narratorId={hostNarratorId}
+							deviceId={deviceId}
+							referenceOrigin={referenceOrigin}
+							selection={selection}
+							navigationRequestId={highlightRequestId}
+							onDirtyChange={onDirtyChange}
+						/>
+					) : (
+						<FileViewerContent
+							key={`${deviceId}:${filePath}`}
+							filePath={filePath}
+							narratorId={hostNarratorId}
+							deviceId={deviceId}
+							referenceOrigin={referenceOrigin}
+							selection={selection}
+							highlightRequestId={highlightRequestId}
+						/>
+					)}
+				</LazyPanelBoundary>
+			</FileReferenceScopeProvider>
 		</ToolPanelShell>
 	);
 }

@@ -19,6 +19,7 @@
  * prop-callback behaviour.
  */
 
+import type { FileReference, FileReferenceEditorSelection } from "@shared/file-reference";
 import type { DockviewApi } from "dockview-react";
 import {
 	createContext,
@@ -38,6 +39,7 @@ import type {
 	NarratorDetailsPanelExternalProps,
 } from "../narrator-panel-types";
 import {
+	type FileOpenOptions,
 	type FilePanelParams,
 	type KnowledgeEntryScope,
 	type KnowledgePanelParams,
@@ -79,6 +81,7 @@ interface NarratorDockBridges {
 	 * new turn instead of queueing behind the current one.
 	 */
 	submitToNarrator: ((text: string) => void) | null;
+	addFileReference: ((reference: FileReference) => void) | null;
 }
 
 export interface NarratorDockContextValue {
@@ -190,7 +193,12 @@ export interface NarratorDockContextValue {
 	 * Open (or focus) a read-only file viewer for an absolute path. Multi-instance:
 	 * one panel per path, keyed by a hash of the path (see `fileDockPanelId`).
 	 */
-	openFilePanel: (filePath: string, fileName?: string) => void;
+	openFilePanel?: (filePath: string, fileName?: string, options?: FileOpenOptions) => void;
+	/** Selection metadata only; never copy an unsaved buffer into a saved-file reference. */
+	fileReferenceSelection?: FileReferenceEditorSelection | null;
+	setFileReferenceSelection?: (selection: FileReferenceEditorSelection | null) => void;
+	registerAddFileReference?: (fn: (reference: FileReference) => void) => () => void;
+	addFileReference?: (reference: FileReference) => void;
 	/**
 	 * Open (or focus) a knowledge entry viewer/editor panel. Multi-instance: one
 	 * panel per entry, keyed by entryId. `scope` determines which hooks are used
@@ -246,6 +254,8 @@ export function NarratorDockProvider({
 }) {
 	const apiRef = useRef<DockviewApi | null>(null);
 	const [fileModProps, setFileModProps] = useState<FileModPanelExternalProps | null>(null);
+	const [fileReferenceSelection, setFileReferenceSelection] =
+		useState<FileReferenceEditorSelection | null>(null);
 	const [detailsProps, setDetailsProps] = useState<NarratorDetailsPanelExternalProps | null>(null);
 	const [browserInfo, setBrowserInfo] = useState<NarratorBrowserInfo>({
 		sessionCount: 0,
@@ -260,6 +270,7 @@ export function NarratorDockProvider({
 		writeTerminalStdin: null,
 		scrollToMessage: null,
 		submitToNarrator: null,
+		addFileReference: null,
 	});
 
 	// Keep chapterId in a ref so openToolPanel always uses the latest without
@@ -420,10 +431,17 @@ export function NarratorDockProvider({
 	// panel id is derived from the path, so re-opening the same file focuses the
 	// existing viewer instead of stacking duplicates.
 	const openFilePanel = useCallback(
-		(filePath: string, fileName?: string) => {
+		(filePath: string, fileName?: string, options: FileOpenOptions = {}) => {
 			const api = apiRef.current;
 			if (!api || !filePath) return;
-			const id = fileDockPanelId(filePath);
+			const deviceId = options.deviceId ?? "local";
+			const navigation = {
+				deviceId,
+				toolEdit: options.toolEdit,
+				selection: options.selection,
+				highlightRequestId: options.highlightRequestId ?? nextHighlightRequestId(),
+			};
+			const id = fileDockPanelId(filePath, deviceId, options.toolEdit);
 			const existing = api.getPanel(id);
 			if (existing) {
 				// Layouts written before file editing carried no host identity. Repair the
@@ -432,18 +450,15 @@ export function NarratorDockProvider({
 				// cast: corrupt persisted params are replaced wholesale — falling through to
 				// addPanel would throw on the duplicate id.
 				const current = existing.params as FilePanelParams | undefined;
-				if (current && typeof current.filePath === "string") {
-					if (current.hostNarratorId !== narratorId) {
-						existing.api.updateParameters({ ...current, hostNarratorId: narratorId });
-					}
-				} else {
-					existing.api.updateParameters({
-						panelType: "file",
-						hostNarratorId: narratorId,
-						filePath,
-						...(fileName ? { fileName } : {}),
-					});
-				}
+				existing.api.updateParameters({
+					...current,
+					panelType: "file",
+					hostNarratorId: narratorId,
+					filePath,
+					...navigation,
+					referenceOrigin: current?.referenceOrigin === true || options.referenceOrigin === true,
+					...(fileName ? { fileName } : {}),
+				});
 				existing.api.setActive();
 				return;
 			}
@@ -457,6 +472,8 @@ export function NarratorDockProvider({
 				panelType: "file",
 				hostNarratorId: narratorId,
 				filePath,
+				...navigation,
+				referenceOrigin: options.referenceOrigin === true,
 				...(fileName ? { fileName } : {}),
 			};
 			const placement = resolveToolPlacement({
@@ -562,6 +579,17 @@ export function NarratorDockProvider({
 		[openToolPanel, closeToolPanel],
 	);
 
+	const registerAddFileReference = useCallback((fn: (reference: FileReference) => void) => {
+		bridgesRef.current.addFileReference = fn;
+		return () => {
+			if (bridgesRef.current.addFileReference === fn) bridgesRef.current.addFileReference = null;
+		};
+	}, []);
+	const addFileReference = useCallback(
+		(reference: FileReference) => bridgesRef.current.addFileReference?.(reference),
+		[],
+	);
+
 	// These callback props (onForkFromMessage, onBack, onMinimize) MUST keep stable
 	// references across parent renders. The sole call site in
 	// routes/narrators/$narratorId.tsx wraps each with useCallback, ensuring the
@@ -580,6 +608,10 @@ export function NarratorDockProvider({
 			apiRef,
 			fileModProps,
 			setFileModProps,
+			fileReferenceSelection,
+			setFileReferenceSelection,
+			registerAddFileReference,
+			addFileReference,
 			detailsProps,
 			setDetailsProps,
 			browserInfo,
@@ -638,6 +670,9 @@ export function NarratorDockProvider({
 		onBack,
 		onMinimize,
 		fileModProps,
+		fileReferenceSelection,
+		registerAddFileReference,
+		addFileReference,
 		detailsProps,
 		browserInfo,
 		openToolTypes,

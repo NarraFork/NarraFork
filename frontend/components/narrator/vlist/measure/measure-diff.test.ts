@@ -14,6 +14,8 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { createDiffDocument } from "@shared/pretext-layout/diff-core";
+import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
 import { installCanvasStub } from "./test-canvas-stub";
 
 // The deterministic canvas stub must be installed before any pretext-backed
@@ -32,20 +34,24 @@ const rows = (...contents: string[]): Row[] => contents.map((content) => ({ cont
 describe("diffGutterWidthChars", () => {
 	it("is zero when there is no structured diff", async () => {
 		const m = await mod();
-		expect(m.diffGutterWidthChars({})).toBe(0);
+		expect(m.diffGutterWidthChars(undefined)).toBe(0);
 	});
 
 	it("reserves two number columns plus a separator and the marker", async () => {
 		const m = await mod();
 		// `oldNo`(3) + ' '(1) + `newNo`(3) + marker(1) = 8
-		expect(m.diffGutterWidthChars({ diffLines: [], diffLineNoWidth: 3 })).toBe(8);
-		expect(m.diffGutterWidthChars({ diffLines: [], diffLineNoWidth: 5 })).toBe(12);
+		expect(
+			m.diffGutterWidthChars(createDiffDocument({ oldText: "a", newText: "b", startLine: 100 })),
+		).toBe(8);
+		expect(
+			m.diffGutterWidthChars(createDiffDocument({ oldText: "a", newText: "b", startLine: 10000 })),
+		).toBe(12);
 	});
 
 	it("reserves just the marker column when the diff carries no line numbers", async () => {
 		const m = await mod();
 		// Mirrors the chunked DiffView's bare `1.5ch` marker gutter.
-		expect(m.diffGutterWidthChars({ diffLines: [] })).toBe(2);
+		expect(m.diffGutterWidthChars(createDiffDocument({ oldText: "a", newText: "b" }))).toBe(6);
 	});
 });
 
@@ -160,62 +166,54 @@ describe("measureDiffContentHeight", () => {
 	});
 });
 
-describe("measureToolDetail — diff cap integration", () => {
-	it("measures the structured rows instead of the fallback line count", async () => {
-		const m = await mod();
-		const detail = {
-			kind: "capped" as const,
-			cap: "diff" as const,
-			// A deliberately WRONG contentLines: the structured rows must win.
+describe("measureToolBody — diff document integration", () => {
+	function body(oldText: string, newText: string, startLine?: number): ToolCappedDetail {
+		const diffDocument = createDiffDocument({ oldText, newText, startLine });
+		return {
+			kind: "capped",
+			cap: "diff",
+			id: "diff-fixture",
+			source: "input.edit",
+			format: "diff",
+			live: false,
+			followTarget: { kind: "diff-row", focus: diffDocument.focus },
+			diffDocument,
 			contentLines: 1,
-			text: " a\n-b\n+B",
-			diffLines: [
-				{ type: "context" as const, content: "a", oldLineNo: 1, newLineNo: 1 },
-				{ type: "removed" as const, content: "b", oldLineNo: 2 },
-				{ type: "added" as const, content: "B", newLineNo: 2 },
-			],
-			diffLineNoWidth: 3,
 		};
-		const measured = m.measureToolDetail(detail, 400);
-		const box = measured.height - m.DETAIL_TOP_MARGIN;
-		// Three rows, none wrapping at 400px.
-		expect(box).toBe(3 * m.DETAIL_CONTENT_LINE_HEIGHT + m.DETAIL_BOX_CHROME_Y);
+	}
+
+	it("measures source rows instead of an inaccurate fallback line count", async () => {
+		const m = await mod();
+		const measured = m.measureToolBody(body("a\nb", "a\nB"), 400);
+		expect(measured.height).toBe(3 * m.DETAIL_CONTENT_LINE_HEIGHT + m.DETAIL_BOX_CHROME_Y);
 	});
 
-	it("passes the gutter geometry through to the render layer", async () => {
+	it("carries only the document and matching gutter geometry, not a selected viewport", async () => {
 		const m = await mod();
-		const measured = m.measureToolDetail(
-			{
-				kind: "capped",
-				cap: "diff",
-				contentLines: 2,
-				text: "-a\n+b",
-				diffLines: [
-					{ type: "removed", content: "a", oldLineNo: 1 },
-					{ type: "added", content: "b", newLineNo: 1 },
-				],
-				diffLineNoWidth: 3,
-				diffLineNumberPrefix: "xx",
-			},
-			400,
-		);
+		const model = body("a", "b", 100);
+		const measured = m.measureToolBody(model, 400);
 		const block = measured.blocks[0];
-		expect(block?.kind).toBe("fixed");
-		if (block?.kind !== "fixed") throw new Error("unreachable");
-		// The render layer must reproduce the SAME gutter the height accounted for.
-		expect(block.data?.diffLineNoWidth).toBe(3);
+		if (block?.kind !== "fixed") throw new Error("missing body geometry");
+		expect(measured.model).toBe(model);
 		expect(block.data?.diffGutterChars).toBe(8);
-		expect(block.data?.diffLineNumberPrefix).toBe("xx");
-		expect(Array.isArray(block.data?.diffLines)).toBe(true);
+		expect(block.data?.diffLines).toBeUndefined();
+		expect(measured.frame.blocks[0]?.top).toBe(0);
 	});
 
-	it("falls back to plain text measurement when no rows are carried", async () => {
+	it("uses explicit format rather than inferring presentation from a cap", async () => {
 		const m = await mod();
-		// A legacy/unstructured diff payload still measures via the text path.
-		const measured = m.measureToolDetail(
-			{ kind: "capped", cap: "diff", contentLines: 2, text: "-a\n+b" },
-			400,
-		);
-		expect(measured.height).toBeGreaterThan(m.DETAIL_TOP_MARGIN);
+		const model: ToolCappedDetail = {
+			kind: "capped",
+			cap: "diff",
+			id: "text-fixture",
+			source: "output.main",
+			format: "text",
+			live: false,
+			followTarget: { kind: "end" },
+			text: "-a\n+b",
+		};
+		const measured = m.measureToolBody(model, 400);
+		expect(measured.height).toBeGreaterThan(0);
+		expect(measured.model.format).toBe("text");
 	});
 });

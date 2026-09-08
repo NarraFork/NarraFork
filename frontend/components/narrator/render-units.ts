@@ -31,6 +31,7 @@
  * decision is the direct result of a user action rather than an unprompted jump.
  */
 
+import { isCommunicationTool } from "@shared/communication-tool";
 import type { RenderSegment, ToolRunItem } from "./message-segments";
 import type { ContentBlock, NarratorMsg } from "./narrator-panel-types";
 import { isReasoningBlock } from "./reasoning-segments";
@@ -158,7 +159,11 @@ export function groupToolRunItemsForLod(
 
 	for (let index = 0; index < items.length; index++) {
 		const item = items[index];
-		if (isActiveToolItem(item) || isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)) {
+		if (
+			isCommunicationTool(item.tc) ||
+			isActiveToolItem(item) ||
+			isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)
+		) {
 			flushFolded();
 			groups.push({ kind: "active", item, index });
 			continue;
@@ -242,7 +247,7 @@ function splitMessageSegmentForActivity(
  *    the task board is the narrator's live working state).
  */
 function isKeptToolItem(item: ToolRunItem, keepToolUseIds?: ReadonlySet<string>): boolean {
-	if (isPermissionAwaitingToolItem(item)) return true;
+	if (isCommunicationTool(item.tc) || isPermissionAwaitingToolItem(item)) return true;
 	const toolUseId = item.tc.toolUseId;
 	return !!toolUseId && keepToolUseIds != null && keepToolUseIds.has(toolUseId);
 }
@@ -368,6 +373,42 @@ export function groupRenderUnits(
 	enabled: boolean,
 	opts?: { keepToolUseIds?: ReadonlySet<string> },
 ): RenderUnit[] {
+	// Communication bubbles keep their shape across streaming hand-off at EVERY LOD.
+	// Retire only synthetic twins; persisted retries remain distinct occurrences.
+	const persistedCommunicationIds = new Set<string>();
+	for (const seg of segments) {
+		if (seg.kind !== "tool-run") continue;
+		for (const item of seg.items) {
+			if (
+				item.msg?.id !== STREAMING_MESSAGE_ID &&
+				item.tc.toolUseId &&
+				isCommunicationTool(item.tc)
+			) {
+				persistedCommunicationIds.add(item.tc.toolUseId);
+			}
+		}
+	}
+	if (persistedCommunicationIds.size > 0) {
+		segments = segments.flatMap<RenderSegment>((seg) => {
+			if (seg.kind !== "tool-run") return [seg];
+			const items = seg.items.filter(
+				(item) =>
+					item.msg?.id !== STREAMING_MESSAGE_ID ||
+					!item.tc.toolUseId ||
+					!persistedCommunicationIds.has(item.tc.toolUseId),
+			);
+			if (items.length === seg.items.length) return [seg];
+			return items.length === 0
+				? []
+				: [
+						{
+							...seg,
+							items,
+							sourceMessages: sourceMessagesForPart({ kind: "keep", items }, seg.sourceMessages),
+						},
+					];
+		});
+	}
 	if (!enabled) return segments.map((seg) => ({ kind: "segment", seg }));
 
 	// Tool-use ids that a PERSISTED message already owns, collected over the whole

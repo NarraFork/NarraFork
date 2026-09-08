@@ -311,6 +311,35 @@ describe("Codex Responses WebSocket helpers", () => {
 		expect(isResumableError(afterOutput)).toBe(true);
 	});
 
+	test.each([
+		{ type: "error", status: 503, error: "backend unavailable" },
+		{ type: "error", status_code: "503", error: { detail: "backend unavailable" } },
+		{ type: "error", error: { statusCode: 503, description: "backend unavailable" } },
+		{ type: "error", statusCode: 503, message: "backend unavailable" },
+	])("normalizes error text and HTTP status before formatting (%j)", (frame) => {
+		const parsed = parseCodexWrappedError(JSON.stringify(frame));
+		expect(parsed?.error?.message).toBe("backend unavailable");
+		expect(parsed?.status).toBe(503);
+	});
+
+	test("keeps a code-only error actionable without inventing an upstream message", () => {
+		const parsed = parseCodexWrappedError(
+			JSON.stringify({ type: "error", error: { code: "invalid_request_error" } }),
+		);
+		expect(parsed?.error?.code).toBe("invalid_request_error");
+		expect(parsed?.error?.message).toContain("invalid_request_error");
+	});
+
+	test.each([
+		{ status: 200, message: "ok" },
+		{ message: "ordinary content" },
+		{ type: "response.metadata", message: "routing", status: 200 },
+		{ type: "response.completed", response: { id: "r", status: "completed", error: null } },
+		{ usage: { input_tokens: 1 }, status_code: 200 },
+	])("does not treat a successful or informational frame as a wrapped error (%j)", (frame) => {
+		expect(parseCodexWrappedError(JSON.stringify(frame))).toBeNull();
+	});
+
 	test("parses detailed websocket close reasons as wrapped errors", () => {
 		const parsed = parseCodexWrappedError(
 			JSON.stringify({

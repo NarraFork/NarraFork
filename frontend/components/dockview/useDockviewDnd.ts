@@ -18,6 +18,7 @@ import {
 	type DropZoneThresholds,
 	hitTestGroups,
 	intentToPosition,
+	resolveNativeDrop,
 	toIndicator,
 } from "./drop-intent";
 import { swapPanels } from "./panel-swap";
@@ -109,6 +110,93 @@ export interface UseDockviewDndResult {
  */
 export const DOCKVIEW_SURFACE_ATTR = "data-dockview-surface";
 
+/** Applied synchronously on the surface root before Dockview paints its overlay. */
+export const NATIVE_DROP_PREVIEW_CLASS = "narrafork-native-drop-preview";
+
+/**
+ * Native preview lifecycle, kept outside React so child dragleave events and
+ * Dockview's synchronous overlay paint can be tested without mocking hooks.
+ * Cancel only the native PAINT (CSS covers both in-place and anchored overlays),
+ * never the will-show event: preventDefault would disable the drop target too.
+ */
+export function bindNativeDropPreview(
+	api: DockviewApi,
+	root: HTMLElement,
+	onIndicator: (indicator: DropIndicator | null) => void,
+	thresholds?: DropZoneThresholds,
+	enableSwapZone = true,
+): () => void {
+	let current: DropIndicator | null = null;
+	const update = (next: DropIndicator | null) => {
+		// Not a React className prop: waiting for a render leaves a frame with
+		// both indicators. The root is not rewritten by Dockview's own classnames.
+		root.classList.toggle(NATIVE_DROP_PREVIEW_CLASS, next !== null);
+		if (
+			current === next ||
+			(current &&
+				next &&
+				current.variant === next.variant &&
+				current.left === next.left &&
+				current.top === next.top &&
+				current.width === next.width &&
+				current.height === next.height)
+		)
+			return;
+		current = next;
+		onIndicator(next);
+	};
+	const clear = () => update(null);
+	const subscription = api.onWillShowOverlay((event) => {
+		const resolved = event.defaultPrevented
+			? null
+			: resolveNativeDrop(api, event, thresholds, enableSwapZone);
+		update(resolved ? toIndicator(resolved.hit, thresholds) : null);
+	});
+	const doc = root.ownerDocument;
+	const outside = (event: MouseEvent) => {
+		const rect = root.getBoundingClientRect();
+		return (
+			event.clientX < rect.left ||
+			event.clientX > rect.right ||
+			event.clientY < rect.top ||
+			event.clientY > rect.bottom
+		);
+	};
+	const leave = (event: MouseEvent) => {
+		// Only the active surface measures anything; many graph docks can coexist.
+		if (current && outside(event)) clear();
+	};
+	const dragLeave = (event: DragEvent) => {
+		if (!current) return;
+		const destination = event.relatedTarget;
+		if (destination && "nodeType" in destination && root.contains(destination as Node)) return;
+		// A child->child transition often has a null relatedTarget in native DnD.
+		// It is NOT a drag end. Only clear on a real surface/window exit; subsequent
+		// dragover/pointermove also clears when the pointer has moved outside.
+		if (outside(event) || event.target === root) clear();
+	};
+	const handleEscape = (event: KeyboardEvent) => {
+		if (event.key === "Escape") clear();
+	};
+	const endEvents = ["drop", "dragend", "pointerup", "pointercancel"] as const;
+	for (const name of endEvents) doc.addEventListener(name, clear, true);
+	root.addEventListener("dragleave", dragLeave);
+	doc.addEventListener("dragover", leave, true);
+	doc.addEventListener("pointermove", leave, true);
+	doc.addEventListener("keydown", handleEscape, true);
+	doc.defaultView?.addEventListener("blur", clear);
+	return () => {
+		clear();
+		subscription.dispose();
+		for (const name of endEvents) doc.removeEventListener(name, clear, true);
+		root.removeEventListener("dragleave", dragLeave);
+		doc.removeEventListener("dragover", leave, true);
+		doc.removeEventListener("pointermove", leave, true);
+		doc.removeEventListener("keydown", handleEscape, true);
+		doc.defaultView?.removeEventListener("blur", clear);
+	};
+}
+
 /**
  * Whether `root` is the topmost DockviewSurface in a front-to-back hit-test stack.
  *
@@ -194,8 +282,6 @@ export function useDockviewDnd(options: UseDockviewDndOptions): UseDockviewDndRe
 	const [dropIndicator, setDropIndicator] = useState<DropIndicator | null>(null);
 
 	useEffect(() => {
-		let target: DockviewDropTarget | null = null;
-
 		const unsubMove = onPanelDragMove((state: PanelDragState) => {
 			const api = apiRef.current;
 			const root = rootRef.current;
@@ -205,27 +291,31 @@ export function useDockviewDnd(options: UseDockviewDndOptions): UseDockviewDndRe
 			// (e.g. a sidebar narrator) can never land here, and the indicator would
 			// compete with the outer drop zone that actually owns the gesture.
 			if (!canSurfaceHandleDrag(state, surfaceId, !!onDropSubject)) {
-				target = null;
 				setDropIndicator(null);
 				return;
 			}
 			const hit = hitTestGroups(api, state.x, state.y, state.panelId, thresholds);
 			if (!hit) {
-				target = null;
 				setDropIndicator(null);
 				return;
 			}
-			target = { groupId: hit.group.id, intent: hit.intent, targetPanelId: hit.targetPanelId };
 			setDropIndicator(toIndicator(hit, thresholds));
 		});
 
 		const unsubEnd = onPanelDragEnd((final: PanelDragState | null) => {
-			const resolved = target;
-			target = null;
 			setDropIndicator(null);
 			const api = apiRef.current;
 			const root = rootRef.current;
-			if (!api || !root || !final || !resolved) return;
+			if (!api || !root || !final) return;
+			if (!canSurfaceHandleDrag(final, surfaceId, !!onDropSubject)) return;
+			// Release may have crossed a zone boundary since the last move event.
+			const hit = hitTestGroups(api, final.x, final.y, final.panelId, thresholds);
+			if (!hit) return;
+			const resolved = {
+				groupId: hit.group.id,
+				intent: hit.intent,
+				targetPanelId: hit.targetPanelId,
+			};
 
 			// Only the surface the pointer was actually released over may act.
 			//

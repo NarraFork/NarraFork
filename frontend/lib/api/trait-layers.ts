@@ -1,3 +1,4 @@
+import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import { request } from "./client";
 
 /** The two layers above a narrator. */
@@ -29,11 +30,11 @@ export interface LayerTraitsResponse {
 	customTraits: {
 		subagentModelRestriction: {
 			version: 1;
-			pools: Record<string, { model: string; purpose?: string }[]>;
+			pools: SubagentModelPools;
 		} | null;
 		disabledTools: { version: 1; tools: string[] } | null;
 		blockedSkills: { version: 1; all: boolean; names: string[] } | null;
-		availableModels: { model: string; purpose?: string }[];
+		availableModels: SubagentModelUse[];
 		availableTools: { name: string; description: string; category: string }[];
 	};
 	deviceInjection: LayerDeviceInjection | null;
@@ -81,7 +82,7 @@ export const traitLayersApi = {
 		layer: TraitLayer,
 		ownerId: string,
 		payload: {
-			pools: Record<string, { model: string; purpose?: string }[]>;
+			pools: SubagentModelPools;
 			enforced: boolean;
 		},
 	) =>

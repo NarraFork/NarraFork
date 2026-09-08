@@ -20,6 +20,7 @@
  * (referencing the narrator's own cell instead of a `chat` panel).
  */
 
+import type { FileReference, FileReferenceEditorSelection } from "@shared/file-reference";
 import type { DockviewApi } from "dockview-react";
 import {
 	createContext,
@@ -33,19 +34,26 @@ import {
 } from "react";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { PluginUiSurfaceProvider } from "../../plugins/PluginUiSurfaceContext";
-import { hashFilePath, type NarratorToolPanelType } from "../dock/dock-panel-types";
+import { filePanelIdentity, type NarratorToolPanelType } from "../dock/dock-panel-types";
 import type { NarratorBrowserInfo, NarratorDockContextValue } from "../dock/NarratorDockContext";
 import type {
 	FileModPanelExternalProps,
 	NarratorDetailsPanelExternalProps,
 } from "../narrator-panel-types";
-import { type KnowledgeEntryScope, nextHighlightRequestId } from "../panels/panel-kind";
+import {
+	type FileOpenOptions,
+	type FilePanelParams,
+	type KnowledgeEntryScope,
+	nextHighlightRequestId,
+} from "../panels/panel-kind";
 import { resolveToolPlacement } from "../panels/tool-placement";
+import type { ToolEditReference } from "../tool-edit-reference";
 import { PANEL_COMPONENT, type WorkspacePanelParams } from "./panel-types";
 
 /** The published + bridged state we shard per narrator. */
 interface NarratorDockShard {
 	fileModProps: FileModPanelExternalProps | null;
+	fileReferenceSelection: FileReferenceEditorSelection | null;
 	detailsProps: NarratorDetailsPanelExternalProps | null;
 	browserInfo: NarratorBrowserInfo;
 	openToolTypes: ReadonlySet<NarratorToolPanelType>;
@@ -56,6 +64,7 @@ const EMPTY_TOOL_TYPES: ReadonlySet<NarratorToolPanelType> = new Set();
 function emptyShard(): NarratorDockShard {
 	return {
 		fileModProps: null,
+		fileReferenceSelection: null,
 		detailsProps: null,
 		browserInfo: { sessionCount: 0, visualChange: null },
 		openToolTypes: EMPTY_TOOL_TYPES,
@@ -82,6 +91,7 @@ interface NarratorDockBridges {
 	 * preserves busy-narrator buffering and slash-command handling.
 	 */
 	submitToNarrator: ((text: string) => void) | null;
+	addFileReference: ((reference: FileReference) => void) | null;
 }
 
 /** Stable dockview panel id for a narrator-scoped tool panel. */
@@ -103,8 +113,13 @@ export function workspaceSubagentPanelId(
  * file is already open; the raw path is unsafe in an id (separators, spaces,
  * length) and lives in the panel params instead.
  */
-export function workspaceFilePanelId(hostNarratorId: string, filePath: string): string {
-	return `wfile_${hostNarratorId}_${hashFilePath(filePath)}`;
+export function workspaceFilePanelId(
+	hostNarratorId: string,
+	filePath: string,
+	deviceId = "local",
+	toolEdit?: ToolEditReference,
+): string {
+	return `wfile_${hostNarratorId}_${filePanelIdentity(filePath, deviceId, toolEdit)}`;
 }
 
 /**
@@ -121,7 +136,7 @@ export function workspaceKnowledgePanelId(hostNarratorId: string, entryId: strin
  * object that is replaced (never mutated) on change so React can bail out of
  * updates for untouched narrators.
  */
-class WorkspaceDockStore {
+export class WorkspaceDockStore {
 	readonly apiRef: RefObject<DockviewApi | null>;
 	private shards = new Map<string, NarratorDockShard>();
 	private bridges = new Map<string, NarratorDockBridges>();
@@ -209,10 +224,28 @@ class WorkspaceDockStore {
 				writeTerminalStdin: null,
 				scrollToMessage: null,
 				submitToNarrator: null,
+				addFileReference: null,
 			};
 			this.bridges.set(narratorId, b);
 		}
 		return b;
+	}
+
+	setFileReferenceSelection(narratorId: string, selection: FileReferenceEditorSelection | null) {
+		if (this.getSnapshot(narratorId).fileReferenceSelection === selection) return;
+		this.patch(narratorId, { fileReferenceSelection: selection });
+	}
+
+	registerAddFileReference(narratorId: string, fn: (reference: FileReference) => void): () => void {
+		const b = this.getBridges(narratorId);
+		b.addFileReference = fn;
+		return () => {
+			if (b.addFileReference === fn) b.addFileReference = null;
+		};
+	}
+
+	addFileReference(narratorId: string, reference: FileReference) {
+		this.getBridges(narratorId).addFileReference?.(reference);
 	}
 
 	registerAppendChatInput(narratorId: string, fn: (text: string) => void): () => void {
@@ -468,12 +501,35 @@ class WorkspaceDockStore {
 	 * Open (or focus) a read-only file viewer inside one narrator's cluster. Same
 	 * placement rule as the other secondary panels; multi-instance, keyed by path.
 	 */
-	openFilePanel(hostNarratorId: string, filePath: string, fileName?: string) {
+	openFilePanel(
+		hostNarratorId: string,
+		filePath: string,
+		fileName?: string,
+		options: FileOpenOptions = {},
+	) {
 		const api = this.apiRef.current;
 		if (!api || !filePath) return;
-		const id = workspaceFilePanelId(hostNarratorId, filePath);
+		const deviceId = options.deviceId ?? "local";
+		const navigation = {
+			deviceId,
+			toolEdit: options.toolEdit,
+			selection: options.selection,
+			highlightRequestId: options.highlightRequestId ?? nextHighlightRequestId(),
+		};
+		const id = workspaceFilePanelId(hostNarratorId, filePath, deviceId, options.toolEdit);
 		const existing = api.getPanel(id);
 		if (existing) {
+			existing.api.updateParameters({
+				...(existing.params as FilePanelParams),
+				panelType: "file",
+				hostNarratorId,
+				filePath,
+				...navigation,
+				referenceOrigin:
+					(existing.params as FilePanelParams)?.referenceOrigin === true ||
+					options.referenceOrigin === true,
+				...(fileName ? { fileName } : {}),
+			});
 			existing.api.setActive();
 			return;
 		}
@@ -487,6 +543,8 @@ class WorkspaceDockStore {
 			panelType: "file",
 			hostNarratorId,
 			filePath,
+			...navigation,
+			referenceOrigin: options.referenceOrigin === true,
 			...(fileName ? { fileName } : {}),
 		};
 		const placement = resolveToolPlacement({
@@ -738,6 +796,11 @@ export function useWorkspaceNarratorDockValue(narratorId: string): NarratorDockC
 			setDetailsProps: (props: NarratorDetailsPanelExternalProps | null) =>
 				store.setDetailsProps(narratorId, props),
 			setBrowserInfo: (info: NarratorBrowserInfo) => store.setBrowserInfo(narratorId, info),
+			setFileReferenceSelection: (selection: FileReferenceEditorSelection | null) =>
+				store.setFileReferenceSelection(narratorId, selection),
+			registerAddFileReference: (fn: (reference: FileReference) => void) =>
+				store.registerAddFileReference(narratorId, fn),
+			addFileReference: (reference: FileReference) => store.addFileReference(narratorId, reference),
 			registerAppendChatInput: (fn: (text: string) => void) =>
 				store.registerAppendChatInput(narratorId, fn),
 			appendChatInput: (text: string) => store.appendChatInput(narratorId, text),
@@ -758,8 +821,8 @@ export function useWorkspaceNarratorDockValue(narratorId: string): NarratorDockC
 				store.openToolPanel(narratorId, type, chapterIdRef.current),
 			openSubagentPanel: (subagentNarratorId: string, messageId?: string) =>
 				store.openSubagentPanel(narratorId, subagentNarratorId, messageId),
-			openFilePanel: (filePath: string, fileName?: string) =>
-				store.openFilePanel(narratorId, filePath, fileName),
+			openFilePanel: (filePath: string, fileName?: string, options?: FileOpenOptions) =>
+				store.openFilePanel(narratorId, filePath, fileName, options),
 			openKnowledgePanel: (entryId: string, scope?: KnowledgeEntryScope) =>
 				store.openKnowledgePanel(narratorId, entryId, scope),
 			closeToolPanel: (type: NarratorToolPanelType) => store.closeToolPanel(narratorId, type),
@@ -780,6 +843,7 @@ export function useWorkspaceNarratorDockValue(narratorId: string): NarratorDockC
 			onMinimize: null,
 			apiRef: store.apiRef,
 			fileModProps: shard.fileModProps,
+			fileReferenceSelection: shard.fileReferenceSelection,
 			detailsProps: shard.detailsProps,
 			browserInfo: shard.browserInfo,
 			openToolTypes: shard.openToolTypes,

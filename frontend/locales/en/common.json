@@ -1,4 +1,8 @@
 {
+	"scrollbar": {
+		"vertical": "Vertical scrollbar",
+		"horizontal": "Horizontal scrollbar"
+	},
 	"create": "Create",
 	"save": "Save",
 	"delete": "Delete",

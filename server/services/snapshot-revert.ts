@@ -1,5 +1,6 @@
 /** Device-aware, compensating snapshot rollback helpers used before history deletion. */
 import { resolve as nodeResolve } from "node:path";
+import type { FileChangeEvidenceUncertaintyWarning } from "@shared/file-change-protocol";
 import { and, asc, eq, gte, inArray } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -14,7 +15,7 @@ import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { LOCAL_DEVICE_ID, readCompleteFileBytes } from "../lib/agent/execution/backend";
 import { backendDirname } from "../lib/agent/execution/path-resolve";
 import { ExecutionTargetError, resolveBackend } from "../lib/agent/execution/registry";
-import { encodeFileBytes } from "../lib/agent/tools/encoding";
+import { encodeFileBytesAs } from "../lib/agent/tools/encoding";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { getDevice, isDeviceAuthorizedForProject } from "./device-service";
@@ -31,6 +32,7 @@ import { invalidateWorkspaceTreeCache } from "./narrator-session-state";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 export type RevertFailureCode =
+	| "REVERT_UNAVAILABLE"
 	| "REMOTE_DEVICE_UNAVAILABLE"
 	| "REMOTE_DEVICE_UNAUTHORIZED"
 	| "MISSING_EXECUTION_PATH"
@@ -67,9 +69,9 @@ export interface RevertFailure {
  * the default because a worktree is shared and discarding someone else's work is
  * not reversible from the UI.
  *
- * `workspace` restores every file to the recorded boundary. Still needed when the
- * intent really is "put this directory back", and for windows the scoped path
- * cannot express (see `narrator-scoped-revert`).
+ * `workspace` is an explicit request to restore a verified workspace boundary.
+ * It is never an automatic substitute for missing narrator-scoped evidence.
+ * M0 refuses v1 history until complete capture receipts are available.
  */
 export type RevertScope = "narrator" | "workspace";
 
@@ -83,6 +85,7 @@ export const DEFAULT_REVERT_SCOPE: RevertScope = "narrator";
  * `sampleFilePaths` is a bounded excerpt, never the full set.
  */
 export type RevertWarning =
+	| FileChangeEvidenceUncertaintyWarning
 	| {
 			/** A workspace-wide restore also reverted work by other actors in the window. */
 			code: "WORKSPACE_SCOPE_DISCARDED_OTHERS";
@@ -114,9 +117,8 @@ export interface RevertResult {
 	 * caller's intent — another narrator's edits, an external edit, or a command
 	 * whose write set was never serialized.
 	 *
-	 * Advisory on purpose: a workspace rollback is all-or-nothing, so the honest
-	 * option is to report reduced confidence rather than to refuse, or to silently
-	 * imply the change set was exactly one actor's.
+	 * Advisory metadata never authorizes rollback: incomplete coverage must still
+	 * be refused, even if the UI could show a warning.
 	 */
 	warnings?: RevertWarning[];
 }
@@ -134,6 +136,14 @@ export const EMPTY_RESULT: RevertResult = Object.freeze({
 	files: [] as string[],
 	failures: [] as RevertFailure[],
 });
+
+/** Refuse an unverified rollback without registering any filesystem compensation. */
+export function unavailableSnapshotRevert(reason: string, filePath = "(unknown)"): RevertResult {
+	return {
+		...EMPTY_RESULT,
+		failures: [treeFailure(filePath, "REVERT_UNAVAILABLE", reason)],
+	};
+}
 
 /**
  * Compensation plans for reverts that already touched the filesystem but whose
@@ -281,7 +291,7 @@ async function applyFileState(
 	await backend.mkdirp(backendDirname(backend, filePath));
 	// Re-encode with the charset the baseline was decoded with. Writing UTF-8
 	// unconditionally would silently convert legacy-encoded files (GBK, Shift_JIS…).
-	await backend.writeFileBytes(filePath, encodeFileBytes(content, encoding ?? "utf-8"));
+	await backend.writeFileBytes(filePath, encodeFileBytesAs(content, encoding ?? "utf-8"));
 }
 
 async function restoreCapturedState(item: RevertPlanItem): Promise<void> {
@@ -684,10 +694,8 @@ export async function revertPatchForToolUses(
 
 // === Tree-based rollback ===================================================
 //
-// Restores a whole workspace to a recorded git tree instead of rebuilding files
-// from recorded edits. This is the preferred path whenever a tree hash exists:
-// it is byte-exact, covers changes no tool input describes, and cannot end up
-// partially applied.
+// Legacy tree metadata remains useful for inspection, but a hash alone is not a
+// complete-capture receipt. Historical workspace restore is disabled in M0.
 
 /** Compensation state for an in-flight tree rollback. */
 interface TreeCompensation {
@@ -729,98 +737,24 @@ export function registerTreeCompensation(
 }
 
 /**
- * Restore a narrator's workspace to a recorded tree snapshot.
- *
- * Captures the current state first so the rollback itself can be undone, then
- * hands the result to {@link commitSnapshotRevert} / {@link finalizeSnapshotRevert}
- * exactly like the per-file path.
- *
- * Fails (without touching any file) when the tree object is absent from the
- * shadow repository — a snapshot recorded on another machine, or one lost to gc.
+ * Compatibility adapter for historical workspace rollback requests.
+ * Refuses without capture/restore: v1 hashes lack a complete historical receipt.
  */
 export async function revertWorkspaceToTree(
 	narratorId: string,
-	treeHash: string,
-	/**
-	 * Start of the window being undone, as an ISO timestamp. When given, changes in
-	 * that window are inspected so the result can warn about ones this rollback will
-	 * discard beyond the caller's intent.
-	 */
-	windowStartedAt?: string,
+	_treeHash: string,
+	_windowStartedAt?: string,
 ): Promise<RevertResult> {
 	const worktreePath = await resolveNarratorCwd(narratorId);
-	if (!worktreePath) {
-		return {
-			...EMPTY_RESULT,
-			failures: [
-				treeFailure(
-					"(unknown)",
-					"PREPARE_FAILED",
-					new Error(`Narrator ${narratorId} has no resolvable workspace path.`),
-				),
-			],
-		};
-	}
-
-	try {
-		if (!(await worktreeTreeSnapshot.hasTree(worktreePath, treeHash, LOCAL_DEVICE_ID))) {
-			return {
-				...EMPTY_RESULT,
-				failures: [
-					treeFailure(
-						worktreePath,
-						"TREE_SNAPSHOT_MISSING",
-						new Error(`Snapshot ${treeHash.slice(0, 12)} is not available for this workspace.`),
-					),
-				],
-			};
-		}
-	} catch (error) {
-		return { ...EMPTY_RESULT, failures: [treeFailure(worktreePath, "PREPARE_FAILED", error)] };
-	}
-
-	// Record where we are so a failed history mutation can be undone.
-	let previousTreeHash: string;
-	try {
-		previousTreeHash = await worktreeTreeSnapshot.capture(worktreePath, LOCAL_DEVICE_ID);
-	} catch (error) {
-		return { ...EMPTY_RESULT, failures: [treeFailure(worktreePath, "PREPARE_FAILED", error)] };
-	}
-
-	let changedFiles: string[];
-	try {
-		changedFiles = await worktreeTreeSnapshot.restore(worktreePath, treeHash, LOCAL_DEVICE_ID);
-	} catch (error) {
-		// A restore can fail after touching some files, so the cache is suspect even
-		// on the error path.
-		invalidateWorkspaceTreeCache(worktreePath);
-		return { ...EMPTY_RESULT, failures: [treeFailure(worktreePath, "TREE_RESTORE_FAILED", error)] };
-	}
-	invalidateWorkspaceTreeCache(worktreePath);
-
-	const warnings = windowStartedAt
-		? await buildImpreciseRevertWarnings(worktreePath, narratorId, windowStartedAt)
-		: [];
-
-	const result: RevertResult = {
-		reverted: changedFiles.length > 0,
-		fileCount: changedFiles.length,
-		files: changedFiles,
-		failures: [],
-		...(warnings.length > 0 && { warnings }),
-	};
-	if (previousTreeHash !== treeHash) {
-		evictStaleCompensationPlans();
-		treeCompensations.set(result, { worktreePath, previousTreeHash });
-	}
-	logger.info("Reverted workspace to tree snapshot", {
-		narratorId,
-		worktreePath,
-		treeHash,
-		fileCount: changedFiles.length,
-		warningCount: warnings.length,
-	});
-	return result;
+	// A hash/DAG object proves content existence, not that this historical scan
+	// completely covered the requested workspace. Never infer a complete receipt
+	// from a successful capture now, or compensate by restoring the entire workspace.
+	return unavailableSnapshotRevert(
+		worktreePath
+			? "legacy_unverified: this historical snapshot has no complete capture receipt; automatic workspace restore is unavailable."
+			: "no_workspace: the narrator has no verified workspace to restore.",
+		worktreePath ?? undefined,
+	);
 }
 
 /**
@@ -844,31 +778,66 @@ export async function buildImpreciseRevertWarnings(
 			since: windowStartedAt,
 			excludeNarratorId: narratorId,
 		});
-		if (!report.hasImprecise) return [];
-		return [
-			{
+		const warnings: RevertWarning[] = [];
+		if (
+			report.otherActorCount + report.externalCount + report.unserializedCount + report.humanCount >
+			0
+		) {
+			warnings.push({
 				code: "WORKSPACE_SCOPE_DISCARDED_OTHERS",
 				otherActorCount: report.otherActorCount,
 				externalCount: report.externalCount,
 				unserializedCount: report.unserializedCount,
-				// Must be threaded through: `hasImprecise` already counts human edits, so
-				// omitting the number here would produce an advisory whose every category is
-				// zero — the renderer names only non-zero parts, so the warning would appear
-				// as an empty sentence and the user would be told nothing at all.
 				humanCount: report.humanCount,
 				sampleFilePaths: report.sampleFilePaths,
+			});
+		}
+		// Older or interrupted readers cannot prove completeness merely by returning
+		// zero counts. Keep uncertainty separate from known third-party effects.
+		const unknownCount =
+			"unknownCount" in report && typeof report.unknownCount === "number" ? report.unknownCount : 0;
+		const legacyCount =
+			"legacyCount" in report && typeof report.legacyCount === "number" ? report.legacyCount : 0;
+		const warningScanComplete =
+			"warningScanComplete" in report && report.warningScanComplete === true;
+		const countsLowerBound =
+			!warningScanComplete || ("countsLowerBound" in report && report.countsLowerBound === true);
+		if (
+			unknownCount > 0 ||
+			legacyCount > 0 ||
+			!warningScanComplete ||
+			countsLowerBound ||
+			(report.hasImprecise && warnings.length === 0)
+		) {
+			warnings.push({
+				code: "WORKSPACE_SCOPE_EVIDENCE_UNCERTAIN",
+				unknownCount,
+				legacyCount,
+				warningScanComplete,
+				countsLowerBound,
+				sampleFilePaths: report.sampleFilePaths,
+			});
+		}
+		return warnings;
+	} catch (error) {
+		logger.warn("Rollback attribution assessment unavailable", {
+			narratorId,
+			error: String(error),
+		});
+		return [
+			{
+				code: "WORKSPACE_SCOPE_EVIDENCE_UNCERTAIN",
+				unknownCount: 0,
+				legacyCount: 0,
+				warningScanComplete: false,
+				countsLowerBound: true,
+				sampleFilePaths: [],
 			},
 		];
-	} catch {
-		return [];
 	}
 }
 
-/**
- * Restore a narrator's workspace to the state recorded just before a tool ran.
- * Returns null when that tool has no recorded boundary, so callers can fall back
- * to the per-file replay path.
- */
+/** Historical tool boundary adapter; missing or unverified evidence is a refusal. */
 export async function revertToToolCallTree(
 	narratorId: string,
 	toolUseId: string,
@@ -880,15 +849,13 @@ export async function revertToToolCallTree(
 		),
 		columns: { treeHashBefore: true, createdAt: true },
 	});
-	if (!toolCall?.treeHashBefore) return null;
+	if (!toolCall?.treeHashBefore)
+		return unavailableSnapshotRevert("no_boundaries: no verified tool snapshot is available.");
 	// The tool's own start time bounds the window this rollback undoes.
 	return revertWorkspaceToTree(narratorId, toolCall.treeHashBefore, toolCall.createdAt);
 }
 
-/**
- * Restore a narrator's workspace to the state recorded at a message boundary.
- * Returns null when that message has no recorded boundary.
- */
+/** Historical message boundary adapter; missing evidence never enables replay. */
 export async function revertToMessageTree(
 	narratorId: string,
 	messageId: string,
@@ -897,44 +864,30 @@ export async function revertToMessageTree(
 		where: eq(narratorMessages.id, messageId),
 		columns: { treeHashAfter: true },
 	});
-	if (!message?.treeHashAfter) return null;
+	if (!message?.treeHashAfter)
+		return unavailableSnapshotRevert("no_boundaries: no verified message snapshot is available.");
 	return revertWorkspaceToTree(narratorId, message.treeHashAfter);
 }
 
-/**
- * Restore the workspace to the state that preceded every tool call from `minSeq`
- * onwards — the target of "undo everything from this message on".
- *
- * Resolves to the earliest recorded pre-tool boundary in that range. Returns null
- * when no tool call in the range has one, so the caller can fall back to replay.
- *
- * Requires that the *first* tool call in the range carry a boundary: starting from
- * a later one would silently keep the earlier tools' writes. When it is missing,
- * replay is the honest answer rather than a partial rollback.
- */
+/** Historical sequence adapter. No v1 boundary can authorize workspace writes. */
 export async function revertFromSeqTree(
 	narratorId: string,
 	minSeq: number,
 ): Promise<RevertResult | null> {
 	const boundary = await resolveSeqTreeBoundary(narratorId, minSeq);
-	if (!boundary) return null;
+	if (!boundary)
+		return unavailableSnapshotRevert("no_boundaries: no verified workspace snapshot is available.");
 	return revertWorkspaceToTree(narratorId, boundary.treeHash, boundary.startedAt);
 }
 
-/**
- * Restore the workspace to the state that preceded a set of messages about to be
- * deleted. Returns null when the earliest affected tool call has no boundary.
- *
- * Only sound when the messages form a contiguous tail of the timeline, which is
- * how deletion and rollback use it: restoring the first boundary also discards
- * everything recorded after it.
- */
+/** Historical message-set adapter; never widens an unavailable request to replay. */
 export async function revertForMessagesTree(
 	narratorId: string,
 	messageIds: string[],
 ): Promise<RevertResult | null> {
 	const boundary = await resolveMessagesTreeBoundary(narratorId, messageIds);
-	if (!boundary) return null;
+	if (!boundary)
+		return unavailableSnapshotRevert("no_boundaries: no verified workspace snapshot is available.");
 	return revertWorkspaceToTree(narratorId, boundary.treeHash, boundary.startedAt);
 }
 
@@ -1019,6 +972,9 @@ export interface TreeRevertPreviewFile {
 }
 
 export interface TreeRevertPreview {
+	/** Legacy comparison material, never an executable plan without a receipt. */
+	available: false;
+	reason: "legacy_unverified";
 	treeHash: string;
 	worktreePath: string;
 	/** State the workspace is in now, for content diffs. */
@@ -1050,21 +1006,21 @@ export async function loadTreePreviewContents(
 				LOCAL_DEVICE_ID,
 			),
 		]);
-		out.push({ ...file, currentContent, revertedContent });
+		out.push({
+			...file,
+			// UTF-8-valid binary data may contain NUL without replacement characters.
+			// Tree inspection must not send it to the text diff renderer as plain text.
+			currentContent: currentContent?.includes("\0") ? null : currentContent,
+			revertedContent: revertedContent?.includes("\0") ? null : revertedContent,
+		});
 	}
 	return out;
 }
 
 /**
- * Describe what a tree rollback would change, for the confirmation dialogs.
- *
- * This must come from the same tree comparison the rollback performs. Deriving the
- * list from recorded Write/Edit inputs instead would under-report: a tree restore
- * also reverts files touched by Bash or external tools, which have no tool input
- * to enumerate.
- *
- * Returns null when there is no boundary (so the caller previews the replay path)
- * or when the snapshot is unavailable.
+ * Read-only comparison with a historical tree, not an executable rollback plan.
+ * Object availability does not verify coverage or permit deletion. Missing trees
+ * return null; callers must keep the unavailable state rather than infer safety.
  */
 async function previewTreeBoundary(
 	narratorId: string,
@@ -1084,10 +1040,9 @@ async function previewTreeBoundary(
 			current,
 			LOCAL_DEVICE_ID,
 		);
-		const inBoundary = new Set(
-			await worktreeTreeSnapshot.listPaths(worktreePath, treeHash, LOCAL_DEVICE_ID),
-		);
 		return {
+			available: false,
+			reason: "legacy_unverified",
 			treeHash,
 			worktreePath,
 			currentTreeHash: current,
@@ -1095,8 +1050,9 @@ async function previewTreeBoundary(
 				deviceId: LOCAL_DEVICE_ID,
 				filePath: joinWorktreePath(worktreePath, relPath),
 				relPath,
-				// Absent from the boundary means it was created afterwards, so restoring removes it.
-				willBeDeleted: !inBoundary.has(relPath),
+				// Without a complete receipt, missing membership is unknown rather than
+				// proof of absence. M0 does not authorize deletion of any legacy path.
+				willBeDeleted: false,
 			})),
 		};
 	} catch (error) {

@@ -36,6 +36,8 @@ import {
 } from "../../narrator/dock/dock-panel-types";
 import { useNarratorDockContext } from "../../narrator/dock/NarratorDockContext";
 import { narratorDockComponents, narratorDockTabComponents } from "../../narrator/dock/panels";
+import { stripIdentityFromLayout } from "../../narrator/panels/layout-envelope";
+import { filePanelResourceParams } from "../../narrator/panels/panel-kind";
 import { acceptForeignPanelDragOver, handleForeignPanelDrop } from "./cross-surface-drop";
 import { isDetachablePanelKind } from "./detachable";
 import type { DetachedPanelEntry } from "./detached-panels";
@@ -67,7 +69,7 @@ function panelIdOf(panel: DetachedPanelEntry): string | null {
 		return panel.subagentNarratorId ? subagentDockPanelId(panel.subagentNarratorId) : null;
 	}
 	if (panel.kind === "file") {
-		return panel.filePath ? fileDockPanelId(panel.filePath) : null;
+		return panel.filePath ? fileDockPanelId(panel.filePath, panel.deviceId, panel.toolEdit) : null;
 	}
 	return dockPanelId(panel.kind);
 }
@@ -78,7 +80,13 @@ function paramsOf(panel: DetachedPanelEntry, narratorId: string, chapterId: stri
 		return { panelType: "subagent" as const, subagentNarratorId: panel.subagentNarratorId ?? "" };
 	}
 	if (panel.kind === "file") {
-		return { panelType: "file" as const, filePath: panel.filePath ?? "" };
+		return {
+			panelType: "file" as const,
+			filePath: panel.filePath ?? "",
+			deviceId: panel.deviceId ?? "local",
+			referenceOrigin: panel.referenceOrigin === true,
+			...(panel.toolEdit ? { toolEdit: panel.toolEdit } : {}),
+		};
 	}
 	return { panelType: panel.kind, narratorId, chapterId };
 }
@@ -123,7 +131,7 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 			onEmptyRef.current(nodeId);
 			return;
 		}
-		saveRef.current(api.toJSON());
+		saveRef.current(stripIdentityFromLayout(api.toJSON()));
 	}, [apiRef, nodeId]);
 
 	const handleReady = useCallback(
@@ -153,7 +161,14 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 			if (!restored) {
 				for (const panel of pendingRef.current ?? []) {
 					const panelId = panelIdOf(panel);
-					if (!panelId || api.getPanel(panelId)) continue;
+					if (!panelId) continue;
+					const existing = api.getPanel(panelId);
+					if (existing) {
+						if (panel.kind === "file" && panel.referenceOrigin) {
+							existing.api.updateParameters({ ...existing.params, referenceOrigin: true });
+						}
+						continue;
+					}
 					api.addPanel({
 						id: panelId,
 						component: NARRATOR_DOCK_COMPONENT[panel.kind],
@@ -209,11 +224,12 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 			const direction = target.intent === "swap" ? "within" : intentToDirection(target.intent);
 
 			if ((kind === "subagent" || kind === "file") && !drag.resourceId) return;
+			const fileTarget = filePanelResourceParams(drag.resourceId ?? "");
 			const panelId =
 				kind === "subagent"
 					? subagentDockPanelId(drag.resourceId as string)
 					: kind === "file"
-						? fileDockPanelId(drag.resourceId as string)
+						? fileDockPanelId(fileTarget.filePath, fileTarget.deviceId, fileTarget.toolEdit)
 						: dockPanelId(kind);
 
 			// Release the panel on the source surface FIRST. Done after adding, a failure
@@ -226,6 +242,9 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 			// Already here: focus it rather than adding a second.
 			const existing = api.getPanel(panelId);
 			if (existing) {
+				if (kind === "file" && fileTarget.referenceOrigin) {
+					existing.api.updateParameters({ ...existing.params, referenceOrigin: true });
+				}
 				existing.api.moveTo({ group, position });
 				existing.api.setActive();
 				return;
@@ -238,7 +257,7 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 					kind === "subagent"
 						? { panelType: "subagent" as const, subagentNarratorId: drag.resourceId ?? "" }
 						: kind === "file"
-							? { panelType: "file" as const, filePath: drag.resourceId ?? "" }
+							? { panelType: "file" as const, ...fileTarget }
 							: { panelType: kind, narratorId, chapterId },
 				position: { referenceGroup: group, direction },
 			});

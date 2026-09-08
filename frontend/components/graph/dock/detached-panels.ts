@@ -29,6 +29,9 @@
  */
 
 import type { SerializedDockview } from "dockview-react";
+import { filePanelIdentity } from "../../narrator/dock/dock-panel-types";
+import { filePanelResourceId, filePanelResourceParams } from "../../narrator/panels/panel-kind";
+import { isToolEditReference, type ToolEditReference } from "../../narrator/tool-edit-reference";
 import { type DetachablePanelKind, isDetachablePanelKind, isMultiInstanceKind } from "./detachable";
 
 /** Current envelope schema version. */
@@ -72,6 +75,9 @@ export interface DetachedPanelEntry {
 	/** Resource identity for multi-instance kinds. */
 	subagentNarratorId?: string;
 	filePath?: string;
+	deviceId?: string;
+	referenceOrigin?: boolean;
+	toolEdit?: ToolEditReference;
 }
 
 /** A canvas node hosting a dockview surface of torn-out panels. */
@@ -113,13 +119,26 @@ interface DetachedPanelsEnvelope {
  * layout identifies its panels through that layout's own ids.
  */
 export function panelIdFor(kind: DetachablePanelKind, resourceId?: string): string {
+	if (kind === "file" && resourceId) {
+		const target = filePanelResourceParams(resourceId);
+		if (target.toolEdit) {
+			return `file:${filePanelIdentity(target.filePath, target.deviceId, target.toolEdit)}`;
+		}
+		return `file:${filePanelResourceId(target.filePath, target.deviceId)}`;
+	}
 	return isMultiInstanceKind(kind) && resourceId ? `${kind}:${resourceId}` : kind;
 }
 
 /** The resource identity carried by an entry, if its kind has one. */
 export function resourceIdOf(panel: DetachedPanelEntry): string | undefined {
 	if (panel.kind === "subagent") return panel.subagentNarratorId;
-	if (panel.kind === "file") return panel.filePath;
+	if (panel.kind === "file" && panel.filePath)
+		return filePanelResourceId(
+			panel.filePath,
+			panel.deviceId,
+			panel.referenceOrigin,
+			panel.toolEdit,
+		);
 	return undefined;
 }
 
@@ -133,7 +152,7 @@ export function makePanelEntry(kind: DetachablePanelKind, resourceId?: string): 
 		panelId: panelIdFor(kind, resourceId),
 		kind,
 		...(kind === "subagent" && resourceId ? { subagentNarratorId: resourceId } : {}),
-		...(kind === "file" && resourceId ? { filePath: resourceId } : {}),
+		...(kind === "file" && resourceId ? filePanelResourceParams(resourceId) : {}),
 	};
 }
 
@@ -161,11 +180,18 @@ function parsePanelEntry(value: unknown): DetachedPanelEntry | null {
 	if (!value || typeof value !== "object") return null;
 	const v = value as Record<string, unknown>;
 	if (!isDetachablePanelKind(v.kind)) return null;
+	if (v.kind === "file" && v.toolEdit !== undefined && !isToolEditReference(v.toolEdit))
+		return null;
 	const resourceId =
 		v.kind === "subagent" && typeof v.subagentNarratorId === "string" && v.subagentNarratorId
 			? v.subagentNarratorId
 			: v.kind === "file" && typeof v.filePath === "string" && v.filePath
-				? v.filePath
+				? filePanelResourceId(
+						v.filePath,
+						typeof v.deviceId === "string" ? v.deviceId : "local",
+						v.referenceOrigin === true,
+						isToolEditReference(v.toolEdit) ? v.toolEdit : undefined,
+					)
 				: undefined;
 	// The stored panelId is ignored in favour of the derived one: it is a pure
 	// function of kind + resource, so recomputing it repairs any drift (a hand-

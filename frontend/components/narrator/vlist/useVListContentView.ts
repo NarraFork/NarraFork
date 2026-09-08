@@ -22,7 +22,12 @@
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { useCallback, useMemo, useRef, useState } from "react";
 import type { VListViewControls } from "./VListContentViewHost";
-import { type VListViewTarget, viewStateSig, viewTargetSpecKey } from "./vlist-content-view-target";
+import {
+	sameViewTarget,
+	type VListViewOwner,
+	type VListViewTarget,
+	viewStateSig,
+} from "./vlist-content-view-target";
 
 export interface UseVListContentViewResult {
 	/** Passed to every render body through `extra.viewControls`. */
@@ -46,7 +51,7 @@ export interface UseVListContentViewResult {
 	 * the full payload. The shell calls this when it observes a new target for the
 	 * open id, so the modal follows the data.
 	 *
-	 * A no-op when nothing is open or the text is unchanged, so it is safe to call
+	 * A no-op when nothing is open or the descriptor is unchanged, so it is safe to call
 	 * from an effect on every rebuild.
 	 */
 	refreshOpenTarget: (next: VListViewTarget) => void;
@@ -75,7 +80,7 @@ export interface UseVListContentViewOptions {
 	 * prefix, which is exactly what a reader scrolls (or opens fullscreen) to get
 	 * past.
 	 */
-	requestFullPayload?: (specKey: string) => void;
+	requestFullPayload?: (owner: VListViewOwner) => void;
 }
 
 export function useVListContentView(
@@ -85,6 +90,7 @@ export function useVListContentView(
 	const [wrap, setWrap] = useState<ReadonlyMap<string, boolean>>(new Map());
 	const [showSource, setShowSource] = useState<ReadonlyMap<string, boolean>>(new Map());
 	const [openTarget, setOpenTarget] = useState<VListViewTarget | null>(null);
+	const ownersRef = useRef(new Map<string, VListViewOwner>());
 	// Read through a ref so `openFullscreen` — and therefore `controls` — cannot gain
 	// a new identity just because the caller passed an inline callback. Every mounted
 	// row compares `controls` identity-wise (the ExactRow memo), so an extra churn
@@ -124,8 +130,7 @@ export function useVListContentView(
 	 */
 	const requestFullPayload = useCallback((target: VListViewTarget) => {
 		if (target.truncated !== true) return;
-		const specKey = viewTargetSpecKey(target.id);
-		if (specKey) requestFullPayloadRef.current?.(specKey);
+		requestFullPayloadRef.current?.(target.owner);
 	}, []);
 
 	const openFullscreen = useCallback(
@@ -142,8 +147,14 @@ export function useVListContentView(
 		() => ({
 			isWrapped,
 			isSourceShown,
-			toggleWrap: (target) => toggle(setWrap, target.id, defaultWrap(target)),
-			toggleSource: (target) => toggle(setShowSource, target.id, false),
+			toggleWrap: (target) => {
+				ownersRef.current.set(target.id, target.owner);
+				toggle(setWrap, target.id, defaultWrap(target));
+			},
+			toggleSource: (target) => {
+				ownersRef.current.set(target.id, target.owner);
+				toggle(setShowSource, target.id, false);
+			},
 			openFullscreen,
 			requestFullPayload,
 		}),
@@ -153,16 +164,14 @@ export function useVListContentView(
 	const refreshOpenTarget = useCallback((next: VListViewTarget) => {
 		setOpenTarget((prev) => {
 			if (!prev || prev.id !== next.id) return prev;
-			// Text identity is the signal: everything else on a target is derived from
-			// the same measured block, and bailing here keeps this callable from an
-			// effect without looping.
-			if (prev.text === next.text && prev.truncated === next.truncated) return prev;
+			if (sameViewTarget(prev, next)) return prev;
+			if (ownersRef.current.has(next.id)) ownersRef.current.set(next.id, next.owner);
 			return next;
 		});
 	}, []);
 
 	const rowSig = useCallback(
-		(specKey: string) => viewStateSig(wrap, showSource, specKey),
+		(specKey: string) => viewStateSig(wrap, showSource, specKey, ownersRef.current),
 		[wrap, showSource],
 	);
 

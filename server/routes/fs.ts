@@ -4,17 +4,16 @@ import {
 	type Dir,
 	type Dirent,
 	existsSync,
-	constants as fsConstants,
 	mkdirSync,
 	opendirSync,
 	readFileSync,
 	statSync,
 } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
+import { basename, extname, join, relative, resolve, sep } from "node:path";
 import { Hono } from "hono";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import { localBackend } from "../lib/agent/execution/local-backend";
 import {
 	applyLineEnding,
 	decodeFileBytesAs,
@@ -33,13 +32,19 @@ import {
 	SECRET_PATH_REFUSAL,
 } from "../lib/fs-secret-paths";
 import { checkWriteBoundary, describeWriteRefusal } from "../lib/fs-write-boundary";
-import { generateShortId } from "../lib/id";
+import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { requireNarratorAccess } from "../lib/narrator-access";
 import { IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
 import { settings } from "../lib/settings";
 import { fsWriteSchema } from "../lib/validators/fs";
-import { recordAttribution } from "../services/file-attribution-service";
+import { LocalFileValidationError } from "../services/file-change-local-io";
+import {
+	EditorFileChangeUncertainError,
+	executeEditorFileChange,
+	type FileChangeCompletion,
+} from "../services/file-change-runtime";
+import { resolveNarratorProjectId } from "../services/narrator-project";
 import { closeClaim, openClaim, sealClaim } from "../services/worktree-write-claims";
 
 export const fsRoutes = new Hono();
@@ -342,17 +347,6 @@ fsRoutes.get("/preview", async (c) => {
 const MAX_WRITE_BYTES = 1024 * 1024;
 
 /**
- * Open flags for a human save: create/truncate as usual, but never follow a link at the
- * final component.
- *
- * Numeric rather than the `"w"` string because `"w"` has no spelling that includes
- * `O_NOFOLLOW`. See the write call for why this is needed at all (the boundary check and
- * the write are separated by several awaits).
- */
-const WRITE_FLAGS =
-	fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW;
-
-/**
  * `GET /api/fs/edit-source?path=...` — load a file FOR EDITING.
  *
  * ## Why the editor cannot just use `/preview`
@@ -467,7 +461,8 @@ fsRoutes.post("/write", async (c) => {
 	if (!parsed.success) {
 		throw new ValidationError(parsed.error.issues[0]?.message ?? "Invalid request body");
 	}
-	const body = parsed.data;
+	const body = Object.freeze(parsed.data);
+	const userId = c.get("user").sub;
 
 	const rawPath = body.path;
 	const narratorId = body.narratorId;
@@ -486,6 +481,7 @@ fsRoutes.post("/write", async (c) => {
 	const narrator = await requireNarratorAccess(c, narratorId, "write");
 	const cwd = narrator.cwd?.trim();
 	if (!cwd) throw new ValidationError("This narrator has no workspace to write into");
+	const projectId = await resolveNarratorProjectId(narrator);
 
 	// `?? []` rather than relying on the defaults merge: a settings object built by any
 	// path that skips `deepMerge` would otherwise spread `undefined` and throw here,
@@ -520,191 +516,158 @@ fsRoutes.post("/write", async (c) => {
 	}
 	// physicalPath is guaranteed here: either `allowed` is true (which always has it),
 	// or we fell through the confirmable+confirmOutsideRoots branch (which also has it).
-	const target = decision.physicalPath ?? resolve(rawPath);
+	if (!decision.physicalPath)
+		throw new WriteRefusedError("Cannot resolve the authorized file path");
+	const target = decision.physicalPath;
 
-	// Optimistic lock. Compared against the file's CURRENT bytes, so any writer since
-	// the editor loaded it — agent, terminal, another person — is detected.
-	let previousContent: string | null = null;
-	if (existsSync(target)) {
-		const stat = statSync(target);
-		if (!stat.isFile()) throw new ValidationError("Target exists and is not a file");
-		if (stat.size > MAX_WRITE_BYTES) {
-			// Refused rather than truncated: the editor could not have loaded this file in
-			// full, so it cannot know what it would be discarding.
-			throw new ValidationError("Target file is too large to edit through this API");
-		}
-		const existingBytes = new Uint8Array(await Bun.file(target).arrayBuffer());
-		if (looksBinary(existingBytes)) {
-			// Text in, text out: this route re-encodes a decoded string, which does not
-			// round-trip binary bytes. Refused rather than mangled, and `/edit-source`
-			// already refuses to open such a file so a compliant client never gets here.
-			throw new ValidationError("This file is binary and cannot be edited as text");
-		}
-		// Decoded the same way `/edit-source` decoded it for the editor, so the
-		// optimistic-lock hash is computed over the same text the client hashed. Reading
-		// UTF-8 here while the editor was served GBK would make every save on a legacy
-		// file look like a conflict.
-		previousContent = decodeFileBytesAs(existingBytes, encoding);
-		const currentHash = sha256Hex(previousContent);
-		if (body.baseHash && body.baseHash !== currentHash) {
-			// 409 with both hashes plus the live content, so the client can show a diff
-			// instead of only reporting failure.
-			return c.json(
-				{
-					error: "The file changed since it was opened",
-					code: "STALE_WRITE",
-					currentHash,
-					expectedHash: body.baseHash,
-					// LF for the same reason `/edit-source` normalizes: this becomes the
-					// editor's new baseline, and a CRLF baseline against its LF buffer would
-					// render the conflict as a whole-file diff.
-					currentContent: normalizeLineEndings(previousContent),
-				},
-				409,
-			);
-		}
-		if (!body.baseHash) {
-			// A missing hash means "I am creating this file". The file exists, so the
-			// editor's premise is already wrong and overwriting would be a silent clobber.
-			return c.json(
-				{
-					error: "The file already exists",
-					code: "STALE_WRITE",
-					currentHash,
-					currentContent: normalizeLineEndings(previousContent),
-				},
-				409,
-			);
-		}
-	}
-
-	// The file's own line endings survive a save, the same way its encoding does. The
-	// editor's document is LF-only, so writing it verbatim converted every line of a
-	// CRLF file — one changed line, and `git diff` showed the whole file.
-	const lineEnding = detectLineEnding(previousContent ?? body.content);
-	const normalizedContent = normalizeLineEndings(body.content);
-	const outputBytes = encodeFileBytesAs(applyLineEnding(normalizedContent, lineEnding), encoding);
-	if (outputBytes.byteLength > MAX_WRITE_BYTES) {
-		throw new ValidationError("Content exceeds the maximum writable size");
-	}
-	// What a later read would decode, which is what the optimistic lock compares
-	// against. Hashing the REQUEST text instead made the lock disagree with the file
-	// whenever encoding or line endings changed the bytes: a character the charset
-	// cannot represent is written as "?", so the client's next save carried a hash the
-	// file could never have, and every save from then on came back 409 STALE_WRITE.
-	const persistedHash = sha256Hex(decodeFileBytesAs(outputBytes, encoding));
-
-	const relPath = relative(cwd, target);
-	// A path inside an extra writable dir is not inside the worktree, so it has no
-	// worktree-relative form and takes no claim or attribution: those are workspace
-	// concepts, and the snapshot machinery only covers the worktree.
-	const insideWorktree = !!relPath && !relPath.startsWith("..");
+	const canonicalCwd = (await localBackend.resolvePathIdentity(cwd)).canonicalPath;
+	const relPath = relative(canonicalCwd, target);
+	const insideWorktree = !!relPath && relPath !== ".." && !relPath.startsWith(`..${sep}`);
+	// Legacy tree claims apply only inside cwd. V2 evidence also covers extra/confirmed
+	// outside paths using their own scope, not an invented cwd-relative file identity.
 	const claimPath = insideWorktree ? relPath.split(sep).join("/") : null;
-	// A synthetic id: the claim registry is keyed by tool-use id, and a human save has
-	// none. Prefixed so it is recognisable in a log or a leaked-claim warning.
-	const claimId = `human-${generateShortId()}`;
-
-	if (claimPath) openClaim(cwd, narratorId, claimId, [claimPath]);
+	const requestId = generateId();
+	const claimId = `human-${requestId}`;
+	let diskMayHaveChanged = false;
+	let completed: FileChangeCompletion<{ hash: string; bytesWritten: number }>;
 	try {
-		await mkdir(dirname(target), { recursive: true });
-		// The bytes encoded above, not the string: writing the string would re-encode it
-		// as UTF-8 and convert a legacy-charset file on every save.
-		//
-		// ── Why the flags ────────────────────────────────────────────────
-		// `checkWriteBoundary` resolved this path minutes of event-loop time ago: the
-		// narrator lookup, the existence check, the decode and the hash comparison all
-		// awaited in between. A link planted in that window at the final component would
-		// be followed by a plain `writeFile`, sending the bytes somewhere the boundary
-		// never saw. `O_NOFOLLOW` makes the kernel refuse instead (ELOOP).
-		//
-		// Writing `target` — the RESOLVED path — is what keeps this compatible with the
-		// legitimate case: a symlink that stays inside the workspace was already followed
-		// during validation, so the final component here is the real file and the flag has
-		// nothing to object to. Only a link that appeared AFTER validation trips it.
-		//
-		// Not complete, and cannot be with this API: `O_NOFOLLOW` covers the last
-		// component only, so swapping an intermediate DIRECTORY for a link is still
-		// possible in principle (that needs `openat2`/`RESOLVE_NO_SYMLINKS`, which Node's
-		// fs does not expose). Both require local write access to the workspace, which in
-		// this deployment model already implies the server's own privileges — so this
-		// closes the cheap half and the remainder is bounded by the trust model, not left
-		// unnoticed.
-		await writeFile(target, outputBytes, { flag: WRITE_FLAGS });
+		if (claimPath) openClaim(cwd, narratorId, claimId, [claimPath]);
+		completed = await executeEditorFileChange({
+			requestId,
+			userId,
+			narratorId,
+			projectId,
+			cwd,
+			lexicalPath: resolve(rawPath),
+			canonicalPath: target,
+			signal: c.req.raw.signal,
+			input: body,
+			authorize: async () => {
+				// A lease wait/blob publication is not an authorization lease. Re-read both
+				// project/owner ACL and live extra roots immediately before capture/dispatch.
+				const current = await requireNarratorAccess(c, narratorId, "write");
+				if (current.cwd?.trim() !== cwd || (await resolveNarratorProjectId(current)) !== projectId)
+					throw new WriteRefusedError("Narrator workspace changed during save");
+				const allowed = checkWriteBoundary(rawPath, [
+					cwd,
+					...(settings.paths.extraWritableDirs ?? []),
+				]);
+				if (!allowed.allowed && !(allowed.confirmable && body.confirmOutsideRoots))
+					throw new WriteRefusedError(describeWriteRefusal(allowed.reason ?? "unresolvable"));
+				if (!allowed.physicalPath || !localBackend.paths.equals(allowed.physicalPath, target))
+					throw new WriteRefusedError("Authorized file path changed during save");
+			},
+			construct: (before) => {
+				// The one real before drives optimistic locking, EOL/encoding and evidence.
+				// ENOENT alone means absent; permission/IO failures never reach construction.
+				let previousContent: string | null = null;
+				if (before.bytes !== null) {
+					if (before.bytes.byteLength > MAX_WRITE_BYTES)
+						throw new LocalFileValidationError("Target file is too large to edit through this API");
+					if (looksBinary(before.bytes))
+						throw new LocalFileValidationError("This file is binary and cannot be edited as text");
+					previousContent = decodeFileBytesAs(before.bytes, encoding);
+					const currentHash = sha256Hex(previousContent);
+					if (!body.baseHash || body.baseHash !== currentHash)
+						throw new EditorWriteConflict({
+							error: body.baseHash
+								? "The file changed since it was opened"
+								: "The file already exists",
+							code: "STALE_WRITE",
+							currentHash,
+							...(body.baseHash ? { expectedHash: body.baseHash } : {}),
+							currentContent: normalizeLineEndings(previousContent),
+						});
+				} else if (body.baseHash) {
+					throw new EditorWriteConflict({
+						error: "The file was deleted since it was opened",
+						code: "STALE_WRITE",
+						expectedHash: body.baseHash,
+						currentHash: null,
+						currentContent: "",
+					});
+				}
+				const lineEnding = detectLineEnding(previousContent ?? body.content);
+				const normalizedContent = normalizeLineEndings(body.content);
+				const nextBytes = encodeFileBytesAs(
+					applyLineEnding(normalizedContent, lineEnding),
+					encoding,
+				);
+				if (nextBytes.byteLength > MAX_WRITE_BYTES)
+					throw new LocalFileValidationError("Content exceeds the maximum writable size");
+				const persistedContent = decodeFileBytesAs(nextBytes, encoding);
+				return {
+					nextBytes,
+					result: { hash: sha256Hex(persistedContent), bytesWritten: nextBytes.byteLength },
+					lineStats: wholeFileLineStats(
+						previousContent === null ? null : normalizeLineEndings(previousContent),
+						normalizeLineEndings(persistedContent),
+					),
+				};
+			},
+		});
+		diskMayHaveChanged = true;
+		// Claims and snapshots are compatibility observations, never the receipt.
+		try {
+			if (claimPath) closeClaim(cwd, claimId, [claimPath]);
+		} catch (error) {
+			logger.debug("Closing editor claim failed", { requestId, error: String(error) });
+		}
 	} catch (err) {
-		// Sealed on the error path for the same reason the tool hooks do it: an unclosed
-		// claim is read as "still running" and would shadow every later window.
-		if (claimPath) sealClaim(cwd, claimId);
+		try {
+			if (claimPath) sealClaim(cwd, claimId);
+		} catch (error) {
+			logger.debug("Sealing editor claim failed", { requestId, error: String(error) });
+		}
+		if (err instanceof EditorFileChangeUncertainError) {
+			diskMayHaveChanged = true;
+			return c.json(
+				{
+					error: err.message,
+					code: "WRITE_RECONCILE_REQUIRED",
+					operationId: err.operationId,
+				},
+				500,
+			);
+		}
+		if (err instanceof EditorWriteConflict) return c.json(err.body, 409);
+		if (err instanceof AppError) throw err;
+		if (err instanceof LocalFileValidationError) throw new ValidationError(err.message);
 		throw new AppError(
 			`Failed to write file: ${err instanceof Error ? err.message : String(err)}`,
 			500,
 			"WRITE_FAILED",
 		);
-	}
-	if (claimPath) closeClaim(cwd, claimId, [claimPath]);
-
-	if (claimPath) {
-		await recordAttribution({
-			deviceId: LOCAL_DEVICE_ID,
-			workspacePath: cwd,
-			filePath: claimPath,
-			// No narratorId: a person is not a session. The narrator only supplied the
-			// workspace, and claiming it here would present a human edit as agent work.
-			narratorId: null,
-			userId: c.get("user").sub,
-			action: "human",
-			// Both sides LF: a CRLF baseline against LF input counted every line as
-			// replaced, so a one-line save was attributed as a whole-file rewrite.
-			lineStats: wholeFileLineStats(
-				previousContent === null ? null : normalizeLineEndings(previousContent),
-				normalizedContent,
-			),
-		});
-
-		// ── Tree snapshot boundary for the save ──────────────────────────────
-		//
-		// Tree hashes are captured around agent TOOL calls, and a human save is not one,
-		// so without this the bytes land inside whatever window the next tool opens.
-		// Two consequences, both silent:
-		//
-		//   1. Reverting that tool call also reverts the person's edit, because the
-		//      window's `before` predates it.
-		//   2. Worse, `session._lastTreeHash` is reused as the next tool's `before`.
-		//      Segment planning decides "nothing else wrote in between" by testing
-		//      `previous.after === next.before`, so a stale `before` can MERGE two
-		//      segments that should have stayed split — reversing whatever landed in
-		//      between. See `invalidateWorkspaceTreeCache`.
-		//
-		// The watcher does eventually take a boundary, but not reliably soon: the
-		// default path is polling, and a same-size edit to an already-dirty file keeps
-		// the status signature byte-identical, so the boundary can wait for the
-		// `MAX_SKIPPED_POLLS` sweep (~1 minute). A save is a discrete event we are
-		// already inside, so it takes its own boundary instead of waiting to be noticed.
-		//
-		// Best-effort and ordered cache-first: the bytes are already on disk, so nothing
-		// here may fail the request, and dropping the cache matters more than recording
-		// the boundary (a missing boundary loses undo granularity, a stale one reverses
-		// someone else's work).
-		try {
-			const { invalidateWorkspaceTreeCache } = await import("../services/narrator-session-state");
-			invalidateWorkspaceTreeCache(cwd);
-			if (settings.chapters.treeSnapshotsEnabled) {
-				const { worktreeTreeSnapshot } = await import("../services/worktree-tree-snapshot");
-				// The hot-path variant: a save is a user-facing request and must not stall
-				// behind (or trigger) an unbounded full-tree scan on a huge worktree.
-				const treeHash = await worktreeTreeSnapshot.tryCaptureHot(cwd, LOCAL_DEVICE_ID);
-				if (treeHash) {
-					// Linked into the snapshot DAG for the same reason the watcher does it: a fork
-					// taken after this save must start from a state that includes it.
-					const { advanceChapterSnapshot } = await import("../services/chapter-snapshot-ref");
-					await advanceChapterSnapshot(cwd, treeHash, "human editor save");
+	} finally {
+		if (diskMayHaveChanged && claimPath) {
+			// Compatibility tree observation, OUTSIDE the coordinator lease: never acquire
+			// an old worktree/shadow lock in the reverse order. A watcher may miss a
+			// same-size dirty-file edit, so invalidate caches immediately and capture a
+			// bounded boundary for the DAG. This is not proof of human ownership; the
+			// immutable file receipt above is. Even an uncertain dispatch invalidates the
+			// cache, and no postprocessing failure may change the disk outcome.
+			try {
+				const { invalidateWorkspaceTreeCache } = await import("../services/narrator-session-state");
+				invalidateWorkspaceTreeCache(cwd);
+				if (settings.chapters.treeSnapshotsEnabled) {
+					const { worktreeTreeSnapshot } = await import("../services/worktree-tree-snapshot");
+					// The hot-path variant: a save is a user-facing request and must not stall
+					// behind (or trigger) an unbounded full-tree scan on a huge worktree.
+					const treeHash = await worktreeTreeSnapshot.tryCaptureHot(cwd, LOCAL_DEVICE_ID);
+					if (treeHash) {
+						// Linked into the snapshot DAG for the same reason the watcher does it: a fork
+						// taken after this save must start from a state that includes it.
+						const { advanceChapterSnapshot } = await import("../services/chapter-snapshot-ref");
+						await advanceChapterSnapshot(cwd, treeHash, "human editor save");
+					}
 				}
+			} catch (err) {
+				logger.debug("Tree snapshot boundary failed after human save", {
+					narratorId,
+					path: claimPath,
+					error: String(err),
+				});
 			}
-		} catch (err) {
-			logger.debug("Tree snapshot boundary failed after human save", {
-				narratorId,
-				path: claimPath,
-				error: String(err),
-			});
 		}
 	}
 
@@ -715,10 +678,10 @@ fsRoutes.post("/write", async (c) => {
 	if (body.notifyAgent) {
 		try {
 			const { interjectFileEditAsUserMessage } = await import("../services/file-edit-interject");
-			const lineStats = wholeFileLineStats(
-				previousContent === null ? null : normalizeLineEndings(previousContent),
-				normalizedContent,
-			);
+			const lineStats =
+				completed.linesAdded !== null && completed.linesRemoved !== null
+					? { added: completed.linesAdded, removed: completed.linesRemoved }
+					: null;
 			const result = await interjectFileEditAsUserMessage(narratorId, {
 				filePath: rawPath,
 				worktreePath: cwd,
@@ -741,14 +704,29 @@ fsRoutes.post("/write", async (c) => {
 	return c.json({
 		ok: true,
 		path: target,
-		hash: persistedHash,
-		bytesWritten: outputBytes.byteLength,
+		...completed.result,
+		fileChangeEvidence: completed.fileChangeEvidence,
 		// Echoed so a client can keep its round trip honest without having to remember
 		// what it sent — and so a save that fell back to UTF-8 for an unknown name says so.
 		encoding,
 		...(notified ? { notified } : {}),
 	});
 });
+
+/** A bounded editor conflict body, caught only before target dispatch. */
+class EditorWriteConflict extends LocalFileValidationError {
+	constructor(
+		readonly body: {
+			error: string;
+			code: "STALE_WRITE";
+			currentHash: string | null;
+			currentContent: string;
+			expectedHash?: string;
+		},
+	) {
+		super(body.error);
+	}
+}
 
 /** 403 for a path the write allow-list refuses. */
 class WriteRefusedError extends AppError {

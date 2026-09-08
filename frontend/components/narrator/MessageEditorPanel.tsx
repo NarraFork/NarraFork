@@ -22,8 +22,19 @@
  */
 
 import { useEditRegeneratePreview } from "@frontend/hooks/useNarrator";
-import { ActionIcon, Button, Group, Paper, Stack, Text, Textarea, Tooltip } from "@mantine/core";
+import {
+	ActionIcon,
+	Button,
+	CloseButton,
+	Group,
+	Paper,
+	Stack,
+	Text,
+	Textarea,
+	Tooltip,
+} from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import type { FileReference } from "@shared/file-reference";
 import {
 	isTextFile,
 	MAX_EDIT_IMAGES_PER_MESSAGE,
@@ -38,6 +49,13 @@ import { shouldClearEditDraft } from "../../lib/api/narrators";
 import { UserAvatar } from "../UserAvatar";
 import { EditExistingImageThumb, EditNewImageThumb, EditTextFileChip } from "./EditAttachmentChips";
 import { EditingMessageCtx } from "./EditingMessageCtx";
+import {
+	editFileReferenceInput,
+	type FileReferenceInput,
+	fileReferenceToken,
+	readFileReferences,
+	trimFileReferenceInput,
+} from "./file-reference-input";
 import { editRevertNeedsConfirm } from "./message-edit-text";
 import {
 	ACCEPTED_TYPES,
@@ -107,6 +125,7 @@ export interface MessageEditorPanelProps {
 			newImages: File[];
 			keepTextFilePaths: string[];
 			newTextFiles: File[];
+			fileReferences: FileReference[];
 		},
 	) => Promise<boolean>;
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
@@ -167,6 +186,13 @@ export function MessageEditorPanel({
 			: [],
 	);
 	const [editNewTextFiles, setEditNewTextFiles] = useState<File[]>([]);
+	const [editFileReferences, setEditFileReferences] = useState<FileReference[]>(() =>
+		isUser
+			? readFileReferences(
+					blocks.filter((block) => block.type === "file_reference").map((block) => block.reference),
+				)
+			: [],
+	);
 	const [isSubmittingEdit, setIsSubmittingEdit] = useState(false);
 	const isSubmittingEditRef = useRef(false);
 	// Mirror the kept-image count in a ref so the async add-images flow reads the
@@ -178,11 +204,34 @@ export function MessageEditorPanel({
 	const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 	// Undo stack for the edit textarea. React controls the textarea `value`, which
 	// disables native Ctrl+Z, so we keep our own bounded stack of prior snapshots.
-	const editUndoStackRef = useRef<string[]>([]);
+	const editUndoStackRef = useRef<FileReferenceInput[]>([]);
+	const beforeEditRef = useRef<{ start: number; end: number; backward?: boolean } | undefined>(
+		undefined,
+	);
+	const composingRef = useRef(false);
+	const compositionUndoSavedRef = useRef(false);
+	const captureEditRange = useCallback((textarea: HTMLTextAreaElement, inputType = "") => {
+		beforeEditRef.current = {
+			start: textarea.selectionStart,
+			end: textarea.selectionEnd,
+			backward: inputType.includes("Backward"),
+		};
+	}, []);
+	// Native beforeinput also covers deletion/paste, which React's synthesized
+	// onBeforeInput does not consistently emit. Read selection BEFORE DOM mutation.
+	useEffect(() => {
+		const textarea = editTextareaRef.current;
+		if (!textarea) return;
+		const beforeInput = (event: Event) =>
+			captureEditRange(textarea, (event as InputEvent).inputType);
+		textarea.addEventListener("beforeinput", beforeInput);
+		return () => textarea.removeEventListener("beforeinput", beforeInput);
+	}, [captureEditRange]);
 	const editImageNarratorId = imageNarratorId ?? narratorId;
 	const hasEditImages = editKeptImages.length > 0 || editNewImages.length > 0;
 	const hasEditTextFiles = editKeptTextFiles.length > 0 || editNewTextFiles.length > 0;
-	const canSubmitEdit = !!editContent.trim() || hasEditImages || hasEditTextFiles;
+	const canSubmitEdit =
+		!!editContent.trim() || hasEditImages || hasEditTextFiles || editFileReferences.length > 0;
 
 	const removeKeptImage = useCallback((imageId: string) => {
 		setEditKeptImages((prev) => prev.filter((b) => b.imageId !== imageId));
@@ -277,7 +326,8 @@ export function MessageEditorPanel({
 	// (validated by extension/size). Unknown items are ignored so normal text
 	// paste still works.
 	const handleEditPaste = useCallback(
-		(e: React.ClipboardEvent) => {
+		(e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+			captureEditRange(e.currentTarget);
 			if (!isUser) return;
 			const imageFiles: File[] = [];
 			const textFiles: File[] = [];
@@ -298,7 +348,7 @@ export function MessageEditorPanel({
 				if (textFiles.length > 0) handleAddEditTextFiles(textFiles);
 			}
 		},
-		[isUser, handleAddEditImages, handleAddEditTextFiles],
+		[isUser, handleAddEditImages, handleAddEditTextFiles, captureEditRange],
 	);
 
 	const buildEditImageOpts = useCallback(
@@ -311,8 +361,19 @@ export function MessageEditorPanel({
 				.map((b) => b.filePath)
 				.filter((p): p is string => typeof p === "string"),
 			newTextFiles: editNewTextFiles,
+			fileReferences: trimFileReferenceInput({
+				text: editContent,
+				fileReferences: editFileReferences,
+			}).fileReferences,
 		}),
-		[editKeptImages, editNewImages, editKeptTextFiles, editNewTextFiles],
+		[
+			editKeptImages,
+			editNewImages,
+			editKeptTextFiles,
+			editNewTextFiles,
+			editContent,
+			editFileReferences,
+		],
 	);
 
 	const submitUserEdit = useCallback(
@@ -385,30 +446,52 @@ export function MessageEditorPanel({
 	// Controlled onChange that also records the prior value on the undo stack so
 	// Ctrl+Z can restore it (React-controlled textareas disable native undo).
 	// Snapshots are pushed only when the value actually changed, capped at 100.
-	const handleEditContentChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-		const next = e.currentTarget.value;
-		setEditContent((prev) => {
-			if (prev !== next) {
-				const stack = editUndoStackRef.current;
-				stack.push(prev);
+	const handleEditContentChange = useCallback(
+		(e: React.ChangeEvent<HTMLTextAreaElement>) => {
+			const next = e.currentTarget.value;
+			const range = beforeEditRef.current;
+			beforeEditRef.current = undefined;
+			if (editContent === next) return;
+			const previous = { text: editContent, fileReferences: editFileReferences };
+			const stack = editUndoStackRef.current;
+			if (!composingRef.current || !compositionUndoSavedRef.current) {
+				stack.push(previous);
 				if (stack.length > 100) stack.shift();
+				if (composingRef.current) compositionUndoSavedRef.current = true;
 			}
-			return next;
-		});
-	}, []);
+			// Collapsed deletion ranges exclude the deleted characters. Anchor the
+			// actual removed length at the caret, including word/line deletion.
+			if (range && range.start === range.end && next.length < editContent.length) {
+				const removed = editContent.length - next.length;
+				if (range.backward) range.start = Math.max(0, range.start - removed);
+				else range.end += removed;
+			}
+			const edited = editFileReferenceInput(previous, next, range);
+			setEditContent(edited.text);
+			setEditFileReferences(edited.fileReferences);
+		},
+		[editContent, editFileReferences],
+	);
 
 	// Handle keyboard shortcuts in edit mode. Editing a message has no queue
 	// semantics, so Enter and Ctrl/Cmd+Enter both submit; Shift+Enter inserts a
 	// native newline.
 	const handleEditKeyDown = useCallback(
 		(e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+			captureEditRange(e.currentTarget, e.key === "Backspace" ? "deleteBackward" : "");
+			if (composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229)
+				return;
 			// Ctrl+Z / Cmd+Z (without shift) → pop the undo stack. Redo (shift+Z)
 			// is left to native behaviour and ignored here.
 			if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
 				if (editUndoStackRef.current.length > 0) {
 					e.preventDefault();
 					const prev = editUndoStackRef.current.pop();
-					if (prev !== undefined) setEditContent(prev);
+					if (prev !== undefined) {
+						beforeEditRef.current = undefined;
+						setEditContent(prev.text);
+						setEditFileReferences(prev.fileReferences);
+					}
 				}
 				return;
 			}
@@ -417,7 +500,7 @@ export function MessageEditorPanel({
 			e.preventDefault();
 			handleConfirmClick();
 		},
-		[handleConfirmClick],
+		[handleConfirmClick, captureEditRange],
 	);
 
 	// Register/unregister editing state with the parent NarratorPanel so the
@@ -459,6 +542,14 @@ export function MessageEditorPanel({
 					<Textarea
 						ref={editTextareaRef}
 						value={editContent}
+						onCompositionStart={(e) => {
+							captureEditRange(e.currentTarget);
+							composingRef.current = true;
+							compositionUndoSavedRef.current = false;
+						}}
+						onCompositionEnd={() => {
+							composingRef.current = false;
+						}}
 						onChange={handleEditContentChange}
 						onKeyDown={handleEditKeyDown}
 						autosize
@@ -504,6 +595,14 @@ export function MessageEditorPanel({
 						ref={editTextareaRef}
 						value={editContent}
 						disabled={isSubmittingEdit}
+						onCompositionStart={(e) => {
+							captureEditRange(e.currentTarget);
+							composingRef.current = true;
+							compositionUndoSavedRef.current = false;
+						}}
+						onCompositionEnd={() => {
+							composingRef.current = false;
+						}}
 						onChange={handleEditContentChange}
 						onKeyDown={handleEditKeyDown}
 						onPaste={handleEditPaste}
@@ -553,6 +652,32 @@ export function MessageEditorPanel({
 									onRemove={() => removeNewTextFile(i)}
 									disabled={isSubmittingEdit}
 								/>
+							))}
+						</Group>
+					)}
+					{editFileReferences.length > 0 && (
+						<Group gap="xs" wrap="wrap">
+							{editFileReferences.map((reference) => (
+								<Group
+									key={reference.id}
+									gap={4}
+									wrap="nowrap"
+									title={`${reference.deviceId}: ${reference.path}`}
+								>
+									<Text size="xs" c="blue" truncate style={{ maxWidth: 240 }}>
+										{fileReferenceToken(reference)}
+									</Text>
+									<CloseButton
+										size="xs"
+										disabled={isSubmittingEdit}
+										aria-label={`${t("removeFile")}: ${reference.label}`}
+										onClick={() =>
+											setEditFileReferences((previous) =>
+												previous.filter((item) => item.id !== reference.id),
+											)
+										}
+									/>
+								</Group>
 							))}
 						</Group>
 					)}

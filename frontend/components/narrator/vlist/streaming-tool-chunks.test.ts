@@ -1,5 +1,17 @@
 import { describe, expect, it } from "bun:test";
 import {
+	createDiffDocument,
+	getDiffRowAnchor,
+	projectDiffDocument,
+	resolveDiffSourcePoint,
+} from "@shared/pretext-layout/diff-core";
+import { normalizeSourceText } from "@shared/pretext-layout/source-text";
+import {
+	buildTopLevelStreamingChunksMsg,
+	resolveAllToolCallsFromMsg,
+	topLevelStreamingChunkToToolFields,
+} from "../narrator-message-helpers";
+import {
 	applyStreamingToolChunk,
 	applyStreamingToolCompleted,
 	applyStreamingToolExecuting,
@@ -295,5 +307,234 @@ describe("collectPersistedToolUseIds", () => {
 			{},
 		]);
 		expect(ids.size).toBe(0);
+	});
+});
+
+describe("streaming field source ranges", () => {
+	it("keeps one epoch and normalized coordinates while a live field crosses 16k and CRLF chunks", () => {
+		const store = createStreamingToolStore();
+		let inputCharsTotal = 0;
+		let received = "";
+		let epoch: string | undefined;
+		for (const delta of ["a".repeat(15_999), "\r", "\nline", "\r\nmore\n"]) {
+			received += delta;
+			inputCharsTotal += delta.length;
+			applyStreamingToolChunk(store, {
+				toolUseId: "edit",
+				toolName: "Edit",
+				inputCharsTotal,
+				streamingField: { name: "new_string", delta },
+			});
+			const entry = store.get("edit");
+			const range = entry?.streamingFieldRanges?.new_string;
+			const tail = normalizeSourceText(entry?.streamingFieldValue ?? "");
+			const normalized = normalizeSourceText(received);
+			epoch ??= range?.epoch;
+			expect(range?.epoch).toBe(epoch);
+			expect(range?.endOffset).toBe(normalized.length);
+			expect(range?.startOffset).toBe(normalized.length - tail.length);
+			expect((entry?.streamingFieldValue ?? "").length).toBeLessThanOrEqual(16_000);
+		}
+		expect(store.get("edit")?.streamingFieldRanges?.new_string.startColumn).toBeGreaterThan(0);
+	});
+
+	it("preserves finished fields AND ranges when switching old→new and when metadata arrives", () => {
+		const store = createStreamingToolStore();
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 12,
+			streamingField: { name: "old_string", delta: "old\ntext" },
+		});
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 20,
+			streamingField: { name: "new_string", delta: "" },
+		});
+		const oldRange = store.get("edit")?.streamingFieldRanges?.old_string;
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 22,
+			metadata: { filePath: "a.ts" },
+		});
+		const entry = store.get("edit");
+		if (!entry) throw new Error("missing chunk");
+		expect(entry.extractedFields?.old_string).toBe("old\ntext");
+		expect(entry.streamingFieldRanges?.old_string).toEqual(oldRange);
+		expect(entry.streamingFieldRanges?.new_string).toBeDefined();
+		const fields = topLevelStreamingChunkToToolFields(entry);
+		expect(fields.inputJson).toMatchObject({
+			_streamingFieldValue: "",
+			_streamingFieldRanges: entry.streamingFieldRanges,
+			_streamingFields: { old_string: "old\ntext" },
+		});
+	});
+
+	it("marks reconnect snapshots with an unknown origin without discarding their retained text", () => {
+		const store = createStreamingToolStore();
+		store.set("edit", {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 500,
+			streamingFieldName: "new_string",
+			streamingFieldValue: "observed\r",
+		});
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 505,
+			streamingField: { name: "new_string", delta: "\ntail" },
+		});
+		const entry = store.get("edit");
+		expect(entry?.streamingFieldValue).toBe("observed\r\ntail");
+		expect(entry?.streamingFieldRanges?.new_string).toMatchObject({
+			originKnown: false,
+			startOffset: 0,
+			endOffset: 13,
+			endLine: 1,
+			endColumn: 4,
+		});
+	});
+
+	it("does not repeat a final delta that accompanies an authoritative completed field", () => {
+		const store = createStreamingToolStore();
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 4,
+			streamingField: { name: "old_string", delta: "a" },
+		});
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 8,
+			extractedFields: { old_string: "abc" },
+			streamingField: { name: "old_string", delta: "bc" },
+		});
+		expect(store.get("edit")?.streamingFieldValue).toBe("abc");
+		expect(store.get("edit")?.streamingFieldRanges?.old_string).toMatchObject({
+			originKnown: true,
+			complete: true,
+			endOffset: 3,
+		});
+	});
+
+	it("retains verified remaps through started/completed and both synthetic tool representations", () => {
+		const store = createStreamingToolStore();
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 20,
+			extractedFields: { old_string: "old" },
+			streamingField: { name: "new_string", delta: "tail\nlast" },
+		});
+		const streamed = store.get("edit");
+		const first = createDiffDocument({
+			oldText: "old",
+			newText: streamed?.streamingFieldValue ?? "",
+			newRange: streamed?.streamingFieldRanges?.new_string,
+			focusSide: "new",
+		});
+		const reader = getDiffRowAnchor(first, 1, "new");
+		const focus = first.focus;
+		if (!reader || !focus) throw new Error("missing anchor");
+		applyStreamingToolStarted(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			input: { old_string: "old", new_string: "header\ntail\nlast" },
+		});
+		applyStreamingToolCompleted(store, { toolUseId: "edit", status: "success" });
+		const completed = store.get("edit");
+		if (!completed) throw new Error("missing completed chunk");
+		const doc = createDiffDocument({
+			oldText: "old",
+			newText: "header\ntail\nlast",
+			newRange: completed.streamingFieldRanges?.new_string,
+		});
+		expect(resolveDiffSourcePoint(doc, reader)).toMatchObject({ lost: false, point: { line: 1 } });
+		expect(resolveDiffSourcePoint(doc, focus)).toMatchObject({ lost: false, point: { line: 2 } });
+		const fields = topLevelStreamingChunkToToolFields(completed);
+		expect(fields.inputJson).toMatchObject({
+			_streamingFieldRanges: completed.streamingFieldRanges,
+		});
+		const synthetic = buildTopLevelStreamingChunksMsg([completed], "n", "2026-09-07T00:00:00Z");
+		expect(synthetic?.toolCalls?.[0]?.inputJson).toEqual(fields.inputJson);
+		expect(synthetic ? resolveAllToolCallsFromMsg(synthetic)[0]?.inputJson : undefined).toEqual(
+			fields.inputJson,
+		);
+	});
+
+	it("promotes a 16k completed extracted field to its verified complete coordinates", () => {
+		const full = `prefix\n${"row\r\n".repeat(4_000)}`;
+		const store = createStreamingToolStore();
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: full.length,
+			extractedFields: { old_string: full },
+			streamingField: { name: "new_string", delta: "" },
+		});
+		const streamed = store.get("edit");
+		const oldRange = streamed?.streamingFieldRanges?.old_string;
+		expect(streamed?.extractedFields?.old_string.length).toBeLessThanOrEqual(16_000);
+		expect(oldRange?.startOffset).toBeGreaterThan(0);
+		applyStreamingToolStarted(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			input: { old_string: full, new_string: "" },
+		});
+		expect(store.get("edit")?.streamingFieldRanges?.old_string).toMatchObject({
+			epoch: oldRange?.epoch,
+			originKnown: true,
+			complete: true,
+			startOffset: 0,
+		});
+		expect(store.get("edit")?.streamingFieldRanges?.new_string).toMatchObject({
+			originKnown: true,
+			complete: true,
+			startOffset: 0,
+			endOffset: 0,
+		});
+	});
+
+	it("uses a new epoch for discontinuous snapshots and never jumps a reader to focus", () => {
+		const store = createStreamingToolStore();
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 50,
+			streamingField: { name: "new_string", delta: "same\ntail" },
+		});
+		const previous = store.get("edit");
+		const doc = createDiffDocument({
+			oldText: "",
+			newText: "same\ntail",
+			newRange: previous?.streamingFieldRanges?.new_string,
+		});
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 8,
+			streamingField: { name: "new_string", delta: "same\nother\nlatest" },
+		});
+		const next = store.get("edit");
+		expect(next?.streamingFieldRanges?.new_string.epoch).not.toBe(
+			previous?.streamingFieldRanges?.new_string.epoch,
+		);
+		const replacement = createDiffDocument({
+			oldText: "",
+			newText: next?.streamingFieldValue ?? "",
+			newRange: next?.streamingFieldRanges?.new_string,
+			focusSide: "new",
+		});
+		const paused = projectDiffDocument(replacement, { anchor: doc.focus });
+		expect(paused).toMatchObject({
+			anchorLost: true,
+			anchorLossReason: "epoch",
+			anchor: { line: 0 },
+		});
+		expect(replacement.focus?.line).toBe(2);
 	});
 });

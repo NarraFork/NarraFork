@@ -1,6 +1,23 @@
+import type {
+	FileChangeActor,
+	FileChangeExecutionBinding,
+	FileChangeExecutionReceipt,
+	FileChangeIdentity,
+	FileChangeRevertMutationJournal,
+	FileChangeState,
+} from "@shared/file-change-protocol";
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import { sql } from "drizzle-orm";
-import { index, integer, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import {
+	type AnySQLiteColumn,
+	check,
+	index,
+	integer,
+	real,
+	sqliteTable,
+	text,
+	uniqueIndex,
+} from "drizzle-orm/sqlite-core";
 import type { ToolExecutionPlan, ToolExecutionTarget } from "../lib/agent/types";
 
 // === projects ===
@@ -447,6 +464,10 @@ export const narrators = sqliteTable(
 			.default("fresh"),
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		parentNarratorId: text("parent_narrator_id").references((): any => narrators.id),
+		/** Immutable actual Agent tool-call PK; retained even if its history is deleted. */
+		originToolCallId: text("origin_tool_call_id"),
+		/** Explicit creation provenance; NULL means unknown legacy origin. */
+		subagentOriginKind: text("subagent_origin_kind", { enum: ["tool", "standalone"] }),
 		contextSummary: text("context_summary"),
 		model: text("model").default("claude-sonnet-4.5"),
 		/** When set, the model should be restored to this value after the current turn completes.
@@ -729,6 +750,7 @@ export const narrators = sqliteTable(
 		// stop it. `narrator-access-nesting.test.ts` covers the paths that exist today.
 		index("idx_narrators_chapter").on(table.chapterId),
 		index("idx_narrators_parent").on(table.parentNarratorId),
+		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
 		// FK covering index for user deletion, and the lookup behind "my narrators".
 		index("idx_narrators_owner").on(table.ownerUserId),
 		// Leads the visibility predicate pushed down into the paginated list query.
@@ -1490,6 +1512,17 @@ export const narratorToolCalls = sqliteTable(
 		permissionDecisionReason: text("permission_decision_reason"),
 		permissionSuggestions: text("permission_suggestions", { mode: "json" }),
 		isBackground: integer("is_background", { mode: "boolean" }).notNull().default(false),
+		/** Zero is legacy/unverified, not permission to claim a migrated row as a fresh call. */
+		executionIdentityVersion: integer("execution_identity_version").notNull().default(0),
+		/** A COW history clone retains its origin but is never an executable attempt. */
+		executionOriginToolCallId: text("execution_origin_tool_call_id"),
+		/** Zero means no durable execution attempt was allocated (including legacy rows). */
+		executionAttempt: integer("execution_attempt").notNull().default(0),
+		/** Actual operation reference; COW copies it without creating new evidence. */
+		fileChangeOperationId: text("file_change_operation_id").references(
+			(): AnySQLiteColumn => fileChangeOperations.id,
+			{ onDelete: "set null" },
+		),
 		/** True when this tool call is a hidden file-history checkpoint clone. */
 		isFileHistoryCheckpoint: integer("is_file_history_checkpoint", { mode: "boolean" })
 			.notNull()
@@ -1549,6 +1582,13 @@ export const narratorToolCalls = sqliteTable(
 			table.createdAt,
 		),
 		index("idx_toolcalls_created").on(table.narratorId, table.createdAt),
+		index("idx_toolcalls_attempt").on(
+			table.narratorId,
+			table.toolUseId,
+			table.messageId,
+			table.executionAttempt,
+		),
+		index("idx_toolcalls_file_change_operation").on(table.fileChangeOperationId),
 		/**
 		 * Global execution-log ordering. `(startedAt, id)` so the admin page can seek a
 		 * keyset cursor with a row-value comparison — measured 0.07ms per page against
@@ -2337,6 +2377,7 @@ export const narratorDrafts = sqliteTable(
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
 		text: text("text").notNull().default(""),
+		fileReferencesJson: text("file_references_json"), // bounded FileReference[]; no file contents
 		sourceId: text("source_id"),
 		revision: integer("revision").notNull().default(1),
 		updatedAt: text("updated_at").notNull(),
@@ -3133,6 +3174,7 @@ export const narratorBufferedMessages = sqliteTable(
 		createdBy: text("created_by"),
 		creatorJson: text("creator_json"), // JSON: BufferCreator | null
 		textFilePathsJson: text("text_file_paths_json"), // JSON: SavedBufferedFile[] | null
+		fileReferencesJson: text("file_references_json"), // bounded FileReferenceSnapshot[] | null
 		priority: integer("priority", { mode: "boolean" }).notNull().default(false),
 		seq: integer("seq").notNull(),
 		bufferedAt: text("buffered_at").notNull(),
@@ -3341,6 +3383,9 @@ export const backgroundTasks = sqliteTable(
 		}),
 		// Common
 		toolUseId: text("tool_use_id"),
+		/** Actual initiating call, retained when its history is removed; NULL is legacy. */
+		toolCallId: text("tool_call_id"),
+		executionAttempt: integer("execution_attempt"),
 		alias: text("alias"),
 		title: text("title"),
 		output: text("output"),
@@ -3356,6 +3401,7 @@ export const backgroundTasks = sqliteTable(
 	(table) => [
 		index("idx_bg_tasks_parent").on(table.parentNarratorId, table.status),
 		index("idx_bg_tasks_subagent").on(table.subagentNarratorId),
+		uniqueIndex("idx_bg_tasks_tool_attempt").on(table.toolCallId, table.executionAttempt),
 		// The transfer runner reaches the projection by the OWNING row's id (it never
 		// holds the projection id), and it does so at every lifecycle transition.
 		// Doubles as the FK covering index for transfer-row deletion.
@@ -3415,6 +3461,18 @@ export const fileAttributions = sqliteTable(
 		toolName: text("tool_name"),
 		/** Tool-use id linking back to narrator_tool_calls, if any. */
 		toolUseId: text("tool_use_id"),
+		/** v2 projection links; NULL keeps legacy observations explicitly unverified. */
+		operationId: text("operation_id").references(() => fileChangeOperations.id, {
+			onDelete: "set null",
+		}),
+		effectId: text("effect_id").references(() => fileChangeEffects.id, { onDelete: "set null" }),
+		scopeId: text("scope_id").references(() => fileChangeScopes.id, { onDelete: "set null" }),
+		fileKey: text("file_key"),
+		actorSubjectKey: text("actor_subject_key"),
+		actorSnapshotJson: text("actor_snapshot_json", { mode: "json" }).$type<FileChangeActor>(),
+		attributionGrade: text("attribution_grade", {
+			enum: ["measured", "observed_ambiguous", "unknown"],
+		}),
 		/**
 		 * Lines added / removed by THIS modification.
 		 *
@@ -3446,6 +3504,492 @@ export const fileAttributions = sqliteTable(
 		),
 		index("idx_file_attr_narrator").on(table.narratorId),
 		index("idx_file_attr_workspace").on(table.workspacePath, table.changedAt),
+		uniqueIndex("idx_file_attr_effect").on(table.effectId),
+		index("idx_file_attr_operation").on(table.operationId),
+		index("idx_file_attr_scope_file").on(table.scopeId, table.fileKey, table.changedAt, table.id),
+		check(
+			"ck_file_attr_line_counts",
+			sql`
+			(${table.linesAdded} IS NULL OR (typeof(${table.linesAdded}) = 'integer' AND ${table.linesAdded} >= 0))
+			AND (${table.linesRemoved} IS NULL OR (typeof(${table.linesRemoved}) = 'integer' AND ${table.linesRemoved} >= 0))
+		`,
+		),
+	],
+);
+
+// === file change evidence v2 ===
+// Scope identity survives reconnects; execution generations belong to individual
+// operation bindings. Never cascade-delete evidence with a narrator or worktree.
+export const fileChangeScopes = sqliteTable(
+	"file_change_scopes",
+	{
+		id: text("id").primaryKey(),
+		sourceInstanceId: text("source_instance_id").notNull(),
+		deviceId: text("device_id").notNull(),
+		workspaceInstanceId: text("workspace_instance_id").notNull(),
+		canonicalRoot: text("canonical_root").notNull(),
+		displayRoot: text("display_root").notNull(),
+		pathFlavor: text("path_flavor", { enum: ["posix", "windows"] }).notNull(),
+		status: text("status", { enum: ["active", "retired", "needs_verification"] })
+			.notNull()
+			.default("needs_verification"),
+		rootIdentityJson: text("root_identity_json", { mode: "json" }).$type<Record<string, string>>(),
+		revision: integer("revision").notNull().default(0),
+		fencingToken: integer("fencing_token").notNull().default(0),
+		/** Durable admission barrier, separate from root identity verification. */
+		activeLeaseId: text("active_lease_id"),
+		activeLeaseEpoch: text("active_lease_epoch"),
+		activeLeaseStartedAt: text("active_lease_started_at"),
+		activeMutationCount: integer("active_mutation_count").notNull().default(0),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_fc_scope_instance").on(
+			table.sourceInstanceId,
+			table.deviceId,
+			table.workspaceInstanceId,
+		),
+		index("idx_fc_scope_root").on(table.sourceInstanceId, table.deviceId, table.canonicalRoot),
+		index("idx_fc_scope_status").on(table.status, table.updatedAt),
+		index("idx_fc_scope_active_lease").on(table.deviceId, table.activeLeaseId, table.canonicalRoot),
+	],
+);
+
+// Metadata only. Raw bodies live in file-change-blobs; expired rows remain as
+// tombstones so a missing object cannot be mistaken for an absent user file.
+export const fileChangeBlobs = sqliteTable(
+	"file_change_blobs",
+	{
+		id: text("id").primaryKey(),
+		digest: text("digest").notNull(),
+		sizeBytes: integer("size_bytes").notNull(),
+		storageKey: text("storage_key").notNull(),
+		status: text("status", { enum: ["staging", "ready", "expired", "missing"] })
+			.notNull()
+			.default("staging"),
+		leaseUntil: text("lease_until"),
+		gcGeneration: integer("gc_generation").notNull().default(0),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_fc_blob_digest").on(table.digest),
+		index("idx_fc_blob_gc").on(table.status, table.leaseUntil, table.updatedAt),
+	],
+);
+
+// Scalar admission counters avoid SUM over the whole blob catalog in a write
+// request. Startup reconciliation owns the transition from unverified to ready.
+export const fileChangeStorageBudgets = sqliteTable(
+	"file_change_storage_budgets",
+	{
+		id: text("id").primaryKey(),
+		namespaceKey: text("namespace_key").notNull(),
+		status: text("status", { enum: ["unverified", "reconciling", "ready"] })
+			.notNull()
+			.default("unverified"),
+		usedBytes: integer("used_bytes").notNull().default(0),
+		reservedBytes: integer("reserved_bytes").notNull().default(0),
+		quotaBytes: integer("quota_bytes").notNull(),
+		generation: integer("generation").notNull().default(0),
+		reconciledAt: text("reconciled_at"),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [uniqueIndex("idx_fc_storage_namespace").on(table.namespaceKey)],
+);
+
+export const fileChangeBlobReservations = sqliteTable(
+	"file_change_blob_reservations",
+	{
+		id: text("id").primaryKey(),
+		budgetId: text("budget_id")
+			.notNull()
+			.references(() => fileChangeStorageBudgets.id),
+		ownerEpoch: text("owner_epoch").notNull(),
+		generation: integer("generation").notNull().default(0),
+		expectedSize: integer("expected_size").notNull(),
+		status: text("status", { enum: ["reserved", "settled", "reconcile_required"] })
+			.notNull()
+			.default("reserved"),
+		blobDigest: text("blob_digest").references(() => fileChangeBlobs.digest),
+		published: integer("published", { mode: "boolean" }),
+		createdAt: text("created_at").notNull(),
+		settledAt: text("settled_at"),
+	},
+	(table) => [
+		index("idx_fc_reservation_budget").on(table.budgetId, table.status, table.createdAt, table.id),
+		index("idx_fc_reservation_owner").on(table.ownerEpoch, table.status),
+		index("idx_fc_reservation_blob").on(table.blobDigest),
+	],
+);
+
+export const fileChangeOperations = sqliteTable(
+	"file_change_operations",
+	{
+		id: text("id").primaryKey(),
+		evidenceVersion: integer("evidence_version").notNull().default(2),
+		sourceInstanceId: text("source_instance_id").notNull(),
+		sourceKind: text("source_kind", {
+			enum: ["tool", "editor", "background_task", "external", "git", "revert", "import"],
+		}).notNull(),
+		/** Immutable origin key, not a FK that disappears when history is removed. */
+		sourceId: text("source_id").notNull(),
+		attempt: integer("attempt").notNull(),
+		/** Nullable only for pre-journal rows, which cannot authorize execution. */
+		requestDigest: text("request_digest"),
+		expectedEffectCount: integer("expected_effect_count"),
+		preparedEffectCount: integer("prepared_effect_count").notNull().default(0),
+		evidenceBytes: integer("evidence_bytes").notNull().default(0),
+		settledEffectCount: integer("settled_effect_count").notNull().default(0),
+		unresolvedEffectCount: integer("unresolved_effect_count").notNull().default(0),
+		toolCallId: text("tool_call_id"),
+		toolUseId: text("tool_use_id"),
+		backgroundTaskId: text("background_task_id"),
+		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "set null" }),
+		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
+		ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
+		actorSubjectKey: text("actor_subject_key").notNull(),
+		actorJson: text("actor_json", { mode: "json" }).$type<FileChangeActor>().notNull(),
+		initiatorSubjectKey: text("initiator_subject_key"),
+		executionBindingJson: text("execution_binding_json", {
+			mode: "json",
+		}).$type<FileChangeExecutionBinding>(),
+		executionOutcome: text("execution_outcome", {
+			enum: ["running", "succeeded", "failed", "interrupted"],
+		})
+			.notNull()
+			.default("running"),
+		effectOutcome: text("effect_outcome", { enum: ["pending", "no_change", "changed", "unknown"] })
+			.notNull()
+			.default("pending"),
+		settlement: text("settlement", {
+			enum: ["preparing", "intent_durable", "applying", "settled", "reconcile_required"],
+		})
+			.notNull()
+			.default("preparing"),
+		attributionGrade: text("attribution_grade", {
+			enum: ["measured", "observed_ambiguous", "unknown"],
+		})
+			.notNull()
+			.default("unknown"),
+		coverage: text("coverage", { enum: ["complete", "partial", "unavailable", "legacy_unknown"] })
+			.notNull()
+			.default("unavailable"),
+		parentOperationId: text("parent_operation_id"),
+		reason: text("reason"),
+		leaseUntil: text("lease_until"),
+		startedAt: text("started_at").notNull(),
+		finishedAt: text("finished_at"),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_fc_operation_attempt").on(
+			table.sourceInstanceId,
+			table.sourceKind,
+			table.sourceId,
+			table.attempt,
+		),
+		index("idx_fc_operation_narrator").on(table.narratorId, table.startedAt, table.id),
+		index("idx_fc_operation_actor").on(table.actorSubjectKey, table.startedAt, table.id),
+		index("idx_fc_operation_pending").on(table.settlement, table.updatedAt, table.id),
+		index("idx_fc_operation_task").on(table.backgroundTaskId, table.attempt),
+		index("idx_fc_operation_parent").on(table.parentOperationId),
+	],
+);
+
+export const fileChangeEffects = sqliteTable(
+	"file_change_effects",
+	{
+		id: text("id").primaryKey(),
+		operationId: text("operation_id")
+			.notNull()
+			.references(() => fileChangeOperations.id),
+		scopeId: text("scope_id")
+			.notNull()
+			.references(() => fileChangeScopes.id),
+		fileKey: text("file_key").notNull(),
+		identityJson: text("identity_json", { mode: "json" }).$type<FileChangeIdentity>().notNull(),
+		scopeRevision: integer("scope_revision").notNull(),
+		mutationId: text("mutation_id").notNull(),
+		requestDigest: text("request_digest").notNull(),
+		phase: text("phase", { enum: ["apply", "compensate"] }).notNull(),
+		beforeStateJson: text("before_state_json", { mode: "json" }).$type<FileChangeState>().notNull(),
+		intendedAfterStateJson: text("intended_after_state_json", { mode: "json" })
+			.$type<FileChangeState>()
+			.notNull(),
+		observedAfterStateJson: text("observed_after_state_json", { mode: "json" })
+			.$type<FileChangeState>()
+			.notNull(),
+		/** Reverse indexes for marking; these must agree with the typed state refs. */
+		beforeBlobDigest: text("before_blob_digest").references(() => fileChangeBlobs.digest),
+		intendedAfterBlobDigest: text("intended_after_blob_digest").references(
+			() => fileChangeBlobs.digest,
+		),
+		observedAfterBlobDigest: text("observed_after_blob_digest").references(
+			() => fileChangeBlobs.digest,
+		),
+		outcome: text("outcome", { enum: ["pending", "no_change", "changed", "unknown"] })
+			.notNull()
+			.default("pending"),
+		settlement: text("settlement", {
+			enum: ["preparing", "intent_durable", "applying", "settled", "reconcile_required"],
+		})
+			.notNull()
+			.default("preparing"),
+		attributionGrade: text("attribution_grade", {
+			enum: ["measured", "observed_ambiguous", "unknown"],
+		})
+			.notNull()
+			.default("unknown"),
+		/** Durable confidence cap across receipt reconciliation; null means not recorded. */
+		attributionCeiling: text("attribution_ceiling", {
+			enum: ["measured", "observed_ambiguous", "unknown"],
+		}),
+		executionConfirmed: integer("execution_confirmed", { mode: "boolean" })
+			.notNull()
+			.default(false),
+		executionReceiptJson: text("execution_receipt_json", {
+			mode: "json",
+		}).$type<FileChangeExecutionReceipt>(),
+		executionReceiptDigest: text("execution_receipt_digest"),
+		linesAdded: integer("lines_added"),
+		linesRemoved: integer("lines_removed"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_fc_effect_mutation").on(table.mutationId),
+		uniqueIndex("idx_fc_effect_operation_file").on(table.operationId, table.fileKey, table.phase),
+		index("idx_fc_effect_file").on(table.scopeId, table.fileKey, table.scopeRevision, table.id),
+		index("idx_fc_effect_pending").on(table.settlement, table.updatedAt),
+		index("idx_fc_effect_before_blob").on(table.beforeBlobDigest),
+		index("idx_fc_effect_intended_blob").on(table.intendedAfterBlobDigest),
+		index("idx_fc_effect_observed_blob").on(table.observedAfterBlobDigest),
+	],
+);
+
+// A scan receipt is NOT deduplicated by treeHash: identical trees can come from
+// different scopes, policies, interrupted scans, or uncoordinated observations.
+export const snapshotCaptures = sqliteTable(
+	"snapshot_captures",
+	{
+		id: text("id").primaryKey(),
+		scopeId: text("scope_id")
+			.notNull()
+			.references(() => fileChangeScopes.id),
+		operationId: text("operation_id").references(() => fileChangeOperations.id),
+		treeHash: text("tree_hash"),
+		snapshotCommitSha: text("snapshot_commit_sha"),
+		coverage: text("coverage", { enum: ["complete", "partial", "unavailable", "legacy_unknown"] })
+			.notNull()
+			.default("unavailable"),
+		temporalConsistency: text("temporal_consistency", {
+			enum: ["platform_quiescent", "concurrent_observation", "unknown"],
+		})
+			.notNull()
+			.default("unknown"),
+		policyVersion: integer("policy_version").notNull(),
+		ignorePolicyDigest: text("ignore_policy_digest"),
+		manifestBlobDigest: text("manifest_blob_digest").references(() => fileChangeBlobs.digest),
+		omittedCount: integer("omitted_count"),
+		reason: text("reason"),
+		startedAt: text("started_at").notNull(),
+		finishedAt: text("finished_at"),
+	},
+	(table) => [
+		index("idx_snapshot_capture_scope").on(table.scopeId, table.startedAt, table.id),
+		index("idx_snapshot_capture_tree").on(table.scopeId, table.treeHash),
+		index("idx_snapshot_capture_operation").on(table.operationId),
+		index("idx_snapshot_capture_manifest").on(table.manifestBlobDigest),
+	],
+);
+
+export const revertOperations = sqliteTable(
+	"revert_operations",
+	{
+		id: text("id").primaryKey(),
+		protocolVersion: integer("protocol_version").notNull().default(2),
+		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "set null" }),
+		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
+		requestedBySubjectKey: text("requested_by_subject_key").notNull(),
+		idempotencyKey: text("idempotency_key").notNull(),
+		requestDigest: text("request_digest").notNull(),
+		kind: text("kind", {
+			enum: ["revert", "unrevert", "history_delete", "rollback_to_block", "edit_regenerate"],
+		}).notNull(),
+		scope: text("scope", { enum: ["narrator", "workspace"] }).notNull(),
+		selectorKind: text("selector_kind", {
+			enum: ["all", "from_seq", "messages", "tool_calls", "after_block"],
+		}).notNull(),
+		selectorBlobDigest: text("selector_blob_digest").references(() => fileChangeBlobs.digest),
+		planBlobDigest: text("plan_blob_digest").references(() => fileChangeBlobs.digest),
+		historyManifestBlobDigest: text("history_manifest_blob_digest").references(
+			() => fileChangeBlobs.digest,
+		),
+		planHash: text("plan_hash"),
+		expectedMessageVersion: integer("expected_message_version"),
+		parentRevertId: text("parent_revert_id"),
+		status: text("status", {
+			enum: [
+				"planned",
+				"prepared",
+				"applying",
+				"files_verified",
+				"committed",
+				"compensating",
+				"compensated",
+				"recovery_required",
+				"cancelled",
+				"expired",
+			],
+		})
+			.notNull()
+			.default("planned"),
+		fileCount: integer("file_count").notNull().default(0),
+		appliedFileCount: integer("applied_file_count").notNull().default(0),
+		coverageComplete: integer("coverage_complete", { mode: "boolean" }).notNull().default(false),
+		reason: text("reason"),
+		expiresAt: text("expires_at").notNull(),
+		leaseUntil: text("lease_until"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_revert_operation_request").on(
+			table.requestedBySubjectKey,
+			table.idempotencyKey,
+		),
+		index("idx_revert_operation_narrator").on(table.narratorId, table.createdAt, table.id),
+		index("idx_revert_operation_pending").on(table.status, table.updatedAt, table.id),
+		index("idx_revert_operation_owner_pending").on(
+			table.requestedBySubjectKey,
+			table.narratorId,
+			table.projectId,
+			table.status,
+			table.updatedAt,
+			table.id,
+		),
+		index("idx_revert_operation_parent").on(table.parentRevertId),
+		index("idx_revert_operation_plan_blob").on(table.planBlobDigest),
+		index("idx_revert_operation_selector_blob").on(table.selectorBlobDigest),
+		index("idx_revert_operation_history_blob").on(table.historyManifestBlobDigest),
+	],
+);
+
+export const revertOperationFiles = sqliteTable(
+	"revert_operation_files",
+	{
+		id: text("id").primaryKey(),
+		revertOperationId: text("revert_operation_id")
+			.notNull()
+			.references(() => revertOperations.id),
+		scopeId: text("scope_id")
+			.notNull()
+			.references(() => fileChangeScopes.id),
+		fileKey: text("file_key").notNull(),
+		identityJson: text("identity_json", { mode: "json" }).$type<FileChangeIdentity>().notNull(),
+		sequence: integer("sequence").notNull(),
+		expectedStateJson: text("expected_state_json", { mode: "json" })
+			.$type<FileChangeState>()
+			.notNull(),
+		desiredStateJson: text("desired_state_json", { mode: "json" })
+			.$type<FileChangeState>()
+			.notNull(),
+		observedAfterStateJson: text("observed_after_state_json", {
+			mode: "json",
+		}).$type<FileChangeState>(),
+		beforeBlobDigest: text("before_blob_digest").references(() => fileChangeBlobs.digest),
+		desiredBlobDigest: text("desired_blob_digest").references(() => fileChangeBlobs.digest),
+		observedAfterBlobDigest: text("observed_after_blob_digest").references(
+			() => fileChangeBlobs.digest,
+		),
+		/** Compensation cannot replace or unpin the original apply observation. */
+		compensationAfterStateJson: text("compensation_after_state_json", {
+			mode: "json",
+		}).$type<FileChangeState>(),
+		compensationAfterBlobDigest: text("compensation_after_blob_digest").references(
+			() => fileChangeBlobs.digest,
+		),
+		applyMutationId: text("apply_mutation_id").notNull(),
+		applyRequestDigest: text("apply_request_digest").notNull(),
+		compensateMutationId: text("compensate_mutation_id").notNull(),
+		compensateRequestDigest: text("compensate_request_digest").notNull(),
+		status: text("status", {
+			enum: [
+				"prepared",
+				"applying",
+				"applied",
+				"verified",
+				"compensating",
+				"compensated",
+				"unknown",
+			],
+		})
+			.notNull()
+			.default("prepared"),
+		receiptJson: text("receipt_json", { mode: "json" }).$type<
+			FileChangeRevertMutationJournal | Record<string, string | number | boolean | null>
+		>(),
+		reason: text("reason"),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_revert_file_identity").on(table.revertOperationId, table.fileKey),
+		uniqueIndex("idx_revert_file_apply").on(table.applyMutationId),
+		uniqueIndex("idx_revert_file_compensate").on(table.compensateMutationId),
+		index("idx_revert_file_pending").on(table.revertOperationId, table.status, table.sequence),
+		index("idx_revert_file_before_blob").on(table.beforeBlobDigest),
+		index("idx_revert_file_desired_blob").on(table.desiredBlobDigest),
+		index("idx_revert_file_observed_blob").on(table.observedAfterBlobDigest),
+		index("idx_revert_file_compensation_blob").on(table.compensationAfterBlobDigest),
+	],
+);
+
+// Rebuildable query projections. Completeness is explicit; a limited sample does
+// not authorize a precise count, author claim, or automatic file rollback.
+export const fileChangeRollups = sqliteTable(
+	"file_change_rollups",
+	{
+		id: text("id").primaryKey(),
+		scopeId: text("scope_id")
+			.notNull()
+			.references(() => fileChangeScopes.id),
+		fileKey: text("file_key").notNull(),
+		actorSubjectKey: text("actor_subject_key").notNull(),
+		projectionKind: text("projection_kind", { enum: ["history", "current", "attempt"] }).notNull(),
+		attemptKey: text("attempt_key").notNull().default(""),
+		changeCount: integer("change_count").notNull().default(0),
+		linesAdded: integer("lines_added").notNull().default(0),
+		linesRemoved: integer("lines_removed").notNull().default(0),
+		unmeasuredCount: integer("unmeasured_count").notNull().default(0),
+		hasExternalChange: integer("has_external_change", { mode: "boolean" }).notNull().default(false),
+		hasImpreciseAttribution: integer("has_imprecise_attribution", { mode: "boolean" })
+			.notNull()
+			.default(true),
+		complete: integer("complete", { mode: "boolean" }).notNull().default(false),
+		asOfRevision: integer("as_of_revision"),
+		lastEffectId: text("last_effect_id").references(() => fileChangeEffects.id),
+		headFingerprint: text("head_fingerprint"),
+		indexFingerprint: text("index_fingerprint"),
+		worktreeFingerprint: text("worktree_fingerprint"),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_fc_rollup_dimension").on(
+			table.scopeId,
+			table.fileKey,
+			table.actorSubjectKey,
+			table.projectionKind,
+			table.attemptKey,
+		),
+		index("idx_fc_rollup_actor").on(
+			table.actorSubjectKey,
+			table.projectionKind,
+			table.updatedAt,
+			table.id,
+		),
+		index("idx_fc_rollup_effect").on(table.lastEffectId),
 	],
 );
 

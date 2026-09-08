@@ -14,15 +14,14 @@
  * "LRU thrash on sequential access". The result is 0% hit rate and worse-than-no-
  * cache overhead.
  *
- * Instead we use a large ceiling with bulk-clear-on-overflow. Within a single
- * narrator session the working set grows monotonically and is always fully retained.
- * The ceiling (131072) accommodates ~65k items (a 30k-message narrator) plus stale
- * entries from 1-2 previously-viewed narrators. If somehow exceeded, a full clear
- * is a one-time cost (next build repopulates the current window).
+ * Each geometry family retains only its current data revision. In particular,
+ * live tool keys are stable (tool-<id>), so they must REPLACE a previous source
+ * document rather than accumulating every frame's model until the entry ceiling.
  *
- * Memory budget: each MeasuredElement is ~0.3-1KB (height + PreparedBlock array +
- * frame). At 131k entries ≈ 40-130MB worst case — acceptable for a desktop app.
- * In practice, a single narrator's entries are 20-60MB.
+ * The entry ceiling still protects small geometry records. Body models can retain
+ * much larger source strings/Diff documents, so they have a separate character
+ * admission budget. Once full, existing admitted entries remain reusable on a
+ * sequential scan; an uncached new entry never evicts the whole useful cohort.
  *
  * Cache key anatomy:
  *   `${spec.key}|${kind}|${roundedWidth}|${lod}|r:${dataRevision}|${optsDigest}`
@@ -31,6 +30,7 @@
  * content changes between measurements.
  */
 
+import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { MeasuredElement } from "./prepared-block";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -38,58 +38,103 @@ import type { MeasuredElement } from "./prepared-block";
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Measurement cache backed by a plain Map. No per-entry eviction. When the
- * entry count exceeds `ceiling`, the entire map is cleared (rare, one-time cost).
- *
- * This avoids LRU thrash on sequential full-window scans while still bounding
- * memory for pathological multi-narrator usage.
+ * Source-payload admission budget, independent of the small-geometry entry cap.
+ * Revisions of the same geometry family replace one another; it is not an LRU.
  */
+export const MEASURE_BODY_SOURCE_CHAR_BUDGET = 4_000_000;
+
+/** Only the measured body's retained payload, never a stringify/deep walk of user input. */
+export function retainedBodySourceChars(value: unknown): number {
+	if (!value || typeof value !== "object") return 0;
+	const item = value as Record<string, unknown>;
+	const model = item.model as Record<string, unknown> | undefined;
+	let chars = 0;
+	if (model?.kind === "capped") {
+		chars += typeof model.text === "string" ? model.text.length : 0;
+		const doc = model.diffDocument as
+			| { oldSource?: { text?: string }; newSource?: { text?: string } }
+			| undefined;
+		chars += doc?.oldSource?.text?.length ?? 0;
+		chars += doc?.newSource?.text?.length ?? 0;
+	}
+	for (const key of ["detail", "promptMeasured", "resultMeasured"] as const)
+		chars += retainedBodySourceChars(item[key]);
+	if (Array.isArray(item.sections))
+		for (const section of item.sections) chars += retainedBodySourceChars(section?.measuredBody);
+	if (Array.isArray(item.rows))
+		for (const row of item.rows) chars += retainedBodySourceChars(row?.cardMeasured);
+	if (Array.isArray(item.children))
+		for (const child of item.children) chars += retainedBodySourceChars(child);
+	return chars;
+}
+
 export class MeasureCache {
-	private map = new Map<string, MeasuredElement>();
+	private map = new Map<string, { value: MeasuredElement; chars: number; family?: string }>();
+	private families = new Map<string, string>();
+	private sourceChars = 0;
 	private _hits = 0;
 	private _misses = 0;
 
-	constructor(private ceiling: number) {}
+	constructor(
+		private ceiling: number,
+		private sourceBudget = MEASURE_BODY_SOURCE_CHAR_BUDGET,
+	) {}
 
 	get(key: string): MeasuredElement | undefined {
-		const value = this.map.get(key);
-		if (value === undefined) {
+		const entry = this.map.get(key);
+		if (entry === undefined) {
 			this._misses++;
 			return undefined;
 		}
 		this._hits++;
-		return value;
+		return entry.value;
 	}
 
-	set(key: string, value: MeasuredElement): void {
-		// Bulk-clear when ceiling is exceeded. This is a safety valve — in normal
-		// usage (single narrator) the map never reaches this. When it fires (e.g.
-		// user scrolled through multiple huge narrators), the next build repopulates
-		// the current window in one pass.
-		if (this.map.size >= this.ceiling && !this.map.has(key)) {
-			this.map.clear();
-		}
-		this.map.set(key, value);
+	private remove(key: string): void {
+		const entry = this.map.get(key);
+		if (!entry) return;
+		this.map.delete(key);
+		this.sourceChars -= entry.chars;
+		if (entry.family && this.families.get(entry.family) === key) this.families.delete(entry.family);
 	}
 
-	clear(): void {
+	/** One current source revision per geometry family; old streamed documents are released. */
+	set(key: string, value: MeasuredElement, family?: string): void {
+		const previous = family ? this.families.get(family) : undefined;
+		if (previous && previous !== key) this.remove(previous);
+		this.remove(key);
+		const chars = retainedBodySourceChars(value);
+		if (chars > this.sourceBudget) return;
+		if (this.map.size >= this.ceiling) this.clearStorage();
+		// Admission, not LRU: keep the retained cohort hot on sequential full-window
+		// scans rather than evicting exactly what the NEXT scan is about to visit.
+		if (this.sourceChars + chars > this.sourceBudget) return;
+		this.map.set(key, { value, chars, family });
+		this.sourceChars += chars;
+		if (family) this.families.set(family, key);
+	}
+
+	private clearStorage(): void {
 		this.map.clear();
-		this._hits = 0;
-		this._misses = 0;
+		this.families.clear();
+		this.sourceChars = 0;
 	}
-
+	clear(): void {
+		this.clearStorage();
+		this.resetStats();
+	}
 	get size(): number {
 		return this.map.size;
 	}
-
+	get retainedSourceChars(): number {
+		return this.sourceChars;
+	}
 	get hits(): number {
 		return this._hits;
 	}
-
 	get misses(): number {
 		return this._misses;
 	}
-
 	resetStats(): void {
 		this._hits = 0;
 		this._misses = 0;
@@ -197,6 +242,34 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// entry and paint the new text inside the old box (CONTRACT.md §4.5 约束 3).
 	// O(1) via the sampled signature, same as every other text field here.
 	if (typeof d.text === "string") rev += `|sx:${textSignature(d.text)}`;
+	// Communication bodies can finish streaming or hydrate without changing status.
+	// Re-key the bounded measured text and both independently reserved footer rows.
+	if (typeof d.message === "string") {
+		rev += `|cm:${textSignature(d.message)}|ct:${d.messageTruncated === true ? 1 : 0}`;
+		if (typeof d.error === "string") rev += `|ce:${textSignature(d.error)}`;
+		if (typeof d.warning === "string") rev += `|cw:${textSignature(d.warning)}`;
+	}
+	if (Array.isArray(d.attachments)) {
+		// Locator data is painted/clicked from cached blocks, including equal labels
+		// on different devices. The adapter already removed every snapshot body.
+		rev += `|ua:${JSON.stringify(
+			d.attachments.map((attachment) => {
+				const a = attachment as Record<string, unknown>;
+				return [
+					a.type,
+					a.reference,
+					a.imageId,
+					a.previewUrl,
+					a.filename,
+					a.size,
+					a.width,
+					a.height,
+					a.filePath,
+					a.uploadNarratorId,
+				];
+			}),
+		)}`;
+	}
 	rev += detailTextRevision(d.detail);
 	rev += reflectionRevision(d.reflection);
 	rev += subagentRevision(d);
@@ -258,6 +331,17 @@ function traceRevision(d: Record<string, unknown>): string {
 		const r = row as Record<string, unknown>;
 		// Row identity + painted content. Titles are already length-capped upstream.
 		if (typeof r.key === "string") rev += `|tk:${r.key}`;
+		// Cached rows also carry inspector refs. A retry/COW can change only the
+		// persisted identity while keeping every painted and height-bearing field.
+		const identity = r.identity as { toolDetailRef?: Record<string, unknown> } | undefined;
+		const ref = identity?.toolDetailRef;
+		if (ref) {
+			rev += `|tref:${JSON.stringify([
+				ref.toolCallId ?? null,
+				ref.messageId ?? null,
+				ref.executionAttempt ?? null,
+			])}`;
+		}
 		// PAINTED as `data-nf-unit` (the LOD morph's pairing identity) and height-neutral,
 		// so it needs keying for the same reason `status` does: it can move while `key`
 		// and every height-bearing field stay put — a reasoning run gains a cross-level
@@ -383,13 +467,15 @@ function subagentRevision(d: Record<string, unknown>): string {
 	// Measured bodies: the description wraps when expanded, the prompt and result
 	// are measured up to their caps.
 	if (typeof d.description === "string") rev += `|gd:${textSignature(d.description)}`;
-	if (typeof d.prompt === "string") rev += `|gp:${textSignature(d.prompt)}`;
+	if (d.promptBody && typeof d.promptBody === "object")
+		rev += leafTextRevision(d.promptBody as Record<string, unknown>);
 	if (d.promptOpen === true) rev += "|gq:1";
 	// A truncated prompt reserves the full cap, so its height differs from an
 	// identical-length complete one; and the flag flips to false when the fetched
 	// body lands, which must re-measure the (now exact) block.
 	if (d.promptTruncated === true) rev += "|gt:1";
-	if (typeof d.resultText === "string") rev += `|gr:${textSignature(d.resultText)}`;
+	if (d.resultBody && typeof d.resultBody === "object")
+		rev += leafTextRevision(d.resultBody as Record<string, unknown>);
 	if (typeof d.resultPreview === "string") rev += `|gv:${textSignature(d.resultPreview)}`;
 	if (d.hasResolveOverride === true) rev += "|gx:1";
 	// File changes. HEIGHT-AFFECTING (unlike the tool card's `diffStats`): this is a
@@ -422,9 +508,23 @@ function subagentFileChangesRevision(value: unknown): string {
 		totalUnmeasured?: unknown;
 		bashTouchedCount?: unknown;
 		countsTruncated?: unknown;
+		attributionScope?: unknown;
+		scope?: unknown;
 	};
 	if (!Array.isArray(changes.files)) return "";
 	let rev = `|gfc:${changes.files.length}`;
+	// Scope is part of the painted warning/boundary identity, not proof of an
+	// attempt. JSON tuples keep delimiters in ids/paths from colliding.
+	const scope =
+		changes.scope != null && typeof changes.scope === "object"
+			? (changes.scope as Record<string, unknown>)
+			: null;
+	rev += `|gfs:${JSON.stringify([
+		changes.attributionScope ?? "legacy_unscoped",
+		scope
+			? [scope.sourceToolUseId ?? null, scope.startedAt ?? null, scope.completedAt ?? null]
+			: null,
+	])}`;
 	if (typeof changes.totalFiles === "number") rev += `|gft:${changes.totalFiles}`;
 	if (typeof changes.totalUnmeasured === "number") rev += `|gfu:${changes.totalUnmeasured}`;
 	if (typeof changes.bashTouchedCount === "number") rev += `|gfb:${changes.bashTouchedCount}`;
@@ -432,16 +532,28 @@ function subagentFileChangesRevision(value: unknown): string {
 	for (const file of changes.files) {
 		if (file == null || typeof file !== "object") continue;
 		const f = file as {
+			subagentNarratorId?: unknown;
+			deviceId?: unknown;
+			workspacePath?: unknown;
 			filePath?: unknown;
 			linesAdded?: unknown;
 			linesRemoved?: unknown;
 			editCount?: unknown;
+			unmeasuredCount?: unknown;
+			outsideParentWorkspace?: unknown;
 		};
-		if (typeof f.filePath === "string") rev += `|gfp:${f.filePath}`;
+		rev += `|gfi:${JSON.stringify([
+			f.subagentNarratorId ?? null,
+			f.deviceId || null,
+			f.workspacePath || null,
+			f.filePath ?? null,
+			f.outsideParentWorkspace ?? null,
+		])}`;
 		// Written as `a/r` so a corrected figure moves the key; `null` (unmeasured) is
 		// deliberately distinct from `0`, matching the data contract.
 		rev += `|gfl:${String(f.linesAdded ?? "n")}/${String(f.linesRemoved ?? "n")}`;
 		if (typeof f.editCount === "number") rev += `|gfe:${f.editCount}`;
+		if (typeof f.unmeasuredCount === "number") rev += `|gfm:${f.unmeasuredCount}`;
 	}
 	return rev;
 }
@@ -489,13 +601,14 @@ function reflectionRevision(reflection: unknown): string {
 function detailTextRevision(detail: unknown): string {
 	if (detail == null || typeof detail !== "object") return "";
 	const d = detail as Record<string, unknown>;
-	let rev = leafTextRevision(d);
-	// Multi-part detail: fold every section body (bodies never nest further).
+	let rev = "";
+	// One production shape; no bare-body or generic detail path.
 	if (Array.isArray(d.sections)) {
 		rev += `|sc:${d.sections.length}`;
 		for (const part of d.sections as unknown[]) {
 			if (part == null || typeof part !== "object") continue;
 			const p = part as Record<string, unknown>;
+			if (typeof p.key === "string") rev += `|sk:${textSignature(p.key)}`;
 			if (typeof p.label === "string") rev += `|sl:${p.label}`;
 			if (p.body != null && typeof p.body === "object") {
 				rev += leafTextRevision(p.body as Record<string, unknown>);
@@ -549,12 +662,100 @@ function textSignature(text: string): string {
 	return `${len}.${hash.toString(36)}`;
 }
 
+/** Source coordinates only; viewport projections, scrollTop and reader anchors never enter keys. */
+function sourceRangeRevision(value: unknown): string {
+	if (!value || typeof value !== "object") return "";
+	const range = value as Record<string, unknown>;
+	const fields = [
+		"epoch",
+		"startOffset",
+		"endOffset",
+		"startLine",
+		"startColumn",
+		"endLine",
+		"endColumn",
+		"originKnown",
+		"complete",
+	];
+	let rev = `|range:${fields.map((key) => textSignature(String(range[key]))).join("/")}`;
+	if (range.remap && typeof range.remap === "object") {
+		const remap = range.remap as Record<string, unknown>;
+		rev +=
+			"|remap:" +
+			[
+				"fromEpoch",
+				"fromStartOffset",
+				"fromEndOffset",
+				"fromStartLine",
+				"offsetDelta",
+				"lineDelta",
+				"columnDelta",
+			]
+				.map((key) => textSignature(String(remap[key])))
+				.join("/");
+	}
+	return rev;
+}
+
+function sourcePointRevision(value: unknown): string {
+	if (!value || typeof value !== "object") return "";
+	const point = value as Record<string, unknown>;
+	return (
+		"|focus:" +
+		["side", "epoch", "line", "column", "offset"]
+			.map((key) => textSignature(String(point[key])))
+			.join("/")
+	);
+}
+
 /** Content-signature revision of one NON-composite detail body. */
 function leafTextRevision(d: Record<string, unknown>): string {
 	let rev = "";
 	if (typeof d.text === "string") rev += `|tx:${textSignature(d.text)}`;
-	if (typeof d.inputText === "string") rev += `|it:${textSignature(d.inputText)}`;
-	if (typeof d.outputText === "string") rev += `|ot:${textSignature(d.outputText)}`;
+	for (const key of [
+		"id",
+		"source",
+		"format",
+		"revision",
+		"cap",
+		"codeLang",
+		"codeLangPath",
+		"sourcePath",
+		"kind",
+	] as const) {
+		if (d[key] != null) rev += `|${key}:${textSignature(String(d[key]))}`;
+	}
+	if (d.live === true) rev += "|live:1";
+	if (d.textTruncated === true) rev += "|cut:1";
+	if (typeof d.contentLines === "number") rev += `|cl:${d.contentLines}`;
+	if (typeof d.contentPx === "number") rev += `|cp:${d.contentPx}`;
+	rev += sourceRangeRevision(d.range);
+	if (d.diffDocument && typeof d.diffDocument === "object") {
+		const doc = d.diffDocument as Record<string, unknown>;
+		rev += `|dr:${textSignature(String(doc.revision))}`;
+		rev += sourcePointRevision(doc.focus);
+		for (const key of ["oldSource", "newSource"] as const) {
+			const source = doc[key] as Record<string, unknown> | undefined;
+			rev += sourceRangeRevision(source?.range);
+		}
+	}
+	if (d.followTarget && typeof d.followTarget === "object") {
+		const target = d.followTarget as Record<string, unknown>;
+		rev += `|ft:${target.kind}${sourcePointRevision(target.focus)}`;
+	}
+	if (d.media && typeof d.media === "object") {
+		const media = d.media as Record<string, unknown>;
+		for (const key of [
+			"width",
+			"height",
+			"previewUrl",
+			"filePath",
+			"imageId",
+			"filename",
+		] as const) {
+			if (media[key] != null) rev += `|m${key}:${textSignature(String(media[key]))}`;
+		}
+	}
 	// Structured results: entry count + per-entry title/snippet signatures.
 	if (Array.isArray(d.entries)) {
 		rev += `|en:${d.entries.length}`;
@@ -625,7 +826,10 @@ function digestOpts(opts: Record<string, unknown>): string {
 		if (v === undefined) continue;
 		if (result.length > 0) result += ";";
 		result += `${k}=`;
-		if (typeof v === "boolean") {
+		if (k === "fileReferenceContext") {
+			// Height-neutral provenance still changes the rendered links/memo identity.
+			result += JSON.stringify(normalizeFileReferenceContext(v));
+		} else if (typeof v === "boolean") {
 			result += v ? "1" : "0";
 		} else if (typeof v === "number") {
 			result += String(v);

@@ -8,6 +8,7 @@ import {
 	useSensors,
 } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { fileReferenceApi } from "@frontend/lib/api/file-references";
 import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import type { AsyncQuestion } from "@frontend/types/narrator";
@@ -46,6 +47,12 @@ import {
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { tailRoleAllowsContinue } from "@shared/continue-tail";
+import type {
+	FileReference,
+	FileReferenceContext,
+	FileReferenceEditorSelection,
+	FileTarget,
+} from "@shared/file-reference";
 import { cardEffortLevels, lookupModelCard } from "@shared/model-card";
 import { MOBILE_TOOLBAR_VISIBLE_LIMIT } from "@shared/narrator-toolbar";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
@@ -179,9 +186,7 @@ import type { RevertScope } from "../../lib/api/narrators";
 import type { PathFlavor } from "../../lib/api/types";
 import {
 	AGG_MODEL_PREFIX,
-	buildAggModelValue,
 	FOLLOW_DEFAULT_MODEL,
-	type ModelAggregation,
 	type ModelOption,
 	parseAggModelValue,
 	resolveDisplayModel,
@@ -237,7 +242,9 @@ import {
 } from "./draft-image-attachments";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { ExecutionDeviceMenu, ExecutionDeviceOptions } from "./ExecutionDeviceMenu";
-import { AsyncQuestionInboxButton } from "./GlobalQuestionInbox";
+import type { FileReferenceScopeValue } from "./FileReferenceScope";
+import { trimFileReferenceInput } from "./file-reference-input";
+import { HumanAttentionInboxButton } from "./GlobalQuestionInbox";
 import {
 	formatKimiBarText,
 	formatKimiDetailsText,
@@ -271,6 +278,7 @@ import { NarratorLodMenu, NarratorLodOptions } from "./NarratorLodMenu";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import {
+	BackgroundTasksStatusButton,
 	NarratorStatusBar,
 	NarratorStatusToolbar,
 	type NarratorStatusToolbarAction,
@@ -307,6 +315,7 @@ import {
 	resolveNarratorToolbarBadge,
 } from "./narrator-toolbar-badges";
 import type { NarratorToolbarHost, NarratorToolbarId } from "./narrator-toolbar-items";
+import { nextHighlightRequestId } from "./panels/panel-kind";
 import { compactProgressLabel } from "./progress-label";
 import { QueuedAttachmentPreview, QueuedMessageRow } from "./QueuedMessageRow";
 import { type RenderLod, RenderLodCtx } from "./RenderLodCtx";
@@ -592,59 +601,6 @@ function SetGlobalModelModal({
 				</Group>
 			</Stack>
 		</Modal>
-	);
-}
-
-/**
- * Inline provider switcher for aggregation models.
- * Shows a SegmentedControl with "Auto" + each member provider.
- */
-function AggProviderSwitcher({
-	currentModel,
-	aggregations,
-	providerLabels,
-	onSelect,
-}: {
-	currentModel: string | null | undefined;
-	aggregations: ModelAggregation[];
-	providerLabels: Record<string, string>;
-	onSelect: (model: string) => void;
-}) {
-	const { t } = useTranslation("settings");
-	const parsed = parseAggModelValue(currentModel);
-	if (!parsed) return null;
-
-	const agg = aggregations.find((a) => a.id === parsed.aggId);
-	if (!agg || agg.models.length === 0) return null;
-
-	// Build segments: "auto" + each member model
-	const segments: Array<{ value: string; label: string }> = [
-		{ value: "auto", label: t("aggAutoLabel") },
-	];
-	for (const memberModel of agg.models) {
-		const colonIdx = memberModel.indexOf(":");
-		const prefix = colonIdx > 0 ? memberModel.slice(0, colonIdx) : memberModel;
-		const displayName = providerLabels[prefix] ?? prefix;
-		segments.push({ value: memberModel, label: displayName });
-	}
-
-	// Determine current value
-	const currentValue = parsed.pinnedModel ?? "auto";
-
-	return (
-		<SegmentedControl
-			size="xs"
-			data={segments}
-			value={currentValue}
-			onChange={(v) => {
-				if (v === "auto") {
-					onSelect(buildAggModelValue(parsed.aggId));
-				} else {
-					onSelect(buildAggModelValue(parsed.aggId, v));
-				}
-			}}
-			style={{ flexShrink: 0 }}
-		/>
 	);
 }
 
@@ -2765,6 +2721,7 @@ export function NarratorPanel({
 				newImages: File[];
 				keepTextFilePaths: string[];
 				newTextFiles: File[];
+				fileReferences?: FileReference[];
 			},
 		): Promise<boolean> => {
 			if (!rollbackEditRegenerateSupported) {
@@ -4896,13 +4853,110 @@ export function NarratorPanel({
 	const [mobileTasksOpen, setMobileTasksOpen] = useState(false);
 
 	const [internalFileViewerPath, setInternalFileViewerPath] = useState<string | null>(null);
+	const [internalFileViewerTarget, setInternalFileViewerTarget] = useState<
+		(FileTarget & { highlightRequestId: string }) | null
+	>(null);
+	const [localFileSelection, setLocalFileSelection] = useState<FileReferenceEditorSelection | null>(
+		null,
+	);
+	const fileNavigationRef = useRef(0);
+	const fileNavigationAbortRef = useRef<AbortController | null>(null);
 	const dockOpenFilePanel = dock?.openFilePanel;
 	const useInternalFileViewer = !dockOpenFilePanel && !isWorkspacePreview;
 	const handleOpenFilePanel = useMemo(() => {
 		if (dockOpenFilePanel) return (filePath: string) => dockOpenFilePanel(filePath);
-		if (useInternalFileViewer) return (filePath: string) => setInternalFileViewerPath(filePath);
+		if (useInternalFileViewer)
+			return (filePath: string) => {
+				setInternalFileViewerTarget(null);
+				setInternalFileViewerPath(filePath);
+			};
 		return undefined;
 	}, [dockOpenFilePanel, useInternalFileViewer]);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: cancel navigation when the owning narrator changes
+	useEffect(
+		() => () => {
+			fileNavigationRef.current++;
+			fileNavigationAbortRef.current?.abort();
+		},
+		[narratorId],
+	);
+	const handleOpenReferencedFile = useCallback(
+		async (target: FileTarget) => {
+			const request = ++fileNavigationRef.current;
+			fileNavigationAbortRef.current?.abort();
+			const controller = new AbortController();
+			fileNavigationAbortRef.current = controller;
+			try {
+				const { targets } = await fileReferenceApi.resolve(narratorId, [target], controller.signal);
+				if (request !== fileNavigationRef.current || !targets[0]) return;
+				const resolved = targets[0];
+				const highlightRequestId = nextHighlightRequestId();
+				if (dockOpenFilePanel) {
+					dockOpenFilePanel(resolved.path, undefined, {
+						deviceId: resolved.deviceId,
+						selection: resolved.selection,
+						highlightRequestId,
+						referenceOrigin: true,
+					});
+				} else if (useInternalFileViewer) {
+					setInternalFileViewerTarget({ ...resolved, highlightRequestId });
+					setInternalFileViewerPath(resolved.path);
+				}
+			} catch (error) {
+				if (request === fileNavigationRef.current)
+					notifications.show({
+						color: "red",
+						title: t("fileReferences.openFailed"),
+						message: error instanceof Error ? error.message : String(error),
+					});
+			}
+		},
+		[narratorId, dockOpenFilePanel, useInternalFileViewer, t],
+	);
+	const addFileReference = useCallback((reference: FileReference) => {
+		composerRef.current?.addFileReference(reference);
+	}, []);
+	const fileReferenceDevice = executionDevicesQuery.data
+		? (executionDevicesQuery.data.defaultDeviceId ?? "local")
+		: undefined;
+	const fileReferenceCwd =
+		fileReferenceDevice === "local"
+			? (fetchedNarrator?.cwd ?? narrator?.cwd ?? chapterWorktreePath)
+			: executionDevicesQuery.data?.devices.find((device) => device.id === fileReferenceDevice)
+					?.defaultCwd;
+	const fileReferenceContext = useMemo<FileReferenceContext | null>(
+		() =>
+			fileReferenceDevice && fileReferenceCwd
+				? { deviceId: fileReferenceDevice, cwd: fileReferenceCwd }
+				: null,
+		[fileReferenceDevice, fileReferenceCwd],
+	);
+	const fileReferenceScope = useMemo<FileReferenceScopeValue>(
+		() => ({
+			narratorId,
+			context: fileReferenceContext,
+			openFile:
+				!isWorkspacePreview && (dockOpenFilePanel || useInternalFileViewer)
+					? handleOpenReferencedFile
+					: undefined,
+			addReference: addFileReference,
+			selection: dock?.fileReferenceSelection ?? localFileSelection,
+			setSelection: dock?.setFileReferenceSelection ?? setLocalFileSelection,
+		}),
+		[
+			narratorId,
+			fileReferenceContext,
+			isWorkspacePreview,
+			dockOpenFilePanel,
+			useInternalFileViewer,
+			handleOpenReferencedFile,
+			addFileReference,
+			dock?.fileReferenceSelection,
+			dock?.setFileReferenceSelection,
+			localFileSelection,
+		],
+	);
 
 	// Opening a child session prefers the host-provided handler (dock/workspace
 	// aware); standalone panels fall back to routing, like SubagentCard does.
@@ -5376,6 +5430,7 @@ export function NarratorPanel({
 			text: string,
 			imageCount: number,
 			priority?: boolean,
+			fileReferences?: FileReference[],
 		) => {
 			if (!result?.buffered || !result.id) return false;
 
@@ -5384,6 +5439,7 @@ export function NarratorPanel({
 				text,
 				bufferedAt: result.bufferedAt ?? new Date().toISOString(),
 				imageCount,
+				fileReferences,
 				creator:
 					currentUser?.id && currentUser?.username
 						? {
@@ -5439,8 +5495,10 @@ export function NarratorPanel({
 		textFiles: File[] = [],
 		signal?: AbortSignal,
 		priority?: boolean,
+		fileReferences: FileReference[] = [],
 	) => {
 		const optimisticBlocks: ContentBlock[] = [
+			...fileReferences.map((reference) => ({ type: "file_reference", reference })),
 			...images.map((f) => ({
 				type: "image",
 				filename: f.name,
@@ -5464,6 +5522,7 @@ export function NarratorPanel({
 				priority,
 				reportUploadProgress,
 				signal,
+				fileReferences,
 			);
 			// Handle /load tool response — not a real message, just a tool load confirmation
 			if (result?.loaded) {
@@ -5499,7 +5558,7 @@ export function NarratorPanel({
 				// Message was buffered — show it in the queue immediately.
 				// The WS buffer_set event can be missed when the subscription is not
 				// fully caught up, so also reconcile with REST.
-				applyBufferedSendResult(result, msg, images.length);
+				applyBufferedSendResult(result, msg, images.length, priority, fileReferences);
 				scrollToBottom(true);
 			} else if (result?.id) {
 				// Normal message — set narrator status to "working" optimistically.
@@ -5531,7 +5590,13 @@ export function NarratorPanel({
 		msg: string,
 		priority?: boolean,
 		signal?: AbortSignal,
+		references?: FileReference[],
 	): Promise<boolean> => {
+		const draft = trimFileReferenceInput({
+			text: composerRef.current?.getText() ?? "",
+			fileReferences: composerRef.current?.getFileReferences() ?? [],
+		});
+		const fileReferences = references ?? (draft.text === msg ? draft.fileReferences : []);
 		const images = [...attachedImages];
 		const textFiles = [...attachedTextFiles];
 		composerRef.current?.hideTextForSend();
@@ -5545,8 +5610,15 @@ export function NarratorPanel({
 				priority,
 				reportUploadProgress,
 				signal,
+				fileReferences,
 			);
-			const buffered = applyBufferedSendResult(result, msg, images.length, priority);
+			const buffered = applyBufferedSendResult(
+				result,
+				msg,
+				images.length,
+				priority,
+				fileReferences,
+			);
 			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();
 			// Whether the message was buffered (202) or the backend fell through
@@ -5554,8 +5626,8 @@ export function NarratorPanel({
 			scrollToBottom(true);
 			return buffered;
 		} catch (err) {
-			// Restore input and attachments on error
-			composerRef.current?.setText(msg);
+			// Restore text and its independently tracked file references together.
+			composerRef.current?.restoreInput(msg, fileReferences);
 			if (images.length > 0) updateAttachedImages(images);
 			if (textFiles.length > 0) updateAttachedTextFiles(textFiles);
 			throw err; // Re-throw to let caller handle
@@ -5593,8 +5665,12 @@ export function NarratorPanel({
 	 */
 	const handleSendWithMode = async (mode: "turn" | "tool" | "interrupt") => {
 		const composerText = composerRef.current?.getText() ?? "";
-		const msg = composerText.trim();
-		const attachmentCount = attachedImages.length + attachedTextFiles.length;
+		const { text: msg, fileReferences } = trimFileReferenceInput({
+			text: composerText,
+			fileReferences: composerRef.current?.getFileReferences() ?? [],
+		});
+		const attachmentCount =
+			attachedImages.length + attachedTextFiles.length + fileReferences.length;
 		// An attachment-only message is a valid turn: images (and text files) carry the
 		// content by themselves, so an empty textarea must not block the send.
 		if (
@@ -5602,6 +5678,7 @@ export function NarratorPanel({
 				text: composerText,
 				imageCount: attachedImages.length,
 				textFileCount: attachedTextFiles.length,
+				fileReferenceCount: fileReferences.length,
 			}) ||
 			sendingRef.current
 		)
@@ -5616,12 +5693,18 @@ export function NarratorPanel({
 			progress: attachmentCount > 0 ? 0 : null,
 			canCancel: attachmentCount > 0,
 		});
-		let restoreOnError: { msg: string; images: File[]; textFiles: File[] } | null = null;
+		let restoreOnError: {
+			msg: string;
+			images: File[];
+			textFiles: File[];
+			fileReferences: FileReference[];
+		} | null = null;
 		try {
-			composerRef.current?.noteSent(msg);
+			composerRef.current?.noteSent(msg, fileReferences);
 
 			const newMatch = msg.match(/^\/new(?:\s+([\s\S]*))?$/);
 			if (newMatch) {
+				if (fileReferences.length) throw new Error(t("fileReferences.newSessionFirst"));
 				if (isActive) {
 					// /new while active: always normal queue (never interrupt to spawn).
 					await doSendBuffered(msg);
@@ -5631,7 +5714,7 @@ export function NarratorPanel({
 				const initialMessage = newMatch[1]?.trim() ?? "";
 				const images = [...attachedImages];
 				const textFiles = [...attachedTextFiles];
-				restoreOnError = { msg, images, textFiles };
+				restoreOnError = { msg, images, textFiles, fileReferences };
 				composerRef.current?.hideTextForSend();
 				hideAttachedFilesForSend();
 
@@ -5717,10 +5800,17 @@ export function NarratorPanel({
 			if (showCompactQueueChoice) {
 				const images = [...attachedImages];
 				const textFiles = [...attachedTextFiles];
-				restoreOnError = { msg, images, textFiles };
+				restoreOnError = { msg, images, textFiles, fileReferences };
 				composerRef.current?.hideTextForSend();
 				hideAttachedFilesForSend();
-				await submitMessage(msg, images, textFiles, abortController.signal, mode !== "turn");
+				await submitMessage(
+					msg,
+					images,
+					textFiles,
+					abortController.signal,
+					mode !== "turn",
+					fileReferences,
+				);
 				composerRef.current?.commitDraftAfterSend();
 				clearAttachedFilesAndDraft();
 				restoreOnError = null;
@@ -5730,10 +5820,17 @@ export function NarratorPanel({
 			const textFiles = [...attachedTextFiles];
 			// Remember the draft so a cancelled upload can restore it — submitMessage
 			// clears the input/attachments up-front for the optimistic bubble.
-			restoreOnError = { msg, images, textFiles };
+			restoreOnError = { msg, images, textFiles, fileReferences };
 			composerRef.current?.hideTextForSend();
 			hideAttachedFilesForSend();
-			await submitMessage(msg, images, textFiles, abortController.signal);
+			await submitMessage(
+				msg,
+				images,
+				textFiles,
+				abortController.signal,
+				undefined,
+				fileReferences,
+			);
 			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();
 			restoreOnError = null;
@@ -5742,7 +5839,7 @@ export function NarratorPanel({
 			// message. `doSendBuffered` already restores internally on its own throw;
 			// this covers the `/new` and idle direct-send paths.
 			if (restoreOnError) {
-				composerRef.current?.setText(restoreOnError.msg);
+				composerRef.current?.restoreInput(restoreOnError.msg, restoreOnError.fileReferences);
 				if (restoreOnError.images.length > 0) updateAttachedImages(restoreOnError.images);
 				if (restoreOnError.textFiles.length > 0) updateAttachedTextFiles(restoreOnError.textFiles);
 			}
@@ -5797,12 +5894,13 @@ export function NarratorPanel({
 			if (!trimmed) return;
 			void (async () => {
 				const preservedDraft = composerRef.current?.getText() ?? "";
+				const preservedFileReferences = composerRef.current?.getFileReferences() ?? [];
 				const preservedImages = attachedImagesRef.current;
 				const preservedTextFiles = attachedTextFilesRef.current;
 				try {
 					// Forward-only send: no attachments, and the in-progress draft is put
 					// back afterwards so the operator does not lose what they were typing.
-					composerRef.current?.setText(trimmed);
+					composerRef.current?.restoreInput(trimmed, []);
 					updateAttachedImages([]);
 					updateAttachedTextFiles([]);
 					await doSendBufferedRef.current(trimmed, false);
@@ -5813,7 +5911,7 @@ export function NarratorPanel({
 						message: err instanceof Error ? err.message : "",
 					});
 				} finally {
-					composerRef.current?.setText(preservedDraft);
+					composerRef.current?.restoreInput(preservedDraft, preservedFileReferences);
 					if (preservedImages.length > 0) updateAttachedImages(preservedImages);
 					if (preservedTextFiles.length > 0) updateAttachedTextFiles(preservedTextFiles);
 				}
@@ -5948,7 +6046,13 @@ export function NarratorPanel({
 		if (queuedMessages.length > 0) {
 			cancelBuffer(narratorId);
 			// Restore the first queued message text to the input
-			composerRef.current?.setText(queuedMessages[0].text);
+			composerRef.current?.restoreInput(
+				queuedMessages[0].text,
+				(queuedMessages[0].fileReferences ?? []).map((reference) => ({
+					...reference,
+					inputRange: undefined,
+				})),
+			);
 			setQueuedMessages([]);
 		}
 	};
@@ -5959,13 +6063,16 @@ export function NarratorPanel({
 		setQueuedMessages((prev) => prev.filter((m) => m.id !== messageId));
 		// If removing the only message, restore its text to input
 		if (queuedMessages.length === 1 && msg) {
-			composerRef.current?.setText(msg.text);
+			composerRef.current?.restoreInput(
+				msg.text,
+				(msg.fileReferences ?? []).map((reference) => ({ ...reference, inputRange: undefined })),
+			);
 		}
 		api.removeBufferedMessage(narratorId, messageId).catch(() => {
 			// Rollback on failure
 			setQueuedMessages(snapshot);
 			if (queuedMessages.length === 1 && msg) {
-				composerRef.current?.setText("");
+				composerRef.current?.restoreInput("", []);
 			}
 		});
 	};
@@ -7033,8 +7140,12 @@ export function NarratorPanel({
 
 	return (
 		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>
-			<ContentViewerEnvironmentProvider value={contentViewerEnvironment}>
+			<ContentViewerEnvironmentProvider
+				value={contentViewerEnvironment}
+				fileReferences={fileReferenceScope}
+			>
 				<Stack
+					data-narrator-panel
 					h="100%"
 					gap={0}
 					style={{ overflow: "hidden", position: "relative" }}
@@ -8179,7 +8290,8 @@ export function NarratorPanel({
 									{/* The current task text can be long (spec task titles especially), so
 									    reveal the full string on hover/tap when the row clips it. */}
 									<TruncatedText size="xs" c={workIndicatorColor} text={workIndicatorText} />
-									{(queuePosition != null || queueMessageValue) && (
+									{((queuePositionValue != null && queuePositionValue > 0) ||
+										queueMessageValue) && (
 										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 											·{" "}
 											{queueMessageValue ??
@@ -8220,6 +8332,16 @@ export function NarratorPanel({
 									}}
 								/>
 								<TruncatedText size="xs" c="dimmed" text={t(statusBarDisplay.labelKey)} />
+								{tasksSupported && tasksButtonEnabled && (
+									<BackgroundTasksStatusButton
+										runningCount={tasksRunningCount}
+										onOpen={() => {
+											// Reveal the panel, even if it is already open in an inactive tab.
+											if (dock) dock.openToolPanel("tasks");
+											else setMobileTasksOpen(true);
+										}}
+									/>
+								)}
 								{compactFailure && !isCompacting && (
 									<Text
 										size="xs"
@@ -8394,17 +8516,27 @@ export function NarratorPanel({
 													<Menu.Target>
 														<NativeSelect
 															size="xs"
-															data={allModels.map((m) => ({
-																value: m.value,
-																label:
-																	m.value === FOLLOW_DEFAULT_MODEL
-																		? t("followDefault", { model: defaultModelValue })
-																		: m.provider === "__agg__"
-																			? `⚡ ${m.label}`
-																			: m.provider
-																				? `${m.provider}:${m.label}`
-																				: m.label,
-															}))}
+															// The menu renders the full catalog; the trigger only needs
+															// the selected option so native sizing ignores longer models.
+															data={allModels
+																.filter((m) => {
+																	const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
+																	const agg = parseAggModelValue(raw);
+																	return (
+																		m.value === (agg ? `${AGG_MODEL_PREFIX}${agg.aggId}` : raw)
+																	);
+																})
+																.map((m) => ({
+																	value: m.value,
+																	label:
+																		m.value === FOLLOW_DEFAULT_MODEL
+																			? t("followDefault", { model: defaultModelValue })
+																			: m.provider === "__agg__"
+																				? `⚡ ${m.label}`
+																				: m.provider
+																					? `${m.provider}:${m.label}`
+																					: m.label,
+																}))}
 															value={(() => {
 																const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
 																const agg = parseAggModelValue(raw);
@@ -8417,8 +8549,13 @@ export function NarratorPanel({
 															style={{ pointerEvents: "auto" }}
 														/>
 													</Menu.Target>
-													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+													<Menu.Dropdown
+														data-model-menu-scroll
+														style={{ maxHeight: "60vh", overflowY: "auto" }}
+													>
 														<ModelMenuItems
+															opened={modelMenuOpenDesktop}
+															aggregations={aggregations}
 															allModels={allModels}
 															currentModel={narrator.model}
 															totalCostUsd={narrator.totalCostUsd}
@@ -8432,24 +8569,19 @@ export function NarratorPanel({
 													</Menu.Dropdown>
 												</Menu>
 											</Tooltip>
-											{parseAggModelValue(narrator.model) && (
-												<AggProviderSwitcher
-													currentModel={narrator.model}
-													aggregations={aggregations}
-													providerLabels={providerLabels}
-													onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
-												/>
-											)}
+
 											{/* Reasoning Effort (Codex + Anthropic providers) */}
 											{supportsReasoningEffort && (
 												<Menu position="top-end">
 													<Menu.Target>
 														<NativeSelect
 															size="xs"
-															data={reasoningEffortOptions.map((effort) => ({
-																value: effort,
-																label: t(`reasoning_${effort}`),
-															}))}
+															data={[
+																{
+																	value: displayedReasoningEffort,
+																	label: t(`reasoning_${displayedReasoningEffort}`),
+																},
+															]}
 															value={displayedReasoningEffort}
 															onChange={() => {}}
 															onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
@@ -8708,8 +8840,13 @@ export function NarratorPanel({
 																	</Text>
 																</ActionIcon>
 															</Menu.Target>
-															<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+															<Menu.Dropdown
+																data-model-menu-scroll
+																style={{ maxHeight: "60vh", overflowY: "auto" }}
+															>
 																<ModelMenuItems
+																	opened={modelMenuOpenMobile}
+																	aggregations={aggregations}
 																	allModels={allModels}
 																	currentModel={narrator.model}
 																	totalCostUsd={narrator.totalCostUsd}
@@ -8726,14 +8863,7 @@ export function NarratorPanel({
 															</Menu.Dropdown>
 														</Menu>
 													</Tooltip>
-													{parseAggModelValue(narrator.model) && (
-														<AggProviderSwitcher
-															currentModel={narrator.model}
-															aggregations={aggregations}
-															providerLabels={providerLabels}
-															onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
-														/>
-													)}
+
 													{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
 													{supportsReasoningEffort && (
 														<Menu position="bottom-end" withinPortal>
@@ -8907,7 +9037,7 @@ export function NarratorPanel({
 					    grouping, but the drawer it opens spans every session. */}
 					{!isWorkspacePreview && (
 						<Box px="md" pb={4} style={{ flexShrink: 0 }}>
-							<AsyncQuestionInboxButton currentNarratorId={narratorId} />
+							<HumanAttentionInboxButton currentNarratorId={narratorId} />
 						</Box>
 					)}
 
@@ -9341,7 +9471,16 @@ export function NarratorPanel({
 									</Center>
 								}
 							>
-								<FileViewerContent key={internalFileViewerPath} filePath={internalFileViewerPath} />
+								<FileViewerContent
+									key={internalFileViewerPath}
+									filePath={internalFileViewerPath}
+									narratorId={narratorId}
+									deviceId={internalFileViewerTarget?.deviceId ?? "local"}
+									referenceOrigin={!!internalFileViewerTarget}
+									selection={internalFileViewerTarget?.selection}
+									highlightRequestId={internalFileViewerTarget?.highlightRequestId}
+									onOpenFileTarget={handleOpenReferencedFile}
+								/>
 							</Suspense>
 						</Drawer>
 					)}

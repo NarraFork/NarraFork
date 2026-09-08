@@ -321,6 +321,8 @@ export function abandonManualOverride(subagentId: string): boolean {
 export interface ConclusionWatcher {
 	parentNarratorId: string;
 	toolUseId: string;
+	/** Original spawning row, preserved even when the parent message is later COW-copied. */
+	originToolCallId?: string;
 }
 
 let _conclusionWatchers: Map<string, ConclusionWatcher> | undefined;
@@ -333,8 +335,9 @@ export function registerConclusionWatcher(
 	subagentId: string,
 	parentNarratorId: string,
 	toolUseId: string,
+	originToolCallId?: string,
 ): void {
-	getConclusionWatchersMap().set(subagentId, { parentNarratorId, toolUseId });
+	getConclusionWatchersMap().set(subagentId, { parentNarratorId, toolUseId, originToolCallId });
 }
 
 export function removeConclusionWatcher(subagentId: string): boolean {

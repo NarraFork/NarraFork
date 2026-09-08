@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
@@ -29,6 +29,7 @@ import { generateId } from "../lib/id";
 import { settings } from "../lib/settings";
 import { ensureFileSnapshot } from "./file-snapshot-service";
 import {
+	applyToolCall,
 	buildCanonicalIdentityAliases,
 	canonicalizeDeviceFileIdentity,
 	canonicalizeDeviceFileIdentityWith,
@@ -36,8 +37,11 @@ import {
 	getToolCallFileIdentity,
 	getToolCallFileIdentityStrict,
 	groupByDeviceFileStrict,
+	normalizeDeviceFileIdentity,
+	type OrderedToolCall,
 	queryOrderedToolCalls,
 	ReplayDivergedError,
+	rebuildDeviceFileStatesExcluding,
 	rebuildDeviceFileStatesUpToSeq,
 } from "./file-state-rebuild";
 import { reconstructToolExecutionTarget } from "./narrator-persistence";
@@ -1614,12 +1618,9 @@ describe("tool execution target persistence", () => {
 		expect(stored?.deviceSelectionSource).toBe("local_default");
 	});
 
-	test("freezes the newest row when the same toolUseId exists from a prior turn", async () => {
-		// Regression for loop-internal "Tool routing error" with providers that
-		// reuse short sequential toolUseIds across requests (call_0, call_1, ...).
-		// Without ORDER BY desc(createdAt), findFirst would hit the stale completed
-		// row from the previous turn, rejecting the freeze because it already left
-		// "initializing".
+	test("requires an exact row when the same toolUseId exists from a prior turn", async () => {
+		// Repeated provider IDs cannot select execution authority, including by date.
+		// Live callers provide a persisted binding; legacy callers must be unambiguous.
 		const cwd = mkdtempSync(join(tmpdir(), "nf-duplicate-tooluseid-"));
 		tempDirs.push(cwd);
 		const narratorId = await createNarrator(cwd);
@@ -1682,9 +1683,7 @@ describe("tool execution target persistence", () => {
 			createdAt: newCreatedAt,
 		});
 
-		// This must succeed — it should target the newest (initializing) row, not
-		// the old (success) row. Before the fix, findFirst without orderBy would
-		// hit the old row and throw "already frozen ... after permission handling".
+		// With no exact binding, neither the old nor new row may be selected.
 		const target = {
 			deviceId: "local",
 			backendKind: "local" as const,
@@ -1693,11 +1692,389 @@ describe("tool execution target persistence", () => {
 		};
 		await expect(
 			narratorService.updateToolCallExecutionTarget(narratorId, duplicateId, target),
-		).resolves.toBeUndefined();
+		).rejects.toThrow("exact tool-call row id");
 	});
 });
 
+describe("legacy replay EOL parity with the real file tools", () => {
+	const cases: Array<{
+		name: string;
+		toolName: "Write" | "Edit";
+		before: string | null;
+		input: Record<string, unknown>;
+		expected: string;
+	}> = [
+		{
+			name: "Write preserves a CRLF baseline with LF input",
+			toolName: "Write",
+			before: "before\r\nsecond\r\n",
+			input: { content: "after\nsecond\n" },
+			expected: "after\r\nsecond\r\n",
+		},
+		{
+			name: "Write preserves LF even when the input uses CRLF",
+			toolName: "Write",
+			before: "before\nsecond\n",
+			input: { content: "after\r\nsecond\r\n" },
+			expected: "after\nsecond\n",
+		},
+		{
+			name: "Write uses the baseline majority rather than any CRLF",
+			toolName: "Write",
+			before: "before\r\nsecond\nthird\n",
+			input: { content: "after\r\nsecond\r\nthird\r\n" },
+			expected: "after\nsecond\nthird\n",
+		},
+		{
+			name: "Write resolves a mixed baseline tie to CRLF",
+			toolName: "Write",
+			before: "before\r\nsecond\n",
+			input: { content: "after\nsecond\n" },
+			expected: "after\r\nsecond\r\n",
+		},
+		{
+			name: "Write distinguishes an empty existing file from a missing file",
+			toolName: "Write",
+			before: "",
+			input: { content: "after\r\n" },
+			expected: "after\n",
+		},
+		{
+			name: "Write normalizes a new file using the input majority",
+			toolName: "Write",
+			before: null,
+			input: { content: "after\r\nsecond\n" },
+			expected: "after\r\nsecond\r\n",
+		},
+		{
+			name: "Edit matches LF input and restores the CRLF baseline",
+			toolName: "Edit",
+			before: "before\r\nsecond\r\n",
+			input: { old_string: "before\nsecond", new_string: "after\nsecond" },
+			expected: "after\r\nsecond\r\n",
+		},
+		{
+			name: "Edit normalizes CRLF input on an LF baseline",
+			toolName: "Edit",
+			before: "before\nsecond\n",
+			input: { old_string: "before\r\nsecond", new_string: "after\r\nsecond" },
+			expected: "after\nsecond\n",
+		},
+		{
+			name: "Edit restores the LF majority across the entire output",
+			toolName: "Edit",
+			before: "before\r\nsecond\nthird\n",
+			input: { old_string: "before", new_string: "after" },
+			expected: "after\nsecond\nthird\n",
+		},
+		{
+			name: "Edit resolves a mixed baseline tie to CRLF",
+			toolName: "Edit",
+			before: "before\r\nsecond\n",
+			input: { old_string: "before", new_string: "after" },
+			expected: "after\r\nsecond\r\n",
+		},
+		{
+			name: "Edit replace_all keeps CRLF and lone carriage returns",
+			toolName: "Edit",
+			before: "before\rmarker\r\nbefore\r\n",
+			input: { old_string: "before", new_string: "after\nextra", replace_all: true },
+			expected: "after\r\nextra\rmarker\r\nafter\r\nextra\r\n",
+		},
+		{
+			name: "Edit overwrite preserves an existing CRLF baseline",
+			toolName: "Edit",
+			before: "before\r\n",
+			input: { old_string: "", new_string: "after\n" },
+			expected: "after\r\n",
+		},
+		{
+			name: "Edit overwrite detects the ending of a genuinely new file",
+			toolName: "Edit",
+			before: null,
+			input: { old_string: "", new_string: "after\r\nsecond\n" },
+			expected: "after\r\nsecond\r\n",
+		},
+		{
+			name: "Edit overwrite uses LF for an existing empty file",
+			toolName: "Edit",
+			before: "",
+			input: { old_string: "", new_string: "after\r\n" },
+			expected: "after\n",
+		},
+	];
+
+	for (const scenario of cases) {
+		test(scenario.name, async () => {
+			const cwd = mkdtempSync(join(tmpdir(), "nf-replay-eol-"));
+			tempDirs.push(cwd);
+			const narratorId = await createNarrator(cwd);
+			const filePath = join(cwd, "eol.txt");
+			if (scenario.before !== null) writeFileSync(filePath, scenario.before);
+			const toolUseId = await addInitializingToolCall(narratorId);
+			const input = { file_path: filePath, ...scenario.input };
+			const result = await executeTool(
+				{ toolUseId, name: scenario.toolName, input },
+				{
+					narratorId,
+					conversationId: "replay-eol-parity-test",
+					model: "codex:gpt-5.5",
+					provider: "codex",
+					cwd,
+					signal: new AbortController().signal,
+					permissionHandler: async () => ({ behavior: "allow" }),
+				},
+			);
+			expect(result.isError).toBeFalsy();
+			const actual = readFileSync(filePath, "utf8");
+			expect(actual).toBe(scenario.expected);
+			expect(
+				applyToolCall(scenario.before, {
+					toolUseId,
+					toolName: scenario.toolName,
+					inputJson: input,
+					status: "success",
+					messageId: "eol-message",
+					seq: 1,
+					createdAt: new Date().toISOString(),
+				}),
+			).toBe(actual);
+		});
+	}
+});
+
 describe("device-aware file state rebuild", () => {
+	test("POSIX absolute paths preserve literal backslashes without recorded flavor", () => {
+		const identity = normalizeDeviceFileIdentity({
+			deviceId: "remote-posix",
+			filePath: "/workspace/a\\b.txt",
+		});
+		expect(identity).toMatchObject({
+			deviceId: "remote-posix",
+			pathFlavor: "posix",
+			identityKey: "/workspace/a\\b.txt",
+		});
+		expect(deviceFileKey(identity)).not.toBe(
+			deviceFileKey({ deviceId: "remote-posix", filePath: "/workspace/a/b.txt" }),
+		);
+	});
+
+	test("ambiguous legacy grammar is refused unless its recorded cwd or flavor identifies it", () => {
+		for (const filePath of ["a\\b.txt", "//server/share/file.txt", "C:relative.txt"]) {
+			expect(() => normalizeDeviceFileIdentity({ deviceId: "local", filePath })).toThrow(
+				"Ambiguous legacy path",
+			);
+		}
+		const toolCall = {
+			toolUseId: "ambiguous-path",
+			toolName: "Write",
+			inputJson: { file_path: "a\\b.txt", content: "x" },
+		};
+		expect(() => getToolCallFileIdentityStrict(toolCall, null)).toThrow("Ambiguous legacy path");
+		expect(
+			getToolCallFileIdentityStrict({ ...toolCall, executionCwd: "/recorded/work" }, null),
+		).toMatchObject({
+			deviceId: "local",
+			filePath: "/recorded/work/a\\b.txt",
+			pathFlavor: "posix",
+		});
+		expect(
+			getToolCallFileIdentityStrict(
+				{ ...toolCall, executionCwd: "C:\\Recorded", executionPathFlavor: "windows" },
+				"/current/host",
+			),
+		).toMatchObject({
+			deviceId: "local",
+			filePath: "C:\\Recorded\\a\\b.txt",
+			pathFlavor: "windows",
+		});
+	});
+
+	test("recorded canonical aliases disambiguate flavor before lexical inference", () => {
+		const call: OrderedToolCall = {
+			toolUseId: "recorded-posix",
+			toolName: "Write",
+			inputJson: { file_path: "a\\b.txt", content: "x" },
+			status: "success",
+			messageId: "alias-message",
+			seq: 1,
+			createdAt: new Date().toISOString(),
+			executionTargetsJson: {
+				primaryKey: "primary",
+				endpoints: [
+					{
+						key: "primary",
+						target: {
+							deviceId: "remote-posix",
+							pathFlavor: "posix",
+							lexicalPath: "a\\b.txt",
+							canonicalPath: "/remote/real/a\\b.txt",
+						},
+					},
+				],
+			},
+		};
+		const lexicalOnly: OrderedToolCall = {
+			...call,
+			toolUseId: "legacy-lexical-only",
+			executionTargetsJson: null,
+			executionDeviceId: "remote-posix",
+			executionPathFlavor: "posix",
+			resolvedFilePath: "a\\b.txt",
+		};
+		for (const calls of [
+			[lexicalOnly, call],
+			[call, lexicalOnly],
+		]) {
+			const aliases = buildCanonicalIdentityAliases(calls, null);
+			expect(
+				canonicalizeDeviceFileIdentityWith(
+					{ deviceId: "remote-posix", filePath: "a\\b.txt" },
+					aliases,
+				).filePath,
+			).toBe("/remote/real/a\\b.txt");
+		}
+		const aliases = buildCanonicalIdentityAliases([call], null);
+		expect(
+			canonicalizeDeviceFileIdentityWith(
+				{ deviceId: "remote-posix", filePath: "a\\b.txt" },
+				aliases,
+			),
+		).toMatchObject({
+			deviceId: "remote-posix",
+			filePath: "/remote/real/a\\b.txt",
+			pathFlavor: "posix",
+		});
+		expect(() =>
+			canonicalizeDeviceFileIdentityWith({ deviceId: "local", filePath: "a\\b.txt" }, aliases),
+		).toThrow("Ambiguous legacy path");
+	});
+
+	test("conflicting canonical aliases or path flavors cannot select a restore target", () => {
+		const filePath = "/shared/a\\b.txt";
+		const call: OrderedToolCall = {
+			toolUseId: "posix-call",
+			toolName: "Write",
+			inputJson: { file_path: filePath, content: "x" },
+			status: "success",
+			messageId: "alias-message",
+			seq: 1,
+			createdAt: new Date().toISOString(),
+			executionDeviceId: "remote-a",
+			executionPathFlavor: "posix",
+			resolvedFilePath: filePath,
+			canonicalFilePath: "/posix/real/a\\b.txt",
+		};
+		const aliases = buildCanonicalIdentityAliases(
+			[
+				call,
+				{
+					...call,
+					toolUseId: "windows-call",
+					executionPathFlavor: "windows",
+					canonicalFilePath: "C:\\Real\\a\\b.txt",
+				},
+			],
+			null,
+		);
+		expect(() =>
+			canonicalizeDeviceFileIdentityWith({ deviceId: "remote-a", filePath }, aliases),
+		).toThrow("recorded path flavors disagree");
+		expect(
+			canonicalizeDeviceFileIdentityWith(
+				{ deviceId: "remote-a", filePath, pathFlavor: "posix" },
+				aliases,
+			).filePath,
+		).toBe("/posix/real/a\\b.txt");
+		expect(() =>
+			buildCanonicalIdentityAliases(
+				[call, { ...call, toolUseId: "retargeted", canonicalFilePath: "/other/target.txt" }],
+				null,
+			),
+		).toThrow("recorded canonical aliases disagree");
+	});
+
+	test("default all excludes failed-only baselines but explicit first-Write exclusion retains them", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-failed-only-baseline-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const filePath = join(cwd, "failed.txt");
+		const original = "original before failed Edit\r\n";
+		writeFileSync(filePath, original);
+		const failedId = await addInitializingToolCall(narratorId);
+		const input = { file_path: filePath, old_string: "not present", new_string: "replacement" };
+		const failure = await executeTool(
+			{ toolUseId: failedId, name: "Edit", input },
+			{
+				narratorId,
+				conversationId: "failed-edit-baseline-test",
+				model: "codex:gpt-5.5",
+				provider: "codex",
+				cwd,
+				signal: new AbortController().signal,
+				permissionHandler: async () => ({ behavior: "allow" }),
+			},
+		);
+		expect(failure.isError).toBe(true);
+		await db
+			.update(narratorToolCalls)
+			.set({ toolName: "Edit", inputJson: input, status: "fail" })
+			.where(eq(narratorToolCalls.toolUseId, failedId));
+		const baseline = await db.query.narratorFileSnapshots.findFirst({
+			where: eq(narratorFileSnapshots.narratorId, narratorId),
+		});
+		expect(baseline?.originalContent).toBe(original);
+		writeFileSync(filePath, "external edit after the failed call");
+		expect(await rebuildDeviceFileStatesUpToSeq(narratorId, 10)).toHaveLength(0);
+
+		const otherPath = join(cwd, "successful.txt");
+		await addToolCall(
+			narratorId,
+			2,
+			{ file_path: otherPath, content: "successful" },
+			{ deviceId: "local", filePath: otherPath },
+		);
+		const all = await rebuildDeviceFileStatesUpToSeq(narratorId, 10);
+		expect([...all.values()].map((state) => state.filePath)).toEqual([otherPath]);
+		expect(readFileSync(filePath, "utf8")).toBe("external edit after the failed call");
+
+		const firstWrite = await addToolCall(
+			narratorId,
+			3,
+			{ file_path: filePath, content: "first successful Write\n" },
+			{ deviceId: "local", filePath },
+		);
+		const identity = { deviceId: "local", filePath };
+		const requested = await rebuildDeviceFileStatesExcluding(
+			narratorId,
+			[identity],
+			new Set([firstWrite]),
+		);
+		expect(requested.get(deviceFileKey(identity))?.content).toBe(original);
+	});
+
+	test("a recorded Windows local snapshot is not resolved against the current POSIX host", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-local-windows-baseline-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const lexicalPath = "C:\\Work\\Link\\a.txt";
+		const filePath = "C:\\Work\\Real\\a.txt";
+		await ensureFileSnapshot(narratorId, "local", lexicalPath, async () => "baseline");
+		const toolUseId = await addToolCall(
+			narratorId,
+			1,
+			{ file_path: lexicalPath, content: "current" },
+			{ deviceId: "local", filePath, pathFlavor: "windows", lexicalPath, canonicalPath: filePath },
+		);
+		const identity = { deviceId: "local", filePath, pathFlavor: "windows" as const };
+		const states = await rebuildDeviceFileStatesExcluding(
+			narratorId,
+			[identity],
+			new Set([toolUseId]),
+		);
+		expect(states.get(deviceFileKey(identity))?.content).toBe("baseline");
+	});
+
 	test("does not infer a known device without resolved path as local", () => {
 		expect(
 			getToolCallFileIdentity({
@@ -2085,6 +2462,86 @@ describe("device-aware file state rebuild", () => {
 });
 
 describe("device-aware snapshot revert", () => {
+	for (const pathFlavor of ["posix", undefined] as const) {
+		test.skipIf(process.platform === "win32")(
+			`internal first-Write revert preserves a POSIX literal backslash baseline (flavor=${pathFlavor})`,
+			async () => {
+				const cwd = mkdtempSync(join(tmpdir(), "nf-posix-backslash-revert-"));
+				tempDirs.push(cwd);
+				const narratorId = await createNarrator(cwd);
+				const filePath = join(cwd, "a\\b.txt");
+				const original = "original POSIX filename content\r\n";
+				writeFileSync(filePath, original);
+				mkdirSync(join(cwd, "a"));
+				const differentPath = join(cwd, "a", "b.txt");
+				writeFileSync(differentPath, "different file must remain untouched");
+				// Model an old text-only row, with no pathFlavor/encoding/raw bytes.
+				await db.insert(narratorFileSnapshots).values({
+					id: generateId(),
+					narratorId,
+					deviceId: "local",
+					filePath,
+					originalContent: readFileSync(filePath, "utf8"),
+					createdAt: new Date().toISOString(),
+				});
+				const toolUseId = await addToolCall(
+					narratorId,
+					1,
+					{ file_path: filePath, content: "first Write\n" },
+					{ deviceId: "local", filePath, pathFlavor },
+				);
+				writeFileSync(filePath, "first Write\r\n");
+
+				// This calls the internal compatibility helper, not a user-route replay
+				// fallback. Text-only history remains legacy_unverified under M0.
+				const result = await revertPatchForToolUse(narratorId, toolUseId);
+				try {
+					expect(result).toMatchObject({ reverted: true, fileCount: 1, failures: [] });
+					expect(existsSync(filePath)).toBe(true);
+					expect(readFileSync(filePath, "utf8")).toBe(original);
+					expect(readFileSync(differentPath, "utf8")).toBe("different file must remain untouched");
+				} finally {
+					finalizeSnapshotRevert(result);
+				}
+			},
+		);
+	}
+
+	test.skipIf(process.platform === "win32")(
+		"internal revert refuses conflicting legacy snapshot path flavors before writing",
+		async () => {
+			const cwd = mkdtempSync(join(tmpdir(), "nf-ambiguous-baseline-revert-"));
+			tempDirs.push(cwd);
+			const narratorId = await createNarrator(cwd);
+			const filePath = join(cwd, "a\\b.txt");
+			writeFileSync(filePath, "current must survive");
+			await ensureFileSnapshot(narratorId, "local", filePath, async () => "old baseline");
+			const toolUseId = await addToolCall(
+				narratorId,
+				1,
+				{ file_path: filePath, content: "current must survive" },
+				{ deviceId: "local", filePath, pathFlavor: "posix" },
+			);
+			await addToolCall(
+				narratorId,
+				2,
+				{ file_path: filePath, content: "unrelated Windows history" },
+				{
+					deviceId: "local",
+					filePath: "C:\\Other\\a\\b.txt",
+					pathFlavor: "windows",
+					lexicalPath: filePath,
+					canonicalPath: "C:\\Other\\a\\b.txt",
+				},
+			);
+			const result = await revertPatchForToolUse(narratorId, toolUseId);
+			expect(result.reverted).toBe(false);
+			expect(result.failures[0]?.code).toBe("MISSING_EXECUTION_PATH");
+			expect(result.failures[0]?.message).toContain("recorded path flavors disagree");
+			expect(readFileSync(filePath, "utf8")).toBe("current must survive");
+		},
+	);
+
 	test("skipRevert checkpoints preserve deleted file history for a later rollback", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "nf-skip-revert-checkpoint-"));
 		tempDirs.push(cwd);
@@ -2599,7 +3056,7 @@ describe("device-aware snapshot revert", () => {
 		expect(visibleRemaining[0]?.messageId).toBe(boundaryId);
 	});
 
-	test("default (no skipRevert) still reverts the file when deleting messages", async () => {
+	test("default deletion refuses unverified replay and preserves later writes and history", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "nf-skiprevert-default-"));
 		tempDirs.push(cwd);
 		const narratorId = await createNarrator(cwd);
@@ -2634,9 +3091,23 @@ describe("device-aware snapshot revert", () => {
 			{ deviceId: "local", filePath: localPath },
 		);
 
-		await narratorService.deleteMessagesAfter(narratorId, boundaryId);
+		// The original replay fallback would overwrite a later external save even
+		// though this narrator has no operation-level evidence for that save.
+		writeFileSync(localPath, "current plus a later external edit");
+		await expect(narratorService.deleteMessagesAfter(narratorId, boundaryId)).rejects.toThrow(
+			"REVERT_UNAVAILABLE",
+		);
 
-		expect(readFileSync(localPath, "utf8")).toBe("original");
+		expect(readFileSync(localPath, "utf8")).toBe("current plus a later external edit");
+		const refs = await db.query.narratorMessageRefs.findMany({
+			where: eq(narratorMessageRefs.narratorId, narratorId),
+		});
+		expect(refs).toHaveLength(2);
+		const retainedCalls = await db.query.narratorToolCalls.findMany({
+			where: eq(narratorToolCalls.narratorId, narratorId),
+			columns: { toolUseId: true },
+		});
+		expect(retainedCalls).toHaveLength(1);
 	});
 
 	test("compensates earlier files when a later remote write fails", async () => {
@@ -2816,8 +3287,11 @@ describe("replay divergence is never silently absorbed", () => {
  * charset of a legacy-encoded file.
  */
 describe("snapshot encoding round trip", () => {
-	test("reverting a GBK file restores the original bytes, not UTF-8", async () => {
-		settings.agent.legacyEncoding = true;
+	test.each([
+		true,
+		false,
+	])("internal revert honors the recorded GBK charset (legacyEncoding=%s)", async (legacyEncoding) => {
+		settings.agent.legacyEncoding = legacyEncoding;
 		try {
 			const cwd = mkdtempSync(join(tmpdir(), "nf-encoding-revert-"));
 			tempDirs.push(cwd);
@@ -2841,9 +3315,11 @@ describe("snapshot encoding round trip", () => {
 			writeFileSync(filePath, "overwritten");
 
 			const result = await revertPatchForToolUses(narratorId, [toolUseId]);
+			finalizeSnapshotRevert(result);
 			expect(result.failures).toEqual([]);
 
-			// Byte-for-byte equality: decoding as UTF-8 would not match.
+			// This well-formed GBK fixture round-trips; legacy text without raw bytes
+			// still cannot prove exact recovery for arbitrary historical content.
 			const restored = readFileSync(filePath);
 			expect(Buffer.compare(restored, originalBytes)).toBe(0);
 			expect(iconv.decode(restored, "gbk")).toBe(original);

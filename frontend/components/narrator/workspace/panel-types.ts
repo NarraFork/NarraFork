@@ -7,6 +7,7 @@
 
 import type { PluginDockPanelParams } from "../../plugins/protocol";
 import type { NarratorToolPanelType } from "../dock/dock-panel-types";
+import type { FilePanelParams } from "../panels/panel-kind";
 import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
 
 /** Panel type discriminator stored on each Dockview panel's params. */
@@ -91,11 +92,8 @@ export interface SubagentPanelParams {
  * `subagent`, the host is explicit so orphan pruning can close it when the
  * owning narrator cell goes away.
  */
-export interface WorkspaceFilePanelParams {
-	panelType: "file";
+export interface WorkspaceFilePanelParams extends FilePanelParams {
 	hostNarratorId: string;
-	filePath: string;
-	fileName?: string;
 }
 
 /**

@@ -156,6 +156,36 @@ export function hitTestGroups(
 	return null;
 }
 
+/** Shared by native drop previews and releases; Dockview's center is NOT our swap zone. */
+export function resolveNativeDrop(
+	api: DockviewApi,
+	event: {
+		kind: string;
+		group: DockviewGroupPanel | undefined;
+		nativeEvent: { clientX: number; clientY: number };
+		getData(): { viewId: string; panelId: string | null; tabGroupId?: string } | undefined;
+	},
+	thresholds?: DropZoneThresholds,
+	enableSwapZone = true,
+): { panelId: string; hit: GroupHit } | null {
+	const data = event.getData();
+	// Leave tab sorting, whole-group moves and foreign/external payloads to Dockview.
+	if (event.kind !== "content" || !data?.panelId || data.tabGroupId || data.viewId !== api.id) {
+		return null;
+	}
+	if (!api.getPanel(data.panelId)) return null;
+	const hit = hitTestGroups(
+		api,
+		event.nativeEvent.clientX,
+		event.nativeEvent.clientY,
+		data.panelId,
+		thresholds,
+	);
+	if (!hit || hit.group.id !== event.group?.id) return null;
+	if (!enableSwapZone && hit.intent === "swap") hit.intent = "merge";
+	return { panelId: data.panelId, hit };
+}
+
 /** Compute the highlight rectangle for a group hit, relative to the root. */
 export function toIndicator(
 	hit: GroupHit,

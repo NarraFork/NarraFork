@@ -97,7 +97,9 @@ import type {
 	LegacyDirectoryBlacklistEntry,
 	LegacyDirectoryWhitelistEntry,
 } from "./execution-policy/types";
+import { notifyHumanAttentionChanged } from "./human-attention-events";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
+import { narratorPersistence } from "./narrator-persistence";
 import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
@@ -121,6 +123,16 @@ import { broadcastReflectionFrame } from "./reflection-broadcast";
 import { SPEC_TASKS_PATH } from "./spec-task-service";
 import { specVfsService } from "./spec-vfs-service";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
+
+// Preserve the original execution receipt and ACL ceiling while the SAME prompt is reprocessed.
+const pendingPermissionContexts = new WeakMap<
+	PendingPermission,
+	{
+		options?: PermissionHandlerOptions;
+		runtimeConstraint?: RuntimePermissionConstraint;
+		reviewReadOnlyBash: boolean;
+	}
+>();
 
 // === Permission handling ===
 
@@ -1504,14 +1516,15 @@ export async function reflectPendingAskUserQuestion(
 
 	const abort = new AbortController();
 	pending.questionReflectionAbort = abort;
+	notifyHumanAttentionChanged();
 
-	await markQuestionReflectionStatus(
-		requestId,
-		pending,
-		"running",
-		"Question reflection is answering AskUserQuestion",
-	);
 	try {
+		await markQuestionReflectionStatus(
+			requestId,
+			pending,
+			"running",
+			"Question reflection is answering AskUserQuestion",
+		);
 		const narrator = await narratorService.getById(pending.narratorId).catch(() => null);
 		const answers = await generateAskUserQuestionAnswers(pending.narratorId, questions, {
 			locale: pending.locale,
@@ -1560,6 +1573,7 @@ export async function reflectPendingAskUserQuestion(
 	} finally {
 		if (pending.questionReflectionAbort === abort) {
 			pending.questionReflectionAbort = undefined;
+			notifyHumanAttentionChanged();
 		}
 	}
 }
@@ -1595,6 +1609,7 @@ export function disarmQuestionReflection(requestId: string): boolean {
 	const hadDeadline = pending.questionReflectionDeadline !== undefined;
 	pending.questionReflectionDeadline = undefined;
 	if (hadTimer || hadDeadline) {
+		notifyHumanAttentionChanged();
 		broadcastReflectionFrame(pending, {
 			type: "question_reflection_disarmed",
 			requestId,
@@ -1625,7 +1640,11 @@ export async function takeOverQuestionReflection(
 	}
 	pending.questionReflectionDeadline = undefined;
 	pending.questionReflectionAbort?.abort(new Error(message));
-	await markQuestionReflectionStatus(requestId, pending, "awaiting_user", message);
+	try {
+		await markQuestionReflectionStatus(requestId, pending, "awaiting_user", message);
+	} finally {
+		notifyHumanAttentionChanged();
+	}
 	return true;
 }
 
@@ -3109,6 +3128,7 @@ async function validateOrRepairAskUserQuestionInput(
 	narratorId: string,
 	toolUseId: string,
 	input: Record<string, unknown>,
+	permissionToolCallId: string,
 ): Promise<{ deny: PermissionResult } | { repairedInput: Record<string, unknown> }> {
 	const tool = toolRegistry.get("AskUserQuestion");
 
@@ -3128,12 +3148,7 @@ async function validateOrRepairAskUserQuestionInput(
 				permissionDecidedAt: new Date().toISOString(),
 				permissionDecisionReason: "invalid_ask_user_question_input",
 			})
-			.where(
-				and(
-					eq(narratorToolCalls.narratorId, narratorId),
-					eq(narratorToolCalls.toolUseId, toolUseId),
-				),
-			);
+			.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
 		return { deny: { behavior: "deny", message, rawMessage: true } };
 	};
 
@@ -3430,6 +3445,7 @@ export async function classifyDeviceAccessGroup(
 }
 
 async function blockCatastrophicCommand(input: {
+	toolCallId: string;
 	narratorId: string;
 	toolName: string;
 	toolUseId: string;
@@ -3454,12 +3470,7 @@ async function blockCatastrophicCommand(input: {
 			permissionDecidedAt: new Date().toISOString(),
 			permissionDecisionReason: reason,
 		})
-		.where(
-			and(
-				eq(narratorToolCalls.narratorId, input.narratorId),
-				eq(narratorToolCalls.toolUseId, input.toolUseId),
-			),
-		);
+		.where(and(eq(narratorToolCalls.id, input.toolCallId)));
 	return { behavior: "deny", message: fatalMsg, fatal: true };
 }
 
@@ -3477,6 +3488,28 @@ export async function handlePermission(
 	runtimeConstraint?: RuntimePermissionConstraint,
 	reviewReadOnlyBash = false,
 ): Promise<PermissionResult> {
+	const binding = options?.toolCallBinding;
+	if (binding) {
+		try {
+			await narratorPersistence.validateToolCallBinding(narratorId, toolUseId, binding);
+		} catch {
+			return { behavior: "deny", message: "Invalid persisted tool execution binding" };
+		}
+	}
+	// Legacy callers may omit the binding only when the provider id is unambiguous.
+	const candidates = await db.query.narratorToolCalls.findMany({
+		where: and(
+			binding ? eq(narratorToolCalls.id, binding.toolCallId) : undefined,
+			eq(narratorToolCalls.narratorId, narratorId),
+			eq(narratorToolCalls.toolUseId, toolUseId),
+		),
+		columns: { id: true, executionAttempt: true },
+		limit: 2,
+	});
+	if (candidates.length > 1 || (binding && candidates.length !== 1)) {
+		return { behavior: "deny", message: "Ambiguous or missing persisted tool execution record" };
+	}
+	const permissionToolCallId = candidates[0]?.id ?? "";
 	// Every routed permission starts from a complete frozen context. Missing backend/target,
 	// canonicalization failure, or backend identity drift is denied before policy loading.
 	let executionContext: ExecutionTargetContext | null = null;
@@ -3690,6 +3723,7 @@ export async function handlePermission(
 			narratorId,
 			toolUseId,
 			effectiveInput,
+			permissionToolCallId,
 		);
 		if ("deny" in askResult) return askResult.deny;
 		effectiveInput = askResult.repairedInput;
@@ -3780,12 +3814,7 @@ export async function handlePermission(
 				permissionDecidedBy: "auto",
 				permissionDecidedAt: new Date().toISOString(),
 			})
-			.where(
-				and(
-					eq(narratorToolCalls.narratorId, narratorId),
-					eq(narratorToolCalls.toolUseId, toolUseId),
-				),
-			);
+			.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
 		return { behavior: "allow", updatedInput: effectiveInput };
 	}
 
@@ -3899,10 +3928,7 @@ export async function handlePermission(
 			return null;
 		}
 		const toolCallRecord = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-			),
+			where: and(eq(narratorToolCalls.id, permissionToolCallId)),
 		});
 		if (!toolCallRecord) {
 			logger.error("Tool call record not found for danger reflection", {
@@ -3948,9 +3974,9 @@ export async function handlePermission(
 		await narratorService.updateStatus(narratorId, "waiting", {
 			substatus: ["reflecting"],
 		});
-		await mirrorPermissionStatusToTarget(narratorId, wsTarget, "waiting", {
-			substatus: ["reflecting"],
-		});
+		// Automatic reflection belongs to the tool owner, not the parent whose
+		// page renders the child card. The lifecycle frame below updates that card
+		// without turning the parent's ongoing work into a false user wait.
 		if (signal.aborted) {
 			await markDangerReflectionAborted(
 				requestId,
@@ -3980,11 +4006,14 @@ export async function handlePermission(
 						requestId,
 					});
 				});
+				// The decision is already cancelled; don't leave a user-actionable live entry
+				// while the best-effort persistence/status updates above are still awaiting.
+				cleanup();
 				resolve({ behavior: "deny", message: "Narrator aborted" });
 			};
 			cleanup = () => {
 				signal.removeEventListener("abort", onAbort);
-				pendingDangerReflections.delete(requestId);
+				if (pendingDangerReflections.delete(requestId)) notifyHumanAttentionChanged();
 			};
 			signal.addEventListener("abort", onAbort, { once: true });
 			pendingDangerReflections.set(requestId, {
@@ -4003,6 +4032,7 @@ export async function handlePermission(
 				resolve,
 				cleanup,
 			});
+			notifyHumanAttentionChanged();
 		});
 		broadcastReflectionFrame(
 			{ narratorId, broadcastTargetId: wsTarget, parentToolUseId },
@@ -4074,6 +4104,7 @@ export async function handlePermission(
 
 	if (decision === "fatal") {
 		return blockCatastrophicCommand({
+			toolCallId: permissionToolCallId,
 			narratorId,
 			toolName,
 			toolUseId,
@@ -4090,12 +4121,7 @@ export async function handlePermission(
 				permissionDecidedBy: "auto",
 				permissionDecidedAt: new Date().toISOString(),
 			})
-			.where(
-				and(
-					eq(narratorToolCalls.narratorId, narratorId),
-					eq(narratorToolCalls.toolUseId, toolUseId),
-				),
-			);
+			.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
 		return {
 			behavior: "allow",
 			updatedInput: effectiveInput,
@@ -4172,12 +4198,7 @@ export async function handlePermission(
 					permissionDecidedAt: new Date().toISOString(),
 					permissionDecisionReason: permMeta.blacklistReason,
 				})
-				.where(
-					and(
-						eq(narratorToolCalls.narratorId, narratorId),
-						eq(narratorToolCalls.toolUseId, toolUseId),
-					),
-				);
+				.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
 			return { behavior: "deny", message: denyMsg };
 		}
 		if (permMeta.commandBlacklistReason) {
@@ -4200,12 +4221,7 @@ export async function handlePermission(
 					permissionDecidedAt: new Date().toISOString(),
 					permissionDecisionReason: permMeta.commandBlacklistReason,
 				})
-				.where(
-					and(
-						eq(narratorToolCalls.narratorId, narratorId),
-						eq(narratorToolCalls.toolUseId, toolUseId),
-					),
-				);
+				.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
 			return { behavior: "deny", message: denyMsg };
 		}
 		const chapterGitIssues = isChapter ? getChapterGitPermissionIssues(bashAnalysis) : [];
@@ -4245,12 +4261,7 @@ export async function handlePermission(
 				permissionDecidedAt: new Date().toISOString(),
 				...(decisionReason ? { permissionDecisionReason: decisionReason } : {}),
 			})
-			.where(
-				and(
-					eq(narratorToolCalls.narratorId, narratorId),
-					eq(narratorToolCalls.toolUseId, toolUseId),
-				),
-			);
+			.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
 		return {
 			behavior: "deny",
 			message: denyMsg,
@@ -4258,10 +4269,7 @@ export async function handlePermission(
 	}
 
 	const toolCallRecord = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
+		where: and(eq(narratorToolCalls.id, permissionToolCallId)),
 	});
 
 	if (!toolCallRecord) {
@@ -4406,7 +4414,7 @@ export async function handlePermission(
 				pendingEntry.questionReflectionTimer = undefined;
 			}
 			signal.removeEventListener("abort", onAbort);
-			pendingPermissions.delete(toolCallId);
+			if (pendingPermissions.delete(toolCallId)) notifyHumanAttentionChanged();
 		};
 
 		const onAbort = async () => {
@@ -4458,14 +4466,6 @@ export async function handlePermission(
 				toolName === "ExitPlanMode" && exitPlanResolvedFromFile ? true : undefined,
 			attentionEmitted,
 		};
-		pendingPermissions.set(toolCallId, pendingEntry);
-		// The row is already `pending` and the request is now registered, so this wait is durable:
-		// a checkpoint will persist it as a `pending_permission` continuation and the replacement
-		// process re-offers it with its stored input. Tell the executor it may drop its update
-		// start grant, so an unanswered request does not block a planned restart. Deliberately
-		// after `pendingPermissions.set` — releasing before the request is discoverable would let
-		// a restart checkpoint see neither an in-flight tool nor a recoverable request.
-		options?.onAwaitingUserDecision?.();
 		if (toolName === "AskUserQuestion" && questionReflectionDeadline !== undefined) {
 			pendingEntry.questionReflectionDeadline = questionReflectionDeadline;
 			pendingEntry.questionReflectionTimer = scheduleQuestionReflection(
@@ -4474,6 +4474,17 @@ export async function handlePermission(
 				questionReflectionDeadline,
 			);
 		}
+		pendingPermissionContexts.set(pendingEntry, { options, runtimeConstraint, reviewReadOnlyBash });
+		pendingPermissions.set(toolCallId, pendingEntry);
+		// Unlike permission_request (above), this fires after the registry and countdown exist.
+		notifyHumanAttentionChanged();
+		// The row is already `pending` and the request is now registered, so this wait is durable:
+		// a checkpoint will persist it as a `pending_permission` continuation and the replacement
+		// process re-offers it with its stored input. Tell the executor it may drop its update
+		// start grant, so an unanswered request does not block a planned restart. Deliberately
+		// after `pendingPermissions.set` — releasing before the request is discoverable would let
+		// a restart checkpoint see neither an in-flight tool nor a recoverable request.
+		options?.onAwaitingUserDecision?.();
 	});
 }
 
@@ -4759,6 +4770,7 @@ export async function resolvePermission(
 				permissionDecidedBy: decidedBy,
 				permissionDecidedAt: now,
 				permissionDenyMessage: effectiveDenyMessage ?? null,
+				...(updatedInput ? { inputJson: updatedInput } : {}),
 				...(decision === "deny"
 					? {
 							errorMessage: effectiveDenyMessage || "Permission denied by user",
@@ -4767,10 +4779,12 @@ export async function resolvePermission(
 			})
 			.where(eq(narratorToolCalls.id, requestId));
 	} catch (err) {
-		logger.error("Failed to update permission state in DB, resolving anyway", {
+		logger.error("Failed to persist permission decision; refusing execution", {
 			requestId,
 			error: String(err),
 		});
+		pending.resolve({ behavior: "deny", message: "Permission decision could not be persisted" });
+		return false;
 	}
 
 	if (decision === "allow") {
@@ -4791,21 +4805,6 @@ export async function resolvePermission(
 			});
 		}
 		const effectiveUpdatedInput = updatedInput ?? pending.input;
-
-		if (updatedInput) {
-			try {
-				await db
-					.update(narratorToolCalls)
-					.set({ inputJson: effectiveUpdatedInput })
-					.where(eq(narratorToolCalls.toolUseId, pending.toolUseId));
-			} catch (err) {
-				logger.error("Failed to persist updated tool call input", {
-					requestId,
-					toolName: pending.toolName,
-					error: String(err),
-				});
-			}
-		}
 
 		if (compactAfter) {
 			pendingPlanCompact.add(pending.narratorId);
@@ -5085,7 +5084,11 @@ async function markDangerReflectionAborted(
 			},
 		);
 		await narratorService.updateStatus(narratorId, "working").catch(() => {});
-		await mirrorPermissionStatusToTarget(narratorId, broadcastTargetId, "working").catch(() => {});
+		if (pause?.reflectionStoppedByUser) {
+			await mirrorPermissionStatusToTarget(narratorId, broadcastTargetId, "working").catch(
+				() => {},
+			);
+		}
 	} catch (err) {
 		logger.warn("Failed to mark danger reflection as aborted", {
 			requestId,
@@ -5094,10 +5097,19 @@ async function markDangerReflectionAborted(
 		});
 	} finally {
 		await narratorService.updateStatus(narratorId, "working").catch(() => {});
-		await mirrorPermissionStatusToTarget(narratorId, broadcastTargetId, "working").catch(() => {});
+		if (pause?.reflectionStoppedByUser) {
+			await mirrorPermissionStatusToTarget(narratorId, broadcastTargetId, "working").catch(
+				() => {},
+			);
+		}
 		if (options.cleanup) {
-			pendingDangerReflections.get(requestId)?.cleanup();
-			pendingDangerReflections.delete(requestId);
+			const current = pendingDangerReflections.get(requestId);
+			// onAbort removes discoverability immediately. Still finish the captured
+			// pause's cleanup hooks after persistence, without touching a replacement.
+			if (!current || current === pause) {
+				pause?.cleanup();
+				if (pendingDangerReflections.delete(requestId)) notifyHumanAttentionChanged();
+			}
 		}
 	}
 }
@@ -5283,6 +5295,8 @@ export async function stopDangerReflectionLoop(
 			narratorId: pause.narratorId,
 			error: err instanceof Error ? err.message : String(err),
 		});
+	} finally {
+		notifyHumanAttentionChanged();
 	}
 	return true;
 }
@@ -5336,11 +5350,13 @@ export async function confirmDangerReflection(
 			await enableRelaxedPlanAfterPlanSoftDeny(pause.narratorId, pause.broadcastTargetId);
 		}
 		await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
-		await mirrorPermissionStatusToTarget(
-			pause.narratorId,
-			pause.broadcastTargetId,
-			"working",
-		).catch(() => {});
+		if (pause.reflectionStoppedByUser) {
+			await mirrorPermissionStatusToTarget(
+				pause.narratorId,
+				pause.broadcastTargetId,
+				"working",
+			).catch(() => {});
+		}
 	} catch (err) {
 		logger.warn("Failed to finalize confirmed danger reflection", {
 			requestId,
@@ -5349,11 +5365,13 @@ export async function confirmDangerReflection(
 		});
 	} finally {
 		await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
-		await mirrorPermissionStatusToTarget(
-			pause.narratorId,
-			pause.broadcastTargetId,
-			"working",
-		).catch(() => {});
+		if (pause.reflectionStoppedByUser) {
+			await mirrorPermissionStatusToTarget(
+				pause.narratorId,
+				pause.broadcastTargetId,
+				"working",
+			).catch(() => {});
+		}
 		pause.resolve(result);
 	}
 	return true;
@@ -5405,11 +5423,13 @@ export async function cancelDangerReflection(
 			...(options.failed ? { failed: true } : {}),
 		});
 		await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
-		await mirrorPermissionStatusToTarget(
-			pause.narratorId,
-			pause.broadcastTargetId,
-			"working",
-		).catch(() => {});
+		if (pause.reflectionStoppedByUser) {
+			await mirrorPermissionStatusToTarget(
+				pause.narratorId,
+				pause.broadcastTargetId,
+				"working",
+			).catch(() => {});
+		}
 	} catch (err) {
 		logger.warn("Failed to finalize cancelled danger reflection", {
 			requestId,
@@ -5418,11 +5438,13 @@ export async function cancelDangerReflection(
 		});
 	} finally {
 		await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
-		await mirrorPermissionStatusToTarget(
-			pause.narratorId,
-			pause.broadcastTargetId,
-			"working",
-		).catch(() => {});
+		if (pause.reflectionStoppedByUser) {
+			await mirrorPermissionStatusToTarget(
+				pause.narratorId,
+				pause.broadcastTargetId,
+				"working",
+			).catch(() => {});
+		}
 		pause.resolve(result);
 	}
 	return true;
@@ -5532,7 +5554,11 @@ export function reprocessAllPendingPermissions(narratorId: string): number {
 			...pendingPermissionRoutingIdentity(pending),
 		});
 
-		const reprocessOptions: PermissionHandlerOptions = { suppressAttention: true };
+		const originalContext = pendingPermissionContexts.get(pending);
+		const reprocessOptions: PermissionHandlerOptions = {
+			...originalContext?.options,
+			suppressAttention: true,
+		};
 		if (pending.executionTarget) {
 			// The backend is live but intentionally not stored in pending state; the
 			// target snapshot is passed back so ExitPlanMode resolves on the same device.
@@ -5554,10 +5580,20 @@ export function reprocessAllPendingPermissions(narratorId: string): number {
 			// pending, so suppress a duplicate attention notification.
 			reprocessOptions,
 			pending.parentToolUseId,
+			originalContext?.runtimeConstraint,
+			originalContext?.reviewReadOnlyBash,
 		)
 			.then(async (result) => {
 				if (result.behavior !== "dangerReflection") {
 					await restoreReprocessedPermissionStatus(pending);
+				} else {
+					// A real user prompt became an automatic child gate. Clear only
+					// the old parent wait; the owner must stay waiting + reflecting.
+					await mirrorPermissionStatusToTarget(
+						pending.narratorId,
+						pending.broadcastTargetId,
+						"working",
+					);
 				}
 				pending.resolve(result);
 			})

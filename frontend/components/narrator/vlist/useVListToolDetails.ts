@@ -22,7 +22,12 @@
  * truncated tool calls, and pre-fetching them would defeat the truncation.
  */
 
-import { narratorsApi } from "@frontend/lib/api/narrators";
+import {
+	narratorsApi,
+	type ToolCallDetailRef,
+	toolCallDetailQueryKey,
+} from "@frontend/lib/api/narrators";
+import type { AdapterContext } from "@shared/pretext-layout/segment-adapter";
 import { useQueries } from "@tanstack/react-query";
 import { useCallback, useMemo, useRef } from "react";
 
@@ -37,11 +42,40 @@ export interface VListFullToolPayload {
 	outputJson?: unknown;
 }
 
-export interface UseVListToolDetailsResult {
-	/** `resolveFullToolInput` for the layout pipeline. */
-	resolveFullToolInput: (toolUseId: string | undefined) => unknown;
-	/** `resolveFullToolOutput` for the layout pipeline. */
-	resolveFullToolOutput: (toolUseId: string | undefined) => unknown;
+export interface VListToolDetailRequest extends ToolCallDetailRef {
+	toolUseId: string;
+}
+
+/** Read refs from the adapter's card data, never from measured/display ids. */
+export function toolDetailRequestFromData(
+	toolUseId: string,
+	data: unknown,
+): VListToolDetailRequest {
+	const source = data as { toolUseId?: string; toolDetailRef?: ToolCallDetailRef } | undefined;
+	return { ...source?.toolDetailRef, toolUseId: source?.toolUseId ?? toolUseId };
+}
+
+export function sameToolDetailRequests(
+	left: readonly VListToolDetailRequest[],
+	right: readonly VListToolDetailRequest[],
+): boolean {
+	return (
+		left.length === right.length &&
+		left.every(
+			(ref, index) =>
+				toolDetailIdentityKey(ref.toolUseId, ref) ===
+				toolDetailIdentityKey(right[index].toolUseId, right[index]),
+		)
+	);
+}
+
+export type UseVListToolDetailsResult = Required<
+	Pick<AdapterContext, "resolveFullToolInput" | "resolveFullToolOutput">
+>;
+
+/** Use the same identity for React Query, retention, and adapter lookups. */
+export function toolDetailIdentityKey(toolUseId: string, ref?: ToolCallDetailRef): string {
+	return JSON.stringify(toolCallDetailQueryKey("", toolUseId, ref));
 }
 
 export type ToolDetailQueryResult = {
@@ -49,7 +83,7 @@ export type ToolDetailQueryResult = {
 };
 
 /**
- * Which of `toolUseIds` currently have a settled payload, as a plain string.
+ * Which exact identity keys currently have a settled payload, as a plain string.
  *
  * This is what `combine` returns, and it must contain NO functions and no fresh
  * object identities. React Query stabilizes a combined result with
@@ -68,21 +102,21 @@ export type ToolDetailQueryResult = {
  */
 export function buildToolDetailRevision(
 	retainedIds: readonly string[],
-	toolUseIds: readonly string[],
+	identityKeys: readonly string[],
 	results: readonly ToolDetailQueryResult[],
 ): string {
 	const settled = new Set(retainedIds);
-	toolUseIds.forEach((toolUseId, index) => {
+	identityKeys.forEach((toolUseId, index) => {
 		if (results[index]?.data) settled.add(toolUseId);
 	});
 	// Sorted so the revision tracks the SET of known payloads, not the order the
 	// shell happened to request them in (a scroll reorders the list without
 	// changing what is available, and must not move the revision).
-	return [...settled].sort().join(",");
+	return JSON.stringify([...settled].sort());
 }
 
 /**
- * Merge the settled payloads into `retained`, keyed by tool use id.
+ * Merge settled payloads into `retained`, keyed by exact row/message/attempt identity.
  *
  * Retention is load-bearing, not an optimization. Once a body lands, the adapter
  * clears the card's `hasTruncatedPayload`, so the shell legitimately drops that
@@ -97,11 +131,11 @@ export function buildToolDetailRevision(
  */
 export function mergeToolDetailPayloads(
 	retained: ReadonlyMap<string, VListFullToolPayload>,
-	toolUseIds: readonly string[],
+	identityKeys: readonly string[],
 	results: readonly ToolDetailQueryResult[],
 ): ReadonlyMap<string, VListFullToolPayload> {
 	let merged: Map<string, VListFullToolPayload> | null = null;
-	toolUseIds.forEach((toolUseId, index) => {
+	identityKeys.forEach((toolUseId, index) => {
 		const data = results[index]?.data;
 		if (!data || retained.has(toolUseId)) return;
 		if (!merged) merged = new Map(retained);
@@ -111,49 +145,52 @@ export function mergeToolDetailPayloads(
 }
 
 /**
- * Fetch the full payloads for `toolUseIds` (already filtered by the caller to the
- * visible + expanded + truncated rows) and expose them as adapter resolvers.
+ * Fetch visible + expanded + truncated calls by their exact persisted identity.
+ * A missing ref remains a legacy request; never borrow a body from a richer ref.
  */
 export function useVListToolDetails(
 	narratorId: string,
-	toolUseIds: readonly string[],
+	requests: readonly VListToolDetailRequest[],
 ): UseVListToolDetailsResult {
-	// Bound the in-flight set: extra ids simply wait for a later render once the
-	// user scrolls / collapses something.
-	const wanted = useMemo(() => toolUseIds.slice(0, MAX_CONCURRENT_FETCHES), [toolUseIds]);
-
-	// The payload map travels through a ref so the resolvers below can stay
-	// referentially stable: the ref is the DATA channel, the combined revision is
-	// the CHANGE signal. Writing it from `combine` only ever ADDS settled bodies
-	// (see mergeToolDetailPayloads), so it is idempotent under React's
-	// double-invoke and unaffected by the order combine happens to run in.
-	const payloadsRef = useRef<ReadonlyMap<string, VListFullToolPayload>>(new Map());
-	// Retained payloads belong to one narrator. Switching narrators must drop them
-	// (tool use ids are not shared, and holding them would leak memory across a
-	// long session), which also resets the revision to "".
-	const payloadsNarratorRef = useRef(narratorId);
-	if (payloadsNarratorRef.current !== narratorId) {
-		payloadsNarratorRef.current = narratorId;
-		payloadsRef.current = new Map();
-	}
-
-	// Stable `combine` identity: QueriesObserver re-runs a combine it has not seen
-	// before, so an inline arrow would recompute on every render even when nothing
-	// settled.
-	const combine = useCallback(
-		(results: readonly ToolDetailQueryResult[]) => {
-			const merged = mergeToolDetailPayloads(payloadsRef.current, wanted, results);
-			payloadsRef.current = merged;
-			return buildToolDetailRevision([...merged.keys()], wanted, results);
-		},
+	// Dedupe exact identities before applying the cap, not provider tool-use ids.
+	const wanted = useMemo(() => {
+		const unique = new Map<string, VListToolDetailRequest>();
+		for (const request of requests) {
+			unique.set(toolDetailIdentityKey(request.toolUseId, request), request);
+		}
+		return [...unique.values()].slice(0, MAX_CONCURRENT_FETCHES);
+	}, [requests]);
+	const wantedKeys = useMemo(
+		() => wanted.map((request) => toolDetailIdentityKey(request.toolUseId, request)),
 		[wanted],
 	);
 
+	// The store is the DATA channel; combine's plain revision is the CHANGE signal.
+	// Capture a separate store per narrator instead of resetting a shared ref: a
+	// late combine from the previous narrator must not write into the new store.
+	const storeRef = useRef<{
+		narratorId: string;
+		current: ReadonlyMap<string, VListFullToolPayload>;
+	}>({ narratorId, current: new Map() });
+	if (storeRef.current.narratorId !== narratorId) {
+		storeRef.current = { narratorId, current: new Map() };
+	}
+	const payloads = storeRef.current;
+	const combine = useCallback(
+		(results: readonly ToolDetailQueryResult[]) => {
+			const merged = mergeToolDetailPayloads(payloads.current, wantedKeys, results);
+			payloads.current = merged;
+			return buildToolDetailRevision([...merged.keys()], wantedKeys, results);
+		},
+		[payloads, wantedKeys],
+	);
+
 	const revision = useQueries({
-		queries: wanted.map((toolUseId) => ({
-			queryKey: ["narrators", narratorId, "tool-calls", toolUseId],
-			queryFn: () => narratorsApi.getToolCallDetail(narratorId, toolUseId),
-			enabled: !!narratorId && !!toolUseId,
+		queries: wanted.map((request) => ({
+			queryKey: toolCallDetailQueryKey(narratorId, request.toolUseId, request),
+			queryFn: ({ signal }: { signal: AbortSignal }) =>
+				narratorsApi.getToolCallDetail(narratorId, request.toolUseId, request, signal),
+			enabled: !!narratorId && !!request.toolUseId,
 			staleTime: DETAIL_CACHE_MS,
 			gcTime: DETAIL_CACHE_MS,
 		})),
@@ -161,16 +198,18 @@ export function useVListToolDetails(
 	});
 
 	return useMemo<UseVListToolDetailsResult>(() => {
-		// `revision` is the sole dependency by design: it changes exactly when a new
-		// payload settles, which is what must give these resolvers a new identity so
-		// the document rebuilds and the now-taller card re-measures. The bodies read
-		// the ref, so they always see the newest map.
+		// Retain bodies even after their now-untruncated cards leave the wanted set.
+		// Only a new settled identity (or narrator) changes these resolver functions.
 		void revision;
 		return {
-			resolveFullToolInput: (toolUseId) =>
-				toolUseId ? payloadsRef.current.get(toolUseId)?.inputJson : undefined,
-			resolveFullToolOutput: (toolUseId) =>
-				toolUseId ? payloadsRef.current.get(toolUseId)?.outputJson : undefined,
+			resolveFullToolInput: (toolUseId, ref) =>
+				toolUseId
+					? payloads.current.get(toolDetailIdentityKey(toolUseId, ref))?.inputJson
+					: undefined,
+			resolveFullToolOutput: (toolUseId, ref) =>
+				toolUseId
+					? payloads.current.get(toolDetailIdentityKey(toolUseId, ref))?.outputJson
+					: undefined,
 		};
-	}, [revision]);
+	}, [payloads, revision]);
 }

@@ -33,6 +33,7 @@ import type {
 	AgentConfig,
 	AgentToolUse,
 	AllowPermissionResult,
+	ToolCallBinding,
 	ToolContext,
 	ToolExecutionEndpointRequest,
 	ToolExecutionPlan,
@@ -74,6 +75,7 @@ export interface ToolExecResult {
 }
 
 export interface ToolAdmissionState {
+	toolCallBinding?: ToolCallBinding;
 	preAdmissionComplete?: boolean;
 	startGrant?: UpdateToolStartGrant;
 	deferred?: {
@@ -84,6 +86,7 @@ export interface ToolAdmissionState {
 }
 
 interface ExecuteToolOptions {
+	toolCallBinding?: ToolCallBinding;
 	preGrantedPermission?: AllowPermissionResult;
 	/** When true, a permission request raised for this tool must not trigger a
 	 *  user-facing attention notification (e.g. reflection-takeover fallback). */
@@ -273,10 +276,18 @@ async function resolveAndPersistFrozenExecutionTarget(
 	const frozen = await resolveFrozenExecutionTarget(tu, config, input, previous);
 	if (!frozen) return undefined;
 	if (config.onExecutionTargetResolved) {
-		await config.onExecutionTargetResolved(tu.toolUseId, frozen.target);
+		await config.onExecutionTargetResolved(
+			tu.toolUseId,
+			frozen.target,
+			requireToolCallBinding(tu, config),
+		);
 	}
 	if (config.onExecutionPlanResolved)
-		await config.onExecutionPlanResolved(tu.toolUseId, frozen.plan);
+		await config.onExecutionPlanResolved(
+			tu.toolUseId,
+			frozen.plan,
+			requireToolCallBinding(tu, config),
+		);
 	return frozen;
 }
 
@@ -362,23 +373,21 @@ export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKi
 	return "ordinary";
 }
 
-async function waitForStableToolCallRow(
+export function requireToolCallBinding(
 	tu: AgentToolUse,
 	config: AgentConfig,
-): Promise<{ id: string; narratorId: string }> {
-	const { narratorService } = await import("@server/services/narrator-service");
-	for (;;) {
-		const toolCall = await narratorService.getToolCallByToolUseId(tu.toolUseId);
-		if (toolCall?.id && toolCall.narratorId === config.narratorId) {
-			return { id: toolCall.id, narratorId: toolCall.narratorId };
-		}
-		if (config.signal.aborted) {
-			const error = new Error("Waiting for the stable tool-call row was aborted");
-			error.name = "AbortError";
-			throw error;
-		}
-		await new Promise((resolve) => setTimeout(resolve, 5));
+	binding = config.toolExecutionBindings?.get(tu),
+): ToolCallBinding | undefined {
+	if (
+		binding &&
+		(!binding.toolCallId || !Number.isSafeInteger(binding.attempt) || binding.attempt < 1)
+	) {
+		throw new Error("Invalid persisted tool execution binding");
 	}
+	if (!binding && config.requireToolCallBinding && !isReflectionDecisionTool(tu, config)) {
+		throw new Error(`Tool ${tu.name} has no durable execution receipt; execution refused`);
+	}
+	return binding;
 }
 
 async function upsertDeferredTool(
@@ -392,7 +401,9 @@ async function upsertDeferredTool(
 	activity: UpdateCheckpointActivityLease,
 ): Promise<void> {
 	try {
-		const toolCall = await waitForStableToolCallRow(tu, config);
+		const binding = state.toolCallBinding ?? requireToolCallBinding(tu, config);
+		if (!binding) throw new Error("Cannot defer a tool without its persisted execution receipt");
+		const toolCall = { id: binding.toolCallId };
 		// Do NOT persist the full tool input here. The authoritative input lives in the
 		// narrator_tool_calls.inputJson column, which reExecuteDeniedToolCall reads when the
 		// deferred tool is restored. Duplicating tu.input in the continuation payload would
@@ -522,6 +533,7 @@ export async function preAdmitToolExecution(
 	} = {},
 ): Promise<ToolAdmissionState> {
 	const state = options.state ?? {};
+	state.toolCallBinding ??= requireToolCallBinding(tu, config);
 	if (state.startGrant) return state;
 	if (isReflectionDecisionTool(tu, config)) {
 		state.preAdmissionComplete = true;
@@ -648,6 +660,19 @@ export async function executeTool(
 ): Promise<ToolExecResult> {
 	const locale = (config.locale as Locale) ?? "en";
 	const admissionState = options.admissionState ?? {};
+	const toolCallBinding = requireToolCallBinding(
+		tu,
+		config,
+		options.toolCallBinding ??
+			admissionState.toolCallBinding ??
+			config.toolExecutionBindings?.get(tu),
+	);
+	admissionState.toolCallBinding = toolCallBinding;
+	// A direct persisted recovery uses the exact same path as a loop receipt.
+	if (toolCallBinding && !config.toolExecutionBindings?.has(tu)) {
+		config.toolExecutionBindings ??= new WeakMap();
+		config.toolExecutionBindings.set(tu, toolCallBinding);
+	}
 
 	// Unified update admission is deliberately the first executable guard. Live loop callers
 	// reach this point only after the tool-use block has a stable narrator_tool_calls row.
@@ -815,6 +840,7 @@ export async function executeTool(
 			permission =
 				options.preGrantedPermission ??
 				(await config.permissionHandler(tu.name, tu.input, tu.toolUseId, {
+					toolCallBinding,
 					suppressAttention: options.suppressAttention,
 					executionBackend: frozenExecution?.backend,
 					executionTarget: frozenExecution?.target,
@@ -1041,8 +1067,12 @@ export async function executeTool(
 			parentNarratorId: config.parentNarratorId,
 			userId: config.userId,
 			projectId: config.projectId,
-			requestPermission: config.permissionHandler,
+			requestPermission: (toolName, input, toolUseId) =>
+				config.permissionHandler(toolName, input, toolUseId, {
+					toolCallBinding: ctx.toolCallBinding,
+				}),
 			currentToolUseId: tu.toolUseId,
+			toolCallBinding,
 			reflectionLoop: config.reflectionLoop?.context,
 			resolveBackend: (device?: string) => {
 				if (frozenExecution) {
@@ -1153,6 +1183,31 @@ export async function executeTool(
 			},
 		};
 		ctx.updateExecutionLease = updateExecutionLease;
+		try {
+			if (toolCallBinding) {
+				const startedBinding = await config.onToolExecutionStarting?.(
+					tu.toolUseId,
+					toolCallBinding,
+					executionStartedAt,
+				);
+				if (config.requireToolCallBinding && (!startedBinding || startedBinding.attempt < 1)) {
+					throw new Error("Tool execution attempt was not durably allocated");
+				}
+				if (startedBinding) {
+					if (
+						startedBinding.toolCallId !== toolCallBinding.toolCallId ||
+						startedBinding.attempt !== toolCallBinding.attempt
+					)
+						throw new Error("Tool start cannot change the persisted attempt");
+					ctx.toolCallBinding = startedBinding;
+					admissionState.toolCallBinding = startedBinding;
+					config.toolExecutionBindings?.set(tu, startedBinding);
+				}
+			}
+		} catch (error) {
+			updateExecutionLease.release();
+			throw error;
+		}
 
 		// Progress starts only after final admission; a deferred tool remains visually pending.
 		let progressTimer: ReturnType<typeof setInterval> | undefined;

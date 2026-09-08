@@ -74,7 +74,7 @@ export type ToolSectionLabelId =
  * render-layer import while the bundle below still has to cover every field.
  * The three `{duration}` entries and `startedAt`'s `{time}` keep a LITERAL
  * placeholder — the render layer substitutes the live value, exactly like
- * `planSource` / `diffTruncated`.
+ * `planSource`.
  */
 export interface VListTimingLabels {
 	title: string;
@@ -124,14 +124,6 @@ export interface VListRenderLabels {
 		copied: string;
 		/** Terminate a running bash / MCP tool. */
 		terminate: string;
-		/**
-		 * Diff bodies initially paint only as many rows as the capped box can
-		 * reveal (see RenderToolCall diffRenderRowLimit); this footer reports the
-		 * rest and doubles as the scroll sentinel that progressively reveals them
-		 * (useDiffRowReveal). Carries a literal `{count}` because the hidden row
-		 * count is per body.
-		 */
-		diffTruncated: string;
 		/** Placeholder for a valid but EMPTY spec task document (`{ tasks: [] }`). */
 		tasksEmpty: string;
 		/** Header timing breakdown popover + timeout editor. */
@@ -187,6 +179,15 @@ export interface VListRenderLabels {
 		shellTouched: string;
 		/** Marker for a file a revert here will not restore (changed in another worktree). */
 		outsideWorkspace: string;
+		fileChangeLegacy: string;
+		fileChangeWindow: string;
+		unknownDevice: string;
+		unknownWorkspace: string;
+		unknownCoverage: string;
+		unmeasuredChanges: string;
+		countsTruncated: string;
+		fileEdits: string;
+		collapseFiles: string;
 		/** Same bundle as the tool card: the header + recent-call rows reuse it. */
 		timing: VListTimingLabels;
 	};
@@ -332,6 +333,16 @@ export function useVListLabels(): VListLabels {
 			// ── read-only AskUserQuestion replay ────────────────────────────────────
 			// These prefixes wrap together with the answer text, so they are MEASURED
 			// (adapter labels) rather than substituted by the render layer.
+			sendAwaitReply: t("sendAwaitReply"),
+			sendNoAwaitReply: t("sendNoAwaitReply"),
+			communicationBroadcast: t("communicationBroadcast"),
+			communicationRecipientUnknown: t("communicationRecipientUnknown"),
+			communicationRunning: t("communicationRunning"),
+			communicationSuccess: t("communicationSuccess"),
+			communicationError: t("communicationError"),
+			communicationCancelled: t("communicationCancelled"),
+			communicationWaiting: t("communicationWaiting"),
+			communicationViewFull: t("communicationViewFull"),
 			askAnswerPrefix: t("askAnswerPrefix"),
 			askCustomAnswerPrefix: t("askCustomAnswerPrefix"),
 			specProtectedBadge: t("specProtectedBadge"),
@@ -514,7 +525,6 @@ export function useVListLabels(): VListLabels {
 				terminate: t("terminateProcess"),
 				// `{count}` stays literal: the render layer substitutes the per-body
 				// hidden row count — same trick as COUNT_PLACEHOLDER above.
-				diffTruncated: t("toolDiffRowsTruncated", { count: COUNT_PLACEHOLDER }),
 				tasksEmpty: t("spec.tasksEmpty"),
 				timing,
 				permission,
@@ -566,6 +576,15 @@ export function useVListLabels(): VListLabels {
 				moreFiles: t("subagentMoreFiles"),
 				shellTouched: t("subagentShellTouched"),
 				outsideWorkspace: t("subagentOutsideWorkspace"),
+				fileChangeLegacy: t("subagentFileChangesLegacy"),
+				fileChangeWindow: t("subagentFileChangesWindow"),
+				unknownDevice: t("subagentFileChangesUnknownDevice"),
+				unknownWorkspace: t("subagentFileChangesUnknownWorkspace"),
+				unknownCoverage: t("subagentFileChangesUnknownCoverage"),
+				unmeasuredChanges: t("subagentFileChangesUnmeasured"),
+				countsTruncated: t("subagentFileChangesTruncated"),
+				fileEdits: t("subagentFileChangesEdits"),
+				collapseFiles: t("subagentFileChangesCollapse"),
 				timing,
 			},
 			permission,

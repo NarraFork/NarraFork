@@ -11,28 +11,31 @@
  * definition of an actor for both the attribution timeline and the workspace
  * modification view.
  */
-import { inArray } from "drizzle-orm";
-import { db } from "../db";
-import { narrators } from "../db/schema";
 
-/** A resolved contributor, ready for display. */
+import { inArray } from "drizzle-orm";
+import type { FileChangeActor, FileChangeActorKind } from "../../shared/file-change-protocol";
+import { db } from "../db";
+import { narrators, users } from "../db/schema";
+
+/** v1 can lose a narrator's subtype with its FK; never pretend it was a primary. */
+export type AttributionActorKind = FileChangeActorKind | "narrator_unknown";
+
+/** Observed actor identity, not ownership of the current diff. */
 export interface AttributionActor {
-	/** Null only for changes with no narrator at all (external / terminal edits). */
+	kind: AttributionActorKind;
 	narratorId: string | null;
-	/** Narrator title, or null when it has none yet. */
+	userId: string | null;
+	/** Resolved narrator title or username. Never fabricated for missing identities. */
 	title: string | null;
-	/** Subagent type when the actor is a subagent, else null. */
 	subagentType: string | null;
-	/** Title of the spawning narrator, for subagents whose parent is known. */
 	parentTitle: string | null;
-	/**
-	 * False when the narrator row no longer exists.
-	 *
-	 * A deleted session is a real answer to "who changed this" and must be
-	 * distinguishable from "no idea": the former means there is no session to open, the
-	 * latter would send someone looking for one.
-	 */
 	exists: boolean;
+	/** Null when a legacy null FK cannot distinguish deletion from missing identity. */
+	deleted: boolean | null;
+	/** Whether separate observations can be linked to one stable subject. */
+	identityKnown: boolean;
+	/** v2 subject remains stable after linked user/narrator deletion. */
+	subjectKey?: string;
 }
 
 /** One narrator row, as actor resolution needs it. */
@@ -47,14 +50,89 @@ export interface NarratorActorRow {
 /** Prefix of the `variant` column for subagents. */
 const SUBAGENT_VARIANT_PREFIX = "subagent:";
 
-/** The actor for a change that carried no narrator id. */
+/** Only an external event implies an external actor; a null FK does not. */
 export const EXTERNAL_ACTOR: AttributionActor = Object.freeze({
+	kind: "external_unknown",
 	narratorId: null,
+	userId: null,
 	title: null,
 	subagentType: null,
 	parentTitle: null,
 	exists: false,
+	deleted: false,
+	identityKnown: false,
 });
+
+export interface AttributionActorEvent {
+	action: string;
+	actorSnapshot?: FileChangeActor | null;
+	narratorId: string | null;
+	userId: string | null;
+	subagentType: string | null;
+}
+
+/** Resolve from this event alone, never from a file group's historical flags. */
+export function resolveEventAttributionActor(
+	event: AttributionActorEvent,
+	narratorActors: ReadonlyMap<string, AttributionActor>,
+	humanActors: ReadonlyMap<string, AttributionActor>,
+): AttributionActor {
+	const snapshot = event.actorSnapshot;
+	if (snapshot) {
+		if (snapshot.kind === "external_unknown") return EXTERNAL_ACTOR;
+		const source =
+			snapshot.kind === "human"
+				? snapshot.userId
+					? humanActors.get(snapshot.userId)
+					: undefined
+				: snapshot.narratorId
+					? narratorActors.get(snapshot.narratorId)
+					: undefined;
+		return {
+			...EXTERNAL_ACTOR,
+			...source,
+			kind: snapshot.kind,
+			narratorId: snapshot.narratorId,
+			userId: snapshot.userId,
+			subjectKey: snapshot.subjectKey,
+			title: source?.exists && !snapshot.deleted ? source.title : null,
+			subagentType: source?.subagentType ?? event.subagentType,
+			exists: !snapshot.deleted && !!source?.exists,
+			deleted: snapshot.deleted || !source?.exists,
+			identityKnown: !!snapshot.subjectKey,
+		};
+	}
+	if (event.action === "external") return EXTERNAL_ACTOR;
+	if (event.action === "human") {
+		return (
+			(event.userId ? humanActors.get(event.userId) : undefined) ?? {
+				...EXTERNAL_ACTOR,
+				kind: "human",
+				userId: event.userId,
+				deleted: event.userId ? true : null,
+				identityKnown: event.userId !== null,
+			}
+		);
+	}
+	const resolved = event.narratorId ? narratorActors.get(event.narratorId) : undefined;
+	if (resolved?.exists) return resolved;
+	return {
+		...EXTERNAL_ACTOR,
+		kind: event.subagentType ? "subagent" : "narrator_unknown",
+		narratorId: event.narratorId,
+		subagentType: event.subagentType,
+		deleted: event.narratorId ? true : null,
+		identityKnown: event.narratorId !== null,
+	};
+}
+
+/** Unknown identities share only a display bucket, never an exact contributor count. */
+export function attributionActorKey(actor: AttributionActor): string {
+	if (actor.subjectKey) return actor.subjectKey;
+	if (actor.userId) return `human:${actor.userId}`;
+	if (actor.narratorId) return `narrator:${actor.narratorId}`;
+	return `${actor.kind}:unknown:${actor.subagentType ?? ""}`;
+}
 
 /**
  * Turn narrator rows into display actors.
@@ -76,7 +154,13 @@ export function buildAttributionActors(
 	for (const id of ids) {
 		const row = byId.get(id);
 		if (!row) {
-			resolved.set(id, { ...EXTERNAL_ACTOR, narratorId: id });
+			resolved.set(id, {
+				...EXTERNAL_ACTOR,
+				kind: "narrator_unknown",
+				narratorId: id,
+				deleted: true,
+				identityKnown: true,
+			});
 			continue;
 		}
 		// `variant` is the authoritative identity ("subagent:<type>"); the
@@ -86,12 +170,17 @@ export function buildAttributionActors(
 			? row.variant.slice(SUBAGENT_VARIANT_PREFIX.length)
 			: null;
 		const parent = row.parentNarratorId ? byId.get(row.parentNarratorId) : undefined;
+		const subagentType = variantType || row.subagentType || null;
 		resolved.set(id, {
+			kind: subagentType || row.variant === "subagent" ? "subagent" : "primary",
 			narratorId: id,
+			userId: null,
 			title: row.title ?? null,
-			subagentType: variantType || row.subagentType || null,
+			subagentType,
 			parentTitle: parent?.title ?? null,
 			exists: true,
+			deleted: false,
+			identityKnown: true,
 		});
 	}
 
@@ -138,4 +227,33 @@ export async function resolveAttributionActors(
 			: [];
 
 	return buildAttributionActors(ids, [...rows, ...parentRows]);
+}
+
+/** A human is resolved by userId, never by the narrator that happens to own a chapter. */
+export async function resolveHumanAttributionActors(
+	ids: string[],
+): Promise<Map<string, AttributionActor>> {
+	if (ids.length === 0) return new Map();
+	const rows = await db
+		.select({ id: users.id, username: users.username })
+		.from(users)
+		.where(inArray(users.id, ids));
+	const byId = new Map(rows.map((row) => [row.id, row]));
+	return new Map(
+		ids.map((id) => {
+			const row = byId.get(id);
+			return [
+				id,
+				{
+					...EXTERNAL_ACTOR,
+					kind: "human",
+					userId: id,
+					title: row?.username ?? null,
+					exists: !!row,
+					deleted: !row,
+					identityKnown: true,
+				},
+			];
+		}),
+	);
 }

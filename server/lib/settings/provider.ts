@@ -460,20 +460,31 @@ export function resolveAllowedModelCandidate(
 	candidate: string | null | undefined,
 	allowedPool: string[],
 ): string | null {
+	return resolveAllowedModelCandidateMatch(candidate, allowedPool)?.model ?? null;
+}
+
+/** Keep the legacy model choice while retaining the pool reference that owns its metadata. */
+export function resolveAllowedModelCandidateMatch(
+	candidate: string | null | undefined,
+	allowedPool: string[],
+): { model: string; poolIndex?: number } | null {
 	const raw = normalizeModelReference(candidate);
 	if (!raw) return null;
-	if (allowedPool.length === 0) return raw;
+	if (allowedPool.length === 0) return { model: raw };
 
+	// A concrete entry (or explicitly named sentinel/aggregation) owns its metadata
+	// ahead of overlapping references. This must NOT reorder the model search itself.
+	const exactIndex = allowedPool.findIndex((entry) => normalizeModelReference(entry) === raw);
 	const candidateValues = expandModelReferenceForMatching(raw);
-	for (const allowedRaw of allowedPool) {
+	for (const [index, allowedRaw] of allowedPool.entries()) {
 		const allowed = normalizeModelReference(allowedRaw);
 		if (!allowed) continue;
 
 		const allowedValues = expandModelReferenceForMatching(allowed);
-		if (allowedValues.has(raw)) return raw;
-
-		const concrete = findConcreteIntersection(candidateValues, allowedValues);
-		if (concrete) return concrete;
+		const model = allowedValues.has(raw)
+			? raw
+			: findConcreteIntersection(candidateValues, allowedValues);
+		if (model) return { model, poolIndex: exactIndex === -1 ? index : exactIndex };
 	}
 
 	return null;
@@ -573,15 +584,7 @@ export function getVisibleModels(): string[] {
 	const extra = listExtraModels();
 	const seen = new Set<string>();
 	const result: string[] = [];
-	for (const v of [
-		...openai,
-		...anthropic,
-		...codex,
-		...nug,
-		...gemini,
-		...custom,
-		...extra,
-	]) {
+	for (const v of [...openai, ...anthropic, ...codex, ...nug, ...gemini, ...custom, ...extra]) {
 		if (seen.has(v) || hidden.has(v)) continue;
 		const colonIdx = v.indexOf(":");
 		if (colonIdx > 0 && disabledPrefixes.has(v.slice(0, colonIdx))) continue;

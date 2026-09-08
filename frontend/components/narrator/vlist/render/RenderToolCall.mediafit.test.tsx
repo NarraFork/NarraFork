@@ -119,12 +119,14 @@ function paintScreenshot(width: number, height: number): MediaPaint {
 	const spec = specs.find((s) => s.kind === "tool-call" || s.kind === "tool-call-group");
 	if (!spec) throw new Error(`no tool-call spec, got: ${specs.map((s) => s.kind).join(",")}`);
 	const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, CONTENT_WIDTH, 5, spec.opts);
-	const detail = (measured as { detail?: { blocks: unknown[]; contentWidth: number } }).detail;
+	const detail = (measured as import("../measure/measure-tool-call").MeasuredToolCall).detail;
 	if (!detail) throw new Error("no measured detail region");
-	// The media block is the one carrying a `media` descriptor.
-	const mediaBlock = detail.blocks.find(
-		(b) => (b as { data?: Record<string, unknown> }).data?.media != null,
-	) as { data?: Record<string, unknown> } | undefined;
+	const body = detail.sections.find(
+		(section) =>
+			section.measuredBody.model.kind === "capped" && section.measuredBody.model.format === "media",
+	)?.measuredBody;
+	const block = body?.blocks[0];
+	const mediaBlock = block?.kind === "fixed" ? block : undefined;
 	if (!mediaBlock?.data) throw new Error("no media block in the measured detail");
 
 	const extra = resolveRenderExtra(spec);

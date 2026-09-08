@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
+import type { FileReferenceContext } from "@shared/file-reference";
 import {
 	projectSubagentToolInputSummary,
 	type SubagentToolInputSummary,
@@ -32,7 +33,8 @@ import { DEFAULT_CONTEXT_THRESHOLDS, LARGE_CONTEXT_BOUNDARY, settings } from "..
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
-import { bumpNarratorMessageVersion } from "./narrator-persistence";
+import { FileReferenceContextTracker } from "./file-reference-context";
+import { bumpNarratorMessageVersion, narratorPersistence } from "./narrator-persistence";
 import type { EnterPlanModeToolResultCommit } from "./narrator-plan-mode";
 import {
 	enrichToolUseBlocks,
@@ -66,6 +68,8 @@ export interface TokenUsageSnapshot {
 }
 
 export interface EventHandlerContext {
+	/** Production runners require durable receipts; standalone display adapters may omit them. */
+	requireToolCallBinding?: boolean;
 	/** Narrator ID that owns the messages (subagent's own ID) */
 	narratorId: string;
 	/** WebSocket broadcast target (subagent → parentNarratorId) */
@@ -90,6 +94,10 @@ export interface EventHandlerContext {
 	getPartialMessageId: () => string | undefined;
 	getTokenUsage: () => TokenUsageSnapshot | undefined;
 	getTurnStartedAt?: () => string | undefined;
+	/** Trusted in-memory execution location, sampled once at the start of each text block. */
+	getFileReferenceContext?: () => FileReferenceContext | null | undefined;
+	/** Text-lane contexts survive device switches until their own block_complete. */
+	fileReferenceContexts?: FileReferenceContextTracker;
 	getTtftMs?: () => number | undefined;
 	setPartialMessageId: (id: string | undefined) => void;
 	setContextUsagePct: (pct: number) => void;
@@ -116,6 +124,11 @@ export interface EventHandlerContext {
 	toolUseCharsMap?: Map<string, number>;
 	/** Exact narrator_tool_calls row id for each persisted tool_use block. */
 	toolCallIdsMap?: Map<string, string>;
+	/** Receipts created by this consumer, scoped to the actual message (not inherited maps). */
+	toolExecutionReceipts?: Map<
+		string,
+		{ messageId: string; binding: import("../lib/agent/types").ToolCallBinding }
+	>;
 	/** Tracks API requests in progress (requestId → request info) */
 	apiRequestsMap?: Map<string, ApiRequestHandle>;
 	/**
@@ -296,7 +309,13 @@ export type SnapshotStreamingBlock =
 			height?: number;
 			outputIndex?: number;
 	  }
-	| { type: "text"; text: string; outputIndex?: number };
+	| {
+			type: "text";
+			text: string;
+			id?: string;
+			outputIndex?: number;
+			fileReferenceContext?: FileReferenceContext | null;
+	  };
 
 export interface StreamingSnapshot {
 	/** Ordered streaming blocks — preserves temporal order of reasoning, web_search, and text. */
@@ -574,6 +593,8 @@ async function discardAttemptPersistedBlocks(
 	// retire them. Done regardless of whether a partial row exists: the streaming
 	// blocks are client state and are not conditional on persistence.
 	clearStreamingSnapshot(broadcastTargetId);
+	if (ctx.parentToolUseId) clearStreamingSnapshot(narratorId);
+	ctx.fileReferenceContexts?.clear();
 	dualBroadcast(ctx, {
 		type: "streaming_reset",
 		narratorId: broadcastTargetId,
@@ -892,6 +913,12 @@ export async function processEvent(
 
 	switch (event.type) {
 		case "stream_text": {
+			ctx.fileReferenceContexts ??= new FileReferenceContextTracker();
+			const fileReferenceContext = ctx.fileReferenceContexts.capture(
+				event.outputIndex,
+				ctx.getFileReferenceContext,
+			);
+			const textBlockId = ctx.fileReferenceContexts.blockId(event.outputIndex);
 			// Clear "reasoning" substatus when text starts (reasoning phase ended)
 			if (ctx.removeSubstatus && ctx.getSubstatus?.().has("reasoning")) {
 				ctx.removeSubstatus("reasoning").catch(() => {});
@@ -907,37 +934,30 @@ export async function processEvent(
 			// Track AI output character rate
 			recordOutputChunk(event.text.length);
 
-			// Snapshot: accumulate streaming text (top-level only). When the provider
-			// exposes outputIndex, keep the text block ordered relative to native
-			// web_search/image_generation blocks.
-			if (!ctx.parentToolUseId) {
-				const snap = getOrCreateSnapshot(broadcastTargetId);
-				const existingIdx =
-					event.outputIndex != null
-						? snap.streamingBlocks.findIndex(
-								(b) => b.type === "text" && b.outputIndex === event.outputIndex,
-							)
-						: -1;
-				if (existingIdx !== -1) {
-					const existing = snap.streamingBlocks[existingIdx];
-					if (existing.type === "text") existing.text += event.text;
-				} else {
-					const lastBlock = snap.streamingBlocks[snap.streamingBlocks.length - 1];
-					if (lastBlock?.type === "text" && event.outputIndex == null) {
-						lastBlock.text += event.text;
-					} else {
-						snap.streamingBlocks.splice(
-							findOrderedSnapshotInsertIndex(snap.streamingBlocks, event.outputIndex),
-							0,
-							{ type: "text", text: event.text, outputIndex: event.outputIndex },
-						);
-					}
-				}
+			// Text snapshots belong to the actual author (also on a subagent's own
+			// page), never to a different narrator sharing the parent's subscription.
+			const snap = getOrCreateSnapshot(ctx.parentToolUseId ? narratorId : broadcastTargetId);
+			const existing = snap.streamingBlocks.find((b) => b.type === "text" && b.id === textBlockId);
+			if (existing?.type === "text") {
+				existing.text += event.text;
+			} else {
+				snap.streamingBlocks.splice(
+					findOrderedSnapshotInsertIndex(snap.streamingBlocks, event.outputIndex),
+					0,
+					{
+						type: "text",
+						id: textBlockId,
+						text: event.text,
+						outputIndex: event.outputIndex,
+						fileReferenceContext,
+					},
+				);
 			}
 
 			const streamEvent: Record<string, unknown> = {
 				type: "content_block_delta",
-				delta: { type: "text_delta", text: event.text },
+				delta: { type: "text_delta", text: event.text, id: textBlockId },
+				fileReferenceContext,
 				...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
 			};
 			// Subagent: attach linking info so frontend knows which tool_use this belongs to
@@ -954,7 +974,8 @@ export async function processEvent(
 				type: "stream_event",
 				data: {
 					type: "content_block_delta",
-					delta: { type: "text_delta", text: event.text },
+					delta: { type: "text_delta", text: event.text, id: textBlockId },
+					fileReferenceContext,
 					...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
 				},
 			});
@@ -1110,12 +1131,31 @@ export async function processEvent(
 
 		case "block_complete": {
 			const { block } = event;
+			const textBlockId =
+				block.type === "text" ? ctx.fileReferenceContexts?.blockId(block.outputIndex) : undefined;
+			const mixedTextSources =
+				block.type === "text" && ctx.fileReferenceContexts?.hasDifferentContexts();
+			let fileReferenceContext =
+				block.type === "text"
+					? (ctx.fileReferenceContexts?.complete(block.outputIndex) ?? null)
+					: null;
+			if (mixedTextSources && block.type === "text") {
+				// The loop can combine multiple output items into one block_complete.
+				// Unless this is provably the exact lane, a mixed-device body has no
+				// single trustworthy base. Keep the text; only disable inferred links.
+				const streamed = streamingSnapshots
+					.get(ctx.parentToolUseId ? narratorId : broadcastTargetId)
+					?.streamingBlocks.find(
+						(candidate) => candidate.type === "text" && candidate.id === textBlockId,
+					);
+				if (streamed?.type !== "text" || streamed.text !== block.text) fileReferenceContext = null;
+			}
 
 			// Snapshot: remove the completed block from the ordered streaming blocks.
 			// The completed block will be served via the partial message from the
 			// database, so the snapshot should only contain blocks still being streamed.
-			if (!ctx.parentToolUseId) {
-				const snap = streamingSnapshots.get(broadcastTargetId);
+			if (block.type === "text" || !ctx.parentToolUseId) {
+				const snap = streamingSnapshots.get(ctx.parentToolUseId ? narratorId : broadcastTargetId);
 				if (snap) {
 					if (block.type === "text") {
 						// Remove the completed text block (prefer exact provider outputIndex).
@@ -1216,6 +1256,8 @@ export async function processEvent(
 					type: "text",
 					text: block.text,
 					outputIndex: block.outputIndex,
+					...(textBlockId ? { id: textBlockId } : {}),
+					...(fileReferenceContext ? { fileReferenceContext } : {}),
 					...(block.citations?.length ? { citations: block.citations } : {}),
 				});
 			} else if (block.type === "reasoning") {
@@ -1249,10 +1291,19 @@ export async function processEvent(
 					outputIndex: block.outputIndex,
 					...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {}),
 				});
-				if (toolCallId) {
-					if (!ctx.toolCallIdsMap) ctx.toolCallIdsMap = new Map();
-					ctx.toolCallIdsMap.set(block.toolUseId, toolCallId);
-				}
+				if (!toolCallId)
+					throw new CriticalEventPersistenceError("Tool block did not produce a persisted row");
+				const binding = await narratorPersistence.getToolCallBinding(
+					narratorId,
+					partialId,
+					block.toolUseId,
+					toolCallId,
+				);
+				ctx.toolCallIdsMap ??= new Map();
+				ctx.toolCallIdsMap.set(block.toolUseId, toolCallId);
+				ctx.toolExecutionReceipts ??= new Map();
+				ctx.toolExecutionReceipts.set(block.toolUseId, { messageId: partialId, binding });
+				event.onToolPersisted?.(binding);
 			} else if (block.type === "web_search") {
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
 					type: "web_search",
@@ -1344,8 +1395,11 @@ export async function processEvent(
 		}
 
 		case "assistant_message": {
+			const fileReferenceContext = ctx.fileReferenceContexts?.fallback() ?? null;
+			ctx.fileReferenceContexts?.clear();
 			// Snapshot: clear streaming state — this turn's text + tools are done
 			clearStreamingSnapshot(broadcastTargetId);
+			if (ctx.parentToolUseId) clearStreamingSnapshot(narratorId);
 			// The turn is settled, so no attempt of it can be discarded any more. Drop the
 			// per-attempt baselines rather than letting them accumulate across a long
 			// session (each retry adds one entry).
@@ -1410,6 +1464,7 @@ export async function processEvent(
 					content.push({
 						type: "text",
 						text: event.text,
+						...(fileReferenceContext ? { fileReferenceContext } : {}),
 						...(event.citations?.length ? { citations: event.citations } : {}),
 					});
 				}
@@ -1488,8 +1543,32 @@ export async function processEvent(
 			}
 			if (fullMessage) {
 				ctx.toolCallIdsMap ??= new Map();
-				for (const toolCall of fullMessage.toolCalls) {
-					if (toolCall.id) ctx.toolCallIdsMap.set(toolCall.toolUseId, toolCall.id);
+				ctx.toolExecutionReceipts ??= new Map();
+				for (const tu of event.toolUses) {
+					const receipt = ctx.toolExecutionReceipts.get(tu.toolUseId);
+					let binding = receipt?.messageId === savedId ? receipt.binding : undefined;
+					if (!binding) {
+						const rows = fullMessage.toolCalls.filter((tc) => tc.toolUseId === tu.toolUseId);
+						if (
+							rows.length !== 1 ||
+							rows[0].narratorId !== narratorId ||
+							rows[0].executionAttempt !== 1 ||
+							rows[0].fileChangeOperationId
+						) {
+							throw new CriticalEventPersistenceError(
+								"Cannot bind a tool to ambiguous or historical execution rows",
+							);
+						}
+						binding = await narratorPersistence.getToolCallBinding(
+							narratorId,
+							savedId,
+							tu.toolUseId,
+							rows[0].id,
+						);
+					}
+					ctx.toolCallIdsMap.set(tu.toolUseId, binding.toolCallId);
+					ctx.toolExecutionReceipts.set(tu.toolUseId, { messageId: savedId, binding });
+					event.onToolPersisted?.(tu.toolUseId, binding);
 				}
 			}
 
@@ -1571,11 +1650,34 @@ export async function processEvent(
 		}
 
 		case "tool_result": {
+			// Only a receipt returned by this consumer (or the loop's exact receipt) may settle a row.
+			const receipt = ctx.toolExecutionReceipts?.get(event.toolUseId);
+			const binding = event.toolCallBinding ?? receipt?.binding;
+			if (!binding && ctx.requireToolCallBinding)
+				throw new CriticalEventPersistenceError("Tool result has no persisted execution receipt");
+			if (binding) {
+				const resultMessageId = await narratorPersistence.validateToolCallBinding(
+					narratorId,
+					event.toolUseId,
+					binding,
+				);
+				if (receipt?.binding.toolCallId === binding.toolCallId) {
+					ctx.toolExecutionReceipts?.set(event.toolUseId, { messageId: resultMessageId, binding });
+				}
+			}
+			// A bare display event is not execution authority and must never perform a fuzzy write.
+			const resultToolCallId =
+				binding?.toolCallId ?? ctx.preparedPlanModeToolCalls?.get(event.toolUseId);
 			// Snapshot: remove completed tool from active chunks
 			streamingSnapshots.get(broadcastTargetId)?.toolChunks.delete(event.toolUseId);
 
 			const status = event.isError ? "fail" : "success";
 			const preparedPlanToolCallId = ctx.preparedPlanModeToolCalls?.get(event.toolUseId);
+			if (binding && preparedPlanToolCallId && preparedPlanToolCallId !== binding.toolCallId) {
+				throw new CriticalEventPersistenceError(
+					"Prepared plan state belongs to another tool attempt",
+				);
+			}
 			const persistedOutput = event.metadata
 				? { _text: event.output, _metadata: event.metadata }
 				: event.output;
@@ -1601,12 +1703,13 @@ export async function processEvent(
 					? "Refusing successful EnterPlanMode without an atomic commit hook."
 					: "Refusing successful EnterPlanMode without prepared persisted state.";
 				try {
-					await narratorService.updateToolCallResult(
-						event.toolUseId,
-						{ output: message, status: "fail", errorMessage: message },
-						undefined,
-						preparedPlanToolCallId,
-					);
+					if (resultToolCallId)
+						await narratorService.updateToolCallResult(
+							event.toolUseId,
+							{ output: message, status: "fail", errorMessage: message },
+							undefined,
+							resultToolCallId,
+						);
 				} catch (persistError) {
 					logger.error("Failed to persist EnterPlanMode fail-closed result", {
 						narratorId,
@@ -1669,7 +1772,7 @@ export async function processEvent(
 							event.toolUseId,
 							{ output: message, status: "fail", errorMessage: message },
 							undefined,
-							preparedPlanToolCallId,
+							resultToolCallId,
 						);
 					} catch (persistError) {
 						logger.error("Failed to persist EnterPlanMode atomic commit failure", {
@@ -1691,7 +1794,7 @@ export async function processEvent(
 				}
 			}
 
-			if (!shouldCommitEnterPlanModeAtomically) {
+			if (!shouldCommitEnterPlanModeAtomically && resultToolCallId) {
 				try {
 					await narratorService.updateToolCallResult(
 						event.toolUseId,
@@ -1705,7 +1808,7 @@ export async function processEvent(
 							completedAt: event.completedAt,
 						},
 						undefined,
-						preparedPlanToolCallId,
+						resultToolCallId,
 					);
 					// Broken tool call: overwrite the persisted inputJson with a sanitized
 					// version (large content fields replaced with a short placeholder).
@@ -1713,7 +1816,7 @@ export async function processEvent(
 						await narratorService.overwriteToolCallInput(
 							event.toolUseId,
 							event.brokenInputOverride,
-							preparedPlanToolCallId,
+							resultToolCallId,
 						);
 					}
 					// Permission-level input redirect (e.g. plan-mode file path):
@@ -1722,7 +1825,7 @@ export async function processEvent(
 						await narratorService.overwriteToolCallInput(
 							event.toolUseId,
 							event.updatedInput,
-							preparedPlanToolCallId,
+							resultToolCallId,
 						);
 					}
 					toolResultPersisted = true;
@@ -1743,21 +1846,24 @@ export async function processEvent(
 								status,
 								errorMessage: event.isError ? event.output : undefined,
 								durationMs: event.durationMs,
+								permissionStartedAt: event.permissionStartedAt,
+								executionStartedAt: event.executionStartedAt,
+								completedAt: event.completedAt,
 							},
 							undefined,
-							preparedPlanToolCallId,
+							resultToolCallId,
 						);
 						if (event.brokenInputOverride) {
 							await narratorService.overwriteToolCallInput(
 								event.toolUseId,
 								event.brokenInputOverride,
-								preparedPlanToolCallId,
+								resultToolCallId,
 							);
 						} else if (event.updatedInput) {
 							await narratorService.overwriteToolCallInput(
 								event.toolUseId,
 								event.updatedInput,
-								preparedPlanToolCallId,
+								resultToolCallId,
 							);
 						}
 						toolResultPersisted = true;
@@ -1766,6 +1872,9 @@ export async function processEvent(
 							narratorId,
 							toolUseId: event.toolUseId,
 							error: String(retryErr),
+						});
+						throw new CriticalEventPersistenceError("Tool result could not be persisted", {
+							cause: retryErr,
 						});
 					}
 				}
@@ -1789,6 +1898,7 @@ export async function processEvent(
 				type: "tool_completed",
 				narratorId: broadcastTargetId,
 				...subagentToolRouting(ctx, event.toolUseId),
+				...(resultToolCallId ? { toolCallId: resultToolCallId } : {}),
 				toolUseId: event.toolUseId,
 				toolName: event.toolName,
 				status,
@@ -1907,6 +2017,8 @@ export async function processEvent(
 		case "error": {
 			// Snapshot: clear streaming state on error
 			clearStreamingSnapshot(broadcastTargetId);
+			if (ctx.parentToolUseId) clearStreamingSnapshot(narratorId);
+			ctx.fileReferenceContexts?.clear();
 
 			if (hooks?.onErrorCleanup) {
 				await hooks.onErrorCleanup(event.message, event.diagnostics);
@@ -1970,6 +2082,8 @@ export async function processEvent(
 			// (which still holds the live reasoning that will not be persisted) and
 			// tell the frontend to drop the streaming blocks it is currently showing.
 			clearStreamingSnapshot(broadcastTargetId);
+			if (ctx.parentToolUseId) clearStreamingSnapshot(narratorId);
+			ctx.fileReferenceContexts?.clear();
 			dualBroadcast(ctx, {
 				type: "streaming_reset",
 				narratorId: broadcastTargetId,
@@ -2161,13 +2275,11 @@ export async function processEvent(
 		// Generic gateway-injected queue/quota events (providers via unified gateway).
 		case "queue_status": {
 			const qsSnap = getOrCreateSnapshot(narratorId);
-			if (event.position !== undefined) {
-				qsSnap.queuePosition = event.position;
-			}
-			if (event.queueDepth !== undefined) {
-				qsSnap.queueDepth = event.queueDepth;
-			}
-			qsSnap.queueMessage = event.queueMessage;
+			// Queue events are snapshots, not patches. Empty/zero ends queueing.
+			const cleared = event.position === 0 || (event.position == null && !event.queueMessage);
+			qsSnap.queuePosition = cleared ? undefined : event.position;
+			qsSnap.queueDepth = cleared ? undefined : event.queueDepth;
+			qsSnap.queueMessage = cleared ? undefined : event.queueMessage;
 			dualBroadcast(ctx, {
 				type: "queue_status",
 				narratorId: broadcastTargetId,

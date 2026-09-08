@@ -92,7 +92,8 @@ describe("stable-height invariant: truncated tool payloads", () => {
 		expect(block).toContain("isFullPayloadRequestedRow(activeInteraction, rowKey)");
 		// Per-ROW scope: several rows of one trace can be open, each with its own
 		// request — a trace-level key would make one row's click fetch its siblings.
-		expect(block).toContain("traceRowViewKey(item.spec.key, row.itemIndex)");
+		expect(block).toContain("ownerRequestKey(rowOwner)");
+		expect(block).toContain("traceItemIndex: row.itemIndex");
 	});
 
 	it("a truncated body inside a drilled-in card still reserves its full cap", () => {
@@ -156,7 +157,12 @@ describe("stable-height invariant: reflection notices", () => {
 		const bridge = read("vlist-permission-bridge.tsx");
 		// A row whose permission area is owned by the measured notice must not also
 		// mount a form (that would double the region AND make the row dynamic).
-		expect(bridge).toContain('decision.kind !== "permission"');
+		const reflectionGuard = bridge.indexOf('if (decision.kind === "reflection") continue;');
+		const permissionGuard = bridge.indexOf(
+			'if (decision.kind === "permission" && decision.pending)',
+		);
+		expect(reflectionGuard).toBeGreaterThanOrEqual(0);
+		expect(permissionGuard).toBeGreaterThan(reflectionGuard);
 	});
 });
 

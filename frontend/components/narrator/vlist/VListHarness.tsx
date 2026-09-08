@@ -29,6 +29,7 @@
  */
 
 import { Badge, Box, Button, Group, Stack, Text } from "@mantine/core";
+import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import {
 	type ComponentType,
 	type ReactNode,
@@ -353,18 +354,26 @@ const TOOL_CALL_TASKS: ToolCallData = {
 	category: "tasks",
 	status: "success",
 	detail: {
-		kind: "spec-tasks",
-		tasks: [
+		kind: "sections",
+		sections: [
 			{
-				text: "Extend HarnessCase with a preview mode that skips the DOM ground truth",
-				status: "done",
+				key: "tasks",
+				body: {
+					kind: "spec-tasks",
+					tasks: [
+						{
+							text: "Extend HarnessCase with a preview mode that skips the DOM ground truth",
+							status: "done",
+						},
+						{
+							text: "Construct sample data for every registry element kind",
+							status: "doing",
+							protected: true,
+						},
+						{ text: "Run tsgo, biome, and the vlist test suite", status: "todo" },
+					],
+				},
 			},
-			{
-				text: "Construct sample data for every registry element kind",
-				status: "doing",
-				protected: true,
-			},
-			{ text: "Run tsgo, biome, and the vlist test suite", status: "todo" },
 		],
 	},
 };
@@ -374,24 +383,33 @@ const TOOL_CALL_ASK: ToolCallData = {
 	category: "ask",
 	status: "success",
 	detail: {
-		kind: "ask",
-		questions: [
+		kind: "sections",
+		sections: [
 			{
-				// Single question → the card header already shows this text.
-				header: "Which flow mode should be the default for new projects?",
-				omitHeader: true,
-				options: [
-					{
-						label: "Classic canvas",
-						description: "Interactive React Flow story-network graph with drag, context menus.",
-					},
-					{
-						label: "Ruler timeline",
-						description: "Linear chronological view of chapters.",
-						selected: true,
-					},
-				],
-				answer: "Answer: Ruler timeline",
+				key: "question",
+				body: {
+					kind: "ask",
+					questions: [
+						{
+							// Single question → the card header already shows this text.
+							header: "Which flow mode should be the default for new projects?",
+							omitHeader: true,
+							options: [
+								{
+									label: "Classic canvas",
+									description:
+										"Interactive React Flow story-network graph with drag, context menus.",
+								},
+								{
+									label: "Ruler timeline",
+									description: "Linear chronological view of chapters.",
+									selected: true,
+								},
+							],
+							answer: "Answer: Ruler timeline",
+						},
+					],
+				},
 			},
 		],
 	},
@@ -401,7 +419,14 @@ const TOOL_CALL_BASH: ToolCallData = {
 	summary: "bun test frontend/components/narrator/vlist/",
 	category: "bash",
 	status: "success",
-	detail: { kind: "generic", inputLines: 1, outputLines: 6 },
+	detail: classifyToolDetail({
+		previewId: "vlist-harness-bash",
+		toolName: "Bash",
+		category: "bash",
+		status: "success",
+		inputJson: { command: "bun test frontend/components/narrator/vlist/" },
+		outputJson: { _text: "1 pass\n2 pass\n3 pass\n4 pass\n5 pass\n6 pass" },
+	}),
 };
 const TOOL_CALL_GROUP: ToolCallData[] = [
 	{ toolName: "read", summary: "measure-tool-call.ts", category: "read", status: "success" },
@@ -441,6 +466,19 @@ const SUBAGENT_DATA: SubagentCardData = {
 	hasRecentCallsButton: true,
 	promptOpen: true,
 };
+const subagentDetail = classifyToolDetail({
+	previewId: "vlist-harness-subagent",
+	toolName: "Agent",
+	category: "agent",
+	status: "success",
+	inputJson: { prompt: SUBAGENT_DATA.prompt },
+	outputJson: { _text: SUBAGENT_DATA.resultText },
+});
+for (const section of subagentDetail?.sections ?? []) {
+	if (section.body.kind !== "capped") continue;
+	if (section.body.source === "input.prompt") SUBAGENT_DATA.promptBody = section.body;
+	if (section.body.source === "output.main") SUBAGENT_DATA.resultBody = section.body;
+}
 const SUBAGENT_RECENT_CALLS = ["read registry.ts", "grep measureElement"];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -881,7 +919,6 @@ const HARNESS_CASES: HarnessCase[] = [
 				agentType={SUBAGENT_DATA.agentType}
 				model={SUBAGENT_DATA.model}
 				reasoningEffort={SUBAGENT_DATA.reasoningEffort}
-				promptText={SUBAGENT_DATA.prompt}
 				recentCallNames={SUBAGENT_RECENT_CALLS}
 				isActive={false}
 			/>

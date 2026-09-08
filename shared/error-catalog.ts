@@ -126,6 +126,21 @@ export const ERROR_CATALOG = {
 		code: "GIT_AUTH_REQUIRED",
 		en: "Git authentication required",
 	},
+	GIT_TREE_MERGE_FAILED: {
+		status: 422,
+		code: "GIT_ERROR",
+		en: "Git tree merge failed: {detail}",
+	},
+	GIT_TREE_MERGE_FALLBACK_FAILED: {
+		status: 422,
+		code: "GIT_ERROR",
+		en: "Git {version} does not support {feature}. An automatic compatibility merge in a temporary directory was attempted but failed: {detail}. Check your Git installation and the temporary directory's permissions and available space, or install Git 2.40+ (for example, install it separately and add it to the server's PATH).",
+	},
+	GIT_TREE_MERGE_CONFLICTS_UNLISTED: {
+		status: 422,
+		code: "GIT_ERROR",
+		en: "Merge conflicts were detected, but their full scope or resolution cannot be verified automatically. Automatic application was refused. Resolve the conflicts manually.",
+	},
 	MERGE_DIRTY_SOURCE: {
 		status: 400,
 		code: "VALIDATION_ERROR",

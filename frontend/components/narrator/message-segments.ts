@@ -4,6 +4,8 @@
  * without any grouping / splitting logic of its own.
  */
 
+import type { FileReferenceContext } from "@shared/file-reference";
+import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import { isEmptyReasoningBlock } from "@shared/reasoning-content";
 import type { ContentBlock, NarratorMsg, ToolCallRow } from "./narrator-panel-types";
 import type { ToolCallData } from "./tool-call-data";
@@ -61,7 +63,7 @@ export type RenderSegment =
 function isVisibleContentBlock(b: ContentBlock): boolean {
 	if (b.type === "text") return !!b.text?.trim();
 	if (b.type === "image") return true;
-	if (b.type === "text_file") return true;
+	if (b.type === "text_file" || b.type === "file_reference") return true;
 	if (b.type === "web_search") return true;
 	if (b.type === "image_generation") return true;
 	if (b.type === "reasoning" || b.type === "thinking") return !isEmptyReasoningBlock(b);
@@ -444,7 +446,13 @@ export type StreamingBlock =
 			height?: number;
 			outputIndex?: number;
 	  }
-	| { type: "text"; text: string; outputIndex?: number };
+	| {
+			type: "text";
+			text: string;
+			id?: string;
+			outputIndex?: number;
+			fileReferenceContext?: FileReferenceContext | null;
+	  };
 
 /** Read a streaming block's provider output index, if any. */
 export function getStreamingBlockOutputIndex(block: StreamingBlock): number | undefined {
@@ -579,6 +587,9 @@ function findMatchingStreamingBlockIndex(
 			return !b.id && getStreamingBlockOutputIndex(b) == null;
 		});
 	}
+	if (incoming.type === "text" && incoming.id) {
+		return blocks.findIndex((b) => b.type === "text" && b.id === incoming.id);
+	}
 	// text — prefer the provider output index, but legacy/providers without one
 	// still keep a single live text block that must merge with a reconnect snapshot
 	// instead of being inserted again and rendered twice.
@@ -619,6 +630,19 @@ export function mergeStreamingSnapshotBlocks(
 			(existing.type === "text" && incoming.type === "text") ||
 			(existing.type === "reasoning" && incoming.type === "reasoning")
 		) {
+			// A legacy/missed first delta may have no provenance. Only fill an absent
+			// field from the server snapshot; explicit null never falls back to live defaults.
+			if (
+				existing.type === "text" &&
+				incoming.type === "text" &&
+				existing.fileReferenceContext === undefined &&
+				incoming.fileReferenceContext !== undefined
+			) {
+				existing.fileReferenceContext = normalizeFileReferenceContext(
+					incoming.fileReferenceContext,
+				);
+				changed = true;
+			}
 			// Keep whichever text is longer so a late snapshot cannot truncate live text.
 			if (incoming.text.length > existing.text.length) {
 				existing.text = incoming.text;
@@ -697,9 +721,12 @@ export function buildStreamingMsg(opts: {
 			} else if (sb.type === "text") {
 				blocks.push({
 					type: "text",
-					id: `streaming:text:${index}`,
+					id: sb.id ?? `streaming:text:${index}`,
 					text: sb.text,
 					outputIndex: sb.outputIndex,
+					...(sb.fileReferenceContext !== undefined
+						? { fileReferenceContext: normalizeFileReferenceContext(sb.fileReferenceContext) }
+						: {}),
 				} as ContentBlock);
 			}
 		}

@@ -203,6 +203,7 @@ describe("selectRecoverableToolCalls — Await", () => {
 
 describe("selectRecoveryCardCandidates", () => {
 	const nowMs = Date.parse("2026-04-01T12:00:00.000Z");
+	const turnStartedAtMs = nowMs - 120_000;
 
 	function cardSubagent(
 		overrides: Partial<RecoveryCardSubagentInput> = {},
@@ -215,6 +216,8 @@ describe("selectRecoveryCardCandidates", () => {
 			title: "Investigate flaky test",
 			subagentType: "explore",
 			errorMessage: "provider timeout",
+			backgroundStatus: "failed",
+			backgroundCompletedAt: new Date(nowMs - 60_000).toISOString(),
 			createdAt: new Date(nowMs - 60_000).toISOString(),
 			updatedAt: new Date(nowMs - 60_000).toISOString(),
 			originToolUseId: "a-old",
@@ -223,7 +226,7 @@ describe("selectRecoveryCardCandidates", () => {
 	}
 
 	test("includes a recent background subagent tagged error", () => {
-		const candidates = selectRecoveryCardCandidates([cardSubagent()], { nowMs });
+		const candidates = selectRecoveryCardCandidates([cardSubagent()], { turnStartedAtMs });
 		expect(candidates).toHaveLength(1);
 		expect(candidates[0]).toMatchObject({
 			id: "sub-1",
@@ -233,29 +236,52 @@ describe("selectRecoveryCardCandidates", () => {
 		});
 	});
 
-	test("excludes subagents that failed outside the 24h window", () => {
-		const old = cardSubagent({ updatedAt: new Date(nowMs - 25 * 60 * 60 * 1000).toISOString() });
-		expect(selectRecoveryCardCandidates([old], { nowMs })).toEqual([]);
-		const edge = cardSubagent({
-			updatedAt: new Date(nowMs - 24 * 60 * 60 * 1000 + 1).toISOString(),
+	test("does not resurrect legacy failures when only metadata was updated", () => {
+		const old = cardSubagent({
+			backgroundCompletedAt: null,
+			createdAt: new Date(nowMs - 30 * 60 * 60 * 1000).toISOString(),
+			updatedAt: new Date(nowMs - 1_000).toISOString(),
 		});
-		expect(selectRecoveryCardCandidates([edge], { nowMs })).toHaveLength(1);
+		expect(selectRecoveryCardCandidates([old], { turnStartedAtMs })).toEqual([]);
 	});
 
-	// The bug this replaced: the window was applied to the SPAWN time, so a long
-	// session listed subagents that had died hours earlier as if they were fresh.
-	test("uses the failure time, not the spawn time, for the window", () => {
+	test("does not re-offer a legacy failure after an alias write advances updatedAt", () => {
+		const failedMs = nowMs - 60_000;
+		const old = cardSubagent({
+			backgroundCompletedAt: new Date(failedMs).toISOString(),
+			createdAt: new Date(failedMs).toISOString(),
+			updatedAt: new Date(nowMs - 1_000).toISOString(),
+			traits: [buildRecoveryOfferedTrait(failedMs)],
+		});
+		expect(selectRecoveryCardCandidates([old], { turnStartedAtMs })).toEqual([]);
+	});
+
+	test("includes failures during a parent turn lasting longer than 24 hours", () => {
+		const longTurnStartedAtMs = nowMs - 48 * 60 * 60 * 1000;
+		const duringTurn = cardSubagent({
+			backgroundCompletedAt: new Date(nowMs - 30 * 60 * 60 * 1000).toISOString(),
+		});
+		expect(
+			selectRecoveryCardCandidates([duringTurn], { turnStartedAtMs: longTurnStartedAtMs }),
+		).toHaveLength(1);
+	});
+
+	test("uses the failure time, not the spawn time, for the parent turn boundary", () => {
 		const spawnedRecentlyFailedLongAgo = cardSubagent({
 			createdAt: new Date(nowMs - 60_000).toISOString(),
-			updatedAt: new Date(nowMs - 30 * 60 * 60 * 1000).toISOString(),
+			backgroundCompletedAt: new Date(nowMs - 30 * 60 * 60 * 1000).toISOString(),
 		});
-		expect(selectRecoveryCardCandidates([spawnedRecentlyFailedLongAgo], { nowMs })).toEqual([]);
+		expect(
+			selectRecoveryCardCandidates([spawnedRecentlyFailedLongAgo], { turnStartedAtMs }),
+		).toEqual([]);
 
 		const spawnedLongAgoFailedJustNow = cardSubagent({
 			createdAt: new Date(nowMs - 30 * 60 * 60 * 1000).toISOString(),
-			updatedAt: new Date(nowMs - 10_000).toISOString(),
+			backgroundCompletedAt: new Date(nowMs - 10_000).toISOString(),
 		});
-		expect(selectRecoveryCardCandidates([spawnedLongAgoFailedJustNow], { nowMs })).toHaveLength(1);
+		expect(
+			selectRecoveryCardCandidates([spawnedLongAgoFailedJustNow], { turnStartedAtMs }),
+		).toHaveLength(1);
 	});
 
 	// A card is about the turn that just failed. Failures from turns the parent
@@ -263,34 +289,65 @@ describe("selectRecoveryCardCandidates", () => {
 	test("excludes failures that predate the failing turn", () => {
 		const turnStartedAtMs = nowMs - 120_000;
 		const beforeTurn = cardSubagent({
-			updatedAt: new Date(turnStartedAtMs - 1).toISOString(),
+			backgroundCompletedAt: new Date(turnStartedAtMs - 1).toISOString(),
 		});
-		expect(selectRecoveryCardCandidates([beforeTurn], { nowMs, turnStartedAtMs })).toEqual([]);
+		expect(selectRecoveryCardCandidates([beforeTurn], { turnStartedAtMs })).toEqual([]);
 
 		const duringTurn = cardSubagent({
-			updatedAt: new Date(turnStartedAtMs + 1_000).toISOString(),
+			backgroundCompletedAt: new Date(turnStartedAtMs + 1_000).toISOString(),
 		});
-		expect(selectRecoveryCardCandidates([duringTurn], { nowMs, turnStartedAtMs })).toHaveLength(1);
+		expect(selectRecoveryCardCandidates([duringTurn], { turnStartedAtMs })).toHaveLength(1);
 	});
 
-	test("falls back to the 24h window when the turn start is unknown", () => {
-		const recent = cardSubagent({ updatedAt: new Date(nowMs - 60_000).toISOString() });
-		expect(selectRecoveryCardCandidates([recent], { nowMs, turnStartedAtMs: null })).toHaveLength(
-			1,
-		);
-		expect(
-			selectRecoveryCardCandidates([recent], { nowMs, turnStartedAtMs: Number.NaN }),
-		).toHaveLength(1);
+	test("includes a failure exactly at the parent turn start", () => {
+		const atBoundary = cardSubagent({
+			backgroundCompletedAt: new Date(turnStartedAtMs).toISOString(),
+		});
+		expect(selectRecoveryCardCandidates([atBoundary], { turnStartedAtMs })).toHaveLength(1);
 	});
 
-	test("falls back to createdAt when updatedAt is missing or unparseable", () => {
-		const noUpdatedAt = cardSubagent({ updatedAt: null });
-		expect(selectRecoveryCardCandidates([noUpdatedAt], { nowMs })).toHaveLength(1);
-		const badUpdatedAt = cardSubagent({
-			updatedAt: "not-a-date",
-			createdAt: new Date(nowMs - 30 * 60 * 60 * 1000).toISOString(),
+	test("requires a known finite parent turn start", () => {
+		const recent = cardSubagent();
+		expect(selectRecoveryCardCandidates([recent], {})).toEqual([]);
+		for (const boundary of [undefined, null, Number.NaN, Infinity, -Infinity]) {
+			expect(selectRecoveryCardCandidates([recent], { turnStartedAtMs: boundary })).toEqual([]);
+		}
+	});
+
+	test("creation, update, and subagent turn start timestamps do not prove a failure", () => {
+		const recent = new Date(nowMs - 10_000).toISOString();
+		for (const timestamps of [
+			{ createdAt: recent },
+			{ updatedAt: recent },
+			{ turnStartedAt: recent },
+			{ createdAt: recent, updatedAt: recent, turnStartedAt: recent },
+		]) {
+			const noFailureTime = cardSubagent({
+				backgroundCompletedAt: null,
+				createdAt: "not-a-date",
+				updatedAt: null,
+				turnStartedAt: null,
+				...timestamps,
+			});
+			expect(selectRecoveryCardCandidates([noFailureTime], { turnStartedAtMs })).toEqual([]);
+		}
+	});
+
+	test("ignores background completion unless the background status is failed", () => {
+		for (const backgroundStatus of [undefined, null, "pending", "running", "completed"]) {
+			const notFailed = cardSubagent({ backgroundStatus });
+			expect(selectRecoveryCardCandidates([notFailed], { turnStartedAtMs })).toEqual([]);
+		}
+	});
+
+	test("admits a foreground failure using its pause marker", () => {
+		const foreground = cardSubagent({
+			isBackground: false,
+			backgroundStatus: null,
+			backgroundCompletedAt: null,
+			substatus: JSON.stringify(["error", `${TURN_PAUSE_STARTED_MS_PREFIX}${turnStartedAtMs}`]),
 		});
-		expect(selectRecoveryCardCandidates([badUpdatedAt], { nowMs })).toEqual([]);
+		expect(selectRecoveryCardCandidates([foreground], { turnStartedAtMs })).toHaveLength(1);
 	});
 
 	// Otherwise every subsequent narrator error re-proposes the same dead subagents.
@@ -300,46 +357,50 @@ describe("selectRecoveryCardCandidates", () => {
 			updatedAt: new Date(failedAtMs).toISOString(),
 			traits: [buildRecoveryOfferedTrait(failedAtMs)],
 		});
-		expect(selectRecoveryCardCandidates([offered], { nowMs })).toEqual([]);
+		expect(selectRecoveryCardCandidates([offered], { turnStartedAtMs })).toEqual([]);
 	});
 
 	test("re-offers a subagent that failed again after being resumed", () => {
 		const offered = cardSubagent({
-			updatedAt: new Date(nowMs - 10_000).toISOString(),
+			backgroundCompletedAt: new Date(nowMs - 10_000).toISOString(),
 			traits: [buildRecoveryOfferedTrait(nowMs - 60_000)],
 		});
-		expect(selectRecoveryCardCandidates([offered], { nowMs })).toHaveLength(1);
+		expect(selectRecoveryCardCandidates([offered], { turnStartedAtMs })).toHaveLength(1);
 	});
 
 	test("ignores unrelated traits and malformed watermarks", () => {
 		const noisy = cardSubagent({
 			traits: ["background", `${RECOVERY_OFFERED_TRAIT_PREFIX}not-a-number`],
 		});
-		expect(selectRecoveryCardCandidates([noisy], { nowMs })).toHaveLength(1);
+		expect(selectRecoveryCardCandidates([noisy], { turnStartedAtMs })).toHaveLength(1);
 	});
 
 	test("requires an error tag parsed from JSON, not substring matching", () => {
-		expect(selectRecoveryCardCandidates([cardSubagent({ substatus: "[]" })], { nowMs })).toEqual(
-			[],
-		);
 		expect(
-			selectRecoveryCardCandidates([cardSubagent({ substatus: '["errors_ignored"]' })], { nowMs }),
+			selectRecoveryCardCandidates([cardSubagent({ substatus: "[]" })], { turnStartedAtMs }),
 		).toEqual([]);
 		expect(
-			selectRecoveryCardCandidates([cardSubagent({ substatus: '["unread","error"]' })], { nowMs }),
+			selectRecoveryCardCandidates([cardSubagent({ substatus: '["errors_ignored"]' })], {
+				turnStartedAtMs,
+			}),
+		).toEqual([]);
+		expect(
+			selectRecoveryCardCandidates([cardSubagent({ substatus: '["unread","error"]' })], {
+				turnStartedAtMs,
+			}),
 		).toHaveLength(1);
 	});
 
 	test("excludes subagents that are not settled", () => {
-		expect(selectRecoveryCardCandidates([cardSubagent({ status: "working" })], { nowMs })).toEqual(
-			[],
-		);
+		expect(
+			selectRecoveryCardCandidates([cardSubagent({ status: "working" })], { turnStartedAtMs }),
+		).toEqual([]);
 	});
 
 	test("includes earlier-turn foreground subagents and flags them for detaching", () => {
 		const candidates = selectRecoveryCardCandidates(
 			[cardSubagent({ isBackground: false, originToolUseId: "a-old" })],
-			{ nowMs, latestTurnToolUseIds: new Set(["a-latest"]) },
+			{ turnStartedAtMs, latestTurnToolUseIds: new Set(["a-latest"]) },
 		);
 		expect(candidates).toHaveLength(1);
 		expect(candidates[0].wasForeground).toBe(true);
@@ -349,7 +410,7 @@ describe("selectRecoveryCardCandidates", () => {
 	test("excludes a foreground subagent owned by the latest turn", () => {
 		const candidates = selectRecoveryCardCandidates(
 			[cardSubagent({ isBackground: false, originToolUseId: "a-latest" })],
-			{ nowMs, latestTurnToolUseIds: new Set(["a-latest"]) },
+			{ turnStartedAtMs, latestTurnToolUseIds: new Set(["a-latest"]) },
 		);
 		expect(candidates).toEqual([]);
 	});
@@ -357,7 +418,7 @@ describe("selectRecoveryCardCandidates", () => {
 	test("still lists a background subagent even when its origin is on the latest turn", () => {
 		const candidates = selectRecoveryCardCandidates(
 			[cardSubagent({ isBackground: true, originToolUseId: "a-latest" })],
-			{ nowMs, latestTurnToolUseIds: new Set(["a-latest"]) },
+			{ turnStartedAtMs, latestTurnToolUseIds: new Set(["a-latest"]) },
 		);
 		expect(candidates).toHaveLength(1);
 	});
@@ -365,45 +426,79 @@ describe("selectRecoveryCardCandidates", () => {
 	test("falls back to the id and a default type when metadata is missing", () => {
 		const candidates = selectRecoveryCardCandidates(
 			[cardSubagent({ title: "   ", subagentType: null })],
-			{ nowMs },
+			{ turnStartedAtMs },
 		);
 		expect(candidates[0]).toMatchObject({ title: "sub-1", subagentType: "general" });
 	});
 
-	test("ignores subagents with no usable timestamp at all", () => {
-		expect(
-			selectRecoveryCardCandidates([cardSubagent({ createdAt: "not-a-date", updatedAt: null })], {
-				nowMs,
-			}),
-		).toEqual([]);
+	test("ignores subagents with no usable failure timestamp", () => {
+		for (const backgroundCompletedAt of [undefined, null, "not-a-date"]) {
+			expect(
+				selectRecoveryCardCandidates([cardSubagent({ backgroundCompletedAt })], {
+					turnStartedAtMs,
+				}),
+			).toEqual([]);
+		}
 	});
 });
 
 describe("recovery offer watermark", () => {
-	test("recoveryFailureTimeMs prefers updatedAt and falls back to createdAt", () => {
-		const created = "2026-04-01T10:00:00.000Z";
-		const updated = "2026-04-01T11:00:00.000Z";
-		expect(
-			recoveryFailureTimeMs({
-				id: "s",
-				status: "idle",
-				createdAt: created,
-				updatedAt: updated,
-			}),
-		).toBe(Date.parse(updated));
-		expect(
-			recoveryFailureTimeMs({ id: "s", status: "idle", createdAt: created, updatedAt: null }),
-		).toBe(Date.parse(created));
-		expect(
-			recoveryFailureTimeMs({ id: "s", status: "idle", createdAt: "nope", updatedAt: "nope" }),
-		).toBeNull();
+	test("recoveryFailureTimeMs accepts valid completion evidence only for failed background work", () => {
+		const completedAt = "2026-04-01T10:00:00.000Z";
+		for (const backgroundStatus of ["failed", undefined, null, "pending", "running", "completed"]) {
+			expect(
+				recoveryFailureTimeMs({
+					id: "s",
+					status: "idle",
+					createdAt: completedAt,
+					backgroundStatus,
+					backgroundCompletedAt: completedAt,
+				}),
+			).toBe(backgroundStatus === "failed" ? Date.parse(completedAt) : null);
+		}
+		for (const backgroundCompletedAt of [undefined, null, "not-a-date"]) {
+			expect(
+				recoveryFailureTimeMs({
+					id: "s",
+					status: "idle",
+					createdAt: completedAt,
+					backgroundStatus: "failed",
+					backgroundCompletedAt,
+				}),
+			).toBeNull();
+		}
 	});
 
-	// `updatedAt` is only an upper bound: ANY later write to the row (title sync, a user
-	// editing custom traits, subagent-alias persistence, subagent-detach's `background`
-	// tagging) pushes it forward, which would resurrect an hours-old failure into the 24h
-	// window. The `turn_pause_started_ms:` tag is written by the same updateStatus call
-	// that tags `error` and is touched by nothing else, so it wins.
+	test("recoveryFailureTimeMs never falls back to metadata or the subagent turn start", () => {
+		const timestamp = "2026-04-01T11:00:00.000Z";
+		for (const timestamps of [
+			{ createdAt: timestamp },
+			{ updatedAt: timestamp },
+			{ turnStartedAt: timestamp },
+			{ createdAt: timestamp, updatedAt: timestamp, turnStartedAt: timestamp },
+			{ createdAt: "nope", updatedAt: "nope", turnStartedAt: "nope" },
+		]) {
+			expect(
+				recoveryFailureTimeMs({ id: "s", status: "idle", createdAt: "not-a-date", ...timestamps }),
+			).toBeNull();
+		}
+	});
+
+	test("recoveryFailureTimeMs rejects malformed pause markers without fallback evidence", () => {
+		for (const marker of ["not-a-number", "NaN", "Infinity"]) {
+			expect(
+				recoveryFailureTimeMs({
+					id: "s",
+					status: "idle",
+					substatus: JSON.stringify(["error", `${TURN_PAUSE_STARTED_MS_PREFIX}${marker}`]),
+					createdAt: "2026-04-01T11:00:00.000Z",
+				}),
+			).toBeNull();
+		}
+	});
+
+	// Metadata writes can happen after a failure, even during a later parent turn.
+	// Only the pause marker or failed background completion proves when it happened.
 	test("recoveryFailureTimeMs prefers the substatus timing tag over a polluted updatedAt", () => {
 		const failedAtMs = Date.parse("2026-04-01T02:00:00.000Z");
 		const pollutedUpdatedAt = "2026-04-01T11:59:00.000Z";
@@ -418,9 +513,10 @@ describe("recovery offer watermark", () => {
 		).toBe(failedAtMs);
 	});
 
-	test("a stale failure stays out of the window even when updatedAt was pushed forward", () => {
+	test("a failure before the parent turn stays excluded after updatedAt is pushed forward", () => {
 		const nowMs = Date.parse("2026-04-01T12:00:00.000Z");
-		const failedAtMs = nowMs - 30 * 60 * 60 * 1000;
+		const turnStartedAtMs = nowMs - 120_000;
+		const failedAtMs = turnStartedAtMs - 1;
 		const touchedAfterFailing: RecoveryCardSubagentInput = {
 			id: "sub-stale",
 			status: "idle",
@@ -433,7 +529,7 @@ describe("recovery offer watermark", () => {
 			// Simulates a later title/trait/alias write touching the row.
 			updatedAt: new Date(nowMs - 1_000).toISOString(),
 		};
-		expect(selectRecoveryCardCandidates([touchedAfterFailing], { nowMs })).toEqual([]);
+		expect(selectRecoveryCardCandidates([touchedAfterFailing], { turnStartedAtMs })).toEqual([]);
 	});
 
 	test("parses the newest watermark and ignores malformed ones", () => {
@@ -484,10 +580,8 @@ describe("the watermark never reaches a client", () => {
 	});
 });
 
-// If someone "fixes" markRecoveryOffered to also write updatedAt (as every other
-// narrators update does), the recorded failure time jumps to the moment the card was
-// offered, `failedMs <= offeredAtMs` stops holding for the rows just watermarked, and the
-// next narrator error re-proposes the same dead subagents. Nothing else would catch that.
+// Offering a recovery card is not new activity. Keep metadata timestamps unchanged,
+// even though the selector no longer trusts updatedAt as proof of a new failure.
 describe("buildRecoveryOfferedUpdate must not touch updatedAt", () => {
 	test("patches traits only — no updatedAt, no other column", () => {
 		const patch = buildRecoveryOfferedUpdate(["background"], 1_700_000_000_000);

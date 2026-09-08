@@ -147,6 +147,33 @@ describe("measureReviewCard — header chrome is height-neutral", () => {
 });
 
 describe("measureReviewCard — the render contract", () => {
+	it.each([
+		{ name: "short", text: APPROVED, textTruncated: false },
+		{ name: "long", text: findings(200), textTruncated: false },
+		{ name: "truncated", text: APPROVED, textTruncated: true },
+		{ name: "empty preview", text: "", textTruncated: true },
+	])("uses helper height/frame directly for $name content", async (data) => {
+		const { measureReviewCard, REVIEW_CARD_PADDING, REVIEW_CARD_BORDER, REVIEW_BODY_CAP } =
+			await import("./measure-review-card");
+		const { measureMarkdownDetail } = await import("./measure-tool-call");
+		for (const width of [360, 800]) {
+			const innerWidth = width - (REVIEW_CARD_PADDING + REVIEW_CARD_BORDER) * 2;
+			const detail = measureMarkdownDetail(
+				data.text,
+				REVIEW_BODY_CAP,
+				innerWidth,
+				undefined,
+				data.textTruncated,
+			);
+			const card = measureReviewCard({ ...data, verdictLabel: "Approved" }, width);
+			expect(card.bodyHeight).toBe(detail.height);
+			expect(card.frame).toEqual(detail.frame);
+			expect(card.blocks).toEqual(detail.blocks);
+			expect(card.contentWidth).toBe(detail.contentWidth);
+			expect(card.frame.blocks.every((block) => block.top >= 0)).toBe(true);
+		}
+	});
+
 	it("reports the body's own offset and the width it was wrapped at", async () => {
 		const { measureReviewCard, reviewCardChrome, REVIEW_HEADER_GAP } = await import(
 			"./measure-review-card"
@@ -163,10 +190,9 @@ describe("measureReviewCard — the render contract", () => {
 		expect(r.usedWidth).toBe(640);
 	});
 
-	it("re-bases the frame onto the box, so the render copy paints from zero", async () => {
-		// The measured tops carry the tool card's leading margin; this card supplies that gap
-		// itself, so leaving it in would stack two gaps and push the first block out of the
-		// box it was measured for.
+	it("keeps the local frame so the render copy paints from zero", async () => {
+		// The helper already removed the outer gap. Rebasing it again would move the
+		// first block to -10 and shave the same ten pixels from every capped box.
 		const { measureReviewCard } = await import("./measure-review-card");
 		const r = measureReviewCard({ text: findings(3), verdictLabel: "x" }, 800);
 		expect(r.frame.blocks[0]?.top).toBe(0);

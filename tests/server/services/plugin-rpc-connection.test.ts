@@ -119,6 +119,68 @@ describe("PluginRpcConnection", () => {
 		await connection.close();
 	});
 
+	it("sends a long outbound request without enlarging the inbound frame limit", async () => {
+		const transport = new MemoryTransport();
+		const connection = new PluginRpcConnection({
+			transport,
+			maxFrameBytes: 1024,
+			maxOutboundFrameBytes: 12 * 1024 * 1024,
+		});
+		transport.onSend = (message) => {
+			if ("id" in message && message.id !== undefined)
+				transport.emit(responseFor(message.id, true));
+		};
+		try {
+			// Exceeds both the old 1 MiB frame limit and the old 8 MiB writer budget.
+			await expect(
+				connection.request("provider.chat", {
+					history: Array.from({ length: 20 }, () => ({
+						role: "user",
+						text: "x".repeat(512 * 1024),
+					})),
+				}),
+			).resolves.toMatchObject({ result: true });
+			expect(connection.getLimits().maxInboundFrameBytes).toBe(1024);
+			expect(connection.getLimits().maxQueuedBytes).toBeGreaterThan(12 * 1024 * 1024);
+			transport.emit(notification("too-large", { text: "x".repeat(2048) }));
+			await eventually(() => connection.isClosed);
+		} finally {
+			await connection.close();
+		}
+	});
+
+	it("measures full UTF-8 outbound frames and keeps a rejected connection usable", async () => {
+		const transport = new MemoryTransport();
+		const text = "界".repeat(30);
+		const max = Buffer.byteLength(
+			JSON.stringify({ jsonrpc: "2.0", id: "cap", method: "echo", params: { text } }),
+		);
+		const connection = new PluginRpcConnection({
+			transport,
+			maxFrameBytes: 64,
+			maxOutboundFrameBytes: max,
+		});
+		transport.onSend = (message) => {
+			if ("id" in message && message.id !== undefined)
+				transport.emit(responseFor(message.id, true));
+		};
+		try {
+			await expect(connection.request("echo", { text }, { id: "cap" })).resolves.toMatchObject({
+				result: true,
+			});
+			await expect(
+				connection.request("echo", { text: `${text}界` }, { id: "cap" }),
+			).rejects.toMatchObject({ code: "OUTBOUND_FRAME_LIMIT" });
+			expect(connection.isClosed).toBe(false);
+			expect(connection.outboundPending.size).toBe(0);
+			await expect(
+				connection.request("echo", { text: "ok" }, { id: "cap" }),
+			).resolves.toMatchObject({ result: true });
+		} finally {
+			await connection.close();
+		}
+	});
+
 	it("removes outbound pending state when the bounded queue rejects a request", async () => {
 		const transport = new MemoryTransport();
 		const connection = new PluginRpcConnection({

@@ -347,6 +347,10 @@ export interface CreateNarratorInput {
 }
 
 interface CreateSubagentInput {
+	/** Immutable source Agent row; omitted only for non-tool/legacy creation paths. */
+	originToolCallId?: string;
+	/** Only trusted non-tool creation paths may explicitly declare standalone provenance. */
+	subagentOriginKind?: "standalone";
 	parentNarratorId: string;
 	subagentType: string;
 	cwd: string;
@@ -1065,14 +1069,19 @@ export async function handleBashCommand(
 			durationMs,
 		})
 		.where(eq(narratorMessages.id, assistantMsgId));
-	await narratorService.updateToolCallResult(toolUseId, {
-		output: persistedOutput,
-		status,
-		errorMessage: result.isError ? result.output : undefined,
-		durationMs,
-		executionStartedAt: streamStartedAt,
-		completedAt,
-	});
+	await narratorService.updateToolCallResult(
+		toolUseId,
+		{
+			output: persistedOutput,
+			status,
+			errorMessage: result.isError ? result.output : undefined,
+			durationMs,
+			executionStartedAt: streamStartedAt,
+			completedAt,
+		},
+		assistantMsgId,
+		toolCallId,
+	);
 
 	broadcastToNarrator(narratorId, {
 		type: "tool_completed",
@@ -1405,10 +1414,39 @@ export const narratorService = {
 	},
 
 	async createSubagent(input: CreateSubagentInput) {
+		if (input.subagentOriginKind === "standalone" && input.originToolCallId != null) {
+			throw new ValidationError("Standalone subagents cannot have an Agent tool-call origin");
+		}
 		const parent = await this.getById(input.parentNarratorId);
 
 		if (isSubagentVariant(parent.variant)) {
 			throw new ValidationError("Subagents cannot spawn nested subagents");
+		}
+		if (input.originToolCallId != null) {
+			const origin = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.id, input.originToolCallId),
+				columns: {
+					narratorId: true,
+					toolUseId: true,
+					toolName: true,
+					status: true,
+					executionAttempt: true,
+					executionStartedAt: true,
+				},
+			});
+			if (
+				!origin ||
+				origin.narratorId !== input.parentNarratorId ||
+				origin.toolName !== "Agent" ||
+				origin.status !== "running" ||
+				!origin.executionStartedAt
+			) {
+				throw new ValidationError("Subagent origin must be its parent's executing Agent row");
+			}
+			await narratorPersistence.validateToolCallBinding(input.parentNarratorId, origin.toolUseId, {
+				toolCallId: input.originToolCallId,
+				attempt: origin.executionAttempt,
+			});
 		}
 
 		const now = new Date().toISOString();
@@ -1473,6 +1511,9 @@ export const narratorService = {
 				behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 				behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 				parentNarratorId: input.parentNarratorId,
+				originToolCallId: input.originToolCallId ?? null,
+				subagentOriginKind:
+					input.originToolCallId != null ? "tool" : (input.subagentOriginKind ?? null),
 				cwd: input.cwd,
 				defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
 				// A subagent is part of its parent's work, so its access is DELEGATED to the
@@ -1646,6 +1687,7 @@ export const narratorService = {
 		options?: {
 			images?: ImageRef[];
 			textFiles?: TextFileRef[];
+			fileReferences?: import("@shared/file-reference").FileReferenceSnapshot[];
 			commandText?: string | null;
 			createdBy?: string | null;
 			origin?: MessageOriginOptions;
@@ -1660,6 +1702,7 @@ export const narratorService = {
 			| { type: "text"; text: string }
 			| PersistedUserImageBlock
 			| { type: "text_file"; filename: string; size: number; filePath: string }
+			| import("@shared/file-reference").FileReferenceSnapshot
 		> = [];
 		for (const image of options?.images ?? []) {
 			contentJson.push(imageRefToContentBlock(image));
@@ -1672,6 +1715,7 @@ export const narratorService = {
 				filePath: file.filePath,
 			});
 		}
+		contentJson.push(...(options?.fileReferences ?? []));
 		contentJson.push({ type: "text", text });
 		const effectiveText =
 			(!text.trim() && (options?.images?.length ?? 0) > 0 ? "[user sent image(s)]" : text) +
@@ -1935,6 +1979,8 @@ export const narratorService = {
 			tx.delete(narrators).where(eq(narrators.id, narratorId)).run();
 			return transition;
 		});
+		// FK cascades remove durable questions without emitting their own lifecycle frames.
+		eventBus.emit({ type: "human_attention:changed" });
 		if (bindingTransition) {
 			await integrationResourceBindingService.recordTransitionAudit(
 				"resource_binding.delete",
@@ -2776,6 +2822,8 @@ export const narratorService = {
 	getMessageLocation: narratorMessageQueries.getMessageLocation.bind(narratorMessageQueries),
 	getMessagesAfter: narratorMessageQueries.getMessagesAfter.bind(narratorMessageQueries),
 	getToolCallDetail: narratorMessageQueries.getToolCallDetail.bind(narratorMessageQueries),
+	getToolCallPreviewMetadata:
+		narratorMessageQueries.getToolCallPreviewMetadata.bind(narratorMessageQueries),
 	getCompactSummary: narratorMessageQueries.getCompactSummary.bind(narratorMessageQueries),
 	deleteCompactMessage: narratorMessageQueries.deleteCompactMessage.bind(narratorMessageQueries),
 	deleteMessage: narratorMessageQueries.deleteMessage.bind(narratorMessageQueries),

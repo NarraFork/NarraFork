@@ -1,5 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import type { CurrentDiffView } from "../../server/services/git-current-diff-view";
+import type {
+	FileChangeActorKind,
+	FileChangeAttributionGrade,
+	FileChangeProjectionCompleteness,
+} from "../../shared/file-change-protocol";
 import { api } from "../lib/api";
+
+export type {
+	CurrentDiffFile,
+	CurrentDiffTarget,
+	CurrentDiffView,
+} from "../../server/services/git-current-diff-view";
 
 // Types
 export interface GitStatusSummary {
@@ -40,59 +52,57 @@ export interface GitStashEntry {
 	date: string;
 }
 
-export type AttributionAction = "write" | "edit" | "bash" | "external";
+export type AttributionAction = "write" | "edit" | "bash" | "external" | "human";
 
-/**
- * A contributor resolved by the server.
- *
- * Attribution spans subagents and narrators outside the current chapter, which a
- * chapter-scoped narrator list cannot name, so labels come from the API rather than being
- * looked up client-side — resolving them locally is what made most writers render as
- * "Unknown".
- */
+/** Observed subject, not an owner of the current net diff. */
 export interface AttributionActor {
-	/** Null for a change with no narrator at all (external / terminal edit). */
+	/** v1 may lose narrator subtype information together with its FK. */
+	kind: FileChangeActorKind | "narrator_unknown";
 	narratorId: string | null;
+	userId: string | null;
 	title: string | null;
 	subagentType: string | null;
 	parentTitle: string | null;
-	/** False when the narrator row no longer exists (deleted session). */
 	exists: boolean;
+	/** Null means v1 cannot distinguish missing identity from deletion. */
+	deleted: boolean | null;
+	identityKnown: boolean;
+	subjectKey?: string;
 }
 
-/** Per-file rollup of who changed a file within the requested scope. */
 export interface FileModificationGroup {
 	filePath: string;
 	changeCount: number;
 	lastChangedAt: string;
-	/** Actor of the most recent change — the one the badge names. */
+	/** Actor and action of the same latest observed event, never guessed from group flags. */
 	lastActor: AttributionActor;
-	/** Distinct actors, most recent first. */
+	lastAction: AttributionAction;
+	/** Known subjects and anonymous buckets seen in the returned row window. */
 	actors: AttributionActor[];
-	hasExternalChange: boolean;
-	/**
-	 * True when some change cannot be attributed with confidence (a shell command's
-	 * write set is not provably its own).
-	 */
-	hasImpreciseAttribution: boolean;
-	/** True when some change came from a session that has since been deleted. */
-	hasDeletedActor: boolean;
+	/** False requires a complete scan; null means absence is unverified. */
+	hasExternalChange: boolean | null;
+	hasImpreciseAttribution: boolean | null;
+	hasDeletedActor: boolean | null;
+	completeness: FileChangeProjectionCompleteness;
+	evidence: "legacy" | "v2" | "mixed";
+	attributionGrade: FileChangeAttributionGrade;
 }
 
 export interface WorkspaceModificationView {
+	source?: "history";
+	currentDiff?: CurrentDiffView;
+	/** Historical page position only; rowId is not a business ID or execution order. */
+	nextCursor?: { changedAt: string; rowId: string } | null;
 	workspacePath: string;
 	deviceId: string;
 	byFile: FileModificationGroup[];
 	hasMore: boolean;
 	actors: AttributionActor[];
-	/**
-	 * Records that actually reached the per-file rollup.
-	 *
-	 * Separates "this file has no attributable session" from "the row window ran out
-	 * before reaching this file's changes" — both render as a missing group otherwise,
-	 * and only the first is an honest "nobody wrote this".
-	 */
+	/** Post-filter observed rows, independent of whether the query was truncated. */
 	windowCount?: number;
+	completeness: FileChangeProjectionCompleteness;
+	evidence: "legacy" | "v2" | "mixed";
+	baselineStatus: "unverified";
 }
 
 // Queries
@@ -137,12 +147,9 @@ export function useGitStatus(chapterId: string | undefined | null) {
 }
 
 /**
- * Who caused the current uncommitted changes.
- *
- * `scope=uncommitted` bounds each file at its own last commit. Without it the view spans
- * the workspace's whole recorded history, which credits a file's current diff to every
- * session that ever touched it — measured on this repository: a median of 7 contributors
- * per file (up to 157) where the real answer was 1.
+ * Recent historical observations for paths in the current diff. The per-file last-commit
+ * timestamp is only a filter hint: without a verified baseline epoch/fingerprint it
+ * cannot establish which actor's changes still survive in HEAD/index/worktree.
  */
 export function useGitModifications(chapterId: string | undefined | null) {
 	return useQuery<WorkspaceModificationView>({

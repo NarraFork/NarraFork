@@ -15,8 +15,10 @@
  */
 
 import { layoutWithLines } from "@chenglou/pretext";
+import type { FileReference } from "@shared/file-reference";
 import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
 import { useId, useMemo } from "react";
+import { FileReferenceScopeProvider, useFileReferenceScope } from "../../FileReferenceScope";
 import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
 import {
 	ASSISTANT_PAD_X,
@@ -114,7 +116,9 @@ export function RenderMessageBubble({
 					paddingBlock: ASSISTANT_PAD_Y,
 				}}
 			>
-				<RenderMarkdown measured={measured} onUnknownHeight={onUnknownHeight} />
+				<FileReferenceScopeProvider value={{ context: null }}>
+					<RenderMarkdown measured={measured} onUnknownHeight={onUnknownHeight} />
+				</FileReferenceScopeProvider>
 			</div>
 		);
 	}
@@ -126,6 +130,9 @@ export function RenderMessageBubble({
 				hasHeader={hasHeader}
 				isSelf={isSelf}
 				onToggle={onToggle}
+				narratorId={narratorId}
+				onOpenAttachment={onOpenAttachment}
+				openAttachmentLabel={openAttachmentLabel}
 			/>
 		);
 	}
@@ -157,12 +164,18 @@ function CommandBubble({
 	hasHeader,
 	isSelf,
 	onToggle,
+	narratorId,
+	onOpenAttachment,
+	openAttachmentLabel,
 }: {
 	measured: MeasuredCommandBubble;
 	header?: React.ReactNode;
 	hasHeader: boolean;
 	isSelf: boolean;
 	onToggle?: () => void;
+	narratorId?: string;
+	onOpenAttachment?: (filePath: string) => void;
+	openAttachmentLabel?: string;
 }) {
 	const bodyBlock = measured.blocks.find((block) => block.kind === "code") as
 		| PreparedCodeBlock
@@ -207,6 +220,23 @@ function CommandBubble({
 						{header}
 					</div>
 				) : null}
+				{measured.blocks.map((block, index) => {
+					if (block.kind !== "fixed" || !block.tag.startsWith("user-")) return null;
+					const frame = measured.frame.blocks[index];
+					if (!frame) return null;
+					return (
+						<UserAttachmentView
+							// biome-ignore lint/suspicious/noArrayIndexKey: immutable message attachment order
+							key={`${block.tag}-${index}`}
+							block={block}
+							top={contentTop + frame.top}
+							left={USER_BUBBLE_PADDING}
+							narratorId={narratorId}
+							onOpenAttachment={onOpenAttachment}
+							openAttachmentLabel={openAttachmentLabel}
+						/>
+					);
+				})}
 				<div
 					style={{
 						position: "absolute",
@@ -442,13 +472,22 @@ function UserAttachmentView({
 	onOpenAttachment?: (filePath: string) => void;
 	openAttachmentLabel?: string;
 }) {
+	const scope = useFileReferenceScope();
 	const data = block.data ?? {};
 	const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
-	if (block.tag === "user-text-file") {
+	if (block.tag === "user-text-file" || block.tag === "user-file-reference") {
 		// The path is a height-neutral passthrough from measure; when both it and a
 		// host handler exist the row becomes clickable WITHOUT changing its box.
 		const filePath = str(data.filePath);
-		const openFile = filePath && onOpenAttachment ? () => onOpenAttachment(filePath) : undefined;
+		const reference = data.reference as FileReference | undefined;
+		const openFile =
+			block.tag === "user-file-reference"
+				? reference && scope.openFile
+					? () => scope.openFile?.(reference)
+					: undefined
+				: filePath && onOpenAttachment
+					? () => onOpenAttachment(filePath)
+					: undefined;
 		return (
 			<div style={{ position: "absolute", top, left, height: block.height, maxWidth: "100%" }}>
 				<TextFileRow

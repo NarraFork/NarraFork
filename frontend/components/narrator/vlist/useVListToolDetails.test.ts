@@ -22,15 +22,21 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { QueryClient, QueryClientProvider, replaceEqualDeep } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
-import { createElement } from "react";
+import { createElement, useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { narratorsApi } from "../../../lib/api/narrators";
+import { segmentMessages } from "../message-segments";
+import type { NarratorMsg } from "../narrator-panel-types";
+import { type AdapterSegment, adaptSegments } from "./segment-adapter";
 import {
 	buildToolDetailRevision,
 	mergeToolDetailPayloads,
+	sameToolDetailRequests,
 	type ToolDetailQueryResult,
+	toolDetailRequestFromData,
 	type UseVListToolDetailsResult,
 	useVListToolDetails,
+	type VListToolDetailRequest,
 } from "./useVListToolDetails";
 
 const DOM_GLOBAL_KEYS = [
@@ -43,6 +49,7 @@ const DOM_GLOBAL_KEYS = [
 	"IS_REACT_ACT_ENVIRONMENT",
 	"requestAnimationFrame",
 	"cancelAnimationFrame",
+	"localStorage",
 ] as const;
 
 function installDom(): () => void {
@@ -62,6 +69,7 @@ function installDom(): () => void {
 		requestAnimationFrame: (callback: FrameRequestCallback) =>
 			setTimeout(() => callback(Date.now()), 0) as unknown as number,
 		cancelAnimationFrame: (handle: number) => clearTimeout(handle),
+		localStorage: { getItem: () => null },
 	};
 	for (const key of DOM_GLOBAL_KEYS) {
 		const descriptor = previous.get(key);
@@ -105,6 +113,7 @@ async function settle() {
 }
 
 const originalGetToolCallDetail = narratorsApi.getToolCallDetail;
+const originalFetch = globalThis.fetch;
 
 let restoreDom: (() => void) | null = null;
 let queryClient: QueryClient | null = null;
@@ -113,14 +122,23 @@ let container: HTMLDivElement | null = null;
 /** Every result object the hook produced, in render order. */
 let renders: UseVListToolDetailsResult[] = [];
 
-/** Mount-time harness: renders the hook and records each returned result. */
-function Harness(props: { narratorId: string; toolUseIds: readonly string[]; tick: number }) {
+interface HarnessProps {
+	narratorId: string;
+	toolUseIds: readonly (string | VListToolDetailRequest)[];
+	tick: number;
+}
+
+/** Mount-time harness: renders the real hook, including no-ref legacy requests. */
+function Harness(props: HarnessProps) {
 	void props.tick;
-	renders.push(useVListToolDetails(props.narratorId, props.toolUseIds));
+	const requests = props.toolUseIds.map((ref) =>
+		typeof ref === "string" ? { toolUseId: ref } : ref,
+	);
+	renders.push(useVListToolDetails(props.narratorId, requests));
 	return null;
 }
 
-async function render(props: { narratorId: string; toolUseIds: readonly string[]; tick: number }) {
+async function render(props: HarnessProps) {
 	if (!queryClient || !root) throw new Error("harness is not initialized");
 	root.render(
 		createElement(QueryClientProvider, { client: queryClient }, createElement(Harness, props)),
@@ -146,6 +164,7 @@ afterEach(async () => {
 	container?.remove();
 	container = null;
 	narratorsApi.getToolCallDetail = originalGetToolCallDetail;
+	globalThis.fetch = originalFetch;
 	restoreDom?.();
 	restoreDom = null;
 });
@@ -329,5 +348,264 @@ describe("useVListToolDetails", () => {
 		expect(last.resolveFullToolOutput("t1")).toEqual({ stdout: "full output" });
 		expect(last.resolveFullToolInput("unknown")).toBeUndefined();
 		expect(last.resolveFullToolInput(undefined)).toBeUndefined();
+	});
+});
+
+// This is the actual pretext transport shape: the relation array was stripped,
+// but the enriched SDK block retains tcId + executionAttempt, and the message
+// supplies its own identity. No tool_use.id is ever promoted to a row PK.
+function message(ref: VListToolDetailRequest): NarratorMsg {
+	return {
+		id: ref.messageId,
+		role: "assistant",
+		contentJson: [
+			{
+				type: "tool_use",
+				id: ref.toolUseId,
+				tcId: ref.toolCallId,
+				executionAttempt: ref.executionAttempt,
+				name: "Bash",
+				status: "success",
+				inputJson: { command: { _truncated: true, preview: "input", fullLength: 9000 } },
+				outputJson: { stdout: { _truncated: true, preview: "output", fullLength: 9000 } },
+			},
+		],
+		toolCalls: [],
+		children: [],
+	} as unknown as NarratorMsg;
+}
+
+function adapted(refs: VListToolDetailRequest[], resolvers?: UseVListToolDetailsResult) {
+	return adaptSegments(segmentMessages(refs.map(message)) as AdapterSegment[], {
+		lod: 5,
+		...resolvers,
+	});
+}
+
+function responseBody(url: URL) {
+	const id = url.searchParams.get("toolCallId");
+	const messageId = url.searchParams.get("messageId");
+	const identity = `${url.pathname}:${messageId}:${id}`;
+	return {
+		id,
+		messageId,
+		inputJson: { command: `in:${identity}` },
+		outputJson: { stdout: `out:${identity}` },
+	};
+}
+
+function installDetailFetch(onRequest?: (url: URL, init?: RequestInit) => Promise<Response>) {
+	const calls: URL[] = [];
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = new URL(String(input), "https://test.invalid");
+		calls.push(url);
+		return onRequest ? onRequest(url, init) : Response.json(responseBody(url));
+	}) as typeof fetch;
+	return calls;
+}
+
+function current() {
+	const result = renders.at(-1);
+	if (!result) throw new Error("hook did not render");
+	return result;
+}
+
+const firstRef = {
+	toolUseId: "provider/repeated +%&?",
+	toolCallId: "pk-one",
+	messageId: "message-one",
+	executionAttempt: 1,
+} satisfies VListToolDetailRequest;
+
+const secondRef = {
+	...firstRef,
+	toolCallId: "pk-two",
+	messageId: "message-two",
+} satisfies VListToolDetailRequest;
+
+describe("exact tool identity — mounted hook through the real API fetch adapter", () => {
+	test("loads two messages with the same provider ID into their own inputs and outputs", async () => {
+		const calls = installDetailFetch();
+		const refs = [firstRef, secondRef];
+		const specs = adapted(refs);
+		const requests = specs.map((spec) => toolDetailRequestFromData(firstRef.toolUseId, spec.data));
+		expect(requests).toEqual(refs);
+		await render({ narratorId: "n1", toolUseIds: requests, tick: 0 });
+		expect(calls).toHaveLength(2);
+		const settled = current();
+		for (const [index, ref] of refs.entries()) {
+			expect(Object.fromEntries(calls[index].searchParams)).toEqual({
+				toolCallId: ref.toolCallId,
+				messageId: ref.messageId,
+			});
+			expect(settled.resolveFullToolInput(ref.toolUseId, ref)).toEqual(
+				responseBody(calls[index]).inputJson,
+			);
+			expect(settled.resolveFullToolOutput(ref.toolUseId, ref)).toEqual(
+				responseBody(calls[index]).outputJson,
+			);
+		}
+		expect(settled.resolveFullToolOutput(firstRef.toolUseId)).toBeUndefined();
+		const fullSpecs = adapted(refs, settled);
+		for (let index = 0; index < fullSpecs.length; index++) {
+			const data = fullSpecs[index].data as { truncatedLeafCount?: number; detail: unknown };
+			expect(data.truncatedLeafCount ?? 0).toBe(0);
+			const serialized = JSON.stringify(data.detail);
+			expect(serialized).toContain(
+				`in:${calls[index].pathname}:${refs[index].messageId}:${refs[index].toolCallId}`,
+			);
+			expect(serialized).toContain(
+				`out:${calls[index].pathname}:${refs[index].messageId}:${refs[index].toolCallId}`,
+			);
+			expect(serialized).not.toContain(String(refs[1 - index].toolCallId));
+		}
+		// Resolved cards leave wanted, but no fresh request/resolver/revision follows.
+		await render({ narratorId: "n1", toolUseIds: [], tick: 1 });
+		expect(current()).toBe(settled);
+		await render({ narratorId: "n1", toolUseIds: [...requests].reverse(), tick: 2 });
+		expect(current()).toBe(settled);
+		expect(calls).toHaveLength(2);
+		const count = renders.length;
+		await settle();
+		expect(renders).toHaveLength(count);
+	});
+
+	test("isolates new attempts, new PKs and COW message refs even with the same provider ID", async () => {
+		const calls = installDetailFetch();
+		await render({ narratorId: "n1", toolUseIds: [firstRef], tick: 0 });
+		const variants = [
+			{ ...firstRef, toolCallId: "retry-pk", executionAttempt: 2 },
+			{ ...firstRef, messageId: "cow-message" },
+			{ ...firstRef, executionAttempt: 3 },
+		];
+		for (const [index, ref] of variants.entries()) {
+			expect(current().resolveFullToolInput(ref.toolUseId, ref)).toBeUndefined();
+			expect(sameToolDetailRequests([firstRef], [ref])).toBe(false);
+			await render({ narratorId: "n1", toolUseIds: [ref], tick: index + 1 });
+			expect(calls).toHaveLength(index + 2);
+			expect(current().resolveFullToolInput(ref.toolUseId, ref)).toEqual(
+				responseBody(calls[index + 1]).inputJson,
+			);
+		}
+		expect(sameToolDetailRequests([firstRef], [{ ...firstRef }])).toBe(true);
+	});
+
+	test("does not promote SDK ids to PKs when only the message ref survives", async () => {
+		const ref = { toolUseId: "sdk-id", messageId: "msg-without-row-pk" };
+		const [spec] = adapted([ref]);
+		const request = toolDetailRequestFromData(ref.toolUseId, spec.data);
+		expect(request).toEqual(ref);
+		const calls = installDetailFetch();
+		await render({ narratorId: "n1", toolUseIds: [request], tick: 0 });
+		expect(Object.fromEntries(calls[0].searchParams)).toEqual({ messageId: ref.messageId });
+	});
+
+	test("never falls back to a cached exact body when a legacy request is ambiguous", async () => {
+		const calls = installDetailFetch(async (url) =>
+			url.searchParams.size
+				? Response.json(responseBody(url))
+				: Response.json({ error: "ambiguous" }, { status: 409 }),
+		);
+		await render({ narratorId: "n1", toolUseIds: [firstRef], tick: 0 });
+		await render({ narratorId: "n1", toolUseIds: [firstRef.toolUseId], tick: 1 });
+		expect(calls).toHaveLength(2);
+		expect(calls[1].search).toBe("");
+		expect(current().resolveFullToolInput(firstRef.toolUseId)).toBeUndefined();
+	});
+
+	test("a late result cannot contaminate the new narrator's store", async () => {
+		let finishOld: ((response: Response) => void) | undefined;
+		const calls = installDetailFetch((url) =>
+			url.pathname.includes("/n1/")
+				? new Promise((resolve) => {
+						finishOld = resolve;
+					})
+				: Promise.resolve(Response.json(responseBody(url))),
+		);
+		await render({ narratorId: "n1", toolUseIds: [firstRef], tick: 0 });
+		const oldResolver = current();
+		await render({ narratorId: "n2", toolUseIds: [firstRef], tick: 1 });
+		const newResolver = current();
+		expect(newResolver).not.toBe(oldResolver);
+		finishOld?.(Response.json(responseBody(calls[0])));
+		await settle();
+		expect(current().resolveFullToolInput(firstRef.toolUseId, firstRef)).toEqual(
+			responseBody(calls[1]).inputJson,
+		);
+		expect(calls).toHaveLength(2);
+		await render({ narratorId: "n3", toolUseIds: [], tick: 2 });
+		expect(current().resolveFullToolInput(firstRef.toolUseId, firstRef)).toBeUndefined();
+	});
+
+	test("bounds in-flight requests to six after exact-identity deduplication", async () => {
+		let active = 0;
+		let maxActive = 0;
+		const calls = installDetailFetch(
+			(_url, init) =>
+				new Promise((_resolve, reject) => {
+					active++;
+					maxActive = Math.max(maxActive, active);
+					init?.signal?.addEventListener(
+						"abort",
+						() => {
+							active--;
+							reject(new DOMException("aborted", "AbortError"));
+						},
+						{ once: true },
+					);
+				}),
+		);
+		const refs = Array.from({ length: 8 }, (_, index) => ({
+			...firstRef,
+			toolCallId: `pk-${index}`,
+		}));
+		await render({ narratorId: "n1", toolUseIds: [refs[0], ...refs], tick: 0 });
+		expect(calls).toHaveLength(6);
+		expect(maxActive).toBe(6);
+		await render({ narratorId: "n1", toolUseIds: refs.slice(6), tick: 1 });
+		expect(calls).toHaveLength(8);
+		expect(maxActive).toBe(6);
+		expect(active).toBe(2);
+	});
+
+	test("the actual layout feedback drains the six-request window and then stays quiescent", async () => {
+		const calls = installDetailFetch();
+		const refs = Array.from({ length: 10 }, (_, index) => ({
+			...firstRef,
+			messageId: `message-${index}`,
+			toolCallId: `pk-${index}`,
+		}));
+		function Feedback() {
+			const [wanted, setWanted] = useState<readonly VListToolDetailRequest[]>(refs);
+			const details = useVListToolDetails("n1", wanted);
+			renders.push(details);
+			useEffect(() => {
+				const stillTruncated = adapted(refs, details)
+					.filter((spec) => (spec.data as { truncatedLeafCount?: number }).truncatedLeafCount)
+					.map((spec) => toolDetailRequestFromData(firstRef.toolUseId, spec.data));
+				setWanted((prev) => (sameToolDetailRequests(prev, stillTruncated) ? prev : stillTruncated));
+			}, [details]);
+			return null;
+		}
+		if (!root || !queryClient) throw new Error("harness is not initialized");
+		root.render(
+			createElement(QueryClientProvider, { client: queryClient }, createElement(Feedback)),
+		);
+		await settle();
+		await settle();
+		await settle();
+		expect(calls).toHaveLength(10);
+		const settledCount = renders.length;
+		expect(settledCount).toBeLessThan(20);
+		await settle();
+		expect(renders).toHaveLength(settledCount);
+		for (const ref of refs)
+			expect(current().resolveFullToolOutput(ref.toolUseId, ref)).toBeDefined();
+	});
+
+	test("revision encoding cannot alias IDs containing delimiters", () => {
+		expect(buildToolDetailRevision(["a,b", "c"], [], [])).not.toBe(
+			buildToolDetailRevision(["a", "b,c"], [], []),
+		);
 	});
 });

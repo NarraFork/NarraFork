@@ -18,13 +18,20 @@ export function createShikiOnigurumaEngine() {
 	return createOnigurumaEngine(import("shiki/wasm"));
 }
 
+interface ShikiHighlightOptions {
+	lang: BundledLanguage;
+	theme: string;
+	tokenizeMaxLineLength?: number;
+	tokenizeTimeLimit?: number;
+}
+
 export interface ShikiModule {
 	/** Compatibility surface used by language-resolution helpers. */
 	bundledLanguages: Record<string, unknown>;
-	codeToHtml: (code: string, options: { lang: BundledLanguage; theme: string }) => Promise<string>;
+	codeToHtml: (code: string, options: ShikiHighlightOptions) => Promise<string>;
 	codeToTokens: (
 		code: string,
-		options: { lang: BundledLanguage; theme: string },
+		options: ShikiHighlightOptions,
 	) => Promise<{ tokens: ThemedToken[][] }>;
 }
 
@@ -214,8 +221,8 @@ export function loadShiki(): Promise<ShikiModule | null> {
 							throw new Error("Shiki language or theme unavailable");
 						}
 						return core.codeToHtml(code, {
+							...options,
 							lang: canonicalLanguage as BundledLanguage,
-							theme: options.theme,
 						});
 					},
 					codeToTokens: async (code, options) => {
@@ -227,8 +234,8 @@ export function loadShiki(): Promise<ShikiModule | null> {
 							throw new Error("Shiki language or theme unavailable");
 						}
 						return core.codeToTokens(code, {
+							...options,
 							lang: canonicalLanguage as BundledLanguage,
-							theme: options.theme,
 						});
 					},
 				};

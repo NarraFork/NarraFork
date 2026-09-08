@@ -4,9 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { fileAttributions, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
+import {
+	fileAttributions,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	users,
+} from "../db/schema";
 import { generateId } from "../lib/id";
-import { recordAttribution } from "./file-attribution-service";
+import { recordAttribution, recordAttributions } from "./file-attribution-service";
 import { normalizeWorkspacePath } from "./git-workspace";
 import {
 	findImpreciseChanges,
@@ -29,7 +35,18 @@ function timelineOf(view: WorkspaceModificationView): ModificationEvent[] {
 }
 
 const createdNarrators: string[] = [];
+const createdUsers: string[] = [];
 const workspaces: string[] = [];
+
+async function createUser(name: string): Promise<{ id: string; username: string }> {
+	const id = generateId();
+	const username = `${name}-${id}`;
+	await db
+		.insert(users)
+		.values({ id, username, passwordHash: "test-only", createdAt: new Date().toISOString() });
+	createdUsers.push(id);
+	return { id, username };
+}
 
 function makeWorkspace(prefix: string): string {
 	const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -50,7 +67,9 @@ async function record(params: {
 	workspacePath: string;
 	filePath: string;
 	narratorId: string | null;
-	action: "write" | "edit" | "bash" | "external";
+	userId?: string;
+	subagentType?: string;
+	action: "write" | "edit" | "bash" | "external" | "human";
 	toolName?: string | null;
 	treeHashAfter?: string;
 }): Promise<void> {
@@ -83,6 +102,8 @@ async function record(params: {
 		workspacePath: params.workspacePath,
 		filePath: params.filePath,
 		narratorId: params.narratorId,
+		userId: params.userId,
+		subagentType: params.subagentType,
 		action: params.action,
 		toolName: params.toolName ?? null,
 		toolUseId: toolUseId ?? null,
@@ -103,6 +124,9 @@ afterEach(async () => {
 		await db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId));
 		await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, narratorId));
 		await db.delete(narrators).where(eq(narrators.id, narratorId));
+	}
+	for (const id of createdUsers.splice(0)) {
+		await db.delete(users).where(eq(users.id, id));
 	}
 });
 
@@ -158,7 +182,7 @@ describe("unified workspace modification view", () => {
 		expect(group?.hasImpreciseAttribution).toBe(true);
 	});
 
-	test("marks write/edit precise and bash/external imprecise", async () => {
+	test("never upgrades legacy write/edit observations to measured attribution", async () => {
 		const ws = makeWorkspace("nf-view-precision-");
 		const narratorId = await createNarrator("Solo", ws);
 		await record({ workspacePath: ws, filePath: "w.ts", narratorId, action: "write" });
@@ -168,16 +192,17 @@ describe("unified workspace modification view", () => {
 
 		const view = await getWorkspaceModificationView(ws);
 		const precision = new Map(timelineOf(view).map((e) => [e.filePath, e.preciseAttribution]));
-		// Write/Edit hold the workspace write lock for their whole window.
-		expect(precision.get("w.ts")).toBe(true);
-		expect(precision.get("e.ts")).toBe(true);
-		// Bash is only serialized for short targeted commands, which is not recorded
-		// per row — so its scope is not provably its own.
+		// A declared path or tree hash is not a settled, execution-confirmed v2 effect.
+		expect(precision.get("w.ts")).toBe(false);
+		expect(precision.get("e.ts")).toBe(false);
+		expect(timelineOf(view).every((event) => event.evidence === "legacy")).toBe(true);
+		expect(timelineOf(view).some((event) => event.attributionGrade === "measured")).toBe(false);
+		expect(view.baselineStatus).toBe("unverified");
 		expect(precision.get("b.ts")).toBe(false);
 		expect(precision.get("x.ts")).toBe(false);
 	});
 
-	test("exposes the tree boundary of a change when one was recorded", async () => {
+	test("legacy toolUseId alone never binds a possibly reused tree boundary", async () => {
 		const ws = makeWorkspace("nf-view-tree-");
 		const narratorId = await createNarrator("Solo", ws);
 		await record({
@@ -192,7 +217,7 @@ describe("unified workspace modification view", () => {
 		const view = await getWorkspaceModificationView(ws);
 		const withBoundary = timelineOf(view).find((e) => e.filePath === "a.ts");
 		const without = timelineOf(view).find((e) => e.filePath === "b.ts");
-		expect(withBoundary?.treeHashAfter).toBe("a".repeat(40));
+		expect(withBoundary?.treeHashAfter).toBeNull();
 		expect(without?.treeHashAfter).toBeNull();
 	});
 
@@ -400,14 +425,16 @@ describe("projections", () => {
 });
 
 describe("imprecise change detection for revert warnings", () => {
-	test("reports nothing when only the reverting narrator wrote precisely", async () => {
+	test("warns for legacy Write/Edit even when the reverting narrator is the only known actor", async () => {
 		const ws = makeWorkspace("nf-imprecise-clean-");
 		const narratorId = await createNarrator("Solo", ws);
 		await record({ workspacePath: ws, filePath: "a.ts", narratorId, action: "write" });
 		await record({ workspacePath: ws, filePath: "b.ts", narratorId, action: "edit" });
 
 		const report = await findImpreciseChanges(ws, { excludeNarratorId: narratorId });
-		expect(report.hasImprecise).toBe(false);
+		expect(report.hasImprecise).toBe(true);
+		expect(report.legacyCount).toBe(2);
+		expect(report.warningScanComplete).toBe(true);
 	});
 
 	test("counts another narrator's changes in the window", async () => {
@@ -447,5 +474,339 @@ describe("imprecise change detection for revert warnings", () => {
 		const report = await findImpreciseChanges(ws, { since: cutoff });
 		expect(report.externalCount).toBe(1);
 		expect(report.sampleFilePaths).toEqual(["new.ts"]);
+	});
+});
+
+/** Seed bounded batches with deterministic UTC timestamps, without wall-clock sleeps. */
+async function seedEvents(
+	workspacePath: string,
+	rows: Array<{
+		filePath: string;
+		action: "write" | "edit" | "external" | "human";
+		narratorId?: string;
+		userId?: string;
+		changedAt: string;
+	}>,
+): Promise<void> {
+	for (let offset = 0; offset < rows.length; offset += 100) {
+		await db.insert(fileAttributions).values(
+			rows.slice(offset, offset + 100).map((row) => ({
+				id: generateId(),
+				deviceId: "local",
+				workspacePath: normalizeWorkspacePath(workspacePath),
+				...row,
+			})),
+		);
+	}
+}
+
+// All DB access uses tests/preload.ts's isolated NARRAFORK_HOME.
+describe("M4 actor identity and honest observation coverage", () => {
+	test("two human users resolve separately in both projections, including batch writes", async () => {
+		const ws = makeWorkspace("nf-view-human-");
+		const alice = await createUser("alice");
+		const bob = await createUser("bob");
+		await recordAttributions({ workspacePath: ws, action: "human", userId: alice.id }, [
+			"shared.ts",
+			"batch.ts",
+		]);
+		await seedEvents(ws, [
+			{
+				filePath: "shared.ts",
+				action: "human",
+				userId: bob.id,
+				changedAt: "2099-01-01T00:00:00.000Z",
+			},
+		]);
+		for (const options of [
+			{},
+			{ filePaths: ["shared.ts", "batch.ts"], projection: "byFile" as const },
+		]) {
+			const view = await getWorkspaceModificationView(ws, options);
+			const group = view.byFile.find((entry) => entry.filePath === "shared.ts");
+			expect(group?.lastAction).toBe("human");
+			expect(group?.lastActor).toMatchObject({
+				kind: "human",
+				userId: bob.id,
+				narratorId: null,
+				title: bob.username,
+				exists: true,
+			});
+			expect(group?.actors.map((actor) => actor.userId)).toEqual([bob.id, alice.id]);
+			expect(view.byFile.find((entry) => entry.filePath === "batch.ts")?.lastActor.userId).toBe(
+				alice.id,
+			);
+			expect(group?.hasDeletedActor).toBe(false);
+			expect(group?.hasExternalChange).toBe(false);
+			expect(group?.completeness.countsLowerBound).toBe(false);
+		}
+	});
+
+	test("external then deleted subagent keeps the last event's kind, action and unknown identity", async () => {
+		const ws = makeWorkspace("nf-view-deleted-order-");
+		const gone = await createNarrator("Do not invent this name", ws);
+		await db
+			.update(narrators)
+			.set({ variant: "subagent:review", subagentType: null })
+			.where(eq(narrators.id, gone));
+		await record({
+			workspacePath: ws,
+			filePath: "shared.ts",
+			narratorId: null,
+			action: "external",
+		});
+		await record({
+			workspacePath: ws,
+			filePath: "shared.ts",
+			narratorId: gone,
+			action: "edit",
+		});
+		await recordAttributions({ workspacePath: ws, narratorId: gone, action: "edit" }, ["batch.ts"]);
+		await db.delete(narrators).where(eq(narrators.id, gone));
+		const view = await getWorkspaceModificationView(ws, { filePaths: ["shared.ts"] });
+		const group = view.byFile[0];
+		expect(group?.lastAction).toBe("edit");
+		expect(group?.lastActor).toMatchObject({
+			kind: "subagent",
+			subagentType: "review",
+			narratorId: null,
+			title: null,
+			exists: false,
+			deleted: null,
+			identityKnown: false,
+		});
+		expect(group?.actors.map((actor) => actor.kind)).toEqual(["subagent", "external_unknown"]);
+		expect(group?.hasExternalChange).toBe(true);
+		// Null FK does not distinguish deletion from an originally absent legacy identity.
+		expect(group?.hasDeletedActor).toBeNull();
+		expect(timelineOf(view)[0]?.actor).toEqual(group?.lastActor);
+		expect(group?.completeness.countsLowerBound).toBe(true);
+		expect(JSON.stringify(view)).not.toContain("Do not invent this name");
+		const batch = await getWorkspaceModificationView(ws, { filePaths: ["batch.ts"] });
+		expect(batch.byFile[0]?.lastActor).toMatchObject({
+			kind: "subagent",
+			subagentType: "review",
+			title: null,
+		});
+	});
+
+	test("anonymized human rows stay human, and id-less tool actors do not become primaries", async () => {
+		const ws = makeWorkspace("nf-view-deleted-unknown-");
+		const user = await createUser("removed");
+		await record({
+			workspacePath: ws,
+			filePath: "human.ts",
+			narratorId: null,
+			userId: user.id,
+			action: "human",
+		});
+		// The legacy migration used NO ACTION despite the schema's SET NULL declaration.
+		// Emulate the anonymized/FK-null read state explicitly; this is not a deletion test.
+		await db
+			.update(fileAttributions)
+			.set({ userId: null })
+			.where(eq(fileAttributions.userId, user.id));
+		await db.delete(users).where(eq(users.id, user.id));
+		await record({ workspacePath: ws, filePath: "tool.ts", narratorId: null, action: "write" });
+		const view = await getWorkspaceModificationView(ws);
+		expect(view.byFile.find((group) => group.filePath === "human.ts")?.lastActor).toMatchObject({
+			kind: "human",
+			userId: null,
+			title: null,
+			deleted: null,
+			identityKnown: false,
+		});
+		expect(view.byFile.find((group) => group.filePath === "tool.ts")?.lastActor.kind).toBe(
+			"narrator_unknown",
+		);
+		const report = await findImpreciseChanges(ws);
+		expect(report).toMatchObject({
+			hasImprecise: true,
+			humanCount: 1,
+			unknownCount: 2,
+			legacyCount: 2,
+		});
+	});
+
+	test("ten rows alone are complete; hidden participants and flags beyond ten remain unknown", async () => {
+		const ws = makeWorkspace("nf-view-ten-");
+		const busy = await createNarrator("Busy", ws);
+		const hidden = await createNarrator("Older participant", ws);
+		const recent = Array.from({ length: 10 }, (_, i) => ({
+			filePath: "busy.ts",
+			narratorId: busy,
+			action: "edit" as const,
+			changedAt: new Date(Date.UTC(2026, 0, 2, 0, 0, i)).toISOString(),
+		}));
+		await seedEvents(ws, recent);
+		const complete = await getWorkspaceModificationView(ws, { filePaths: ["busy.ts"] });
+		expect(complete.hasMore).toBe(false);
+		expect(complete.byFile[0]?.completeness).toMatchObject({
+			fileHistoryComplete: true,
+			contributorsTruncated: false,
+			countsLowerBound: false,
+			warningScanComplete: true,
+		});
+		await seedEvents(ws, [
+			{
+				filePath: "busy.ts",
+				narratorId: hidden,
+				action: "write",
+				changedAt: "2026-01-01T01:00:00.000Z",
+			},
+			{ filePath: "busy.ts", action: "external", changedAt: "2026-01-01T00:00:00.000Z" },
+			{
+				filePath: "quiet.ts",
+				narratorId: hidden,
+				action: "write",
+				changedAt: "2026-01-01T00:00:00.000Z",
+			},
+		]);
+		const partial = await getWorkspaceModificationView(ws, { filePaths: ["busy.ts", "quiet.ts"] });
+		const group = partial.byFile.find((entry) => entry.filePath === "busy.ts");
+		expect(partial.hasMore).toBe(true);
+		expect(group?.changeCount).toBe(10);
+		expect(group?.actors.map((actor) => actor.narratorId)).toEqual([busy]);
+		expect(group?.hasExternalChange).toBeNull();
+		expect(group?.hasDeletedActor).toBeNull();
+		expect(group?.completeness).toMatchObject({
+			fileHistoryComplete: false,
+			contributorsTruncated: true,
+			countsLowerBound: true,
+			warningScanComplete: false,
+		});
+		expect(
+			partial.byFile.find((entry) => entry.filePath === "quiet.ts")?.completeness
+				.fileHistoryComplete,
+		).toBe(true);
+	});
+
+	test("a capped window stays incomplete after its per-path timestamp filter empties it", async () => {
+		const ws = makeWorkspace("nf-view-filtered-cap-");
+		await seedEvents(
+			ws,
+			Array.from({ length: 11 }, (_, i) => ({
+				filePath: "a.ts",
+				action: "external" as const,
+				changedAt: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
+			})),
+		);
+		const view = await getWorkspaceModificationView(ws, {
+			filePaths: ["a.ts"],
+			sinceByPath: new Map([["a.ts", "2026-02-01T00:00:00.000Z"]]),
+		});
+		expect(view.byFile).toHaveLength(0);
+		expect(view.windowCount).toBe(0);
+		expect(view.hasMore).toBe(true);
+		expect(view.completeness.fileHistoryComplete).toBe(false);
+	});
+
+	test("requested paths beyond the cap are disclosed, and duplicate paths do not duplicate rows", async () => {
+		const ws = makeWorkspace("nf-view-path-cap-");
+		await record({ workspacePath: ws, filePath: "a.ts", narratorId: null, action: "external" });
+		const duplicate = await getWorkspaceModificationView(ws, { filePaths: ["a.ts", "a.ts"] });
+		expect(duplicate.windowCount).toBe(1);
+		const capped = await getWorkspaceModificationView(ws, {
+			filePaths: Array.from({ length: 401 }, (_, i) => `f${i}.ts`),
+		});
+		expect(capped.hasMore).toBe(true);
+		expect(capped.completeness.fileHistoryComplete).toBe(false);
+	});
+
+	test("more than 2000 events cannot hide older external, human and other-actor hazards as safe", async () => {
+		const ws = makeWorkspace("nf-view-warning-cap-");
+		const owner = await createNarrator("Owner", ws);
+		const other = await createNarrator("Other", ws);
+		const human = await createUser("human");
+		await seedEvents(ws, [
+			{ filePath: "external.ts", action: "external", changedAt: "2026-01-01T00:00:00.000Z" },
+			{
+				filePath: "human.ts",
+				userId: human.id,
+				action: "human",
+				changedAt: "2026-01-01T00:00:01.000Z",
+			},
+			{
+				filePath: "other.ts",
+				narratorId: other,
+				action: "write",
+				changedAt: "2026-01-01T00:00:02.000Z",
+			},
+			...Array.from({ length: 2000 }, (_, i) => ({
+				filePath: `recent-${i}.ts`,
+				narratorId: owner,
+				action: "edit" as const,
+				changedAt: new Date(Date.UTC(2026, 0, 2) + i).toISOString(),
+			})),
+		]);
+		const report = await findImpreciseChanges(ws, { excludeNarratorId: owner });
+		expect(report).toMatchObject({
+			hasImprecise: true,
+			hasMore: true,
+			windowCount: 2000,
+			warningScanComplete: false,
+			countsLowerBound: true,
+			externalCount: 0,
+			humanCount: 0,
+			otherActorCount: 0,
+			legacyCount: 2000,
+		});
+		expect(report.sampleFilePaths.length).toBeLessThanOrEqual(10);
+		expect(report.completeness.warningScanComplete).toBe(false);
+		const exactlyAtLimit = await findImpreciseChanges(ws, {
+			excludeNarratorId: owner,
+			since: "2026-01-02T00:00:00.000Z",
+		});
+		expect(exactlyAtLimit).toMatchObject({
+			windowCount: 2000,
+			hasMore: false,
+			warningScanComplete: true,
+			countsLowerBound: false,
+			hasImprecise: true,
+		});
+	});
+
+	test("an empty warning window is complete, rather than an inferred safe prefix", async () => {
+		const ws = makeWorkspace("nf-view-warning-empty-");
+		expect(await findImpreciseChanges(ws)).toMatchObject({
+			hasImprecise: false,
+			hasMore: false,
+			windowCount: 0,
+			warningScanComplete: true,
+			countsLowerBound: false,
+		});
+	});
+
+	test("since, until and per-path boundaries normalize equivalent offsets to UTC", async () => {
+		const ws = makeWorkspace("nf-view-offset-");
+		await seedEvents(ws, [
+			{ filePath: "a.ts", action: "external", changedAt: "2026-01-01T00:00:00.000Z" },
+			{ filePath: "b.ts", action: "external", changedAt: "2026-01-01T01:00:00.000Z" },
+		]);
+		const utc = { since: "2026-01-01T00:00:00.000Z", until: "2026-01-01T00:00:00.000Z" };
+		const offset = { since: "2026-01-01T08:00:00+08:00", until: "2025-12-31T19:00:00-05:00" };
+		expect(await getWorkspaceModificationView(ws, offset)).toEqual(
+			await getWorkspaceModificationView(ws, utc),
+		);
+		expect(
+			await getWorkspaceModificationView(ws, { ...offset, filePaths: ["a.ts", "b.ts"] }),
+		).toEqual(await getWorkspaceModificationView(ws, { ...utc, filePaths: ["a.ts", "b.ts"] }));
+		expect(await findImpreciseChanges(ws, offset)).toEqual(await findImpreciseChanges(ws, utc));
+		const utcBoundary = await getWorkspaceModificationView(ws, {
+			filePaths: ["a.ts", "b.ts"],
+			sinceByPath: new Map([
+				["a.ts", utc.since],
+				["b.ts", utc.since],
+			]),
+		});
+		const offsetBoundary = await getWorkspaceModificationView(ws, {
+			filePaths: ["a.ts", "b.ts"],
+			sinceByPath: new Map([
+				["a.ts", offset.since],
+				["b.ts", offset.since],
+			]),
+		});
+		expect(offsetBoundary).toEqual(utcBoundary);
+		expect(offsetBoundary.byFile.map((group) => group.filePath)).toEqual(["b.ts"]);
 	});
 });

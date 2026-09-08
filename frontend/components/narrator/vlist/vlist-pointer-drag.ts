@@ -26,11 +26,12 @@
  * mouse events becomes invisible, and the failure mode is silent (no error, just
  * jank returning).
  *
- * Double-counting is impossible because the two families share one counter keyed by
- * id: a real mouse press adds `pointerId` (typically 1) from `pointerdown`, and the
- * `mousedown` that follows maps to the same MOUSE_ID slot rather than a second
- * entry. Worst case the counter holds one extra id until its matching release, and
- * every release path clears by the same key.
+ * A real mouse press occupies two slots: its `pointerId` and MOUSE_ID. Normal
+ * `mouseup` clears both. HTML5 drag/drop is DIFFERENT: the browser sends
+ * `pointercancel` when it takes over the drag, and can finish without mouseup.
+ * Native dragstart therefore holds its own slot until drop/dragend clears ALL
+ * slots. Otherwise the orphaned MOUSE_ID defers a Dockview merge/swap's new width
+ * until the 3s backstop, even though the user has already released the panel.
  *
  * Listeners use the CAPTURE phase with `passive: true`: capture runs before any
  * bubble-phase `stopPropagation` an intermediate node might apply, and passive
@@ -48,7 +49,7 @@
  */
 
 export interface PointerDragTracker {
-	/** True while at least one pointer / mouse button is held. */
+	/** True while a pointer / mouse button or browser-owned native drag is active. */
 	isDown: () => boolean;
 	/** Stop listening. */
 	dispose: () => void;
@@ -62,6 +63,8 @@ export interface PointerDragTracker {
  * at most two slots that are both cleared by their matching releases.
  */
 const MOUSE_ID = -1;
+/** Browser-owned HTML5 drag: survives pointercancel until drop/dragend. */
+const NATIVE_DRAG_ID = -2;
 
 /**
  * Track pointer-down state at the document level.
@@ -86,6 +89,9 @@ export function createPointerDragTracker(onRelease: () => void): PointerDragTrac
 	const onDown = (event: Event) => {
 		active.add(slotOf(event));
 	};
+	const onDragStart = () => {
+		active.add(NATIVE_DRAG_ID);
+	};
 	/**
 	 * Release ONE pointer. Reports a release only when it was the last one held.
 	 *
@@ -104,12 +110,11 @@ export function createPointerDragTracker(onRelease: () => void): PointerDragTrac
 	/**
 	 * Release EVERY counted pointer at once.
 	 *
-	 * Clearing wholesale is deliberate for both of its registrations: `mouseup` is the
-	 * last event of a mouse sequence (and a physical mouse press opened a `pointerId`
-	 * slot as well as the MOUSE_ID one), and `contextmenu` means the gesture is over
-	 * however many buttons were counted. Deleting only one slot would leave the other
-	 * occupied whenever a host's matching release was missed, and a stuck slot keeps
-	 * the list deferred until the 3s backstop.
+	 * Clearing wholesale is deliberate: mouseup, drop/dragend, contextmenu and
+	 * window blur all end the gesture, regardless of which event family opened it.
+	 * Deleting only one slot leaves orphaned aliases when the browser suppresses
+	 * mouseup during HTML5 DnD. The empty-set guard also makes drop → dragend a
+	 * single release, not two layout commits.
 	 */
 	const releaseAll = () => {
 		if (active.size === 0) return;
@@ -129,6 +134,12 @@ export function createPointerDragTracker(onRelease: () => void): PointerDragTrac
 		// sequence, so it clears every slot rather than just the mouse one.
 		target.addEventListener("mousedown", onDown, { capture: true, passive: true });
 		target.addEventListener("mouseup", releaseAll, { capture: true, passive: true });
+		// Browser-owned tab DnD may send neither pointerup nor mouseup. Preserve
+		// the freeze through its pointercancel, then release it at the real end.
+		target.addEventListener("dragstart", onDragStart, { capture: true, passive: true });
+		target.addEventListener("drop", releaseAll, { capture: true, passive: true });
+		target.addEventListener("dragend", releaseAll, { capture: true, passive: true });
+		target.defaultView?.addEventListener("blur", releaseAll);
 		// `contextmenu` carries no pointerId, and it ends the gesture however many
 		// buttons were counted — so it clears them all too. (Dockview itself ends a sash
 		// drag this way; a right-click mid-gesture otherwise leaves a counted button
@@ -145,6 +156,10 @@ export function createPointerDragTracker(onRelease: () => void): PointerDragTrac
 			target.removeEventListener("pointercancel", onUp, { capture: true });
 			target.removeEventListener("mousedown", onDown, { capture: true });
 			target.removeEventListener("mouseup", releaseAll, { capture: true });
+			target.removeEventListener("dragstart", onDragStart, { capture: true });
+			target.removeEventListener("drop", releaseAll, { capture: true });
+			target.removeEventListener("dragend", releaseAll, { capture: true });
+			target.defaultView?.removeEventListener("blur", releaseAll);
 			target.removeEventListener("contextmenu", releaseAll, { capture: true });
 			active.clear();
 		},

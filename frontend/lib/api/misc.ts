@@ -33,11 +33,6 @@ import type {
 	SearchResponse,
 	StorageScanJobState,
 	StorageScanResult,
-	TutorialIndexResponse,
-	TutorialLessonProgress,
-	TutorialLessonResponse,
-	TutorialLessonSessionResponse,
-	TutorialSandboxStatus,
 } from "./types";
 
 /**
@@ -100,35 +95,6 @@ export const miscApi = {
 		request<LearningSearchResponse>(
 			`/learning/search?q=${encodeURIComponent(q)}${lang ? `&lang=${encodeURIComponent(lang)}` : ""}`,
 		),
-
-	// Interactive tutorial
-	//
-	// No `lang` parameter: the server resolves the locale from the user's stored
-	// preference. The lesson locale also has to be baked into the narrator's model
-	// value at start time, so letting the client pass a different one per request
-	// would let the page copy and the scripted turns disagree.
-	getTutorialIndex: () => request<TutorialIndexResponse>("/tutorial"),
-	getTutorialLesson: (lessonId: string) =>
-		request<TutorialLessonResponse>(`/tutorial/${encodeURIComponent(lessonId)}`),
-	startTutorialLesson: (lessonId: string) =>
-		request<TutorialLessonSessionResponse>(`/tutorial/${encodeURIComponent(lessonId)}/start`, {
-			method: "POST",
-			body: JSON.stringify({}),
-		}),
-	updateTutorialProgress: (
-		lessonId: string,
-		body: { completedStepIds: string[]; completed?: boolean },
-	) =>
-		request<{ ok: boolean; progress: TutorialLessonProgress | null }>(
-			`/tutorial/${encodeURIComponent(lessonId)}/progress`,
-			{ method: "PATCH", body: JSON.stringify(body) },
-		),
-	resetTutorialLesson: (lessonId: string) =>
-		request<{ ok: boolean }>(`/tutorial/${encodeURIComponent(lessonId)}/reset`, {
-			method: "POST",
-			body: JSON.stringify({}),
-		}),
-	getTutorialSandboxStatus: () => request<TutorialSandboxStatus>("/tutorial/sandbox/status"),
 
 	// Search
 	search: (q: string, entities = "chapters,messages") =>

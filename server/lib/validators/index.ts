@@ -158,6 +158,7 @@ export {
 	editAssistantMessageSchema,
 	forkFromMessagesSchema,
 	forkNarratorSchema,
+	humanAttentionListQuerySchema,
 	migrateBrokenModelNarratorsSchema,
 	narratorExportQuerySchema,
 	narratorGrantCreateSchema,
@@ -229,11 +230,6 @@ export {
 export { createProjectSkillSchema, updateProjectSkillSchema } from "./skills";
 export { specFileQuerySchema, updateSpecFileSchema } from "./spec";
 export { createTerminalSchema, updateTerminalViewStateSchema } from "./terminals";
-export {
-	startTutorialLessonSchema,
-	tutorialIdSchema,
-	tutorialProgressSchema,
-} from "./tutorial";
 export { narratorWsMessageSchema, terminalWsMessageSchema } from "./websocket";
 
 export {

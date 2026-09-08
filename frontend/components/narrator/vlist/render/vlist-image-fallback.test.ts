@@ -39,6 +39,7 @@ function mediaOf(detail: unknown): ToolCappedDetail {
 describe("browser screenshot media ref", () => {
 	it("carries savedFilePath as a durable fallback beside the ephemeral previewUrl", () => {
 		const detail = classifyToolDetail({
+			toolUseId: "screenshot-fixture",
 			toolName: "Browser",
 			category: "browser",
 			inputJson: { action: "screenshot", url: "https://x.dev" },
@@ -56,6 +57,7 @@ describe("browser screenshot media ref", () => {
 
 	it("omits filePath when the screenshot was never written to disk", () => {
 		const detail = classifyToolDetail({
+			toolUseId: "screenshot-fixture",
 			toolName: "Browser",
 			category: "browser",
 			inputJson: { action: "screenshot", url: "https://x.dev" },
@@ -68,6 +70,7 @@ describe("browser screenshot media ref", () => {
 
 	it("reserves the same height as a chat image block, not a taller estimate", () => {
 		const detail = classifyToolDetail({
+			toolUseId: "screenshot-fixture",
 			toolName: "Browser",
 			category: "browser",
 			inputJson: { action: "screenshot", url: "https://x.dev" },

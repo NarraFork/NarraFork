@@ -104,7 +104,7 @@ export function resolveVListBlockTarget(
 	const messageId = sourceMessageIds[0];
 	if (!messageId) return null;
 
-	if (kind === "tool-call" || kind === "subagent-card") {
+	if (kind === "tool-call" || kind === "subagent-card" || kind === "communication-bubble") {
 		// key = `tool-{toolUseId}`; prefix length 5. Selection registers both
 		// tc-/sa- aliases to the same entry, so either prefix resolves the entry.
 		const toolUseId = key.startsWith("tool-") ? key.slice(5) : null;

@@ -13,6 +13,7 @@
  * identity there.
  */
 
+import type { FileReference } from "@shared/file-reference";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -22,6 +23,7 @@ import type {
 	BufferedTextFileSummary,
 	BufferMessageSummary,
 } from "../../lib/api/types";
+import { trimFileReferenceInput } from "./file-reference-input";
 
 /**
  * Attachments a queued message may carry, per type; mirrors the server limits.
@@ -37,6 +39,7 @@ export interface QueuedEditAttachmentState {
 	newImages: File[];
 	keptTextFiles: BufferedTextFileSummary[];
 	newTextFiles: File[];
+	fileReferences: FileReference[];
 }
 
 export interface QueuedEditPayload {
@@ -44,6 +47,7 @@ export interface QueuedEditPayload {
 	keepTextFiles: { index: number; filename: string }[];
 	newImages: File[];
 	newTextFiles: File[];
+	fileReferences: FileReference[];
 }
 
 /**
@@ -56,10 +60,12 @@ export interface QueuedEditPayload {
 export function seedQueuedEditAttachments(msg: BufferMessageSummary): {
 	keptImages: BufferedImageSummary[];
 	keptTextFiles: BufferedTextFileSummary[];
+	fileReferences: FileReference[];
 } {
 	return {
 		keptImages: [...(msg.images ?? [])],
 		keptTextFiles: [...(msg.textFiles ?? [])],
+		fileReferences: structuredClone(msg.fileReferences ?? []),
 	};
 }
 
@@ -84,7 +90,8 @@ export function canSubmitQueuedEdit(state: QueuedEditAttachmentState): boolean {
 		state.keptImages.length > 0 ||
 		state.newImages.length > 0 ||
 		state.keptTextFiles.length > 0 ||
-		state.newTextFiles.length > 0
+		state.newTextFiles.length > 0 ||
+		state.fileReferences.length > 0
 	);
 }
 
@@ -104,6 +111,7 @@ export function buildQueuedEditPayload(state: QueuedEditAttachmentState): Queued
 		})),
 		newImages: [...state.newImages],
 		newTextFiles: [...state.newTextFiles],
+		fileReferences: structuredClone(trimFileReferenceInput(state).fileReferences),
 	};
 }
 
@@ -118,6 +126,7 @@ export function queuedEditTouchesAttachments(
 		state.newImages.length > 0 ||
 		state.newTextFiles.length > 0 ||
 		state.keptImages.length !== originalImages.length ||
-		state.keptTextFiles.length !== originalTextFiles.length
+		state.keptTextFiles.length !== originalTextFiles.length ||
+		JSON.stringify(state.fileReferences) !== JSON.stringify(original.fileReferences ?? [])
 	);
 }

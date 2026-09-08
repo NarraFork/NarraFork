@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import type { HumanAttentionItem } from "@shared/human-attention";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
@@ -12,6 +13,7 @@ import {
 	useAsyncQuestions,
 	useDismissAsyncQuestion,
 } from "../../hooks/useAsyncQuestions";
+import { humanAttentionListKey } from "../../hooks/useHumanAttention";
 import { api } from "../../lib/api";
 import {
 	flush,
@@ -24,9 +26,9 @@ import {
 	AsyncQuestionInboxButton,
 	AsyncQuestionInboxDrawer,
 	type GlobalQuestion,
-	globalQuestionsQueryKey,
 } from "./GlobalQuestionInbox";
-import { buildAsyncQuestionNode } from "./vlist/vlist-permission-bridge";
+
+const { buildAsyncQuestionNode } = await import("./vlist/vlist-permission-bridge");
 
 const questions = [{ question: "notes", header: "Notes?", options: [] }];
 const deferredQuestion: GlobalQuestion = {
@@ -45,6 +47,25 @@ const deferredQuestion: GlobalQuestion = {
 	decidedAt: null,
 	createdAt: "2026-01-01T00:00:00.000Z",
 };
+function attentionItem(question: GlobalQuestion): HumanAttentionItem {
+	return {
+		id: `question:${question.id}`,
+		kind: "async_question",
+		source: "question",
+		requestId: question.id,
+		toolCallId: question.toolCallId,
+		toolName: "AskUserQuestion",
+		narratorId: question.narratorId,
+		narratorTitle: question.narratorTitle,
+		parentNarratorId: null,
+		rootNarratorId: null,
+		chapterId: question.chapterId,
+		createdAt: question.createdAt,
+		blocking: question.awaited === true,
+		canAct: true,
+		summary: question.questions[0]?.header ?? "",
+	};
+}
 const draft = JSON.stringify({
 	selections: {},
 	customInputs: { notes: "Keep this unfinished answer" },
@@ -161,10 +182,9 @@ function button(label: string) {
 
 test("the real inbox appears for a quiet open, updates urgency, and disappears after inline decisions", async () => {
 	let items: GlobalQuestion[] = [];
-	const globalList = spyOn(api, "getAllAsyncQuestions").mockImplementation(async () => ({
-		items,
-		openCount: items.length,
-		awaitedCount: items.filter((item) => item.awaited).length,
+	const globalList = spyOn(api, "getHumanAttention").mockImplementation(async () => ({
+		items: items.map(attentionItem),
+		nextCursor: null,
 	}));
 	const narratorList = spyOn(api, "getAsyncQuestions").mockImplementation(async () => ({
 		items,
@@ -194,7 +214,7 @@ test("the real inbox appears for a quiet open, updates urgency, and disappears a
 			await new Promise((resolve) => setTimeout(resolve, 0));
 		});
 	};
-	const entry = () => document.querySelector('button[aria-label="globalInboxOpen"]');
+	const entry = () => document.querySelector('button[aria-label="humanAttentionOpen"]');
 	try {
 		await render(<Harness />);
 		await settle();
@@ -229,7 +249,7 @@ test("the real inbox appears for a quiet open, updates urgency, and disappears a
 			await settle();
 			expect(entry()).toBeNull();
 			expect(qc.getQueryData(["async-questions", "n1"])).toMatchObject({ items: [], openCount: 0 });
-			expect(qc.getQueryData(globalQuestionsQueryKey)).toMatchObject({ items: [] });
+			expect(qc.getQueryData(humanAttentionListKey)).toMatchObject({ pages: [{ items: [] }] });
 		}
 	} finally {
 		globalList.mockRestore();
@@ -260,24 +280,35 @@ describe("AskUserQuestion draft identity", () => {
 		flush();
 		// A page lifecycle loses in-memory state but keeps sessionStorage.
 		resetSessionStoreForTest();
-		qc.setQueryData(globalQuestionsQueryKey, {
-			items: [deferredQuestion],
-			openCount: 1,
-			awaitedCount: 0,
+		const list = spyOn(api, "getHumanAttention").mockResolvedValue({
+			items: [attentionItem(deferredQuestion)],
+			nextCursor: null,
 		});
-		await render(<AsyncQuestionInboxDrawer opened onClose={() => {}} currentNarratorId="n1" />);
-		expect(document.querySelector("textarea")?.value).toBe("Keep this unfinished answer");
+		const detail = spyOn(api, "getHumanAttentionDetail").mockResolvedValue({
+			item: attentionItem(deferredQuestion),
+			question: deferredQuestion,
+		});
 		const answer = spyOn(api, "answerAsyncQuestion").mockResolvedValue({
 			ok: true,
 			question: { ...deferredQuestion, status: "answered" },
 		});
-		const list = spyOn(api, "getAllAsyncQuestions").mockResolvedValue({
-			items: [],
-			openCount: 0,
-			awaitedCount: 0,
-		});
 		try {
+			await render(<AsyncQuestionInboxDrawer opened onClose={() => {}} currentNarratorId="n1" />);
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			});
+			await act(async () => button("humanAttentionReview").click());
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			});
+			expect(document.querySelector("textarea")?.value).toBe("Keep this unfinished answer");
+			list.mockResolvedValue({ items: [], nextCursor: null });
 			await act(async () => button("submitAnswer").click());
+			for (let n = 0; n < 3; n++) {
+				await act(async () => {
+					await new Promise((resolve) => setTimeout(resolve, 0));
+				});
+			}
 			expect(answer).toHaveBeenCalledWith("n1", deferredQuestion.id, {
 				answers: { notes: "Keep this unfinished answer" },
 			});
@@ -285,6 +316,7 @@ describe("AskUserQuestion draft identity", () => {
 		} finally {
 			answer.mockRestore();
 			list.mockRestore();
+			detail.mockRestore();
 		}
 	});
 

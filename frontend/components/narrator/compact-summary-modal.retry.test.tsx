@@ -40,7 +40,11 @@ const realUseModels = { ...(await import("../../hooks/useModels")) };
 mock.module("../../hooks/useModels", () => ({
 	...realUseModels,
 	useAllModels: () => ({
-		visibleModels: [{ value: "provider:model", label: "Model", provider: "provider" }],
+		visibleModels: [
+			{ value: "provider:model", label: "Model", provider: "provider" },
+			{ value: "other:model", label: "Model", provider: "other" },
+		],
+		providerLabels: { provider: "Provider A", other: "Provider B" },
 		summaryModelValue: "provider:model",
 	}),
 }));
@@ -266,6 +270,39 @@ afterAll(() => {
 });
 
 describe("CompactSummaryModal failed compact retry", () => {
+	test("groups identical model names by provider and retries with the selected full model ID", async () => {
+		const retryCalls: unknown[][] = [];
+		api.retryFailedCompact = async (...args) => {
+			retryCalls.push(args);
+			return { ok: true, messageId: "compact-old" };
+		};
+		api.getCompactSummary = async () => completedDetail("retried with provider B");
+
+		await renderModal({});
+		const trigger = document.body.querySelector<HTMLButtonElement>(
+			`button[aria-label="${narratorLocale.compactRetryModel}"]`,
+		);
+		if (!trigger) throw new Error("model picker trigger not found");
+		expect(trigger.textContent).toContain("Provider A · Model");
+		await act(async () => trigger.click());
+		await settle();
+
+		const menu = document.body.querySelector("[data-model-menu-scroll]");
+		expect(menu?.textContent).toContain("Provider A");
+		expect(menu?.textContent).toContain("Provider B");
+		expect(menu?.querySelector("input")).not.toBeNull();
+		const choices = Array.from(menu?.querySelectorAll<HTMLButtonElement>("[data-menu-item]") ?? []);
+		expect(choices).toHaveLength(2);
+		expect(choices.map((choice) => choice.textContent)).toEqual(["Model", "Model"]);
+		await act(async () => choices[1].click());
+		await settle();
+		expect(trigger.textContent).toContain("Provider B · Model");
+		expect(retryCalls).toEqual([]);
+
+		await clickRetry();
+		expect(retryCalls).toEqual([["narrator-1", "compact-old", "other:model"]]);
+	});
+
 	test("resolves COW, ordinary, and legacy retry targets", () => {
 		expect(
 			resolveCompactRetryTargetMigration("compact-old", {

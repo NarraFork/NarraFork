@@ -28,6 +28,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import type { ContentBlock } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 // The behavioural cases below drive the REAL layout pipeline, which measures text
@@ -592,6 +593,21 @@ describe("live event → patch field mapping", () => {
 		);
 		expect(block(result.messages).status).toBe("success");
 		expect(block(result.messages)._timeoutMs).toBe(90_000);
+	});
+
+	it("Send awaiting reply gains navigation from the live target event", async () => {
+		const { awaitAgentResolvedPatch } = await import("./vlist-live-events");
+		const { deriveToolMeta } = await import("./vlist-tool-meta");
+		const doc = toolDoc("tu-1", "running");
+		Object.assign(block(doc), { name: "Send", input: { id: "worker", await: true } });
+		const result = awaitAgentResolvedPatch({ toolUseId: "tu-1", subagentNarratorId: "sub-live" })(
+			doc,
+		);
+		expect(
+			deriveToolMeta(block(result.messages) as unknown as ContentBlock)?.sendTargetNarratorId,
+		).toBe("sub-live");
+		expect(block(result.messages).status).toBe("running");
+		expect(block(result.messages).outputJson).toBeUndefined();
 	});
 
 	it("await_agent_resolved writes the child id without touching the lifecycle", async () => {

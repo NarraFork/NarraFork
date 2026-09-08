@@ -105,11 +105,11 @@ describe("resolveSubagentExpanded — LOD / exemption main switch", () => {
 
 describe("measureSubagentCard — collapsed header (55-75px)", () => {
 	it("collapsed with no result preview ≈ 56px (padding + badge + desc)", async () => {
-		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
+		const c = await import("./measure-subagent");
+		const { measureSubagentCard } = c;
 		// L3 forces collapse; not recent, not opened, terminal, no result.
 		const r = measureSubagentCard(BASE, WIDTH, 3, { isRecent: false, opened: false });
 		expect(r.effectiveExpanded).toBe(false);
-		const c = MEASURE_SUBAGENT_CONSTANTS;
 		// header = pad*2 + badge row + descMt + xs line ; + border*2 (not inRun).
 		const expectedHeader =
 			c.CARD_PADDING * 2 + c.BADGE_ROW_HEIGHT + c.DESC_MARGIN_TOP + c.XS_LINE_HEIGHT;
@@ -122,16 +122,16 @@ describe("measureSubagentCard — collapsed header (55-75px)", () => {
 	});
 
 	it("collapsed WITH terminal result preview adds one line (≈75px)", async () => {
-		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
+		const c = await import("./measure-subagent");
+		const { measureSubagentCard } = c;
 		const r = measureSubagentCard(
-			{ ...BASE, resultText: "The auth flow uses JWT bearer tokens." },
+			{ ...BASE, resultBody: bodyFixture("output.main", "The auth flow uses JWT bearer tokens.") },
 			WIDTH,
 			3,
 			{ isRecent: false, opened: false },
 		);
 		expect(r.effectiveExpanded).toBe(false);
 		expect(r.hasResultPreview).toBe(true);
-		const c = MEASURE_SUBAGENT_CONSTANTS;
 		const expectedHeader =
 			c.CARD_PADDING * 2 +
 			c.BADGE_ROW_HEIGHT +
@@ -169,7 +169,7 @@ describe("measureSubagentCard — expanded body", () => {
 
 	it("expanding a card with a body region is taller than collapsed", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
-		const data = { ...BASE, resultText: "one line result" };
+		const data = { ...BASE, resultBody: bodyFixture("output.main", "one line result") };
 		const collapsed = measureSubagentCard(data, WIDTH, 3, {});
 		const expanded = measureSubagentCard(data, WIDTH, 5, {});
 		// Collapsed shows only a result-preview line; expanded reveals the full
@@ -179,11 +179,22 @@ describe("measureSubagentCard — expanded body", () => {
 	});
 
 	it("expanded result is capped at maxHeight:300 (min(content, cap))", async () => {
-		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
-		const c = MEASURE_SUBAGENT_CONSTANTS;
-		const short = measureSubagentCard({ ...BASE, resultText: "one line result" }, WIDTH, 5, {});
+		const c = await import("./measure-subagent");
+		const { measureSubagentCard } = c;
+		const short = measureSubagentCard(
+			{ ...BASE, resultBody: bodyFixture("output.main", "one line result") },
+			WIDTH,
+			5,
+			{},
+		);
 		const huge = measureSubagentCard(
-			{ ...BASE, resultText: Array.from({ length: 400 }, (_, i) => `line ${i}`).join("\n\n") },
+			{
+				...BASE,
+				resultBody: bodyFixture(
+					"output.main",
+					Array.from({ length: 400 }, (_, i) => `line ${i}`).join("\n\n"),
+				),
+			},
 			WIDTH,
 			5,
 			{},
@@ -196,10 +207,10 @@ describe("measureSubagentCard — expanded body", () => {
 	});
 
 	it("prompt block: toggle row only when closed, + capped body when open (maxHeight:200)", async () => {
-		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
-		const c = MEASURE_SUBAGENT_CONSTANTS;
+		const c = await import("./measure-subagent");
+		const { measureSubagentCard } = c;
 		const closed = measureSubagentCard(
-			{ ...BASE, prompt: "do the thing", promptOpen: false },
+			{ ...BASE, promptBody: bodyFixture("input.prompt", "do the thing"), promptOpen: false },
 			WIDTH,
 			5,
 			{},
@@ -208,7 +219,7 @@ describe("measureSubagentCard — expanded body", () => {
 		expect(closed.promptBlockHeight).toBe(c.PROMPT_TOGGLE_ROW_HEIGHT + c.BLOCK_PADDING_BOTTOM);
 
 		const openShort = measureSubagentCard(
-			{ ...BASE, prompt: "short prompt", promptOpen: true },
+			{ ...BASE, promptBody: bodyFixture("input.prompt", "short prompt"), promptOpen: true },
 			WIDTH,
 			5,
 			{},
@@ -219,7 +230,10 @@ describe("measureSubagentCard — expanded body", () => {
 		const openHuge = measureSubagentCard(
 			{
 				...BASE,
-				prompt: Array.from({ length: 400 }, (_, i) => `prompt line ${i}`).join("\n"),
+				promptBody: bodyFixture(
+					"input.prompt",
+					Array.from({ length: 400 }, (_, i) => `prompt line ${i}`).join("\n"),
+				),
 				promptOpen: true,
 			},
 			WIDTH,
@@ -238,9 +252,28 @@ describe("measureSubagentCard — expanded body", () => {
 	it("expanded body grows monotonically as regions are added", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
 		const bare = measureSubagentCard(BASE, WIDTH, 5, {});
-		const withPrompt = measureSubagentCard({ ...BASE, prompt: "p" }, WIDTH, 5, {});
-		const withResult = measureSubagentCard({ ...BASE, resultText: "r" }, WIDTH, 5, {});
-		const withBoth = measureSubagentCard({ ...BASE, prompt: "p", resultText: "r" }, WIDTH, 5, {});
+		const withPrompt = measureSubagentCard(
+			{ ...BASE, promptBody: bodyFixture("input.prompt", "p") },
+			WIDTH,
+			5,
+			{},
+		);
+		const withResult = measureSubagentCard(
+			{ ...BASE, resultBody: bodyFixture("output.main", "r") },
+			WIDTH,
+			5,
+			{},
+		);
+		const withBoth = measureSubagentCard(
+			{
+				...BASE,
+				promptBody: bodyFixture("input.prompt", "p"),
+				resultBody: bodyFixture("output.main", "r"),
+			},
+			WIDTH,
+			5,
+			{},
+		);
 		expect(withPrompt.height).toBeGreaterThan(bare.height);
 		expect(withResult.height).toBeGreaterThan(bare.height);
 		expect(withBoth.height).toBeGreaterThan(withPrompt.height);
@@ -248,8 +281,8 @@ describe("measureSubagentCard — expanded body", () => {
 	});
 
 	it("resolveOverride adds a button block when present", async () => {
-		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
-		const c = MEASURE_SUBAGENT_CONSTANTS;
+		const c = await import("./measure-subagent");
+		const { measureSubagentCard } = c;
 		const without = measureSubagentCard(BASE, WIDTH, 5, {});
 		const withOverride = measureSubagentCard({ ...BASE, hasResolveOverride: true }, WIDTH, 5, {});
 		expect(withOverride.resolveOverrideHeight).toBe(
@@ -261,8 +294,8 @@ describe("measureSubagentCard — expanded body", () => {
 
 describe("measureSubagentCard — recent calls (independent of expansion)", () => {
 	it("recent calls show even when collapsed; ≤3 rows", async () => {
-		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
-		const c = MEASURE_SUBAGENT_CONSTANTS;
+		const c = await import("./measure-subagent");
+		const { measureSubagentCard } = c;
 		const none = measureSubagentCard(BASE, WIDTH, 3, {});
 		expect(none.recentCallsHeight).toBe(0);
 
@@ -286,8 +319,8 @@ describe("measureSubagentCard — recent calls (independent of expansion)", () =
 	});
 
 	it("recent-calls title button row uses the taller compact-xs when present", async () => {
-		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
-		const c = MEASURE_SUBAGENT_CONSTANTS;
+		const c = await import("./measure-subagent");
+		const { measureSubagentCard } = c;
 		const withBtn = measureSubagentCard(
 			{ ...BASE, recentCallCount: 1, hasRecentCallsButton: true },
 			WIDTH,
@@ -405,8 +438,8 @@ describe("measureSubagentCard — permission integration (P11) + P10 dependency"
 	});
 
 	it("pending permissions force expansion; placeholder used without P10 detail", async () => {
-		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
-		const c = MEASURE_SUBAGENT_CONSTANTS;
+		const c = await import("./measure-subagent");
+		const { measureSubagentCard } = c;
 		const r = measureSubagentCard(BASE, WIDTH, 3, { pendingPermissionCount: 2 });
 		expect(r.effectiveExpanded).toBe(true);
 		expect(r.pendingCardCount).toBe(2);
@@ -419,9 +452,9 @@ describe("measureSubagentCard — permission integration (P11) + P10 dependency"
 	});
 
 	it("pending permissions with P11 detail refine the card estimate", async () => {
-		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
+		const c = await import("./measure-subagent");
+		const { measureSubagentCard } = c;
 		const { measureInlinePermission } = await import("./measure-permission");
-		const c = MEASURE_SUBAGENT_CONSTANTS;
 		const detail = { hasExecutionTarget: true, buttonCount: 2 };
 		const r = measureSubagentCard({ ...BASE, pendingPermissions: [detail] }, WIDTH, 3, {});
 		expect(r.pendingCardCount).toBe(1);
@@ -439,8 +472,8 @@ describe("measureSubagentCard — permission integration (P11) + P10 dependency"
 
 describe("measureSubagentCard — outer frame (inRun vs Paper)", () => {
 	it("inRun=false adds a Paper border; inRun=true removes it", async () => {
-		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
-		const c = MEASURE_SUBAGENT_CONSTANTS;
+		const c = await import("./measure-subagent");
+		const { measureSubagentCard } = c;
 		const boxed = measureSubagentCard(BASE, WIDTH, 3, { inRun: false });
 		const inRun = measureSubagentCard(BASE, WIDTH, 3, { inRun: true, isLast: true });
 		expect(boxed.borderHeight).toBe(c.CARD_BORDER * 2);
@@ -450,8 +483,8 @@ describe("measureSubagentCard — outer frame (inRun vs Paper)", () => {
 	});
 
 	it("inRun && !isLast adds a 1px divider", async () => {
-		const { measureSubagentCard, MEASURE_SUBAGENT_CONSTANTS } = await import("./measure-subagent");
-		const c = MEASURE_SUBAGENT_CONSTANTS;
+		const c = await import("./measure-subagent");
+		const { measureSubagentCard } = c;
 		const notLast = measureSubagentCard(BASE, WIDTH, 3, { inRun: true, isLast: false });
 		const last = measureSubagentCard(BASE, WIDTH, 3, { inRun: true, isLast: true });
 		expect(notLast.dividerHeight).toBe(c.DIVIDER_HEIGHT);
@@ -469,15 +502,15 @@ describe("measureSubagentCard — width sensitivity + reusable measurer", () => 
 		expect(narrow.height).toBeGreaterThan(wide.height);
 	});
 
-	it("prepareSubagentMeasurer measures once and re-runs across widths/LODs", async () => {
-		const { prepareSubagentMeasurer } = await import("./measure-subagent");
-		const measure = prepareSubagentMeasurer({
+	it("re-measures the same subagent data across widths/LODs", async () => {
+		const { measureSubagentCard } = await import("./measure-subagent");
+		const data = {
 			...BASE,
 			description: "a recurring subagent description phrase for wrapping",
-			resultText: "some result body",
-		});
-		const collapsed = measure(WIDTH, 3, {});
-		const expanded = measure(WIDTH, 5, {});
+			resultBody: bodyFixture("output.main", "some result body"),
+		};
+		const collapsed = measureSubagentCard(data, WIDTH, 3, {});
+		const expanded = measureSubagentCard(data, WIDTH, 5, {});
 		expect(collapsed.effectiveExpanded).toBe(false);
 		expect(expanded.effectiveExpanded).toBe(true);
 		expect(expanded.height).toBeGreaterThan(collapsed.height);
@@ -594,6 +627,97 @@ describe("measureSubagent — file changes", () => {
 		).toBe(false);
 	});
 
+	it.each([
+		{ bashTouchedCount: 3 },
+		{ countsTruncated: true },
+		{ totalUnmeasured: 2 },
+		{ totalFiles: 7 },
+	])("reserves summary-only blocks without negative file gaps: %j", async (summary) => {
+		const { measureSubagentCard, BLOCK_PADDING_BOTTOM } = await import("./measure-subagent");
+		const measured = measureSubagentCard(
+			{ ...baseCard(), fileChanges: changes(0, summary) },
+			600,
+			5,
+		);
+		expect(measured.fileChangeRowCount).toBe(0);
+		expect(measured.hasFileChangeOverflowRow).toBe(true);
+		expect(measured.fileChangeNoticeRowCount).toBe(1);
+		// Title + legacy notice + summary, and NO seam between nonexistent files.
+		expect(measured.fileChangesHeight).toBeCloseTo(
+			3 * measured.fileChangeRowHeight + BLOCK_PADDING_BOTTOM,
+			5,
+		);
+	});
+
+	it("reserves legacy and optional boundary notices, including old payloads", async () => {
+		const { measureSubagentCard } = await import("./measure-subagent");
+		const oldPayload = measureSubagentCard({ ...baseCard(), fileChanges: changes(1) }, 600, 5);
+		const scoped = measureSubagentCard(
+			{
+				...baseCard(),
+				fileChanges: changes(1, {
+					attributionScope: "legacy_unscoped",
+					scope: { sourceToolUseId: "parent-call", startedAt: null, completedAt: null },
+				}),
+			},
+			600,
+			5,
+		);
+		expect(oldPayload.fileChangeNoticeRowCount).toBe(1);
+		expect(scoped.fileChangeNoticeRowCount).toBe(2);
+		expect(scoped.fileChangesHeight - oldPayload.fileChangesHeight).toBeCloseTo(
+			scoped.fileChangeRowHeight,
+			5,
+		);
+	});
+
+	it("keeps a collapse affordance after expanding every file", async () => {
+		const { measureSubagentCard } = await import("./measure-subagent");
+		const expanded = measureSubagentCard(
+			{ ...baseCard(), fileChanges: changes(12), fileChangesExpanded: true },
+			600,
+			5,
+		);
+		expect(expanded.fileChangeRowCount).toBe(12);
+		expect(expanded.hasFileChangeOverflowRow).toBe(true);
+		const folded = measureSubagentCard(
+			{ ...baseCard(), fileChanges: changes(0, { bashTouchedCount: 2 }) },
+			600,
+			5,
+			{ opened: false },
+		);
+		expect(folded.effectiveExpanded).toBe(false);
+		expect(folded.fileChangesHeight).toBe(0);
+	});
+
+	it("keeps device/workspace/child identity and unknown location distinct", async () => {
+		const { subagentFileChangeIdentityKey, measureSubagentCard } = await import(
+			"./measure-subagent"
+		);
+		const rows = [
+			{ ...file("same.ts"), deviceId: "remote-a", workspacePath: "/repo" },
+			{ ...file("same.ts"), deviceId: "remote-b", workspacePath: "/repo" },
+			{ ...file("same.ts"), deviceId: "remote-a", workspacePath: "/other" },
+			{
+				...file("same.ts"),
+				deviceId: "remote-a",
+				workspacePath: "/repo",
+				subagentNarratorId: "other",
+			},
+			file("same.ts"),
+		];
+		expect(new Set(rows.map(subagentFileChangeIdentityKey)).size).toBe(rows.length);
+		expect(subagentFileChangeIdentityKey(file("same.ts"))).toBe(
+			JSON.stringify([null, null, null, "same.ts"]),
+		);
+		const measured = measureSubagentCard(
+			{ ...baseCard(), fileChanges: { ...changes(5), files: rows } },
+			600,
+			5,
+		);
+		expect(measured.fileChangeRowCount).toBe(5);
+	});
+
 	it("costs nothing while the card is folded", async () => {
 		// The block lives in the EXPANDED region, so a folded card must be unaffected.
 		// L3 folds unconditionally (`resolveSubagentExpanded`), which is why the LOD —
@@ -606,3 +730,19 @@ describe("measureSubagent — file changes", () => {
 		expect(withFiles.fileChangesHeight).toBe(0);
 	});
 });
+
+function bodyFixture(
+	source: "input.prompt" | "output.main",
+	text: string,
+): import("@shared/pretext-layout/tool-detail").ToolCappedDetail {
+	return {
+		kind: "capped",
+		id: JSON.stringify(["fixture-call", source]),
+		source,
+		cap: source === "input.prompt" ? "code" : "agent-result",
+		text,
+		format: source === "input.prompt" ? "text" : "markdown",
+		live: false,
+		followTarget: { kind: "end" },
+	};
+}

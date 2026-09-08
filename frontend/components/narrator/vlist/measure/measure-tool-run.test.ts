@@ -668,14 +668,32 @@ describe("row status + timing are height-neutral", () => {
 // ── Drill-down: an expanded tool row nests a real tool card ───────────────────
 
 /** A minimal ToolCallData with a capped code detail (the common Read shape). */
-function drillCard(text = "line\n".repeat(4)) {
+function drillCard(text = "line\n".repeat(4)): import("./measure-tool-call").ToolCallData {
 	return {
 		toolName: "Read",
 		summary: "src/index.ts",
 		category: "read" as const,
 		status: "success" as const,
 		toolUseId: "tu-0",
-		detail: { kind: "capped" as const, cap: "code" as const, text, hasLabel: true },
+		detail: {
+			kind: "sections",
+			sections: [
+				{
+					key: "output.main",
+					label: "output",
+					body: {
+						kind: "capped",
+						cap: "code",
+						id: '["tu-0","output.main"]',
+						source: "output.main",
+						format: "code",
+						live: false,
+						followTarget: { kind: "end" },
+						text,
+					},
+				},
+			],
+		},
 	};
 }
 

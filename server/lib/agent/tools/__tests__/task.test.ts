@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
-import type { ToolContext, ToolUpdateExecutionLease } from "../../types";
+import { settings } from "../../../settings";
+import type { AgentConfig, ToolContext, ToolUpdateExecutionLease } from "../../types";
 
 const runCalls: Array<Record<string, unknown>> = [];
 let agentTool: typeof import("../task").agentTool;
@@ -24,6 +25,42 @@ afterAll(() => {
 });
 
 describe("Agent task tool", () => {
+	test("schema advertises fixed global tiers but never invents one for unconfigured models", () => {
+		settings.agent.subagentAllowedModels = {
+			explore: ["p:legacy"],
+			plan: [],
+			general: [],
+			review: ["p:review"],
+			search: ["p:search"],
+		};
+		settings.agent.subagentModelReasoningEfforts = {
+			review: { "p:review": "high" },
+			search: { "p:search": "none" },
+			explore: { "p:not-in-pool": "max" },
+		};
+		const schema = agentTool.rawJsonSchema as {
+			properties: Record<string, { description: string }>;
+		};
+		expect(schema.properties.model.description).toContain("p:review [fixed reasoning_effort=high]");
+		expect(schema.properties.model.description).toContain("p:search [fixed reasoning_effort=none]");
+		expect(schema.properties.model.description).not.toContain("p:legacy [fixed");
+		expect(schema.properties.model.description).not.toContain("p:not-in-pool");
+		expect(schema.properties.reasoning_effort.description).toContain("overrides this parameter");
+		expect(agentTool.parameters.safeParse({ reasoning_effort: "none" }).success).toBe(true);
+		expect(agentTool.parameters.safeParse({ reasoning_effort: "invalid" }).success).toBe(false);
+	});
+
+	test("custom effective pool description takes precedence over global metadata", () => {
+		settings.agent.subagentAllowedModels = { explore: ["p:global"], plan: [], general: [] };
+		settings.agent.subagentModelReasoningEfforts = { explore: { "p:global": "high" } };
+		const custom = "explore: p:custom [fixed reasoning_effort=medium]";
+		const schema = agentTool.getRawJsonSchema?.({
+			subagentModelRestrictionDescription: custom,
+		} as AgentConfig) as { properties: Record<string, { description: string }> };
+		expect(schema.properties.model.description).toContain(custom);
+		expect(schema.properties.model.description).not.toContain("p:global");
+	});
+
 	test("passes the executeTool lease into the subagent runner for transfer", async () => {
 		const updateExecutionLease: ToolUpdateExecutionLease = {
 			kind: "resumable",
@@ -37,6 +74,7 @@ describe("Agent task tool", () => {
 			signal: new AbortController().signal,
 			locale: "en",
 			currentToolUseId: "agent-tool-use",
+			toolCallBinding: { toolCallId: "agent-row-1", attempt: 1 },
 			updateExecutionLease,
 			requestPermission: async () => ({ behavior: "allow" }),
 		};
@@ -55,6 +93,7 @@ describe("Agent task tool", () => {
 		expect(runCalls[0]).toMatchObject({
 			parentNarratorId: "parent-narrator",
 			toolUseId: "agent-tool-use",
+			toolCallBinding: ctx.toolCallBinding,
 			updateExecutionLease,
 		});
 		expect(updateExecutionLease.transfer).not.toHaveBeenCalled();
@@ -71,6 +110,7 @@ describe("Agent task tool", () => {
 			signal: new AbortController().signal,
 			locale: "en",
 			currentToolUseId: "agent-tool-use-2",
+			toolCallBinding: { toolCallId: "agent-row-2", attempt: 1 },
 			userId: "user-42",
 			updateExecutionLease: {
 				kind: "resumable",
@@ -96,6 +136,7 @@ describe("Agent task tool", () => {
 			signal: new AbortController().signal,
 			locale: "en",
 			currentToolUseId: "agent-tool-use-3",
+			toolCallBinding: { toolCallId: "agent-row-3", attempt: 1 },
 			updateExecutionLease: {
 				kind: "resumable",
 				setNarratorId: mock(() => {}),

@@ -35,7 +35,7 @@
  */
 
 import type { SideCarAsyncQuestionAnswer, SideCarBody } from "@shared/sidecar-body";
-import { and, desc, eq, inArray, lt, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lt, or, type SQLWrapper, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorQuestions, narrators, narratorToolCalls } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
@@ -45,6 +45,7 @@ import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { sideCarBodyWithText } from "../lib/sidecar-templates";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { notifyHumanAttentionChanged } from "./human-attention-events";
 import { type DeliverInjectionOptions, deliverInjection } from "./narrator-injection";
 
 /** One question as the tool defined it. Structurally the tool's own input shape. */
@@ -255,6 +256,8 @@ async function broadcastChange(
 	record: AsyncQuestionRecord,
 	change: AsyncQuestionChange,
 ): Promise<void> {
+	// Global discovery must not depend on a narrator subscription or successful local delivery.
+	notifyHumanAttentionChanged();
 	const seam = await resolveSeam();
 	// `awaited` is re-read here rather than taken from `record`: a record captured before
 	// the wait started (which is what the `awaited` / `await_ended` transitions carry)
@@ -422,6 +425,57 @@ export async function getAsyncQuestion(id: string): Promise<AsyncQuestionRecord 
 		where: eq(narratorQuestions.id, id),
 	});
 	return row ? toRecord(row) : null;
+}
+
+/** Single-item lazy read. CASE prevents SQLite/Drizzle from materializing oversized JSON. */
+export async function getBoundedOpenAsyncQuestion(
+	id: string,
+	maxBytes: number,
+): Promise<{ record: AsyncQuestionRecord | null; tooLarge: boolean }> {
+	const bytes = sql`coalesce(length(cast(${narratorQuestions.questionsJson} as blob)), 0)
+		+ coalesce(length(cast(${narratorQuestions.answersJson} as blob)), 0)
+		+ coalesce(length(cast(${narratorQuestions.annotationsJson} as blob)), 0)`;
+	const bounded = (column: SQLWrapper) =>
+		sql<string | null>`case when ${bytes} <= ${maxBytes} then ${column} else null end`;
+	const row = await db
+		.select({
+			id: narratorQuestions.id,
+			narratorId: narratorQuestions.narratorId,
+			toolCallId: narratorQuestions.toolCallId,
+			toolUseId: narratorQuestions.toolUseId,
+			questionsJson: bounded(narratorQuestions.questionsJson),
+			answersJson: bounded(narratorQuestions.answersJson),
+			annotationsJson: bounded(narratorQuestions.annotationsJson),
+			withinBudget: sql<number>`${bytes} <= ${maxBytes}`,
+			status: narratorQuestions.status,
+			origin: narratorQuestions.origin,
+			answerMessageId: narratorQuestions.answerMessageId,
+			decidedBy: narratorQuestions.decidedBy,
+			decidedAt: narratorQuestions.decidedAt,
+			createdAt: narratorQuestions.createdAt,
+		})
+		.from(narratorQuestions)
+		.where(and(eq(narratorQuestions.id, id), eq(narratorQuestions.status, "open")))
+		.limit(1)
+		.get();
+	if (!row) return { record: null, tooLarge: false };
+	if (!row.withinBudget) return { record: null, tooLarge: true };
+	const parse = (value: string | null): unknown => {
+		try {
+			return value === null ? null : JSON.parse(value);
+		} catch {
+			return null;
+		}
+	};
+	return {
+		record: toRecord({
+			...row,
+			questionsJson: parse(row.questionsJson),
+			answersJson: parse(row.answersJson),
+			annotationsJson: parse(row.annotationsJson),
+		}),
+		tooLarge: false,
+	};
 }
 
 /** An open question plus the narrator context the global inbox needs to label it. */

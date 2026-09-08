@@ -12,6 +12,43 @@ function msg(contentJson: ContentBlock[], id = "m1"): NarratorMsg {
 	return { id, seq: 1, role: "assistant", contentJson } as unknown as NarratorMsg;
 }
 
+describe("running Send navigation", () => {
+	it("reads the live resolution without output or lifecycle mutation", () => {
+		const block = toolBlock({
+			name: "Send",
+			input: { name: "worker", await: true },
+			status: "running",
+			_awaitAgentNarratorId: "sub-live",
+		});
+		expect(deriveToolMeta(block)?.sendTargetNarratorId).toBe("sub-live");
+		expect(block).not.toHaveProperty("outputJson");
+	});
+	it("never overrides returned targets or guesses parent and multiple inputs", () => {
+		for (const input of [{ id: "parent" }, { ids: ["a", "b"] }, { id: "a", name: "b" }]) {
+			expect(
+				deriveToolMeta(toolBlock({ name: "Send", input, _awaitAgentNarratorId: "sub-live" }))
+					?.sendTargetNarratorId,
+			).toBeUndefined();
+		}
+		for (const targets of [
+			[],
+			[{ id: "a" }, { id: "b" }],
+			[{ id: "real-parent", label: "parent" }],
+		]) {
+			expect(
+				deriveToolMeta(
+					toolBlock({
+						name: "Send",
+						input: { id: "a" },
+						_metadata: { targets },
+						_awaitAgentNarratorId: "sub-live",
+					}),
+				)?.sendTargetNarratorId,
+			).toBeUndefined();
+		}
+	});
+});
+
 describe("deriveToolMeta", () => {
 	it("returns null for non tool_use blocks", () => {
 		expect(deriveToolMeta({ type: "text", text: "hi" } as ContentBlock)).toBeNull();

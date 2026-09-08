@@ -1,12 +1,15 @@
-import { and, eq, inArray, ne } from "drizzle-orm";
+import type { FileReference } from "@shared/file-reference";
+import { and, eq, inArray, isNotNull, ne, or } from "drizzle-orm";
 import { db } from "../db";
 import { narratorDrafts } from "../db/schema";
+import { copyFileReference } from "../lib/agent/file-reference-projection";
 import { narratorDraftLock } from "../lib/async-mutex";
 import { generateId } from "../lib/id";
 
 export interface NarratorDraftState {
 	hasDraft: boolean;
 	text: string;
+	fileReferences: FileReference[];
 	revision: number;
 	updatedAt: string | null;
 	updatedBy: string | null;
@@ -28,6 +31,7 @@ function emptyDraftState(): NarratorDraftState {
 	return {
 		hasDraft: false,
 		text: "",
+		fileReferences: [],
 		revision: 0,
 		updatedAt: null,
 		updatedBy: null,
@@ -39,6 +43,7 @@ function rowToDraftState(
 	row:
 		| {
 				text: string;
+				fileReferencesJson?: string | null;
 				revision: number;
 				updatedAt: string;
 				sourceId: string | null;
@@ -47,9 +52,13 @@ function rowToDraftState(
 	userId: string,
 ): NarratorDraftState {
 	if (!row) return emptyDraftState();
+	const fileReferences: FileReference[] = row.fileReferencesJson
+		? (JSON.parse(row.fileReferencesJson) as FileReference[]).map(copyFileReference)
+		: [];
 	return {
-		hasDraft: !!row.text.trim(),
+		hasDraft: !!row.text.trim() || fileReferences.length > 0,
 		text: row.text,
+		fileReferences,
 		revision: row.revision,
 		updatedAt: row.updatedAt,
 		updatedBy: userId,
@@ -57,17 +66,46 @@ function rowToDraftState(
 	};
 }
 
+/**
+ * A legacy text-only client cannot move token offsets. Retain only occurrences
+ * whose existing, nonempty token still occupies exactly the same input range.
+ * Detached chips have no verifiable range and cannot survive an omitted field.
+ */
+export function retainMatchingDraftFileReferences(
+	previousText: string,
+	text: string,
+	references: readonly FileReference[],
+): FileReference[] {
+	return references.filter((reference) => {
+		const range = reference.inputRange;
+		if (!range) return false;
+		const [start, end] = range;
+		return (
+			Number.isInteger(start) &&
+			Number.isInteger(end) &&
+			start >= 0 &&
+			end > start &&
+			end <= previousText.length &&
+			end <= text.length &&
+			previousText.slice(start, end) === text.slice(start, end)
+		);
+	});
+}
+
+const draftColumns = {
+	text: narratorDrafts.text,
+	fileReferencesJson: narratorDrafts.fileReferencesJson,
+	revision: narratorDrafts.revision,
+	updatedAt: narratorDrafts.updatedAt,
+	sourceId: narratorDrafts.sourceId,
+};
+
 export async function getNarratorDraft(
 	userId: string,
 	narratorId: string,
 ): Promise<NarratorDraftState> {
 	const row = await db
-		.select({
-			text: narratorDrafts.text,
-			revision: narratorDrafts.revision,
-			updatedAt: narratorDrafts.updatedAt,
-			sourceId: narratorDrafts.sourceId,
-		})
+		.select(draftColumns)
 		.from(narratorDrafts)
 		.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId)))
 		.get();
@@ -80,15 +118,13 @@ export async function updateNarratorDraft(
 	text: string,
 	sourceId?: string,
 	baseRevision?: number,
+	fileReferences?: FileReference[],
 ): Promise<NarratorDraftUpdateResult> {
+	// Capture metadata before awaiting the lock: text and references are one CAS value.
+	const suppliedReferences = fileReferences?.map(copyFileReference);
 	return narratorDraftLock.acquire(`${userId.length}:${userId}:${narratorId}`, async () => {
 		const previous = await db
-			.select({
-				text: narratorDrafts.text,
-				revision: narratorDrafts.revision,
-				updatedAt: narratorDrafts.updatedAt,
-				sourceId: narratorDrafts.sourceId,
-			})
+			.select(draftColumns)
 			.from(narratorDrafts)
 			.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId)))
 			.get();
@@ -100,38 +136,33 @@ export async function updateNarratorDraft(
 
 		const now = new Date().toISOString();
 		const storedText = text.trim() ? text : "";
-		// Preserve the existing source attribution when the caller omits sourceId
-		// (undefined) rather than clobbering it to null; only an explicit value
-		// reassigns it. This keeps cross-device "who typed this" attribution stable
-		// for clients that don't resend sourceId on every autosave.
+		const storedReferences =
+			suppliedReferences ??
+			retainMatchingDraftFileReferences(current.text, storedText, current.fileReferences);
+		const fileReferencesJson = storedReferences.length ? JSON.stringify(storedReferences) : null;
+		// Omission keeps the previous source attribution for legacy autosave clients.
 		const storedSourceId = sourceId ?? current.sourceId ?? null;
 		const nextRevision = current.revision + 1;
-
+		const fields = {
+			text: storedText,
+			fileReferencesJson,
+			sourceId: storedSourceId,
+			revision: nextRevision,
+			updatedAt: now,
+		};
 		await db
 			.insert(narratorDrafts)
-			.values({
-				id: generateId(),
-				userId,
-				narratorId,
-				text: storedText,
-				sourceId: storedSourceId,
-				revision: nextRevision,
-				updatedAt: now,
-			})
+			.values({ id: generateId(), userId, narratorId, ...fields })
 			.onConflictDoUpdate({
 				target: [narratorDrafts.userId, narratorDrafts.narratorId],
-				set: {
-					text: storedText,
-					sourceId: storedSourceId,
-					revision: nextRevision,
-					updatedAt: now,
-				},
+				set: fields,
 			});
 
 		return {
 			previousHasDraft: current.hasDraft,
-			hasDraft: !!storedText,
+			hasDraft: !!storedText || storedReferences.length > 0,
 			text: storedText,
+			fileReferences: storedReferences,
 			revision: nextRevision,
 			updatedAt: now,
 			updatedBy: userId,
@@ -140,12 +171,12 @@ export async function updateNarratorDraft(
 	});
 }
 
-/**
- * Cheap presence check for a single narrator that never materializes the draft
- * text. Use this when only `hasDraft` is needed (e.g. the narrator detail /
- * by-handle endpoints); `getNarratorDraft` reads the full text column (up to
- * MAX_NARRATOR_DRAFT_CHARS) which is wasteful just to derive a boolean.
- */
+// Empty reference lists are always stored as NULL. Presence queries return only
+// ids: neither the draft text nor the up-to-64-KiB locator JSON is materialized.
+function draftPresent() {
+	return or(ne(narratorDrafts.text, ""), isNotNull(narratorDrafts.fileReferencesJson));
+}
+
 export async function narratorHasDraft(userId: string, narratorId: string): Promise<boolean> {
 	const row = await db
 		.select({ narratorId: narratorDrafts.narratorId })
@@ -154,7 +185,7 @@ export async function narratorHasDraft(userId: string, narratorId: string): Prom
 			and(
 				eq(narratorDrafts.userId, userId),
 				eq(narratorDrafts.narratorId, narratorId),
-				ne(narratorDrafts.text, ""),
+				draftPresent(),
 			),
 		)
 		.get();
@@ -173,7 +204,7 @@ export async function getNarratorIdsWithDraft(
 			and(
 				eq(narratorDrafts.userId, userId),
 				inArray(narratorDrafts.narratorId, narratorIds),
-				ne(narratorDrafts.text, ""),
+				draftPresent(),
 			),
 		);
 	return new Set(rows.map((row) => row.narratorId));

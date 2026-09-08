@@ -232,6 +232,99 @@ describe("subagent snapshot hooks record boundaries", () => {
 		expect(row?.treeHashAfter).toBeNull();
 	});
 
+	for (const target of [
+		"remote-override",
+		"local-override-remote-default",
+		"outside",
+		"workdir",
+	] as const) {
+		test(`unverified ${target} records unknown boundaries, not a local no-op`, async () => {
+			const repo = await createRepo("nf-sa-snap-unknown-target-");
+			const narratorId = await createSubagent(repo);
+			const session: TreeSnapshotSession = {
+				cwd: repo,
+				...(target === "local-override-remote-default" && { _defaultDeviceId: "remote-a" }),
+			};
+			const hooks = buildTreeSnapshotEventHooks({ session, narratorId, isInGitRepo: true });
+			const toolName = target === "workdir" ? "Bash" : "Write";
+			const { toolUseId } = await seedToolCall(narratorId, toolName, 1);
+			writeFileSync(join(repo, "a.txt"), "local bytes\n");
+			const input = {
+				file_path: target === "outside" ? join(repo, "..", "outside.txt") : join(repo, "a.txt"),
+				...(target === "remote-override" && { device: "remote-a" }),
+				...(target === "local-override-remote-default" && { device: "local" }),
+				...(target === "workdir" && { command: "...", workdir: join(repo, "..") }),
+			};
+			const capture = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
+			try {
+				await hooks.onSnapshotBefore?.(toolUseId, toolName, input);
+				await hooks.onSnapshotAfter?.(toolUseId, toolName);
+				expect(capture).not.toHaveBeenCalled();
+			} finally {
+				capture.mockRestore();
+			}
+			const row = await readToolCallBoundaries(toolUseId);
+			expect(row?.treeHashBefore).toBeNull();
+			expect(row?.treeHashAfter).toBeNull();
+			expect(row?.ownedPathsJson).toBeNull();
+		});
+	}
+
+	test("a remote retry clears earlier local evidence and never consumes the session cache", async () => {
+		const repo = await createRepo("nf-sa-snap-remote-retry-");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		const hooks = buildTreeSnapshotEventHooks({ session, narratorId, isInGitRepo: true });
+		const { toolUseId, messageId } = await seedToolCall(narratorId, "Write", 1);
+		writeFileSync(join(repo, "a.txt"), "before\n");
+		await hooks.onSnapshotBefore?.(toolUseId, "Write", { file_path: join(repo, "a.txt") });
+		writeFileSync(join(repo, "a.txt"), "after\n");
+		await hooks.onSnapshotAfter?.(toolUseId, "Write");
+		expect(session._lastTreeHash).toMatch(/^[0-9a-f]{40}$/);
+		expect((await readToolCallBoundaries(toolUseId))?.ownedPathsJson).toEqual(["a.txt"]);
+
+		// Re-execution may reuse the row after the default device changed. Even an
+		// explicit local override cannot prove that the remote session cwd is local.
+		session._defaultDeviceId = "remote-a";
+		const capture = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
+		try {
+			await hooks.onSnapshotBefore?.(toolUseId, "Write", {
+				file_path: join(repo, "a.txt"),
+				device: "local",
+			});
+			await hooks.onSnapshotAfter?.(toolUseId, "Write");
+			expect(capture).not.toHaveBeenCalled();
+		} finally {
+			capture.mockRestore();
+		}
+		expect(await readToolCallBoundaries(toolUseId)).toEqual({
+			treeHashBefore: null,
+			treeHashAfter: null,
+			ownedPathsJson: null,
+		});
+		const message = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { treeHashAfter: true },
+		});
+		expect(message?.treeHashAfter).toBeNull();
+	});
+
+	test("an explicit local override in a local session still records a real boundary", async () => {
+		const repo = await createRepo("nf-sa-snap-local-override-");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		const hooks = buildTreeSnapshotEventHooks({ session, narratorId, isInGitRepo: true });
+		const { toolUseId } = await seedToolCall(narratorId, "Write", 1);
+		writeFileSync(join(repo, "a.txt"), "before\n");
+		await hooks.onSnapshotBefore?.(toolUseId, "Write", {
+			file_path: join(repo, "a.txt"),
+			device: "local",
+		});
+		writeFileSync(join(repo, "a.txt"), "after\n");
+		await hooks.onSnapshotAfter?.(toolUseId, "Write");
+		expect((await readToolCallBoundaries(toolUseId))?.ownedPathsJson).toEqual(["a.txt"]);
+	});
+
 	test("the treeSnapshotsEnabled escape hatch applies to subagents too", async () => {
 		// The setting exists for worktrees whose whole-tree scan is not viable at all.
 		// It gates `captureSessionTree`, so it has to reach the subagent path as well —

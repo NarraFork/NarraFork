@@ -1,8 +1,13 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { basename, extname, join } from "node:path";
+import type { FileReference, FileReferenceSnapshot } from "@shared/file-reference";
 import { eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import { narratorBufferedMessages } from "../db/schema";
+import {
+	copyFileReference,
+	freezeFileReferenceSnapshots,
+} from "../lib/agent/file-reference-projection";
 import { generateShortId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import type { ImageRef } from "../lib/uploads";
@@ -151,6 +156,7 @@ function dbInsertBuffered(
 	savedFiles?: SavedBufferedFile[],
 	priority = false,
 	bashCommand?: string | null,
+	fileReferences?: FileReferenceSnapshot[],
 ): void {
 	db.insert(narratorBufferedMessages)
 		.values({
@@ -165,6 +171,7 @@ function dbInsertBuffered(
 			createdBy: createdBy ?? null,
 			creatorJson: creator ? JSON.stringify(creator) : null,
 			textFilePathsJson: savedFiles?.length ? JSON.stringify(savedFiles) : null,
+			fileReferencesJson: fileReferences?.length ? JSON.stringify(fileReferences) : null,
 			priority,
 		})
 		.run();
@@ -193,28 +200,37 @@ export async function pushBufferedMessage(
 	textFiles?: File[],
 	position: "back" | "front" = "back",
 	bashCommand?: string | null,
+	fileReferences?: FileReferenceSnapshot[],
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
 	if (!canQueueForNarrator(narratorId)) {
 		return { ok: false, bufferedAt: "", id: "" };
 	}
-	const queue = bufferedMessages.get(narratorId) ?? [];
-	if (queue.length >= MAX_BUFFERED_MESSAGES) {
+	if ((bufferedMessages.get(narratorId)?.length ?? 0) >= MAX_BUFFERED_MESSAGES) {
 		return { ok: false, bufferedAt: "", id: "", full: true };
 	}
 	const id = generateShortId();
 	const bufferedAt = new Date().toISOString();
+	const acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
 
 	let savedFiles: SavedBufferedFile[] | undefined;
 	if (textFiles?.length) {
 		savedFiles = await persistBufferedTextFiles(id, textFiles);
 	}
 
+	// Upload persistence above may yield. Read the live queue again rather than
+	// overwriting messages that arrived or were consumed while saving files.
+	const queue = [...(bufferedMessages.get(narratorId) ?? [])];
+	if (queue.length >= MAX_BUFFERED_MESSAGES) {
+		cleanupBufferedTextFiles(id);
+		return { ok: false, bufferedAt: "", id: "", full: true };
+	}
 	const priority = position === "front";
 	const entry: BufferedMessage = {
 		id,
 		text,
 		images,
 		textFiles,
+		fileReferences: acceptedReferences,
 		bufferedAt,
 		commandText,
 		bashCommand: bashCommand ?? null,
@@ -245,6 +261,7 @@ export async function pushBufferedMessage(
 				savedFiles,
 				priority,
 				bashCommand,
+				acceptedReferences,
 			);
 		})();
 	} else {
@@ -262,6 +279,7 @@ export async function pushBufferedMessage(
 			savedFiles,
 			priority,
 			bashCommand,
+			acceptedReferences,
 		);
 	}
 	bufferedMessages.set(narratorId, queue);
@@ -281,6 +299,7 @@ export interface BufferedMessageAttachmentUpdate {
 	images?: ImageRef[];
 	textFiles?: File[];
 	savedFiles?: SavedBufferedFile[];
+	fileReferences?: FileReferenceSnapshot[];
 }
 
 /** Edit a queued message in-place (text and/or attachments). */
@@ -294,16 +313,21 @@ export function updateBufferedMessage(
 	if (!queue) return false;
 	const msg = queue.find((m) => m.id === messageId);
 	if (!msg) return false;
-	const { images, textFiles, savedFiles } = opts ?? {};
-	msg.text = text;
-	if (images !== undefined) msg.images = images.length ? images : undefined;
-	if (textFiles !== undefined) msg.textFiles = textFiles.length ? textFiles : undefined;
-	if (savedFiles !== undefined) msg._savedFiles = savedFiles.length ? savedFiles : undefined;
-	msg.bufferedAt = new Date().toISOString();
+	const { images, textFiles, savedFiles, fileReferences } = opts ?? {};
+	const acceptedReferences =
+		fileReferences === undefined ? undefined : freezeFileReferenceSnapshots(fileReferences);
+	const bufferedAt = new Date().toISOString();
 	db.update(narratorBufferedMessages)
 		.set({
 			text,
-			bufferedAt: msg.bufferedAt,
+			bufferedAt,
+			...(acceptedReferences !== undefined
+				? {
+						fileReferencesJson: acceptedReferences.length
+							? JSON.stringify(acceptedReferences)
+							: null,
+					}
+				: {}),
 			...(images !== undefined
 				? { imagesJson: images.length ? JSON.stringify(images) : null }
 				: {}),
@@ -313,6 +337,12 @@ export function updateBufferedMessage(
 		})
 		.where(eq(narratorBufferedMessages.id, messageId))
 		.run();
+	msg.text = text;
+	msg.bufferedAt = bufferedAt;
+	if (acceptedReferences !== undefined) msg.fileReferences = acceptedReferences;
+	if (images !== undefined) msg.images = images.length ? images : undefined;
+	if (textFiles !== undefined) msg.textFiles = textFiles.length ? textFiles : undefined;
+	if (savedFiles !== undefined) msg._savedFiles = savedFiles.length ? savedFiles : undefined;
 	return true;
 }
 
@@ -399,6 +429,7 @@ export function restoreBufferedMessage(narratorId: string, msg: BufferedMessage)
 		msg._savedFiles,
 		msg.priority ?? false,
 		msg.bashCommand,
+		msg.fileReferences,
 	);
 	dbRewriteSeqs(
 		narratorId,
@@ -463,6 +494,7 @@ export interface BufferMessageSummary {
 	imageCount: number;
 	images: BufferedImageSummary[];
 	textFiles: BufferedTextFileSummary[];
+	fileReferences: FileReference[];
 	creator?: BufferCreator | null;
 	priority?: boolean;
 }
@@ -497,7 +529,15 @@ function toTextFileSummaries(
 export function toBufferSummary(
 	msgs: readonly Pick<
 		BufferedMessage,
-		"id" | "text" | "bufferedAt" | "images" | "textFiles" | "_savedFiles" | "creator" | "priority"
+		| "id"
+		| "text"
+		| "bufferedAt"
+		| "images"
+		| "textFiles"
+		| "_savedFiles"
+		| "creator"
+		| "priority"
+		| "fileReferences"
 	>[],
 ): BufferMessageSummary[] {
 	return msgs.map((m) => ({
@@ -514,6 +554,9 @@ export function toBufferSummary(
 			...(image.uploadNarratorId !== undefined ? { uploadNarratorId: image.uploadNarratorId } : {}),
 		})),
 		textFiles: toTextFileSummaries(m),
+		fileReferences: (m.fileReferences ?? []).map((snapshot) =>
+			copyFileReference(snapshot.reference),
+		),
 		creator: m.creator ?? null,
 		priority: m.priority || undefined,
 	}));

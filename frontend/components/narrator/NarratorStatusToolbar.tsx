@@ -1,4 +1,4 @@
-import { ActionIcon, Box, Group, Menu, Tooltip } from "@mantine/core";
+import { ActionIcon, Box, Group, Menu, Text, Tooltip, UnstyledButton } from "@mantine/core";
 import { IconDotsVertical } from "@tabler/icons-react";
 import {
 	createContext,
@@ -13,6 +13,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { useTranslation } from "react-i18next";
 import { getNarratorStatusInlineStyle } from "../../lib/safe-area";
 
 const DEFAULT_GAP_PX = 4;
@@ -279,6 +280,35 @@ export function NarratorStatusBar({
 				</NarratorStatusRowContext.Provider>
 			</Group>
 		</Box>
+	);
+}
+
+/** Reuses the toolbar's live count without starting another task-list subscription. */
+export function BackgroundTasksStatusButton({
+	runningCount,
+	onOpen,
+}: {
+	runningCount: number;
+	onOpen: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	if (runningCount <= 0) return null;
+
+	const label = t("backgroundTasks.activeCount", { count: runningCount });
+	return (
+		<Tooltip label={t("backgroundTasks.openPanel")} withinPortal>
+			<UnstyledButton
+				type="button"
+				onClick={onOpen}
+				aria-label={label}
+				style={{ flexShrink: 0, whiteSpace: "nowrap" }}
+			>
+				<Text component="span" size="xs" c="blue">
+					<span aria-hidden="true">· </span>
+					{label}
+				</Text>
+			</UnstyledButton>
+		</Tooltip>
 	);
 }
 

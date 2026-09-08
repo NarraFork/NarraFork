@@ -6,9 +6,16 @@ import {
 	IconRefresh,
 	IconSearch,
 } from "@tabler/icons-react";
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { AGG_MODEL_PREFIX, type ModelOption, parseAggModelValue } from "../../lib/constants";
+import {
+	AGG_MODEL_PREFIX,
+	buildAggModelValue,
+	type ModelAggregation,
+	type ModelOption,
+	parseAggModelValue,
+} from "../../lib/constants";
+import { centerModelMenuSelection, modelMenuSelection } from "./model-menu-selection";
 
 /**
  * The provider-grouped model list rendered inside a narrator's model menu.
@@ -20,6 +27,8 @@ import { AGG_MODEL_PREFIX, type ModelOption, parseAggModelValue } from "../../li
  */
 export function ModelMenuItems({
 	allModels,
+	aggregations = [],
+	opened = true,
 	currentModel,
 	totalCostUsd,
 	onSelect,
@@ -34,6 +43,9 @@ export function ModelMenuItems({
 	onPickerOpened,
 }: {
 	allModels: ModelOption[];
+	aggregations?: ModelAggregation[];
+	/** Also tracks quick reopen before the exit transition has unmounted the dropdown. */
+	opened?: boolean;
 	currentModel: string | null | undefined;
 	totalCostUsd: number | null | undefined;
 	onSelect: (model: string) => void;
@@ -56,8 +68,7 @@ export function ModelMenuItems({
 	/** Provider id whose refresh is in flight, used to show the spinner. */
 	refreshingProviderId?: string | null;
 	/**
-	 * Called once when the menu opens. The dropdown only mounts this component
-	 * while open, so mounting *is* the open event. Used to kick off an
+	 * Called once when the menu opens. Used to kick off an
 	 * opportunistic model-catalog refresh, which is what clears a stale
 	 * "temporarily unavailable" flag without the user hunting for the refresh
 	 * button.
@@ -65,19 +76,39 @@ export function ModelMenuItems({
 	onPickerOpened?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
+	const { t: ts } = useTranslation("settings");
+	const selection = modelMenuSelection(currentModel, aggregations);
+	const selectedItemRef = useRef<HTMLButtonElement>(null);
+	const footerRef = useRef<HTMLDivElement>(null);
 	const [filter, setFilter] = useState("");
+	// Never recenter on search or catalog refresh, including during the exit transition.
+	useEffect(() => {
+		if (!opened) {
+			setFilter("");
+			return;
+		}
+		const frame = window.requestAnimationFrame(() => {
+			const item = selectedItemRef.current;
+			const container = item?.closest<HTMLElement>("[data-model-menu-scroll]");
+			if (container && item) {
+				centerModelMenuSelection(container, item, footerRef.current?.offsetHeight ?? 0);
+			}
+		});
+		return () => window.cancelAnimationFrame(frame);
+	}, [opened]);
 	const filterInputRef = useRef<HTMLInputElement>(null);
 	useEffect(() => {
+		if (!opened) return;
 		const id = window.setTimeout(() => filterInputRef.current?.focus({ preventScroll: true }));
 		return () => window.clearTimeout(id);
-	}, []);
+	}, [opened]);
 	// Fire once per open. `onPickerOpened` is deliberately read through a ref so an
 	// unstable inline callback cannot re-trigger the refresh on every render.
 	const onPickerOpenedRef = useRef(onPickerOpened);
 	onPickerOpenedRef.current = onPickerOpened;
 	useEffect(() => {
-		onPickerOpenedRef.current?.();
-	}, []);
+		if (opened) onPickerOpenedRef.current?.();
+	}, [opened]);
 	const groups = new Map<string, ModelOption[]>();
 	for (const m of allModels) {
 		const prov = m.provider ?? "unknown";
@@ -200,52 +231,96 @@ export function ModelMenuItems({
 								// For aggregation items, check if the current model's aggId matches
 								const isAggItem = m.provider === "__agg__";
 								const aggId = isAggItem ? m.value.slice(AGG_MODEL_PREFIX.length) : null;
-								const selected = isAggItem ? currentAgg?.aggId === aggId : currentModel === m.value;
+								const selected = isAggItem
+									? currentAgg?.aggId === aggId
+									: selection.value === m.value;
+								const showMembers = isAggItem && selected && selection.members.length > 0;
 								return (
-									<Menu.Item
-										key={m.value}
-										onClick={() => onSelect(m.value)}
-										rightSection={
-											<Group gap={4} wrap="nowrap">
-												{m.available === false && (
-													<Badge size="xs" variant="light" color="yellow">
-														{t("modelTemporarilyUnavailable")}
-													</Badge>
-												)}
-												{m.rateMultiplier != null && (
-													<Badge size="xs" variant="outline" color="gray">
-														×{m.rateMultiplier}
-													</Badge>
-												)}
-												{m.pricing && (
-													<ActionIcon
-														component="div"
-														role="button"
-														tabIndex={0}
-														variant="subtle"
-														color="gray"
-														size="sm"
-														aria-label={t("viewModelPrice")}
-														onClick={(e) => {
-															e.stopPropagation();
-															e.preventDefault();
-															onShowPrice?.(m);
-														}}
+									<Fragment key={m.value}>
+										<Menu.Item
+											ref={
+												selection.targetValue === m.value &&
+												(!showMembers || !!currentAgg?.pinnedModel)
+													? selectedItemRef
+													: undefined
+											}
+											onClick={() => onSelect(m.value)}
+											rightSection={
+												<Group gap={4} wrap="nowrap">
+													{m.available === false && (
+														<Badge size="xs" variant="light" color="yellow">
+															{t("modelTemporarilyUnavailable")}
+														</Badge>
+													)}
+													{m.rateMultiplier != null && (
+														<Badge size="xs" variant="outline" color="gray">
+															×{m.rateMultiplier}
+														</Badge>
+													)}
+													{m.pricing && (
+														<ActionIcon
+															component="div"
+															role="button"
+															tabIndex={0}
+															variant="subtle"
+															color="gray"
+															size="sm"
+															aria-label={t("viewModelPrice")}
+															onClick={(e) => {
+																e.stopPropagation();
+																e.preventDefault();
+																onShowPrice?.(m);
+															}}
+														>
+															<IconInfoCircle size={14} />
+														</ActionIcon>
+													)}
+													<IconCheck
+														size={14}
+														style={{ visibility: selected ? "visible" : "hidden" }}
+													/>
+												</Group>
+											}
+											fw={selected ? 600 : 400}
+											c={m.available === false ? "dimmed" : undefined}
+										>
+											{m.label}
+										</Menu.Item>
+										{showMembers &&
+											aggId &&
+											[undefined, ...selection.members].map((member) => {
+												const value = buildAggModelValue(aggId, member);
+												const memberSelected = value === selection.value;
+												const prefix = member?.split(":")[0] ?? "";
+												const providerLabel = provLabels[prefix] ?? prefix;
+												const memberLabel = member
+													? (allModels.find((option) => option.value === member)?.label ??
+														member.slice(prefix.length + 1))
+													: "";
+												return (
+													<Menu.Item
+														key={value}
+														ref={memberSelected ? selectedItemRef : undefined}
+														pl="xl"
+														fw={memberSelected ? 600 : 400}
+														onClick={() => onSelect(value)}
+														rightSection={
+															<IconCheck
+																size={14}
+																style={{ visibility: memberSelected ? "visible" : "hidden" }}
+															/>
+														}
 													>
-														<IconInfoCircle size={14} />
-													</ActionIcon>
-												)}
-												<IconCheck
-													size={14}
-													style={{ visibility: selected ? "visible" : "hidden" }}
-												/>
-											</Group>
-										}
-										fw={selected ? 600 : 400}
-										c={m.available === false ? "dimmed" : undefined}
-									>
-										{m.label}
-									</Menu.Item>
+														<Text
+															size="sm"
+															style={{ overflowWrap: "anywhere", whiteSpace: "normal" }}
+														>
+															{member ? `${providerLabel} · ${memberLabel}` : ts("aggAutoLabel")}
+														</Text>
+													</Menu.Item>
+												);
+											})}
+									</Fragment>
 								);
 							})}
 						</span>
@@ -254,6 +329,7 @@ export function ModelMenuItems({
 			)}
 			<Menu.Divider />
 			<Box
+				ref={footerRef}
 				p={4}
 				style={{
 					position: "sticky",

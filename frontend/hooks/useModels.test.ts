@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { TUTORIAL_PROVIDER_PREFIX } from "@shared/tutorial/lessons";
 import { getConfiguredFallbackModels, isSelectableProviderPrefix } from "./useModels";
 
 describe("configured fallback models", () => {
@@ -46,24 +45,17 @@ describe("configured fallback models", () => {
 		]);
 		expect(models.every((model) => model.provider === "gemini-live")).toBe(true);
 	});
-
 });
 
 describe("selectable provider prefixes", () => {
 	const none: ReadonlySet<string> = new Set();
 
-	test("the tutorial prefix is never selectable", () => {
-		// A user who picked the scripted tutorial model for real work would get a
-		// session that ignores everything they say, with no error explaining why.
-		expect(isSelectableProviderPrefix(TUTORIAL_PROVIDER_PREFIX, none)).toBe(false);
+	test("the retired tutorial prefix is never selectable", () => {
+		expect(isSelectableProviderPrefix("tutorial", none)).toBe(false);
 	});
 
-	test("the tutorial prefix stays excluded even if explicitly enabled", () => {
-		// The exclusion must not be expressible as a user preference: it is a product
-		// invariant, not a default.
-		expect(isSelectableProviderPrefix(TUTORIAL_PROVIDER_PREFIX, new Set(["anthropic"]))).toBe(
-			false,
-		);
+	test("the retired prefix stays excluded even if old settings enable it", () => {
+		expect(isSelectableProviderPrefix("tutorial", new Set(["anthropic"]))).toBe(false);
 	});
 
 	test("ordinary prefixes are selectable unless disabled", () => {

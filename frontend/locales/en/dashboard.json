@@ -28,5 +28,6 @@
 	"recentNarrators": "Recently Active Narrators",
 	"chapterSession": "Chapter session",
 	"standaloneSession": "Standalone session",
-	"pendingQuestions": "Questions waiting for you"
+	"pendingQuestions": "Questions waiting for you",
+	"humanAttention": "Human decisions"
 }

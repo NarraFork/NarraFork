@@ -1,3 +1,5 @@
+import { REASONING_EFFORT_VALUES, type ReasoningEffort } from "@shared/reasoning-effort";
+import { isSubagentReasoningEffort, SUBAGENT_POOL_TYPES } from "@shared/subagent-model-policy";
 import { z } from "zod/v4";
 import { resolvePath } from "../../platform-path";
 import { shouldUseNativeSearch } from "../../search/native";
@@ -5,13 +7,11 @@ import { expandAllowedPoolForDisplay, getVisibleModels, settings } from "../../s
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
 
-type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
-
-const REASONING_EFFORT_VALUES = ["none", "low", "medium", "high", "xhigh", "max"] as const;
 const REASONING_EFFORT_DESCRIPTION =
 	'Reasoning/thinking effort for this subagent. Use "none" to disable thinking where supported. ' +
 	'Valid values: "none", "low", "medium", "high", "xhigh", "max" ("max" is only honored by some providers like DeepSeek; other providers clamp it down). ' +
-	"If the selected model/provider does not support configurable thinking intensity, this option is ignored.";
+	"If the selected model/provider does not support configurable thinking intensity, this option is ignored. " +
+	"A fixed reasoning effort configured in the matching model pool overrides this parameter.";
 
 // Use text import so the bundler inlines the file content at build time
 import baseDescription from "./task.txt" with { type: "text" };
@@ -28,8 +28,6 @@ function getAvailableModelsList(): string {
 const MODEL_PARAM_BASE =
 	"Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback).";
 
-const SUBAGENT_POOL_TYPES = ["explore", "plan", "search", "general"] as const;
-
 function getModelParameterDescription(config?: AgentConfig): string {
 	// Per-narrator custom restriction trait takes precedence and already describes the pools.
 	if (config?.subagentModelRestrictionDescription) {
@@ -44,7 +42,18 @@ function getModelParameterDescription(config?: AgentConfig): string {
 		for (const type of SUBAGENT_POOL_TYPES) {
 			const pool = pools[type];
 			if (pool && pool.length > 0) {
-				restrictedParts.push(`${type}: ${expandAllowedPoolForDisplay(pool).join(", ")}`);
+				const efforts = settings.agent.subagentModelReasoningEfforts?.[type];
+				// Keep the old compact display untouched when this pool has no fixed tiers.
+				const models = pool.some((model) => isSubagentReasoningEffort(efforts?.[model]))
+					? pool.map((model) => {
+							const display = expandAllowedPoolForDisplay([model]).join(", ");
+							const effort = efforts?.[model];
+							return isSubagentReasoningEffort(effort)
+								? `${display} [fixed reasoning_effort=${effort}]`
+								: display;
+						})
+					: expandAllowedPoolForDisplay(pool);
+				restrictedParts.push(`${type}: ${models.join(", ")}`);
 			} else {
 				unrestrictedTypes.push(type);
 			}
@@ -262,6 +271,10 @@ export const agentTool: ToolDefinition = {
 		if (!toolUseId) {
 			return { output: "Internal error: missing toolUseId", isError: true };
 		}
+		const toolCallBinding = ctx.toolCallBinding;
+		if (!toolCallBinding) {
+			return { output: "Internal error: missing persisted Agent tool-call binding", isError: true };
+		}
 		const updateExecutionLease = ctx.updateExecutionLease;
 		if (!updateExecutionLease) {
 			return { output: "Internal error: missing Agent update execution lease", isError: true };
@@ -281,6 +294,7 @@ export const agentTool: ToolDefinition = {
 			const result = await runSubagent({
 				parentNarratorId: ctx.narratorId,
 				toolUseId,
+				toolCallBinding,
 				subagentType: subagent_type || "general",
 				prompt,
 				title: description || undefined,

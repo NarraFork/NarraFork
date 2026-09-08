@@ -68,7 +68,53 @@
 
 import { measureLineStats, prepareWithSegments } from "@chenglou/pretext";
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
-import type { DiffLine } from "@shared/pretext-layout/diff-core";
+import {
+	type DiffDocument,
+	diffDocumentLineNoWidth,
+	readDiffRowContent,
+} from "@shared/pretext-layout/diff-core";
+import type {
+	DetailCapKind,
+	ToolAskQuestion,
+	ToolCappedDetail,
+	ToolDetailData,
+	ToolMediaRef,
+	ToolMetaRow,
+	ToolSectionBody,
+	ToolSectionLabel,
+	ToolStructuredEntry,
+} from "@shared/pretext-layout/tool-detail";
+import { ASK_OPTIONS_MAX, ASK_QUESTIONS_MAX } from "@shared/pretext-layout/tool-detail";
+
+export type {
+	DetailCapKind,
+	SpecTaskLine,
+	ToolAskDetail,
+	ToolAskOption,
+	ToolAskQuestion,
+	ToolCappedDetail,
+	ToolDetailData,
+	ToolDetailSection,
+	ToolErrorDetail,
+	ToolMediaRef,
+	ToolMetaRow,
+	ToolMetaRowsDetail,
+	ToolRowAction,
+	ToolRowProgress,
+	ToolSectionBody,
+	ToolSectionLabel,
+	ToolSectionsDetail,
+	ToolSpecTasksDetail,
+	ToolStructuredBadge,
+	ToolStructuredDetail,
+	ToolStructuredEntry,
+} from "@shared/pretext-layout/tool-detail";
+export {
+	ASK_OPTIONS_MAX,
+	ASK_QUESTIONS_MAX,
+	MEDIA_IMAGE_CONTENT_PX,
+} from "@shared/pretext-layout/tool-detail";
+
 import {
 	type FittedImageBox,
 	fitImageBox,
@@ -76,11 +122,10 @@ import {
 } from "@shared/pretext-layout/image-fit";
 import type { ReflectionNoticeData } from "@shared/pretext-layout/reflection";
 import { BARE_ROW_GAP, BARE_ROW_ICON } from "@shared/pretext-layout/row-metrics";
-import { scaleFontSize } from "@shared/pretext-layout/typography";
+import { letterSpacingPxFor, scaleFontSize } from "@shared/pretext-layout/typography";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import {
 	accumulateFrame,
-	type BlockFrame,
 	DEFAULT_RENDER_LOD,
 	type ElementFrame,
 	type LineMetricsResolver,
@@ -105,7 +150,6 @@ import {
 } from "../pretext-fonts";
 import { preparedMarkdownBlocks } from "./math-support";
 import { MEASURE_MARKDOWN_CODE_PADDING } from "./measure-markdown";
-import { IMAGE_FIXED_HEIGHT } from "./measure-media";
 import {
 	ALERT_STACK_GAP,
 	CUSTOM_ANSWER_FONT,
@@ -417,8 +461,6 @@ export const ENTRY_SNIPPET_MAX_LINES = 3;
  * truncates, but re-truncating here means a hand-built detail (harness, test,
  * future producer) can never reach the layout path unbounded.
  */
-export const ASK_QUESTIONS_MAX = 8;
-export const ASK_OPTIONS_MAX = 8;
 
 // ── Grouped-card chrome ──────────────────────────────────────────────────────
 /** Group header text line box (Mantine `<Text size="xs">` → xs 1.4 = 17). */
@@ -435,18 +477,6 @@ export const GROUP_BODY_PADDING_LEFT = 4;
 export const GROUP_BODY_BORDER_LEFT = 2;
 
 // ── Detail maxHeight caps (px) — ToolCallCard codeStyle/termStyle + per-detail ─
-export type DetailCapKind =
-	| "code"
-	| "term"
-	| "diff"
-	| "bash-cmd"
-	| "media"
-	| "skill"
-	| "knowledge"
-	| "plan"
-	| "streaming-bash"
-	| "streaming";
-
 /** Central cap table (px). `plan` is a fallback — the live card uses vpHeight. */
 export const DETAIL_CAPS: Record<DetailCapKind, number> = {
 	code: 200,
@@ -457,12 +487,10 @@ export const DETAIL_CAPS: Record<DetailCapKind, number> = {
 	skill: 400,
 	knowledge: 400,
 	plan: 400,
+	"agent-result": 300,
 	"streaming-bash": 120,
 	streaming: 400,
 };
-
-/** Detail kinds that render a leading "Input"/"Output"-style label row. */
-const CAPPED_WITH_LABEL = new Set<DetailCapKind>(["code", "term", "skill", "knowledge"]);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Prebuilt fonts.
@@ -477,35 +505,6 @@ export const DETAIL_MONO_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${MONO
 // call into ONE of these — passing wrap-critical text for the pretext-measured
 // kinds and a line/pixel estimate for the capped kinds.
 // ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Image descriptor for a `media` cap (mirrors ToolMediaRef in tool-detail.ts).
- * The src fields are render-only (the render layer resolves an <img> src);
- * `width`/`height` are HEIGHT-RELEVANT — when present, the reserved content
- * height is the aspect-ratio fit rather than the fixed fallback.
- */
-export interface ToolMediaRef {
-	previewUrl?: string;
-	filePath?: string;
-	imageId?: string;
-	filename?: string;
-	sizeKB?: number;
-	imageFormat?: string;
-	/** Intrinsic pixel size from the tool payload (drives the aspect fit). */
-	width?: number;
-	height?: number;
-}
-
-/**
- * Fallback reserved pixel height for an inline media image (`media` cap
- * `contentPx`) when the payload carries no intrinsic dimensions.
- *
- * Mirrors the shared classifier's MEDIA_IMAGE_CONTENT_PX, which is itself the
- * same fixed height a dimensionless user message's image block uses
- * (IMAGE_FIXED_HEIGHT), so a screenshot inside a tool card reserves exactly as
- * much room as a chat image.
- */
-export const MEDIA_IMAGE_CONTENT_PX = IMAGE_FIXED_HEIGHT;
 
 /**
  * Content height for a media cap. With the image's intrinsic dimensions the
@@ -533,283 +532,6 @@ function mediaContentPx(
 	const fit = fitImageBox(natural, availableWidth, cap);
 	return { contentPx: fit.displayHeight, fit };
 }
-
-/** 🟡 A single maxHeight-capped detail body (code/term/diff/media/skill/…). */
-export interface ToolCappedDetail {
-	kind: "capped";
-	/** Which cap applies (also selects the default label behaviour). */
-	cap: DetailCapKind;
-	/** Estimated content line count (× detailContentLineHeight()). */
-	contentLines?: number;
-	/** Direct content pixel estimate (media/images); wins over contentLines. */
-	contentPx?: number;
-	/** Override the default label presence for this cap kind. */
-	hasLabel?: boolean;
-	/**
-	 * Real body text (code/command/diff/output), painted inside the maxHeight-
-	 * capped scroll box.
-	 *
-	 * MEASURED (not render-only): when present, the body height comes from how
-	 * this text wraps at the available width, because `contentLines` counts hard
-	 * newlines only and under-reports every soft-wrapped line. The measurement is
-	 * bounded (see measureCappedContentHeight), and the cap still clamps the
-	 * result. Kept in sync with tool-detail.ts.
-	 */
-	text?: string;
-	/**
-	 * Image descriptor for `media` caps. The src fields are render-only; the
-	 * intrinsic `width`/`height` drive the reserved content height (see
-	 * mediaContentPx). Kept in sync with tool-detail.ts.
-	 */
-	media?: ToolMediaRef;
-	/**
-	 * Render `text` as MARKDOWN (ExitPlanMode plans). The body is parsed +
-	 * measured as markdown and painted with RenderMarkdown inside the capped
-	 * scroll box. Kept in sync with tool-detail.ts.
-	 */
-	markdown?: boolean;
-	/**
-	 * `text` is only a PREFIX of the real body (the payload was truncated
-	 * server-side). MEASURED: the body then reserves the FULL cap instead of being
-	 * sized to the prefix — see `cappedBodyHeight`. Kept in sync with tool-detail.ts.
-	 */
-	textTruncated?: boolean;
-	/**
-	 * RAW provenance path for a file-based body (`_planFile`), shown as a leading
-	 * dimmed line. Never localized here — the render layer formats it. Kept in
-	 * sync with tool-detail.ts.
-	 */
-	sourcePath?: string;
-	/**
-	 * RENDER-ONLY explicit syntax-highlighting language id (`"json"`, `"html"`,
-	 * `"shellscript"`, …). Height-neutral. Kept in sync with tool-detail.ts.
-	 */
-	codeLang?: string;
-	/**
-	 * RENDER-ONLY raw file path whose extension implies the highlighting language.
-	 * Only the path travels through the pure layer; `getShikiLang` resolution
-	 * happens in the render layer. Height-neutral. Kept in sync with tool-detail.ts.
-	 */
-	codeLangPath?: string;
-	/**
-	 * Structured diff rows for a `diff` cap. MEASURED: the height comes from these
-	 * rows wrapped at the width left over after the gutter (see
-	 * measureDiffContentHeight). Kept in sync with tool-detail.ts.
-	 */
-	diffLines?: DiffLine[];
-	/**
-	 * Character width of ONE line-number column. MEASURED (it sets the gutter
-	 * width, which narrows every code line). Kept in sync with tool-detail.ts.
-	 */
-	diffLineNoWidth?: number;
-	/** Provisional line-number prefix (streaming Edit). Kept in sync with tool-detail.ts. */
-	diffLineNumberPrefix?: string;
-}
-
-/** 🟡 Generic detail: an input section + an optional output section (cap 200 each). */
-export interface ToolGenericDetail {
-	kind: "generic";
-	inputLines: number;
-	outputLines?: number;
-	/**
-	 * Real input/output body text painted in the capped box. MEASURED when
-	 * present (wrapped at the available width, bounded); `inputLines`/
-	 * `outputLines` are the no-text fallback. Kept in sync with tool-detail.ts.
-	 */
-	inputText?: string;
-	outputText?: string;
-	/** `inputText` is only a prefix → reserve the full cap. Sync: tool-detail.ts. */
-	inputTruncated?: boolean;
-	/** `outputText` is only a prefix → reserve the full cap. Sync: tool-detail.ts. */
-	outputTruncated?: boolean;
-}
-
-/** One SpecTasks row (mirrors SpecTaskLine in tool-detail.ts). */
-export interface SpecTaskLine {
-	text: string;
-	status?: string;
-	protected?: boolean;
-}
-
-/** 🔴 SpecTasks list: one wrapped row per task (task text drives wrapping). */
-export interface ToolSpecTasksDetail {
-	kind: "spec-tasks";
-	tasks: SpecTaskLine[];
-}
-
-/** A structured badge chip (mirrors ToolStructuredBadge in tool-detail.ts). */
-export interface ToolStructuredBadge {
-	label: string;
-	color?: string;
-}
-
-/** One ask-replay option (mirrors ToolAskOption in tool-detail.ts). */
-export interface ToolAskOption {
-	/** Option label; wraps, MEASURED. */
-	label: string;
-	/** Option description under the label; wraps, MEASURED. */
-	description?: string;
-	/** RENDER-ONLY selected state (filled control + emphasized label). */
-	selected?: boolean;
-}
-
-/** One ask-replay question (mirrors ToolAskQuestion in tool-detail.ts). */
-export interface ToolAskQuestion {
-	/** Question header; wraps, MEASURED (skipped entirely when `omitHeader`). */
-	header: string;
-	/** The card header already shows this text → drop the row (single-question). */
-	omitHeader?: boolean;
-	/** RENDER-ONLY control shape (checkbox vs radio). Height-neutral. */
-	multiSelect?: boolean;
-	options: ToolAskOption[];
-	/** Prefixed answer line; wraps, MEASURED. */
-	answer?: string;
-	/** Prefixed free-text answer line; wraps, MEASURED (mono). */
-	customAnswer?: string;
-}
-
-/** 🔴 Read-only AskUserQuestion replay (mirrors ToolAskDetail in tool-detail.ts). */
-export interface ToolAskDetail {
-	kind: "ask";
-	questions: ToolAskQuestion[];
-}
-
-/** One structured RESULT entry (mirrors ToolStructuredEntry in tool-detail.ts). */
-export interface ToolStructuredEntry {
-	/** Title line (wraps; MEASURED). */
-	title: string;
-	/** RENDER-ONLY external link for the title. Height-neutral. */
-	href?: string;
-	/** Secondary info line (domain / time / seq); wraps, MEASURED. */
-	meta?: string;
-	/** Body excerpt; wraps, clamped to ENTRY_SNIPPET_MAX_LINES. */
-	snippet?: string;
-	/** Badge chips for this entry (reserved fixed row when present). */
-	badges?: ToolStructuredBadge[];
-	/** RENDER-ONLY tone hint (user vs assistant). Height-neutral. */
-	tone?: string;
-}
-
-/** 🔴 Structured segment (recall/send/pipeline/web-search): badges + body lines. */
-export interface ToolStructuredDetail {
-	kind: "structured";
-	/** Number of badge header rows (0 = none). Drives the reserved header height. */
-	badgeRows?: number;
-	/** RENDER-ONLY badge chips painted in the reserved header row(s). */
-	badges?: ToolStructuredBadge[];
-	/** Body text lines (each wraps; monospace when `mono`). */
-	bodyLines: string[];
-	/** Render the body lines in monospace (recall paths, pipeline ids). */
-	mono?: boolean;
-	/** Structured result entries; when present they REPLACE `bodyLines`. */
-	entries?: ToolStructuredEntry[];
-}
-
-/** 🔴 Error detail: a leading icon + wrapped error text. */
-export interface ToolErrorDetail {
-	kind: "error";
-	text: string;
-	/** RENDER-ONLY tone (mirrors ToolErrorDetail.tone). Height-neutral. */
-	tone?: "warning";
-}
-
-/** A meta-row action control (mirrors ToolRowAction in tool-detail.ts). */
-export interface ToolRowAction {
-	kind: "download" | "copy";
-	/** RENDER-ONLY target (href / clipboard text). Height-neutral. */
-	value: string;
-}
-
-/** A determinate progress bar on a meta row (mirrors ToolRowProgress). */
-export interface ToolRowProgress {
-	/** 0–1 fill, or null for an indeterminate/animated bar. */
-	ratio: number | null;
-	/** Whole percent beside the bar; absent when indeterminate. */
-	percent?: number;
-	/** Pre-formatted figures under the bar ("20.1 MB / 48.0 MB", "2.1 MB/s"). */
-	figures?: string[];
-	/** RENDER-ONLY bar colour. Height-neutral. */
-	color?: string;
-	/** RENDER-ONLY animated state. Height-neutral. */
-	active?: boolean;
-}
-
-/** One meta row (mirrors ToolMetaRow in tool-detail.ts). */
-export interface ToolMetaRow {
-	/** Row text; wraps, MEASURED. */
-	text: string;
-	/** Monospace text (paths / ids / URLs) — changes the measured font. */
-	mono?: boolean;
-	/** RENDER-ONLY external link. Height-neutral. */
-	href?: string;
-	/** Badge chips (reserved fixed row when present). */
-	badges?: ToolStructuredBadge[];
-	/** Action buttons (reserved fixed button row when present). */
-	actions?: ToolRowAction[];
-	/**
-	 * A progress bar (reserved fixed row when present).
-	 *
-	 * The reservation is FIXED and independent of the numbers — that is what keeps
-	 * a card from resizing on every progress frame. Only the presence of a
-	 * `figures` line changes the height, and a producer that emits figures emits
-	 * them for the whole run.
-	 */
-	progress?: ToolRowProgress;
-	/** RENDER-ONLY dimmed styling. Height-neutral. */
-	dimmed?: boolean;
-}
-
-/** 🔴 Meta rows region (mirrors ToolMetaRowsDetail in tool-detail.ts). */
-export interface ToolMetaRowsDetail {
-	kind: "meta-rows";
-	rows: ToolMetaRow[];
-}
-
-/** Section label id (mirrors ToolSectionLabel in tool-detail.ts). */
-export type ToolSectionLabel =
-	| "input"
-	| "output"
-	| "command"
-	| "message"
-	| "delivery"
-	| "reply"
-	| "result"
-	| "rule"
-	| "captured"
-	| "files"
-	| "plan"
-	| "error";
-
-/** A section body: every leaf kind except `sections` (no nesting). */
-export type ToolSectionBody =
-	| ToolCappedDetail
-	| ToolStructuredDetail
-	| ToolErrorDetail
-	| ToolSpecTasksDetail
-	| ToolMetaRowsDetail
-	| ToolAskDetail;
-
-/** One labelled section (mirrors ToolDetailSection in tool-detail.ts). */
-export interface ToolDetailSection {
-	label?: ToolSectionLabel;
-	body: ToolSectionBody;
-}
-
-/** 🔴 Multi-part detail (mirrors ToolSectionsDetail in tool-detail.ts). */
-export interface ToolSectionsDetail {
-	kind: "sections";
-	sections: ToolDetailSection[];
-}
-
-export type ToolDetailData =
-	| ToolCappedDetail
-	| ToolGenericDetail
-	| ToolSpecTasksDetail
-	| ToolStructuredDetail
-	| ToolErrorDetail
-	| ToolMetaRowsDetail
-	| ToolAskDetail
-	| ToolSectionsDetail;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool-call data (the measure input) + options.
@@ -999,139 +721,37 @@ export interface MeasureToolCallOpts {
 // Measured result.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Geometry of one section inside a measured `sections` detail. The blocks of all
- * sections live in ONE flat list (so `blocks[i]` ↔ `frame.blocks[i]` holds);
- * this describes which slice belongs to which section, letting the render layer
- * draw labels and per-section scroll boxes without re-measuring.
- */
-export interface MeasuredToolDetailSection {
-	/** Localized by the render layer via its label table; absent = no label row. */
-	label?: ToolSectionLabel;
-	/** The section body's own kind (selects the visual). */
-	kind: ToolSectionBody["kind"];
-	/** Index of this section's first block in the flat list. */
-	blockStart: number;
-	/** How many blocks belong to this section (label row included). */
-	blockCount: number;
-	/** True when the first block of the slice is the label row. */
-	hasLabel: boolean;
-	/** Section top within the detail region (label row included). */
-	top: number;
-	/** Full section height (label chrome + visible body). */
+/** Geometry belongs to the body itself, with local zero-based coordinates. */
+export interface MeasuredToolBody<T extends ToolSectionBody = ToolSectionBody> {
+	model: T;
+	kind: T["kind"];
 	height: number;
-	/** Body top within the detail region (below the label row). */
-	bodyTop: number;
-	/** VISIBLE body height (already clamped by the body's own cap). */
-	bodyHeight: number;
-	/**
-	 * Un-clamped content height of the body. Larger than `bodyHeight` when the cap
-	 * bit — the render layer scrolls the overflow inside the fixed-height box.
-	 */
-	bodyContentHeight: number;
-	/** The cap applied to this section's body (capped bodies only), else null. */
+	blocks: PreparedBlock[];
+	frame: ElementFrame;
+	contentWidth: number;
 	appliedCap: number | null;
-	/** True when this section's body is markdown (plans / skills / knowledge). */
-	markdown: boolean;
-	/**
-	 * The width the body's LINE BREAKING actually used.
-	 *
-	 * NOT the section's available width, and that difference is the whole reason
-	 * this field exists: a markdown body lives inside a padded scroll box, so
-	 * `measureMarkdownDetail` wraps it at `availableWidth - DETAIL_BOX_CHROME_X`
-	 * while every other body kind is measured at the full `availableWidth`.
-	 *
-	 * The render layer MUST paint the markdown host at this width rather than
-	 * re-deriving one. Handing it `availableWidth` was wrong in both directions at
-	 * once: the host came out `DETAIL_BOX_CHROME_X` px wider than the box's own
-	 * content area, so EVERY markdown body grew a horizontal scrollbar with nothing
-	 * to scroll to — and on a one-line body (a failed search, a short error) that
-	 * bar covered essentially the whole 24px box. It also made `RenderMarkdown`
-	 * re-wrap the text at a wider width than the height was predicted from, which
-	 * is the drift CONTRACT §0 iron law 2 forbids.
-	 */
-	bodyContentWidth: number;
-	/**
-	 * The section body's RAW source text, carried for the fullscreen viewer only.
-	 *
-	 * Height-neutral by construction: a markdown body's geometry comes from
-	 * `measureMarkdownDetail`, which parses the text into prepared blocks — the
-	 * text itself is consumed there and then dropped. Re-exposing it as a plain
-	 * output field (rather than a new zero-height block) keeps the
-	 * `blocks[i] ↔ frame.blocks[i]` invariant, the `blockStart/blockCount` slices
-	 * and the `detail-plan-source` lookups untouched.
-	 *
-	 * Non-markdown bodies already keep their text in the fixed block's `data`, so
-	 * this is only populated for markdown ones.
-	 */
+	markdown?: boolean;
 	sourceText?: string;
-	/**
-	 * The painted markdown blocks cover only a PREFIX of `sourceText` (the body
-	 * exceeded the parse ceiling). See `MeasuredToolDetail.bodyIsPrefix`.
-	 */
 	bodyIsPrefix?: boolean;
-	/**
-	 * `sourceText` is only a SERVER-side prefix; the rest must be fetched. See
-	 * `MeasuredToolDetail.textTruncated` — height-neutral output field.
-	 */
 	textTruncated?: boolean;
 }
 
-/** A measured detail region (the LazyCollapse body's DetailRenderer part). */
-export interface MeasuredToolDetail {
-	/** Detail discriminant (renderer picks the visual). */
-	kind: ToolDetailData["kind"];
-	/** Region height (px), INCLUDING the `mt="xs"` top margin. */
+export interface MeasuredToolDetailSection {
+	key: string;
+	label?: ToolSectionLabel;
+	top: number;
 	height: number;
-	/** Prepared blocks (fixed for capped, inline for measured). */
-	blocks: PreparedBlock[];
-	/** Resolved frame at `contentWidth`. */
-	frame: ElementFrame;
-	/** Inner content width the frame was computed at. */
+	bodyTop: number;
+	bodyHeight: number;
+	measuredBody: MeasuredToolBody;
+}
+
+export interface MeasuredToolDetail {
+	kind: "sections";
+	/** Includes the single leading detail margin. */
+	height: number;
 	contentWidth: number;
-	/** The cap that was applied (capped/generic/plan only), else null. */
-	appliedCap: number | null;
-	/**
-	 * True when a `capped` region carries real MARKDOWN blocks (plans) instead of
-	 * one opaque fixed block. The render layer switches to RenderMarkdown inside
-	 * the capped scroll box; `blocks`/`frame` are the merged provenance+markdown
-	 * list (see measureMarkdownDetail).
-	 */
-	markdown?: boolean;
-	/**
-	 * RAW source text of a `markdown` capped region, for the fullscreen viewer.
-	 * See `MeasuredToolDetailSection.sourceText` — height-neutral output field,
-	 * never a block and never part of the frame.
-	 */
-	sourceText?: string;
-	/**
-	 * The painted markdown blocks cover only a PREFIX of `sourceText`, because the
-	 * body exceeded `DETAIL_MARKDOWN_PREFIX_MAX_CHARS`.
-	 *
-	 * Distinct from `textTruncated` below, which says the SERVER sent a preview.
-	 * This one says the client chose not to parse the rest, so the full text is
-	 * already in hand (`sourceText`) and the viewer can show all of it.
-	 * Height-neutral output field.
-	 */
-	bodyIsPrefix?: boolean;
-	/**
-	 * `sourceText` is only a SERVER-side prefix of the real body (a `markdown`
-	 * capped region only — a plain capped body keeps the flag in its block `data`).
-	 *
-	 * The opposite direction from `bodyIsPrefix`: there the whole text is in hand
-	 * and only the viewer is needed, here the remaining bytes must be fetched. The
-	 * viewer host reads it to decide whether reading into this body should request
-	 * them.
-	 *
-	 * Output-only: the height was already reserved at the full cap inside
-	 * `measureMarkdownDetail`, so this field carries no geometry of its own.
-	 */
-	textTruncated?: boolean;
-	/**
-	 * Per-section geometry — present only for `kind === "sections"`. Parallel view
-	 * over the flat `blocks`/`frame` arrays (never a second copy of them).
-	 */
-	sections?: MeasuredToolDetailSection[];
+	sections: MeasuredToolDetailSection[];
 }
 
 export interface MeasuredToolCall extends MeasuredElement {
@@ -1405,15 +1025,25 @@ export function cappedMeasurePrefix(
  * Exported-adjacent helper shared by measure and render so both agree on exactly
  * how much horizontal room the gutter takes.
  */
-export function diffGutterWidthChars(detail: {
-	diffLines?: unknown;
-	diffLineNoWidth?: number;
-}): number {
-	if (detail.diffLines == null) return 0;
-	const w = detail.diffLineNoWidth;
-	// With line numbers: two right-aligned columns, a separating space, and the
-	// +/- marker. Without: only the marker column (chunked DiffView's `1.5ch`).
-	return w != null && w > 0 ? w * 2 + 2 : 2;
+export function diffGutterWidthChars(document: DiffDocument | undefined): number {
+	if (!document) return 0;
+	return diffDocumentLineNoWidth(document) * 2 + 2;
+}
+
+/** Outer-card probing reads only enough rows to prove its cap. No viewport projection. */
+function measureDiffDocumentHeight(
+	document: DiffDocument,
+	cap: number,
+	availableWidth: number,
+	textTruncated?: boolean,
+): number {
+	const maxRows = cappedUsefulLines(cap);
+	if (textTruncated || document.totalRows >= maxRows) return cap;
+	const rows: { content: string }[] = [];
+	for (let row = 0; row < document.totalRows; row++) {
+		rows.push({ content: readDiffRowContent(document, row) ?? "" });
+	}
+	return measureDiffContentHeight(rows, diffGutterWidthChars(document), cap, availableWidth);
 }
 
 /**
@@ -1464,6 +1094,7 @@ export function measureDiffContentHeight(
 		} else {
 			const prepared = prepareWithSegments(line.content, detailBodyFont(), {
 				whiteSpace: "pre-wrap",
+				letterSpacing: letterSpacingPxFor(detailBodyFontSize()),
 			});
 			totalLines += Math.max(1, measureLineStats(prepared, wrapWidth).lineCount);
 		}
@@ -1496,6 +1127,7 @@ function monoAdvance(font: string, count: number): number {
 	// its measured width IS the advance of `count` monospace glyphs.
 	const prepared = prepareWithSegments("0".repeat(Math.max(1, count)), font, {
 		whiteSpace: "pre-wrap",
+		letterSpacing: letterSpacingPxFor(detailBodyFontSize()),
 	});
 	return measureLineStats(prepared, NO_WRAP_WIDTH).maxLineWidth;
 }
@@ -1545,14 +1177,9 @@ export function markdownMeasurePrefix(
  * undefined frame for the last block), so the frame is always re-accumulated
  * over the merged list here. `blocks.length === frame.blocks.length` holds.
  *
- * Geometry mirrors the other capped details: `DETAIL_TOP_MARGIN` rides on the
- * first merged block, so the scroll box starts at y = DETAIL_TOP_MARGIN and the
- * CAP clamps the box only — never the outer gap:
- *
- *   region height = DETAIL_TOP_MARGIN + min(box content + box padding, cap)
- *
- * The render layer recovers the box height as `detail.height - DETAIL_TOP_MARGIN`
- * and offsets each block by `bf.top - DETAIL_TOP_MARGIN`.
+ * All geometry is local to the body: the first block starts at zero, and height
+ * is min(box content + box padding, cap). Callers own their header/section gap
+ * and must use this height and frame directly, without subtracting a top margin.
  */
 export function measureMarkdownDetail(
 	text: string,
@@ -1596,7 +1223,7 @@ export function measureMarkdownDetail(
 	const prefix = markdownMeasurePrefix(text, DETAIL_MARKDOWN_PREFIX_MAX_CHARS);
 	const built = buildMarkdownDetailFrame(prefix, innerWidth, sourcePath);
 	const boxHeight = textTruncated === true ? cap : Math.min(built.boxContent, cap);
-	const height = DETAIL_TOP_MARGIN + boxHeight;
+	const height = boxHeight;
 	return {
 		blocks: built.blocks,
 		frame: built.frame,
@@ -1616,14 +1243,13 @@ function buildMarkdownDetailFrame(
 	const blocks: PreparedBlock[] = [];
 	if (sourcePath) {
 		blocks.push(
-			makeFixed(typographyMetrics().line.xs, "detail-plan-source", DETAIL_TOP_MARGIN, {
+			makeFixed(typographyMetrics().line.xs, "detail-plan-source", 0, {
 				sourcePath,
 			}),
 		);
 	}
 	for (const [index, block] of mdBlocks.entries()) {
-		// The leading gap belongs to the merged list's first block: a markdown block
-		// only claims DETAIL_TOP_MARGIN when no provenance line precedes it.
+		// The first markdown block starts at zero unless a provenance line precedes it.
 		//
 		// This RE-WRAPS rather than assigning `block.marginTop` in place. The parsed
 		// array is shared (see prepared-markdown-cache): the same markdown measured by
@@ -1636,13 +1262,13 @@ function buildMarkdownDetailFrame(
 			index === 0
 				? {
 						...block,
-						marginTop: sourcePath ? DETAIL_SOURCE_LINE_MARGIN_BOTTOM : DETAIL_TOP_MARGIN,
+						marginTop: sourcePath ? DETAIL_SOURCE_LINE_MARGIN_BOTTOM : 0,
 					}
 				: block,
 		);
 	}
 	if (blocks.length === 0) {
-		blocks.push(makeFixed(typographyMetrics().line.xs, "detail-plan-empty", DETAIL_TOP_MARGIN));
+		blocks.push(makeFixed(typographyMetrics().line.xs, "detail-plan-empty", 0));
 	}
 	const frame = accumulateFrame(blocks, innerWidth, RESOLVER, {
 		codePaddingX: MEASURE_MARKDOWN_CODE_PADDING.x,
@@ -1651,9 +1277,8 @@ function buildMarkdownDetailFrame(
 		quotePaddingY: MARKDOWN_CONSTANTS.BLOCKQUOTE_PADDING,
 		quoteMarginTop: MARKDOWN_CONSTANTS.PARAGRAPH_MARGIN_TOP,
 	});
-	// frame.contentHeight includes the leading DETAIL_TOP_MARGIN, which sits
-	// OUTSIDE the scroll box — exclude it, then add the box's own padding.
-	const boxContent = Math.max(0, frame.contentHeight - DETAIL_TOP_MARGIN) + DETAIL_BOX_CHROME_Y;
+	// The local content frame excludes only the scroll box's own padding.
+	const boxContent = Math.max(0, frame.contentHeight) + DETAIL_BOX_CHROME_Y;
 	return { blocks, frame, boxContent };
 }
 
@@ -1671,45 +1296,36 @@ function cappedBodyHeight(
 	cap: number,
 	contentLines: number | undefined,
 	contentPx: number | undefined,
-	hasLabel: boolean,
 	text: string | undefined,
 	availableWidth: number,
-	/** Structured diff rows — measured per row, minus the gutter (see measureDiffContentHeight). */
-	diff?: { lines: readonly { content: string }[]; gutterChars: number },
-	/**
-	 * `text` is only a PREFIX of the real body (the payload was truncated
-	 * server-side and the full one has not been fetched).
-	 */
 	textTruncated?: boolean,
-): { height: number; capped: number } {
+): number {
 	const content =
 		contentPx ??
-		// A truncated body reserves the WHOLE cap. Measuring the prefix would make
-		// the height depend on how many chars the server's budget happened to
-		// include: a wider layout wraps that prefix into fewer lines, so the box
-		// shrinks and the rest of the (scrollable) content has nowhere to go. The
-		// cap can never clip — the box scrolls — and loading the full payload
-		// shrinks it back to exact, which is a user action.
-		(textTruncated === true && (text == null || text.length > 0)
+		(textTruncated === true
 			? cap
-			: diff
-				? measureDiffContentHeight(diff.lines, diff.gutterChars, cap, availableWidth)
-				: text != null && text.length > 0
-					? measureCappedContentHeight(text, cap, availableWidth)
-					: (contentLines ?? 0) * detailContentLineHeight());
-	const capped = Math.min(content, cap);
-	const labelH = hasLabel ? DETAIL_LABEL_CHROME_Y : 0;
-	return { height: labelH + capped, capped };
+			: text !== undefined
+				? measureCappedContentHeight(text, cap, availableWidth)
+				: (contentLines ?? 0) * detailContentLineHeight());
+	return Math.min(content, cap);
 }
 
 function finishRegion(
-	kind: ToolDetailData["kind"],
+	model: ToolSectionBody,
 	blocks: PreparedBlock[],
 	innerWidth: number,
 	appliedCap: number | null,
-): MeasuredToolDetail {
+): MeasuredToolBody {
 	const frame = accumulateFrame(blocks, innerWidth, RESOLVER);
-	return { kind, height: frame.contentHeight, blocks, frame, contentWidth: innerWidth, appliedCap };
+	return {
+		model,
+		kind: model.kind,
+		height: frame.contentHeight,
+		blocks,
+		frame,
+		contentWidth: innerWidth,
+		appliedCap,
+	};
 }
 
 /**
@@ -1940,154 +1556,74 @@ function clampedLineCount(text: string, font: string, width: number): number {
 	return Math.max(1, lineCount);
 }
 
-/**
- * Measure a multi-part detail: an ordered list of labelled sections.
- *
- * Each section body is measured on its own (reusing the single-kind path), then
- * flattened into ONE block list so the render layer keeps its `blocks[i]` ↔
- * `frame.blocks[i]` invariant. Per-section geometry is exposed via `sections`
- * so the renderer can place labels and scroll boxes without re-deriving it.
- *
- * The leading `DETAIL_TOP_MARGIN` rides on the first emitted block exactly like
- * every single-kind region, so the outer card geometry is unchanged.
- */
-function measureSectionsDetail(
-	detail: ToolSectionsDetail,
-	innerWidth: number,
-	viewportHeight?: number,
-): MeasuredToolDetail {
-	const blocks: PreparedBlock[] = [];
-	const frameBlocks: BlockFrame[] = [];
-	const sections: MeasuredToolDetailSection[] = [];
-	let appliedCap: number | null = null;
-	let y = 0;
-
-	for (const [index, part] of detail.sections.entries()) {
-		// The leading gap rides ahead of the first section exactly like every
-		// single-kind region; later sections are separated by SECTION_GAP.
-		y += index === 0 ? DETAIL_TOP_MARGIN : SECTION_GAP;
-		const top = y;
-		const blockStart = blocks.length;
-		let hasLabel = false;
-		if (part.label !== undefined) {
-			hasLabel = true;
-			const labelHeight = typographyMetrics().line.xs + SECTION_LABEL_MARGIN_BOTTOM;
-			blocks.push(makeFixed(labelHeight, "detail-section-label", 0, { label: part.label }));
-			frameBlocks.push({
-				index: frameBlocks.length,
-				top: y,
-				height: labelHeight,
-				usedWidth: innerWidth,
-			});
-			y += labelHeight;
-		}
-
-		// Measure the body in isolation so it keeps its OWN cap, then re-home its
-		// geometry into this region. Re-accumulating a flat frame instead would
-		// discard the cap and let a long markdown body grow the card without limit.
-		const body = measureToolDetail(part.body, innerWidth, viewportHeight);
-		if (body.appliedCap != null && appliedCap == null) appliedCap = body.appliedCap;
-		// A body's own geometry starts at DETAIL_TOP_MARGIN (its leading gap, which
-		// this region already accounted for), so shift it onto the section origin.
-		const shift = y - DETAIL_TOP_MARGIN;
-		for (const [i, block] of body.blocks.entries()) {
-			const bf = body.frame.blocks[i];
-			if (!bf) continue;
-			blocks.push(block);
-			frameBlocks.push({ ...bf, index: frameBlocks.length, top: bf.top + shift });
-		}
-		// The VISIBLE body height is the capped one the body reported (its blocks may
-		// legitimately overflow it — the render layer scrolls inside the box).
-		const bodyHeight = Math.max(0, body.height - DETAIL_TOP_MARGIN);
-		y += bodyHeight;
-
-		sections.push({
-			...(part.label === undefined ? {} : { label: part.label }),
-			kind: part.body.kind,
-			blockStart,
-			blockCount: blocks.length - blockStart,
-			hasLabel,
-			top,
-			height: y - top,
-			bodyTop: top + (hasLabel ? typographyMetrics().line.xs + SECTION_LABEL_MARGIN_BOTTOM : 0),
-			bodyHeight,
-			bodyContentHeight: Math.max(0, body.frame.contentHeight - DETAIL_TOP_MARGIN),
-			appliedCap: body.appliedCap,
-			markdown: body.markdown === true,
-			// The width the body was actually wrapped at (see the field's doc). For a
-			// markdown body this is narrower than `innerWidth` by the scroll box's
-			// padding; every other kind reports `innerWidth` unchanged.
-			bodyContentWidth: body.contentWidth,
-			// Forward the markdown body's raw source (see MeasuredToolDetailSection).
-			// Copying one string into the section descriptor cannot move `y`.
-			...(body.sourceText === undefined ? {} : { sourceText: body.sourceText }),
-			// Same for "the painted blocks are only a prefix of that source": a
-			// sectioned body (skill / knowledge / Send message) hits the same parse
-			// ceiling, and the viewer has to make the same statement about it.
-			...(body.bodyIsPrefix === true ? { bodyIsPrefix: true } : {}),
-			// And for "the server only sent a prefix": a sectioned markdown body
-			// (skill / knowledge / Send message) is truncated by the same projection,
-			// and its viewer host needs the flag to request the rest. Another boolean
-			// copy — it cannot move `y` any more than `sourceText` can.
-			...(body.textTruncated === true ? { textTruncated: true } : {}),
-		});
-	}
-
-	if (blocks.length === 0) {
-		// An all-empty section list still occupies one placeholder row so the card
-		// never collapses to a zero-height detail box.
-		const block = makeFixed(
-			typographyMetrics().line.xs,
-			"detail-sections-empty",
-			DETAIL_TOP_MARGIN,
-		);
-		const region = finishRegion("sections", [block], innerWidth, null);
-		return { ...region, sections: [] };
-	}
-
-	return {
-		kind: "sections",
-		height: y,
-		blocks,
-		frame: { blocks: frameBlocks, contentHeight: y, usedWidth: innerWidth },
-		contentWidth: innerWidth,
-		appliedCap,
-		sections,
-	};
-}
-
-/**
- * Measure a detail region at the card's inner width. Capped kinds are a single
- * fixed block (`min(content, cap)`); the pretext-measured kinds build inline
- * blocks. The first block carries `DETAIL_TOP_MARGIN` (the `<Box mt="xs">` gap).
- */
+/** Place independently measured bodies; labels/gaps belong only to this level. */
 export function measureToolDetail(
 	detail: ToolDetailData,
 	innerWidth: number,
 	viewportHeight?: number,
 ): MeasuredToolDetail {
+	const sections: MeasuredToolDetailSection[] = [];
+	let y = DETAIL_TOP_MARGIN;
+	for (const part of detail.sections) {
+		if (sections.length > 0) y += SECTION_GAP;
+		const top = y;
+		if (part.label !== undefined) y += typographyMetrics().line.xs + SECTION_LABEL_MARGIN_BOTTOM;
+		const bodyTop = y;
+		const measuredBody = measureToolBody(part.body, innerWidth, viewportHeight);
+		y += measuredBody.height;
+		sections.push({
+			key: part.key,
+			label: part.label,
+			top,
+			height: y - top,
+			bodyTop,
+			bodyHeight: measuredBody.height,
+			measuredBody,
+		});
+	}
+	return {
+		kind: "sections",
+		height: sections.length > 0 ? y : 0,
+		contentWidth: innerWidth,
+		sections,
+	};
+}
+
+/** Measure one leaf in its own zero-based coordinates. No section margin or label. */
+export function measureToolBody(
+	detail: ToolCappedDetail,
+	innerWidth: number,
+	viewportHeight?: number,
+): MeasuredToolBody<ToolCappedDetail>;
+export function measureToolBody(
+	detail: ToolSectionBody,
+	innerWidth: number,
+	viewportHeight?: number,
+): MeasuredToolBody;
+export function measureToolBody(
+	detail: ToolSectionBody,
+	innerWidth: number,
+	viewportHeight?: number,
+): MeasuredToolBody {
 	switch (detail.kind) {
 		case "meta-rows": {
 			const rows = detail.rows.slice(0, META_ROWS_MAX);
 			const blocks: PreparedBlock[] = [];
 			rows.forEach((row, i) => {
-				blocks.push(...metaRowBlocks(row, i === 0 ? DETAIL_TOP_MARGIN : META_ROW_GAP));
+				blocks.push(...metaRowBlocks(row, i === 0 ? 0 : META_ROW_GAP));
 			});
 			if (blocks.length === 0) {
-				blocks.push(makeFixed(typographyMetrics().line.xs, "detail-meta-empty", DETAIL_TOP_MARGIN));
+				blocks.push(makeFixed(typographyMetrics().line.xs, "detail-meta-empty", 0));
 			}
-			return finishRegion("meta-rows", blocks, innerWidth, null);
+			return finishRegion(detail, blocks, innerWidth, null);
 		}
-
-		case "sections":
-			return measureSectionsDetail(detail, innerWidth, viewportHeight);
 
 		case "capped": {
 			const cap = resolveDetailCap(detail.cap, viewportHeight);
 			// Markdown bodies (ExitPlanMode plans) carry real prepared blocks instead
 			// of one opaque fixed block, so the render layer can paint headings/lists/
 			// code the way the chunked card's ContentViewer does.
-			if (detail.markdown && detail.text != null && detail.text.length > 0) {
+			if (detail.format === "markdown" && detail.text != null && detail.text.length > 0) {
 				const md = measureMarkdownDetail(
 					detail.text,
 					cap,
@@ -2097,6 +1633,7 @@ export function measureToolDetail(
 				);
 				return {
 					kind: "capped",
+					model: detail,
 					height: md.height,
 					blocks: md.blocks,
 					frame: md.frame,
@@ -2119,100 +1656,25 @@ export function measureToolDetail(
 					...(detail.textTruncated === true ? { textTruncated: true } : {}),
 				};
 			}
-			const hasLabel = detail.hasLabel ?? CAPPED_WITH_LABEL.has(detail.cap);
-			// A structured diff is measured ROW BY ROW at the width left over after the
-			// line-number gutter, because that gutter narrows every code line.
-			const diffGutterChars = diffGutterWidthChars(detail);
-			// A media cap with intrinsic dimensions reserves the aspect-fitted
-			// height instead of the fixed fallback (screenshots, image Reads). The
-			// fitted BOX (both dimensions) travels into `block.data` below so the
-			// render layer paints exactly the rectangle reserved here.
+			const diffGutterChars = diffGutterWidthChars(detail.diffDocument);
 			const media = mediaContentPx(detail.media, detail.contentPx, innerWidth, cap);
-			const { height, capped } = cappedBodyHeight(
-				cap,
-				detail.contentLines,
-				media.contentPx,
-				hasLabel,
-				detail.text,
-				innerWidth,
-				detail.diffLines ? { lines: detail.diffLines, gutterChars: diffGutterChars } : undefined,
-				detail.textTruncated,
-			);
-			const block = makeFixed(height, `detail-${detail.cap}`, DETAIL_TOP_MARGIN, {
+			const capped = detail.diffDocument
+				? measureDiffDocumentHeight(detail.diffDocument, cap, innerWidth, detail.textTruncated)
+				: cappedBodyHeight(
+						cap,
+						detail.contentLines,
+						media.contentPx,
+						detail.text,
+						innerWidth,
+						detail.textTruncated,
+					);
+			const block = makeFixed(capped, "detail-body", 0, {
 				cap,
 				capped,
-				hasLabel,
-				// Render-only body text (painted in the capped scroll box).
-				text: detail.text,
-				// Render-only image descriptor for media caps (painted as an <img>).
-				media: detail.media,
-				// The EXACT display box the height above was reserved from. Without
-				// these the render layer falls back to its legacy full-width centred
-				// box, which paints `boxWidth × h/w` — taller than the reservation
-				// whenever the cap (not the width) was the binding constraint, and the
-				// overflow is clipped away. Same contract as the chat image block's
-				// `displayWidth`/`displayHeight` (see measure-media).
-				...(media.fit
-					? { displayWidth: media.fit.displayWidth, displayHeight: media.fit.displayHeight }
-					: {}),
-				// Render-only syntax-highlighting hints (colour only, never geometry).
-				codeLang: detail.codeLang,
-				codeLangPath: detail.codeLangPath,
-				// Structured diff rows + the gutter geometry the render layer must
-				// reproduce exactly (it was folded into the height above).
-				diffLines: detail.diffLines,
-				diffLineNoWidth: detail.diffLineNoWidth,
-				diffLineNumberPrefix: detail.diffLineNumberPrefix,
 				diffGutterChars,
-				// Render-only passthrough: `text` is a PREFIX of the real payload, so the
-				// fullscreen viewer must say the body is incomplete rather than present
-				// the prefix as the whole thing. Already folded into the height above.
-				textTruncated: detail.textTruncated,
+				...(media.fit ? media.fit : {}),
 			});
-			return finishRegion("capped", [block], innerWidth, cap);
-		}
-
-		case "generic": {
-			const cap = DETAIL_CAPS.code; // 200 per section
-			const inH = cappedBodyHeight(
-				cap,
-				detail.inputLines,
-				undefined,
-				true,
-				detail.inputText,
-				innerWidth,
-				undefined,
-				detail.inputTruncated,
-			);
-			const blocks: PreparedFixedBlock[] = [
-				makeFixed(inH.height, "detail-generic-input", DETAIL_TOP_MARGIN, {
-					cap,
-					capped: inH.capped,
-					text: detail.inputText,
-					textTruncated: detail.inputTruncated,
-				}),
-			];
-			if (detail.outputLines != null) {
-				const outH = cappedBodyHeight(
-					cap,
-					detail.outputLines,
-					undefined,
-					true,
-					detail.outputText,
-					innerWidth,
-					undefined,
-					detail.outputTruncated,
-				);
-				blocks.push(
-					makeFixed(outH.height, "detail-generic-output", GENERIC_SECTION_GAP, {
-						cap,
-						capped: outH.capped,
-						text: detail.outputText,
-						textTruncated: detail.outputTruncated,
-					}),
-				);
-			}
-			return finishRegion("generic", blocks, innerWidth, cap);
+			return finishRegion(detail, [block], innerWidth, cap);
 		}
 
 		case "spec-tasks": {
@@ -2227,7 +1689,7 @@ export function measureToolDetail(
 					DETAIL_TEXT_FONT,
 					XS_LINE_HEIGHT,
 					indent,
-					i === 0 ? DETAIL_TOP_MARGIN : SPEC_TASK_GAP,
+					i === 0 ? 0 : SPEC_TASK_GAP,
 					"vlist-tc-spec-task",
 					// RENDER-ONLY: status glyph + protected lock (height-neutral).
 					{ status: task.status ?? "todo", protected: task.protected === true },
@@ -2237,13 +1699,13 @@ export function measureToolDetail(
 			// Paper with the "task list is empty" line, mirroring the chunked card).
 			if (blocks.length === 0) {
 				return finishRegion(
-					"spec-tasks",
-					[makeFixed(SPEC_TASK_EMPTY_HEIGHT, "detail-spec-empty", DETAIL_TOP_MARGIN)],
+					detail,
+					[makeFixed(SPEC_TASK_EMPTY_HEIGHT, "detail-spec-empty", 0)],
 					innerWidth,
 					null,
 				);
 			}
-			return finishRegion("spec-tasks", blocks, innerWidth, null);
+			return finishRegion(detail, blocks, innerWidth, null);
 		}
 
 		case "ask": {
@@ -2251,19 +1713,19 @@ export function measureToolDetail(
 			detail.questions.slice(0, ASK_QUESTIONS_MAX).forEach((question, i) => {
 				// Questions are separated by the banner's outer Stack gap; the first one
 				// carries the region's own leading gap instead.
-				blocks.push(...askQuestionBlocks(question, i === 0 ? DETAIL_TOP_MARGIN : ALERT_STACK_GAP));
+				blocks.push(...askQuestionBlocks(question, i === 0 ? 0 : ALERT_STACK_GAP));
 			});
 			// A question with no header, no options and no answer would otherwise
 			// produce a zero-height region; keep one placeholder row.
 			if (blocks.length === 0) {
 				return finishRegion(
-					"ask",
-					[makeFixed(typographyMetrics().line.xs, "detail-ask-empty", DETAIL_TOP_MARGIN)],
+					detail,
+					[makeFixed(typographyMetrics().line.xs, "detail-ask-empty", 0)],
 					innerWidth,
 					null,
 				);
 			}
-			return finishRegion("ask", blocks, innerWidth, null);
+			return finishRegion(detail, blocks, innerWidth, null);
 		}
 
 		case "structured": {
@@ -2271,7 +1733,7 @@ export function measureToolDetail(
 			const badgeRows = detail.badgeRows ?? 0;
 			if (badgeRows > 0) {
 				blocks.push(
-					makeFixed(badgeRows * STRUCT_BADGE_ROW, "detail-struct-badges", DETAIL_TOP_MARGIN, {
+					makeFixed(badgeRows * STRUCT_BADGE_ROW, "detail-struct-badges", 0, {
 						badgeRows,
 						// RENDER-ONLY badge chips (height-neutral; height comes from badgeRows).
 						badges: detail.badges,
@@ -2283,16 +1745,14 @@ export function measureToolDetail(
 			if (detail.entries && detail.entries.length > 0) {
 				const entries = detail.entries.slice(0, ENTRY_MAX);
 				entries.forEach((entry, i) => {
-					const marginTop =
-						i === 0 ? (badgeRows > 0 ? STRUCT_BADGE_GAP : DETAIL_TOP_MARGIN) : SECTION_GAP;
+					const marginTop = i === 0 ? (badgeRows > 0 ? STRUCT_BADGE_GAP : 0) : SECTION_GAP;
 					blocks.push(...entryBlocks(entry, marginTop, innerWidth));
 				});
-				return finishRegion("structured", blocks, innerWidth, null);
+				return finishRegion(detail, blocks, innerWidth, null);
 			}
 			const font = detail.mono ? typographyMetrics().font.xsMono : typographyMetrics().font.xs;
 			detail.bodyLines.forEach((line, i) => {
-				const marginTop =
-					i === 0 ? (badgeRows > 0 ? STRUCT_BADGE_GAP : DETAIL_TOP_MARGIN) : STRUCT_BADGE_GAP;
+				const marginTop = i === 0 ? (badgeRows > 0 ? STRUCT_BADGE_GAP : 0) : STRUCT_BADGE_GAP;
 				blocks.push(
 					makeInline(
 						line.length > 0 ? line : " ",
@@ -2307,13 +1767,13 @@ export function measureToolDetail(
 			// A badge-only structured detail (no body lines) is still one region.
 			if (blocks.length === 0) {
 				blocks.push(
-					makeFixed(STRUCT_BADGE_ROW, "detail-struct-badges", DETAIL_TOP_MARGIN, {
+					makeFixed(STRUCT_BADGE_ROW, "detail-struct-badges", 0, {
 						badgeRows: 1,
 						badges: detail.badges,
 					}),
 				);
 			}
-			return finishRegion("structured", blocks, innerWidth, null);
+			return finishRegion(detail, blocks, innerWidth, null);
 		}
 
 		case "error": {
@@ -2322,14 +1782,14 @@ export function measureToolDetail(
 				DETAIL_TEXT_FONT,
 				XS_LINE_HEIGHT,
 				ERROR_INDENT,
-				DETAIL_TOP_MARGIN,
+				0,
 				"vlist-tc-error",
 				// RENDER-ONLY tone, carried on the block because the render layer only
 				// ever sees the measured blocks (it never re-reads the classifier
 				// output). Colour only — the geometry above is identical either way.
 				detail.tone ? { tone: detail.tone } : undefined,
 			);
-			return finishRegion("error", [block], innerWidth, null);
+			return finishRegion(detail, [block], innerWidth, null);
 		}
 	}
 }
@@ -2496,14 +1956,6 @@ export function measureToolCall(
 	};
 }
 
-/** Parse once, measure many (e.g. on resize / LOD change). Reusable closure. */
-export function prepareToolCallMeasurer(
-	data: ToolCallData,
-): (contentWidth: number, lod?: RenderLod, opts?: MeasureToolCallOpts) => MeasuredToolCall {
-	return (contentWidth, lod = DEFAULT_RENDER_LOD, opts = {}) =>
-		measureToolCall(data, contentWidth, lod, opts);
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Grouped card (ToolCallGroup) — consecutive same-category tools folded into one.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2637,44 +2089,3 @@ export function measureToolCallGroup(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-
-export const MEASURE_TOOL_CALL_CONSTANTS = {
-	CARD_PADDING,
-	CARD_BORDER,
-	CARD_DIVIDER,
-	HEADER_CATEGORY_ICON,
-	HEADER_TEXT_LINE_HEIGHT,
-	HEADER_ROW_HEIGHT,
-	DETAIL_TOP_MARGIN,
-	DETAIL_CONTENT_LINE_HEIGHT,
-	DETAIL_LABEL_LINE_HEIGHT,
-	DETAIL_LABEL_MARGIN_BOTTOM,
-	GENERIC_SECTION_GAP,
-	DETAIL_BOX_PADDING_X,
-	DETAIL_BOX_PADDING_Y,
-	DETAIL_BOX_CHROME_X,
-	DETAIL_BOX_CHROME_Y,
-	DETAIL_MEASURE_PREFIX_MAX_CHARS,
-	DETAIL_MARKDOWN_PREFIX_MAX_CHARS,
-	DETAIL_SOURCE_LINE_MARGIN_BOTTOM,
-	XS_LINE_HEIGHT,
-	SPEC_TASK_ICON,
-	SPEC_TASK_INDENT,
-	SPEC_TASK_GAP,
-	SPEC_TASK_LOCK,
-	SPEC_TASK_LOCK_GAP,
-	SPEC_TASK_LOCK_LANE,
-	SPEC_TASK_EMPTY_HEIGHT,
-	STRUCT_BADGE_ROW,
-	STRUCT_BODY_LINE_HEIGHT,
-	STRUCT_BADGE_GAP,
-	ERROR_ICON,
-	ERROR_INDENT,
-	GROUP_HEADER_TEXT_LINE,
-	GROUP_HEADER_ICON,
-	GROUP_HEADER_ROW,
-	GROUP_BODY_MARGIN_TOP,
-	GROUP_BODY_PADDING_LEFT,
-	GROUP_BODY_BORDER_LEFT,
-	DETAIL_CAPS,
-} as const;

@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseManifest } from "@server/lib/plugins/manifest";
+import { PROVIDER_REQUEST_MAX_BYTES } from "@server/lib/plugins/protocol";
+import { PluginManager } from "@server/services/plugin-manager";
 import { createPluginProviderAdapterFactory } from "@server/services/plugin-provider-adapter-factory";
 import { PluginProviderCatalogRefresher } from "@server/services/plugin-provider-catalog-refresh";
 import {
@@ -10,7 +13,11 @@ import {
 } from "@server/services/plugin-provider-client";
 import { providerRegistrationsFromManifest } from "@server/services/plugin-provider-manifest";
 import { PluginProviderRegistry } from "@server/services/plugin-provider-registry";
-import { LocalProcessRunner, PluginRuntime } from "@server/services/plugin-runtime";
+import {
+	LocalProcessRunner,
+	PluginRuntime,
+	RuntimeSupervisor,
+} from "@server/services/plugin-runtime";
 
 /**
  * The provider counterpart of `plugin-reference-lifecycle.e2e.test.ts`: a real
@@ -211,6 +218,72 @@ describe("provider plugin over real stdio RPC", () => {
 		}
 		expect(runtime.state).toBe("stopped");
 	}, 30_000);
+
+	test("production runner delivers long histories through every outbound limit", async () => {
+		const root = await mkdtemp(join(tmpdir(), "provider-long-history-"));
+		const supervisor = new RuntimeSupervisor();
+		const manager = new PluginManager({ root, disabled: false, runtimeSupervisor: supervisor });
+		try {
+			const manifest = await loadManifest();
+			await manager.install(fixtureRoot);
+			await manager.enable(manifest.pluginId);
+			await manager.activate(manifest.pluginId);
+			const runtime = supervisor.get(manifest.pluginId);
+			if (!runtime) throw new Error("Missing production runtime");
+			expect(runtime.rpcConnection?.getLimits()).toMatchObject({
+				maxInboundFrameBytes: 1024 * 1024,
+				maxOutboundFrameBytes: PROVIDER_REQUEST_MAX_BYTES,
+			});
+			const { registry, pool } = createStack(runtime, manifest);
+			const entry = registry.list()[0];
+			const client = await pool
+				.get({
+					pluginId: manifest.pluginId,
+					providerTypeId: entry.providerTypeId,
+					providerInstanceId: entry.providerInstanceId,
+				})
+				.acquire();
+			const block = "x".repeat(512 * 1024);
+			const history = (count: number) =>
+				Array.from({ length: count }, () => ({
+					role: "user" as const,
+					content: [{ type: "text" as const, text: block }],
+				}));
+			// Cross the former connection (1 MiB), writer (8 MiB) and receiver (16 MiB) ceilings.
+			for (const count of [4, 20, 40]) {
+				const operation = await client.chat({
+					providerTypeId: entry.providerTypeId,
+					providerInstanceId: entry.providerInstanceId,
+					providerPrefix: entry.providerPrefix,
+					modelId: "example/offline",
+					config: {},
+					conversation: { conversationId: "long-history" },
+					request: {
+						history: history(count),
+						current: { text: "hello", toolResults: [] },
+						tools: [],
+					},
+				});
+				let text = "";
+				for await (const event of operation.events())
+					if (event.type === "text.delta") text += event.text;
+				expect(text).toBe(EXPECTED_CHAT_TEXT);
+			}
+			await expect(runtime.request("provider.chat", { history: history(66) })).rejects.toThrow(
+				"connection frame limit",
+			);
+			expect(runtime.state).toBe("active");
+			expect(runtime.rpcConnection?.outboundPending.size).toBe(0);
+			await expect(runtime.request("health")).resolves.toBeDefined();
+			pool.clear();
+		} catch (error) {
+			const stderr = supervisor.get("com.example.provider")?.getDiagnostics().stderr ?? "";
+			throw new Error(`${String(error)}\n${stderr.slice(-2000)}`);
+		} finally {
+			await manager.shutdown();
+			await rm(root, { recursive: true, force: true });
+		}
+	}, 60_000);
 
 	test("reports a provider error without killing the runtime", async () => {
 		const manifest = await loadManifest();

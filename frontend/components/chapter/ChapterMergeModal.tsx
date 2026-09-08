@@ -110,6 +110,7 @@ export function ChapterMergeModal({
 		mutationFn: () =>
 			api.checkMergeConflicts(chapterId, targetId ?? "") as Promise<MergeCheckResult>,
 		onSuccess: (data) => setConflicts(data),
+		onError: () => setConflicts(null),
 	});
 
 	const merge = useMutation({
@@ -203,11 +204,7 @@ export function ChapterMergeModal({
 
 				{checkConflicts.isError && (
 					<Alert color="red" title={t("conflictCheckFailed")}>
-						<Text size="sm">
-							{checkConflicts.error instanceof Error
-								? checkConflicts.error.message
-								: tc("unknownError")}
-						</Text>
+						<ErrorDetail error={checkConflicts.error} fallback={tc("unknownError")} />
 					</Alert>
 				)}
 

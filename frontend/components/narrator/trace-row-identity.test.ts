@@ -27,6 +27,35 @@ import {
 // hand-copied expectation.
 const { buildSelectionIndex } = await import("./vlist/vlist-selection");
 
+test("running Send trace uses resolved id but excludes parent and fanout", () => {
+	const tc = {
+		toolName: "Send",
+		inputJson: { name: "worker", await: true },
+		_awaitAgentNarratorId: "sub-live",
+		status: "running",
+	};
+	expect(traceRowSendTargetNarratorId(tc)).toBe("sub-live");
+	for (const inputJson of [{ id: "parent" }, { names: ["a", "b"] }]) {
+		expect(traceRowSendTargetNarratorId({ ...tc, inputJson })).toBeUndefined();
+	}
+	expect(
+		traceRowSendTargetNarratorId({
+			...tc,
+			outputJson: {
+				_metadata: { targets: [{ id: "authoritative" }] },
+			},
+		}),
+	).toBe("authoritative");
+	expect(
+		traceRowSendTargetNarratorId({
+			...tc,
+			outputJson: {
+				_metadata: { targets: [] },
+			},
+		}),
+	).toBeUndefined();
+});
+
 // biome-ignore lint/suspicious/noExplicitAny: structural test fixtures
 function msg(partial: Record<string, any>): NarratorMsg {
 	return { children: [], contentText: null, ...partial } as unknown as NarratorMsg;
@@ -378,6 +407,21 @@ describe("traceRowAwaitAgentNarratorId — embedded metadata only", () => {
  * was hidden on essentially every Send row on both render paths.
  */
 describe("traceRowSendTargetNarratorId", () => {
+	test("TeamStatus direct messages navigate but broadcasts never guess a recipient", async () => {
+		const { deriveSendTargetNarratorId } = await import("./vlist/vlist-tool-meta");
+		const metadata = { targets: [{ id: "child", label: "worker" }] };
+		for (const action of ["send", "broadcast", "list"]) {
+			const expected = action === "send" ? "child" : undefined;
+			expect(
+				traceRowSendTargetNarratorId({
+					toolName: "TeamStatus",
+					inputJson: { action },
+					outputJson: { _metadata: metadata },
+				}),
+			).toBe(expected);
+			expect(deriveSendTargetNarratorId("TeamStatus", metadata, { action })).toBe(expected);
+		}
+	});
 	test("resolves a single sibling target's narrator id", () => {
 		expect(
 			traceRowSendTargetNarratorId({

@@ -6,6 +6,7 @@ import { worktreeLock } from "../lib/async-mutex";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
+import { requireCompleteMergeTree, requireMarkerResolvableTree } from "../lib/git-tree-merge";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getPrompt, type Locale } from "../lib/prompt-i18n";
@@ -21,6 +22,7 @@ import {
 	planSnapshotMerge,
 	planSnapshotUnmerge,
 	restoreSourceSnapshot,
+	revalidateSnapshotConflictPlan,
 } from "./chapter-merge-snapshot";
 import { advanceChapterSnapshot, ensureChapterSnapshot } from "./chapter-snapshot-ref";
 import { commitSyncService } from "./commit-sync-service";
@@ -861,8 +863,9 @@ export const chapterMerge = {
 				.trim()
 				.slice(0, 40);
 			const plan = await planSnapshotMerge(source, target);
+			requireCompleteMergeTree(plan);
 
-			if (plan.conflicts.length > 0) {
+			if (plan.hasConflicts) {
 				return { success: false, conflictFiles: plan.conflicts };
 			}
 
@@ -1199,8 +1202,9 @@ export const chapterMerge = {
 				.trim()
 				.slice(0, 40);
 			const plan = await planSnapshotMerge(source, target);
+			requireCompleteMergeTree(plan);
 
-			if (plan.conflicts.length === 0) {
+			if (!plan.hasConflicts) {
 				const applied = await applySnapshotMerge(targetWorktree, plan, message);
 				const { warning } = await markMergedSnapshot(
 					source.id,
@@ -1218,7 +1222,7 @@ export const chapterMerge = {
 				return { success: true, ...(warning && { warning }) };
 			}
 
-			await materializeConflicts(targetWorktree, plan.tree);
+			await materializeConflicts(targetWorktree, plan);
 			try {
 				await chapterEdgeService.createMergeEdge(source.projectId, source.id, target.id, {
 					strategy,
@@ -1243,7 +1247,7 @@ export const chapterMerge = {
 				),
 				snapshotState: {
 					preMergeTree: plan.preMergeTree,
-					conflictTree: plan.tree,
+					conflictTree: requireMarkerResolvableTree(plan),
 					targetSnapshot: plan.targetSnapshot,
 					sourceSnapshot: plan.sourceSnapshot,
 					preMergeTargetSha: preMergeTargetSha || null,
@@ -1275,6 +1279,12 @@ export const chapterMerge = {
 		);
 
 		return worktreeLock.acquire(targetWorktree, async () => {
+			await revalidateSnapshotConflictPlan(source, target, {
+				targetSnapshot: state.targetSnapshot,
+				sourceSnapshot: state.sourceSnapshot,
+				tree: state.conflictTree,
+				conflicts: state.conflictFiles,
+			});
 			const remaining = await detectRemainingConflicts(targetWorktree, state.conflictFiles);
 			if (remaining.length > 0) {
 				return {
@@ -1598,6 +1608,7 @@ export const chapterMerge = {
 				.trim()
 				.slice(0, 40);
 			const plan = await planSnapshotMerge(source, target);
+			requireCompleteMergeTree(plan);
 
 			const finish = async (mergeTree: string, sourceSnapshot: string) => {
 				const commitSha = await worktreeTreeSnapshot.commitSnapshot(
@@ -1627,13 +1638,14 @@ export const chapterMerge = {
 				} satisfies AiResolveResult;
 			};
 
-			if (plan.conflicts.length === 0) {
-				await worktreeTreeSnapshot.materializeTree(targetWorktree, plan.tree);
-				return finish(plan.tree, plan.sourceSnapshot);
+			if (!plan.hasConflicts) {
+				const tree = requireCompleteMergeTree(plan);
+				await worktreeTreeSnapshot.materializeTree(targetWorktree, tree);
+				return finish(tree, plan.sourceSnapshot);
 			}
 
 			// Write the conflicted tree so the narrator sees standard markers.
-			await materializeConflicts(targetWorktree, plan.tree);
+			await materializeConflicts(targetWorktree, plan);
 			const prompt = buildConflictResolutionPrompt(
 				plan.conflicts,
 				source.branch,
@@ -2290,7 +2302,8 @@ export const chapterMerge = {
 				mergeSnapshotCommitSha,
 				preMergeTargetSnapshot,
 			);
-			if (plan.conflicts.length > 0) {
+			requireCompleteMergeTree(plan);
+			if (plan.hasConflicts) {
 				// The target has since edited the very lines being rolled back. Same
 				// situation the commit path reports when a revert conflicts, and the
 				// worktree is left untouched.

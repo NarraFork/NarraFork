@@ -17,31 +17,41 @@ import { beforeEach, describe, expect, it } from "bun:test";
 import {
 	buildDiffHighlightPlan,
 	buildDiffHighlightSource,
-	computeDiff,
-	computeDiffCached,
 	countDiffLineStats,
 	countTextLines,
+	createDiffDocument,
 	type DiffLine,
-	diffCacheStats,
+	type DiffSourcePoint,
+	diffDocumentCacheStats,
+	diffDocumentLineNoWidth,
 	diffLineMarker,
 	diffLineNoWidth,
 	formatDiffGutter,
 	formatDiffLineNumber,
+	getDiffRowAnchor,
 	MAX_DIFF_INPUT_CHARS,
 	MAX_DIFF_LINES,
 	normalizeDiffLineEndings,
-	resetDiffCache,
+	projectDiffDocument,
+	readDiffRowContent,
+	resetDiffDocumentCache,
+	resolveDiffSourcePoint,
 } from "./diff-core";
+import { appendSourceText, createSourceText, reconcileSourceText } from "./source-text";
+
+/** Small-fixture projection; source caching and bounds are tested separately below. */
+const projectTextRows = (oldText: string, newText: string, startLine?: number) =>
+	projectDiffDocument(createDiffDocument({ oldText, newText, startLine }), { startRow: 0 }).lines;
 
 const shape = (lines: DiffLine[]) => lines.map((l) => [l.type, l.content]);
 const numbers = (lines: DiffLine[]) => lines.map((l) => [l.oldLineNo, l.newLineNo]);
 
-describe("computeDiff — line classification", () => {
+describe("document projection — line classification", () => {
 	it("keeps unchanged lines as context instead of removing and re-adding them", () => {
 		// The regression this locks down: a naive implementation emits
 		// [removed a, removed b, added a, added B], losing the fact that `a` is
 		// unchanged and destroying the line numbering.
-		expect(shape(computeDiff("a\nb", "a\nB"))).toEqual([
+		expect(shape(projectTextRows("a\nb", "a\nB"))).toEqual([
 			["context", "a"],
 			["removed", "b"],
 			["added", "B"],
@@ -49,14 +59,14 @@ describe("computeDiff — line classification", () => {
 	});
 
 	it("reports a pure insertion with no removed rows", () => {
-		expect(shape(computeDiff("a\n", "a\nb\n"))).toEqual([
+		expect(shape(projectTextRows("a\n", "a\nb\n"))).toEqual([
 			["context", "a"],
 			["added", "b"],
 		]);
 	});
 
 	it("reports a pure deletion with no added rows", () => {
-		expect(shape(computeDiff("a\nb\n", "a\n"))).toEqual([
+		expect(shape(projectTextRows("a\nb\n", "a\n"))).toEqual([
 			["context", "a"],
 			["removed", "b"],
 		]);
@@ -69,7 +79,7 @@ describe("computeDiff — line classification", () => {
 		// Both render paths share this function, so both agree — which is the
 		// property that matters here. Real Edit payloads normally keep their
 		// newlines, in which case the case above applies.
-		expect(shape(computeDiff("a", "a\nb"))).toEqual([
+		expect(shape(projectTextRows("a", "a\nb"))).toEqual([
 			["removed", "a"],
 			["added", "a"],
 			["added", "b"],
@@ -77,32 +87,32 @@ describe("computeDiff — line classification", () => {
 	});
 
 	it("handles an empty old side (whole body added)", () => {
-		expect(shape(computeDiff("", "x\ny"))).toEqual([
+		expect(shape(projectTextRows("", "x\ny"))).toEqual([
 			["added", "x"],
 			["added", "y"],
 		]);
 	});
 
 	it("handles an empty new side (whole body removed)", () => {
-		expect(shape(computeDiff("x\ny", ""))).toEqual([
+		expect(shape(projectTextRows("x\ny", ""))).toEqual([
 			["removed", "x"],
 			["removed", "y"],
 		]);
 	});
 
 	it("returns no rows when both sides are identical and empty", () => {
-		expect(computeDiff("", "")).toEqual([]);
+		expect(projectTextRows("", "")).toEqual([]);
 	});
 
 	it("emits all context when the two sides are identical", () => {
-		const lines = computeDiff("a\nb\nc", "a\nb\nc");
+		const lines = projectTextRows("a\nb\nc", "a\nb\nc");
 		expect(lines.every((l) => l.type === "context")).toBe(true);
 		expect(lines).toHaveLength(3);
 	});
 
 	it("pairs uneven modification blocks, then lists the leftovers", () => {
 		// 3 removed vs 1 added: one pair, then two unpaired removals.
-		expect(shape(computeDiff("a\nb\nc", "X"))).toEqual([
+		expect(shape(projectTextRows("a\nb\nc", "X"))).toEqual([
 			["removed", "a"],
 			["added", "X"],
 			["removed", "b"],
@@ -111,9 +121,9 @@ describe("computeDiff — line classification", () => {
 	});
 });
 
-describe("computeDiff — line numbers", () => {
+describe("document projection — line numbers", () => {
 	it("numbers context on both sides and each change on its own side only", () => {
-		expect(numbers(computeDiff("a\nb", "a\nB"))).toEqual([
+		expect(numbers(projectTextRows("a\nb", "a\nB"))).toEqual([
 			[1, 1],
 			[2, undefined],
 			[undefined, 2],
@@ -121,7 +131,7 @@ describe("computeDiff — line numbers", () => {
 	});
 
 	it("offsets every row by startLine", () => {
-		expect(numbers(computeDiff("a\nb", "a\nB", 42))).toEqual([
+		expect(numbers(projectTextRows("a\nb", "a\nB", 42))).toEqual([
 			[42, 42],
 			[43, undefined],
 			[undefined, 43],
@@ -130,7 +140,7 @@ describe("computeDiff — line numbers", () => {
 
 	it("keeps the two sides diverging after an insertion", () => {
 		// Adding a line makes the new side run one ahead of the old side.
-		const lines = computeDiff("a\nz", "a\nb\nz");
+		const lines = projectTextRows("a\nz", "a\nb\nz");
 		expect(numbers(lines)).toEqual([
 			[1, 1],
 			[undefined, 2],
@@ -139,9 +149,9 @@ describe("computeDiff — line numbers", () => {
 	});
 });
 
-describe("computeDiff — word-level changes", () => {
+describe("document projection — word-level changes", () => {
 	it("marks only the differing token inside a modified pair", () => {
-		const lines = computeDiff("const a = 1;", "const a = 2;");
+		const lines = projectTextRows("const a = 1;", "const a = 2;");
 		const removed = lines.find((l) => l.type === "removed");
 		const added = lines.find((l) => l.type === "added");
 		// The removed row must contain no additions, and vice versa.
@@ -157,14 +167,14 @@ describe("computeDiff — word-level changes", () => {
 	it("omits word changes for unpaired insertions and deletions", () => {
 		// `b` is an unpaired addition (nothing was removed opposite it), so there is
 		// no counterpart to word-diff against.
-		const inserted = computeDiff("a\n", "a\nb\n").find((l) => l.content === "b");
+		const inserted = projectTextRows("a\n", "a\nb\n").find((l) => l.content === "b");
 		expect(inserted?.type).toBe("added");
 		expect(inserted?.wordChanges).toBeUndefined();
 	});
 
 	it("skips the word diff for lines beyond the per-line budget", () => {
 		const long = "x".repeat(3_000);
-		const lines = computeDiff(long, `${long}y`);
+		const lines = projectTextRows(long, `${long}y`);
 		// 3000 + 3001 > MAX_WORD_DIFF_CHARS (4000) → no quadratic word diff.
 		expect(lines.find((l) => l.type === "removed")?.wordChanges).toBeUndefined();
 	});
@@ -176,7 +186,7 @@ describe("normalizeDiffLineEndings", () => {
 	});
 
 	it("makes line-ending-only changes produce no edits", () => {
-		const lines = computeDiff("a\r\nb\r\n", "a\nb\n");
+		const lines = projectTextRows("a\r\nb\r\n", "a\nb\n");
 		expect(lines.every((l) => l.type === "context")).toBe(true);
 	});
 });
@@ -197,7 +207,7 @@ describe("gutter formatting", () => {
 	});
 
 	it("produces the same total width for every row type", () => {
-		const lines = computeDiff("a\nb", "a\nB", 1);
+		const lines = projectTextRows("a\nb", "a\nB", 1);
 		const width = diffLineNoWidth(lines);
 		const gutters = lines.map((l) => formatDiffGutter(l, width));
 		// Fixed width is what makes the code column start at the same offset.
@@ -207,7 +217,7 @@ describe("gutter formatting", () => {
 	});
 
 	it("builds the two-column gutter with the correct markers", () => {
-		const lines = computeDiff("a\nb", "a\nB", 1);
+		const lines = projectTextRows("a\nb", "a\nB", 1);
 		// Layout: `oldNo` + one space + `newNo` + marker, each column 3 wide.
 		// A missing number becomes blanks so the columns still line up.
 		expect(lines.map((l) => formatDiffGutter(l, 3))).toEqual([
@@ -236,7 +246,7 @@ describe("gutter formatting", () => {
 
 describe("buildDiffHighlightSource", () => {
 	it("joins row contents without markers or gutters", () => {
-		const lines = computeDiff("a\nb", "a\nB");
+		const lines = projectTextRows("a\nb", "a\nB");
 		expect(buildDiffHighlightSource(lines)).toBe("a\nb\nB");
 	});
 
@@ -337,23 +347,25 @@ describe("bounds", () => {
 	it("caps the emitted row count", () => {
 		const oldStr = Array.from({ length: 2_000 }, (_, i) => `old ${i}`).join("\n");
 		const newStr = Array.from({ length: 2_000 }, (_, i) => `new ${i}`).join("\n");
-		expect(computeDiff(oldStr, newStr).length).toBeLessThanOrEqual(MAX_DIFF_LINES);
+		expect(projectTextRows(oldStr, newStr).length).toBeLessThanOrEqual(MAX_DIFF_LINES);
 	});
 
 	it("clamps an over-long single line", () => {
-		const lines = computeDiff("a", `${"b".repeat(9_000)}`);
+		const lines = projectTextRows("a", `${"b".repeat(9_000)}`);
 		const added = lines.find((l) => l.type === "added");
 		// 4000-char clamp plus the " …" marker.
 		expect(added?.content.length).toBeLessThan(4_100);
 		expect(added?.content.endsWith("…")).toBe(true);
 	});
 
-	it("falls back to a bounded preview for an oversized input", () => {
+	it("marks an oversized bounded diff without injecting a fake source row", () => {
 		const big = "x\n".repeat(150_000);
-		const lines = computeDiff(big, `${big}y`);
-		expect(lines.length).toBeLessThanOrEqual(MAX_DIFF_LINES);
-		// The preview announces itself rather than silently truncating.
-		expect(lines[0]?.content).toContain("too large");
+		const doc = createDiffDocument({ oldText: big, newText: `${big}y`, focusSide: "new" });
+		const projection = projectDiffDocument(doc);
+		expect(projection.lines.length).toBeLessThanOrEqual(MAX_DIFF_LINES);
+		expect(doc.omission).toBe("input-budget");
+		expect(doc.truncated).toBe(true);
+		expect(projection.lines[projection.focusIndex]?.content).toBe("y");
 	});
 });
 
@@ -362,71 +374,83 @@ describe("bounds", () => {
  * every tool card on every rebuild), so these tests assert both halves: it must
  * return the identical rows a fresh computation would, and it must stay bounded.
  */
-describe("computeDiffCached", () => {
+describe("createDiffDocument source cache", () => {
 	beforeEach(() => {
-		resetDiffCache();
+		resetDiffDocumentCache();
 	});
 
-	it("returns the same rows the uncached computation does", () => {
-		const oldStr = "a\nb\nc";
-		const newStr = "a\nB\nc";
-		expect(computeDiffCached(oldStr, newStr, 1)).toEqual(computeDiff(oldStr, newStr, 1));
+	it("rebuilds the same source runs and projected rows after clearing the cache", () => {
+		const input = { oldText: "a\nb\nc", newText: "a\nB\nc", startLine: 1 };
+		const cached = createDiffDocument(input);
+		resetDiffDocumentCache();
+		const rebuilt = createDiffDocument(input);
+		expect(rebuilt).not.toBe(cached);
+		expect(rebuilt.runs).toEqual(cached.runs);
+		expect(projectDiffDocument(rebuilt)).toEqual(projectDiffDocument(cached));
 	});
 
-	it("returns the SAME array instance on a repeat call", () => {
-		const oldStr = "const a = 1;\nkeep";
-		const newStr = "const a = 2;\nkeep";
-		const first = computeDiffCached(oldStr, newStr, 7);
-		expect(computeDiffCached(oldStr, newStr, 7)).toBe(first);
-		expect(diffCacheStats().entries).toBe(1);
+	it("shares the document but never a reader's projected rows on repeat calls", () => {
+		const input = { oldText: "const a = 1;\nkeep", newText: "const a = 2;\nkeep", startLine: 7 };
+		const first = createDiffDocument(input);
+		expect(createDiffDocument(input)).toBe(first);
+		const projection = projectDiffDocument(first);
+		expect(projectDiffDocument(first).lines).not.toBe(projection.lines);
+		expect(diffDocumentCacheStats().entries).toBe(1);
 	});
 
 	it("keys on startLine, so the same texts at a different offset recompute", () => {
-		const first = computeDiffCached("a\nb", "a\nB", 1);
-		const second = computeDiffCached("a\nb", "a\nB", 40);
+		const input = { oldText: "a\nb", newText: "a\nB" };
+		const first = createDiffDocument({ ...input, startLine: 1 });
+		const second = createDiffDocument({ ...input, startLine: 40 });
 		expect(second).not.toBe(first);
-		expect(second[0]?.oldLineNo).toBe(40);
-		expect(diffCacheStats().entries).toBe(2);
+		expect(projectDiffDocument(second).lines[0]?.oldLineNo).toBe(40);
+		expect(diffDocumentCacheStats().entries).toBe(2);
 	});
 
 	it("does not confuse two inputs that share length and sampled edges", () => {
-		// Same length, same head/middle/tail sample → same bucket key. The stored
-		// strings must still be compared, or one edit would render as another.
-		const head = "h".repeat(64);
-		const tail = "t".repeat(64);
-		const a = `${head}AAAA${tail}`;
-		const b = `${head}BBBB${tail}`;
-		const first = computeDiffCached(a, `${a}\nz`, 1);
-		const second = computeDiffCached(b, `${b}\nz`, 1);
+		// The changed region is outside the head/middle/tail samples. Exact source
+		// equality must reject the bucket collision before reusing cached runs.
+		const prefix = "h".repeat(64);
+		const suffix = "t".repeat(256);
+		const a = `${prefix}AAAA${suffix}`;
+		const b = `${prefix}BBBB${suffix}`;
+		const first = createDiffDocument({ oldText: a, newText: `${a}\nz`, startLine: 1 });
+		const second = createDiffDocument({ oldText: b, newText: `${b}\nz`, startLine: 1 });
 		expect(second).not.toBe(first);
-		expect(second.some((l) => l.content.includes("BBBB"))).toBe(true);
+		expect(projectDiffDocument(second).lines.some((line) => line.content.includes("BBBB"))).toBe(
+			true,
+		);
 	});
 
-	it("bounds the retained entries", () => {
+	it("bounds the retained source document entries", () => {
 		for (let i = 0; i < 400; i++) {
-			computeDiffCached(`old ${i}`, `new ${i}`, 1);
+			createDiffDocument({ oldText: `old ${i}`, newText: `new ${i}` });
 		}
-		expect(diffCacheStats().entries).toBeLessThanOrEqual(192);
+		expect(diffDocumentCacheStats().entries).toBeLessThanOrEqual(192);
 	});
 
-	it("bounds the retained rows for large diffs", () => {
-		for (let i = 0; i < 80; i++) {
-			const oldStr = Array.from({ length: 400 }, (_, n) => `old ${i}-${n}`).join("\n");
-			const newStr = Array.from({ length: 400 }, (_, n) => `new ${i}-${n}`).join("\n");
-			computeDiffCached(oldStr, newStr, 1);
+	it("bounds retained source characters instead of retaining projected rows and words", () => {
+		for (let i = 0; i < 24; i++) {
+			const text = `${"line\n".repeat(16_000)}${i}`;
+			const doc = createDiffDocument({ oldText: text, newText: `${text}!` });
+			const beforeProjection = diffDocumentCacheStats();
+			projectDiffDocument(doc);
+			expect(diffDocumentCacheStats()).toEqual(beforeProjection);
 		}
-		const stats = diffCacheStats();
-		expect(stats.rows).toBeLessThanOrEqual(24_000);
+		const stats = diffDocumentCacheStats();
+		expect(stats.chars).toBeLessThanOrEqual(MAX_DIFF_INPUT_CHARS * 10);
 		expect(stats.entries).toBeGreaterThan(0);
 	});
 
-	it("makes a repeated large diff cheap (the reason it exists)", () => {
-		const oldStr = Array.from({ length: 400 }, (_, i) => `line ${i}`).join("\n");
-		const newStr = Array.from({ length: 400 }, (_, i) => `LINE ${i}`).join("\n");
-		computeDiffCached(oldStr, newStr, 1);
+	it("makes a repeated large source document cheap without rehashing or projecting it", () => {
+		const input = {
+			oldText: Array.from({ length: 400 }, (_, i) => `line ${i}`).join("\n"),
+			newText: Array.from({ length: 400 }, (_, i) => `LINE ${i}`).join("\n"),
+			startLine: 1,
+		};
+		const first = createDiffDocument(input);
 		const started = performance.now();
-		for (let i = 0; i < 50; i++) computeDiffCached(oldStr, newStr, 1);
-		// 50 uncached calls on this input take seconds; 50 hits are sub-millisecond.
+		for (let i = 0; i < 50; i++) expect(createDiffDocument(input)).toBe(first);
 		expect(performance.now() - started).toBeLessThan(50);
 	});
 });
@@ -518,5 +542,332 @@ describe("countTextLines", () => {
 		expect(countTextLines("a")).toBe(1);
 		expect(countTextLines("a\nb")).toBe(2);
 		expect(countTextLines("a\nb\n")).toBe(2);
+	});
+});
+
+describe("DiffDocument — source runs and independent viewport projections", () => {
+	const text = (count: number) => Array.from({ length: count }, (_, i) => `${i}\n`).join("");
+	const anchorAt = (
+		doc: ReturnType<typeof createDiffDocument>,
+		row: number,
+		side: "old" | "new" = "new",
+	) => {
+		const point = getDiffRowAnchor(doc, row, side);
+		if (!point) throw new Error("missing test anchor");
+		return point;
+	};
+
+	it("shares all line runs, not a first-500-row projection or word-change objects", () => {
+		const doc = createDiffDocument({
+			oldText: text(2_000),
+			newText: text(2_000),
+			focusSide: "new",
+		});
+		expect(doc.totalRows).toBe(2_000);
+		expect(doc.runs).toHaveLength(1);
+		expect(doc.oldSource.lineStarts).toHaveLength(2_000);
+		expect(JSON.stringify(doc)).not.toContain("wordChanges");
+		const follow = projectDiffDocument(doc);
+		expect(follow.lines).toHaveLength(500);
+		expect(follow.lines[follow.focusIndex]?.newPoint?.line).toBe(1_999);
+		expect(follow.beforeRows).toBe(1_500);
+		expect(follow.afterRows).toBe(0);
+		expect(projectDiffDocument(doc).lines).not.toBe(follow.lines);
+	});
+
+	it("lets a follower cross multiple 500-row boundaries while a reader keeps row 200", () => {
+		const oldText = text(2_000);
+		let doc = createDiffDocument({ oldText, newText: text(450), focusSide: "new" });
+		const reader = anchorAt(doc, 200);
+		const original = projectDiffDocument(doc, { anchor: reader });
+		for (const count of [650, 1_200, 1_750, 2_000]) {
+			doc = createDiffDocument({ oldText, newText: text(count), focusSide: "new" });
+			const follower = projectDiffDocument(doc);
+			const paused = projectDiffDocument(doc, { anchor: reader });
+			expect(follower.lines[follower.focusIndex]?.newPoint?.line).toBe(count - 1);
+			expect(paused.lines[paused.anchorIndex]?.newPoint?.line).toBe(200);
+			expect(paused.anchorLost).toBe(false);
+			expect(paused.anchor).toEqual(reader);
+			expect(paused.lines.length).toBeLessThanOrEqual(500);
+			expect(original.lines[original.anchorIndex]?.newPoint?.line).toBe(200);
+		}
+		expect(doc.totalRows).toBe(2_000);
+	});
+
+	it("puts new-side focus before the long remaining deletion suffix", () => {
+		const doc = createDiffDocument({
+			oldText: text(2_000),
+			newText: "new content",
+			focusSide: "new",
+		});
+		const projection = projectDiffDocument(doc);
+		expect(doc.totalRows).toBe(2_001);
+		expect(doc.focus?.side).toBe("new");
+		expect(projection.lines[projection.focusIndex]?.type).toBe("added");
+		expect(projection.lines[projection.focusIndex]?.row).toBe(1);
+		expect(projection.afterRows).toBeGreaterThan(1_000);
+	});
+
+	it("keeps pairing and words when a projection starts in the second half of a pair", () => {
+		const doc = createDiffDocument({
+			oldText: "a\nb\nc\nsame\nd",
+			newText: "X\nsame\ny\nz",
+			startLine: 40,
+		});
+		const all = projectDiffDocument(doc, { startRow: 0 }).lines;
+		expect(shape(all)).toEqual([
+			["removed", "a"],
+			["added", "X"],
+			["removed", "b"],
+			["removed", "c"],
+			["context", "same"],
+			["removed", "d"],
+			["added", "y"],
+			["added", "z"],
+		]);
+		const added = projectDiffDocument(doc, { startRow: 1, limit: 1 }).lines[0];
+		expect(added?.wordChanges?.map((word) => word.value).join("")).toBe("X");
+		expect(added?.newLineNo).toBe(40);
+		for (const row of all) {
+			for (const point of [row.oldPoint, row.newPoint]) {
+				if (point) expect(resolveDiffSourcePoint(doc, point).row).toBe(row.row);
+			}
+		}
+	});
+
+	it("advances same-line focus and maps added→context without changing the source key", () => {
+		const before = createDiffDocument({ oldText: "hello", newText: "he", focusSide: "new" });
+		const after = createDiffDocument({ oldText: "hello", newText: "hello", focusSide: "new" });
+		const previous = projectDiffDocument(before).lines.find((row) => row.type === "added");
+		const current = projectDiffDocument(after).lines[0];
+		if (!previous || !current) throw new Error("missing projected test row");
+		expect(before.focus?.column).toBe(2);
+		expect(after.focus?.column).toBe(5);
+		expect(after.revision).not.toBe(before.revision);
+		expect(current.key).toBe(previous.key);
+		expect(current.type).toBe("context");
+		expect(resolveDiffSourcePoint(after, before.focus as DiffSourcePoint).lost).toBe(false);
+	});
+
+	it("falls back to the affected old side for empty replacement and to no row for empty diff", () => {
+		const deletion = createDiffDocument({ oldText: "a\nb", newText: "", focusSide: "new" });
+		expect(deletion.focus).toMatchObject({ side: "old", line: 1 });
+		expect(projectDiffDocument(deletion).focusIndex).toBe(1);
+		const empty = createDiffDocument({ oldText: "", newText: "" });
+		expect(projectDiffDocument(empty, { anchor: deletion.focus }).anchorLost).toBe(true);
+		expect(projectDiffDocument(empty, { anchor: deletion.focus }).lines).toEqual([]);
+		expect(projectDiffDocument(empty).startRow).toBe(0);
+	});
+
+	it("remaps retained source lines after 16k eviction, and clamps genuinely lost lines", () => {
+		const initial = createSourceText("h\n".repeat(7_900), { epoch: "stream" });
+		const first = createDiffDocument({
+			oldText: "",
+			newText: initial.text,
+			newRange: initial.range,
+			focusSide: "new",
+		});
+		const retained = anchorAt(first, 7_800);
+		const lost = anchorAt(first, 4);
+		const appended = appendSourceText(initial, "tail\n".repeat(300), 16_000);
+		const next = createDiffDocument({
+			oldText: "",
+			newText: appended.text,
+			newRange: appended.range,
+			focusSide: "new",
+		});
+		const paused = projectDiffDocument(next, { anchor: retained });
+		expect(paused.anchorLost).toBe(false);
+		expect(paused.anchor?.line).toBe(7_800);
+		const evicted = projectDiffDocument(next, { anchor: lost });
+		expect(evicted.anchorLost).toBe(true);
+		expect(evicted.anchorLossReason).toBe("range");
+		expect(evicted.anchor?.line).toBe(appended.range.startLine);
+		expect(evicted.anchor?.line).not.toBe(next.focus?.line);
+	});
+
+	it("keeps a partial first line's identity and clamps its in-line offset", () => {
+		const initial = createSourceText("abcdef", { epoch: "stream" });
+		const first = createDiffDocument({
+			oldText: "",
+			newText: initial.text,
+			newRange: initial.range,
+		});
+		const point = { ...anchorAt(first, 0), column: 4, offset: 4 };
+		const next = appendSourceText(initial, "ghi", 6);
+		const doc = createDiffDocument({ oldText: "", newText: next.text, newRange: next.range });
+		expect(resolveDiffSourcePoint(doc, point)).toMatchObject({
+			lost: false,
+			point: { line: 0, column: 4, offset: 4 },
+		});
+		expect(resolveDiffSourcePoint(doc, { ...point, column: 1, offset: 1 })).toMatchObject({
+			lost: true,
+			reason: "range",
+			point: { line: 0, column: 3 },
+		});
+	});
+
+	it("translates both readers through verified full completion, never through text search", () => {
+		const preview = createSourceText("XYZ\ntail", { epoch: "unknown", originKnown: false });
+		const first = createDiffDocument({
+			oldText: "",
+			newText: preview.text,
+			newRange: preview.range,
+			focusSide: "new",
+			startLine: 80,
+		});
+		const inline = first.focus as DiffSourcePoint;
+		const reader = { ...anchorAt(first, 0), column: 2, offset: 2 };
+		expect(projectDiffDocument(first).lines[0]?.newLineNo).toBe(1);
+		const complete = reconcileSourceText(preview, "header\nabcXYZ\ntail", { epoch: "unused" });
+		const doc = createDiffDocument({
+			oldText: "",
+			newText: complete.text,
+			newRange: complete.range,
+			focusSide: "new",
+			startLine: 80,
+		});
+		expect(resolveDiffSourcePoint(doc, reader)).toMatchObject({
+			lost: false,
+			point: { line: 1, column: 5, offset: 12 },
+		});
+		expect(resolveDiffSourcePoint(doc, inline)).toMatchObject({
+			lost: false,
+			point: { line: 2, column: 4 },
+		});
+		expect(projectDiffDocument(doc, { anchor: reader }).lines[1]?.newLineNo).toBe(81);
+		const invalid = reconcileSourceText(preview, "XYZ\ntail\nother", { epoch: "unused" });
+		const replaced = createDiffDocument({
+			oldText: "",
+			newText: invalid.text,
+			newRange: invalid.range,
+			focusSide: "new",
+		});
+		expect(projectDiffDocument(replaced, { anchor: reader })).toMatchObject({
+			anchorLost: true,
+			anchorLossReason: "epoch",
+			anchorIndex: 0,
+		});
+		expect(projectDiffDocument(replaced, { anchor: reader }).anchor?.line).toBe(0);
+	});
+
+	it("keeps the focus in a bounded diff when the source exceeds 240k", () => {
+		const huge = `${"repeat\n".repeat(50_000)}LATEST`;
+		const doc = createDiffDocument({ oldText: huge, newText: `${huge}!`, focusSide: "new" });
+		expect(doc.oldSource.text.length + doc.newSource.text.length).toBeLessThanOrEqual(
+			MAX_DIFF_INPUT_CHARS,
+		);
+		expect(doc.omission).toBe("input-budget");
+		expect(doc.truncated).toBe(true);
+		const projection = projectDiffDocument(doc);
+		expect(projection.lines.length).toBeLessThanOrEqual(500);
+		expect(projection.lines[projection.focusIndex]?.content).toContain("LATEST!");
+		expect(projection.lines.some((line) => line.type === "added")).toBe(true);
+		expect(doc.focus?.line).toBe(50_000);
+	});
+
+	it("keeps static revisions stable when rebuilding more than 192 cached documents", () => {
+		resetDiffDocumentCache();
+		const inputs = Array.from({ length: 256 }, (_, index) => ({
+			oldText: `before ${index}\nkeep`,
+			newText: `after ${index}\nkeep`,
+			startLine: index + 1,
+		}));
+		const original = inputs.map(createDiffDocument);
+		for (let rebuild = 0; rebuild < 3; rebuild++) {
+			for (const [index, input] of inputs.entries()) {
+				const first = original[index];
+				if (!first) throw new Error("missing original document");
+				const rebuilt = createDiffDocument(input);
+				expect(rebuilt).not.toBe(first);
+				expect(rebuilt.revision).toBe(first.revision);
+			}
+		}
+	});
+
+	it("keeps revisions stable after the source-character cache budget evicts a document", () => {
+		resetDiffDocumentCache();
+		const inputs = Array.from({ length: 12 }, (_, index) => ({
+			oldText: `${"x".repeat(80_000)}${index}`,
+			newText: `${"x".repeat(80_000)}${index}`,
+		}));
+		const original = inputs.map(createDiffDocument);
+		for (const [index, input] of inputs.entries()) {
+			const first = original[index];
+			if (!first) throw new Error("missing original document");
+			const rebuilt = createDiffDocument(input);
+			expect(rebuilt).not.toBe(first);
+			expect(rebuilt.revision).toBe(first.revision);
+			expect(rebuilt.revision).toHaveLength(21);
+		}
+	});
+
+	it("fingerprints full bounded content and semantic range/focus options, not just samples", () => {
+		const text = "x".repeat(400);
+		const first = createDiffDocument({ oldText: "", newText: text });
+		const changed = createDiffDocument({
+			oldText: "",
+			newText: `${text.slice(0, 70)}y${text.slice(71)}`,
+		});
+		expect(changed.focus).toEqual(first.focus);
+		expect(changed.revision).not.toBe(first.revision);
+		const range = createSourceText(text, { epoch: "known", complete: true }).range;
+		const input = {
+			oldText: text,
+			newText: text,
+			oldRange: range,
+			newRange: range,
+			focusSide: "new" as const,
+		};
+		const doc = createDiffDocument(input);
+		expect(createDiffDocument({ ...input, focusSide: "old" }).revision).not.toBe(doc.revision);
+		expect(createDiffDocument({ ...input, startLine: 20 }).revision).not.toBe(doc.revision);
+		expect(
+			createDiffDocument({ ...input, newRange: { ...range, epoch: "other" } }).revision,
+		).not.toBe(doc.revision);
+		expect(
+			createDiffDocument({
+				...input,
+				newRange: {
+					...range,
+					startOffset: 10,
+					endOffset: range.endOffset + 10,
+					startColumn: 10,
+					endColumn: range.endColumn + 10,
+				},
+			}).revision,
+		).not.toBe(doc.revision);
+	});
+
+	it("does not include an unavailable oversized prefix in the bounded source fingerprint", () => {
+		const text = `${"x".repeat(MAX_DIFF_INPUT_CHARS + 20)}tail`;
+		const first = createDiffDocument({ oldText: "", newText: text, focusSide: "new" });
+		resetDiffDocumentCache();
+		const sameRetainedSource = createDiffDocument({
+			oldText: "",
+			newText: `y${text.slice(1)}`,
+			focusSide: "new",
+		});
+		expect(sameRetainedSource.oldSource).toEqual(first.oldSource);
+		expect(sameRetainedSource.newSource).toEqual(first.newSource);
+		expect(sameRetainedSource.revision).toBe(first.revision);
+	});
+
+	it("memoizes only source-dependent documents and has bounded geometry-free probes", () => {
+		const input = {
+			oldText: text(2_000),
+			newText: text(1_999),
+			focusSide: "old" as const,
+			startLine: 99,
+		};
+		const doc = createDiffDocument(input);
+		expect(createDiffDocument(input)).toBe(doc);
+		projectDiffDocument(doc, { anchor: anchorAt(doc, 20), limit: 50 });
+		expect(createDiffDocument(input)).toBe(doc);
+		expect(createDiffDocument({ ...input, focusSide: "new" }).revision).not.toBe(doc.revision);
+		expect(readDiffRowContent(doc, 1_998)).toBe("1998");
+		expect(readDiffRowContent(doc, -1)).toBeNull();
+		expect(diffDocumentLineNoWidth(doc)).toBe(4);
+		expect(projectDiffDocument(doc, { limit: 99_999 }).lines.length).toBe(500);
 	});
 });

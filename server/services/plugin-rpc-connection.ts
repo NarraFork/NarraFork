@@ -1,4 +1,5 @@
 import { generateId } from "@server/lib/id";
+import { logger } from "@server/lib/logger";
 import {
 	isPluginToHostRequestMethod,
 	JSON_RPC_ERROR_CODES,
@@ -211,6 +212,10 @@ export class PluginPriorityWriter {
 		return this.queuedBytesValue;
 	}
 
+	get byteLimit(): number {
+		return this.maxQueuedBytes;
+	}
+
 	get queuedMessages(): number {
 		return (
 			this.inFlightMessages +
@@ -334,7 +339,10 @@ export interface PluginRpcConnectionOptions {
 	transport?: PluginRpcTransport;
 	generation?: number;
 	maxInFlight?: number;
+	/** Inbound frame cap; also the outbound default for existing callers. */
 	maxFrameBytes?: number;
+	/** Host-to-plugin cap, independent of untrusted inbound traffic. */
+	maxOutboundFrameBytes?: number;
 	maxQueuedBytes?: number;
 	controlReserveBytes?: number;
 	maxQueuedMessages?: number;
@@ -393,6 +401,7 @@ export class PluginRpcConnection {
 
 	private readonly maxInFlight: number;
 	private readonly maxFrameBytes: number;
+	private readonly maxOutboundFrameBytes: number;
 	private readonly inboundTimeoutMs: number;
 	private readonly maxWaiters: number;
 	private readonly transport: PluginRpcTransport;
@@ -438,6 +447,10 @@ export class PluginRpcConnection {
 		this.generationValue = nonNegativeInteger(options.generation ?? 0, "generation");
 		this.maxInFlight = positiveInteger(options.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT, "maxInFlight");
 		this.maxFrameBytes = positiveInteger(options.maxFrameBytes ?? 1024 * 1024, "maxFrameBytes");
+		this.maxOutboundFrameBytes = positiveInteger(
+			options.maxOutboundFrameBytes ?? this.maxFrameBytes,
+			"maxOutboundFrameBytes",
+		);
 		this.inboundTimeoutMs = positiveInteger(
 			options.inboundTimeoutMs ?? DEFAULT_INBOUND_TIMEOUT_MS,
 			"inboundTimeoutMs",
@@ -447,7 +460,15 @@ export class PluginRpcConnection {
 		this.setNegotiatedFeatures(options.negotiatedFeatures ?? [], this.enforceFeatureNegotiation);
 		this.idFactory = options.idFactory ?? (() => `rpc_${generateId(12)}`);
 		this.writer = new PluginPriorityWriter((message) => this.transport.send(message), {
-			maxQueuedBytes: options.maxQueuedBytes,
+			// One maximum-sized request (including framing) must fit without consuming
+			// cancellation/shutdown reserve. An explicitly smaller queue is still respected.
+			maxQueuedBytes:
+				options.maxQueuedBytes ??
+				Math.max(
+					DEFAULT_MAX_QUEUED_BYTES,
+					framedBodyBytes(this.maxOutboundFrameBytes) +
+						(options.controlReserveBytes ?? DEFAULT_CONTROL_RESERVE_BYTES),
+				),
 			controlReserveBytes: options.controlReserveBytes,
 			maxQueuedMessages: options.maxQueuedMessages,
 			controlReserveMessages: options.controlReserveMessages,
@@ -855,6 +876,20 @@ export class PluginRpcConnection {
 		this.closeHandlers.clear();
 	}
 
+	getLimits(): {
+		maxInboundFrameBytes: number;
+		maxOutboundFrameBytes: number;
+		maxQueuedBytes: number;
+		maxInFlight: number;
+	} {
+		return {
+			maxInboundFrameBytes: this.maxFrameBytes,
+			maxOutboundFrameBytes: this.maxOutboundFrameBytes,
+			maxQueuedBytes: this.writer.byteLimit,
+			maxInFlight: this.maxInFlight,
+		};
+	}
+
 	/** Generation fence for callers that replace a transport without constructing a new object. */
 	setGeneration(generation: number): void {
 		const next = nonNegativeInteger(generation, "generation");
@@ -888,12 +923,16 @@ export class PluginRpcConnection {
 			return;
 		}
 		const envelope = parsed.data;
-		if (jsonBodyBytes(envelope) > this.maxFrameBytes) {
+		const inboundBytes = jsonBodyBytes(envelope);
+		if (inboundBytes > this.maxFrameBytes) {
 			this.handleTransportError(
-				new PluginRpcConnectionError("RPC frame exceeds the connection frame limit", {
-					code: "INBOUND_FRAME_LIMIT",
-					phase: "inbound",
-				}),
+				new PluginRpcConnectionError(
+					`RPC frame exceeds the connection frame limit (inbound: ${inboundBytes} bytes, limit: ${this.maxFrameBytes} bytes)`,
+					{
+						code: "INBOUND_FRAME_LIMIT",
+						phase: "inbound",
+					},
+				),
 			);
 			return;
 		}
@@ -962,6 +1001,7 @@ export class PluginRpcConnection {
 
 	private async enqueue(message: JsonRpcEnvelope, priority: RpcMessagePriority): Promise<void> {
 		if (this.closed) throw this.closeError ?? closedError();
+		const startedAt = performance.now();
 		const parsed = jsonRpcEnvelopeSchema.safeParse(message);
 		if (!parsed.success) {
 			throw new PluginRpcConnectionError("Cannot enqueue an invalid JSON-RPC envelope", {
@@ -971,11 +1011,22 @@ export class PluginRpcConnection {
 			});
 		}
 		const bodyBytes = jsonBodyBytes(parsed.data);
-		if (bodyBytes > this.maxFrameBytes) {
-			throw new PluginRpcConnectionError("RPC frame exceeds the connection frame limit", {
-				code: "OUTBOUND_FRAME_LIMIT",
-				phase: "outbound",
+		const elapsedMs = performance.now() - startedAt;
+		if (elapsedMs >= 100) {
+			logger.warn("Slow plugin RPC outbound validation", {
+				method: "method" in message ? message.method.slice(0, 128) : "response",
+				bytes: bodyBytes,
+				elapsedMs: Math.round(elapsedMs),
 			});
+		}
+		if (bodyBytes > this.maxOutboundFrameBytes) {
+			throw new PluginRpcConnectionError(
+				`RPC frame exceeds the connection frame limit (outbound: ${bodyBytes} bytes, limit: ${this.maxOutboundFrameBytes} bytes)`,
+				{
+					code: "OUTBOUND_FRAME_LIMIT",
+					phase: "outbound",
+				},
+			);
 		}
 		await this.writer.enqueue(message, priority);
 	}
@@ -1312,7 +1363,10 @@ function resolveInboundDeadline(
 function encodedFrameBytes(message: JsonRpcEnvelope): number {
 	const body = JSON.stringify(message);
 	if (body === undefined) throw new TypeError("RPC message is not JSON serializable");
-	const bodyBytes = textEncoder.encode(body).byteLength;
+	return framedBodyBytes(textEncoder.encode(body).byteLength);
+}
+
+function framedBodyBytes(bodyBytes: number): number {
 	const header = `Content-Length: ${bodyBytes}\r\nContent-Type: application/json; charset=utf-8\r\n\r\n`;
 	return bodyBytes + textEncoder.encode(header).byteLength;
 }

@@ -1,10 +1,25 @@
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
 import { Button, MultiSelect, Select, Stack, Text } from "@mantine/core";
+import {
+	isSubagentReasoningEffort,
+	SUBAGENT_POOL_TYPES,
+	type SubagentAllowedModels,
+	type SubagentModelReasoningEfforts,
+	type SubagentPoolType,
+} from "@shared/subagent-model-policy";
 import type { NavigateOptions, ToOptions } from "@tanstack/react-router";
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FOLLOW_SUMMARY_MODEL } from "../../lib/constants";
 import { CmdListEditor } from "../common/CmdListEditor";
+import {
+	SubagentReasoningEffortSection,
+	SubagentReasoningEffortSelect,
+} from "../common/SubagentReasoningEffortSelect";
+import {
+	removeDeselectedPoolEfforts,
+	setPoolReasoningEffort,
+} from "../narrator/subagent-model-pool-state";
 
 // Only loaded when the user opens the migration dialog from this section.
 const BrokenModelMigrationModal = lazy(() =>
@@ -39,13 +54,7 @@ function filterSentinelGroups(data: ComboboxData, sentinels: string[]): Combobox
 	);
 }
 
-export interface SubagentAllowedModels {
-	explore: string[];
-	plan: string[];
-	general: string[];
-	search?: string[];
-	review?: string[];
-}
+export type { SubagentAllowedModels } from "@shared/subagent-model-policy";
 
 export interface ModelsSectionProps {
 	defaultModel: string;
@@ -68,6 +77,8 @@ export interface ModelsSectionProps {
 	setReasoningEffortBlocklist: (v: Array<{ pattern: string; enabled?: boolean }>) => void;
 	subagentAllowedModels: SubagentAllowedModels;
 	setSubagentAllowedModels: (v: SubagentAllowedModels) => void;
+	subagentModelReasoningEfforts: SubagentModelReasoningEfforts;
+	setSubagentModelReasoningEfforts: (v: SubagentModelReasoningEfforts) => void;
 	groupedModels: ComboboxData;
 	navigate: (opts: ToOptions & NavigateOptions) => void;
 }
@@ -93,6 +104,8 @@ export function ModelsSection({
 	setReasoningEffortBlocklist,
 	subagentAllowedModels,
 	setSubagentAllowedModels,
+	subagentModelReasoningEfforts,
+	setSubagentModelReasoningEfforts,
 	groupedModels,
 	navigate,
 }: ModelsSectionProps) {
@@ -100,6 +113,36 @@ export function ModelsSection({
 	const { t: tn } = useTranslation("narrator");
 	const [migrationOpened, setMigrationOpened] = useState(false);
 	const prefixedModels = useMemo(() => prefixLabels(groupedModels), [groupedModels]);
+	// Stored references remain editable when providers are hidden or the catalog is unavailable.
+	const poolModels = useMemo(() => {
+		const known = new Set(
+			(prefixedModels as ModelComboboxItemGroup[]).flatMap((group) =>
+				group.items.map((item) => (typeof item === "string" ? item : item.value)),
+			),
+		);
+		const missing = [...new Set(Object.values(subagentAllowedModels).flat())].filter(
+			(model) => !known.has(model),
+		);
+		return [...prefixedModels, ...missing];
+	}, [prefixedModels, subagentAllowedModels]);
+	const fixedCount = SUBAGENT_POOL_TYPES.reduce(
+		(count, type) =>
+			count +
+			(subagentAllowedModels[type] ?? []).filter((model) =>
+				isSubagentReasoningEffort(subagentModelReasoningEfforts[type]?.[model]),
+			).length,
+		0,
+	);
+	const changePoolModels = (type: SubagentPoolType, selected: string[]) => {
+		setSubagentAllowedModels({ ...subagentAllowedModels, [type]: selected });
+		const next = removeDeselectedPoolEfforts(
+			subagentModelReasoningEfforts,
+			type,
+			subagentAllowedModels[type] ?? [],
+			selected,
+		);
+		if (next !== subagentModelReasoningEfforts) setSubagentModelReasoningEfforts(next);
+	};
 
 	// Default model selector: exclude "follow default" (self-reference) and
 	// "follow summary" (would be circular, since summary follows default).
@@ -251,54 +294,86 @@ export function ModelsSection({
 				</Text>
 				<MultiSelect
 					label={t("subagentAllowedModelsExplore")}
-					data={prefixedModels}
+					data={poolModels}
 					searchable
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}
 					value={subagentAllowedModels.explore}
-					onChange={(v) => setSubagentAllowedModels({ ...subagentAllowedModels, explore: v })}
+					onChange={(v) => changePoolModels("explore", v)}
 				/>
 				<MultiSelect
 					label={t("subagentAllowedModelsPlan")}
-					data={prefixedModels}
+					data={poolModels}
 					searchable
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}
 					value={subagentAllowedModels.plan}
-					onChange={(v) => setSubagentAllowedModels({ ...subagentAllowedModels, plan: v })}
+					onChange={(v) => changePoolModels("plan", v)}
 				/>
 				<MultiSelect
 					label={t("subagentAllowedModelsGeneral")}
-					data={prefixedModels}
+					data={poolModels}
 					searchable
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}
 					value={subagentAllowedModels.general}
-					onChange={(v) => setSubagentAllowedModels({ ...subagentAllowedModels, general: v })}
+					onChange={(v) => changePoolModels("general", v)}
 				/>
 				<MultiSelect
 					label={t("subagentAllowedModelsSearch")}
-					data={prefixedModels}
+					data={poolModels}
 					searchable
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}
 					value={subagentAllowedModels.search ?? []}
-					onChange={(v) => setSubagentAllowedModels({ ...subagentAllowedModels, search: v })}
+					onChange={(v) => changePoolModels("search", v)}
 				/>
 				<MultiSelect
 					label={t("subagentAllowedModelsReview")}
-					data={prefixedModels}
+					data={poolModels}
 					searchable
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}
 					value={subagentAllowedModels.review ?? []}
-					onChange={(v) => setSubagentAllowedModels({ ...subagentAllowedModels, review: v })}
+					onChange={(v) => changePoolModels("review", v)}
 				/>
+				<SubagentReasoningEffortSection
+					count={fixedCount}
+					help={t("subagentPoolReasoningEffortHelp")}
+				>
+					{SUBAGENT_POOL_TYPES.map(
+						(type) =>
+							(subagentAllowedModels[type] ?? []).length > 0 && (
+								<Stack key={type} gap={6}>
+									<Text size="xs" fw={600}>
+										{tn(`details.subagentType_${type}`)}
+									</Text>
+									{(subagentAllowedModels[type] ?? []).map((model) => (
+										<SubagentReasoningEffortSelect
+											key={model}
+											model={model}
+											value={subagentModelReasoningEfforts[type]?.[model]}
+											onChange={(effort) =>
+												setSubagentModelReasoningEfforts(
+													setPoolReasoningEffort(
+														subagentModelReasoningEfforts,
+														type,
+														model,
+														effort,
+													),
+												)
+											}
+										/>
+									))}
+								</Stack>
+							),
+					)}
+				</SubagentReasoningEffortSection>
 			</Stack>
 			<Select
 				label={t("agentDefaultReasoningEffort")}

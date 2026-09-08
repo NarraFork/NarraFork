@@ -19,6 +19,7 @@ import {
 	isSeedEnvelope,
 	type SeedEnvelope,
 	type PanelSpec as SharedPanelSpec,
+	stripNavigationFromLayout,
 } from "../panels/layout-envelope";
 import {
 	DEFAULT_DIRECTOR_PRIMARY_RATIO,
@@ -118,7 +119,7 @@ export function serializeWorkspaceLayout(
 	const envelope: WorkspaceLayoutEnvelope = {
 		version: WORKSPACE_LAYOUT_VERSION,
 		kind: "dockview",
-		layout: api.toJSON(),
+		layout: stripNavigationFromLayout(api.toJSON()),
 		director,
 	};
 	return JSON.stringify(envelope);

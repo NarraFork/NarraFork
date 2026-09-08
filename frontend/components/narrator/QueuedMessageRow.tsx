@@ -29,6 +29,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import type { FileReference } from "@shared/file-reference";
 import { isTextFile, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 import {
 	IconBolt,
@@ -48,6 +49,11 @@ import type {
 } from "../../lib/api/types";
 import { UserAvatar } from "../UserAvatar";
 import { EditNewImageThumb, EditTextFileChip, QueuedImageThumb } from "./EditAttachmentChips";
+import {
+	editFileReferenceInput,
+	type FileReferenceInput,
+	fileReferenceToken,
+} from "./file-reference-input";
 import {
 	ACCEPTED_TYPES,
 	MAX_IMAGE_LONG_EDGE,
@@ -91,12 +97,14 @@ export interface QueuedMessageRowProps {
 function QueuedAttachmentPreview({
 	images,
 	textFiles,
+	fileReferences = [],
 }: {
 	images: BufferedImageSummary[];
 	textFiles: BufferedTextFileSummary[];
+	fileReferences?: FileReference[];
 }) {
 	const { t } = useTranslation("narrator");
-	if (images.length === 0 && textFiles.length === 0) return null;
+	if (images.length === 0 && textFiles.length === 0 && fileReferences.length === 0) return null;
 	const shown = images.slice(0, INLINE_THUMB_LIMIT);
 	const overflow = images.length - shown.length;
 	return (
@@ -108,6 +116,13 @@ function QueuedAttachmentPreview({
 					filename={image.filename}
 					uploadNarratorId={image.uploadNarratorId}
 				/>
+			))}
+			{fileReferences.map((reference) => (
+				<Tooltip key={reference.id} label={`${reference.deviceId}: ${reference.path}`}>
+					<Text size="xs" c="blue" truncate style={{ maxWidth: 160 }}>
+						{fileReferenceToken(reference)}
+					</Text>
+				</Tooltip>
 			))}
 			{overflow > 0 && (
 				<Text size="xs" c="blue">
@@ -157,9 +172,34 @@ export function QueuedMessageRow({
 	const [newImages, setNewImages] = useState<File[]>([]);
 	const [keptTextFiles, setKeptTextFiles] = useState<BufferedTextFileSummary[]>([]);
 	const [newTextFiles, setNewTextFiles] = useState<File[]>([]);
+	const [fileReferences, setFileReferences] = useState<FileReference[]>([]);
 	const [submitting, setSubmitting] = useState(false);
 	const submittingRef = useRef(false);
 	const fileInputRef = useRef<HTMLInputElement | null>(null);
+	const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+	const beforeEditRef = useRef<{ start: number; end: number; backward?: boolean } | undefined>(
+		undefined,
+	);
+	const undoStackRef = useRef<FileReferenceInput[]>([]);
+	const composingRef = useRef(false);
+	const compositionUndoSavedRef = useRef(false);
+	const captureEditRange = useCallback((textarea: HTMLTextAreaElement, inputType = "") => {
+		beforeEditRef.current = {
+			start: textarea.selectionStart,
+			end: textarea.selectionEnd,
+			backward: inputType.includes("Backward"),
+		};
+	}, []);
+	// Unlike React's synthesized onBeforeInput, native beforeinput includes
+	// keyboard deletion and clipboard edits, before the DOM changes selection.
+	useEffect(() => {
+		const textarea = textareaRef.current;
+		if (!textarea || !isEditing) return;
+		const beforeInput = (event: Event) =>
+			captureEditRange(textarea, (event as InputEvent).inputType);
+		textarea.addEventListener("beforeinput", beforeInput);
+		return () => textarea.removeEventListener("beforeinput", beforeInput);
+	}, [isEditing, captureEditRange]);
 	// The kept counts are read inside the async image flow, where a removal during
 	// the await would otherwise be missed by a stale closure.
 	const keptImageCountRef = useRef(0);
@@ -180,11 +220,16 @@ export function QueuedMessageRow({
 	// nothing else to re-seed on.
 	useEffect(() => {
 		if (!isEditing) return;
+		beforeEditRef.current = undefined;
+		undoStackRef.current = [];
+		composingRef.current = false;
+		compositionUndoSavedRef.current = false;
 		const current = msgRef.current;
 		const seeded = seedQueuedEditAttachments(current);
 		setText(current.text);
 		setKeptImages(seeded.keptImages);
 		setKeptTextFiles(seeded.keptTextFiles);
+		setFileReferences(seeded.fileReferences);
 		setNewImages([]);
 		setNewTextFiles([]);
 	}, [isEditing]);
@@ -260,7 +305,8 @@ export function QueuedMessageRow({
 	);
 
 	const handlePaste = useCallback(
-		(e: React.ClipboardEvent) => {
+		(e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+			captureEditRange(e.currentTarget);
 			const images: File[] = [];
 			const files: File[] = [];
 			for (const item of e.clipboardData.items) {
@@ -281,12 +327,12 @@ export function QueuedMessageRow({
 			if (images.length > 0) void addImages(images);
 			if (files.length > 0) addTextFiles(files);
 		},
-		[addImages, addTextFiles],
+		[addImages, addTextFiles, captureEditRange],
 	);
 
 	const editState = useMemo(
-		() => ({ text, keptImages, newImages, keptTextFiles, newTextFiles }),
-		[text, keptImages, newImages, keptTextFiles, newTextFiles],
+		() => ({ text, keptImages, newImages, keptTextFiles, newTextFiles, fileReferences }),
+		[text, keptImages, newImages, keptTextFiles, newTextFiles, fileReferences],
 	);
 	const canSubmit = canSubmitQueuedEdit(editState);
 
@@ -348,7 +394,11 @@ export function QueuedMessageRow({
 				) : (
 					<Box w={16} h={16} style={{ flexShrink: 0 }} />
 				)}
-				<QueuedAttachmentPreview images={msg.images ?? []} textFiles={msg.textFiles ?? []} />
+				<QueuedAttachmentPreview
+					images={msg.images ?? []}
+					textFiles={msg.textFiles ?? []}
+					fileReferences={msg.fileReferences}
+				/>
 				{msg.priority && (
 					<Badge
 						size="xs"
@@ -398,13 +448,53 @@ export function QueuedMessageRow({
 			)}
 			<Stack gap={6} style={{ flex: 1, minWidth: 0 }}>
 				<Textarea
+					ref={textareaRef}
 					size="xs"
 					value={text}
 					disabled={submitting}
-					onChange={(e) => setText(e.currentTarget.value)}
+					onCompositionStart={(e) => {
+						captureEditRange(e.currentTarget);
+						composingRef.current = true;
+						compositionUndoSavedRef.current = false;
+					}}
+					onCompositionEnd={() => {
+						composingRef.current = false;
+					}}
+					onChange={(e) => {
+						const next = e.currentTarget.value;
+						const range = beforeEditRef.current;
+						beforeEditRef.current = undefined;
+						if (next === text) return;
+						const previous = { text, fileReferences };
+						if (!composingRef.current || !compositionUndoSavedRef.current) {
+							undoStackRef.current.push(previous);
+							if (undoStackRef.current.length > 100) undoStackRef.current.shift();
+							if (composingRef.current) compositionUndoSavedRef.current = true;
+						}
+						if (range && range.start === range.end && next.length < text.length) {
+							const removed = text.length - next.length;
+							if (range.backward) range.start = Math.max(0, range.start - removed);
+							else range.end += removed;
+						}
+						const edited = editFileReferenceInput(previous, next, range);
+						setText(edited.text);
+						setFileReferences(edited.fileReferences);
+					}}
 					onPaste={handlePaste}
 					onKeyDown={(e) => {
-						if (e.nativeEvent.isComposing) return;
+						captureEditRange(e.currentTarget, e.key === "Backspace" ? "deleteBackward" : "");
+						if (composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229)
+							return;
+						if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
+							const previous = undoStackRef.current.pop();
+							if (previous) {
+								e.preventDefault();
+								beforeEditRef.current = undefined;
+								setText(previous.text);
+								setFileReferences(previous.fileReferences);
+							}
+							return;
+						}
 						if (e.key === "Enter" && !e.shiftKey) {
 							e.preventDefault();
 							void submit();
@@ -473,6 +563,32 @@ export function QueuedMessageRow({
 								disabled={submitting}
 								onRemove={() => setNewTextFiles((prev) => prev.filter((_, idx) => idx !== i))}
 							/>
+						))}
+					</Group>
+				)}
+				{fileReferences.length > 0 && (
+					<Group gap="xs" wrap="wrap">
+						{fileReferences.map((reference) => (
+							<Group
+								key={reference.id}
+								gap={4}
+								wrap="nowrap"
+								title={`${reference.deviceId}: ${reference.path}`}
+							>
+								<Text size="xs" c="blue" truncate style={{ maxWidth: 240 }}>
+									{fileReferenceToken(reference)}
+								</Text>
+								<CloseButton
+									size="xs"
+									disabled={submitting}
+									aria-label={`${t("removeFile")}: ${reference.label}`}
+									onClick={() =>
+										setFileReferences((previous) =>
+											previous.filter((item) => item.id !== reference.id),
+										)
+									}
+								/>
+							</Group>
 						))}
 					</Group>
 				)}

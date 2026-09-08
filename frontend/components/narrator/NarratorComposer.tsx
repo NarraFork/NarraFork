@@ -1,5 +1,6 @@
 import { Box, Button, Group, Stack, Text, Textarea } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import type { FileReference, FileReferenceCandidate } from "@shared/file-reference";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -21,6 +22,19 @@ import { formatLocaleNumber } from "../../lib/intl-format";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
+import { FileReferencePopover } from "./FileReferencePopover";
+import { useFileReferenceScope } from "./FileReferenceScope";
+import {
+	copyFileReferences,
+	editFileReferenceInput,
+	type FileReferenceInput,
+	fileReferenceKeyAction,
+	getFileReferenceQuery,
+	insertFileReference,
+	readFileReferences,
+	rememberFileReference,
+	sameFileReferenceInput,
+} from "./file-reference-input";
 import { getMentionQuery, type MentionCandidate, MentionPopover } from "./MentionPopover";
 import {
 	classifyDraftRevisionConflict,
@@ -49,6 +63,7 @@ function isDraftWithinSyncLimit(input: string): boolean {
 export interface NarratorRemoteDraft {
 	hasDraft: boolean;
 	text: string;
+	fileReferences?: FileReference[];
 	revision: number;
 	updatedAt: string | null;
 	updatedBy: string | null;
@@ -65,14 +80,18 @@ export type ComposerQueueMode = "turn" | "tool" | "interrupt";
 export interface NarratorComposerHandle {
 	/** Current raw textarea value (untrimmed). */
 	getText(): string;
-	/** True when the textarea holds no non-whitespace text (attachments not counted). */
+	/** True when both text and file references are empty (other attachments are panel-owned). */
 	isTextEmpty(): boolean;
 	/** True when `target` is this composer's textarea element. */
 	ownsTextarea(target: unknown): boolean;
 	focus(): void;
 	setText(text: string): void;
+	getFileReferences(): FileReference[];
+	setFileReferences(refs: FileReference[]): void;
+	restoreInput(text: string, refs: FileReference[]): void;
+	addFileReference(ref: FileReference): void;
 	appendText(text: string): void;
-	/** Clear the text and, when the draft link is ready, sync the empty draft. */
+	/** Clear text and references and, when ready, sync the empty draft tombstone. */
 	clearTextAndDraft(): void;
 	/** Clear only the on-screen text for an in-flight send; the draft record is
 	 * left untouched so a failed send can restore it. */
@@ -80,7 +99,7 @@ export interface NarratorComposerHandle {
 	/** Post-send draft bookkeeping (sync empty / adopt conflicting server draft). */
 	commitDraftAfterSend(): void;
 	/** Record a sent message in the up-arrow input history. */
-	noteSent(text: string): void;
+	noteSent(text: string, refs?: FileReference[]): void;
 	/** Forward a WS `draft_changed` event into the draft state machine. */
 	handleDraftChanged(draft: NarratorRemoteDraft): void;
 }
@@ -141,18 +160,32 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const { data: currentUser } = useCurrentUser();
 		const currentUserId = currentUser?.id ? String(currentUser.id) : null;
 		const dock = useNarratorDockContext();
+		const fileScope = useFileReferenceScope();
+		const fileCacheScope =
+			currentUserId && fileScope.context
+				? JSON.stringify([
+						currentUserId,
+						narratorId,
+						fileScope.context.deviceId,
+						fileScope.context.cwd,
+					])
+				: null;
 
-		// --- Input management ---
-		const [input, setInput] = useState("");
+		// Text and reference occurrences have one source of truth, local to this subtree.
+		const [inputState, setInputState] = useState<FileReferenceInput>({
+			text: "",
+			fileReferences: [],
+		});
+		const { text: input, fileReferences } = inputState;
+		const inputStateRef = useRef(inputState);
 		const [draftHydrated, setDraftHydrated] = useState(false);
 		const [draftSyncState, setDraftSyncState] = useState<
 			"loading" | "ready" | "error" | "conflict"
 		>("loading");
 		const [draftLoadAttempt, setDraftLoadAttempt] = useState(0);
 		const inputRef = useRef(input);
-		inputRef.current = input;
 		const draftSourceIdRef = useRef(createDraftSourceId());
-		const lastSyncedDraftRef = useRef("");
+		const lastSyncedDraftRef = useRef<FileReferenceInput>({ text: "", fileReferences: [] });
 		const lastDraftRevisionRef = useRef<number | null>(null);
 		const lastDraftUpdatedAtRef = useRef<string | null>(null);
 		const draftConflictRef = useRef<NarratorRemoteDraft | null>(null);
@@ -166,19 +199,57 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			currentUserId ? getNarratorDraftStorageId(currentUserId, narratorId) : null,
 		);
 
-		/** Set text and synchronously update the ref so same-tick readers see it. */
-		const setText = useCallback((text: string) => {
-			inputRef.current = text;
-			setInput(text);
+		/** Synchronous ref updates make restore→send in the same tick atomic. */
+		const applyInput = useCallback((next: FileReferenceInput) => {
+			inputStateRef.current = next;
+			inputRef.current = next.text;
+			setInputState(next);
 		}, []);
-
-		const appendText = useCallback((text: string) => {
-			setInput((prev) => {
-				const next = prev ? `${prev}\n${text}` : text;
-				inputRef.current = next;
-				return next;
-			});
-		}, []);
+		const setText = useCallback(
+			(text: string) => {
+				applyInput(editFileReferenceInput(inputStateRef.current, text));
+			},
+			[applyInput],
+		);
+		const restoreInput = useCallback(
+			(text: string, refs: FileReference[]) => {
+				applyInput({ text, fileReferences: copyFileReferences(refs, text) });
+			},
+			[applyInput],
+		);
+		const setFileReferences = useCallback(
+			(refs: FileReference[]) => {
+				restoreInput(inputRef.current, refs);
+			},
+			[restoreInput],
+		);
+		const appendText = useCallback(
+			(text: string) => {
+				const previous = inputRef.current;
+				setText(previous ? `${previous}\n${text}` : text);
+			},
+			[setText],
+		);
+		const addFileReference = useCallback(
+			(reference: FileReference) => {
+				try {
+					const next = insertFileReference(inputStateRef.current, reference);
+					applyInput(next);
+					if (fileCacheScope) rememberFileReference(fileCacheScope, reference);
+					requestAnimationFrame(() => {
+						textareaRef.current?.focus();
+						textareaRef.current?.setSelectionRange(next.caret, next.caret);
+					});
+				} catch (error) {
+					notifications.show({
+						title: t("fileReferences.addFailed", { defaultValue: "无法添加文件引用" }),
+						message: error instanceof Error ? error.message : String(error),
+						color: "red",
+					});
+				}
+			},
+			[applyInput, fileCacheScope, t],
+		);
 		useEffect(() => {
 			if (!currentUserId || !draftHydrated || sendingRef.current) return;
 			persistNarratorInputDraft(
@@ -187,11 +258,17 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				input,
 				lastDraftRevisionRef.current,
 				lastDraftUpdatedAtRef.current,
+				fileReferences,
 			);
-		}, [currentUserId, draftHydrated, input, narratorId, sendingRef]);
+		}, [currentUserId, draftHydrated, input, fileReferences, narratorId, sendingRef]);
 
 		const syncDraftNow = useCallback(
-			async (text: string, baseRevision = lastDraftRevisionRef.current) => {
+			async (
+				text: string,
+				baseRevision = lastDraftRevisionRef.current,
+				references = inputStateRef.current.fileReferences,
+			) => {
+				const refs = copyFileReferences(references, text);
 				if (!currentUserId) throw new Error("Current user is unavailable");
 				if (baseRevision == null) throw new Error("Draft has not been loaded from the server");
 				if (!isDraftWithinSyncLimit(text)) {
@@ -207,11 +284,20 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				let retriedOwnRevision = false;
 				while (true) {
 					try {
-						const result = await api.updateNarratorDraft(narratorId, text, revision, sourceId);
+						const result = await api.updateNarratorDraft(
+							narratorId,
+							text,
+							revision,
+							sourceId,
+							refs,
+						);
 						if (seq === draftSyncSeqRef.current) {
 							const newerConflict = draftConflictRef.current;
 							if (newerConflict && newerConflict.revision > result.revision) return result;
-							lastSyncedDraftRef.current = result.text;
+							lastSyncedDraftRef.current = {
+								text: result.text,
+								fileReferences: readFileReferences(result.fileReferences, result.text),
+							};
 							lastDraftRevisionRef.current = result.revision;
 							lastDraftUpdatedAtRef.current = result.updatedAt;
 							draftConflictRef.current = null;
@@ -222,6 +308,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 								inputRef.current,
 								result.revision,
 								result.updatedAt,
+								inputStateRef.current.fileReferences,
 							);
 							qc.setQueryData(
 								["narrators", narratorId],
@@ -237,6 +324,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 										| {
 												hasDraft?: unknown;
 												text?: unknown;
+												fileReferences?: unknown;
 												revision?: unknown;
 												updatedAt?: unknown;
 												updatedBy?: unknown;
@@ -252,6 +340,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							const remote: NarratorRemoteDraft = {
 								hasDraft: !!current.hasDraft,
 								text: current.text,
+								fileReferences: readFileReferences(current.fileReferences, current.text),
 								revision: current.revision,
 								updatedAt: typeof current.updatedAt === "string" ? current.updatedAt : null,
 								updatedBy: typeof current.updatedBy === "string" ? current.updatedBy : null,
@@ -281,15 +370,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		);
 
 		const clearTextAndDraft = useCallback(() => {
-			inputRef.current = "";
-			setInput("");
-			if (draftSyncState === "ready") void syncDraftNow("").catch(() => {});
-		}, [draftSyncState, syncDraftNow]);
+			restoreInput("", []);
+			if (draftSyncState === "ready") void syncDraftNow("", undefined, []).catch(() => {});
+		}, [draftSyncState, syncDraftNow, restoreInput]);
 
 		const hideTextForSend = useCallback(() => {
-			inputRef.current = "";
-			setInput("");
-		}, []);
+			restoreInput("", []);
+		}, [restoreInput]);
 
 		// Reclaim pre-facade draft/history keys once per tab.
 		//
@@ -307,6 +394,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 
 		useEffect(() => {
 			void draftLoadAttempt;
+			// An old account/narrator's in-flight CAS must not overwrite the newly hydrated pair.
+			draftSyncSeqRef.current++;
 			if (!currentUserId) {
 				setDraftHydrated(false);
 				setDraftSyncState("loading");
@@ -316,7 +405,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			setDraftHydrated(false);
 			setDraftSyncState("loading");
 			draftConflictRef.current = null;
-			lastSyncedDraftRef.current = "";
+			lastSyncedDraftRef.current = { text: "", fileReferences: [] };
 			lastDraftRevisionRef.current = null;
 			if (draftSyncTimerRef.current) {
 				clearTimeout(draftSyncTimerRef.current);
@@ -326,39 +415,46 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			const localDraft = readNarratorInputDraft(currentUserId, narratorId);
 			lastDraftRevisionRef.current = localDraft.serverRevision;
 			lastDraftUpdatedAtRef.current = localDraft.serverUpdatedAt;
-			inputRef.current = localDraft.text;
-			setInput(localDraft.text);
+			restoreInput(localDraft.text, localDraft.fileReferences ?? []);
 			setDraftHydrated(true);
-			const localDraftAtRequest = localDraft.text;
+			const localDraftAtRequest = inputStateRef.current;
 
 			api
 				.getNarratorDraft(narratorId)
 				.then((draft) => {
 					if (cancelled) return;
 					const serverText = draft.hasDraft ? draft.text : "";
+					const serverFileReferences = draft.hasDraft
+						? readFileReferences(draft.fileReferences, serverText)
+						: [];
 					const currentInput = inputRef.current;
 					const resolved = resolveHydratedNarratorDraft({
 						local: localDraft,
 						serverText,
+						serverFileReferences,
 						serverRevision: draft.revision,
 						currentInput,
-						localChangedSinceRequest: currentInput !== localDraftAtRequest,
+						currentFileReferences: inputStateRef.current.fileReferences,
+						localChangedSinceRequest: !sameFileReferenceInput(
+							inputStateRef.current,
+							localDraftAtRequest,
+						),
 					});
-					lastSyncedDraftRef.current = serverText;
+					lastSyncedDraftRef.current = { text: serverText, fileReferences: serverFileReferences };
 					lastDraftRevisionRef.current = resolved.conflict
 						? localDraft.serverRevision
 						: draft.revision;
 					lastDraftUpdatedAtRef.current = resolved.conflict
 						? localDraft.serverUpdatedAt
 						: draft.updatedAt;
-					inputRef.current = resolved.text;
-					setInput(resolved.text);
+					restoreInput(resolved.text, resolved.fileReferences ?? []);
 					persistNarratorInputDraft(
 						currentUserId,
 						narratorId,
 						resolved.text,
 						resolved.conflict ? localDraft.serverRevision : draft.revision,
 						resolved.conflict ? localDraft.serverUpdatedAt : draft.updatedAt,
+						resolved.fileReferences ?? [],
 					);
 					if (resolved.conflict) {
 						draftConflictRef.current = draft;
@@ -373,13 +469,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			return () => {
 				cancelled = true;
 			};
-		}, [currentUserId, draftLoadAttempt, narratorId]);
+		}, [currentUserId, draftLoadAttempt, narratorId, restoreInput]);
 
 		useEffect(() => {
 			if (!draftHydrated || !currentUserId || draftSyncState !== "ready" || sendingRef.current)
 				return;
 			if (!isDraftWithinSyncLimit(input)) return;
-			if (input === lastSyncedDraftRef.current) return;
+			if (sameFileReferenceInput(inputState, lastSyncedDraftRef.current)) return;
 			if (draftSyncTimerRef.current) clearTimeout(draftSyncTimerRef.current);
 			draftSyncTimerRef.current = setTimeout(() => {
 				draftSyncTimerRef.current = null;
@@ -393,7 +489,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					draftSyncTimerRef.current = null;
 				}
 			};
-		}, [currentUserId, draftHydrated, draftSyncState, input, syncDraftNow, sendingRef]);
+		}, [currentUserId, draftHydrated, draftSyncState, input, inputState, syncDraftNow, sendingRef]);
 
 		const retryDraftHydration = useCallback(() => {
 			setDraftLoadAttempt((attempt) => attempt + 1);
@@ -403,12 +499,12 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			const remote = draftConflictRef.current;
 			if (!remote || !currentUserId) return;
 			const remoteText = remote.hasDraft ? remote.text : "";
-			lastSyncedDraftRef.current = remoteText;
+			const refs = remote.hasDraft ? readFileReferences(remote.fileReferences, remoteText) : [];
+			lastSyncedDraftRef.current = { text: remoteText, fileReferences: refs };
 			lastDraftRevisionRef.current = remote.revision;
 			lastDraftUpdatedAtRef.current = remote.updatedAt;
 			draftConflictRef.current = null;
-			inputRef.current = remoteText;
-			setInput(remoteText);
+			restoreInput(remoteText, refs);
 			setDraftSyncState("ready");
 			persistNarratorInputDraft(
 				currentUserId,
@@ -416,13 +512,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				remoteText,
 				remote.revision,
 				remote.updatedAt,
+				refs,
 			);
-		}, [currentUserId, narratorId]);
+		}, [currentUserId, narratorId, restoreInput]);
 
 		const commitDraftAfterSend = useCallback(() => {
 			if (draftSyncState === "ready") {
 				setDraftSyncState("loading");
-				void syncDraftNow("").catch(() => setDraftSyncState("error"));
+				void syncDraftNow("", undefined, []).catch(() => setDraftSyncState("error"));
 			} else if (draftSyncState === "conflict") {
 				// The local text was sent, but another client owns a newer draft. Keep that
 				// remote draft rather than clearing it as a side effect of this send.
@@ -447,38 +544,43 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				const currentRevision = lastDraftRevisionRef.current;
 				if (currentRevision != null && draft.revision < currentRevision) return;
 				const remoteText = draft.hasDraft ? draft.text : "";
-				const hasLocalUnsyncedChanges = inputRef.current !== lastSyncedDraftRef.current;
+				const remoteRefs = draft.hasDraft
+					? readFileReferences(draft.fileReferences, remoteText)
+					: [];
+				const remoteInput = { text: remoteText, fileReferences: remoteRefs };
+				const hasLocalUnsyncedChanges = !sameFileReferenceInput(
+					inputStateRef.current,
+					lastSyncedDraftRef.current,
+				);
 				if (
 					draft.sourceId !== draftSourceIdRef.current &&
 					hasLocalUnsyncedChanges &&
-					remoteText !== inputRef.current
+					!sameFileReferenceInput(remoteInput, inputStateRef.current)
 				) {
 					draftConflictRef.current = draft;
 					setDraftSyncState("conflict");
 					return;
 				}
-				lastSyncedDraftRef.current = remoteText;
+				lastSyncedDraftRef.current = remoteInput;
 				lastDraftRevisionRef.current = draft.revision;
 				lastDraftUpdatedAtRef.current = draft.updatedAt;
 				draftConflictRef.current = null;
 				setDraftSyncState("ready");
 				const shouldApplyRemote = draft.sourceId !== draftSourceIdRef.current;
-				const nextInput = shouldApplyRemote ? remoteText : inputRef.current;
+				const nextInput = shouldApplyRemote ? remoteInput : inputStateRef.current;
 				if (currentUserId) {
 					persistNarratorInputDraft(
 						currentUserId,
 						narratorId,
-						nextInput,
+						nextInput.text,
 						draft.revision,
 						draft.updatedAt,
+						nextInput.fileReferences,
 					);
 				}
-				if (shouldApplyRemote) {
-					inputRef.current = remoteText;
-					setInput(remoteText);
-				}
+				if (shouldApplyRemote) restoreInput(remoteText, remoteRefs);
 			},
-			[currentUserId, narratorId],
+			[currentUserId, narratorId, restoreInput],
 		);
 
 		// --- Command popover ---
@@ -578,6 +680,60 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		);
 		const closeMentionPopover = useCallback(() => setMentionCaret(null), []);
 
+		const [dismissedFileQuery, setDismissedFileQuery] = useState<string | null>(null);
+		const fileQuery = useMemo(() => {
+			if (mentionCaret === null || input.startsWith("/") || inputHistory.isBrowsing) return null;
+			const query = getFileReferenceQuery(input, mentionCaret, fileReferences);
+			return query && JSON.stringify([input, mentionCaret]) !== dismissedFileQuery ? query : null;
+		}, [input, mentionCaret, fileReferences, inputHistory.isBrowsing, dismissedFileQuery]);
+		const closeFilePopover = useCallback(() => {
+			setDismissedFileQuery(
+				JSON.stringify([inputRef.current, textareaRef.current?.selectionStart]),
+			);
+		}, []);
+		const moveFileCaret = useCallback((caret: number) => {
+			requestAnimationFrame(() => {
+				textareaRef.current?.focus();
+				textareaRef.current?.setSelectionRange(caret, caret);
+				setMentionCaret(caret);
+			});
+		}, []);
+		const handleFileSelect = useCallback(
+			(reference: FileReference) => {
+				if (!fileQuery) return;
+				try {
+					const next = insertFileReference(inputStateRef.current, reference, [
+						fileQuery.start,
+						fileQuery.end,
+					]);
+					applyInput(next);
+					if (fileCacheScope) rememberFileReference(fileCacheScope, reference);
+					moveFileCaret(next.caret);
+				} catch (error) {
+					notifications.show({
+						title: t("fileReferences.addFailed", { defaultValue: "无法添加文件引用" }),
+						message: error instanceof Error ? error.message : String(error),
+						color: "red",
+					});
+				}
+			},
+			[fileQuery, applyInput, fileCacheScope, moveFileCaret, t],
+		);
+		const handleFileNavigate = useCallback(
+			(candidate: FileReferenceCandidate) => {
+				if (!fileQuery) return;
+				const prefix = `#${candidate.relativePath.replace(/[\\/]+$/, "")}/`;
+				setText(
+					inputRef.current.slice(0, fileQuery.start) +
+						prefix +
+						inputRef.current.slice(fileQuery.end),
+				);
+				moveFileCaret(fileQuery.start + prefix.length);
+			},
+			[fileQuery, setText, moveFileCaret],
+		);
+		useEffect(() => dock?.registerAddFileReference?.(addFileReference), [dock, addFileReference]);
+
 		useEffect(() => {
 			if (appendInputRef) {
 				appendInputRef.current = appendText;
@@ -622,7 +778,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 
 		// Report the empty↔non-empty transition upward (the panel's send-button
 		// gating and permission Enter-hint need it), never the text itself.
-		const hasText = input.trim().length > 0;
+		const hasText = input.trim().length > 0 || fileReferences.length > 0;
 		useEffect(() => {
 			onTextFlagsChange(hasText);
 		}, [hasText, onTextFlagsChange]);
@@ -641,7 +797,62 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			}
 		};
 
+		// Enter outside interactive controls returns focus to this visible chat input.
+		useEffect(() => {
+			const textarea = textareaRef.current;
+			if (!textarea || permEnterActive) return;
+			const doc = textarea.ownerDocument;
+			const handler = (e: KeyboardEvent) => {
+				if (
+					e.key !== "Enter" ||
+					e.defaultPrevented ||
+					e.repeat ||
+					e.isComposing ||
+					e.keyCode === 229 ||
+					e.shiftKey ||
+					e.ctrlKey ||
+					e.metaKey ||
+					e.altKey ||
+					textarea.disabled ||
+					textarea.getClientRects().length === 0
+				)
+					return;
+				const target = e.target instanceof Element ? e.target : null;
+				if (
+					target?.closest(
+						'input, textarea, select, button, a[href], summary, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="menu"], [role="listbox"], [role="dialog"], [role="alertdialog"], .xterm',
+					) ||
+					doc.querySelector('[aria-modal="true"]')
+				)
+					return;
+				const panel = textarea.closest("[data-narrator-panel]");
+				if (target && target !== doc.body && target !== doc.documentElement) {
+					if (!panel?.contains(target)) return;
+				} else {
+					// Multiple chats can be visible in the workspace: don't pick one arbitrarily.
+					const visible = Array.from(doc.querySelectorAll("[data-narrator-composer]")).filter(
+						(node) => node.getClientRects().length > 0,
+					);
+					if (visible.length !== 1 || visible[0] !== textarea) return;
+				}
+				e.preventDefault();
+				textarea.focus();
+			};
+			doc.defaultView?.addEventListener("keydown", handler);
+			return () => doc.defaultView?.removeEventListener("keydown", handler);
+		}, [permEnterActive]);
+
+		const composingRef = useRef(false);
+		const beforeEditRef = useRef<{ start: number; end: number } | undefined>(undefined);
 		const handleKeyDown = (e: React.KeyboardEvent) => {
+			if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229 || composingRef.current)
+				return;
+			if (fileQuery && fileReferenceKeyAction(e.nativeEvent)) {
+				// The scoped capture listener owns these keys, including empty/loading results.
+				e.preventDefault();
+				e.stopPropagation();
+				return;
+			}
 			// Let CommandPopover handle arrow/tab/escape keys when visible,
 			// but still allow Enter to reach our send handler (CommandPopover
 			// calls stopPropagation when it consumes Enter for selection).
@@ -693,9 +904,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				requestAnimationFrame(() => {
 					const posAfter = textarea.selectionStart;
 					if (posBefore !== posAfter) return; // 光标移动了，说明还在文本中间行
-					const result = inputHistory.navigate(direction, inputRef.current);
+					const result = inputHistory.navigateEntry(
+						direction,
+						inputRef.current,
+						inputStateRef.current.fileReferences,
+					);
 					if (result !== null) {
-						setText(result);
+						restoreInput(result.text, result.fileReferences);
 						// 将光标移到末尾
 						requestAnimationFrame(() => {
 							textarea.selectionStart = textarea.selectionEnd = textarea.value.length;
@@ -709,19 +924,27 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			ref,
 			(): NarratorComposerHandle => ({
 				getText: () => inputRef.current,
-				isTextEmpty: () => inputRef.current.trim().length === 0,
+				isTextEmpty: () =>
+					inputRef.current.trim().length === 0 && inputStateRef.current.fileReferences.length === 0,
 				ownsTextarea: (target) => target === textareaRef.current,
 				focus: () => textareaRef.current?.focus(),
 				setText,
+				getFileReferences: () => copyFileReferences(inputStateRef.current.fileReferences),
+				setFileReferences,
+				restoreInput,
+				addFileReference,
 				appendText,
 				clearTextAndDraft,
 				hideTextForSend,
 				commitDraftAfterSend,
-				noteSent: (text) => inputHistory.push(text),
+				noteSent: (text, refs) => inputHistory.push(text, refs),
 				handleDraftChanged,
 			}),
 			[
 				setText,
+				setFileReferences,
+				restoreInput,
+				addFileReference,
 				appendText,
 				clearTextAndDraft,
 				hideTextForSend,
@@ -746,6 +969,19 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					visible={mentionPopoverVisible}
 					onSelect={handleMentionSelect}
 					onClose={closeMentionPopover}
+				/>
+				<FileReferencePopover
+					narratorId={narratorId}
+					context={fileScope.context}
+					cacheScope={fileCacheScope}
+					query={fileQuery}
+					selection={
+						fileScope.selection !== undefined ? fileScope.selection : dock?.fileReferenceSelection
+					}
+					textareaRef={textareaRef}
+					onSelect={handleFileSelect}
+					onNavigate={handleFileNavigate}
+					onClose={closeFilePopover}
 				/>
 				{matchedCommand && (
 					<CommandParamHelper
@@ -786,14 +1022,55 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						})}
 					</Text>
 				)}
+				{fileReferences
+					.filter((reference) => !reference.inputRange)
+					.map((reference) => (
+						<Group key={reference.id} gap="xs" mb={4} wrap="nowrap">
+							<Text size="xs" truncate style={{ flex: 1 }}>
+								{reference.deviceId} · {reference.label}
+							</Text>
+							<Button
+								size="compact-xs"
+								variant="subtle"
+								onClick={() =>
+									setFileReferences(
+										inputStateRef.current.fileReferences.filter((item) => item.id !== reference.id),
+									)
+								}
+							>
+								{t("fileReferences.remove", { defaultValue: "移除引用" })}
+							</Button>
+						</Group>
+					))}
 				<Textarea
 					ref={textareaRef}
+					data-narrator-composer
 					placeholder={t("sendPlaceholder")}
 					value={input}
+					onBeforeInput={(e) => {
+						beforeEditRef.current = {
+							start: e.currentTarget.selectionStart,
+							end: e.currentTarget.selectionEnd,
+						};
+					}}
 					onChange={(e) => {
-						setInput(e.currentTarget.value);
+						applyInput(
+							editFileReferenceInput(
+								inputStateRef.current,
+								e.currentTarget.value,
+								beforeEditRef.current,
+							),
+						);
+						beforeEditRef.current = undefined;
+						setDismissedFileQuery(null);
 						setMentionCaret(e.currentTarget.selectionStart);
 						inputHistory.reset();
+					}}
+					onCompositionStart={() => {
+						composingRef.current = true;
+					}}
+					onCompositionEnd={() => {
+						composingRef.current = false;
 					}}
 					onKeyDown={handleKeyDown}
 					onKeyUp={(e) => setMentionCaret(e.currentTarget.selectionStart)}

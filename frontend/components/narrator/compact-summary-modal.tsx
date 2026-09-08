@@ -13,24 +13,25 @@ import {
 	Button,
 	Group,
 	Loader,
+	Menu,
 	Modal,
 	Paper,
-	Select,
 	Stack,
 	Text,
 	Textarea,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { type CompactMessageDetail, isCompactRetryableDetail } from "@shared/compact-message";
-import { IconArrowsMinimize } from "@tabler/icons-react";
+import { IconArrowsMinimize, IconChevronDown } from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { createContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../hooks/useModels";
 import { api } from "../../lib/api";
 import type { RetryFailedCompactResponse } from "../../lib/api/narrators";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { MarkdownContent } from "./MarkdownContent";
+import { ModelMenuItems } from "./ModelMenuItems";
 
 export const COMPACTING_MARKER_ATTR = "data-compacting-marker";
 export const COMPACT_DETAIL_QUERY_GC_TIME_MS = 30_000;
@@ -192,13 +193,14 @@ export function CompactSummaryModal({
 }) {
 	const { t } = useTranslation("narrator");
 	const queryClient = useQueryClient();
-	const { visibleModels, summaryModelValue } = useAllModels();
+	const { visibleModels, summaryModelValue, providerLabels } = useAllModels();
 	const [deleting, setDeleting] = useState(false);
 	const [editing, setEditing] = useState(false);
 	const [editText, setEditText] = useState("");
 	const [saving, setSaving] = useState(false);
 	const [retrying, setRetrying] = useState(false);
 	const [retryModel, setRetryModel] = useState<string | null>(null);
+	const [retryModelMenuOpened, setRetryModelMenuOpened] = useState(false);
 	const sourceTargetKey = target ? `${target.kind}:${target.narratorId}:${target.messageId}` : null;
 	const [retryTargetOverride, setRetryTargetOverride] = useState<{
 		sourceTargetKey: string;
@@ -348,10 +350,12 @@ export function CompactSummaryModal({
 	const compactDetail = !isSegment ? (data as CompactMessageDetail | undefined) : undefined;
 	const failed = compactDetail?.status === "failed";
 	const canRetry = compactDetail ? isCompactRetryableDetail(compactDetail) : false;
-	const retryModelOptions = useMemo(
-		() => visibleModels.map((model) => ({ value: model.value, label: model.label })),
-		[visibleModels],
-	);
+	const selectedRetryModel = visibleModels.find((model) => model.value === retryModel);
+	const retryModelLabel = selectedRetryModel
+		? selectedRetryModel.provider
+			? `${providerLabels?.[selectedRetryModel.provider] ?? selectedRetryModel.provider} · ${selectedRetryModel.label}`
+			: selectedRetryModel.label
+		: (retryModel ?? t("compactRetryModel"));
 	const previousSourceTargetKeyRef = useRef(sourceTargetKey);
 
 	useEffect(() => {
@@ -385,6 +389,7 @@ export function CompactSummaryModal({
 	}, [activeTargetKind, activeTargetNarratorId, activeTargetMessageId, queryClient]);
 
 	useEffect(() => {
+		setRetryModelMenuOpened(false);
 		if (!targetKey) {
 			setEditing(false);
 			setEditText("");
@@ -404,14 +409,14 @@ export function CompactSummaryModal({
 
 	useEffect(() => {
 		if (!canRetry) return;
-		const availableModels = new Set(retryModelOptions.map((model) => model.value));
+		const availableModels = new Set(visibleModels.map((model) => model.value));
 		if (retryModel && availableModels.has(retryModel)) return;
 		const lastAttemptModel = compactDetail?.attempts.at(-1)?.model;
 		const preferredModel = [lastAttemptModel, summaryModelValue].find(
 			(model): model is string => typeof model === "string" && availableModels.has(model),
 		);
-		setRetryModel(preferredModel ?? retryModelOptions[0]?.value ?? null);
-	}, [canRetry, compactDetail?.attempts, retryModel, retryModelOptions, summaryModelValue]);
+		setRetryModel(preferredModel ?? visibleModels[0]?.value ?? null);
+	}, [canRetry, compactDetail?.attempts, retryModel, visibleModels, summaryModelValue]);
 
 	useEffect(() => {
 		if (!activeTarget?.autoEdit || isLoading) return;
@@ -611,13 +616,46 @@ export function CompactSummaryModal({
 							))}
 						</Stack>
 						{canRetry && (
-							<Select
-								label={t("compactRetryModel")}
-								data={retryModelOptions}
-								value={retryModel}
-								onChange={setRetryModel}
-								searchable
-							/>
+							<Stack gap={4}>
+								<Text size="sm" fw={500}>
+									{t("compactRetryModel")}
+								</Text>
+								<Menu
+									opened={retryModelMenuOpened}
+									onChange={setRetryModelMenuOpened}
+									position="bottom-start"
+									width="target"
+									withinPortal
+									zIndex={1100}
+								>
+									<Menu.Target>
+										<Button
+											variant="default"
+											fullWidth
+											justify="space-between"
+											fw={400}
+											aria-label={t("compactRetryModel")}
+											disabled={retrying || visibleModels.length === 0}
+											rightSection={<IconChevronDown size={14} />}
+										>
+											{retryModelLabel}
+										</Button>
+									</Menu.Target>
+									<Menu.Dropdown
+										data-model-menu-scroll
+										style={{ maxHeight: "60vh", overflowY: "auto" }}
+									>
+										<ModelMenuItems
+											opened={retryModelMenuOpened}
+											allModels={visibleModels}
+											currentModel={retryModel}
+											totalCostUsd={null}
+											providerLabels={providerLabels}
+											onSelect={setRetryModel}
+										/>
+									</Menu.Dropdown>
+								</Menu>
+							</Stack>
 						)}
 					</Stack>
 				) : editing ? (

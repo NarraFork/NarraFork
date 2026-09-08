@@ -24,7 +24,7 @@
  *
  *   height = padding×2 + border×2
  *          + header row (icon / badges / action button)
- *          + markdown detail region (DETAIL_TOP_MARGIN + min(content, cap))
+ *          + header gap + markdown scroll box (min(content + box padding, cap))
  *
  * The body's own geometry comes from `measureMarkdownDetail`, so it is NOT re-derived
  * here: that function owns the merged block list, the box padding and the cap, and a
@@ -34,7 +34,7 @@
  * Zero DOM — the wrap comes from pretext arithmetic inside `measureMarkdown`.
  */
 
-import type { ElementFrame, MeasuredElement, PreparedBlock } from "../prepared-block";
+import type { MeasuredElement } from "../prepared-block";
 import { DEFAULT_RENDER_LOD, type RenderLod } from "../prepared-block";
 import {
 	FONT_SIZE,
@@ -43,7 +43,7 @@ import {
 	SPACING,
 	typographyMetrics,
 } from "../pretext-fonts";
-import { DETAIL_CAPS, DETAIL_TOP_MARGIN, measureMarkdownDetail } from "./measure-tool-call";
+import { DETAIL_CAPS, measureMarkdownDetail } from "./measure-tool-call";
 
 // ── Chrome constants (px) ────────────────────────────────────────────────────
 
@@ -141,10 +141,8 @@ export function isMeasuredReviewCard(measured: MeasuredElement): measured is Mea
 /**
  * Measure a review card at a content width.
  *
- * The body is measured through `measureMarkdownDetail`, whose result is already
- * "DETAIL_TOP_MARGIN + capped box". That outer margin is the tool card's gap between a
- * label and its box; here the header gap plays that role, so it is subtracted back out
- * and only the box travels — otherwise the two gaps would stack into a visible seam.
+ * `measureMarkdownDetail` already returns a capped box and a zero-based local frame.
+ * The review header gap belongs to this card's chrome; no body rebase is necessary.
  */
 export function measureReviewCard(
 	data: ReviewCardData,
@@ -159,25 +157,14 @@ export function measureReviewCard(
 		undefined,
 		data.textTruncated,
 	);
-	// `measureMarkdownDetail` reports the box plus its own leading gap; this card supplies
-	// that gap itself (REVIEW_HEADER_GAP), so take the box alone.
-	const bodyHeight = Math.max(0, detail.height - DETAIL_TOP_MARGIN);
+	const bodyHeight = detail.height;
 	const height = reviewCardChrome() + bodyHeight;
-
-	// Re-based onto the box's coordinate space, the same transform the tool card's
-	// markdown body applies: the measured frame's tops include DETAIL_TOP_MARGIN, and the
-	// render copy offsets the whole box instead.
-	const frame: ElementFrame = {
-		...detail.frame,
-		contentHeight: Math.max(0, detail.frame.contentHeight - DETAIL_TOP_MARGIN),
-		blocks: detail.frame.blocks.map((b) => ({ ...b, top: b.top - DETAIL_TOP_MARGIN })),
-	};
 
 	return {
 		form: "review-card",
 		height,
-		blocks: detail.blocks as PreparedBlock[],
-		frame,
+		blocks: detail.blocks,
+		frame: detail.frame,
 		contentWidth: detail.contentWidth,
 		// A full-width card: a conclusion is a document to read, not an utterance to
 		// attribute, so it does not shrink-wrap the way a speech bubble does.

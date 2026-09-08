@@ -7,6 +7,7 @@ import {
 	hitTestGroups,
 	intentToDirection,
 	intentToPosition,
+	resolveNativeDrop,
 	type SplitDirection,
 	toIndicator,
 	VERTICAL_ONLY_THRESHOLDS,
@@ -46,6 +47,90 @@ function apiWithGroup(opts: {
 	};
 	return { groups: [group] } as unknown as DockviewApi;
 }
+
+describe("native content drop uses the same geometry as the custom preview", () => {
+	function fixture(x = 500, y = 500) {
+		const geometry = apiWithGroup({ width: 1000, height: 1000 });
+		const api = {
+			...geometry,
+			id: "surface-a",
+			getPanel: (id: string) => ({ id }),
+		} as unknown as DockviewApi;
+		const data = {
+			viewId: api.id,
+			panelId: "dragged" as string | null,
+			tabGroupId: undefined as string | undefined,
+		};
+		const event = {
+			kind: "content",
+			position: "center",
+			group: api.groups[0],
+			nativeEvent: { clientX: x, clientY: y },
+			getData: () => data,
+		};
+		return { api, event, data };
+	}
+
+	test.each([
+		[300, 500, "merge"],
+		[700, 500, "merge"],
+		[500, 300, "merge"],
+		[500, 500, "swap"],
+		[100, 500, "left"],
+		[900, 500, "right"],
+		[500, 100, "above"],
+		[500, 900, "below"],
+	] as const)("native center at (%s, %s) resolves to %s", (x, y, intent) => {
+		const { api, event } = fixture(x, y);
+		const resolved = resolveNativeDrop(api, event);
+		expect(resolved?.hit.intent).toBe(intent);
+		expect(resolved && toIndicator(resolved.hit).variant).toBe(intent);
+	});
+
+	test("disabled swap merges; restricted edges and custom thresholds apply", () => {
+		const { api, event } = fixture();
+		expect(resolveNativeDrop(api, event, undefined, false)?.hit.intent).toBe("merge");
+		event.nativeEvent.clientX = 100;
+		expect(resolveNativeDrop(api, event, VERTICAL_ONLY_THRESHOLDS)?.hit.intent).toBe("merge");
+		event.nativeEvent.clientX = 400;
+		expect(resolveNativeDrop(api, event, { edge: 0.2, swapHalf: 0.05 })?.hit.intent).toBe("merge");
+	});
+
+	test("never hijacks tab sorting, foreign same-name panels or whole-group drags", () => {
+		const { api, event, data } = fixture();
+		for (const kind of ["tab", "header_space", "edge"]) {
+			expect(resolveNativeDrop(api, { ...event, kind })).toBeNull();
+		}
+		data.viewId = "surface-b";
+		expect(resolveNativeDrop(api, event)).toBeNull();
+		data.viewId = api.id;
+		data.tabGroupId = "tab-group";
+		expect(resolveNativeDrop(api, event)).toBeNull();
+		data.tabGroupId = undefined;
+		data.panelId = null;
+		expect(resolveNativeDrop(api, event)).toBeNull();
+	});
+
+	test("self-swap becomes merge and release coordinates replace the prior preview", () => {
+		const { api, event, data } = fixture();
+		expect(resolveNativeDrop(api, event)?.hit.intent).toBe("swap");
+		event.nativeEvent.clientX = 300;
+		expect(resolveNativeDrop(api, event)?.hit.intent).toBe("merge");
+		event.nativeEvent.clientX = 500;
+		data.panelId = "panel-target";
+		expect(resolveNativeDrop(api, event)?.hit.intent).toBe("merge");
+		event.nativeEvent.clientX = 1100;
+		expect(resolveNativeDrop(api, event)).toBeNull();
+	});
+
+	test("missing panel, external payload and wrong target group are ignored", () => {
+		const { api, event } = fixture();
+		expect(resolveNativeDrop(api, { ...event, getData: () => undefined })).toBeNull();
+		expect(resolveNativeDrop(api, { ...event, group: undefined })).toBeNull();
+		api.getPanel = () => undefined;
+		expect(resolveNativeDrop(api, event)).toBeNull();
+	});
+});
 
 /**
  * A group inside an ancestor `transform: scale(zoom)`, modelled the way a browser

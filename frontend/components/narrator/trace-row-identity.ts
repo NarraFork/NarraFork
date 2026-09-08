@@ -201,10 +201,34 @@ function isReservedSendSelector(value: unknown): boolean {
  * single-target Send resolves, and why a parent report is excluded even though its
  * `id` is a real narrator id (the affordance opens a SUBAGENT panel).
  */
+export function runningSendTargetNarratorId(input: unknown, resolved: unknown): string | undefined {
+	const record = asRecord(input);
+	if (
+		[record.ids, record.names].some(
+			(value) =>
+				value !== undefined &&
+				(!Array.isArray(value) || value.some((item) => typeof item !== "string")),
+		)
+	)
+		return undefined;
+	const selectors = [
+		record.id,
+		record.name,
+		...(Array.isArray(record.ids) ? record.ids : []),
+		...(Array.isArray(record.names) ? record.names : []),
+	].filter((value) => nonEmpty(value));
+	if (selectors.length !== 1 || isReservedSendSelector(selectors[0])) return undefined;
+	return isReservedSendSelector(resolved) ? undefined : nonEmpty(resolved);
+}
+
 export function traceRowSendTargetNarratorId(tc: TraceRowToolCallLike): string | undefined {
-	if (tc.toolName !== "Send") return undefined;
+	const isTeamSend = tc.toolName === "TeamStatus" && asRecord(tc.inputJson).action === "send";
+	if (tc.toolName !== "Send" && !isTeamSend) return undefined;
 	const metadata = asRecord(asRecord(tc.outputJson)._metadata ?? tc._metadata);
 	const targets = metadata.targets;
+	if (targets === undefined && tc.outputJson == null) {
+		return runningSendTargetNarratorId(tc.inputJson, tc._awaitAgentNarratorId);
+	}
 	if (!Array.isArray(targets) || targets.length !== 1) return undefined;
 	const target = asRecord(targets[0]);
 	if (isReservedSendSelector(target.label)) return undefined;

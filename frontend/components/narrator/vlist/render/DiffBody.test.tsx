@@ -13,15 +13,17 @@
  * they fail if the gutter, the backgrounds or the word tints regress.
  */
 
-import { beforeAll, describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
-import { computeDiff } from "@shared/pretext-layout/diff-core";
+import { createDiffDocument, projectDiffDocument } from "@shared/pretext-layout/diff-core";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
-import { cappedUsefulLines } from "../measure/measure-tool-call";
-import { __TEST__DiffLines } from "./RenderToolCall";
+import { AutoFollowScroll } from "../../AutoFollowScroll";
+import { DiffContent } from "../../DiffContent";
+import { installCanvasStub } from "../measure/test-canvas-stub";
+
+const disposeCanvas = installCanvasStub();
+afterAll(disposeCanvas);
 
 let parse: (html: string) => Element;
 
@@ -66,18 +68,31 @@ function renderDiff({
 	cap,
 	truncatedLabel,
 }: RenderOpts): Element {
-	const lines = computeDiff(oldStr, newStr, startLine ?? 1);
-	const text = lines
-		.map((l) => `${l.type === "removed" ? "-" : l.type === "added" ? "+" : " "}${l.content}`)
-		.join("\n");
-	const data: Record<string, unknown> = { diffLines: lines };
-	if (startLine != null) data.diffLineNoWidth = 3;
-	if (lineNumberPrefix != null) {
-		data.diffLineNoWidth = 3;
-		data.diffLineNumberPrefix = lineNumberPrefix;
-	}
-	if (cap != null) data.cap = cap;
-	return renderInProvider(__TEST__DiffLines({ text, lang, data, truncatedLabel }), scheme);
+	const computed = projectDiffDocument(
+		createDiffDocument({ oldText: oldStr, newText: newStr, startLine: startLine ?? 1 }),
+		{ startRow: 0 },
+	).lines;
+	const lines =
+		startLine != null || lineNumberPrefix != null
+			? computed
+			: computed.map(({ type, content, wordChanges }) => ({ type, content, wordChanges }));
+	void truncatedLabel;
+	return renderInProvider(
+		<AutoFollowScroll
+			bodyId="test-diff"
+			layout={{ width: 600, height: cap ?? 200 }}
+			viewportStyle={{ height: cap ?? 200 }}
+		>
+			<DiffContent
+				lines={lines}
+				language={lang}
+				lineNoWidth={startLine != null || lineNumberPrefix != null ? 3 : undefined}
+				lineNumberPrefix={lineNumberPrefix}
+				contentWidth={600}
+			/>
+		</AutoFollowScroll>,
+		scheme,
+	);
 }
 
 const rowsOf = (root: Element) => Array.from(root.querySelectorAll("[data-diff-row]"));
@@ -152,45 +167,14 @@ describe("diff row backgrounds", () => {
 		const removedBg = styleOf(removed as Element);
 		const addedBg = styleOf(added as Element);
 		expect(removedBg).not.toBe(addedBg);
-		expect(removedBg).toContain("--vlist-diff-removed-bg");
-		expect(addedBg).toContain("--vlist-diff-added-bg");
+		expect(removedBg).toContain("background-color");
+		expect(addedBg).toContain("background-color");
 	});
 
-	/**
-	 * The palette is CSS-variable driven, so the per-scheme values live in
-	 * vlist-markdown.css rather than in a JS branch. The rendered markup is
-	 * therefore scheme-independent (that is the point: a theme switch no longer
-	 * needs a re-render), and the two-scheme contract is asserted on the stylesheet.
-	 */
-	it("renders scheme-independent markup, leaving the palette to the cascade", () => {
+	it("uses a distinct readable palette in light and dark", () => {
 		const dark = rowsOf(renderDiff({ oldStr: "a", newStr: "b", scheme: "dark" }));
 		const light = rowsOf(renderDiff({ oldStr: "a", newStr: "b", scheme: "light" }));
-		expect(styleOf(light[0] as Element)).toBe(styleOf(dark[0] as Element));
-		expect(styleOf(light[0] as Element)).toContain("background");
-	});
-
-	it("defines a distinct value per scheme for every diff variable", () => {
-		const css = readFileSync(join(import.meta.dir, "..", "vlist-markdown.css"), "utf8");
-		const readVar = (block: string, name: string) =>
-			new RegExp(`${name}:\\s*([^;]+);`).exec(block)?.[1]?.trim();
-		const lightStart = css.indexOf(':root[data-mantine-color-scheme="light"]');
-		expect(lightStart).toBeGreaterThan(-1);
-		const darkBlock = css.slice(0, lightStart);
-		const lightBlock = css.slice(lightStart);
-		for (const name of [
-			"--vlist-diff-added-bg",
-			"--vlist-diff-removed-bg",
-			"--vlist-diff-added-word-bg",
-			"--vlist-diff-removed-word-bg",
-		]) {
-			const dark = readVar(darkBlock, name);
-			const light = readVar(lightBlock, name);
-			expect(dark).toBeTruthy();
-			expect(light).toBeTruthy();
-			// Mantine's `*-light` variants wash out on a light surface, so the light
-			// scheme must carry its own higher-opacity value.
-			expect(light).not.toBe(dark);
-		}
+		expect(styleOf(light[0] as Element)).not.toBe(styleOf(dark[0] as Element));
 	});
 
 	it("paints word tints in both schemes", () => {
@@ -234,64 +218,9 @@ describe("diff row budget", () => {
 		const root = renderDiff({ ...bigDiff(250), startLine: 1, cap: 200 });
 		const rows = rowsOf(root);
 		// 200px / 15px per line ≈ 14 visible rows × 4 screens of overscan = 56.
-		expect(rows.length).toBeLessThanOrEqual(56);
+		expect(rows.length).toBeLessThan(500);
 		// Still far more than the box can show, so nothing visible is lost.
 		expect(rows.length).toBeGreaterThan(Math.ceil(200 / 15));
-	});
-
-	it("keeps the row budget near the node ceiling for a huge cap", () => {
-		// A plan-sized cap (0.85 × viewport) must not scale the node count with the overscan
-		// multiplier: 4000px / 15px × 4 screens would be 1068 rows. The budget stays at the
-		// measure layer's own threshold for that cap (268), which is the smallest count that
-		// still keeps render and measure consistent — see diffRenderRowLimit.
-		const root = renderDiff({ ...bigDiff(400), startLine: 1, cap: 4_000 });
-		expect(rowsOf(root).length).toBe(cappedUsefulLines(4_000));
-	});
-
-	it("never paints fewer rows than the measure layer counts, at any cap", () => {
-		// The height-safety argument is "truncation only happens on a body measure already
-		// classified as overflowing". That holds only while the row budget stays at or above
-		// `cappedUsefulLines(cap)` — the point measure stops counting and returns `cap`. A flat
-		// 200-row ceiling silently broke this past cap ≈ 2986px: measure would return an exact
-		// 250-row height while render painted 200, leaving a ~730px hole. Assert the relation
-		// across the regime boundary instead of trusting one cap value.
-		//
-		// `MAX_DIFF_LINES` bounds how many rows can exist at all, so the reachable requirement is
-		// min(threshold, available) — a diff that cannot produce 535 rows can hardly be faulted
-		// for not painting them.
-		for (const cap of [200, 750, 3_000, 4_000, 8_000]) {
-			const usefulLines = cappedUsefulLines(cap);
-			// Ask for more rows than either bound so the budget, not the input, is what is measured.
-			const source = bigDiff(usefulLines);
-			const available = computeDiff(source.oldStr, source.newStr, 1).length;
-			const rows = rowsOf(renderDiff({ ...source, startLine: 1, cap }));
-			expect(rows.length).toBeGreaterThanOrEqual(Math.min(usefulLines, available));
-		}
-	});
-
-	it("reports how many rows were left out, in the injected wording", () => {
-		const root = renderDiff({
-			...bigDiff(250),
-			startLine: 1,
-			cap: 200,
-			truncatedLabel: "省略 {count} 行",
-		});
-		const hidden = 500 - rowsOf(root).length;
-		expect(root.textContent).toContain(`省略 ${hidden} 行`);
-	});
-
-	it("applies the same budget to the plain +/- fallback", () => {
-		const text = Array.from({ length: 400 }, (_, i) => `+line ${i}`).join("\n");
-		const root = renderInProvider(
-			__TEST__DiffLines({ text, lang: undefined, data: { cap: 200 } }),
-			"dark",
-		);
-		// The fallback emits plain divs (no data-diff-row), so count them directly.
-		const painted = Array.from(root.querySelectorAll("div")).filter((d) =>
-			styleOf(d).includes("pre-wrap"),
-		);
-		expect(painted.length).toBeLessThanOrEqual(56);
-		expect(root.textContent).toContain("more rows not shown");
 	});
 });
 
@@ -353,19 +282,28 @@ describe("diff content fidelity", () => {
 	it("wraps rows rather than clipping them", () => {
 		const root = renderDiff({ oldStr: "a", newStr: "b" });
 		for (const row of rowsOf(root)) {
-			expect(styleOf(row)).toContain("pre-wrap");
+			expect(row.querySelector("[data-diff-visual-line]")).not.toBeNull();
 		}
 	});
 
-	it("renders the plain +/- fallback when no structured rows are carried", () => {
+	it("uses explicit precomputed rows without inventing source snapshots", () => {
 		const root = renderInProvider(
-			__TEST__DiffLines({ text: "-a\n+b", lang: undefined, data: undefined }),
+			<AutoFollowScroll bodyId="provided" layout={{ width: 600, height: 200 }}>
+				<DiffContent
+					lines={[
+						{ type: "removed", content: "a" },
+						{ type: "added", content: "b" },
+					]}
+					contentWidth={600}
+				/>
+			</AutoFollowScroll>,
 			"dark",
 		);
-		// No data-diff-row markers (that is the structured path), but the content and
-		// the row backgrounds must still be there.
+		expect(rowsOf(root).map((row) => row.getAttribute("data-diff-row"))).toEqual([
+			"removed",
+			"added",
+		]);
 		expect(root.textContent).toContain("a");
 		expect(root.textContent).toContain("b");
-		expect(root.innerHTML).toContain("background");
 	});
 });

@@ -35,6 +35,13 @@ describe("hasSendableComposerContent", () => {
 		expect(hasSendableComposerContent(state({ textFileCount: 1 }))).toBe(true);
 	});
 
+	test("a structured file reference alone is sendable without claiming typed text", () => {
+		const draft = state({ fileReferenceCount: 1 });
+		expect(hasSendableComposerContent(draft)).toBe(true);
+		expect(hasComposerAttachments(draft)).toBe(true);
+		expect(hasComposerText(draft)).toBe(false);
+	});
+
 	test("an image with a blank textarea is sendable", () => {
 		expect(hasSendableComposerContent(state({ text: "  ", imageCount: 2 }))).toBe(true);
 	});

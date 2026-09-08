@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { diffDocumentLineNoWidth, projectDiffDocument } from "./diff-core";
+import { createSourceText } from "./source-text";
 import {
 	classifyToolDetail,
 	countLines,
@@ -13,12 +15,14 @@ import {
 	type ToolCappedDetail,
 	type ToolDetailData,
 	type ToolErrorDetail,
-	type ToolGenericDetail,
 	type ToolMetaRowsDetail,
+	type ToolSectionBody,
 	type ToolSectionLabel,
 	type ToolSectionsDetail,
 	type ToolSpecTasksDetail,
 	type ToolStructuredDetail,
+	toolBodyId,
+	toolInputFieldView,
 } from "./tool-detail";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -33,9 +37,23 @@ import {
  * original single-block shape and height model); normalize both forms here.
  */
 function asSections(detail: ToolDetailData | null): ToolSectionsDetail {
-	expect(detail).not.toBeNull();
-	if (detail?.kind === "sections") return detail;
-	return { kind: "sections", sections: [{ body: detail as never }] };
+	expect(detail?.kind).toBe("sections");
+	if (!detail) throw new Error("Missing sections detail");
+	return detail;
+}
+
+function bodyOfKind<K extends ToolSectionBody["kind"]>(
+	detail: ToolDetailData | null,
+	kind: K,
+): Extract<ToolSectionBody, { kind: K }> {
+	const body = asSections(detail).sections.find((part) => part.body.kind === kind)?.body;
+	if (!body) throw new Error(`Missing ${kind} body`);
+	return body as Extract<ToolSectionBody, { kind: K }>;
+}
+
+function diffRows(body: ToolCappedDetail) {
+	if (!body.diffDocument) throw new Error("Missing diff document");
+	return projectDiffDocument(body.diffDocument, { startRow: 0 }).lines;
 }
 
 /** The body of the section carrying `label` (fails when absent). */
@@ -210,31 +228,40 @@ describe("countLines", () => {
 
 describe("classifyToolDetail — read", () => {
 	it("maps an image read to a media cap with contentPx", () => {
-		const d = classifyToolDetail({
-			toolName: "Read",
-			category: "read",
-			outputJson: "ignored",
-			metadata: { isImage: true },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Read",
+				category: "read",
+				outputJson: "ignored",
+				metadata: { isImage: true },
+			}),
+			"capped",
+		);
 		expect(d.kind).toBe("capped");
 		expect(d.cap).toBe("media");
 		// Same reserved height a chat image block uses — not a taller standalone
 		// estimate that would letterbox every screenshot.
 		expect(d.contentPx).toBe(MEDIA_IMAGE_CONTENT_PX);
-		expect(d.hasLabel).toBe(false);
+		expect(d.source).toBe("output.main");
 	});
 	it("maps a text read to a code cap with content line count", () => {
-		const d = classifyToolDetail({
-			toolName: "Read",
-			category: "read",
-			outputJson: "line1\nline2\nline3",
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Read",
+				category: "read",
+				outputJson: "line1\nline2\nline3",
+			}),
+			"capped",
+		);
 		expect(d.cap).toBe("code");
 		expect(d.contentLines).toBe(3);
-		expect(d.hasLabel).toBe(false);
+		expect(d.source).toBe("output.main");
 	});
 	it("keeps the file path as a leading meta row (chunked parity)", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Read",
 			category: "read",
 			inputJson: { file_path: "/src/app.ts" },
@@ -244,6 +271,7 @@ describe("classifyToolDetail — read", () => {
 	});
 	it("shows size + format next to the path for an image read", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Read",
 			category: "read",
 			inputJson: { file_path: "/tmp/pic.png" },
@@ -253,6 +281,7 @@ describe("classifyToolDetail — read", () => {
 	});
 	it("forwards intrinsic dimensions on a media ref (aspect-ratio reservation)", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Read",
 			category: "read",
 			inputJson: { file_path: "/tmp/pic.png" },
@@ -270,20 +299,28 @@ describe("classifyToolDetail — read", () => {
 		expect(media.contentPx).toBe(MEDIA_IMAGE_CONTENT_PX);
 	});
 	it("omits dimensions when only one side is present or they are invalid", () => {
-		const d = classifyToolDetail({
-			toolName: "Read",
-			category: "read",
-			inputJson: { file_path: "/tmp/pic.png" },
-			metadata: { isImage: true, width: 1600 },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Read",
+				category: "read",
+				inputJson: { file_path: "/tmp/pic.png" },
+				metadata: { isImage: true, width: 1600 },
+			}),
+			"capped",
+		);
 		expect(d.media?.width).toBeUndefined();
 		expect(d.media?.height).toBeUndefined();
-		const bad = classifyToolDetail({
-			toolName: "Read",
-			category: "read",
-			inputJson: { file_path: "/tmp/pic.png" },
-			metadata: { isImage: true, width: 0, height: -3 },
-		}) as ToolCappedDetail;
+		const bad = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Read",
+				category: "read",
+				inputJson: { file_path: "/tmp/pic.png" },
+				metadata: { isImage: true, width: 0, height: -3 },
+			}),
+			"capped",
+		);
 		expect(bad.media?.width).toBeUndefined();
 		expect(bad.media?.height).toBeUndefined();
 	});
@@ -291,25 +328,30 @@ describe("classifyToolDetail — read", () => {
 
 describe("classifyToolDetail — file", () => {
 	it("maps Edit with old_string to a REAL line diff, not two concatenated halves", () => {
-		const d = classifyToolDetail({
-			toolName: "Edit",
-			category: "file",
-			inputJson: { old_string: "a\nb", new_string: "a\nB\nc" },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Edit",
+				category: "file",
+				inputJson: { old_string: "a\nb", new_string: "a\nB\nc" },
+			}),
+			"capped",
+		);
 		expect(d.cap).toBe("diff");
 		// The unchanged first line must be CONTEXT, not "removed then re-added".
 		// A naive concatenation would emit 5 rows (2 removed + 3 added); a real diff
 		// emits 4: context "a", removed "b", added "B", added "c".
-		expect(d.diffLines?.map((line) => [line.type, line.content])).toEqual([
+		expect(diffRows(d).map((line) => [line.type, line.content])).toEqual([
 			["context", "a"],
 			["removed", "b"],
 			["added", "B"],
 			["added", "c"],
 		]);
-		expect(d.contentLines).toBe(4);
+		expect(d.diffDocument ? d.diffDocument.totalRows : countLines(d.text ?? "")).toBe(4);
 	});
 	it("numbers Edit diff rows on both the old and new side", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Edit",
 			category: "file",
 			inputJson: { file_path: "/x.ts", old_string: "a\nb", new_string: "a\nB" },
@@ -318,22 +360,26 @@ describe("classifyToolDetail — file", () => {
 		const body = cappedSectionBody(d, "diff");
 		// Context lines carry BOTH numbers; a removal only the old, an addition only
 		// the new — that is what the two-column gutter renders.
-		expect(body.diffLines?.map((line) => [line.type, line.oldLineNo, line.newLineNo])).toEqual([
+		expect(diffRows(body).map((line) => [line.type, line.oldLineNo, line.newLineNo])).toEqual([
 			["context", 42, 42],
 			["removed", 43, undefined],
 			["added", undefined, 43],
 		]);
 		// One column is 2 chars wide at minimum, so both columns align.
-		expect(body.diffLineNoWidth).toBe(2);
+		expect(diffDocumentLineNoWidth(body.diffDocument!)).toBe(2);
 	});
 	it("carries word-level changes for a modified line pair", () => {
-		const d = classifyToolDetail({
-			toolName: "Edit",
-			category: "file",
-			inputJson: { old_string: "const a = 1;", new_string: "const a = 2;" },
-		}) as ToolCappedDetail;
-		const removed = d.diffLines?.find((line) => line.type === "removed");
-		const added = d.diffLines?.find((line) => line.type === "added");
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Edit",
+				category: "file",
+				inputJson: { old_string: "const a = 1;", new_string: "const a = 2;" },
+			}),
+			"capped",
+		);
+		const removed = diffRows(d).find((line) => line.type === "removed");
+		const added = diffRows(d).find((line) => line.type === "added");
 		// The shared prefix must NOT be marked as changed; only the differing token.
 		expect(removed?.wordChanges?.some((c) => c.removed && c.value.includes("1"))).toBe(true);
 		expect(removed?.wordChanges?.some((c) => c.added)).toBe(false);
@@ -341,25 +387,34 @@ describe("classifyToolDetail — file", () => {
 		expect(added?.wordChanges?.some((c) => c.removed)).toBe(false);
 	});
 	it("omits the diff gutter width when the edit position is unknown", () => {
-		const d = classifyToolDetail({
-			toolName: "Edit",
-			category: "file",
-			inputJson: { old_string: "a", new_string: "b" },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Edit",
+				category: "file",
+				inputJson: { old_string: "a", new_string: "b" },
+			}),
+			"capped",
+		);
 		// No startLine and not streaming → no line-number gutter (chunked parity).
-		expect(d.diffLineNoWidth).toBeUndefined();
+		expect(d.diffDocument?.startLine).toBeUndefined();
 	});
 	it("maps Write to a code cap using content", () => {
-		const d = classifyToolDetail({
-			toolName: "Write",
-			category: "file",
-			inputJson: { content: "x\ny\nz\nw" },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Write",
+				category: "file",
+				inputJson: { content: "x\ny\nz\nw" },
+			}),
+			"capped",
+		);
 		expect(d.cap).toBe("code");
-		expect(d.contentLines).toBe(4);
+		expect(d.diffDocument ? d.diffDocument.totalRows : countLines(d.text ?? "")).toBe(4);
 	});
 	it("shows the Write path as a meta row", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Write",
 			category: "file",
 			inputJson: { file_path: "/src/new.ts", content: "x" },
@@ -368,6 +423,7 @@ describe("classifyToolDetail — file", () => {
 	});
 	it("annotates an Edit diff header with the original start line", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Edit",
 			category: "file",
 			inputJson: { file_path: "/src/a.ts", old_string: "a", new_string: "b" },
@@ -379,17 +435,21 @@ describe("classifyToolDetail — file", () => {
 
 describe("classifyToolDetail — tasks", () => {
 	it("parses tasks from metadata with status + protected", () => {
-		const d = classifyToolDetail({
-			toolName: "Read",
-			category: "tasks",
-			metadata: {
-				tasks: [
-					{ text: "do A", status: "done" },
-					{ text: "do B", status: "doing", protected: true },
-					{},
-				],
-			},
-		}) as ToolSpecTasksDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Read",
+				category: "tasks",
+				metadata: {
+					tasks: [
+						{ text: "do A", status: "done" },
+						{ text: "do B", status: "doing", protected: true },
+						{},
+					],
+				},
+			}),
+			"spec-tasks",
+		);
 		expect(d.kind).toBe("spec-tasks");
 		expect(d.tasks).toEqual([
 			{ text: "do A", status: "done", protected: false },
@@ -399,29 +459,41 @@ describe("classifyToolDetail — tasks", () => {
 	});
 	it("parses tasks from input.content JSON", () => {
 		const doc = JSON.stringify({ tasks: [{ text: "first", status: "todo" }] });
-		const d = classifyToolDetail({
-			toolName: "Write",
-			category: "tasks",
-			inputJson: { content: doc },
-		}) as ToolSpecTasksDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Write",
+				category: "tasks",
+				inputJson: { content: doc },
+			}),
+			"spec-tasks",
+		);
 		expect(d.tasks).toEqual([{ text: "first", status: "todo", protected: false }]);
 	});
 	it("returns empty spec-tasks for an empty task document", () => {
 		const doc = JSON.stringify({ tasks: [] });
-		const d = classifyToolDetail({
-			toolName: "Write",
-			category: "tasks",
-			inputJson: { content: doc },
-		}) as ToolSpecTasksDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Write",
+				category: "tasks",
+				inputJson: { content: doc },
+			}),
+			"spec-tasks",
+		);
 		expect(d.kind).toBe("spec-tasks");
 		expect(d.tasks).toEqual([]);
 	});
 	it("falls back to file branch when nothing parseable", () => {
-		const d = classifyToolDetail({
-			toolName: "Write",
-			category: "tasks",
-			inputJson: { content: "not json" },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Write",
+				category: "tasks",
+				inputJson: { content: "not json" },
+			}),
+			"capped",
+		);
 		expect(d.kind).toBe("capped");
 		expect(d.cap).toBe("code");
 	});
@@ -430,6 +502,7 @@ describe("classifyToolDetail — tasks", () => {
 describe("classifyToolDetail — bash", () => {
 	it("keeps the command and the output as SEPARATE labelled sections", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Bash",
 			category: "bash",
 			inputJson: { command: "echo hi" },
@@ -447,6 +520,7 @@ describe("classifyToolDetail — bash", () => {
 	});
 	it("uses streaming-bash cap when streaming output present", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Bash",
 			category: "bash",
 			inputJson: { command: "sleep 1" },
@@ -458,6 +532,7 @@ describe("classifyToolDetail — bash", () => {
 	});
 	it("surfaces the await badge row (task id, timeout, wait_for)", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Bash",
 			category: "bash",
 			inputJson: { await: { task_id: "t-1", timeout: 30000, wait_for_text: "ready" } },
@@ -466,23 +541,35 @@ describe("classifyToolDetail — bash", () => {
 		expect(metaTexts(d)).toEqual(['wait_for: "ready"']);
 	});
 	it("returns null when no command and no output", () => {
-		expect(classifyToolDetail({ toolName: "Bash", category: "bash", inputJson: {} })).toBeNull();
+		expect(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Bash",
+				category: "bash",
+				inputJson: {},
+			}),
+		).toBeNull();
 	});
 });
 
 describe("classifyToolDetail — search", () => {
 	it("returns error on failed search with no output", () => {
-		const d = classifyToolDetail({
-			toolName: "Grep",
-			category: "search",
-			status: "fail",
-			inputJson: { pattern: "foo" },
-		}) as ToolErrorDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Grep",
+				category: "search",
+				status: "fail",
+				inputJson: { pattern: "foo" },
+			}),
+			"error",
+		);
 		expect(d.kind).toBe("error");
 		expect(d.text).toBe("foo");
 	});
 	it("returns a labelled output section on success", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Grep",
 			category: "search",
 			outputJson: "match1\nmatch2",
@@ -493,6 +580,7 @@ describe("classifyToolDetail — search", () => {
 	});
 	it("keeps the pattern and search path as meta rows", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Grep",
 			category: "search",
 			inputJson: { pattern: "foo", path: "src/" },
@@ -511,6 +599,7 @@ describe("classifyToolDetail — webSearch", () => {
 			],
 		});
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "WebSearch",
 			category: "webSearch",
 			outputJson: output,
@@ -527,6 +616,7 @@ describe("classifyToolDetail — webSearch", () => {
 	});
 	it("renders non-JSON output as MARKDOWN (chunked ContentViewer parity)", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "WebSearch",
 			category: "webSearch",
 			inputJson: { query: "how to" },
@@ -534,14 +624,18 @@ describe("classifyToolDetail — webSearch", () => {
 		});
 		const out = sectionBody(d, "output") as ToolCappedDetail;
 		expect(out.cap).toBe("code");
-		expect(out.markdown).toBe(true);
+		expect(out.format).toBe("markdown");
 		expect(metaTexts(d)).toEqual(["how to"]);
 	});
 	it("returns error when no output", () => {
-		const d = classifyToolDetail({
-			toolName: "WebSearch",
-			category: "webSearch",
-		}) as ToolErrorDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "WebSearch",
+				category: "webSearch",
+			}),
+			"error",
+		);
 		expect(d.kind).toBe("error");
 	});
 });
@@ -549,6 +643,7 @@ describe("classifyToolDetail — webSearch", () => {
 describe("classifyToolDetail — webFetch", () => {
 	it("maps screenshot mode with previewUrl to media", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "WebFetch",
 			category: "webFetch",
 			inputJson: { mode: "screenshot" },
@@ -561,6 +656,7 @@ describe("classifyToolDetail — webFetch", () => {
 	});
 	it("forwards screenshot dimensions from the metadata", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "WebFetch",
 			category: "webFetch",
 			inputJson: { mode: "screenshot" },
@@ -574,6 +670,7 @@ describe("classifyToolDetail — webFetch", () => {
 	});
 	it("keeps the url link, mode badge and selector rows", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "WebFetch",
 			category: "webFetch",
 			inputJson: { url: "https://x.dev/a", mode: "readability", selector: "main" },
@@ -587,6 +684,7 @@ describe("classifyToolDetail — webFetch", () => {
 	});
 	it("renders smart/readability output as markdown", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "WebFetch",
 			category: "webFetch",
 			inputJson: { mode: "readability" },
@@ -595,52 +693,71 @@ describe("classifyToolDetail — webFetch", () => {
 		const out = sectionBody(d, "output") as ToolCappedDetail;
 		expect(out.cap).toBe("code");
 		expect(out.contentLines).toBe(2);
-		expect(out.markdown).toBe(true);
+		expect(out.format).toBe("markdown");
 	});
 	it("leaves raw modes as plain monospace", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "WebFetch",
 			category: "webFetch",
 			inputJson: { mode: "dom" },
 			outputJson: "<html>",
 		});
-		expect((sectionBody(d, "output") as ToolCappedDetail).markdown).toBeUndefined();
+		expect((sectionBody(d, "output") as ToolCappedDetail).format).not.toBe("markdown");
 	});
 });
 
 describe("classifyToolDetail — agent/generic", () => {
 	it("produces generic input/output line counts", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Task",
 			category: "agent",
 			inputJson: "prompt line",
 			outputJson: "out1\nout2",
-		}) as ToolGenericDetail;
-		expect(d.kind).toBe("generic");
-		expect(d.inputLines).toBe(1);
-		expect(d.outputLines).toBe(2);
+		});
+		expect(asSections(d).kind).toBe("sections");
+		expect(countLines(bodyOfKind(d, "capped").text ?? "")).toBe(1);
+		expect(
+			d?.sections.find((part) => part.key === "output.main")?.body.kind === "capped"
+				? countLines(
+						(d.sections.find((part) => part.key === "output.main")!.body as ToolCappedDetail)
+							.text ?? "",
+					)
+				: undefined,
+		).toBe(2);
 	});
 	it("omits outputLines when there's no output", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Task",
 			category: "agent",
 			inputJson: "prompt",
-		}) as ToolGenericDetail;
-		expect(d.outputLines).toBeUndefined();
+		});
+		expect(
+			d?.sections.find((part) => part.key === "output.main")?.body.kind === "capped"
+				? countLines(
+						(d.sections.find((part) => part.key === "output.main")!.body as ToolCappedDetail)
+							.text ?? "",
+					)
+				: undefined,
+		).toBeUndefined();
 	});
 	it("falls back to generic for unknown category", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Mystery",
 			category: "generic",
 			inputJson: "in",
-		}) as ToolGenericDetail;
-		expect(d.kind).toBe("generic");
+		});
+		expect(asSections(d).kind).toBe("sections");
 	});
 });
 
 describe("classifyToolDetail — await", () => {
 	it("uses a term-capped output section for bash await", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Await",
 			category: "await",
 			inputJson: { type: "bash" },
@@ -650,6 +767,7 @@ describe("classifyToolDetail — await", () => {
 	});
 	it("uses a markdown result section for agent await", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Await",
 			category: "await",
 			inputJson: { type: "agent" },
@@ -657,10 +775,11 @@ describe("classifyToolDetail — await", () => {
 		});
 		const body = sectionBody(d, "result") as ToolCappedDetail;
 		expect(body.cap).toBe("code");
-		expect(body.markdown).toBe(true);
+		expect(body.format).toBe("markdown");
 	});
 	it("surfaces the badge row plus waitFor / subagent rows", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Await",
 			category: "await",
 			inputJson: { type: "agent", id: "t-9", timeout: 600000, wait_for_text: "done" },
@@ -672,8 +791,27 @@ describe("classifyToolDetail — await", () => {
 });
 
 describe("classifyToolDetail — send", () => {
+	it.each([
+		[{ await: true }, undefined, "等待回复"],
+		[{ await: false }, undefined, "不等待回复"],
+		[{}, undefined, "不等待回复"],
+		[{ await: false }, { await: true }, "不等待回复"],
+		[{ _truncated: true, preview: "{}" }, { await: true }, "等待回复"],
+		[{ _truncated: true, preview: "{}" }, { await: false }, "不等待回复"],
+	])("measures the localized reply mode for %j / %j", (inputJson, metadata, expected) => {
+		const d = classifyToolDetail({
+			previewId: "send-mode",
+			toolName: "Send",
+			category: "send",
+			inputJson,
+			metadata,
+			labels: { sendAwaitReply: "等待回复", sendNoAwaitReply: "不等待回复" },
+		});
+		expect(metaBadgeLabels(d)).toContain(expected);
+	});
 	it("splits message / delivery / result into labelled sections", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Send",
 			category: "send",
 			inputJson: { message: "hi\nthere" },
@@ -682,17 +820,18 @@ describe("classifyToolDetail — send", () => {
 		});
 		const message = sectionBody(d, "message") as ToolCappedDetail;
 		expect(message.text).toBe("hi\nthere");
-		expect(message.markdown).toBe(true);
+		expect(message.format).toBe("markdown");
 		// Delivery keeps per-target structure instead of "sent · Agent A" text.
 		const delivery = sectionBody(d, "delivery") as ToolStructuredDetail;
 		expect(delivery.entries).toEqual([
 			{ title: "Agent A", badges: [{ label: "sent", color: "green" }] },
 		]);
 		expect((sectionBody(d, "result") as ToolCappedDetail).text).toBe("delivered");
-		expect(metaBadgeLabels(d)).toEqual(["→ Agent A", "async"]);
+		expect(metaBadgeLabels(d)).toEqual(["→ Agent A", "Do not wait for reply"]);
 	});
 	it("marks a failed delivery and carries its error", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Send",
 			category: "send",
 			inputJson: { message: "hi" },
@@ -707,13 +846,14 @@ describe("classifyToolDetail — send", () => {
 	});
 	it("labels the output `reply` in await mode and marks the badges", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Send",
 			category: "send",
 			inputJson: { message: "hi", await: true, doInterrupt: true },
 			outputJson: "pong",
 		});
 		expect(hasSection(d, "reply")).toBe(true);
-		expect(metaBadgeLabels(d)).toContain("await");
+		expect(metaBadgeLabels(d)).toContain("Wait for reply");
 		expect(metaBadgeLabels(d)).toContain("interrupt");
 	});
 });
@@ -721,18 +861,23 @@ describe("classifyToolDetail — send", () => {
 describe("classifyToolDetail — ask", () => {
 	/** Classify an ask payload, typed as the ask replay it must produce. */
 	function ask(inputJson: unknown, labels?: Record<string, string>): ToolAskDetail {
-		return classifyToolDetail({
-			toolName: "AskUserQuestion",
-			category: "ask",
-			status: "success",
-			inputJson,
-			...(labels ? { labels } : {}),
-		}) as ToolAskDetail;
+		return bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "AskUserQuestion",
+				category: "ask",
+				status: "success",
+				inputJson,
+				...(labels ? { labels } : {}),
+			}),
+			"ask",
+		);
 	}
 
 	it("suppresses the summary only when a LIVE permission form is mounted", () => {
 		expect(
 			classifyToolDetail({
+				previewId: "classifier-fixture",
 				toolName: "AskUserQuestion",
 				category: "ask",
 				status: "pending",
@@ -744,18 +889,27 @@ describe("classifyToolDetail — ask", () => {
 	it("still renders a running question when no form is mounted", () => {
 		// Previously `running` alone returned null, so an in-flight question showed
 		// an empty card whenever the interactive banner lived elsewhere.
-		const d = classifyToolDetail({
-			toolName: "AskUserQuestion",
-			category: "ask",
-			status: "running",
-			inputJson: { questions: [{ header: "Q" }] },
-		}) as ToolAskDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "AskUserQuestion",
+				category: "ask",
+				status: "running",
+				inputJson: { questions: [{ header: "Q" }] },
+			}),
+			"ask",
+		);
 		expect(d.kind).toBe("ask");
 		expect(d.questions[0]?.header).toBe("Q");
 	});
 	it("returns null when there are no questions", () => {
 		expect(
-			classifyToolDetail({ toolName: "AskUserQuestion", category: "ask", inputJson: {} }),
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "AskUserQuestion",
+				category: "ask",
+				inputJson: {},
+			}),
 		).toBeNull();
 	});
 	it("carries each option's DESCRIPTION alongside its label", () => {
@@ -872,6 +1026,7 @@ describe("classifyToolDetail — ask", () => {
 		// withErrorSection composes `[ask, error]` — the shape the render layer must
 		// route explicitly (a bare fallthrough loses the option glyphs).
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "AskUserQuestion",
 			category: "ask",
 			status: "fail",
@@ -887,43 +1042,64 @@ describe("classifyToolDetail — ask", () => {
 describe("classifyToolDetail — plan", () => {
 	it("returns null when no plan text", () => {
 		expect(
-			classifyToolDetail({ toolName: "ExitPlanMode", category: "plan", inputJson: {} }),
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "ExitPlanMode",
+				category: "plan",
+				inputJson: {},
+			}),
 		).toBeNull();
 	});
 	it("maps plan text to a plan cap", () => {
-		const d = classifyToolDetail({
-			toolName: "ExitPlanMode",
-			category: "plan",
-			inputJson: { plan: "step 1\nstep 2" },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "ExitPlanMode",
+				category: "plan",
+				inputJson: { plan: "step 1\nstep 2" },
+			}),
+			"capped",
+		);
 		expect(d.cap).toBe("plan");
 		expect(d.contentLines).toBe(2);
 	});
 	it("marks the body as markdown (parity with the chunked ContentViewer)", () => {
-		const d = classifyToolDetail({
-			toolName: "ExitPlanMode",
-			category: "plan",
-			inputJson: { plan: "# Title\n\n- a\n- b" },
-		}) as ToolCappedDetail;
-		expect(d.markdown).toBe(true);
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "ExitPlanMode",
+				category: "plan",
+				inputJson: { plan: "# Title\n\n- a\n- b" },
+			}),
+			"capped",
+		);
+		expect(d.format).toBe("markdown");
 		expect(d.text).toBe("# Title\n\n- a\n- b");
 	});
 	it("passes through the RAW _planFile path, never a localized string", () => {
-		const d = classifyToolDetail({
-			toolName: "ExitPlanMode",
-			category: "plan",
-			inputJson: { plan: "body", _planFile: ".narrafork/plan-abc123.md" },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "ExitPlanMode",
+				category: "plan",
+				inputJson: { plan: "body", _planFile: ".narrafork/plan-abc123.md" },
+			}),
+			"capped",
+		);
 		expect(d.sourcePath).toBe(".narrafork/plan-abc123.md");
 		// The render layer owns the "Plan from …" wording (shared/ has no i18n).
 		expect(d.sourcePath).not.toContain("Plan from");
 	});
 	it("omits sourcePath for an inline plan", () => {
-		const d = classifyToolDetail({
-			toolName: "ExitPlanMode",
-			category: "plan",
-			inputJson: { plan: "body" },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "ExitPlanMode",
+				category: "plan",
+				inputJson: { plan: "body" },
+			}),
+			"capped",
+		);
 		expect(d.sourcePath).toBeUndefined();
 	});
 
@@ -938,6 +1114,7 @@ describe("classifyToolDetail — plan", () => {
 			"Re-read that file with the Read tool if you need the plan details.";
 		expect(
 			classifyToolDetail({
+				previewId: "classifier-fixture",
 				toolName: "ExitPlanMode",
 				category: "plan",
 				inputJson: {
@@ -952,6 +1129,7 @@ describe("classifyToolDetail — plan", () => {
 describe("classifyToolDetail — pipeline", () => {
 	it("keeps rule / captured / output as separate sections", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ExtractPipeline",
 			category: "pipeline",
 			inputJson: { rule: "grab logs", aliases: ["a1"], format: "json" },
@@ -968,6 +1146,7 @@ describe("classifyToolDetail — pipeline", () => {
 	});
 	it("shows the char caps for a start stage", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "StartPipeline",
 			category: "pipeline",
 			inputJson: { maxPreviewChars: 500, maxChars: 9000 },
@@ -976,6 +1155,7 @@ describe("classifyToolDetail — pipeline", () => {
 	});
 	it("returns just the stage badge when nothing parseable", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "StartPipeline",
 			category: "pipeline",
 			inputJson: {},
@@ -987,6 +1167,7 @@ describe("classifyToolDetail — pipeline", () => {
 describe("classifyToolDetail — terminal", () => {
 	it("maps write action to a labelled bash-cmd section", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Terminal",
 			category: "terminal",
 			inputJson: { action: "write", input: "ls", terminalId: "term-7" },
@@ -1000,6 +1181,7 @@ describe("classifyToolDetail — terminal", () => {
 	});
 	it("maps read action to a term-capped output section", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Terminal",
 			category: "terminal",
 			inputJson: { action: "read" },
@@ -1010,12 +1192,16 @@ describe("classifyToolDetail — terminal", () => {
 		expect(body.contentLines).toBe(2);
 	});
 	it("returns error on failed read with no output", () => {
-		const d = classifyToolDetail({
-			toolName: "Terminal",
-			category: "terminal",
-			status: "fail",
-			inputJson: { action: "read" },
-		}) as ToolErrorDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Terminal",
+				category: "terminal",
+				status: "fail",
+				inputJson: { action: "read" },
+			}),
+			"error",
+		);
 		expect(d.kind).toBe("error");
 	});
 });
@@ -1023,6 +1209,7 @@ describe("classifyToolDetail — terminal", () => {
 describe("classifyToolDetail — share", () => {
 	it("maps media preview to a media cap with a preview URL", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ShareFile",
 			category: "share",
 			metadata: { downloadUrl: "/d/x", preview: true, previewUrl: "/p/x", filename: "shot.png" },
@@ -1036,6 +1223,7 @@ describe("classifyToolDetail — share", () => {
 	});
 	it("forwards preview image dimensions from the share metadata", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ShareFile",
 			category: "share",
 			metadata: {
@@ -1055,6 +1243,7 @@ describe("classifyToolDetail — share", () => {
 	});
 	it("carries the download + copy-link ACTIONS and the metadata badges", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ShareFile",
 			category: "share",
 			metadata: {
@@ -1077,11 +1266,12 @@ describe("classifyToolDetail — share", () => {
 	});
 	it("falls back to generic when no downloadUrl", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ShareFile",
 			category: "share",
 			inputJson: "in",
-		}) as ToolGenericDetail;
-		expect(d.kind).toBe("generic");
+		});
+		expect(asSections(d).kind).toBe("sections");
 	});
 });
 
@@ -1091,6 +1281,7 @@ describe("classifyToolDetail — transfer", () => {
 		// element. Carrying it as text would mean the client re-parses the producer's
 		// own formatting, and the bar could neither animate nor be styled.
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "TransferFile",
 			category: "transfer",
 			status: "running",
@@ -1114,6 +1305,7 @@ describe("classifyToolDetail — transfer", () => {
 		// An upload reports no total. A ratio of 0 would paint a bar frozen at zero,
 		// which reads as a stalled transfer rather than as an unmeasurable one.
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "TransferFile",
 			category: "transfer",
 			status: "running",
@@ -1129,6 +1321,7 @@ describe("classifyToolDetail — transfer", () => {
 		// Both channels describe the same instant; showing them together would say it
 		// twice, once badly.
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "TransferFile",
 			category: "transfer",
 			status: "running",
@@ -1145,6 +1338,7 @@ describe("classifyToolDetail — transfer", () => {
 	it("falls back to the streamed TEXT when no measurement arrived", () => {
 		// An older payload, or a producer that only wired the text channel.
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "TransferFile",
 			category: "transfer",
 			status: "running",
@@ -1158,6 +1352,7 @@ describe("classifyToolDetail — transfer", () => {
 		// A finished transfer's bar would sit at 100% forever, saying nothing the
 		// summary line does not already say.
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "TransferFile",
 			category: "transfer",
 			status: "success",
@@ -1172,6 +1367,7 @@ describe("classifyToolDetail — transfer", () => {
 
 	it("uses the persisted output once the transfer finishes", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "TransferFile",
 			category: "transfer",
 			status: "success",
@@ -1184,6 +1380,7 @@ describe("classifyToolDetail — transfer", () => {
 
 	it("badges the direction, device, size and rate", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "TransferFile",
 			category: "transfer",
 			status: "success",
@@ -1212,6 +1409,7 @@ describe("classifyToolDetail — transfer", () => {
 		// An arrow is the only thing telling the reader which side is which, so it
 		// must follow the transfer, not the argument order.
 		const up = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "TransferFile",
 			category: "transfer",
 			status: "success",
@@ -1220,6 +1418,7 @@ describe("classifyToolDetail — transfer", () => {
 		});
 		expect(metaTexts(up)).toContain("/local/x  →  /remote/x");
 		const down = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "TransferFile",
 			category: "transfer",
 			status: "success",
@@ -1231,6 +1430,7 @@ describe("classifyToolDetail — transfer", () => {
 
 	it("keeps the header and reports the failure when a transfer errors with no body", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "TransferFile",
 			category: "transfer",
 			status: "fail",
@@ -1245,6 +1445,7 @@ describe("classifyToolDetail — transfer", () => {
 		// classifier returned, so emitting our own placeholder unconditionally would
 		// print the failure twice.
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "TransferFile",
 			category: "transfer",
 			status: "fail",
@@ -1259,18 +1460,22 @@ describe("classifyToolDetail — transfer", () => {
 
 describe("classifyToolDetail — recall", () => {
 	it("keeps each search hit as its own entry (role badge + title + snippet)", () => {
-		const d = classifyToolDetail({
-			toolName: "Recall",
-			category: "recall",
-			metadata: {
-				action: "search",
-				queries: ["find me"],
-				results: [
-					{ id: "1", role: "user", narratorTitle: "Chat A", snippet: "hello" },
-					{ id: "2", role: "assistant", snippet: "world" },
-				],
-			},
-		}) as ToolStructuredDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Recall",
+				category: "recall",
+				metadata: {
+					action: "search",
+					queries: ["find me"],
+					results: [
+						{ id: "1", role: "user", narratorTitle: "Chat A", snippet: "hello" },
+						{ id: "2", role: "assistant", snippet: "world" },
+					],
+				},
+			}),
+			"structured",
+		);
 		expect(d.kind).toBe("structured");
 		expect(d.badgeRows).toBe(1);
 		// Flattening these into body lines lost the role, title and id structure.
@@ -1286,16 +1491,20 @@ describe("classifyToolDetail — recall", () => {
 		expect(d.badges).toEqual([{ label: "find me", color: "cyan" }]);
 	});
 	it("keeps seq + model for a read_conversation recall", () => {
-		const d = classifyToolDetail({
-			toolName: "Recall",
-			category: "recall",
-			metadata: {
-				action: "read_conversation",
-				narratorTitle: "Chat A",
-				model: "opus",
-				messages: [{ role: "user", seq: 4, text: "hi" }],
-			},
-		}) as ToolStructuredDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Recall",
+				category: "recall",
+				metadata: {
+					action: "read_conversation",
+					narratorTitle: "Chat A",
+					model: "opus",
+					messages: [{ role: "user", seq: 4, text: "hi" }],
+				},
+			}),
+			"structured",
+		);
 		expect(d.badges).toEqual([
 			{ label: "Chat A", color: "gray" },
 			{ label: "opus", color: "gray" },
@@ -1304,20 +1513,25 @@ describe("classifyToolDetail — recall", () => {
 		expect(d.entries?.[0]?.snippet).toBe("hi");
 	});
 	it("produces a no-results body when empty", () => {
-		const d = classifyToolDetail({
-			toolName: "Recall",
-			category: "recall",
-			metadata: { action: "search", results: [] },
-		}) as ToolStructuredDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Recall",
+				category: "recall",
+				metadata: { action: "search", results: [] },
+			}),
+			"structured",
+		);
 		expect(d.bodyLines).toEqual(["No results"]);
 	});
 	it("falls back to generic without recall metadata", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Recall",
 			category: "recall",
 			inputJson: "in",
-		}) as ToolGenericDetail;
-		expect(d.kind).toBe("generic");
+		});
+		expect(asSections(d).kind).toBe("sections");
 	});
 });
 
@@ -1325,6 +1539,7 @@ describe("classifyToolDetail — skill", () => {
 	it("maps parsed skill content to a MARKDOWN skill cap plus a name badge", () => {
 		const output = `<skill_content name="demo">\n\nHello\nWorld\nBase directory for this skill: /x`;
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Skill",
 			category: "skill",
 			outputJson: output,
@@ -1334,22 +1549,24 @@ describe("classifyToolDetail — skill", () => {
 		)?.body as ToolCappedDetail;
 		expect(body.contentLines).toBeGreaterThanOrEqual(3);
 		// Skill bodies are markdown documents; monospace was a visible downgrade.
-		expect(body.markdown).toBe(true);
+		expect(body.format).toBe("markdown");
 		expect(metaBadgeLabels(d)).toEqual(["demo"]);
 	});
 	it("falls back to generic without skill_content", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Skill",
 			category: "skill",
 			outputJson: "no marker",
-		}) as ToolGenericDetail;
-		expect(d.kind).toBe("generic");
+		});
+		expect(asSections(d).kind).toBe("sections");
 	});
 });
 
 describe("classifyToolDetail — browser", () => {
 	it("maps screenshot action to a media cap under an action/url header", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Browser",
 			category: "browser",
 			inputJson: { action: "screenshot", url: "https://x.dev" },
@@ -1364,6 +1581,7 @@ describe("classifyToolDetail — browser", () => {
 	});
 	it("forwards screenshot dimensions from the browser metadata", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Browser",
 			category: "browser",
 			inputJson: { action: "screenshot", url: "https://x.dev" },
@@ -1376,28 +1594,36 @@ describe("classifyToolDetail — browser", () => {
 		expect(media.media?.height).toBe(810);
 	});
 	it("returns error on failed browser action with no output", () => {
-		const d = classifyToolDetail({
-			toolName: "Browser",
-			category: "browser",
-			status: "fail",
-			inputJson: { action: "click" },
-		}) as ToolErrorDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Browser",
+				category: "browser",
+				status: "fail",
+				inputJson: { action: "click" },
+			}),
+			"error",
+		);
 		expect(d.kind).toBe("error");
 	});
 });
 
 describe("classifyToolDetail — knowledge", () => {
 	it("maps KnowledgeSearch results to linked entries with tag badges", () => {
-		const d = classifyToolDetail({
-			toolName: "KnowledgeSearch",
-			category: "knowledge",
-			metadata: {
-				results: [
-					{ id: "e1", title: "Entry One", tags: ["a", "b"], snippet: "snip one" },
-					{ id: "e2", title: "Entry Two", snippet: "snip two" },
-				],
-			},
-		}) as ToolStructuredDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "KnowledgeSearch",
+				category: "knowledge",
+				metadata: {
+					results: [
+						{ id: "e1", title: "Entry One", tags: ["a", "b"], snippet: "snip one" },
+						{ id: "e2", title: "Entry Two", snippet: "snip two" },
+					],
+				},
+			}),
+			"structured",
+		);
 		expect(d.kind).toBe("structured");
 		expect(d.entries?.[0]?.title).toBe("Entry One");
 		// The entry link was missing entirely; tags were flattened into text.
@@ -1411,6 +1637,7 @@ describe("classifyToolDetail — knowledge", () => {
 	});
 	it("maps KnowledgeRead to a MARKDOWN knowledge cap with a linked header", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "KnowledgeRead",
 			category: "knowledge",
 			outputJson: "doc\nbody",
@@ -1420,7 +1647,7 @@ describe("classifyToolDetail — knowledge", () => {
 			(s) => s.body.kind === "capped" && s.body.cap === "knowledge",
 		)?.body as ToolCappedDetail;
 		expect(body.contentLines).toBe(4); // 2 + 2
-		expect(body.markdown).toBe(true);
+		expect(body.format).toBe("markdown");
 		const rows = metaRowsOf(d).rows;
 		expect(rows[0]?.text).toBe("Doc");
 		expect(rows[0]?.href).toBe("/knowledge/e9");
@@ -1431,6 +1658,7 @@ describe("classifyToolDetail — knowledge", () => {
 describe("classifyToolDetail — taskOutput", () => {
 	it("surfaces the task badges and the retrieval error", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "TaskOutput",
 			category: "taskOutput",
 			inputJson: { task_id: "t-3", task_type: "explore", timeout: 5000 },
@@ -1451,6 +1679,7 @@ describe("classifyToolDetail — plan deny feedback", () => {
 
 	it("keeps the denial feedback above the plan body", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ExitPlanMode",
 			category: "plan",
 			inputJson: { plan: "the plan" },
@@ -1466,6 +1695,7 @@ describe("classifyToolDetail — plan deny feedback", () => {
 	// section was produced rather than because the one produced is unlabelled.
 	it("leaves the feedback body unlabelled", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ExitPlanMode",
 			category: "plan",
 			status: "fail",
@@ -1482,6 +1712,7 @@ describe("classifyToolDetail — plan deny feedback", () => {
 	// collapsed plan — the user's own words were dropped with no error anywhere.
 	it("reads the denial feedback from the top-level denyMessage field", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ExitPlanMode",
 			category: "plan",
 			status: "fail",
@@ -1496,6 +1727,7 @@ describe("classifyToolDetail — plan deny feedback", () => {
 	// the chunked PlanDetail paints it yellow, so the tone has to travel.
 	it("marks the feedback as a warning, not an error", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ExitPlanMode",
 			category: "plan",
 			status: "fail",
@@ -1509,14 +1741,15 @@ describe("classifyToolDetail — plan deny feedback", () => {
 	// would attribute a system string to the user, so it counts as "no feedback".
 	it("drops the system placeholder written when no feedback was typed", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ExitPlanMode",
 			category: "plan",
 			status: "fail",
 			inputJson: { plan: "the plan" },
 			denyMessage: "Permission denied by user",
 		});
-		expect(d?.kind).toBe("capped");
-		expect((d as ToolCappedDetail).text).toBe("the plan");
+		expect(bodyOfKind(d, "capped").kind).toBe("capped");
+		expect(bodyOfKind(d, "capped").text).toBe("the plan");
 	});
 
 	// `failReprocessedPendingPermission` DOES write this into the column (unlike the
@@ -1524,13 +1757,14 @@ describe("classifyToolDetail — plan deny feedback", () => {
 	// so it is matched by prefix.
 	it("drops a reprocessing-failure message, whatever detail it carries", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ExitPlanMode",
 			category: "plan",
 			status: "fail",
 			inputJson: { plan: "the plan" },
 			denyMessage: "Permission reprocessing failed: target narrator is frozen",
 		});
-		expect(d?.kind).toBe("capped");
+		expect(bodyOfKind(d, "capped").kind).toBe("capped");
 	});
 
 	// The column is NOT denial-only: narrator-permission stores `denyMessage ||
@@ -1541,14 +1775,15 @@ describe("classifyToolDetail — plan deny feedback", () => {
 	// card contradicts it.
 	it("ignores the column on an APPROVED plan, where it holds approval feedback", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ExitPlanMode",
 			category: "plan",
 			status: "success",
 			inputJson: { plan: "the plan" },
 			denyMessage: "批准。方案分析透彻",
 		});
-		expect(d?.kind).toBe("capped");
-		expect((d as ToolCappedDetail).text).toBe("the plan");
+		expect(bodyOfKind(d, "capped").kind).toBe("capped");
+		expect(bodyOfKind(d, "capped").text).toBe("the plan");
 	});
 
 	// A metadata copy (older rows / fixtures) still wins, so nothing regresses for
@@ -1556,6 +1791,7 @@ describe("classifyToolDetail — plan deny feedback", () => {
 	// names a denial, so it is honoured without a status gate.
 	it("prefers a metadata copy over the top-level field", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ExitPlanMode",
 			category: "plan",
 			status: "fail",
@@ -1574,6 +1810,7 @@ describe("classifyToolDetail — plan deny feedback", () => {
 	// left resting on another field being non-null.
 	it("shows the feedback exactly once on a realistic denied call", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "ExitPlanMode",
 			category: "plan",
 			status: "fail",
@@ -1607,6 +1844,7 @@ function leaf(preview: string, fullLength = 40_000) {
 describe("classifyToolDetail — textTruncated is per body", () => {
 	it("flags a truncated bash OUTPUT without touching the command box", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Bash",
 			category: "bash",
 			inputJson: { command: "echo hi" },
@@ -1618,6 +1856,7 @@ describe("classifyToolDetail — textTruncated is per body", () => {
 
 	it("flags a truncated bash COMMAND without touching the output box", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Bash",
 			category: "bash",
 			inputJson: { command: leaf("echo hi") },
@@ -1629,6 +1868,7 @@ describe("classifyToolDetail — textTruncated is per body", () => {
 
 	it("flags a truncated STREAMING bash body", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Bash",
 			category: "bash",
 			inputJson: { command: "sleep 1" },
@@ -1642,6 +1882,7 @@ describe("classifyToolDetail — textTruncated is per body", () => {
 	it("flags a truncated skill body (carved from the OUTPUT, not the input)", () => {
 		const output = `<skill_content name="demo">\n\nHello\nWorld\nBase directory for this skill: /x`;
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Skill",
 			category: "skill",
 			inputJson: { name: "demo" },
@@ -1655,6 +1896,7 @@ describe("classifyToolDetail — textTruncated is per body", () => {
 
 	it("flags a truncated KnowledgeRead body", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "KnowledgeRead",
 			category: "knowledge",
 			outputJson: { _text: leaf("doc\nbody"), _metadata: { entryId: "e9" } },
@@ -1668,6 +1910,7 @@ describe("classifyToolDetail — textTruncated is per body", () => {
 
 	it("leaves the flag absent for complete payloads", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Bash",
 			category: "bash",
 			inputJson: { command: "echo hi" },
@@ -1681,6 +1924,7 @@ describe("classifyToolDetail — textTruncated is per body", () => {
 describe("classifyToolDetail — trailing error section", () => {
 	it("appends the tool error when nothing else displays it", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Bash",
 			category: "bash",
 			status: "fail",
@@ -1691,6 +1935,7 @@ describe("classifyToolDetail — trailing error section", () => {
 	});
 	it("omits it once a real output body exists (chunked parity)", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Bash",
 			category: "bash",
 			status: "fail",
@@ -1705,6 +1950,7 @@ describe("classifyToolDetail — trailing error section", () => {
 describe("classifyToolDetail — streaming input", () => {
 	it("previews the streamed written content with its path", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Write",
 			category: "file",
 			isStreaming: true,
@@ -1721,6 +1967,7 @@ describe("classifyToolDetail — streaming input", () => {
 	});
 	it("previews a provisional Edit diff while streaming", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Edit",
 			category: "file",
 			isStreaming: true,
@@ -1732,17 +1979,18 @@ describe("classifyToolDetail — streaming input", () => {
 		});
 		const body = cappedSectionBody(d, "diff");
 		// Unified-diff markers are SINGLE characters (chunked parity), not "- ".
-		expect(body.text).toBe("-a\n+b");
-		expect(body.diffLines?.map((line) => [line.type, line.content])).toEqual([
+		expect(JSON.parse(body.text!)).toEqual({ old_string: "a", new_string: "b" });
+		expect(diffRows(body).map((line) => [line.type, line.content])).toEqual([
 			["removed", "a"],
 			["added", "b"],
 		]);
 		// new_string is arriving → the replacing phase, so positions are real.
-		expect(body.diffLineNumberPrefix).toBeUndefined();
-		expect(body.diffLineNoWidth).toBe(2);
+		expect(body.diffDocument?.startLine).toBeUndefined();
+		expect(diffDocumentLineNoWidth(body.diffDocument!)).toBe(2);
 	});
 	it("shows provisional line numbers while a streaming Edit is still matching", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Edit",
 			category: "file",
 			isStreaming: true,
@@ -1755,54 +2003,67 @@ describe("classifyToolDetail — streaming input", () => {
 		const body = cappedSectionBody(d, "diff");
 		// Nothing to replace yet: the preview is all context, and the numbers are
 		// flagged provisional with the `xx` prefix (chunked EditDiffBlock parity).
-		expect(body.diffLines?.every((line) => line.type === "context")).toBe(true);
-		expect(body.diffLineNumberPrefix).toBe("xx");
+		expect(diffRows(body).every((line) => line.type === "context")).toBe(true);
+		expect(body.diffDocument?.oldSource.range.originKnown).toBe(false);
 	});
 	it("previews the streamed shell command", () => {
-		const d = classifyToolDetail({
-			toolName: "Bash",
-			category: "bash",
-			isStreaming: true,
-			inputJson: { _streamingFieldName: "command", _streamingFieldValue: "ls -la" },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Bash",
+				category: "bash",
+				isStreaming: true,
+				inputJson: { _streamingFieldName: "command", _streamingFieldValue: "ls -la" },
+			}),
+			"capped",
+		);
 		expect(d.cap).toBe("streaming-bash");
 		expect(d.text).toBe("$ ls -la");
 	});
 	it("previews a streamed plan as markdown", () => {
-		const d = classifyToolDetail({
-			toolName: "ExitPlanMode",
-			category: "plan",
-			isStreaming: true,
-			inputJson: { _streamingFieldName: "plan", _streamingFieldValue: "# Step" },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "ExitPlanMode",
+				category: "plan",
+				isStreaming: true,
+				inputJson: { _streamingFieldName: "plan", _streamingFieldValue: "# Step" },
+			}),
+			"capped",
+		);
 		expect(d.cap).toBe("plan");
-		expect(d.markdown).toBe(true);
+		expect(d.format).toBe("markdown");
 	});
 	it("renders nothing extra for read/search (header already says it)", () => {
 		expect(
 			classifyToolDetail({
+				previewId: "classifier-fixture",
 				toolName: "Read",
 				category: "read",
 				isStreaming: true,
 				inputJson: { _streamingFieldName: "file_path", _streamingFieldValue: "/a" },
 			})?.kind,
-		).not.toBe("sections");
+		).toBe("sections");
 	});
 
 	it("previews streamed content that arrived BEFORE its file_path", () => {
 		// Write commonly streams `content` first. Gating the whole preview on the
 		// path left the card blank for the entire write, and — worse — let the
 		// classifier fall through to classifyFile (see the leak test below).
-		const d = classifyToolDetail({
-			toolName: "Write",
-			category: "file",
-			isStreaming: true,
-			inputJson: {
-				_streamingChars: 1429,
-				_streamingFieldName: "content",
-				_streamingFieldValue: "# Heading\nbody",
-			},
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Write",
+				category: "file",
+				isStreaming: true,
+				inputJson: {
+					_streamingChars: 1429,
+					_streamingFieldName: "content",
+					_streamingFieldValue: "# Heading\nbody",
+				},
+			}),
+			"capped",
+		);
 		expect(d.cap).toBe("streaming");
 		expect(d.text).toBe("# Heading\nbody");
 	});
@@ -1813,6 +2074,7 @@ describe("classifyToolDetail — streaming input", () => {
 		// the field in flight. Without the fallback the path row and the syntax
 		// language were both lost.
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Write",
 			category: "file",
 			isStreaming: true,
@@ -1847,7 +2109,13 @@ describe("classifyToolDetail — streaming input", () => {
 				["KnowledgeSearch", "knowledge"],
 				["SomeMcpTool", "generic"],
 			] as const) {
-				const d = classifyToolDetail({ toolName, category, isStreaming: true, inputJson });
+				const d = classifyToolDetail({
+					previewId: "classifier-fixture",
+					toolName,
+					category,
+					isStreaming: true,
+					inputJson,
+				});
 				expect(JSON.stringify(d) ?? "").not.toContain("_streaming");
 			}
 		}
@@ -1856,42 +2124,63 @@ describe("classifyToolDetail — streaming input", () => {
 
 describe("classifyToolDetail — render-only body text passthrough (Approach B)", () => {
 	it("read/code carries the real output text", () => {
-		const d = classifyToolDetail({
-			toolName: "Read",
-			category: "read",
-			outputJson: "line1\nline2",
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Read",
+				category: "read",
+				outputJson: "line1\nline2",
+			}),
+			"capped",
+		);
 		expect(d.text).toBe("line1\nline2");
 	});
 	it("Write/file carries the written content", () => {
-		const d = classifyToolDetail({
-			toolName: "Write",
-			category: "file",
-			inputJson: { content: "const x = 1;\nconst y = 2;" },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Write",
+				category: "file",
+				inputJson: { content: "const x = 1;\nconst y = 2;" },
+			}),
+			"capped",
+		);
 		expect(d.text).toBe("const x = 1;\nconst y = 2;");
 	});
 	it("Edit/diff composes a unified +/- diff body as the plain fallback", () => {
-		const d = classifyToolDetail({
-			toolName: "Edit",
-			category: "file",
-			inputJson: { old_string: "a", new_string: "b" },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Edit",
+				category: "file",
+				inputJson: { old_string: "a", new_string: "b" },
+			}),
+			"capped",
+		);
 		// Single-character markers, and the structured rows travel alongside.
-		expect(d.text).toBe("-a\n+b");
-		expect(d.diffLines).toHaveLength(2);
+		expect(JSON.parse(d.text!)).toEqual({ old_string: "a", new_string: "b" });
+		expect(diffRows(d)).toHaveLength(2);
 	});
 	it("keeps unchanged lines as context in the plain fallback text too", () => {
-		const d = classifyToolDetail({
-			toolName: "Edit",
-			category: "file",
-			inputJson: { old_string: "keep\ndrop", new_string: "keep\nadd" },
-		}) as ToolCappedDetail;
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "Edit",
+				category: "file",
+				inputJson: { old_string: "keep\ndrop", new_string: "keep\nadd" },
+			}),
+			"capped",
+		);
 		// A leading space marks context — the unchanged line is not duplicated.
-		expect(d.text).toBe(" keep\n-drop\n+add");
+		expect(diffRows(d).map((line) => [line.type, line.content])).toEqual([
+			["context", "keep"],
+			["removed", "drop"],
+			["added", "add"],
+		]);
 	});
 	it("bash carries the command and output in their own sections", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Bash",
 			category: "bash",
 			inputJson: { command: "ls -la" },
@@ -1902,16 +2191,21 @@ describe("classifyToolDetail — render-only body text passthrough (Approach B)"
 	});
 	it("generic carries input + output text", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Agent",
 			category: "agent",
 			inputJson: "the prompt",
 			outputJson: "the result",
-		}) as ToolGenericDetail;
-		expect(d.inputText).toBe("the prompt");
-		expect(d.outputText).toBe("the result");
+		});
+		expect(bodyOfKind(d, "capped").text).toBe("the prompt");
+		expect(
+			(asSections(d).sections.find((part) => part.key === "output.main")!.body as ToolCappedDetail)
+				.text,
+		).toBe("the result");
 	});
 	it("media caps carry no text (contentPx only) but do carry a media ref", () => {
 		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
 			toolName: "Read",
 			category: "read",
 			metadata: { isImage: true, filePath: "/tmp/pic.png", sizeKB: 12, imageFormat: "png" },
@@ -1942,6 +2236,243 @@ const truncatedLeaf = (preview: string) => ({
 	_truncated: true as const,
 	preview,
 	fullLength: 99_999,
+});
+
+describe("canonical sections and source lifecycle", () => {
+	const body = (detail: ToolDetailData | null, source: string) => {
+		const found = detail?.sections.find(
+			(part) => part.body.kind === "capped" && part.body.source === source,
+		)?.body;
+		if (!found || found.kind !== "capped") throw new Error(`Missing ${source}`);
+		return found;
+	};
+
+	it.each([
+		["Bash", "bash"],
+		["Grep", "search"],
+		["WebFetch", "webFetch"],
+		["TaskOutput", "taskOutput"],
+		["Await", "await"],
+		["Send", "send"],
+		["StartPipeline", "pipeline"],
+		["Terminal", "terminal"],
+		["Browser", "browser"],
+		["KnowledgeRead", "knowledge"],
+	])("%s keeps an empty output and its own truncation flag", (toolName, category) => {
+		for (const truncated of [false, true]) {
+			const detail = classifyToolDetail({
+				toolUseId: "empty-output",
+				toolName,
+				category,
+				status: "success",
+				inputJson: {
+					command: "",
+					message: "",
+					rule: "",
+					action: "read",
+					type: "bash",
+					mode: "readability",
+				},
+				outputJson: truncated ? { _truncated: true, preview: "", fullLength: 1000 } : "",
+			});
+			const output = body(detail, "output.main");
+			expect(output.text).toBe("");
+			expect(output.textTruncated === true).toBe(truncated);
+			expect(output.id).toBe(toolBodyId("empty-output", "output.main"));
+			expect(output.live).toBe(false);
+		}
+	});
+
+	it("Send without a message omits that section without evaluating an absent string", () => {
+		const detail = classifyToolDetail({
+			toolUseId: "send-no-input",
+			toolName: "Send",
+			category: "send",
+			outputJson: "reply",
+		});
+		expect(detail?.sections.some((section) => section.key === "input.message")).toBe(false);
+		expect(body(detail, "output.main").text).toBe("reply");
+	});
+
+	it("resolves current > settled > formal by presence, including empty strings", () => {
+		const input = {
+			content: "formal",
+			new_string: "formal-new",
+			file_path: "/formal.ts",
+			_streamingFields: { content: "settled", new_string: "settled-new" },
+			_streamingFieldName: "new_string",
+			_streamingFieldValue: "",
+		};
+		const fields = toolInputFieldView(input);
+		expect(fields).toEqual({ content: "settled", new_string: "", file_path: "/formal.ts" });
+		expect(input.new_string).toBe("formal-new");
+	});
+
+	it("keeps the same Write body through path arrival, metadata and completion", () => {
+		const source = "input.content";
+		const states = [
+			{
+				status: "running",
+				isStreaming: true,
+				inputJson: { _streamingFieldName: "content", _streamingFieldValue: "" },
+			},
+			{
+				status: "running",
+				isStreaming: true,
+				inputJson: { _streamingFieldName: "content", _streamingFieldValue: "hello" },
+			},
+			{
+				status: "running",
+				isStreaming: true,
+				inputJson: {
+					_streamingFields: { content: "hello" },
+					_streamingFieldName: "file_path",
+					_streamingFieldValue: "/late.ts",
+				},
+			},
+			{ status: "success", inputJson: { content: "hello", file_path: "/late.ts" } },
+		];
+		const bodies = states.map((state) =>
+			body(
+				classifyToolDetail({
+					toolUseId: "write-one",
+					toolName: "Write",
+					category: "file",
+					...state,
+				}),
+				source,
+			),
+		);
+		expect(new Set(bodies.map((b) => b.id))).toEqual(new Set([toolBodyId("write-one", source)]));
+		expect(bodies.map((b) => b.live)).toEqual([true, true, false, false]);
+		expect(bodies.map((b) => b.text)).toEqual(["", "hello", "hello", "hello"]);
+		expect(bodies.every((b) => b.format === "code")).toBe(true);
+	});
+
+	it("separates input and output live state and lets terminal status win", () => {
+		const common = {
+			toolUseId: "bash-one",
+			toolName: "Bash",
+			category: "bash",
+			inputJson: { command: "formal", _streamingFieldName: "command", _streamingFieldValue: "ls" },
+			metadata: { _streamingOutput: "stdout" },
+		};
+		const streaming = classifyToolDetail({ ...common, status: "running", isStreaming: true });
+		const executing = classifyToolDetail({ ...common, status: "running", isStreaming: false });
+		const done = classifyToolDetail({
+			...common,
+			status: "success",
+			isStreaming: true,
+			outputJson: "",
+		});
+		for (const [detail, inputLive, outputLive] of [
+			[streaming, true, false],
+			[executing, false, true],
+			[done, false, false],
+		] as const) {
+			expect(body(detail, "input.command").live).toBe(inputLive);
+			expect(body(detail, "output.main").live).toBe(outputLive);
+			expect(body(detail, "input.command").id).not.toBe(body(detail, "output.main").id);
+		}
+		expect(body(done, "output.main").text).toBe("");
+	});
+
+	it("Edit matching, replacing and empty replacement share input.edit", () => {
+		const context = {
+			toolUseId: "edit-one",
+			toolName: "Edit",
+			category: "file",
+			status: "running",
+			isStreaming: true,
+		};
+		const matching = body(
+			classifyToolDetail({
+				...context,
+				inputJson: { _streamingFieldName: "old_string", _streamingFieldValue: "keep\ndrop" },
+			}),
+			"input.edit",
+		);
+		const replacing = body(
+			classifyToolDetail({
+				...context,
+				inputJson: {
+					new_string: "stale",
+					_streamingFields: { old_string: "keep\ndrop", new_string: "settled-stale" },
+					_streamingFieldName: "new_string",
+					_streamingFieldValue: "",
+				},
+			}),
+			"input.edit",
+		);
+		const done = body(
+			classifyToolDetail({
+				...context,
+				status: "success",
+				isStreaming: false,
+				inputJson: { old_string: "keep\ndrop", new_string: "", file_path: "/late.ts" },
+			}),
+			"input.edit",
+		);
+		expect([matching.id, replacing.id, done.id]).toEqual(
+			Array(3).fill(toolBodyId("edit-one", "input.edit")),
+		);
+		expect(diffRows(matching).every((row) => row.type === "context")).toBe(true);
+		expect(diffRows(replacing).every((row) => row.type === "removed")).toBe(true);
+		expect(replacing.diffDocument?.newSource.text).toBe("");
+		expect(replacing.followTarget.kind).toBe("diff-row");
+		expect(replacing.diffDocument?.focus?.side).toBe("old");
+		expect(done.live).toBe(false);
+	});
+
+	it("forwards both source ranges without selecting a 500-row viewport", () => {
+		const text = Array.from({ length: 1600 }, (_, i) => `r${i}`).join("\n");
+		const range = createSourceText(text, { epoch: "same-epoch", originKnown: false }).range;
+		const model = body(
+			classifyToolDetail({
+				toolUseId: "long-edit",
+				toolName: "Edit",
+				category: "file",
+				status: "running",
+				isStreaming: true,
+				inputJson: {
+					_streamingFields: { old_string: text },
+					_streamingFieldName: "new_string",
+					_streamingFieldValue: `${text}!`,
+					_streamingFieldRanges: {
+						old_string: range,
+						new_string: {
+							...range,
+							endOffset: range.endOffset + 1,
+							endColumn: range.endColumn + 1,
+						},
+					},
+				},
+			}),
+			"input.edit",
+		);
+		expect(model.diffDocument?.totalRows).toBeGreaterThan(500);
+		expect(model.diffDocument?.oldSource.range).toEqual(range);
+		expect(model.diffDocument?.focus?.line).toBe(1599);
+		expect(model.diffDocument?.focus?.epoch).toBe("same-epoch");
+		expect("diffLines" in model).toBe(false);
+		expect("lines" in model.diffDocument!).toBe(false);
+	});
+
+	it("generic has ordinary sections and source identities stay distinct across calls", () => {
+		const classify = (toolUseId: string) =>
+			classifyToolDetail({
+				toolUseId,
+				toolName: "Unknown",
+				category: "generic",
+				inputJson: { content: "same" },
+				outputJson: "same",
+			});
+		const first = asSections(classify("one"));
+		const second = asSections(classify("two"));
+		expect(first.sections.map((s) => s.key)).toEqual(["input.arguments", "output.main"]);
+		expect(first.sections.every((s) => s.body.kind === "capped")).toBe(true);
+		expect(body(first, "output.main").id).not.toBe(body(second, "output.main").id);
+	});
 });
 
 describe("resolveFileDiffStats — tool metadata (authoritative)", () => {

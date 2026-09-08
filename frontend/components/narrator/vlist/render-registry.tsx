@@ -13,9 +13,12 @@
  * PretextMessageList — never statically from outside vlist/ (isolation guard).
  */
 
+import { normalizeFileReferenceContext } from "@shared/file-reference-context";
+import { FileReferenceScopeProvider } from "../FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
 import type { VListElementKind } from "./registry";
 import { RenderAskInPassing } from "./render/RenderAskInPassing";
+import { RenderCommunicationBubble } from "./render/RenderCommunicationBubble";
 import { RenderInjectionBubble } from "./render/RenderInjectionBubble";
 import { RenderMarkdown } from "./render/RenderMarkdown";
 import { RenderMedia } from "./render/RenderMedia";
@@ -71,6 +74,9 @@ export function resolveRenderExtra(spec: {
 	if (spec.opts?.onToggleRow) extra.onToggleRow = spec.opts.onToggleRow;
 	if (spec.opts?.onToggleTranslation) extra.onToggleTranslation = spec.opts.onToggleTranslation;
 	switch (spec.kind) {
+		case "markdown":
+			extra.fileReferenceContext = normalizeFileReferenceContext(spec.opts?.fileReferenceContext);
+			break;
 		case "message-bubble":
 			if ("role" in data) extra.role = data.role;
 			// User bubbles carry a header (avatar + name + time). Forward the raw
@@ -86,6 +92,10 @@ export function resolveRenderExtra(spec: {
 			// Slash-command bubbles fold their expansion behind a toggle; mark them so
 			// the integration layer wires onToggle (plain bubbles get no toggle).
 			if ("commandText" in data && data.commandText) extra.commandText = data.commandText;
+			break;
+		case "communication-bubble":
+			// Header metadata stays fresh even when geometry is served from the measure cache.
+			extra.data = data;
 			break;
 		case "injection-bubble":
 			// Producer tag drives the accent rail; the speaker header is built by the
@@ -241,18 +251,22 @@ export function renderElement(
 	switch (kind) {
 		case "markdown":
 			return (
-				<RenderMarkdown
-					measured={m}
-					// Per-body source toggle. Without this forward the row's action bar
-					// flipped shell state that nothing read, so "view source" was inert on
-					// every plain markdown message.
-					showSource={extra.showSource as boolean | undefined}
-					sourceText={extra.sourceText as string | undefined}
-					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
-					animateStreaming={extra.animateStreaming as boolean | undefined}
-					animKeyBase={extra.animKeyBase as string | undefined}
-					animScope={extra.animScope as string | undefined}
-				/>
+				<FileReferenceScopeProvider
+					value={{ context: normalizeFileReferenceContext(extra.fileReferenceContext) }}
+				>
+					<RenderMarkdown
+						measured={m}
+						// Per-body source toggle. Without this forward the row's action bar
+						// flipped shell state that nothing read, so "view source" was inert on
+						// every plain markdown message.
+						showSource={extra.showSource as boolean | undefined}
+						sourceText={extra.sourceText as string | undefined}
+						onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
+						animateStreaming={extra.animateStreaming as boolean | undefined}
+						animKeyBase={extra.animKeyBase as string | undefined}
+						animScope={extra.animScope as string | undefined}
+					/>
+				</FileReferenceScopeProvider>
 			);
 		case "message-bubble":
 			return (
@@ -267,6 +281,16 @@ export function renderElement(
 					onToggle={extra.onToggle as (() => void) | undefined}
 					onOpenAttachment={extra.onOpenAttachment as ((filePath: string) => void) | undefined}
 					openAttachmentLabel={extra.openAttachmentLabel as string | undefined}
+				/>
+			);
+		case "communication-bubble":
+			return (
+				<RenderCommunicationBubble
+					measured={m}
+					data={extra.data as never}
+					header={extra.header as React.ReactNode}
+					onOpenRecipient={extra.onOpenRecipient as ((id: string) => void) | undefined}
+					onViewFull={extra.onViewFull as (() => void) | undefined}
 				/>
 			);
 		case "injection-bubble":
@@ -462,7 +486,6 @@ export function renderElement(
 					model={extra.model as string | undefined}
 					reasoningEffort={extra.reasoningEffort as string | undefined}
 					resultPreview={extra.resultPreview as string | undefined}
-					promptText={extra.promptText as string | undefined}
 					recentCallNames={extra.recentCallNames as string[] | undefined}
 					fileChanges={extra.fileChanges as never}
 					isActive={extra.isActive as boolean | undefined}

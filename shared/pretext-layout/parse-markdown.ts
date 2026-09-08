@@ -28,6 +28,7 @@ import { prepareWithSegments } from "@chenglou/pretext";
 import type { RichInlineItem } from "@chenglou/pretext/rich-inline";
 import { measureRichInlineStats, prepareRichInline } from "@chenglou/pretext/rich-inline";
 import { marked, type Token, type Tokens } from "marked";
+import { fileLinkLineSuffix, localFileHref, parseLocalFilePath } from "../markdown-file-path";
 import type { GlyphVerticalResolver, GlyphWidthResolver, KatexRuntime } from "./katex-geometry";
 import { measureKatex } from "./katex-geometry";
 import { inlineTokensToPlainText, slugifyHeading } from "./markdown-anchor";
@@ -124,7 +125,12 @@ interface InlinePiece {
 	math?: InlineMathFragment;
 }
 
-const EMPTY_MARKS: MarkState = { bold: false, italic: false, strike: false, href: null };
+const EMPTY_MARKS: MarkState = {
+	bold: false,
+	italic: false,
+	strike: false,
+	href: null,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Math support
@@ -691,15 +697,8 @@ function markerClassName(list: Tokens.List, item: Tokens.ListItem): string {
 // Inline blocks
 // ─────────────────────────────────────────────────────────────────────────────
 function buildPlainText(text: string, variant: InlineVariant, ctx: ParseContext): PreparedBlock[] {
-	// A bare text run can still carry inline-math sentinels (list items and
-	// token-less text blocks reach here), so expand them the same way.
-	if (ctx.math != null && ctx.formulas != null && text.includes(MATH_SENTINEL_OPEN)) {
-		const lines = collectInlineLines([{ type: "text", raw: text, text }] as Token[], variant, ctx);
-		return buildPreparedInline(lines, variant, ctx);
-	}
-	const piece = textPiece(text, EMPTY_MARKS, variant);
-	if (piece === null) return [];
-	return buildPreparedInline([[piece]], variant, ctx);
+	const lines = collectInlineLines([{ type: "text", raw: text, text }] as Token[], variant, ctx);
+	return buildPreparedInline(lines, variant, ctx);
 }
 
 function buildInlineBlocks(
@@ -798,13 +797,16 @@ function collectInlineLines(
 		line.push(piece);
 	};
 
-	/**
-	 * Push a text run, expanding any inline-math sentinels it contains into
-	 * fixed-width atoms. Text without sentinels takes the plain path.
-	 */
+	// Only authored Markdown links carry hrefs. Prose cannot reliably distinguish
+	// a Chinese filename from adjacent Chinese narrative, so never scan text for paths.
+	const pushPlainText = (text: string, marks: MarkState) => {
+		push(textPiece(text, marks, variant));
+	};
+
+	/** Expand math sentinels without changing their surrounding text or link marks. */
 	const pushText = (text: string, marks: MarkState) => {
 		if (ctx.math == null || ctx.formulas == null || !text.includes(MATH_SENTINEL_OPEN)) {
-			push(textPiece(text, marks, variant));
+			pushPlainText(text, marks);
 			return;
 		}
 		MATH_SENTINEL_RE.lastIndex = 0;
@@ -813,7 +815,7 @@ function collectInlineLines(
 			const match = MATH_SENTINEL_RE.exec(text);
 			if (!match) break;
 			if (match.index > cursor) {
-				push(textPiece(text.slice(cursor, match.index), marks, variant));
+				pushPlainText(text.slice(cursor, match.index), marks);
 			}
 			const latex = ctx.formulas[Number(match[1])];
 			const piece = latex != null ? mathPiece(latex, resolveFont(variant, marks), ctx.math) : null;
@@ -821,7 +823,7 @@ function collectInlineLines(
 			push(piece ?? textPiece(latex != null ? `$${latex}$` : match[0], marks, variant));
 			cursor = match.index + match[0].length;
 		}
-		if (cursor < text.length) push(textPiece(text.slice(cursor), marks, variant));
+		if (cursor < text.length) pushPlainText(text.slice(cursor), marks);
 	};
 
 	const walk = (list: readonly Token[], marks: MarkState) => {
@@ -848,12 +850,19 @@ function collectInlineLines(
 				case "codespan":
 					push(codePiece((token as Tokens.Codespan).text, marks));
 					continue;
-				case "link":
-					walk((token as Tokens.Link).tokens ?? [], {
-						...marks,
-						href: parseHref((token as Tokens.Link).href),
-					});
+				case "link": {
+					const link = token as Tokens.Link;
+					const linkMarks = { ...marks, href: parseHref(link.href) };
+					walk(link.tokens ?? [], linkMarks);
+					// Append once to the logical link BEFORE measuring. Decorating each
+					// painted fragment would repeat the suffix and invalidate line widths.
+					const suffix = fileLinkLineSuffix(
+						linkMarks.href ?? undefined,
+						inlineTokensToPlainText(link.tokens ?? []),
+					);
+					push(textPiece(suffix, linkMarks, variant));
 					continue;
+				}
 				case "image": {
 					const img = token as Tokens.Image;
 					push(textPiece(img.text.length > 0 ? img.text : (img.href ?? "image"), marks, variant));
@@ -1488,6 +1497,12 @@ function parseHref(href: string | null | undefined): string | null {
 	// Decoding only matters when there is a reference to decode; skipping the
 	// regex passes keeps the common link on one string scan.
 	const probe = trimmed.includes("&") ? decodeCharacterReferences(trimmed) : trimmed;
+	// These are file hints, never browser-navigable schemes. Validate the full
+	// shape and carry the location/device in an inert marker before filtering.
+	if (/^(?:file:|nf-file:|[a-z]:[\\/])/i.test(probe)) {
+		const target = parseLocalFilePath(probe);
+		return target ? localFileHref(target) : null;
+	}
 	const scheme = hrefScheme(probe);
 	// No scheme: a relative path, a query or a fragment. Keep it as written so the
 	// app's own router (or the browser) resolves it.

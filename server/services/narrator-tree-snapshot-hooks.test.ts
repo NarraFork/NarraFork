@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -205,6 +205,63 @@ describe("narrator tree snapshot hooks", () => {
 		expect(secondResult.after).not.toBe(secondResult.before);
 	});
 
+	test("fresh before preserves a human edit in the same file between cached tool boundaries", async () => {
+		const repo = await createRepo("nf-hook-human-between-tools-");
+		const narratorId = await createNarrator(repo);
+		const session = makeSession(repo);
+		const path = join(repo, "shared.txt");
+		const content = (ai: number, human: number) =>
+			`ai=${ai}\ncontext 1\ncontext 2\ncontext 3\ncontext 4\ncontext 5\nhuman=${human}\n`;
+		writeFileSync(path, content(0, 0));
+
+		const first = await seedToolCall(narratorId, "Edit", 1);
+		await recordTreeSnapshotBefore(session, narratorId, first.toolUseId, ["shared.txt"]);
+		writeFileSync(path, content(1, 0));
+		const firstResult = await recordTreeSnapshotAfter(session, narratorId, first.toolUseId);
+		if (!firstResult.after) throw new Error("missing first after boundary");
+		expect(session._lastTreeHash).toBe(firstResult.after);
+
+		// An external editor does not invalidate the session's cached observation.
+		writeFileSync(path, content(1, 1));
+		const second = await seedToolCall(narratorId, "Edit", 2);
+		await recordTreeSnapshotBefore(session, narratorId, second.toolUseId, ["shared.txt"]);
+		writeFileSync(path, content(2, 1));
+		const secondResult = await recordTreeSnapshotAfter(session, narratorId, second.toolUseId);
+		expect(secondResult.before).not.toBe(firstResult.after);
+		if (!secondResult.before || !secondResult.after) throw new Error("missing boundaries");
+
+		const reversed = await worktreeTreeSnapshot.reverseAndRestore(repo, [
+			{ before: secondResult.before, after: secondResult.after, ownedPaths: ["shared.txt"] },
+		]);
+		expect(reversed.conflicts).toEqual([]);
+		expect(reversed.changedFiles).toEqual(["shared.txt"]);
+		expect(readFileSync(path, "utf8")).toBe(content(1, 1));
+	});
+
+	test("failed path measurement stays unknown rather than recording an owned no-op", async () => {
+		const repo = await createRepo("nf-hook-diff-unavailable-");
+		const narratorId = await createNarrator(repo);
+		const session = makeSession(repo);
+		writeFileSync(join(repo, "a.txt"), "before\n");
+		const { toolUseId } = await seedToolCall(narratorId, "Write", 1);
+		await recordTreeSnapshotBefore(session, narratorId, toolUseId, ["a.txt"]);
+		writeFileSync(join(repo, "a.txt"), "after\n");
+		const diff = spyOn(worktreeTreeSnapshot, "diffPathStatuses").mockRejectedValue(
+			new Error("snapshot path listing exceeded the size limit"),
+		);
+		try {
+			await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+		} finally {
+			diff.mockRestore();
+		}
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, toolUseId),
+			columns: { treeHashBefore: true, treeHashAfter: true, ownedPathsJson: true },
+		});
+		expect(row?.treeHashBefore).not.toBe(row?.treeHashAfter);
+		expect(row?.ownedPathsJson).toBeNull();
+	});
+
 	test("restoring a recorded boundary undoes the tool's writes", async () => {
 		const repo = await createRepo("nf-hook-restore-");
 		const narratorId = await createNarrator(repo);
@@ -325,7 +382,6 @@ describe("unfinished tool lifecycles", () => {
 		const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
 		await recordTreeSnapshotBefore(session, narratorId, toolUseId, null);
 		writeFileSync(join(repo, "target.txt"), "written-by-shell\n");
-		session._lastTreeHash = undefined;
 		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 
 		expect(result.changedFiles).toEqual(["target.txt"]);
@@ -352,7 +408,6 @@ describe("unfinished tool lifecycles", () => {
 		await recordTreeSnapshotBefore(neighbour, neighbourId, "threw-mid-write", ["theirs.txt"]);
 		writeFileSync(join(repo, "theirs.txt"), "v2\n");
 		abandonTreeSnapshot(neighbour, neighbourId, "threw-mid-write");
-		session._lastTreeHash = undefined;
 		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 
 		expect(result.workspaceDelta).toEqual(["theirs.txt"]);
@@ -384,7 +439,6 @@ describe("unfinished tool lifecycles", () => {
 		await recordTreeSnapshotBefore(shell, shellId, toolUseId, null);
 		writeFileSync(join(repo, "one.txt"), "shell-wrote-this\n");
 		writeFileSync(join(repo, "two.txt"), "shell-wrote-this\n");
-		shell._lastTreeHash = undefined;
 		const result = await recordTreeSnapshotAfter(shell, shellId, toolUseId);
 
 		// `one.txt` survives (its claim was sealed before the shell window opened);
@@ -442,6 +496,17 @@ describe("declaredWorktreePaths", () => {
 		]);
 	});
 
+	test("resolves relative targets against the session workspace rather than the server cwd", () => {
+		expect(declaredWorktreePaths("/work/repo", { file_path: "src/a.ts" })).toEqual(["src/a.ts"]);
+		expect(declaredWorktreePaths("/work/repo", { file_path: "..notes" })).toEqual(["..notes"]);
+	});
+
+	test.skipIf(process.platform === "win32")("preserves POSIX filename backslashes", () => {
+		expect(declaredWorktreePaths("/work/repo", { file_path: "/work/repo/a\\\\b.txt" })).toEqual([
+			"a\\\\b.txt",
+		]);
+	});
+
 	test("treats a spec:// URI as owning nothing on disk", () => {
 		// Virtual files never reach the worktree, so there is nothing to restore. This
 		// used to be inferred from `before === after`, which stops holding in a shared
@@ -484,7 +549,6 @@ describe("attribution in a shared worktree", () => {
 		// its own snapshot hook does.
 		await recordTreeSnapshotBefore(neighbour, neighbourId, "neighbour-tool", ["theirs.txt"]);
 		writeFileSync(join(repo, "theirs.txt"), "v2\n");
-		session._lastTreeHash = undefined;
 		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 
 		// The workspace genuinely moved, and the raw delta still says so — that is the
@@ -514,7 +578,6 @@ describe("attribution in a shared worktree", () => {
 		await recordTreeSnapshotBefore(neighbour, neighbourId, "neighbour-tool", ["theirs.txt"]);
 		writeFileSync(join(repo, "mine.txt"), "mine-v2\n");
 		writeFileSync(join(repo, "theirs.txt"), "theirs-v2\n");
-		session._lastTreeHash = undefined;
 		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 
 		expect(result.workspaceDelta.sort()).toEqual(["mine.txt", "theirs.txt"]);
@@ -536,7 +599,6 @@ describe("attribution in a shared worktree", () => {
 		const { toolUseId } = await seedToolCall(narratorId, "Edit", 1);
 		await recordTreeSnapshotBefore(session, narratorId, toolUseId, declare(repo, "target.txt"));
 		writeFileSync(join(repo, "other.txt"), "v2\n");
-		session._lastTreeHash = undefined;
 		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 
 		expect(result.workspaceDelta).toEqual(["other.txt"]);
@@ -562,7 +624,6 @@ describe("attribution in a shared worktree", () => {
 			cwd: repo,
 			timeout: 15_000,
 		});
-		session._lastTreeHash = undefined;
 		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 
 		expect(result.workspaceDelta.sort()).toEqual(["built.txt", "theirs.txt"]);
@@ -588,7 +649,6 @@ describe("attribution in a shared worktree", () => {
 		const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
 		await recordTreeSnapshotBefore(session, narratorId, toolUseId, null);
 		writeFileSync(join(repo, "shared.txt"), "v2\n");
-		session._lastTreeHash = undefined;
 		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 
 		expect(result.changedFiles).toEqual(["shared.txt"]);
@@ -653,7 +713,6 @@ describe("workspace path change broadcast", () => {
 		await recordTreeSnapshotBefore(neighbour, neighbourId, "neighbour-tool", ["theirs.txt"]);
 		writeFileSync(join(repo, "mine.txt"), "mine-v2\n");
 		writeFileSync(join(repo, "theirs.txt"), "theirs-v2\n");
-		session._lastTreeHash = undefined;
 
 		let result: Awaited<ReturnType<typeof recordTreeSnapshotAfter>> | undefined;
 		const frames = await captureBroadcasts(async () => {
@@ -678,7 +737,6 @@ describe("workspace path change broadcast", () => {
 		await recordTreeSnapshotBefore(session, narratorId, toolUseId, null);
 		rmSync(join(repo, "gone.txt"));
 		writeFileSync(join(repo, "fresh.txt"), "new\n");
-		session._lastTreeHash = undefined;
 
 		const frames = await captureBroadcasts(async () => {
 			await recordTreeSnapshotAfter(session, narratorId, toolUseId);
@@ -701,7 +759,6 @@ describe("workspace path change broadcast", () => {
 		const { toolUseId } = await seedToolCall(narratorId, "Edit", 1);
 		await recordTreeSnapshotBefore(session, narratorId, toolUseId, declare(repo, "a.txt"));
 		writeFileSync(join(repo, "a.txt"), "one\n");
-		session._lastTreeHash = undefined;
 
 		const frames = await captureBroadcasts(async () => {
 			await recordTreeSnapshotAfter(session, narratorId, toolUseId);
@@ -719,7 +776,6 @@ describe("workspace path change broadcast", () => {
 
 		const { toolUseId } = await seedToolCall(narratorId, "Read", 1);
 		await recordTreeSnapshotBefore(session, narratorId, toolUseId, []);
-		session._lastTreeHash = undefined;
 
 		const frames = await captureBroadcasts(async () => {
 			await recordTreeSnapshotAfter(session, narratorId, toolUseId);

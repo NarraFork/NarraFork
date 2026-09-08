@@ -14,6 +14,7 @@ import {
 	panelIdFor,
 	parseDetachedNodes,
 	removeDetachedNode,
+	resourceIdOf,
 	serializeDetachedNodes,
 	setDetachedLayout,
 	updateDetachedNodeGeometry,
@@ -50,6 +51,53 @@ function pending(over: Partial<DetachedNode> = {}): DetachedNode {
 function mounted(over: Partial<DetachedNode> = {}): DetachedNode {
 	return { id: "n1", x: 10, y: 20, w: 480, h: 360, layout: layout(), ...over };
 }
+
+describe("device-scoped pending file panels", () => {
+	test("historical pending panels survive persistence and remain distinct from live files", () => {
+		const toolEdit = { narratorId: "origin", toolUseId: "sdk-id", executionAttempt: 2 };
+		const resourceId = JSON.stringify(["DeviceA", "/repo/a.ts", true, toolEdit]);
+		const entry = makePanelEntry("file", resourceId);
+		const live = makePanelEntry("file", JSON.stringify(["DeviceA", "/repo/a.ts"]));
+		expect(entry.toolEdit).toEqual(toolEdit);
+		expect(entry.panelId).not.toBe(live.panelId);
+		expect(
+			panelIdFor(
+				"file",
+				JSON.stringify([
+					"DeviceA",
+					"/repo/a.ts",
+					false,
+					{ executionAttempt: 2, toolUseId: "sdk-id", narratorId: "origin" },
+				]),
+			),
+		).toBe(entry.panelId);
+		const parsed = parseDetachedNodes(
+			serializeDetachedNodes([pending({ pendingPanels: [entry, live] })]),
+		);
+		expect(parsed[0].pendingPanels).toEqual([entry, live]);
+		expect(resourceIdOf(parsed[0].pendingPanels?.[0] as typeof entry)).toBe(resourceId);
+		const invalid = { ...entry, toolEdit: { ...toolEdit, executionAttempt: -1 } };
+		const bad = JSON.stringify({ nodes: [pending({ pendingPanels: [invalid] })] });
+		expect(parseDetachedNodes(bad)).toEqual([]);
+	});
+
+	test("scoped local references remain scoped after a detached layout round-trip", () => {
+		const entry = makePanelEntry("file", JSON.stringify(["local", "/repo/a.png", true]));
+		expect(entry).toMatchObject({
+			filePath: "/repo/a.png",
+			deviceId: "local",
+			referenceOrigin: true,
+		});
+		const nodes = parseDetachedNodes(serializeDetachedNodes([pending({ pendingPanels: [entry] })]));
+		expect(nodes[0].pendingPanels?.[0].referenceOrigin).toBe(true);
+	});
+	test("retains device identity through detach and layout round-trip", () => {
+		const entry = makePanelEntry("file", JSON.stringify(["DeviceA", "/repo/a.ts"]));
+		expect(entry).toMatchObject({ filePath: "/repo/a.ts", deviceId: "DeviceA" });
+		const nodes = parseDetachedNodes(serializeDetachedNodes([pending({ pendingPanels: [entry] })]));
+		expect(nodes[0].pendingPanels?.[0]).toEqual(entry);
+	});
+});
 
 describe("detachable kinds", () => {
 	test("the panels that depend on chat-published props are NOT detachable", () => {

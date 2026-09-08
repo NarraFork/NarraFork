@@ -18,6 +18,7 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import type { BackgroundTaskListItem, BackgroundTaskType } from "@shared/background-task-list";
 import { isBackgroundTaskActiveStatus } from "@shared/background-task-list";
+import { toolBodyId } from "@shared/pretext-layout/tool-detail";
 import {
 	deriveToolProgress,
 	formatProgressBytes,
@@ -151,6 +152,7 @@ function statusColor(status: string): string {
 		// Yellow, not the failure red: a paused transfer is intact and resumable, and
 		// colouring it like an error would push users to discard recoverable work.
 		case "paused":
+		case "taken_over":
 			return "yellow";
 		case "cancelled":
 			return "orange";
@@ -175,6 +177,8 @@ function statusLabel(
 			return t("backgroundTasks.statusCompleted");
 		case "paused":
 			return t("backgroundTasks.statusPaused");
+		case "taken_over":
+			return t("subagentTakenOver");
 		case "cancelled":
 			return t("backgroundTasks.statusCancelled");
 		case "failed":
@@ -250,6 +254,7 @@ function BashTaskDetail({ narratorId, task, isActive, opened }: BashTaskDetailPr
 						{t("backgroundTasks.commandLabel")}
 					</Text>
 					<ContentViewer
+						bodyId={toolBodyId(task.toolUseId ?? task.id, "input.command")}
 						content={task.command}
 						title={t("backgroundTasks.commandLabel")}
 						language="shellscript"
@@ -276,23 +281,24 @@ function BashTaskDetail({ narratorId, task, isActive, opened }: BashTaskDetailPr
 						{isLoading && <Loader size={12} />}
 					</Group>
 				</Group>
+				<ContentViewer
+					bodyId={toolBodyId(task.toolUseId ?? task.id, "output.main")}
+					content={tail}
+					title={t("backgroundTasks.outputLabel")}
+					style={{ maxHeight: 320, fontSize: 11 }}
+					live={isActive && (data?.live ?? true)}
+					truncated={data?.truncated}
+					revision={tail}
+				/>
 				{isError ? (
 					<Text size="xs" c="red">
 						{t("backgroundTasks.outputLoadFailed")}
 					</Text>
-				) : tail ? (
-					<ContentViewer
-						content={tail}
-						title={t("backgroundTasks.outputLabel")}
-						style={{ maxHeight: 320, overflow: "auto", fontSize: 11 }}
-						autoFollow={isActive}
-						autoFollowKey={task.id}
-					/>
-				) : (
+				) : !tail ? (
 					<Text size="xs" c="dimmed">
 						{isActive ? t("backgroundTasks.outputWaiting") : t("backgroundTasks.outputEmpty")}
 					</Text>
-				)}
+				) : null}
 			</Stack>
 			{task.exitCode != null && (
 				<Text size="xs" c="dimmed">

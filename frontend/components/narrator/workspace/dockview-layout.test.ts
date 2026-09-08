@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import type { DockviewApi, SerializedDockview } from "dockview-react";
 import { serializeSeedEnvelope } from "../panels/layout-envelope";
 import { createBranch, createLeafWith } from "../split-tree";
 import { DEFAULT_DIRECTOR_PRIMARY_RATIO } from "./director-constants";
 import {
 	componentForParams,
+	DEFAULT_DIRECTOR_STATE,
 	nextWorkspacePanelId,
 	resolveWorkspaceLayout,
+	serializeWorkspaceLayout,
 	twoNarratorWorkspaceSeed,
 	WORKSPACE_LAYOUT_VERSION,
 } from "./dockview-layout";
@@ -17,6 +20,42 @@ import { PANEL_COMPONENT } from "./panel-types";
 // `recoverPanelsFromLayout` — covered by `tests/server/services/workspace-panel-service.test.ts`
 // ("backfill on first read"), including the split-tree and seed-envelope cases this
 // suite used to assert.
+
+test("workspace serialization drops navigation but preserves membership and device", () => {
+	const toolEdit = {
+		narratorId: "origin",
+		toolUseId: "sdk-id",
+		toolCallId: "row",
+		executionAttempt: 2,
+	};
+	const layout = {
+		panels: {
+			chat: { params: { panelType: "narrator", narratorId: "n" } },
+			file: {
+				params: {
+					panelType: "file",
+					hostNarratorId: "n",
+					filePath: "/a.ts",
+					deviceId: "DeviceA",
+					toolEdit,
+					selection: {},
+					highlightRequestId: "h1",
+				},
+			},
+		},
+	} as unknown as SerializedDockview;
+	const api = { toJSON: () => layout } as unknown as DockviewApi;
+	const saved = JSON.parse(serializeWorkspaceLayout(api, DEFAULT_DIRECTOR_STATE));
+	expect(saved.layout.panels.chat.params.narratorId).toBe("n");
+	expect(saved.layout.panels.file.params).toEqual({
+		panelType: "file",
+		hostNarratorId: "n",
+		filePath: "/a.ts",
+		deviceId: "DeviceA",
+		toolEdit,
+	});
+	expect(layout.panels.file.params?.selection).toBeDefined();
+});
 
 describe("resolveWorkspaceLayout", () => {
 	// "No usable arrangement" must never be read as "no panels": membership is a

@@ -182,6 +182,7 @@ export function isBackgroundTaskActiveStatus(status: string): boolean {
 		status === "running" ||
 		status === "paused" ||
 		status === "continued" ||
+		status === "taken_over" ||
 		status === "child_running"
 	);
 }

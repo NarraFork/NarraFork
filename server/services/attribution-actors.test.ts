@@ -38,7 +38,11 @@ function row(overrides: Partial<NarratorActorRow> = {}): NarratorActorRow {
 describe("buildAttributionActors", () => {
 	test("resolves a primary narrator with no subagent type", () => {
 		const actors = buildAttributionActors(["n1"], [row()]);
-		expect(actors.get("n1")).toEqual({
+		expect(actors.get("n1")).toMatchObject({
+			kind: "primary",
+			userId: null,
+			deleted: false,
+			identityKnown: true,
 			narratorId: "n1",
 			title: "Primary session",
 			subagentType: null,
@@ -85,7 +89,11 @@ describe("buildAttributionActors", () => {
 		// Dropping it would make a file look untouched by a session that really wrote to
 		// it; "deleted session" is a truthful answer, silence is not.
 		const actors = buildAttributionActors(["gone"], []);
-		expect(actors.get("gone")).toEqual({
+		expect(actors.get("gone")).toMatchObject({
+			kind: "narrator_unknown",
+			userId: null,
+			deleted: true,
+			identityKnown: true,
 			narratorId: "gone",
 			title: null,
 			subagentType: null,
@@ -177,7 +185,11 @@ describe("actor resolution in the modification view", () => {
 		const view = await getWorkspaceModificationView(ws);
 		const group = view.byFile.find((g) => g.filePath === "src/a.ts");
 
-		expect(group?.lastActor).toEqual({
+		expect(group?.lastActor).toMatchObject({
+			kind: "subagent",
+			userId: null,
+			deleted: false,
+			identityKnown: true,
 			narratorId: sub,
 			title: "Trace edges",
 			subagentType: "explore",
@@ -235,9 +247,9 @@ describe("actor resolution in the modification view", () => {
 		expect(group?.hasDeletedActor).toBe(false);
 	});
 
-	test("a deleted session's change is flagged as deleted, not as unknown", async () => {
-		// `narrator_id` is ON DELETE SET NULL, so deleting the session leaves a row with
-		// no id and a non-external action. That must not read as "no idea who did this".
+	test("a deleted session's nulled identity stays a narrator observation, not external", async () => {
+		// v1 ON DELETE SET NULL loses the subject and cannot prove which session (or
+		// whether the original identity was missing). Report that uncertainty explicitly.
 		const ws = makeWorkspace("nf-actor-deleted-");
 		const gone = await createNarrator({ title: "Doomed", cwd: ws });
 		await recordAttribution({
@@ -251,7 +263,7 @@ describe("actor resolution in the modification view", () => {
 		const view = await getWorkspaceModificationView(ws);
 		const group = view.byFile.find((g) => g.filePath === "orphan.ts");
 
-		expect(group?.hasDeletedActor).toBe(true);
+		expect(group?.hasDeletedActor).toBeNull();
 		expect(group?.hasExternalChange).toBe(false);
 	});
 
@@ -281,7 +293,7 @@ describe("actor resolution in the modification view", () => {
 		// The latest writer still exists, so the badge stays informative while the
 		// deleted co-writer is accounted for separately.
 		expect(group?.lastActor.title).toBe("Survivor");
-		expect(group?.hasDeletedActor).toBe(true);
+		expect(group?.hasDeletedActor).toBeNull();
 	});
 });
 

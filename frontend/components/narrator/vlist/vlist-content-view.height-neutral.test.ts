@@ -16,10 +16,27 @@
  *     functions could not notice them being wired in.
  */
 
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
+import { DETAIL_TOP_MARGIN, measureToolBody, measureToolDetail } from "./measure/measure-tool-call";
+import { installCanvasStub } from "./measure/test-canvas-stub";
 import { sliceBracketedRegion } from "./source-slice";
+import { resolveToolDetailViewTargets } from "./vlist-content-view-target";
+
+const disposeCanvas = installCanvasStub();
+afterAll(disposeCanvas);
+const MODEL: ToolCappedDetail = {
+	kind: "capped",
+	id: "call:input.plan",
+	source: "input.plan",
+	cap: "plan",
+	format: "markdown",
+	live: false,
+	followTarget: { kind: "end" },
+	text: "# Plan\n\n- do work",
+};
 
 const VLIST_DIR = import.meta.dir;
 
@@ -40,27 +57,38 @@ describe("sourceText is a pure output field", () => {
 		}
 	});
 
-	it("the markdown capped branch reports the same height with the field present", () => {
-		const src = read("measure/measure-tool-call.ts");
-		const branch = src.slice(
-			src.indexOf("if (detail.markdown && detail.text != null"),
-			src.indexOf("const hasLabel = detail.hasLabel"),
+	it("target extraction preserves the exact measured height and frame", () => {
+		const detail = measureToolDetail(
+			{ kind: "sections", sections: [{ key: MODEL.source, body: MODEL }] },
+			600,
 		);
-		expect(branch.length).toBeGreaterThan(0);
-		// The height still comes straight from measureMarkdownDetail's result.
-		expect(branch).toContain("height: md.height");
-		expect(branch).toContain("sourceText: detail.text");
+		const section = detail.sections[0];
+		if (!section) throw new Error("missing measured section");
+		const geometry = JSON.stringify([
+			detail.height,
+			section.bodyHeight,
+			section.measuredBody.frame,
+		]);
+		const [target] = resolveToolDetailViewTargets("owner", { detail });
+		expect(target?.model).toBe(MODEL);
+		expect(target?.text).toBe(MODEL.text ?? "");
+		expect(JSON.stringify([detail.height, section.bodyHeight, section.measuredBody.frame])).toBe(
+			geometry,
+		);
 	});
 
-	it("a section only copies the string; the y accumulator is untouched", () => {
-		const src = read("measure/measure-tool-call.ts");
-		const push = src.slice(
-			src.indexOf("sections.push({"),
-			src.indexOf("if (blocks.length === 0) {", src.indexOf("sections.push({")),
+	it("sections keep body-local frames and add their own chrome only once", () => {
+		const body = measureToolBody(MODEL, 600);
+		const detail = measureToolDetail(
+			{ kind: "sections", sections: [{ key: MODEL.source, body: MODEL }] },
+			600,
 		);
-		expect(push).toContain("sourceText: body.sourceText");
-		// No arithmetic on the accumulator inside the descriptor literal.
-		expect(push).not.toContain("y +=");
+		const section = detail.sections[0];
+		expect(section?.bodyTop).toBe(DETAIL_TOP_MARGIN);
+		expect(section?.measuredBody.frame).toEqual(body.frame);
+		expect(section?.bodyHeight).toBe(body.height);
+		expect(detail.height).toBe(DETAIL_TOP_MARGIN + body.height);
+		expect(section?.measuredBody.blocks.length).toBe(body.frame.blocks.length);
 	});
 });
 

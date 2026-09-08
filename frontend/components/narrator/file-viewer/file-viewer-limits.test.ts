@@ -100,5 +100,10 @@ describe("fileBaseName", () => {
 		expect(fileBaseName("/a/b/c.md")).toBe("c.md");
 		expect(fileBaseName("C:\\a\\b\\c.md")).toBe("c.md");
 		expect(fileBaseName("c.md")).toBe("c.md");
+		expect(fileBaseName("./c.md")).toBe("c.md");
+		expect(fileBaseName("/work/a\\b.md")).toBe("a\\b.md");
+		expect(fileBaseName("/work/a\\b/readme.md")).toBe("readme.md");
+		expect(fileBaseName("C:/work\\readme.md")).toBe("readme.md");
+		expect(fileBaseName("C:\\readme.md")).toBe("readme.md");
 	});
 });

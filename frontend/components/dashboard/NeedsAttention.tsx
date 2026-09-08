@@ -1,16 +1,24 @@
-import { Alert, Badge, Card, Group, Loader, Stack, Text, ThemeIcon, Title } from "@mantine/core";
 import {
-	IconAlertCircle,
-	IconClockPause,
-	IconExclamationMark,
-	IconInbox,
-} from "@tabler/icons-react";
-import { useQueries, useQuery } from "@tanstack/react-query";
+	Alert,
+	Badge,
+	Button,
+	Card,
+	Group,
+	Loader,
+	Stack,
+	Text,
+	ThemeIcon,
+	Title,
+	UnstyledButton,
+} from "@mantine/core";
+import { IconClockPause, IconExclamationMark, IconInbox } from "@tabler/icons-react";
+import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
 import { api } from "../../lib/api";
-import { type GlobalQuestion, useGlobalAsyncQuestions } from "../narrator/GlobalQuestionInbox";
+import { HumanAttentionInboxDrawer } from "../narrator/GlobalQuestionInbox";
 
 const NEEDS_ATTENTION_QUERY_GC_TIME_MS = 30_000;
 const MAX_ITEMS = 5;
@@ -39,23 +47,13 @@ function truncate(text: string, maxLength: number): string {
 	return `${text.slice(0, maxLength)}…`;
 }
 
-function toAttentionItems(narrators: NarratorEntity[], subtitle: string): AttentionItem[] {
-	return narrators.map((n) => ({
-		id: n.id,
-		key: n.id,
-		title: n.title ?? n.id,
-		subtitle,
-	}));
-}
-
 export function NeedsAttention() {
 	const { t } = useTranslation("dashboard");
-
-	const { data: waitingData, isLoading: waitingLoading } = useQuery({
-		queryKey: ["narrators", "waiting-attention"],
-		queryFn: () => api.listNarratorsPaginated({ standalone: "all", status: "waiting", limit: 20 }),
-		gcTime: NEEDS_ATTENTION_QUERY_GC_TIME_MS,
-	});
+	const { t: tn } = useTranslation("narrator");
+	const [inboxOpened, setInboxOpened] = useState(false);
+	const attention = useHumanAttention();
+	const attentionItems = loadedHumanAttentionItems(attention.data?.pages);
+	const blocking = attentionItems.some((item) => item.blocking);
 
 	const { data: recentData, isLoading: recentLoading } = useQuery({
 		queryKey: ["narrators", "failed-attention"],
@@ -69,37 +67,6 @@ export function NeedsAttention() {
 		gcTime: NEEDS_ATTENTION_QUERY_GC_TIME_MS,
 	});
 
-	const waitingNarrators: NarratorEntity[] = useMemo(() => waitingData?.items ?? [], [waitingData]);
-
-	const permissionQueries = useQueries({
-		queries: waitingNarrators.map((n: NarratorEntity) => ({
-			queryKey: ["permissions", n.id],
-			queryFn: () => api.getPendingPermissions(n.id),
-			gcTime: NEEDS_ATTENTION_QUERY_GC_TIME_MS,
-			retry: false,
-		})),
-	});
-
-	// Only surface narrators that have at least one *visible* pending item.
-	// The backend's getPendingPermissions hides non-awaiting_user reflections
-	// (danger/plan/task/question) via shouldHidePendingPermission, so a narrator
-	// whose waiting status comes purely from an in-flight reflection (running)
-	// returns an empty array here and must NOT be flagged as needing attention.
-	// On query error (q.data === undefined) we fall back to showing the narrator
-	// to avoid hiding a genuine permission request.
-	const visibleWaitingNarrators = useMemo(() => {
-		return waitingNarrators.filter((_n: NarratorEntity, i: number) => {
-			const q = permissionQueries[i];
-			if (!q) return false;
-			if (q.data === undefined) return true; // error / still settling → keep visible
-			return Array.isArray(q.data) && q.data.length > 0;
-		});
-	}, [waitingNarrators, permissionQueries]);
-
-	const waitingItems = useMemo<AttentionItem[]>(() => {
-		return toAttentionItems(visibleWaitingNarrators, t("waitingPermission"));
-	}, [visibleWaitingNarrators, t]);
-
 	const failedItems = useMemo<AttentionItem[]>(() => {
 		const failed = (recentData?.items ?? []).filter((n: NarratorEntity) => n.errorMessage);
 		return failed.map((n: NarratorEntity) => ({
@@ -110,40 +77,13 @@ export function NeedsAttention() {
 		}));
 	}, [recentData]);
 
-	const permissionsLoading = permissionQueries.some((q) => q.isLoading);
-	const isLoading =
-		waitingLoading || recentLoading || (waitingNarrators.length > 0 && permissionsLoading);
-
-	// Deferred questions belong in this card rather than a section of their own: it is
-	// already "what needs you", and an unanswered question is exactly that. Reuses the
-	// cross-session query the composer inbox holds, so opening the dashboard costs no
-	// extra request when that data is already warm.
-	const { data: questionData } = useGlobalAsyncQuestions();
-	const questionItems = useMemo<AttentionItem[]>(() => {
-		const items = (questionData?.items ?? []) as GlobalQuestion[];
-		return items.map((q) => ({
-			id: q.narratorId,
-			// The QUESTION id: a session with two open questions produces two rows.
-			key: q.id,
-			title: q.narratorTitle || q.narratorId,
-			// The question text itself, not a generic label: the point of showing it here is
-			// that the user can often decide whether it is worth opening at all.
-			subtitle: truncate(q.questions[0]?.header ?? "", ERROR_MESSAGE_MAX_LENGTH),
-			// An awaited question has STOPPED its session, so it is ranked with the
-			// permission prompts rather than the quiet backlog.
-			awaited: q.awaited === true,
-		}));
-	}, [questionData]);
-	// Blocked sessions first — the rest of this card is ordered by urgency too.
-	const sortedQuestionItems = useMemo(
-		() => [...questionItems].sort((a, b) => Number(b.awaited) - Number(a.awaited)),
-		[questionItems],
-	);
-
-	const waitingCount = waitingItems.length;
 	const failedCount = failedItems.length;
-	const questionCount = sortedQuestionItems.length;
-	const allClear = waitingCount === 0 && failedCount === 0 && questionCount === 0;
+	const isLoading = recentLoading || attention.isLoading;
+	const allClear =
+		failedCount === 0 &&
+		attentionItems.length === 0 &&
+		!attention.hasNextPage &&
+		!attention.isError;
 
 	return (
 		<Card withBorder>
@@ -158,37 +98,59 @@ export function NeedsAttention() {
 				</Alert>
 			) : (
 				<Stack gap="sm">
-					{waitingCount > 0 && (
-						<AttentionSection
-							icon={
-								<ThemeIcon color="yellow" variant="light" size="lg">
-									<IconAlertCircle size={18} />
-								</ThemeIcon>
-							}
-							title={t("waitingPermission")}
-							count={waitingCount}
-							items={waitingItems}
-						/>
+					{attention.isError && (
+						<Alert color="red">
+							<Text size="sm">{tn("humanAttentionLoadError")}</Text>
+							<Button
+								size="xs"
+								variant="light"
+								onClick={() => void attention.refetch()}
+								loading={attention.isFetching}
+							>
+								{tn("humanAttentionRetry")}
+							</Button>
+						</Alert>
 					)}
-					{questionCount > 0 && (
-						<AttentionSection
-							icon={
-								<ThemeIcon
-									color={sortedQuestionItems[0]?.awaited ? "yellow" : "blue"}
-									variant="light"
-									size="lg"
-								>
-									{sortedQuestionItems[0]?.awaited ? (
-										<IconClockPause size={18} />
-									) : (
-										<IconInbox size={18} />
-									)}
+					{(attentionItems.length > 0 || attention.hasNextPage) && (
+						<Card withBorder padding="sm">
+							<Group gap="sm" mb="xs">
+								<ThemeIcon color={blocking ? "yellow" : "blue"} variant="light" size="lg">
+									{blocking ? <IconClockPause size={18} /> : <IconInbox size={18} />}
 								</ThemeIcon>
-							}
-							title={t("pendingQuestions")}
-							count={questionCount}
-							items={sortedQuestionItems}
-						/>
+								<Text fw={500}>{t("humanAttention")}</Text>
+								<Badge size="sm" variant="light">
+									{attentionItems.length}
+									{attention.hasNextPage ? "+" : ""}
+								</Badge>
+							</Group>
+							<Stack gap={4}>
+								{attentionItems.slice(0, MAX_ITEMS).map((item) => (
+									<UnstyledButton key={item.id} onClick={() => setInboxOpened(true)}>
+										<Group gap="xs">
+											<Text size="sm" fw={500}>
+												{item.narratorTitle || item.narratorId}
+											</Text>
+											<Badge size="xs" color={item.blocking ? "yellow" : "gray"}>
+												{tn(item.blocking ? "humanAttentionBlocking" : "humanAttentionLater")}
+											</Badge>
+										</Group>
+										<Text size="xs" c="dimmed" lineClamp={2}>
+											{item.summary ||
+												tn(
+													item.source === "question"
+														? item.blocking
+															? "asyncQuestionAwaitedNotice"
+															: "asyncQuestionInboxTitle"
+														: `humanAttentionKind.${item.kind}`,
+												)}
+										</Text>
+									</UnstyledButton>
+								))}
+								<Button size="compact-xs" variant="subtle" onClick={() => setInboxOpened(true)}>
+									{t("viewAll")}
+								</Button>
+							</Stack>
+						</Card>
 					)}
 					{failedCount > 0 && (
 						<AttentionSection
@@ -204,6 +166,7 @@ export function NeedsAttention() {
 					)}
 				</Stack>
 			)}
+			<HumanAttentionInboxDrawer opened={inboxOpened} onClose={() => setInboxOpened(false)} />
 		</Card>
 	);
 }

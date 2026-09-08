@@ -66,22 +66,32 @@ function bashCard() {
 				kind: "sections",
 				sections: [
 					{
+						key: "input.command",
 						label: "command",
 						body: {
 							kind: "capped",
 							cap: "bash-cmd",
+							id: "tu_1:input.command",
+							source: "input.command",
+							format: "code",
+							live: false,
+							followTarget: { kind: "end" },
 							contentLines: 1,
-							hasLabel: false,
 							text: "$ bun test",
 						},
 					},
 					{
+						key: "output.main",
 						label: "output",
 						body: {
 							kind: "capped",
 							cap: "term",
+							id: "tu_1:output.main",
+							source: "output.main",
+							format: "text",
+							live: false,
+							followTarget: { kind: "end" },
 							contentLines: 80,
-							hasLabel: false,
 							text: LONG_OUTPUT,
 						},
 					},
@@ -173,8 +183,11 @@ describe("wrap is content-only (the vlist's key difference from ContentViewer)",
 });
 
 describe("markdown bodies can show their source", () => {
-	it("swaps the render for the raw markdown inside the same box", () => {
-		const plan = "# Plan\n\n- step one\n- step two";
+	it.each([
+		true,
+		false,
+	])("keeps rendered markdown clipped but lets unwrapped source scroll (wrap=%s)", (wrap) => {
+		const plan = `# Plan\n\n- step one\n- ${"long source line ".repeat(100)}`;
 		const measured = measureToolCall(
 			{
 				toolName: "ExitPlanMode",
@@ -183,11 +196,23 @@ describe("markdown bodies can show their source", () => {
 				status: "success",
 				toolUseId: "tu_2",
 				detail: {
-					kind: "capped",
-					cap: "plan",
-					contentLines: 4,
-					text: plan,
-					markdown: true,
+					kind: "sections",
+					sections: [
+						{
+							key: "input.plan",
+							body: {
+								kind: "capped",
+								id: "tu_2:input.plan",
+								source: "input.plan",
+								live: false,
+								followTarget: { kind: "end" },
+								cap: "plan",
+								contentLines: 4,
+								text: plan,
+								format: "markdown",
+							},
+						},
+					],
 				},
 			},
 			WIDTH,
@@ -197,12 +222,27 @@ describe("markdown bodies can show their source", () => {
 		const targets = resolveToolDetailViewTargets("tool-tu_2", measured);
 		expect(targets[0]?.kind).toBe("markdown");
 
-		const rendered = renderCard({ measured, targets, controls: makeControls() });
+		const rendered = renderCard({
+			measured,
+			targets,
+			controls: makeControls({ isWrapped: () => wrap }),
+		});
 		const source = renderCard({
 			measured,
 			targets,
-			controls: makeControls({ isSourceShown: () => true }),
+			controls: makeControls({ isWrapped: () => wrap, isSourceShown: () => true }),
 		});
+		const renderedViewport = rendered.querySelector("[data-content-scrollport]");
+		const sourceViewport = source.querySelector("[data-content-scrollport]");
+		expect(renderedViewport?.getAttribute("style")).toContain("overflow-x:hidden");
+		expect(sourceViewport?.getAttribute("style")).toContain(
+			`overflow-x:${wrap ? "hidden" : "auto"}`,
+		);
+		expect(sourceViewport?.firstElementChild?.getAttribute("style")).toMatch(
+			new RegExp(`(?:^|;)white-space:${wrap ? "pre-wrap" : "pre"}(?:;|$)`),
+		);
+		expect(rendered.querySelector("[data-tool-markdown]")).not.toBeNull();
+		expect(source.querySelector("[data-tool-markdown]")).toBeNull();
 
 		// The rendered form shows the heading text without its markdown marker; the
 		// source form shows the raw `#`.

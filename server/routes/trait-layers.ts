@@ -36,6 +36,7 @@ import {
 	parseEnforcedKeys,
 	withEnforcedKeys,
 } from "../lib/trait-resolution";
+import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
 import { assertAdmin } from "../middleware/auth";
 import {
 	type EditableTraitLayer,
@@ -175,6 +176,7 @@ traitLayerRoutes.delete("/:layer/:ownerId/blocked-skills", async (c) => {
 traitLayerRoutes.put("/:layer/:ownerId/subagent-model-restriction", async (c) => {
 	const { layer, ownerId } = resolveTarget(c);
 	const body = await parseJsonBody(c);
+	validateSubagentModelRestrictionInput(body);
 	const restriction = normalizeSubagentModelRestriction(body);
 	const enforced = readEnforcedFlag(body);
 	const view = await updateLayerTraits(layer, ownerId, (current) =>

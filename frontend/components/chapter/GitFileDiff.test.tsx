@@ -21,6 +21,8 @@ mock.module("../../hooks/useGit", () => ({
 		isLoading: false,
 	}),
 }));
+const { installCanvasStub } = await import("../narrator/vlist/measure/test-canvas-stub");
+const disposeCanvas = installCanvasStub();
 const { GitFileDiff } = await import("./GitFileDiff");
 
 class TestResizeObserver {
@@ -34,9 +36,76 @@ class TestShadowRoot {}
 const i18n = i18next.createInstance();
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
+let restoreGeometry: () => void;
 
 function installDom() {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
+	const proto = window.HTMLElement.prototype;
+	const saved = new Map(
+		[
+			"clientHeight",
+			"clientWidth",
+			"clientTop",
+			"scrollTop",
+			"scrollHeight",
+			"getBoundingClientRect",
+		].map((key) => [key, Object.getOwnPropertyDescriptor(proto, key)]),
+	);
+	const positions = new WeakMap<object, number>();
+	Object.defineProperties(proto, {
+		clientHeight: { configurable: true, get: () => 500 },
+		clientWidth: { configurable: true, get: () => 700 },
+		clientTop: { configurable: true, get: () => 0 },
+		scrollHeight: {
+			configurable: true,
+			get() {
+				const canvas = (this as HTMLElement).querySelector<HTMLElement>("[data-diff-content]");
+				return canvas
+					? Array.from(canvas.children).reduce(
+							(sum, child) => sum + (Number.parseFloat((child as HTMLElement).style.height) || 0),
+							0,
+						)
+					: 0;
+			},
+		},
+		scrollTop: {
+			configurable: true,
+			get() {
+				return positions.get(this) ?? 0;
+			},
+			set(value: number) {
+				positions.set(this, Math.max(0, Math.min(value, (this as HTMLElement).scrollHeight - 500)));
+			},
+		},
+		getBoundingClientRect: {
+			configurable: true,
+			value() {
+				const top = (this as HTMLElement).hasAttribute("data-diff-content")
+					? -(
+							(this as HTMLElement).closest<HTMLElement>("[data-content-scrollport]")?.scrollTop ??
+							0
+						)
+					: 0;
+				return {
+					top,
+					bottom: top + 500,
+					left: 0,
+					right: 700,
+					width: 700,
+					height: 500,
+					x: 0,
+					y: top,
+					toJSON() {},
+				};
+			},
+		},
+	});
+	restoreGeometry = () => {
+		for (const [key, descriptor] of saved) {
+			if (descriptor) Object.defineProperty(proto, key, descriptor);
+			else Reflect.deleteProperty(proto, key);
+		}
+	};
 	const matchMedia = (query: string) => ({
 		matches: false,
 		media: query,
@@ -120,6 +189,7 @@ describe("GitFileDiff incremental rows", () => {
 	afterEach(() => {
 		root?.unmount();
 		container?.remove();
+		restoreGeometry();
 		root = undefined;
 		container = undefined;
 	});
@@ -127,33 +197,41 @@ describe("GitFileDiff incremental rows", () => {
 	afterAll(() => {
 		mock.module("../../hooks/useGit", () => realUseGit);
 		mock.restore();
+		disposeCanvas();
 	});
 
-	test("starts at 500 rows and appends 500 per deliberate bottom reach", async () => {
+	test("loads 500-row source segments while painting only the viewport window", async () => {
 		const scroller = await waitForDiffScroller();
 		const bodyText = () => document.body.textContent ?? "";
-		expect(bodyText()).toContain("ROW_000499");
-		expect(bodyText()).not.toContain("ROW_000500");
+		const flush = async () => {
+			for (let i = 0; i < 8; i++) await flushRender();
+		};
+		const move = async (top: number) => {
+			const wheel = new Event("wheel", { bubbles: true });
+			Object.defineProperty(wheel, "deltaY", { value: top < scroller.scrollTop ? -100 : 100 });
+			scroller.dispatchEvent(wheel);
+			scroller.scrollTop = top;
+			scroller.dispatchEvent(new Event("scroll"));
+			await flush();
+		};
+		await flush();
+		expect(bodyText()).toContain("ROW_000000");
+		expect(bodyText()).not.toContain("ROW_000499");
 		expect(bodyText()).toContain("Showing 500 of 1250 lines");
-		Object.defineProperties(scroller, {
-			clientHeight: { configurable: true, value: 500 },
-			scrollHeight: { configurable: true, value: 2_000 },
-			scrollTop: { configurable: true, value: 1_390, writable: true },
-		});
+		expect(scroller.querySelectorAll("[data-diff-row]").length).toBeLessThan(200);
 
-		scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-		await flushRender();
-		expect(bodyText()).toContain("ROW_000999");
-		expect(bodyText()).not.toContain("ROW_001000");
+		await move(scroller.scrollHeight - scroller.clientHeight - 40);
+		expect(bodyText()).toContain("ROW_000499");
 		expect(bodyText()).toContain("Showing 1000 of 1250 lines");
+		expect(scroller.querySelectorAll("[data-diff-row]").length).toBeLessThan(200);
 
-		// Reset DiffView's near-bottom latch, then enter the zone again.
-		scroller.scrollTop = 1_000;
-		scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-		scroller.scrollTop = 1_400;
-		scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-		await flushRender();
+		// One fresh deliberate reach, not two scroll events collapsed into one frame.
+		await move(1000);
+		await move(scroller.scrollHeight - scroller.clientHeight - 40);
+		expect(bodyText()).toContain("ROW_000999");
+		expect(bodyText()).not.toContain("Showing 1000 of 1250 lines");
+		await move(scroller.scrollHeight - scroller.clientHeight);
 		expect(bodyText()).toContain("ROW_001249");
-		expect(bodyText()).not.toContain("Showing 1250 of 1250 lines");
+		expect(scroller.querySelectorAll("[data-diff-row]").length).toBeLessThan(200);
 	});
 });

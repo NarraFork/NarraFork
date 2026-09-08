@@ -1,9 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import { createSourceText } from "@shared/pretext-layout/source-text";
 import {
+	buildTopLevelStreamingChunksMsg,
 	findLatestSpecTasksToolUseId,
+	getStreamingFieldPreview,
+	getToolOutputPreview,
 	normalizeReflectionAfterToolStatus,
 	preserveCompleteStreamedOutput,
 	preserveLiveSubagentActivity,
+	resolveAllToolCallsFromMsg,
+	type TopLevelStreamingChunk,
+	topLevelStreamingChunkToToolFields,
 } from "./narrator-message-helpers";
 import type { NarratorMsg } from "./narrator-panel-types";
 
@@ -21,6 +28,62 @@ function msg(overrides: Partial<NarratorMsg> = {}): NarratorMsg {
 		...overrides,
 	} as NarratorMsg;
 }
+
+describe("streaming source-range projection", () => {
+	test("keeps CRLF and surrogate-pair boundaries under both 16000-character caps", () => {
+		for (const bound of [getStreamingFieldPreview, getToolOutputPreview]) {
+			expect(bound(`x\r\n${"a".repeat(15_999)}`)).toBe("a".repeat(15_999));
+			expect(bound(`x😀${"a".repeat(15_999)}`)).toBe("a".repeat(15_999));
+			expect(bound("x".repeat(16_001))).toHaveLength(16_000);
+			expect(bound("")).toBe("");
+		}
+	});
+
+	test("preserves empty active fields and range metadata in both synthetic representations", () => {
+		const range = createSourceText("", { epoch: "edit:new", originKnown: false }).range;
+		const chunk: TopLevelStreamingChunk = {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 5,
+			streamingFieldName: "new_string",
+			streamingFieldValue: "",
+			streamingFieldRanges: { new_string: range },
+		};
+		const input = topLevelStreamingChunkToToolFields(chunk).inputJson;
+		expect(input).toMatchObject({
+			_streamingFieldValue: "",
+			_streamingFieldRanges: { new_string: range },
+		});
+		const synthetic = buildTopLevelStreamingChunksMsg([chunk], "n", "2026-09-07T00:00:00Z");
+		expect(synthetic?.toolCalls?.[0]?.inputJson).toEqual(input);
+		expect(synthetic ? resolveAllToolCallsFromMsg(synthetic)[0]?.inputJson : undefined).toEqual(
+			input,
+		);
+	});
+
+	test("retains ranges after completed input stops using streaming content markers", () => {
+		const range = createSourceText("", { epoch: "edit:new", complete: true }).range;
+		const chunk: TopLevelStreamingChunk = {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 5,
+			_started: true,
+			_status: "success",
+			_input: { old_string: "old", new_string: "" },
+			streamingFieldName: "new_string",
+			streamingFieldValue: "stale preview",
+			streamingFieldRanges: { new_string: range },
+		};
+		const input = topLevelStreamingChunkToToolFields(chunk).inputJson as Record<string, unknown>;
+		expect(input).toMatchObject({
+			old_string: "old",
+			new_string: "",
+			_streamingFieldRanges: { new_string: range },
+		});
+		expect(Object.hasOwn(input, "_streamingFieldValue")).toBe(false);
+		expect(chunk._input).toEqual({ old_string: "old", new_string: "" });
+	});
+});
 
 describe("preserveLiveSubagentActivity", () => {
 	test("keeps a known model when a terminal refresh carries an empty activity model", () => {

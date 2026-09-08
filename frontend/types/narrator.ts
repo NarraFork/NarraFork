@@ -1,4 +1,14 @@
+import type { HumanAttentionItem } from "@shared/human-attention";
 import type { ExecutionTargetIdentity } from "../lib/api/types";
+
+/** Full decision input is fetched only after opening a summary row. */
+export interface HumanAttentionDetail {
+	item: HumanAttentionItem;
+	question?: AsyncQuestion;
+	permission?: PendingPermission;
+	/** No safe approval is possible without reviewing the omitted input in its session. */
+	tooLarge?: boolean;
+}
 
 export interface PendingPermission {
 	id: string;

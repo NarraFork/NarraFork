@@ -43,6 +43,7 @@ import {
 } from "../../narrator/dock/NarratorDockContext";
 import { narratorDockComponents, narratorDockTabComponents } from "../../narrator/dock/panels";
 import { NarratorPanelSkeleton } from "../../narrator/NarratorPanelSkeleton";
+import { filePanelResourceParams } from "../../narrator/panels/panel-kind";
 import { acceptForeignPanelDragOver, handleForeignPanelDrop } from "./cross-surface-drop";
 import { isDetachablePanelKind } from "./detachable";
 import { getChapterDock, isDetachedSurface, registerChapterDock } from "./dock-registry";
@@ -218,11 +219,12 @@ const ChapterNodeDockSurface = memo(function ChapterNodeDockSurface({
 			// Multi-instance kinds are keyed by their resource; the rest are singletons
 			// per surface (`dockPanelId` deliberately does not accept the former).
 			if ((kind === "subagent" || kind === "file") && !drag.resourceId) return;
+			const fileTarget = filePanelResourceParams(drag.resourceId ?? "");
 			const panelId =
 				kind === "subagent"
 					? subagentDockPanelId(drag.resourceId as string)
 					: kind === "file"
-						? fileDockPanelId(drag.resourceId as string)
+						? fileDockPanelId(fileTarget.filePath, fileTarget.deviceId, fileTarget.toolEdit)
 						: dockPanelId(kind);
 
 			// Release the panel on the source surface FIRST, when it is a live one. If
@@ -239,6 +241,9 @@ const ChapterNodeDockSurface = memo(function ChapterNodeDockSurface({
 			// second, so the panel does not exist in two places.
 			const existing = api.getPanel(panelId);
 			if (existing) {
+				if (kind === "file" && fileTarget.referenceOrigin) {
+					existing.api.updateParameters({ ...existing.params, referenceOrigin: true });
+				}
 				existing.api.moveTo({ group, position });
 				existing.api.setActive();
 				return;
@@ -248,7 +253,7 @@ const ChapterNodeDockSurface = memo(function ChapterNodeDockSurface({
 				kind === "subagent"
 					? { panelType: "subagent" as const, subagentNarratorId: drag.resourceId ?? "" }
 					: kind === "file"
-						? { panelType: "file" as const, filePath: drag.resourceId ?? "" }
+						? { panelType: "file" as const, ...fileTarget }
 						: { panelType: kind, narratorId, chapterId };
 			api.addPanel({
 				id: panelId,

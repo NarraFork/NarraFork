@@ -31,6 +31,7 @@
 
 import { usePlatform } from "@frontend/hooks/usePlatform";
 import { useSwipeMenu } from "@frontend/hooks/useSwipeMenu";
+import type { ToolCallDetailRef } from "@frontend/lib/api/narrators";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Z } from "@frontend/lib/z-index";
 import { Box, Menu } from "@mantine/core";
@@ -62,6 +63,7 @@ import {
 } from "./MessageSelectionCtx";
 import { useRenderInteractive } from "./RenderLodCtx";
 import type { TraceRowIdentity } from "./trace-row-identity";
+import { useToolEditNavigation } from "./useToolEditNavigation";
 
 // Both modals are only needed once a menu item fires, so both are lazy: a
 // scrolling trace never pays for their module graph (ToolCallInspector pulls
@@ -96,6 +98,8 @@ export interface TraceRowInteractionProps {
 	actions: MessageContextMenuActions;
 	/** Owning panel narrator id — required by the inspector; absent → item hidden. */
 	narratorId?: string;
+	/** Adapter-owned persisted ref, separate from selection-system message coords. */
+	toolDetailRef?: ToolCallDetailRef;
 	/**
 	 * Open a child narrator's session (subagent rows + resolved Await-agent rows);
 	 * absent → item hidden.
@@ -126,6 +130,7 @@ export function TraceRowInteraction({
 	identity,
 	actions: msgCtx,
 	narratorId,
+	toolDetailRef,
 	onViewSubagentSession,
 	onDetachSubagent,
 	onCancelBackgroundTask,
@@ -143,6 +148,13 @@ export function TraceRowInteraction({
 	const [previewOpened, setPreviewOpened] = useState(false);
 
 	const { blockId, messageId, blockIndex, blockIndices, copyText, tool } = identity;
+	const editNavigation = useToolEditNavigation({
+		toolName: tool?.toolName,
+		narratorId,
+		toolUseId: tool?.toolUseId,
+		toolDetailRef,
+		filePath: tool?.filePath,
+	});
 	const isSelected = selection.selectedBlockIds.has(blockId);
 
 	const handleDeselectBlock = useCallback(() => {
@@ -246,7 +258,8 @@ export function TraceRowInteraction({
 	);
 	// The file panel opens for any file-oriented tool (Read / Write / Edit): it
 	// shows the file's CURRENT on-disk content, so a write is a valid entry point.
-	const canOpenFilePanel = !!(filePath && tool?.isFileTool && onOpenFilePanel);
+	const canOpenFilePanel =
+		!!editNavigation.open || !!(filePath && tool?.isFileTool && onOpenFilePanel);
 	const hasToolActions = !!(
 		canViewSession ||
 		canDetach ||
@@ -329,11 +342,12 @@ export function TraceRowInteraction({
 				<Menu.Item
 					leftSection={<IconFileText size={14} />}
 					onClick={() => {
-						if (filePath) onOpenFilePanel?.(filePath);
+						if (editNavigation.open) editNavigation.open();
+						else if (filePath) onOpenFilePanel?.(filePath);
 						swipe.closeSwipe();
 					}}
 				>
-					{tNarrator("contextMenu_openFilePanel")}
+					{tNarrator(editNavigation.open ? "editPreview.open" : "contextMenu_openFilePanel")}
 				</Menu.Item>
 			)}
 		</>
@@ -527,6 +541,9 @@ export function TraceRowInteraction({
 					<ToolCallInspector
 						narratorId={narratorId}
 						toolUseId={tool.toolUseId}
+						toolCallId={toolDetailRef?.toolCallId}
+						messageId={toolDetailRef?.messageId}
+						executionAttempt={toolDetailRef?.executionAttempt}
 						opened={inspectorOpened}
 						onClose={() => setInspectorOpened(false)}
 					/>
@@ -534,6 +551,7 @@ export function TraceRowInteraction({
 			)}
 
 			{/* File preview (Read tool) — mounted only while open (lazy chunk). */}
+			{editNavigation.modal}
 			{previewOpened && filePath && (
 				<Suspense fallback={null}>
 					<FilePreviewModal

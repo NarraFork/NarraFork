@@ -201,6 +201,55 @@ describe("taking over a background subagent", () => {
 	});
 });
 
+describe("releasing a background takeover after switching to a foreground runner", () => {
+	test("records the release for the current foreground driver, not the former background driver", async () => {
+		const { markTakenOver, isPendingStopTakeover, consumePendingBackgroundFinalize } = await import(
+			"../../services/narrator-subagent"
+		);
+		markTakenOver(subagentId, { background: true });
+		registerForegroundTurn(subagentId);
+		const response = await app().request(`http://localhost/narrators/${subagentId}/stop-takeover`, {
+			method: "POST",
+		});
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ stopped: true, deferred: true });
+		expect(isPendingStopTakeover(subagentId)).toBe(true);
+		expect(consumePendingBackgroundFinalize(subagentId)).toBe(false);
+	});
+
+	test("releases the suspended runner instead of bypassing its terminal completion", async () => {
+		const { markTakenOver, waitForManualOverride, isManualOverride } = await import(
+			"../../services/narrator-subagent"
+		);
+		await setSubagentRow({
+			status: "idle",
+			isBackground: false,
+			substatus: JSON.stringify(["taken_over"]),
+		});
+		markTakenOver(subagentId, { background: true });
+		const controller = new AbortController();
+		const completion = waitForManualOverride(
+			subagentId,
+			controller.signal,
+			parentId,
+			"origin-tool",
+		);
+		try {
+			const response = await app().request(
+				`http://localhost/narrators/${subagentId}/stop-takeover`,
+				{ method: "POST" },
+			);
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual({ stopped: true, deferred: false });
+			expect(isManualOverride(subagentId)).toBe(false);
+			expect(await completion).toMatchObject({ action: "finish", hasError: false });
+		} finally {
+			controller.abort();
+			await completion;
+		}
+	});
+});
+
 describe("when nothing is actually running", () => {
 	test("refuses with 409 rather than recording a hold nobody will honour", async () => {
 		// working in the DB, but no engine owns it: a foreground subagent between

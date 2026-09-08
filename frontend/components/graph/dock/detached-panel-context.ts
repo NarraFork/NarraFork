@@ -95,7 +95,11 @@ export function createDetachedPanelDockValue(input: {
 		openToolTypes: new Set(),
 		refreshOpenToolTypes: () => {},
 		openToolPanel: () => {},
-		openFilePanel: () => {},
+		openFilePanel: sourceDock?.openFilePanel,
+		fileReferenceSelection: sourceDock?.fileReferenceSelection,
+		setFileReferenceSelection: sourceDock?.setFileReferenceSelection,
+		registerAddFileReference: sourceDock?.registerAddFileReference,
+		addFileReference: sourceDock?.addFileReference,
 		closeToolPanel: () => {},
 		toggleToolPanel: () => {},
 	};

@@ -17,6 +17,222 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
+describe("trace inspector refs in cached measurements", () => {
+	it("replaces changed PK/message/attempt refs without changing geometry or remeasuring identical refs", async () => {
+		const { measureCache } = await import("./measure-cache");
+		const { measureElementCached } = await import("./registry");
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		measureCache.clear();
+		const initial = { toolCallId: "row", messageId: "message", executionAttempt: 1 };
+		const measure = (ref = initial) => {
+			const spec = adaptActivityUnit(
+				[
+					{
+						kind: "tool",
+						blockIndex: 0,
+						isSubagent: false,
+						msg: { id: ref.messageId, role: "assistant", contentJson: [] },
+						tc: {
+							id: ref.toolCallId,
+							executionAttempt: ref.executionAttempt,
+							toolUseId: "same-provider",
+							toolName: "Bash",
+							status: "success",
+							inputJson: { command: "same" },
+							outputJson: "same",
+						},
+					},
+				],
+				"stable-trace",
+				{ lod: 2 },
+			);
+			return measureElementCached(
+				"activity-trace",
+				spec.data,
+				600,
+				2,
+				spec.opts,
+				spec.key,
+				"stable-doc",
+			) as import("./measure/measure-tool-run").MeasuredCollapsibleTrace;
+		};
+		const first = measure();
+		for (const ref of [
+			{ ...initial, toolCallId: "new-row" },
+			{ ...initial, messageId: "cow-message" },
+			{ ...initial, executionAttempt: 2 },
+		]) {
+			const next = measure(ref);
+			expect(next).not.toBe(first);
+			expect(next.height).toBe(first.height);
+			expect(next.blocks).toEqual(first.blocks);
+			expect(next.rows[0]?.identity?.toolDetailRef).toEqual(ref);
+			expect(measure({ ...ref })).toBe(next);
+		}
+		measureCache.clear();
+	});
+});
+
+describe("bounded source retention", () => {
+	it("replaces prior live source revisions at one geometry while retaining same-frame hits", async () => {
+		const { measureCache } = await import("./measure-cache");
+		const { measureElementCached } = await import("./registry");
+		const { classifyToolDetail } = await import("@shared/pretext-layout/tool-detail");
+		measureCache.clear();
+		for (let i = 0; i < 220; i++) {
+			const data = {
+				toolName: "Edit",
+				summary: "live",
+				category: "file",
+				status: "running",
+				isStreaming: true,
+				detail: classifyToolDetail({
+					toolUseId: "source-retention",
+					toolName: "Edit",
+					category: "file",
+					status: "running",
+					isStreaming: true,
+					inputJson: {
+						_streamingFieldName: "new_string",
+						_streamingFieldValue: `value ${i}\n${"more\n".repeat(40)}`,
+						_streamingFields: { old_string: "old" },
+					},
+				}),
+			};
+			const result = measureElementCached(
+				"tool-call",
+				data,
+				600,
+				5,
+				{ opened: true },
+				"tool-source-retention",
+				"stable-doc",
+			);
+			expect(measureCache.size).toBe(1);
+			expect(measureCache.retainedSourceChars).toBeLessThan(2000);
+			expect(
+				measureElementCached(
+					"tool-call",
+					data,
+					600,
+					5,
+					{ opened: true },
+					"tool-source-retention",
+					"stable-doc",
+				),
+			).toBe(result);
+		}
+		measureCache.clear();
+	});
+
+	it("bounds retained source characters without LRU thrashing the admitted cohort", async () => {
+		const { MeasureCache } = await import("./measure-cache");
+		const cache = new MeasureCache(100, 400);
+		const element = (chars: number) =>
+			({
+				height: 20,
+				blocks: [],
+				frame: null,
+				contentWidth: 600,
+				detail: {
+					sections: [{ measuredBody: { model: { kind: "capped", text: "x".repeat(chars) } } }],
+				},
+			}) as never;
+		const first = element(240);
+		cache.set("a.1", first, "a");
+		for (let i = 0; i < 20; i++) {
+			cache.set("b", element(240), "b");
+			expect(cache.get("a.1")).toBe(first);
+		}
+		expect(cache.size).toBe(1);
+		expect(cache.retainedSourceChars).toBe(240);
+		cache.set("a.2", element(390), "a");
+		expect(cache.get("a.1")).toBeUndefined();
+		expect(cache.retainedSourceChars).toBe(390);
+		cache.clear();
+		expect(cache.retainedSourceChars).toBe(0);
+	});
+
+	it("accounts for retained Diff sources in nested/subagent measured bodies", async () => {
+		const { retainedBodySourceChars } = await import("./measure-cache");
+		const body = {
+			model: {
+				kind: "capped",
+				text: "copy",
+				diffDocument: { oldSource: { text: "old" }, newSource: { text: "new!" } },
+			},
+		};
+		expect(
+			retainedBodySourceChars({
+				promptMeasured: body,
+				rows: [{ cardMeasured: { resultMeasured: body } }],
+			}),
+		).toBe(22);
+	});
+});
+
+describe("canonical body revision", () => {
+	it("tracks format/live/source/range/revision even with identical painted text", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const { createSourceText } = await import("@shared/pretext-layout/source-text");
+		const body = {
+			...bodyFixture("input.prompt", "same"),
+			range: createSourceText("same", { epoch: "one" }).range,
+		};
+		const revision = (over: Record<string, unknown> = {}) =>
+			extractDataRevision({
+				detail: {
+					kind: "sections",
+					sections: [{ key: "input.prompt", body: { ...body, ...over } }],
+				},
+			});
+		for (const over of [
+			{ format: "markdown" },
+			{ live: true },
+			{ source: "input.message" },
+			{ revision: 2 },
+			{ range: { ...body.range, epoch: "two" } },
+			{ range: { ...body.range, startOffset: 2, startColumn: 2 } },
+		]) {
+			expect(revision(over)).not.toBe(revision());
+		}
+	});
+
+	it("keys source focus, never a viewport projection or reading state", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const { createDiffDocument } = await import("@shared/pretext-layout/diff-core");
+		const doc = createDiffDocument({ oldText: "old", newText: "new" });
+		const body = { ...bodyFixture("output.main", "same"), format: "diff", diffDocument: doc };
+		const revision = (diffDocument = doc, extras: Record<string, unknown> = {}) =>
+			extractDataRevision({
+				detail: {
+					kind: "sections",
+					sections: [{ key: "input.edit", body: { ...body, diffDocument, ...extras } }],
+				},
+			});
+		expect(revision({ ...doc, focus: { ...doc.focus!, column: 1 } })).not.toBe(revision());
+		expect(revision({ ...doc, revision: `${doc.revision}-next` })).not.toBe(revision());
+		expect(
+			revision(doc, {
+				scrollTop: 400,
+				following: false,
+				readingAnchor: { row: 200 },
+				projection: { startRow: 500, lines: ["viewport-only"] },
+			}),
+		).toBe(revision());
+	});
+
+	it("uses the same body revision for standalone and drilled-in subagent cards", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const card = { agentType: "send", promptBody: bodyFixture("input.prompt", "same") };
+		const changed = { ...card, promptBody: { ...card.promptBody, live: true } };
+		expect(extractDataRevision(changed)).not.toBe(extractDataRevision(card));
+		expect(extractDataRevision({ items: [{ key: "row", card: changed }] })).not.toBe(
+			extractDataRevision({ items: [{ key: "row", card }] }),
+		);
+	});
+});
+
 describe("MeasureCache", () => {
 	it("returns cached value for identical key", async () => {
 		const { MeasureCache } = await import("./measure-cache");
@@ -257,7 +473,15 @@ describe("extractDataRevision", () => {
 		const { extractDataRevision } = await import("./measure-cache");
 		const withDetail = (text?: string) => ({
 			status: "pending",
-			detail: { kind: "capped", cap: "plan", ...(text === undefined ? {} : { text }) },
+			detail: {
+				kind: "sections",
+				sections: [
+					{
+						key: "output.main",
+						body: { kind: "capped", cap: "plan", ...(text === undefined ? {} : { text }) },
+					},
+				],
+			},
 		});
 		// A plan arriving from a pending permission must not reuse the empty height.
 		const empty = extractDataRevision(withDetail());
@@ -277,7 +501,10 @@ describe("extractDataRevision", () => {
 		const { extractDataRevision } = await import("./measure-cache");
 		const body = (text: string) => ({
 			status: "success",
-			detail: { kind: "capped", cap: "term", text },
+			detail: {
+				kind: "sections",
+				sections: [{ key: "output.main", body: { kind: "capped", cap: "term", text } }],
+			},
 		});
 		const oneLine = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 30 chars, 1 line
 		const sixLines = "aaaa\naaaa\naaaa\naaaa\naaaa\naaaaa"; // 30 chars, 6 lines
@@ -291,7 +518,10 @@ describe("extractDataRevision", () => {
 	// the measure layer can parse (DETAIL_MARKDOWN_PREFIX_MAX_CHARS = 32KB).
 	it("detects a same-length edit anywhere inside the measured range", async () => {
 		const { extractDataRevision } = await import("./measure-cache");
-		const rev = (text: string) => extractDataRevision({ detail: { text } });
+		const rev = (text: string) =>
+			extractDataRevision({
+				detail: { kind: "sections", sections: [{ key: "output.main", body: { text } }] },
+			});
 		for (const depth of [500, 2_000, 8_000, 30_000]) {
 			const base = "x".repeat(depth);
 			expect(rev(`${base}aaaa bbbb`)).not.toBe(rev(`${base}aaaabbbb_`));
@@ -305,7 +535,9 @@ describe("extractDataRevision", () => {
 		const { extractDataRevision } = await import("./measure-cache");
 		const huge = "z".repeat(2_000_000);
 		const started = performance.now();
-		extractDataRevision({ detail: { text: huge } });
+		extractDataRevision({
+			detail: { kind: "sections", sections: [{ key: "output.main", body: { text: huge } }] },
+		});
 		// Fixed sample count → far below any per-frame budget (~0.05ms in practice).
 		expect(performance.now() - started).toBeLessThan(20);
 	});
@@ -366,16 +598,27 @@ describe("extractDataRevision", () => {
 		const withEntries = (count: number) => ({
 			status: "success",
 			detail: {
-				kind: "structured",
-				bodyLines: [],
-				entries: Array.from({ length: count }, (_, i) => ({ title: `e${i}`, snippet: "s" })),
+				kind: "sections",
+				sections: [
+					{
+						key: "output.main",
+						body: {
+							kind: "structured",
+							bodyLines: [],
+							entries: Array.from({ length: count }, (_, i) => ({ title: `e${i}`, snippet: "s" })),
+						},
+					},
+				],
 			},
 		});
 		expect(extractDataRevision(withEntries(1))).not.toBe(extractDataRevision(withEntries(2)));
 
 		const withRows = (text: string) => ({
 			status: "success",
-			detail: { kind: "meta-rows", rows: [{ text }] },
+			detail: {
+				kind: "sections",
+				sections: [{ key: "output.main", body: { kind: "meta-rows", rows: [{ text }] } }],
+			},
 		});
 		expect(extractDataRevision(withRows("short"))).not.toBe(
 			extractDataRevision(withRows("a much longer path value")),
@@ -389,7 +632,10 @@ describe("extractDataRevision", () => {
 		// clip the answer row away.
 		const askDetail = (question: Record<string, unknown>) => ({
 			status: "success",
-			detail: { kind: "ask", questions: [question] },
+			detail: {
+				kind: "sections",
+				sections: [{ key: "output.main", body: { kind: "ask", questions: [question] } }],
+			},
 		});
 		const unanswered = askDetail({
 			header: "Pick",
@@ -432,7 +678,15 @@ describe("extractDataRevision", () => {
 		const { extractDataRevision } = await import("./measure-cache");
 		const card = (over: Record<string, unknown> = {}) => ({
 			status: "success",
-			detail: { kind: "capped", cap: "term", text: "identical measured prefix" },
+			detail: {
+				kind: "sections",
+				sections: [
+					{
+						key: "output.main",
+						body: { kind: "capped", cap: "term", text: "identical measured prefix" },
+					},
+				],
+			},
 			...over,
 		});
 		const truncated = extractDataRevision(
@@ -454,10 +708,19 @@ describe("extractDataRevision", () => {
 		const { extractDataRevision } = await import("./measure-cache");
 		const rev = extractDataRevision({
 			status: "success",
-			detail: { kind: "generic", inputText: "abc", outputText: "de" },
+			detail: {
+				kind: "sections",
+				sections: [
+					{
+						key: "input.arguments",
+						body: { ...bodyFixture("output.main", "abc"), source: "input.arguments" },
+					},
+					{ key: "output.main", body: bodyFixture("output.main", "de") },
+				],
+			},
 		});
-		expect(rev).toContain("it:3");
-		expect(rev).toContain("ot:2");
+		expect(rev).toContain("tx:3");
+		expect(rev).toContain("tx:2");
 	});
 
 	/**
@@ -476,7 +739,12 @@ describe("extractDataRevision", () => {
 		const codeCard = (over: Record<string, unknown> = {}) => ({
 			toolName: "Read",
 			status: "success",
-			detail: { kind: "capped", cap: "code", text: "line1\nline2" },
+			detail: {
+				kind: "sections",
+				sections: [
+					{ key: "output.main", body: { kind: "capped", cap: "code", text: "line1\nline2" } },
+				],
+			},
 			...over,
 		});
 
@@ -519,14 +787,30 @@ describe("extractDataRevision", () => {
 				traceWith(
 					codeCard({
 						truncatedLeafCount: 1,
-						detail: { kind: "capped", cap: "code", text: "first 200…", textTruncated: true },
+						detail: {
+							kind: "sections",
+							sections: [
+								{
+									key: "output.main",
+									body: { kind: "capped", cap: "code", text: "first 200…", textTruncated: true },
+								},
+							],
+						},
 					}),
 				),
 			);
 			const full = extractDataRevision(
 				traceWith(
 					codeCard({
-						detail: { kind: "capped", cap: "code", text: "x".repeat(20_000) },
+						detail: {
+							kind: "sections",
+							sections: [
+								{
+									key: "output.main",
+									body: { kind: "capped", cap: "code", text: "x".repeat(20_000) },
+								},
+							],
+						},
 					}),
 				),
 			);
@@ -588,7 +872,11 @@ describe("extractDataRevision", () => {
 		it("a subagent conclusion landing re-keys the fold (status stays success)", async () => {
 			const { extractDataRevision } = await import("./measure-cache");
 			expect(
-				extractDataRevision(traceWith(agentCard({ resultText: "found the dispatch site" }))),
+				extractDataRevision(
+					traceWith(
+						agentCard({ resultBody: bodyFixture("output.main", "found the dispatch site") }),
+					),
+				),
 			).not.toBe(extractDataRevision(traceWith(agentCard())));
 		});
 
@@ -597,8 +885,16 @@ describe("extractDataRevision", () => {
 			// The prompt fold lives on the CARD, not in the trace's opts, so it is the
 			// only thing that moves when the reader unfolds it.
 			expect(
-				extractDataRevision(traceWith(agentCard({ prompt: "look", promptOpen: true }))),
-			).not.toBe(extractDataRevision(traceWith(agentCard({ prompt: "look" }))));
+				extractDataRevision(
+					traceWith(
+						agentCard({ promptBody: bodyFixture("input.prompt", "look"), promptOpen: true }),
+					),
+				),
+			).not.toBe(
+				extractDataRevision(
+					traceWith(agentCard({ promptBody: bodyFixture("input.prompt", "look") })),
+				),
+			);
 		});
 
 		it("an ordinary tool card pays nothing for the subagent component", async () => {
@@ -642,6 +938,128 @@ describe("extractDataRevision", () => {
 				extractDataRevision(traceWithBody("one line")),
 			);
 		});
+	});
+});
+
+describe("subagent file-change cache identity", () => {
+	const file = {
+		subagentNarratorId: "child",
+		deviceId: "device-a",
+		workspacePath: "/repo",
+		filePath: "same.ts",
+		linesAdded: 2,
+		linesRemoved: 1,
+		editCount: 1,
+		unmeasuredCount: 0,
+		outsideParentWorkspace: false,
+	};
+	const changes = {
+		files: [file],
+		totalFiles: 1,
+		totalUnmeasured: 0,
+		bashTouchedCount: 0,
+		countsTruncated: false,
+		attributionScope: "legacy_unscoped",
+	};
+	const data = (over: Record<string, unknown> = {}) => ({
+		agentType: "general",
+		isTerminal: true,
+		description: "same card",
+		fileChanges: { ...changes, ...over },
+	});
+
+	it.each([
+		{ deviceId: "device-b" },
+		{ workspacePath: "/other" },
+		{ subagentNarratorId: "other-child" },
+		{ outsideParentWorkspace: true },
+		{ outsideParentWorkspace: null },
+		{ deviceId: null, workspacePath: null, outsideParentWorkspace: null },
+		{ unmeasuredCount: 1 },
+	])("invalidates standalone and drilled-in cards for %j", async (over) => {
+		const { extractDataRevision, buildCacheKey } = await import("./measure-cache");
+		const key = (card: unknown) =>
+			buildCacheKey("tool-same", "subagent-card", 600, 5, undefined, extractDataRevision(card));
+		const updated = data({ files: [{ ...file, ...over }] });
+		expect(key(updated)).not.toBe(key(data()));
+		const trace = (card: unknown) => ({ items: [{ key: "same", title: "Agent", card }] });
+		expect(key(trace(updated))).not.toBe(key(trace(data())));
+	});
+
+	it("tracks every scope component without upgrading legacy windows", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const scope = { sourceToolUseId: "call-a", startedAt: "start", completedAt: "end" };
+		const scoped = data({ scope });
+		const baseline = extractDataRevision(scoped);
+		expect(baseline).not.toBe(extractDataRevision(data()));
+		expect(baseline).toContain("legacy_unscoped");
+		for (const over of [
+			{ sourceToolUseId: "call-b" },
+			{ startedAt: "new-start" },
+			{ completedAt: "new-end" },
+			{ startedAt: null, completedAt: null },
+		]) {
+			expect(extractDataRevision(data({ scope: { ...scope, ...over } }))).not.toBe(baseline);
+		}
+		expect(extractDataRevision(data({ attributionScope: "future-scope" }))).not.toBe(
+			extractDataRevision(data()),
+		);
+	});
+
+	it("distinguishes unknown/inside/outside but normalizes missing legacy location to unknown", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const rev = (outsideParentWorkspace: unknown) =>
+			extractDataRevision(data({ files: [{ ...file, outsideParentWorkspace }] }));
+		expect(new Set([rev(null), rev(false), rev(true)]).size).toBe(3);
+		expect(rev(undefined)).toBe(rev(null));
+	});
+
+	it("keeps delimiter-bearing identities distinct and rekeys a same-path device swap", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const rows = [file, { ...file, deviceId: "device-b" }];
+		expect(extractDataRevision(data({ files: rows }))).not.toBe(
+			extractDataRevision(data({ files: rows.toReversed() })),
+		);
+		const rev = (deviceId: string, workspacePath: string) =>
+			extractDataRevision(data({ files: [{ ...file, deviceId, workspacePath }] }));
+		expect(rev("device|/repo", "/other")).not.toBe(rev("device", "/repo|/other"));
+	});
+
+	it("actually misses the measure cache when only device or scope changes", async () => {
+		const { measureElementCached } = await import("./registry");
+		const { measureCache } = await import("./measure-cache");
+		measureCache.clear();
+		try {
+			const measure = (card: unknown) =>
+				measureElementCached("subagent-card", card, 600, 5, undefined, "same-tool", 7);
+			const baseline = measure(data());
+			expect(measure(data())).toBe(baseline);
+			const newDevice = measure(data({ files: [{ ...file, deviceId: "device-b" }] }));
+			expect(newDevice).not.toBe(baseline);
+			expect(newDevice.height).toBe(baseline.height);
+			const scope = { sourceToolUseId: "same-tool", startedAt: null, completedAt: null };
+			const scoped = measure(data({ scope }));
+			expect(scoped).not.toBe(baseline);
+			expect(scoped.height).toBeGreaterThan(baseline.height);
+			const updatedScope = measure(data({ scope: { ...scope, completedAt: "end" } }));
+			expect(updatedScope).not.toBe(scoped);
+			expect(updatedScope.height).toBe(scoped.height);
+			expect(measureCache.hits).toBe(1);
+			expect(measureCache.misses).toBe(4);
+		} finally {
+			measureCache.clear();
+		}
+	});
+
+	it("rekeys summary-only updates even with no listed files", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const empty = data({ files: [], totalFiles: 0 });
+		const revisions = [
+			empty,
+			data({ files: [], totalFiles: 0, bashTouchedCount: 3 }),
+			data({ files: [], totalFiles: 0, countsTruncated: true }),
+		].map(extractDataRevision);
+		expect(new Set(revisions).size).toBe(3);
 	});
 });
 
@@ -932,3 +1350,19 @@ describe("computeVListLayout with cache (performance)", () => {
 		expect(measureCache.hits).toBe(N); // all existing items hit
 	});
 });
+
+function bodyFixture(
+	source: "input.prompt" | "output.main",
+	text: string,
+): import("@shared/pretext-layout/tool-detail").ToolCappedDetail {
+	return {
+		kind: "capped",
+		id: JSON.stringify(["fixture-call", source]),
+		source,
+		cap: source === "input.prompt" ? "code" : "agent-result",
+		text,
+		format: source === "input.prompt" ? "text" : "markdown",
+		live: false,
+		followTarget: { kind: "end" },
+	};
+}

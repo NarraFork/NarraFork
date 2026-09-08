@@ -24,6 +24,14 @@ const FeatureFsReadAtomicResolvedPathV1 = "fs.read.atomic-resolved-path.v1"
 // immediately before writing to the canonical create/existing path.
 const FeatureFsWriteAtomicResolvedPathV1 = "fs.write.atomic-resolved-path.v1"
 
+// FeatureGlobBoundedV1 guarantees cancellation/deadline checks during enumeration
+// (including unmatched entries) and count/byte caps before collecting results.
+const FeatureGlobBoundedV1 = "glob.bounded.v1"
+
+// FeatureFsReadBoundedV1 means fs.read enforces cancellation/deadlines between
+// bounded chunks and revalidates canonical identity and file size before returning.
+const FeatureFsReadBoundedV1 = "fs.read.bounded.v1"
+
 // ── Frame envelope ────────────────────────────────────────────────────────────
 
 // Frame is the common shape used to peek at a message's type before decoding
@@ -84,6 +92,8 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 		FeatureFsStatResolvedPathV1,
 		FeatureFsReadAtomicResolvedPathV1,
 		FeatureFsWriteAtomicResolvedPathV1,
+		FeatureGlobBoundedV1,
+		FeatureFsReadBoundedV1,
 	} {
 		seen := false
 		for _, feature := range features {

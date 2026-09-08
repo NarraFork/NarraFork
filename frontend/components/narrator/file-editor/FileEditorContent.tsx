@@ -3,8 +3,8 @@
  *
  * Wraps the CodeMirror surface with the three things a save needs to be honest:
  * the optimistic lock, a conflict view built from the existing `DiffView`, and an
- * explicit choice when the lock fails. Editing is opt-in per panel — the default
- * remains the read-only viewer, so nothing about opening a file changes.
+ * explicit choice when the lock fails. Text panels open directly in this editor;
+ * remote files and files without a narrator remain read-only on the same surface.
  *
  * The state transitions live in `save-state.ts` and are tested there; this component
  * only performs I/O and rendering.
@@ -22,11 +22,26 @@ import {
 	Text,
 	Tooltip,
 } from "@mantine/core";
-import { IconAlertTriangle, IconDeviceFloppy, IconRefresh } from "@tabler/icons-react";
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import {
+	FILE_REFERENCE_READ_TIMEOUT_MS,
+	type FileReferenceEditorSelection,
+	type FileSelection,
+} from "@shared/file-reference";
+import {
+	IconAlertTriangle,
+	IconDeviceFloppy,
+	IconRefresh,
+	IconSearch,
+	IconTextWrap,
+} from "@tabler/icons-react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError, api } from "../../../lib/api";
+import { request } from "../../../lib/api/client";
+import { fileReferenceApi } from "../../../lib/api/file-references";
 import { getShikiLang } from "../../../lib/shiki-lang";
+import { useFileReferenceScope } from "../FileReferenceScope";
+import { filePanelBaseName } from "../panels/panel-kind";
 import { CodeMirrorEditor } from "./CodeMirrorEditor";
 import {
 	applyEdit,
@@ -47,13 +62,28 @@ import {
 
 const DiffView = lazy(() => import("../DiffView").then((m) => ({ default: m.DiffView })));
 
+/** Match CodeMirror's document newlines without changing the server's byte hash or encoding. */
+function editorText(content: string): string {
+	return content.replace(/\r\n?/g, "\n");
+}
+
 export interface FileEditorContentProps {
 	/** Absolute path of the file being edited. */
 	filePath: string;
 	/** Narrator whose workspace bounds the write. Required by the server. */
-	narratorId: string;
+	narratorId?: string;
+	deviceId?: string;
+	referenceOrigin?: boolean;
+	selection?: FileSelection;
+	navigationRequestId?: string;
+	/** Only direct editor selection events may take ownership; metadata refreshes may not. */
+	onFileReferenceSelectionChange?: (
+		selection: FileReferenceEditorSelection | null,
+		takeOwnership?: boolean,
+	) => void;
 	/**
-	 * Reports whether the buffer differs from disk.
+	 * Reports whether closing would be unsafe: the buffer differs from disk or
+	 * a write is still in flight (even if the user undid back to the old baseline).
 	 *
 	 * The buffer lives only in this component's state, so unmounting the editor
 	 * destroys it. The owner needs to know before it does that.
@@ -80,10 +110,61 @@ function describeLoadError(err: unknown, t: (key: string) => string): string {
 	return err instanceof Error ? err.message : String(err);
 }
 
-export function FileEditorContent({ filePath, narratorId, onDirtyChange }: FileEditorContentProps) {
+/** Only a known saved version can back #selection; dirty remains explicit metadata. */
+export function fileEditorReferenceSelection(
+	state: EditorState | null,
+	deviceId: string,
+	filePath: string,
+	selection: FileSelection | null,
+): FileReferenceEditorSelection | null {
+	if (!state?.baseHash || !selection) return null;
+	return {
+		target: { deviceId, path: filePath, selection },
+		label: filePanelBaseName(filePath),
+		expectedHash: state.baseHash,
+		dirty: isDirty(state),
+	};
+}
+
+export function FileEditorContent({
+	filePath,
+	narratorId,
+	deviceId = "local",
+	referenceOrigin = false,
+	selection,
+	navigationRequestId,
+	onFileReferenceSelectionChange,
+	onDirtyChange,
+}: FileEditorContentProps) {
 	const { t } = useTranslation("narrator");
-	const [state, setState] = useState<EditorState | null>(null);
+	const tRef = useRef(t);
+	tRef.current = t;
+	const scope = useFileReferenceScope();
+	const publishSelection = onFileReferenceSelectionChange ?? scope.setSelection;
+	const [editorSelection, setEditorSelection] = useState<FileSelection | null>(null);
+	const loadControllerRef = useRef<AbortController | null>(null);
+	// Upgrading a reused panel to a reference must not reload its dirty editor.
+	// The next explicit load still uses the latest scoped/legacy reader policy.
+	const referenceOriginRef = useRef(referenceOrigin);
+	referenceOriginRef.current = referenceOrigin;
+	const [state, renderState] = useState<EditorState | null>(null);
+	const stateRef = useRef<EditorState | null>(null);
+	const setState = useCallback(
+		(next: EditorState | null | ((previous: EditorState | null) => EditorState | null)) => {
+			stateRef.current = typeof next === "function" ? next(stateRef.current) : next;
+			renderState(stateRef.current);
+		},
+		[],
+	);
 	const [loadError, setLoadError] = useState<string | null>(null);
+	const [loading, setLoading] = useState(true);
+	const [lineWrapping, setLineWrapping] = useState(false);
+	const [searchRequestId, setSearchRequestId] = useState(0);
+	const readOnly = deviceId !== "local" || !narratorId;
+	const phrases = useMemo(
+		() => t("fileEditor.searchPhrases", { returnObjects: true }) as Record<string, string>,
+		[t],
+	);
 	/**
 	 * The file's encoding, echoed back on every save.
 	 *
@@ -105,24 +186,59 @@ export function FileEditorContent({ filePath, narratorId, onDirtyChange }: FileE
 	const savingRef = useRef(false);
 
 	const load = useCallback(async () => {
+		if (savingRef.current) return;
+		if (
+			stateRef.current &&
+			isDirty(stateRef.current) &&
+			!window.confirm(tRef.current("fileEditor.confirmReload"))
+		)
+			return;
+		const bufferAtStart = stateRef.current?.buffer;
+		loadControllerRef.current?.abort();
+		const controller = new AbortController();
+		loadControllerRef.current = controller;
+		const timeout = setTimeout(() => controller.abort(), FILE_REFERENCE_READ_TIMEOUT_MS);
 		setLoadError(null);
+		setLoading(true);
 		try {
-			// `/fs/edit-source`, not `/fs/preview`: preview decodes as UTF-8 unconditionally,
-			// so saving a GBK file loaded through it would write replacement characters over
-			// every un-decodable byte. This route reports the real encoding and refuses
-			// files that cannot round-trip as text at all.
-			const res = await api.fsEditSource(filePath);
+			// Scoped/remote identities must never fall back to the local filesystem.
+			if ((referenceOriginRef.current || deviceId !== "local") && !narratorId)
+				throw new Error(tRef.current("fileEditor.missingContext"));
+			// Both readers return server-decoded text, hash and encoding together.
+			const res =
+				referenceOriginRef.current || deviceId !== "local"
+					? await fileReferenceApi.preview(
+							narratorId as string,
+							{ deviceId, path: filePath },
+							controller.signal,
+						)
+					: await request<{ content: string; encoding: string; hash: string }>(
+							`/fs/edit-source?path=${encodeURIComponent(filePath)}`,
+							{ signal: controller.signal },
+						);
+			if (loadControllerRef.current !== controller) return;
+			// An edit made while the read was pending must never be replaced by its reply.
+			if (stateRef.current?.buffer !== bufferAtStart)
+				throw new Error(tRef.current("fileEditor.changedDuringReload"));
 			setEncoding(res.encoding);
-			// The hash comes from the server, computed over the same decoded text — so the
-			// lock cannot disagree with itself, and it works without WebCrypto.
-			setState(initialEditorState(res.content, res.hash));
+			// Preview preserves source newlines; both initial load and reload need the
+			// same LF baseline as the editor, not a synthetic unsaved conversion.
+			setState(initialEditorState(editorText(res.content), res.hash));
 		} catch (err) {
-			setLoadError(describeLoadError(err, t));
+			if (loadControllerRef.current === controller)
+				setLoadError(describeLoadError(err, tRef.current));
+		} finally {
+			clearTimeout(timeout);
+			if (loadControllerRef.current === controller) setLoading(false);
 		}
-	}, [filePath, t]);
+	}, [deviceId, filePath, narratorId, setState]);
 
 	useEffect(() => {
 		void load();
+		return () => {
+			loadControllerRef.current?.abort();
+			loadControllerRef.current = null;
+		};
 	}, [load]);
 
 	/**
@@ -134,9 +250,10 @@ export function FileEditorContent({ filePath, narratorId, onDirtyChange }: FileE
 	 */
 	const performSave = useCallback(
 		async (confirmOutsideRoots: boolean) => {
-			if (!state || savingRef.current) return;
+			const current = stateRef.current;
+			if (!current || savingRef.current || loading || readOnly || !narratorId) return;
 
-			const sending = state.buffer;
+			const sending = current.buffer;
 			savingRef.current = true;
 			setState((prev) => (prev ? beginSave(prev) : prev));
 			try {
@@ -144,7 +261,7 @@ export function FileEditorContent({ filePath, narratorId, onDirtyChange }: FileE
 					path: filePath,
 					content: sending,
 					narratorId,
-					baseHash: state.baseHash,
+					baseHash: current.baseHash,
 					// Echoed, never re-derived: the encoding belongs to the file, and letting the
 					// server sniff the NEW text could convert the file because the replacement
 					// content happened to sniff differently.
@@ -186,7 +303,11 @@ export function FileEditorContent({ filePath, narratorId, onDirtyChange }: FileE
 					if (typeof data?.currentContent === "string" && data.currentHash) {
 						setState((prev) =>
 							prev
-								? saveConflicted(prev, data.currentContent as string, data.currentHash as string)
+								? saveConflicted(
+										prev,
+										editorText(data.currentContent as string),
+										data.currentHash as string,
+									)
 								: prev,
 						);
 						return;
@@ -202,24 +323,75 @@ export function FileEditorContent({ filePath, narratorId, onDirtyChange }: FileE
 				savingRef.current = false;
 			}
 		},
-		[encoding, filePath, narratorId, state, t],
+		[encoding, filePath, narratorId, loading, readOnly, t, setState],
 	);
 
 	const handleSave = useCallback(() => {
-		if (!state || !canSave(state)) return;
+		if (!stateRef.current || !canSave(stateRef.current)) return;
 		void performSave(false);
-	}, [performSave, state]);
+	}, [performSave]);
 
-	const handleChange = useCallback((buffer: string) => {
-		setState((prev) => (prev ? applyEdit(prev, buffer) : prev));
-	}, []);
+	const handleChange = useCallback(
+		(buffer: string) => {
+			// Ctrl+S can arrive before React commits the input render. Publish the
+			// new buffer synchronously so saving never sends the previous keystroke.
+			if (!stateRef.current) return;
+			setState(applyEdit(stateRef.current, buffer));
+		},
+		[setState],
+	);
+	const handleSelectionChange = useCallback(
+		(next: FileSelection | null, selectionSet: boolean) => {
+			// Publish explicit selection transactions even when the range is unchanged:
+			// another panel may have acquired ownership. Document-only updates use the
+			// metadata effect below and must not acquire ownership (e.g. reload).
+			if (selectionSet)
+				publishSelection?.(
+					fileEditorReferenceSelection(stateRef.current, deviceId, filePath, next),
+					true,
+				);
+			setEditorSelection((previous) =>
+				previous?.startLineNumber === next?.startLineNumber &&
+				previous?.startColumn === next?.startColumn &&
+				previous?.endLineNumber === next?.endLineNumber &&
+				previous?.endColumn === next?.endColumn
+					? previous
+					: next,
+			);
+		},
+		[deviceId, filePath, publishSelection],
+	);
 
 	// Computed before the early returns below so the hook order stays fixed; the
 	// render path re-reads it once `state` is known to be non-null.
 	const dirty = state ? isDirty(state) : false;
+	const exitBlocked = dirty || !!state?.saving;
+	const baseHash = state?.baseHash;
 	useEffect(() => {
-		onDirtyChange?.(dirty);
-	}, [dirty, onDirtyChange]);
+		publishSelection?.(
+			baseHash && editorSelection
+				? {
+						target: { deviceId, path: filePath, selection: editorSelection },
+						label: filePanelBaseName(filePath),
+						expectedHash: baseHash,
+						dirty,
+					}
+				: null,
+		);
+	}, [deviceId, filePath, editorSelection, baseHash, dirty, publishSelection]);
+	useEffect(() => {
+		const beforeUnload = (event: BeforeUnloadEvent) => {
+			if (!savingRef.current && (!stateRef.current || !isDirty(stateRef.current))) return;
+			event.preventDefault();
+			event.returnValue = "";
+		};
+		window.addEventListener("beforeunload", beforeUnload);
+		return () => window.removeEventListener("beforeunload", beforeUnload);
+	}, []);
+	useEffect(() => () => publishSelection?.(null), [publishSelection]);
+	useEffect(() => {
+		onDirtyChange?.(exitBlocked);
+	}, [exitBlocked, onDirtyChange]);
 	useEffect(
 		() => () => {
 			// On unmount the buffer is gone, so nothing is dirty any more — leaving the
@@ -230,7 +402,7 @@ export function FileEditorContent({ filePath, narratorId, onDirtyChange }: FileE
 		[onDirtyChange],
 	);
 
-	if (loadError) {
+	if (loadError && !state) {
 		return (
 			<Center h="100%" p="md">
 				<Group gap="xs" wrap="nowrap">
@@ -259,42 +431,76 @@ export function FileEditorContent({ filePath, narratorId, onDirtyChange }: FileE
 	return (
 		<Box style={{ height: "100%", display: "flex", flexDirection: "column" }}>
 			<Group justify="space-between" gap="xs" px="xs" py={6} wrap="nowrap">
-				<Group gap={6} wrap="nowrap">
+				<Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
+					<Text size="xs" c="dimmed" truncate title={filePath}>
+						{filePanelBaseName(filePath)}
+					</Text>
+					{readOnly && (
+						<Badge size="xs" color="gray">
+							{t("fileEditor.readOnly")}
+						</Badge>
+					)}
 					{dirty && (
 						<Badge size="xs" color="yellow" variant="light">
 							{t("fileEditor.unsaved")}
 						</Badge>
 					)}
-					{state.error && (
-						<Text size="xs" c="red" truncate>
-							{state.error}
+					{(state.error || loadError) && (
+						<Text size="xs" c="red" truncate title={state.error ?? loadError ?? undefined}>
+							{state.error || loadError}
 						</Text>
 					)}
 				</Group>
-				<Group gap={4} wrap="nowrap">
+				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+					<Tooltip label={`${t("fileEditor.search")} (Ctrl/Cmd+F)`} openDelay={200}>
+						<ActionIcon
+							variant="subtle"
+							size="sm"
+							aria-label={t("fileEditor.search")}
+							onClick={() => setSearchRequestId((id) => id + 1)}
+						>
+							<IconSearch size={14} />
+						</ActionIcon>
+					</Tooltip>
+					<Tooltip label={t("fileEditor.wrap")} openDelay={200}>
+						<ActionIcon
+							variant={lineWrapping ? "light" : "subtle"}
+							size="sm"
+							aria-label={t("fileEditor.wrap")}
+							aria-pressed={lineWrapping}
+							onClick={() => setLineWrapping((enabled) => !enabled)}
+						>
+							<IconTextWrap size={14} />
+						</ActionIcon>
+					</Tooltip>
 					<Tooltip label={t("fileEditor.reload")} openDelay={200}>
 						<ActionIcon
 							variant="subtle"
 							color="gray"
 							size="sm"
 							onClick={() => void load()}
-							disabled={state.saving}
+							aria-label={t("fileEditor.reload")}
+							loading={loading}
+							disabled={state.saving || loading}
 						>
 							<IconRefresh size={14} />
 						</ActionIcon>
 					</Tooltip>
-					<Tooltip label={t("fileEditor.save")} openDelay={200}>
-						<ActionIcon
-							variant={dirty ? "filled" : "subtle"}
-							color={dirty ? "green" : "gray"}
-							size="sm"
-							onClick={handleSave}
-							loading={state.saving}
-							disabled={!canSave(state)}
-						>
-							<IconDeviceFloppy size={14} />
-						</ActionIcon>
-					</Tooltip>
+					{!readOnly && (
+						<Tooltip label={`${t("fileEditor.save")} (Ctrl/Cmd+S)`} openDelay={200}>
+							<ActionIcon
+								variant={dirty ? "filled" : "subtle"}
+								color={dirty ? "green" : "gray"}
+								size="sm"
+								onClick={handleSave}
+								aria-label={t("fileEditor.save")}
+								loading={state.saving}
+								disabled={loading || !canSave(state)}
+							>
+								<IconDeviceFloppy size={14} />
+							</ActionIcon>
+						</Tooltip>
+					)}
 				</Group>
 			</Group>
 
@@ -383,7 +589,20 @@ export function FileEditorContent({ filePath, narratorId, onDirtyChange }: FileE
 			)}
 
 			<Box style={{ flex: 1, minHeight: 0 }}>
-				<CodeMirrorEditor value={state.buffer} onChange={handleChange} onSave={handleSave} />
+				<CodeMirrorEditor
+					value={state.buffer}
+					language={getShikiLang(filePath)}
+					onChange={handleChange}
+					onSave={handleSave}
+					selection={selection}
+					navigationRequestId={navigationRequestId}
+					onSelectionChange={handleSelectionChange}
+					readOnly={readOnly || loading}
+					lineWrapping={lineWrapping}
+					searchRequestId={searchRequestId}
+					phrases={phrases}
+					ariaLabel={filePath}
+				/>
 			</Box>
 		</Box>
 	);

@@ -26,7 +26,7 @@
  * overlapping window. The result is persisted so a rollback can act on this call's
  * own changes instead of the whole workspace delta.
  */
-import { relative } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages, narratorToolCalls } from "../db/schema";
@@ -54,17 +54,9 @@ export interface TreeSnapshotSession {
 	_defaultDeviceId?: string | null;
 	/** Staged pre-execution hashes, keyed by toolUseId. */
 	_treeHashBefore?: Map<string, string>;
-	/** Cache of the most recent capture; cleared whenever a tool writes. */
+	/** Last observation, for compatibility only; never reused as a tool boundary. */
 	_lastTreeHash?: string;
-	/**
-	 * When `_lastTreeHash` was captured (epoch ms).
-	 *
-	 * The cached hash is reused as the next tool's `before`, so the span the two
-	 * boundaries describe can start well before that tool did — in real sessions by
-	 * many seconds. Attribution has to be asked about *that* span, not about the
-	 * tool's own runtime, otherwise a neighbour's write landing in the gap is
-	 * invisible to the query and gets credited to the tool.
-	 */
+	/** When the last observation completed (epoch ms), not a future tool's start. */
 	_lastTreeHashAt?: number;
 }
 
@@ -89,21 +81,21 @@ export function declaredWorktreePaths(cwd: string, input: unknown): string[] {
 	// `before === after` and is now stated directly.
 	if (specVfsService.isSpecUri(filePath)) return [];
 	try {
-		const rel = relative(cwd, filePath);
-		// Empty means the path *is* the worktree root; ".." means it escapes the tree.
-		// Neither is a file this call can own.
-		if (!rel || rel === "." || rel.startsWith("..")) return [];
-		// git reports paths with forward slashes even on Windows, and the owned set is
-		// compared against `diff-tree` output.
-		return [rel.split(/[\\/]/).join("/")];
+		const rel = relative(cwd, resolve(cwd, filePath));
+		// Empty means the root itself; a parent component or a different Windows
+		// drive escapes the scope. A filename beginning with '..' does not.
+		if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return [];
+		// Only the local platform's separator is a separator. A backslash is a real
+		// filename byte on POSIX, not a Windows path to reinterpret.
+		return [rel.split(sep).join("/")];
 	} catch {
 		return [];
 	}
 }
 
 /**
- * Capture the session workspace, reusing the cached hash when nothing has run
- * since the last capture.
+ * Capture a fresh session-workspace observation. A previous session hash cannot
+ * describe the next boundary: human and other narrator writes bypass that cache.
  *
  * Never throws. Returns null for a remote target, a non-git cwd, or a git error.
  *
@@ -119,20 +111,22 @@ export async function captureSessionTree(
 	narratorId: string,
 	opts?: { minCaptureStartedAt?: number },
 ): Promise<string | null> {
-	// The gate comes before the cache: with the feature switched off mid-session a
-	// hash captured earlier must not surface as one side of a boundary pair.
+	// Even a failed/disabled capture must not leave a stale observation looking fresh.
+	session._lastTreeHash = undefined;
+	session._lastTreeHashAt = undefined;
 	if (!settings.chapters.treeSnapshotsEnabled) return null;
-	if (session._lastTreeHash) return session._lastTreeHash;
-	// Remote workspaces have no shadow repository yet; the per-file snapshot path
-	// still covers them.
 	if ((session._defaultDeviceId ?? LOCAL_DEVICE_ID) !== LOCAL_DEVICE_ID) return null;
 	const treeHash = await worktreeTreeSnapshot.tryCaptureHot(session.cwd, LOCAL_DEVICE_ID, {
-		...(opts?.minCaptureStartedAt !== undefined && {
-			minStartedAt: opts.minCaptureStartedAt,
-		}),
+		// Before boundaries also reject an older in-flight warm scan. It may have
+		// read this file before a human saved it between the two tool calls.
+		minStartedAt: opts?.minCaptureStartedAt ?? Date.now(),
+		requireFresh: true,
 	});
 	if (!treeHash) {
-		logger.debug("Workspace tree snapshot unavailable", { narratorId, cwd: session.cwd });
+		logger.warn("Workspace tree snapshot unavailable; boundary protection degraded", {
+			narratorId,
+			cwd: session.cwd,
+		});
 		return null;
 	}
 	session._lastTreeHash = treeHash;
@@ -154,12 +148,16 @@ export async function recordTreeSnapshotBefore(
 	toolUseId: string,
 	declared: string[] | null = null,
 ): Promise<void> {
-	const treeHash = await captureSessionTree(session, narratorId);
-	// The claim window has to start when the `before` state was actually captured,
-	// which may be earlier than now: a cached hash from a previous tool is reused,
-	// and everything written since then is inside the span the two boundaries
-	// describe. Registered after the capture so that timestamp is available.
-	openClaim(session.cwd, narratorId, toolUseId, declared, session._lastTreeHashAt);
+	// A repeated attempt cannot inherit an earlier attempt's staged boundary.
+	session._treeHashBefore?.delete(toolUseId);
+	const startedAt = Date.now();
+	const treeHash = await captureSessionTree(session, narratorId, {
+		minCaptureStartedAt: startedAt,
+	});
+	// The scan is an observation window, not an atomic timestamp. Include writes
+	// that overlap the scan, but never extend it back to a previous tool's cache.
+	if ((session._defaultDeviceId ?? LOCAL_DEVICE_ID) !== LOCAL_DEVICE_ID) return;
+	openClaim(session.cwd, narratorId, toolUseId, declared, startedAt);
 	if (!treeHash) return;
 	if (!session._treeHashBefore) session._treeHashBefore = new Map();
 	session._treeHashBefore.set(toolUseId, treeHash);
@@ -267,8 +265,9 @@ export async function recordTreeSnapshotAfter(
 	session: TreeSnapshotSession,
 	narratorId: string,
 	toolUseId: string,
+	opts?: { unavailable: true },
 ): Promise<TreeSnapshotAfterResult> {
-	const before = session._treeHashBefore?.get(toolUseId) ?? null;
+	const before = opts?.unavailable ? null : (session._treeHashBefore?.get(toolUseId) ?? null);
 	session._treeHashBefore?.delete(toolUseId);
 	// The tool just wrote, so any cached hash describes a stale state.
 	session._lastTreeHash = undefined;
@@ -279,15 +278,13 @@ export async function recordTreeSnapshotAfter(
 	// producing a tree that never existed on disk. Rolling back "to after this
 	// message" would then silently drop this call's own edits. The cutoff tells
 	// tryCaptureHot to wait out such a scan and re-capture instead of sharing it.
-	const after = await captureSessionTree(session, narratorId, {
-		minCaptureStartedAt: Date.now(),
-	});
-	if (!before && !after) {
-		// Nothing was measured, so there is no resolved set to close the claim with.
-		closeClaim(session.cwd, toolUseId, []);
-		return { before, after, changedFiles: [], workspaceDelta: [] };
-	}
-
+	const after = opts?.unavailable
+		? null
+		: await captureSessionTree(session, narratorId, {
+				minCaptureStartedAt: Date.now(),
+			});
+	// A missing boundary or failed diff is unknown, never an ownedPaths=[] no-op.
+	let deltaMeasured = before !== null && after !== null;
 	let workspaceDelta: string[] = [];
 	let deltaStatuses: { path: string; kind: "added" | "updated" | "deleted" }[] = [];
 	if (before && after && before !== after) {
@@ -303,7 +300,12 @@ export async function recordTreeSnapshotAfter(
 			);
 			workspaceDelta = deltaStatuses.map((entry) => entry.path);
 		} catch (err) {
-			logger.debug("Tree snapshot diff failed", { narratorId, toolUseId, error: String(err) });
+			deltaMeasured = false;
+			logger.warn("Tree snapshot diff failed; path coverage is unknown", {
+				narratorId,
+				toolUseId,
+				error: String(err),
+			});
 		}
 	}
 
@@ -319,20 +321,21 @@ export async function recordTreeSnapshotAfter(
 	}
 
 	const owned = resolveOwnedPaths(session.cwd, narratorId, toolUseId, workspaceDelta);
-	// Closing with the resolved set (not the declaration) keeps the registry honest:
-	// a declared path the tool never touched must stop shadowing neighbours.
-	closeClaim(session.cwd, toolUseId, owned);
+	if (deltaMeasured) {
+		// Only a measured empty delta can clear a tool's declared paths.
+		closeClaim(session.cwd, toolUseId, owned);
+	} else {
+		sealClaim(session.cwd, toolUseId);
+	}
 
 	try {
 		const [updated] = await db
 			.update(narratorToolCalls)
 			.set({
-				...(before && { treeHashBefore: before }),
-				...(after && { treeHashAfter: after }),
-				// Written whenever a boundary exists, including as an empty array: that
-				// is a positive result ("this call changed nothing"), which is exactly
-				// what a rollback needs to know to skip it.
-				...(before && after && { ownedPathsJson: owned }),
+				treeHashBefore: before,
+				treeHashAfter: after,
+				// Explicit null also invalidates evidence from a previous attempt.
+				ownedPathsJson: deltaMeasured ? owned : null,
 			})
 			.where(
 				and(
@@ -358,12 +361,12 @@ export async function recordTreeSnapshotAfter(
 		// after this message" has a boundary to restore. A later tool in the same
 		// message overwrites it, which is correct: the boundary is the state after the
 		// message's final tool.
-		if (after && updated?.messageId) {
+		if (updated?.messageId) {
 			await db
 				.update(narratorMessages)
 				.set({
 					treeHashAfter: after,
-					...(linked && { snapshotCommitSha: linked.commitSha }),
+					snapshotCommitSha: linked?.commitSha ?? null,
 				})
 				.where(eq(narratorMessages.id, updated.messageId));
 		}

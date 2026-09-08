@@ -5,6 +5,7 @@
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { ModelCard } from "@shared/model-card";
+import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
 import type { PermissionMode } from "../permission-modes";
@@ -573,6 +574,8 @@ export interface NarraForkSettings {
 			search?: string[];
 			review?: string[];
 		};
+		/** Optional fixed tiers for entries in the corresponding allowed model pool. */
+		subagentModelReasoningEfforts?: SubagentModelReasoningEfforts;
 		/**
 		 * Enable non-UTF-8 charset detection (GBK, Shift_JIS, …) for file read/write
 		 * and grep. Note: shell command output is auto-detected on Windows regardless

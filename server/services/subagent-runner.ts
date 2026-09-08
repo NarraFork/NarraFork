@@ -1,3 +1,4 @@
+import type { FileReferenceSnapshot } from "@shared/file-reference";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, narratorToolCalls } from "../db/schema";
@@ -6,7 +7,11 @@ import {
 	normalizeOptionalExecutionTimeout,
 	resolveOptionalExecutionTimeout,
 } from "../lib/agent/execution-timeout";
-import type { ToolUpdateExecutionLease } from "../lib/agent/types";
+import {
+	freezeFileReferenceSnapshots,
+	projectFileReferenceText,
+} from "../lib/agent/file-reference-projection";
+import type { ToolCallBinding, ToolUpdateExecutionLease } from "../lib/agent/types";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
@@ -16,7 +21,7 @@ import {
 	BLOCKED_SKILLS_TRAIT_PREFIX,
 	DISABLED_TOOLS_TRAIT_PREFIX,
 	resolveEffectiveSubagentModelPolicy,
-	resolveSubagentModelFromPolicy,
+	resolveSubagentModelSelectionFromPolicy,
 } from "../lib/narrator-custom-traits";
 import { getSubagentType, hasTrait, isSubagentVariant, parseTraits } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
@@ -545,10 +550,10 @@ export async function announceResumedBackgroundTask(
 		const statusWord = status === "timeout" ? "timed out" : status;
 		const content =
 			locale === "zh-CN"
-				? `[系统] 后台代理"${title}"（ID: ${alias}）的重新运行已结束（${statusWord}）。` +
+				? `[系统] 子代理"${title}"（ID: ${alias}）的重新运行已结束（${statusWord}）。` +
 					`它的结果已写回原来的 Agent 工具调用结果中；如需完整内容可用 ` +
 					`Await({ type: "agent", id: "${alias}" }) 查看。`
-				: `[System] Background agent "${title}" (ID: ${alias}) finished its restarted run (${statusWord}). ` +
+				: `[System] Subagent "${title}" (ID: ${alias}) finished its restarted run (${statusWord}). ` +
 					`Its result has been written back into the original Agent tool result; use ` +
 					`Await({ type: "agent", id: "${alias}" }) for the stored output.`;
 		const { deliverInjection } = await import("./narrator-injection");
@@ -777,9 +782,8 @@ export function broadcastSubagentStarted(
 		...(model && { model }),
 		...(reasoningEffort && { reasoningEffort }),
 	});
+	backgroundTaskService.notifyDerivedStatusChanged(parentNarratorId, subagentId);
 }
-
-// === Background task management ===
 
 /**
  * Execute a background task (fire-and-forget).
@@ -827,7 +831,10 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 	if (executionTimeout?.signal.aborted) onTimeout();
 
 	try {
-		const result = await executeSubagent(opts);
+		const result = await executeSubagent({
+			...opts,
+			fileChangeStartedAt: new Date(executionStartedAt).toISOString(),
+		});
 
 		const timeoutText = timeoutLabelMs
 			? `Background task timed out after ${timeoutLabelMs}ms`
@@ -1393,6 +1400,7 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					provider: currentProvider,
 					locale,
 					signal: proxy.signal,
+					fileChangeStartedAt: new Date(executionStartedAt).toISOString(),
 					timeoutMs: remainingTimeoutMs,
 					userId: currentUserId,
 					systemPrompt: currentSystemPrompt,
@@ -1473,7 +1481,10 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					// finalizer hand this turn's result straight back to the blocked
 					// parent. clearTakenOver must run before finalizeSubagent so
 					// preserveTakenOverSubstatus does not re-inject the taken_over tag.
-					if (heldByTakeover && consumePendingStopTakeover(subagentId)) {
+					if (
+						heldByTakeover &&
+						(consumePendingStopTakeover(subagentId) || consumePendingBackgroundFinalize(subagentId))
+					) {
 						clearTakenOver(subagentId);
 						break;
 					}
@@ -1498,7 +1509,12 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 					// turn the user drives to completion themselves. Keep this foreground
 					// runner alive and wait for the next user command instead of handing the
 					// result to the parent or switching to the generic session engine.
-					if (consumePendingStopTakeover(subagentId)) {
+					// A background takeover can resume inside this foreground driver.
+					// Accept a release recorded during that engine's settling window too.
+					if (
+						consumePendingStopTakeover(subagentId) ||
+						consumePendingBackgroundFinalize(subagentId)
+					) {
 						clearTakenOver(subagentId);
 						break;
 					}
@@ -1573,10 +1589,16 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 				// Bind the result to the subagent's last assistant message
 				const resultMsgId = await getSubagentResultMessageId(subagentId);
 				if (resultMsgId) {
+					const { narratorPersistence } = await import("./narrator-persistence");
+					const reference = await narratorPersistence.resolveSubagentConclusionReference(
+						subagentId,
+						parentNarratorId,
+						toolUseId,
+					);
 					await db
 						.update(narratorToolCalls)
 						.set({ resultMessageId: resultMsgId })
-						.where(eq(narratorToolCalls.toolUseId, toolUseId));
+						.where(eq(narratorToolCalls.id, reference.toolCallId));
 				}
 			} catch {
 				// Non-critical — don't fail the whole flow
@@ -1628,10 +1650,18 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 			updateLease?.release();
 			executionTimeout?.dispose();
 			unregisterRunningExecution();
+			backgroundTaskService.notifyDerivedStatusChanged(parentNarratorId, subagentId);
 			publishTerminal({
 				output: await appendSubagentFileChanges(
-					parentNarratorId,
-					null,
+					{
+						parentNarratorId,
+						childNarratorId: subagentId,
+						scope: {
+							sourceToolUseId: toolUseId,
+							startedAt: new Date(executionStartedAt).toISOString(),
+							completedAt: new Date().toISOString(),
+						},
+					},
 					agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId)) +
 						(finalText || "(no output)"),
 				),
@@ -1654,8 +1684,15 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 			// `appendSubagentFileChanges` returns the text unchanged if aggregation fails,
 			// so the error message itself can never be lost to a failed summary.
 			output: await appendSubagentFileChanges(
-				parentNarratorId,
-				null,
+				{
+					parentNarratorId,
+					childNarratorId: subagentId,
+					scope: {
+						sourceToolUseId: toolUseId,
+						startedAt: new Date(executionStartedAt).toISOString(),
+						completedAt: new Date().toISOString(),
+					},
+				},
 				agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId)) + finalText,
 			),
 			finalText,
@@ -1676,6 +1713,8 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 // === Subagent runner ===
 
 export interface RunSubagentInput {
+	/** Exact spawning Agent attempt, supplied by executeTool, never resolved by provider id. */
+	toolCallBinding?: ToolCallBinding;
 	parentNarratorId: string;
 	toolUseId: string;
 	subagentType: string;
@@ -1779,11 +1818,14 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		parent.model ?? FOLLOW_DEFAULT_MODEL,
 		settings.agent.defaultModel,
 	];
-	const resolvedModelInput = resolveSubagentModelFromPolicy({
+	const modelSelection = resolveSubagentModelSelectionFromPolicy({
 		policy: modelPolicy,
 		explicitModel,
 		candidates: candidateModels,
 	});
+	const resolvedModelInput = modelSelection?.model;
+	// No configured tier means the original explicit/parent/global inheritance stays intact.
+	const configuredReasoningEffort = modelSelection?.poolEntry?.reasoningEffort ?? reasoningEffort;
 	if (modelPolicy.source !== "none" && !resolvedModelInput) {
 		const allowedModels = expandAllowedPoolForDisplay(
 			modelPolicy.models.map((entry) => entry.model),
@@ -1816,14 +1858,23 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	);
 	let subagent: Awaited<ReturnType<typeof narratorService.createSubagent>>;
 	try {
+		if (input.toolCallBinding) {
+			const { narratorPersistence } = await import("./narrator-persistence");
+			await narratorPersistence.validateToolCallBinding(
+				parentNarratorId,
+				toolUseId,
+				input.toolCallBinding,
+			);
+		}
 		subagent = await narratorService.createSubagent({
 			parentNarratorId,
+			originToolCallId: input.toolCallBinding?.toolCallId,
 			subagentType,
 			title,
 			cwd,
 			systemPrompt,
 			model: resolvedModelInput,
-			reasoningEffort,
+			reasoningEffort: configuredReasoningEffort,
 			inheritedTraits,
 		});
 	} catch (error) {
@@ -2000,6 +2051,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 // === Continue subagent ===
 
 export interface ContinueSubagentInput {
+	fileReferences?: FileReferenceSnapshot[];
 	subagentId: string;
 	parentNarratorId: string;
 	/** Stable tool call that originally created this subagent. */
@@ -2080,6 +2132,7 @@ export async function startContinuedSubagent(
 	input: ContinueSubagentInput,
 ): Promise<StartedSubagentContinuation> {
 	const { subagentId, parentNarratorId, toolUseId, prompt, signal, locale } = input;
+	const acceptedReferences = freezeFileReferenceSnapshots(input.fileReferences);
 	const backgroundAbortController = input.preserveBackground
 		? (input.abortController ?? new AbortController())
 		: undefined;
@@ -2118,12 +2171,18 @@ export async function startContinuedSubagent(
 		(original.backgroundStatus === "completed" || original.backgroundStatus === "failed")
 	) {
 		const resultPrefix = agentResultTag(agentLabelFromNarrator(original, parentNarratorId));
-		// Replaying a finished background task's stored result. The summary is rebuilt
-		// from the attribution rows rather than taken from `backgroundResult`, so a
-		// replay reports the same changes the original completion did.
+		// Reuse the stored execution window, not replay time and not sibling history.
+		// Legacy rows still lack an operation/attempt receipt even within this window.
 		const completion = appendSubagentFileChanges(
-			parentNarratorId,
-			null,
+			{
+				parentNarratorId,
+				childNarratorId: subagentId,
+				scope: {
+					sourceToolUseId: toolUseId,
+					startedAt: original.turnStartedAt ?? null,
+					completedAt: original.backgroundCompletedAt ?? null,
+				},
+			},
 			resultPrefix + (original.backgroundResult ?? "(no output)"),
 		);
 		return {
@@ -2237,6 +2296,7 @@ export async function startContinuedSubagent(
 				{
 					images: input.images,
 					textFiles: savedTextFiles,
+					fileReferences: acceptedReferences,
 					commandText: input.commandText,
 					createdBy: input.createdBy,
 				},
@@ -2253,6 +2313,10 @@ export async function startContinuedSubagent(
 			original.reasoningEffort ?? resolveDefaultReasoningEffort(provider, model),
 		);
 
+		const currentInput = projectFileReferenceText(
+			userMessage?.contentText ?? prompt ?? "",
+			input.persistPrompt !== false ? acceptedReferences : [],
+		);
 		// 5. Load full subagent history unless the resume service already prepared it.
 		const rebuilt =
 			input.initialHistory && input.initialTrailingToolResults
@@ -2260,7 +2324,7 @@ export async function startContinuedSubagent(
 						history: input.initialHistory,
 						trailingToolResults: input.initialTrailingToolResults,
 					}
-				: await loadSubagentHistory(subagentId, model, provider);
+				: await loadSubagentHistory(subagentId, model, provider, undefined, currentInput);
 
 		// 6. Run via the structured foreground handle (same subagentId).
 		if (priorTaskVersion) {
@@ -2293,7 +2357,7 @@ export async function startContinuedSubagent(
 			parentNarratorId,
 			toolUseId,
 			subagentType,
-			prompt: prompt ?? "",
+			prompt: currentInput,
 			cwd,
 			model,
 			provider,
@@ -2339,14 +2403,16 @@ export async function startContinuedSubagent(
 					backgroundAbortController,
 				);
 			}
+			// Notification ownership is independent of the optional task projection:
+			// foreground children never had one, and old background rows may be reaped.
+			const plan = planResumedBackgroundTaskNotice({
+				preserveBackground: input.preserveBackground,
+				skipConclusionDelivery: input.skipConclusionDelivery,
+				timedOut: terminal.timedOut,
+				interrupted: terminal.interrupted,
+				hasError: terminal.hasError,
+			});
 			if (priorTaskVersion) {
-				const plan = planResumedBackgroundTaskNotice({
-					preserveBackground: input.preserveBackground,
-					skipConclusionDelivery: input.skipConclusionDelivery,
-					timedOut: terminal.timedOut,
-					interrupted: terminal.interrupted,
-					hasError: terminal.hasError,
-				});
 				// The ROW is reconciled regardless of who notifies: it is what `Await` and
 				// the task panel read, so leaving it terminal-but-stale would outlive the run.
 				await backgroundTaskService
@@ -2362,18 +2428,17 @@ export async function startContinuedSubagent(
 							error: err instanceof Error ? err.message : String(err),
 						});
 					});
-				// Handed to the caller instead of fired here: this chain settles BEFORE the
-				// conclusion is persisted, so waking now would build the parent's turn from
-				// the superseded tool result. See announceResumedBackgroundTask.
-				if (plan.deliver) {
-					pendingAnnouncement = {
-						subagentId,
-						parentNarratorId,
-						status: plan.status,
-						wakeParent: plan.wakeParent,
-						locale: locale as Locale,
-					};
-				}
+			}
+			// Handed to the caller instead of fired here: only wake AFTER it has
+			// persisted the conclusion, even when there was no background task row.
+			if (plan.deliver) {
+				pendingAnnouncement = {
+					subagentId,
+					parentNarratorId,
+					status: plan.status,
+					wakeParent: plan.wakeParent,
+					locale: locale as Locale,
+				};
 			}
 			return terminal.output;
 		})

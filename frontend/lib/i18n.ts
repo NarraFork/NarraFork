@@ -27,7 +27,6 @@ export const namespaces = [
 	"narrator",
 	"nav",
 	"learning",
-	"tutorial",
 	"projects",
 	"search",
 	"narrators",

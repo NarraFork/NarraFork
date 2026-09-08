@@ -1,11 +1,14 @@
 import { notifications } from "@mantine/notifications";
 import { DEFAULT_BRAND_ICON_COLOR } from "@shared/branding";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
+import type {
+	SubagentAllowedModels,
+	SubagentModelReasoningEfforts,
+} from "@shared/subagent-model-policy";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ensurePrefix } from "../components/providers/types";
-import type { SubagentAllowedModels } from "../components/settings/ModelsSection";
 import { api } from "../lib/api";
 import type {
 	CommandBlacklistRuleInput,
@@ -49,6 +52,7 @@ export interface InstanceSettingsState {
 	subagentSearchModel: string;
 	subagentReviewModel: string;
 	subagentAllowedModels: SubagentAllowedModels;
+	subagentModelReasoningEfforts: SubagentModelReasoningEfforts;
 	legacyEncoding: boolean;
 	freshShellEnv: boolean;
 	translateReasoning: boolean;
@@ -165,6 +169,7 @@ function makeDefaults(): InstanceSettingsState {
 		subagentSearchModel: "",
 		subagentReviewModel: "",
 		subagentAllowedModels: { explore: [], plan: [], general: [], search: [], review: [] },
+		subagentModelReasoningEfforts: {},
 		legacyEncoding: false,
 		freshShellEnv: false,
 		translateReasoning: false,
@@ -273,6 +278,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					search: settings.agent?.subagentAllowedModels?.search ?? [],
 					review: settings.agent?.subagentAllowedModels?.review ?? [],
 				},
+				subagentModelReasoningEfforts: settings.agent?.subagentModelReasoningEfforts ?? {},
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
 				freshShellEnv: settings.agent?.freshShellEnv ?? false,
 				translateReasoning: settings.agent?.translateReasoning ?? false,
@@ -355,6 +361,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 	}, [isDirty]);
 
 	const save = () => {
+		if (!initialized) return;
 		const normalizedUpdateServerUrl = normalizeUrlProtocol(state.updateServerUrl) ?? "";
 		const normalizedState = {
 			...state,
@@ -396,6 +403,10 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 						review: state.subagentReviewModel,
 					},
 					subagentAllowedModels: state.subagentAllowedModels,
+					...(JSON.stringify(state.subagentModelReasoningEfforts) !==
+					JSON.stringify(serverSnapshot.current.subagentModelReasoningEfforts)
+						? { subagentModelReasoningEfforts: state.subagentModelReasoningEfforts }
+						: {}),
 					legacyEncoding: state.legacyEncoding,
 					freshShellEnv: state.freshShellEnv,
 					translateReasoning: state.translateReasoning,

@@ -161,14 +161,7 @@ export interface MotionOp {
  * Consolidated here from three identical copies (fold / drill / LOD), which the shell
  * imported under three aliases.
  */
-export function prefersReducedMotion(): boolean {
-	if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
-	try {
-		return window.matchMedia("(prefers-reduced-motion: reduce)").matches === true;
-	} catch {
-		return false;
-	}
-}
+export { prefersReducedMotion } from "@frontend/lib/smooth-scroll";
 
 /**
  * Start one animation, or return null when there is no node / no WAAPI support

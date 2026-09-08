@@ -1,5 +1,29 @@
 import { getEffectiveNarratorDisplay, type StatusAccent } from "../../lib/status-registry";
 
+export function withQueueSubstatus(
+	substatus: string[],
+	position?: number,
+	queueDepth?: number,
+	queueMessage?: string,
+): string[] {
+	const nextSubstatus = substatus.filter(
+		(s) =>
+			!s.startsWith("queue_position:") &&
+			!s.startsWith("queue_depth:") &&
+			!s.startsWith("queue_message:"),
+	);
+	const safePosition = typeof position === "number" && Number.isFinite(position) ? position : null;
+	if (safePosition != null && safePosition > 0) {
+		const safeDepth =
+			typeof queueDepth === "number" && Number.isFinite(queueDepth) ? Math.max(0, queueDepth) : 0;
+		nextSubstatus.push(`queue_position:${safePosition}`, `queue_depth:${safeDepth}`);
+	}
+	if (queueMessage && safePosition !== 0) {
+		nextSubstatus.push(`queue_message:${encodeURIComponent(queueMessage)}`);
+	}
+	return nextSubstatus;
+}
+
 const STATUS_BAR_SUBSTATUS_PRIORITY = [
 	"error",
 	// Without this the label falls back to the base status ("Waiting"), which

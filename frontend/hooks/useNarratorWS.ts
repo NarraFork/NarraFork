@@ -489,6 +489,7 @@ interface NarratorWSCallbacks {
 	onDraftChanged?: (draft: {
 		hasDraft: boolean;
 		text: string;
+		fileReferences?: import("@shared/file-reference").FileReference[];
 		revision: number;
 		updatedAt: string | null;
 		updatedBy: string | null;
@@ -1158,6 +1159,9 @@ export function useNarratorWS(
 						callbackOwner.callbacks.onDraftChanged?.({
 							hasDraft: !!data.hasDraft,
 							text: typeof data.text === "string" ? data.text : "",
+							fileReferences: Array.isArray(data.fileReferences)
+								? (data.fileReferences as import("@shared/file-reference").FileReference[])
+								: [],
 							revision: typeof data.revision === "number" ? data.revision : 0,
 							updatedAt: typeof data.updatedAt === "string" ? data.updatedAt : null,
 							updatedBy: typeof data.updatedBy === "string" ? data.updatedBy : null,

@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, mock as bunMock, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, mock as bunMock, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
@@ -8,6 +8,9 @@ import { I18nextProvider, initReactI18next } from "react-i18next";
 import chaptersLocale from "../../locales/en/chapters.json";
 import commonLocale from "../../locales/en/common.json";
 import errorsLocale from "../../locales/en/errors.json";
+import chaptersZhLocale from "../../locales/zh-CN/chapters.json";
+import commonZhLocale from "../../locales/zh-CN/common.json";
+import errorsZhLocale from "../../locales/zh-CN/errors.json";
 
 // Isolated i18next instance + <I18nextProvider> so shared-singleton mutations from
 // other frontend suites can't leave this suite rendering raw i18n keys.
@@ -22,6 +25,12 @@ let mergeCalls: MergeCall[] = [];
 let mergeResult: unknown = { success: true };
 /** When set, `mergeChapter` rejects with a TestApiError carrying this shape. */
 let mergeRejection: { message: string; data: Record<string, unknown> } | null = null;
+let previewRejection: { message: string; data: Record<string, unknown> } | null = null;
+let previewResult: {
+	hasConflicts: boolean;
+	conflictFiles: string[];
+	isFastForward: boolean;
+} = { hasConflicts: false, conflictFiles: [], isFastForward: false };
 let notificationsShown: Array<{
 	title?: unknown;
 	message?: unknown;
@@ -83,8 +92,14 @@ const moduleMocks = {
 				reviewConclusion === "throw"
 					? Promise.reject(new Error("network down"))
 					: Promise.resolve({ conclusion: reviewConclusion }),
-			checkMergeConflicts: () =>
-				Promise.resolve({ hasConflicts: false, conflictFiles: [], isFastForward: false }),
+			checkMergeConflicts: () => {
+				if (previewRejection) {
+					const error = new TestApiError(previewRejection.message);
+					error.data = previewRejection.data;
+					return Promise.reject(error);
+				}
+				return Promise.resolve(previewResult);
+			},
 			mergeChapter: (chapterId: string, data: MergeCall["data"]) => {
 				mergeCalls.push({ chapterId, data });
 				if (mergeRejection) {
@@ -187,6 +202,11 @@ async function initTestI18n() {
 			ns: ["chapters", "common", "errors"],
 			resources: {
 				en: { chapters: chaptersLocale, common: commonLocale, errors: errorsLocale },
+				"zh-CN": {
+					chapters: chaptersZhLocale,
+					common: commonZhLocale,
+					errors: errorsZhLocale,
+				},
 			},
 			interpolation: { escapeValue: false },
 			react: { useSuspense: false },
@@ -201,6 +221,17 @@ async function flush() {
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
 let queryClient: QueryClient | undefined;
+
+// Locale-switching tests must not leave earlier roots subscribed to the same i18n instance.
+afterEach(async () => {
+	root?.unmount();
+	root = undefined;
+	container?.remove();
+	container = undefined;
+	queryClient?.clear();
+	queryClient = undefined;
+	await i18n.changeLanguage("en");
+});
 
 function render() {
 	if (!container || !root) throw new Error("test root not initialized");
@@ -232,14 +263,6 @@ function findButton(text: string): HTMLButtonElement {
 }
 
 /**
- * Choose a merge target, then click the modal's own Merge button.
- *
- * The target Select is a Mantine combobox; opening its dropdown and clicking an option
- * is what makes the component's `targetId` state real, which is what un-disables the
- * button. Everything after that — payload assembly, onSuccess, warning handling — is
- * the component's own code path.
- */
-/**
  * Open the merge-mode Select and choose an option by its visible label.
  *
  * Identified by current value rather than position, so reordering the modal's fields
@@ -262,7 +285,8 @@ async function chooseMergeMode(optionLabel: string) {
 	await flush();
 }
 
-async function mergeWithTarget(targetLabel = "Trunk") {
+/** Select a real target through the combobox, enabling both preview and merge. */
+async function chooseMergeTarget(targetLabel = "Trunk") {
 	// `Event`, not `MouseEvent`: linkedom does not implement the latter, and React's
 	// synthetic click handler only needs the type and bubbling.
 	const targetInput = document.body.querySelector("input");
@@ -276,9 +300,19 @@ async function mergeWithTarget(targetLabel = "Trunk") {
 	if (!option) throw new Error(`target option not found: ${targetLabel}`);
 	option.dispatchEvent(new Event("click", { bubbles: true }));
 	await flush();
+}
 
+async function mergeWithTarget(targetLabel = "Trunk") {
+	await chooseMergeTarget(targetLabel);
 	const button = findButton("Merge");
 	if (button.disabled) throw new Error("merge button still disabled after choosing a target");
+	button.dispatchEvent(new Event("click", { bubbles: true }));
+	await flush();
+}
+
+async function checkPreview() {
+	const button = findButton(i18n.t("checkConflicts"));
+	if (button.disabled) throw new Error("preview button still disabled after choosing a target");
 	button.dispatchEvent(new Event("click", { bubbles: true }));
 	await flush();
 }
@@ -295,12 +329,6 @@ describe("ChapterMergeModal", () => {
 		container = document.createElement("div");
 		document.body.appendChild(container);
 		root = createRoot(container);
-	});
-
-	afterAll(() => {
-		root?.unmount();
-		container?.remove();
-		queryClient?.clear();
 	});
 
 	test("offers both merge modes and describes the default as history-free", async () => {
@@ -510,5 +538,92 @@ describe("merge failure presentation", () => {
 		expect(document.body.textContent).toContain("refusing to merge unrelated histories");
 		// No disclosure: it would only repeat the sentence already shown.
 		expect(document.body.textContent).not.toContain("Show original message");
+	});
+});
+
+describe.each(["en", "zh-CN"])("merge preview failure presentation (%s)", (locale) => {
+	beforeEach(async () => {
+		previewRejection = null;
+		previewResult = { hasConflicts: false, conflictFiles: [], isFastForward: false };
+		mergeRejection = null;
+		reviewConclusion = null;
+		requireReviewBeforeMerge = false;
+		installDom();
+		await initTestI18n();
+		await i18n.changeLanguage(locale);
+		container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+	});
+
+	test.each([
+		{
+			messageCode: "GIT_TREE_MERGE_FAILED",
+			messageParams: { detail: "unable to read tree" },
+		},
+		{
+			messageCode: "GIT_TREE_MERGE_FALLBACK_FAILED",
+			messageParams: {
+				version: "2.39.5",
+				feature: "merge-tree --merge-base",
+				detail: "temporary directory permission denied",
+			},
+		},
+		{ messageCode: "GIT_TREE_MERGE_CONFLICTS_UNLISTED", messageParams: {} },
+	])("translates a preview error using $messageCode", async ({ messageCode, messageParams }) => {
+		// Deliberately differs from the English translation, so even the English test
+		// fails if the modal falls back to the server's prose instead of messageCode.
+		const raw = "sentinel-raw-preview-prose";
+		previewRejection = {
+			message: raw,
+			data: { error: raw, code: "GIT_ERROR", messageCode, messageParams },
+		};
+		render();
+		await flush();
+		await chooseMergeTarget();
+		await checkPreview();
+
+		expect(document.body.textContent).toContain(i18n.t("conflictCheckFailed"));
+		const message = document.body.querySelector("[role='alert'] p")?.textContent;
+		expect(message).toBe(i18n.t(messageCode, { ns: "errors", replace: messageParams }));
+		expect(message).not.toContain(raw);
+		expect(document.body.textContent).toContain(i18n.t("showOriginal", { ns: "errors" }));
+	});
+
+	test.each([
+		{
+			titleKey: "noConflicts",
+			result: { hasConflicts: false, conflictFiles: [], isFastForward: false },
+		},
+		{
+			titleKey: "fastForward",
+			result: { hasConflicts: false, conflictFiles: [], isFastForward: true },
+		},
+		{
+			titleKey: "conflictsDetected",
+			result: { hasConflicts: true, conflictFiles: ["source.ts"], isFastForward: false },
+		},
+	])("clears a stale $titleKey result when preview fails", async ({ titleKey, result }) => {
+		previewResult = { ...result, conflictFiles: [...result.conflictFiles] };
+		render();
+		await flush();
+		await chooseMergeTarget();
+		await checkPreview();
+		expect(document.body.textContent).toContain(i18n.t(titleKey));
+
+		previewRejection = {
+			message: "Git tree merge failed: preview unavailable",
+			data: {
+				code: "GIT_ERROR",
+				messageCode: "GIT_TREE_MERGE_FAILED",
+				messageParams: { detail: "preview unavailable" },
+			},
+		};
+		await checkPreview();
+
+		expect(document.body.textContent).toContain(i18n.t("conflictCheckFailed"));
+		expect(document.body.textContent).not.toContain(i18n.t(titleKey));
+		expect(document.body.textContent).not.toContain(i18n.t("mergeClean"));
+		expect(document.body.querySelectorAll("[role='alert']")).toHaveLength(1);
 	});
 });

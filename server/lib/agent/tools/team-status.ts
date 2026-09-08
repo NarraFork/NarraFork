@@ -321,7 +321,16 @@ export const teamStatusTool: ToolDefinition = {
 				);
 				if (targets.length === 0) {
 					const targetKind = ctx.parentNarratorId ? "sibling subagents" : "child subagents";
-					return { output: `No ${targetKind} to broadcast to.` };
+					return {
+						output: `No ${targetKind} to broadcast to.`,
+						metadata: {
+							kind: "send",
+							broadcast: true,
+							await: false,
+							targets: [],
+							warning: `No ${targetKind} to broadcast to.`,
+						},
+					};
 				}
 				const senderType = teamMemberType(sender.variant);
 				const now = new Date().toISOString();
@@ -355,7 +364,25 @@ export const teamStatusTool: ToolDefinition = {
 				if (nonWorking.length > 0) {
 					output += `\n(warning: ${nonWorking.length} target(s) not currently working — messages may not be received)`;
 				}
-				return { output };
+				return {
+					output,
+					metadata: {
+						kind: "send",
+						broadcast: true,
+						await: false,
+						...(nonWorking.length > 0
+							? {
+									warning: `${nonWorking.length} target(s) not currently working — messages may not be received`,
+								}
+							: {}),
+						targets: targets.map((target) => ({
+							id: target.id,
+							label: agentLabelFromNarrator(target, parentNarratorId),
+							title: target.title,
+							status: "queued",
+						})),
+					},
+				};
 			}
 
 			case "send": {
@@ -409,6 +436,20 @@ export const teamStatusTool: ToolDefinition = {
 						: "";
 				return {
 					output: `Message sent to ${agentLabelFromNarrator(target, parentNarratorId)}.${warning}`,
+					metadata: {
+						kind: "send",
+						broadcast: false,
+						await: false,
+						...(warning ? { warning: warning.trim() } : {}),
+						targets: [
+							{
+								id: target.id,
+								label: agentLabelFromNarrator(target, parentNarratorId),
+								title: target.title,
+								status: "queued",
+							},
+						],
+					},
 				};
 			}
 

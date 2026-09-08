@@ -1,0 +1,696 @@
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import type { AsyncQuestion, HumanAttentionDetail } from "@frontend/types/narrator";
+import { MantineProvider } from "@mantine/core";
+import type { HumanAttentionItem, HumanAttentionPage } from "@shared/human-attention";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { createInstance } from "i18next";
+import { parseHTML } from "linkedom";
+import { act, type ReactNode } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { I18nextProvider } from "react-i18next";
+import {
+	groupHumanAttentionByScope,
+	humanAttentionListKey,
+	loadedHumanAttentionItems,
+	useHumanAttention,
+} from "../../hooks/useHumanAttention";
+import { api } from "../../lib/api";
+import { ApiError } from "../../lib/api/client";
+import { narratorsApi } from "../../lib/api/narrators";
+import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { readSession, resetSessionStoreForTest, writeSession } from "../../lib/session-store";
+import commonEn from "../../locales/en/common.json";
+import dashboardEn from "../../locales/en/dashboard.json";
+import narratorEn from "../../locales/en/narrator.json";
+import { NeedsAttention } from "../dashboard/NeedsAttention";
+import { HumanAttentionInboxButton, HumanAttentionInboxDrawer } from "./GlobalQuestionInbox";
+import { PermEnterHintCtx } from "./tool-call-contexts";
+
+const i18n = createInstance();
+await i18n.init({
+	lng: "en",
+	fallbackLng: "en",
+	initImmediate: false,
+	resources: { en: { narrator: narratorEn, dashboard: dashboardEn, common: commonEn } },
+});
+
+function item(id: string, overrides: Partial<HumanAttentionItem> = {}): HumanAttentionItem {
+	return {
+		id: `permission:${id}`,
+		kind: "permission",
+		source: "permission",
+		requestId: id,
+		toolCallId: `call-${id}`,
+		toolName: "Bash",
+		narratorId: `owner-${id}`,
+		narratorTitle: `Source ${id}`,
+		parentNarratorId: null,
+		rootNarratorId: null,
+		chapterId: null,
+		createdAt: "2026-01-01T00:00:00.000Z",
+		blocking: true,
+		canAct: true,
+		summary: `Review ${id}`,
+		...overrides,
+	};
+}
+function question(row: HumanAttentionItem): AsyncQuestion {
+	return {
+		id: row.requestId,
+		narratorId: row.narratorId,
+		toolCallId: row.toolCallId,
+		toolUseId: `use-${row.requestId}`,
+		questions: [{ question: "notes", header: "Notes?", options: [] }],
+		answers: null,
+		status: "open",
+		origin: "user_deferred",
+		answerMessageId: null,
+		decidedBy: null,
+		decidedAt: null,
+		createdAt: row.createdAt,
+	};
+}
+let qc: QueryClient;
+let root: Root;
+let container: HTMLDivElement;
+let restoreGlobals: () => void;
+let listPage: HumanAttentionPage;
+let details: Map<string, HumanAttentionDetail>;
+let restorers: (() => void)[];
+function track<T extends { mockRestore(): void }>(spy: T): T {
+	restorers.push(() => spy.mockRestore());
+	return spy;
+}
+
+beforeEach(() => {
+	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
+	Object.defineProperty(window.document, "fonts", {
+		configurable: true,
+		value: { addEventListener() {}, removeEventListener() {} },
+	});
+	const values = new Map<string, string>();
+	const sessionStorage = {
+		get length() {
+			return values.size;
+		},
+		key: (index: number) => [...values.keys()][index] ?? null,
+		getItem: (key: string) => values.get(key) ?? null,
+		setItem: (key: string, value: string) => {
+			values.set(key, value);
+		},
+		removeItem: (key: string) => {
+			values.delete(key);
+		},
+		clear: () => values.clear(),
+	};
+	const globals = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Element: window.Element,
+		Node: window.Node,
+		Event: window.Event,
+		ShadowRoot: window.ShadowRoot,
+		sessionStorage,
+		localStorage: sessionStorage,
+		matchMedia: (query: string) => ({
+			matches: false,
+			media: query,
+			addEventListener() {},
+			removeEventListener() {},
+			addListener() {},
+			removeListener() {},
+		}),
+		getComputedStyle: () => ({ getPropertyValue: () => "", boxSizing: "border-box" }),
+		requestAnimationFrame: (cb: FrameRequestCallback) => setTimeout(cb, 0),
+		cancelAnimationFrame: (id: number) => clearTimeout(id),
+		ResizeObserver: class {
+			observe() {}
+			unobserve() {}
+			disconnect() {}
+		},
+		IS_REACT_ACT_ENVIRONMENT: true,
+	};
+	const descriptors = new Map(
+		Object.keys(globals).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]),
+	);
+	for (const [key, value] of Object.entries(globals))
+		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+	restoreGlobals = () => {
+		for (const [key, descriptor] of descriptors) {
+			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+			else Reflect.deleteProperty(globalThis, key);
+		}
+	};
+	resetSessionStoreForTest();
+	qc = new QueryClient({
+		defaultOptions: { queries: { staleTime: Infinity, retry: false }, mutations: { retry: false } },
+	});
+	qc.setQueryData(["settings"], { agent: {} });
+	container = document.createElement("div");
+	document.body.appendChild(container);
+	root = createRoot(container);
+	listPage = { items: [], nextCursor: null };
+	details = new Map();
+	restorers = [];
+	track(spyOn(api, "getHumanAttention").mockImplementation(async () => listPage));
+	track(
+		spyOn(api, "getHumanAttentionDetail").mockImplementation(async (id) => {
+			const data = details.get(id);
+			if (!data) throw new ApiError("Gone", 404);
+			return data;
+		}),
+	);
+});
+afterEach(async () => {
+	await act(async () => root.unmount());
+	await settle();
+	qc.clear();
+	container.remove();
+	for (const restore of restorers.reverse()) restore();
+	resetSessionStoreForTest();
+	restoreGlobals();
+});
+async function settle() {
+	for (let n = 0; n < 3; n++)
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		});
+}
+async function render(node: ReactNode) {
+	await act(async () =>
+		root.render(
+			<QueryClientProvider client={qc}>
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">{node}</MantineProvider>
+				</I18nextProvider>
+			</QueryClientProvider>,
+		),
+	);
+	await settle();
+}
+function button(label: string, within: ParentNode = document) {
+	const found = [...within.querySelectorAll<HTMLButtonElement>("button")].find((node) =>
+		node.textContent?.includes(label),
+	);
+	expect(found).toBeDefined();
+	return found as HTMLButtonElement;
+}
+function row(id: string) {
+	const found = [...document.querySelectorAll<HTMLElement>("[data-attention-id]")].find(
+		(node) => node.getAttribute("data-attention-id") === id,
+	);
+	expect(found).toBeDefined();
+	return found as HTMLElement;
+}
+async function click(label: string, within: ParentNode = document) {
+	await act(async () => button(label, within).click());
+	await settle();
+}
+async function openDrawer() {
+	await render(<HumanAttentionInboxDrawer opened onClose={() => {}} currentNarratorId="parent" />);
+}
+function addPermission(
+	row: HumanAttentionItem,
+	input: Record<string, unknown> = { command: "git diff --stat" },
+) {
+	listPage.items.push(row);
+	details.set(row.id, {
+		item: row,
+		permission: {
+			id: row.requestId,
+			toolName: row.toolName,
+			inputJson: input,
+			ownerNarratorId: row.narratorId,
+		},
+	});
+}
+
+const draft = JSON.stringify({ selections: {}, customInputs: { notes: "Keep this answer" } });
+
+describe("human attention global listener and pagination", () => {
+	test("appears with no tabs/subscriptions, shares one listener, ignores automatic progress, reconnects and cleans up", async () => {
+		const listener = track(spyOn(narratorWSManager, "addListener"));
+		const remove = track(spyOn(narratorWSManager, "removeListener"));
+		const subscriptions = track(spyOn(narratorWSManager, "subscribe"));
+		const connection = track(spyOn(narratorWSManager, "onConnectionChange"));
+		const list = spyOn(api, "getHumanAttention");
+		function OtherMount() {
+			useHumanAttention();
+			return null;
+		}
+		await render(
+			<>
+				<HumanAttentionInboxButton currentNarratorId="parent" />
+				<OtherMount />
+			</>,
+		);
+		expect(listener).toHaveBeenCalledTimes(1);
+		expect(subscriptions).not.toHaveBeenCalled();
+		expect(document.querySelector("button")).toBeNull();
+		const before = list.mock.calls.length;
+		listPage = { items: [item("outside-tabs")], nextCursor: null };
+		await act(async () =>
+			narratorWSManager.dispatchLocalFrame({ type: "human_attention_changed" }),
+		);
+		await settle();
+		expect(document.querySelector("button")?.textContent).toContain("1 decision");
+		expect(list.mock.calls.length).toBe(before + 1);
+		await act(async () =>
+			narratorWSManager.dispatchLocalFrame({
+				type: "reflection_progress",
+				narratorId: "not-subscribed",
+			}),
+		);
+		await settle();
+		expect(list.mock.calls.length).toBe(before + 1);
+		for (const type of [
+			"narrator_access_changed",
+			"project_access_changed",
+			"narrator_deleted",
+			"chapter_deleted",
+			"project_deleted",
+		]) {
+			const calls = list.mock.calls.length;
+			await act(async () => narratorWSManager.dispatchLocalFrame({ type, narratorId: "unknown" }));
+			await settle();
+			expect(list.mock.calls.length).toBe(calls + 1);
+		}
+		listPage = { items: [], nextCursor: null };
+		await act(async () => connection.mock.calls[0][0](true, true));
+		await settle();
+		expect(document.querySelector("button")).toBeNull();
+		await render(null);
+		expect(remove).toHaveBeenCalledTimes(1);
+	});
+
+	test("groups background children by root without losing distinct question/permission identities; lazy loads pages and details", async () => {
+		const child = item("same", {
+			narratorId: "background-child",
+			parentNarratorId: "intermediate",
+			rootNarratorId: "parent",
+		});
+		const asyncRow = item("same", {
+			id: "question:same",
+			kind: "async_question",
+			source: "question",
+			narratorId: "parent",
+			blocking: false,
+		});
+		const other = item("other");
+		addPermission(child);
+		listPage = { items: [asyncRow, child], nextCursor: "next/opaque" };
+		details.set(asyncRow.id, { item: asyncRow, question: question(asyncRow) });
+		const list = spyOn(api, "getHumanAttention").mockImplementation(async (params) =>
+			params?.cursor ? { items: [other], nextCursor: null } : listPage,
+		);
+		const detail = spyOn(api, "getHumanAttentionDetail");
+		await openDrawer();
+		expect(document.body.textContent).toContain("2+");
+		expect(detail).not.toHaveBeenCalled();
+		expect(
+			[...document.querySelectorAll('[data-attention-scope="current"] [data-attention-id]')].map(
+				(node) => node.getAttribute("data-attention-id"),
+			),
+		).toEqual([child.id, asyncRow.id]);
+		await click("Review decision", row(child.id));
+		expect(detail).toHaveBeenCalledTimes(1);
+		expect(detail.mock.calls[0][0]).toBe(child.id);
+		expect(row(child.id).textContent).toContain("Decision owner: background-child");
+		expect(row(child.id).querySelector("a")?.getAttribute("href")).toBe(
+			"/narrators/background-child",
+		);
+		await click("Load more");
+		expect(list.mock.calls.at(-1)?.[0]?.cursor).toBe("next/opaque");
+		expect(row(other.id).closest('[data-attention-scope="others"]')).not.toBeNull();
+		expect(document.body.textContent).not.toContain("2+");
+		expect(detail).toHaveBeenCalledTimes(1);
+		expect(groupHumanAttentionByScope([child, asyncRow, other], "parent").current).toHaveLength(2);
+		expect(
+			loadedHumanAttentionItems([
+				{ items: [child, asyncRow], nextCursor: "a" },
+				{ items: [child, other], nextCursor: null },
+			]),
+		).toHaveLength(3);
+	});
+
+	test("a failed list retains an explicit retry and does not claim nothing is waiting", async () => {
+		const list = spyOn(api, "getHumanAttention").mockRejectedValueOnce(new Error("network"));
+		await render(<HumanAttentionInboxButton />);
+		expect(document.body.textContent).toContain("Could not load human decisions");
+		list.mockResolvedValue({ items: [item("retry")], nextCursor: null });
+		await click("Could not load human decisions");
+		expect(row("permission:retry")).toBeDefined();
+	});
+});
+
+describe("human attention decisions", () => {
+	test("full plan editing, feedback and compactAfter use the original approval API; failure keeps row and draft", async () => {
+		const plan = item("plan", { toolName: "ExitPlanMode", kind: "plan_approval" });
+		addPermission(plan, { plan: "Original full plan\nReview every step" });
+		writeSession(
+			"permission-draft",
+			plan.requestId,
+			JSON.stringify({ feedback: "Check rollout", editedPlan: "Edited full plan\nWith tests" }),
+		);
+		const approve = track(
+			spyOn(api, "approvePermission").mockRejectedValue(new Error("connection interrupted")),
+		);
+		const invalidations = track(spyOn(qc, "invalidateQueries"));
+		await openDrawer();
+		await click("Review decision", row(plan.id));
+		expect(row(plan.id).textContent).toContain("Edited full plan");
+		await click(narratorEn.planEditDone, row(plan.id));
+		await click(narratorEn.acceptAndResetContext, row(plan.id));
+		await click(narratorEn.planExecuteWithoutRevision);
+		expect(approve).toHaveBeenCalledWith("plan", {
+			feedbackText: "Check rollout",
+			compactAfter: true,
+			updatedPlan: "Edited full plan\nWith tests",
+		});
+		expect(row(plan.id).textContent).toContain("decision was not confirmed");
+		expect(readSession("permission-draft", "plan")).not.toBeNull();
+		for (const key of [
+			["human-attention"],
+			["permissions", plan.narratorId],
+			["async-questions", plan.narratorId],
+			["narrators", plan.narratorId],
+		]) {
+			expect(
+				invalidations.mock.calls.some(
+					([filter]) => JSON.stringify(filter?.queryKey) === JSON.stringify(key),
+				),
+			).toBe(true);
+		}
+	});
+
+	test("each item stays independently busy and denial preserves feedback and frozen remote target", async () => {
+		const one = item("one");
+		const two = item("two");
+		addPermission(one, { command: "git push origin feature" });
+		addPermission(two, { command: "dangerous command" });
+		const d = details.get(two.id);
+		if (d?.permission) {
+			d.permission.executionDeviceId = "frozen-remote";
+			d.permission.executionCwd = "/remote/original";
+			d.permission.suggestions = [
+				{
+					type: "danger_reflection",
+					status: "awaiting_user",
+					reason: "Needs confirmation",
+					danger: { consequences: ["Deletes originals"], saferAlternatives: ["Backup first"] },
+				},
+			];
+		}
+		writeSession(
+			"permission-draft",
+			two.requestId,
+			JSON.stringify({ feedback: "Do not delete", editedPlan: null }),
+		);
+		let finish: (value: unknown) => void = () => {};
+		const approve = track(
+			spyOn(api, "approvePermission").mockImplementation(
+				() =>
+					new Promise((resolve) => {
+						finish = resolve;
+					}),
+			),
+		);
+		const deny = track(spyOn(api, "denyPermission").mockRejectedValue(new Error("offline")));
+		await openDrawer();
+		await click("Review decision", row(one.id));
+		await click("Review decision", row(two.id));
+		await click(commonEn.allow, row(one.id));
+		expect(row(one.id).querySelector("fieldset")?.hasAttribute("disabled")).toBe(true);
+		expect(row(two.id).querySelector("fieldset")?.hasAttribute("disabled")).toBe(false);
+		expect(row(two.id).textContent).toContain("frozen-remote");
+		expect(row(two.id).textContent).toContain("Deletes originals");
+		expect(row(two.id).textContent).toContain("Backup first");
+		await click(commonEn.deny, row(two.id));
+		expect(deny).toHaveBeenCalledWith("two", { feedbackText: "Do not delete" });
+		expect(row(two.id).textContent).toContain("offline");
+		await act(async () => finish({ ok: true }));
+		await settle();
+		expect(approve).toHaveBeenCalledTimes(1);
+	});
+
+	test("Write/Edit show full old/new input and task mutations; file review opens actual owner and never registers the inline Enter handler", async () => {
+		const write = item("write", {
+			toolName: "Write",
+			narratorId: "child-owner",
+			parentNarratorId: "parent",
+		});
+		const edit = item("edit", { toolName: "Edit", kind: "reflection" });
+		addPermission(write, { file_path: "/remote/new.ts", content: "complete\nnew content" });
+		addPermission(edit, {
+			file_path: "spec://tasks.json",
+			old_string: "old task",
+			new_string: "new task",
+		});
+		const d = details.get(edit.id);
+		if (d?.permission)
+			d.permission.suggestions = [
+				{
+					type: "task_reflection",
+					status: "awaiting_user",
+					mutations: [{ text: "Remove protected task", status: "done" }],
+					reason: "Missing completion evidence",
+				},
+			];
+		const actions: unknown[] = [];
+		await render(
+			<PermEnterHintCtx.Provider
+				value={{
+					activePermissionId: "write",
+					focusIndex: 0,
+					setFocusIndex() {},
+					setButtonCount: (n) => actions.push(n),
+					setHasFeedback() {},
+					registerActions: (a) => actions.push(a),
+				}}
+			>
+				<HumanAttentionInboxDrawer opened onClose={() => {}} currentNarratorId="parent" />
+			</PermEnterHintCtx.Provider>,
+		);
+		await click("Review decision", row(write.id));
+		await click("Review decision", row(edit.id));
+		expect(row(write.id).textContent).toContain("new content");
+		expect(row(write.id).textContent).toContain("/remote/new.ts");
+		expect(row(edit.id).textContent).toContain("old task");
+		expect(row(edit.id).textContent).toContain("new task");
+		expect(row(edit.id).textContent).toContain("Missing completion evidence");
+		expect(row(edit.id).textContent).toContain("Remove protected task");
+		expect(actions).toHaveLength(0);
+		const opened: string[] = [];
+		const original = Object.getOwnPropertyDescriptor(window, "open");
+		Object.defineProperty(window, "open", {
+			configurable: true,
+			value: (url: string) => {
+				opened.push(url);
+			},
+		});
+		try {
+			await click(narratorEn.fileMod_viewInPanel, row(write.id));
+			expect(opened).toEqual(["/narrators/child-owner"]);
+		} finally {
+			if (original) Object.defineProperty(window, "open", original);
+			else Reflect.deleteProperty(window, "open");
+		}
+	});
+
+	test("read-only and oversized forms cannot submit, while the owner session remains reachable", async () => {
+		const readonly = item("readonly", { canAct: false });
+		const oversized = item("oversized");
+		addPermission(readonly);
+		addPermission(oversized);
+		details.set(oversized.id, { item: oversized, tooLarge: true });
+		const approve = track(spyOn(api, "approvePermission"));
+		await openDrawer();
+		await click("Review decision", row(readonly.id));
+		await click("Review decision", row(oversized.id));
+		expect(row(readonly.id).querySelector("textarea")).toBeNull();
+		expect(row(readonly.id).textContent).toContain("do not have permission");
+		expect(row(oversized.id).textContent).toContain("too large");
+		expect(row(oversized.id).querySelector("fieldset")).toBeNull();
+		expect(row(oversized.id).querySelector("a")?.getAttribute("href")).toBe(
+			"/narrators/owner-oversized",
+		);
+		expect(approve).not.toHaveBeenCalled();
+	});
+
+	test("blocking answers and defer use permission identity; async retains annotations and legacy draft identity", async () => {
+		const blocking = item("block", { toolName: "AskUserQuestion", kind: "blocking_question" });
+		const asyncRow = item("async", {
+			id: "question:async",
+			source: "question",
+			kind: "async_question",
+			toolName: "AskUserQuestion",
+			blocking: false,
+		});
+		addPermission(blocking, { questions: question(blocking).questions });
+		const asyncQuestion = {
+			...question(asyncRow),
+			annotations: { notes: { preview: "Existing preview", notes: "Existing annotation" } },
+		};
+		listPage.items.push(asyncRow);
+		details.set(asyncRow.id, { item: asyncRow, question: asyncQuestion });
+		writeSession("ask-draft", blocking.toolCallId, draft);
+		writeSession("ask-draft", asyncRow.requestId, draft);
+		const defer = track(
+			spyOn(api, "deferPermissionQuestion").mockRejectedValue(new Error("retry defer")),
+		);
+		const approve = track(spyOn(api, "approvePermission").mockResolvedValue({ ok: true }));
+		const answer = track(
+			spyOn(api, "answerAsyncQuestion").mockRejectedValue(new Error("retry answer")),
+		);
+		await openDrawer();
+		await click("Review decision", row(blocking.id));
+		await click("Review decision", row(asyncRow.id));
+		expect(row(asyncRow.id).querySelector("textarea")?.value).toBe("Keep this answer");
+		await click(narratorEn.deferQuestion, row(blocking.id));
+		expect(defer).toHaveBeenCalledWith("block");
+		expect(readSession("ask-draft", blocking.toolCallId)).not.toBeNull();
+		await click(narratorEn.submitAnswer, row(blocking.id));
+		expect(approve).toHaveBeenCalledWith("block", { answers: { notes: "Keep this answer" } });
+		await click(narratorEn.submitAnswer, row(asyncRow.id));
+		expect(answer).toHaveBeenCalledWith(asyncRow.narratorId, "async", {
+			answers: { notes: "Keep this answer" },
+			annotations: asyncQuestion.annotations,
+		});
+		expect(readSession("ask-draft", asyncRow.toolCallId)).not.toBeNull();
+		expect(row(asyncRow.id).textContent).not.toContain(narratorEn.deferQuestion);
+	});
+
+	test("404 detail and 409 decision refetch the authority without looping or optimistic removals", async () => {
+		const gone = item("gone");
+		addPermission(gone);
+		const detail = spyOn(api, "getHumanAttentionDetail").mockRejectedValue(
+			new ApiError("already handled", 404),
+		);
+		const list = spyOn(api, "getHumanAttention");
+		await openDrawer();
+		await click("Review decision", row(gone.id));
+		expect(detail).toHaveBeenCalledTimes(1);
+		expect(list.mock.calls.length).toBeLessThanOrEqual(3);
+		expect(row(gone.id).textContent).toContain("no longer visible");
+		detail.mockResolvedValue(details.get(gone.id) as HumanAttentionDetail);
+		await click("Refresh / retry", row(gone.id));
+		const approve = track(
+			spyOn(api, "approvePermission").mockImplementation(async () => {
+				listPage = { items: [], nextCursor: null };
+				throw new ApiError("already decided", 409);
+			}),
+		);
+		await click(commonEn.allow, row(gone.id));
+		expect(approve).toHaveBeenCalledTimes(1);
+		expect(document.querySelector("[data-attention-id]")).toBeNull();
+	});
+});
+
+test("API encodes opaque identities/cursors and forwards the query AbortSignal", async () => {
+	const signal = new AbortController().signal;
+	const opaqueId = "permission:child/% request";
+	const expectedDetail = { item: item("encoded") };
+	const fetchSpy = track(
+		spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(Response.json({ items: [], nextCursor: "opaque/next" }))
+			.mockResolvedValueOnce(Response.json(expectedDetail)),
+	);
+	expect(
+		await narratorsApi.getHumanAttention({ cursor: "cursor/+ value", limit: 17 }, signal),
+	).toEqual({ items: [], nextCursor: "opaque/next" });
+	expect(fetchSpy.mock.calls[0][0]).toBe(
+		"/api/narrators/human-attention?cursor=cursor%2F%2B+value&limit=17",
+	);
+	expect(fetchSpy.mock.calls[0][1]?.signal).toBe(signal);
+	expect(await narratorsApi.getHumanAttentionDetail(opaqueId, signal)).toEqual(expectedDetail);
+	expect(fetchSpy.mock.calls[1][0]).toBe(
+		`/api/narrators/human-attention/${encodeURIComponent(opaqueId)}`,
+	);
+	expect(fetchSpy.mock.calls[1][1]?.signal).toBe(signal);
+});
+
+test("an empty scanned page with a next cursor stays loadable, rather than claiming an empty inbox", async () => {
+	const next = item("beyond-acl-window");
+	spyOn(api, "getHumanAttention").mockImplementation(async (params) =>
+		params?.cursor
+			? { items: [next], nextCursor: null }
+			: { items: [], nextCursor: "continue-acl-scan" },
+	);
+	await render(<HumanAttentionInboxButton />);
+	expect(document.body.textContent).toContain("0+");
+	await click("decision(s)");
+	expect(document.body.textContent).not.toContain("Nothing waiting for a human decision");
+	await click("Load more");
+	expect(row(next.id)).toBeDefined();
+});
+
+test("detail failures offer retry, and ACL changes remove decision controls without relying on tabs", async () => {
+	const permission = item("acl");
+	addPermission(permission);
+	spyOn(api, "getHumanAttentionDetail").mockRejectedValueOnce(new Error("network"));
+	const approve = track(spyOn(api, "approvePermission"));
+	await openDrawer();
+	await click("Review decision", row(permission.id));
+	expect(row(permission.id).textContent).toContain("Could not load");
+	await click("Refresh / retry", row(permission.id));
+	expect(button(commonEn.allow, row(permission.id))).toBeDefined();
+	const readOnly = { ...permission, canAct: false };
+	listPage = { items: [readOnly], nextCursor: null };
+	const old = details.get(permission.id) as HumanAttentionDetail;
+	details.set(permission.id, { ...old, item: readOnly });
+	await act(async () =>
+		narratorWSManager.dispatchLocalFrame({
+			type: "narrator_access_changed",
+			narratorId: permission.narratorId,
+		}),
+	);
+	await settle();
+	expect(row(permission.id).querySelector("textarea")).toBeNull();
+	expect(row(permission.id).textContent).toContain("do not have permission");
+	expect(approve).not.toHaveBeenCalled();
+});
+
+test("failed blocking question reflection keeps its draft and explicit retry", async () => {
+	const blocking = item("reflect", { toolName: "AskUserQuestion", kind: "blocking_question" });
+	addPermission(blocking, { questions: question(blocking).questions });
+	writeSession("ask-draft", blocking.toolCallId, draft);
+	const reflect = track(
+		spyOn(api, "reflectQuestion").mockRejectedValue(new Error("reflection offline")),
+	);
+	await openDrawer();
+	await click("Review decision", row(blocking.id));
+	await click(narratorEn.questionReflectionAnswer, row(blocking.id));
+	expect(reflect).toHaveBeenCalledWith(blocking.requestId);
+	expect(row(blocking.id).textContent).toContain("reflection offline");
+	expect(readSession("ask-draft", blocking.toolCallId)).not.toBeNull();
+});
+
+test("Dashboard uses summaries only and View all opens the same drawer", async () => {
+	addPermission(item("dashboard"));
+	const narrators = track(
+		spyOn(api, "listNarratorsPaginated").mockResolvedValue({
+			items: [],
+			nextCursor: null,
+			hasMore: false,
+			totalCount: 0,
+		}),
+	);
+	const permissions = track(spyOn(api, "getPendingPermissions"));
+	const detail = spyOn(api, "getHumanAttentionDetail");
+	await render(<NeedsAttention />);
+	expect(narrators).toHaveBeenCalledTimes(1);
+	expect(narrators.mock.calls[0][0]?.status).toBeUndefined();
+	expect(permissions).not.toHaveBeenCalled();
+	expect(detail).not.toHaveBeenCalled();
+	await click("View all");
+	expect(document.body.textContent).toContain("Human attention center");
+	expect(row("permission:dashboard")).toBeDefined();
+	expect(detail).not.toHaveBeenCalled();
+	expect(qc.getQueryData(humanAttentionListKey)).toMatchObject({
+		pages: [{ items: [{ id: "permission:dashboard" }] }],
+	});
+});

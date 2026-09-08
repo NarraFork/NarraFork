@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { isGatewayEventType, parseGatewaySSEEvent } from "../gateway-events";
+import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "../gateway-events";
+
+describe("gateway queue clear events", () => {
+	test("empty SSE and embedded events normalize to explicit clears", () => {
+		const clear = { queueStatus: { position: 0, queueDepth: 0 } };
+		expect(parseGatewaySSEEvent("queueEvent", {})).toEqual(clear);
+		expect(parseGatewayDataEvent({ type: "queueEvent" })).toEqual(clear);
+		expect(parseGatewaySSEEvent("queueEvent", { position: 0, queueDepth: 0 })).toMatchObject(clear);
+	});
+});
 
 describe("gateway model catalog events", () => {
 	test("ignores hash-only catalog events", () => {

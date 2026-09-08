@@ -128,6 +128,8 @@ export interface ReadBytesOptions {
 	expectedResolvedPath?: string;
 	/** Abort signal to cancel a long read. */
 	signal?: AbortSignal;
+	/** Require a bounded cancellable read on remote executors (fs.read.bounded.v1). */
+	timeoutMs?: number;
 }
 
 /** Result of reading raw file bytes. */
@@ -162,6 +164,17 @@ export async function readCompleteFileBytes(
 	return result;
 }
 
+/** Cancellation/deadline for metadata RPCs used by interactive file navigation. */
+export interface FileMetadataOptions {
+	signal?: AbortSignal;
+	timeoutMs?: number;
+}
+
+/** Array-compatible search results; old tool callers may ignore the optional marker. */
+export interface GlobMatches extends Array<string> {
+	truncated?: boolean;
+}
+
 /** Options for glob scanning. */
 export interface GlobOptions {
 	/** Base directory to scan from. */
@@ -170,6 +183,15 @@ export interface GlobOptions {
 	dot?: boolean;
 	/** Maximum results to return. */
 	maxResults?: number;
+	/** Maximum JSON-encoded result bytes; limits collection, not just the response. */
+	maxBytes?: number;
+	/** Hard scan deadline, including scans with no matching entries. */
+	timeoutMs?: number;
+	signal?: AbortSignal;
+	/** Include directory candidates for navigation, never recursive attachment. */
+	includeDirectories?: boolean;
+	/** Optional literal, case-insensitive relative-path filter (not glob syntax). */
+	query?: string;
 }
 
 /** Parameters for a grep (ripgrep) search. Mirrors the Grep tool surface. */
@@ -280,10 +302,10 @@ export interface ExecutionBackend {
 	 * are supported by canonicalizing the nearest existing ancestor and rebuilding
 	 * the missing suffix, so create operations can be frozen safely.
 	 */
-	resolvePathIdentity(path: string): Promise<PathIdentity>;
+	resolvePathIdentity(path: string, opts?: FileMetadataOptions): Promise<PathIdentity>;
 
 	// ── File primitives ──────────────────────────────────────────────
-	statFile(path: string): Promise<FileStat | null>;
+	statFile(path: string, opts?: FileMetadataOptions): Promise<FileStat | null>;
 	readFileBytes(path: string, opts?: ReadBytesOptions): Promise<ReadBytesResult>;
 	writeFileBytes(path: string, bytes: Uint8Array, opts?: WriteBytesOptions): Promise<void>;
 	/** Remove one file. Must be idempotent for a missing path and must not remove directories. */
@@ -293,7 +315,7 @@ export interface ExecutionBackend {
 	fileExists(path: string): Promise<boolean>;
 
 	// ── Search ───────────────────────────────────────────────────────
-	glob(pattern: string, opts: GlobOptions): Promise<string[]>;
+	glob(pattern: string, opts: GlobOptions): Promise<GlobMatches>;
 	grep(params: GrepParams): Promise<GrepResult>;
 
 	// ── Command execution ────────────────────────────────────────────

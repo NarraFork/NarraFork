@@ -15,11 +15,12 @@ export interface ComposerContentState {
 	text: string;
 	imageCount: number;
 	textFileCount: number;
+	fileReferenceCount?: number;
 }
 
 /** True when at least one attachment is staged. */
 export function hasComposerAttachments(state: ComposerContentState): boolean {
-	return state.imageCount > 0 || state.textFileCount > 0;
+	return state.imageCount > 0 || state.textFileCount > 0 || (state.fileReferenceCount ?? 0) > 0;
 }
 
 /** True when the composer has typed text (ignoring whitespace-only input). */

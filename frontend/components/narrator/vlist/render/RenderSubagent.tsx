@@ -54,19 +54,19 @@ import {
 	CHEVRON_SIZE,
 	DESC_LEFT,
 	DESC_MARGIN_TOP,
-	FILE_CHANGE_ROW_HEIGHT,
+	FILE_CHANGE_MAX_ROWS,
+	FILE_CHANGE_STACK_GAP,
 	type MeasuredSubagent,
 	PENDING_CARD_BORDER,
 	PROMPT_BODY_MARGIN_TOP,
 	PROMPT_TOGGLE_ROW_HEIGHT,
-	promptFontSize,
 	RECENT_STACK_GAP,
 	RECENT_TITLE_MARGIN_BOTTOM,
-	RESULT_MD_PADDING_BLOCK,
-	RESULT_MD_PADDING_INLINE,
 	SELF_PERMISSION_MARGIN_X,
 	STATUS_ICON_SIZE,
 	type SubagentFileChangesData,
+	subagentFileChangeIdentityKey,
+	subagentFileChangeScopeKey,
 	THEME_ICON_SIZE,
 } from "../measure/measure-subagent";
 import { HEADER_CELL_GAP, type ToolCategory } from "../measure/measure-tool-call";
@@ -74,19 +74,19 @@ import { HEADER_CELL_GAP, type ToolCategory } from "../measure/measure-tool-call
 // height model rather than a second set of numbers.
 import { TRACE_CHEVRON, TRACE_ROW_GAP, TRACE_ROW_ICON } from "../measure/measure-tool-run";
 import { typographyMetrics } from "../pretext-fonts";
-import { VListContentViewHost, type VListViewControls } from "../VListContentViewHost";
-import {
-	findViewTarget,
-	PROMPT_SLOT,
-	RESULT_SLOT,
-	type VListViewTarget,
-} from "../vlist-content-view-target";
+import type { VListViewControls } from "../VListContentViewHost";
+import { findViewTarget, type VListViewTarget } from "../vlist-content-view-target";
 import { categoryIcon } from "./category-icons";
 import { DiffStatsText } from "./diff-stats-text";
 import { swallowSelectionClick } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { RenderInlinePermission } from "./RenderPermission";
-import { CATEGORY_COLOR, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
+import {
+	CATEGORY_COLOR,
+	RenderToolBody,
+	ToolTimingArea,
+	type ToolTimingLabels,
+} from "./RenderToolCall";
 import {
 	hasToolRowStatusMark,
 	isTerminalToolRowStatus,
@@ -126,6 +126,20 @@ export interface SubagentLabels {
 	moreFiles?: string;
 	/** Overflow row: `{count}` files touched by shell commands. */
 	shellTouched?: string;
+	/** Legacy churn is neither exact per-attempt ownership nor net contribution. */
+	fileChangeLegacy?: string;
+	/** A requested execution window is not a verified attempt boundary. */
+	fileChangeWindow?: string;
+	unknownDevice?: string;
+	unknownWorkspace?: string;
+	/** Unknown parent comparison must not read as known inside/revert coverage. */
+	unknownCoverage?: string;
+	/** Overflow row: `{count}` changes with missing line measurements. */
+	unmeasuredChanges?: string;
+	countsTruncated?: string;
+	/** Per-file churn qualifier: `{count}` edits. */
+	fileEdits?: string;
+	collapseFiles?: string;
 	/**
 	 * Timing popover strings for the header + recent-call rows. Absent → the render
 	 * layer's English fallbacks. Height-neutral (portaled popover / fixed rows).
@@ -147,6 +161,15 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing">> = {
 	moreFiles: "{count} more files",
 	shellTouched: "{count} touched by shell",
 	outsideWorkspace: "outside this workspace",
+	fileChangeLegacy: "Legacy/unscoped · not per-attempt or net changes",
+	fileChangeWindow: "Requested boundary only; not verified attempt evidence",
+	unknownDevice: "unknown device",
+	unknownWorkspace: "unknown workspace",
+	unknownCoverage: "parent workspace coverage unknown",
+	unmeasuredChanges: "{count} changes not measured",
+	countsTruncated: "counts truncated; totals are lower bounds",
+	fileEdits: "{count} edits",
+	collapseFiles: "Show fewer files",
 };
 
 /**
@@ -159,24 +182,27 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing">> = {
  * in `subagent-file-changes.ts`).
  */
 function overflowSummary(
-	changes: { totalUnmeasured: number; bashTouchedCount: number; countsTruncated: boolean },
+	changes: SubagentFileChangesData,
 	hidden: number,
-	labels: { moreFiles: string; shellTouched: string },
+	expanded: boolean,
+	labels: ResolvedSubagentLabels,
 ): string {
-	// The label may arrive with either interpolation form: i18next writes `{{count}}`,
-	// while this module's own English fallbacks use `{count}`. Substituting both keeps
-	// the row correct whichever bundle supplied it — a missed placeholder would print
-	// the literal braces to the reader.
-	const withCount = (template: string, count: number) =>
-		template.replace("{{count}}", String(count)).replace("{count}", String(count));
 	const parts: string[] = [];
+	if (expanded) parts.push(labels.collapseFiles);
 	if (hidden > 0) parts.push(withCount(labels.moreFiles, hidden));
 	if (changes.bashTouchedCount > 0) {
 		parts.push(withCount(labels.shellTouched, changes.bashTouchedCount));
 	}
-	if (changes.totalUnmeasured > 0) parts.push(`${changes.totalUnmeasured} not measured`);
-	if (changes.countsTruncated) parts.push("counts truncated");
+	if (changes.totalUnmeasured > 0) {
+		parts.push(withCount(labels.unmeasuredChanges, changes.totalUnmeasured));
+	}
+	if (changes.countsTruncated) parts.push(labels.countsTruncated);
 	return parts.join(" · ");
+}
+
+/** Labels may use i18next's {{count}} or the renderer's {count} fallback. */
+function withCount(template: string, count: number): string {
+	return template.replace("{{count}}", String(count)).replace("{count}", String(count));
 }
 
 /**
@@ -206,8 +232,6 @@ interface RenderSubagentProps {
 	reasoningEffort?: string;
 	/** Collapsed result preview text (first ~120 chars). */
 	resultPreview?: string;
-	/** Prompt body text (shown when the prompt block is open). */
-	promptText?: string;
 	/** Recent activity call tool names (≤3 drawn). */
 	recentCallNames?: string[];
 	/**
@@ -447,7 +471,6 @@ function SubagentInner({
 	model,
 	reasoningEffort,
 	resultPreview,
-	promptText,
 	recentCallNames = [],
 	fileChanges,
 	isActive,
@@ -713,7 +736,6 @@ function SubagentInner({
 				<SubagentBody
 					measured={measured}
 					labels={labels}
-					promptText={promptText}
 					fileChanges={fileChanges}
 					onTogglePrompt={onTogglePrompt}
 					onToggleFileChanges={onToggleFileChanges}
@@ -756,7 +778,6 @@ function SubagentInner({
 function SubagentBody({
 	measured,
 	labels,
-	promptText,
 	fileChanges,
 	onTogglePrompt,
 	onToggleFileChanges,
@@ -766,7 +787,6 @@ function SubagentBody({
 }: {
 	measured: MeasuredSubagent;
 	labels: ResolvedSubagentLabels;
-	promptText?: string;
 	fileChanges?: SubagentFileChangesData;
 	onTogglePrompt?: () => void;
 	onToggleFileChanges?: () => void;
@@ -777,9 +797,12 @@ function SubagentBody({
 }) {
 	let top = 0;
 	const parts: React.ReactNode[] = [];
-	const promptTarget = findViewTarget(viewTargets, PROMPT_SLOT);
-	const promptWrapped = promptTarget ? viewControls?.isWrapped(promptTarget) !== false : true;
-	const resultTarget = findViewTarget(viewTargets, RESULT_SLOT);
+	const promptTarget = measured.promptMeasured
+		? findViewTarget(viewTargets, measured.promptMeasured.model.source)
+		: undefined;
+	const resultTarget = measured.resultMeasured
+		? findViewTarget(viewTargets, measured.resultMeasured.model.source)
+		: undefined;
 
 	// selfPermission (Box mx="xs" mb="xs" + InlinePermission).
 	if (measured.selfPermissionBlockHeight > 0 && measured.selfPermissionMeasured) {
@@ -839,27 +862,13 @@ function SubagentBody({
 					</Text>
 				</Group>
 				{promptOpen && measured.promptMeasured ? (
-					<VListContentViewHost target={promptTarget} controls={viewControls}>
-						<div
-							style={{
-								marginTop: PROMPT_BODY_MARGIN_TOP,
-								maxHeight: measured.promptBlockHeight - PROMPT_TOGGLE_ROW_HEIGHT - BLOCK_PADDING_X,
-								// The chunked ContentViewer's axis policy: a wrapped body has
-								// nothing to scroll to horizontally, so `overflowX: auto` would
-								// only turn a paint artifact into a scrollbar covering a short
-								// body (see CappedBodyBox). Unwrapped scrolls horizontally.
-								overflowY: "auto",
-								overflowX: promptWrapped ? "hidden" : "auto",
-								// Wrap only changes the scroll axis: the box height is already
-								// fixed by measure-subagent's prompt cap.
-								...(promptWrapped ? { whiteSpace: "pre-wrap" } : { whiteSpace: "pre" }),
-								fontSize: promptFontSize(),
-								fontFamily: "var(--mantine-font-family-monospace)",
-							}}
-						>
-							{promptText ?? ""}
-						</div>
-					</VListContentViewHost>
+					<div style={{ marginTop: PROMPT_BODY_MARGIN_TOP }}>
+						<RenderToolBody
+							measured={measured.promptMeasured}
+							viewTarget={promptTarget}
+							viewControls={viewControls}
+						/>
+					</div>
 				) : null}
 			</div>,
 		);
@@ -941,10 +950,27 @@ function SubagentBody({
 	// (one truncating xs mono line each), so the measured height is row count × line.
 	if (measured.fileChangesHeight > 0 && fileChanges) {
 		const rows = fileChanges.files.slice(0, measured.fileChangeRowCount);
-		const hidden = fileChanges.totalFiles - rows.length;
+		const hidden = Math.max(0, fileChanges.totalFiles - rows.length);
+		const canToggle = fileChanges.files.length > FILE_CHANGE_MAX_ROWS && !!onToggleFileChanges;
+		const summary = overflowSummary(
+			fileChanges,
+			hidden,
+			rows.length > FILE_CHANGE_MAX_ROWS,
+			labels,
+		);
+		const scopeKey = subagentFileChangeScopeKey(fileChanges);
+		const rowStyle = {
+			height: measured.fileChangeRowHeight,
+			lineHeight: `${measured.fileChangeRowHeight}px`,
+		};
+		const scopeDescription = fileChanges.scope
+			? `${labels.fileChangeWindow} · ${JSON.stringify(fileChanges.scope)}`
+			: "";
 		parts.push(
 			<div
-				key="file-changes"
+				key={`file-changes:${scopeKey}`}
+				data-testid="subagent-file-changes"
+				data-file-change-scope={scopeKey}
 				style={{
 					position: "absolute",
 					top,
@@ -957,70 +983,127 @@ function SubagentBody({
 					boxSizing: "border-box",
 				}}
 			>
-				<Text size="xs" c="dimmed" fw={500} style={{ height: FILE_CHANGE_ROW_HEIGHT }}>
-					{labels.fileChanges ?? "Changed files"} · {fileChanges.totalFiles}
+				<Text size="xs" c="dimmed" fw={500} truncate style={rowStyle}>
+					{labels.fileChanges} · {fileChanges.totalFiles}
 				</Text>
-				{rows.map((file) => (
-					<Group
-						key={file.filePath}
-						gap={6}
-						wrap="nowrap"
-						style={{ height: FILE_CHANGE_ROW_HEIGHT }}
+				{measured.fileChangeNoticeRowCount > 0 ? (
+					<Text
+						data-testid="subagent-file-changes-legacy"
+						size="xs"
+						c="yellow"
+						truncate
+						style={rowStyle}
+						title={labels.fileChangeLegacy}
 					>
-						<Text
-							size="xs"
-							c="dimmed"
-							truncate
-							ff="monospace"
-							style={{ flex: "0 1 auto", minWidth: 0 }}
-							title={file.filePath}
+						{labels.fileChangeLegacy}
+					</Text>
+				) : null}
+				{measured.fileChangeNoticeRowCount > 1 ? (
+					<Text
+						data-testid="subagent-file-changes-window"
+						size="xs"
+						c="dimmed"
+						truncate
+						style={rowStyle}
+						title={scopeDescription}
+					>
+						{scopeDescription}
+					</Text>
+				) : null}
+				<div style={{ display: "flex", flexDirection: "column", gap: FILE_CHANGE_STACK_GAP }}>
+					{rows.map((file) => (
+						<Group
+							key={subagentFileChangeIdentityKey(file)}
+							data-testid="subagent-file-change"
+							data-file-identity={subagentFileChangeIdentityKey(file)}
+							gap={6}
+							wrap="nowrap"
+							style={{ ...rowStyle, overflow: "hidden" }}
 						>
-							{file.filePath}
-						</Text>
-						{/* Same green/red plain text the tool cards use, so one file reads
+							<Text
+								data-testid="subagent-file-location"
+								size="xs"
+								c="dimmed"
+								truncate
+								ff="monospace"
+								style={{ flex: "0 1 auto", minWidth: 0, maxWidth: "40%" }}
+								title={`${file.deviceId || labels.unknownDevice} · ${file.workspacePath || labels.unknownWorkspace}`}
+							>
+								{file.deviceId || labels.unknownDevice} ·{" "}
+								{file.workspacePath || labels.unknownWorkspace}
+							</Text>
+							<Text
+								size="xs"
+								c="dimmed"
+								truncate
+								ff="monospace"
+								style={{ flex: "0 1 auto", minWidth: 0 }}
+								title={file.filePath}
+							>
+								{file.filePath}
+							</Text>
+							{/* Same green/red plain text the tool cards use, so one file reads
 						    identically wherever it appears. */}
-						<DiffStatsText
-							stats={
-								file.linesAdded === null || file.linesRemoved === null
-									? null
-									: { added: file.linesAdded, removed: file.linesRemoved }
-							}
-						/>
-						{/* The churn qualifier: without it `+42 -3` reads as "this file is now
+							<DiffStatsText
+								stats={
+									file.linesAdded == null || file.linesRemoved == null
+										? null
+										: { added: file.linesAdded, removed: file.linesRemoved }
+								}
+							/>
+							{/* The churn qualifier: without it `+42 -3` reads as "this file is now
 						    42 lines longer", which these figures do not measure. */}
-						{file.editCount > 1 ? (
-							<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-								· {file.editCount} edits
-							</Text>
-						) : null}
-						{file.linesAdded === null ? (
-							<Text size="xs" c="dimmed" style={{ flexShrink: 0, opacity: 0.7 }}>
-								{labels.linesNotMeasured ?? "lines not measured"}
-							</Text>
-						) : null}
-						{/* A revert restores only this workspace, so a change made elsewhere
-						    survives it. The injected text warns the model about exactly these
-						    files; without the marker the card contradicted it, and the card is
-						    what the reader sees. Height-neutral: the row is a fixed
-						    FILE_CHANGE_ROW_HEIGHT with `wrap="nowrap"`, so this cannot alter
-						    what the measure layer reserved. */}
-						{file.outsideParentWorkspace ? (
-							<Text size="xs" c="yellow" style={{ flexShrink: 0 }} title={file.filePath}>
-								· {labels.outsideWorkspace ?? "outside this workspace"}
-							</Text>
-						) : null}
-					</Group>
-				))}
+							{file.editCount > 1 ? (
+								<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+									· {withCount(labels.fileEdits, file.editCount)}
+								</Text>
+							) : null}
+							{file.linesAdded == null ||
+							file.linesRemoved == null ||
+							(file.unmeasuredCount ?? 0) > 0 ? (
+								<Text size="xs" c="dimmed" style={{ flexShrink: 0, opacity: 0.7 }}>
+									{labels.linesNotMeasured}
+								</Text>
+							) : null}
+							{/* Location is not undo authority. null/missing must never read as inside. */}
+							{file.outsideParentWorkspace === true ? (
+								<Text size="xs" c="yellow" style={{ flexShrink: 0 }} title={file.filePath}>
+									· {labels.outsideWorkspace}
+								</Text>
+							) : null}
+							{file.outsideParentWorkspace == null || !file.deviceId || !file.workspacePath ? (
+								<Text
+									data-testid="subagent-file-coverage-unknown"
+									size="xs"
+									c="yellow"
+									truncate
+									style={{ flex: "0 1 auto", minWidth: 0 }}
+									title={labels.unknownCoverage}
+								>
+									· {labels.unknownCoverage}
+								</Text>
+							) : null}
+						</Group>
+					))}
+				</div>
 				{measured.hasFileChangeOverflowRow ? (
 					<UnstyledButton
+						data-testid="subagent-file-changes-overflow"
+						disabled={!canToggle}
+						aria-expanded={canToggle ? rows.length > FILE_CHANGE_MAX_ROWS : undefined}
 						onClick={(e: React.MouseEvent) => {
 							e.stopPropagation();
 							onToggleFileChanges?.();
 						}}
-						style={{ height: FILE_CHANGE_ROW_HEIGHT, display: "block", width: "100%" }}
+						style={{
+							...rowStyle,
+							display: "block",
+							width: "100%",
+							cursor: canToggle ? "pointer" : "default",
+						}}
 					>
-						<Text size="xs" c="dimmed" truncate>
-							{overflowSummary(fileChanges, hidden, labels)}
+						<Text size="xs" c="dimmed" truncate style={rowStyle} title={summary}>
+							{summary}
 						</Text>
 					</UnstyledButton>
 				) : null}
@@ -1046,38 +1129,11 @@ function SubagentBody({
 					boxSizing: "border-box",
 				}}
 			>
-				<VListContentViewHost target={resultTarget} controls={viewControls}>
-					<div
-						style={{
-							maxHeight: measured.resultBlockHeight - BLOCK_PADDING_X,
-							// A markdown body is always wrapped (rendered form wraps by
-							// construction, the source view is `pre-wrap`), so horizontal
-							// overflow is a paint artifact, never content to scroll to.
-							overflowY: "auto",
-							overflowX: "hidden",
-							paddingInline: RESULT_MD_PADDING_INLINE,
-							paddingBlock: RESULT_MD_PADDING_BLOCK,
-							boxSizing: "border-box",
-						}}
-					>
-						{/* Source view shows the raw markdown in the same fixed-height box,
-						    so switching cannot move the card. */}
-						{resultTarget && viewControls?.isSourceShown(resultTarget) ? (
-							<div
-								style={{
-									fontSize: promptFontSize(),
-									fontFamily: "var(--mantine-font-family-monospace)",
-									whiteSpace: "pre-wrap",
-									wordBreak: "break-word",
-								}}
-							>
-								{resultTarget.text}
-							</div>
-						) : (
-							<RenderMarkdown measured={measured.resultMeasured} />
-						)}
-					</div>
-				</VListContentViewHost>
+				<RenderToolBody
+					measured={measured.resultMeasured}
+					viewTarget={resultTarget}
+					viewControls={viewControls}
+				/>
 			</div>,
 		);
 		top += measured.resultBlockHeight;

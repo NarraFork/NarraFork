@@ -1,4 +1,6 @@
 import { z } from "zod/v4";
+import { LocalFileValidationError } from "../../../services/file-change-local-io";
+import { executeLocalFileChange } from "../../../services/file-change-runtime";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
@@ -586,6 +588,72 @@ export const editTool: ToolDefinition = {
 		const ioPath = canonicalPath ?? resolvedPath;
 
 		try {
+			const recorded = await executeLocalFileChange({
+				ctx,
+				backend,
+				toolName: "Edit",
+				filePath: file_path,
+				input: { old_string, new_string, replace_all: replace_all ?? false },
+				construct(before) {
+					if (old_string === new_string)
+						throw new LocalFileValidationError(
+							"No changes to apply: old_string and new_string are identical.",
+							"No changes to apply: old_string and new_string are identical.",
+						);
+					if (before.bytes === null && old_string !== "")
+						throw new LocalFileValidationError(
+							`File not found: ${file_path}`,
+							`File not found: ${file_path}`,
+						);
+					const decoded =
+						before.bytes === null ? { text: "", encoding: "utf-8" } : decodeFileBytes(before.bytes);
+					const normalizedOld = normalizeLineEndings(old_string);
+					const normalizedNew = normalizeLineEndings(new_string);
+					const content = normalizeLineEndings(decoded.text);
+					let result: ReplaceResult;
+					try {
+						result =
+							old_string === ""
+								? { content: normalizedNew, startLine: 1, matchedText: "", occurrences: 1 }
+								: replace(content, normalizedOld, normalizedNew, replace_all);
+					} catch (error) {
+						throw new LocalFileValidationError(
+							error instanceof Error ? error.message : String(error),
+						);
+					}
+					const ending = detectLineEnding(before.bytes === null ? new_string : decoded.text);
+					const stats =
+						before.bytes !== null && looksBinary(before.bytes)
+							? null
+							: old_string === ""
+								? wholeFileLineStats(before.bytes === null ? null : content, result.content)
+								: replacementLineStats(result.matchedText, normalizedNew, result.occurrences);
+					return {
+						nextBytes: encodeFileBytes(applyLineEnding(result.content, ending), decoded.encoding),
+						lineStats: stats,
+						result: {
+							output:
+								old_string === "" ? `Created/overwritten ${file_path}` : `Edited ${file_path}`,
+							title: file_path,
+							metadata: {
+								...(old_string === ""
+									? {}
+									: {
+											startLine: result.startLine,
+											endLine: result.startLine + normalizedOld.split("\n").length - 1,
+											newEndLine: result.startLine + normalizedNew.split("\n").length - 1,
+										}),
+								...lineStatsMetadata(stats),
+							},
+						},
+					};
+				},
+			});
+			if (recorded) {
+				await trackFileChange(ctx, ioPath, "edit", backend, null, { evidenceRecorded: true });
+				return recorded;
+			}
+			// Legacy/remote compatibility only; it never creates v2 evidence.
 			// Guard: identical strings
 			if (old_string === new_string) {
 				return {
@@ -658,7 +726,10 @@ export const editTool: ToolDefinition = {
 					return {
 						output: `Created/overwritten ${file_path}`,
 						title: file_path,
-						...(overwriteStats ? { metadata: lineStatsMetadata(overwriteStats) } : {}),
+						metadata: {
+							...lineStatsMetadata(overwriteStats),
+							fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
+						},
 					};
 				}
 
@@ -696,12 +767,16 @@ export const editTool: ToolDefinition = {
 						endLine: result.startLine + oldLines - 1,
 						newEndLine: result.startLine + newLines - 1,
 						...lineStatsMetadata(editStats),
+						fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
 					},
 				};
 			});
 		} catch (err) {
 			return {
-				output: `Error editing ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
+				output:
+					err instanceof LocalFileValidationError && err.toolOutput
+						? err.toolOutput
+						: `Error editing ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,
 			};
 		}

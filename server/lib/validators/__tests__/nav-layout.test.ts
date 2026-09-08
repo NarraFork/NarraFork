@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { CUSTOMIZABLE_NAV_ITEMS } from "@frontend/components/nav/nav-items";
+import { mergeNavLayout, toPersistedNavLayout } from "@frontend/hooks/nav-layout";
 import { CUSTOMIZABLE_NAV_IDS, NAV_DIVIDER_ID } from "@shared/nav-layout";
 import { updateUserPreferencesSchema } from "../settings";
 
@@ -26,6 +27,16 @@ describe("navLayout id whitelist", () => {
 
 	test("the frontend registry covers exactly the shared id set", () => {
 		expect(CUSTOMIZABLE_NAV_ITEMS.map((def) => def.id)).toEqual([...CUSTOMIZABLE_NAV_IDS]);
+	});
+
+	test("accepts a normalized legacy tutorial layout and preserves the learning guide", () => {
+		const navLayout = toPersistedNavLayout(
+			mergeNavLayout({ items: [{ id: "tutorial" }, { id: "learn" }, { id: NAV_DIVIDER_ID }] }),
+		);
+		const parsed = updateUserPreferencesSchema.parse({ navLayout });
+		const ids = parsed.navLayout?.items.map((item) => item.id);
+		expect(ids).not.toContain("tutorial");
+		expect(ids).toContain("learn");
 	});
 
 	test("still rejects ids that no longer exist in the registry", () => {

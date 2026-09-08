@@ -3,7 +3,27 @@ import {
 	getNarratorStatusBarDisplay,
 	type NarratorWorkIndicatorPrimary,
 	planNarratorWorkIndicator,
+	withQueueSubstatus,
 } from "./narrator-status-bar";
+
+describe("queue substatus", () => {
+	const queued = ["reasoning", "queue_position:1", "queue_depth:2", "queue_message:waiting"];
+	test("zero and empty events clear all queue tags before any text arrives", () => {
+		expect(withQueueSubstatus(queued, 0, 0, "stale")).toEqual(["reasoning"]);
+		expect(withQueueSubstatus(queued)).toEqual(["reasoning"]);
+	});
+	test("queue updates and message-only queues remain supported", () => {
+		expect(withQueueSubstatus(queued, 2, 3)).toEqual([
+			"reasoning",
+			"queue_position:2",
+			"queue_depth:3",
+		]);
+		expect(withQueueSubstatus(queued, undefined, undefined, "waiting")).toEqual([
+			"reasoning",
+			"queue_message:waiting",
+		]);
+	});
+});
 
 type WorkIndicatorInput = Parameters<typeof planNarratorWorkIndicator>[0];
 
@@ -197,6 +217,30 @@ describe("getNarratorStatusBarDisplay", () => {
 });
 
 describe("NarratorPanel status layout contract", () => {
+	test("queue suffix and separator share the positive-position/message condition", async () => {
+		const source = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
+		expect(source).toMatch(
+			/\{\(\(queuePositionValue != null && queuePositionValue > 0\) \|\|\s*queueMessageValue\) && \(\s*<Text[^>]*>\s*·\{" "\}/,
+		);
+	});
+	test("idle background work reuses the live count and opens the correct task host", async () => {
+		const source = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
+		const idleStart = source.indexOf("text={t(statusBarDisplay.labelKey)}");
+		const elapsedStart = source.indexOf("{turnElapsedText && !isWorkspacePreview", idleStart);
+		expect(idleStart).toBeGreaterThan(-1);
+		expect(elapsedStart).toBeGreaterThan(idleStart);
+		const idleStatus = source.slice(idleStart, elapsedStart);
+
+		// Keep preview/pushed-subagent views from opening a different narrator's tasks.
+		expect(idleStatus).toContain("tasksSupported && tasksButtonEnabled");
+		expect(idleStatus).toContain("<BackgroundTasksStatusButton");
+		expect(idleStatus).toContain("runningCount={tasksRunningCount}");
+		// This entry reveals existing tabs instead of toggling them closed.
+		expect(idleStatus).toContain('dock.openToolPanel("tasks")');
+		expect(idleStatus).toContain("setMobileTasksOpen(true)");
+		expect(idleStatus).not.toContain("toggleToolPanel");
+	});
+
 	test("long idle and elapsed labels can shrink without losing their full accessible text", async () => {
 		const source = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
 

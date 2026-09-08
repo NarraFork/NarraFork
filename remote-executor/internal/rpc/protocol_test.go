@@ -26,6 +26,8 @@ func TestCapabilitiesAdvertiseSafePlanReadFeatures(t *testing.T) {
 		FeatureFsStatResolvedPathV1,
 		FeatureFsReadAtomicResolvedPathV1,
 		FeatureFsWriteAtomicResolvedPathV1,
+		FeatureGlobBoundedV1,
+		FeatureFsReadBoundedV1,
 	} {
 		if !containsFeature(decoded.Features, feature) {
 			t.Fatalf("updated executor did not advertise %q: %s", feature, encoded)
@@ -77,6 +79,17 @@ func TestDispatcherSystemPing(t *testing.T) {
 	payload, ok := result.(map[string]any)
 	if !ok || payload["ok"] != true {
 		t.Fatalf("unexpected system.ping result: %#v", result)
+	}
+}
+
+func TestDispatcherCancelsBoundedFileOperations(t *testing.T) {
+	dispatcher := NewDispatcher(handlers.New(handlers.NewPathGuard(nil), 1024))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, method := range []string{"glob", "fs.read"} {
+		if _, err := dispatcher.Dispatch(ctx, method, nil, nil); err != context.Canceled {
+			t.Fatalf("%s dispatcher lost RPC cancellation: %v", method, err)
+		}
 	}
 }
 

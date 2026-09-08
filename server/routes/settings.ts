@@ -65,6 +65,7 @@ import {
 	modelCardSchema,
 	whitelistDirEntrySchema,
 } from "../lib/validators";
+import { subagentModelReasoningEffortsSchema } from "../lib/validators/subagent-models";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { requireAdmin } from "../middleware/auth";
 import {
@@ -394,6 +395,7 @@ export const updateSettingsSchema = z
 						review: z.string(),
 					})
 					.partial(),
+				subagentModelReasoningEfforts: subagentModelReasoningEffortsSchema,
 				subagentAllowedModels: z
 					.object({
 						explore: z.array(z.string()),

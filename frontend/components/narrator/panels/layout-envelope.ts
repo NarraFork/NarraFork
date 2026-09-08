@@ -44,7 +44,7 @@ import type { Direction, SerializedDockview } from "dockview-react";
  * between them.
  */
 export function stripIdentityFromLayout(layout: SerializedDockview): SerializedDockview {
-	const clone = structuredClone(layout) as SerializedDockview;
+	const clone = stripNavigationFromLayout(layout);
 	const panels = (clone as { panels?: Record<string, { params?: Record<string, unknown> }> })
 		.panels;
 	if (panels) {
@@ -52,10 +52,22 @@ export function stripIdentityFromLayout(layout: SerializedDockview): SerializedD
 			if (panel?.params) {
 				delete panel.params.narratorId;
 				delete panel.params.chapterId;
-				delete panel.params.highlightMessageId;
-				delete panel.params.highlightRequestId;
 			}
 		}
+	}
+	return clone;
+}
+
+/** Workspace membership needs narrator ids, but no surface should replay navigation. */
+export function stripNavigationFromLayout(layout: SerializedDockview): SerializedDockview {
+	const clone = structuredClone(layout);
+	const panels = (clone as { panels?: Record<string, { params?: Record<string, unknown> }> })
+		.panels;
+	for (const panel of Object.values(panels ?? {})) {
+		if (!panel?.params) continue;
+		delete panel.params.highlightMessageId;
+		delete panel.params.highlightRequestId;
+		if (panel.params.panelType === "file") delete panel.params.selection;
 	}
 	return clone;
 }

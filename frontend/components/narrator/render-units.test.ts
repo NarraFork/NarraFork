@@ -116,6 +116,137 @@ describe("groupToolRunItemsForLod", () => {
 	});
 });
 
+describe("communication remains chronological conversation content", () => {
+	function communicationMessage(messageId: string, status = "success"): NarratorMsg {
+		const msg = toolMessage(messageId, "send-1", "", { status });
+		msg.contentJson = [
+			{
+				type: "tool_use",
+				id: "send-1",
+				name: "Send",
+				input: { name: "worker", message: "**hello**" },
+			},
+		];
+		msg.toolCalls = msg.toolCalls.map((tc) => ({ ...tc, toolName: "Send" }));
+		return msg;
+	}
+
+	test.each([
+		true,
+		false,
+	])("communication handoff deduplicates across boundaries (fold=%s)", (enabled) => {
+		const persisted = communicationMessage("persisted");
+		const live = communicationMessage("__streaming__", "running");
+		for (const messages of [
+			[persisted, userMessage("boundary"), live],
+			[live, userMessage("boundary"), persisted],
+		]) {
+			const units = groupRenderUnits(segmentMessages(messages), enabled);
+			const tools = units.flatMap((unit) =>
+				unit.kind === "segment" && unit.seg.kind === "tool-run" ? unit.seg.items : [],
+			);
+			expect(tools).toHaveLength(1);
+			expect(tools[0]?.msg.id).toBe("persisted");
+			expect(tools[0]?.tc.status).toBe("success");
+			expect(units.some((unit) => unit.kind === "activity")).toBe(false);
+		}
+	});
+
+	test.each([
+		true,
+		false,
+	])("persisted retries are not mistaken for live twins (fold=%s)", (enabled) => {
+		const units = groupRenderUnits(
+			segmentMessages([communicationMessage("retry-one"), communicationMessage("retry-two")]),
+			enabled,
+		);
+		const tools = units.flatMap((unit) =>
+			unit.kind === "segment" && unit.seg.kind === "tool-run" ? unit.seg.items : [],
+		);
+		expect(tools.map((item) => item.msg.id)).toEqual(["retry-one", "retry-two"]);
+	});
+
+	test("mixed completed tool groups exempt only Send and TeamStatus send/broadcast", () => {
+		const items = toolRunItems(["success", "success", "success", "success", "success", "success"]);
+		const names = ["Read", "Send", "Bash", "TeamStatus", "TeamStatus", "TeamStatus"];
+		for (const [index, item] of items.entries()) {
+			item.tc.toolName = names[index] ?? "Read";
+			item.tc.inputJson = {
+				action: index === 3 ? "send" : index === 4 ? "list" : "broadcast",
+				message: "hello",
+			};
+		}
+		const segments = [
+			{ kind: "tool-run" as const, items, sourceMessages: items.map((item) => item.msg) },
+		];
+		const units = groupRenderUnits(segments, true);
+		expect(units.map((unit) => unit.kind)).toEqual([
+			"activity",
+			"segment",
+			"activity",
+			"segment",
+			"activity",
+			"segment",
+		]);
+		expect(
+			units.flatMap((unit) =>
+				unit.kind === "activity"
+					? unit.items.map((item) => (item.kind === "tool" ? item.tc.toolName : "reasoning"))
+					: [],
+			),
+		).toEqual(["Read", "Bash", "TeamStatus"]);
+		expect(groupToolRunItemsForLod(items).map((group) => group.kind)).toEqual([
+			"folded",
+			"active",
+			"folded",
+			"active",
+			"folded",
+			"active",
+		]);
+		const kept = units.flatMap((unit) =>
+			unit.kind === "segment" && unit.seg.kind === "tool-run" ? unit.seg.items : [],
+		);
+		expect(kept.map((item) => item.tc.toolUseId)).toEqual(["tool-1", "tool-3", "tool-5"]);
+	});
+
+	test("reasoning, communication, answer, and tool activity keep original message order", () => {
+		const units = groupRenderUnits(
+			segmentMessages([
+				toolMessage("before", "read-before", "first thought"),
+				communicationMessage("sent"),
+				userMessage("answer-boundary"),
+				toolMessage("after", "read-after", "next thought"),
+			]),
+			true,
+		);
+		expect(units.map((unit) => unit.kind)).toEqual(["activity", "segment", "segment", "activity"]);
+		expect(
+			units.map((unit) =>
+				unit.kind === "activity"
+					? unit.sourceMessages[0]?.id
+					: unit.seg.kind === "tool-run"
+						? unit.seg.items[0]?.msg.id
+						: unit.seg.kind === "message"
+							? unit.seg.msg.id
+							: "other",
+			),
+		).toEqual(["before", "sent", "answer-boundary", "after"]);
+	});
+
+	test("TeamStatus streamed action is recognized before full input is committed", () => {
+		const items = toolRunItems(["running"]);
+		const item = items[0];
+		if (!item) throw new Error("missing tool item");
+		item.tc.toolName = "TeamStatus";
+		item.tc.inputJson = { _streamingFields: { action: "broadcast", message: "live" } };
+		const units = groupRenderUnits(
+			[{ kind: "tool-run", items, sourceMessages: items.map((item) => item.msg) }],
+			true,
+		);
+		expect(units[0]?.kind).toBe("segment");
+	});
+});
+
 describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 	test("disabled → identity (one unit per segment)", () => {
 		const segments = segmentMessages([

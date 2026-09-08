@@ -124,7 +124,18 @@ describe("measureToolCall — collapsed = header only", () => {
 	it("a folded card (L3) is exactly the collapsed height, with no detail", async () => {
 		const { measureToolCall } = await mod();
 		const r = measureToolCall(
-			baseCard({ detail: { kind: "capped", cap: "code", contentLines: 50 } }),
+			baseCard({
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							label: "output",
+							body: bodyFixture({ kind: "capped", cap: "code", contentLines: 50 }),
+						},
+					],
+				},
+			}),
 			600,
 			3,
 		);
@@ -155,12 +166,34 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 	it("short code content is not capped (height grows with content)", async () => {
 		const { measureToolCall, DETAIL_CONTENT_LINE_HEIGHT } = await mod();
 		const few = measureToolCall(
-			baseCard({ detail: { kind: "capped", cap: "code", contentLines: 3 } }),
+			baseCard({
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							label: "output",
+							body: bodyFixture({ kind: "capped", cap: "code", contentLines: 3 }),
+						},
+					],
+				},
+			}),
 			600,
 			5,
 		);
 		const more = measureToolCall(
-			baseCard({ detail: { kind: "capped", cap: "code", contentLines: 6 } }),
+			baseCard({
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							label: "output",
+							body: bodyFixture({ kind: "capped", cap: "code", contentLines: 6 }),
+						},
+					],
+				},
+			}),
 			600,
 			5,
 		);
@@ -177,13 +210,24 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 			DETAIL_TOP_MARGIN,
 		} = await mod();
 		const r = measureToolCall(
-			baseCard({ detail: { kind: "capped", cap: "code", contentLines: 500 } }),
+			baseCard({
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							label: "output",
+							body: bodyFixture({ kind: "capped", cap: "code", contentLines: 500 }),
+						},
+					],
+				},
+			}),
 			600,
 			5,
 		);
 		// The region = mt="xs" gap + label chrome + body clamped to the cap.
 		const labelH = DETAIL_LABEL_LINE_HEIGHT + DETAIL_LABEL_MARGIN_BOTTOM;
-		expect(r.detail!.appliedCap).toBe(DETAIL_CAPS.code);
+		expect(r.detail!.sections[0]!.measuredBody.appliedCap).toBe(DETAIL_CAPS.code);
 		expect(r.detail!.height).toBe(DETAIL_TOP_MARGIN + labelH + DETAIL_CAPS.code);
 	});
 
@@ -192,12 +236,20 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 		const r = measureToolCall(
 			baseCard({
 				category: "bash",
-				detail: { kind: "capped", cap: "bash-cmd", contentLines: 999 },
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							body: bodyFixture({ kind: "capped", cap: "bash-cmd", contentLines: 999 }),
+						},
+					],
+				},
 			}),
 			600,
 			5,
 		);
-		expect(r.detail!.appliedCap).toBe(DETAIL_CAPS["bash-cmd"]);
+		expect(r.detail!.sections[0]!.measuredBody.appliedCap).toBe(DETAIL_CAPS["bash-cmd"]);
 		// bash-cmd has no leading label → region = mt="xs" gap + clamped body.
 		expect(r.detail!.height).toBe(DETAIL_TOP_MARGIN + DETAIL_CAPS["bash-cmd"]);
 	});
@@ -205,12 +257,34 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 	it("media detail uses a direct pixel estimate clamped at 400", async () => {
 		const { measureToolCall, DETAIL_CAPS, DETAIL_TOP_MARGIN } = await mod();
 		const small = measureToolCall(
-			baseCard({ category: "browser", detail: { kind: "capped", cap: "media", contentPx: 150 } }),
+			baseCard({
+				category: "browser",
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							body: bodyFixture({ kind: "capped", cap: "media", contentPx: 150 }),
+						},
+					],
+				},
+			}),
 			600,
 			5,
 		);
 		const huge = measureToolCall(
-			baseCard({ category: "browser", detail: { kind: "capped", cap: "media", contentPx: 5000 } }),
+			baseCard({
+				category: "browser",
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							body: bodyFixture({ kind: "capped", cap: "media", contentPx: 5000 }),
+						},
+					],
+				},
+			}),
 			600,
 			5,
 		);
@@ -227,10 +301,18 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 			baseCard({
 				category: "browser",
 				detail: {
-					kind: "capped",
-					cap: "media",
-					contentPx: 200,
-					media: { previewUrl: "/p/x", width: 1280, height: 720 },
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							body: bodyFixture({
+								kind: "capped",
+								cap: "media",
+								contentPx: 200,
+								media: { previewUrl: "/p/x", width: 1280, height: 720 },
+							}),
+						},
+					],
 				},
 			}),
 			600,
@@ -244,10 +326,18 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 			baseCard({
 				category: "browser",
 				detail: {
-					kind: "capped",
-					cap: "media",
-					contentPx: 200,
-					media: { previewUrl: "/p/x", width: 720, height: 1280 },
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							body: bodyFixture({
+								kind: "capped",
+								cap: "media",
+								contentPx: 200,
+								media: { previewUrl: "/p/x", width: 720, height: 1280 },
+							}),
+						},
+					],
 				},
 			}),
 			600,
@@ -259,10 +349,18 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 			baseCard({
 				category: "browser",
 				detail: {
-					kind: "capped",
-					cap: "media",
-					contentPx: 200,
-					media: { previewUrl: "/p/x", width: 1280 },
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							body: bodyFixture({
+								kind: "capped",
+								cap: "media",
+								contentPx: 200,
+								media: { previewUrl: "/p/x", width: 1280 },
+							}),
+						},
+					],
 				},
 			}),
 			600,
@@ -283,7 +381,7 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 		const { measureToolCall, DETAIL_CAPS, CARD_PADDING, CARD_BORDER } = await mod();
 		const innerWidth = 600 - CARD_PADDING * 2 - CARD_BORDER * 2; // 578
 		const mediaBlock = (m: Awaited<ReturnType<typeof measureToolCall>>) => {
-			const block = m.detail?.blocks[0];
+			const block = m.detail?.sections[0]?.measuredBody.blocks[0];
 			expect(block?.kind).toBe("fixed");
 			return (block as { data?: Record<string, unknown> }).data ?? {};
 		};
@@ -292,10 +390,18 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 				baseCard({
 					category: "browser",
 					detail: {
-						kind: "capped",
-						cap: "media",
-						contentPx: 200,
-						media: { previewUrl: "/p/x", width, height },
+						kind: "sections",
+						sections: [
+							{
+								key: "output.main",
+								body: bodyFixture({
+									kind: "capped",
+									cap: "media",
+									contentPx: 200,
+									media: { previewUrl: "/p/x", width, height },
+								}),
+							},
+						],
 					},
 				}),
 				600,
@@ -327,10 +433,18 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 			baseCard({
 				category: "browser",
 				detail: {
-					kind: "capped",
-					cap: "media",
-					contentPx: 200,
-					media: { previewUrl: "/p/x" },
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							body: bodyFixture({
+								kind: "capped",
+								cap: "media",
+								contentPx: 200,
+								media: { previewUrl: "/p/x" },
+							}),
+						},
+					],
 				},
 			}),
 			600,
@@ -344,20 +458,42 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 	it("plan cap = round(0.85 × viewportHeight), falling back to 400", async () => {
 		const { measureToolCall, DETAIL_CAPS, DETAIL_TOP_MARGIN } = await mod();
 		const withVp = measureToolCall(
-			baseCard({ category: "plan", detail: { kind: "capped", cap: "plan", contentLines: 999 } }),
+			baseCard({
+				category: "plan",
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							body: bodyFixture({ kind: "capped", cap: "plan", contentLines: 999 }),
+						},
+					],
+				},
+			}),
 			600,
 			5,
 			{ viewportHeight: 1000 },
 		);
 		// 0.85 × 1000 = 850.
-		expect(withVp.detail!.appliedCap).toBe(850);
+		expect(withVp.detail!.sections[0]!.measuredBody.appliedCap).toBe(850);
 		expect(withVp.detail!.height).toBe(DETAIL_TOP_MARGIN + 850);
 		const noVp = measureToolCall(
-			baseCard({ category: "plan", detail: { kind: "capped", cap: "plan", contentLines: 999 } }),
+			baseCard({
+				category: "plan",
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							body: bodyFixture({ kind: "capped", cap: "plan", contentLines: 999 }),
+						},
+					],
+				},
+			}),
 			600,
 			5,
 		);
-		expect(noVp.detail!.appliedCap).toBe(DETAIL_CAPS.plan);
+		expect(noVp.detail!.sections[0]!.measuredBody.appliedCap).toBe(DETAIL_CAPS.plan);
 	});
 
 	it("a server-truncated MARKDOWN body reserves the full cap, like a plain one", async () => {
@@ -373,12 +509,20 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 				baseCard({
 					category: "plan",
 					detail: {
-						kind: "capped",
-						cap: "plan",
-						contentLines: 3,
-						text: short,
-						markdown: true,
-						...(textTruncated ? { textTruncated: true } : {}),
+						kind: "sections",
+						sections: [
+							{
+								key: "output.main",
+								body: bodyFixture({
+									kind: "capped",
+									cap: "plan",
+									contentLines: 3,
+									text: short,
+									format: "markdown",
+									...(textTruncated ? { textTruncated: true } : {}),
+								}),
+							},
+						],
 					},
 				}),
 				600,
@@ -393,8 +537,8 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 		expect(whole.detail!.height).toBeLessThan(prefix.detail!.height);
 		// And the flag travels out as a height-neutral output field, which is what
 		// lets the viewer host request the missing bytes.
-		expect(prefix.detail!.textTruncated).toBe(true);
-		expect(whole.detail!.textTruncated).toBeUndefined();
+		expect(prefix.detail!.sections[0]!.measuredBody.textTruncated).toBe(true);
+		expect(whole.detail!.sections[0]!.measuredBody.textTruncated).toBeUndefined();
 	});
 
 	it("does not reserve any row for a truncated payload (there is no notice line)", async () => {
@@ -406,7 +550,21 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 			measureToolCall(
 				baseCard({
 					category: "read",
-					detail: { kind: "capped", cap: "code", contentLines: 4, text: "a\nb\nc\nd" },
+					detail: {
+						kind: "sections",
+						sections: [
+							{
+								key: "output.main",
+								label: "output",
+								body: bodyFixture({
+									kind: "capped",
+									cap: "code",
+									contentLines: 4,
+									text: "a\nb\nc\nd",
+								}),
+							},
+						],
+					},
 					...(truncated ? { truncatedLeafCount: 1, truncatedTotalBytes: 17 * 1024 } : {}),
 				}),
 				600,
@@ -422,17 +580,56 @@ describe("measureToolCall — expanded capped detail = min(content, cap)", () =>
 	it("generic detail sums an input + optional output section (each capped 200)", async () => {
 		const { measureToolCall } = await mod();
 		const inputOnly = measureToolCall(
-			baseCard({ category: "generic", detail: { kind: "generic", inputLines: 3 } }),
+			baseCard({
+				category: "generic",
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "input.arguments",
+							label: "input",
+							body: bodyFixture({
+								cap: "code",
+								source: "input.arguments",
+								contentLines: 3,
+								text: undefined,
+							}),
+						},
+					],
+				},
+			}),
 			600,
 			5,
 		);
 		const both = measureToolCall(
-			baseCard({ category: "generic", detail: { kind: "generic", inputLines: 3, outputLines: 3 } }),
+			baseCard({
+				category: "generic",
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "input.arguments",
+							label: "input",
+							body: bodyFixture({
+								cap: "code",
+								source: "input.arguments",
+								contentLines: 3,
+								text: undefined,
+							}),
+						},
+						{
+							key: "output.main",
+							label: "output",
+							body: bodyFixture({ cap: "code", contentLines: 3, text: undefined }),
+						},
+					],
+				},
+			}),
 			600,
 			5,
 		);
-		expect(inputOnly.detail!.blocks).toHaveLength(1);
-		expect(both.detail!.blocks).toHaveLength(2);
+		expect(inputOnly.detail!.sections[0]!.measuredBody.blocks).toHaveLength(1);
+		expect(both.detail!.sections).toHaveLength(2);
 		expect(both.detail!.height).toBeGreaterThan(inputOnly.detail!.height);
 	});
 });
@@ -450,12 +647,26 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 		const measured = measureToolCall(
 			baseCard({
 				category: "generic",
-				detail: { kind: "capped", cap: "code", contentLines: 1, text: REFERENCE_LINE },
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							label: "output",
+							body: bodyFixture({
+								kind: "capped",
+								cap: "code",
+								contentLines: 1,
+								text: REFERENCE_LINE,
+							}),
+						},
+					],
+				},
 			}),
 			400,
 			5,
 		);
-		const block = measured.detail!.blocks[0];
+		const block = measured.detail!.sections[0]!.measuredBody.blocks[0];
 		const capped = block?.kind === "fixed" ? (block.data?.capped as number) : 0;
 		// Before the fix this was exactly one 15px line (countLines only counts \n).
 		const oneLine = DETAIL_CONTENT_LINE_HEIGHT + DETAIL_BOX_CHROME_Y;
@@ -468,12 +679,26 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 			const measured = measureToolCall(
 				baseCard({
 					category: "generic",
-					detail: { kind: "capped", cap: "code", contentLines: 1, text: REFERENCE_LINE },
+					detail: {
+						kind: "sections",
+						sections: [
+							{
+								key: "output.main",
+								label: "output",
+								body: bodyFixture({
+									kind: "capped",
+									cap: "code",
+									contentLines: 1,
+									text: REFERENCE_LINE,
+								}),
+							},
+						],
+					},
 				}),
 				width,
 				5,
 			);
-			const block = measured.detail!.blocks[0];
+			const block = measured.detail!.sections[0]!.measuredBody.blocks[0];
 			return block?.kind === "fixed" ? (block.data?.capped as number) : 0;
 		};
 		expect(cappedAt(300)).toBeGreaterThan(cappedAt(900));
@@ -487,12 +712,21 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 		const measured = m.measureToolCall(
 			baseCard({
 				category: "generic",
-				detail: { kind: "capped", cap: "code", contentLines: 1, text: "short" },
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							label: "output",
+							body: bodyFixture({ kind: "capped", cap: "code", contentLines: 1, text: "short" }),
+						},
+					],
+				},
 			}),
 			600,
 			5,
 		);
-		const block = measured.detail!.blocks[0];
+		const block = measured.detail!.sections[0]!.measuredBody.blocks[0];
 		const capped = block?.kind === "fixed" ? (block.data?.capped as number) : 0;
 		expect(capped).toBe(m.DETAIL_CONTENT_LINE_HEIGHT + m.DETAIL_BOX_CHROME_Y);
 	});
@@ -502,7 +736,16 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 		const withLabel = m.measureToolCall(
 			baseCard({
 				category: "read",
-				detail: { kind: "capped", cap: "code", contentLines: 1, text: "short", hasLabel: true },
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							label: "output",
+							body: bodyFixture({ kind: "capped", cap: "code", contentLines: 1, text: "short" }),
+						},
+					],
+				},
 			}),
 			600,
 			5,
@@ -510,7 +753,15 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 		const withoutLabel = m.measureToolCall(
 			baseCard({
 				category: "read",
-				detail: { kind: "capped", cap: "code", contentLines: 1, text: "short", hasLabel: false },
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							body: bodyFixture({ kind: "capped", cap: "code", contentLines: 1, text: "short" }),
+						},
+					],
+				},
 			}),
 			600,
 			5,
@@ -527,12 +778,21 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 		const measured = m.measureToolCall(
 			baseCard({
 				category: "generic",
-				detail: { kind: "capped", cap: "code", contentLines: 1, text: huge },
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							label: "output",
+							body: bodyFixture({ kind: "capped", cap: "code", contentLines: 1, text: huge }),
+						},
+					],
+				},
 			}),
 			600,
 			5,
 		);
-		const block = measured.detail!.blocks[0];
+		const block = measured.detail!.sections[0]!.measuredBody.blocks[0];
 		expect(block?.kind === "fixed" ? block.data?.capped : null).toBe(m.DETAIL_CAPS.code);
 		// The prefix handed to pretext is bounded, never the whole body.
 		const prefix = m.cappedMeasurePrefix(huge, m.cappedUsefulLines(m.DETAIL_CAPS.code), 588);
@@ -553,11 +813,23 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 	it("details without text still use the contentLines estimate", async () => {
 		const m = await mod();
 		const measured = m.measureToolCall(
-			baseCard({ category: "generic", detail: { kind: "capped", cap: "code", contentLines: 4 } }),
+			baseCard({
+				category: "generic",
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							label: "output",
+							body: bodyFixture({ kind: "capped", cap: "code", contentLines: 4 }),
+						},
+					],
+				},
+			}),
 			600,
 			5,
 		);
-		const block = measured.detail!.blocks[0];
+		const block = measured.detail!.sections[0]!.measuredBody.blocks[0];
 		const capped = block?.kind === "fixed" ? (block.data?.capped as number) : 0;
 		expect(capped).toBe(4 * m.DETAIL_CONTENT_LINE_HEIGHT);
 	});
@@ -567,7 +839,26 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 		const shortBoth = m.measureToolCall(
 			baseCard({
 				category: "generic",
-				detail: { kind: "generic", inputLines: 1, inputText: "a", outputLines: 1, outputText: "b" },
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "input.arguments",
+							label: "input",
+							body: bodyFixture({
+								cap: "code",
+								source: "input.arguments",
+								contentLines: 1,
+								text: "a",
+							}),
+						},
+						{
+							key: "output.main",
+							label: "output",
+							body: bodyFixture({ cap: "code", contentLines: 1, text: "b" }),
+						},
+					],
+				},
 			}),
 			400,
 			5,
@@ -576,11 +867,24 @@ describe("measureToolCall — capped body text wraps (not just hard newlines)", 
 			baseCard({
 				category: "generic",
 				detail: {
-					kind: "generic",
-					inputLines: 1,
-					inputText: "a",
-					outputLines: 1,
-					outputText: "x".repeat(600),
+					kind: "sections",
+					sections: [
+						{
+							key: "input.arguments",
+							label: "input",
+							body: bodyFixture({
+								cap: "code",
+								source: "input.arguments",
+								contentLines: 1,
+								text: "a",
+							}),
+						},
+						{
+							key: "output.main",
+							label: "output",
+							body: bodyFixture({ cap: "code", contentLines: 1, text: "x".repeat(600) }),
+						},
+					],
 				},
 			}),
 			400,
@@ -599,12 +903,20 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 			toolName: "ExitPlanMode",
 			category: "plan",
 			detail: {
-				kind: "capped",
-				cap: "plan",
-				contentLines: 9,
-				text: PLAN,
-				markdown: true,
-				...detail,
+				kind: "sections",
+				sections: [
+					{
+						key: "output.main",
+						body: bodyFixture({
+							kind: "capped",
+							cap: "plan",
+							contentLines: 9,
+							text: PLAN,
+							format: "markdown",
+							...detail,
+						}),
+					},
+				],
 			},
 		});
 	}
@@ -612,7 +924,7 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 	it("flags the region as markdown and carries real prepared blocks", async () => {
 		const { measureToolCall } = await mod();
 		const measured = measureToolCall(planCard(), 600, 5, { viewportHeight: 1000 });
-		const detail = measured.detail!;
+		const detail = measured.detail!.sections[0]!.measuredBody;
 		expect(detail.markdown).toBe(true);
 		// Not one opaque fixed block: headings/paragraph/list/code all appear.
 		expect(detail.blocks.length).toBeGreaterThan(1);
@@ -623,7 +935,7 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 		const { measureToolCall } = await mod();
 		for (const sourcePath of [undefined, ".narrafork/plan-abc.md"]) {
 			const measured = measureToolCall(planCard({ sourcePath }), 600, 5, { viewportHeight: 1000 });
-			const detail = measured.detail!;
+			const detail = measured.detail!.sections[0]!.measuredBody;
 			expect(detail.frame.blocks).toHaveLength(detail.blocks.length);
 			for (const [index, frame] of detail.frame.blocks.entries()) {
 				expect(frame.index).toBe(index);
@@ -637,8 +949,10 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 		const withSource = measureToolCall(planCard({ sourcePath: ".narrafork/plan-abc.md" }), 600, 5, {
 			viewportHeight: 1000,
 		});
-		expect(withSource.detail!.blocks).toHaveLength(without.detail!.blocks.length + 1);
-		const first = withSource.detail!.blocks[0];
+		expect(withSource.detail!.sections[0]!.measuredBody.blocks).toHaveLength(
+			without.detail!.sections[0]!.measuredBody.blocks.length + 1,
+		);
+		const first = withSource.detail!.sections[0]!.measuredBody.blocks[0];
 		expect(first?.kind).toBe("fixed");
 		expect(first?.kind === "fixed" ? first.tag : null).toBe("detail-plan-source");
 		expect(first?.kind === "fixed" ? first.data?.sourcePath : null).toBe(".narrafork/plan-abc.md");
@@ -655,7 +969,7 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 		const measured = measureToolCall(planCard({ text: longPlan, contentLines: 1200 }), 600, 5, {
 			viewportHeight: 1000,
 		});
-		expect(measured.detail!.appliedCap).toBe(850);
+		expect(measured.detail!.sections[0]!.measuredBody.appliedCap).toBe(850);
 		// Region = the outer mt gap + the clamped scroll box (cap never eats the gap).
 		expect(measured.detail!.height).toBe(DETAIL_TOP_MARGIN + 850);
 	});
@@ -691,8 +1005,8 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 		const m = await mod();
 		const block = "## Section\n\nSome body text that is reasonably long enough to wrap.\n\n";
 		const measure = (text: string) =>
-			m.measureToolDetail(
-				{ kind: "capped", cap: "plan", contentLines: 1, text, markdown: true },
+			m.measureToolBody(
+				bodyFixture({ kind: "capped", cap: "plan", contentLines: 1, text, format: "markdown" }),
 				600,
 				1000,
 			);
@@ -708,7 +1022,7 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 		const longDetail = measure(longer);
 		// The OUTER height is identical (both clamp at the cap)...
 		expect(shortDetail.height).toBe(longDetail.height);
-		expect(shortDetail.height).toBe(m.DETAIL_TOP_MARGIN + 850);
+		expect(shortDetail.height).toBe(850);
 		// ...while the scrollable content really does double. Under the old early
 		// break both collapsed to the same 8K prefix and these were equal.
 		const contentOf = (d: { frame: { contentHeight: number } }) => d.frame.contentHeight;
@@ -727,8 +1041,8 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 		).join("\n\n");
 		const plan = `# Plan\n\n${body}\n\n## END-OF-PLAN-MARKER\n\nThe closing line.`;
 		expect(plan.length).toBeLessThan(m.DETAIL_MARKDOWN_PREFIX_MAX_CHARS);
-		const detail = m.measureToolDetail(
-			{ kind: "capped", cap: "plan", contentLines: 1, text: plan, markdown: true },
+		const detail = m.measureToolBody(
+			bodyFixture({ kind: "capped", cap: "plan", contentLines: 1, text: plan, format: "markdown" }),
 			600,
 			1000,
 		);
@@ -747,8 +1061,8 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 		const m = await mod();
 		const block = "## Section\n\nSome body text that is reasonably long.\n\n";
 		const measure = (text: string) =>
-			m.measureToolDetail(
-				{ kind: "capped", cap: "plan", contentLines: 1, text, markdown: true },
+			m.measureToolBody(
+				bodyFixture({ kind: "capped", cap: "plan", contentLines: 1, text, format: "markdown" }),
 				600,
 				1000,
 			);
@@ -766,8 +1080,8 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 		const block = "## Section\n\nSome body text that is reasonably long enough to wrap.\n\n";
 		const measureMs = (text: string) => {
 			const started = performance.now();
-			m.measureToolDetail(
-				{ kind: "capped", cap: "plan", contentLines: 1, text, markdown: true },
+			m.measureToolBody(
+				bodyFixture({ kind: "capped", cap: "plan", contentLines: 1, text, format: "markdown" }),
 				600,
 				1000,
 			);
@@ -783,10 +1097,16 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 	});
 
 	it("a plan that fits under the cap keeps its exact measured height", async () => {
-		const { measureToolDetail, DETAIL_TOP_MARGIN } = await mod();
+		const { measureToolBody, DETAIL_TOP_MARGIN } = await mod();
 		const small = "# Title\n\nbody\n\n- a\n- b\n";
-		const measured = measureToolDetail(
-			{ kind: "capped", cap: "plan", contentLines: 1, text: small, markdown: true },
+		const measured = measureToolBody(
+			bodyFixture({
+				kind: "capped",
+				cap: "plan",
+				contentLines: 1,
+				text: small,
+				format: "markdown",
+			}),
 			600,
 			1000,
 		);
@@ -801,14 +1121,22 @@ describe("measureToolCall — plan detail renders as markdown", () => {
 			baseCard({
 				toolName: "ExitPlanMode",
 				category: "plan",
-				detail: { kind: "capped", cap: "plan", contentLines: 3, text: PLAN },
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							body: bodyFixture({ kind: "capped", cap: "plan", contentLines: 3, text: PLAN }),
+						},
+					],
+				},
 			}),
 			600,
 			5,
 			{ viewportHeight: 1000 },
 		);
-		expect(measured.detail!.markdown).toBeUndefined();
-		expect(measured.detail!.blocks).toHaveLength(1);
+		expect(measured.detail!.sections[0]!.measuredBody.markdown).toBeUndefined();
+		expect(measured.detail!.sections[0]!.measuredBody.blocks).toHaveLength(1);
 	});
 });
 
@@ -817,14 +1145,30 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 	it("spec-tasks height grows with the number of tasks", async () => {
 		const { measureToolCall } = await mod();
 		const two = measureToolCall(
-			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: specTasks("a", "b") } }),
+			baseCard({
+				category: "tasks",
+				detail: {
+					kind: "sections",
+					sections: [
+						{ key: "meta.spec-tasks", body: { kind: "spec-tasks", tasks: specTasks("a", "b") } },
+					],
+				},
+			}),
 			600,
 			5,
 		);
 		const four = measureToolCall(
 			baseCard({
 				category: "tasks",
-				detail: { kind: "spec-tasks", tasks: specTasks("a", "b", "c", "d") },
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "meta.spec-tasks",
+							body: { kind: "spec-tasks", tasks: specTasks("a", "b", "c", "d") },
+						},
+					],
+				},
 			}),
 			600,
 			5,
@@ -836,12 +1180,28 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 		const { measureToolCall } = await mod();
 		const task = "one two three four five six seven eight nine ten eleven twelve thirteen";
 		const wide = measureToolCall(
-			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: specTasks(task) } }),
+			baseCard({
+				category: "tasks",
+				detail: {
+					kind: "sections",
+					sections: [
+						{ key: "meta.spec-tasks", body: { kind: "spec-tasks", tasks: specTasks(task) } },
+					],
+				},
+			}),
 			2000,
 			5,
 		);
 		const narrow = measureToolCall(
-			baseCard({ category: "tasks", detail: { kind: "spec-tasks", tasks: specTasks(task) } }),
+			baseCard({
+				category: "tasks",
+				detail: {
+					kind: "sections",
+					sections: [
+						{ key: "meta.spec-tasks", body: { kind: "spec-tasks", tasks: specTasks(task) } },
+					],
+				},
+			}),
 			160,
 			5,
 		);
@@ -851,14 +1211,28 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 	it("structured detail adds a badge row + a body line above the plain-body case", async () => {
 		const { measureToolCall, STRUCT_BADGE_ROW, STRUCT_BADGE_GAP, DETAIL_TOP_MARGIN } = await mod();
 		const noBadge = measureToolCall(
-			baseCard({ category: "recall", detail: { kind: "structured", bodyLines: ["one"] } }),
+			baseCard({
+				category: "recall",
+				detail: {
+					kind: "sections",
+					sections: [{ key: "meta.structured", body: { kind: "structured", bodyLines: ["one"] } }],
+				},
+			}),
 			600,
 			5,
 		);
 		const withBadge = measureToolCall(
 			baseCard({
 				category: "recall",
-				detail: { kind: "structured", badgeRows: 1, bodyLines: ["one"] },
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "meta.structured",
+							body: { kind: "structured", badgeRows: 1, bodyLines: ["one"] },
+						},
+					],
+				},
 			}),
 			600,
 			5,
@@ -878,12 +1252,24 @@ describe("measureToolCall — pretext-measured detail (spec-tasks / structured /
 		const text =
 			"Command failed with a fairly long multi word error message that must wrap somewhere";
 		const wide = measureToolCall(
-			baseCard({ status: "fail", detail: { kind: "error", text } }),
+			baseCard({
+				status: "fail",
+				detail: {
+					kind: "sections",
+					sections: [{ key: "meta.error", body: { kind: "error", text } }],
+				},
+			}),
 			2000,
 			5,
 		);
 		const narrow = measureToolCall(
-			baseCard({ status: "fail", detail: { kind: "error", text } }),
+			baseCard({
+				status: "fail",
+				detail: {
+					kind: "sections",
+					sections: [{ key: "meta.error", body: { kind: "error", text } }],
+				},
+			}),
 			160,
 			5,
 		);
@@ -1012,11 +1398,19 @@ describe("measureToolCall — a card can be folded at L5", () => {
 			category: "plan",
 			status: "fail",
 			detail: {
-				kind: "capped",
-				cap: "plan",
-				contentLines: 40,
-				markdown: true,
-				text: "# Plan\n\n- one\n- two\n\n## Detail\n\nbody text\n",
+				kind: "sections",
+				sections: [
+					{
+						key: "output.main",
+						body: bodyFixture({
+							kind: "capped",
+							cap: "plan",
+							contentLines: 40,
+							format: "markdown",
+							text: "# Plan\n\n- one\n- two\n\n## Detail\n\nbody text\n",
+						}),
+					},
+				],
 			},
 		});
 		// The shell routes to the override channel at exactly the levels where a card
@@ -1073,7 +1467,19 @@ describe("measureToolCall — running/pending cards are lodExempt", () => {
 	it("a running card stays expanded at L3 (would otherwise collapse)", async () => {
 		const { measureToolCall } = await mod();
 		const r = measureToolCall(
-			baseCard({ status: "running", detail: { kind: "capped", cap: "term", contentLines: 5 } }),
+			baseCard({
+				status: "running",
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							label: "output",
+							body: bodyFixture({ kind: "capped", cap: "term", contentLines: 5 }),
+						},
+					],
+				},
+			}),
 			600,
 			3,
 		);
@@ -1105,8 +1511,16 @@ describe("measureToolCall — the pinned latest-tasks card is forceExpanded", ()
 				toolName: "Write",
 				status: "success",
 				detail: {
-					kind: "spec-tasks",
-					tasks: [{ text: "do the thing", status: "doing", protected: false }],
+					kind: "sections",
+					sections: [
+						{
+							key: "meta.spec-tasks",
+							body: {
+								kind: "spec-tasks",
+								tasks: [{ text: "do the thing", status: "doing", protected: false }],
+							},
+						},
+					],
 				},
 			}),
 			600,
@@ -1171,7 +1585,15 @@ describe("measureToolCall — pendingPermission adds the InlinePermission UI", (
 			baseCard({
 				category: "file",
 				toolName: "Write",
-				detail: { kind: "capped", cap: "diff", contentLines: 4 },
+				detail: {
+					kind: "sections",
+					sections: [
+						{
+							key: "output.main",
+							body: bodyFixture({ kind: "capped", cap: "diff", contentLines: 4 }),
+						},
+					],
+				},
 			}),
 			600,
 			5,
@@ -1320,7 +1742,10 @@ describe("measureToolCall — lifecycle stamps reach the renderer", () => {
 		// The breakdown lives in a portal, so carrying the stamps must not move a
 		// single pixel — the invariant CONTRACT §0 rule 2 depends on here.
 		const { measureToolCall } = await mod();
-		const detail = { kind: "capped", cap: "term", contentLines: 4, text: "a\nb\nc\nd" } as const;
+		const detail: import("./measure-tool-call").ToolDetailData = {
+			kind: "sections",
+			sections: [{ key: "output.main", body: bodyFixture({ cap: "term", text: "a\nb\nc\nd" }) }],
+		};
 		for (const opts of [{}, { opened: true }] as const) {
 			const bare = measureToolCall(baseCard({ detail }), 600, 4, opts);
 			const timed = measureToolCall(baseCard({ detail, ...STAMPS }), 600, 4, opts);
@@ -1348,7 +1773,10 @@ describe("measureToolCall — Write/Edit line counts", () => {
 		// ever reached the height math, a Write/Edit card would be a different height
 		// from every other card in the same run.
 		const { measureToolCall } = await mod();
-		const detail = { kind: "capped", cap: "term", contentLines: 4, text: "a\nb\nc\nd" } as const;
+		const detail: import("./measure-tool-call").ToolDetailData = {
+			kind: "sections",
+			sections: [{ key: "output.main", body: bodyFixture({ cap: "term", text: "a\nb\nc\nd" }) }],
+		};
 		for (const opts of [{}, { opened: true }] as const) {
 			const bare = measureToolCall(baseCard({ detail }), 600, 4, opts);
 			for (const diffStats of [
@@ -1394,18 +1822,39 @@ describe("measureToolCall — MeasuredElement shape", () => {
 		expect(r.contentWidth).toBeLessThan(600); // inner width < outer
 	});
 
-	it("prepareToolCallMeasurer re-measures across widths/LODs", async () => {
-		const { prepareToolCallMeasurer } = await mod();
-		const measure = prepareToolCallMeasurer(
-			baseCard({
-				category: "tasks",
-				detail: { kind: "spec-tasks", tasks: specTasks("x".repeat(80)) },
-			}),
-		);
-		const collapsed = measure(600, 3);
-		const wide = measure(2000, 5);
-		const narrow = measure(160, 5);
+	it("re-measures the same tool data across widths/LODs", async () => {
+		const { measureToolCall } = await mod();
+		const data = baseCard({
+			category: "tasks",
+			detail: {
+				kind: "sections",
+				sections: [
+					{
+						key: "meta.spec-tasks",
+						body: { kind: "spec-tasks", tasks: specTasks("x".repeat(80)) },
+					},
+				],
+			},
+		});
+		const collapsed = measureToolCall(data, 600, 3);
+		const wide = measureToolCall(data, 2000, 5);
+		const narrow = measureToolCall(data, 160, 5);
 		expect(collapsed.effectiveOpened).toBe(false);
 		expect(narrow.height).toBeGreaterThan(wide.height);
 	});
 });
+
+function bodyFixture(
+	options: Partial<import("@shared/pretext-layout/tool-detail").ToolCappedDetail> &
+		Pick<import("@shared/pretext-layout/tool-detail").ToolCappedDetail, "cap">,
+): import("@shared/pretext-layout/tool-detail").ToolCappedDetail {
+	return {
+		kind: "capped",
+		id: "test-body",
+		source: "output.main",
+		format: "text",
+		live: false,
+		followTarget: { kind: "end" },
+		...options,
+	};
+}

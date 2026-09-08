@@ -29,13 +29,8 @@ import { Hono } from "hono";
 import iconv from "iconv-lite";
 import { AppError } from "../../lib/errors";
 
-const previousHome = process.env.NARRAFORK_HOME;
-const testHome = mkdtempSync(join(tmpdir(), "narrafork-fs-write-"));
-process.env.NARRAFORK_HOME = testHome;
-process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
-
-// Imported after NARRAFORK_HOME is redirected: these initialise the DB at import time
-// and must not touch the developer's real instance.
+// tests/preload owns HOME and the single application DB/blob namespace. Changing
+// NARRAFORK_HOME here split the evidence directory from an already imported DB.
 const { fsRoutes } = await import("../fs");
 const { db } = await import("../../db");
 const { narrators, users } = await import("../../db/schema");
@@ -45,9 +40,7 @@ const { claimCount, foreignDeclaredPaths, openClaim } = await import(
 );
 const { worktreeTreeSnapshot } = await import("../../services/worktree-tree-snapshot");
 const { safeSpawn } = await import("../../lib/spawn");
-// narraforkDir is frozen at settings module load time (which happens before NARRAFORK_HOME
-// is redirected, via the static `AppError` import chain). The secret-path checker uses
-// this frozen value, so tests against it must use the same reference.
+// The secret-path checker uses the same preload-isolated settings root.
 const { narraforkDir } = await import("../../lib/settings");
 
 const USER_ID = "fs-write-user";
@@ -140,9 +133,6 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
-	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
-	else process.env.NARRAFORK_HOME = previousHome;
-	rmSync(testHome, { recursive: true, force: true });
 	rmSync(workspace, { recursive: true, force: true });
 	rmSync(outside, { recursive: true, force: true });
 });

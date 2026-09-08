@@ -21,6 +21,7 @@
 
 import type { VListElementKind } from "@shared/pretext-layout/element-kinds";
 import { measureAskInPassing } from "./measure/measure-ask-in-passing";
+import { measureCommunicationBubble } from "./measure/measure-communication-bubble";
 import { measureInjectionBubble } from "./measure/measure-injection-bubble";
 import { measureMarkdown } from "./measure/measure-markdown";
 import { measureMedia } from "./measure/measure-media";
@@ -91,6 +92,12 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		// `opts` carries the slash-command bubble's expand state + toggle labels;
 		// plain bubbles pass no opts and are unaffected.
 		measure: (d, w, l, o) => measureMessageBubble(d as AnyData, w, l, o as AnyData),
+	},
+	"communication-bubble": {
+		kind: "communication-bubble",
+		label: "Outgoing communication bubble (framed markdown)",
+		lodSensitive: false,
+		measure: (d, w, l) => measureCommunicationBubble(d as AnyData, w, l),
 	},
 	"injection-bubble": {
 		kind: "injection-bubble",
@@ -313,7 +320,9 @@ export function measureElementCached(
 	if (cached !== undefined) return cached;
 
 	const result = VLIST_REGISTRY[kind].measure(data, contentWidth, lod, opts);
-	measureCache.set(cacheKey, result);
+	// Source revisions replace their previous value at this geometry; they must
+	// not retain every streamed DiffDocument until the global entry ceiling.
+	measureCache.set(cacheKey, result, buildCacheKey(specKey, kind, contentWidth, lod, opts));
 	return result;
 }
 

@@ -30,11 +30,9 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
-import { DiffWordTokens } from "@frontend/components/narrator/DiffWordTokens";
-import { findVerticalScrollParent } from "@frontend/hooks/scroll-parent";
+import { DiffContent } from "@frontend/components/narrator/DiffContent";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
-import type { ShikiToken } from "@frontend/lib/shiki-token-cache";
 import {
 	Badge,
 	Box,
@@ -52,12 +50,6 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import {
-	buildDiffHighlightPlan,
-	type DiffLine,
-	diffLineMarker,
-	formatDiffGutter,
-} from "@shared/pretext-layout/diff-core";
 import {
 	CARD_SHIMMER_CLASS,
 	resolveToolShimmerFlash,
@@ -81,9 +73,10 @@ import {
 	IconTool,
 	IconX,
 } from "@tabler/icons-react";
-import type { ComponentType, ReactNode, Ref } from "react";
+import type { ComponentType, ReactNode } from "react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
+import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { AutoFollowScroll } from "../../AutoFollowScroll";
 import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
@@ -91,10 +84,8 @@ import { OPTION_CONTROL_SIZE } from "../measure/measure-permission";
 import {
 	CARD_HEADER_INNER_ICON,
 	CARD_PADDING,
-	cappedUsefulLines,
 	DETAIL_BOX_PADDING_X,
 	DETAIL_BOX_PADDING_Y,
-	DETAIL_LABEL_CHROME_Y,
 	DETAIL_TOP_MARGIN,
 	detailBodyFontSize,
 	detailContentLineHeight,
@@ -107,10 +98,10 @@ import {
 	HEADER_CELL_GAP,
 	HEADER_ROW_HEIGHT,
 	isRunningStatus,
+	type MeasuredToolBody,
 	type MeasuredToolCall,
 	type MeasuredToolCallGroup,
 	type MeasuredToolDetail,
-	type MeasuredToolDetailSection,
 	SPEC_TASK_ICON,
 	SPEC_TASK_INDENT,
 	SPEC_TASK_LOCK,
@@ -125,15 +116,8 @@ import {
 } from "../measure/measure-tool-call";
 import type { BlockFrame, PreparedInlineBlock } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
-import { useShikiTokens } from "../useShikiTokens";
 import { VListContentViewHost, type VListViewControls } from "../VListContentViewHost";
-import {
-	BODY_SLOT,
-	blockSlot,
-	findViewTarget,
-	sectionSlot,
-	type VListViewTarget,
-} from "../vlist-content-view-target";
+import { findViewTarget, type VListViewTarget } from "../vlist-content-view-target";
 import { categoryIcon } from "./category-icons";
 import { DiffStatsText, type DiffStatsValue } from "./diff-stats-text";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
@@ -141,8 +125,8 @@ import { FragmentGap, LineFragments } from "./line-fragments";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
-import { TokenFlowText, TokenText } from "./TokenLines";
-import { readExactDisplayBox, VListImage, type VListImageRef } from "./vlist-image";
+import { TokenFlowText } from "./TokenLines";
+import { readExactDisplayBox, VListImage } from "./vlist-image";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // i18n-facing labels, injected by the dispatch/registry layer (no i18n import
@@ -182,11 +166,6 @@ export interface ToolCallLabels {
 	 * so translating them cannot move a measured height.
 	 */
 	timing?: ToolTimingLabels;
-	/**
-	 * Footer shown when a diff body has more rows than the render layer paints.
-	 * Carries a literal `{count}` placeholder (the hidden row count is per body).
-	 */
-	diffTruncated?: string;
 	/** Placeholder line for a valid but EMPTY spec task document. */
 	tasksEmpty?: string;
 	/** Permission labels forwarded to RenderInlinePermission. */
@@ -207,7 +186,6 @@ const DEFAULT_LABELS: Required<
 		| "copy"
 		| "copied"
 		| "terminate"
-		| "diffTruncated"
 		| "tasksEmpty"
 	>
 > = {
@@ -220,12 +198,8 @@ const DEFAULT_LABELS: Required<
 	copy: "Copy link",
 	copied: "Copied",
 	terminate: "Terminate",
-	diffTruncated: "… {count} more rows not shown",
 	tasksEmpty: "Task list is empty",
 };
-
-/** English fallback used when a diff body is rendered without injected labels. */
-const DEFAULT_DIFF_TRUNCATED = DEFAULT_LABELS.diffTruncated;
 
 /** English fallbacks for the section labels (overridden by injected labels). */
 const DEFAULT_SECTION_LABELS: Record<ToolSectionLabel, string> = {
@@ -1335,135 +1309,11 @@ function SpecTasksEmpty({ height, label }: { height: number; label: string }) {
 	);
 }
 
-/**
- * Markdown detail body (ExitPlanMode plans) inside the capped scroll box.
- *
- * `detail.blocks`/`detail.frame` are the merged provenance+markdown list from
- * measureMarkdownDetail, whose geometry starts at y = DETAIL_TOP_MARGIN (the gap
- * lives outside the box). We therefore shift the frame up by that margin and give
- * the box `detail.height - DETAIL_TOP_MARGIN`.
- *
- * `onUnknownHeight` is deliberately NOT forwarded: mermaid/katex/image blocks sit
- * inside a maxHeight-clamped scroll box, so reporting their settled content
- * height would fight the cap that already fixed the outer height. Overflow simply
- * scrolls.
- */
-function MarkdownDetailBody({
-	detail,
-	planSourceLabel,
-	showSource,
-	sourceText,
-}: {
-	detail: MeasuredToolDetail;
-	planSourceLabel: string;
-	/** Show the raw markdown instead of the rendered form (viewer toggle). */
-	showSource?: boolean;
-	/** The raw markdown, needed only while `showSource` holds. */
-	sourceText?: string;
-}) {
-	const boxHeight = Math.max(0, detail.height - DETAIL_TOP_MARGIN);
-	const sourceBlockIndex = detail.blocks.findIndex(
-		(b) => b.kind === "fixed" && b.tag === "detail-plan-source",
-	);
-	const sourceBlock = sourceBlockIndex >= 0 ? detail.blocks[sourceBlockIndex] : undefined;
-	const sourcePath =
-		sourceBlock?.kind === "fixed" && typeof sourceBlock.data?.sourcePath === "string"
-			? sourceBlock.data.sourcePath
-			: null;
-	const sourceFrame = sourceBlockIndex >= 0 ? detail.frame.blocks[sourceBlockIndex] : undefined;
-	// Re-base the measured frame onto the box's own coordinate space.
-	const bodyFrame = useMemo(
-		() => ({
-			...detail.frame,
-			contentHeight: Math.max(0, detail.frame.contentHeight - DETAIL_TOP_MARGIN),
-			blocks: detail.frame.blocks.map((b) => ({ ...b, top: b.top - DETAIL_TOP_MARGIN })),
-		}),
-		[detail.frame],
-	);
-	return (
-		<div
-			style={{
-				maxHeight: detail.appliedCap ?? undefined,
-				height: boxHeight,
-				// A markdown body is ALWAYS wrapped (the rendered form wraps by
-				// construction, the source view is `pre-wrap`), so it never needs
-				// horizontal scrolling; anything wider than the box is a painted
-				// artifact (a wrap point's trailing space), and `overflowX: auto`
-				// would answer it with a scrollbar that covers a short body.
-				// Content that legitimately exceeds the width (tables, display
-				// math, mermaid) scrolls inside its OWN block-level box.
-				overflowY: "auto",
-				overflowX: "hidden",
-				boxSizing: "border-box",
-				padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
-				// Markdown body text inherits the theme foreground, so the surface must
-				// follow the colour scheme too — a fixed dark-8 panel would render dark
-				// text on near-black in light mode (see vlist-markdown.css).
-				background: "var(--vlist-detail-panel-bg)",
-				borderRadius: 4,
-				position: "relative",
-			}}
-		>
-			{sourcePath != null && sourceFrame ? (
-				<Text
-					size="xs"
-					c="dimmed"
-					ff="monospace"
-					truncate
-					title={sourcePath}
-					style={{
-						position: "absolute",
-						top: sourceFrame.top - DETAIL_TOP_MARGIN + DETAIL_BOX_PADDING_Y,
-						left: DETAIL_BOX_PADDING_X,
-						width: detail.contentWidth,
-						height: sourceFrame.height,
-					}}
-				>
-					{formatPlanSource(planSourceLabel, sourcePath)}
-				</Text>
-			) : null}
-			{/* Source view swaps the render for the raw markdown inside the SAME
-			    fixed-height box, so the card cannot move (see CappedMarkdownBody). */}
-			{showSource && sourceText ? (
-				<div
-					style={{
-						fontSize: detailBodyFontSize(),
-						lineHeight: `${detailContentLineHeight()}px`,
-						fontFamily: "var(--mantine-font-family-monospace)",
-						color: "var(--vlist-detail-panel-fg)",
-						whiteSpace: "pre-wrap",
-						wordBreak: "break-word",
-					}}
-				>
-					{sourceText}
-				</div>
-			) : (
-				<RenderMarkdown
-					measured={{
-						height: bodyFrame.contentHeight,
-						blocks: detail.blocks,
-						frame: bodyFrame,
-						contentWidth: detail.contentWidth,
-						usedWidth: detail.frame.usedWidth,
-					}}
-				/>
-			)}
-		</div>
-	);
-}
-
 /** Resolved label bundle the detail renderers need. */
 type DetailLabels = Required<
 	Pick<
 		ToolCallLabels,
-		| "input"
-		| "output"
-		| "planSource"
-		| "download"
-		| "copy"
-		| "copied"
-		| "diffTruncated"
-		| "tasksEmpty"
+		"input" | "output" | "planSource" | "download" | "copy" | "copied" | "tasksEmpty"
 	>
 > & { sections?: Partial<Record<ToolSectionLabel, string>> };
 
@@ -1516,7 +1366,9 @@ function MetaActions({ actions, labels }: { actions: ToolRowAction[]; labels: De
  * guard), so it hands over either an explicit language id or the raw file path;
  * the extension → language mapping happens here.
  */
-function resolveDetailLang(data: Record<string, unknown> | undefined): string | undefined {
+function resolveDetailLang(
+	data: { codeLang?: string; codeLangPath?: string } | undefined,
+): string | undefined {
 	if (!data) return undefined;
 	if (typeof data.codeLang === "string" && data.codeLang) return data.codeLang;
 	if (typeof data.codeLangPath === "string" && data.codeLangPath) {
@@ -1538,973 +1390,12 @@ function HighlightedBody({ text, lang }: { text: string; lang: string | undefine
 }
 
 /**
- * Per-line and per-word diff backgrounds, matching the chunked DiffView.
- *
- * The two schemes are NOT the same colours (Mantine's `*-light` variants read
- * well on a dark surface but are too pale in light mode, where explicit rgba at a
- * higher opacity keeps syntax-highlighted text legible), but that split now lives
- * in vlist-markdown.css: the variables carry both schemes and the cascade picks
- * one. Reading them here means the palette follows a theme switch on its own,
- * without a `useComputedColorScheme` subscription in every diff body.
- */
-const DIFF_COLORS = {
-	removedLine: "var(--vlist-diff-removed-bg)",
-	addedLine: "var(--vlist-diff-added-bg)",
-	removedWord: "var(--vlist-diff-removed-word-bg)",
-	addedWord: "var(--vlist-diff-added-word-bg)",
-} as const;
-
-/**
- * How many diff rows the render layer paints, and why it is bounded.
- *
- * A 500-row diff used to emit every row: 2 spans each, plus one span per word
- * chunk inside a modified pair — a few thousand nodes inside a 200px scroll box
- * whose visible window is ~13 rows. `maxHeight` clips the VISUAL height, not the
- * node count, so several expanded Edit cards in one viewport built thousands of
- * nodes nobody could see.
- *
- * Height safety: the box height comes from the measure layer
- * (`measureDiffContentHeight`), never from how many rows are painted, so a row
- * limit cannot desync the two. Better still, the limit is deliberately larger
- * than `cappedUsefulLines(cap)` — the point at which the measure layer stops
- * counting and returns `cap` — so truncation can only ever happen on a body that
- * measure ALREADY classified as overflowing. A short diff (the case where the
- * height is the exact row count) is never truncated.
- *
- * The rows past the INITIAL budget are not unreachable: the truncation notice at
- * the end of the painted window doubles as a scroll sentinel — each time the
- * reader scrolls it into view, `useDiffRowReveal` grows the window by one base
- * budget until every row is painted. That is height-neutral by construction (see
- * the height-safety paragraph: a truncated body's box is already exactly `cap`,
- * so extra rows only extend the scrollable content of a fixed box), and it is a
- * user action, the same gate the full-payload auto-fetch uses. The detail's
- * plain `text` remains the unified-diff copy source, and the fullscreen viewer
- * still shows the whole body in one step.
- */
-const DIFF_ROW_OVERSCAN_SCREENS = 4;
-/** Fallback visible-row estimate when the cap did not reach the render layer. */
-const DIFF_ROW_FALLBACK_VISIBLE = 14;
-/**
- * Node-count ceiling for an ordinary cap.
- *
- * NOT an absolute floor-free ceiling: see `diffRenderRowLimit`, which raises it when a cap grows
- * large enough that `cappedUsefulLines(cap)` would exceed it.
- */
-const DIFF_ROW_SOFT_MAX = 200;
-
-/**
- * Row budget for a diff body inside a box capped at `cap` px.
- *
- * The `Math.max` is what keeps the height-safety claim above true for EVERY cap rather than just
- * the current one. `DIFF_ROW_SOFT_MAX` is a constant while `cappedUsefulLines(cap)` grows with the
- * cap, so past cap ≈ 2986px the plain `min(200, …)` would fall BELOW the point where measure stops
- * counting: measure would return an exact row-count height (say 250 rows → 3754px) while render
- * painted 200 rows (~3000px), leaving a ~730px hole. Today diff details always get
- * `DETAIL_CAPS.diff` (200), so that regime is unreachable — but nothing enforces that, and a future
- * viewport-derived cap would hit it silently. Deriving the ceiling from the same function measure
- * uses makes the two provably consistent instead of consistent by coincidence.
- */
-function diffRenderRowLimit(cap: number | undefined): number {
-	const visible =
-		cap != null && cap > 0 ? Math.ceil(cap / detailContentLineHeight()) : DIFF_ROW_FALLBACK_VISIBLE;
-	const budget = Math.min(DIFF_ROW_SOFT_MAX, visible * DIFF_ROW_OVERSCAN_SCREENS);
-	// The floor, not a second ceiling: `visible * overscan` can itself drop below
-	// `cappedUsefulLines(cap)` once the cap is large (at cap=8000 the overscan budget is 2136 but
-	// measure counts 535 — fine — while at the soft-max boundary the 200-row clamp is what bites).
-	// Taking the max of the budget and measure's own threshold keeps the two provably consistent
-	// without letting an ordinary 200px cap inflate its node count.
-	if (cap == null || cap <= 0) return budget;
-	return Math.max(budget, cappedUsefulLines(cap));
-}
-
-/**
- * Progressive reveal for a row-budget-truncated diff body.
- *
- * The initial paint stops at `diffRenderRowLimit(cap)`; the truncation notice at
- * the end of the painted window doubles as the sentinel. Each time the reader
- * scrolls it into the box's visible region the window grows by one base budget,
- * until no rows remain hidden — the "auto-load on scroll" the capped boxes
- * already promise for server-side prefixes (`useAutoLoadOnScroll`), here served
- * from rows that are already local.
- *
- * Height-neutral: the notice only ever appears on a body the measure layer
- * classified as overflowing, whose box height is exactly `cap` (see
- * `diffRenderRowLimit`), so painting more rows extends the scrollable content of
- * a FIXED box and cannot move any measured geometry.
- *
- * One batch per reach: the sentinel sits at the end of the painted content, so a
- * reveal pushes it below the visible region again; the next batch waits for the
- * next scroll. Component-local by design — leaving the virtualization window
- * resets the window to the initial budget, and the same scroll gesture re-veals
- * it (the rows are local; nothing has to be re-fetched).
- */
-function useDiffRowReveal(baseRowLimit: number, rowCount: number) {
-	const [extraRows, setExtraRows] = useState(0);
-	const rowLimit = Math.min(rowCount, baseRowLimit + extraRows);
-	const hidden = rowCount - rowLimit;
-	const sentinelRef = useRef<HTMLDivElement | null>(null);
-	useEffect(() => {
-		const node = sentinelRef.current;
-		if (!node || hidden <= 0) return;
-		// Test DOMs without an observer keep the pre-reveal behaviour: the notice
-		// stays a static footer.
-		if (typeof IntersectionObserver !== "function") return;
-		// `root` is the capped box, NOT the default (the viewport).
-		//
-		// This is what makes "one batch per reach" true. An observer without a root
-		// ignores the clipping done by ancestor `overflow`, so a 200px box sitting
-		// fully inside the viewport reports its footer as intersecting even though the
-		// box has scrolled nowhere and the reader cannot see it — every batch fires
-		// immediately, in a chain, until all 500 rows are painted. That defeats both
-		// the node ceiling and the user-action gate the reveal is built on.
-		//
-		// Resolved from the DOM rather than threaded down as a ref: the sentinel sits
-		// several components below whoever owns the scrollport, and the box that
-		// actually scrolls differs between the inline detail, the drilldown, and the
-		// fullscreen viewer. A null root (no scrollable ancestor found — the body fits,
-		// so nothing is hidden anyway) falls back to viewport semantics.
-		const observer = new IntersectionObserver(
-			(entries) => {
-				if (!entries.some((entry) => entry.isIntersecting)) return;
-				setExtraRows((prev) => prev + baseRowLimit);
-			},
-			{ root: findVerticalScrollParent(node.parentElement) },
-		);
-		observer.observe(node);
-		return () => observer.disconnect();
-	}, [hidden, baseRowLimit]);
-	return { rowLimit, hidden, sentinelRef };
-}
-
-/** Fill the single `{count}` placeholder of the truncation notice template. */
-function formatDiffTruncated(template: string, hidden: number): string {
-	return template.includes("{count}")
-		? template.replace("{count}", String(hidden))
-		: `${template} (${hidden})`;
-}
-
-/** The "N rows are not painted" footer inside a truncated diff body. */
-function DiffTruncatedNotice({
-	hidden,
-	label,
-	ref,
-}: {
-	hidden: number;
-	label: string;
-	/** Progressive-reveal hook: the sentinel observer watches this node. */
-	ref?: Ref<HTMLDivElement>;
-}) {
-	return (
-		<div ref={ref} style={{ opacity: 0.6, fontStyle: "italic" }}>
-			{formatDiffTruncated(label, hidden)}
-		</div>
-	);
-}
-
-/** Gutter text colour per row type (chunked DiffView parity). */
-function diffGutterColor(type: DiffLine["type"]): string {
-	return type === "removed"
-		? "var(--mantine-color-red-text)"
-		: type === "added"
-			? "var(--mantine-color-green-text)"
-			: "var(--mantine-color-dimmed)";
-}
-
-/**
- * A structured diff body: two-column line-number gutter, per-line +/- background,
- * word-level tints inside a modified pair, and Shiki syntax colours.
- *
- * Layering mirrors the chunked DiffView exactly:
- *   1. the row gets a full-width background (added / removed / none)
- *   2. the gutter shows `oldNo newNo±` at a FIXED width so code starts at the
- *      same column on every row
- *   3. the content shows word-level tints when the row is half of a modified
- *      pair, otherwise Shiki tokens, otherwise plain text
- *
- * Word tints and syntax colours are deliberately exclusive (same as chunked):
- * a modified line's value is "what changed", so the word highlight wins there.
- *
- * The gutter width is the SAME character count the measure layer subtracted (see
- * measureDiffContentHeight / diffGutterWidthChars), so the wrapping the height
- * model predicted is the wrapping the browser produces.
- */
-function DiffBody({
-	lines,
-	lang,
-	lineNoWidth,
-	lineNumberPrefix,
-	cap,
-	truncatedLabel,
-}: {
-	lines: readonly DiffLine[];
-	lang?: string | undefined;
-	lineNoWidth?: number | undefined;
-	lineNumberPrefix?: string | undefined;
-	/** Measured box cap (px) — sets how many rows are worth painting. */
-	cap?: number | undefined;
-	/** Localized "N more rows" template carrying a literal `{count}`. */
-	truncatedLabel?: string | undefined;
-}) {
-	const colors = DIFF_COLORS;
-	const baseRowLimit = diffRenderRowLimit(cap);
-	const { rowLimit, hidden, sentinelRef } = useDiffRowReveal(baseRowLimit, lines.length);
-	const painted = useMemo(
-		() => (lines.length > rowLimit ? lines.slice(0, rowLimit) : lines),
-		[lines, rowLimit],
-	);
-	// Shiki sees the row CONTENT only (no markers, no gutter), so the grammar gets
-	// plausible source. Only the painted rows are highlighted — tokens for rows
-	// that are never drawn are pure waste.
-	//
-	// The two sides are tokenized separately so a multi-line construct (block
-	// comment, unterminated template literal) on one side cannot leak its state into
-	// the other side's rows; `plan.rows[i]` then says where row `i` reads from. A
-	// single-sided diff yields one source, so the second call is a no-op miss.
-	const plan = useMemo(() => buildDiffHighlightPlan(painted), [painted]);
-	const oldTokens = useShikiTokens(plan?.sources[0] ?? "", lang);
-	const newTokens = useShikiTokens(plan?.sources[1] ?? "", lang);
-	const tokensForRow = (row: number): readonly ShikiToken[] | undefined => {
-		const ref = plan?.rows[row];
-		if (!ref) return undefined;
-		return (ref.source === 0 ? oldTokens : newTokens)?.[ref.line];
-	};
-
-	return (
-		<>
-			{painted.map((line, i) => {
-				const background =
-					line.type === "removed"
-						? colors.removedLine
-						: line.type === "added"
-							? colors.addedLine
-							: undefined;
-				return (
-					<div
-						// biome-ignore lint/suspicious/noArrayIndexKey: diff rows are a stable ordered list
-						key={i}
-						data-diff-row={line.type}
-						style={{
-							background,
-							whiteSpace: "pre-wrap",
-							wordBreak: "break-word",
-						}}
-					>
-						<span
-							data-diff-gutter
-							style={{
-								// `pre` keeps the padded alignment; inline-block would let the
-								// gutter and content wrap as separate boxes.
-								whiteSpace: "pre",
-								userSelect: "none",
-								opacity: lineNoWidth != null ? 0.4 : 0.6,
-								color: diffGutterColor(line.type),
-							}}
-						>
-							{lineNoWidth != null
-								? formatDiffGutter(line, lineNoWidth, lineNumberPrefix)
-								: diffLineMarker(line.type)}
-						</span>
-						<DiffRowContent
-							line={line}
-							tokens={tokensForRow(i)}
-							colors={colors}
-							hasHighlight={plan != null}
-						/>
-					</div>
-				);
-			})}
-			{hidden > 0 ? (
-				<DiffTruncatedNotice
-					hidden={hidden}
-					label={truncatedLabel ?? DEFAULT_DIFF_TRUNCATED}
-					ref={sentinelRef}
-				/>
-			) : null}
-		</>
-	);
-}
-
-/** One diff row's content: word tints, else Shiki tokens, else plain text. */
-function DiffRowContent({
-	line,
-	tokens,
-	colors,
-	hasHighlight,
-}: {
-	line: DiffLine;
-	tokens?: readonly ShikiToken[];
-	colors: typeof DIFF_COLORS;
-	hasHighlight: boolean;
-}) {
-	if (line.wordChanges && line.wordChanges.length > 0) {
-		// Chunk tint outside, Shiki colour inside. Imported from OUTSIDE vlist/ so
-		// DiffView can share it — the isolation guard only forbids the reverse.
-		return (
-			<DiffWordTokens
-				wordChanges={line.wordChanges}
-				tokens={tokens}
-				styles={{
-					removedWord: { background: colors.removedWord, borderRadius: 2 },
-					addedWord: { background: colors.addedWord, borderRadius: 2 },
-				}}
-			/>
-		);
-	}
-	if (hasHighlight) return <TokenText text={line.content} tokens={tokens} />;
-	return (
-		<span style={line.type === "context" ? { color: "var(--mantine-color-dimmed)" } : undefined}>
-			{line.content}
-		</span>
-	);
-}
-
-/**
- * Legacy plain-text diff fallback: used when a `diff` cap somehow carries only
- * `text` (no structured rows) — e.g. a payload produced before the structured
- * diff existed. Keeps the +/- rows readable rather than rendering nothing.
- */
-function DiffTextFallback({
-	text,
-	lang,
-	cap,
-	truncatedLabel,
-}: {
-	text: string;
-	lang?: string | undefined;
-	cap?: number | undefined;
-	truncatedLabel?: string | undefined;
-}) {
-	// Same row budget as the structured path: the fallback had the identical
-	// unbounded-node problem, and the box height is likewise measure-owned.
-	const baseRowLimit = diffRenderRowLimit(cap);
-	const all = useMemo(() => text.split("\n"), [text]);
-	const { rowLimit, hidden, sentinelRef } = useDiffRowReveal(baseRowLimit, all.length);
-	const lines = useMemo(
-		() => (all.length > rowLimit ? all.slice(0, rowLimit) : all),
-		[all, rowLimit],
-	);
-	const source = useMemo(
-		() => lines.map((line) => (/^[+\- ]/.test(line) ? line.slice(1) : line)).join("\n"),
-		[lines],
-	);
-	const tokens = useShikiTokens(source, lang);
-	const colors = DIFF_COLORS;
-	return (
-		<>
-			{lines.map((line, i) => {
-				const added = line.startsWith("+");
-				const removed = line.startsWith("-");
-				const marker = /^[+\- ]/.test(line) ? line.slice(0, 1) : "";
-				const body = marker ? line.slice(1) : line;
-				return (
-					<div
-						// biome-ignore lint/suspicious/noArrayIndexKey: lines are a stable ordered list
-						key={i}
-						style={{
-							background: added ? colors.addedLine : removed ? colors.removedLine : undefined,
-							whiteSpace: "pre-wrap",
-							wordBreak: "break-word",
-						}}
-					>
-						{line.length > 0 ? (
-							<>
-								<span style={{ whiteSpace: "pre", userSelect: "none", opacity: 0.6 }}>
-									{marker}
-								</span>
-								<TokenText text={body} tokens={tokens?.[i]} />
-							</>
-						) : (
-							"\u00a0"
-						)}
-					</div>
-				);
-			})}
-			{hidden > 0 ? (
-				<DiffTruncatedNotice
-					hidden={hidden}
-					label={truncatedLabel ?? DEFAULT_DIFF_TRUNCATED}
-					ref={sentinelRef}
-				/>
-			) : null}
-		</>
-	);
-}
-
-/** Read the structured diff payload a `diff` cap carries, if present. */
-function readDiffPayload(data: Record<string, unknown> | undefined): {
-	lines: readonly DiffLine[];
-	lineNoWidth?: number;
-	lineNumberPrefix?: string;
-} | null {
-	if (!data || !Array.isArray(data.diffLines) || data.diffLines.length === 0) return null;
-	return {
-		lines: data.diffLines as DiffLine[],
-		...(typeof data.diffLineNoWidth === "number" ? { lineNoWidth: data.diffLineNoWidth } : {}),
-		...(typeof data.diffLineNumberPrefix === "string"
-			? { lineNumberPrefix: data.diffLineNumberPrefix }
-			: {}),
-	};
-}
-
-/**
- * A diff detail body: the structured renderer when rows are available, else the
- * plain +/- text fallback.
- */
-function DiffLines({
-	text,
-	lang,
-	data,
-	truncatedLabel,
-}: {
-	text: string;
-	lang?: string | undefined;
-	data?: Record<string, unknown> | undefined;
-	truncatedLabel?: string | undefined;
-}) {
-	const payload = readDiffPayload(data);
-	// The cap the measure layer applied to this body: it decides how many rows can
-	// ever be on screen, and therefore how many are worth building.
-	const cap = typeof data?.cap === "number" ? data.cap : undefined;
-	if (!payload) {
-		return <DiffTextFallback text={text} lang={lang} cap={cap} truncatedLabel={truncatedLabel} />;
-	}
-	return (
-		<DiffBody
-			lines={payload.lines}
-			lang={lang}
-			lineNoWidth={payload.lineNoWidth}
-			lineNumberPrefix={payload.lineNumberPrefix}
-			cap={cap}
-			truncatedLabel={truncatedLabel}
-		/>
-	);
-}
-
-/**
- * Test-only handle on the diff body renderer. The diff gutter / row backgrounds /
- * word tints are the visual contract most at risk of silent regression, and they
- * are only reachable through a fully measured tool card otherwise. Exported so
- * DiffBody.test.tsx can assert the produced DOM directly.
- */
-export const __TEST__DiffLines = DiffLines;
-
-/**
  * Test-only handle on the timing breakdown body. Mantine's Popover dropdown is
  * portaled and only mounts while open, so a static render of the header cannot
  * reach the breakdown — exported so RenderToolCall.timing.test.tsx can assert the
  * phase rows and summary lines directly.
  */
 export const __TEST__ToolTimingBreakdown = ToolTimingBreakdown;
-
-/**
- * Which capped bodies follow their own tail, and whether they pin on mount.
- *
- * The follow is for bodies whose NEWEST content lands at the BOTTOM while they
- * GROW: bash/terminal output (the classifier's literal `output` label AND a
- * terminal-style cap), a streaming Write preview (`streaming` cap only ever
- * comes out of `classifyStreamingInput`, so the tag alone proves liveness), and
- * a streaming Edit diff (`diff` cap while the tool is still streaming).
- *
- * `followOnMount` splits those by freshness: a body that is streaming RIGHT NOW
- * pins to the tail the moment its box mounts (its first frame may already
- * overflow — a session opened mid-run, or output that arrived in one burst —
- * and skipping that pass is exactly the "follow never engages" failure), while
- * a SETTLED body (`term` cap on a finished command) still opens at its head so
- * the truncated-body auto-fetch keeps gating on the reader's own scroll.
- *
- * Deliberately NOT followed: command boxes (`bash-cmd`, and `streaming-bash`
- * WITHOUT the output label — the same tag paints the streaming command preview,
- * which reads from the head), settled code/diff bodies, and generic
- * input/output dumps.
- */
-export function resolveTailFollow(opts: {
-	/** The section label (absent on the single-block path). */
-	label?: ToolSectionLabel;
-	/** The body block's tag (`detail-${cap}`). */
-	blockTag?: string;
-	/** The card's own streaming flag (measured.isStreaming). */
-	isStreaming: boolean;
-}): { follow: boolean; followOnMount: boolean } {
-	const { label, blockTag, isStreaming } = opts;
-	if (label === "output" && (blockTag === "detail-term" || blockTag === "detail-streaming-bash")) {
-		return { follow: true, followOnMount: blockTag === "detail-streaming-bash" };
-	}
-	if (blockTag === "detail-streaming") return { follow: true, followOnMount: true };
-	if (blockTag === "detail-diff" && isStreaming) return { follow: true, followOnMount: true };
-	return { follow: false, followOnMount: false };
-}
-
-/**
- * A capped body scroll box: the fixed-height, clamped container the measure layer
- * reserved. Shared by the single-block path and the per-section path so both keep
- * identical geometry.
- *
- * `tailFollow` turns on output-tail following for bodies whose NEWEST content is
- * at the BOTTOM (bash / terminal output, streaming Write previews, streaming Edit
- * diffs — see resolveTailFollow). While the text grows the box stays pinned to
- * the tail; a reader scrolling up detaches it (AutoFollowScroll shows a
- * jump-to-bottom button). `followOnMount` pins the box to the tail the moment it
- * mounts — right for a body that is streaming NOW, wrong for a settled one,
- * whose truncated-body auto-fetch (`useAutoLoadOnScroll`) must keep gating on
- * the reader actually scrolling deep.
- */
-function CappedBodyBox({
-	height,
-	cap,
-	wordWrap = true,
-	tailFollow = false,
-	followOnMount = false,
-	followDeps = [],
-	children,
-}: {
-	height: number;
-	cap?: number | null;
-	/**
-	 * Soft-wrap (default) or horizontal scroll. Changing this never moves the box:
-	 * its height is fixed by the measure pass and the overflow scrolls, so wrap
-	 * only decides what the reader sees inside it.
-	 */
-	wordWrap?: boolean;
-	/** Follow the output tail while `followDeps` change (streaming output). */
-	tailFollow?: boolean;
-	/** Pin to the tail on mount (a body streaming NOW). See resolveTailFollow. */
-	followOnMount?: boolean;
-	/** Content identity that drives follow attempts (the body text + wrap flag). */
-	followDeps?: readonly unknown[];
-	children: ReactNode;
-}) {
-	const box = (
-		<div
-			style={{
-				maxHeight: cap ?? undefined,
-				height,
-				// The chunked ContentViewer's axis policy: a WRAPPED body never needs
-				// horizontal scrolling — its text is measured to fit — so any horizontal
-				// overflow is a rendering artifact (e.g. a wrap point's trailing space
-				// painted by `pre` fragments), and `overflowX: auto` would answer it
-				// with a scrollbar. On a short body that bar covers almost the whole
-				// box: a one-line output reserves ~24px and a classic scrollbar takes
-				// ~half of it, which is exactly what a failed WebSearch card showed.
-				// An UNWRAPPED body (`pre`) scrolls horizontally by definition.
-				overflowY: "auto",
-				overflowX: wordWrap ? "hidden" : "auto",
-				fontSize: detailBodyFontSize(),
-				// The measure layer counts INTEGER line boxes
-				// (DETAIL_CONTENT_LINE_HEIGHT = round(11 × 1.4) = 15). Declaring the
-				// ratio `1.4` here would make the browser use 15.4px instead, so every
-				// wrapped line drifts 0.4px and a 15-line body renders 6px taller than
-				// the box reserved for it — the overflow is silently clipped. Pinning
-				// the same integer keeps measure and render byte-identical.
-				lineHeight: `${detailContentLineHeight()}px`,
-				fontFamily: "var(--mantine-font-family-monospace)",
-				// Scheme-aware: a fixed dark-8 panel renders near-black text on
-				// near-black in light mode (see vlist-markdown.css).
-				background: "var(--vlist-detail-panel-bg)",
-				color: "var(--vlist-detail-panel-fg)",
-				borderRadius: 4,
-				padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
-				boxSizing: "border-box",
-				...(wordWrap ? { whiteSpace: "pre-wrap", wordBreak: "break-word" } : { whiteSpace: "pre" }),
-			}}
-		>
-			{children}
-		</div>
-	);
-	if (!tailFollow) return box;
-	// asChild: the follow handlers land on the SAME div, so the wrapper adds only
-	// a position:relative box — height-neutral, like VListContentViewHost's own.
-	return (
-		<AutoFollowScroll asChild followOnMount={followOnMount} deps={followDeps}>
-			{box}
-		</AutoFollowScroll>
-	);
-}
-
-/**
- * A multi-part detail: the ordered section list the classifier produced.
- *
- * All sections share ONE flat block list (blocks[i] ↔ frame.blocks[i]); each
- * `MeasuredToolDetailSection` says which slice it owns and where its label /
- * body sit, so every piece is drawn at exactly the measured geometry.
- */
-function SectionsDetailBody({
-	detail,
-	availableWidth,
-	labels,
-	narratorId,
-	viewTargets,
-	viewControls,
-	specTasksLive,
-	isStreaming,
-}: {
-	detail: MeasuredToolDetail;
-	availableWidth: number;
-	labels: DetailLabels;
-	narratorId?: string;
-	viewTargets?: readonly VListViewTarget[];
-	viewControls?: VListViewControls;
-	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
-	specTasksLive?: boolean;
-	/** The card is streaming NOW — feeds resolveTailFollow (a live diff follows its tail). */
-	isStreaming: boolean;
-}) {
-	// kind === "sections" guarantees the section list (the caller gates on it).
-	const sections = detail.sections ?? [];
-	return (
-		<div style={{ position: "relative", width: availableWidth, height: detail.height }}>
-			{sections.map((part, sectionIndex) => (
-				<SectionView
-					// biome-ignore lint/suspicious/noArrayIndexKey: sections are a stable ordered list — the measure pass fixes their order and count, and a section is never inserted, removed or reordered without a re-measure that rebuilds this whole region
-					key={sectionIndex}
-					detail={detail}
-					part={part}
-					availableWidth={availableWidth}
-					labels={labels}
-					narratorId={narratorId}
-					// SLOT lookup, never `viewTargets[sectionIndex]`:
-					// `resolveDetailViewTargets` pushes CONDITIONALLY (a section whose body
-					// yields no readable target — error text, a label-only row, a media
-					// placeholder — contributes nothing), so the target array is SPARSE
-					// relative to the section list and array indices do not line up.
-					// Indexing it hands section 0 the target that belongs to section 1,
-					// which both misroutes the hover bar / wrap / source / fullscreen
-					// controls and — since `truncated` is the only gate for fetching the
-					// bytes the server withheld — leaves the real body unable to ever load
-					// its full payload.
-					viewTarget={findViewTarget(viewTargets, sectionSlot(sectionIndex))}
-					viewControls={viewControls}
-					specTasksLive={specTasksLive}
-					isStreaming={isStreaming}
-				/>
-			))}
-		</div>
-	);
-}
-
-/** One section: its optional label row + its body drawn at the measured offset. */
-function SectionView({
-	detail,
-	part,
-	availableWidth,
-	labels,
-	narratorId,
-	viewTarget,
-	viewControls,
-	specTasksLive,
-	isStreaming,
-}: {
-	detail: MeasuredToolDetail;
-	part: MeasuredToolDetailSection;
-	availableWidth: number;
-	labels: DetailLabels;
-	narratorId?: string;
-	viewTarget?: VListViewTarget;
-	viewControls?: VListViewControls;
-	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
-	specTasksLive?: boolean;
-	/** The card is streaming NOW — feeds resolveTailFollow (a live diff follows its tail). */
-	isStreaming: boolean;
-}) {
-	// The slice of blocks owned by this section (skipping its own label row).
-	const bodyStart = part.blockStart + (part.hasLabel ? 1 : 0);
-	const bodyEnd = part.blockStart + part.blockCount;
-	const blocks = detail.blocks.slice(bodyStart, bodyEnd);
-	const frames = detail.frame.blocks.slice(bodyStart, bodyEnd);
-	return (
-		<>
-			{part.label !== undefined ? (
-				<Text
-					size="xs"
-					fw={500}
-					style={{
-						position: "absolute",
-						top: part.top,
-						left: 0,
-						width: availableWidth,
-						height: typographyMetrics().line.xs,
-					}}
-				>
-					{sectionLabelText(labels, part.label)}
-				</Text>
-			) : null}
-			<div
-				style={{
-					position: "absolute",
-					top: part.bodyTop,
-					left: 0,
-					width: availableWidth,
-					height: part.bodyHeight,
-				}}
-			>
-				<SectionBody
-					part={part}
-					blocks={blocks}
-					frames={frames}
-					availableWidth={availableWidth}
-					labels={labels}
-					narratorId={narratorId}
-					viewTarget={viewTarget}
-					viewControls={viewControls}
-					specTasksLive={specTasksLive}
-					isStreaming={isStreaming}
-				/>
-			</div>
-		</>
-	);
-}
-
-/**
- * The body of one section, re-based onto its own origin. A capped body is drawn
- * inside its clamped scroll box (so overflow scrolls instead of growing the
- * card); the pretext-measured bodies are absolutely positioned lines.
- */
-function SectionBody({
-	part,
-	blocks,
-	frames,
-	availableWidth,
-	labels,
-	narratorId,
-	viewTarget,
-	viewControls,
-	specTasksLive,
-	isStreaming,
-}: {
-	part: MeasuredToolDetailSection;
-	blocks: MeasuredToolDetail["blocks"];
-	frames: readonly BlockFrame[];
-	availableWidth: number;
-	labels: DetailLabels;
-	narratorId?: string;
-	viewTarget?: VListViewTarget;
-	viewControls?: VListViewControls;
-	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
-	specTasksLive?: boolean;
-	/** The card is streaming NOW — feeds resolveTailFollow (a live diff follows its tail). */
-	isStreaming: boolean;
-}) {
-	// Section geometry is absolute within the region; shift it to a local origin.
-	const origin = frames[0]?.top ?? 0;
-	const localFrames = useMemo(
-		() => frames.map((f) => ({ ...f, top: f.top - origin })),
-		[frames, origin],
-	);
-	const inner: MeasuredToolDetail = useMemo(
-		() => ({
-			kind: part.kind,
-			height: part.bodyContentHeight,
-			blocks: [...blocks],
-			frame: {
-				blocks: localFrames,
-				contentHeight: part.bodyContentHeight,
-				usedWidth: availableWidth,
-			},
-			// The width the LINE BREAKING used, not the section's available width. A
-			// markdown body was wrapped inside its padded scroll box, so it is narrower
-			// by `DETAIL_BOX_CHROME_X`; painting it at `availableWidth` overflowed the
-			// box horizontally (a scrollbar with nothing to scroll to, covering a
-			// one-line body almost entirely) AND re-wrapped the text at a width the
-			// height was not predicted from. See `bodyContentWidth`.
-			contentWidth: part.bodyContentWidth,
-			appliedCap: part.appliedCap,
-			...(part.markdown ? { markdown: true } : {}),
-		}),
-		[part, blocks, localFrames, availableWidth],
-	);
-
-	if (part.kind === "capped" && part.markdown) {
-		// A markdown body (plan / skill / knowledge) painted inside the capped box.
-		return (
-			<VListContentViewHost target={viewTarget} controls={viewControls}>
-				<CappedMarkdownBody
-					measured={inner}
-					boxHeight={part.bodyHeight}
-					cap={part.appliedCap}
-					planSourceLabel={labels.planSource}
-					showSource={viewTarget ? viewControls?.isSourceShown(viewTarget) : false}
-					sourceText={viewTarget?.text}
-				/>
-			</VListContentViewHost>
-		);
-	}
-	if (part.kind === "capped") {
-		const block = blocks[0];
-		const media =
-			block?.kind === "fixed" ? (block.data?.media as VListImageRef | undefined) : undefined;
-		if (media) {
-			// The measure layer reserved either the aspect-fitted rectangle or a
-			// fixed-height placeholder; paint the same one it reserved (see
-			// readExactDisplayBox).
-			const exact = block?.kind === "fixed" ? readExactDisplayBox(block.data) : null;
-			return (
-				<VListImage
-					media={media}
-					narratorId={narratorId}
-					maxHeight={part.bodyHeight}
-					{...(exact ?? {})}
-				/>
-			);
-		}
-		const text =
-			block?.kind === "fixed" && typeof block.data?.text === "string" ? block.data.text : null;
-		const isDiff = block?.kind === "fixed" && block.tag === "detail-diff";
-		const lang = block?.kind === "fixed" ? resolveDetailLang(block.data) : undefined;
-		const blockData = block?.kind === "fixed" ? block.data : undefined;
-		const blockTag = block?.kind === "fixed" ? block.tag : undefined;
-		const wordWrap = viewTarget ? viewControls?.isWrapped(viewTarget) !== false : true;
-		const { follow: tailFollow, followOnMount } = resolveTailFollow({
-			label: part.label,
-			blockTag,
-			isStreaming,
-		});
-		return (
-			<VListContentViewHost target={viewTarget} controls={viewControls}>
-				<CappedBodyBox
-					height={part.bodyHeight}
-					cap={part.appliedCap}
-					wordWrap={wordWrap}
-					tailFollow={tailFollow}
-					followOnMount={followOnMount}
-					followDeps={[text, wordWrap]}
-				>
-					{isDiff ? (
-						<DiffLines
-							text={text ?? ""}
-							lang={lang}
-							data={blockData}
-							truncatedLabel={labels.diffTruncated}
-						/>
-					) : text == null ? null : (
-						<HighlightedBody text={text} lang={lang} />
-					)}
-				</CappedBodyBox>
-			</VListContentViewHost>
-		);
-	}
-	// A denied / skipped question arrives as `{ sections: [ask, error] }`, so the ask
-	// replay must be routed here too. Letting it fall through to DetailBlocks below
-	// keeps the height correct but drops the option glyphs and the selected
-	// emphasis — the whole point of the card.
-	if (part.kind === "ask") {
-		return (
-			<AskDetailBlocks
-				blocks={blocks}
-				frames={localFrames}
-				availableWidth={availableWidth}
-				height={part.bodyHeight}
-			/>
-		);
-	}
-	// meta-rows / structured / spec-tasks / error → absolutely positioned blocks.
-	return (
-		<DetailBlocks
-			kind={part.kind}
-			blocks={blocks}
-			frames={localFrames}
-			availableWidth={availableWidth}
-			height={part.bodyHeight}
-			labels={labels}
-			narratorId={narratorId}
-			specTasksLive={specTasksLive}
-		/>
-	);
-}
-
-/** Markdown body inside a clamped scroll box (shared by plan / skill / knowledge). */
-function CappedMarkdownBody({
-	measured,
-	boxHeight,
-	cap,
-	planSourceLabel,
-	showSource,
-	sourceText,
-}: {
-	measured: MeasuredToolDetail;
-	boxHeight: number;
-	cap: number | null;
-	planSourceLabel: string;
-	/** Show the raw markdown instead of the rendered form (viewer toggle). */
-	showSource?: boolean;
-	/** The raw markdown, needed only while `showSource` holds. */
-	sourceText?: string;
-}) {
-	const sourceIndex = measured.blocks.findIndex(
-		(b) => b.kind === "fixed" && b.tag === "detail-plan-source",
-	);
-	const sourceBlock = sourceIndex >= 0 ? measured.blocks[sourceIndex] : undefined;
-	const sourcePath =
-		sourceBlock?.kind === "fixed" && typeof sourceBlock.data?.sourcePath === "string"
-			? sourceBlock.data.sourcePath
-			: null;
-	const sourceFrame = sourceIndex >= 0 ? measured.frame.blocks[sourceIndex] : undefined;
-	return (
-		<div
-			style={{
-				maxHeight: cap ?? undefined,
-				height: boxHeight,
-				// Same axis policy as MarkdownDetailBody: a markdown body is always
-				// wrapped, so horizontal overflow is a paint artifact, not content
-				// to scroll to (see CappedBodyBox for the full rationale).
-				overflowY: "auto",
-				overflowX: "hidden",
-				boxSizing: "border-box",
-				padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
-				// Markdown body text inherits the theme foreground, so the surface
-				// must follow the colour scheme too (see vlist-markdown.css).
-				background: "var(--vlist-detail-panel-bg)",
-				borderRadius: 4,
-				position: "relative",
-			}}
-		>
-			{sourcePath != null && sourceFrame ? (
-				<Text
-					size="xs"
-					c="dimmed"
-					ff="monospace"
-					truncate
-					title={sourcePath}
-					style={{
-						position: "absolute",
-						top: sourceFrame.top + DETAIL_BOX_PADDING_Y,
-						left: DETAIL_BOX_PADDING_X,
-						width: measured.contentWidth,
-						height: sourceFrame.height,
-					}}
-				>
-					{formatPlanSource(planSourceLabel, sourcePath)}
-				</Text>
-			) : null}
-			{/* Source view: the same fixed-height, scrolling box shows the raw markdown
-			    instead of the measured render. The box keeps its height either way, so
-			    this cannot move the card (parity with ContentViewer's source toggle,
-			    minus the reflow that one causes). */}
-			{showSource && sourceText ? (
-				<div
-					style={{
-						fontSize: detailBodyFontSize(),
-						lineHeight: `${detailContentLineHeight()}px`,
-						fontFamily: "var(--mantine-font-family-monospace)",
-						color: "var(--vlist-detail-panel-fg)",
-						whiteSpace: "pre-wrap",
-						wordBreak: "break-word",
-					}}
-				>
-					{sourceText}
-				</div>
-			) : (
-				<RenderMarkdown
-					measured={{
-						height: measured.frame.contentHeight,
-						blocks: measured.blocks,
-						frame: measured.frame,
-						contentWidth: measured.contentWidth,
-						usedWidth: measured.frame.usedWidth,
-					}}
-				/>
-			)}
-		</div>
-	);
-}
 
 /**
  * Absolutely-positioned blocks for the pretext-measured detail kinds
@@ -2521,8 +1412,8 @@ function DetailBlocks({
 	narratorId,
 	specTasksLive,
 }: {
-	kind: MeasuredToolDetail["kind"];
-	blocks: MeasuredToolDetail["blocks"];
+	kind: MeasuredToolBody["kind"];
+	blocks: MeasuredToolBody["blocks"];
 	frames: readonly BlockFrame[];
 	availableWidth: number;
 	height: number;
@@ -2727,7 +1618,7 @@ function AskDetailBlocks({
 	availableWidth,
 	height,
 }: {
-	blocks: MeasuredToolDetail["blocks"];
+	blocks: MeasuredToolBody["blocks"];
 	frames: readonly BlockFrame[];
 	availableWidth: number;
 	height: number;
@@ -2785,7 +1676,6 @@ function DetailRegion({
 	viewTargets,
 	viewControls,
 	specTasksLive,
-	isStreaming,
 }: {
 	detail: MeasuredToolDetail;
 	availableWidth: number;
@@ -2793,190 +1683,192 @@ function DetailRegion({
 	narratorId?: string;
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
-	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
 	specTasksLive?: boolean;
-	/** The card is streaming NOW — feeds resolveTailFollow (a live diff follows its tail). */
-	isStreaming: boolean;
 }) {
-	// Multi-part detail: the meta header + labelled body sections the classic card
-	// draws. This is the shape whose absence made whole blocks disappear.
-	if (detail.kind === "sections") {
-		return (
-			<SectionsDetailBody
-				detail={detail}
-				availableWidth={availableWidth}
-				labels={labels}
-				narratorId={narratorId}
-				viewTargets={viewTargets}
-				viewControls={viewControls}
-				specTasksLive={specTasksLive}
-				isStreaming={isStreaming}
-			/>
-		);
-	}
-	// Read-only AskUserQuestion replay: needs the option glyphs / selected emphasis
-	// the generic block renderer knows nothing about.
-	if (detail.kind === "ask") {
-		return (
-			<AskDetailBlocks
-				blocks={detail.blocks}
-				frames={detail.frame.blocks}
-				availableWidth={availableWidth}
-				height={detail.height}
-			/>
-		);
-	}
-	// Markdown-bodied capped detail (plans): real prepared blocks, not one opaque
-	// fixed block. Rendered with RenderMarkdown inside the same clamped box.
-	if (detail.kind === "capped" && detail.markdown) {
-		const target = findViewTarget(viewTargets, BODY_SLOT);
-		return (
-			<VListContentViewHost target={target} controls={viewControls}>
-				<MarkdownDetailBody
-					detail={detail}
-					planSourceLabel={labels.planSource}
-					showSource={target ? viewControls?.isSourceShown(target) : false}
-					sourceText={target?.text}
-				/>
-			</VListContentViewHost>
-		);
-	}
-	// Capped / generic kinds are fixed blocks → a clamped scroll container each.
-	if (detail.kind === "capped" || detail.kind === "generic") {
-		return (
-			<div style={{ position: "relative", width: availableWidth, height: detail.height }}>
-				{detail.blocks.map((block, index) => {
-					const bf = detail.frame.blocks[index];
-					if (!bf || block.kind !== "fixed") return null;
-					// Each fixed block owns the `b{index}` slot (see blockSlot).
-					const viewTarget = findViewTarget(viewTargets, blockSlot(index));
-					const bodyWrapped = viewTarget ? viewControls?.isWrapped(viewTarget) !== false : true;
-					const isOutput = block.tag === "detail-generic-output";
-					const hasLabel =
-						block.tag === "detail-generic-input" ||
-						block.tag === "detail-generic-output" ||
-						block.data?.hasLabel === true;
-					// Media caps paint an actual image inside the reserved box.
-					const media = block.data?.media as VListImageRef | undefined;
-					const isMedia = block.tag === "detail-media" && media != null;
-					const bodyText = typeof block.data?.text === "string" ? block.data.text : null;
-					const isDiff = block.tag === "detail-diff";
-					const bodyLang = resolveDetailLang(block.data);
-					// Same tail-follow contract as the sectioned CappedBodyBox, minus the
-					// label dimension (the single-block path has no section labels). This is
-					// where a streaming Write/Edit preview lands while its path row is still
-					// absent — `sections()` collapses a lone unlabelled section into this
-					// branch (tool-detail.ts), so skipping the follow here left exactly the
-					// earliest streaming frames head-pinned.
-					const { follow: tailFollow, followOnMount } = resolveTailFollow({
-						blockTag: block.tag,
-						isStreaming,
-					});
-					const scrollBody = (
-						<div
-							style={{
-								maxHeight: typeof block.data?.cap === "number" ? block.data.cap : undefined,
-								// Axis policy of the chunked ContentViewer (see
-								// CappedBodyBox): a WRAPPED body never scrolls
-								// horizontally, so any overflow is a rendering artifact
-								// that must not summon a scrollbar; an UNWRAPPED body
-								// scrolls horizontally by definition.
-								overflowY: "auto",
-								overflowX: bodyWrapped ? "hidden" : "auto",
-								fontSize: detailBodyFontSize(),
-								// Integer line box, not the 1.4 ratio — see CappedBodyBox.
-								lineHeight: `${detailContentLineHeight()}px`,
-								fontFamily: "var(--mantine-font-family-monospace)",
-								// Scheme-aware — see CappedBodyBox.
-								background: "var(--vlist-detail-panel-bg)",
-								color: "var(--vlist-detail-panel-fg)",
-								borderRadius: 4,
-								padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
-								boxSizing: "border-box",
-								// Wrap is a reader preference; the box height is fixed either
-								// way, so switching it only changes the scroll axis.
-								...(bodyWrapped
-									? { whiteSpace: "pre-wrap", wordBreak: "break-word" }
-									: { whiteSpace: "pre" }),
-								// The scroll body fills the block minus the label chrome (the
-								// same amount `cappedBodyHeight` added for the label row).
-								height: bf.height - (hasLabel ? DETAIL_LABEL_CHROME_Y : 0),
-							}}
-						>
-							{/* Real body text (code/command/diff/output). Diffs get +/- line
-						    tinting plus syntax colours; other bodies get syntax colours
-						    when a language is known. Height-capped so content never
-						    shifts layout. */}
-							{isDiff ? (
-								<DiffLines
-									text={bodyText ?? ""}
-									lang={bodyLang}
-									data={block.data}
-									truncatedLabel={labels.diffTruncated}
-								/>
-							) : bodyText == null ? null : (
-								<HighlightedBody text={bodyText} lang={bodyLang} />
-							)}
-						</div>
-					);
-					return (
-						<div
-							// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
-							key={index}
+	return (
+		<div style={{ position: "relative", width: availableWidth, height: detail.height }}>
+			{detail.sections.map((section) => (
+				<Fragment key={section.key}>
+					{section.label ? (
+						<Text
+							size="xs"
+							fw={500}
 							style={{
 								position: "absolute",
-								top: bf.top,
+								top: section.top,
 								left: 0,
 								width: availableWidth,
-								height: bf.height,
+								height: typographyMetrics().line.xs,
 							}}
 						>
-							{hasLabel ? (
-								<Text size="xs" fw={500} mb={2}>
-									{isOutput ? labels.output : labels.input}
+							{sectionLabelText(labels, section.label)}
+						</Text>
+					) : null}
+					<div
+						style={{
+							position: "absolute",
+							top: section.bodyTop,
+							left: 0,
+							width: availableWidth,
+							height: section.bodyHeight,
+						}}
+					>
+						<RenderToolBody
+							measured={section.measuredBody}
+							labels={labels}
+							narratorId={narratorId}
+							viewTarget={
+								section.measuredBody.model.kind === "capped"
+									? findViewTarget(viewTargets, section.measuredBody.model.source)
+									: undefined
+							}
+							viewControls={viewControls}
+							specTasksLive={specTasksLive}
+						/>
+					</div>
+				</Fragment>
+			))}
+		</div>
+	);
+}
+
+/** One dispatch over the original model; measurement only supplies local geometry. */
+export function RenderToolBody({
+	measured,
+	labels = DEFAULT_LABELS,
+	narratorId,
+	viewTarget,
+	viewControls,
+	specTasksLive,
+}: {
+	measured: MeasuredToolBody;
+	labels?: DetailLabels;
+	narratorId?: string;
+	viewTarget?: VListViewTarget;
+	viewControls?: VListViewControls;
+	specTasksLive?: boolean;
+}) {
+	const { model, blocks, frame, contentWidth, height, appliedCap } = measured;
+	if (model.kind === "ask")
+		return (
+			<AskDetailBlocks
+				blocks={blocks}
+				frames={frame.blocks}
+				availableWidth={contentWidth}
+				height={height}
+			/>
+		);
+	if (model.kind !== "capped")
+		return (
+			<DetailBlocks
+				kind={model.kind}
+				blocks={blocks}
+				frames={frame.blocks}
+				availableWidth={contentWidth}
+				height={height}
+				labels={labels}
+				specTasksLive={specTasksLive}
+			/>
+		);
+	if (model.format === "media") {
+		const block = blocks[0];
+		return model.media ? (
+			<VListImage
+				media={model.media}
+				narratorId={narratorId}
+				maxHeight={height}
+				{...(block?.kind === "fixed" ? readExactDisplayBox(block.data) : null)}
+			/>
+		) : null;
+	}
+	const wordWrap = viewTarget ? viewControls?.isWrapped(viewTarget) !== false : true;
+	const showSource = !!viewTarget && viewControls?.isSourceShown(viewTarget) === true;
+	const isMarkdown = model.format === "markdown";
+	const sourceIndex = blocks.findIndex(
+		(block) => block.kind === "fixed" && block.tag === "detail-plan-source",
+	);
+	const sourceFrame = sourceIndex >= 0 ? frame.blocks[sourceIndex] : undefined;
+	return (
+		<VListContentViewHost target={viewTarget} controls={viewControls}>
+			{(onReaderProgress) => (
+				<AutoFollowScroll
+					bodyId={model.id}
+					live={model.live}
+					revision={model.revision}
+					followTarget={model.followTarget.kind === "diff-row" ? "row" : "end"}
+					layout={model.format === "diff" ? { width: contentWidth, height } : undefined}
+					contentPadding={
+						model.format === "diff"
+							? { x: DETAIL_BOX_PADDING_X, y: DETAIL_BOX_PADDING_Y }
+							: undefined
+					}
+					onReaderProgress={onReaderProgress}
+					viewportStyle={{
+						height,
+						maxHeight: appliedCap ?? undefined,
+						overflowX: wordWrap || (isMarkdown && !showSource) ? "hidden" : "auto",
+						boxSizing: "border-box",
+						background: "var(--vlist-detail-panel-bg)",
+						borderRadius: 4,
+					}}
+					contentStyle={{
+						padding: `${DETAIL_BOX_PADDING_Y}px ${DETAIL_BOX_PADDING_X}px`,
+						boxSizing: "border-box",
+						fontSize: detailBodyFontSize(),
+						lineHeight: `${detailContentLineHeight()}px`,
+						fontFamily: "var(--mantine-font-family-monospace)",
+						color: "var(--vlist-detail-panel-fg)",
+						...(wordWrap
+							? { whiteSpace: "pre-wrap", wordBreak: "break-word" }
+							: { whiteSpace: "pre" }),
+					}}
+				>
+					{model.format === "diff" ? (
+						<DiffContent
+							document={model.diffDocument}
+							language={resolveDetailLang(model)}
+							wordWrap={wordWrap}
+							contentWidth={contentWidth - DETAIL_BOX_PADDING_X * 2}
+						/>
+					) : isMarkdown && !showSource ? (
+						<div data-tool-markdown style={{ position: "relative", width: contentWidth }}>
+							{model.sourcePath && sourceFrame ? (
+								<Text
+									size="xs"
+									c="dimmed"
+									ff="monospace"
+									truncate
+									title={model.sourcePath}
+									style={{
+										position: "absolute",
+										top: sourceFrame.top,
+										left: 0,
+										width: contentWidth,
+										height: sourceFrame.height,
+									}}
+								>
+									{formatPlanSource(labels.planSource, model.sourcePath)}
 								</Text>
 							) : null}
-							{isMedia ? (
-								<VListImage
-									media={media}
-									narratorId={narratorId}
-									maxHeight={bf.height - (hasLabel ? DETAIL_LABEL_CHROME_Y : 0)}
-									{...(readExactDisplayBox(block.data) ?? {})}
-								/>
-							) : (
-								<VListContentViewHost target={viewTarget} controls={viewControls}>
-									{tailFollow ? (
-										<AutoFollowScroll
-											asChild
-											followOnMount={followOnMount}
-											deps={[bodyText, bodyWrapped]}
-										>
-											{scrollBody}
-										</AutoFollowScroll>
-									) : (
-										scrollBody
-									)}
-								</VListContentViewHost>
-							)}
+							<RenderMarkdown
+								measured={{
+									height: frame.contentHeight,
+									blocks,
+									frame,
+									contentWidth,
+									usedWidth: frame.usedWidth,
+								}}
+							/>
 						</div>
-					);
-				})}
-			</div>
-		);
-	}
-
-	// Pretext-measured kinds (meta-rows / spec-tasks / structured / error).
-	return (
-		<DetailBlocks
-			kind={detail.kind}
-			blocks={detail.blocks}
-			frames={detail.frame.blocks}
-			availableWidth={availableWidth}
-			height={detail.height}
-			labels={labels}
-			narratorId={narratorId}
-			specTasksLive={specTasksLive}
-		/>
+					) : (
+						<HighlightedBody
+							text={model.text ?? ""}
+							lang={showSource ? undefined : resolveDetailLang(model)}
+						/>
+					)}
+				</AutoFollowScroll>
+			)}
+		</VListContentViewHost>
 	);
 }
 
@@ -3198,7 +2090,6 @@ export function RenderToolCall({
 									viewTargets={viewTargets}
 									viewControls={viewControls}
 									specTasksLive={specTasksLive}
-									isStreaming={isStreaming}
 								/>
 							</div>
 						</Box>

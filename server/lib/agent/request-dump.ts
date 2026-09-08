@@ -14,6 +14,11 @@ export interface ApiRequestDump {
 	 * handled downstream by spilling the whole dump to a file, not by discarding parts of it.
 	 */
 	capture?: unknown;
+	/** Earlier transport attempts; request previews are explicitly bounded. */
+	attempts?: Array<{ requestText: string; response?: ApiRequestDump["response"] }>;
+	attemptsTruncated?: boolean;
+	/** Never erase the original request when a reconnect/fallback changes the payload. */
+	initialRequest?: ApiRequestDump["request"];
 	request?: {
 		transport?: string;
 		url?: string;
@@ -26,6 +31,11 @@ export interface ApiRequestDump {
 		bodyText?: string;
 		events?: unknown[];
 		error?: string;
+		errorTruncated?: boolean;
+		bodyBytesReceived?: number;
+		bodyBytesKept?: number;
+		bodyTruncated?: boolean;
+		bodyIncomplete?: boolean;
 	};
 }
 
@@ -33,6 +43,105 @@ export interface ApiRequestDump {
 export const DEFAULT_DUMP_MAX_BYTES = 1024 * 1024;
 /** Hard cap on the number of stored SSE events in a raw dump. */
 export const MAX_DUMP_EVENT_COUNT = 2000;
+
+/** Negative/unlimited settings still obey this in-memory safety ceiling. */
+export const HARD_DUMP_MAX_BYTES = 32 * 1024 * 1024;
+export function responseDumpBudget(value = DEFAULT_DUMP_MAX_BYTES): number {
+	return Number.isFinite(value) && value >= 0
+		? Math.min(Math.floor(value), HARD_DUMP_MAX_BYTES)
+		: HARD_DUMP_MAX_BYTES;
+}
+
+/** Retains a UTF-8 prefix, never allocates an encoding of an unbounded input string. */
+export class BoundedUtf8Capture {
+	private parts: Uint8Array[] = [];
+	private sealed = false;
+	private store(value: Uint8Array): void {
+		let offset = 0;
+		while (offset < value.length) {
+			const position = this.kept % 65536;
+			if (position === 0) this.parts.push(new Uint8Array(Math.min(65536, this.limit - this.kept)));
+			const part = this.parts[this.parts.length - 1];
+			const size = Math.min(part.length - position, value.length - offset);
+			part.set(value.subarray(offset, offset + size), position);
+			this.kept += size;
+			offset += size;
+		}
+	}
+	kept = 0;
+	received = 0;
+	readonly limit: number;
+	constructor(limit = DEFAULT_DUMP_MAX_BYTES) {
+		this.limit = responseDumpBudget(limit);
+	}
+	append(value: string | Uint8Array): void {
+		if (typeof value === "string") {
+			this.received += Buffer.byteLength(value, "utf8");
+			const remaining = this.limit - this.kept;
+			if (remaining <= 0 || this.sealed) return;
+			const target = new Uint8Array(Math.min(remaining, value.length * 3));
+			const { written } = new TextEncoder().encodeInto(value, target);
+			if (written) this.store(target.subarray(0, written));
+			if (this.received > this.kept) this.sealed = true;
+		} else {
+			this.received += value.byteLength;
+			if (this.sealed) return;
+			const size = Math.min(value.byteLength, this.limit - this.kept);
+			if (size > 0) this.store(value.subarray(0, size));
+			if (size < value.byteLength) this.sealed = true;
+		}
+	}
+	text(): string {
+		// stream:true omits a partial trailing codepoint rather than inventing U+FFFD.
+		return new TextDecoder().decode(Buffer.concat(this.parts, this.kept), { stream: true });
+	}
+}
+
+/** Pull-only tap: no tee, no background drain, and cleanup preserves a partial prefix. */
+export function captureResponseStream(
+	source: ReadableStream<Uint8Array>,
+	collector?: ApiRequestDumpCollector,
+): { stream: ReadableStream<Uint8Array>; finish: () => void } {
+	if (!collector) return { stream: source, finish: () => {} };
+	const reader = source.getReader();
+	let complete = false;
+	let finished = false;
+	const finish = () => {
+		if (finished) return;
+		finished = true;
+		collector.finishResponseCapture(complete);
+		void reader.cancel().catch(() => {});
+	};
+	const stream = new ReadableStream<Uint8Array>(
+		{
+			async pull(controller) {
+				try {
+					const { done, value } = await reader.read();
+					if (finished) {
+						controller.close();
+						return;
+					}
+					if (done) {
+						complete = true;
+						controller.close();
+						finish();
+					} else {
+						collector.appendResponseText(value);
+						controller.enqueue(value);
+					}
+				} catch (error) {
+					if (finished) return;
+					collector.setResponseError(error);
+					controller.error(error);
+					finish();
+				}
+			},
+			cancel: finish,
+		},
+		{ highWaterMark: 0 },
+	);
+	return { stream, finish };
+}
 
 const SENSITIVE_HEADER_PATTERNS = [
 	/^authorization$/i,
@@ -94,6 +203,56 @@ export function sanitizeHeaders(
 
 export class ApiRequestDumpCollector {
 	private dump: ApiRequestDump;
+	private responseCapture?: BoundedUtf8Capture;
+	private responseBudgetUsed = 0;
+
+	beginResponseAttempt(
+		request: NonNullable<ApiRequestDump["request"]>,
+		maxBytes = DEFAULT_DUMP_MAX_BYTES,
+	): void {
+		this.flushResponseCapture();
+		if (this.dump.request) {
+			this.dump.initialRequest ??= this.dump.request;
+			this.dump.attempts ??= [];
+			const attempts = this.dump.attempts;
+			if (attempts.length < 16) {
+				const preview = new BoundedUtf8Capture(64 * 1024);
+				preview.append(JSON.stringify(this.dump.request));
+				attempts.push({
+					requestText:
+						preview.text() +
+						(preview.received > preview.kept ? "\n[request preview truncated]" : ""),
+					response: this.dump.response,
+				});
+			} else this.dump.attemptsTruncated = true;
+		}
+		this.responseBudgetUsed += this.responseCapture?.kept ?? 0;
+		this.responseCapture = new BoundedUtf8Capture(
+			Math.max(0, responseDumpBudget(maxBytes) - this.responseBudgetUsed),
+		);
+		this.dump.response = { bodyIncomplete: true };
+		this.setRequest(request);
+	}
+
+	appendResponseText(value: string | Uint8Array): void {
+		this.responseCapture?.append(value);
+	}
+
+	finishResponseCapture(complete: boolean): void {
+		if (this.responseCapture) this.setResponseMeta({ bodyIncomplete: !complete });
+		this.flushResponseCapture();
+	}
+
+	private flushResponseCapture(): void {
+		const capture = this.responseCapture;
+		if (!capture) return;
+		this.setResponseMeta({
+			bodyText: capture.text(),
+			bodyBytesReceived: capture.received,
+			bodyBytesKept: capture.kept,
+			bodyTruncated: capture.received > capture.kept,
+		});
+	}
 
 	constructor(initial?: ApiRequestDump) {
 		this.dump = toJsonSafe(initial ?? {});
@@ -115,12 +274,14 @@ export class ApiRequestDumpCollector {
 	}
 
 	setResponseBodyTextWithLimit(bodyText: string, maxSize: number): void {
-		if (maxSize < 0 || bodyText.length <= maxSize) {
-			this.setResponseBodyText(bodyText);
-			return;
-		}
-		const truncated = `${bodyText.slice(0, maxSize)}\n\n[... truncated ${bodyText.length - maxSize} bytes]`;
-		this.setResponseBodyText(truncated);
+		const capture = new BoundedUtf8Capture(maxSize);
+		capture.append(bodyText);
+		this.setResponseMeta({
+			bodyText: capture.text(),
+			bodyBytesReceived: capture.received,
+			bodyBytesKept: capture.kept,
+			bodyTruncated: capture.received > capture.kept,
+		});
 	}
 
 	setResponseEvents(events: unknown[]): void {
@@ -162,7 +323,12 @@ export class ApiRequestDumpCollector {
 
 	setResponseError(error: unknown): void {
 		const message = error instanceof Error ? error.message : String(error);
-		this.setResponseMeta({ error: message });
+		const capture = new BoundedUtf8Capture(8192);
+		capture.append(message);
+		this.setResponseMeta({
+			error: capture.text(),
+			errorTruncated: capture.received > capture.kept,
+		});
 	}
 
 	setDiagnostics(diagnostics: ApiRequestDiagnostics | undefined): void {
@@ -182,6 +348,7 @@ export class ApiRequestDumpCollector {
 	}
 
 	snapshot(): ApiRequestDump {
+		this.flushResponseCapture();
 		return toJsonSafe(this.dump);
 	}
 }

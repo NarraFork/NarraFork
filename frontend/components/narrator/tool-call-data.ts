@@ -64,8 +64,8 @@ export interface ToolCallData {
 	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
 	_subagentActivity?: SubagentActivitySummary;
 	/**
-	 * Child narrator id of a RUNNING `Await({type:"agent"})`, resolved by the server
-	 * from the call's target selector.
+	 * Child narrator id of a RUNNING Await-agent or single-target Send, resolved
+	 * by the server from the call's target selector (legacy transport field name).
 	 *
 	 * A wait in flight has no output, so `metadata.subagentId` and the
 	 * `<subagent_id>` tag do not exist yet — this is the only source that lets the

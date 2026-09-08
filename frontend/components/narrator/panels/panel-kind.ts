@@ -16,8 +16,11 @@
  * migration) can depend on it without pulling in panel components.
  */
 
+import type { FileSelection } from "@shared/file-reference";
+import { localFileDirectory } from "@shared/markdown-file-path";
 import type { PluginDockPanelParams } from "../../plugins/protocol";
 import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
+import { isToolEditReference, type ToolEditReference } from "../tool-edit-reference";
 
 /**
  * Every panel kind that can appear on any surface.
@@ -125,7 +128,18 @@ export function nextHighlightRequestId(): string {
  * serialization — `stripIdentityFromLayout` only removes host identity
  * (narratorId / chapterId).
  */
-export interface FilePanelParams {
+/** Navigation is transient; device/path and toolEdit are persisted resource identity. */
+export interface FileOpenOptions {
+	deviceId?: string;
+	/** Historical edit identity; never replace this resource with the current disk file. */
+	toolEdit?: ToolEditReference;
+	/** Sticky read boundary: references cannot fall back to legacy filesystem routes. */
+	referenceOrigin?: boolean;
+	selection?: FileSelection;
+	highlightRequestId?: string;
+}
+
+export interface FilePanelParams extends FileOpenOptions {
 	panelType: "file";
 	/** Absolute path of the file being viewed. */
 	filePath: string;
@@ -133,6 +147,57 @@ export interface FilePanelParams {
 	fileName?: string;
 	/** Owning root narrator cluster (required by workspace surfaces). */
 	hostNarratorId?: string;
+}
+
+/** Use the shared dirname grammar on raw target paths; POSIX backslashes are filename bytes. */
+export function filePanelBaseName(filePath: string): string {
+	const directory = localFileDirectory(filePath);
+	if (directory === "." && !filePath.startsWith("./")) return filePath;
+	// Windows normalization changes separator characters, not their UTF-16 length.
+	const separator = filePath[directory.length];
+	const start = directory.length + (separator === "/" || separator === "\\" ? 1 : 0);
+	return filePath.slice(start) || filePath;
+}
+
+/** Graph drag payloads historically carried a plain local path. Keep that form local-only. */
+export function filePanelResourceId(
+	filePath: string,
+	deviceId = "local",
+	referenceOrigin = false,
+	toolEdit?: ToolEditReference,
+): string {
+	if (toolEdit) return JSON.stringify([deviceId, filePath, referenceOrigin, toolEdit]);
+	if (referenceOrigin) return JSON.stringify([deviceId, filePath, true]);
+	return deviceId === "local" ? filePath : JSON.stringify([deviceId, filePath]);
+}
+
+/** Decode a device-scoped drag identity without guessing the current/default device. */
+export function filePanelResourceParams(
+	resourceId: string,
+): Pick<FilePanelParams, "filePath" | "deviceId" | "referenceOrigin" | "toolEdit"> {
+	if (resourceId.startsWith("[")) {
+		try {
+			const value: unknown = JSON.parse(resourceId);
+			if (
+				Array.isArray(value) &&
+				(value.length === 2 ||
+					(value.length === 3 && value[2] === true) ||
+					(value.length === 4 && typeof value[2] === "boolean" && isToolEditReference(value[3]))) &&
+				typeof value[0] === "string" &&
+				typeof value[1] === "string"
+			) {
+				return {
+					deviceId: value[0],
+					filePath: value[1],
+					...(value[2] === true ? { referenceOrigin: true } : {}),
+					...(value.length === 4 ? { toolEdit: value[3] as ToolEditReference } : {}),
+				};
+			}
+		} catch {
+			// Old local paths are not JSON.
+		}
+	}
+	return { filePath: resourceId, deviceId: "local" };
 }
 
 /**

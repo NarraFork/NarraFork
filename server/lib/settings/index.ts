@@ -90,6 +90,7 @@ export {
 	registerOpenaiModelLister,
 	resolveAggregation,
 	resolveAllowedModelCandidate,
+	resolveAllowedModelCandidateMatch,
 	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
 	resolveModelContextWindow,

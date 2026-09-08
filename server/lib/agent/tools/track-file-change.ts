@@ -25,12 +25,27 @@ export async function trackFileChange(
 	action: "write" | "edit" | "bash" = "edit",
 	backend: ExecutionBackend = localBackend,
 	lineStats?: { added: number; removed: number } | null,
+	options?: { evidenceRecorded: boolean },
 ): Promise<void> {
-	// Team file-change tracking (subagents only)
-	if (ctx.parentNarratorId) {
-		const { recordTeamFileChange } = await import("@server/services/narrator-subagent");
-		recordTeamFileChange(ctx.parentNarratorId, ctx.narratorId, filePath);
+	// Team file-change tracking (subagents only). A UI projection failure cannot
+	// turn a durably settled mutation into a failed execution.
+	try {
+		if (ctx.parentNarratorId) {
+			const { recordTeamFileChange } = await import("@server/services/narrator-subagent");
+			recordTeamFileChange(ctx.parentNarratorId, ctx.narratorId, filePath, {
+				deviceId: backend.deviceId,
+				workspacePath:
+					backend.kind === "local"
+						? ctx.cwd
+						: (ctx.executionTarget?.cwd ?? backend.defaultCwd ?? null),
+			});
+		}
+	} catch {
+		// Rebuildable team display, not mutation evidence.
 	}
+	// The local v2 runtime already persisted exactly one effect projection. Never
+	// add a legacy row for it or write a decoded first-touch baseline again.
+	if (options?.evidenceRecorded) return;
 
 	// File attribution (all narrators, including standalone)
 	try {

@@ -1,14 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import type { DockviewApi } from "dockview-react";
+import type { DockviewApi, DockviewWillShowOverlayLocationEvent } from "dockview-react";
 import { parseHTML } from "linkedom";
 import type { PanelDragState } from "../../lib/panel-drag";
+import { type DropIndicator, resolveNativeDrop, toIndicator } from "./drop-intent";
 import type { DockviewDropTarget } from "./useDockviewDnd";
 import {
+	bindNativeDropPreview,
 	canSurfaceHandleDrag,
 	DOCKVIEW_SURFACE_ATTR,
 	dropExistingPanel,
 	isLocalPanelDrag,
 	isTopmostSurface,
+	NATIVE_DROP_PREVIEW_CLASS,
 } from "./useDockviewDnd";
 
 /**
@@ -37,6 +40,17 @@ function makeApi(
 
 	const groupObjs = groups.map((id, i) => ({
 		id,
+		activePanel: { id: Object.keys(panels).find((key) => panels[key].groupId === id) },
+		element: {
+			getBoundingClientRect: () => ({
+				left: i * 500,
+				right: (i + 1) * 500,
+				top: 0,
+				bottom: 800,
+				width: 500,
+				height: 800,
+			}),
+		},
 		// Each group reports a panels array sized by groupPanelCount of any panel
 		// that belongs to it (default 1) so `group.panels.length` is meaningful.
 		get panels() {
@@ -69,12 +83,39 @@ function makeApi(
 	};
 
 	const api = {
+		id: "native-surface",
 		groups: groupObjs,
 		getPanel: (id: string) => (panels[id] ? makePanel(id) : undefined),
 	} as unknown as DockviewApi;
 
 	return { api, moves, activated };
 }
+
+describe("native drop resolution → preview → panel mutation", () => {
+	test.each([
+		{ x: 650, intent: "merge", move: { group: "g2", index: 1 } },
+		{ x: 750, intent: "swap", move: { group: "g2", position: "right" } },
+		{ x: 550, intent: "left", move: { group: "g2", position: "left" } },
+	])("$intent uses the same intent for paint and mutation", ({ x, intent, move }) => {
+		const { api, moves } = makeApi({ a: { groupId: "g1" }, b: { groupId: "g2" } }, ["g1", "g2"]);
+		const resolved = resolveNativeDrop(api, {
+			kind: "content",
+			group: api.groups[1],
+			nativeEvent: { clientX: x, clientY: 400 },
+			getData: () => ({ viewId: api.id, panelId: "a" }),
+		});
+		expect(resolved).not.toBeNull();
+		if (!resolved) throw new Error("expected native drop target");
+		expect(toIndicator(resolved.hit).variant).toBe(intent);
+		dropExistingPanel(api, resolved.panelId, {
+			groupId: resolved.hit.group.id,
+			intent: resolved.hit.intent,
+			targetPanelId: resolved.hit.targetPanelId,
+		});
+		expect(moves).toHaveLength(1);
+		expect(moves[0]).toMatchObject({ panel: "a", ...move });
+	});
+});
 
 describe("dropExistingPanel", () => {
 	test("no-op when panel or target group is missing", () => {
@@ -299,6 +340,148 @@ function surfaceStack(html: string): { doc: Document; el: (id: string) => Elemen
 		},
 	};
 }
+
+describe("native drop preview lifecycle", () => {
+	function setup() {
+		const { document, window } = parseHTML(
+			'<html><body><div id="surface"><div id="childA"></div><div id="childB"></div></div><div id="outside"></div></body></html>',
+		);
+		const root = document.getElementById("surface") as unknown as HTMLElement;
+		root.getBoundingClientRect = () =>
+			({ left: 0, top: 0, right: 1000, bottom: 800, width: 1000, height: 800 }) as DOMRect;
+		const { api } = makeApi({ a: { groupId: "g1" }, b: { groupId: "g2" } }, ["g1", "g2"]);
+		let listener: ((event: DockviewWillShowOverlayLocationEvent) => void) | null = null;
+		Object.defineProperty(api, "onWillShowOverlay", {
+			value: (callback: typeof listener) => {
+				listener = callback;
+				return {
+					dispose: () => {
+						listener = null;
+					},
+				};
+			},
+		});
+		const indicators: (DropIndicator | null)[] = [];
+		const stop = bindNativeDropPreview(api, root, (indicator) => {
+			// Must hide the native layer BEFORE the React render is even requested.
+			expect(root.classList.contains(NATIVE_DROP_PREVIEW_CLASS)).toBe(indicator !== null);
+			indicators.push(indicator);
+		});
+		const hover = (kind = "content", x = 650, prevented = false) => {
+			listener?.({
+				kind,
+				group: api.groups[1],
+				defaultPrevented: prevented,
+				nativeEvent: { clientX: x, clientY: 400 },
+				getData: () => ({ viewId: api.id, panelId: "a" }),
+				preventDefault: () => {
+					throw new Error("preview must not disable native dropping");
+				},
+			} as unknown as DockviewWillShowOverlayLocationEvent);
+		};
+		const fire = (type: string, target = "childA", fields: Record<string, unknown> = {}) => {
+			const event = new window.Event(type, { bubbles: true });
+			Object.assign(event, { clientX: 650, clientY: 400, relatedTarget: null, ...fields });
+			document.getElementById(target)?.dispatchEvent(event);
+		};
+		return { root, document, indicators, stop, hover, fire };
+	}
+
+	test("child dragleave with/without relatedTarget never clears or remounts the preview", () => {
+		const { root, document, indicators, hover, fire, stop } = setup();
+		try {
+			hover();
+			fire("dragleave", "childA", { relatedTarget: document.getElementById("childB") });
+			fire("dragleave", "childA");
+			fire("dragleave", "outside");
+			hover();
+			expect(indicators).toHaveLength(1);
+			expect(indicators[0]?.variant).toBe("merge");
+			expect(root.classList.contains(NATIVE_DROP_PREVIEW_CLASS)).toBe(true);
+			hover("content", 750);
+			expect(indicators.map((i) => i?.variant)).toEqual(["merge", "swap"]);
+		} finally {
+			stop();
+		}
+	});
+
+	test.each(["tab", "header_space", "edge"])("%s hands paint back to Dockview", (kind) => {
+		const { root, hover, indicators, stop } = setup();
+		try {
+			hover();
+			hover(kind);
+			expect(root.classList.contains(NATIVE_DROP_PREVIEW_CLASS)).toBe(false);
+			expect(indicators[1]).toBeNull();
+		} finally {
+			stop();
+		}
+	});
+
+	test.each(["drop", "dragend", "pointerup", "pointercancel"])("%s clears once", (type) => {
+		const { root, hover, fire, indicators, stop } = setup();
+		try {
+			hover();
+			fire(type);
+			fire(type);
+			expect(indicators).toHaveLength(2);
+			expect(indicators[1]).toBeNull();
+			expect(root.classList.contains(NATIVE_DROP_PREVIEW_CLASS)).toBe(false);
+		} finally {
+			stop();
+		}
+	});
+
+	test("real surface exit, Escape and vetoed overlays clear", () => {
+		const { root, hover, fire, indicators, stop } = setup();
+		try {
+			hover();
+			fire("dragleave", "childA", { clientX: 1100 });
+			expect(indicators.at(-1)).toBeNull();
+			hover();
+			fire("keydown", "childA", { key: "Escape" });
+			expect(indicators.at(-1)).toBeNull();
+			hover();
+			hover("content", 650, true);
+			expect(indicators.at(-1)).toBeNull();
+			hover();
+			fire("dragleave", "surface");
+			expect(root.classList.contains(NATIVE_DROP_PREVIEW_CLASS)).toBe(false);
+		} finally {
+			stop();
+		}
+	});
+
+	test("dispose removes the suppression and detaches all event handling", () => {
+		const { root, hover, fire, indicators, stop } = setup();
+		hover();
+		stop();
+		expect(root.classList.contains(NATIVE_DROP_PREVIEW_CLASS)).toBe(false);
+		const count = indicators.length;
+		hover();
+		fire("dragend");
+		expect(indicators).toHaveLength(count);
+	});
+
+	test("idle pointer movement does not measure every mounted dock", () => {
+		const { root, fire, hover, indicators, stop } = setup();
+		try {
+			let measurements = 0;
+			const measure = root.getBoundingClientRect;
+			root.getBoundingClientRect = () => {
+				measurements++;
+				return measure();
+			};
+			fire("pointermove");
+			expect(measurements).toBe(0);
+			hover();
+			fire("pointermove", "outside", { clientX: 1100 });
+			expect(measurements).toBe(1);
+			expect(indicators.at(-1)).toBeNull();
+		} finally {
+			stop();
+		}
+	});
+});
 
 describe("isTopmostSurface", () => {
 	const html = `

@@ -1,12 +1,15 @@
 package handlers
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
+	"time"
 )
 
 // FsStat returns existence + type + size for a path.
@@ -75,7 +78,13 @@ func (h *Handlers) openReadFile(params map[string]any) (*os.File, string, error)
 		}
 	}
 
-	f, err := os.Open(resolvedPath)
+	flags := os.O_RDONLY
+	if expectedPath != "" {
+		// POSIX FIFOs swapped in after stat must not hang open before type checking.
+		// Windows ignores O_NONBLOCK; its regular-file validation still applies.
+		flags |= syscall.O_NONBLOCK
+	}
+	f, err := os.OpenFile(resolvedPath, flags, 0)
 	if err != nil {
 		return nil, "", err
 	}
@@ -117,36 +126,129 @@ func (h *Handlers) openReadFile(params map[string]any) (*os.File, string, error)
 // expectedResolvedPath is present, no bytes are returned unless openReadFile has
 // atomically verified the opened object against that canonical identity.
 func (h *Handlers) FsRead(params map[string]any) (any, error) {
+	return h.FsReadContext(context.Background(), params)
+}
+
+// FsReadContext preserves the wire result while making protected reads cancellable.
+// The extra byte detects growth, and the final identity check precedes serialization.
+func (h *Handlers) FsReadContext(parent context.Context, params map[string]any) (any, error) {
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	timeoutMs := intParam(params, "timeoutMs", 120000)
+	if timeoutMs <= 0 || timeoutMs > 120000 {
+		return nil, fmt.Errorf("invalid read timeout")
+	}
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutMs)*time.Millisecond)
+	defer cancel()
 	f, resolvedPath, err := h.openReadFile(params)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-
+	// Closing on cancellation also unblocks filesystems whose reads are pollable.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			f.Close()
+		case <-done:
+		}
+	}()
 	maxBytes := intParam(params, "maxBytes", h.maxRpcBytes)
 	if maxBytes <= 0 || maxBytes > h.maxRpcBytes {
 		maxBytes = h.maxRpcBytes
 	}
-
 	info, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
-	totalSize := info.Size()
-
-	buf := make([]byte, maxBytes)
-	n, err := io.ReadFull(f, buf)
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("refusing to read non-regular file")
+	}
+	check := func() error {
+		if err := parent.Err(); err != nil {
+			return err
+		}
+		return ctx.Err()
+	}
+	buf, probeTruncated, err := readFileChunks(ctx, f, maxBytes, check)
+	if err != nil {
 		return nil, err
 	}
-	truncated := totalSize > int64(n)
-
+	finalInfo, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if stringParam(params, "expectedResolvedPath") != "" {
+		currentPath, err := h.guard.CheckExisting(stringParam(params, "path"))
+		if err != nil {
+			return nil, err
+		}
+		if !samePath(currentPath, resolvedPath) {
+			return nil, fmt.Errorf("resolved path changed while reading")
+		}
+		currentInfo, err := os.Stat(currentPath)
+		if err != nil {
+			return nil, err
+		}
+		if !os.SameFile(info, currentInfo) || !os.SameFile(finalInfo, currentInfo) {
+			return nil, fmt.Errorf("opened file identity changed while reading")
+		}
+	}
+	if err := check(); err != nil {
+		return nil, err
+	}
+	totalSize := info.Size()
+	if finalInfo.Size() > totalSize {
+		totalSize = finalInfo.Size()
+	}
+	if int64(len(buf)) > totalSize {
+		totalSize = int64(len(buf))
+	}
 	return map[string]any{
-		"dataB64":      base64.StdEncoding.EncodeToString(buf[:n]),
-		"truncated":    truncated,
+		"dataB64":      base64.StdEncoding.EncodeToString(buf),
+		"truncated":    probeTruncated || totalSize > int64(len(buf)),
 		"totalSize":    totalSize,
 		"resolvedPath": resolvedPath,
 	}, nil
+}
+
+func readFileChunks(ctx context.Context, reader io.Reader, maxBytes int64, check func() error) ([]byte, bool, error) {
+	buf := make([]byte, maxBytes+1)
+	n := 0
+	for n < len(buf) {
+		if err := check(); err != nil {
+			return nil, false, err
+		}
+		end := n + 64*1024
+		if end > len(buf) {
+			end = len(buf)
+		}
+		count, err := reader.Read(buf[n:end])
+		n += count
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if ctx.Err() != nil {
+				return nil, false, ctx.Err()
+			}
+			return nil, false, err
+		}
+		if count == 0 {
+			return nil, false, io.ErrNoProgress
+		}
+	}
+	if err := check(); err != nil {
+		return nil, false, err
+	}
+	truncated := int64(n) > maxBytes
+	if truncated {
+		n = int(maxBytes)
+	}
+	return buf[:n], truncated, nil
 }
 
 // FsWrite writes base64 content to a path (creating parent dirs). When

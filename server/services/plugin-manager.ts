@@ -17,6 +17,7 @@ import {
 	type PermissionScope,
 	permissionScopeSchema,
 } from "@server/lib/plugins/permissions";
+import { PROVIDER_REQUEST_MAX_BYTES } from "@server/lib/plugins/protocol";
 import { markExtraSearchChannelsReady } from "@server/lib/search/plugin-source";
 import { normalizeSearchSettings } from "@server/lib/search/settings";
 import { saveSettings, settings } from "@server/lib/settings";
@@ -2236,6 +2237,10 @@ export class PluginManager {
 			cwd,
 			runner,
 			rpcProtocol: server.protocol,
+			// Provider calls include full histories; keep all plugin-to-host frame limits small.
+			...(context.manifest.contributes.providers.length > 0
+				? { maxOutboundFrameBytes: PROVIDER_REQUEST_MAX_BYTES }
+				: {}),
 			hostApiVersion: HOST_API_VERSION,
 			grantedCapabilities: context.state.grants.capabilities,
 			activationReason: context.reason,
@@ -3252,6 +3257,7 @@ export const pluginManager = new PluginManager({
 	toolRegistry: pluginPlatformServices.toolRegistry,
 	agentToolBridge: pluginPlatformServices.toolBridge,
 	contributionCoordinator: pluginPlatformServices.contributionCoordinator,
+	providerCatalogRefresher: pluginPlatformServices.providerCatalogRefresher,
 	lifecycleRevokeCoordinator: pluginPlatformServices.lifecycleRevokeCoordinator,
 	restorePluginLifecycle: pluginPlatformServices.restorePlugin,
 });

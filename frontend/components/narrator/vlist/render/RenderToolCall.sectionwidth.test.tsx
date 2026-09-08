@@ -47,15 +47,32 @@ beforeAll(async () => {
 
 const CONTENT_WIDTH = 600;
 
+function textBody(
+	text: string,
+	markdown = false,
+): import("@shared/pretext-layout/tool-detail").ToolCappedDetail {
+	return {
+		kind: "capped",
+		cap: "code",
+		id: "call:output.main",
+		source: "output.main",
+		format: markdown ? "markdown" : "code",
+		live: false,
+		followTarget: { kind: "end" },
+		text,
+	};
+}
+
 type ToolDetailSection = import("../measure/measure-tool-call").ToolDetailSection;
 
 /** A failed WebSearch's real shape: a query meta row + a markdown output section. */
 function markdownOutputSections(text: string): ToolDetailSection[] {
 	return [
-		{ body: { kind: "meta-rows", rows: [{ text: "some query", mono: true }] } },
+		{ key: "meta.query", body: { kind: "meta-rows", rows: [{ text: "some query", mono: true }] } },
 		{
+			key: "output.main",
 			label: "output",
-			body: { kind: "capped", cap: "code", contentLines: 1, hasLabel: false, text, markdown: true },
+			body: textBody(text, true),
 		},
 	];
 }
@@ -85,11 +102,11 @@ function render(node: ReactNode): Element {
 /** Every `overflow` scroll box paired with the width of its painted child. */
 function scrollBoxes(root: Element): Array<{ style: string; childWidth: number | null }> {
 	const out: Array<{ style: string; childWidth: number | null }> = [];
-	for (const el of Array.from(root.querySelectorAll("div"))) {
+	for (const el of Array.from(root.querySelectorAll("[data-content-scrollport]"))) {
 		const style = el.getAttribute("style") ?? "";
 		if (!/overflow(-[xy])?:\s*(auto|hidden)/.test(style) || !/overflow-y:\s*auto/.test(style))
 			continue;
-		const child = el.firstElementChild;
+		const child = el.querySelector("[data-tool-markdown]");
 		const childStyle = child?.getAttribute("style") ?? "";
 		const match = /(?:^|;)\s*width:\s*([\d.]+)px/.exec(childStyle);
 		out.push({ style, childWidth: match ? Number(match[1]) : null });
@@ -135,11 +152,11 @@ describe("a section's markdown body is painted at its wrap width", () => {
 		]) {
 			const measured = measureCard(markdownOutputSections(text));
 			const section = measured.detail?.sections?.at(-1);
-			expect(section?.markdown).toBe(true);
+			expect(section?.measuredBody.markdown).toBe(true);
 			// What the measure layer wrapped at IS what the render layer paints at.
 			const boxes = scrollBoxes(render(<RenderToolCall measured={measured} />));
 			const painted = boxes.find((b) => b.childWidth != null)?.childWidth;
-			expect(painted).toBe(section?.bodyContentWidth);
+			expect(painted).toBe(section?.measuredBody.contentWidth);
 		}
 	});
 
@@ -148,7 +165,7 @@ describe("a section's markdown body is painted at its wrap width", () => {
 		// would be a no-op and the test would silently stop protecting anything.
 		const measured = measureCard(markdownOutputSections("one line"));
 		const section = measured.detail?.sections?.at(-1);
-		expect(section?.bodyContentWidth).toBe(
+		expect(section?.measuredBody.contentWidth).toBe(
 			(measured.detail?.contentWidth ?? 0) - measureMod.DETAIL_BOX_CHROME_X,
 		);
 	});
@@ -158,11 +175,11 @@ describe("a section's markdown body is painted at its wrap width", () => {
 		// the padding around already-wrapped text), so narrowing every section would
 		// have been the mirror-image bug.
 		const measured = measureCard([
-			{ label: "output", body: { kind: "capped", cap: "code", contentLines: 1, text: "plain" } },
+			{ key: "output.main", label: "output", body: textBody("plain") },
 		]);
 		const section = measured.detail?.sections?.at(-1);
-		expect(section?.markdown).toBe(false);
-		expect(section?.bodyContentWidth).toBe(measured.detail?.contentWidth);
+		expect(section?.measuredBody.markdown).toBeUndefined();
+		expect(section?.measuredBody.contentWidth).toBe(measured.detail?.contentWidth);
 	});
 });
 
@@ -189,12 +206,13 @@ describe("a wrapped body box never offers horizontal scrolling", () => {
 
 	it("a WRAPPED plain capped body hides the horizontal axis", () => {
 		const measured = measureCard([
-			{ label: "output", body: { kind: "capped", cap: "code", contentLines: 1, text: "plain" } },
+			{ key: "output.main", label: "output", body: textBody("plain") },
 		]);
 		const targets = [
 			{
-				id: "tool-x:s0",
-				slot: "s0",
+				id: "call:output.main",
+				slot: "output.main",
+				owner: { specKey: "tool-x" },
 				kind: "code" as const,
 				text: "plain",
 			},
@@ -217,12 +235,13 @@ describe("a wrapped body box never offers horizontal scrolling", () => {
 		// The policy must not overshoot: with wrap off the reader scrolled
 		// horizontally ON PURPOSE, and the whole point of `pre` is long lines.
 		const measured = measureCard([
-			{ label: "output", body: { kind: "capped", cap: "code", contentLines: 1, text: "plain" } },
+			{ key: "output.main", label: "output", body: textBody("plain") },
 		]);
 		const targets = [
 			{
-				id: "tool-x:s0",
-				slot: "s0",
+				id: "call:output.main",
+				slot: "output.main",
+				owner: { specKey: "tool-x" },
 				kind: "code" as const,
 				text: "plain",
 			},

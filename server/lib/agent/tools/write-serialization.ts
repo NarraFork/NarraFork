@@ -49,9 +49,29 @@ export async function withWorkspaceWriteLock<T>(
 	backend: Pick<ExecutionBackend, "deviceId">,
 	workspacePath: string,
 	fn: () => Promise<T>,
+	/** Admission only: aborting after entry never releases a running write window. */
+	signal?: AbortSignal,
 ): Promise<T> {
+	signal?.throwIfAborted();
 	if (backend.deviceId !== LOCAL_DEVICE_ID) return fn();
-	return worktreeWriteLock.acquire(writeLockKey(workspacePath), fn);
+	const key = writeLockKey(workspacePath);
+	if (!signal) return worktreeWriteLock.acquire(key, fn);
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => {
+			signal.removeEventListener("abort", onAbort);
+			reject(signal.reason);
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		void worktreeWriteLock
+			.acquire(key, async () => {
+				signal.removeEventListener("abort", onAbort);
+				// A cancelled waiter retains its FIFO slot until its predecessor ends.
+				// It then drains without IO; never release the predecessor's lock early.
+				signal.throwIfAborted();
+				return fn();
+			})
+			.then(resolve, reject);
+	});
 }
 
 export interface BashSerializationDecision {

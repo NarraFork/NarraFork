@@ -402,10 +402,14 @@ export interface RunnerStartOptions {
 	totalTimeoutMs?: number;
 	maxStderrBytes?: number;
 	maxStderrBytesPerSecond?: number;
+	/** Host-to-plugin budget; must not enlarge the stdout parser limit. */
+	maxOutboundBodyBytes?: number;
 }
 
 export interface PluginProcessHandle {
 	readonly pid?: number;
+	readonly maxInboundFrameBytes?: number;
+	readonly maxOutboundFrameBytes?: number;
 	readonly exited: Promise<number>;
 	send(message: JsonRpcEnvelope): Promise<void>;
 	onMessage(handler: (message: JsonRpcEnvelope) => void): () => void;
@@ -426,6 +430,8 @@ export interface LocalProcessResourceLimits {
 }
 
 export interface LocalProcessRunnerOptions extends ContentLengthFrameParserOptions {
+	/** Explicit runner-side ceiling on host-to-plugin frames. */
+	maxOutboundBodyBytes?: number;
 	spawn?: PluginProcessSpawner;
 	allowedCwdRoots?: string[];
 	allowedCwds?: string[];
@@ -459,6 +465,16 @@ export class LocalProcessRunner {
 
 	async start(options: RunnerStartOptions): Promise<PluginProcessHandle> {
 		validateCommand(options.command);
+		const maxOutboundBodyBytes = Math.min(
+			options.maxOutboundBodyBytes ??
+				this.options.maxOutboundBodyBytes ??
+				this.options.maxBodyBytes ??
+				DEFAULT_MAX_FRAME_BYTES,
+			this.options.maxOutboundBodyBytes ?? Number.MAX_SAFE_INTEGER,
+		);
+		if (!Number.isSafeInteger(maxOutboundBodyBytes) || maxOutboundBodyBytes <= 0) {
+			throw new RangeError("maxOutboundBodyBytes must be a positive safe integer");
+		}
 		validateCwd(options.cwd, this.options.allowedCwdRoots, this.options.allowedCwds);
 		if (options.signal?.aborted) throw createAbortError(options.signal.reason);
 
@@ -494,6 +510,7 @@ export class LocalProcessRunner {
 			totalTimeoutMs:
 				options.totalTimeoutMs ?? this.options.totalTimeoutMs ?? DEFAULT_TOTAL_TIMEOUT_MS,
 			maxBodyBytes: this.options.maxBodyBytes ?? DEFAULT_MAX_FRAME_BYTES,
+			maxOutboundBodyBytes,
 			maxStdoutBytes: this.options.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES,
 			stderrRingBytes: this.options.stderrRingBytes ?? DEFAULT_STDERR_RING_BYTES,
 			maxStderrBytes:
@@ -515,6 +532,7 @@ interface LocalProcessHandleOptions extends RunnerStartOptions {
 	killProcessTree: boolean;
 	maxHeaderBytes?: number;
 	maxBodyBytes?: number;
+	maxOutboundBodyBytes?: number;
 }
 
 class LocalProcessHandleImpl implements PluginProcessHandle {
@@ -583,6 +601,14 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 		}
 	}
 
+	get maxInboundFrameBytes(): number {
+		return this.options.maxBodyBytes ?? DEFAULT_MAX_FRAME_BYTES;
+	}
+
+	get maxOutboundFrameBytes(): number {
+		return this.options.maxOutboundBodyBytes ?? this.maxInboundFrameBytes;
+	}
+
 	send(message: JsonRpcEnvelope): Promise<void> {
 		if (this.closed || this.killed) {
 			return Promise.reject(
@@ -593,10 +619,7 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 			);
 		}
 		const bodyBytes = textEncoder.encode(JSON.stringify(message));
-		if (
-			this.options.maxBodyBytes !== undefined &&
-			bodyBytes.byteLength > this.options.maxBodyBytes
-		) {
+		if (bodyBytes.byteLength > this.maxOutboundFrameBytes) {
 			return Promise.reject(
 				new PluginRuntimeError("Outbound RPC frame exceeded the body limit", {
 					code: "OUTBOUND_FRAME_LIMIT",
@@ -1116,6 +1139,8 @@ export interface PluginRuntimeOptions {
 	contributionId?: string;
 	inboundTimeoutMs?: number;
 	maxFrameBytes?: number;
+	/** Independent cap for host-to-plugin frames such as complete provider histories. */
+	maxOutboundFrameBytes?: number;
 	maxQueuedBytes?: number;
 	controlReserveBytes?: number;
 	maxQueuedMessages?: number;
@@ -1277,6 +1302,7 @@ export class PluginRuntime {
 				generation,
 				idleTimeoutMs: this.options.idleTimeoutMs,
 				totalTimeoutMs: this.options.totalTimeoutMs,
+				maxOutboundBodyBytes: this.options.maxOutboundFrameBytes ?? this.options.maxFrameBytes,
 			});
 			const injectedRequestHandler =
 				this.options.requestHandler ?? this.options.inboundRequestHandler;
@@ -1293,7 +1319,16 @@ export class PluginRuntime {
 				transport: this.handle,
 				generation,
 				maxInFlight: this.options.maxInFlight ?? 16,
-				maxFrameBytes: this.options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES,
+				maxFrameBytes: Math.min(
+					this.options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES,
+					this.handle.maxInboundFrameBytes ?? Number.MAX_SAFE_INTEGER,
+				),
+				maxOutboundFrameBytes: Math.min(
+					this.options.maxOutboundFrameBytes ??
+						this.options.maxFrameBytes ??
+						DEFAULT_MAX_FRAME_BYTES,
+					this.handle.maxOutboundFrameBytes ?? Number.MAX_SAFE_INTEGER,
+				),
 				maxQueuedBytes: this.options.maxQueuedBytes,
 				controlReserveBytes: this.options.controlReserveBytes,
 				maxQueuedMessages: this.options.maxQueuedMessages,
@@ -1366,11 +1401,7 @@ export class PluginRuntime {
 					generation,
 					capabilities: [...(this.options.grantedCapabilities ?? [])],
 					features: this.negotiatedFeatures,
-					limits: {
-						maxInboundFrameBytes: this.options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES,
-						maxInFlight: this.options.maxInFlight ?? 16,
-						maxQueuedBytes: this.options.maxQueuedBytes ?? 8 * 1024 * 1024,
-					},
+					limits: this.connection.getLimits(),
 				},
 				"initialized",
 				this.timeouts.handshakeMs,

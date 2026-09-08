@@ -1,4 +1,7 @@
+import { notifications } from "@mantine/notifications";
+import type { SubagentModelPools } from "@shared/subagent-model-policy";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import {
 	ApiError,
 	api,
@@ -8,6 +11,7 @@ import {
 	type WhitelistCmd,
 	type WhitelistDir,
 } from "../lib/api";
+import { type ToolCallDetailRef, toolCallDetailQueryKey } from "../lib/api/narrators";
 import type {
 	CommandBlacklistRuleInput,
 	CommandWhitelistRuleInput,
@@ -321,6 +325,7 @@ export function useCancelAskInPassing() {
 
 export function useResumeRecoverySubagents() {
 	const qc = useQueryClient();
+	const { t } = useTranslation("narrator");
 	return useMutation({
 		mutationFn: ({
 			narratorId,
@@ -333,9 +338,26 @@ export function useResumeRecoverySubagents() {
 			subagentIds: string[];
 			mode: "notify" | "await";
 		}) => api.resumeRecoverySubagents(narratorId, { messageId, subagentIds, mode }),
-		onSuccess: (_data, { narratorId }) => {
+		onSuccess: (data, { narratorId }) => {
 			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "messages"] });
 			qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
+			if (data.skipped.length > 0) {
+				notifications.show({
+					color: "orange",
+					title: t("subagentRecoveryPartial", {
+						resumed: data.resumed,
+						skipped: data.skipped.length,
+					}),
+					message: data.skipped.map((entry) => `${entry.id}: ${entry.reason}`).join("\n"),
+				});
+			}
+		},
+		onError: (error) => {
+			notifications.show({
+				color: "red",
+				title: t("subagentRecoveryFailed"),
+				message: error.message,
+			});
 		},
 	});
 }
@@ -376,10 +398,15 @@ export function useNarratorUsageStats(narratorId: string, includeSubagents = tru
 	});
 }
 
-export function useToolCallDetail(narratorId: string, toolUseId: string, enabled: boolean) {
+export function useToolCallDetail(
+	narratorId: string,
+	toolUseId: string,
+	enabled: boolean,
+	ref?: ToolCallDetailRef,
+) {
 	return useQuery({
-		queryKey: ["narrators", narratorId, "tool-calls", toolUseId],
-		queryFn: () => api.getToolCallDetail(narratorId, toolUseId),
+		queryKey: toolCallDetailQueryKey(narratorId, toolUseId, ref),
+		queryFn: ({ signal }) => api.getToolCallDetail(narratorId, toolUseId, ref, signal),
 		enabled: !!narratorId && !!toolUseId && enabled,
 		staleTime: TOOL_CALL_DETAIL_QUERY_GC_TIME_MS,
 		gcTime: TOOL_CALL_DETAIL_QUERY_GC_TIME_MS,
@@ -865,14 +892,10 @@ export function useNarratorCustomTraits(id: string, enabled = true) {
 export function useUpdateSubagentModelRestriction() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: ({
-			id,
-			pools,
-		}: {
-			id: string;
-			pools: Record<string, { model: string; purpose?: string }[]>;
-		}) => api.updateSubagentModelRestriction(id, pools),
-		onSuccess: (_data, vars) => {
+		mutationFn: ({ id, pools }: { id: string; pools: SubagentModelPools }) =>
+			api.updateSubagentModelRestriction(id, pools),
+		onSuccess: (data, vars) => {
+			qc.setQueryData(["narrators", vars.id, "custom-traits"], data.customTraits);
 			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
 			qc.invalidateQueries({ queryKey: ["narrators", vars.id, "custom-traits"] });
 		},
@@ -883,7 +906,8 @@ export function useClearSubagentModelRestriction() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: (id: string) => api.clearSubagentModelRestriction(id),
-		onSuccess: (_data, id) => {
+		onSuccess: (data, id) => {
+			qc.setQueryData(["narrators", id, "custom-traits"], data.customTraits);
 			qc.invalidateQueries({ queryKey: ["narrators", id] });
 			qc.invalidateQueries({ queryKey: ["narrators", id, "custom-traits"] });
 		},

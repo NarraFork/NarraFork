@@ -397,7 +397,7 @@ describe("merging uncommitted work", () => {
 		);
 		expect(merged.conflicts).toEqual([]);
 
-		await worktreeTreeSnapshot.materializeTree(trunk.worktree, merged.tree);
+		await worktreeTreeSnapshot.materializeTree(trunk.worktree, present(merged.tree, "merged tree"));
 		const result = readFileSync(join(trunk.worktree, "app.txt"), "utf-8");
 		expect(result).toContain("l1-trunk");
 		expect(result).toContain("l9-branch");
@@ -452,10 +452,14 @@ describe("merging uncommitted work", () => {
 		// conflict markers, so writing it out would corrupt the file it claims to merge.
 		expect(readFileSync(join(trunk.worktree, "app.txt"), "utf-8")).toBe("l1\nTRUNK\nl3\n");
 
-		// It is still readable, which is what lets a caller show or resolve the conflict.
+		if (!merged.conflictsComplete) {
+			expect(merged.tree).toBeNull();
+			return; // Old Git cannot certify a marker-only resolution; no partial tree is exposed.
+		}
+		// Native, completely described file conflicts still carry a readable result.
 		const conflicted = await worktreeTreeSnapshot.readFileAtTree(
 			trunk.worktree,
-			merged.tree,
+			present(merged.tree, "merged tree"),
 			"app.txt",
 		);
 		expect(conflicted).toContain("<<<<<<<");
@@ -505,19 +509,22 @@ describe("merging uncommitted work", () => {
 			present(trunkIn, "fetched trunk lineage"),
 		);
 		expect(synced.conflicts).toEqual([]);
-		await worktreeTreeSnapshot.materializeTree(branch.worktree, synced.tree);
+		await worktreeTreeSnapshot.materializeTree(
+			branch.worktree,
+			present(synced.tree, "synced tree"),
+		);
 
 		// Record that sync BOTH ways and compare. Single-parent loses the fact that
 		// trunk's change is already incorporated.
 		const singleParent = await worktreeTreeSnapshot.commitSnapshot(
 			branch.worktree,
-			synced.tree,
+			present(synced.tree, "synced tree"),
 			[present(branchHead, "branch head")],
 			"sync without merge parent",
 		);
 		const twoParents = await worktreeTreeSnapshot.commitSnapshot(
 			branch.worktree,
-			synced.tree,
+			present(synced.tree, "synced tree"),
 			[present(branchHead, "branch head"), present(trunkIn, "fetched trunk lineage")],
 			"sync with merge parent",
 		);

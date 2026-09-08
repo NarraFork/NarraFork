@@ -20,6 +20,7 @@
  * no DOM.
  */
 
+import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import {
 	findStreamingInsertIndex,
 	getStreamingBlockOutputIndex,
@@ -32,6 +33,7 @@ import { appendStreamingTextPreview } from "./narrator-message-helpers";
 export interface StreamDeltaEvent {
 	type?: unknown;
 	subagentToolUseId?: unknown;
+	fileReferenceContext?: unknown;
 	outputIndex?: unknown;
 	delta?: {
 		type?: unknown;
@@ -88,8 +90,10 @@ export function applyStreamingDelta(
 
 	if (delta.type === "text_delta") {
 		const outputIndex = typeof event.outputIndex === "number" ? event.outputIndex : undefined;
-		const existingIdx =
-			outputIndex != null
+		const textBlockId = typeof delta.id === "string" && delta.id ? delta.id : undefined;
+		const existingIdx = textBlockId
+			? blocks.findIndex((b) => b.type === "text" && b.id === textBlockId)
+			: outputIndex != null
 				? blocks.findIndex((b) => b.type === "text" && b.outputIndex === outputIndex)
 				: -1;
 		if (existingIdx !== -1) {
@@ -99,7 +103,7 @@ export function applyStreamingDelta(
 			}
 			return { applied: true, blockIndex: existingIdx };
 		}
-		if (outputIndex == null) {
+		if (outputIndex == null && !textBlockId) {
 			// An UN-INDEXED delta belongs to the un-indexed text lane, so match on that
 			// rather than on "the array happens to end with a text block".
 			//
@@ -125,7 +129,11 @@ export function applyStreamingDelta(
 		const insertAt = findStreamingInsertIndex(blocks, outputIndex);
 		blocks.splice(insertAt, 0, {
 			type: "text",
+			...(textBlockId ? { id: textBlockId } : {}),
 			text: appendStreamingTextPreview("", deltaText),
+			...(event.fileReferenceContext !== undefined
+				? { fileReferenceContext: normalizeFileReferenceContext(event.fileReferenceContext) }
+				: {}),
 			...(outputIndex != null ? { outputIndex } : {}),
 		});
 		return { applied: true, blockIndex: insertAt };

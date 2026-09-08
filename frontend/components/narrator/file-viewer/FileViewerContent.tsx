@@ -1,5 +1,7 @@
 /**
- * FileViewerContent.tsx — read-only file viewer body for the `file` dock panel.
+ * FileViewerContent.tsx — binary dock previews and the legacy off-dock reader.
+ * Text dock panels use FileEditorContent directly; NarratorPanel's mobile drawer
+ * still uses the text modes here, so they remain backward-compatible.
  *
  * Reads the file's CURRENT on-disk content through `/api/fs/preview` (the same
  * endpoint and the same bounded streaming read the "view this file" modal uses),
@@ -15,8 +17,7 @@
  * Bounded on purpose, mirroring FilePreviewModal: the text is capped while
  * streaming (`readTextPreview` cancels the reader at the cap, so a huge file
  * never fully lands in memory) and the node tree has its own depth/count caps.
- * Images and PDFs are NOT rendered here — this panel is the text/code surface,
- * and the existing modal / image viewer own binary previews.
+ * Images and PDFs use bounded blob previews; images also open the fullscreen viewer.
  */
 
 import {
@@ -31,18 +32,35 @@ import {
 } from "@mantine/core";
 import { useClipboard } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import {
+	FILE_REFERENCE_READ_TIMEOUT_MS,
+	type FileReferenceEditorSelection,
+	type FileSelection,
+	type FileTarget,
+} from "@shared/file-reference";
+import { localFileDirectory } from "@shared/markdown-file-path";
 import { IconCheck, IconCopy, IconDownload, IconRefresh } from "@tabler/icons-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useFileSystemCapability } from "../../../hooks/usePlatform";
 import { ApiError, api, authorizedFetch, readFetchError } from "../../../lib/api";
+import { fileReferenceApi } from "../../../lib/api/file-references";
 import { saveBlobAsFile } from "../../../lib/file-download";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { getShikiLang } from "../../../lib/shiki-lang";
+import { useImageViewer } from "../../common/image-viewer-context";
 import { TruncatedText } from "../../common/TruncatedText";
 import { ContentViewer } from "../ContentViewer";
-import { getFilePreviewType, readTextPreview } from "../FilePreviewModal";
+import {
+	getFilePreviewType,
+	MAX_FILE_PREVIEW_BLOB_BYTES,
+	readTextPreview,
+} from "../FilePreviewModal";
+import { FileReferenceScopeProvider, useFileReferenceScope } from "../FileReferenceScope";
+import { CodeMirrorEditor } from "../file-editor/CodeMirrorEditor";
+import { MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../highlight-cache";
 import { MarkdownContent } from "../MarkdownContent";
+import { filePanelBaseName } from "../panels/panel-kind";
 import { StructuredNodeTree } from "./StructuredNodeTree";
 import {
 	detectStructuredFormat,
@@ -67,9 +85,9 @@ const MARKDOWN_EXTS = new Set(["md", "markdown", "mdx"]);
  * refused with 413. In practice the panel now shows every file the API serves.
  *
  * Rendering stays bounded independently, and by DEGRADING rather than cutting:
- * HighlightedCode drops to an unhighlighted code block past 20k chars, and
- * MarkdownContent falls back to plain text past 80k. Both still show the whole
- * document, so raising this cap cannot produce silently-clipped content.
+ * Raw source has its own bounded file highlighting budget (rather than the
+ * chat preview's 20k cap); MarkdownContent falls back to plain text past 80k.
+ * Both still show the whole document, so raising this cap cannot silently clip it.
  *
  * Kept at the backend's byte ceiling EXACTLY (1024 * 1024, not a round 1e6):
  * 1,000,000 would clip the last 48,576 characters of an ASCII file the API had
@@ -109,7 +127,7 @@ export function resolveNodeUnavailable(args: {
 
 /** True when the path should render as markdown in `preview` mode. */
 export function isMarkdownPath(filePath: string): boolean {
-	const base = filePath.split(/[/\\]/).pop() ?? filePath;
+	const base = fileBaseName(filePath);
 	const dot = base.lastIndexOf(".");
 	if (dot <= 0) return false;
 	return MARKDOWN_EXTS.has(base.slice(dot + 1).toLowerCase());
@@ -119,15 +137,16 @@ export function isMarkdownPath(filePath: string): boolean {
  * The modes a path supports, in display order. Always ends with `raw`; a single
  * entry means the caller should hide the switch.
  */
-export function availableModes(filePath: string): FileViewerMode[] {
+export function availableModes(filePath: string, selection?: FileSelection): FileViewerMode[] {
+	if (selection) return ["raw"];
 	if (isMarkdownPath(filePath)) return ["preview", "raw"];
 	if (detectStructuredFormat(filePath)) return ["node", "raw"];
 	return ["raw"];
 }
 
-/** Basename of a path, tolerating both separators. */
+/** Same target-path grammar as markdown resolution and the dock/editor labels. */
 export function fileBaseName(filePath: string): string {
-	return filePath.split(/[/\\]/).pop() || filePath;
+	return filePanelBaseName(filePath);
 }
 
 /**
@@ -152,16 +171,58 @@ interface LoadState {
 	truncated: boolean;
 	error: string | null;
 	loading: boolean;
+	hash?: string;
+	target?: FileTarget;
 }
 
 const INITIAL_LOAD: LoadState = { text: null, truncated: false, error: null, loading: false };
 
 export interface FileViewerContentProps {
 	filePath: string;
+	/** Scoped references never fall back to the unrestricted/local preview route. */
+	narratorId?: string;
+	deviceId?: string;
+	/** References are text-only and cannot enter the legacy binary/download reader. */
+	referenceOrigin?: boolean;
+	selection?: FileSelection;
+	highlightRequestId?: string;
+	onOpenFileTarget?: (target: FileTarget) => void;
+	onFileReferenceSelectionChange?: (selection: FileReferenceEditorSelection | null) => void;
 }
 
-export function FileViewerContent({ filePath }: FileViewerContentProps) {
+/** Directory semantics come from the file's own device, not the browser URL. */
+export function fileReferenceDirectory(filePath: string): string {
+	const directory = localFileDirectory(filePath);
+	return directory === "." ? "" : directory;
+}
+
+/** Inheriting a narrator scope must not silently change a legacy local reader's policy. */
+export function fileViewerReadMode(
+	narratorId: string | undefined,
+	deviceId = "local",
+	referenceOrigin = false,
+): "legacy" | "scoped" | "missing-context" {
+	if (!referenceOrigin && deviceId === "local") return "legacy";
+	return narratorId ? "scoped" : "missing-context";
+}
+
+export function FileViewerContent({
+	filePath,
+	narratorId: narratorIdProp,
+	deviceId = "local",
+	referenceOrigin = false,
+	selection,
+	highlightRequestId,
+	onOpenFileTarget,
+	onFileReferenceSelectionChange,
+}: FileViewerContentProps) {
 	const { t } = useTranslation("narrator");
+	const parentScope = useFileReferenceScope();
+	const narratorId = narratorIdProp ?? parentScope.narratorId;
+	const readerMode = fileViewerReadMode(narratorId, deviceId, referenceOrigin);
+	const scopedNarratorId = readerMode === "scoped" ? narratorId : undefined;
+	const publishSelection = onFileReferenceSelectionChange ?? parentScope.setSelection;
+	const [sourceSelection, setSourceSelection] = useState<FileSelection | null>(null);
 	// The fetch effect needs `t` only for its fallback error string. Held in a ref so
 	// switching the UI language does not re-run the effect and re-download the file.
 	const tRef = useRef(t);
@@ -170,14 +231,16 @@ export function FileViewerContent({ filePath }: FileViewerContentProps) {
 	const previewCapability = fsCapability.preview;
 	const clipboard = useClipboard({ timeout: 1500 });
 
-	const modes = useMemo(() => availableModes(filePath), [filePath]);
+	const modes = useMemo(() => availableModes(filePath, selection), [filePath, selection]);
 	const defaultMode = modes[0] ?? "raw";
 	const [mode, setMode] = useState<FileViewerMode>(defaultMode);
 	const [reloadToken, setReloadToken] = useState(0);
 	const [load, setLoad] = useState<LoadState>(INITIAL_LOAD);
 
 	const previewType = getFilePreviewType(filePath);
-	const isText = previewType === "text";
+	const isText = previewType === "text" || !!selection || referenceOrigin || deviceId !== "local";
+	const previewSupported = readerMode !== "legacy" || previewCapability.supported;
+	const sourceOnly = !!selection;
 	const lang = useMemo(() => getShikiLang(filePath), [filePath]);
 	const fileName = fileBaseName(filePath);
 	const structuredFormat = useMemo(() => detectStructuredFormat(filePath), [filePath]);
@@ -188,35 +251,63 @@ export function FileViewerContent({ filePath }: FileViewerContentProps) {
 		setMode(defaultMode);
 	}, [defaultMode]);
 
-	// Fetch (and re-fetch on reload). Text only: binary types never hit the wire
-	// here, they get the "use the image/PDF viewer" hint instead.
+	// Fetch text here; binary previews own their request and object URL lifecycle.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reloadToken is the intentional re-fetch trigger
 	useEffect(() => {
-		if (!isText || !previewCapability.supported) {
+		if (!isText || !previewSupported) {
 			setLoad(INITIAL_LOAD);
 			return;
 		}
 		let cancelled = false;
 		const controller = new AbortController();
 		setLoad({ text: null, truncated: false, error: null, loading: true });
-		authorizedFetch(`/api/fs/preview?path=${encodeURIComponent(filePath)}`, {
-			signal: controller.signal,
-		})
-			.then(async (response) => {
-				if (!response.ok) {
-					const failure = await readFetchError(response, "Request failed");
-					throw new ApiError(failure.message, response.status, failure.data);
-				}
-				return readTextPreview(response, MAX_FILE_VIEWER_TEXT_CHARS);
-			})
-			.then((preview) => {
-				if (cancelled) return;
-				setLoad({
-					text: preview.text,
-					truncated: preview.truncated,
+		setSourceSelection(null);
+		const timeout = setTimeout(() => controller.abort(), FILE_REFERENCE_READ_TIMEOUT_MS);
+		const read = async (): Promise<LoadState> => {
+			if (referenceOrigin && previewType !== "text")
+				throw new Error(
+					tRef.current("fileReferences.binaryNotSupported", {
+						defaultValue:
+							"Binary files cannot be opened as text references. Use a file attachment instead.",
+					}),
+				);
+			if (scopedNarratorId) {
+				const preview = await fileReferenceApi.preview(
+					scopedNarratorId,
+					{ deviceId, path: filePath },
+					controller.signal,
+				);
+				return {
+					text: preview.content,
+					hash: preview.hash,
+					target: preview.target,
+					truncated: false,
 					error: null,
 					loading: false,
-				});
+				};
+			}
+			if (readerMode === "missing-context")
+				throw new Error(
+					tRef.current("fileReferences.missingContext", {
+						defaultValue: "This file requires a narrator context to preview.",
+					}),
+				);
+			const response = await authorizedFetch(
+				`/api/fs/preview?path=${encodeURIComponent(filePath)}`,
+				{
+					signal: controller.signal,
+				},
+			);
+			if (!response.ok) {
+				const failure = await readFetchError(response, "Request failed");
+				throw new ApiError(failure.message, response.status, failure.data);
+			}
+			const preview = await readTextPreview(response, MAX_FILE_VIEWER_TEXT_CHARS);
+			return { text: preview.text, truncated: preview.truncated, error: null, loading: false };
+		};
+		read()
+			.then((preview) => {
+				if (!cancelled) setLoad(preview);
 			})
 			.catch((err) => {
 				if (cancelled) return;
@@ -226,12 +317,24 @@ export function FileViewerContent({ filePath }: FileViewerContentProps) {
 					error: err instanceof Error ? err.message : tRef.current("filePreview_loadError"),
 					loading: false,
 				});
-			});
+			})
+			.finally(() => clearTimeout(timeout));
 		return () => {
 			cancelled = true;
+			clearTimeout(timeout);
 			controller.abort();
 		};
-	}, [filePath, isText, previewCapability.supported, reloadToken]);
+	}, [
+		deviceId,
+		readerMode,
+		scopedNarratorId,
+		filePath,
+		isText,
+		previewSupported,
+		previewType,
+		referenceOrigin,
+		reloadToken,
+	]);
 
 	const reload = useCallback(() => setReloadToken((token) => token + 1), []);
 
@@ -246,6 +349,8 @@ export function FileViewerContent({ filePath }: FileViewerContentProps) {
 	 * is also why this button is available for binary files the panel cannot render.
 	 */
 	const download = useCallback(async () => {
+		// Scoped/remote references must not bypass their reader via local fsDownload.
+		if (referenceOrigin || deviceId !== "local") return;
 		setDownloading(true);
 		try {
 			const { blob, fileName: served } = await api.fsDownload(filePath);
@@ -259,7 +364,7 @@ export function FileViewerContent({ filePath }: FileViewerContentProps) {
 		} finally {
 			setDownloading(false);
 		}
-	}, [filePath]);
+	}, [deviceId, referenceOrigin, filePath]);
 
 	// Parse for node mode. A truncated read is NOT attempted at all: its tail is
 	// cut mid-token, so any parser would either fail or (worse) succeed on a
@@ -277,7 +382,41 @@ export function FileViewerContent({ filePath }: FileViewerContentProps) {
 		parseFailed: parsed != null && isStructuredParseError(parsed),
 	});
 	// The effective mode: nodes can only render from a complete, parsed document.
-	const effectiveMode: FileViewerMode = mode === "node" && nodeUnavailable ? "raw" : mode;
+	const effectiveMode: FileViewerMode =
+		sourceOnly || (mode === "node" && nodeUnavailable) ? "raw" : mode;
+	const sourcePath = load.target?.path ?? filePath;
+	const sourceDeviceId = load.target?.deviceId ?? deviceId;
+	const viewerScope = useMemo(
+		() => ({
+			narratorId,
+			context: fileReferenceDirectory(sourcePath)
+				? { deviceId: sourceDeviceId, cwd: fileReferenceDirectory(sourcePath) }
+				: null,
+			openFile: onOpenFileTarget ?? parentScope.openFile,
+		}),
+		[narratorId, sourcePath, sourceDeviceId, onOpenFileTarget, parentScope.openFile],
+	);
+	useEffect(() => {
+		publishSelection?.(
+			load.hash && sourceSelection && !load.truncated
+				? {
+						target: { deviceId: sourceDeviceId, path: sourcePath, selection: sourceSelection },
+						label: fileName,
+						expectedHash: load.hash,
+						dirty: false,
+					}
+				: null,
+		);
+	}, [
+		fileName,
+		load.hash,
+		load.truncated,
+		sourceSelection,
+		sourceDeviceId,
+		sourcePath,
+		publishSelection,
+	]);
+	useEffect(() => () => publishSelection?.(null), [publishSelection]);
 
 	const header = (
 		<Group gap={6} px="xs" py={4} wrap="nowrap" style={{ flexShrink: 0 }}>
@@ -324,18 +463,20 @@ export function FileViewerContent({ filePath }: FileViewerContentProps) {
 				</Tooltip>
 				{/* Offered even when the panel cannot render the file (binary, or a read
 				    that failed): saving the bytes does not depend on previewing them. */}
-				<Tooltip label={t("fileViewer.download")} withinPortal>
-					<ActionIcon
-						size="sm"
-						variant="subtle"
-						color="gray"
-						aria-label={t("fileViewer.download")}
-						loading={downloading}
-						onClick={download}
-					>
-						<IconDownload size={14} />
-					</ActionIcon>
-				</Tooltip>
+				{!referenceOrigin && deviceId === "local" && (
+					<Tooltip label={t("fileViewer.download")} withinPortal>
+						<ActionIcon
+							size="sm"
+							variant="subtle"
+							color="gray"
+							aria-label={t("fileViewer.download")}
+							loading={downloading}
+							onClick={download}
+						>
+							<IconDownload size={14} />
+						</ActionIcon>
+					</Tooltip>
+				)}
 				<Tooltip label={t("fileViewer.reload")} withinPortal>
 					<ActionIcon
 						size="sm"
@@ -352,47 +493,188 @@ export function FileViewerContent({ filePath }: FileViewerContentProps) {
 	);
 
 	return (
-		<Box style={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
-			{header}
-			<Box style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
-				{!previewCapability.supported ? (
-					<Box p="md">
-						<Text size="sm" c="dimmed">
-							{previewCapability.reason ?? t("filePreview_unsupported")}
-						</Text>
-					</Box>
-				) : !isText ? (
-					<Box p="md">
-						<Text size="sm" c="dimmed">
-							{t("fileViewer.binaryHint")}
-						</Text>
-					</Box>
-				) : load.loading ? (
-					<Center h="100%">
-						<Loader size="sm" />
-					</Center>
-				) : load.error ? (
-					<Box p="md">
-						<Text size="sm" c="red">
-							{load.error}
-						</Text>
-					</Box>
-				) : load.text == null ? null : (
-					<FileBody
-						filePath={filePath}
-						fileName={fileName}
-						lang={lang}
-						text={load.text}
-						truncated={load.truncated}
-						mode={effectiveMode}
-						parsed={parsed}
-						nodeUnavailable={nodeUnavailable}
-						structuredFormat={structuredFormat}
-						reloadToken={reloadToken}
-					/>
-				)}
+		<FileReferenceScopeProvider value={viewerScope}>
+			<Box style={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+				{header}
+				<Box style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+					{!previewSupported ? (
+						<Box p="md">
+							<Text size="sm" c="dimmed">
+								{previewCapability.reason ?? t("filePreview_unsupported")}
+							</Text>
+						</Box>
+					) : !isText ? (
+						<BinaryFilePreview
+							key={`${filePath}:${reloadToken}`}
+							filePath={filePath}
+							previewType={previewType}
+						/>
+					) : load.loading ? (
+						<Center h="100%">
+							<Loader size="sm" />
+						</Center>
+					) : load.error ? (
+						<Box p="md">
+							<Text size="sm" c="red">
+								{load.error}
+							</Text>
+						</Box>
+					) : load.text == null ? null : effectiveMode === "raw" && (sourceOnly || !!load.hash) ? (
+						<Box h="100%" style={{ display: "flex", flexDirection: "column" }}>
+							<Box style={{ flex: 1, minHeight: 0 }}>
+								<CodeMirrorEditor
+									value={load.text}
+									language={lang}
+									onChange={() => {}}
+									readOnly
+									selection={selection}
+									navigationRequestId={highlightRequestId}
+									onSelectionChange={setSourceSelection}
+								/>
+							</Box>
+							{load.truncated && (
+								<Text size="xs" c="yellow" p="xs">
+									{t("fileViewer.truncated", {
+										chars: formatLocaleNumber(MAX_FILE_VIEWER_TEXT_CHARS),
+									})}
+								</Text>
+							)}
+						</Box>
+					) : (
+						<FileBody
+							filePath={filePath}
+							fileName={fileName}
+							lang={lang}
+							text={load.text}
+							truncated={load.truncated}
+							mode={effectiveMode}
+							parsed={parsed}
+							nodeUnavailable={nodeUnavailable}
+							structuredFormat={structuredFormat}
+							reloadToken={reloadToken}
+						/>
+					)}
+				</Box>
 			</Box>
-		</Box>
+		</FileReferenceScopeProvider>
+	);
+}
+
+/** Enforce the byte budget while reading, not after allocating the entire response. */
+export async function readBinaryPreview(response: Response): Promise<Blob> {
+	const limit = MAX_FILE_PREVIEW_BLOB_BYTES;
+	if (Number(response.headers.get("content-length")) > limit) {
+		await response.body?.cancel();
+		throw new Error("Preview too large");
+	}
+	const reader = response.body?.getReader();
+	if (!reader) return new Blob([]);
+	const chunks: Uint8Array<ArrayBuffer>[] = [];
+	let bytes = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			bytes += value.byteLength;
+			if (bytes > limit) {
+				await reader.cancel();
+				throw new Error("Preview too large");
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	return new Blob(chunks, { type: response.headers.get("content-type") ?? "" });
+}
+
+function BinaryFilePreview({
+	filePath,
+	previewType,
+}: {
+	filePath: string;
+	previewType: "image" | "pdf";
+}) {
+	const { t } = useTranslation("narrator");
+	const openImageViewer = useImageViewer();
+	const [url, setUrl] = useState<string | null>(null);
+	const [error, setError] = useState<string | null>(null);
+	const fileName = fileBaseName(filePath);
+
+	useEffect(() => {
+		const controller = new AbortController();
+		let disposed = false;
+		let objectUrl: string | null = null;
+		const timeout = setTimeout(() => controller.abort(), 30_000);
+		authorizedFetch(`/api/fs/preview?path=${encodeURIComponent(filePath)}`, {
+			signal: controller.signal,
+		})
+			.then(async (response) => {
+				if (!response.ok) {
+					const failure = await readFetchError(response, "Request failed");
+					throw new ApiError(failure.message, response.status, failure.data);
+				}
+				return readBinaryPreview(response);
+			})
+			.then((blob) => {
+				if (disposed) return;
+				objectUrl = URL.createObjectURL(blob);
+				setUrl(objectUrl);
+			})
+			.catch((err) => {
+				if (!disposed) setError(err instanceof Error ? err.message : String(err));
+			})
+			.finally(() => clearTimeout(timeout));
+		return () => {
+			disposed = true;
+			clearTimeout(timeout);
+			controller.abort();
+			if (objectUrl) URL.revokeObjectURL(objectUrl);
+		};
+	}, [filePath]);
+
+	if (error) {
+		return (
+			<Text p="md" size="sm" c="red">
+				{error}
+			</Text>
+		);
+	}
+	if (!url)
+		return (
+			<Center h="100%">
+				<Loader size="sm" />
+			</Center>
+		);
+	if (previewType === "pdf") {
+		return (
+			<iframe
+				src={url}
+				title={fileName}
+				sandbox="allow-same-origin allow-scripts"
+				onError={() => setError(t("filePreview_loadError"))}
+				style={{ width: "100%", height: "100%", border: 0, display: "block" }}
+			/>
+		);
+	}
+	return (
+		<Center h="100%" p="xs">
+			<button
+				type="button"
+				aria-label={fileName}
+				onClick={() =>
+					openImageViewer({ src: url, savedPath: filePath, filename: fileName, alt: fileName })
+				}
+				style={{ display: "contents", cursor: "zoom-in" }}
+			>
+				<img
+					src={url}
+					alt={fileName}
+					onError={() => setError(t("filePreview_loadError"))}
+					style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
+				/>
+			</button>
+		</Center>
 	);
 }
 
@@ -477,7 +759,13 @@ function FileBody({
 		<>
 			{topNotices}
 			<Box p="xs">
-				<ContentViewer content={text} title={fileName} language={lang} style={{ fontSize: 12 }} />
+				<ContentViewer
+					content={text}
+					title={fileName}
+					language={lang}
+					maxHighlightChars={MAX_FILE_HIGHLIGHT_CODE_CHARS}
+					style={{ fontSize: 12 }}
+				/>
 			</Box>
 			{truncationNotice}
 		</>

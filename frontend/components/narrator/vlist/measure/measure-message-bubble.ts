@@ -16,6 +16,8 @@
  */
 
 import { measureLineStats, measureNaturalWidth, prepareWithSegments } from "@chenglou/pretext";
+import type { FileReference } from "@shared/file-reference";
+import { fileReferenceLabel } from "@shared/file-reference-display";
 import { fitImageBox, readImageIntrinsicSize } from "@shared/pretext-layout/image-fit";
 import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
 import {
@@ -153,6 +155,8 @@ export interface MeasureUserAttachment {
 	 * always TEXT_FILE_HEIGHT, this only lets the render layer make it clickable.
 	 */
 	filePath?: string | null;
+	/** Accepted locator only: snapshots never enter the layout payload. */
+	reference?: FileReference;
 }
 
 export interface MeasureMessageInput {
@@ -277,7 +281,12 @@ function attachmentBlock(
 	innerWidth: number,
 ): PreparedFixedBlock | null {
 	const isImage = attachment.type === "image";
-	if (!isImage && attachment.type !== "text_file") return null;
+	const isReference = attachment.type === "file_reference" && !!attachment.reference;
+	if (!isImage && !isReference && attachment.type !== "text_file") return null;
+	const filename =
+		isReference && attachment.reference
+			? fileReferenceLabel(attachment.reference)
+			: attachment.filename;
 	const natural = isImage ? readImageIntrinsicSize(attachment.width, attachment.height) : null;
 	const fit = natural ? fitImageBox(natural, innerWidth, IMAGE_MAX_DISPLAY_HEIGHT) : null;
 	// A text-file row is reserved at ONE line and truncates instead of wrapping, so
@@ -289,7 +298,7 @@ function attachmentBlock(
 		: Math.min(
 				innerWidth,
 				textFileRowNaturalWidth({
-					filename: attachment.filename ?? undefined,
+					filename: filename ?? undefined,
 					size: typeof attachment.size === "number" ? attachment.size : undefined,
 				}),
 			);
@@ -298,12 +307,13 @@ function attachmentBlock(
 		kind: "fixed",
 		marginTop,
 		height: isImage ? (fit?.displayHeight ?? IMAGE_FIXED_HEIGHT) : TEXT_FILE_HEIGHT,
-		tag: isImage ? "user-image" : "user-text-file",
+		tag: isImage ? "user-image" : isReference ? "user-file-reference" : "user-text-file",
 		...(displayWidth != null ? { displayWidth } : {}),
 		data: {
 			imageId: attachment.imageId ?? null,
 			previewUrl: attachment.previewUrl ?? null,
-			filename: attachment.filename ?? null,
+			filename: filename ?? null,
+			...(isReference ? { reference: attachment.reference } : {}),
 			mediaType: attachment.mediaType ?? null,
 			size: typeof attachment.size === "number" ? attachment.size : null,
 			uploadNarratorId: attachment.uploadNarratorId ?? null,
@@ -410,6 +420,11 @@ function measureCommandMessage(
 	const expansionText = input.text.slice(0, COMMAND_EXPANSION_MAX_CHARS);
 	const hasBody = expansionText.length > 0;
 	const hasHeader = input.hasHeader !== false;
+	const attachments = (input.attachments ?? []).flatMap((attachment, index) => {
+		const block = attachmentBlock(attachment, index ? USER_ATTACHMENT_GAP : 0, innerWidth);
+		return block ? [block] : [];
+	});
+	const attachmentFrame = accumulateFrame(attachments, innerWidth, pretextLineMetrics);
 
 	// ── Width first, THEN overflow ──────────────────────────────────────────────
 	// The bubble SHRINK-WRAPS, so the box the expansion is painted in is
@@ -444,6 +459,8 @@ function measureCommandMessage(
 			Math.min(innerWidth, commandWidth),
 			hasBody ? Math.min(innerWidth, expansionStats.maxLineWidth) : 0,
 			hasHeader ? USER_HEADER_MIN_CONTENT_WIDTH : 0,
+			attachmentFrame.usedWidth,
+			attachments.length ? USER_ATTACHMENT_MIN_CONTENT_WIDTH : 0,
 		),
 	);
 	const usedWidth = Math.min(contentWidth, USER_BUBBLE_PADDING * 2 + innerUsed);
@@ -457,8 +474,8 @@ function measureCommandMessage(
 	// Nothing to reveal when the whole expansion already fits the preview line.
 	const expanded = overflows && expandState.expanded === true;
 
-	const blocks: PreparedBlock[] = [];
-	// Block 0 — the command line, forced to one line (truncate), so its height is
+	const blocks: PreparedBlock[] = [...attachments];
+	// After the attachments — the command line, forced to one line (truncate), so its height is
 	// constant no matter how long the command is.
 	blocks.push({
 		kind: "fixed",
@@ -489,8 +506,8 @@ function measureCommandMessage(
 	};
 	if (hasBody) blocks.push(bodyBlock);
 
-	const commandTop = 0;
-	const bodyTop = hasBody ? typographyMetrics().line.body + COMMAND_ROW_GAP : -1;
+	const commandTop = attachments.length ? attachmentFrame.contentHeight + USER_ATTACHMENT_GAP : 0;
+	const bodyTop = hasBody ? commandTop + typographyMetrics().line.body + COMMAND_ROW_GAP : -1;
 	const bodyHeight = !hasBody
 		? 0
 		: expanded
@@ -502,6 +519,7 @@ function measureCommandMessage(
 		: (expandState.showLabel ?? "Show expanded prompt");
 
 	const contentHeight =
+		commandTop +
 		typographyMetrics().line.body +
 		(hasBody ? COMMAND_ROW_GAP + bodyHeight : 0) +
 		(overflows ? COMMAND_ROW_GAP + typographyMetrics().line.xs : 0);
@@ -525,12 +543,15 @@ function measureCommandMessage(
 	// `prepared` handle from it), and the frame now mirrors the collapsed geometry
 	// the render copy actually paints.
 	const frame: ElementFrame = {
-		blocks: blocks.map((_, index) => ({
-			index,
-			top: index === 0 ? commandTop : bodyTop,
-			height: index === 0 ? typographyMetrics().line.body : bodyHeight,
-			usedWidth: innerUsed,
-		})),
+		blocks: blocks.map(
+			(_, index) =>
+				attachmentFrame.blocks[index] ?? {
+					index,
+					top: index === attachments.length ? commandTop : bodyTop,
+					height: index === attachments.length ? typographyMetrics().line.body : bodyHeight,
+					usedWidth: innerUsed,
+				},
+		),
 		contentHeight,
 		usedWidth: innerUsed,
 	};

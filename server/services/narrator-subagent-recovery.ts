@@ -11,7 +11,7 @@
  *   result back into that very tool call and the parent loop resumes.
  *
  * - **Path B (card)**: on a narrator error we insert a UI-only card listing
- *   error subagents created within the last 24h that Path A does NOT cover
+ *   subagents that failed since the parent's latest turn started that Path A does NOT cover
  *   (background ones + foreground ones from EARLIER turns). The user picks which
  *   to resume; earlier-turn foreground subagents are converted to background
  *   first (their original tool_result slot is no longer replayable).
@@ -32,7 +32,13 @@
 
 import { and, asc, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
+import {
+	backgroundTasks,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+} from "../db/schema";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -58,9 +64,7 @@ const SUBAGENT_ERROR_MARKER = "Subagent error:";
 /** Substatus tags that mark a settled subagent as "did not finish its job". */
 const UNFINISHED_SUBSTATUS_TAGS = ["error", "interrupted", "timeout"] as const;
 
-const RECOVERY_CARD_WINDOW_MS = 24 * 60 * 60 * 1000;
-
-/** Serializes Path A preparation per narrator. */
+/** Serializes recovery preparation per narrator. */
 const recoveryLock = new AsyncMutex();
 
 // === Pure selection logic (unit-testable) ===
@@ -193,11 +197,11 @@ export interface RecoveryCardSubagentInput extends RecoverySubagentInput {
 	variant?: string | null;
 	errorMessage?: string | null;
 	createdAt: string;
-	/**
-	 * Last write to this subagent row. Used only as a FALLBACK failure timestamp —
-	 * see {@link recoveryFailureTimeMs} for why it cannot be trusted on its own.
-	 */
+	/** Metadata timestamp: useful only as a SQL prefilter, never as failure evidence. */
 	updatedAt?: string | null;
+	backgroundCompletedAt?: string | null;
+	backgroundStatus?: string | null;
+	turnStartedAt?: string | null;
 	/** The parent Agent tool_use id that originally spawned this subagent. */
 	originToolUseId?: string | null;
 	/**
@@ -258,41 +262,26 @@ export function withRecoveryOfferedTrait(traits: unknown, failedAtMs: number): s
 }
 
 /**
- * The moment a settled subagent actually failed, as far as the row can tell.
- *
- * Three sources, in descending order of trustworthiness:
- *
- * 1. **`turn_pause_started_ms:` in `substatus`** — written by
- *    `transitionTurnTimingSubstatus` in the very `updateStatus` call that tags the row
- *    `error`/`interrupted`/`payment_required`, and cleared only when the row goes back
- *    to `working`. This is the real failure instant, and nothing outside the
- *    status/substatus path ever rewrites it: title syncs, trait writes, alias
- *    persistence and detach all touch other columns.
- *
- * 2. **`updatedAt`** — a FALLBACK for rows that predate turn timing or were settled by
- *    a path that wrote no timing tag. It is only an upper bound on the failure time:
- *    `updatedAt` is the last write to the row from ANY source, so a subagent that
- *    failed hours ago has its `updatedAt` pushed to "now" by e.g.
- *    `persistSubagentAlias` (subagent-alias), the `background` tagging in
- *    `subagent-detach`, a title sync (narrator-title), or a user editing this
- *    subagent's custom traits. When that happens with no timing tag present, the stale
- *    failure looks fresh again and the card re-offers it — precisely the symptom the
- *    watermark exists to kill, which is why the watermark is the second line of
- *    defence and this is not the primary source.
- *
- * 3. **`createdAt`** — last resort, so a row with no usable timestamp at all is simply
- *    dropped by the caller rather than treated as "failed at epoch".
- *
- * A dedicated `failed_at` column would make (1) unconditional instead of derived, but
- * that needs a schema change; the timing tag is an existing, equally durable signal.
+ * Only actual failure evidence counts: the error timing tag, or the terminal
+ * timestamp of a failed background run. Creation, metadata updates and run starts
+ * cannot prove when an error happened; legacy rows without evidence are omitted.
  */
 export function recoveryFailureTimeMs(sa: RecoveryCardSubagentInput): number | null {
 	const { pauseStartedAtMs } = parseTurnPauseTiming(parseSubstatus(sa.substatus));
 	if (pauseStartedAtMs != null) return pauseStartedAtMs;
-	const failedMs = Date.parse(sa.updatedAt ?? "");
-	if (Number.isFinite(failedMs)) return failedMs;
-	const createdMs = Date.parse(sa.createdAt);
-	return Number.isFinite(createdMs) ? createdMs : null;
+	if (sa.backgroundStatus !== "failed") return null;
+	const completedMs = Date.parse(sa.backgroundCompletedAt ?? "");
+	return Number.isFinite(completedMs) ? completedMs : null;
+}
+
+/** Shared by card generation and execution: old cards never bypass a newer turn. */
+function recoveryFailureTimeInTurn(
+	sa: RecoveryCardSubagentInput,
+	turnStartedAtMs: number | null | undefined,
+): number | null {
+	if (turnStartedAtMs == null || !Number.isFinite(turnStartedAtMs)) return null;
+	const failedMs = recoveryFailureTimeMs(sa);
+	return failedMs != null && failedMs >= turnStartedAtMs ? failedMs : null;
 }
 
 /**
@@ -307,8 +296,6 @@ export function recoveryFailureTimeMs(sa: RecoveryCardSubagentInput): number | n
 export function selectRecoveryCardCandidates(
 	subagents: RecoveryCardSubagentInput[],
 	options: {
-		nowMs: number;
-		windowMs?: number;
 		/**
 		 * Start of the parent turn that just failed. Failures older than this
 		 * belong to turns the parent already finished (and was already told about
@@ -320,27 +307,16 @@ export function selectRecoveryCardCandidates(
 		latestTurnToolUseIds?: Set<string>;
 	},
 ): RecoveryCardCandidate[] {
-	const windowMs = options.windowMs ?? RECOVERY_CARD_WINDOW_MS;
-	// The turn boundary is the precise rule; the window is only an outer bound for
-	// rows whose turn start is unknown (pre-feature data, externally driven runs).
-	const turnStartedAtMs =
-		options.turnStartedAtMs != null && Number.isFinite(options.turnStartedAtMs)
-			? options.turnStartedAtMs
-			: null;
-	const cutoffMs = Math.max(options.nowMs - windowMs, turnStartedAtMs ?? Number.NEGATIVE_INFINITY);
+	const { turnStartedAtMs } = options;
+	if (turnStartedAtMs == null || !Number.isFinite(turnStartedAtMs)) return [];
 	const latest = options.latestTurnToolUseIds ?? new Set<string>();
 	const candidates: RecoveryCardCandidate[] = [];
 
 	for (const sa of subagents) {
 		if (sa.status !== "idle") continue;
 		if (!parseSubstatus(sa.substatus).includes("error")) continue;
-		// The window applies to the FAILURE, not to the spawn: a subagent created
-		// early in a long session and failed minutes ago is relevant, while one that
-		// failed many hours ago is not, no matter when it was created.
-		// See recoveryFailureTimeMs for why the substatus timing tag is preferred over
-		// updatedAt, and what goes wrong when only the fallback is available.
-		const failedMs = recoveryFailureTimeMs(sa);
-		if (failedMs == null || failedMs < cutoffMs) continue;
+		const failedMs = recoveryFailureTimeInTurn(sa, turnStartedAtMs);
+		if (failedMs == null) continue;
 		// Already proposed once. Only a NEWER failure re-opens the offer.
 		const offeredAtMs = parseRecoveryOfferedAtMs(sa.traits);
 		if (offeredAtMs != null && failedMs <= offeredAtMs) continue;
@@ -900,13 +876,10 @@ export async function persistSubagentRecoveryCard(narratorId: string): Promise<b
 	});
 	if (!narrator || isSubagentVariant(narrator.variant)) return false;
 
-	const nowMs = Date.now();
 	const turnStartedAtMs = narrator.turnStartedAt ? Date.parse(narrator.turnStartedAt) : Number.NaN;
-	// The turn that just failed is the relevant scope. Fall back to the 24h window
-	// only when the turn start is unknown.
-	const cutoffMs = Number.isFinite(turnStartedAtMs)
-		? Math.max(nowMs - RECOVERY_CARD_WINDOW_MS, turnStartedAtMs)
-		: nowMs - RECOVERY_CARD_WINDOW_MS;
+	// Without a known parent turn we cannot prove that a failure belongs to it.
+	if (!Number.isFinite(turnStartedAtMs)) return false;
+	const cutoffMs = turnStartedAtMs;
 	// SQL prefilter on updatedAt, not createdAt: selecting by spawn time pulled in every
 	// subagent a long session ever started. It stays a PREFILTER only — `updatedAt` is
 	// the last write from any source, so it is an upper bound on the failure time and can
@@ -931,7 +904,10 @@ export async function persistSubagentRecoveryCard(narratorId: string): Promise<b
 			traits: true,
 			createdAt: true,
 			updatedAt: true,
+			backgroundCompletedAt: true,
+			backgroundStatus: true,
 		},
+		orderBy: [desc(narrators.updatedAt), desc(narrators.id)],
 		limit: 50,
 	});
 	if (rows.length === 0) return false;
@@ -959,8 +935,7 @@ export async function persistSubagentRecoveryCard(narratorId: string): Promise<b
 	const byId = new Map(withOrigin.map((row) => [row.id, row]));
 
 	const candidates = selectRecoveryCardCandidates(withOrigin, {
-		nowMs,
-		turnStartedAtMs: Number.isFinite(turnStartedAtMs) ? turnStartedAtMs : null,
+		turnStartedAtMs,
 		latestTurnToolUseIds,
 	});
 	if (candidates.length === 0) return false;
@@ -983,21 +958,9 @@ export async function persistSubagentRecoveryCard(narratorId: string): Promise<b
 }
 
 /**
- * Build the column patch that stamps the watermark onto one subagent row.
- *
- * ⚠️ THIS MUST NEVER WRITE `updatedAt`, and the omission is deliberate — do not
- * "fix" it to match the rest of the codebase.
- *
- * `updatedAt` is the fallback failure timestamp of this whole mechanism (see
- * {@link recoveryFailureTimeMs}). Touching it here would move the recorded failure
- * time forward to the moment the card was OFFERED, so on the next narrator error the
- * comparison `failedMs <= offeredAtMs` would flip to false for every row we just
- * watermarked and the card would re-propose the very same dead subagents — the exact
- * bug the watermark exists to prevent. It would also keep resurrecting stale failures
- * into the 24h window forever.
- *
- * `narrator-subagent-recovery.test.ts` asserts both that this patch carries no
- * `updatedAt` key and that a real watermark write leaves the stored value untouched.
+ * Offering a card is bookkeeping, not a new subagent run. Do not advance updatedAt:
+ * it still feeds the SQL prefilter and older clients, even though failure selection
+ * now uses durable run timing rather than metadata timestamps.
  */
 export function buildRecoveryOfferedUpdate(
 	traits: unknown,
@@ -1088,11 +1051,38 @@ export interface ResumeRecoverySubagentsResult {
  * `Await` would wait for a result that can never arrive, and a later recovery pass would
  * see a task that is already running and skip it.
  */
-async function clearBackgroundRunningClaim(subagentId: string): Promise<void> {
+async function clearBackgroundRunningClaim(
+	subagentId: string,
+	parentNarratorId: string,
+	reason: string,
+): Promise<void> {
+	// Creation can throw after INSERT (e.g. while broadcasting). Check ownership
+	// before compensating: an id conflict with another task must leave it untouched.
+	try {
+		const { hasActiveSubagentResumeRun } = await import("./subagent-resume");
+		// A manual resume may have won the per-subagent lock while this batch
+		// prepared its row. Never withdraw the claim of that live continuation.
+		if (hasActiveSubagentResumeRun(subagentId)) return;
+		const task = await db.query.backgroundTasks.findFirst({
+			where: and(
+				eq(backgroundTasks.id, subagentId),
+				eq(backgroundTasks.type, "agent"),
+				eq(backgroundTasks.parentNarratorId, parentNarratorId),
+				eq(backgroundTasks.subagentNarratorId, subagentId),
+			),
+			columns: { id: true },
+		});
+		// Await reads background_tasks first: clearing only the narrator flag leaves
+		// a durable running task with no runner and can hold an await batch open.
+		if (task) await backgroundTaskService.markFailed(subagentId, reason);
+	} catch (err) {
+		logger.error("Failed to settle an unstarted recovery task", { subagentId, error: String(err) });
+	}
+	const now = new Date().toISOString();
 	await db
 		.update(narrators)
-		.set({ backgroundStatus: null, updatedAt: new Date().toISOString() })
-		.where(eq(narrators.id, subagentId))
+		.set({ backgroundStatus: "failed", backgroundCompletedAt: now, updatedAt: now })
+		.where(and(eq(narrators.id, subagentId), eq(narrators.backgroundStatus, "running")))
 		.catch((err) => {
 			logger.error("Failed to clear the background claim of an unstarted subagent", {
 				subagentId,
@@ -1114,126 +1104,155 @@ export async function resumeRecoverySubagents(input: {
 	locale: Locale;
 	userId?: string | null;
 }): Promise<ResumeRecoverySubagentsResult> {
-	const resumed: string[] = [];
-	const skipped: Array<{ id: string; reason: string }> = [];
+	return recoveryLock.acquire(input.narratorId, async () => {
+		const resumed: string[] = [];
+		const skipped: Array<{ id: string; reason: string }> = [];
 
-	for (const subagentId of input.subagentIds) {
-		try {
-			const subagent = await db.query.narrators.findFirst({
-				where: eq(narrators.id, subagentId),
-				columns: {
-					id: true,
-					variant: true,
-					status: true,
-					parentNarratorId: true,
-					isBackground: true,
-					subagentType: true,
-					title: true,
-					traits: true,
-				},
-			});
-			if (!subagent || subagent.parentNarratorId !== input.narratorId) {
-				skipped.push({ id: subagentId, reason: "not_a_child" });
-				continue;
-			}
-			if (!isSubagentVariant(subagent.variant)) {
-				skipped.push({ id: subagentId, reason: "not_a_subagent" });
-				continue;
-			}
-			if (subagent.status !== "idle") {
-				skipped.push({ id: subagentId, reason: `status_${subagent.status}` });
-				continue;
-			}
-			const originToolUseId = await resolveOriginToolUseId(subagentId);
-			if (!originToolUseId) {
-				skipped.push({ id: subagentId, reason: "origin_tool_call_missing" });
-				continue;
-			}
-
-			const title = subagent.title?.trim() || subagentId;
-			const subagentType = subagent.subagentType?.trim() || "general";
-
-			// a) stable alias so the model can Await it later. `title` may itself be the
-			//    id (untitled subagent); the alias builder recognizes that and falls back
-			//    to a short id instead of slugifying the whole nanoid.
-			const { alias } = await registerAndPersistSubagentAlias(input.narratorId, subagentId, title);
-			// b) durable background task row (idempotent restart when it exists)
-			await backgroundTaskService.createAgentTask({
-				id: subagentId,
-				parentNarratorId: input.narratorId,
-				subagentNarratorId: subagentId,
-				subagentType,
-				toolUseId: originToolUseId,
-				alias,
-				title,
-			});
-			// c) mark the narrator itself as background (detach's job, done by hand).
-			//    Under narratorTraitsLock with a fresh read, because `traits` is a whole-column
-			//    JSON array: writing the copy fetched at the top of this iteration would drop
-			//    any trait written since (including the watermark this very card just stamped).
-			//    `updatedAt` IS written here on purpose — unlike the watermark, this row is
-			//    being resumed, so its old failure time is no longer the relevant one.
-			await narratorTraitsLock.acquire(subagentId, async () => {
-				const current = await db.query.narrators.findFirst({
+		for (const subagentId of new Set(input.subagentIds)) {
+			let taskClaimed = false;
+			try {
+				const subagent = await db.query.narrators.findFirst({
 					where: eq(narrators.id, subagentId),
-					columns: { traits: true },
-				});
-				await db
-					.update(narrators)
-					.set({
+					columns: {
+						id: true,
+						variant: true,
+						status: true,
+						substatus: true,
+						createdAt: true,
+						backgroundStatus: true,
+						backgroundCompletedAt: true,
+						parentNarratorId: true,
 						isBackground: true,
-						backgroundStatus: "running",
-						backgroundResult: null,
-						backgroundCompletedAt: null,
-						traits: [
-							...new Set([...parseTraits(current?.traits ?? subagent.traits), "background"]),
-						],
-						updatedAt: new Date().toISOString(),
-					})
-					.where(eq(narrators.id, subagentId));
-			});
-
-			// d) restart, keeping background semantics and leaving the historical
-			//    Agent tool_result untouched.
-			const { resumeSubagent } = await import("./subagent-resume");
-			const started = await resumeSubagent({
-				subagentId,
-				intent: "continue_tool_results",
-				actor: "parent_agent",
-				locale: input.locale,
-				createdBy: input.userId ?? null,
-				abortController: new AbortController(),
-				allowRunningRestart: true,
-				skipStaleAttach: true,
-				preserveBackground: true,
-				skipConclusionDelivery: true,
-			}).catch(async (err) => {
-				// (c) already advertised this subagent as a running background task. If the
-				// restart never happens, that claim has to be withdrawn, or `Await` would
-				// block on a task nobody is driving.
-				await clearBackgroundRunningClaim(subagentId);
-				throw err;
-			});
-			if (!started.started) {
-				await clearBackgroundRunningClaim(subagentId);
-				skipped.push({ id: subagentId, reason: "resume_not_started" });
-				continue;
-			}
-			void started.terminalCompletion?.catch((err) => {
-				logger.warn("Recovered background subagent failed", {
-					subagentId,
-					error: err instanceof Error ? err.message : String(err),
+						subagentType: true,
+						title: true,
+						traits: true,
+					},
 				});
-			});
-			resumed.push(alias);
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			logger.warn("Failed to resume recovery subagent", { subagentId, error: message });
-			skipped.push({ id: subagentId, reason: message });
-		}
-	}
+				if (!subagent || subagent.parentNarratorId !== input.narratorId) {
+					skipped.push({ id: subagentId, reason: "not_a_child" });
+					continue;
+				}
+				if (!isSubagentVariant(subagent.variant)) {
+					skipped.push({ id: subagentId, reason: "not_a_subagent" });
+					continue;
+				}
+				if (subagent.status !== "idle") {
+					skipped.push({ id: subagentId, reason: `status_${subagent.status}` });
+					continue;
+				}
+				// A persisted card is only a snapshot. Work may already have completed
+				// or been resumed manually since it was offered.
+				if (!parseSubstatus(subagent.substatus).includes("error")) {
+					skipped.push({ id: subagentId, reason: "no_longer_failed" });
+					continue;
+				}
+				// Re-read the parent's latest turn for each item. A saved card or an
+				// earlier item in this batch must not authorize work from an older turn.
+				const parent = await db.query.narrators.findFirst({
+					where: eq(narrators.id, input.narratorId),
+					columns: { turnStartedAt: true },
+				});
+				const turnStartedAtMs = Date.parse(parent?.turnStartedAt ?? "");
+				if (recoveryFailureTimeInTurn(subagent, turnStartedAtMs) == null) {
+					skipped.push({ id: subagentId, reason: "failure_outside_latest_turn" });
+					continue;
+				}
+				const { resumeSubagent, hasActiveSubagentResumeRun } = await import("./subagent-resume");
+				if (hasActiveSubagentResumeRun(subagentId)) {
+					skipped.push({ id: subagentId, reason: "already_resuming" });
+					continue;
+				}
+				const originToolUseId = await resolveOriginToolUseId(subagentId);
+				if (!originToolUseId) {
+					skipped.push({ id: subagentId, reason: "origin_tool_call_missing" });
+					continue;
+				}
 
-	return { resumed, skipped };
+				const title = subagent.title?.trim() || subagentId;
+				const subagentType = subagent.subagentType?.trim() || "general";
+
+				// a) stable alias so the model can Await it later. `title` may itself be the
+				//    id (untitled subagent); the alias builder recognizes that and falls back
+				//    to a short id instead of slugifying the whole nanoid.
+				const { alias } = await registerAndPersistSubagentAlias(
+					input.narratorId,
+					subagentId,
+					title,
+				);
+				// b) durable background task row (idempotent restart when it exists).
+				// The service can fail after INSERT, so compensate that path too.
+				taskClaimed = true;
+				await backgroundTaskService.createAgentTask({
+					id: subagentId,
+					parentNarratorId: input.narratorId,
+					subagentNarratorId: subagentId,
+					subagentType,
+					toolUseId: originToolUseId,
+					alias,
+					title,
+				});
+				// c) mark the narrator itself as background (detach's job, done by hand).
+				//    Under narratorTraitsLock with a fresh read, because `traits` is a whole-column
+				//    JSON array: writing the copy fetched at the top of this iteration would drop
+				//    any trait written since (including the watermark this very card just stamped).
+				//    `updatedAt` IS written here on purpose — unlike the watermark, this row is
+				//    being resumed, so its old failure time is no longer the relevant one.
+				await narratorTraitsLock.acquire(subagentId, async () => {
+					const current = await db.query.narrators.findFirst({
+						where: eq(narrators.id, subagentId),
+						columns: { traits: true },
+					});
+					await db
+						.update(narrators)
+						.set({
+							isBackground: true,
+							backgroundStatus: "running",
+							backgroundResult: null,
+							backgroundCompletedAt: null,
+							traits: [
+								...new Set([...parseTraits(current?.traits ?? subagent.traits), "background"]),
+							],
+							updatedAt: new Date().toISOString(),
+						})
+						.where(eq(narrators.id, subagentId));
+				});
+
+				// d) restart, keeping background semantics and leaving the historical
+				//    Agent tool_result untouched.
+				const started = await resumeSubagent({
+					subagentId,
+					intent: "continue_tool_results",
+					actor: "parent_agent",
+					locale: input.locale,
+					createdBy: input.userId ?? null,
+					abortController: new AbortController(),
+					allowRunningRestart: true,
+					skipStaleAttach: true,
+					preserveBackground: true,
+					skipConclusionDelivery: true,
+				});
+				if (!started.started) {
+					await clearBackgroundRunningClaim(subagentId, input.narratorId, "resume_not_started");
+					skipped.push({ id: subagentId, reason: "resume_not_started" });
+					continue;
+				}
+				void started.terminalCompletion?.catch((err) => {
+					logger.warn("Recovered background subagent failed", {
+						subagentId,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				});
+				resumed.push(alias);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				if (taskClaimed) await clearBackgroundRunningClaim(subagentId, input.narratorId, message);
+				logger.warn("Failed to resume recovery subagent", { subagentId, error: message });
+				skipped.push({ id: subagentId, reason: message });
+			}
+		}
+
+		return { resumed, skipped };
+	});
 }
 
 /** Flip the card block to its resolved state and push the update to clients. */
@@ -1242,6 +1261,8 @@ export async function markRecoveryCardResolved(input: {
 	messageId: string;
 	mode: "notify" | "await";
 	resumedAliases: string[];
+	/** Failed starts stay actionable; successful starts must not be restarted twice. */
+	retrySubagentIds?: string[];
 }): Promise<void> {
 	const message = await db.query.narratorMessages.findFirst({
 		where: eq(narratorMessages.id, input.messageId),
@@ -1253,11 +1274,19 @@ export async function markRecoveryCardResolved(input: {
 		(block) => (block as { type?: string } | null)?.type === "subagent_recovery",
 	);
 	if (index < 0) return;
+	const previous = blocks[index] as Record<string, unknown>;
+	const retryIds = new Set(input.retrySubagentIds ?? []);
+	const remaining = (Array.isArray(previous.subagents) ? previous.subagents : []).filter(
+		(entry) => entry && typeof entry.id === "string" && retryIds.has(entry.id),
+	);
 	blocks[index] = {
-		...(blocks[index] as Record<string, unknown>),
-		status: "resolved",
+		...previous,
+		status: remaining.length > 0 ? "pending" : "resolved",
 		mode: input.mode,
-		resumedCount: input.resumedAliases.length,
+		resumedCount:
+			(typeof previous.resumedCount === "number" ? previous.resumedCount : 0) +
+			input.resumedAliases.length,
+		...(remaining.length > 0 ? { subagents: remaining } : {}),
 	};
 
 	await db
@@ -1453,6 +1482,7 @@ async function runRecoveryAwaitBatch(
 							bumpMessageVersion: index === input.entries.length - 1,
 						},
 						input.messageId,
+						entry.toolCallId ?? undefined,
 					)
 					.catch((err) => {
 						logger.error("Failed to persist recovery await result", {

@@ -21,6 +21,25 @@ async function* makeEventSource(events: AgentEvent[]): AsyncIterable<AgentEvent>
 	}
 }
 
+describe("executeAgentLoop file-reference context", () => {
+	test("binds a reused event context to this pass's in-memory config", async () => {
+		const eventContext = {} as EventHandlerContext;
+		for (const cwd of ["/first/pass", "/second/pass"]) {
+			const config = { ...makeConfig(new AbortController().signal), cwd };
+			await executeAgentLoop(
+				{ config, userText: "", history: [], eventContext },
+				{
+					eventSource: makeEventSource([{ type: "stream_text", text: "src/a.ts" }]),
+					processEventFn: async (_event, ctx) => {
+						expect(ctx.getFileReferenceContext?.()).toEqual({ deviceId: "local", cwd });
+						return null;
+					},
+				},
+			);
+		}
+	});
+});
+
 describe("executeAgentLoop result handling", () => {
 	test("handles an empty assistant turn", async () => {
 		const ac = new AbortController();

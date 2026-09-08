@@ -18,12 +18,14 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createSourceText } from "@shared/pretext-layout/source-text";
+import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { type UseVListContentViewResult, useVListContentView } from "./useVListContentView";
-import type { VListViewTarget } from "./vlist-content-view-target";
+import type { VListViewOwner, VListViewTarget } from "./vlist-content-view-target";
 
 const DOM_GLOBAL_KEYS = [
 	"window",
@@ -111,7 +113,7 @@ let queryClient: QueryClient | null = null;
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 let renders: UseVListContentViewResult[] = [];
-let requested: string[] = [];
+let requested: VListViewOwner[] = [];
 
 function Harness() {
 	renders.push(
@@ -141,8 +143,9 @@ function latest(): UseVListContentViewResult {
 
 function target(overrides: Partial<VListViewTarget> = {}): VListViewTarget {
 	return {
-		id: "tool-tu_1:s1",
-		slot: "s1",
+		id: "call-1/output.main",
+		slot: "output.main",
+		owner: { specKey: "tool-tu_1" },
 		kind: "term",
 		text: "prefix only",
 		...overrides,
@@ -180,8 +183,8 @@ describe("openFullscreen requests a truncated body's full payload", () => {
 		await settle();
 		// The spec key half of `${specKey}:${slot}` — what the shell's
 		// per-key `markVListFullPayloadRequested` handler is cached under.
-		expect(requested).toEqual(["tool-tu_1"]);
-		expect(latest().openTarget?.id).toBe("tool-tu_1:s1");
+		expect(requested).toEqual([{ specKey: "tool-tu_1" }]);
+		expect(latest().openTarget?.id).toBe("call-1/output.main");
 	});
 
 	test("a COMPLETE body fetches nothing (there is nothing left to load)", async () => {
@@ -189,7 +192,7 @@ describe("openFullscreen requests a truncated body's full payload", () => {
 		latest().controls.openFullscreen(target());
 		await settle();
 		expect(requested).toEqual([]);
-		expect(latest().openTarget?.id).toBe("tool-tu_1:s1");
+		expect(latest().openTarget?.id).toBe("call-1/output.main");
 	});
 
 	test("closing and reopening re-requests, which is safe (the channel is grow-only)", async () => {
@@ -201,7 +204,7 @@ describe("openFullscreen requests a truncated body's full payload", () => {
 		expect(latest().openTarget).toBeNull();
 		latest().controls.openFullscreen(target({ truncated: true }));
 		await settle();
-		expect(requested).toEqual(["tool-tu_1", "tool-tu_1"]);
+		expect(requested).toEqual([{ specKey: "tool-tu_1" }, { specKey: "tool-tu_1" }]);
 	});
 });
 
@@ -241,8 +244,52 @@ describe("refreshOpenTarget follows the data into the open modal", () => {
 		await settle();
 		latest().refreshOpenTarget(target({ id: "tool-tu_2:s1", text: "other row" }));
 		await settle();
-		expect(latest().openTarget?.id).toBe("tool-tu_1:s1");
+		expect(latest().openTarget?.id).toBe("call-1/output.main");
 		expect(latest().openTarget?.text).toBe("prefix only");
+	});
+
+	test("refreshes same-text lifecycle, revision and range changes", async () => {
+		await mount();
+		const model: ToolCappedDetail = {
+			kind: "capped",
+			id: "call-1/output.main",
+			source: "output.main",
+			cap: "term",
+			format: "text",
+			live: true,
+			followTarget: { kind: "end" },
+			text: "prefix only",
+			revision: 1,
+		};
+		latest().controls.openFullscreen(target({ model }));
+		await settle();
+		const settled = { ...model, live: false };
+		latest().refreshOpenTarget(target({ model: settled }));
+		await settle();
+		expect(latest().openTarget?.model?.live).toBe(false);
+		const moved = {
+			...settled,
+			revision: 2,
+			range: createSourceText("prefix only", { epoch: "next" }).range,
+		};
+		latest().refreshOpenTarget(target({ model: moved }));
+		await settle();
+		expect(latest().openTarget?.model?.revision).toBe(2);
+		expect(latest().openTarget?.model?.range?.epoch).toBe("next");
+	});
+
+	test("scopes toggles and payload lookup by the explicit trace owner", async () => {
+		await mount();
+		const traced = target({
+			owner: { specKey: "folded-trace", traceItemIndex: 9 },
+			truncated: true,
+		});
+		latest().controls.toggleWrap(traced);
+		latest().controls.openFullscreen(traced);
+		await settle();
+		expect(requested).toEqual([{ specKey: "folded-trace", traceItemIndex: 9 }]);
+		expect(latest().rowSig("folded-trace")).toContain(traced.id);
+		expect(latest().rowSig("tool-tu_1")).toBe("");
 	});
 
 	test("does nothing while no modal is open", async () => {

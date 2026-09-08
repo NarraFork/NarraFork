@@ -1,3 +1,4 @@
+import { notifyHumanAttentionChanged } from "@server/services/human-attention-events";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
@@ -184,9 +185,11 @@ async function markExitPlanReflectionStatus(
 	try {
 		const { narratorService } = await import("@server/services/narrator-service");
 		const nextStatus = status === "running" || status === "awaiting_user" ? "waiting" : "working";
-		const substatus = status === "running" ? ["reflecting"] : status === "awaiting_user" ? [] : [];
+		const substatus = status === "running" ? ["reflecting"] : [];
 		await narratorService.updateStatus(pending.narratorId, nextStatus, { substatus });
-		if (pending.broadcastTargetId !== pending.narratorId) {
+		// Broadcast the child gate to its parent card without changing the parent's
+		// own status. Only explicit manual takeover is a user-facing wait there.
+		if (pending.reflectionStoppedByUser && pending.broadcastTargetId !== pending.narratorId) {
 			await narratorService.updateStatus(pending.broadcastTargetId, nextStatus, { substatus });
 		}
 	} catch {
@@ -239,6 +242,7 @@ export function createExitPlanReflectionDecision(
 		resolved: false,
 		startedAt: Date.now(),
 	});
+	notifyHumanAttentionChanged();
 	return promise;
 }
 
@@ -264,7 +268,7 @@ async function resolveExitPlanReflection(
 		reason,
 		decision.action === "confirm_compact",
 	);
-	pendingExitPlanReflections.delete(requestId);
+	if (pendingExitPlanReflections.delete(requestId)) notifyHumanAttentionChanged();
 	pending.resolve(decision);
 	return true;
 }
@@ -318,6 +322,9 @@ export async function takeOverExitPlanReflection(
 	pending.reflectionStoppedByUser = true;
 	pending.abortController?.abort(new Error(message));
 	await markExitPlanReflectionStatus(pending, "awaiting_user", message);
+	// This synthetic gate is NOT approvable; the subsequent real permission registration
+	// sends its own invalidation once it is discoverable.
+	notifyHumanAttentionChanged();
 	return true;
 }
 
@@ -339,7 +346,7 @@ export function getExitPlanReflectionNarratorId(requestId: string): string | nul
 }
 
 export function cleanupExitPlanReflection(requestId: string): void {
-	pendingExitPlanReflections.delete(requestId);
+	if (pendingExitPlanReflections.delete(requestId)) notifyHumanAttentionChanged();
 }
 
 export const exitPlanConfirmTool: ToolDefinition = {

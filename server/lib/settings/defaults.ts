@@ -63,6 +63,7 @@ export const DEFAULTS: NarraForkSettings = {
 			search: [],
 			review: [],
 		},
+		subagentModelReasoningEfforts: {},
 		legacyEncoding: false,
 		freshShellEnv: false,
 		requestDumpEnabled: false,
@@ -471,6 +472,12 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"agent.subagentAllowedModels.review": {
 		desc: "review 子代理允许的模型池。空数组表示无限制。",
 		type: "string[]",
+	},
+	"agent.subagentModelReasoningEfforts": {
+		desc: "子代理模型池的可选固定思考等级。仅影响之后新建的子代理，覆盖调用方指定等级；缺席条目不覆盖原有继承。",
+		type: "object",
+		valid:
+			"explore/plan/search/review/general；每类最多 50 项；模型引用最长 200；等级 none/low/medium/high/xhigh/max；默认 {}",
 	},
 	"agent.legacyEncoding": {
 		desc: "启用非 UTF-8 编码检测（GBK、Shift_JIS 等）。启用后文件读写使用 chardet 自动检测并保留原始编码。禁用时仅使用 UTF-8。",

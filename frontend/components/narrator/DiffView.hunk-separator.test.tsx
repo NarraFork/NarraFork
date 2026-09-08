@@ -19,6 +19,7 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { clearShikiTokenCache } from "@frontend/lib/shiki-token-cache";
 import { MantineProvider } from "@mantine/core";
 import { parseUnifiedDiff } from "@shared/pretext-layout/parse-unified-diff";
 import { parseHTML } from "linkedom";
@@ -62,6 +63,8 @@ mock.module("../../lib/shiki-loader", () => ({
 	}),
 }));
 
+const { installCanvasStub } = await import("./vlist/measure/test-canvas-stub");
+installCanvasStub();
 const { DiffView } = await import("./DiffView");
 
 class TestResizeObserver {
@@ -158,6 +161,8 @@ function renderPatch(language?: string, patch: string = PATCH, onNearBottom?: ()
 	root.render(
 		<MantineProvider>
 			<DiffView
+				// This fixture owns a known box; linkedom cannot resolve CSS flex geometry.
+				layout={{ width: 700, height: 400 }}
 				lines={parsed.lines}
 				hunks={parsed.hunks}
 				maxHeight={400}
@@ -182,11 +187,7 @@ function separators(): HTMLElement[] {
  * hard-coding the depth.
  */
 function diffRows(): HTMLElement[] {
-	const list = separators()[0]?.parentElement;
-	if (!list) return [];
-	return Array.from(list.children).filter(
-		(el): el is HTMLElement => !el.hasAttribute("data-diff-hunk-separator"),
-	);
+	return Array.from(container?.querySelectorAll<HTMLElement>("[data-diff-row]") ?? []);
 }
 
 /** Row indexes that rendered at least one span in `color`. */
@@ -241,6 +242,7 @@ describe("DiffView", () => {
 	afterAll(() => {
 		// `mock.module` is process-wide and survives `mock.restore()`, so the real
 		// loader has to be handed back or every later suite gets the fake tokeniser.
+		clearShikiTokenCache();
 		mock.module("../../lib/shiki-loader", () => realShikiLoader);
 		mock.restore();
 	});
@@ -319,34 +321,49 @@ describe("DiffView", () => {
 
 	test("fires near-bottom once until the reader leaves the bottom zone", async () => {
 		let calls = 0;
-		renderPatch(undefined, PATCH, () => {
+		const body = Array.from({ length: 200 }, (_, index) => ` line${index}`);
+		const patch = ["@@ -1,200 +1,200 @@", ...body].join("\n");
+		renderPatch(undefined, patch, () => {
 			calls++;
 		});
 		await flushRender();
 
-		const scroller = container?.querySelector<HTMLElement>('[data-diff-scroll-container="true"]');
-		expect(scroller).toBeTruthy();
-		if (!scroller) return;
-		Object.defineProperties(scroller, {
-			clientHeight: { configurable: true, value: 500 },
-			scrollHeight: { configurable: true, value: 2_000 },
-			scrollTop: { configurable: true, value: 1_300, writable: true },
-		});
-
+		const scroller = container?.querySelector<HTMLElement>("[data-content-scrollport]");
+		if (!scroller) throw new Error("declared scrollport missing");
+		const content = scroller.querySelector<HTMLElement>("[data-content-box]");
+		if (!content) throw new Error("declared content box missing");
+		// These are model-owned CSS declarations, not simulated client/scroll dimensions.
+		// The actual 200-row payload determines the content extent, including its hunk.
+		const scrollHeight = Number.parseFloat(content.style.height);
+		const viewportHeight = Number.parseFloat(scroller.style.height);
+		const contentOrigin = Number.parseFloat(content.style.padding);
+		expect(scroller.getAttribute("data-content-geometry")).toBe("layout");
+		expect(viewportHeight).toBe(400);
+		expect(scrollHeight).toBeGreaterThan(viewportHeight + 240);
+		expect(contentOrigin).toBe(10);
+		// DiffContent compares content-local top, so include the declared top inset.
+		const zoneStart = scrollHeight - viewportHeight - 120 + contentOrigin;
+		const outsideZone = zoneStart - 50;
+		const insideZone = zoneStart + 1;
+		scroller.scrollTop = outsideZone;
 		scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+		await flushRender();
 		expect(calls).toBe(0);
 
-		scroller.scrollTop = 1_390;
+		scroller.scrollTop = insideZone;
 		scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
 		scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+		await flushRender();
 		expect(calls).toBe(1);
 
 		// Leaving the 120px zone resets the latch. Returning to it represents the
 		// next deliberate downward scroll and may load one more segment.
-		scroller.scrollTop = 1_000;
+		scroller.scrollTop = outsideZone;
 		scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-		scroller.scrollTop = 1_400;
+		await flushRender();
+		scroller.scrollTop = insideZone;
 		scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+		await flushRender();
 		expect(calls).toBe(2);
 	});
 });

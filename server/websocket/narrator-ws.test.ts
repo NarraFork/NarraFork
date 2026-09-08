@@ -12,6 +12,7 @@ const realDbModule = { ...(await import("../db")) };
 mock.module("../db", () => ({ db, sqlite }));
 
 const { broadcastToUser, getNarratorConnections, handleNarratorWS } = await import("./narrator-ws");
+const { eventBus } = await import("../lib/event-bus");
 
 type SentMessage = Record<string, unknown>;
 type FakeNarratorWS = Parameters<typeof handleNarratorWS.open>[0];
@@ -135,6 +136,82 @@ afterAll(() => {
 	sqlite.close();
 });
 
+describe("HumanAttention global invalidation", () => {
+	it("reaches authenticated clients without any narrator subscription and carries no source data", async () => {
+		const first = openFakeWs({ userId: "attention-user-a" });
+		const second = openFakeWs({ userId: "attention-user-b" });
+		const anonymous = createFakeWs();
+		anonymous.ws.data.userId = undefined;
+		handleNarratorWS.open(anonymous.ws);
+		openedConnections.push(anonymous.ws);
+
+		for (let index = 0; index < 10; index++) {
+			eventBus.emit({ type: "human_attention:changed" });
+		}
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		for (const { sent, ws } of [first, second]) {
+			expect(ws.data.subscribedNarrators.size).toBe(0);
+			expect(sent.filter((message) => message.type === "human_attention_changed")).toEqual([
+				{ type: "human_attention_changed" },
+			]);
+		}
+		expect(anonymous.sent.filter((message) => message.type === "human_attention_changed")).toEqual(
+			[],
+		);
+
+		// A later committed change must not be swallowed by the previous batch.
+		eventBus.emit({ type: "human_attention:changed" });
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		expect(first.sent.filter((message) => message.type === "human_attention_changed")).toHaveLength(
+			2,
+		);
+	});
+
+	it("invalidates cascaded question deletion without exposing the private history frame", async () => {
+		const { sent } = openFakeWs();
+		eventBus.emit({
+			type: "narrator:message_broadcast",
+			narratorId: "private-owner",
+			message: {
+				type: "messages_deleted",
+				narratorId: "private-owner",
+				deletedMessageIds: ["private-question-message"],
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		expect(sent.filter((message) => message.type === "human_attention_changed")).toEqual([
+			{ type: "human_attention_changed" },
+		]);
+		expect(sent.some((message) => message.type === "messages_deleted")).toBe(false);
+	});
+
+	it("does not turn reflection progress or narrator working status into inbox scans", async () => {
+		const { sent } = openFakeWs();
+		eventBus.emit({
+			type: "narrator:status_changed",
+			narratorId: "unsubscribed-child",
+			status: "waiting",
+			substatus: ["reflecting"],
+		});
+		eventBus.emit({
+			type: "narrator:message_broadcast",
+			narratorId: "unsubscribed-child",
+			message: {
+				type: "reflection_progress",
+				narratorId: "unsubscribed-child",
+				requestId: "automatic-gate",
+				toolUseId: "automatic-tool",
+				kind: "danger_reflection",
+				phase: "thinking",
+				thinkingChars: 200,
+				outputChars: 0,
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		expect(sent.filter((message) => message.type === "human_attention_changed")).toEqual([]);
+	});
+});
+
 describe("narrator WebSocket message snapshot subscribe", () => {
 	it("returns request-scoped sync_ok for a matching version-only empty snapshot", async () => {
 		seedNarrators();
@@ -152,6 +229,21 @@ describe("narrator WebSocket message snapshot subscribe", () => {
 			type: "sync_ok",
 			narratorId: "narrator-idle",
 			version: 0,
+			subscriptionRequestId: "messages-empty-current",
+		});
+		// Panel subscriptions own runtime state, independently of the message cursor.
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "panel",
+			narratorIds: ["narrator-idle"],
+			requestId: "messages-empty-current",
+		});
+		// Reconnect must explicitly clear client queue tags even with no streaming snapshot.
+		expect(sent).toContainEqual({
+			type: "queue_status",
+			narratorId: "narrator-idle",
+			position: 0,
+			queueDepth: 0,
 			subscriptionRequestId: "messages-empty-current",
 		});
 		expect(ws.data.subscribedNarrators.has("narrator-idle")).toBe(true);

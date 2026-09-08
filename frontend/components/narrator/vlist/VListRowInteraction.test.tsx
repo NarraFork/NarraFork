@@ -16,6 +16,8 @@ import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import type { ToolCallDetailRef } from "../../../lib/api/narrators";
+import { NarratorDockContext, type NarratorDockContextValue } from "../dock/NarratorDockContext";
 
 const realReactI18nextModule = { ...(await import("react-i18next")) };
 const realUsePlatformModule = { ...(await import("@frontend/hooks/usePlatform")) };
@@ -131,6 +133,8 @@ function installDom() {
 }
 
 interface RenderOpts {
+	dock?: NarratorDockContextValue;
+	toolDetailRef?: ToolCallDetailRef & { toolUseId?: string };
 	toolMeta?: VListToolMeta;
 	handlers?: VListRowHandlers;
 	narratorId?: string;
@@ -149,21 +153,24 @@ async function renderRow(opts: RenderOpts = {}) {
 	await act(async () => {
 		root?.render(
 			<MantineProvider>
-				<VListRowInteraction
-					blockId="sa-tu_1"
-					messageId="m1"
-					blockIndex={0}
-					copyText={opts.copyText}
-					actions={opts.actions ?? { messageId: "m1" }}
-					narratorId={opts.narratorId}
-					toolUseId={opts.toolUseId}
-					toolMeta={opts.toolMeta}
-					toolActions={toolActions}
-					onViewOriginal={opts.onViewOriginal}
-					onOpenFullscreen={opts.onOpenFullscreen}
-				>
-					<div>row body</div>
-				</VListRowInteraction>
+				<NarratorDockContext.Provider value={opts.dock ?? null}>
+					<VListRowInteraction
+						blockId="sa-tu_1"
+						messageId="m1"
+						blockIndex={0}
+						copyText={opts.copyText}
+						actions={opts.actions ?? { messageId: "m1" }}
+						narratorId={opts.narratorId}
+						toolUseId={opts.toolUseId}
+						toolDetailRef={opts.toolDetailRef}
+						toolMeta={opts.toolMeta}
+						toolActions={toolActions}
+						onViewOriginal={opts.onViewOriginal}
+						onOpenFullscreen={opts.onOpenFullscreen}
+					>
+						<div>row body</div>
+					</VListRowInteraction>
+				</NarratorDockContext.Provider>
 			</MantineProvider>,
 		);
 	});
@@ -212,6 +219,31 @@ afterAll(() => {
 	mock.module("@frontend/hooks/usePlatform", () => realUsePlatformModule);
 	mock.module("../MessageSelectionCtx", () => realMessageSelectionModule);
 	mock.restore();
+});
+
+test("Edit right-click prefers the persisted tool ref over the render id and current-file action", async () => {
+	const openFilePanel = mock((..._args: unknown[]) => {});
+	const legacyOpen = mock((_path: string) => {});
+	const ref = {
+		toolUseId: "actual-sdk",
+		toolCallId: "actual-pk",
+		messageId: "actual-message",
+		executionAttempt: 2,
+	};
+	await renderRow({
+		narratorId: "row-reader",
+		toolUseId: "render-only-index",
+		toolDetailRef: ref,
+		toolMeta: { toolName: "Edit", filePath: "/work/a.ts", isFileTool: true },
+		handlers: { onOpenFilePanel: legacyOpen },
+		dock: { narratorId: "different-host", openFilePanel } as unknown as NarratorDockContextValue,
+	});
+	expect(menuLabels()).toContain("editPreview.open");
+	clickMenuItem("editPreview.open");
+	expect(openFilePanel).toHaveBeenCalledWith("/work/a.ts", undefined, {
+		toolEdit: { ...ref, narratorId: "row-reader" },
+	});
+	expect(legacyOpen).not.toHaveBeenCalled();
 });
 
 describe("VListRowInteraction — subagent card items", () => {

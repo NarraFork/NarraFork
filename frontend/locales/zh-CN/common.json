@@ -1,4 +1,8 @@
 {
+	"scrollbar": {
+		"vertical": "垂直滚动条",
+		"horizontal": "水平滚动条"
+	},
 	"create": "创建",
 	"save": "保存",
 	"delete": "删除",

@@ -17,6 +17,7 @@
  *   catalog keeps serving while the provider is unreachable.
  */
 
+import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import type { JsonValue } from "@server/lib/plugins/protocol";
 import type { ProviderHostHintsContext } from "./plugin-provider-adapter-factory";
@@ -272,6 +273,14 @@ export class PluginProviderCatalogRefresher {
 			this.registry.updateModelCatalog(entry.providerInstanceId, collected, {
 				...(catalogVersion ? { catalogVersion } : {}),
 				stale,
+			});
+			// Discovery runs after registration/activation (and may finish after a page cached
+			// an empty settings response). Notify only after the complete catalog is installed;
+			// no models, configs or credentials are included in the broadcast.
+			eventBus.emit({
+				type: "plugin:provider_models_changed",
+				pluginId: entry.pluginId,
+				providerInstanceId: entry.providerInstanceId,
 			});
 			logger.debug("plugin provider catalog refreshed", {
 				providerInstanceId: entry.providerInstanceId,

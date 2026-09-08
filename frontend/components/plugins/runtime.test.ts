@@ -131,6 +131,58 @@ describe("PluginUiSession", () => {
 		expect(session.getSnapshot().status).toBe("disposed");
 	});
 
+	test("resyncs presentation changed while connecting before the plugin entry loads", async () => {
+		let scheme: "light" | "dark" = "light";
+		const session = new PluginUiSession({
+			params,
+			contribution,
+			getPresentation: () => ({
+				tokenCss: `:root { --nf-color-body: ${scheme === "light" ? "white" : "black"}; }`,
+				colorScheme: scheme,
+				locale: scheme === "light" ? "en" : "zh-CN",
+				localeChain: scheme === "light" ? ["en"] : ["zh-CN", "en"],
+			}),
+		});
+		const initialShell = session.getSrcdoc();
+		const received: Array<{ kind: string; method?: string; params?: unknown }> = [];
+		let pluginPort: MessagePort | undefined;
+		try {
+			scheme = "dark";
+			session.setColorScheme(scheme); // No ready port yet; this cannot be delivered.
+			session.attach(
+				fakeIframe((bootstrap, port) => {
+					pluginPort = port;
+					port.addEventListener("message", (event) => received.push(event.data));
+					port.start();
+					port.postMessage({
+						protocol: "narrafork.ui/1",
+						kind: "request",
+						id: "delayed_handshake",
+						method: "handshake",
+						params: {
+							nonce: bootstrap.nonce,
+							pluginId: bootstrap.pluginId,
+							contributionId: bootstrap.contributionId,
+							panelInstanceId: bootstrap.panelInstanceId,
+							protocolVersion: 1,
+						},
+					});
+				}),
+			);
+			await waitFor(() => received.some((event) => event.kind === "response"));
+			expect(received.slice(0, 3)).toMatchObject([
+				{ method: "host.theme", params: { tokenCss: ":root { --nf-color-body: black; }" } },
+				{ method: "host.theme", params: { colorScheme: "dark" } },
+				{ method: "host.locale", params: { locale: "zh-CN", localeChain: ["zh-CN", "en"] } },
+			]);
+			expect(received[3].kind).toBe("response");
+			expect(session.getSrcdoc()).toBe(initialShell); // No iframe reload to fix a theme.
+		} finally {
+			session.dispose();
+			pluginPort?.close();
+		}
+	});
+
 	test("fails closed when the plugin does not complete the handshake", async () => {
 		const session = new PluginUiSession({ params, contribution, defaultTimeoutMs: 5 });
 		session.attach(

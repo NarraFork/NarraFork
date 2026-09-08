@@ -10,17 +10,7 @@
  * content later; this file only decides which detail variant applies and how
  * many wrapping lines / pixels it will occupy.
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * TYPE-SYNC NOTE (IMPORTANT):
- * The `ToolDetailData` union + variant types below are a STRUCTURAL COPY of the
- * authoritative definitions in
- *   frontend/components/narrator/vlist/measure/measure-tool-call.ts (~L205-296).
- * They are duplicated here (rather than imported) because importing a frontend
- * module would break this file's purity guard. The two copies MUST stay in sync
- * field-for-field. If you change one, change the other. The adapter passes
- * `data.detail` through the registry's `unknown`-compatible boundary, so
- * structural identity is all that is required.
- * ─────────────────────────────────────────────────────────────────────────────
+ * Shared types are the single source for classification, measurement and paint.
  */
 
 import { hasUsablePlanBody } from "../plan-reference";
@@ -32,16 +22,23 @@ import {
 	readToolProgressPayload,
 } from "../tool-progress";
 import {
-	computeDiffCached,
-	diffLineNoWidth as computeDiffLineNoWidth,
 	countDiffLineStats,
-	type DiffLine,
+	createDiffDocument,
+	type DiffDocument,
 	type DiffLineStats,
+	type DiffSourcePoint,
+	MAX_DIFF_INPUT_CHARS,
 } from "./diff-core";
+import {
+	createSourceText,
+	isSourceTextRange,
+	normalizeSourceText,
+	type SourceTextRange,
+} from "./source-text";
 import { hasTruncatedLeaf, readLeafText, stringifyForDisplay } from "./tool-io-projection";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Structural mirror of measure-tool-call.ts's detail union (keep in sync).
+// Canonical tool-detail bodies and ordered sections.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Which maxHeight cap a `capped` detail body uses (mirrors DetailCapKind). */
@@ -54,6 +51,7 @@ export type DetailCapKind =
 	| "skill"
 	| "knowledge"
 	| "plan"
+	| "agent-result"
 	| "streaming-bash"
 	| "streaming";
 
@@ -107,17 +105,29 @@ export interface ToolMediaRef {
 	height?: number;
 }
 
-/** 🟡 A single maxHeight-capped detail body (code/term/diff/media/skill/…). */
+export type ToolBodySource = `input.${string}` | `output.${string}`;
+export type ToolBodyFormat = "text" | "code" | "markdown" | "diff" | "media";
+export type ToolBodyFollowTarget =
+	| { kind: "end" }
+	| { kind: "diff-row"; focus: DiffSourcePoint | null };
+
+/** One canonical body descriptor. Geometry and viewport reading state live elsewhere. */
 export interface ToolCappedDetail {
 	kind: "capped";
-	/** Which cap applies (also selects the default label behaviour). */
+	id: string;
+	source: ToolBodySource;
+	format: ToolBodyFormat;
+	live: boolean;
+	followTarget: ToolBodyFollowTarget;
+	range?: SourceTextRange;
+	revision?: string | number;
+	diffDocument?: DiffDocument;
+	/** Height budget only; labels and presentation never derive from it. */
 	cap: DetailCapKind;
 	/** Estimated content line count (× DETAIL_CONTENT_LINE_HEIGHT). */
 	contentLines?: number;
 	/** Direct content pixel estimate (media/images); wins over contentLines. */
 	contentPx?: number;
-	/** Override the default label presence for this cap kind. */
-	hasLabel?: boolean;
 	/**
 	 * The real body text (code / command / diff / output), painted inside the
 	 * maxHeight-capped scroll box.
@@ -138,13 +148,6 @@ export interface ToolCappedDetail {
 	 * aspect-fitted content height over the fixed fallback).
 	 */
 	media?: ToolMediaRef;
-	/**
-	 * Render `text` as MARKDOWN instead of plain monospace (ExitPlanMode plans,
-	 * matching the chunked card's `ContentViewer markdown`). The measure layer
-	 * parses/measures the body as markdown; the render layer paints it with
-	 * RenderMarkdown inside the same maxHeight-capped scroll box.
-	 */
-	markdown?: boolean;
 	/**
 	 * True when `text` is only a PREFIX of the real body (a truncated leaf).
 	 *
@@ -182,46 +185,6 @@ export interface ToolCappedDetail {
 	 * Height-neutral.
 	 */
 	codeLangPath?: string;
-	/**
-	 * The structured diff model for a `diff` cap: real context / removed / added
-	 * rows with their old and new line numbers and word-level changes.
-	 *
-	 * MEASURED, not render-only. `text` remains the plain fallback (and the copy
-	 * source), but when this is present the height comes from these rows wrapped
-	 * at the available width MINUS the fixed gutter, because the gutter narrows
-	 * every code line. The render layer draws the two-column line-number gutter,
-	 * the per-line +/- background and the word-level tints from it.
-	 */
-	diffLines?: DiffLine[];
-	/**
-	 * Character width of ONE line-number column in the diff gutter, so both
-	 * columns align. Absent when the diff has no known start line (no gutter).
-	 * MEASURED: it determines how much horizontal room the code column loses.
-	 */
-	diffLineNoWidth?: number;
-	/**
-	 * Placeholder prefix for provisional line numbers (streaming Edit before the
-	 * match location is known) — the chunked card's `lineNumberPrefix`.
-	 */
-	diffLineNumberPrefix?: string;
-}
-
-/** 🟡 Generic detail: an input section + an optional output section (cap 200 each). */
-export interface ToolGenericDetail {
-	kind: "generic";
-	inputLines: number;
-	outputLines?: number;
-	/**
-	 * Real input/output body text painted in the capped box. MEASURED when
-	 * present (wrapped at the available width, bounded); `inputLines`/
-	 * `outputLines` are the fallback when no text is carried.
-	 */
-	inputText?: string;
-	outputText?: string;
-	/** `inputText` is only a prefix → reserve the full cap (see textTruncated). */
-	inputTruncated?: boolean;
-	/** `outputText` is only a prefix → reserve the full cap. */
-	outputTruncated?: boolean;
 }
 
 /** One SpecTasks row: text drives wrapping; status/protected drive the glyph. */
@@ -462,6 +425,8 @@ export type ToolSectionBody =
 
 /** One labelled section inside a multi-part detail. */
 export interface ToolDetailSection {
+	/** Semantic identity, never a path, label, array slot or text revision. */
+	key: string;
 	/** Localized by the render layer via its label table; omitted = no label row. */
 	label?: ToolSectionLabel;
 	body: ToolSectionBody;
@@ -480,15 +445,7 @@ export interface ToolSectionsDetail {
 	sections: ToolDetailSection[];
 }
 
-export type ToolDetailData =
-	| ToolCappedDetail
-	| ToolGenericDetail
-	| ToolSpecTasksDetail
-	| ToolStructuredDetail
-	| ToolErrorDetail
-	| ToolMetaRowsDetail
-	| ToolAskDetail
-	| ToolSectionsDetail;
+export type ToolDetailData = ToolSectionsDetail;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure helpers (mirrored in frontend/components/narrator/tool-display.ts — keep
@@ -732,7 +689,12 @@ function stringArray(val: unknown): string[] {
 // DetailRenderer's dominant height-driving branch.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface ClassifyToolDetailInput {
+export type ClassifyToolDetailInput = ClassifyToolDetailFields &
+	({ toolUseId: string; previewId?: never } | { previewId: string; toolUseId?: never });
+
+interface ClassifyToolDetailFields {
+	/** Explicit producer-supplied attempt identity; never inferred from a viewport index. */
+	occurrence?: string | number;
 	toolName: string;
 	category: string;
 	status?: string | null;
@@ -797,33 +759,95 @@ function isFailStatus(status?: string | null): boolean {
  * knowledge|generic).
  */
 export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailData | null {
-	const { toolName, category, status, inputJson, outputJson } = input;
+	const { toolName, category, status } = input;
 	const metadata = asObject(input.metadata);
-
-	// Streaming input owns the whole detail region while it lasts, and it owns it
-	// EXCLUSIVELY: the chunked card swaps DetailRenderer for StreamingInputDetail
-	// (ToolCallCard.tsx:5740) and renders nothing when there is no preview yet.
-	//
-	// Falling through to the category classifiers here leaked NarraFork's internal
-	// stream markers into the UI. A Write whose `content` arrives before its
-	// `file_path` has no real `content` field yet (the text lives only in
-	// `_streamingFieldValue`), so `classifyFile` hit its `resolveDisplayText`
-	// fallback and dumped `{_streamingChars, _streamingFieldName, ...}` into the
-	// card as JSON, labelled "Input".
-	if (input.isStreaming) {
-		return classifyStreamingInput(toolName, category, inputJson, metadata);
-	}
-
-	const base = classifyByCategory(
-		toolName,
-		category,
-		status,
-		inputJson,
-		outputJson,
-		metadata,
-		input,
+	const fields =
+		asObject(input.inputJson) && !Array.isArray(input.inputJson) && !isTruncated(input.inputJson)
+			? toolInputFieldView(input.inputJson)
+			: input.inputJson;
+	const output = toolOutputValue(input.outputJson, metadata);
+	const base = withErrorSection(
+		classifyByCategory(toolName, category, status, fields, output, metadata, input),
+		input.errorMessage,
+		input.outputJson,
 	);
-	return withErrorSection(base, input.errorMessage, outputJson);
+	if (!base) return null;
+	return {
+		kind: "sections",
+		sections: base.sections.map((part) => ({
+			...part,
+			body: part.body.kind === "capped" ? describeToolBody(part.body, input) : part.body,
+		})),
+	};
+}
+
+/** Resolve each field once: current delta > settled stream fields > formal input. */
+export function toolInputFieldView(value: unknown): Record<string, unknown> {
+	const input = asObject(value) ?? {};
+	const settled = asObject(input._streamingFields) ?? {};
+	const fields: Record<string, unknown> = {};
+	for (const [key, field] of Object.entries(input)) {
+		if (!key.startsWith("_streaming")) fields[key] = field;
+	}
+	Object.assign(fields, settled);
+	const name = readLeafText(input._streamingFieldName);
+	if (name !== undefined && Object.hasOwn(input, "_streamingFieldValue")) {
+		fields[name] = input._streamingFieldValue;
+	}
+	if (!Object.hasOwn(fields, "file_path") && Object.hasOwn(input, "_streamingFilePath")) {
+		fields.file_path = input._streamingFilePath;
+	}
+	return fields;
+}
+
+/** An explicit empty output supersedes an old streaming snapshot. */
+export function toolOutputValue(output: unknown, metadata: unknown): unknown {
+	return output ?? asObject(metadata)?._streamingOutput;
+}
+
+export function toolBodyId(
+	callIdentity: string,
+	source: ToolBodySource,
+	occurrence?: string | number,
+): string {
+	return JSON.stringify(
+		occurrence === undefined ? [callIdentity, source] : [callIdentity, source, occurrence],
+	);
+}
+
+/** Canonical lifecycle descriptor shared with the real subagent-card adapter. */
+export function describeToolBody(
+	body: ToolCappedDetail,
+	input: ClassifyToolDetailInput,
+): ToolCappedDetail {
+	const rawInput = asObject(input.inputJson);
+	const metadata = asObject(input.metadata);
+	const field = body.source.slice("input.".length);
+	const currentField = readLeafText(rawInput?._streamingFieldName);
+	const inputLive = !isTerminalToolStatus(input.status) && input.isStreaming === true;
+	const live = body.source.startsWith("input.")
+		? inputLive &&
+			(field === "arguments" ||
+				currentField === undefined ||
+				(field === "edit"
+					? currentField === "old_string" || currentField === "new_string"
+					: currentField === field))
+		: !isTerminalToolStatus(input.status) && !inputLive && metadata?._streamingOutput != null;
+	const range = body.source.startsWith("input.")
+		? asObject(rawInput?._streamingFieldRanges)?.[field]
+		: metadata?._streamingOutputRange;
+	return {
+		...body,
+		id: toolBodyId(input.toolUseId ?? `preview:${input.previewId}`, body.source, input.occurrence),
+		live: body.format !== "media" && live,
+		...(isSourceTextRange(range) ? { range } : {}),
+		...(body.diffDocument
+			? {
+					revision: body.diffDocument.revision,
+					followTarget: { kind: "diff-row", focus: body.diffDocument.focus } as const,
+				}
+			: {}),
+	};
 }
 
 function classifyByCategory(
@@ -839,11 +863,11 @@ function classifyByCategory(
 		case "read":
 			return classifyRead(inputJson, outputJson, metadata);
 		case "file":
-			return classifyFile(toolName, inputJson, metadata);
+			return classifyFile(toolName, inputJson, metadata, input);
 		case "tasks":
-			return classifyTasks(toolName, inputJson, outputJson, metadata);
+			return classifyTasks(toolName, inputJson, outputJson, metadata, input);
 		case "bash":
-			return classifyBash(inputJson, outputJson, metadata);
+			return classifyBash(status, inputJson, outputJson, metadata, input.isStreaming === true);
 		case "search":
 			return classifySearch(status, inputJson, outputJson);
 		case "webSearch":
@@ -852,12 +876,23 @@ function classifyByCategory(
 			return classifyWebFetch(status, inputJson, outputJson, metadata);
 		case "taskOutput":
 			return classifyTaskOutput(inputJson, outputJson);
-		case "agent":
-			return classifyGeneric(inputJson, outputJson);
+		case "agent": {
+			const prompt = readLeafText(asObject(inputJson)?.prompt) ?? readLeafText(inputJson);
+			if (prompt === undefined) return classifyGeneric(inputJson, outputJson);
+			return sections([
+				textSection("input.prompt", asObject(inputJson)?.prompt ?? inputJson, "input", {
+					text: prompt,
+					format: "markdown",
+				}),
+				textSection("output.main", outputJson, "result", {
+					format: "markdown",
+				}),
+			]);
+		}
 		case "await":
 			return classifyAwait(inputJson, outputJson, metadata);
 		case "send":
-			return classifySend(inputJson, outputJson, metadata);
+			return classifySend(inputJson, outputJson, metadata, input.labels);
 		case "ask":
 			return classifyAsk(inputJson, input.hasPendingPermission === true, input.labels);
 		case "plan":
@@ -876,7 +911,7 @@ function classifyByCategory(
 		case "share":
 			return classifyShare(inputJson, outputJson, metadata);
 		case "transfer":
-			return classifyTransfer(status, inputJson, outputJson, metadata, input.errorMessage);
+			return classifyTransfer(status, inputJson, input.outputJson, metadata, input.errorMessage);
 		case "recall":
 			return classifyRecall(inputJson, outputJson, metadata);
 		case "skill":
@@ -894,24 +929,23 @@ function classifyByCategory(
 // Section / meta-row builders.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Wrap an ordered section list, collapsing the single-section case to its body. */
+/** Every detail, including one unlabelled body, has the same production shape. */
 function sections(list: Array<ToolDetailSection | null>): ToolDetailData | null {
 	const kept = list.filter((s): s is ToolDetailSection => s !== null);
-	if (kept.length === 0) return null;
-	// One unlabelled section is just that body — keeps the simple cards (and all
-	// their existing height tests) on the original single-block path.
-	const only = kept[0];
-	if (kept.length === 1 && only && only.label === undefined) return only.body;
-	return { kind: "sections", sections: kept };
+	return kept.length > 0 ? { kind: "sections", sections: kept } : null;
 }
 
-/** A section, or null when its body is absent. */
 function section(
+	key: string,
 	label: ToolSectionLabel | undefined,
 	body: ToolSectionBody | null,
 ): ToolDetailSection | null {
 	if (body === null) return null;
-	return label === undefined ? { body } : { label, body };
+	return { key, ...(label === undefined ? {} : { label }), body };
+}
+
+function single(key: string, body: ToolSectionBody): ToolDetailData {
+	return { kind: "sections", sections: [{ key, body }] };
 }
 
 /** A meta-rows body from the non-empty rows, or null when nothing remains. */
@@ -961,36 +995,58 @@ function withErrorSection(
 ): ToolDetailData | null {
 	const text = typeof errorMessage === "string" ? errorMessage.trim() : "";
 	if (!text) return base;
-	// An error-only detail already IS the message.
-	if (base?.kind === "error") return base;
+	if (base?.sections.some((part) => part.body.kind === "error")) return base;
 	// The chunked cards hide the error line once a real output body exists.
 	if (outputJson != null && base !== null) return base;
-	const errorSection: ToolDetailSection = { label: "error", body: { kind: "error", text } };
-	if (base === null) return { kind: "sections", sections: [errorSection] };
-	if (base.kind === "sections") {
-		return { kind: "sections", sections: [...base.sections, errorSection] };
-	}
-	if (base.kind === "generic") {
-		// Generic keeps its own two-section shape; wrap it as one section.
-		return { kind: "sections", sections: [{ body: toCappedInput(base) }, errorSection] };
-	}
-	return { kind: "sections", sections: [{ body: base }, errorSection] };
+	const errorSection: ToolDetailSection = {
+		key: "meta.error",
+		label: "error",
+		body: { kind: "error", text },
+	};
+	return { kind: "sections", sections: [...(base?.sections ?? []), errorSection] };
 }
 
-/** Represent a generic detail's input half as a capped body (section wrapping). */
-function toCappedInput(detail: ToolGenericDetail): ToolCappedDetail {
-	return capped("code", {
-		contentLines: detail.inputLines,
-		hasLabel: false,
-		...(detail.inputText ? { text: detail.inputText } : {}),
-	});
-}
+type CappedOptions = Omit<
+	ToolCappedDetail,
+	"kind" | "cap" | "id" | "source" | "live" | "followTarget" | "format"
+> &
+	Partial<Pick<ToolCappedDetail, "format" | "followTarget">>;
 
+/** Source is mandatory; neither format nor lifecycle is inferred from cap/labels. */
 function capped(
+	source: ToolBodySource,
 	cap: DetailCapKind,
-	extras: Omit<ToolCappedDetail, "kind" | "cap"> = {},
+	extras: CappedOptions = {},
 ): ToolCappedDetail {
-	return { kind: "capped", cap, ...extras };
+	return {
+		kind: "capped",
+		id: source,
+		source,
+		cap,
+		format: "text",
+		live: false,
+		followTarget: { kind: "end" },
+		...extras,
+	};
+}
+
+/** One text-section constructor; absence, empty text and truncation keep their own meanings. */
+function textSection(
+	source: ToolBodySource,
+	value: unknown,
+	label?: ToolSectionLabel,
+	{ cap = "code", ...extras }: CappedOptions & { cap?: DetailCapKind } = {},
+): ToolDetailSection | null {
+	if (value == null) return null;
+	return section(
+		source,
+		label,
+		capped(source, cap, {
+			text: extras.text ?? resolveDisplayText(value),
+			...truncatedFlag(value),
+			...extras,
+		}),
+	);
 }
 
 /**
@@ -1005,63 +1061,31 @@ function truncatedFlag(source: unknown): { textTruncated?: true } {
 	return hasTruncatedLeaf(source) ? { textTruncated: true } : {};
 }
 
-/**
- * Build a `diff` capped body from the two sides of an edit.
- *
- * The real line diff is computed here (not a naive "all old lines removed, all
- * new lines added" concatenation) so both render paths show the same thing: the
- * unchanged context, per-row old/new line numbers, and the word-level changes
- * inside a modified pair.
- *
- * `text` stays as the plain fallback and the copy/selection source, formatted the
- * way a unified diff reads. `diffLines` is what the renderer actually draws when
- * present, and what the measure layer measures.
- *
- * The gutter only exists when the edit's real position is known (`startLine`) or
- * a placeholder prefix is supplied — matching the chunked DiffView, which shows a
- * bare marker column otherwise.
- */
-function diffBody(
-	oldStr: string,
-	newStr: string,
-	startLine: number | undefined,
-	extras: Omit<ToolCappedDetail, "kind" | "cap"> = {},
-	lineNumberPrefix?: string,
-): ToolCappedDetail {
-	// Memoized: this runs on the synchronous layout path for every Edit card on
-	// every rebuild, while the payload it diffs never changes. The rows are shared
-	// with previous callers and are read-only from here on.
-	const lines = computeDiffCached(oldStr, newStr, startLine ?? 1);
-	// Plain-text fallback / copy source: a readable unified-style body.
-	const text = lines
-		.map(
-			(line) =>
-				`${line.type === "removed" ? "-" : line.type === "added" ? "+" : " "}${line.content}`,
-		)
-		.join("\n");
-	const showGutter = startLine != null || lineNumberPrefix != null;
-	return capped("diff", {
-		contentLines: lines.length,
-		...(text ? { text } : {}),
-		diffLines: lines,
-		...(showGutter ? { diffLineNoWidth: computeDiffLineNoWidth(lines, lineNumberPrefix) } : {}),
-		...(lineNumberPrefix ? { diffLineNumberPrefix: lineNumberPrefix } : {}),
-		...extras,
-	});
-}
-
-function classifyGeneric(inputJson: unknown, outputJson: unknown): ToolGenericDetail {
+function classifyGeneric(inputJson: unknown, outputJson: unknown): ToolDetailData {
 	const input = resolveDisplayBody(inputJson);
 	const output = outputJson != null ? resolveDisplayBody(outputJson) : undefined;
-	return {
-		kind: "generic",
-		inputLines: countLines(input.text),
-		outputLines: output != null ? countLines(output.text) : undefined,
-		inputText: input.text || undefined,
-		outputText: output?.text || undefined,
-		...(input.truncated ? { inputTruncated: true } : {}),
-		...(output?.truncated ? { outputTruncated: true } : {}),
-	};
+	const list: ToolDetailSection[] = [
+		{
+			key: "input.arguments",
+			label: "input",
+			body: capped("input.arguments", "code", {
+				text: input.text,
+				format: "code",
+				codeLang: "json",
+				textTruncated: input.truncated,
+			}),
+		},
+	];
+	if (output)
+		list.push({
+			key: "output.main",
+			label: "output",
+			body: capped("output.main", "code", {
+				text: output.text,
+				textTruncated: output.truncated,
+			}),
+		});
+	return { kind: "sections", sections: list };
 }
 
 /** The read/write file path (mirrors the chunked `getFilePath`). */
@@ -1098,12 +1122,13 @@ function classifyRead(
 		// The chunked card shows "path (12 KB, png)" above the image.
 		const suffix = sizeKB != null && imageFormat ? ` (${sizeKB} KB, ${imageFormat})` : "";
 		return sections([
-			section(undefined, metaRows([pathRow(filePath ? `${filePath}${suffix}` : "")])),
+			section("meta.file", undefined, metaRows([pathRow(filePath ? `${filePath}${suffix}` : "")])),
 			section(
+				"output.main",
 				undefined,
-				capped("media", {
+				capped("output.main", "media", {
+					format: "media",
 					contentPx: MEDIA_IMAGE_CONTENT_PX,
-					hasLabel: false,
 					media: {
 						filePath,
 						filename: filePath ? filePath.split(/[\\/]/).pop() : undefined,
@@ -1118,64 +1143,135 @@ function classifyRead(
 	const text = resolveDisplayText(outputJson);
 	const body =
 		outputJson != null
-			? capped("code", {
+			? capped("output.main", "code", {
 					contentLines: countLines(text),
-					hasLabel: false,
 					text: text || undefined,
 					...truncatedFlag(outputJson),
 					// Parity with the chunked ReadDetail: `language={getShikiLang(fp)}`.
 					...(fp ? { codeLangPath: fp } : {}),
 				})
 			: null;
-	return sections([section(undefined, metaRows([pathRow(fp)])), section(undefined, body)]);
+	return sections([
+		section("meta.file", undefined, metaRows([pathRow(fp)])),
+		section("output.main", undefined, body),
+	]);
+}
+
+/** Legacy snapshots without stream metadata have no append-continuity evidence. */
+function untrackedSnapshotRevision(text: string): string {
+	const retained = normalizeSourceText(text.slice(-MAX_DIFF_INPUT_CHARS));
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < retained.length; i++)
+		hash = Math.imul(hash ^ retained.charCodeAt(i), 0x01000193);
+	return `${text.length}:${hash >>> 0}`;
+}
+
+/**
+ * A projected string leaf is the HEAD of that field, not a new source version.
+ * Existing stream coordinates outrank that default: a projected tail window is
+ * still a tail window, and an unknown origin must remain unknown until verified.
+ */
+export function toolInputFieldRange(
+	input: ClassifyToolDetailInput,
+	field: string,
+): SourceTextRange | undefined {
+	const value = toolInputFieldView(input.inputJson)[field];
+	const text = readLeafText(value);
+	if (text === undefined) return undefined;
+	const candidate = asObject(asObject(input.inputJson)?._streamingFieldRanges)?.[field];
+	const range = isSourceTextRange(candidate) ? candidate : undefined;
+	const truncated = isTruncated(value);
+	if (range && !truncated) return range;
+	const live = input.isStreaming === true && !isTerminalToolStatus(input.status);
+	const sourceId = toolBodyId(
+		input.toolUseId ?? `preview:${input.previewId}`,
+		`input.${field}`,
+		input.occurrence,
+	);
+	const observed = createSourceText(text, {
+		epoch:
+			range?.epoch ??
+			(live ? `untracked:${sourceId}:${untrackedSnapshotRevision(text)}` : `source:${sourceId}`),
+		originKnown: range?.originKnown ?? !live,
+		complete: !live && !truncated,
+	}).range;
+	if (!range) return observed;
+	// The server cut the field at its beginning. Preserve that beginning's source
+	// coordinates, while limiting the end to the prefix we actually received.
+	return {
+		...range,
+		complete: false,
+		endsWithCR: observed.endsWithCR,
+		endOffset: range.startOffset + observed.endOffset,
+		endLine: range.startLine + observed.endLine,
+		endColumn: observed.endLine === 0 ? range.startColumn + observed.endColumn : observed.endColumn,
+	};
 }
 
 function classifyFile(
 	toolName: string,
 	inputJson: unknown,
 	metadata: Record<string, unknown> | null,
+	context: ClassifyToolDetailInput,
 ): ToolDetailData | null {
-	const input = asObject(inputJson);
-	const oldString = extractField(inputJson, "old_string");
-	const hasOld = oldString.length > 0 || (input != null && "old_string" in input);
-	const fp = filePathOf(inputJson);
-	if (toolName === "Edit" && hasOld) {
-		const oldStr = extractField(inputJson, "old_string");
-		const newStr = extractField(inputJson, "new_string");
-		// The chunked EditDiffBlock labels the diff with the path + original line.
-		const startLine = readStartLine(inputJson, metadata);
-		const header = fp ? (startLine != null ? `${fp}:${startLine}` : fp) : "";
+	const fields = asObject(inputJson) ?? {};
+	const fp = filePathOf(fields);
+	const inputLive = context.isStreaming === true && !isTerminalToolStatus(context.status);
+	if (toolName === "Edit") {
+		if (!("old_string" in fields) && !("new_string" in fields)) {
+			return sections([section("meta.file", undefined, metaRows([pathRow(fp)]))]);
+		}
+		const oldText = readLeafText(fields.old_string) ?? "";
+		const replacing = Object.hasOwn(fields, "new_string") || !inputLive;
+		const newText = replacing ? (readLeafText(fields.new_string) ?? "") : oldText;
+		const oldRange = toolInputFieldRange(context, "old_string");
+		const newRange = replacing ? toolInputFieldRange(context, "new_string") : oldRange;
+		const startLine = readStartLine(context.inputJson, metadata);
+		const diffDocument = createDiffDocument({
+			oldText,
+			newText,
+			oldRange,
+			newRange,
+			startLine,
+			focusSide: replacing && newText.length > 0 ? "new" : "old",
+		});
 		return sections([
-			section(undefined, metaRows([pathRow(header)])),
 			section(
+				"meta.file",
 				undefined,
-				// Parity with the chunked EditDiffBlock: the edited file's own language
-				// colours the diff body (the +/- tint is layered on top).
-				diffBody(oldStr, newStr, startLine, fp ? { codeLangPath: fp } : {}),
+				metaRows([pathRow(fp && startLine != null ? `${fp}:${startLine}` : fp)]),
 			),
+			textSection("input.edit", fields, undefined, {
+				cap: "diff",
+				format: "diff",
+				diffDocument,
+				revision: diffDocument.revision,
+				text: JSON.stringify(
+					{
+						old_string: diffDocument.oldSource.text,
+						...(replacing ? { new_string: diffDocument.newSource.text } : {}),
+					},
+					null,
+					2,
+				),
+				followTarget: { kind: "diff-row", focus: diffDocument.focus },
+				textTruncated:
+					hasTruncatedLeaf(fields.old_string) ||
+					hasTruncatedLeaf(fields.new_string) ||
+					diffDocument.truncated,
+				...(fp ? { codeLangPath: fp } : {}),
+			}),
 		]);
 	}
-	// Write (or Edit without an old_string): show the written content.
-	const writtenContent = extractField(inputJson, "content");
-	const content = writtenContent || resolveDisplayText(inputJson);
+	const text = readLeafText(fields.content);
 	return sections([
-		section(undefined, metaRows([pathRow(fp)])),
-		section(
-			undefined,
-			capped("code", {
-				contentLines: countLines(content),
-				text: content || undefined,
-				...truncatedFlag(inputJson),
-				// The written file content takes the file's own language (chunked
-				// FileDetail Write branch). Without a `content` field the body is a JSON
-				// dump of the input instead, which the chunked card highlights as JSON.
-				...(writtenContent && fp
-					? { codeLangPath: fp }
-					: writtenContent
-						? {}
-						: { codeLang: "json" }),
-			}),
-		),
+		section("meta.file", undefined, metaRows([pathRow(fp)])),
+		textSection("input.content", text === undefined ? undefined : fields.content, "input", {
+			cap: inputLive ? "streaming" : "code",
+			text,
+			format: "code",
+			...(fp ? { codeLangPath: fp } : {}),
+		}),
 	]);
 }
 
@@ -1194,38 +1290,38 @@ function classifyTasks(
 	inputJson: unknown,
 	outputJson: unknown,
 	metadata: Record<string, unknown> | null,
+	input: ClassifyToolDetailInput,
 ): ToolDetailData | null {
 	const tasks = extractSpecTasks(inputJson, outputJson, metadata);
 	if (tasks === null) {
 		// Not parseable → fall back to the file diff/code branch.
-		return classifyFile(toolName, inputJson, metadata);
+		return classifyFile(toolName, inputJson, metadata, input);
 	}
-	return {
+	return single("input.tasks", {
 		kind: "spec-tasks",
 		tasks: tasks.map((task) => ({
 			text: task.text ?? "—",
 			status: readLeafText(task.status),
 			protected: task.protected === true,
 		})),
-	};
+	});
 }
 
 function classifyBash(
+	status: string | null | undefined,
 	inputJson: unknown,
 	outputJson: unknown,
 	metadata: Record<string, unknown> | null,
+	inputStreaming: boolean,
 ): ToolDetailData | null {
 	const awaitParam = isTruncated(inputJson) ? undefined : asObject(inputJson)?.await;
 	const awaitObj =
 		awaitParam != null && typeof awaitParam === "object" ? asObject(awaitParam) : null;
 	const commandStr = awaitObj ? "" : extractField(inputJson, "command");
 	const outputStr = resolveDisplayText(outputJson);
-	const streamingOutput = (metadata ? readLeafText(metadata._streamingOutput) : undefined) ?? "";
-	if (!commandStr && !outputStr && !awaitObj && !streamingOutput) return null;
-	// Streaming bash uses a smaller cap while running.
-	const streaming =
-		metadata?._streamingOutput != null ||
-		(asObject(inputJson)?._streamingChars != null && !outputStr);
+	const hasCommand = !awaitObj && Object.hasOwn(asObject(inputJson) ?? {}, "command");
+	if (!hasCommand && outputJson == null && !awaitObj) return null;
+	const streaming = !isTerminalToolStatus(status) && metadata?._streamingOutput != null;
 
 	// Await mode: the chunked card leads with an `await` badge row carrying the
 	// task id, timeout and wait_for text — none of which existed in the vlist.
@@ -1245,43 +1341,29 @@ function classifyBash(
 	// Command and output are SEPARATE capped boxes in the chunked card (60px vs
 	// 200px caps, each with its own label); merging them into one string lost the
 	// boundary and the "Output" label.
-	const body = outputStr || streamingOutput;
-	// The output box gets the flag for ITS OWN source: the persisted output, or the
-	// streaming snapshot on `_metadata` (which the projection cuts independently).
-	// Bash output is among the most frequently truncated payloads, so measuring this
-	// prefix as if it were complete is exactly the height instability `textTruncated`
-	// exists to prevent.
-	const bodyTruncatedFlag = outputStr
-		? truncatedFlag(outputJson)
-		: truncatedFlag(metadata?._streamingOutput);
+	const body = outputStr;
 	return sections([
-		section(undefined, metaRows([awaitRow])),
-		section(
-			commandStr ? "command" : undefined,
-			commandStr
-				? capped("bash-cmd", {
-						contentLines: countLines(commandStr),
-						hasLabel: false,
-						text: `$ ${commandStr}`,
-						...truncatedFlag(inputJson),
-						// Shell syntax for the command box. The OUTPUT box below stays
-						// unhighlighted: it is program output, not source (the chunked card
-						// likewise passes no language for it).
-						codeLang: "shellscript",
-					})
-				: null,
+		section("meta.await", undefined, metaRows([awaitRow])),
+		textSection(
+			"input.command",
+			hasCommand ? (asObject(inputJson)?.command ?? "") : undefined,
+			"command",
+			{
+				cap: inputStreaming && !isTerminalToolStatus(status) ? "streaming-bash" : "bash-cmd",
+				contentLines: countLines(commandStr),
+				text: `$ ${commandStr}`,
+				// Shell syntax for the command box. The OUTPUT box below stays
+				// unhighlighted: it is program output, not source (the chunked card
+				// likewise passes no language for it).
+				format: "code",
+				codeLang: "shellscript",
+			},
 		),
-		section(
-			body ? "output" : undefined,
-			body
-				? capped(streaming ? "streaming-bash" : "term", {
-						contentLines: countLines(body),
-						hasLabel: false,
-						text: body,
-						...bodyTruncatedFlag,
-					})
-				: null,
-		),
+		textSection("output.main", outputJson, "output", {
+			cap: streaming ? "streaming-bash" : "term",
+			contentLines: countLines(body),
+			text: body,
+		}),
 	]);
 }
 
@@ -1311,30 +1393,27 @@ function classifySearch(
 ): ToolDetailData | null {
 	const output = resolveDisplayText(outputJson);
 	if (isFailStatus(status) && !output) {
-		return { kind: "error", text: extractField(inputJson, "pattern", "glob") || "Search failed" };
+		return single("meta.error", {
+			kind: "error",
+			text: extractField(inputJson, "pattern", "glob") || "Search failed",
+		});
 	}
 	// The chunked card leads with the pattern chip and an `in <path>` line.
 	const pattern = extractField(inputJson, "pattern", "glob");
 	const searchPath = extractField(inputJson, "path");
 	return sections([
 		section(
+			"meta.query",
 			undefined,
 			metaRows([
 				pattern ? { text: pattern, mono: true } : null,
 				searchPath ? { text: `in ${searchPath}`, dimmed: true } : null,
 			]),
 		),
-		section(
-			output ? "output" : undefined,
-			output
-				? capped("code", {
-						contentLines: countLines(output),
-						hasLabel: false,
-						text: output,
-						...truncatedFlag(outputJson),
-					})
-				: null,
-		),
+		textSection("output.main", outputJson, "output", {
+			contentLines: countLines(output),
+			text: output,
+		}),
 	]);
 }
 
@@ -1342,7 +1421,7 @@ function classifyWebSearch(inputJson: unknown, outputJson: unknown): ToolDetailD
 	const query = extractField(inputJson, "query");
 	const output = resolveDisplayText(outputJson);
 	if (!output) {
-		return { kind: "error", text: "Web search failed" };
+		return single("meta.error", { kind: "error", text: "Web search failed" });
 	}
 	const parsed = asObject(tryParseJson(output));
 	const results = parsed && Array.isArray(parsed.results) ? parsed.results : null;
@@ -1362,25 +1441,25 @@ function classifyWebSearch(inputJson: unknown, outputJson: unknown): ToolDetailD
 			});
 		}
 		return sections([
-			section(undefined, metaRows([query ? { text: query, mono: true } : null])),
-			section(undefined, { kind: "structured", badgeRows: 0, bodyLines: [], entries }),
+			section("meta.query", undefined, metaRows([query ? { text: query, mono: true } : null])),
+			section("output.results", undefined, {
+				kind: "structured",
+				badgeRows: 0,
+				bodyLines: [],
+				entries,
+			}),
 		]);
 	}
 	// Non-structured output is markdown in the chunked card (ContentViewer markdown).
 	// `sections()` cannot return null here: the output section's body is built
 	// unconditionally, so `kept` always holds at least one entry.
 	return sections([
-		section(undefined, metaRows([query ? { text: query, mono: true } : null])),
-		section(
-			"output",
-			capped("code", {
-				contentLines: countLines(output),
-				hasLabel: false,
-				text: output,
-				...truncatedFlag(outputJson),
-				markdown: true,
-			}),
-		),
+		section("meta.query", undefined, metaRows([query ? { text: query, mono: true } : null])),
+		textSection("output.main", outputJson, "output", {
+			contentLines: countLines(output),
+			text: output,
+			format: "markdown",
+		}),
 	]);
 }
 
@@ -1403,10 +1482,12 @@ function classifyWebFetch(
 	const fetchPreviewUrl = readLeafText(metadata?.previewUrl);
 	if (mode === "screenshot" && fetchPreviewUrl !== undefined) {
 		return sections([
-			section(undefined, header),
+			section("meta.request", undefined, header),
 			section(
+				"output.main",
 				undefined,
-				capped("media", {
+				capped("output.main", "media", {
+					format: "media",
 					contentPx: MEDIA_IMAGE_CONTENT_PX,
 					media: { previewUrl: fetchPreviewUrl, filename: url, ...mediaDimensions(metadata) },
 				}),
@@ -1415,26 +1496,19 @@ function classifyWebFetch(
 	}
 	if (isFailStatus(status) && !output) {
 		return sections([
-			section(undefined, header),
-			section("error", { kind: "error", text: "Fetch failed" }),
+			section("meta.request", undefined, header),
+			section("meta.error", "error", { kind: "error", text: "Fetch failed" }),
 		]);
 	}
 	// smart / readability outputs are markdown in the chunked card.
 	const isMarkdown = mode === "smart" || mode === "readability";
 	return sections([
-		section(undefined, header),
-		section(
-			output ? "output" : undefined,
-			output
-				? capped("code", {
-						contentLines: countLines(output),
-						hasLabel: false,
-						text: output,
-						...truncatedFlag(outputJson),
-						...(isMarkdown ? { markdown: true } : {}),
-					})
-				: null,
-		),
+		section("meta.request", undefined, header),
+		textSection("output.main", outputJson, "output", {
+			contentLines: countLines(output),
+			text: output,
+			...(isMarkdown ? { format: "markdown" as const } : {}),
+		}),
 	]);
 }
 
@@ -1457,22 +1531,16 @@ function classifyTaskOutput(inputJson: unknown, outputJson: unknown): ToolDetail
 		),
 	]);
 	return sections([
-		section(undefined, header),
+		section("meta.task", undefined, header),
 		section(
+			"meta.retrieval",
 			retrievalStatus ? "error" : undefined,
 			retrievalStatus ? { kind: "error", text: retrievalStatus } : null,
 		),
-		section(
-			output ? "output" : undefined,
-			output
-				? capped("code", {
-						contentLines: countLines(output),
-						hasLabel: false,
-						text: output,
-						...truncatedFlag(outputJson),
-					})
-				: null,
-		),
+		textSection("output.main", outputJson, "output", {
+			contentLines: countLines(output),
+			text: output,
+		}),
 	]);
 }
 
@@ -1504,20 +1572,14 @@ function classifyAwait(
 		subagentId ? pathRow(`subagent: ${subagentId}`) : null,
 	]);
 	return sections([
-		section(undefined, header),
-		section(
-			output ? (isBash ? "output" : "result") : undefined,
-			output
-				? capped(isBash ? "term" : "code", {
-						contentLines: countLines(output),
-						hasLabel: false,
-						text: output,
-						...truncatedFlag(outputJson),
-						// Non-bash await results are markdown in the chunked card.
-						...(isBash ? {} : { markdown: true }),
-					})
-				: null,
-		),
+		section("meta.await", undefined, header),
+		textSection("output.main", outputJson, isBash ? "output" : "result", {
+			cap: isBash ? "term" : "code",
+			contentLines: countLines(output),
+			text: output,
+			// Non-bash await results are markdown in the chunked card.
+			...(isBash ? {} : { format: "markdown" as const }),
+		}),
 	]);
 }
 
@@ -1525,18 +1587,16 @@ function classifySend(
 	inputJson: unknown,
 	outputJson: unknown,
 	metadata: Record<string, unknown> | null,
+	labels: Record<string, string> | undefined,
 ): ToolDetailData | null {
 	const input = asObject(inputJson);
-	const message = isTruncated(inputJson)
-		? inputJson.preview
-		: typeof input?.message === "string"
-			? input.message
-			: "";
+	const message = readLeafText(input?.message);
 	const output = resolveDisplayText(outputJson);
 	const targets = Array.isArray(metadata?.targets) ? (metadata.targets as unknown[]) : [];
-	const isAwait = isTruncated(inputJson)
-		? metadata?.await === true
-		: input?.await === true || metadata?.await === true;
+	const isAwait =
+		!isTruncated(inputJson) && typeof input?.await === "boolean"
+			? input.await
+			: metadata?.await === true;
 	const doInterrupt = isTruncated(inputJson)
 		? metadata?.doInterrupt === true
 		: input?.doInterrupt === true || metadata?.doInterrupt === true;
@@ -1548,7 +1608,12 @@ function classifySend(
 					return { label: `→ ${label}`, color: "blue" };
 				})
 			: [{ label: "Subagent message", color: "blue" }];
-	badges.push({ label: isAwait ? "await" : "async", color: isAwait ? "indigo" : "gray" });
+	badges.push({
+		label: isAwait
+			? (labels?.sendAwaitReply ?? "Wait for reply")
+			: (labels?.sendNoAwaitReply ?? "Do not wait for reply"),
+		color: isAwait ? "indigo" : "gray",
+	});
 	if (doInterrupt) badges.push({ label: "interrupt", color: "orange" });
 
 	// Delivery rows keep their per-target structure (status badge + label +
@@ -1569,37 +1634,24 @@ function classifySend(
 	});
 
 	return sections([
-		section(undefined, metaRows([badgeRow(badges)])),
+		section("meta.targets", undefined, metaRows([badgeRow(badges)])),
+		textSection("input.message", message === undefined ? undefined : input?.message, "message", {
+			contentLines: countLines(message ?? ""),
+			text: message,
+			format: "markdown",
+		}),
 		section(
-			message ? "message" : undefined,
-			message
-				? capped("code", {
-						contentLines: countLines(message),
-						hasLabel: false,
-						text: message,
-						...truncatedFlag(inputJson),
-						markdown: true,
-					})
-				: null,
-		),
-		section(
+			"output.delivery",
 			deliveryEntries.length > 0 ? "delivery" : undefined,
 			deliveryEntries.length > 0
 				? { kind: "structured", badgeRows: 0, bodyLines: [], entries: deliveryEntries }
 				: null,
 		),
-		section(
-			output ? (isAwait ? "reply" : "result") : undefined,
-			output
-				? capped("code", {
-						contentLines: countLines(output),
-						hasLabel: false,
-						text: output,
-						...truncatedFlag(outputJson),
-						markdown: true,
-					})
-				: null,
-		),
+		textSection("output.main", outputJson, isAwait ? "reply" : "result", {
+			contentLines: countLines(output),
+			text: output,
+			format: "markdown",
+		}),
 	]);
 }
 
@@ -1750,7 +1802,7 @@ function classifyAsk(
 				: {}),
 		});
 	}
-	return { kind: "ask", questions };
+	return single("output.results", { kind: "ask", questions });
 }
 
 /**
@@ -1794,17 +1846,21 @@ function classifyPlan(
 	// history; showing it would present "the plan is saved in <path>" to the user AS
 	// the plan. Treated as absent so the caller's pending-permission fallback (which
 	// holds the server-resolved body) supplies the real plan instead.
-	if (!hasUsablePlanBody(planText)) return null;
+	if (
+		!Object.hasOwn(asObject(inputJson) ?? {}, "plan") ||
+		(planText.trim().length > 0 && !hasUsablePlanBody(planText))
+	)
+		return null;
 	// Plans are authored in markdown and the chunked card renders them as such
 	// (ToolCallCard PlanDetail → ContentViewer markdown), so the vlist must not
 	// degrade them to monospace plain text. `_planFile` marks a file-based plan;
 	// pass the raw path through and let the render layer localize it.
 	const planFile = extractField(inputJson, "_planFile");
-	const body = capped("plan", {
+	const body = capped("input.plan", "plan", {
 		contentLines: countLines(planText),
 		text: planText,
 		...truncatedFlag(inputJson),
-		markdown: true,
+		format: "markdown",
 		...(planFile ? { sourcePath: planFile } : {}),
 	});
 	// A DENIED plan carries the reviewer's feedback above the body.
@@ -1830,14 +1886,15 @@ function classifyPlan(
 		"";
 	// A server-authored value would put a system string where the user's words
 	// belong (the chunked PlanDetail filters the same placeholder).
-	if (!denyFeedback.trim() || isServerAuthoredDenyMessage(denyFeedback.trim())) return body;
+	if (!denyFeedback.trim() || isServerAuthoredDenyMessage(denyFeedback.trim()))
+		return single("input.plan", body);
 	// Deliberately UNLABELLED: the chunked PlanDetail prints this text bare, and an
 	// "Error" heading would file the reviewer's own note under tool failures.
 	return {
 		kind: "sections",
 		sections: [
-			{ body: { kind: "error", text: denyFeedback, tone: "warning" } },
-			{ label: "plan", body },
+			{ key: "meta.denial", body: { kind: "error", text: denyFeedback, tone: "warning" } },
+			{ key: "input.plan", label: "plan", body },
 		],
 	};
 }
@@ -1849,6 +1906,7 @@ function classifyPipeline(
 	metadata: Record<string, unknown> | null,
 ): ToolDetailData | null {
 	const rule = extractField(inputJson, "rule");
+	const hasRule = Object.hasOwn(asObject(inputJson) ?? {}, "rule");
 	const aliases = stringArray(asObject(inputJson)?.aliases);
 	const label = extractField(inputJson, "label");
 	const format = extractField(inputJson, "format");
@@ -1881,37 +1939,25 @@ function classifyPipeline(
 	});
 
 	return sections([
-		section(undefined, metaRows([badgeRow(badges)])),
+		section("meta.pipeline", undefined, metaRows([badgeRow(badges)])),
+		textSection("input.rule", hasRule ? (asObject(inputJson)?.rule ?? "") : undefined, "rule", {
+			contentLines: countLines(rule),
+			text: rule,
+			// A pipeline rule is a shell expression (parity with the Pixi renderer).
+			format: "code",
+			codeLang: "shellscript",
+		}),
 		section(
-			rule ? "rule" : undefined,
-			rule
-				? capped("code", {
-						contentLines: countLines(rule),
-						hasLabel: false,
-						text: rule,
-						...truncatedFlag(inputJson),
-						// A pipeline rule is a shell expression (parity with the Pixi renderer).
-						codeLang: "shellscript",
-					})
-				: null,
-		),
-		section(
+			"output.captured",
 			captureEntries.length > 0 ? "captured" : undefined,
 			captureEntries.length > 0
 				? { kind: "structured", badgeRows: 0, bodyLines: [], entries: captureEntries }
 				: null,
 		),
-		section(
-			output ? "output" : undefined,
-			output
-				? capped("code", {
-						contentLines: countLines(output),
-						hasLabel: false,
-						text: output,
-						...truncatedFlag(outputJson),
-					})
-				: null,
-		),
+		textSection("output.main", outputJson, "output", {
+			contentLines: countLines(output),
+			text: output,
+		}),
 	]);
 }
 
@@ -1934,41 +1980,38 @@ function classifyTerminal(
 	]);
 	if (action === "write") {
 		const inp = extractField(inputJson, "input");
-		if (isFailStatus(status) && !inp) return { kind: "error", text: "Terminal write failed" };
+		const hasInput = Object.hasOwn(asObject(inputJson) ?? {}, "input");
+		if (isFailStatus(status) && !inp)
+			return single("meta.error", { kind: "error", text: "Terminal write failed" });
 		return sections([
-			section(undefined, header),
-			section(
-				inp ? "input" : undefined,
-				inp
-					? capped("bash-cmd", {
-							contentLines: countLines(inp),
-							hasLabel: false,
-							text: inp,
-							...truncatedFlag(inputJson),
-							// Terminal stdin is shell input; the read/list OUTPUT below is
-							// program output and stays unhighlighted.
-							codeLang: "shellscript",
-						})
-					: null,
+			section("meta.terminal", undefined, header),
+			textSection(
+				"input.input",
+				hasInput ? (asObject(inputJson)?.input ?? "") : undefined,
+				"input",
+				{
+					cap: "bash-cmd",
+					contentLines: countLines(inp),
+					text: inp,
+					// Terminal stdin is shell input; the read/list OUTPUT below is
+					// program output and stays unhighlighted.
+					format: "code",
+					codeLang: "shellscript",
+				},
 			),
 		]);
 	}
 	// read / list
 	const output = resolveDisplayText(outputJson);
-	if (isFailStatus(status) && !output) return { kind: "error", text: "Terminal read failed" };
+	if (isFailStatus(status) && !output)
+		return single("meta.error", { kind: "error", text: "Terminal read failed" });
 	return sections([
-		section(undefined, header),
-		section(
-			output ? "output" : undefined,
-			output
-				? capped("term", {
-						contentLines: countLines(output),
-						hasLabel: false,
-						text: output,
-						...truncatedFlag(outputJson),
-					})
-				: null,
-		),
+		section("meta.terminal", undefined, header),
+		textSection("output.main", outputJson, "output", {
+			cap: "term",
+			contentLines: countLines(output),
+			text: output,
+		}),
 	]);
 }
 
@@ -2015,17 +2058,19 @@ function classifyShare(
 	const sharePreviewUrl = readLeafText(metadata.previewUrl);
 	if (metadata.preview === true && sharePreviewUrl !== undefined) {
 		return sections([
-			section(undefined, header),
+			section("meta.share", undefined, header),
 			section(
+				"output.main",
 				undefined,
-				capped("media", {
+				capped("output.main", "media", {
+					format: "media",
 					contentPx: MEDIA_IMAGE_CONTENT_PX,
 					media: { previewUrl: sharePreviewUrl, filename, ...mediaDimensions(metadata) },
 				}),
 			),
 		]);
 	}
-	return sections([section(undefined, header)]);
+	return sections([section("meta.share", undefined, header)]);
 }
 
 /** Tool statuses meaning the call is over (no live bar past this point). */
@@ -2152,7 +2197,7 @@ function classifyTransfer(
 	// finished call). It is NOT shown alongside the bar: the two say the same thing.
 	const streamingOutput = readLeafText(metadata?._streamingOutput) ?? "";
 	const output = resolveDisplayText(outputJson);
-	const body = output || (progressRow ? "" : streamingOutput);
+	const body = outputJson != null ? output : progressRow ? "" : streamingOutput;
 	// A failed transfer with no body still has to say SOMETHING under the paths: a
 	// bare header leaves the reader unable to tell "failed" from "still starting".
 	//
@@ -2161,22 +2206,21 @@ function classifyTransfer(
 	// here too would print the failure twice.
 	if (isFailStatus(status) && !body && !nonEmptyTrimmedText(errorMessage)) {
 		return sections([
-			section(undefined, header),
-			section("error", { kind: "error", text: "Transfer failed" }),
+			section("meta.transfer", undefined, header),
+			section("meta.error", "error", { kind: "error", text: "Transfer failed" }),
 		]);
 	}
 	return sections([
-		section(undefined, header),
-		section(
+		section("meta.transfer", undefined, header),
+		textSection(
+			"output.main",
+			body ? (outputJson ?? metadata?._streamingOutput) : undefined,
 			undefined,
-			body
-				? capped(output ? "term" : "streaming-bash", {
-						contentLines: countLines(body),
-						hasLabel: false,
-						text: body,
-						...(output ? truncatedFlag(outputJson) : truncatedFlag(metadata?._streamingOutput)),
-					})
-				: null,
+			{
+				cap: outputJson != null ? "term" : "streaming-bash",
+				contentLines: countLines(body),
+				text: body,
+			},
 		),
 	]);
 }
@@ -2193,7 +2237,11 @@ function classifyRecall(
 	if (action === "search") {
 		const results = Array.isArray(metadata.results) ? (metadata.results as unknown[]) : [];
 		if (results.length === 0) {
-			return { kind: "structured", badgeRows: 0, bodyLines: ["No results"] };
+			return single("output.results", {
+				kind: "structured",
+				badgeRows: 0,
+				bodyLines: ["No results"],
+			});
 		}
 		const visible = Math.min(results.length, 10);
 		// Each hit is its own card in the chunked view: role badge + narrator title
@@ -2216,18 +2264,22 @@ function classifyRecall(
 				tone: role === "user" ? "indigo" : undefined,
 			});
 		}
-		return {
+		return single("output.results", {
 			kind: "structured",
 			badgeRows: 1,
 			badges: recallQueryBadges(metadata),
 			bodyLines: [],
 			entries,
-		};
+		});
 	}
 	// read_conversation
 	const messages = Array.isArray(metadata.messages) ? (metadata.messages as unknown[]) : [];
 	if (messages.length === 0) {
-		return { kind: "structured", badgeRows: 0, bodyLines: ["No results"] };
+		return single("output.results", {
+			kind: "structured",
+			badgeRows: 0,
+			bodyLines: ["No results"],
+		});
 	}
 	const visible = Math.min(messages.length, 10);
 	const entries: ToolStructuredEntry[] = [];
@@ -2253,7 +2305,13 @@ function classifyRecall(
 	const title = readLeafText(metadata.narratorTitle) ?? "";
 	const model = readLeafText(metadata.model) ?? "";
 	const badges = chips([chip(title, "gray"), chip(model, "gray")]);
-	return { kind: "structured", badgeRows: 1, badges, bodyLines: [], entries };
+	return single("output.results", {
+		kind: "structured",
+		badgeRows: 1,
+		badges,
+		bodyLines: [],
+		entries,
+	});
 }
 
 /** Build query badge chips for a recall search (mirrors RecallDetail badges). */
@@ -2288,23 +2346,15 @@ function classifySkill(inputJson: unknown, outputJson: unknown): ToolDetailData 
 		// Attached skill files listed after the body.
 		const files = parseSkillFiles(output);
 		return sections([
-			section(undefined, metaRows([badgeRow(chips([chip(skillName, "grape")]))])),
+			section("meta.skill", undefined, metaRows([badgeRow(chips([chip(skillName, "grape")]))])),
+			textSection("output.main", outputJson, undefined, {
+				cap: "skill",
+				contentLines: countLines(content) + 2,
+				text: content,
+				...(content ? { format: "markdown" as const } : {}),
+			}),
 			section(
-				undefined,
-				// Skill bodies are markdown documents (the chunked card uses
-				// ContentViewer markdown); monospace was a visible downgrade.
-				capped("skill", {
-					contentLines: countLines(content) + 2,
-					hasLabel: false,
-					text: content || undefined,
-					// The body is carved out of the OUTPUT (`resolveDisplayText(outputJson)`),
-					// so the flag must describe the output — the input only holds the skill
-					// name and args and is never the cut payload here.
-					...truncatedFlag(outputJson),
-					...(content ? { markdown: true } : {}),
-				}),
-			),
-			section(
+				"meta.files",
 				files.length > 0 ? "files" : undefined,
 				files.length > 0
 					? {
@@ -2358,10 +2408,12 @@ function classifyBrowser(
 		// this to still show a screenshot from an earlier run.
 		const savedFilePath = readLeafText(metadata?.savedFilePath);
 		return sections([
-			section(undefined, header),
+			section("meta.browser", undefined, header),
 			section(
+				"output.main",
 				undefined,
-				capped("media", {
+				capped("output.main", "media", {
+					format: "media",
 					contentPx: MEDIA_IMAGE_CONTENT_PX,
 					media: {
 						previewUrl: browserPreviewUrl,
@@ -2374,23 +2426,17 @@ function classifyBrowser(
 		]);
 	}
 	const output = resolveDisplayText(outputJson);
-	if (isFailStatus(status) && !output) return { kind: "error", text: "Browser action failed" };
+	if (isFailStatus(status) && !output)
+		return single("meta.error", { kind: "error", text: "Browser action failed" });
 	return sections([
-		section(undefined, header),
-		section(
-			output ? "output" : undefined,
-			output
-				? capped("code", {
-						contentLines: countLines(output),
-						hasLabel: false,
-						text: output,
-						...truncatedFlag(outputJson),
-						// Parity with the chunked BrowserDetail: only the `dom` action returns
-						// markup; other actions return prose/JSON-ish text.
-						...(action === "dom" ? { codeLang: "html" } : {}),
-					})
-				: null,
-		),
+		section("meta.browser", undefined, header),
+		textSection("output.main", outputJson, "output", {
+			contentLines: countLines(output),
+			text: output,
+			// Parity with the chunked BrowserDetail: only the `dom` action returns
+			// markup; other actions return prose/JSON-ish text.
+			...(action === "dom" ? { format: "code" as const, codeLang: "html" } : {}),
+		}),
 	]);
 }
 
@@ -2422,13 +2468,13 @@ function classifyKnowledge(
 				...(snippet ? { snippet: snippet.slice(0, 300) } : {}),
 			});
 		}
-		return {
+		return single("output.results", {
 			kind: "structured",
 			badgeRows: 1,
 			badges: chips([chip(`${results.length} results`, "grape")]),
 			bodyLines: [],
 			entries,
-		};
+		});
 	}
 	if (toolName === "KnowledgeRead") {
 		const body = resolveDisplayText(outputJson);
@@ -2456,21 +2502,13 @@ function classifyKnowledge(
 			),
 		]);
 		return sections([
-			section(undefined, header),
-			section(
-				undefined,
-				// Knowledge bodies are markdown documents, like plans.
-				capped("knowledge", {
-					contentLines: countLines(body) + 2,
-					hasLabel: false,
-					text: body || undefined,
-					// A knowledge entry is one of the largest bodies the projection sees, so
-					// the flag matters most here: without it the box is sized to whatever
-					// prefix the budget happened to include.
-					...truncatedFlag(outputJson),
-					...(body ? { markdown: true } : {}),
-				}),
-			),
+			section("meta.entry", undefined, header),
+			textSection("output.main", outputJson ?? "", undefined, {
+				cap: "knowledge",
+				contentLines: countLines(body) + 2,
+				text: body,
+				...(body ? { format: "markdown" as const } : {}),
+			}),
 		]);
 	}
 	// Create/Edit/Review/Admin: prefer the output body as structured lines.
@@ -2490,8 +2528,8 @@ function classifyKnowledge(
 			),
 		]);
 		return sections([
-			section(undefined, header),
-			section(undefined, {
+			section("meta.entry", undefined, header),
+			section("output.main", undefined, {
 				kind: "structured",
 				badgeRows: 0,
 				bodyLines: output.split("\n"),
@@ -2504,123 +2542,4 @@ function classifyKnowledge(
 /** In-app link to a knowledge entry (the chunked EntryLink target). */
 function knowledgeEntryHref(entryId: string): string {
 	return `/knowledge/${entryId}`;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Streaming input (mirrors ToolCallCard's StreamingInputDetail).
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Live preview of a tool's input as it streams in. The chunked card swaps its
- * whole detail region for this while `isStreaming` holds; the vlist rendered
- * nothing at all, so every streaming card looked empty.
- *
- * Returns null for the categories whose header already says everything
- * (read/search) — matching the chunked component's own early returns.
- */
-function classifyStreamingInput(
-	toolName: string,
-	category: string,
-	inputJson: unknown,
-	metadata: Record<string, unknown> | null,
-): ToolDetailData | null {
-	const input = asObject(inputJson);
-	if (!input) return null;
-	const fields = asObject(input._streamingFields) ?? {};
-	const fieldName = readLeafText(input._streamingFieldName) ?? "";
-	const fieldValue = readLeafText(input._streamingFieldValue) ?? "";
-	// The real `file_path` is the last resort, not an afterthought: a live chunk
-	// MERGES into an already-persisted input (mergeToolFields), so a re-streamed
-	// call can carry the settled path on the input itself while the stream markers
-	// only describe the field in flight. The pixi model already reads all three
-	// (pixi-message-model.ts:992); this classifier used to stop at the markers.
-	const filePath =
-		(readLeafText(input._streamingFilePath) ?? "") ||
-		(readLeafText(fields.file_path) ?? "") ||
-		filePathOf(inputJson);
-
-	if (category === "file") {
-		if (toolName === "Edit") {
-			// Edit streams old_string first, then new_string: show the provisional diff.
-			// BOTH sides must also consider the field currently streaming — reading
-			// only the settled `_streamingFields` misses the in-flight value, and while
-			// old_string was still arriving the card fell through to a raw JSON dump
-			// instead of the matching-phase preview (chunked getStreamingEditPreview
-			// reads `fields.x || (fieldName === "x" ? fieldValue : "")` for each side).
-			const oldStr =
-				(readLeafText(fields.old_string) ?? "") || (fieldName === "old_string" ? fieldValue : "");
-			const newStr =
-				(readLeafText(fields.new_string) ?? "") || (fieldName === "new_string" ? fieldValue : "");
-			if (oldStr || newStr) {
-				const startLine = readStartLine(inputJson, metadata);
-				const header = filePath ? (startLine != null ? `${filePath}:${startLine}` : filePath) : "";
-				// Mirrors the chunked EditDiffBlock's streaming rules exactly:
-				//   phase "replacing" once new_string starts arriving, else "matching"
-				//   hasReplacement = phase === "replacing"
-				//   while matching, both sides are the same text (an all-context diff)
-				//   startLine falls back to 1 so the gutter is always present
-				//   lineNumberPrefix = "xx" while matching (positions are provisional)
-				const isReplacing = fieldName === "new_string" || newStr.length > 0;
-				return sections([
-					section(undefined, metaRows([pathRow(header)])),
-					section(
-						undefined,
-						diffBody(
-							oldStr,
-							isReplacing ? newStr : oldStr,
-							startLine ?? 1,
-							{ hasLabel: false, ...(filePath ? { codeLangPath: filePath } : {}) },
-							isReplacing ? undefined : "xx",
-						),
-					),
-				]);
-			}
-		}
-		const isContentField = fieldName === "content" || fieldName === "new_string";
-		if (!isContentField || !fieldValue) return null;
-		// A missing path only costs the path row and the syntax language — the
-		// streamed body is still the most useful thing on the card. Write emits
-		// `content` before `file_path` often enough that gating the whole preview on
-		// the path left the card blank for the entire write.
-		return sections([
-			section(undefined, metaRows([pathRow(filePath)])),
-			section(
-				undefined,
-				capped("streaming", {
-					contentLines: countLines(fieldValue),
-					hasLabel: false,
-					text: fieldValue,
-					...(filePath ? { codeLangPath: filePath } : {}),
-				}),
-			),
-		]);
-	}
-
-	if (category === "bash") {
-		const cmd = fieldName === "command" ? fieldValue : (readLeafText(fields.command) ?? "");
-		if (!cmd) return null;
-		return capped("streaming-bash", {
-			contentLines: countLines(cmd),
-			hasLabel: false,
-			text: `$ ${cmd}`,
-			codeLang: "shellscript",
-		});
-	}
-
-	// Agent / Send / Plan stream a markdown body.
-	const MARKDOWN_STREAM_FIELD: Record<string, string> = {
-		agent: "prompt",
-		send: "message",
-		plan: "plan",
-	};
-	const expected = MARKDOWN_STREAM_FIELD[category];
-	if (expected && fieldName === expected && fieldValue) {
-		return capped(category === "plan" ? "plan" : "streaming", {
-			contentLines: countLines(fieldValue),
-			hasLabel: false,
-			text: fieldValue,
-			markdown: true,
-		});
-	}
-	return null;
 }

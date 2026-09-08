@@ -21,6 +21,9 @@ describe("registerAndPersistSubagentAlias", () => {
 		let maxInFlightReads = 0;
 
 		setSubagentAliasPersistenceAdapterForTests({
+			async getExistingAlias(_parentNarratorId, subagentId) {
+				return persistedAliases.get(subagentId);
+			},
 			async getTakenAliases(_parentNarratorId, excludeSubagentId) {
 				inFlightReads++;
 				maxInFlightReads = Math.max(maxInFlightReads, inFlightReads);
@@ -77,6 +80,9 @@ describe("alias fallback for an unnamed subagent", () => {
 
 	test("persisting an unnamed subagent also avoids the full id", async () => {
 		setSubagentAliasPersistenceAdapterForTests({
+			async getExistingAlias() {
+				return undefined;
+			},
 			async getTakenAliases() {
 				return new Set<string>();
 			},
@@ -93,6 +99,9 @@ describe("alias suffixing terminates", () => {
 		// answering true for every candidate — a bug, or a corrupt taken-set — would
 		// spin the main thread forever instead of degrading to an id-based alias.
 		setSubagentAliasPersistenceAdapterForTests({
+			async getExistingAlias() {
+				return undefined;
+			},
 			async getTakenAliases() {
 				return {
 					has: () => true,

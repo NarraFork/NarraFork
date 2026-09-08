@@ -1,13 +1,18 @@
 import { randomUUID } from "node:crypto";
+import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters } from "../db/schema";
+import { chapters, narrators } from "../db/schema";
 import {
 	type AgentConfig,
 	buildHistory,
 	type RuntimeSettingsOverride,
 	TODO_REMINDER_TOOL_INTERVAL,
 } from "../lib/agent";
+import {
+	freezeFileReferenceSnapshots,
+	projectFileReferenceText,
+} from "../lib/agent/file-reference-projection";
 import {
 	normalizeAutoContinuationMode,
 	normalizeBooleanOverride,
@@ -36,6 +41,7 @@ import { sideCarBodyWithText } from "../lib/sidecar-templates";
 import { type ImageRef, saveTextFileToWorktree, type TextFileRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { CustomSubagentDef } from "./custom-subagent-service";
+import { getAgentFileReferenceContext } from "./file-reference-context";
 import { gitService } from "./git-service";
 import { knowledgeService } from "./knowledge-service";
 import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
@@ -105,6 +111,7 @@ export interface SubagentBufferedMessage {
 	text: string;
 	images?: ImageRef[];
 	textFiles?: File[];
+	fileReferences?: FileReferenceSnapshot[];
 	commandText?: string | null;
 	createdBy?: string | null;
 	prePromptBashCommand?: string;
@@ -123,6 +130,8 @@ export interface SubagentExecOptions {
 	provider: string;
 	locale: string;
 	signal: AbortSignal;
+	/** Stable across passes of one run; a legacy attribution filter, not an attempt receipt. */
+	fileChangeStartedAt?: string;
 	/** Optional wall-clock execution timeout for a newly started run; 0/undefined means none. */
 	timeoutMs?: number;
 	/** Absolute execution deadline preserved across a planned-update restart. */
@@ -209,12 +218,15 @@ export const MAX_SUBAGENT_INTERRUPTION_RETRIES = 3;
 export function canDeliverBufferedMessageInPass(
 	message: Pick<
 		SubagentBufferedMessage,
-		"images" | "textFiles" | "createdBy" | "prePromptBashCommand"
+		"images" | "textFiles" | "fileReferences" | "createdBy" | "prePromptBashCommand"
 	>,
 	currentUserId: string | null | undefined,
 ): boolean {
 	if (message.images?.length) return false;
 	if (message.textFiles?.length) return false;
+	// Accepted snapshots must commit before consuming; the in-pass legacy path
+	// persists fire-and-forget. Restart at the safe boundary like other attachments.
+	if (message.fileReferences?.length) return false;
 	if (message.prePromptBashCommand) return false;
 	// An absent createdBy is "no particular user", which never conflicts with the
 	// pass identity; only a concrete, different user forces a rebuild.
@@ -427,6 +439,7 @@ export async function readSubagentSpecContinuationState(narratorId: string): Pro
 export interface SubagentBufferedMessageOptions {
 	images?: ImageRef[];
 	textFiles?: File[];
+	fileReferences?: FileReferenceSnapshot[];
 	commandText?: string | null;
 	createdBy?: string | null;
 	prePromptBashCommand?: string;
@@ -450,6 +463,7 @@ export function pushSubagentBufferedMessage(
 		text,
 		images: options?.images,
 		textFiles: options?.textFiles,
+		fileReferences: freezeFileReferenceSnapshots(options?.fileReferences),
 		commandText: options?.commandText,
 		createdBy: options?.createdBy,
 		prePromptBashCommand: options?.prePromptBashCommand,
@@ -506,7 +520,7 @@ export function updateSubagentBufferedMessage(
 	subagentId: string,
 	messageId: string,
 	text: string,
-	opts?: { images?: ImageRef[]; textFiles?: File[] },
+	opts?: { images?: ImageRef[]; textFiles?: File[]; fileReferences?: FileReferenceSnapshot[] },
 ): boolean {
 	const queue = getSubagentBufferedMessagesMap().get(subagentId);
 	const message = queue?.find((queued) => queued.id === messageId);
@@ -520,6 +534,9 @@ export function updateSubagentBufferedMessage(
 	}
 	if (opts?.textFiles !== undefined) {
 		message.textFiles = opts.textFiles.length ? opts.textFiles : undefined;
+	}
+	if (opts?.fileReferences !== undefined) {
+		message.fileReferences = freezeFileReferenceSnapshots(opts.fileReferences);
 	}
 	message.bufferedAt = new Date().toISOString();
 	return true;
@@ -668,13 +685,14 @@ export async function loadSubagentHistory(
 	model: string,
 	provider: string,
 	pruneBoundaryId?: string | null,
+	currentInput?: string,
 ) {
 	const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId);
 	const dbMessages = rawMessages.map((msg) => ({ ...msg, parentToolUseId: null }));
 	if (pruneBoundaryId) {
 		pruneToolCalls(dbMessages, pruneBoundaryId);
 	}
-	return buildHistory(dbMessages, model, provider, narratorId);
+	return buildHistory(dbMessages, model, provider, narratorId, { currentInput });
 }
 
 // ---------------------------------------------------------------------------
@@ -711,32 +729,45 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 	const bufQueue = getSubagentBufferedMessagesMap().get(narratorId);
 	const buffered = bufQueue?.[0];
 	if (!buffered) return null;
+	// Claim synchronously so concurrent drains cannot dispatch the same entry.
+	// Restore only if persistence fails; accepted bytes are never re-read.
+	const hadSoftStop = shouldStopSubagentForBufferedMessage(narratorId);
 	bufQueue?.shift();
 	if (bufQueue?.length === 0) {
 		getSubagentBufferedMessagesMap().delete(narratorId);
 		getSubagentBufferedMessageSoftStops().delete(narratorId);
 	}
-	const textFiles = await saveBufferedTextFiles(opts.cwd, buffered.textFiles);
-	const userMsg = await narratorService.persistSubagentUserMessage(
-		narratorId,
-		buffered.text,
-		toolUseId,
-		{
-			images: buffered.images,
-			textFiles,
-			commandText: buffered.commandText,
-			createdBy: buffered.createdBy,
-		},
-	);
+	let userMsg: Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>;
+	try {
+		const textFiles = await saveBufferedTextFiles(opts.cwd, buffered.textFiles);
+		userMsg = await narratorService.persistSubagentUserMessage(
+			narratorId,
+			buffered.text,
+			toolUseId,
+			{
+				images: buffered.images,
+				textFiles,
+				fileReferences: buffered.fileReferences,
+				commandText: buffered.commandText,
+				createdBy: buffered.createdBy,
+			},
+		);
+	} catch (error) {
+		const remaining = getSubagentBufferedMessagesMap().get(narratorId) ?? [];
+		remaining.unshift(buffered);
+		getSubagentBufferedMessagesMap().set(narratorId, remaining);
+		if (hadSoftStop) requestSubagentBufferedMessageSoftStop(narratorId);
+		throw error;
+	}
 	broadcastToNarrator(parentNarratorId, {
 		type: "user_message",
 		narratorId: parentNarratorId,
-		message: userMsg,
+		message: fileReferenceMessageForDisplay(userMsg),
 	});
 	broadcastToNarrator(narratorId, {
 		type: "user_message",
 		narratorId,
-		message: { ...userMsg, parentToolUseId: null },
+		message: fileReferenceMessageForDisplay({ ...userMsg, parentToolUseId: null }),
 	});
 	const remaining = toBufferSummary(getSubagentBufferedMessagesMap().get(narratorId) ?? []);
 	broadcastToNarrator(parentNarratorId, {
@@ -772,15 +803,25 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 		const freshNarrator = await narratorService.getById(narratorId);
 		pruneBoundaryId = freshNarrator.pruneBoundaryMessageId ?? null;
 	}
-	const rebuilt = await loadSubagentHistory(narratorId, model, provider, pruneBoundaryId);
+	const modelText = projectFileReferenceText(
+		userMsg.contentText ?? buffered.text,
+		buffered.fileReferences,
+	);
+	const rebuilt = await loadSubagentHistory(
+		narratorId,
+		model,
+		provider,
+		pruneBoundaryId,
+		modelText,
+	);
 	// Match the primary loop's currentTurnText: only prepend context the builder
 	// extracted. Official Anthropic keeps sys as system history, so replaying the
 	// persisted hint itself here would inject it twice.
 	const prompt = rebuilt.trailingUserText?.trim()
-		? buffered.text.trim()
-			? `${rebuilt.trailingUserText}\n\n${buffered.text}`
+		? modelText.trim()
+			? `${rebuilt.trailingUserText}\n\n${modelText}`
 			: rebuilt.trailingUserText
-		: buffered.text;
+		: modelText;
 	return {
 		prompt,
 		history: rebuilt.history,
@@ -898,6 +939,21 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	contextLengthExceeded?: boolean;
 	aborted?: boolean;
 }> {
+	// Replays/conclusion updates need the same bounded legacy window as the live
+	// result. Reuse an existing timing column; never treat it as v2 attempt evidence.
+	if (opts.fileChangeStartedAt) {
+		try {
+			await db
+				.update(narrators)
+				.set({ turnStartedAt: opts.fileChangeStartedAt })
+				.where(eq(narrators.id, opts.narratorId));
+		} catch (error) {
+			logger.debug("Failed to persist subagent attribution window", {
+				narratorId: opts.narratorId,
+				error: String(error),
+			});
+		}
+	}
 	// Snapshot session state is owned HERE, outside the loop, for the `finally`
 	// below: a claim opened by the pre-execution hook and never closed is read as
 	// "still running, so it extends to now", which makes its declared paths shadow
@@ -1185,6 +1241,8 @@ async function runSubagentLoop(
 			model,
 		);
 
+		eventContext.getFileReferenceContext = () => getAgentFileReferenceContext(config);
+
 		const hooks: EventHooks = {
 			...treeSnapshotHooks,
 			onContextUsage: ctxMgmt.onContextUsage,
@@ -1252,10 +1310,25 @@ async function runSubagentLoop(
 			disabledTools,
 			blockedSkills: { all: blockedSkills.all, names: [...blockedSkills.names] },
 			toolFilter,
-			onExecutionTargetResolved: (resolvedToolUseId, target) =>
-				narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
-			onExecutionPlanResolved: (resolvedToolUseId, plan) =>
-				narratorService.updateToolCallExecutionPlan(narratorId, resolvedToolUseId, plan),
+			requireToolCallBinding: true,
+			onToolExecutionStarting: (resolvedToolUseId, binding, startedAt) =>
+				import("./narrator-persistence").then(({ narratorPersistence }) =>
+					narratorPersistence.claimToolCallExecution(
+						narratorId,
+						resolvedToolUseId,
+						binding,
+						startedAt,
+					),
+				),
+			onExecutionTargetResolved: (resolvedToolUseId, target, binding) =>
+				narratorService.updateToolCallExecutionTarget(
+					narratorId,
+					resolvedToolUseId,
+					target,
+					binding,
+				),
+			onExecutionPlanResolved: (resolvedToolUseId, plan, binding) =>
+				narratorService.updateToolCallExecutionPlan(narratorId, resolvedToolUseId, plan, binding),
 			// Share the compact-cycle de-dup set so the loop's tool-output scan (point B)
 			// de-dups against the incoming-text injections (point A) and vice versa — the
 			// same wiring the primary session does. Without these two fields the loop falls
@@ -1396,17 +1469,18 @@ async function runSubagentLoop(
 						.persistSubagentUserMessage(narratorId, buf.text, toolUseId, {
 							commandText: buf.commandText,
 							createdBy: buf.createdBy,
+							fileReferences: buf.fileReferences,
 						})
 						.then((userMsg) => {
 							broadcastToNarrator(parentNarratorId, {
 								type: "user_message",
 								narratorId: parentNarratorId,
-								message: userMsg,
+								message: fileReferenceMessageForDisplay(userMsg),
 							});
 							broadcastToNarrator(narratorId, {
 								type: "user_message",
 								narratorId,
-								message: { ...userMsg, parentToolUseId: null },
+								message: fileReferenceMessageForDisplay({ ...userMsg, parentToolUseId: null }),
 							});
 						})
 						.catch((err) => {
@@ -1428,7 +1502,7 @@ async function runSubagentLoop(
 						messageId: buf.id,
 						remaining,
 					});
-					parts.push(buf.text);
+					parts.push(projectFileReferenceText(buf.text, buf.fileReferences));
 					// Point A for a LIVE subagent: this text was typed on the subagent's own
 					// page or sent by the parent/a sibling, so nobody has scanned it. The ACL
 					// identity is the message's own `createdBy` when it has one, else the
@@ -1686,6 +1760,7 @@ async function runSubagentLoop(
 				model,
 				resolvedProvider,
 				pruneBoundaryId,
+				prompt,
 			);
 			history = rebuilt.history;
 			trailingToolResults = rebuilt.trailingToolResults;
@@ -1850,6 +1925,7 @@ async function runSubagentLoop(
 					model,
 					resolvedProvider,
 					pruneBoundaryId,
+					prompt,
 				);
 				history = rebuilt.history;
 				trailingToolResults = rebuilt.trailingToolResults;
@@ -1927,6 +2003,7 @@ async function runSubagentLoop(
 					model,
 					resolvedProvider,
 					pruneBoundaryId,
+					prompt,
 				);
 				history = rebuilt.history;
 				trailingToolResults = rebuilt.trailingToolResults;
@@ -1999,6 +2076,7 @@ async function runSubagentLoop(
 					model,
 					resolvedProvider,
 					pruneBoundaryId,
+					prompt,
 				);
 				history = rebuilt.history;
 				trailingToolResults = rebuilt.trailingToolResults;
@@ -2101,12 +2179,12 @@ async function runSubagentLoop(
 					broadcastToNarrator(parentNarratorId, {
 						type: "user_message",
 						narratorId: parentNarratorId,
-						message: userMsg,
+						message: fileReferenceMessageForDisplay(userMsg),
 					});
 					broadcastToNarrator(narratorId, {
 						type: "user_message",
 						narratorId,
-						message: { ...userMsg, parentToolUseId: null },
+						message: fileReferenceMessageForDisplay({ ...userMsg, parentToolUseId: null }),
 					});
 					prompt = continueText;
 				}
@@ -2212,7 +2290,7 @@ async function runSubagentLoop(
 		}
 
 		// Reload history from post-compact messages (no prune after compact)
-		const rebuilt = await loadSubagentHistory(narratorId, model, resolvedProvider, null);
+		const rebuilt = await loadSubagentHistory(narratorId, model, resolvedProvider, null, prompt);
 		history = rebuilt.history;
 		trailingToolResults = rebuilt.trailingToolResults;
 	}

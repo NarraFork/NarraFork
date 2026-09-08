@@ -11,6 +11,7 @@ export function invalidateAsyncQuestionQueries(queryClient: QueryClient, narrato
 	return Promise.all([
 		queryClient.invalidateQueries({ queryKey: asyncQuestionsQueryKey(narratorId), exact: true }),
 		queryClient.invalidateQueries({ queryKey: globalQuestionsQueryKey, exact: true }),
+		queryClient.invalidateQueries({ queryKey: ["human-attention"] }),
 	]);
 }
 
@@ -107,6 +108,7 @@ export function useApplyAsyncQuestionChange(narratorId?: string) {
 			// Refetch it on EVERY change, even an unawaited open while its button is hidden.
 			// Cache correctness must not depend on whether a notification is urgent.
 			void queryClient.invalidateQueries({ queryKey: globalQuestionsQueryKey, exact: true });
+			void queryClient.invalidateQueries({ queryKey: ["human-attention"] });
 		},
 		[queryClient, narratorId],
 	);

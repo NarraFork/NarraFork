@@ -186,61 +186,158 @@ function envelopeMessage(source: Record<string, unknown>): string | undefined {
 	return undefined;
 }
 
+function firstHttpStatus(...values: unknown[]): number | undefined {
+	for (const value of values) {
+		const status = numberValue(value);
+		if (status != null && Number.isInteger(status) && status >= 100 && status <= 599) {
+			return status;
+		}
+	}
+	return undefined;
+}
+
+function envelopeCode(value: unknown): string | undefined {
+	const code =
+		typeof value === "number" && Number.isFinite(value) ? String(value) : stringValue(value, 512);
+	return code !== "error" ? code : undefined;
+}
+
+function envelopeType(value: unknown): string | undefined {
+	const type = stringValue(value, 512);
+	// Responses event names describe the lifecycle, not the upstream error code.
+	return type && type !== "error" && !type.startsWith("response.") ? type : undefined;
+}
+
+const NON_ERROR_CODES = new Set([
+	"ok",
+	"success",
+	"successful",
+	"succeeded",
+	"completed",
+	"complete",
+	"accepted",
+	"queued",
+	"pending",
+	"in_progress",
+	"usage",
+	"meta",
+	"metadata",
+	"info",
+	"informational",
+	"message",
+	"delta",
+	"ping",
+	"pong",
+	"heartbeat",
+	"no_error",
+]);
+
+function isNonErrorCode(code: string | undefined): boolean {
+	if (!code) return false;
+	const number = numberValue(code);
+	return (
+		(number != null && number >= 0 && number < 400) ||
+		NON_ERROR_CODES.has(code.trim().toLowerCase())
+	);
+}
+
+function isErrorCode(code: string | undefined): boolean {
+	if (!code || isNonErrorCode(code)) return false;
+	const status = firstHttpStatus(code);
+	if (status != null) return status >= 400;
+	// A code alone is sufficient only when it positively names a failure. Do not
+	// treat arbitrary metadata codes ("ok", "usage", etc.) as error signals.
+	return (
+		/(?:^|[_-])(?:error|failed|failure|denied|rejected|blocked|refused|exceeded|exhausted|overloaded|unavailable|unauthorized|forbidden|expired|timeout|timed_out|not_found|limit_reached)$/i.test(
+			code,
+		) ||
+		/^invalid(?:_|$)/i.test(code) ||
+		/^(?:insufficient_quota|too_many_requests|rate_limit|content_filter|cyber_policy)$/i.test(code)
+	);
+}
+
 /**
- * Recognize an upstream error payload by its CONTENT rather than by a `type`
- * discriminator.
- *
- * Every stream parser used to gate on `type === "error"`, which is only one of
- * the shapes that arrive in practice. A gateway relaying a bare
- * `{"error":{"message":"..."}}` frame — no `type` field — produced no event at
- * all, so the real upstream message was dropped and the turn was later reported
- * as "the provider returned no content". The same payload shown in the provider
- * model-test dialog displayed correctly, because that path reads a thrown
- * error's message instead of parsing a stream.
- *
- * Returns null for anything that does not positively look like an error, so
- * ordinary content chunks are never misread as failures. In particular a bare
- * `code`/`status` with no human-readable text is rejected: several providers
- * put `code: 200` on success frames.
+ * Recognize errors by positive signals, not merely the presence of a message or
+ * a numeric status (successful frames also carry both). Only the envelope and
+ * its direct `error` field are inspected: never recurse into tool output,
+ * metadata, or Responses lifecycle payloads. Their parsers own those semantics.
  */
 export function parseUpstreamErrorEnvelope(value: unknown): UpstreamErrorEnvelope | null {
 	if (!isRecord(value)) return null;
 
 	const nested = isRecord(value.error) ? value.error : undefined;
-	// `error: "something failed"` — the whole envelope is a string.
 	const errorAsString = stringValue(value.error);
-
-	const message =
-		errorAsString ?? (nested ? envelopeMessage(nested) : undefined) ?? envelopeMessage(value);
-	if (!message) return null;
-
-	// A top-level `message` alone is ambiguous: it is also how some providers label
-	// ordinary content. Require a corroborating error signal before claiming failure.
+	const nestedMessage = nested ? envelopeMessage(nested) : undefined;
+	const flatMessage = envelopeMessage(value);
+	const nestedCode = envelopeCode(nested?.code);
+	const flatCode = envelopeCode(value.code);
+	const nestedType = envelopeType(nested?.type);
+	const typeCode = envelopeType(value.type);
+	const code =
+		nestedCode ?? flatCode ?? nestedType ?? (isErrorCode(typeCode) ? typeCode : undefined);
+	// Validate each candidate before choosing it: status: "failed" must not hide
+	// a numeric status_code/statusCode, nor may an outer HTTP 200 hide error.status.
+	const statusCode = firstHttpStatus(
+		nested?.statusCode,
+		nested?.status_code,
+		nested?.status,
+		value.statusCode,
+		value.status_code,
+		value.status,
+		nested?.code,
+		value.code,
+	);
+	// Empty placeholder objects are common on successful completed/usage frames.
+	// Only meaningful direct error fields corroborate failure; never object presence.
+	const hasNestedError =
+		nestedMessage != null ||
+		(nestedCode != null && !isNonErrorCode(nestedCode)) ||
+		(nestedType != null && !isNonErrorCode(nestedType)) ||
+		nested?.code === "error" ||
+		nested?.type === "error" ||
+		nested?.status === "failed" ||
+		nested?.status === "incomplete";
+	const hasSuccessStatus = statusCode != null && statusCode < 400;
+	const hasContentEnvelope =
+		(stringValue(value.type) != null && value.type !== "error" && !isErrorCode(typeCode)) ||
+		value.usage != null ||
+		value.metadata != null ||
+		value.meta != null ||
+		value.choices != null ||
+		value.output != null ||
+		value.item != null ||
+		value.delta != null ||
+		value.response != null;
+	// Keep legacy bare {code, message} errors, including provider-specific codes
+	// whose spelling cannot be predicted. Without text, require a positive code.
+	const hasBareCodeError =
+		!hasSuccessStatus &&
+		!hasContentEnvelope &&
+		!isNonErrorCode(flatCode) &&
+		(isErrorCode(stringValue(value.code) ?? flatCode) ||
+			(typeof value.code === "string" &&
+				flatCode != null &&
+				flatMessage != null &&
+				!isNonErrorCode(flatMessage)));
 	const hasErrorSignal =
-		value.error != null ||
+		errorAsString != null ||
+		hasNestedError ||
 		value.type === "error" ||
-		stringValue(value.code) != null ||
-		numberValue(value.status) != null ||
-		numberValue(value.status_code) != null ||
-		numberValue(value.statusCode) != null;
+		hasBareCodeError ||
+		isErrorCode(typeCode) ||
+		(statusCode != null && statusCode >= 400);
 	if (!hasErrorSignal) return null;
 
-	const code = firstValue(nested?.code, nested?.type, value.code, value.type);
-	const statusCode = numberValue(
-		firstValue(
-			value.status,
-			value.status_code,
-			value.statusCode,
-			nested?.status,
-			nested?.status_code,
-		),
-	);
-
-	return {
-		message,
-		code: typeof code === "string" && code !== "error" ? code : undefined,
-		statusCode,
-	};
+	const message =
+		errorAsString ??
+		nestedMessage ??
+		flatMessage ??
+		(code
+			? `Upstream API error: ${code}`
+			: statusCode != null
+				? `Upstream API error (HTTP ${statusCode})`
+				: "Unknown API error");
+	return { message, code, statusCode };
 }
 
 /**
@@ -254,13 +351,23 @@ export function parseErrorDiagnostics(
 	const nested = isRecord(data.error) ? data.error : undefined;
 	const supplied = isRecord(data.diagnostics) ? data.diagnostics : undefined;
 	const suppliedError = supplied && isRecord(supplied.error) ? supplied.error : undefined;
-	const statusCode = firstValue(
+	const statusCode = firstHttpStatus(
 		supplied?.statusCode,
-		supplied?.code,
+		supplied?.status_code,
+		supplied?.status,
 		data.statusCode,
-		data.code,
+		data.status_code,
+		data.status,
 		nested?.statusCode,
+		nested?.status_code,
+		nested?.status,
+		suppliedError?.statusCode,
+		suppliedError?.status_code,
+		suppliedError?.status,
+		supplied?.code,
+		data.code,
 		nested?.code,
+		suppliedError?.code,
 		defaults.statusCode,
 	);
 	const code = firstValue(supplied?.code, data.code, nested?.code, suppliedError?.code);
@@ -320,8 +427,16 @@ export function diagnosticsFromError(error: unknown): ApiRequestDiagnostics | un
 	const value = isRecord(error) ? error : {};
 	const cause = isRecord(value.cause) ? value.cause : undefined;
 	const message = error instanceof Error ? error.message : stringValue(value.message);
-	const statusCode = firstValue(value.status, value.statusCode, cause?.status, cause?.statusCode);
 	const diagnostics = isRecord(value.diagnostics) ? value.diagnostics : undefined;
+	const statusCode = firstHttpStatus(
+		value.statusCode,
+		value.status_code,
+		value.status,
+		cause?.statusCode,
+		cause?.status_code,
+		cause?.status,
+		diagnostics?.statusCode,
+	);
 	return normalizeApiRequestDiagnostics({
 		...diagnostics,
 		source: stringValue(diagnostics?.source) ?? "provider",

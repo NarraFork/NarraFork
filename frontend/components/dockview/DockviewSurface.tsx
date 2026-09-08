@@ -12,6 +12,7 @@
  */
 
 import { Box } from "@mantine/core";
+import { IconSwitchHorizontal } from "@tabler/icons-react";
 import {
 	type DockviewApi,
 	DockviewDefaultTab,
@@ -24,11 +25,24 @@ import {
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
 import "./theme.css";
-import { createContext, type RefObject, useCallback, useContext, useRef } from "react";
+import {
+	createContext,
+	type RefObject,
+	useCallback,
+	useContext,
+	useEffect,
+	useRef,
+	useState,
+} from "react";
 import type { PanelDragState } from "../../lib/panel-drag";
-import type { DropZoneThresholds } from "./drop-intent";
-import { swapPanels } from "./panel-swap";
-import { DOCKVIEW_SURFACE_ATTR, type DockviewDropTarget, useDockviewDnd } from "./useDockviewDnd";
+import { type DropIndicator, type DropZoneThresholds, resolveNativeDrop } from "./drop-intent";
+import {
+	bindNativeDropPreview,
+	DOCKVIEW_SURFACE_ATTR,
+	type DockviewDropTarget,
+	dropExistingPanel,
+	useDockviewDnd,
+} from "./useDockviewDnd";
 
 /** Theme class that maps dockview CSS variables to Mantine (see theme.css). */
 export const DOCKVIEW_THEME_CLASS = "dockview-theme-narrafork";
@@ -68,7 +82,7 @@ export interface DockviewSurfaceProps {
 	onDropSubject?: (state: PanelDragState, target: DockviewDropTarget, api: DockviewApi) => void;
 	/**
 	 * Enable the central "swap" zone for native (dockview-internal) panel drags.
-	 * Defaults to true. Merge/split fall through to dockview's own behaviour.
+	 * Defaults to true. When disabled, the small center zone merges instead.
 	 */
 	enableSwapZone?: boolean;
 	/** Override the three-zone thresholds. */
@@ -141,10 +155,19 @@ export function DockviewSurface({
 	const internalApiRef = useRef<DockviewApi | null>(null);
 	const apiRef = externalApiRef ?? internalApiRef;
 	const rootRef = useRef<HTMLDivElement | null>(null);
+	const [readyApi, setReadyApi] = useState<DockviewApi | null>(null);
+	const [nativeIndicator, setNativeIndicator] = useState<DropIndicator | null>(null);
+
+	useEffect(() => {
+		const root = rootRef.current;
+		if (!readyApi || !root) return;
+		return bindNativeDropPreview(readyApi, root, setNativeIndicator, thresholds, enableSwapZone);
+	}, [readyApi, thresholds, enableSwapZone]);
 
 	const handleReady = useCallback(
 		(event: DockviewReadyEvent) => {
 			apiRef.current = event.api;
+			setReadyApi(event.api);
 			onReady?.(event.api);
 		},
 		[apiRef, onReady],
@@ -159,24 +182,23 @@ export function DockviewSurface({
 		[apiRef, onDidDrop],
 	);
 
-	// Native (dockview-internal) panel drag: add a center "swap" zone. Dockview
-	// already merges on center and splits on edges, matching our merge/split
-	// intents, so we only override the content-center drop → swap.
+	// Resolve from the RELEASE coordinates, using exactly the preview geometry.
 	const handleWillDrop = useCallback(
 		(event: DockviewWillDropEvent) => {
-			if (!enableSwapZone) return;
-			if (event.kind !== "content" || event.position !== "center") return;
-			const data = event.getData();
+			setNativeIndicator(null);
 			const api = apiRef.current;
-			if (!data || !api) return;
-			const draggedPanelId = data.panelId;
-			const targetPanelId = event.group?.activePanel?.id;
-			if (!draggedPanelId || !targetPanelId || draggedPanelId === targetPanelId) return;
-			if (data.groupId === event.group?.id) return; // same group → let default run
+			if (!api || event.defaultPrevented) return;
+			const resolved = resolveNativeDrop(api, event, thresholds, enableSwapZone);
+			if (!resolved) return;
 			event.preventDefault();
-			swapPanels(api, draggedPanelId, targetPanelId);
+			const { panelId, hit } = resolved;
+			dropExistingPanel(api, panelId, {
+				groupId: hit.group.id,
+				intent: hit.intent,
+				targetPanelId: hit.targetPanelId,
+			});
 		},
-		[apiRef, enableSwapZone],
+		[apiRef, enableSwapZone, thresholds],
 	);
 
 	const handleDropSubject = useCallback(
@@ -188,7 +210,7 @@ export function DockviewSurface({
 		[apiRef, onDropSubject],
 	);
 
-	const { dropIndicator } = useDockviewDnd({
+	const { dropIndicator: customIndicator } = useDockviewDnd({
 		apiRef,
 		rootRef,
 		onDropSubject: onDropSubject ? handleDropSubject : undefined,
@@ -196,6 +218,7 @@ export function DockviewSurface({
 		surfaceId,
 	});
 
+	const dropIndicator = nativeIndicator ?? customIndicator;
 	const surfaceClass = [themeless ? "" : DOCKVIEW_THEME_CLASS, className].filter(Boolean).join(" ");
 
 	return (
@@ -230,6 +253,7 @@ export function DockviewSurface({
 				/>
 				{dropIndicator && (
 					<Box
+						data-dockview-drop-intent={dropIndicator.variant}
 						style={{
 							position: "absolute",
 							left: dropIndicator.left,
@@ -238,9 +262,11 @@ export function DockviewSurface({
 							height: dropIndicator.height,
 							backgroundColor:
 								dropIndicator.variant === "swap"
-									? "var(--mantine-color-teal-8)"
-									: "var(--mantine-color-indigo-9)",
-							opacity: dropIndicator.variant === "swap" ? 0.35 : 0.25,
+									? "color-mix(in srgb, var(--mantine-color-teal-8) 35%, transparent)"
+									: "color-mix(in srgb, var(--mantine-color-indigo-9) 25%, transparent)",
+							display: "flex",
+							alignItems: "center",
+							justifyContent: "center",
 							border:
 								dropIndicator.variant === "swap"
 									? "2px dashed var(--mantine-color-teal-4)"
@@ -250,7 +276,17 @@ export function DockviewSurface({
 							transition: "all 80ms ease",
 							zIndex: 5,
 						}}
-					/>
+					>
+						{dropIndicator.variant === "swap" && (
+							<IconSwitchHorizontal
+								size={28}
+								stroke={2}
+								color="var(--mantine-color-teal-2)"
+								style={{ maxWidth: "60%", maxHeight: "60%" }}
+								aria-hidden="true"
+							/>
+						)}
+					</Box>
 				)}
 			</Box>
 		</DockviewSurfaceIdContext.Provider>

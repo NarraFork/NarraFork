@@ -11,6 +11,11 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import {
+	classifyToolDetail,
+	type ToolCappedDetail,
+	toolBodyId,
+} from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { MeasuredSubagent } from "../measure/measure-subagent";
@@ -49,7 +54,12 @@ const CARD = {
 	category: "read" as const,
 	status: "success" as const,
 	toolUseId: "tu-1",
-	detail: { kind: "capped" as const, cap: "code" as const, text: OUTPUT, hasLabel: true },
+	detail: classifyToolDetail({
+		toolUseId: "tu-1",
+		toolName: "Read",
+		category: "read",
+		outputJson: OUTPUT,
+	}),
 };
 
 function traceRows(cardOnIndex?: number) {
@@ -169,7 +179,27 @@ describe("RenderToolRun — trace row drill-down", () => {
  * only way to catch it is to assert the SHAPE that reaches the DOM.
  */
 describe("RenderToolRun — a subagent row drills into the agent card", () => {
+	const promptBody: ToolCappedDetail = {
+		kind: "capped",
+		id: toolBodyId("tu-a", "input.prompt"),
+		source: "input.prompt",
+		format: "text",
+		cap: "code",
+		live: false,
+		followTarget: { kind: "end" },
+		text: "look at the fold",
+	};
+	const resultBody: ToolCappedDetail = {
+		...promptBody,
+		id: toolBodyId("tu-a", "output.main"),
+		source: "output.main",
+		format: "markdown",
+		cap: "agent-result",
+		text: "found the dispatch site",
+	};
 	const SUBAGENT_CARD = {
+		promptBody,
+		resultBody,
 		agentType: "explore",
 		description: "trace the vlist path",
 		prompt: "look at the fold",
@@ -209,7 +239,6 @@ describe("RenderToolRun — a subagent row drills into the agent card", () => {
 					measured={row.cardMeasured as MeasuredSubagent}
 					description={SUBAGENT_CARD.description}
 					agentType={SUBAGENT_CARD.agentType}
-					promptText={SUBAGENT_CARD.prompt}
 					recentCallNames={SUBAGENT_CARD.recentCallNames}
 					status={SUBAGENT_CARD.status}
 				/>

@@ -18,6 +18,8 @@ import { eq } from "drizzle-orm";
 import { getTestDb } from "../../../tests/setup";
 import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
 import type { DangerInfo } from "../../lib/agent";
+import { localPathSemantics } from "../../lib/agent/execution/path-semantics";
+import { localBackend } from "../../lib/agent/execution/registry";
 import type { PendingDangerReflection } from "../narrator-session-state";
 
 const { db, sqlite } = getTestDb();
@@ -49,10 +51,19 @@ mock.module("../narrator-service", () => ({
 	},
 }));
 
-const { stopDangerReflectionLoop } = await import("../narrator-permission");
-const { claimNarratorRuntime, pendingDangerReflections } = await import(
-	"../narrator-session-state"
-);
+const {
+	cancelDangerReflection,
+	confirmDangerReflection,
+	handlePermission,
+	reprocessAllPendingPermissions,
+	stopDangerReflectionLoop,
+} = await import("../narrator-permission");
+const {
+	claimNarratorRuntime,
+	pendingDangerConfirmations,
+	pendingDangerReflections,
+	pendingPermissions,
+} = await import("../narrator-session-state");
 
 const PARENT_ID = "takeover-parent-narrator";
 const SUBAGENT_ID = "takeover-subagent-narrator";
@@ -129,7 +140,10 @@ function registerRuntimePause(overrides?: Partial<PendingDangerReflection>): Abo
 afterEach(() => {
 	broadcasts.length = 0;
 	statusUpdates.length = 0;
+	pendingPermissions.get(TOOL_CALL_ID)?.cleanup();
+	pendingDangerReflections.get(TOOL_CALL_ID)?.cleanup();
 	pendingDangerReflections.clear();
+	pendingDangerConfirmations.clear();
 	sqlite.run("DELETE FROM narrator_tool_calls");
 	sqlite.run("DELETE FROM narrator_messages");
 	sqlite.run("DELETE FROM narrators");
@@ -235,6 +249,179 @@ describe("stopDangerReflectionLoop (live runtime pause)", () => {
 		expect((row?.permissionSuggestions as Array<{ status?: string }>)[0]?.status).toBe(
 			"awaiting_user",
 		);
+	});
+});
+
+function requestChildBashPermission(
+	signal = new AbortController().signal,
+	onAwaitingUserDecision?: () => void,
+) {
+	return handlePermission(
+		SUBAGENT_ID,
+		signal,
+		"Bash",
+		{ command: "rm -rf ./build" },
+		TOOL_USE_ID,
+		process.cwd(),
+		"en",
+		PARENT_ID,
+		{
+			onAwaitingUserDecision,
+			executionBackend: localBackend,
+			executionTarget: {
+				deviceId: "local",
+				backendKind: "local",
+				cwd: process.cwd(),
+				pathFlavor: localPathSemantics.flavor,
+				runtimeGeneration: localBackend.runtimeGeneration ?? 0,
+				selectionSource: "local_default",
+			},
+		},
+		PARENT_TOOL_USE,
+	);
+}
+
+describe("automatic danger reflection — parent attention isolation", () => {
+	test("starting a child gate updates its card without marking a busy parent as waiting", async () => {
+		await seedSubagentReflection();
+		await db
+			.update(narrators)
+			.set({ permissionMode: "bypassPermissions", dangerReflectionOverride: "standard" })
+			.where(eq(narrators.id, SUBAGENT_ID));
+		const release = claimNarratorRuntime(PARENT_ID, "test-parent-busy");
+		try {
+			const result = await requestChildBashPermission();
+			expect(result.behavior).toBe("dangerReflection");
+			expect(statusUpdates).toEqual([
+				{ narratorId: SUBAGENT_ID, status: "waiting", substatus: ["reflecting"] },
+			]);
+			const started = broadcasts.filter(
+				(entry) => entry.message.type === "danger_reflection_started",
+			);
+			expect(started.map((entry) => entry.target).sort()).toEqual([PARENT_ID, SUBAGENT_ID].sort());
+		} finally {
+			await cancelDangerReflection(TOOL_CALL_ID);
+			release();
+		}
+	});
+
+	test("a real permission becoming automatic reflection clears only the parent's old wait", async () => {
+		await seedSubagentReflection();
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "initializing", permissionSuggestions: [] })
+			.where(eq(narratorToolCalls.id, TOOL_CALL_ID));
+		const release = claimNarratorRuntime(PARENT_ID, "test-parent-busy");
+		const controller = new AbortController();
+		const ready = Promise.withResolvers<void>();
+		try {
+			const permission = requestChildBashPermission(controller.signal, ready.resolve);
+			await Promise.race([
+				ready.promise,
+				permission.then(() => {
+					throw new Error("Expected a pending user permission");
+				}),
+			]);
+			expect(pendingPermissions.has(TOOL_CALL_ID)).toBe(true);
+			expect(statusUpdates).toContainEqual({
+				narratorId: PARENT_ID,
+				status: "waiting",
+				substatus: undefined,
+			});
+			await db
+				.update(narrators)
+				.set({ permissionMode: "bypassPermissions", dangerReflectionOverride: "standard" })
+				.where(eq(narrators.id, SUBAGENT_ID));
+			statusUpdates.length = 0;
+
+			expect(reprocessAllPendingPermissions(PARENT_ID)).toBe(1);
+			expect((await permission).behavior).toBe("dangerReflection");
+			expect(pendingPermissions.has(TOOL_CALL_ID)).toBe(false);
+			expect(statusUpdates).toEqual([
+				{ narratorId: SUBAGENT_ID, status: "waiting", substatus: ["reflecting"] },
+				{ narratorId: PARENT_ID, status: "working", substatus: undefined },
+			]);
+		} finally {
+			await cancelDangerReflection(TOOL_CALL_ID);
+			controller.abort();
+			release();
+		}
+	});
+
+	test("aborting an automatic child gate cannot reset the parent's own status", async () => {
+		await seedSubagentReflection();
+		await db
+			.update(narrators)
+			.set({ permissionMode: "bypassPermissions", dangerReflectionOverride: "standard" })
+			.where(eq(narrators.id, SUBAGENT_ID));
+		const release = claimNarratorRuntime(PARENT_ID, "test-parent-busy");
+		const controller = new AbortController();
+		try {
+			const result = await requestChildBashPermission(controller.signal);
+			expect(result.behavior).toBe("dangerReflection");
+			const pause = pendingDangerReflections.get(TOOL_CALL_ID);
+			if (!pause || result.behavior !== "dangerReflection") throw new Error("Missing reflection");
+			const finished = Promise.withResolvers<void>();
+			const cleanup = pause.cleanup;
+			pause.cleanup = () => {
+				cleanup();
+				finished.resolve();
+			};
+			statusUpdates.length = 0;
+			controller.abort();
+			await finished.promise;
+			expect((await result.decision).behavior).toBe("deny");
+			expect(statusUpdates.length).toBeGreaterThan(0);
+			expect(statusUpdates.every((update) => update.narratorId === SUBAGENT_ID)).toBe(true);
+		} finally {
+			await cancelDangerReflection(TOOL_CALL_ID);
+			release();
+		}
+	});
+
+	for (const outcome of ["confirm", "cancel", "failed"] as const) {
+		test(`${outcome} cannot reset the parent's own status`, async () => {
+			await seedSubagentReflection();
+			registerRuntimePause();
+			const release = claimNarratorRuntime(PARENT_ID, "test-parent-busy");
+			try {
+				const resolved =
+					outcome === "confirm"
+						? await confirmDangerReflection(TOOL_CALL_ID)
+						: await cancelDangerReflection(TOOL_CALL_ID, "Test outcome", "reflection", {
+								failed: outcome === "failed",
+							});
+				expect(resolved).toBe(true);
+				expect(statusUpdates.length).toBeGreaterThan(0);
+				expect(statusUpdates.every((update) => update.narratorId === SUBAGENT_ID)).toBe(true);
+				expect(
+					broadcasts.some(
+						(entry) =>
+							entry.target === PARENT_ID && entry.message.type === "danger_reflection_resolved",
+					),
+				).toBe(true);
+			} finally {
+				release();
+			}
+		});
+	}
+
+	test("resolving a manually taken-over gate still clears the parent's user wait", async () => {
+		await seedSubagentReflection();
+		registerRuntimePause();
+		const release = claimNarratorRuntime(PARENT_ID, "test-parent-busy");
+		try {
+			await stopDangerReflectionLoop(TOOL_CALL_ID);
+			statusUpdates.length = 0;
+			expect(await cancelDangerReflection(TOOL_CALL_ID, "Denied by user", "user")).toBe(true);
+			expect(
+				statusUpdates.some(
+					(update) => update.narratorId === PARENT_ID && update.status === "working",
+				),
+			).toBe(true);
+		} finally {
+			release();
+		}
 	});
 });
 

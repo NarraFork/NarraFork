@@ -15,6 +15,13 @@ let htmlCacheBytes = 0;
 const MAX_CACHE_ENTRIES = 64;
 const MAX_CACHE_BYTES = 1 * 1024 * 1024;
 export const MAX_CACHEABLE_CODE_CHARS = 20_000;
+// A dedicated file panel can spend more than a chat preview, without removing
+// the rendering budget or retaining large documents in the shared HTML cache.
+export const MAX_FILE_HIGHLIGHT_CODE_CHARS = 200_000;
+export const FILE_HIGHLIGHT_OPTIONS = {
+	tokenizeMaxLineLength: 10_000,
+	tokenizeTimeLimit: 10,
+} as const;
 
 function hashCodeForCache(code: string): string {
 	let hash1 = 0xdeadbeef;

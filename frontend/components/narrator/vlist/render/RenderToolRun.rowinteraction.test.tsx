@@ -25,6 +25,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { MeasuredToolCall } from "../measure/measure-tool-call";
@@ -61,7 +62,12 @@ const CARD = {
 	category: "read" as const,
 	status: "success" as const,
 	toolUseId: "tu-1",
-	detail: { kind: "capped" as const, cap: "code" as const, text: OUTPUT, hasLabel: true },
+	detail: classifyToolDetail({
+		toolUseId: "tu-1",
+		toolName: "Read",
+		category: "read",
+		outputJson: OUTPUT,
+	}),
 };
 
 /**

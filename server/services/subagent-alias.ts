@@ -1,5 +1,5 @@
 import { eq } from "drizzle-orm";
-import { AsyncMutex } from "../lib/async-mutex";
+import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 
 // === Background task alias registry ===
 // Provides human-readable aliases for background tasks (both Agent and Bash).
@@ -160,23 +160,54 @@ export async function persistSubagentAlias(
 	alias: string,
 ): Promise<void> {
 	const { db, narrators } = await loadAliasDb();
+	await narratorTraitsLock.acquire(subagentId, async () => {
+		const row = await db.query.narrators.findFirst({
+			where: eq(narrators.id, subagentId),
+			columns: { parentNarratorId: true, traits: true },
+		});
+		if (!row || row.parentNarratorId !== parentNarratorId) return;
+
+		const currentTraits = Array.isArray(row.traits)
+			? row.traits.filter((trait): trait is string => typeof trait === "string")
+			: [];
+		const nextTraits = [
+			...currentTraits.filter((trait) => !trait.startsWith(SUBAGENT_ALIAS_TRAIT_PREFIX)),
+			`${SUBAGENT_ALIAS_TRAIT_PREFIX}${alias}`,
+		];
+		await db
+			.update(narrators)
+			.set({ traits: nextTraits, updatedAt: new Date().toISOString() })
+			.where(eq(narrators.id, subagentId));
+	});
+}
+
+/** Recover the original selector after turn cleanup or a server restart. */
+async function getExistingSubagentAlias(
+	parentNarratorId: string,
+	subagentId: string,
+): Promise<string | undefined> {
+	const { db, backgroundTasks, narrators } = await loadAliasDb();
 	const row = await db.query.narrators.findFirst({
 		where: eq(narrators.id, subagentId),
 		columns: { parentNarratorId: true, traits: true },
 	});
 	if (!row || row.parentNarratorId !== parentNarratorId) return;
+	const persisted = getPersistedSubagentAliases(row.traits)[0];
+	if (persisted) return persisted;
 
-	const currentTraits = Array.isArray(row.traits)
-		? row.traits.filter((trait): trait is string => typeof trait === "string")
-		: [];
-	const nextTraits = [
-		...currentTraits.filter((trait) => !trait.startsWith(SUBAGENT_ALIAS_TRAIT_PREFIX)),
-		`${SUBAGENT_ALIAS_TRAIT_PREFIX}${alias}`,
-	];
-	await db
-		.update(narrators)
-		.set({ traits: nextTraits, updatedAt: new Date().toISOString() })
-		.where(eq(narrators.id, subagentId));
+	// Agent task rows share their subagent's id. Keep this a bounded PK lookup,
+	// and do not adopt an alias from a different task type or team.
+	const task = await db.query.backgroundTasks.findFirst({
+		where: eq(backgroundTasks.id, subagentId),
+		columns: { type: true, parentNarratorId: true, subagentNarratorId: true, alias: true },
+	});
+	if (
+		task?.type === "agent" &&
+		task.parentNarratorId === parentNarratorId &&
+		(task.subagentNarratorId ?? subagentId) === subagentId
+	) {
+		return task.alias || undefined;
+	}
 }
 
 async function getPersistedTakenAliases(
@@ -201,7 +232,7 @@ async function getPersistedTakenAliases(
 		for (const alias of getPersistedSubagentAliases(sibling.traits)) taken.add(alias);
 	}
 	for (const task of tasks) {
-		if (task.subagentNarratorId === excludeSubagentId) continue;
+		if (task.subagentNarratorId === excludeSubagentId || task.id === excludeSubagentId) continue;
 		taken.add(task.id);
 		if (task.alias) taken.add(task.alias);
 	}
@@ -209,11 +240,13 @@ async function getPersistedTakenAliases(
 }
 
 export interface SubagentAliasPersistenceAdapter {
+	getExistingAlias(parentNarratorId: string, subagentId: string): Promise<string | undefined>;
 	getTakenAliases(parentNarratorId: string, excludeSubagentId: string): Promise<Set<string>>;
 	persistAlias(parentNarratorId: string, subagentId: string, alias: string): Promise<void>;
 }
 
 const defaultSubagentAliasPersistenceAdapter: SubagentAliasPersistenceAdapter = {
+	getExistingAlias: getExistingSubagentAlias,
 	getTakenAliases: getPersistedTakenAliases,
 	persistAlias: persistSubagentAlias,
 };
@@ -238,7 +271,12 @@ export async function registerAndPersistSubagentAlias(
 ): Promise<{ alias: string; conflicted: boolean }> {
 	return subagentAliasRegistrationLock.acquire(parentNarratorId, async () => {
 		const reg = getOrCreateRegistry(parentNarratorId);
-		const existing = reg.idToAlias.get(subagentId);
+		// Recovery passes the (mutable) title, not necessarily the alias originally
+		// printed in Agent/Send results. Never overwrite that selector just because
+		// the parent turn's cleanup cleared the in-memory registry.
+		const existing =
+			reg.idToAlias.get(subagentId) ||
+			(await subagentAliasPersistenceAdapter.getExistingAlias(parentNarratorId, subagentId));
 		const base = existing || aliasBaseFor(subagentId, desiredAlias);
 		const persistedTaken = await subagentAliasPersistenceAdapter.getTakenAliases(
 			parentNarratorId,

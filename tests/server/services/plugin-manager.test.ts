@@ -8,9 +8,16 @@ import { CapabilityBroker } from "@server/services/plugin-capability-broker";
 import { PluginHostDispatcher } from "@server/services/plugin-host-dispatcher";
 import { PluginHostServices } from "@server/services/plugin-host-services";
 import { pluginInstallationAuthorityId } from "@server/services/plugin-integration-authority-service";
-import { PluginManager, type PluginRuntimeSupervisorLike } from "@server/services/plugin-manager";
+import {
+	PluginManager,
+	type PluginRuntimeSupervisorLike,
+	pluginManager,
+} from "@server/services/plugin-manager";
 import { PluginPermissionStore } from "@server/services/plugin-permission-store";
-import { createPluginPlatformServices } from "@server/services/plugin-platform-services";
+import {
+	createPluginPlatformServices,
+	pluginPlatformServices,
+} from "@server/services/plugin-platform-services";
 import { PodmanRunner } from "@server/services/plugin-podman-runner";
 import {
 	LocalProcessRunner,
@@ -199,6 +206,16 @@ afterEach(async () => {
 });
 
 describe("PluginManager", () => {
+	test("the production singleton wires the shared provider catalog refresher", () => {
+		// Injection-based lifecycle tests explicitly supply this dependency. The exported
+		// singleton also injects services, so it does NOT take the constructor's shared-default
+		// branch; omitting this one dependency leaves real startup catalogs empty.
+		const production = pluginManager as unknown as { providerCatalogRefresher?: unknown };
+		expect(production.providerCatalogRefresher).toBe(
+			pluginPlatformServices.providerCatalogRefresher,
+		);
+	});
+
 	test("installs without executing entry and supports idempotent lifecycle operations", async () => {
 		const root = await makeTempRoot();
 		const storeRoot = join(root, "plugins");
@@ -926,6 +943,51 @@ describe("PluginManager", () => {
 		const healthyStatus = await recovered.getStatus(healthy.pluginId);
 		expect(healthyStatus?.lastError?.code).not.toBe("INTEGRATION_AUTHORITY_CONFLICT");
 		expect(healthyStatus?.current).toEqual(healthy.current);
+	});
+
+	test("rebuilds enabled onStartup providers and refreshes catalogs after activation on restart", async () => {
+		const root = await makeTempRoot();
+		const storeRoot = join(root, "plugins");
+		const pluginId = "com.example.startup-catalog";
+		const disabledId = "com.example.disabled-startup";
+		const first = new PluginManager({
+			root: storeRoot,
+			disabled: false,
+			runtimeSupervisor: new FakeSupervisor(),
+		});
+		for (const id of [pluginId, disabledId]) {
+			await first.install(
+				await makePackage(root, id, (manifest) => {
+					manifest.activationEvents = ["onStartup"];
+				}),
+			);
+		}
+		await first.enable(pluginId);
+		await first.shutdown();
+		const supervisor = new FakeSupervisor();
+		const refreshStates: Array<RuntimeState | undefined> = [];
+		const recovered = new PluginManager({
+			root: storeRoot,
+			disabled: false,
+			runtimeSupervisor: supervisor,
+			providerCatalogRefresher: {
+				refreshStale: async () => {
+					refreshStates.push(supervisor.get(pluginId)?.state);
+					return [];
+				},
+			},
+		});
+		try {
+			await recovered.initialize();
+			expect((await recovered.getStatus(pluginId))?.runtimeState).toBe("active");
+			expect(supervisor.startCount.get(pluginId)).toBe(1);
+			expect(supervisor.startCount.get(disabledId)).toBeUndefined();
+			expect(refreshStates).toEqual(["active"]);
+			await recovered.initialize();
+			expect(refreshStates).toHaveLength(1);
+		} finally {
+			await recovered.shutdown();
+		}
 	});
 
 	test("recovers incomplete journal operations by disabling automatic activation", async () => {

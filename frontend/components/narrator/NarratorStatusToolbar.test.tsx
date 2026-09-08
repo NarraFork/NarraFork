@@ -1,10 +1,15 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { Indicator, MantineProvider, Menu, Modal } from "@mantine/core";
+import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
 import { act, type ReactNode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { I18nextProvider } from "react-i18next";
 import { SAFE_AREA_INSET_LEFT, SAFE_AREA_INSET_RIGHT } from "../../lib/safe-area";
+import enNarrator from "../../locales/en/narrator.json";
+import zhNarrator from "../../locales/zh-CN/narrator.json";
 import {
+	BackgroundTasksStatusButton,
 	NARRATOR_STATUS_RESERVED_TEXT_WIDTH_PX,
 	NARRATOR_STATUS_ROW_MIN_HEIGHT_PX,
 	NarratorStatusBar,
@@ -589,6 +594,63 @@ describe("NarratorStatusBar", () => {
 		expect(content?.style.width).toBe("100%");
 		expect(first?.closest('[data-testid="narrator-status-bar-content"]')).toBe(content);
 		expect(last?.closest('[data-testid="narrator-status-bar-content"]')).toBe(content);
+	});
+});
+
+async function renderBackgroundTasksStatus(
+	runningCount: number,
+	onOpen: () => void = () => {},
+	language = "zh-CN",
+) {
+	const i18n = createInstance();
+	await i18n.init({
+		lng: language,
+		fallbackLng: "en",
+		resources: { en: { narrator: enNarrator }, "zh-CN": { narrator: zhNarrator } },
+	});
+	await act(async () => {
+		root?.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider env="test">
+					<BackgroundTasksStatusButton runningCount={runningCount} onOpen={onOpen} />
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+	});
+	return container?.querySelector<HTMLButtonElement>("button");
+}
+
+describe("BackgroundTasksStatusButton", () => {
+	test("shows the live count and disappears when the last task finishes", async () => {
+		expect(await renderBackgroundTasksStatus(0)).toBeNull();
+
+		const button = await renderBackgroundTasksStatus(2);
+		expect(button?.textContent).toBe("· 后台任务 2");
+		// Preserve the count when the neighboring elapsed label needs to shrink.
+		expect(button?.style.flexShrink).toBe("0");
+		expect(button?.style.whiteSpace).toBe("nowrap");
+
+		expect((await renderBackgroundTasksStatus(1))?.textContent).toBe("· 后台任务 1");
+		expect(await renderBackgroundTasksStatus(0)).toBeNull();
+	});
+
+	test("uses an accessible button and delegates each click to the panel opener", async () => {
+		const onOpen = mock(() => {});
+		const button = await renderBackgroundTasksStatus(3, onOpen);
+		expect(button?.getAttribute("type")).toBe("button");
+		expect(button?.getAttribute("aria-label")).toBe("后台任务 3");
+		for (let click = 0; click < 2; click++) {
+			await act(async () => button?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+		}
+		expect(onOpen).toHaveBeenCalledTimes(2);
+	});
+
+	test.each([
+		["en", "· Background tasks: 4"],
+		["zh-CN", "· 后台任务 4"],
+	])("localizes the count in %s", async (language, expected) => {
+		const button = await renderBackgroundTasksStatus(4, undefined, language);
+		expect(button?.textContent).toBe(expected);
 	});
 });
 

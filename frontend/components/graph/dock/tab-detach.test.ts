@@ -62,6 +62,38 @@ describe("readPanelSubject", () => {
 		});
 	});
 
+	it("preserves remote file identity when a native tab is detached", () => {
+		expect(
+			readPanelSubject({ panelType: "file", filePath: "/tmp/a.ts", deviceId: "DeviceA" }),
+		).toEqual({
+			kind: "file",
+			resourceId: JSON.stringify(["DeviceA", "/tmp/a.ts"]),
+		});
+	});
+
+	it("retains the scoped reader requirement for local reference tabs", () => {
+		expect(
+			readPanelSubject({ panelType: "file", filePath: "/tmp/a.png", referenceOrigin: true }),
+		).toEqual({
+			kind: "file",
+			resourceId: JSON.stringify(["local", "/tmp/a.png", true]),
+		});
+	});
+
+	it("retains historical tool identity in tab drags and rejects malformed references", () => {
+		const toolEdit = {
+			narratorId: "origin",
+			toolUseId: "sdk-id",
+			messageId: "message",
+			executionAttempt: 2,
+		};
+		expect(readPanelSubject({ panelType: "file", filePath: "/a.ts", toolEdit })).toEqual({
+			kind: "file",
+			resourceId: JSON.stringify(["local", "/a.ts", false, toolEdit]),
+		});
+		expect(readPanelSubject({ panelType: "file", filePath: "/a.ts", toolEdit: {} })).toBeNull();
+	});
+
 	it("leaves resourceId unset for singleton kinds even if extra fields exist", () => {
 		// A stray field must not become a resource identity: singletons are keyed by
 		// kind alone, and a spurious resourceId would defeat the duplicate check.

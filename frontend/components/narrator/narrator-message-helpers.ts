@@ -1,3 +1,12 @@
+import {
+	appendSourceText,
+	createSourceText,
+	nextSourceEpoch,
+	reconcileSourceText,
+	type SourceTextRange,
+	type SourceTextSnapshot,
+	safeSourceSliceStart,
+} from "@shared/pretext-layout/source-text";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { SubagentActivitySummary, TreeMessage } from "../../lib/api";
 import {
@@ -144,13 +153,17 @@ export function preserveCompleteStreamedOutput(
 /** Keep only the trailing window of a streamed tool output preview. */
 export function getToolOutputPreview(output: string): string {
 	if (output.length <= STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS) return output;
-	return output.slice(-STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS);
+	return output.slice(
+		safeSourceSliceStart(output, output.length - STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS),
+	);
 }
 
 /** Keep only the trailing window of a streamed tool field preview. */
 export function getStreamingFieldPreview(value: string): string {
 	if (value.length <= STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS) return value;
-	return value.slice(-STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS);
+	return value.slice(
+		safeSourceSliceStart(value, value.length - STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS),
+	);
 }
 
 /**
@@ -168,6 +181,8 @@ export interface TopLevelStreamingChunk {
 	metadata?: Record<string, unknown>;
 	streamingFieldName?: string;
 	streamingFieldValue?: string;
+	/** Kept after a field finishes and after the tool starts/completes. */
+	streamingFieldRanges?: Record<string, SourceTextRange>;
 	// Sentinel fields set once the tool is promoted to started/completed.
 	_started?: boolean;
 	_input?: Record<string, unknown>;
@@ -181,6 +196,135 @@ export interface TopLevelStreamingChunk {
 	_streamingOutput?: string;
 	/** Latest determinate progress measurement (drives a real progress bar). */
 	_structuredProgress?: ToolProgressPayload;
+}
+
+function streamingFieldSource(
+	chunk: TopLevelStreamingChunk | undefined,
+	name: string,
+): SourceTextSnapshot | undefined {
+	const range = chunk?.streamingFieldRanges?.[name];
+	const text =
+		typeof chunk?._input?.[name] === "string"
+			? chunk._input[name]
+			: chunk?.streamingFieldName === name
+				? chunk.streamingFieldValue
+				: chunk?.extractedFields?.[name];
+	if (typeof text !== "string" || !chunk) return undefined;
+	return range
+		? { text, range }
+		: createSourceText(text, {
+				epoch: `${chunk.toolUseId}:${name}`,
+				originKnown: typeof chunk._input?.[name] === "string",
+				complete: typeof chunk._input?.[name] === "string",
+			});
+}
+
+/** Shared fold: retain completed fields and advance coordinates only by deltas. */
+export function foldStreamingToolFields(
+	previous: TopLevelStreamingChunk | undefined,
+	event: {
+		toolUseId: string;
+		inputCharsTotal: number;
+		extractedFields?: Record<string, string>;
+		streamingField?: { name: string; delta: string };
+	},
+): Pick<
+	TopLevelStreamingChunk,
+	"streamingFieldName" | "streamingFieldValue" | "streamingFieldRanges" | "extractedFields"
+> {
+	const fields = { ...previous?.extractedFields };
+	const ranges = { ...previous?.streamingFieldRanges };
+	let name = previous?.streamingFieldName;
+	let value = previous?.streamingFieldValue;
+	const discontinuous = previous !== undefined && event.inputCharsTotal < previous.inputCharsTotal;
+	if (name !== undefined && value !== undefined && event.streamingField?.name !== name)
+		fields[name] = value;
+	for (const [field, text] of Object.entries(event.extractedFields ?? {})) {
+		const before = streamingFieldSource(previous, field);
+		const source = reconcileSourceText(before, text, {
+			epoch: `${event.toolUseId}:${field}`,
+			limit: STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS,
+		});
+		fields[field] = source.text;
+		ranges[field] = source.range;
+		if (field === name) value = source.text;
+	}
+	if (event.streamingField) {
+		const field = event.streamingField.name;
+		const same = name === field;
+		const before = !discontinuous && same ? streamingFieldSource(previous, field) : undefined;
+		// A first delta can be a reconnect tail. No wire field proves its file origin.
+		const source = appendSourceText(
+			before ??
+				createSourceText("", {
+					epoch: ranges[field]
+						? nextSourceEpoch(ranges[field].epoch)
+						: `${event.toolUseId}:${field}`,
+					originKnown: false,
+				}),
+			event.streamingField.delta,
+			STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS,
+		);
+		name = field;
+		value = source.text;
+		ranges[field] = source.range;
+		// Some wire events close a field and also flush its last delta. The completed
+		// extracted value is authoritative; do not append that tail twice.
+		if (Object.hasOwn(event.extractedFields ?? {}, field)) {
+			const complete = reconcileSourceText(source, event.extractedFields?.[field] ?? "", {
+				epoch: source.range.epoch,
+				limit: STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS,
+			});
+			value = complete.text;
+			ranges[field] = complete.range;
+			fields[field] = complete.text;
+		}
+	}
+	return {
+		...(Object.keys(fields).length ? { extractedFields: fields } : {}),
+		...(Object.keys(ranges).length ? { streamingFieldRanges: ranges } : {}),
+		...(name !== undefined ? { streamingFieldName: name } : {}),
+		...(value !== undefined ? { streamingFieldValue: value } : {}),
+	};
+}
+
+/** Full parameters retain verified epochs/translations, never stale preview ranges. */
+export function completeStreamingFieldRanges(
+	chunk: TopLevelStreamingChunk | undefined,
+	input: Record<string, unknown>,
+): Record<string, SourceTextRange> | undefined {
+	if (!chunk?.streamingFieldRanges) return undefined;
+	const ranges = { ...chunk.streamingFieldRanges };
+	for (const [name, text] of Object.entries(input)) {
+		if (typeof text !== "string" || name.startsWith("_")) continue;
+		ranges[name] = reconcileSourceText(streamingFieldSource(chunk, name), text, {
+			epoch: `${chunk.toolUseId}:${name}`,
+		}).range;
+	}
+	return ranges;
+}
+
+function streamingChunkInput(chunk: TopLevelStreamingChunk): Record<string, unknown> {
+	const ranges = chunk.streamingFieldRanges
+		? { _streamingFieldRanges: chunk.streamingFieldRanges }
+		: {};
+	if (chunk._input) return { ...chunk._input, ...ranges };
+	return {
+		_streamingChars: chunk.inputCharsTotal,
+		...(chunk.extractedFilePath ? { _streamingFilePath: chunk.extractedFilePath } : {}),
+		...(chunk.contentCharsReceived != null
+			? { _streamingContentChars: chunk.contentCharsReceived }
+			: {}),
+		...(chunk.extractedFields ? { _streamingFields: chunk.extractedFields } : {}),
+		...(chunk.metadata ? { _streamingMetadata: chunk.metadata } : {}),
+		...(chunk.streamingFieldName !== undefined
+			? { _streamingFieldName: chunk.streamingFieldName }
+			: {}),
+		...(chunk.streamingFieldValue !== undefined
+			? { _streamingFieldValue: chunk.streamingFieldValue }
+			: {}),
+		...ranges,
+	};
 }
 
 /**
@@ -200,7 +344,9 @@ export function topLevelStreamingChunkToToolFields(
 			// it here would claim execution that may not have begun — the bug that made a
 			// card awaiting approval animate as though it were working.
 			status: chunk._status ?? "initializing",
-			...(chunk._input ? { inputJson: chunk._input } : {}),
+			...(chunk._input || chunk.streamingFieldRanges
+				? { inputJson: streamingChunkInput(chunk) }
+				: {}),
 			...(chunk._startedAt != null ? { startedAt: chunk._startedAt } : {}),
 			...(chunk._output !== undefined ? { outputJson: chunk._output } : {}),
 			...(chunk._durationMs != null ? { durationMs: chunk._durationMs } : {}),
@@ -214,20 +360,8 @@ export function topLevelStreamingChunkToToolFields(
 		};
 	}
 
-	const streamingInput: Record<string, unknown> = {
-		_streamingChars: chunk.inputCharsTotal,
-		...(chunk.extractedFilePath ? { _streamingFilePath: chunk.extractedFilePath } : {}),
-		...(chunk.contentCharsReceived != null
-			? { _streamingContentChars: chunk.contentCharsReceived }
-			: {}),
-		...(chunk.extractedFields ? { _streamingFields: chunk.extractedFields } : {}),
-		...(chunk.metadata ? { _streamingMetadata: chunk.metadata } : {}),
-		...(chunk.streamingFieldName ? { _streamingFieldName: chunk.streamingFieldName } : {}),
-		...(chunk.streamingFieldValue ? { _streamingFieldValue: chunk.streamingFieldValue } : {}),
-	};
-
 	return {
-		inputJson: streamingInput,
+		inputJson: streamingChunkInput(chunk),
 		...(chunk.metadata ? { _metadata: chunk.metadata } : {}),
 	};
 }
@@ -346,7 +480,8 @@ export function buildTopLevelStreamingChunksMsg(
 	for (const chunk of chunks) {
 		if (chunk._started) {
 			// Tool promoted to started/completed — render as a real card.
-			const inputJson = chunk._input ?? {};
+			const inputJson =
+				chunk._input || chunk.streamingFieldRanges ? streamingChunkInput(chunk) : {};
 			const next = upsertStreamingToolBlock(
 				blocks,
 				toolCalls,
@@ -377,17 +512,13 @@ export function buildTopLevelStreamingChunksMsg(
 				} as (typeof toolCalls)[number];
 			}
 		} else {
-			const next = upsertStreamingToolBlock(blocks, toolCalls, chunk.toolUseId, chunk.toolName, {
-				_streamingChars: chunk.inputCharsTotal,
-				...(chunk.extractedFilePath && { _streamingFilePath: chunk.extractedFilePath }),
-				...(chunk.contentCharsReceived != null && {
-					_streamingContentChars: chunk.contentCharsReceived,
-				}),
-				...(chunk.extractedFields && { _streamingFields: chunk.extractedFields }),
-				...(chunk.metadata && { _streamingMetadata: chunk.metadata }),
-				...(chunk.streamingFieldName && { _streamingFieldName: chunk.streamingFieldName }),
-				...(chunk.streamingFieldValue && { _streamingFieldValue: chunk.streamingFieldValue }),
-			});
+			const next = upsertStreamingToolBlock(
+				blocks,
+				toolCalls,
+				chunk.toolUseId,
+				chunk.toolName,
+				streamingChunkInput(chunk),
+			);
 			blocks = next.blocks;
 			toolCalls = next.toolCalls;
 			const tcIdx = toolCalls.findIndex((tc) => tc.toolUseId === chunk.toolUseId);

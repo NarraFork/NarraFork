@@ -13,14 +13,21 @@
  *    platforms that report zero scrollbar width (Firefox overlay scrollbars).
  */
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { I18nextProvider } from "react-i18next";
 
-mock.module("react-i18next", () => ({
-	useTranslation: () => ({ t: (key: string) => key }),
-}));
+const testI18n = i18next.createInstance();
+await testI18n.init({
+	lng: "en",
+	fallbackLng: "en",
+	resources: { en: { narrator: {} } },
+	defaultNS: "narrator",
+	react: { useSuspense: false },
+});
 
 const { VListUserMarkers } = await import("./VListUserMarkers");
 type VListUserMarker = import("./vlist-user-markers").VListUserMarker;
@@ -120,17 +127,19 @@ async function renderMarkers(
 	const viewportRef = makeViewport(overrides.scrollbarWidth ?? 15);
 	await act(async () => {
 		root?.render(
-			<VListUserMarkers
-				markers={overrides.markers ?? MARKERS}
-				compactMarkers={overrides.compactMarkers}
-				documentHeight={overrides.documentHeight ?? 4200}
-				trackHeight={overrides.trackHeight ?? 600}
-				onJump={overrides.onJump ?? (() => {})}
-				onJumpCompact={overrides.onJumpCompact}
-				viewportRef={viewportRef}
-				resolveLabel={(ordinal) => `jump-${ordinal}`}
-				resolveCompactLabel={(marker) => `jump-compact-${marker.status}`}
-			/>,
+			<I18nextProvider i18n={testI18n}>
+				<VListUserMarkers
+					markers={overrides.markers ?? MARKERS}
+					compactMarkers={overrides.compactMarkers}
+					documentHeight={overrides.documentHeight ?? 4200}
+					trackHeight={overrides.trackHeight ?? 600}
+					onJump={overrides.onJump ?? (() => {})}
+					onJumpCompact={overrides.onJumpCompact}
+					viewportRef={viewportRef}
+					resolveLabel={(ordinal) => `jump-${ordinal}`}
+					resolveCompactLabel={(marker) => `jump-compact-${marker.status}`}
+				/>
+			</I18nextProvider>,
 		);
 	});
 }

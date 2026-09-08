@@ -19,9 +19,11 @@
  *
  * ## Contract for callers
  *
- * - Pass a session object that lives as long as the loop: the staged `before`
- *   hashes and the reused `_lastTreeHash` cache are stored ON it, so a fresh
- *   object per pass would lose the pairing between the two hooks.
+ * - Pass a session object that lives as long as the loop: staged `before` hashes
+ *   are stored ON it, so a fresh object per pass loses the boundary pairing.
+ * - Until actual execution-target receipts are available, only an unambiguous
+ *   local session/call target is measured. Remote overrides and out-of-workspace
+ *   paths have missing evidence, not equal local hashes proving a no-op.
  * - `isInGitRepo: false` means "return no hooks at all" rather than "hooks that
  *   do nothing", so the loop never awaits a call that cannot produce anything.
  * - The hooks never throw. A capture failure degrades that boundary to null;
@@ -37,6 +39,7 @@ import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { logger } from "../lib/logger";
 import type { EventHooks } from "./narrator-event-handler";
 import {
+	abandonTreeSnapshot,
 	declaredWorktreePaths,
 	recordTreeSnapshotAfter,
 	recordTreeSnapshotBefore,
@@ -61,6 +64,9 @@ export function buildTreeSnapshotEventHooks(opts: {
 }): Pick<EventHooks, "onSnapshotBefore" | "onSnapshotAfter"> {
 	const { session, narratorId, isInGitRepo } = opts;
 	if (!isInGitRepo) return {};
+	// Keep the accepted scope per attempt without mutating the session's default
+	// device to impersonate a per-call override. A remote cwd is not a local cwd.
+	const localCalls = new Map<string, string>();
 
 	return {
 		// Capture the workspace state before a file-mutating tool runs. This is a
@@ -73,12 +79,45 @@ export function buildTreeSnapshotEventHooks(opts: {
 			// so it declares nothing and its set is derived instead.
 			const declared =
 				toolName === SHELL_TOOL_NAME ? null : declaredWorktreePaths(session.cwd, input);
+			localCalls.delete(toolUseId);
+			const args = input as Record<string, unknown> | null;
+			const defaultDeviceId = session._defaultDeviceId ?? LOCAL_DEVICE_ID;
+			const requestedDevice = args?.device;
+			const workdir = args?.workdir;
+			if (
+				defaultDeviceId !== LOCAL_DEVICE_ID ||
+				(requestedDevice !== undefined && requestedDevice !== LOCAL_DEVICE_ID) ||
+				(toolName === SHELL_TOOL_NAME && workdir !== undefined && workdir !== session.cwd) ||
+				(declared !== null && declared.length === 0)
+			) {
+				abandonTreeSnapshot(session, narratorId, toolUseId);
+				logger.warn(
+					"Tree snapshot skipped: tool target is not verified inside the local workspace",
+					{
+						narratorId,
+						toolUseId,
+						toolName,
+					},
+				);
+				return;
+			}
+			localCalls.set(toolUseId, session.cwd);
 			await recordTreeSnapshotBefore(session, narratorId, toolUseId, declared);
 		},
 		// Capture the resulting state, persist both boundaries, and attribute the
 		// files Bash changed using the authoritative tree diff.
 		onSnapshotAfter: async (toolUseId, toolName) => {
 			if (!FILE_MUTATING_TOOLS.has(toolName)) return;
+			const capturedCwd = localCalls.get(toolUseId);
+			localCalls.delete(toolUseId);
+			if (
+				capturedCwd !== session.cwd ||
+				(session._defaultDeviceId ?? LOCAL_DEVICE_ID) !== LOCAL_DEVICE_ID
+			) {
+				abandonTreeSnapshot(session, narratorId, toolUseId);
+				await recordTreeSnapshotAfter(session, narratorId, toolUseId, { unavailable: true });
+				return;
+			}
 			const { changedFiles } = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 			if (toolName !== SHELL_TOOL_NAME || changedFiles.length === 0) return;
 			try {

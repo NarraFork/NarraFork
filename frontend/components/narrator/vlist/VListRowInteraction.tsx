@@ -35,6 +35,7 @@
 
 import { usePlatform } from "@frontend/hooks/usePlatform";
 import { useSwipeMenu } from "@frontend/hooks/useSwipeMenu";
+import type { ToolCallDetailRef } from "@frontend/lib/api/narrators";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Z } from "@frontend/lib/z-index";
 import { Box, Menu } from "@mantine/core";
@@ -68,6 +69,7 @@ import {
 	useMessageSelection,
 } from "../MessageSelectionCtx";
 import { useRenderInteractive } from "../RenderLodCtx";
+import { useToolEditNavigation } from "../useToolEditNavigation";
 import type { VListRowToolActions } from "./vlist-row-actions";
 import type { VListToolMeta } from "./vlist-tool-meta";
 
@@ -110,6 +112,8 @@ export interface VListRowInteractionProps {
 	 * Tool-call id behind this row (tc-/sa- rows only). Drives the inspect item.
 	 */
 	toolUseId?: string;
+	/** Card-owned request identity; never derive refs from the selection messageId. */
+	toolDetailRef?: ToolCallDetailRef & { toolUseId?: string };
 	/** Row tool facts (file path, child narrator, background state). */
 	toolMeta?: VListToolMeta;
 	/** Card-specific actions already bound to this row's tool. */
@@ -156,6 +160,7 @@ export function VListRowInteraction({
 	actions: msgCtx,
 	narratorId,
 	toolUseId,
+	toolDetailRef,
 	toolMeta,
 	toolActions,
 	onViewOriginal,
@@ -175,6 +180,13 @@ export function VListRowInteraction({
 	const [inspectorOpened, setInspectorOpened] = useState(false);
 	const [previewOpened, setPreviewOpened] = useState(false);
 	const [contentInspectorOpened, setContentInspectorOpened] = useState(false);
+	const editNavigation = useToolEditNavigation({
+		toolName: toolMeta?.toolName,
+		narratorId,
+		toolUseId: toolDetailRef?.toolUseId ?? toolUseId,
+		toolDetailRef,
+		filePath: toolMeta?.filePath,
+	});
 
 	const isSelected = selection.selectedBlockIds.has(blockId);
 
@@ -334,15 +346,16 @@ export function VListRowInteraction({
 					{tNarrator("contextMenu_viewFile")}
 				</Menu.Item>
 			)}
-			{toolActions?.onOpenFilePanel && (
+			{(editNavigation.open || toolActions?.onOpenFilePanel) && (
 				<Menu.Item
 					leftSection={<IconFileText size={14} />}
 					onClick={() => {
-						toolActions.onOpenFilePanel?.();
+						if (editNavigation.open) editNavigation.open();
+						else toolActions?.onOpenFilePanel?.();
 						swipe.closeSwipe();
 					}}
 				>
-					{tNarrator("contextMenu_openFilePanel")}
+					{tNarrator(editNavigation.open ? "editPreview.open" : "contextMenu_openFilePanel")}
 				</Menu.Item>
 			)}
 		</>
@@ -581,7 +594,10 @@ export function VListRowInteraction({
 				<Suspense fallback={null}>
 					<ToolCallInspector
 						narratorId={narratorId}
-						toolUseId={toolUseId}
+						toolUseId={toolDetailRef?.toolUseId ?? toolUseId}
+						toolCallId={toolDetailRef?.toolCallId}
+						messageId={toolDetailRef?.messageId}
+						executionAttempt={toolDetailRef?.executionAttempt}
 						opened={inspectorOpened}
 						onClose={() => setInspectorOpened(false)}
 					/>
@@ -601,6 +617,7 @@ export function VListRowInteraction({
 			)}
 
 			{/* File preview (Read tool) — mounted only while open (lazy chunk). */}
+			{editNavigation.modal}
 			{previewOpened && filePath && (
 				<Suspense fallback={null}>
 					<FilePreviewModal

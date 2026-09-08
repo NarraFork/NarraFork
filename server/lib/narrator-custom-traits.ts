@@ -1,8 +1,16 @@
+import type { ReasoningEffort } from "@shared/reasoning-effort";
+import {
+	isSubagentReasoningEffort,
+	MAX_SUBAGENT_FIXED_EFFORTS_PER_POOL,
+	MAX_SUBAGENT_MODEL_REFERENCE_LENGTH,
+	type SubagentModelUse,
+	type SubagentPoolType,
+} from "@shared/subagent-model-policy";
 import { toolRegistry } from "./agent/tool-registry";
 import { OPTIONAL_TOOLS, REVIEW_TOOLS } from "./agent/tools/index";
 import type { ToolDefinition } from "./agent/types";
 import { parseTraits } from "./narrator-utils";
-import { getVisibleModels, resolveAllowedModelCandidate, settings } from "./settings";
+import { getVisibleModels, resolveAllowedModelCandidateMatch, settings } from "./settings";
 import { expandAllowedPoolForDisplay } from "./settings/provider";
 
 export const SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX = "custom-subagent-models:";
@@ -10,16 +18,13 @@ export const DISABLED_TOOLS_TRAIT_PREFIX = "custom-disabled-tools:";
 export const BLOCKED_SKILLS_TRAIT_PREFIX = "custom-blocked-skills:";
 
 const BUILTIN_SUBAGENT_POOL_KEYS = new Set(["explore", "plan", "search", "review", "general"]);
-const MAX_MODEL_LENGTH = 200;
+const MAX_MODEL_LENGTH = MAX_SUBAGENT_MODEL_REFERENCE_LENGTH;
 const MAX_PURPOSE_LENGTH = 1000;
-const MAX_MODELS_PER_POOL = 50;
+const MAX_MODELS_PER_POOL = MAX_SUBAGENT_FIXED_EFFORTS_PER_POOL;
 const MAX_BLOCKED_SKILL_NAME_LENGTH = 200;
 const MAX_BLOCKED_SKILLS = 200;
 
-export interface SubagentModelUse {
-	model: string;
-	purpose?: string;
-}
+export type { SubagentModelUse } from "@shared/subagent-model-policy";
 
 export interface SubagentModelRestrictionTrait {
 	version: 1;
@@ -110,16 +115,22 @@ export function normalizeSubagentModelRestriction(input: unknown): SubagentModel
 		for (const item of rawValue) {
 			let model = "";
 			let purpose: string | undefined;
+			let reasoningEffort: ReasoningEffort | undefined;
 			if (typeof item === "string") {
 				model = item.trim();
 			} else if (item && typeof item === "object") {
-				const obj = item as { model?: unknown; purpose?: unknown };
+				const obj = item as { model?: unknown; purpose?: unknown; reasoningEffort?: unknown };
 				model = typeof obj.model === "string" ? obj.model.trim() : "";
 				purpose = normalizePurpose(obj.purpose);
+				if (isSubagentReasoningEffort(obj.reasoningEffort)) reasoningEffort = obj.reasoningEffort;
 			}
 			if (!model || model.length > MAX_MODEL_LENGTH || seen.has(model)) continue;
 			seen.add(model);
-			entries.push(purpose ? { model, purpose } : { model });
+			entries.push({
+				model,
+				...(purpose && { purpose }),
+				...(reasoningEffort && { reasoningEffort }),
+			});
 			if (entries.length >= MAX_MODELS_PER_POOL) break;
 		}
 		pools[key] = entries;
@@ -299,34 +310,67 @@ export function resolveEffectiveSubagentModelPolicy(
 	return {
 		source: "settings",
 		poolKey,
-		models: settingsPool.map((model) => ({ model })),
+		models: settingsPool.map((model) => {
+			const effort =
+				settings.agent.subagentModelReasoningEfforts?.[poolKey as SubagentPoolType]?.[model];
+			return { model, ...(isSubagentReasoningEffort(effort) && { reasoningEffort: effort }) };
+		}),
 		isExplicitEmpty: false,
 	};
 }
 
-export function resolveSubagentModelFromPolicy(params: {
+interface SubagentModelSelectionParams {
 	policy: EffectiveSubagentModelPolicy;
 	explicitModel?: string;
 	candidates: Array<string | undefined | null>;
-}): string | undefined {
+}
+
+export interface SubagentModelSelection {
+	model: string;
+	poolEntry?: SubagentModelUse;
+}
+
+export function resolveSubagentModelFromPolicy(
+	params: SubagentModelSelectionParams,
+): string | undefined {
+	return resolveSubagentModelSelectionFromPolicy(params)?.model;
+}
+
+/** Resolve once: metadata follows the selected pool reference, not a second routed model. */
+export function resolveSubagentModelSelectionFromPolicy(
+	params: SubagentModelSelectionParams,
+): SubagentModelSelection | undefined {
 	const allowedPool = params.policy.models.map((item) => item.model);
 	if (params.policy.source === "none") {
-		return (
+		const model =
 			params.explicitModel ||
-			params.candidates.find((candidate): candidate is string => !!candidate)
-		);
+			params.candidates.find((candidate): candidate is string => !!candidate);
+		return model ? { model } : undefined;
 	}
 	if (params.policy.isExplicitEmpty) return undefined;
 
-	if (params.explicitModel) {
-		return resolveAllowedModelCandidate(params.explicitModel, allowedPool) ?? undefined;
-	}
+	const matchCandidate = (candidate: string | null | undefined) => {
+		const match = resolveAllowedModelCandidateMatch(candidate, allowedPool);
+		if (!match) return undefined;
+		return {
+			model: match.model,
+			...(match.poolIndex !== undefined && { poolEntry: params.policy.models[match.poolIndex] }),
+		};
+	};
+	if (params.explicitModel) return matchCandidate(params.explicitModel);
 
 	for (const candidate of params.candidates) {
-		const resolved = resolveAllowedModelCandidate(candidate, allowedPool);
+		const resolved = matchCandidate(candidate);
 		if (resolved) return resolved;
 	}
-	return allowedPool[0];
+	const poolEntry = params.policy.models[0];
+	return poolEntry ? { model: poolEntry.model, poolEntry } : undefined;
+}
+
+export function formatSubagentModelUse(entry: SubagentModelUse): string {
+	const models = expandAllowedPoolForDisplay([entry.model]).join(", ") || entry.model;
+	const effort = entry.reasoningEffort ? ` [fixed reasoning_effort=${entry.reasoningEffort}]` : "";
+	return `${models}${effort}${entry.purpose ? ` — ${entry.purpose}` : ""}`;
 }
 
 export function formatSubagentModelRestrictionDescription(traits: unknown): string | null {
@@ -346,14 +390,7 @@ export function formatSubagentModelRestrictionDescription(traits: unknown): stri
 			parts.push(`${key}: (no models allowed)`);
 			continue;
 		}
-		parts.push(
-			`${key}: ${entries
-				.map((entry) => {
-					const models = expandAllowedPoolForDisplay([entry.model]).join(", ") || entry.model;
-					return entry.purpose ? `${models} — ${entry.purpose}` : models;
-				})
-				.join("; ")}`,
-		);
+		parts.push(`${key}: ${entries.map(formatSubagentModelUse).join("; ")}`);
 	}
 	if (parts.length === 0) return null;
 	return `Subagent model selection is restricted by this narrator's custom trait. Allowed models and intended uses — ${parts.join(" | ")}. Models outside the matching pool are not available.`;

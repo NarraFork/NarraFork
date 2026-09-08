@@ -52,6 +52,9 @@ scripts/lib/__tests__/*
 # fresh clone and `bun run package` inside vscode-extension/ would fail on a missing
 # module rather than on anything explaining why.
 !scripts/package-vscode-extension.ts
+# Reproducible tool-body follow regression harness; reports remain under .narrafork/.
+!scripts/smoke-tool-content-follow.ts
+!scripts/smoke-tool-content-follow-fixture.tsx
 .tmp-narrafork-home.*
 .release.local.json
 mitm-dump/

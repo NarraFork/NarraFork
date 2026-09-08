@@ -67,6 +67,41 @@ function toolMsg(toolName: string, inputJson?: unknown, outputJson?: unknown): T
 /** Exceeds the default 2000-char per-leaf budget. */
 const LONG = "x".repeat(3000);
 
+describe("file-reference display projection", () => {
+	test("lists and child/WS summaries omit snapshots but keep context and locator", () => {
+		const snapshot = {
+			type: "file_reference",
+			reference: { id: "ref", deviceId: "A", path: "/repo/a.ts", label: "a.ts" },
+			snapshotText: "hidden file body".repeat(8192),
+			snapshotHash: "hash",
+			capturedAt: "2026-09-07T00:00:00Z",
+		};
+		const context = { deviceId: "B", cwd: "/repo" };
+		const child = { role: "user", contentText: "review", contentJson: [snapshot] };
+		const tree = [
+			{
+				role: "assistant",
+				contentJson: [{ type: "text", text: "src/a.ts", fileReferenceContext: context }],
+				children: [child],
+			},
+			child,
+		];
+		const projected = truncateToolIO(tree);
+		expect(projected[0].contentJson[0].fileReferenceContext).toEqual(context);
+		for (const message of [projected[0].children[0], projected[1]]) {
+			expect(message.contentJson).toEqual([
+				{ type: "file_reference", reference: snapshot.reference },
+			]);
+			expect(message.contentText).toBe("review");
+		}
+		expect(JSON.stringify(projected)).not.toContain("hidden file body");
+		expect(JSON.stringify(projected)).not.toContain("snapshotText");
+		// Display projection must not mutate the row used by details/history/model replay.
+		expect(child.contentJson[0]).toBe(snapshot);
+		expect(snapshot.snapshotText.length).toBeGreaterThan(100_000);
+	});
+});
+
 describe("truncateToolIO — header fields survive without _hints", () => {
 	test("truncated Bash input keeps command/description/timeout as PLAIN fields", () => {
 		const out = truncateToolIO(

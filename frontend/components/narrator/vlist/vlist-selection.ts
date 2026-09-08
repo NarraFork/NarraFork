@@ -21,6 +21,8 @@
  */
 
 import { cleanAssistantText } from "@shared/citations";
+import type { FileReference } from "@shared/file-reference";
+import { fileReferenceLabel } from "@shared/file-reference-display";
 import { stringifyForDisplay } from "@shared/pretext-layout/tool-io-projection";
 import type { BlockMeta, CollectedSelectedText } from "../MessageSelectionCtx";
 import {
@@ -67,6 +69,9 @@ function stableStringify(value: unknown, maxChars = 4000): string {
  * in — quoting the marker is legitimate there.
  */
 function getBlockCopyText(block: ContentBlock, assistant = false): string {
+	if (block.type === "file_reference") {
+		return block.reference ? fileReferenceLabel(block.reference as FileReference) : "";
+	}
 	if (typeof block.text === "string") {
 		return assistant ? cleanAssistantText(block.text).text : block.text;
 	}
@@ -122,6 +127,7 @@ function getUserMessageCopyText(msg: NarratorMsg): string {
 	const parts: string[] = [];
 	for (const block of (msg.contentJson ?? []) as ContentBlock[]) {
 		if (block.type === "text" && block.text?.trim()) parts.push(block.text);
+		else if (block.type === "file_reference") parts.push(getBlockCopyText(block));
 	}
 	return parts.join("\n\n");
 }

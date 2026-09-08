@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { QueryClient } from "@tanstack/react-query";
-import { handlePluginUiNotification } from "./notifications";
+import { handlePluginUiNotification, invalidatePluginModelQueries } from "./notifications";
 
 describe("handlePluginUiNotification", () => {
 	test("invalidates settings caches for a catalog-invalidated notification", async () => {
@@ -26,6 +26,21 @@ describe("handlePluginUiNotification", () => {
 		expect(queryClient.getQueryState(["settings"])?.isInvalidated).toBe(true);
 		expect(queryClient.getQueryState(["admin", "settings"])?.isInvalidated).toBe(true);
 		expect(queryClient.getQueryState(["other"])?.isInvalidated).toBe(false);
+	});
+
+	test("startup discovery invalidates previously fresh empty model caches", () => {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } });
+		try {
+			queryClient.setQueryData(["settings"], { pluginProviderModelsGrouped: [] });
+			queryClient.setQueryData(["admin", "settings"], { pluginProviderModelsGrouped: [] });
+			queryClient.setQueryData(["other"], { unchanged: true });
+			invalidatePluginModelQueries(queryClient);
+			expect(queryClient.getQueryState(["settings"])?.isInvalidated).toBe(true);
+			expect(queryClient.getQueryState(["admin", "settings"])?.isInvalidated).toBe(true);
+			expect(queryClient.getQueryState(["other"])?.isInvalidated).toBe(false);
+		} finally {
+			queryClient.clear();
+		}
 	});
 
 	test("ignores unrelated notifications", () => {

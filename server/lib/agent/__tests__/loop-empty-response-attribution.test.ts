@@ -1,4 +1,9 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
+import { settings } from "../../settings";
+import {
+	clearCodexResponsesWebSocketSessions,
+	streamCodexResponsesWebSocket,
+} from "../codex-websocket";
 import type { ProviderAdapter } from "../provider";
 import { type AgentConfig, type AgentEvent, ApiError } from "../types";
 
@@ -22,8 +27,10 @@ let providerScenario:
 	| "no_events_forever"
 	| "stop_reason_without_content_forever"
 	| "truncated_tool_input_forever"
-	| "reasoning_then_truncated_tool_input" = "error_then_usage_only";
+	| "reasoning_then_truncated_tool_input"
+	| "ws_error_response" = "error_then_usage_only";
 let providerAttempts = 0;
+let wsBaseUrl = "";
 /** `content` (user-side turn text) seen by each provider.chat() call, in order. */
 let sentContents: string[] = [];
 
@@ -35,6 +42,21 @@ const testProvider: ProviderAdapter = {
 		providerAttempts++;
 		sentContents.push(params.content ?? "");
 		params.onRequestStart?.();
+
+		if (providerScenario === "ws_error_response") {
+			yield* streamCodexResponsesWebSocket({
+				baseUrl: wsBaseUrl,
+				apiKey: "local-test-key",
+				sessionKey: "ws-empty-attribution",
+				conversationId: params.conversationId,
+				credentialId: "local-test-credential",
+				model: params.model,
+				request: { model: params.model, input: [], stream: true },
+				signal: AbortSignal.any([params.signal, AbortSignal.timeout(2000)]),
+				requestDump: params.requestDump,
+			});
+			return;
+		}
 
 		if (providerScenario === "error_then_usage_only") {
 			if (providerAttempts === 1) {
@@ -181,6 +203,77 @@ describe("空响应归因链", () => {
 		expect(terminal?.type).toBe("retryable_error");
 		expect((terminal as { message: string }).message).toContain("503");
 		expect((terminal as { message: string }).message).not.toContain("base URL");
+	});
+});
+
+describe("真实 WS 错误不落入空响应兜底", () => {
+	test.each([
+		["error", 400, false],
+		["error", 503, false],
+		["completed", 400, false],
+		["completed", 503, false],
+		["completed", 400, true],
+		["completed", 503, true],
+	] as const)("保留错误并按状态重试，关闭 dump 也有效 (%s, %i, usage=%s)", async (delivery, status, withUsage) => {
+		const message = "backend rejected this request";
+		const code = "gateway_failure";
+		const frame =
+			delivery === "error"
+				? { type: "error", status, code, error: message }
+				: {
+						type: "response.completed",
+						response: {
+							id: "failed-response",
+							status: "failed",
+							statusCode: status,
+							error: { code, message },
+							...(withUsage ? { usage: { input_tokens: 4, output_tokens: 0 } } : {}),
+						},
+					};
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request, server) {
+				if (server.upgrade(request)) return;
+				return new Response("upgrade required", { status: 426 });
+			},
+			websocket: {
+				message(socket) {
+					socket.send(JSON.stringify(frame));
+				},
+			},
+		});
+		wsBaseUrl = `http://127.0.0.1:${server.port}/backend-api/codex`;
+		providerScenario = "ws_error_response";
+		providerAttempts = 0;
+		const dumpEnabled = settings.agent.requestDumpEnabled;
+		settings.agent.requestDumpEnabled = false;
+		try {
+			const events = await runLoop({ maxTransientRetries: 1 });
+			const terminal = events.at(-1);
+			expect(terminal).toBeDefined();
+			if (!terminal || !("message" in terminal)) throw new Error("Missing terminal error");
+			expect(terminal.message).toContain(message);
+			expect(terminal.message).not.toContain("base URL");
+			if (status === 503) expect(terminal.type).toBe("retryable_error");
+			else expect(["error", "invalid_state"]).toContain(terminal.type);
+			expect(providerAttempts).toBe(status === 503 ? 2 : 1);
+			expect(events.filter((event) => event.type === "retrying")).toHaveLength(
+				status === 503 ? 1 : 0,
+			);
+			const requests = events.filter((event) => event.type === "api_request_end");
+			expect(requests).toHaveLength(providerAttempts);
+			for (const request of requests) {
+				expect(request.rawDump).toBeUndefined();
+				expect(request.diagnostics).toMatchObject({ code, statusCode: status });
+				expect(request.diagnostics?.message).toContain(message);
+				expect(request.diagnostics?.reason).not.toMatch(/^empty_response/);
+			}
+		} finally {
+			settings.agent.requestDumpEnabled = dumpEnabled;
+			await clearCodexResponsesWebSocketSessions();
+			server.stop(true);
+		}
 	});
 });
 

@@ -628,8 +628,15 @@ export async function attachSubagent(
 
 	const resultPrefix = agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId));
 	return appendSubagentFileChanges(
-		parentNarratorId,
-		null,
+		{
+			parentNarratorId,
+			childNarratorId: subagentId,
+			scope: {
+				sourceToolUseId: toolUseId,
+				startedAt: subNarrator.turnStartedAt ?? null,
+				completedAt: new Date().toISOString(),
+			},
+		},
 		resultPrefix + (result.finalText || "(no output)"),
 	);
 }

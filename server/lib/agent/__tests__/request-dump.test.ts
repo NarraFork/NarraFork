@@ -4,7 +4,107 @@ import {
 	normalizeApiRequestDiagnostics,
 	parseErrorDiagnostics,
 } from "../error-diagnostics";
-import { ApiRequestDumpCollector, MAX_DUMP_EVENT_COUNT, sanitizeHeaders } from "../request-dump";
+import {
+	ApiRequestDumpCollector,
+	BoundedUtf8Capture,
+	captureResponseStream,
+	HARD_DUMP_MAX_BYTES,
+	MAX_DUMP_EVENT_COUNT,
+	responseDumpBudget,
+	sanitizeHeaders,
+} from "../request-dump";
+
+describe("incremental response capture", () => {
+	test("UTF8 byte boundaries preserve prefixes and seal on truncation", () => {
+		const c = new BoundedUtf8Capture(5);
+		c.append("中😀");
+		c.append("a");
+		expect(c.text()).toBe("中");
+		expect(c.received).toBe(8);
+		const split = new BoundedUtf8Capture(7);
+		const bytes = new TextEncoder().encode("中😀x");
+		for (const byte of bytes) split.append(new Uint8Array([byte]));
+		expect(split.text()).toBe("中😀");
+		expect(split.kept).toBe(7);
+		expect(responseDumpBudget(-1)).toBe(HARD_DUMP_MAX_BYTES);
+		expect(responseDumpBudget(Infinity)).toBe(HARD_DUMP_MAX_BYTES);
+		expect(new BoundedUtf8Capture(0).text()).toBe("");
+	});
+
+	test("many tiny chunks stay a correct bounded prefix across storage blocks", () => {
+		const capture = new BoundedUtf8Capture(65537);
+		for (let i = 0; i < 100000; i++) capture.append(new Uint8Array([97]));
+		expect(capture.text()).toBe("a".repeat(65537));
+		expect(capture.received).toBe(100000);
+		const partial = new BoundedUtf8Capture(5);
+		partial.append(new TextEncoder().encode("中😀"));
+		expect(partial.text()).toBe("中");
+		expect(capture.kept).toBe(65537);
+	});
+
+	test("disabled capture does not wrap the source", () => {
+		const source = new ReadableStream<Uint8Array>();
+		expect(captureResponseStream(source).stream).toBe(source);
+	});
+
+	test("HTTP early exit cancels without draining and keeps received bytes", async () => {
+		const dump = new ApiRequestDumpCollector();
+		dump.beginResponseAttempt({ transport: "http" }, 32);
+		let pulls = 0;
+		let cancelled = false;
+		const capture = captureResponseStream(
+			new ReadableStream(
+				{
+					pull(controller) {
+						pulls++;
+						controller.enqueue(new TextEncoder().encode("raw中"));
+					},
+					cancel() {
+						cancelled = true;
+					},
+				},
+				{ highWaterMark: 0 },
+			),
+			dump,
+		);
+		await capture.stream.getReader().read();
+		capture.finish();
+		expect(pulls).toBe(1);
+		expect(cancelled).toBe(true);
+		expect(dump.snapshot().response).toMatchObject({ bodyText: "raw中", bodyIncomplete: true });
+	});
+
+	test("stream error preserves the prefix and attempts share a byte budget", async () => {
+		const dump = new ApiRequestDumpCollector();
+		dump.beginResponseAttempt({ transport: "websocket", body: "first" }, 5);
+		dump.appendResponseText("abc");
+		dump.beginResponseAttempt({ transport: "http", body: "second" }, 5);
+		let reads = 0;
+		const tap = captureResponseStream(
+			new ReadableStream(
+				{
+					pull(controller) {
+						if (reads++ === 0) controller.enqueue(new TextEncoder().encode("def"));
+						else controller.error(new Error("broken"));
+					},
+				},
+				{ highWaterMark: 0 },
+			),
+			dump,
+		);
+		const reader = tap.stream.getReader();
+		await reader.read();
+		await expect(reader.read()).rejects.toThrow("broken");
+		expect(dump.snapshot().response).toMatchObject({
+			bodyText: "de",
+			bodyTruncated: true,
+			error: "broken",
+		});
+		expect(dump.snapshot().attempts?.[0].response?.bodyText).toBe("abc");
+		expect(dump.snapshot().initialRequest?.body).toBe("first");
+		expect(dump.snapshot().request?.body).toBe("second");
+	});
+});
 
 describe("ApiRequestDumpCollector.setResponseEventsWithLimit", () => {
 	test("keeps all events when under both caps", () => {

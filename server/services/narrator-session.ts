@@ -192,6 +192,7 @@ import {
 	consumePendingBackgroundFinalize,
 	consumePendingStopTakeover,
 	isTakenOver,
+	markPendingStopTakeover,
 } from "./subagent-takeover";
 import { isMcpToolAllowedForNarrator } from "./subagent-tools";
 import { resolveEffectiveTraits } from "./trait-layer-service";
@@ -333,6 +334,18 @@ function interruptPlannedUpdateRecovery(narratorId: string): {
 // === Imported from extracted modules ===
 
 import {
+	type FileReferenceSnapshot,
+	fileReferenceContentForDisplay,
+	fileReferenceMessageForDisplay,
+} from "@shared/file-reference";
+import {
+	freezeFileReferenceSnapshots,
+	getFileReferenceSnapshots,
+	parseFileReferenceSnapshotsJson,
+	projectFileReferenceText,
+} from "../lib/agent/file-reference-projection";
+import { getAgentFileReferenceContext } from "./file-reference-context";
+import {
 	cleanupBufferedTextFiles,
 	dbClearAllBuffered,
 	dbConsumeBuffered,
@@ -352,6 +365,7 @@ import {
 } from "./narrator-compact";
 import { handlePermission, resolvePermissionOrDangerReflection } from "./narrator-permission";
 import {
+	narratorPersistence,
 	reconstructToolExecutionTarget,
 	recoverStaleCompactingMessages,
 } from "./narrator-persistence";
@@ -614,7 +628,7 @@ async function executeQueuedNewCommand(
 		ownerUserId: buffered.createdBy ?? sourceNarrator.ownerUserId,
 	});
 
-	if (initialMessage) {
+	if (initialMessage || buffered.fileReferences?.length) {
 		await sendMessage(
 			newNarrator.id,
 			initialMessage,
@@ -624,6 +638,9 @@ async function executeQueuedNewCommand(
 			undefined,
 			buffered.createdBy,
 			buffered.textFiles,
+			undefined,
+			undefined,
+			buffered.fileReferences,
 		);
 	}
 
@@ -667,11 +684,15 @@ async function executeQueuedGoalCommand(
 	const userMsg = await narratorService.persistUserMessage(
 		narratorId,
 		rawCommand,
-		[{ type: "text", text: rawCommand }],
+		[...(buffered.fileReferences ?? []), { type: "text", text: rawCommand }],
 		rawCommand,
 		buffered.createdBy,
 	);
-	broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
+	broadcastToNarrator(narratorId, {
+		type: "user_message",
+		narratorId,
+		message: fileReferenceMessageForDisplay(userMsg),
+	});
 	const { added, written } = await specVfsService.appendProtectedSpecTask(narratorId, objective);
 	if (added) {
 		broadcastSpecChanged(
@@ -781,13 +802,19 @@ function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void
 			first.textFiles,
 			first.bashCommand,
 			{ bufferedDelivery: true },
+			undefined,
+			first.fileReferences,
 		)
 			.then(({ userMsg, userBroadcasted }) => {
 				// Delivered: the attachments have been re-materialized into the turn, so the
 				// queued copies are finally safe to drop.
 				cleanupBufferedTextFiles(first.id);
 				if (!userBroadcasted) {
-					broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
+					broadcastToNarrator(narratorId, {
+						type: "user_message",
+						narratorId,
+						message: fileReferenceMessageForDisplay(userMsg),
+					});
 				}
 			})
 			.catch((err) => {
@@ -1176,7 +1203,7 @@ async function broadcastInterruptedPartialMessage(
 				broadcastToNarrator(parentNarratorId, {
 					type: "message",
 					narratorId: parentNarratorId,
-					message: processed,
+					message: fileReferenceMessageForDisplay(processed),
 				});
 			}
 		}
@@ -1186,7 +1213,7 @@ async function broadcastInterruptedPartialMessage(
 		broadcastToNarrator(narratorId, {
 			type: "message",
 			narratorId,
-			message: { ...processed, parentToolUseId: null },
+			message: fileReferenceMessageForDisplay({ ...processed, parentToolUseId: null }),
 		});
 	} catch (err) {
 		logger.warn("Failed to broadcast interrupted partial message", {
@@ -1520,7 +1547,7 @@ async function maybeStartSpecContinuation(
 				id: msg.id,
 				narratorId: active.narratorId,
 				role: msg.role,
-				contentJson: msg.contentJson,
+				contentJson: fileReferenceContentForDisplay(msg.contentJson),
 				contentText: msg.contentText,
 				createdAt: msg.createdAt,
 				seq: msg.seq,
@@ -1569,7 +1596,7 @@ async function maybeStartSpecContinuation(
 			id: msg.id,
 			narratorId: active.narratorId,
 			role: msg.role,
-			contentJson: msg.contentJson,
+			contentJson: fileReferenceContentForDisplay(msg.contentJson),
 			contentText: msg.contentText,
 			createdAt: msg.createdAt,
 			seq: msg.seq,
@@ -2140,11 +2167,15 @@ export function resolvePoppedTrailingUserText(
 			)
 			.map((block: { text?: unknown }) => String(block.text))
 			.join("\n");
-		if (text.trim()) return text;
-		// `contentText` is the flat fallback for rows written without an explicit text
-		// block, matching how `dbMessageVisibleText` reads a row.
+		// Snapshot-only inputs are real turns too. Prefer contentText for the old
+		// uploaded-file hint when references are present, just as history projection does.
 		const flat = typeof msg.contentText === "string" ? msg.contentText : "";
-		return flat.trim() ? flat : null;
+		const snapshots = getFileReferenceSnapshots(blocks);
+		const projected = projectFileReferenceText(
+			snapshots.length ? flat || text : text || flat,
+			snapshots,
+		);
+		return projected.trim() ? projected : null;
 	}
 	return null;
 }
@@ -2558,6 +2589,7 @@ export async function runAgentLoop(
 	let unregisterUpdateLoop: () => void = () => {};
 	let shouldUpdateTitle = false;
 	let currentText = text;
+	let pendingBufferedDelivery: BufferedMessage | undefined;
 	// Knowledge entries already injected in the CURRENT COMPACT CYCLE (de-dup across runAgentLoop
 	// calls, loop passes, and tool outputs). This is narratorId-scoped hotSafe state rather than
 	// ActiveNarrator state because ActiveNarrator is recreated between idle user turns.
@@ -2744,6 +2776,7 @@ export async function runAgentLoop(
 				resolved.model,
 				resolved.provider,
 				narratorId,
+				{ currentInput: currentText },
 			);
 
 			const { prompt: freshSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
@@ -2772,6 +2805,7 @@ export async function runAgentLoop(
 			active._usedCompactSummary = usedCompactSummary;
 
 			const eventContext: EventHandlerContext = {
+				getFileReferenceContext: () => getAgentFileReferenceContext(config),
 				narratorId,
 				broadcastTargetId: saParentNarratorId ?? narratorId,
 				sseEmitter: active.events,
@@ -3240,10 +3274,13 @@ export async function runAgentLoop(
 							return true;
 						}
 					: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
-				onExecutionTargetResolved: (toolUseId, target) =>
-					narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, target),
-				onExecutionPlanResolved: (toolUseId, plan) =>
-					narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, plan),
+				requireToolCallBinding: true,
+				onToolExecutionStarting: (toolUseId, binding, startedAt) =>
+					narratorPersistence.claimToolCallExecution(narratorId, toolUseId, binding, startedAt),
+				onExecutionTargetResolved: (toolUseId, target, binding) =>
+					narratorService.updateToolCallExecutionTarget(narratorId, toolUseId, target, binding),
+				onExecutionPlanResolved: (toolUseId, plan, binding) =>
+					narratorService.updateToolCallExecutionPlan(narratorId, toolUseId, plan, binding),
 				// Share the compact-cycle de-dup set so the loop's tool-output scan (point B)
 				// de-dups against the user-message injections (point A) and vice versa.
 				knowledgeInjectedEntryIds: knowledgeInjectedIds,
@@ -4070,9 +4107,12 @@ export async function runAgentLoop(
 					broadcastToNarrator(narratorId, {
 						type: "user_message",
 						narratorId,
-						message: userMsg,
+						message: fileReferenceMessageForDisplay(userMsg),
 					});
-					active.events.emit("event", { type: "user_message", data: userMsg });
+					active.events.emit("event", {
+						type: "user_message",
+						data: fileReferenceMessageForDisplay(userMsg),
+					});
 					await narratorService.updateStatus(narratorId, "working");
 					currentText = continueText;
 					currentImages = undefined;
@@ -4151,9 +4191,12 @@ export async function runAgentLoop(
 				broadcastToNarrator(narratorId, {
 					type: "user_message",
 					narratorId,
-					message: userMsg,
+					message: fileReferenceMessageForDisplay(userMsg),
 				});
-				active.events.emit("event", { type: "user_message", data: userMsg });
+				active.events.emit("event", {
+					type: "user_message",
+					data: fileReferenceMessageForDisplay(userMsg),
+				});
 				await narratorService.updateStatus(narratorId, "working");
 				currentText = promptText;
 				currentImages = undefined;
@@ -4189,8 +4232,15 @@ export async function runAgentLoop(
 					fb.userId ?? undefined,
 					{ origin: "user" },
 				);
-				broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
-				active.events.emit("event", { type: "user_message", data: userMsg });
+				broadcastToNarrator(narratorId, {
+					type: "user_message",
+					narratorId,
+					message: fileReferenceMessageForDisplay(userMsg),
+				});
+				active.events.emit("event", {
+					type: "user_message",
+					data: fileReferenceMessageForDisplay(userMsg),
+				});
 				await narratorService.updateStatus(narratorId, "working");
 				currentText = fb.feedbackText;
 				// Approving a permission with attached text starts a new pass here, so a
@@ -4217,9 +4267,12 @@ export async function runAgentLoop(
 					broadcastToNarrator(narratorId, {
 						type: "user_message",
 						narratorId,
-						message: userMsg,
+						message: fileReferenceMessageForDisplay(userMsg),
 					});
-					active.events.emit("event", { type: "user_message", data: userMsg });
+					active.events.emit("event", {
+						type: "user_message",
+						data: fileReferenceMessageForDisplay(userMsg),
+					});
 					await narratorService.updateStatus(narratorId, "working");
 					currentText = gitCheck.message;
 					// The guardrail notice starts a new pass, so keep a cut-in message's
@@ -4366,8 +4419,16 @@ export async function runAgentLoop(
 					active._bufferSoftStopTaken = false;
 					queue?.shift();
 					if (queue?.length === 0) bufferedMessages.delete(narratorId);
-					// Remove consumed message from DB + cleanup persisted text files
-					dbConsumeBuffered(buffered.id);
+					// Keep accepted snapshots and uploaded files recoverable until the
+					// ordinary user message commits, just like the interrupt drain path.
+					const terminalCommand =
+						parseQueuedNewCommand(buffered.text, buffered.commandText) ||
+						parseQueuedGoalCommand(buffered.text, buffered.commandText);
+					if (terminalCommand) dbConsumeBuffered(buffered.id);
+					else {
+						pendingBufferedDelivery = buffered;
+						dbConsumeBufferedRow(buffered.id);
+					}
 					// Broadcast which message was consumed + remaining queue snapshot
 					const remaining = toBufferSummary(getBufferedMessages(narratorId));
 					broadcastToNarrator(narratorId, {
@@ -4445,6 +4506,7 @@ export async function runAgentLoop(
 					const persistBlocks: Array<
 						| { type: "text"; text: string }
 						| PersistedUserImageBlock
+						| FileReferenceSnapshot
 						| {
 								type: "text_file";
 								filename: string;
@@ -4470,7 +4532,10 @@ export async function runAgentLoop(
 					const effectiveBufferedText =
 						buffered.text + buildAttachedFilesHint(savedBufferedTextFiles);
 					// contentJson blocks store raw user text; contentText stores effectiveBufferedText (see feedMessage)
-					persistBlocks.push({ type: "text", text: buffered.text });
+					persistBlocks.push(...(buffered.fileReferences ?? []), {
+						type: "text",
+						text: buffered.text,
+					});
 					const userMsg = await narratorService.persistUserMessage(
 						narratorId,
 						effectiveBufferedText,
@@ -4478,8 +4543,17 @@ export async function runAgentLoop(
 						buffered.commandText,
 						buffered.createdBy,
 					);
-					broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
-					active.events.emit("event", { type: "user_message", data: userMsg });
+					pendingBufferedDelivery = undefined;
+					cleanupBufferedTextFiles(buffered.id);
+					broadcastToNarrator(narratorId, {
+						type: "user_message",
+						narratorId,
+						message: fileReferenceMessageForDisplay(userMsg),
+					});
+					active.events.emit("event", {
+						type: "user_message",
+						data: fileReferenceMessageForDisplay(userMsg),
+					});
 					await narratorService.updateStatus(narratorId, "working");
 					// runBashFirst flow: run the Bash command as an assistant tool card after the
 					// user message, then replay it as the current turn (empty text) so the model
@@ -4496,7 +4570,7 @@ export async function runAgentLoop(
 						currentImages = undefined;
 						continue;
 					}
-					currentText = effectiveBufferedText;
+					currentText = projectFileReferenceText(effectiveBufferedText, buffered.fileReferences);
 					currentImages = buffered.images;
 					continue;
 				}
@@ -4560,6 +4634,17 @@ export async function runAgentLoop(
 			break;
 		}
 	} catch (err) {
+		if (pendingBufferedDelivery) {
+			try {
+				restoreBufferedMessage(narratorId, pendingBufferedDelivery);
+			} catch (restoreError) {
+				logger.error("Failed to restore undelivered buffered message", {
+					narratorId,
+					error: String(restoreError),
+				});
+			}
+			pendingBufferedDelivery = undefined;
+		}
 		const errorMsg = serializeCatalogErrorMessage(err);
 		logger.error("Narrator loop error", {
 			narratorId,
@@ -4656,6 +4741,7 @@ export async function runAgentLoop(
 
 		// When a subagent narrator completes (from the subagent page), check if
 		// there's a conclusion watcher registered for post-completion updates.
+		let pendingStopHandoff = false;
 		try {
 			const narr = await db.query.narrators.findFirst({
 				where: eq(narrators.id, narratorId),
@@ -4692,8 +4778,9 @@ export async function runAgentLoop(
 					// Foreground takeover stopped while still working — resolve the
 					// parent's blocked Promise exactly once so the parent's
 					// runForegroundLoop finalizer returns the result (no double-write).
-					clearTakenOver(narratorId);
+					pendingStopHandoff = true;
 					if (getManualOverrideMap().has(narratorId)) {
+						clearTakenOver(narratorId);
 						resolveManualOverride(narratorId, lastFinalText, loopHadError);
 					} else {
 						// Session-engine takeover stopped while still working — the
@@ -4702,9 +4789,16 @@ export async function runAgentLoop(
 						// and clear the lingering taken_over tag.
 						const watcher = getConclusionWatcher(narratorId);
 						if (watcher) {
-							removeConclusionWatcher(narratorId);
 							const resultMsgId = await getSubagentResultMessageId(narratorId);
+							const reference = await prepareSubagentConclusionReference(
+								narratorId,
+								watcher.parentNarratorId,
+								watcher.toolUseId,
+								watcher.originToolCallId,
+							);
 							await updateToolCallConclusion({
+								toolCallId: reference.toolCallId,
+								messageId: reference.messageId,
 								subagentId: narratorId,
 								parentNarratorId: watcher.parentNarratorId,
 								toolUseId: watcher.toolUseId,
@@ -4713,7 +4807,9 @@ export async function runAgentLoop(
 								resultMessageId: resultMsgId,
 								refreshTiming: true,
 							});
+							if (getConclusionWatcher(narratorId) === watcher) removeConclusionWatcher(narratorId);
 						}
+						clearTakenOver(narratorId);
 						await narratorService.removeSubstatus(narratorId, "taken_over").catch(() => {});
 					}
 				} else if (isTakenOver(narratorId)) {
@@ -4721,10 +4817,17 @@ export async function runAgentLoop(
 				} else {
 					const watcher = getConclusionWatcher(narratorId);
 					if (watcher) {
-						removeConclusionWatcher(narratorId);
 						// Resolve the last assistant message ID for result binding
 						const resultMsgId = await getSubagentResultMessageId(narratorId);
+						const reference = await prepareSubagentConclusionReference(
+							narratorId,
+							watcher.parentNarratorId,
+							watcher.toolUseId,
+							watcher.originToolCallId,
+						);
 						await updateToolCallConclusion({
+							toolCallId: reference.toolCallId,
+							messageId: reference.messageId,
 							subagentId: narratorId,
 							parentNarratorId: watcher.parentNarratorId,
 							toolUseId: watcher.toolUseId,
@@ -4733,10 +4836,12 @@ export async function runAgentLoop(
 							resultMessageId: resultMsgId,
 							refreshTiming: true,
 						});
+						if (getConclusionWatcher(narratorId) === watcher) removeConclusionWatcher(narratorId);
 					}
 				}
 			}
 		} catch (err) {
+			if (pendingStopHandoff && isTakenOver(narratorId)) markPendingStopTakeover(narratorId);
 			logger.error("Failed to resolve suspended subagent / conclusion watcher", {
 				narratorId,
 				error: String(err),
@@ -4946,6 +5051,7 @@ async function feedMessage(
 		bufferedDelivery?: boolean;
 	},
 	origin?: MessageOriginOptions,
+	fileReferences?: FileReferenceSnapshot[],
 ): Promise<{
 	active: ActiveNarrator;
 	userMsg: typeof narratorMessages.$inferSelect;
@@ -4953,6 +5059,7 @@ async function feedMessage(
 	/** The message is durable, but a later dispatch step failed and was reported. */
 	postCommitError?: unknown;
 }> {
+	const acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	// Final guard against a concurrent loop slipping past the route-level admission
 	// check (which should have buffered this message). ensureNarrator reuses the live
@@ -4985,6 +5092,7 @@ async function feedMessage(
 	const persistBlocks: Array<
 		| { type: "text"; text: string }
 		| PersistedUserImageBlock
+		| FileReferenceSnapshot
 		| { type: "text_file"; filename: string; size: number; filePath: string }
 	> = [];
 	if (images?.length) {
@@ -5007,7 +5115,7 @@ async function feedMessage(
 	// is stored in contentText and sent to the AI. This intentional split means:
 	//   - contentJson (blocks) → frontend display, shows original user input
 	//   - contentText → FTS search index + AI prompt, includes file references
-	persistBlocks.push({ type: "text", text: prompt });
+	persistBlocks.push(...acceptedReferences, { type: "text", text: prompt });
 
 	// When the user sends images without text, inject a placeholder so that
 	// providers that gate on non-empty content still include the image blocks.
@@ -5054,10 +5162,16 @@ async function feedMessage(
 				if (overrideEntry) {
 					const currentFinalText = await getSubagentFinalText(narratorId);
 
+					const origin = await narratorPersistence.resolveSubagentConclusionReference(
+						narratorId,
+						overrideEntry.parentNarratorId,
+						overrideEntry.toolUseId,
+					);
 					registerConclusionWatcher(
 						narratorId,
 						overrideEntry.parentNarratorId,
 						overrideEntry.toolUseId,
+						origin.originToolCallId,
 					);
 					resolveManualOverride(narratorId, currentFinalText, false);
 				}
@@ -5094,7 +5208,7 @@ async function feedMessage(
 			broadcastToNarrator(narratorId, {
 				type: "user_message",
 				narratorId,
-				message: userMsg,
+				message: fileReferenceMessageForDisplay(userMsg),
 			});
 			await handleBashCommand(
 				narratorId,
@@ -5129,7 +5243,11 @@ async function feedMessage(
 		}
 
 		// Start agent loop in background
-		runAgentLoop(active, effectivePrompt, images).catch(async (err) => {
+		runAgentLoop(
+			active,
+			projectFileReferenceText(effectivePrompt, acceptedReferences),
+			images,
+		).catch(async (err) => {
 			const diagnostics = diagnosticsFromError(err);
 			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
 			await narratorService.updateStatus(narratorId, "idle", {
@@ -5235,6 +5353,36 @@ export function resolveToolCallConclusionTiming(
 	};
 }
 
+/** Resolve the live parent slot and isolate shared history before a conclusion write. */
+export async function prepareSubagentConclusionReference(
+	subagentId: string,
+	parentNarratorId: string,
+	toolUseId: string,
+	expectedOriginToolCallId?: string,
+) {
+	const reference = await narratorPersistence.resolveSubagentConclusionReference(
+		subagentId,
+		parentNarratorId,
+		toolUseId,
+		expectedOriginToolCallId,
+	);
+	if (await narratorService.isMessageSharedByMultipleNarrators(reference.messageId)) {
+		await narratorService.copyOnWriteToolCallMessage(
+			parentNarratorId,
+			reference.messageId,
+			toolUseId,
+		);
+	}
+	// Re-resolve even on subsequent writes: the origin stays immutable but COW
+	// replaces both the visible message and tool-call primary keys.
+	return narratorPersistence.resolveSubagentConclusionReference(
+		subagentId,
+		parentNarratorId,
+		toolUseId,
+		reference.originToolCallId,
+	);
+}
+
 /**
  * Update the parent narrator's tool_call outputJson with a new conclusion.
  * Used for scenario 2 (conclusion watcher) and the update-conclusion API.
@@ -5245,6 +5393,8 @@ export async function updateToolCallConclusion(opts: {
 	toolUseId: string;
 	finalText: string;
 	hasError: boolean;
+	/** Exact parent call when retained by the execution driver. */
+	toolCallId?: string;
 	/** Pass after copy-on-write to scope the update to the private message copy. */
 	messageId?: string;
 	/** The subagent assistant message that produced this result. */
@@ -5266,14 +5416,45 @@ export async function updateToolCallConclusion(opts: {
 		refreshTiming = false,
 	} = opts;
 	const resultPrefix = agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId));
+	// Scope metadata only: do not load the child's transcript or file-tool payloads.
+	const attributionTurn = await db.query.narrators
+		.findFirst({
+			where: eq(narrators.id, subagentId),
+			columns: { turnStartedAt: true },
+		})
+		.catch(() => undefined);
 	const output = await appendSubagentFileChanges(
-		parentNarratorId,
-		null,
+		{
+			parentNarratorId,
+			childNarratorId: subagentId,
+			scope: {
+				sourceToolUseId: toolUseId,
+				startedAt: attributionTurn?.turnStartedAt ?? null,
+				completedAt: new Date().toISOString(),
+			},
+		},
 		resultPrefix + (finalText || "(no output)"),
 	);
-	const timing = refreshTiming
-		? resolveToolCallConclusionTiming(await narratorService.getToolCallByToolUseId(toolUseId))
-		: undefined;
+	const resultRows = await db.query.narratorToolCalls.findMany({
+		where: and(
+			eq(narratorToolCalls.narratorId, parentNarratorId),
+			eq(narratorToolCalls.toolUseId, toolUseId),
+			messageId ? eq(narratorToolCalls.messageId, messageId) : undefined,
+			opts.toolCallId ? eq(narratorToolCalls.id, opts.toolCallId) : undefined,
+		),
+		columns: {
+			id: true,
+			createdAt: true,
+			streamStartedAt: true,
+			permissionStartedAt: true,
+			executionStartedAt: true,
+		},
+		limit: 2,
+	});
+	if (resultRows.length !== 1)
+		throw new ValidationError("Subagent conclusion requires an exact parent tool-call row");
+	const resultRow = resultRows[0];
+	const timing = refreshTiming ? resolveToolCallConclusionTiming(resultRow) : undefined;
 
 	await narratorService.updateToolCallResult(
 		toolUseId,
@@ -5285,6 +5466,7 @@ export async function updateToolCallConclusion(opts: {
 			...(timing ?? { preserveTiming: true }),
 		},
 		messageId,
+		resultRow.id,
 	);
 	// Broadcast to parent narrator so the frontend can update the SubagentCard
 	broadcastToNarrator(parentNarratorId, {
@@ -5309,7 +5491,7 @@ export async function updateToolCallConclusion(opts: {
  * Parameter order (long positional tail — count carefully; passing a userId into
  * the `commandText` slot is a mistake that has already shipped once):
  *   1 narratorId, 2 prompt, 3 images, 4 locale, 5 replyInUserLanguage,
- *   6 commandText, 7 userId, 8 textFiles, 9 preBashCommand, 10 origin
+ *   6 commandText, 7 userId, 8 textFiles, 9 preBashCommand, 10 origin, 11 fileReferences
  *
  * `origin` attributes the message when the caller is not a human typing into
  * this session (auto-continuation, IM gateway, scheduled tasks, AI-initiated
@@ -5326,7 +5508,9 @@ export async function sendMessage(
 	textFiles?: File[],
 	preBashCommand?: string | null,
 	origin?: MessageOriginOptions,
+	fileReferences?: FileReferenceSnapshot[],
 ): Promise<typeof narratorMessages.$inferSelect> {
+	const acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
 	const narrator = await narratorService.getById(narratorId);
 	if (isSubagentVariant(narrator.variant)) {
 		throw new ValidationError("Subagent messages must be sent through resumeSubagent");
@@ -5343,18 +5527,20 @@ export async function sendMessage(
 		preBashCommand,
 		undefined,
 		origin,
+		acceptedReferences,
 	);
 	if (!userBroadcasted) {
 		broadcastToNarrator(narratorId, {
 			type: "user_message",
 			narratorId,
-			message: userMsg,
+			message: fileReferenceMessageForDisplay(userMsg),
 		});
 	}
 	return userMsg;
 }
 
 export interface SendSubagentMessageInput {
+	fileReferences?: FileReferenceSnapshot[];
 	subagentId: string;
 	message: string;
 	priority?: boolean;
@@ -5384,6 +5570,7 @@ export interface SendSubagentMessageResult {
 export async function sendSubagentMessage(
 	input: SendSubagentMessageInput,
 ): Promise<SendSubagentMessageResult> {
+	input = { ...input, fileReferences: freezeFileReferenceSnapshots(input.fileReferences) };
 	const narrator = await narratorService.getById(input.subagentId);
 	if (!isSubagentVariant(narrator.variant)) {
 		throw new ValidationError("Target narrator is not a subagent");
@@ -5403,6 +5590,7 @@ export async function sendSubagentMessage(
 		const { isTakenOver } = await import("./subagent-takeover");
 		const result = bufferSubagentUserMessage(input.subagentId, input.message, {
 			createdBy: input.createdBy ?? null,
+			fileReferences: input.fileReferences,
 			priority: input.priority ?? false,
 			requestSoftStop: !isTakenOver(input.subagentId),
 		});
@@ -5417,14 +5605,15 @@ export async function sendSubagentMessage(
 		};
 	}
 	// Idle (or never-started) subagent: resume in-place with a follow-up turn.
-	// This requires the subagent to have been started at least once by its parent
-	// narrator (the originating Agent tool call is resolved internally); subagents
-	// that have never run get a standalone origin synthesized and still start.
+	// Tool-created subagents resolve their originating Agent call internally. Plugin
+	// workers carry explicit durable standalone provenance and can start without one;
+	// their synthesized tool-use id groups messages only.
 	const resumed = await resumeSubagent({
 		subagentId: input.subagentId,
 		intent: "follow_up",
 		actor: "parent_agent",
 		prompt: input.message,
+		fileReferences: input.fileReferences,
 		locale: input.locale ?? "en",
 		createdBy: input.createdBy ?? null,
 		signal: input.signal,
@@ -5473,6 +5662,7 @@ export async function createNarratorForPlugin(
 		}
 		const parent = await narratorService.getById(input.parentNarratorId);
 		const narrator = await narratorService.createSubagent({
+			subagentOriginKind: "standalone",
 			parentNarratorId: input.parentNarratorId,
 			subagentType: input.subagentType ?? "general",
 			title: input.title,
@@ -6191,7 +6381,10 @@ export async function retryLastMessage(
 	}
 	const lastMsg = resolved.target;
 
-	const prompt = lastMsg.contentText ?? "";
+	const prompt = projectFileReferenceText(
+		lastMsg.contentText ?? "",
+		getFileReferenceSnapshots(lastMsg.contentJson),
+	);
 	if (!prompt.trim()) {
 		throw new ValidationError("Last user message has no text");
 	}
@@ -6345,7 +6538,7 @@ export async function continueNarrator(
 		broadcastToNarrator(narratorId, {
 			type: "user_message",
 			narratorId,
-			message: userMsg,
+			message: fileReferenceMessageForDisplay(userMsg),
 		});
 		return { ok: true };
 	}
@@ -6519,13 +6712,10 @@ export function evaluateRerunnableToolCall(
  *
  * The denied tool_use block is still present in the assistant message's
  * contentJson, and its tool_result is reconstructed from the narrator_tool_calls
- * row at history-build time. So "un-denying" a tool only requires:
- *   1. reset the tool call row (fail → pending, clear deny/output fields),
- *   2. execute the tool directly with a pre-granted permission (the in-memory
- *      pendingPermissions entry is gone after the interrupt, so resolvePermission
- *      cannot be used),
- *   3. write the fresh result back into the row,
- *   4. continue the loop so the model sees the new result and resumes.
+ * rows at history-build time. A real retry first isolates shared messages with COW,
+ * appends a fresh attempt without inherited approval/evidence/accounting, and binds
+ * executeTool to that exact row. Recovery may reuse only a trusted unstarted attempt.
+ * The model/display projection selects the newest attempt while retaining prior facts.
  */
 export async function reExecuteDeniedToolCall(
 	narratorId: string,
@@ -6552,18 +6742,6 @@ export async function reExecuteDeniedToolCall(
 		return { ok: false, reason: "narrator_busy" };
 	}
 
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: options?.persistedToolCallId
-			? and(
-					eq(narratorToolCalls.id, options.persistedToolCallId),
-					eq(narratorToolCalls.narratorId, narratorId),
-				)
-			: and(
-					eq(narratorToolCalls.narratorId, narratorId),
-					eq(narratorToolCalls.toolUseId, toolUseId),
-				),
-	});
-
 	// The tool call must belong to the latest top-level assistant message so
 	// re-running it does not reorder history relative to later turns.
 	const isSubagent = isSubagentVariant(narrator.variant);
@@ -6581,6 +6759,19 @@ export async function reExecuteDeniedToolCall(
 		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 		.limit(1);
 	const latestAssistantMessageId = lastRef.length ? lastRef[0].messageId : null;
+	let toolCall = await db.query.narratorToolCalls.findFirst({
+		where: options?.persistedToolCallId
+			? and(
+					eq(narratorToolCalls.id, options.persistedToolCallId),
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				)
+			: and(
+					eq(narratorToolCalls.messageId, latestAssistantMessageId ?? ""),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+		orderBy: [desc(narratorToolCalls.executionAttempt), desc(narratorToolCalls.createdAt)],
+	});
 
 	const rejectReason = restoringPersistedCall
 		? toolCall
@@ -6600,11 +6791,19 @@ export async function reExecuteDeniedToolCall(
 			? (toolCall.inputJson as Record<string, unknown>)
 			: {};
 
-	// Reset the row so buildHistory no longer treats it as a completed failure.
-	await db
-		.update(narratorToolCalls)
-		.set(TOOL_CALL_RERUN_RESET_FIELDS)
-		.where(eq(narratorToolCalls.id, toolCall.id));
+	const sourceToolCall = toolCall;
+	const preparedAttempt = await narratorPersistence.prepareToolCallAttempt(
+		narratorId,
+		toolCall.id,
+		restoringPersistedCall,
+	);
+	toolCall = preparedAttempt.toolCall;
+	const toolCallBinding = await narratorPersistence.getToolCallBinding(
+		narratorId,
+		toolCall.messageId,
+		toolUseId,
+		toolCall.id,
+	);
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	// Restore the triggering user so knowledge-base ACL works after a rebuild.
@@ -6625,9 +6824,15 @@ export async function reExecuteDeniedToolCall(
 	const { executeTool } = await import("../lib/agent/tool-executor");
 	const toolName = toolCall.toolName;
 
-	// Minimal AgentConfig sufficient for executeTool. Nested permission requests
-	// (e.g. narrafork-admin) still flow through the normal handler; the top-level
-	// call is pre-granted because the user just explicitly allowed it.
+	// Reuse the same runtime/device ACL ceiling as the ordinary loop, including recovery.
+	const oauthRuntime = await assertOAuthNarratorRuntimeActive(narratorId, active._currentUserId);
+	const sessionDevices = (await resolveSessionDevices(active._projectId ?? null)) ?? [];
+	const rerunMessage = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, toolCall.messageId),
+		columns: { parentToolUseId: true },
+	});
+	const parentNarratorId = isSubagent ? (narrator.parentNarratorId ?? undefined) : undefined;
+	const parentToolUseId = isSubagent ? (rerunMessage?.parentToolUseId ?? undefined) : undefined;
 	const config: import("../lib/agent").AgentConfig = {
 		narratorId,
 		conversationId: active.conversationId,
@@ -6637,6 +6842,16 @@ export async function reExecuteDeniedToolCall(
 		locale,
 		signal: active.abortController.signal,
 		chapterId: active._chapterId,
+		parentNarratorId,
+		parentToolUseId,
+		reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
+		allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
+		allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
+		runtimeAuthorizationGuard: oauthRuntime
+			? async () => {
+					await assertOAuthNarratorRuntimeActive(narratorId, active._currentUserId);
+				}
+			: undefined,
 		get planFileId() {
 			return active._planFileId;
 		},
@@ -6648,18 +6863,23 @@ export async function reExecuteDeniedToolCall(
 		skillScopeKey: active._skillScopeKey ?? undefined,
 		userId: active._currentUserId ?? null,
 		projectId: active._projectId ?? null,
-		defaultDeviceId: toolCall.executionDeviceId ?? active._defaultDeviceId ?? null,
-		availableDevices: await resolveSessionDevices(active._projectId ?? null),
+		defaultDeviceId: sourceToolCall.executionDeviceId ?? active._defaultDeviceId ?? null,
+		availableDevices: oauthRuntime
+			? filterOAuthSessionDevices(sessionDevices, oauthRuntime)
+			: sessionDevices,
 		setDefaultDevice: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
 		disabledTools: active._disabledTools,
 		blockedSkills: {
 			all: active._blockedSkills.all,
 			names: [...active._blockedSkills.names],
 		},
-		onExecutionTargetResolved: (resolvedToolUseId, target) =>
-			narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target),
-		onExecutionPlanResolved: (resolvedToolUseId, plan) =>
-			narratorService.updateToolCallExecutionPlan(narratorId, resolvedToolUseId, plan),
+		requireToolCallBinding: true,
+		onToolExecutionStarting: (resolvedToolUseId, binding, startedAt) =>
+			narratorPersistence.claimToolCallExecution(narratorId, resolvedToolUseId, binding, startedAt),
+		onExecutionTargetResolved: (resolvedToolUseId, target, binding) =>
+			narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target, binding),
+		onExecutionPlanResolved: (resolvedToolUseId, plan, binding) =>
+			narratorService.updateToolCallExecutionPlan(narratorId, resolvedToolUseId, plan, binding),
 		permissionHandler: (tName, input, tUseId, options) =>
 			handlePermission(
 				narratorId,
@@ -6669,8 +6889,21 @@ export async function reExecuteDeniedToolCall(
 				tUseId,
 				active.cwd,
 				locale,
-				undefined,
+				parentNarratorId,
 				options,
+				parentToolUseId,
+				oauthRuntime
+					? {
+							permissionMode: oauthRuntime.permissionMode,
+							allowKnowledgeWrite: oauthRuntime.allowKnowledgeWrite,
+							dangerReflectionPrompt: oauthRuntime.dangerReflectionPrompt,
+							useRobotDiagnosticPreset: oauthRuntime.useRobotDiagnosticPreset,
+							deviceAccess: oauthRuntime.policy.deviceAccess,
+							oauthClientId: oauthRuntime.clientId,
+							grantId: oauthRuntime.grantId,
+						}
+					: undefined,
+				config.reviewReadOnlyBash,
 			),
 		onEvent: (event) => {
 			if (event.type === "tool_output") {
@@ -6741,11 +6974,15 @@ export async function reExecuteDeniedToolCall(
 	// "initializing") and, for a pre-granted re-run, acts as the baseline that executeTool
 	// compares against to detect environment drift. Legacy rows without a frozen device
 	// fall back to normal resolution.
-	const preFrozenTarget = reconstructToolExecutionTarget(toolCall);
+	const preFrozenTarget = reconstructToolExecutionTarget(sourceToolCall);
 
 	try {
 		const result = await executeTool({ name: toolName, input: toolInput, toolUseId }, config, {
-			...(options?.permissionMode === "normal"
+			toolCallBinding,
+			...(options?.permissionMode === "normal" ||
+			preparedAttempt.requiresFreshPermission ||
+			!!oauthRuntime ||
+			config.reviewReadOnlyBash
 				? {}
 				: { preGrantedPermission: { behavior: "allow" as const } }),
 			...(preFrozenTarget ? { preFrozenTarget } : {}),
@@ -6768,7 +7005,7 @@ export async function reExecuteDeniedToolCall(
 			toolCall.id,
 		);
 		if (result.updatedInput) {
-			await narratorService.overwriteToolCallInput(toolUseId, result.updatedInput);
+			await narratorService.overwriteToolCallInput(toolUseId, result.updatedInput, toolCall.id);
 		}
 
 		broadcastToNarrator(narratorId, {
@@ -6886,7 +7123,10 @@ export async function executePersistedToolCall(input: {
 	permissionMode?: "normal" | "preGranted";
 }): Promise<ReExecuteDeniedResult> {
 	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, input.toolCallId),
+		where: and(
+			eq(narratorToolCalls.id, input.toolCallId),
+			eq(narratorToolCalls.narratorId, input.narratorId),
+		),
 		columns: { toolUseId: true },
 	});
 	if (!toolCall) return { ok: false, reason: "not_found" };
@@ -7017,7 +7257,7 @@ export async function rollbackToBlock(
 				broadcastToNarrator(narratorId, {
 					type: "message_updated",
 					narratorId,
-					message: updatedMsg,
+					message: fileReferenceMessageForDisplay(updatedMsg),
 				});
 			}
 		}
@@ -7076,6 +7316,7 @@ export function resolveRequestedAttachmentKeys(
 
 type EditableUserContentBlock =
 	| { type: "text"; text: string }
+	| FileReferenceSnapshot
 	| PersistedUserImageBlock
 	// `fileId` is optional: legacy uploads stored files under
 	// ~/.narrafork/uploads/<narratorId>/text/<fileId>.ext with a relative
@@ -7137,6 +7378,7 @@ function buildEditedUserContentJson(
 		newImages?: ImageRef[];
 		keepTextFilePaths?: string[];
 		newTextFiles?: TextFileRef[];
+		fileReferences?: FileReferenceSnapshot[];
 	},
 ): EditableUserContentBlock[] {
 	const blocks = Array.isArray(contentJson) ? (contentJson as Array<Record<string, unknown>>) : [];
@@ -7222,8 +7464,11 @@ function buildEditedUserContentJson(
 		}
 	}
 
-	// Canonical order matches freshly sent messages: images, text_files, text.
-	return [...imageBlocks, ...textFileBlocks, { type: "text", text: newContent }];
+	// Omission preserves accepted bytes; an explicit [] removes all references.
+	const references = freezeFileReferenceSnapshots(
+		opts?.fileReferences ?? getFileReferenceSnapshots(contentJson),
+	);
+	return [...imageBlocks, ...textFileBlocks, ...references, { type: "text", text: newContent }];
 }
 
 /**
@@ -7257,6 +7502,8 @@ export async function editAndRegenerate(
 }
 
 export interface EditAndRegenerateOptions {
+	/** Server-selected accepted snapshots; omitted keeps the target message's snapshots. */
+	fileReferences?: FileReferenceSnapshot[];
 	keepImageIds?: string[];
 	newImages?: File[];
 	keepTextFilePaths?: string[];
@@ -7317,6 +7564,9 @@ async function editAndRegenerateUnlocked(
 	const originalBlocks = Array.isArray(targetMsg.contentJson)
 		? (targetMsg.contentJson as Array<Record<string, unknown>>)
 		: [];
+	const selectedReferences = freezeFileReferenceSnapshots(
+		opts?.fileReferences ?? getFileReferenceSnapshots(originalBlocks),
+	);
 	const actualImageIds = originalBlocks
 		.filter((block) => block.type === "image" && typeof block.imageId === "string")
 		.map((block) => block.imageId as string);
@@ -7351,6 +7601,7 @@ async function editAndRegenerateUnlocked(
 		!newContent.trim() &&
 		keepImageIds.length === 0 &&
 		keepTextFilePaths.length === 0 &&
+		selectedReferences.length === 0 &&
 		!(opts?.newImages?.length || opts?.newTextFiles?.length)
 	) {
 		throw new ValidationError("content is required");
@@ -7509,6 +7760,7 @@ async function editAndRegenerateUnlocked(
 			newImages: savedNewImages,
 			keepTextFilePaths: relocatedKeepTextFilePaths,
 			newTextFiles: savedNewTextFiles.length > 0 ? savedNewTextFiles : undefined,
+			fileReferences: selectedReferences,
 		});
 		existingImages = extractImageRefs(newContentJson, targetMsg.narratorId);
 		existingTextFiles = extractTextFileRefs(newContentJson);
@@ -7548,7 +7800,7 @@ async function editAndRegenerateUnlocked(
 		broadcastToNarrator(narratorId, {
 			type: "message_updated",
 			narratorId,
-			message: updatedMsg,
+			message: fileReferenceMessageForDisplay(updatedMsg),
 		});
 		if (privateMessageId !== messageId) {
 			broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
@@ -7576,23 +7828,25 @@ async function editAndRegenerateUnlocked(
 	active._turnStartedAt = new Date().toISOString();
 	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 
-	runAgentLoop(active, effectivePrompt, imageRefs.length > 0 ? imageRefs : undefined).catch(
-		async (err) => {
-			logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
-				narratorId,
-				error: String(err),
-			});
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-			});
-		},
-	);
+	runAgentLoop(
+		active,
+		projectFileReferenceText(effectivePrompt, selectedReferences),
+		imageRefs.length > 0 ? imageRefs : undefined,
+	).catch(async (err) => {
+		logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
+			narratorId,
+			error: String(err),
+		});
+		await narratorService.updateStatus(narratorId, "idle", {
+			substatus: ["error"],
+			errorMessage: String(err),
+		});
+		broadcastToNarrator(narratorId, {
+			type: "narrator_error",
+			narratorId,
+			error: String(err),
+		});
+	});
 
 	return { ok: true, ...warnings };
 }
@@ -7694,7 +7948,7 @@ export async function editAssistantMessage(
 		broadcastToNarrator(narratorId, {
 			type: "message_updated",
 			narratorId,
-			message: updatedMsg,
+			message: fileReferenceMessageForDisplay(updatedMsg),
 		});
 		if (privateMessageId !== messageId) {
 			broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
@@ -7767,7 +8021,7 @@ export async function restoreAssistantMessage(
 		broadcastToNarrator(narratorId, {
 			type: "message_updated",
 			narratorId,
-			message: updatedMsg,
+			message: fileReferenceMessageForDisplay(updatedMsg),
 		});
 		if (privateMessageId !== messageId) {
 			broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
@@ -7787,6 +8041,7 @@ export async function* startSession(
 	images?: ImageRef[],
 	locale: Locale = "en",
 	replyInUserLanguage = false,
+	fileReferences?: FileReferenceSnapshot[],
 ): AsyncGenerator<NarratorEvent> {
 	let active: ActiveNarrator;
 	let userMsg: typeof narratorMessages.$inferSelect;
@@ -7797,6 +8052,13 @@ export async function* startSession(
 			images,
 			locale,
 			replyInUserLanguage,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			fileReferences,
 		));
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
@@ -7826,9 +8088,9 @@ export async function* startSession(
 	broadcastToNarrator(narratorId, {
 		type: "user_message",
 		narratorId,
-		message: userMsg,
+		message: fileReferenceMessageForDisplay(userMsg),
 	});
-	yield { type: "user_message", data: userMsg };
+	yield { type: "user_message", data: fileReferenceMessageForDisplay(userMsg) };
 
 	try {
 		while (!done) {
@@ -8928,6 +9190,7 @@ export async function recoverOnStartup(
 				text: row.text,
 				images,
 				textFiles: textFiles?.length ? textFiles : undefined,
+				fileReferences: parseFileReferenceSnapshotsJson(row.fileReferencesJson),
 				bufferedAt: row.bufferedAt,
 				commandText: row.commandText,
 				bashCommand: row.bashCommand,

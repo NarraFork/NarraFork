@@ -17,11 +17,13 @@
  * cosmetic difference. See CONTRACT.md §0 on the measure/render split.
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { I18nextProvider } from "react-i18next";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 
 // pretext measures text through canvas `measureText`, which the bun runtime lacks.
@@ -31,12 +33,14 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
-const realReactI18nextModule = { ...(await import("react-i18next")) };
-
-mock.module("react-i18next", () => ({
-	...realReactI18nextModule,
-	useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en" } }),
-}));
+const testI18n = i18next.createInstance();
+await testI18n.init({
+	lng: "en",
+	fallbackLng: "en",
+	resources: { en: { narrator: {}, common: {} } },
+	defaultNS: "narrator",
+	react: { useSuspense: false },
+});
 
 const { RenderMessageBubble } = await import("./RenderMessageBubble");
 const { measureMessageBubble } = await import("../measure/measure-message-bubble");
@@ -95,10 +99,17 @@ function renderBubble(isSelf: boolean): { justifyContent: string; background: st
 	currentRoot = root;
 	act(() => {
 		root.render(
-			<MantineProvider>
-				{/* biome-ignore lint/a11y/useValidAriaRole: `role` is a domain prop, not an ARIA role */}
-				<RenderMessageBubble role="user" measured={measured()} hasHeader={false} isSelf={isSelf} />
-			</MantineProvider>,
+			<I18nextProvider i18n={testI18n}>
+				<MantineProvider>
+					{/* biome-ignore lint/a11y/useValidAriaRole: `role` is a domain prop, not an ARIA role */}
+					<RenderMessageBubble
+						role="user"
+						measured={measured()}
+						hasHeader={false}
+						isSelf={isSelf}
+					/>
+				</MantineProvider>
+			</I18nextProvider>,
 		);
 	});
 	const wrapper = currentContainer.querySelector("div");
@@ -119,10 +130,6 @@ afterEach(() => {
 	}
 	currentContainer?.remove();
 	currentContainer = null;
-});
-
-afterAll(() => {
-	mock.restore();
 });
 
 describe("RenderMessageBubble — authorship decides the side", () => {
@@ -151,10 +158,12 @@ describe("RenderMessageBubble — authorship decides the side", () => {
 		currentRoot = root;
 		act(() => {
 			root.render(
-				<MantineProvider>
-					{/* biome-ignore lint/a11y/useValidAriaRole: `role` is a domain prop, not an ARIA role */}
-					<RenderMessageBubble role="user" measured={measured()} hasHeader={false} />
-				</MantineProvider>,
+				<I18nextProvider i18n={testI18n}>
+					<MantineProvider>
+						{/* biome-ignore lint/a11y/useValidAriaRole: `role` is a domain prop, not an ARIA role */}
+						<RenderMessageBubble role="user" measured={measured()} hasHeader={false} />
+					</MantineProvider>
+				</I18nextProvider>,
 			);
 		});
 		const wrapper = currentContainer.querySelector("div") as HTMLElement | null;
@@ -184,10 +193,12 @@ describe("RenderMessageBubble — the side is height-neutral", () => {
 		for (const isSelf of [true, false]) {
 			act(() => {
 				root.render(
-					<MantineProvider>
-						{/* biome-ignore lint/a11y/useValidAriaRole: `role` is a domain prop, not an ARIA role */}
-						<RenderMessageBubble role="user" measured={m} hasHeader={false} isSelf={isSelf} />
-					</MantineProvider>,
+					<I18nextProvider i18n={testI18n}>
+						<MantineProvider>
+							{/* biome-ignore lint/a11y/useValidAriaRole: `role` is a domain prop, not an ARIA role */}
+							<RenderMessageBubble role="user" measured={m} hasHeader={false} isSelf={isSelf} />
+						</MantineProvider>
+					</I18nextProvider>,
 				);
 			});
 			const inner = currentContainer.querySelector("div > div") as HTMLElement | null;

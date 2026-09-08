@@ -323,21 +323,18 @@ function WebviewDockPanel(props: IDockviewPanelProps<WebviewPanelParams>) {
  * adaptation needed is dropping the workspace-only `hostNarratorId`.
  */
 function WorkspaceFileDockPanel(props: IDockviewPanelProps<WorkspaceFilePanelParams>) {
-	// Director mode hosts live panel instances itself; avoid a second mount.
+	// Preserve the host bridge and resource identity, including device and navigation.
 	const directorActive = useWorkspaceDirectorActive();
+	const dockValue = useWorkspaceNarratorDockValue(props.params.hostNarratorId);
 	if (directorActive) return null;
 
-	const adaptedParams: FilePanelParams = {
-		panelType: "file",
-		filePath: props.params.filePath,
-		...(props.params.fileName ? { fileName: props.params.fileName } : {}),
-		hostNarratorId: props.params.hostNarratorId,
-	};
-	const fileProps = {
-		...props,
-		params: adaptedParams,
-	} as IDockviewPanelProps<FilePanelParams>;
-	return <FileViewerAdapter {...fileProps} />;
+	const adaptedParams: FilePanelParams = { ...props.params, panelType: "file" };
+	const fileProps = { ...props, params: adaptedParams } as IDockviewPanelProps<FilePanelParams>;
+	return (
+		<NarratorDockContext.Provider value={dockValue}>
+			<FileViewerAdapter {...fileProps} />
+		</NarratorDockContext.Provider>
+	);
 }
 
 /**

@@ -51,7 +51,6 @@
  * Zero DOM. Follows the measure-reasoning.ts / measure-web-search.ts template.
  */
 
-import { prepareWithSegments } from "@chenglou/pretext";
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
 // The recent-call rows ARE trace rows, so their height comes from the shared row
 // metrics rather than a second copy of it. Sourced from `row-metrics` directly
@@ -60,13 +59,13 @@ import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-i
 // would close a cycle — and `RECENT_ROW_HEIGHT` is a module-level const, which
 // would hit the TDZ at import time.
 import { BARE_ROW_HEIGHT, bareRowMetrics } from "@shared/pretext-layout/row-metrics";
+import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
 import { scaleFontSize } from "@shared/pretext-layout/typography";
 import {
 	accumulateFrame,
 	DEFAULT_RENDER_LOD,
 	type ElementFrame,
 	type MeasuredElement,
-	type PreparedCodeBlock,
 	type PreparedInlineBlock,
 	type RenderLod,
 } from "../prepared-block";
@@ -82,13 +81,17 @@ import {
 	scaledLineBoxHeight,
 	typographyMetrics,
 } from "../pretext-fonts";
-import { measureMarkdown } from "./measure-markdown";
 import {
 	type InlinePermissionData,
 	type MeasuredInlinePermission,
 	measureInlinePermission,
 } from "./measure-permission";
-import { resolveToolTimingStamps, type ToolTimingStamps } from "./measure-tool-call";
+import {
+	type MeasuredToolBody,
+	measureToolBody,
+	resolveToolTimingStamps,
+	type ToolTimingStamps,
+} from "./measure-tool-call";
 import { pretextLineMetrics } from "./pretext-metrics";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -169,19 +172,58 @@ export const FILE_CHANGE_ROW_HEIGHT = BARE_ROW_HEIGHT;
 /** Gap between stacked file rows (flush, like recent calls). */
 export const FILE_CHANGE_STACK_GAP = 0;
 
-/** Structural mirror of the server's `SubagentFileChanges` (height-relevant fields). */
+/** Structural mirror of the server payload. Missing legacy location is UNKNOWN, not local. */
 export interface SubagentFileChangesData {
 	files: {
+		subagentNarratorId?: string | null;
+		deviceId?: string | null;
+		workspacePath?: string | null;
 		filePath: string;
 		linesAdded: number | null;
 		linesRemoved: number | null;
 		editCount: number;
-		outsideParentWorkspace?: boolean;
+		unmeasuredCount?: number;
+		/** Even false describes location only; it never authorizes a revert. */
+		outsideParentWorkspace?: boolean | null;
 	}[];
 	totalFiles: number;
 	totalUnmeasured: number;
 	bashTouchedCount: number;
 	countsTruncated: boolean;
+	/** Old payloads without this field are also legacy/unscoped, never exact attempts. */
+	attributionScope?: "legacy_unscoped";
+	/** Requested filter boundary, NOT evidence linking changes to an execution attempt. */
+	scope?: {
+		sourceToolUseId: string | null;
+		startedAt?: string | null;
+		completedAt?: string | null;
+	};
+}
+
+/** A display path alone is not identity, including within one child's card. */
+export function subagentFileChangeIdentityKey(
+	file: SubagentFileChangesData["files"][number],
+): string {
+	return JSON.stringify([
+		file.subagentNarratorId ?? null,
+		file.deviceId || null,
+		file.workspacePath || null,
+		file.filePath,
+	]);
+}
+
+/** Card-local scope identity. Presence of a window never upgrades legacy attribution. */
+export function subagentFileChangeScopeKey(changes: SubagentFileChangesData): string {
+	return JSON.stringify([
+		changes.attributionScope ?? "legacy_unscoped",
+		changes.scope
+			? [
+					changes.scope.sourceToolUseId ?? null,
+					changes.scope.startedAt ?? null,
+					changes.scope.completedAt ?? null,
+				]
+			: null,
+	]);
 }
 /** Trace rows sit flush; the old 4px seam belonged to the tinted-button look. */
 export const RECENT_STACK_GAP = 0;
@@ -292,6 +334,8 @@ export interface SubagentCardData {
 	description: string;
 	/** Prompt text — presence enables the prompt toggle block. */
 	prompt?: string;
+	promptBody?: ToolCappedDetail;
+	resultBody?: ToolCappedDetail;
 	/**
 	 * `prompt` is only a PREFIX of the real body (the input was truncated
 	 * server-side and the full one has not been fetched yet).
@@ -417,7 +461,7 @@ export interface MeasuredSubagent extends MeasuredElement {
 	/** Wrapped description (expanded only); null when collapsed. */
 	descriptionMeasured: MeasuredElement | null;
 	/** Prompt ContentViewer body (promptOpen only); null otherwise. */
-	promptMeasured: MeasuredElement | null;
+	promptMeasured: MeasuredToolBody<ToolCappedDetail> | null;
 	/** Prompt block height (toggle row + optional body + padding); 0 when absent. */
 	promptBlockHeight: number;
 	/**
@@ -435,11 +479,15 @@ export interface MeasuredSubagent extends MeasuredElement {
 	 */
 	toolUseId: string | null;
 	/** Result ContentViewer body (expanded + resultText); null otherwise. */
-	resultMeasured: MeasuredElement | null;
+	resultMeasured: MeasuredToolBody<ToolCappedDetail> | null;
 	/** Result block height (min(content,300) + padding); 0 when absent. */
 	resultBlockHeight: number;
-	/** File-changes block height (title + rows + overflow row); 0 when absent. */
+	/** File-changes block height (title + attribution notices + rows + overflow). */
 	fileChangesHeight: number;
+	/** Shared title/notice/file/overflow line height at the measured typography. */
+	fileChangeRowHeight: number;
+	/** Legacy notice, plus a requested-boundary notice when a scope was supplied. */
+	fileChangeNoticeRowCount: number;
 	/** How many file rows are DRAWN (capped unless the reader expanded the list). */
 	fileChangeRowCount: number;
 	/** Whether the trailing "N more / N touched by shell" row is drawn. */
@@ -498,29 +546,6 @@ function measureWrappedText(text: string, innerWidth: number, className: string)
 		fonts: [typographyMetrics().font.xs],
 	};
 	const frame = accumulateFrame([block], innerWidth, pretextLineMetrics);
-	return {
-		height: frame.contentHeight,
-		blocks: [block],
-		frame,
-		contentWidth: innerWidth,
-		usedWidth: frame.usedWidth,
-	};
-}
-
-/** Measure the monospace pre-wrap prompt body (before the maxHeight cap). */
-function measurePromptBody(prompt: string, innerWidth: number): MeasuredElement {
-	const block: PreparedCodeBlock = {
-		...baseBlockFields(),
-		kind: "code",
-		prepared: prepareWithSegments(prompt, promptFont(), { whiteSpace: "pre-wrap" }),
-		lineHeight: promptLineHeight(),
-		lang: null,
-	};
-	const frame = accumulateFrame([block], innerWidth, pretextLineMetrics, {
-		codePaddingX: 0,
-		codePaddingY: 0,
-		codeLangExtraTop: 0,
-	});
 	return {
 		height: frame.contentHeight,
 		blocks: [block],
@@ -607,7 +632,7 @@ export function measureSubagentCard(
 	});
 
 	// ── Header (always shown) ──────────────────────────────────────────────────
-	const hasResultPreview = !effectiveExpanded && isTerminal && !!data.resultText;
+	const hasResultPreview = !effectiveExpanded && isTerminal && !!data.resultBody?.text;
 	const descInnerWidth = Math.max(1, contentWidth - CARD_PADDING * 2 - DESC_LEFT);
 	const descriptionMeasured = effectiveExpanded
 		? measureWrappedText(data.description, descInnerWidth, "vlist-sa-desc")
@@ -631,15 +656,19 @@ export function measureSubagentCard(
 		data.fileChangesExpanded === true
 			? fileChangeTotal
 			: Math.min(fileChangeTotal, FILE_CHANGE_MAX_ROWS);
-	// The overflow row is what makes the hidden files reachable, so it must be
-	// reserved whenever anything is hidden. It also carries the shell-touched and
-	// unmeasured tallies, which is why a fully-listed set can still need it.
+	// Keep the toggle after expansion so the list can collapse again. Shell-only,
+	// unmeasured-only and budget-truncated observations need this row even when
+	// there are NO Write/Edit files. totalFiles can also exceed the returned list.
 	const hasFileChangeOverflowRow =
-		fileChangeRowCount > 0 &&
-		(fileChangeRowCount < fileChangeTotal ||
-			(data.fileChanges?.bashTouchedCount ?? 0) > 0 ||
-			(data.fileChanges?.totalUnmeasured ?? 0) > 0 ||
-			data.fileChanges?.countsTruncated === true);
+		fileChangeTotal > FILE_CHANGE_MAX_ROWS ||
+		fileChangeRowCount < (data.fileChanges?.totalFiles ?? 0) ||
+		(data.fileChanges?.bashTouchedCount ?? 0) > 0 ||
+		(data.fileChanges?.totalUnmeasured ?? 0) > 0 ||
+		data.fileChanges?.countsTruncated === true;
+	const hasFileChanges = fileChangeRowCount > 0 || hasFileChangeOverflowRow;
+	const fileChangeRowHeight = bareRowMetrics().height;
+	// Even old payloads without attributionScope are legacy, not verified attempts.
+	const fileChangeNoticeRowCount = hasFileChanges ? 1 + (data.fileChanges?.scope ? 1 : 0) : 0;
 	let fileChangesHeight = 0;
 
 	// ── Recent Calls (always shown when there are activity calls) ───────────────
@@ -659,12 +688,12 @@ export function measureSubagentCard(
 	let expandedHeight = 0;
 	let selfPermissionMeasured: MeasuredInlinePermission | null = null;
 	let selfPermissionBlockHeight = 0;
-	let promptMeasured: MeasuredElement | null = null;
+	let promptMeasured: MeasuredToolBody<ToolCappedDetail> | null = null;
 	let promptBlockHeight = 0;
 	let pendingBlockHeight = 0;
 	let pendingCardCount = 0;
 	let resolveOverrideHeight = 0;
-	let resultMeasured: MeasuredElement | null = null;
+	let resultMeasured: MeasuredToolBody<ToolCappedDetail> | null = null;
 	let resultBlockHeight = 0;
 
 	if (effectiveExpanded) {
@@ -676,20 +705,15 @@ export function measureSubagentCard(
 			expandedHeight += selfPermissionBlockHeight;
 		}
 
-		// prompt (toggle row + optional ContentViewer maxHeight:200).
-		if (data.prompt) {
-			const promptOpen = data.promptOpen === true;
+		// Prompt and result use the same body model and painter as tool sections.
+		if (data.promptBody) {
 			let body = 0;
-			if (promptOpen) {
-				const promptInnerWidth = Math.max(1, contentWidth - BLOCK_PADDING_X * 2);
-				promptMeasured = measurePromptBody(data.prompt, promptInnerWidth);
-				// A still-truncated prompt reserves the full cap, so the fetched body
-				// arriving later cannot resize a committed row (see `promptTruncated`).
-				const capped =
-					data.promptTruncated === true
-						? PROMPT_MAX_HEIGHT
-						: Math.min(promptMeasured.frame.contentHeight, PROMPT_MAX_HEIGHT);
-				body = PROMPT_BODY_MARGIN_TOP + capped;
+			if (data.promptOpen === true) {
+				promptMeasured = measureToolBody(
+					data.promptBody,
+					Math.max(1, contentWidth - BLOCK_PADDING_X * 2),
+				);
+				body = PROMPT_BODY_MARGIN_TOP + promptMeasured.height;
 			}
 			promptBlockHeight = PROMPT_TOGGLE_ROW_HEIGHT + body + BLOCK_PADDING_BOTTOM;
 			expandedHeight += promptBlockHeight;
@@ -722,29 +746,24 @@ export function measureSubagentCard(
 			expandedHeight += resolveOverrideHeight;
 		}
 
-		// File changes: a title row + up to FILE_CHANGE_MAX_ROWS file rows (+ one
-		// "N more" row when capped). Every row is single-line and truncating, so the
-		// count alone decides the height.
-		if (fileChangeRowCount > 0) {
+		// Title + explicit legacy/boundary notices + file rows + optional summary.
+		// Every row is single-line and truncating. Clamp seams at zero: summary-only
+		// blocks must not acquire a negative gap when no file rows were returned.
+		if (hasFileChanges) {
 			fileChangesHeight =
-				FILE_CHANGE_ROW_HEIGHT + // title row ("changed N files")
-				fileChangeRowCount * FILE_CHANGE_ROW_HEIGHT +
-				(fileChangeRowCount - 1) * FILE_CHANGE_STACK_GAP +
-				(hasFileChangeOverflowRow ? FILE_CHANGE_ROW_HEIGHT : 0) +
+				(1 + fileChangeNoticeRowCount + fileChangeRowCount + (hasFileChangeOverflowRow ? 1 : 0)) *
+					fileChangeRowHeight +
+				Math.max(0, fileChangeRowCount - 1) * FILE_CHANGE_STACK_GAP +
 				BLOCK_PADDING_BOTTOM;
 			expandedHeight += fileChangesHeight;
 		}
 
-		// resultText (ContentViewer maxHeight:300, markdown).
-		if (data.resultText) {
-			const resultInnerWidth = Math.max(
-				1,
-				contentWidth - BLOCK_PADDING_X * 2 - RESULT_MD_PADDING_INLINE * 2,
+		if (data.resultBody) {
+			resultMeasured = measureToolBody(
+				data.resultBody,
+				Math.max(1, contentWidth - BLOCK_PADDING_X * 2),
 			);
-			resultMeasured = measureMarkdown(data.resultText, resultInnerWidth);
-			const mdHeight = resultMeasured.frame.contentHeight + RESULT_MD_PADDING_BLOCK * 2;
-			const capped = Math.min(mdHeight, RESULT_MAX_HEIGHT);
-			resultBlockHeight = capped + BLOCK_PADDING_BOTTOM;
+			resultBlockHeight = resultMeasured.height + BLOCK_PADDING_BOTTOM;
 			expandedHeight += resultBlockHeight;
 		}
 	}
@@ -779,11 +798,13 @@ export function measureSubagentCard(
 		descriptionMeasured,
 		promptMeasured,
 		promptBlockHeight,
-		promptTruncated: promptMeasured != null && data.promptTruncated === true,
+		promptTruncated: promptMeasured != null && data.promptBody?.textTruncated === true,
 		toolUseId: data.toolUseId ?? null,
 		resultMeasured,
 		resultBlockHeight,
 		fileChangesHeight,
+		fileChangeRowHeight,
+		fileChangeNoticeRowCount,
 		fileChangeRowCount,
 		hasFileChangeOverflowRow,
 		selfPermissionMeasured,
@@ -823,49 +844,3 @@ function sliceRowStrings(
 	}
 	return out;
 }
-
-/** Parse once, measure many (e.g. on resize / LOD change). Reusable closure. */
-export function prepareSubagentMeasurer(
-	data: SubagentCardData,
-): (contentWidth: number, lod?: RenderLod, opts?: SubagentMeasureOpts) => MeasuredSubagent {
-	return (contentWidth, lod = DEFAULT_RENDER_LOD, opts = {}) =>
-		measureSubagentCard(data, contentWidth, lod, opts);
-}
-
-export const MEASURE_SUBAGENT_CONSTANTS = {
-	CARD_PADDING,
-	XS_LINE_HEIGHT,
-	THEME_ICON_SIZE,
-	BADGE_XS_HEIGHT,
-	CHEVRON_SIZE,
-	STATUS_ICON_SIZE,
-	BADGE_ROW_HEIGHT,
-	DESC_MARGIN_TOP,
-	DESC_LEFT,
-	RESULT_PREVIEW_MARGIN_TOP,
-	BUTTON_COMPACT_XS,
-	RECENT_TITLE_MARGIN_BOTTOM,
-	RECENT_ROW_HEIGHT,
-	RECENT_STACK_GAP,
-	RECENT_MAX_ROWS,
-	BLOCK_PADDING_X,
-	BLOCK_PADDING_BOTTOM,
-	SELF_PERMISSION_MARGIN_X,
-	SELF_PERMISSION_MARGIN_BOTTOM,
-	PROMPT_TOGGLE_ROW_HEIGHT,
-	PROMPT_BODY_MARGIN_TOP,
-	PROMPT_MAX_HEIGHT,
-	PROMPT_LINE_HEIGHT,
-	PENDING_TITLE_ROW_HEIGHT,
-	PENDING_TITLE_MARGIN_BOTTOM,
-	PENDING_CARD_BORDER,
-	PENDING_STACK_GAP,
-	PENDING_PERMISSION_CARD_PLACEHOLDER,
-	TOOLCALL_HEADER_ESTIMATE,
-	RESOLVE_OVERRIDE_BUTTON_HEIGHT,
-	RESULT_MAX_HEIGHT,
-	RESULT_MD_PADDING_BLOCK,
-	RESULT_MD_PADDING_INLINE,
-	CARD_BORDER,
-	DIVIDER_HEIGHT,
-} as const;

@@ -9,6 +9,8 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import type { BackgroundTaskListItem, BackgroundTaskListPage } from "@shared/background-task-list";
+import { Hono } from "hono";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
 
@@ -41,7 +43,16 @@ const {
 	decodeBackgroundTaskListCursor,
 	encodeBackgroundTaskListCursor,
 } = await import("../background-task-service");
-const { BACKGROUND_TASK_LIST_OUTPUT_PREVIEW_CHARS } = await import("@shared/background-task-list");
+const { BACKGROUND_TASK_LIST_OUTPUT_PREVIEW_CHARS, BACKGROUND_TASK_LIST_PAGE_SIZE } = await import(
+	"@shared/background-task-list"
+);
+const { narratorRoutes } = await import("../../routes/narrators");
+const app = new Hono();
+app.use("*", async (c, next) => {
+	c.set("user", { sub: "test-admin", role: "admin", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+	await next();
+});
+app.route("/api/narrators", narratorRoutes);
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
@@ -196,6 +207,172 @@ describe("background task list cursor paging", () => {
 			decodeBackgroundTaskListCursor(encodeBackgroundTaskListCursor({} as never)),
 		).toThrow();
 		expect(decodeBackgroundTaskListCursor(undefined)).toBeUndefined();
+	});
+});
+
+describe("subagents remain discoverable without a background projection", () => {
+	test("lists a foreground/resumed child but not a forked primary narrator", async () => {
+		await seedParent();
+		const now = new Date().toISOString();
+		await db.insert(narrators).values([
+			{
+				id: "foreground-child",
+				parentNarratorId: PARENT,
+				variant: "subagent:general",
+				type: "subagent",
+				status: "working",
+				createdAt: now,
+				updatedAt: now,
+			},
+			{
+				id: "forked-primary",
+				parentNarratorId: PARENT,
+				variant: "primary",
+				type: "primary",
+				status: "working",
+				createdAt: now,
+				updatedAt: now,
+			},
+		]);
+		const page = await backgroundTaskService.listPageByParent(PARENT);
+		expect(page.tasks.map((task) => task.id)).toEqual(["foreground-child"]);
+		expect(page.activeTasks?.map((task) => task.id)).toEqual(["foreground-child"]);
+		backgroundTaskService.notifyDerivedStatusChanged(PARENT, "foreground-child");
+		await flushDeltas();
+		expect(listDeltas().at(-1)).toMatchObject({
+			activeCount: 1,
+			upsert: { id: "foreground-child", effectiveStatus: "running" },
+		});
+	});
+
+	test("keeps a taken-over task through cleanup and in the active set", async () => {
+		await seedParent();
+		const id = "held-child";
+		const old = "2020-01-01T00:00:00.000Z";
+		await seedLegacyTask({ id, createdAt: old });
+		await backgroundTaskService.createAgentTask({
+			id,
+			parentNarratorId: PARENT,
+			subagentNarratorId: id,
+			subagentType: "general",
+		});
+		await backgroundTaskService.markTakenOver(id);
+		const { backgroundTasks } = await import("../../db/schema");
+		const { eq } = await import("drizzle-orm");
+		await db.update(backgroundTasks).set({ completedAt: old }).where(eq(backgroundTasks.id, id));
+		await db
+			.update(narrators)
+			.set({
+				isBackground: false,
+				backgroundStatus: null,
+				substatus: JSON.stringify(["taken_over"]),
+			})
+			.where(eq(narrators.id, id));
+		expect(await backgroundTaskService.cleanupCompleted()).toBe(0);
+		expect(await backgroundTaskService.getById(id)).not.toBeNull();
+		const page = await backgroundTaskService.listPageByParent(PARENT);
+		expect(page.activeTasks).toEqual([
+			expect.objectContaining({ id, effectiveStatus: "taken_over", canCancelActiveWork: false }),
+		]);
+	});
+});
+
+describe("background task list HTTP compatibility", () => {
+	type LegacyResponse = BackgroundTaskListPage & {
+		legacySubagentTasks: Array<{ id: string; backgroundResult: string | null }>;
+	};
+
+	async function requestList(query = ""): Promise<LegacyResponse> {
+		const response = await app.request(`/api/narrators/${PARENT}/background-tasks${query}`);
+		expect(response.status).toBe(200);
+		return response.json();
+	}
+
+	test("an already-open pre-paging client can decode the no-parameter response", async () => {
+		await seedParent();
+		await seedBashTaskAt("running", "2026-01-01T00:00:02.000Z");
+		await seedLegacyTask({ id: "legacy", createdAt: "2026-01-01T00:00:01.000Z" });
+
+		const data = await requestList();
+		// The old queryFn maps BOTH arrays unconditionally after HTTP 200. Omitting
+		// legacySubagentTasks turns a successful request into a failed query before
+		// the panel can render any of its rows.
+		const decoded = {
+			tasks: data.tasks.map((task) => ({ ...task, output: task.output?.slice(0, 4_000) })),
+			legacySubagentTasks: data.legacySubagentTasks.map((task) => ({
+				...task,
+				backgroundResult: task.backgroundResult?.slice(0, 4_000),
+			})),
+		};
+		expect(decoded.tasks.map((task) => task.id)).toEqual(["running", "legacy"]);
+		// Legacy DB rows are already normalized in tasks; do not send them twice.
+		expect(decoded.legacySubagentTasks).toEqual([]);
+	});
+
+	test("includes active tasks outside the first page without restoring unbounded history", async () => {
+		await seedParent();
+		await seedBashTaskAt("old-running", "2025-01-01T00:00:00.000Z");
+		await seedLegacyTask({
+			id: "old-legacy-running",
+			createdAt: "2025-01-02T00:00:00.000Z",
+			backgroundStatus: "running",
+		});
+		for (let i = 0; i < BACKGROUND_TASK_LIST_PAGE_SIZE + 5; i++) {
+			await seedLegacyTask({
+				id: `history-${String(i).padStart(2, "0")}`,
+				createdAt: "2026-01-01T00:00:00.000Z",
+				result: "x".repeat(8_000),
+			});
+		}
+		await seedBashTaskAt("new-running", "2026-02-01T00:00:00.000Z");
+
+		const data = await requestList();
+		const ids = data.tasks.map((task) => task.id);
+		expect(ids).toContain("old-running");
+		expect(ids).toContain("old-legacy-running");
+		expect(ids[0]).toBe("new-running");
+		expect(new Set(ids).size).toBe(ids.length);
+		expect(data.tasks).toHaveLength(BACKGROUND_TASK_LIST_PAGE_SIZE + 2);
+		expect(ids).not.toContain("history-00");
+		expect(data.activeCount).toBe(3);
+		expect(data.nextCursor).not.toBeNull();
+		for (const task of data.tasks) {
+			expect(task.output?.length ?? 0).toBeLessThanOrEqual(
+				BACKGROUND_TASK_LIST_OUTPUT_PREVIEW_CHARS + 1,
+			);
+		}
+	});
+
+	test("keeps explicit cursor pages bounded and compatible with the current reducer", async () => {
+		await seedParent();
+		await seedBashTaskAt("older", "2026-01-01T00:00:01.000Z");
+		await seedBashTaskAt("newer", "2026-01-01T00:00:02.000Z");
+
+		const first = await requestList("?limit=1");
+		expect(first.tasks.map((task) => task.id)).toEqual(["newer"]);
+		expect(first.activeTasks?.map((task) => task.id)).toEqual(["newer", "older"]);
+		const { flattenBackgroundTaskList, toBackgroundTaskListState } = await import(
+			"../../../frontend/components/narrator/background-task-list-state"
+		);
+		const currentTasks: BackgroundTaskListItem[] = flattenBackgroundTaskList(
+			toBackgroundTaskListState([first]),
+		);
+		expect(currentTasks.map((task) => task.id)).toEqual(["newer", "older"]);
+
+		const second = await requestList(`?cursor=${encodeURIComponent(first.nextCursor as string)}`);
+		expect(second.tasks.map((task) => task.id)).toEqual(["older"]);
+		expect(second.activeTasks).toBeUndefined();
+		expect(second.nextCursor).toBeNull();
+	});
+
+	test("returns both empty arrays for an old client with no tasks", async () => {
+		await seedParent();
+		expect(await requestList()).toMatchObject({
+			tasks: [],
+			legacySubagentTasks: [],
+			activeCount: 0,
+			nextCursor: null,
+		});
 	});
 });
 

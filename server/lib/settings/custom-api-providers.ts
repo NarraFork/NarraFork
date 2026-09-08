@@ -1,3 +1,7 @@
+import {
+	SUBAGENT_POOL_TYPES,
+	type SubagentModelReasoningEfforts,
+} from "@shared/subagent-model-policy";
 import { ValidationError } from "../errors";
 import type {
 	AnthropicProviderConfig,
@@ -383,12 +387,43 @@ export function migrateProviderPrefixReferences(
 		}
 	}
 
+	// Compute every effort target before mutating any settings, including unrelated refs.
+	let migratedReasoningEfforts: SubagentModelReasoningEfforts | undefined;
+	const reasoningEfforts = settings.agent.subagentModelReasoningEfforts;
+	if (
+		reasoningEfforts &&
+		typeof reasoningEfforts === "object" &&
+		!Array.isArray(reasoningEfforts)
+	) {
+		migratedReasoningEfforts = { ...reasoningEfforts };
+		for (const poolType of SUBAGENT_POOL_TYPES) {
+			const pool = reasoningEfforts[poolType];
+			if (!pool || typeof pool !== "object" || Array.isArray(pool)) continue;
+			const targets = new Map<string, (typeof pool)[string]>();
+			const sources = new Map<string, string>();
+			for (const [sourceModel, effort] of Object.entries(pool)) {
+				const targetModel = rewriteModelReference(sourceModel, prefixMap);
+				if (targets.has(targetModel) && targets.get(targetModel) !== effort) {
+					throw new ValidationError(
+						`Provider prefix migration would overwrite subagent reasoning effort ` +
+							`"${poolType}:${targetModel}" from both "${sources.get(targetModel)}" ` +
+							`and "${sourceModel}".`,
+					);
+				}
+				targets.set(targetModel, effort);
+				sources.set(targetModel, sourceModel);
+			}
+			migratedReasoningEfforts[poolType] = Object.fromEntries(targets);
+		}
+	}
+
 	const before = JSON.stringify({
 		defaultModel: settings.agent.defaultModel,
 		summaryModel: settings.agent.summaryModel,
 		translationModel: settings.agent.translationModel,
 		subagentModels: settings.agent.subagentModels,
 		subagentAllowedModels: settings.agent.subagentAllowedModels,
+		subagentModelReasoningEfforts: settings.agent.subagentModelReasoningEfforts,
 		modelAggregations: settings.agent.modelAggregations,
 		hiddenModels: settings.agent.hiddenModels,
 		customModels: settings.agent.customModels,
@@ -426,6 +461,9 @@ export function migrateProviderPrefixReferences(
 		settings.agent.hiddenModels ?? [],
 		prefixMap,
 	);
+	if (migratedReasoningEfforts !== undefined) {
+		settings.agent.subagentModelReasoningEfforts = migratedReasoningEfforts;
+	}
 	settings.agent.customModels = migratedCustomModels;
 	settings.agent.modelContextWindows = migratedContextWindows;
 	settings.agent.providerOrder = settings.agent.providerOrder?.map(
@@ -447,6 +485,7 @@ export function migrateProviderPrefixReferences(
 		translationModel: settings.agent.translationModel,
 		subagentModels: settings.agent.subagentModels,
 		subagentAllowedModels: settings.agent.subagentAllowedModels,
+		subagentModelReasoningEfforts: settings.agent.subagentModelReasoningEfforts,
 		modelAggregations: settings.agent.modelAggregations,
 		hiddenModels: settings.agent.hiddenModels,
 		customModels: settings.agent.customModels,

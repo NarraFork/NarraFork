@@ -19,20 +19,25 @@
 
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { I18nextProvider } from "react-i18next";
 import type { VListElementKind } from "./registry";
 import type { RenderExtra } from "./render-registry";
 
-const realReactI18nextModule = { ...(await import("react-i18next")) };
 const realUsePlatformModule = { ...(await import("@frontend/hooks/usePlatform")) };
 
 // i18n returns raw keys so the label assertions are translation-stable.
-mock.module("react-i18next", () => ({
-	...realReactI18nextModule,
-	useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en" } }),
-}));
+const testI18n = i18next.createInstance();
+await testI18n.init({
+	lng: "en",
+	fallbackLng: "en",
+	resources: { en: { narrator: {}, common: {} } },
+	defaultNS: "narrator",
+	react: { useSuspense: false },
+});
 mock.module("@frontend/hooks/usePlatform", () => ({
 	...realUsePlatformModule,
 	useUploadCapability: () => ({ serveAvatars: { supported: false } }),
@@ -94,9 +99,11 @@ function renderHeader(props: React.ComponentProps<typeof InjectionSpeakerHeader>
 	currentRoot = root;
 	act(() => {
 		root.render(
-			<MantineProvider>
-				<InjectionSpeakerHeader {...props} />
-			</MantineProvider>,
+			<I18nextProvider i18n={testI18n}>
+				<MantineProvider>
+					<InjectionSpeakerHeader {...props} />
+				</MantineProvider>
+			</I18nextProvider>,
 		);
 	});
 	const row = currentContainer.querySelector('[class*="mantine-Group-root"]');
@@ -377,7 +384,11 @@ describe("injectInjectionBubbleChrome", () => {
 			const root = createRoot(currentContainer);
 			currentRoot = root;
 			act(() => {
-				root.render(<MantineProvider>{extra.header as React.ReactNode}</MantineProvider>);
+				root.render(
+					<I18nextProvider i18n={testI18n}>
+						<MantineProvider>{extra.header as React.ReactNode}</MantineProvider>
+					</I18nextProvider>,
+				);
 			});
 			const link = currentContainer.querySelector("[data-injection-open-session]");
 			if (link) (link as unknown as HTMLElement).click();

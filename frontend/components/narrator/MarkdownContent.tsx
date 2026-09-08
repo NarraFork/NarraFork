@@ -1,8 +1,4 @@
-import {
-	handleMarkdownAnchorClick,
-	MD_HEADING_SLUG_ATTR,
-	markdownLinkTargetProps,
-} from "@frontend/lib/markdown-anchor-scroll";
+import { MD_HEADING_SLUG_ATTR } from "@frontend/lib/markdown-anchor-scroll";
 import { Code, Divider, Table, Text } from "@mantine/core";
 import { reactChildrenToHeadingText, slugifyHeading } from "@shared/pretext-layout/markdown-anchor";
 import {
@@ -24,6 +20,7 @@ import remarkGfm from "remark-gfm";
 import type { Pluggable, PluggableList } from "unified";
 import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
 import classes from "./MarkdownContent.module.css";
+import { MarkdownLink } from "./MarkdownLink";
 import { MermaidDiagram } from "./MermaidDiagram";
 import {
 	hasMarkdownMath,
@@ -32,6 +29,7 @@ import {
 	isSafeForFlowtokenTail,
 	normalizeMathDelimiters,
 } from "./markdown-detection";
+import { remarkLocalFileLinks } from "./remark-local-file-links";
 import { hasUnclosedFence, splitStableAndTail } from "./streaming-markdown-split";
 
 export { MD_PATTERN } from "./markdown-detection";
@@ -209,31 +207,16 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 		li({ children }) {
 			return <li>{at(children)}</li>;
 		},
-		a({ href, children }) {
-			// A same-document `#heading` anchor scrolls WITHIN this body and gets no
-			// `target`; every real destination keeps opening in a new tab as before.
-			// Applying `target="_blank"` to a fragment is what used to open a blank tab
-			// on an in-document link.
-			//
-			// The scope is resolved from the DOM at click time (`closest`) rather than
-			// through a context: these components are built once at module level, and a
-			// context would force them to be rebuilt per instance — re-mounting every
-			// markdown subtree in the app on each render.
+		a({ href, children, title }) {
 			return (
-				<a
-					className={classes.mdLink}
+				<MarkdownLink
 					href={href}
-					{...markdownLinkTargetProps(href)}
-					onClick={(event) => {
-						handleMarkdownAnchorClick(
-							event,
-							href,
-							event.currentTarget.closest(`[${MD_ROOT_ATTR}]`),
-						);
-					}}
+					labelText={extractText(children)}
+					linkClassName={classes.mdLink}
+					title={title}
 				>
 					{at(children)}
-				</a>
+				</MarkdownLink>
 			);
 		},
 		blockquote({ children }) {
@@ -473,7 +456,8 @@ export const AnimatedMarkdownText = memo(function AnimatedMarkdownText({ text }:
 
 function animateText(children: ReactNode): ReactNode {
 	if (Array.isArray(children)) {
-		return Children.toArray(children).map((child) => animateText(child));
+		// Also key the new animated text leaves between autolink elements.
+		return Children.map(children, (child) => animateText(child));
 	}
 	if (typeof children !== "string") return children;
 	return <AnimatedMarkdownText text={children} />;
@@ -736,6 +720,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 	const remarkPlugins = useMemo<PluggableList>(() => {
 		const plugins: PluggableList = supportsLookbehind ? [remarkGfm] : [];
 		if (mathPlugins) plugins.push(mathPlugins.remarkMath);
+		plugins.push(remarkLocalFileLinks);
 		return plugins;
 	}, [mathPlugins]);
 	const rehypePlugins = useMemo<PluggableList>(() => {

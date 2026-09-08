@@ -25,7 +25,12 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, projects } from "../db/schema";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { catalogError, NotFoundError, ValidationError } from "../lib/errors";
+import {
+	type GitTreeMergeResult,
+	requireCompleteMergeTree,
+	requireMarkerResolvableTree,
+} from "../lib/git-tree-merge";
 import { logger } from "../lib/logger";
 import { advanceChapterSnapshot, ensureChapterSnapshot } from "./chapter-snapshot-ref";
 import { gitService } from "./git-service";
@@ -46,17 +51,13 @@ const CONFLICT_END = ">>>>>>> ";
 const MAX_MARKER_SCAN_BYTES = 8 * 1024 * 1024;
 
 /** A merge computed in snapshot space, not yet applied to any worktree. */
-export interface SnapshotMergePlan {
+export interface SnapshotMergePlan extends GitTreeMergeResult {
 	/** Snapshot the target was at before anything was applied. */
 	preMergeTree: string;
 	/** Target's snapshot commit, one side of the merge. */
 	targetSnapshot: string;
 	/** Source's snapshot commit as present in the target's shadow repo. */
 	sourceSnapshot: string;
-	/** Resulting tree. Carries conflict markers when `conflicts` is non-empty. */
-	tree: string;
-	/** Paths git could not merge automatically. */
-	conflicts: string[];
 }
 
 async function getProjectGitPath(projectId: string): Promise<string> {
@@ -167,8 +168,7 @@ export async function planSnapshotMerge(
 		preMergeTree: targetAdvance.treeHash,
 		targetSnapshot: targetAdvance.commitSha,
 		sourceSnapshot: incoming,
-		tree: merged.tree,
-		conflicts: merged.conflicts,
+		...merged,
 	};
 }
 
@@ -184,7 +184,8 @@ export async function applySnapshotMerge(
 	plan: SnapshotMergePlan,
 	message: string,
 ): Promise<{ commitSha: string; changedFiles: string[] }> {
-	if (plan.conflicts.length > 0) {
+	const tree = requireCompleteMergeTree(plan);
+	if (plan.hasConflicts || plan.conflicts.length > 0) {
 		throw new ValidationError("Refusing to apply a conflicted merge tree");
 	}
 	// Guarded on the state the plan was computed from. `planSnapshotMerge` captures the
@@ -195,18 +196,18 @@ export async function applySnapshotMerge(
 	// cheap; the alternative is silent loss.
 	const changedFiles = await worktreeTreeSnapshot.materializeTree(
 		targetWorktree,
-		plan.tree,
+		tree,
 		undefined,
 		plan.preMergeTree,
 	);
 	const commitSha = await worktreeTreeSnapshot.commitSnapshot(
 		targetWorktree,
-		plan.tree,
+		tree,
 		[plan.targetSnapshot, plan.sourceSnapshot],
 		message,
 	);
 	await worktreeTreeSnapshot.setRef(targetWorktree, SNAPSHOT_HEAD_REF, commitSha);
-	await advanceChapterSnapshot(targetWorktree, plan.tree, message);
+	await advanceChapterSnapshot(targetWorktree, tree, message);
 	return { commitSha, changedFiles };
 }
 
@@ -218,9 +219,37 @@ export async function applySnapshotMerge(
  */
 export async function materializeConflicts(
 	targetWorktree: string,
-	conflictTree: string,
+	result: GitTreeMergeResult,
 ): Promise<string[]> {
-	return worktreeTreeSnapshot.materializeTree(targetWorktree, conflictTree);
+	return worktreeTreeSnapshot.materializeTree(targetWorktree, requireMarkerResolvableTree(result));
+}
+
+/** Recheck persisted conflict coverage before a marker-only session may complete. */
+export async function revalidateSnapshotConflictPlan(
+	source: ChapterRow,
+	target: ChapterRow,
+	expected: Pick<SnapshotMergePlan, "targetSnapshot" | "sourceSnapshot" | "tree" | "conflicts">,
+): Promise<void> {
+	if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
+	const fallbackBase = await resolveBranchMergeBase(source, target, target.worktreePath);
+	const result = await worktreeTreeSnapshot.mergeSnapshots(
+		target.worktreePath,
+		expected.targetSnapshot,
+		expected.sourceSnapshot,
+		undefined,
+		fallbackBase ?? undefined,
+	);
+	const tree = requireMarkerResolvableTree(result);
+	const declared = new Set(expected.conflicts);
+	if (
+		!result.hasConflicts ||
+		tree !== expected.tree ||
+		declared.size !== expected.conflicts.length ||
+		declared.size !== result.conflicts.length ||
+		result.conflicts.some((path) => !declared.has(path))
+	) {
+		throw catalogError("GIT_TREE_MERGE_CONFLICTS_UNLISTED");
+	}
 }
 
 /**
@@ -380,11 +409,7 @@ export async function restoreSourceSnapshot(
 }
 
 /** Outcome of reversing a snapshot merge out of the target. */
-export interface SnapshotUnmergePlan {
-	/** Tree to write to the target. */
-	tree: string;
-	/** Paths that could not be reversed automatically. */
-	conflicts: string[];
+export interface SnapshotUnmergePlan extends GitTreeMergeResult {
 	/** Target snapshot the reversal was computed from. */
 	targetSnapshot: string;
 	/** Tree of that snapshot, for the drift guard when the plan is applied. */
@@ -481,8 +506,7 @@ export async function planSnapshotUnmerge(
 		preMergeTargetSnapshotSha,
 	);
 	return {
-		tree: reversed.tree,
-		conflicts: reversed.conflicts,
+		...reversed,
 		targetSnapshot: current.commitSha,
 		preUnmergeTree: current.treeHash,
 	};
@@ -494,7 +518,8 @@ export async function applySnapshotUnmerge(
 	plan: SnapshotUnmergePlan,
 	message: string,
 ): Promise<string[]> {
-	if (plan.conflicts.length > 0) {
+	const tree = requireCompleteMergeTree(plan);
+	if (plan.hasConflicts || plan.conflicts.length > 0) {
 		throw new ValidationError("Refusing to apply a conflicted unmerge tree");
 	}
 	// Guarded on the state the plan was computed from: the reversal is only the correct
@@ -502,18 +527,18 @@ export async function applySnapshotUnmerge(
 	// apply rather than have its work overwritten by a tree that never saw it.
 	const changed = await worktreeTreeSnapshot.materializeTree(
 		targetWorktree,
-		plan.tree,
+		tree,
 		undefined,
 		plan.preUnmergeTree,
 	);
 	const commitSha = await worktreeTreeSnapshot.commitSnapshot(
 		targetWorktree,
-		plan.tree,
+		tree,
 		[plan.targetSnapshot],
 		message,
 	);
 	await worktreeTreeSnapshot.setRef(targetWorktree, SNAPSHOT_HEAD_REF, commitSha);
-	await advanceChapterSnapshot(targetWorktree, plan.tree, message);
+	await advanceChapterSnapshot(targetWorktree, tree, message);
 	return changed;
 }
 
@@ -555,5 +580,6 @@ export async function checkSnapshotConflicts(
 	// merge itself auto-committed first, which is exactly how it could promise a clean
 	// merge and then conflict.
 	const plan = await planSnapshotMerge(source, target);
-	return { conflictFiles: plan.conflicts, hasConflicts: plan.conflicts.length > 0 };
+	requireCompleteMergeTree(plan);
+	return { conflictFiles: plan.conflicts, hasConflicts: plan.hasConflicts };
 }

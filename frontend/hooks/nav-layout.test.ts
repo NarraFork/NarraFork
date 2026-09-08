@@ -26,6 +26,12 @@ describe("nav layout defaults", () => {
 		expect([...visible, ...tucked].sort()).toEqual([...CUSTOMIZABLE_NAV_IDS].sort());
 	});
 
+	it("removes the tutorial entry but preserves the independent learning guide", () => {
+		expect(CUSTOMIZABLE_NAV_IDS).not.toContain("tutorial");
+		expect(CUSTOMIZABLE_NAV_ITEMS.map((def) => def.to)).not.toContain("/tutorial");
+		expect(CUSTOMIZABLE_NAV_ITEMS.find((def) => def.id === "learn")?.to).toBe("/learn");
+	});
+
 	it("keeps projects surfaced — it is the app's primary destination", () => {
 		expect(split(DEFAULT_NAV_ENTRIES).visible).toContain("projects");
 	});
@@ -82,6 +88,23 @@ describe("nav layout merge", () => {
 		expect(ids).not.toContain("groups");
 		for (const id of ids) {
 			expect(id === NAV_DIVIDER_ID || CUSTOMIZABLE_NAV_IDS.includes(id as never)).toBe(true);
+		}
+	});
+
+	it("drops retired tutorial entries without moving the remaining custom layout", () => {
+		const currentIds = ["knowledge", "projects", "messages", "routines", "scheduled-tasks"];
+		for (const hidden of [undefined, true]) {
+			const entries = mergeNavLayout({
+				items: [
+					{ id: "tutorial", hidden },
+					...currentIds.map((id) => ({ id })),
+					{ id: NAV_DIVIDER_ID },
+					{ id: "tutorial" },
+					{ id: "learn" },
+				],
+			});
+			expect(split(entries)).toEqual({ visible: currentIds, tucked: ["learn"] });
+			expect(toPersistedNavLayout(entries).items.map((item) => item.id)).not.toContain("tutorial");
 		}
 	});
 

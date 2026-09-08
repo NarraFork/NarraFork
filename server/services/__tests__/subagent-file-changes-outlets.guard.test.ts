@@ -65,6 +65,14 @@ describe("subagent result outlets carry the file-change summary", () => {
 			// the guard must fail loudly rather than pass by matching zero against zero.
 			expect(tagged).toBeGreaterThan(0);
 			expect(summarized).toBe(tagged);
+			const childScoped =
+				source.match(
+					/appendSubagentFileChanges\(\s*\{\s*parentNarratorId,\s*childNarratorId:\s*subagentId,\s*scope:\s*\{/g,
+				) ?? [];
+			expect(childScoped.length).toBe(summarized);
+			const executionBoundary =
+				source.match(/scope:\s*\{\s*sourceToolUseId:\s*toolUseId,\s*startedAt:/g) ?? [];
+			expect(executionBoundary.length).toBe(summarized);
 		});
 	}
 
@@ -76,6 +84,31 @@ describe("subagent result outlets carry the file-change summary", () => {
 			0,
 		);
 		expect(total).toBe(5);
+	});
+
+	test("single-result append cannot regress to the whole-team query or load payloads", () => {
+		const source = executableSource("subagent-file-changes.ts");
+		const append = source.slice(source.indexOf("export async function appendSubagentFileChanges("));
+		expect(append).toContain("getChildSubagentFileChanges(options)");
+		expect(append).not.toContain("getSubagentFileChanges(");
+		expect(append).not.toContain("getTeamSubagentFileChanges(");
+		for (const field of [
+			"inputJson",
+			"outputJson",
+			"contentJson",
+			"input_json",
+			"output_json",
+			"content_json",
+		])
+			expect(source).not.toContain(field);
+	});
+
+	test("the executor preserves a runner window instead of using replay time", () => {
+		const executor = executableSource("subagent-executor.ts");
+		expect(executor).toContain("turnStartedAt: opts.fileChangeStartedAt");
+		const runner = executableSource("subagent-runner.ts");
+		expect(runner).toContain("startedAt: original.turnStartedAt ?? null");
+		expect(runner).toContain("completedAt: original.backgroundCompletedAt ?? null");
 	});
 
 	test("the crash outlet is one of them", () => {

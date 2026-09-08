@@ -2,7 +2,6 @@
  * Rebuild file contents by replaying successful Write/Edit tool calls from the
  * narrator's first-touch snapshots. File identity is device + target path.
  */
-import { isAbsolute, resolve } from "node:path";
 import { and, asc, eq, lte, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -16,6 +15,11 @@ import {
 import { LOCAL_DEVICE_ID, type PathFlavor } from "../lib/agent/execution/backend";
 import { targetPathSemantics } from "../lib/agent/execution/path-resolve";
 import { replace } from "../lib/agent/tools/edit";
+import {
+	applyLineEnding,
+	detectLineEnding,
+	normalizeLineEndings,
+} from "../lib/agent/tools/encoding";
 import { logger } from "../lib/logger";
 
 // Threshold for logging: file state rebuild must be complete for correctness
@@ -62,11 +66,21 @@ export interface DeviceFileState extends DeviceFileIdentity {
 	encoding?: string | null;
 }
 
-function inferPathFlavor(filePath: string): PathFlavor {
+function inferPathFlavor(filePath: string, cwd: string | null = null): PathFlavor {
 	if (filePath.startsWith("spec://")) return "spec";
-	return /^[a-zA-Z]:[\\/]/u.test(filePath) || /^\\\\/u.test(filePath) || filePath.includes("\\")
-		? "windows"
-		: "posix";
+	if (/^[a-zA-Z]:[\\/]/u.test(filePath) || /^\\\\/u.test(filePath)) return "windows";
+	// A backslash in a POSIX absolute path is a literal filename character, not
+	// evidence of a Windows separator. Recorded target/alias metadata wins before
+	// this fallback is used; never consult the current host OS to interpret history.
+	if (filePath.startsWith("/") && !filePath.startsWith("//")) return "posix";
+	if (cwd) return inferPathFlavor(cwd);
+	if (filePath.includes("\\") || filePath.startsWith("//") || /^[a-zA-Z]:/u.test(filePath)) {
+		throw new FileHistoryError(
+			"MISSING_EXECUTION_PATH",
+			`Ambiguous legacy path ${filePath}: no recorded path flavor, cwd, or canonical alias identifies its target grammar.`,
+		);
+	}
+	return "posix";
 }
 
 function pathIdentityKey(filePath: string, pathFlavor: PathFlavor): string {
@@ -172,9 +186,14 @@ async function resolveLegacyLocalCwd(narratorId: string): Promise<string | null>
 	return null;
 }
 
-function canonicalLocalPath(path: string, cwd: string | null): string | null {
-	if (isAbsolute(path)) return path;
-	return cwd ? resolve(cwd, path) : null;
+function canonicalLocalPath(
+	path: string,
+	cwd: string | null,
+	pathFlavor = inferPathFlavor(path, cwd),
+): string | null {
+	const paths = targetPathSemantics(pathFlavor);
+	if (paths.isAbsolute(path)) return paths.normalize(path);
+	return cwd && paths.isAbsolute(cwd) ? paths.resolve(cwd, path) : null;
 }
 
 type FileTargetProjection = Pick<
@@ -321,15 +340,16 @@ export function getToolCallFileIdentity(
 		return normalizeDeviceFileIdentity({
 			deviceId: target.deviceId,
 			filePath,
-			pathFlavor: target.pathFlavor ?? inferPathFlavor(filePath),
+			pathFlavor: target.pathFlavor ?? inferPathFlavor(filePath, target.cwd),
 		});
 	}
 
 	const legacyDevice = typeof input?.device === "string" ? input.device : LOCAL_DEVICE_ID;
 	if (legacyDevice !== LOCAL_DEVICE_ID || !legacyInputPath) return null;
-	const filePath =
-		canonicalLocalPath(legacyInputPath, target.cwd ?? legacyLocalCwd) ?? legacyInputPath;
-	return normalizeDeviceFileIdentity({ deviceId: LOCAL_DEVICE_ID, filePath });
+	const cwd = target.cwd ?? legacyLocalCwd;
+	const pathFlavor = target.pathFlavor ?? inferPathFlavor(legacyInputPath, cwd);
+	const filePath = canonicalLocalPath(legacyInputPath, cwd, pathFlavor) ?? legacyInputPath;
+	return normalizeDeviceFileIdentity({ deviceId: LOCAL_DEVICE_ID, filePath, pathFlavor });
 }
 
 export function getToolCallFileIdentityStrict(
@@ -366,7 +386,7 @@ export function getToolCallFileIdentityStrict(
 		return normalizeDeviceFileIdentity({
 			deviceId: target.deviceId,
 			filePath,
-			pathFlavor: target.pathFlavor ?? inferPathFlavor(filePath),
+			pathFlavor: target.pathFlavor ?? inferPathFlavor(filePath, target.cwd),
 		});
 	}
 
@@ -385,7 +405,9 @@ export function getToolCallFileIdentityStrict(
 			toolCall.toolUseId,
 		);
 	}
-	const filePath = canonicalLocalPath(legacyInputPath, target.cwd ?? legacyLocalCwd);
+	const cwd = target.cwd ?? legacyLocalCwd;
+	const pathFlavor = target.pathFlavor ?? inferPathFlavor(legacyInputPath, cwd);
+	const filePath = canonicalLocalPath(legacyInputPath, cwd, pathFlavor);
 	if (!filePath) {
 		throw new FileHistoryError(
 			"MISSING_LOCAL_CWD",
@@ -393,7 +415,7 @@ export function getToolCallFileIdentityStrict(
 			toolCall.toolUseId,
 		);
 	}
-	return normalizeDeviceFileIdentity({ deviceId: LOCAL_DEVICE_ID, filePath });
+	return normalizeDeviceFileIdentity({ deviceId: LOCAL_DEVICE_ID, filePath, pathFlavor });
 }
 
 /** Query successful Write/Edit calls ordered by message seq and creation time. */
@@ -511,6 +533,10 @@ export async function queryOrderedToolCalls(
  * `currentContent`. Callers that rebuild file state must treat that as "this
  * file is not reconstructable" rather than falling back to the pre-call
  * content, which would corrupt the result (see the class doc for why).
+ *
+ * This is legacy_unverified text reconstruction, not byte-exact recovery. EOL
+ * parity with today's tools cannot recover a stripped BOM, lossy decoding,
+ * historical executor differences, or writes absent from the recorded history.
  */
 export function applyToolCall(
 	currentContent: string | null,
@@ -527,7 +553,10 @@ export function applyToolCall(
 				toolCall.toolUseId,
 			);
 		}
-		return content;
+		return applyLineEnding(
+			normalizeLineEndings(content),
+			detectLineEnding(currentContent ?? content),
+		);
 	}
 
 	if (toolCall.toolName === "Edit") {
@@ -542,9 +571,12 @@ export function applyToolCall(
 		}
 		// An empty old_string is the tool's create/overwrite mode: the Edit tool
 		// writes new_string as the whole file body (edit.ts create-new-file mode).
-		if (oldString === undefined || oldString === "") return newString;
-
-		const normalizeLineEndings = (text: string) => text.replaceAll("\r\n", "\n");
+		if (oldString === undefined || oldString === "") {
+			return applyLineEnding(
+				normalizeLineEndings(newString),
+				detectLineEnding(currentContent ?? newString),
+			);
+		}
 		if (currentContent === null) {
 			throw new ReplayDivergedError(
 				`Edit call ${toolCall.toolUseId} expects existing content but the baseline is missing.`,
@@ -553,12 +585,13 @@ export function applyToolCall(
 		}
 
 		try {
-			return replace(
+			const result = replace(
 				normalizeLineEndings(currentContent),
 				normalizeLineEndings(oldString),
 				normalizeLineEndings(newString),
 				replaceAll,
-			).content;
+			);
+			return applyLineEnding(result.content, detectLineEnding(currentContent));
 		} catch (error) {
 			throw new ReplayDivergedError(
 				`Edit call ${toolCall.toolUseId} no longer applies to the reconstructed content: ` +
@@ -638,6 +671,7 @@ export function buildCanonicalIdentityAliases(
 	legacyLocalCwd: string | null,
 ): Map<string, DeviceFileIdentity> {
 	const aliases = new Map<string, DeviceFileIdentity>();
+	const canonicalEvidence = new Set<string>();
 	for (const toolCall of toolCalls) {
 		const identity = getToolCallFileIdentity(toolCall, legacyLocalCwd);
 		if (!identity) continue;
@@ -654,10 +688,51 @@ export function buildCanonicalIdentityAliases(
 				filePath: aliasPath,
 				pathFlavor: normalizedIdentity.pathFlavor,
 			});
-			aliases.set(deviceFileKey(alias), normalizedIdentity);
+			const key = deviceFileKey(alias);
+			const previous = aliases.get(key);
+			if (previous && deviceFileKey(previous) !== deviceFileKey(normalizedIdentity)) {
+				// Lexical-only legacy rows are not evidence that a path is canonical.
+				// They must not contradict or overwrite a recorded canonical mapping,
+				// regardless of which kind of row was seen first.
+				if (canonicalEvidence.has(key) && !target.canonicalPath) continue;
+				if (canonicalEvidence.has(key) || !target.canonicalPath) {
+					throw new FileHistoryError(
+						"MISSING_EXECUTION_PATH",
+						`Ambiguous legacy path ${aliasPath} on device ${identity.deviceId}: recorded canonical aliases disagree.`,
+						toolCall.toolUseId,
+					);
+				}
+			}
+			aliases.set(key, normalizedIdentity);
+			if (target.canonicalPath) canonicalEvidence.add(key);
 		}
 	}
 	return aliases;
+}
+
+/** Resolve recorded evidence before guessing the grammar of a legacy snapshot. */
+function findCanonicalIdentityAlias(
+	identity: DeviceFileIdentity,
+	canonicalAliases: Map<string, DeviceFileIdentity>,
+): DeviceFileIdentity | undefined {
+	const flavors: PathFlavor[] = identity.pathFlavor
+		? [identity.pathFlavor]
+		: identity.filePath.startsWith("spec://")
+			? ["spec"]
+			: ["posix", "windows"];
+	let match: DeviceFileIdentity | undefined;
+	for (const pathFlavor of flavors) {
+		const candidate = canonicalAliases.get(deviceFileKey({ ...identity, pathFlavor }));
+		if (!candidate) continue;
+		if (match && deviceFileKey(match) !== deviceFileKey(candidate)) {
+			throw new FileHistoryError(
+				"MISSING_EXECUTION_PATH",
+				`Ambiguous legacy path ${identity.filePath} on device ${identity.deviceId}: recorded path flavors disagree.`,
+			);
+		}
+		match = candidate;
+	}
+	return match;
 }
 
 /**
@@ -671,8 +746,9 @@ export function canonicalizeDeviceFileIdentityWith(
 	identity: DeviceFileIdentity,
 	canonicalAliases: Map<string, DeviceFileIdentity>,
 ): DeviceFileIdentity {
-	const normalized = normalizeDeviceFileIdentity(identity);
-	return canonicalAliases.get(deviceFileKey(normalized)) ?? normalized;
+	return (
+		findCanonicalIdentityAlias(identity, canonicalAliases) ?? normalizeDeviceFileIdentity(identity)
+	);
 }
 
 /**
@@ -718,22 +794,27 @@ async function loadSnapshotMap(
 	}
 	const result = new Map<string, SnapshotBaseline>();
 	for (const snapshot of snapshots) {
-		let filePath = snapshot.filePath;
-		if (snapshot.deviceId === LOCAL_DEVICE_ID && !isAbsolute(filePath)) {
-			const canonical = canonicalLocalPath(filePath, legacyLocalCwd);
-			if (!canonical) {
+		// Snapshot rows predate pathFlavor. Probe both grammars against durable
+		// execution metadata first, including calls excluded from this replay.
+		let identity = findCanonicalIdentityAlias(snapshot, canonicalAliases);
+		if (!identity) {
+			const cwd = snapshot.deviceId === LOCAL_DEVICE_ID ? legacyLocalCwd : null;
+			const pathFlavor = inferPathFlavor(snapshot.filePath, cwd);
+			const filePath =
+				snapshot.deviceId === LOCAL_DEVICE_ID
+					? canonicalLocalPath(snapshot.filePath, cwd, pathFlavor)
+					: snapshot.filePath;
+			if (!filePath) {
 				throw new FileHistoryError(
 					"MISSING_LOCAL_CWD",
-					`Legacy local snapshot ${filePath} has no recoverable cwd.`,
+					`Legacy local snapshot ${snapshot.filePath} has no recoverable cwd.`,
 				);
 			}
-			filePath = canonical;
+			identity = canonicalizeDeviceFileIdentityWith(
+				{ deviceId: snapshot.deviceId, filePath, pathFlavor },
+				canonicalAliases,
+			);
 		}
-		const snapshotIdentity = normalizeDeviceFileIdentity({
-			deviceId: snapshot.deviceId,
-			filePath,
-		});
-		const identity = canonicalAliases.get(deviceFileKey(snapshotIdentity)) ?? snapshotIdentity;
 		const key = deviceFileKey(identity);
 		if (!result.has(key)) {
 			result.set(key, {
@@ -765,18 +846,19 @@ async function rebuildDeviceStates(
 	const requestedMap = requested
 		? new Map(
 				requested.map((requestedIdentity) => {
-					const normalized = normalizeDeviceFileIdentity(requestedIdentity);
-					const identity = canonicalAliases.get(deviceFileKey(normalized)) ?? normalized;
+					const identity = canonicalizeDeviceFileIdentityWith(requestedIdentity, canonicalAliases);
 					return [deviceFileKey(identity), identity] as const;
 				}),
 			)
 		: null;
 	const grouped = groupByDeviceFileStrict(toolCalls, legacyLocalCwd);
-	const snapshots = await loadSnapshotMap(narratorId, legacyLocalCwd, canonicalAliases);
-	const keys = requestedMap
-		? requestedMap.keys()
-		: new Set([...snapshots.keys(), ...grouped.keys()]);
 	const result = new Map<string, DeviceFileState>();
+	if ((requestedMap ?? grouped).size === 0) return result;
+	const snapshots = await loadSnapshotMap(narratorId, legacyLocalCwd, canonicalAliases);
+	// First-touch capture precedes Edit matching, so a snapshot alone does not
+	// prove any successful mutation. Default "all" includes only successful calls;
+	// explicit requests may still retrieve the baseline after excluding first Write.
+	const keys = requestedMap ? requestedMap.keys() : grouped.keys();
 
 	for (const key of keys) {
 		const baseline = snapshots.get(key);

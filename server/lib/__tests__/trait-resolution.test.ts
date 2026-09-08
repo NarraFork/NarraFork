@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { SubagentModelUse } from "@shared/subagent-model-policy";
 import {
 	BLOCKED_SKILLS_TRAIT_PREFIX,
 	DISABLED_TOOLS_TRAIT_PREFIX,
@@ -28,7 +29,7 @@ function blockedSkills(value: { all?: boolean; names?: string[] }, base: unknown
 }
 
 function subagentModels(
-	pools: Record<string, Array<string | { model: string; purpose?: string }>>,
+	pools: Record<string, Array<string | SubagentModelUse>>,
 	base: unknown = [],
 ): string[] {
 	return upsertEncodedTrait(base, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX, {
@@ -236,6 +237,71 @@ describe("subagent models (grant)", () => {
 		});
 		const policy = resolveEffectiveSubagentModelPolicy(resolved.traits, "explore");
 		expect(policy.models[0]).toEqual({ model: "m1", purpose: "cheap" });
+	});
+
+	test("effort and purpose inherit independently across all layers", () => {
+		const resolved = resolveLayeredTraits({
+			user: {
+				traits: subagentModels({
+					explore: [{ model: "m1", purpose: "from user", reasoningEffort: "low" }],
+				}),
+			},
+			project: { traits: subagentModels({ explore: [{ model: "m1", reasoningEffort: "high" }] }) },
+			narrator: { traits: subagentModels({ explore: ["m1"] }) },
+		});
+		expect(resolveEffectiveSubagentModelPolicy(resolved.traits, "explore").models).toEqual([
+			{ model: "m1", purpose: "from user", reasoningEffort: "high" },
+		]);
+	});
+
+	test("a nearer purpose does not erase an inherited effort and clearing a local effort inherits", () => {
+		const project = {
+			traits: subagentModels({ explore: [{ model: "m1", reasoningEffort: "high" }] }),
+		};
+		const local = (reasoningEffort?: SubagentModelUse["reasoningEffort"]) =>
+			resolveLayeredTraits({
+				project,
+				narrator: {
+					traits: subagentModels({
+						explore: [
+							{ model: "m1", purpose: "local", ...(reasoningEffort && { reasoningEffort }) },
+						],
+					}),
+				},
+			});
+		expect(resolveEffectiveSubagentModelPolicy(local("none").traits, "explore").models[0]).toEqual({
+			model: "m1",
+			purpose: "local",
+			reasoningEffort: "none",
+		});
+		expect(resolveEffectiveSubagentModelPolicy(local().traits, "explore").models[0]).toEqual({
+			model: "m1",
+			purpose: "local",
+			reasoningEffort: "high",
+		});
+	});
+
+	test("enforced model grants do not turn execution metadata into a separate permission lock", () => {
+		const resolved = resolveLayeredTraits({
+			project: {
+				traits: withEnforcedKeys(
+					subagentModels({ explore: [{ model: "m1", reasoningEffort: "high" }] }),
+					{ subagentModels: true },
+				),
+			},
+			narrator: {
+				traits: subagentModels({
+					explore: [
+						{ model: "m1", reasoningEffort: "medium" },
+						{ model: "forbidden", reasoningEffort: "max" },
+					],
+				}),
+			},
+		});
+		expect(resolveEffectiveSubagentModelPolicy(resolved.traits, "explore").models).toEqual([
+			{ model: "m1", reasoningEffort: "medium" },
+		]);
+		expect(resolved.enforced.subagentModels.has("explore")).toBe(true);
 	});
 
 	test("an explicit empty pool stays distinguishable from inheriting", () => {

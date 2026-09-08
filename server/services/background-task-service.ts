@@ -20,6 +20,7 @@ import {
 	eq,
 	getTableColumns,
 	inArray,
+	like,
 	lt,
 	ne,
 	notExists,
@@ -28,7 +29,9 @@ import {
 	sql,
 } from "drizzle-orm";
 import { db } from "../db";
-import { backgroundTasks, deviceTransferTasks, narrators } from "../db/schema";
+import { backgroundTasks, deviceTransferTasks, narrators, narratorToolCalls } from "../db/schema";
+import { BASH_TOOL_NAME } from "../lib/agent/tool-name";
+import type { ToolCallBinding, ToolExecutionTarget } from "../lib/agent/types";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
@@ -46,7 +49,8 @@ export type BackgroundTaskRecord = typeof backgroundTasks.$inferSelect;
 export type BackgroundTaskEffectiveStatus =
 	| BackgroundTaskRecord["status"]
 	| "continued"
-	| "child_running";
+	| "child_running"
+	| "taken_over";
 
 export interface BackgroundTaskSummary extends BackgroundTaskRecord {
 	effectiveStatus: BackgroundTaskEffectiveStatus;
@@ -78,6 +82,7 @@ export function resolveBackgroundTaskEffectiveStatus(input: {
 	currentNarratorErrorMessage?: string | null;
 	activeChildTaskCount?: number;
 }): BackgroundTaskEffectiveStatus {
+	if (parseSubstatus(input.currentNarratorSubstatus).includes("taken_over")) return "taken_over";
 	if (input.taskStatus === "running") return "running";
 	if (input.currentNarratorStatus === "working" || input.currentNarratorStatus === "waiting") {
 		return "continued";
@@ -450,7 +455,9 @@ class BackgroundTaskService {
 	 */
 	private async broadcastTaskUpsert(parentNarratorId: string, taskId: string): Promise<void> {
 		try {
-			const [item] = await this.listItemsByIds([taskId]);
+			const [unified] = await this.listItemsByIds([taskId]);
+			const item =
+				unified ?? (await this.listLegacyRows(parentNarratorId, { ids: [taskId], limit: 1 }))[0];
 			if (!item) {
 				await this.broadcastListDelta(parentNarratorId, { removeIds: [taskId] });
 				return;
@@ -526,9 +533,22 @@ class BackgroundTaskService {
 		parentNarratorId: string;
 		command: string;
 		toolUseId?: string;
+		/** Exact, already-claimed execution. Omitted by legacy/direct callers. */
+		toolCallBinding?: ToolCallBinding;
+		executionTarget?: ToolExecutionTarget;
 		alias?: string;
 		title?: string;
 	}): Promise<BackgroundTaskRecord> {
+		const binding = opts.toolCallBinding;
+		if (
+			binding !== undefined &&
+			(typeof binding?.toolCallId !== "string" ||
+				!binding.toolCallId ||
+				!Number.isSafeInteger(binding.attempt) ||
+				binding.attempt <= 0)
+		) {
+			throw new ValidationError("Invalid background Bash execution binding");
+		}
 		const now = new Date().toISOString();
 		const row: typeof backgroundTasks.$inferInsert = {
 			id: opts.id,
@@ -537,6 +557,10 @@ class BackgroundTaskService {
 			status: "running",
 			command: opts.command,
 			toolUseId: opts.toolUseId ?? null,
+			// No binding means no v2 execution evidence. Never infer an attempt from
+			// a provider id: it can be reused across messages and narrators.
+			toolCallId: binding?.toolCallId ?? null,
+			executionAttempt: binding?.attempt ?? null,
 			alias: opts.alias ?? null,
 			title: opts.title ?? null,
 			output: null,
@@ -547,7 +571,72 @@ class BackgroundTaskService {
 			createdAt: now,
 			updatedAt: now,
 		};
-		await db.insert(backgroundTasks).values(row);
+		// A short synchronous transaction keeps validation and insertion together.
+		// This records provenance only: it cannot claim/replay a call, prove the
+		// process exited, or authorize writes after cancellation/restart.
+		db.transaction((tx) => {
+			if (binding) {
+				// One primary-key lookup of metadata, never input/output/target-plan JSON.
+				const source = tx
+					.select({
+						narratorId: narratorToolCalls.narratorId,
+						toolName: narratorToolCalls.toolName,
+						toolUseId: narratorToolCalls.toolUseId,
+						status: narratorToolCalls.status,
+						executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
+						executionOriginToolCallId: narratorToolCalls.executionOriginToolCallId,
+						isFileHistoryCheckpoint: narratorToolCalls.isFileHistoryCheckpoint,
+						executionAttempt: narratorToolCalls.executionAttempt,
+						executionStartedAt: narratorToolCalls.executionStartedAt,
+						executionDeviceId: narratorToolCalls.executionDeviceId,
+						executionCwd: narratorToolCalls.executionCwd,
+						executionPathFlavor: narratorToolCalls.executionPathFlavor,
+						runtimeGeneration: narratorToolCalls.runtimeGeneration,
+					})
+					.from(narratorToolCalls)
+					.where(eq(narratorToolCalls.id, binding.toolCallId))
+					.limit(1)
+					.get();
+				if (
+					!source ||
+					source.narratorId !== opts.parentNarratorId ||
+					source.toolName !== BASH_TOOL_NAME ||
+					source.executionIdentityVersion !== 1 ||
+					source.executionOriginToolCallId !== null ||
+					source.isFileHistoryCheckpoint ||
+					source.status !== "running" ||
+					!source.executionStartedAt ||
+					source.executionAttempt !== binding.attempt ||
+					(opts.toolUseId !== undefined && source.toolUseId !== opts.toolUseId)
+				) {
+					throw new ValidationError("Background Bash binding is not an actual running attempt");
+				}
+				const target = opts.executionTarget;
+				if (
+					target &&
+					(source.executionDeviceId !== target.deviceId ||
+						source.executionCwd !== target.cwd ||
+						source.executionPathFlavor !== (target.pathFlavor ?? null) ||
+						source.runtimeGeneration !== (target.runtimeGeneration ?? null) ||
+						target.backendKind !== (target.deviceId === "local" ? "local" : "remote"))
+				) {
+					throw new ValidationError("Background Bash execution target does not match its binding");
+				}
+			}
+			const inserted = tx
+				.insert(backgroundTasks)
+				.values(row)
+				.onConflictDoNothing({
+					target: [backgroundTasks.toolCallId, backgroundTasks.executionAttempt],
+				})
+				.returning({ id: backgroundTasks.id })
+				.get();
+			// Returning an existing task would still let the caller spawn a second
+			// process. The unique actual-attempt constraint must instead fail closed.
+			if (!inserted) {
+				throw new ValidationError("Background Bash task already exists for this execution attempt");
+			}
+		});
 		this.outputChunks.set(opts.id, []);
 		this.parentNarratorCache.set(opts.id, opts.parentNarratorId);
 		// Creation must push a delta: with polling gone, a new task that emits
@@ -1507,7 +1596,12 @@ class BackgroundTaskService {
 			if (!isLive(item.subagentNarratorId ?? item.id)) return item;
 			return {
 				...item,
-				effectiveStatus: item.status === "running" ? "running" : "continued",
+				effectiveStatus:
+					item.effectiveStatus === "taken_over"
+						? "taken_over"
+						: item.status === "running"
+							? "running"
+							: "continued",
 				currentNarratorStatus: "working",
 				canCancelActiveWork: true,
 			};
@@ -1635,7 +1729,8 @@ class BackgroundTaskService {
 	}
 
 	/**
-	 * Legacy background rows: subagents recorded before the unified table existed.
+	 * Narrator fallback: legacy background tasks, foreground children, and resumed
+	 * children whose background projection has already been reaped.
 	 *
 	 * `backgroundResult` is read through `substr` for the same reason `output` is —
 	 * this path used to return the whole column, and a single parent's history came
@@ -1657,13 +1752,16 @@ class BackgroundTaskService {
 			cursor?: BackgroundTaskListCursor;
 			limit: number;
 			activeOnly?: boolean;
+			ids?: string[];
 			/** Skip the preview column entirely; for count-only callers. */
 			omitOutput?: boolean;
 		},
 	): Promise<BackgroundTaskListItem[]> {
 		const conditions = [
 			eq(narrators.parentNarratorId, parentNarratorId),
-			eq(narrators.isBackground, true),
+			// Execution mode is temporary, not membership: user continuations clear
+			// isBackground, and foreground agents never set it in the first place.
+			or(eq(narrators.isBackground, true), like(narrators.variant, "subagent:%")),
 			notExists(
 				db
 					.select({ one: sql`1` })
@@ -1671,7 +1769,15 @@ class BackgroundTaskService {
 					.where(eq(backgroundTasks.id, narrators.id)),
 			),
 		];
-		if (opts.activeOnly) conditions.push(eq(narrators.backgroundStatus, "running"));
+		if (opts.ids) conditions.push(inArray(narrators.id, opts.ids));
+		if (opts.activeOnly)
+			conditions.push(
+				or(
+					eq(narrators.backgroundStatus, "running"),
+					inArray(narrators.status, ["working", "waiting"]),
+					like(narrators.substatus, '%"taken_over"%'),
+				),
+			);
 		const cursorCondition = opts.cursor
 			? listCursorCondition(opts.cursor, narrators.createdAt, narrators.id)
 			: undefined;
@@ -1679,6 +1785,9 @@ class BackgroundTaskService {
 			.select({
 				id: narrators.id,
 				subagentType: narrators.subagentType,
+				substatus: narrators.substatus,
+				errorMessage: narrators.errorMessage,
+				isBackground: narrators.isBackground,
 				backgroundStatus: narrators.backgroundStatus,
 				backgroundResult: opts.omitOutput
 					? sql<string | null>`null`
@@ -1697,37 +1806,49 @@ class BackgroundTaskService {
 			.limit(opts.limit)
 			.all();
 
-		return rows.map((row) => {
-			const status = row.backgroundStatus ?? row.status;
-			const chars = Number(row.backgroundResultChars) || 0;
-			const preview = toListPreview(row.backgroundResult);
-			return {
-				id: row.id,
-				type: "agent" as const,
-				status,
-				effectiveStatus: status,
-				currentNarratorStatus: row.status,
-				activeChildTaskCount: 0,
-				canCancelActiveWork: status === "running",
-				command: null,
-				exitCode: null,
-				toolUseId: null,
-				subagentNarratorId: row.id,
-				subagentType: row.subagentType,
-				alias: null,
-				title: row.title,
-				output: preview.preview,
-				outputBytes: chars,
-				// The legacy path stores whatever the subagent returned, uncapped — so
-				// nothing was lost at write time, only at preview time.
-				outputTruncated: false,
-				outputPreviewTruncated: preview.truncated,
-				startedAt: row.createdAt,
-				completedAt: row.backgroundCompletedAt,
-				createdAt: row.createdAt,
-				legacy: true,
-			};
-		});
+		return this.applyLiveness(
+			rows.map((row) => {
+				const status =
+					row.backgroundStatus ??
+					(row.status === "working" || row.status === "waiting" ? "running" : "completed");
+				const effectiveStatus = resolveBackgroundTaskEffectiveStatus({
+					taskStatus: status as BackgroundTaskRecord["status"],
+					currentNarratorStatus: row.status,
+					currentNarratorIsBackground: row.isBackground,
+					currentNarratorBackgroundStatus: row.backgroundStatus,
+					currentNarratorSubstatus: row.substatus,
+					currentNarratorErrorMessage: row.errorMessage,
+				});
+				const chars = Number(row.backgroundResultChars) || 0;
+				const preview = toListPreview(row.backgroundResult);
+				return {
+					id: row.id,
+					type: "agent" as const,
+					status,
+					effectiveStatus,
+					currentNarratorStatus: row.status,
+					activeChildTaskCount: 0,
+					canCancelActiveWork: status === "running" || effectiveStatus === "continued",
+					command: null,
+					exitCode: null,
+					toolUseId: null,
+					subagentNarratorId: row.id,
+					subagentType: row.subagentType,
+					alias: null,
+					title: row.title,
+					output: preview.preview,
+					outputBytes: chars,
+					// The legacy path stores whatever the subagent returned, uncapped — so
+					// nothing was lost at write time, only at preview time.
+					outputTruncated: false,
+					outputPreviewTruncated: preview.truncated,
+					startedAt: row.createdAt,
+					completedAt: row.backgroundCompletedAt,
+					createdAt: row.createdAt,
+					legacy: true,
+				};
+			}),
+		);
 	}
 
 	private async listUnifiedItems(
@@ -1891,6 +2012,30 @@ class BackgroundTaskService {
 				hasMore && last
 					? encodeBackgroundTaskListCursor({ createdAt: last.createdAt, id: last.id })
 					: null,
+		};
+	}
+
+	/**
+	 * Bounded snapshot for pre-paging clients still open after a server upgrade.
+	 *
+	 * They request the list without limit/cursor and unconditionally map both
+	 * `tasks` and `legacySubagentTasks`. Legacy rows are already normalized into
+	 * `tasks`, so an empty compatibility array prevents a successful HTTP response
+	 * from throwing in their queryFn. They also cannot read `activeTasks` or page
+	 * older history: include the capped active set alongside the first page, not
+	 * the entire history. Keep the cursor from that original page unchanged.
+	 */
+	async listLegacySnapshotByParent(
+		parentNarratorId: string,
+	): Promise<BackgroundTaskListPage & { legacySubagentTasks: never[] }> {
+		const page = await this.listPageByParent(parentNarratorId);
+		const byId = new Map(page.tasks.map((task) => [task.id, task]));
+		// The active read is fresher and wins if a row appears in both sets.
+		for (const task of page.activeTasks ?? []) byId.set(task.id, task);
+		return {
+			...page,
+			tasks: [...byId.values()].sort(compareBackgroundTaskListItemsDesc),
+			legacySubagentTasks: [],
 		};
 	}
 
@@ -2545,7 +2690,11 @@ class BackgroundTaskService {
 		const cutoff = new Date(Date.now() - olderThanMs).toISOString();
 		// Count first, then delete — Drizzle's delete() returns void for SQLite
 		const rows = await db
-			.select({ id: backgroundTasks.id, parentNarratorId: backgroundTasks.parentNarratorId })
+			.select({
+				id: backgroundTasks.id,
+				parentNarratorId: backgroundTasks.parentNarratorId,
+				type: backgroundTasks.type,
+			})
 			.from(backgroundTasks)
 			.where(
 				and(
@@ -2556,6 +2705,26 @@ class BackgroundTaskService {
 					// resume with no task card anywhere.
 					notInArray(backgroundTasks.status, ["running", "paused"]),
 					lt(backgroundTasks.completedAt, cutoff),
+					// A takeover temporarily cancels the projection, not the work. Keep
+					// it while the child is held/running so its finalizer retains a row.
+					notExists(
+						db
+							.select({ one: sql`1` })
+							.from(narrators)
+							.where(
+								and(
+									eq(
+										narrators.id,
+										sql`coalesce(${backgroundTasks.subagentNarratorId}, ${backgroundTasks.id})`,
+									),
+									or(
+										inArray(narrators.status, ["working", "waiting"]),
+										like(narrators.substatus, '%"taken_over"%'),
+										like(narrators.substatus, '%"manual_override"%'),
+									),
+								),
+							),
+					),
 				),
 			)
 			.all();
@@ -2564,15 +2733,33 @@ class BackgroundTaskService {
 		if (deletable.length === 0) return 0;
 
 		const deletableIds = deletable.map((row) => row.id);
-		await db
-			.delete(backgroundTasks)
-			.where(
-				and(
-					inArray(backgroundTasks.id, deletableIds),
-					notInArray(backgroundTasks.status, ["running", "paused"]),
-					lt(backgroundTasks.completedAt, cutoff),
+		await db.delete(backgroundTasks).where(
+			and(
+				inArray(backgroundTasks.id, deletableIds),
+				notInArray(backgroundTasks.status, ["running", "paused"]),
+				lt(backgroundTasks.completedAt, cutoff),
+				// A takeover temporarily cancels the projection, not the work. Keep
+				// it while the child is held/running so its finalizer retains a row.
+				notExists(
+					db
+						.select({ one: sql`1` })
+						.from(narrators)
+						.where(
+							and(
+								eq(
+									narrators.id,
+									sql`coalesce(${backgroundTasks.subagentNarratorId}, ${backgroundTasks.id})`,
+								),
+								or(
+									inArray(narrators.status, ["working", "waiting"]),
+									like(narrators.substatus, '%"taken_over"%'),
+									like(narrators.substatus, '%"manual_override"%'),
+								),
+							),
+						),
 				),
-			);
+			),
+		);
 
 		for (const taskId of deletableIds) {
 			this.cleanupRuntime(taskId);
@@ -2587,10 +2774,15 @@ class BackgroundTaskService {
 			if (ids) ids.push(row.id);
 			else byParent.set(row.parentNarratorId, [row.id]);
 		}
+		const fallbackParents = new Set(
+			deletable.filter((row) => row.type === "agent").map((row) => row.parentNarratorId),
+		);
 		for (const [parentNarratorId, ids] of byParent) {
 			void this.broadcastListDelta(
 				parentNarratorId,
-				ids.length > BACKGROUND_TASK_DELTA_MAX_REMOVE_IDS
+				// Reaped agents still have a narrator fallback; do not tell the client
+				// to remove an item that the next page query will return again.
+				fallbackParents.has(parentNarratorId) || ids.length > BACKGROUND_TASK_DELTA_MAX_REMOVE_IDS
 					? { invalidate: true }
 					: { removeIds: ids },
 			).catch(() => {});

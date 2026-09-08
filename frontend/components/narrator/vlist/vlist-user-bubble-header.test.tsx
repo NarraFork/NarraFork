@@ -15,20 +15,25 @@
 
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { I18nextProvider } from "react-i18next";
 import type { VListElementKind } from "./registry";
 import type { RenderExtra } from "./render-registry";
 
-const realReactI18nextModule = { ...(await import("react-i18next")) };
 const realUsePlatformModule = { ...(await import("@frontend/hooks/usePlatform")) };
 
 // i18n returns raw keys so the fallback username assertion is label-stable.
-mock.module("react-i18next", () => ({
-	...realReactI18nextModule,
-	useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en" } }),
-}));
+const testI18n = i18next.createInstance();
+await testI18n.init({
+	lng: "en",
+	fallbackLng: "en",
+	resources: { en: { narrator: {}, common: {} } },
+	defaultNS: "narrator",
+	react: { useSuspense: false },
+});
 // UserAvatar's blob-url hook queries the upload capability; keep it offline.
 mock.module("@frontend/hooks/usePlatform", () => ({
 	...realUsePlatformModule,
@@ -228,7 +233,11 @@ function renderHeader(extra: RenderExtra): string {
 	const root = createRoot(currentContainer);
 	currentRoot = root;
 	act(() => {
-		root.render(<MantineProvider>{extra.header as React.ReactNode}</MantineProvider>);
+		root.render(
+			<I18nextProvider i18n={testI18n}>
+				<MantineProvider>{extra.header as React.ReactNode}</MantineProvider>
+			</I18nextProvider>,
+		);
 	});
 	const headerRow = currentContainer.querySelector('[class*="mantine-Group-root"]');
 	if (!headerRow) throw new Error("expected the header Group row to render");

@@ -1,257 +1,350 @@
-/**
- * attribution-label.test.ts — "who changed this file" must name real writers.
- *
- * The bug this guards: the panel used to resolve narrator ids against the CHAPTER's
- * primary narrator list, so every subagent write and every write from a standalone
- * or other-chapter session rendered as "Unknown" — the common case in a shared
- * worktree, not an edge case. Labels now come from the resolved actor, and these
- * tests pin the phrasing decisions rather than the lookup mechanism.
- */
 import { describe, expect, test } from "bun:test";
-import type { AttributionActor, FileModificationGroup } from "@frontend/hooks/useGit";
-import { buildAttributionBadge, buildAttributionLabels } from "./attribution-label";
+import type {
+	AttributionActor,
+	CurrentDiffTarget,
+	FileModificationGroup,
+} from "@frontend/hooks/useGit";
+import {
+	buildAttributionBadge,
+	buildAttributionLabels,
+	buildCurrentAttributionBadge,
+} from "./attribution-label";
 
-/** Stand-in for i18n: renders "key(param=value,...)" so assertions stay readable. */
 const t = (key: string, opts?: Record<string, unknown>): string => {
 	if (!opts || Object.keys(opts).length === 0) return key;
-	const params = Object.entries(opts)
+	return `${key}(${Object.entries(opts)
 		.map(([k, v]) => `${k}=${String(v)}`)
-		.join(",");
-	return `${key}(${params})`;
+		.join(",")})`;
 };
 
 function actor(overrides: Partial<AttributionActor> = {}): AttributionActor {
 	return {
+		kind: "primary",
 		narratorId: "n1",
+		userId: null,
 		title: "Refactor auth",
 		subagentType: null,
 		parentTitle: null,
 		exists: true,
+		deleted: false,
+		identityKnown: true,
+		...overrides,
+	};
+}
+const EXTERNAL_ACTOR = actor({
+	kind: "external_unknown",
+	narratorId: null,
+	title: null,
+	exists: false,
+	identityKnown: false,
+});
+const UNKNOWN_NARRATOR = actor({
+	kind: "narrator_unknown",
+	narratorId: null,
+	title: null,
+	exists: false,
+	deleted: null,
+	identityKnown: false,
+});
+
+function group(overrides: Partial<FileModificationGroup> = {}): FileModificationGroup {
+	const lastActor = overrides.lastActor ?? EXTERNAL_ACTOR;
+	const actors = overrides.actors ?? [lastActor];
+	return {
+		filePath: "src/one.ts",
+		changeCount: 1,
+		lastChangedAt: "2026-01-01T00:00:00.000Z",
+		lastAction: "external",
+		lastActor,
+		actors,
+		hasExternalChange: false,
+		hasImpreciseAttribution: true,
+		hasDeletedActor: false,
+		completeness: {
+			fileHistoryComplete: true,
+			contributorsTruncated: false,
+			countsLowerBound: actors.some((actor) => !actor.identityKnown),
+			warningScanComplete: actors.every((actor) => actor.deleted !== null),
+			asOfRevision: null,
+		},
+		evidence: "legacy",
+		attributionGrade: "observed_ambiguous",
 		...overrides,
 	};
 }
 
 describe("buildAttributionLabels", () => {
 	test("names a primary narrator by its title", () => {
-		const labels = buildAttributionLabels(actor(), t);
-		expect(labels.short).toBe("Refactor auth");
-		// Nothing more to add for a plain narrator, so the tooltip must not invent a
-		// parenthetical that the badge lacks.
-		expect(labels.detail).toBe("Refactor auth");
+		expect(buildAttributionLabels(actor(), t)).toEqual({
+			short: "Refactor auth",
+			detail: "Refactor auth",
+		});
 	});
-
-	test("a subagent is named, not reported as unknown", () => {
-		const labels = buildAttributionLabels(
-			actor({ title: "Implement OAuth fix", subagentType: "general" }),
-			t,
-		);
-		expect(labels.short).toBe("Implement OAuth fix");
-		expect(labels.detail).toBe("attributionSubagentDetail(name=Implement OAuth fix,type=general)");
-		expect(labels.detail).not.toContain("attributionUnknown");
+	test("retains a subagent's type and parent", () => {
+		expect(
+			buildAttributionLabels(
+				actor({
+					kind: "subagent",
+					title: "Trace edges",
+					subagentType: "explore",
+					parentTitle: "Graph rewrite",
+				}),
+				t,
+			),
+		).toEqual({
+			short: "Trace edges",
+			detail:
+				"attributionSubagentDetailWithParent(name=Trace edges,type=explore,parent=Graph rewrite)",
+		});
 	});
-
-	test("a subagent's detail credits the spawning session when known", () => {
-		const labels = buildAttributionLabels(
-			actor({ title: "Trace edges", subagentType: "explore", parentTitle: "Graph rewrite" }),
-			t,
-		);
-		expect(labels.detail).toBe(
-			"attributionSubagentDetailWithParent(name=Trace edges,type=explore,parent=Graph rewrite)",
-		);
-	});
-
-	test("an untitled subagent falls back to its type, not the generic session label", () => {
-		const labels = buildAttributionLabels(actor({ title: null, subagentType: "review" }), t);
-		expect(labels.short).toBe("attributionSubagentUnnamed(type=review)");
-		expect(labels.short).not.toBe("attributionUnnamed");
-	});
-
-	test("a blank title is treated as absent", () => {
+	test("untitled sessions and subagents have truthful fallbacks", () => {
 		expect(buildAttributionLabels(actor({ title: "   " }), t).short).toBe("attributionUnnamed");
+		expect(
+			buildAttributionLabels(actor({ kind: "subagent", title: null, subagentType: "review" }), t)
+				.short,
+		).toBe("attributionSubagentUnnamed(type=review)");
 	});
-
-	test("a deleted session is reported as deleted rather than unknown", () => {
-		// The distinction is actionable: "deleted" means there is no session to open,
-		// while "unknown" would send the user looking for one.
+	test("a known deleted session is not relabelled external and keeps its subtype", () => {
 		const labels = buildAttributionLabels(
-			actor({ title: null, exists: false, subagentType: "general" }),
+			actor({
+				kind: "subagent",
+				exists: false,
+				deleted: true,
+				title: "Do not reuse",
+				subagentType: "general",
+			}),
 			t,
 		);
 		expect(labels.short).toBe("attributionDeletedSession");
-		expect(labels.detail).toBe("attributionDeletedSession");
+		expect(labels.detail).toBe(
+			"attributionSubagentDetail(name=attributionDeletedSession,type=general)",
+		);
+		expect(labels.detail).not.toContain("Do not reuse");
 	});
-
-	test("no actor means external when the change came from outside the tool path", () => {
-		expect(buildAttributionLabels(null, t, { external: true }).short).toBe("attributionExternal");
+	test("human usernames are labelled as users, not narrator sessions", () => {
+		expect(
+			buildAttributionLabels(
+				actor({ kind: "human", narratorId: null, userId: "u1", title: "Alice" }),
+				t,
+			).short,
+		).toBe("attributionHuman(name=Alice)");
 	});
-
-	test("no actor and no external evidence stays unknown", () => {
+	test("deleted and unknown human identities never get fabricated names", () => {
+		const human = actor({
+			kind: "human",
+			narratorId: null,
+			userId: null,
+			exists: false,
+			title: "Do not reuse",
+			identityKnown: false,
+			deleted: null,
+		});
+		expect(buildAttributionLabels(human, t).short).toBe("attributionUnknownUser");
+		expect(buildAttributionLabels({ ...human, deleted: true }, t).short).toBe(
+			"attributionDeletedUser",
+		);
+	});
+	test("an id-less legacy tool subject is explicitly unknown, rather than assumed primary or external", () => {
+		expect(buildAttributionLabels(UNKNOWN_NARRATOR, t).short).toBe("attributionUnknownSession");
+		expect(buildAttributionLabels(EXTERNAL_ACTOR, t).short).toBe("attributionExternal");
 		expect(buildAttributionLabels(undefined, t).short).toBe("attributionUnknown");
-	});
-
-	test("an id-less row from a deleted session is labelled deleted, not unknown", () => {
-		// The FK is ON DELETE SET NULL, so the row loses its id entirely; the caller
-		// signals the cause because the row alone cannot.
-		expect(buildAttributionLabels(null, t, { deleted: true }).short).toBe(
-			"attributionDeletedSession",
-		);
-	});
-
-	test("external wins over deleted when both were recorded", () => {
-		// External is the one the user can still investigate.
-		expect(buildAttributionLabels(null, t, { external: true, deleted: true }).short).toBe(
-			"attributionExternal",
-		);
-	});
-
-	test("an actor with a null narratorId is treated as having no session", () => {
-		// The server sends this shape for an external change rather than omitting the
-		// actor, so the label must not present it as a named session.
-		const labels = buildAttributionLabels(actor({ narratorId: null, title: null }), t);
-		expect(labels.short).toBe("attributionUnnamed");
 	});
 });
 
-const EXTERNAL_ACTOR: AttributionActor = {
-	narratorId: null,
-	title: null,
-	subagentType: null,
-	parentTitle: null,
-	exists: false,
-};
+describe("buildAttributionBadge", () => {
+	test("a lone external observation is not counted twice", () => {
+		const badge = buildAttributionBadge(group({ hasExternalChange: true }), t);
+		expect(badge.label).toBe("attributionExternal");
+		expect(badge.extraCount).toBe(0);
+		expect(badge.extraCountIsLowerBound).toBe(true);
+	});
+	test("known deleted lastActor is not re-listed as another contributor", () => {
+		const deleted = actor({ narratorId: "gone", exists: false, title: null, deleted: true });
+		const badge = buildAttributionBadge(
+			group({ lastActor: deleted, actors: [deleted], hasDeletedActor: true }),
+			t,
+		);
+		expect(badge.label).toBe("attributionDeletedSession");
+		expect(badge.extraCount).toBe(0);
+		expect(
+			badge.tooltipLines.filter((line) => line.includes("attributionAlsoModified")),
+		).toHaveLength(0);
+	});
+	test("latest deleted/unknown narrator wins over older external events, regardless of flags", () => {
+		const badge = buildAttributionBadge(
+			group({
+				lastActor: UNKNOWN_NARRATOR,
+				lastAction: "edit",
+				actors: [UNKNOWN_NARRATOR, EXTERNAL_ACTOR],
+				hasExternalChange: true,
+				hasDeletedActor: true,
+			}),
+			t,
+		);
+		expect(badge.label).toBe("attributionUnknownSession");
+		expect(badge.tooltipLines[0]).toBe("attributionLastModified(name=attributionUnknownSession)");
+		expect(badge.tooltipLines).toContain("attributionLastAction(action=attributionAction.edit)");
+		expect(badge.tooltipLines).toContain("attributionAlsoModified(name=attributionExternal)");
+	});
+	test("latest external event is not replaced by a historical deleted session", () => {
+		const deleted = actor({ exists: false, deleted: true, title: null });
+		const badge = buildAttributionBadge(
+			group({
+				lastActor: EXTERNAL_ACTOR,
+				actors: [EXTERNAL_ACTOR, deleted],
+				hasExternalChange: true,
+				hasDeletedActor: true,
+			}),
+			t,
+		);
+		expect(badge.label).toBe("attributionExternal");
+		expect(badge.tooltipLines).toContain("attributionAlsoModified(name=attributionDeletedSession)");
+		// An anonymous external subject could be the same person: no invented extra count.
+		expect(badge.extraCount).toBe(0);
+	});
+	test("group flags do not invent extra participants", () => {
+		const badge = buildAttributionBadge(
+			group({
+				lastActor: actor(),
+				actors: [actor()],
+				hasExternalChange: true,
+				hasDeletedActor: true,
+			}),
+			t,
+		);
+		expect(badge.extraCount).toBe(0);
+		expect(badge.label).toBe("Refactor auth");
+	});
+	test("counts other identified narrators without counting the displayed one", () => {
+		const last = actor();
+		const second = actor({ narratorId: "n2", title: "Fix tests" });
+		const third = actor({
+			narratorId: "n3",
+			title: "Docs",
+			kind: "subagent",
+			subagentType: "general",
+		});
+		const badge = buildAttributionBadge(
+			group({ lastActor: last, actors: [last, second, third, second] }),
+			t,
+		);
+		expect(badge.extraCount).toBe(2);
+		expect(badge.hasNarrator).toBe(true);
+		expect(badge.tooltipLines).toContain("attributionAlsoModified(name=Fix tests)");
+	});
+	test("two users with null narratorIds remain two separate identified subjects", () => {
+		const alice = actor({ kind: "human", narratorId: null, userId: "u1", title: "Alice" });
+		const bob = actor({ kind: "human", narratorId: null, userId: "u2", title: "Bob" });
+		const badge = buildAttributionBadge(
+			group({ lastActor: bob, lastAction: "human", actors: [bob, alice] }),
+			t,
+		);
+		expect(badge.label).toBe("attributionHuman(name=Bob)");
+		expect(badge.extraCount).toBe(1);
+		expect(badge.hasNarrator).toBe(false);
+		expect(badge.tooltipLines).toContain(
+			"attributionAlsoModified(name=attributionHuman(name=Alice))",
+		);
+	});
+	test("truncated history discloses lower-bound counts and unknown absent flags", () => {
+		const last = actor();
+		const badge = buildAttributionBadge(
+			group({
+				lastActor: last,
+				actors: [last],
+				hasExternalChange: null,
+				hasDeletedActor: null,
+				completeness: {
+					fileHistoryComplete: false,
+					contributorsTruncated: true,
+					countsLowerBound: true,
+					warningScanComplete: false,
+					asOfRevision: null,
+				},
+			}),
+			t,
+		);
+		expect(badge.incomplete).toBe(true);
+		expect(badge.extraCountIsLowerBound).toBe(true);
+		expect(badge.tooltipLines).toContain("attributionHistoryTruncated");
+		expect(badge.tooltipLines).toContain("attributionCountsLowerBound");
+		expect(badge.tooltipLines).toContain("attributionFlagsUnknown");
+	});
+	test("even complete Write/Edit history is legacy observation, never current ownership", () => {
+		const badge = buildAttributionBadge(group({ lastActor: actor(), lastAction: "write" }), t);
+		expect(badge.incomplete).toBe(false);
+		expect(badge.tooltipLines).toContain("attributionHistoryComplete");
+		expect(badge.tooltipLines).toContain("attributionLegacyObserved");
+		expect(badge.tooltipLines).toContain("attributionNotCurrentOwnership");
+	});
+});
 
-function group(overrides: Partial<FileModificationGroup> = {}): FileModificationGroup {
+function current(overrides: Partial<CurrentDiffTarget> = {}): CurrentDiffTarget {
 	return {
-		filePath: "src/one.ts",
-		changeCount: 1,
-		lastChangedAt: "2026-01-01T00:00:00.000Z",
-		lastActor: EXTERNAL_ACTOR,
-		actors: [EXTERNAL_ACTOR],
-		hasExternalChange: false,
-		hasImpreciseAttribution: false,
-		hasDeletedActor: false,
+		source: "current_diff",
+		target: "worktree",
+		status: "matching_evidence",
+		actor: actor(),
+		effectId: "effect-1",
+		reason: null,
+		baselineVersion: "a".repeat(64),
+		historyComplete: true,
+		modeScope: "filesystem",
+		continuity: "unverified",
 		...overrides,
 	};
 }
 
-/**
- * The count as it was computed before the caption and the count shared a decision.
- *
- * Kept here so these tests demonstrably fail against the old behaviour rather than
- * merely passing against the new one: each case below asserts what this formula got
- * wrong alongside what the current one gets right.
- */
-function legacyExtraCount(attribution: FileModificationGroup): number {
-	const lastActor = attribution.lastActor;
-	const hasNarratorId = !!lastActor?.narratorId;
-	const others = attribution.actors.filter(
-		(candidate) => candidate.narratorId && candidate.narratorId !== lastActor?.narratorId,
-	);
-	return (
-		others.length +
-		(attribution.hasExternalChange ? 1 : 0) +
-		(attribution.hasDeletedActor && hasNarratorId ? 1 : 0)
-	);
-}
-
-describe("buildAttributionBadge", () => {
-	test("a lone external contributor is counted once, not twice", () => {
-		const attribution = group({ hasExternalChange: true });
-		const badge = buildAttributionBadge(attribution, t);
-
-		expect(badge.label).toBe("attributionExternal");
-		// The caption IS the external contributor, so there is nothing left to add.
-		expect(badge.extraCount).toBe(0);
-		// Pin the regression: the old formula claimed a second contributor.
-		expect(legacyExtraCount(attribution)).toBe(1);
+describe("current target attribution labels", () => {
+	test("matching evidence names one actor but never counts historical participants as owners", () => {
+		const old = actor({ narratorId: "old", title: "Historic" });
+		const badge = buildCurrentAttributionBadge(
+			current(),
+			group({ lastActor: old, actors: [old, actor()] }),
+			t,
+		);
+		expect(badge?.label).toBe("attributionEvidenceBadge(name=Refactor auth)");
+		expect(badge?.extraCount).toBe(0);
+		expect(badge?.tooltipLines).toContain("attributionHistorySection");
+		expect(badge?.tooltipLines).toContain("attributionContinuityUnknown");
+		expect(badge?.tooltipLines).toContain("attributionBaselineVersion(version=aaaaaaaaaaaa)");
 	});
-
-	test("a lone deleted session is counted once, not twice", () => {
-		const attribution = group({ hasDeletedActor: true });
-		const badge = buildAttributionBadge(attribution, t);
-
-		expect(badge.label).toBe("attributionDeletedSession");
-		expect(badge.extraCount).toBe(0);
-		expect(badge.tooltipLines).toEqual(["attributionLastModified(name=attributionDeletedSession)"]);
+	test("unknown or missing current data cannot fall back to a historical actor", () => {
+		for (const target of [
+			undefined,
+			current({ status: "unknown", actor: null, reason: "state_mismatch" }),
+		]) {
+			const badge = buildCurrentAttributionBadge(target, group({ lastActor: actor() }), t);
+			expect(badge?.label).toBe("attributionCurrentUnknownBadge");
+			expect(badge?.incomplete).toBe(true);
+		}
 	});
-
-	test("a deleted lastActor is not re-listed as somebody else", () => {
-		// `exists: false` with an id is the same deleted session, seen from a row that
-		// kept the id. The tooltip used to name it, then add "also modified by" ABOUT IT.
-		const deleted = actor({ narratorId: "gone", title: null, exists: false });
-		const attribution = group({
-			lastActor: deleted,
-			actors: [deleted],
-			hasDeletedActor: true,
+	test("clean target suppresses all attribution even with a populated history", () => {
+		expect(
+			buildCurrentAttributionBadge(current({ status: "clean", actor: null }), group(), t),
+		).toBeNull();
+	});
+	test("human and deleted types survive current labels and index mode is explicit", () => {
+		const deleted = actor({
+			kind: "human",
+			narratorId: null,
+			userId: "gone",
+			exists: false,
+			deleted: true,
+			title: null,
 		});
-		const badge = buildAttributionBadge(attribution, t);
-
-		expect(badge.label).toBe("attributionDeletedSession");
-		expect(badge.extraCount).toBe(0);
-		expect(badge.tooltipLines).toEqual(["attributionLastModified(name=attributionDeletedSession)"]);
-		expect(legacyExtraCount(attribution)).toBe(1);
-	});
-
-	test("external and deleted together: the caption's class is the one subtracted", () => {
-		// The label builder picks external here, so the count must keep deleted and drop
-		// external. Getting this backwards is the subtle failure: the total stays 1 while
-		// naming the wrong leftover.
-		const attribution = group({ hasExternalChange: true, hasDeletedActor: true });
-		const badge = buildAttributionBadge(attribution, t);
-
-		expect(badge.label).toBe("attributionExternal");
-		expect(badge.extraCount).toBe(1);
-		expect(badge.tooltipLines).toEqual([
-			"attributionLastModified(name=attributionExternal)",
-			"attributionAlsoModified(name=attributionDeletedSession)",
-		]);
-		// Not the external line: the caption already says external.
-		expect(badge.tooltipLines).not.toContain("attributionHasExternal");
-	});
-
-	test("narrator contributors are counted except the one named", () => {
-		const last = actor({ narratorId: "n1", title: "Refactor auth" });
-		const second = actor({ narratorId: "n2", title: "Fix tests" });
-		const third = actor({ narratorId: "n3", title: "Docs", subagentType: "general" });
-		const badge = buildAttributionBadge(
-			group({ lastActor: last, actors: [last, second, third], changeCount: 3 }),
+		const badge = buildCurrentAttributionBadge(
+			current({ target: "index", modeScope: "git_executable_bit", actor: deleted }),
+			undefined,
 			t,
 		);
-
-		expect(badge.label).toBe("Refactor auth");
-		expect(badge.extraCount).toBe(2);
-		expect(badge.hasNarrator).toBe(true);
-		expect(badge.tooltipLines).toEqual([
-			"attributionLastModified(name=Refactor auth)",
-			"attributionAlsoModified(name=Fix tests)",
-			"attributionAlsoModified(name=attributionSubagentDetail(name=Docs,type=general))",
-		]);
+		expect(badge?.label).toBe("attributionEvidenceBadge(name=attributionDeletedUser)");
+		expect(badge?.tooltipLines).toContain("attributionIndexMode");
+		expect(badge?.hasNarrator).toBe(false);
 	});
-
-	test("an external change beside a named narrator is genuinely extra", () => {
-		// The complement: the caption names a session, so the external flag adds
-		// information and must be counted. This is the case the old formula got right,
-		// and it must keep working after the fix.
-		const last = actor();
-		const badge = buildAttributionBadge(
-			group({ lastActor: last, actors: [last], hasExternalChange: true }),
-			t,
-		);
-
-		expect(badge.extraCount).toBe(1);
-		expect(badge.tooltipLines).toContain("attributionHasExternal");
-	});
-
-	test("imprecise attribution is disclosed last, without inflating the count", () => {
-		// A shell command's write set is a guess, which is a caveat about the answer
-		// rather than an additional contributor.
-		const last = actor();
-		const badge = buildAttributionBadge(
-			group({ lastActor: last, actors: [last], hasImpreciseAttribution: true }),
-			t,
-		);
-
-		expect(badge.extraCount).toBe(0);
-		expect(badge.tooltipLines.at(-1)).toBe("attributionImprecise");
+	test("a v2 historical group is not mislabeled legacy or promoted to current ownership", () => {
+		const badge = buildAttributionBadge(group({ evidence: "v2", lastActor: actor() }), t);
+		expect(badge.tooltipLines).toContain("attributionRecordedEvidence");
+		expect(badge.tooltipLines).not.toContain("attributionLegacyObserved");
 	});
 });

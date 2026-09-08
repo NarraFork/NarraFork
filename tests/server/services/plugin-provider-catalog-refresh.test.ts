@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { eventBus, type NarraForkEvent } from "@server/lib/event-bus";
 import { PluginProviderCatalogRefresher } from "@server/services/plugin-provider-catalog-refresh";
 import {
 	PluginProviderClientPool,
@@ -141,6 +142,43 @@ describe("plugin provider catalog refresh", () => {
 		expect(entry?.catalogStale).toBe(false);
 		expect(entry?.getModel("cat/a")?.displayName).toBe("CAT/A");
 		expect(log.activations).toBe(1);
+	});
+
+	test("publishes a bounded invalidation only after the complete catalog is available", async () => {
+		const options: FakePluginOptions = {
+			pages: [{ models: [model("cat/a")], nextCursor: "next" }, { models: [model("cat/b")] }],
+		};
+		const { registry, refresher } = harness(options);
+		const seen: Array<{ event: NarraForkEvent; models: string[] }> = [];
+		const onChanged = (event: NarraForkEvent) => {
+			seen.push({
+				event,
+				models:
+					registry
+						.get(`${pluginId}/cat`)
+						?.getModels()
+						.map((item) => item.id) ?? [],
+			});
+		};
+		eventBus.on("plugin:provider_models_changed", onChanged);
+		try {
+			await refresher.refresh(`${pluginId}/cat`);
+			expect(seen).toEqual([
+				{
+					event: {
+						type: "plugin:provider_models_changed",
+						pluginId,
+						providerInstanceId: `${pluginId}/cat`,
+					},
+					models: ["cat/a", "cat/b"],
+				},
+			]);
+			options.failListModels = "unreachable";
+			await refresher.refresh(`${pluginId}/cat`);
+			expect(seen).toHaveLength(1); // Failed discovery is not advertised as a new catalog.
+		} finally {
+			eventBus.off("plugin:provider_models_changed", onChanged);
+		}
 	});
 
 	test("forwards the stored provider config so credentialed discovery works", async () => {

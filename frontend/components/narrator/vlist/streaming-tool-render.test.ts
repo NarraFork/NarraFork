@@ -17,6 +17,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import type { MeasuredToolCall } from "./measure/measure-tool-call";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -222,13 +223,11 @@ describe("a determinate progress bar reaches the card", () => {
 
 	/** The progress descriptor the measure layer put on a reserved fixed block. */
 	function barOf(built: ReturnType<Mod["buildPretextDocumentLayout"]>) {
-		const measured = toolRow(built)?.measured as
-			| { detail?: { blocks?: Array<{ kind: string; tag?: string; data?: unknown }> } }
-			| undefined;
-		const found = measured?.detail?.blocks?.find(
-			(b) => b.kind === "fixed" && b.tag === "detail-meta-progress",
-		);
-		const data = found?.data as
+		const measured = toolRow(built)?.measured as MeasuredToolCall | undefined;
+		const found = measured?.detail?.sections
+			.flatMap((section) => section.measuredBody.blocks)
+			.find((block) => block.kind === "fixed" && block.tag === "detail-meta-progress");
+		const data = (found?.kind === "fixed" ? found.data : undefined) as
 			| { progress?: { ratio: number | null; percent?: number } }
 			| undefined;
 		return data?.progress ?? null;

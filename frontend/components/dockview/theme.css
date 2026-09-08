@@ -8,6 +8,15 @@
  * color scheme switching stays consistent with the rest of the app.
  */
 
+/* Keep native drop targets alive; only replace their visual indicator.
+ * Dockview defaults to an in-place dropzone; absolute mounting uses a container.
+ * Both must be hidden while our own preview is active, not only the latter.
+ */
+.narrafork-native-drop-preview .dv-drop-target-dropzone,
+.narrafork-native-drop-preview .dv-drop-target-container {
+	opacity: 0;
+}
+
 .dockview-theme-narrafork {
 	/* Core surfaces */
 	--dv-group-view-background-color: var(--mantine-color-body);

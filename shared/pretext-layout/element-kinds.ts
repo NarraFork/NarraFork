@@ -7,6 +7,8 @@ export type VListElementKind =
 	 * Distinct from `message-bubble` (plain-text body) and `markdown` (unframed).
 	 */
 	| "injection-bubble"
+	/** Outgoing Send / TeamStatus messages, never folded into tool activity traces. */
+	| "communication-bubble"
 	| "markdown"
 	| "reasoning"
 	| "media"

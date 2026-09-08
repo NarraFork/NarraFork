@@ -95,7 +95,9 @@ export function VListContentViewModal({
 	const notice =
 		target.truncated === true && loadingFullPayload === true
 			? tNarrator("truncatedLoadingBody")
-			: t("contentViewerTruncated");
+			: target.truncated
+				? tNarrator("contentSourceIncomplete")
+				: t("contentViewerTruncated");
 	const bodyText = incomplete ? `${clamped.text}\n\n${notice}` : clamped.text;
 
 	// Browser-native landscape: fullscreen the modal shell + lock the orientation.
@@ -176,7 +178,7 @@ export function VListContentViewModal({
 				content: SAFE_AREA_FULLSCREEN_MODAL_CONTENT_STYLE,
 				header: SAFE_AREA_FULLSCREEN_MODAL_HEADER_STYLE,
 				body: {
-					overflow: "auto",
+					overflow: "hidden",
 					padding: isMobile ? 8 : undefined,
 					display: "flex",
 					flexDirection: "column",

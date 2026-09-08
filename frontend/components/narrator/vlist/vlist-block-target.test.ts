@@ -57,6 +57,17 @@ describe("resolveVListBlockTarget", () => {
 		});
 	});
 
+	it("maps communication bubbles to the original tool interaction identity", () => {
+		expect(target("communication-bubble", "tool-send_1")).toEqual({
+			blockId: "tc-send_1",
+			messageId: MSG,
+			blockIndex: -1,
+		});
+		expect(toolUseIdFromBlockId(target("communication-bubble", "tool-send_1")?.blockId ?? "")).toBe(
+			"send_1",
+		);
+	});
+
 	it("maps subagent-card to sa-{toolUseId}", () => {
 		expect(target("subagent-card", "tool-tu_999")).toEqual({
 			blockId: "sa-tu_999",

@@ -321,6 +321,7 @@ export function getSummary(
 	toolName: string,
 	input: unknown,
 	metadata?: Record<string, unknown>,
+	labels?: Record<string, string>,
 ): string {
 	if (
 		typeof input === "object" &&
@@ -416,12 +417,17 @@ export function getSummary(
 		case "send": {
 			const targets = getSendTargetLabels(input).map((target) => formatAgentIdForDisplay(target));
 			const targetLabel = targets.length === 1 ? targets[0] : `${targets.length} targets`;
-			const flags: string[] = [];
-			if (!isTruncated(input) && typeof input === "object" && input) {
-				const obj = input as Record<string, unknown>;
-				if (obj.doInterrupt) flags.push("interrupt");
-				if (obj.await) flags.push("await");
-			}
+			const obj =
+				!isTruncated(input) && typeof input === "object" && input
+					? (input as Record<string, unknown>)
+					: undefined;
+			const isAwait = typeof obj?.await === "boolean" ? obj.await : metadata?.await === true;
+			const flags = [
+				isAwait
+					? (labels?.sendAwaitReply ?? "Wait for reply")
+					: (labels?.sendNoAwaitReply ?? "Do not wait for reply"),
+			];
+			if (obj?.doInterrupt || metadata?.doInterrupt) flags.push("interrupt");
 			const base = `to ${targetLabel || "subagent"}`;
 			return flags.length > 0 ? `${base} · ${flags.join(" · ")}` : base;
 		}

@@ -27,6 +27,7 @@
 
 import { extractField, isTruncated, resolveDisplayText } from "@shared/pretext-layout/tool-detail";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
+import { runningSendTargetNarratorId } from "../trace-row-identity";
 
 /** Tools whose input carries a file path worth offering in the menu. */
 const FILE_TOOLS = new Set(["Read", "Write", "Edit"]);
@@ -167,9 +168,13 @@ function isReservedSendSelector(value: unknown): boolean {
 export function deriveSendTargetNarratorId(
 	toolName: string | undefined,
 	metadata: Record<string, unknown>,
+	input?: unknown,
+	resolved?: unknown,
 ): string | undefined {
-	if (toolName !== "Send") return undefined;
+	const isTeamSend = toolName === "TeamStatus" && asRecord(input).action === "send";
+	if (toolName !== "Send" && !isTeamSend) return undefined;
 	const targets = metadata.targets;
+	if (targets === undefined) return runningSendTargetNarratorId(input, resolved);
 	if (!Array.isArray(targets) || targets.length !== 1) return undefined;
 	const target = asRecord(targets[0]);
 	if (isReservedSendSelector(target.label)) return undefined;
@@ -222,7 +227,12 @@ export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 		const awaitNarratorId = deriveAwaitAgentNarratorId(block, metadata);
 		if (awaitNarratorId) meta.awaitAgentNarratorId = awaitNarratorId;
 	}
-	const sendTargetNarratorId = deriveSendTargetNarratorId(toolName, metadata);
+	const sendTargetNarratorId = deriveSendTargetNarratorId(
+		toolName,
+		metadata,
+		input,
+		(record.output ?? record.outputJson) == null ? record[AWAIT_AGENT_RESOLVED_FIELD] : undefined,
+	);
 	if (sendTargetNarratorId) meta.sendTargetNarratorId = sendTargetNarratorId;
 	if (filePath) {
 		meta.filePath = filePath;

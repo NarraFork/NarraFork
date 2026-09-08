@@ -20,6 +20,8 @@ import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import type { ToolCallDetailRef } from "../../lib/api/narrators";
+import { NarratorDockContext, type NarratorDockContextValue } from "./dock/NarratorDockContext";
 
 const realReactI18nextModule = { ...(await import("react-i18next")) };
 const realUsePlatformModule = { ...(await import("@frontend/hooks/usePlatform")) };
@@ -137,6 +139,8 @@ function installDom() {
 }
 
 interface RenderOpts {
+	dock?: NarratorDockContextValue;
+	toolDetailRef?: ToolCallDetailRef;
 	tool?: TraceRowToolMeta;
 	narratorId?: string;
 	copyText?: string;
@@ -160,20 +164,23 @@ async function renderRow(opts: RenderOpts = {}) {
 	await act(async () => {
 		root?.render(
 			<MantineProvider>
-				<TraceRowInteraction
-					identity={identity}
-					actions={
-						opts.withMessageActions
-							? { messageId: "m1", onForkFromMessage: () => {}, onRollbackToBlock: () => {} }
-							: { messageId: "m1" }
-					}
-					narratorId={opts.narratorId}
-					onViewSubagentSession={opts.onViewSubagentSession}
-					onDetachSubagent={opts.onDetachSubagent}
-					onCancelBackgroundTask={opts.onCancelBackgroundTask}
-				>
-					<div>row title</div>
-				</TraceRowInteraction>
+				<NarratorDockContext.Provider value={opts.dock ?? null}>
+					<TraceRowInteraction
+						identity={identity}
+						actions={
+							opts.withMessageActions
+								? { messageId: "m1", onForkFromMessage: () => {}, onRollbackToBlock: () => {} }
+								: { messageId: "m1" }
+						}
+						narratorId={opts.narratorId}
+						toolDetailRef={opts.toolDetailRef}
+						onViewSubagentSession={opts.onViewSubagentSession}
+						onDetachSubagent={opts.onDetachSubagent}
+						onCancelBackgroundTask={opts.onCancelBackgroundTask}
+					>
+						<div>row title</div>
+					</TraceRowInteraction>
+				</NarratorDockContext.Provider>
 			</MantineProvider>,
 		);
 	});
@@ -226,6 +233,23 @@ afterAll(() => {
 	mock.module("@frontend/hooks/usePlatform", () => realUsePlatformModule);
 	mock.module("./MessageSelectionCtx", () => realMessageSelectionModule);
 	mock.restore();
+});
+
+test("Edit right-click opens its historical resource with the persisted row identity", async () => {
+	const openFilePanel = mock((..._args: unknown[]) => {});
+	const ref = { toolCallId: "actual-pk", messageId: "actual-message", executionAttempt: 2 };
+	await renderRow({
+		narratorId: "row-reader",
+		tool: { toolName: "Edit", toolUseId: "reused-sdk", filePath: "/work/a.ts", isFileTool: true },
+		toolDetailRef: ref,
+		dock: { narratorId: "different-host", openFilePanel } as unknown as NarratorDockContextValue,
+	});
+	expect(menuLabels()).toContain("editPreview.open");
+	clickMenuItem("editPreview.open");
+	expect(openFilePanel).toHaveBeenCalledWith("/work/a.ts", undefined, {
+		toolEdit: { ...ref, narratorId: "row-reader", toolUseId: "reused-sdk" },
+	});
+	expect(closeSwipeMock).toHaveBeenCalled();
 });
 
 describe("TraceRowInteraction — tool-call inspector gating", () => {

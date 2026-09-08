@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { executeLocalFileChange } from "../../../services/file-change-runtime";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
@@ -149,6 +150,40 @@ export const writeTool: ToolDefinition = {
 		const canonicalPath = ctx.executionTarget?.canonicalPath;
 		const ioPath = canonicalPath ?? resolvedPath;
 		try {
+			const recorded = await executeLocalFileChange({
+				ctx,
+				backend,
+				toolName: "Write",
+				filePath: file_path,
+				input: { content },
+				construct(before) {
+					const decoded =
+						before.bytes === null ? { text: "", encoding: "utf-8" } : decodeFileBytes(before.bytes);
+					const normalized = normalizeLineEndings(content);
+					const ending = detectLineEnding(before.bytes === null ? content : decoded.text);
+					const diffStats =
+						before.bytes !== null && looksBinary(before.bytes)
+							? null
+							: wholeFileLineStats(
+									before.bytes === null ? null : normalizeLineEndings(decoded.text),
+									normalized,
+								);
+					return {
+						nextBytes: encodeFileBytes(applyLineEnding(normalized, ending), decoded.encoding),
+						lineStats: diffStats,
+						result: {
+							output: `Wrote ${content.length} bytes to ${file_path}`,
+							title: file_path,
+							...(diffStats ? { metadata: lineStatsMetadata(diffStats) } : {}),
+						},
+					};
+				},
+			});
+			if (recorded) {
+				await trackFileChange(ctx, ioPath, "write", backend, null, { evidenceRecorded: true });
+				return recorded;
+			}
+			// Legacy/remote compatibility only: no v2 evidence or exact remote capability.
 			// The whole read-modify-write window runs under the workspace write lock, so
 			// a concurrent narrator sharing this worktree cannot interleave between the
 			// baseline read and the write. It is milliseconds long, so holding it is free.
@@ -215,7 +250,10 @@ export const writeTool: ToolDefinition = {
 				return {
 					output: `Wrote ${content.length} bytes to ${file_path}`,
 					title: file_path,
-					...(diffStats ? { metadata: lineStatsMetadata(diffStats) } : {}),
+					metadata: {
+						...lineStatsMetadata(diffStats),
+						fileChangeEvidence: { version: 1, grade: "legacy_unverified" },
+					},
 				};
 			});
 		} catch (err) {

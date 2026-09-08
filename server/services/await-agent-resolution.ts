@@ -61,7 +61,35 @@ import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
  * `deriveAwaitAgentNarratorId` / `getAwaitAgentNarratorId`), so a finished call
  * always prefers its authoritative id.
  */
+// Also used by single-target Send: this is a navigation-only transport channel,
+// independent of either tool's returned metadata or completion state.
 export const AWAIT_AGENT_RESOLVED_FIELD = "_awaitAgentNarratorId";
+
+/** Conservative input gating: never guess among multiple selectors or parent reports. */
+export function singleSendSelector(input: Record<string, unknown>): string | undefined {
+	if (
+		[input.ids, input.names].some(
+			(value) =>
+				value !== undefined &&
+				(!Array.isArray(value) || value.some((item) => typeof item !== "string")),
+		)
+	)
+		return undefined;
+	const selectors = [
+		input.id,
+		input.name,
+		...(Array.isArray(input.ids) ? input.ids : []),
+		...(Array.isArray(input.names) ? input.names : []),
+	]
+		.map(nonEmpty)
+		.filter(Boolean);
+	if (selectors.length !== 1) return undefined;
+	const selector = selectors[0];
+	if (!selector || ["parent", "main", "@parent", "@main"].includes(selector.toLowerCase())) {
+		return undefined;
+	}
+	return selector;
+}
 
 /**
  * Field marking a tool call whose target subagent is currently TAKEN OVER by the
@@ -224,6 +252,9 @@ export interface PendingAwaitAgent {
 	toolUseId: string;
 	/** The selector the model typed (`input.id`): alias | title | id | id-prefix. */
 	selector: string;
+	/** Send enforces child/sibling authorization, unlike legacy Await resolution. */
+	send?: boolean;
+	callerId?: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -262,11 +293,20 @@ export function collectPendingAwaitAgents(
 	const pending: PendingAwaitAgent[] = [];
 	const seen = new Set<string>();
 	for (const tc of toolCalls) {
-		if (tc.toolName !== "Await" || !tc.toolUseId) continue;
+		if ((tc.toolName !== "Await" && tc.toolName !== "Send") || !tc.toolUseId) continue;
 		if (seen.has(tc.toolUseId)) continue;
 		const input = asRecord(tc.inputJson);
 		// A truncated input keeps its short fields, so `type`/`id` survive; anything
 		// else is not an agent await and has no session to open.
+		if (tc.toolName === "Send") {
+			// Never retarget a completed Send from today's roster. Returned targets win.
+			if (tc.outputJson != null) continue;
+			const selector = singleSendSelector(input);
+			if (!selector) continue;
+			seen.add(tc.toolUseId);
+			pending.push({ toolUseId: tc.toolUseId, selector, send: true });
+			continue;
+		}
 		if (nonEmpty(input.type) !== "agent") continue;
 		const selector = nonEmpty(input.id);
 		if (!selector) continue;
@@ -335,27 +375,80 @@ export async function resolveAwaitAgentNarratorIds(
 		const [roster, tasks] = await Promise.all([
 			db.query.narrators.findMany({
 				where: eq(narrators.parentNarratorId, teamParentId),
-				columns: { id: true, title: true, traits: true },
+				columns: { id: true, title: true, traits: true, variant: true },
 			}),
 			db.query.backgroundTasks.findMany({
-				where: eq(backgroundTasks.parentNarratorId, teamParentId),
-				columns: { id: true, alias: true, subagentNarratorId: true, type: true },
+				where: inArray(backgroundTasks.parentNarratorId, [
+					teamParentId,
+					...new Set(
+						pending.flatMap((entry) => (entry.send && entry.callerId ? [entry.callerId] : [])),
+					),
+				]),
+				columns: {
+					id: true,
+					alias: true,
+					subagentNarratorId: true,
+					type: true,
+					parentNarratorId: true,
+					createdAt: true,
+				},
 			}),
 		]);
 		if (roster.length === 0 && tasks.length === 0) return resolved;
 
 		const taskAliasToSubagentId = new Map<string, string>();
+		const sendTaskAliases = new Map<string, Map<string, { id: string; createdAt: string }>>();
 		for (const task of tasks) {
-			if (task.type !== "agent") continue;
-			// An agent task row shares the subagent's id (see createAgentTask), but the
-			// explicit column wins when present.
-			const subagentId = task.subagentNarratorId ?? task.id;
-			if (!subagentId) continue;
-			taskAliasToSubagentId.set(task.id, subagentId);
-			if (task.alias) taskAliasToSubagentId.set(task.alias, subagentId);
+			// Preserve Await's agent-task fallback; Send's aliases additionally honor
+			// the latest non-agent task reusing an alias, just like getByAlias.
+			const subagentId =
+				task.subagentNarratorId ?? (task.type === "agent" ? task.id : (task.alias ?? ""));
+			if (task.type === "agent" && task.parentNarratorId === teamParentId) {
+				taskAliasToSubagentId.set(task.id, subagentId);
+				if (task.alias) taskAliasToSubagentId.set(task.alias, subagentId);
+			}
+			if (task.parentNarratorId && task.alias) {
+				let aliases = sendTaskAliases.get(task.parentNarratorId);
+				if (!aliases) {
+					aliases = new Map();
+					sendTaskAliases.set(task.parentNarratorId, aliases);
+				}
+				const previous = aliases.get(task.alias);
+				if (!previous || task.createdAt > previous.createdAt) {
+					aliases.set(task.alias, { id: subagentId, createdAt: task.createdAt });
+				} else if (task.createdAt === previous.createdAt && subagentId !== previous.id) {
+					// A timestamp tie has no authoritative latest target: do not guess.
+					aliases.set(task.alias, { id: "", createdAt: task.createdAt });
+				}
+			}
 		}
 
+		const rosterById = new Map(roster.map((target) => [target.id, target]));
 		for (const entry of pending) {
+			if (entry.send) {
+				// Match Send's caller-first alias lookup, and never allow a task pointer
+				// to bypass the actual child/sibling roster authorization.
+				let candidate = entry.selector;
+				for (const owner of new Set([entry.callerId ?? teamParentId, teamParentId])) {
+					candidate = resolveTaskAlias(owner, entry.selector);
+					if (candidate !== entry.selector) break;
+					candidate = sendTaskAliases.get(owner)?.get(entry.selector)?.id ?? entry.selector;
+					if (candidate !== entry.selector) break;
+				}
+				const eligible = (target: (typeof roster)[number]) =>
+					isSubagentVariant(target.variant ?? "") && target.id !== entry.callerId;
+				const direct = rosterById.get(candidate);
+				if (direct) {
+					if (eligible(direct)) resolved.set(entry.toolUseId, direct.id);
+					continue;
+				}
+				if (candidate !== entry.selector) continue;
+				const matches = roster.filter(
+					(target) => eligible(target) && subagentMatchesSelector(target, entry.selector),
+				);
+				if (matches.length === 1) resolved.set(entry.toolUseId, matches[0].id);
+				continue;
+			}
 			// The registry maps an alias to a real id within this parent's session.
 			const aliasCandidate = resolveTaskAlias(teamParentId, entry.selector);
 			const hit =
@@ -428,9 +521,10 @@ export async function resolveAwaitAgentIdsForToolCalls(
 		const owner = ownerByToolUseId.get(entry.toolUseId);
 		const scope = owner ? scopeByNarratorId.get(owner) : undefined;
 		if (!scope) continue;
+		const scopedEntry = entry.send ? { ...entry, callerId: owner } : entry;
 		const bucket = byScope.get(scope);
-		if (bucket) bucket.push(entry);
-		else byScope.set(scope, [entry]);
+		if (bucket) bucket.push(scopedEntry);
+		else byScope.set(scope, [scopedEntry]);
 	}
 
 	const resolved = new Map<string, string>();

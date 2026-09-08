@@ -121,14 +121,38 @@ gitRoutes.get("/:chapterId/git/modifications", async (c) => {
 	// attribution", which is the failure mode this endpoint exists to remove.
 	const query = gitModificationsQuerySchema.parse(c.req.query());
 
-	// `scope=uncommitted` answers the question the Git panel actually asks: who caused the
-	// changes that are sitting in the working tree right now. Without it the view spans the
-	// workspace's entire recorded history, which for a long-lived worktree credits a file's
-	// current diff to every session that ever touched it (measured here: a median of 7
-	// contributors per file, up to 157, where the real answer was 1).
-	const scope = query.scope === "uncommitted" ? await resolveUncommittedScope(worktreePath) : null;
+	// History stays a bounded observation window. Current evidence is a separate live
+	// HEAD/index/worktree fingerprint; commit timestamps cannot establish ownership.
+	const scope =
+		query.scope === "uncommitted" ? await resolveUncommittedScope(worktreePath, false) : null;
 
+	const cursorAt = c.req.query("cursorAt");
+	const cursorRowId = c.req.query("cursorRowId");
+	if (
+		(cursorAt === undefined) !== (cursorRowId === undefined) ||
+		(cursorAt?.length ?? 0) > 64 ||
+		(cursorRowId?.length ?? 0) > 64
+	) {
+		throw new ValidationError("A bounded cursorAt/cursorRowId pair is required");
+	}
+	if (
+		cursorRowId !== undefined &&
+		(!/^[1-9]\d*$/.test(cursorRowId) || !Number.isSafeInteger(Number(cursorRowId)))
+	) {
+		throw new ValidationError("Invalid historical row cursor");
+	}
+	// Reuse only the timestamp validator. The validated rowId is a page position,
+	// never a narrator/business ID or evidence of execution order within a timestamp.
+	const cursorQuery =
+		cursorAt !== undefined && cursorRowId !== undefined
+			? gitModificationsQuerySchema.parse({ until: cursorAt })
+			: null;
 	const view = await getWorkspaceModificationView(worktreePath, {
+		currentDiff: query.scope === "uncommitted",
+		signal: c.req.raw.signal,
+		...(cursorQuery?.until && cursorRowId
+			? { cursor: { changedAt: cursorQuery.until, rowId: cursorRowId } }
+			: {}),
 		...(query.limit !== undefined ? { limit: query.limit } : {}),
 		...(query.since ? { since: query.since } : {}),
 		...(query.until ? { until: query.until } : {}),
@@ -166,7 +190,10 @@ gitRoutes.get("/:chapterId/git/modifications", async (c) => {
  * detection, untracked reporting) and on the boundary walk, so the only honest test runs
  * it against a throwaway repository rather than a hand-built status object.
  */
-export async function resolveUncommittedScope(worktreePath: string): Promise<{
+export async function resolveUncommittedScope(
+	worktreePath: string,
+	includeTimestampHints = true,
+): Promise<{
 	filePaths: string[];
 	sinceByPath: Map<string, string>;
 	pathAliases: Map<string, string>;
@@ -178,7 +205,9 @@ export async function resolveUncommittedScope(worktreePath: string): Promise<{
 		if (file.oldPath && file.oldPath !== file.path) pathAliases.set(file.oldPath, file.path);
 	}
 	const filePaths = [...status.files.map((file) => file.path), ...pathAliases.keys()];
-	if (filePaths.length === 0) {
+	// Current-diff uses content fingerprints, so its historical companion must not be
+	// cut at a guessed commit time. Keep the legacy hint helper for other callers.
+	if (filePaths.length === 0 || !includeTimestampHints) {
 		return { filePaths, sinceByPath: new Map(), pathAliases };
 	}
 

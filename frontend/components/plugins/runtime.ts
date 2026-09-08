@@ -451,6 +451,15 @@ export class PluginUiSession {
 			if (this.handshakeTimer) clearTimeout(this.handshakeTimer);
 			this.handshakeTimer = null;
 			this.setState("ready");
+			// Presentation pushes made while loading/connecting are dropped by sendNotification.
+			// Resync before acknowledging the handshake (which loads the plugin entry), so its
+			// first render never uses a theme/locale captured before a host-side change.
+			const presentation = this.options.getPresentation?.();
+			if (presentation) {
+				this.setThemeTokens(presentation.tokenCss);
+				if (presentation.colorScheme) this.setColorScheme(presentation.colorScheme);
+				this.setLocale(presentation.locale, presentation.localeChain);
+			}
 			const context = this.options.getContext?.(this.params);
 			this.sendResponse(
 				makeUiResponse(request.id, {

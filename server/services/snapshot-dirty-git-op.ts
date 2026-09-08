@@ -62,6 +62,7 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { ValidationError } from "../lib/errors";
+import { requireCompleteMergeTree } from "../lib/git-tree-merge";
 import { logger } from "../lib/logger";
 import { safeSpawn } from "../lib/spawn";
 import { advanceChapterSnapshot, ensureChapterSnapshot } from "./chapter-snapshot-ref";
@@ -535,12 +536,13 @@ export async function reapplyParkedWork(
 		current,
 		parked.treeHash,
 	);
-	if (merged.conflicts.length > 0) {
+	const tree = requireCompleteMergeTree(merged);
+	if (merged.hasConflicts) {
 		return { conflicts: merged.conflicts, changedFiles: [] };
 	}
 
-	const changedFiles = await worktreeTreeSnapshot.materializeTree(worktreePath, merged.tree);
-	await advanceChapterSnapshot(worktreePath, merged.tree, "reapplied uncommitted work");
+	const changedFiles = await worktreeTreeSnapshot.materializeTree(worktreePath, tree);
+	await advanceChapterSnapshot(worktreePath, tree, "reapplied uncommitted work");
 	return { conflicts: [], changedFiles };
 }
 

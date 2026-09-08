@@ -46,7 +46,10 @@ import {
 	syncPluginUiContributions,
 } from "@frontend/components/plugins";
 import { createAppPluginHostLocal } from "@frontend/components/plugins/app-host-local";
-import { handlePluginUiNotification } from "@frontend/components/plugins/notifications";
+import {
+	handlePluginUiNotification,
+	invalidatePluginModelQueries,
+} from "@frontend/components/plugins/notifications";
 import { useBranding } from "@frontend/hooks/useBranding";
 import { usePluginContributions } from "@frontend/hooks/usePluginContributions";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
@@ -160,7 +163,11 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 	React.useEffect(
 		() =>
 			narratorWSManager.onConnectionChange((connected, isReconnect) => {
-				if (connected && isReconnect) void syncPluginUiContributions().catch(() => {});
+				if (!connected) return;
+				// Includes the first connection: startup discovery may finish between the initial
+				// settings request and WS subscription, not only while reconnecting.
+				invalidatePluginModelQueries(queryClient);
+				if (isReconnect) void syncPluginUiContributions().catch(() => {});
 			}),
 		[],
 	);
@@ -169,10 +176,13 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 	// refetch the bounded HTTP snapshot so every open panel converges quickly.
 	React.useEffect(() => {
 		const listener = narratorWSManager.addListener(
-			{ types: ["plugin_contributions_changed"] },
-			() => {
-				invalidatePluginUiContributions();
-				void queryClient.invalidateQueries({ queryKey: ["plugins", "ui-contributions"] });
+			{ types: ["plugin_contributions_changed", "plugin_provider_models_changed"] },
+			(message) => {
+				invalidatePluginModelQueries(queryClient);
+				if (message.type === "plugin_contributions_changed") {
+					invalidatePluginUiContributions();
+					void queryClient.invalidateQueries({ queryKey: ["plugins", "ui-contributions"] });
+				}
 			},
 		);
 		return () => narratorWSManager.removeListener(listener);

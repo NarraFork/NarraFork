@@ -7,8 +7,10 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
@@ -21,6 +23,7 @@ import { worktreeTreeSnapshots } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
+import * as spawn from "../lib/spawn";
 import { safeSpawn } from "../lib/spawn";
 import {
 	planTreeRevertSegments,
@@ -632,10 +635,335 @@ describe("restore failure compensation", () => {
 	});
 });
 
+describe("restore deletion safety", () => {
+	async function attemptRestore(
+		repo: string,
+		tree: string,
+		failCheckout: boolean | "after",
+	): Promise<unknown> {
+		const realSpawn = spawn.safeSpawn;
+		let injected = false;
+		const failure = failCheckout
+			? spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+					if (!injected && opts.cmd.includes(repo) && opts.cmd.includes("checkout-index")) {
+						injected = true;
+						if (failCheckout === "after") {
+							expect((await realSpawn(opts)).exitCode).toBe(0);
+						}
+						return { stdout: "", stderr: "injected checkout failure", exitCode: 1 };
+					}
+					return realSpawn(opts);
+				})
+			: undefined;
+		try {
+			return await worktreeTreeSnapshot.restore(repo, tree).catch((error: unknown) => error);
+		} finally {
+			failure?.mockRestore();
+			if (failCheckout === "after") expect(injected).toBe(true);
+		}
+	}
+
+	for (const operation of ["restore", "checkout-failure", "restoreInto"] as const) {
+		const failCheckout = operation === "checkout-failure";
+		const copy = operation === "restoreInto";
+		const suffix = failCheckout ? " with a checkout failure" : copy ? " using restoreInto" : "";
+		test(`failed file restore and compensation preserve an ignored-only directory${suffix}`, async () => {
+			const repo = await createRepo("nf-tree-safe-ignored-");
+			const source = copy ? await createRepo("nf-tree-safe-ignored-src-") : repo;
+			writeFileSync(join(source, ".gitignore"), "*.ignore\n");
+			writeFileSync(join(source, "a"), "original file\n");
+			const target = await worktreeTreeSnapshot.capture(source);
+			writeFileSync(join(repo, ".gitignore"), "*.ignore\n");
+
+			if (!copy) rmSync(join(repo, "a"));
+			mkdirSync(join(repo, "a"));
+			writeFileSync(join(repo, "a", "keep.ignore"), "not in any snapshot\n");
+			const beforeRestore = await worktreeTreeSnapshot.capture(repo);
+			expect(await worktreeTreeSnapshot.listPaths(repo, beforeRestore)).toEqual([".gitignore"]);
+
+			const error = copy
+				? await worktreeTreeSnapshot
+						.restoreInto(source, repo, target)
+						.catch((error: unknown) => error)
+				: await attemptRestore(repo, target, failCheckout);
+			// Neither checkout nor compensation may delete contents the tree cannot restore.
+			expect(readFileSync(join(repo, "a", "keep.ignore"), "utf8")).toBe("not in any snapshot\n");
+			expect(error).toBeInstanceOf(TreeSnapshotError);
+			if (!copy) {
+				expect(error).toBeInstanceOf(TreeRestoreError);
+				expect((error as TreeRestoreError).capturedTreeHash).toBe(beforeRestore);
+				expect((error as TreeRestoreError).compensated).toBe(true);
+			}
+			expect(await worktreeTreeSnapshot.capture(repo)).toBe(beforeRestore);
+		});
+
+		test(`failed file restore cannot delete an ancestor of a nested repository${suffix}`, async () => {
+			const repo = await createRepo("nf-tree-safe-nested-");
+			const source = copy ? await createRepo("nf-tree-safe-nested-src-") : repo;
+			writeFileSync(join(source, "a"), "original file\n");
+			const target = await worktreeTreeSnapshot.capture(source);
+			if (!copy) rmSync(join(repo, "a"));
+			const nested = join(repo, "a", "sub");
+			mkdirSync(nested, { recursive: true });
+			for (const args of [
+				["init"],
+				["config", "user.email", "test@example.com"],
+				["config", "user.name", "Test"],
+			]) {
+				expect(
+					(await safeSpawn({ cmd: ["git", ...args], cwd: nested, timeout: 15_000 })).exitCode,
+				).toBe(0);
+			}
+			writeFileSync(join(nested, "committed.txt"), "committed\n");
+			expect(
+				(await safeSpawn({ cmd: ["git", "add", "-A"], cwd: nested, timeout: 15_000 })).exitCode,
+			).toBe(0);
+			expect(
+				(await safeSpawn({ cmd: ["git", "commit", "-m", "seed"], cwd: nested, timeout: 15_000 }))
+					.exitCode,
+			).toBe(0);
+			writeFileSync(join(nested, "valuable"), "uncommitted and irreplaceable\n");
+			const beforeRestore = await worktreeTreeSnapshot.capture(repo);
+			expect(await worktreeTreeSnapshot.listPaths(repo, beforeRestore)).toContain("a/sub");
+
+			const error = copy
+				? await worktreeTreeSnapshot
+						.restoreInto(source, repo, target)
+						.catch((error: unknown) => error)
+				: await attemptRestore(repo, target, failCheckout);
+			expect(readFileSync(join(nested, "valuable"), "utf8")).toBe(
+				"uncommitted and irreplaceable\n",
+			);
+			expect(error).toBeInstanceOf(TreeSnapshotError);
+			expect(readFileSync(join(nested, "committed.txt"), "utf8")).toBe("committed\n");
+			expect(lstatSync(join(nested, ".git")).isDirectory()).toBe(true);
+			if (!copy) {
+				expect(error).toBeInstanceOf(TreeRestoreError);
+				expect((error as TreeRestoreError).compensated).toBe(true);
+			}
+			expect(await worktreeTreeSnapshot.capture(repo)).toBe(beforeRestore);
+		});
+	}
+
+	test("deleting a tracked child leaves its ignored sibling and parent directory intact", async () => {
+		const repo = await createRepo("nf-tree-safe-ignored-sibling-");
+		writeFileSync(join(repo, ".gitignore"), "*.ignore\n");
+		const target = await worktreeTreeSnapshot.capture(repo);
+		mkdirSync(join(repo, "a"));
+		writeFileSync(join(repo, "a", "created.txt"), "remove only this\n");
+		writeFileSync(join(repo, "a", "keep.ignore"), "keep the directory for me\n");
+
+		expect(await worktreeTreeSnapshot.restore(repo, target)).toEqual(["a/created.txt"]);
+		expect(readFileSync(join(repo, "a", "keep.ignore"), "utf8")).toBe(
+			"keep the directory for me\n",
+		);
+		expect(existsSync(join(repo, "a", "created.txt"))).toBe(false);
+	});
+
+	for (const linkTarget of ["dangling", "repository"] as const) {
+		test(`compensation unlinks a newly checked-out ${linkTarget} symlink`, async () => {
+			const repo = await createRepo("nf-tree-safe-compensate-link-");
+			const external = await createRepo("nf-tree-safe-compensate-target-");
+			writeFileSync(join(external, "valuable"), "untouched\n");
+			const beforeRestore = await worktreeTreeSnapshot.capture(repo);
+			symlinkSync(
+				linkTarget === "dangling" ? "missing" : external,
+				join(repo, "link"),
+				linkTarget === "dangling" ? "file" : "dir",
+			);
+			const target = await worktreeTreeSnapshot.capture(repo);
+			rmSync(join(repo, "link"));
+
+			const error = await attemptRestore(repo, target, "after");
+			expect(error).toBeInstanceOf(TreeRestoreError);
+			expect((error as TreeRestoreError).compensated).toBe(true);
+			expect(() => lstatSync(join(repo, "link"))).toThrow();
+			expect(readFileSync(join(external, "valuable"), "utf8")).toBe("untouched\n");
+			expect(await worktreeTreeSnapshot.capture(repo)).toBe(beforeRestore);
+		});
+	}
+
+	for (const targetIsFile of [false, true]) {
+		test(`compensates a checked-out ${targetIsFile ? "directory-to-file" : "file-to-directory"} transition`, async () => {
+			const repo = await createRepo("nf-tree-safe-compensate-shape-");
+			writeFileSync(join(repo, "a"), "file\n");
+			const fileTree = await worktreeTreeSnapshot.capture(repo);
+			rmSync(join(repo, "a"));
+			mkdirSync(join(repo, "a", "sub"), { recursive: true });
+			writeFileSync(join(repo, "a", "sub", "file.bin"), Buffer.from([0, 255, 128]));
+			const dirTree = await worktreeTreeSnapshot.capture(repo);
+			if (!targetIsFile) await worktreeTreeSnapshot.restore(repo, fileTree);
+
+			const error = await attemptRestore(repo, targetIsFile ? fileTree : dirTree, "after");
+			expect(error).toBeInstanceOf(TreeRestoreError);
+			expect((error as TreeRestoreError).compensated).toBe(true);
+			expect(await worktreeTreeSnapshot.capture(repo)).toBe(targetIsFile ? dirTree : fileTree);
+			if (targetIsFile) {
+				expect(readFileSync(join(repo, "a", "sub", "file.bin"))).toEqual(
+					Buffer.from([0, 255, 128]),
+				);
+			} else expect(readFileSync(join(repo, "a"), "utf8")).toBe("file\n");
+		});
+	}
+
+	test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+		"an EACCES discovered after capture is not treated as an absent deletion path",
+		async () => {
+			const repo = await createRepo("nf-tree-safe-lstat-error-");
+			const target = await worktreeTreeSnapshot.capture(repo);
+			const locked = join(repo, "locked");
+			mkdirSync(locked);
+			writeFileSync(join(locked, "valuable"), "must survive\n");
+			const realSpawn = spawn.safeSpawn;
+			let lockedAfterCapture = false;
+			const failure = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+				const result = await realSpawn(opts);
+				if (!lockedAfterCapture && opts.cmd.includes(repo) && opts.cmd.includes("ls-tree")) {
+					lockedAfterCapture = true;
+					chmodSync(locked, 0o000);
+				}
+				return result;
+			});
+			try {
+				await expect(worktreeTreeSnapshot.restore(repo, target)).rejects.toBeInstanceOf(
+					TreeRestoreError,
+				);
+				expect(lockedAfterCapture).toBe(true);
+			} finally {
+				chmodSync(locked, 0o700);
+				failure.mockRestore();
+			}
+			expect(readFileSync(join(locked, "valuable"), "utf8")).toBe("must survive\n");
+		},
+	);
+
+	for (const copy of [false, true]) {
+		const operation = copy ? "restoreInto" : "restore";
+		test(`${operation} rejects a nonempty directory that appears just before checkout`, async () => {
+			const repo = await createRepo("nf-tree-safe-late-directory-");
+			const source = copy ? await createRepo("nf-tree-safe-late-directory-src-") : repo;
+			writeFileSync(join(source, ".gitignore"), "*.ignore\n");
+			writeFileSync(join(source, "a"), "target\n");
+			const target = await worktreeTreeSnapshot.capture(source);
+			writeFileSync(join(repo, ".gitignore"), "*.ignore\n");
+			writeFileSync(join(repo, "a"), "current\n");
+			const realSpawn = spawn.safeSpawn;
+			let inserted = false;
+			const race = spyOn(spawn, "safeSpawn").mockImplementation((opts) => {
+				if (!inserted && opts.cmd.includes(repo) && opts.cmd.includes("checkout-index")) {
+					inserted = true;
+					// A concurrent writer wins after preparation. Force checkout would
+					// silently delete this unsnapshotted subtree, despite earlier lstat.
+					rmSync(join(repo, "a"), { force: true });
+					mkdirSync(join(repo, "a"));
+					writeFileSync(join(repo, "a", "keep.ignore"), "arrived after preparation\n");
+				}
+				return realSpawn(opts);
+			});
+			try {
+				const apply = copy
+					? worktreeTreeSnapshot.restoreInto(source, repo, target)
+					: worktreeTreeSnapshot.restore(repo, target);
+				await expect(apply).rejects.toBeInstanceOf(TreeSnapshotError);
+				expect(inserted).toBe(true);
+			} finally {
+				race.mockRestore();
+			}
+			expect(readFileSync(join(repo, "a", "keep.ignore"), "utf8")).toBe(
+				"arrived after preparation\n",
+			);
+		});
+
+		test(`${operation} never follows a newly substituted symlink ancestor when deleting`, async () => {
+			const repo = await createRepo("nf-tree-safe-link-ancestor-");
+			const source = copy ? await createRepo("nf-tree-safe-link-ancestor-src-") : repo;
+			const external = await createRepo("nf-tree-safe-link-ancestor-target-");
+			writeFileSync(join(external, "valuable"), "external bytes\n");
+			const target = await worktreeTreeSnapshot.capture(source);
+			mkdirSync(join(repo, "a"));
+			writeFileSync(join(repo, "a", "valuable"), "captured bytes\n");
+			const realSpawn = spawn.safeSpawn;
+			let substituted = false;
+			const race = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+				const result = await realSpawn(opts);
+				if (!substituted && opts.cmd.includes(repo) && opts.cmd.includes("ls-tree")) {
+					substituted = true;
+					renameSync(join(repo, "a"), join(external, "original-a"));
+					symlinkSync(external, join(repo, "a"), "dir");
+				}
+				return result;
+			});
+			try {
+				const apply = copy
+					? worktreeTreeSnapshot.restoreInto(source, repo, target)
+					: worktreeTreeSnapshot.restore(repo, target);
+				await expect(apply).rejects.toBeInstanceOf(TreeSnapshotError);
+				expect(substituted).toBe(true);
+			} finally {
+				race.mockRestore();
+			}
+			expect(readFileSync(join(external, "valuable"), "utf8")).toBe("external bytes\n");
+			expect(readFileSync(join(external, "original-a", "valuable"), "utf8")).toBe(
+				"captured bytes\n",
+			);
+		});
+
+		test(`${operation} removes a dangling symlink absent from the target`, async () => {
+			const repo = await createRepo("nf-tree-safe-dangling-");
+			const source = copy ? await createRepo("nf-tree-safe-dangling-src-") : repo;
+			const target = await worktreeTreeSnapshot.capture(source);
+			symlinkSync("missing-target", join(repo, "link"));
+			expect(lstatSync(join(repo, "link")).isSymbolicLink()).toBe(true);
+
+			if (copy) await worktreeTreeSnapshot.restoreInto(source, repo, target);
+			else await worktreeTreeSnapshot.restore(repo, target);
+
+			expect(() => lstatSync(join(repo, "link"))).toThrow();
+			expect(await worktreeTreeSnapshot.capture(repo)).toBe(target);
+		});
+
+		test(`${operation} unlinks a link to a repository without touching its target`, async () => {
+			const repo = await createRepo("nf-tree-safe-link-");
+			const source = copy ? await createRepo("nf-tree-safe-link-src-") : repo;
+			const external = await createRepo("nf-tree-safe-link-target-");
+			writeFileSync(join(external, "valuable"), "outside snapshot authority\n");
+			const target = await worktreeTreeSnapshot.capture(source);
+			symlinkSync(external, join(repo, "link"), "dir");
+
+			if (copy) await worktreeTreeSnapshot.restoreInto(source, repo, target);
+			else await worktreeTreeSnapshot.restore(repo, target);
+
+			expect(() => lstatSync(join(repo, "link"))).toThrow();
+			expect(readFileSync(join(external, "valuable"), "utf8")).toBe("outside snapshot authority\n");
+			expect(lstatSync(join(external, ".git")).isDirectory()).toBe(true);
+		});
+
+		test(`${operation} round-trips a file and a deep directory without recursive deletion`, async () => {
+			const source = await createRepo("nf-tree-safe-shape-src-");
+			writeFileSync(join(source, "a"), "file bytes\n");
+			const fileTree = await worktreeTreeSnapshot.capture(source);
+			rmSync(join(source, "a"));
+			mkdirSync(join(source, "a", "sub", "deep"), { recursive: true });
+			writeFileSync(join(source, "a", "sub", "deep", "file.bin"), Buffer.from([0, 255, 128]));
+			const dirTree = await worktreeTreeSnapshot.capture(source);
+			const repo = copy ? await createRepo("nf-tree-safe-shape-dst-") : source;
+			for (const tree of [fileTree, dirTree, fileTree]) {
+				if (copy) await worktreeTreeSnapshot.restoreInto(source, repo, tree);
+				else await worktreeTreeSnapshot.restore(repo, tree);
+				expect(await worktreeTreeSnapshot.capture(repo)).toBe(tree);
+				if (tree === fileTree) expect(readFileSync(join(repo, "a"), "utf8")).toBe("file bytes\n");
+				else
+					expect(readFileSync(join(repo, "a", "sub", "deep", "file.bin"))).toEqual(
+						Buffer.from([0, 255, 128]),
+					);
+			}
+		});
+	}
+});
+
 describe("planTreeRevertSegments", () => {
-	test("merges pairs that chain and splits where a foreign write landed", () => {
-		// b→c chains, so those collapse; the c→x gap means someone else wrote in
-		// between, and spanning it would reverse their change too.
+	test("preserves each pair even when adjacent workspace hashes match", () => {
+		// Hash continuity says nothing about who owned each path inside the windows.
 		expect(
 			planTreeRevertSegments([
 				{ before: "a", after: "b" },
@@ -643,7 +971,8 @@ describe("planTreeRevertSegments", () => {
 				{ before: "x", after: "y" },
 			]),
 		).toEqual([
-			{ before: "a", after: "c", ownedPaths: null },
+			{ before: "a", after: "b", ownedPaths: null },
+			{ before: "b", after: "c", ownedPaths: null },
 			{ before: "x", after: "y", ownedPaths: null },
 		]);
 	});
@@ -661,27 +990,51 @@ describe("planTreeRevertSegments", () => {
 		expect(planTreeRevertSegments([])).toEqual([]);
 	});
 
-	test("unions owned paths across a chained run", () => {
-		// The collapsed span covers both calls, so reversing it must be allowed to
-		// touch either one's paths — but nothing else in the shared worktree.
+	test("keeps owned paths scoped to the individual pair", () => {
 		expect(
 			planTreeRevertSegments([
 				{ before: "a", after: "b", ownedPaths: ["one.txt"] },
 				{ before: "b", after: "c", ownedPaths: ["two.txt", "one.txt"] },
 			]),
-		).toEqual([{ before: "a", after: "c", ownedPaths: ["one.txt", "two.txt"] }]);
+		).toEqual([
+			{ before: "a", after: "b", ownedPaths: ["one.txt"] },
+			{ before: "b", after: "c", ownedPaths: ["two.txt", "one.txt"] },
+		]);
 	});
 
-	test("one unknown range poisons the chained run to whole-tree", () => {
-		// A legacy row states nothing about which paths were its own, so the span it
-		// belongs to cannot be narrowed. Claiming the known half would leave the other
-		// half of the same span un-reversed.
+	test("an unknown range never widens the neighbouring known range", () => {
 		expect(
 			planTreeRevertSegments([
 				{ before: "a", after: "b", ownedPaths: ["one.txt"] },
 				{ before: "b", after: "c", ownedPaths: null },
 			]),
-		).toEqual([{ before: "a", after: "c", ownedPaths: null }]);
+		).toEqual([
+			{ before: "a", after: "b", ownedPaths: ["one.txt"] },
+			{ before: "b", after: "c", ownedPaths: null },
+		]);
+	});
+
+	test("reverses owned b only to its own before, preserving the foreign write in pair one", async () => {
+		const repo = await createRepo("nf-tree-owned-boundaries-");
+		writeFileSync(join(repo, "a.txt"), "a-original\n");
+		writeFileSync(join(repo, "b.txt"), "b-original\n");
+		const firstBefore = await worktreeTreeSnapshot.capture(repo);
+		writeFileSync(join(repo, "a.txt"), "a-mine\n");
+		writeFileSync(join(repo, "b.txt"), "b-human\n");
+		const firstAfter = await worktreeTreeSnapshot.capture(repo);
+		const secondBefore = await worktreeTreeSnapshot.capture(repo);
+		writeFileSync(join(repo, "b.txt"), "b-mine\n");
+		const secondAfter = await worktreeTreeSnapshot.capture(repo);
+		expect(secondBefore).toBe(firstAfter);
+
+		const reversed = await worktreeTreeSnapshot.reverseAndRestore(repo, [
+			{ before: firstBefore, after: firstAfter, ownedPaths: ["a.txt"] },
+			{ before: secondBefore, after: secondAfter, ownedPaths: ["b.txt"] },
+		]);
+		expect(reversed.conflicts).toEqual([]);
+		expect(reversed.changedFiles.sort()).toEqual(["a.txt", "b.txt"]);
+		expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("a-original\n");
+		expect(readFileSync(join(repo, "b.txt"), "utf8")).toBe("b-human\n");
 	});
 
 	test("a duplicate pair does not chain, so it costs an extra segment", () => {
@@ -1252,22 +1605,167 @@ describe("stale index.lock recovery", () => {
 	});
 });
 
-/** One unreadable file used to cost the entire workspace its snapshots. */
-describe("unreadable files", () => {
-	test("captures everything else when one file cannot be read", async () => {
-		const repo = await createRepo("nf-tree-unreadable-");
-		writeFileSync(join(repo, "readable.txt"), "kept\n");
-		writeFileSync(join(repo, "locked.txt"), "unreadable\n");
-		chmodSync(join(repo, "locked.txt"), 0o000);
+/** Unknown paths must never become absent entries in a restorable snapshot. */
+describe("incomplete captures", () => {
+	const cannotEnforceUnreadable = process.platform === "win32" || process.getuid?.() === 0;
+
+	test.skipIf(cannotEnforceUnreadable)(
+		"first unreadable capture produces no deletion baseline when the file later becomes readable",
+		async () => {
+			const repo = await createRepo("nf-tree-unreadable-");
+			writeFileSync(join(repo, "readable.txt"), "kept\n");
+			writeFileSync(join(repo, "locked.txt"), "must survive\n");
+			chmodSync(join(repo, "locked.txt"), 0o000);
+			try {
+				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow("snapshot add failed");
+				expect(await worktreeTreeSnapshot.tryCapture(repo)).toBeNull();
+				const rows = await db.query.worktreeTreeSnapshots.findMany({
+					where: eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(repo)),
+				});
+				expect(rows).toEqual([]);
+			} finally {
+				chmodSync(join(repo, "locked.txt"), 0o600);
+			}
+
+			// No cache reset: the first usable baseline must include the now-readable
+			// file. The old --ignore-errors fallback had published an earlier tree
+			// without it, and restoring that tree would silently delete this file.
+			const complete = await worktreeTreeSnapshot.capture(repo);
+			expect(await worktreeTreeSnapshot.listPaths(repo, complete)).toContain("locked.txt");
+			writeFileSync(join(repo, "readable.txt"), "changed\n");
+			expect(await worktreeTreeSnapshot.restore(repo, complete)).toEqual(["readable.txt"]);
+			expect(readFileSync(join(repo, "locked.txt"), "utf8")).toBe("must survive\n");
+		},
+	);
+
+	test.skipIf(cannotEnforceUnreadable)(
+		"an unreadable current snapshot aborts restore before writing or deleting anything",
+		async () => {
+			const repo = await createRepo("nf-tree-restore-unreadable-");
+			writeFileSync(join(repo, "readable.txt"), "baseline\n");
+			const target = await worktreeTreeSnapshot.capture(repo);
+			writeFileSync(join(repo, "readable.txt"), "must not be reverted\n");
+			writeFileSync(join(repo, "locked.txt"), "must not be deleted\n");
+			chmodSync(join(repo, "locked.txt"), 0o000);
+			try {
+				await expect(worktreeTreeSnapshot.restore(repo, target)).rejects.toThrow(
+					"restore add failed",
+				);
+				expect(readFileSync(join(repo, "readable.txt"), "utf8")).toBe("must not be reverted\n");
+				expect(existsSync(join(repo, "locked.txt"))).toBe(true);
+			} finally {
+				chmodSync(join(repo, "locked.txt"), 0o600);
+			}
+			expect(readFileSync(join(repo, "locked.txt"), "utf8")).toBe("must not be deleted\n");
+		},
+	);
+
+	test.skipIf(cannotEnforceUnreadable)(
+		"a directory skipped with git exit zero still makes capture and restore unavailable",
+		async () => {
+			const repo = await createRepo("nf-tree-unreadable-directory-");
+			writeFileSync(join(repo, "a.txt"), "baseline\n");
+			const target = await worktreeTreeSnapshot.capture(repo);
+			writeFileSync(join(repo, "a.txt"), "preserve current\n");
+			const locked = join(repo, "locked");
+			mkdirSync(locked);
+			writeFileSync(join(locked, "secret.txt"), "preserve unseen\n");
+			chmodSync(locked, 0o000);
+			try {
+				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow("coverage is incomplete");
+				await expect(worktreeTreeSnapshot.restore(repo, target)).rejects.toThrow(
+					"coverage is incomplete",
+				);
+				expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("preserve current\n");
+			} finally {
+				chmodSync(locked, 0o700);
+			}
+			expect(readFileSync(join(locked, "secret.txt"), "utf8")).toBe("preserve unseen\n");
+		},
+	);
+
+	test("force-add failure is fatal and its tentative memo cannot hide a later retry", async () => {
+		const repo = await createRepo("nf-tree-force-failure-");
+		writeFileSync(join(repo, ".gitignore"), ".env\n");
+		writeFileSync(join(repo, ".env"), "SECRET=preserve\n");
+		await safeSpawn({ cmd: ["git", "add", "-f", ".env"], cwd: repo, timeout: 15_000 });
+		const realSpawn = spawn.safeSpawn;
+		const failed = spyOn(spawn, "safeSpawn").mockImplementation((opts) => {
+			if (opts.cmd.includes(repo) && opts.cmd.includes("--force")) {
+				return Promise.resolve({ stdout: "", stderr: "unreadable forced path", exitCode: 1 });
+			}
+			return realSpawn(opts);
+		});
 		try {
-			// A plain `add -A` exits 128 and stages *nothing* here, so the whole repository
-			// became unrevertable because of one file.
-			const tree = await worktreeTreeSnapshot.capture(repo);
-			expect(await worktreeTreeSnapshot.listPaths(repo, tree)).toContain("readable.txt");
+			await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow("snapshot add failed");
 		} finally {
-			chmodSync(join(repo, "locked.txt"), 0o600);
+			failed.mockRestore();
 		}
+		const tree = await worktreeTreeSnapshot.capture(repo);
+		expect(await worktreeTreeSnapshot.listPaths(repo, tree)).toContain(".env");
+		expect(readFileSync(join(repo, ".env"), "utf8")).toBe("SECRET=preserve\n");
 	});
+
+	for (const flag of ["stdoutTruncated", "stderrTruncated"] as const) {
+		test(`${flag} cannot turn capture or restore into a complete success`, async () => {
+			const repo = await createRepo("nf-tree-output-limit-");
+			writeFileSync(join(repo, "a.txt"), "baseline\n");
+			const target = await worktreeTreeSnapshot.capture(repo);
+			writeFileSync(join(repo, "a.txt"), "preserve current\n");
+			writeFileSync(join(repo, "new.txt"), "preserve new\n");
+			const realSpawn = spawn.safeSpawn;
+			const truncated = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+				const result = await realSpawn(opts);
+				return opts.cmd.includes(repo) && opts.cmd.includes("add")
+					? { ...result, [flag]: true }
+					: result;
+			});
+			try {
+				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow("size limit");
+				await expect(worktreeTreeSnapshot.restore(repo, target)).rejects.toThrow("size limit");
+			} finally {
+				truncated.mockRestore();
+			}
+			expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("preserve current\n");
+			expect(readFileSync(join(repo, "new.txt"), "utf8")).toBe("preserve new\n");
+		});
+	}
+
+	for (const failure of [
+		"query",
+		"warning",
+		"stdoutTruncated",
+		"stderrTruncated",
+		"pathCount",
+	] as const) {
+		test(`tracked-ignored ${failure} failure cannot publish an incomplete tree`, async () => {
+			const repo = await createRepo("nf-tree-listing-failure-");
+			writeFileSync(join(repo, "a.txt"), "preserve\n");
+			const realSpawn = spawn.safeSpawn;
+			const failed = spyOn(spawn, "safeSpawn").mockImplementation((opts) => {
+				if (opts.cwd === repo && opts.cmd.includes("ls-files")) {
+					return Promise.resolve({
+						stdout: failure === "pathCount" ? "ignored.txt\0".repeat(5_001) : "ignored.txt\0",
+						stderr: failure === "query" || failure === "warning" ? "incomplete listing" : "",
+						exitCode: failure === "query" ? 1 : 0,
+						stdoutTruncated: failure === "stdoutTruncated",
+						stderrTruncated: failure === "stderrTruncated",
+					});
+				}
+				return realSpawn(opts);
+			});
+			try {
+				await expect(worktreeTreeSnapshot.capture(repo)).rejects.toThrow(TreeSnapshotError);
+			} finally {
+				failed.mockRestore();
+			}
+			const rows = await db.query.worktreeTreeSnapshots.findMany({
+				where: eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(repo)),
+			});
+			expect(rows).toEqual([]);
+			expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("preserve\n");
+		});
+	}
 });
 
 /**
@@ -1307,6 +1805,41 @@ describe("hot-path capture budget", () => {
 		});
 		expect(warmed).toMatch(/^[0-9a-f]{40}$/);
 		expect(warmed).toBe(await worktreeTreeSnapshot.capture(repo));
+	});
+
+	test("a fresh boundary never shares an existing observation even with a permissive timestamp", async () => {
+		const repo = await createRepo("nf-tree-hot-require-fresh-");
+		writeFileSync(join(repo, "a.txt"), "before human\n");
+		const oldTree = await worktreeTreeSnapshot.capture(repo);
+		writeFileSync(join(repo, "a.txt"), "after human\n");
+		const realCapture = worktreeTreeSnapshot.capture.bind(worktreeTreeSnapshot);
+		let release: ((tree: string) => void) | undefined;
+		const oldObservation = new Promise<string>((resolve) => {
+			release = resolve;
+		});
+		const capture = spyOn(worktreeTreeSnapshot, "capture")
+			.mockImplementationOnce(() => oldObservation)
+			.mockImplementation(realCapture);
+		try {
+			expect(
+				await worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, { budgetMs: 0 }),
+			).toBeNull();
+			// Millisecond timestamps cannot distinguish calls in the same clock tick.
+			// requireFresh must reject sharing independently of the cutoff comparison.
+			const fresh = worktreeTreeSnapshot.tryCaptureHot(repo, LOCAL_DEVICE_ID, {
+				budgetMs: 5_000,
+				minStartedAt: 0,
+				requireFresh: true,
+			});
+			release?.(oldTree);
+			const tree = await fresh;
+			expect(tree).not.toBe(oldTree);
+			expect(tree).toMatch(/^[0-9a-f]{40}$/);
+			expect(capture).toHaveBeenCalledTimes(2);
+		} finally {
+			release?.(oldTree);
+			capture.mockRestore();
+		}
 	});
 
 	test("concurrent over-budget calls share one warm-up", async () => {

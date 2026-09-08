@@ -11,8 +11,8 @@
  *     tool inputs, so Bash, external editors and build scripts were invisible.
  *   - It is byte-exact, so binary files and legacy charsets round-trip. Storing
  *     decoded text cannot represent either.
- *   - Restoring is one `read-tree` + `checkout-index`, so there is no chance of a
- *     partially-applied or diverged rebuild.
+ *   - Restoring checks out changed paths without force, verifies the tree and
+ *     compensates failures. User directories are never recursively deleted.
  *
  * "Byte-exact" is an outcome that has to be engineered, not a property inherited from
  * using git. git's own content filters — `core.autocrlf`, `text=auto`, `filter=`,
@@ -38,20 +38,46 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	type Stats,
+	statSync,
+} from "node:fs";
+import { lstat, rmdir, unlink } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+import type {
+	ToolEditPreviewSide,
+	ToolEditPreviewUnavailableReason,
+} from "@shared/tool-edit-preview";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, worktreeTreeSnapshots } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { AsyncMutex } from "../lib/async-mutex";
+import {
+	type GitTreeMergeResult,
+	mergeGitTrees,
+	requireCompleteMergeTree,
+} from "../lib/git-tree-merge";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
+import { snapshotCaptureReceipts } from "./snapshot-capture-receipts";
 import { clearClaims } from "./worktree-write-claims";
+
+export {
+	MERGE_TREE_PROBE_ARGV,
+	resetMergeTreeSupportCacheForTests,
+	supportsMergeTree,
+} from "../lib/git-tree-merge";
 
 const SHADOW_ROOT = getNarraforkPath("tree-snapshots");
 
@@ -140,9 +166,8 @@ const SLOW_PATH_COUNT = 2_000;
  * The set is normally empty or a handful (`.env`, a checked-in build artefact), so
  * the cap only exists to stop a pathological repository — one that `git add -f`'d a
  * whole ignored dependency tree — from putting thousands of extra argv bytes and a
- * proportional index write on the tool-execution path. Past the cap the excess is
- * dropped with a warning rather than silently: those paths stay outside snapshots,
- * which is the pre-existing behaviour, and the warning is what makes it visible.
+ * proportional index write on the tool-execution path. Past the cap the capture
+ * fails: an omitted path must not be presented as absent in a complete tree.
  */
 const MAX_TRACKED_IGNORED_PATHS = 5_000;
 
@@ -352,19 +377,35 @@ async function runGitRaw(
 	workTree: string,
 	opts?: { maxOutputBytes?: number; timeoutMs?: number; signal?: AbortSignal },
 ): Promise<GitResult & { stdoutTruncated?: boolean }> {
-	const result = await safeSpawn({
-		cmd: ["git", "--git-dir", gitDir, "--work-tree", workTree, ...args],
-		timeout: opts?.timeoutMs ?? GIT_TIMEOUT_MS,
-		maxOutputBytes: opts?.maxOutputBytes ?? GIT_MAX_OUTPUT_BYTES,
-		env: { ...process.env, ...SHADOW_CONFIG_ENV },
-		...(opts?.signal && { signal: opts.signal }),
-	});
-	return {
-		stdout: result.stdout,
-		stderr: result.stderr,
-		exitCode: result.exitCode,
-		...(result.stdoutTruncated && { stdoutTruncated: true }),
-	};
+	const timeoutMs = opts?.timeoutMs ?? GIT_TIMEOUT_MS;
+	// safeSpawn currently returns the killed exit code but not its timeout cause.
+	// Observe the same deadline without changing its process/cancellation behavior.
+	let deadlineExpired = false;
+	const deadline = setTimeout(() => {
+		deadlineExpired = true;
+	}, timeoutMs);
+	try {
+		const result = await safeSpawn({
+			cmd: ["git", "--git-dir", gitDir, "--work-tree", workTree, ...args],
+			timeout: timeoutMs,
+			maxOutputBytes: opts?.maxOutputBytes ?? GIT_MAX_OUTPUT_BYTES,
+			env: { ...process.env, ...SHADOW_CONFIG_ENV },
+			...(opts?.signal && { signal: opts.signal }),
+		});
+		if (result.stdoutTruncated || result.stderrTruncated) {
+			throw new TreeSnapshotError("snapshot git output exceeded the size limit");
+		}
+		return {
+			stdout: result.stdout,
+			stderr:
+				deadlineExpired && result.exitCode !== 0
+					? `snapshot git deadline exceeded (${timeoutMs}ms): ${result.stderr}`
+					: result.stderr,
+			exitCode: result.exitCode,
+		};
+	} finally {
+		clearTimeout(deadline);
+	}
 }
 
 /** Run one git command against the shadow repo with the real worktree attached. */
@@ -404,6 +445,9 @@ async function runGitWithIndex(
 		maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
 		env: { ...process.env, ...SHADOW_CONFIG_ENV, GIT_INDEX_FILE: indexFile },
 	});
+	if (result.stdoutTruncated || result.stderrTruncated) {
+		throw new TreeSnapshotError("snapshot git output exceeded the size limit");
+	}
 	return {
 		stdout: result.stdout.trim(),
 		stderr: result.stderr.trim(),
@@ -923,43 +967,79 @@ async function writeShadowAttributes(dir: string): Promise<void> {
 	await Bun.write(attributesPath, SHADOW_ATTRIBUTES);
 }
 
-/**
- * Whether a directory is the root of a git worktree (or repository).
- *
- * The second line of defence for the deletion loops. `.git` present as either a file
- * (a linked worktree's pointer) or a directory (a nested clone) means the directory
- * belongs to a different repository, whose uncommitted contents this module has no
- * snapshot of and therefore cannot restore. Excluding `/.worktrees/` already keeps
- * NarraFork's own chapters out; this also covers a nested repository somewhere else
- * in the tree, and a worktree that predates the exclude rule and is still recorded
- * inside an old snapshot.
- */
-function isWorktreeRoot(absolutePath: string): boolean {
+/** Inspect the directory entry, not a symlink's target. Only ENOENT proves absence. */
+async function lstatIfPresent(absolute: string): Promise<Stats | null> {
 	try {
-		return existsSync(resolve(absolutePath, ".git"));
-	} catch {
-		return false;
+		return await lstat(absolute);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw new TreeSnapshotError(`snapshot could not inspect ${absolute}`, error);
 	}
 }
 
+/** Called only for a real directory, never for a link to one. */
+async function isWorktreeRoot(absolutePath: string): Promise<boolean> {
+	return (await lstatIfPresent(resolve(absolutePath, ".git"))) !== null;
+}
+
 /**
- * Delete a path a target tree does not contain, refusing to take another
- * repository's worktree with it.
- *
- * Returns whether the path was removed; a refusal is logged, because "the rollback
- * did not fully apply" is something the caller's own tree comparison will notice and
- * a silent skip would make that comparison inexplicable.
+ * Do not reach a recorded child through a newly substituted symlink or repository.
+ * lstat alone protects only the final component. Inspecting parents also makes a
+ * non-directory ancestor an explicit failure, rather than silently treating ENOTDIR
+ * (or EACCES/ELOOP) as absence. The workspace root itself is caller-owned/trusted.
  */
-function removePathNotInTree(worktreePath: string, absolute: string): boolean {
-	if (isWorktreeRoot(absolute)) {
-		logger.warn("Refusing to delete a nested git worktree during a snapshot rollback", {
-			worktreePath,
-			nestedWorktree: absolute,
-		});
-		return false;
+async function inspectWorktreeEntry(worktreePath: string, absolute: string): Promise<Stats | null> {
+	const rel = relative(worktreePath, absolute);
+	const parts = rel.split(sep);
+	if (!rel || isAbsolute(rel) || parts.includes("..") || parts.includes(".git")) {
+		throw new TreeSnapshotError(
+			`Refusing to modify a path outside the snapshot workspace: ${absolute}`,
+		);
 	}
-	rmSync(absolute, { force: true, recursive: true });
-	return true;
+	let parent = worktreePath;
+	for (const part of parts.slice(0, -1)) {
+		parent = resolve(parent, part);
+		const entry = await lstatIfPresent(parent);
+		if (!entry) return null;
+		if (!entry.isDirectory()) {
+			throw new TreeSnapshotError(
+				`Refusing to traverse a non-directory snapshot ancestor: ${parent}`,
+			);
+		}
+		if (await isWorktreeRoot(parent)) {
+			throw new TreeSnapshotError(`Refusing to traverse a nested git worktree: ${parent}`);
+		}
+	}
+	return lstatIfPresent(absolute);
+}
+
+/**
+ * Remove one entry, never a subtree. A tree records blobs/links, NOT all contents
+ * of their current on-disk directories: ignored bytes and nested repositories may
+ * live there. Checking only `absolute/.git` cannot protect a repository below it.
+ * rmdir is the safety boundary: even a directory populated after lstat cannot have
+ * its contents removed. A refusal must fail the restore, not report a false success.
+ */
+async function removePathNotInTree(worktreePath: string, absolute: string): Promise<void> {
+	const entry = await inspectWorktreeEntry(worktreePath, absolute);
+	if (!entry) return;
+	if (entry.isDirectory() && (await isWorktreeRoot(absolute))) {
+		throw new TreeSnapshotError(`Refusing to delete a nested git worktree: ${absolute}`);
+	}
+	try {
+		if (entry.isDirectory()) await rmdir(absolute);
+		else await unlink(absolute);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return;
+		if (code === "ENOTEMPTY" || code === "EEXIST") {
+			throw new TreeSnapshotError(
+				`Refusing to remove a nonempty snapshot directory: ${absolute}`,
+				error,
+			);
+		}
+		throw new TreeSnapshotError(`snapshot could not safely remove ${absolute}`, error);
+	}
 }
 
 /**
@@ -1049,58 +1129,6 @@ async function ensureShadowRepo(dir: string, worktreePath: string): Promise<void
 }
 
 /**
- * Whether the local git supports `merge-tree --write-tree` (git >= 2.38).
- *
- * Cached because it cannot change while the process runs, and the scoped-revert
- * preview would otherwise probe it on every request. `null` means "not probed
- * yet"; the probe itself never throws so a missing git degrades to "unsupported"
- * rather than breaking the caller.
- */
-let mergeTreeSupported: boolean | null = null;
-
-/**
- * The probe's argv, exactly. **No flag may be added to this array.**
- *
- * git only takes the "print usage and exit" shortcut when `-h` is the *sole*
- * argument (`git.c`: `help = argc == 2 && !strcmp(argv[1], "-h")`), which is also
- * what demotes merge-tree's RUN_SETUP to RUN_SETUP_GENTLY. With `--write-tree -h`
- * the argc check fails, so git insists on finding a repository first and dies with
- * "fatal: not a git repository" before printing anything — the probe then reads a
- * modern git as unsupported and caches that for the process lifetime, permanently
- * losing merge preview / scoped revert. Invisible in development (cwd is this
- * repo) and fatal for a binary launched from anywhere else.
- *
- * Exported so a test can pin the shape; that assertion is the only thing standing
- * between this comment and a well-meant "let's probe the actual flag" edit.
- */
-export const MERGE_TREE_PROBE_ARGV: readonly string[] = ["git", "merge-tree", "-h"];
-
-export async function supportsMergeTree(): Promise<boolean> {
-	if (mergeTreeSupported !== null) return mergeTreeSupported;
-	try {
-		const result = await safeSpawn({
-			cmd: [...MERGE_TREE_PROBE_ARGV],
-			// Still pin a cwd that exists: an unset cwd inherits the process's, which may
-			// have been removed under a long-running server.
-			cwd: tmpdir(),
-			timeout: GIT_TIMEOUT_MS,
-			maxOutputBytes: 8192,
-		});
-		// `-h` exits non-zero by design; an unknown option is reported in the usage
-		// text, so the flag's presence is what decides support.
-		mergeTreeSupported = `${result.stdout}${result.stderr}`.includes("--write-tree");
-	} catch {
-		mergeTreeSupported = false;
-	}
-	return mergeTreeSupported;
-}
-
-/** Test-only: drop the cached probe result so a fresh probe runs. */
-export function resetMergeTreeSupportCacheForTests(): void {
-	mergeTreeSupported = null;
-}
-
-/**
  * Test-only: drop hot-path warm-up/cooldown state.
  *
  * Clearing the in-flight map does not cancel a capture that is actually running —
@@ -1112,23 +1140,15 @@ export function resetHotPathCaptureStateForTests(): void {
 	warmupCooldownUntil.clear();
 }
 
-/** Result of a three-way tree merge. */
-export interface TreeMergeResult {
-	/**
-	 * The merged tree. Written to the object store even when conflicts exist, but
-	 * a conflicted tree must never be checked out: it contains conflict markers.
-	 */
-	tree: string;
-	/** Paths git could not merge automatically. Empty on a clean merge. */
-	conflicts: string[];
-}
+/** Preserve conflict completeness across the snapshot adapter; names alone are not safety. */
+export type TreeMergeResult = GitTreeMergeResult;
 
 /**
  * One recorded pre/post workspace boundary to reverse.
  *
- * `before`/`after` are tree hashes of real bytes, so `after === before` of the
- * next pair proves nothing else wrote in between — that is what lets consecutive
- * pairs be collapsed while a gap forces a separate segment.
+ * `before`/`after` observe the whole workspace, not just this actor's bytes.
+ * Matching adjacent hashes cannot prove that a path belonged to the same actor
+ * throughout both windows, so each pair must keep its own reversal boundary.
  *
  * `ownedPaths` narrows the reversal to the paths the recorded call is attributable
  * for. It is needed because the hashes cover the *whole* worktree: in a shared
@@ -1143,58 +1163,34 @@ export interface TreeBoundaryPair {
 	ownedPaths?: string[] | null;
 }
 
-/** A maximal run of boundary pairs with no foreign write between them. */
+/** One boundary pair, kept independent even when adjacent tree hashes match. */
 export interface TreeRevertSegment {
-	/** Start state of the run — what this segment is merged back toward. */
 	before: string;
-	/** End state of the run — the merge base for this segment. */
 	after: string;
-	/**
-	 * Union of the collapsed pairs' owned paths, or null when any of them was
-	 * unknown. null keeps the legacy whole-tree reversal for that segment.
-	 */
+	/** Only this pair's path scope; null retains the low-level whole-tree mode. */
 	ownedPaths: string[] | null;
 }
 
 /**
- * Collapse boundary pairs into the fewest segments that are safe to reverse.
+ * Keep each measured pair in chronological order for newest-first reversal.
  *
- * Two adjacent pairs may only be merged into one span when the earlier `after`
- * equals the later `before`. A mismatch means some other actor (another narrator,
- * a subagent, the user's editor) wrote to the worktree in between; spanning across
- * that gap would put the foreign change inside the range being reversed and
- * discard it. Splitting there keeps each segment describing this actor's bytes
- * only.
+ * Unioning paths across matching boundaries is unsafe: pair 1 may own only `a`
+ * while somebody else changes `b`, then pair 2 owns `b`. A union would restore
+ * `b` to pair 1's earlier baseline, discarding the other actor's bytes. Keeping
+ * both boundaries restores `b` only to pair 2's actual before state.
  *
- * Pairs where `before === after` are skipped: the call changed nothing on disk, so
- * it neither needs reversing nor may act as an anchor.
- *
- * Owned paths are unioned across a collapsed run, since the resulting span covers
- * every one of those calls. A single unknown range poisons the union to null: the
- * span then has to be reversed whole, because there is no statement of which paths
- * inside it belonged to the actor.
+ * Equal hashes mean no workspace delta only for an already validated pair. The
+ * caller must first reject incomplete, unknown-target or out-of-scope evidence;
+ * hash equality is not proof that an arbitrary tool had no effect.
  */
 export function planTreeRevertSegments(pairs: TreeBoundaryPair[]): TreeRevertSegment[] {
-	const segments: TreeRevertSegment[] = [];
-	for (const pair of pairs) {
-		if (pair.before === pair.after) continue;
-		const owned = pair.ownedPaths === undefined ? null : pair.ownedPaths;
-		const open = segments[segments.length - 1];
-		if (open && open.after === pair.before) {
-			open.after = pair.after;
-			open.ownedPaths =
-				open.ownedPaths === null || owned === null
-					? null
-					: [...new Set([...open.ownedPaths, ...owned])];
-			continue;
-		}
-		segments.push({
+	return pairs
+		.filter((pair) => pair.before !== pair.after)
+		.map((pair) => ({
 			before: pair.before,
 			after: pair.after,
-			ownedPaths: owned === null ? null : [...new Set(owned)],
-		});
-	}
-	return segments;
+			ownedPaths: pair.ownedPaths == null ? null : [...new Set(pair.ownedPaths)],
+		}));
 }
 
 /**
@@ -1282,37 +1278,14 @@ async function mergeTreeUnlocked(
 	ours: string,
 	theirs: string,
 ): Promise<TreeMergeResult> {
-	if (!(await supportsMergeTree())) {
-		throw new TreeSnapshotError(
-			"git merge-tree --write-tree is unavailable (requires git >= 2.38)",
-		);
-	}
-	const result = await runGitRaw(
-		[
-			"merge-tree",
-			"--write-tree",
-			"--name-only",
-			"--no-messages",
-			"-z",
-			...(base === null ? [] : [`--merge-base=${base}`]),
-			ours,
-			theirs,
-		],
-		dir,
+	return mergeGitTrees({
+		gitDir: dir,
 		worktreePath,
-	);
-	if (result.exitCode !== 0 && result.exitCode !== 1) {
-		throw new TreeSnapshotError(`snapshot merge-tree failed: ${result.stderr.trim()}`);
-	}
-	if (result.stdoutTruncated) {
-		throw new TreeSnapshotError("snapshot merge-tree output exceeded the size limit");
-	}
-	const parts = result.stdout.split("\0").filter(Boolean);
-	const tree = parts[0];
-	if (!tree) {
-		throw new TreeSnapshotError("snapshot merge-tree returned no tree");
-	}
-	return { tree, conflicts: parts.slice(1) };
+		base,
+		ours,
+		theirs,
+		config: SHADOW_CONFIG_ENTRIES,
+	});
 }
 
 /** Outcome of reversing a set of segments out of the current workspace state. */
@@ -1440,6 +1413,101 @@ async function pathsPresentInTree(
 	return present;
 }
 
+/** Git tree paths always use '/', including on Windows. Deepest parent first. */
+function* treePathParents(path: string): Generator<string> {
+	for (let slash = path.lastIndexOf("/"); slash > 0; slash = path.lastIndexOf("/", slash - 1)) {
+		yield path.slice(0, slash);
+	}
+}
+
+/**
+ * Prepare changed paths for a NON-FORCED checkout. `checkout-index -f` itself can
+ * recursively delete a directory in the way of a blob, bypassing our unlink guard.
+ * Remove known leaves ourselves and let non-forced checkout fail on a new obstacle.
+ *
+ * No directory walk: only intermediate directories implied by changed tree paths
+ * are pruned, deepest first, and only with rmdir. Unknown/nonempty directories stop
+ * the restore. Compensation keeps going at independent paths and verifies its tree.
+ */
+async function prepareTreeCheckout(
+	dir: string,
+	worktreePath: string,
+	treeHash: string,
+	changedPaths: string[],
+	bestEffort = false,
+): Promise<string[]> {
+	const entries = await readTreeEntries(dir, worktreePath, treeHash, changedPaths);
+	const requiredDirs = new Set<string>();
+	for (const path of entries.keys()) {
+		for (const parent of treePathParents(path)) requiredDirs.add(parent);
+	}
+	const attempt = async (action: () => Promise<void>): Promise<boolean> => {
+		try {
+			await action();
+			return true;
+		} catch (error) {
+			if (!bestEffort) throw error;
+			return false;
+		}
+	};
+
+	// Remove the old file before creating children beneath it. A directory already
+	// needed by the target is NOT an absent blob: notably, compensation must keep
+	// `a` when the captured tree contains the gitlink `a/sub`.
+	for (const path of changedPaths) {
+		if (entries.has(path)) continue;
+		await attempt(async () => {
+			const absolute = resolve(worktreePath, path);
+			if (requiredDirs.has(path)) {
+				const entry = await inspectWorktreeEntry(worktreePath, absolute);
+				if (entry?.isDirectory()) return;
+			}
+			await removePathNotInTree(worktreePath, absolute);
+		});
+	}
+
+	// The reverse transition needs empty intermediates removed before the final
+	// directory can become a file. Do not prune unrelated parents: an ignored
+	// sibling is allowed to keep a directory whose tracked child was deleted.
+	const prune = new Set<string>();
+	for (const path of changedPaths) {
+		const intermediates: string[] = [];
+		for (const parent of treePathParents(path)) {
+			const entry = entries.get(parent);
+			if (entry) {
+				if (entry.mode !== "160000") {
+					for (const intermediate of intermediates) prune.add(intermediate);
+				}
+				break;
+			}
+			intermediates.push(parent);
+		}
+	}
+	for (const path of [...prune].sort((a, b) => b.length - a.length)) {
+		await attempt(async () => {
+			const absolute = resolve(worktreePath, path);
+			const entry = await inspectWorktreeEntry(worktreePath, absolute);
+			if (!entry) return;
+			if (!entry.isDirectory()) {
+				throw new TreeSnapshotError(`Refusing to prune a non-directory snapshot path: ${absolute}`);
+			}
+			await removePathNotInTree(worktreePath, absolute);
+		});
+	}
+
+	const toWrite: string[] = [];
+	for (const path of changedPaths) {
+		const entry = entries.get(path);
+		// A gitlink records only another repo's commit, not its uncommitted files.
+		// Leave it alone; tree verification rejects a gitlink we cannot materialise.
+		if (!entry || entry.mode === "160000") continue;
+		if (await attempt(() => removePathNotInTree(worktreePath, resolve(worktreePath, path)))) {
+			toWrite.push(path);
+		}
+	}
+	return toWrite;
+}
+
 /**
  * Produce a tree equal to `baseTree` except that `paths` take their state from
  * `sourceTree`.
@@ -1551,6 +1619,7 @@ async function planSegmentReversalUnlocked(
 ): Promise<SegmentReversalPlan> {
 	let accumulated = currentTree;
 	for (const segment of [...segments].reverse()) {
+		if (segment.ownedPaths?.length === 0) continue;
 		const merged = await mergeTreeUnlocked(
 			dir,
 			worktreePath,
@@ -1558,6 +1627,9 @@ async function planSegmentReversalUnlocked(
 			accumulated,
 			segment.before,
 		);
+		// Must precede the owned-path filter: structural conflicts can be absent
+		// from Git's index entirely, even when another file DID get listed.
+		const mergedTree = requireCompleteMergeTree(merged);
 		const owned = segment.ownedPaths;
 		// Membership goes through a Set rather than `Array.includes`: both sides scale
 		// with the change set, so a conflicted merge in a large window was O(n·m) — a
@@ -1579,11 +1651,11 @@ async function planSegmentReversalUnlocked(
 			};
 		}
 		if (!owned) {
-			accumulated = merged.tree;
+			accumulated = mergedTree;
 		} else if (owned.length > 0) {
 			// A conflicted merge tree is only safe to read at the paths that merged
 			// cleanly, and every owned path did (checked above).
-			accumulated = await adoptPathsUnlocked(dir, worktreePath, accumulated, merged.tree, owned);
+			accumulated = await adoptPathsUnlocked(dir, worktreePath, accumulated, mergedTree, owned);
 		}
 	}
 
@@ -1689,32 +1761,70 @@ async function captureUnlocked(
 	deviceId: string,
 	opts?: { gitTimeoutMs?: number; signal?: AbortSignal },
 ): Promise<string> {
-	await ensureShadowRepo(dir, worktreePath);
-	const startedAt = Date.now();
-	let added = await addAllUnlocked(dir, worktreePath, opts?.gitTimeoutMs, opts?.signal);
-	// A stale lock is indistinguishable from a live one by exit code alone, so the
-	// retry is gated on the lock file's own age. Done here rather than in `ensure`
-	// because the lock can also appear *between* two captures.
-	if (added.exitCode !== 0 && recoverStaleIndexLock(dir, worktreePath, added.stderr)) {
-		added = await addAllUnlocked(dir, worktreePath, opts?.gitTimeoutMs, opts?.signal);
+	opts?.signal?.throwIfAborted();
+	// One receipt per real scan, inside the shadow lock, never per hash/caller.
+	// This observer acquires no workspace lock and cannot authorize a restore.
+	const receipts = snapshotCaptureReceipts();
+	const attempt = await receipts.begin(worktreePath, deviceId);
+	let observedTree: string | undefined;
+	let failed: unknown;
+	try {
+		opts?.signal?.throwIfAborted();
+		await ensureShadowRepo(dir, worktreePath);
+		const startedAt = Date.now();
+		let added = await addAllUnlocked(dir, worktreePath, opts?.gitTimeoutMs, opts?.signal);
+		// A stale lock is indistinguishable from a live one by exit code alone, so the
+		// retry is gated on the lock file's own age. Done here rather than in `ensure`
+		// because the lock can also appear *between* two captures.
+		if (added.exitCode !== 0 && recoverStaleIndexLock(dir, worktreePath, added.stderr)) {
+			added = await addAllUnlocked(dir, worktreePath, opts?.gitTimeoutMs, opts?.signal);
+		}
+		reportCaptureCost(
+			worktreePath,
+			dir,
+			Date.now() - startedAt,
+			added.exitCode === 0,
+			opts?.gitTimeoutMs,
+		);
+		if (added.exitCode !== 0) {
+			throw new TreeSnapshotError(`snapshot add failed: ${added.stderr}`);
+		}
+		const written = await runGit(
+			["write-tree"],
+			dir,
+			worktreePath,
+			opts?.gitTimeoutMs,
+			opts?.signal,
+		);
+		if (written.exitCode !== 0 || !written.stdout) {
+			throw new TreeSnapshotError(`snapshot write-tree failed: ${written.stderr}`);
+		}
+		opts?.signal?.throwIfAborted();
+		const treeHash = written.stdout;
+		await recordTreeHash(deviceId, worktreePath, treeHash);
+		observedTree = treeHash;
+		return treeHash;
+	} catch (error) {
+		failed = error;
+		throw error;
+	} finally {
+		// A timed-out hot caller has already returned null. Finishing this receipt
+		// never revisits its tool/message before/after fields or session cache.
+		await receipts.finish(
+			attempt,
+			observedTree
+				? { treeHash: observedTree }
+				: {
+						reason: opts?.signal?.aborted
+							? "cancelled"
+							: /timed?\s*out|timeout|deadline exceeded|output.*(?:limit|exceed|truncat)/i.test(
+										String(failed),
+									)
+								? "budget_exceeded"
+								: "capture_failed",
+					},
+		);
 	}
-	reportCaptureCost(
-		worktreePath,
-		dir,
-		Date.now() - startedAt,
-		added.exitCode === 0,
-		opts?.gitTimeoutMs,
-	);
-	if (added.exitCode !== 0) {
-		throw new TreeSnapshotError(`snapshot add failed: ${added.stderr}`);
-	}
-	const written = await runGit(["write-tree"], dir, worktreePath, opts?.gitTimeoutMs, opts?.signal);
-	if (written.exitCode !== 0 || !written.stdout) {
-		throw new TreeSnapshotError(`snapshot write-tree failed: ${written.stderr}`);
-	}
-	const treeHash = written.stdout;
-	await recordTreeHash(deviceId, worktreePath, treeHash);
-	return treeHash;
 }
 
 /**
@@ -1757,94 +1867,43 @@ async function addAllUnlocked(
 	gitTimeoutMs?: number,
 	signal?: AbortSignal,
 ): Promise<GitResult> {
-	let added = await runGit(["add", "-A"], dir, worktreePath, gitTimeoutMs, signal);
-	if (added.exitCode !== 0) {
-		const partial = await addAllIgnoringUnreadable(dir, worktreePath, added, gitTimeoutMs, signal);
-		if (!partial) return added;
-		added = partial;
+	const addArgs = ["add", "-A", "--no-warn-embedded-repo"];
+	const added = await runGit(addArgs, dir, worktreePath, gitTimeoutMs, signal);
+	// Never retry with --ignore-errors: a skipped path is unknown, not absent.
+	// Publishing that index as a tree would let a later restore delete the path.
+	if (added.exitCode !== 0) return added;
+	// Git can exit zero after warning that an unreadable directory was skipped.
+	// Suppress only the known, non-coverage embedded-repo advice above; all other
+	// staging diagnostics leave coverage uncertain and must fail closed.
+	if (added.stderr) {
+		throw new TreeSnapshotError(`snapshot add coverage is incomplete: ${added.stderr}`);
 	}
 
-	const forced = await trackedButIgnoredPaths(dir, worktreePath);
-	if (forced.length === 0) return added;
-
-	for (const batch of batchArgs(forced)) {
-		// `--force` overrides the exclude rules for these paths only. `--ignore-errors`
-		// keeps one unreadable file from failing the batch, and the missing-pathspec case
-		// is handled by filtering to paths that exist: git aborts the *entire* `add` with
-		// exit 128 on a pathspec that matches nothing, so a file deleted between the
-		// `ls-files` and this call would otherwise cost the whole capture.
-		const result = await runGit(
-			["add", "-A", "--force", "--ignore-errors", "--", ...batch],
-			dir,
-			worktreePath,
-			gitTimeoutMs,
-			signal,
-		);
-		// Reported rather than fatal. The plain `add -A` already succeeded, so a tree
-		// missing these paths is still the pre-existing behaviour and strictly better
-		// than no snapshot at all — but it is a real loss of revert precision, so it
-		// must not be silent.
-		if (result.exitCode !== 0) {
-			logger.warn("Could not snapshot tracked-but-ignored paths", {
+	try {
+		const forced = await trackedButIgnoredPaths(dir, worktreePath);
+		for (const batch of batchArgs(forced)) {
+			const result = await runGit(
+				[...addArgs, "--force", "--", ...batch],
+				dir,
 				worktreePath,
-				pathCount: batch.length,
-				stderr: result.stderr.slice(0, 500),
-			});
+				gitTimeoutMs,
+				signal,
+			);
+			if (result.exitCode !== 0) {
+				// A failed introduction must be retried on the next real capture, not
+				// hidden by the real-index memo. No partial tree may become a boundary.
+				trackedIgnoredCache.delete(dir);
+				return result;
+			}
+			if (result.stderr) {
+				throw new TreeSnapshotError(`snapshot force-add coverage is incomplete: ${result.stderr}`);
+			}
 		}
+		return added;
+	} catch (error) {
+		trackedIgnoredCache.delete(dir);
+		throw error;
 	}
-	return added;
-}
-
-/**
- * Retry a failed `add -A` with `--ignore-errors`, for a worktree containing a file
- * git cannot read.
- *
- * A plain `add -A` treats one unreadable path as fatal: it exits 128 and stages
- * *nothing*, so a single `chmod 000` file — a fixture, a root-owned artefact a
- * container wrote, a Windows file another process holds open — cost the capture
- * outright and every boundary in that workspace with it. The whole repository became
- * unrevertable because of one file.
- *
- * `--ignore-errors` skips just the unreadable paths and exits 1, having staged
- * everything else. That is a *partial* snapshot, which is why it is not the default:
- * a tree that silently omits paths would let a rollback delete a file it never
- * recorded. It is safe as a fallback because of what it omits — a path already in the
- * index keeps its previous entry (verified), so the omission is "this one file's
- * latest bytes are missing" rather than "this file does not exist", and the rollback
- * comparison sees no change for it instead of a deletion.
- *
- * Only accepted for exit 1, which is `--ignore-errors`' specific "some paths were
- * skipped" code. Any other failure (a vanished worktree, a stale lock, a timeout) is
- * a different problem and must keep failing the capture.
- *
- * Returns null when the retry did not help, so the caller reports the original error.
- */
-async function addAllIgnoringUnreadable(
-	dir: string,
-	worktreePath: string,
-	original: GitResult,
-	gitTimeoutMs?: number,
-	signal?: AbortSignal,
-): Promise<GitResult | null> {
-	// The stderr wording is locale-dependent, so this is not gated on the message.
-	// Instead the *outcome* decides: a retry that also fails to make progress is
-	// discarded, and a stale lock is handled by its own dedicated path.
-	if (original.stderr.includes("index.lock")) return null;
-	const retried = await runGit(
-		["add", "-A", "--ignore-errors"],
-		dir,
-		worktreePath,
-		gitTimeoutMs,
-		signal,
-	);
-	if (retried.exitCode !== 0 && retried.exitCode !== 1) return null;
-	logger.warn("Snapshot captured without paths git could not read", {
-		worktreePath,
-		stderr: original.stderr.slice(0, 500),
-	});
-	// Normalised to success: the caller only distinguishes "usable index" from "no
-	// index", and the partial outcome has already been reported.
-	return { ...retried, exitCode: 0 };
 }
 
 /**
@@ -1865,43 +1924,54 @@ async function addAllIgnoringUnreadable(
  * aborts the whole invocation with exit 128 rather than skipping that one path. The
  * missing ones need no action anyway: a deletion is recorded by the plain `add -A`.
  *
- * Never throws. This is an enhancement layered on a capture that already succeeded, so
- * a failure degrades to the old behaviour instead of costing the boundary entirely.
+ * Any failed or truncated query leaves coverage unknown and fails the capture.
+ * Only a confirmed non-repository has no tracked paths by definition.
  */
 async function trackedButIgnoredPaths(dir: string, worktreePath: string): Promise<string[]> {
-	try {
-		const indexKey = realIndexIdentity(worktreePath);
-		const cached = trackedIgnoredCache.get(dir);
-		// A null key means the index could not be stat'ed (a non-git directory, or one
-		// whose gitdir moved). Caching on it would pin a stale answer, so the query runs
-		// every time — correct, and only reachable for a workspace that has no index for
-		// the tracked-but-ignored notion to even apply to.
-		if (indexKey !== null && cached?.indexKey === indexKey) return [];
+	const indexKey = realIndexIdentity(worktreePath);
+	const cached = trackedIgnoredCache.get(dir);
+	if (indexKey !== null && cached?.indexKey === indexKey) return [];
 
-		const result = await safeSpawn({
-			cmd: ["git", "ls-files", "-i", "-c", "--exclude-standard", "-z"],
-			cwd: worktreePath,
-			timeout: GIT_TIMEOUT_MS,
-			maxOutputBytes: GIT_MAX_LISTING_BYTES,
-		});
-		if (result.exitCode !== 0 || result.stdoutTruncated) return [];
-		const paths = result.stdout.split("\0").filter(Boolean);
-		if (paths.length > MAX_TRACKED_IGNORED_PATHS) {
-			logger.warn("Too many tracked-but-ignored paths to snapshot; keeping the first batch", {
-				worktreePath,
-				pathCount: paths.length,
-				cap: MAX_TRACKED_IGNORED_PATHS,
-			});
-			paths.length = MAX_TRACKED_IGNORED_PATHS;
-		}
-		const present = paths.filter((relPath) => existsSync(resolve(worktreePath, relPath)));
-		// Recorded only once the paths are about to be staged, and only for a usable key,
-		// so an interrupted capture cannot leave the cache claiming work that never ran.
-		if (indexKey !== null) trackedIgnoredCache.set(dir, { indexKey, paths: present });
-		return present;
-	} catch {
-		return [];
+	const result = await safeSpawn({
+		cmd: ["git", "ls-files", "-i", "-c", "--exclude-standard", "-z"],
+		cwd: worktreePath,
+		timeout: GIT_TIMEOUT_MS,
+		maxOutputBytes: GIT_MAX_LISTING_BYTES,
+		env: { ...process.env, LC_ALL: "C" },
+	});
+	if (result.stdoutTruncated || result.stderrTruncated) {
+		throw new TreeSnapshotError("snapshot tracked path listing exceeded the size limit");
 	}
+	if (result.exitCode !== 0) {
+		if (result.exitCode === 128 && result.stderr.startsWith("fatal: not a git repository")) {
+			return [];
+		}
+		throw new TreeSnapshotError(`snapshot tracked path listing failed: ${result.stderr}`);
+	}
+	if (result.stderr.trim()) {
+		throw new TreeSnapshotError(`snapshot tracked path coverage is incomplete: ${result.stderr}`);
+	}
+	const paths = result.stdout.split("\0").filter(Boolean);
+	if (paths.length > MAX_TRACKED_IGNORED_PATHS) {
+		throw new TreeSnapshotError("snapshot tracked path count exceeded the size limit");
+	}
+	const present = paths.filter((relPath) => {
+		try {
+			// Unlike existsSync, lstat distinguishes unreadable from absent and keeps
+			// dangling symlinks, whose link bytes still belong in the snapshot.
+			lstatSync(resolve(worktreePath, relPath));
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw new TreeSnapshotError("snapshot could not inspect a tracked path", error);
+		}
+	});
+	// addAllUnlocked clears this tentative memo if any force-add fails or throws.
+	// Do not memoize an omitted path: it can reappear without a real-index change.
+	if (indexKey !== null && present.length === paths.length) {
+		trackedIgnoredCache.set(dir, { indexKey, paths: present });
+	}
+	return present;
 }
 
 /**
@@ -2051,20 +2121,7 @@ async function restoreUnlocked(
 	// throws while earlier files are already gone — and without this the caller sees
 	// only "restore failed" over a half-applied worktree it has no way to describe.
 	try {
-		// Paths absent from the target tree were created after it and must go. Asked
-		// about only the changed paths, so the cost tracks the change set rather than
-		// the repository size.
-		const targetPaths = await pathsPresentInTree(dir, worktreePath, treeHash, changedPaths);
-		for (const relPath of changedPaths) {
-			if (targetPaths.has(relPath)) continue;
-			const absolute = resolve(worktreePath, relPath);
-			if (!existsSync(absolute)) continue;
-			// `recursive` covers the case the plain unlink cannot: the path is a file in
-			// the target tree's view but a directory on disk now — and is exactly why the
-			// nested-worktree guard is needed, since a gitlink recorded by an older
-			// snapshot looks like precisely that.
-			removePathNotInTree(worktreePath, absolute);
-		}
+		const toWrite = await prepareTreeCheckout(dir, worktreePath, treeHash, changedPaths);
 
 		// Load the target tree into the index, then materialise it on disk.
 		const readTree = await readTreeIntoShadowIndex(dir, worktreePath, treeHash);
@@ -2084,12 +2141,22 @@ async function restoreUnlocked(
 		// just above, and `checkout-index` errors with "not in the cache" for a path it
 		// has no entry for — so filtering keeps a real failure distinguishable from the
 		// expected shape of a deletion instead of having to parse the message.
-		const toWrite = changedPaths.filter((relPath) => targetPaths.has(relPath));
 		for (const batch of batchArgs(toWrite)) {
-			const checkout = await runGit(["checkout-index", "-f", "--", ...batch], dir, worktreePath);
-			if (checkout.exitCode !== 0) {
+			const checkout = await runGit(["checkout-index", "--", ...batch], dir, worktreePath);
+			if (checkout.exitCode !== 0 || checkout.stderr) {
 				throw new TreeSnapshotError(`restore checkout-index failed: ${checkout.stderr}`);
 			}
+		}
+		// Gitlinks cannot be checked out as blobs, and any skipped entry must not
+		// become a false success. Verification is scoped to this module's capture
+		// semantics, not an assertion that ignored or nested-repo bytes are recorded.
+		const verified = await addAllUnlocked(dir, worktreePath);
+		if (verified.exitCode !== 0) {
+			throw new TreeSnapshotError(`restore verification add failed: ${verified.stderr}`);
+		}
+		const restored = await runGit(["write-tree"], dir, worktreePath);
+		if (restored.exitCode !== 0 || restored.stdout !== treeHash) {
+			throw new TreeSnapshotError("restore verification did not match the target tree");
 		}
 	} catch (error) {
 		// The same two steps as a normal restore, aimed back at the state captured
@@ -2142,27 +2209,15 @@ async function compensateRestore(
 	changedPaths: string[],
 ): Promise<boolean> {
 	try {
-		const inCaptured = await pathsPresentInTree(dir, worktreePath, capturedTree, changedPaths);
-		for (const relPath of changedPaths) {
-			if (inCaptured.has(relPath)) continue;
-			const absolute = resolve(worktreePath, relPath);
-			if (!existsSync(absolute)) continue;
-			try {
-				removePathNotInTree(worktreePath, absolute);
-			} catch {
-				// The very condition that failed the restore can also block this one path.
-				// Keep going: the remaining paths are still worth restoring, and the tree
-				// comparison below decides whether the result counts as compensated.
-			}
-		}
+		const toWrite = await prepareTreeCheckout(dir, worktreePath, capturedTree, changedPaths, true);
 		const readBack = await readTreeIntoShadowIndex(dir, worktreePath, capturedTree);
 		if (readBack.exitCode !== 0) return false;
 		// Scoped to the paths the restore was going to touch, and issued in batches.
 		// `checkout-index -a` would rewrite every file in the worktree, so whatever
 		// blocked the restore (a locked file, a read-only directory) would block the
 		// compensation too even when it lies outside the change set.
-		for (const batch of batchArgs(changedPaths)) {
-			await runGit(["checkout-index", "-f", "--", ...batch], dir, worktreePath);
+		for (const batch of batchArgs(toWrite)) {
+			await runGit(["checkout-index", "--", ...batch], dir, worktreePath);
 		}
 		// Verified by hash rather than by exit code: what matters is that the bytes are
 		// back, and a per-path failure outside the change set does not change that. Must
@@ -2449,6 +2504,8 @@ export const worktreeTreeSnapshot = {
 			warmupGitTimeoutMs?: number;
 			cooldownMs?: number;
 			minStartedAt?: number;
+			/** Never reuse a scan already in flight, including one started in the same ms. */
+			requireFresh?: boolean;
 		},
 	): Promise<string | null> {
 		const budgetMs = opts?.budgetMs ?? HOT_PATH_CAPTURE_BUDGET_MS;
@@ -2470,7 +2527,10 @@ export const worktreeTreeSnapshot = {
 			for (;;) {
 				const inFlight = warmupInFlight.get(dir);
 				if (!inFlight) break;
-				if (minStartedAt === undefined || inFlight.startedAt >= minStartedAt) {
+				if (
+					!opts?.requireFresh &&
+					(minStartedAt === undefined || inFlight.startedAt >= minStartedAt)
+				) {
 					return (await raceBudget(inFlight.promise, remainingMs)) ?? null;
 				}
 				// The shared scan started before the caller's cutoff: its tree may mix
@@ -2615,6 +2675,77 @@ export const worktreeTreeSnapshot = {
 		// A replacement character means the blob was not text; a diff of mojibake is
 		// worse than reporting no preview.
 		return result.stdout.includes("\uFFFD") ? null : result.stdout;
+	},
+
+	/** Bounded historical preview; an omitted tree path is not proof of disk absence. */
+	async readFilePreviewAtTree(
+		worktreePath: string,
+		treeHash: string,
+		relPath: string,
+		deviceId: string,
+		maxBytes: number,
+		opts: { signal: AbortSignal; timeoutMs: number },
+	): Promise<ToolEditPreviewSide> {
+		const unavailable = (reason: ToolEditPreviewUnavailableReason): ToolEditPreviewSide => ({
+			status: "unavailable",
+			reason,
+		});
+		const signal = AbortSignal.any([opts.signal, AbortSignal.timeout(opts.timeoutMs)]);
+		const aborted = () =>
+			unavailable(signal.reason?.name === "TimeoutError" ? "timeout" : "cancelled");
+		if (signal.aborted) return aborted();
+		if (deviceId !== LOCAL_DEVICE_ID) return unavailable("unsupported");
+		if (
+			!/^[a-f0-9]{40,64}$/.test(treeHash) ||
+			!relPath ||
+			relPath.startsWith("/") ||
+			relPath.split("/").some((part) => part === ".." || part === ".")
+		)
+			return unavailable("unsupported");
+		const dir = shadowDir(deviceId, worktreePath);
+		const run = (args: string[], limit: number) =>
+			safeSpawn({
+				cmd: ["git", "--git-dir", dir, "--work-tree", worktreePath, ...args],
+				timeout: opts.timeoutMs,
+				signal,
+				maxOutputBytes: limit,
+				env: { ...process.env, ...SHADOW_CONFIG_ENV, GIT_LITERAL_PATHSPECS: "1" },
+			});
+		try {
+			const entry = await run(["ls-tree", "-l", "-z", treeHash, "--", relPath], 16 * 1024);
+			if (signal.aborted) return aborted();
+			if (entry.exitCode !== 0) return unavailable("missing_evidence");
+			if (entry.stdoutTruncated) return unavailable("too_large");
+			// Snapshots exclude ignored paths. No entry can mean an existing file was
+			// omitted, so neither current disk contents nor current ignore rules can
+			// upgrade this historical coverage gap into proof of absence.
+			if (!entry.stdout) return unavailable("missing_evidence");
+			const tab = entry.stdout.indexOf("\t");
+			const [mode, type, oid, sizeText] = entry.stdout.slice(0, tab).trim().split(/\s+/);
+			if (tab < 0 || entry.stdout.slice(tab + 1) !== `${relPath}\0`)
+				return unavailable("ambiguous");
+			if (type !== "blob" || (mode !== "100644" && mode !== "100755"))
+				return unavailable("unsupported");
+			const size = Number(sizeText);
+			if (!Number.isSafeInteger(size) || size < 0) return unavailable("unreadable");
+			if (size > maxBytes) return unavailable("too_large");
+			const body = await run(["cat-file", "blob", oid], maxBytes);
+			if (signal.aborted) return aborted();
+			if (body.stdoutTruncated) return unavailable("too_large");
+			if (body.exitCode !== 0) return unavailable("unreadable");
+			if (body.stdout.includes("\0")) return unavailable("binary");
+			// safeSpawn decodes stdout. Verify the re-encoded Git blob identity so invalid
+			// UTF-8 (or a stripped BOM) can never silently become plausible historic text.
+			const actual = createHash(oid.length === 64 ? "sha256" : "sha1")
+				.update(`blob ${size}\0`)
+				.update(body.stdout, "utf8")
+				.digest("hex");
+			if (Buffer.byteLength(body.stdout, "utf8") !== size || actual !== oid)
+				return unavailable("invalid_encoding");
+			return { status: "available", content: body.stdout };
+		} catch {
+			return signal.aborted ? aborted() : unavailable("unreadable");
+		}
 	},
 
 	/**
@@ -2830,48 +2961,40 @@ export const worktreeTreeSnapshot = {
 			// The system temp directory is swept by the OS, which is the whole point.
 			const scratchIndex = resolve(tmpdir(), `nf-restore-into-${generateId()}.index`);
 			try {
-				let currentTree: string | null = null;
 				const added = await runGitWithIndex(
-					["add", "-A"],
+					["add", "-A", "--no-warn-embedded-repo"],
 					sourceDir,
 					targetWorktreePath,
 					scratchIndex,
 				);
-				if (added.exitCode === 0) {
-					const written = await runGitWithIndex(
-						["write-tree"],
-						sourceDir,
-						targetWorktreePath,
-						scratchIndex,
-					);
-					if (written.exitCode === 0 && written.stdout) currentTree = written.stdout;
+				if (added.exitCode !== 0 || added.stderr) {
+					throw new TreeSnapshotError(`fork capture add failed or incomplete: ${added.stderr}`);
 				}
-
-				if (currentTree && currentTree !== treeHash) {
-					const changed = await runGitPaths(
-						["diff-tree", "-r", "--name-only", "--no-commit-id", "-z", treeHash, currentTree],
-						sourceDir,
-						targetWorktreePath,
-						{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
-					);
-					if (changed.exitCode === 0 && changed.paths.length > 0) {
-						const inSnapshot = await pathsPresentInTree(
-							sourceDir,
-							targetWorktreePath,
-							treeHash,
-							changed.paths,
-						);
-						for (const relPath of changed.paths) {
-							if (inSnapshot.has(relPath)) continue;
-							const absolute = resolve(targetWorktreePath, relPath);
-							if (!existsSync(absolute)) continue;
-							// `recursive` covers a path that is a file in the snapshot's view but a
-							// directory on disk, and the guard keeps that from eating a nested
-							// worktree this module holds no snapshot of.
-							removePathNotInTree(targetWorktreePath, absolute);
-						}
-					}
+				const written = await runGitWithIndex(
+					["write-tree"],
+					sourceDir,
+					targetWorktreePath,
+					scratchIndex,
+				);
+				if (written.exitCode !== 0 || !written.stdout) {
+					throw new TreeSnapshotError(`fork capture write-tree failed: ${written.stderr}`);
 				}
+				if (written.stdout === treeHash) return;
+				const changed = await runGitPaths(
+					["diff-tree", "-r", "--name-only", "--no-commit-id", "-z", treeHash, written.stdout],
+					sourceDir,
+					targetWorktreePath,
+					{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
+				);
+				if (changed.exitCode !== 0) {
+					throw new TreeSnapshotError(`fork diff-tree failed: ${changed.stderr}`);
+				}
+				const toWrite = await prepareTreeCheckout(
+					sourceDir,
+					targetWorktreePath,
+					treeHash,
+					changed.paths,
+				);
 
 				// The write phase uses the scratch index too, for the reason the hash phase
 				// already documents: this repo's own index is a stat cache of the *source*
@@ -2894,17 +3017,38 @@ export const worktreeTreeSnapshot = {
 				if (readTree.exitCode !== 0) {
 					throw new TreeSnapshotError(`fork read-tree failed: ${readTree.stderr}`);
 				}
-				// `-a` is correct here, unlike in `restore`: the target worktree is a fresh
-				// fork being brought to a known state wholesale, so there is no "outside the
-				// change set" whose mtime this could disturb.
-				const checkout = await runGitWithIndex(
-					["checkout-index", "-a", "-f"],
+				// Only prepared paths, without -f: even a fresh fork may contain ignored
+				// directories or a nested repository that no snapshot can reconstruct.
+				for (const batch of batchArgs(toWrite)) {
+					const checkout = await runGitWithIndex(
+						["checkout-index", "--", ...batch],
+						sourceDir,
+						targetWorktreePath,
+						scratchIndex,
+					);
+					if (checkout.exitCode !== 0 || checkout.stderr) {
+						throw new TreeSnapshotError(`fork checkout-index failed: ${checkout.stderr}`);
+					}
+				}
+				const verified = await runGitWithIndex(
+					["add", "-A", "--no-warn-embedded-repo"],
 					sourceDir,
 					targetWorktreePath,
 					scratchIndex,
 				);
-				if (checkout.exitCode !== 0) {
-					throw new TreeSnapshotError(`fork checkout-index failed: ${checkout.stderr}`);
+				if (verified.exitCode !== 0 || verified.stderr) {
+					throw new TreeSnapshotError(
+						`fork verification add failed or incomplete: ${verified.stderr}`,
+					);
+				}
+				const restored = await runGitWithIndex(
+					["write-tree"],
+					sourceDir,
+					targetWorktreePath,
+					scratchIndex,
+				);
+				if (restored.exitCode !== 0 || restored.stdout !== treeHash) {
+					throw new TreeSnapshotError("fork verification did not match the target tree");
 				}
 			} finally {
 				rmSync(scratchIndex, { force: true });

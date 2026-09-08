@@ -19,7 +19,7 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { fileAttributions, narrators } from "../../db/schema";
+import { fileAttributions, narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
 // The real module is captured and restored in `afterAll`: `mock.module` is
@@ -33,7 +33,11 @@ const {
 	appendSubagentFileChanges,
 	formatSubagentFileChanges,
 	getFileChangesBySubagent,
+	getChildSubagentFileChanges,
+	getTeamSubagentFileChanges,
 	getSubagentFileChanges,
+	subagentFileIdentityKey,
+	MAX_LEGACY_ATTRIBUTION_ROWS,
 	hasSubagentFileChanges,
 	INJECTED_FILE_LIST_MAX,
 	MAX_AGGREGATED_FILES,
@@ -43,7 +47,12 @@ const PARENT = "parent-1";
 const WORKSPACE = "/repo";
 const OTHER_WORKSPACE = "/elsewhere";
 
-async function makeNarrator(id: string, parentNarratorId: string | null, cwd?: string) {
+async function makeNarrator(
+	id: string,
+	parentNarratorId: string | null,
+	cwd?: string,
+	over: Partial<typeof narrators.$inferInsert> = {},
+) {
 	const now = new Date().toISOString();
 	await db.insert(narrators).values({
 		id,
@@ -51,7 +60,10 @@ async function makeNarrator(id: string, parentNarratorId: string | null, cwd?: s
 		createdAt: now,
 		updatedAt: now,
 		...(cwd ? { cwd } : {}),
-		...(parentNarratorId ? { parentNarratorId, type: "subagent" } : {}),
+		...(parentNarratorId
+			? { parentNarratorId, type: "subagent" as const, variant: "subagent:general" }
+			: {}),
+		...over,
 	});
 }
 
@@ -64,18 +76,21 @@ async function attribute(over: {
 	linesAdded?: number | null;
 	linesRemoved?: number | null;
 	workspacePath?: string;
+	deviceId?: string;
+	changedAt?: string;
 }) {
 	attributionSeq += 1;
 	await db.insert(fileAttributions).values({
 		id: `attr-${attributionSeq}`,
-		deviceId: "local",
+		deviceId: over.deviceId ?? "local",
 		workspacePath: over.workspacePath ?? WORKSPACE,
 		filePath: over.filePath,
 		narratorId: over.narratorId,
 		action: over.action ?? "edit",
 		linesAdded: over.linesAdded ?? null,
-		linesRemoved: over.linesRemoved ?? null,
-		changedAt: new Date().toISOString(),
+		linesRemoved:
+			over.linesRemoved === undefined ? (over.linesAdded == null ? null : 0) : over.linesRemoved,
+		changedAt: over.changedAt ?? new Date().toISOString(),
 	});
 }
 
@@ -208,7 +223,7 @@ describe("getSubagentFileChanges — aggregation", () => {
 		// Absent parent path must not be read as "everything is outside".
 		await attribute({ narratorId: "sub-a", filePath: "x.ts", linesAdded: 1 });
 		const changes = await getSubagentFileChanges(PARENT);
-		expect(changes.files[0]?.outsideParentWorkspace).toBe(false);
+		expect(changes.files[0]?.outsideParentWorkspace).toBeNull();
 	});
 });
 
@@ -369,7 +384,7 @@ describe("getFileChangesBySubagent — the card projection", () => {
 
 		const byId = await getFileChangesBySubagent(["sub-a"]);
 
-		expect(byId.get("sub-a")?.files[0]?.outsideParentWorkspace).toBe(false);
+		expect(byId.get("sub-a")?.files[0]?.outsideParentWorkspace).toBeNull();
 	});
 });
 
@@ -386,6 +401,9 @@ describe("formatSubagentFileChanges — model-facing block", () => {
 	}) {
 		return {
 			subagentNarratorId: "sub-a",
+			deviceId: "local",
+			workspacePath: WORKSPACE,
+
 			filePath: over.filePath ?? "a.ts",
 			linesAdded: over.linesAdded === undefined ? 1 : over.linesAdded,
 			linesRemoved: over.linesRemoved === undefined ? 0 : over.linesRemoved,
@@ -405,6 +423,7 @@ describe("formatSubagentFileChanges — model-facing block", () => {
 			totalUnmeasured: 0,
 			bashTouchedCount: 0,
 			countsTruncated: false,
+			attributionScope: "legacy_unscoped" as const,
 		};
 	}
 
@@ -412,7 +431,7 @@ describe("formatSubagentFileChanges — model-facing block", () => {
 		expect(formatSubagentFileChanges(aggregate())).toBe("");
 	});
 
-	test("lists a single change without a churn qualifier", () => {
+	test("labels even a single legacy observation as churn, never exact net contribution", () => {
 		const text = formatSubagentFileChanges(
 			aggregate({
 				files: [file({ filePath: "w.ts", linesAdded: 42, linesRemoved: 3 })],
@@ -420,9 +439,9 @@ describe("formatSubagentFileChanges — model-facing block", () => {
 			}),
 		);
 		expect(text).toContain("w.ts +42 -3");
-		// One change means churn == net difference, so the qualifier would be noise.
-		expect(text).not.toContain("across");
-		expect(text).not.toContain("cumulative");
+		expect(text).toContain("cumulative");
+		expect(text).toContain("Legacy/unscoped");
+		expect(text).toContain("no verified operation/attempt link");
 	});
 
 	test("qualifies figures that fold several edits together", () => {
@@ -519,17 +538,280 @@ describe("formatSubagentFileChanges — model-facing block", () => {
 	});
 });
 
+describe("execution and device isolation regressions", () => {
+	const scope = {
+		sourceToolUseId: "agent-current",
+		startedAt: "2026-01-01T10:00:00.000Z",
+		completedAt: "2026-01-01T11:00:00.000Z",
+	};
+	const childOptions = (childNarratorId = "sub-a") => ({
+		parentNarratorId: PARENT,
+		childNarratorId,
+		scope,
+		parentWorkspace: { deviceId: "local", workspacePath: WORKSPACE },
+	});
+
+	test("readonly B's result never carries A's changes", async () => {
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "only-a.ts",
+			linesAdded: 10,
+			changedAt: scope.startedAt,
+		});
+		const text = await appendSubagentFileChanges(
+			childOptions("sub-b"),
+			"Read-only review finished",
+		);
+		expect(text).toBe("Read-only review finished");
+		expect((await getTeamSubagentFileChanges(PARENT)).files[0]?.filePath).toBe("only-a.ts");
+	});
+
+	test("single child and scoped card agree while the explicit team query retains history", async () => {
+		for (const [changedAt, linesAdded] of [
+			["2026-01-01T09:00:00.000Z", 100],
+			["2026-01-01T10:30:00.000Z", 5],
+			["2026-01-01T12:00:00.000Z", 200],
+		] as const)
+			await attribute({ narratorId: "sub-a", filePath: "same.ts", linesAdded, changedAt });
+		await attribute({
+			narratorId: "sub-b",
+			filePath: "sibling.ts",
+			linesAdded: 9,
+			changedAt: scope.startedAt,
+		});
+		const child = await getChildSubagentFileChanges(childOptions());
+		const card = (
+			await getFileChangesBySubagent(["sub-a"], {
+				scopesBySubagent: new Map([["sub-a", scope]]),
+				parentWorkspacesBySubagent: new Map([["sub-a", childOptions().parentWorkspace]]),
+			})
+		).get("sub-a");
+		if (!card) throw new Error("The scoped card must include the measured child");
+		expect(child).toEqual(card);
+		expect(child.totalFiles).toBe(1);
+		expect(child.files[0]?.linesAdded).toBe(5);
+		expect(child.attributionScope).toBe("legacy_unscoped");
+		const team = await getTeamSubagentFileChanges(PARENT);
+		expect(team.files.find((file) => file.filePath === "same.ts")?.linesAdded).toBe(305);
+		expect(team.totalFiles).toBe(2);
+		const text = await appendSubagentFileChanges(childOptions(), "done");
+		expect(text).toContain("same.ts +5 -0");
+		expect(text).not.toContain("sibling.ts");
+		expect(text).toContain("Time-window filter only");
+		expect(text).toContain("not proof of this attempt");
+	});
+
+	test("unlinked historical attribution is explicitly legacy/unscoped", async () => {
+		await attribute({ narratorId: "sub-a", filePath: "legacy.ts", linesAdded: 3 });
+		const options = { ...childOptions(), scope: { sourceToolUseId: "missing-attempt" } };
+		const changes = await getChildSubagentFileChanges(options);
+		expect(changes.attributionScope).toBe("legacy_unscoped");
+		expect(changes.scope).toEqual({
+			sourceToolUseId: "missing-attempt",
+			startedAt: null,
+			completedAt: null,
+		});
+		const text = await appendSubagentFileChanges(options, "done");
+		expect(text).toContain("Execution boundary unavailable");
+		expect(text).toContain("not verified changes from the current run");
+	});
+
+	test("narrow parent tool timing selects the requested legacy window", async () => {
+		await db.insert(narratorMessages).values({
+			id: "agent-message",
+			narratorId: PARENT,
+			role: "assistant",
+			contentJson: [],
+			createdAt: scope.startedAt,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: "agent-call",
+			narratorId: PARENT,
+			messageId: "agent-message",
+			toolUseId: scope.sourceToolUseId,
+			toolName: "Agent",
+			executionStartedAt: scope.startedAt,
+			completedAt: scope.completedAt,
+			createdAt: "2026-01-01T09:00:00.000Z",
+		});
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "previous.ts",
+			linesAdded: 99,
+			changedAt: "2026-01-01T09:30:00.000Z",
+		});
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "current.ts",
+			linesAdded: 2,
+			changedAt: scope.startedAt,
+		});
+		const changes = await getChildSubagentFileChanges({
+			...childOptions(),
+			scope: { sourceToolUseId: scope.sourceToolUseId },
+		});
+		expect(changes.scope).toEqual(scope);
+		expect(changes.files.map((file) => file.filePath)).toEqual(["current.ts"]);
+		expect(changes.attributionScope).toBe("legacy_unscoped");
+	});
+
+	test("device + workspace + path partition write/edit and shell aggregates", async () => {
+		for (const [deviceId, workspacePath] of [
+			["local", WORKSPACE],
+			["remote-a", WORKSPACE],
+			["remote-a", OTHER_WORKSPACE],
+		]) {
+			await attribute({
+				narratorId: "sub-a",
+				filePath: "shared.ts",
+				deviceId,
+				workspacePath,
+				linesAdded: 2,
+				changedAt: scope.startedAt,
+			});
+			await attribute({
+				narratorId: "sub-a",
+				filePath: "shell.ts",
+				deviceId,
+				workspacePath,
+				action: "bash",
+				changedAt: scope.startedAt,
+			});
+		}
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "shell.ts",
+			action: "bash",
+			changedAt: scope.startedAt,
+		});
+		const child = await getChildSubagentFileChanges(childOptions());
+		expect(child.totalFiles).toBe(3);
+		expect(child.bashTouchedCount).toBe(3);
+		expect(new Set(child.files.map(subagentFileIdentityKey)).size).toBe(3);
+		expect(child.files.every((file) => file.linesAdded === 2)).toBe(true);
+		expect(child.files.filter((file) => file.outsideParentWorkspace === true)).toHaveLength(2);
+		const team = await getTeamSubagentFileChanges(PARENT, WORKSPACE, "local");
+		expect(team.files).toEqual(child.files);
+		expect(team.bashTouchedCount).toBe(3);
+		expect(formatSubagentFileChanges(child)).toContain('device="remote-a"');
+	});
+
+	test("ordinary primary forks are excluded while legacy and variant subagents remain", async () => {
+		await makeNarrator("ordinary-fork", PARENT, WORKSPACE, { type: "primary", variant: "primary" });
+		await makeNarrator("legacy-child", PARENT, WORKSPACE, { type: "subagent", variant: "primary" });
+		await makeNarrator("variant-child", PARENT, WORKSPACE, {
+			type: "primary",
+			variant: "subagent:review",
+		});
+		for (const narratorId of ["ordinary-fork", "legacy-child", "variant-child"]) {
+			await attribute({
+				narratorId,
+				filePath: `${narratorId}.ts`,
+				linesAdded: 1,
+				changedAt: scope.startedAt,
+			});
+		}
+		const team = await getSubagentFileChanges(PARENT);
+		expect(team.totalFiles).toBe(2);
+		expect(team.files.some((file) => file.subagentNarratorId === "ordinary-fork")).toBe(false);
+		const cards = await getFileChangesBySubagent([
+			"ordinary-fork",
+			"legacy-child",
+			"variant-child",
+		]);
+		expect(cards.has("ordinary-fork")).toBe(false);
+		expect(cards.size).toBe(2);
+		expect(await appendSubagentFileChanges(childOptions("ordinary-fork"), "fork result")).toBe(
+			"fork result",
+		);
+	});
+
+	test("single-child requests cannot cross the parent relationship", async () => {
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "private.ts",
+			linesAdded: 1,
+			changedAt: scope.startedAt,
+		});
+		const changes = await getChildSubagentFileChanges({
+			...childOptions(),
+			parentNarratorId: "different-parent",
+		});
+		expect(changes.totalFiles).toBe(0);
+	});
+
+	test("unknown parent device is null, not known-inside, across child/team/cards", async () => {
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "same-path.ts",
+			linesAdded: 1,
+			changedAt: scope.startedAt,
+		});
+		const parentWorkspace = { deviceId: null, workspacePath: WORKSPACE };
+		const child = await getChildSubagentFileChanges({ ...childOptions(), parentWorkspace });
+		const team = await getTeamSubagentFileChanges(PARENT, WORKSPACE, null);
+		const card = (
+			await getFileChangesBySubagent(["sub-a"], {
+				parentWorkspacesBySubagent: new Map([["sub-a", parentWorkspace]]),
+			})
+		).get("sub-a");
+		for (const value of [child, team, card])
+			expect(value?.files[0]?.outsideParentWorkspace).toBeNull();
+		expect(formatSubagentFileChanges(child)).toContain("unknown parent device/workspace coverage");
+	});
+
+	test("a missing removed measurement remains unmeasured even with known added lines", async () => {
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "partial.ts",
+			linesAdded: 3,
+			linesRemoved: null,
+		});
+		const changes = await getSubagentFileChanges(PARENT);
+		expect(changes.files[0]?.linesAdded).toBe(3);
+		expect(changes.files[0]?.linesRemoved).toBeNull();
+		expect(changes.totalUnmeasured).toBe(1);
+	});
+
+	test("source-row budget yields an explicit lower bound, including wholly omitted children", async () => {
+		const stmt = sqlite.prepare(
+			"INSERT INTO file_attributions (id, device_id, workspace_path, file_path, narrator_id, action, lines_added, lines_removed, changed_at) VALUES (?, 'local', '/repo', 'many.ts', 'sub-a', 'edit', 1, 0, ?)",
+		);
+		sqlite.transaction(() => {
+			for (let index = 0; index < MAX_LEGACY_ATTRIBUTION_ROWS + 1; index++)
+				stmt.run(`bulk-${index}`, scope.startedAt);
+		})();
+		await attribute({ narratorId: "sub-b", filePath: "later.ts", linesAdded: 1 });
+		const cards = await getFileChangesBySubagent(["sub-a", "sub-b"]);
+		expect(cards.get("sub-a")?.countsTruncated).toBe(true);
+		expect(cards.get("sub-b")?.countsTruncated).toBe(true);
+		expect(cards.get("sub-b")?.totalFiles).toBe(0);
+		const omitted = cards.get("sub-b");
+		if (!omitted) throw new Error("Omitted child must retain an incomplete projection");
+		expect(hasSubagentFileChanges(omitted)).toBe(true);
+		expect(formatSubagentFileChanges(omitted)).toContain("totals are lower bounds");
+	});
+});
+
 describe("appendSubagentFileChanges", () => {
 	test("appends the block to a result", async () => {
 		await attribute({ narratorId: "sub-a", filePath: "w.ts", linesAdded: 4, linesRemoved: 1 });
-		const text = await appendSubagentFileChanges(PARENT, WORKSPACE, "all done");
+		const text = await appendSubagentFileChanges(
+			{ parentNarratorId: PARENT, childNarratorId: "sub-a", scope: { sourceToolUseId: null } },
+			"all done",
+		);
 		expect(text.startsWith("all done")).toBe(true);
 		expect(text).toContain("<subagent_file_changes>");
 		expect(text).toContain("w.ts +4 -1");
 	});
 
 	test("leaves the result untouched when nothing changed", async () => {
-		expect(await appendSubagentFileChanges(PARENT, WORKSPACE, "all done")).toBe("all done");
+		expect(
+			await appendSubagentFileChanges(
+				{ parentNarratorId: PARENT, childNarratorId: "sub-a", scope: { sourceToolUseId: null } },
+				"all done",
+			),
+		).toBe("all done");
 	});
 
 	/**
@@ -538,7 +820,16 @@ describe("appendSubagentFileChanges", () => {
 	 */
 	test("preserves the original text when aggregation fails", async () => {
 		const errorText = "Subagent error: boom";
-		expect(await appendSubagentFileChanges("no-such-parent", WORKSPACE, errorText)).toBe(errorText);
+		expect(
+			await appendSubagentFileChanges(
+				{
+					parentNarratorId: "no-such-parent",
+					childNarratorId: "sub-a",
+					scope: { sourceToolUseId: null },
+				},
+				errorText,
+			),
+		).toBe(errorText);
 	});
 });
 
@@ -557,6 +848,68 @@ describe("appendSubagentFileChanges", () => {
  * pins the overlap: a file recorded by the tool chain must be visible in BOTH.
  */
 describe("in-memory TeamStatus source and the DB aggregate agree", () => {
+	test("same path on different devices/workspaces remains distinct in every projection", async () => {
+		const {
+			recordTeamFileChange,
+			getTeamFileChanges,
+			getTeamFileChangeEntries,
+			clearTeamFileChanges,
+		} = await import("../subagent-team");
+		clearTeamFileChanges(PARENT);
+		for (const [deviceId, workspacePath] of [
+			["local", WORKSPACE],
+			["remote-a", WORKSPACE],
+			["remote-a", OTHER_WORKSPACE],
+		]) {
+			recordTeamFileChange(PARENT, "sub-a", "same.ts", { deviceId, workspacePath });
+			await attribute({
+				narratorId: "sub-a",
+				filePath: "same.ts",
+				deviceId,
+				workspacePath,
+				linesAdded: 1,
+			});
+		}
+		recordTeamFileChange(PARENT, "sub-a", "same.ts", {
+			deviceId: "local",
+			workspacePath: WORKSPACE,
+		});
+		const entries = getTeamFileChangeEntries(PARENT).get("sub-a") ?? [];
+		const dbFiles = (await getSubagentFileChanges(PARENT)).files;
+		expect(entries.map(subagentFileIdentityKey).sort()).toEqual(
+			dbFiles.map(subagentFileIdentityKey).sort(),
+		);
+		expect(getTeamFileChanges(PARENT).get("sub-a")?.size).toBe(3);
+		clearTeamFileChanges(PARENT);
+	});
+
+	test("legacy callers expose unknown location and ordinary forks do not enter the team", async () => {
+		const {
+			recordTeamFileChange,
+			getTeamFileChanges,
+			getTeamFileChangeEntries,
+			clearTeamFileChanges,
+		} = await import("../subagent-team");
+		clearTeamFileChanges(PARENT);
+		await makeNarrator("ordinary-fork", PARENT, WORKSPACE, { type: "primary", variant: "primary" });
+		recordTeamFileChange(PARENT, "ordinary-fork", "fork.ts", {
+			deviceId: "local",
+			workspacePath: WORKSPACE,
+		});
+		recordTeamFileChange(PARENT, "sub-a", "legacy.ts");
+		expect(getTeamFileChanges(PARENT).has("ordinary-fork")).toBe(false);
+		expect(getTeamFileChangeEntries(PARENT).get("sub-a")?.[0]).toEqual({
+			deviceId: null,
+			workspacePath: null,
+			filePath: "legacy.ts",
+			attributionScope: "legacy_unscoped",
+		});
+		expect([...(getTeamFileChanges(PARENT).get("sub-a") ?? [])].join("\n")).toContain(
+			"location unknown",
+		);
+		clearTeamFileChanges(PARENT);
+	});
+
 	test("a file recorded for a subagent appears in both sources", async () => {
 		const { recordTeamFileChange, getTeamFileChanges, clearTeamFileChanges } = await import(
 			"../subagent-team"
@@ -565,7 +918,10 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 
 		// One change, recorded the way `trackFileChange` records it: the in-memory team
 		// map AND an attribution row.
-		recordTeamFileChange(PARENT, "sub-a", "src/shared.ts");
+		recordTeamFileChange(PARENT, "sub-a", "src/shared.ts", {
+			deviceId: "local",
+			workspacePath: WORKSPACE,
+		});
 		await attribute({
 			narratorId: "sub-a",
 			filePath: "src/shared.ts",
@@ -574,7 +930,13 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 		});
 
 		const inMemory = getTeamFileChanges(PARENT);
-		expect(inMemory.get("sub-a")?.has("src/shared.ts")).toBe(true);
+		expect([...(inMemory.get("sub-a") ?? [])].join("\n")).toContain(
+			subagentFileIdentityKey({
+				deviceId: "local",
+				workspacePath: WORKSPACE,
+				filePath: "src/shared.ts",
+			}),
+		);
 
 		const aggregate = await getSubagentFileChanges(PARENT);
 		const file = aggregate.files.find((f) => f.filePath === "src/shared.ts");

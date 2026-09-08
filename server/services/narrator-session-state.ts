@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
+import type { FileReferenceSnapshot } from "@shared/file-reference";
 import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent";
 import { hotSafe } from "../lib/hot-safe";
 import { normalizePathForComparison } from "../lib/platform-path";
@@ -291,6 +292,8 @@ export interface SavedBufferedFile {
 export interface BufferedMessage {
 	id: string;
 	text: string;
+	/** Server-accepted immutable bytes; summaries expose only reference metadata. */
+	fileReferences?: FileReferenceSnapshot[];
 	images?: ImageRef[];
 	textFiles?: File[];
 	bufferedAt: string;

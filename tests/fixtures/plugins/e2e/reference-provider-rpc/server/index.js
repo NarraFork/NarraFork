@@ -4,7 +4,8 @@ const PACKAGE_DIGEST = process.env.NF_PLUGIN_PACKAGE_DIGEST;
 const RPC_PROTOCOL = "narrafork.rpc/1";
 const PROVIDER_PROTOCOL = "1.0";
 const MAX_HEADER_BYTES = 8 * 1024;
-const MAX_FRAME_BYTES = 64 * 1024;
+// Provider requests carry full histories; inbound host responses share this bounded parser.
+const MAX_FRAME_BYTES = 32 * 1024 * 1024;
 const MAX_BUFFER_BYTES = MAX_HEADER_BYTES + MAX_FRAME_BYTES + 4;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -15,10 +16,21 @@ let runtimeId;
 let generation;
 
 function append(left, right) {
-	const next = new Uint8Array(left.byteLength + right.byteLength);
+	const length = left.byteLength + right.byteLength;
+	if (left.buffer instanceof ArrayBuffer && left.byteOffset + length <= left.buffer.byteLength) {
+		const next = new Uint8Array(left.buffer, left.byteOffset, length);
+		next.set(right, left.byteLength);
+		return next;
+	}
+	// Geometric growth avoids repeatedly copying a multi-MiB history for each stdin chunk.
+	const capacity = Math.max(
+		length,
+		Math.min(MAX_BUFFER_BYTES, Math.max(64 * 1024, left.buffer.byteLength * 2)),
+	);
+	const next = new Uint8Array(capacity);
 	next.set(left);
 	next.set(right, left.byteLength);
-	return next;
+	return next.subarray(0, length);
 }
 
 function delimiterIndex(bytes) {
@@ -419,9 +431,13 @@ function parseFrames() {
 process.stdin.on("data", (chunk) => {
 	try {
 		buffer = append(buffer, new Uint8Array(chunk));
-		if (buffer.byteLength > MAX_BUFFER_BYTES) throw new Error("RPC input buffer exceeds limit");
 		parseFrames();
-	} catch {
+		if (buffer.byteLength > MAX_BUFFER_BYTES) throw new Error("RPC input buffer exceeds limit");
+	} catch (error) {
+		// Diagnostics only; never log request content.
+		process.stderr.write(
+			`RPC framing failure (${error instanceof Error ? error.name : "unknown"}, buffered=${buffer.byteLength})\n`,
+		);
 		process.exit(2);
 	}
 });

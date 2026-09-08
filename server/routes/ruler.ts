@@ -7,6 +7,7 @@ import { chapterEdges, chapters, narrators, projects } from "../db/schema";
 import { worktreeLock } from "../lib/async-mutex";
 import { catalogError, NotFoundError, ValidationError } from "../lib/errors";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
+import { requireMarkerResolvableTree } from "../lib/git-tree-merge";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { requireProjectAccess } from "../lib/project-access";
@@ -1462,7 +1463,10 @@ rulerRoutes.post("/:id/ruler/rebase-parked", async (c) => {
 			current,
 			treeHash,
 		);
-		const changedFiles = await worktreeTreeSnapshot.materializeTree(worktreePath, merged.tree);
+		const changedFiles = await worktreeTreeSnapshot.materializeTree(
+			worktreePath,
+			requireMarkerResolvableTree(merged),
+		);
 		// The bytes are on disk now — with markers where the two sides disagree — so the
 		// snapshot is no longer the only copy and the debt is discharged. Keeping the
 		// coordinates instead would make the next rebase try to settle a reapply against a

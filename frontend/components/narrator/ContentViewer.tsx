@@ -1,5 +1,6 @@
-import { ActionIcon, Box, Code, CopyButton, Group, Menu, Modal, Tooltip } from "@mantine/core";
+import { ActionIcon, Box, CopyButton, Group, Menu, Modal, Tooltip } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
+import type { DiffDocument } from "@shared/pretext-layout/diff-core";
 import {
 	IconArrowBackUp,
 	IconArrowBarToUp,
@@ -22,10 +23,8 @@ import {
 	type CSSProperties,
 	createContext,
 	forwardRef,
-	lazy,
 	memo,
 	type ReactNode,
-	Suspense,
 	useCallback,
 	useContext,
 	useEffect,
@@ -44,11 +43,11 @@ import {
 	safeAreaFullscreenModalBodyStyle,
 } from "../../lib/safe-area";
 import { Z } from "../../lib/z-index";
-import { AutoFollowScroll } from "./AutoFollowScroll";
+import { AutoFollowScroll, type ContentViewportLayout } from "./AutoFollowScroll";
 import { CompactMenuSub } from "./CompactMenuSub";
+import { ContentBody } from "./ContentBody";
 import { useDetachFromBottom } from "./DetachFromBottomCtx";
-import { DiffView } from "./DiffView";
-import { MarkdownContent } from "./MarkdownContent";
+import { FileReferenceScopeProvider, type FileReferenceScopeValue } from "./FileReferenceScope";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
 import {
 	BLOCK_ID_ATTR,
@@ -62,30 +61,6 @@ import { useRenderInteractive } from "./RenderLodCtx";
 const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
 const INLINE_FULL_CONTENT_MAX_CHARS = 20_000;
 const MODAL_FULL_CONTENT_MAX_CHARS = 120_000;
-
-const HighlightedCode = lazy(() =>
-	import("./HighlightedCode").then((module) => ({ default: module.HighlightedCode })),
-);
-
-interface CodeHighlightOrFallbackProps {
-	code: string;
-	lang: string;
-	style?: CSSProperties;
-}
-
-function CodeHighlightOrFallback({ code, lang, style }: CodeHighlightOrFallbackProps) {
-	return (
-		<Suspense
-			fallback={
-				<Code block style={style}>
-					{code}
-				</Code>
-			}
-		>
-			<HighlightedCode code={code} lang={lang} style={style} />
-		</Suspense>
-	);
-}
 
 export type CodeContentType = "markdown" | "code" | "diff";
 
@@ -107,21 +82,29 @@ const ContentViewerEnvironmentContext = createContext<ContentViewerEnvironment>(
 	DEFAULT_CONTENT_VIEWER_ENV,
 );
 
+const EMPTY_FILE_REFERENCE_SCOPE: FileReferenceScopeValue = {};
+
 export function ContentViewerEnvironmentProvider({
 	value,
+	fileReferences = EMPTY_FILE_REFERENCE_SCOPE,
 	children,
 }: {
 	value: ContentViewerEnvironment;
+	fileReferences?: FileReferenceScopeValue;
 	children: ReactNode;
 }) {
 	return (
 		<ContentViewerEnvironmentContext.Provider value={value}>
-			{children}
+			<FileReferenceScopeProvider value={fileReferences}>{children}</FileReferenceScopeProvider>
 		</ContentViewerEnvironmentContext.Provider>
 	);
 }
 
 interface ContentViewerProps {
+	/** Declared inline viewport for Diff only; code/markdown keep DOM geometry. */
+	layout?: ContentViewportLayout;
+	/** Independent Diff fullscreen geometry; never reused from inline or applied to plain bodies. */
+	fullscreenLayout?: ContentViewportLayout;
 	/** Text content to display and copy */
 	content: string;
 	/** Full (untruncated) content shown only in fullscreen modal. Falls back to `content`. */
@@ -130,26 +113,26 @@ interface ContentViewerProps {
 	style?: CSSProperties;
 	/** Modal title when fullscreen */
 	title?: string;
-	/** If provided, renders DiffView instead of Code in fullscreen */
-	diff?: { oldStr: string; newStr: string };
+	/** Shared immutable diff source; each viewport owns its own projection. */
+	diffDocument?: DiffDocument;
 	/** If true, render content as markdown instead of a code block */
 	markdown?: boolean;
 	/** Content type for word-wrap default preference. Defaults to "code". */
 	contentType?: CodeContentType;
-	/** Extra children rendered inside the wrapper (e.g. existing Code block) */
-	children?: ReactNode;
-	/** Render function receiving wordWrap state, used instead of children when wrap control is needed */
-	renderContent?: (wordWrap: boolean) => ReactNode;
 	/** Shiki language id for syntax highlighting (e.g. "typescript"). */
 	language?: string;
+	/** Optional file-panel budget, applied to both inline and fullscreen source. */
+	maxHighlightChars?: number;
 	/** Block index within the parent message's contentJson array */
 	blockIndex?: number;
 	/** Whether this content is currently being streamed (enables per-char animation) */
 	streaming?: boolean;
-	/** Keep the inline scrollable content pinned to bottom until the user scrolls manually. */
-	autoFollow?: boolean;
-	/** Changing this resets auto-follow for a new streaming session. */
-	autoFollowKey?: string | number | null;
+	/** Stable source identity, independent of status, text and path. */
+	bodyId?: string;
+	live?: boolean;
+	revision?: string | number;
+	/** Source data itself is incomplete, independently of the painter budget. */
+	truncated?: boolean;
 	/**
 	 * Text used for copy actions when it must differ from what is displayed.
 	 *
@@ -219,20 +202,23 @@ export interface ContentViewerHandle {
 export const ContentViewer = memo(
 	forwardRef<ContentViewerHandle, ContentViewerProps>(function ContentViewer(
 		{
+			layout,
+			fullscreenLayout,
 			content,
 			fullContent,
 			style,
 			title,
-			diff,
+			diffDocument,
 			markdown,
 			contentType = "code",
-			children,
-			renderContent,
 			language,
+			maxHighlightChars,
 			blockIndex,
 			streaming,
-			autoFollow,
-			autoFollowKey,
+			bodyId,
+			live,
+			revision,
+			truncated,
 			copyText,
 		},
 		ref,
@@ -539,9 +525,11 @@ export const ContentViewer = memo(
 						truncated: true,
 					}
 				: { content: modalContent, truncated: false };
-		const modalRenderContent = modalPreview.truncated
-			? `${modalPreview.content}\n\n${t("contentViewerTruncated")}`
-			: modalPreview.content;
+		const modalRenderContent = truncated
+			? `${modalPreview.content}\n\n${tNarrator("contentSourceIncomplete")}`
+			: modalPreview.truncated
+				? `${modalPreview.content}\n\n${t("contentViewerTruncated")}`
+				: modalPreview.content;
 		const modalCopyBtn = fullContent ? makeCopyBtn(modalContent) : copyBtn;
 
 		const fullscreenBtn = (
@@ -592,10 +580,6 @@ export const ContentViewer = memo(
 			</Tooltip>
 		);
 
-		const wrapStyle: CSSProperties = wordWrap
-			? { whiteSpace: "pre-wrap", wordBreak: "break-all", overflowX: "hidden" }
-			: { whiteSpace: "pre", overflowX: "auto" };
-
 		const sourceToggle = markdown ? (
 			<Tooltip label={showSource ? t("rendered") : t("source")} withArrow position="top">
 				<ActionIcon
@@ -611,54 +595,42 @@ export const ContentViewer = memo(
 			</Tooltip>
 		) : null;
 
-		/** Render markdown or raw source depending on toggle */
-		const renderMarkdown = (text: string, extraStyle?: CSSProperties) =>
-			showSource ? (
-				<Code block style={{ ...style, ...wrapStyle, ...extraStyle }}>
-					{text}
-				</Code>
-			) : (
-				<div
-					style={{
-						minWidth: 0,
-						paddingInline: "var(--mantine-spacing-xs)",
-						paddingBlock: "calc(0.25rem * var(--mantine-scale))",
-						...extraStyle,
-					}}
-				>
-					<MarkdownContent text={text} wordWrap={wordWrap} streaming={streaming} />
-				</div>
-			);
-
-		const contentNode = renderContent
-			? renderContent(wordWrap)
-			: (children ??
-				(markdown ? (
-					renderMarkdown(inlineContent, {
-						maxHeight: style?.maxHeight,
-						overflowY: style?.maxHeight ? "auto" : undefined,
-					})
-				) : language && language !== "text" ? (
-					<CodeHighlightOrFallback
-						code={inlineContent}
-						lang={language}
-						style={{ ...style, ...wrapStyle, maxWidth: "100%" }}
-					/>
-				) : (
-					<Code block style={{ ...style, ...wrapStyle, maxWidth: "100%" }}>
-						{inlineContent}
-					</Code>
-				)));
-		const inlineNode = autoFollow ? (
+		const stableBodyId = bodyId ?? stableBlockId ?? String(instanceId.current);
+		const bodyLive = live ?? streaming ?? false;
+		const format = diffDocument ? "diff" : markdown ? "markdown" : "code";
+		const paintStyle: CSSProperties = {
+			...style,
+			height: undefined,
+			minHeight: undefined,
+			maxHeight: undefined,
+			overflow: "visible",
+		};
+		const inlineNode = (
 			<AutoFollowScroll
-				asChild
-				followKey={autoFollowKey ?? title ?? contentType}
-				deps={[inlineContent]}
+				bodyId={stableBodyId}
+				layout={diffDocument ? layout : undefined}
+				live={bodyLive}
+				revision={revision}
+				followTarget={diffDocument ? "row" : "end"}
+				viewportStyle={{
+					height: style?.height,
+					minHeight: style?.minHeight,
+					maxHeight: style?.maxHeight,
+					overflowX: wordWrap ? "hidden" : "auto",
+				}}
 			>
-				{contentNode}
+				<ContentBody
+					format={format}
+					text={inlineContent}
+					diffDocument={diffDocument}
+					wordWrap={wordWrap}
+					showSource={showSource}
+					language={language}
+					maxHighlightChars={maxHighlightChars}
+					streaming={streaming}
+					style={paintStyle}
+				/>
 			</AutoFollowScroll>
-		) : (
-			contentNode
 		);
 
 		const SWIPE_REVEAL_WIDTH = 180;
@@ -875,7 +847,7 @@ export const ContentViewer = memo(
 							content: SAFE_AREA_FULLSCREEN_MODAL_CONTENT_STYLE,
 							header: SAFE_AREA_FULLSCREEN_MODAL_HEADER_STYLE,
 							body: {
-								overflow: "auto",
+								overflow: "hidden",
 								padding: isMobile ? 8 : undefined,
 								display: "flex",
 								flexDirection: "column",
@@ -902,56 +874,27 @@ export const ContentViewer = memo(
 							)}
 						</div>
 
-						{diff ? (
-							<Box
-								style={{
-									flex: 1,
-									minHeight: 0,
-									overflow: "hidden",
-									display: "flex",
-									flexDirection: "column",
-								}}
-							>
-								<DiffView
-									oldStr={diff.oldStr}
-									newStr={diff.newStr}
-									maxHeight={undefined}
-									wordWrap={wordWrap}
-									language={language}
-								/>
-							</Box>
-						) : markdown ? (
-							renderMarkdown(modalRenderContent, { flex: 1, minHeight: 0, overflow: "auto" })
-						) : language && language !== "text" ? (
-							<CodeHighlightOrFallback
-								code={modalRenderContent}
-								lang={language}
-								style={{
-									...style,
-									...wrapStyle,
-									maxHeight: undefined,
-									overflow: "auto",
-									fontSize: isMobile ? 11 : 12,
-									flex: 1,
-									minHeight: 0,
-								}}
+						<AutoFollowScroll
+							bodyId={stableBodyId}
+							layout={diffDocument ? fullscreenLayout : undefined}
+							live={bodyLive}
+							revision={revision}
+							followTarget={diffDocument ? "row" : "end"}
+							style={{ flex: 1, minHeight: 0 }}
+							viewportStyle={{ height: "100%", overflowX: wordWrap ? "hidden" : "auto" }}
+						>
+							<ContentBody
+								format={format}
+								text={modalRenderContent}
+								diffDocument={diffDocument}
+								wordWrap={wordWrap}
+								showSource={showSource}
+								language={language}
+								maxHighlightChars={maxHighlightChars}
+								streaming={streaming}
+								style={{ ...paintStyle, fontSize: isMobile ? 11 : 12 }}
 							/>
-						) : (
-							<Code
-								block
-								style={{
-									...style,
-									...wrapStyle,
-									maxHeight: undefined,
-									overflow: "auto",
-									fontSize: isMobile ? 11 : 12,
-									flex: 1,
-									minHeight: 0,
-								}}
-							>
-								{modalRenderContent}
-							</Code>
-						)}
+						</AutoFollowScroll>
 					</Modal>
 				)}
 

@@ -20,6 +20,429 @@ beforeAll(() => {
 
 const CTX: AdapterContext = { lod: 5 };
 
+describe("communication bubbles", () => {
+	function bubble(
+		inputJson: Record<string, unknown>,
+		tc: Record<string, unknown> = {},
+		ctx: AdapterContext = CTX,
+	) {
+		return adaptSegment(
+			{
+				kind: "tool-run",
+				sourceMessages: [],
+				items: [
+					{
+						blockIndex: 1,
+						isSubagent: true,
+						msg: { id: "message-send", role: "assistant", contentJson: [] },
+						tc: {
+							toolName: "Send",
+							toolUseId: "send-1",
+							id: "row-send",
+							executionAttempt: 2,
+							status: "success",
+							inputJson,
+							...tc,
+						},
+					},
+				],
+			},
+			ctx,
+		)[0]!;
+	}
+	function data(
+		inputJson: Record<string, unknown>,
+		tc: Record<string, unknown> = {},
+		ctx: AdapterContext = CTX,
+	) {
+		return bubble(inputJson, tc, ctx)
+			.data as import("@shared/pretext-layout/segment-adapter").CommunicationBubbleData;
+	}
+
+	it.each([
+		1, 2, 3, 4, 5,
+	] as const)("L%s retains old completed communication bodies despite fold overrides", (lod) => {
+		const spec = bubble(
+			{ id: "worker", message: "**visible markdown**" },
+			{},
+			{
+				lod,
+				recentMessageIds: new Set(),
+				isExpanded: () => false,
+			},
+		);
+		expect(spec.kind).toBe("communication-bubble");
+		expect(spec.key).toBe("tool-send-1");
+		expect(spec.unitId).toBe(spec.key);
+		expect(spec.opts).toMatchObject({ opened: true, forceExpanded: true, inRun: false });
+		expect(spec.data).toMatchObject({
+			message: "**visible markdown**",
+			messageBody: { format: "markdown" },
+			toolDetailRef: { toolCallId: "row-send", messageId: "message-send", executionAttempt: 2 },
+		});
+	});
+
+	it.each([
+		1, 2, 3, 4, 5,
+	] as const)("L%s retains approval controls before switching to the communication bubble", (lod) => {
+		for (const toolName of ["Send", "TeamStatus"]) {
+			const input = { action: "send", message: "approve this" };
+			const pending = bubble(
+				input,
+				{ toolName, status: "pending" },
+				{ lod, resolveHasPendingPermission: () => true },
+			);
+			expect(pending.kind).toBe("tool-call");
+			expect(pending.opts?.hasPendingPermission).toBe(true);
+			expect(pending.opts?.collapsesByLod).toBe(false);
+			const approved = bubble(
+				input,
+				{ toolName, status: "success" },
+				{ lod, resolveHasPendingPermission: () => false },
+			);
+			expect(approved.kind).toBe("communication-bubble");
+			expect(approved.key).toBe(pending.key);
+		}
+	});
+
+	it("uses authoritative targets, including an empty result, instead of guessing aliases", () => {
+		expect(
+			data(
+				{ names: ["old"], message: "hello" },
+				{
+					outputJson: {
+						_metadata: {
+							targets: [
+								{ id: "real-1", label: "worker one" },
+								{ id: "real-2", label: "worker two" },
+							],
+						},
+					},
+				},
+			).recipients,
+		).toEqual([
+			{ id: "real-1", label: "worker one" },
+			{ id: "real-2", label: "worker two" },
+		]);
+		expect(
+			data({ id: "missing", message: "hello" }, { _metadata: { targets: [] } }).recipients,
+		).toEqual([]);
+	});
+
+	it("resolves only an unambiguous live recipient and keeps fanout distinct from broadcast", () => {
+		expect(
+			data(
+				{ name: "worker", message: "hello", await: true },
+				{ status: "running", _awaitAgentNarratorId: "real-worker" },
+			),
+		).toMatchObject({
+			recipients: [{ label: "worker", id: "real-worker" }],
+			awaitReply: true,
+			broadcast: false,
+		});
+		expect(
+			data({ names: ["one", "two"], message: "hello" }, { _awaitAgentNarratorId: "real-one" }),
+		).toMatchObject({
+			recipients: [{ label: "one" }, { label: "two" }],
+			broadcast: false,
+			awaitReply: false,
+		});
+		expect(data({ action: "broadcast", message: "all" }, { toolName: "TeamStatus" })).toMatchObject(
+			{ broadcast: true, awaitReply: false },
+		);
+		expect(
+			data({ action: "send", target_id: "one", message: "one" }, { toolName: "TeamStatus" }),
+		).toMatchObject({ broadcast: false, recipients: [{ label: "one" }] });
+		expect(data({ id: "one", await: true }, { _metadata: { await: false } }).awaitReply).toBe(true);
+		expect(data({ id: "one", await: false }, { _metadata: { await: true } }).awaitReply).toBe(
+			false,
+		);
+	});
+
+	it("reads streaming message fields without stale-text fallback, with stable body identity", () => {
+		const streaming = data(
+			{
+				message: "stale",
+				_streamingChars: 5,
+				_streamingFields: { message: "settled" },
+				_streamingFieldName: "message",
+				_streamingFieldValue: "live",
+			},
+			{ status: "running" },
+		);
+		const complete = data({ message: "live" });
+		expect(streaming.message).toBe("live");
+		expect(streaming.messageBody?.live).toBe(true);
+		expect(complete.messageBody?.live).toBe(false);
+		expect(streaming.messageBody?.id).toBe(complete.messageBody?.id);
+		expect(
+			data({ message: "stale", _streamingFieldName: "message", _streamingFieldValue: "" }).message,
+		).toBe("");
+	});
+
+	it("keeps long and projected messages bounded and preserves the explicit full-input resolver", () => {
+		const projected = { _truncated: true, preview: "**head**", fullLength: 100_000 };
+		expect(data({ message: projected })).toMatchObject({
+			message: "**head**",
+			messageTruncated: true,
+		});
+		expect(data({ message: "x".repeat(100_000) }).message).toHaveLength(8_192);
+		const refs: unknown[] = [];
+		const full = data(
+			{ message: projected },
+			{},
+			{
+				lod: 5,
+				resolveFullToolInput: (_id, ref) => {
+					refs.push(ref);
+					return { message: "y".repeat(100_000) };
+				},
+			},
+		);
+		expect(full.message).toHaveLength(8_192);
+		expect(full.messageTruncated).toBe(true);
+		expect(full.messageBody?.textTruncated).toBe(false);
+		expect(full.messageBody?.text).toHaveLength(100_000);
+		expect(refs).toEqual([
+			{ toolCallId: "row-send", messageId: "message-send", executionAttempt: 2 },
+		]);
+	});
+
+	it("caps dense markdown at 120 source lines while preserving viewer content", () => {
+		const text = "- **dense**\n".repeat(2_000);
+		const full = data({ message: text });
+		expect(full.message.split("\n").length).toBeLessThanOrEqual(120);
+		expect(full.message.length).toBeLessThanOrEqual(8_192);
+		expect(full.messageTruncated).toBe(true);
+		expect(full.messageBody?.text).toBe(text);
+		expect(full.messageBody?.textTruncated).toBe(false);
+	});
+
+	it("preserves target-level failures, cancelled waits and nonfatal delivery warnings", () => {
+		expect(
+			data(
+				{ message: "request" },
+				{ _metadata: { targets: [{ id: "a", status: "failed", error: "gone" }] } },
+			),
+		).toMatchObject({ status: "error", error: "gone", message: "request" });
+		for (const status of ["timeout", "aborted", "cancelled"]) {
+			expect(
+				data(
+					{ message: "request", await: true },
+					{ _metadata: { targets: [{ id: "a", status }] } },
+				),
+			).toMatchObject({ status, warning: status, message: "request" });
+		}
+		expect(
+			data(
+				{ action: "send", message: "request" },
+				{ toolName: "TeamStatus", _metadata: { warning: "Target is not currently working" } },
+			),
+		).toMatchObject({ status: "success", warning: "Target is not currently working" });
+		expect(
+			data({}, { _metadata: { targets: [{ id: "parent", title: "Primary" }] } }).recipients,
+		).toEqual([{ label: "Primary" }]);
+	});
+
+	it("retains errors and normalized timing without substituting output for sent text", () => {
+		expect(
+			data(
+				{ message: "request" },
+				{
+					status: "error",
+					outputJson: { _text: "Send error: gone" },
+					startedAt: 100,
+					completedAt: 300,
+				},
+			),
+		).toMatchObject({
+			message: "request",
+			error: "Send error: gone",
+			timing: { startedAt: 100, completedAt: 300, durationMs: 200 },
+		});
+		expect(data({}, { errorMessage: "x".repeat(5000) }).error).toHaveLength(2048);
+	});
+
+	it.each([1, 2, 3, 4, 5] as const)("L%s splits mixed tool frames in source order", (lod) => {
+		const tools = ["Read", "Send", "Bash", "TeamStatus", "Grep"].map((toolName, blockIndex) => ({
+			blockIndex,
+			isSubagent: toolName === "Send",
+			tc: {
+				toolName,
+				toolUseId: String(blockIndex),
+				status: "success",
+				inputJson: { action: "send", target_id: "worker", message: "visible" },
+			},
+		}));
+		const specs = adaptSegment({ kind: "tool-run", sourceMessages: [], items: tools }, { lod });
+		expect(specs.map((s) => s.kind)).toEqual([
+			lod <= 2 ? "tool-run-count" : "tool-call",
+			"communication-bubble",
+			lod <= 2 ? "tool-run-count" : "tool-call",
+			"communication-bubble",
+			lod <= 2 ? "tool-run-count" : "tool-call",
+		]);
+		expect(specs.filter((s) => s.kind === "communication-bubble").map((s) => s.key)).toEqual([
+			"tool-1",
+			"tool-3",
+		]);
+		if (lod >= 3) for (const spec of specs) expect(spec.opts?.inRun).toBe(false);
+	});
+});
+
+describe("exact detail refs remain independent of LOD/display identity", () => {
+	it.each([
+		"Bash",
+		"Agent",
+	])("preserves %s refs on standalone and drilled-in cards", async (toolName) => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const truncated = { _truncated: true, preview: "head", fullLength: 9000 };
+		const items = [1, 2].map((index) => ({
+			kind: "tool" as const,
+			blockIndex: 0,
+			isSubagent: toolName === "Agent",
+			msg: {
+				id: `message-${index}`,
+				role: "assistant",
+				contentJson: [{ type: "tool_use", id: "reused-sdk-id", executionAttempt: index }],
+			},
+			tc: {
+				id: `row-${index}`,
+				toolUseId: "reused-sdk-id",
+				toolName,
+				status: "success",
+				inputJson: toolName === "Agent" ? { prompt: truncated } : { command: truncated },
+				outputJson: truncated,
+			},
+		}));
+		const refs = items.map((item, index) => ({
+			toolCallId: item.tc.id,
+			messageId: item.msg.id,
+			executionAttempt: index + 1,
+		}));
+		const received: unknown[] = [];
+		const ctx: AdapterContext = {
+			lod: 5,
+			isRowExpanded: () => true,
+			isPromptOpen: () => true,
+			resolveFullToolInput: (_id, ref) => {
+				received.push(ref);
+				return undefined;
+			},
+			resolveFullToolOutput: (_id, ref) => {
+				received.push(ref);
+				return undefined;
+			},
+		};
+		const cards = adaptSegment({ kind: "tool-run", items, sourceMessages: [] }, ctx);
+		expect(cards.map((card) => (card.data as { toolDetailRef?: unknown }).toolDetailRef)).toEqual(
+			refs,
+		);
+		const trace = adaptActivityUnit(items, "activity", { ...ctx, lod: 2 });
+		const rows = (trace.data as { items: { card?: { toolDetailRef?: unknown } }[] }).items;
+		expect(rows.map((row) => row.card?.toolDetailRef)).toEqual(refs);
+		for (const ref of received) expect<unknown[]>(refs).toContainEqual(ref);
+		expect(received.length).toBeGreaterThanOrEqual(8);
+	});
+});
+
+describe("subagent canonical body adaptation", () => {
+	function data(
+		toolName: "Agent" | "Send",
+		inputJson: Record<string, unknown>,
+		status = "running",
+		metadata?: unknown,
+	) {
+		const segment: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: true,
+					tc: { toolName, toolUseId: "same-agent-call", inputJson, status, _metadata: metadata },
+				},
+			],
+		};
+		return adaptSegment(segment, { lod: 5, isPromptOpen: () => true })[0]
+			?.data as import("./measure/measure-subagent").SubagentCardData;
+	}
+
+	it.each([
+		"Agent",
+	] as const)("%s current prompt wins and settles independently of child activity", (toolName) => {
+		const field = "prompt";
+		const streaming = data(toolName, {
+			[field]: "formal",
+			_streamingChars: 4,
+			_streamingFields: { [field]: "settled" },
+			_streamingFieldName: field,
+			_streamingFieldValue: "live",
+		});
+		const switched = data(toolName, {
+			_streamingChars: 4,
+			_streamingFields: { [field]: "live" },
+			_streamingFieldName: "description",
+			_streamingFieldValue: "late title",
+		});
+		const executing = data(toolName, { [field]: "live" });
+		const completed = data(
+			toolName,
+			{
+				[field]: "live",
+				_streamingChars: 4,
+				_streamingFieldName: field,
+				_streamingFieldValue: "live",
+			},
+			"success",
+		);
+		expect(streaming.promptBody?.source).toBe(`input.${field}`);
+		expect(streaming.promptBody?.text).toBe("live");
+		expect(streaming.promptBody?.format).toBe("text");
+		expect([streaming, switched, executing, completed].map((d) => d.promptBody?.live)).toEqual([
+			true,
+			false,
+			false,
+			false,
+		]);
+		expect(
+			new Set([streaming, switched, executing, completed].map((d) => d.promptBody?.id)).size,
+		).toBe(1);
+	});
+
+	it("keeps an explicit empty prompt and forwards its source range", async () => {
+		const { createSourceText } = await import("@shared/pretext-layout/source-text");
+		const range = createSourceText("", { epoch: "input-epoch", originKnown: false }).range;
+		const card = data("Agent", {
+			prompt: "stale",
+			_streamingChars: 0,
+			_streamingFieldName: "prompt",
+			_streamingFieldValue: "",
+			_streamingFieldRanges: { prompt: range },
+		});
+		expect(card.promptBody?.text).toBe("");
+		expect(card.promptBody?.range).toEqual(range);
+		const { measureSubagentCard } = await import("./measure/measure-subagent");
+		const measured = measureSubagentCard(card, 500, 5);
+		expect(measured.promptMeasured?.model).toBe(card.promptBody);
+		expect(measured.promptBlockHeight).toBeGreaterThan(0);
+	});
+
+	it("marks streamed result separately and terminal legacy output is not live", async () => {
+		const { createSourceText } = await import("@shared/pretext-layout/source-text");
+		const range = createSourceText("result", { epoch: "output-epoch" }).range;
+		const metadata = { _streamingOutput: "result", _streamingOutputRange: range };
+		const running = data("Agent", { prompt: "finished input" }, "running", metadata);
+		const complete = data("Agent", { prompt: "finished input" }, "success", metadata);
+		expect(running.promptBody?.live).toBe(false);
+		expect(running.resultBody?.live).toBe(true);
+		expect(running.resultBody?.source).toBe("output.main");
+		expect(running.resultBody?.range).toEqual(range);
+		expect(complete.resultBody?.live).toBe(false);
+		expect(complete.resultBody?.id).toBe(running.resultBody?.id);
+	});
+});
+
 describe("classifyContentBlock", () => {
 	it("routes content blocks to element kinds", () => {
 		expect(classifyContentBlock({ type: "text", text: "hi" })).toBe("markdown");
@@ -1165,14 +1588,24 @@ describe("adaptSegment — subagent card enrichment (height-safe field passthrou
 		expect(data.description).toBe(longFirst.slice(0, 80));
 	});
 
-	it("reads prompt from `message` and agentType 'send' for Send tools", () => {
-		const data = subagentData({
-			toolName: "Send",
-			status: "success",
-			inputJson: { message: "please continue" },
-		});
-		expect(data.prompt).toBe("please continue");
-		expect(data.agentType).toBe("send");
+	it("Send no longer builds a subagent card even when the segment marks it as one", () => {
+		const [spec] = adaptSegment(
+			{
+				kind: "tool-run",
+				sourceMessages: [],
+				items: [
+					{
+						blockIndex: 0,
+						isSubagent: true,
+						tc: { toolName: "Send", status: "success", inputJson: { message: "please continue" } },
+					},
+				],
+			},
+			CTX,
+		);
+		expect(spec?.kind).toBe("communication-bubble");
+		expect(spec?.data).toMatchObject({ message: "please continue" });
+		expect(spec?.data).not.toHaveProperty("agentType");
 	});
 
 	it("maps the effective reasoning effort from the activity summary", () => {
@@ -1886,6 +2319,16 @@ describe("folded tool rows — drill-down payload", () => {
 		// The bare key opens the FIRST attempt only, so the two stay independent.
 		const first = adaptActivityUnit(items, "act-1", { lod: 2, ...openRows("act-1", "tool-tu-1") });
 		expect(activityRows(first).map((row) => row.card != null)).toEqual([true, false]);
+		const callBody = (spec: ReturnType<typeof adaptActivityUnit>) => {
+			const card = activityRows(spec).find((row) => row.card)
+				?.card as import("./measure/measure-tool-call").ToolCallData;
+			return card.detail?.sections.find((part) => part.body.kind === "capped")?.body;
+		};
+		expect(
+			(callBody(first) as import("@shared/pretext-layout/tool-detail").ToolCappedDetail).id,
+		).not.toBe(
+			(callBody(second) as import("@shared/pretext-layout/tool-detail").ToolCappedDetail).id,
+		);
 	});
 
 	it("a folded reasoning row reveals its own step body, keyed by row", async () => {
@@ -2212,7 +2655,11 @@ describe("adaptSegment — pending plan fallback", () => {
 
 	function planDetail(seg: AdapterSegment, ctx: AdapterContext) {
 		const spec = adaptSegment(seg, ctx).find((s) => s.key === "tool-tu-plan");
-		return (spec?.data as { detail?: { text?: string } | null })?.detail ?? null;
+		const detail = (
+			spec?.data as { detail?: import("@shared/pretext-layout/tool-detail").ToolDetailData | null }
+		)?.detail;
+		const body = detail?.sections.find((part) => part.key === "input.plan")?.body;
+		return body?.kind === "capped" ? body : null;
 	}
 
 	/** The shell injects the authoritative category resolver; plans need it. */
@@ -2345,8 +2792,8 @@ describe("adaptSegment — pending plan fallback", () => {
 		it("shows only the plan when the denial carried no feedback", () => {
 			// A feedback-less deny stores an English system placeholder; attributing
 			// it to the user would be worse than showing nothing.
-			expect(sections(deniedSeg("Permission denied by user"))?.kind).toBe("capped");
-			expect(sections(deniedSeg(null))?.kind).toBe("capped");
+			expect(sections(deniedSeg("Permission denied by user"))?.sections).toHaveLength(1);
+			expect(sections(deniedSeg(null))?.sections).toHaveLength(1);
 		});
 
 		// The column is NOT denial-only — narrator-permission stores the note typed
@@ -2354,7 +2801,7 @@ describe("adaptSegment — pending plan fallback", () => {
 		// (status travels with it), so this asserts the pair end to end: an approved
 		// plan must not grow a rejection notice above a plan that WAS accepted.
 		it("says nothing about a denial when the plan was APPROVED with feedback", () => {
-			expect(sections(planSeg("批准。方案分析透彻", "success"))?.kind).toBe("capped");
+			expect(sections(planSeg("批准。方案分析透彻", "success"))?.sections).toHaveLength(1);
 		});
 	});
 });
@@ -2612,6 +3059,177 @@ describe("adaptSegment — subagent card timing passthrough", () => {
 		);
 		expect(d.recentCallSummaries).toEqual([null]);
 		expect(d.recentCallCategories).toEqual([null]);
+	});
+});
+
+describe("Edit source continuity when a projected input is completed", () => {
+	const preview = (text: string) => ({
+		_truncated: true,
+		preview: text,
+		fullLength: text.length + 100,
+	});
+	function editBody(inputJson: Record<string, unknown>, full?: Record<string, unknown>) {
+		const segment: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: { toolName: "Edit", toolUseId: "edit-fetch", status: "success", inputJson },
+				},
+			],
+		};
+		const data = adaptSegment(segment, {
+			lod: 5,
+			resolveToolCategory: () => "file",
+			...(full ? { resolveFullToolInput: () => full } : {}),
+		})[0]?.data as import("./measure/measure-tool-call").ToolCallData;
+		const body = data.detail?.sections.find((section) => section.key === "input.edit")?.body;
+		if (!body || body.kind !== "capped" || !body.diffDocument)
+			throw new Error("Missing Edit document");
+		return { body, document: body.diffDocument };
+	}
+
+	it("static preview reconstruction preserves per-source epochs without object identity", () => {
+		const input = { old_string: preview("a\nb\nc"), new_string: preview("a\nb\nc") };
+		const first = editBody(input);
+		const cloned = editBody(structuredClone(input));
+		expect(cloned.document.oldSource.range).toEqual(first.document.oldSource.range);
+		expect(cloned.document.newSource.range).toEqual(first.document.newSource.range);
+		expect(first.document.oldSource.range.originKnown).toBe(true);
+		expect(first.document.oldSource.range.startOffset).toBe(0);
+		expect(first.document.oldSource.range.complete).toBe(false);
+		expect(first.document.oldSource.range.epoch).not.toBe(first.document.newSource.range.epoch);
+	});
+
+	it("verified CRLF head completion keeps both paused source lines, not row zero", async () => {
+		const { getDiffRowAnchor, resolveDiffSourcePoint, projectDiffDocument } = await import(
+			"@shared/pretext-layout/diff-core"
+		);
+		const prefix = "first\r\nsecond\r\nkeep reading here\r\npartial";
+		const input = { old_string: preview(prefix), new_string: preview(prefix) };
+		const before = editBody(input);
+		const full = {
+			old_string: `${prefix}\nold suffix`,
+			new_string: `${prefix.replaceAll("\r\n", "\n")}\nnew suffix`,
+		};
+		const after = editBody(structuredClone(input), full);
+		for (const side of ["old", "new"] as const) {
+			const paused = getDiffRowAnchor(before.document, 2, side);
+			if (!paused) throw new Error("Missing paused source point");
+			const resolution = resolveDiffSourcePoint(after.document, paused);
+			expect(resolution.lost).toBe(false);
+			expect(resolution.row).toBe(2);
+			expect(resolution.point).toEqual(paused);
+			const projection = projectDiffDocument(after.document, { anchor: paused, limit: 2 });
+			expect(projection.anchorLost).toBe(false);
+			expect(projection.lines[projection.anchorIndex]?.content).toBe("keep reading here");
+		}
+		expect(after.body.id).toBe(before.body.id);
+		expect(after.body.live).toBe(false);
+		expect(after.body.textTruncated).toBe(false);
+		expect(after.document.newSource.range.complete).toBe(true);
+		expect(editBody(input, structuredClone(full)).document.newSource.range).toEqual(
+			after.document.newSource.range,
+		);
+	});
+
+	it("reuses verified immutable full payloads without rescanning them per layout", () => {
+		const input = { old_string: preview("a\nb"), new_string: preview("a\nb") };
+		let reads = 0;
+		const full = {
+			get old_string() {
+				reads++;
+				return "a\nb\nfull";
+			},
+			new_string: "a\nb\nfull",
+		};
+		editBody(input, full);
+		const firstReads = reads;
+		const again = editBody(input, full);
+		expect(reads).toBe(firstReads);
+		expect(again.document.oldSource.range.complete).toBe(true);
+	});
+
+	it("an inconsistent known prefix changes epoch without guessing a repeated suffix", async () => {
+		const { getDiffRowAnchor, resolveDiffSourcePoint } = await import(
+			"@shared/pretext-layout/diff-core"
+		);
+		const prefix = "first\nsecond\nthird";
+		const input = { old_string: preview(prefix), new_string: preview(prefix) };
+		const before = editBody(input);
+		const paused = getDiffRowAnchor(before.document, 1, "new");
+		if (!paused) throw new Error("Missing paused point");
+		const after = editBody(input, { old_string: prefix, new_string: `different head\n${prefix}` });
+		expect(after.document.newSource.range.epoch).not.toBe(paused.epoch);
+		expect(after.document.newSource.range.remap).toBeUndefined();
+		expect(resolveDiffSourcePoint(after.document, paused)).toMatchObject({
+			row: 0,
+			lost: true,
+			reason: "epoch",
+		});
+	});
+
+	it("unknown-origin tail completion still uses the verified coordinate remap", async () => {
+		const { createSourceText } = await import("@shared/pretext-layout/source-text");
+		const { getDiffRowAnchor, resolveDiffSourcePoint } = await import(
+			"@shared/pretext-layout/diff-core"
+		);
+		const tail = "tail zero\ntail one\ntail two";
+		const range = createSourceText(tail, { epoch: "unknown-tail", originKnown: false }).range;
+		const input = {
+			old_string: "",
+			new_string: preview(tail),
+			_streamingFieldRanges: { new_string: range },
+		};
+		const before = editBody(input);
+		const paused = getDiffRowAnchor(before.document, 1, "new");
+		if (!paused) throw new Error("Missing paused point");
+		expect(before.document.newSource.range.originKnown).toBe(false);
+		const after = editBody(input, {
+			old_string: "",
+			new_string: `earlier zero\nearlier one\n${tail}`,
+		});
+		expect(after.document.newSource.range.remap?.fromEpoch).toBe(range.epoch);
+		expect(resolveDiffSourcePoint(after.document, paused)).toMatchObject({
+			lost: false,
+			point: { line: paused.line + 2 },
+		});
+		const notATail = editBody(input, {
+			old_string: "",
+			new_string: `${tail}\nnot the retained tail`,
+		});
+		expect(notATail.document.newSource.range.remap).toBeUndefined();
+		expect(resolveDiffSourcePoint(notATail.document, paused).reason).toBe("epoch");
+	});
+
+	it("an existing 16k known tail range keeps its epoch and absolute source line", async () => {
+		const { createSourceText } = await import("@shared/pretext-layout/source-text");
+		const { getDiffRowAnchor, resolveDiffSourcePoint } = await import(
+			"@shared/pretext-layout/diff-core"
+		);
+		const full = Array.from({ length: 2500 }, (_, i) => `source ${i}`).join("\n");
+		const tail = createSourceText(full, {
+			epoch: "retained-stream",
+			originKnown: true,
+			limit: 16_000,
+		});
+		const input = {
+			old_string: preview("old"),
+			new_string: tail.text,
+			_streamingFieldRanges: { new_string: tail.range },
+		};
+		const before = editBody(input);
+		expect(before.document.newSource.range.startOffset).toBeGreaterThan(0);
+		const paused = getDiffRowAnchor(before.document, 10, "new");
+		if (!paused) throw new Error("Missing paused point");
+		const after = editBody(input, { old_string: "old", new_string: full });
+		expect(after.document.newSource.range.epoch).toBe(tail.range.epoch);
+		expect(resolveDiffSourcePoint(after.document, paused)).toMatchObject({
+			lost: false,
+			point: paused,
+		});
 	});
 });
 

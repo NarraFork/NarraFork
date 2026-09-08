@@ -117,12 +117,14 @@ describe("async-question real hook caches", () => {
 				async (hook, qc) => {
 					qc.setQueryData(asyncQuestionsQueryKey("n1"), page(change === "opened" ? [] : [q("a")]));
 					qc.setQueryData(globalKey, page(change === "opened" ? [] : [q("a")]));
+					qc.setQueryData(["human-attention"], { pages: [{ items: [], nextCursor: null }] });
 					await act(async () => hook()(change, q("a", { awaited: change === "awaited" })));
 					const keep = ["opened", "awaited", "await_ended"].includes(change);
 					expect(qc.getQueryData(asyncQuestionsQueryKey("n1"))).toMatchObject({
 						openCount: keep ? 1 : 0,
 					});
 					expect(qc.getQueryState(globalKey)?.isInvalidated).toBe(true);
+					expect(qc.getQueryState(["human-attention"])?.isInvalidated).toBe(true);
 				},
 			);
 		});
@@ -141,6 +143,7 @@ describe("async-question real hook caches", () => {
 					async (hook, qc) => {
 						qc.setQueryData(asyncQuestionsQueryKey("n1"), page([q("a")]));
 						qc.setQueryData(globalKey, page([q("a")]));
+						qc.setQueryData(["human-attention"], { pages: [{ items: [], nextCursor: null }] });
 						await act(async () => {
 							if (decision === "answer")
 								await hook().answer.mutateAsync({ questionId: "a", answers: { k: "yes" } });
@@ -148,6 +151,7 @@ describe("async-question real hook caches", () => {
 						});
 						expect(qc.getQueryState(asyncQuestionsQueryKey("n1"))?.isInvalidated).toBe(true);
 						expect(qc.getQueryState(globalKey)?.isInvalidated).toBe(true);
+						expect(qc.getQueryState(["human-attention"])?.isInvalidated).toBe(true);
 					},
 				);
 			} finally {

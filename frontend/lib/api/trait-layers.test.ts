@@ -70,6 +70,40 @@ describe("request paths", () => {
 		expect(calls[0]).toContain(encodeURIComponent("proj id/with slash"));
 	});
 
+	test("model pools retain effort, purpose, hidden types and explicit empties across API payloads", async () => {
+		installLocalStorage();
+		const originalFetch = globalThis.fetch;
+		const pools = {
+			explore: [{ model: "default", purpose: "keep", reasoningEffort: "high" as const }],
+			plan: [],
+			search: [{ model: "summary", reasoningEffort: "none" as const }],
+			review: [{ model: "p:r", purpose: "review" }],
+			custom: [{ model: "aggregation:custom", reasoningEffort: "max" as const }],
+		};
+		const bodies: unknown[] = [];
+		globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+			if (init?.body) bodies.push(JSON.parse(String(init.body)));
+			return Response.json({
+				ok: true,
+				customTraits: { subagentModelRestriction: { version: 1, pools } },
+			});
+		}) as typeof fetch;
+		try {
+			for (const layer of ["user", "project"] as const) {
+				const result = await traitLayersApi.updateLayerSubagentModelRestriction(layer, "owner", {
+					pools,
+					enforced: true,
+				});
+				expect(result.customTraits.subagentModelRestriction?.pools).toEqual(pools);
+			}
+			const result = await narratorsApi.updateSubagentModelRestriction("narrator", pools);
+			expect(result.customTraits.subagentModelRestriction?.pools).toEqual(pools);
+			expect(bodies).toEqual([{ pools, enforced: true }, { pools, enforced: true }, { pools }]);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
 	test("each trait uses its own sub-path", async () => {
 		installLocalStorage();
 		const { calls, restore } = capture();

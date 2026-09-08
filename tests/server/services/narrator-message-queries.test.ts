@@ -27,7 +27,7 @@ const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
 const { narratorService } = await import("../../../server/services/narrator-service");
-const { narratorMessageQueries } = await import("../../../server/services/narrator-messages");
+await import("../../../server/services/narrator-messages");
 const { narratorContext } = await import("../../../server/services/narrator-context");
 const { recoverStaleCompactingMessages } = await import(
 	"../../../server/services/narrator-persistence"
@@ -126,6 +126,8 @@ function insertToolCall(params: {
 			messageId: params.messageId,
 			toolUseId: params.toolUseId,
 			toolName: params.toolName,
+			// These fixtures represent newly recorded calls, not legacy origin evidence.
+			executionIdentityVersion: 1,
 			status: params.status ?? "success",
 			inputJson: params.inputJson,
 			outputJson: params.outputJson,
@@ -143,6 +145,7 @@ function insertSubagentNarrator(params: {
 	isBackground?: boolean;
 	backgroundStatus?: "running" | "completed" | "failed" | "cancelled" | null;
 	parentNarratorId?: string;
+	originToolCallId?: string;
 }) {
 	db.insert(narrators)
 		.values({
@@ -154,6 +157,7 @@ function insertSubagentNarrator(params: {
 			model: params.model ?? "claude-sonnet-4.5",
 			reasoningEffort: params.reasoningEffort ?? null,
 			parentNarratorId: params.parentNarratorId ?? "n1",
+			originToolCallId: params.originToolCallId ?? null,
 			inheritMode: "fresh",
 			status: params.status ?? "idle",
 			isBackground: params.isBackground ?? false,
@@ -509,6 +513,7 @@ describe("narratorService message query regressions", () => {
 		seedBase();
 		insertSubagentNarrator({
 			id: "sa-done",
+			originToolCallId: "tc-tu-task",
 			status: "idle",
 			model: "gpt-5.5",
 			reasoningEffort: "high",
@@ -611,9 +616,10 @@ describe("narratorService message query regressions", () => {
 
 	it("getPretextDocumentPage 对运行中和后台子代理同样不内联 child 消息", async () => {
 		seedBase();
-		insertSubagentNarrator({ id: "sa-working", status: "working" });
+		insertSubagentNarrator({ id: "sa-working", status: "working", originToolCallId: "tc-tu-a" });
 		insertSubagentNarrator({
 			id: "sa-bg",
+			originToolCallId: "tc-tu-b",
 			status: "idle",
 			isBackground: true,
 			backgroundStatus: "running",
@@ -1828,6 +1834,7 @@ describe("narratorService message query regressions", () => {
 				subagentType: "general",
 				variant: "subagent:general",
 				parentNarratorId: "n1",
+				originToolCallId: "tc-tu-old",
 				inheritMode: "fresh",
 				createdAt: ts(),
 				updatedAt: ts(),
@@ -1909,6 +1916,7 @@ describe("narratorService message query regressions", () => {
 				subagentType: "general",
 				variant: "subagent:general",
 				parentNarratorId: "n1",
+				originToolCallId: "tc-tu-old",
 				inheritMode: "fresh",
 				createdAt: ts(),
 				updatedAt: ts(),
@@ -2586,7 +2594,7 @@ describe("subagent activity input summary projection", () => {
 		}>,
 	) {
 		seedBase();
-		insertSubagentNarrator({ id: "sa-1", status: "working" });
+		insertSubagentNarrator({ id: "sa-1", status: "working", originToolCallId: "tc-tu-agent" });
 		insertMessage({
 			id: "m-agent",
 			seq: 0,
@@ -2719,7 +2727,7 @@ describe("subagent activity input summary projection", () => {
 	 */
 	it("caps the value inside SQL, not just in the JS normalizer", async () => {
 		seedBase();
-		insertSubagentNarrator({ id: "sa-1", status: "working" });
+		insertSubagentNarrator({ id: "sa-1", status: "working", originToolCallId: "tc-tu-agent" });
 		insertMessage({
 			id: "m-1",
 			seq: 0,

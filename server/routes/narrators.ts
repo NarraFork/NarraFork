@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
+import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
+import {
+	type FileReference,
+	type FileReferenceSnapshot,
+	fileReferenceMessageForDisplay,
+} from "@shared/file-reference";
 import { formatOriginLabel } from "@shared/message-origin";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
@@ -24,7 +30,7 @@ import {
 	or,
 	sql,
 } from "drizzle-orm";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { db } from "../db";
 import {
@@ -44,6 +50,7 @@ import {
 	terminals,
 	users,
 } from "../db/schema";
+import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
 import { redactSpillPointerPaths } from "../lib/api-request-dump-store";
@@ -80,6 +87,10 @@ import {
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { resolveFastModeForUser } from "../lib/fast-mode";
+import {
+	parseFileReferenceInput,
+	replaceFileReferenceSnapshots,
+} from "../lib/file-reference-input";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
@@ -153,6 +164,7 @@ import {
 	editAndRegenerateJsonSchema,
 	editAssistantMessageSchema,
 	forkNarratorSchema,
+	humanAttentionListQuerySchema,
 	migrateBrokenModelNarratorsSchema,
 	narratorExportQuerySchema,
 	narratorGrantCreateSchema,
@@ -182,6 +194,12 @@ import {
 	updateWhitelistCmdSchema,
 	updateWhitelistDirSchema,
 } from "../lib/validators";
+import {
+	createRevertPlanSchema,
+	revertPlanFilesQuerySchema,
+	revertPlanIdSchema,
+} from "../lib/validators/narrators";
+import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
 import { requireAdmin } from "../middleware/auth";
 import { generateAskUserQuestionAnswers } from "../services/ask-user-question-reflection";
 import {
@@ -211,10 +229,10 @@ import {
 	resolveRemoteBrowseTarget,
 } from "../services/device-transfer-service";
 import { normalizePathKey, type PathFlavor, pathKeyContains } from "../services/execution-policy";
+import { captureFileReferences } from "../services/file-reference-service";
 import {
 	applyToolCall,
 	buildCanonicalIdentityAliases,
-	canonicalizeDeviceFileIdentity,
 	canonicalizeDeviceFileIdentityWith,
 	type DeviceFileIdentity,
 	type DeviceFileState,
@@ -226,10 +244,13 @@ import {
 	queryOrderedToolCalls,
 	rebuildDeviceFileState,
 	rebuildDeviceFileStatesExcluding,
-	rebuildDeviceFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
 import { gitService } from "../services/git-service";
 import { getStatusSummaryCached } from "../services/git-status-cache";
+import {
+	getHumanAttentionForPrincipal,
+	listHumanAttentionForPrincipal,
+} from "../services/human-attention-service";
 import { filterReadableNarrators, narratorReadableWhere } from "../services/narrator-acl";
 import {
 	deleteBufferedTextFile,
@@ -265,7 +286,6 @@ import {
 	listAllOpenAsyncQuestionsForPrincipal,
 	listAsyncQuestions,
 } from "../services/narrator-question-service";
-
 import { resolveLazyLineage } from "../services/narrator-refs-backfill";
 import {
 	previewNarratorScopedForToolUses,
@@ -362,10 +382,14 @@ import {
 } from "../services/narrator-subagent-recovery";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { permissionRuleService } from "../services/permission-rule-service";
+import {
+	getLocalRevertPlan,
+	listLocalRevertPlanFiles,
+	prepareLocalRevertPlan,
+} from "../services/revert-planner-local-access";
 import { searchService } from "../services/search-service";
 import { skillService } from "../services/skill-service";
 import {
-	applyDeviceFileStates,
 	buildImpreciseRevertWarnings,
 	DEFAULT_REVERT_SCOPE,
 	finalizeSnapshotRevert,
@@ -376,7 +400,7 @@ import {
 	type RevertWarning,
 	resolveNarratorCwd,
 	revertFromSeqTree,
-	revertPatchForToolUses,
+	unavailableSnapshotRevert,
 } from "../services/snapshot-revert";
 import { broadcastSpecChanged } from "../services/spec-broadcast";
 import { appendProtectedSpecTask } from "../services/spec-vfs-service";
@@ -384,6 +408,7 @@ import { resolveStandaloneNarratorCwd } from "../services/standalone-narrator-cw
 import { resumeSubagent, withSubagentResumeLock } from "../services/subagent-resume";
 import { TAKEN_OVER_SUBSTATUS } from "../services/subagent-takeover";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
+import { getToolEditPreview } from "../services/tool-edit-preview";
 import { usageHistoryService } from "../services/usage-history-service";
 import { syncNarratorDraftToRecentTabs } from "../services/user-preferences-service";
 import {
@@ -392,6 +417,7 @@ import {
 	getNarratorIdsWithPresence,
 	getNarratorPresenceBatch,
 } from "../websocket/narrator-ws";
+import { fileReferenceRoutes } from "./narrator-file-references";
 
 function parseNewCommand(message: string): { rawCommand: string; initialMessage: string } | null {
 	const match = message.trim().match(/^\/new(?:\s+([\s\S]*))?$/);
@@ -409,12 +435,19 @@ export async function parseMessageRequest(
 		};
 	},
 	narratorId: string,
-): Promise<{ message: string; images: ImageRef[]; textFiles: File[]; priority?: boolean }> {
+): Promise<{
+	message: string;
+	images: ImageRef[];
+	textFiles: File[];
+	priority?: boolean;
+	fileReferences?: FileReference[];
+}> {
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.includes("multipart/form-data")) {
 		const formData = await c.req.formData();
 		const rawMessage = formData.get("message");
 		const message = typeof rawMessage === "string" ? rawMessage : "";
+		const fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
 		const imageFiles = formData.getAll("images") as File[];
 		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
 			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
@@ -428,7 +461,12 @@ export async function parseMessageRequest(
 		// An attachment carries the turn on its own: images (and text files, whose
 		// paths are injected as an <attached_files> hint) are meaningful content even
 		// when the user typed nothing. Only a fully empty request is rejected.
-		if (!message.trim() && imageFiles.length === 0 && textFileEntries.length === 0) {
+		if (
+			!message.trim() &&
+			imageFiles.length === 0 &&
+			textFileEntries.length === 0 &&
+			!fileReferences?.length
+		) {
 			throw new ValidationError("message or an attachment is required");
 		}
 		// Validate everything before any disk write so a rejected attachment cannot
@@ -458,7 +496,13 @@ export async function parseMessageRequest(
 			throw error;
 		}
 		const priority = formData.get("priority") === "true";
-		return { message, images, textFiles: textFileEntries, priority: priority || undefined };
+		return {
+			message,
+			images,
+			textFiles: textFileEntries,
+			priority: priority || undefined,
+			fileReferences,
+		};
 	}
 	const body = await c.req.json();
 	const parsed = sendMessageSchema.safeParse(body);
@@ -468,10 +512,28 @@ export async function parseMessageRequest(
 		images: [],
 		textFiles: [],
 		priority: parsed.data.priority,
+		fileReferences: parsed.data.fileReferences,
 	};
 }
 
 export const narratorRoutes = new Hono();
+
+// This smaller guard MUST run before the general attachment-body middleware below.
+// Preview inputs contain only bounded selectors, never tool bodies or raw evidence.
+narratorRoutes.use(
+	"/:id/revert-plans",
+	bodyLimit({
+		maxSize: FILE_CHANGE_LIMITS.summaryBytes,
+		onError: (c) =>
+			c.json(
+				{
+					error: "Preview request exceeds the selector byte limit",
+					code: "REVERT_PREVIEW_REQUEST_TOO_LARGE",
+				},
+				413,
+			),
+	}),
+);
 
 narratorRoutes.use(
 	"*",
@@ -520,6 +582,8 @@ const NARRATOR_ID_GATE_EXEMPT_SEGMENTS = new Set([
 	// `/:id/questions` and is still gated normally — only this literal first segment
 	// is skipped.
 	"questions",
+	// Every inbox row/detail is authorized against its actual owner by the service.
+	"human-attention",
 	"whitelist-dirs",
 	"blacklist-dirs",
 	"cmd-whitelist",
@@ -538,7 +602,8 @@ const NARRATOR_ID_GATE_EXEMPT_SEGMENTS = new Set([
  * same word — a future `/:id/rooms/:roomId/leave` would silently inherit a
  * downgrade nobody chose, and the resulting hole looks exactly like correct code.
  */
-const READ_ONLY_WRITE_SUBPATHS = new Set(["leave"]);
+// Resolving a target reads metadata only; it still requires this narrator's read ACL.
+const READ_ONLY_WRITE_SUBPATHS = new Set(["leave", "file-references/resolve"]);
 
 /** The path after `/api/narrators/:id/`, or "" when there is none. */
 function narratorSubPath(requestPath: string, id: string): string {
@@ -573,6 +638,8 @@ narratorRoutes.use("/:id", async (c, next) => {
 	await requireNarratorAccess(c, id, c.req.method === "GET" ? "read" : "write");
 	return next();
 });
+
+narratorRoutes.route("/:id/file-references", fileReferenceRoutes);
 
 /**
  * Gate for the routes keyed by a permission request id.
@@ -1164,6 +1231,28 @@ narratorRoutes.get("/questions/all", async (c) => {
 	});
 });
 
+/** The unified inbox is a projection; all decisions keep their existing guarded endpoints. */
+narratorRoutes.get("/human-attention", async (c) => {
+	const parsed = humanAttentionListQuerySchema.safeParse(c.req.query());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await listHumanAttentionForPrincipal(narratorPrincipalOf(c), {
+			...parsed.data,
+			signal: c.req.raw.signal,
+		}),
+	);
+});
+
+narratorRoutes.get("/human-attention/:attentionId", async (c) => {
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await getHumanAttentionForPrincipal(narratorPrincipalOf(c), c.req.param("attentionId"), {
+			signal: c.req.raw.signal,
+		}),
+	);
+});
+
 narratorRoutes.get("/broken-models", requireAdmin, async (c) => {
 	const includeArchived = c.req.query("includeArchived") === "true";
 	const scan = await scanBrokenModelNarrators({ includeArchived });
@@ -1280,6 +1369,7 @@ narratorRoutes.put("/:id/draft", async (c) => {
 		parsed.data.text,
 		parsed.data.sourceId,
 		parsed.data.baseRevision,
+		parsed.data.fileReferences,
 	);
 	if ("conflict" in update) {
 		return c.json(
@@ -1297,6 +1387,7 @@ narratorRoutes.put("/:id/draft", async (c) => {
 		narratorId: id,
 		hasDraft: update.hasDraft,
 		text: update.text,
+		fileReferences: update.fileReferences,
 		revision: update.revision,
 		updatedAt: update.updatedAt,
 		updatedBy: update.updatedBy,
@@ -1310,6 +1401,7 @@ narratorRoutes.put("/:id/draft", async (c) => {
 		traits: publicTraitsResponse(narrator.traits),
 		hasDraft: update.hasDraft,
 		text: update.text,
+		fileReferences: update.fileReferences,
 		revision: update.revision,
 		updatedAt: update.updatedAt,
 		updatedBy: update.updatedBy,
@@ -1464,6 +1556,7 @@ narratorRoutes.get("/:id/custom-traits", async (c) => {
 narratorRoutes.put("/:id/custom-traits/subagent-model-restriction", async (c) => {
 	const id = c.req.param("id");
 	const body = await c.req.json().catch(() => ({}));
+	validateSubagentModelRestrictionInput(body);
 	const restriction = normalizeSubagentModelRestriction(body);
 	const traits = await updateNarratorTraits(id, (currentTraits) =>
 		Object.keys(restriction.pools).length === 0
@@ -1592,429 +1685,486 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		await narratorService.updateStatus(id, "idle");
 	}
 
-	const { message, images, textFiles, priority } = await parseMessageRequest(c, id);
+	const { message, images, textFiles, priority, fileReferences } = await parseMessageRequest(c, id);
 	const userId = c.get("user").sub;
-	const queuedNewCommand = parseNewCommand(message);
-
-	// Whether an idle-but-compacting narrator should QUEUE this message instead of
-	// starting a turn right now. Evaluated up-front because two independent paths need
-	// the same answer: the `/goal` fast path (which would otherwise mutate tasks.json
-	// and start a Spec turn against the history being replaced) and the ordinary send
-	// path. `priority` is the user's explicit cut-in and opts out.
-	//
-	// Subagents are excluded, and not for lack of care: their queue lives in a separate
-	// map that only accepts input while a foreground runner is attached, and
-	// `resumeBufferedMessagesIfIdle` declines for subagents by design. Queuing an idle
-	// compacting subagent would therefore strand the message with no consumer, so that
-	// window keeps the blocking wait below.
-	const compactionQueueEligible = !priority && getQueueDuringCompaction();
-	const queueBehindCompaction =
-		compactionQueueEligible && !isSubagentVariant(narrator.variant) && isCompactInProgress(id);
-
-	// Resolve slash commands
-	let finalMessage = message;
-	let commandText: string | null = queuedNewCommand?.rawCommand ?? null;
-	// Set when a busy `/goal` falls through to the buffer path, so the buffered
-	// response can prompt the UI to show a "queued protected task" toast.
-	let specGoalQueued = false;
-	let specGoalObjective = "";
-	const cmdResult = queuedNewCommand
-		? ({ resolved: false } as Awaited<ReturnType<typeof resolveCommand>>)
-		: await resolveCommand(message, id, userId);
-	if (cmdResult.resolved && ("loadTool" in cmdResult || "loadToolNotFound" in cmdResult)) {
-		const locale = await getUserLanguage(userId);
-		const result = await handleLoadToolCommand(
-			id,
-			cmdResult as LoadToolResult | LoadToolNotFound,
-			locale,
-			userId,
-		);
-		return c.json(result, 200);
-	}
-	if (cmdResult.resolved && ("unloadTool" in cmdResult || "unloadToolNotFound" in cmdResult)) {
-		const locale = await getUserLanguage(userId);
-		const result = await handleUnloadToolCommand(
-			id,
-			cmdResult as UnloadToolResult | UnloadToolNotFound,
-			locale,
-		);
-		return c.json(result, 200);
-	}
-	if (cmdResult.resolved && "blockSkill" in cmdResult) {
-		const locale = await getUserLanguage(userId);
-		const result = await handleBlockSkillCommand(id, cmdResult as BlockSkillResult, locale);
-		return c.json(result, 200);
-	}
-	if (cmdResult.resolved && "blockAllSkills" in cmdResult) {
-		const locale = await getUserLanguage(userId);
-		const result = await handleBlockAllSkillsCommand(id, cmdResult as BlockAllSkillsResult, locale);
-		return c.json(result, 200);
-	}
-	if (cmdResult.resolved && "unblockSkill" in cmdResult) {
-		const locale = await getUserLanguage(userId);
-		const result = await handleUnblockSkillCommand(id, cmdResult as UnblockSkillResult, locale);
-		return c.json(result, 200);
-	}
-	if (cmdResult.resolved && "unblockAllSkills" in cmdResult) {
-		const locale = await getUserLanguage(userId);
-		const result = await handleUnblockAllSkillsCommand(
-			id,
-			cmdResult as UnblockAllSkillsResult,
-			locale,
-		);
-		return c.json(result, 200);
-	}
-	if (cmdResult.resolved && "loadSkill" in cmdResult) {
-		const skillResult = await handleLoadSkillCommand(id, cmdResult as LoadSkillResult);
-		if (!skillResult.found) {
-			return c.json({ skillName: skillResult.skillName, loaded: false }, 200);
+	// Only a successfully persisted message/queue owns these uploads. In particular,
+	// a rejected reference must not strand images saved by multipart parsing.
+	let uploadsAccepted = false;
+	try {
+		const queuedNewCommand = parseNewCommand(message);
+		if (queuedNewCommand && fileReferences?.length) {
+			throw new ValidationError(
+				"File references are not supported by /new; send them in the new session",
+			);
 		}
-		// Inject skill content into the message, preserving user input after the skill name
-		const userInput = (cmdResult as LoadSkillResult).skillInput;
-		finalMessage = `<command-name>${skillResult.skillName}</command-name>\n${skillResult.content}${userInput ? `\n\n${userInput}` : ""}`;
-		commandText = cmdResult.rawCommand;
-	}
-	// Only the built-in /bash command should short-circuit here. Custom slash commands
-	// with runBashFirst also carry bashCommand, but they must continue below so the
-	// expanded prompt is sent after the pre-prompt Bash command completes.
-	if (cmdResult.resolved && "bashCommand" in cmdResult && !("expandedPrompt" in cmdResult)) {
-		const bashResult = await handleBashCommand(
-			id,
-			(cmdResult as BashCommandResult).bashCommand,
-			cmdResult.rawCommand,
-			userId,
-		);
-		return c.json(bashResult, 201);
-	}
-	// Handle /goal <objective> — add a protected task to spec://tasks.json and
-	// immediately start its first Spec execution turn. When the narrator is busy,
-	// queue the command and append/start it once the buffer consumer reaches it;
-	// this avoids mutating tasks.json in the middle of the current turn.
-	if (cmdResult.resolved && "specGoal" in cmdResult) {
-		const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
-		// A compacting narrator counts as busy here for the same reason a running one
-		// does: appending the protected task now and starting its Spec turn would run
-		// that turn against the history the compact is replacing.
-		const goalNarratorBusy =
-			narrator.status === "working" ||
-			narrator.status === "waiting" ||
-			isLoopRunning(id) ||
-			queueBehindCompaction;
-		if (!goalNarratorBusy) {
-			// Idle: persist the typed /goal command as the canonical user message and
-			// append the protected task immediately.
-			const userMsg = await narratorService.persistUserMessage(
+
+		// Whether an idle-but-compacting narrator should QUEUE this message instead of
+		// starting a turn right now. Evaluated up-front because two independent paths need
+		// the same answer: the `/goal` fast path (which would otherwise mutate tasks.json
+		// and start a Spec turn against the history being replaced) and the ordinary send
+		// path. `priority` is the user's explicit cut-in and opts out.
+		//
+		// Subagents are excluded, and not for lack of care: their queue lives in a separate
+		// map that only accepts input while a foreground runner is attached, and
+		// `resumeBufferedMessagesIfIdle` declines for subagents by design. Queuing an idle
+		// compacting subagent would therefore strand the message with no consumer, so that
+		// window keeps the blocking wait below.
+		const compactionQueueEligible = !priority && getQueueDuringCompaction();
+		const queueBehindCompaction =
+			compactionQueueEligible && !isSubagentVariant(narrator.variant) && isCompactInProgress(id);
+
+		// Resolve slash commands
+		let finalMessage = message;
+		let commandText: string | null = queuedNewCommand?.rawCommand ?? null;
+		// Set when a busy `/goal` falls through to the buffer path, so the buffered
+		// response can prompt the UI to show a "queued protected task" toast.
+		let specGoalQueued = false;
+		let specGoalObjective = "";
+		const cmdResult = queuedNewCommand
+			? ({ resolved: false } as Awaited<ReturnType<typeof resolveCommand>>)
+			: await resolveCommand(message, id, userId);
+		if (
+			fileReferences?.length &&
+			cmdResult.resolved &&
+			!("expandedPrompt" in cmdResult) &&
+			!("loadSkill" in cmdResult)
+		) {
+			throw new ValidationError("File references require a model message, not a control command");
+		}
+		if (cmdResult.resolved && ("loadTool" in cmdResult || "loadToolNotFound" in cmdResult)) {
+			const locale = await getUserLanguage(userId);
+			const result = await handleLoadToolCommand(
 				id,
-				rawCommand,
-				[{ type: "text", text: rawCommand }],
-				rawCommand,
+				cmdResult as LoadToolResult | LoadToolNotFound,
+				locale,
 				userId,
 			);
-			broadcastToNarrator(id, {
-				type: "user_message",
-				narratorId: id,
-				message: {
-					id: userMsg.id,
-					narratorId: id,
-					role: "user",
-					contentJson: userMsg.contentJson,
-					contentText: userMsg.contentText,
-					commandText: rawCommand,
-					createdAt: userMsg.createdAt,
-					seq: userMsg.seq,
-					children: [],
-					creator: userMsg.creator ?? null,
-				},
-			});
-			const { added, written } = await appendProtectedSpecTask(id, objective);
-			if (added) {
-				broadcastSpecChanged(
-					id,
-					{ uri: written.uri, path: written.path, revisionId: written.revisionId },
-					"ui",
-					"user",
-				);
+			return c.json(result, 200);
+		}
+		if (cmdResult.resolved && ("unloadTool" in cmdResult || "unloadToolNotFound" in cmdResult)) {
+			const locale = await getUserLanguage(userId);
+			const result = await handleUnloadToolCommand(
+				id,
+				cmdResult as UnloadToolResult | UnloadToolNotFound,
+				locale,
+			);
+			return c.json(result, 200);
+		}
+		if (cmdResult.resolved && "blockSkill" in cmdResult) {
+			const locale = await getUserLanguage(userId);
+			const result = await handleBlockSkillCommand(id, cmdResult as BlockSkillResult, locale);
+			return c.json(result, 200);
+		}
+		if (cmdResult.resolved && "blockAllSkills" in cmdResult) {
+			const locale = await getUserLanguage(userId);
+			const result = await handleBlockAllSkillsCommand(
+				id,
+				cmdResult as BlockAllSkillsResult,
+				locale,
+			);
+			return c.json(result, 200);
+		}
+		if (cmdResult.resolved && "unblockSkill" in cmdResult) {
+			const locale = await getUserLanguage(userId);
+			const result = await handleUnblockSkillCommand(id, cmdResult as UnblockSkillResult, locale);
+			return c.json(result, 200);
+		}
+		if (cmdResult.resolved && "unblockAllSkills" in cmdResult) {
+			const locale = await getUserLanguage(userId);
+			const result = await handleUnblockAllSkillsCommand(
+				id,
+				cmdResult as UnblockAllSkillsResult,
+				locale,
+			);
+			return c.json(result, 200);
+		}
+		if (cmdResult.resolved && "loadSkill" in cmdResult) {
+			const skillResult = await handleLoadSkillCommand(id, cmdResult as LoadSkillResult);
+			if (!skillResult.found) {
+				if (fileReferences?.length) {
+					throw new ValidationError("Skill was not found; file references were not sent");
+				}
+				return c.json({ skillName: skillResult.skillName, loaded: false }, 200);
 			}
-			// Leave a durable, self-explanatory card in the conversation so the
-			// effect of /goal is visible on scrollback, not only via a toast. This
-			// display-only side effect must not turn an already-applied goal into a
-			// failed command if message persistence is temporarily unavailable.
-			await persistGoalAddedNotice(id, objective, added).catch((err) => {
-				logger.warn("Failed to persist /goal confirmation notice", {
+			// Inject skill content into the message, preserving user input after the skill name
+			const userInput = (cmdResult as LoadSkillResult).skillInput;
+			finalMessage = `<command-name>${skillResult.skillName}</command-name>\n${skillResult.content}${userInput ? `\n\n${userInput}` : ""}`;
+			commandText = cmdResult.rawCommand;
+		}
+		// Only the built-in /bash command should short-circuit here. Custom slash commands
+		// with runBashFirst also carry bashCommand, but they must continue below so the
+		// expanded prompt is sent after the pre-prompt Bash command completes.
+		if (cmdResult.resolved && "bashCommand" in cmdResult && !("expandedPrompt" in cmdResult)) {
+			const bashResult = await handleBashCommand(
+				id,
+				(cmdResult as BashCommandResult).bashCommand,
+				cmdResult.rawCommand,
+				userId,
+			);
+			return c.json(bashResult, 201);
+		}
+		// Handle /goal <objective> — add a protected task to spec://tasks.json and
+		// immediately start its first Spec execution turn. When the narrator is busy,
+		// queue the command and append/start it once the buffer consumer reaches it;
+		// this avoids mutating tasks.json in the middle of the current turn.
+		if (cmdResult.resolved && "specGoal" in cmdResult) {
+			const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
+			// A compacting narrator counts as busy here for the same reason a running one
+			// does: appending the protected task now and starting its Spec turn would run
+			// that turn against the history the compact is replacing.
+			const goalNarratorBusy =
+				narrator.status === "working" ||
+				narrator.status === "waiting" ||
+				isLoopRunning(id) ||
+				queueBehindCompaction;
+			if (!goalNarratorBusy) {
+				// Idle: persist the typed /goal command as the canonical user message and
+				// append the protected task immediately.
+				const userMsg = await narratorService.persistUserMessage(
+					id,
+					rawCommand,
+					[{ type: "text", text: rawCommand }],
+					rawCommand,
+					userId,
+				);
+				broadcastToNarrator(id, {
+					type: "user_message",
 					narratorId: id,
-					error: String(err),
+					message: {
+						id: userMsg.id,
+						narratorId: id,
+						role: "user",
+						contentJson: userMsg.contentJson,
+						contentText: userMsg.contentText,
+						commandText: rawCommand,
+						createdAt: userMsg.createdAt,
+						seq: userMsg.seq,
+						children: [],
+						creator: userMsg.creator ?? null,
+					},
 				});
+				const { added, written } = await appendProtectedSpecTask(id, objective);
+				if (added) {
+					broadcastSpecChanged(
+						id,
+						{ uri: written.uri, path: written.path, revisionId: written.revisionId },
+						"ui",
+						"user",
+					);
+				}
+				// Leave a durable, self-explanatory card in the conversation so the
+				// effect of /goal is visible on scrollback, not only via a toast. This
+				// display-only side effect must not turn an already-applied goal into a
+				// failed command if message persistence is temporarily unavailable.
+				await persistGoalAddedNotice(id, objective, added).catch((err) => {
+					logger.warn("Failed to persist /goal confirmation notice", {
+						narratorId: id,
+						error: String(err),
+					});
+				});
+				const locale = await getUserLanguage(userId);
+				const replyInUserLanguage = await getUserReplyInLanguage(userId);
+				const { started } = await startSpecContinuationIfPossible(
+					id,
+					locale,
+					replyInUserLanguage,
+					userId,
+				);
+				return c.json({ specGoal: true, added, objective, started }, 200);
+			}
+			// Busy: fall through to the shared buffer path. Carry the raw command so the
+			// buffer consumer recognizes it as a /goal, appends the task, and starts its
+			// Spec turn then. The flag lets the UI show a "queued" toast.
+			finalMessage = rawCommand;
+			commandText = rawCommand;
+			specGoalQueued = true;
+			specGoalObjective = objective;
+		}
+		let prePromptBashCommand: string | undefined;
+		if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
+			finalMessage = cmdResult.expandedPrompt;
+			commandText = cmdResult.rawCommand;
+			prePromptBashCommand = cmdResult.bashCommand;
+		}
+
+		// Freeze once before deciding between direct delivery and either queue. The
+		// service owns the read/time budget and reauthorizes the actual HTTP user.
+		const snapshots = fileReferences?.length
+			? await captureFileReferences(id, userId, fileReferences, c.req.raw.signal)
+			: undefined;
+
+		// Extract model override from resolved command (if any)
+		const modelOverride =
+			cmdResult.resolved && "command" in cmdResult ? cmdResult.command.modelOverride : undefined;
+
+		// Busy = DB status says running OR a loop is actually running in memory. The
+		// in-memory check is authoritative: it catches the case where the DB status
+		// went stale to idle while the loop was still draining, which would otherwise
+		// let this message start a second concurrent loop instead of being buffered.
+		let narratorBusy =
+			narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
+
+		// An idle narrator whose context is being compacted takes the same queue path as a
+		// busy one, so the turn runs against the summary that is about to replace its
+		// history rather than racing it (a compact resets the upstream session). This is a
+		// QUEUE, not a wait: the request returns 202 immediately and the message becomes a
+		// cancellable, editable queued card. `drainQueuedMessagesAfterCompact` consumes it
+		// when the compact settles — including on failure or cancel, so nothing is stranded.
+		//
+		// `priority` (already folded into `queueBehindCompaction`) is the user's explicit
+		// "don't wait for the compact" cut-in: it keeps the pre-existing concurrent
+		// behaviour where the compact runs on in the background and the new turn uses the
+		// current history.
+		if (queueBehindCompaction) narratorBusy = true;
+
+		// A compacting SUBAGENT cannot use that queue (see `compactionQueueEligible`), so it
+		// keeps the original blocking wait: still better than racing the summary, just
+		// without the cancellable card.
+		if (!narratorBusy && compactionQueueEligible && isCompactInProgress(id)) {
+			await awaitCompactCompletion(id);
+			narrator = await narratorService.getById(id);
+			narratorBusy =
+				narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
+		}
+
+		if (queuedNewCommand && !narratorBusy) {
+			const currentCwd = narrator.cwd ?? undefined;
+			const newNarrator = await narratorService.create({
+				chapterId: null,
+				model: narrator.model ?? undefined,
+				systemPrompt: narrator.systemPrompt ?? undefined,
+				permissionMode: narrator.permissionMode ?? undefined,
+				reasoningEffort: narrator.reasoningEffort ?? undefined,
+				fastModeOverride: normalizeBooleanOverride(narrator.fastModeOverride),
+				relaxedPlan: narrator.relaxedPlan ?? undefined,
+				planReflectionAutoApproveOverride: normalizeBooleanOverride(
+					narrator.planReflectionAutoApproveOverride,
+				),
+				dangerReflectionOverride: normalizeDangerReflectionOverride(
+					narrator.dangerReflectionOverride,
+				),
+				autoContinuationOverride: normalizeAutoContinuationOverride(
+					narrator.autoContinuationOverride,
+				),
+				cwd: currentCwd,
+				// `/new` spawns a session for the person who typed it, not for the source
+				// narrator's owner — they may differ when working in a shared session.
+				ownerUserId: userId,
 			});
 			const locale = await getUserLanguage(userId);
 			const replyInUserLanguage = await getUserReplyInLanguage(userId);
-			const { started } = await startSpecContinuationIfPossible(
-				id,
-				locale,
-				replyInUserLanguage,
-				userId,
-			);
-			return c.json({ specGoal: true, added, objective, started }, 200);
+			if (queuedNewCommand.initialMessage) {
+				await sendMessage(
+					newNarrator.id,
+					queuedNewCommand.initialMessage,
+					images,
+					locale,
+					replyInUserLanguage,
+					undefined,
+					userId,
+					textFiles,
+				);
+				uploadsAccepted = true;
+			}
+			return c.json({ newNarrator: publicNarratorResponse(newNarrator) }, 201);
 		}
-		// Busy: fall through to the shared buffer path. Carry the raw command so the
-		// buffer consumer recognizes it as a /goal, appends the task, and starts its
-		// Spec turn then. The flag lets the UI show a "queued" toast.
-		finalMessage = rawCommand;
-		commandText = rawCommand;
-		specGoalQueued = true;
-		specGoalObjective = objective;
-	}
-	let prePromptBashCommand: string | undefined;
-	if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
-		finalMessage = cmdResult.expandedPrompt;
-		commandText = cmdResult.rawCommand;
-		prePromptBashCommand = cmdResult.bashCommand;
-	}
 
-	// Extract model override from resolved command (if any)
-	const modelOverride =
-		cmdResult.resolved && "command" in cmdResult ? cmdResult.command.modelOverride : undefined;
+		// Running narrator: buffer the message for the next configured safe boundary.
+		if (narratorBusy) {
+			if (isSubagentVariant(narrator.variant)) {
+				if (queuedNewCommand) {
+					throw new ValidationError("/new cannot be queued from a running subagent");
+				}
+				if (prePromptBashCommand) {
+					throw new ValidationError(
+						"runBashFirst commands are not yet supported while resuming a subagent",
+					);
+				}
 
-	// Busy = DB status says running OR a loop is actually running in memory. The
-	// in-memory check is authoritative: it catches the case where the DB status
-	// went stale to idle while the loop was still draining, which would otherwise
-	// let this message start a second concurrent loop instead of being buffered.
-	let narratorBusy =
-		narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
+				const { bufferSubagentUserMessage, getSubagentBufferedMessages, isTakenOver } =
+					await import("../services/narrator-subagent");
+				const takenOver = isTakenOver(id);
+				const result = bufferSubagentUserMessage(id, finalMessage, {
+					images: images.length > 0 ? images : undefined,
+					textFiles: textFiles.length > 0 ? textFiles : undefined,
+					commandText,
+					createdBy: userId,
+					prePromptBashCommand,
+					priority,
+					requestSoftStop: !takenOver,
+					fileReferences: snapshots,
+				});
+				if (!result.ok) {
+					if (result.full) throw new ValidationError("Message queue is full");
+					throw new ValidationError("Subagent is not running in foreground");
+				}
+				uploadsAccepted = true;
+				const messages = toBufferSummary(getSubagentBufferedMessages(id));
+				broadcastToNarrator(id, {
+					type: "buffer_set",
+					narratorId: id,
+					messages,
+				});
+				return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
+			}
 
-	// An idle narrator whose context is being compacted takes the same queue path as a
-	// busy one, so the turn runs against the summary that is about to replace its
-	// history rather than racing it (a compact resets the upstream session). This is a
-	// QUEUE, not a wait: the request returns 202 immediately and the message becomes a
-	// cancellable, editable queued card. `drainQueuedMessagesAfterCompact` consumes it
-	// when the compact settles — including on failure or cancel, so nothing is stranded.
-	//
-	// `priority` (already folded into `queueBehindCompaction`) is the user's explicit
-	// "don't wait for the compact" cut-in: it keeps the pre-existing concurrent
-	// behaviour where the compact runs on in the background and the new turn uses the
-	// current history.
-	if (queueBehindCompaction) narratorBusy = true;
+			// Primary narrator: push onto buffer queue (or unshift if priority).
+			// If the DB status was stale-idle while a loop is actually running, correct
+			// it so the user regains the interrupt button instead of being stuck.
+			await reconcileRunningStatus(id);
+			const user = await db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+			});
+			const creator: BufferCreator | null = user
+				? {
+						id: user.id,
+						username: user.username,
+						avatarColor: user.avatarColor,
+						avatarImageId: user.avatarImageId,
+					}
+				: null;
+			const result = await pushBufferedMessage(
+				id,
+				finalMessage,
+				images.length > 0 ? images : undefined,
+				commandText,
+				userId,
+				creator,
+				textFiles.length > 0 ? textFiles : undefined,
+				priority ? "front" : undefined,
+				prePromptBashCommand,
+				snapshots,
+			);
+			if (result.ok) {
+				uploadsAccepted = true;
+				const messages = toBufferSummary(getBufferedMessages(id));
+				broadcastToNarrator(id, {
+					type: "buffer_set",
+					narratorId: id,
+					messages,
+				});
+				// Priority messages should cut in at the next safe model-request boundary without
+				// aborting running tools. The loop soft-stops after current tools complete, then
+				// consumes the front of the buffer as the next request.
+				if (priority) {
+					requestBufferedMessageSoftStop(id);
+				}
+				return c.json(
+					{
+						buffered: true,
+						bufferedAt: result.bufferedAt,
+						id: result.id,
+						...(specGoalQueued ? { specGoalQueued: true, objective: specGoalObjective } : {}),
+					},
+					202,
+				);
+			}
+			if (result.full) {
+				throw new ValidationError("Message queue is full");
+			}
+			// The queue refused this message. Falling through to a normal send is only
+			// correct when the narrator turned out NOT to be busy after all — the
+			// legitimate case is a zombie `working`/`waiting` row whose writer is gone,
+			// which `reconcileRunningStatus` above has just repaired to idle.
+			//
+			// If a runtime owner still exists, falling through would start a second agent
+			// loop next to the live one. `feedMessage`'s own guard cannot catch that: it
+			// tests `active._loopRunning`, and a loop-less owner (planned-update recovery,
+			// a subagent recovery stage, the recovery Await batch) has no `activeNarrators`
+			// entry at all, so `ensureNarrator` hands back a fresh session whose flag is
+			// false. That is exactly how a post-update restart ended up talking over its
+			// own still-running subagent.
+			if (isNarratorRuntimeBusy(id)) {
+				logger.warn("Refused to send while a loop-less runtime owner holds the narrator", {
+					narratorId: id,
+				});
+				throw new ValidationError("Narrator is busy; the message could not be queued");
+			}
+			// No runtime owner: the busy status was stale. Fall through to a normal send.
+		}
 
-	// A compacting SUBAGENT cannot use that queue (see `compactionQueueEligible`), so it
-	// keeps the original blocking wait: still better than racing the summary, just
-	// without the cancellable card.
-	if (!narratorBusy && compactionQueueEligible && isCompactInProgress(id)) {
-		await awaitCompactCompletion(id);
-		narrator = await narratorService.getById(id);
-		narratorBusy =
-			narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
-	}
-
-	if (queuedNewCommand && !narratorBusy) {
-		const currentCwd = narrator.cwd ?? undefined;
-		const newNarrator = await narratorService.create({
-			chapterId: null,
-			model: narrator.model ?? undefined,
-			systemPrompt: narrator.systemPrompt ?? undefined,
-			permissionMode: narrator.permissionMode ?? undefined,
-			reasoningEffort: narrator.reasoningEffort ?? undefined,
-			fastModeOverride: normalizeBooleanOverride(narrator.fastModeOverride),
-			relaxedPlan: narrator.relaxedPlan ?? undefined,
-			planReflectionAutoApproveOverride: normalizeBooleanOverride(
-				narrator.planReflectionAutoApproveOverride,
-			),
-			dangerReflectionOverride: normalizeDangerReflectionOverride(
-				narrator.dangerReflectionOverride,
-			),
-			autoContinuationOverride: normalizeAutoContinuationOverride(
-				narrator.autoContinuationOverride,
-			),
-			cwd: currentCwd,
-			// `/new` spawns a session for the person who typed it, not for the source
-			// narrator's owner — they may differ when working in a shared session.
-			ownerUserId: userId,
-		});
 		const locale = await getUserLanguage(userId);
 		const replyInUserLanguage = await getUserReplyInLanguage(userId);
-		if (queuedNewCommand.initialMessage) {
-			await sendMessage(
-				newNarrator.id,
-				queuedNewCommand.initialMessage,
-				images,
-				locale,
-				replyInUserLanguage,
-				undefined,
-				userId,
-				textFiles,
-			);
-		}
-		return c.json({ newNarrator: publicNarratorResponse(newNarrator) }, 201);
-	}
 
-	// Running narrator: buffer the message for the next configured safe boundary.
-	if (narratorBusy) {
-		if (isSubagentVariant(narrator.variant)) {
-			if (queuedNewCommand) {
-				throw new ValidationError("/new cannot be queued from a running subagent");
+		// Apply model override from slash command before sending
+		if (modelOverride?.model) {
+			if (modelOverride.mode === "temporary") {
+				// Persist the original model so it can be restored after the turn
+				// (survives server restarts). Must be written before sendMessage to
+				// avoid a race with the agent loop's finally block.
+				await setTemporaryModelRestore(id, narrator.model ?? "__default__");
 			}
+			// Switch model in DB (sendMessage → ensureNarrator reads from DB)
+			await narratorService.updateModel(id, modelOverride.model);
+		}
+
+		if (isSubagentVariant(narrator.variant)) {
 			if (prePromptBashCommand) {
 				throw new ValidationError(
 					"runBashFirst commands are not yet supported while resuming a subagent",
 				);
 			}
-
-			const { bufferSubagentUserMessage, getSubagentBufferedMessages, isTakenOver } = await import(
-				"../services/narrator-subagent"
-			);
-			const takenOver = isTakenOver(id);
-			const result = bufferSubagentUserMessage(id, finalMessage, {
+			const resumed = await resumeSubagent({
+				subagentId: id,
+				intent: "follow_up",
+				actor: "user",
+				prompt: finalMessage,
+				fileReferences: snapshots,
 				images: images.length > 0 ? images : undefined,
 				textFiles: textFiles.length > 0 ? textFiles : undefined,
 				commandText,
 				createdBy: userId,
-				prePromptBashCommand,
-				priority,
-				requestSoftStop: !takenOver,
+				locale,
 			});
-			if (!result.ok) {
-				if (result.full) throw new ValidationError("Message queue is full");
-				throw new ValidationError("Subagent is not running in foreground");
-			}
-			const messages = toBufferSummary(getSubagentBufferedMessages(id));
-			broadcastToNarrator(id, {
-				type: "buffer_set",
-				narratorId: id,
-				messages,
-			});
-			return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
-		}
-
-		// Primary narrator: push onto buffer queue (or unshift if priority).
-		// If the DB status was stale-idle while a loop is actually running, correct
-		// it so the user regains the interrupt button instead of being stuck.
-		await reconcileRunningStatus(id);
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-		});
-		const creator: BufferCreator | null = user
-			? {
-					id: user.id,
-					username: user.username,
-					avatarColor: user.avatarColor,
-					avatarImageId: user.avatarImageId,
-				}
-			: null;
-		const result = await pushBufferedMessage(
-			id,
-			finalMessage,
-			images.length > 0 ? images : undefined,
-			commandText,
-			userId,
-			creator,
-			textFiles.length > 0 ? textFiles : undefined,
-			priority ? "front" : undefined,
-			prePromptBashCommand,
-		);
-		if (result.ok) {
-			const messages = toBufferSummary(getBufferedMessages(id));
-			broadcastToNarrator(id, {
-				type: "buffer_set",
-				narratorId: id,
-				messages,
-			});
-			// Priority messages should cut in at the next safe model-request boundary without
-			// aborting running tools. The loop soft-stops after current tools complete, then
-			// consumes the front of the buffer as the next request.
-			if (priority) {
-				requestBufferedMessageSoftStop(id);
+			uploadsAccepted = true;
+			if (modelOverride?.model) {
+				updateNarratorModel(id, modelOverride.model);
 			}
 			return c.json(
-				{
-					buffered: true,
-					bufferedAt: result.bufferedAt,
-					id: result.id,
-					...(specGoalQueued ? { specGoalQueued: true, objective: specGoalObjective } : {}),
-				},
-				202,
+				resumed.userMessage ? fileReferenceMessageForDisplay(resumed.userMessage) : { ok: true },
+				201,
 			);
 		}
-		if (result.full) {
-			throw new ValidationError("Message queue is full");
-		}
-		// The queue refused this message. Falling through to a normal send is only
-		// correct when the narrator turned out NOT to be busy after all — the
-		// legitimate case is a zombie `working`/`waiting` row whose writer is gone,
-		// which `reconcileRunningStatus` above has just repaired to idle.
-		//
-		// If a runtime owner still exists, falling through would start a second agent
-		// loop next to the live one. `feedMessage`'s own guard cannot catch that: it
-		// tests `active._loopRunning`, and a loop-less owner (planned-update recovery,
-		// a subagent recovery stage, the recovery Await batch) has no `activeNarrators`
-		// entry at all, so `ensureNarrator` hands back a fresh session whose flag is
-		// false. That is exactly how a post-update restart ended up talking over its
-		// own still-running subagent.
-		if (isNarratorRuntimeBusy(id)) {
-			logger.warn("Refused to send while a loop-less runtime owner holds the narrator", {
-				narratorId: id,
-			});
-			throw new ValidationError("Narrator is busy; the message could not be queued");
-		}
-		// No runtime owner: the busy status was stale. Fall through to a normal send.
-	}
 
-	const locale = await getUserLanguage(userId);
-	const replyInUserLanguage = await getUserReplyInLanguage(userId);
-
-	// Apply model override from slash command before sending
-	if (modelOverride?.model) {
-		if (modelOverride.mode === "temporary") {
-			// Persist the original model so it can be restored after the turn
-			// (survives server restarts). Must be written before sendMessage to
-			// avoid a race with the agent loop's finally block.
-			await setTemporaryModelRestore(id, narrator.model ?? "__default__");
-		}
-		// Switch model in DB (sendMessage → ensureNarrator reads from DB)
-		await narratorService.updateModel(id, modelOverride.model);
-	}
-
-	if (isSubagentVariant(narrator.variant)) {
-		if (prePromptBashCommand) {
-			throw new ValidationError(
-				"runBashFirst commands are not yet supported while resuming a subagent",
-			);
-		}
-		const resumed = await resumeSubagent({
-			subagentId: id,
-			intent: "follow_up",
-			actor: "user",
-			prompt: finalMessage,
-			images: images.length > 0 ? images : undefined,
-			textFiles: textFiles.length > 0 ? textFiles : undefined,
-			commandText,
-			createdBy: userId,
+		// prePromptBashCommand (runBashFirst) is passed to sendMessage so the order is:
+		// user prompt message → Bash tool card → model reply (handled inside feedMessage).
+		const userMsg = await sendMessage(
+			id,
+			finalMessage,
+			images,
 			locale,
-		});
+			replyInUserLanguage,
+			commandText,
+			userId,
+			textFiles,
+			prePromptBashCommand,
+			undefined,
+			snapshots,
+		);
+		uploadsAccepted = true;
+
+		// Broadcast model change to frontend (ensureNarrator already picked up the new model from DB)
 		if (modelOverride?.model) {
 			updateNarratorModel(id, modelOverride.model);
 		}
-		return c.json(resumed.userMessage ?? { ok: true }, 201);
+
+		return c.json(fileReferenceMessageForDisplay(userMsg), 201);
+	} finally {
+		if (!uploadsAccepted) {
+			for (const image of images) {
+				try {
+					deleteUploadedImage(id, image.imageId);
+				} catch (error) {
+					logger.warn("Failed to clean rejected message upload", {
+						narratorId: id,
+						imageId: image.imageId,
+						error: String(error),
+					});
+				}
+			}
+		}
 	}
-
-	// prePromptBashCommand (runBashFirst) is passed to sendMessage so the order is:
-	// user prompt message → Bash tool card → model reply (handled inside feedMessage).
-	const userMsg = await sendMessage(
-		id,
-		finalMessage,
-		images,
-		locale,
-		replyInUserLanguage,
-		commandText,
-		userId,
-		textFiles,
-		prePromptBashCommand,
-	);
-
-	// Broadcast model change to frontend (ensureNarrator already picked up the new model from DB)
-	if (modelOverride?.model) {
-		updateNarratorModel(id, modelOverride.model);
-	}
-
-	return c.json(userMsg, 201);
 });
 
 // Retry last user message — re-run agent loop without creating a new message
@@ -2165,6 +2315,7 @@ narratorRoutes.post("/:id/subagent-recovery", async (c) => {
 		messageId: body.messageId,
 		mode: body.mode,
 		resumedAliases: resumed,
+		retrySubagentIds: skipped.map((entry) => entry.id),
 	});
 
 	if (resumed.length === 0) {
@@ -2283,6 +2434,36 @@ narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 	return c.json(result);
 });
 
+/** Read snapshots only from the message being edited, never from a different session. */
+async function resolveEditedFileReferences(
+	narratorId: string,
+	messageId: string,
+	requested: FileReference[] | undefined,
+	userId: string,
+	signal: AbortSignal,
+): Promise<FileReferenceSnapshot[] | undefined> {
+	if (requested === undefined) return undefined;
+	const ref = await db.query.narratorMessageRefs.findFirst({
+		where: and(
+			eq(narratorMessageRefs.narratorId, narratorId),
+			eq(narratorMessageRefs.messageId, messageId),
+		),
+		columns: { messageId: true },
+	});
+	if (!ref) throw new NotFoundError("Message", messageId);
+	const message = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, ref.messageId),
+		columns: { role: true, contentJson: true },
+	});
+	if (!message) throw new NotFoundError("Message", messageId);
+	if (message.role !== "user") throw new ValidationError("Can only edit user messages");
+	return replaceFileReferenceSnapshots(
+		getFileReferenceSnapshots(message.contentJson),
+		requested,
+		(references) => captureFileReferences(narratorId, userId, references, signal),
+	);
+}
+
 // Edit a user message and regenerate the response.
 // Supports JSON (text-only / keep-image-subset) and multipart/form-data (when the
 // user adds new images during editing).
@@ -2291,6 +2472,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	const messageId = c.req.param("messageId");
 
 	let content: string;
+	let fileReferences: FileReference[] | undefined;
 	// Whether the truncated messages' file changes are rolled back, and how wide.
 	// Undefined => the legacy `rollback` field decides (see below), then default true.
 	let skipRevert: boolean | undefined;
@@ -2321,6 +2503,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	if (contentType.includes("multipart/form-data")) {
 		const formData = await c.req.formData();
 		content = (formData.get("content") as string) ?? "";
+		fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
 		const rawSkipRevert = formData.get("skipRevert");
 		if (typeof rawSkipRevert === "string") skipRevert = rawSkipRevert === "true";
 		const rawRollback = formData.get("rollback");
@@ -2364,6 +2547,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	} else {
 		const body = editAndRegenerateJsonSchema.parse(await c.req.json());
 		content = body.content ?? "";
+		fileReferences = body.fileReferences;
 		skipRevert = body.skipRevert;
 		legacyRollback = body.rollback;
 		scope = body.scope;
@@ -2378,6 +2562,15 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	const revertFiles = skipRevert !== undefined ? !skipRevert : (legacyRollback ?? true);
 
 	const narrator = await narratorService.getById(id);
+	const userId = c.get("user").sub;
+	// Invalid/new references must fail before interrupting or rewriting history.
+	const snapshots = await resolveEditedFileReferences(
+		id,
+		messageId,
+		fileReferences,
+		userId,
+		c.req.raw.signal,
+	);
 
 	// Editing a message truncates everything after it and regenerates, so the running
 	// turn is exactly what the user is replacing. Interrupt it for them rather than
@@ -2388,7 +2581,6 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		await narratorService.updateStatus(id, "idle");
 	}
 
-	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
@@ -2409,6 +2601,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 			editNewImages: newImages.length > 0 ? newImages : undefined,
 			editKeepTextFilePaths: keepTextFilePaths,
 			editNewTextFiles: newTextFiles.length > 0 ? newTextFiles : undefined,
+			editFileReferences: snapshots,
 			createdBy: userId,
 			locale,
 			replyInUserLanguage,
@@ -2420,6 +2613,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	}
 
 	const result = await editAndRegenerate(id, messageId, content, locale, replyInUserLanguage, {
+		fileReferences: snapshots,
 		keepImageIds,
 		newImages: newImages.length > 0 ? newImages : undefined,
 		keepTextFilePaths,
@@ -2428,7 +2622,12 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		revertFiles,
 		...(scope ? { revertScope: scope } : {}),
 	});
-	return c.json(result);
+	// Editing acknowledges the rewrite; refreshed message bubbles arrive separately.
+	// Do not expose internal message/snapshot fields if the service result grows.
+	return c.json({
+		ok: result.ok,
+		...(result.warnings?.length ? { warnings: result.warnings } : {}),
+	});
 });
 
 // Edit an assistant message's text without deleting later messages or regenerating.
@@ -2456,7 +2655,7 @@ narratorRoutes.post("/:id/edit-message/:messageId", async (c) => {
 
 	const userId = c.get("user").sub;
 	const result = await editAssistantMessage(id, messageId, content, userId);
-	return c.json(result);
+	return c.json({ ok: result.ok });
 });
 
 // Restore an edited assistant message back to its original text, clearing the
@@ -2479,7 +2678,7 @@ narratorRoutes.post("/:id/restore-message/:messageId", async (c) => {
 	}
 
 	const result = await restoreAssistantMessage(id, messageId);
-	return c.json(result);
+	return c.json({ ok: result.ok });
 });
 
 /**
@@ -2611,6 +2810,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	const mid = c.req.param("mid");
 
 	let rawText: string | undefined;
+	let fileReferences: FileReference[] | undefined;
 	let keepImageIds: string[] | undefined;
 	let keepTextFiles: Array<{ index: number; filename: string }> | undefined;
 	const newImageFiles: File[] = [];
@@ -2623,6 +2823,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		if (typeof rawTextField === "string") rawText = rawTextField;
 		const parsed = updateBufferedMessageSchema.safeParse({
 			...(rawText !== undefined ? { text: rawText } : {}),
+			fileReferences: parseFileReferenceInput(formData.get("fileReferences")),
 			...(formData.has("keepImageIds")
 				? { keepImageIds: parseJsonArrayField(formData.get("keepImageIds"), "keepImageIds") }
 				: {}),
@@ -2633,6 +2834,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		if (!parsed.success) throw new ValidationError(parsed.error.message);
 		keepImageIds = parsed.data.keepImageIds;
 		keepTextFiles = parsed.data.keepTextFiles;
+		fileReferences = parsed.data.fileReferences;
 
 		for (const file of formData.getAll("images") as File[]) {
 			validateUploadedImage(file);
@@ -2655,6 +2857,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		rawText = parsed.data.text;
 		keepImageIds = parsed.data.keepImageIds;
 		keepTextFiles = parsed.data.keepTextFiles;
+		fileReferences = parsed.data.fileReferences;
 	}
 
 	const located = await locateBufferedMessage(id, mid);
@@ -2675,9 +2878,26 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	if (keptTextFileIndexes.length + newTextFiles.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
 		throw new ValidationError(`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`);
 	}
+	// The primary buffer consumer interprets /new and /goal rather than sending
+	// them as ordinary model turns. Editing must not bypass send-time rejection.
+	if (
+		!located.fromSubagentQueue &&
+		(fileReferences ?? located.message.fileReferences ?? []).length > 0 &&
+		[text, located.message.commandText ?? ""].some((value) =>
+			/^\/(?:new|goal)(?:\s|$)/.test(value.trim()),
+		)
+	) {
+		throw new ValidationError("File references are not supported by queued /new or /goal commands");
+	}
+	const snapshots = await replaceFileReferenceSnapshots(
+		located.message.fileReferences ?? [],
+		fileReferences,
+		(references) => captureFileReferences(id, c.get("user").sub, references, c.req.raw.signal),
+	);
+	const finalReferenceCount = (snapshots ?? located.message.fileReferences ?? []).length;
 	const finalImageCount = keptImages.length + newImageFiles.length;
 	const finalTextFileCount = keptTextFileIndexes.length + newTextFiles.length;
-	if (!text && finalImageCount === 0 && finalTextFileCount === 0) {
+	if (!text && finalImageCount === 0 && finalTextFileCount === 0 && finalReferenceCount === 0) {
 		throw new ValidationError("Message cannot be empty");
 	}
 
@@ -2718,6 +2938,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 			ok = updateSubagentBufferedMessage(id, mid, text, {
 				images: [...keptImages, ...newImages],
 				textFiles: [...keptTextFileObjects, ...newTextFiles],
+				fileReferences: snapshots,
 			});
 		} else {
 			// New files join the message's existing directory; reserving the kept
@@ -2734,6 +2955,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 				images: [...keptImages, ...newImages],
 				textFiles: loadBufferedTextFiles(savedFiles),
 				savedFiles,
+				fileReferences: snapshots,
 			});
 		}
 		if (!ok) throw new NotFoundError("Buffered message", mid);
@@ -2959,11 +3181,34 @@ narratorRoutes.get("/:id/export", async (c) => {
 	});
 });
 
-// Get full tool call detail (untruncated inputJson/outputJson)
+// Exact historical file bodies, authorized by the same ref/COW/child selector as detail.
+narratorRoutes.get("/:id/tool-calls/:toolUseId/file-edit-preview", async (c) => {
+	const row = await narratorService.getToolCallPreviewMetadata(
+		c.req.param("id"),
+		c.req.param("toolUseId"),
+		{ toolCallId: c.req.query("toolCallId"), messageId: c.req.query("messageId") },
+	);
+	const preview = await getToolEditPreview(row, c.req.raw.signal);
+	// Blob/git IO yields: a revoked narrator ACL or message ref must not leak a
+	// response that was authorized before that asynchronous read began.
+	await requireNarratorAccess(c, c.req.param("id"), "read");
+	await narratorService.getToolCallPreviewMetadata(c.req.param("id"), row.toolUseId, {
+		toolCallId: row.id,
+		messageId: row.messageId,
+	});
+	c.header("Cache-Control", "no-store");
+	return c.json(preview);
+});
+
+// Get full tool call detail (untruncated inputJson/outputJson). Provider IDs can
+// repeat, so callers may pin the actual tool row or containing message.
 narratorRoutes.get("/:id/tool-calls/:toolUseId", async (c) => {
 	const id = c.req.param("id");
 	const toolUseId = c.req.param("toolUseId");
-	const tc = await narratorService.getToolCallDetail(id, toolUseId);
+	const tc = await narratorService.getToolCallDetail(id, toolUseId, {
+		toolCallId: c.req.query("toolCallId"),
+		messageId: c.req.query("messageId"),
+	});
 	return c.json(tc);
 });
 
@@ -3602,11 +3847,6 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 		const { getForegroundAbortControllers, getBackgroundAbortControllers } = await import(
 			"../services/narrator-subagent"
 		);
-		const isRunning =
-			isNarratorActive(id) ||
-			getForegroundAbortControllers().has(id) ||
-			getBackgroundAbortControllers().has(id);
-
 		// Resolve the parent tool_use that originally spawned this subagent.
 		const firstMsg = await db.query.narratorMessages.findFirst({
 			where: and(
@@ -3619,19 +3859,27 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 		});
 		const parentToolUseId = firstMsg?.parentToolUseId ?? "";
 
-		// Clear the card's takeover badge here rather than at each exit below: every
-		// remaining branch stops the takeover (the only failure path is the guard
-		// above), so one call covers all six of them and cannot be forgotten when a
-		// branch is added. Deferred branches included — the user has released control
-		// even when the result handoff waits for the loop to end.
-		await broadcastSubagentTakeoverChanged({
-			parentNarratorId: narrator.parentNarratorId,
-			subagentNarratorId: id,
-			takenOver: false,
-			...(parentToolUseId ? { toolUseId: parentToolUseId } : {}),
-		});
+		// Publish release only once its handoff/deferral succeeded. In particular,
+		// a conclusion validation/write failure must keep the takeover retryable.
+		const parentNarratorId = narrator.parentNarratorId;
+		const broadcastReleased = () =>
+			broadcastSubagentTakeoverChanged({
+				parentNarratorId,
+				subagentNarratorId: id,
+				takenOver: false,
+				...(parentToolUseId ? { toolUseId: parentToolUseId } : {}),
+			});
 
-		if (wasBackground) {
+		// Probe after the awaited lookups, immediately before marking the
+		// handoff. A loop can finish while those awaits yield. Its CURRENT owner,
+		// not the mode it originally started in, decides who must settle the result.
+		const foregroundRunning = getForegroundAbortControllers().has(id);
+		const isRunning =
+			isNarratorActive(id) ||
+			isLoopRunning(id) ||
+			foregroundRunning ||
+			getBackgroundAbortControllers().has(id);
+		if (wasBackground && !foregroundRunning && !isManualOverride(id)) {
 			// Background takeover: the parent was never blocked (it holds the
 			// background_task_id). Restore background completion semantics so the
 			// result reaches the parent via Await / completion sidecar.
@@ -3641,6 +3889,7 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 				// stays consistent; only drop the visible tag.
 				markPendingBackgroundFinalize(id);
 				await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
+				await broadcastReleased();
 				return c.json({ stopped: true, deferred: true });
 			}
 			// Idle — finalize as a background completion now.
@@ -3658,6 +3907,7 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 				finalText,
 				locale,
 			);
+			await broadcastReleased();
 			return c.json({ stopped: true, deferred: false });
 		}
 
@@ -3670,6 +3920,7 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 			// all takeover sets). The handoff clears takeover state after consuming it.
 			markPendingStopTakeover(id);
 			await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
+			await broadcastReleased();
 			return c.json({ stopped: true, deferred: true });
 		}
 
@@ -3684,6 +3935,7 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 			clearTakenOver(id);
 			await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
 			resolveManualOverride(id, finalText, hasError);
+			await broadcastReleased();
 			return c.json({ stopped: true, deferred: false });
 		}
 
@@ -3695,21 +3947,21 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 		);
 		const watcher = getConclusionWatcher(id);
 		if (watcher) {
-			const { getSubagentResultMessageId, updateToolCallConclusion } = await import(
-				"../services/narrator-session"
-			);
-			removeConclusionWatcher(id);
+			const {
+				getSubagentResultMessageId,
+				prepareSubagentConclusionReference,
+				updateToolCallConclusion,
+			} = await import("../services/narrator-session");
 			const resultMsgId = await getSubagentResultMessageId(id);
-			// Clear takeover state BEFORE the status write so preserveTakenOverSubstatus
-			// does not re-inject the taken_over tag.
-			clearTakenOver(id);
-			await narratorService
-				.updateStatus(id, "idle", {
-					substatus: hasError ? ["error"] : ["unread"],
-					skipErrorMessage: true,
-				})
-				.catch(() => {});
+			const reference = await prepareSubagentConclusionReference(
+				id,
+				narrator.parentNarratorId,
+				watcher.toolUseId,
+				watcher.originToolCallId,
+			);
 			await updateToolCallConclusion({
+				toolCallId: reference.toolCallId,
+				messageId: reference.messageId,
 				subagentId: id,
 				parentNarratorId: narrator.parentNarratorId,
 				toolUseId: watcher.toolUseId,
@@ -3718,6 +3970,16 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 				resultMessageId: resultMsgId,
 				refreshTiming: true,
 			});
+			// A failed write must leave both the watcher and takeover retryable.
+			if (getConclusionWatcher(id) === watcher) removeConclusionWatcher(id);
+			clearTakenOver(id);
+			await narratorService
+				.updateStatus(id, "idle", {
+					substatus: hasError ? ["error"] : ["unread"],
+					skipErrorMessage: true,
+				})
+				.catch(() => {});
+			await broadcastReleased();
 			return c.json({ stopped: true, deferred: false });
 		}
 
@@ -3731,6 +3993,7 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 		// the marker is consumed (clearing it here would wipe the marker too).
 		markPendingStopTakeover(id);
 		await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
+		await broadcastReleased();
 		return c.json({ stopped: true, deferred: true });
 	});
 });
@@ -3792,35 +4055,22 @@ narratorRoutes.post("/:id/update-conclusion", async (c) => {
 			return c.json({ ok: true, toolUseId, outcome: "released_blocked_parent" });
 		}
 
-		// Not in manual_override — update the tool_call outputJson directly
-		// (existing behavior for already-completed subagents).
-		// Find the tool_call record
-		const tc = await narratorService.getToolCallByToolUseId(toolUseId);
-		if (!tc?.messageId) {
-			return c.json({ error: "Tool call not found" }, 400);
-		}
-
-		// Fork detection: check if the parent's assistant message is shared.
-		// After copy-on-write, track the new messageId so updateToolCallResult
-		// only updates the private copy (not the original shared record).
-		const isShared = await narratorService.isMessageSharedByMultipleNarrators(tc.messageId);
-		let privateMessageId: string | undefined;
-		if (isShared) {
-			privateMessageId = await narratorService.copyOnWriteToolCallMessage(
-				narrator.parentNarratorId,
-				tc.messageId,
-				toolUseId,
-			);
-		}
-
-		const { updateToolCallConclusion } = await import("../services/narrator-session");
+		const { prepareSubagentConclusionReference, updateToolCallConclusion } = await import(
+			"../services/narrator-session"
+		);
+		const reference = await prepareSubagentConclusionReference(
+			id,
+			narrator.parentNarratorId,
+			toolUseId,
+		);
 		await updateToolCallConclusion({
 			subagentId: id,
 			parentNarratorId: narrator.parentNarratorId,
 			toolUseId,
 			finalText,
 			hasError,
-			messageId: privateMessageId,
+			messageId: reference.messageId,
+			toolCallId: reference.toolCallId,
 		});
 
 		return c.json({ ok: true, toolUseId, outcome: "updated_existing_conclusion" });
@@ -4073,14 +4323,28 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 			],
 		},
 	});
-	await narratorService.updateToolCallResult(toolUseId, {
-		output: getToolMessageWithParams("enterPlanModeOutputWithPath", locale as Locale, {
-			planFilePath: planState.planFilePath ?? buildPlanFileRelPath("<id>"),
-		}),
-		status: "success",
-		// The following message broadcast already accounts for this persisted tool state.
-		bumpMessageVersion: false,
+	const manualToolCall = await db.query.narratorToolCalls.findFirst({
+		where: and(
+			eq(narratorToolCalls.messageId, msg.id),
+			eq(narratorToolCalls.narratorId, id),
+			eq(narratorToolCalls.toolUseId, toolUseId),
+		),
+		columns: { id: true },
 	});
+	if (!manualToolCall) throw new Error("Manual plan-mode message has no persisted tool row");
+	await narratorService.updateToolCallResult(
+		toolUseId,
+		{
+			output: getToolMessageWithParams("enterPlanModeOutputWithPath", locale as Locale, {
+				planFilePath: planState.planFilePath ?? buildPlanFileRelPath("<id>"),
+			}),
+			status: "success",
+			// The following message broadcast already accounts for this persisted tool state.
+			bumpMessageVersion: false,
+		},
+		msg.id,
+		manualToolCall.id,
+	);
 	const fullMsg = await db.query.narratorMessages.findFirst({
 		where: eq(narratorMessages.id, msg.id),
 		with: { toolCalls: true },
@@ -5100,21 +5364,16 @@ function fileHistoryConflictBody(error: unknown) {
 }
 
 /**
- * Describe both rollback scopes for a window, or null when neither tree-based
- * scope applies (pre-snapshot history, which the caller previews via replay).
- *
- * Each scope's file list is produced by the same comparison its rollback performs,
- * so the dialog can never advertise a narrower change set than what gets applied.
- * `withContents` attaches current/reverted text for the diff view — to BOTH scopes,
- * because either can be the selected one and a diff view with no contents would
- * render every file as an empty change.
+ * Expose both scopes' availability without choosing a wider fallback. Legacy tree
+ * differences are read-only inspection material, not permission to execute them.
  */
 async function buildRevertScopePreviews(narratorId: string, minSeq: number, withContents = false) {
 	const [narratorScope, treePreview] = await Promise.all([
 		previewNarratorScopedFromSeq(narratorId, minSeq, { withContents }),
 		previewSeqTreeRevert(narratorId, minSeq),
 	]);
-	if (!treePreview && !narratorScope.available) return null;
+	// Always return the unavailable reasons. Dropping them here used to make the
+	// route advertise a legacy replay as though there were no protection gap.
 
 	const workspaceFiles = treePreview
 		? withContents
@@ -5138,8 +5397,7 @@ async function buildRevertScopePreviews(narratorId: string, minSeq: number, with
 		}
 	}
 
-	const scope: RevertScope =
-		narratorScope.available && narratorScope.conflicts.length === 0 ? "narrator" : "workspace";
+	const scope: RevertScope = DEFAULT_REVERT_SCOPE;
 
 	return {
 		scope,
@@ -5153,7 +5411,8 @@ async function buildRevertScopePreviews(narratorId: string, minSeq: number, with
 			...(narratorScope.subagentWarning ? { subagentWarning: narratorScope.subagentWarning } : {}),
 		},
 		workspaceScope: {
-			available: !!treePreview,
+			available: false,
+			reason: treePreview ? "legacy_unverified" : "no_boundaries",
 			files: workspaceFiles,
 			warnings: workspaceWarnings,
 		},
@@ -5281,6 +5540,63 @@ narratorRoutes.get("/:id/patches/:patchId/diff", async (c) => {
 	});
 });
 
+/** Durable preview only: these endpoints do not apply files or mutate history. */
+function revertPreviewJson(c: Context, value: unknown) {
+	const body = JSON.stringify(value);
+	if (Buffer.byteLength(body) >= FILE_CHANGE_LIMITS.summaryBytes)
+		throw new AppError(
+			"Preview response exceeds its metadata byte budget",
+			409,
+			"REVERT_PREVIEW_RESPONSE_TOO_LARGE",
+		);
+	return c.body(body, 200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+}
+
+function validRevertPreview<T>(result: { success: true; data: T } | { success: false }): T {
+	if (!result.success)
+		throw new ValidationError("Invalid narrator-only preview request, selector or pagination");
+	return result.data;
+}
+
+narratorRoutes.post("/:id/revert-plans", async (c) => {
+	const raw = await c.req.json().catch((error: unknown) => {
+		// Preserve bodyLimit's own 413 handling and request cancellation.
+		if (!(error instanceof SyntaxError)) throw error;
+		throw new ValidationError("Invalid preview JSON body");
+	});
+	const body = validRevertPreview(createRevertPlanSchema.safeParse(raw));
+	const result = await prepareLocalRevertPlan({
+		...body,
+		principal: narratorPrincipalOf(c),
+		narratorId: c.req.param("id"),
+		signal: AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(60_000)]),
+	});
+	return revertPreviewJson(c, result);
+});
+narratorRoutes.get("/:id/revert-plans/:planId", async (c) => {
+	const result = await getLocalRevertPlan(
+		narratorPrincipalOf(c),
+		c.req.param("id"),
+		validRevertPreview(revertPlanIdSchema.safeParse(c.req.param("planId"))),
+		AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(30_000)]),
+	);
+	return revertPreviewJson(c, result);
+});
+narratorRoutes.get("/:id/revert-plans/:planId/files", async (c) => {
+	const query = validRevertPreview(revertPlanFilesQuerySchema.safeParse(c.req.query()));
+	const result = await listLocalRevertPlanFiles(
+		narratorPrincipalOf(c),
+		c.req.param("id"),
+		validRevertPreview(revertPlanIdSchema.safeParse(c.req.param("planId"))),
+		{
+			limit: query.limit,
+			cursor: query.cursor ? { fileKey: query.cursor } : undefined,
+			signal: AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(30_000)]),
+		},
+	);
+	return revertPreviewJson(c, result);
+});
+
 /** Revert file changes from a specific message onwards */
 narratorRoutes.post("/:id/revert", async (c) => {
 	const narratorId = c.req.param("id");
@@ -5304,38 +5620,17 @@ narratorRoutes.post("/:id/revert", async (c) => {
 		targetSeq = targetRef.seq;
 	}
 
-	const toolCallsToRevert = await db
-		.select({ toolUseId: narratorToolCalls.toolUseId })
-		.from(narratorToolCalls)
-		.innerJoin(
-			narratorMessageRefs,
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-			),
-		)
-		.where(
-			and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.status, "success"),
-				gte(narratorMessageRefs.seq, targetSeq),
-			),
-		);
 	if (isNarratorActive(narratorId)) {
 		return c.json({ error: "Narrator became active during revert" }, 409);
 	}
-	// Narrowest applicable strategy first: the narrator scope reverses only this
-	// narrator's own changes, so other actors' work in the same window survives.
-	// It returns null when it cannot express the window, falling through to the
-	// workspace tree and then to per-file replay for pre-snapshot history.
+	// Scope is a user decision, not a strategy fallback. In particular, missing
+	// narrator evidence cannot authorize a workspace restore or whole-file replay.
 	const scope = body.scope ?? DEFAULT_REVERT_SCOPE;
 	const result =
-		(scope === "narrator" ? await revertNarratorScopedFromSeq(narratorId, targetSeq) : null) ??
-		(await revertFromSeqTree(narratorId, targetSeq)) ??
-		(await revertPatchForToolUses(
-			narratorId,
-			toolCallsToRevert.map((toolCall) => toolCall.toolUseId),
-		));
+		scope === "narrator"
+			? await revertNarratorScopedFromSeq(narratorId, targetSeq)
+			: ((await revertFromSeqTree(narratorId, targetSeq)) ??
+				unavailableSnapshotRevert("no_boundaries: no verified workspace snapshot is available."));
 	if (result.failures.length > 0) return c.json(revertConflictBody(result), 409);
 	// No history mutation follows: the reverted files are the intended end state.
 	finalizeSnapshotRevert(result);
@@ -5348,26 +5643,22 @@ narratorRoutes.post("/:id/revert", async (c) => {
 	});
 });
 
-/** Unrevert — rebuild current (full) file state and write to disk */
+/** Unrevert requires the real pre-revert states in a durable revert journal. */
 narratorRoutes.post("/:id/unrevert", async (c) => {
 	const narratorId = c.req.param("id");
-
 	if (isNarratorActive(narratorId)) {
 		return c.json({ error: "Cannot unrevert while narrator is running" }, 409);
 	}
-
-	try {
-		if (isNarratorActive(narratorId)) {
-			return c.json({ error: "Narrator became active during unrevert" }, 409);
-		}
-		const fileStates = await rebuildDeviceFileStatesUpToSeq(narratorId, Number.MAX_SAFE_INTEGER);
-		const result = await applyDeviceFileStates(narratorId, [...fileStates.values()]);
-		if (result.failures.length > 0) return c.json(revertConflictBody(result), 409);
-		finalizeSnapshotRevert(result);
-		return c.json({ success: true, fileCount: result.fileCount, files: result.files });
-	} catch (err) {
-		return c.json(fileHistoryConflictBody(err), 409);
-	}
+	// M0 has no persistent revert operation to address. Replaying all historical
+	// Write/Edit inputs would overwrite later edits and failed first-touch baselines.
+	return c.json(
+		revertConflictBody(
+			unavailableSnapshotRevert(
+				"legacy_unverified: unrevert requires a committed durable revert journal; files were not changed.",
+			),
+		),
+		409,
+	);
 });
 
 /**
@@ -5563,40 +5854,20 @@ narratorRoutes.post("/:id/revert-file", async (c) => {
 			eq(narratorFileSnapshots.deviceId, deviceId),
 			eq(narratorFileSnapshots.filePath, body.filePath),
 		),
-		columns: {
-			deviceId: true,
-			filePath: true,
-			originalContent: true,
-			originalEncoding: true,
-			isBinary: true,
-		},
+		columns: { filePath: true },
 	});
 	if (!snap) return c.json({ error: "No snapshot found for this file" }, 404);
-	// Binary snapshots are stored as decoded text, which does not round-trip.
-	// Writing them back would corrupt the file, so refuse instead.
-	if (snap.isBinary) {
-		return c.json(
-			{
-				error: `${snap.filePath} was recorded as binary and cannot be restored from a text snapshot.`,
-				code: "REPLAY_DIVERGED",
-			},
-			409,
-		);
-	}
-	if (isNarratorActive(narratorId)) {
-		return c.json({ error: "Narrator became active during revert" }, 409);
-	}
-	const identity = canonicalizeDeviceFileIdentity(
-		{ deviceId: snap.deviceId, filePath: snap.filePath },
-		await queryOrderedToolCalls(narratorId, undefined, { filePathOnly: true }),
-		await resolveNarratorCwd(narratorId),
+	// First-touch text is viewing material, not a verified operation or an expected
+	// current version. Do not read the full baseline just to reject unsafe replay.
+	return c.json(
+		revertConflictBody(
+			unavailableSnapshotRevert(
+				"legacy_unverified: a first-touch text snapshot cannot safely authorize file rollback.",
+				snap.filePath,
+			),
+		),
+		409,
 	);
-	const result = await applyDeviceFileStates(narratorId, [
-		{ ...identity, content: snap.originalContent, encoding: snap.originalEncoding },
-	]);
-	if (result.failures.length > 0) return c.json(revertConflictBody(result), 409);
-	finalizeSnapshotRevert(result);
-	return c.json({ success: true, originalExists: snap.originalContent !== null });
 });
 
 /**
@@ -6057,20 +6328,26 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 
 /**
  * GET /api/narrators/:id/background-tasks
- * List all background tasks spawned by this narrator.
+ * Cursor page, or a bounded compatibility snapshot for pre-paging clients.
  */
 narratorRoutes.get("/:id/background-tasks", async (c) => {
 	const parentNarratorId = c.req.param("id");
 	const limitRaw = c.req.query("limit");
+	const cursor = c.req.query("cursor");
 	const limit = limitRaw != null ? Number.parseInt(limitRaw, 10) : undefined;
 	const { backgroundTaskService } = await import("../services/background-task-service");
+	// Old tabs do not send pagination parameters. Keep their required array shape
+	// and active rows without restoring an unbounded full-history query.
+	if (limitRaw === undefined && cursor === undefined) {
+		return c.json(await backgroundTaskService.listLegacySnapshotByParent(parentNarratorId));
+	}
 	// In-process liveness (a subagent whose loop is running while its task row is
 	// already terminal) is applied inside the service, not here: `activeCount`, the
 	// `activeTasks` set, the paged rows and the delta upserts all have to agree, and
 	// a route-only overlay left the badge disagreeing with the rows beside it.
 	return c.json(
 		await backgroundTaskService.listPageByParent(parentNarratorId, {
-			cursor: c.req.query("cursor"),
+			cursor,
 			limit: limit != null && !Number.isNaN(limit) ? limit : undefined,
 		}),
 	);

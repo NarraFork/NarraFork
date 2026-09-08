@@ -20,6 +20,7 @@ import type {
 	PendingPermission,
 	PermissionCallbacks,
 } from "./narrator-panel-types";
+import { withQueueSubstatus } from "./narrator-status-bar";
 import {
 	clearAllReflectionProgress,
 	clearReflectionProgress,
@@ -308,31 +309,6 @@ function withoutCompactingSubstatus(substatus: unknown): string[] {
 
 function withoutSubstatusTag(substatus: unknown, tag: string): string[] {
 	return Array.isArray(substatus) ? substatus.filter((s) => s !== tag) : [];
-}
-
-function withQueueSubstatus(
-	substatus: string[],
-	position?: number,
-	queueDepth?: number,
-	queueMessage?: string,
-): string[] {
-	const withoutQueue = substatus.filter(
-		(s) =>
-			!s.startsWith("queue_position:") &&
-			!s.startsWith("queue_depth:") &&
-			!s.startsWith("queue_message:"),
-	);
-	const nextSubstatus = [...withoutQueue];
-	const safePosition = typeof position === "number" && Number.isFinite(position) ? position : null;
-	if (safePosition != null && safePosition > 0) {
-		const safeDepth =
-			typeof queueDepth === "number" && Number.isFinite(queueDepth) ? Math.max(0, queueDepth) : 0;
-		nextSubstatus.push(`queue_position:${safePosition}`, `queue_depth:${safeDepth}`);
-	}
-	if (queueMessage) {
-		nextSubstatus.push(`queue_message:${encodeURIComponent(queueMessage)}`);
-	}
-	return nextSubstatus;
 }
 
 export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarratorPanelWSReturn {

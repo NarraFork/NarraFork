@@ -20,7 +20,14 @@ export function handlePluginUiNotification(
 	queryClient: Pick<QueryClient, "invalidateQueries">,
 ): boolean {
 	if (notification.method !== "providerSettings.catalogInvalidated") return false;
+	invalidatePluginModelQueries(queryClient);
+	return true;
+}
+
+/** Shared by iframe writes, backend discovery and WS reconnect (which can miss a push). */
+export function invalidatePluginModelQueries(
+	queryClient: Pick<QueryClient, "invalidateQueries">,
+): void {
 	void queryClient.invalidateQueries({ queryKey: ["settings"] });
 	void queryClient.invalidateQueries({ queryKey: ["admin", "settings"] });
-	return true;
 }

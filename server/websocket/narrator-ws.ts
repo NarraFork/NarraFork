@@ -1,3 +1,4 @@
+import { HUMAN_ATTENTION_CHANGED_WS_TYPE } from "@shared/human-attention";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
@@ -674,25 +675,23 @@ async function sendListStateSnapshot(ws: NarratorWS, narratorIds: string[]): Pro
 function sendRuntimeSnapshot(ws: NarratorWS, narratorIds: string[], requestId?: string): void {
 	for (const id of narratorIds) {
 		const snap = getStreamingSnapshot(id);
-		const hasQueue = !!snap && (snap.queuePosition != null || !!snap.queueMessage);
-		if (hasQueue) {
-			if (
-				!safeSend(
-					ws,
-					withSubscriptionRequestId(
-						{
-							type: "queue_status",
-							narratorId: id,
-							position: snap.queuePosition,
-							queueDepth: snap.queueDepth ?? 0,
-							queueMessage: snap.queueMessage,
-						},
-						requestId,
-					),
-				)
-			) {
-				return;
-			}
+		// Always sync queue state: a reconnect may have missed the clear event.
+		if (
+			!safeSend(
+				ws,
+				withSubscriptionRequestId(
+					{
+						type: "queue_status",
+						narratorId: id,
+						position: snap?.queuePosition ?? (snap?.queueMessage ? undefined : 0),
+						queueDepth: snap?.queueDepth ?? 0,
+						queueMessage: snap?.queueMessage,
+					},
+					requestId,
+				),
+			)
+		) {
+			return;
 		}
 
 		const browserCount = listBrowserSessions(id).length;
@@ -954,6 +953,35 @@ export function broadcastToUser(userId: string, data: NarratorServerMessage): vo
 			removeConnection(ws);
 		}
 	}
+}
+
+let humanAttentionBroadcastTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** A bounded, data-free wake-up for inboxes, including sessions absent from RecentTabs. */
+function scheduleHumanAttentionBroadcast(): void {
+	if (humanAttentionBroadcastTimer) return;
+	humanAttentionBroadcastTimer = setTimeout(() => {
+		humanAttentionBroadcastTimer = undefined;
+		const payload = JSON.stringify({ type: HUMAN_ATTENTION_CHANGED_WS_TYPE });
+		for (const ws of connections) {
+			if (!ws.data.userId) continue;
+			try {
+				ws.send(payload);
+			} catch {
+				removeConnection(ws);
+			}
+		}
+	}, 50);
+}
+
+// A separate key also registers the new bridge when an older WS module was hot-loaded.
+if (hotOnce("narrafork.humanAttentionWs.listenersRegistered")) {
+	eventBus.on("human_attention:changed", scheduleHumanAttentionBroadcast);
+	// Deleting history can cascade-delete an async question without calling its
+	// decision service. The frame is emitted after the history change commits.
+	eventBus.on("narrator:message_broadcast", ({ message }) => {
+		if (message.type === "messages_deleted") scheduleHumanAttentionBroadcast();
+	});
 }
 
 /** Broadcast a message to ALL narrator WS connections (not filtered by subscription). */
@@ -1363,6 +1391,14 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 			type: "plugin_contributions_changed",
 			revision: event.revision,
 			reason: event.reason,
+		});
+	});
+
+	eventBus.on("plugin:provider_models_changed", (event) => {
+		broadcastToAll({
+			type: "plugin_provider_models_changed",
+			pluginId: event.pluginId,
+			providerInstanceId: event.providerInstanceId,
 		});
 	});
 

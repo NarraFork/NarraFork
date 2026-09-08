@@ -21,13 +21,13 @@ import {
 	Stack,
 	Switch,
 	Text,
-	Textarea,
 	TextInput,
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import type { SubagentModelPools } from "@shared/subagent-model-policy";
 import {
 	IconChevronDown,
 	IconChevronRight,
@@ -108,6 +108,7 @@ import {
 import { localizeNarratorError } from "./error-localization";
 import { NarratorAccessPanel } from "./NarratorAccessPanel";
 import { NarratorAvatar } from "./NarratorAvatar";
+import { SubagentModelPoolEditor, useSubagentModelPoolDraft } from "./SubagentModelPoolEditor";
 import type { ViewerInfo } from "./useNarratorPanelWS";
 
 export interface NarratorDetailsPanelProps {
@@ -452,6 +453,11 @@ export function NarratorDetailsPanel({
 	const [cwdValue, setCwdValue] = useState(String(narrator?.cwd ?? ""));
 	const [cwdDirty, setCwdDirty] = useState(false);
 	const { data: customTraits } = useNarratorCustomTraits(narratorId, opened);
+	const modelPoolDraft = useSubagentModelPoolDraft(
+		customTraits?.subagentModelRestriction?.pools,
+		customTraits !== undefined,
+		narratorId,
+	);
 	const updateSubagentModelsMutation = useUpdateSubagentModelRestriction();
 	const clearSubagentModelsMutation = useClearSubagentModelRestriction();
 	const updateDisabledToolsMutation = useUpdateDisabledTools();
@@ -488,12 +494,6 @@ export function NarratorDetailsPanel({
 		},
 	});
 	const updateCwdMutation = useUpdateCwd();
-	const [modelPools, setModelPools] = useState<Record<string, string[]>>({
-		explore: [],
-		plan: [],
-		general: [],
-	});
-	const [modelPurposes, setModelPurposes] = useState<Record<string, Record<string, string>>>({});
 	const [disabledToolSelection, setDisabledToolSelection] = useState<string[]>([]);
 	const [blockAllSkills, setBlockAllSkills] = useState(false);
 	const [blockedSkillSelection, setBlockedSkillSelection] = useState<string[]>([]);
@@ -505,14 +505,6 @@ export function NarratorDetailsPanel({
 	const [exportFullHistory, setExportFullHistory] = useState(false);
 	const [exporting, setExporting] = useState(false);
 
-	const modelOptions = useMemo(
-		() =>
-			(customTraits?.availableModels ?? []).map((item) => ({
-				value: item.model,
-				label: item.model,
-			})),
-		[customTraits?.availableModels],
-	);
 	const toolOptions = useMemo(
 		() =>
 			(customTraits?.availableTools ?? []).map((tool) => ({
@@ -536,20 +528,6 @@ export function NarratorDetailsPanel({
 	const allSkillsBlocked = customTraits?.blockedSkills?.all ?? false;
 
 	useEffect(() => {
-		const pools = customTraits?.subagentModelRestriction?.pools ?? {};
-		setModelPools({
-			explore: (pools.explore ?? []).map((entry) => entry.model),
-			plan: (pools.plan ?? []).map((entry) => entry.model),
-			general: (pools.general ?? []).map((entry) => entry.model),
-		});
-		const nextPurposes: Record<string, Record<string, string>> = {};
-		for (const [type, entries] of Object.entries(pools)) {
-			nextPurposes[type] = {};
-			for (const entry of entries) {
-				if (entry.purpose) nextPurposes[type][entry.model] = entry.purpose;
-			}
-		}
-		setModelPurposes(nextPurposes);
 		setDisabledToolSelection(customTraits?.disabledTools?.tools ?? []);
 		setBlockAllSkills(customTraits?.blockedSkills?.all ?? false);
 		setBlockedSkillSelection(customTraits?.blockedSkills?.names ?? []);
@@ -737,20 +715,8 @@ export function NarratorDetailsPanel({
 		}
 	};
 
-	const handleSaveSubagentModels = async () => {
-		const pools = Object.fromEntries(
-			(["explore", "plan", "general"] as const)
-				.map((type) => {
-					const entries = (modelPools[type] ?? []).map((model) => ({
-						model,
-						...(modelPurposes[type]?.[model]?.trim()
-							? { purpose: modelPurposes[type][model].trim() }
-							: {}),
-					}));
-					return [type, entries] as const;
-				})
-				.filter(([, entries]) => entries.length > 0),
-		);
+	const handleSaveSubagentModels = async (pools: SubagentModelPools) => {
+		if (!customTraits) return;
 		await updateSubagentModelsMutation.mutateAsync({ id: narratorId, pools });
 		notifications.show({
 			title: t("details.customTraitsSaved"),
@@ -1563,6 +1529,7 @@ export function NarratorDetailsPanel({
 					title={t("details.customTraits")}
 					searchableText={[
 						t("details.subagentModelRestriction"),
+						t("poolReasoningEffort.title"),
 						t("details.toolRestriction"),
 						t("details.skillRestriction"),
 						t("details.blockAllSkills"),
@@ -1572,61 +1539,16 @@ export function NarratorDetailsPanel({
 					]}
 				>
 					<Stack gap="md">
-						<Stack gap="xs">
-							<Text size="sm" fw={600}>
-								{t("details.subagentModelRestriction")}
-							</Text>
-							<Text size="xs" c="dimmed">
-								{t("details.subagentModelRestrictionDesc")}
-							</Text>
-							{(["explore", "plan", "general"] as const).map((type) => (
-								<Stack key={type} gap={6}>
-									<MultiSelect
-										label={t(`details.subagentType_${type}`)}
-										data={modelOptions}
-										searchable
-										clearable
-										value={modelPools[type] ?? []}
-										onChange={(value) => setModelPools((old) => ({ ...old, [type]: value }))}
-									/>
-									{(modelPools[type] ?? []).map((model) => (
-										<Textarea
-											key={`${type}-${model}`}
-											label={model}
-											placeholder={t("details.modelPurposePlaceholder")}
-											minRows={2}
-											value={modelPurposes[type]?.[model] ?? ""}
-											onChange={(event) => {
-												// currentTarget is nulled after the handler returns, so read it
-												// before the deferred updater runs.
-												const val = event.currentTarget.value;
-												setModelPurposes((old) => ({
-													...old,
-													[type]: { ...(old[type] ?? {}), [model]: val },
-												}));
-											}}
-										/>
-									))}
-								</Stack>
-							))}
-							<Group justify="flex-end" gap="xs">
-								<Button
-									variant="default"
-									size="xs"
-									loading={clearSubagentModelsMutation.isPending}
-									onClick={handleClearSubagentModels}
-								>
-									{t("details.clearTrait")}
-								</Button>
-								<Button
-									size="xs"
-									loading={updateSubagentModelsMutation.isPending}
-									onClick={handleSaveSubagentModels}
-								>
-									{tc("save")}
-								</Button>
-							</Group>
-						</Stack>
+						<SubagentModelPoolEditor
+							key={narratorId}
+							{...modelPoolDraft}
+							availableModels={customTraits?.availableModels}
+							loaded={customTraits !== undefined}
+							saving={updateSubagentModelsMutation.isPending}
+							clearing={clearSubagentModelsMutation.isPending}
+							onSave={handleSaveSubagentModels}
+							onClear={handleClearSubagentModels}
+						/>
 						<Divider />
 						<Stack gap="xs">
 							<Text size="sm" fw={600}>

@@ -52,7 +52,7 @@ func (d *Dispatcher) Dispatch(
 	case "fs.exists":
 		return d.h.FsExists(params)
 	case "fs.read":
-		return d.h.FsRead(params)
+		return d.h.FsReadContext(ctx, params)
 	case "fs.write":
 		return d.h.FsWrite(params)
 	case "fs.remove":
@@ -62,7 +62,7 @@ func (d *Dispatcher) Dispatch(
 	case "fs.list":
 		return d.h.FsList(params)
 	case "glob":
-		return d.h.Glob(params)
+		return d.h.GlobContext(ctx, params)
 	case "grep":
 		return d.h.Grep(params)
 	case "exec.start":

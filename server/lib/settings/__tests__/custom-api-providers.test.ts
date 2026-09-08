@@ -150,6 +150,79 @@ describe("custom API provider migration", () => {
 		expect(settings.agent.modelAggregations?.[0]?.models).toEqual(["new:model-a", "other:model-b"]);
 	});
 
+	test("migrates effort keys including aggregate members and preserves per-type tiers", () => {
+		const settings = structuredClone(DEFAULTS);
+		settings.agent.subagentModelReasoningEfforts = {
+			explore: { "old:model [note]": "high", __default__: "none" },
+			plan: { "__agg__:pool:old:model": "medium", __summary__: "max" },
+			search: { "old:model": "low" },
+			review: { "old:model": "xhigh" },
+			general: {},
+		};
+		const changes = [{ id: "stable", from: "old", to: "new" }];
+		expect(migrateProviderPrefixReferences(settings, changes)).toBe(true);
+		expect(settings.agent.subagentModelReasoningEfforts).toEqual({
+			explore: { "new:model [note]": "high", __default__: "none" },
+			plan: { "__agg__:pool:new:model": "medium", __summary__: "max" },
+			search: { "new:model": "low" },
+			review: { "new:model": "xhigh" },
+			general: {},
+		});
+		// Only effort keys changed; before/after must include that field, and be idempotent.
+		expect(migrateProviderPrefixReferences(settings, changes)).toBe(false);
+	});
+
+	test("merges identical effort targets without changing another pool", () => {
+		const settings = structuredClone(DEFAULTS);
+		settings.agent.subagentModelReasoningEfforts = {
+			explore: { "old:model": "none", "new:model": "none" },
+			general: { "new:model": "max" },
+		};
+		expect(
+			migrateProviderPrefixReferences(settings, [{ id: "stable", from: "old", to: "new" }]),
+		).toBe(true);
+		expect(settings.agent.subagentModelReasoningEfforts).toEqual({
+			explore: { "new:model": "none" },
+			general: { "new:model": "max" },
+		});
+	});
+
+	test("rejects conflicting effort targets before any settings mutation", () => {
+		const settings = structuredClone(DEFAULTS);
+		settings.agent.defaultModel = "old:default";
+		settings.agent.subagentAllowedModels.explore = ["old:model"];
+		settings.agent.modelContextWindows = { "old:model": 123 };
+		settings.agent.subagentModelReasoningEfforts = {
+			explore: { "old:model": "high" },
+			review: { "old:model": "low", "new:model": "max" },
+		};
+		const before = structuredClone(settings);
+		expect(() =>
+			migrateProviderPrefixReferences(settings, [{ id: "stable", from: "old", to: "new" }]),
+		).toThrow("would overwrite subagent reasoning effort");
+		expect(settings).toEqual(before);
+	});
+
+	test("keeps optional map absent when migrating legacy settings", () => {
+		const settings = structuredClone(DEFAULTS);
+		delete settings.agent.subagentModelReasoningEfforts;
+		settings.agent.defaultModel = "old:model";
+		migrateProviderPrefixReferences(settings, [{ id: "stable", from: "old", to: "new" }]);
+		expect(settings.agent.subagentModelReasoningEfforts).toBeUndefined();
+	});
+
+	test("does not let malformed optional disk maps block unrelated prefix migration", () => {
+		for (const value of [null, [], "invalid"]) {
+			const settings = structuredClone(DEFAULTS);
+			settings.agent.defaultModel = "old:model";
+			settings.agent.subagentModelReasoningEfforts =
+				value as unknown as NarraForkSettings["agent"]["subagentModelReasoningEfforts"];
+			migrateProviderPrefixReferences(settings, [{ id: "stable", from: "old", to: "new" }]);
+			expect(settings.agent.defaultModel).toBe("new:model");
+			expect(settings.agent.subagentModelReasoningEfforts as unknown).toEqual(value);
+		}
+	});
+
 	test("rejects prefix migration when context-window targets conflict", () => {
 		const settings = structuredClone(DEFAULTS) as NarraForkSettings;
 		settings.agent.modelContextWindows = {

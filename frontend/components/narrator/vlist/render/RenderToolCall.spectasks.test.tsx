@@ -46,7 +46,10 @@ function measureTasksCard(tasks: SpecTaskLine[]) {
 			summary: "spec://tasks.json",
 			category: "tasks",
 			status: "success",
-			detail: { kind: "spec-tasks", tasks },
+			detail: {
+				kind: "sections",
+				sections: [{ key: "spec.tasks", body: { kind: "spec-tasks", tasks } }],
+			},
 		},
 		CONTENT_WIDTH,
 		5,
@@ -193,10 +196,12 @@ describe("spec-tasks rows — the spinner is gated on `specTasksLive`", () => {
 describe("spec-tasks empty document", () => {
 	it("reserves the bordered placeholder row instead of a bare icon", () => {
 		const measured = measureTasksCard([]);
-		const block = measured.detail?.blocks[0];
+		const block = measured.detail?.sections[0]?.measuredBody.blocks[0];
 		expect(block?.kind).toBe("fixed");
 		expect(block?.kind === "fixed" ? block.tag : null).toBe("detail-spec-empty");
-		expect(measured.detail?.frame.blocks[0]?.height).toBe(measureMod.SPEC_TASK_EMPTY_HEIGHT);
+		expect(measured.detail?.sections[0]?.measuredBody.frame.blocks[0]?.height).toBe(
+			measureMod.SPEC_TASK_EMPTY_HEIGHT,
+		);
 	});
 
 	it("paints the placeholder at the reserved height", () => {

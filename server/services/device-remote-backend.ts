@@ -11,8 +11,10 @@ import type {
 	ExecHandle,
 	ExecParams,
 	ExecutionBackend,
+	FileMetadataOptions,
 	FileStat,
 	GitDiffParams,
+	GlobMatches,
 	GlobOptions,
 	GrepParams,
 	GrepResult,
@@ -35,13 +37,19 @@ import type {
 	RpcMethod,
 } from "../lib/agent/execution/rpc-types";
 import {
+	FEATURE_FS_READ_BOUNDED_V1,
+	FEATURE_GLOB_BOUNDED_V1,
 	FS_READ_ATOMIC_RESOLVED_PATH_FEATURE,
 	FS_STAT_RESOLVED_PATH_FEATURE,
 	FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE,
 } from "../lib/agent/execution/rpc-types";
 import { pathsEqualForOS } from "../lib/platform-path";
 import { settings } from "../lib/settings";
-import { type SendRpcOptions, sendRpc } from "./device-connection-service";
+import {
+	hasDeviceProtocolFeature,
+	type SendRpcOptions,
+	sendRpc,
+} from "./device-connection-service";
 
 function toBase64(bytes: Uint8Array): string {
 	return Buffer.from(bytes).toString("base64");
@@ -156,6 +164,10 @@ export class RemoteBackend implements ExecutionBackend {
 		this.supportsFsWriteAtomicResolvedPath = options.supportsFsWriteAtomicResolvedPath ?? false;
 	}
 
+	get supportsFsReadBounded(): boolean {
+		return hasDeviceProtocolFeature(this.deviceId, FEATURE_FS_READ_BOUNDED_V1);
+	}
+
 	private get maxBytes(): number {
 		return settings.devices?.maxRpcBytes ?? 10 * 1024 * 1024;
 	}
@@ -171,17 +183,22 @@ export class RemoteBackend implements ExecutionBackend {
 		});
 	}
 
-	private async statPath(path: string): Promise<FsStatResult> {
+	private async statPath(path: string, opts?: FileMetadataOptions): Promise<FsStatResult> {
 		return (await this.rpc(
 			"fs.stat",
 			{ path },
-			this.supportsFsStatResolvedPath ? { requiredFeatures: [FS_STAT_RESOLVED_PATH_FEATURE] } : {},
+			{
+				...opts,
+				...(this.supportsFsStatResolvedPath
+					? { requiredFeatures: [FS_STAT_RESOLVED_PATH_FEATURE] }
+					: {}),
+			},
 		)) as FsStatResult;
 	}
 
-	async resolvePathIdentity(path: string): Promise<PathIdentity> {
+	async resolvePathIdentity(path: string, opts?: FileMetadataOptions): Promise<PathIdentity> {
 		const lexicalPath = this.paths.resolve(this.defaultCwd ?? "", path);
-		const result = await this.statPath(lexicalPath);
+		const result = await this.statPath(lexicalPath, opts);
 		if (this.supportsFsStatResolvedPath && !result.resolvedPath) {
 			throw new Error(
 				`Remote device ${this.deviceId} advertised canonical fs.stat but omitted resolvedPath`,
@@ -195,8 +212,8 @@ export class RemoteBackend implements ExecutionBackend {
 		};
 	}
 
-	async statFile(path: string): Promise<FileStat | null> {
-		const res = await this.statPath(path);
+	async statFile(path: string, opts?: FileMetadataOptions): Promise<FileStat | null> {
+		const res = await this.statPath(path, opts);
 		if (!res.exists) return null;
 		if (this.supportsFsStatResolvedPath && !res.resolvedPath) {
 			throw new Error(
@@ -226,13 +243,16 @@ export class RemoteBackend implements ExecutionBackend {
 			{
 				path,
 				maxBytes: opts?.maxBytes ?? this.maxBytes,
+				timeoutMs: opts?.timeoutMs,
 				...(expectedResolvedPath ? { expectedResolvedPath } : {}),
 			},
 			{
 				signal: opts?.signal,
-				...(expectedResolvedPath
-					? { requiredFeatures: [FS_READ_ATOMIC_RESOLVED_PATH_FEATURE] }
-					: {}),
+				timeoutMs: opts?.timeoutMs,
+				requiredFeatures: [
+					...(expectedResolvedPath ? [FS_READ_ATOMIC_RESOLVED_PATH_FEATURE] : []),
+					...(opts?.timeoutMs !== undefined ? [FEATURE_FS_READ_BOUNDED_V1] : []),
+				],
 			},
 		)) as FsReadResult;
 		if (expectedResolvedPath) {
@@ -285,14 +305,32 @@ export class RemoteBackend implements ExecutionBackend {
 		return res.entries;
 	}
 
-	async glob(pattern: string, opts: GlobOptions): Promise<string[]> {
-		const res = (await this.rpc("glob", {
-			pattern,
-			cwd: opts.cwd,
-			dot: opts.dot,
-			maxResults: opts.maxResults,
-		})) as GlobResult;
-		return res.matches;
+	async glob(pattern: string, opts: GlobOptions): Promise<GlobMatches> {
+		const bounded =
+			opts.signal !== undefined ||
+			opts.timeoutMs !== undefined ||
+			opts.maxBytes !== undefined ||
+			opts.query !== undefined ||
+			opts.includeDirectories !== undefined;
+		const res = (await this.rpc(
+			"glob",
+			{
+				pattern,
+				cwd: opts.cwd,
+				dot: opts.dot,
+				maxResults: opts.maxResults,
+				maxBytes: opts.maxBytes,
+				timeoutMs: opts.timeoutMs,
+				includeDirectories: opts.includeDirectories,
+				query: opts.query,
+			},
+			{
+				signal: opts.signal,
+				timeoutMs: opts.timeoutMs,
+				...(bounded ? { requiredFeatures: [FEATURE_GLOB_BOUNDED_V1] } : {}),
+			},
+		)) as GlobResult;
+		return Object.assign(res.matches, { truncated: res.truncated ?? false });
 	}
 
 	async grep(params: GrepParams): Promise<GrepResult> {

@@ -9,6 +9,8 @@ export const manifestSchemaVersion = MANIFEST_SCHEMA_VERSION;
 export const NARRAFORK_RPC_PROTOCOL = "narrafork.rpc/1" as const;
 /** Provider business protocol negotiated on top of the RPC transport. */
 export const PROVIDER_PROTOCOL_VERSION = "1.0" as const;
+/** Bounded host-to-provider request budget; inbound events keep their smaller limits. */
+export const PROVIDER_REQUEST_MAX_BYTES = 32 * 1024 * 1024;
 /** MessageChannel UI bridge protocol. */
 export const NARRAFORK_UI_PROTOCOL = "narrafork.ui/1" as const;
 

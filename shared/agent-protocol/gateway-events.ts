@@ -90,7 +90,8 @@ export function parseGatewaySSEEvent(
 				},
 			};
 		}
-		return null;
+		// An empty queue event explicitly ends queueing, before upstream emits text.
+		return { queueStatus: { position: 0, queueDepth: 0 } };
 	}
 
 	if (eventType === QUOTA_BALANCE_EVENT) {

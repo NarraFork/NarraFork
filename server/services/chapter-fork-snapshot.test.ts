@@ -294,7 +294,7 @@ describe("forking from uncommitted state", () => {
 		expect(merged.conflicts).toEqual([]);
 		const combined = await worktreeTreeSnapshot.readFileAtTree(
 			parent.worktree,
-			merged.tree,
+			present(merged.tree, "merged tree"),
 			"app.txt",
 		);
 		expect(combined).toContain("l1-parent");

@@ -2,6 +2,7 @@ import { type AgentConfig, agentLoop } from "../lib/agent";
 import type { AgentEvent, ApiRequestDiagnostics } from "../lib/agent/types";
 import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { getAgentFileReferenceContext } from "./file-reference-context";
 import {
 	CriticalEventPersistenceError,
 	type EventHandlerContext,
@@ -116,6 +117,11 @@ export async function executeAgentLoop(
 	sourceOptions?: ExecuteLoopSourceOptions,
 ): Promise<ExecuteLoopResult> {
 	const { config, userText, history, trailingToolResults, images, eventContext, hooks } = options;
+	config.requireToolCallBinding = true;
+	eventContext.requireToolCallBinding = true;
+	// Read the active pass's mutable default only when a new text block starts.
+	// Rebind per pass: a reused event context must not close over an older config.
+	eventContext.getFileReferenceContext = () => getAgentFileReferenceContext(config);
 	const eventSource =
 		sourceOptions?.eventSource ?? agentLoop(config, userText, history, trailingToolResults, images);
 	const processEventFn = sourceOptions?.processEventFn ?? processEvent;
@@ -177,6 +183,14 @@ export async function executeAgentLoop(
 				error: String(err),
 			});
 			if (err instanceof CriticalEventPersistenceError) throw err;
+			if (
+				(event.type === "block_complete" && event.block.type === "tool_use") ||
+				(event.type === "assistant_message" && event.toolUses.length > 0)
+			) {
+				throw new CriticalEventPersistenceError("Tool execution persistence barrier failed", {
+					cause: err,
+				});
+			}
 			// For critical events, notify frontend about persistence issues
 			if (event.type === "block_complete" || event.type === "tool_result") {
 				broadcastToNarrator(config.narratorId, {

@@ -1,5 +1,6 @@
 {
 	"title": "Settings",
+	"subagentPoolReasoningEffortHelp": "Only affects newly created subagents. A specified tier overrides the agent's input and is adapted to model support. Not specified applies no pool override; it is not none (thinking off).",
 	"personalGroup": "Personal",
 	"instanceGroup": "Instance",
 	"instanceAdminOnlyTitle": "Admin only",

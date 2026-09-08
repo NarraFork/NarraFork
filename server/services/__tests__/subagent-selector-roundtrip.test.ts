@@ -16,16 +16,19 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { narrators } from "../../db/schema";
+import { backgroundTasks, narrators } from "../../db/schema";
+import { narratorTraitsLock } from "../../lib/async-mutex";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
-const { resolveSubagentTargets } = await import("../agent-communication");
+const { resolveSubagentTargets, awaitAgentResultDetailed } = await import("../agent-communication");
 const { agentLabelFromNarrator } = await import("../subagent-label");
 const { clearAgentLabelMemo } = await import("../subagent-label");
-const { clearAliasRegistry, registerTaskAlias } = await import("../subagent-alias");
+const { clearAliasRegistry, registerTaskAlias, registerAndPersistSubagentAlias } = await import(
+	"../subagent-alias"
+);
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
@@ -114,6 +117,125 @@ describe("a printed label is always an accepted selector", () => {
 		await seed(NANOID, { title: "Map The Providers" });
 		const targets = await resolveSubagentTargets({ callerNarratorId: PARENT, id: NANOID });
 		expect(targets.map((target) => target.id)).toEqual([NANOID]);
+	});
+});
+
+describe("recovered subagents retain their original selectors", () => {
+	test("re-registering with the title after cleanup preserves the original alias", async () => {
+		const title = "核实法线实际调用阶段";
+		await seed(NANOID, { title, traits: ["background"] });
+		await registerAndPersistSubagentAlias(PARENT, NANOID, "normal-stage-audit");
+
+		// A failed parent turn clears the registry before recovery registers by title.
+		clearAliasRegistry(PARENT);
+		const restored = await registerAndPersistSubagentAlias(PARENT, NANOID, title);
+		expect(restored).toEqual({ alias: "normal-stage-audit", conflicted: false });
+
+		await db
+			.update(narrators)
+			.set({ isBackground: true, backgroundStatus: "completed", backgroundResult: "audit result" })
+			.where(eq(narrators.id, NANOID));
+		// Exercise the resolver used by Await/Send with both warm and cold registries.
+		for (const cold of [false, true]) {
+			if (cold) clearAliasRegistry(PARENT);
+			const targets = await resolveSubagentTargets({
+				callerNarratorId: PARENT,
+				id: "normal-stage-audit",
+			});
+			expect(targets.map((target) => target.id)).toEqual([NANOID]);
+			const result = await awaitAgentResultDetailed({
+				callerNarratorId: PARENT,
+				id: "normal-stage-audit",
+				signal: new AbortController().signal,
+			});
+			expect(result).toMatchObject({
+				id: NANOID,
+				label: "normal-stage-audit",
+				status: "completed",
+				output: "audit result",
+			});
+			expect(await roundTrip(NANOID)).toEqual({
+				label: "normal-stage-audit",
+				resolvedIds: [NANOID],
+			});
+		}
+		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, NANOID) });
+		expect(row?.traits).toEqual(["background", "subagent-alias:normal-stage-audit"]);
+	});
+
+	test.each([NANOID, null])("recovers a task-only alias (child reference: %s)", async (childId) => {
+		await seed(NANOID, { title: "核实法线实际调用阶段" });
+		const now = new Date().toISOString();
+		await db.insert(backgroundTasks).values({
+			id: NANOID,
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "failed",
+			subagentNarratorId: childId,
+			alias: "normal-stage-audit",
+			startedAt: now,
+			createdAt: now,
+			updatedAt: now,
+		});
+		expect(await registerAndPersistSubagentAlias(PARENT, NANOID, "恢复时的标题")).toEqual({
+			alias: "normal-stage-audit",
+			conflicted: false,
+		});
+		clearAliasRegistry(PARENT);
+		expect(await roundTrip(NANOID)).toEqual({
+			label: "normal-stage-audit",
+			resolvedIds: [NANOID],
+		});
+	});
+
+	test("persisted aliases still participate in collision checks", async () => {
+		await seed(NANOID, { traits: ["subagent-alias:worker"] });
+		await seed("other-worker", { traits: ["subagent-alias:worker"] });
+		expect(await registerAndPersistSubagentAlias(PARENT, NANOID, "new title")).toEqual({
+			alias: "worker-2",
+			conflicted: true,
+		});
+		clearAliasRegistry(PARENT);
+		expect((await roundTrip(NANOID)).resolvedIds).toEqual([NANOID]);
+	});
+
+	test("recovery does not make the original alias accessible to another team", async () => {
+		await seed(NANOID, { traits: ["subagent-alias:normal-stage-audit"] });
+		await registerAndPersistSubagentAlias(PARENT, NANOID, "恢复时的标题");
+		clearAliasRegistry(PARENT);
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: "other-parent",
+			type: "primary",
+			variant: "primary",
+			createdAt: now,
+			updatedAt: now,
+		});
+		await expect(
+			resolveSubagentTargets({ callerNarratorId: "other-parent", id: "normal-stage-audit" }),
+		).rejects.toThrow(/No accessible subagent found/);
+	});
+
+	test("alias persistence waits for concurrent trait edits without losing them", async () => {
+		await seed(NANOID);
+		const { persistSubagentAlias } = await import("../subagent-alias");
+		let persistence: Promise<void> | undefined;
+		let completed = false;
+		await narratorTraitsLock.acquire(NANOID, async () => {
+			persistence = persistSubagentAlias(PARENT, NANOID, "normal-stage-audit").then(() => {
+				completed = true;
+			});
+			// Let the asynchronous DB import settle while another trait writer owns the lock.
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			expect(completed).toBe(false);
+			await db
+				.update(narrators)
+				.set({ traits: ["background"] })
+				.where(eq(narrators.id, NANOID));
+		});
+		await persistence;
+		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, NANOID) });
+		expect(row?.traits).toEqual(["background", "subagent-alias:normal-stage-audit"]);
 	});
 });
 

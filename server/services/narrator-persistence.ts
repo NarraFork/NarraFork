@@ -20,10 +20,11 @@ import {
 import { isModelPlanReference } from "../lib/agent/strip-plan-body";
 import type {
 	ApiRequestDiagnostics,
+	ToolCallBinding,
 	ToolExecutionPlan,
 	ToolExecutionTarget,
 } from "../lib/agent/types";
-import { narratorSubstatusLock } from "../lib/async-mutex";
+import { AsyncMutex, narratorSubstatusLock } from "../lib/async-mutex";
 import type {
 	AutoContinuationOverride,
 	BooleanOverride,
@@ -46,6 +47,31 @@ import { preserveTakenOverSubstatus } from "./subagent-takeover";
 // ── Internal helpers ───────────────────────────────────────────────────────
 
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+const toolAttemptCreationLock = new AsyncMutex();
+
+/** Compatibility callers may omit the PK only when there is exactly one possible row. */
+async function resolveToolCallWriteId(
+	toolUseId: string,
+	options: { toolCallId?: string; messageId?: string; narratorId?: string } = {},
+): Promise<string | undefined> {
+	const rows = await db
+		.select({ id: narratorToolCalls.id })
+		.from(narratorToolCalls)
+		.where(
+			and(
+				eq(narratorToolCalls.toolUseId, toolUseId),
+				options.toolCallId ? eq(narratorToolCalls.id, options.toolCallId) : undefined,
+				options.messageId ? eq(narratorToolCalls.messageId, options.messageId) : undefined,
+				options.narratorId ? eq(narratorToolCalls.narratorId, options.narratorId) : undefined,
+			),
+		)
+		.limit(2);
+	if (rows.length > 1)
+		throw new ValidationError(
+			"An exact tool-call row id is required for repeated toolUseId values",
+		);
+	return rows[0]?.id;
+}
 
 type CompactBoundary = { messageId: string; seq: number };
 
@@ -299,6 +325,7 @@ function copyMessageForNarratorTx(
 			.values(
 				originalToolCalls.map((toolCall) => ({
 					...toolCall,
+					executionOriginToolCallId: toolCall.executionOriginToolCallId ?? toolCall.id,
 					id: generateId(),
 					narratorId,
 					messageId: newMessageId,
@@ -1538,6 +1565,8 @@ export const narratorPersistence = {
 					block.thoughtSignatureSource,
 				),
 				status: "initializing",
+				executionAttempt: 1,
+				executionIdentityVersion: 1,
 				streamStartedAt:
 					"streamStartedAt" in block && typeof block.streamStartedAt === "number"
 						? new Date(block.streamStartedAt).toISOString()
@@ -1620,6 +1649,8 @@ export const narratorPersistence = {
 					text: string;
 					outputIndex?: number;
 					citations?: import("@shared/citations").TextCitation[];
+					fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
+					id?: string;
 			  }
 			| {
 					type: "reasoning";
@@ -1668,6 +1699,8 @@ export const narratorPersistence = {
 					text: string;
 					outputIndex?: number;
 					citations?: import("@shared/citations").TextCitation[];
+					fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
+					id?: string;
 			  }
 			| {
 					type: "reasoning";
@@ -1746,6 +1779,8 @@ export const narratorPersistence = {
 					block.thoughtSignatureSource,
 				),
 				status: "initializing",
+				executionAttempt: 1,
+				executionIdentityVersion: 1,
 				streamStartedAt:
 					typeof block.streamStartedAt === "number"
 						? new Date(block.streamStartedAt).toISOString()
@@ -2409,21 +2444,293 @@ export const narratorPersistence = {
 		});
 	},
 
+	/** Validate a receipt against its actor, current message and exact persisted attempt. */
+	async getToolCallBinding(
+		narratorId: string,
+		messageId: string,
+		toolUseId: string,
+		toolCallId: string,
+	): Promise<ToolCallBinding> {
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.id, toolCallId),
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.messageId, messageId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: {
+				executionAttempt: true,
+				executionIdentityVersion: true,
+				executionOriginToolCallId: true,
+			},
+		});
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+			columns: { messageId: true },
+		});
+		if (
+			!row ||
+			!ref ||
+			row.executionAttempt < 1 ||
+			row.executionIdentityVersion !== 1 ||
+			row.executionOriginToolCallId !== null
+		)
+			throw new ValidationError(
+				"Tool execution receipt does not belong to the current narrator/message",
+			);
+		return Object.freeze({ toolCallId, attempt: row.executionAttempt });
+	},
+
+	async validateToolCallBinding(narratorId: string, toolUseId: string, binding: ToolCallBinding) {
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.id, binding.toolCallId),
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+				eq(narratorToolCalls.executionAttempt, binding.attempt),
+			),
+			columns: { messageId: true },
+		});
+		if (!row)
+			throw new ValidationError("Tool execution binding is stale or belongs to another narrator");
+		await this.getToolCallBinding(narratorId, row.messageId, toolUseId, binding.toolCallId);
+		return row.messageId;
+	},
+
+	/** A retry of this claim cannot start tool I/O twice, including after process recovery. */
+	async claimToolCallExecution(
+		narratorId: string,
+		toolUseId: string,
+		binding: ToolCallBinding,
+		startedAt: number,
+	) {
+		await this.validateToolCallBinding(narratorId, toolUseId, binding);
+		const attempt = binding.attempt;
+		const claimed = await db
+			.update(narratorToolCalls)
+			.set({
+				status: "running",
+				executionAttempt: attempt,
+				executionStartedAt: new Date(startedAt).toISOString(),
+			})
+			.where(
+				and(
+					eq(narratorToolCalls.id, binding.toolCallId),
+					eq(narratorToolCalls.executionAttempt, binding.attempt),
+					isNull(narratorToolCalls.executionStartedAt),
+					inArray(narratorToolCalls.status, ["initializing", "pending", "running"]),
+				),
+			)
+			.returning({ id: narratorToolCalls.id });
+		if (claimed.length !== 1)
+			throw new ValidationError("Tool attempt has already started or is no longer executable");
+		return Object.freeze({ toolCallId: binding.toolCallId, attempt });
+	},
+
+	/** A child can publish only into the actual parent slot recorded at creation. */
+	async resolveSubagentConclusionReference(
+		subagentId: string,
+		parentNarratorId: string,
+		toolUseId: string,
+		expectedOriginToolCallId?: string,
+	) {
+		const child = await db.query.narrators.findFirst({
+			where: eq(narrators.id, subagentId),
+			columns: { type: true, variant: true, parentNarratorId: true, originToolCallId: true },
+		});
+		if (
+			!child ||
+			child.type !== "subagent" ||
+			!child.variant.startsWith("subagent:") ||
+			child.parentNarratorId !== parentNarratorId ||
+			!child.originToolCallId
+		) {
+			throw new ValidationError("Subagent has no trusted parent tool-call origin");
+		}
+		if (expectedOriginToolCallId && expectedOriginToolCallId !== child.originToolCallId) {
+			throw new ValidationError(
+				"Conclusion watcher does not match the subagent's original Agent row",
+			);
+		}
+		const original = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, child.originToolCallId),
+			columns: {
+				narratorId: true,
+				toolUseId: true,
+				toolName: true,
+				executionIdentityVersion: true,
+				executionOriginToolCallId: true,
+			},
+		});
+		if (
+			original &&
+			(original.narratorId !== parentNarratorId ||
+				original.toolUseId !== toolUseId ||
+				original.toolName !== "Agent" ||
+				original.executionIdentityVersion !== 1 ||
+				original.executionOriginToolCallId !== null)
+		) {
+			throw new ValidationError("Subagent origin is not the parent's original Agent row");
+		}
+		const target = await this.resolveToolCallConclusionReference(parentNarratorId, toolUseId, {
+			toolCallId: child.originToolCallId,
+		});
+		const visible = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, target.toolCallId),
+			columns: { toolName: true, executionIdentityVersion: true },
+		});
+		if (!visible || visible.toolName !== "Agent" || visible.executionIdentityVersion !== 1) {
+			throw new ValidationError("Subagent conclusion target is not a trusted Agent history slot");
+		}
+		return { ...target, originToolCallId: child.originToolCallId };
+	},
+
+	/** Resolve an existing history slot, including its COW copy. Never execution authority. */
+	async resolveToolCallConclusionReference(
+		narratorId: string,
+		toolUseId: string,
+		reference: { toolCallId?: string; messageId?: string },
+	): Promise<{ toolCallId: string; messageId: string }> {
+		if (!reference.toolCallId && !reference.messageId) {
+			throw new ValidationError("A conclusion requires its original tool-call row or message");
+		}
+		const original = reference.toolCallId
+			? await db.query.narratorToolCalls.findFirst({
+					where: eq(narratorToolCalls.id, reference.toolCallId),
+					columns: { toolUseId: true, executionOriginToolCallId: true },
+				})
+			: undefined;
+		if (original && original.toolUseId !== toolUseId) {
+			throw new ValidationError("Conclusion tool-use identity does not match its original row");
+		}
+		const originId = original?.executionOriginToolCallId ?? reference.toolCallId;
+		const rows = await db
+			.select({ toolCallId: narratorToolCalls.id, messageId: narratorToolCalls.messageId })
+			.from(narratorToolCalls)
+			.innerJoin(
+				narratorMessageRefs,
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+				),
+			)
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+					reference.messageId ? eq(narratorToolCalls.messageId, reference.messageId) : undefined,
+					originId
+						? sql`(${narratorToolCalls.id} = ${reference.toolCallId} OR ${narratorToolCalls.executionOriginToolCallId} = ${originId})`
+						: undefined,
+				),
+			)
+			.limit(2);
+		if (rows.length !== 1) {
+			throw new ValidationError(
+				"Conclusion reference is missing or ambiguous in the parent's history",
+			);
+		}
+		return rows[0];
+	},
+
+	/** Resume an unstarted attempt, or append a new attempt after isolating shared history. */
+	async prepareToolCallAttempt(narratorId: string, sourceToolCallId: string, resume = false) {
+		return toolAttemptCreationLock.acquire(narratorId, async () => {
+			const source = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.id, sourceToolCallId),
+			});
+			if (!source) throw new NotFoundError("Tool call", sourceToolCallId);
+			const ref = await db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, source.messageId),
+				),
+				columns: { messageId: true },
+			});
+			if (!ref) throw new ValidationError("Tool call is not in this narrator's history");
+			const shared = await this.isMessageSharedByMultipleNarrators(source.messageId);
+			if (
+				resume &&
+				(source.executionIdentityVersion !== 1 || source.executionOriginToolCallId !== null)
+			) {
+				throw new ValidationError(
+					"Legacy or COW tool rows cannot authorize automatic recovery; create an explicit new attempt",
+				);
+			}
+			if (resume && (source.executionStartedAt || source.fileChangeOperationId)) {
+				throw new ValidationError(
+					"An already-started tool attempt requires reconciliation, not re-execution",
+				);
+			}
+			if (resume && !shared && source.narratorId === narratorId) {
+				if (!["initializing", "pending", "running"].includes(source.status)) {
+					throw new ValidationError("Only an unstarted pending attempt can resume");
+				}
+				return { toolCall: source, requiresFreshPermission: false };
+			}
+			// COW only copies historical references; none of those clones becomes execution authority.
+			const messageId = await this.copyOnWriteMessage(narratorId, source.messageId);
+			const toolCall = db.transaction((tx) => {
+				const latest = tx.query.narratorToolCalls
+					.findFirst({
+						where: and(
+							eq(narratorToolCalls.messageId, messageId),
+							eq(narratorToolCalls.toolUseId, source.toolUseId),
+						),
+						orderBy: [desc(narratorToolCalls.executionAttempt)],
+						columns: { id: true, executionAttempt: true },
+					})
+					.sync();
+				// Repeating an old request must not allocate a second successor attempt.
+				if (latest && latest.executionAttempt > source.executionAttempt) {
+					throw new ValidationError("This tool call already has a newer execution attempt");
+				}
+				const [created] = tx
+					.insert(narratorToolCalls)
+					.values({
+						id: generateId(),
+						narratorId,
+						messageId,
+						toolUseId: source.toolUseId,
+						toolName: source.toolName,
+						inputJson: source.inputJson,
+						executionIdentityVersion: 1,
+						executionAttempt: Math.max(
+							1,
+							(latest?.executionAttempt ?? source.executionAttempt) + 1,
+						),
+						status: "initializing",
+						createdAt: new Date().toISOString(),
+						// Deliberately no operation, approval, timing, result, token accounting or tree data.
+					})
+					.returning()
+					.all();
+				return created;
+			});
+			return { toolCall, requiresFreshPermission: shared || source.narratorId !== narratorId };
+		});
+	},
+
 	async updateToolCallExecutionTarget(
 		narratorId: string,
 		toolUseId: string,
 		target: ToolExecutionTarget,
+		binding?: ToolCallBinding,
 	) {
+		if (binding) await this.validateToolCallBinding(narratorId, toolUseId, binding);
+		const toolCallId =
+			binding?.toolCallId ?? (await resolveToolCallWriteId(toolUseId, { narratorId }));
+		if (!toolCallId) throw new NotFoundError("Tool call", toolUseId);
 		const existing = await db.query.narratorToolCalls.findFirst({
 			where: and(
+				eq(narratorToolCalls.id, toolCallId),
 				eq(narratorToolCalls.narratorId, narratorId),
 				eq(narratorToolCalls.toolUseId, toolUseId),
 			),
-			// Order by newest first: some providers (GLM, DeepSeek, etc.) reuse short
-			// sequential toolUseIds across requests (call_0, call_1, call_2...). Without
-			// this ordering, findFirst may hit a stale completed row from a previous turn
-			// instead of the current "initializing" row, tripping the frozen-target guard.
-			orderBy: [desc(narratorToolCalls.createdAt)],
+			// Production callers always supply the receipt; legacy callers remain supported.
 			columns: {
 				id: true,
 				status: true,
@@ -2513,7 +2820,12 @@ export const narratorPersistence = {
 		narratorId: string,
 		toolUseId: string,
 		plan: ToolExecutionPlan,
+		binding?: ToolCallBinding,
 	) {
+		if (binding) await this.validateToolCallBinding(narratorId, toolUseId, binding);
+		const toolCallId =
+			binding?.toolCallId ?? (await resolveToolCallWriteId(toolUseId, { narratorId }));
+		if (!toolCallId) throw new NotFoundError("Tool call", toolUseId);
 		const normalizedPlan = normalizeExecutionPlan(plan);
 		const primary = normalizedPlan.endpoints.find(
 			(endpoint) => endpoint.key === normalizedPlan.primaryKey,
@@ -2535,10 +2847,10 @@ export const narratorPersistence = {
 		// two queries where one suffices.
 		const existing = await db.query.narratorToolCalls.findFirst({
 			where: and(
+				eq(narratorToolCalls.id, toolCallId),
 				eq(narratorToolCalls.narratorId, narratorId),
 				eq(narratorToolCalls.toolUseId, toolUseId),
 			),
-			orderBy: [desc(narratorToolCalls.createdAt)],
 			columns: { id: true, status: true, executionTargetsJson: true },
 		});
 		if (!existing) throw new NotFoundError("Tool call", toolUseId);
@@ -2566,7 +2878,7 @@ export const narratorPersistence = {
 				);
 			}
 		}
-		await this.updateToolCallExecutionTarget(narratorId, toolUseId, primary.target);
+		await this.updateToolCallExecutionTarget(narratorId, toolUseId, primary.target, binding);
 		await db
 			.update(narratorToolCalls)
 			.set({ executionTargetsJson: normalizedPlan })
@@ -2591,10 +2903,9 @@ export const narratorPersistence = {
 		messageId?: string,
 		toolCallId?: string,
 	) {
-		const conditions = toolCallId
-			? [eq(narratorToolCalls.id, toolCallId)]
-			: [eq(narratorToolCalls.toolUseId, toolUseId)];
-		if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
+		const exactId = await resolveToolCallWriteId(toolUseId, { toolCallId, messageId });
+		if (!exactId) return;
+		const conditions = [eq(narratorToolCalls.id, exactId)];
 		const affectedToolCalls = await db
 			.select({
 				narratorId: narratorToolCalls.narratorId,
@@ -2697,10 +3008,9 @@ export const narratorPersistence = {
 		messageId?: string,
 		toolCallId?: string,
 	): Promise<boolean> {
-		const conditions = toolCallId
-			? [eq(narratorToolCalls.id, toolCallId)]
-			: [eq(narratorToolCalls.toolUseId, toolUseId)];
-		if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
+		const exactId = await resolveToolCallWriteId(toolUseId, { toolCallId, messageId });
+		if (!exactId) return false;
+		const conditions = [eq(narratorToolCalls.id, exactId)];
 		conditions.push(inArray(narratorToolCalls.status, ["initializing", "pending", "running"]));
 		const condition = and(...conditions);
 		if (!condition) return false;
@@ -2744,11 +3054,12 @@ export const narratorPersistence = {
 	},
 
 	async isMessageSharedByMultipleNarrators(messageId: string): Promise<boolean> {
-		const result = await db
-			.select({ count: sql<number>`count(*)` })
+		const refs = await db
+			.select({ id: narratorMessageRefs.id })
 			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.messageId, messageId));
-		return (result[0]?.count ?? 0) > 1;
+			.where(eq(narratorMessageRefs.messageId, messageId))
+			.limit(2);
+		return refs.length > 1;
 	},
 
 	async getToolCallByToolUseId(toolUseId: string) {
@@ -2835,6 +3146,7 @@ export const narratorPersistence = {
 					.values(
 						originalToolCalls.map((tc) => ({
 							...tc,
+							executionOriginToolCallId: tc.executionOriginToolCallId ?? tc.id,
 							id: generateId(),
 							narratorId,
 							messageId: newMessageId,
@@ -2886,9 +3198,9 @@ export const narratorPersistence = {
 			toolCallId,
 			inputKeys: Object.keys(input),
 		});
-		const condition = toolCallId
-			? eq(narratorToolCalls.id, toolCallId)
-			: eq(narratorToolCalls.toolUseId, toolUseId);
+		const exactId = await resolveToolCallWriteId(toolUseId, { toolCallId });
+		if (!exactId) return;
+		const condition = eq(narratorToolCalls.id, exactId);
 
 		const existing = await db.query.narratorToolCalls.findFirst({
 			where: condition,

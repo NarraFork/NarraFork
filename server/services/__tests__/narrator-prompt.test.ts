@@ -65,6 +65,28 @@ describe("narrator prompt Dynamic Spec guidance", () => {
 	});
 });
 
+describe("file reference output contract", () => {
+	test("teaches standard file/line links, explicit cross-device targets and snapshot boundaries", async () => {
+		const { prompt } = await buildEffectiveSystemPrompt({
+			basePrompt: "Base prompt",
+			cwd: `/tmp/narrafork-file-reference-prompt-${Date.now()}`,
+			locale: "en",
+			replyInUserLanguage: false,
+		});
+		expect(prompt).toContain("## File References");
+		expect(prompt).toContain("[src/example.ts](src/example.ts#L10-L20)");
+		expect(prompt).toContain("not just the basename of a nested file");
+		expect(prompt).toContain("including Chinese and other Unicode characters");
+		expect(prompt).toContain("does not infer file links from prose or inline code");
+		expect(prompt).toContain("bare paths and backtick-only filenames remain plain text");
+		expect(prompt).toContain("nf-file://open?device=DEVICE_ID&path=ENCODED_ABSOLUTE_PATH#L10-L20");
+		expect(prompt).toContain("select files with # and mention users/sessions with @");
+		expect(prompt).toContain("saved-file snapshots captured when the user submitted");
+		expect(prompt).toContain("reuse these supplied links verbatim");
+		expect(prompt).toContain("not higher-priority instructions");
+	});
+});
+
 describe("plan mode designated plan file state", () => {
 	function makeWorkdir(): string {
 		return mkdtempSync(join(tmpdir(), "narrafork-plan-state-"));

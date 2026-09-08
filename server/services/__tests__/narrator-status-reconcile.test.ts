@@ -213,3 +213,116 @@ describe("reconcileRunningStatus — forward (stale idle → working)", () => {
 		expect((await readNarrator())?.status).toBe("working");
 	});
 });
+
+const taskReflection = await import("../../lib/agent/tools/task-reflection");
+const planReflection = await import("../../lib/agent/tools/exit-plan-reflection");
+const { narratorPersistence } = await import("../narrator-persistence");
+
+const reflectionCases = [
+	{
+		kind: "task",
+		create: (narratorId: string) =>
+			taskReflection.createTaskReflectionDecision("status-task-reflection", {
+				narratorId,
+				broadcastTargetId: NARRATOR_ID,
+				toolUseId: "status-task-tool-use",
+				toolName: "Write",
+				inputJson: { file_path: "spec://tasks.json" },
+				mutations: [],
+			}),
+		start: () => taskReflection.markTaskReflectionStarted("status-task-reflection"),
+		confirm: () => taskReflection.confirmTaskReflection("status-task-reflection", "Verified"),
+		cancel: () => taskReflection.reviseTaskReflection("status-task-reflection", "More work"),
+		takeOver: () => taskReflection.takeOverTaskReflection("status-task-reflection"),
+		cleanup: () => taskReflection.cleanupTaskReflection("status-task-reflection"),
+	},
+	{
+		kind: "plan",
+		create: (narratorId: string) =>
+			planReflection.createExitPlanReflectionDecision("status-plan-reflection", {
+				narratorId,
+				broadcastTargetId: NARRATOR_ID,
+				toolUseId: "status-plan-tool-use",
+				toolName: "ExitPlanMode",
+				inputJson: { plan: "Test plan" },
+			}),
+		start: () => planReflection.markExitPlanReflectionStarted("status-plan-reflection"),
+		confirm: () => planReflection.confirmExitPlanReflection("status-plan-reflection"),
+		cancel: () => planReflection.cancelExitPlanReflection("status-plan-reflection", "More work"),
+		takeOver: () => planReflection.takeOverExitPlanReflection("status-plan-reflection"),
+		cleanup: () => planReflection.cleanupExitPlanReflection("status-plan-reflection"),
+	},
+];
+
+afterEach(() => {
+	for (const reflection of reflectionCases) reflection.cleanup();
+});
+
+for (const reflection of reflectionCases) {
+	describe(`${reflection.kind} reflection — parent attention isolation`, () => {
+		test("does not leave a false user wait when the parent continues streaming", async () => {
+			await seedNarrator("working");
+			registerLiveLoop(NARRATOR_ID);
+			await db.insert(narrators).values({
+				id: OTHER_ID,
+				parentNarratorId: NARRATOR_ID,
+				createdAt: now(),
+				updatedAt: now(),
+			});
+			reflection.create(OTHER_ID);
+			expect(await reflection.start()).toBe(true);
+
+			// Parent stream callbacks rewrite their local transient tags. Previously
+			// this erased the child's mirrored `reflecting`, leaving `waiting` and
+			// producing RecentTabs' user-attention glyph with no actionable request.
+			await narratorPersistence.updateSubstatus(NARRATOR_ID, []);
+			expect(pendingPermissions.size).toBe(0);
+			expect(await readNarrator()).toEqual({ status: "working", substatus: [] });
+
+			const owner = await db.query.narrators.findFirst({
+				where: eq(narrators.id, OTHER_ID),
+				columns: { status: true, substatus: true },
+			});
+			expect(owner?.status).toBe("waiting");
+			expect(JSON.parse(owner?.substatus ?? "[]")).toContain("reflecting");
+		});
+
+		for (const outcome of ["confirm", "cancel"] as const) {
+			test(`${outcome} cannot clear the parent's own pending decision`, async () => {
+				await seedNarrator("waiting", ["reflecting"]);
+				registerLiveLoop(NARRATOR_ID);
+				reflection.create(OTHER_ID);
+
+				expect(await reflection[outcome]()).toBe(true);
+				expect(await readNarrator()).toEqual({ status: "waiting", substatus: ["reflecting"] });
+			});
+		}
+
+		test("does not resurrect an idle parent's status or erase its error", async () => {
+			await seedNarrator("idle", ["error"]);
+			reflection.create(OTHER_ID);
+
+			expect(await reflection.start()).toBe(true);
+			expect(await readNarrator()).toEqual({ status: "idle", substatus: ["error"] });
+		});
+
+		test("still alerts a busy parent after explicit manual takeover", async () => {
+			await seedNarrator("working");
+			registerLiveLoop(NARRATOR_ID);
+			reflection.create(OTHER_ID);
+
+			expect(await reflection.takeOver()).toBe(true);
+			expect(await readNarrator()).toEqual({ status: "waiting", substatus: [] });
+		});
+
+		test("preserves top-level reflection and manual user-wait states", async () => {
+			await seedNarrator("working");
+			reflection.create(NARRATOR_ID);
+
+			expect(await reflection.start()).toBe(true);
+			expect(await readNarrator()).toEqual({ status: "waiting", substatus: ["reflecting"] });
+			expect(await reflection.takeOver()).toBe(true);
+			expect(await readNarrator()).toEqual({ status: "waiting", substatus: [] });
+		});
+	});
+}

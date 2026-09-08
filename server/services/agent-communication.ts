@@ -66,6 +66,8 @@ export interface SendSubagentInput extends ResolveTargetsInput {
 	userId?: string | null;
 	/** Internal aggregate registry used to checkpoint an already-delivered Send await. */
 	replyRun?: AgentReplyWaitRunHandle;
+	/** Navigation only; called after authorization, before waiting for replies. */
+	onTargetResolved?: (narratorId: string) => void;
 }
 
 export interface AwaitAgentInput {
@@ -1183,6 +1185,7 @@ async function sendSubagentMessageDetailedWithRun(
 	if (parentResult) return parentResult;
 
 	const targets = await resolveSubagentTargets(input);
+	if (targets.length === 1) input.onTargetResolved?.(targets[0].id);
 	if (input.replyTo && targets.length !== 1) {
 		return {
 			output: "An explicit replyTo Send must address exactly one requester.",

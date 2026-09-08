@@ -24,13 +24,11 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
-import {
-	handleMarkdownAnchorClick,
-	MD_HEADING_SLUG_ATTR,
-	markdownLinkTargetProps,
-} from "@frontend/lib/markdown-anchor-scroll";
+import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
+import { MD_HEADING_SLUG_ATTR } from "@frontend/lib/markdown-anchor-scroll";
 import { Box } from "@mantine/core";
 import { Fragment, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { MarkdownLink } from "../../MarkdownLink";
 import { MEASURE_MARKDOWN_CODE_PADDING } from "../measure/measure-markdown";
 import { pretextLineMetrics } from "../measure/pretext-metrics";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
@@ -47,7 +45,6 @@ import type {
 } from "../prepared-block";
 import { DEFAULT_TABLE_METRICS, layoutTable, tableRowLineHeight } from "../prepared-block";
 import { MONO_FAMILY, typographyMetrics } from "../pretext-fonts";
-import { useShikiTokens } from "../useShikiTokens";
 import { type CodeCopyPlacement, resolveCodeCopyPlacement } from "../vlist-content-view-float";
 import { splitTokensByVisualLines } from "../vlist-token-lines";
 import { hasUnpredictableBlock } from "../vlist-unpredictable-blocks";
@@ -661,19 +658,9 @@ function TableCellView({
 											lineHeight={lineHeight}
 										/>
 									) : frag.href != null ? (
-										<a
+										<MarkdownLink
+											lineNumbersInChildren
 											href={frag.href}
-											// Same rule as the paragraph path above: fragments scroll in place,
-											// everything else opens in a new tab. A table cell can hold a
-											// document-internal link too.
-											{...markdownLinkTargetProps(frag.href)}
-											onClick={(event) => {
-												handleMarkdownAnchorClick(
-													event,
-													frag.href,
-													event.currentTarget.closest(`[${MD_BODY_ATTR}]`),
-												);
-											}}
 											className={frag.className}
 											style={fragmentTextStyle({
 												font: frag.font,
@@ -682,7 +669,7 @@ function TableCellView({
 											})}
 										>
 											{frag.text}
-										</a>
+										</MarkdownLink>
 									) : (
 										<span
 											className={frag.className}
@@ -924,20 +911,9 @@ function InlineBlockView({
 											frag.text
 										);
 									return frag.href != null ? (
-										<a
+										<MarkdownLink
+											lineNumbersInChildren
 											href={frag.href}
-											// A same-document `#heading` anchor gets NO target and scrolls this
-											// body's own scroller; every real destination keeps `_blank`.
-											// `noopener` is stated rather than relied on as the `_blank` default,
-											// so both markdown paths carry the same `rel`.
-											{...markdownLinkTargetProps(frag.href)}
-											onClick={(event) => {
-												handleMarkdownAnchorClick(
-													event,
-													frag.href,
-													event.currentTarget.closest(`[${MD_BODY_ATTR}]`),
-												);
-											}}
 											className={frag.className}
 											style={fragmentTextStyle({
 												font: frag.font,
@@ -946,7 +922,7 @@ function InlineBlockView({
 											})}
 										>
 											{content}
-										</a>
+										</MarkdownLink>
 									) : (
 										<span
 											className={frag.className}

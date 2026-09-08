@@ -8,6 +8,8 @@ export const gitApi = {
 		opts?: {
 			scope?: "uncommitted";
 			limit?: number;
+			/** nextCursor from the historical (unscoped) response; never a current baseline. */
+			cursor?: { changedAt: string; rowId: string };
 			/**
 			 * `"byFile"` drops the per-event timeline from the response; no caller renders it.
 			 * `"all"` keeps it, and is what the server assumes when the parameter is absent.
@@ -23,6 +25,10 @@ export const gitApi = {
 		if (opts?.scope) params.set("scope", opts.scope);
 		if (opts?.limit) params.set("limit", String(opts.limit));
 		if (opts?.projection) params.set("projection", opts.projection);
+		if (opts?.cursor) {
+			params.set("cursorAt", opts.cursor.changedAt);
+			params.set("cursorRowId", opts.cursor.rowId);
+		}
 		const qs = params.toString();
 		return request<ApiEntity>(`/chapters/${chapterId}/git/modifications${qs ? `?${qs}` : ""}`);
 	},

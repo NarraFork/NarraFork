@@ -14,6 +14,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { parseHTML } from "linkedom";
 import { createPointerDragTracker } from "./vlist-pointer-drag";
+import { resolveWidthSettle, WIDTH_SETTLE_DELAY_MS } from "./vlist-width-settle";
 
 let restore: (() => void) | undefined;
 
@@ -198,6 +199,110 @@ describe("createPointerDragTracker", () => {
 		tracker.dispose();
 	});
 
+	it("native Dockview drop releases frozen width without waiting for the 3s backstop", () => {
+		let committedWidth = 900;
+		let releases = 0;
+		const tracker = createPointerDragTracker(() => {
+			releases++;
+			const decision = resolveWidthSettle({
+				nextWidth: 600,
+				committedWidth,
+				trigger: "gesture-end",
+				pointerDown: tracker.isDown(),
+			});
+			if (decision.commit) committedWidth = 600;
+		});
+		try {
+			fire("pointerdown", 1);
+			fire("mousedown");
+			fire("dragstart");
+			fire("pointercancel", 1);
+			expect(tracker.isDown()).toBe(true);
+			expect(releases).toBe(0);
+			fire("drop");
+			expect(tracker.isDown()).toBe(false);
+			expect(committedWidth).toBe(600);
+			expect(releases).toBe(1);
+			fire("dragend");
+			fire("mouseup");
+			expect(releases).toBe(1);
+			// Dockview's drop handler may resize AFTER capture-phase drop. Its observer
+			// must see idle, not an orphaned MOUSE_ID holding this and later toggles.
+			expect(
+				resolveWidthSettle({
+					nextWidth: 1000,
+					committedWidth,
+					trigger: "observer",
+					pointerDown: tracker.isDown(),
+				}).deferForMs,
+			).toBe(WIDTH_SETTLE_DELAY_MS);
+		} finally {
+			tracker.dispose();
+		}
+	});
+
+	it("native drag survives pointercancel even when compatibility mousedown is absent", () => {
+		let releases = 0;
+		const tracker = createPointerDragTracker(() => releases++);
+		try {
+			fire("pointerdown", 4);
+			fire("dragstart");
+			fire("pointercancel", 4);
+			expect(tracker.isDown()).toBe(true);
+			expect(releases).toBe(0);
+			// Cancelled/rejected native drops only emit dragend, not drop.
+			fire("dragend");
+			expect(tracker.isDown()).toBe(false);
+			expect(releases).toBe(1);
+		} finally {
+			tracker.dispose();
+		}
+	});
+
+	it("repeated native drags each release exactly once", () => {
+		let releases = 0;
+		const tracker = createPointerDragTracker(() => releases++);
+		try {
+			for (let i = 0; i < 5; i++) {
+				fire("mousedown");
+				fire("dragstart");
+				fire("drop");
+				fire("dragend");
+				expect(tracker.isDown()).toBe(false);
+				expect(releases).toBe(i + 1);
+			}
+		} finally {
+			tracker.dispose();
+		}
+	});
+
+	it("window blur clears a lost release without leaking its listener after dispose", () => {
+		let releases = 0;
+		const tracker = createPointerDragTracker(() => releases++);
+		const blur = () => {
+			const event = document.createEvent("Event");
+			event.initEvent("blur", false, false);
+			document.defaultView?.dispatchEvent(event);
+		};
+		try {
+			fire("pointerdown", 1);
+			fire("mousedown");
+			blur();
+			expect(tracker.isDown()).toBe(false);
+			expect(releases).toBe(1);
+			fire("dragstart");
+			tracker.dispose();
+			blur();
+			fire("dragstart");
+			fire("drop");
+			fire("dragend");
+			expect(tracker.isDown()).toBe(false);
+			expect(releases).toBe(1);
+		} finally {
+			tracker.dispose();
+		}
+	});
+
 	// The order above, reversed — some environments deliver mouseup first.
 	it("does not get stuck when mouseup arrives before pointerup", () => {
 		const tracker = createPointerDragTracker(() => {});
@@ -291,6 +396,8 @@ describe("createPointerDragTracker", () => {
 		fire("pointercancel", 1);
 		fire("mouseup");
 		fire("contextmenu");
+		fire("drop");
+		fire("dragend");
 		expect(releases).toBe(0);
 		tracker.dispose();
 	});
@@ -316,14 +423,19 @@ describe("listener coverage (source)", () => {
 			"mousedown",
 			"mouseup",
 			"contextmenu",
+			"dragstart",
+			"drop",
+			"dragend",
 		]) {
 			expect(source).toContain(`addEventListener("${type}"`);
 			// Every listener must also be removed, or a remounting list leaks them.
 			expect(source).toContain(`removeEventListener("${type}"`);
 		}
 		// Capture phase + passive: see the module comment for why both matter.
-		const registrations = source.match(/addEventListener\([^)]*\)/g) ?? [];
-		expect(registrations.length).toBe(6);
+		const registrations = source.match(/target\.addEventListener\([^)]*\)/g) ?? [];
+		expect(registrations.length).toBe(9);
+		expect(source).toContain('defaultView?.addEventListener("blur", releaseAll)');
+		expect(source).toContain('defaultView?.removeEventListener("blur", releaseAll)');
 		for (const registration of registrations) {
 			expect(registration).toContain("capture: true");
 			expect(registration).toContain("passive: true");

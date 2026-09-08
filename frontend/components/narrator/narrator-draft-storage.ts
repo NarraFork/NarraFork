@@ -1,5 +1,16 @@
-import { readSession, removeSession, writeSession } from "@frontend/lib/session-store";
+import {
+	readSession,
+	removeSession,
+	SESSION_STORE_LIMITS,
+	writeSession,
+} from "@frontend/lib/session-store";
+import type { FileReference } from "@shared/file-reference";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
+import {
+	copyFileReferences,
+	readFileReferences,
+	sameFileReferenceInput,
+} from "./file-reference-input";
 
 const INPUT_DRAFT_STORAGE_VERSION = 2;
 
@@ -20,6 +31,7 @@ export const MAX_LOCAL_DRAFT_MIRROR_CHARS = 16_000;
 
 export interface StoredNarratorInputDraft {
 	text: string;
+	fileReferences?: FileReference[];
 	serverRevision: number | null;
 	serverUpdatedAt: string | null;
 }
@@ -36,6 +48,7 @@ interface LegacyStoredNarratorInputDraftEnvelope {
 
 export interface ResolvedNarratorDraft {
 	text: string;
+	fileReferences?: FileReference[];
 	conflict: boolean;
 }
 
@@ -209,8 +222,10 @@ export function readNarratorInputDraft(
 		) {
 			return drop();
 		}
+		const fileReferences = readFileReferences(parsed.fileReferences, parsed.text);
 		return {
 			text: parsed.text,
+			...(fileReferences.length ? { fileReferences } : {}),
 			serverRevision: parsed.serverRevision ?? null,
 			serverUpdatedAt: parsed.serverUpdatedAt ?? null,
 		};
@@ -236,6 +251,7 @@ export function persistNarratorInputDraft(
 	text: string,
 	serverRevision: number | null,
 	serverUpdatedAt: string | null,
+	fileReferences: FileReference[] = [],
 ): boolean {
 	const id = getNarratorDraftStorageId(userId, narratorId);
 	if (text.length > MAX_LOCAL_DRAFT_MIRROR_CHARS) {
@@ -244,12 +260,25 @@ export function persistNarratorInputDraft(
 		removeSession("narrator-draft", id);
 		return false;
 	}
+	let references: FileReference[];
+	try {
+		references = copyFileReferences(fileReferences, text);
+	} catch {
+		removeSession("narrator-draft", id);
+		return false;
+	}
 	const envelope: StoredNarratorInputDraftEnvelope = {
 		version: INPUT_DRAFT_STORAGE_VERSION,
 		text,
+		fileReferences: references,
 		serverRevision,
 		serverUpdatedAt,
 	};
+	const serialized = JSON.stringify(envelope);
+	if (serialized.length > SESSION_STORE_LIMITS.MAX_VALUE_CHARS) {
+		removeSession("narrator-draft", id);
+		return false;
+	}
 	/*
 	 * An EMPTY mirror is disposable; one with text is not.
 	 *
@@ -264,38 +293,60 @@ export function persistNarratorInputDraft(
 	 * The empty record still has to be WRITTEN (it is how a cleared draft stops
 	 * resurrecting on reload); it just must never be worth more than typed text.
 	 */
-	writeSession("narrator-draft", id, JSON.stringify(envelope), text ? "durable" : "disposable");
+	writeSession(
+		"narrator-draft",
+		id,
+		serialized,
+		text || references.length ? "durable" : "disposable",
+	);
 	return true;
 }
 
 export function resolveHydratedNarratorDraft(options: {
 	local: StoredNarratorInputDraft;
 	serverText: string;
+	serverFileReferences?: FileReference[];
 	serverRevision: number;
 	currentInput: string;
+	currentFileReferences?: FileReference[];
 	localChangedSinceRequest: boolean;
 }): ResolvedNarratorDraft {
+	const local = {
+		text: options.local.text,
+		fileReferences: readFileReferences(options.local.fileReferences, options.local.text),
+	};
+	const server = {
+		text: options.serverText,
+		fileReferences: readFileReferences(options.serverFileReferences, options.serverText),
+	};
+	const current = {
+		text: options.currentInput,
+		fileReferences: readFileReferences(options.currentFileReferences, options.currentInput),
+	};
+	const result = (value: typeof local, conflict: boolean): ResolvedNarratorDraft => ({
+		text: value.text,
+		...(value.fileReferences.length ? { fileReferences: value.fileReferences } : {}),
+		conflict,
+	});
 	if (options.localChangedSinceRequest) {
-		return {
-			text: options.currentInput,
-			conflict:
-				options.currentInput !== options.serverText &&
+		return result(
+			current,
+			!sameFileReferenceInput(current, server) &&
 				options.local.serverRevision !== options.serverRevision,
-		};
+		);
 	}
 	if (options.local.serverRevision === options.serverRevision) {
-		// Same server base but different text means this browser has unsynced edits.
-		return { text: options.local.text, conflict: false };
+		// Text AND references share one revision; metadata-only changes are edits too.
+		return result(local, false);
 	}
 	if (
 		options.local.serverRevision === null &&
-		options.local.text &&
-		options.local.text !== options.serverText
+		(local.text || local.fileReferences.length) &&
+		!sameFileReferenceInput(local, server)
 	) {
-		// Version-1 browser storage has no trustworthy base revision. Preserve it for an
-		// explicit user choice instead of silently overwriting either side.
-		return { text: options.local.text, conflict: true };
+		// Version-1 browser storage has no trustworthy base revision.
+		return result(local, true);
 	}
-	// A different known server revision (including a newer clear tombstone) is authoritative.
-	return { text: options.serverText, conflict: false };
+	// A newer server clear tombstone removes both text and references.
+	return result(server, false);
 }

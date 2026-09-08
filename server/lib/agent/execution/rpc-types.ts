@@ -23,6 +23,10 @@ export const FS_READ_ATOMIC_RESOLVED_PATH_FEATURE = FEATURE_FS_READ_ATOMIC_RESOL
 /** Executor capability that verifies a canonical identity immediately before writing. */
 export const FEATURE_FS_WRITE_ATOMIC_RESOLVED_PATH_V1 = "fs.write.atomic-resolved-path.v1";
 export const FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE = FEATURE_FS_WRITE_ATOMIC_RESOLVED_PATH_V1;
+/** Glob enforces byte/count limits during enumeration and stops on deadline/rpc_cancel. */
+export const FEATURE_GLOB_BOUNDED_V1 = "glob.bounded.v1";
+/** Reads check cancellation between chunks and revalidate identity/size after reading. */
+export const FEATURE_FS_READ_BOUNDED_V1 = "fs.read.bounded.v1";
 
 // ── Handshake ────────────────────────────────────────────────────────────────
 
@@ -215,6 +219,7 @@ export interface FsStatResult {
 export interface FsReadParams {
 	path: string;
 	maxBytes?: number;
+	timeoutMs?: number;
 	/**
 	 * Canonical identity returned by a prior fs.stat. Executors advertising
 	 * FS_READ_ATOMIC_RESOLVED_PATH_FEATURE must open the file, verify that the
@@ -266,9 +271,14 @@ export interface GlobParams {
 	cwd: string;
 	dot?: boolean;
 	maxResults?: number;
+	maxBytes?: number;
+	timeoutMs?: number;
+	includeDirectories?: boolean;
+	query?: string;
 }
 export interface GlobResult {
 	matches: string[];
+	truncated?: boolean;
 }
 
 export interface GrepRpcParams {

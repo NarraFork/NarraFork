@@ -48,6 +48,7 @@ function state(overrides: Partial<QueuedEditAttachmentState> = {}): QueuedEditAt
 		newImages: [],
 		keptTextFiles: [],
 		newTextFiles: [],
+		fileReferences: [],
 		...overrides,
 	};
 }
@@ -91,6 +92,52 @@ describe("seedQueuedEditAttachments", () => {
 
 		expect(seeded.keptImages).toEqual([]);
 		expect(seeded.keptTextFiles).toEqual([]);
+	});
+});
+
+describe("file reference queue attachments", () => {
+	const reference = {
+		id: "ref-a",
+		deviceId: "RemoteCaseID",
+		path: "/work/a.ts",
+		label: "a.ts",
+		selection: { startLineNumber: 2, startColumn: 1, endLineNumber: 3, endColumn: 1 },
+	};
+
+	test("seeding and payloads detach reference metadata from the queue", () => {
+		const original = summary({ fileReferences: [reference] });
+		const seeded = seedQueuedEditAttachments(original);
+		seeded.fileReferences[0].label = "new label";
+		if (seeded.fileReferences[0].selection) seeded.fileReferences[0].selection.startLineNumber = 1;
+		expect(original.fileReferences?.[0].label).toBe("a.ts");
+		expect(original.fileReferences?.[0].selection?.startLineNumber).toBe(2);
+		const payload = buildQueuedEditPayload(state({ fileReferences: seeded.fileReferences }));
+		payload.fileReferences[0].label = "another label";
+		expect(seeded.fileReferences[0].label).toBe("new label");
+	});
+
+	test("a pure reference can be submitted and retains its occurrence ID", () => {
+		const edit = state({ fileReferences: [reference] });
+		expect(canSubmitQueuedEdit(edit)).toBe(true);
+		expect(buildQueuedEditPayload(edit).fileReferences).toEqual([reference]);
+	});
+
+	test("removal is explicit and changes attachment detection", () => {
+		const original = summary({ fileReferences: [reference] });
+		const unchanged = state({ text: "changed wording", fileReferences: [reference] });
+		expect(queuedEditTouchesAttachments(original, unchanged)).toBe(false);
+		const removed = state({ text: "no attachment" });
+		expect(queuedEditTouchesAttachments(original, removed)).toBe(true);
+		expect(buildQueuedEditPayload(removed).fileReferences).toEqual([]);
+		expect(seedQueuedEditAttachments(summary()).fileReferences).toEqual([]);
+	});
+
+	test("submission trims prompt and token positions together", () => {
+		const plain = { ...reference, selection: undefined, inputRange: [2, 12] as [number, number] };
+		const payload = buildQueuedEditPayload(
+			state({ text: "  #file:a.ts  ", fileReferences: [plain] }),
+		);
+		expect(payload.fileReferences[0].inputRange).toEqual([0, 10]);
 	});
 });
 

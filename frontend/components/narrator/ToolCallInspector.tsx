@@ -23,7 +23,10 @@ import { ContentViewer } from "./ContentViewer";
 const MAX_JSON_PREVIEW_CHARS = 80_000;
 
 interface ToolCallLike {
+	/** Actual narrator_tool_calls PK, never the SDK tool_use.id. */
 	id?: string;
+	messageId?: string;
+	executionAttempt?: number;
 	toolName?: string;
 	toolUseId?: string;
 	status?: string;
@@ -49,6 +52,10 @@ interface ToolCallLike {
 interface ToolCallInspectorProps {
 	narratorId: string;
 	toolUseId: string | null | undefined;
+	/** Explicit persisted refs, for callers without a full initial row. */
+	toolCallId?: string;
+	messageId?: string;
+	executionAttempt?: number;
 	opened: boolean;
 	onClose: () => void;
 	initialToolCall?: ToolCallLike | null;
@@ -341,6 +348,9 @@ function JsonSection({ title, value }: { title: string; value: unknown }) {
 export function ToolCallInspector({
 	narratorId,
 	toolUseId,
+	toolCallId,
+	messageId,
+	executionAttempt,
 	opened,
 	onClose,
 	initialToolCall,
@@ -358,7 +368,11 @@ export function ToolCallInspector({
 		data: fetched,
 		isLoading: fetchLoading,
 		isError: fetchError,
-	} = useToolCallDetail(narratorId, toolUseId ?? "", enabled);
+	} = useToolCallDetail(narratorId, toolUseId ?? "", enabled, {
+		toolCallId: toolCallId ?? initialToolCall?.id,
+		messageId: messageId ?? initialToolCall?.messageId,
+		executionAttempt: executionAttempt ?? initialToolCall?.executionAttempt,
+	});
 	const data = externallyFed ? detail : fetched;
 	const isLoading = externallyFed ? !!detailLoading : fetchLoading;
 	const isError = externallyFed ? !!detailError : fetchError;

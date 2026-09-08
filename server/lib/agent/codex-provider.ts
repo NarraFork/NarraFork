@@ -43,7 +43,6 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
-import { sanitizeHeaders } from "./request-dump";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
 
 function getCodexProviderErrorMessage(err: unknown): string {
@@ -620,13 +619,8 @@ export class CodexProvider implements ProviderAdapter {
 					resetSessionBeforeRequest: params.resetUpstreamSession,
 					userAgent: fingerprint.userAgent,
 					extraHeaders: fingerprint.headers,
-					onRequestPrepared: ({ url, headers, body }) =>
-						params.requestDump?.setRequest({
-							transport: "websocket",
-							url,
-							headers: sanitizeHeaders(headers),
-							body,
-						}),
+					requestDump: params.requestDump,
+					requestDumpMaxBytes: settings.agent?.requestDumpMaxSize,
 				})) {
 					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 					// Same neutrality rule as the SSE path: a policy violation is a

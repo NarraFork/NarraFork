@@ -1,3 +1,4 @@
+import { notifyHumanAttentionChanged } from "@server/services/human-attention-events";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
@@ -49,6 +50,55 @@ const pendingTaskReflections = hotSafe<Map<string, PendingTaskReflection>>(
 	"narrafork.pendingTaskReflections",
 	() => new Map(),
 );
+
+/** Read-only views of user-owned gates. Automatic/resolved reflections never escape. */
+export type HumanTaskReflection = Readonly<
+	Pick<
+		PendingTaskReflection,
+		| "requestId"
+		| "narratorId"
+		| "toolCallId"
+		| "toolUseId"
+		| "toolName"
+		| "parentToolUseId"
+		| "inputJson"
+		| "mutations"
+		| "startedAt"
+	>
+>;
+
+export function getTaskReflectionAwaitingUser(requestId: string): HumanTaskReflection | null {
+	const pending = pendingTaskReflections.get(requestId);
+	if (!pending || pending.resolved || !pending.reflectionStoppedByUser) return null;
+	const {
+		narratorId,
+		toolCallId,
+		toolUseId,
+		toolName,
+		parentToolUseId,
+		inputJson,
+		mutations,
+		startedAt,
+	} = pending;
+	return {
+		requestId,
+		narratorId,
+		toolCallId,
+		toolUseId,
+		toolName,
+		parentToolUseId,
+		inputJson,
+		mutations,
+		startedAt,
+	};
+}
+
+export function* iterateTaskReflectionsAwaitingUser(): IterableIterator<HumanTaskReflection> {
+	for (const requestId of pendingTaskReflections.keys()) {
+		const pending = getTaskReflectionAwaitingUser(requestId);
+		if (pending) yield pending;
+	}
+}
 
 const taskReflectionGrants = hotSafe<Set<string>>(
 	"narrafork.taskReflectionGrants",
@@ -217,7 +267,11 @@ async function markTaskReflectionStatus(
 		// control to the user (awaiting_user) we clear it so the UI shows a plain wait.
 		const substatus = status === "running" ? ["reflecting"] : [];
 		await narratorService.updateStatus(pending.narratorId, nextStatus, { substatus });
-		if (pending.broadcastTargetId !== pending.narratorId) {
+		// An automatic child reflection is not a user wait on its parent. Its
+		// lifecycle already reaches the parent card via broadcastReflectionFrame;
+		// mirroring status lets the parent's next stream tick erase `reflecting`
+		// and leave a false `waiting` alert. Only manual takeover needs attention.
+		if (pending.reflectionStoppedByUser && pending.broadcastTargetId !== pending.narratorId) {
 			await narratorService.updateStatus(pending.broadcastTargetId, nextStatus, { substatus });
 		}
 	} catch {
@@ -273,6 +327,7 @@ export function createTaskReflectionDecision(
 		resolved: false,
 		startedAt: Date.now(),
 	});
+	notifyHumanAttentionChanged();
 	return promise;
 }
 
@@ -297,14 +352,15 @@ async function resolveTaskReflection(
 	// decision — only the user's approve/deny may. (Mirrors danger reflection.)
 	if (decidedBy === "reflection" && pending.reflectionStoppedByUser) return false;
 	pending.resolved = true;
+	notifyHumanAttentionChanged();
 	await markTaskReflectionStatus(pending, status, reason, nextSteps);
-	pendingTaskReflections.delete(requestId);
+	if (pendingTaskReflections.delete(requestId)) notifyHumanAttentionChanged();
 	pending.resolve(decision);
 	return true;
 }
 
 export function cleanupTaskReflection(requestId: string): void {
-	pendingTaskReflections.delete(requestId);
+	if (pendingTaskReflections.delete(requestId)) notifyHumanAttentionChanged();
 }
 
 /** Whether a task reflection is still pending (used to route user approve/deny). */
@@ -367,6 +423,7 @@ export async function takeOverTaskReflection(requestId: string, reason?: string)
 	pending.reflectionStoppedByUser = true;
 	pending.abortController?.abort(new Error(message));
 	await markTaskReflectionStatus(pending, "awaiting_user", message);
+	notifyHumanAttentionChanged();
 	return true;
 }
 

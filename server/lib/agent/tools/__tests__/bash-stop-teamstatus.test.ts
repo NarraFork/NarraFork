@@ -606,6 +606,12 @@ describe("TeamStatus actions", () => {
 		expect(result.output).toContain("worker");
 		expect(result.output).not.toContain("sub-1");
 		expect(result.output).not.toContain("foreign");
+		expect(result.metadata).toEqual({
+			kind: "send",
+			broadcast: true,
+			await: false,
+			targets: [{ id: "sub-1", label: "worker", title: "Worker", status: "queued" }],
+		});
 		expect(deliveredMessages).toHaveLength(1);
 		expect(deliveredMessages[0]).toMatchObject({
 			targetId: "sub-1",
@@ -645,6 +651,13 @@ describe("TeamStatus actions", () => {
 		expect(sent.isError).toBeFalsy();
 		// Confirmation names the target readably ("Explorer" → `explorer`).
 		expect(sent.output).toContain("explorer");
+		expect(sent.metadata).toEqual({
+			kind: "send",
+			broadcast: false,
+			await: false,
+			targets: [{ id: "sub-1", label: "explorer", title: "Explorer", status: "queued" }],
+			warning: "(warning: target is idle, message may not be received)",
+		});
 		expect(deliveredMessages[0]).toMatchObject({
 			targetId: "sub-1",
 			message: { fromType: "primary", isBroadcast: false },

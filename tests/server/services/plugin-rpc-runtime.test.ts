@@ -5,6 +5,7 @@ import {
 	type PluginProcessHandle,
 	type PluginRunner,
 	PluginRuntime,
+	type RunnerStartOptions,
 } from "../../../server/services/plugin-runtime";
 
 class RuntimeHandle implements PluginProcessHandle {
@@ -81,8 +82,10 @@ class RuntimeHandle implements PluginProcessHandle {
 
 class RuntimeRunner implements PluginRunner {
 	readonly handles: RuntimeHandle[] = [];
+	readonly starts: RunnerStartOptions[] = [];
 
-	async start(): Promise<PluginProcessHandle> {
+	async start(options: RunnerStartOptions): Promise<PluginProcessHandle> {
+		this.starts.push(options);
 		const handle = new RuntimeHandle();
 		this.handles.push(handle);
 		setTimeout(() =>
@@ -100,6 +103,33 @@ class RuntimeRunner implements PluginRunner {
 		return handle;
 	}
 }
+
+test("PluginRuntime advertises actual directional frame and writer limits", async () => {
+	const runner = new RuntimeRunner();
+	const runtime = new PluginRuntime({
+		pluginId: "com.example.runtime",
+		pluginVersion: "1.0.0",
+		command: [process.execPath, "unused"],
+		cwd: process.cwd(),
+		runner,
+		maxFrameBytes: 1024,
+		maxOutboundFrameBytes: 12 * 1024 * 1024,
+		timeouts: { handshakeMs: 500, activationMs: 500, shutdownMs: 50, drainMs: 20 },
+	});
+	try {
+		await runtime.start();
+		expect(runner.starts[0].maxOutboundBodyBytes).toBe(12 * 1024 * 1024);
+		const limits = runtime.rpcConnection?.getLimits();
+		expect(limits?.maxInboundFrameBytes).toBe(1024);
+		expect(limits?.maxQueuedBytes).toBeGreaterThan(12 * 1024 * 1024);
+		const initialize = runner.handles[0].writes.find(
+			(message) => "method" in message && message.method === "initialize",
+		);
+		expect(initialize).toMatchObject({ params: { limits } });
+	} finally {
+		await runtime.shutdown();
+	}
+});
 
 test("PluginRuntime closes the bidirectional loop with an injected Host dispatcher", async () => {
 	const runner = new RuntimeRunner();

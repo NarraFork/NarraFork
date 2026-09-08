@@ -40,6 +40,7 @@ describe("复现：截断的 bash 输出在 vlist 的 target 标记", () => {
 		expect(typeof outputJson).toBe("object");
 
 		const detail = classifyToolDetail({
+			toolUseId: "tu_repro",
 			toolName: "Bash",
 			category: "bash",
 			status: "success",
@@ -67,7 +68,7 @@ describe("复现：截断的 bash 输出在 vlist 的 target 标记", () => {
 		const targets = resolveToolDetailViewTargets("tool-tu_repro", measured, {
 			sections: { command: "Command", output: "Output" } as never,
 		});
-		const outputTarget = targets.find((t) => t.title === "Output" || t.kind === "term");
+		const outputTarget = targets.find((t) => t.model?.source === "output.main");
 		expect(outputTarget).toBeDefined();
 		expect(outputTarget?.truncated).toBe(true);
 		// 盒子高度必须是完整 cap（200px），为滚动加载预留空间
@@ -76,6 +77,7 @@ describe("复现：截断的 bash 输出在 vlist 的 target 标记", () => {
 
 	it("完整 payload 落地后 → target 不再 truncated（加载完成态）", () => {
 		const detail = classifyToolDetail({
+			toolUseId: "tu_repro",
 			toolName: "Bash",
 			category: "bash",
 			status: "success",
@@ -100,7 +102,7 @@ describe("复现：截断的 bash 输出在 vlist 的 target 标记", () => {
 		const targets = resolveToolDetailViewTargets("tool-tu_repro", measured, {
 			sections: { output: "Output" } as never,
 		});
-		const outputTarget = targets.find((t) => t.kind === "term");
+		const outputTarget = targets.find((t) => t.model?.source === "output.main");
 		expect(outputTarget).toBeDefined();
 		expect(outputTarget?.truncated).toBeUndefined();
 		// 完整文本必须到达 target（行内盒子可滚到全部内容）
@@ -113,6 +115,7 @@ describe("复现：截断的 bash 输出在 vlist 的 target 标记", () => {
 			markdownBudget: 2000,
 		});
 		const detail = classifyToolDetail({
+			toolUseId: "tu_repro",
 			toolName: "Bash",
 			category: "bash",
 			status: "success",
@@ -137,7 +140,7 @@ describe("复现：截断的 bash 输出在 vlist 的 target 标记", () => {
 		const targets = resolveToolDetailViewTargets("tool-tu_repro", measured, {
 			sections: { output: "Output" } as never,
 		});
-		const outputTarget = targets.find((t) => t.kind === "term");
+		const outputTarget = targets.find((t) => t.model?.source === "output.main");
 		expect(outputTarget?.truncated).toBe(true);
 	});
 

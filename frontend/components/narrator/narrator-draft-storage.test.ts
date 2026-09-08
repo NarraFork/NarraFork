@@ -5,7 +5,9 @@ import {
 	SESSION_STORE_LIMITS,
 	writeSession,
 } from "@frontend/lib/session-store";
+import type { FileReference } from "@shared/file-reference";
 import { getDraftImageAttachmentKey } from "./draft-image-attachments";
+import { insertFileReference } from "./file-reference-input";
 import {
 	classifyDraftRevisionConflict,
 	cleanupLegacyNarratorInputStorage,
@@ -331,5 +333,125 @@ describe("narrator draft hydration conflict resolution", () => {
 				localChangedSinceRequest: false,
 			}),
 		).toEqual({ text: "legacy local", conflict: true });
+	});
+});
+
+const ref: FileReference = {
+	id: "file-occurrence",
+	deviceId: "remote-A",
+	path: "/work/src/a.ts",
+	label: "src/a.ts",
+};
+
+describe("file references share the draft revision", () => {
+	test("mirrors and reloads complete reference metadata without a snapshot", () => {
+		const state = insertFileReference({ text: "read ", fileReferences: [] }, ref);
+		expect(
+			persistNarratorInputDraft("user-a", "n1", state.text, 4, "t4", state.fileReferences),
+		).toBe(true);
+		flush();
+		expect(readNarratorInputDraft("user-a", "n1")).toEqual({
+			text: state.text,
+			fileReferences: state.fileReferences,
+			serverRevision: 4,
+			serverUpdatedAt: "t4",
+		});
+		expect(readNarratorInputDraft("user-b", "n1").fileReferences).toBeUndefined();
+	});
+	test("keeps a reference-only draft durable and records an explicit clear tombstone", () => {
+		persistNarratorInputDraft("user-a", "n1", "", 1, "t1", [ref]);
+		flush();
+		const cap = SESSION_STORE_LIMITS.NAMESPACE_KEY_CAPS["narrator-draft"];
+		for (let i = 0; i < cap + 3; i++) {
+			persistNarratorInputDraft("user-a", `empty${i}`, "", 0, null);
+			flush();
+		}
+		expect(readNarratorInputDraft("user-a", "n1").fileReferences).toEqual([ref]);
+		persistNarratorInputDraft("user-a", "n1", "", 2, "t2", []);
+		flush();
+		expect(readNarratorInputDraft("user-a", "n1")).toEqual({
+			text: "",
+			serverRevision: 2,
+			serverUpdatedAt: "t2",
+		});
+	});
+	test("keeps metadata-only unsynced edits on the same CAS base", () => {
+		expect(
+			resolveHydratedNarratorDraft({
+				local: { text: "same", fileReferences: [ref], serverRevision: 7, serverUpdatedAt: null },
+				serverText: "same",
+				serverFileReferences: [],
+				serverRevision: 7,
+				currentInput: "same",
+				currentFileReferences: [ref],
+				localChangedSinceRequest: false,
+			}),
+		).toEqual({ text: "same", fileReferences: [ref], conflict: false });
+	});
+	test("metadata changed while loading conflicts even when the text is unchanged", () => {
+		expect(
+			resolveHydratedNarratorDraft({
+				local: { text: "same", serverRevision: 7, serverUpdatedAt: null },
+				serverText: "same",
+				serverFileReferences: [{ ...ref, deviceId: "remote-B" }],
+				serverRevision: 8,
+				currentInput: "same",
+				currentFileReferences: [ref],
+				localChangedSinceRequest: true,
+			}),
+		).toEqual({ text: "same", fileReferences: [ref], conflict: true });
+	});
+	test("identical text and refs advanced elsewhere do not cause a false conflict", () => {
+		expect(
+			resolveHydratedNarratorDraft({
+				local: { text: "same", serverRevision: 7, serverUpdatedAt: null },
+				serverText: "same",
+				serverFileReferences: [ref],
+				serverRevision: 8,
+				currentInput: "same",
+				currentFileReferences: [ref],
+				localChangedSinceRequest: true,
+			}).conflict,
+		).toBe(false);
+	});
+	test("a newer clear removes stale reference-only drafts", () => {
+		expect(
+			resolveHydratedNarratorDraft({
+				local: { text: "", fileReferences: [ref], serverRevision: 7, serverUpdatedAt: null },
+				serverText: "",
+				serverFileReferences: [],
+				serverRevision: 8,
+				currentInput: "",
+				currentFileReferences: [ref],
+				localChangedSinceRequest: false,
+			}),
+		).toEqual({ text: "", conflict: false });
+	});
+	test("old string-only envelopes restore no implicit #file references", () => {
+		writeSession(
+			"narrator-draft",
+			getNarratorDraftStorageId("user-a", "n1"),
+			JSON.stringify({
+				version: 2,
+				text: "#file:src/a.ts",
+				serverRevision: 1,
+				serverUpdatedAt: null,
+			}),
+		);
+		expect(readNarratorInputDraft("user-a", "n1").fileReferences).toBeUndefined();
+	});
+	test("oversized reference metadata removes stale mirrors, not just its reference prefix", () => {
+		persistNarratorInputDraft("user-a", "n1", "short", 1, null);
+		expect(
+			persistNarratorInputDraft(
+				"user-a",
+				"n1",
+				"short",
+				1,
+				null,
+				Array.from({ length: 17 }, (_, i) => ({ ...ref, id: String(i) })),
+			),
+		).toBe(false);
+		expect(readNarratorInputDraft("user-a", "n1").text).toBe("");
 	});
 });

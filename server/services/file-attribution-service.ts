@@ -216,9 +216,13 @@ export async function recordAttribution(input: RecordAttributionInput): Promise<
 		if (input.narratorId && subagentType == null) {
 			const n = await db.query.narrators.findFirst({
 				where: eq(narrators.id, input.narratorId),
-				columns: { type: true, subagentType: true },
+				columns: { type: true, variant: true, subagentType: true },
 			});
-			if (n?.type === "subagent") {
+			// Preserve the authoritative subtype on the event before a later FK deletion
+			// can remove the narrator row. Legacy type/subagentType may not be populated.
+			if (n?.variant.startsWith("subagent:")) {
+				subagentType = n.variant.slice("subagent:".length) || n.subagentType || "subagent";
+			} else if (n?.type === "subagent" || n?.variant === "subagent") {
 				subagentType = n.subagentType ?? "subagent";
 			}
 		}
@@ -274,9 +278,13 @@ export async function recordAttributions(
 		if (base.narratorId && subagentType == null) {
 			const n = await db.query.narrators.findFirst({
 				where: eq(narrators.id, base.narratorId),
-				columns: { type: true, subagentType: true },
+				columns: { type: true, variant: true, subagentType: true },
 			});
-			if (n?.type === "subagent") {
+			// Preserve the authoritative subtype on the event before a later FK deletion
+			// can remove the narrator row. Legacy type/subagentType may not be populated.
+			if (n?.variant.startsWith("subagent:")) {
+				subagentType = n.variant.slice("subagent:".length) || n.subagentType || "subagent";
+			} else if (n?.type === "subagent" || n?.variant === "subagent") {
 				subagentType = n.subagentType ?? "subagent";
 			}
 		}
@@ -288,6 +296,7 @@ export async function recordAttributions(
 			workspacePath,
 			filePath,
 			narratorId: base.narratorId ?? null,
+			userId: base.userId ?? null,
 			subagentType,
 			action: base.action,
 			toolName: base.toolName ?? null,

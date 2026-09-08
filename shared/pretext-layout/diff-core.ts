@@ -19,18 +19,96 @@
  *
  * Every bound here is deliberate — an Edit payload can be megabytes, and this
  * runs on the layout path:
- *   MAX_DIFF_INPUT_CHARS  — past this, skip the diff and show a bounded preview
- *   MAX_DIFF_LINES        — hard ceiling on emitted rows
+ *   MAX_DIFF_INPUT_CHARS  — retained source budget for the line-level diff
+ *   MAX_DIFF_LINES        — hard ceiling on each viewport's projected rows
  *   MAX_WORD_DIFF_CHARS   — per-line ceiling for the (quadratic) word diff
  *   MAX_DIFF_LINE_CHARS   — per-line content clamp
  *
- * `computeDiffCached` additionally memoizes the whole computation, because the
- * layout adapter re-classifies EVERY tool card on every rebuild (LOD step, width
- * change, each live patch) while the underlying Edit payload never changes. See
- * the cache block below.
+ * `createDiffDocument` memoizes source snapshots and line runs, because the layout
+ * adapter re-classifies every tool card on rebuilds (LOD, width, live patches).
+ * Each viewport projects its own bounded rows and word changes; none of those
+ * reader-dependent objects belongs in the shared source cache.
  */
 
 import { diffLines as computeLineDiff, diffWordsWithSpace } from "diff";
+import {
+	createSourceText,
+	normalizeSourceText,
+	type SourceTextRange,
+	type SourceTextSnapshot,
+	trimSourceText,
+} from "./source-text";
+
+export type { SourceTextRange } from "./source-text";
+
+export interface DiffSourcePoint {
+	side: "old" | "new";
+	epoch: string;
+	/** Zero-based normalized parameter coordinates, NOT file line numbers. */
+	line: number;
+	column: number;
+	offset: number;
+}
+
+export interface DiffProjectedLine extends DiffLine {
+	key: string;
+	oldPoint?: DiffSourcePoint;
+	newPoint?: DiffSourcePoint;
+	/** Zero-based row in the shared document, independent of any viewport. */
+	row: number;
+}
+
+export interface DiffSourceSnapshot extends SourceTextSnapshot {
+	/** Offsets of retained lines; no per-line word diffs live in the document. */
+	lineStarts: readonly number[];
+}
+
+export interface DiffRun {
+	type: "context" | "removed" | "added" | "paired";
+	startRow: number;
+	rowCount: number;
+	oldStart: number;
+	newStart: number;
+	count: number;
+}
+
+export interface DiffDocument {
+	revision: string;
+	focus: DiffSourcePoint | null;
+	oldSource: DiffSourceSnapshot;
+	newSource: DiffSourceSnapshot;
+	runs: readonly DiffRun[];
+	totalRows: number;
+	/** Defined only when the file origin was provided by the caller. */
+	startLine?: number;
+	/** Missing source data / bounded calculation; NOT a viewport's row limit. */
+	truncated: boolean;
+	omission: "source-range" | "input-budget" | "diff-budget" | null;
+}
+
+export interface DiffDocumentInput {
+	oldText: string;
+	newText: string;
+	oldRange?: SourceTextRange;
+	newRange?: SourceTextRange;
+	focusSide?: "old" | "new";
+	startLine?: number;
+}
+
+export interface DiffProjection {
+	lines: DiffProjectedLine[];
+	focusIndex: number;
+	anchorIndex: number;
+	/** Resolved (possibly clamped/remapped) viewport anchor. */
+	anchor: DiffSourcePoint | null;
+	anchorLost: boolean;
+	anchorLossReason: "range" | "epoch" | "side" | null;
+	startRow: number;
+	beforeRows: number;
+	afterRows: number;
+	totalRows: number;
+	truncated: boolean;
+}
 
 /** One word-level chunk inside a modified line. */
 export interface DiffWordChange {
@@ -58,9 +136,7 @@ export const MAX_WORD_DIFF_CHARS = 4_000;
 export const MAX_DIFF_LINE_CHARS = 4_000;
 
 /** Normalize line endings so CRLF/CR vs LF never shows up as a content edit. */
-export function normalizeDiffLineEndings(value: string): string {
-	return value.replace(/\r\n?/g, "\n");
-}
+export const normalizeDiffLineEndings = normalizeSourceText;
 
 function clampLineContent(line: string): string {
 	return line.length > MAX_DIFF_LINE_CHARS ? `${line.slice(0, MAX_DIFF_LINE_CHARS)} …` : line;
@@ -82,7 +158,7 @@ export function clampDiffLineContent(line: string): string {
  * large to diff.
  *
  * Extracted so BOTH row producers share one definition of "what changed inside a
- * modified line": `computeDiff` (two texts) and `parseUnifiedDiff` (a patch).
+ * modified line": `projectDiffDocument` (two texts) and `parseUnifiedDiff` (a patch).
  * The word diff is quadratic, hence the `MAX_WORD_DIFF_CHARS` budget over the
  * combined length — returning null tells the caller to emit plain rows.
  */
@@ -106,166 +182,460 @@ function splitIntoLines(value: string): string[] {
 	return lines.map(clampLineContent);
 }
 
-function appendPreviewLines(
-	value: string,
-	type: "removed" | "added",
-	startLine: number,
-	maxLines: number,
-	result: DiffLine[],
-) {
-	let lineNo = startLine;
-	let start = 0;
-	while (start <= value.length && result.length < maxLines) {
-		const newline = value.indexOf("\n", start);
-		const end = newline === -1 ? value.length : newline;
-		const rawContent = value.slice(start, end);
-		result.push({
-			type,
-			content: clampLineContent(rawContent),
-			oldLineNo: type === "removed" ? lineNo : undefined,
-			newLineNo: type === "added" ? lineNo : undefined,
-		});
-		lineNo++;
-		start = newline === -1 ? value.length + 1 : newline + 1;
+function sourceSnapshot(
+	text: string,
+	range: SourceTextRange | undefined,
+	limit: number,
+): DiffSourceSnapshot {
+	const source = range
+		? trimSourceText({ text, range }, limit)
+		: createSourceText(text, { epoch: "source", complete: true, limit });
+	const normalized = normalizeSourceText(source.text);
+	const lineStarts: number[] = [];
+	if (normalized.length) {
+		lineStarts.push(0);
+		for (let i = 0; i < normalized.length - 1; i++) {
+			if (normalized.charCodeAt(i) === 10) lineStarts.push(i + 1);
+		}
 	}
+	const retainedRange = { ...source.range };
+	if (retainedRange.remap) retainedRange.remap = Object.freeze({ ...retainedRange.remap });
+	return Object.freeze({
+		text: normalized,
+		range: Object.freeze(retainedRange),
+		lineStarts: Object.freeze(lineStarts),
+	});
 }
 
-function buildLargeInputPreview(oldStr: string, newStr: string, startLine: number): DiffLine[] {
-	const result: DiffLine[] = [
-		{
-			type: "context",
-			content:
-				"... diff input too large; showing a bounded preview without full diff computation ...",
-		},
-	];
-	const perSide = Math.floor((MAX_DIFF_LINES - result.length) / 2);
-	appendPreviewLines(oldStr, "removed", startLine, perSide, result);
-	appendPreviewLines(newStr, "added", startLine, MAX_DIFF_LINES - result.length, result);
-	return result;
+function lineEnd(source: DiffSourceSnapshot, line: number): number {
+	const end = source.lineStarts[line + 1] ?? source.text.length;
+	return source.text.charCodeAt(end - 1) === 10 ? end - 1 : end;
 }
 
-/**
- * Compute the diff rows between two texts.
- *
- * @param startLine 1-based line number the OLD text starts at in its file
- */
-export function computeDiff(oldStr: string, newStr: string, startLine = 1): DiffLine[] {
-	const normalizedOldStr = normalizeDiffLineEndings(oldStr);
-	const normalizedNewStr = normalizeDiffLineEndings(newStr);
+function lineContent(source: DiffSourceSnapshot, line: number): string {
+	return source.text.slice(source.lineStarts[line] ?? 0, lineEnd(source, line));
+}
 
-	if (normalizedOldStr.length + normalizedNewStr.length > MAX_DIFF_INPUT_CHARS) {
-		return buildLargeInputPreview(normalizedOldStr, normalizedNewStr, startLine);
-	}
-
-	const changes = computeLineDiff(normalizedOldStr, normalizedNewStr);
-	const result: DiffLine[] = [];
-	let oldLine = startLine;
-	let newLine = startLine;
-	const appendLine = (line: DiffLine): boolean => {
-		if (result.length >= MAX_DIFF_LINES) return false;
-		result.push(line);
-		return true;
+function sourcePoint(
+	source: DiffSourceSnapshot,
+	side: DiffSourcePoint["side"],
+	index: number,
+	column?: number,
+): DiffSourcePoint {
+	const firstColumn = index === 0 ? source.range.startColumn : 0;
+	const resolvedColumn = Math.max(
+		firstColumn,
+		Math.min(
+			column ?? firstColumn,
+			firstColumn + lineEnd(source, index) - (source.lineStarts[index] ?? 0),
+		),
+	);
+	return {
+		side,
+		epoch: source.range.epoch,
+		line: source.range.startLine + index,
+		column: resolvedColumn,
+		offset:
+			source.range.startOffset + (source.lineStarts[index] ?? 0) + resolvedColumn - firstColumn,
 	};
+}
 
-	for (let i = 0; i < changes.length; i++) {
-		if (result.length >= MAX_DIFF_LINES) break;
-		const change = changes[i];
-		if (!change) continue;
+/** Stable across base-cache eviction; only bounded retained sources are hashed. */
+function diffDocumentRevision(
+	doc: DiffDocument,
+	focusSide: DiffDocumentInput["focusSide"],
+): string {
+	let first = 0x811c9dc5;
+	let second = 0x9e3779b9;
+	const mix = (value: number) => {
+		first = Math.imul(first ^ value, 0x01000193);
+		second = Math.imul(second ^ value, 0x5bd1e995);
+	};
+	const text = (value: string) => {
+		mix(value.length);
+		for (let i = 0; i < value.length; i++) mix(value.charCodeAt(i));
+	};
+	// Canonical field order also makes equivalent deserialized ranges stable.
+	const range = (value: SourceTextRange) => [
+		value.epoch,
+		value.startOffset,
+		value.endOffset,
+		value.startLine,
+		value.startColumn,
+		value.endLine,
+		value.endColumn,
+		value.originKnown,
+		value.complete,
+		value.endsWithCR ?? false,
+		value.remap
+			? [
+					value.remap.fromEpoch,
+					value.remap.fromStartOffset,
+					value.remap.fromEndOffset,
+					value.remap.fromStartLine,
+					value.remap.offsetDelta,
+					value.remap.lineDelta,
+					value.remap.columnDelta,
+				]
+			: null,
+	];
+	text(doc.oldSource.text);
+	text(doc.newSource.text);
+	text(
+		JSON.stringify([
+			range(doc.oldSource.range),
+			range(doc.newSource.range),
+			doc.startLine ?? null,
+			focusSide ?? null,
+			doc.focus,
+			doc.omission,
+			doc.totalRows,
+		]),
+	);
+	return `diff:${(first >>> 0).toString(16).padStart(8, "0")}${(second >>> 0).toString(16).padStart(8, "0")}`;
+}
 
-		if (!change.added && !change.removed) {
-			for (const line of splitIntoLines(change.value)) {
-				if (
-					!appendLine({ type: "context", content: line, oldLineNo: oldLine, newLineNo: newLine })
-				) {
-					return result;
-				}
-				oldLine++;
-				newLine++;
-			}
-			continue;
-		}
-
-		if (change.removed) {
-			const next = changes[i + 1];
-			if (next?.added) {
-				// A modification: pair removed/added lines and diff them word-wise so
-				// the render layer can tint only what actually changed.
-				const removedLines = splitIntoLines(change.value);
-				const addedLines = splitIntoLines(next.value);
-				const maxPaired = Math.min(removedLines.length, addedLines.length);
-
-				for (let j = 0; j < maxPaired; j++) {
-					const removedLine = removedLines[j] ?? "";
-					const addedLine = addedLines[j] ?? "";
-					const wc = pairWordChanges(removedLine, addedLine);
-					if (
-						!appendLine({
-							type: "removed",
-							content: removedLine,
-							wordChanges: wc?.removed,
-							oldLineNo: oldLine,
-						})
-					) {
-						return result;
-					}
-					oldLine++;
-					if (
-						!appendLine({
-							type: "added",
-							content: addedLine,
-							wordChanges: wc?.added,
-							newLineNo: newLine,
-						})
-					) {
-						return result;
-					}
-					newLine++;
-				}
-				for (let j = maxPaired; j < removedLines.length; j++) {
-					if (
-						!appendLine({ type: "removed", content: removedLines[j] ?? "", oldLineNo: oldLine })
-					) {
-						return result;
-					}
-					oldLine++;
-				}
-				for (let j = maxPaired; j < addedLines.length; j++) {
-					if (!appendLine({ type: "added", content: addedLines[j] ?? "", newLineNo: newLine })) {
-						return result;
-					}
-					newLine++;
-				}
-				i++; // the added chunk was consumed as this modification's other half
-			} else {
-				for (const line of splitIntoLines(change.value)) {
-					if (!appendLine({ type: "removed", content: line, oldLineNo: oldLine })) return result;
-					oldLine++;
-				}
-			}
-			continue;
-		}
-
-		// A pure addition (no preceding removal).
-		for (const line of splitIntoLines(change.value)) {
-			if (!appendLine({ type: "added", content: line, newLineNo: newLine })) return result;
-			newLine++;
-		}
+/** One bounded source model, shared by inline and fullscreen; no viewport state. */
+export function createDiffDocument(input: DiffDocumentInput): DiffDocument {
+	// The usual hit samples a bounded key and confirms exact strings BEFORE scanning
+	// coordinates/normalizing. Oversized original strings are never retained here.
+	const rawKey =
+		input.oldText.length + input.newText.length <= MAX_DIFF_INPUT_CHARS
+			? `raw:${diffCacheKey(input.oldText, input.newText, input.startLine ?? 0)}\u0000${JSON.stringify([input.oldRange, input.newRange, input.focusSide])}`
+			: null;
+	const rawHit = rawKey === null ? undefined : documentCache.get(rawKey);
+	if (rawKey !== null && rawHit?.oldText === input.oldText && rawHit.newText === input.newText) {
+		documentCache.delete(rawKey);
+		documentCache.set(rawKey, rawHit);
+		return rawHit.doc;
 	}
+	const half = MAX_DIFF_INPUT_CHARS / 2;
+	const oldLimit = Math.max(half, MAX_DIFF_INPUT_CHARS - input.newText.length);
+	const newLimit = Math.max(half, MAX_DIFF_INPUT_CHARS - input.oldText.length);
+	const oldSource = sourceSnapshot(input.oldText, input.oldRange, oldLimit);
+	const newSource = sourceSnapshot(input.newText, input.newRange, newLimit);
+	const key =
+		rawKey ??
+		`bounded:${diffCacheKey(oldSource.text, newSource.text, input.startLine ?? 0)}\u0000${JSON.stringify([oldSource.range, newSource.range, input.focusSide])}`;
+	const hit = documentCache.get(key);
+	if (!rawKey && hit?.oldText === oldSource.text && hit.newText === newSource.text) {
+		documentCache.delete(key);
+		documentCache.set(key, hit);
+		return hit.doc;
+	}
+	const runs: DiffRun[] = [];
+	let oldStart = 0;
+	let newStart = 0;
+	let totalRows = 0;
+	const take = (type: DiffRun["type"], count: number) => {
+		if (!count) return;
+		const rowCount = type === "paired" ? count * 2 : count;
+		runs.push({ type, count, rowCount, startRow: totalRows, oldStart, newStart });
+		if (type !== "added") oldStart += count;
+		if (type !== "removed") newStart += count;
+		totalRows += rowCount;
+	};
+	let omission: DiffDocument["omission"] =
+		input.oldText.length > oldLimit || input.newText.length > newLimit
+			? "input-budget"
+			: !oldSource.range.complete || !newSource.range.complete
+				? "source-range"
+				: null;
+	const changes = computeLineDiff(oldSource.text, newSource.text, {
+		timeout: DIFF_STATS_TIMEOUT_MS,
+		maxEditLength: DIFF_STATS_MAX_EDIT_LENGTH,
+	});
+	if (changes) {
+		for (let i = 0; i < changes.length; i++) {
+			const change = changes[i];
+			if (!change) continue;
+			const next = changes[i + 1];
+			if (change.removed && next?.added) {
+				const pairs = Math.min(change.count, next.count);
+				take("paired", pairs);
+				take("removed", change.count - pairs);
+				take("added", next.count - pairs);
+				i++;
+			} else take(change.added ? "added" : change.removed ? "removed" : "context", change.count);
+		}
+	} else {
+		// The same replacement pairing, explicitly approximate rather than false context.
+		omission = omission === "input-budget" ? omission : "diff-budget";
+		const pairs = Math.min(oldSource.lineStarts.length, newSource.lineStarts.length);
+		take("paired", pairs);
+		take("removed", oldSource.lineStarts.length - pairs);
+		take("added", newSource.lineStarts.length - pairs);
+	}
+	const doc: DiffDocument = {
+		revision: "",
+		focus: null,
+		oldSource,
+		newSource,
+		runs,
+		totalRows,
+		startLine: input.startLine,
+		truncated: omission !== null,
+		omission,
+	};
+	if (input.focusSide) {
+		const side =
+			input.focusSide === "new" && !newSource.lineStarts.length ? "old" : input.focusSide;
+		const source = side === "old" ? oldSource : newSource;
+		if (source.lineStarts.length) {
+			doc.focus = sourcePoint(source, side, source.lineStarts.length - 1, Number.MAX_SAFE_INTEGER);
+		}
+	} else {
+		// Static/final data focus is the last changed new row, not a suffix of deletions.
+		const changed = runs.findLast((run) => run.type === "added" || run.type === "paired");
+		const removed = changed ? undefined : runs.findLast((run) => run.type === "removed");
+		const target = changed ?? removed;
+		if (target) {
+			const side = changed ? "new" : "old";
+			const source = changed ? newSource : oldSource;
+			const index = (changed ? target.newStart : target.oldStart) + target.count - 1;
+			doc.focus = sourcePoint(source, side, index, Number.MAX_SAFE_INTEGER);
+		} else doc.focus = getDiffRowAnchor(doc, totalRows - 1);
+	}
+	// Cache residency is not a content version. Compute this only after both miss
+	// paths, from the <=240k source snapshots rather than the original payload.
+	doc.revision = diffDocumentRevision(doc, input.focusSide);
+	for (const run of runs) Object.freeze(run);
+	Object.freeze(runs);
+	if (doc.focus) Object.freeze(doc.focus);
+	Object.freeze(doc);
+	const oldText = rawKey ? input.oldText : oldSource.text;
+	const newText = rawKey ? input.newText : newSource.text;
+	const cost = oldText.length + newText.length + oldSource.text.length + newSource.text.length;
+	if (hit) documentCacheChars -= hit.cost;
+	documentCache.set(key, { doc, oldText, newText, cost });
+	documentCacheChars += cost;
+	while (documentCache.size > DIFF_CACHE_MAX_ENTRIES || documentCacheChars > DIFF_CACHE_MAX_CHARS) {
+		const oldest = documentCache.entries().next().value;
+		if (!oldest) break;
+		documentCache.delete(oldest[0]);
+		documentCacheChars -= oldest[1].cost;
+	}
+	return doc;
+}
 
-	return result;
+function runForRow(doc: DiffDocument, row: number): DiffRun | undefined {
+	let low = 0;
+	let high = doc.runs.length;
+	while (low < high) {
+		const mid = (low + high) >>> 1;
+		if ((doc.runs[mid]?.startRow ?? 0) <= row) low = mid + 1;
+		else high = mid;
+	}
+	return doc.runs[low - 1];
+}
+
+function rowPoints(doc: DiffDocument, row: number) {
+	const run = runForRow(doc, row);
+	if (!run || row < 0 || row >= doc.totalRows) return null;
+	const relative = row - run.startRow;
+	const index = run.type === "paired" ? Math.floor(relative / 2) : relative;
+	const type = run.type === "paired" ? (relative % 2 ? "added" : "removed") : run.type;
+	return {
+		run,
+		index,
+		type,
+		oldPoint:
+			type === "added" ? undefined : sourcePoint(doc.oldSource, "old", run.oldStart + index),
+		newPoint:
+			type === "removed" ? undefined : sourcePoint(doc.newSource, "new", run.newStart + index),
+	};
+}
+
+/** Cheap row → source mapping for scroll/virtualization, without word diff work. */
+export function getDiffRowAnchor(
+	doc: DiffDocument,
+	row: number,
+	sidePreference: "old" | "new" = "new",
+): DiffSourcePoint | null {
+	const points = rowPoints(doc, row);
+	return (
+		(sidePreference === "old" ? points?.oldPoint : points?.newPoint) ??
+		points?.newPoint ??
+		points?.oldPoint ??
+		null
+	);
+}
+
+/** Bounded measurement probe; does not materialize a projected row or word diff. */
+export function readDiffRowContent(doc: DiffDocument, row: number): string | null {
+	const points = rowPoints(doc, row);
+	if (!points) return null;
+	return clampLineContent(
+		lineContent(
+			points.newPoint ? doc.newSource : doc.oldSource,
+			(points.newPoint ? points.run.newStart : points.run.oldStart) + points.index,
+		),
+	);
+}
+
+/** The shared gutter width comes from source coordinates, not a reader window. */
+export function diffDocumentLineNoWidth(
+	doc: DiffDocument,
+	lineNumberPrefix?: string,
+	minWidth = DIFF_LINE_NO_MIN_WIDTH,
+): number {
+	let max = 1;
+	for (const source of [doc.oldSource, doc.newSource]) {
+		const base = doc.startLine !== undefined && source.range.originKnown ? doc.startLine : 1;
+		max = Math.max(max, source.range.startLine + Math.max(0, source.lineStarts.length - 1) + base);
+	}
+	return Math.max(minWidth, `${lineNumberPrefix ?? ""}${max}`.length);
+}
+
+export interface DiffPointResolution {
+	row: number;
+	point: DiffSourcePoint | null;
+	lost: boolean;
+	reason: DiffProjection["anchorLossReason"];
+}
+
+export function resolveDiffSourcePoint(
+	doc: DiffDocument,
+	anchor: DiffSourcePoint,
+): DiffPointResolution {
+	const source = anchor.side === "old" ? doc.oldSource : doc.newSource;
+	const fallback = (reason: DiffPointResolution["reason"]): DiffPointResolution => ({
+		row: doc.totalRows ? 0 : -1,
+		point: getDiffRowAnchor(doc, 0),
+		lost: true,
+		reason,
+	});
+	if (!source.lineStarts.length) return fallback("side");
+	let point = anchor;
+	if (point.epoch !== source.range.epoch) {
+		const remap = source.range.remap;
+		if (
+			!remap ||
+			point.epoch !== remap.fromEpoch ||
+			point.offset < remap.fromStartOffset ||
+			point.offset > remap.fromEndOffset
+		)
+			return fallback("epoch");
+		point = {
+			...point,
+			epoch: source.range.epoch,
+			offset: point.offset + remap.offsetDelta,
+			line: point.line + remap.lineDelta,
+			column: point.column + (point.line === remap.fromStartLine ? remap.columnDelta : 0),
+		};
+	}
+	const index = Math.max(
+		0,
+		Math.min(source.lineStarts.length - 1, point.line - source.range.startLine),
+	);
+	const resolved = sourcePoint(source, point.side, index, point.column);
+	const lost = resolved.line !== point.line || resolved.column !== point.column;
+	let low = 0;
+	let high = doc.runs.length;
+	const sideStart = point.side === "old" ? "oldStart" : "newStart";
+	while (low < high) {
+		const mid = (low + high) >>> 1;
+		if ((doc.runs[mid]?.[sideStart] ?? 0) <= index) low = mid + 1;
+		else high = mid;
+	}
+	const run = doc.runs[low - 1];
+	if (!run) return fallback("side");
+	const inRun = index - run[sideStart];
+	const row =
+		run.startRow + (run.type === "paired" ? inRun * 2 + (point.side === "new" ? 1 : 0) : inRun);
+	return { row, point: resolved, lost, reason: lost ? "range" : null };
+}
+
+/** Each caller owns its <=500 rows, word diffs and reading anchor. Never cached. */
+export function projectDiffDocument(
+	doc: DiffDocument,
+	options: { anchor?: DiffSourcePoint | null; startRow?: number; limit?: number } = {},
+): DiffProjection {
+	const requestedLimit = options.limit ?? MAX_DIFF_LINES;
+	const limit = Number.isFinite(requestedLimit)
+		? Math.max(1, Math.min(MAX_DIFF_LINES, Math.trunc(requestedLimit)))
+		: MAX_DIFF_LINES;
+	const wanted = options.anchor ?? doc.focus;
+	const resolution = wanted
+		? resolveDiffSourcePoint(doc, wanted)
+		: { row: -1, point: null, lost: false, reason: null };
+	const startRow = Math.max(
+		0,
+		Math.min(
+			Math.max(0, doc.totalRows - limit),
+			Math.trunc(options.startRow ?? resolution.row - Math.floor(limit / 2)),
+		),
+	);
+	const endRow = Math.min(doc.totalRows, startRow + limit);
+	const lines: DiffProjectedLine[] = [];
+	const words = new Map<number, ReturnType<typeof pairWordChanges>>();
+	for (let row = startRow; row < endRow; row++) {
+		const points = rowPoints(doc, row);
+		if (!points) continue;
+		const { type, oldPoint, newPoint, run, index } = points;
+		let wordChanges: DiffWordChange[] | undefined;
+		if (run.type === "paired") {
+			const key = run.startRow + index * 2;
+			if (!words.has(key))
+				words.set(
+					key,
+					pairWordChanges(
+						lineContent(doc.oldSource, run.oldStart + index),
+						lineContent(doc.newSource, run.newStart + index),
+					),
+				);
+			const pair = words.get(key);
+			wordChanges = type === "removed" ? pair?.removed : pair?.added;
+		}
+		const point = newPoint ?? oldPoint;
+		if (!point) continue;
+		const number = (p: DiffSourcePoint | undefined, source: DiffSourceSnapshot) =>
+			p
+				? p.line + (doc.startLine !== undefined && source.range.originKnown ? doc.startLine : 1)
+				: undefined;
+		lines.push({
+			type,
+			content: clampLineContent(
+				lineContent(
+					newPoint ? doc.newSource : doc.oldSource,
+					newPoint ? run.newStart + index : run.oldStart + index,
+				),
+			),
+			wordChanges,
+			oldLineNo: number(oldPoint, doc.oldSource),
+			newLineNo: number(newPoint, doc.newSource),
+			key: `${point.side}:${point.epoch}:${point.line}`,
+			oldPoint,
+			newPoint,
+			row,
+		});
+	}
+	const focusRow = doc.focus ? resolveDiffSourcePoint(doc, doc.focus).row : -1;
+	const local = (row: number) => (row >= startRow && row < endRow ? row - startRow : -1);
+	return {
+		lines,
+		focusIndex: local(focusRow),
+		anchorIndex: local(resolution.row),
+		anchor: resolution.point,
+		anchorLost: resolution.lost,
+		anchorLossReason: resolution.reason,
+		startRow,
+		beforeRows: startRow,
+		afterRows: doc.totalRows - endRow,
+		totalRows: doc.totalRows,
+		truncated: doc.truncated || startRow > 0 || endRow < doc.totalRows,
+	};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Memoized entry point.
+// Shared source-document cache.
 //
-// Why this exists: `classifyToolDetail` runs for EVERY tool card on EVERY layout
-// rebuild, and a rebuild is triggered by an LOD step, a width change, and each
-// live lifecycle patch. The measurement cache does not help here — it caches the
-// measured height, not the adapter output — so a session with a handful of large
-// Edits paid a full `diffLines` + per-line `diffWordsWithSpace` for each of them
-// on every patch (measured: ~79ms for one 400-line Edit).
+// `classifyToolDetail` runs for every tool card on layout rebuilds. The source
+// cache avoids redoing line-level diff work for unchanged inputs, while each
+// viewport independently owns its bounded row/word projection. Source snapshots
+// and runs are immutable, so a cache hit is reusable by multiple viewports.
 //
-// An Edit payload is immutable once persisted, so the memo hit rate is ~100%.
+// Eviction affects residency only, never the document's content revision.
 //
 // Key construction must not itself be O(input): hashing a 240KB string on every
 // lookup would just trade one cost for another. So the bucket key is built from
@@ -276,21 +646,17 @@ export function computeDiff(oldStr: string, newStr: string, startLine = 1): Diff
 // a sample collision degrades to a recompute, never to a wrong diff.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Bucket entries retained. Small: a 500-row diff with word changes is not tiny. */
+/** Retained source documents; the separate character budget also bounds large edits. */
 const DIFF_CACHE_MAX_ENTRIES = 192;
-/** Total retained rows, so many large diffs cannot pin an unbounded heap. */
-const DIFF_CACHE_MAX_ROWS = 24_000;
 /** Chars sampled per side when building a bucket key. */
 const DIFF_CACHE_SAMPLE_CHARS = 32;
-
-interface DiffCacheEntry {
-	oldStr: string;
-	newStr: string;
-	lines: DiffLine[];
-}
-
-const diffCache = new Map<string, DiffCacheEntry>();
-let diffCacheRows = 0;
+/** Source/run cache only: no 500-row projections, words, geometry or reader state. */
+const DIFF_CACHE_MAX_CHARS = MAX_DIFF_INPUT_CHARS * 10;
+const documentCache = new Map<
+	string,
+	{ doc: DiffDocument; oldText: string; newText: string; cost: number }
+>();
+let documentCacheChars = 0;
 
 /** Head + middle + tail sample of `value`, at a fixed cost regardless of length. */
 function sampleForKey(value: string): string {
@@ -305,45 +671,6 @@ function sampleForKey(value: string): string {
 
 function diffCacheKey(oldStr: string, newStr: string, startLine: number): string {
 	return `${startLine}\u0000${oldStr.length}\u0000${newStr.length}\u0000${sampleForKey(oldStr)}\u0000${sampleForKey(newStr)}`;
-}
-
-/** Drop least-recently-used entries until both bounds hold. */
-function evictDiffCache() {
-	while (
-		diffCache.size > DIFF_CACHE_MAX_ENTRIES ||
-		(diffCacheRows > DIFF_CACHE_MAX_ROWS && diffCache.size > 1)
-	) {
-		// Map iteration is insertion-ordered, and a hit re-inserts, so the first key
-		// is the least recently used one.
-		const oldest = diffCache.keys().next();
-		if (oldest.done) return;
-		const entry = diffCache.get(oldest.value);
-		diffCache.delete(oldest.value);
-		if (entry) diffCacheRows -= entry.lines.length;
-	}
-}
-
-/**
- * `computeDiff` with a bounded memo on `(oldStr, newStr, startLine)`.
- *
- * The returned array is SHARED between callers and must be treated as read-only
- * (`DiffLine[]` is only ever read by the measure and render layers).
- */
-export function computeDiffCached(oldStr: string, newStr: string, startLine = 1): DiffLine[] {
-	const key = diffCacheKey(oldStr, newStr, startLine);
-	const hit = diffCache.get(key);
-	if (hit && hit.oldStr === oldStr && hit.newStr === newStr) {
-		// Refresh recency.
-		diffCache.delete(key);
-		diffCache.set(key, hit);
-		return hit.lines;
-	}
-	const lines = computeDiff(oldStr, newStr, startLine);
-	if (hit) diffCacheRows -= hit.lines.length;
-	diffCache.set(key, { oldStr, newStr, lines });
-	diffCacheRows += lines.length;
-	evictDiffCache();
-	return lines;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -389,7 +716,7 @@ const DIFF_STATS_MAX_EDIT_LENGTH = 20_000;
  * Rendering `+0 -0` for either case would state that the call changed nothing,
  * which is a worse error than saying nothing at all.
  *
- * Cheaper than `computeDiff` on purpose: it accumulates the per-change `count`
+ * Independent of row projection: it accumulates the per-change `count`
  * and never runs the (quadratic) word diff, because nothing here needs to know
  * WHICH parts of a line changed.
  *
@@ -427,15 +754,15 @@ export function countTextLines(value: string): number {
 	return splitIntoLines(normalizeDiffLineEndings(value)).length;
 }
 
-/** Test hook: forget every memoized diff. */
-export function resetDiffCache() {
-	diffCache.clear();
-	diffCacheRows = 0;
+/** Test hook: forget every memoized source document. */
+export function resetDiffDocumentCache() {
+	documentCache.clear();
+	documentCacheChars = 0;
 }
 
-/** Test hook: current memo occupancy. */
-export function diffCacheStats(): { entries: number; rows: number } {
-	return { entries: diffCache.size, rows: diffCacheRows };
+/** Test hook: source-cache occupancy; projected rows are never retained here. */
+export function diffDocumentCacheStats(): { entries: number; chars: number } {
+	return { entries: documentCache.size, chars: documentCacheChars };
 }
 
 /**

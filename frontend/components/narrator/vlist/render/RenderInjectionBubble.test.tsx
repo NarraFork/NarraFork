@@ -15,22 +15,27 @@
  *      is reserved for the reader's own turns.
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { I18nextProvider } from "react-i18next";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 
 beforeAll(() => {
 	installCanvasStub();
 });
 
-const realReactI18nextModule = { ...(await import("react-i18next")) };
-mock.module("react-i18next", () => ({
-	...realReactI18nextModule,
-	useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en" } }),
-}));
+const testI18n = i18next.createInstance();
+await testI18n.init({
+	lng: "en",
+	fallbackLng: "en",
+	resources: { en: { narrator: {}, common: {} } },
+	defaultNS: "narrator",
+	react: { useSuspense: false },
+});
 
 const { RenderInjectionBubble } = await import("./RenderInjectionBubble");
 const { measureInjectionBubble, INJECTION_BUBBLE_PADDING } = await import(
@@ -100,9 +105,11 @@ function render(
 	currentRoot = root;
 	act(() => {
 		root.render(
-			<MantineProvider>
-				<RenderInjectionBubble measured={measured} {...props} />
-			</MantineProvider>,
+			<I18nextProvider i18n={testI18n}>
+				<MantineProvider>
+					<RenderInjectionBubble measured={measured} {...props} />
+				</MantineProvider>
+			</I18nextProvider>,
 		);
 	});
 	// Addressed by the render layer's stable `data-vlist-*` markers rather than by
@@ -138,9 +145,11 @@ function renderFrameEl(measured: ReturnType<typeof measureInjectionBubble>): HTM
 	currentRoot = root;
 	act(() => {
 		root.render(
-			<MantineProvider>
-				<RenderInjectionBubble measured={measured} />
-			</MantineProvider>,
+			<I18nextProvider i18n={testI18n}>
+				<MantineProvider>
+					<RenderInjectionBubble measured={measured} />
+				</MantineProvider>
+			</I18nextProvider>,
 		);
 	});
 	const frame = currentContainer.querySelector("[data-vlist-injection-frame]");
@@ -156,10 +165,6 @@ afterEach(() => {
 	}
 	currentContainer?.remove();
 	currentContainer = null;
-});
-
-afterAll(() => {
-	mock.restore();
 });
 
 describe("RenderInjectionBubble — paints the measured geometry", () => {

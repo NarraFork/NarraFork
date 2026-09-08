@@ -28,6 +28,9 @@ import {
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+	type CurrentDiffFile,
+	type CurrentDiffTarget,
+	type CurrentDiffView,
 	type FileModificationGroup,
 	useGitAiCommitMessage,
 	useGitCommit,
@@ -40,7 +43,7 @@ import {
 import { useGitFolderPrefs } from "../../hooks/useGitFolderPrefs";
 import { useGitStatusFilter } from "../../hooks/useGitStatusFilter";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
-import { buildAttributionBadge } from "./attribution-label";
+import { buildAttributionBadge, buildCurrentAttributionBadge } from "./attribution-label";
 import { GitFileDiff } from "./GitFileDiff";
 import { type GitFileSection, gitFileBadgeChar } from "./git-file-status";
 import { buildGitFileTree, compactGitFileTree, type GitFileTreeNode } from "./git-file-tree";
@@ -102,6 +105,8 @@ interface TreeContext {
 	onAction: (files: string[]) => void;
 	onOpenFile: (path: string) => void;
 	attrByPath: Map<string, FileModificationGroup>;
+	currentByPath: Map<string, CurrentDiffFile>;
+	currentDiff?: CurrentDiffView;
 	t: Translate;
 }
 
@@ -134,19 +139,21 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	const stagedFolders = useGitFolderPrefs(chapterId, "staged");
 	const unstagedFolders = useGitFolderPrefs(chapterId, "unstaged");
 
-	// path → who changed it in the current uncommitted change. A path absent from this map
-	// has no attributable session, which the badge reports by not rendering. Memoized
-	// because every file row reads it: rebuilding per render also handed each row a new
-	// `ctx` object, defeating any downstream memoization on the tree.
+	// path → historical observations for this path. An absent group proves neither no
+	// writer nor no current changes; the current net diff comes from git status, not
+	// these observations. Memoized because every rendered file row consults it.
 	const attrByPath = useMemo(
 		() => new Map((modifications?.byFile ?? []).map((g) => [g.filePath, g])),
 		[modifications?.byFile],
 	);
-	// A truncated row window means an absent path proves nothing: its changes may simply
-	// lie beyond the window. `windowCount === 0` with `hasMore` is the clear case — the cap
-	// was spent entirely on rows outside the per-file boundary — so the panel says the
-	// attribution is incomplete instead of implying nobody wrote these files.
-	const attributionTruncated = !!modifications?.hasMore && (modifications.windowCount ?? 1) === 0;
+	const currentByPath = useMemo(
+		() => new Map((modifications?.currentDiff?.byFile ?? []).map((file) => [file.filePath, file])),
+		[modifications?.currentDiff?.byFile],
+	);
+	// Any truncated row window is incomplete, even when some contributors were found.
+	// Neither a missing badge nor the displayed contributors prove the full history.
+	const attributionTruncated =
+		!!modifications?.hasMore || modifications?.completeness?.fileHistoryComplete === false;
 
 	if (isLoading) {
 		return <Loader size="sm" />;
@@ -285,6 +292,15 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 
 			<ScrollArea style={{ flex: 1, minHeight: 0 }}>
 				<Stack gap="xs" pb="xs">
+					{modifications && (
+						<Text size="xs" c="dimmed">
+							{t(
+								modifications.currentDiff
+									? "attributionCurrentExplanation"
+									: "attributionObservationOnly",
+							)}
+						</Text>
+					)}
 					{/*
 					 * Stated once for the whole list rather than per row: the shortfall is a
 					 * property of the query window, not of any one file, and a missing badge on
@@ -354,6 +370,8 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 										setDiffStaged(true);
 									},
 									attrByPath,
+									currentByPath,
+									currentDiff: modifications?.currentDiff,
 									t,
 								}}
 							/>
@@ -415,6 +433,8 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 										setDiffStaged(false);
 									},
 									attrByPath,
+									currentByPath,
+									currentDiff: modifications?.currentDiff,
 									t,
 								}}
 							/>
@@ -758,6 +778,21 @@ function FileRow({
 	const statusChar = gitFileBadgeChar(file.status, ctx.section);
 	const color = statusRegistry.gitFileStatus(statusChar).color;
 	const actionLabel = ctx.action === "stage" ? ctx.t("stageFile") : ctx.t("unstageFile");
+	const observedTarget = ctx.currentByPath.get(file.path)?.[
+		ctx.section === "staged" ? "index" : "worktree"
+	];
+	const currentTarget: CurrentDiffTarget | undefined =
+		ctx.currentDiff?.baselineStatus === "stable"
+			? observedTarget
+			: observedTarget
+				? {
+						...observedTarget,
+						status: "unknown",
+						actor: null,
+						effectId: null,
+						reason: ctx.currentDiff?.baselineStatus === "stale" ? "stale" : "unavailable",
+					}
+				: undefined;
 
 	return (
 		<TreeRow
@@ -783,7 +818,14 @@ function FileRow({
 			>
 				{clampGitFilePath(children)}
 			</Text>
-			<AttributionBadge attribution={ctx.attrByPath.get(file.path)} t={ctx.t} />
+			{!ctx.currentDiff?.clean && (
+				<AttributionBadge
+					attribution={ctx.attrByPath.get(file.path)}
+					currentMode={!!ctx.currentDiff}
+					current={currentTarget}
+					t={ctx.t}
+				/>
+			)}
 			<LineStats added={file.displayLinesAdded} removed={file.displayLinesRemoved} />
 			<Tooltip label={actionLabel}>
 				<ActionIcon
@@ -803,29 +845,27 @@ function FileRow({
 }
 
 /**
- * Compact badge naming who caused a file's current uncommitted change.
- *
- * Scoped to this round of edits, not the file's history: a long-lived worktree has been
- * touched by dozens of sessions, and listing them all here answered a question nobody
- * asked while looking authoritative. A file with no attributable session in scope renders
- * nothing at all — "no session wrote this" is the honest answer, and inventing a
- * contributor is worse than showing none.
- *
- * Labels come from the API because attribution spans subagents and sessions outside this
- * chapter, which a chapter-scoped narrator list cannot name.
+ * Latest observed actor plus historical participants. None is claimed to own the current
+ * diff: v1 timestamp hints have no verified baseline fingerprint or workspace epoch.
+ * Missing observations render no badge, not a claim that no one changed the file.
  */
 function AttributionBadge({
 	attribution,
+	current,
+	currentMode,
 	t,
 }: {
 	attribution?: FileModificationGroup;
+	current?: CurrentDiffTarget;
+	currentMode: boolean;
 	t: Translate;
 }) {
-	if (!attribution) return null;
-
-	// Caption, "+N" and tooltip are one decision, made in the pure module: computing them
-	// separately here is what let a lone external contributor render as "External +1".
-	const badge = buildAttributionBadge(attribution, t);
+	const badge = currentMode
+		? buildCurrentAttributionBadge(current, attribution, t)
+		: attribution
+			? buildAttributionBadge(attribution, t)
+			: null;
+	if (!badge) return null;
 	const tooltip = badge.tooltipLines.join("\n");
 
 	return (
@@ -839,13 +879,16 @@ function AttributionBadge({
 				aria-label={tooltip}
 				// Uncertainty is carried by an icon rather than by colour alone, which
 				// would not survive a colour-blind or high-contrast viewer.
-				leftSection={attribution.hasImpreciseAttribution ? <IconHelpCircle size={10} /> : undefined}
+				leftSection={<IconHelpCircle size={10} />}
 				style={{ flexShrink: 0, maxWidth: 110, cursor: "default", textTransform: "none" }}
 				onClick={(e) => e.stopPropagation()}
 			>
 				<Text size="xs" lineClamp={1} component="span">
 					{badge.label}
-					{badge.extraCount > 0 ? ` +${badge.extraCount}` : ""}
+					{badge.extraCount > 0
+						? ` +${badge.extraCountIsLowerBound ? "≥" : ""}${badge.extraCount}`
+						: ""}
+					{badge.incomplete ? ` · ${t("attributionPartial")}` : ""}
 				</Text>
 			</Badge>
 		</Tooltip>

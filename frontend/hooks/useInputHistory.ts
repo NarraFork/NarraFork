@@ -1,4 +1,11 @@
+import {
+	type FileReferenceInput,
+	readFileReferences,
+	sameFileReferenceInput,
+	trimFileReferenceInput,
+} from "@frontend/components/narrator/file-reference-input";
 import { readSession, removeSession, writeSession } from "@frontend/lib/session-store";
+import type { FileReference } from "@shared/file-reference";
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 
 const MAX_HISTORY = 50;
@@ -14,6 +21,31 @@ export const MAX_HISTORY_MESSAGE_CHARS = 2_000;
 /** Whole-list ceiling, enforced on write so the list is trimmed rather than dropped. */
 const MAX_HISTORY_STORAGE_CHARS = 24_000;
 
+function readHistoryEntry(value: unknown): FileReferenceInput | null {
+	if (typeof value === "string")
+		return value.length <= MAX_HISTORY_MESSAGE_CHARS ? { text: value, fileReferences: [] } : null;
+	if (!value || typeof value !== "object") return null;
+	const entry = value as FileReferenceInput;
+	if (typeof entry.text !== "string" || entry.text.length > MAX_HISTORY_MESSAGE_CHARS) return null;
+	return { text: entry.text, fileReferences: readFileReferences(entry.fileReferences, entry.text) };
+}
+
+export function readInputHistoryEntries(storageKey: string | null): FileReferenceInput[] {
+	if (storageKey === null) return [];
+	try {
+		const raw = readSession("narrator-history", storageKey);
+		if (!raw || raw.length > MAX_HISTORY_STORAGE_CHARS) return [];
+		const parsed: unknown = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed
+			.slice(0, MAX_HISTORY)
+			.map(readHistoryEntry)
+			.filter((entry): entry is FileReferenceInput => entry !== null);
+	} catch {
+		return [];
+	}
+}
+
 /**
  * Write a history list under the CURRENT limits.
  *
@@ -22,10 +54,15 @@ const MAX_HISTORY_STORAGE_CHARS = 24_000;
  * list is trimmed from the oldest end until it fits. A second implementation
  * would be the thing that lets the two drift.
  */
-export function writeInputHistoryEntries(storageId: string, entries: string[]): void {
+export function writeInputHistoryEntries(
+	storageId: string,
+	entries: Array<string | FileReferenceInput>,
+): void {
 	const kept = entries
-		.filter((entry) => entry.length <= MAX_HISTORY_MESSAGE_CHARS)
-		.slice(0, MAX_HISTORY);
+		.map(readHistoryEntry)
+		.filter((entry): entry is FileReferenceInput => entry !== null)
+		.slice(0, MAX_HISTORY)
+		.map((entry) => (entry.fileReferences.length ? entry : entry.text));
 	if (kept.length === 0) {
 		removeSession("narrator-history", storageId);
 		return;
@@ -57,7 +94,7 @@ export function writeInputHistoryEntries(storageId: string, entries: string[]): 
  */
 export function useInputHistory(storageKey: string | null) {
 	const indexRef = useRef(-1);
-	const draftRef = useRef("");
+	const draftRef = useRef<FileReferenceInput>({ text: "", fileReferences: [] });
 	const storageKeyRef = useRef(storageKey);
 	// Track browsing version so useSyncExternalStore can react to index changes
 	const versionRef = useRef(0);
@@ -79,28 +116,14 @@ export function useInputHistory(storageKey: string | null) {
 		if (storageKeyRef.current === storageKey) return;
 		storageKeyRef.current = storageKey;
 		indexRef.current = -1;
-		draftRef.current = "";
+		draftRef.current = { text: "", fileReferences: [] };
 		notify();
 	}, [storageKey, notify]);
 
-	const getHistory = useCallback((): string[] => {
-		if (storageKey == null) return [];
-		try {
-			const raw = readSession("narrator-history", storageKey);
-			if (!raw) return [];
-			const parsed: unknown = JSON.parse(raw);
-			if (!Array.isArray(parsed)) return [];
-			return parsed
-				.filter((item): item is string => typeof item === "string")
-				.filter((item) => item.length <= MAX_HISTORY_MESSAGE_CHARS)
-				.slice(0, MAX_HISTORY);
-		} catch {
-			return [];
-		}
-	}, [storageKey]);
+	const getHistory = useCallback(() => readInputHistoryEntries(storageKey), [storageKey]);
 
 	const setHistory = useCallback(
-		(history: string[]) => {
+		(history: FileReferenceInput[]) => {
 			if (storageKey == null) return;
 			// Trimming (oldest end first, so recent entries survive an overflow) lives in
 			// writeInputHistoryEntries, shared with the legacy-key migration.
@@ -111,9 +134,13 @@ export function useInputHistory(storageKey: string | null) {
 
 	/** 发送消息后调用，将消息推入历史并重置浏览位置 */
 	const push = useCallback(
-		(message: string) => {
+		(message: string, fileReferences: FileReference[] = []) => {
 			const trimmed = message.trim();
-			if (!trimmed) return;
+			const entry = trimFileReferenceInput({
+				text: message,
+				fileReferences: readFileReferences(fileReferences, message),
+			});
+			if (!trimmed && entry.fileReferences.length === 0) return;
 			if (trimmed.length > MAX_HISTORY_MESSAGE_CHARS) {
 				indexRef.current = -1;
 				notify();
@@ -121,12 +148,12 @@ export function useInputHistory(storageKey: string | null) {
 			}
 			const history = getHistory();
 			// 去重：如果最近一条相同则不重复添加
-			if (history[0] === trimmed) {
+			if (history[0] && sameFileReferenceInput(history[0], entry)) {
 				indexRef.current = -1;
 				notify();
 				return;
 			}
-			const next = [trimmed, ...history].slice(0, MAX_HISTORY);
+			const next = [entry, ...history].slice(0, MAX_HISTORY);
 			setHistory(next);
 			indexRef.current = -1;
 			notify();
@@ -139,15 +166,22 @@ export function useInputHistory(storageKey: string | null) {
 	 * @param direction "up" | "down"
 	 * @param currentInput 当前输入框的值
 	 */
-	const navigate = useCallback(
-		(direction: "up" | "down", currentInput: string): string | null => {
+	const navigateEntry = useCallback(
+		(
+			direction: "up" | "down",
+			currentInput: string,
+			fileReferences: FileReference[] = [],
+		): FileReferenceInput | null => {
 			const history = getHistory();
 			if (history.length === 0) return null;
 
 			if (direction === "up") {
 				// 首次按上箭头时保存当前草稿
 				if (indexRef.current === -1) {
-					draftRef.current = currentInput;
+					draftRef.current = {
+						text: currentInput,
+						fileReferences: readFileReferences(fileReferences, currentInput),
+					};
 				}
 				const nextIndex = Math.min(indexRef.current + 1, history.length - 1);
 				if (nextIndex === indexRef.current && indexRef.current !== -1) return null;
@@ -179,5 +213,10 @@ export function useInputHistory(storageKey: string | null) {
 	/** 是否正在浏览历史（index !== -1） */
 	const isBrowsing = indexRef.current !== -1;
 
-	return { push, navigate, reset, isBrowsing };
+	const navigate = useCallback(
+		(direction: "up" | "down", currentInput: string): string | null =>
+			navigateEntry(direction, currentInput)?.text ?? null,
+		[navigateEntry],
+	);
+	return { push, navigate, navigateEntry, reset, isBrowsing };
 }

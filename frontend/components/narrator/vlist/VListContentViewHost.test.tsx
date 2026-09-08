@@ -16,9 +16,11 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { MantineProvider } from "@mantine/core";
+import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { I18nextProvider } from "react-i18next";
 
 let isMobileViewport = false;
 
@@ -26,14 +28,23 @@ mock.module("@mantine/hooks", () => ({
 	useMediaQuery: () => isMobileViewport,
 	useClipboard: () => ({ copy: () => {}, copied: false, reset: () => {} }),
 }));
-mock.module("react-i18next", () => ({
-	useTranslation: () => ({ t: (key: string) => key }),
-}));
+// Empty resources preserve key-based assertions without replacing a shared module export.
+const testI18n = i18next.createInstance();
+await testI18n.init({
+	lng: "en",
+	fallbackLng: "en",
+	resources: { en: { common: {}, narrator: {} } },
+	defaultNS: "common",
+	react: { useSuspense: false },
+});
 
 const { RenderLodCtx } = await import("../RenderLodCtx");
+const { AutoFollowScroll } = await import("../AutoFollowScroll");
 const { VListContentViewHost } = await import("./VListContentViewHost");
 type VListViewTarget = import("./vlist-content-view-target").VListViewTarget;
 type VListViewControls = import("./VListContentViewHost").VListViewControls;
+type ContentViewportSnapshot = import("../AutoFollowScroll").ContentViewportSnapshot;
+let readerProgress: ((node: HTMLElement, snapshot?: ContentViewportSnapshot) => void) | undefined;
 
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
@@ -95,6 +106,7 @@ function installDom() {
 }
 
 const CODE_TARGET: VListViewTarget = {
+	owner: { specKey: "owner-tool" },
 	id: "tool-tu_1:b0",
 	slot: "b0",
 	kind: "code",
@@ -102,6 +114,7 @@ const CODE_TARGET: VListViewTarget = {
 };
 
 const MARKDOWN_TARGET: VListViewTarget = {
+	owner: { specKey: "owner-tool" },
 	id: "m1-b0:body",
 	slot: "body",
 	kind: "markdown",
@@ -117,6 +130,7 @@ const MARKDOWN_TARGET: VListViewTarget = {
  * it would only flip shell state that no renderer reads.
  */
 const MARKDOWN_NO_INLINE_SOURCE: VListViewTarget = {
+	owner: { specKey: "owner-tool" },
 	id: "m1-b1:body",
 	slot: "body",
 	kind: "markdown",
@@ -124,15 +138,16 @@ const MARKDOWN_NO_INLINE_SOURCE: VListViewTarget = {
 };
 
 const DIFF_TARGET: VListViewTarget = {
+	owner: { specKey: "owner-tool" },
 	id: "tool-tu_2:b0",
 	slot: "b0",
 	kind: "diff",
 	text: "-a\n+b",
-	diff: { oldStr: "a", newStr: "b" },
 };
 
 /** A body whose payload is only a server-side prefix (the auto-load case). */
 const TRUNCATED_TARGET: VListViewTarget = {
+	owner: { specKey: "owner-tool" },
 	id: "tool-tu_3:b0",
 	slot: "b0",
 	kind: "term",
@@ -177,19 +192,28 @@ async function renderHost(opts: {
 }): Promise<void> {
 	await act(async () => {
 		root?.render(
-			<MantineProvider>
-				<RenderLodCtx.Provider value={{ lod: 5, interactive: opts.interactive !== false }}>
-					<VListContentViewHost target={opts.target} controls={opts.controls}>
-						<div data-testid="body">
-							{/* The scrollport the auto-load listener observes. Production bodies
-							    are `overflow:auto` boxes nested inside the host exactly like
-							    this, which is why the listener is registered in the CAPTURE
-							    phase (scroll does not bubble). */}
-							<div data-testid="scrollbox">body</div>
-						</div>
-					</VListContentViewHost>
-				</RenderLodCtx.Provider>
-			</MantineProvider>,
+			<I18nextProvider i18n={testI18n}>
+				<MantineProvider>
+					<RenderLodCtx.Provider value={{ lod: 5, interactive: opts.interactive !== false }}>
+						<VListContentViewHost target={opts.target} controls={opts.controls}>
+							{(onReaderProgress) => {
+								readerProgress = onReaderProgress;
+								return (
+									<AutoFollowScroll
+										bodyId={opts.target?.id ?? "fixture-body"}
+										onReaderProgress={onReaderProgress}
+										viewportStyle={{ height: 200 }}
+									>
+										<div data-testid="body">
+											<div data-testid="nested-scrollbox">body</div>
+										</div>
+									</AutoFollowScroll>
+								);
+							}}
+						</VListContentViewHost>
+					</RenderLodCtx.Provider>
+				</MantineProvider>
+			</I18nextProvider>,
 		);
 	});
 }
@@ -212,8 +236,9 @@ async function scrollBody(opts: {
 	ratio: number;
 	scrollHeight?: number;
 	clientHeight?: number;
+	reader?: boolean;
 }): Promise<void> {
-	const box = container?.querySelector("[data-testid='scrollbox']") as HTMLElement | null;
+	const box = container?.querySelector("[data-content-scrollport]") as HTMLElement | null;
 	if (!box) throw new Error("scroll box not found");
 	const scrollHeight = opts.scrollHeight ?? 1000;
 	const clientHeight = opts.clientHeight ?? 200;
@@ -224,13 +249,18 @@ async function scrollBody(opts: {
 		scrollTop: { configurable: true, writable: true, value: scrollable * opts.ratio },
 	});
 	await act(async () => {
-		box.dispatchEvent(new (globalThis.Event as typeof Event)("scroll", { bubbles: true }));
+		if (opts.reader !== false) {
+			const wheel = new Event("wheel", { bubbles: true });
+			Object.defineProperty(wheel, "deltaY", { value: 20 });
+			box.dispatchEvent(wheel);
+		}
+		box.dispatchEvent(new Event("scroll"));
 	});
 }
 
 /** The host wrapper element (the Box that carries position:relative). */
 function hostEl(): HTMLElement {
-	const host = container?.querySelector("[data-testid='body']")?.parentElement;
+	const host = container?.querySelector("[data-vlist-content-host]");
 	if (!host) throw new Error("host wrapper not found");
 	return host as HTMLElement;
 }
@@ -357,16 +387,16 @@ afterEach(async () => {
 	container?.remove();
 	root = undefined;
 	container = undefined;
+	readerProgress = undefined;
 });
 
 describe("VListContentViewHost — gating", () => {
-	test("renders children untouched when the body has no readable target", async () => {
+	test("keeps the host when the body has no readable target", async () => {
 		const { controls } = makeControls();
 		await renderHost({ controls });
 		// No wrapper and no action bar: the row looks exactly as it did before.
 		expect(actionLabels()).toEqual([]);
-		const bodyEl = container?.querySelector("[data-testid='body']");
-		expect(bodyEl?.parentElement?.getAttribute("style")).toBeNull();
+		expect(hostEl().getAttribute("style")).toBe("position:relative");
 	});
 
 	test("renders children untouched when no controls were injected", async () => {
@@ -616,7 +646,7 @@ describe("VListContentViewHost — height neutrality", () => {
 	test("the wrapper adds position:relative and nothing that could resize the body", async () => {
 		const { controls } = makeControls();
 		await renderHost({ target: CODE_TARGET, controls });
-		const host = container?.querySelector("[data-testid='body']")?.parentElement;
+		const host = container?.querySelector("[data-vlist-content-host]");
 		const style = host?.getAttribute("style") ?? "";
 		expect(style).toContain("position:relative");
 		// No padding / border / height of its own: the decorated box keeps exactly the
@@ -632,7 +662,7 @@ describe("VListContentViewHost — mobile", () => {
 		isMobileViewport = true;
 		const { controls, recorded } = makeControls();
 		await renderHost({ target: CODE_TARGET, controls });
-		const host = container?.querySelector("[data-testid='body']")?.parentElement;
+		const host = container?.querySelector("[data-vlist-content-host]");
 		if (!host) throw new Error("host wrapper not found");
 		// Hover does nothing on a touch surface.
 		await hover();
@@ -791,21 +821,93 @@ describe("VListContentViewHost — auto-load on scroll", () => {
 		expect(seen[0]?.text).toBe(rebuilt.text);
 	});
 
-	test("registers in the CAPTURE phase (scroll does not bubble in a browser)", () => {
-		// The behavioural tests above dispatch a BUBBLING scroll, because linkedom
-		// only walks ancestors for bubbling events. That makes them blind to the one
-		// mistake that would break this in a real browser: registering on the bubble
-		// phase, where a descendant box's scroll never arrives. Pinned at the source,
-		// which is the only place the distinction is observable here.
+	test("programmatic scroll is not a full-payload request", async () => {
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		await scrollBody({ ratio: 0.9, reader: false });
+		expect(recorded.payloadRequests).toEqual([]);
+	});
+
+	test("nested painter scroll is not a full-payload request", async () => {
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		const nested = container?.querySelector("[data-testid=nested-scrollbox]");
+		nested?.dispatchEvent(new Event("scroll", { bubbles: true }));
+		expect(recorded.payloadRequests).toEqual([]);
+	});
+
+	test("uses snapshot progress without reading any node geometry", async () => {
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		const node = document.createElement("div");
+		for (const name of ["scrollHeight", "clientHeight", "scrollTop"]) {
+			Object.defineProperty(node, name, {
+				get() {
+					throw new Error(`unexpected ${name} read`);
+				},
+			});
+		}
+		const snapshot: ContentViewportSnapshot = {
+			scrollTop: 399,
+			scrollLeft: 0,
+			viewportWidth: 600,
+			viewportHeight: 200,
+			contentWidth: 600,
+			contentOrigin: 0,
+			scrollWidth: 600,
+			scrollHeight: 1_000,
+			source: "layout",
+		};
+		if (!readerProgress) throw new Error("reader callback not captured");
+		readerProgress(node, snapshot);
+		expect(recorded.payloadRequests).toEqual([]);
+		readerProgress(node, { ...snapshot, scrollTop: 400 });
+		expect(recorded.payloadRequests).toEqual([TRUNCATED_TARGET.id]);
+	});
+
+	test("keeps zero snapshot values instead of falling back to node metrics", async () => {
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		const node = document.createElement("div");
+		for (const name of ["scrollHeight", "clientHeight", "scrollTop"]) {
+			Object.defineProperty(node, name, {
+				get() {
+					throw new Error(`unexpected ${name} read`);
+				},
+			});
+		}
+		if (!readerProgress) throw new Error("reader callback not captured");
+		readerProgress(node, {
+			scrollTop: 0,
+			scrollLeft: 0,
+			viewportWidth: 0,
+			viewportHeight: 0,
+			contentWidth: 0,
+			contentOrigin: 0,
+			scrollWidth: 0,
+			scrollHeight: 0,
+			source: "layout",
+		});
+		expect(recorded.payloadRequests).toEqual([]);
+	});
+
+	test("still supports a legacy reader callback that passes only a node", async () => {
+		const { controls, recorded } = makeControls();
+		await renderHost({ target: TRUNCATED_TARGET, controls });
+		const node = document.createElement("div");
+		Object.defineProperties(node, {
+			scrollHeight: { value: 1_000 },
+			clientHeight: { value: 200 },
+			scrollTop: { value: 400 },
+		});
+		if (!readerProgress) throw new Error("reader callback not captured");
+		readerProgress(node);
+		expect(recorded.payloadRequests).toEqual([TRUNCATED_TARGET.id]);
+	});
+
+	test("never captures all descendant scroll events", () => {
 		const src = readFileSync(join(import.meta.dir, "VListContentViewHost.tsx"), "utf8");
-		const fn = src.slice(
-			src.indexOf("function useAutoLoadOnScroll("),
-			src.indexOf("export interface VListContentViewHostProps"),
-		);
-		expect(fn.length).toBeGreaterThan(0);
-		expect(fn).toContain('node.addEventListener("scroll", onScroll, { capture: true');
-		// Passive too: this handler never calls preventDefault, and a non-passive
-		// scroll listener costs the browser a main-thread round trip per frame.
-		expect(fn).toContain("passive: true");
+		expect(src).not.toContain("capture: true");
+		expect(src).toContain("children(onReaderProgress)");
 	});
 });

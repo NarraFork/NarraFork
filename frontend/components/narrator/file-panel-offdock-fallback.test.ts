@@ -35,8 +35,8 @@ describe("off-dock file viewer fallback", () => {
 		expect(PANEL).toContain(
 			"const useInternalFileViewer = !dockOpenFilePanel && !isWorkspacePreview;",
 		);
-		expect(PANEL).toContain(
-			"if (useInternalFileViewer) return (filePath: string) => setInternalFileViewerPath(filePath);",
+		expect(PANEL).toMatch(
+			/if \(useInternalFileViewer\)[\s\S]*?setInternalFileViewerTarget\(null\);[\s\S]*?setInternalFileViewerPath\(filePath\);/,
 		);
 	});
 
@@ -57,6 +57,8 @@ describe("off-dock file viewer fallback", () => {
 		// Two viewers would drift; the drawer is only a different HOST for the same
 		// content.
 		expect(PANEL).toContain('import("./file-viewer/FileViewerContent")');
-		expect(PANEL).toContain("<FileViewerContent key={internalFileViewerPath}");
+		expect(PANEL).toMatch(/<FileViewerContent\s+key=\{internalFileViewerPath\}/);
+		expect(PANEL).toContain("referenceOrigin={!!internalFileViewerTarget}");
+		expect(PANEL).toContain("selection={internalFileViewerTarget?.selection}");
 	});
 });

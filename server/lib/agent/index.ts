@@ -3,6 +3,10 @@ import { logger } from "../logger";
 import { isProviderUnavailableError } from "../provider-availability-error";
 import { parseModelId, settings } from "../settings";
 import { auxiliaryRetryDelayMs, getAuxiliaryMaxRetries } from "./error-handling";
+import {
+	type FileReferenceProjectionOptions,
+	projectFileReferencesForModel,
+} from "./file-reference-projection";
 import { isRetryableError } from "./loop";
 import {
 	type BuiltHistory,
@@ -63,6 +67,7 @@ export async function buildHistory(
 	// callers resolve the provider before calling, so there is nothing to guess.
 	provider: string,
 	narratorId?: string,
+	options?: FileReferenceProjectionOptions,
 ): Promise<BuiltHistory> {
 	const requestedModel = model || settings.agent.defaultModel;
 	const parsed = parseModelId(requestedModel);
@@ -78,7 +83,12 @@ export async function buildHistory(
 	// Historical rows may still embed provider-internal citation markers. Replaying
 	// them teaches the model the markers are part of its output format, so it keeps
 	// producing them; strip on the in-memory copy only.
-	const cleanedMessages = stripCitationMarkersForModel(modelMessages);
+	// Expand accepted file bytes after prose cleanup: citation-like strings in
+	// a source file are data and must not be rewritten by the citation sanitizer.
+	const cleanedMessages = projectFileReferencesForModel(
+		stripCitationMarkersForModel(modelMessages),
+		options,
+	);
 	// Some providers mint the same tool_use id for every call (e.g. "call_go_0"),
 	// which only breaks once several turns accumulate: the replayed history then
 	// carries duplicate ids and the API rejects the request with 400. Rename the

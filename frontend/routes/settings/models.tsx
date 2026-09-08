@@ -119,6 +119,8 @@ function SettingsModelsPage() {
 				setSubagentReviewModel={is.setSubagentReviewModel}
 				subagentAllowedModels={is.subagentAllowedModels}
 				setSubagentAllowedModels={is.setSubagentAllowedModels}
+				subagentModelReasoningEfforts={is.subagentModelReasoningEfforts}
+				setSubagentModelReasoningEfforts={is.setSubagentModelReasoningEfforts}
 				agentDefaultReasoningEffort={is.agentDefaultReasoningEffort}
 				setAgentDefaultReasoningEffort={is.setAgentDefaultReasoningEffort}
 				reasoningEffortBlocklist={is.reasoningEffortBlocklist}

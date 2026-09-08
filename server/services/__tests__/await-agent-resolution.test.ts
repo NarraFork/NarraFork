@@ -24,6 +24,7 @@ mock.module("../../db", () => ({ db, sqlite }));
 
 const {
 	collectPendingAwaitAgents,
+	attachAwaitAgentNarratorIds,
 	resolveAwaitAgentIdsForToolCalls,
 	resolveAwaitAgentNarratorIds,
 } = await import("../await-agent-resolution");
@@ -119,6 +120,121 @@ describe("collectPendingAwaitAgents", () => {
 			inputJson: { type: "agent", id: "paper-extract" },
 		};
 		expect(collectPendingAwaitAgents([call, call])).toHaveLength(1);
+	});
+});
+
+describe("running Send navigation", () => {
+	test("task aliases cannot escape the roster and primary forks are not subagents", async () => {
+		await seedTeam([{ id: SUB_A }, { id: SUB_B, title: "task-alias" }]);
+		const now = new Date().toISOString();
+		await db.insert(narrators).values([
+			{ id: "foreign-parent", variant: "primary", createdAt: now, updatedAt: now },
+			{
+				id: "foreign-child",
+				variant: "subagent:general",
+				parentNarratorId: "foreign-parent",
+				createdAt: now,
+				updatedAt: now,
+			},
+			{
+				id: "fork-primary",
+				variant: "primary",
+				parentNarratorId: PARENT_ID,
+				createdAt: now,
+				updatedAt: now,
+			},
+		]);
+		await db.insert(backgroundTasks).values({
+			id: "task-record",
+			type: "agent",
+			alias: "task-alias",
+			parentNarratorId: PARENT_ID,
+			subagentNarratorId: SUB_A,
+			status: "running",
+			createdAt: now,
+			updatedAt: now,
+			startedAt: now,
+		});
+		registerTaskAlias(PARENT_ID, "escaped", "foreign-child");
+		const resolved = await resolveAwaitAgentIdsForToolCalls(
+			["task-alias", "escaped", "foreign-child", "fork-primary"].map((id) => ({
+				toolUseId: id,
+				toolName: "Send",
+				inputJson: { id, await: true },
+				narratorId: PARENT_ID,
+			})),
+		);
+		expect([...resolved]).toEqual([["task-alias", SUB_A]]);
+	});
+	test("collects single selectors but never parent, fanout, or completed calls", () => {
+		const inputs = [
+			{ id: "child", await: true },
+			{ name: "child" },
+			{ ids: ["child"] },
+			{ names: ["child"] },
+			{ id: "parent" },
+			{ name: "@MAIN" },
+			{ ids: ["a", "b"] },
+			{ id: "a", name: "b" },
+		];
+		expect(
+			collectPendingAwaitAgents(
+				inputs.map((inputJson, i) => ({
+					toolUseId: String(i),
+					toolName: "Send",
+					inputJson,
+				})),
+			).map((entry) => entry.toolUseId),
+		).toEqual(["0", "1", "2", "3"]);
+		expect(
+			collectPendingAwaitAgents([
+				{
+					toolUseId: "done",
+					toolName: "Send",
+					inputJson: { id: "child" },
+					outputJson: { _text: "failed" },
+				},
+			]),
+		).toEqual([]);
+	});
+
+	test("resolves aliases and ids in bulk while rejecting self and foreign teams", async () => {
+		await seedTeam([{ id: SUB_A, traits: ["subagent-alias:worker"] }, { id: SUB_B }]);
+		const calls = [
+			{ toolUseId: "alias", narratorId: PARENT_ID, inputJson: { name: "worker" } },
+			{ toolUseId: "id", narratorId: PARENT_ID, inputJson: { ids: [SUB_B] } },
+			{ toolUseId: "self", narratorId: SUB_A, inputJson: { id: SUB_A } },
+			{ toolUseId: "parent", narratorId: SUB_A, inputJson: { id: PARENT_ID } },
+			{ toolUseId: "foreign", narratorId: PARENT_ID, inputJson: { id: "foreign" } },
+		].map((call) => ({ ...call, toolName: "Send" }));
+		const resolved = await resolveAwaitAgentIdsForToolCalls(calls);
+		expect([...resolved]).toEqual([
+			["alias", SUB_A],
+			["id", SUB_B],
+		]);
+		expect(calls.every((call) => !("outputJson" in call))).toBe(true);
+		const tree = attachAwaitAgentNarratorIds(
+			[
+				{
+					contentJson: [
+						{
+							type: "tool_use",
+							id: "alias",
+							name: "Send",
+							input: { name: "worker", await: true },
+							status: "running",
+						},
+					],
+				},
+			],
+			resolved,
+		);
+		const { deriveToolMeta } = await import(
+			"../../../frontend/components/narrator/vlist/vlist-tool-meta"
+		);
+		expect(deriveToolMeta(tree[0].contentJson[0])?.sendTargetNarratorId).toBe(SUB_A);
+		expect(tree[0].contentJson[0].outputJson).toBeUndefined();
+		expect(tree[0].contentJson[0].status).toBe("running");
 	});
 });
 

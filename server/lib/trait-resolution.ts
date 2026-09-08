@@ -16,6 +16,7 @@
  * `enforced`. Write paths use that to reject an edit up front rather than letting
  * resolution silently discard it.
  */
+import type { SubagentModelUse } from "@shared/subagent-model-policy";
 import {
 	type DeviceInjectionTrait,
 	mergeDeviceInjection,
@@ -175,8 +176,9 @@ function mergeSubagentModels(
 	const enforcedPools = new Set<string>();
 
 	for (const key of poolKeys) {
-		// Preserve each model's `purpose` while merging on model id only.
-		const byModel = new Map<string, { model: string; purpose?: string }>();
+		// Grant membership still merges on model id. Optional execution metadata
+		// inherits independently: a nearer explicit value wins, absence passes through.
+		const byModel = new Map<string, SubagentModelUse>();
 		const perLayer: TraitLayerInput<TraitSetEntry> = {};
 		for (const layer of TRAIT_LAYERS) {
 			const entry = layers[layer];
@@ -184,12 +186,14 @@ function mergeSubagentModels(
 			const uses = entry.trait.pools[key];
 			if (uses === undefined) continue;
 			for (const use of uses) {
-				// Keep the richest description of a model: a higher layer usually
-				// re-lists it as a bare id just to narrow the pool, which must not
-				// erase a `purpose` a lower layer supplied.
 				const existing = byModel.get(use.model);
-				if (existing?.purpose && !use.purpose) continue;
-				byModel.set(use.model, use);
+				const purpose = use.purpose || existing?.purpose;
+				const reasoningEffort = use.reasoningEffort ?? existing?.reasoningEffort;
+				byModel.set(use.model, {
+					model: use.model,
+					...(purpose && { purpose }),
+					...(reasoningEffort && { reasoningEffort }),
+				});
 			}
 			perLayer[layer] = setEntry(
 				uses.map((use) => use.model),

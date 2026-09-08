@@ -1,3 +1,8 @@
+import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
+import {
+	HUMAN_ATTENTION_DEFAULT_PAGE_SIZE,
+	HUMAN_ATTENTION_MAX_PAGE_SIZE,
+} from "@shared/human-attention";
 import {
 	handleLength,
 	isValidHandle,
@@ -12,6 +17,7 @@ import {
 import { z } from "zod";
 import { permissionModeSchema } from "../permission-modes";
 import { legacyRuleDeviceScopeSchema, pathFlavorSchema, ruleTargetSelectorSchema } from "./common";
+import { fileReferencesSchema } from "./file-references";
 
 const reasoningEffortSchema = z.enum(["none", "low", "medium", "high", "xhigh", "max"]);
 const booleanOverrideSchema = z.enum(["inherit", "on", "off"]);
@@ -148,13 +154,19 @@ export const codexFingerprintSchema = z.object({
 	extraHeaders: z.record(z.string(), z.string().max(2048)).optional(),
 });
 
-export const sendMessageSchema = z.object({
-	message: z.string().min(1),
-	priority: z.boolean().optional(),
-});
+export const sendMessageSchema = z
+	.object({
+		message: z.string().default(""),
+		priority: z.boolean().optional(),
+		fileReferences: fileReferencesSchema.optional(),
+	})
+	.refine((body) => !!body.message.trim() || !!body.fileReferences?.length, {
+		message: "message or an attachment is required",
+	});
 
 export const updateNarratorDraftSchema = z.object({
 	text: z.string().max(MAX_NARRATOR_DRAFT_CHARS),
+	fileReferences: fileReferencesSchema.optional(),
 	baseRevision: z.number().int().min(0),
 	sourceId: z.string().min(1).max(120).optional(),
 });
@@ -167,6 +179,77 @@ export const updateNarratorDraftSchema = z.object({
  * the more dangerous default.
  */
 export const revertScopeSchema = z.enum(["narrator", "workspace"]).optional();
+
+const revertPlanIdentifierSchema = z
+	.string()
+	.min(1)
+	.max(256)
+	.refine(
+		(value) => !value.includes("\0") && Buffer.byteLength(value) <= 256,
+		"Invalid bounded identifier",
+	);
+export const revertPlanIdSchema = z.string().regex(/^[A-Za-z0-9_-]{21}$/);
+const revertPlanSelectorSchema = z.discriminatedUnion("kind", [
+	z.object({ kind: z.literal("all") }).strict(),
+	z
+		.object({
+			kind: z.literal("from_seq"),
+			minSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+		})
+		.strict(),
+	z
+		.object({
+			kind: z.literal("messages"),
+			messageIds: z
+				.array(revertPlanIdentifierSchema)
+				.min(1)
+				.max(FILE_CHANGE_LIMITS.historyMessageRefChanges),
+		})
+		.strict(),
+	z
+		.object({
+			kind: z.literal("tool_calls"),
+			toolCallIds: z
+				.array(revertPlanIdentifierSchema)
+				.min(1)
+				.max(FILE_CHANGE_LIMITS.historyToolRelatedChanges),
+		})
+		.strict(),
+	z
+		.object({
+			kind: z.literal("after_block"),
+			messageId: revertPlanIdentifierSchema,
+			keepThroughBlockIndex: z
+				.number()
+				.int()
+				.min(-1)
+				.max(FILE_CHANGE_LIMITS.historyToolRelatedChanges),
+		})
+		.strict(),
+]);
+/** Preview only. No client-supplied subject/project/raw refs, proof, or scope upgrade. */
+export const createRevertPlanSchema = z
+	.object({
+		idempotencyKey: revertPlanIdentifierSchema,
+		expectedMessageVersion: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+		kind: z.enum(["revert", "history_delete", "rollback_to_block"]),
+		revertScope: z.literal("narrator").default("narrator"),
+		selector: revertPlanSelectorSchema,
+	})
+	.strict()
+	.refine(
+		(value) => value.kind !== "rollback_to_block" || value.selector.kind === "after_block",
+		"Block rollback requires an after_block selector",
+	);
+export const revertPlanFilesQuerySchema = z
+	.object({
+		cursor: z
+			.string()
+			.regex(/^[a-f0-9]{64}$/)
+			.optional(),
+		limit: z.coerce.number().int().min(1).max(FILE_CHANGE_LIMITS.historyPageItems).default(32),
+	})
+	.strict();
 
 export const revertFilesSchema = z.object({
 	messageId: z.string().min(1),
@@ -208,6 +291,16 @@ export const asyncQuestionAnswerSchema = z.object({
 			}),
 		)
 		.optional(),
+});
+
+export const humanAttentionListQuerySchema = z.object({
+	cursor: z.string().min(1).max(2048).optional(),
+	limit: z.coerce
+		.number()
+		.int()
+		.min(1)
+		.max(HUMAN_ATTENTION_MAX_PAGE_SIZE)
+		.default(HUMAN_ATTENTION_DEFAULT_PAGE_SIZE),
 });
 
 export const asyncQuestionListQuerySchema = z.object({
@@ -302,6 +395,7 @@ export const updateBlacklistCmdSchema = z.object({
  */
 export const updateBufferedMessageSchema = z.object({
 	text: z.string().max(100_000).optional(),
+	fileReferences: fileReferencesSchema.optional(),
 	keepImageIds: z.array(z.string().min(1)).max(MAX_EDIT_IMAGES_PER_MESSAGE).optional(),
 	keepTextFiles: z
 		.array(z.object({ index: z.number().int().min(0), filename: z.string().min(1) }))
@@ -476,6 +570,8 @@ export const suggestAnswersSchema = z.object({
 		.min(1),
 });
 
+export const MAX_BATCH_DELETE_BLOCKS = 200;
+
 export const batchDeleteBlocksSchema = z.object({
 	blocks: z
 		.array(
@@ -485,7 +581,17 @@ export const batchDeleteBlocksSchema = z.object({
 			}),
 		)
 		.min(1)
-		.max(200),
+		.max(MAX_BATCH_DELETE_BLOCKS)
+		.transform((blocks) => {
+			const seen = new Map<string, Set<number>>();
+			return blocks.filter(({ messageId, blockIndex }) => {
+				const indices = seen.get(messageId) ?? new Set<number>();
+				if (indices.has(blockIndex)) return false;
+				indices.add(blockIndex);
+				seen.set(messageId, indices);
+				return true;
+			});
+		}),
 	// When true, delete the blocks from history only, leaving files/spec untouched.
 	skipRevert: z.boolean().optional(),
 	// The narrator scope is the default and refuses on conflict, so the caller needs
@@ -516,6 +622,7 @@ export const editAssistantMessageSchema = z.object({
  */
 export const editAndRegenerateJsonSchema = z.object({
 	content: z.string().max(100000).optional(),
+	fileReferences: fileReferencesSchema.optional(),
 	keepImageIds: z.array(z.string()).max(100).optional(),
 	keepTextFilePaths: z.array(z.string()).max(100).optional(),
 	/** True => delete the messages but leave the workspace alone. */

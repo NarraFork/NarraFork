@@ -5,24 +5,13 @@ export type {
 } from "@shared/compact-message";
 
 import type { TextCitation } from "@shared/citations";
+import type { FileReference, FileReferenceContext } from "@shared/file-reference";
 import type { LocalizedValue } from "@shared/i18n-locales";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
-import type {
-	TutorialLesson,
-	TutorialLessonSummary,
-	TutorialTrack,
-} from "@shared/tutorial/lessons";
 
 export type { TextCitation } from "@shared/citations";
 export type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
-export type {
-	TutorialCompletion,
-	TutorialLesson,
-	TutorialLessonSummary,
-	TutorialStep,
-	TutorialTrack,
-} from "@shared/tutorial/lessons";
 
 export type ChangelogEntry = {
 	version: string;
@@ -153,50 +142,6 @@ export interface LearningIndexResponse {
 
 export interface LearningSearchResponse {
 	results: LearningDocSummary[];
-}
-
-// --- Interactive tutorial ---
-//
-// The lesson/step shapes are imported from `@shared/tutorial/lessons` rather than
-// redeclared: the server serialises exactly those types, and a second copy here is
-// how a field silently stops being rendered after the shared one changes.
-
-export interface TutorialIndexResponse {
-	tracks: TutorialTrack[];
-	lessons: TutorialLessonSummary[];
-	progress: Record<string, TutorialLessonProgress>;
-	sandbox: { exists: boolean; projectId: string | null };
-}
-
-export interface TutorialLessonResponse {
-	lesson: TutorialLesson;
-	progress: TutorialLessonProgress | null;
-	/**
-	 * The tutorial narrator this lesson would continue, when one already exists.
-	 *
-	 * Null means nothing is running yet. The page must mount this rather than asking
-	 * the user to start again: starting writes a new lesson boundary, which rewinds
-	 * the script of a lesson that was already in progress.
-	 */
-	session: TutorialLessonSessionResponse | null;
-}
-
-export interface TutorialLessonSessionResponse {
-	lessonId: string;
-	narratorId: string;
-	projectId: string | null;
-	chapterId: string | null;
-}
-
-export interface TutorialLessonProgress {
-	completedStepIds: string[];
-	completedAt?: string;
-}
-
-export interface TutorialSandboxStatus {
-	exists: boolean;
-	projectId: string | null;
-	gitPath: string;
 }
 
 export interface SearchFallback {
@@ -572,8 +517,8 @@ export interface BaseContentBlock {
 	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
 	_subagentActivity?: SubagentActivitySummary;
 	/**
-	 * Child narrator id of a RUNNING `Await({type:"agent"})`, resolved server-side
-	 * from the call's target selector.
+	 * Child narrator id of a RUNNING `Await({type:"agent"})` or single-target Send,
+	 * resolved server-side from the call's target selector (legacy field name).
 	 *
 	 * Declared explicitly (the index signature would already admit it) because it is
 	 * the ONLY source of that id before the wait returns: a call in flight has no
@@ -596,6 +541,8 @@ export interface BaseContentBlock {
 	_takenOver?: boolean;
 	/** Source citations on assistant text blocks, indexed against `text`. */
 	citations?: TextCitation[];
+	fileReferenceContext?: FileReferenceContext;
+	reference?: FileReference;
 	[key: string]: unknown;
 }
 
@@ -836,6 +783,7 @@ export interface BufferMessageSummary {
 	/** Optional so a snapshot from an older server still parses. */
 	images?: BufferedImageSummary[];
 	textFiles?: BufferedTextFileSummary[];
+	fileReferences?: FileReference[];
 	creator?: BufferCreator | null;
 	priority?: boolean;
 }

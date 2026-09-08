@@ -26,8 +26,8 @@
  * reserved. The bar itself stays a zero-height absolute overlay; only its `top`
  * moves, so none of this can affect a measured height.
  *
- * Bodies with no readable text pass `target === undefined`; the host then renders
- * its children verbatim and costs nothing.
+ * The host stays mounted even before readable text or controls arrive. Only the
+ * toolbar is optional; late metadata never replaces the body's ancestor chain.
  */
 
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
@@ -41,6 +41,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import type { ContentViewportSnapshot } from "../AutoFollowScroll";
 import { useRenderInteractive } from "../RenderLodCtx";
 import { VListContentViewActions } from "./VListContentViewActions";
 import {
@@ -183,84 +184,47 @@ function useFloatState(
 	return { state, scrollToBodyTop };
 }
 
-/**
- * Fetch a PREFIX body's real payload once the reader has scrolled past
- * AUTO_LOAD_SCROLL_RATIO of it.
- *
- * WHY THE LISTENER IS IN THE CAPTURE PHASE
- * `scroll` does not bubble, so a listener on the host would never see its own
- * body scrolling. It DOES propagate down the capture path, which is exactly what
- * is wanted here: the host does not have to know which descendant owns the
- * scrollport (a capped box, a nested markdown box, a diff), and the list's own
- * viewport — an ANCESTOR of the host — is not on that path, so scrolling the
- * conversation can never be mistaken for reading this body.
- *
- * HEIGHT STABILITY
- * This does not weaken the "no resize without a user action" invariant. The
- * request goes through the same `fullPayloadRequested` gate a notice click used,
- * and a truncated body already reserves its FULL cap
- * (`cappedBodyHeight`), so the landing payload measures to `min(exact, cap)` —
- * byte-identical for any body that overflows its box, which every server-side
- * prefix does.
- */
-function useAutoLoadOnScroll(
-	hostRef: React.RefObject<HTMLDivElement | null>,
+/** Only the owning viewport may report reader progress, never programmatic scroll echoes. */
+function useReaderProgress(
 	target: VListViewTarget | undefined,
 	controls: VListViewControls | undefined,
 	enabled: boolean,
-): void {
-	// One shot per BODY IDENTITY, not per render: `target` is rebuilt from the
-	// measured document on every build, and the narrator list rebuilds on every
-	// live WS patch. Depending on the object therefore tore down and re-registered
-	// the listener — and reset `firedRef` — for every visible body on every frame
-	// of a stream. The request itself is idempotent (`markVListFullPayloadRequested`
-	// dedupes), so that churn bought nothing; the effect is keyed on `target.id`
-	// instead, which is what actually decides whether this is a different body.
-	const firedRef = useRef(false);
-	const request = controls?.requestFullPayload;
-	const truncated = target?.truncated === true;
-	const targetId = target?.id;
-	// `request(target)` must hand over the CURRENT target object, so the latest one
-	// is kept in a ref rather than closed over: narrowing the deps to `target.id`
-	// would otherwise pin the closure to whichever object happened to be current
-	// when the listener was installed.
-	const targetRef = useRef(target);
-	targetRef.current = target;
-
+): (node: HTMLElement, snapshot?: ContentViewportSnapshot) => void {
+	const currentRef = useRef({ target, controls, enabled });
+	currentRef.current = { target, controls, enabled };
+	const firedIdRef = useRef<string | null>(null);
+	const bodyIdRef = useRef(target?.id);
 	useEffect(() => {
-		const node = hostRef.current;
-		if (!enabled || !truncated || !request || targetId == null || !node) return;
-		// A new body starts un-fired. Reached only when one of the scalars above
-		// changes, so a document rebuild of the SAME body keeps whatever it already
-		// decided (and cannot ask twice).
-		firedRef.current = false;
-		const onScroll = (event: Event) => {
-			if (firedRef.current) return;
-			const box = event.target;
-			if (!(box instanceof HTMLElement)) return;
-			const scrollable = box.scrollHeight - box.clientHeight;
-			// A body that does not overflow its box has nothing to read past, so its
-			// scroll position says nothing about the reader's intent.
-			if (scrollable <= 0) return;
-			if (box.scrollTop / scrollable < AUTO_LOAD_SCROLL_RATIO) return;
-			const current = targetRef.current;
-			if (!current) return;
-			firedRef.current = true;
-			node.removeEventListener("scroll", onScroll, { capture: true });
-			request(current);
-		};
-		node.addEventListener("scroll", onScroll, { capture: true, passive: true });
-		return () => node.removeEventListener("scroll", onScroll, { capture: true });
-	}, [hostRef, enabled, truncated, request, targetId]);
+		if (bodyIdRef.current === target?.id) return;
+		bodyIdRef.current = target?.id;
+		firedIdRef.current = null;
+	}, [target?.id]);
+	return useCallback((node: HTMLElement, snapshot?: ContentViewportSnapshot) => {
+		const { target: current, controls: actions, enabled: interactive } = currentRef.current;
+		if (!interactive || !current?.truncated || !actions?.requestFullPayload) return;
+		if (firedIdRef.current === current.id) return;
+		const scrollHeight = snapshot?.scrollHeight ?? node.scrollHeight;
+		const viewportHeight = snapshot?.viewportHeight ?? node.clientHeight;
+		const scrollTop = snapshot?.scrollTop ?? node.scrollTop;
+		const scrollable = scrollHeight - viewportHeight;
+		if (scrollable <= 0 || scrollTop / scrollable < AUTO_LOAD_SCROLL_RATIO) return;
+		firedIdRef.current = current.id;
+		actions.requestFullPayload(current);
+	}, []);
 }
 
 export interface VListContentViewHostProps {
-	/** The body this host decorates; absent → children render untouched. */
+	/** The body this host decorates; absent only suppresses the toolbar. */
 	target: VListViewTarget | undefined;
 	controls: VListViewControls | undefined;
 	/** Extra styles merged onto the relative wrapper (never height-affecting). */
 	style?: CSSProperties;
-	children: ReactNode;
+	/** Pass this callback only to the owning AutoFollowScroll, never a painter. */
+	children:
+		| ReactNode
+		| ((
+				onReaderProgress: (node: HTMLElement, snapshot?: ContentViewportSnapshot) => void,
+		  ) => ReactNode);
 }
 
 export function VListContentViewHost({
@@ -281,11 +245,9 @@ export function VListContentViewHost({
 	// reached for a button. Either surface keeps it alive.
 	const hovered = pointerOverBody || pointerOverBar;
 	// Only tracked while the bar is actually on screen: an idle body pays nothing.
-	const { state: float, scrollToBodyTop } = useFloatState(hostRef, hovered && !isMobile);
-	// Reading far enough into a PREFIX body fetches the rest. Gated on `interactive`
-	// like every other affordance here: a workspace preview must not issue requests
-	// for bodies nobody is reading.
-	useAutoLoadOnScroll(hostRef, target, controls, interactive);
+	const enabled = !!target && !!controls && interactive;
+	const { state: float, scrollToBodyTop } = useFloatState(hostRef, enabled && hovered && !isMobile);
+	const onReaderProgress = useReaderProgress(target, controls, interactive);
 
 	const openFullscreen = useCallback(() => {
 		if (target && controls) controls.openFullscreen(target);
@@ -305,10 +267,6 @@ export function VListContentViewHost({
 		}
 	}, [isMobile, openFullscreen]);
 
-	if (!target || !controls || !interactive) {
-		return <>{children}</>;
-	}
-
 	return (
 		// A Mantine Box (not a raw div) keeps the pointer handlers off a static host
 		// element — the same pattern RenderSubagent's click-to-toggle header uses.
@@ -317,14 +275,15 @@ export function VListContentViewHost({
 		<Box
 			ref={hostRef}
 			style={{ ...relative, ...style }}
-			onMouseEnter={isMobile ? undefined : () => setPointerOverBody(true)}
-			onMouseLeave={isMobile ? undefined : () => setPointerOverBody(false)}
-			onClick={isMobile ? handleClick : undefined}
+			data-vlist-content-host
+			onMouseEnter={!enabled || isMobile ? undefined : () => setPointerOverBody(true)}
+			onMouseLeave={!enabled || isMobile ? undefined : () => setPointerOverBody(false)}
+			onClick={enabled && isMobile ? handleClick : undefined}
 		>
 			{/* Mounted only while hovered, so a scrolling list builds no Tooltip /
 			    CopyButton trees for bodies the reader is not pointing at. `hidden` drops
 			    it entirely: too little of the body is left to host a bar. */}
-			{hovered && float.mode !== "hidden" ? (
+			{enabled && target && controls && hovered && float.mode !== "hidden" ? (
 				<VListContentViewActions
 					target={target}
 					wordWrap={controls.isWrapped(target)}
@@ -338,7 +297,7 @@ export function VListContentViewHost({
 					onPointerOverChange={isMobile ? undefined : setPointerOverBar}
 				/>
 			) : null}
-			{children}
+			{typeof children === "function" ? children(onReaderProgress) : children}
 		</Box>
 	);
 }

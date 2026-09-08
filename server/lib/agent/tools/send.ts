@@ -136,6 +136,7 @@ export const sendTool: ToolDefinition = {
 			return { output: "Internal error: missing toolUseId", isError: true };
 		}
 
+		const toolUseId = ctx.currentToolUseId;
 		try {
 			const { sendSubagentMessageDetailed } = await import("@server/services/agent-communication");
 			const result = await sendSubagentMessageDetailed({
@@ -153,6 +154,18 @@ export const sendTool: ToolDefinition = {
 				signal: ctx.signal,
 				locale: ctx.locale,
 				userId: ctx.userId ?? null,
+				onTargetResolved: (targetId) => {
+					// Only primaries can wait. Reuse Await's navigation-only event; never
+					// manufacture a result while Send is still awaiting a reply.
+					if (raw.await !== true) return;
+					void import("@server/services/await-agent-resolution")
+						.then(async ({ singleSendSelector }) => {
+							if (!singleSendSelector(raw)) return;
+							const { broadcastAwaitAgentResolved } = await import("./await");
+							await broadcastAwaitAgentResolved(ctx.narratorId, toolUseId, targetId);
+						})
+						.catch(() => {});
+				},
 			});
 			return {
 				output: result.output,

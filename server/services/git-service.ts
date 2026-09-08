@@ -4,11 +4,12 @@ import { dirname, join } from "node:path";
 import { worktreeLock } from "../lib/async-mutex";
 import { GitAuthError, GitError } from "../lib/errors";
 import type { GitIdentityEnv } from "../lib/git-identity";
+import { mergeGitTrees, requireCompleteMergeTree } from "../lib/git-tree-merge";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { DEV_NULL } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
-import { supportsMergeTree, WORKTREES_DIR_NAME } from "./worktree-tree-snapshot";
+import { WORKTREES_DIR_NAME } from "./worktree-tree-snapshot";
 
 interface ExecResult {
 	stdout: string;
@@ -823,19 +824,10 @@ export const gitService = {
 	},
 
 	/**
-	 * Simulate a merge to detect conflicts without touching any worktree.
-	 *
-	 * Uses `merge-tree --write-tree` (git >= 2.38), whose contract is machine-readable:
-	 * exit 0 means clean, exit 1 means conflicted, and with `--name-only -z` stdout is
-	 * the result tree followed by the conflicting paths. The older three-argument form
-	 * cannot be used for this: it exits 0 either way and describes conflicts by
-	 * inlining `<<<<<<< .our` markers into a diff, so parsing it for `+++ b/` or
-	 * `CONFLICT` lines — patterns that only the new form emits — reported "no
-	 * conflicts" unconditionally and let the UI promise a clean merge that then failed.
-	 *
-	 * Throws on old git rather than falling back to the legacy form. A merge preview
-	 * that cannot see conflicts is worse than no preview: the caller can surface "not
-	 * checkable", but it cannot recover from being told a lie.
+	 * Simulate a merge without touching the user's worktree, index or refs.
+	 * Native merge-tree is preferred; old Git uses merge-recursive in a disposable
+	 * worktree/index. Never parse the legacy three-argument merge-tree's text: it
+	 * exits zero even on conflicts and previously promised clean merges incorrectly.
 	 */
 	async mergeTree(
 		repoPath: string,
@@ -843,43 +835,14 @@ export const gitService = {
 		ourBranch: string,
 		theirBranch: string,
 	): Promise<{ hasConflicts: boolean; conflictFiles: string[] }> {
-		if (!(await supportsMergeTree())) {
-			throw new GitError(
-				"Cannot check for merge conflicts: git merge-tree --write-tree is unavailable (requires git >= 2.38)",
-			);
-		}
-		const result = await execRead(
-			[
-				"merge-tree",
-				"--write-tree",
-				"--name-only",
-				"--no-messages",
-				"-z",
-				`--merge-base=${baseSha}`,
-				ourBranch,
-				theirBranch,
-			],
-			repoPath,
-			// exit 1 is the documented "conflicts found" status, so it must not be logged
-			// as a command failure.
-			true,
-		);
-		if (result.exitCode !== 0 && result.exitCode !== 1) {
-			throw new GitError(gitFailureMessage("Merge conflict check failed", result));
-		}
-		if (result.truncated) {
-			// A cut-off list would understate the conflicts, which is the exact failure
-			// this rewrite exists to remove.
-			throw new GitError("Merge conflict check produced more output than can be read");
-		}
-		const parts = result.stdout.split("\0").filter(Boolean);
-		// parts[0] is the merged tree — written to the object store even when
-		// conflicted, and irrelevant here since nothing gets checked out.
-		const [tree, ...conflictFiles] = parts;
-		if (!tree) throw new GitError("Merge conflict check returned no tree");
-		// Trust the exit code over the path list: `--name-only` omits paths for some
-		// conflict kinds, so exit 1 with no names still means "do not promise clean".
-		return { hasConflicts: result.exitCode === 1, conflictFiles };
+		const result = await mergeGitTrees({
+			worktreePath: repoPath,
+			base: baseSha,
+			ours: ourBranch,
+			theirs: theirBranch,
+		});
+		requireCompleteMergeTree(result);
+		return { hasConflicts: result.hasConflicts, conflictFiles: result.conflicts };
 	},
 
 	/** Perform actual merge in a worktree */

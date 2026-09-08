@@ -1,6 +1,12 @@
+import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import { and, asc, eq, isNotNull } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages, narrators } from "../db/schema";
+import {
+	freezeFileReferenceSnapshots,
+	getFileReferenceSnapshots,
+	projectFileReferenceText,
+} from "../lib/agent/file-reference-projection";
 import { AsyncMutex } from "../lib/async-mutex";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
@@ -42,6 +48,8 @@ export interface ResumeSubagentInput {
 	prompt?: string;
 	images?: ImageRef[];
 	textFiles?: File[];
+	fileReferences?: FileReferenceSnapshot[];
+	editFileReferences?: FileReferenceSnapshot[];
 	commandText?: string | null;
 	createdBy?: string | null;
 	retryToolUseId?: string;
@@ -113,6 +121,7 @@ interface ActiveResumeRun {
 	runId: string | null;
 	publicationClaimId: string;
 	originToolUseId: string;
+	standaloneParentNarratorId: string | null;
 	phase: "starting" | "running" | "delivering";
 	delivered: boolean;
 }
@@ -170,7 +179,12 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 		const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
 		if (!lastUserMessage)
 			throw new ValidationError("No subagent user message is available to retry");
-		prompt = extractPromptText(lastUserMessage.contentText);
+		prompt = extractPromptText(
+			projectFileReferenceText(
+				lastUserMessage.contentText ?? "",
+				getFileReferenceSnapshots(lastUserMessage.contentJson),
+			),
+		);
 		// `skipRevert` must be forwarded, not defaulted. `deleteMessagesAfter` rolls the
 		// workspace back unless told otherwise, so omitting it here reverts files that
 		// the caller may have explicitly asked to keep — and a `regenerate_edited_message`
@@ -196,7 +210,13 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 				});
 			}
 		}
-		const rebuilt = await loadSubagentHistory(input.subagentId, effectiveModel, provider);
+		const rebuilt = await loadSubagentHistory(
+			input.subagentId,
+			effectiveModel,
+			provider,
+			undefined,
+			prompt,
+		);
 		initialHistory = rebuilt.history;
 		initialTrailingToolResults = rebuilt.trailingToolResults;
 		persistPrompt = false;
@@ -213,7 +233,13 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 		}
 	}
 
-	if (persistPrompt && !prompt.trim() && !input.images?.length && !input.textFiles?.length) {
+	if (
+		persistPrompt &&
+		!prompt.trim() &&
+		!input.images?.length &&
+		!input.textFiles?.length &&
+		!input.fileReferences?.length
+	) {
 		throw new ValidationError("A follow-up message or attachment is required");
 	}
 
@@ -234,12 +260,12 @@ function broadcastUserMessage(
 	broadcastToNarrator(parentNarratorId, {
 		type: "user_message",
 		narratorId: parentNarratorId,
-		message: userMessage,
+		message: fileReferenceMessageForDisplay(userMessage),
 	});
 	broadcastToNarrator(subagentId, {
 		type: "user_message",
 		narratorId: subagentId,
-		message: { ...userMessage, parentToolUseId: null },
+		message: fileReferenceMessageForDisplay({ ...userMessage, parentToolUseId: null }),
 	});
 }
 
@@ -282,6 +308,17 @@ async function deliverCompletedResume(
 				active.phase = "delivering";
 
 				const narrator = await narratorService.getById(subagentId);
+				if (active.standaloneParentNarratorId && narrator.originToolCallId === null) {
+					if (
+						narrator.subagentOriginKind !== "standalone" ||
+						narrator.parentNarratorId !== active.standaloneParentNarratorId
+					) {
+						throw new ValidationError("Standalone worker creation binding has changed");
+					}
+					active.delivered = true;
+					activeResumeRuns.delete(subagentId);
+					return;
+				}
 				const substatus = parseSubstatus(narrator.substatus);
 				const hasError = substatus.includes("error") || !!narrator.errorMessage;
 				const finalText = stripSubagentResultPrefix(completionOutput) || "(no output)";
@@ -289,15 +326,21 @@ async function deliverCompletedResume(
 					"./narrator-session"
 				);
 				const resultMessageId = await getSubagentResultMessageId(subagentId);
-				const toolCall = await narratorService.getToolCallByToolUseId(originToolUseId);
-				let privateMessageId: string | undefined;
-				if (
-					toolCall?.messageId &&
-					(await narratorService.isMessageSharedByMultipleNarrators(toolCall.messageId))
-				) {
-					privateMessageId = await narratorService.copyOnWriteToolCallMessage(
+				const { narratorPersistence } = await import("./narrator-persistence");
+				let reference = await narratorPersistence.resolveSubagentConclusionReference(
+					subagentId,
+					narrator.parentNarratorId as string,
+					originToolUseId,
+				);
+				if (await narratorService.isMessageSharedByMultipleNarrators(reference.messageId)) {
+					await narratorService.copyOnWriteToolCallMessage(
 						narrator.parentNarratorId as string,
-						toolCall.messageId,
+						reference.messageId,
+						originToolUseId,
+					);
+					reference = await narratorPersistence.resolveSubagentConclusionReference(
+						subagentId,
+						narrator.parentNarratorId as string,
 						originToolUseId,
 					);
 				}
@@ -307,7 +350,8 @@ async function deliverCompletedResume(
 					toolUseId: originToolUseId,
 					finalText,
 					hasError,
-					messageId: privateMessageId,
+					messageId: reference.messageId,
+					toolCallId: reference.toolCallId,
 					resultMessageId,
 				});
 				active.delivered = true;
@@ -325,6 +369,17 @@ async function deliverCompletedResume(
 }
 
 export async function resumeSubagent(input: ResumeSubagentInput): Promise<ResumeSubagentResult> {
+	input = {
+		...input,
+		fileReferences:
+			input.fileReferences === undefined
+				? undefined
+				: freezeFileReferenceSnapshots(input.fileReferences),
+		editFileReferences:
+			input.editFileReferences === undefined
+				? undefined
+				: freezeFileReferenceSnapshots(input.editFileReferences),
+	};
 	return withSubagentResumeLock(input.subagentId, async () => {
 		const original = await narratorService.getById(input.subagentId);
 		if (!isSubagentVariant(original.variant) || !original.parentNarratorId) {
@@ -353,14 +408,16 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 		if (await reconcileRunningStatus(input.subagentId)) {
 			original.status = (await narratorService.getById(input.subagentId)).status;
 		}
-		// A subagent that was never started by its parent (e.g. a team temp worker
-		// recruited directly through the plugin API) has no real runner, so its
-		// "working" status is stale — treating it as running would either buffer the
-		// message forever or reject the resume. Let the standalone start path
-		// below (which synthesizes an origin tool-use id) actually run it.
-		const neverStarted = !(await resolveSubagentOriginToolUseId(input.subagentId).catch(
-			() => null,
-		));
+		const standaloneOrigin =
+			original.subagentOriginKind === "standalone" && original.originToolCallId === null;
+		const linkedOrigin = await resolveSubagentOriginToolUseId(input.subagentId).catch((error) => {
+			if (!(error instanceof ValidationError)) throw error;
+			if (!standaloneOrigin) throw error;
+			return null;
+		});
+		// Only an explicitly standalone worker with no persisted input can bypass the stale
+		// status check. Message grouping is not evidence of creation provenance.
+		const neverStarted = !!standaloneOrigin && !linkedOrigin;
 		if (
 			!manualOverride &&
 			!neverStarted &&
@@ -370,15 +427,8 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 			throw new ValidationError("Subagent is already running; queue the message instead");
 		}
 
-		const originToolUseId = await resolveSubagentOriginToolUseId(input.subagentId).catch(() => {
-			// Never-started subagent (e.g. a team temp worker recruited directly
-			// through the plugin API): there is no originating Agent tool call.
-			// Synthesize a standalone tool-use id so the message can still be
-			// persisted and the subagent run. Conclusion delivery back to a tool
-			// call is a no-op for the synthesized id (updateToolCallResult finds
-			// no matching row), which is exactly right for standalone runs.
-			return `standalone-${generateId()}`;
-		});
+		// A standalone tool-use id is a message transport link only, never an Agent origin.
+		const originToolUseId = linkedOrigin ?? `standalone-${input.subagentId}`;
 		let effectiveInput = input;
 		// Set by the regenerate_edited_message branch below, then attached to every
 		// return path so the advisory is not lost between the rollback and the reply.
@@ -424,6 +474,7 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 					newImages: effectiveInput.editNewImages,
 					keepTextFilePaths: effectiveInput.editKeepTextFilePaths,
 					newTextFiles: effectiveInput.editNewTextFiles,
+					fileReferences: effectiveInput.editFileReferences,
 					userId: effectiveInput.createdBy,
 					deferContinuation: true,
 					revertFiles: effectiveInput.editRevertFiles ?? true,
@@ -479,11 +530,16 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 						{
 							images: input.images,
 							textFiles: savedTextFiles,
+							fileReferences: input.fileReferences,
 							commandText: input.commandText,
 							createdBy: input.createdBy,
 						},
 					);
 				}
+				const currentInput = projectFileReferenceText(
+					userMessage?.contentText ?? prepared.prompt,
+					prepared.persistPrompt ? input.fileReferences : [],
+				);
 				const rebuilt =
 					prepared.initialHistory && prepared.initialTrailingToolResults
 						? {
@@ -494,6 +550,8 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 								input.subagentId,
 								resolveEffectiveModel(prepared.narrator.model),
 								resolveProvider(resolveEffectiveModel(prepared.narrator.model)),
+								undefined,
+								currentInput,
 							);
 
 				const runtime = getManualOverrideRuntime(input.subagentId);
@@ -504,7 +562,7 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 				await narratorService.updateStatus(input.subagentId, "working");
 				const resumed = settleManualOverrideClaim(manualClaim, {
 					action: "resume",
-					prompt: prepared.prompt,
+					prompt: currentInput,
 					history: rebuilt.history,
 					trailingToolResults: rebuilt.trailingToolResults,
 					userId: input.createdBy ?? null,
@@ -539,6 +597,7 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 			runId: null,
 			publicationClaimId,
 			originToolUseId,
+			standaloneParentNarratorId: standaloneOrigin ? original.parentNarratorId : null,
 			phase: "starting",
 			delivered: false,
 		});
@@ -550,6 +609,7 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 				prompt: prepared.prompt,
 				images: input.images,
 				textFiles: input.textFiles,
+				fileReferences: input.fileReferences,
 				commandText: input.commandText,
 				createdBy: input.createdBy,
 				userId: input.createdBy,

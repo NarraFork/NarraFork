@@ -72,7 +72,25 @@ describe("live-patch audit: fields that DO change height are in the cache key", 
 		const running = card({ status: "running" });
 		const done = card({
 			status: "success",
-			detail: { kind: "capped", cap: "term", contentLines: 6, text: "a\nb\nc\nd\ne\nf" },
+			detail: {
+				kind: "sections",
+				sections: [
+					{
+						key: "output.main",
+						body: {
+							kind: "capped",
+							id: "audit:output.main",
+							source: "output.main",
+							format: "text",
+							live: false,
+							followTarget: { kind: "end" },
+							cap: "term",
+							contentLines: 6,
+							text: "a\nb\nc\nd\ne\nf",
+						},
+					},
+				],
+			},
 		} as Partial<ToolCallData>);
 		expect(measureToolCall(done, WIDTH, LOD, OPENED).height).not.toBe(
 			measureToolCall(running, WIDTH, LOD, OPENED).height,
@@ -85,15 +103,46 @@ describe("live-patch audit: fields that DO change height are in the cache key", 
 		const { extractDataRevision } = await cacheMod();
 		const short = card({
 			status: "success",
-			detail: { kind: "capped", cap: "term", contentLines: 1, text: "ok" },
+			detail: {
+				kind: "sections",
+				sections: [
+					{
+						key: "output.main",
+						body: {
+							kind: "capped",
+							id: "audit:output.main",
+							source: "output.main",
+							format: "text",
+							live: false,
+							followTarget: { kind: "end" },
+							cap: "term",
+							contentLines: 1,
+							text: "ok",
+						},
+					},
+				],
+			},
 		} as Partial<ToolCallData>);
 		const long = card({
 			status: "success",
 			detail: {
-				kind: "capped",
-				cap: "term",
-				contentLines: 8,
-				text: "1\n2\n3\n4\n5\n6\n7\n8",
+				kind: "sections",
+				sections: [
+					{
+						key: "output.main",
+						body: {
+							kind: "capped",
+							id: "audit:output.main",
+							source: "output.main",
+							format: "text",
+							live: false,
+							followTarget: { kind: "end" },
+							cap: "term",
+							contentLines: 8,
+							text: "1\n2\n3\n4\n5\n6\n7\n8",
+						},
+					},
+				],
 			},
 		} as Partial<ToolCallData>);
 		expect(measureToolCall(long, WIDTH, LOD, OPENED).height).toBeGreaterThan(
@@ -108,7 +157,12 @@ describe("live-patch audit: fields that DO change height are in the cache key", 
 		const bare = card({ status: "fail" });
 		const withError = card({
 			status: "fail",
-			detail: { kind: "error", text: "boom\nstack line\nanother line" },
+			detail: {
+				kind: "sections",
+				sections: [
+					{ key: "meta.error", body: { kind: "error", text: "boom\nstack line\nanother line" } },
+				],
+			},
 		} as Partial<ToolCallData>);
 		expect(measureToolCall(withError, WIDTH, LOD, OPENED).height).toBeGreaterThan(
 			measureToolCall(bare, WIDTH, LOD, OPENED).height,
@@ -664,7 +718,25 @@ describe("live-patch audit: fields that are height-NEUTRAL (single header row)",
 	const expandedCard = (overrides: Partial<ToolCallData> = {}) =>
 		card({
 			status: "success",
-			detail: { kind: "capped", cap: "term", contentLines: 4, text: "a\nb\nc\nd" },
+			detail: {
+				kind: "sections",
+				sections: [
+					{
+						key: "output.main",
+						body: {
+							kind: "capped",
+							id: "audit:output.main",
+							source: "output.main",
+							format: "text",
+							live: false,
+							followTarget: { kind: "end" },
+							cap: "term",
+							contentLines: 4,
+							text: "a\nb\nc\nd",
+						},
+					},
+				],
+			},
 			...overrides,
 		} as Partial<ToolCallData>);
 
@@ -847,8 +919,13 @@ describe("live-patch audit: fields that are height-NEUTRAL (single header row)",
 			status: "running",
 			inputJson: { type: "agent", id: "paper-extract" },
 		} as const;
-		const without = classifyToolDetail({ ...base, metadata: { awaitType: "agent" } });
+		const without = classifyToolDetail({
+			toolUseId: "audit-await",
+			...base,
+			metadata: { awaitType: "agent" },
+		});
 		const withId = classifyToolDetail({
+			toolUseId: "audit-await",
 			...base,
 			metadata: { awaitType: "agent", subagentId: "sub-live" },
 		});
@@ -883,7 +960,25 @@ describe("live-patch audit: a patched card misses its stale cache entry", () => 
 			extractDataRevision(
 				card({
 					status: "success",
-					detail: { kind: "capped", cap: "term", contentLines: 3, text: "a\nb\nc" },
+					detail: {
+						kind: "sections",
+						sections: [
+							{
+								key: "output.main",
+								body: {
+									kind: "capped",
+									id: "audit:output.main",
+									source: "output.main",
+									format: "text",
+									live: false,
+									followTarget: { kind: "end" },
+									cap: "term",
+									contentLines: 3,
+									text: "a\nb\nc",
+								},
+							},
+						],
+					},
 				} as Partial<ToolCallData>),
 			),
 		);

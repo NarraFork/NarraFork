@@ -20,6 +20,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import type {
 	AttributionActor,
+	CurrentDiffTarget,
+	CurrentDiffView,
 	FileModificationGroup,
 	GitStatusSummary,
 	WorkspaceModificationView,
@@ -27,6 +29,7 @@ import type {
 import { __resetGitFolderPrefsCache } from "../../hooks/useGitFolderPrefs";
 import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
+import zhGitLocale from "../../locales/zh-CN/git.json";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
 
 // Isolated i18next instance, for the same reason as GitPanel.test.tsx: sibling suites
@@ -117,7 +120,10 @@ async function initTestI18n() {
 			fallbackLng: "en",
 			defaultNS: "common",
 			ns: ["common", "git"],
-			resources: { en: { common: commonLocale, git: gitLocale } },
+			resources: {
+				en: { common: commonLocale, git: gitLocale },
+				"zh-CN": { git: zhGitLocale },
+			},
 			interpolation: { escapeValue: false },
 			react: { useSuspense: false },
 		});
@@ -152,16 +158,29 @@ function makeStatus(path = "src/one.ts"): GitStatusSummary {
 }
 
 const EXTERNAL_ACTOR: AttributionActor = {
+	kind: "external_unknown",
 	narratorId: null,
+	userId: null,
 	title: null,
 	subagentType: null,
 	parentTitle: null,
 	exists: false,
+	deleted: false,
+	identityKnown: false,
+};
+const UNKNOWN_NARRATOR: AttributionActor = {
+	...EXTERNAL_ACTOR,
+	kind: "narrator_unknown",
+	deleted: null,
 };
 
 function narrator(overrides: Partial<AttributionActor> = {}): AttributionActor {
 	return {
+		kind: "primary",
 		narratorId: "n1",
+		userId: null,
+		deleted: false,
+		identityKnown: true,
 		title: "Refactor auth",
 		subagentType: null,
 		parentTitle: null,
@@ -171,15 +190,27 @@ function narrator(overrides: Partial<AttributionActor> = {}): AttributionActor {
 }
 
 function group(overrides: Partial<FileModificationGroup> = {}): FileModificationGroup {
+	const lastActor = overrides.lastActor ?? EXTERNAL_ACTOR;
+	const actors = overrides.actors ?? [lastActor];
 	return {
 		filePath: "src/one.ts",
 		changeCount: 1,
 		lastChangedAt: "2026-01-01T00:00:00.000Z",
-		lastActor: EXTERNAL_ACTOR,
-		actors: [EXTERNAL_ACTOR],
+		lastAction: "external",
+		lastActor,
+		actors,
 		hasExternalChange: false,
-		hasImpreciseAttribution: false,
+		hasImpreciseAttribution: true,
 		hasDeletedActor: false,
+		completeness: {
+			fileHistoryComplete: true,
+			contributorsTruncated: false,
+			countsLowerBound: actors.some((actor) => !actor.identityKnown),
+			warningScanComplete: actors.every((actor) => actor.deleted !== null),
+			asOfRevision: null,
+		},
+		evidence: "legacy",
+		attributionGrade: "observed_ambiguous",
 		...overrides,
 	};
 }
@@ -192,6 +223,53 @@ function view(byFile: FileModificationGroup[]): WorkspaceModificationView {
 		hasMore: false,
 		actors: byFile.flatMap((g) => g.actors),
 		windowCount: byFile.reduce((sum, g) => sum + g.changeCount, 0),
+		completeness: {
+			fileHistoryComplete: byFile.every((group) => group.completeness.fileHistoryComplete),
+			contributorsTruncated: byFile.some((group) => group.completeness.contributorsTruncated),
+			countsLowerBound: byFile.some((group) => group.completeness.countsLowerBound),
+			warningScanComplete: byFile.every((group) => group.completeness.warningScanComplete),
+			asOfRevision: null,
+		},
+		evidence: "legacy",
+		baselineStatus: "unverified",
+	};
+}
+
+function currentTarget(overrides: Partial<CurrentDiffTarget> = {}): CurrentDiffTarget {
+	return {
+		source: "current_diff",
+		target: "worktree",
+		status: "matching_evidence",
+		actor: narrator(),
+		effectId: "effect-id",
+		reason: null,
+		baselineVersion: "a".repeat(64),
+		historyComplete: true,
+		modeScope: "filesystem",
+		continuity: "unverified",
+		...overrides,
+	};
+}
+function currentView(
+	index: CurrentDiffTarget,
+	worktree: CurrentDiffTarget,
+	overrides: Partial<CurrentDiffView> = {},
+): CurrentDiffView {
+	return {
+		source: "current_diff",
+		baselineStatus: "stable",
+		version: "a".repeat(64),
+		headSha: "abc1234",
+		clean: false,
+		complete: true,
+		scope: {
+			id: "scope",
+			sourceInstanceId: "source",
+			workspaceInstanceId: "instance",
+			revision: 2,
+		},
+		byFile: [{ filePath: "src/one.ts", index, worktree }],
+		...overrides,
 	};
 }
 
@@ -207,6 +285,7 @@ async function renderBadge(
 	chapterId: string,
 	modifications: WorkspaceModificationView,
 	path = "src/one.ts",
+	statusOverride?: GitStatusSummary,
 ): Promise<HTMLElement> {
 	const queryClient = new QueryClient({
 		defaultOptions: {
@@ -214,7 +293,7 @@ async function renderBadge(
 			mutations: { retry: false },
 		},
 	});
-	queryClient.setQueryData(["gitStatus", chapterId], makeStatus(path));
+	queryClient.setQueryData(["gitStatus", chapterId], statusOverride ?? makeStatus(path));
 	queryClient.setQueryData(["gitModifications", chapterId, "uncommitted"], modifications);
 
 	const container = document.createElement("div");
@@ -270,6 +349,7 @@ describe("GitChangesTab attribution badge", () => {
 		installDom();
 		__resetGitFolderPrefsCache();
 		await initTestI18n();
+		await i18n.changeLanguage("en");
 	});
 
 	afterEach(() => {
@@ -286,7 +366,7 @@ describe("GitChangesTab attribution badge", () => {
 			view([group({ hasExternalChange: true })]),
 		);
 
-		expect(badgeText(container)).toBe("External");
+		expect(badgeText(container)).toBe("External · incomplete");
 		expect(badgeText(container)).not.toContain("+");
 	});
 
@@ -294,10 +374,17 @@ describe("GitChangesTab attribution badge", () => {
 		// Same shape via the other flag: a tool change whose narrator row is gone.
 		const container = await renderBadge(
 			"chapter-attr-deleted-only",
-			view([group({ hasDeletedActor: true })]),
+			view([
+				group({
+					lastActor: UNKNOWN_NARRATOR,
+					lastAction: "write",
+					actors: [UNKNOWN_NARRATOR],
+					hasDeletedActor: null,
+				}),
+			]),
 		);
 
-		expect(badgeText(container)).toBe("Deleted session");
+		expect(badgeText(container)).toBe("Unknown session (identity missing or deleted) · incomplete");
 		expect(badgeText(container)).not.toContain("+");
 	});
 
@@ -305,7 +392,7 @@ describe("GitChangesTab attribution badge", () => {
 		// `exists: false` on the last actor is the deleted-session case seen from a row
 		// that still carries the id. The tooltip used to name it, then append "Also
 		// modified by Deleted session" about the very same actor.
-		const deleted = narrator({ narratorId: "gone", title: null, exists: false });
+		const deleted = narrator({ narratorId: "gone", title: null, exists: false, deleted: true });
 		const container = await renderBadge(
 			"chapter-attr-deleted-lastactor",
 			view([group({ lastActor: deleted, actors: [deleted], hasDeletedActor: true })]),
@@ -313,25 +400,29 @@ describe("GitChangesTab attribution badge", () => {
 
 		expect(badgeText(container)).toBe("Deleted session");
 		expect(badgeText(container)).not.toContain("+");
-		expect(tooltipText(container)).toBe("Last modified by Deleted session");
-		expect(tooltipText(container)).not.toContain("Also modified by");
+		expect(tooltipText(container)).toContain("Latest observed actor: Deleted session");
+		expect(tooltipText(container)).not.toContain("Previously observed participant:");
 	});
 
-	test("external and deleted together: the badge names one and counts the other", async () => {
-		// External wins the label (it is the one still investigable), so the count must
-		// subtract external and keep deleted — exactly one, not zero and not two.
+	test("external then deleted narrator uses the last event, not historical flags", async () => {
 		const container = await renderBadge(
 			"chapter-attr-external-and-deleted",
-			view([group({ hasExternalChange: true, hasDeletedActor: true })]),
+			view([
+				group({
+					lastActor: UNKNOWN_NARRATOR,
+					lastAction: "edit",
+					actors: [UNKNOWN_NARRATOR, EXTERNAL_ACTOR],
+					hasExternalChange: true,
+					hasDeletedActor: null,
+				}),
+			]),
 		);
-
-		expect(badgeText(container)).toBe("External +1");
+		expect(badgeText(container)).toBe("Unknown session (identity missing or deleted) · incomplete");
 		const tooltip = tooltipText(container);
-		expect(tooltip).toContain("Last modified by External");
-		// The remaining class is reported once, as an "also", and external is NOT
-		// repeated as a separate line.
-		expect(tooltip).toContain("Also modified by Deleted session");
-		expect(tooltip).not.toContain("Also has external/terminal changes");
+		expect(tooltip).toContain("Latest observed actor: Unknown session");
+		expect(tooltip).toContain("Latest observed action: Edit");
+		expect(tooltip).toContain("Previously observed participant: External");
+		expect(tooltip).not.toContain("Latest observed actor: External");
 	});
 
 	test("multiple narrator contributors are counted, excluding the one named", async () => {
@@ -345,27 +436,25 @@ describe("GitChangesTab attribution badge", () => {
 
 		expect(badgeText(container)).toBe("Refactor auth +2");
 		const tooltip = tooltipText(container);
-		expect(tooltip).toContain("Last modified by Refactor auth");
-		expect(tooltip).toContain("Also modified by Fix tests");
-		expect(tooltip).toContain("Also modified by Docs pass (general subagent)");
+		expect(tooltip).toContain("Latest observed actor: Refactor auth");
+		expect(tooltip).toContain("Previously observed participant: Fix tests");
+		expect(tooltip).toContain("Previously observed participant: Docs pass (general subagent)");
 	});
 
-	test("an external change alongside a named narrator is reported as an extra", async () => {
-		// The complement of the first test: here the label names a narrator, so the
-		// external flag is genuinely additional information and must be counted.
+	test("an external observation is shown without inventing a distinct extra identity", async () => {
 		const last = narrator();
 		const container = await renderBadge(
 			"chapter-attr-narrator-plus-external",
-			view([group({ lastActor: last, actors: [last], hasExternalChange: true })]),
+			view([group({ lastActor: last, actors: [last, EXTERNAL_ACTOR], hasExternalChange: true })]),
 		);
-
-		expect(badgeText(container)).toBe("Refactor auth +1");
-		expect(tooltipText(container)).toContain("Also has external/terminal changes");
+		expect(badgeText(container)).toBe("Refactor auth · incomplete");
+		expect(tooltipText(container)).toContain("Previously observed participant: External");
+		expect(tooltipText(container)).toContain(gitLocale.attributionCountsLowerBound);
 	});
 
 	test("a file with no recorded contributor renders no badge", async () => {
-		// "Nobody wrote this" is the honest answer for an absent path; inventing a
-		// contributor is worse than showing none.
+		// An absent path has no observation to label. This is not evidence that no one
+		// changed the file; the panel explains the distinction instead of inventing an actor.
 		const container = await renderBadge("chapter-attr-none", view([]));
 
 		expect(() => badgeText(container)).toThrow("Attribution badge not rendered");
@@ -380,6 +469,174 @@ describe("GitChangesTab attribution badge", () => {
 			windowCount: 0,
 		});
 
-		expect(container.textContent).toContain("Attribution not fully loaded");
+		expect(container.textContent).toContain(gitLocale.attributionWindowTruncated);
+	});
+
+	test("a nonempty capped window still reports incomplete contributors", async () => {
+		const last = narrator();
+		const container = await renderBadge("chapter-attr-partial-nonempty", {
+			...view([group({ lastActor: last, actors: [last] })]),
+			hasMore: true,
+			windowCount: 1,
+		});
+
+		expect(badgeText(container)).toBe("Refactor auth");
+		expect(container.textContent).toContain(gitLocale.attributionWindowTruncated);
+	});
+
+	test("a complete nonempty window does not show the truncation warning", async () => {
+		const container = await renderBadge(
+			"chapter-attr-complete-nonempty",
+			view([group({ hasExternalChange: true })]),
+		);
+
+		expect(badgeText(container)).toBe("External · incomplete");
+		expect(container.textContent).not.toContain(gitLocale.attributionWindowTruncated);
+	});
+
+	test("the incomplete-window warning has the same meaning in Chinese", async () => {
+		await i18n.changeLanguage("zh-CN");
+		const container = await renderBadge(
+			"chapter-attr-partial-zh",
+			{ ...view([]), hasMore: true, windowCount: 4 },
+			"one.ts",
+		);
+
+		expect(container.textContent).toContain(zhGitLocale.attributionWindowTruncated);
+		expect(container.textContent).not.toContain(gitLocale.attributionWindowTruncated);
+	});
+
+	test("human saves name the real users and do not collapse null narratorIds", async () => {
+		const alice = narrator({ kind: "human", narratorId: null, userId: "u1", title: "Alice" });
+		const bob = narrator({ kind: "human", narratorId: null, userId: "u2", title: "Bob" });
+		const container = await renderBadge(
+			"chapter-human-users",
+			view([group({ lastActor: bob, lastAction: "human", actors: [bob, alice] })]),
+		);
+		expect(badgeText(container)).toBe("User: Bob +1");
+		expect(tooltipText(container)).toContain("Previously observed participant: User: Alice");
+		expect(tooltipText(container)).toContain("Latest observed action: User save");
+	});
+
+	test("a deleted user's lost identity is explicitly unknown, never external", async () => {
+		const missingUser = { ...EXTERNAL_ACTOR, kind: "human" as const, deleted: null };
+		const container = await renderBadge(
+			"chapter-human-unknown",
+			view([group({ lastActor: missingUser, lastAction: "human", actors: [missingUser] })]),
+		);
+		expect(badgeText(container)).toBe("Unknown user (identity missing or deleted) · incomplete");
+		expect(tooltipText(container)).not.toContain("Latest observed actor: External");
+	});
+
+	test("a ten-row slice renders lower-bound counts and unknown flags in its badge", async () => {
+		const last = narrator();
+		const other = narrator({ narratorId: "n2", title: "Earlier" });
+		const container = await renderBadge("chapter-file-truncated", {
+			...view([
+				group({
+					lastActor: last,
+					actors: [last, other],
+					changeCount: 10,
+					hasExternalChange: null,
+					hasDeletedActor: null,
+					completeness: {
+						fileHistoryComplete: false,
+						contributorsTruncated: true,
+						countsLowerBound: true,
+						warningScanComplete: false,
+						asOfRevision: null,
+					},
+				}),
+			]),
+			hasMore: true,
+		});
+		expect(badgeText(container)).toBe("Refactor auth +≥1 · incomplete");
+		expect(tooltipText(container)).toContain(gitLocale.attributionHistoryTruncated);
+		expect(tooltipText(container)).toContain(gitLocale.attributionFlagsUnknown);
+		expect(tooltipText(container)).toContain(gitLocale.attributionCountsLowerBound);
+		expect(container.textContent).toContain(gitLocale.attributionWindowTruncated);
+	});
+
+	test("complete Write history still distinguishes observations from the current net diff", async () => {
+		const last = narrator();
+		const container = await renderBadge(
+			"chapter-legacy-observation",
+			view([group({ lastActor: last, lastAction: "write", actors: [last] })]),
+		);
+		expect(container.textContent).toContain(gitLocale.attributionObservationOnly);
+		expect(tooltipText(container)).toContain(gitLocale.attributionHistoryComplete);
+		expect(tooltipText(container)).toContain(gitLocale.attributionLegacyObserved);
+		expect(tooltipText(container)).toContain(gitLocale.attributionNotCurrentOwnership);
+		expect(container.textContent).not.toContain(gitLocale.attributionWindowTruncated);
+	});
+
+	test("current index and worktree rows display their own evidence rather than history counts", async () => {
+		const ai = narrator();
+		const person = narrator({ kind: "human", narratorId: null, userId: "human", title: "Alice" });
+		const status = makeStatus();
+		status.staged = 1;
+		status.files[0].status = "MM";
+		status.files[0].stagedLinesAdded = 1;
+		const current = currentView(
+			currentTarget({ target: "index", modeScope: "git_executable_bit", actor: ai }),
+			currentTarget({ actor: person }),
+		);
+		const container = await renderBadge(
+			"chapter-current-split",
+			{ ...view([group({ lastActor: ai, actors: [ai, person] })]), currentDiff: current },
+			"src/one.ts",
+			status,
+		);
+		const rows = Array.from(
+			container.querySelectorAll('[role="button"][aria-label="View diff of src/one.ts"]'),
+		);
+		expect(rows).toHaveLength(2);
+		const captions = rows.map((row) => row.querySelectorAll(".mantine-Badge-root")[1]?.textContent);
+		expect(captions).toEqual(["Evidence: Refactor auth", "Evidence: User: Alice"]);
+		expect(container.textContent).toContain(gitLocale.attributionCurrentExplanation);
+		expect(tooltipText(container)).toContain(gitLocale.attributionContinuityUnknown);
+		expect(tooltipText(container)).toContain("Baseline version: aaaaaaaaaaaa");
+	});
+
+	test("a clean live workspace suppresses historical badges even if the status cache is old", async () => {
+		const clean = currentTarget({ status: "clean", actor: null });
+		const container = await renderBadge("chapter-current-clean", {
+			...view([group({ lastActor: narrator() })]),
+			currentDiff: currentView(clean, clean, { clean: true }),
+		});
+		expect(() => badgeText(container)).toThrow("Attribution badge not rendered");
+	});
+
+	test("stale and unknown current baselines never show the historic actor as current", async () => {
+		const matching = currentTarget();
+		const container = await renderBadge("chapter-current-stale", {
+			...view([group({ lastActor: narrator() })]),
+			currentDiff: currentView(matching, matching, {
+				baselineStatus: "stale",
+				version: null,
+				complete: false,
+			}),
+		});
+		expect(badgeText(container)).toBe("Attribution unknown · incomplete");
+		expect(tooltipText(container)).toContain(gitLocale.attributionCurrentUnknown);
+		expect(tooltipText(container)).toContain(gitLocale.attributionHistorySection);
+	});
+
+	test("matching evidence retains deleted human type without inventing a name", async () => {
+		const person = narrator({
+			kind: "human",
+			narratorId: null,
+			userId: "gone",
+			title: null,
+			exists: false,
+			deleted: true,
+		});
+		const current = currentTarget({ actor: person });
+		const container = await renderBadge("chapter-current-deleted-human", {
+			...view([]),
+			currentDiff: currentView(currentTarget({ status: "clean", actor: null }), current),
+		});
+		expect(badgeText(container)).toBe("Evidence: Deleted user (name unknown)");
+		expect(tooltipText(container)).toContain(gitLocale.attributionContinuityUnknown);
 	});
 });

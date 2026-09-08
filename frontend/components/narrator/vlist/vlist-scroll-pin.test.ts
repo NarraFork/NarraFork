@@ -17,6 +17,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { resolveOlderHistoryAutoLoad } from "../older-history-auto-load";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -51,6 +52,119 @@ describe("isSuppressedScrollEcho — telling our own write from the reader", () 
 	it("stays conservative when the written value is unknown", async () => {
 		const { isSuppressedScrollEcho } = await import("./PretextExactMessageList");
 		expect(isSuppressedScrollEcho(true, null, 123)).toBe(true);
+	});
+});
+
+describe("upward scroll intent loads older history without a wheel event", () => {
+	const baseInput = {
+		now: 10_000,
+		autoLoadEnabled: true,
+		hasOlder: true,
+		expanding: false,
+		atBottom: false,
+		scrollTop: 0,
+		triggerPx: 400,
+	};
+
+	it("loads when a scrollbar drag or keyboard scroll reaches the top", async () => {
+		const { isUpwardHistoryScroll } = await import("./PretextExactMessageList");
+		for (const previousTop of [4000, 600, 3]) {
+			const intentAt = isUpwardHistoryScroll(previousTop, 0, false) ? baseInput.now : null;
+			expect(resolveOlderHistoryAutoLoad({ ...baseInput, intentAt })).toEqual({
+				shouldLoad: true,
+				nextIntentAt: null,
+			});
+		}
+	});
+
+	it("refreshes intent during a drag longer than the gesture timeout", async () => {
+		const { isUpwardHistoryScroll } = await import("./PretextExactMessageList");
+		const travelling = resolveOlderHistoryAutoLoad({
+			...baseInput,
+			scrollTop: 500,
+			intentAt: isUpwardHistoryScroll(4000, 500, false) ? baseInput.now : null,
+		});
+		expect(travelling.shouldLoad).toBe(false);
+		const now = baseInput.now + 4000;
+		expect(
+			resolveOlderHistoryAutoLoad({
+				...baseInput,
+				now,
+				intentAt: isUpwardHistoryScroll(500, 0, false) ? now : travelling.nextIntentAt,
+			}).shouldLoad,
+		).toBe(true);
+	});
+
+	it("ignores programmatic echoes, unchanged positions, downward scrolls and pixel jitter", async () => {
+		const { isUpwardHistoryScroll } = await import("./PretextExactMessageList");
+		expect(isUpwardHistoryScroll(1000, 0, true)).toBe(false);
+		// writeScrollTop updates the live ref, so even a delayed echo after the
+		// suppression window closes cannot renew an already-consumed intent.
+		expect(isUpwardHistoryScroll(0, 0, false)).toBe(false);
+		expect(isUpwardHistoryScroll(0, 300, false)).toBe(false);
+		expect(isUpwardHistoryScroll(300, 299.5, false)).toBe(false);
+		expect(isUpwardHistoryScroll(300, 299, false)).toBe(false);
+	});
+
+	it("recognizes a drag even while a different programmatic position is suppressed", async () => {
+		const { isSuppressedScrollEcho, isUpwardHistoryScroll } = await import(
+			"./PretextExactMessageList"
+		);
+		expect(isUpwardHistoryScroll(1000, 0, isSuppressedScrollEcho(true, 1000, 0))).toBe(true);
+	});
+
+	it("preserves manual mode, the loading lock and the end-of-history guard", async () => {
+		const { isUpwardHistoryScroll } = await import("./PretextExactMessageList");
+		const intentAt = isUpwardHistoryScroll(1000, 0, false) ? baseInput.now : null;
+		for (const guard of [{ autoLoadEnabled: false }, { expanding: true }, { hasOlder: false }]) {
+			expect(resolveOlderHistoryAutoLoad({ ...baseInput, intentAt, ...guard }).shouldLoad).toBe(
+				false,
+			);
+		}
+	});
+
+	it("consumes intent once and does not re-arm from a prepend correction or an idle top", async () => {
+		const { isUpwardHistoryScroll } = await import("./PretextExactMessageList");
+		const loaded = resolveOlderHistoryAutoLoad({ ...baseInput, intentAt: baseInput.now });
+		expect(loaded).toEqual({ shouldLoad: true, nextIntentAt: null });
+		for (const [previousTop, nextTop, isEcho] of [
+			[0, 0, false],
+			[300, 300, true],
+			[300, 300, false],
+		] as const) {
+			const intentAt = isUpwardHistoryScroll(previousTop, nextTop, isEcho)
+				? baseInput.now
+				: loaded.nextIntentAt;
+			expect(
+				resolveOlderHistoryAutoLoad({ ...baseInput, intentAt, scrollTop: nextTop }).shouldLoad,
+			).toBe(false);
+		}
+	});
+
+	it("records scroll-frame intent before evaluating the auto-load gate", async () => {
+		const source = await Bun.file(
+			new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
+		).text();
+		const frame = source.slice(
+			source.indexOf("const processScrollFrame = useCallback("),
+			source.indexOf("const onScroll = useCallback("),
+		);
+		expect(frame).toContain("if (isUpwardHistoryScroll(previousTop, nextTop, isEcho))");
+		const intentWrite = frame.indexOf("olderHistoryIntentAtRef.current = Date.now();");
+		expect(intentWrite).toBeGreaterThan(-1);
+		expect(intentWrite).toBeLessThan(frame.indexOf("maybeAutoLoadOlder("));
+	});
+
+	it("records native message reveals as programmatic scrolls too", async () => {
+		const source = await Bun.file(
+			new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
+		).text();
+		const reveal = source.slice(
+			source.indexOf("const revealMounted = () =>"),
+			source.indexOf("const revealByLayout = async"),
+		);
+		expect(reveal).toContain('behavior: "instant"');
+		expect(reveal).toContain("writeScrollTop(node.scrollTop)");
 	});
 });
 

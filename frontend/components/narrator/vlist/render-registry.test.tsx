@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { isValidElement } from "react";
+import { FileReferenceScopeProvider } from "../FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
 import { VLIST_ELEMENT_KINDS, type VListElementKind } from "./registry";
 import { RenderMarkdown } from "./render/RenderMarkdown";
@@ -19,8 +20,16 @@ const STUB: MeasuredElement = {
 };
 
 /** Read the component function a rendered element routes to. */
+function unwrapScope(node: React.ReactNode): React.ReactNode {
+	return isValidElement<{ children: React.ReactNode }>(node) &&
+		node.type === FileReferenceScopeProvider
+		? node.props.children
+		: node;
+}
+
 function elementType(node: React.ReactNode): unknown {
-	return isValidElement(node) ? (node as React.ReactElement).type : null;
+	const content = unwrapScope(node);
+	return isValidElement(content) ? content.type : null;
 }
 
 describe("render-registry dispatch", () => {
@@ -248,7 +257,9 @@ describe("render-registry dispatch", () => {
 		// flipped shell state that no renderer read: the button lit up and the text on
 		// screen never changed. Asserted on the forwarded props, which is the hole.
 		for (const kind of ["markdown", "reasoning"] as const) {
-			const node = renderElement(kind, STUB, { showSource: true, sourceText: "# raw" });
+			const node = unwrapScope(
+				renderElement(kind, STUB, { showSource: true, sourceText: "# raw" }),
+			);
 			const props = isValidElement(node) ? (node as React.ReactElement).props : {};
 			expect((props as { showSource?: boolean }).showSource).toBe(true);
 			expect((props as { sourceText?: string }).sourceText).toBe("# raw");

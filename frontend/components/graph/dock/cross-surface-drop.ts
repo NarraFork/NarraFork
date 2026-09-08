@@ -29,6 +29,7 @@ import {
 	NARRATOR_DOCK_COMPONENT,
 	subagentDockPanelId,
 } from "../../narrator/dock/dock-panel-types";
+import { filePanelResourceParams } from "../../narrator/panels/panel-kind";
 import { getChapterDock } from "./dock-registry";
 import { resolveTabDetachSubject } from "./tab-detach";
 
@@ -93,11 +94,12 @@ export function handleForeignPanelDrop(
 	// Multi-instance kinds are keyed by their resource; the rest are singletons per
 	// surface (`dockPanelId` deliberately does not accept the former).
 	if ((kind === "subagent" || kind === "file") && !resourceId) return false;
+	const fileTarget = filePanelResourceParams(resourceId ?? "");
 	const newPanelId =
 		kind === "subagent"
 			? subagentDockPanelId(resourceId as string)
 			: kind === "file"
-				? fileDockPanelId(resourceId as string)
+				? fileDockPanelId(fileTarget.filePath, fileTarget.deviceId, fileTarget.toolEdit)
 				: dockPanelId(kind);
 
 	api.addPanel({
@@ -107,7 +109,7 @@ export function handleForeignPanelDrop(
 			kind === "subagent"
 				? { panelType: "subagent" as const, subagentNarratorId: resourceId ?? "" }
 				: kind === "file"
-					? { panelType: "file" as const, filePath: resourceId ?? "" }
+					? { panelType: "file" as const, ...fileTarget }
 					: { panelType: kind, narratorId: target.narratorId, chapterId: target.chapterId },
 		// Dropped position: dockview reports which group and edge the pointer was
 		// over; `position` is absent for a plain tab-strip drop.

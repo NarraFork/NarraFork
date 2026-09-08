@@ -78,7 +78,7 @@ export function updateAwaitTimeout(toolUseId: string, newTimeoutMs: number): num
  * subagents (see `buildRawJsonSchema`), so the owning narrator is always the
  * top-level one and no `parentToolUseId` routing is needed.
  */
-async function broadcastAwaitAgentResolved(
+export async function broadcastAwaitAgentResolved(
 	narratorId: string,
 	toolUseId: string,
 	subagentNarratorId: string,

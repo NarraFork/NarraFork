@@ -27,6 +27,8 @@
  * (`DockviewDefaultTab` belongs to dockview-react and cannot be modified).
  */
 
+import { filePanelResourceId } from "../../narrator/panels/panel-kind";
+import { isToolEditReference } from "../../narrator/tool-edit-reference";
 import { type DetachablePanelKind, isDetachablePanelKind } from "./detachable";
 import { getChapterDock, getSurfaceChapterId, listSurfaceIds } from "./dock-registry";
 
@@ -66,16 +68,26 @@ export function readPanelSubject(
 		panelType?: unknown;
 		subagentNarratorId?: unknown;
 		filePath?: unknown;
+		deviceId?: unknown;
+		referenceOrigin?: unknown;
+		toolEdit?: unknown;
 	};
 	if (!isDetachablePanelKind(p.panelType)) return null;
 	const kind = p.panelType;
+	// Reject corrupt historical identity instead of silently detaching a live file.
+	if (kind === "file" && p.toolEdit !== undefined && !isToolEditReference(p.toolEdit)) return null;
 	// Multi-instance kinds carry the identity needed to rebuild the same panel
 	// elsewhere; singletons leave it unset.
 	const resourceId =
 		kind === "subagent" && typeof p.subagentNarratorId === "string"
 			? p.subagentNarratorId
 			: kind === "file" && typeof p.filePath === "string"
-				? p.filePath
+				? filePanelResourceId(
+						p.filePath,
+						typeof p.deviceId === "string" ? p.deviceId : "local",
+						p.referenceOrigin === true,
+						isToolEditReference(p.toolEdit) ? p.toolEdit : undefined,
+					)
 				: undefined;
 	return resourceId ? { kind, resourceId } : { kind };
 }

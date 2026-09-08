@@ -22,7 +22,7 @@ import {
 import { isAbsolute, join as joinPath, posix as posixPath, resolve } from "node:path";
 import { envWithAmbientProxy } from "../../net/proxy-env";
 import { getHome, IS_WINDOWS } from "../../platform";
-import { pathsEqualForOS, toForwardSlash } from "../../platform-path";
+import { pathsEqualForOS } from "../../platform-path";
 import { resolveRgPath } from "../../ripgrep";
 import { loadSettings } from "../../settings";
 import { clearInheritableHandlesBeforeSpawn } from "../../win-handle-guard";
@@ -33,8 +33,10 @@ import type {
 	ExecHandle,
 	ExecParams,
 	ExecutionBackend,
+	FileMetadataOptions,
 	FileStat,
 	GitDiffParams,
+	GlobMatches,
 	GlobOptions,
 	GrepParams,
 	GrepResult,
@@ -45,6 +47,27 @@ import type {
 } from "./backend";
 import { LOCAL_DEVICE_ID } from "./backend";
 import { localPathSemantics } from "./path-semantics";
+
+// Inline source works in both development and compiled Bun binaries without a filesystem worker.
+const BOUNDED_GLOB_WORKER = `
+self.onmessage = async ({ data }) => {
+	try {
+		const matches = [];
+		let bytes = 2;
+		let truncated = false;
+		const query = data.query.toLowerCase();
+		for await (const raw of new Bun.Glob(data.pattern).scan({ cwd: data.cwd, dot: data.dot, onlyFiles: !data.includeDirectories, followSymlinks: false })) {
+			const entry = process.platform === "win32" ? raw.replaceAll(String.fromCharCode(92), "/") : raw;
+			if (query && !entry.toLowerCase().includes(query)) continue;
+			const size = Buffer.byteLength(JSON.stringify(entry)) + 1;
+			if (matches.length >= data.maxResults || bytes + size > data.maxBytes) { truncated = true; break; }
+			matches.push(entry);
+			bytes += size;
+		}
+		self.postMessage({ matches, truncated });
+	} catch (error) { self.postMessage({ error: String(error).slice(0, 4096) }); }
+};
+`;
 
 const FILE_READ_CHUNK_BYTES = 64 * 1024;
 const MAX_POSIX_SYMLINKS = 40;
@@ -354,14 +377,19 @@ export class LocalBackend implements ExecutionBackend {
 		};
 	}
 
-	async resolvePathIdentity(path: string): Promise<PathIdentity> {
-		return resolveLocalPathIdentity(path);
+	async resolvePathIdentity(path: string, opts?: FileMetadataOptions): Promise<PathIdentity> {
+		throwIfReadAborted(opts?.signal);
+		const identity = await resolveLocalPathIdentity(path);
+		throwIfReadAborted(opts?.signal);
+		return identity;
 	}
 
-	async statFile(path: string): Promise<FileStat | null> {
+	async statFile(path: string, opts?: FileMetadataOptions): Promise<FileStat | null> {
+		throwIfReadAborted(opts?.signal);
 		try {
 			const resolvedPath = await resolveCanonicalPath(path);
 			const st = await stat(resolvedPath);
+			throwIfReadAborted(opts?.signal);
 			return {
 				isDirectory: st.isDirectory(),
 				isFile: st.isFile(),
@@ -369,6 +397,7 @@ export class LocalBackend implements ExecutionBackend {
 				resolvedPath,
 			};
 		} catch {
+			throwIfReadAborted(opts?.signal);
 			return null;
 		}
 	}
@@ -389,7 +418,8 @@ export class LocalBackend implements ExecutionBackend {
 		}
 
 		const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
-		const flags = IS_WINDOWS ? "r" : fsConstants.O_RDONLY | noFollow;
+		// Non-blocking open prevents a raced-in FIFO from hanging before fstat rejects it.
+		const flags = IS_WINDOWS ? "r" : fsConstants.O_RDONLY | noFollow | fsConstants.O_NONBLOCK;
 		const file = await open(resolvedPath, flags);
 		try {
 			const openedStat = await verifyOpenedFileIdentity(file, path, expectedResolvedPath);
@@ -476,15 +506,61 @@ export class LocalBackend implements ExecutionBackend {
 		return out;
 	}
 
-	async glob(pattern: string, opts: GlobOptions): Promise<string[]> {
-		const glob = new Bun.Glob(pattern);
-		const results: string[] = [];
-		const max = opts.maxResults ?? 500;
-		for await (const entry of glob.scan({ cwd: opts.cwd, dot: opts.dot ?? false })) {
-			results.push(toForwardSlash(entry));
-			if (results.length >= max) break;
+	async glob(pattern: string, opts: GlobOptions): Promise<GlobMatches> {
+		throwIfReadAborted(opts.signal);
+		const maxResults = opts.maxResults ?? 500;
+		const maxBytes = opts.maxBytes ?? 256 * 1024;
+		const timeoutMs = opts.timeoutMs ?? 10_000;
+		if (![maxResults, maxBytes, timeoutMs].every((n) => Number.isSafeInteger(n) && n > 0)) {
+			throw new RangeError("Glob limits must be positive safe integers");
 		}
-		return results;
+		// Bun's glob can scan a huge tree without yielding a single matching entry. A
+		// loop-side deadline alone cannot stop it or protect the HTTP event loop.
+		const url = URL.createObjectURL(new Blob([BOUNDED_GLOB_WORKER], { type: "text/javascript" }));
+		const worker = new Worker(url);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort = () => {};
+		try {
+			return await new Promise<GlobMatches>((resolveResult, reject) => {
+				onAbort = () => {
+					worker.terminate();
+					reject(opts.signal?.reason ?? new Error("Glob scan aborted"));
+				};
+				timer = setTimeout(() => {
+					worker.terminate();
+					reject(new Error(`Glob scan timed out after ${timeoutMs}ms`));
+				}, timeoutMs);
+				worker.onmessage = (
+					event: MessageEvent<{ matches?: string[]; truncated?: boolean; error?: string }>,
+				) => {
+					if (event.data.error) reject(new Error(event.data.error));
+					else
+						resolveResult(
+							Object.assign(event.data.matches ?? [], { truncated: event.data.truncated ?? false }),
+						);
+				};
+				worker.onerror = (event) => reject(new Error(event.message || "Glob worker failed"));
+				opts.signal?.addEventListener("abort", onAbort, { once: true });
+				if (opts.signal?.aborted) {
+					onAbort();
+					return;
+				}
+				worker.postMessage({
+					pattern,
+					cwd: opts.cwd,
+					dot: opts.dot ?? false,
+					maxResults,
+					maxBytes,
+					includeDirectories: opts.includeDirectories ?? false,
+					query: opts.query ?? "",
+				});
+			});
+		} finally {
+			if (timer) clearTimeout(timer);
+			opts.signal?.removeEventListener("abort", onAbort);
+			worker.terminate();
+			URL.revokeObjectURL(url);
+		}
 	}
 
 	async grep(params: GrepParams): Promise<GrepResult> {

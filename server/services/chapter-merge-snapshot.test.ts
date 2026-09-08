@@ -246,7 +246,7 @@ describe("conflict lifecycle", () => {
 		const plan = await planSnapshotMerge(source, target);
 		expect(plan.conflicts.sort()).toEqual(["a.txt", "b.txt"]);
 
-		await materializeConflicts(env.target.worktree, plan.tree);
+		await materializeConflicts(env.target.worktree, plan);
 		// Both are unresolved, and this must be reported — the git-state query would
 		// return nothing here and declare the merge finished.
 		expect((await detectRemainingConflicts(env.target.worktree, plan.conflicts)).sort()).toEqual([
@@ -281,7 +281,7 @@ describe("conflict lifecycle", () => {
 		const plan = await planSnapshotMerge(source, target);
 		expect(plan.conflicts).toEqual([BASE_FILE]);
 
-		await materializeConflicts(env.target.worktree, plan.tree);
+		await materializeConflicts(env.target.worktree, plan);
 		expect(readFileSync(join(env.target.worktree, BASE_FILE), "utf-8")).toContain("<<<<<<<");
 
 		await abortSnapshotMerge(env.target.worktree, plan.preMergeTree);
@@ -588,6 +588,22 @@ describe("interactive snapshot merge state lifecycle", () => {
 		expect(row.status).toBe("error");
 		expect(row.error).toMatch(/may still contain conflict markers/i);
 		expect(row.preMergeTree).toBeNull();
+	});
+
+	test("completion refuses a persisted conflict list with missing coverage", async () => {
+		const env = await createMergePair();
+		const { state } = await startConflictedSession(env);
+		writeFileSync(join(env.target.worktree, BASE_FILE), "apparently resolved\n");
+		await expect(
+			chapterMerge.completeInteractiveSnapshotMergeById(env.source.id, env.target.id, "merge", {
+				...state,
+				conflictFiles: [],
+			}),
+		).rejects.toMatchObject({ messageCode: "GIT_TREE_MERGE_CONFLICTS_UNLISTED" });
+		expect((await chapterRow(env.source.id)).status).not.toBe("merged");
+		expect(readFileSync(join(env.target.worktree, BASE_FILE), "utf8")).toBe(
+			"apparently resolved\n",
+		);
 	});
 
 	test("a resolved conflict clears the coordinates, so a later restart cannot undo it", async () => {

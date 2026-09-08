@@ -142,6 +142,123 @@ function sameObjectName(a: string, b: string): boolean {
 	return a.toLowerCase() === b.toLowerCase();
 }
 
+const SQLITE_IDENTIFIER_LIST = String.raw`(?:${SQLITE_IDENTIFIER})(?:\s*,\s*(?:${SQLITE_IDENTIFIER}))*`;
+const CANONICAL_REBUILD_COPY = new RegExp(
+	String.raw`^\s*INSERT\s+INTO\s+(${SQLITE_IDENTIFIER})\s*\(\s*(${SQLITE_IDENTIFIER_LIST})\s*\)\s*SELECT\s+(${SQLITE_IDENTIFIER_LIST})\s+FROM\s+(${SQLITE_IDENTIFIER})\s*;?\s*$`,
+	"i",
+);
+// Above SQLite's default 2000-column limit, but still bounded for custom SQLite builds.
+const REBUILD_COPY_MAX_COLUMNS = 2048;
+
+type RebuildCopyColumn = { name: string; notnull: number; dflt_value: string | null };
+
+/** SQLite identifier folding is ASCII-only; Unicode lowercasing could mistake a DQS literal for a column. */
+function rebuildIdentifierKey(name: string): string {
+	return name.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
+function rebuildCopyColumns(sqlite: Database, table: string): RebuildCopyColumn[] {
+	// The table-valued PRAGMA accepts a bound name and a LIMIT; never inspect table data here.
+	const columns = sqlite
+		.prepare('SELECT name, "notnull", dflt_value FROM pragma_table_info(?) LIMIT ?')
+		.all(table, REBUILD_COPY_MAX_COLUMNS + 1) as RebuildCopyColumn[];
+	if (columns.length === 0) throw new Error(`no such table: ${table} (Drizzle rebuild-copy)`);
+	if (columns.length > REBUILD_COPY_MAX_COLUMNS) {
+		throw new Error(`Drizzle rebuild-copy metadata exceeds ${REBUILD_COPY_MAX_COLUMNS} columns`);
+	}
+	return columns;
+}
+
+/**
+ * Drizzle can rebuild a table while adding columns, yet put those new names in BOTH sides of
+ * its INSERT ... SELECT. SQLite DQS then treats absent double-quoted source names as strings:
+ * a successful copy can silently corrupt rows before the original table is dropped.
+ *
+ * Only the complete, identifier-only __new_<table> copy is eligible. Preserve source-backed
+ * mappings (including renames) verbatim; omit a pair only when the destination really exists,
+ * the source lacks that same name, and both sides name the same column. Omission lets SQLite
+ * supply the destination DEFAULT/NULL, not an invented value. Unknown mappings are fatal.
+ * Expressions, aliases, schema-qualified references and other SQL shapes remain untouched.
+ * A null result means the source is empty and no source-backed column remains to copy.
+ */
+function compatibleRebuildCopyStatement(sqlite: Database, stmt: string): string | null {
+	const match = CANONICAL_REBUILD_COPY.exec(stmt);
+	if (!match) return stmt;
+	const [, targetRef, targetList, sourceList, sourceRef] = match;
+	const targetName = normalizeObjectName(targetRef);
+	if (!rebuildIdentifierKey(targetName).startsWith("__new_")) return stmt;
+	const sourceTokens = sourceList.match(new RegExp(SQLITE_IDENTIFIER, "g")) ?? [];
+	// These unquoted SQL literals are expressions, not identifier mappings.
+	if (
+		sourceTokens.some((token) =>
+			/^(NULL|TRUE|FALSE|CURRENT_TIME|CURRENT_DATE|CURRENT_TIMESTAMP)$/i.test(token),
+		)
+	) {
+		return stmt;
+	}
+	const targetTokens = targetList.match(new RegExp(SQLITE_IDENTIFIER, "g")) ?? [];
+	const sourceName = normalizeObjectName(sourceRef);
+	const sourceColumns = new Set(
+		rebuildCopyColumns(sqlite, sourceName).map((column) => rebuildIdentifierKey(column.name)),
+	);
+	if (
+		rebuildIdentifierKey(targetName) !== `__new_${rebuildIdentifierKey(sourceName)}` ||
+		targetTokens.length !== sourceTokens.length ||
+		targetTokens.length > REBUILD_COPY_MAX_COLUMNS
+	) {
+		throw new Error(`Unrecognized Drizzle rebuild-copy mapping from ${sourceRef} to ${targetRef}`);
+	}
+	const targetColumns = new Map(
+		rebuildCopyColumns(sqlite, targetName).map((column) => [
+			rebuildIdentifierKey(column.name),
+			column,
+		]),
+	);
+	const seenTargets = new Set<string>();
+	const keptTargets: string[] = [];
+	const keptSources: string[] = [];
+	const omitted: RebuildCopyColumn[] = [];
+	for (let i = 0; i < targetTokens.length; i++) {
+		const targetKey = rebuildIdentifierKey(normalizeObjectName(targetTokens[i]));
+		const sourceKey = rebuildIdentifierKey(normalizeObjectName(sourceTokens[i]));
+		const targetColumn = targetColumns.get(targetKey);
+		if (!targetColumn || seenTargets.has(targetKey)) {
+			throw new Error(`Unrecognized Drizzle rebuild-copy destination mapping: ${targetTokens[i]}`);
+		}
+		seenTargets.add(targetKey);
+		if (sourceColumns.has(sourceKey)) {
+			keptTargets.push(targetTokens[i]);
+			keptSources.push(sourceTokens[i]);
+		} else if (targetKey === sourceKey && !sourceColumns.has(targetKey)) {
+			omitted.push(targetColumn);
+		} else {
+			throw new Error(
+				`Unrecognized Drizzle rebuild-copy column mapping: ${targetTokens[i]} <- ${sourceTokens[i]}`,
+			);
+		}
+	}
+	if (omitted.length === 0) return stmt;
+
+	const requiredWithoutDefault = omitted.filter(
+		(column) => column.notnull !== 0 && column.dflt_value === null,
+	);
+	if (requiredWithoutDefault.length > 0 || keptTargets.length === 0) {
+		// LIMIT 1 checks emptiness without counting/scanning the entire source table.
+		const hasRows = sqlite.prepare(`SELECT 1 FROM ${sourceRef} LIMIT 1`).get() != null;
+		if (hasRows) {
+			if (requiredWithoutDefault.length > 0) {
+				throw new Error(
+					`Drizzle rebuild-copy cannot populate required columns without defaults: ${requiredWithoutDefault.map((column) => column.name).join(", ")}`,
+				);
+			}
+			throw new Error("Drizzle rebuild-copy has no source-backed column mapping for existing rows");
+		}
+		if (keptTargets.length === 0) return null;
+	}
+
+	return `INSERT INTO ${targetRef} (${keptTargets.join(", ")}) SELECT ${keptSources.join(", ")} FROM ${sourceRef};`;
+}
+
 /** The names SQLite reported for a failure, including the DrizzleError-wrapped `cause`. */
 function errorMessages(err: unknown): string[] {
 	const messages = [String(err instanceof Error ? err.message : err)];
@@ -404,6 +521,13 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 					});
 				} else {
 					for (const stmt of statements) {
+						// Validate before SQLite can accept missing DQS names as literals. Neither
+						// compatibility failures nor repaired-copy failures are tolerable DDL errors.
+						const copyStatement = compatibleRebuildCopyStatement(sqlite, stmt);
+						if (copyStatement !== stmt) {
+							if (copyStatement !== null) sqlite.run(copyStatement);
+							continue;
+						}
 						try {
 							sqlite.run(stmt);
 						} catch (err) {
