@@ -65,6 +65,10 @@ import {
 	modelCardSchema,
 	whitelistDirEntrySchema,
 } from "../lib/validators";
+import {
+	defaultNarratorVisibilitySchema,
+	defaultNarratorWriteAudienceSchema,
+} from "../lib/validators/settings";
 import { subagentModelReasoningEffortsSchema } from "../lib/validators/subagent-models";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { requireAdmin } from "../middleware/auth";
@@ -381,6 +385,8 @@ export const updateSettingsSchema = z
 			.object({
 				defaultModel: z.string().min(1),
 				defaultPermissionMode: legacyPermissionModeSchema,
+				defaultNarratorVisibility: defaultNarratorVisibilitySchema,
+				defaultNarratorWriteAudience: defaultNarratorWriteAudienceSchema,
 				defaultStartInPlanMode: z.boolean(),
 				summaryModel: z.string(),
 				translationModel: z.string(),

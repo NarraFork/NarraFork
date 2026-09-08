@@ -11,6 +11,9 @@ import { z } from "zod";
 import { legacyPermissionModeSchema } from "../permission-modes";
 import { commandSchema, localeSchema } from "./common";
 
+export const defaultNarratorVisibilitySchema = z.enum(["auto", "private", "public"]);
+export const defaultNarratorWriteAudienceSchema = z.enum(["auto", "owner", "project", "public"]);
+
 /**
  * One model card delta, as persisted in `agent.modelCards`.
  *

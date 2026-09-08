@@ -63,6 +63,7 @@ import type {
 	NarratorWriteAudience,
 } from "../../lib/api/types";
 import { UserAvatar } from "../UserAvatar";
+import { NarratorPublicShareManager } from "./NarratorPublicShareManager";
 
 export interface NarratorAccessPanelProps {
 	narratorId: string;
@@ -387,6 +388,13 @@ export function NarratorAccessPanel({ narratorId }: NarratorAccessPanelProps) {
 						{t("access.readOnlyNotice")}
 					</Text>
 				</Box>
+			)}
+			{canManage && (
+				<NarratorPublicShareManager
+					key={narratorId}
+					narratorId={narratorId}
+					canManage={canManage}
+				/>
 			)}
 		</Stack>
 	);

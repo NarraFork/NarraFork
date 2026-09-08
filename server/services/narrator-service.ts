@@ -1,11 +1,6 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import type { MessageOriginOptions } from "@shared/message-origin";
-import {
-	isWriteAudienceAllowed,
-	type NarratorVisibility,
-	type NarratorWriteAudience,
-} from "@shared/narrator-access";
 import { foldHandle } from "@shared/narrator-handle";
 import { and, desc, eq, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
@@ -53,6 +48,7 @@ import { fastModeOverrideFromLegacyInput, legacyFastModeMirror } from "../lib/fa
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { resolveNarratorAudiences } from "../lib/narrator-audiences";
 import {
 	BLOCKED_SKILLS_TRAIT_PREFIX,
 	type BlockedSkillsTrait,
@@ -107,12 +103,7 @@ import type {
 } from "./command-service";
 import { getAvailableOptionalToolIds } from "./command-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
-import {
-	assertNarratorAccess,
-	defaultVisibilityForNarrator,
-	defaultWriteAudienceForNarrator,
-	type NarratorAccessNeed,
-} from "./narrator-acl";
+import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
 // `bumpParentNarratorMessageVersion` is deliberately NOT imported any more: the bump
 // now happens inside `persistUserMessage`/`persistSystemMessage`, so every writer of a
@@ -335,13 +326,13 @@ export interface CreateNarratorInput {
 	 */
 	ownerUserId?: string | null;
 	/**
-	 * Read audience. Omitted means the default for the kind of narrator being
-	 * created: private for standalone, project for chapter-bound.
+	 * Read audience. Omitted follows agent.defaultNarratorVisibility; auto keeps
+	 * standalone narrators private and chapter-bound narrators project-visible.
 	 */
 	visibility?: "private" | "project" | "public";
 	/**
-	 * Write audience. Omitted means the default for the kind of narrator being
-	 * created: owner-only for standalone, project for chapter-bound.
+	 * Write audience. Omitted follows agent.defaultNarratorWriteAudience, narrowed
+	 * to effective visibility; auto uses the widest legal audience for that visibility.
 	 */
 	writeAudience?: "owner" | "project" | "public";
 }
@@ -1195,35 +1186,6 @@ export interface PreparedNarratorCreation {
 	handleFold: string | null;
 }
 
-/**
- * Settle the two audience columns for a new narrator, keeping the pair legal.
- *
- * The write audience is nested inside the read audience (see
- * `@shared/narrator-access`), so it is derived from whichever visibility actually
- * takes effect rather than from the chapter id independently — otherwise a caller
- * passing an explicit `visibility: "private"` would silently get a `project` write
- * audience, which is exactly the lying-column state this nesting removes.
- *
- * An explicitly supplied pair is validated rather than clamped: reaching here with an
- * illegal combination means a caller constructed it in code, which is a bug to
- * surface, not a user action to accommodate.
- */
-function resolveNarratorAudiences(
-	visibility: NarratorVisibility | undefined,
-	writeAudience: NarratorWriteAudience | undefined,
-	chapterId: string | null | undefined,
-): { visibility: NarratorVisibility; writeAudience: NarratorWriteAudience } {
-	const effectiveVisibility = visibility ?? defaultVisibilityForNarrator(chapterId);
-	const effectiveWriteAudience =
-		writeAudience ?? defaultWriteAudienceForNarrator(effectiveVisibility);
-	if (!isWriteAudienceAllowed(effectiveVisibility, effectiveWriteAudience)) {
-		throw new ValidationError(
-			`Write audience "${effectiveWriteAudience}" is wider than visibility "${effectiveVisibility}"`,
-		);
-	}
-	return { visibility: effectiveVisibility, writeAudience: effectiveWriteAudience };
-}
-
 export async function prepareNarratorCreation(
 	input: CreateNarratorInput,
 ): Promise<PreparedNarratorCreation> {
@@ -1364,7 +1326,13 @@ export async function prepareNarratorCreation(
 			oauthPolicySnapshotJson: input.oauthPolicySnapshotJson ?? null,
 			defaultDeviceId: input.defaultDeviceId ?? null,
 			ownerUserId: input.ownerUserId ?? null,
-			...resolveNarratorAudiences(input.visibility, input.writeAudience, chapterId),
+			...resolveNarratorAudiences(
+				input.visibility,
+				input.writeAudience,
+				chapterId,
+				settings.agent.defaultNarratorVisibility,
+				settings.agent.defaultNarratorWriteAudience,
+			),
 			inheritMode: "fresh",
 			status: "idle",
 			title: input.title ?? null,

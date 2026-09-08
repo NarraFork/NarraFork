@@ -28,7 +28,17 @@
  * already gives every room a clean instance.
  */
 
-import { ActionIcon, Box, Button, Group, Loader, Text, Tooltip } from "@mantine/core";
+import {
+	ActionIcon,
+	Avatar,
+	Badge,
+	Box,
+	Button,
+	Group,
+	Loader,
+	Text,
+	Tooltip,
+} from "@mantine/core";
 import {
 	findVisibleRange,
 	layoutItems,
@@ -388,7 +398,7 @@ export const ChatMessageList = forwardRef<ChatMessageListHandle, ChatMessageList
 								index={index}
 								measured={measuredRow}
 								bubbleWidth={bubbleWidth}
-								isOwn={row.message.sender?.id === currentUserId}
+								isOwn={!row.message.sender?.isGuest && row.message.sender?.id === currentUserId}
 								selected={selectedIds?.has(row.message.id) ?? false}
 								highlighted={highlightedId === row.message.id}
 								// The layout model puts the gap BETWEEN items, so the last
@@ -527,16 +537,27 @@ function ChatMessageRow({
 						wrap="nowrap"
 						style={{ height: CHAT_HEADER_HEIGHT, marginBottom: CHAT_HEADER_GAP }}
 					>
-						<UserAvatar
-							userId={sender?.id ?? ""}
-							username={sender?.username ?? "?"}
-							avatarColor={sender?.avatarColor ?? null}
-							avatarImageId={sender?.avatarImageId ?? null}
-							size={20}
-						/>
+						{sender?.isGuest ? (
+							<Avatar size={20} radius="xl">
+								{sender.username.slice(0, 1)}
+							</Avatar>
+						) : (
+							<UserAvatar
+								userId={sender?.id ?? ""}
+								username={sender?.username ?? "?"}
+								avatarColor={sender?.avatarColor ?? null}
+								avatarImageId={sender?.avatarImageId ?? null}
+								size={20}
+							/>
+						)}
 						<Text size="xs" fw={600} truncate>
 							{sender?.username ?? t("unknownSender")}
 						</Text>
+						{sender?.isGuest ? (
+							<Badge size="xs" variant="light" style={{ flexShrink: 0 }}>
+								{t("shareGuest")}
+							</Badge>
+						) : null}
 						<Text size="xs" c="dimmed">
 							{timestamp}
 						</Text>
@@ -686,6 +707,7 @@ function ChatReplyStrip({
 			{reply.authorName ? (
 				<Text size="xs" fw={600} c="dimmed" style={{ flexShrink: 0, maxWidth: "45%" }} truncate>
 					{reply.authorName}
+					{reply.authorIsGuest ? ` (${t("shareGuest")})` : ""}
 				</Text>
 			) : null}
 			<Text

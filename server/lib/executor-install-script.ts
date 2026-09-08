@@ -26,6 +26,7 @@
  *    other — and a missing parser at that point would leave the binary installed
  *    but the service unable to authenticate.
  */
+import { X509Certificate } from "node:crypto";
 import {
 	type ExecutorPlatform,
 	executorInstalledFilename,
@@ -71,6 +72,8 @@ export interface ExecutorInstallScriptInput {
 	ticket: string;
 	/** Defaults to "prompt", the behaviour that predates automated enrollment. */
 	tokenDelivery?: ExecutorTokenDelivery;
+	/** Public deployment CA, delivered via the already-trusted management session. */
+	caCertPem?: string;
 }
 
 export interface GeneratedExecutorInstallScript {
@@ -133,10 +136,89 @@ const UNIX_FETCH_FAILURE_FALLBACK = [
 	"exit 1",
 ].join("; ");
 
+// PEM is public, but accepting arbitrary text here could turn a certificate into
+// shell code (or accidentally ship a private key). Normalize exactly one certificate.
+function normalizeInstallCa(pem: string | undefined): string | undefined {
+	if (pem === undefined) return undefined;
+	if (
+		pem.length > 64 * 1024 ||
+		!/^\s*-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----\s*$/.test(pem)
+	) {
+		throw new ValidationError("Installation CA must contain one public PEM certificate only");
+	}
+	try {
+		return `${new X509Certificate(pem).toString().trim()}\n`;
+	} catch {
+		throw new ValidationError("Installation CA certificate is invalid");
+	}
+}
+
+// curl is deliberately required for custom trust. BusyBox wget cannot reliably
+// load a CA file; falling back to --no-check-certificate would expose the ticket.
+const CA_CURL_FLAGS =
+	'--disable --fail --silent --show-error --location --max-redirs 5 --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 300';
+
+// Built-in/private CAs may have no CRL, or its distribution point may be offline.
+// Schannel best-effort (curl >= 7.70.0) tolerates only unavailable revocation data;
+// certificate chain/hostname checks and known-revoked rejection remain enabled.
+// Resolve the executable once: Windows PATH can contain OpenSSL/MultiSSL curl too.
+// In --version, inactive MultiSSL backends are parenthesized, so ignore those.
+// Probe option support without a URL BEFORE sending any ticket; never downgrade an
+// unsupported Schannel build to disabled verification or silently omit the policy.
+const WINDOWS_CA_CURL_SETUP = [
+	"$nfCurl = (Get-Command curl.exe -CommandType Application -ErrorAction Stop).Source",
+	"$nfCurlVersion = @(& $nfCurl --disable --version)",
+	"if ($LASTEXITCODE -ne 0 -or $nfCurlVersion.Count -eq 0 -or $nfCurlVersion[0] -notmatch '^curl [0-9]+\\.') { throw 'Cannot determine curl TLS backend.' }",
+	"$nfCurlCaFlags = @()",
+	"if (($nfCurlVersion[0] -replace '\\([^)]*\\)', '') -match '\\bSchannel\\b') { " +
+		"& $nfCurl --disable --ssl-revoke-best-effort --version | Out-Null; " +
+		"if ($LASTEXITCODE -ne 0) { throw 'Custom CA installation requires Schannel curl 7.70.0 or newer with --ssl-revoke-best-effort support. Upgrade curl and retry.' }; " +
+		"$nfCurlCaFlags = @('--ssl-revoke-best-effort') }",
+];
+const WINDOWS_CA_CURL_FLAGS = `${CA_CURL_FLAGS} @nfCurlCaFlags`;
+
 export function buildExecutorInstallOneLiner(input: {
 	scriptUrl: string;
 	shell: "sh" | "powershell";
+	caCertPem?: string;
 }): string {
+	const ca = normalizeInstallCa(input.caCertPem);
+	if (ca) {
+		validateUrl("Install script URL", input.scriptUrl, ["https:"]);
+		if (input.shell === "powershell") {
+			const q = powershellSingleQuote;
+			return [
+				"& { $ErrorActionPreference = 'Stop'",
+				...WINDOWS_CA_CURL_SETUP,
+				"$nfCa = [System.IO.Path]::GetTempFileName()",
+				"try {",
+				`[System.IO.File]::WriteAllBytes($nfCa, [Convert]::FromBase64String('${Buffer.from(ca).toString("base64")}'))`,
+				`$nfScript = & $nfCurl ${WINDOWS_CA_CURL_FLAGS} --max-filesize 1048576 --cacert $nfCa ${q(input.scriptUrl)}`,
+				"if ($LASTEXITCODE -ne 0) { throw 'NarraFork install script download failed; check TLS trust and ticket expiry.' }",
+				"if (-not $nfScript) { throw 'NarraFork returned an empty install script.' }",
+				"& ([scriptblock]::Create(($nfScript -join [Environment]::NewLine)))",
+				"} finally { Remove-Item -LiteralPath $nfCa -Force -ErrorAction SilentlyContinue } }",
+			]
+				.join("; ")
+				.replace("try {;", "try {");
+		}
+		const q = shellSingleQuote;
+		const body = [
+			"set -eu",
+			'command -v curl >/dev/null 2>&1 || { echo "NarraFork custom CA installation requires curl." >&2; exit 1; }',
+			"umask 077",
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: shell expansion
+			'd=$(mktemp -d "${TMPDIR:-/tmp}/narrafork-bootstrap.XXXXXX")',
+			`trap 'rm -rf "$d"' EXIT`,
+			"trap 'exit 130' INT",
+			"trap 'exit 143' TERM",
+			`printf '%b' ${q(ca.replaceAll("\n", "\\n"))} > "$d/ca.pem"`,
+			`curl ${CA_CURL_FLAGS} --max-filesize 1048576 --cacert "$d/ca.pem" ${q(input.scriptUrl)} -o "$d/install.sh" || { ${UNIX_FETCH_FAILURE_FALLBACK}; }`,
+			'[ -s "$d/install.sh" ] || { echo "NarraFork returned an empty install script." >&2; exit 1; }',
+			'sh "$d/install.sh"',
+		].join("; ");
+		return `sh -c ${q(body)}`;
+	}
 	if (input.shell === "powershell") {
 		return `irm ${powershellSingleQuote(input.scriptUrl)} | iex`;
 	}
@@ -235,6 +317,13 @@ function resolvePaths(input: ExecutorInstallScriptInput): ResolvedInput {
 	const expectedSha256 = validateSha256(input.expectedSha256);
 	const ticket = validateTicket(input.ticket);
 	const artifactFilename = validateArtifactFilename(input.artifactFilename);
+	const caCertPem = normalizeInstallCa(input.caCertPem);
+	if (caCertPem && !serverBaseUrl.startsWith("https:")) {
+		throw new ValidationError("Installation CA requires an HTTPS server URL");
+	}
+	if (caCertPem && input.connectionMode === "reverse" && !deviceWsUrl.startsWith("wss:")) {
+		throw new ValidationError("Installation CA requires a WSS executor URL");
+	}
 	assertEmbeddable("Device name", input.deviceName);
 	assertEmbeddable("Executor version", input.executorVersion);
 
@@ -259,6 +348,7 @@ function resolvePaths(input: ExecutorInstallScriptInput): ResolvedInput {
 
 	return {
 		...input,
+		caCertPem,
 		serverBaseUrl,
 		deviceWsUrl,
 		deviceSlug,
@@ -693,8 +783,36 @@ function ptyNotice(platform: ExecutorPlatform): string[] {
  * `enroll` branch must NOT have that guard — it is the entire reason a piped or
  * non-interactive run can work at all.
  */
+function unixDownload(input: ResolvedInput, enroll: boolean): string[] {
+	const url = shellSingleQuote(enroll ? input.enrollUrl : input.downloadUrl);
+	const target = enroll ? '"$TMP_ENROLL"' : '"$TMP_BINARY"';
+	const failure = enroll ? " || ENROLL_FAILED=1" : "";
+	if (input.caCertPem) {
+		return [
+			'command -v curl >/dev/null 2>&1 || { echo "NarraFork custom CA installation requires curl." >&2; exit 1; }',
+			`curl ${CA_CURL_FLAGS} --max-filesize ${enroll ? 65536 : 134217728} --cacert "$TMP_CA" ${enroll ? "-X POST " : ""}${url} -o ${target}${failure}`,
+		];
+	}
+	return [
+		"if command -v curl >/dev/null 2>&1; then",
+		`  curl -fsSL ${enroll ? "-X POST " : ""}${url} -o ${target}${failure}`,
+		"elif command -v wget >/dev/null 2>&1; then",
+		// Empty --post-data is shared by GNU and BusyBox wget; --method is not.
+		enroll
+			? `  wget -q --post-data='' -O ${target} ${url}${failure}`
+			: `  wget -qO ${target} ${url}`,
+		"else",
+		'  echo "Neither curl nor wget is available." >&2',
+		"  exit 1",
+		"fi",
+	];
+}
+
+function unixCleanupTrap(input: ResolvedInput, enroll = false): string {
+	return `trap 'rm -f "$TMP_BINARY"${input.caCertPem ? ' "$TMP_CA"' : ""}${enroll ? ' "$TMP_ENROLL"' : ""}' EXIT INT TERM`;
+}
+
 function unixTokenAcquisition(input: ResolvedInput): string[] {
-	const q = shellSingleQuote;
 	if (input.tokenDelivery === "prompt") {
 		return [
 			"if [ ! -t 0 ]; then",
@@ -725,19 +843,8 @@ function unixTokenAcquisition(input: ResolvedInput): string[] {
 		'umask "$UMASK_ENROLL_OLD"',
 		// Chained onto the binary's trap so a failure here cannot leave the key
 		// response behind on disk.
-		'trap \'rm -f "$TMP_BINARY" "$TMP_ENROLL"\' EXIT INT TERM',
-		"if command -v curl >/dev/null 2>&1; then",
-		`  curl -fsSL -X POST ${q(input.enrollUrl)} -o "$TMP_ENROLL" || ENROLL_FAILED=1`,
-		"elif command -v wget >/dev/null 2>&1; then",
-		// --post-data='', not --method=POST: an empty body still forces POST, and this
-		// is the only POST spelling GNU and BusyBox wget share — BusyBox has no
-		// --method at all, and a BusyBox-only host (e.g. a minimal Alpine install) is
-		// exactly the machine this fallback exists for.
-		`  wget -q --post-data='' -O "$TMP_ENROLL" ${q(input.enrollUrl)} || ENROLL_FAILED=1`,
-		"else",
-		'  echo "Neither curl nor wget is available." >&2',
-		"  exit 1",
-		"fi",
+		unixCleanupTrap(input, true),
+		...unixDownload(input, true),
 		// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a JS template
 		'if [ "${ENROLL_FAILED:-0}" = "1" ]; then',
 		'  echo "Could not obtain the device key." >&2',
@@ -750,7 +857,7 @@ function unixTokenAcquisition(input: ResolvedInput): string[] {
 		// half-enrolled machine. The response shape is fixed and server-controlled.
 		`DEVICE_TOKEN=$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$TMP_ENROLL")`,
 		'rm -f "$TMP_ENROLL"',
-		"trap 'rm -f \"$TMP_BINARY\"' EXIT INT TERM",
+		unixCleanupTrap(input),
 		'if [ -z "$DEVICE_TOKEN" ]; then',
 		'  echo "NarraFork did not return a device key." >&2',
 		"  exit 1",
@@ -966,14 +1073,15 @@ function buildUnixScript(input: ResolvedInput): string {
 		// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a JS template
 		'TMP_BINARY=$(mktemp "${TMPDIR:-/tmp}/narrafork-executor.XXXXXX")',
 		"trap 'rm -f \"$TMP_BINARY\"' EXIT INT TERM",
-		"if command -v curl >/dev/null 2>&1; then",
-		`  curl -fsSL ${q(input.downloadUrl)} -o "$TMP_BINARY"`,
-		"elif command -v wget >/dev/null 2>&1; then",
-		`  wget -qO "$TMP_BINARY" ${q(input.downloadUrl)}`,
-		"else",
-		'  echo "Neither curl nor wget is available." >&2',
-		"  exit 1",
-		"fi",
+		...(input.caCertPem
+			? [
+					// biome-ignore lint/suspicious/noTemplateCurlyInString: shell expansion
+					'TMP_CA=$(mktemp "${TMPDIR:-/tmp}/narrafork-ca.XXXXXX")',
+					unixCleanupTrap(input),
+					`printf '%s' ${q(input.caCertPem)} > "$TMP_CA"`,
+				]
+			: []),
+		...unixDownload(input, false),
 		"",
 		"# Verify the digest even though the download used TLS: this script may have",
 		"# been forwarded, and the binary gains full access to the account it runs as.",
@@ -993,7 +1101,22 @@ function buildUnixScript(input: ResolvedInput): string {
 		"",
 		`${sudo}mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"`,
 		`${sudo}install -m 755 "$TMP_BINARY" "$BINARY"`,
+		...(input.caCertPem && input.connectionMode === "reverse"
+			? [`${sudo}install -m 644 "$TMP_CA" "$CONFIG_DIR/server-ca.pem"`]
+			: []),
 		'echo "Installed $BINARY"',
+		...(input.caCertPem && input.connectionMode === "reverse"
+			? [
+					"# Older published executors silently ignore unknown JSON fields.",
+					"# Refuse before redeeming the one-time enrollment ticket.",
+					'EXECUTOR_HELP=$("$BINARY" --help 2>&1 || true)',
+					'case "$EXECUTOR_HELP" in',
+					"  *-ca-file*) ;;",
+					'  *) echo "This executor release does not support custom CA trust. Publish an updated executor and generate a fresh install command." >&2; exit 1 ;;',
+					"esac",
+					"unset EXECUTOR_HELP",
+				]
+			: []),
 		"",
 		...unixTokenAcquisition(input),
 		"",
@@ -1013,6 +1136,9 @@ function buildUnixScript(input: ResolvedInput): string {
 		`${sudo}tee "$CONFIG_FILE" >/dev/null <<'CONFEOF'`,
 		"{",
 		`  "serverUrl": ${JSON.stringify(input.deviceWsUrl)},`,
+		...(input.caCertPem && input.connectionMode === "reverse"
+			? ['  "caFile": "server-ca.pem",']
+			: []),
 		`  "deviceRef": ${JSON.stringify(input.deviceSlug)},`,
 		// Empty = unrestricted. Path rules are configured after install, from the
 		// device page, where the operator can browse the machine's real directories.
@@ -1052,7 +1178,15 @@ function windowsTokenAcquisition(input: ResolvedInput): string[] {
 	return [
 		"Write-Host 'Requesting the device key from NarraFork…'",
 		"try {",
-		`  $enrollResponse = Invoke-RestMethod -Method Post -Uri ${q(input.enrollUrl)} -UseBasicParsing`,
+		...(input.caCertPem
+			? [
+					`  $enrollJson = & $nfCurl ${WINDOWS_CA_CURL_FLAGS} --max-filesize 65536 --cacert $caFile -X POST ${q(input.enrollUrl)}`,
+					"  if ($LASTEXITCODE -ne 0) { throw 'NarraFork enrollment request failed.' }",
+					"  $enrollResponse = ($enrollJson -join [Environment]::NewLine) | ConvertFrom-Json",
+				]
+			: [
+					`  $enrollResponse = Invoke-RestMethod -Method Post -Uri ${q(input.enrollUrl)} -UseBasicParsing`,
+				]),
 		"} catch {",
 		"  Write-Error (",
 		"    'Could not obtain the device key: ' + $_.Exception.Message + " +
@@ -1124,11 +1258,23 @@ function buildWindowsScript(input: ResolvedInput): string {
 		"",
 		"New-Item -ItemType Directory -Force -Path $installDir | Out-Null",
 		"New-Item -ItemType Directory -Force -Path $configDir | Out-Null",
+		...(input.caCertPem
+			? [
+					...WINDOWS_CA_CURL_SETUP,
+					"$caFile = Join-Path $configDir 'server-ca.pem'",
+					`[System.IO.File]::WriteAllBytes($caFile, [Convert]::FromBase64String('${Buffer.from(input.caCertPem).toString("base64")}'))`,
+				]
+			: []),
 		"",
 		`Write-Host "Downloading narrafork-executor v${input.executorVersion} (${input.platform})…"`,
 		"$tempBinary = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())",
 		"try {",
-		`  Invoke-WebRequest -Uri ${q(input.downloadUrl)} -OutFile $tempBinary -UseBasicParsing`,
+		...(input.caCertPem
+			? [
+					`  & $nfCurl ${WINDOWS_CA_CURL_FLAGS} --max-filesize 134217728 --cacert $caFile ${q(input.downloadUrl)} -o $tempBinary`,
+					"  if ($LASTEXITCODE -ne 0) { throw 'NarraFork executor download failed.' }",
+				]
+			: [`  Invoke-WebRequest -Uri ${q(input.downloadUrl)} -OutFile $tempBinary -UseBasicParsing`]),
 		"",
 		"  # Verify the digest even though the download used TLS: this script may have",
 		"  # been forwarded, and the binary gains full access to the account it runs as.",
@@ -1142,6 +1288,25 @@ function buildWindowsScript(input: ResolvedInput): string {
 		"  Remove-Item -LiteralPath $tempBinary -Force -ErrorAction SilentlyContinue",
 		"}",
 		'Write-Host "Installed $binary"',
+		...(input.caCertPem && input.connectionMode === "reverse"
+			? [
+					"# Verify capability before spending the one-time key exchange ticket.",
+					"$helpProcess = New-Object System.Diagnostics.Process",
+					"try {",
+					"  $helpProcess.StartInfo.FileName = $binary",
+					"  $helpProcess.StartInfo.Arguments = '--help'",
+					"  $helpProcess.StartInfo.UseShellExecute = $false",
+					"  $helpProcess.StartInfo.CreateNoWindow = $true",
+					"  $helpProcess.StartInfo.RedirectStandardError = $true",
+					"  $helpProcess.Start() | Out-Null",
+					"  $helpOutput = $helpProcess.StandardError.ReadToEndAsync()",
+					"  if (-not $helpProcess.WaitForExit(10000)) { $helpProcess.Kill(); throw 'Executor help timed out.' }",
+					"  if ($helpOutput.GetAwaiter().GetResult() -notmatch '-ca-file') {",
+					"    throw 'This executor release does not support custom CA trust. Publish an updated executor and generate a fresh install command.'",
+					"  }",
+					"} finally { $helpProcess.Dispose() }",
+				]
+			: []),
 		"",
 		...windowsTokenAcquisition(input),
 		"# UTF8 without BOM: the executor reads the file as a raw token string.",
@@ -1167,12 +1332,17 @@ function buildWindowsScript(input: ResolvedInput): string {
 		"",
 		"$config = [ordered]@{",
 		`  serverUrl = ${q(input.deviceWsUrl)}`,
+		...(input.caCertPem && input.connectionMode === "reverse"
+			? ["  caFile = 'server-ca.pem'"]
+			: []),
 		`  deviceRef = ${q(input.deviceSlug)}`,
 		// Empty = unrestricted; configured after install from the device page.
 		"  pathRules = @()",
 		`  disableShell = $${input.disableShell ? "true" : "false"}`,
 		"}",
-		"$config | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $configFile -Encoding utf8",
+		// Windows PowerShell 5's Set-Content -Encoding utf8 adds a BOM, which Go's
+		// JSON decoder rejects. Use the same BOM-free encoding as the token file.
+		"[System.IO.File]::WriteAllText($configFile, ($config | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))",
 		'Write-Host "Config written to $configFile"',
 		"",
 		/*

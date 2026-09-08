@@ -55,6 +55,8 @@ import ReactDOM from "react-dom/client";
  */
 import { App } from "./App";
 import { cleanupStaleNarratorDockLayouts } from "./components/narrator/dock/narrator-dock-layout";
+import { isPublicNarratorSharePath } from "./lib/app-path-classify";
+import { getRouterBasepath } from "./lib/base-path";
 import { installHostBridge } from "./lib/host-bridge";
 import { getInitialNamespaces, initI18n } from "./lib/i18n";
 
@@ -75,7 +77,8 @@ function applyInitialPluginTheme() {
 }
 
 async function bootstrap() {
-	applyInitialPluginTheme();
+	const isPublicShare = isPublicNarratorSharePath(window.location.pathname, getRouterBasepath());
+	if (!isPublicShare) applyInitialPluginTheme();
 	/*
 	 * Session handoff with an editor host that embeds this app (the VS Code extension).
 	 *
@@ -86,7 +89,7 @@ async function bootstrap() {
 	 * Returns null (and installs nothing) unless this document is a deliberately embedded
 	 * panel; see `lib/host-bridge.ts` for the guards.
 	 */
-	installHostBridge();
+	if (!isPublicShare) installHostBridge();
 	// Before React mounts, so the first gesture on the first paint is already
 	// covered. Safari in a browser tab ignores index.html's `user-scalable=no`, and
 	// a component-level handler is structurally too late (see pinch-zoom-guard.ts).
@@ -99,10 +102,10 @@ async function bootstrap() {
 	const history = createBrowserHistory();
 
 	// Sweep focus-dock layouts unopened for >30 days (best-effort, never throws).
-	cleanupStaleNarratorDockLayouts();
+	if (!isPublicShare) cleanupStaleNarratorDockLayouts();
 
 	await initI18n(getInitialNamespaces(window.location.pathname));
-	void syncPluginUiContributions().catch(() => {});
+	if (!isPublicShare) void syncPluginUiContributions().catch(() => {});
 
 	// biome-ignore lint/style/noNonNullAssertion: root element always exists
 	ReactDOM.createRoot(document.getElementById("root")!, {

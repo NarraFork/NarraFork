@@ -447,6 +447,8 @@ export interface OidcProviderConfig {
 }
 
 export interface NarraForkSettings {
+	/** Instance-wide, monotonic setup completion; absent until legacy preferences are migrated. */
+	setupWizardCompleted?: boolean;
 	server: {
 		port: number;
 		host: string;
@@ -552,6 +554,10 @@ export interface NarraForkSettings {
 	agent: {
 		defaultModel: string;
 		defaultPermissionMode: PermissionMode;
+		/** Creation default only; auto keeps chapter/project and standalone/private behavior. */
+		defaultNarratorVisibility: "auto" | "private" | "public";
+		/** Creation default only; narrowed to visibility, auto uses its widest legal audience. */
+		defaultNarratorWriteAudience: "auto" | "owner" | "project" | "public";
 		/** Whether newly-created narrators should start with the plan trait enabled. */
 		defaultStartInPlanMode: boolean;
 		summaryModel: string;

@@ -7,6 +7,19 @@ import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../../server/db")) };
+const realSettingsModule = { ...(await import("../../../server/lib/settings")) };
+const testSettings = {
+	...realSettingsModule.settings,
+	setupWizardCompleted: undefined as boolean | undefined,
+};
+const saveTestSettings = mock((next: typeof realSettingsModule.settings) => {
+	Object.assign(testSettings, next);
+});
+mock.module("../../../server/lib/settings", () => ({
+	...realSettingsModule,
+	settings: testSettings,
+	saveSettings: saveTestSettings,
+}));
 const realNarratorWsModule = { ...(await import("../../../server/websocket/narrator-ws")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 mock.module("../../../server/websocket/narrator-ws", () => ({
@@ -79,12 +92,111 @@ async function requestJson(
 	return { status: response.status, body: await response.json() };
 }
 
-afterEach(() => cleanDb(sqlite));
+afterEach(() => {
+	cleanDb(sqlite);
+	authUser.sub = "user-1";
+	authUser.role = "user";
+	testSettings.setupWizardCompleted = undefined;
+	saveTestSettings.mockClear();
+});
 
 afterAll(() => {
 	mock.module("../../../server/db", () => realDbModule);
+	mock.module("../../../server/lib/settings", () => realSettingsModule);
 	mock.module("../../../server/websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
+});
+
+describe("instance setup wizard completion", () => {
+	async function patch(body: Record<string, unknown>) {
+		return requestJson("/", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+	}
+
+	it("migrates legacy completion for a newly promoted admin without preferences and survives deletion", async () => {
+		seedPreferences([], { setupWizardCompleted: true });
+		db.insert(users)
+			.values({
+				id: "new-admin",
+				username: "new-admin",
+				passwordHash: "test",
+				role: "admin",
+				createdAt: NOW,
+			})
+			.run();
+		authUser.sub = "new-admin";
+		authUser.role = "admin";
+		expect(await requestJson("/")).toMatchObject({
+			status: 200,
+			body: { setupWizardCompleted: true },
+		});
+		expect(saveTestSettings).toHaveBeenCalledWith(
+			expect.objectContaining({ setupWizardCompleted: true }),
+		);
+		sqlite.run("DELETE FROM user_preferences WHERE user_id = 'user-1'");
+		sqlite.run("DELETE FROM users WHERE id = 'user-1'");
+		expect(await patch({ language: "zh-CN" })).toMatchObject({
+			status: 200,
+			body: { setupWizardCompleted: true },
+		});
+		expect(await patch({ setupWizardCompleted: false })).toMatchObject({
+			status: 200,
+			body: { setupWizardCompleted: true },
+		});
+		expect(await requestJson("/")).toMatchObject({ body: { setupWizardCompleted: true } });
+	});
+
+	it("returns explicit false on a fresh instance with no preferences", async () => {
+		seedUser();
+		authUser.role = "admin";
+		expect(await requestJson("/")).toMatchObject({
+			status: 200,
+			body: { setupWizardCompleted: false },
+		});
+		expect(await patch({ language: "zh-CN" })).toMatchObject({
+			status: 200,
+			body: { setupWizardCompleted: false },
+		});
+	});
+
+	it("allows admin completion and ignores attempts to reset it", async () => {
+		seedUser();
+		authUser.role = "admin";
+		expect(await patch({ setupWizardCompleted: true })).toMatchObject({
+			status: 200,
+			body: { setupWizardCompleted: true },
+		});
+		expect(testSettings.setupWizardCompleted).toBe(true);
+		expect(await patch({ setupWizardCompleted: false })).toMatchObject({
+			status: 200,
+			body: { setupWizardCompleted: true },
+		});
+	});
+
+	it("does not let ordinary preference writes complete setup, even after legacy migration is retried", async () => {
+		seedUser();
+		expect(await patch({ setupWizardCompleted: true })).toMatchObject({
+			status: 200,
+			body: { setupWizardCompleted: false },
+		});
+		expect(db.select().from(userPreferences).get()?.setupWizardCompleted).toBe(false);
+		testSettings.setupWizardCompleted = undefined;
+		authUser.role = "admin";
+		expect(await requestJson("/")).toMatchObject({ body: { setupWizardCompleted: false } });
+	});
+
+	it("migrates legacy completion before PATCH false overwrites its only evidence", async () => {
+		seedPreferences([], { setupWizardCompleted: true });
+		authUser.role = "admin";
+		expect(await patch({ setupWizardCompleted: false })).toMatchObject({
+			status: 200,
+			body: { setupWizardCompleted: true },
+		});
+		expect(testSettings.setupWizardCompleted).toBe(true);
+	});
 });
 
 const storedSecrets = {

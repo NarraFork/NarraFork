@@ -11,6 +11,7 @@ import { sql } from "drizzle-orm";
 import {
 	type AnySQLiteColumn,
 	check,
+	foreignKey,
 	index,
 	integer,
 	real,
@@ -2166,6 +2167,35 @@ export const registrationCodes = sqliteTable(
 	],
 );
 
+// === narrator_public_shares ===
+// Bearer capabilities for one session's public transcript and discussion, never login tokens.
+export const narratorPublicShares = sqliteTable(
+	"narrator_public_shares",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		tokenHash: text("token_hash").notNull(),
+		guestName: text("guest_name").notNull(),
+		label: text("label"),
+		createdByUserId: text("created_by_user_id").references(() => users.id, {
+			onDelete: "set null",
+		}),
+		createdAt: text("created_at").notNull(),
+		revokedAt: text("revoked_at"),
+	},
+	(table) => [
+		uniqueIndex("idx_narrator_public_shares_token_hash").on(table.tokenHash),
+		index("idx_narrator_public_shares_narrator_created").on(
+			table.narratorId,
+			table.createdAt,
+			table.id,
+		),
+		index("idx_narrator_public_shares_created_by").on(table.createdByUserId),
+	],
+);
+
 // === chat_rooms ===
 // Human-to-human conversation, deliberately disjoint from `narrator_messages`:
 // nothing written here ever reaches a model's context unless a person explicitly
@@ -2255,6 +2285,9 @@ export const chatMessages = sqliteTable(
 		/** Monotonic within the room, claimed from `chat_rooms.next_seq`. */
 		seq: integer("seq").notNull(),
 		senderUserId: text("sender_user_id").references(() => users.id, { onDelete: "set null" }),
+		/** A share is not a user. The name snapshot survives link deletion/revocation. */
+		senderShareId: text("sender_share_id"),
+		senderGuestName: text("sender_guest_name"),
 		/** `text` = written by a person; `system` = a room event (e.g. DM created). */
 		kind: text("kind", { enum: ["text", "system"] })
 			.notNull()
@@ -2287,6 +2320,7 @@ export const chatMessages = sqliteTable(
 		 */
 		replyToSeq: integer("reply_to_seq"),
 		replyToSenderUserId: text("reply_to_sender_user_id"),
+		replyToGuestName: text("reply_to_guest_name"),
 		replyToPreview: text("reply_to_preview"),
 		editedAt: text("edited_at"),
 		deletedAt: text("deleted_at"),
@@ -2295,6 +2329,14 @@ export const chatMessages = sqliteTable(
 	(table) => [
 		uniqueIndex("idx_chat_messages_room_seq").on(table.roomId, table.seq),
 		index("idx_chat_messages_sender").on(table.senderUserId),
+		index("idx_chat_messages_sender_share").on(table.senderShareId),
+		// Explicitly named so migration generation rebuilds the FK rather than losing
+		// ON DELETE SET NULL in SQLite's ADD COLUMN path.
+		foreignKey({
+			name: "fk_chat_messages_sender_share",
+			columns: [table.senderShareId],
+			foreignColumns: [narratorPublicShares.id],
+		}).onDelete("set null"),
 	],
 );
 

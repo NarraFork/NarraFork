@@ -12,6 +12,10 @@ import { logger } from "../logger";
 import { invalidateModelCardCache } from "../model-cards";
 import { type ModelPricing, setModelPricingOverrides } from "../model-pricing";
 import { getNarraforkHome } from "../narrafork-home";
+import {
+	normalizeDefaultNarratorVisibility,
+	normalizeDefaultNarratorWriteAudience,
+} from "../narrator-audiences";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
 import { normalizeSearchSettings } from "../search/settings";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
@@ -268,6 +272,22 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	// smaller one — is an operator decision and is left alone.
 	if (raw.agent?.requestDumpMaxSize === LEGACY_REQUEST_DUMP_MAX_SIZE) {
 		merged.agent.requestDumpMaxSize = DEFAULTS.agent.requestDumpMaxSize;
+		needsSave = true;
+	}
+
+	const defaultVisibility = normalizeDefaultNarratorVisibility(
+		merged.agent.defaultNarratorVisibility,
+	);
+	if (merged.agent.defaultNarratorVisibility !== defaultVisibility) {
+		merged.agent.defaultNarratorVisibility = defaultVisibility;
+		needsSave = true;
+	}
+
+	const defaultWriteAudience = normalizeDefaultNarratorWriteAudience(
+		merged.agent.defaultNarratorWriteAudience,
+	);
+	if (merged.agent.defaultNarratorWriteAudience !== defaultWriteAudience) {
+		merged.agent.defaultNarratorWriteAudience = defaultWriteAudience;
 		needsSave = true;
 	}
 

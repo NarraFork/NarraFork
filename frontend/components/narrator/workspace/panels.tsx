@@ -31,6 +31,7 @@ import {
 	TerminalDockPanel as TerminalToolAdapter,
 	UserChatDockPanel as UserChatToolAdapter,
 } from "../dock/panels";
+import { useFilePanelSourceOpener } from "../file-panel-navigation";
 import { NarratorPanel } from "../NarratorPanel";
 import type {
 	FilePanelParams,
@@ -120,6 +121,11 @@ function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
 	const { ref, compact } = usePanelCompact();
 	const directorActive = useWorkspaceDirectorActive();
 	const dockValue = useWorkspaceNarratorDockValue(hostNarratorId);
+	const openFilePanel = useFilePanelSourceOpener(
+		dockValue?.openFilePanel,
+		props.api.id,
+		subagentNarratorId,
+	);
 	const close = useCallback(() => props.api.close(), [props.api]);
 	const onHeaderPointerDown = usePanelHeaderDrag(props, subagentNarratorId, "tool");
 	const handleTitleChange = useCallback(
@@ -139,6 +145,7 @@ function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
 				onClose={close}
 				onHeaderPointerDown={onHeaderPointerDown}
 				onViewSubagentSession={dockValue?.openSubagentPanel}
+				onOpenFilePanel={openFilePanel}
 				onTitleChange={handleTitleChange}
 				highlightMessageId={highlightMessageId}
 				highlightRequestId={highlightRequestId}
@@ -319,8 +326,8 @@ function WebviewDockPanel(props: IDockviewPanelProps<WebviewPanelParams>) {
 
 /**
  * File viewer adapter. Delegates to the focus dock's `FileDockPanel` — it reads
- * its identity from params (a resource, not the host narrator), so the only
- * adaptation needed is dropping the workspace-only `hostNarratorId`.
+ * file-operation identity from params, while the host context owns layout and
+ * selection publication. Preserve both identities through the adapter.
  */
 function WorkspaceFileDockPanel(props: IDockviewPanelProps<WorkspaceFilePanelParams>) {
 	// Preserve the host bridge and resource identity, including device and navigation.

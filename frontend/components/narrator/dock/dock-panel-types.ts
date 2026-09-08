@@ -89,14 +89,18 @@ export function hashFilePath(filePath: string): string {
 	return `${hash.toString(36)}${filePath.length.toString(36)}`;
 }
 
-/** Keep legacy local ids, with a separate namespace for case-sensitive remote devices. */
+/** Keep host legacy ids; live cross-session reads differ, historical refs retain their own identity. */
 export function filePanelIdentity(
 	filePath: string,
 	deviceId = "local",
 	toolEdit?: ToolEditReference,
+	fileNarratorId?: string,
 ): string {
 	if (toolEdit) {
 		return `history-${hashFilePath(JSON.stringify([deviceId, filePath, toolEditReferenceKey(toolEdit)]))}`;
+	}
+	if (fileNarratorId) {
+		return `session-${hashFilePath(JSON.stringify([fileNarratorId, deviceId, filePath]))}`;
 	}
 	return deviceId === "local"
 		? hashFilePath(filePath)
@@ -108,8 +112,9 @@ export function fileDockPanelId(
 	filePath: string,
 	deviceId = "local",
 	toolEdit?: ToolEditReference,
+	fileNarratorId?: string,
 ): string {
-	return `ndock-file-${filePanelIdentity(filePath, deviceId, toolEdit)}`;
+	return `ndock-file-${filePanelIdentity(filePath, deviceId, toolEdit, fileNarratorId)}`;
 }
 
 /**

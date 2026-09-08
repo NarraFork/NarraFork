@@ -68,6 +68,7 @@ import {
 	RouteChunkErrorBoundary,
 	RoutePendingIndicator,
 } from "./components/common/RouteChunkErrorBoundary";
+import { isPublicNarratorSharePath } from "./lib/app-path-classify";
 import { getRouterBasepath } from "./lib/base-path";
 import i18n from "./lib/i18n";
 import { mantineTheme } from "./lib/mantine-theme";
@@ -292,6 +293,25 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
  */
 export function App({ history }: { history: RouterHistory }) {
 	const [router] = React.useState(() => createAppRouter(history));
+	// History lives outside RouterProvider. Subscribe here so both cold opens and
+	// client-side navigation unmount the authenticated plugin hosts before a share renders.
+	const subscribe = React.useCallback((notify: () => void) => history.subscribe(notify), [history]);
+	const isPublicShare = React.useSyncExternalStore(
+		subscribe,
+		() => isPublicNarratorSharePath(history.location.pathname, getRouterBasepath()),
+		() => false,
+	);
+	const routeContent = (
+		<React.Suspense
+			fallback={
+				<Center h="100vh">
+					<Loader />
+				</Center>
+			}
+		>
+			<RouterProvider router={router} />
+		</React.Suspense>
+	);
 
 	return (
 		<MantineProvider
@@ -302,20 +322,16 @@ export function App({ history }: { history: RouterHistory }) {
 			<DatesProvider settings={{ firstDayOfWeek: 1 }}>
 				<ConfirmDialogProvider>
 					<ImageViewerProvider>
-						<AppNotifications />
+						{!isPublicShare && <AppNotifications />}
 						<QueryClientProvider client={queryClient}>
-							<PluginThemeInjector />
-							<PluginRuntimeShell>
-								<React.Suspense
-									fallback={
-										<Center h="100vh">
-											<Loader />
-										</Center>
-									}
-								>
-									<RouterProvider router={router} />
-								</React.Suspense>
-							</PluginRuntimeShell>
+							{isPublicShare ? (
+								routeContent
+							) : (
+								<>
+									<PluginThemeInjector />
+									<PluginRuntimeShell>{routeContent}</PluginRuntimeShell>
+								</>
+							)}
 						</QueryClientProvider>
 					</ImageViewerProvider>
 				</ConfirmDialogProvider>

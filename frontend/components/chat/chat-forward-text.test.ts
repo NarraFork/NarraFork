@@ -67,6 +67,22 @@ describe("attribution and framing", () => {
 		expect(text).toContain("**bob**");
 	});
 
+	test("guests stay attributed in both the sender and quoted author", () => {
+		const guest = { ...sender("guest:original"), username: "固定访客", isGuest: true };
+		const text = buildForwardText([
+			msg({
+				id: "reply",
+				sender: guest,
+				replyToSender: guest,
+				replyToMessageId: "original",
+				replyToPreview: "quoted text",
+			}),
+		]);
+		expect(text).toContain("**固定访客 [share guest]**");
+		expect(text).toContain("in reply to **固定访客 [share guest]**");
+		expect(text).not.toContain("guest:original");
+	});
+
 	test("a missing sender degrades to 'unknown' rather than vanishing", () => {
 		const text = buildForwardText([msg({ id: "a", sender: null })]);
 		expect(text).toContain("unknown");

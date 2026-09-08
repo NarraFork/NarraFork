@@ -81,6 +81,23 @@ describe("device-scoped pending file panels", () => {
 		expect(parseDetachedNodes(bad)).toEqual([]);
 	});
 
+	test("child authority survives pending-panel persistence and stays distinct from host/siblings", () => {
+		const path = "/work/b/a.ts";
+		const children = ["child", "sibling"].map((id) =>
+			makePanelEntry("file", JSON.stringify(["local", path, true, null, id])),
+		);
+		const host = makePanelEntry("file", path);
+		const entries = [...children, host];
+		expect(new Set(entries.map((entry) => entry.panelId)).size).toBe(3);
+		const restored = parseDetachedNodes(
+			serializeDetachedNodes([pending({ pendingPanels: entries })]),
+		);
+		expect(restored[0].pendingPanels).toEqual(entries);
+		for (const entry of restored[0].pendingPanels ?? []) {
+			expect(makePanelEntry("file", resourceIdOf(entry))).toEqual(entry);
+		}
+	});
+
 	test("scoped local references remain scoped after a detached layout round-trip", () => {
 		const entry = makePanelEntry("file", JSON.stringify(["local", "/repo/a.png", true]));
 		expect(entry).toMatchObject({

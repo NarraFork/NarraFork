@@ -183,3 +183,19 @@ export function setBaseHref(html: string, href: string): string {
 export function injectSpaBaseHref(html: string, requestPath: string): string {
 	return setBaseHref(html, computeSpaBaseHref(requestPath));
 }
+
+/** Both filesystem and embedded SPA responses use the same public-share privacy policy. */
+export function spaIndexHeaders(requestPath: string): Record<string, string> {
+	const publicShare =
+		requestPath === "/shared/narrators" || requestPath.startsWith("/shared/narrators/");
+	return {
+		"Content-Type": "text/html; charset=utf-8",
+		"Cache-Control": publicShare ? "no-store" : "no-cache",
+		...(publicShare
+			? {
+					"Referrer-Policy": "no-referrer",
+					"X-Robots-Tag": "noindex, nofollow, noarchive",
+				}
+			: {}),
+	};
+}

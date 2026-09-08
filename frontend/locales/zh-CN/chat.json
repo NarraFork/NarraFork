@@ -9,6 +9,7 @@
 	"searchUsers": "搜索用户",
 	"noUsersFound": "没有匹配的用户",
 	"unknownSender": "未知发送者",
+	"shareGuest": "分享访客",
 	"composerPlaceholder": "输入消息…（Enter 发送，Shift+Enter 换行）",
 	"send": "发送",
 	"sendFailed": "发送失败",

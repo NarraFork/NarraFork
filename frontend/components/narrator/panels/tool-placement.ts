@@ -5,6 +5,19 @@
  * without a live DockviewApi.
  */
 
+import type { DockviewApi } from "dockview-react";
+
+/** Prefer an existing group away from the browser; otherwise split beside it. */
+export function resolveFileBrowserPosition(api: DockviewApi, sourcePanelId?: string) {
+	const source = sourcePanelId ? api.getPanel(sourcePanelId) : undefined;
+	if (!source) return undefined;
+	const candidates = api.panels.filter((panel) => panel.group.id !== source.group.id);
+	const target = candidates.find((panel) => panel.params?.panelType === "file") ?? candidates[0];
+	return target
+		? { referenceGroup: target.group }
+		: { referencePanel: source.id, direction: "right" as const };
+}
+
 export interface ToolPlacementInputs {
 	/** Whether a secondary (tool) group already exists in the surface. */
 	hasSecondaryGroup: boolean;

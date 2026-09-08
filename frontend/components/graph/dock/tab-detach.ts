@@ -68,6 +68,7 @@ export function readPanelSubject(
 		panelType?: unknown;
 		subagentNarratorId?: unknown;
 		filePath?: unknown;
+		fileNarratorId?: unknown;
 		deviceId?: unknown;
 		referenceOrigin?: unknown;
 		toolEdit?: unknown;
@@ -87,6 +88,7 @@ export function readPanelSubject(
 						typeof p.deviceId === "string" ? p.deviceId : "local",
 						p.referenceOrigin === true,
 						isToolEditReference(p.toolEdit) ? p.toolEdit : undefined,
+						typeof p.fileNarratorId === "string" ? p.fileNarratorId : undefined,
 					)
 				: undefined;
 	return resourceId ? { kind, resourceId } : { kind };

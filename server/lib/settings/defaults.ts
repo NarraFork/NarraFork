@@ -39,6 +39,8 @@ export const DEFAULTS: NarraForkSettings = {
 		// wizard makes selecting one a hard gate before anything can run.
 		defaultModel: "",
 		defaultPermissionMode: "acceptEdits",
+		defaultNarratorVisibility: "auto",
+		defaultNarratorWriteAudience: "auto",
 		defaultStartInPlanMode: false,
 		// Deliberately empty: an unset summary model follows the default model
 		// (resolveConfiguredSummaryModel). Shipping a concrete model here would
@@ -410,6 +412,16 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "新建叙述者的默认权限模式。控制工具调用是否需要用户批准（不包含计划模式）。",
 		type: "string",
 		valid: '"default" | "acceptEdits" | "bypassPermissions" | "readOnly" | "dontAsk"',
+	},
+	"agent.defaultNarratorVisibility": {
+		desc: "新建叙述者的默认可见性，仅在未显式指定时生效。auto 保持章节叙述者 project、独立叙述者 private；不改变已有会话或分叉继承。可操作性由独立的 defaultNarratorWriteAudience 配置决定，并按最终可见性收窄。",
+		type: "string",
+		valid: '"auto" | "private" | "public"',
+	},
+	"agent.defaultNarratorWriteAudience": {
+		desc: "新建叙述者的默认可操作性，仅在未显式指定 writeAudience 时生效。auto 随最终可见性采用最宽合法写权限；owner、project、public 会按最终可见性收窄，绝不扩大可见性。不改变已有会话、分叉或子代理的继承。",
+		type: "string",
+		valid: '"auto" | "owner" | "project" | "public"',
 	},
 	"agent.defaultStartInPlanMode": {
 		desc: "新建叙述者是否默认进入计划模式。计划模式是独立 trait，不再作为权限模式保存。",

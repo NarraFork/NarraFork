@@ -46,7 +46,7 @@ import {
 	type KnowledgeEntryScope,
 	nextHighlightRequestId,
 } from "../panels/panel-kind";
-import { resolveToolPlacement } from "../panels/tool-placement";
+import { resolveFileBrowserPosition, resolveToolPlacement } from "../panels/tool-placement";
 import type { ToolEditReference } from "../tool-edit-reference";
 import { PANEL_COMPONENT, type WorkspacePanelParams } from "./panel-types";
 
@@ -118,8 +118,9 @@ export function workspaceFilePanelId(
 	filePath: string,
 	deviceId = "local",
 	toolEdit?: ToolEditReference,
+	fileNarratorId?: string,
 ): string {
-	return `wfile_${hostNarratorId}_${filePanelIdentity(filePath, deviceId, toolEdit)}`;
+	return `wfile_${hostNarratorId}_${filePanelIdentity(filePath, deviceId, toolEdit, fileNarratorId === hostNarratorId ? undefined : fileNarratorId)}`;
 }
 
 /**
@@ -510,13 +511,22 @@ export class WorkspaceDockStore {
 		const api = this.apiRef.current;
 		if (!api || !filePath) return;
 		const deviceId = options.deviceId ?? "local";
+		const fileNarratorId =
+			options.fileNarratorId === hostNarratorId ? undefined : options.fileNarratorId;
 		const navigation = {
 			deviceId,
+			fileNarratorId,
 			toolEdit: options.toolEdit,
 			selection: options.selection,
 			highlightRequestId: options.highlightRequestId ?? nextHighlightRequestId(),
 		};
-		const id = workspaceFilePanelId(hostNarratorId, filePath, deviceId, options.toolEdit);
+		const id = workspaceFilePanelId(
+			hostNarratorId,
+			filePath,
+			deviceId,
+			options.toolEdit,
+			fileNarratorId,
+		);
 		const existing = api.getPanel(id);
 		if (existing) {
 			existing.api.updateParameters({
@@ -547,6 +557,11 @@ export class WorkspaceDockStore {
 			referenceOrigin: options.referenceOrigin === true,
 			...(fileName ? { fileName } : {}),
 		};
+		const browserPosition = resolveFileBrowserPosition(api, options.sourcePanelId);
+		if (browserPosition) {
+			api.addPanel({ id, component: PANEL_COMPONENT.file, params, position: browserPosition });
+			return;
+		}
 		const placement = resolveToolPlacement({
 			hasSecondaryGroup: !!existingSecondary?.group,
 			hasChatPanel: !!narratorPanel,

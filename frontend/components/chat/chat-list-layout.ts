@@ -49,6 +49,7 @@ export interface ChatReplyInfo {
 	preview: string;
 	/** Display name of the quoted author, when known. */
 	authorName: string | null;
+	authorIsGuest?: boolean;
 	/** Target message id, for the jump action. */
 	targetId: string;
 	/**
@@ -162,6 +163,7 @@ export function resolveReplyInfo(
 			state: preview ? "quoted" : "deleted",
 			preview,
 			authorName: snapshotAuthor,
+			...(message.replyToSender?.isGuest ? { authorIsGuest: true } : {}),
 			targetId,
 			targetSeq: message.replyToSeq ?? null,
 		};
@@ -174,6 +176,7 @@ export function resolveReplyInfo(
 			state: "unavailable",
 			preview: "",
 			authorName: snapshotAuthor,
+			...(message.replyToSender?.isGuest ? { authorIsGuest: true } : {}),
 			targetId,
 			targetSeq: message.replyToSeq ?? null,
 		};
@@ -183,6 +186,7 @@ export function resolveReplyInfo(
 		state: target.deletedAt || !preview ? "deleted" : "quoted",
 		preview,
 		authorName: snapshotAuthor ?? target.sender?.username ?? null,
+		...((message.replyToSender ?? target.sender)?.isGuest ? { authorIsGuest: true } : {}),
 		targetId,
 		targetSeq: target.seq,
 	};

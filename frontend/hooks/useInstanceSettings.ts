@@ -19,6 +19,8 @@ import type {
 import { normalizeRuleTargetSelector } from "../lib/api/types";
 import { normalizeUrlProtocol } from "../lib/url";
 
+export type DefaultNarratorVisibility = "auto" | "private" | "public";
+export type DefaultNarratorWriteAudience = "auto" | "owner" | "project" | "public";
 export type DangerReflectionLevel = "off" | "light" | "standard" | "strict";
 export type AutoContinuationMode = "always" | "blockStop" | "protectedOnly" | "off";
 
@@ -58,6 +60,8 @@ export interface InstanceSettingsState {
 	translateReasoning: boolean;
 	requestDumpEnabled: boolean;
 	requestDumpErrorsOnly: boolean;
+	defaultNarratorVisibility: DefaultNarratorVisibility;
+	defaultNarratorWriteAudience: DefaultNarratorWriteAudience;
 	defaultStartInPlanMode: boolean;
 	defaultRelaxedPlan: boolean;
 	defaultPruneEnabled: boolean;
@@ -175,6 +179,8 @@ function makeDefaults(): InstanceSettingsState {
 		translateReasoning: false,
 		requestDumpEnabled: false,
 		requestDumpErrorsOnly: false,
+		defaultNarratorVisibility: "auto",
+		defaultNarratorWriteAudience: "auto",
 		defaultStartInPlanMode: false,
 		defaultRelaxedPlan: false,
 		defaultPruneEnabled: false,
@@ -261,6 +267,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				brandIconColor: settings.branding?.iconColor ?? DEFAULT_BRAND_ICON_COLOR,
 				defaultModel: ensurePrefix(settings.agent?.defaultModel ?? ""),
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
+				defaultNarratorVisibility: settings.agent?.defaultNarratorVisibility ?? "auto",
+				defaultNarratorWriteAudience: settings.agent?.defaultNarratorWriteAudience ?? "auto",
 				defaultStartInPlanMode: settings.agent?.defaultStartInPlanMode ?? false,
 				summaryModel: ensurePrefix(settings.agent?.summaryModel ?? ""),
 				translationModel: settings.agent?.translationModel?.startsWith("__")
@@ -412,6 +420,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					translateReasoning: state.translateReasoning,
 					requestDumpEnabled: state.requestDumpEnabled,
 					requestDumpErrorsOnly: state.requestDumpErrorsOnly,
+					defaultNarratorVisibility: state.defaultNarratorVisibility,
+					defaultNarratorWriteAudience: state.defaultNarratorWriteAudience,
 					defaultStartInPlanMode: state.defaultStartInPlanMode,
 					defaultRelaxedPlan: state.defaultRelaxedPlan,
 					defaultPruneEnabled: state.defaultPruneEnabled,

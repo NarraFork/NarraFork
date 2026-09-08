@@ -46,7 +46,7 @@ import {
 	nextHighlightRequestId,
 	type SubagentPanelParams,
 } from "../panels/panel-kind";
-import { resolveToolPlacement } from "../panels/tool-placement";
+import { resolveFileBrowserPosition, resolveToolPlacement } from "../panels/tool-placement";
 import {
 	dockPanelId,
 	fileDockPanelId,
@@ -435,13 +435,17 @@ export function NarratorDockProvider({
 			const api = apiRef.current;
 			if (!api || !filePath) return;
 			const deviceId = options.deviceId ?? "local";
+			// Absent means the host's authority (legacy panels keep their existing ids).
+			const fileNarratorId =
+				options.fileNarratorId === narratorId ? undefined : options.fileNarratorId;
 			const navigation = {
 				deviceId,
+				fileNarratorId,
 				toolEdit: options.toolEdit,
 				selection: options.selection,
 				highlightRequestId: options.highlightRequestId ?? nextHighlightRequestId(),
 			};
-			const id = fileDockPanelId(filePath, deviceId, options.toolEdit);
+			const id = fileDockPanelId(filePath, deviceId, options.toolEdit, fileNarratorId);
 			const existing = api.getPanel(id);
 			if (existing) {
 				// Layouts written before file editing carried no host identity. Repair the
@@ -476,6 +480,16 @@ export function NarratorDockProvider({
 				referenceOrigin: options.referenceOrigin === true,
 				...(fileName ? { fileName } : {}),
 			};
+			const browserPosition = resolveFileBrowserPosition(api, options.sourcePanelId);
+			if (browserPosition) {
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT.file,
+					params,
+					position: browserPosition,
+				});
+				return;
+			}
 			const placement = resolveToolPlacement({
 				hasSecondaryGroup: !!existingSecondary?.group,
 				hasChatPanel: !!chatPanel,

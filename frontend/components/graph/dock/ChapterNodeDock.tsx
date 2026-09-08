@@ -224,7 +224,12 @@ const ChapterNodeDockSurface = memo(function ChapterNodeDockSurface({
 				kind === "subagent"
 					? subagentDockPanelId(drag.resourceId as string)
 					: kind === "file"
-						? fileDockPanelId(fileTarget.filePath, fileTarget.deviceId, fileTarget.toolEdit)
+						? fileDockPanelId(
+								fileTarget.filePath,
+								fileTarget.deviceId,
+								fileTarget.toolEdit,
+								fileTarget.fileNarratorId,
+							)
 						: dockPanelId(kind);
 
 			// Release the panel on the source surface FIRST, when it is a live one. If

@@ -32,3 +32,16 @@ export const API_WS_PREFIXES = ["api", "ws"] as const;
 export function isApiOrWsRelativePath(relative: string): boolean {
 	return API_WS_PREFIXES.some((prefix) => relative === prefix || relative.startsWith(`${prefix}/`));
 }
+
+/**
+ * Sharing pages are isolated even with an existing login token, including malformed links.
+ * `basePath` is supplied for browser history paths; router-relative paths use the default.
+ * Keep this pure: bootstrap and tests must not load the authenticated application to classify it.
+ */
+export function isPublicNarratorSharePath(pathname: string, basePath = "/"): boolean {
+	const base = basePath.replace(/\/+$/, "");
+	const path = pathname.split(/[?#]/, 1)[0] ?? "";
+	if (base && !path.startsWith(`${base}/`)) return false;
+	const relative = base ? path.slice(base.length) : path;
+	return relative === "/shared/narrators" || relative.startsWith("/shared/narrators/");
+}

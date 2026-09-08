@@ -709,7 +709,9 @@ export function ChatRoomView({
 				>
 					<Text size="xs" c="dimmed" truncate style={{ flex: 1 }}>
 						{t("replyingTo", {
-							name: replyTo.sender?.username ?? t("unknownSender"),
+							name: replyTo.sender?.isGuest
+								? `${replyTo.sender.username} (${t("shareGuest")})`
+								: (replyTo.sender?.username ?? t("unknownSender")),
 						})}
 						{": "}
 						{/* An attachment-only target has no body; naming its files is what

@@ -48,6 +48,10 @@ function SettingsAgentPage() {
 				setRequestDumpEnabled={is.setRequestDumpEnabled}
 				requestDumpErrorsOnly={is.requestDumpErrorsOnly}
 				setRequestDumpErrorsOnly={is.setRequestDumpErrorsOnly}
+				defaultNarratorVisibility={is.defaultNarratorVisibility}
+				setDefaultNarratorVisibility={is.setDefaultNarratorVisibility}
+				defaultNarratorWriteAudience={is.defaultNarratorWriteAudience}
+				setDefaultNarratorWriteAudience={is.setDefaultNarratorWriteAudience}
 				defaultStartInPlanMode={is.defaultStartInPlanMode}
 				setDefaultStartInPlanMode={is.setDefaultStartInPlanMode}
 				defaultRelaxedPlan={is.defaultRelaxedPlan}

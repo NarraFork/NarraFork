@@ -61,6 +61,7 @@ import { CodeMirrorEditor } from "../file-editor/CodeMirrorEditor";
 import { MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../highlight-cache";
 import { MarkdownContent } from "../MarkdownContent";
 import { filePanelBaseName } from "../panels/panel-kind";
+import { availableModes, type FileViewerMode } from "./file-viewer-modes";
 import { StructuredNodeTree } from "./StructuredNodeTree";
 import {
 	detectStructuredFormat,
@@ -69,7 +70,7 @@ import {
 	type StructuredNode,
 } from "./structured-parse";
 
-const MARKDOWN_EXTS = new Set(["md", "markdown", "mdx"]);
+export { availableModes, type FileViewerMode, isMarkdownPath } from "./file-viewer-modes";
 
 /**
  * Character cap for the viewer's streaming read, aligned with the backend's own
@@ -94,8 +95,6 @@ const MARKDOWN_EXTS = new Set(["md", "markdown", "mdx"]);
  * served in full. `file-viewer-limits.test.ts` pins this alignment.
  */
 export const MAX_FILE_VIEWER_TEXT_CHARS = 1024 * 1024;
-
-export type FileViewerMode = "preview" | "node" | "raw";
 
 /** Why node mode cannot render, when it cannot. */
 export type NodeUnavailableReason = "truncated" | "parse-error";
@@ -123,25 +122,6 @@ export function resolveNodeUnavailable(args: {
 	// fabricated.
 	if (args.truncated) return "truncated";
 	return args.parseFailed ? "parse-error" : null;
-}
-
-/** True when the path should render as markdown in `preview` mode. */
-export function isMarkdownPath(filePath: string): boolean {
-	const base = fileBaseName(filePath);
-	const dot = base.lastIndexOf(".");
-	if (dot <= 0) return false;
-	return MARKDOWN_EXTS.has(base.slice(dot + 1).toLowerCase());
-}
-
-/**
- * The modes a path supports, in display order. Always ends with `raw`; a single
- * entry means the caller should hide the switch.
- */
-export function availableModes(filePath: string, selection?: FileSelection): FileViewerMode[] {
-	if (selection) return ["raw"];
-	if (isMarkdownPath(filePath)) return ["preview", "raw"];
-	if (detectStructuredFormat(filePath)) return ["node", "raw"];
-	return ["raw"];
 }
 
 /** Same target-path grammar as markdown resolution and the dock/editor labels. */

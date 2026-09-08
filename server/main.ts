@@ -46,7 +46,7 @@ import {
 } from "./lib/server-restart";
 import { settings } from "./lib/settings";
 import { ShutdownActivityTracker } from "./lib/shutdown-activity";
-import { injectSpaBaseHref } from "./lib/spa-base-href";
+import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
 import {
 	buildHealthPayload,
 	createStartupReadinessGate,
@@ -279,10 +279,7 @@ function getFrontendCacheControl(path: string): string {
 async function serveSpaIndex(indexFile: Bun.BunFile, requestPath: string): Promise<Response> {
 	const html = injectSpaBaseHref(await indexFile.text(), requestPath);
 	return new Response(html, {
-		headers: {
-			"Content-Type": "text/html; charset=utf-8",
-			"Cache-Control": "no-cache",
-		},
+		headers: spaIndexHeaders(requestPath),
 	});
 }
 

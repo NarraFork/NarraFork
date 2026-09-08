@@ -9,6 +9,7 @@
 	"searchUsers": "Search people",
 	"noUsersFound": "No matching people",
 	"unknownSender": "Unknown sender",
+	"shareGuest": "Share guest",
 	"composerPlaceholder": "Write a message… (Enter to send, Shift+Enter for a new line)",
 	"send": "Send",
 	"sendFailed": "Failed to send",

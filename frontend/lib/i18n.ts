@@ -37,6 +37,7 @@ export const namespaces = [
 	"scheduledTasks",
 	"plugins",
 	"chat",
+	"publicShare",
 ] as const;
 export type Namespace = (typeof namespaces)[number];
 
@@ -97,6 +98,7 @@ const PUBLIC_PATH_NAMESPACES = new Map<string, Namespace[]>([
 
 export function getNamespacesForPath(pathname: string): Namespace[] {
 	const path = normalizePathname(pathname);
+	if (path.startsWith("/shared/narrators/")) return ["common", "errors", "publicShare"];
 
 	const publicNamespaces = PUBLIC_PATH_NAMESPACES.get(path);
 	if (publicNamespaces) return publicNamespaces;

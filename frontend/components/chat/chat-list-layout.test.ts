@@ -49,6 +49,29 @@ function msg(overrides: Partial<ChatMessage> & { id: string }): ChatMessage {
 	};
 }
 
+describe("guest quotes", () => {
+	test("the snapshot preserves the guest label outside the loaded window", () => {
+		const message = msg({
+			id: "reply",
+			replyToMessageId: "original",
+			replyToSeq: 1,
+			replyToPreview: "quoted text",
+			replyToSender: {
+				id: "guest:original",
+				username: "固定访客",
+				avatarColor: null,
+				avatarImageId: null,
+				isGuest: true,
+			},
+		});
+		expect(resolveReplyInfo(message, new Map())).toMatchObject({
+			authorName: "固定访客",
+			authorIsGuest: true,
+			state: "quoted",
+		});
+	});
+});
+
 describe("grouping", () => {
 	test("same author inside the window is grouped", () => {
 		const first = msg({ id: "a", seq: 1 });

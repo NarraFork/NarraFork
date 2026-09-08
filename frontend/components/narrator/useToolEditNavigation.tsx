@@ -2,7 +2,7 @@ import { Box, Modal } from "@mantine/core";
 import { lazy, Suspense, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ToolCallDetailRef } from "../../lib/api/narrators";
-import { useNarratorDockContext } from "./dock/NarratorDockContext";
+import { useFilePanelNavigation } from "./file-panel-navigation";
 import type { ToolEditReference } from "./tool-edit-reference";
 
 const ToolEditFileViewer = lazy(() =>
@@ -23,7 +23,7 @@ export function useToolEditNavigation({
 	toolDetailRef?: ToolCallDetailRef;
 	filePath?: string;
 }) {
-	const dock = useNarratorDockContext();
+	const openFilePanel = useFilePanelNavigation();
 	const { t } = useTranslation("narrator");
 	const [opened, setOpened] = useState(false);
 	const reference = useMemo<ToolEditReference | null>(() => {
@@ -46,9 +46,9 @@ export function useToolEditNavigation({
 	]);
 	const open = useCallback(() => {
 		if (!reference || !filePath) return;
-		if (dock?.openFilePanel) dock.openFilePanel(filePath, undefined, { toolEdit: reference });
+		if (openFilePanel) openFilePanel(filePath, undefined, { toolEdit: reference });
 		else setOpened(true);
-	}, [dock?.openFilePanel, reference, filePath]);
+	}, [openFilePanel, reference, filePath]);
 	return {
 		open: reference ? open : undefined,
 		modal:

@@ -29,7 +29,12 @@ import {
 import { type UseMutationResult, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { AutoContinuationMode, DangerReflectionLevel } from "../../hooks/useInstanceSettings";
+import type {
+	AutoContinuationMode,
+	DangerReflectionLevel,
+	DefaultNarratorVisibility,
+	DefaultNarratorWriteAudience,
+} from "../../hooks/useInstanceSettings";
 import { usePlatform, useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type {
@@ -61,6 +66,10 @@ export interface AgentSectionProps {
 	setRequestDumpEnabled: (v: boolean) => void;
 	requestDumpErrorsOnly: boolean;
 	setRequestDumpErrorsOnly: (v: boolean) => void;
+	defaultNarratorVisibility: DefaultNarratorVisibility;
+	setDefaultNarratorVisibility: (v: DefaultNarratorVisibility) => void;
+	defaultNarratorWriteAudience: DefaultNarratorWriteAudience;
+	setDefaultNarratorWriteAudience: (v: DefaultNarratorWriteAudience) => void;
 	defaultStartInPlanMode: boolean;
 	setDefaultStartInPlanMode: (v: boolean) => void;
 	defaultRelaxedPlan: boolean;
@@ -281,6 +290,37 @@ export function AgentSection(props: AgentSectionProps) {
 					</Stack>
 				</Modal>
 			</Stack>
+			<Select
+				label={t("defaultNarratorVisibility")}
+				description={t("defaultNarratorVisibilityDesc")}
+				data={[
+					{ value: "auto", label: t("defaultNarratorVisibilityAuto") },
+					{ value: "private", label: t("defaultNarratorVisibilityPrivate") },
+					{ value: "public", label: t("defaultNarratorVisibilityPublic") },
+				]}
+				value={props.defaultNarratorVisibility}
+				allowDeselect={false}
+				onChange={(v) =>
+					props.setDefaultNarratorVisibility(v === "private" || v === "public" ? v : "auto")
+				}
+			/>
+			<Select
+				label={t("defaultNarratorWriteAudience")}
+				description={t("defaultNarratorWriteAudienceDesc")}
+				data={[
+					{ value: "auto", label: t("defaultNarratorWriteAudienceAuto") },
+					{ value: "owner", label: t("defaultNarratorWriteAudienceOwner") },
+					{ value: "project", label: t("defaultNarratorWriteAudienceProject") },
+					{ value: "public", label: t("defaultNarratorWriteAudiencePublic") },
+				]}
+				value={props.defaultNarratorWriteAudience}
+				allowDeselect={false}
+				onChange={(v) =>
+					props.setDefaultNarratorWriteAudience(
+						v === "owner" || v === "project" || v === "public" ? v : "auto",
+					)
+				}
+			/>
 			<Title order={5} mt="sm">
 				{t("planAndApprovalSettings")}
 			</Title>

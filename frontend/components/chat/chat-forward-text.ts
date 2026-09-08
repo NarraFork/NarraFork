@@ -64,7 +64,9 @@ function quoteLines(text: string): string {
  */
 function replyContextLine(message: ChatMessage): string {
 	if (!message.replyToMessageId) return "";
-	const author = message.replyToSender?.username ?? "unknown";
+	const author = message.replyToSender?.isGuest
+		? `${message.replyToSender.username} [share guest]`
+		: (message.replyToSender?.username ?? "unknown");
 	if (message.replyToPreview == null) {
 		// Legacy row: the relationship is known, the content is not. Saying so is more
 		// useful than omitting the line, because it still tells the model this message
@@ -131,7 +133,9 @@ export function buildForwardText(
 			body.length > CHAT_FORWARD_PER_MESSAGE_MAX_CHARS
 				? `${body.slice(0, CHAT_FORWARD_PER_MESSAGE_MAX_CHARS)}…`
 				: body;
-		const author = message.sender?.username ?? "unknown";
+		const author = message.sender?.isGuest
+			? `${message.sender.username} [share guest]`
+			: (message.sender?.username ?? "unknown");
 		const timestamp = formatTimestamp(message.createdAt);
 		const header = timestamp ? `**${author}** · ${timestamp}` : `**${author}**`;
 		const attachmentLine = attachmentNames.length > 0 ? `> 📎 ${attachmentNames.join(", ")}\n` : "";

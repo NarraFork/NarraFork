@@ -4,13 +4,18 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,13 +105,20 @@ func (s *connectionState) BufferedAmount() int { return 0 }
 // Run connects and serves until ctx is cancelled, reconnecting with exponential
 // backoff on any disconnect.
 func (c *Client) Run(ctx context.Context) error {
+	// Load trust once, before reconnecting. Invalid local configuration must
+	// return to the caller rather than being retried forever as a dial error.
+	httpClient, err := newReverseHTTPClient(c.cfg)
+	if err != nil {
+		return err
+	}
+	defer httpClient.CloseIdleConnections()
 	backoff := time.Second
 	maxBackoff := time.Duration(c.cfg.ReconnectMaxSeconds) * time.Second
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		err := c.connectAndServe(ctx)
+		err := c.connectAndServe(ctx, httpClient)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -123,16 +135,116 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 }
 
-func (c *Client) connectAndServe(ctx context.Context) error {
+// maxCAFileBytes limits both file IO and certificate parsing at startup.
+const maxCAFileBytes = 1024 * 1024
+
+func newReverseHTTPClient(cfg *config.Config) (*http.Client, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	if cfg.ListenAddr != "" {
+		return nil, fmt.Errorf("reverse client cannot use direct listen mode")
+	}
+	client := &http.Client{}
+	if cfg.CAFile == "" && !cfg.InsecureSkipVerify {
+		return client, nil
+	}
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("cannot configure reverse TLS: default transport is not an HTTP transport")
+	}
+	// Preserve proxy selection, dial/handshake timeouts, connection pooling and
+	// other defaults. Never mutate the process-global default transport.
+	transport := base.Clone()
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	}
+	transport.TLSClientConfig.InsecureSkipVerify = cfg.InsecureSkipVerify
+	if cfg.CAFile != "" {
+		roots, err := loadCARoots(cfg.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("caFile: %w", err)
+		}
+		transport.TLSClientConfig.RootCAs = roots
+	}
+	client.Transport = transport
+	return client, nil
+}
+
+func loadCARoots(path string) (*x509.CertPool, error) {
+	// Inspect before opening so accidental pipes/devices cannot block startup.
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("inspect %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%q is not a regular PEM file", path)
+	}
+	if info.Size() > maxCAFileBytes {
+		return nil, fmt.Errorf("%q exceeds %d bytes", path, maxCAFileBytes)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %q: %w", path, err)
+	}
+	defer file.Close()
+	info, err = file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect opened %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%q is not a regular PEM file", path)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxCAFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", path, err)
+	}
+	if len(data) > maxCAFileBytes {
+		return nil, fmt.Errorf("%q exceeds %d bytes", path, maxCAFileBytes)
+	}
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("load system roots: %w", err)
+	}
+	count := 0
+	for rest := bytes.TrimSpace(data); len(rest) > 0; rest = bytes.TrimSpace(rest) {
+		// Reject malformed or mixed-content bundles rather than silently using
+		// only their valid subset. CA files must contain certificate PEM blocks.
+		if !bytes.HasPrefix(rest, []byte("-----BEGIN CERTIFICATE-----")) {
+			return nil, fmt.Errorf("%q contains invalid certificate PEM", path)
+		}
+		endMarker := []byte("-----END CERTIFICATE-----")
+		end := bytes.Index(rest, endMarker)
+		if end < 0 {
+			return nil, fmt.Errorf("%q contains invalid certificate PEM", path)
+		}
+		end += len(endMarker)
+		if bytes.Count(rest[:end], []byte("-----BEGIN")) != 1 {
+			return nil, fmt.Errorf("%q contains invalid certificate PEM", path)
+		}
+		block, trailing := pem.Decode(rest[:end])
+		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 || len(bytes.TrimSpace(trailing)) != 0 {
+			return nil, fmt.Errorf("%q contains invalid certificate PEM", path)
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse certificate in %q: %w", path, err)
+		}
+		// An explicitly trusted legacy self-signed server leaf is also a valid
+		// anchor, even without IsCA. TLS still verifies hostname and validity.
+		roots.AddCert(cert)
+		count++
+		rest = rest[end:]
+	}
+	if count == 0 {
+		return nil, fmt.Errorf("%q contains no PEM certificates", path)
+	}
+	return roots, nil
+}
+
+func (c *Client) connectAndServe(ctx context.Context, httpClient *http.Client) error {
 	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-
-	httpClient := &http.Client{}
-	if c.cfg.InsecureSkipVerify {
-		httpClient.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
-	}
 
 	conn, _, err := websocket.Dial(dialCtx, c.cfg.ServerURL, &websocket.DialOptions{
 		HTTPClient: httpClient,

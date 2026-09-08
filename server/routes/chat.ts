@@ -228,10 +228,6 @@ chatRoutes.delete("/rooms/:roomId/messages/:messageId", async (c) => {
 	const roomId = c.req.param("roomId");
 	const messageId = c.req.param("messageId");
 	await softDeleteMessage(roomId, messageId, user.sub, user.role === "admin");
-	// Deletion is rare and carries no body, so it is pushed straight rather than
-	// going through the event bus (which exists for the message fan-out's routing).
-	const { broadcastToChatRoom } = await import("../websocket/narrator-ws");
-	broadcastToChatRoom(roomId, { type: "chat:message_deleted", roomId, messageId });
 	return c.json({ ok: true });
 });
 

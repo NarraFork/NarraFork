@@ -69,7 +69,9 @@ function panelIdOf(panel: DetachedPanelEntry): string | null {
 		return panel.subagentNarratorId ? subagentDockPanelId(panel.subagentNarratorId) : null;
 	}
 	if (panel.kind === "file") {
-		return panel.filePath ? fileDockPanelId(panel.filePath, panel.deviceId, panel.toolEdit) : null;
+		return panel.filePath
+			? fileDockPanelId(panel.filePath, panel.deviceId, panel.toolEdit, panel.fileNarratorId)
+			: null;
 	}
 	return dockPanelId(panel.kind);
 }
@@ -86,6 +88,7 @@ function paramsOf(panel: DetachedPanelEntry, narratorId: string, chapterId: stri
 			deviceId: panel.deviceId ?? "local",
 			referenceOrigin: panel.referenceOrigin === true,
 			...(panel.toolEdit ? { toolEdit: panel.toolEdit } : {}),
+			...(panel.fileNarratorId ? { fileNarratorId: panel.fileNarratorId } : {}),
 		};
 	}
 	return { panelType: panel.kind, narratorId, chapterId };
@@ -229,7 +232,12 @@ export const DetachedNodeDock = memo(function DetachedNodeDock({
 				kind === "subagent"
 					? subagentDockPanelId(drag.resourceId as string)
 					: kind === "file"
-						? fileDockPanelId(fileTarget.filePath, fileTarget.deviceId, fileTarget.toolEdit)
+						? fileDockPanelId(
+								fileTarget.filePath,
+								fileTarget.deviceId,
+								fileTarget.toolEdit,
+								fileTarget.fileNarratorId,
+							)
 						: dockPanelId(kind);
 
 			// Release the panel on the source surface FIRST. Done after adding, a failure

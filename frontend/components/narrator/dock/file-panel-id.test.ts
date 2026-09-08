@@ -107,7 +107,7 @@ describe("focus file panel editing ownership", () => {
 		expect(body).toContain("props.api.updateParameters({ ...props.params, hostNarratorId })");
 		expect(body).toContain('getFilePreviewType(filePath ?? "") === "text"');
 		expect(body).toContain(") : isText ? (");
-		expect(body).toContain("narratorId={hostNarratorId}");
+		expect(body).toContain("narratorId={fileNarratorId}");
 		expect(body).toContain("referenceOrigin={referenceOrigin}");
 		expect(body).toContain("navigationRequestId={highlightRequestId}");
 		expect(body).toContain("beforeDrag={canExit}");
@@ -574,7 +574,50 @@ describe("historical file panels", () => {
 		expect(body).toMatch(/toolEdit \? `.* · Edit`/);
 		expect(body.indexOf("<ToolEditFileViewer")).toBeLessThan(body.indexOf("<FileEditorContent"));
 		expect(body).toContain(") : isText ? (");
-		expect(body).toContain("filePanelResourceId(filePath, deviceId, referenceOrigin, toolEdit)");
+		expect(body).toMatch(
+			/filePanelResourceId\(\s*filePath,\s*deviceId,\s*referenceOrigin,\s*toolEdit,\s*props.params.fileNarratorId,/,
+		);
+	});
+});
+
+describe("file operation identity", () => {
+	it("isolates child/sibling readers, keeps host legacy ids, and leaves historical identity unchanged", () => {
+		const path = "/work/b/a.ts";
+		const toolEdit = { narratorId: "child", toolUseId: "edit" };
+		expect(
+			new Set([
+				fileDockPanelId(path),
+				fileDockPanelId(path, "local", undefined, "child"),
+				fileDockPanelId(path, "local", undefined, "sibling"),
+			]).size,
+		).toBe(3);
+		expect(workspaceFilePanelId("host", path, "local", undefined, "host")).toBe(
+			workspaceFilePanelId("host", path),
+		);
+		expect(fileDockPanelId(path, "local", toolEdit, "child")).toBe(
+			fileDockPanelId(path, "local", toolEdit),
+		);
+		expect(workspaceFilePanelId("host", path, "local", toolEdit, "child")).toBe(
+			workspaceFilePanelId("host", path, "local", toolEdit),
+		);
+	});
+
+	it("round-trips operation authority through drag resources, with and without historical edits", () => {
+		const path = "/work/b/a.ts";
+		for (const toolEdit of [undefined, { narratorId: "child", toolUseId: "edit" }]) {
+			const resource = filePanelResourceId(path, "Remote", true, toolEdit, "child");
+			expect(filePanelResourceParams(resource)).toEqual({
+				filePath: path,
+				deviceId: "Remote",
+				referenceOrigin: true,
+				fileNarratorId: "child",
+				...(toolEdit ? { toolEdit } : {}),
+			});
+		}
+		for (const invalid of ["", null, 123, {}]) {
+			const resource = JSON.stringify(["local", path, true, null, invalid]);
+			expect(filePanelResourceParams(resource)).toEqual({ filePath: resource, deviceId: "local" });
+		}
 	});
 });
 

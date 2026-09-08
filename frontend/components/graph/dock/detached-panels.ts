@@ -75,6 +75,7 @@ export interface DetachedPanelEntry {
 	/** Resource identity for multi-instance kinds. */
 	subagentNarratorId?: string;
 	filePath?: string;
+	fileNarratorId?: string;
 	deviceId?: string;
 	referenceOrigin?: boolean;
 	toolEdit?: ToolEditReference;
@@ -121,8 +122,8 @@ interface DetachedPanelsEnvelope {
 export function panelIdFor(kind: DetachablePanelKind, resourceId?: string): string {
 	if (kind === "file" && resourceId) {
 		const target = filePanelResourceParams(resourceId);
-		if (target.toolEdit) {
-			return `file:${filePanelIdentity(target.filePath, target.deviceId, target.toolEdit)}`;
+		if (target.toolEdit || target.fileNarratorId) {
+			return `file:${filePanelIdentity(target.filePath, target.deviceId, target.toolEdit, target.fileNarratorId)}`;
 		}
 		return `file:${filePanelResourceId(target.filePath, target.deviceId)}`;
 	}
@@ -138,6 +139,7 @@ export function resourceIdOf(panel: DetachedPanelEntry): string | undefined {
 			panel.deviceId,
 			panel.referenceOrigin,
 			panel.toolEdit,
+			panel.fileNarratorId,
 		);
 	return undefined;
 }
@@ -191,6 +193,7 @@ function parsePanelEntry(value: unknown): DetachedPanelEntry | null {
 						typeof v.deviceId === "string" ? v.deviceId : "local",
 						v.referenceOrigin === true,
 						isToolEditReference(v.toolEdit) ? v.toolEdit : undefined,
+						typeof v.fileNarratorId === "string" ? v.fileNarratorId : undefined,
 					)
 				: undefined;
 	// The stored panelId is ignored in favour of the derived one: it is a pure

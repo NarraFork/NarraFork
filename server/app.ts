@@ -58,6 +58,10 @@ import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginRoutes } from "./routes/plugins";
 import { projectDbRoutes } from "./routes/project-db";
 import { projectRoutes } from "./routes/projects";
+import {
+	publicNarratorShareManagementRoutes,
+	publicNarratorShareRoutes,
+} from "./routes/public-narrator-shares";
 import { reviewsRouter } from "./routes/reviews";
 import { routineRoutes } from "./routes/routines";
 import { rulerRoutes } from "./routes/ruler";
@@ -293,6 +297,9 @@ app.route("/api/oauth", oauthRoutes);
 // but the router itself requires an OAuth principal and enforces scope + resource ownership.
 app.route("/api/external/v1", externalV1Routes);
 
+// Anonymous sharing is a closed, Share-token-only prefix, never a login bypass.
+app.route("/api/public/narrator-shares", publicNarratorShareRoutes);
+
 // All ordinary routes below require a first-party session. OAuth access tokens
 // must opt into an explicitly mounted external route and can never fall through
 // to the internal UI/API surface.
@@ -349,6 +356,7 @@ app.route("/api/chapters", chapterRoutes);
 app.route("/api/chapters", gitRoutes);
 app.route("/api/chapter-edges", chapterEdgeRoutes);
 app.route("/api/chat", chatRoutes);
+app.route("/api/narrators", publicNarratorShareManagementRoutes);
 app.route("/api/narrators", narratorRoutes);
 app.route("/api/narrators", specRoutes);
 app.route("/api/terminals", terminalRoutes);

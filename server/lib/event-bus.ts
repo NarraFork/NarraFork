@@ -498,9 +498,15 @@ export type NarraForkEvent =
 			roomId: string;
 			messageId: string;
 			seq: number;
-			senderUserId: string;
+			senderUserId: string | null;
 			roomKind: "dm" | "narrator";
 			/** Set for a narrator room, so a consumer can scope by narrator. */
+			narratorId: string | null;
+	  }
+	| {
+			type: "chat:message_deleted";
+			roomId: string;
+			messageId: string;
 			narratorId: string | null;
 	  }
 	| {

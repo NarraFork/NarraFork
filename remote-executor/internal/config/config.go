@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -73,6 +74,9 @@ type Config struct {
 	DefaultCwd string `json:"defaultCwd"`
 	// InsecureSkipVerify disables reverse-dial TLS certificate verification.
 	InsecureSkipVerify bool `json:"insecureSkipVerify"`
+	// CAFile adds PEM trust anchors to the system roots for reverse wss only.
+	// JSON-relative paths are resolved against the config file directory.
+	CAFile string `json:"caFile"`
 	// ReconnectMaxSeconds caps the exponential reconnect backoff.
 	ReconnectMaxSeconds int `json:"reconnectMaxSeconds"`
 	// ListenAddr enables direct mode: the executor listens on this address
@@ -106,6 +110,7 @@ func Load() (*Config, error) {
 	fs.Var(&pathRuleFlags, "path-rule", `Ordered path rule "allow:/dir" or "deny:/dir" (repeatable; last match wins)`)
 	defaultCwd := fs.String("cwd", "", "Default working directory reported to the server")
 	insecure := fs.Bool("insecure", false, "Skip reverse-dial TLS certificate verification")
+	caFile := fs.String("ca-file", "", "Additional trusted CA certificate PEM file for reverse wss (incompatible with --insecure)")
 	listenAddr := fs.String("listen", "", "Direct mode: listen on this address (e.g. 127.0.0.1:7900) instead of dialing out")
 	tlsCert := fs.String("tls-cert", "", "Path to TLS certificate PEM file (required unless listen uses a loopback IP literal)")
 	tlsKey := fs.String("tls-key", "", "Path to TLS private key PEM file (required unless listen uses a loopback IP literal)")
@@ -124,6 +129,15 @@ func Load() (*Config, error) {
 		}
 		if err := json.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("parse config file: %w", err)
+		}
+		// The installer keeps its CA next to executor.json. Only this new field
+		// uses the config directory; existing token/TLS path semantics stay intact.
+		if cfg.CAFile != "" {
+			base, err := filepath.Abs(filepath.Dir(configPath))
+			if err != nil {
+				return nil, fmt.Errorf("resolve config directory: %w", err)
+			}
+			cfg.CAFile = resolveConfigPath(base, cfg.CAFile)
 		}
 	}
 	tokenChoice, tokenChoiceSet, err := selectTokenSource(
@@ -217,6 +231,12 @@ func Load() (*Config, error) {
 	if explicitFlags["insecure"] {
 		cfg.InsecureSkipVerify = *insecure
 	}
+	if explicitFlags["ca-file"] {
+		if strings.TrimSpace(*caFile) == "" {
+			return nil, fmt.Errorf("--ca-file path must not be empty")
+		}
+		cfg.CAFile = *caFile
+	}
 	if *listenAddr != "" {
 		cfg.ListenAddr = *listenAddr
 	}
@@ -268,6 +288,14 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+func resolveConfigPath(base, path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(base, path)
 }
 
 func selectTokenSource(
@@ -493,8 +521,15 @@ func (c *Config) Validate() error {
 	c.ListenAddr = strings.TrimSpace(c.ListenAddr)
 	c.TLSCert = strings.TrimSpace(c.TLSCert)
 	c.TLSKey = strings.TrimSpace(c.TLSKey)
+	c.CAFile = strings.TrimSpace(c.CAFile)
+	if c.CAFile != "" && c.InsecureSkipVerify {
+		return fmt.Errorf("caFile (--ca-file) and insecureSkipVerify (--insecure) are mutually exclusive")
+	}
 
 	if c.ListenAddr != "" {
+		if c.CAFile != "" {
+			return fmt.Errorf("caFile (--ca-file) applies only to reverse wss clients, not direct listeners")
+		}
 		if _, _, err := splitListenAddress(c.ListenAddr); err != nil {
 			return err
 		}
@@ -535,6 +570,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Token == "" {
 		return fmt.Errorf("token is required (--token, --token-file, or --token-stdin)")
+	}
+	if c.CAFile != "" && parsed.Scheme != "wss" {
+		return fmt.Errorf("caFile (--ca-file) requires a wss:// reverse-dial server")
 	}
 	if c.InsecureSkipVerify && parsed.Scheme != "wss" {
 		return fmt.Errorf("--insecure is only meaningful with a wss:// reverse-dial server")

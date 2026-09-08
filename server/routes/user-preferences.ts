@@ -6,6 +6,7 @@ import { userPreferences } from "../db/schema";
 import { userPreferencesLock } from "../lib/async-mutex";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { saveSettings, settings } from "../lib/settings";
 import {
 	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
@@ -274,12 +275,24 @@ function restoreMaskedGatewaySecrets(
 	};
 }
 
+/** Migrate once, persisting even false so ordinary requests never rescan all users. */
+function instanceSetupWizardCompleted(): boolean {
+	if (settings.setupWizardCompleted === undefined) {
+		const completed = !!sqlite
+			.query("SELECT 1 FROM user_preferences WHERE setup_wizard_completed = 1 LIMIT 1")
+			.get();
+		saveSettings({ ...settings, setupWizardCompleted: completed });
+	}
+	return settings.setupWizardCompleted === true;
+}
+
 function serializeUserPreferences(
 	pref: typeof userPreferences.$inferSelect,
 	recentTabs?: Record<string, unknown>[],
 ): Record<string, unknown> {
 	return {
 		...pref,
+		setupWizardCompleted: instanceSetupWizardCompleted(),
 		...(recentTabs === undefined ? {} : { recentTabs }),
 		commands: parseJsonArray(pref.commands),
 		notifyDingtalkWebhook: maskSecret(pref.notifyDingtalkWebhook),
@@ -305,6 +318,7 @@ userPreferencesRoutes.get("/", async (c) => {
 	if (!pref) {
 		return c.json({
 			...DEFAULTS,
+			setupWizardCompleted: instanceSetupWizardCompleted(),
 			recentTabs,
 			commands: [],
 			gatewayConfig: {},
@@ -344,6 +358,13 @@ userPreferencesRoutes.patch("/", async (c) => {
 		const now = new Date().toISOString();
 		const id = generateId();
 		const d = parsed.data;
+		// Resolve legacy completion before any write can erase its last evidence.
+		const setupCompleted = instanceSetupWizardCompleted();
+		if (d.setupWizardCompleted === true && c.get("user").role === "admin" && !setupCompleted) {
+			saveSettings({ ...settings, setupWizardCompleted: true });
+		}
+		// Never let personal preferences reset completion or seed a non-admin legacy bypass.
+		d.setupWizardCompleted = settings.setupWizardCompleted === true;
 		const dingtalkWebhook = d.notifyDingtalkWebhook ?? null;
 		const dingtalkSecret = d.notifyDingtalkSecret ?? null;
 		const feishuWebhook = d.notifyFeishuWebhook ?? null;

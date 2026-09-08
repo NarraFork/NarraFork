@@ -28,6 +28,7 @@ import {
 	chatMessages,
 	chatRoomMembers,
 	chatRooms,
+	narratorPublicShares,
 	narrators,
 	users,
 } from "@server/db/schema";
@@ -42,7 +43,13 @@ import {
 	getChatAttachmentFileInfo,
 	saveChatAttachment,
 } from "@server/lib/chat-attachments";
-import { ForbiddenError, NotFoundError, RateLimitError, ValidationError } from "@server/lib/errors";
+import {
+	AppError,
+	ForbiddenError,
+	NotFoundError,
+	RateLimitError,
+	ValidationError,
+} from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
 import { hotSafe } from "@server/lib/hot-safe";
 import { generateId } from "@server/lib/id";
@@ -54,7 +61,10 @@ import {
 	canWriteNarrator,
 	NARRATOR_ACL_COLUMNS,
 } from "@server/services/narrator-acl";
+import type { PublicDiscussionMessage, PublicDiscussionPage } from "@shared/public-narrator-share";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/sqlite-core";
+import { PUBLIC_SHARE_LIMITS } from "./public-narrator-share-limits";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bounds
@@ -127,6 +137,8 @@ export interface ChatUserSnapshot {
 	username: string;
 	avatarColor: string | null;
 	avatarImageId: string | null;
+	/** Display-only identity, never a user/profile lookup key. */
+	isGuest?: boolean;
 }
 
 /**
@@ -222,6 +234,18 @@ function toUserSnapshot(
 		username: row.username,
 		avatarColor: row.avatarColor,
 		avatarImageId: row.avatarImageId,
+	};
+}
+
+/** A stable message-scoped display identity, including after the link is removed. */
+function toGuestSnapshot(name: string | null, messageId: string): ChatUserSnapshot | null {
+	if (name === null) return null;
+	return {
+		id: `guest:${messageId}`,
+		username: name,
+		avatarColor: null,
+		avatarImageId: null,
+		isGuest: true,
 	};
 }
 
@@ -398,6 +422,35 @@ export async function resolveNarratorRoom(
 	};
 }
 
+/** Called only after the share manager has checked owner/admin access; never by a public GET. */
+export async function ensureNarratorDiscussionRoomForShare(narratorId: string): Promise<string> {
+	return db.transaction((tx) => {
+		const narrator = tx
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(and(eq(narrators.id, narratorId), eq(narrators.type, "primary")))
+			.get();
+		if (!narrator) throw new NotFoundError("Narrator", narratorId);
+		tx.insert(chatRooms)
+			.values({
+				id: generateId(),
+				kind: "narrator",
+				narratorId,
+				nextSeq: 1,
+				createdAt: nowIso(),
+			})
+			.onConflictDoNothing({ target: chatRooms.narratorId })
+			.run();
+		const room = tx
+			.select({ id: chatRooms.id })
+			.from(chatRooms)
+			.where(and(eq(chatRooms.narratorId, narratorId), eq(chatRooms.kind, "narrator")))
+			.get();
+		if (!room) throw new NotFoundError("Chat room for narrator", narratorId);
+		return room.id;
+	});
+}
+
 async function ensureMembers(roomId: string, userIds: string[]): Promise<void> {
 	const timestamp = nowIso();
 	for (const userId of userIds) {
@@ -477,6 +530,31 @@ async function resolvePrincipal(userId: string): Promise<{ userId: string; isAdm
 // Posting
 // ─────────────────────────────────────────────────────────────────────────────
 
+type ChatTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/** Shared allocation only; each caller must apply its own authorization before entering here. */
+function claimMessageSeq(
+	tx: ChatTransaction,
+	roomId: string,
+	timestamp: string,
+	preview: string,
+	senderUserId: string | null,
+): number {
+	const updated = tx
+		.update(chatRooms)
+		.set({
+			nextSeq: sql`${chatRooms.nextSeq} + 1`,
+			lastMessageAt: timestamp,
+			lastMessagePreview: preview,
+			lastMessageSenderId: senderUserId,
+		})
+		.where(eq(chatRooms.id, roomId))
+		.returning({ nextSeq: chatRooms.nextSeq })
+		.get();
+	if (!updated) throw new NotFoundError("Chat room", roomId);
+	return updated.nextSeq - 1;
+}
+
 export interface PostMessageInput {
 	roomId: string;
 	senderUserId: string;
@@ -529,8 +607,9 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 	let replySnapshot: {
 		replyToSeq: number | null;
 		replyToSenderUserId: string | null;
+		replyToGuestName: string | null;
 		replyToPreview: string | null;
-	} = { replyToSeq: null, replyToSenderUserId: null, replyToPreview: null };
+	} = { replyToSeq: null, replyToSenderUserId: null, replyToGuestName: null, replyToPreview: null };
 	if (input.replyToMessageId) {
 		const target = await db.query.chatMessages.findFirst({
 			where: and(
@@ -541,6 +620,7 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 				id: true,
 				seq: true,
 				senderUserId: true,
+				senderGuestName: true,
 				contentText: true,
 				deletedAt: true,
 			},
@@ -549,6 +629,7 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 		replySnapshot = {
 			replyToSeq: target.seq,
 			replyToSenderUserId: target.senderUserId,
+			replyToGuestName: target.senderGuestName,
 			// An empty string (not null) for an already-deleted target: null means
 			// "legacy row, no snapshot taken", and conflating the two would send the
 			// client back to window resolution for a message we know is gone.
@@ -595,25 +676,7 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 	const preview = buildRoomPreview(text, pendingAttachments);
 
 	const seq = db.transaction((tx) => {
-		const [updated] = tx
-			.update(chatRooms)
-			.set({
-				nextSeq: sql`${chatRooms.nextSeq} + 1`,
-				lastMessageAt: timestamp,
-				lastMessagePreview: preview,
-				lastMessageSenderId: input.senderUserId,
-			})
-			.where(eq(chatRooms.id, input.roomId))
-			.returning({ nextSeq: chatRooms.nextSeq })
-			.all();
-		// No row means the room was deleted (or cascaded away with its narrator)
-		// between `assertCanRead` and this transaction. Without the check the next
-		// line reads `.nextSeq` off undefined and the caller gets a TypeError/500
-		// instead of the 404 that actually describes what happened.
-		if (!updated) throw new NotFoundError("Chat room", input.roomId);
-		// `returning` gives the POST-increment value, so the number this message
-		// owns is one less.
-		const claimed = updated.nextSeq - 1;
+		const claimed = claimMessageSeq(tx, input.roomId, timestamp, preview, input.senderUserId);
 
 		tx.insert(chatMessages)
 			.values({
@@ -626,6 +689,7 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 				replyToMessageId: input.replyToMessageId ?? null,
 				replyToSeq: replySnapshot.replyToSeq,
 				replyToSenderUserId: replySnapshot.replyToSenderUserId,
+				replyToGuestName: replySnapshot.replyToGuestName,
 				replyToPreview: replySnapshot.replyToPreview,
 				createdAt: timestamp,
 			})
@@ -697,7 +761,9 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 		contentText: text,
 		replyToMessageId: input.replyToMessageId ?? null,
 		replyToSeq: replySnapshot.replyToSeq,
-		replyToSender,
+		replyToSender:
+			toGuestSnapshot(replySnapshot.replyToGuestName, input.replyToMessageId ?? messageId) ??
+			replyToSender,
 		replyToPreview: replySnapshot.replyToPreview,
 		attachments: pendingAttachments.map(toAttachmentRow),
 		editedAt: null,
@@ -717,6 +783,237 @@ export async function postMessage(input: PostMessageInput): Promise<ChatMessageR
 	});
 
 	return row;
+}
+
+// ─── Public discussion: capabilities, not user ACL bypasses ────────────────────
+
+interface PublicDiscussionAccessInput {
+	shareId: string;
+	tokenHash: string;
+}
+
+function unavailablePublicDiscussion(): AppError {
+	return new AppError("Share link unavailable", 404, "PUBLIC_SHARE_UNAVAILABLE");
+}
+
+/** One indexed join; no room creation, user lookup or membership write. */
+function requirePublicDiscussion(
+	input: PublicDiscussionAccessInput,
+	connection: typeof db | ChatTransaction = db,
+) {
+	const access = connection
+		.select({
+			shareId: narratorPublicShares.id,
+			guestName: narratorPublicShares.guestName,
+			narratorId: narrators.id,
+			roomId: chatRooms.id,
+		})
+		.from(narratorPublicShares)
+		.innerJoin(
+			narrators,
+			and(eq(narrators.id, narratorPublicShares.narratorId), eq(narrators.type, "primary")),
+		)
+		.innerJoin(
+			chatRooms,
+			and(eq(chatRooms.narratorId, narrators.id), eq(chatRooms.kind, "narrator")),
+		)
+		.where(
+			and(
+				eq(narratorPublicShares.id, input.shareId),
+				eq(narratorPublicShares.tokenHash, input.tokenHash),
+				isNull(narratorPublicShares.revokedAt),
+			),
+		)
+		.get();
+	if (!access) throw unavailablePublicDiscussion();
+	return access;
+}
+
+const PUBLIC_DISCUSSION_RESPONSE_BYTES = PUBLIC_SHARE_LIMITS.responseBytes;
+const PUBLIC_DISCUSSION_NAME_CHARS = 120;
+const PUBLIC_DISCUSSION_MAX_CHARS = PUBLIC_SHARE_LIMITS.discussionChars;
+const publicReplyUser = alias(users, "public_discussion_reply_user");
+
+/** All large fields are bounded in SQLite before crossing into the JS heap. */
+function publicDiscussionQuery(roomId: string, shareId: string) {
+	return db
+		.select({
+			id: chatMessages.id,
+			seq: chatMessages.seq,
+			text: sql<string>`CASE WHEN ${chatMessages.deletedAt} IS NOT NULL THEN '' ELSE substr(${chatMessages.contentText}, 1, ${PUBLIC_DISCUSSION_MAX_CHARS}) END`,
+			truncated: sql<number>`CASE WHEN ${chatMessages.deletedAt} IS NULL AND length(substr(${chatMessages.contentText}, 1, ${PUBLIC_DISCUSSION_MAX_CHARS + 1})) > ${PUBLIC_DISCUSSION_MAX_CHARS} THEN 1 ELSE 0 END`,
+			name: sql<string>`substr(COALESCE(${chatMessages.senderGuestName}, ${users.username}, 'Unknown sender'), 1, ${PUBLIC_DISCUSSION_NAME_CHARS})`,
+			isGuest: sql<number>`${chatMessages.senderGuestName} IS NOT NULL`,
+			isSelf: sql<number>`COALESCE(${chatMessages.senderShareId} = ${shareId}, 0)`,
+			createdAt: chatMessages.createdAt,
+			deletedAt: chatMessages.deletedAt,
+			replyId: chatMessages.replyToMessageId,
+			replySeq: chatMessages.replyToSeq,
+			replyName: sql<string>`substr(COALESCE(${chatMessages.replyToGuestName}, ${publicReplyUser.username}, 'Unknown sender'), 1, ${PUBLIC_DISCUSSION_NAME_CHARS})`,
+			replyText: sql<
+				string | null
+			>`substr(${chatMessages.replyToPreview}, 1, ${CHAT_REPLY_PREVIEW_SNAPSHOT_MAX_CHARS + 1})`,
+			hasAttachments: sql<number>`CASE WHEN ${chatMessages.deletedAt} IS NOT NULL THEN 0 ELSE EXISTS(SELECT 1 FROM ${chatAttachments} WHERE ${chatAttachments.messageId} = ${chatMessages.id} LIMIT 1) END`,
+		})
+		.from(chatMessages)
+		.leftJoin(users, eq(users.id, chatMessages.senderUserId))
+		.leftJoin(publicReplyUser, eq(publicReplyUser.id, chatMessages.replyToSenderUserId))
+		.where(eq(chatMessages.roomId, roomId));
+}
+
+type PublicDiscussionRow = ReturnType<ReturnType<typeof publicDiscussionQuery>["all"]>[number];
+
+function toPublicDiscussionMessage(row: PublicDiscussionRow): PublicDiscussionMessage {
+	return {
+		id: row.id,
+		seq: row.seq,
+		text: row.truncated ? `${row.text}\n[Content truncated]` : row.text,
+		author: { name: row.name, isGuest: !!row.isGuest, isSelf: !!row.isSelf },
+		createdAt: row.createdAt,
+		deletedAt: row.deletedAt,
+		replyTo: row.replyId
+			? { id: row.replyId, seq: row.replySeq, name: row.replyName, text: row.replyText }
+			: null,
+		hasAttachments: !!row.hasAttachments,
+	};
+}
+
+export async function listPublicDiscussion(
+	input: PublicDiscussionAccessInput & {
+		beforeSeq?: number;
+		limit?: number;
+	},
+): Promise<PublicDiscussionPage> {
+	const access = requirePublicDiscussion(input);
+	if (
+		input.beforeSeq !== undefined &&
+		(!Number.isSafeInteger(input.beforeSeq) || input.beforeSeq < 1)
+	) {
+		throw new ValidationError("Invalid discussion cursor");
+	}
+	if (input.limit !== undefined && (!Number.isSafeInteger(input.limit) || input.limit < 1)) {
+		throw new ValidationError("Invalid discussion limit");
+	}
+	const limit = Math.min(
+		input.limit ?? PUBLIC_SHARE_LIMITS.defaultPage,
+		PUBLIC_SHARE_LIMITS.maxPage,
+	);
+	const rows = publicDiscussionQuery(access.roomId, access.shareId)
+		.$dynamic()
+		.where(
+			and(
+				eq(chatMessages.roomId, access.roomId),
+				input.beforeSeq !== undefined ? lt(chatMessages.seq, input.beforeSeq) : undefined,
+			),
+		)
+		.orderBy(desc(chatMessages.seq))
+		.limit(limit + 1)
+		.all();
+	const messages: PublicDiscussionMessage[] = [];
+	// Reserve the envelope/cursor and commas. Each row is <= ~200 KiB even with JSON escapes.
+	let bytes = 256;
+	for (const row of rows.slice(0, limit)) {
+		const message = toPublicDiscussionMessage(row);
+		const rowBytes = Buffer.byteLength(JSON.stringify(message)) + 1;
+		if (bytes + rowBytes > PUBLIC_DISCUSSION_RESPONSE_BYTES) break;
+		bytes += rowBytes;
+		messages.push(message);
+	}
+	const hasMore = rows.length > messages.length;
+	messages.reverse();
+	return {
+		messages,
+		hasMore,
+		nextBeforeSeq: hasMore && messages.length > 0 ? messages[0].seq : null,
+	};
+}
+
+export async function postPublicDiscussion(
+	input: PublicDiscussionAccessInput & {
+		text: string;
+		replyToMessageId?: string | null;
+	},
+): Promise<PublicDiscussionMessage> {
+	const access = requirePublicDiscussion(input);
+	if (
+		typeof input.text !== "string" ||
+		input.text.length > PUBLIC_DISCUSSION_MAX_CHARS ||
+		!input.text.trim()
+	) {
+		throw new ValidationError(`Message must contain 1–${PUBLIC_DISCUSSION_MAX_CHARS} characters`);
+	}
+	if (
+		input.replyToMessageId != null &&
+		(typeof input.replyToMessageId !== "string" ||
+			!input.replyToMessageId ||
+			input.replyToMessageId.length > 128)
+	) {
+		throw new ValidationError("Invalid replied-to message");
+	}
+	const text = input.text.trim();
+	const timestamp = nowIso();
+	const messageId = generateId();
+	const result = db.transaction((tx) => {
+		// Re-check after any wait between the first check and transaction acquisition.
+		const live = requirePublicDiscussion(input, tx);
+		if (live.roomId !== access.roomId || live.narratorId !== access.narratorId)
+			throw unavailablePublicDiscussion();
+		const reply = input.replyToMessageId
+			? tx
+					.select({
+						id: chatMessages.id,
+						seq: chatMessages.seq,
+						senderUserId: chatMessages.senderUserId,
+						guestName: sql<
+							string | null
+						>`substr(${chatMessages.senderGuestName}, 1, ${PUBLIC_DISCUSSION_NAME_CHARS})`,
+						text: sql<string>`CASE WHEN ${chatMessages.deletedAt} IS NOT NULL THEN '' ELSE substr(${chatMessages.contentText}, 1, ${PUBLIC_DISCUSSION_MAX_CHARS}) END`,
+					})
+					.from(chatMessages)
+					.where(
+						and(eq(chatMessages.id, input.replyToMessageId), eq(chatMessages.roomId, live.roomId)),
+					)
+					.get()
+			: undefined;
+		if (input.replyToMessageId && !reply)
+			throw new ValidationError("Replied-to message is not in this room");
+		const seq = claimMessageSeq(tx, live.roomId, timestamp, buildRoomPreview(text), null);
+		tx.insert(chatMessages)
+			.values({
+				id: messageId,
+				roomId: live.roomId,
+				seq,
+				senderUserId: null,
+				senderShareId: live.shareId,
+				senderGuestName: live.guestName,
+				kind: "text",
+				contentText: text,
+				replyToMessageId: reply?.id ?? null,
+				replyToSeq: reply?.seq ?? null,
+				replyToSenderUserId: reply?.senderUserId ?? null,
+				replyToGuestName: reply?.guestName ?? null,
+				replyToPreview: reply ? truncateReplyPreview(reply.text) : null,
+				createdAt: timestamp,
+			})
+			.run();
+		return { seq, roomId: live.roomId, narratorId: live.narratorId };
+	});
+	const stored = publicDiscussionQuery(result.roomId, access.shareId)
+		.$dynamic()
+		.where(and(eq(chatMessages.id, messageId), eq(chatMessages.roomId, result.roomId)))
+		.get();
+	if (!stored) throw unavailablePublicDiscussion();
+	const message = toPublicDiscussionMessage(stored);
+	eventBus.emit({
+		type: "chat:message_created",
+		roomId: result.roomId,
+		messageId,
+		seq: result.seq,
+		senderUserId: null,
+		roomKind: "narrator",
+		narratorId: result.narratorId,
+	});
+	return message;
 }
 
 /**
@@ -760,13 +1057,15 @@ export async function hydrateMessageForBroadcast(
 		contentText: row.deletedAt ? "" : row.contentText,
 		replyToMessageId: row.replyToMessageId,
 		replyToSeq: row.replyToSeq,
-		replyToSender: toUserSnapshot(replyToSender),
+		replyToSender:
+			toGuestSnapshot(row.replyToGuestName, row.replyToMessageId ?? row.id) ??
+			toUserSnapshot(replyToSender),
 		replyToPreview: row.replyToPreview,
 		attachments: attachmentRows.map(toAttachmentRow),
 		editedAt: row.editedAt,
 		deletedAt: row.deletedAt,
 		createdAt: row.createdAt,
-		sender: toUserSnapshot(sender),
+		sender: toGuestSnapshot(row.senderGuestName, row.id) ?? toUserSnapshot(sender),
 	};
 }
 
@@ -834,9 +1133,9 @@ export async function listMessages(input: ListMessagesInput): Promise<ChatMessag
 			contentText: row.deletedAt ? "" : row.contentText,
 			replyToMessageId: row.replyToMessageId,
 			replyToSeq: row.replyToSeq,
-			replyToSender: row.replyToSenderUserId
-				? (replyAuthors.get(row.replyToSenderUserId) ?? null)
-				: null,
+			replyToSender:
+				toGuestSnapshot(row.replyToGuestName, row.replyToMessageId ?? row.id) ??
+				(row.replyToSenderUserId ? (replyAuthors.get(row.replyToSenderUserId) ?? null) : null),
 			replyToPreview: row.replyToPreview,
 			// A soft-deleted message reports no attachments: its body is already gone,
 			// so listing files it used to carry would offer content the delete removed.
@@ -844,7 +1143,7 @@ export async function listMessages(input: ListMessagesInput): Promise<ChatMessag
 			editedAt: row.editedAt,
 			deletedAt: row.deletedAt,
 			createdAt: row.createdAt,
-			sender: toUserSnapshot(row.sender),
+			sender: toGuestSnapshot(row.senderGuestName, row.id) ?? toUserSnapshot(row.sender),
 		}))
 		.reverse();
 
@@ -1215,7 +1514,7 @@ export async function softDeleteMessage(
 	userId: string,
 	isAdmin: boolean,
 ): Promise<void> {
-	await assertCanRead(roomId, userId);
+	const access = await assertCanRead(roomId, userId);
 	const message = await db.query.chatMessages.findFirst({
 		where: and(eq(chatMessages.id, messageId), eq(chatMessages.roomId, roomId)),
 		columns: { id: true, senderUserId: true, deletedAt: true },
@@ -1239,10 +1538,18 @@ export async function softDeleteMessage(
 		where: eq(chatAttachments.messageId, messageId),
 		columns: { id: true, roomId: true, storedName: true },
 	});
-	await db
+	const deleted = await db
 		.update(chatMessages)
 		.set({ contentText: "", deletedAt: nowIso() })
-		.where(eq(chatMessages.id, messageId));
+		.where(and(eq(chatMessages.id, messageId), isNull(chatMessages.deletedAt)))
+		.returning({ id: chatMessages.id });
+	if (deleted.length === 0) return;
+	eventBus.emit({
+		type: "chat:message_deleted",
+		roomId,
+		messageId,
+		narratorId: access.room.narratorId,
+	});
 	if (attached.length > 0) {
 		await db.delete(chatAttachments).where(eq(chatAttachments.messageId, messageId));
 		// After the DB rows are gone: an orphaned file is reclaimable by the cleanup
@@ -1634,10 +1941,16 @@ export async function summarizeMessages(input: SummarizeInput): Promise<{ summar
 	for (const row of rows) {
 		if (budget <= 0) break;
 		if (row.deletedAt) continue;
-		const author = row.sender?.username ?? "unknown";
-		const quoted = row.replyToSenderUserId
-			? replyAuthors.get(row.replyToSenderUserId)?.username
-			: undefined;
+		const author =
+			row.senderGuestName !== null
+				? `${row.senderGuestName} [share guest]`
+				: (row.sender?.username ?? "unknown");
+		const quoted =
+			row.replyToGuestName !== null
+				? `${row.replyToGuestName} [share guest]`
+				: row.replyToSenderUserId
+					? replyAuthors.get(row.replyToSenderUserId)?.username
+					: undefined;
 		// The quote is rendered inline from the SNAPSHOT, so summarizing never has to
 		// fetch a message outside the selection to know what was being answered.
 		const replyPrefix = row.replyToPreview

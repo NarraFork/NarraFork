@@ -8,12 +8,14 @@ import {
 	enrollmentRefusalMessage,
 	evaluateEnrollmentTransport,
 } from "../lib/executor-enrollment-policy";
+import { resolveExecutorInstallCa } from "../lib/executor-install-ca";
 import {
 	buildExecutorInstallOneLiner,
 	buildExecutorInstallScript,
 } from "../lib/executor-install-script";
 import { resolvePublicOrigin } from "../lib/public-origin";
 import { settings } from "../lib/settings";
+import { getTlsPaths } from "../lib/tls";
 import {
 	buildPathRulesConfigSnippet,
 	createRemoteDeviceSchema,
@@ -315,6 +317,14 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 		}
 	}
 
+	// Resolve local public trust material before creating a ticket. The trusted
+	// management response carries the CA needed for the very first script fetch.
+	const caCertPem = await resolveExecutorInstallCa({
+		serverUrl: resolvedBaseUrl,
+		tls: settings.server.tls,
+		builtinCaCertPath: getTlsPaths().caCertPath,
+	});
+
 	/*
 	 * The script embeds its own ticket, and the ticket must carry the script so the
 	 * public fetch endpoint can serve it without touching the database — a cycle.
@@ -341,6 +351,7 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 		executorVersion: manifest.version,
 		ticket: ticket.ticket,
 		tokenDelivery,
+		caCertPem,
 	});
 	attachExecutorTicketScript(ticket.ticket, {
 		body: generated.script,
@@ -354,7 +365,7 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 		filename: generated.filename,
 		shell: generated.shell,
 		scriptUrl,
-		oneLiner: buildExecutorInstallOneLiner({ scriptUrl, shell: generated.shell }),
+		oneLiner: buildExecutorInstallOneLiner({ scriptUrl, shell: generated.shell, caCertPem }),
 		tokenDelivery,
 		executorVersion: manifest.version,
 		platform,

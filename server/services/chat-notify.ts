@@ -67,7 +67,7 @@ async function onMessageCreated(
 		roomId: string;
 		messageId: string;
 		seq: number;
-		senderUserId: string;
+		senderUserId: string | null;
 	},
 	deps: ChatNotifyDeps = { listRoomUnread: listRoomUnreadForFanout },
 ): Promise<void> {
@@ -102,7 +102,7 @@ async function onMessageCreated(
 	// popularity, which is what CLAUDE.md's SQLite discipline excludes from a write path.
 	const viewing = target.getChatRoomSubscriberUserIds(event.roomId);
 	const exclude = new Set(viewing);
-	exclude.add(event.senderUserId);
+	if (event.senderUserId !== null) exclude.add(event.senderUserId);
 	for (const { userId, unread } of await deps.listRoomUnread(event.roomId, exclude)) {
 		target.broadcastToUser(userId, {
 			type: "chat:unread_changed",
@@ -110,6 +110,15 @@ async function onMessageCreated(
 			unread,
 		});
 	}
+}
+
+async function onMessageDeleted(event: { roomId: string; messageId: string }): Promise<void> {
+	const target = await resolveChannel();
+	target.broadcastToChatRoom(event.roomId, {
+		type: "chat:message_deleted",
+		roomId: event.roomId,
+		messageId: event.messageId,
+	});
 }
 
 async function onRoomRead(event: {
@@ -152,6 +161,9 @@ export function initChatNotify(): void {
 	eventBus.on("chat:message_created", (event) => {
 		guard("chat:message_created", () => onMessageCreated(event));
 	});
+	eventBus.on("chat:message_deleted", (event) => {
+		guard("chat:message_deleted", () => onMessageDeleted(event));
+	});
 	eventBus.on("chat:room_read", (event) => {
 		guard("chat:room_read", () => onRoomRead(event));
 	});
@@ -164,4 +176,4 @@ export function initChatNotify(): void {
  * fire-and-forget (`guard` swallows the promise): a test that emitted would have
  * to race the handler instead of awaiting it.
  */
-export const chatNotifyTesting = { onMessageCreated, onRoomRead };
+export const chatNotifyTesting = { onMessageCreated, onMessageDeleted, onRoomRead };

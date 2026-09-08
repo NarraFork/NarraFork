@@ -46,6 +46,11 @@ import type { PluginDockPanelProps } from "../../plugins/types";
 import { getFilePreviewType } from "../FilePreviewModal";
 import { FileReferenceScopeProvider } from "../FileReferenceScope";
 import {
+	FilePanelNavigationProvider,
+	type FilePanelOpener,
+	useFilePanelSourceOpener,
+} from "../file-panel-navigation";
+import {
 	type FilePanelParams,
 	filePanelBaseName,
 	filePanelResourceId,
@@ -304,6 +309,8 @@ export interface SubagentSessionPanelContentProps {
 	onHeaderPointerDown?: (event: React.PointerEvent) => void;
 	onViewSubagentSession?: (narratorId: string, messageId?: string) => void;
 	onTitleChange?: (title: string) => void;
+	/** Host navigation only; the child must not inherit parent state publishers. */
+	onOpenFilePanel?: FilePanelOpener;
 	/**
 	 * Scroll to and flash this message on mount — set when the panel was opened from
 	 * a row that points at one specific thing this child said.
@@ -324,6 +331,7 @@ export function SubagentSessionPanelContent({
 	onHeaderPointerDown,
 	onViewSubagentSession,
 	onTitleChange,
+	onOpenFilePanel,
 	highlightMessageId,
 	highlightRequestId,
 }: SubagentSessionPanelContentProps) {
@@ -373,33 +381,37 @@ export function SubagentSessionPanelContent({
 
 	return (
 		<NarratorDockContext.Provider value={null}>
-			<LazyPanelBoundary>
-				<NarratorPanel
-					/*
-					 * The request token joins the key so a repeat jump into an ALREADY-OPEN
-					 * panel actually moves. `NarratorPanel` latches its deep-link jump per
-					 * (narrator, target) — deliberately, so it does not fight the reader's own
-					 * scrolling — which means passing the same target again is a no-op. A new
-					 * token remounts the session, re-arming the latch.
-					 *
-					 * Remounting is acceptable precisely because the reader ASKED to be taken
-					 * somewhere: whatever scroll position is discarded is the position they are
-					 * navigating away from. Without the token in the key, the second click on a
-					 * speaker row would look broken.
-					 */
-					key={
-						highlightRequestId ? `${subagentNarratorId}:${highlightRequestId}` : subagentNarratorId
-					}
-					narratorId={subagentNarratorId}
-					narrator={narrator}
-					compact={compact}
-					onClose={onClose}
-					onHeaderPointerDown={onHeaderPointerDown}
-					onOpenStandalonePage={openStandalone}
-					onViewSubagentSession={onViewSubagentSession}
-					highlightMessageId={highlightMessageId}
-				/>
-			</LazyPanelBoundary>
+			<FilePanelNavigationProvider value={onOpenFilePanel}>
+				<LazyPanelBoundary>
+					<NarratorPanel
+						/*
+						 * The request token joins the key so a repeat jump into an ALREADY-OPEN
+						 * panel actually moves. `NarratorPanel` latches its deep-link jump per
+						 * (narrator, target) — deliberately, so it does not fight the reader's own
+						 * scrolling — which means passing the same target again is a no-op. A new
+						 * token remounts the session, re-arming the latch.
+						 *
+						 * Remounting is acceptable precisely because the reader ASKED to be taken
+						 * somewhere: whatever scroll position is discarded is the position they are
+						 * navigating away from. Without the token in the key, the second click on a
+						 * speaker row would look broken.
+						 */
+						key={
+							highlightRequestId
+								? `${subagentNarratorId}:${highlightRequestId}`
+								: subagentNarratorId
+						}
+						narratorId={subagentNarratorId}
+						narrator={narrator}
+						compact={compact}
+						onClose={onClose}
+						onHeaderPointerDown={onHeaderPointerDown}
+						onOpenStandalonePage={openStandalone}
+						onViewSubagentSession={onViewSubagentSession}
+						highlightMessageId={highlightMessageId}
+					/>
+				</LazyPanelBoundary>
+			</FilePanelNavigationProvider>
 		</NarratorDockContext.Provider>
 	);
 }
@@ -412,6 +424,11 @@ export function SubagentSessionPanelContent({
  */
 export function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
 	const hostDock = useNarratorDockContext();
+	const openFilePanel = useFilePanelSourceOpener(
+		hostDock?.openFilePanel,
+		props.api.id,
+		props.params.subagentNarratorId,
+	);
 	const { ref, compact } = usePanelCompact();
 	const close = useCallback(() => props.api.close(), [props.api]);
 	const onHeaderPointerDown = usePanelHeaderDrag(props, props.params.subagentNarratorId, "tool", {
@@ -434,6 +451,7 @@ export function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams
 				onClose={close}
 				onHeaderPointerDown={onHeaderPointerDown}
 				onViewSubagentSession={hostDock?.openSubagentPanel}
+				onOpenFilePanel={openFilePanel}
 				onTitleChange={handleTitleChange}
 				highlightMessageId={props.params.highlightMessageId}
 				highlightRequestId={props.params.highlightRequestId}
@@ -964,14 +982,20 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 		referenceOrigin,
 		toolEdit,
 	} = props.params;
+	const hostNarratorId = dock?.narratorId ?? props.params.hostNarratorId;
+	const fileNarratorId = props.params.fileNarratorId ?? toolEdit?.narratorId ?? hostNarratorId;
 	const openFilePanel = dock?.openFilePanel;
 	const openFileTarget = useCallback(
 		(target: FileTarget) =>
-			openFilePanel?.(target.path, undefined, { ...target, referenceOrigin: true }),
-		[openFilePanel],
+			openFilePanel?.(target.path, undefined, {
+				...target,
+				fileNarratorId,
+				referenceOrigin: true,
+			}),
+		[openFilePanel, fileNarratorId],
 	);
+	// Selections still belong to the receiving chat, not the file-operation session.
 	const publishSelection = useFilePanelSelectionPublisher();
-	const hostNarratorId = dock?.narratorId ?? props.params.hostNarratorId;
 	const title = fileName?.trim() || filePanelBaseName(filePath) || t("fileViewer.title");
 	const [editorDirty, setEditorDirty] = useState(false);
 	const dirtyRef = useRef(false);
@@ -1035,11 +1059,17 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 			beforeDrag={canExit}
 			// Multi-instance: the path is what identifies WHICH file viewer this is, so
 			// a torn-out panel can be rebuilt pointing at the same file.
-			resourceId={filePanelResourceId(filePath, deviceId, referenceOrigin, toolEdit)}
+			resourceId={filePanelResourceId(
+				filePath,
+				deviceId,
+				referenceOrigin,
+				toolEdit,
+				props.params.fileNarratorId,
+			)}
 		>
 			<FileReferenceScopeProvider
 				value={{
-					narratorId: hostNarratorId,
+					narratorId: fileNarratorId,
 					openFile: openFilePanel ? openFileTarget : undefined,
 					addReference: dock?.addFileReference,
 					setSelection: publishSelection,
@@ -1055,9 +1085,9 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 						/>
 					) : isText ? (
 						<FileEditorContent
-							key={`edit:${deviceId}:${filePath}`}
+							key={`edit:${fileNarratorId}:${deviceId}:${filePath}`}
 							filePath={filePath}
-							narratorId={hostNarratorId}
+							narratorId={fileNarratorId}
 							deviceId={deviceId}
 							referenceOrigin={referenceOrigin}
 							selection={selection}
@@ -1066,9 +1096,9 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 						/>
 					) : (
 						<FileViewerContent
-							key={`${deviceId}:${filePath}`}
+							key={`${fileNarratorId}:${deviceId}:${filePath}`}
 							filePath={filePath}
-							narratorId={hostNarratorId}
+							narratorId={fileNarratorId}
 							deviceId={deviceId}
 							referenceOrigin={referenceOrigin}
 							selection={selection}
@@ -1099,9 +1129,9 @@ export function FileTreeDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 			// Routed through the dock's existing multi-instance file viewer rather than a
 			// viewer of our own: re-opening the same path must focus the panel that is
 			// already showing it, and that dedup lives in `openFilePanel`.
-			openFilePanel?.(absolutePath, fileName);
+			openFilePanel?.(absolutePath, fileName, { sourcePanelId: props.api.id });
 		},
-		[openFilePanel],
+		[openFilePanel, props.api.id],
 	);
 
 	return (

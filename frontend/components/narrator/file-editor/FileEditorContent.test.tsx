@@ -4,17 +4,35 @@ import { getSearchQuery, SearchQuery, searchPanelOpen, setSearchQuery } from "@c
 import { EditorView, keymap } from "@codemirror/view";
 import { MantineProvider } from "@mantine/core";
 import type { FileReferenceEditorSelection, FileSelection } from "@shared/file-reference";
+import type { DockviewApi, IDockviewPanelProps, SerializedDockview } from "dockview-react";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { renderToString } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
 import { ApiError, api } from "../../../lib/api";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import en from "../../../locales/en/narrator.json";
-import { NarratorDockContext, type NarratorDockContextValue } from "../dock/NarratorDockContext";
-import { useFilePanelSelectionPublisher } from "../dock/panels";
+import { createDetachedPanelDockValue } from "../../graph/dock/detached-panel-context";
+import {
+	makePanelEntry,
+	parseDetachedNodes,
+	serializeDetachedNodes,
+} from "../../graph/dock/detached-panels";
+import { readPanelSubject } from "../../graph/dock/tab-detach";
+import {
+	NarratorDockContext,
+	type NarratorDockContextValue,
+	NarratorDockProvider,
+	useNarratorDockContext,
+} from "../dock/NarratorDockContext";
+import { FileDockPanel, useFilePanelSelectionPublisher } from "../dock/panels";
+import { type FilePanelOpener, useFilePanelSourceOpener } from "../file-panel-navigation";
+import { stripIdentityFromLayout, stripNavigationFromLayout } from "../panels/layout-envelope";
+import type { FilePanelParams } from "../panels/panel-kind";
 import { installCanvasStub } from "../vlist/measure/test-canvas-stub";
+import { WorkspaceDockStore } from "../workspace/workspace-dock";
 import { FileEditorContent, type FileEditorContentProps } from "./FileEditorContent";
 import { fileNavigationHighlight } from "./file-navigation-highlight";
 
@@ -323,6 +341,163 @@ function expectClean(hash: string, hasSelection = true) {
 	else expect(currentSelection()).toBeNull();
 }
 
+for (const surface of ["focus", "workspace"] as const) {
+	for (const lifecycle of ["live", "restored", "detached"] as const) {
+		test(`${surface} ${lifecycle} child file reads/writes as child while publishing selection to host`, async () => {
+			const filePath = "/work/b/a.txt";
+			preview.mockImplementation(async (narratorId, target) => {
+				// Model the server's cwd authorization: parent /work/a cannot read child /work/b.
+				const cwd = narratorId === "child" ? "/work/b/" : "/work/a/";
+				if (!target.path.startsWith(cwd)) throw new ApiError("Forbidden outside cwd", 403);
+				return { ...source, target };
+			});
+			const panels = new Map<string, { id: string; params: FilePanelParams; api: object }>();
+			const apiRef = {
+				current: {
+					getPanel: (id: string) => panels.get(id),
+					get panels() {
+						return [...panels.values()];
+					},
+					addPanel: ({ id, params }: { id: string; params: FilePanelParams }) => {
+						const panel = {
+							id,
+							params,
+							api: {
+								setActive() {},
+								updateParameters(next: FilePanelParams) {
+									panel.params = next;
+								},
+							},
+						};
+						panels.set(id, panel);
+					},
+				} as unknown as DockviewApi,
+			};
+			const store = new WorkspaceDockStore(apiRef);
+			let open: FilePanelOpener = (path, name, options) =>
+				store.openFilePanel("parent", path, name, options);
+			if (surface === "focus") {
+				const captured: { current: NarratorDockContextValue | null } = { current: null };
+				function Capture() {
+					captured.current = useNarratorDockContext();
+					return null;
+				}
+				renderToString(
+					<NarratorDockProvider narratorId="parent">
+						<Capture />
+					</NarratorDockProvider>,
+				);
+				if (!captured.current?.openFilePanel) throw new Error("Missing focus opener");
+				captured.current.apiRef.current = apiRef.current;
+				open = captured.current.openFilePanel;
+			}
+			let childOpen: FilePanelOpener | undefined;
+			function Child() {
+				childOpen = useFilePanelSourceOpener(open, "child-panel", "child");
+				return null;
+			}
+			renderToString(<Child />);
+			childOpen?.(filePath, undefined, { referenceOrigin: true, selection });
+			const panel = [...panels.values()][0];
+			if (!panel) throw new Error("Missing child file panel");
+			childOpen?.(filePath, undefined, { referenceOrigin: true, selection });
+			expect(panels.size).toBe(1);
+			open(filePath, undefined, { referenceOrigin: true });
+			expect(panels.size).toBe(2); // Same device/path, different read authority: don't reuse the child editor.
+			expect(panel.params).toMatchObject({ hostNarratorId: "parent", fileNarratorId: "child" });
+			let params = panel.params;
+			if (lifecycle === "restored") {
+				const layout = { panels: { file: { params } } } as unknown as SerializedDockview;
+				const strip = surface === "focus" ? stripIdentityFromLayout : stripNavigationFromLayout;
+				params = JSON.parse(JSON.stringify(strip(layout))).panels.file.params;
+			} else if (lifecycle === "detached") {
+				// Use the real native-tab → pending entry → persisted detached-node pipeline.
+				const subject = readPanelSubject(params);
+				if (!subject?.resourceId) throw new Error("Missing drag resource");
+				const entry = makePanelEntry("file", subject.resourceId);
+				const nodes = parseDetachedNodes(
+					serializeDetachedNodes([
+						{
+							id: "detached",
+							x: 0,
+							y: 0,
+							w: 480,
+							h: 360,
+							pendingPanels: [entry],
+						},
+					]),
+				);
+				const restored = nodes[0]?.pendingPanels?.[0];
+				if (!restored?.filePath) throw new Error("Missing detached file");
+				params = { ...restored, panelType: "file", filePath: restored.filePath };
+			}
+			const hostSelections = mock((_next: FileReferenceEditorSelection | null) => {});
+			const hostDock = {
+				narratorId: "parent",
+				openFilePanel: open,
+				setFileReferenceSelection: hostSelections,
+			} as unknown as NarratorDockContextValue;
+			const dock =
+				lifecycle === "detached"
+					? createDetachedPanelDockValue({
+							narratorId: "parent",
+							chapterId: "chapter",
+							sourceDock: hostDock,
+							apiRef,
+						})
+					: hostDock;
+			const props = {
+				params,
+				api: {
+					id: panel.id,
+					title: "a.txt",
+					close() {},
+					setTitle() {},
+					updateParameters() {},
+					getWindow: () => window,
+					group: { id: "group", element: host },
+				},
+				containerApi: {
+					onWillDragPanel: () => ({ dispose() {} }),
+					onWillDragGroup: () => ({ dispose() {} }),
+				},
+			} as unknown as IDockviewPanelProps<FilePanelParams>;
+			await act(async () => {
+				root?.render(
+					<I18nextProvider i18n={i18n}>
+						<MantineProvider env="test">
+							<NarratorDockContext.Provider value={dock}>
+								<FileDockPanel {...props} />
+							</NarratorDockContext.Provider>
+						</MantineProvider>
+					</I18nextProvider>,
+				);
+			});
+			expect(preview).toHaveBeenCalledWith(
+				"child",
+				{ deviceId: "local", path: filePath },
+				expect.any(AbortSignal),
+			);
+			const element = host.querySelector<HTMLElement>(".cm-editor");
+			if (!element) throw new Error(`Editor not mounted: ${host.textContent}`);
+			const view = EditorView.findFromDOM(element);
+			if (!view) throw new Error("Missing CodeMirror view");
+			expect(view.state.doc.toString()).toBe("a\nb\n");
+			await edit(view, "child draft");
+			expect(hostSelections.mock.calls.at(-1)?.[0]).toMatchObject({
+				target: { path: filePath },
+				dirty: true,
+			});
+			await click(iconButton("device-floppy"));
+			expect(write.mock.calls[0]?.[0]).toMatchObject({
+				narratorId: "child",
+				path: filePath,
+				content: "child draft",
+			});
+		});
+	}
+}
+
 test("reference CRLF load is clean, selection-ready, and retains raw hash/encoding on real edits", async () => {
 	const view = await mount();
 	expect(preview).toHaveBeenCalledWith(
@@ -456,6 +631,172 @@ test("scoped files without narrator context never fall back to another reader", 
 	expect(preview).not.toHaveBeenCalled();
 	expect(write).not.toHaveBeenCalled();
 	expect(host.querySelector(".cm-editor")).toBeNull();
+});
+
+async function switchFileMode(mode: "raw" | "preview" | "node") {
+	const input = host.querySelector<HTMLInputElement>(`input[type="radio"][value="${mode}"]`);
+	if (!input) throw new Error(`Missing file mode ${mode}`);
+	await act(async () => {
+		input.checked = true;
+		input.dispatchEvent(new Event("click", { bubbles: true }));
+	});
+}
+
+for (const extension of ["txt", "md", "json"] as const) {
+	test(`${extension} source inherits dock tab visibility without replacing editor state`, async () => {
+		const view = await mount({ filePath: `/work/draft.${extension}`, selection: undefined });
+		const sourceElement = host.querySelector<HTMLElement>("[data-file-editor-source]");
+		if (!sourceElement) throw new Error("Source layer missing");
+		await edit(view, "unsaved draft\n");
+		const doc = view.state.doc;
+		const selected = view.state.selection;
+		const history = undoDepth(view.state);
+
+		// Model Dockview's always-rendered ancestor. LinkeDOM has no layout engine:
+		// assert the inheritance contract, not simulated computed visibility.
+		for (let cycle = 0; cycle < 2; cycle++) {
+			host.style.visibility = "hidden";
+			expect(sourceElement.style.visibility).toBe("inherit");
+			if (extension !== "txt") {
+				await switchFileMode(extension === "md" ? "preview" : "node");
+				expect(sourceElement.style.visibility).toBe("hidden");
+				expect(sourceElement.hasAttribute("inert")).toBe(true);
+				await switchFileMode("raw");
+				expect(host.style.visibility).toBe("hidden");
+				expect(sourceElement.style.visibility).toBe("inherit");
+			}
+			host.style.visibility = "";
+			expect(sourceElement.style.visibility).toBe("inherit");
+			expect(sourceElement.hasAttribute("inert")).toBe(false);
+			expect(host.querySelector(".cm-editor")).toBe(view.dom);
+			expect(view.state.doc).toBe(doc);
+			expect(view.state.selection).toBe(selected);
+			expect(undoDepth(view.state)).toBe(history);
+		}
+		expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
+		expect(preview).toHaveBeenCalledTimes(1);
+		expect(write).not.toHaveBeenCalled();
+	});
+}
+
+for (const extension of ["md", "json"] as const) {
+	test(`${extension} preview renders the unsaved buffer without losing editor state or reading again`, async () => {
+		const filePath = `/work/draft.${extension}`;
+		preview.mockResolvedValue({
+			...source,
+			content: extension === "md" ? "# Saved" : '{"name":"Saved"}',
+		});
+		const view = await mount({ filePath, selection: undefined });
+		const sourceElement = host.querySelector<HTMLElement>("[data-file-editor-source]");
+		expect(sourceElement?.style.visibility).toBe("inherit");
+		expect(host.querySelector("[data-file-editor-preview]")).toBeNull();
+		const draft =
+			extension === "md"
+				? "# Draft heading\n\n**bold draft**"
+				: '{"name":"Draft value","nested":{"enabled":true}}';
+		await edit(view, draft);
+		const doc = view.state.doc;
+		const selected = view.state.selection;
+		const history = undoDepth(view.state);
+		await switchFileMode(extension === "md" ? "preview" : "node");
+		const body = host.querySelector("[data-file-editor-preview]");
+		expect(body).not.toBeNull();
+		expect(body?.textContent).toContain(extension === "md" ? "Draft heading" : "Draft value");
+		if (extension === "md") expect(body?.querySelector("h1")?.textContent).toBe("Draft heading");
+		else expect(body?.querySelector('[role="tree"]')).not.toBeNull();
+		expect(sourceElement?.style.visibility).toBe("hidden");
+		expect(sourceElement?.hasAttribute("inert")).toBe(true);
+		expect(host.querySelector(".cm-editor")).toBe(view.dom);
+		await switchFileMode("raw");
+		expect(sourceElement?.style.visibility).toBe("inherit");
+		expect(view.state.doc).toBe(doc);
+		expect(view.state.selection).toBe(selected);
+		expect(undoDepth(view.state)).toBe(history);
+		expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
+		expect(preview).toHaveBeenCalledTimes(1);
+		expect(write).not.toHaveBeenCalled();
+		await act(async () => {
+			undo(view);
+		});
+		expect(view.state.doc.toString()).toContain("Saved");
+	});
+}
+
+test("read-only JSON keeps both source and node views without enabling writes", async () => {
+	preview.mockResolvedValue({ ...source, content: '{"remote":"read-only value"}' });
+	const view = await mount({
+		filePath: "/work/a.json",
+		deviceId: "remote-device",
+		selection: undefined,
+	});
+	await switchFileMode("node");
+	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain(
+		"read-only value",
+	);
+	await switchFileMode("raw");
+	expect(view.state.readOnly).toBe(true);
+	expect(host.querySelector(".tabler-icon-device-floppy")).toBeNull();
+	expect(preview).toHaveBeenCalledTimes(1);
+	expect(write).not.toHaveBeenCalled();
+});
+
+test("oversized unsaved JSON declines rendering without truncating the editor", async () => {
+	preview.mockResolvedValue({ ...source, content: "{}" });
+	const view = await mount({ filePath: "/work/a.json", selection: undefined });
+	// Keep individual lines bounded: linkedom has no layout for CM's long-line gaps.
+	const text = JSON.stringify(
+		{ values: Array.from({ length: 2048 }, () => "x".repeat(512)) },
+		null,
+		2,
+	);
+	await edit(view, text);
+	await switchFileMode("node");
+	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain(
+		en["fileEditor.previewTooLarge"],
+	);
+	await switchFileMode("raw");
+	expect(view.state.doc.toString()).toBe(text);
+	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
+	expect(preview).toHaveBeenCalledTimes(1);
+});
+
+test("invalid JSON can be corrected by switching back without dropping the buffer", async () => {
+	preview.mockResolvedValue({ ...source, content: '{"name":"saved"}' });
+	const view = await mount({ filePath: "/work/a.json", selection: undefined });
+	await edit(view, '{"name":');
+	await switchFileMode("node");
+	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain("not valid json");
+	expect(view.state.doc.toString()).toBe('{"name":');
+	await switchFileMode("raw");
+	await edit(view, '{"name":"fixed"}');
+	await switchFileMode("node");
+	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain("fixed");
+	expect(preview).toHaveBeenCalledTimes(1);
+});
+
+test("line references keep the preview switch and new navigation returns to the same editor", async () => {
+	const filePath = "/work/a.md";
+	const view = await mount({ filePath, navigationRequestId: "first" });
+	await switchFileMode("preview");
+	expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
+	const again = await mount({ filePath, navigationRequestId: "second" });
+	expect(again).toBe(view);
+	expect(host.querySelector("[data-file-editor-preview]")).toBeNull();
+	expect(preview).toHaveBeenCalledTimes(1);
+});
+
+test("search from preview returns to source without replacing the document", async () => {
+	const view = await mount({ filePath: "/work/a.md", selection: undefined });
+	await switchFileMode("preview");
+	await click(iconButton("search"));
+	expect(host.querySelector("[data-file-editor-preview]")).toBeNull();
+	expect(searchPanelOpen(view.state)).toBe(true);
+	expect(preview).toHaveBeenCalledTimes(1);
+});
+
+test("ordinary text does not expose irrelevant preview modes", async () => {
+	await mount();
+	expect(host.querySelector('input[type="radio"]')).toBeNull();
 });
 
 test("search and wrapping preserve the document, selection and undo history", async () => {

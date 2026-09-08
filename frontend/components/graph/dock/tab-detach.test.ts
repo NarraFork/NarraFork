@@ -94,6 +94,21 @@ describe("readPanelSubject", () => {
 		expect(readPanelSubject({ panelType: "file", filePath: "/a.ts", toolEdit: {} })).toBeNull();
 	});
 
+	it("retains file-operation authority instead of the layout host in native tab drags", () => {
+		expect(
+			readPanelSubject({
+				panelType: "file",
+				filePath: "/work/b/a.ts",
+				hostNarratorId: "parent",
+				fileNarratorId: "child",
+				referenceOrigin: true,
+			}),
+		).toEqual({
+			kind: "file",
+			resourceId: JSON.stringify(["local", "/work/b/a.ts", true, null, "child"]),
+		});
+	});
+
 	it("leaves resourceId unset for singleton kinds even if extra fields exist", () => {
 		// A stray field must not become a resource identity: singletons are keyed by
 		// kind alone, and a spurious resourceId would defeat the duplicate check.

@@ -5,6 +5,8 @@ export interface ChatUserSnapshot {
 	username: string;
 	avatarColor: string | null;
 	avatarImageId: string | null;
+	/** Guests have a display-only id; never use it for user/profile requests. */
+	isGuest?: boolean;
 }
 
 /**

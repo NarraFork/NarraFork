@@ -243,6 +243,7 @@ import {
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { ExecutionDeviceMenu, ExecutionDeviceOptions } from "./ExecutionDeviceMenu";
 import type { FileReferenceScopeValue } from "./FileReferenceScope";
+import { useFilePanelNavigation } from "./file-panel-navigation";
 import { trimFileReferenceInput } from "./file-reference-input";
 import { HumanAttentionInboxButton } from "./GlobalQuestionInbox";
 import {
@@ -4861,7 +4862,7 @@ export function NarratorPanel({
 	);
 	const fileNavigationRef = useRef(0);
 	const fileNavigationAbortRef = useRef<AbortController | null>(null);
-	const dockOpenFilePanel = dock?.openFilePanel;
+	const dockOpenFilePanel = useFilePanelNavigation();
 	const useInternalFileViewer = !dockOpenFilePanel && !isWorkspacePreview;
 	const handleOpenFilePanel = useMemo(() => {
 		if (dockOpenFilePanel) return (filePath: string) => dockOpenFilePanel(filePath);
@@ -4894,6 +4895,7 @@ export function NarratorPanel({
 				const highlightRequestId = nextHighlightRequestId();
 				if (dockOpenFilePanel) {
 					dockOpenFilePanel(resolved.path, undefined, {
+						fileNarratorId: narratorId,
 						deviceId: resolved.deviceId,
 						selection: resolved.selection,
 						highlightRequestId,

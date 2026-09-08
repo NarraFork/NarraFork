@@ -5,10 +5,10 @@ import { useUserPreferences } from "./useUserPreferences";
 /**
  * Whether an action must be blocked until the setup wizard has been completed.
  *
- * `setupWizardCompleted` is a per-user preference, so every newly registered user
- * starts out "incomplete". The wizard itself only configures instance-wide settings
- * (providers, default models, listen address) that non-admins may not change, so
- * they are never gated on it.
+ * `setupWizardCompleted` is instance-wide, projected through the preferences API.
+ * Once any admin completes setup, later users (including promoted admins) skip it.
+ * The wizard configures instance-wide settings (providers, models, listen address)
+ * that non-admins may not change, so they are never gated on it.
  */
 export function shouldBlockForSetupWizard(options: {
 	role: string | undefined;

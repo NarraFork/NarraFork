@@ -19,6 +19,7 @@ import {
 	Center,
 	Group,
 	Loader,
+	SegmentedControl,
 	Text,
 	Tooltip,
 } from "@mantine/core";
@@ -41,6 +42,7 @@ import { request } from "../../../lib/api/client";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import { getShikiLang } from "../../../lib/shiki-lang";
 import { useFileReferenceScope } from "../FileReferenceScope";
+import { availableModes, type FileViewerMode } from "../file-viewer/file-viewer-modes";
 import { filePanelBaseName } from "../panels/panel-kind";
 import { CodeMirrorEditor } from "./CodeMirrorEditor";
 import {
@@ -61,6 +63,9 @@ import {
 } from "./save-state";
 
 const DiffView = lazy(() => import("../DiffView").then((m) => ({ default: m.DiffView })));
+const FileEditorPreview = lazy(() =>
+	import("./FileEditorPreview").then((m) => ({ default: m.FileEditorPreview })),
+);
 
 /** Match CodeMirror's document newlines without changing the server's byte hash or encoding. */
 function editorText(content: string): string {
@@ -160,6 +165,14 @@ export function FileEditorContent({
 	const [loading, setLoading] = useState(true);
 	const [lineWrapping, setLineWrapping] = useState(false);
 	const [searchRequestId, setSearchRequestId] = useState(0);
+	const [mode, setMode] = useState<FileViewerMode>("raw");
+	// A line reference starts in source, but never removes the preview switch.
+	const modes = useMemo(() => availableModes(filePath), [filePath]);
+	const navigationKey = JSON.stringify([deviceId, filePath, navigationRequestId, selection]);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: only a new navigation request returns to source, never typing or an equivalent selection object.
+	useEffect(() => {
+		setMode("raw");
+	}, [navigationKey]);
 	const readOnly = deviceId !== "local" || !narratorId;
 	const phrases = useMemo(
 		() => t("fileEditor.searchPhrases", { returnObjects: true }) as Record<string, string>,
@@ -429,7 +442,21 @@ export function FileEditorContent({
 	}
 
 	return (
-		<Box style={{ height: "100%", display: "flex", flexDirection: "column" }}>
+		<Box
+			style={{ height: "100%", display: "flex", flexDirection: "column" }}
+			onKeyDownCapture={(event) => {
+				if (
+					mode !== "raw" &&
+					!event.nativeEvent.isComposing &&
+					(event.ctrlKey || event.metaKey) &&
+					event.key.toLowerCase() === "s"
+				) {
+					event.preventDefault();
+					event.stopPropagation();
+					handleSave();
+				}
+			}}
+		>
 			<Group justify="space-between" gap="xs" px="xs" py={6} wrap="nowrap">
 				<Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
 					<Text size="xs" c="dimmed" truncate title={filePath}>
@@ -457,7 +484,10 @@ export function FileEditorContent({
 							variant="subtle"
 							size="sm"
 							aria-label={t("fileEditor.search")}
-							onClick={() => setSearchRequestId((id) => id + 1)}
+							onClick={() => {
+								setMode("raw");
+								setSearchRequestId((id) => id + 1);
+							}}
 						>
 							<IconSearch size={14} />
 						</ActionIcon>
@@ -468,6 +498,7 @@ export function FileEditorContent({
 							size="sm"
 							aria-label={t("fileEditor.wrap")}
 							aria-pressed={lineWrapping}
+							disabled={mode !== "raw"}
 							onClick={() => setLineWrapping((enabled) => !enabled)}
 						>
 							<IconTextWrap size={14} />
@@ -503,6 +534,23 @@ export function FileEditorContent({
 					)}
 				</Group>
 			</Group>
+
+			{modes.length > 1 && (
+				<Box px="xs" pb={6} style={{ flexShrink: 0 }}>
+					<SegmentedControl
+						size="xs"
+						value={mode}
+						onChange={(value) => setMode(value as FileViewerMode)}
+						data={["raw" as const, ...modes.filter((value) => value !== "raw")].map((value) => ({
+							value,
+							label:
+								value === "raw"
+									? t(readOnly ? "fileViewer.mode_raw" : "fileEditor.edit")
+									: t(value === "preview" ? "fileViewer.mode_preview" : "fileViewer.mode_node"),
+						}))}
+					/>
+				</Box>
+			)}
 
 			{state.confirmation && (
 				<Alert
@@ -588,21 +636,55 @@ export function FileEditorContent({
 				</Alert>
 			)}
 
-			<Box style={{ flex: 1, minHeight: 0 }}>
-				<CodeMirrorEditor
-					value={state.buffer}
-					language={getShikiLang(filePath)}
-					onChange={handleChange}
-					onSave={handleSave}
-					selection={selection}
-					navigationRequestId={navigationRequestId}
-					onSelectionChange={handleSelectionChange}
-					readOnly={readOnly || loading}
-					lineWrapping={lineWrapping}
-					searchRequestId={searchRequestId}
-					phrases={phrases}
-					ariaLabel={filePath}
-				/>
+			<Box style={{ flex: 1, minHeight: 0, position: "relative" }}>
+				{/* Keep geometry as well as the instance: display:none resets browser scroll offsets. */}
+				<Box
+					data-file-editor-source
+					inert={mode !== "raw"}
+					aria-hidden={mode !== "raw"}
+					style={{
+						position: "absolute",
+						inset: 0,
+						visibility: mode === "raw" ? "visible" : "hidden",
+					}}
+				>
+					<CodeMirrorEditor
+						value={state.buffer}
+						language={getShikiLang(filePath)}
+						onChange={handleChange}
+						onSave={handleSave}
+						selection={selection}
+						navigationRequestId={navigationRequestId}
+						onSelectionChange={handleSelectionChange}
+						readOnly={readOnly || loading}
+						lineWrapping={lineWrapping}
+						searchRequestId={searchRequestId}
+						phrases={phrases}
+						ariaLabel={filePath}
+					/>
+				</Box>
+				{mode !== "raw" && (
+					<Box
+						data-file-editor-preview={mode}
+						style={{ position: "absolute", inset: 0, overflow: "auto" }}
+					>
+						<Suspense
+							fallback={
+								<Center p="md">
+									<Loader size="sm" />
+								</Center>
+							}
+						>
+							<FileEditorPreview
+								text={state.buffer}
+								mode={mode}
+								filePath={filePath}
+								deviceId={deviceId}
+								narratorId={narratorId}
+							/>
+						</Suspense>
+					</Box>
+				)}
 			</Box>
 		</Box>
 	);

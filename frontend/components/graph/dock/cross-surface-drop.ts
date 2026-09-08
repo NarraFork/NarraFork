@@ -99,7 +99,12 @@ export function handleForeignPanelDrop(
 		kind === "subagent"
 			? subagentDockPanelId(resourceId as string)
 			: kind === "file"
-				? fileDockPanelId(fileTarget.filePath, fileTarget.deviceId, fileTarget.toolEdit)
+				? fileDockPanelId(
+						fileTarget.filePath,
+						fileTarget.deviceId,
+						fileTarget.toolEdit,
+						fileTarget.fileNarratorId,
+					)
 				: dockPanelId(kind);
 
 	api.addPanel({

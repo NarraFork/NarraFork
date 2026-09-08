@@ -105,6 +105,38 @@ describe("historical file cross-surface drop", () => {
 	});
 });
 
+it("drops a child reader beside the host's same-path editor without rebinding authority", () => {
+	const filePath = "/work/b/a.ts";
+	const childId = fileDockPanelId(filePath, "local", undefined, "child");
+	const hostId = fileDockPanelId(filePath);
+	const params = {
+		panelType: "file",
+		filePath,
+		deviceId: "local",
+		referenceOrigin: true,
+		fileNarratorId: "child",
+	};
+	const source = { id: childId, params, api: { close() {} } };
+	registerDetachedDock("source", "chapter", {
+		apiRef: { current: { getPanel: (id: string) => (id === childId ? source : undefined) } },
+	} as unknown as NarratorDockContextValue);
+	const host = { id: hostId, params: { panelType: "file", filePath } };
+	const added: Array<{ id: string; params: unknown }> = [];
+	const api = {
+		getPanel: (id: string) => (id === hostId ? host : undefined),
+		addPanel: (panel: { id: string; params: unknown }) => added.push(panel),
+	} as unknown as DockviewApi;
+	expect(
+		handleForeignPanelDrop(
+			{ getData: () => ({ panelId: childId }) } as unknown as DockviewDidDropEvent,
+			api,
+			{ narratorId: "parent", chapterId: "chapter" },
+		),
+	).toBe(true);
+	expect(added[0]).toMatchObject({ id: childId, params });
+	expect(api.getPanel(hostId)).toBe(host as never);
+});
+
 describe("shouldAcceptForeignPanel", () => {
 	it("accepts a detachable panel held by another surface", () => {
 		// Without this the target draws no overlay at all — the reported "cannot drag

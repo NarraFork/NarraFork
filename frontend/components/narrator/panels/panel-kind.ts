@@ -128,8 +128,12 @@ export function nextHighlightRequestId(): string {
  * serialization — `stripIdentityFromLayout` only removes host identity
  * (narratorId / chapterId).
  */
-/** Navigation is transient; device/path and toolEdit are persisted resource identity. */
+/** Navigation is transient; file authority, device/path and toolEdit are resource identity. */
 export interface FileOpenOptions {
+	/** File-operation authority, independent of the layout host; persists across drags/restores. */
+	fileNarratorId?: string;
+	/** Transient placement hint: keep the originating file browser visible. */
+	sourcePanelId?: string;
 	deviceId?: string;
 	/** Historical edit identity; never replace this resource with the current disk file. */
 	toolEdit?: ToolEditReference;
@@ -165,7 +169,10 @@ export function filePanelResourceId(
 	deviceId = "local",
 	referenceOrigin = false,
 	toolEdit?: ToolEditReference,
+	fileNarratorId?: string,
 ): string {
+	if (fileNarratorId)
+		return JSON.stringify([deviceId, filePath, referenceOrigin, toolEdit ?? null, fileNarratorId]);
 	if (toolEdit) return JSON.stringify([deviceId, filePath, referenceOrigin, toolEdit]);
 	if (referenceOrigin) return JSON.stringify([deviceId, filePath, true]);
 	return deviceId === "local" ? filePath : JSON.stringify([deviceId, filePath]);
@@ -174,7 +181,10 @@ export function filePanelResourceId(
 /** Decode a device-scoped drag identity without guessing the current/default device. */
 export function filePanelResourceParams(
 	resourceId: string,
-): Pick<FilePanelParams, "filePath" | "deviceId" | "referenceOrigin" | "toolEdit"> {
+): Pick<
+	FilePanelParams,
+	"filePath" | "deviceId" | "referenceOrigin" | "toolEdit" | "fileNarratorId"
+> {
 	if (resourceId.startsWith("[")) {
 		try {
 			const value: unknown = JSON.parse(resourceId);
@@ -182,7 +192,12 @@ export function filePanelResourceParams(
 				Array.isArray(value) &&
 				(value.length === 2 ||
 					(value.length === 3 && value[2] === true) ||
-					(value.length === 4 && typeof value[2] === "boolean" && isToolEditReference(value[3]))) &&
+					(value.length === 4 && typeof value[2] === "boolean" && isToolEditReference(value[3])) ||
+					(value.length === 5 &&
+						typeof value[2] === "boolean" &&
+						(value[3] === null || isToolEditReference(value[3])) &&
+						typeof value[4] === "string" &&
+						value[4].length > 0)) &&
 				typeof value[0] === "string" &&
 				typeof value[1] === "string"
 			) {
@@ -190,7 +205,8 @@ export function filePanelResourceParams(
 					deviceId: value[0],
 					filePath: value[1],
 					...(value[2] === true ? { referenceOrigin: true } : {}),
-					...(value.length === 4 ? { toolEdit: value[3] as ToolEditReference } : {}),
+					...(value.length >= 4 && value[3] ? { toolEdit: value[3] as ToolEditReference } : {}),
+					...(value.length === 5 ? { fileNarratorId: value[4] as string } : {}),
 				};
 			}
 		} catch {
