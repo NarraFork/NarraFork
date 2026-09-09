@@ -1,6 +1,8 @@
 import { notifications } from "@mantine/notifications";
+import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import type { SubagentModelPools } from "@shared/subagent-model-policy";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	ApiError,
@@ -11,7 +13,17 @@ import {
 	type WhitelistCmd,
 	type WhitelistDir,
 } from "../lib/api";
-import { type ToolCallDetailRef, toolCallDetailQueryKey } from "../lib/api/narrators";
+import {
+	type RevertAction,
+	type RevertActionConfirmOptions,
+	type RevertActionPreview,
+	type RevertActionTarget,
+	type RevertPlanFile,
+	type RevertPlanPreviewIssue,
+	type RevertScopePreviews,
+	type ToolCallDetailRef,
+	toolCallDetailQueryKey,
+} from "../lib/api/narrators";
 import type {
 	CommandBlacklistRuleInput,
 	CommandWhitelistRuleInput,
@@ -198,6 +210,365 @@ export function useBlockDeletePreview(
 		queryFn: () => api.blockDeletePreview(narratorId, messageId as string, blockIndex as number),
 		enabled: enabled && !!messageId && blockIndex != null,
 		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
+	});
+}
+
+const REVERT_PLAN_PAGE_SIZE = 32;
+const REVERT_PREVIEW_TIMEOUT_MS = 60_000;
+
+function newRevertPreviewKey(revision: number): string {
+	// randomUUID is absent on plain HTTP; an unavailable helper must not crash
+	// the whole history-only confirmation. This is a dedup key, not a credential.
+	const nonce =
+		globalThis.crypto?.randomUUID?.() ??
+		`${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+	return `${revision}-${nonce}`;
+}
+
+interface RevertPreviewRequest {
+	narratorId: string;
+	action: RevertAction;
+	target: RevertActionTarget;
+	key: string;
+}
+
+interface RevertPreviewState {
+	request: RevertPreviewRequest;
+	response?: RevertActionPreview;
+	files: RevertPlanFile[];
+	filesComplete: boolean;
+	loading: boolean;
+	issue?: RevertPlanPreviewIssue;
+	error?: string;
+}
+
+function validPlanFile(file: RevertPlanFile): boolean {
+	const identity = file?.identityJson;
+	const boundedText = (value: unknown) =>
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= FILE_CHANGE_LIMITS.metadataBytes;
+	const knownState = (kind: unknown) =>
+		kind === "absent" || kind === "regular" || kind === "symlink";
+	return (
+		boundedText(file?.id) &&
+		boundedText(file?.fileKey) &&
+		boundedText(identity?.deviceId) &&
+		boundedText(identity?.displayPath) &&
+		boundedText(identity?.lexicalPath) &&
+		boundedText(identity?.canonicalPath) &&
+		knownState(file?.expectedStateJson?.kind) &&
+		knownState(file?.desiredStateJson?.kind)
+	);
+}
+
+/**
+ * An action preview is a POST creating one durable plan, not a live query. Never
+ * refetch on focus/invalidation or reuse a previous opening's plan. Pages are
+ * loaded serially under one deadline, with abort and count/cursor admission checks.
+ * Expiration/failed apply revokes the plan; only an explicit reload may re-plan.
+ */
+export function useRevertActionPreview(
+	narratorId: string,
+	action: RevertAction,
+	target: RevertActionTarget | null,
+) {
+	const [revision, setRevision] = useState(0);
+	const request = useMemo<RevertPreviewRequest | null>(
+		() =>
+			target && narratorId
+				? { narratorId, action, target: { ...target }, key: newRevertPreviewKey(revision) }
+				: null,
+		[narratorId, action, target, revision],
+	);
+	const [state, setState] = useState<RevertPreviewState | null>(null);
+	const [invalidated, setInvalidated] = useState<RevertPreviewRequest | null>(null);
+	const active = useRef<{ request: RevertPreviewRequest; controller: AbortController } | null>(
+		null,
+	);
+
+	useEffect(() => {
+		if (!request) return;
+		const controller = new AbortController();
+		active.current = { request, controller };
+		let disposed = false;
+		let expiryTimer: ReturnType<typeof setTimeout> | undefined;
+		const update = (patch: Partial<RevertPreviewState>) => {
+			if (disposed) return;
+			setState((current) => (current?.request === request ? { ...current, ...patch } : current));
+		};
+		setState({ request, files: [], filesComplete: false, loading: true });
+		const deadline = setTimeout(() => {
+			update({ loading: false, issue: "preview_failed" });
+			controller.abort();
+		}, REVERT_PREVIEW_TIMEOUT_MS);
+
+		void (async () => {
+			try {
+				const response = await api.previewRevertAction(
+					request.narratorId,
+					{ ...request.target, action: request.action, idempotencyKey: request.key },
+					controller.signal,
+				);
+				if (disposed || controller.signal.aborted) return;
+				const { plan, historySummary } = response;
+				if (
+					response.action !== request.action ||
+					response.executable !== false ||
+					(plan !== null &&
+						(!historySummary ||
+							!Number.isSafeInteger(historySummary.deletedMessageCount) ||
+							historySummary.deletedMessageCount < 0 ||
+							!Number.isSafeInteger(historySummary.deletedBlockCount) ||
+							historySummary.deletedBlockCount < 0))
+				) {
+					throw new Error("Invalid rollback preview response");
+				}
+				update({ response });
+				if (!plan) {
+					update({ loading: false });
+					return;
+				}
+				const remaining = Date.parse(plan.expiresAt) - Date.now();
+				if (plan.expired !== false || !Number.isFinite(remaining) || remaining <= 0) {
+					update({ loading: false, issue: "expired" });
+					return;
+				}
+				expiryTimer = setTimeout(
+					() => {
+						update({ loading: false, issue: "expired" });
+						controller.abort();
+					},
+					Math.min(remaining, FILE_CHANGE_LIMITS.planLifetimeMs),
+				);
+				const expectedKind = {
+					rollback_to_block: "rollback_to_block",
+					delete_tool_block: "history_delete",
+					revert_files: "revert",
+				}[request.action];
+				if (
+					plan.status !== "prepared" ||
+					typeof plan.id !== "string" ||
+					!plan.id ||
+					typeof plan.planHash !== "string" ||
+					!plan.planHash ||
+					plan.kind !== expectedKind ||
+					plan.coverageComplete !== true
+				) {
+					update({ loading: false, issue: "not_prepared" });
+					return;
+				}
+				if (!Number.isSafeInteger(plan.expectedFileCount) || plan.expectedFileCount < 0) {
+					update({ loading: false, issue: "incomplete_files" });
+					return;
+				}
+				if (plan.expectedFileCount > FILE_CHANGE_LIMITS.revertFiles) {
+					update({ loading: false, issue: "window_too_large" });
+					return;
+				}
+				const files: RevertPlanFile[] = [];
+				const keys = new Set<string>();
+				let cursor: string | undefined;
+				while (!disposed && !controller.signal.aborted) {
+					const page = await api.getRevertPlanFiles(
+						request.narratorId,
+						plan.id,
+						{ limit: REVERT_PLAN_PAGE_SIZE, cursor },
+						controller.signal,
+					);
+					if (disposed || controller.signal.aborted) return;
+					if (
+						!Array.isArray(page.items) ||
+						page.items.length > REVERT_PLAN_PAGE_SIZE ||
+						typeof page.hasMore !== "boolean" ||
+						files.length + page.items.length > plan.expectedFileCount ||
+						page.items.some((file) => {
+							if (!validPlanFile(file) || keys.has(file.fileKey)) return true;
+							keys.add(file.fileKey);
+							return false;
+						})
+					) {
+						update({ loading: false, issue: "incomplete_files" });
+						return;
+					}
+					files.push(...page.items);
+					const nextCursor = page.nextCursor?.fileKey;
+					if (
+						(page.hasMore &&
+							(!nextCursor ||
+								nextCursor === cursor ||
+								nextCursor !== page.items.at(-1)?.fileKey ||
+								files.length >= plan.expectedFileCount)) ||
+						(!page.hasMore && (page.nextCursor !== null || files.length !== plan.expectedFileCount))
+					) {
+						update({ files: [...files], loading: false, issue: "incomplete_files" });
+						return;
+					}
+					update({ files: [...files], filesComplete: !page.hasMore, loading: page.hasMore });
+					if (!page.hasMore) return;
+					cursor = nextCursor;
+				}
+			} catch (error) {
+				if (!controller.signal.aborted) {
+					update({
+						loading: false,
+						issue: "preview_failed",
+						error: error instanceof Error ? error.message : undefined,
+					});
+				}
+			} finally {
+				clearTimeout(deadline);
+			}
+		})();
+		return () => {
+			disposed = true;
+			controller.abort();
+			clearTimeout(deadline);
+			clearTimeout(expiryTimer);
+		};
+	}, [request]);
+
+	const current = request && state?.request === request ? state : null;
+	const revoked = request !== null && invalidated === request;
+	const data = useMemo<RevertScopePreviews | undefined>(() => {
+		if (!current && !revoked) return undefined;
+		const response = current?.response;
+		const plan = response?.plan;
+		const files = (current?.files ?? []).map((file) => ({
+			fileKey: file.fileKey,
+			deviceId: file.identityJson.deviceId,
+			filePath: file.identityJson.displayPath,
+			willBeDeleted: file.desiredStateJson.kind === "absent",
+		}));
+		const issue = revoked ? "reload_required" : current?.issue;
+		return {
+			scope: "narrator",
+			affectedFiles: files,
+			previewIssue: issue,
+			previewError: current?.error,
+			narratorScope: {
+				available: !!plan && !issue && current?.filesComplete === true,
+				reason: response?.unavailable,
+				files,
+				conflicts: [],
+				totalFileCount: plan?.expectedFileCount,
+				hasMore: !!plan && !current?.filesComplete,
+			},
+			...(plan && request
+				? {
+						revertPlan: {
+							...plan,
+							planId: plan.id,
+							action: request.action,
+							previewKey: request.key,
+							filesComplete: current?.filesComplete === true && !revoked,
+						},
+					}
+				: {}),
+		};
+	}, [current, request, revoked]);
+	const reload = useCallback(() => setRevision((value) => value + 1), []);
+	const invalidate = useCallback(() => {
+		setInvalidated(request);
+		if (active.current?.request === request) active.current?.controller.abort();
+	}, [request]);
+	return {
+		data,
+		previewKey: request?.key,
+		historySummary: current?.response?.historySummary ?? null,
+		isLoading: !!request && !revoked && (!current || current.loading),
+		reload,
+		invalidate,
+	};
+}
+
+/** File+history apply is already one transaction. Never follow it with a legacy delete. */
+export function useRevertHistoryAction(narratorId: string) {
+	const qc = useQueryClient();
+	const { t } = useTranslation("narrator");
+	return useMutation({
+		retry: false,
+		mutationFn: async ({
+			action,
+			target,
+			opts,
+		}: {
+			action: "rollback_to_block" | "delete_tool_block";
+			target: { messageId: string; blockIndex: number };
+			opts: RevertActionConfirmOptions;
+		}) => {
+			if (opts.skipRevert) {
+				const result =
+					action === "rollback_to_block"
+						? await api.rollbackToBlock(narratorId, target.messageId, target.blockIndex, {
+								skipRevert: true,
+							})
+						: await api.deleteMessageBlock(narratorId, target.messageId, target.blockIndex, {
+								skipRevert: true,
+							});
+				if (result.ok !== true) throw new Error(t("deleteMessageFailedDesc"));
+				return { reason: null };
+			}
+			const plan = opts.revertPlan;
+			if (!plan?.planId || !plan.planHash || plan.action !== action) {
+				throw new Error(t("revertPlanReloadRequired"));
+			}
+			const result = await api.applyRevertPlan(narratorId, plan);
+			if (
+				result.planId !== plan.planId ||
+				result.status !== "committed" ||
+				result.journalStatus !== "committed" ||
+				result.settling !== false
+			) {
+				throw new ApiError(result.reason ?? t("revertPlanApplyFailed"), 409, { ...result });
+			}
+			return result;
+		},
+		onSuccess: (result) => {
+			if (result.reason) {
+				notifications.show({
+					title: t("rollbackPartialTitle"),
+					message: result.reason,
+					color: "yellow",
+					autoClose: false,
+				});
+			}
+		},
+		onError: (error, { opts }) => {
+			const status = error instanceof ApiError ? error.data?.status : undefined;
+			const settling = error instanceof ApiError && error.data?.settling === true;
+			const reloadRequired =
+				error instanceof ApiError && error.data?.code === "REVERT_RUNTIME_RELOAD_REQUIRED";
+			const explanation = opts.skipRevert
+				? t("deleteMessageFailedDesc")
+				: reloadRequired
+					? t("revertScopeRuntimeReloadRequired")
+					: settling
+						? t("revertPlanSettling")
+						: status === "recovery_required"
+							? t("revertPlanRecoveryRequired")
+							: status === "compensated"
+								? t("revertPlanCompensated")
+								: t("revertPlanApplyFailed");
+			notifications.show({
+				title: t(opts.skipRevert ? "deleteMessageFailed" : "rollbackFailed"),
+				message: `${explanation}\n${error.message}`,
+				color: "red",
+				autoClose: false,
+			});
+		},
+		onSettled: () => {
+			// A lost response or a compensated result can still change what is visible.
+			for (const resource of [
+				"messages",
+				"file-modifications",
+				"file-diff",
+				"file-tree-status",
+				"tool-calls",
+			]) {
+				void qc.invalidateQueries({ queryKey: ["narrators", narratorId, resource] });
+			}
+		},
 	});
 }
 

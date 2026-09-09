@@ -4,7 +4,9 @@ import {
 	FILE_CHANGE_EVIDENCE_VERSION,
 	type FileChangeBlobRef,
 	type FileChangeExecutionBinding,
+	type FileChangeRevertAction,
 	type FileChangeState,
+	fileChangeRevertActionMatches,
 	type KnownFileChangeState,
 	FILE_CHANGE_LIMITS as LIMIT,
 } from "@shared/file-change-protocol";
@@ -42,7 +44,14 @@ export type TransactionManifestRequest =
 			files: RevertJournalFile[];
 			userId: string;
 	  }
-	| { action: "compare"; fixed: RevertSelectionResult; current: RevertSelectionResult };
+	| { action: "compare"; fixed: RevertSelectionResult; current: RevertSelectionResult }
+	| {
+			action: "entrypoint";
+			raw: { ref: FileChangeBlobRef; bytes: Uint8Array };
+			operation: RevertJournalOperation;
+			userId: string;
+			expectedAction: FileChangeRevertAction;
+	  };
 
 const port = parentPort;
 if (port) {
@@ -51,6 +60,9 @@ if (port) {
 			if (request.action === "compare") {
 				check(equal(request.fixed, request.current), "SELECTION_STALE");
 				port.postMessage({ value: true });
+			} else if (request.action === "entrypoint") {
+				validateEntrypoint(request);
+				port.postMessage({ value: true });
 			} else port.postMessage({ value: validate(request) });
 		} catch (error) {
 			port.postMessage({
@@ -58,6 +70,44 @@ if (port) {
 			});
 		}
 	});
+}
+
+/** Also works for terminal journals: applying twice cannot bypass the original UI consent. */
+function validateEntrypoint(input: Extract<TransactionManifestRequest, { action: "entrypoint" }>) {
+	const { ref, bytes } = input.raw;
+	refValid(ref);
+	check(ref.digest === input.operation.selectorBlobDigest, "SELECTOR_REF");
+	check(bytes.byteLength === ref.sizeBytes && hash(bytes) === ref.digest, "RAW_INTEGRITY");
+	const selector = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+	bounded(selector);
+	keys(selector, ["version", "owner", "request", "fixedSelector", "boundary"]);
+	check(selector.version === 1, "SELECTOR_VERSION");
+	check(
+		equal(selector.owner, {
+			subjectKey: input.operation.requestedBySubjectKey,
+			narratorId: input.operation.narratorId,
+			projectId: input.operation.projectId,
+		}) && input.operation.requestedBySubjectKey === `human:${input.userId}`,
+		"OWNER",
+	);
+	check(
+		hash(JSON.stringify({ version: 1, owner: selector.owner, request: selector.request })) ===
+			input.operation.requestDigest,
+		"ORIGINAL_REQUEST_DIGEST",
+	);
+	selectorValid(selector.request.selector);
+	check(
+		selector.request.uiAction === input.expectedAction &&
+			selector.request.kind === input.operation.kind &&
+			selector.request.narratorId === input.operation.narratorId &&
+			selector.request.principal.userId === input.userId &&
+			fileChangeRevertActionMatches(
+				input.expectedAction,
+				input.operation.kind,
+				selector.request.selector,
+			),
+		"ACTION_MISMATCH",
+	);
 }
 
 function validate(
@@ -174,15 +224,28 @@ function validate(
 		}),
 		"OWNER",
 	);
-	keys(selector.request, [
-		"principal",
-		"narratorId",
-		"expectedMessageVersion",
-		"idempotencyKey",
-		"kind",
-		"revertScope",
-		"selector",
-	]);
+	keys(
+		selector.request,
+		[
+			"principal",
+			"narratorId",
+			"expectedMessageVersion",
+			"idempotencyKey",
+			"kind",
+			"revertScope",
+			"selector",
+		],
+		["uiAction"],
+	);
+	if (selector.request.uiAction !== undefined)
+		check(
+			fileChangeRevertActionMatches(
+				selector.request.uiAction,
+				selector.request.kind,
+				selector.request.selector,
+			),
+			"ACTION_MISMATCH",
+		);
 	keys(selector.request.principal, ["userId", "isAdmin"]);
 	check(
 		selector.request.principal.userId === input.userId &&

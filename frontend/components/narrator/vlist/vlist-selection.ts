@@ -23,6 +23,7 @@
 import { cleanAssistantText } from "@shared/citations";
 import type { FileReference } from "@shared/file-reference";
 import { fileReferenceLabel } from "@shared/file-reference-display";
+import { readCommunicationInjection } from "@shared/pretext-layout/segment-adapter";
 import { stringifyForDisplay } from "@shared/pretext-layout/tool-io-projection";
 import type { BlockMeta, CollectedSelectedText } from "../MessageSelectionCtx";
 import {
@@ -153,6 +154,40 @@ export function buildSelectionIndex(
 	for (const msg of messages) {
 		const seq = getMessageSeq(msg);
 		if (!msg.id || seq == null || !Array.isArray(msg.contentJson)) {
+			traversalIndex++;
+			continue;
+		}
+		// A communication row has two projections of ONE message: model text and the
+		// reader-facing injection. Register the visible block, not a hidden text row at
+		// index zero. The paired model text participates in deletion/selection too.
+		const injectionIndex = msg.contentJson.findIndex((block) => block.type === "system_injection");
+		const injection = msg.contentJson[injectionIndex];
+		const inbound = injection ? readCommunicationInjection(injection) : null;
+		if (
+			inbound &&
+			((msg.role === "user" &&
+				(msg as NarratorMsg & { origin?: string | null }).origin !== "user") ||
+				msg.role === "sys" ||
+				msg.role === "system" ||
+				msg.role === "disp")
+		) {
+			const blockId = makeMessageBlockSelectionId(msg.id, injectionIndex);
+			const blockIndices = msg.contentJson.flatMap((block, index) =>
+				index === injectionIndex || block.type === "text" ? [index] : [],
+			);
+			const entry: SelectionEntry = {
+				blockId,
+				messageId: msg.id,
+				blockIndex: injectionIndex,
+				blockIndices,
+				seq,
+				chunkIndex: resolveChunkIndex?.(seq) ?? traversalIndex,
+				copyText: inbound.text,
+			};
+			index.entries.push(entry);
+			for (const pairedIndex of blockIndices) {
+				index.byBlockId.set(makeMessageBlockSelectionId(msg.id, pairedIndex), entry);
+			}
 			traversalIndex++;
 			continue;
 		}

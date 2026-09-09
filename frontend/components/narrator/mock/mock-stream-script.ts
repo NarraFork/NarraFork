@@ -156,7 +156,7 @@ function expandTool(
 		// Short scalar fields (a path, a pattern) arrive in one frame; a long body
 		// (content / old_string / prompt) is chunked like real streamed arguments.
 		const size = value.length > 200 ? Math.max(8, scenario.charsPerFrame) : value.length;
-		for (const chunk of chunkText(value, size)) {
+		for (const [index, chunk] of chunkText(value, size).entries()) {
 			sent += chunk.length;
 			extracted[fieldName] = (extracted[fieldName] ?? "") + chunk;
 			steps.push({
@@ -168,7 +168,7 @@ function expandTool(
 					toolUseId,
 					toolName,
 					inputCharsTotal: sent,
-					streamingField: { name: fieldName, delta: chunk },
+					streamingField: { name: fieldName, delta: chunk, startsField: index === 0 },
 					// The path the streaming parser has extracted so far. It selects the
 					// card's category (a `spec://tasks.json` write renders a task board,
 					// not a diff) and must be present while streaming, or the glyph

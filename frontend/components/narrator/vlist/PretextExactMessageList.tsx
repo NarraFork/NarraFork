@@ -85,6 +85,7 @@ import {
 	subagentRecentCallSummary,
 } from "../tool-display";
 import type { TraceRowIdentity } from "../trace-row-identity";
+import { openCommunicationRecipient } from "./communication-navigation";
 import type { MeasuredReasoning } from "./measure/measure-reasoning";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-call";
@@ -203,7 +204,12 @@ import {
 	traceRowFoldChannel,
 	type VListInteractionState,
 } from "./vlist-interaction-state";
-import { jumpTargetMessageId, resolveJumpTargetSeq } from "./vlist-jump-target";
+import {
+	jumpTargetItemIndex,
+	jumpTargetMessageId,
+	mountedJumpTarget,
+	resolveJumpTargetSeq,
+} from "./vlist-jump-target";
 import { resolveJumpWindowDecision } from "./vlist-jump-window";
 import {
 	createLodFocusPoint,
@@ -1514,7 +1520,7 @@ const ExactRow = memo(
 		// Injection bubbles: speaker row + the localized trailing note, plus the
 		// navigation binding for rows that point somewhere this host can reach. All
 		// chrome the measure pass already reserved space for, so this only fills it in.
-		injectInjectionBubbleChrome(kind, extra, injectionNoteLabel, injectionNavigation);
+		injectInjectionBubbleChrome(kind, extra, injectionNoteLabel, injectionNavigation, narratorId);
 		// knowledge_hint card: make its entry rows open the entry they name.
 		//
 		// `RenderSystemList` has always read `extra.onOpenEntry`, but nothing ever wrote
@@ -1773,7 +1779,35 @@ const ExactRow = memo(
 		// always accepted onOpenSession, but nothing supplied it — the button was
 		// inert. Bind it to the same action the row menu uses.
 		if (kind === "communication-bubble") {
-			extra.onOpenRecipient = injectionNavigation?.onOpenNarrator;
+			const open = injectionNavigation?.onOpenNarrator;
+			// Registry-projected data follows the measured identity: recipient changes
+			// re-key extractDataRevision, and language changes re-key labelsRevision.
+			// Comparing spec.data itself would repaint every row on every rebuild.
+			const labels = (extra.data as { labels?: Record<string, string> }).labels;
+			if (open) {
+				extra.onOpenRecipient = (id: string, deliveryMessageId?: string) => {
+					void openCommunicationRecipient(
+						{ id, deliveryMessageId },
+						{
+							locate: narratorsApi.getMessageLocation,
+							open,
+							notify: (reason) =>
+								notifications.show({
+									color: reason === "error" ? "red" : "yellow",
+									message:
+										reason === "legacy"
+											? (labels?.communicationReceiptLegacy ??
+												"This older message has no receipt link. Opened the recipient's session instead.")
+											: reason === "unavailable"
+												? (labels?.communicationReceiptUnavailable ??
+													"The message has not been received yet or is no longer available. Please try again later.")
+												: (labels?.communicationReceiptError ??
+													"Could not locate the received message."),
+								}),
+						},
+					);
+				};
+			}
 			if (viewControls) {
 				const target = resolveItemViewTargets(item, renderLabels, extra)[0];
 				if (target) extra.onViewFull = () => viewControls.openFullscreen(target);
@@ -5540,26 +5574,19 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				// is driven by the reveal itself, so it can never fire on a failed jump or
 				// on a row that has since scrolled away.
 				const revealMounted = () => {
-					const candidates = [
-						...domIds,
-						...targetIds.flatMap((target) => [target, `msg-${messageIdFromTarget(target)}`]),
-					];
-					for (const id of candidates) {
-						const element = document.getElementById(id);
-						if (!element) continue;
-						pinnedToBottomRef.current = false;
-						setPinnedToBottom(false);
-						element.scrollIntoView?.({ block: "center", behavior: "instant" });
-						// Native reveals bypass writeScrollTop. Record the settled position
-						// so their scroll event cannot masquerade as a history-loading drag.
-						const node = viewportRef.current;
-						if (node) writeScrollTop(node.scrollTop);
-						// Flash the row itself (not a wrapper): the id is on the ExactRow hit
-						// box, so the outline traces the row the jump landed on.
-						if (highlightId) highlightRef.current.flash(element);
-						return true;
-					}
-					return false;
+					const node = viewportRef.current;
+					if (!node) return false;
+					const element = mountedJumpTarget(node, domIds, targetIds);
+					if (!element) return false;
+					pinnedToBottomRef.current = false;
+					setPinnedToBottom(false);
+					element.scrollIntoView?.({ block: "center", behavior: "instant" });
+					// Native reveals bypass writeScrollTop. Record the settled position
+					// so their scroll event cannot masquerade as a history-loading drag.
+					writeScrollTop(node.scrollTop);
+					// Highlight the exact tool row, not its message's earlier text/alias.
+					if (highlightId) highlightRef.current.flash(element);
+					return true;
 				};
 				// Scroll to a message that HAS a layout item, then let the mounted-window
 				// recomputation (one frame) produce the node the flash needs.
@@ -5569,7 +5596,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 						const index = pretextDocumentRef.current.readWindow().index;
 						const node = viewportRef.current;
 						if (!index || !node) return false;
-						const itemIndex = index.itemIndicesForSourceMessageId(messageId)[0];
+						const itemIndex = jumpTargetItemIndex(index, messageId);
 						if (itemIndex == null) continue;
 						const targetTop = index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
 						pinnedToBottomRef.current = false;

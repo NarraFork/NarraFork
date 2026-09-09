@@ -7,7 +7,7 @@ import { api } from "../../lib/api";
 import { toolCallDetailQueryKey } from "../../lib/api/narrators";
 import { getShikiLang } from "../../lib/shiki-lang";
 import { DiffView } from "./DiffView";
-import { CodeMirrorEditor } from "./file-editor/CodeMirrorEditor";
+import { MonacoEditor } from "./file-editor/MonacoEditor";
 import { buildToolEditDiff, toolEditSelection } from "./tool-edit-diff";
 import {
 	isToolEditReference,
@@ -20,8 +20,6 @@ export interface ToolEditFileViewerProps {
 	filePath: string;
 	navigationRequestId?: string;
 }
-
-const ignoreChange = () => {};
 
 /** A separate, read-only historical resource; never mounts a current-file reader/editor. */
 export function ToolEditFileViewer(props: ToolEditFileViewerProps) {
@@ -161,15 +159,14 @@ function HistoricalEdit({ reference, filePath, navigationRequestId }: ToolEditFi
 					)}
 					{selectedSide.status === "available" && (
 						<Box style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
-							<CodeMirrorEditor
+							<MonacoEditor
 								key={mode}
-								value={selectedSide.content}
+								documentKey={`historical:${toolEditReferenceKey(reference)}:${mode}`}
+								initialValue={selectedSide.content}
+								filePath={preview.filePath ?? filePath}
 								readOnly
-								onChange={ignoreChange}
-								language={language}
 								selection={selection}
 								navigationRequestId={requestId}
-								ariaLabel={t(mode === "old" ? "editPreview.old" : "editPreview.new")}
 							/>
 						</Box>
 					)}

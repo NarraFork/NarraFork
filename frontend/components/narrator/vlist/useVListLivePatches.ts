@@ -40,6 +40,7 @@ import {
 	reflectionResolvedPatch,
 	reflectionStartedPatch,
 	reflectionStoppedPatch,
+	sendDeliveryResolvedPatch,
 	subagentActivityPatch,
 	subagentConclusionPatch,
 	subagentTakeoverPatch,
@@ -315,6 +316,10 @@ export function useVListLivePatches(
 			// "open session" item stays hidden for the whole wait — exactly when the
 			// child's progress is only visible inside its own session — because the
 			// id does not reach the persisted row until the tool returns.
+			onSendDeliveryResolved: (toolUseId, targets, parentToolUseId, toolCallBinding) => {
+				if (!toolUseId || routeParent(parentToolUseId)) return;
+				enqueue(sendDeliveryResolvedPatch({ toolUseId, targets, toolCallBinding }));
+			},
 			onAwaitAgentResolved: (toolUseId, subagentNarratorId) => {
 				if (!toolUseId || !subagentNarratorId) return;
 				enqueue(awaitAgentResolvedPatch({ toolUseId, subagentNarratorId }));

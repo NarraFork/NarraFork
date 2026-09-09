@@ -46,6 +46,60 @@ const projectTextRows = (oldText: string, newText: string, startLine?: number) =
 const shape = (lines: DiffLine[]) => lines.map((l) => [l.type, l.content]);
 const numbers = (lines: DiffLine[]) => lines.map((l) => [l.oldLineNo, l.newLineNo]);
 
+describe("streaming source completeness", () => {
+	it("does not treat a known live frontier as omitted source content", () => {
+		const source = appendSourceText(createSourceText("", { epoch: "stream" }), "a\nb", 16_000);
+		const doc = createDiffDocument({
+			oldText: source.text,
+			newText: source.text,
+			oldRange: source.range,
+			newRange: source.range,
+			startLine: 445,
+		});
+		expect(source.range.complete).toBe(false);
+		expect(doc.truncated).toBe(false);
+		expect(doc.omission).toBeNull();
+		expect(numbers(projectDiffDocument(doc).lines)).toEqual([
+			[445, 445],
+			[446, 446],
+		]);
+		const staticPrefix = createDiffDocument({
+			oldText: source.text,
+			newText: source.text,
+			oldRange: { ...source.range, streaming: false },
+			newRange: source.range,
+			startLine: 445,
+		});
+		expect(staticPrefix.omission).toBe("source-range");
+		expect(staticPrefix.revision).not.toBe(doc.revision);
+	});
+
+	it("still marks actually missing heads and unverified reconnect tails as partial", () => {
+		for (const source of [
+			appendSourceText(createSourceText("", { epoch: "stream" }), "head\ntail", 4),
+			appendSourceText(
+				createSourceText("", { epoch: "reconnect", originKnown: false }),
+				"tail",
+				16_000,
+			),
+		]) {
+			expect(
+				createDiffDocument({
+					oldText: "old",
+					newText: source.text,
+					newRange: source.range,
+				}).omission,
+			).toBe("source-range");
+		}
+	});
+
+	it("marks only the unknown side of the line-number gutter as provisional", () => {
+		const row: DiffLine = { type: "context", content: "}", oldLineNo: 446, newLineNo: 2 };
+		expect(formatDiffGutter(row, 4, { new: "~" })).toBe(" 446   ~2 ");
+		expect(formatDiffGutter(row, 4, { old: "~" })).toBe("~446    2 ");
+	});
+});
+
 describe("document projection — line classification", () => {
 	it("keeps unchanged lines as context instead of removing and re-adding them", () => {
 		// The regression this locks down: a naive implementation emits

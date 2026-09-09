@@ -28,6 +28,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { MOCK_ROUND_COUNT, REASONING_ROUNDS, TEXT_ROUNDS, TOOL_ROUNDS } from "./mock-stream-corpus";
+import { mockToolChunkFrame } from "./mock-stream-frames";
 import {
 	buildMockScript,
 	chunkText,
@@ -96,6 +97,17 @@ describe("chunkText", () => {
 });
 
 describe("frame shapes", () => {
+	it("preserves an absent field-start marker rather than inventing a first chunk", () => {
+		const frame = mockToolChunkFrame({
+			narratorId: "narr_test",
+			toolUseId: "tu_legacy",
+			toolName: "Edit",
+			inputCharsTotal: 12,
+			streamingField: { name: "old_string", delta: "tail" },
+		});
+		expect(frame.streamingField).toEqual({ name: "old_string", delta: "tail" });
+	});
+
 	it("puts outputIndex on the EVENT for text deltas", () => {
 		const steps = buildMockScript(
 			scenario({ reasoning: false, tools: false, rounds: 1, charsPerFrame: 100_000 }),
@@ -346,7 +358,12 @@ describe("tool lifecycle", () => {
 				const next = chunk.frame.inputCharsTotal as number;
 				expect(next).toBeGreaterThan(total);
 				total = next;
-				const field = chunk.frame.streamingField as { name: string; delta: string };
+				const field = chunk.frame.streamingField as {
+					name: string;
+					delta: string;
+					startsField?: boolean;
+				};
+				expect(field.startsField).toBe(!perField.has(field.name));
 				perField.set(field.name, (perField.get(field.name) ?? "") + field.delta);
 			}
 			// Each streamed field reassembles to the resolved input's value.

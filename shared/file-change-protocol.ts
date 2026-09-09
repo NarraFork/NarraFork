@@ -213,6 +213,26 @@ export type FileChangeRevertSelector =
 	| { kind: "tool_calls"; toolCallIds: string[] }
 	| { kind: "after_block"; messageId: string; keepThroughBlockIndex: number };
 
+export type FileChangeRevertAction = "revert_files" | "rollback_to_block" | "delete_tool_block";
+
+/** Bind a UI consent action to its immutable journal program, not an apply-time selector. */
+export function fileChangeRevertActionMatches(
+	action: FileChangeRevertAction,
+	kind: string,
+	selector: FileChangeRevertSelector,
+): boolean {
+	if (action === "revert_files")
+		return kind === "revert" && (selector.kind === "all" || selector.kind === "from_seq");
+	if (action === "rollback_to_block")
+		return kind === "rollback_to_block" && selector.kind === "after_block";
+	return (
+		action === "delete_tool_block" &&
+		kind === "history_delete" &&
+		selector.kind === "tool_calls" &&
+		selector.toolCallIds.length === 1
+	);
+}
+
 /** An advisory about missing attribution evidence, not a claim that any files were reverted. */
 export interface FileChangeEvidenceUncertaintyWarning {
 	code: "WORKSPACE_SCOPE_EVIDENCE_UNCERTAIN";

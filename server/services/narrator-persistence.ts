@@ -796,6 +796,8 @@ export async function recoverStaleCompactingMessages(
  * pass it when the recipient is a subagent whose page drops the filter.
  */
 export interface MessagePlacementOptions {
+	/** Reserved by the exact agent delivery; never supplied by public input. */
+	messageId?: string;
 	/**
 	 * The `tool_use` id that owns this row — the Agent/Task call that spawned the
 	 * recipient subagent. Null/omitted writes a top-level row.
@@ -838,7 +840,7 @@ export const narratorPersistence = {
 		const parentToolUseId = placement?.parentToolUseId ?? null;
 		const msgWithSeq = await withDbRetry(
 			async () => {
-				const id = generateId();
+				const id = placement?.messageId ?? generateId();
 				const now = new Date().toISOString();
 				return db.transaction((tx) => {
 					const created = tx
@@ -871,7 +873,20 @@ export const narratorPersistence = {
 		// messageVersion. Without this the parent's incremental sync reports "nothing
 		// changed" and its open panel keeps the stale card. No-op when there is no
 		// parentToolUseId, which is the whole primary-narrator path.
-		await bumpParentNarratorMessageVersion(parentToolUseId);
+		// Commit is the retry boundary for ALL inputs, not just reserved agent deliveries.
+		// A human edit clears the delivery ID; requeueing on a post-commit error would
+		// then insert the same input again under a new ID.
+		await bumpParentNarratorMessageVersion(parentToolUseId).catch((error) => {
+			logger.warn("Committed user message parent-version notification failed", {
+				narratorId,
+				messageId: msgWithSeq.id,
+				error: String(error),
+			});
+		});
+		// This audit user is intentionally not rendered for agent-authored inputs.
+		if (placement?.messageId && origin?.origin === "assistant") {
+			return { ...msgWithSeq, creator: null };
+		}
 
 		// NOTE: the creator row is returned whenever `createdBy` names an account, even
 		// for a non-human `origin`. That is DELIBERATELY left as it was: the subagent
@@ -881,11 +896,21 @@ export const narratorPersistence = {
 		// its configurer's `createdBy` with `origin: "system"`). Widening it is a
 		// behaviour decision about the primary path, not part of opening this seam.
 		if (createdBy) {
-			const user = await db.query.users.findFirst({
-				where: eq(users.id, createdBy),
-				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-			});
-			return { ...msgWithSeq, creator: user ?? null };
+			try {
+				const user = await db.query.users.findFirst({
+					where: eq(users.id, createdBy),
+					columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+				});
+				return { ...msgWithSeq, creator: user ?? null };
+			} catch (error) {
+				// Display enrichment cannot turn a committed input into a failed write.
+				// Keep createdBy on the row so later history reads can recover the creator.
+				logger.warn("Committed user message creator lookup failed", {
+					narratorId,
+					messageId: msgWithSeq.id,
+					error: String(error),
+				});
+			}
 		}
 		return { ...msgWithSeq, creator: null };
 	},
@@ -911,7 +936,7 @@ export const narratorPersistence = {
 		const msg = await withDbRetry(
 			async () =>
 				db.transaction((tx) => {
-					const id = generateId();
+					const id = placement?.messageId ?? generateId();
 					const now = new Date().toISOString();
 					const blocks: unknown[] = [{ type: "text", text }, ...(contentBlocks ?? [])];
 					const created = tx
@@ -937,7 +962,17 @@ export const narratorPersistence = {
 				}),
 			{ label: "persistSystemMessage", maxRetries: 5 },
 		);
-		await bumpParentNarratorMessageVersion(parentToolUseId);
+		if (placement?.messageId) {
+			await bumpParentNarratorMessageVersion(parentToolUseId).catch((error) => {
+				logger.warn("Committed injection parent-version notification failed", {
+					narratorId,
+					messageId: msg.id,
+					error: String(error),
+				});
+			});
+		} else {
+			await bumpParentNarratorMessageVersion(parentToolUseId);
+		}
 		return msg;
 	},
 

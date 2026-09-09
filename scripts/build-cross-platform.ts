@@ -358,6 +358,8 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 			// `worker-entry.js` (note the rewritten extension), which is what pool.ts resolves at
 			// runtime when it detects the compiled runtime.
 			"./server/lib/db-worker/worker-entry.ts",
+			// Large editor IO/encoding runs off-thread in source and compiled builds alike.
+			"./server/services/editor-document-worker.ts",
 			"--compile",
 			"--minify",
 			"--target",

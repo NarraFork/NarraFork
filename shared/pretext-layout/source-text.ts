@@ -10,6 +10,8 @@ export interface SourceTextRange {
 	endColumn: number;
 	originKnown: boolean;
 	complete: boolean;
+	/** The end is still being generated, not an omitted suffix of a finished source. */
+	streaming?: boolean;
 	/** A terminal CR already counted as LF; a following LF must not count twice. */
 	endsWithCR?: boolean;
 	/** At most one verified old-coordinate translation, never a version history. */
@@ -91,7 +93,13 @@ export function trimSourceText(source: SourceTextSnapshot, limit: number): Sourc
 
 export function createSourceText(
 	text: string,
-	options: { epoch: string; originKnown?: boolean; complete?: boolean; limit?: number },
+	options: {
+		epoch: string;
+		originKnown?: boolean;
+		complete?: boolean;
+		streaming?: boolean;
+		limit?: number;
+	},
 ): SourceTextSnapshot {
 	const end = advance(text, { offset: 0, line: 0, column: 0 });
 	const source: SourceTextSnapshot = {
@@ -106,6 +114,7 @@ export function createSourceText(
 			endColumn: end.column,
 			originKnown: options.originKnown ?? true,
 			complete: options.complete ?? false,
+			...(options.streaming ? { streaming: true } : {}),
 			endsWithCR: text.endsWith("\r"),
 		},
 	};
@@ -137,6 +146,7 @@ export function appendSourceText(
 				endColumn: end.column,
 				endsWithCR: delta.endsWith("\r"),
 				complete: false,
+				streaming: true,
 			},
 		},
 		limit,

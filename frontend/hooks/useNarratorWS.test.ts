@@ -355,8 +355,11 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		let oldListener: ListenerCallback | undefined;
 		const oldWrites: string[] = [];
 		const newWrites: string[] = [];
+		const receipts: unknown[] = [];
 		function Harness(): ReactNode {
 			useNarratorWS(narratorId, {
+				onSendDeliveryResolved: (toolUseId, targets, parentToolUseId, toolCallBinding) =>
+					receipts.push({ toolUseId, targets, parentToolUseId, toolCallBinding }),
 				onTitleUpdated:
 					narratorId === "n1" ? (title) => oldWrites.push(title) : (title) => newWrites.push(title),
 			});
@@ -395,6 +398,25 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			expect(newListener).toBeFunction();
 			newListener?.({ type: "title_updated", narratorId: "n2", title: "fresh-new-frame" });
 			expect(newWrites).toEqual(["fresh-new-frame"]);
+			const targets = [{ id: "child", deliveryMessageId: "reserved" }];
+			const toolCallBinding = { toolCallId: "row", attempt: 2 };
+			newListener?.({
+				type: "send_delivery_resolved",
+				narratorId: "n2",
+				toolUseId: "send-tool",
+				targets,
+				toolCallBinding,
+			});
+			expect(receipts).toEqual([
+				{ toolUseId: "send-tool", targets, parentToolUseId: undefined, toolCallBinding },
+			]);
+			oldListener?.({
+				type: "send_delivery_resolved",
+				narratorId: "n1",
+				toolUseId: "stale-send",
+				targets,
+			});
+			expect(receipts).toHaveLength(1);
 		} finally {
 			root.unmount();
 			await settle();

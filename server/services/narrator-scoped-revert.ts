@@ -11,7 +11,6 @@ import { and, asc, eq, gte, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorToolCalls } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
-import { isWorkspaceBeingWritten } from "./narrator-session-state";
 import {
 	EMPTY_RESULT,
 	type RevertResult,
@@ -44,6 +43,9 @@ export type ScopedRevertUnavailableReason =
 	| "git_unsupported"
 	| "window_too_large"
 	| "legacy_unverified"
+	/** A recorded operation is not yet connected to execution through this adapter. */
+	| "execution_unavailable"
+	| "runtime_reload_required"
 	| "incomplete_coverage"
 	| "unsupported_target"
 	| "pending_operations"
@@ -109,9 +111,9 @@ async function selectPairs(
 		return { pairs: [], unavailable: "window_too_large" };
 
 	const input = sql`CASE
-		WHEN length(CAST(${narratorToolCalls.inputJson} AS BLOB)) <= ${MAX_INPUT_METADATA_BYTES}
-			AND json_valid(${narratorToolCalls.inputJson})
-		THEN ${narratorToolCalls.inputJson} ELSE '{}' END`;
+		WHEN octet_length(${narratorToolCalls.inputJson}) <= ${MAX_INPUT_METADATA_BYTES}
+		THEN CASE WHEN json_valid(${narratorToolCalls.inputJson}) THEN ${narratorToolCalls.inputJson} ELSE '{}' END
+		ELSE '{}' END`;
 	const rows = await db
 		.select({
 			toolUseId: narratorToolCalls.toolUseId,
@@ -120,6 +122,7 @@ async function selectPairs(
 			toolName: narratorToolCalls.toolName,
 			status: narratorToolCalls.status,
 			isBackground: narratorToolCalls.isBackground,
+			fileChangeOperationId: narratorToolCalls.fileChangeOperationId,
 			before: narratorToolCalls.treeHashBefore,
 			after: narratorToolCalls.treeHashAfter,
 			executionDeviceId: narratorToolCalls.executionDeviceId,
@@ -183,8 +186,6 @@ async function selectPairs(
 		)
 			continue;
 
-		if (row.status === "initializing" || row.status === "pending" || row.status === "running")
-			reasons.add("pending_operations");
 		if (
 			(row.executionDeviceId && row.executionDeviceId !== LOCAL_DEVICE_ID) ||
 			(typeof row.inputDevice === "string" && row.inputDevice !== LOCAL_DEVICE_ID) ||
@@ -197,19 +198,21 @@ async function selectPairs(
 		) {
 			reasons.add("unsupported_target");
 		}
+		// Non-terminal rows can survive a stopped/failed loop. They prove missing
+		// completion evidence, not live IO that waiting will necessarily resolve.
 		if (
 			row.status !== "success" ||
 			row.isBackground ||
 			row.inputBackground ||
-			!row.before ||
-			!row.after
+			(!row.fileChangeOperationId && (!row.before || !row.after))
 		) {
 			reasons.add("incomplete_coverage");
 		}
 		if (!worktreePath) reasons.add("no_workspace");
-		// Existing v1 rows have no actual operation-content evidence or capture
-		// receipt. This also covers before===after, unknown targets and ignored paths.
-		reasons.add("legacy_unverified");
+		// This adapter does not validate or execute operation journals. A pointer
+		// identifies the unconnected execution path, NOT settled/complete evidence.
+		// Legacy rows still lack receipts even when before===after or paths look known.
+		reasons.add(row.fileChangeOperationId ? "execution_unavailable" : "legacy_unverified");
 		if (row.before && row.after)
 			pairs.push({
 				toolUseId: row.toolUseId,
@@ -220,15 +223,15 @@ async function selectPairs(
 				ownedPaths: null,
 			});
 	}
-	if (reasons.size > 0 && worktreePath && isWorkspaceBeingWritten(worktreePath))
-		reasons.add("pending_operations");
-	// A complete-looking pair must never mask a later unknown operation.
+	// A loop sharing this cwd may only be thinking/reading; even a real writer
+	// cannot make these unavailable execution paths work just by finishing.
+	// Preserve the actual blocker, and never hide unknown coverage behind a pointer.
 	for (const reason of [
-		"pending_operations",
 		"unsupported_target",
 		"incomplete_coverage",
 		"no_workspace",
 		"legacy_unverified",
+		"execution_unavailable",
 	] as const) {
 		if (reasons.has(reason)) return { pairs, unavailable: reason };
 	}

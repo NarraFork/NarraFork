@@ -14,6 +14,14 @@
  * injection card. The text prefix stays (the model needs it), but the UI must stop
  * inferring authorship from it.
  *
+ * ## Legacy registry (not used by runtime delivery anymore)
+ *
+ * Runtime callers now carry `AgentMessageDelivery` explicitly through queue/resume
+ * and persistence. The functions below remain only for compatibility tests; they
+ * must never be consulted to associate messages or attribute human input.
+ *
+ * Historical rationale follows (superseded by the explicit envelope):
+ *
  * ## Why a registry rather than a parameter
  *
  * The delivered text reaches `persistSubagentUserMessage` through three different

@@ -15,7 +15,6 @@ import type { AsyncQuestion } from "@frontend/types/narrator";
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
 import {
 	ActionIcon,
-	Alert,
 	Anchor,
 	Avatar,
 	Badge,
@@ -127,7 +126,6 @@ import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
 	useBlacklistDirs,
-	useBlockDeletePreview,
 	useCmdBlacklist,
 	useCmdWhitelist,
 	useCreateBlacklistDir,
@@ -145,7 +143,7 @@ import {
 	useInterruptNarrator,
 	useNarrator,
 	usePromoteNarrator,
-	useRollbackPreview,
+	useRevertHistoryAction,
 	useStartAskInPassing,
 	useStopTakeoverSubagent,
 	useTakeoverSubagent,
@@ -182,7 +180,7 @@ import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { ApiError, api, type BufferMessageSummary, isAbortError } from "../../lib/api";
-import type { RevertScope } from "../../lib/api/narrators";
+import type { RevertActionConfirmOptions, RevertScope } from "../../lib/api/narrators";
 import type { PathFlavor } from "../../lib/api/types";
 import {
 	AGG_MODEL_PREFIX,
@@ -201,7 +199,7 @@ import {
 import { formatLocaleNumber } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
-import { formatRevertWarning, formatRevertWarnings } from "../../lib/revert-warnings";
+import { formatRevertWarnings } from "../../lib/revert-warnings";
 import {
 	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
 	SAFE_AREA_DRAWER_BODY_STYLE,
@@ -320,7 +318,7 @@ import { nextHighlightRequestId } from "./panels/panel-kind";
 import { compactProgressLabel } from "./progress-label";
 import { QueuedAttachmentPreview, QueuedMessageRow } from "./QueuedMessageRow";
 import { type RenderLod, RenderLodCtx } from "./RenderLodCtx";
-import { RevertScopeConfirmModal } from "./RevertScopeConfirmModal";
+import { RevertActionConfirmModal } from "./RevertScopeConfirmModal";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./selection-anchor-overlay";
 import { revealSpecFile } from "./spec-file-reveal";
@@ -1625,207 +1623,6 @@ function ReasoningEffortMenuItems({
 	);
 }
 
-/**
- * Confirmation modal for rollback-to-block.
- *
- * Owns only the preview query and this action's wording; the scope choice, the file
- * list and the three exits live in RevertScopeConfirmModal, shared with
- * edit-and-regenerate so both present the same decision.
- */
-function RollbackConfirmModal({
-	narratorId,
-	pendingRollback,
-	onConfirm,
-	onCancel,
-}: {
-	narratorId: string;
-	pendingRollback: { messageId: string; blockIndex: number } | null;
-	onConfirm: (opts: { skipRevert: boolean; scope?: RevertScope }) => void;
-	onCancel: () => void;
-}) {
-	const { t } = useTranslation("narrator");
-	const { data, isLoading } = useRollbackPreview(
-		narratorId,
-		pendingRollback?.messageId ?? null,
-		pendingRollback?.blockIndex ?? null,
-		!!pendingRollback,
-	);
-
-	const blockCount = data?.deletedBlockCount ?? 0;
-	const messageCount = data?.deletedMessageCount ?? 0;
-
-	let description: string;
-	if (blockCount > 0 && messageCount > 0) {
-		description = t("rollbackConfirmDesc", { blockCount, messageCount });
-	} else if (blockCount > 0) {
-		description = t("rollbackConfirmDescBlocksOnly", { blockCount });
-	} else {
-		description = t("rollbackConfirmDescMessagesOnly", { messageCount });
-	}
-
-	return (
-		<RevertScopeConfirmModal
-			opened={!!pendingRollback}
-			title={t("rollbackConfirmTitle")}
-			description={description}
-			data={data}
-			isLoading={isLoading}
-			confirmWithRevertLabel={t("rollbackConfirmWithRevert")}
-			confirmNoFilesLabel={t("rollbackConfirm")}
-			messagesOnlyLabel={t("rollbackConfirmMessagesOnly")}
-			onConfirm={onConfirm}
-			onCancel={onCancel}
-		/>
-	);
-}
-
-/**
- * Confirmation modal for deleting a single tool_use block.
- *
- * Deleting a block rolls back exactly the files that one call changed, which now
- * includes changes no tool input describes (Bash, build scripts, editors). That
- * makes it a destructive action worth confirming: previously it fired straight from
- * the context menu with no indication of what would be undone.
- *
- * There is no scope picker here — a block IS one recorded call, so the narrow scope
- * is the only meaningful one. A conflict means another actor changed the same
- * regions, so the file rollback is refused and only history-only deletion is left.
- */
-function BlockDeleteConfirmModal({
-	narratorId,
-	pending,
-	onConfirm,
-	onCancel,
-}: {
-	narratorId: string;
-	pending: { messageId: string; blockIndex: number } | null;
-	onConfirm: (opts: { skipRevert: boolean }) => void;
-	onCancel: () => void;
-}) {
-	const { t } = useTranslation("narrator");
-	const { t: tc } = useTranslation("common");
-	const { data, isLoading, isError } = useBlockDeletePreview(
-		narratorId,
-		pending?.messageId ?? null,
-		pending?.blockIndex ?? null,
-		!!pending,
-	);
-
-	const files = data?.files ?? [];
-	const conflicts = data?.conflicts ?? [];
-	// A failed preview must not read as "nothing would change": both lists are empty
-	// in that case, which would otherwise render as a reassuring "no files affected"
-	// next to an enabled rollback button.
-	const previewFailed = !isLoading && (isError || !data);
-	// A conflict is the one case where the file rollback cannot run at all.
-	const revertBlocked = conflicts.length > 0 || previewFailed;
-	const subagentWarningText = data?.subagentWarning
-		? formatRevertWarning(t, {
-				code: "SUBAGENT_CHANGES_REVERTED",
-				changeCount: data.subagentWarning.changeCount,
-				sampleFilePaths: data.subagentWarning.sampleFiles,
-			})
-		: null;
-
-	return (
-		<Modal
-			opened={!!pending}
-			onClose={onCancel}
-			title={t("blockDeleteConfirmTitle")}
-			centered
-			size="md"
-		>
-			<Stack gap="md">
-				{isLoading ? (
-					<Center py="md">
-						<Loader size="sm" />
-					</Center>
-				) : (
-					<>
-						<Text size="sm">{t("blockDeleteConfirmDesc")}</Text>
-
-						{previewFailed && (
-							<Alert color="red" variant="light" title={t("blockDeletePreviewFailedTitle")}>
-								<Text size="xs">{t("blockDeletePreviewFailedDesc")}</Text>
-							</Alert>
-						)}
-
-						{conflicts.length > 0 && (
-							<Alert color="red" variant="light" title={t("revertScopeConflictTitle")}>
-								<Text size="xs">
-									{t("revertScopeConflictDesc", { files: conflicts.slice(0, 5).join(", ") })}
-								</Text>
-							</Alert>
-						)}
-
-						{subagentWarningText && (
-							<Alert color="yellow" variant="light" title={t("revertScopeSubagentTitle")}>
-								<Text size="xs">{subagentWarningText}</Text>
-							</Alert>
-						)}
-
-						{files.length > 0 ? (
-							<>
-								<Text size="sm" fw={500}>
-									{t("rollbackConfirmFiles")}
-								</Text>
-								<Stack gap={4} mah={260} style={{ overflowY: "auto" }}>
-									{files.map((file) => (
-										<Group key={file.filePath} gap="xs" wrap="nowrap">
-											<TruncatedPath path={file.filePath} />
-											<Badge
-												size="xs"
-												variant="light"
-												color={file.willBeDeleted ? "red" : "orange"}
-											>
-												{file.willBeDeleted
-													? t("fileMod_willBeDeleted")
-													: t("fileMod_willBeReverted")}
-											</Badge>
-										</Group>
-									))}
-								</Stack>
-							</>
-						) : (
-							!previewFailed && (
-								<Text size="sm" c="dimmed">
-									{conflicts.length > 0
-										? t("revertScopeBlocked")
-										: data?.reason === "nothing_owned"
-											? t("revertScopeNothingOwned")
-											: t("blockDeleteConfirmNoFiles")}
-								</Text>
-							)
-						)}
-					</>
-				)}
-				<Group gap="xs" justify="flex-end">
-					<Button size="xs" variant="subtle" onClick={onCancel}>
-						{tc("cancel")}
-					</Button>
-					<Button
-						size="xs"
-						variant="default"
-						onClick={() => onConfirm({ skipRevert: true })}
-						loading={isLoading}
-					>
-						{t("blockDeleteHistoryOnly")}
-					</Button>
-					<Button
-						size="xs"
-						color="red"
-						disabled={revertBlocked}
-						onClick={() => onConfirm({ skipRevert: false })}
-						loading={isLoading}
-					>
-						{files.length > 0 ? t("blockDeleteWithRevert") : t("contextMenu_delete")}
-					</Button>
-				</Group>
-			</Stack>
-		</Modal>
-	);
-}
-
 function TurnElapsedTime({
 	text,
 	startedAtLabel,
@@ -2611,6 +2408,9 @@ export function NarratorPanel({
 
 	// --- Message operations ---
 	const setUnreadCountRef = useRef<React.Dispatch<React.SetStateAction<number>>>(undefined);
+	const revertHistoryAction = useRevertHistoryAction(narratorId);
+	const { mutateAsync: applyHistoryAction, isPending: revertHistorySubmitting } =
+		revertHistoryAction;
 	// Deleting a block rolls its file changes back, so it asks first rather than
 	// firing straight from the context menu.
 	const [pendingBlockDelete, setPendingBlockDelete] = useState<{
@@ -2618,33 +2418,27 @@ export function NarratorPanel({
 		blockIndex: number;
 	} | null>(null);
 
-	const handleDeleteBlock = useCallback((messageId: string, blockIndex: number) => {
-		setPendingBlockDelete({ messageId, blockIndex });
-	}, []);
+	const handleDeleteBlock = useCallback(
+		(messageId: string, blockIndex: number) => {
+			if (!revertHistorySubmitting) setPendingBlockDelete({ messageId, blockIndex });
+		},
+		[revertHistorySubmitting],
+	);
 
 	const confirmBlockDelete = useCallback(
-		async ({ skipRevert }: { skipRevert: boolean }) => {
-			if (!pendingBlockDelete) return;
-			const { messageId, blockIndex } = pendingBlockDelete;
-			setPendingBlockDelete(null);
+		async (opts: RevertActionConfirmOptions) => {
+			if (!pendingBlockDelete || revertHistorySubmitting) return;
 			try {
-				await api.deleteMessageBlock(narratorId, messageId, blockIndex, { skipRevert });
+				await applyHistoryAction({ action: "delete_tool_block", target: pendingBlockDelete, opts });
+				setPendingBlockDelete(null);
+			} catch {
+				// The mutation explains the journal outcome. Keep the revoked preview open
+				// for an explicit reload or a history-only choice; never retry automatically.
+			} finally {
 				chunkListRef.current?.refreshStructure("full");
-			} catch (error) {
-				// A rollback refusal (another actor changed the same regions) is not a
-				// generic failure: the server explains what happened and the user still has
-				// a way forward. Surfacing "please retry" instead would send them into a
-				// loop that cannot succeed.
-				const isConflict = error instanceof ApiError && error.status === 409;
-				notifications.show({
-					title: isConflict ? t("blockDeleteConflictTitle") : t("deleteMessageFailed"),
-					message: isConflict ? t("blockDeleteConflictDesc") : t("deleteMessageFailedDesc"),
-					color: isConflict ? "yellow" : "red",
-					autoClose: isConflict ? 10000 : 5000,
-				});
 			}
 		},
-		[narratorId, pendingBlockDelete, t],
+		[applyHistoryAction, pendingBlockDelete, revertHistorySubmitting],
 	);
 
 	const [pendingRollback, setPendingRollback] = useState<{
@@ -2662,14 +2456,19 @@ export function NarratorPanel({
 				});
 				return;
 			}
-			setPendingRollback({ messageId, blockIndex });
+			if (!revertHistorySubmitting) setPendingRollback({ messageId, blockIndex });
 		},
-		[rollbackEditRegenerateSupported, rollbackEditRegenerateUnsupportedReason, t],
+		[
+			rollbackEditRegenerateSupported,
+			rollbackEditRegenerateUnsupportedReason,
+			revertHistorySubmitting,
+			t,
+		],
 	);
 
 	const confirmRollback = useCallback(
-		async ({ skipRevert, scope }: { skipRevert: boolean; scope?: RevertScope }) => {
-			if (!pendingRollback) return;
+		async (opts: RevertActionConfirmOptions) => {
+			if (!pendingRollback || revertHistorySubmitting) return;
 			if (!rollbackEditRegenerateSupported) {
 				notifications.show({
 					title: t("rollbackEditRegenerateUnsupportedTitle"),
@@ -2680,32 +2479,18 @@ export function NarratorPanel({
 				return;
 			}
 			try {
-				const result = await api.rollbackToBlock(
-					narratorId,
-					pendingRollback.messageId,
-					pendingRollback.blockIndex,
-					{ skipRevert, ...(scope ? { scope } : {}) },
-				);
-				// A rollback can reach beyond the chosen scope (subagent writes, a
-				// workspace restore); surface that so the result is verified, not assumed.
-				const warningText = formatRevertWarnings(t, result.warnings);
-				if (warningText) {
-					notifications.show({
-						title: t("rollbackPartialTitle"),
-						message: warningText,
-						color: "yellow",
-						autoClose: false,
-					});
-				}
-			} catch (err) {
-				const message = err instanceof Error ? err.message : "Failed to rollback";
-				notifications.show({ title: t("rollbackFailed"), message, color: "red" });
+				await applyHistoryAction({ action: "rollback_to_block", target: pendingRollback, opts });
+				setPendingRollback(null);
+			} catch {
+				// No second history mutation, and no re-plan/retry after an uncertain apply.
+			} finally {
+				chunkListRef.current?.refreshStructure("full");
 			}
-			setPendingRollback(null);
 		},
 		[
-			narratorId,
+			applyHistoryAction,
 			pendingRollback,
+			revertHistorySubmitting,
 			rollbackEditRegenerateSupported,
 			rollbackEditRegenerateUnsupportedReason,
 			t,
@@ -9524,17 +9309,25 @@ export function NarratorPanel({
 					)}
 				</Stack>
 			</ContentViewerEnvironmentProvider>
-			<RollbackConfirmModal
+			<RevertActionConfirmModal
 				narratorId={narratorId}
-				pendingRollback={pendingRollback}
+				action="rollback_to_block"
+				pending={pendingRollback}
+				submitting={revertHistorySubmitting}
 				onConfirm={confirmRollback}
-				onCancel={() => setPendingRollback(null)}
+				onCancel={() => {
+					if (!revertHistorySubmitting) setPendingRollback(null);
+				}}
 			/>
-			<BlockDeleteConfirmModal
+			<RevertActionConfirmModal
 				narratorId={narratorId}
+				action="delete_tool_block"
 				pending={pendingBlockDelete}
+				submitting={revertHistorySubmitting}
 				onConfirm={confirmBlockDelete}
-				onCancel={() => setPendingBlockDelete(null)}
+				onCancel={() => {
+					if (!revertHistorySubmitting) setPendingBlockDelete(null);
+				}}
 			/>
 			<ModelPriceModal
 				model={priceModel}

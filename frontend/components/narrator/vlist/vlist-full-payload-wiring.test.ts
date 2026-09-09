@@ -45,7 +45,9 @@ describe("full-payload request wiring (inline auto-load + fullscreen)", () => {
 		expect(communication).toContain("toolDetailRequestFromData(source.toolUseId, source)");
 		expect(SHELL).toContain('key: "input.message", label: "message", body: data.messageBody');
 		expect(SHELL).toContain("extra.onViewFull = () => viewControls.openFullscreen(target)");
-		expect(SHELL).toContain("extra.onOpenRecipient = injectionNavigation?.onOpenNarrator");
+		expect(SHELL).toContain("const open = injectionNavigation?.onOpenNarrator");
+		expect(/openCommunicationRecipient\(\s*\{ id, deliveryMessageId \}/.test(SHELL)).toBe(true);
+		expect(SHELL).toContain("locate: narratorsApi.getMessageLocation");
 		expect(SHELL).toContain('kind !== "communication-bubble" && !cardHostsOwnBars');
 	});
 	it("wires inspector refs from card/trace data independently of selection aliases", () => {

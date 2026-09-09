@@ -107,15 +107,15 @@ export interface SideCarInboundMessage {
 	 * Where this message sits in the SENDER's own session — the navigation target
 	 * when the reader opens that session from this row.
 	 *
-	 * Recorded at send time as the sender's latest message, because a `Send` is not
-	 * itself a message in the sender's history: the closest thing to "where the
-	 * sender was when it said this" is what it had just written. Absent when the
-	 * sender had written nothing yet, or for senders that are not narrators —
-	 * absence means "open at the tail", never "jump somewhere arbitrary".
+	 * Legacy senders recorded their latest text message, which can precede the
+	 * actual Send call. Prefer `fromToolUseId` when present. If neither exists,
+	 * open the session at its tail.
 	 *
 	 * NOT model-facing: the projections ignore it.
 	 */
 	fromMessageId?: string | null;
+	/** Exact sending tool call in the sender's session. Reader-only, never model-facing. */
+	fromToolUseId?: string;
 	/** Team channel only: the message went to everyone. */
 	isBroadcast?: boolean;
 	text: string;

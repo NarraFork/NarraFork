@@ -58,14 +58,16 @@ function marker(node: ReactNode, key: string): ReactElement<Record<string, unkno
 }
 
 describe("outgoing communication bubble", () => {
-	test("renders recipient chips above expanded markdown with neutral left-aligned frame", () => {
+	test("renders recipient chips above expanded markdown with a tinted left-aligned frame", () => {
 		const document = render({ onOpenRecipient: () => {} });
 		const row = document.querySelector("[data-vlist-communication-row]");
 		const frame = document.querySelector("[data-vlist-communication-frame]");
 		const measured = measureCommunicationBubble(data, 800);
 		expect(row?.getAttribute("style")).toContain("justify-content:flex-start");
 		expect(frame?.getAttribute("style")).toContain("border-radius:8px");
-		expect(frame?.getAttribute("style")).toContain("var(--mantine-color-dark-6)");
+		expect(frame?.getAttribute("style")).toContain(
+			"background:light-dark(var(--mantine-color-indigo-0), color-mix(in srgb, var(--mantine-color-indigo-8) 30%, var(--mantine-color-dark-6)))",
+		);
 		expect(frame?.getAttribute("style")).toContain(`height:${measured.height}px`);
 		expect(document.querySelectorAll("[data-vlist-communication-recipient]").length).toBe(2);
 		expect(document.querySelector("[data-vlist-communication-header]")?.textContent).toContain(
@@ -88,12 +90,15 @@ describe("outgoing communication bubble", () => {
 	});
 
 	test("recipient click opens its target without taking over the context menu", () => {
-		const opened: string[] = [];
+		const opened: unknown[] = [];
 		let stopped = false;
 		const node = RenderCommunicationBubble({
 			measured: measureCommunicationBubble(data, 800),
-			data,
-			onOpenRecipient: (id) => opened.push(id),
+			data: {
+				...data,
+				recipients: [{ id: "r1", label: "Reviewer", deliveryMessageId: "receipt-1" }],
+			},
+			onOpenRecipient: (...args) => opened.push(args),
 		});
 		const chip = marker(node, "data-vlist-communication-recipient");
 		expect(chip?.props["data-vlist-communication-recipient"]).toBe("r1");
@@ -102,7 +107,7 @@ describe("outgoing communication bubble", () => {
 				stopped = true;
 			},
 		});
-		expect(opened).toEqual(["r1"]);
+		expect(opened).toEqual([["r1", "receipt-1"]]);
 		expect(stopped).toBe(true);
 		expect(chip?.props.onContextMenu).toBeUndefined();
 	});

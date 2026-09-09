@@ -1,11 +1,10 @@
 /**
  * measure-subagent.ts — Height model for the SubagentCard (batch-2 P12).
  *
- * Visual parity target: SubagentCard.tsx. This is the ONLY list element that
- * reads the render LOD directly (mirroring ToolCallCard's layering), so — like
- * measure-reasoning — the height model MUST take (data, contentWidth, lod, opts)
- * and resolve `effectiveExpanded` deterministically. The card has three always-
- * visible regions plus a LazyCollapse expansion body:
+ * L1 defaults to folded; L2–L5 follow the reader's preference, not recency. The height
+ * model takes (data, contentWidth, lod, opts) and resolves `effectiveExpanded`
+ * deterministically; nested permissions still receive the current LOD. The card
+ * has always-visible regions plus a collapsible expansion body:
  *
  *   ┌ Header  (Box p="xs" = 10 padding, ALWAYS shown) ───────────────────────────┐
  *   │  badge row  ThemeIcon16 + Badge×N(xs 16) + status12 + timing + chevron12    │
@@ -556,7 +555,7 @@ function measureWrappedText(text: string, innerWidth: number, className: string)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// effectiveExpanded — the LOD/expand main switch (mirrors SubagentCard.tsx).
+// effectiveExpanded — reader preference with active/permission exemptions.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface SubagentExpandInput {
@@ -569,27 +568,18 @@ export interface SubagentExpandInput {
 	/**
 	 * The reader EXPLICITLY folded this card (a stored preference), as opposed to
 	 * `opened === false` merely being the derived default. Only the former may
-	 * collapse a card at L5 — see the note in `resolveSubagentExpanded`.
+	 * collapse a card at any LOD — see `resolveSubagentExpanded`.
 	 */
 	userCollapsed?: boolean;
 }
 
-/**
- * Decide whether the card body is shown. Pure + deterministic — this is the
- * height/shape main switch and must match SubagentCard.tsx:289-317 exactly.
- */
+/** Decide whether the card body is shown; shared by measurement and rendering. */
 export function resolveSubagentExpanded(lod: RenderLod, input: SubagentExpandInput): boolean {
 	const lodExempt = input.isActive || input.hasSelfPermission || input.pendingPermissionCount > 0;
 	if (lodExempt || input.lodUserOverride) return true;
-	// Same contract as the tool card's `resolveToolCallOpened`: L5 keeps an
-	// UNTOUCHED card expanded, but an explicit fold is honoured. A bare `true` made
-	// this card's header chevron dead at L5 too — the shell writes the click into
-	// the `expanded` map, which this branch never read.
-	if (lod >= 5) return !input.userCollapsed;
-	if (lod === 4) return input.isRecent ? input.opened : false;
-	if (lod === 3) return false;
-	// L1/L2 follow the upstream gate / user-opened state.
-	return input.opened;
+	if (lod === 1) return false;
+	// L2–L5 stay expanded regardless of recency, unless the reader folds the card.
+	return !input.userCollapsed;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -600,7 +590,7 @@ export function resolveSubagentExpanded(lod: RenderLod, input: SubagentExpandInp
  * Measure a SubagentCard at a content width + LOD. Deterministic, zero DOM.
  * @param data         subagent card data (badges/description/prompt/result/…)
  * @param contentWidth available OUTER card width in px
- * @param lod          render LOD (1..6) — selects effectiveExpanded
+ * @param lod          render LOD (1..5) — passed to nested permission cards
  * @param opts         layering inputs (isRecent/opened/isActive/permissions/inRun)
  */
 export function measureSubagentCard(
@@ -627,7 +617,7 @@ export function measureSubagentCard(
 		lodUserOverride: opts.lodUserOverride,
 		// Distinct from `opened === false`, which is also the DEFAULT here (`?? false`)
 		// and therefore says nothing about the reader's intent. Only a stored
-		// preference may fold an L5 card.
+		// preference may fold a card, at any LOD.
 		userCollapsed: opts.opened === false,
 	});
 

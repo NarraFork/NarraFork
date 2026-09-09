@@ -16,7 +16,7 @@ export interface RenderCommunicationBubbleProps {
 	>;
 	/** Interactive recipient chips supplied by the host, with its route/context-menu behavior. */
 	header?: ReactNode;
-	onOpenRecipient?: (id: string) => void;
+	onOpenRecipient?: (id: string, deliveryMessageId?: string) => void;
 	onViewFull?: () => void;
 }
 
@@ -74,7 +74,9 @@ export function RenderCommunicationBubble({
 					height: measured.height,
 					padding: INJECTION_BUBBLE_PADDING,
 					borderRadius: 8,
-					background: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
+					// Outgoing messages are tinted; incoming injections keep their neutral frame.
+					background:
+						"light-dark(var(--mantine-color-indigo-0), color-mix(in srgb, var(--mantine-color-indigo-8) 30%, var(--mantine-color-dark-6)))",
 					boxSizing: "border-box",
 				}}
 			>
@@ -123,7 +125,7 @@ export function RenderCommunicationBubble({
 												data-vlist-communication-recipient={recipient.id}
 												onClick={(event) => {
 													event.stopPropagation();
-													onOpenRecipient(recipient.id as string);
+													onOpenRecipient(recipient.id as string, recipient.deliveryMessageId);
 												}}
 												style={{ ...chipStyle, cursor: "pointer" }}
 											>

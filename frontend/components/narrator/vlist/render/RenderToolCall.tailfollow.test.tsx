@@ -227,6 +227,42 @@ describe("tool bodies use one permanent viewport", () => {
 		expect(output.getAttribute("data-following")).toBe("false");
 		expect(output.scrollTop).toBe(0);
 	});
+	it("an Edit grows from empty input without briefly reserving an empty 200px diff", async () => {
+		await render(card({ toolName: "Edit", isStreaming: true, inputJson: {} }));
+		expect(container.querySelector("[data-content-scrollport]")).toBeNull();
+		let viewport: HTMLElement | undefined;
+		let previousHeight = 0;
+		for (const value of ["", "a", "a\nb\nc"]) {
+			await render(
+				card({
+					toolName: "Edit",
+					isStreaming: true,
+					inputJson: { _streamingFieldName: "old_string", _streamingFieldValue: value },
+				}),
+			);
+			const node = port("input.edit");
+			viewport ??= node;
+			expect(node).toBe(viewport);
+			const height = Number.parseFloat(node.style.height);
+			expect(height).toBeLessThan(200);
+			expect(height).toBeGreaterThanOrEqual(previousHeight);
+			previousHeight = height;
+		}
+		await render(
+			card({
+				toolName: "Edit",
+				isStreaming: true,
+				inputJson: {
+					_streamingFieldName: "old_string",
+					_streamingFieldValue: "line\n".repeat(100),
+				},
+			}),
+		);
+		if (!viewport) throw new Error("Streaming Edit viewport was never mounted");
+		expect(port("input.edit")).toBe(viewport);
+		expect(Number.parseFloat(port("input.edit").style.height)).toBe(200);
+	});
+
 	it("keeps one dynamic Diff painter from matching through replacing and completion", async () => {
 		await render(
 			card({

@@ -33,7 +33,6 @@ import {
 	grantBehaviorFenceEdit,
 } from "../lib/agent/tools/behavior-fence-grant";
 import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
-import { AsyncMutex } from "../lib/async-mutex";
 import { buildAttachedFilesHint } from "../lib/attached-files";
 import {
 	type BooleanOverride,
@@ -47,7 +46,7 @@ import {
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { withDbRetry } from "../lib/db-resilience";
 import { resolveInjectedDevices } from "../lib/device-injection-trait";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { resolveFastModeForUser } from "../lib/fast-mode";
 import { hotSafe } from "../lib/hot-safe";
 import { InjectionCadence } from "../lib/injection-cadence";
@@ -114,6 +113,7 @@ import {
 } from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { agentMessageDeliveryBody } from "./agent-message-delivery";
 import { backgroundTaskService } from "./background-task-service";
 import { formatBackgroundCompletionNotifications } from "./bg-completion-queue";
 import { gitService } from "./git-service";
@@ -217,10 +217,14 @@ import {
 	clearPlanModePromptRebuild,
 	compactLocks,
 	consumePlanModePromptRebuild,
+	hasNarratorAdmissionWork,
 	hasPendingHistoryCompact,
+	isNarratorRevertAdmissionBlocked,
 	isNarratorRuntimeBusy,
 	knowledgeInjectionCycleStates,
+	listNarratorAdmissionOwners,
 	narratorCreationLocks,
+	narratorLoopAdmissions,
 	pendingFeedback,
 	pendingPermissions,
 	pendingPlanApprover,
@@ -230,9 +234,14 @@ import {
 	planModeAskedOnce,
 	pruneLocks,
 	recordNarratorRuntimeModel,
+	reserveNarratorRevertAdmission,
 	resetActiveUpstreamSession,
 	updateActiveSubagentModel,
 	updateActiveSubagentReasoningEffort,
+	waitForNarratorAdmissionWork,
+	withNarratorMutationAdmission,
+	withNarratorStartAdmission,
+	withNarratorWorkAdmission,
 } from "./narrator-session-state";
 
 export type { PersistedUserImageBlock };
@@ -277,6 +286,7 @@ export function registerPlannedUpdateRecoveryController(
 	options: { foregroundSubagentIds?: readonly string[]; token?: string } = {},
 ): PlannedUpdateRecoveryRegistration {
 	const token = options.token ?? randomUUID();
+	const releaseRuntimeClaim = claimNarratorRuntime(narratorId, token);
 	const control: PlannedUpdateRecoveryControl = {
 		token,
 		controller,
@@ -289,7 +299,6 @@ export function registerPlannedUpdateRecoveryController(
 	// legitimately hold it in `working`. Claim the runtime for the registration's
 	// lifetime so the zombie-status reconcile does not mistake that for an orphaned
 	// row and flip a genuinely busy narrator back to idle mid-recovery.
-	const releaseRuntimeClaim = claimNarratorRuntime(narratorId, token);
 	const finalizeInterrupt = (): Promise<void> => {
 		if (control.interruptFinalizer) return control.interruptFinalizer;
 		const current = plannedUpdateRecoveryControls.get(narratorId);
@@ -656,6 +665,12 @@ async function executeQueuedNewCommand(
  * Shared by the idle route path and the busy buffer-consumption path.
  */
 export async function persistGoalAddedNotice(
+	...args: Parameters<typeof persistGoalAddedNoticeUnlocked>
+): ReturnType<typeof persistGoalAddedNoticeUnlocked> {
+	return withNarratorWorkAdmission(args[0], () => persistGoalAddedNoticeUnlocked(...args));
+}
+
+async function persistGoalAddedNoticeUnlocked(
 	narratorId: string,
 	objective: string,
 	added: boolean,
@@ -721,8 +736,18 @@ async function executeQueuedGoalCommand(
  * message goes through feedMessage, whose own loop drains the rest at its next
  * safe boundary. Returns after scheduling the first message.
  */
-function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void {
+async function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): Promise<void> {
+	return withNarratorStartAdmission(active.narratorId, () =>
+		resumeNextBufferedMessageUnlocked(active, locale),
+	);
+}
+
+async function resumeNextBufferedMessageUnlocked(
+	active: ActiveNarrator,
+	locale: Locale,
+): Promise<void> {
 	const narratorId = active.narratorId;
+	if (isLoopRunning(narratorId)) return;
 	if ((bufferedMessages.get(narratorId)?.length ?? 0) === 0) return;
 	const queue = bufferedMessages.get(narratorId);
 	const first = queue?.shift();
@@ -746,7 +771,7 @@ function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void
 	const settleAfterTerminalCommand = async () => {
 		// More queued behind this terminal command → keep draining; else settle idle.
 		if ((bufferedMessages.get(narratorId)?.length ?? 0) > 0) {
-			resumeNextBufferedMessage(active, locale);
+			await resumeNextBufferedMessage(active, locale);
 			return;
 		}
 		await narratorService
@@ -765,7 +790,7 @@ function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void
 	};
 
 	if (newCommand) {
-		executeQueuedNewCommand(active, first, newCommand.initialMessage)
+		await executeQueuedNewCommand(active, first, newCommand.initialMessage)
 			.then(async (newNarratorId) => {
 				broadcastToNarrator(narratorId, {
 					type: "queued_new_narrator_created",
@@ -779,7 +804,7 @@ function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void
 	} else if (goalCommand) {
 		// Queued /goal: persist the protected task, then launch its first Spec turn.
 		// If plan mode or another guard prevents starting, keep draining as before.
-		executeQueuedGoalCommand(narratorId, first, goalCommand.objective)
+		await executeQueuedGoalCommand(narratorId, first, goalCommand.objective)
 			.then(async () => {
 				const result = await startSpecContinuationIfPossible(
 					narratorId,
@@ -791,7 +816,7 @@ function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void
 			})
 			.catch((err) => handleTerminalCommandError("/goal", err));
 	} else {
-		feedMessage(
+		await feedMessage(
 			narratorId,
 			first.text,
 			first.images,
@@ -835,7 +860,7 @@ function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void
 // Serialize externally-triggered continuation starts and edit/regenerate transactions.
 // This prevents two idle checks from racing into concurrent loops and ensures uploads
 // cannot both materialize files before the narrator's turn-admission flag is set.
-const continuationStartLock = new AsyncMutex();
+const continuationStartLock = { acquire: withNarratorStartAdmission };
 
 function isDynamicPruningWindowEnabled(thresholds: {
 	pruneStart: number;
@@ -851,6 +876,12 @@ function isDynamicPruningWindowEnabled(thresholds: {
  * If one is already alive, return it. Otherwise create a new one.
  */
 export async function ensureNarrator(
+	...args: Parameters<typeof ensureNarratorUnlocked>
+): ReturnType<typeof ensureNarratorUnlocked> {
+	return withNarratorStartAdmission(args[0], () => ensureNarratorUnlocked(...args));
+}
+
+async function ensureNarratorUnlocked(
 	narratorId: string,
 	locale: Locale,
 	replyInUserLanguage = false,
@@ -1895,9 +1926,9 @@ async function deliverPendingInjection(
 						fromTitle: message.fromTitle ?? null,
 						fromLabel: message.fromLabel ?? null,
 						fromType: message.fromType ?? null,
-						// Reader-only navigation target, omitted when the sender had written
-						// nothing yet (see the field's own doc).
+						// Preserve the exact Send target, with message ids for legacy deliveries.
 						...(message.fromMessageId ? { fromMessageId: message.fromMessageId } : {}),
+						...(message.fromToolUseId ? { fromToolUseId: message.fromToolUseId } : {}),
 						text: message.text,
 					},
 				],
@@ -1908,7 +1939,8 @@ async function deliverPendingInjection(
 			mode === "idle" ? formatParentInboundMessages([message], locale) : projected.content;
 		const { turnText } = await deliverInjection(narratorId, {
 			content,
-			body: projected.body,
+			body: message.delivery ? agentMessageDeliveryBody(message.delivery) : projected.body,
+			messageId: message.delivery?.recipientMessageId,
 			source: "subagent_message",
 			schedule,
 			locale,
@@ -2572,6 +2604,60 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
  * when the DB `status` went stale to idle while the loop was still draining).
  */
 export async function runAgentLoop(
+	active: ActiveNarrator,
+	text: string,
+	images?: ImageRef[],
+): Promise<{ started: boolean }> {
+	const narratorId = active.narratorId;
+	if (narratorLoopAdmissions.has(narratorId) || narratorToolExecutionAdmissions.has(narratorId)) {
+		return { started: false };
+	}
+	try {
+		const launch = await withNarratorStartAdmission(narratorId, async () => {
+			if (
+				narratorLoopAdmissions.has(narratorId) ||
+				narratorToolExecutionAdmissions.has(narratorId)
+			) {
+				return null;
+			}
+			// Return the handle, never await the loop while holding the start mutex.
+			const completion = withNarratorWorkAdmission(narratorId, async () => {
+				narratorLoopAdmissions.add(narratorId);
+				try {
+					return await runAgentLoopUnlocked(active, text, images);
+				} finally {
+					narratorLoopAdmissions.delete(narratorId);
+				}
+			});
+			return { completion };
+		});
+		return launch ? await launch.completion : { started: false };
+	} catch (error) {
+		if (!narratorLoopAdmissions.has(narratorId)) {
+			active._loopRunning = false;
+			active.alive = false;
+		}
+		throw error;
+	} finally {
+		if (active._resumeBufferedAfterLoop) {
+			active._resumeBufferedAfterLoop = false;
+			void resumeBufferedMessagesIfIdle(
+				narratorId,
+				active.locale,
+				active._replyInUserLanguage,
+			).catch((error) => {
+				if (!isNarratorRevertAdmissionBlocked(narratorId)) {
+					logger.warn("Could not resume queued messages after finalization", {
+						narratorId,
+						error: String(error),
+					});
+				}
+			});
+		}
+	}
+}
+
+async function runAgentLoopUnlocked(
 	active: ActiveNarrator,
 	text: string,
 	images?: ImageRef[],
@@ -4411,7 +4497,7 @@ export async function runAgentLoop(
 			// When the loop had an error, skip consumption entirely so queued
 			// messages are preserved for the user to retry or dismiss.
 			// [continuation-source: buffered-message]
-			if (!loopHadError) {
+			if (!loopHadError && !isNarratorRevertAdmissionBlocked(narratorId)) {
 				const queue = bufferedMessages.get(narratorId);
 				const buffered = queue?.[0];
 				if (buffered) {
@@ -4695,10 +4781,10 @@ export async function runAgentLoop(
 		// --- Stop hooks ---
 		// Fire once per completed response turn for the MAIN narrator only (not
 		// subagents). Covers every termination path: normal done, error, and
-		// user interrupt. Non-blocking and fire-and-forget — hook failures never
-		// affect narrator state.
+		// user interrupt. Hook failures never affect narrator state, but their actual
+		// execution must settle before file-revert admission can be granted.
 		if (saParentNarratorId === undefined) {
-			void (async () => {
+			await (async () => {
 				try {
 					const narr = await db.query.narrators.findFirst({
 						where: eq(narrators.id, narratorId),
@@ -4954,7 +5040,7 @@ export async function runAgentLoop(
 					});
 				}
 			}
-		} else {
+		} else if (!hasBuffered) {
 			bufferedMessages.delete(narratorId);
 			dbClearAllBuffered(narratorId);
 		}
@@ -5000,9 +5086,10 @@ export async function runAgentLoop(
 		// consume them. This makes priority messages run at the next safe boundary
 		// without waiting for manual input. `/new` drains immediately; `/goal`
 		// starts a Spec continuation and leaves later queued messages in order.
-		if (loopWasInterrupted && !loopHadError) {
-			resumeNextBufferedMessage(active, locale);
-		}
+		// Messages can also arrive during a normal finalizer now that busy covers
+		// its full lifetime. Let the post-release check drain those rather than
+		// leaving them stranded (or clearing them as the old early-idle path did).
+		active._resumeBufferedAfterLoop = !loopHadError;
 
 		// Wait until every old-session cleanup step is complete before broadcasting
 		// the recovery card. Otherwise a fast click could start a new session while
@@ -5035,6 +5122,12 @@ export async function runAgentLoop(
  * Returns the active narrator and persisted message for SSE subscription.
  */
 async function feedMessage(
+	...args: Parameters<typeof feedMessageUnlocked>
+): ReturnType<typeof feedMessageUnlocked> {
+	return withNarratorStartAdmission(args[0], () => feedMessageUnlocked(...args));
+}
+
+async function feedMessageUnlocked(
 	narratorId: string,
 	prompt: string,
 	images?: ImageRef[],
@@ -5065,7 +5158,7 @@ async function feedMessage(
 	// check (which should have buffered this message). ensureNarrator reuses the live
 	// `active`, so starting a second runAgentLoop here would corrupt the shared session.
 	// Throw BEFORE persisting the user message so we never leave a half-applied turn.
-	if (active._loopRunning) {
+	if (isLoopRunning(narratorId) || isNarratorRuntimeBusy(narratorId)) {
 		logger.warn("feedMessage blocked: loop already running", { narratorId });
 		// Correct a stale idle status so the user regains the interrupt button.
 		await reconcileRunningStatus(narratorId);
@@ -5355,6 +5448,14 @@ export function resolveToolCallConclusionTiming(
 
 /** Resolve the live parent slot and isolate shared history before a conclusion write. */
 export async function prepareSubagentConclusionReference(
+	...args: Parameters<typeof prepareSubagentConclusionReferenceUnlocked>
+): ReturnType<typeof prepareSubagentConclusionReferenceUnlocked> {
+	return withNarratorWorkAdmission(args[0], () =>
+		prepareSubagentConclusionReferenceUnlocked(...args),
+	);
+}
+
+async function prepareSubagentConclusionReferenceUnlocked(
 	subagentId: string,
 	parentNarratorId: string,
 	toolUseId: string,
@@ -5387,7 +5488,13 @@ export async function prepareSubagentConclusionReference(
  * Update the parent narrator's tool_call outputJson with a new conclusion.
  * Used for scenario 2 (conclusion watcher) and the update-conclusion API.
  */
-export async function updateToolCallConclusion(opts: {
+export async function updateToolCallConclusion(
+	opts: Parameters<typeof updateToolCallConclusionUnlocked>[0],
+): ReturnType<typeof updateToolCallConclusionUnlocked> {
+	return withNarratorWorkAdmission(opts.subagentId, () => updateToolCallConclusionUnlocked(opts));
+}
+
+async function updateToolCallConclusionUnlocked(opts: {
 	subagentId: string;
 	parentNarratorId: string;
 	toolUseId: string;
@@ -5708,7 +5815,7 @@ export async function createNarratorForPlugin(
 
 /** Delete a narrator entirely (team fire flow: removes the worker narrator). */
 export async function deleteNarratorForPlugin(narratorId: string): Promise<void> {
-	await narratorService.remove(narratorId);
+	await withNarratorWorkAdmission(narratorId, () => narratorService.remove(narratorId));
 }
 
 /**
@@ -5896,8 +6003,7 @@ export async function startSpecContinuationIfPossible(
 	userId?: string | null,
 ): Promise<{ started: boolean }> {
 	return continuationStartLock.acquire(narratorId, async () => {
-		const activeExisting = activeNarrators.get(narratorId);
-		if (activeExisting?.alive && activeExisting._loopRunning) return { started: false };
+		if (isLoopRunning(narratorId)) return { started: false };
 
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status !== "idle" || isPlanModeTrait(narrator.traits)) {
@@ -5945,8 +6051,7 @@ export async function startBackgroundCompletionContinuationIfPossible(
 	replyInUserLanguage = false,
 ): Promise<{ started: boolean }> {
 	return continuationStartLock.acquire(narratorId, async () => {
-		const activeExisting = activeNarrators.get(narratorId);
-		if (activeExisting?.alive && activeExisting._loopRunning) return { started: false };
+		if (isLoopRunning(narratorId)) return { started: false };
 
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status !== "idle") return { started: false };
@@ -6044,8 +6149,7 @@ export async function startInjectionContinuationIfPossible(
 		return startSubagentInjectionContinuation(recipient, locale, replyInUserLanguage);
 	}
 	return continuationStartLock.acquire(narratorId, async () => {
-		const activeExisting = activeNarrators.get(narratorId);
-		if (activeExisting?.alive && activeExisting._loopRunning) return { started: false };
+		if (isLoopRunning(narratorId)) return { started: false };
 
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status !== "idle") return { started: false };
@@ -6184,7 +6288,7 @@ export async function resumeBufferedMessagesIfIdle(
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning) return { resumed: false };
 
-		resumeNextBufferedMessage(active, locale);
+		await resumeNextBufferedMessage(active, locale);
 		return { resumed: true };
 	});
 }
@@ -6205,8 +6309,7 @@ export async function startParentInboundContinuationIfPossible(
 	replyInUserLanguage = false,
 ): Promise<{ started: boolean }> {
 	return continuationStartLock.acquire(narratorId, async () => {
-		const activeExisting = activeNarrators.get(narratorId);
-		if (activeExisting?.alive && activeExisting._loopRunning) return { started: false };
+		if (isLoopRunning(narratorId)) return { started: false };
 
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status !== "idle") return { started: false };
@@ -6311,6 +6414,12 @@ export function resolveRetryTarget<T extends RetryCandidateMessage>(
  * then re-runs the agent loop with the existing user message text.
  */
 export async function retryLastMessage(
+	...args: Parameters<typeof retryLastMessageUnlocked>
+): ReturnType<typeof retryLastMessageUnlocked> {
+	return withNarratorStartAdmission(args[0], () => retryLastMessageUnlocked(...args));
+}
+
+async function retryLastMessageUnlocked(
 	narratorId: string,
 	locale: Locale = "en",
 	replyInUserLanguage = false,
@@ -6443,6 +6552,12 @@ export async function retryLastMessage(
  * model receives a properly localised prompt.
  */
 export async function continueNarrator(
+	...args: Parameters<typeof continueNarratorUnlocked>
+): ReturnType<typeof continueNarratorUnlocked> {
+	return withNarratorStartAdmission(args[0], () => continueNarratorUnlocked(...args));
+}
+
+async function continueNarratorUnlocked(
 	narratorId: string,
 	locale: Locale = "en",
 	replyInUserLanguage = false,
@@ -6706,6 +6821,33 @@ export function evaluateRerunnableToolCall(
 	return null;
 }
 
+// Loop-less tool execution owns the foreground slot until its cleanup settles.
+const narratorToolExecutionAdmissions = hotSafe<Map<string, Promise<void>>>(
+	"narrafork.narratorToolExecutionAdmissions",
+	() => new Map(),
+);
+
+type ToolCallReexecutionLaunch =
+	| ReExecuteDeniedResult
+	| { completion: Promise<ReExecuteDeniedResult> }
+	| { retryAfter: Promise<void> };
+
+async function completeToolCallReexecution(
+	narratorId: string,
+	prepare: () => Promise<ToolCallReexecutionLaunch>,
+): Promise<ReExecuteDeniedResult> {
+	for (;;) {
+		const launch = await withNarratorStartAdmission(narratorId, prepare);
+		if ("retryAfter" in launch) {
+			// Recovery batches may submit multiple tools for the same owner. Preserve
+			// their serial execution, but wait outside the start mutex and recheck.
+			await launch.retryAfter;
+			continue;
+		}
+		return "completion" in launch ? launch.completion : launch;
+	}
+}
+
 /**
  * Re-execute a tool call that was denied by the user (or whose pending
  * permission was cancelled by an interrupt) in the latest assistant turn.
@@ -6718,6 +6860,12 @@ export function evaluateRerunnableToolCall(
  * The model/display projection selects the newest attempt while retaining prior facts.
  */
 export async function reExecuteDeniedToolCall(
+	...args: Parameters<typeof reExecuteDeniedToolCallUnlocked>
+): Promise<ReExecuteDeniedResult> {
+	return completeToolCallReexecution(args[0], () => reExecuteDeniedToolCallUnlocked(...args));
+}
+
+async function reExecuteDeniedToolCallUnlocked(
 	narratorId: string,
 	toolUseId: string,
 	locale: Locale = "en",
@@ -6728,9 +6876,16 @@ export async function reExecuteDeniedToolCall(
 		persistedToolCallId?: string;
 		permissionMode?: "normal" | "preGranted";
 	},
-): Promise<ReExecuteDeniedResult> {
+): Promise<ToolCallReexecutionLaunch> {
 	const narrator = await narratorService.getById(narratorId);
 	const restoringPersistedCall = Boolean(options?.persistedToolCallId);
+	const currentExecution = narratorToolExecutionAdmissions.get(narratorId);
+	if (restoringPersistedCall && currentExecution) return { retryAfter: currentExecution };
+	// Recovery owns an outer runtime claim, but must not overlap an actual loop
+	// or another tool reexecution. Ordinary retries also respect loop-less owners.
+	if (isLoopRunning(narratorId) || (!restoringPersistedCall && isNarratorRuntimeBusy(narratorId))) {
+		return { ok: false, reason: "narrator_busy" };
+	}
 	if (!restoringPersistedCall && (narrator.status === "working" || narrator.status === "waiting")) {
 		return { ok: false, reason: "narrator_busy" };
 	}
@@ -6805,323 +6960,395 @@ export async function reExecuteDeniedToolCall(
 		toolCall.id,
 	);
 
-	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-	// Restore the triggering user so knowledge-base ACL works after a rebuild.
-	// The active may have been freshly recreated (interrupt destroyed the old one),
-	// in which case _currentUserId would otherwise be undefined → null.
-	active._currentUserId = userId ?? active._currentUserId ?? null;
-	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-
-	broadcastToNarrator(narratorId, {
-		type: "tool_started",
-		narratorId,
-		toolCallId: toolCall.id,
-		toolUseId,
-		toolName: toolCall.toolName,
-		input: toolInput,
-	});
-
-	const { executeTool } = await import("../lib/agent/tool-executor");
-	const toolName = toolCall.toolName;
-
-	// Reuse the same runtime/device ACL ceiling as the ordinary loop, including recovery.
-	const oauthRuntime = await assertOAuthNarratorRuntimeActive(narratorId, active._currentUserId);
-	const sessionDevices = (await resolveSessionDevices(active._projectId ?? null)) ?? [];
-	const rerunMessage = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, toolCall.messageId),
-		columns: { parentToolUseId: true },
-	});
-	const parentNarratorId = isSubagent ? (narrator.parentNarratorId ?? undefined) : undefined;
-	const parentToolUseId = isSubagent ? (rerunMessage?.parentToolUseId ?? undefined) : undefined;
-	const config: import("../lib/agent").AgentConfig = {
-		narratorId,
-		conversationId: active.conversationId,
-		model: active.model,
-		provider: active.provider,
-		cwd: active.cwd,
-		locale,
-		signal: active.abortController.signal,
-		chapterId: active._chapterId,
-		parentNarratorId,
-		parentToolUseId,
-		reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
-		allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
-		allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
-		runtimeAuthorizationGuard: oauthRuntime
-			? async () => {
-					await assertOAuthNarratorRuntimeActive(narratorId, active._currentUserId);
-				}
-			: undefined,
-		get planFileId() {
-			return active._planFileId;
-		},
-		get planFilePath() {
-			return active._planFilePath;
-		},
-		skillRoot: active._skillRoot ?? undefined,
-		projectGitPath: active._projectGitPath ?? undefined,
-		skillScopeKey: active._skillScopeKey ?? undefined,
-		userId: active._currentUserId ?? null,
-		projectId: active._projectId ?? null,
-		defaultDeviceId: sourceToolCall.executionDeviceId ?? active._defaultDeviceId ?? null,
-		availableDevices: oauthRuntime
-			? filterOAuthSessionDevices(sessionDevices, oauthRuntime)
-			: sessionDevices,
-		setDefaultDevice: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
-		disabledTools: active._disabledTools,
-		blockedSkills: {
-			all: active._blockedSkills.all,
-			names: [...active._blockedSkills.names],
-		},
-		requireToolCallBinding: true,
-		onToolExecutionStarting: (resolvedToolUseId, binding, startedAt) =>
-			narratorPersistence.claimToolCallExecution(narratorId, resolvedToolUseId, binding, startedAt),
-		onExecutionTargetResolved: (resolvedToolUseId, target, binding) =>
-			narratorService.updateToolCallExecutionTarget(narratorId, resolvedToolUseId, target, binding),
-		onExecutionPlanResolved: (resolvedToolUseId, plan, binding) =>
-			narratorService.updateToolCallExecutionPlan(narratorId, resolvedToolUseId, plan, binding),
-		permissionHandler: (tName, input, tUseId, options) =>
-			handlePermission(
-				narratorId,
-				active.abortController.signal,
-				tName,
-				input,
-				tUseId,
-				active.cwd,
-				locale,
-				parentNarratorId,
-				options,
-				parentToolUseId,
-				oauthRuntime
-					? {
-							permissionMode: oauthRuntime.permissionMode,
-							allowKnowledgeWrite: oauthRuntime.allowKnowledgeWrite,
-							dangerReflectionPrompt: oauthRuntime.dangerReflectionPrompt,
-							useRobotDiagnosticPreset: oauthRuntime.useRobotDiagnosticPreset,
-							deviceAccess: oauthRuntime.policy.deviceAccess,
-							oauthClientId: oauthRuntime.clientId,
-							grantId: oauthRuntime.grantId,
-						}
-					: undefined,
-				config.reviewReadOnlyBash,
-			),
-		onEvent: (event) => {
-			if (event.type === "tool_output") {
-				broadcastToNarrator(narratorId, {
-					type: "tool_output",
-					narratorId,
-					toolUseId: event.toolUseId,
-					output: event.output,
-				});
-			} else if (event.type === "tool_progress") {
-				broadcastToNarrator(narratorId, {
-					type: "tool_progress",
-					narratorId,
-					toolUseId: event.toolUseId,
-					elapsed: event.elapsed,
-				});
-			} else if (event.type === "tool_structured_progress") {
-				broadcastToNarrator(narratorId, {
-					type: "tool_structured_progress",
-					narratorId,
-					toolUseId: event.toolUseId,
-					progress: event.progress,
-				});
-			} else if (event.type === "tool_long_running") {
-				broadcastToNarrator(narratorId, {
-					type: "tool_long_running",
-					narratorId,
-					toolUseId: event.toolUseId,
-					elapsed: event.elapsed,
-				});
-			}
-		},
+	// Atomically hand off the checked/prepared attempt to a long-lived work lease.
+	// Await may depend on an independently running child whose Send(parent) needs
+	// this same start mutex; only the completion handle may leave the transaction.
+	const releaseRuntime = claimNarratorRuntime(narratorId, randomUUID());
+	const settled = Promise.withResolvers<void>();
+	narratorToolExecutionAdmissions.set(narratorId, settled.promise);
+	let executionReleased = false;
+	const releaseExecution = () => {
+		if (executionReleased) return;
+		executionReleased = true;
+		narratorToolExecutionAdmissions.delete(narratorId);
+		releaseRuntime();
+		settled.resolve();
 	};
-
-	// A re-run mutates files just like the original pass, so it must record the same
-	// content-addressed boundaries the loop's onSnapshotBefore/After hooks record.
-	const isShellTool = toolName === SHELL_TOOL_NAME;
-	const requestedDevice =
-		typeof toolInput.device === "string"
-			? toolInput.device
-			: (active._defaultDeviceId ?? LOCAL_DEVICE_ID);
-	const canSnapshotRerun =
-		active._isInGitRepo && FILE_MUTATING_TOOLS.has(toolName) && requestedDevice === LOCAL_DEVICE_ID;
-	if (canSnapshotRerun) {
-		// A re-run starts from whatever is on disk now, so the cached hash from the
-		// original pass must not be reused as this run's baseline.
-		active._lastTreeHash = undefined;
-		// Same declaration rule as the loop hook: only a re-run that can name its
-		// target up front gets its delta attributed by declaration.
-		await recordTreeSnapshotBefore(
-			active,
-			narratorId,
-			toolUseId,
-			isShellTool ? null : declaredWorktreePaths(active.cwd, toolInput),
-		);
-	} else if (isShellTool && requestedDevice !== LOCAL_DEVICE_ID) {
-		logger.debug("Skipping Bash rerun snapshot for remote execution target", {
-			narratorId,
-			toolUseId,
-			deviceId: requestedDevice,
-		});
-	}
-
-	// Reproduce the exact execution identity frozen on the original pass. It pins the
-	// audit-only selectionSource (a local tool frozen as "local_default" would otherwise be
-	// recomputed as "session_default" once defaultDeviceId is seeded with the frozen device
-	// id, which the persistence-layer frozen-target guard rejects once the row has left
-	// "initializing") and, for a pre-granted re-run, acts as the baseline that executeTool
-	// compares against to detect environment drift. Legacy rows without a frozen device
-	// fall back to normal resolution.
-	const preFrozenTarget = reconstructToolExecutionTarget(sourceToolCall);
-
-	try {
-		const result = await executeTool({ name: toolName, input: toolInput, toolUseId }, config, {
-			toolCallBinding,
-			...(options?.permissionMode === "normal" ||
-			preparedAttempt.requiresFreshPermission ||
-			!!oauthRuntime ||
-			config.reviewReadOnlyBash
-				? {}
-				: { preGrantedPermission: { behavior: "allow" as const } }),
-			...(preFrozenTarget ? { preFrozenTarget } : {}),
-		});
-
-		await narratorService.updateToolCallResult(
-			toolUseId,
-			{
-				output: result.metadata
-					? { _text: result.output, _metadata: result.metadata }
-					: result.output,
-				status: result.isError ? "fail" : "success",
-				errorMessage: result.isError ? result.output : undefined,
-				durationMs: result.durationMs,
-				permissionStartedAt: result.permissionStartedAt,
-				executionStartedAt: result.executionStartedAt,
-				completedAt: result.completedAt,
-			},
-			toolCall.messageId,
-			toolCall.id,
-		);
-		if (result.updatedInput) {
-			await narratorService.overwriteToolCallInput(toolUseId, result.updatedInput, toolCall.id);
-		}
-
-		broadcastToNarrator(narratorId, {
-			type: "tool_completed",
-			narratorId,
-			toolCallId: toolCall.id,
-			toolUseId,
-			toolName,
-			status: result.isError ? "fail" : "success",
-			output: result.metadata
-				? { _text: result.output, _metadata: result.metadata }
-				: result.output,
-			durationMs: result.durationMs,
-			...(result.updatedInput ? { updatedInput: result.updatedInput } : {}),
-			...(result.metadata ? { metadata: result.metadata } : {}),
-		});
-
-		// Record the re-run's own boundaries. Remote targets have no shadow repository
-		// yet, so they are skipped rather than treated as if they were local.
-		const executionTarget = result.metadata?.executionTarget as
-			| { deviceId?: string; cwd?: string }
-			| undefined;
-		if (canSnapshotRerun && executionTarget?.deviceId !== LOCAL_DEVICE_ID) {
-			// The before-hook already opened a write claim, and nothing here will close
-			// it: a claim left in flight is read as extending to now, so its declared
-			// paths would be subtracted from every other narrator's shell call in this
-			// worktree from now on — turning their real writes into unrevertable ones.
-			abandonTreeSnapshot(active, narratorId, toolUseId);
-		}
-		if (canSnapshotRerun && executionTarget?.deviceId === LOCAL_DEVICE_ID) {
+	const completion = withNarratorWorkAdmission(
+		narratorId,
+		async (): Promise<ReExecuteDeniedResult> => {
 			try {
-				const { changedFiles } = await recordTreeSnapshotAfter(active, narratorId, toolUseId);
-				if (isShellTool && changedFiles.length > 0) {
-					const { recordAttributions } = await import("./file-attribution-service");
-					await recordAttributions(
-						{
-							deviceId: LOCAL_DEVICE_ID,
-							workspacePath: active.cwd,
-							narratorId,
-							action: "bash",
-							toolName: SHELL_TOOL_NAME,
-							toolUseId,
-						},
-						changedFiles,
-					);
-				}
-			} catch (err) {
-				// The after-hook closes the claim before it can fail, but a failure here
-				// leaves that unproven, and a claim left in flight overlaps every later
-				// window. Sealing is a no-op once it is already closed.
-				abandonTreeSnapshot(active, narratorId, toolUseId);
-				logger.debug("Bash rerun after-snapshot failed", {
+				const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+				// Restore the triggering user so knowledge-base ACL works after a rebuild.
+				// The active may have been freshly recreated (interrupt destroyed the old one),
+				// in which case _currentUserId would otherwise be undefined → null.
+				active._currentUserId = userId ?? active._currentUserId ?? null;
+				await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
+
+				broadcastToNarrator(narratorId, {
+					type: "tool_started",
 					narratorId,
+					toolCallId: toolCall.id,
 					toolUseId,
-					error: String(err),
+					toolName: toolCall.toolName,
+					input: toolInput,
 				});
+
+				const { executeTool } = await import("../lib/agent/tool-executor");
+				const toolName = toolCall.toolName;
+
+				// Reuse the same runtime/device ACL ceiling as the ordinary loop, including recovery.
+				const oauthRuntime = await assertOAuthNarratorRuntimeActive(
+					narratorId,
+					active._currentUserId,
+				);
+				const sessionDevices = (await resolveSessionDevices(active._projectId ?? null)) ?? [];
+				const rerunMessage = await db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, toolCall.messageId),
+					columns: { parentToolUseId: true },
+				});
+				const parentNarratorId = isSubagent ? (narrator.parentNarratorId ?? undefined) : undefined;
+				const parentToolUseId = isSubagent
+					? (rerunMessage?.parentToolUseId ?? undefined)
+					: undefined;
+				const config: import("../lib/agent").AgentConfig = {
+					narratorId,
+					conversationId: active.conversationId,
+					model: active.model,
+					provider: active.provider,
+					cwd: active.cwd,
+					locale,
+					signal: active.abortController.signal,
+					chapterId: active._chapterId,
+					parentNarratorId,
+					parentToolUseId,
+					reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
+					allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
+					allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
+					runtimeAuthorizationGuard: oauthRuntime
+						? async () => {
+								await assertOAuthNarratorRuntimeActive(narratorId, active._currentUserId);
+							}
+						: undefined,
+					get planFileId() {
+						return active._planFileId;
+					},
+					get planFilePath() {
+						return active._planFilePath;
+					},
+					skillRoot: active._skillRoot ?? undefined,
+					projectGitPath: active._projectGitPath ?? undefined,
+					skillScopeKey: active._skillScopeKey ?? undefined,
+					userId: active._currentUserId ?? null,
+					projectId: active._projectId ?? null,
+					defaultDeviceId: sourceToolCall.executionDeviceId ?? active._defaultDeviceId ?? null,
+					availableDevices: oauthRuntime
+						? filterOAuthSessionDevices(sessionDevices, oauthRuntime)
+						: sessionDevices,
+					setDefaultDevice: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
+					disabledTools: active._disabledTools,
+					blockedSkills: {
+						all: active._blockedSkills.all,
+						names: [...active._blockedSkills.names],
+					},
+					requireToolCallBinding: true,
+					onToolExecutionStarting: (resolvedToolUseId, binding, startedAt) =>
+						narratorPersistence.claimToolCallExecution(
+							narratorId,
+							resolvedToolUseId,
+							binding,
+							startedAt,
+						),
+					onExecutionTargetResolved: (resolvedToolUseId, target, binding) =>
+						narratorService.updateToolCallExecutionTarget(
+							narratorId,
+							resolvedToolUseId,
+							target,
+							binding,
+						),
+					onExecutionPlanResolved: (resolvedToolUseId, plan, binding) =>
+						narratorService.updateToolCallExecutionPlan(
+							narratorId,
+							resolvedToolUseId,
+							plan,
+							binding,
+						),
+					permissionHandler: (tName, input, tUseId, options) =>
+						handlePermission(
+							narratorId,
+							active.abortController.signal,
+							tName,
+							input,
+							tUseId,
+							active.cwd,
+							locale,
+							parentNarratorId,
+							options,
+							parentToolUseId,
+							oauthRuntime
+								? {
+										permissionMode: oauthRuntime.permissionMode,
+										allowKnowledgeWrite: oauthRuntime.allowKnowledgeWrite,
+										dangerReflectionPrompt: oauthRuntime.dangerReflectionPrompt,
+										useRobotDiagnosticPreset: oauthRuntime.useRobotDiagnosticPreset,
+										deviceAccess: oauthRuntime.policy.deviceAccess,
+										oauthClientId: oauthRuntime.clientId,
+										grantId: oauthRuntime.grantId,
+									}
+								: undefined,
+							config.reviewReadOnlyBash,
+						),
+					onEvent: (event) => {
+						if (event.type === "tool_output") {
+							broadcastToNarrator(narratorId, {
+								type: "tool_output",
+								narratorId,
+								toolUseId: event.toolUseId,
+								output: event.output,
+							});
+						} else if (event.type === "tool_progress") {
+							broadcastToNarrator(narratorId, {
+								type: "tool_progress",
+								narratorId,
+								toolUseId: event.toolUseId,
+								elapsed: event.elapsed,
+							});
+						} else if (event.type === "tool_structured_progress") {
+							broadcastToNarrator(narratorId, {
+								type: "tool_structured_progress",
+								narratorId,
+								toolUseId: event.toolUseId,
+								progress: event.progress,
+							});
+						} else if (event.type === "tool_long_running") {
+							broadcastToNarrator(narratorId, {
+								type: "tool_long_running",
+								narratorId,
+								toolUseId: event.toolUseId,
+								elapsed: event.elapsed,
+							});
+						}
+					},
+				};
+
+				// A re-run mutates files just like the original pass, so it must record the same
+				// content-addressed boundaries the loop's onSnapshotBefore/After hooks record.
+				const isShellTool = toolName === SHELL_TOOL_NAME;
+				const requestedDevice =
+					typeof toolInput.device === "string"
+						? toolInput.device
+						: (active._defaultDeviceId ?? LOCAL_DEVICE_ID);
+				const canSnapshotRerun =
+					active._isInGitRepo &&
+					FILE_MUTATING_TOOLS.has(toolName) &&
+					requestedDevice === LOCAL_DEVICE_ID;
+				if (canSnapshotRerun) {
+					// A re-run starts from whatever is on disk now, so the cached hash from the
+					// original pass must not be reused as this run's baseline.
+					active._lastTreeHash = undefined;
+					// Same declaration rule as the loop hook: only a re-run that can name its
+					// target up front gets its delta attributed by declaration.
+					await recordTreeSnapshotBefore(
+						active,
+						narratorId,
+						toolUseId,
+						isShellTool ? null : declaredWorktreePaths(active.cwd, toolInput),
+					);
+				} else if (isShellTool && requestedDevice !== LOCAL_DEVICE_ID) {
+					logger.debug("Skipping Bash rerun snapshot for remote execution target", {
+						narratorId,
+						toolUseId,
+						deviceId: requestedDevice,
+					});
+				}
+
+				// Reproduce the exact execution identity frozen on the original pass. It pins the
+				// audit-only selectionSource (a local tool frozen as "local_default" would otherwise be
+				// recomputed as "session_default" once defaultDeviceId is seeded with the frozen device
+				// id, which the persistence-layer frozen-target guard rejects once the row has left
+				// "initializing") and, for a pre-granted re-run, acts as the baseline that executeTool
+				// compares against to detect environment drift. Legacy rows without a frozen device
+				// fall back to normal resolution.
+				const preFrozenTarget = reconstructToolExecutionTarget(sourceToolCall);
+
+				try {
+					const result = await executeTool(
+						{ name: toolName, input: toolInput, toolUseId },
+						config,
+						{
+							toolCallBinding,
+							...(options?.permissionMode === "normal" ||
+							preparedAttempt.requiresFreshPermission ||
+							!!oauthRuntime ||
+							config.reviewReadOnlyBash
+								? {}
+								: { preGrantedPermission: { behavior: "allow" as const } }),
+							...(preFrozenTarget ? { preFrozenTarget } : {}),
+						},
+					);
+
+					await narratorService.updateToolCallResult(
+						toolUseId,
+						{
+							output: result.metadata
+								? { _text: result.output, _metadata: result.metadata }
+								: result.output,
+							status: result.isError ? "fail" : "success",
+							errorMessage: result.isError ? result.output : undefined,
+							durationMs: result.durationMs,
+							permissionStartedAt: result.permissionStartedAt,
+							executionStartedAt: result.executionStartedAt,
+							completedAt: result.completedAt,
+						},
+						toolCall.messageId,
+						toolCall.id,
+					);
+					if (result.updatedInput) {
+						await narratorService.overwriteToolCallInput(
+							toolUseId,
+							result.updatedInput,
+							toolCall.id,
+						);
+					}
+
+					broadcastToNarrator(narratorId, {
+						type: "tool_completed",
+						narratorId,
+						toolCallId: toolCall.id,
+						toolUseId,
+						toolName,
+						status: result.isError ? "fail" : "success",
+						output: result.metadata
+							? { _text: result.output, _metadata: result.metadata }
+							: result.output,
+						durationMs: result.durationMs,
+						...(result.updatedInput ? { updatedInput: result.updatedInput } : {}),
+						...(result.metadata ? { metadata: result.metadata } : {}),
+					});
+
+					// Record the re-run's own boundaries. Remote targets have no shadow repository
+					// yet, so they are skipped rather than treated as if they were local.
+					const executionTarget = result.metadata?.executionTarget as
+						| { deviceId?: string; cwd?: string }
+						| undefined;
+					if (canSnapshotRerun && executionTarget?.deviceId !== LOCAL_DEVICE_ID) {
+						// The before-hook already opened a write claim, and nothing here will close
+						// it: a claim left in flight is read as extending to now, so its declared
+						// paths would be subtracted from every other narrator's shell call in this
+						// worktree from now on — turning their real writes into unrevertable ones.
+						abandonTreeSnapshot(active, narratorId, toolUseId);
+					}
+					if (canSnapshotRerun && executionTarget?.deviceId === LOCAL_DEVICE_ID) {
+						try {
+							const { changedFiles } = await recordTreeSnapshotAfter(active, narratorId, toolUseId);
+							if (isShellTool && changedFiles.length > 0) {
+								const { recordAttributions } = await import("./file-attribution-service");
+								await recordAttributions(
+									{
+										deviceId: LOCAL_DEVICE_ID,
+										workspacePath: active.cwd,
+										narratorId,
+										action: "bash",
+										toolName: SHELL_TOOL_NAME,
+										toolUseId,
+									},
+									changedFiles,
+								);
+							}
+						} catch (err) {
+							// The after-hook closes the claim before it can fail, but a failure here
+							// leaves that unproven, and a claim left in flight overlaps every later
+							// window. Sealing is a no-op once it is already closed.
+							abandonTreeSnapshot(active, narratorId, toolUseId);
+							logger.debug("Bash rerun after-snapshot failed", {
+								narratorId,
+								toolUseId,
+								error: String(err),
+							});
+						}
+					}
+				} catch (err) {
+					// executeTool threw, so the after-hook above is skipped entirely. The claim the
+					// before-hook opened has to be sealed here or it stays "in flight" forever.
+					if (canSnapshotRerun) abandonTreeSnapshot(active, narratorId, toolUseId);
+					const message = err instanceof Error ? err.message : String(err);
+					logger.error("Failed to re-execute denied tool call", {
+						narratorId,
+						toolUseId,
+						error: message,
+					});
+					await narratorService
+						.updateToolCallResult(
+							toolUseId,
+							{
+								output: `Re-execution failed: ${message}`,
+								status: "fail",
+								errorMessage: `Re-execution failed: ${message}`,
+								completedAt: Date.now(),
+							},
+							toolCall.messageId,
+							toolCall.id,
+						)
+						.catch(() => {});
+					broadcastToNarrator(narratorId, {
+						type: "tool_completed",
+						narratorId,
+						toolCallId: toolCall.id,
+						toolUseId,
+						toolName,
+						status: "fail",
+						output: `Re-execution failed: ${message}`,
+					});
+					await narratorService.updateStatus(narratorId, "idle", { substatus: ["error"] });
+					disposeInactiveNarratorSession(narratorId, active);
+					return { ok: true, shouldContinue: false };
+				}
+
+				if (options?.autoContinue === false) {
+					await narratorService.updateStatus(narratorId, "idle", { substatus: [] });
+					disposeInactiveNarratorSession(narratorId, active);
+					return { ok: true, shouldContinue: true };
+				}
+
+				// Auto-continue: replay the freshly produced tool result so the model resumes
+				// from where it was interrupted. Forward the triggering user so knowledge ACL
+				// keeps working through the continued loop.
+				return await withNarratorMutationAdmission(narratorId, async () => {
+					// Release the execution slot and mount the continuation in one short
+					// transaction. A waiting revert may drain cleanup, but never start a turn.
+					releaseExecution();
+					if (isNarratorRevertAdmissionBlocked(narratorId)) {
+						await narratorService.updateStatus(narratorId, "idle", { substatus: [] });
+						disposeInactiveNarratorSession(narratorId, active);
+						return { ok: true, shouldContinue: true };
+					}
+					await continueNarrator(narratorId, locale, replyInUserLanguage, userId);
+					return { ok: true };
+				});
+			} finally {
+				releaseExecution();
 			}
-		}
-	} catch (err) {
-		// executeTool threw, so the after-hook above is skipped entirely. The claim the
-		// before-hook opened has to be sealed here or it stays "in flight" forever.
-		if (canSnapshotRerun) abandonTreeSnapshot(active, narratorId, toolUseId);
-		const message = err instanceof Error ? err.message : String(err);
-		logger.error("Failed to re-execute denied tool call", {
-			narratorId,
-			toolUseId,
-			error: message,
-		});
-		await narratorService
-			.updateToolCallResult(
-				toolUseId,
-				{
-					output: `Re-execution failed: ${message}`,
-					status: "fail",
-					errorMessage: `Re-execution failed: ${message}`,
-					completedAt: Date.now(),
-				},
-				toolCall.messageId,
-				toolCall.id,
-			)
-			.catch(() => {});
-		broadcastToNarrator(narratorId, {
-			type: "tool_completed",
-			narratorId,
-			toolCallId: toolCall.id,
-			toolUseId,
-			toolName,
-			status: "fail",
-			output: `Re-execution failed: ${message}`,
-		});
-		await narratorService.updateStatus(narratorId, "idle", { substatus: ["error"] });
-		disposeInactiveNarratorSession(narratorId, active);
-		return { ok: true, shouldContinue: false };
-	}
-
-	if (options?.autoContinue === false) {
-		await narratorService.updateStatus(narratorId, "idle", { substatus: [] });
-		disposeInactiveNarratorSession(narratorId, active);
-		return { ok: true, shouldContinue: true };
-	}
-
-	// Auto-continue: replay the freshly produced tool result so the model resumes
-	// from where it was interrupted. Forward the triggering user so knowledge ACL
-	// keeps working through the continued loop.
-	await continueNarrator(narratorId, locale, replyInUserLanguage, userId);
-	return { ok: true };
+		},
+	);
+	return { completion };
 }
 
-export async function executePersistedToolCall(input: {
+export async function executePersistedToolCall(
+	input: Parameters<typeof executePersistedToolCallUnlocked>[0],
+): Promise<ReExecuteDeniedResult> {
+	return completeToolCallReexecution(input.narratorId, () =>
+		executePersistedToolCallUnlocked(input),
+	);
+}
+
+async function executePersistedToolCallUnlocked(input: {
 	toolCallId: string;
 	narratorId: string;
 	locale?: Locale;
 	replyInUserLanguage?: boolean;
 	userId?: string | null;
 	permissionMode?: "normal" | "preGranted";
-}): Promise<ReExecuteDeniedResult> {
+}): Promise<ToolCallReexecutionLaunch> {
 	const toolCall = await db.query.narratorToolCalls.findFirst({
 		where: and(
 			eq(narratorToolCalls.id, input.toolCallId),
@@ -7130,7 +7357,9 @@ export async function executePersistedToolCall(input: {
 		columns: { toolUseId: true },
 	});
 	if (!toolCall) return { ok: false, reason: "not_found" };
-	return reExecuteDeniedToolCall(
+	// Preserve the short-lock handoff: calling the public wrapper here would
+	// await its completion while this outer recovery transaction still held the lock.
+	return reExecuteDeniedToolCallUnlocked(
 		input.narratorId,
 		toolCall.toolUseId,
 		input.locale ?? "en",
@@ -7165,6 +7394,12 @@ export function normalizeRollbackBlockIndexForMessage(
  * File changes are automatically reverted via snapshot system.
  */
 export async function rollbackToBlock(
+	...args: Parameters<typeof rollbackToBlockUnlocked>
+): ReturnType<typeof rollbackToBlockUnlocked> {
+	return withNarratorStartAdmission(args[0], () => rollbackToBlockUnlocked(...args));
+}
+
+async function rollbackToBlockUnlocked(
 	narratorId: string,
 	messageId: string,
 	blockIndex: number,
@@ -7897,6 +8132,12 @@ function buildEditedAssistantContentJson(
  * narrators (ref count > 1), a private copy is created for this narrator only.
  */
 export async function editAssistantMessage(
+	...args: Parameters<typeof editAssistantMessageUnlocked>
+): ReturnType<typeof editAssistantMessageUnlocked> {
+	return withNarratorWorkAdmission(args[0], () => editAssistantMessageUnlocked(...args));
+}
+
+async function editAssistantMessageUnlocked(
 	narratorId: string,
 	messageId: string,
 	newContent: string,
@@ -7968,6 +8209,12 @@ export async function editAssistantMessage(
  * Copy-on-write protects fork sources, mirroring editAssistantMessage.
  */
 export async function restoreAssistantMessage(
+	...args: Parameters<typeof restoreAssistantMessageUnlocked>
+): ReturnType<typeof restoreAssistantMessageUnlocked> {
+	return withNarratorWorkAdmission(args[0], () => restoreAssistantMessageUnlocked(...args));
+}
+
+async function restoreAssistantMessageUnlocked(
 	narratorId: string,
 	messageId: string,
 ): Promise<{ ok: boolean }> {
@@ -8122,6 +8369,12 @@ export async function* startSession(
  * Deletes children first to satisfy FK constraints.
  */
 export async function cleanupPartialMessage(partialId: string, narratorId: string): Promise<void> {
+	return withNarratorWorkAdmission(narratorId, () =>
+		cleanupPartialMessageUnlocked(partialId, narratorId),
+	);
+}
+
+async function cleanupPartialMessageUnlocked(partialId: string, narratorId: string): Promise<void> {
 	try {
 		db.transaction((tx) => {
 			tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, partialId)).run();
@@ -8161,6 +8414,15 @@ export async function cleanupPartialMessage(partialId: string, narratorId: strin
  * @returns `true` if the message was kept (finalized), `false` if deleted.
  */
 export async function finalizeOrCleanupPartialMessage(
+	partialId: string,
+	narratorId: string,
+): Promise<boolean> {
+	return withNarratorWorkAdmission(narratorId, () =>
+		finalizeOrCleanupPartialMessageUnlocked(partialId, narratorId),
+	);
+}
+
+async function finalizeOrCleanupPartialMessageUnlocked(
 	partialId: string,
 	narratorId: string,
 ): Promise<boolean> {
@@ -8318,6 +8580,14 @@ const INTERRUPTABLE_TOOL_CALL_STATUSES = ["initializing", "pending", "running"] 
  * partial should be kept or deleted.
  */
 export async function markInterruptedToolCallsForMessage(
+	...args: Parameters<typeof markInterruptedToolCallsForMessageUnlocked>
+): ReturnType<typeof markInterruptedToolCallsForMessageUnlocked> {
+	return withNarratorWorkAdmission(args[0], () =>
+		markInterruptedToolCallsForMessageUnlocked(...args),
+	);
+}
+
+async function markInterruptedToolCallsForMessageUnlocked(
 	narratorId: string,
 	messageId: string,
 	locale: Locale = "en",
@@ -8346,6 +8616,12 @@ export async function markInterruptedToolCallsForMessage(
  * protocol requirement that every tool_use has a matching tool_result.
  */
 async function cleanupOrphanedToolCalls(narratorId: string, locale: Locale = "en"): Promise<void> {
+	return withNarratorWorkAdmission(narratorId, () =>
+		cleanupOrphanedToolCallsUnlocked(narratorId, locale),
+	);
+}
+
+async function cleanupOrphanedToolCallsUnlocked(narratorId: string, locale: Locale): Promise<void> {
 	await db
 		.update(narratorToolCalls)
 		.set({
@@ -8466,8 +8742,111 @@ export function isNarratorActive(narratorId: string): boolean {
  * cannot let a second concurrent loop start.
  */
 export function isLoopRunning(narratorId: string): boolean {
+	// Tool reexecution occupies the same exclusive foreground slot as a loop.
+	if (narratorLoopAdmissions.has(narratorId) || narratorToolExecutionAdmissions.has(narratorId)) {
+		return true;
+	}
 	const active = activeNarrators.get(narratorId);
 	return active?.alive === true && active._loopRunning === true;
+}
+
+/**
+ * Exclusive history/file-revert admission. HTTP cancellation only governs acquisition;
+ * after this resolves, the transaction owner MUST release after its true settlement.
+ */
+export async function acquireNarratorRevertAdmission(
+	narratorId: string,
+	options: { signal: AbortSignal; interrupt: boolean },
+): Promise<() => void> {
+	const { signal, interrupt } = options;
+	signal.throwIfAborted();
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { id: true, variant: true, parentNarratorId: true },
+	});
+	if (!narrator) throw new NotFoundError("Narrator", narratorId);
+	signal.throwIfAborted();
+	if (isSubagentVariant(narrator.variant)) {
+		throw new AppError(
+			"File revert admission only supports primary narrators",
+			409,
+			"NARRATOR_REVERT_SUBAGENT_UNSUPPORTED",
+		);
+	}
+	const busy = () => isNarratorRuntimeBusy(narratorId) || compactLocks.has(narratorId);
+	if (!interrupt && (busy() || hasNarratorAdmissionWork(narratorId))) {
+		throw new AppError("Narrator execution has not settled", 409, "NARRATOR_REVERT_BUSY");
+	}
+	const reservation = reserveNarratorRevertAdmission(narratorId);
+	let released = false;
+	const releaseAndResume = () => {
+		if (released) return;
+		released = true;
+		reservation.release();
+		// A loop's one-shot finalizer may already have tried (and been refused by
+		// the waiting gate). Cancellation can also leave admitted cleanup running:
+		// wait for its real settlement, rather than losing the wakeup to busy once.
+		void (async () => {
+			await waitForNarratorAdmissionWork(narratorId, new AbortController().signal);
+			await resumeBufferedMessagesIfIdle(narratorId, "en");
+		})().catch((error) => {
+			if (!isNarratorRevertAdmissionBlocked(narratorId)) {
+				logger.warn("Could not resume messages after file revert", {
+					narratorId,
+					error: String(error),
+				});
+			}
+		});
+	};
+	try {
+		if (interrupt) {
+			const {
+				getBackgroundAbortControllers,
+				getForegroundAbortControllers,
+				interruptForegroundSubagent,
+			} = await import("./subagent-detach");
+			const interrupted = new Set<AbortController>();
+			interruptPlannedUpdateRecovery(narratorId);
+			// No start mutex is held here. Starting work may not have mounted its abort
+			// controller yet, so rescan until ALL admitted work (including delivery) exits.
+			while (busy() || hasNarratorAdmissionWork(narratorId)) {
+				signal.throwIfAborted();
+				for (const owner of new Set([narratorId, ...listNarratorAdmissionOwners(narratorId)])) {
+					// A soft foreground abort suspends for manual input; a revert needs
+					// the real terminal boundary, including an already-suspended runner.
+					if (owner !== narratorId) interruptForegroundSubagent(owner, { hard: true });
+					const controllers = [
+						activeNarrators.get(owner)?.abortController,
+						getBackgroundAbortControllers().get(owner),
+						getForegroundAbortControllers().get(owner),
+						compactLocks.get(owner)?.abortController,
+					];
+					for (const controller of controllers) {
+						if (!controller || interrupted.has(controller)) continue;
+						interrupted.add(controller);
+						controller.abort(new Error("Narrator interrupted for file revert"));
+					}
+				}
+				await new Promise<void>((resolve, reject) => {
+					const onAbort = () => {
+						clearTimeout(timer);
+						signal.removeEventListener("abort", onAbort);
+						reject(signal.reason);
+					};
+					const timer = setTimeout(() => {
+						signal.removeEventListener("abort", onAbort);
+						resolve();
+					}, INTERRUPT_IDLE_POLL_MS);
+					signal.addEventListener("abort", onAbort, { once: true });
+				});
+			}
+		}
+		await reservation.acquire(signal, busy);
+		return releaseAndResume;
+	} catch (error) {
+		releaseAndResume();
+		throw error;
+	}
 }
 
 /**

@@ -324,6 +324,7 @@ class LocalExecHandle implements ExecHandle {
 	private proc: ChildProcess;
 	private exitedFlag = false;
 	readonly exited: Promise<number | null>;
+	readonly whenSettled: Promise<void>;
 
 	constructor(proc: ChildProcess) {
 		this.proc = proc;
@@ -339,10 +340,21 @@ class LocalExecHandle implements ExecHandle {
 				resolvePromise(code ?? null);
 			});
 			proc.once("error", (err) => {
-				this.exitedFlag = true;
+				// A failed kill/send is also an `error`: it says nothing about whether
+				// an already-spawned process has stopped. Only absent pid proves no spawn.
+				if (proc.pid === undefined) this.exitedFlag = true;
 				reject(err);
 			});
 		});
+		this.whenSettled = new Promise<void>((resolvePromise, reject) => {
+			proc.once("close", () => {
+				if (this.exitedFlag || proc.pid === undefined) resolvePromise();
+				else reject(new Error("Local process closed without a confirmed exit"));
+			});
+		});
+		// Other ExecHandle consumers may only await exited. Keep the independent
+		// barrier observable without introducing an unhandled rejection for them.
+		void this.whenSettled.catch(() => {});
 	}
 
 	onData(cb: (chunk: Uint8Array) => void): void {
@@ -702,6 +714,9 @@ export class LocalBackend implements ExecutionBackend {
 			];
 		}
 
+		// Cancellation before dispatch is a proven no-process outcome. Once spawn
+		// succeeds we always return its handle, including asynchronous spawn errors.
+		params.signal?.throwIfAborted();
 		clearInheritableHandlesBeforeSpawn();
 		const proc = spawn(...spawnArgs);
 		const handle = new LocalExecHandle(proc);
@@ -714,7 +729,8 @@ export class LocalBackend implements ExecutionBackend {
 			} else {
 				const onAbort = () => void handle.kill();
 				params.signal.addEventListener("abort", onAbort, { once: true });
-				void handle.exited.finally(() => params.signal?.removeEventListener("abort", onAbort));
+				const cleanup = () => params.signal?.removeEventListener("abort", onAbort);
+				void handle.whenSettled.then(cleanup, cleanup);
 			}
 		}
 

@@ -43,7 +43,7 @@ describe("file reference source viewer", () => {
 
 	test("navigation source is read-only and inherits the parent's internal opener", async () => {
 		const source = await Bun.file(new URL("./FileViewerContent.tsx", import.meta.url)).text();
-		expect(source).toContain("<CodeMirrorEditor");
+		expect(source).toContain("<MonacoEditor");
 		expect(source).toContain("readOnly");
 		expect(source).toContain("navigationRequestId={highlightRequestId}");
 		expect(source).toContain("onOpenFileTarget ?? parentScope.openFile");

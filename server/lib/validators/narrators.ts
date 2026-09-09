@@ -241,6 +241,35 @@ export const createRevertPlanSchema = z
 		(value) => value.kind !== "rollback_to_block" || value.selector.kind === "after_block",
 		"Block rollback requires an after_block selector",
 	);
+export const revertActionSchema = z.enum([
+	"revert_files",
+	"rollback_to_block",
+	"delete_tool_block",
+]);
+export const createRevertActionPreviewSchema = z
+	.object({
+		action: revertActionSchema,
+		messageId: revertPlanIdentifierSchema,
+		blockIndex: z
+			.number()
+			.int()
+			.min(0)
+			.max(FILE_CHANGE_LIMITS.historyToolRelatedChanges)
+			.optional(),
+		idempotencyKey: revertPlanIdentifierSchema,
+	})
+	.strict()
+	.refine(
+		(value) =>
+			value.action === "revert_files"
+				? value.blockIndex === undefined
+				: value.messageId !== "__all__" && value.blockIndex !== undefined,
+		"The action requires an exact message/block boundary",
+	);
+export const applyRevertPlanSchema = z
+	.object({ planHash: z.string().regex(/^[a-f0-9]{64}$/), action: revertActionSchema })
+	.strict();
+
 export const revertPlanFilesQuerySchema = z
 	.object({
 		cursor: z

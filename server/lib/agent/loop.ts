@@ -4073,7 +4073,9 @@ export async function* agentLoop(
 												}
 
 												// Compute streaming field delta
-												let streamingField: { name: string; delta: string } | undefined;
+												let streamingField:
+													| { name: string; delta: string; startsField?: boolean }
+													| undefined;
 												if (acc.activeStreamingField && wantedKeys.size > 0) {
 													const sfResult = extractJsonFields(raw, wantedKeys);
 													if (
@@ -4089,6 +4091,7 @@ export async function* agentLoop(
 																streamingField = {
 																	name: acc.activeStreamingField,
 																	delta: decoded.text,
+																	startsField: acc.streamingFieldYielded === 0,
 																};
 															}
 															acc.streamingFieldYielded += decoded.consumedChars;
@@ -4138,7 +4141,9 @@ export async function* agentLoop(
 											) {
 												acc.streamingMetadata = await resolveStreamingEditMetadata(acc, config.cwd);
 											}
-											let streamingField: { name: string; delta: string } | undefined;
+											let streamingField:
+												| { name: string; delta: string; startsField?: boolean }
+												| undefined;
 
 											if (acc.activeStreamingField && stopWantedKeys.size > 0) {
 												const sfResult = extractJsonFields(stopRaw, stopWantedKeys);
@@ -4155,6 +4160,7 @@ export async function* agentLoop(
 															streamingField = {
 																name: acc.activeStreamingField,
 																delta: decoded.text,
+																startsField: acc.streamingFieldYielded === 0,
 															};
 														}
 														acc.streamingFieldYielded += decoded.consumedChars;

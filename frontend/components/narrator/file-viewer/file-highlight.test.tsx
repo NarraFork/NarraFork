@@ -32,9 +32,7 @@ const globalKeys = [
 	"matchMedia",
 	"IS_REACT_ACT_ENVIRONMENT",
 ] as const;
-const originalGlobals = new Map(
-	globalKeys.map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]),
-);
+const originalGlobals = new Map<string, PropertyDescriptor | undefined>();
 
 beforeAll(async () => {
 	core = await createHighlighterCore({
@@ -49,7 +47,9 @@ beforeAll(async () => {
 
 beforeEach(() => {
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
-	Object.assign(globalThis, {
+	for (const key of globalKeys)
+		originalGlobals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+	const overrides = {
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -58,7 +58,10 @@ beforeEach(() => {
 		Node: window.Node,
 		matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
 		IS_REACT_ACT_ENVIRONMENT: true,
-	});
+	};
+	for (const [key, value] of Object.entries(overrides)) {
+		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+	}
 	container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);
@@ -71,17 +74,21 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-	await act(async () => root.unmount());
-	container.remove();
-	loaderSpy.mockRestore();
-	clearHighlightCache();
+	try {
+		await act(async () => root?.unmount());
+		container?.remove();
+	} finally {
+		loaderSpy?.mockRestore();
+		clearHighlightCache();
+		for (const [key, descriptor] of originalGlobals) {
+			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+			else Reflect.deleteProperty(globalThis, key);
+		}
+		originalGlobals.clear();
+	}
 });
 afterAll(() => {
 	core.dispose();
-	for (const [key, descriptor] of originalGlobals) {
-		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
-		else Reflect.deleteProperty(globalThis, key);
-	}
 });
 
 async function render(

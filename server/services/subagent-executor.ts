@@ -107,6 +107,7 @@ import type { UpdateExecutionLease } from "./update-coordinator";
 // ---------------------------------------------------------------------------
 
 export interface SubagentBufferedMessage {
+	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	id: string;
 	text: string;
 	images?: ImageRef[];
@@ -437,6 +438,7 @@ export async function readSubagentSpecContinuationState(narratorId: string): Pro
  * Returns false if the queue is full.
  */
 export interface SubagentBufferedMessageOptions {
+	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	images?: ImageRef[];
 	textFiles?: File[];
 	fileReferences?: FileReferenceSnapshot[];
@@ -459,6 +461,7 @@ export function pushSubagentBufferedMessage(
 	}
 	const position = options?.position ?? "back";
 	const entry: SubagentBufferedMessage = {
+		delivery: options?.delivery,
 		id,
 		text,
 		images: options?.images,
@@ -526,6 +529,9 @@ export function updateSubagentBufferedMessage(
 	const message = queue?.find((queued) => queued.id === messageId);
 	if (!message) return false;
 	message.text = text;
+	// A human edit replaces the queued agent delivery. Its reserved receipt must
+	// not later point at different bytes or attribute the human's words to an agent.
+	message.delivery = undefined;
 	// `undefined` means "leave this alone" so text-only callers are unaffected.
 	// This queue is purely in-memory: there is no DB row to sync and no persisted
 	// file to remove, so replacing the arrays is the whole update.
@@ -707,25 +713,16 @@ async function saveBufferedTextFiles(cwd: string, files?: File[]): Promise<TextF
 	return saved;
 }
 
-export async function consumeNextBufferedSubagentMessage(opts: {
+async function persistNextBufferedSubagentMessage(opts: {
 	narratorId: string;
 	parentNarratorId: string;
 	toolUseId: string;
-	model: string;
-	provider: string;
 	cwd: string;
-	pruneBoundaryId?: string | null;
-	/** Locale for the knowledge hint this drain may write. Defaults to English. */
-	locale?: string;
 }): Promise<{
-	prompt: string;
-	history: unknown[];
-	trailingToolResults: unknown[];
-	userId?: string | null;
-	prePromptBashCommand?: string;
+	buffered: SubagentBufferedMessage;
+	userMsg: Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>;
 } | null> {
-	const { narratorId, parentNarratorId, toolUseId, model, provider } = opts;
-	let { pruneBoundaryId } = opts;
+	const { narratorId, parentNarratorId, toolUseId } = opts;
 	const bufQueue = getSubagentBufferedMessagesMap().get(narratorId);
 	const buffered = bufQueue?.[0];
 	if (!buffered) return null;
@@ -748,6 +745,7 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 				images: buffered.images,
 				textFiles,
 				fileReferences: buffered.fileReferences,
+				delivery: buffered.delivery,
 				commandText: buffered.commandText,
 				createdBy: buffered.createdBy,
 			},
@@ -782,6 +780,62 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 		messageId: buffered.id,
 		remaining,
 	});
+	return { buffered, userMsg };
+}
+
+/** The running-pass path shares the same durable claim/restore boundary as restarts. */
+export async function consumeBufferedSubagentMessageInPass(opts: {
+	narratorId: string;
+	parentNarratorId: string;
+	toolUseId: string;
+	cwd: string;
+	currentUserId?: string | null;
+}): Promise<{ buffered: SubagentBufferedMessage; text: string } | null> {
+	const buffered = getSubagentBufferedMessagesMap().get(opts.narratorId)?.[0];
+	if (
+		!buffered ||
+		shouldStopSubagentForBufferedMessage(opts.narratorId) ||
+		!canDeliverBufferedMessageInPass(buffered, opts.currentUserId)
+	)
+		return null;
+	try {
+		const claimed = await persistNextBufferedSubagentMessage(opts);
+		return claimed
+			? {
+					buffered: claimed.buffered,
+					text: projectFileReferenceText(claimed.buffered.text, claimed.buffered.fileReferences),
+				}
+			: null;
+	} catch (error) {
+		logger.error("Failed to persist injected subagent user message; retained for retry", {
+			narratorId: opts.narratorId,
+			error: String(error),
+		});
+		return null;
+	}
+}
+
+export async function consumeNextBufferedSubagentMessage(opts: {
+	narratorId: string;
+	parentNarratorId: string;
+	toolUseId: string;
+	model: string;
+	provider: string;
+	cwd: string;
+	pruneBoundaryId?: string | null;
+	locale?: string;
+}): Promise<{
+	prompt: string;
+	history: unknown[];
+	trailingToolResults: unknown[];
+	userId?: string | null;
+	prePromptBashCommand?: string;
+} | null> {
+	const claimed = await persistNextBufferedSubagentMessage(opts);
+	if (!claimed) return null;
+	const { buffered, userMsg } = claimed;
+	const { narratorId, parentNarratorId, toolUseId, model, provider } = opts;
+	let { pruneBoundaryId } = opts;
 	// Point A for a message that could NOT be folded into the running pass (attachments, a
 	// pre-prompt command, or a different acting user). Scanned here rather than at the
 	// three call sites — the executor's pass restart, the runner's post-interrupt drain and
@@ -1448,65 +1502,18 @@ async function runSubagentLoop(
 				// it is — somebody addressed this subagent). Injecting again would duplicate
 				// it. The text is still needed because the loop built its in-memory history
 				// at pass start.
-				const queue = getSubagentBufferedMessagesMap().get(narratorId);
-				const buf = queue?.[0];
-				// A pending soft stop means this pass is already ending for the sake of the
-				// queue (direct user feedback asks for that). Draining here would be worse
-				// than waiting: the loop sets `gracefulStopRequested` back in the tool loop
-				// and returns right after this drain, discarding the `nextTurnContent` we
-				// would have contributed — while the queue is now empty, so the restart path
-				// finds nothing and the subagent finalizes with the message unanswered.
-				// Leave those to `consumeNextBufferedSubagentMessage`, which rebuilds history.
-				const softStopPending = shouldStopSubagentForBufferedMessage(narratorId);
-				if (buf && !softStopPending && canDeliverBufferedMessageInPass(buf, currentUserId)) {
-					queue?.shift();
-					if (queue?.length === 0) {
-						getSubagentBufferedMessagesMap().delete(narratorId);
-						getSubagentBufferedMessageSoftStops().delete(narratorId);
-					}
-					// Persist user message in the background (fire-and-forget).
-					narratorService
-						.persistSubagentUserMessage(narratorId, buf.text, toolUseId, {
-							commandText: buf.commandText,
-							createdBy: buf.createdBy,
-							fileReferences: buf.fileReferences,
-						})
-						.then((userMsg) => {
-							broadcastToNarrator(parentNarratorId, {
-								type: "user_message",
-								narratorId: parentNarratorId,
-								message: fileReferenceMessageForDisplay(userMsg),
-							});
-							broadcastToNarrator(narratorId, {
-								type: "user_message",
-								narratorId,
-								message: fileReferenceMessageForDisplay({ ...userMsg, parentToolUseId: null }),
-							});
-						})
-						.catch((err) => {
-							logger.error("Failed to persist injected subagent user message", {
-								narratorId,
-								error: String(err),
-							});
-						});
-					const remaining = toBufferSummary(getSubagentBufferedMessagesMap().get(narratorId) ?? []);
-					broadcastToNarrator(parentNarratorId, {
-						type: "buffer_consumed",
-						narratorId: parentNarratorId,
-						messageId: buf.id,
-						remaining,
-					});
-					broadcastToNarrator(narratorId, {
-						type: "buffer_consumed",
-						narratorId,
-						messageId: buf.id,
-						remaining,
-					});
-					parts.push(projectFileReferenceText(buf.text, buf.fileReferences));
-					// Point A for a LIVE subagent: this text was typed on the subagent's own
-					// page or sent by the parent/a sibling, so nobody has scanned it. The ACL
-					// identity is the message's own `createdBy` when it has one, else the
-					// chain's acting user — never the sending agent.
+				// Soft-stop inputs remain queued for the restart path; eligible inputs are
+				// claimed and persisted before their bytes can enter the next model request.
+				const inPass = await consumeBufferedSubagentMessageInPass({
+					narratorId,
+					parentNarratorId,
+					toolUseId,
+					cwd,
+					currentUserId,
+				});
+				if (inPass) {
+					parts.push(inPass.text);
+					const buf = inPass.buffered;
 					const hint = await deliverKnowledgeHint(buf.text, "buffered_message", buf.createdBy);
 					if (hint) parts.push(hint);
 				}
@@ -1541,6 +1548,7 @@ async function runSubagentLoop(
 									// Reader-only navigation target into the sender's own session;
 									// omitted when the sender had written nothing yet.
 									...(m.fromMessageId ? { fromMessageId: m.fromMessageId } : {}),
+									...(m.fromToolUseId ? { fromToolUseId: m.fromToolUseId } : {}),
 									...(m.isBroadcast ? { isBroadcast: true } : {}),
 									text: m.text,
 								},
@@ -1551,6 +1559,7 @@ async function runSubagentLoop(
 					const { turnText } = await deliverInjection(narratorId, {
 						content,
 						body,
+						messageId: m.delivery?.recipientMessageId,
 						source: "team_message",
 						schedule: "onNextTurn",
 						locale: locale as Locale,

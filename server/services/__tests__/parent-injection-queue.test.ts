@@ -15,7 +15,11 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { CompletedNotification } from "../background-task-service";
 import type { CompletedBgSubagentNotification } from "../bg-completion-queue";
-import { formatParentInboundMessages, type ParentInboundMessage } from "../parent-inbound-queue";
+import {
+	formatParentInboundMessages,
+	type ParentInboundMessage,
+	pushParentInboundMessage,
+} from "../parent-inbound-queue";
 import {
 	drainPendingInjections,
 	hasPendingInjections,
@@ -73,6 +77,31 @@ beforeEach(() => {
 });
 
 describe("parent injection queue — order across kinds", () => {
+	test("preserves the exact Send invocation without leaking it into model text", () => {
+		const message: ParentInboundMessage = {
+			fromId: "child",
+			fromTitle: "worker",
+			fromType: "general",
+			fromToolUseId: "send-tool-secret",
+			text: "progress report",
+			timestamp: new Date().toISOString(),
+		};
+		pushParentInboundMessage(P, message);
+		const entry = drainPendingInjections(P)[0];
+		expect(entry?.kind).toBe("subagent_message");
+		if (entry?.kind !== "subagent_message") throw new Error("missing delivery");
+		expect(entry.message.fromToolUseId).toBe("send-tool-secret");
+		expect(formatParentInboundMessages([entry.message], "en")).not.toContain("send-tool-secret");
+	});
+
+	test("Send producer and persisted injection keep the invocation coordinate", async () => {
+		const producer = await Bun.file(new URL("../agent-communication.ts", import.meta.url)).text();
+		const delivery = await Bun.file(new URL("../narrator-session.ts", import.meta.url)).text();
+		expect(producer).toContain("fromToolUseId: input.toolUseId");
+		expect(producer).not.toContain("getSubagentResultMessageId");
+		expect(delivery).toContain("{ fromToolUseId: message.fromToolUseId }");
+	});
+
 	test("preserves arrival order when kinds interleave", () => {
 		// The exact shape of the reported bug: Send happens first, completion second.
 		pushPendingInjection(P, msg("ready"));

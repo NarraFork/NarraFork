@@ -196,6 +196,8 @@ export interface TopLevelStreamingChunk {
 	_streamingOutput?: string;
 	/** Latest determinate progress measurement (drives a real progress bar). */
 	_structuredProgress?: ToolProgressPayload;
+	_sendDeliveryTargets?: Array<{ id: string; deliveryMessageId: string }>;
+	_sendDeliveryBinding?: { toolCallId: string; attempt: number };
 }
 
 function streamingFieldSource(
@@ -226,7 +228,7 @@ export function foldStreamingToolFields(
 		toolUseId: string;
 		inputCharsTotal: number;
 		extractedFields?: Record<string, string>;
-		streamingField?: { name: string; delta: string };
+		streamingField?: { name: string; delta: string; startsField?: boolean };
 	},
 ): Pick<
 	TopLevelStreamingChunk,
@@ -252,15 +254,19 @@ export function foldStreamingToolFields(
 	if (event.streamingField) {
 		const field = event.streamingField.name;
 		const same = name === field;
-		const before = !discontinuous && same ? streamingFieldSource(previous, field) : undefined;
-		// A first delta can be a reconnect tail. No wire field proves its file origin.
+		const before =
+			!discontinuous && same && !event.streamingField.startsField
+				? streamingFieldSource(previous, field)
+				: undefined;
+		// Only an explicit field-start marker proves a first delta is not a reconnect tail.
 		const source = appendSourceText(
 			before ??
 				createSourceText("", {
 					epoch: ranges[field]
 						? nextSourceEpoch(ranges[field].epoch)
 						: `${event.toolUseId}:${field}`,
-					originKnown: false,
+					originKnown: event.streamingField.startsField === true,
+					streaming: true,
 				}),
 			event.streamingField.delta,
 			STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS,
@@ -336,8 +342,18 @@ function streamingChunkInput(chunk: TopLevelStreamingChunk): Record<string, unkn
 export function topLevelStreamingChunkToToolFields(
 	chunk: TopLevelStreamingChunk,
 ): Record<string, unknown> {
+	const receipts = {
+		...(chunk._sendDeliveryTargets ? { _sendDeliveryTargets: chunk._sendDeliveryTargets } : {}),
+		...(chunk._sendDeliveryBinding
+			? {
+					tcId: chunk._sendDeliveryBinding.toolCallId,
+					executionAttempt: chunk._sendDeliveryBinding.attempt,
+				}
+			: {}),
+	};
 	if (chunk._started) {
 		return {
+			...receipts,
 			// `initializing`, not `running`: `_started` means the tool's INPUT finished
 			// parsing, and the permission gate sits after that. The real `running` arrives
 			// with `tool_executing` (which the store folds into `_status`), so defaulting to
@@ -361,6 +377,7 @@ export function topLevelStreamingChunkToToolFields(
 	}
 
 	return {
+		...receipts,
 		inputJson: streamingChunkInput(chunk),
 		...(chunk.metadata ? { _metadata: chunk.metadata } : {}),
 	};
@@ -528,6 +545,20 @@ export function buildTopLevelStreamingChunksMsg(
 					_metadata: chunk.metadata,
 				} as (typeof toolCalls)[number];
 			}
+		}
+		if (chunk._sendDeliveryTargets) {
+			const index = toolCalls.findIndex((tc) => tc.toolUseId === chunk.toolUseId);
+			if (index >= 0)
+				toolCalls[index] = {
+					...toolCalls[index],
+					_sendDeliveryTargets: chunk._sendDeliveryTargets,
+					...(chunk._sendDeliveryBinding
+						? {
+								tcId: chunk._sendDeliveryBinding.toolCallId,
+								executionAttempt: chunk._sendDeliveryBinding.attempt,
+							}
+						: {}),
+				} as (typeof toolCalls)[number];
 		}
 	}
 

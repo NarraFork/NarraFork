@@ -40,6 +40,7 @@ import {
 import { resetStreamingBlockCache } from "./streaming-block-cache";
 import { commitGrowthSignature, type HandoffMessage } from "./streaming-handoff";
 import {
+	applyStreamingSendDelivery,
 	applyStreamingToolChunk,
 	applyStreamingToolCompleted,
 	applyStreamingToolExecuting,
@@ -421,6 +422,13 @@ export function useVListStreamingMessage(
 			// On a parent page an event carrying a parentToolUseId describes a CHILD
 			// tool; the parent card's activity summary is maintained by the document
 			// patch channel, so it must not become a top-level card here.
+			onSendDeliveryResolved: (toolUseId, targets, rawParentToolUseId, toolCallBinding) => {
+				if (!isSubagent && rawParentToolUseId) return;
+				if (
+					applyStreamingSendDelivery(toolStoreRef.current, { toolUseId, targets, toolCallBinding })
+				)
+					flush();
+			},
 			onToolUseChunk: (
 				toolUseId,
 				toolName,

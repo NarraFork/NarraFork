@@ -7,7 +7,6 @@ import {
 	getFileReferenceSnapshots,
 	projectFileReferenceText,
 } from "../lib/agent/file-reference-projection";
-import { AsyncMutex } from "../lib/async-mutex";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -17,6 +16,11 @@ import { resolveEffectiveModel, resolveProvider } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
+import {
+	withNarratorMutationAdmission,
+	withNarratorStartAdmission,
+	withNarratorWorkAdmission,
+} from "./narrator-session-state";
 import type { RevertScope, RevertWarning } from "./snapshot-revert";
 import { loadSubagentHistory } from "./subagent-executor";
 import {
@@ -42,6 +46,7 @@ export type SubagentResumeIntent =
 export type SubagentResumeActor = "user" | "parent_agent";
 
 export interface ResumeSubagentInput {
+	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	subagentId: string;
 	intent: SubagentResumeIntent;
 	actor: SubagentResumeActor;
@@ -126,7 +131,6 @@ interface ActiveResumeRun {
 	delivered: boolean;
 }
 
-const resumeLock = new AsyncMutex();
 const activeResumeRuns = new Map<string, ActiveResumeRun>();
 
 export function hasActiveSubagentResumeRun(subagentId: string): boolean {
@@ -134,7 +138,7 @@ export function hasActiveSubagentResumeRun(subagentId: string): boolean {
 }
 
 export function withSubagentResumeLock<T>(subagentId: string, fn: () => Promise<T>): Promise<T> {
-	return resumeLock.acquire(subagentId, fn);
+	return withNarratorMutationAdmission(subagentId, fn);
 }
 
 export async function resolveSubagentOriginToolUseId(subagentId: string): Promise<string> {
@@ -369,6 +373,16 @@ async function deliverCompletedResume(
 }
 
 export async function resumeSubagent(input: ResumeSubagentInput): Promise<ResumeSubagentResult> {
+	return withNarratorStartAdmission(input.subagentId, () =>
+		withNarratorWorkAdmission(
+			input.subagentId,
+			() => resumeSubagentUnlocked(input),
+			(result) => result.terminalCompletion,
+		),
+	);
+}
+
+async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<ResumeSubagentResult> {
 	input = {
 		...input,
 		fileReferences:
@@ -531,6 +545,7 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 							images: input.images,
 							textFiles: savedTextFiles,
 							fileReferences: input.fileReferences,
+							delivery: input.delivery,
 							commandText: input.commandText,
 							createdBy: input.createdBy,
 						},
@@ -610,6 +625,7 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 				images: input.images,
 				textFiles: input.textFiles,
 				fileReferences: input.fileReferences,
+				delivery: input.delivery,
 				commandText: input.commandText,
 				createdBy: input.createdBy,
 				userId: input.createdBy,
@@ -674,7 +690,7 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 				}
 				return output;
 			});
-			void terminalCompletion.catch(async (error) => {
+			const settledCompletion = terminalCompletion.catch(async (error) => {
 				logger.error("Resumed subagent run failed", {
 					subagentId: input.subagentId,
 					token,
@@ -690,13 +706,15 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 						activeResumeRuns.delete(input.subagentId);
 					}
 				});
+				throw error;
 			});
+			void settledCompletion.catch(() => {});
 			return {
 				started: true,
 				resumedSuspendedRunner: false,
 				originToolUseId,
 				token,
-				terminalCompletion,
+				terminalCompletion: settledCompletion,
 				userMessage: started.userMessage,
 				...(editRevertWarnings?.length ? { revertWarnings: editRevertWarnings } : {}),
 			};

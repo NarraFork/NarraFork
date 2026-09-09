@@ -3,6 +3,7 @@ import { db } from "../db";
 import { narrators } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { type AgentMessageDelivery, createAgentMessageDelivery } from "./agent-message-delivery";
 import { normalizeWorkspacePath } from "./git-workspace";
 import { subagentFileIdentityKey } from "./subagent-file-changes";
 
@@ -107,6 +108,8 @@ export function clearTeamFileChanges(parentNarratorId: string): void {
 // === Team messaging ===
 
 export interface TeamMessage {
+	fromToolUseId?: string;
+	delivery?: AgentMessageDelivery;
 	fromId: string;
 	fromTitle: string | null;
 	/**
@@ -142,7 +145,25 @@ export function deliverTeamMessage(
 	targetId: string,
 	message: TeamMessage,
 	parentNarratorId?: string,
-): void {
+): string | undefined {
+	// Reserve independently per recipient, even when the caller broadcasts one object.
+	if (message.fromToolUseId) {
+		message = {
+			...message,
+			delivery: createAgentMessageDelivery(
+				targetId,
+				{
+					id: message.fromId,
+					title: message.fromTitle,
+					label: message.fromLabel ?? message.fromId,
+					type: message.fromType,
+					isParent: message.fromId === parentNarratorId,
+				},
+				message.fromToolUseId,
+				message.text,
+			),
+		};
+	}
 	const inbox = getTeamInboxMap();
 	if (!inbox.has(targetId)) inbox.set(targetId, []);
 	inbox.get(targetId)?.push(message);
@@ -165,6 +186,7 @@ export function deliverTeamMessage(
 			isBroadcast: message.isBroadcast,
 		});
 	}
+	return message.delivery?.recipientMessageId;
 }
 
 /** Drain all pending team messages for a subagent. */

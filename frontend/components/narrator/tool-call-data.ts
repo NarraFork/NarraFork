@@ -74,6 +74,8 @@ export interface ToolCallData {
 	 * height); see `AWAIT_AGENT_RESOLVED_FIELD` on the server.
 	 */
 	_awaitAgentNarratorId?: string;
+	/** Accepted/queued delivery receipts, independent of the eventual tool result. */
+	_sendDeliveryTargets?: Array<{ id: string; deliveryMessageId: string }>;
 	/**
 	 * The subagent this call waits on is TAKEN OVER by the user, so the call is
 	 * blocked until the takeover stops.

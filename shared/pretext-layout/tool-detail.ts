@@ -1194,6 +1194,7 @@ export function toolInputFieldRange(
 			(live ? `untracked:${sourceId}:${untrackedSnapshotRevision(text)}` : `source:${sourceId}`),
 		originKnown: range?.originKnown ?? !live,
 		complete: !live && !truncated,
+		streaming: live && !truncated,
 	}).range;
 	if (!range) return observed;
 	// The server cut the field at its beginning. Preserve that beginning's source
@@ -1201,6 +1202,7 @@ export function toolInputFieldRange(
 	return {
 		...range,
 		complete: false,
+		streaming: false,
 		endsWithCR: observed.endsWithCR,
 		endOffset: range.startOffset + observed.endOffset,
 		endLine: range.startLine + observed.endLine,

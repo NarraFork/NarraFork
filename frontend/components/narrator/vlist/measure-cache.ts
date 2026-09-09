@@ -248,6 +248,16 @@ export function extractDataRevision(data: unknown): string | undefined {
 		rev += `|cm:${textSignature(d.message)}|ct:${d.messageTruncated === true ? 1 : 0}`;
 		if (typeof d.error === "string") rev += `|ce:${textSignature(d.error)}`;
 		if (typeof d.warning === "string") rev += `|cw:${textSignature(d.warning)}`;
+		// ExactRow memoizes by the measured object: navigation-only changes must
+		// still repaint the recipient buttons, even when body and height stay equal.
+		if (Array.isArray(d.recipients)) {
+			rev += `|cr:${JSON.stringify(
+				d.recipients.map((recipient) => {
+					const r = recipient as Record<string, unknown>;
+					return [r.id, r.label, r.deliveryMessageId];
+				}),
+			)}|ca:${d.awaitReply === true}|cb:${d.broadcast === true}`;
+		}
 	}
 	if (Array.isArray(d.attachments)) {
 		// Locator data is painted/clicked from cached blocks, including equal labels

@@ -24,6 +24,8 @@ import {
 	reflectionTitleKeySuffix,
 } from "@shared/pretext-layout/reflection";
 import { VLIST_ELEMENT_KINDS } from "./registry";
+import { resolveRenderExtra } from "./render-registry";
+import { adaptSegments } from "./segment-adapter";
 import {
 	reflectionTitleLabels,
 	renderLabelsForKind,
@@ -68,6 +70,9 @@ const NO_LABELS_KINDS: Record<string, string> = {
 	// only chrome is the speaker header node and the trailing note, both built by the
 	// integration layer — the render layer imports no avatar and no i18n.
 	"injection-bubble": "shell injects extra.header + extra.noteText",
+	// Unlike render bundles, communication chrome travels in data.labels from
+	// ctx.labels; the adapter → registry test below pins that separate route.
+	"communication-bubble": "adapter injects data.labels; registry forwards extra.data",
 	"tool-call-group": "shell injects extra.label + extra.statusLabel",
 	"prune-divider": "shell injects extra.fallbackLabel",
 	// Count lines carry adapter-composed header text as DATA (it embeds the live
@@ -114,6 +119,51 @@ describe("renderLabelsForKind — every chrome-painting kind is localizable", ()
 });
 
 describe("adapter chrome keys — every fallback has an injected translation", () => {
+	it("forwards communication chrome and receipt labels through adapter data", () => {
+		const keys = [
+			"sendAwaitReply",
+			"sendNoAwaitReply",
+			"communicationBroadcast",
+			"communicationRecipientUnknown",
+			"communicationRunning",
+			"communicationSuccess",
+			"communicationError",
+			"communicationCancelled",
+			"communicationWaiting",
+			"communicationViewFull",
+			"communicationReceiptLegacy",
+			"communicationReceiptUnavailable",
+			"communicationReceiptError",
+		];
+		const labels = Object.fromEntries(keys.map((key) => [key, `localized:${key}`]));
+		const [spec] = adaptSegments(
+			[
+				{
+					kind: "tool-run",
+					items: [
+						{
+							blockIndex: 0,
+							isSubagent: false,
+							tc: {
+								toolUseId: "send-labels",
+								toolName: "Send",
+								status: "success",
+								inputJson: { id: "worker", message: "hello" },
+							},
+						},
+					],
+					sourceMessages: [],
+				},
+			],
+			{ lod: 5, labels },
+		);
+		expect(spec?.kind).toBe("communication-bubble");
+		if (!spec) throw new Error("missing communication bubble");
+		expect(resolveRenderExtra(spec).data).toMatchObject({ labels });
+		const source = readFileSync(join(import.meta.dir, "useVListLabels.ts"), "utf8");
+		for (const key of keys) expect(source).toContain(`${key}: t("${key}")`);
+	});
+
 	it("injects every SYSTEM_LABEL_FALLBACKS key", () => {
 		// The adapter falls back to English for any key the shell fails to inject,
 		// so the fallback table is the authoritative list of what must be injected.

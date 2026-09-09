@@ -350,6 +350,15 @@ export type NarratorServerMessage =
 			subagentNarratorId: string;
 			parentToolUseId?: string;
 	  }
+	/** Navigation receipts only: queued deliveryMessageIds may not yet exist in the DB. */
+	| {
+			type: "send_delivery_resolved";
+			narratorId: string;
+			toolUseId: string;
+			targets: Array<{ id: string; deliveryMessageId: string }>;
+			toolCallBinding?: { toolCallId: string; attempt: number };
+			parentToolUseId?: string;
+	  }
 	| {
 			type: "tool_output";
 			narratorId: string;
@@ -620,7 +629,7 @@ export type NarratorServerMessage =
 			extractedFields?: Record<string, string>;
 			metadata?: Record<string, unknown>;
 			/** Incremental delta of the large streaming field */
-			streamingField?: { name: string; delta: string };
+			streamingField?: { name: string; delta: string; startsField?: boolean };
 			/**
 			 * Child-row label for the parent card's "recent calls" list. Built from the
 			 * fields the streaming JSON parser has already extracted, so the row can be

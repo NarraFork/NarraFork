@@ -43,6 +43,7 @@ import {
 	getSubagentResultMessageId,
 	startBackgroundCompletionContinuationIfPossible,
 } from "./narrator-session";
+import { withNarratorStartAdmission, withNarratorWorkAdmission } from "./narrator-session-state";
 import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
 import {
 	attachSubagent,
@@ -583,6 +584,14 @@ export async function announceResumedBackgroundTask(
  * silently ended during takeover, so the normal task-row transition is skipped).
  */
 export async function finalizeTakenOverBackgroundSubagent(
+	...args: Parameters<typeof finalizeTakenOverBackgroundSubagentUnlocked>
+): ReturnType<typeof finalizeTakenOverBackgroundSubagentUnlocked> {
+	return withNarratorWorkAdmission(args[0], () =>
+		finalizeTakenOverBackgroundSubagentUnlocked(...args),
+	);
+}
+
+async function finalizeTakenOverBackgroundSubagentUnlocked(
 	narratorId: string,
 	parentNarratorId: string,
 	toolUseId: string,
@@ -790,6 +799,10 @@ export function broadcastSubagentStarted(
  * Updates narrator status and broadcasts events on completion/failure.
  */
 export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<void> {
+	return withNarratorWorkAdmission(opts.narratorId, () => executeBackgroundTaskUnlocked(opts));
+}
+
+async function executeBackgroundTaskUnlocked(opts: SubagentExecOptions): Promise<void> {
 	const { narratorId, parentNarratorId, toolUseId, locale, updateLease } = opts;
 	const backgroundAbortController = getBackgroundAbortControllers().get(narratorId);
 	const executionStartedAt = Date.now();
@@ -1165,6 +1178,23 @@ export interface ForegroundRunHandle {
  * detach may hand control back to the parent without pretending the run finished.
  */
 export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHandle {
+	const runId = generateId();
+	const admitted = withNarratorWorkAdmission(
+		input.subagentId,
+		async () => startForegroundRunUnlocked(input, runId),
+		(run) => run.terminal,
+	);
+	const terminal = admitted.then((run) => run.terminal);
+	// Legacy callers only await foreground; admission rejection must not leave an
+	// unobserved second rejection, while terminal still rejects for structured callers.
+	void terminal.catch(() => {});
+	return { runId, foreground: admitted.then((run) => run.foreground), terminal };
+}
+
+function startForegroundRunUnlocked(
+	input: ForegroundLoopInput,
+	runId: string,
+): ForegroundRunHandle {
 	const {
 		subagentId,
 		parentNarratorId,
@@ -1232,7 +1262,6 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 		? AbortSignal.any([signal, executionTimeout.signal])
 		: signal;
 
-	const runId = generateId();
 	const { promise: foregroundPromise, resolve: resolveForeground } =
 		Promise.withResolvers<ForegroundRunPublication>();
 	const { promise: terminalPromise, resolve: resolveTerminal } =
@@ -1747,6 +1776,10 @@ export interface RunSubagentInput {
  * and returns the final text result.
  */
 export async function runSubagent(input: RunSubagentInput): Promise<string> {
+	return withNarratorWorkAdmission(input.parentNarratorId, () => runSubagentUnlocked(input));
+}
+
+async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	const {
 		parentNarratorId,
 		toolUseId,
@@ -1982,29 +2015,31 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			throw error;
 		}
 
-		// Fire-and-forget execution
-		executeBackgroundTask({
-			narratorId: subagentId,
-			parentNarratorId,
-			toolUseId,
-			subagentType,
-			prompt,
-			cwd,
-			model,
-			provider,
-			locale,
-			signal: bgAbort.signal,
-			timeoutMs,
-			userId: userId ?? null,
-			systemPrompt,
-			initialHistory: [],
-			customDef,
-			rebuildSystemPrompt,
-			updateLease,
-		}).catch((err) => {
-			logger.error("Background task unexpected error", {
-				subagentId,
-				error: err instanceof Error ? err.message : String(err),
+		// Resolve the child's trusted root before handing off the startup lease.
+		await withNarratorWorkAdmission(subagentId, async () => {
+			void executeBackgroundTask({
+				narratorId: subagentId,
+				parentNarratorId,
+				toolUseId,
+				subagentType,
+				prompt,
+				cwd,
+				model,
+				provider,
+				locale,
+				signal: bgAbort.signal,
+				timeoutMs,
+				userId: userId ?? null,
+				systemPrompt,
+				initialHistory: [],
+				customDef,
+				rebuildSystemPrompt,
+				updateLease,
+			}).catch((err) => {
+				logger.error("Background task unexpected error", {
+					subagentId,
+					error: err instanceof Error ? err.message : String(err),
+				});
 			});
 		});
 
@@ -2051,6 +2086,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 // === Continue subagent ===
 
 export interface ContinueSubagentInput {
+	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	fileReferences?: FileReferenceSnapshot[];
 	subagentId: string;
 	parentNarratorId: string;
@@ -2129,6 +2165,18 @@ export interface StartedSubagentContinuation {
  * continuous conversation visible on the subagent page.
  */
 export async function startContinuedSubagent(
+	input: ContinueSubagentInput,
+): Promise<StartedSubagentContinuation> {
+	return withNarratorStartAdmission(input.subagentId, () =>
+		withNarratorWorkAdmission(
+			input.subagentId,
+			() => startContinuedSubagentUnlocked(input),
+			(result) => result.terminalCompletion,
+		),
+	);
+}
+
+async function startContinuedSubagentUnlocked(
 	input: ContinueSubagentInput,
 ): Promise<StartedSubagentContinuation> {
 	const { subagentId, parentNarratorId, toolUseId, prompt, signal, locale } = input;
@@ -2297,6 +2345,7 @@ export async function startContinuedSubagent(
 					images: input.images,
 					textFiles: savedTextFiles,
 					fileReferences: acceptedReferences,
+					delivery: input.delivery,
 					commandText: input.commandText,
 					createdBy: input.createdBy,
 				},

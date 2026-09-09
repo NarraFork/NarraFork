@@ -125,6 +125,19 @@ describe("canonical body measurement", () => {
 		}
 	});
 
+	it("partial Edit previews reserve only the rows currently available", async () => {
+		const { createDiffDocument } = await import("@shared/pretext-layout/diff-core");
+		const m = await mod();
+		for (const text of ["", "a", "a\nb\nc"]) {
+			const document = createDiffDocument({ oldText: text, newText: text });
+			const model = bodyFixture({ cap: "diff", format: "diff", diffDocument: document });
+			const partial = m.measureToolBody({ ...model, live: true, textTruncated: true }, WIDTH);
+			const complete = m.measureToolBody(model, WIDTH);
+			expect(partial.height).toBe(complete.height);
+			expect(partial.height).toBeLessThan(m.DETAIL_CAPS.diff);
+		}
+	});
+
 	it("empty truncated text still reserves the complete cap", async () => {
 		const m = await mod();
 		const result = m.measureToolBody(

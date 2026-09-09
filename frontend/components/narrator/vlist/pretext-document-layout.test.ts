@@ -95,6 +95,49 @@ describe("buildPretextDocumentLayout", () => {
 		expect(built.manifest.items.some((item) => item.sourceMessageIds.includes("m1"))).toBe(true);
 	});
 
+	it("reuses communication measurements on rebuild but invalidates receipt labels on language change", () => {
+		const input = { id: "worker", message: "hello" };
+		const messages = [
+			{
+				...message("communication-label-cache", 0, "assistant", ""),
+				contentJson: [{ type: "tool_use", id: "send-label-cache", name: "Send", input }],
+				toolCalls: [
+					{
+						toolUseId: "send-label-cache",
+						toolName: "Send",
+						status: "success",
+						inputJson: input,
+					},
+				],
+			},
+		] as unknown as NarratorMsg[];
+		const build = (language: string, receiptLabel: string) => {
+			const result = buildPretextDocumentLayout(messages, {
+				layoutRevision: "communication-label-cache",
+				documentRevision: 1,
+				lod: 5,
+				widthBucket: "860",
+				contentWidth: 860,
+				labelsRevision: language,
+				labels: { communicationReceiptLegacy: receiptLabel },
+			});
+			const row = result.items.find((item) => item.spec.kind === "communication-bubble");
+			if (!row) throw new Error("missing communication bubble");
+			return row;
+		};
+		const first = build("en", "Old receipt");
+		const rebuilt = build("en", "Old receipt");
+		expect(rebuilt.spec.data).not.toBe(first.spec.data);
+		expect(rebuilt.measured).toBe(first.measured);
+		const translated = build("zh-CN", "旧消息回执");
+		expect(translated.spec.key).toBe(first.spec.key);
+		expect(translated.measured.height).toBe(first.measured.height);
+		expect(translated.measured).not.toBe(first.measured);
+		expect(translated.spec.data).toMatchObject({
+			labels: { communicationReceiptLegacy: "旧消息回执" },
+		});
+	});
+
 	it("includes the versioned prune boundary in the exact layout", () => {
 		const built = buildPretextDocumentLayout(
 			[message("m0", 0, "user", "older"), message("m1", 1, "assistant", "newer")],

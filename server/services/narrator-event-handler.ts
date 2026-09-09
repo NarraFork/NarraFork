@@ -2280,9 +2280,10 @@ export async function processEvent(
 			qsSnap.queuePosition = cleared ? undefined : event.position;
 			qsSnap.queueDepth = cleared ? undefined : event.queueDepth;
 			qsSnap.queueMessage = cleared ? undefined : event.queueMessage;
-			dualBroadcast(ctx, {
+			// Queue state belongs to this session, not its parent's status bar.
+			broadcastToNarrator(narratorId, {
 				type: "queue_status",
-				narratorId: broadcastTargetId,
+				narratorId,
 				position: event.position,
 				queueDepth: event.queueDepth,
 				queueMessage: event.queueMessage,

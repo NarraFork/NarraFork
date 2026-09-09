@@ -68,6 +68,8 @@ import {
 	revertNarratorScopedForMessages,
 	revertNarratorScopedForToolUses,
 } from "./narrator-scoped-revert";
+import { withNarratorWorkAdmission } from "./narrator-session-state";
+import { attachActiveSendDeliveryTargets } from "./send-delivery-resolution";
 import {
 	commitSnapshotRevert,
 	DEFAULT_REVERT_SCOPE,
@@ -2515,7 +2517,7 @@ async function buildTreeFromTopLevelRefs(
 	// row can open the child's session before the wait returns.
 	const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMessages, ...childMessages]);
 	return attachTakenOverFlags(
-		attachAwaitAgentNarratorIds(enriched, awaitAgentIds),
+		attachActiveSendDeliveryTargets(attachAwaitAgentNarratorIds(enriched, awaitAgentIds)),
 		collectTakenOverToolUseIds(activities, awaitAgentIds),
 	);
 }
@@ -2785,7 +2787,7 @@ function getToolCallDetailTx(
 
 // ── narratorMessages object ────────────────────────────────────────────────
 
-export const narratorMessageQueries = {
+const narratorMessageQueriesUnlocked = {
 	async getMessages(narratorId: string, limit = 100, offset = 0) {
 		const refRows = await db
 			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
@@ -3845,16 +3847,18 @@ export const narratorMessageQueries = {
 		attachSubagentActivities(topMsgs, topActivities);
 		const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMsgs, ...childMsgs]);
 		const takenOverToolUseIds = collectTakenOverToolUseIds(topActivities, awaitAgentIds);
-		const tree = attachTakenOverFlags(
-			attachAwaitAgentNarratorIds(
-				enrichToolUseBlocks(
-					filterExitPlanBeforePlanCompact(
-						truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
+		const tree = attachActiveSendDeliveryTargets(
+			attachTakenOverFlags(
+				attachAwaitAgentNarratorIds(
+					enrichToolUseBlocks(
+						filterExitPlanBeforePlanCompact(
+							truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
+						),
 					),
+					awaitAgentIds,
 				),
-				awaitAgentIds,
+				takenOverToolUseIds,
 			),
-			takenOverToolUseIds,
 		);
 
 		const newTopToolUseIdSet = new Set(newTopToolUseIds);
@@ -3875,12 +3879,14 @@ export const narratorMessageQueries = {
 
 		return {
 			topLevel: tree,
-			orphanChildren: attachTakenOverFlags(
-				attachAwaitAgentNarratorIds(
-					enrichToolUseBlocks(truncateToolIO(orphanChildren)),
-					awaitAgentIds,
+			orphanChildren: attachActiveSendDeliveryTargets(
+				attachTakenOverFlags(
+					attachAwaitAgentNarratorIds(
+						enrichToolUseBlocks(truncateToolIO(orphanChildren)),
+						awaitAgentIds,
+					),
+					takenOverToolUseIds,
 				),
-				takenOverToolUseIds,
 			),
 			subagentActivities,
 			hitLimit: false,
@@ -4642,4 +4648,40 @@ export const narratorMessageQueries = {
 				}),
 			);
 	},
+};
+
+function admittedMutation<A extends [string, ...unknown[]], R>(fn: (...args: A) => Promise<R>) {
+	return (...args: A): Promise<R> => withNarratorWorkAdmission(args[0], () => fn(...args));
+}
+
+// Keep readers unchanged. Every mutation entry, including marker/card deletion,
+// reserves admission before reading the history it will later modify.
+export const narratorMessageQueries = {
+	...narratorMessageQueriesUnlocked,
+	deleteCompactMessage: admittedMutation(narratorMessageQueriesUnlocked.deleteCompactMessage),
+	deleteMessage: admittedMutation(narratorMessageQueriesUnlocked.deleteMessage),
+	deleteMessagesAfter: admittedMutation(narratorMessageQueriesUnlocked.deleteMessagesAfter),
+	deleteMessageBlock: admittedMutation(narratorMessageQueriesUnlocked.deleteMessageBlock),
+	deleteMessageBlocks: admittedMutation(narratorMessageQueriesUnlocked.deleteMessageBlocks),
+	deleteDanglingReasoningMessage: admittedMutation(
+		narratorMessageQueriesUnlocked.deleteDanglingReasoningMessage,
+	),
+	removeCompactingMessage: admittedMutation(narratorMessageQueriesUnlocked.removeCompactingMessage),
+	updateCompactSummary: admittedMutation(narratorMessageQueriesUnlocked.updateCompactSummary),
+	dismissSpecCarryoverMessage: admittedMutation(
+		narratorMessageQueriesUnlocked.dismissSpecCarryoverMessage,
+	),
+	dismissInterruptTaskGuardMessage: admittedMutation(
+		narratorMessageQueriesUnlocked.dismissInterruptTaskGuardMessage,
+	),
+	dismissCwdRecoveryMessage: admittedMutation(
+		narratorMessageQueriesUnlocked.dismissCwdRecoveryMessage,
+	),
+	dismissErrorMessage: admittedMutation(narratorMessageQueriesUnlocked.dismissErrorMessage),
+	markReviewFeedbackApplied: admittedMutation(
+		narratorMessageQueriesUnlocked.markReviewFeedbackApplied,
+	),
+	releaseReviewFeedbackClaim: admittedMutation(
+		narratorMessageQueriesUnlocked.releaseReviewFeedbackClaim,
+	),
 };

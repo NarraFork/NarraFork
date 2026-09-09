@@ -137,6 +137,7 @@ export const sendTool: ToolDefinition = {
 		}
 
 		const toolUseId = ctx.currentToolUseId;
+		const deliveryTargets = new Map<string, { id: string; deliveryMessageId: string }>();
 		try {
 			const { sendSubagentMessageDetailed } = await import("@server/services/agent-communication");
 			const result = await sendSubagentMessageDetailed({
@@ -151,9 +152,24 @@ export const sendTool: ToolDefinition = {
 				shouldAwait: raw.await,
 				timeoutMs: normalizeNumber(raw.timeout, { min: 1 }),
 				toolUseId: ctx.currentToolUseId,
+				toolCallBinding: ctx.toolCallBinding,
 				signal: ctx.signal,
 				locale: ctx.locale,
 				userId: ctx.userId ?? null,
+				onDeliveryResolved: (target) => {
+					deliveryTargets.set(target.id, { ...target });
+					const snapshot = [...deliveryTargets.values()];
+					void import("@server/services/send-delivery-resolution")
+						.then(({ broadcastSendDeliveryResolved }) =>
+							broadcastSendDeliveryResolved(
+								ctx.narratorId,
+								toolUseId,
+								snapshot,
+								ctx.toolCallBinding,
+							),
+						)
+						.catch(() => {});
+				},
 				onTargetResolved: (targetId) => {
 					// Only primaries can wait. Reuse Await's navigation-only event; never
 					// manufacture a result while Send is still awaiting a reply.

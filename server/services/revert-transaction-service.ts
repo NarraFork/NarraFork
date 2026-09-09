@@ -6,6 +6,7 @@ import {
 	FILE_CHANGE_LIMITS,
 	type FileChangeBlobRef,
 	type FileChangeExecutionReceipt,
+	type FileChangeRevertAction,
 	type FileChangeRevertMutationJournal,
 	fileChangeStatesEqual,
 } from "@shared/file-change-protocol";
@@ -35,7 +36,7 @@ import {
 } from "./file-change-local-restore";
 import { type LocalFileChangeRuntime, localFileChangeRuntimeBinding } from "./file-change-runtime";
 import type { NarratorPrincipal } from "./narrator-acl";
-import { RevertHistoryCommitService } from "./revert-history-commit";
+import { type RevertHistoryApplyResult, RevertHistoryCommitService } from "./revert-history-commit";
 import {
 	type RevertJournalClaim,
 	type RevertJournalContext,
@@ -66,6 +67,8 @@ export interface RevertTransactionRequest {
 	narratorId: string;
 	planId: string;
 	planHash: string;
+	/** Required by HTTP; internal callers may still exercise non-UI preview plans. */
+	action?: FileChangeRevertAction;
 	signal?: AbortSignal;
 }
 export interface RevertTransactionOutcome {
@@ -77,6 +80,9 @@ export interface RevertTransactionOutcome {
 	settling: boolean;
 	/** May report coordination recovery even when history/files committed or compensated. */
 	reason: string | null;
+	/** Internal post-commit invalidation data, never serialized as the public result. */
+	historyResult?: RevertHistoryApplyResult;
+	worktreePaths?: string[];
 }
 export interface RevertTransactionExecution {
 	/** Bounded caller wait. Rejection means preflight refused without target dispatch. */
@@ -125,6 +131,8 @@ type Run = {
 	started: boolean;
 	usedBytes: number;
 	files: BoundFile[];
+	worktreePaths: string[];
+	historyResult?: RevertHistoryApplyResult;
 	leases: readonly WorkspaceWriteLease[];
 };
 
@@ -182,6 +190,71 @@ export class RevertTransactionService {
 		});
 	}
 
+	/** Bounded read-only admission preflight: invalid consent must not interrupt a live turn. */
+	async validateHttpAction(input: RevertTransactionRequest): Promise<void> {
+		const request = fixedRequest(input);
+		if (!request.action) throw fail("ACTION_MISMATCH");
+		if (this.active >= FILE_CHANGE_LIMITS.captureConcurrency) throw fail("BUSY");
+		this.active++;
+		const signal = AbortSignal.any([
+			...(input.signal ? [input.signal] : []),
+			AbortSignal.timeout(this.timeoutMs),
+		]);
+		const started = performance.now();
+		try {
+			await this.options.access.authenticate(request.principal, signal);
+			const context = await this.options.access.resolveContext({
+				principal: request.principal,
+				narratorId: request.narratorId,
+				signal,
+			});
+			const operation = this.journal.getOperation({
+				owner: {
+					subjectKey: `human:${request.principal.userId}`,
+					narratorId: request.narratorId,
+					projectId: context.projectId,
+				},
+				planId: request.planId,
+				planHash: request.planHash,
+			});
+			await this.verifyEntrypoint(request, operation, signal);
+		} finally {
+			this.active--;
+			this.report(started, 0, "action_preflight");
+		}
+	}
+
+	private async verifyEntrypoint(
+		request: Omit<RevertTransactionRequest, "signal">,
+		operation: RevertJournalOperation,
+		signal: AbortSignal,
+	): Promise<void> {
+		if (!request.action) return;
+		await this.namespace(signal);
+		const blob = this.db
+			.select({ size: fileChangeBlobs.sizeBytes, status: fileChangeBlobs.status })
+			.from(fileChangeBlobs)
+			.where(eq(fileChangeBlobs.digest, operation.selectorBlobDigest ?? ""))
+			.get();
+		if (!operation.selectorBlobDigest || blob?.status !== "ready")
+			throw fail("MANIFEST_UNAVAILABLE");
+		const ref: FileChangeBlobRef = {
+			algorithm: "sha256",
+			digest: operation.selectorBlobDigest,
+			sizeBytes: blob.size,
+		};
+		await worker<boolean>(
+			{
+				action: "entrypoint",
+				raw: { ref, bytes: await this.readBlob(ref, signal) },
+				operation,
+				userId: request.principal.userId,
+				expectedAction: request.action,
+			},
+			signal,
+		);
+	}
+
 	execute(input: RevertTransactionRequest): RevertTransactionExecution {
 		const request = fixedRequest(input);
 		if (this.active >= FILE_CHANGE_LIMITS.captureConcurrency) throw fail("BUSY");
@@ -196,6 +269,7 @@ export class RevertTransactionService {
 			started: false,
 			usedBytes: 0,
 			files: [],
+			worktreePaths: [],
 			leases: [],
 		};
 		this.active++;
@@ -252,6 +326,7 @@ export class RevertTransactionService {
 			!["revert", "history_delete", "rollback_to_block"].includes(operation.kind)
 		)
 			throw fail("UNSUPPORTED");
+		await this.verifyEntrypoint(run.request, operation, run.signal);
 		if (operation.status !== "prepared") return this.outcome(run, operation);
 		if (this.plans.getSummary(run.ctx.owner, operation.id).expired) throw fail("EXPIRED");
 		await this.namespace(run.signal);
@@ -328,6 +403,7 @@ export class RevertTransactionService {
 			if (!fixed) throw fail("INCOMPLETE_FILES");
 			run.files.push({ manifest: file, fixed, scope, objectIdentity: null });
 		}
+		run.worktreePaths = [...new Set([...scopes.values()].map((scope) => scope.canonicalRoot))];
 		bound(scopes.size, WORKSPACE_WRITE_COORDINATOR_LIMITS.batchScopes);
 		for (const scope of scopes.values()) {
 			// Reserve independent compensation IDs too; never auto-split one fixed transaction.
@@ -422,7 +498,7 @@ export class RevertTransactionService {
 				const committed = this.journal.commit(run.ctx as RevertJournalContext, {
 					db: this.db,
 					apply: (tx) => {
-						if (prepared) this.history.applyToTransaction(tx, prepared);
+						if (prepared) run.historyResult = this.history.applyToTransaction(tx, prepared);
 					},
 				});
 				return this.outcome(run, committed);
@@ -906,6 +982,9 @@ export class RevertTransactionService {
 			status,
 			journalStatus: operation?.status ?? null,
 			settling,
+			...(status === "committed"
+				? { historyResult: run.historyResult, worktreePaths: run.worktreePaths }
+				: {}),
 			// History/file terminality does not prove coordinator finalization succeeded.
 			// Preserve an explicit release/recovery warning alongside the durable result.
 			reason:
@@ -1002,7 +1081,7 @@ function fixedRequest(input: RevertTransactionRequest): Omit<RevertTransactionRe
 	if (
 		!input ||
 		Object.keys(input).some(
-			(key) => !["principal", "narratorId", "planId", "planHash", "signal"].includes(key),
+			(key) => !["principal", "narratorId", "planId", "planHash", "action", "signal"].includes(key),
 		)
 	)
 		throw fail("INVALID_REQUEST");
@@ -1020,6 +1099,11 @@ function fixedRequest(input: RevertTransactionRequest): Omit<RevertTransactionRe
 			Buffer.byteLength(value) > 256
 		)
 			throw fail("INVALID_REQUEST");
+	if (
+		input.action !== undefined &&
+		!["revert_files", "rollback_to_block", "delete_tool_block"].includes(input.action)
+	)
+		throw fail("INVALID_REQUEST");
 	if (typeof input.planHash !== "string" || !/^[a-f0-9]{64}$/.test(input.planHash))
 		throw fail("INVALID_PLAN_HASH");
 	return Object.freeze({
@@ -1027,6 +1111,7 @@ function fixedRequest(input: RevertTransactionRequest): Omit<RevertTransactionRe
 		narratorId: input.narratorId,
 		planId: input.planId,
 		planHash: input.planHash,
+		...(input.action === undefined ? {} : { action: input.action }),
 	});
 }
 function bound(value: number, max: number, min = 0) {

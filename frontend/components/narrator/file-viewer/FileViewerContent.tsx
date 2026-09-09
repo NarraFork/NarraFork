@@ -57,7 +57,7 @@ import {
 	readTextPreview,
 } from "../FilePreviewModal";
 import { FileReferenceScopeProvider, useFileReferenceScope } from "../FileReferenceScope";
-import { CodeMirrorEditor } from "../file-editor/CodeMirrorEditor";
+import { MonacoEditor } from "../file-editor/MonacoEditor";
 import { MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../highlight-cache";
 import { MarkdownContent } from "../MarkdownContent";
 import { filePanelBaseName } from "../panels/panel-kind";
@@ -502,10 +502,10 @@ export function FileViewerContent({
 					) : load.text == null ? null : effectiveMode === "raw" && (sourceOnly || !!load.hash) ? (
 						<Box h="100%" style={{ display: "flex", flexDirection: "column" }}>
 							<Box style={{ flex: 1, minHeight: 0 }}>
-								<CodeMirrorEditor
-									value={load.text}
-									language={lang}
-									onChange={() => {}}
+								<MonacoEditor
+									initialValue={load.text}
+									documentKey={JSON.stringify([narratorId, sourceDeviceId, sourcePath])}
+									filePath={sourcePath}
 									readOnly
 									selection={selection}
 									navigationRequestId={highlightRequestId}

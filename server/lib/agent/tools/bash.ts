@@ -1,10 +1,13 @@
 import { backgroundTaskService } from "@server/services/background-task-service";
+import { registerLocalBashActivity } from "@server/services/file-change-runtime";
 import { z } from "zod/v4";
+import { AppError } from "../../errors";
 import { resolveNarratorGitIdentityEnv } from "../../git-identity";
 import { hotSafe } from "../../hot-safe";
 import { generateShortId } from "../../id";
+import { logger } from "../../logger";
 import { getHome } from "../../platform";
-import type { ExecutionBackend } from "../execution/backend";
+import type { ExecHandle, ExecutionBackend } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
@@ -80,10 +83,26 @@ interface RunningBashEntry {
 	setTimedOut: () => void;
 }
 
-const runningBashProcesses = hotSafe(
-	"narrafork:runningBashProcesses",
-	() => new Map<string, RunningBashEntry>(),
+let preexistingBashRegistry = true;
+const runningBashProcesses = hotSafe("narrafork:runningBashProcesses", () => {
+	preexistingBashRegistry = false;
+	return new Map<string, RunningBashEntry>();
+});
+// A hot upgrade cannot prove that older loops discarded their old tool closures,
+// even when their process registry is momentarily empty. This one-time data flag
+// is false on a clean boot and survives later hot reloads without storing old code.
+const bashActivityMigration = hotSafe("narrafork:bashActivityMigration:v1", () =>
+	Object.freeze({ requiresColdStart: preexistingBashRegistry }),
 );
+
+export function assertBashActivityProtectionReady(): void {
+	if (bashActivityMigration.requiresColdStart)
+		throw new AppError(
+			"File rollback protection was enabled by a hot upgrade. Finish current work and restart the service before reverting files.",
+			409,
+			"REVERT_RUNTIME_RELOAD_REQUIRED",
+		);
+}
 
 /**
  * Kill all running bash processes spawned by the Bash tool.
@@ -150,6 +169,75 @@ const REVIEW_READ_ONLY_BASH_DESCRIPTION =
 	"Do not write files, change Git state, access remotes, use redirection, prefix the command " +
 	"with environment variable assignments, run background/control operations, or invoke other " +
 	"commands.";
+
+interface BashExecution {
+	start(signal: AbortSignal): Promise<ExecHandle>;
+	cancelUndispatched(): void;
+}
+
+/** Admission and lifetime are independent of the legacy attribution mutex and
+ * tool/HTTP return. Even an unrecognized/read-only-looking command participates. */
+async function prepareBashExecution(
+	backend: ExecutionBackend,
+	command: string,
+	cwd: string,
+	ctx: ToolContext,
+	env?: Record<string, string> | null,
+): Promise<BashExecution> {
+	const activity = await registerLocalBashActivity({
+		backend,
+		cwd,
+		target: ctx.executionTarget,
+		signal: ctx.signal,
+	});
+	let started = false;
+	let ended = false;
+	const end = (outcome: "finished" | "unknown") => {
+		if (!activity || ended) return;
+		ended = true;
+		try {
+			activity.end(outcome);
+		} catch (error) {
+			// The coordinator retains its recovery hold on persistence failure.
+			// Never retry an uncertain outcome as "finished" or let a detached
+			// callback's rejection discard the only lifecycle observer.
+			logger.warn("Bash workspace activity settlement requires recovery", {
+				scopeId: activity.scope.id,
+				outcome,
+				error: String(error),
+			});
+		}
+	};
+	return {
+		async start(signal) {
+			if (started) throw new Error("Bash execution was already dispatched");
+			started = true;
+			let handle: ExecHandle;
+			try {
+				signal.throwIfAborted();
+				handle = await backend.execCommand({
+					command,
+					cwd: activity?.cwd ?? cwd,
+					signal,
+					env: env ?? undefined,
+				});
+			} catch (error) {
+				// LocalBackend rejects dispatch only before spawning. Asynchronous
+				// spawn/process errors always come with a handle and its real barrier.
+				end("finished");
+				throw error;
+			}
+			void (handle.whenSettled ?? handle.exited).then(
+				() => end("finished"),
+				() => end("unknown"),
+			);
+			return handle;
+		},
+		cancelUndispatched() {
+			if (!started) end("finished");
+		},
+	};
+}
 
 export const bashTool: ToolDefinition = {
 	name: SHELL_TOOL_NAME,
@@ -280,6 +368,10 @@ export const bashTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
+		ctx = {
+			...ctx,
+			executionTarget: ctx.executionTarget && Object.freeze({ ...ctx.executionTarget }),
+		};
 		const { command, stop, timeout, workdir, description, run_in_background, device } = args as {
 			command?: string;
 			stop?: string;
@@ -404,32 +496,38 @@ export const bashTool: ToolDefinition = {
 			narratorId: ctx.narratorId,
 		});
 
-		// Background execution: fire-and-forget via backgroundTaskService
-		if (run_in_background) {
-			return _runInBackground(command, cwd, timeoutMs, title, ctx, device, gitIdentityEnv);
+		let execution: BashExecution;
+		try {
+			execution = await prepareBashExecution(backend, command, cwd, ctx, gitIdentityEnv);
+		} catch (error) {
+			if (run_in_background) throw error;
+			return {
+				output: `Bash admission error: ${error instanceof Error ? error.message : String(error)}`,
+				isError: true,
+			};
 		}
 
-		// Commands that explicitly name in-workspace write targets (`sed -i src/a.ts`,
-		// `biome check --write server/`) take the workspace write lock so their change
-		// set can be attributed to this narrator alone. The attempt is bounded: a
-		// command that cannot get the lock in time runs unserialized rather than
-		// stalling the session, and commands whose writes are unpredictable
-		// (`bun run build`) are never serialized at all.
-		const serializationInput = await resolveBashSerializationInput({
-			command,
-			cwd,
-			isBackground: false,
-			isChapter: !!ctx.chapterId,
-		});
+		// Preserve background pre-spawn failures as rejected tool executions, while
+		// releasing only activity that was never handed to a process.
+		if (run_in_background) {
+			try {
+				return await _runInBackground(command, timeoutMs, title, ctx, execution);
+			} finally {
+				execution.cancelUndispatched();
+			}
+		}
 
 		try {
+			// Legacy attribution remains bounded/heuristic. Its timeout fallback does
+			// NOT bypass the separately registered coordinator activity above.
+			const serializationInput = await resolveBashSerializationInput({
+				command,
+				cwd,
+				isBackground: false,
+				isChapter: !!ctx.chapterId,
+			});
 			const runForeground = async (): Promise<ToolResult> => {
-				const handle = await backend.execCommand({
-					command,
-					cwd,
-					signal: ctx.signal,
-					env: gitIdentityEnv ?? undefined,
-				});
+				const handle = await execution.start(ctx.signal);
 
 				let output = "";
 				let timedOut = false;
@@ -583,8 +681,16 @@ export const bashTool: ToolDefinition = {
 				let exitCodeValue: number | null = null;
 				try {
 					exitCodeValue = await handle.exited;
+				} catch (error) {
+					if (toolUseId) {
+						clearTimeout(runningBashProcesses.get(toolUseId)?.timer);
+						runningBashProcesses.delete(toolUseId);
+					}
+					if (liveEmitTimer) clearTimeout(liveEmitTimer);
+					throw error;
 				} finally {
 					clearTimeout(timer);
+					if (toolUseId) clearTimeout(runningBashProcesses.get(toolUseId)?.timer);
 					clearInterval(watchdogTimer);
 					ctx.signal.removeEventListener("abort", abortHandler);
 				}
@@ -637,6 +743,10 @@ export const bashTool: ToolDefinition = {
 				output: `Error: ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,
 			};
+		} finally {
+			// Background start() owns lifetime before returning; only pre-spawn
+			// admission/task/serialization failures are cleaned up here.
+			execution.cancelUndispatched();
 		}
 	},
 };
@@ -647,12 +757,10 @@ import type { ToolContext } from "../types";
 
 async function _runInBackground(
 	command: string,
-	cwd: string,
 	timeoutMs: number | undefined,
 	title: string,
 	ctx: ToolContext,
-	device?: string,
-	gitIdentityEnv?: Record<string, string> | null,
+	execution: BashExecution,
 ): Promise<ToolResult> {
 	const taskId = `bash_${generateShortId()}`;
 	const bgAbort = new AbortController();
@@ -685,16 +793,10 @@ async function _runInBackground(
 	(async () => {
 		let timedOut = false;
 		try {
-			const backend = getToolBackend(ctx, device);
-			const handle = await backend.execCommand({
-				command,
-				cwd,
-				signal: bgAbort.signal,
-				// Resolved by the caller before the task record was created: a background
-				// command outlives the turn, and re-resolving here could pick up a
-				// different acting user than the one who started it.
-				env: gitIdentityEnv ?? undefined,
-			});
+			// Frozen backend/cwd/env and activity were captured before task creation.
+			// Do not resolve a second backend after the tool/HTTP request has returned.
+			ctx.signal.throwIfAborted();
+			const handle = await execution.start(bgAbort.signal);
 			let outputBytes = 0;
 			let outputTruncated = false;
 			const killFn = () => handle.kill();

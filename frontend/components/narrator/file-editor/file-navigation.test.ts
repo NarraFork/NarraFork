@@ -1,16 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { history, undo, undoDepth } from "@codemirror/commands";
-import { EditorState, Transaction, type TransactionSpec } from "@codemirror/state";
-import type { EditorView } from "@codemirror/view";
 import type { FileSelection } from "@shared/file-reference";
-import { editorFileSelection, fileSelectionRange, navigateFileSelection } from "./CodeMirrorEditor";
+import type { editor, IPosition, IRange } from "monaco-editor/editor/editor.api";
 import { fileEditorReferenceSelection } from "./FileEditorContent";
 import {
-	fileNavigationGutterMarker,
-	fileNavigationHighlight,
-	fileNavigationHighlightExtension,
-	setFileNavigationHighlight,
-} from "./file-navigation-highlight";
+	MonacoNavigationHighlight,
+	monacoFileSelection,
+	monacoFileSelectionRange,
+	monacoNavigationLines,
+} from "./monaco-navigation";
 import { applyEdit, initialEditorState, saveSucceeded } from "./save-state";
 
 const selection: FileSelection = {
@@ -19,166 +16,128 @@ const selection: FileSelection = {
 	endLineNumber: 3,
 	endColumn: 1,
 };
-
-function fakeView(source: string) {
-	let state = EditorState.create({
-		doc: source,
-		extensions: [history(), fileNavigationHighlightExtension],
-	});
-	const transactions: Transaction[] = [];
-	const view: Pick<EditorView, "state" | "dispatch"> = {
-		get state() {
-			return state;
+function model(source: string) {
+	const lines = source.split("\n");
+	const starts = [0];
+	for (let i = 0; i < lines.length - 1; i++) starts.push(starts[i] + lines[i].length + 1);
+	return {
+		getLineCount: () => lines.length,
+		getLineMaxColumn: (line: number) => lines[line - 1].length + 1,
+		getOffsetAt: (position: IPosition) => starts[position.lineNumber - 1] + position.column - 1,
+		getPositionAt: (offset: number): IPosition => {
+			let line = lines.length - 1;
+			while (line > 0 && starts[line] > offset) line--;
+			return { lineNumber: line + 1, column: offset - starts[line] + 1 };
 		},
-		dispatch: ((...specs: (Transaction | TransactionSpec)[]) => {
-			const transaction = specs[0] instanceof Transaction ? specs[0] : state.update(...specs);
-			transactions.push(transaction);
-			state = transaction.state;
-		}) as EditorView["dispatch"],
 	};
-	return { view, transactions };
+}
+function fixture() {
+	const collections: { items: editor.IModelDeltaDecoration[] }[] = [];
+	const view = {
+		createDecorationsCollection: () => {
+			const state = { items: [] as editor.IModelDeltaDecoration[] };
+			collections.push(state);
+			return {
+				set: (items: editor.IModelDeltaDecoration[]) => {
+					state.items = items;
+				},
+				getRange: () => state.items[0]?.range ?? null,
+				clear: () => {
+					state.items = [];
+				},
+			};
+		},
+	} as unknown as editor.IStandaloneCodeEditor;
+	return { highlight: new MonacoNavigationHighlight(view), collections };
 }
 
-describe("file editor navigation", () => {
-	test("uses one-based UTF-16 columns and an exclusive range end", () => {
-		const doc = EditorState.create({ doc: "first\n中文𝄞\nlast" }).doc;
-		const range = fileSelectionRange(doc, selection);
-		expect(doc.sliceString(range.main.from, range.main.to)).toBe("文𝄞\n");
-		const state = EditorState.create({ doc, selection: range });
-		expect(editorFileSelection(state)).toEqual(selection);
+describe("file editor navigation (Monaco migration)", () => {
+	test("one-based UTF-16 columns retain the exact exclusive-end excerpt", () => {
+		const text = "first\n中文𝄞\nlast";
+		const doc = model(text);
+		const range = monacoFileSelectionRange(doc, selection);
+		const from = doc.getOffsetAt({ lineNumber: range.startLineNumber, column: range.startColumn });
+		const to = doc.getOffsetAt({ lineNumber: range.endLineNumber, column: range.endColumn });
+		expect(text.slice(from, to)).toBe("文𝄞\n");
+		expect(monacoFileSelection(range)).toEqual(selection);
 	});
-
-	test("clamps a removed line or long column to the current buffer", () => {
-		const doc = EditorState.create({ doc: "a\nb" }).doc;
-		const range = fileSelectionRange(doc, { ...selection, startColumn: 80, endLineNumber: 100 });
-		expect(range.main.from).toBe(doc.length);
-		expect(range.main.to).toBe(doc.length);
+	test("removed lines and oversized columns clamp to the current EOF", () => {
+		expect(
+			monacoFileSelectionRange(model("a\nb"), {
+				...selection,
+				startColumn: 80,
+				endLineNumber: 100,
+			}),
+		).toEqual({ startLineNumber: 2, startColumn: 2, endLineNumber: 2, endColumn: 2 });
 	});
-
-	test("a repeat navigation dispatches again without losing dirty text or undo", () => {
-		const { view, transactions } = fakeView("first\nsecond\nlast");
-		view.dispatch({ changes: { from: 0, insert: "dirty " } });
-		const doc = view.state.doc;
-		const depth = undoDepth(view.state);
-		navigateFileSelection(view, selection);
-		view.dispatch({ selection: { anchor: 0 } });
-		navigateFileSelection(view, selection);
-		expect(transactions.filter((item) => item.effects.length > 0)).toHaveLength(2);
-		expect(view.state.doc).toBe(doc);
-		expect(undoDepth(view.state)).toBe(depth);
-		expect(editorFileSelection(view.state)).toBeNull();
-		expect(view.state.selection.main.from).toBe(fileSelectionRange(doc, selection).main.from);
-		expect(view.state.field(fileNavigationHighlight)?.range).toEqual({
-			from: fileSelectionRange(doc, selection).main.from,
-			to: fileSelectionRange(doc, selection).main.to,
-		});
-		expect(undo(view)).toBe(true);
-		expect(view.state.doc.toString()).toBe("first\nsecond\nlast");
+	test("navigation does not mutate document, selection or undo history APIs", () => {
+		const { highlight, collections } = fixture();
+		// The fixture exposes decorations only: calling a text/selection/undo API would throw.
+		highlight.set(selection);
+		highlight.set(selection);
+		expect(collections[0].items[0].range).toEqual(selection);
+		expect(monacoFileSelection({ ...selection, endLineNumber: 2, endColumn: 2 })).toBeNull();
 	});
-
-	test("navigation markers survive clicks and real text selections without becoming excerpts", () => {
-		const { view, transactions } = fakeView("first\nsecond\nlast");
-		navigateFileSelection(view, selection);
-		const highlight = view.state.field(fileNavigationHighlight);
-		expect(highlight).not.toBeNull();
-		expect(editorFileSelection(view.state)).toBeNull();
-		expect(transactions.at(-1)?.annotation(Transaction.addToHistory)).toBe(false);
-		view.dispatch({ selection: { anchor: 0 } });
-		expect(view.state.field(fileNavigationHighlight)).toBe(highlight);
-		view.dispatch({ selection: { anchor: 0, head: 3 } });
-		expect(view.state.field(fileNavigationHighlight)).toBe(highlight);
-		expect(editorFileSelection(view.state)).toEqual({
-			startLineNumber: 1,
+	test("only the target gutter and two boundary lines are painted, not a text selection", () => {
+		const { highlight, collections } = fixture();
+		highlight.set({ ...selection, startColumn: 1, endLineNumber: 5 });
+		const paint = collections[1].items;
+		expect(paint).toHaveLength(3);
+		expect(paint[0].range).toEqual({
+			startLineNumber: 2,
 			startColumn: 1,
-			endLineNumber: 1,
-			endColumn: 4,
+			endLineNumber: 4,
+			endColumn: 1,
 		});
+		expect(paint[0].options.marginClassName).toBe("nf-monaco-navigation-gutter");
+		expect(paint[1].options.className).toBe("nf-monaco-navigation-start");
+		expect(paint[2].options.className).toBe("nf-monaco-navigation-end");
+		expect(paint.every((item) => item.options.isWholeLine)).toBe(true);
+		expect(paint.every((item) => item.options.inlineClassName === undefined)).toBe(true);
 	});
-
-	test("colors only target gutter lines and uses two non-text boundary decorations", () => {
-		const { view } = fakeView("first\nsecond\nthird\nfourth\nlast");
-		navigateFileSelection(view, { ...selection, startColumn: 1, endLineNumber: 5 });
-		const highlight = view.state.field(fileNavigationHighlight);
-		const marker = (line: number) =>
-			fileNavigationGutterMarker(highlight, view.state.doc.line(line).from);
-		expect(marker(1)).toBeNull();
-		expect(marker(2)?.elementClass).toBe("cm-file-navigation-start");
-		expect(marker(3)).not.toBeNull();
-		expect(marker(3)?.toDOM).toBeUndefined();
-		expect(marker(4)?.elementClass).toBe("cm-file-navigation-end");
-		expect(marker(5)).toBeNull();
-		expect(highlight?.boundaries.size).toBe(2);
-	});
-
-	test("exclusive ends, blank lines, point targets and stale EOF coordinates get correct boundaries", () => {
-		const { view } = fakeView("first\n\nlast\n");
+	test("blank lines, point references, exclusive ends and stale EOF have single boundaries", () => {
+		const { highlight, collections } = fixture();
 		for (const [target, line] of [
 			[{ ...selection, startColumn: 1 }, 2],
 			[{ ...selection, startColumn: 1, endLineNumber: 2 }, 2],
 			[{ ...selection, startLineNumber: 99, endLineNumber: 100 }, 4],
 		] as const) {
-			navigateFileSelection(view, target);
-			const highlight = view.state.field(fileNavigationHighlight);
-			expect(highlight?.firstLine).toBe(view.state.doc.line(line).from);
-			expect(highlight?.lastLine).toBe(view.state.doc.line(line).from);
-			expect(highlight?.boundaries.size).toBe(1);
-			expect(
-				fileNavigationGutterMarker(highlight, view.state.doc.line(line).from)?.elementClass,
-			).toBe("cm-file-navigation-start cm-file-navigation-end");
+			const range = monacoFileSelectionRange(model("first\n\nlast\n"), target);
+			highlight.set(range);
+			expect(monacoNavigationLines(range)).toEqual({ first: line, last: line });
+			expect(collections[1].items).toHaveLength(2);
+			expect(collections[1].items[1].options.className).toBe(
+				"nf-monaco-navigation-start nf-monaco-navigation-end",
+			);
 		}
 	});
-
-	test("markers follow edits and undo, then are replaced or explicitly cleared", () => {
-		const { view } = fakeView("first\nsecond\nlast");
-		navigateFileSelection(view, selection);
-		view.dispatch({ changes: { from: 0, insert: "new\n" } });
-		expect(view.state.field(fileNavigationHighlight)?.firstLine).toBe(view.state.doc.line(3).from);
-		expect(undo(view)).toBe(true);
-		expect(view.state.field(fileNavigationHighlight)?.firstLine).toBe(view.state.doc.line(2).from);
-		navigateFileSelection(view, {
-			startLineNumber: 1,
-			startColumn: 1,
-			endLineNumber: 1,
-			endColumn: 1,
-		});
-		expect(view.state.field(fileNavigationHighlight)?.firstLine).toBe(0);
-		expect(
-			fileNavigationGutterMarker(
-				view.state.field(fileNavigationHighlight),
-				view.state.doc.line(2).from,
-			),
-		).toBeNull();
-		view.dispatch({ effects: setFileNavigationHighlight.of(null) });
-		expect(view.state.field(fileNavigationHighlight)).toBeNull();
+	test("refresh follows Monaco tracked edits/undo, replacement and explicit clear", () => {
+		const { highlight, collections } = fixture();
+		highlight.set(selection);
+		// Monaco owns edit/undo mapping. Refresh must read the current tracked range, not a cached input.
+		for (const delta of [1, 0]) {
+			collections[0].items[0].range = {
+				...selection,
+				startLineNumber: 2 + delta,
+				endLineNumber: 3 + delta,
+			};
+			highlight.refresh();
+			expect(collections[1].items[0].range.startLineNumber).toBe(2 + delta);
+		}
+		const point: IRange = { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 };
+		highlight.set(point);
+		expect(collections[1].items[0].range).toEqual(point);
+		highlight.set(null);
+		expect(collections.every((item) => item.items.length === 0)).toBe(true);
 	});
-
-	test("a huge target stores just its endpoints and uses on-demand gutter markers", () => {
-		const { view } = fakeView("line\n".repeat(100_000));
-		navigateFileSelection(view, {
-			startLineNumber: 1,
-			startColumn: 1,
-			endLineNumber: 100_001,
-			endColumn: 1,
-		});
-		const highlight = view.state.field(fileNavigationHighlight);
-		expect(highlight?.boundaries.size).toBe(2);
-		expect(fileNavigationGutterMarker(highlight, view.state.doc.line(50_000).from)).not.toBeNull();
-		expect(fileNavigationGutterMarker(highlight, view.state.doc.line(100_001).from)).toBeNull();
-		expect(view.state.selection.main.empty).toBe(true);
-	});
-
-	test("cursor-only selections do not masquerade as file excerpts", () => {
-		expect(editorFileSelection(EditorState.create({ doc: "a" }))).toBeNull();
-	});
-
-	test("component navigation is independent of document replacement and view creation", async () => {
-		const source = await Bun.file(new URL("./CodeMirrorEditor.tsx", import.meta.url)).text();
-		expect(source.match(/new EditorView\(/g)).toHaveLength(1);
-		expect(source).toContain("[selection, navigationRequestId, value]");
-		expect(source).toContain("}, [value]);");
-		expect(source.indexOf("navigateFileSelection(view, selection)")).toBeGreaterThan(
-			source.indexOf("}, [value]);"),
-		);
+	test("300k-line reference remains constant-size and excludes its exclusive final line", () => {
+		const { highlight, collections } = fixture();
+		highlight.set({ startLineNumber: 1, startColumn: 1, endLineNumber: 300_001, endColumn: 1 });
+		expect(collections[0].items).toHaveLength(1);
+		expect(collections[1].items).toHaveLength(3);
+		expect(collections[1].items[0].range.endLineNumber).toBe(300_000);
+		highlight.dispose();
+		expect(collections.every((item) => item.items.length === 0)).toBe(true);
 	});
 });
 
@@ -192,19 +151,8 @@ describe("saved-file selection bridge", () => {
 			"b.md",
 		);
 	});
-
-	test("legacy editing uses the original saved-hash reader without reloading on origin upgrades", async () => {
-		const source = await Bun.file(new URL("./FileEditorContent.tsx", import.meta.url)).text();
-		expect(source).toContain('referenceOriginRef.current || deviceId !== "local"');
-		expect(source).toContain("/fs/edit-source?path=");
-		expect(source).toContain("{ signal: controller.signal }");
-		expect(source).toContain("}, [deviceId, filePath, narratorId, setState]);");
-		expect(source).toContain("initialEditorState(editorText(res.content), res.hash)");
-	});
-
 	test("publishes only the saved hash and flags an unsaved selection", () => {
-		const saved = initialEditorState("saved", "saved-hash");
-		const dirty = applyEdit(saved, "unsaved");
+		const dirty = applyEdit(initialEditorState("saved", "saved-hash"), "unsaved");
 		const reference = fileEditorReferenceSelection(dirty, "local", "/repo/a.ts", selection);
 		expect(reference).toEqual({
 			target: { deviceId: "local", path: "/repo/a.ts", selection },
@@ -222,7 +170,6 @@ describe("saved-file selection bridge", () => {
 			)?.dirty,
 		).toBe(false);
 	});
-
 	test("typing during save stays dirty even when the saved hash advances", () => {
 		const state = saveSucceeded(
 			applyEdit(initialEditorState("old", "hash"), "newer"),
@@ -234,7 +181,6 @@ describe("saved-file selection bridge", () => {
 			expectedHash: "new-hash",
 		});
 	});
-
 	test("unknown versions or absent selections cannot become saved excerpts", () => {
 		expect(
 			fileEditorReferenceSelection(initialEditorState("new", null), "local", "/new", selection),

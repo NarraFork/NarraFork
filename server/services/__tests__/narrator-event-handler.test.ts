@@ -17,8 +17,10 @@ const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) 
 mock.module("../../db", () => ({ db, sqlite }));
 
 const broadcastMessages: unknown[] = [];
+const broadcastTargets: string[] = [];
 mock.module("../../websocket/narrator-ws", () => ({
 	broadcastToNarrator: (_narratorId: string, message: unknown) => {
+		broadcastTargets.push(_narratorId);
 		broadcastMessages.push(message);
 	},
 	getNarratorConnections: () => [],
@@ -58,7 +60,9 @@ function makeSubagentContext(): EventHandlerContext {
 
 afterEach(() => {
 	clearStreamingSnapshot(PARENT_NARRATOR_ID);
+	clearStreamingSnapshot("subagent-narrator");
 	broadcastMessages.length = 0;
+	broadcastTargets.length = 0;
 });
 
 afterAll(() => {
@@ -81,6 +85,29 @@ async function cleanupFileContextNarrator(id: string) {
 }
 
 describe("queue snapshot clear", () => {
+	for (const isSubagent of [false, true]) {
+		test(`queue updates only reach their owner (subagent=${isSubagent})`, async () => {
+			const ctx = makeSubagentContext();
+			if (!isSubagent) {
+				ctx.narratorId = PARENT_NARRATOR_ID;
+				ctx.parentToolUseId = undefined;
+			}
+			for (const event of [
+				{ type: "queue_status" as const, position: 2, queueDepth: 3 },
+				{ type: "queue_status" as const, position: 0 },
+				{ type: "queue_status" as const },
+			]) {
+				await processEvent(event, ctx);
+			}
+			expect(broadcastTargets).toEqual(Array(3).fill(ctx.narratorId));
+			expect(broadcastMessages).toEqual([
+				expect.objectContaining({ type: "queue_status", narratorId: ctx.narratorId, position: 2 }),
+				expect.objectContaining({ type: "queue_status", narratorId: ctx.narratorId, position: 0 }),
+				expect.objectContaining({ type: "queue_status", narratorId: ctx.narratorId }),
+			]);
+			if (isSubagent) expect(getStreamingSnapshot(PARENT_NARRATOR_ID)).toBeUndefined();
+		});
+	}
 	for (const clear of [
 		{ type: "queue_status" as const },
 		{ type: "queue_status" as const, position: 0, queueDepth: 0 },

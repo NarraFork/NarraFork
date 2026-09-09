@@ -50,26 +50,51 @@ describe("resolveSubagentExpanded — LOD / exemption main switch", () => {
 		).toBe(true);
 	});
 
-	it("non-exempt: L5 expands; L3 collapses; L4 follows recent+opened", async () => {
-		const { resolveSubagentExpanded } = await import("./measure-subagent");
-		const inert = { isActive: false, hasSelfPermission: false, pendingPermissionCount: 0 };
-		expect(resolveSubagentExpanded(5, { ...inert, isRecent: false, opened: false })).toBe(true);
-		expect(resolveSubagentExpanded(3, { ...inert, isRecent: true, opened: true })).toBe(false);
-		// L4: recent card follows `opened`; old card always collapses.
-		expect(resolveSubagentExpanded(4, { ...inert, isRecent: true, opened: true })).toBe(true);
-		expect(resolveSubagentExpanded(4, { ...inert, isRecent: true, opened: false })).toBe(false);
-		expect(resolveSubagentExpanded(4, { ...inert, isRecent: false, opened: true })).toBe(false);
-		// L1/L2 follow the upstream gate (`opened`).
-		expect(resolveSubagentExpanded(2, { ...inert, isRecent: false, opened: true })).toBe(true);
-		expect(resolveSubagentExpanded(1, { ...inert, isRecent: false, opened: false })).toBe(false);
-		expect(
-			resolveSubagentExpanded(3, {
-				...inert,
-				isRecent: false,
+	it.each([
+		2, 3, 4, 5,
+	] as const)("L%i expands untouched cards regardless of recency and honours explicit folding", async (lod) => {
+		const { measureSubagentCard, resolveSubagentExpanded } = await import("./measure-subagent");
+		for (const isRecent of [false, true]) {
+			const input = {
+				isActive: false,
+				hasSelfPermission: false,
+				pendingPermissionCount: 0,
+				isRecent,
 				opened: false,
-				lodUserOverride: true,
-			}),
-		).toBe(true);
+			};
+			expect(resolveSubagentExpanded(lod, input)).toBe(true);
+			expect(resolveSubagentExpanded(lod, { ...input, userCollapsed: true })).toBe(false);
+			expect(
+				resolveSubagentExpanded(lod, { ...input, userCollapsed: true, lodUserOverride: true }),
+			).toBe(true);
+			expect(measureSubagentCard(BASE, WIDTH, lod, { isRecent }).effectiveExpanded).toBe(true);
+			expect(
+				measureSubagentCard(BASE, WIDTH, lod, { isRecent, opened: false }).effectiveExpanded,
+			).toBe(false);
+			expect(
+				measureSubagentCard(BASE, WIDTH, lod, { isRecent, opened: true }).effectiveExpanded,
+			).toBe(true);
+		}
+	});
+
+	it("L1 folds even a sole/default-open card, but keeps manual overrides and live controls", async () => {
+		const { measureSubagentCard } = await import("./measure-subagent");
+		for (const opened of [undefined, false, true]) {
+			const opts = { opened, isRecent: true };
+			expect(measureSubagentCard(BASE, WIDTH, 1, opts).effectiveExpanded).toBe(false);
+			expect(
+				measureSubagentCard(BASE, WIDTH, 1, { ...opts, lodUserOverride: true }).effectiveExpanded,
+			).toBe(true);
+			for (const exemption of [
+				{ isActive: true },
+				{ hasSelfPermission: true },
+				{ pendingPermissionCount: 1 },
+			]) {
+				expect(
+					measureSubagentCard(BASE, WIDTH, 1, { ...opts, ...exemption }).effectiveExpanded,
+				).toBe(true);
+			}
+		}
 	});
 
 	// L5 used to return a bare `true`, making this card's header chevron dead there
@@ -107,7 +132,7 @@ describe("measureSubagentCard — collapsed header (55-75px)", () => {
 	it("collapsed with no result preview ≈ 56px (padding + badge + desc)", async () => {
 		const c = await import("./measure-subagent");
 		const { measureSubagentCard } = c;
-		// L3 forces collapse; not recent, not opened, terminal, no result.
+		// Explicitly folded; not recent, terminal, no result.
 		const r = measureSubagentCard(BASE, WIDTH, 3, { isRecent: false, opened: false });
 		expect(r.effectiveExpanded).toBe(false);
 		// header = pad*2 + badge row + descMt + xs line ; + border*2 (not inRun).
@@ -145,8 +170,10 @@ describe("measureSubagentCard — collapsed header (55-75px)", () => {
 
 	it("collapsed description is a single fixed line regardless of length", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
-		const short = measureSubagentCard(BASE, WIDTH, 3, {});
-		const long = measureSubagentCard({ ...BASE, description: "x ".repeat(400) }, WIDTH, 3, {});
+		const short = measureSubagentCard(BASE, WIDTH, 3, { opened: false });
+		const long = measureSubagentCard({ ...BASE, description: "x ".repeat(400) }, WIDTH, 3, {
+			opened: false,
+		});
 		expect(short.headerHeight).toBe(long.headerHeight);
 		expect(short.descriptionMeasured).toBeNull();
 	});
@@ -157,7 +184,7 @@ describe("measureSubagentCard — expanded body", () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
 		// A long description: collapsed truncates to 1 line; expanded wraps to many.
 		const longDesc = { ...BASE, description: "word ".repeat(120).trim() };
-		const collapsed = measureSubagentCard(longDesc, WIDTH, 3, {});
+		const collapsed = measureSubagentCard(longDesc, WIDTH, 3, { opened: false });
 		const expanded = measureSubagentCard(longDesc, WIDTH, 5, {});
 		expect(collapsed.effectiveExpanded).toBe(false);
 		expect(expanded.effectiveExpanded).toBe(true);
@@ -170,7 +197,7 @@ describe("measureSubagentCard — expanded body", () => {
 	it("expanding a card with a body region is taller than collapsed", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
 		const data = { ...BASE, resultBody: bodyFixture("output.main", "one line result") };
-		const collapsed = measureSubagentCard(data, WIDTH, 3, {});
+		const collapsed = measureSubagentCard(data, WIDTH, 3, { opened: false });
 		const expanded = measureSubagentCard(data, WIDTH, 5, {});
 		// Collapsed shows only a result-preview line; expanded reveals the full
 		// result ContentViewer block → strictly taller.
@@ -296,16 +323,16 @@ describe("measureSubagentCard — recent calls (independent of expansion)", () =
 	it("recent calls show even when collapsed; ≤3 rows", async () => {
 		const c = await import("./measure-subagent");
 		const { measureSubagentCard } = c;
-		const none = measureSubagentCard(BASE, WIDTH, 3, {});
+		const none = measureSubagentCard(BASE, WIDTH, 3, { opened: false });
 		expect(none.recentCallsHeight).toBe(0);
 
-		const three = measureSubagentCard({ ...BASE, recentCallCount: 3 }, WIDTH, 3, {});
+		const three = measureSubagentCard({ ...BASE, recentCallCount: 3 }, WIDTH, 3, { opened: false });
 		expect(three.effectiveExpanded).toBe(false);
 		expect(three.recentRowCount).toBe(3);
 		expect(three.recentCallsHeight).toBeGreaterThan(0);
 
 		// >3 is clamped to 3 rows.
-		const five = measureSubagentCard({ ...BASE, recentCallCount: 5 }, WIDTH, 3, {});
+		const five = measureSubagentCard({ ...BASE, recentCallCount: 5 }, WIDTH, 3, { opened: false });
 		expect(five.recentRowCount).toBe(3);
 		expect(five.recentCallsHeight).toBe(three.recentCallsHeight);
 
@@ -380,7 +407,7 @@ describe("measureSubagentCard — timing passthrough (header + recent rows)", ()
 
 	it("defaults to an empty row list and a null-filled header record", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
-		const m = measureSubagentCard(BASE, WIDTH, 3, {});
+		const m = measureSubagentCard(BASE, WIDTH, 3, { opened: false });
 		expect(m.recentCallTimings).toEqual([]);
 		expect(m.timing.durationMs).toBeNull();
 	});
@@ -456,7 +483,9 @@ describe("measureSubagentCard — permission integration (P11) + P10 dependency"
 		const { measureSubagentCard } = c;
 		const { measureInlinePermission } = await import("./measure-permission");
 		const detail = { hasExecutionTarget: true, buttonCount: 2 };
-		const r = measureSubagentCard({ ...BASE, pendingPermissions: [detail] }, WIDTH, 3, {});
+		const r = measureSubagentCard({ ...BASE, pendingPermissions: [detail] }, WIDTH, 3, {
+			opened: false,
+		});
 		expect(r.pendingCardCount).toBe(1);
 		const cardInner = WIDTH - c.BLOCK_PADDING_X * 2 - c.PENDING_CARD_BORDER * 2;
 		const perm = measureInlinePermission(detail, cardInner, 3);
@@ -509,7 +538,7 @@ describe("measureSubagentCard — width sensitivity + reusable measurer", () => 
 			description: "a recurring subagent description phrase for wrapping",
 			resultBody: bodyFixture("output.main", "some result body"),
 		};
-		const collapsed = measureSubagentCard(data, WIDTH, 3, {});
+		const collapsed = measureSubagentCard(data, WIDTH, 3, { opened: false });
 		const expanded = measureSubagentCard(data, WIDTH, 5, {});
 		expect(collapsed.effectiveExpanded).toBe(false);
 		expect(expanded.effectiveExpanded).toBe(true);
@@ -720,11 +749,12 @@ describe("measureSubagent — file changes", () => {
 
 	it("costs nothing while the card is folded", async () => {
 		// The block lives in the EXPANDED region, so a folded card must be unaffected.
-		// L3 folds unconditionally (`resolveSubagentExpanded`), which is why the LOD —
-		// not an `expanded` option — is what selects the folded shape here.
+		// Low LOD defaults to expanded too, so folding requires a reader preference.
 		const { measureSubagentCard } = await import("./measure-subagent");
-		const bare = measureSubagentCard(baseCard(), 600, 3);
-		const withFiles = measureSubagentCard({ ...baseCard(), fileChanges: changes(20) }, 600, 3);
+		const bare = measureSubagentCard(baseCard(), 600, 3, { opened: false });
+		const withFiles = measureSubagentCard({ ...baseCard(), fileChanges: changes(20) }, 600, 3, {
+			opened: false,
+		});
 		expect(withFiles.effectiveExpanded).toBe(false);
 		expect(withFiles.height).toBe(bare.height);
 		expect(withFiles.fileChangesHeight).toBe(0);

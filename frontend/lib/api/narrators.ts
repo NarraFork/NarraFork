@@ -127,6 +127,8 @@ export type ScopedRevertUnavailableReason =
 	| "git_unsupported"
 	| "window_too_large"
 	| "legacy_unverified"
+	| "execution_unavailable"
+	| "runtime_reload_required"
 	| "incomplete_coverage"
 	| "unsupported_target"
 	| "pending_operations"
@@ -158,7 +160,99 @@ export type RevertWarning =
 			sampleFilePaths: string[];
 	  };
 
+export type RevertAction = "rollback_to_block" | "delete_tool_block" | "revert_files";
+
+export interface RevertActionTarget {
+	messageId: string;
+	blockIndex?: number;
+}
+
+/** The exact durable plan reviewed by the user, never a request to re-plan. */
+export interface RevertPlanConfirmation {
+	planId: string;
+	planHash: string;
+	action: RevertAction;
+}
+
+export interface RevertActionConfirmOptions {
+	skipRevert: boolean;
+	scope?: RevertScope;
+	revertPlan?: RevertPlanConfirmation;
+}
+
+export interface RevertActionPlan {
+	id: string;
+	planHash: string | null;
+	status: string;
+	coverageComplete: boolean;
+	expectedFileCount: number;
+	expiresAt: string;
+	expired: boolean;
+	kind: "revert" | "history_delete" | "rollback_to_block";
+	selectorKind: string;
+}
+
+export interface RevertHistorySummary {
+	deletedMessageCount: number;
+	deletedBlockCount: number;
+}
+
+export interface RevertActionPreview {
+	action: RevertAction;
+	plan: RevertActionPlan | null;
+	executable: false;
+	historySummary: RevertHistorySummary | null;
+	unavailable?: ScopedRevertUnavailableReason;
+}
+
+/** Bounded metadata only; snapshots and file contents are not loaded by this UI. */
+export interface RevertPlanFile {
+	id: string;
+	fileKey: string;
+	sequence: number;
+	identityJson: {
+		deviceId: string;
+		displayPath: string;
+		lexicalPath: string;
+		canonicalPath: string;
+	};
+	expectedStateJson: { kind: "absent" | "regular" | "symlink" | "unknown" };
+	desiredStateJson: { kind: "absent" | "regular" | "symlink" };
+}
+
+export interface RevertPlanFilesPage {
+	items: RevertPlanFile[];
+	hasMore: boolean;
+	nextCursor: { fileKey: string } | null;
+	executable: false;
+}
+
+export interface RevertPlanApplyResult {
+	planId: string;
+	status: "committed" | "compensated" | "recovery_required";
+	journalStatus: string;
+	settling: boolean;
+	reason: string | null;
+}
+
+export type RevertPlanPreviewIssue =
+	| "expired"
+	| "not_prepared"
+	| "preview_failed"
+	| "incomplete_files"
+	| "window_too_large"
+	| "reload_required";
+
+/** UI-only review state, tied to one target and one opening/reload. */
+export interface RevertPlanReview extends Omit<RevertActionPlan, "id"> {
+	planId: string;
+	action: RevertAction;
+	previewKey: string;
+	filesComplete: boolean;
+}
+
 export interface RevertPreviewFile {
+	fileKey?: string;
 	deviceId: string;
 	filePath: string;
 	willBeDeleted: boolean;
@@ -195,6 +289,10 @@ export interface BlockDeletePreview {
  * user choice and an available, complete preview.
  */
 export interface RevertScopePreviews<F extends RevertPreviewFile = RevertPreviewFile> {
+	/** Present only for the new action-preview + paged-files flow. */
+	revertPlan?: RevertPlanReview;
+	previewIssue?: RevertPlanPreviewIssue;
+	previewError?: string;
 	scope?: RevertScope;
 	affectedFiles: F[];
 	narratorScope?: {
@@ -1214,6 +1312,37 @@ export const narratorsApi = {
 		request<{ ok: boolean }>(
 			`/narrators/${narratorId}/tool-calls/${encodeURIComponent(toolUseId)}/allow-retry`,
 			{ method: "POST" },
+		),
+	previewRevertAction: (
+		narratorId: string,
+		body: RevertActionTarget & { action: RevertAction; idempotencyKey: string },
+		signal?: AbortSignal,
+	) =>
+		request<RevertActionPreview>(`/narrators/${narratorId}/revert-action-preview`, {
+			method: "POST",
+			body: JSON.stringify(body),
+			signal,
+		}),
+	getRevertPlanFiles: (
+		narratorId: string,
+		planId: string,
+		params: { limit: number; cursor?: string },
+		signal?: AbortSignal,
+	) => {
+		const query = new URLSearchParams({ limit: String(params.limit) });
+		if (params.cursor !== undefined) query.set("cursor", params.cursor);
+		return request<RevertPlanFilesPage>(
+			`/narrators/${narratorId}/revert-plans/${encodeURIComponent(planId)}/files?${query}`,
+			{ signal },
+		);
+	},
+	applyRevertPlan: (narratorId: string, plan: RevertPlanConfirmation) =>
+		request<RevertPlanApplyResult>(
+			`/narrators/${narratorId}/revert-plans/${encodeURIComponent(plan.planId)}/apply`,
+			{
+				method: "POST",
+				body: JSON.stringify({ planHash: plan.planHash, action: plan.action }),
+			},
 		),
 	rollbackToBlock: (
 		narratorId: string,

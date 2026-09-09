@@ -29,6 +29,7 @@ import {
 	rawSideCarToMarkdown,
 	readSideCarBody,
 	type SideCarBody,
+	type SideCarInboundMessage,
 	sideCarBodyToMarkdown,
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
@@ -1238,6 +1239,50 @@ function adaptMessage(
 			const reviewBlock = blocks[reviewBlockIndex];
 			if (reviewBlock) return [adaptReviewCard(reviewBlock, idBase, reviewBlockIndex, ctx)];
 		}
+		// Send deliveries keep role=user for the model, but their structured block owns
+		// the reader-facing identity. Match it BEFORE origin erases that structure.
+		// Only communication is rerouted here; reminder/permission cards keep their
+		// existing paths, and an explicit human origin keeps its right-hand bubble.
+		const injectionIndex = blocks.findIndex((b) => b.type === "system_injection");
+		const injection = blocks[injectionIndex];
+		if (msg.origin !== "user" && injection && readCommunicationInjection(injection)) {
+			const modelFacingText = blocks
+				.filter((b) => b.type === "text")
+				.map((b) => b.text ?? "")
+				.join("\n");
+			const spoken = adaptSpokenInjection(injection, idBase, injectionIndex, modelFacingText, ctx);
+			if (spoken) return spoken;
+		}
+		// Older Send rows have attribution but no structured body. Keep their COMPLETE
+		// text and readable label; never recover a sender id or strip prompt prefixes
+		// by guessing at the prose. Index zero is the historical user row's address.
+		if (
+			!injection &&
+			msg.origin === "assistant" &&
+			(msg.originLabel === "agentMessage" || msg.originLabel?.startsWith("agentMessage:"))
+		) {
+			const text = blocks
+				.filter((b) => b.type === "text")
+				.map((b) => b.text ?? "")
+				.join("\n");
+			return [
+				{
+					kind: "injection-bubble",
+					key: `${idBase}-b0-m-legacy`,
+					data: {
+						markdown: rawSideCarToMarkdown(text),
+						speaker: originHeadingLabel(ctx, msg.origin, msg.originLabel),
+						speakerId: null,
+						speakerKind: null,
+						target: null,
+						isBroadcast: false,
+						source: "subagent_message",
+						hasHeader: true,
+						modelFacing: text,
+					},
+				},
+			];
+		}
 		// Turns stored as role=user for protocol/scheduling reasons that no human
 		// wrote (auto-continuation, review kickoff, AI-initiated sends). Painting
 		// them as user bubbles is what made authorship ambiguous, so they get the
@@ -2248,7 +2293,7 @@ function adaptSpokenInjection(
 						? ({
 								kind: "narrator",
 								narratorId: message.fromId,
-								messageId: message.fromMessageId ?? null,
+								messageId: message.fromToolUseId ?? message.fromMessageId ?? null,
 							} satisfies InjectionTarget)
 						: null,
 					isBroadcast: message.isBroadcast === true,
@@ -2527,11 +2572,35 @@ export const PLATFORM_INJECTION_SOURCES = new Set([
  * adding a producer here is a claim that its content has an author worth naming, and
  * that claim should be made explicitly at the point someone adds the producer.
  */
-const SPOKEN_INJECTION_SOURCES = new Set([
-	// Somebody sent the reader something.
+const COMMUNICATION_INJECTION_SOURCES = new Set([
 	"subagent_message",
+	"agent_message",
 	"team_message",
 	"group_message",
+]);
+
+/** The same structural predicate drives user-row rendering and selection ownership. */
+export function readCommunicationInjection(block: {
+	type: string;
+	source?: unknown;
+	body?: unknown;
+	bodyJson?: unknown;
+}): SideCarInboundMessage | null {
+	if (
+		block.type !== "system_injection" ||
+		typeof block.source !== "string" ||
+		!COMMUNICATION_INJECTION_SOURCES.has(block.source)
+	)
+		return null;
+	const body = readSideCarBody(block);
+	if (body?.kind !== "messages") return null;
+	const message = body.items[0];
+	return message && typeof message.text === "string" && message.text.trim() ? message : null;
+}
+
+const SPOKEN_INJECTION_SOURCES = new Set([
+	// Somebody sent the reader something.
+	...COMMUNICATION_INJECTION_SOURCES,
 	// Work the reader started reporting its own result. `bg_bash` qualifies for the
 	// same reason as `bg_agent`: an aliased background command is a named entity the
 	// system already treats as addressable, not an anonymous event.
@@ -2561,12 +2630,14 @@ function specUpdateTarget(body: SideCarBody): InjectionTarget | null {
 /**
  * Display name for one inbound message's sender.
  *
- * Mirrors `senderLabel` in `@shared/sidecar-body` (title, else an 8-char id prefix) so
+ * Mirrors `senderLabel` in `@shared/sidecar-body` (title, alias, then an 8-char id prefix) so
  * the bubble header and the model-facing text name the same participant. Falls back to
  * empty, which the render layer shows as an unnamed speaker rather than inventing one.
  */
-function spokenSpeakerLabel(message: { fromTitle?: string | null; fromId?: string }): string {
-	return message.fromTitle?.trim() || message.fromId?.slice(0, 8) || "";
+function spokenSpeakerLabel(message: SideCarInboundMessage): string {
+	return (
+		message.fromTitle?.trim() || message.fromLabel?.trim() || message.fromId?.slice(0, 8) || ""
+	);
 }
 
 function adaptSystemBlock(
@@ -2942,6 +3013,7 @@ export function groupToolItemsForLod(
 		if (!item) continue;
 		if (
 			isCommunicationTool(item.tc) ||
+			item.isSubagent ||
 			isActiveToolItem(item) ||
 			isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)
 		) {
@@ -2975,7 +3047,7 @@ interface ToolRunContext {
 export interface CommunicationBubbleData {
 	toolUseId?: string;
 	toolName: string;
-	recipients: { label: string; id?: string }[];
+	recipients: { label: string; id?: string; deliveryMessageId?: string }[];
 	broadcast: boolean;
 	message: string;
 	messageTruncated: boolean;
@@ -2996,16 +3068,6 @@ function communicationRecipients(
 	metadata: Record<string, unknown>,
 	tc: AdapterToolItem["tc"],
 ): CommunicationBubbleData["recipients"] {
-	// Persisted targets are the resolved authoritative set (including an empty
-	// broadcast result); selectors may be aliases or prefixes, never guessed ids.
-	if (Array.isArray(metadata.targets)) {
-		return metadata.targets.flatMap((target) => {
-			const value = asObject(target);
-			const id = readNonEmptyString(value, "id");
-			const label = readNonEmptyString(value, "label") ?? readNonEmptyString(value, "title") ?? id;
-			return label ? [{ label, ...(id && id !== "parent" && id !== "main" ? { id } : {}) }] : [];
-		});
-	}
 	const selectors: string[] = [];
 	const add = (value: unknown) => {
 		if (typeof value === "string" && value.trim() && !selectors.includes(value.trim())) {
@@ -3016,6 +3078,35 @@ function communicationRecipients(
 	for (const field of ["ids", "names"]) {
 		const values = input[field];
 		if (Array.isArray(values)) for (const value of values) add(value);
+	}
+	// Persisted targets are the resolved authoritative set (including an empty
+	// broadcast result); selectors may be aliases or prefixes, never guessed ids.
+	const liveTargets = asObject(tc)._sendDeliveryTargets;
+	const targets = Array.isArray(metadata.targets)
+		? metadata.targets
+		: Array.isArray(liveTargets)
+			? liveTargets
+			: undefined;
+	if (targets) {
+		return targets.flatMap((target) => {
+			const value = asObject(target);
+			const id = readNonEmptyString(value, "id");
+			const deliveryMessageId = readNonEmptyString(value, "deliveryMessageId");
+			const label =
+				readNonEmptyString(value, "label") ??
+				readNonEmptyString(value, "title") ??
+				(!Array.isArray(metadata.targets) && selectors.length === 1 ? selectors[0] : undefined) ??
+				id;
+			return label
+				? [
+						{
+							label,
+							...(id && id !== "parent" && id !== "main" ? { id } : {}),
+							...(deliveryMessageId ? { deliveryMessageId } : {}),
+						},
+					]
+				: [];
+		});
 	}
 	const resolved = readNonEmptyString(tc, "_awaitAgentNarratorId");
 	// The WS event resolves only a single target, never every member of a fanout.
@@ -3157,7 +3248,9 @@ function adaptToolItemFull(
 		collapsesByLod:
 			!hasPendingPermission &&
 			!isActiveToolItem(item) &&
-			(ctx.lod === 3 || (ctx.lod === 4 && !isRecentToolItem(item, ctx))),
+			(item.isSubagent
+				? ctx.lod === 1
+				: ctx.lod === 3 || (ctx.lod === 4 && !isRecentToolItem(item, ctx))),
 	};
 	if (item.isSubagent && !isCommunication) {
 		const data = buildSubagentCardData(item, ctx);

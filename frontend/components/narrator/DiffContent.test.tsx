@@ -9,11 +9,21 @@ import {
 } from "@shared/pretext-layout/diff-core";
 import { layoutDiffRows } from "@shared/pretext-layout/diff-layout";
 import { createSourceText, trimSourceText } from "@shared/pretext-layout/source-text";
+import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import { useLayoutEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { AutoFollowScroll, useContentViewport } from "./AutoFollowScroll";
 import { DiffContent } from "./DiffContent";
+import { topLevelStreamingChunkToToolFields } from "./narrator-message-helpers";
+
+const {
+	applyStreamingToolChunk,
+	applyStreamingToolCompleted,
+	applyStreamingToolExecuting,
+	applyStreamingToolStarted,
+	createStreamingToolStore,
+} = await import("./vlist/streaming-tool-chunks");
 
 const { installCanvasStub } = await import("./vlist/measure/test-canvas-stub");
 installCanvasStub();
@@ -468,6 +478,156 @@ describe("DiffContent declared geometry", () => {
 });
 
 describe("DiffContent permanent viewport", () => {
+	test("normal Edit chunks have no warnings and use file lines as soon as matching locates them", async () => {
+		const store = createStreamingToolStore();
+		const input = { file_path: "/a.ts", old_string: "keep\nold\n}", new_string: "keep\nnew\n}" };
+		const renderChunk = async () => {
+			const chunk = store.get("edit");
+			if (!chunk) throw new Error("missing Edit chunk");
+			const fields = topLevelStreamingChunkToToolFields(chunk);
+			const detail = classifyToolDetail({
+				toolUseId: "edit",
+				toolName: "Edit",
+				category: "file",
+				inputJson: fields.inputJson,
+				metadata: fields._metadata,
+				status: chunk._status ?? "streaming",
+				isStreaming: !chunk._started,
+			});
+			const body = detail?.sections.find((part) => part.key === "input.edit")?.body;
+			if (body?.kind !== "capped" || !body.diffDocument) throw new Error("missing Edit diff");
+			root.render(<Fixture doc={body.diffDocument} live={body.live} />);
+			await settle();
+			expect(canvas().querySelector("[data-diff-range-warning]")).toBeNull();
+		};
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 30,
+			extractedFields: { file_path: input.file_path },
+			streamingField: { name: "old_string", delta: "keep\n", startsField: true },
+		});
+		await renderChunk();
+		const node = scroller();
+		const body = canvas();
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 60,
+			extractedFields: { old_string: input.old_string },
+			metadata: { startLine: 445 },
+			streamingField: { name: "new_string", delta: "keep\n", startsField: true },
+		});
+		await renderChunk();
+		expect(canvas().querySelector("[data-diff-gutter]")?.textContent).toMatch(/445\s+445/);
+		expect(canvas().querySelector("[data-diff-gutter]")?.textContent).not.toContain("~");
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 70,
+			streamingField: { name: "new_string", delta: "new\n}" },
+		});
+		await renderChunk();
+		expect(canvas().textContent).not.toContain("~");
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 80,
+			extractedFields: { new_string: input.new_string },
+		});
+		await renderChunk();
+		applyStreamingToolStarted(store, { toolUseId: "edit", toolName: "Edit", input });
+		await renderChunk();
+		applyStreamingToolExecuting(store, { toolUseId: "edit" });
+		await renderChunk();
+		applyStreamingToolCompleted(store, {
+			toolUseId: "edit",
+			status: "success",
+			metadata: { startLine: 445 },
+		});
+		await renderChunk();
+		expect(scroller()).toBe(node);
+		expect(canvas()).toBe(body);
+		expect(canvas().textContent).not.toContain("~");
+	});
+
+	test("a bounded live window does not cover streaming code with a partial-source banner", async () => {
+		const full = createSourceText(text(4_000), { epoch: "stream", streaming: true });
+		const window = trimSourceText(full, 16_000);
+		const doc = createDiffDocument({
+			oldText: window.text,
+			newText: window.text,
+			oldRange: window.range,
+			newRange: window.range,
+			startLine: 445,
+		});
+		expect(doc.truncated).toBe(true);
+		root.render(<Fixture doc={doc} />);
+		await settle();
+		expect(canvas().querySelector("[data-diff-range-warning]")).toBeNull();
+		root.render(<Fixture doc={doc} live={false} />);
+		await settle();
+		expect(canvas().querySelector("[data-diff-range-warning='preview']")).not.toBeNull();
+	});
+
+	test("an unknown new-side origin does not mark known old file lines as provisional", async () => {
+		const unknown = createSourceText("keep", { epoch: "reconnect", originKnown: false });
+		root.render(
+			<Fixture
+				live={false}
+				doc={createDiffDocument({
+					oldText: "keep",
+					newText: unknown.text,
+					newRange: unknown.range,
+					startLine: 446,
+				})}
+			/>,
+		);
+		await settle();
+		expect(canvas().querySelector("[data-diff-gutter]")?.textContent).toMatch(/446\s+~1/);
+		expect(canvas().textContent).not.toContain("~446");
+	});
+
+	test("source transitions do not leave a version warning on an automatic follower", async () => {
+		const build = (epoch: string) => {
+			const source = createSourceText(text(200), { epoch, complete: true });
+			return createDiffDocument({
+				oldText: source.text,
+				newText: source.text,
+				oldRange: source.range,
+				newRange: source.range,
+			});
+		};
+		root.render(<Fixture doc={build("first")} />);
+		await settle();
+		root.render(<Fixture doc={build("verified")} />);
+		await settle();
+		expect(controllers.get("inline")?.following).toBe(true);
+		expect(canvas().querySelector("[data-diff-range-warning]")).toBeNull();
+	});
+
+	test("a paused reader's real version warning clears when its new anchor is valid", async () => {
+		const build = (epoch: string, count: number) => {
+			const source = createSourceText(text(count), { epoch, complete: true });
+			return createDiffDocument({
+				oldText: source.text,
+				newText: source.text,
+				oldRange: source.range,
+				newRange: source.range,
+			});
+		};
+		root.render(<Fixture doc={build("first", 800)} />);
+		await settle();
+		await pauseAt(200);
+		root.render(<Fixture doc={build("replacement", 500)} />);
+		await settle();
+		expect(canvas().querySelector("[data-diff-range-warning='epoch']")).not.toBeNull();
+		root.render(<Fixture doc={build("replacement", 501)} />);
+		await settle();
+		expect(controllers.get("inline")?.following).toBe(false);
+		expect(canvas().querySelector("[data-diff-range-warning]")).toBeNull();
+	});
+
 	test("follows a new-side change before a long removed suffix, not the bottom", async () => {
 		const doc = createDiffDocument({ oldText: text(2_000), newText: text(80), focusSide: "new" });
 		root.render(<Fixture doc={doc} />);

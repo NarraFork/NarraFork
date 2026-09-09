@@ -918,6 +918,43 @@ const productionDependencies: FileReferenceDependencies = {
 	},
 };
 
+/** Editor-only authorization: uses the real reference Read policy without reading text or
+ * requiring the live file to exist. Immutable source/conflict versions remain readable
+ * after deletion, and commit can report the deletion as an optimistic-lock conflict.
+ * Ordinary reference/preview budgets and existence checks remain unchanged. */
+export async function authorizeEditorReferenceTarget(
+	narratorId: string,
+	userId: string,
+	path: string,
+): Promise<string> {
+	const deps = productionDependencies;
+	const scope = await deps.loadScope(narratorId, userId, "read");
+	if (scope.runtimePolicy && !scope.runtimePolicy.allowLocalExecution)
+		throw failure("FORBIDDEN", "Narrator runtime policy denies local files", 403);
+	const backend = await deps.getBackend("local");
+	const context = await createExecutionTargetContext({
+		backend,
+		target: {
+			deviceId: "local",
+			backendKind: "local",
+			cwd: scope.cwd,
+			lexicalPath: backend.paths.resolve(scope.cwd, path),
+			pathFlavor: backend.pathFlavor,
+			runtimeGeneration: backend.runtimeGeneration,
+			selectionSource: "explicit",
+		},
+	});
+	const canonical = context.target.canonicalPath;
+	if (
+		!canonical ||
+		(await deps.isSecretPath(context, path)) ||
+		(await deps.isSecretPath(context, canonical)) ||
+		(await deps.readDecision(scope, context)) !== "allow"
+	)
+		throw failure("FORBIDDEN", "Read policy denies this editor source", 403);
+	return canonical;
+}
+
 export const fileReferenceService = createFileReferenceService(productionDependencies);
 export const captureFileReferences: FileReferenceService["captureFileReferences"] = (...args) =>
 	fileReferenceService.captureFileReferences(...args);

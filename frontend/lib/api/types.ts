@@ -527,6 +527,8 @@ export interface BaseContentBlock {
 	 * for why it is kept out of `_metadata`.
 	 */
 	_awaitAgentNarratorId?: string;
+	/** Accepted/queued Send receipts; message location must confirm persistence. */
+	_sendDeliveryTargets?: Array<{ id: string; deliveryMessageId: string }>;
 	/**
 	 * The subagent this call is waiting on is currently TAKEN OVER by the user, so
 	 * the call is blocked until the takeover is stopped.

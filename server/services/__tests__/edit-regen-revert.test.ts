@@ -77,7 +77,9 @@ mock.module("../../lib/uploads", () => ({
 	}),
 }));
 
-const { closeNarrator, editAndRegenerate } = await import("../narrator-session");
+const { closeNarrator, editAndRegenerate, interruptAndWaitForIdle } = await import(
+	"../narrator-session"
+);
 const { narratorMessages, narratorMessageRefs, narrators } = schema;
 
 afterAll(() => {
@@ -129,6 +131,8 @@ async function runEdit(opts?: Parameters<typeof editAndRegenerate>[5]) {
 		/* expected: no provider is reachable */
 	}
 	closeNarrator("n1");
+	// close only signals abort; do not reseed n1 while its full finalizer owns it.
+	expect(await interruptAndWaitForIdle("n1", { timeoutMs: 5_000 })).toBe(true);
 }
 
 describe("edit-and-regenerate file rollback", () => {

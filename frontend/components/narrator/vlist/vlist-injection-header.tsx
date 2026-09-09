@@ -26,6 +26,7 @@ import { PLATFORM_INJECTION_SOURCES as ADAPTER_PLATFORM_SOURCES } from "@shared/
 import { IconBook2, IconChecklist, IconSparkles, IconTerminal2 } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { ReminderFrequencySettings } from "./ReminderFrequencySettings";
 import type { VListElementKind } from "./registry";
 import type { RenderExtra } from "./render-registry";
 import type { BubbleCreator } from "./vlist-user-bubble-header";
@@ -153,6 +154,7 @@ export function InjectionSpeakerHeader({
 	source,
 	onOpenSession,
 	openSessionLabel,
+	narratorId,
 }: {
 	speaker?: string | null;
 	/**
@@ -191,6 +193,8 @@ export function InjectionSpeakerHeader({
 	onOpenSession?: () => void;
 	/** Localized tooltip / aria label for that affordance. */
 	openSessionLabel?: string;
+	/** Owning session, not the speaker's session; enables reminder frequency controls. */
+	narratorId?: string;
 }) {
 	const { t } = useTranslation("narrator");
 	// Identity resolution, in priority order:
@@ -309,11 +313,21 @@ export function InjectionSpeakerHeader({
 			) : null}
 		</Group>
 	);
-	if (!onOpenSession) return row;
-	return (
+	const identity = onOpenSession ? (
 		<OpenSessionHeaderLink label={openSessionLabel ?? name} onOpen={onOpenSession}>
 			{row}
 		</OpenSessionHeaderLink>
+	) : (
+		row
+	);
+	if (!narratorId || (source !== "living_work_spec" && source !== "silent_progress")) {
+		return identity;
+	}
+	return (
+		<Group gap={6} wrap="nowrap" h="100%">
+			<Box style={{ flex: 1, minWidth: 0, height: "100%", overflow: "hidden" }}>{identity}</Box>
+			<ReminderFrequencySettings source={source} narratorId={narratorId} />
+		</Group>
 	);
 }
 
@@ -407,6 +421,7 @@ export function injectInjectionBubbleChrome(
 	extra: RenderExtra,
 	noteText: string | undefined,
 	navigation?: InjectionNavigation,
+	narratorId?: string,
 ): void {
 	if (kind !== "injection-bubble") return;
 	// Clickable only when BOTH exist: a resolvable target on the row, and a host that
@@ -416,6 +431,7 @@ export function injectInjectionBubbleChrome(
 	const openSession = target ? resolveInjectionOpener(target, navigation) : undefined;
 	extra.header = (
 		<InjectionSpeakerHeader
+			narratorId={narratorId}
 			speaker={(extra.speaker as string | null | undefined) ?? null}
 			speakerId={(extra.speakerId as string | null | undefined) ?? null}
 			speakerKind={(extra.speakerKind as string | null | undefined) ?? null}

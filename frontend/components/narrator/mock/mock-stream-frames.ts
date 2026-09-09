@@ -83,7 +83,7 @@ export function mockToolChunkFrame(opts: {
 	toolUseId: string;
 	toolName: string;
 	inputCharsTotal: number;
-	streamingField?: { name: string; delta: string };
+	streamingField?: { name: string; delta: string; startsField?: boolean };
 	extractedFilePath?: string;
 	extractedFields?: Record<string, string>;
 }): MockFrame {

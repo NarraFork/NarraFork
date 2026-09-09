@@ -161,6 +161,7 @@ export function groupToolRunItemsForLod(
 		const item = items[index];
 		if (
 			isCommunicationTool(item.tc) ||
+			item.isSubagent ||
 			isActiveToolItem(item) ||
 			isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)
 		) {
@@ -239,7 +240,8 @@ function splitMessageSegmentForActivity(
  * activity trace.
  *
  * Running / streaming tools DO fold (that is what makes the hand-off invisible —
- * see the module header). Only two kinds keep their cards:
+ * see the module header). These kinds keep their cards:
+ *  - subagent calls, whose task details stay visible at every LOD;
  *  - a tool blocked on a permission decision (its approve/deny form has nowhere
  *    else to live — see `isPermissionAwaitingToolItem`);
  *  - the most recent spec://tasks.json call, when the caller passes its tool-use
@@ -247,7 +249,9 @@ function splitMessageSegmentForActivity(
  *    the task board is the narrator's live working state).
  */
 function isKeptToolItem(item: ToolRunItem, keepToolUseIds?: ReadonlySet<string>): boolean {
-	if (isCommunicationTool(item.tc) || isPermissionAwaitingToolItem(item)) return true;
+	if (item.isSubagent || isCommunicationTool(item.tc) || isPermissionAwaitingToolItem(item)) {
+		return true;
+	}
 	const toolUseId = item.tc.toolUseId;
 	return !!toolUseId && keepToolUseIds != null && keepToolUseIds.has(toolUseId);
 }

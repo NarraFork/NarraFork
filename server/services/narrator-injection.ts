@@ -183,6 +183,8 @@ export interface InjectionRecipientPlacement {
 }
 
 export interface DeliverInjectionOptions {
+	/** Exact recipient row reserved by an inbound agent delivery. */
+	messageId?: string;
 	/** Model-facing text. Stored verbatim as the row's first text block. */
 	content: string;
 	/** Producer tag. */
@@ -260,6 +262,14 @@ export function buildSystemInjectionBlock(
  * consumer as well as its collaborator, and a static import would close a cycle.
  */
 export async function deliverInjection(
+	...args: Parameters<typeof deliverInjectionUnlocked>
+): ReturnType<typeof deliverInjectionUnlocked> {
+	if (!args[1].content.trim()) return EMPTY_RESULT;
+	const { withNarratorWorkAdmission } = await import("./narrator-session-state");
+	return withNarratorWorkAdmission(args[0], () => deliverInjectionUnlocked(...args));
+}
+
+async function deliverInjectionUnlocked(
 	narratorId: string,
 	options: DeliverInjectionOptions,
 ): Promise<DeliverInjectionResult> {
@@ -282,8 +292,9 @@ export async function deliverInjection(
 	};
 
 	const placement =
-		options.subagent || options.onPersist
+		options.subagent || options.onPersist || options.messageId
 			? {
+					...(options.messageId ? { messageId: options.messageId } : {}),
 					...(options.subagent ? { parentToolUseId: options.subagent.parentToolUseId } : {}),
 					...(options.onPersist ? { onPersist: options.onPersist } : {}),
 				}

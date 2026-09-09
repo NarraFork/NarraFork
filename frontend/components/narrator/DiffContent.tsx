@@ -176,7 +176,7 @@ const DiffLineRow = memo(function DiffLineRow({
 	colors: ReturnType<typeof palette>;
 	gutterWidth: number;
 	lineNoWidth?: number;
-	lineNumberPrefix?: string;
+	lineNumberPrefix?: Parameters<typeof formatDiffGutter>[2];
 	lineHeight: number;
 	top: number;
 	viewportTop: number;
@@ -322,14 +322,28 @@ export const DiffContent = memo(function DiffContent({
 		row: number;
 	} | null>(null);
 	const source = diffDocument ?? providedLines;
+	const lineNumberPrefixes = useMemo(
+		() =>
+			suppliedLineNumberPrefix ??
+			(diffDocument
+				? {
+						old:
+							diffDocument.startLine == null || !diffDocument.oldSource.range.originKnown
+								? "~"
+								: undefined,
+						new:
+							diffDocument.startLine == null || !diffDocument.newSource.range.originKnown
+								? "~"
+								: undefined,
+					}
+				: undefined),
+		[diffDocument, suppliedLineNumberPrefix],
+	);
+	// Reserve room for the wider side without marking a located side as provisional.
 	const lineNumberPrefix =
-		suppliedLineNumberPrefix ??
-		(diffDocument &&
-		(diffDocument.startLine == null ||
-			!diffDocument.oldSource.range.originKnown ||
-			!diffDocument.newSource.range.originKnown)
-			? "~"
-			: undefined);
+		typeof lineNumberPrefixes === "object"
+			? (lineNumberPrefixes.old ?? lineNumberPrefixes.new)
+			: lineNumberPrefixes;
 	const previousDocument = current.current?.document;
 	const settlingWithoutNewText =
 		!live &&
@@ -513,7 +527,9 @@ export const DiffContent = memo(function DiffContent({
 		setRowTarget(target ? { top: target.top + origin, bottom: target.bottom + origin } : null);
 		if (ready && previous && previous !== frame && anchor) {
 			const resolved = anchorTop(frame, anchor);
-			if (resolved.loss) setLoss(resolved.loss);
+			// A follower has no pinned reading position to lose. For a paused reader,
+			// clear a previous loss as soon as its current anchor maps successfully.
+			setLoss(following ? null : resolved.loss);
 			const next = Math.max(
 				0,
 				Math.min(resolved.top + origin, frame.layout.totalHeight + origin * 2 - height),
@@ -546,18 +562,19 @@ export const DiffContent = memo(function DiffContent({
 	]);
 
 	useLayoutEffect(() => () => setRowTarget(null), [setRowTarget]);
+	const activeLoss = following ? null : loss;
 	const warning =
-		loss === "range"
+		activeLoss === "range"
 			? t("diffReadRangeExpired", {
 					defaultValue:
 						"Reading position is outside the retained range; showing the nearest available line.",
 				})
-			: loss
+			: activeLoss
 				? t("diffReadVersionChanged", {
 						defaultValue:
 							"The source range or version changed; the previous reading line is unavailable.",
 					})
-				: diffDocument?.truncated
+				: !live && diffDocument?.truncated
 					? t("diffSourcePreview", {
 							defaultValue: "Source content is incomplete; showing a bounded diff preview.",
 						})
@@ -583,7 +600,7 @@ export const DiffContent = memo(function DiffContent({
 		>
 			{warning ? (
 				<div
-					data-diff-range-warning={loss ?? "preview"}
+					data-diff-range-warning={activeLoss ?? "preview"}
 					role="status"
 					style={{ position: "sticky", top: 0, height: 0, zIndex: 1, pointerEvents: "none" }}
 				>
@@ -632,7 +649,7 @@ export const DiffContent = memo(function DiffContent({
 							colors={colors}
 							gutterWidth={frame.layout.gutterWidth}
 							lineNoWidth={lineNoWidth}
-							lineNumberPrefix={lineNumberPrefix}
+							lineNumberPrefix={lineNumberPrefixes}
 							lineHeight={frame.layout.typography.lineHeight}
 							top={diffRowBodyTop(frame.layout, index)}
 							viewportTop={top}

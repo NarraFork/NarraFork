@@ -105,6 +105,29 @@ describe("communication bubbles", () => {
 		}
 	});
 
+	it("carries exact receipt ids in running and persisted recipients without matching text", () => {
+		const live = [{ id: "child", label: "worker", deliveryMessageId: "receipt-live" }];
+		expect(
+			data(
+				{ id: "worker", message: "same" },
+				{
+					status: "running",
+					_sendDeliveryTargets: live,
+				},
+			).recipients,
+		).toEqual(live);
+		const settled = [{ id: "child", label: "worker", deliveryMessageId: "receipt-final" }];
+		expect(
+			data(
+				{ id: "worker", message: "same" },
+				{
+					_sendDeliveryTargets: live,
+					outputJson: { _metadata: { targets: settled } },
+				},
+			).recipients,
+		).toEqual(settled);
+	});
+
 	it("uses authoritative targets, including an empty result, instead of guessing aliases", () => {
 		expect(
 			data(

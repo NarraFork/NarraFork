@@ -446,6 +446,56 @@ describe("narrator model history projection", () => {
 });
 
 describe("pretext exact document transport", () => {
+	test("running Send pages carry reserved delivery receipts without persisting a fake result", async () => {
+		const { beginAgentReplyWaitRun } = await import("../agent-reply-waiter");
+		await seedNarrator();
+		await seedMessage({
+			id: "send-message",
+			narratorId: "n1",
+			seq: 1,
+			role: "assistant",
+			contentJson: [
+				{ type: "tool_use", id: "send-live", name: "Send", input: { id: "child", await: true } },
+			],
+		});
+		await db.insert(narratorToolCalls).values({
+			id: "send-row",
+			narratorId: "n1",
+			messageId: "send-message",
+			toolUseId: "send-live",
+			toolName: "Send",
+			inputJson: { id: "child", await: true },
+			status: "running",
+			createdAt: now,
+		});
+		const run = beginAgentReplyWaitRun({
+			requesterId: "n1",
+			toolUseId: "send-live",
+			requesterToolCallBinding: { toolCallId: "send-row", attempt: 0 },
+		});
+		try {
+			run.markStable({
+				prefixTargets: [
+					{ id: "child", status: "queued", deliveryMessageId: "reserved-not-persisted" },
+				],
+			});
+			const page = await narratorService.getPretextDocumentPage("n1", { limit: 2 });
+			const block = page.messages[0].contentJson[0];
+			expect(block._sendDeliveryTargets).toEqual([
+				{ id: "child", deliveryMessageId: "reserved-not-persisted" },
+			]);
+			expect(block.outputJson).toBeNull();
+			expect(block.status).toBe("running");
+			expect(
+				sqlite.query("SELECT output_json FROM narrator_tool_calls WHERE id = ?").get("send-row"),
+			).toEqual({ output_json: null });
+			expect(
+				sqlite.query("SELECT id FROM narrator_messages WHERE id = ?").get("reserved-not-persisted"),
+			).toBeNull();
+		} finally {
+			run.complete();
+		}
+	});
 	test("pages the complete ordered top-level history without layout estimates", async () => {
 		await seedNarrator();
 		for (let seq = 1; seq <= 5; seq++) {

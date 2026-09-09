@@ -14,15 +14,21 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { coerceInjectionTarget } from "@shared/pretext-layout/injection-target";
+import { type AdapterRenderUnit, adaptRenderUnits } from "@shared/pretext-layout/segment-adapter";
 import type {
 	SideCarBody,
 	SideCarDoneTask,
 	SideCarInboundMessage,
 	SideCarKnowledgeHit,
 } from "@shared/sidecar-body";
+import type { RenderSegment } from "../message-segments";
+import type { NarratorMsg } from "../narrator-panel-types";
+import { groupRenderUnits } from "../render-units";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
 import { type AdapterContext, type AdapterSegment, adaptSegment } from "./segment-adapter";
+import { resolveVListBlockTarget } from "./vlist-block-target";
+import { buildSelectionIndex, entriesToBlockMeta, entriesToText } from "./vlist-selection";
 
 beforeAll(() => {
 	installCanvasStub();
@@ -261,6 +267,195 @@ function bubbleSpecs(source: string, items: SideCarInboundMessage[]) {
 		CTX,
 	);
 }
+
+describe("communication delivery — protocol role is not the speaker", () => {
+	for (const delivery of [
+		{ direction: "parent to child", role: "user", origin: "assistant", fromType: "primary" },
+		{ direction: "sibling to child", role: "user", origin: "assistant", fromType: "subagent" },
+		{ direction: "child to parent", role: "sys", origin: "system", fromType: "subagent" },
+	]) {
+		for (const lod of [1, 2, 3, 4, 5] as const) {
+			it(`${delivery.direction} keeps one addressable left bubble at L${lod}`, () => {
+				const segment = injectionSegment(
+					{
+						type: "system_injection",
+						source: "subagent_message",
+						body: MESSAGES_BODY([
+							{
+								fromId: "real-sender",
+								fromTitle: "Sender title",
+								fromType: delivery.fromType,
+								fromMessageId: "sending-message",
+								fromToolUseId: "sending-tool",
+								text: "The actual message",
+							},
+						]),
+					},
+					{
+						role: delivery.role,
+						origin: delivery.origin,
+						originLabel: "agentMessage:old-label",
+						createdBy: "triggering-human",
+						creator: { id: "triggering-human", displayName: "Human" },
+						seq: 10,
+					},
+				);
+				const row = (segment as Extract<AdapterSegment, { kind: "message" }>).msg;
+				const before = JSON.stringify(row);
+				const units = groupRenderUnits([segment as RenderSegment], lod <= 2);
+				const specs = adaptRenderUnits(units as unknown as AdapterRenderUnit[], { lod });
+				expect(specs).toHaveLength(1);
+				const spec = specs[0];
+				if (!spec) throw new Error("Missing communication bubble");
+				expect(spec.kind).toBe("injection-bubble");
+				expect(spec.data).toMatchObject({
+					markdown: "The actual message",
+					speaker: "Sender title",
+					speakerId: "real-sender",
+					speakerKind: delivery.fromType,
+					modelFacing: MODEL_TEXT,
+					target: { kind: "narrator", narratorId: "real-sender", messageId: "sending-tool" },
+				});
+				expect(spec.data).not.toHaveProperty("creator");
+				const measured = VLIST_REGISTRY["injection-bubble"].measure(spec.data, 600, lod);
+				expect(measured.height).toBeGreaterThan(0);
+				expect(measured.usedWidth).toBeLessThan(600);
+				const target = resolveVListBlockTarget(spec.kind, spec.key, ["m1"]);
+				expect(target).toEqual({ blockId: "msg-m1-1", messageId: "m1", blockIndex: 1 });
+				if (!target) throw new Error("Missing communication block target");
+				const index = buildSelectionIndex([row as NarratorMsg]);
+				expect(index.entries).toHaveLength(1);
+				expect(index.byBlockId.get(target.blockId)).toMatchObject({
+					blockId: "msg-m1-1",
+					blockIndex: 1,
+					blockIndices: [0, 1],
+				});
+				expect(entriesToText(index.entries, new Set([target.blockId])).text).toBe(
+					"The actual message",
+				);
+				expect(entriesToBlockMeta(index.entries, new Set([target.blockId]))).toHaveLength(2);
+				expect(JSON.stringify(row)).toBe(before);
+			});
+		}
+	}
+
+	it("supports the agent_message alias, bodyJson and readable fallback without inventing ids", () => {
+		const segment = injectionSegment(
+			{
+				type: "system_injection",
+				source: "agent_message",
+				bodyJson: MESSAGES_BODY([{ fromLabel: "main narrator", text: "hello" }]),
+			},
+			{ role: "user", origin: "assistant" },
+		);
+		expect(adaptSegment(segment, CTX)[0]?.data).toMatchObject({
+			speaker: "main narrator",
+			speakerId: null,
+			target: null,
+			markdown: "hello",
+		});
+	});
+
+	it("falls back to the real sending message when the tool id is absent", () => {
+		const segment = injectionSegment(
+			{
+				type: "system_injection",
+				source: "subagent_message",
+				body: MESSAGES_BODY([{ fromId: "sender", fromMessageId: "message", text: "hello" }]),
+			},
+			{ role: "user", origin: "assistant" },
+		);
+		expect(adaptSegment(segment, CTX)[0]?.data).toMatchObject({
+			target: { kind: "narrator", narratorId: "sender", messageId: "message" },
+		});
+	});
+
+	it("keeps explicit human origin on the original user bubble even with a structured extra", () => {
+		const segment = injectionSegment(
+			{
+				type: "system_injection",
+				source: "subagent_message",
+				body: MESSAGES_BODY([{ fromId: "sender", text: "not human text" }]),
+			},
+			{ role: "user", origin: "user", seq: 10 },
+		);
+		expect(adaptSegment(segment, CTX)[0]).toMatchObject({
+			kind: "message-bubble",
+			data: { role: "user", text: MODEL_TEXT },
+		});
+		const row = (segment as Extract<AdapterSegment, { kind: "message" }>).msg;
+		expect(buildSelectionIndex([row as NarratorMsg]).entries[0]?.blockIndex).toBe(0);
+	});
+
+	it("does not promote non-communication injection bodies or malformed communication", () => {
+		for (const block of [
+			{ type: "system_injection", source: "interrupt_task_guard", body: { kind: "notice" } },
+			{ type: "system_injection", source: "living_work_spec", body: TASKS_BODY },
+			{
+				type: "system_injection",
+				source: "subagent_message",
+				body: { kind: "messages", items: [] },
+			},
+			{ type: "system_injection", source: "subagent_message", body: TASKS_BODY },
+		]) {
+			const specs = adaptSegment(
+				injectionSegment(block, {
+					role: "user",
+					origin: "assistant",
+					originLabel: "agentMessage:do-not-override",
+				}),
+				CTX,
+			);
+			expect(specs[0]).toMatchObject({ kind: "system-text", data: { kind: "origin_notice" } });
+		}
+	});
+
+	it("old agentMessage rows keep complete prose, readable attribution and index-zero identity", () => {
+		const text = "[Message from agent X]\\nKeep this exact prefix; agentMessage:not-an-id";
+		for (const lod of [1, 2, 3, 4, 5] as const) {
+			const row = {
+				id: "legacy",
+				seq: 1,
+				role: "user",
+				origin: "assistant",
+				originLabel: "agentMessage:main narrator",
+				contentJson: [{ type: "text", text }],
+			};
+			const spec = adaptSegment({ kind: "message", msg: row }, { lod })[0];
+			if (!spec) throw new Error("Missing legacy communication bubble");
+			expect(spec.kind).toBe("injection-bubble");
+			expect(spec.data).toMatchObject({
+				speaker: "Agent message · main narrator",
+				speakerId: null,
+				target: null,
+				modelFacing: text,
+				markdown: text,
+			});
+			const target = resolveVListBlockTarget(spec.kind, spec.key, [row.id]);
+			if (!target) throw new Error("Missing legacy block target");
+			const index = buildSelectionIndex([row as unknown as NarratorMsg]);
+			expect(index.byBlockId.get(target.blockId)?.blockIndex).toBe(0);
+		}
+	});
+
+	it("does not infer communication from user prose or unrelated origin labels", () => {
+		for (const origin of ["user", null]) {
+			const specs = adaptSegment(
+				{
+					kind: "message",
+					msg: {
+						id: "human",
+						role: "user",
+						origin,
+						contentJson: [{ type: "text", text: "[Message from agent parent] hello" }],
+					},
+				},
+				CTX,
+			);
+			expect(specs[0]?.kind).toBe("message-bubble");
+		}
+	});
+});
 
 describe("spoken injections — one bubble per message row", () => {
 	it("renders one framed bubble for the single message the row carries", () => {
@@ -715,6 +910,33 @@ describe("injection bubbles — the navigation target", () => {
 			kind: "narrator",
 			narratorId: "narr-sender-1",
 			messageId: "msg-in-child",
+		});
+	});
+
+	it("prefers the exact Send call over the sender's earlier text message", () => {
+		const specs = bubbleSpecs("subagent_message", [
+			{
+				fromId: "narr-sender-1",
+				fromMessageId: "earlier-text",
+				fromToolUseId: "send-call-2",
+				text: "found the leak",
+			},
+		]);
+		expect(targetOf(specs)).toEqual({
+			kind: "narrator",
+			narratorId: "narr-sender-1",
+			messageId: "send-call-2",
+		});
+	});
+
+	it("can target Send before the subagent has written any text", () => {
+		const specs = bubbleSpecs("subagent_message", [
+			{ fromId: "child", fromToolUseId: "first-send", text: "starting" },
+		]);
+		expect(targetOf(specs)).toEqual({
+			kind: "narrator",
+			narratorId: "child",
+			messageId: "first-send",
 		});
 	});
 

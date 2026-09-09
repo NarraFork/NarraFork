@@ -195,6 +195,8 @@ import {
 	updateWhitelistDirSchema,
 } from "../lib/validators";
 import {
+	applyRevertPlanSchema,
+	createRevertActionPreviewSchema,
 	createRevertPlanSchema,
 	revertPlanFilesQuerySchema,
 	revertPlanIdSchema,
@@ -362,6 +364,7 @@ import {
 	requestPlanModePromptRebuild,
 	resetActiveUpstreamSession,
 	type SavedBufferedFile,
+	withNarratorWorkAdmission,
 } from "../services/narrator-session-state";
 import {
 	getNarratorAccess,
@@ -383,8 +386,10 @@ import {
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { permissionRuleService } from "../services/permission-rule-service";
 import {
+	applyLocalRevertPlan,
 	getLocalRevertPlan,
 	listLocalRevertPlanFiles,
+	prepareLocalRevertAction,
 	prepareLocalRevertPlan,
 } from "../services/revert-planner-local-access";
 import { searchService } from "../services/search-service";
@@ -520,20 +525,20 @@ export const narratorRoutes = new Hono();
 
 // This smaller guard MUST run before the general attachment-body middleware below.
 // Preview inputs contain only bounded selectors, never tool bodies or raw evidence.
-narratorRoutes.use(
-	"/:id/revert-plans",
-	bodyLimit({
-		maxSize: FILE_CHANGE_LIMITS.summaryBytes,
-		onError: (c) =>
-			c.json(
-				{
-					error: "Preview request exceeds the selector byte limit",
-					code: "REVERT_PREVIEW_REQUEST_TOO_LARGE",
-				},
-				413,
-			),
-	}),
-);
+const boundedRevertRequest = bodyLimit({
+	maxSize: FILE_CHANGE_LIMITS.summaryBytes,
+	onError: (c) =>
+		c.json(
+			{
+				error: "Preview request exceeds the selector byte limit",
+				code: "REVERT_PREVIEW_REQUEST_TOO_LARGE",
+			},
+			413,
+		),
+});
+narratorRoutes.use("/:id/revert-plans", boundedRevertRequest);
+narratorRoutes.use("/:id/revert-action-preview", boundedRevertRequest);
+narratorRoutes.use("/:id/revert-plans/:planId/apply", boundedRevertRequest);
 
 narratorRoutes.use(
 	"*",
@@ -628,6 +633,10 @@ narratorRoutes.use("/:id/*", async (c, next) => {
 			? ("read" as const)
 			: ("write" as const);
 	await requireNarratorAccess(c, id, need);
+	// Direct route SQL must not race the guarded executor. Apply owns its exclusive
+	// admission through whenSettled; wrapping it in shared work would deadlock it.
+	if (need === "write" && !/^revert-plans\/[^/]+\/apply$/.test(subPath))
+		return withNarratorWorkAdmission(id, next);
 	return next();
 });
 
@@ -636,7 +645,7 @@ narratorRoutes.use("/:id", async (c, next) => {
 	const id = c.req.param("id");
 	if (!id || NARRATOR_ID_GATE_EXEMPT_SEGMENTS.has(id)) return next();
 	await requireNarratorAccess(c, id, c.req.method === "GET" ? "read" : "write");
-	return next();
+	return c.req.method === "GET" ? next() : withNarratorWorkAdmission(id, next);
 });
 
 narratorRoutes.route("/:id/file-references", fileReferenceRoutes);
@@ -5557,6 +5566,47 @@ function validRevertPreview<T>(result: { success: true; data: T } | { success: f
 		throw new ValidationError("Invalid narrator-only preview request, selector or pagination");
 	return result.data;
 }
+
+narratorRoutes.post("/:id/revert-action-preview", async (c) => {
+	const raw = await c.req.json().catch((error: unknown) => {
+		if (!(error instanceof SyntaxError)) throw error;
+		throw new ValidationError("Invalid preview JSON body");
+	});
+	const body = validRevertPreview(createRevertActionPreviewSchema.safeParse(raw));
+	const result = await prepareLocalRevertAction(
+		narratorPrincipalOf(c),
+		c.req.param("id"),
+		body,
+		AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(60_000)]),
+	);
+	return revertPreviewJson(c, result);
+});
+
+narratorRoutes.post("/:id/revert-plans/:planId/apply", async (c) => {
+	const raw = await c.req.json().catch((error: unknown) => {
+		if (!(error instanceof SyntaxError)) throw error;
+		throw new ValidationError("Invalid apply JSON body");
+	});
+	const body = validRevertPreview(applyRevertPlanSchema.safeParse(raw));
+	const result = await applyLocalRevertPlan(
+		narratorPrincipalOf(c),
+		c.req.param("id"),
+		validRevertPreview(revertPlanIdSchema.safeParse(c.req.param("planId"))),
+		body,
+		AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(60_000)]),
+	);
+	c.header("Cache-Control", "no-store");
+	if (result.status !== "committed" || result.settling)
+		return c.json(
+			{
+				...result,
+				code: "REVERT_APPLY_NOT_COMMITTED",
+				error: result.reason ?? "Rollback did not commit",
+			},
+			409,
+		);
+	return c.json(result);
+});
 
 narratorRoutes.post("/:id/revert-plans", async (c) => {
 	const raw = await c.req.json().catch((error: unknown) => {

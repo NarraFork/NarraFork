@@ -26,6 +26,7 @@ import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import {
 	type LivePatch,
 	patchReflection,
+	patchSendDeliveryTargets,
 	patchSubagentActivity,
 	patchSubagentTakeover,
 	patchToolCallFields,
@@ -130,6 +131,15 @@ export function timeoutUpdatedPatch(opts: { toolUseId: string; timeoutMs: number
  * `status` is deliberately absent: resolving a target says nothing about the
  * lifecycle, and writing one would let a replayed frame regress a finished card.
  */
+export function sendDeliveryResolvedPatch(opts: {
+	toolUseId: string;
+	targets: Array<{ id: string; deliveryMessageId: string }>;
+	toolCallBinding?: { toolCallId: string; attempt: number };
+}): LivePatch {
+	return (messages) =>
+		patchSendDeliveryTargets(messages, opts.toolUseId, opts.targets, opts.toolCallBinding);
+}
+
 export function awaitAgentResolvedPatch(opts: {
 	toolUseId: string;
 	subagentNarratorId: string;

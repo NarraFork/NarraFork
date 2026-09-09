@@ -57,6 +57,7 @@ const REQUIRED_EVENTS = [
 	// "open session" item stays hidden for the whole wait: the child narrator id does
 	// not reach the persisted row until the tool RETURNS.
 	"onAwaitAgentResolved",
+	"onSendDeliveryResolved",
 	// Permission decisions (persisted status half).
 	"onPermissionRequest",
 	"onPermissionResolved",
@@ -608,6 +609,138 @@ describe("live event → patch field mapping", () => {
 		).toBe("sub-live");
 		expect(block(result.messages).status).toBe("running");
 		expect(block(result.messages).outputJson).toBeUndefined();
+	});
+
+	it("Send receipt WS patch survives message segmentation and reaches adapter recipients", async () => {
+		const { sendDeliveryResolvedPatch } = await import("./vlist-live-events");
+		const { resolveAllToolCallsFromMsg } = await import("../message-segments");
+		const { adaptSegment } = await import("./segment-adapter");
+		const doc = toolDoc("tu-1", "running");
+		Object.assign(block(doc), {
+			name: "Send",
+			input: { ids: ["a", "b"], message: "same", await: true },
+		});
+		const a = { id: "child-a", deliveryMessageId: "reserved-a" };
+		const b = { id: "child-b", deliveryMessageId: "reserved-b" };
+		const first = sendDeliveryResolvedPatch({ toolUseId: "tu-1", targets: [a] })(doc);
+		const second = sendDeliveryResolvedPatch({ toolUseId: "tu-1", targets: [b] })(first.messages);
+		const duplicate = sendDeliveryResolvedPatch({ toolUseId: "tu-1", targets: [a] })(
+			second.messages,
+		);
+		expect(duplicate.changed).toBe(false);
+		expect(block(second.messages)._sendDeliveryTargets).toEqual([a, b]);
+		expect(block(second.messages).status).toBe("running");
+		expect(block(second.messages).outputJson).toBeUndefined();
+		const tc = resolveAllToolCallsFromMsg(second.messages[0] as never)[0];
+		expect(tc._sendDeliveryTargets).toEqual([a, b]);
+		const rows = adaptSegment(
+			{
+				kind: "tool-run",
+				sourceMessages: [],
+				items: [
+					{
+						blockIndex: 0,
+						isSubagent: false,
+						msg: second.messages[0],
+						tc,
+					},
+				],
+			} as never,
+			{ lod: 5 },
+		);
+		expect(rows[0].kind).toBe("communication-bubble");
+		expect((rows[0].data as { recipients: unknown[] }).recipients).toEqual([
+			{ ...a, label: "child-a" },
+			{ ...b, label: "child-b" },
+		]);
+	});
+
+	it("live tail receipt survives the explicit streaming field projection and reaches adapter", async () => {
+		const { applyStreamingToolStarted, applyStreamingSendDelivery, createStreamingToolStore } =
+			await import("./streaming-tool-chunks");
+		const { buildTopLevelStreamingChunksMsg, topLevelStreamingChunkToToolFields } = await import(
+			"../narrator-message-helpers"
+		);
+		const { resolveAllToolCallsFromMsg } = await import("../message-segments");
+		const { adaptSegment } = await import("./segment-adapter");
+		const store = createStreamingToolStore();
+		const started = {
+			toolUseId: "live-send",
+			toolName: "Send",
+			input: { id: "worker", message: "same", await: true },
+		};
+		applyStreamingToolStarted(store, started);
+		const target = { id: "child", deliveryMessageId: "reserved" };
+		expect(
+			applyStreamingSendDelivery(store, {
+				toolUseId: "live-send",
+				targets: [target],
+				toolCallBinding: { toolCallId: "row", attempt: 1 },
+			}),
+		).toBe(true);
+		applyStreamingToolStarted(store, started);
+		const chunk = [...store.values()][0];
+		expect(topLevelStreamingChunkToToolFields(chunk)._sendDeliveryTargets).toEqual([target]);
+		expect(topLevelStreamingChunkToToolFields(chunk)).not.toHaveProperty("outputJson");
+		const msg = buildTopLevelStreamingChunksMsg([...store.values()], "n1", null);
+		if (!msg) throw new Error("Expected live Send message");
+		const tc = resolveAllToolCallsFromMsg(msg)[0];
+		expect(tc._sendDeliveryTargets).toEqual([target]);
+		const rows = adaptSegment(
+			{
+				kind: "tool-run",
+				sourceMessages: [],
+				items: [{ blockIndex: 0, isSubagent: false, msg, tc }],
+			} as never,
+			{ lod: 5 },
+		);
+		expect((rows[0].data as { recipients: unknown[] }).recipients).toEqual([
+			{ ...target, label: "worker" },
+		]);
+		expect(
+			applyStreamingSendDelivery(store, {
+				toolUseId: "live-send",
+				targets: [{ id: "wrong", deliveryMessageId: "old" }],
+				toolCallBinding: { toolCallId: "old-row", attempt: 0 },
+			}),
+		).toBe(false);
+	});
+
+	it("Send receipt bindings reject delayed frames from a different attempt", async () => {
+		const { sendDeliveryResolvedPatch } = await import("./vlist-live-events");
+		const doc = toolDoc("tu-1", "running");
+		Object.assign(block(doc), { name: "Send", tcId: "row-new", executionAttempt: 2 });
+		const targets = [{ id: "child", deliveryMessageId: "reserved" }];
+		expect(
+			sendDeliveryResolvedPatch({
+				toolUseId: "tu-1",
+				targets,
+				toolCallBinding: { toolCallId: "row-old", attempt: 1 },
+			})(doc).changed,
+		).toBe(false);
+		expect(
+			sendDeliveryResolvedPatch({
+				toolUseId: "tu-1",
+				targets,
+				toolCallBinding: { toolCallId: "row-new", attempt: 2 },
+			})(doc).changed,
+		).toBe(true);
+	});
+
+	it("Send receipt patch ignores old failed attempts and terminal replay", async () => {
+		const { sendDeliveryResolvedPatch } = await import("./vlist-live-events");
+		const old = toolDoc("tu-1", "fail");
+		const live = toolDoc("tu-1", "running");
+		Object.assign(block(old), { name: "Send", outputJson: null });
+		Object.assign(block(live), { name: "Send" });
+		const patch = sendDeliveryResolvedPatch({
+			toolUseId: "tu-1",
+			targets: [{ id: "child", deliveryMessageId: "reserved" }],
+		});
+		const result = patch([...old, ...live]);
+		expect(block(result.messages)._sendDeliveryTargets).toBeUndefined();
+		expect(result.messages[1].contentJson?.[0]).toHaveProperty("_sendDeliveryTargets");
+		expect(patch(old).changed).toBe(false);
 	});
 
 	it("await_agent_resolved writes the child id without touching the lifecycle", async () => {

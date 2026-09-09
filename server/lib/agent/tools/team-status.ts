@@ -334,26 +334,22 @@ export const teamStatusTool: ToolDefinition = {
 				}
 				const senderType = teamMemberType(sender.variant);
 				const now = new Date().toISOString();
-				// Reader-only navigation target: where the sender was in its own session
-				// when it broadcast this. Best-effort — a sender that has written nothing
-				// has nothing to point at, and that must not fail the broadcast.
-				const { getSubagentResultMessageId } = await import("@server/services/narrator-session");
-				const fromMessageId = await getSubagentResultMessageId(ctx.narratorId).catch(
-					() => undefined,
-				);
 				const msg: TeamMessage = {
 					fromId: ctx.narratorId,
 					fromTitle: sender.title,
 					fromLabel: agentLabelFromNarrator(sender, parentNarratorId),
 					fromType: senderType,
-					...(fromMessageId ? { fromMessageId } : {}),
+					fromToolUseId: ctx.currentToolUseId,
 					text: message,
 					timestamp: now,
 					isBroadcast: true,
 				};
-				for (const target of targets) {
-					deliverTeamMessage(target.id, msg, parentNarratorId);
-				}
+				const deliveryIds = new Map(
+					targets.map((target) => [
+						target.id,
+						deliverTeamMessage(target.id, msg, parentNarratorId),
+					]),
+				);
 				const nonWorking = targets.filter(
 					(t: { id: string; status: string }) => t.status !== "working",
 				);
@@ -377,6 +373,7 @@ export const teamStatusTool: ToolDefinition = {
 							: {}),
 						targets: targets.map((target) => ({
 							id: target.id,
+							deliveryMessageId: deliveryIds.get(target.id),
 							label: agentLabelFromNarrator(target, parentNarratorId),
 							title: target.title,
 							status: "queued",
@@ -410,26 +407,19 @@ export const teamStatusTool: ToolDefinition = {
 				}
 				const sendSenderType = teamMemberType(sender.variant);
 				const now = new Date().toISOString();
-				// See the broadcast branch: reader-only navigation target, best-effort.
-				const { getSubagentResultMessageId: resolveSenderMessageId } = await import(
-					"@server/services/narrator-session"
-				);
-				const sendFromMessageId = await resolveSenderMessageId(ctx.narratorId).catch(
-					() => undefined,
-				);
 				const msg: TeamMessage = {
 					fromId: ctx.narratorId,
 					fromTitle: sender.title,
 					fromLabel: agentLabelFromNarrator(sender, parentNarratorId),
 					fromType: sendSenderType,
-					...(sendFromMessageId ? { fromMessageId: sendFromMessageId } : {}),
+					fromToolUseId: ctx.currentToolUseId,
 					text: message,
 					timestamp: now,
 					isBroadcast: false,
 				};
 				// Inbox keys are real narrator ids; delivering under an alias would drop the
 				// message into an inbox nobody drains.
-				deliverTeamMessage(resolvedTargetId, msg, parentNarratorId);
+				const deliveryMessageId = deliverTeamMessage(resolvedTargetId, msg, parentNarratorId);
 				const warning =
 					target.status !== "working"
 						? ` (warning: target is ${target.status}, message may not be received)`
@@ -444,6 +434,7 @@ export const teamStatusTool: ToolDefinition = {
 						targets: [
 							{
 								id: target.id,
+								deliveryMessageId,
 								label: agentLabelFromNarrator(target, parentNarratorId),
 								title: target.title,
 								status: "queued",

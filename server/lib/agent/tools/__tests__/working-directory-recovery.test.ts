@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExecutionBackend } from "../../execution/backend";
+import { windowsPathSemantics } from "../../execution/path-semantics";
 import { resolveBackend } from "../../execution/registry";
 import type { ToolContext } from "../../types";
 import { bashTool } from "../bash";
@@ -20,6 +21,9 @@ describe("missing working directory recovery", () => {
 		const backend = {
 			kind: "local",
 			deviceId: "local",
+			pathFlavor: "windows",
+			paths: windowsPathSemantics,
+			runtimeGeneration: 0,
 			statFile: async (path: string) =>
 				path === windowsCwd ? { isDirectory: true, isFile: false, size: 0 } : null,
 			execCommand: async ({ cwd }: { cwd: string }) => {

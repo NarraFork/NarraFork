@@ -266,6 +266,7 @@ function diffDocumentRevision(
 		value.endColumn,
 		value.originKnown,
 		value.complete,
+		value.streaming ?? false,
 		value.endsWithCR ?? false,
 		value.remap
 			? [
@@ -293,6 +294,11 @@ function diffDocumentRevision(
 		]),
 	);
 	return `diff:${(first >>> 0).toString(16).padStart(8, "0")}${(second >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+/** An open stream end is expected; only missing source bytes make a preview partial. */
+function hasMissingSource(range: SourceTextRange): boolean {
+	return !range.complete && !(range.streaming && range.originKnown && range.startOffset === 0);
 }
 
 /** One bounded source model, shared by inline and fullscreen; no viewport state. */
@@ -338,7 +344,7 @@ export function createDiffDocument(input: DiffDocumentInput): DiffDocument {
 	let omission: DiffDocument["omission"] =
 		input.oldText.length > oldLimit || input.newText.length > newLimit
 			? "input-budget"
-			: !oldSource.range.complete || !newSource.range.complete
+			: hasMissingSource(oldSource.range) || hasMissingSource(newSource.range)
 				? "source-range"
 				: null;
 	const changes = computeLineDiff(oldSource.text, newSource.text, {
@@ -823,9 +829,15 @@ export function diffLineMarker(type: DiffLine["type"]): string {
  * The full fixed-width gutter text: `oldNo newNo±`. Every row produces the same
  * length, so the code column starts at the same offset on every line.
  */
-export function formatDiffGutter(line: DiffLine, width: number, lineNumberPrefix?: string): string {
-	const old = formatDiffLineNumber(line.oldLineNo, width, lineNumberPrefix);
-	const nw = formatDiffLineNumber(line.newLineNo, width, lineNumberPrefix);
+export function formatDiffGutter(
+	line: DiffLine,
+	width: number,
+	lineNumberPrefix?: string | { old?: string; new?: string },
+): string {
+	const oldPrefix = typeof lineNumberPrefix === "object" ? lineNumberPrefix.old : lineNumberPrefix;
+	const newPrefix = typeof lineNumberPrefix === "object" ? lineNumberPrefix.new : lineNumberPrefix;
+	const old = formatDiffLineNumber(line.oldLineNo, width, oldPrefix);
+	const nw = formatDiffLineNumber(line.newLineNo, width, newPrefix);
 	return `${old} ${nw}${diffLineMarker(line.type)}`;
 }
 

@@ -78,11 +78,14 @@ describe("folded trace row: file-panel handler wiring", () => {
 		}
 	});
 
-	it("gates the row's item on both the handler and isFileTool", () => {
-		// Mirrors the expanded card: a path alone is not enough (a host without a
-		// dockview surface supplies no handler), and a handler alone is not enough.
-		expect(TRACE_ROW).toContain(
-			"const canOpenFilePanel = !!(filePath && tool?.isFileTool && onOpenFilePanel);",
+	it("allows edit navigation or a file tool with a path and panel handler", () => {
+		// An exact Edit preview owns its own opener. The current-file fallback still
+		// requires all three facts: neither a path nor a handler alone is sufficient.
+		const condition = TRACE_ROW.match(/const canOpenFilePanel\s*=\s*([^;]+);/)?.[1];
+		expect(condition?.replace(/\s+/g, " ").trim()).toBe(
+			"!!editNavigation.open || !!(filePath && tool?.isFileTool && onOpenFilePanel)",
 		);
+		expect(TRACE_ROW).toContain("if (editNavigation.open) editNavigation.open();");
+		expect(TRACE_ROW).toContain("else if (filePath) onOpenFilePanel?.(filePath);");
 	});
 });

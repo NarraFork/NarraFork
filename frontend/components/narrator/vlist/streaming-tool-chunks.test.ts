@@ -311,6 +311,75 @@ describe("collectPersistedToolUseIds", () => {
 });
 
 describe("streaming field source ranges", () => {
+	it("keeps proven field origins and epochs through matching, replacement and full input", () => {
+		const store = createStreamingToolStore();
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 30,
+			streamingField: { name: "old_string", delta: "keep\n", startsField: true },
+		});
+		const oldEpoch = store.get("edit")?.streamingFieldRanges?.old_string.epoch;
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 60,
+			extractedFields: { old_string: "keep\ndrop" },
+			metadata: { startLine: 445 },
+			streamingField: { name: "new_string", delta: "keep\n", startsField: true },
+		});
+		const entry = store.get("edit");
+		expect(entry?.streamingFieldRanges?.old_string).toMatchObject({
+			epoch: oldEpoch,
+			originKnown: true,
+			complete: true,
+		});
+		expect(entry?.streamingFieldRanges?.new_string).toMatchObject({
+			originKnown: true,
+			complete: false,
+			streaming: true,
+			startOffset: 0,
+		});
+		const newEpoch = entry?.streamingFieldRanges?.new_string.epoch;
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 65,
+			streamingField: { name: "new_string", delta: "add" },
+		});
+		applyStreamingToolStarted(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			input: { old_string: "keep\ndrop", new_string: "keep\nadded" },
+		});
+		expect(store.get("edit")?.streamingFieldRanges?.new_string).toMatchObject({
+			epoch: newEpoch,
+			originKnown: true,
+			complete: true,
+			startOffset: 0,
+		});
+		expect(store.get("edit")?.streamingFieldRanges?.new_string.streaming).toBeUndefined();
+	});
+
+	it("does not infer a field origin from an unmarked first delta", () => {
+		const store = createStreamingToolStore();
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 800,
+			streamingField: { name: "new_string", delta: "tail" },
+		});
+		expect(store.get("edit")?.streamingFieldRanges?.new_string.originKnown).toBe(false);
+		applyStreamingToolChunk(store, {
+			toolUseId: "edit",
+			toolName: "Edit",
+			inputCharsTotal: 900,
+			streamingField: { name: "new_string", delta: "replacement", startsField: true },
+		});
+		expect(store.get("edit")?.streamingFieldValue).toBe("replacement");
+		expect(store.get("edit")?.streamingFieldRanges?.new_string.originKnown).toBe(true);
+	});
+
 	it("keeps one epoch and normalized coordinates while a live field crosses 16k and CRLF chunks", () => {
 		const store = createStreamingToolStore();
 		let inputCharsTotal = 0;

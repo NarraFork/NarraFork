@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { db } from "@server/db";
 import {
+	fileChangeOperations,
 	narratorFileSnapshots,
 	narratorMessageRefs,
 	narratorMessages,
@@ -15,6 +16,7 @@ import { AppError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
 import { safeSpawn } from "@server/lib/spawn";
 import { narratorRoutes } from "@server/routes/narrators";
+import { type ActiveNarrator, activeNarrators } from "@server/services/narrator-session-state";
 import { worktreeTreeSnapshot } from "@server/services/worktree-tree-snapshot";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -34,7 +36,11 @@ app.onError((error) =>
 );
 app.route("/api/narrators", narratorRoutes);
 
-async function fixture(capture: boolean, status: "success" | "fail" = "success") {
+async function fixture(
+	capture: boolean,
+	status: "success" | "fail" | "initializing" | "pending" | "running" = "success",
+	recordOperation = false,
+) {
 	const repo = mkdtempSync(join(tmpdir(), "nf-route-revert-m0-"));
 	dirs.push(repo);
 	await safeSpawn({ cmd: ["git", "init"], cwd: repo, timeout: 15_000 });
@@ -64,8 +70,33 @@ async function fixture(capture: boolean, status: "success" | "fail" = "success")
 	const before = capture ? await worktreeTreeSnapshot.capture(repo) : null;
 	writeFileSync(file, "AI\n");
 	const after = capture ? await worktreeTreeSnapshot.capture(repo) : null;
+	const toolCallId = generateId();
+	const operationId = recordOperation ? generateId() : null;
+	if (operationId) {
+		await db.insert(fileChangeOperations).values({
+			id: operationId,
+			sourceInstanceId: "test-installation",
+			sourceKind: "tool",
+			sourceId: toolCallId,
+			attempt: 1,
+			narratorId,
+			actorSubjectKey: `primary:${narratorId}`,
+			actorJson: {
+				kind: "primary",
+				subjectKey: `primary:${narratorId}`,
+				narratorId,
+				userId: null,
+				label: null,
+				deleted: false,
+				parentSubjectKey: null,
+			},
+			startedAt: now,
+			updatedAt: now,
+		});
+	}
 	await db.insert(narratorToolCalls).values({
-		id: generateId(),
+		id: toolCallId,
+		fileChangeOperationId: operationId,
 		narratorId,
 		messageId,
 		toolUseId,
@@ -105,7 +136,9 @@ async function assertUnavailable(response: Response) {
 
 afterEach(async () => {
 	for (const id of ids.splice(0)) {
+		activeNarrators.delete(id);
 		await db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, id));
+		await db.delete(fileChangeOperations).where(eq(fileChangeOperations.narratorId, id));
 		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, id));
 		await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, id));
 		await db.delete(narrators).where(eq(narrators.id, id));
@@ -154,6 +187,75 @@ describe("M0 rollback route safety", () => {
 		const f = await fixture(false, "fail");
 		await assertUnavailable(await request(f.narratorId, "revert-file", { filePath: f.file }));
 		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
+	});
+
+	test.each([
+		"initializing",
+		"pending",
+		"running",
+	] as const)("an orphaned %s tool reports missing completion evidence without changing its status", async (status) => {
+		const f = await fixture(false, status);
+		const response = await app.request(
+			`/api/narrators/${f.narratorId}/delete-preview?messageId=${f.messageId}`,
+		);
+		expect(response.status).toBe(200);
+		expect((await response.json()).narratorScope).toMatchObject({
+			available: false,
+			reason: "incomplete_coverage",
+		});
+		await assertUnavailable(await request(f.narratorId, "revert", { messageId: f.messageId }));
+		expect(
+			await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.messageId, f.messageId),
+				columns: { status: true },
+			}),
+		).toEqual({ status });
+		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
+	});
+
+	test("an unrelated live loop sharing the workspace cannot hide the legacy blocker", async () => {
+		const f = await fixture(true);
+		const other = await fixture(false);
+		activeNarrators.set(other.narratorId, {
+			cwd: f.repo,
+			alive: true,
+			_loopRunning: true,
+		} as ActiveNarrator);
+		const response = await app.request(
+			`/api/narrators/${f.narratorId}/delete-preview?messageId=${f.messageId}`,
+		);
+		expect(response.status).toBe(200);
+		expect((await response.json()).narratorScope).toMatchObject({
+			available: false,
+			reason: "legacy_unverified",
+		});
+		await assertUnavailable(await request(f.narratorId, "revert", { messageId: f.messageId }));
+		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
+	});
+
+	test("operation-backed preview names the disconnected executor and still refuses mutation", async () => {
+		const f = await fixture(false, "success", true);
+		const response = await app.request(
+			`/api/narrators/${f.narratorId}/delete-preview?messageId=${f.messageId}`,
+		);
+		expect(response.status).toBe(200);
+		expect((await response.json()).narratorScope).toMatchObject({
+			available: false,
+			reason: "execution_unavailable",
+			files: [],
+		});
+		const refusal = await request(f.narratorId, "revert", { messageId: f.messageId });
+		expect(refusal.status).toBe(409);
+		const body = await refusal.json();
+		expect(body.failures[0]).toMatchObject({ code: "REVERT_UNAVAILABLE" });
+		expect(body.failures[0].message).toContain("execution_unavailable");
+		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
+		expect(
+			await db.query.narratorMessageRefs.findFirst({
+				where: eq(narratorMessageRefs.messageId, f.messageId),
+				columns: { messageId: true },
+			}),
+		).toEqual({ messageId: f.messageId });
 	});
 
 	test("preview cannot advertise a legacy workspace snapshot as an available fallback", async () => {

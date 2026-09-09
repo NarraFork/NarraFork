@@ -12,6 +12,7 @@ import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import {
 	fileAttributions,
+	fileChangeOperations,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -56,8 +57,9 @@ type CallOptions = {
 	seq?: number;
 	toolName?: string;
 	input?: Record<string, unknown>;
-	status?: "success" | "fail" | "running" | "pending";
+	status?: "success" | "fail" | "running" | "pending" | "initializing";
 	capture?: "both" | "before" | "none";
+	recordOperation?: boolean;
 	isBackground?: boolean;
 	executionDeviceId?: string;
 	resolvedFilePath?: string;
@@ -92,8 +94,35 @@ async function call(f: Fixture, mutate: () => void | Promise<void>, opts: CallOp
 	});
 	// The production event handler captures before inserting the tool-call row.
 	if (opts.capture !== "none") await hooks.onSnapshotBefore?.(toolUseId, toolName, input);
+	const toolCallId = generateId();
+	const operationId = opts.recordOperation ? generateId() : null;
+	if (operationId) {
+		// A real FK-bound pointer, deliberately WITHOUT settled/complete evidence.
+		// The diagnostic must not treat its existence as permission to revert.
+		await db.insert(fileChangeOperations).values({
+			id: operationId,
+			sourceInstanceId: "test-installation",
+			sourceKind: "tool",
+			sourceId: toolCallId,
+			attempt: 1,
+			narratorId: f.narratorId,
+			actorSubjectKey: `primary:${f.narratorId}`,
+			actorJson: {
+				kind: "primary",
+				subjectKey: `primary:${f.narratorId}`,
+				narratorId: f.narratorId,
+				userId: null,
+				label: null,
+				deleted: false,
+				parentSubjectKey: null,
+			},
+			startedAt: createdAt,
+			updatedAt: createdAt,
+		});
+	}
 	await db.insert(narratorToolCalls).values({
-		id: generateId(),
+		id: toolCallId,
+		fileChangeOperationId: operationId,
 		narratorId: f.narratorId,
 		messageId,
 		toolUseId,
@@ -114,7 +143,9 @@ async function call(f: Fixture, mutate: () => void | Promise<void>, opts: CallOp
 		.set({
 			status: opts.status ?? "success",
 			completedAt:
-				opts.status === "running" || opts.status === "pending" ? null : new Date().toISOString(),
+				opts.status === "running" || opts.status === "pending" || opts.status === "initializing"
+					? null
+					: new Date().toISOString(),
 		})
 		.where(eq(narratorToolCalls.toolUseId, toolUseId));
 	if (!opts.capture || opts.capture === "both") await hooks.onSnapshotAfter?.(toolUseId, toolName);
@@ -136,6 +167,7 @@ afterEach(async () => {
 	for (const id of ids.splice(0).reverse()) {
 		activeNarrators.delete(id);
 		await db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, id));
+		await db.delete(fileChangeOperations).where(eq(fileChangeOperations.narratorId, id));
 		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, id));
 		await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, id));
 		await db.delete(fileAttributions).where(eq(fileAttributions.narratorId, id));
@@ -153,6 +185,7 @@ describe("M0 complete operation coverage", () => {
 		"fail",
 		"running",
 		"pending",
+		"initializing",
 	] as const)("does not omit a %s call missing its after boundary from a mixed window", async (status) => {
 		const f = await fixture();
 		writeFileSync(join(f.repo, "a.txt"), "base\n");
@@ -163,17 +196,15 @@ describe("M0 complete operation coverage", () => {
 			capture: "before",
 			input: { file_path: join(f.repo, "b.txt"), content: "partial\n" },
 		});
-		await expectRefused(
-			f,
-			status === "running" || status === "pending" ? "pending_operations" : "incomplete_coverage",
-		);
+		// A historical non-terminal row is not proof that an operation is still alive.
+		await expectRefused(f, "incomplete_coverage");
 		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("first\n");
 		expect(readFileSync(join(f.repo, "b.txt"), "utf8")).toBe("partial\n");
 		expect(
 			await db.query.narratorToolCalls.findFirst({
 				where: eq(narratorToolCalls.toolUseId, incomplete.toolUseId),
 			}),
-		).toBeTruthy();
+		).toMatchObject({ status });
 	});
 
 	test("a nonzero shell exit cannot erase the write it already made", async () => {
@@ -354,16 +385,78 @@ describe("M0 rejects unverified ownership without mutation", () => {
 		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("later human\n");
 	});
 
-	test("known concurrent workspace writers return pending_operations", async () => {
+	test.each([
+		true,
+		false,
+	])("an active loop does not mask permanent legacy refusal (same narrator=%s)", async (sameNarrator) => {
 		const f = await fixture();
+		const active = sameNarrator ? f : await fixture();
 		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "AI\n"));
+		// A live loop may just be thinking/reading. Even a real writer does not
+		// make waiting sufficient to turn legacy evidence into an executable plan.
+		activeNarrators.set(active.narratorId, {
+			cwd: f.repo,
+			alive: true,
+			_loopRunning: true,
+		} as ActiveNarrator);
+		await expectRefused(f, "legacy_unverified");
+		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("AI\n");
+	});
+
+	test("active incomplete writes remain blocked without claiming waiting will enable rollback", async () => {
+		const f = await fixture();
+		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "partial\n"), {
+			status: "running",
+			capture: "before",
+		});
 		activeNarrators.set(f.narratorId, {
 			cwd: f.repo,
 			alive: true,
 			_loopRunning: true,
 		} as ActiveNarrator);
-		await expectRefused(f, "pending_operations");
+		await expectRefused(f, "incomplete_coverage");
+		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("partial\n");
+	});
+
+	test.each([
+		"none",
+		"both",
+	] as const)("an operation pointer identifies the unconnected entrypoint without authorizing rollback (trees=%s)", async (capture) => {
+		const f = await fixture();
+		const target = await call(f, () => writeFileSync(join(f.repo, "a.txt"), "AI\n"), {
+			recordOperation: true,
+			capture,
+		});
+		await expectRefused(f, "execution_unavailable");
+		for (const preview of [
+			await previewNarratorScopedForMessages(f.narratorId, [target.messageId]),
+			await previewNarratorScopedForToolUses(f.narratorId, [target]),
+		]) {
+			expect(preview).toMatchObject({ available: false, reason: "execution_unavailable" });
+		}
 		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("AI\n");
+		expect(
+			await db.query.fileChangeOperations.findFirst({
+				where: eq(fileChangeOperations.narratorId, f.narratorId),
+				columns: { settlement: true, coverage: true },
+			}),
+		).toMatchObject({ settlement: "preparing", coverage: "unavailable" });
+	});
+
+	test.each([
+		true,
+		false,
+	])("a new operation pointer cannot mask another legacy call (new operation first=%s)", async (newFirst) => {
+		const f = await fixture();
+		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "first\n"), {
+			recordOperation: newFirst,
+		});
+		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "second\n"), {
+			seq: 2,
+			recordOperation: !newFirst,
+		});
+		await expectRefused(f, "legacy_unverified");
+		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("second\n");
 	});
 });
 

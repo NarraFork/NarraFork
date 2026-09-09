@@ -218,6 +218,71 @@ function hasActiveReflectionSuggestion(suggestions: unknown): boolean {
  * toolUseId collapses to one `tool-<id>` vlist row anyway, so writing every
  * occurrence cannot make two rows disagree.
  */
+/** Receipt frames only patch the newest nonterminal attempt; never a failed older Send. */
+export function patchSendDeliveryTargets(
+	messages: readonly TreeMessage[],
+	toolUseId: string,
+	targets: Array<{ id: string; deliveryMessageId: string }>,
+	toolCallBinding?: { toolCallId: string; attempt: number },
+): LivePatchResult {
+	if (!toolUseId || !Array.isArray(targets) || !targets.length) return unchanged(messages);
+	function newest(rows: readonly TreeMessage[]): Record<string, unknown> | undefined {
+		for (let i = rows.length - 1; i >= 0; i--) {
+			const row = rows[i];
+			const nested = row.children?.length ? newest(row.children) : undefined;
+			if (nested) return nested;
+			for (const block of [...(row.contentJson ?? [])].reverse()) {
+				if (block.type === "tool_use" && block.id === toolUseId)
+					return block as Record<string, unknown>;
+			}
+			for (const tc of [...(row.toolCalls ?? [])].reverse()) {
+				if (tc.toolUseId === toolUseId) return tc as unknown as Record<string, unknown>;
+			}
+		}
+		return undefined;
+	}
+	const current = newest(messages);
+	if (
+		!current ||
+		(current.name ?? current.toolName) !== "Send" ||
+		isTerminalToolStatus(current.status) ||
+		current.outputJson != null
+	)
+		return unchanged(messages);
+	if (toolCallBinding) {
+		const knownId = current.tcId ?? (current.toolUseId ? current.id : undefined);
+		if (
+			(knownId != null && knownId !== toolCallBinding.toolCallId) ||
+			(typeof current.executionAttempt === "number" &&
+				current.executionAttempt !== toolCallBinding.attempt)
+		)
+			return unchanged(messages);
+	}
+	const merged = new Map<string, { id: string; deliveryMessageId: string }>();
+	for (const target of [
+		...(Array.isArray(current._sendDeliveryTargets) ? current._sendDeliveryTargets : []),
+		...targets,
+	]) {
+		if (
+			typeof target?.id !== "string" ||
+			!target.id.trim() ||
+			typeof target.deliveryMessageId !== "string" ||
+			!target.deliveryMessageId.trim()
+		)
+			continue;
+		merged.set(target.id, { id: target.id, deliveryMessageId: target.deliveryMessageId });
+	}
+	const next = [...merged.values()];
+	if (!next.length || JSON.stringify(next) === JSON.stringify(current._sendDeliveryTargets))
+		return unchanged(messages);
+	return mergeFieldsIntoNewestToolOccurrenceInTree(messages as TreeMessage[], toolUseId, {
+		_sendDeliveryTargets: next,
+		...(toolCallBinding
+			? { tcId: toolCallBinding.toolCallId, executionAttempt: toolCallBinding.attempt }
+			: {}),
+	});
+}
+
 export function patchToolCallFields(
 	messages: readonly TreeMessage[],
 	toolUseId: string,

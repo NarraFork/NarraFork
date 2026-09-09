@@ -45,6 +45,7 @@ import {
 	localDirectoryIdentity,
 } from "./file-change-local-io";
 import {
+	type WorkspaceActivityToken,
 	type WorkspaceRuntimeBinding,
 	WorkspaceWriteCoordinator,
 	type WorkspaceWriteCoordinatorState,
@@ -105,7 +106,9 @@ export interface EditorFileChangeRequest<Result> {
 	/** Reauthorize the SAME frozen target; cannot return a replacement path. */
 	authorize(): Promise<void>;
 	/** Pure construction from the raw before captured inside the shared lease. */
-	construct(before: LocalFileObservation): PreparedFileChange<Result>;
+	construct(
+		before: LocalFileObservation,
+	): PreparedFileChange<Result> | Promise<PreparedFileChange<Result>>;
 }
 
 export interface FileChangeCompletion<Result> {
@@ -151,7 +154,9 @@ type BoundFileChange<Result> = {
 	userId?: string | null;
 	actor: FileChangeActor;
 	subtype: string | null;
-	construct(before: LocalFileObservation): PreparedFileChange<Result>;
+	construct(
+		before: LocalFileObservation,
+	): PreparedFileChange<Result> | Promise<PreparedFileChange<Result>>;
 	assertBinding(): void | Promise<void>;
 	linkOperation?(operationId: string): void;
 	recordNoDispatch?(operation: BeginFileChangeOperation, error: unknown): void;
@@ -166,7 +171,26 @@ export interface LocalFileChangeRequest {
 	/** Only this tool's actual input, hashed with the frozen target. Never stored as a body. */
 	input: Record<string, unknown>;
 	/** Pure construction: no target IO, legacy snapshot or attribution inside this callback. */
-	construct(before: LocalFileObservation): PreparedLocalFileChange;
+	construct(
+		before: LocalFileObservation,
+	): PreparedLocalFileChange | Promise<PreparedLocalFileChange>;
+}
+
+export interface LocalBashActivityRequest {
+	backend: ExecutionBackend;
+	cwd: string;
+	signal: AbortSignal;
+	/** Present for real routed calls; bare callers still bind the actual backend/cwd. */
+	target?: ToolContext["executionTarget"];
+}
+
+export interface LocalBashActivity {
+	/** Canonical cwd actually dispatched, not a second resolution of a symlink alias. */
+	readonly cwd: string;
+	readonly scope: Readonly<FileChangeScopeIdentity>;
+	readonly token: WorkspaceActivityToken;
+	/** Only pre-spawn cancellation or an authoritative process barrier can finish it. */
+	end(outcome: "finished" | "unknown"): void;
 }
 
 export interface LocalFileChangeRuntimeOptions {
@@ -551,27 +575,52 @@ export class LocalFileChangeRuntime {
 		}
 	}
 
-	/** One actual-byte journal/IO/receipt pipeline for tools and the human editor. */
-	private async executeBound<Result>(
-		request: BoundFileChange<Result>,
-	): Promise<FileChangeCompletion<Result>> {
-		const startedAt = performance.now();
-		const { backend, lexicalPath, canonicalPath } = request;
+	/** Bash is an unmeasured writer, not reversible history. Use the very same
+	 * namespace and physical scope as Write/Edit; fail closed before process dispatch. */
+	async registerBashActivity(request: LocalBashActivityRequest): Promise<LocalBashActivity> {
+		const { backend, cwd } = request;
+		const runtime = this.readRuntime(LOCAL_DEVICE_ID);
+		if (
+			backend.kind !== "local" ||
+			backend.deviceId !== LOCAL_DEVICE_ID ||
+			!runtime ||
+			backend.runtimeGeneration !== runtime.runtimeGeneration
+		)
+			throw new Error("Bash activity requires the actual local execution runtime");
+		const frozenRuntime = Object.freeze({ ...runtime });
+		const signal = AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]);
+		signal.throwIfAborted();
+		await this.initialize();
+		const namespace = await this.verifyNamespace(signal);
+		const { scope, root } = await this.prepareWorkspaceScope(namespace, backend, cwd, signal);
+		signal.throwIfAborted();
+		const token = this.coordinator.registerActivity({ scope, runtime: frozenRuntime });
+		return Object.freeze({
+			cwd: root,
+			scope,
+			token,
+			end: (outcome: "finished" | "unknown") => this.coordinator.endActivity(token, outcome),
+		});
+	}
+
+	/** One scope resolver for actual local Write/Edit/editor targets and Bash cwd.
+	 * A file outside cwd uses its nearest existing parent; Bash covers cwd itself. */
+	private async prepareWorkspaceScope(
+		namespace: Namespace,
+		backend: ExecutionBackend,
+		cwdPath: string,
+		signal: AbortSignal,
+		canonicalPath?: string,
+	) {
 		if (backend.pathFlavor !== "posix" && backend.pathFlavor !== "windows")
 			throw new Error("Local evidence requires a filesystem path grammar");
-		const signal = AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]);
-		const namespace = await this.initialize();
-		await this.assertNamespaceDirectories(namespace);
-		const existing = this.existingOperation(namespace.sourceInstanceId, request);
-		if (existing) throw alreadyAttempted(existing);
-		signal.throwIfAborted();
-		const path = await backend.resolvePathIdentity(lexicalPath, { signal });
-		if (!backend.paths.equals(path.canonicalPath, canonicalPath))
-			throw new LocalFileValidationError("Authorized canonical path changed before capture");
-		const cwd = await backend.resolvePathIdentity(request.cwd, { signal });
+		const cwd = await backend.resolvePathIdentity(cwdPath, { signal });
 		await localDirectoryIdentity(cwd.canonicalPath);
 		let root = cwd.canonicalPath;
-		if (!backend.paths.contains(root, canonicalPath) || backend.paths.equals(root, canonicalPath)) {
+		if (
+			canonicalPath !== undefined &&
+			(!backend.paths.contains(root, canonicalPath) || backend.paths.equals(root, canonicalPath))
+		) {
 			root = dirname(canonicalPath);
 			for (let depth = 0; ; depth++) {
 				if (depth > 128) throw new LocalFileValidationError("Target parent depth limit exceeded");
@@ -600,6 +649,33 @@ export class LocalFileChangeRuntime {
 			});
 		else if (scope.rootIdentityJson.object !== rootIdentity)
 			throw new Error("Workspace incarnation no longer matches the verified scope");
+		return { scope, root, rootIdentity };
+	}
+
+	/** One actual-byte journal/IO/receipt pipeline for tools and the human editor. */
+	private async executeBound<Result>(
+		request: BoundFileChange<Result>,
+	): Promise<FileChangeCompletion<Result>> {
+		const startedAt = performance.now();
+		const { backend, lexicalPath, canonicalPath } = request;
+		if (backend.pathFlavor !== "posix" && backend.pathFlavor !== "windows")
+			throw new Error("Local evidence requires a filesystem path grammar");
+		const signal = AbortSignal.any([request.signal, AbortSignal.timeout(30_000)]);
+		const namespace = await this.initialize();
+		await this.assertNamespaceDirectories(namespace);
+		const existing = this.existingOperation(namespace.sourceInstanceId, request);
+		if (existing) throw alreadyAttempted(existing);
+		signal.throwIfAborted();
+		const path = await backend.resolvePathIdentity(lexicalPath, { signal });
+		if (!backend.paths.equals(path.canonicalPath, canonicalPath))
+			throw new LocalFileValidationError("Authorized canonical path changed before capture");
+		const { scope, root, rootIdentity } = await this.prepareWorkspaceScope(
+			namespace,
+			backend,
+			request.cwd,
+			signal,
+			canonicalPath,
+		);
 		const identity = createFileChangeIdentity(scope, {
 			deviceId: LOCAL_DEVICE_ID,
 			pathFlavor: backend.pathFlavor,
@@ -666,7 +742,7 @@ export class LocalFileChangeRuntime {
 								if (request.sourceKind === "editor") await assertTarget();
 								if (before.mode !== null && (before.mode & 0o222) === 0)
 									throw new LocalFileValidationError("File is read-only");
-								prepared = request.construct(before);
+								prepared = await request.construct(before);
 								if (prepared.nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
 									throw new LocalFileValidationError("Output exceeds the 32 MiB evidence limit");
 							} catch (error) {
@@ -936,6 +1012,35 @@ export async function executeEditorFileChange<Result>(
 	request: EditorFileChangeRequest<Result>,
 ): Promise<FileChangeCompletion<Result>> {
 	return (await currentRuntime()).executeEditor(request);
+}
+
+/** Resolve no local runtime/DB at all for remote execution, and never turn a
+ * mismatched frozen remote target into a local fallback. Shares Write/Edit's DI. */
+export async function registerLocalBashActivity(
+	request: LocalBashActivityRequest,
+): Promise<LocalBashActivity | undefined> {
+	const { backend, cwd } = request;
+	const target = request.target && Object.freeze({ ...request.target });
+	if (
+		target &&
+		(target.backendKind !== backend.kind ||
+			target.deviceId !== backend.deviceId ||
+			target.pathFlavor !== backend.pathFlavor ||
+			target.runtimeGeneration !== backend.runtimeGeneration ||
+			!backend.paths.equals(target.cwd, cwd))
+	)
+		throw new Error("Bash execution target does not match its frozen backend/cwd");
+	if (backend.kind === "remote") {
+		if (backend.deviceId === LOCAL_DEVICE_ID)
+			throw new Error("A remote Bash backend cannot use the local device identity");
+		return undefined;
+	}
+	if (backend.deviceId !== LOCAL_DEVICE_ID)
+		throw new Error("Local Bash requires the local device identity");
+	// Real rollback is currently local POSIX only. Do not introduce its namespace
+	// requirements on Windows or remote targets where rollback execution is disabled.
+	if (backend.pathFlavor === "windows" || process.platform === "win32") return undefined;
+	return (await currentRuntime()).registerBashActivity({ ...request, target });
 }
 
 async function currentRuntime(): Promise<LocalFileChangeRuntime> {

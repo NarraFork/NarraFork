@@ -24,6 +24,7 @@ import {
 	markActiveHistoryCompactPending,
 	pruneLocks,
 	resetActiveUpstreamSession,
+	withNarratorWorkAdmission,
 } from "./narrator-session-state";
 
 /**
@@ -665,6 +666,12 @@ export function triggerMidTurnCompact(
  * Run custom compact with concurrency protection.
  */
 export async function runCustomCompact(
+	...args: Parameters<typeof runCustomCompactUnlocked>
+): ReturnType<typeof runCustomCompactUnlocked> {
+	return withNarratorWorkAdmission(args[0], () => runCustomCompactUnlocked(...args));
+}
+
+async function runCustomCompactUnlocked(
 	narratorId: string,
 	locale: Locale,
 	beforeMessageId?: string,
@@ -799,6 +806,16 @@ export async function runCustomCompact(
 }
 
 export async function retryFailedCompact(
+	...args: Parameters<typeof retryFailedCompactUnlocked>
+): ReturnType<typeof retryFailedCompactUnlocked> {
+	return withNarratorWorkAdmission(
+		args[0],
+		() => retryFailedCompactUnlocked(...args),
+		(result) => result.promise,
+	);
+}
+
+async function retryFailedCompactUnlocked(
 	narratorId: string,
 	locale: Locale,
 	messageId: string,
@@ -1265,6 +1282,12 @@ async function doRunCustomCompact({
 // === Segment compact ===
 
 export async function runSegmentCompact(
+	...args: Parameters<typeof runSegmentCompactUnlocked>
+): ReturnType<typeof runSegmentCompactUnlocked> {
+	return withNarratorWorkAdmission(args[0], () => runSegmentCompactUnlocked(...args));
+}
+
+async function runSegmentCompactUnlocked(
 	narratorId: string,
 	locale: Locale,
 	messageIds: string[],
@@ -1640,6 +1663,10 @@ export function computeLineDiff(oldText: string, newText: string): string | null
  * Run a plan compact: persist the plan text as a compact message and clear prune boundary.
  */
 export async function runPlanCompact(narratorId: string, planText: string): Promise<void> {
+	return withNarratorWorkAdmission(narratorId, () => runPlanCompactUnlocked(narratorId, planText));
+}
+
+async function runPlanCompactUnlocked(narratorId: string, planText: string): Promise<void> {
 	logger.info("Starting plan compact", { narratorId, planLength: planText.length });
 
 	// persistPlanMessage atomically inserts the message, sets isCompact=1,

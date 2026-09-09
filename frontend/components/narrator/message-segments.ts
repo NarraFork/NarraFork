@@ -172,6 +172,9 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			// Server-derived child narrator id of a RUNNING Await-agent call. This
 			// mapping is an explicit field list, so omitting it here would silently
 			// drop the only source that exists before the wait returns.
+			// Queued Send receipts must survive both enriched-block and row projections.
+			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
+			_sendDeliveryTargets: block._sendDeliveryTargets ?? (tc as any)?._sendDeliveryTargets,
 			_awaitAgentNarratorId:
 				// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 				block._awaitAgentNarratorId ?? (tc as any)?._awaitAgentNarratorId,

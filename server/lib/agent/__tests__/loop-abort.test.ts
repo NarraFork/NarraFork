@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod/v4";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, CodexRebuildHistoryRetryError } from "../codex-errors";
 import type { ProviderAdapter } from "../provider";
@@ -12,6 +12,7 @@ let providerScenario:
 	| "abort_pending_tool"
 	| "truncated_after_tool"
 	| "split_streaming_escape"
+	| "streaming_field_boundaries"
 	| "codex_rebuild_after_text"
 	| "codex_rebuild_after_tool"
 	| "soft_stop_serial"
@@ -22,6 +23,9 @@ let providerScenario:
 	| "enter_plan_prepared_order"
 	| "interleaved_tool_chunk_order" = "abort";
 let providerAttempts = 0;
+let streamingBoundaryClock = 0;
+let streamingBoundaryTool = "Write";
+let streamingBoundaryChunks: Array<{ input: string; advanceMs?: number; stop?: boolean }> = [];
 const executedToolValues: string[] = [];
 const completedToolValues: string[] = [];
 const formattedToolResultOrder: string[] = [];
@@ -54,6 +58,20 @@ const testProvider: ProviderAdapter = {
 				previousCredentialId: "cred-a",
 				operation: "chat",
 			});
+		}
+		if (providerScenario === "streaming_field_boundaries") {
+			for (const { input, advanceMs = 0, stop } of streamingBoundaryChunks) {
+				streamingBoundaryClock += advanceMs;
+				yield {
+					toolUseChunk: {
+						toolUseId: "tu_field_boundaries",
+						name: streamingBoundaryTool,
+						input,
+						stop,
+					},
+				};
+			}
+			return;
 		}
 		if (providerScenario === "split_streaming_escape") {
 			yield {
@@ -779,9 +797,11 @@ describe("agentLoop abort result draining", () => {
 		providerAttempts = 0;
 		const ac = new AbortController();
 		let streamedText = "";
+		const startsField: Array<boolean | undefined> = [];
 
 		for await (const event of agentLoop(makeConfig(ac.signal), "write a multiline file", [])) {
 			if (event.type === "tool_use_chunk" && event.streamingField?.delta) {
+				startsField.push(event.streamingField.startsField);
 				streamedText += event.streamingField.delta;
 				if (streamedText.includes("line2")) break;
 			}
@@ -790,7 +810,84 @@ describe("agentLoop abort result draining", () => {
 		expect(providerAttempts).toBe(1);
 		expect(streamedText).toBe("line1\nline2");
 		expect(streamedText).not.toContain("\\n");
+		expect(startsField).toEqual([true, false]);
 	});
+
+	for (const scenario of [
+		{
+			name: "首段 Unicode 转义未完整时保留起点，stop flush 仍标记 true",
+			tool: "Write",
+			chunks: [
+				{ input: '{"file_path":"split.txt","content":"\\u0' },
+				{ input: "041tail", stop: true },
+			],
+			expected: [{ name: "content", delta: "Atail", startsField: true }],
+		},
+		{
+			name: "已发送首段后 stop flush 的续段标记 false",
+			tool: "Write",
+			chunks: [
+				{ input: '{"file_path":"split.txt","content":"first' },
+				{ input: "tail", stop: true },
+			],
+			expected: [
+				{ name: "content", delta: "first", startsField: true },
+				{ name: "content", delta: "tail", startsField: false },
+			],
+		},
+		{
+			name: "节流合并多个原始 chunk 后仍从字段起点发送",
+			tool: "Write",
+			chunks: [
+				{ input: '{"file_path":"split.txt",' },
+				{ input: '"content":"first' },
+				{ input: "tail", advanceMs: 50 },
+			],
+			expected: [{ name: "content", delta: "firsttail", startsField: true }],
+		},
+		{
+			name: "Edit 切换字段后重置起点，起始转义完成前不消耗标记",
+			tool: "Edit",
+			chunks: [
+				{ input: '{"file_path":"split.txt","old_string":"old' },
+				{ input: "tail", advanceMs: 50 },
+				{ input: '","new_string":"\\' },
+				{ input: "nnew", advanceMs: 50 },
+				{ input: "tail", advanceMs: 50 },
+			],
+			expected: [
+				{ name: "old_string", delta: "old", startsField: true },
+				{ name: "old_string", delta: "tail", startsField: false },
+				{ name: "new_string", delta: "\nnew", startsField: true },
+				{ name: "new_string", delta: "tail", startsField: false },
+			],
+		},
+	]) {
+		test(scenario.name, async () => {
+			providerScenario = "streaming_field_boundaries";
+			providerAttempts = 0;
+			streamingBoundaryTool = scenario.tool;
+			streamingBoundaryChunks = scenario.chunks;
+			streamingBoundaryClock = Date.now();
+			const clock = spyOn(Date, "now").mockImplementation(() => streamingBoundaryClock);
+			const deltas: Array<{ name: string; delta: string; startsField?: boolean }> = [];
+			try {
+				for await (const event of agentLoop(
+					makeConfig(new AbortController().signal),
+					"stream tool arguments",
+					[],
+				)) {
+					if (event.type !== "tool_use_chunk" || !event.streamingField) continue;
+					deltas.push(event.streamingField);
+					if (deltas.length === scenario.expected.length) break;
+				}
+				expect(providerAttempts).toBe(1);
+				expect(deltas).toEqual(scenario.expected);
+			} finally {
+				clock.mockRestore();
+			}
+		});
+	}
 
 	test("工具执行已启动后遇到 retryable 截断流时不重试并保留结果", async () => {
 		providerScenario = "truncated_after_tool";

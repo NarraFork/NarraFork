@@ -447,7 +447,12 @@ export type AgentEvent =
 			/** Metadata derived while tool input is still streaming (e.g. Edit match line). */
 			metadata?: Record<string, unknown>;
 			/** Incremental delta of the large streaming field (content, command, prompt, etc.) */
-			streamingField?: { name: string; delta: string };
+			streamingField?: {
+				name: string;
+				delta: string;
+				/** True at the JSON string's start, false for a continuation; absent means unknown. */
+				startsField?: boolean;
+			};
 	  }
 	| {
 			type: "block_complete";

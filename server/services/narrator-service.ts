@@ -89,7 +89,8 @@ import {
 } from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import { claimAgentMessageOrigin } from "./agent-message-origin";
+import { agentMessageDeliveryBody } from "./agent-message-delivery";
+import { buildAgentMessageOrigin } from "./agent-message-origin";
 import type {
 	BlockAllSkillsResult,
 	BlockSkillResult,
@@ -104,6 +105,7 @@ import type {
 import { getAvailableOptionalToolIds } from "./command-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
+import { buildSystemInjectionBlock, type SystemInjectionBlock } from "./narrator-injection";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
 // `bumpParentNarratorMessageVersion` is deliberately NOT imported any more: the bump
 // now happens inside `persistUserMessage`/`persistSystemMessage`, so every writer of a
@@ -1627,15 +1629,10 @@ export const narratorService = {
 	 * there is one insert path for user rows again. Three things remain this method's
 	 * own, and each is a decision the generic entry point must NOT make:
 	 *
-	 * 1. **Registry attribution.** Three routes reach this method (the in-pass drain,
-	 *    the pass-restart drain, `resumeSubagent`) and any of them may carry either a
-	 *    human's typed message or a message another AGENT sent through `Send`. Those two
-	 *    are indistinguishable by the time they arrive — same text, same `createdBy` (the
-	 *    human whose session triggered the send) — so the delivery registry is consulted
-	 *    instead of trusting the row's shape. Claiming is consume-once and MUST happen on
-	 *    exactly the routes that deliver agent-to-agent messages; doing it inside
-	 *    `persistUserMessage` would let an unrelated primary-narrator turn with identical
-	 *    text claim a subagent's pending attribution.
+	 * 1. **Explicit delivery attribution.** The in-pass drain, pass-restart drain and
+	 *    `resumeSubagent` carry an envelope only for agent-authored messages. It owns
+	 *    the exact reserved message ID and reader-facing body. No text/hash registry is
+	 *    consulted: a cleared, reordered or failed delivery cannot label human input.
 	 * 2. **Withholding the creator for AI-authored text.** `createdBy` stays audit data,
 	 *    but the creator ROW is what a bubble header renders as the author, so a machine's
 	 *    words must not be signed with a real person's avatar. The generic path keeps
@@ -1659,16 +1656,19 @@ export const narratorService = {
 			commandText?: string | null;
 			createdBy?: string | null;
 			origin?: MessageOriginOptions;
+			delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 		},
 	) {
-		// Claimed unconditionally: `claimAgentMessageOrigin` returns null for an
-		// ordinary human message, and claiming is consume-once so the attribution
-		// cannot leak onto a later message that repeats the same text.
-		const claimed = claimAgentMessageOrigin(narratorId, text);
-		const origin = options?.origin ?? claimed ?? undefined;
+		const delivery = options?.delivery;
+		if (delivery && delivery.recipientNarratorId !== narratorId) {
+			throw new ValidationError("Agent delivery recipient does not match message recipient");
+		}
+		const origin =
+			options?.origin ?? (delivery ? buildAgentMessageOrigin(delivery.sender) : undefined);
 		const contentJson: Array<
 			| { type: "text"; text: string }
 			| PersistedUserImageBlock
+			| SystemInjectionBlock
 			| { type: "text_file"; filename: string; size: number; filePath: string }
 			| import("@shared/file-reference").FileReferenceSnapshot
 		> = [];
@@ -1685,6 +1685,11 @@ export const narratorService = {
 		}
 		contentJson.push(...(options?.fileReferences ?? []));
 		contentJson.push({ type: "text", text });
+		if (delivery) {
+			contentJson.push(
+				buildSystemInjectionBlock("subagent_message", agentMessageDeliveryBody(delivery)),
+			);
+		}
 		const effectiveText =
 			(!text.trim() && (options?.images?.length ?? 0) > 0 ? "[user sent image(s)]" : text) +
 			buildAttachedFilesHint(options?.textFiles ?? []);
@@ -1695,7 +1700,7 @@ export const narratorService = {
 			options?.commandText ?? null,
 			options?.createdBy ?? null,
 			origin,
-			{ parentToolUseId },
+			{ parentToolUseId, messageId: delivery?.recipientMessageId },
 		);
 		// See (2) above: withheld here rather than in the shared entry point, so the
 		// row's `created_by` survives as audit data while the rendered author does not

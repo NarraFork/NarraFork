@@ -41,17 +41,25 @@ const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
-const { closeNarrator, editAndRegenerate, imageRefToContentBlock, resolveRequestedAttachmentKeys } =
-	await import("../narrator-session");
+const {
+	closeNarrator,
+	editAndRegenerate,
+	imageRefToContentBlock,
+	resolveRequestedAttachmentKeys,
+	interruptAndWaitForIdle,
+} = await import("../narrator-session");
 const { setUploadsDirForTests } = await import("../../lib/uploads");
 const { narratorMessages, narratorMessageRefs, narrators } = schema;
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });
-afterEach(() => {
+afterEach(async () => {
 	closeNarrator("n1");
 	closeNarrator("n2");
+	// Reseeding these IDs must wait for their complete admitted finalizers.
+	expect(await interruptAndWaitForIdle("n1", { timeoutMs: 5_000 })).toBe(true);
+	expect(await interruptAndWaitForIdle("n2", { timeoutMs: 5_000 })).toBe(true);
 	setUploadsDirForTests(null);
 });
 const now = new Date().toISOString();

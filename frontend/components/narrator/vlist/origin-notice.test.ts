@@ -67,14 +67,18 @@ describe("adapter routing by origin", () => {
 		expect((specs[0]?.data as { kind: string }).kind).toBe("origin_notice");
 	});
 
-	test("a message from another agent routes to the origin_notice card", () => {
+	test("a legacy message from another agent uses an injection bubble", () => {
 		// A `Send` to a subagent is persisted as `role: "user"` with a `created_by` naming
 		// whoever's session triggered it. Before `origin` was written on this path the row
 		// took the bubble branch and got signed with that person's avatar, even though an
 		// AI wrote the words.
 		const specs = adapt({ origin: "assistant", originLabel: "agentMessage:explore-1" });
-		expect(specs[0]?.kind).toBe("system-text");
-		expect((specs[0]?.data as { kind: string }).kind).toBe("origin_notice");
+		expect(specs[0]?.kind).toBe("injection-bubble");
+		expect(specs[0]?.data).toMatchObject({
+			markdown: "continue the task",
+			speakerId: null,
+			target: null,
+		});
 	});
 
 	test("the agent-message heading names the SENDER, not the triggering human", () => {
@@ -82,14 +86,14 @@ describe("adapter routing by origin", () => {
 			userMessage({ origin: "assistant", originLabel: "agentMessage:Fix the lease path" }),
 			{ ...CTX, labels: { originSourceAgentMessage: "代理消息" } },
 		);
-		expect((specs[0]?.data as { title: string }).title).toBe("代理消息 · Fix the lease path");
+		expect((specs[0]?.data as { speaker: string }).speaker).toBe("代理消息 · Fix the lease path");
 	});
 
 	test("the agent-message source is recognized, so it never leaks its raw label", () => {
 		// An unmapped source falls through to the raw stored string; that would surface
 		// the internal `agentMessage:` token in the header.
 		const specs = adapt({ origin: "assistant", originLabel: "agentMessage:explore-1" });
-		expect((specs[0]?.data as { title: string }).title).toBe("Agent message · explore-1");
+		expect((specs[0]?.data as { speaker: string }).speaker).toBe("Agent message · explore-1");
 	});
 
 	test("a plan-reflection-approved turn stays a bubble (origin user + planReflection label)", () => {

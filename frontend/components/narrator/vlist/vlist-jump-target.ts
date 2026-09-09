@@ -14,6 +14,36 @@
  * testable without a server.
  */
 
+import type { PretextLayoutIndex } from "@shared/pretext-layout/index";
+
+/** Prefer an exact tool row over the first row of its owning assistant message. */
+export function jumpTargetItemIndex(index: PretextLayoutIndex, target: string): number | undefined {
+	const id = jumpTargetMessageId(target);
+	return index.itemByKey(`tool-${id}`)?.index ?? index.itemIndicesForSourceMessageId(id)[0];
+}
+
+/** Look only inside this list: docked sessions can render the same message ids. */
+export function mountedJumpTarget(
+	root: HTMLElement,
+	domIds: readonly string[],
+	targetIds: readonly string[],
+): HTMLElement | null {
+	for (const target of targetIds) {
+		const key = `tool-${jumpTargetMessageId(target)}`;
+		const row = root.querySelector<HTMLElement>(`[data-nf-row-key="${CSS.escape(key)}"]`);
+		if (row) return row;
+	}
+	const candidates = [
+		...domIds,
+		...targetIds.flatMap((target) => [target, `msg-${jumpTargetMessageId(target)}`]),
+	];
+	for (const id of candidates) {
+		const element = root.querySelector<HTMLElement>(`[id="${CSS.escape(id)}"]`);
+		if (element) return element.closest<HTMLElement>("[data-nf-row-key]") ?? element;
+	}
+	return null;
+}
+
 /** Resolve a message id to its top-level ref seq (`getMessageLocation`). */
 export type JumpMessageLocationFetcher = (messageId: string) => Promise<{
 	seq: number;

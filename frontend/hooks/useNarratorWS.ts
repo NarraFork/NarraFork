@@ -430,7 +430,7 @@ interface NarratorWSCallbacks {
 		contentCharsReceived?: number,
 		extractedFields?: Record<string, string>,
 		metadata?: Record<string, unknown>,
-		streamingField?: { name: string; delta: string },
+		streamingField?: { name: string; delta: string; startsField?: boolean },
 		meta?: SubagentToolEventMeta,
 	) => void;
 	onToolCompleted?: (
@@ -476,6 +476,13 @@ interface NarratorWSCallbacks {
 		toolUseId: string,
 		subagentNarratorId: string,
 		parentToolUseId?: string,
+	) => void;
+	/** Accepted Send receipts; their reserved message IDs may still be queued. */
+	onSendDeliveryResolved?: (
+		toolUseId: string,
+		targets: Array<{ id: string; deliveryMessageId: string }>,
+		parentToolUseId?: string,
+		toolCallBinding?: { toolCallId: string; attempt: number },
 	) => void;
 	onTitleUpdated?: (title: string) => void;
 	onBufferSet?: (messages: BufferMessageSummary[]) => void;
@@ -1052,7 +1059,9 @@ export function useNarratorWS(
 							data.contentCharsReceived as number | undefined,
 							data.extractedFields as Record<string, string> | undefined,
 							data.metadata as Record<string, unknown> | undefined,
-							data.streamingField as { name: string; delta: string } | undefined,
+							data.streamingField as
+								| { name: string; delta: string; startsField?: boolean }
+								| undefined,
 							subagentToolEventMeta(data),
 						);
 						break;
@@ -1113,6 +1122,14 @@ export function useNarratorWS(
 							data.toolUseId as string,
 							data.subagentNarratorId as string,
 							data.parentToolUseId as string | undefined,
+						);
+						break;
+					case "send_delivery_resolved":
+						callbackOwner.callbacks.onSendDeliveryResolved?.(
+							data.toolUseId as string,
+							data.targets as Array<{ id: string; deliveryMessageId: string }>,
+							data.parentToolUseId as string | undefined,
+							data.toolCallBinding as { toolCallId: string; attempt: number } | undefined,
 						);
 						break;
 					case "title_updated":

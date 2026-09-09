@@ -7,8 +7,10 @@ import {
 	type FileChangeBlobRef,
 	type FileChangeExecutionBinding,
 	type FileChangeIdentity,
+	type FileChangeRevertAction,
 	type FileChangeRevertSelector,
 	type FileChangeState,
+	fileChangeRevertActionMatches,
 	fileChangeStatesEqual,
 	hasConfirmedNoFileChange,
 	type KnownFileChangeState,
@@ -48,6 +50,8 @@ export interface RevertPlannerRequest {
 	kind: "revert" | "history_delete" | "rollback_to_block";
 	revertScope: "narrator";
 	selector: FileChangeRevertSelector;
+	/** Server-selected UI entrypoint, persisted inside the original request commitment. */
+	uiAction?: FileChangeRevertAction;
 	signal?: AbortSignal;
 }
 export interface RevertPlannerFileAccess {
@@ -107,6 +111,7 @@ export interface RevertPlannerResult {
 	plan: RevertPlanSummary;
 	/** Prepared is a durable preview, NOT execution admission or a history/files mutation. */
 	executable: false;
+	historySummary: { deletedMessageCount: number; deletedBlockCount: number };
 }
 export class RevertPlannerError extends AppError {
 	constructor(code: string, message: string) {
@@ -427,7 +432,24 @@ export class RevertPlannerService {
 				ordered,
 				{ signal: work.signal },
 			);
-			return { plan, executable: false };
+			const deletedMessages = new Set(
+				selected.history.messages
+					.filter((message) => message.action === "delete" || message.action === "unlink")
+					.map((message) => message.id),
+			);
+			return {
+				plan,
+				executable: false,
+				historySummary: {
+					deletedMessageCount: fixed.kind === "revert" ? 0 : deletedMessages.size,
+					deletedBlockCount:
+						fixed.kind === "revert"
+							? 0
+							: selected.history.blocks.filter(
+									(block) => block.action === "remove" && !deletedMessages.has(block.messageId),
+								).length,
+				},
+			};
 		} finally {
 			work.close(() => {
 				this.active--;
@@ -651,6 +673,7 @@ function snapshotRequest(input: RevertPlannerRequest): FixedRequest {
 		"kind",
 		"revertScope",
 		"selector",
+		"uiAction",
 		"signal",
 	]);
 	keys(input.principal, ["userId", "isAdmin"]);
@@ -709,6 +732,11 @@ function snapshotRequest(input: RevertPlannerRequest): FixedRequest {
 	}
 	if (input.kind === "rollback_to_block" && selector.kind !== "after_block")
 		throw fail("INVALID_INPUT", "Block rollback requires a fixed after_block selection");
+	if (
+		input.uiAction !== undefined &&
+		!fileChangeRevertActionMatches(input.uiAction, input.kind, selector)
+	)
+		throw fail("ACTION_MISMATCH", "The UI action must match its fixed journal program");
 	if (selector.kind === "messages") Object.freeze(selector.messageIds);
 	if (selector.kind === "tool_calls") Object.freeze(selector.toolCallIds);
 	return Object.freeze({
@@ -719,6 +747,7 @@ function snapshotRequest(input: RevertPlannerRequest): FixedRequest {
 		kind: input.kind,
 		revertScope: input.revertScope,
 		selector: Object.freeze(selector),
+		...(input.uiAction === undefined ? {} : { uiAction: input.uiAction }),
 	});
 }
 function ids(values: string[], max: number) {

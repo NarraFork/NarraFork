@@ -16,6 +16,7 @@ import { segmentMessages } from "../message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits } from "../render-units";
 import type { MeasuredCommunicationBubble } from "./measure/measure-communication-bubble";
+import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { buildPretextLayoutManifest } from "./pretext-layout-manifest";
 import { VLIST_REGISTRY } from "./registry";
@@ -79,6 +80,60 @@ function textMessage(id: string, role: string, text: string): NarratorMsg {
 		children: [],
 	} as unknown as NarratorMsg;
 }
+
+describe("subagent cards default to folded at L1 and expanded at L2–L5", () => {
+	it.each([
+		1, 2, 3, 4, 5,
+	] as const)("L%s keeps multiple finished subagents between their ordinary-tool neighbours", (lod) => {
+		const message = {
+			...toolMessage(),
+			contentJson: ["Read", "Agent", "Agent", "Read"].map((name, index) => ({
+				type: "tool_use",
+				id: `call-${index}`,
+				name,
+				input:
+					name === "Agent"
+						? { subagent_type: "explore", description: "Inspect auth", prompt: "Check auth" }
+						: { file_path: "/repo/auth.ts" },
+				status: "success",
+				outputJson: { _text: "Finished inspection" },
+			})),
+			toolCalls: [],
+		} as unknown as NarratorMsg;
+		const units = groupRenderUnits(segmentMessages([message]), lod <= 2).map((unit, i) =>
+			unit.kind === "activity" ? { ...unit, key: `activity-${i}` } : unit,
+		) as unknown as AdapterRenderUnit[];
+		const built = buildPretextLayoutManifest({
+			layoutRevision: "subagent-low-lod",
+			documentRevision: 1,
+			lod,
+			widthBucket: "600",
+			renderUnits: units,
+			contentWidth: 600,
+			viewportHeight: 720,
+			resolveSource: () => ({ firstSeq: 1, lastSeq: 1, sourceMessageIds: [message.id] }),
+		});
+		expect(built.items.map((item) => item.spec.kind)).toEqual([
+			lod <= 2 ? "activity-trace" : "tool-call",
+			"subagent-card",
+			"subagent-card",
+			lod <= 2 ? "activity-trace" : "tool-call",
+		]);
+		for (const item of built.items.filter((item) => item.spec.kind === "subagent-card")) {
+			expect(item.spec.opts?.collapsesByLod).toBe(lod === 1);
+			const measured = item.measured as MeasuredSubagent;
+			expect(measured.effectiveExpanded).toBe(lod !== 1);
+			expect(measured.resultBlockHeight > 0).toBe(lod !== 1);
+			for (const opened of [false, true]) {
+				const toggled = VLIST_REGISTRY["subagent-card"].measure(item.spec.data, 600, lod, {
+					...item.spec.opts,
+					...(lod === 1 ? { lodUserOverride: opened } : { opened }),
+				}) as MeasuredSubagent;
+				expect(toggled.effectiveExpanded).toBe(opened);
+			}
+		}
+	});
+});
 
 describe("communication × real messages, manifest and selection", () => {
 	function send(id: string, seq: number, status = "success"): NarratorMsg {

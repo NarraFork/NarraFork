@@ -1,8 +1,12 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
 import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent";
+import { AsyncMutex } from "../lib/async-mutex";
+import { AppError, NotFoundError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
+import { isSubagentVariant } from "../lib/narrator-utils";
 import { normalizePathForComparison } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
 import type { ImageRef } from "../lib/uploads";
@@ -147,6 +151,8 @@ export interface ActiveNarrator {
 	_interruptCleanupDone?: boolean;
 	/** Whether the agent loop is currently running for this narrator. */
 	_loopRunning?: boolean;
+	/** Queued input is only restarted after the complete loop finalizer released admission. */
+	_resumeBufferedAfterLoop?: boolean;
 	/**
 	 * The user who triggered the current loop turn (set on each runAgentLoop / message feed).
 	 * Flows into ToolContext.userId for per-turn knowledge-base ACL. null when triggered by
@@ -463,7 +469,11 @@ export function invalidateWorkspaceTreeCache(worktreePath: string): void {
 export function isWorkspaceBeingWritten(worktreePath: string): boolean {
 	const target = normalizePathForComparison(worktreePath);
 	for (const active of activeNarrators.values()) {
-		if (!active.alive || active._loopRunning !== true) continue;
+		if (
+			!narratorLoopAdmissions.has(active.narratorId) &&
+			(!active.alive || active._loopRunning !== true)
+		)
+			continue;
 		if (normalizePathForComparison(active.cwd) === target) return true;
 	}
 	return false;
@@ -696,6 +706,7 @@ const narratorRuntimeClaims = hotSafe<Map<string, Set<string>>>(
  * function; releasing a claim that was already released is a no-op.
  */
 export function claimNarratorRuntime(narratorId: string, token: string): () => void {
+	assertNarratorNotReverting(narratorId);
 	const claims = narratorRuntimeClaims.get(narratorId) ?? new Set<string>();
 	claims.add(token);
 	narratorRuntimeClaims.set(narratorId, claims);
@@ -731,7 +742,13 @@ export function hasNarratorRuntimeClaim(narratorId: string): boolean {
  * `broadcastTargetId` merely points here belongs to a subagent, and a subagent's
  * pause is not the parent's work.
  */
+export const narratorLoopAdmissions = hotSafe<Set<string>>(
+	"narrafork.narratorLoopAdmissions",
+	() => new Set(),
+);
+
 export function isNarratorRuntimeBusy(narratorId: string): boolean {
+	if (narratorLoopAdmissions.has(narratorId)) return true;
 	const active = activeNarrators.get(narratorId);
 	if (active?.alive === true && active._loopRunning === true) return true;
 	if (hasNarratorRuntimeClaim(narratorId)) return true;
@@ -748,6 +765,247 @@ export const bufferedMessages = hotSafe<Map<string, BufferedMessage[]>>(
 	"narrafork.bufferedMessages",
 	() => new Map(),
 );
+
+// === Shared start/history/revert admission ===
+
+interface NarratorWorkAdmission {
+	narratorId: string;
+	rootId: string;
+	live: boolean;
+	settled: Promise<void>;
+	release: () => void;
+}
+
+interface NarratorAdmissionContext {
+	work: Map<string, NarratorWorkAdmission>;
+	starts: Map<string, { live: boolean }>;
+}
+
+const admissionContext = hotSafe(
+	"narrafork.narratorAdmissionContext",
+	() => new AsyncLocalStorage<NarratorAdmissionContext>(),
+);
+const admissionStartLock = hotSafe("narrafork.narratorAdmissionStartLock", () => new AsyncMutex());
+const admissionWork = hotSafe<Map<string, Set<NarratorWorkAdmission>>>(
+	"narrafork.narratorAdmissionWork",
+	() => new Map(),
+);
+const revertAdmissions = hotSafe<Map<string, { phase: "waiting" | "held" }>>(
+	"narrafork.narratorRevertAdmissions",
+	() => new Map(),
+);
+
+/** Resolve ownership from persisted parent links, never a request's broadcast/cwd hint. */
+export async function resolveNarratorAdmissionRoot(narratorId: string): Promise<string> {
+	const [{ db }, { narrators }, { eq }] = await Promise.all([
+		import("../db"),
+		import("../db/schema"),
+		import("drizzle-orm"),
+	]);
+	const seen = new Set<string>();
+	let id = narratorId;
+	while (seen.size < 32 && !seen.has(id)) {
+		seen.add(id);
+		// Admission is a frequent metadata read; never load prompts or compact summaries.
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, id),
+			columns: { id: true, variant: true, parentNarratorId: true },
+		});
+		if (!narrator) throw new NotFoundError("Narrator", id);
+		if (!isSubagentVariant(narrator.variant)) return id;
+		if (!narrator.parentNarratorId) break;
+		id = narrator.parentNarratorId;
+	}
+	throw new AppError(
+		"Cannot verify narrator admission root",
+		409,
+		"NARRATOR_ADMISSION_ROOT_INVALID",
+	);
+}
+
+export function isNarratorRevertAdmissionBlocked(narratorId: string): boolean {
+	const inherited = admissionContext.getStore()?.work.get(narratorId);
+	return revertAdmissions.has(inherited?.live ? inherited.rootId : narratorId);
+}
+
+export function assertNarratorNotReverting(narratorId: string): void {
+	if (isNarratorRevertAdmissionBlocked(narratorId)) {
+		throw new AppError(
+			"Narrator history is reserved for a file revert",
+			409,
+			"NARRATOR_REVERT_IN_PROGRESS",
+		);
+	}
+}
+
+function claimAdmissionWork(narratorId: string, rootId: string): NarratorWorkAdmission {
+	let settle!: () => void;
+	const settled = new Promise<void>((resolve) => {
+		settle = resolve;
+	});
+	const work: NarratorWorkAdmission = {
+		narratorId,
+		rootId,
+		live: true,
+		settled,
+		release: () => {
+			if (!work.live) return;
+			work.live = false;
+			const current = admissionWork.get(rootId);
+			current?.delete(work);
+			if (current?.size === 0) admissionWork.delete(rootId);
+			settle();
+		},
+	};
+	const claims = admissionWork.get(rootId) ?? new Set<NarratorWorkAdmission>();
+	claims.add(work);
+	admissionWork.set(rootId, claims);
+	return work;
+}
+
+/**
+ * A shared work lease, NOT a mutex held while a loop runs. Nested work gets its own
+ * lease so detached compacts/runners cannot outlive admission. An inherited lease
+ * only allows existing work to drain while an interrupting revert waits; it never
+ * permits writes after the exclusive lease has been granted.
+ */
+export function withNarratorWorkAdmission<T>(
+	narratorId: string,
+	fn: () => Promise<T>,
+	until?: (result: T) => Promise<unknown> | undefined,
+): Promise<T> {
+	const inherited = admissionContext.getStore()?.work.get(narratorId);
+	const enter = (rootId: string): Promise<T> => {
+		const gate = revertAdmissions.get(rootId);
+		const draining = [...(admissionContext.getStore()?.work.values() ?? [])].some(
+			(work) => work.live && work.rootId === rootId,
+		);
+		if (gate && !(gate.phase === "waiting" && draining)) {
+			return Promise.reject(
+				new AppError(
+					"Narrator history is reserved for a file revert",
+					409,
+					"NARRATOR_REVERT_IN_PROGRESS",
+				),
+			);
+		}
+		const lease = claimAdmissionWork(narratorId, rootId);
+		const parent = admissionContext.getStore();
+		const work = new Map(parent?.work);
+		work.set(narratorId, lease);
+		// The root is also covered when a child publishes a conclusion to its parent.
+		work.set(rootId, lease);
+		return admissionContext.run({ work, starts: new Map(parent?.starts) }, async () => {
+			try {
+				const result = await fn();
+				const terminal = until?.(result);
+				if (terminal) void terminal.then(lease.release, lease.release);
+				else lease.release();
+				return result;
+			} catch (error) {
+				lease.release();
+				throw error;
+			}
+		});
+	};
+	// Preserve the synchronous handoff from a start transaction into a background loop.
+	return inherited?.live
+		? enter(inherited.rootId)
+		: resolveNarratorAdmissionRoot(narratorId).then(enter);
+}
+
+/** Short start transaction: a pending revert also prevents NEW automatic turns. */
+export function withNarratorStartAdmission<T>(
+	narratorId: string,
+	fn: () => Promise<T>,
+): Promise<T> {
+	assertNarratorNotReverting(narratorId);
+	return withNarratorMutationAdmission(narratorId, async () => {
+		assertNarratorNotReverting(narratorId);
+		return fn();
+	});
+}
+
+/**
+ * The same short mutex for history/resume publication. Already-admitted delivery
+ * may drain during `waiting`; new callers are rejected by the work lease. Sharing
+ * this mutex removes the old resume→edit versus start→resume lock-order cycle.
+ */
+export function withNarratorMutationAdmission<T>(
+	narratorId: string,
+	fn: () => Promise<T>,
+): Promise<T> {
+	if (admissionContext.getStore()?.starts.get(narratorId)?.live) {
+		return withNarratorWorkAdmission(narratorId, fn);
+	}
+	return withNarratorWorkAdmission(narratorId, () =>
+		admissionStartLock.acquire(narratorId, async () => {
+			const parent = admissionContext.getStore();
+			const token = { live: true };
+			const starts = new Map(parent?.starts);
+			starts.set(narratorId, token);
+			try {
+				return await admissionContext.run({ work: new Map(parent?.work), starts }, fn);
+			} finally {
+				token.live = false;
+			}
+		}),
+	);
+}
+
+/** Includes startup and COMPLETE finalization, but does not make a background child's parent busy. */
+export function hasNarratorAdmissionWork(narratorId: string): boolean {
+	return (admissionWork.get(narratorId)?.size ?? 0) > 0;
+}
+
+export function listNarratorAdmissionOwners(narratorId: string): string[] {
+	return [...new Set([...(admissionWork.get(narratorId) ?? [])].map((work) => work.narratorId))];
+}
+
+export async function waitForNarratorAdmissionWork(
+	narratorId: string,
+	signal: AbortSignal,
+): Promise<void> {
+	while (hasNarratorAdmissionWork(narratorId)) {
+		signal.throwIfAborted();
+		await new Promise<void>((resolve, reject) => {
+			const onAbort = () => {
+				signal.removeEventListener("abort", onAbort);
+				reject(signal.reason);
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			void Promise.all([...(admissionWork.get(narratorId) ?? [])].map((work) => work.settled))
+				.then(() => resolve())
+				.finally(() => signal.removeEventListener("abort", onAbort));
+		});
+	}
+	signal.throwIfAborted();
+}
+
+/** Reserve starts while interrupt drains OUTSIDE the start mutex; promotion is atomic. */
+export function reserveNarratorRevertAdmission(narratorId: string): {
+	acquire: (signal: AbortSignal, busy: () => boolean) => Promise<() => void>;
+	release: () => void;
+} {
+	assertNarratorNotReverting(narratorId);
+	const gate = { phase: "waiting" as "waiting" | "held" };
+	revertAdmissions.set(narratorId, gate);
+	const release = () => {
+		if (revertAdmissions.get(narratorId) === gate) revertAdmissions.delete(narratorId);
+	};
+	return {
+		release,
+		acquire: (signal, busy) =>
+			admissionStartLock.acquire(narratorId, async () => {
+				signal.throwIfAborted();
+				if (hasNarratorAdmissionWork(narratorId) || busy()) {
+					throw new AppError("Narrator execution has not settled", 409, "NARRATOR_REVERT_BUSY");
+				}
+				gate.phase = "held";
+				return release;
+			}),
+	};
+}
 
 // === Compact/Prune locks ===
 

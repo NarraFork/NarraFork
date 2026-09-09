@@ -15,6 +15,7 @@ import {
 import type { HumanAttentionItem } from "@shared/human-attention";
 import { IconClockPause, IconInbox } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { globalQuestionsQueryKey } from "../../hooks/useAsyncQuestions";
@@ -28,7 +29,6 @@ import {
 	useHumanAttentionDetail,
 } from "../../hooks/useHumanAttention";
 import { api } from "../../lib/api";
-import { assetUrl } from "../../lib/base-path";
 import { readSession, writeSession } from "../../lib/session-store";
 import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
 import { toBannerQuestions } from "./async-question-questions";
@@ -253,18 +253,14 @@ function RetryNotice({
 	);
 }
 
-function ownerHref(narratorId: string) {
-	return assetUrl(`/narrators/${encodeURIComponent(narratorId)}`);
-}
-
 function OwnerLink({ item }: { item: HumanAttentionItem }) {
 	const { t } = useTranslation("narrator");
+	const navigate = useNavigate();
 	return (
 		<Button
-			component="a"
-			href={ownerHref(item.narratorId)}
-			target="_blank"
-			rel="noopener noreferrer"
+			onClick={() =>
+				void navigate({ to: "/narrators/$narratorId", params: { narratorId: item.narratorId } })
+			}
 			size="compact-xs"
 			variant="subtle"
 		>
@@ -416,6 +412,7 @@ function ReviewText({ label, value }: { label: string; value: unknown }) {
 
 function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 	const { t } = useTranslation("narrator");
+	const navigate = useNavigate();
 	const client = useQueryClient();
 	const query = useHumanAttentionDetail(summary.id);
 	const item = query.data?.item ?? summary;
@@ -473,9 +470,9 @@ function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 		() => ({
 			// The inbox has no workspace file drawer; open the ACTUAL owner rather than a noop or parent.
 			openForApproval: () =>
-				window.open(ownerHref(item.narratorId), "_blank", "noopener,noreferrer"),
+				void navigate({ to: "/narrators/$narratorId", params: { narratorId: item.narratorId } }),
 		}),
-		[item.narratorId],
+		[item.narratorId, navigate],
 	);
 
 	if (query.isLoading) return <Text size="sm">{t("humanAttentionLoading")}</Text>;

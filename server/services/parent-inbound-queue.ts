@@ -22,6 +22,7 @@ import { pushPendingInjection } from "./parent-injection-queue";
 const MAX_PARENT_INBOUND_CHARS = 8_000;
 
 export interface ParentInboundMessage {
+	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	/** Subagent narrator id that sent the message. */
 	fromId: string;
 	/** Subagent title (may be null when untitled). */
@@ -41,6 +42,8 @@ export interface ParentInboundMessage {
 	 * agents by alias and has no use for a message id.
 	 */
 	fromMessageId?: string | null;
+	/** Exact Send call in the sender's session; preferred over the legacy message target. */
+	fromToolUseId?: string;
 	/** Message text (already capped). */
 	text: string;
 	timestamp: string;
@@ -59,14 +62,18 @@ export function pushParentInboundMessage(
 	parentNarratorId: string,
 	message: ParentInboundMessage,
 ): void {
+	const capped = (text: string) =>
+		text.length > MAX_PARENT_INBOUND_CHARS
+			? `${text.slice(0, MAX_PARENT_INBOUND_CHARS)}…[truncated]`
+			: text;
 	pushPendingInjection(parentNarratorId, {
 		kind: "subagent_message",
 		message: {
 			...message,
-			text:
-				message.text.length > MAX_PARENT_INBOUND_CHARS
-					? `${message.text.slice(0, MAX_PARENT_INBOUND_CHARS)}…[truncated]`
-					: message.text,
+			text: capped(message.text),
+			...(message.delivery
+				? { delivery: { ...message.delivery, text: capped(message.delivery.text) } }
+				: {}),
 		},
 	});
 }

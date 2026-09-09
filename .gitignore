@@ -55,6 +55,12 @@ scripts/lib/__tests__/*
 # Reproducible tool-body follow regression harness; reports remain under .narrafork/.
 !scripts/smoke-tool-content-follow.ts
 !scripts/smoke-tool-content-follow-fixture.tsx
+# Monaco regression sources are required in fresh clones; generated reports stay ignored.
+!scripts/smoke-monaco-large-file*.ts
+!scripts/smoke-monaco-large-file*.tsx
+!scripts/smoke-file-navigation.ts
+!scripts/smoke-file-navigation-fixture.tsx
+!scripts/smoke-editor-real-io-fixture.tsx
 .tmp-narrafork-home.*
 .release.local.json
 mitm-dump/

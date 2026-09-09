@@ -1,5 +1,6 @@
 import { hotSafe } from "@server/lib/hot-safe";
 import { generateShortId } from "@server/lib/id";
+import type { ToolCallBinding } from "../lib/agent/types";
 
 const DEFAULT_REPLY_TIMEOUT_MS = 60_000;
 const MAX_REPLY_TIMEOUT_MS = 86_400_000;
@@ -27,6 +28,7 @@ export type SendAwaitTargetStatus =
 	| "taken_over";
 
 export interface SendAwaitTargetSnapshot {
+	deliveryMessageId?: string;
 	id: string;
 	title?: string | null;
 	status: SendAwaitTargetStatus;
@@ -36,6 +38,9 @@ export interface SendAwaitTargetSnapshot {
 }
 
 export interface AgentReplyWaitSnapshot {
+	requesterMessageId?: string;
+	requesterToolCallBinding?: ToolCallBinding;
+	deliveryMessageId?: string;
 	toolUseId: string;
 	requestId: string;
 	requesterId: string;
@@ -50,6 +55,7 @@ export interface AgentReplyWaitSnapshot {
 }
 
 export interface AgentReplyWaitRunSnapshot {
+	requesterToolCallBinding?: ToolCallBinding;
 	toolUseId: string;
 	requesterId: string;
 	doInterrupt: boolean;
@@ -97,7 +103,10 @@ export interface AgentReplyWaitHandle {
 	fail: (error: string) => void;
 	updateSnapshot: (
 		input: Partial<
-			Pick<AgentReplyWaitSnapshot, "label" | "title" | "deliveryNote" | "interrupted">
+			Pick<
+				AgentReplyWaitSnapshot,
+				"label" | "title" | "deliveryNote" | "interrupted" | "deliveryMessageId"
+			>
 		>,
 	) => void;
 }
@@ -110,6 +119,36 @@ const activeReplyWaitRuns = hotSafe(
 	"narrafork:activeAgentReplyWaitRuns:v1",
 	() => new Map<string, ActiveAgentReplyWaitRun>(),
 );
+
+/** Exact active-run receipts for a loaded tool row; no text lookup or history scan. */
+export function getActiveSendDeliveryTargets(
+	requesterId: string,
+	toolUseId: string,
+	toolCallBinding?: ToolCallBinding,
+): Array<{ id: string; deliveryMessageId: string }> {
+	const run = activeReplyWaitRuns.get(toolUseId);
+	if (!run || run.snapshot.requesterId !== requesterId) return [];
+	const binding = run.snapshot.requesterToolCallBinding;
+	if (toolCallBinding && !binding) return [];
+	if (
+		binding &&
+		(binding.toolCallId !== toolCallBinding?.toolCallId ||
+			binding.attempt !== toolCallBinding?.attempt)
+	)
+		return [];
+	return [
+		...run.snapshot.waiters.flatMap((waiter) =>
+			waiter.deliveryMessageId
+				? [{ id: waiter.responderId, deliveryMessageId: waiter.deliveryMessageId }]
+				: [],
+		),
+		...run.snapshot.prefixTargets.flatMap((target) =>
+			target.deliveryMessageId
+				? [{ id: target.id, deliveryMessageId: target.deliveryMessageId }]
+				: [],
+		),
+	];
+}
 
 function sameScope(a: AgentReplyScope, b: AgentReplyScope): boolean {
 	return a.type === b.type && a.id === b.id;
@@ -183,6 +222,7 @@ function activeRunForHandle(handle: AgentReplyWaitRunHandle): ActiveAgentReplyWa
 }
 
 export function beginAgentReplyWaitRun(input: {
+	requesterToolCallBinding?: ToolCallBinding;
 	toolUseId: string;
 	requesterId: string;
 	doInterrupt?: boolean;
@@ -195,6 +235,9 @@ export function beginAgentReplyWaitRun(input: {
 	const run: ActiveAgentReplyWaitRun = {
 		token,
 		snapshot: {
+			...(input.requesterToolCallBinding
+				? { requesterToolCallBinding: { ...input.requesterToolCallBinding } }
+				: {}),
 			toolUseId: input.toolUseId,
 			requesterId: input.requesterId,
 			doInterrupt: input.doInterrupt ?? false,
@@ -309,6 +352,8 @@ function resolveDeadline(input: { timeoutMs?: number; deadlineAt?: string }): st
 }
 
 export function registerAgentReplyWait(opts: {
+	requesterMessageId?: string;
+	requesterToolCallBinding?: ToolCallBinding;
 	requesterId: string;
 	responderId: string;
 	scope: AgentReplyScope;
@@ -322,6 +367,7 @@ export function registerAgentReplyWait(opts: {
 	title?: string | null;
 	deliveryNote?: string;
 	interrupted?: boolean;
+	deliveryMessageId?: string;
 }): AgentReplyWaitHandle {
 	const deadlineAt = resolveDeadline(opts);
 	let resolvePromise!: (result: AgentReplyWaitResult) => void;
@@ -338,6 +384,10 @@ export function registerAgentReplyWait(opts: {
 	const toolUseId = opts.toolUseId ?? opts.run?.toolUseId;
 	const attachedSnapshot = toolUseId
 		? attachWaiterSnapshot(opts.run, {
+				...(opts.requesterMessageId ? { requesterMessageId: opts.requesterMessageId } : {}),
+				...(opts.requesterToolCallBinding
+					? { requesterToolCallBinding: { ...opts.requesterToolCallBinding } }
+					: {}),
 				toolUseId,
 				requestId,
 				requesterId: opts.requesterId,
@@ -348,6 +398,7 @@ export function registerAgentReplyWait(opts: {
 				title: opts.title,
 				deliveryNote: opts.deliveryNote ?? "",
 				interrupted: opts.interrupted,
+				deliveryMessageId: opts.deliveryMessageId,
 			})
 		: undefined;
 	const entry: PendingAgentReplyWait = {
@@ -416,10 +467,16 @@ export function registerAgentReplyWaitFromSnapshot(
 		title: snapshot.title,
 		deliveryNote: snapshot.deliveryNote,
 		interrupted: snapshot.interrupted,
+		deliveryMessageId: snapshot.deliveryMessageId,
+		requesterMessageId: snapshot.requesterMessageId,
+		requesterToolCallBinding: snapshot.requesterToolCallBinding,
 	});
 }
 
 export interface ResolvePendingAgentReplyResult {
+	recipientMessageId?: string;
+	/** The existing waiting Send row receives this reply; no ordinary inbox message. */
+	recipientToolUseId?: string;
 	matched: boolean;
 	requestId?: string;
 	ambiguous?: boolean;
@@ -472,7 +529,16 @@ export function resolvePendingAgentReply(opts: {
 		message,
 		receivedAt: new Date().toISOString(),
 	});
-	return matched ? { matched: true, requestId: entry.requestId } : { matched: false };
+	return matched
+		? {
+				matched: true,
+				requestId: entry.requestId,
+				...(entry.snapshot?.requesterMessageId
+					? { recipientMessageId: entry.snapshot.requesterMessageId }
+					: {}),
+				...(entry.snapshot?.toolUseId ? { recipientToolUseId: entry.snapshot.toolUseId } : {}),
+			}
+		: { matched: false };
 }
 
 export function clearPendingAgentReplyWaits(): void {

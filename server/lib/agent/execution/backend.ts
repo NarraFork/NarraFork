@@ -258,6 +258,11 @@ export interface ExecHandle {
 	onData(cb: (chunk: Uint8Array) => void): void;
 	/** Resolves with the exit code when the process exits. */
 	readonly exited: Promise<number | null>;
+	/** Authoritative local lifetime barrier: process exit (or proven spawn failure)
+	 * AND closed stdio. Unlike an error/abort/kill acknowledgement, resolution means
+	 * execution is finished. Rejects if final termination cannot be confirmed.
+	 * Backends without this barrier must make `exited` authoritative instead. */
+	readonly whenSettled?: Promise<void>;
 	/** True once the process has exited. */
 	isExited(): boolean;
 	/** Terminate the process (and its process group, when supported). */
@@ -319,6 +324,8 @@ export interface ExecutionBackend {
 	grep(params: GrepParams): Promise<GrepResult>;
 
 	// ── Command execution ────────────────────────────────────────────
+	/** Local dispatch rejection proves no spawn. Once spawned, local execution
+	 * returns a handle even on asynchronous errors, retaining its lifetime barrier. */
 	execCommand(params: ExecParams): Promise<ExecHandle>;
 
 	// ── Git diagnostics (read-only) ──────────────────────────────────

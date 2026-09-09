@@ -1,4 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
+import type { SQL } from "drizzle-orm";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 
 const originToolUseId = "origin-tool-use";
 const parentNarratorId = "parent-narrator";
@@ -30,6 +32,9 @@ let clearManualOverrideRuntimes: typeof import("../subagent-manual-override").cl
 let waitForManualOverride: typeof import("../subagent-manual-override").waitForManualOverride;
 let hasActiveSubagentResumeRun: typeof import("../subagent-resume").hasActiveSubagentResumeRun;
 let resumeSubagent: typeof import("../subagent-resume").resumeSubagent;
+let acquireNarratorRevertAdmission: typeof import("../narrator-session").acquireNarratorRevertAdmission;
+let startupAdmissionBarrier: { entered: () => void; wait: Promise<void> } | undefined;
+let publicationAdmissionBarrier: { entered: () => void; wait: Promise<void> } | undefined;
 
 // Real module namespaces captured before mocking, so afterAll can re-point the
 // GLOBAL module mocks back to the real implementations. Bun's mock.module is
@@ -75,6 +80,7 @@ beforeAll(async () => {
 	// module. Bun's mock.module is process-wide and mock.restore() does not undo it.
 	const realNarratorSession = { ...(await import("../narrator-session")) };
 	const realEditAndRegenerate = realNarratorSession.editAndRegenerate;
+	acquireNarratorRevertAdmission = realNarratorSession.acquireNarratorRevertAdmission;
 	const realNarratorServiceModule = { ...(await import("../narrator-service")) };
 	const realNarratorService = realNarratorServiceModule.narratorService;
 	const realSettings = { ...(await import("../../lib/settings")) };
@@ -100,13 +106,35 @@ beforeAll(async () => {
 		},
 		narrators: {
 			...realDb.query.narrators,
-			findFirst: mock(async (options?: { columns?: Record<string, boolean> }) =>
-				options?.columns?.pendingModelRestore
+			findFirst: mock(async (options?: { columns?: Record<string, boolean>; where?: SQL }) => {
+				// Scheduling fixtures have synthetic rows; model the same three-column
+				// admission projection without hiding the real-database provenance cases.
+				if (
+					options?.where &&
+					options.columns?.id &&
+					options.columns.variant &&
+					options.columns.parentNarratorId
+				) {
+					const id = new SQLiteSyncDialect().sqlToQuery(options.where).params[0];
+					if (
+						typeof id === "string" &&
+						id !== "n1" &&
+						id !== "n2" &&
+						!databaseNarratorIds.has(id)
+					) {
+						return {
+							id,
+							variant: id === parentNarratorId ? "primary" : "subagent:general",
+							parentNarratorId: id === parentNarratorId ? null : parentNarratorId,
+						};
+					}
+				}
+				return options?.columns?.pendingModelRestore
 					? { pendingModelRestore: null }
 					: realResolverChild && options?.columns?.originToolCallId
 						? realResolverChild
-						: realDb.query.narrators.findFirst(options as never),
-			),
+						: realDb.query.narrators.findFirst(options as never);
+			}),
 		},
 	};
 	const dbProxy = new Proxy(realDb, {
@@ -141,6 +169,13 @@ beforeAll(async () => {
 		narratorService: {
 			...realNarratorService,
 			getById: mock(async (id: string) => {
+				if (id === parentNarratorId)
+					return {
+						...makeNarrator(id),
+						variant: "primary",
+						type: "primary",
+						parentNarratorId: null,
+					};
 				if (isEditTestNarrator(id) || databaseNarratorIds.has(id)) {
 					return realNarratorService.getById(id);
 				}
@@ -273,6 +308,10 @@ beforeAll(async () => {
 		}),
 		startContinuedSubagent: mock(async (input: Record<string, unknown>) => {
 			startCalls.push(input);
+			if (startupAdmissionBarrier) {
+				startupAdmissionBarrier.entered();
+				await startupAdmissionBarrier.wait;
+			}
 			const subagentId = String(input.subagentId);
 			const completion = new Promise<string>((resolve) => {
 				foregroundResolvers.set(subagentId, resolve);
@@ -371,6 +410,10 @@ beforeAll(async () => {
 		),
 		updateToolCallConclusion: mock(async (input: Record<string, unknown>) => {
 			conclusionCalls.push(input);
+			if (publicationAdmissionBarrier) {
+				publicationAdmissionBarrier.entered();
+				await publicationAdmissionBarrier.wait;
+			}
 		}),
 	}));
 	realModules["../narrator-session"] = () => realNarratorSession;
@@ -395,10 +438,123 @@ async function finishRun(subagentId: string, output = "done") {
 	}
 }
 
+describe("resume lifecycle shares the root's file-revert admission", () => {
+	test("starting is occupied before the runner returns a terminal handle", async () => {
+		const entered = Promise.withResolvers<void>();
+		const proceed = Promise.withResolvers<void>();
+		startupAdmissionBarrier = { entered: entered.resolve, wait: proceed.promise };
+		const pending = resumeSubagent({
+			subagentId: "admission-starting",
+			intent: "follow_up",
+			actor: "user",
+			prompt: "start",
+			locale: "en",
+		});
+		await entered.promise;
+		try {
+			const { isNarratorRuntimeBusy } = await import("../narrator-session-state");
+			expect(isNarratorRuntimeBusy(parentNarratorId)).toBe(false);
+			await expect(
+				acquireNarratorRevertAdmission(parentNarratorId, {
+					signal: new AbortController().signal,
+					interrupt: false,
+				}),
+			).rejects.toMatchObject({ statusCode: 409, code: "NARRATOR_REVERT_BUSY" });
+		} finally {
+			proceed.resolve();
+			const started = await pending;
+			await finishRun("admission-starting");
+			await started.terminalCompletion;
+			startupAdmissionBarrier = undefined;
+		}
+	});
+
+	test("terminal execution is not quiescent while its conclusion is still publishing", async () => {
+		const entered = Promise.withResolvers<void>();
+		const publish = Promise.withResolvers<void>();
+		publicationAdmissionBarrier = { entered: entered.resolve, wait: publish.promise };
+		const started = await resumeSubagent({
+			subagentId: "admission-delivering",
+			intent: "follow_up",
+			actor: "user",
+			prompt: "start",
+			locale: "en",
+		});
+		terminalResolvers.get("admission-delivering")?.("final output");
+		await entered.promise;
+		let exclusive: Promise<() => void> | undefined;
+		let granted = false;
+		try {
+			await expect(
+				acquireNarratorRevertAdmission(parentNarratorId, {
+					signal: new AbortController().signal,
+					interrupt: false,
+				}),
+			).rejects.toMatchObject({ code: "NARRATOR_REVERT_BUSY" });
+			exclusive = acquireNarratorRevertAdmission(parentNarratorId, {
+				signal: new AbortController().signal,
+				interrupt: true,
+			}).then((release) => {
+				granted = true;
+				return release;
+			});
+			await Promise.resolve();
+			expect(granted).toBe(false);
+			expect(hasActiveSubagentResumeRun("admission-delivering")).toBe(true);
+		} finally {
+			publish.resolve();
+			await started.terminalCompletion;
+			const release = await exclusive;
+			release?.();
+			publicationAdmissionBarrier = undefined;
+		}
+		expect(granted).toBe(true);
+		expect(hasActiveSubagentResumeRun("admission-delivering")).toBe(false);
+	});
+
+	test("all resume intents refuse an exclusive revert before retry/edit/persistence", async () => {
+		const release = await acquireNarratorRevertAdmission(parentNarratorId, {
+			signal: new AbortController().signal,
+			interrupt: false,
+		});
+		try {
+			for (const intent of [
+				"follow_up",
+				"retry_last_input",
+				"continue_tool_results",
+				"retry_denied_tool",
+				"regenerate_edited_message",
+			] as const) {
+				await expect(
+					resumeSubagent({
+						subagentId: "admission-blocked",
+						intent,
+						actor: "user",
+						prompt: "start",
+						retryToolUseId: "tool",
+						editMessageId: "message",
+						editContent: "changed",
+						locale: "en",
+					}),
+				).rejects.toMatchObject({ statusCode: 409, code: "NARRATOR_REVERT_IN_PROGRESS" });
+			}
+			expect(startCalls).toHaveLength(0);
+			expect(persistedCalls).toHaveLength(0);
+			expect(retriedToolCalls).toHaveLength(0);
+			expect(editedMessageCalls).toHaveLength(0);
+			expect(deleteMessagesAfterCalls).toHaveLength(0);
+		} finally {
+			release();
+		}
+	});
+});
+
 afterEach(async () => {
 	for (const subagentId of [...terminalResolvers.keys()]) {
 		await finishRun(subagentId);
 	}
+	startupAdmissionBarrier = undefined;
+	publicationAdmissionBarrier = undefined;
 	startCalls.length = 0;
 	persistedCalls.length = 0;
 	conclusionCalls.length = 0;

@@ -43,6 +43,66 @@ export type StreamingToolStore = Map<string, TopLevelStreamingChunk>;
  */
 const UNKNOWN_TOOL_NAME = "Tool";
 
+/** Keep navigation receipts in the live tail store, independently of lifecycle/output. */
+export function applyStreamingSendDelivery(
+	store: StreamingToolStore,
+	event: {
+		toolUseId: string;
+		targets: Array<{ id: string; deliveryMessageId: string }>;
+		toolCallBinding?: { toolCallId: string; attempt: number };
+	},
+): boolean {
+	if (!event.toolUseId || !Array.isArray(event.targets)) return false;
+	const existing = store.get(event.toolUseId);
+	if (
+		existing &&
+		((existing.toolName !== "Send" && existing.toolName !== UNKNOWN_TOOL_NAME) ||
+			[
+				"success",
+				"completed",
+				"fail",
+				"failed",
+				"error",
+				"cancelled",
+				"aborted",
+				"timeout",
+			].includes(existing._status ?? "") ||
+			existing._output != null)
+	)
+		return false;
+	const binding = existing?._sendDeliveryBinding;
+	if (
+		binding &&
+		event.toolCallBinding &&
+		(binding.toolCallId !== event.toolCallBinding.toolCallId ||
+			binding.attempt !== event.toolCallBinding.attempt)
+	)
+		return false;
+	const targets = new Map<string, { id: string; deliveryMessageId: string }>();
+	for (const target of [...(existing?._sendDeliveryTargets ?? []), ...event.targets]) {
+		if (
+			typeof target?.id !== "string" ||
+			!target.id.trim() ||
+			typeof target.deliveryMessageId !== "string" ||
+			!target.deliveryMessageId.trim()
+		)
+			continue;
+		targets.set(target.id, { id: target.id, deliveryMessageId: target.deliveryMessageId });
+	}
+	const next = [...targets.values()];
+	if (!next.length || JSON.stringify(next) === JSON.stringify(existing?._sendDeliveryTargets))
+		return false;
+	store.set(event.toolUseId, {
+		toolUseId: event.toolUseId,
+		inputCharsTotal: 0,
+		...existing,
+		toolName: "Send",
+		_sendDeliveryTargets: next,
+		...(event.toolCallBinding ? { _sendDeliveryBinding: event.toolCallBinding } : {}),
+	});
+	return true;
+}
+
 export function createStreamingToolStore(): StreamingToolStore {
 	return new Map();
 }
@@ -56,7 +116,7 @@ export interface ToolChunkEvent {
 	extractedFields?: Record<string, string>;
 	metadata?: Record<string, unknown>;
 	/** One delta of a field being streamed (accumulated across frames). */
-	streamingField?: { name: string; delta: string };
+	streamingField?: { name: string; delta: string; startsField?: boolean };
 }
 
 /**

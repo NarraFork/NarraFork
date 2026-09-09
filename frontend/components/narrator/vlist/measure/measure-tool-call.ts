@@ -1035,10 +1035,11 @@ function measureDiffDocumentHeight(
 	document: DiffDocument,
 	cap: number,
 	availableWidth: number,
-	textTruncated?: boolean,
 ): number {
 	const maxRows = cappedUsefulLines(cap);
-	if (textTruncated || document.totalRows >= maxRows) return cap;
+	// Missing or still-streaming source says nothing about the height we can paint.
+	// Reserve only available rows, otherwise even an empty Edit starts at the full cap.
+	if (document.totalRows >= maxRows) return cap;
 	const rows: { content: string }[] = [];
 	for (let row = 0; row < document.totalRows; row++) {
 		rows.push({ content: readDiffRowContent(document, row) ?? "" });
@@ -1659,7 +1660,7 @@ export function measureToolBody(
 			const diffGutterChars = diffGutterWidthChars(detail.diffDocument);
 			const media = mediaContentPx(detail.media, detail.contentPx, innerWidth, cap);
 			const capped = detail.diffDocument
-				? measureDiffDocumentHeight(detail.diffDocument, cap, innerWidth, detail.textTruncated)
+				? measureDiffDocumentHeight(detail.diffDocument, cap, innerWidth)
 				: cappedBodyHeight(
 						cap,
 						detail.contentLines,

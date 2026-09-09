@@ -8,8 +8,79 @@
  * pinned here rather than left to the shell's integration path.
  */
 
-import { describe, expect, it } from "bun:test";
-import { jumpTargetMessageId, resolveJumpTargetSeq } from "./vlist-jump-target";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { buildPretextLayoutIndex } from "@shared/pretext-layout/index";
+import {
+	jumpTargetItemIndex,
+	jumpTargetMessageId,
+	mountedJumpTarget,
+	resolveJumpTargetSeq,
+} from "./vlist-jump-target";
+
+// Minimal DOM surface: these tests need identity/scope, not browser layout.
+function fakeRoot(entries: Record<string, unknown>): HTMLElement {
+	return { querySelector: (selector: string) => entries[selector] ?? null } as HTMLElement;
+}
+
+describe("exact Send row navigation", () => {
+	const originalCss = Object.getOwnPropertyDescriptor(globalThis, "CSS");
+	beforeAll(() => {
+		// Fixtures use only CSS-safe ids; Bun has no browser CSS namespace.
+		if (!originalCss) {
+			Object.defineProperty(globalThis, "CSS", {
+				configurable: true,
+				value: { escape: (value: string) => value },
+			});
+		}
+	});
+	afterAll(() => {
+		if (!originalCss) Reflect.deleteProperty(globalThis, "CSS");
+	});
+
+	it("uses the tool's own layout offset, not the first row of its message", () => {
+		const index = buildPretextLayoutIndex({
+			layoutRevision: "1",
+			documentRevision: 1,
+			lod: 5,
+			widthBucket: 800,
+			metrics: { topPadding: 0, itemGap: 4, bottomPadding: 0 },
+			items: ["text", "tool-read-1", "tool-send-2"].map((itemKey) => ({
+				itemKey,
+				firstSeq: 10,
+				lastSeq: 10,
+				sourceMessageIds: ["assistant-message"],
+				kind: "communication-bubble",
+				height: 100,
+			})),
+		});
+		expect(jumpTargetItemIndex(index, "send-2")).toBe(2);
+		expect(jumpTargetItemIndex(index, "msg-send-2")).toBe(2);
+		expect(jumpTargetItemIndex(index, "assistant-message")).toBe(0);
+		expect(jumpTargetItemIndex(index, "missing")).toBeUndefined();
+	});
+
+	it("reveals and highlights the Send row before any message alias", () => {
+		const row = {} as HTMLElement;
+		const root = fakeRoot({
+			'[data-nf-row-key="tool-send-2"]': row,
+			'[id="msg-assistant-message"]': { closest: () => null },
+		});
+		expect(mountedJumpTarget(root, ["msg-assistant-message"], ["send-2"])).toBe(row);
+	});
+
+	it("does not select a matching row in another docked list", () => {
+		const otherRow = {} as HTMLElement;
+		const otherRoot = fakeRoot({ '[data-nf-row-key="tool-send-2"]': otherRow });
+		expect(mountedJumpTarget(fakeRoot({}), [], ["send-2"])).toBeNull();
+		expect(mountedJumpTarget(otherRoot, [], ["send-2"])).toBe(otherRow);
+	});
+
+	it("highlights the containing row instead of a zero-size message alias", () => {
+		const row = {} as HTMLElement;
+		const root = fakeRoot({ '[id="msg-owner"]': { closest: () => row } });
+		expect(mountedJumpTarget(root, [], ["owner"])).toBe(row);
+	});
+});
 
 describe("jumpTargetMessageId", () => {
 	it("strips a msg- DOM id prefix and passes a raw id through", () => {

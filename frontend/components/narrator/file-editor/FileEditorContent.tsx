@@ -1,15 +1,3 @@
-/**
- * FileEditorContent.tsx — editing a workspace file in the browser.
- *
- * Wraps the CodeMirror surface with the three things a save needs to be honest:
- * the optimistic lock, a conflict view built from the existing `DiffView`, and an
- * explicit choice when the lock fails. Text panels open directly in this editor;
- * remote files and files without a narrator remain read-only on the same surface.
- *
- * The state transitions live in `save-state.ts` and are tested there; this component
- * only performs I/O and rendering.
- */
-
 import {
 	ActionIcon,
 	Alert,
@@ -30,6 +18,8 @@ import {
 } from "@shared/file-reference";
 import {
 	IconAlertTriangle,
+	IconArrowBackUp,
+	IconArrowForwardUp,
 	IconDeviceFloppy,
 	IconRefresh,
 	IconSearch,
@@ -37,85 +27,55 @@ import {
 } from "@tabler/icons-react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ApiError, api } from "../../../lib/api";
 import { request } from "../../../lib/api/client";
 import { fileReferenceApi } from "../../../lib/api/file-references";
+import { saveBlobAsFile } from "../../../lib/file-download";
 import { getShikiLang } from "../../../lib/shiki-lang";
+import type { DiffLine } from "../DiffView";
 import { useFileReferenceScope } from "../FileReferenceScope";
 import { availableModes, type FileViewerMode } from "../file-viewer/file-viewer-modes";
 import { filePanelBaseName } from "../panels/panel-kind";
-import { CodeMirrorEditor } from "./CodeMirrorEditor";
 import {
-	applyEdit,
-	beginSave,
-	canSave,
-	dismissConfirmation,
-	type EditorState,
-	initialEditorState,
-	isDirty,
-	reloaded,
-	resolveConflictKeepingMine,
-	resolveConflictTakingTheirs,
-	saveConflicted,
-	saveFailed,
-	saveNeedsConfirmation,
-	saveSucceeded,
-} from "./save-state";
+	EditorDocumentSession,
+	type EditorSessionState,
+	sessionCanSave,
+	sessionDirty,
+	sessionExitBlocked,
+} from "./editor-session-state";
+import {
+	captureEditorSnapshot,
+	computeEditorConflictDiff,
+	encodeEditorSnapshot,
+} from "./editor-worker-client";
+import { type MonacoDocumentStatus, MonacoEditor, type MonacoEditorHandle } from "./MonacoEditor";
+import { MonacoSearchPanel } from "./MonacoSearchPanel";
+import { monacoHostVisible } from "./monaco-scroll";
+import { type EditorState, isDirty, reloaded } from "./save-state";
 
 const DiffView = lazy(() => import("../DiffView").then((m) => ({ default: m.DiffView })));
 const FileEditorPreview = lazy(() =>
 	import("./FileEditorPreview").then((m) => ({ default: m.FileEditorPreview })),
 );
-
-/** Match CodeMirror's document newlines without changing the server's byte hash or encoding. */
-function editorText(content: string): string {
-	return content.replace(/\r\n?/g, "\n");
-}
+const PREVIEW_BYTES = 1024 * 1024;
+// Both conflict inputs are bounded prefixes; even the small diff is computed in a Worker.
+const CONFLICT_DIFF_CHARS = 32 * 1024;
 
 export interface FileEditorContentProps {
-	/** Absolute path of the file being edited. */
 	filePath: string;
-	/** Narrator whose workspace bounds the write. Required by the server. */
+	/** Actual source narrator; the dock host is not a filesystem authority. */
 	narratorId?: string;
 	deviceId?: string;
 	referenceOrigin?: boolean;
 	selection?: FileSelection;
 	navigationRequestId?: string;
-	/** Only direct editor selection events may take ownership; metadata refreshes may not. */
 	onFileReferenceSelectionChange?: (
 		selection: FileReferenceEditorSelection | null,
 		takeOwnership?: boolean,
 	) => void;
-	/**
-	 * Reports whether closing would be unsafe: the buffer differs from disk or
-	 * a write is still in flight (even if the user undid back to the old baseline).
-	 *
-	 * The buffer lives only in this component's state, so unmounting the editor
-	 * destroys it. The owner needs to know before it does that.
-	 */
 	onDirtyChange?: (dirty: boolean) => void;
 }
 
-/**
- * Turn a load failure into something the reader can act on.
- *
- * The two refusals that matter are not errors in the file's content but statements
- * about what this editor can do: a binary file cannot round-trip through text, and a
- * file over the cap cannot be loaded in full — so saving it would truncate it. Both
- * arrive with a machine-readable `code`, and both deserve an explanation rather than
- * the server's English sentence, because they are the answer to "why can I not edit
- * this" rather than a fault.
- */
-function describeLoadError(err: unknown, t: (key: string) => string): string {
-	if (err instanceof ApiError) {
-		const code = (err.data as { code?: unknown } | undefined)?.code;
-		if (code === "BINARY") return t("fileEditor.binaryNotEditable");
-		if (code === "TOO_LARGE_TO_EDIT") return t("fileEditor.tooLargeToEdit");
-	}
-	return err instanceof Error ? err.message : String(err);
-}
-
-/** Only a known saved version can back #selection; dirty remains explicit metadata. */
+/** Compatibility for reference consumers; mutable text is no longer part of this component's state. */
 export function fileEditorReferenceSelection(
 	state: EditorState | null,
 	deviceId: string,
@@ -131,7 +91,17 @@ export function fileEditorReferenceSelection(
 	};
 }
 
-export function FileEditorContent({
+/** Identity changes dispose the old session; navigation/visibility never replace its model. */
+export function FileEditorContent(props: FileEditorContentProps) {
+	return (
+		<FileEditorDocument
+			key={JSON.stringify([props.narratorId, props.deviceId ?? "local", props.filePath])}
+			{...props}
+		/>
+	);
+}
+
+function FileEditorDocument({
 	filePath,
 	narratorId,
 	deviceId = "local",
@@ -146,240 +116,184 @@ export function FileEditorContent({
 	tRef.current = t;
 	const scope = useFileReferenceScope();
 	const publishSelection = onFileReferenceSelectionChange ?? scope.setSelection;
+	const origin = useRef(referenceOrigin);
+	origin.current = referenceOrigin;
+	const editorRef = useRef<MonacoEditorHandle | null>(null);
+	const [editor, setEditor] = useState<ReturnType<MonacoEditorHandle["getEditor"]>>(null);
+	// This seed changes ONLY before the first model is ready. Reload uses setValue once.
+	const initialValue = useRef("");
+	const documentKey = useRef(JSON.stringify([narratorId, deviceId, filePath]));
+	const [state, setState] = useState<EditorSessionState | null>(null);
+	const [history, setHistory] = useState<MonacoDocumentStatus | null>(null);
+	const [editorError, setEditorError] = useState<string | null>(null);
 	const [editorSelection, setEditorSelection] = useState<FileSelection | null>(null);
-	const loadControllerRef = useRef<AbortController | null>(null);
-	// Upgrading a reused panel to a reference must not reload its dirty editor.
-	// The next explicit load still uses the latest scoped/legacy reader policy.
-	const referenceOriginRef = useRef(referenceOrigin);
-	referenceOriginRef.current = referenceOrigin;
-	const [state, renderState] = useState<EditorState | null>(null);
-	const stateRef = useRef<EditorState | null>(null);
-	const setState = useCallback(
-		(next: EditorState | null | ((previous: EditorState | null) => EditorState | null)) => {
-			stateRef.current = typeof next === "function" ? next(stateRef.current) : next;
-			renderState(stateRef.current);
-		},
-		[],
-	);
-	const [loadError, setLoadError] = useState<string | null>(null);
-	const [loading, setLoading] = useState(true);
 	const [lineWrapping, setLineWrapping] = useState(false);
-	const [searchRequestId, setSearchRequestId] = useState(0);
+	const [searchOpen, setSearchOpen] = useState(false);
 	const [mode, setMode] = useState<FileViewerMode>("raw");
-	// A line reference starts in source, but never removes the preview switch.
-	const modes = useMemo(() => availableModes(filePath), [filePath]);
-	const navigationKey = JSON.stringify([deviceId, filePath, navigationRequestId, selection]);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: only a new navigation request returns to source, never typing or an equivalent selection object.
-	useEffect(() => {
-		setMode("raw");
-	}, [navigationKey]);
+	const [previewText, setPreviewText] = useState<string | null>(null);
+	const [previewError, setPreviewError] = useState<string | null>(null);
+	const previewController = useRef<AbortController | null>(null);
+	const [conflictDiff, setConflictDiff] = useState<{
+		lines: readonly DiffLine[];
+		truncated: boolean;
+	} | null>(null);
+	const [conflictError, setConflictError] = useState<string | null>(null);
+	const [conflictRetry, setConflictRetry] = useState(0);
+	const [downloadingConflict, setDownloadingConflict] = useState(false);
+	const downloadController = useRef<AbortController | null>(null);
 	const readOnly = deviceId !== "local" || !narratorId;
-	const phrases = useMemo(
-		() => t("fileEditor.searchPhrases", { returnObjects: true }) as Record<string, string>,
-		[t],
+	const modes = useMemo(() => availableModes(filePath), [filePath]);
+	const session = useMemo(
+		() =>
+			new EditorDocumentSession({
+				narratorId: narratorId ?? "",
+				path: filePath,
+				deviceId,
+				origin: () => (origin.current ? "reference" : "legacy"),
+				snapshot: () => {
+					const model = editorRef.current?.getModel();
+					if (!model) throw new Error("Editor is not ready");
+					return captureEditorSnapshot(model);
+				},
+				encode: encodeEditorSnapshot,
+				translate: (key, defaultValue) => tRef.current(`fileEditor.${key}`, { defaultValue }),
+				applyContent: (text, document) => {
+					const model = editorRef.current?.getModel();
+					setEditorSelection(null);
+					setPreviewText(null);
+					setMode("raw");
+					if (!model) {
+						if (document)
+							documentKey.current = JSON.stringify([
+								narratorId,
+								document.target.deviceId,
+								document.target.path,
+							]);
+						initialValue.current = text;
+						return null;
+					}
+					model.setValue(text);
+					return {
+						revision: model.getVersionId(),
+						alternativeVersionId: model.getAlternativeVersionId(),
+						length: model.getValueLength(),
+					};
+				},
+				onChange: setState,
+				...(readOnly
+					? {
+							readOnlySource: async (signal: AbortSignal) => {
+								const boundedSignal = AbortSignal.any([
+									signal,
+									AbortSignal.timeout(FILE_REFERENCE_READ_TIMEOUT_MS),
+								]);
+								if ((origin.current || deviceId !== "local") && !narratorId)
+									throw new Error(tRef.current("fileEditor.missingContext"));
+								if (deviceId !== "local")
+									return fileReferenceApi.preview(
+										narratorId as string,
+										{ deviceId, path: filePath },
+										boundedSignal,
+									);
+								return request<{ content: string; encoding: string; hash: string }>(
+									`/fs/edit-source?path=${encodeURIComponent(filePath)}`,
+									{ signal: boundedSignal },
+								);
+							},
+						}
+					: {}),
+			}),
+		[deviceId, filePath, narratorId, readOnly],
 	);
-	/**
-	 * The file's encoding, echoed back on every save.
-	 *
-	 * Held outside `EditorState` because it is a property of the FILE rather than of the
-	 * edit: it survives conflict resolution and a reload, and none of the state
-	 * transitions have any business changing it.
-	 */
-	const [encoding, setEncoding] = useState<string>("utf-8");
-	/**
-	 * In-flight guard, held in a ref rather than read from `state.saving`.
-	 *
-	 * `handleSave` closes over `state`, and `beginSave`'s `setState` does not update that
-	 * closure. Two Ctrl+S presses inside one React batch therefore both see
-	 * `saving: false` and both fire — two requests carrying the same `baseHash`, so the
-	 * optimistic lock cannot separate them and whichever lands second overwrites the
-	 * first with content the user may have already changed. A ref flips synchronously,
-	 * which is what a mutual exclusion needs to be.
-	 */
-	const savingRef = useRef(false);
-
-	const load = useCallback(async () => {
-		if (savingRef.current) return;
-		if (
-			stateRef.current &&
-			isDirty(stateRef.current) &&
-			!window.confirm(tRef.current("fileEditor.confirmReload"))
-		)
-			return;
-		const bufferAtStart = stateRef.current?.buffer;
-		loadControllerRef.current?.abort();
-		const controller = new AbortController();
-		loadControllerRef.current = controller;
-		const timeout = setTimeout(() => controller.abort(), FILE_REFERENCE_READ_TIMEOUT_MS);
-		setLoadError(null);
-		setLoading(true);
-		try {
-			// Scoped/remote identities must never fall back to the local filesystem.
-			if ((referenceOriginRef.current || deviceId !== "local") && !narratorId)
-				throw new Error(tRef.current("fileEditor.missingContext"));
-			// Both readers return server-decoded text, hash and encoding together.
-			const res =
-				referenceOriginRef.current || deviceId !== "local"
-					? await fileReferenceApi.preview(
-							narratorId as string,
-							{ deviceId, path: filePath },
-							controller.signal,
-						)
-					: await request<{ content: string; encoding: string; hash: string }>(
-							`/fs/edit-source?path=${encodeURIComponent(filePath)}`,
-							{ signal: controller.signal },
-						);
-			if (loadControllerRef.current !== controller) return;
-			// An edit made while the read was pending must never be replaced by its reply.
-			if (stateRef.current?.buffer !== bufferAtStart)
-				throw new Error(tRef.current("fileEditor.changedDuringReload"));
-			setEncoding(res.encoding);
-			// Preview preserves source newlines; both initial load and reload need the
-			// same LF baseline as the editor, not a synthetic unsaved conversion.
-			setState(initialEditorState(editorText(res.content), res.hash));
-		} catch (err) {
-			if (loadControllerRef.current === controller)
-				setLoadError(describeLoadError(err, tRef.current));
-		} finally {
-			clearTimeout(timeout);
-			if (loadControllerRef.current === controller) setLoading(false);
-		}
-	}, [deviceId, filePath, narratorId, setState]);
 
 	useEffect(() => {
-		void load();
+		session.activate();
+		void session.load();
 		return () => {
-			loadControllerRef.current?.abort();
-			loadControllerRef.current = null;
+			previewController.current?.abort();
+			session.dispose();
 		};
-	}, [load]);
-
-	/**
-	 * Send the buffer.
-	 *
-	 * `confirmOutsideRoots` is only ever true on the second attempt, after the user read
-	 * the resolved path and accepted it — the first attempt must be the one that gets
-	 * refused, because the refusal is what produces the path to show.
-	 */
-	const performSave = useCallback(
-		async (confirmOutsideRoots: boolean) => {
-			const current = stateRef.current;
-			if (!current || savingRef.current || loading || readOnly || !narratorId) return;
-
-			const sending = current.buffer;
-			savingRef.current = true;
-			setState((prev) => (prev ? beginSave(prev) : prev));
-			try {
-				const result = await api.fsWrite({
-					path: filePath,
-					content: sending,
-					narratorId,
-					baseHash: current.baseHash,
-					// Echoed, never re-derived: the encoding belongs to the file, and letting the
-					// server sniff the NEW text could convert the file because the replacement
-					// content happened to sniff differently.
-					encoding,
-					// Tell the narrator a person edited the file. Without this the agent's next
-					// turn reads a file it believes it last wrote, and the human edit looks like
-					// an anonymous external change in the modification view.
-					notifyAgent: true,
-					...(confirmOutsideRoots ? { confirmOutsideRoots: true } : {}),
+	}, [session]);
+	const load = () => {
+		if (session.state.phase !== "idle") return;
+		if (sessionDirty(session.state) && !window.confirm(tRef.current("fileEditor.confirmReload")))
+			return;
+		previewController.current?.abort();
+		void session.load();
+	};
+	const handleReady = useCallback(
+		(handle: MonacoEditorHandle | null) => {
+			editorRef.current = handle;
+			setEditor(handle?.getEditor() ?? null);
+			const model = handle?.getModel();
+			if (model)
+				session.change({
+					revision: model.getVersionId(),
+					alternativeVersionId: model.getAlternativeVersionId(),
+					length: model.getValueLength(),
 				});
-				setState((prev) => (prev ? saveSucceeded(prev, sending, result.hash) : prev));
-			} catch (err) {
-				// 409 covers TWO different outcomes, and treating them alike is what made the
-				// confirmation flow unreachable: a stale lock carries the winning content and
-				// needs the diff UI, while an outside-roots refusal carries a physical path and
-				// needs an acknowledgement. Dispatch on `code`, not on the status.
-				if (err instanceof ApiError && err.status === 409) {
-					const data = err.data as
-						| {
-								code?: string;
-								currentContent?: string;
-								currentHash?: string;
-								physicalPath?: string;
-								error?: string;
-						  }
-						| undefined;
-					if (data?.code === "NEEDS_CONFIRMATION" && typeof data.physicalPath === "string") {
-						setState((prev) =>
-							prev
-								? saveNeedsConfirmation(
-										prev,
-										data.physicalPath as string,
-										data.error ?? t("fileEditor.outsideWorkspaceBody"),
-									)
-								: prev,
-						);
-						return;
-					}
-					if (typeof data?.currentContent === "string" && data.currentHash) {
-						setState((prev) =>
-							prev
-								? saveConflicted(
-										prev,
-										editorText(data.currentContent as string),
-										data.currentHash as string,
-									)
-								: prev,
-						);
-						return;
-					}
-				}
-				setState((prev) =>
-					prev ? saveFailed(prev, err instanceof Error ? err.message : String(err)) : prev,
-				);
-			} finally {
-				// Released in `finally`, not after the success path: an early `return` from a
-				// 409 branch would otherwise leave the guard latched and the editor unable to
-				// save again for the rest of its life.
-				savingRef.current = false;
-			}
 		},
-		[encoding, filePath, narratorId, loading, readOnly, t, setState],
+		[session],
 	);
-
-	const handleSave = useCallback(() => {
-		if (!stateRef.current || !canSave(stateRef.current)) return;
-		void performSave(false);
-	}, [performSave]);
-
 	const handleChange = useCallback(
-		(buffer: string) => {
-			// Ctrl+S can arrive before React commits the input render. Publish the
-			// new buffer synchronously so saving never sends the previous keystroke.
-			if (!stateRef.current) return;
-			setState(applyEdit(stateRef.current, buffer));
+		(status: MonacoDocumentStatus) => {
+			session.change(status);
+			setHistory(status);
 		},
-		[setState],
+		[session],
 	);
-	const handleSelectionChange = useCallback(
-		(next: FileSelection | null, selectionSet: boolean) => {
-			// Publish explicit selection transactions even when the range is unchanged:
-			// another panel may have acquired ownership. Document-only updates use the
-			// metadata effect below and must not acquire ownership (e.g. reload).
-			if (selectionSet)
+	const handleSave = useCallback(() => {
+		if (!readOnly) void session.save();
+	}, [session, readOnly]);
+	const openSearch = useCallback(() => {
+		setMode("raw");
+		setSearchOpen(true);
+	}, []);
+	const handleSelection = useCallback(
+		(next: FileSelection | null, explicit: boolean) => {
+			if (explicit)
 				publishSelection?.(
-					fileEditorReferenceSelection(stateRef.current, deviceId, filePath, next),
+					session.state.baseHash && next
+						? {
+								target: { deviceId, path: filePath, selection: next },
+								label: filePanelBaseName(filePath),
+								expectedHash: session.state.baseHash,
+								dirty: sessionDirty(session.state),
+							}
+						: null,
 					true,
 				);
-			setEditorSelection((previous) =>
-				previous?.startLineNumber === next?.startLineNumber &&
-				previous?.startColumn === next?.startColumn &&
-				previous?.endLineNumber === next?.endLineNumber &&
-				previous?.endColumn === next?.endColumn
-					? previous
+			setEditorSelection((old) =>
+				old?.startLineNumber === next?.startLineNumber &&
+				old?.startColumn === next?.startColumn &&
+				old?.endLineNumber === next?.endLineNumber &&
+				old?.endColumn === next?.endColumn
+					? old
 					: next,
 			);
 		},
-		[deviceId, filePath, publishSelection],
+		[deviceId, filePath, publishSelection, session],
 	);
-
-	// Computed before the early returns below so the hook order stays fixed; the
-	// render path re-reads it once `state` is known to be non-null.
-	const dirty = state ? isDirty(state) : false;
-	const exitBlocked = dirty || !!state?.saving;
+	const dirty = state ? sessionDirty(state) : false;
+	const exitBlocked = state ? sessionExitBlocked(state) : false;
 	const baseHash = state?.baseHash;
+	const revision = state?.version?.revision;
+	const phase = state?.phase;
+	// A quiet-window equivalence check is not part of the keystroke path. Undo to the
+	// known alternativeVersionId is immediate; equal text with different history is verified.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: any new revision or baseline cancels and restarts the quiet window
+	useEffect(() => {
+		if (!dirty || phase !== "idle" || readOnly) return;
+		const controller = new AbortController();
+		const timer = setTimeout(() => {
+			const host = editorRef.current?.getEditor()?.getDomNode?.();
+			if (host && monacoHostVisible(host)) void session.verifyEquivalent(controller.signal);
+		}, 750);
+		return () => {
+			clearTimeout(timer);
+			controller.abort();
+		};
+	}, [dirty, phase, readOnly, session, revision, baseHash]);
 	useEffect(() => {
 		publishSelection?.(
 			baseHash && editorSelection
@@ -391,56 +305,131 @@ export function FileEditorContent({
 					}
 				: null,
 		);
-	}, [deviceId, filePath, editorSelection, baseHash, dirty, publishSelection]);
+	}, [baseHash, deviceId, dirty, editorSelection, filePath, publishSelection]);
+	useEffect(() => () => publishSelection?.(null), [publishSelection]);
+	useEffect(() => {
+		onDirtyChange?.(exitBlocked);
+	}, [exitBlocked, onDirtyChange]);
+	useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
 	useEffect(() => {
 		const beforeUnload = (event: BeforeUnloadEvent) => {
-			if (!savingRef.current && (!stateRef.current || !isDirty(stateRef.current))) return;
+			if (!sessionExitBlocked(session.state)) return;
 			event.preventDefault();
 			event.returnValue = "";
 		};
 		window.addEventListener("beforeunload", beforeUnload);
 		return () => window.removeEventListener("beforeunload", beforeUnload);
-	}, []);
-	useEffect(() => () => publishSelection?.(null), [publishSelection]);
+	}, [session]);
+	const navigationKey = JSON.stringify([deviceId, filePath, navigationRequestId, selection]);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: only explicit navigation returns to source
 	useEffect(() => {
-		onDirtyChange?.(exitBlocked);
-	}, [exitBlocked, onDirtyChange]);
-	useEffect(
-		() => () => {
-			// On unmount the buffer is gone, so nothing is dirty any more — leaving the
-			// flag set would keep the owner refusing an action there is no longer a
-			// reason to refuse.
-			onDirtyChange?.(false);
-		},
-		[onDirtyChange],
-	);
+		setMode("raw");
+	}, [navigationKey]);
+	useEffect(() => {
+		if (mode === "raw") {
+			previewController.current?.abort();
+			setPreviewText(null);
+		}
+	}, [mode]);
+	const switchMode = async (next: FileViewerMode) => {
+		previewController.current?.abort();
+		setMode(next);
+		setPreviewText(null);
+		setPreviewError(null);
+		if (next === "raw") return;
+		setSearchOpen(false);
+		const model = editorRef.current?.getModel();
+		if (!model) return;
+		// No snapshot/full-text work until the user explicitly requests a preview.
+		if (model.getValueLength() > PREVIEW_BYTES) {
+			setPreviewError(tRef.current("fileEditor.previewTooLarge"));
+			return;
+		}
+		const controller = new AbortController();
+		previewController.current = controller;
+		try {
+			const blob = await encodeEditorSnapshot(captureEditorSnapshot(model), controller.signal);
+			if (blob.size > PREVIEW_BYTES) throw new Error(tRef.current("fileEditor.previewTooLarge"));
+			const text = await blob.text();
+			controller.signal.throwIfAborted();
+			setPreviewText(text);
+		} catch (error) {
+			if (!controller.signal.aborted)
+				setPreviewError(error instanceof Error ? error.message : String(error));
+		}
+	};
+	const conflict = state?.conflict;
+	// biome-ignore lint/correctness/useExhaustiveDependencies: retry is an explicit bounded conflict-read request
+	useEffect(() => {
+		setConflictDiff(null);
+		setConflictError(null);
+		const model = editorRef.current?.getModel();
+		if (!conflict || !model) return;
+		const controller = new AbortController();
+		// This is a bounded display prefix, NEVER an editable or saveable document.
+		const snapshot = captureEditorSnapshot(model);
+		let mine = "";
+		while (mine.length < CONFLICT_DIFF_CHARS) {
+			const chunk = snapshot.read();
+			if (chunk === null) break;
+			mine += chunk.slice(0, CONFLICT_DIFF_CHARS - mine.length);
+		}
+		void session
+			.conflictPreview(controller.signal)
+			.then(async (theirs) => {
+				const diff = await computeEditorConflictDiff(theirs.content, mine, controller.signal);
+				if (!controller.signal.aborted)
+					setConflictDiff({
+						lines: diff.lines,
+						truncated: diff.truncated || theirs.truncated || snapshot.length > CONFLICT_DIFF_CHARS,
+					});
+			})
+			.catch((error) => {
+				if (!controller.signal.aborted)
+					setConflictError(error instanceof Error ? error.message : String(error));
+			});
+		return () => controller.abort();
+	}, [conflict, session, conflictRetry]);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: changing conflict identity cancels its old download
+	useEffect(() => {
+		setDownloadingConflict(false);
+		return () => downloadController.current?.abort();
+	}, [conflict]);
+	const downloadConflict = async () => {
+		downloadController.current?.abort();
+		const controller = new AbortController();
+		downloadController.current = controller;
+		setDownloadingConflict(true);
+		try {
+			const blob = await session.conflictDownload(controller.signal);
+			controller.signal.throwIfAborted();
+			saveBlobAsFile(blob, `${filePanelBaseName(filePath)}.conflict.utf8.txt`);
+		} catch (error) {
+			if (!controller.signal.aborted)
+				setConflictError(error instanceof Error ? error.message : String(error));
+		} finally {
+			if (!controller.signal.aborted) setDownloadingConflict(false);
+		}
+	};
 
-	if (loadError && !state) {
+	if (!state?.loaded)
 		return (
 			<Center h="100%" p="md">
-				<Group gap="xs" wrap="nowrap">
-					<IconAlertTriangle size={16} color="var(--mantine-color-orange-6)" />
-					<Text size="sm" c="dimmed">
-						{loadError}
-					</Text>
-					<Tooltip label={t("fileTree.retry")} openDelay={200}>
-						<ActionIcon variant="subtle" size="sm" onClick={() => void load()}>
-							<IconRefresh size={14} />
-						</ActionIcon>
-					</Tooltip>
-				</Group>
+				{state?.error ? (
+					<Group gap="xs">
+						<Text size="sm" c="red">
+							{state.error}
+						</Text>
+						<Button size="xs" onClick={load}>
+							{t("fileTree.retry")}
+						</Button>
+					</Group>
+				) : (
+					<Loader size="sm" />
+				)}
 			</Center>
 		);
-	}
-
-	if (!state) {
-		return (
-			<Center h="100%">
-				<Loader size="sm" />
-			</Center>
-		);
-	}
-
+	const saving = state.phase !== "idle" && state.phase !== "unknown";
 	return (
 		<Box
 			style={{ height: "100%", display: "flex", flexDirection: "column" }}
@@ -472,22 +461,41 @@ export function FileEditorContent({
 							{t("fileEditor.unsaved")}
 						</Badge>
 					)}
-					{(state.error || loadError) && (
-						<Text size="xs" c="red" truncate title={state.error ?? loadError ?? undefined}>
-							{state.error || loadError}
+					{(state.error || editorError) && (
+						<Text size="xs" c="red" truncate title={state.error ?? editorError ?? undefined}>
+							{state.error || editorError}
 						</Text>
 					)}
 				</Group>
 				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+					<Tooltip label={`${t("fileEditor.undo")} (Ctrl/Cmd+Z)`} openDelay={200}>
+						<ActionIcon
+							variant="subtle"
+							size="sm"
+							aria-label={t("fileEditor.undo")}
+							disabled={readOnly || state.loading || mode !== "raw" || !history?.canUndo}
+							onClick={() => editorRef.current?.undo()}
+						>
+							<IconArrowBackUp size={14} />
+						</ActionIcon>
+					</Tooltip>
+					<Tooltip label={`${t("fileEditor.redo")} (Ctrl/Cmd+Shift+Z)`} openDelay={200}>
+						<ActionIcon
+							variant="subtle"
+							size="sm"
+							aria-label={t("fileEditor.redo")}
+							disabled={readOnly || state.loading || mode !== "raw" || !history?.canRedo}
+							onClick={() => editorRef.current?.redo()}
+						>
+							<IconArrowForwardUp size={14} />
+						</ActionIcon>
+					</Tooltip>
 					<Tooltip label={`${t("fileEditor.search")} (Ctrl/Cmd+F)`} openDelay={200}>
 						<ActionIcon
 							variant="subtle"
 							size="sm"
 							aria-label={t("fileEditor.search")}
-							onClick={() => {
-								setMode("raw");
-								setSearchRequestId((id) => id + 1);
-							}}
+							onClick={openSearch}
 						>
 							<IconSearch size={14} />
 						</ActionIcon>
@@ -498,8 +506,8 @@ export function FileEditorContent({
 							size="sm"
 							aria-label={t("fileEditor.wrap")}
 							aria-pressed={lineWrapping}
-							disabled={mode !== "raw"}
-							onClick={() => setLineWrapping((enabled) => !enabled)}
+							disabled={mode !== "raw" || history?.longLine}
+							onClick={() => setLineWrapping((old) => !old)}
 						>
 							<IconTextWrap size={14} />
 						</ActionIcon>
@@ -509,10 +517,10 @@ export function FileEditorContent({
 							variant="subtle"
 							color="gray"
 							size="sm"
-							onClick={() => void load()}
 							aria-label={t("fileEditor.reload")}
-							loading={loading}
-							disabled={state.saving || loading}
+							onClick={load}
+							loading={state.loading}
+							disabled={state.phase !== "idle" || state.loading}
 						>
 							<IconRefresh size={14} />
 						</ActionIcon>
@@ -523,10 +531,10 @@ export function FileEditorContent({
 								variant={dirty ? "filled" : "subtle"}
 								color={dirty ? "green" : "gray"}
 								size="sm"
-								onClick={handleSave}
 								aria-label={t("fileEditor.save")}
-								loading={state.saving}
-								disabled={loading || !canSave(state)}
+								onClick={handleSave}
+								loading={saving}
+								disabled={!editor || !sessionCanSave(state)}
 							>
 								<IconDeviceFloppy size={14} />
 							</ActionIcon>
@@ -534,13 +542,34 @@ export function FileEditorContent({
 					)}
 				</Group>
 			</Group>
-
+			{deviceId !== "local" && (
+				<Text size="xs" c="dimmed" px="xs">
+					{t("fileEditor.remoteBudget", {
+						defaultValue: "Remote files are read-only and use the existing 1 MiB preview limit.",
+					})}
+				</Text>
+			)}
+			{history?.longLine && (
+				<Text size="xs" c="yellow" px="xs">
+					{t("fileEditor.longLine", {
+						defaultValue:
+							"Long-line highlighting and wrapping are limited; the full text remains editable and saveable.",
+					})}
+				</Text>
+			)}
+			{history?.languageSupported === false && (
+				<Text size="xs" c="yellow" px="xs">
+					{t("fileEditor.languageUnavailable", {
+						defaultValue: "Syntax highlighting is unavailable for this language.",
+					})}
+				</Text>
+			)}
 			{modes.length > 1 && (
 				<Box px="xs" pb={6} style={{ flexShrink: 0 }}>
 					<SegmentedControl
 						size="xs"
 						value={mode}
-						onChange={(value) => setMode(value as FileViewerMode)}
+						onChange={(value) => void switchMode(value as FileViewerMode)}
 						data={["raw" as const, ...modes.filter((value) => value !== "raw")].map((value) => ({
 							value,
 							label:
@@ -551,7 +580,31 @@ export function FileEditorContent({
 					/>
 				</Box>
 			)}
-
+			{saving && (
+				<Group px="xs" pb="xs">
+					<Text size="xs">
+						{t("fileEditor.saveTask", {
+							defaultValue: "Saving an immutable snapshot; you may continue editing.",
+						})}
+					</Text>
+					<Button size="xs" variant="default" onClick={() => session.cancel()}>
+						{t("fileEditor.cancelTask", { defaultValue: "Cancel task" })}
+					</Button>
+				</Group>
+			)}
+			{state.phase === "unknown" && (
+				<Alert color="yellow" radius={0}>
+					<Text size="xs">
+						{t("fileEditor.unknownSave", {
+							defaultValue:
+								"The save result needs verification. Your draft is retained; another save is blocked.",
+						})}
+					</Text>
+					<Button size="xs" onClick={() => void session.reconcile()}>
+						{t("fileEditor.checkSave", { defaultValue: "Check save result" })}
+					</Button>
+				</Alert>
+			)}
 			{state.confirmation && (
 				<Alert
 					color="yellow"
@@ -560,11 +613,8 @@ export function FileEditorContent({
 					radius={0}
 				>
 					<Text size="xs" mb="xs">
-						{state.confirmation.message}
+						{t("fileEditor.outsideWorkspaceBody")}
 					</Text>
-					{/* The RESOLVED path, which is the only thing worth confirming: it differs
-					    from the path the user typed exactly when a link redirected the write,
-					    and that is the case where consent must not be based on appearances. */}
 					<Text size="xs" ff="monospace" mb="xs" style={{ wordBreak: "break-all" }}>
 						{state.confirmation.physicalPath}
 					</Text>
@@ -572,25 +622,18 @@ export function FileEditorContent({
 						<Button
 							size="xs"
 							color="yellow"
-							onClick={() => void performSave(true)}
-							loading={state.saving}
+							disabled={state.loading}
+							onClick={() => void session.confirm()}
 						>
 							{t("fileEditor.outsideWorkspaceConfirm")}
 						</Button>
-						<Button
-							size="xs"
-							variant="default"
-							onClick={() => {
-								setState((prev) => (prev ? dismissConfirmation(prev) : prev));
-							}}
-						>
+						<Button size="xs" variant="default" onClick={() => session.cancel()}>
 							{t("fileEditor.outsideWorkspaceCancel")}
 						</Button>
 					</Group>
 				</Alert>
 			)}
-
-			{state.conflict && (
+			{conflict && (
 				<Alert
 					color="orange"
 					icon={<IconAlertTriangle size={16} />}
@@ -600,34 +643,69 @@ export function FileEditorContent({
 					<Text size="xs" mb="xs">
 						{t("fileEditor.conflictBody")}
 					</Text>
-					{/* The difference is shown BEFORE either choice is offered: "keep mine"
-					    advances the optimistic lock, so it must not be reachable without the
-					    user having seen what it would overwrite. */}
-					<Box mb="xs" style={{ maxHeight: 240, overflow: "auto" }}>
-						<Suspense fallback={<Loader size="xs" />}>
-							<DiffView
-								oldStr={state.conflict.theirContent}
-								newStr={state.buffer}
-								language={getShikiLang(filePath)}
-								maxHeight={240}
-							/>
-						</Suspense>
-					</Box>
+					{conflictDiff ? (
+						<Box mb="xs" style={{ maxHeight: 240, overflow: "auto" }}>
+							<Suspense fallback={<Loader size="xs" />}>
+								<DiffView
+									lines={conflictDiff.lines}
+									language={getShikiLang(filePath)}
+									maxHeight={240}
+								/>
+							</Suspense>
+						</Box>
+					) : conflictError ? (
+						<Text size="xs" c="red">
+							{conflictError}
+						</Text>
+					) : (
+						<Loader size="xs" />
+					)}
+					{conflictDiff?.truncated && (
+						<Text size="xs" mb="xs">
+							{t("fileEditor.conflictDiffLimited", {
+								defaultValue:
+									"This is a partial conflict preview (up to 32 Ki characters per side). Download the full immutable disk version to inspect the remainder; saving never uses this truncated preview.",
+							})}
+						</Text>
+					)}
+					<Text size="xs" mb="xs">
+						{t("fileEditor.conflictSnapshot", {
+							defaultValue:
+								"This comparison is a fixed snapshot. Keeping mine retains your current draft and permits replacing this disk version.",
+						})}
+					</Text>
 					<Group gap="xs">
 						<Button
 							size="xs"
+							variant="default"
+							onClick={() => setConflictRetry((value) => value + 1)}
+						>
+							{t("fileTree.retry")}
+						</Button>
+						<Button
+							size="xs"
+							variant="default"
+							loading={downloadingConflict}
+							onClick={() => void downloadConflict()}
+						>
+							{t("fileEditor.downloadConflict", {
+								defaultValue: "Download full conflict version (UTF-8)",
+							})}
+						</Button>
+						<Button
+							size="xs"
 							color="orange"
-							onClick={() => {
-								setState((prev) => (prev ? resolveConflictKeepingMine(prev) : prev));
-							}}
+							disabled={state.loading || !conflictDiff}
+							onClick={() => session.keepMine()}
 						>
 							{t("fileEditor.conflictKeepMine")}
 						</Button>
 						<Button
 							size="xs"
 							variant="default"
+							loading={state.loading}
 							onClick={() => {
-								setState((prev) => (prev ? resolveConflictTakingTheirs(prev) : prev));
+								if (window.confirm(t("fileEditor.confirmReload"))) void session.takeTheirs();
 							}}
 						>
 							{t("fileEditor.conflictTakeTheirs")}
@@ -635,9 +713,15 @@ export function FileEditorContent({
 					</Group>
 				</Alert>
 			)}
-
+			{searchOpen && mode === "raw" && editor && (
+				<MonacoSearchPanel
+					editor={editor}
+					readOnly={readOnly || state.loading}
+					onSave={handleSave}
+					onClose={() => setSearchOpen(false)}
+				/>
+			)}
 			<Box style={{ flex: 1, minHeight: 0, position: "relative" }}>
-				{/* Keep geometry as well as the instance: display:none resets browser scroll offsets. */}
 				<Box
 					data-file-editor-source
 					inert={mode !== "raw"}
@@ -645,22 +729,24 @@ export function FileEditorContent({
 					style={{
 						position: "absolute",
 						inset: 0,
-						visibility: mode === "raw" ? "visible" : "hidden",
+						visibility: mode === "raw" ? "inherit" : "hidden",
 					}}
 				>
-					<CodeMirrorEditor
-						value={state.buffer}
-						language={getShikiLang(filePath)}
-						onChange={handleChange}
+					<MonacoEditor
+						initialValue={initialValue.current}
+						documentKey={documentKey.current}
+						filePath={filePath}
+						onReady={handleReady}
+						onDocumentChange={handleChange}
+						onSelectionChange={handleSelection}
+						onSearchRequested={openSearch}
 						onSave={handleSave}
+						onError={(error) => setEditorError(error.message)}
 						selection={selection}
 						navigationRequestId={navigationRequestId}
-						onSelectionChange={handleSelectionChange}
-						readOnly={readOnly || loading}
+						readOnly={readOnly || state.loading}
 						lineWrapping={lineWrapping}
-						searchRequestId={searchRequestId}
-						phrases={phrases}
-						ariaLabel={filePath}
+						visible={mode === "raw"}
 					/>
 				</Box>
 				{mode !== "raw" && (
@@ -668,21 +754,31 @@ export function FileEditorContent({
 						data-file-editor-preview={mode}
 						style={{ position: "absolute", inset: 0, overflow: "auto" }}
 					>
-						<Suspense
-							fallback={
-								<Center p="md">
-									<Loader size="sm" />
-								</Center>
-							}
-						>
-							<FileEditorPreview
-								text={state.buffer}
-								mode={mode}
-								filePath={filePath}
-								deviceId={deviceId}
-								narratorId={narratorId}
-							/>
-						</Suspense>
+						{previewError ? (
+							<Text size="sm" c="yellow" p="md">
+								{previewError}
+							</Text>
+						) : previewText === null ? (
+							<Center p="md">
+								<Loader size="sm" />
+							</Center>
+						) : (
+							<Suspense
+								fallback={
+									<Center p="md">
+										<Loader size="sm" />
+									</Center>
+								}
+							>
+								<FileEditorPreview
+									text={previewText}
+									mode={mode}
+									filePath={filePath}
+									deviceId={deviceId}
+									narratorId={narratorId}
+								/>
+							</Suspense>
+						)}
 					</Box>
 				)}
 			</Box>
@@ -690,5 +786,4 @@ export function FileEditorContent({
 	);
 }
 
-/** Re-exported so the panel can reset the editor when the path changes. */
 export { reloaded };

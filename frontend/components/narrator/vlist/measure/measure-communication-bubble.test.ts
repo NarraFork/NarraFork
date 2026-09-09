@@ -119,6 +119,34 @@ describe("communication bubble geometry", () => {
 		expect(measured.usedWidth).toBeLessThan(900);
 	});
 
+	test("receipt arrival repaints a mounted recipient without changing its geometry", async () => {
+		const { measureElementCached } = await import("../registry");
+		const base = {
+			message: "hello",
+			status: "running",
+			recipients: [{ id: "child", label: "worker" }],
+		};
+		const measure = (data: unknown) =>
+			measureElementCached("communication-bubble", data, 500, 3, undefined, "receipt-cache-test");
+		const first = measure(base);
+		const received = {
+			...base,
+			recipients: [{ ...base.recipients[0], deliveryMessageId: "receipt" }],
+		};
+		const second = measure(received);
+		expect(second).not.toBe(first);
+		expect(second.height).toBe(first.height);
+		expect(measure(received)).toBe(second);
+		// Ordinary document rebuilds allocate new data/recipient objects. Value
+		// equality must still hit the cache so ExactRow can skip a repaint.
+		expect(
+			measure({
+				...received,
+				recipients: received.recipients.map((recipient) => ({ ...recipient })),
+			}),
+		).toBe(second);
+	});
+
 	test("cache invalidates body, truncation, and error without a status transition", async () => {
 		const { measureElementCached, VLIST_REGISTRY } = await import("../registry");
 		const data = { message: "short", status: "success" };

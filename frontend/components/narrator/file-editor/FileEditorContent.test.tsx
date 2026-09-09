@@ -1,17 +1,16 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
-import { undo, undoDepth } from "@codemirror/commands";
-import { getSearchQuery, SearchQuery, searchPanelOpen, setSearchQuery } from "@codemirror/search";
-import { EditorView, keymap } from "@codemirror/view";
 import { MantineProvider } from "@mantine/core";
+import type { EditorCommitResult, EditorDocumentDescriptor } from "@shared/editor-document";
 import type { FileReferenceEditorSelection, FileSelection } from "@shared/file-reference";
 import type { DockviewApi, IDockviewPanelProps, SerializedDockview } from "dockview-react";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
-import { act, useState } from "react";
+import { act, StrictMode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
 import { ApiError, api } from "../../../lib/api";
+import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import en from "../../../locales/en/narrator.json";
 import { createDetachedPanelDockValue } from "../../graph/dock/detached-panel-context";
@@ -31,13 +30,23 @@ import { FileDockPanel, useFilePanelSelectionPublisher } from "../dock/panels";
 import { type FilePanelOpener, useFilePanelSourceOpener } from "../file-panel-navigation";
 import { stripIdentityFromLayout, stripNavigationFromLayout } from "../panels/layout-envelope";
 import type { FilePanelParams } from "../panels/panel-kind";
-import { installCanvasStub } from "../vlist/measure/test-canvas-stub";
 import { WorkspaceDockStore } from "../workspace/workspace-dock";
+import * as snapshots from "./editor-worker-client";
 import { FileEditorContent, type FileEditorContentProps } from "./FileEditorContent";
-import { fileNavigationHighlight } from "./file-navigation-highlight";
+import {
+	mountedTestModels,
+	type TestEditorModel,
+	TestMonacoEditor,
+} from "./file-editor-test-model";
 
-// Mount the real FileEditorContent AND CodeMirrorEditor. Only I/O is stubbed;
-// the document normalization, external-value effects and callbacks are real.
+// Only the Monaco browser boundary/worker transport and I/O are mocked. The real
+// component, session controller, dock ownership and preview renderer run below.
+// Real Monaco tokenization/navigation/IME/search are covered by the Chromium fixture.
+import * as monacoComponent from "./MonacoEditor";
+import * as searchComponent from "./MonacoSearchPanel";
+
+const { installCanvasStub } = await import("../vlist/measure/test-canvas-stub");
+
 const i18n = i18next.createInstance();
 const originalGlobals = new Map<string, PropertyDescriptor | undefined>();
 let root: Root | undefined;
@@ -55,11 +64,28 @@ const source = Object.freeze({
 	encoding: "utf-16le",
 	hash: "raw-server-byte-hash",
 });
+const descriptor: EditorDocumentDescriptor = {
+	docId: "doc",
+	target: source.target,
+	versionHandle: "v1",
+	baseHash: source.hash,
+	encoding: source.encoding,
+	eol: "CRLF",
+	sourceBytes: 12,
+	utf8Bytes: 4,
+};
 let preview: ReturnType<typeof spyOn<typeof fileReferenceApi, "preview">>;
-let write: ReturnType<typeof spyOn<typeof api, "fsWrite">>;
+let create: ReturnType<typeof spyOn<typeof editorDocumentApi, "create">>;
+let read: ReturnType<typeof spyOn<typeof editorDocumentApi, "source">>;
+let beginUpload: ReturnType<typeof spyOn<typeof editorDocumentApi, "createUpload">>;
+let upload: ReturnType<typeof spyOn<typeof editorDocumentApi, "upload">>;
+let commit: ReturnType<typeof spyOn<typeof editorDocumentApi, "commit">>;
+let legacyWrite: ReturnType<typeof spyOn<typeof api, "fsWrite">>;
+const restores: (() => void)[] = [];
 const dirty = mock((_value: boolean) => {});
 const publish = mock((_value: FileReferenceEditorSelection | null) => {});
 const confirmReload = mock((_message: string) => true);
+let uploadedRevision = 0;
 
 beforeEach(async () => {
 	originalGlobals.set(
@@ -74,10 +100,6 @@ beforeEach(async () => {
 		configurable: true,
 		value() {},
 	});
-	// linkedom has no layout engine. Leave layout RAFs pending (and discard on
-	// teardown); CodeMirror document transactions and React effects run normally.
-	const frames = new Map<number, FrameRequestCallback>();
-	let nextFrame = 0;
 	const overrides = {
 		window,
 		confirm: confirmReload,
@@ -95,11 +117,8 @@ beforeEach(async () => {
 		},
 		Event: window.Event,
 		getSelection: () => null,
-		requestAnimationFrame: (callback: FrameRequestCallback) => {
-			frames.set(++nextFrame, callback);
-			return nextFrame;
-		},
-		cancelAnimationFrame: (id: number) => frames.delete(id),
+		requestAnimationFrame: () => 1,
+		cancelAnimationFrame: () => {},
 		getComputedStyle: () => ({ getPropertyValue: () => "", whiteSpace: "pre" }),
 		matchMedia: (media: string) => ({
 			media,
@@ -119,41 +138,86 @@ beforeEach(async () => {
 			resources: { en: { narrator: en } },
 			react: { useSuspense: false },
 		});
+	const monaco = spyOn(monacoComponent, "MonacoEditor").mockImplementation(TestMonacoEditor);
+	const search = spyOn(searchComponent, "MonacoSearchPanel").mockImplementation(({ readOnly }) => (
+		<div data-editor-search-panel data-read-only={readOnly} />
+	));
+	restores.push(
+		() => monaco.mockRestore(),
+		() => search.mockRestore(),
+	);
 	dirty.mockClear();
 	publish.mockClear();
 	confirmReload.mockReset();
 	confirmReload.mockReturnValue(true);
 	preview = spyOn(fileReferenceApi, "preview").mockResolvedValue(source);
-	write = spyOn(api, "fsWrite").mockResolvedValue({
-		ok: true,
-		path: source.target.path,
-		encoding: source.encoding,
-		hash: "saved-byte-hash",
-		bytesWritten: 12,
+	create = spyOn(editorDocumentApi, "create").mockImplementation(async (_narrator, input) => ({
+		...descriptor,
+		target: { deviceId: input.deviceId ?? "local", path: input.path },
+	}));
+	read = spyOn(editorDocumentApi, "source").mockResolvedValue("a\nb\n");
+	beginUpload = spyOn(editorDocumentApi, "createUpload").mockImplementation(
+		async (_narrator, _doc, input) => {
+			uploadedRevision = input.snapshotRevision;
+			return { uploadId: "upload", state: "uploading" };
+		},
+	);
+	upload = spyOn(editorDocumentApi, "upload").mockResolvedValue({
+		uploadId: "upload",
+		state: "sealed",
 	});
+	commit = spyOn(editorDocumentApi, "commit").mockImplementation(async () => ({
+		status: "saved",
+		operationId: "op",
+		hash: "saved-byte-hash",
+		bytes: 12,
+		snapshotRevision: uploadedRevision,
+	}));
+	legacyWrite = spyOn(api, "fsWrite").mockRejectedValue(new Error("Legacy writes are forbidden"));
+	const release = spyOn(editorDocumentApi, "release").mockResolvedValue({});
+	const cancel = spyOn(editorDocumentApi, "cancelUpload").mockResolvedValue({ state: "cancelled" });
+	const encoder = spyOn(snapshots, "encodeEditorSnapshot").mockImplementation(
+		async (snapshot, signal) => {
+			signal?.throwIfAborted();
+			const chunks: string[] = [];
+			for (let chunk = snapshot.read(); chunk !== null; chunk = snapshot.read()) chunks.push(chunk);
+			return new Blob(chunks);
+		},
+	);
+	for (const spy of [
+		preview,
+		create,
+		read,
+		beginUpload,
+		upload,
+		commit,
+		legacyWrite,
+		release,
+		cancel,
+		encoder,
+	])
+		restores.push(() => spy.mockRestore());
 	host = document.createElement("div");
 	document.body.appendChild(host);
 	root = createRoot(host);
 });
-
 afterEach(async () => {
 	try {
 		await act(async () => root?.unmount());
 		host?.remove();
 	} finally {
 		root = undefined;
-		preview?.mockRestore();
-		write?.mockRestore();
+		for (const restore of restores.splice(0)) restore();
 		for (const [key, descriptor] of originalGlobals) {
 			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 			else Reflect.deleteProperty(globalThis, key);
 		}
 		originalGlobals.clear();
+		mountedTestModels.clear();
 	}
 });
-
 async function mount(props: Partial<FileEditorContentProps> = {}) {
-	await act(async () => {
+	await act(async () =>
 		root?.render(
 			<I18nextProvider i18n={i18n}>
 				<MantineProvider env="test">
@@ -168,15 +232,54 @@ async function mount(props: Partial<FileEditorContentProps> = {}) {
 					/>
 				</MantineProvider>
 			</I18nextProvider>,
-		);
-	});
-	const element = host.querySelector<HTMLElement>(".cm-editor");
-	if (!element) throw new Error(`Editor missing: ${host.textContent}`);
-	const view = EditorView.findFromDOM(element);
-	if (!view) throw new Error("CodeMirror view missing");
-	return view;
+		),
+	);
+	const key = host.querySelector("[data-monaco-test-editor]")?.getAttribute("data-document-key");
+	const model = key ? mountedTestModels.get(key) : null;
+	if (!model) throw new Error(`Editor missing: ${host.textContent}`);
+	return model;
 }
-
+function iconButton(icon: string) {
+	const button = host.querySelector(`.tabler-icon-${icon}`)?.closest("button");
+	if (!button) throw new Error(`Missing ${icon} button`);
+	return button;
+}
+async function click(button: HTMLButtonElement) {
+	await act(async () => {
+		button.dispatchEvent(new Event("click", { bubbles: true }));
+	});
+}
+async function edit(model: TestEditorModel, text: string) {
+	await act(async () => {
+		model.edit(text);
+		model.select({ startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 2 });
+	});
+}
+function currentSelection() {
+	return publish.mock.calls.at(-1)?.[0];
+}
+function expectClean(hash: string, hasSelection = true) {
+	expect(dirty.mock.calls.at(-1)?.[0]).toBe(false);
+	expect(host.textContent).not.toContain(en["fileEditor.unsaved"]);
+	expect(iconButton("device-floppy").disabled).toBe(true);
+	if (hasSelection) expect(currentSelection()).toMatchObject({ expectedHash: hash, dirty: false });
+	else expect(currentSelection()).toBeNull();
+}
+async function switchFileMode(mode: "raw" | "preview" | "node") {
+	const input = host.querySelector<HTMLInputElement>(`input[type="radio"][value="${mode}"]`);
+	if (!input) throw new Error(`Missing mode ${mode}`);
+	await act(async () => {
+		input.checked = true;
+		input.dispatchEvent(new Event("click", { bubbles: true }));
+	});
+}
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((yes) => {
+		resolve = yes;
+	});
+	return { resolve, promise };
+}
 function OwnedEditor({ filePath }: { filePath: string }) {
 	const onFileReferenceSelectionChange = useFilePanelSelectionPublisher();
 	return (
@@ -189,16 +292,11 @@ function OwnedEditor({ filePath }: { filePath: string }) {
 	);
 }
 
-for (const switchToA of [true, false]) {
+for (const switchToA of [true, false])
 	test(`pending B save ${switchToA ? "cannot steal A's selection" : "refreshes B's owned selection"}`, async () => {
 		let shared: FileReferenceEditorSelection | null = null;
-		let resolveSave!: (result: Awaited<ReturnType<typeof api.fsWrite>>) => void;
-		write.mockImplementation(
-			() =>
-				new Promise((resolve) => {
-					resolveSave = resolve;
-				}),
-		);
+		const pending = deferred<EditorCommitResult>();
+		commit.mockImplementation(() => pending.promise);
 		function Pair({ showB }: { showB: boolean }) {
 			const [fileReferenceSelection, setFileReferenceSelection] =
 				useState<FileReferenceEditorSelection | null>(null);
@@ -230,26 +328,18 @@ for (const switchToA of [true, false]) {
 			);
 		}
 		await renderPair(true);
-		const views = Array.from(host.querySelectorAll<HTMLElement>(".cm-editor"), (element) => {
-			const view = EditorView.findFromDOM(element);
-			if (!view) throw new Error("CodeMirror view missing");
-			return view;
-		});
-		const [a, b] = views;
+		const [a, b] = [...mountedTestModels.values()];
 		await edit(b, "changed B\n");
 		expect(shared).toMatchObject({ target: { path: "/work/b.txt" }, dirty: true });
-		const saveB = host.querySelectorAll<HTMLButtonElement>('button[aria-label="Save"]')[1];
-		if (!saveB) throw new Error("B save button missing");
-		await click(saveB);
-		expect(write).toHaveBeenCalledTimes(1);
-		if (switchToA) await act(async () => a.dispatch({ selection: { anchor: 0, head: 1 } }));
+		await click(host.querySelectorAll<HTMLButtonElement>('button[aria-label="Save"]')[1]);
+		if (switchToA) await act(async () => a.select(selection));
 		await act(async () =>
-			resolveSave({
-				ok: true,
-				path: "/work/b.txt",
-				encoding: source.encoding,
+			pending.resolve({
+				status: "saved",
+				operationId: "op",
 				hash: "saved-B",
-				bytesWritten: 10,
+				bytes: 10,
+				snapshotRevision: uploadedRevision,
 			}),
 		);
 		expect(shared).toMatchObject(
@@ -257,18 +347,16 @@ for (const switchToA of [true, false]) {
 				? { target: { path: "/work/a.txt" }, expectedHash: source.hash, dirty: false }
 				: { target: { path: "/work/b.txt" }, expectedHash: "saved-B", dirty: false },
 		);
-		// Identical range is still a new user selection event and must reclaim B.
-		await act(async () => b.dispatch({ selection: { anchor: 0, head: 1 } }));
+		await act(async () => b.select(selection));
 		expect(shared).toMatchObject({
 			target: { path: "/work/b.txt" },
 			expectedHash: "saved-B",
 			dirty: false,
 		});
-		await act(async () => a.dispatch({ selection: { anchor: 0, head: 1 } }));
+		await act(async () => a.select(selection));
 		await renderPair(false);
 		expect(shared).toMatchObject({ target: { path: "/work/a.txt" } });
 	});
-}
 
 test("old narrator publication cannot update or clear the new narrator's selection", async () => {
 	let publishFromPanel: ReturnType<typeof useFilePanelSelectionPublisher> | undefined;
@@ -302,7 +390,7 @@ test("old narrator publication cannot update or clear the new narrator's selecti
 	}
 	await renderNarrator("old");
 	const stalePublish = publishFromPanel;
-	if (!stalePublish) throw new Error("Publisher missing");
+	if (!stalePublish) throw new Error("Missing publisher");
 	stalePublish(next, true);
 	setSelection.mockClear();
 	await renderNarrator("new");
@@ -314,42 +402,14 @@ test("old narrator publication cannot update or clear the new narrator's selecti
 	expect(setSelection).toHaveBeenCalledWith(next);
 });
 
-function currentSelection() {
-	return publish.mock.calls.at(-1)?.[0];
-}
-function iconButton(icon: string) {
-	const button = host.querySelector(`.tabler-icon-${icon}`)?.closest("button");
-	if (!button) throw new Error(`Missing ${icon} button`);
-	return button;
-}
-async function click(button: HTMLButtonElement) {
-	await act(async () => {
-		button.dispatchEvent(new Event("click", { bubbles: true }));
-	});
-}
-async function edit(view: EditorView, text: string) {
-	await act(async () => {
-		view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
-		view.dispatch({ selection: { anchor: 0, head: 1 } });
-	});
-}
-function expectClean(hash: string, hasSelection = true) {
-	expect(dirty.mock.calls.at(-1)?.[0]).toBe(false);
-	expect(host.textContent).not.toContain(en["fileEditor.unsaved"]);
-	expect(iconButton("device-floppy").disabled).toBe(true);
-	if (hasSelection) expect(currentSelection()).toMatchObject({ expectedHash: hash, dirty: false });
-	else expect(currentSelection()).toBeNull();
-}
-
-for (const surface of ["focus", "workspace"] as const) {
-	for (const lifecycle of ["live", "restored", "detached"] as const) {
+for (const surface of ["focus", "workspace"] as const)
+	for (const lifecycle of ["live", "restored", "detached"] as const)
 		test(`${surface} ${lifecycle} child file reads/writes as child while publishing selection to host`, async () => {
 			const filePath = "/work/b/a.txt";
-			preview.mockImplementation(async (narratorId, target) => {
-				// Model the server's cwd authorization: parent /work/a cannot read child /work/b.
+			create.mockImplementation(async (narratorId, input) => {
 				const cwd = narratorId === "child" ? "/work/b/" : "/work/a/";
-				if (!target.path.startsWith(cwd)) throw new ApiError("Forbidden outside cwd", 403);
-				return { ...source, target };
+				if (!input.path.startsWith(cwd)) throw new ApiError("Forbidden outside cwd", 403);
+				return { ...descriptor, target: { deviceId: "local", path: input.path } };
 			});
 			const panels = new Map<string, { id: string; params: FilePanelParams; api: object }>();
 			const apiRef = {
@@ -403,28 +463,23 @@ for (const surface of ["focus", "workspace"] as const) {
 			childOpen?.(filePath, undefined, { referenceOrigin: true, selection });
 			expect(panels.size).toBe(1);
 			open(filePath, undefined, { referenceOrigin: true });
-			expect(panels.size).toBe(2); // Same device/path, different read authority: don't reuse the child editor.
+			expect(panels.size).toBe(2);
 			expect(panel.params).toMatchObject({ hostNarratorId: "parent", fileNarratorId: "child" });
 			let params = panel.params;
 			if (lifecycle === "restored") {
 				const layout = { panels: { file: { params } } } as unknown as SerializedDockview;
-				const strip = surface === "focus" ? stripIdentityFromLayout : stripNavigationFromLayout;
-				params = JSON.parse(JSON.stringify(strip(layout))).panels.file.params;
+				params = JSON.parse(
+					JSON.stringify(
+						(surface === "focus" ? stripIdentityFromLayout : stripNavigationFromLayout)(layout),
+					),
+				).panels.file.params;
 			} else if (lifecycle === "detached") {
-				// Use the real native-tab → pending entry → persisted detached-node pipeline.
 				const subject = readPanelSubject(params);
 				if (!subject?.resourceId) throw new Error("Missing drag resource");
 				const entry = makePanelEntry("file", subject.resourceId);
 				const nodes = parseDetachedNodes(
 					serializeDetachedNodes([
-						{
-							id: "detached",
-							x: 0,
-							y: 0,
-							w: 480,
-							h: 360,
-							pendingPanels: [entry],
-						},
+						{ id: "detached", x: 0, y: 0, w: 480, h: 360, pendingPanels: [entry] },
 					]),
 				);
 				const restored = nodes[0]?.pendingPanels?.[0];
@@ -462,7 +517,7 @@ for (const surface of ["focus", "workspace"] as const) {
 					onWillDragGroup: () => ({ dispose() {} }),
 				},
 			} as unknown as IDockviewPanelProps<FilePanelParams>;
-			await act(async () => {
+			await act(async () =>
 				root?.render(
 					<I18nextProvider i18n={i18n}>
 						<MantineProvider env="test">
@@ -471,612 +526,531 @@ for (const surface of ["focus", "workspace"] as const) {
 							</NarratorDockContext.Provider>
 						</MantineProvider>
 					</I18nextProvider>,
-				);
-			});
-			expect(preview).toHaveBeenCalledWith(
+				),
+			);
+			expect(create).toHaveBeenCalledWith(
 				"child",
-				{ deviceId: "local", path: filePath },
+				{ deviceId: "local", path: filePath, origin: "reference" },
 				expect.any(AbortSignal),
 			);
-			const element = host.querySelector<HTMLElement>(".cm-editor");
-			if (!element) throw new Error(`Editor not mounted: ${host.textContent}`);
-			const view = EditorView.findFromDOM(element);
-			if (!view) throw new Error("Missing CodeMirror view");
-			expect(view.state.doc.toString()).toBe("a\nb\n");
-			await edit(view, "child draft");
+			const model = [...mountedTestModels.values()][0];
+			expect(model.text).toBe("a\nb\n");
+			await edit(model, "child draft");
 			expect(hostSelections.mock.calls.at(-1)?.[0]).toMatchObject({
 				target: { path: filePath },
 				dirty: true,
 			});
 			await click(iconButton("device-floppy"));
-			expect(write.mock.calls[0]?.[0]).toMatchObject({
-				narratorId: "child",
-				path: filePath,
-				content: "child draft",
-			});
+			expect(beginUpload.mock.calls[0]?.[0]).toBe("child");
+			expect(upload.mock.calls[0]?.[0]).toBe("child");
+			expect(await upload.mock.calls[0]?.[3].text()).toBe("child draft");
+			expect(legacyWrite).not.toHaveBeenCalled();
 		});
-	}
-}
 
-test("reference CRLF load is clean, selection-ready, and retains raw hash/encoding on real edits", async () => {
-	const view = await mount();
-	expect(preview).toHaveBeenCalledWith(
+test("StrictMode effect replay still loads an editable session and releases abandoned authorization", async () => {
+	await act(async () =>
+		root?.render(
+			<StrictMode>
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<FileEditorContent filePath="/work/a.txt" narratorId="child" referenceOrigin />
+					</MantineProvider>
+				</I18nextProvider>
+			</StrictMode>,
+		),
+	);
+	const model = [...mountedTestModels.values()][0];
+	expect(model?.text).toBe("a\nb\n");
+	await edit(model, "strict draft");
+	await click(iconButton("device-floppy"));
+	expect(await upload.mock.calls[0]?.[3].text()).toBe("strict draft");
+	expect(beginUpload.mock.calls[0]?.[0]).toBe("child");
+});
+
+test("model identity includes source narrator and canonical authorized path", async () => {
+	create.mockResolvedValue({
+		...descriptor,
+		target: { deviceId: "local", path: "/canonical/a.txt" },
+	});
+	const model = await mount({ filePath: "/alias/a.txt", narratorId: "child" });
+	expect(JSON.parse(model.props.documentKey)).toEqual(["child", "local", "/canonical/a.txt"]);
+});
+
+test("large conflicts use bounded immutable prefixes and worker diff, never truncate the draft", async () => {
+	const prefixRead = spyOn(editorDocumentApi, "sourcePreview").mockResolvedValue({
+		content: "disk-prefix",
+		truncated: true,
+	});
+	const difference = spyOn(snapshots, "computeEditorConflictDiff").mockResolvedValue({
+		lines: [],
+		truncated: true,
+	});
+	restores.push(
+		() => prefixRead.mockRestore(),
+		() => difference.mockRestore(),
+	);
+	const model = await mount();
+	const text = "x".repeat(1024 * 1024 + 1);
+	await edit(model, text);
+	const flatten = spyOn(model, "getValue");
+	restores.push(() => flatten.mockRestore());
+	commit.mockRejectedValueOnce(
+		new ApiError("Stale", 409, {
+			code: "STALE_WRITE",
+			currentHash: "winning",
+			conflictVersionHandle: "immutable-conflict",
+			encoding: "utf-8",
+			size: text.length,
+		}),
+	);
+	await click(iconButton("device-floppy"));
+	expect(prefixRead).toHaveBeenCalledWith(
 		"narrator",
-		{ deviceId: "local", path: source.target.path },
+		"doc",
+		"immutable-conflict",
 		expect.any(AbortSignal),
 	);
-	expect(view.state.doc.toString()).toBe("a\nb\n");
-	expect(dirty.mock.calls.every(([value]) => !value)).toBe(true);
-	// File navigation highlights its range without creating an editable selection.
-	expectClean(source.hash, false);
-	expect(view.state.selection.main.empty).toBe(true);
-	await act(async () => view.dispatch({ selection: { anchor: 2, head: 3 } }));
-	expect(currentSelection()?.target.selection).toEqual(selection);
-	expect(write).not.toHaveBeenCalled();
-	expect(source.content).toBe("a\r\nb\r\n");
-	await edit(view, "a\nchanged\n");
-	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
-	expect(currentSelection()).toMatchObject({ expectedHash: source.hash, dirty: true });
-	expect(iconButton("device-floppy").disabled).toBe(false);
+	expect(difference.mock.calls[0]?.[0]).toBe("disk-prefix");
+	expect(difference.mock.calls[0]?.[1].length).toBe(32768);
+	expect(host.textContent).toContain(i18n.t("fileEditor.conflictDiffLimited", { ns: "narrator" }));
+	expect(host.textContent).toContain("Download full conflict version");
+	expect(flatten).not.toHaveBeenCalled();
+	expect(model.text).toBe(text);
+	expect(currentSelection()?.expectedHash).toBe(source.hash);
+	const mine = [...host.querySelectorAll("button")].find(
+		(button) => button.textContent === en["fileEditor.conflictKeepMine"],
+	);
+	if (!mine) throw new Error("Missing keep-mine choice");
+	await click(mine);
+	expect(model.text).toBe(text);
+	expect(currentSelection()?.expectedHash).toBe("winning");
 	await click(iconButton("device-floppy"));
-	expect(write.mock.calls[0]?.[0]).toMatchObject({
-		content: "a\nchanged\n",
+	expect(await upload.mock.calls.at(-1)?.[3].text()).toBe(text);
+});
+
+test("conflict preview failure preserves draft and prevents an unseen keep-mine decision", async () => {
+	const prefixRead = spyOn(editorDocumentApi, "sourcePreview").mockRejectedValue(
+		new Error("conflict source unavailable"),
+	);
+	restores.push(() => prefixRead.mockRestore());
+	const model = await mount();
+	await edit(model, "mine");
+	commit.mockRejectedValueOnce(
+		new ApiError("Stale", 409, {
+			code: "STALE_WRITE",
+			currentHash: "winning",
+			conflictVersionHandle: "immutable-conflict",
+			encoding: "utf-8",
+			size: 9,
+		}),
+	);
+	await click(iconButton("device-floppy"));
+	expect(host.textContent).toContain("conflict source unavailable");
+	const mine = [...host.querySelectorAll("button")].find(
+		(button) => button.textContent === en["fileEditor.conflictKeepMine"],
+	);
+	expect(mine?.disabled).toBe(true);
+	expect(model.text).toBe("mine");
+	expect(currentSelection()?.expectedHash).toBe(source.hash);
+});
+
+test("reference CRLF loads clean with raw hash/encoding, preserving source narrator and reference authorization", async () => {
+	const model = await mount();
+	expectClean(source.hash, false);
+	expect(model.selected).toBeNull();
+	expect(model.text).toBe("a\nb\n");
+	expect(create.mock.calls[0]?.[1].origin).toBe("reference");
+	expect(preview).not.toHaveBeenCalled();
+	await act(async () => model.select(selection));
+	expect(currentSelection()?.target.selection).toEqual(selection);
+	await edit(model, "a\nchanged\n");
+	expect(currentSelection()).toMatchObject({ expectedHash: source.hash, dirty: true });
+	await click(iconButton("device-floppy"));
+	expect(beginUpload.mock.calls[0]?.[2]).toMatchObject({
 		baseHash: source.hash,
 		encoding: source.encoding,
 	});
+	expect(await upload.mock.calls[0]?.[3].text()).toBe("a\nchanged\n");
 	expectClean("saved-byte-hash");
 });
 
-test("mounted navigation paints the gutter and boundaries independently of text selection", async () => {
-	const view = await mount();
-	const highlight = view.state.field(fileNavigationHighlight);
-	const markedGutters = () => host.querySelectorAll(".cm-file-navigation-gutter .cm-gutterElement");
-	const markedLine = () =>
-		view.contentDOM.querySelector(".cm-file-navigation-start.cm-file-navigation-end");
-	expect(view.state.selection.main.empty).toBe(true);
-	expect(markedGutters()).toHaveLength(1);
-	expect(markedGutters()[0]?.classList.contains("cm-file-navigation-start")).toBe(true);
-	expect(markedGutters()[0]?.classList.contains("cm-file-navigation-end")).toBe(true);
-	expect(markedGutters()[0]?.textContent).toBe("");
-	expect(
-		Array.from(host.querySelectorAll(".cm-lineNumbers .cm-gutterElement")).some(
-			(item) => item.textContent === "2",
-		),
-	).toBe(true);
-	expect(markedLine()?.textContent).toBe("b");
-	await act(async () => view.dispatch({ selection: { anchor: 0 } }));
-	expect(view.state.field(fileNavigationHighlight)).toBe(highlight);
-	expect(markedGutters()).toHaveLength(1);
-	await act(async () => view.dispatch({ selection: { anchor: 0, head: 1 } }));
-	expect(view.state.field(fileNavigationHighlight)).toBe(highlight);
-	expect(currentSelection()?.target.selection?.startLineNumber).toBe(1);
-	expect(markedLine()?.textContent).toBe("b");
-	const repeated = await mount({ navigationRequestId: "again" });
-	expect(repeated).toBe(view);
-	expect(view.state.selection.main.empty).toBe(true);
-	expect(markedGutters()).toHaveLength(1);
+test("local legacy-origin narrator files still use the authorized large-file session", async () => {
+	await mount({ referenceOrigin: false });
+	expect(create.mock.calls[0]?.[1].origin).toBe("legacy");
+	expect(preview).not.toHaveBeenCalled();
+	expect(legacyWrite).not.toHaveBeenCalled();
+});
+
+test("reference upgrade does not reload a reused dirty model", async () => {
+	const model = await mount({ referenceOrigin: false });
+	await edit(model, "draft");
+	expect(await mount({ referenceOrigin: true })).toBe(model);
+	expect(create).toHaveBeenCalledTimes(1);
+	expect(model.text).toBe("draft");
+	await click(iconButton("refresh"));
+	expect(create.mock.calls[1]?.[1].origin).toBe("reference");
+});
+
+test("navigation passes independent highlights without taking text selection ownership", async () => {
+	const model = await mount();
+	expect(model.navigation).toEqual(selection);
+	expect(model.selected).toBeNull();
+	await act(async () =>
+		model.select({ startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 2 }),
+	);
+	expect(model.navigation).toEqual(selection);
+	expect(await mount({ navigationRequestId: "again" })).toBe(model);
+	expect(model.selected).toBeNull();
+	expect(model.navigation).toEqual(selection);
 	await mount({ selection: undefined, navigationRequestId: "file-only" });
-	expect(view.state.field(fileNavigationHighlight)).toBeNull();
-	expect(markedGutters()).toHaveLength(0);
-	expect(markedLine()).toBeNull();
+	expect(model.navigation).toBeUndefined();
 	expectClean(source.hash, false);
 });
 
-test("explicit CRLF reload replaces the dirty document with an LF baseline and the new raw hash", async () => {
-	const view = await mount();
-	await edit(view, "unsaved");
-	preview.mockResolvedValue({ ...source, content: "c\r\nd\r\n", hash: "reload-byte-hash" });
-	dirty.mockClear();
+test("explicit reload resets model only once and installs new hash without resetting initialValue", async () => {
+	const model = await mount();
+	await edit(model, "unsaved");
+	const setValue = spyOn(model, "setValue");
+	const seed = model.props.initialValue;
+	create.mockResolvedValue({ ...descriptor, baseHash: "reload-hash" });
+	read.mockResolvedValue("c\nd\n");
 	await click(iconButton("refresh"));
-	expect(preview).toHaveBeenCalledTimes(2);
-	expect(view.state.doc.toString()).toBe("c\nd\n");
-	expect(dirty.mock.calls.every(([value]) => !value)).toBe(true);
-	expectClean("reload-byte-hash", false);
-	expect(write).not.toHaveBeenCalled();
+	expect(setValue).toHaveBeenCalledTimes(1);
+	expect(model.props.initialValue).toBe(seed);
+	expect(model.text).toBe("c\nd\n");
+	expectClean("reload-hash", false);
+	setValue.mockRestore();
 });
 
-test("cancelled reload keeps the dirty buffer, selection and undo history without reading", async () => {
-	const view = await mount();
-	await edit(view, "unsaved");
-	const doc = view.state.doc;
-	const selected = view.state.selection;
-	const depth = undoDepth(view.state);
+test("cancelled reload keeps dirty document, selection and undo history without reading", async () => {
+	const model = await mount();
+	await edit(model, "unsaved");
+	const selected = model.selected;
+	const history = model.undoEntries;
 	confirmReload.mockReturnValue(false);
 	await click(iconButton("refresh"));
 	expect(confirmReload).toHaveBeenCalledWith(en["fileEditor.confirmReload"]);
-	expect(preview).toHaveBeenCalledTimes(1);
-	expect(view.state.doc).toBe(doc);
-	expect(view.state.selection).toBe(selected);
-	expect(undoDepth(view.state)).toBe(depth);
+	expect(create).toHaveBeenCalledTimes(1);
+	expect(model.text).toBe("unsaved");
+	expect(model.selected).toBe(selected);
+	expect(model.undoEntries).toBe(history);
 	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
 });
 
-test("reload failure keeps the editor mounted and its dirty buffer saveable", async () => {
-	const view = await mount();
-	await edit(view, "keep this draft");
-	preview.mockRejectedValue(new Error("network unavailable"));
+test("failed reload retains mounted model and saveable draft", async () => {
+	const model = await mount();
+	await edit(model, "keep draft");
+	read.mockRejectedValue(new Error("network unavailable"));
 	await click(iconButton("refresh"));
 	expect(host.textContent).toContain("network unavailable");
-	expect(host.querySelector(".cm-editor")).toBe(view.dom);
-	expect(view.state.doc.toString()).toBe("keep this draft");
+	expect([...mountedTestModels.values()][0]).toBe(model);
+	expect(model.text).toBe("keep draft");
 	expect(iconButton("device-floppy").disabled).toBe(false);
 	await click(iconButton("device-floppy"));
-	expect(write.mock.calls[0]?.[0].content).toBe("keep this draft");
+	expect(await upload.mock.calls[0]?.[3].text()).toBe("keep draft");
 });
 
-test("a late reload cannot overwrite an edit made after the read started", async () => {
-	const view = await mount();
-	let finish!: (value: Awaited<ReturnType<typeof fileReferenceApi.preview>>) => void;
-	preview.mockImplementation(
-		() =>
-			new Promise((resolve) => {
-				finish = resolve;
-			}),
-	);
+test("late reload cannot replace queued input and restores editability after failure", async () => {
+	const model = await mount();
+	const pending = deferred<string>();
+	read.mockImplementation(() => pending.promise);
 	await click(iconButton("refresh"));
-	expect(view.state.readOnly).toBe(true);
-	// Simulate an already queued input transaction, despite the loading lock.
-	await edit(view, "new input while loading");
-	await act(async () => finish({ ...source, content: "late disk response" }));
-	expect(view.state.doc.toString()).toBe("new input while loading");
-	expect(view.state.readOnly).toBe(false);
-	expect(host.textContent).toContain(en["fileEditor.changedDuringReload"]);
+	expect(model.props.readOnly).toBe(true);
+	await edit(model, "input while loading");
+	await act(async () => pending.resolve("late disk"));
+	expect(model.text).toBe("input while loading");
+	expect(model.props.readOnly).toBe(false);
 	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
 });
 
-test("scoped files without narrator context never fall back to another reader", async () => {
+test("scoped files with no narrator never fall back to broad/local readers", async () => {
 	await expect(mount({ narratorId: undefined, deviceId: "remote-device" })).rejects.toThrow(
 		en["fileEditor.missingContext"],
 	);
 	expect(preview).not.toHaveBeenCalled();
-	expect(write).not.toHaveBeenCalled();
-	expect(host.querySelector(".cm-editor")).toBeNull();
+	expect(create).not.toHaveBeenCalled();
+	expect(legacyWrite).not.toHaveBeenCalled();
 });
 
-async function switchFileMode(mode: "raw" | "preview" | "node") {
-	const input = host.querySelector<HTMLInputElement>(`input[type="radio"][value="${mode}"]`);
-	if (!input) throw new Error(`Missing file mode ${mode}`);
-	await act(async () => {
-		input.checked = true;
-		input.dispatchEvent(new Event("click", { bubbles: true }));
-	});
-}
-
-for (const extension of ["txt", "md", "json"] as const) {
-	test(`${extension} source inherits dock tab visibility without replacing editor state`, async () => {
-		const view = await mount({ filePath: `/work/draft.${extension}`, selection: undefined });
-		const sourceElement = host.querySelector<HTMLElement>("[data-file-editor-source]");
-		if (!sourceElement) throw new Error("Source layer missing");
-		await edit(view, "unsaved draft\n");
-		const doc = view.state.doc;
-		const selected = view.state.selection;
-		const history = undoDepth(view.state);
-
-		// Model Dockview's always-rendered ancestor. LinkeDOM has no layout engine:
-		// assert the inheritance contract, not simulated computed visibility.
+for (const extension of ["txt", "md", "json"] as const)
+	test(`${extension} source inherits hidden dock visibility while preserving model/selection/history`, async () => {
+		const model = await mount({ filePath: `/work/draft.${extension}`, selection: undefined });
+		const layer = host.querySelector<HTMLElement>("[data-file-editor-source]");
+		if (!layer) throw new Error("No source");
+		await edit(model, "unsaved draft\n");
+		const selected = model.selected;
+		const history = model.undoEntries;
 		for (let cycle = 0; cycle < 2; cycle++) {
 			host.style.visibility = "hidden";
-			expect(sourceElement.style.visibility).toBe("inherit");
+			expect(layer.style.visibility).toBe("inherit");
 			if (extension !== "txt") {
 				await switchFileMode(extension === "md" ? "preview" : "node");
-				expect(sourceElement.style.visibility).toBe("hidden");
-				expect(sourceElement.hasAttribute("inert")).toBe(true);
+				expect(layer.style.visibility).toBe("hidden");
+				expect(layer.hasAttribute("inert")).toBe(true);
 				await switchFileMode("raw");
 				expect(host.style.visibility).toBe("hidden");
-				expect(sourceElement.style.visibility).toBe("inherit");
 			}
 			host.style.visibility = "";
-			expect(sourceElement.style.visibility).toBe("inherit");
-			expect(sourceElement.hasAttribute("inert")).toBe(false);
-			expect(host.querySelector(".cm-editor")).toBe(view.dom);
-			expect(view.state.doc).toBe(doc);
-			expect(view.state.selection).toBe(selected);
-			expect(undoDepth(view.state)).toBe(history);
+			expect(layer.style.visibility).toBe("inherit");
+			expect(layer.hasAttribute("inert")).toBe(false);
+			expect([...mountedTestModels.values()][0]).toBe(model);
+			expect(model.selected).toBe(selected);
+			expect(model.undoEntries).toBe(history);
 		}
 		expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
-		expect(preview).toHaveBeenCalledTimes(1);
-		expect(write).not.toHaveBeenCalled();
+		expect(create).toHaveBeenCalledTimes(1);
+		expect(upload).not.toHaveBeenCalled();
 	});
-}
 
-for (const extension of ["md", "json"] as const) {
-	test(`${extension} preview renders the unsaved buffer without losing editor state or reading again`, async () => {
-		const filePath = `/work/draft.${extension}`;
-		preview.mockResolvedValue({
-			...source,
-			content: extension === "md" ? "# Saved" : '{"name":"Saved"}',
-		});
-		const view = await mount({ filePath, selection: undefined });
-		const sourceElement = host.querySelector<HTMLElement>("[data-file-editor-source]");
-		expect(sourceElement?.style.visibility).toBe("inherit");
-		expect(host.querySelector("[data-file-editor-preview]")).toBeNull();
+for (const extension of ["md", "json"] as const)
+	test(`${extension} explicit preview snapshots unsaved text without losing model or history`, async () => {
+		read.mockResolvedValue(extension === "md" ? "# Saved" : '{"name":"Saved"}');
+		const model = await mount({ filePath: `/work/a.${extension}`, selection: undefined });
 		const draft =
 			extension === "md"
 				? "# Draft heading\n\n**bold draft**"
 				: '{"name":"Draft value","nested":{"enabled":true}}';
-		await edit(view, draft);
-		const doc = view.state.doc;
-		const selected = view.state.selection;
-		const history = undoDepth(view.state);
+		await edit(model, draft);
+		const selected = model.selected;
+		const history = model.undoEntries;
 		await switchFileMode(extension === "md" ? "preview" : "node");
 		const body = host.querySelector("[data-file-editor-preview]");
-		expect(body).not.toBeNull();
 		expect(body?.textContent).toContain(extension === "md" ? "Draft heading" : "Draft value");
 		if (extension === "md") expect(body?.querySelector("h1")?.textContent).toBe("Draft heading");
 		else expect(body?.querySelector('[role="tree"]')).not.toBeNull();
-		expect(sourceElement?.style.visibility).toBe("hidden");
-		expect(sourceElement?.hasAttribute("inert")).toBe(true);
-		expect(host.querySelector(".cm-editor")).toBe(view.dom);
 		await switchFileMode("raw");
-		expect(sourceElement?.style.visibility).toBe("inherit");
-		expect(view.state.doc).toBe(doc);
-		expect(view.state.selection).toBe(selected);
-		expect(undoDepth(view.state)).toBe(history);
-		expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
-		expect(preview).toHaveBeenCalledTimes(1);
-		expect(write).not.toHaveBeenCalled();
-		await act(async () => {
-			undo(view);
-		});
-		expect(view.state.doc.toString()).toContain("Saved");
+		expect(model.selected).toBe(selected);
+		expect(model.undoEntries).toBe(history);
+		expect(create).toHaveBeenCalledTimes(1);
+		await act(async () => model.undo());
+		expect(model.text).toContain("Saved");
 	});
-}
 
-test("read-only JSON keeps both source and node views without enabling writes", async () => {
-	preview.mockResolvedValue({ ...source, content: '{"remote":"read-only value"}' });
-	const view = await mount({
-		filePath: "/work/a.json",
-		deviceId: "remote-device",
-		selection: undefined,
-	});
-	await switchFileMode("node");
+test("preview text is a fixed snapshot, not a per-key renderer", async () => {
+	const model = await mount({ filePath: "/work/a.md", selection: undefined });
+	await edit(model, "# Preview snapshot");
+	await switchFileMode("preview");
+	await act(async () => model.edit("# New unrendered text"));
 	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain(
-		"read-only value",
+		"Preview snapshot",
 	);
-	await switchFileMode("raw");
-	expect(view.state.readOnly).toBe(true);
-	expect(host.querySelector(".tabler-icon-device-floppy")).toBeNull();
-	expect(preview).toHaveBeenCalledTimes(1);
-	expect(write).not.toHaveBeenCalled();
+	expect(host.querySelector("[data-file-editor-preview]")?.textContent).not.toContain(
+		"New unrendered text",
+	);
 });
 
-test("oversized unsaved JSON declines rendering without truncating the editor", async () => {
-	preview.mockResolvedValue({ ...source, content: "{}" });
-	const view = await mount({ filePath: "/work/a.json", selection: undefined });
-	// Keep individual lines bounded: linkedom has no layout for CM's long-line gaps.
-	const text = JSON.stringify(
-		{ values: Array.from({ length: 2048 }, () => "x".repeat(512)) },
-		null,
-		2,
-	);
-	await edit(view, text);
+test("oversized JSON refuses only preview and saves the complete blob beyond the legacy 1 MiB cap", async () => {
+	const model = await mount({ filePath: "/work/a.json", selection: undefined });
+	const text = JSON.stringify({ text: "x".repeat(1024 * 1024) });
+	await edit(model, text);
 	await switchFileMode("node");
 	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain(
 		en["fileEditor.previewTooLarge"],
 	);
 	await switchFileMode("raw");
-	expect(view.state.doc.toString()).toBe(text);
-	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
-	expect(preview).toHaveBeenCalledTimes(1);
+	expect(model.text).toBe(text);
+	await click(iconButton("device-floppy"));
+	expect(await upload.mock.calls[0]?.[3].text()).toBe(text);
+	expect(legacyWrite).not.toHaveBeenCalled();
 });
 
-test("invalid JSON can be corrected by switching back without dropping the buffer", async () => {
-	preview.mockResolvedValue({ ...source, content: '{"name":"saved"}' });
-	const view = await mount({ filePath: "/work/a.json", selection: undefined });
-	await edit(view, '{"name":');
+test("invalid JSON can be fixed without dropping the model", async () => {
+	const model = await mount({ filePath: "/work/a.json", selection: undefined });
+	await edit(model, '{"name":');
 	await switchFileMode("node");
 	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain("not valid json");
-	expect(view.state.doc.toString()).toBe('{"name":');
 	await switchFileMode("raw");
-	await edit(view, '{"name":"fixed"}');
+	await edit(model, '{"name":"fixed"}');
 	await switchFileMode("node");
 	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain("fixed");
-	expect(preview).toHaveBeenCalledTimes(1);
+	expect(create).toHaveBeenCalledTimes(1);
 });
 
-test("line references keep the preview switch and new navigation returns to the same editor", async () => {
-	const filePath = "/work/a.md";
-	const view = await mount({ filePath, navigationRequestId: "first" });
+test("line references preserve preview switch and new navigation returns to same model", async () => {
+	const model = await mount({ filePath: "/work/a.md", navigationRequestId: "first" });
 	await switchFileMode("preview");
 	expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
-	const again = await mount({ filePath, navigationRequestId: "second" });
-	expect(again).toBe(view);
+	expect(await mount({ filePath: "/work/a.md", navigationRequestId: "second" })).toBe(model);
 	expect(host.querySelector("[data-file-editor-preview]")).toBeNull();
-	expect(preview).toHaveBeenCalledTimes(1);
+	expect(create).toHaveBeenCalledTimes(1);
 });
 
-test("search from preview returns to source without replacing the document", async () => {
-	const view = await mount({ filePath: "/work/a.md", selection: undefined });
+test("search from preview returns to source without replacing draft", async () => {
+	const model = await mount({ filePath: "/work/a.md", selection: undefined });
+	await edit(model, "# draft");
 	await switchFileMode("preview");
 	await click(iconButton("search"));
 	expect(host.querySelector("[data-file-editor-preview]")).toBeNull();
-	expect(searchPanelOpen(view.state)).toBe(true);
-	expect(preview).toHaveBeenCalledTimes(1);
+	expect(host.querySelector("[data-editor-search-panel]")).not.toBeNull();
+	expect(model.text).toBe("# draft");
+	expect(create).toHaveBeenCalledTimes(1);
 });
 
-test("ordinary text does not expose irrelevant preview modes", async () => {
-	await mount();
+test("ordinary text exposes no preview switch; search/wrapping retain model and undo history", async () => {
+	const model = await mount();
 	expect(host.querySelector('input[type="radio"]')).toBeNull();
-});
-
-test("search and wrapping preserve the document, selection and undo history", async () => {
-	const view = await mount();
-	await edit(view, "find me\nfind me");
-	const doc = view.state.doc;
-	const selected = view.state.selection;
-	const depth = undoDepth(view.state);
+	await edit(model, "find me\nfind me");
+	const selected = model.selected;
+	const history = model.undoEntries;
 	await click(iconButton("text-wrap"));
-	// linkedom has no computed layout; the extension's DOM class is observable.
-	expect(view.contentDOM.classList.contains("cm-lineWrapping")).toBe(true);
+	expect(model.props.lineWrapping).toBe(true);
 	expect(iconButton("text-wrap").getAttribute("aria-pressed")).toBe("true");
 	await click(iconButton("search"));
-	expect(searchPanelOpen(view.state)).toBe(true);
-	expect(view.state.doc).toBe(doc);
-	expect(view.state.selection).toBe(selected);
-	expect(undoDepth(view.state)).toBe(depth);
-	expect(preview).toHaveBeenCalledTimes(1);
+	expect(model.selected).toBe(selected);
+	expect(model.undoEntries).toBe(history);
+	expect(host.querySelector("[data-editor-search-panel]")).not.toBeNull();
 });
 
-function searchPanelElement() {
-	const panel = host.querySelector<HTMLElement>("[data-editor-search-panel]");
-	if (!panel) throw new Error("Custom search panel missing");
-	return panel;
-}
-
-async function setQuery(view: EditorView, search: string, replace = "", regexp = false) {
-	await act(async () =>
-		view.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search, replace, regexp })) }),
-	);
-}
-
-async function searchKey(
-	target: HTMLElement,
-	key: string,
-	options: { shiftKey?: boolean; isComposing?: boolean } = {},
-) {
-	const event = new Event("keydown", { bubbles: true, cancelable: true });
-	Object.assign(event, {
-		key,
-		keyCode: key === "Enter" ? 13 : key === "Escape" ? 27 : 0,
-		...options,
-	});
-	await act(async () => {
-		target.dispatchEvent(event);
-	});
-	return event;
-}
-
-test("search uses Mantine inputs/buttons and real replacements remain undoable", async () => {
-	preview.mockResolvedValue({ ...source, content: "cat cat dog" });
-	const view = await mount({ selection: undefined });
-	await click(iconButton("search"));
-	const panel = searchPanelElement();
-	expect(panel.querySelector("input[main-field]")?.className).toContain("mantine-TextInput-input");
-	expect(panel.querySelector(".mantine-Checkbox-input")).not.toBeNull();
-	expect(panel.querySelector(".cm-textfield, .cm-button, .cm-search")).toBeNull();
-	await setQuery(view, "cat", "fox");
-	expect(panel.querySelector<HTMLInputElement>("input[name=search]")?.value).toBe("cat");
-	expect(panel.querySelector<HTMLInputElement>("input[name=replace]")?.value).toBe("fox");
-	const replaceButton = Array.from(panel.querySelectorAll("button")).find(
-		(button) => button.textContent === "replace all",
-	);
-	if (!replaceButton) throw new Error("Replace-all button missing");
-	expect(replaceButton.className).toContain("mantine-Button-root");
-	await click(replaceButton);
-	expect(view.state.doc.toString()).toBe("fox fox dog");
+test("undo/redo buttons restore dirty state and keyboard undo updates toolbar", async () => {
+	const model = await mount();
+	const back = iconButton("arrow-back-up");
+	const forward = iconButton("arrow-forward-up");
+	expect(back.disabled).toBe(true);
+	expect(forward.disabled).toBe(true);
+	await edit(model, "edited");
+	expect(back.disabled).toBe(false);
+	await click(back);
+	expect(model.text).toBe("a\nb\n");
+	expect(dirty.mock.calls.at(-1)?.[0]).toBe(false);
+	expect(forward.disabled).toBe(false);
+	await click(forward);
+	expect(model.text).toBe("edited");
 	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
-	await act(async () => {
-		undo(view);
-	});
-	expect(view.state.doc.toString()).toBe("cat cat dog");
+	await act(async () => model.undo());
+	await edit(model, "new branch");
+	expect(forward.disabled).toBe(true);
 });
 
-test("custom search handles Enter, Shift+Enter and Escape but not composition Enter", async () => {
-	preview.mockResolvedValue({ ...source, content: "cat cat dog" });
-	const view = await mount({ selection: undefined });
-	const open = view.state
-		.facet(keymap)
-		.flat()
-		.find((binding) => binding.key === "Mod-f")?.run;
-	await act(async () => {
-		open?.(view);
-	});
-	await setQuery(view, "cat");
-	const input = searchPanelElement().querySelector<HTMLInputElement>("input[main-field]");
-	if (!input) throw new Error("Find input missing");
-	const composing = await searchKey(input, "Enter", { isComposing: true });
-	expect(composing.defaultPrevented).toBe(false);
-	expect(view.state.selection.main.empty).toBe(true);
-	expect((await searchKey(input, "Enter")).defaultPrevented).toBe(true);
-	expect(view.state.selection.main.from).toBe(0);
-	expect(view.state.selection.main.to).toBe(3);
-	await searchKey(input, "Enter");
-	expect(view.state.selection.main.from).toBe(4);
-	await searchKey(input, "Enter", { shiftKey: true });
-	expect(view.state.selection.main.from).toBe(0);
-	expect((await searchKey(input, "Escape")).defaultPrevented).toBe(true);
-	expect(searchPanelOpen(view.state)).toBe(false);
-	expect(host.querySelector("[data-editor-search-panel]")).toBeNull();
-	expect(view.state.doc.toString()).toBe("cat cat dog");
+test("preview disables history buttons without dropping undo stack", async () => {
+	const model = await mount({ filePath: "/work/a.md", selection: undefined });
+	await edit(model, "# draft");
+	await switchFileMode("preview");
+	expect(iconButton("arrow-back-up").disabled).toBe(true);
+	await switchFileMode("raw");
+	expect(iconButton("arrow-back-up").disabled).toBe(false);
+	await click(iconButton("arrow-back-up"));
+	expect(model.text).toBe("a\nb\n");
 });
 
-test("invalid regex is explained and replacement actions are disabled", async () => {
-	const view = await mount();
-	await click(iconButton("search"));
-	await setQuery(view, "[", "replacement", true);
-	const panel = searchPanelElement();
-	expect(getSearchQuery(view.state).valid).toBe(false);
-	expect(panel.textContent).toContain(en["fileEditor.searchInvalidRegex"]);
-	const input = panel.querySelector("input[main-field]");
-	expect(input?.getAttribute("aria-invalid")).toBe("true");
-	const replacement = Array.from(panel.querySelectorAll("button")).find(
-		(button) => button.textContent === "replace all",
+test("remote JSON remains scoped/read-only with source/node/search and explicit 1 MiB budget", async () => {
+	preview.mockResolvedValue({ ...source, content: '{"remote":"read-only value"}' });
+	const model = await mount({
+		filePath: "/work/a.json",
+		deviceId: "remote-device",
+		selection: undefined,
+	});
+	expect(preview.mock.calls[0]?.[0]).toBe("narrator");
+	expect(preview.mock.calls[0]?.[1].deviceId).toBe("remote-device");
+	expect(create).not.toHaveBeenCalled();
+	expect(host.textContent).toContain("1 MiB");
+	await switchFileMode("node");
+	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain(
+		"read-only value",
 	);
-	expect(replacement?.disabled).toBe(true);
-	expect(view.state.doc.toString()).toBe("a\nb\n");
-});
-
-test("read-only search uses the same Mantine UI but offers no replacement controls", async () => {
-	const view = await mount({ deviceId: "remote-device" });
+	await switchFileMode("raw");
 	await click(iconButton("search"));
-	const panel = searchPanelElement();
-	expect(panel.querySelector(".mantine-TextInput-input")).not.toBeNull();
-	expect(panel.querySelector("input[name=replace]")).toBeNull();
-	expect(view.contentDOM.getAttribute("tabindex")).toBe("0");
-	expect(panel.textContent).not.toContain("replace all");
-	await setQuery(view, "b");
-	const next = panel.querySelector<HTMLButtonElement>('button[aria-label="next"]');
-	if (!next) throw new Error("Next match button missing");
-	await click(next);
-	expect(view.state.doc.toString()).toBe("a\nb\n");
-	expect(write).not.toHaveBeenCalled();
+	expect(model.props.readOnly).toBe(true);
+	expect(host.querySelector(".tabler-icon-device-floppy")).toBeNull();
+	expect(iconButton("arrow-back-up").disabled).toBe(true);
+	expect(iconButton("arrow-forward-up").disabled).toBe(true);
+	expect(host.querySelector("[data-editor-search-panel]")?.getAttribute("data-read-only")).toBe(
+		"true",
+	);
+	expect(upload).not.toHaveBeenCalled();
 });
 
-test("an input followed immediately by Ctrl+S sends the newest buffer exactly once", async () => {
-	const view = await mount();
-	const save = view.state
-		.facet(keymap)
-		.flat()
-		.find((binding) => binding.key === "Mod-s")?.run;
-	expect(save).toBeDefined();
+test("search-panel save delegates to the same immutable snapshot handler", async () => {
+	const model = await mount();
+	await edit(model, "draft from search");
+	await click(iconButton("search"));
+	const search = spyOn(searchComponent, "MonacoSearchPanel");
+	const props = search.mock.calls.at(-1)?.[0];
+	expect(props?.onSave).toBeDefined();
 	await act(async () => {
-		view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "latest keystroke" } });
-		save?.(view);
-		save?.(view);
+		props?.onSave?.();
 	});
-	expect(write).toHaveBeenCalledTimes(1);
-	expect(write.mock.calls[0]?.[0].content).toBe("latest keystroke");
+	expect(await upload.mock.calls[0]?.[3].text()).toBe("draft from search");
 	expect(dirty.mock.calls.at(-1)?.[0]).toBe(false);
 });
 
-test("typing during a save is preserved and remains dirty after the response", async () => {
-	let finish!: (result: Awaited<ReturnType<typeof api.fsWrite>>) => void;
-	write.mockImplementation(
-		() =>
-			new Promise((resolve) => {
-				finish = resolve;
-			}),
-	);
-	const view = await mount();
-	await edit(view, "sent version");
-	await click(iconButton("device-floppy"));
-	await edit(view, "newer unsaved version");
-	await act(async () =>
-		finish({
-			ok: true,
-			path: source.target.path,
-			encoding: source.encoding,
-			hash: "saved",
-			bytesWritten: 12,
-		}),
-	);
-	expect(view.state.doc.toString()).toBe("newer unsaved version");
-	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
-	expect(iconButton("device-floppy").disabled).toBe(false);
-});
-
-test("undoing to the old baseline during a save still blocks panel exit and unload", async () => {
-	let finish!: (result: Awaited<ReturnType<typeof api.fsWrite>>) => void;
-	write.mockImplementation(
-		() =>
-			new Promise((resolve) => {
-				finish = resolve;
-			}),
-	);
-	const view = await mount();
-	await edit(view, "sent version");
-	await click(iconButton("device-floppy"));
+test("input immediately followed by two save shortcuts captures newest version once", async () => {
+	const model = await mount();
 	await act(async () => {
-		undo(view);
+		model.edit("latest keystroke");
+		model.props.onSave?.();
+		model.props.onSave?.();
 	});
-	expect(view.state.doc.toString()).toBe("a\nb\n");
-	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
-	const event = new Event("beforeunload", { cancelable: true });
-	window.dispatchEvent(event);
-	expect(event.defaultPrevented).toBe(true);
-	await act(async () =>
-		finish({
-			ok: true,
-			path: source.target.path,
-			encoding: source.encoding,
-			hash: "saved",
-			bytesWritten: 12,
-		}),
-	);
-	// Disk now contains the sent version; the undo is a new unsaved edit.
-	expect(view.state.doc.toString()).toBe("a\nb\n");
-	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
-	expect(iconButton("device-floppy").disabled).toBe(false);
+	expect(upload).toHaveBeenCalledTimes(1);
+	expect(await upload.mock.calls[0]?.[3].text()).toBe("latest keystroke");
+	expect(dirty.mock.calls.at(-1)?.[0]).toBe(false);
 });
 
-test("remote files use the scoped reader and a read-only editor with no save action", async () => {
-	const view = await mount({ deviceId: "remote-device" });
-	expect(preview).toHaveBeenCalledWith(
-		"narrator",
-		{ deviceId: "remote-device", path: source.target.path },
-		expect.any(AbortSignal),
-	);
-	expect(view.state.readOnly).toBe(true);
-	expect(view.state.facet(EditorView.editable)).toBe(false);
-	expect(host.querySelector(".tabler-icon-device-floppy")).toBeNull();
-	expect(write).not.toHaveBeenCalled();
-});
+for (const undo of [false, true])
+	test(`${undo ? "undo to old baseline" : "typing"} during save retains draft and blocks exit`, async () => {
+		const pending = deferred<EditorCommitResult>();
+		commit.mockImplementation(() => pending.promise);
+		const model = await mount();
+		await edit(model, "sent");
+		await click(iconButton("device-floppy"));
+		if (undo) await act(async () => model.undo());
+		else await edit(model, "newer draft");
+		expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
+		const unload = new Event("beforeunload", { cancelable: true });
+		window.dispatchEvent(unload);
+		expect(unload.defaultPrevented).toBe(true);
+		await act(async () =>
+			pending.resolve({
+				status: "saved",
+				operationId: "op",
+				hash: "saved",
+				snapshotRevision: uploadedRevision,
+				bytes: 4,
+			}),
+		);
+		expect(model.text).toBe(undo ? "a\nb\n" : "newer draft");
+		expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
+		expect(iconButton("device-floppy").disabled).toBe(false);
+	});
 
-test("controlled input echoes do not flatten the document a second time", async () => {
-	const view = await mount();
-	const transaction = view.state.update({ changes: { from: 0, insert: "typed" } });
-	const stringify = spyOn(transaction.state.doc, "toString");
-	try {
-		await act(async () => view.dispatch(transaction));
-		expect(stringify).toHaveBeenCalledTimes(1);
-	} finally {
-		stringify.mockRestore();
-	}
-});
-
-test("stable selection metadata is not republished on every dirty keystroke", async () => {
-	const view = await mount();
-	await edit(view, "already dirty");
+test("ordinary typing never flattens model, changes initialValue, or republishes stable dirty selection", async () => {
+	const model = await mount();
+	await edit(model, "already dirty");
+	const seed = model.props.initialValue;
 	publish.mockClear();
-	await act(async () => view.dispatch({ changes: { from: view.state.doc.length, insert: "!" } }));
+	const flatten = spyOn(model, "getValue");
+	const snapshot = spyOn(model, "createSnapshot");
+	await act(async () => model.edit("already dirty!"));
+	expect(flatten).not.toHaveBeenCalled();
+	expect(snapshot).not.toHaveBeenCalled();
+	expect(model.props.initialValue).toBe(seed);
 	expect(publish).not.toHaveBeenCalled();
-	await act(async () => undo(view));
+	flatten.mockRestore();
+	snapshot.mockRestore();
 });
 
-test("beforeunload protects dirty edits and permits a clean buffer", async () => {
-	const view = await mount();
+test("beforeunload allows clean document and protects dirty edits", async () => {
+	const model = await mount();
 	const clean = new Event("beforeunload", { cancelable: true });
 	window.dispatchEvent(clean);
 	expect(clean.defaultPrevented).toBe(false);
-	await edit(view, "unsaved");
-	const dirtyEvent = new Event("beforeunload", { cancelable: true });
-	window.dispatchEvent(dirtyEvent);
-	expect(dirtyEvent.defaultPrevented).toBe(true);
+	await edit(model, "dirty");
+	const event = new Event("beforeunload", { cancelable: true });
+	window.dispatchEvent(event);
+	expect(event.defaultPrevented).toBe(true);
 });
 
-for (const choice of ["conflictTakeTheirs", "conflictKeepMine"] as const) {
-	test(`CRLF conflict ${choice} adopts an LF baseline without changing the winning hash`, async () => {
-		const view = await mount();
-		await edit(view, "same\ntext\n");
-		const theirText = choice === "conflictTakeTheirs" ? "theirs\r\ntext\r\n" : "same\r\ntext\r\n";
-		write.mockRejectedValue(
-			new ApiError("Conflict", 409, {
-				currentContent: theirText,
-				currentHash: "winning-byte-hash",
-			}),
-		);
-		await click(iconButton("device-floppy"));
-		expect(currentSelection()).toMatchObject({ expectedHash: source.hash, dirty: true });
-		const button = Array.from(host.querySelectorAll("button")).find(
-			(item) => item.textContent === en[`fileEditor.${choice}`],
-		);
-		if (!button) throw new Error("Conflict choice missing");
-		dirty.mockClear();
-		await click(button);
-		expect(view.state.doc.toString()).toBe(theirText.replaceAll("\r\n", "\n"));
-		expect(dirty.mock.calls.every(([value]) => !value)).toBe(true);
-		expectClean("winning-byte-hash", choice === "conflictKeepMine");
-		await edit(view, "different\ntext\n");
-		expect(currentSelection()).toMatchObject({ expectedHash: "winning-byte-hash", dirty: true });
-	});
-}
+test("preview save shortcut ignores composition and otherwise submits immutable draft", async () => {
+	const model = await mount({ filePath: "/work/a.md", selection: undefined });
+	await edit(model, "# Draft");
+	await switchFileMode("preview");
+	const body = host.querySelector("[data-file-editor-preview]");
+	if (!body) throw new Error("No preview");
+	for (const composing of [true, false]) {
+		const event = new Event("keydown", { bubbles: true, cancelable: true });
+		Object.assign(event, { key: "s", ctrlKey: true, isComposing: composing });
+		await act(async () => {
+			body.dispatchEvent(event);
+		});
+		expect(upload).toHaveBeenCalledTimes(composing ? 0 : 1);
+	}
+});
