@@ -41,6 +41,10 @@ scripts/lib/*
 !scripts/lib/executor-manifest.ts
 !scripts/lib/__tests__/
 scripts/lib/__tests__/*
+# Required by the cross-platform build and its post-processing workers.
+!scripts/post-process-worker.ts
+!scripts/lib/binary-metadata.ts
+!scripts/lib/__tests__/binary-metadata.test.ts
 !scripts/lib/__tests__/latest-yml.test.ts
 !scripts/lib/__tests__/executor-manifest.test.ts
 !scripts/validate-plugin-release.ts
