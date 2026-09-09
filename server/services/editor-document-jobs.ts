@@ -21,6 +21,16 @@ export function editorWorkerSpecifierCandidates(
 		: ["./editor-document-worker.ts"];
 	return paths.map((path) => new URL(path, moduleUrl).href);
 }
+/** Bun's Windows embedded module keys use forward slashes. Bypass Worker's
+ * file URL → native OS path conversion so the loader receives that exact key.
+ * Only unwrap the compiled virtual drive; real files retain normal URL handling. */
+export function editorWorkerEntryPoint(specifier: string): string | URL {
+	const url = new URL(specifier);
+	if (url.protocol === "file:" && /^\/[a-z]:\/(?:~BUN|%7eBUN)\/root\//i.test(url.pathname)) {
+		return decodeURIComponent(url.pathname.slice(1));
+	}
+	return url;
+}
 const WORKER_READY_TIMEOUT_MS = 5_000;
 
 type Permit = { userId: string; signal: AbortSignal };
@@ -126,6 +136,10 @@ export class EditorDocumentJobs {
 				// A readiness acknowledgement is the no-replay boundary. The job may have
 				// created a source/conflict/receipt object even if its reply was lost.
 				if (ready || signal.aborted) throw error;
+				logger.warn("Editor worker failed before ready", {
+					specifier: specifier.slice(0, 1024),
+					error: (error instanceof Error ? error.message : String(error)).slice(0, 1024),
+				});
 				failure = error;
 			}
 		}
@@ -151,7 +165,7 @@ export class EditorDocumentJobs {
 					abort();
 					return;
 				}
-				worker = new Worker(new URL(specifier));
+				worker = new Worker(editorWorkerEntryPoint(specifier));
 				startupTimer = setTimeout(
 					() =>
 						reject(new AppError("Editor worker did not become ready", 503, "EDITOR_WORKER_FAILED")),

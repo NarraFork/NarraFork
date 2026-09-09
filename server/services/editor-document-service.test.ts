@@ -26,7 +26,11 @@ import { testEnvironment } from "../../tests/preload";
 import { db } from "../db";
 import { fileChangeOperations, narrators, users } from "../db/schema";
 import { generateId } from "../lib/id";
-import { EditorDocumentJobs, editorWorkerSpecifierCandidates } from "./editor-document-jobs";
+import {
+	EditorDocumentJobs,
+	editorWorkerEntryPoint,
+	editorWorkerSpecifierCandidates,
+} from "./editor-document-jobs";
 import { queryEditorOperation } from "./editor-document-runtime";
 import {
 	type EditorActor,
@@ -650,6 +654,27 @@ describe("large editor objects and real durable pipeline", () => {
 				"file:///workspace/server/services/editor-document-jobs.ts",
 			),
 		).toEqual(["file:///workspace/server/services/editor-document-worker.ts"]);
+	});
+	test("Windows compiled workers keep forward-slash virtual paths at the Worker boundary", () => {
+		for (const root of ["file:///B:/~BUN/root/", "file:///B:/%7EBUN/root/"]) {
+			const candidates = editorWorkerSpecifierCandidates(true, `${root}narrafork.exe`);
+			expect(candidates.map(editorWorkerEntryPoint)).toEqual([
+				"B:/~BUN/root/services/editor-document-worker.js",
+				"B:/~BUN/root/server/services/editor-document-worker.js",
+				"B:/~BUN/root/editor-document-worker.js",
+			]);
+		}
+	});
+	test("ordinary files and Linux compiled workers retain URL handling", () => {
+		for (const specifier of [
+			"file:///C:/workspace%20name/server/services/editor-document-worker.ts",
+			"file:///workspace/server/services/editor-document-worker.ts",
+			"file:///$bunfs/root/services/editor-document-worker.js",
+		]) {
+			const entry = editorWorkerEntryPoint(specifier);
+			expect(entry).toBeInstanceOf(URL);
+			expect(String(entry)).toBe(specifier);
+		}
 	});
 	test("an unavailable pre-ready candidate can fall through without dispatching the job", async () => {
 		const jobs = new EditorDocumentJobs([
