@@ -1,0 +1,6 @@
+{
+	"version": "0.7.1",
+	"date": "2026-09-09",
+	"en": "## Bug Fixes\n\n- Detect application data directory permission issues at startup and provide a clear recovery path instead of leaving users with an unexplained Bash admission error.\n- Show a dismissible floating notification without moving the interface or resizing Dock panes; open a compact repair dialog from the notification or Settings > Storage.\n- Let administrators confirm a safe, non-recursive directory permission repair, then retry their operation without restarting the server. Ownership, ancestor safety and authorization checks remain enforced.\n- Avoid repeated permission notifications when session tokens renew, and keep host paths and ownership details hidden from non-administrators.\n- Create new application data directories and settings files with private permissions by default, without silently changing existing installations.",
+	"zh-CN": "## 修复\n\n- 启动时提前检查应用数据目录权限，提供明确的处理入口，避免用户只看到难以理解的 Bash 准入错误。\n- 使用可关闭的浮层通知，不挤压界面或改变 Dock 窗格高度；点击通知或进入「设置 → 存储」即可打开小型修复弹窗。\n- 管理员确认后可安全修复目录本身的权限，不递归修改；修复后无需重启服务即可重试原操作，所有权、父目录安全及授权检查仍然保留。\n- 会话令牌续期不再重复弹出权限提醒，普通用户不会看到宿主路径和所有权详情。\n- 新安装默认以私有权限创建应用数据目录和设置文件，不静默修改旧安装的现有权限。"
+}
