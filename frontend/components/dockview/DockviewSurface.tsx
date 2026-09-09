@@ -15,7 +15,6 @@ import { Box } from "@mantine/core";
 import { IconSwitchHorizontal } from "@tabler/icons-react";
 import {
 	type DockviewApi,
-	DockviewDefaultTab,
 	type DockviewDidDropEvent,
 	DockviewReact,
 	type DockviewReadyEvent,
@@ -31,11 +30,13 @@ import {
 	useCallback,
 	useContext,
 	useEffect,
+	useMemo,
 	useRef,
 	useState,
 } from "react";
 import type { PanelDragState } from "../../lib/panel-drag";
 import { type DropIndicator, type DropZoneThresholds, resolveNativeDrop } from "./drop-intent";
+import { DefaultSurfaceTab, withSurfaceTabMenu } from "./SurfaceTab";
 import {
 	bindNativeDropPreview,
 	DOCKVIEW_SURFACE_ATTR,
@@ -152,6 +153,14 @@ export function DockviewSurface({
 	tabComponents,
 	surfaceId,
 }: DockviewSurfaceProps) {
+	const wrappedTabs = useMemo(
+		() =>
+			tabComponents &&
+			Object.fromEntries(
+				Object.entries(tabComponents).map(([name, Tab]) => [name, withSurfaceTabMenu(Tab)]),
+			),
+		[tabComponents],
+	);
 	const internalApiRef = useRef<DockviewApi | null>(null);
 	const apiRef = externalApiRef ?? internalApiRef;
 	const rootRef = useRef<HTMLDivElement | null>(null);
@@ -238,14 +247,15 @@ export function DockviewSurface({
 					// caller opts out of theming.
 					theme={themeless ? undefined : NARRAFORK_DOCKVIEW_THEME}
 					components={components}
-					tabComponents={tabComponents}
+					tabComponents={wrappedTabs}
 					// dockview-core's vanilla default tab only closes on the close-button
 					// click; dockview-react's DockviewDefaultTab additionally closes on a
 					// middle-click (mouse button 1) and honours `hideClose`. Registering it
 					// as the default gives every ordinary panel middle-click-to-close, while
 					// panels that opt into a custom `tabComponent` (e.g. the close-less chat
-					// protagonist on the single-narrator page) are unaffected.
-					defaultTabComponent={DockviewDefaultTab}
+					// protagonist on the single-narrator page) retain their own interactions.
+					// Both paths share the context menu through stable renderer wrappers.
+					defaultTabComponent={DefaultSurfaceTab}
 					onReady={handleReady}
 					onDidDrop={handleDidDrop}
 					onWillDrop={handleWillDrop}

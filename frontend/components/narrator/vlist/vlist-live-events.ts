@@ -133,11 +133,18 @@ export function timeoutUpdatedPatch(opts: { toolUseId: string; timeoutMs: number
  */
 export function sendDeliveryResolvedPatch(opts: {
 	toolUseId: string;
-	targets: Array<{ id: string; deliveryMessageId: string }>;
+	targets: import("@shared/communication-tool").SendDeliveryReceipt[];
 	toolCallBinding?: { toolCallId: string; attempt: number };
+	targetCount?: number;
 }): LivePatch {
 	return (messages) =>
-		patchSendDeliveryTargets(messages, opts.toolUseId, opts.targets, opts.toolCallBinding);
+		patchSendDeliveryTargets(
+			messages,
+			opts.toolUseId,
+			opts.targets,
+			opts.toolCallBinding,
+			opts.targetCount,
+		);
 }
 
 export function awaitAgentResolvedPatch(opts: {

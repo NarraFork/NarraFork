@@ -1,3 +1,5 @@
+import { runtimePolicyForContext } from "@server/services/agent-runtime/policy";
+import { SUBAGENT_SEND_ASYNC_ONLY_ERROR } from "@server/services/subagent-communication-policy";
 import { z } from "zod/v4";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
@@ -10,7 +12,8 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 			type: "string",
 		},
 		ids: {
-			description: "Target subagent IDs or aliases.",
+			description:
+				"Target IDs or aliases. Subagents may mix parent/main with sibling targets for ordinary asynchronous messages.",
 			type: "array",
 			items: { type: "string" },
 		},
@@ -40,7 +43,7 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 	// The model-facing schema omits reply-wait parameters for subagents. The Zod
 	// schema remains permissive for post-resolution validation and legacy inputs;
 	// the service layer is the authoritative runtime guard.
-	if (!config?.parentNarratorId) {
+	if (runtimePolicyForContext(config).capabilities.sendAwait) {
 		properties.await = {
 			description:
 				"Primary-narrator-only option: request and wait for target(s) to call Send back. Subagents must omit this or set it false; it does not wait for task completion.",
@@ -66,7 +69,9 @@ export const sendTool: ToolDefinition = {
 	description:
 		"Send a message to one or more accessible subagents. " +
 		"Primary narrators may send to their child subagents; subagents may send to sibling subagents. " +
-		'Subagents may also report progress to the narrator that launched them via the reserved target "parent" (or "main"), e.g. Send({ id: "parent", message: "..." }). ' +
+		'Subagents may also report progress to the narrator that launched them via "parent" (or "main"). Ordinary asynchronous messages may mix parent and sibling targets in one call; aliases for the same recipient are deduplicated. ' +
+		"Foreground reports are durably queued until the parent's safe input boundary; they do not start a second parent loop or guarantee immediate reading. Each target is accepted independently after whole-call authorization and reply validation; partial failures preserve successful deliveries. Explicit replyTo requires a single recipient, and replies cannot mix with ordinary messages. " +
+		"Messages have a 256 KiB UTF-8 body limit; larger content must use a file reference or summary. " +
 		"Use Send for new information, changed requirements, or concrete corrections—not for routine " +
 		"status checks after an Await timeout. Repeated messages can distract a working subagent. " +
 		"Set doInterrupt=true only when the current work must stop immediately; never use it merely " +
@@ -81,7 +86,12 @@ export const sendTool: ToolDefinition = {
 			.describe(
 				'Target subagent ID or alias. Subagents may use "parent" to reach their parent narrator.',
 			),
-		ids: z.array(z.string()).optional().describe("Target subagent IDs or aliases."),
+		ids: z
+			.array(z.string())
+			.optional()
+			.describe(
+				"Target IDs or aliases. Subagents may mix parent/main with sibling targets for ordinary asynchronous messages.",
+			),
 		name: z.string().optional().describe("Target subagent title, alias, or unique ID prefix."),
 		names: z
 			.array(z.string())
@@ -129,6 +139,9 @@ export const sendTool: ToolDefinition = {
 			await?: boolean;
 			timeout?: number;
 		};
+		if (raw.await === true && !runtimePolicyForContext(ctx).capabilities.sendAwait) {
+			return { output: `Send error: ${SUBAGENT_SEND_ASYNC_ONLY_ERROR}`, isError: true };
+		}
 		if (!raw.message?.trim()) {
 			return { output: "Error: message is required.", isError: true };
 		}
@@ -137,7 +150,7 @@ export const sendTool: ToolDefinition = {
 		}
 
 		const toolUseId = ctx.currentToolUseId;
-		const deliveryTargets = new Map<string, { id: string; deliveryMessageId: string }>();
+		let targetCount: number | undefined;
 		try {
 			const { sendSubagentMessageDetailed } = await import("@server/services/agent-communication");
 			const result = await sendSubagentMessageDetailed({
@@ -156,9 +169,23 @@ export const sendTool: ToolDefinition = {
 				signal: ctx.signal,
 				locale: ctx.locale,
 				userId: ctx.userId ?? null,
+				onTargetsResolved: (count) => {
+					targetCount = count;
+					void import("@server/services/send-delivery-resolution")
+						.then(({ broadcastSendDeliveryResolved }) =>
+							broadcastSendDeliveryResolved(
+								ctx.narratorId,
+								toolUseId,
+								[],
+								ctx.toolCallBinding,
+								count,
+							),
+						)
+						.catch(() => {});
+				},
 				onDeliveryResolved: (target) => {
-					deliveryTargets.set(target.id, { ...target });
-					const snapshot = [...deliveryTargets.values()];
+					// The frontend merges by receipt; avoid O(targets²) cumulative broadcasts.
+					const snapshot = [{ ...target }];
 					void import("@server/services/send-delivery-resolution")
 						.then(({ broadcastSendDeliveryResolved }) =>
 							broadcastSendDeliveryResolved(
@@ -166,6 +193,7 @@ export const sendTool: ToolDefinition = {
 								toolUseId,
 								snapshot,
 								ctx.toolCallBinding,
+								targetCount,
 							),
 						)
 						.catch(() => {});
@@ -190,6 +218,7 @@ export const sendTool: ToolDefinition = {
 					// Each entry carries both the real id (for the card's session link)
 					// and a readable label (for what the reader actually sees).
 					targets: result.targets,
+					targetCount: targetCount ?? result.targets.length,
 					doInterrupt: raw.doInterrupt ?? false,
 					await: raw.await ?? false,
 				},

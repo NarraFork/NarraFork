@@ -316,9 +316,16 @@ export function useVListLivePatches(
 			// "open session" item stays hidden for the whole wait — exactly when the
 			// child's progress is only visible inside its own session — because the
 			// id does not reach the persisted row until the tool returns.
-			onSendDeliveryResolved: (toolUseId, targets, parentToolUseId, toolCallBinding) => {
-				if (!toolUseId || routeParent(parentToolUseId)) return;
-				enqueue(sendDeliveryResolvedPatch({ toolUseId, targets, toolCallBinding }));
+			onSendDeliveryResolved: (
+				toolUseId,
+				targets,
+				_parentToolUseId,
+				toolCallBinding,
+				targetCount,
+			) => {
+				if (!toolUseId) return;
+				// The patch walks loaded children too; parent pages must receive child receipts.
+				enqueue(sendDeliveryResolvedPatch({ toolUseId, targets, toolCallBinding, targetCount }));
 			},
 			onAwaitAgentResolved: (toolUseId, subagentNarratorId) => {
 				if (!toolUseId || !subagentNarratorId) return;

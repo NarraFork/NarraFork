@@ -316,8 +316,7 @@ export interface SubagentSessionPanelContentProps {
 	 * a row that points at one specific thing this child said.
 	 *
 	 * Paired with `highlightRequestId` so a repeat click on an already-open panel
-	 * jumps again: `NarratorPanel` latches the jump per (narrator, target), and
-	 * remounting on a changed token is what re-arms that latch.
+	 * jumps again without remounting the session or discarding its loaded history.
 	 */
 	highlightMessageId?: string;
 	highlightRequestId?: string;
@@ -384,23 +383,8 @@ export function SubagentSessionPanelContent({
 			<FilePanelNavigationProvider value={onOpenFilePanel}>
 				<LazyPanelBoundary>
 					<NarratorPanel
-						/*
-						 * The request token joins the key so a repeat jump into an ALREADY-OPEN
-						 * panel actually moves. `NarratorPanel` latches its deep-link jump per
-						 * (narrator, target) — deliberately, so it does not fight the reader's own
-						 * scrolling — which means passing the same target again is a no-op. A new
-						 * token remounts the session, re-arming the latch.
-						 *
-						 * Remounting is acceptable precisely because the reader ASKED to be taken
-						 * somewhere: whatever scroll position is discarded is the position they are
-						 * navigating away from. Without the token in the key, the second click on a
-						 * speaker row would look broken.
-						 */
-						key={
-							highlightRequestId
-								? `${subagentNarratorId}:${highlightRequestId}`
-								: subagentNarratorId
-						}
+						key={subagentNarratorId}
+						highlightRequestId={highlightRequestId}
 						narratorId={subagentNarratorId}
 						narrator={narrator}
 						compact={compact}

@@ -47,6 +47,7 @@ interface ResumeCall {
 	prompt?: string;
 }
 const resumeCalls: ResumeCall[] = [];
+const resumePrincipals: unknown[] = [];
 let resumeStarted = true;
 let resumeThrows: Error | null = null;
 let activeResumeRuns = new Set<string>();
@@ -56,6 +57,7 @@ mock.module("../subagent-resume", () => ({
 	hasActiveSubagentResumeRun: (id: string) => activeResumeRuns.has(id),
 	// biome-ignore lint/suspicious/noExplicitAny: only the asserted fields are used
 	resumeSubagent: async (input: any) => {
+		resumePrincipals.push(input.executionPrincipal);
 		resumeCalls.push({
 			subagentId: input.subagentId,
 			intent: input.intent,
@@ -96,6 +98,7 @@ function seedNarrator(
 beforeEach(() => {
 	cleanDb(sqlite);
 	resumeCalls.length = 0;
+	resumePrincipals.length = 0;
 	resumeStarted = true;
 	resumeThrows = null;
 	activeResumeRuns = new Set();
@@ -112,6 +115,77 @@ afterAll(() => {
 });
 
 describe("an idle SUBAGENT recipient", () => {
+	test("an async question answer persists to the child before dispatching its original resume path", async () => {
+		seedNarrator(PARENT_ID);
+		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID });
+		const { narratorMessages, narratorToolCalls, users } = await import("../../db/schema");
+		const questions = await import("../narrator-question-service");
+		await db.insert(users).values({
+			id: "wake-original-user",
+			username: "wake-original-user",
+			passwordHash: "unused",
+			createdAt: now,
+		});
+		await db.insert(users).values({
+			id: "wake-answer-user",
+			username: "wake-answer-user",
+			passwordHash: "unused",
+			createdAt: now,
+		});
+		await db.insert(narratorMessages).values({
+			id: "wake-q-message",
+			narratorId: SUB_ID,
+			role: "assistant",
+			contentJson: [],
+			createdAt: now,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: "wake-q-call",
+			narratorId: SUB_ID,
+			messageId: "wake-q-message",
+			toolUseId: "wake-q-use",
+			toolName: "AskUserQuestion",
+			inputJson: { async: true },
+			status: "success",
+			createdAt: now,
+		});
+		const { record } = await questions.createAsyncQuestion({
+			narratorId: SUB_ID,
+			toolCallId: "wake-q-call",
+			toolUseId: "wake-q-use",
+			executionPrincipal: { version: 1, userId: "wake-original-user" },
+			questions: [{ question: "direction", header: "Which direction?", options: [] }],
+		});
+		const answer = await questions.answerAsyncQuestion(record.id, {
+			answers: { direction: "keep compatibility" },
+			userId: "wake-answer-user",
+			locale: "en",
+		});
+		expect(answer.ok).toBe(true);
+		if (!answer.ok) throw new Error("answer failed");
+		expect(answer.record.answerMessageId).not.toBeNull();
+		expect(resumePrincipals).toEqual([{ version: 1, userId: "wake-original-user" }]);
+		expect(resumeCalls).toEqual([
+			{
+				subagentId: SUB_ID,
+				intent: "continue_tool_results",
+				actor: "parent_agent",
+				prompt: undefined,
+			},
+		]);
+		const row = sqlite
+			.query(
+				"SELECT narrator_id, role, created_by, content_text FROM narrator_messages WHERE id = ?",
+			)
+			.get(answer.record.answerMessageId ?? "");
+		expect(row).toMatchObject({
+			narrator_id: SUB_ID,
+			role: "user",
+			created_by: "wake-answer-user",
+			content_text: expect.stringContaining("keep compatibility"),
+		});
+	});
+
 	test("is resumed rather than run through the primary loop", async () => {
 		seedNarrator(PARENT_ID);
 		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID });

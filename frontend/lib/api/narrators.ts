@@ -857,6 +857,11 @@ export const narratorsApi = {
 		}
 		return (await res.json()) as { ok: boolean };
 	},
+	retryBufferedMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: true; resumed: boolean }>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/retry`,
+			{ method: "POST" },
+		),
 	removeBufferedMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer/${messageId}`, {
 			method: "DELETE",

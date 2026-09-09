@@ -733,6 +733,136 @@ describe("end to end through a real SSE stream", () => {
 	}
 });
 
+describe("OpenAI lightweight partial output regression", () => {
+	const partialText = "  partial\ntext\t";
+	for (const apiMode of ["completions", "responses"] as const) {
+		for (const transport of ["SSE", "JSON"] as const) {
+			for (const method of ["generateWithMeta", "generateWithHistoryWithMeta"] as const) {
+				async function run(withText: boolean, withError = false) {
+					const provider = new OpenAIProvider({
+						id: "test-openai",
+						name: "Test OpenAI",
+						prefix: "openai",
+						apiKey: "test-key",
+						baseUrl: "https://example.com/v1",
+						defaultModel: "gpt-5",
+						apiMode,
+					});
+					const error = { code: "server_error", message: "upstream unavailable max_tokens" };
+					const usage =
+						apiMode === "completions"
+							? {
+									prompt_tokens: 11,
+									completion_tokens: 7,
+									prompt_tokens_details: { cached_tokens: 3 },
+									completion_tokens_details: { reasoning_tokens: 2 },
+								}
+							: {
+									input_tokens: 11,
+									output_tokens: 7,
+									input_tokens_details: { cached_tokens: 3 },
+									output_tokens_details: { reasoning_tokens: 2 },
+								};
+					const text = withText ? partialText : "";
+					const incomplete = {
+						status: "incomplete",
+						incomplete_details: { reason: "max_output_tokens" },
+					};
+					const frames: unknown[] =
+						apiMode === "completions"
+							? [
+									// Text can first appear on the same chunk as finish_reason.
+									{ choices: [{ index: 0, delta: { content: text }, finish_reason: "length" }] },
+									{ choices: [], usage },
+								]
+							: [
+									...(withText ? [{ type: "response.output_text.delta", delta: text }] : []),
+									{ type: "response.incomplete", response: incomplete },
+									// Relays may deliver final accounting after the first incomplete event.
+									{ type: "response.completed", response: { ...incomplete, usage } },
+								];
+					if (withError) frames.push({ type: "error", error });
+					const json =
+						apiMode === "completions"
+							? {
+									choices: [{ index: 0, message: { content: text }, finish_reason: "length" }],
+									usage,
+									...(withError && { error }),
+								}
+							: {
+									...incomplete,
+									output: [{ type: "message", content: [{ type: "output_text", text }] }],
+									usage,
+									...(withError && { status: "failed", error }),
+								};
+					const body =
+						transport === "SSE"
+							? `${frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join("")}data: [DONE]\n\n`
+							: JSON.stringify(json);
+					const originalFetch = globalThis.fetch;
+					globalThis.fetch = (async () =>
+						new Response(body, {
+							headers: {
+								"content-type": transport === "SSE" ? "text/event-stream" : "application/json",
+							},
+						})) as unknown as typeof fetch;
+					const deltas: string[] = [];
+					const options = {
+						onTextDelta: async (delta: string) => {
+							deltas.push(delta);
+						},
+					};
+					try {
+						const result =
+							method === "generateWithMeta"
+								? await provider.generateWithMeta("prompt", "openai:gpt-5", "system", options)
+								: await provider.generateWithHistoryWithMeta(
+										"system",
+										"prompt",
+										"openai:gpt-5",
+										"en",
+										options,
+									);
+						return { result, deltas };
+					} finally {
+						globalThis.fetch = originalFetch;
+					}
+				}
+
+				test(`${apiMode} ${method} ${transport} retains partial text and full trailing usage`, async () => {
+					const { result, deltas } = await run(true);
+					expect(result).toMatchObject({
+						text: partialText,
+						outputTruncated: true,
+						usage: { inputTokens: 11, outputTokens: 7, cachedInputTokens: 3, reasoningTokens: 2 },
+					});
+					expect(deltas).toEqual([partialText]);
+				});
+
+				test(`${apiMode} ${method} ${transport} still rejects a completion limit without text`, async () => {
+					await expect(run(false)).rejects.toMatchObject({
+						reason:
+							apiMode === "responses"
+								? "max_output_tokens"
+								: transport === "SSE"
+									? "max_tokens"
+									: "length",
+						classification: "completion_limit",
+						retryable: false,
+					});
+				});
+
+				test(`${apiMode} ${method} ${transport} does not swallow a real error after partial output`, async () => {
+					await expect(run(true, true)).rejects.toMatchObject({
+						reason: "server_error",
+						message: expect.stringContaining("upstream unavailable max_tokens"),
+					});
+				});
+			}
+		}
+	}
+});
+
 describe("Codex WebSocket wrapped-error parser", () => {
 	for (const [name, shape, expected] of UNDISCRIMINATED_SHAPES) {
 		test(`recognizes ${name}`, () => {

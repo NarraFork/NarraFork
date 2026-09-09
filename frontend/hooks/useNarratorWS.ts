@@ -480,9 +480,10 @@ interface NarratorWSCallbacks {
 	/** Accepted Send receipts; their reserved message IDs may still be queued. */
 	onSendDeliveryResolved?: (
 		toolUseId: string,
-		targets: Array<{ id: string; deliveryMessageId: string }>,
+		targets: import("@shared/communication-tool").SendDeliveryReceipt[],
 		parentToolUseId?: string,
 		toolCallBinding?: { toolCallId: string; attempt: number },
+		targetCount?: number,
 	) => void;
 	onTitleUpdated?: (title: string) => void;
 	onBufferSet?: (messages: BufferMessageSummary[]) => void;
@@ -1127,9 +1128,10 @@ export function useNarratorWS(
 					case "send_delivery_resolved":
 						callbackOwner.callbacks.onSendDeliveryResolved?.(
 							data.toolUseId as string,
-							data.targets as Array<{ id: string; deliveryMessageId: string }>,
+							data.targets as import("@shared/communication-tool").SendDeliveryReceipt[],
 							data.parentToolUseId as string | undefined,
 							data.toolCallBinding as { toolCallId: string; attempt: number } | undefined,
+							data.targetCount as number | undefined,
 						);
 						break;
 					case "title_updated":

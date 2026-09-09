@@ -147,6 +147,37 @@ describe("communication bubble geometry", () => {
 		).toBe(second);
 	});
 
+	test("consumption, reply counts and current titles repaint without moving geometry", async () => {
+		const { measureElementCached } = await import("../registry");
+		const base = {
+			message: "hello",
+			status: "success",
+			recipients: [{ id: "child", label: "alias", title: "Old", deliveryMessageId: "m" }],
+			deliveryState: {
+				targetCount: 3,
+				sentCount: 3,
+				receivedCount: 0,
+				replyCount: 0,
+				awaitReply: true,
+			},
+		};
+		const measure = (data: unknown) =>
+			measureElementCached("communication-bubble", data, 500, 1, undefined, "send-state-cache");
+		let previous = measure(base);
+		for (const patch of [
+			{ ...base, recipients: [{ ...base.recipients[0], title: "Current" }] },
+			{ ...base, deliveryState: { ...base.deliveryState, receivedCount: 2 } },
+			{ ...base, deliveryState: { ...base.deliveryState, receivedCount: 3, replyCount: 2 } },
+			{ ...base, deliveryState: { ...base.deliveryState, receivedCount: 3, replyCount: 3 } },
+		]) {
+			const next = measure(patch);
+			expect(next).not.toBe(previous);
+			expect(next.height).toBe(previous.height);
+			expect(measure({ ...patch })).toBe(next);
+			previous = next;
+		}
+	});
+
 	test("cache invalidates body, truncation, and error without a status transition", async () => {
 		const { measureElementCached, VLIST_REGISTRY } = await import("../registry");
 		const data = { message: "short", status: "success" };

@@ -298,7 +298,12 @@ async function loadManager(): Promise<McpManagerLike> {
 async function loadSettingsRef(): Promise<SettingsLike> {
 	const mod = await import("../../settings");
 	return {
-		mcpServers: Array.isArray(mod.settings.mcpServers) ? mod.settings.mcpServers : [],
+		get mcpServers() {
+			return Array.isArray(mod.settings.mcpServers) ? mod.settings.mcpServers : [];
+		},
+		set mcpServers(servers: unknown[]) {
+			mod.settings.mcpServers = servers as NonNullable<typeof mod.settings.mcpServers>;
+		},
 		save() {
 			mod.saveSettings(mod.settings);
 		},

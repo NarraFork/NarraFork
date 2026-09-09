@@ -334,11 +334,14 @@ export function useVListLabels(): VListLabels {
 			// These prefixes wrap together with the answer text, so they are MEASURED
 			// (adapter labels) rather than substituted by the render layer.
 			sendAwaitReply: t("sendAwaitReply"),
-			sendNoAwaitReply: t("sendNoAwaitReply"),
 			communicationBroadcast: t("communicationBroadcast"),
 			communicationRecipientUnknown: t("communicationRecipientUnknown"),
 			communicationRunning: t("communicationRunning"),
+			communicationNoRecipients: t("communicationNoRecipients"),
 			communicationSuccess: t("communicationSuccess"),
+			communicationReceived: t("communicationReceived"),
+			communicationReplyReceived: t("communicationReplyReceived"),
+			communicationTimeout: t("communicationTimeout"),
 			communicationError: t("communicationError"),
 			communicationCancelled: t("communicationCancelled"),
 			communicationWaiting: t("communicationWaiting"),

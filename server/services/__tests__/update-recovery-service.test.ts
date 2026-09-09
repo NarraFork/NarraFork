@@ -1,5 +1,14 @@
 import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { cleanDb } from "../../../tests/setup";
+import { db, sqlite } from "../../db";
+import {
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+} from "../../db/schema";
 import { NotFoundError } from "../../lib/errors";
+import { runtimePublication } from "../agent-runtime/publication";
 
 const realNarratorServiceModule = { ...(await import("../narrator-service")) };
 const realNarratorPersistenceModule = { ...(await import("../narrator-persistence")) };
@@ -426,6 +435,7 @@ afterEach(() => {
 	continuationRows = [];
 	setObservedRestartHandoffForTests(null);
 	updateCoordinator.resetUpdateCoordinationForTests();
+	cleanDb(sqlite);
 });
 
 afterAll(() => {
@@ -487,6 +497,79 @@ function recoveryItem(
 }
 
 async function prepareRecovery() {
+	// These are current-protocol scheduling fixtures, not fabricated legacy proofs.
+	// Persist their original run/slot and exact origin before simulating replacement.
+	for (const item of recoveryQueue) {
+		const record = item.record;
+		if (record.kind !== "foreground_agent" && record.kind !== "background_agent") continue;
+		const subagentId = record.payloadJson?.subagentId;
+		if (typeof subagentId !== "string") continue;
+		const now = new Date().toISOString();
+		db.insert(narrators)
+			.values({
+				id: record.narratorId,
+				type: "primary",
+				variant: "primary",
+				createdAt: now,
+				updatedAt: now,
+			})
+			.onConflictDoNothing()
+			.run();
+		db.insert(narratorMessages)
+			.values({
+				id: item.messageId,
+				narratorId: record.narratorId,
+				role: "assistant",
+				contentJson: [],
+				createdAt: now,
+			})
+			.onConflictDoNothing()
+			.run();
+		db.insert(narratorMessageRefs)
+			.values({
+				id: `ref-${item.messageId}`,
+				narratorId: record.narratorId,
+				messageId: item.messageId,
+				seq: 1,
+			})
+			.onConflictDoNothing()
+			.run();
+		db.insert(narratorToolCalls)
+			.values({
+				id: record.toolCallId,
+				narratorId: record.narratorId,
+				messageId: item.messageId,
+				toolUseId: toolCallResults.get(record.toolCallId)?.toolUseId ?? record.toolCallId,
+				toolName: "Agent",
+				inputJson: item.input,
+				status: "running",
+				executionIdentityVersion: 1,
+				executionAttempt: 1,
+				executionStartedAt: now,
+				createdAt: now,
+			})
+			.onConflictDoNothing()
+			.run();
+		db.insert(narrators)
+			.values({
+				id: subagentId,
+				type: "subagent",
+				variant: "subagent:general",
+				parentNarratorId: record.narratorId,
+				originToolCallId: record.toolCallId,
+				subagentOriginKind: "tool",
+				status: "working",
+				createdAt: now,
+				updatedAt: now,
+			})
+			.onConflictDoNothing()
+			.run();
+		const run = runtimePublication.startAgentRun({
+			narratorId: subagentId,
+			parentNarratorId: record.narratorId,
+		});
+		record.payloadJson = { ...record.payloadJson, logicalRunId: run.logicalRunId };
+	}
 	updateCoordinator.writePlannedUpdateRecoverySnapshot({
 		version: 2,
 		updateEpoch: "epoch",

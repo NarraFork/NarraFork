@@ -24,7 +24,7 @@ import { db } from "../../db";
 import { narrators, narratorToolCalls } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { deleteNugCachedModels, setNugCachedModels } from "../../lib/nug-model-cache";
-import { settings } from "../../lib/settings";
+import { settings, usesStatefulModel } from "../../lib/settings";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 import * as narratorExecutor from "../narrator-executor";
 import * as narratorRecovery from "../narrator-recovery";
@@ -699,20 +699,24 @@ describe("the spec read is the SUBAGENT's own namespace", () => {
 describe("persisted continuation reaches the next executor request", () => {
 	async function runContinuation(
 		cause: SubagentContinuationCause,
-		route: "compatible" | "official" | "nug",
+		route: "compatible" | "official" | "nug" | "responses",
 		options: { blocked?: boolean; retry?: boolean; hints?: boolean; noTools?: boolean } = {},
 	) {
 		const prefix = `spec_${route}`;
+		const baseModel = route === "responses" ? "gpt-5" : "claude-sonnet-4";
+		const savedOpenaiProviders = settings.openaiProviders;
 		const providerConfig = {
 			id: generateId(),
 			name: "Spec continuation regression",
 			prefix,
 			apiKey: "test-only",
 			baseUrl: "https://example.invalid/v1",
-			defaultModel: "claude-sonnet-4",
+			defaultModel: baseModel,
 		};
-		const model = `${prefix}:${route === "nug" ? "anthropic:" : ""}claude-sonnet-4`;
-		if (route === "nug") {
+		const model = `${prefix}:${route === "nug" ? "anthropic:" : ""}${baseModel}`;
+		if (route === "responses") {
+			settings.openaiProviders = [{ ...providerConfig, apiMode: "responses" }];
+		} else if (route === "nug") {
 			settings.nugProviders = [providerConfig];
 			setNugCachedModels(providerConfig.id, [
 				{
@@ -831,19 +835,40 @@ describe("persisted continuation reaches the next executor request", () => {
 				systemPrompt: "Test subagent",
 				initialHistory: [],
 			});
-			expect(result.hasError).toBe(false);
-			expect(requests).toHaveLength(options.retry ? 3 : 2);
+			// Use the real configured provider classification, never a mocked identity:
+			// Anthropic exhausted its inner retries; Responses can rebuild a stateful session.
+			const stateful = usesStatefulModel(prefix, model);
+			expect(stateful).toBe(route === "responses");
+			const exhaustedStateless = !!options.retry && !stateful;
+			expect(result.hasError).toBe(exhaustedStateless);
+			expect(requests).toHaveLength(options.retry && stateful ? 3 : 2);
+			expect(retry).toHaveBeenCalledTimes(options.retry && stateful ? 1 : 0);
+			if (exhaustedStateless) {
+				expect(result.finalText).toContain("test transient failure");
+				expect((await readSubagentSpecContinuationState(narratorId)).openTask?.status).toBe(
+					task.status,
+				);
+			}
 			const rows = await narratorService.getModelHistorySinceLastCompact(narratorId);
-			const injection = rows.find(
+			const injections = rows.filter(
 				(row) => row.role === "sys" && row.contentText?.includes("Self-continuations left"),
 			);
+			// A retry must neither grant another Spec continuation nor spend its budget again.
+			expect(injections).toHaveLength(1);
+			const injection = injections[0];
 			expect(injection?.parentToolUseId).toBe(toolUseId);
 			const content = injection?.contentText;
 			if (!content) throw new Error("expected the persisted continuation sys row");
 			expect(content).toContain("Self-continuations left");
 			for (const request of requests.slice(1)) {
 				// Assert the ACTUAL next pass input, not a manually concatenated BuiltHistory.
-				if (route === "official") {
+				if (route === "responses") {
+					expect(request.userText).toBe("");
+					expect(request.history).toContainEqual({
+						role: "user",
+						content: [{ type: "input_text", text: content }],
+					});
+				} else if (route === "official") {
 					expect(request.userText).toBe("");
 					expect(request.history).toContainEqual({ role: "system", content });
 				} else {
@@ -876,6 +901,7 @@ describe("persisted continuation reaches the next executor request", () => {
 			executor.mockRestore();
 			retry.mockRestore();
 			if (route === "nug") deleteNugCachedModels(providerConfig.id);
+			if (route === "responses") settings.openaiProviders = savedOpenaiProviders;
 		}
 	}
 
@@ -897,6 +923,9 @@ describe("persisted continuation reaches the next executor request", () => {
 	test("blocked-task sys prompt reaches the next compatible Anthropic pass", () =>
 		runContinuation("spec", "compatible", { blocked: true }));
 
-	test("retrying the continuation request does not append the same sys text again", () =>
+	test("stateless continuation failure does not multiply retries or spend the Spec budget twice", () =>
 		runContinuation("spec", "compatible", { retry: true }));
+
+	test("stateful Responses retry preserves one continuation sys row and one Spec budget grant", () =>
+		runContinuation("spec", "responses", { retry: true }));
 });

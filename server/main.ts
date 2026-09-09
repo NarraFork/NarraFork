@@ -1260,6 +1260,11 @@ pluginManager
 // the background after that queue is mounted.
 getPlannedUpdateStartupProtection()
 	.then(async (plannedUpdate) => {
+		// The instance lock is already held. Release only previous-process mailbox claims
+		// before planned recovery mounts owners; hot reload preserves the process marker.
+		await import("./services/agent-runtime/inbox").then(({ recoverInboxClaimsOnColdStartup }) =>
+			recoverInboxClaimsOnColdStartup(),
+		);
 		await recoverNarrators(plannedUpdate.protection);
 		await restorePendingModelOverrides();
 		// Browser-backed narrators must see their restored sessions before planned-update continuation

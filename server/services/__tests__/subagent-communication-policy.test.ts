@@ -55,9 +55,8 @@ describe("subagent communication policy", () => {
 		expect(subagentAwaitTypes).not.toContain("agent");
 		expect(subagentAwaitTypes).toContain("bash");
 		expect(subagentAwaitTypes).toContain("transfer");
-		// A subagent can ask a question asynchronously, so it must be able to wait for its
-		// own answer. Only `agent` is withheld — a subagent awaiting a sibling is the case
-		// that deadlocks.
+		// Own-question waits are independent of question creation: P5 enables async
+		// creation, while a custom allowlist may still withhold AskUserQuestion.
 		expect(subagentAwaitTypes).toContain("question");
 		// Asserted as a SUPERSET plus the agent-only check, not as an exact list. The exact
 		// form pinned the wait-target vocabulary itself, so adding a target that subagents

@@ -8,6 +8,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
+import { generateShortId } from "../id";
 import { logger } from "../logger";
 import { invalidateModelCardCache } from "../model-cards";
 import { type ModelPricing, setModelPricingOverrides } from "../model-pricing";
@@ -397,6 +398,10 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
+	if (normalizeMcpServerIds(merged)) {
+		needsSave = true;
+	}
+
 	if (migrateLegacyMcpBehaviors(merged)) {
 		needsSave = true;
 	}
@@ -482,6 +487,29 @@ type LegacyMcpServerConfig = {
 	defaultBehavior?: string;
 	toolPermissions?: Array<{ behavior?: string }>;
 };
+
+/** Raw settings edits bypass the MCP create route, but every UI action needs a unique string ID. */
+export function normalizeMcpServerIds(settings: NarraForkSettings): boolean {
+	if (!Array.isArray(settings.mcpServers)) return false;
+	const isValidId = (id: unknown): id is string => typeof id === "string" && id.trim().length > 0;
+	// Reserve existing IDs before generating replacements so valid references stay intact.
+	const reserved = new Set(settings.mcpServers.map((server) => server.id).filter(isValidId));
+	const seen = new Set<string>();
+	let dirty = false;
+	for (const server of settings.mcpServers) {
+		if (!isValidId(server.id) || seen.has(server.id)) {
+			let id: string;
+			do {
+				id = generateShortId();
+			} while (reserved.has(id));
+			server.id = id;
+			reserved.add(id);
+			dirty = true;
+		}
+		seen.add(server.id);
+	}
+	return dirty;
+}
 
 /** Migrate pre readOnly/readWrite MCP behavior values. */
 export function migrateLegacyMcpBehaviors(settings: NarraForkSettings): boolean {
@@ -697,6 +725,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	normalizeCustomApiProviderSettings(newSettings);
 	normalizeSettingsProxyUrls(newSettings);
 	normalizeSearchSettings(newSettings);
+	normalizeMcpServerIds(newSettings);
 	mkdirSync(narraforkDir, { recursive: true });
 	const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
 	try {

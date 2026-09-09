@@ -1,105 +1,82 @@
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators } from "../db/schema";
-import {
-	type AgentConfig,
-	buildHistory,
-	type RuntimeSettingsOverride,
-	TODO_REMINDER_TOOL_INTERVAL,
-} from "../lib/agent";
-import {
-	freezeFileReferenceSnapshots,
-	projectFileReferenceText,
-} from "../lib/agent/file-reference-projection";
-import {
-	normalizeAutoContinuationMode,
-	normalizeBooleanOverride,
-	resolveAutoContinuationMode,
-} from "../lib/boolean-override";
-import { resolveInjectedDevices } from "../lib/device-injection-trait";
+import { projectFileReferenceText } from "../lib/agent/file-reference-projection";
+import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
-import { resolveFastModeForUser, resolveSubagentActingUserId } from "../lib/fast-mode";
-import { generateShortId } from "../lib/id";
-import { InjectionCadence } from "../lib/injection-cadence";
 import { logger } from "../lib/logger";
-import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
-import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
-import { resolveKnownUnavailableNugModel } from "../lib/nug-model-availability";
-import { markNugCachedModelUnavailable } from "../lib/nug-model-cache";
-import { getToolMessage, type Locale } from "../lib/prompt-i18n";
-import {
-	isAnthropicProvider,
-	resolveDefaultReasoningEffort,
-	resolveEffectiveModel,
-	resolveProvider,
-	settings,
-	usesCodexModel,
-} from "../lib/settings";
-import { sideCarBodyWithText } from "../lib/sidecar-templates";
+import type { Locale } from "../lib/prompt-i18n";
+import { resolveEffectiveModel, resolveProvider } from "../lib/settings";
 import { type ImageRef, saveTextFileToWorktree, type TextFileRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import type { MailboxDeliveryConsumption } from "./agent-message-delivery";
+import { createRuntimeEventContext } from "./agent-runtime/context";
+import { buildRuntimeHistory } from "./agent-runtime/history";
+import {
+	claimInboxHead,
+	enqueueInboxAgent,
+	type InboxAgentMetadata,
+	inboxAgentText,
+	inboxClaim,
+	inboxConsumption,
+	inboxDelivery,
+	inboxMetadata,
+	peekInbox,
+	releaseInboxClaim,
+	withInboxOwner,
+} from "./agent-runtime/inbox";
+import type { RuntimeForegroundControl } from "./agent-runtime/input";
+import type { MailboxClaim, MailboxRow } from "./agent-runtime/mailbox-types";
+import { runAgentLoopUnlocked } from "./agent-runtime/orchestrator";
+import {
+	claimExecutionPass,
+	clearRuntimeBufferSoftStop,
+	type ExecutionOwner,
+	hasRuntimeBufferSoftStop,
+	requestRuntimeBufferSoftStop,
+	tryClaimExecution,
+} from "./agent-runtime/ownership";
 import type { CustomSubagentDef } from "./custom-subagent-service";
-import { getAgentFileReferenceContext } from "./file-reference-context";
-import { gitService } from "./git-service";
 import { knowledgeService } from "./knowledge-service";
-import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
-import { type ExecuteLoopResult, executeAgentLoop } from "./narrator-executor";
+import {
+	cleanupBufferedTextFiles,
+	clearBufferedMessages,
+	deleteBufferedTextFile,
+	enqueueBufferedMessage,
+	getBufferedMessages,
+	persistAdditionalBufferedTextFiles,
+	projectMailboxUserMessage,
+	removeBufferedMessage,
+	reorderBufferedMessages,
+	updateBufferedMessage,
+} from "./narrator-buffer";
+import type { EventHandlerContext } from "./narrator-event-handler";
+import type { ExecuteLoopResult } from "./narrator-executor";
 import { deliverInjection } from "./narrator-injection";
-import {
-	getContextOverflowFailureError,
-	getFirstTokenTimeoutMs,
-	getMaxTransientRetries,
-	getPipelineUnusedToolCallThreshold,
-	getRetryBackoffCeilMs,
-	getSilentToolCallThreshold,
-	handleContextOverflow,
-	handleTransientError,
-	MAX_CONTEXT_OVERFLOW_RETRIES,
-	resetContextOverflowRetriesAfterProgress,
-} from "./narrator-recovery";
 import { narratorService } from "./narrator-service";
+import { toBufferSummary } from "./narrator-session";
 import {
-	buildContextManagementHooks,
-	finalizeOrCleanupPartialMessage,
-	handlePermission,
-	pruneToolCalls,
-	toBufferSummary,
-} from "./narrator-session";
-import {
+	type ActiveNarrator,
 	activeNarrators,
-	activeSubagentSettings,
+	knowledgeInjectionCycleStates,
 	registerActiveSubagent,
 	unregisterActiveSubagent,
+	withNarratorStartAdmission,
+	withNarratorWorkAdmission,
 } from "./narrator-session-state";
-import {
-	abandonSessionTreeSnapshots,
-	type TreeSnapshotSession,
-} from "./narrator-tree-snapshot-hooks";
-import { buildSpecTaskDigestBody } from "./spec-reminder";
+import { abandonSessionTreeSnapshots } from "./narrator-tree-snapshot-hooks";
+import { projectPendingInjection } from "./parent-injection-queue";
 import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
 import { specVfsService } from "./spec-vfs-service";
 import {
 	clearSubagentKnowledgeCycle,
 	getSubagentKnowledgeCycle,
 	scanSubagentTextForKnowledge,
-	syncSubagentKnowledgeCycle,
 } from "./subagent-knowledge-injection";
-import { clearTeamInbox, drainTeamInbox } from "./subagent-team";
-import { resolveToolFilter } from "./subagent-tools";
-import { resolveEffectiveTraits } from "./trait-layer-service";
-import { buildTreeSnapshotEventHooks } from "./tree-snapshot-loop-hooks";
-import {
-	buildSubagentContinuationPrompt,
-	createSubagentContinuationState,
-	interruptionContinuationLabel,
-	planSubagentContinuation,
-	planTurnInterruption,
-	type SubagentContinuationCause,
-	subagentContinuationStopNote,
-	type TurnInterruptionPlan,
-} from "./turn-continuation-decisions";
+import { planTurnInterruption, type TurnInterruptionPlan } from "./turn-continuation-decisions";
 import type { UpdateExecutionLease } from "./update-coordinator";
 
 // ---------------------------------------------------------------------------
@@ -107,6 +84,11 @@ import type { UpdateExecutionLease } from "./update-coordinator";
 // ---------------------------------------------------------------------------
 
 export interface SubagentBufferedMessage {
+	state?: "queued" | "failed";
+	error?: string | null;
+	_mailboxClaim?: MailboxClaim;
+	_mailboxConsumption?: MailboxDeliveryConsumption;
+	_stagingId?: string;
 	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	id: string;
 	text: string;
@@ -121,6 +103,7 @@ export interface SubagentBufferedMessage {
 }
 
 export interface SubagentExecOptions {
+	control?: RuntimeForegroundControl;
 	narratorId: string;
 	parentNarratorId: string;
 	toolUseId: string;
@@ -145,6 +128,7 @@ export interface SubagentExecOptions {
 	/** Initial history (empty for new subagents, pre-loaded for continued) */
 	initialHistory: unknown[];
 	initialTrailingToolResults?: unknown[];
+	initialPrePromptBashCommand?: string;
 	/** Pre-loaded custom subagent definition (avoids redundant I/O) */
 	customDef?: CustomSubagentDef | null;
 	/** Rebuild system prompt callback — called after compact to regenerate with new contextSummary */
@@ -161,32 +145,52 @@ export interface SubagentExecOptions {
 // where a stale dynamic-import resolution can reference the module binding
 // before the const initializer has executed.
 
-let _subagentBufferedMessages: Map<string, SubagentBufferedMessage[]> | undefined;
-export function getSubagentBufferedMessagesMap() {
-	if (!_subagentBufferedMessages) _subagentBufferedMessages = new Map();
-	return _subagentBufferedMessages;
+function projectSubagentInboxMessage(row: MailboxRow): SubagentBufferedMessage {
+	if (row.kind === "user_input") {
+		const user = projectMailboxUserMessage(row);
+		return {
+			...user,
+			prePromptBashCommand: user.bashCommand ?? undefined,
+			_mailboxConsumption: inboxConsumption(row),
+		};
+	}
+	return {
+		id: row.id,
+		text: inboxAgentText(row),
+		delivery: inboxDelivery(row),
+		createdBy: row.createdBy,
+		bufferedAt: row.bufferedAt,
+		...(row.state === "claimed" ? { _mailboxClaim: inboxClaim(row) } : {}),
+	};
 }
-
-let _subagentBufferedMessageSoftStops: Set<string> | undefined;
-function getSubagentBufferedMessageSoftStops(): Set<string> {
-	if (!_subagentBufferedMessageSoftStops) _subagentBufferedMessageSoftStops = new Set();
-	return _subagentBufferedMessageSoftStops;
+function acceptsBufferedSubagentInput(row: Pick<MailboxRow, "kind" | "metadataJson">): boolean {
+	return (
+		row.kind === "user_input" ||
+		(row.kind === "agent_message" && inboxMetadata<InboxAgentMetadata>(row).channel === "buffer")
+	);
+}
+function peekSubagentBufferedMessage(narratorId: string): SubagentBufferedMessage | undefined {
+	const row = peekInbox(narratorId);
+	return row && acceptsBufferedSubagentInput(row) ? projectSubagentInboxMessage(row) : undefined;
+}
+/** Read-only legacy inspection; this object owns no queue or mutable arrays. */
+export function getSubagentBufferedMessagesMap() {
+	return {
+		get: (id: string) => getSubagentBufferedMessages(id),
+		has: (id: string) => getSubagentBufferedMessages(id).length > 0,
+	};
 }
 
 /** Stop the current subagent loop at the next safe post-tool boundary. */
 export function requestSubagentBufferedMessageSoftStop(subagentId: string): void {
-	getSubagentBufferedMessageSoftStops().add(subagentId);
+	requestRuntimeBufferSoftStop(subagentId);
 }
 
 /** Whether a queued user message should stop this loop at its next safe boundary. */
 export function shouldStopSubagentForBufferedMessage(subagentId: string): boolean {
-	return (
-		getSubagentBufferedMessageSoftStops().has(subagentId) &&
-		(getSubagentBufferedMessagesMap().get(subagentId)?.length ?? 0) > 0
-	);
+	return hasRuntimeBufferSoftStop(subagentId) && !!peekInbox(subagentId);
 }
 
-const MAX_BUFFERED_MESSAGES = 10;
 export const MAX_SUBAGENT_INTERRUPTION_RETRIES = 3;
 
 /**
@@ -448,54 +452,48 @@ export interface SubagentBufferedMessageOptions {
 	position?: "front" | "back";
 }
 
-export function pushSubagentBufferedMessage(
+export async function pushSubagentBufferedMessage(
 	subagentId: string,
 	text: string,
 	options?: SubagentBufferedMessageOptions,
-): { ok: boolean; bufferedAt: string; id: string; full?: boolean } {
-	const queue = getSubagentBufferedMessagesMap().get(subagentId) ?? [];
-	const bufferedAt = new Date().toISOString();
-	const id = generateShortId();
-	if (queue.length >= MAX_BUFFERED_MESSAGES) {
-		return { ok: false, bufferedAt, id, full: true };
+): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean; duplicate?: boolean }> {
+	if (options?.delivery) {
+		const result = enqueueInboxAgent(options.delivery, text, { createdBy: options.createdBy });
+		if (result.delivery.state === "cancelled" || result.delivery.state === "failed")
+			throw new Error(`Previous delivery is ${result.delivery.state}; explicit retry is required`);
+		return {
+			ok: true,
+			bufferedAt: result.delivery.bufferedAt,
+			id: result.delivery.id,
+			duplicate: result.status === "duplicate",
+		};
 	}
-	const position = options?.position ?? "back";
-	const entry: SubagentBufferedMessage = {
-		delivery: options?.delivery,
-		id,
+	return enqueueBufferedMessage(
+		subagentId,
 		text,
-		images: options?.images,
-		textFiles: options?.textFiles,
-		fileReferences: freezeFileReferenceSnapshots(options?.fileReferences),
-		commandText: options?.commandText,
-		createdBy: options?.createdBy,
-		prePromptBashCommand: options?.prePromptBashCommand,
-		bufferedAt,
-		priority: position === "front" || undefined,
-	};
-	if (position === "front") {
-		// Priority messages stay ahead of ordinary messages, but remain FIFO among
-		// themselves. Repeated unshift() would reverse consecutive priority input.
-		const firstOrdinaryIndex = queue.findIndex((queued) => !queued.priority);
-		queue.splice(firstOrdinaryIndex < 0 ? queue.length : firstOrdinaryIndex, 0, entry);
-	} else {
-		queue.push(entry);
-	}
-	getSubagentBufferedMessagesMap().set(subagentId, queue);
-	return { ok: true, bufferedAt, id };
+		options?.images,
+		options?.commandText,
+		options?.createdBy,
+		null,
+		options?.textFiles,
+		options?.position,
+		options?.prePromptBashCommand,
+		options?.fileReferences,
+		"fifo",
+	);
 }
 
 /** Queue direct user feedback and optionally request the next safe stop boundary. */
-export function bufferSubagentUserMessage(
+export async function bufferSubagentUserMessage(
 	subagentId: string,
 	text: string,
 	options?: Omit<SubagentBufferedMessageOptions, "position"> & {
 		priority?: boolean;
 		requestSoftStop?: boolean;
 	},
-): { ok: boolean; bufferedAt: string; id: string; full?: boolean } {
+): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
 	const { priority = false, requestSoftStop = true, ...messageOptions } = options ?? {};
-	const result = pushSubagentBufferedMessage(subagentId, text, {
+	const result = await pushSubagentBufferedMessage(subagentId, text, {
 		...messageOptions,
 		position: priority ? "front" : "back",
 	});
@@ -505,13 +503,16 @@ export function bufferSubagentUserMessage(
 
 /** Clear the entire subagent buffer queue and any pending post-tool stop. */
 export function clearSubagentBufferedMessages(subagentId: string): void {
-	getSubagentBufferedMessagesMap().delete(subagentId);
-	getSubagentBufferedMessageSoftStops().delete(subagentId);
+	clearBufferedMessages(subagentId);
+	clearRuntimeBufferSoftStop(subagentId);
 }
 
 /** Get the full subagent buffer queue (for REST hydration). */
 export function getSubagentBufferedMessages(subagentId: string): SubagentBufferedMessage[] {
-	return getSubagentBufferedMessagesMap().get(subagentId) ?? [];
+	return getBufferedMessages(subagentId).map((message) => ({
+		...message,
+		prePromptBashCommand: message.bashCommand ?? undefined,
+	}));
 }
 
 /**
@@ -519,33 +520,24 @@ export function getSubagentBufferedMessages(subagentId: string): SubagentBuffere
  * message id does not exist, so callers can fall through to the primary-narrator
  * queue (the two queues live in separate maps and never share ids).
  */
-export function updateSubagentBufferedMessage(
+export async function updateSubagentBufferedMessage(
 	subagentId: string,
 	messageId: string,
 	text: string,
 	opts?: { images?: ImageRef[]; textFiles?: File[]; fileReferences?: FileReferenceSnapshot[] },
-): boolean {
-	const queue = getSubagentBufferedMessagesMap().get(subagentId);
-	const message = queue?.find((queued) => queued.id === messageId);
-	if (!message) return false;
-	message.text = text;
-	// A human edit replaces the queued agent delivery. Its reserved receipt must
-	// not later point at different bytes or attribute the human's words to an agent.
-	message.delivery = undefined;
-	// `undefined` means "leave this alone" so text-only callers are unaffected.
-	// This queue is purely in-memory: there is no DB row to sync and no persisted
-	// file to remove, so replacing the arrays is the whole update.
-	if (opts?.images !== undefined) {
-		message.images = opts.images.length ? opts.images : undefined;
+): Promise<boolean> {
+	if (!getBufferedMessages(subagentId).some((message) => message.id === messageId)) return false;
+	const savedFiles =
+		opts?.textFiles === undefined
+			? undefined
+			: await persistAdditionalBufferedTextFiles(messageId, opts.textFiles, []);
+	let updated = false;
+	try {
+		updated = await updateBufferedMessage(subagentId, messageId, text, { ...opts, savedFiles });
+		return updated;
+	} finally {
+		if (!updated) for (const file of savedFiles ?? []) deleteBufferedTextFile(file);
 	}
-	if (opts?.textFiles !== undefined) {
-		message.textFiles = opts.textFiles.length ? opts.textFiles : undefined;
-	}
-	if (opts?.fileReferences !== undefined) {
-		message.fileReferences = freezeFileReferenceSnapshots(opts.fileReferences);
-	}
-	message.bufferedAt = new Date().toISOString();
-	return true;
 }
 
 /**
@@ -554,29 +546,14 @@ export function updateSubagentBufferedMessage(
  * the next tool boundary with nothing left to resume.
  */
 export function removeSubagentBufferedMessage(subagentId: string, messageId: string): boolean {
-	const queue = getSubagentBufferedMessagesMap().get(subagentId);
-	if (!queue) return false;
-	const index = queue.findIndex((queued) => queued.id === messageId);
-	if (index === -1) return false;
-	queue.splice(index, 1);
-	if (queue.length === 0) clearSubagentBufferedMessages(subagentId);
-	return true;
+	const removed = removeBufferedMessage(subagentId, messageId);
+	if (!peekInbox(subagentId)) clearRuntimeBufferSoftStop(subagentId);
+	return removed;
 }
 
 /** Reorder the subagent buffer queue by an exact list of its message ids. */
 export function reorderSubagentBufferedMessages(subagentId: string, orderedIds: string[]): boolean {
-	const queue = getSubagentBufferedMessagesMap().get(subagentId);
-	if (!queue || queue.length === 0) return false;
-	if (orderedIds.length !== queue.length) return false;
-	const byId = new Map(queue.map((queued) => [queued.id, queued]));
-	const reordered: SubagentBufferedMessage[] = [];
-	for (const id of orderedIds) {
-		const message = byId.get(id);
-		if (!message) return false;
-		reordered.push(message);
-	}
-	getSubagentBufferedMessagesMap().set(subagentId, reordered);
-	return true;
+	return reorderBufferedMessages(subagentId, orderedIds);
 }
 
 // ---------------------------------------------------------------------------
@@ -590,39 +567,19 @@ export function buildSubagentEventContext(
 	parentToolUseId: string,
 	conversationId: string,
 	subagentModel: string,
+	provider = resolveProvider(subagentModel),
+	locale: string = "en",
 ): EventHandlerContext {
-	let contextUsagePct: number | undefined;
-	let meterUsage: number | undefined;
-	let meterUnit: string | undefined;
-	let partialMessageId: string | undefined;
-	let tokenUsage: import("./narrator-event-handler").TokenUsageSnapshot | undefined;
-
-	return {
+	return createRuntimeEventContext({
 		narratorId: subagentId,
 		broadcastTargetId: parentNarratorId,
 		conversationId,
 		parentToolUseId,
 		subagentModel,
-		getContextUsagePct: () => contextUsagePct,
-		getMeterUsage: () => meterUsage,
-		getMeterUnit: () => meterUnit,
-		getPartialMessageId: () => partialMessageId,
-		getTokenUsage: () => tokenUsage,
-		setPartialMessageId: (id) => {
-			partialMessageId = id;
-		},
-		setContextUsagePct: (pct) => {
-			contextUsagePct = pct;
-		},
-		setMeterData: (u, un) => {
-			meterUsage = u;
-			meterUnit = un;
-		},
-		setTokenUsage: (u) => {
-			tokenUsage = u;
-		},
-		toolCallIdsMap: new Map(),
-	};
+		model: subagentModel,
+		provider,
+		locale,
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -636,15 +593,16 @@ export async function finalizeSubagent(
 	toolUseId: string,
 	hasError: boolean,
 	errorText: string | null,
-	options?: { interrupted?: boolean; timedOut?: boolean },
+	options?: { interrupted?: boolean; timedOut?: boolean; owner?: ExecutionOwner },
 ): Promise<void> {
-	// Clean up any remaining buffered messages, post-tool stop, and team inbox.
-	clearSubagentBufferedMessages(subagentId);
-	clearTeamInbox(subagentId);
+	if (options?.owner && !options.owner.isCurrent()) return;
+	// Accepted mailbox entries survive the terminal window for the next eligible run.
+	clearRuntimeBufferSoftStop(subagentId);
 	// The knowledge de-dup set has the same lifetime as the team inbox: it is per-run
 	// state, and the durable record of what was injected is the ledger table, which the
 	// next run reloads. Dropping it only keeps the map from growing.
 	clearSubagentKnowledgeCycle(subagentId);
+	knowledgeInjectionCycleStates.delete(subagentId);
 
 	// NOTE: file change records are intentionally NOT cleared here.
 	// They remain available for sibling subagents to query via TeamStatus.file_changes
@@ -662,6 +620,7 @@ export async function finalizeSubagent(
 		errorMessage: hasError && !options?.interrupted ? (errorText ?? undefined) : undefined,
 		skipErrorMessage: true,
 	});
+	if (options?.owner && !options.owner.isCurrent()) return;
 	broadcastToNarrator(parentNarratorId, {
 		type: "subagent_status_changed",
 		narratorId: parentNarratorId,
@@ -692,13 +651,15 @@ export async function loadSubagentHistory(
 	provider: string,
 	pruneBoundaryId?: string | null,
 	currentInput?: string,
-) {
-	const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId);
-	const dbMessages = rawMessages.map((msg) => ({ ...msg, parentToolUseId: null }));
-	if (pruneBoundaryId) {
-		pruneToolCalls(dbMessages, pruneBoundaryId);
-	}
-	return buildHistory(dbMessages, model, provider, narratorId, { currentInput });
+): Promise<import("../lib/agent/provider").BuiltHistory> {
+	return buildRuntimeHistory({
+		narratorId,
+		model,
+		provider,
+		profile: "subagent",
+		pruneBoundaryId,
+		currentInput,
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -714,6 +675,7 @@ async function saveBufferedTextFiles(cwd: string, files?: File[]): Promise<TextF
 }
 
 async function persistNextBufferedSubagentMessage(opts: {
+	expectedMessageId?: string;
 	narratorId: string;
 	parentNarratorId: string;
 	toolUseId: string;
@@ -723,17 +685,21 @@ async function persistNextBufferedSubagentMessage(opts: {
 	userMsg: Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>;
 } | null> {
 	const { narratorId, parentNarratorId, toolUseId } = opts;
-	const bufQueue = getSubagentBufferedMessagesMap().get(narratorId);
-	const buffered = bufQueue?.[0];
-	if (!buffered) return null;
-	// Claim synchronously so concurrent drains cannot dispatch the same entry.
-	// Restore only if persistence fails; accepted bytes are never re-read.
-	const hadSoftStop = shouldStopSubagentForBufferedMessage(narratorId);
-	bufQueue?.shift();
-	if (bufQueue?.length === 0) {
-		getSubagentBufferedMessagesMap().delete(narratorId);
-		getSubagentBufferedMessageSoftStops().delete(narratorId);
+	const row = claimInboxHead(
+		narratorId,
+		(head) =>
+			acceptsBufferedSubagentInput(head) &&
+			(opts.expectedMessageId === undefined || head.id === opts.expectedMessageId),
+	);
+	if (!row) return null;
+	let buffered: SubagentBufferedMessage;
+	try {
+		buffered = projectSubagentInboxMessage(row);
+	} catch (error) {
+		releaseInboxClaim(row, error);
+		throw error;
 	}
+	const hadSoftStop = shouldStopSubagentForBufferedMessage(narratorId);
 	let userMsg: Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>;
 	try {
 		const textFiles = await saveBufferedTextFiles(opts.cwd, buffered.textFiles);
@@ -742,6 +708,7 @@ async function persistNextBufferedSubagentMessage(opts: {
 			buffered.text,
 			toolUseId,
 			{
+				mailboxClaim: inboxClaim(row),
 				images: buffered.images,
 				textFiles,
 				fileReferences: buffered.fileReferences,
@@ -751,35 +718,42 @@ async function persistNextBufferedSubagentMessage(opts: {
 			},
 		);
 	} catch (error) {
-		const remaining = getSubagentBufferedMessagesMap().get(narratorId) ?? [];
-		remaining.unshift(buffered);
-		getSubagentBufferedMessagesMap().set(narratorId, remaining);
+		releaseInboxClaim(row, error);
 		if (hadSoftStop) requestSubagentBufferedMessageSoftStop(narratorId);
 		throw error;
 	}
-	broadcastToNarrator(parentNarratorId, {
-		type: "user_message",
-		narratorId: parentNarratorId,
-		message: fileReferenceMessageForDisplay(userMsg),
-	});
-	broadcastToNarrator(narratorId, {
-		type: "user_message",
-		narratorId,
-		message: fileReferenceMessageForDisplay({ ...userMsg, parentToolUseId: null }),
-	});
-	const remaining = toBufferSummary(getSubagentBufferedMessagesMap().get(narratorId) ?? []);
-	broadcastToNarrator(parentNarratorId, {
-		type: "buffer_consumed",
-		narratorId: parentNarratorId,
-		messageId: buffered.id,
-		remaining,
-	});
-	broadcastToNarrator(narratorId, {
-		type: "buffer_consumed",
-		narratorId,
-		messageId: buffered.id,
-		remaining,
-	});
+	try {
+		broadcastToNarrator(parentNarratorId, {
+			type: "user_message",
+			narratorId: parentNarratorId,
+			message: fileReferenceMessageForDisplay(userMsg),
+		});
+		broadcastToNarrator(narratorId, {
+			type: "user_message",
+			narratorId,
+			message: fileReferenceMessageForDisplay({ ...userMsg, parentToolUseId: null }),
+		});
+		if (buffered._stagingId) cleanupBufferedTextFiles(buffered._stagingId);
+		if (!getBufferedMessages(narratorId).length) clearRuntimeBufferSoftStop(narratorId);
+		const remaining = toBufferSummary(getSubagentBufferedMessages(narratorId));
+		broadcastToNarrator(parentNarratorId, {
+			type: "buffer_consumed",
+			narratorId: parentNarratorId,
+			messageId: buffered.id,
+			remaining,
+		});
+		broadcastToNarrator(narratorId, {
+			type: "buffer_consumed",
+			narratorId,
+			messageId: buffered.id,
+			remaining,
+		});
+	} catch (error) {
+		logger.warn("Mailbox user message committed; broadcast deferred", {
+			narratorId,
+			error: String(error),
+		});
+	}
 	return { buffered, userMsg };
 }
 
@@ -791,7 +765,7 @@ export async function consumeBufferedSubagentMessageInPass(opts: {
 	cwd: string;
 	currentUserId?: string | null;
 }): Promise<{ buffered: SubagentBufferedMessage; text: string } | null> {
-	const buffered = getSubagentBufferedMessagesMap().get(opts.narratorId)?.[0];
+	const buffered = peekSubagentBufferedMessage(opts.narratorId);
 	if (
 		!buffered ||
 		shouldStopSubagentForBufferedMessage(opts.narratorId) ||
@@ -799,13 +773,22 @@ export async function consumeBufferedSubagentMessageInPass(opts: {
 	)
 		return null;
 	try {
-		const claimed = await persistNextBufferedSubagentMessage(opts);
-		return claimed
-			? {
-					buffered: claimed.buffered,
-					text: projectFileReferenceText(claimed.buffered.text, claimed.buffered.fileReferences),
-				}
-			: null;
+		const claimed = await persistNextBufferedSubagentMessage({
+			...opts,
+			expectedMessageId: buffered.id,
+		});
+		if (!claimed) return null;
+		const hint = await deliverBufferedKnowledgeHint({
+			narratorId: opts.narratorId,
+			parentNarratorId: opts.parentNarratorId,
+			toolUseId: opts.toolUseId,
+			text: claimed.buffered.text,
+			turnUserId: opts.currentUserId,
+			locale: activeNarrators.get(opts.narratorId)?.locale,
+			inPass: true,
+		});
+		const text = projectFileReferenceText(claimed.buffered.text, claimed.buffered.fileReferences);
+		return { buffered: claimed.buffered, text: hint ? `${text}\n\n${hint}` : text };
 	} catch (error) {
 		logger.error("Failed to persist injected subagent user message; retained for retry", {
 			narratorId: opts.narratorId,
@@ -826,63 +809,107 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 	locale?: string;
 }): Promise<{
 	prompt: string;
+	/** Raw current input for an orchestrator that will rebuild history itself. */
+	currentInput?: string;
 	history: unknown[];
 	trailingToolResults: unknown[];
 	userId?: string | null;
+	preservePrincipal?: boolean;
 	prePromptBashCommand?: string;
 } | null> {
-	const claimed = await persistNextBufferedSubagentMessage(opts);
-	if (!claimed) return null;
-	const { buffered, userMsg } = claimed;
-	const { narratorId, parentNarratorId, toolUseId, model, provider } = opts;
-	let { pruneBoundaryId } = opts;
-	// Point A for a message that could NOT be folded into the running pass (attachments, a
-	// pre-prompt command, or a different acting user). Scanned here rather than at the
-	// three call sites — the executor's pass restart, the runner's post-interrupt drain and
-	// its takeover suspension all funnel through this function, and a per-site scan is how
-	// one of them would end up forgotten.
-	//
-	// Write the hint BEFORE rebuilding. Some builders lift the trailing sys row out of
-	// history; the rebuilt current-turn text below must carry that extracted field too.
-	await deliverBufferedKnowledgeHint({
-		narratorId,
-		parentNarratorId,
-		toolUseId,
-		text: buffered.text,
-		turnUserId: buffered.createdBy,
-		locale: opts.locale,
-	});
+	return withInboxOwner(opts.narratorId, async () => {
+		const head = peekInbox(opts.narratorId);
+		if (head && !acceptsBufferedSubagentInput(head)) {
+			const row = claimInboxHead(opts.narratorId, (candidate) => candidate.kind !== "user_input");
+			if (!row) return null;
+			try {
+				const { deliverPendingInjection } = await import("./narrator-session");
+				const text = await deliverPendingInjection(
+					opts.narratorId,
+					(opts.locale ?? "en") as Locale,
+					"idle",
+					"none",
+					{
+						...projectPendingInjection(row),
+						mailboxClaim: inboxClaim(row),
+						recipientMessageId: row.recipientMessageId ?? undefined,
+					},
+					{ parentNarratorId: opts.parentNarratorId, parentToolUseId: opts.toolUseId },
+				);
+				const rebuilt = await loadSubagentHistory(
+					opts.narratorId,
+					opts.model,
+					opts.provider,
+					opts.pruneBoundaryId,
+					text ?? undefined,
+				);
+				return {
+					prompt: rebuilt.trailingUserText ?? text ?? "",
+					currentInput: "",
+					history: rebuilt.history,
+					trailingToolResults: rebuilt.trailingToolResults,
+					userId: row.createdBy,
+					preservePrincipal: true,
+				};
+			} catch (error) {
+				releaseInboxClaim(row, error);
+				throw error;
+			}
+		}
+		const claimed = await persistNextBufferedSubagentMessage(opts);
+		if (!claimed) return null;
+		const { buffered, userMsg } = claimed;
+		const { narratorId, parentNarratorId, toolUseId, model, provider } = opts;
+		let { pruneBoundaryId } = opts;
+		// Point A for a message that could NOT be folded into the running pass (attachments, a
+		// pre-prompt command, or a different acting user). Scanned here rather than at the
+		// three call sites — the executor's pass restart, the runner's post-interrupt drain and
+		// its takeover suspension all funnel through this function, and a per-site scan is how
+		// one of them would end up forgotten.
+		//
+		// Write the hint BEFORE rebuilding. Some builders lift the trailing sys row out of
+		// history; the rebuilt current-turn text below must carry that extracted field too.
+		await deliverBufferedKnowledgeHint({
+			narratorId,
+			parentNarratorId,
+			toolUseId,
+			text: buffered.text,
+			turnUserId: buffered.createdBy,
+			locale: opts.locale,
+		});
 
-	if (pruneBoundaryId === undefined) {
-		const freshNarrator = await narratorService.getById(narratorId);
-		pruneBoundaryId = freshNarrator.pruneBoundaryMessageId ?? null;
-	}
-	const modelText = projectFileReferenceText(
-		userMsg.contentText ?? buffered.text,
-		buffered.fileReferences,
-	);
-	const rebuilt = await loadSubagentHistory(
-		narratorId,
-		model,
-		provider,
-		pruneBoundaryId,
-		modelText,
-	);
-	// Match the primary loop's currentTurnText: only prepend context the builder
-	// extracted. Official Anthropic keeps sys as system history, so replaying the
-	// persisted hint itself here would inject it twice.
-	const prompt = rebuilt.trailingUserText?.trim()
-		? modelText.trim()
-			? `${rebuilt.trailingUserText}\n\n${modelText}`
-			: rebuilt.trailingUserText
-		: modelText;
-	return {
-		prompt,
-		history: rebuilt.history,
-		trailingToolResults: rebuilt.trailingToolResults,
-		userId: buffered.createdBy,
-		prePromptBashCommand: buffered.prePromptBashCommand,
-	};
+		if (pruneBoundaryId === undefined) {
+			const freshNarrator = await narratorService.getById(narratorId);
+			pruneBoundaryId = freshNarrator.pruneBoundaryMessageId ?? null;
+		}
+		const modelText = projectFileReferenceText(
+			userMsg.contentText ?? buffered.text,
+			buffered.fileReferences,
+		);
+		const rebuilt = await loadSubagentHistory(
+			narratorId,
+			model,
+			provider,
+			pruneBoundaryId,
+			modelText,
+		);
+		// Match the primary loop's currentTurnText: only prepend context the builder
+		// extracted. Official Anthropic keeps sys as system history, so replaying the
+		// persisted hint itself here would inject it twice.
+		const prompt = rebuilt.trailingUserText?.trim()
+			? modelText.trim()
+				? `${rebuilt.trailingUserText}\n\n${modelText}`
+				: rebuilt.trailingUserText
+			: modelText;
+		return {
+			prompt,
+			currentInput: modelText,
+			history: rebuilt.history,
+			trailingToolResults: rebuilt.trailingToolResults,
+			userId: buffered.createdBy,
+			prePromptBashCommand: buffered.prePromptBashCommand,
+		};
+	});
 }
 
 /**
@@ -903,7 +930,8 @@ async function deliverBufferedKnowledgeHint(input: {
 	text: string;
 	turnUserId: string | null | undefined;
 	locale?: string;
-}): Promise<void> {
+	inPass?: boolean;
+}): Promise<string | undefined> {
 	const { narratorId, parentNarratorId, toolUseId, text, turnUserId } = input;
 	try {
 		// A failed scope lookup must SKIP the scan, not proceed with an absent project:
@@ -923,13 +951,13 @@ async function deliverBufferedKnowledgeHint(input: {
 			locale: (input.locale ?? "en") as Locale,
 		});
 		if (!scan) return;
-		const { messageId } = await deliverInjection(narratorId, {
+		const { messageId, turnText } = await deliverInjection(narratorId, {
 			content: scan.content,
 			body: scan.body,
 			source: "knowledge_base_hint",
 			// The caller rebuilds history right after this, so the row is picked up from the
 			// database; asking for `onNextTurn` text nobody would fold in would be a lie.
-			schedule: "none",
+			schedule: input.inPass ? "onNextTurn" : "none",
 			locale: (input.locale ?? "en") as Locale,
 			subagent: { parentToolUseId: toolUseId, parentNarratorId },
 		});
@@ -942,6 +970,7 @@ async function deliverBufferedKnowledgeHint(input: {
 				hits: scan.record.hits,
 			});
 		}
+		return input.inPass ? (turnText ?? scan.content) : undefined;
 	} catch (err) {
 		logger.warn("Failed to deliver knowledge hint for a drained subagent message", {
 			narratorId,
@@ -979,17 +1008,45 @@ async function resolveSubagentProjectId(
 // executeSubagent
 // ---------------------------------------------------------------------------
 
-/**
- * Execute a subagent with optional compact/prune support.
- *
- * For general subagents: wraps executeAgentLoop in a while-loop that
- * restarts after compact, with prune boundary tracking and onBeforeTurn.
- *
- * For explore/plan subagents: single-pass execution (no compact/prune).
- */
-export async function executeSubagent(opts: SubagentExecOptions): Promise<{
+/** Admit one invocation of the shared runtime; a runner may lend its terminal-lifetime owner. */
+export async function executeSubagent(
+	opts: SubagentExecOptions,
+	borrowedOwner?: ExecutionOwner,
+): ReturnType<typeof executeSubagentOwned> {
+	const launch = await withNarratorStartAdmission(opts.narratorId, async () => {
+		const owner = borrowedOwner ?? tryClaimExecution(opts.narratorId, "subagent");
+		if (!owner || owner.narratorId !== opts.narratorId || owner.kind !== "subagent") {
+			throw new AppError("Narrator already has an execution owner", 409, "NARRATOR_EXECUTION_BUSY");
+		}
+		const releasePass = claimExecutionPass(owner);
+		if (!releasePass) {
+			if (!borrowedOwner) owner.release();
+			throw new AppError(
+				"Narrator executor is already active or suspended",
+				409,
+				"NARRATOR_EXECUTION_BUSY",
+			);
+		}
+		// The model and all asynchronous preparation run OUTSIDE the short mutex.
+		const completion = withNarratorWorkAdmission(opts.narratorId, () =>
+			executeSubagentOwned(opts, owner),
+		).finally(() => {
+			if (owner.isCurrent()) unregisterActiveSubagent(opts.narratorId);
+			releasePass();
+			if (!borrowedOwner) owner.release();
+		});
+		return { completion };
+	});
+	return launch.completion;
+}
+
+async function executeSubagentOwned(
+	opts: SubagentExecOptions,
+	owner: ExecutionOwner,
+): Promise<{
 	finalText: string;
 	hasError: boolean;
+	allowInboxWake: boolean;
 	contextLengthExceeded?: boolean;
 	aborted?: boolean;
 }> {
@@ -1008,1333 +1065,104 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			});
 		}
 	}
-	// Snapshot session state is owned HERE, outside the loop, for the `finally`
-	// below: a claim opened by the pre-execution hook and never closed is read as
-	// "still running, so it extends to now", which makes its declared paths shadow
-	// every later window in this worktree — silently turning other narrators' real
-	// writes into unrevertable ones. The primary loop has the same backstop
-	// (narrator-session's `finally`), and it must not depend on the loop returning
-	// normally, so it cannot live inside the loop body.
-	//
-	// `_defaultDeviceId` is filled in by the loop once it has read the narrator row;
-	// nothing captures before then.
-	const treeSnapshotSession: TreeSnapshotSession = { cwd: opts.cwd };
-	try {
-		return await runSubagentLoop(opts, treeSnapshotSession);
-	} finally {
-		abandonSessionTreeSnapshots(treeSnapshotSession, opts.narratorId);
-	}
+	// The runtime session below owns both the mandatory hooks and their finalizer.
+	return runSubagentRuntime(opts, owner);
 }
 
-async function runSubagentLoop(
+async function runSubagentRuntime(
 	opts: SubagentExecOptions,
-	treeSnapshotSession: TreeSnapshotSession,
+	owner: ExecutionOwner,
 ): Promise<{
 	finalText: string;
 	hasError: boolean;
+	allowInboxWake: boolean;
 	contextLengthExceeded?: boolean;
 	aborted?: boolean;
 }> {
-	let {
-		narratorId,
-		parentNarratorId,
-		toolUseId,
-		subagentType,
-		prompt,
-		cwd,
-		model,
-		provider,
-		locale,
-		signal,
-	} = opts;
-	model = resolveEffectiveModel(model);
-	provider = resolveProvider(model);
-	let currentUserId = opts.userId ?? null;
-
-	let {
-		systemPrompt,
-		initialHistory: history,
-		initialTrailingToolResults: trailingToolResults,
-	} = opts;
-
-	// Mutable state for compact/prune
-	let pruneBoundaryId: string | null = null;
-	let needsRestart = false;
-	let currentConversationId = randomUUID();
-	let resetUpstreamSessionOnNextRequest = false;
-	let contextLengthExceeded = false;
-	// Consecutive overflow recoveries since the last completed assistant turn.
-	let overflowRetries = 0;
-
-	// Transient error retry state
-	let transientRetries = 0;
-	// Consecutive completion-limit / resumable-error continuations.
-	let interruptionRetries = 0;
-
-	// Self-continuation budget for this RUN.
-	//
-	// The primary narrator keeps the equivalent counters on its `ActiveNarrator`, which
-	// a subagent has no entry in. Run-local is not a workaround for that absence but the
-	// tighter scope: a subagent's run is exactly the window its parent is blocked for, so
-	// the budget should reset per dispatch and never leak across them. The bound itself
-	// is the shared `computeContinuationStallState` plus a per-run pass cap — see
-	// `planSubagentContinuation`.
-	const continuationState = createSubagentContinuationState();
-	// Set when the bound stopped a continuation, so the run's final text can say so.
-	// A parent that receives a partial answer with no explanation reads it as complete.
-	let continuationStopNote: string | null = null;
-
-	// Compact-done flag: set by onCompactDone, consumed by onBeforeTurn to
-	// rebuild history/systemPrompt within the same agent loop (inner path).
-	// The outer needsRestart flag is a fallback for when compact finishes
-	// after the agent loop has already returned.
-	let compactDoneFlag = false;
-	let compactConsumedInLoop = false;
-
-	// Build context management hooks (prune + compact) for all subagent types
-	const ctxMgmt = buildContextManagementHooks({
-		narratorId,
-		locale: locale as Locale,
-		getModel: () => model,
-		getProvider: () => provider,
-		isSubagent: true,
-		getPruneBoundary: () => pruneBoundaryId,
-		setPruneBoundary: (id) => {
-			pruneBoundaryId = id;
-		},
-		onCompactDone: () => {
-			needsRestart = true;
-			currentConversationId = randomUUID();
-			resetUpstreamSessionOnNextRequest = true;
-			compactDoneFlag = true;
-		},
-		isCompactDone: () => compactDoneFlag,
-		clearCompactDone: () => {
-			compactDoneFlag = false;
-			compactConsumedInLoop = true;
-		},
-		rebuildSystemPrompt: async () => {
-			const freshNarrator = await narratorService.getById(narratorId);
-			if (opts.rebuildSystemPrompt) {
-				return opts.rebuildSystemPrompt(freshNarrator.contextSummary);
-			}
-			return null;
-		},
-	});
-
-	let finalText = "";
-	let hasError = false;
-	let aborted = false;
-	const initialNarrator = await narratorService.getById(narratorId);
-	const projectId = initialNarrator.chapterId
-		? ((
-				await db.query.chapters.findFirst({
-					where: eq(chapters.id, initialNarrator.chapterId),
-					columns: { projectId: true },
-				})
-			)?.projectId ?? null)
+	// The owner is already admitted. Do not call ensureNarrator here: it holds a
+	// start transaction while creating its session and would serialize async preparation.
+	const row = await narratorService.getById(opts.narratorId);
+	const chapter = row.chapterId
+		? await db.query.chapters.findFirst({
+				where: eq(chapters.id, row.chapterId),
+				columns: { projectId: true },
+			})
 		: null;
-	const authorizedDevices = await import("./device-connection-service")
-		.then(({ getSessionDevices }) =>
-			getSessionDevices(
-				projectId,
-				resolveSubagentActingUserId(
-					opts.userId ?? null,
-					activeNarrators.get(parentNarratorId)?._currentUserId,
-				),
-			),
-		)
-		.catch(() => []);
-	const defaultDeviceId = initialNarrator.defaultDeviceId ?? null;
-
-	// --- Workspace tree snapshot boundaries ---
-	//
-	// A subagent writes to a real worktree with the same tools as its parent, so its
-	// tool calls need the same content-addressed boundaries: without them
-	// `narrator_tool_calls.treeHashBefore/After` stay null and a rollback of that call
-	// degrades to per-file replay (which cannot see Bash or external writes at all).
-	//
-	// The session object is owned by `executeSubagent` (per RUN, not per pass): the
-	// staged `before` hashes and the reused `_lastTreeHash` cache live on it and must
-	// survive a compact restart in the middle of a tool pair, and its `finally` needs
-	// it to seal leaked claims.
-	//
-	// A subagent has no `activeNarrators` entry, so the field the hooks read for the
-	// execution target is resolved from its own narrator row here — a remote-targeted
-	// subagent is then skipped exactly like a remote primary session.
-	treeSnapshotSession._defaultDeviceId = defaultDeviceId;
-	// Same rule as a primary session: a chapter always has a worktree; a chapterless
-	// subagent's cwd has to be probed once. Failure counts as "not a repo", which only
-	// costs snapshots rather than failing the run.
-	let subagentIsInGitRepo = !!initialNarrator.chapterId;
-	if (!initialNarrator.chapterId) {
-		try {
-			subagentIsInGitRepo = await gitService.isGitRepo(cwd);
-		} catch {
-			subagentIsInGitRepo = false;
-		}
-	}
-	const treeSnapshotHooks = buildTreeSnapshotEventHooks({
-		session: treeSnapshotSession,
-		narratorId,
-		isInGitRepo: subagentIsInGitRepo,
-	});
-
-	let narratorReasoningEffort = initialNarrator.reasoningEffort ?? undefined;
-	let narratorFastModeOverride = normalizeBooleanOverride(initialNarrator.fastModeOverride);
-	// Layered traits: the parent narrator is an upper layer relative to a subagent,
-	// so an enforced restriction on the parent (or on the project/user above it)
-	// cannot be escaped here. `currentUserId` may be absent on recovery/detached
-	// paths, matching how fast mode falls back to the parent's acting user.
-	const subagentTraits = await resolveEffectiveTraits({
-		narratorTraits: initialNarrator.traits,
-		projectId,
-		actingUserId: resolveSubagentActingUserId(
-			currentUserId,
-			activeNarrators.get(parentNarratorId)?._currentUserId,
-		),
-	});
-	const disabledTools = getDisabledToolSet(subagentTraits.traits);
-	const blockedSkills = getBlockedSkills(subagentTraits.traits);
-	// Same narrowing as a primary session: authorization decides what may be used,
-	// the injection policy decides what the model is told about.
-	const availableDevices = resolveInjectedDevices(
-		authorizedDevices,
-		subagentTraits.deviceInjection,
-	);
-
-	// Register in the active subagent settings map so that model/reasoningEffort
-	// updates from the UI are picked up via getRuntimeSettingsOverride.
-	registerActiveSubagent(narratorId, model, narratorReasoningEffort);
-
-	// Passive knowledge-injection de-dup, scoped to the current compact cycle and shared
-	// by both scan points: the tool-output scan inside the loop (point B) and the
-	// incoming-text scan below (point A). One set is what makes the two points de-dup
-	// against each other; a per-point set would inject the same entry twice for a message
-	// whose keyword also appears in the next tool's output.
-	//
-	// Keyed by narrator id rather than owned by this invocation: a subagent's turns are
-	// also driven by the runner's post-interrupt drain and by `resumeSubagent`, each of
-	// which re-enters `executeSubagent`, and a per-invocation set would re-inject
-	// everything on the next continuation. Re-aligned against the ledger by
-	// `syncSubagentKnowledgeCycle` whenever the compact boundary moves.
-	const knowledgeCycle = getSubagentKnowledgeCycle(narratorId);
-
-	/**
-	 * Scan one piece of incoming text for relevant knowledge and, if anything hit, write
-	 * the hint as its own row; returns the text to fold into this turn (or null).
-	 *
-	 * A row of its own rather than an addition to somebody else's: the hint is about the
-	 * incoming request, and appending it to the message's text would make a reader unable
-	 * to tell the sender's words from the platform's.
-	 *
-	 * The ledger write happens only after the row is durable, for the same reason point B
-	 * defers it — a record whose content never landed would suppress that entry for the
-	 * rest of the compact cycle.
-	 */
-	const deliverKnowledgeHint = async (
-		text: string,
-		source: "buffered_message" | "team_message",
-		turnUserId: string | null | undefined,
-	): Promise<string | null> => {
-		const scan = await scanSubagentTextForKnowledge({
-			narratorId,
-			parentNarratorId,
-			text,
-			source,
-			// A message with its own author is evaluated as that author; everything else
-			// falls back to the run's user and then the parent session's.
-			turnUserId: turnUserId ?? currentUserId,
-			projectId,
-			cycle: knowledgeCycle,
-			locale: locale as Locale,
-		});
-		if (!scan) return null;
-		try {
-			const { messageId, turnText } = await deliverInjection(narratorId, {
-				content: scan.content,
-				body: scan.body,
-				source: "knowledge_base_hint",
-				schedule: "onNextTurn",
-				locale: locale as Locale,
-				subagent: { parentToolUseId: toolUseId, parentNarratorId },
-			});
-			if (messageId) {
-				knowledgeService.recordInjectionEvents({
-					narratorId: scan.record.narratorId,
-					compactSeq: scan.record.compactSeq,
-					source: "user_message",
-					triggerMessageId: messageId,
-					hits: scan.record.hits,
-				});
-			}
-			return turnText ?? null;
-		} catch (err) {
-			logger.warn("Failed to deliver subagent knowledge hint", {
-				narratorId,
-				source,
-				error: String(err),
-			});
-			return null;
-		}
+	const model = resolveEffectiveModel(opts.model);
+	const active: ActiveNarrator = {
+		narratorId: opts.narratorId,
+		conversationId: randomUUID(),
+		cwd: opts.cwd,
+		model,
+		provider: resolveProvider(model),
+		systemPrompt: opts.systemPrompt,
+		events: new EventEmitter(),
+		alive: true,
+		locale: opts.locale as Locale,
+		abortController: new AbortController(),
+		_enabledOptionalTools: new Set(),
+		_disabledTools: new Set(),
+		_blockedSkills: { all: false, names: new Set() },
+		_substatus: new Set(),
+		// Freeze a legacy omitted principal at run admission. Explicit null is anonymous.
+		_currentUserId:
+			opts.userId !== undefined
+				? opts.userId
+				: (activeNarrators.get(opts.parentNarratorId)?._currentUserId ?? null),
+		_defaultDeviceId: row.defaultDeviceId,
+		_chapterId: row.chapterId ?? undefined,
+		_projectId: chapter?.projectId ?? undefined,
+		reasoningEffort: row.reasoningEffort,
+		_reasoningEffortRef: row.reasoningEffort,
+		_modelRef: row.model ?? opts.model,
+		_turnStartedAt: opts.fileChangeStartedAt ?? new Date().toISOString(),
 	};
-
-	// Resolve tool filter for this subagent type using pre-loaded customDef
-	const baseToolFilter = resolveToolFilter(subagentType, opts.customDef);
-	const toolFilter = (tool: import("../lib/agent").ToolDefinition) =>
-		!disabledTools.has(tool.name) &&
-		!(tool.name === "Skill" && blockedSkills.all) &&
-		(!baseToolFilter || baseToolFilter(tool));
-
-	while (true) {
-		const eventContext = buildSubagentEventContext(
-			narratorId,
-			parentNarratorId,
-			toolUseId,
-			currentConversationId,
-			model,
-		);
-
-		eventContext.getFileReferenceContext = () => getAgentFileReferenceContext(config);
-
-		const hooks: EventHooks = {
-			...treeSnapshotHooks,
-			onContextUsage: ctxMgmt.onContextUsage,
-		};
-
-		const resolvedProvider = resolveProvider(model);
-		// "inherit" resolves against the acting user's fastModeDefault on every loop,
-		// so changing that preference affects running sessions from the next turn.
-		// A subagent has no user of its own: recovery/detached paths may start it
-		// without one, so fall back to the parent session's triggering user rather
-		// than silently degrading "inherit" to disabled.
-		const resolvedFastMode = await resolveFastModeForUser(
-			narratorFastModeOverride,
-			resolveSubagentActingUserId(
-				currentUserId,
-				activeNarrators.get(parentNarratorId)?._currentUserId,
-			),
-		);
-		const resolvedServiceTier =
-			resolvedFastMode && usesCodexModel(resolvedProvider, model) ? "priority" : undefined;
-		let todoReminderCompletedToolCount = 0;
-		// Gates buildSpecTaskDigestBody to a fixed cadence so we don't hit SQLite on
-		// every tool result. Shared helper rather than a local counter: the previous
-		// inline version advanced its marker only after a SUCCESSFUL build, so a
-		// subagent whose spec had no open tasks stayed permanently due and re-read the
-		// spec file on every subsequent tool call. `InjectionCadence.due` spends the
-		// tick when asked, which is the behaviour narrator-session already had.
-		const tasksCadence = new InjectionCadence(() => TODO_REMINDER_TOOL_INTERVAL);
-		const resetUpstreamSessionForThisLoop = resetUpstreamSessionOnNextRequest;
-		resetUpstreamSessionOnNextRequest = false;
-		// Align the de-dup set with this pass's compact cycle BEFORE the config captures the
-		// seq: a compact that landed during the previous pass invalidates the old set (its
-		// entries are now only in the summary), and the ledger seq the loop stamps its
-		// point-B records with has to be the same one the set was rebuilt for.
-		const knowledgeCycleSeq = await syncSubagentKnowledgeCycle(narratorId, knowledgeCycle);
-		const config: AgentConfig = {
-			narratorId,
-			conversationId: currentConversationId,
-			model,
-			provider: resolvedProvider,
-			cwd,
-			systemPrompt,
-			locale,
-			signal,
-			chapterId: initialNarrator.chapterId ?? undefined,
-			parentNarratorId,
-			parentToolUseId: toolUseId,
-			reviewReadOnlyBash: subagentType === "review",
-			userId: currentUserId,
-			projectId,
-			defaultDeviceId,
-			availableDevices,
-			reasoningEffort:
-				narratorReasoningEffort ?? resolveDefaultReasoningEffort(resolvedProvider, model),
-			serviceTier: resolvedServiceTier,
-			maxTransientRetries: getMaxTransientRetries(),
-			silentToolCallThreshold: getSilentToolCallThreshold(),
-			pipelineUnusedToolCallThreshold: getPipelineUnusedToolCallThreshold(),
-			retryBackoffCeilMs: getRetryBackoffCeilMs(),
-			firstTokenTimeoutMs: getFirstTokenTimeoutMs(),
-			metadata: isAnthropicProvider(resolvedProvider)
-				? { user_id: `user_${narratorId}_account__session_${currentConversationId}` }
-				: undefined,
-			resetUpstreamSessionOnFirstRequest: resetUpstreamSessionForThisLoop,
-			disabledTools,
-			blockedSkills: { all: blockedSkills.all, names: [...blockedSkills.names] },
-			toolFilter,
-			requireToolCallBinding: true,
-			onToolExecutionStarting: (resolvedToolUseId, binding, startedAt) =>
-				import("./narrator-persistence").then(({ narratorPersistence }) =>
-					narratorPersistence.claimToolCallExecution(
-						narratorId,
-						resolvedToolUseId,
-						binding,
-						startedAt,
-					),
-				),
-			onExecutionTargetResolved: (resolvedToolUseId, target, binding) =>
-				narratorService.updateToolCallExecutionTarget(
-					narratorId,
-					resolvedToolUseId,
-					target,
-					binding,
-				),
-			onExecutionPlanResolved: (resolvedToolUseId, plan, binding) =>
-				narratorService.updateToolCallExecutionPlan(narratorId, resolvedToolUseId, plan, binding),
-			// Share the compact-cycle de-dup set so the loop's tool-output scan (point B)
-			// de-dups against the incoming-text injections (point A) and vice versa — the
-			// same wiring the primary session does. Without these two fields the loop falls
-			// back to a per-call set and stamps its ledger rows with -1, so a subagent could
-			// be told about the same entry once per pass.
-			knowledgeInjectedEntryIds: knowledgeCycle.ids,
-			knowledgeInjectionCompactSeq: knowledgeCycleSeq,
-			deferEagerToolsForSafeStop: true,
-			shouldStop: () => shouldStopSubagentForBufferedMessage(narratorId),
-			permissionHandler: (toolName, permInput, permToolUseId, options) =>
-				handlePermission(
-					narratorId,
-					signal,
-					toolName,
-					permInput,
-					permToolUseId,
-					cwd,
-					locale as Locale,
-					parentNarratorId,
-					options,
-					toolUseId,
-					undefined,
-					config.reviewReadOnlyBash,
-				),
-			onBeforeTurn: ctxMgmt.onBeforeTurn,
-			getContextUsagePercentage: eventContext.getContextUsagePct,
-			onReasoningOnlyHighContext: ctxMgmt.onReasoningOnlyHighContext,
-			getRuntimeSettingsOverride: () => {
-				const sa = activeSubagentSettings.get(narratorId);
-				if (!sa) return null;
-				const override: RuntimeSettingsOverride = {};
-				if (sa.model !== config.model) {
-					override.model = sa.model;
-				}
-				const effectiveReasoningEffort =
-					sa.reasoningEffort ?? resolveDefaultReasoningEffort(resolvedProvider, sa.model);
-				if (effectiveReasoningEffort !== (config.reasoningEffort ?? null)) {
-					override.reasoningEffort = effectiveReasoningEffort;
-				}
-				return Object.keys(override).length > 0 ? override : null;
-			},
-			initialCompletedToolCount: todoReminderCompletedToolCount,
-			onCompletedToolCount: (count: number) => {
-				todoReminderCompletedToolCount = count;
-			},
-			deliverInjectionRow: async (injection) => {
-				const { messageId, turnText } = await deliverInjection(narratorId, {
-					content: injection.content,
-					body: injection.body,
-					source: injection.source,
-					schedule: "onNextTurn",
-					locale: locale as Locale,
-					subagent: { parentToolUseId: toolUseId, parentNarratorId },
-				});
-				// Point-B hits are recorded only AFTER the row is durable, for the reason the
-				// primary session states: the de-dup key `(narratorId, compactSeq, entryId)`
-				// is reloaded from this table after a compact, so recording a hit whose
-				// content never landed would suppress that entry permanently.
-				if (messageId && injection.knowledgeInjection) {
-					const record = injection.knowledgeInjection;
-					try {
-						knowledgeService.recordInjectionEvents({
-							narratorId: record.narratorId,
-							compactSeq: record.compactSeq,
-							source: "tool_output",
-							triggerToolCallId: record.triggerToolCallId,
-							hits: record.hits,
-						});
-					} catch (err) {
-						logger.warn("Failed to record subagent knowledge injection events", {
-							narratorId,
-							error: String(err),
-						});
-					}
-				}
-				return turnText ?? "";
-			},
-			getAfterToolsInjections: async () => {
-				const parts: string[] = [];
-
-				// 0. The Dynamic Spec digest, on its cadence.
-				//
-				// Previously appended inside a tool result's string (hence the `toolUseId`);
-				// it is session-level information, not about any one call, so it now lands at
-				// the turn boundary as its own row. The tick is still the loop's completed-tool
-				// count, so the cadence is unchanged — a turn that ran several tools now yields
-				// at most one reminder instead of one per tool.
-				if (tasksCadence.due(todoReminderCompletedToolCount)) {
-					const tasksBody = await buildSpecTaskDigestBody(narratorId);
-					if (tasksBody) {
-						const { body, content } = sideCarBodyWithText(
-							"living_work_spec",
-							tasksBody,
-							locale as Locale,
-						);
-						const { turnText } = await deliverInjection(narratorId, {
-							content,
-							body,
-							source: "living_work_spec",
-							schedule: "onNextTurn",
-							locale: locale as Locale,
-						});
-						if (turnText) parts.push(turnText);
-					}
-				}
-
-				// 1. A message queued for this subagent — typed by the user on the subagent
-				// page, or sent by the parent narrator / a sibling through Send.
-				//
-				// This is the boundary that makes Send feel like conversation: the message
-				// lands in the very next request instead of waiting for this whole pass to
-				// finish. See `canDeliverBufferedMessageInPass` for the cases that cannot be
-				// carried here and must fall through to the pass-restart path.
-				//
-				// Text only, no `deliverInjection`: the row is written just below by
-				// `persistSubagentUserMessage` as a real `role: "user"` turn (which is what
-				// it is — somebody addressed this subagent). Injecting again would duplicate
-				// it. The text is still needed because the loop built its in-memory history
-				// at pass start.
-				// Soft-stop inputs remain queued for the restart path; eligible inputs are
-				// claimed and persisted before their bytes can enter the next model request.
-				const inPass = await consumeBufferedSubagentMessageInPass({
-					narratorId,
-					parentNarratorId,
-					toolUseId,
-					cwd,
-					currentUserId,
-				});
-				if (inPass) {
-					parts.push(inPass.text);
-					const buf = inPass.buffered;
-					const hint = await deliverKnowledgeHint(buf.text, "buffered_message", buf.createdBy);
-					if (hint) parts.push(hint);
-				}
-
-				// 2. Messages a sibling sent through TeamStatus, delivered as this subagent's
-				// own message row rather than as a side-car attached to somebody else's: a
-				// teammate's words belong in the transcript on their own line.
-				//
-				// One injection row PER message: a row that fans out into N bubbles has no
-				// per-bubble address, which is what made delete/rollback impossible to aim
-				// at one of them. A single message per row gives every bubble its own
-				// blockIndex and its own context-menu target.
-				//
-				// Undelivered mail is still dropped when the subagent finishes
-				// (`clearTeamInbox` in finalizeSubagent) — that is unchanged, and correct: a
-				// message that never reached a turn was never part of the conversation.
-				const teamMessages = drainTeamInbox(narratorId);
-				for (const m of teamMessages) {
-					const { body, content } = sideCarBodyWithText(
-						"team_message",
-						{
-							kind: "messages",
-							items: [
-								{
-									fromId: m.fromId,
-									// The renderer applies the `fromTitle → fromLabel → fromId` fallback, so
-									// passing all three keeps the text right AND gives the UI every part. The
-									// label matters because an untitled sender used to be named by its nanoid.
-									fromTitle: m.fromTitle ?? null,
-									fromLabel: m.fromLabel ?? null,
-									fromType: m.fromType ?? null,
-									// Reader-only navigation target into the sender's own session;
-									// omitted when the sender had written nothing yet.
-									...(m.fromMessageId ? { fromMessageId: m.fromMessageId } : {}),
-									...(m.fromToolUseId ? { fromToolUseId: m.fromToolUseId } : {}),
-									...(m.isBroadcast ? { isBroadcast: true } : {}),
-									text: m.text,
-								},
-							],
-						},
-						locale as Locale,
-					);
-					const { turnText } = await deliverInjection(narratorId, {
-						content,
-						body,
-						messageId: m.delivery?.recipientMessageId,
-						source: "team_message",
-						schedule: "onNextTurn",
-						locale: locale as Locale,
-					});
-					if (turnText) parts.push(turnText);
-					// A sibling's words are new prose no point-A pass has seen: the sender was
-					// scanned on what it RECEIVED, not on what it wrote, so it can name a term
-					// it was never injected for. Resolved as the chain's acting user (a team
-					// message carries no user of its own), which cannot escalate — the parent's
-					// own point A already ran under that identity.
-					const teamHint = await deliverKnowledgeHint(m.text, "team_message", null);
-					if (teamHint) parts.push(teamHint);
-				}
-
-				return parts.join("\n\n");
-			},
-		};
-
-		needsRestart = false;
-		compactConsumedInLoop = false;
-
-		/**
-		 * Decide whether this pass should be followed by a self-continuation, and if so
-		 * inject the prompt for it.
-		 *
-		 * Serves BOTH end-of-pass causes (`spec-continuation` and
-		 * `max-turns-spec-continuation`): the decision, the bound and the counter writes
-		 * are identical, only the wording differs, and duplicating the branch is how the
-		 * two loops drifted in the first place.
-		 *
-		 * What it does NOT do, on purpose:
-		 *
-		 *  - It never parks. A primary narrator may sit idle waiting for an external
-		 *    condition; a subagent owes its parent a `tool_result`, so every path here
-		 *    either drives another pass or lets the run finish.
-		 *  - It never marks the run as an error. The bound stopping a run is not a
-		 *    failure — the work that happened is real, and `hasError` would discard an
-		 *    explore/plan subagent's conclusion file. The reason travels as text.
-		 *
-		 * ⚠️ Called at most ONCE per pass, and only from an end-of-pass branch. The
-		 * `grantedKind` handoff assumes it: it says "the pass that just ran was a
-		 * continuation of this kind", so calling it twice for one pass would judge that
-		 * pass twice and advance the stall counter at double rate. The two call sites are
-		 * mutually exclusive in practice (`maxTurnsExceeded` continues the loop, so the
-		 * spec branch below is not reached on that pass).
-		 *
-		 * @returns true when the caller should `continue` the loop.
-		 */
-		const maybeContinueForSpec = async (
-			cause: SubagentContinuationCause,
-			suppressed: boolean,
-		): Promise<boolean> => {
-			const spec = await readSubagentSpecContinuationState(narratorId);
-			// Re-read the row rather than reusing `initialNarrator`: the setting can be
-			// changed from the UI while a pass is in flight, and the primary loop applies
-			// such a change at the very next turn boundary (`maybeStartContinuation` does
-			// its own re-read for exactly this reason). A failed read degrades to the
-			// global default rather than to "continue anyway".
-			const freshOverride = await narratorService
-				.getById(narratorId)
-				.then((row) => row.autoContinuationOverride)
-				.catch(() => null);
-			const plan = planSubagentContinuation({
-				cause,
-				mode: resolveAutoContinuationMode(
-					freshOverride,
-					normalizeAutoContinuationMode(settings.agent.autoContinuationMode),
-				),
-				openTask: spec.openTask,
-				protectedOpenCount: spec.protectedOpenCount,
-				previous: continuationState,
-				result,
-				suppressed,
-			});
-			// Both fields are written back unconditionally, mirroring the primary loop: the
-			// stall classification is the whole bound, and `grantedKind` is what lets the NEXT
-			// pass be judged as a continuation (or, when absent, not judged at all).
-			continuationState.stall = plan.stall;
-			continuationState.grantedKind = plan.grantedKind;
-			if (plan.action === "none") return false;
-			if (plan.action === "stop") {
-				continuationStopNote = subagentContinuationStopNote(plan, locale as Locale);
-				logger.warn("Subagent self-continuation stopped by its bound", {
-					narratorId,
-					parentNarratorId,
-					cause: plan.cause,
-					reason: plan.reason,
-					passes: plan.passes,
-					stallCount: plan.stall.count,
-				});
-				return false;
-			}
-			continuationState.passes = plan.passes;
-
-			// A continuation that started is progress of its own kind: clear any note left
-			// by an earlier stop so a run that recovers does not report a stale reason.
-			continuationStopNote = null;
-
-			const content = buildSubagentContinuationPrompt({
-				cause: plan.cause,
-				task: plan.task,
-				passes: plan.passes,
-				locale: locale as Locale,
-			});
-			// `schedule: "none"`: this loop drives the pass itself. The sys row is either
-			// retained as system history or extracted as this pass's CURRENT turn text.
-			//
-			// `subagent: {...}` is what puts the row in the parent's tool-card subtree AND on
-			// the subagent's own page — without it the card would be a top-level row on the
-			// parent, attributed to nobody.
-			await deliverInjection(narratorId, {
-				content,
-				source: plan.task.status === "blocked" ? "spec_blocked_continuation" : "spec_continuation",
-				schedule: "none",
-				locale: locale as Locale,
-				originSource: "autoContinuation",
-				subagent: { parentToolUseId: toolUseId, parentNarratorId },
-			});
-
-			logger.info("Subagent self-continuation started", {
-				narratorId,
-				parentNarratorId,
-				cause: plan.cause,
-				passes: plan.passes,
-				taskStatus: plan.task.status,
-			});
-
-			// Start a fresh turn rather than replaying the dispatched prompt. Compatible
-			// Anthropic (including NUG delegates) extracts the trailing sys rows; official
-			// Anthropic retains them as system history and returns no trailing text.
-			const rebuilt = await loadSubagentHistory(
-				narratorId,
-				model,
-				resolvedProvider,
-				pruneBoundaryId,
-			);
-			history = rebuilt.history;
-			trailingToolResults = rebuilt.trailingToolResults;
-			prompt = rebuilt.trailingUserText ?? "";
-			hasError = false;
-			finalText = "";
-			await narratorService.updateStatus(narratorId, "working").catch(() => {});
-			return true;
-		};
-
-		/**
-		 * Suspend this subagent until a NUG model becomes available again, then
-		 * report whether the loop may continue.
-		 *
-		 * Shared by the pre-flight check below (the catalog already recorded an
-		 * outage) and the post-request `modelUnavailable` branch (the gateway just
-		 * refused), so both park on the shared availability poller — which polls
-		 * only the lightweight `/v1/models` list — with identical status, broadcast
-		 * and history-rebuild behaviour.
-		 *
-		 * @returns true when the model recovered and the caller should `continue`;
-		 * false when the wait was aborted and the caller must `break`.
-		 */
-		const suspendUntilNugModelAvailable = async (
-			mu: Omit<NonNullable<ExecuteLoopResult["modelUnavailable"]>, "provider">,
-		): Promise<boolean> => {
-			// Finalize/clean up the partial message from the failed turn.
-			const partialId = eventContext.getPartialMessageId();
-			let keptPartial = false;
-			if (partialId) {
-				keptPartial = await finalizeOrCleanupPartialMessage(partialId, narratorId);
-				eventContext.setPartialMessageId(undefined);
-			}
-
-			await narratorService.updateStatus(narratorId, "waiting", {
-				substatus: ["model_unavailable"],
-			});
-			broadcastToNarrator(parentNarratorId, {
-				type: "subagent_model_unavailable_waiting",
-				narratorId: parentNarratorId,
-				subagentNarratorId: narratorId,
-				message: mu.message,
-				model: mu.model,
-				nugModelId: mu.nugModelId,
-				diagnostics: mu.diagnostics,
-			});
-
-			const outcome =
-				mu.providerId && mu.nugModelId
-					? await nugAvailabilityPoller.waitForModelAvailable({
-							providerId: mu.providerId,
-							nugModelId: mu.nugModelId,
-							signal,
-						})
-					: "aborted";
-
-			if (signal.aborted || outcome === "aborted") return false;
-
-			broadcastToNarrator(parentNarratorId, {
-				type: "subagent_model_unavailable_recovered",
-				narratorId: parentNarratorId,
-				subagentNarratorId: narratorId,
-				model: mu.model,
-				nugModelId: mu.nugModelId,
-			});
-			await narratorService.updateStatus(narratorId, "working");
-			if (keptPartial) {
-				prompt = "";
-			}
-			const rebuilt = await loadSubagentHistory(
-				narratorId,
-				model,
-				resolvedProvider,
-				pruneBoundaryId,
-				prompt,
-			);
-			history = rebuilt.history;
-			trailingToolResults = rebuilt.trailingToolResults;
-			currentConversationId = randomUUID();
-			resetUpstreamSessionOnNextRequest = true;
-			return true;
-		};
-
-		// --- Pre-flight: the model is already known to be unavailable ---
-		// A subagent's model comes from settings or its parent, so it can point at a
-		// model whose outage is already recorded. Waiting here rather than sending
-		// the request avoids uploading the whole history just to be refused, and it
-		// does not depend on the gateway's error text being recognized. An unknown
-		// model counts as usable, so a working model is never held back.
-		{
-			const known = resolveKnownUnavailableNugModel(model, resolvedProvider);
-			if (known && !signal.aborted) {
-				const resumed = await suspendUntilNugModelAvailable({
-					message: `Model ${known.model} is recorded as temporarily unavailable; waiting for it to recover before sending the request.`,
-					model: known.model,
-					providerId: known.providerId,
-					providerPrefix: known.providerPrefix,
-					nugModelId: known.nugModelId,
-				});
-				if (!resumed) {
-					aborted = true;
-					break;
-				}
-				transientRetries = 0;
-				continue;
-			}
-		}
-
-		const baselineCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
-		const result = await executeAgentLoop({
-			config,
-			userText: prompt,
-			history,
-			trailingToolResults,
-			eventContext,
-			hooks,
+	active._isInGitRepo =
+		!!row.chapterId ||
+		(await import("./git-service")
+			.then(({ gitService }) => gitService.isGitRepo(opts.cwd))
+			.catch(() => false));
+	if (!owner.isCurrent())
+		throw new AppError("Subagent execution owner expired", 409, "NARRATOR_EXECUTION_BUSY");
+	activeNarrators.set(opts.narratorId, active);
+	// Legacy child scan helpers and the shared pass use the same compact-cycle object.
+	knowledgeInjectionCycleStates.set(opts.narratorId, getSubagentKnowledgeCycle(opts.narratorId));
+	const initialController = active.abortController;
+	const abort = () => initialController.abort(opts.signal.reason);
+	opts.signal.addEventListener("abort", abort, { once: true });
+	if (opts.signal.aborted) abort();
+	registerActiveSubagent(opts.narratorId, active.model, active.reasoningEffort);
+	try {
+		const result = await runAgentLoopUnlocked(active, owner, opts.prompt, undefined, {
+			kind: "subagent",
+			parentNarratorId: opts.parentNarratorId,
+			parentToolUseId: opts.toolUseId,
+			subagentType: opts.subagentType,
+			customDefinition: opts.customDef,
+			systemPrompt: opts.systemPrompt,
+			initialModel: opts.model,
+			rebuildSystemPrompt: opts.rebuildSystemPrompt,
+			initialHistory: opts.initialHistory,
+			initialTrailingToolResults: opts.initialTrailingToolResults,
+			initialPrePromptBashCommand: opts.initialPrePromptBashCommand,
+			control: opts.control,
 		});
-		overflowRetries = resetContextOverflowRetriesAfterProgress(
-			overflowRetries,
-			result.completedAssistantTurn,
-		);
-
-		finalText = result.contextLengthExceeded
-			? "Error: context length exceeded"
-			: result.maxTurnsExceeded
-				? result.finalText || "Error: max turns exceeded"
-				: result.finalText;
-		hasError = result.hasError || result.maxTurnsExceeded === true;
-		aborted = aborted || result.aborted === true || signal.aborted;
-		if (result.retryableError && !result.hasError) {
-			// Don't mark as error yet — try transient retry below
-		}
-
-		// --- Payment required: the balance is exhausted, so stop with a real reason ---
-		//
-		// The provider refused the request outright; no amount of retrying or history
-		// rebuilding changes that, only the user topping up does. Handled explicitly
-		// because `paymentRequired` sets none of the other result flags: without this
-		// branch the pass looked like an ordinary empty completion, fell through to the
-		// finalText backfill at the end of the run, and delivered the subagent's
-		// PREVIOUS answer (or "(no output)") to the parent as if the work had finished.
-		//
-		// Unlike the primary narrator, this cannot merely park the session in a
-		// `payment_required` state and wait: a subagent owes its parent a tool_result,
-		// and a parent blocked on a tool that never returns is a dead turn. So the run
-		// ends as an error whose text names the cause — the parent can then decide (and
-		// can re-run the subagent once the balance is restored).
-		//
-		// The narrator row still carries the `payment_required` substatus + errorCode so
-		// the subagent's own panel shows the recharge prompt rather than a generic
-		// failure, while the parent-facing outcome is carried by finalText.
-		// `signal.aborted` is this loop's spelling of the abort-before-recovery rule: an
-		// already-stopped run must not spend a recovery branch on itself. Every branch below
-		// carries the same guard, which is why the marker sits here.
-		// [continuation-source: abort-before-recovery]
-		// [continuation-source: payment-required]
-		const paymentPlan = planSubagentPaymentRequired(result, signal.aborted);
-		if (paymentPlan.action === "fail" && result.paymentRequired) {
-			const partialId = eventContext.getPartialMessageId();
-			eventContext.setPartialMessageId(undefined);
-			if (partialId) {
-				await finalizeOrCleanupPartialMessage(partialId, narratorId);
-			}
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["payment_required"],
-				errorCode: "payment_required",
-				errorMessage: paymentPlan.errorMessage,
-			});
-			// The subagent's own page renders this like a primary narrator's.
-			broadcastToNarrator(narratorId, {
-				type: "payment_required",
-				narratorId,
-				providerId: result.paymentRequired.providerId,
-				providerPrefix: result.paymentRequired.providerPrefix,
-				balance: result.paymentRequired.balance,
-				required: result.paymentRequired.required,
-				resumeAction: result.paymentRequired.resumeAction,
-			});
-			// Also surfaced on the parent's subagent card, which otherwise shows only a
-			// generic error and gives the user no idea a top-up would fix it.
-			broadcastToNarrator(parentNarratorId, {
-				type: "payment_required",
-				narratorId: parentNarratorId,
-				providerId: result.paymentRequired.providerId,
-				providerPrefix: result.paymentRequired.providerPrefix,
-				balance: result.paymentRequired.balance,
-				required: result.paymentRequired.required,
-				resumeAction: result.paymentRequired.resumeAction,
-			});
-			logger.warn("Subagent stopped: provider balance exhausted", {
-				narratorId,
-				parentNarratorId,
-				providerId: result.paymentRequired.providerId,
-			});
-			hasError = true;
-			finalText = paymentPlan.finalText;
-			break;
-		}
-
-		// --- Context length exceeded: aggressive prune (Codex) then compact/retry ---
-		// [continuation-source: context-overflow]
-		if (result.contextLengthExceeded) {
-			if (signal.aborted) {
-				aborted = true;
-				hasError = true;
-				contextLengthExceeded = true;
-				finalText = "Error: context length exceeded";
-				break;
-			}
-
-			// Finalize or clean up partial message from the failed turn before retry.
-			// If tools were already executed, the message is kept so the retry
-			// includes them in history.
-			const partialId = eventContext.getPartialMessageId();
-			if (partialId) {
-				await finalizeOrCleanupPartialMessage(partialId, narratorId);
-				eventContext.setPartialMessageId(undefined);
-			}
-
-			const overflow = await handleContextOverflow({
-				narratorId,
-				locale: locale as Locale,
-				provider: resolvedProvider,
-				model,
-				overflowRetries,
-				maxRetries: MAX_CONTEXT_OVERFLOW_RETRIES,
-				baselineCompactSeq,
-				signal,
-			});
-			overflowRetries = overflow.overflowRetries;
-
-			if (overflow.action === "retry_pruned") {
-				pruneBoundaryId = overflow.boundaryMessageId;
-				resetUpstreamSessionOnNextRequest = true;
-				const rebuilt = await loadSubagentHistory(
-					narratorId,
-					model,
-					resolvedProvider,
-					pruneBoundaryId,
-					prompt,
-				);
-				history = rebuilt.history;
-				trailingToolResults = rebuilt.trailingToolResults;
-				transientRetries = 0;
-				continue;
-			}
-			if (overflow.action === "retry_compacted") {
-				needsRestart = true;
-				currentConversationId = overflow.newConversationId;
-				resetUpstreamSessionOnNextRequest = true;
-				transientRetries = 0;
-				// Continue to the restart-after-compact flow below
-			} else {
-				const failure = getContextOverflowFailureError(overflow.reason);
-				hasError = true;
-				contextLengthExceeded = true;
-				finalText = `Error: ${failure.message}`;
-				break;
-			}
-		}
-
-		// --- Model temporarily unavailable: suspend and wait for recovery ---
-		// The NUG model's whole credential pool is disabled (recoverable
-		// exhaustion). Suspend this subagent and register with the shared
-		// instance-level availability poller (only fetches the lightweight
-		// `/v1/models` list, no history). On recovery, rebuild history from the DB
-		// and resume with one fresh request.
-		// [continuation-source: model-unavailable]
-		if (result.modelUnavailable && !signal.aborted) {
-			const mu = result.modelUnavailable;
-			// Record the refusal before waiting: the poller decides recovery from
-			// the model cache, so a pre-outage `available: true` snapshot would
-			// otherwise resume this subagent immediately and fail again.
-			if (mu.providerId && mu.nugModelId) {
-				markNugCachedModelUnavailable(mu.providerId, mu.nugModelId);
-			}
-			if (!(await suspendUntilNugModelAvailable(mu))) {
-				aborted = true;
-				break;
-			}
-			transientRetries = 0;
-			continue;
-		}
-
-		// --- Transient API error: retry with exponential backoff ---
-		// [continuation-source: transient-error]
-		if (result.retryableError && !signal.aborted) {
-			transientRetries++;
-			const { shouldRetry } = await handleTransientError({
-				narratorId,
-				error: result.retryableError,
-				retryCount: transientRetries,
-				maxRetries: result.bypassRetryLimit ? -1 : getMaxTransientRetries(),
-				signal,
-			});
-			if (shouldRetry) {
-				// Finalize or clean up partial message from the failed turn.
-				// If tools were already executed, the message is kept so the
-				// rebuilt history includes them.
-				const partialId = eventContext.getPartialMessageId();
-				let keptPartial = false;
-				if (partialId) {
-					keptPartial = await finalizeOrCleanupPartialMessage(partialId, narratorId);
-					eventContext.setPartialMessageId(undefined);
-				}
-				if (keptPartial) {
-					prompt = "";
-				}
-				// Rebuild history from DB so the retry includes any tool calls
-				// that were persisted before the API error occurred. Without this,
-				// the retry would use stale history and the model would repeat
-				// the same tool calls it already executed.
-				const rebuilt = await loadSubagentHistory(
-					narratorId,
-					model,
-					resolvedProvider,
-					pruneBoundaryId,
-					prompt,
-				);
-				history = rebuilt.history;
-				trailingToolResults = rebuilt.trailingToolResults;
-				currentConversationId = randomUUID();
-				resetUpstreamSessionOnNextRequest = true;
-				continue;
-			}
-			// If aborted during backoff sleep, don't mark as error — the
-			// caller will handle the abort status.
-			if (signal.aborted) {
-				aborted = true;
-				break;
-			}
-			hasError = true;
-			finalText = `Error: ${result.retryableError}`;
-			break;
-		}
-
-		// --- Codex WebSocket silent disconnect: retry with the transient backoff ---
-		//
-		// The upstream socket closed quietly, so the turn produced no answer and no
-		// error either. This used to only clean up the partial message and fall through
-		// to the end of the run, which delivered whatever text happened to be lying
-		// around (or nothing) to the parent as the subagent's conclusion — a dropped
-		// connection silently became "the work is done".
-		//
-		// Same treatment as the primary loop: it counts against `transientRetries` and
-		// goes through `handleTransientError`, which applies the backoff and warns the
-		// parent panel. Placed BEFORE the success reset below, because that reset would
-		// otherwise zero the counter every pass and turn the bounded retry into an
-		// unbounded reconnect loop.
-		// [continuation-source: silent-disconnect]
-		const disconnectPlan = planSubagentSilentDisconnect(
-			result,
-			transientRetries,
-			getMaxTransientRetries(),
-			signal.aborted,
-		);
-		if (disconnectPlan.action !== "none") {
-			transientRetries = disconnectPlan.retries;
-			// Runs for both outcomes: it applies the backoff and warns the parent panel,
-			// and on the exhausted path it is what logs the final give-up.
-			const { shouldRetry } = await handleTransientError({
-				narratorId,
-				error: SUBAGENT_SILENT_DISCONNECT_ERROR,
-				retryCount: transientRetries,
-				maxRetries: getMaxTransientRetries(),
-				signal,
-			});
-
-			// The partial turn is finalized either way: on retry it becomes history the
-			// rebuilt request includes (so the model does not repeat executed tools), and
-			// on giving up it is the transcript of what did happen.
-			const partialId = eventContext.getPartialMessageId();
-			let keptPartial = false;
-			if (partialId) {
-				keptPartial = await finalizeOrCleanupPartialMessage(partialId, narratorId);
-				eventContext.setPartialMessageId(undefined);
-			}
-
-			// Aborted during the backoff sleep: not an error, the caller owns the status.
-			if (signal.aborted) {
-				aborted = true;
-				break;
-			}
-			if (shouldRetry && disconnectPlan.action === "retry") {
-				if (keptPartial) prompt = "";
-				const rebuilt = await loadSubagentHistory(
-					narratorId,
-					model,
-					resolvedProvider,
-					pruneBoundaryId,
-					prompt,
-				);
-				history = rebuilt.history;
-				trailingToolResults = rebuilt.trailingToolResults;
-				currentConversationId = randomUUID();
-				resetUpstreamSessionOnNextRequest = true;
-				continue;
-			}
-			// Retries exhausted. The parent must be told the turn died rather than
-			// receiving a stale or empty conclusion as if it had succeeded.
-			logger.warn("Subagent stopped: upstream socket kept closing silently", {
-				narratorId,
-				parentNarratorId,
-				retries: transientRetries,
-			});
-			hasError = true;
-			finalText = `Error: ${SUBAGENT_SILENT_DISCONNECT_ERROR}`;
-			break;
-		}
-
-		// A successful pass right after transient retries: tell the parent panel
-		// the subagent has recovered (see subagentRetryRecoveredBroadcast).
-		const retryRecovered = subagentRetryRecoveredBroadcast(
-			transientRetries,
-			parentNarratorId,
-			narratorId,
-		);
-		if (retryRecovered) {
-			broadcastToNarrator(parentNarratorId, retryRecovered);
-		}
-		// Reset transient retry counter on success
-		transientRetries = 0;
-
-		// --- Turn budget spent while the spec still has open work ---
-		//
-		// A pass that exhausts `maxTurns` is not a failed pass: it did real work and was
-		// cut off by a per-pass budget. Treating it as terminal (which this loop used to
-		// do) means a subagent doing exactly what it was told loses its remaining work at
-		// an arbitrary boundary, and the parent receives "Error: max turns exceeded" as
-		// the answer.
-		//
-		// ⚠️ The bound CANNOT come from turn counts. Each continuation pass is granted a
-		// fresh budget, so "how many turns has this run used" is unbounded by construction.
-		// The only thing that bounds it is progress plus a per-run pass cap, which is what
-		// `planSubagentContinuation` applies — see its own note.
-		//
-		// Placed before the interruption branch (and thus before anything that would end
-		// the run) for the same reason as on the primary side: max-turns marks the result
-		// as an error, so a continuation attempt has to come first or the run ends instead.
-		// [continuation-source: max-turns-spec-continuation]
-		if (result.maxTurnsExceeded && !signal.aborted && !aborted) {
-			if (await maybeContinueForSpec("maxTurns", false)) continue;
-		}
-
-		// Completion-limit and resumable stream interruptions both leave a valid partial
-		// assistant turn in the DB. Rebuild history and continue instead of returning that
-		// partial text as the subagent's terminal result.
-		// [continuation-source: interruption-continuation]
-		const interruptionPlan = planTurnInterruption(result, interruptionRetries, {
-			suppressed: signal.aborted,
-			maxRetries: MAX_SUBAGENT_INTERRUPTION_RETRIES,
-		});
-		interruptionRetries = interruptionPlan.retries;
-		if (interruptionPlan.action !== "none") {
-			const continuationLogLabel = interruptionContinuationLabel(
-				interruptionPlan.reason,
-				"subagent",
-			);
-			if (interruptionPlan.action === "stop") {
-				logger.warn(`${continuationLogLabel}: max retries reached, stopping`, {
-					narratorId,
-					parentNarratorId,
-					retries: interruptionPlan.retries,
-				});
-			} else {
-				// The interrupted pass already flushed its partial assistant content. Reload it
-				// before the next request so continuation starts from the persisted transcript.
-				const rebuilt = await loadSubagentHistory(
-					narratorId,
-					model,
-					resolvedProvider,
-					pruneBoundaryId,
-				);
-				history = rebuilt.history;
-				trailingToolResults = rebuilt.trailingToolResults;
-
-				if (interruptionPlan.action === "replay") {
-					logger.info(`${continuationLogLabel}: replaying interrupted tool-result turn`, {
-						narratorId,
-						parentNarratorId,
-						retries: interruptionPlan.retries,
-					});
-					prompt = "";
-				} else {
-					const continueText = getToolMessage(interruptionPlan.promptKey, locale as Locale);
-					const userMsg = await narratorService.persistSubagentUserMessage(
-						narratorId,
-						continueText,
-						toolUseId,
-					);
-					broadcastToNarrator(parentNarratorId, {
-						type: "user_message",
-						narratorId: parentNarratorId,
-						message: fileReferenceMessageForDisplay(userMsg),
-					});
-					broadcastToNarrator(narratorId, {
-						type: "user_message",
-						narratorId,
-						message: fileReferenceMessageForDisplay({ ...userMsg, parentToolUseId: null }),
-					});
-					prompt = continueText;
-				}
-				continue;
-			}
-		}
-
-		// A silent disconnect on an ALREADY-ABORTED run: the retry branch above skips
-		// those (there is nothing to retry into), so the partial turn is finalized here
-		// instead. Retained rather than folded into that branch because an abort must
-		// not pay for a backoff sleep before its transcript is written.
-		if (result.silentDisconnect) {
-			const partialId = eventContext.getPartialMessageId();
-			eventContext.setPartialMessageId(undefined);
-			if (partialId) {
-				await finalizeOrCleanupPartialMessage(partialId, narratorId);
-			}
-		}
-
-		// --- Check for buffered user message (sent from subagent page) ---
-		// [continuation-source: buffered-message]
-		if (!signal.aborted && !hasError) {
-			const consumedBuffered = await consumeNextBufferedSubagentMessage({
-				narratorId,
-				parentNarratorId,
-				toolUseId,
-				model,
-				provider: resolveProvider(model),
-				cwd,
-				pruneBoundaryId,
-				locale,
-			});
-			if (consumedBuffered) {
-				prompt = consumedBuffered.prompt;
-				history = consumedBuffered.history;
-				trailingToolResults = consumedBuffered.trailingToolResults;
-				currentUserId = consumedBuffered.userId ?? null;
-				currentConversationId = randomUUID();
-				resetUpstreamSessionOnNextRequest = true;
-				continue;
-			}
-		}
-
-		// --- The subagent's OWN Dynamic Spec still has open work ---
-		//
-		// The digest already reaches a subagent (`getAfterToolsInjections` builds it on a
-		// cadence), so it was being told about its open tasks and then the run ended with
-		// them still `doing`: the reminder existed, the loop that closes it did not.
-		//
-		// Deliberately AFTER the buffered-message consumer, matching the primary order:
-		// real input outranks the loop's own self-continuation. A message someone just sent
-		// this subagent is more current than a task it wrote for itself earlier.
-		//
-		// `hasError` suppresses it: a run already ending in a stated failure must not be
-		// extended, or the error text is replaced by whatever the extra pass produces.
-		// [continuation-source: spec-continuation]
-		if (!signal.aborted && !aborted && !hasError) {
-			if (await maybeContinueForSpec("spec", false)) continue;
-		}
-
-		if (!needsRestart || signal.aborted || hasError) break;
-
-		// Do not key this decision on finalText: it is filled in after the loop, so an
-		// empty value here does not mean the subagent produced nothing.
-		// [continuation-source: compact-restart]
-		const restartDecision = planSubagentCompactRestart({
-			result,
-			compactConsumedInLoop,
-			compactDoneFlag,
-		});
-		if (restartDecision.action === "finish") {
-			logger.info("Subagent skipping restart after compact", {
-				narratorId,
-				parentNarratorId,
-				reason: restartDecision.reason,
-				finalTextLength: finalText.length,
-			});
-			needsRestart = false;
-			compactDoneFlag = false;
-			break;
-		}
-		compactDoneFlag = false;
-
-		// Compact completed mid-turn — restart with fresh history
-		logger.info("Subagent restarting after compact", { narratorId, parentNarratorId });
-
-		// Reload fresh state — compact clears prune boundary
-		const freshNarrator = await narratorService.getById(narratorId);
-		pruneBoundaryId = freshNarrator.pruneBoundaryMessageId ?? null;
-		narratorReasoningEffort = freshNarrator.reasoningEffort ?? undefined;
-		narratorFastModeOverride = normalizeBooleanOverride(freshNarrator.fastModeOverride);
-
-		// Sync model from the active subagent settings map (may have been changed via UI)
-		const saSettings = activeSubagentSettings.get(narratorId);
-		if (saSettings && saSettings.model !== model) {
-			model = saSettings.model;
-			provider = resolveProvider(model);
-		}
-
-		// Rebuild system prompt with new contextSummary
-		if (opts.rebuildSystemPrompt) {
-			systemPrompt = await opts.rebuildSystemPrompt(freshNarrator.contextSummary);
-		}
-
-		// Reload history from post-compact messages (no prune after compact)
-		const rebuilt = await loadSubagentHistory(narratorId, model, resolvedProvider, null, prompt);
-		history = rebuilt.history;
-		trailingToolResults = rebuilt.trailingToolResults;
-	}
-
-	// Backfill an empty result when the run ended cleanly but left no in-memory
-	// final text. This happens when a compact completes and the restarted turn
-	// ends before producing a new assistant_message (the compact marker is now at
-	// the tail, so the last real answer sits just before the boundary). Recover it
-	// from history so the parent's Await / background result is not "(no output)".
-	if (!finalText.trim() && !hasError && !aborted && !signal.aborted && !contextLengthExceeded) {
-		const latest = await narratorService.getLatestAssistantTextAndId(narratorId).catch(() => null);
-		if (latest?.text.trim()) {
-			finalText = latest.text;
-		} else {
-			const compactSummary = await narratorService
-				.getLatestSuccessfulCompactSummary(narratorId)
-				.catch(() => null);
-			if (compactSummary?.summary.trim()) finalText = compactSummary.summary;
+		return {
+			finalText: result.finalText ?? "",
+			hasError: result.hasError ?? false,
+			allowInboxWake: result.allowInboxWake === true,
+			contextLengthExceeded: result.contextLengthExceeded,
+			aborted:
+				result.aborted || (opts.control ? opts.control.proxy.signal.aborted : opts.signal.aborted),
+		};
+	} finally {
+		opts.signal.removeEventListener("abort", abort);
+		opts.control?.cleanupTurnAbort?.();
+		if (owner.isCurrent()) {
+			abandonSessionTreeSnapshots(active, opts.narratorId);
+			active._loopRunning = false;
+			active.alive = false;
+			if (activeNarrators.get(opts.narratorId) === active) activeNarrators.delete(opts.narratorId);
 		}
 	}
-
-	// The continuation bound stopped this run with spec work still open. Say so in the
-	// text the parent receives: the run ends normally (the work that happened is real,
-	// and flagging `hasError` would discard an explore/plan conclusion), so without this
-	// note a truncated answer is indistinguishable from a finished one.
-	//
-	// APPENDED rather than substituted, and only after the backfill above, so the
-	// subagent's own conclusion stays the primary content. An aborted run is skipped:
-	// its ending was decided by the abort, not by this bound.
-	if (continuationStopNote && !aborted && !signal.aborted) {
-		finalText = finalText.trim()
-			? `${finalText.trim()}\n\n${continuationStopNote}`
-			: continuationStopNote;
-	}
-
-	unregisterActiveSubagent(narratorId);
-	return { finalText, hasError, contextLengthExceeded, aborted: aborted || signal.aborted };
 }

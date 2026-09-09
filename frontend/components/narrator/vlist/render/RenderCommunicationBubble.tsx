@@ -1,4 +1,9 @@
 /** Render-only outgoing message bubble. Navigation and full payload fetching belong to the host. */
+import {
+	communicationTargetLabel,
+	deriveCommunicationState,
+	formatCommunicationState,
+} from "@shared/pretext-layout/communication-state";
 import type { CommunicationBubbleData } from "@shared/pretext-layout/segment-adapter";
 import type { CSSProperties, ReactNode } from "react";
 import type { MeasuredCommunicationBubble } from "../measure/measure-communication-bubble";
@@ -12,7 +17,10 @@ import { RenderMarkdown } from "./RenderMarkdown";
 export interface RenderCommunicationBubbleProps {
 	measured: MeasuredCommunicationBubble;
 	data?: Partial<
-		Pick<CommunicationBubbleData, "recipients" | "broadcast" | "awaitReply" | "status" | "labels">
+		Pick<
+			CommunicationBubbleData,
+			"recipients" | "broadcast" | "awaitReply" | "status" | "labels" | "deliveryState"
+		>
 	>;
 	/** Interactive recipient chips supplied by the host, with its route/context-menu behavior. */
 	header?: ReactNode;
@@ -53,17 +61,14 @@ export function RenderCommunicationBubble({
 	};
 	const labels = data?.labels;
 	const failed = measured.errorTop >= 0;
-	const status = failed
-		? labels?.communicationError
-		: data?.status === "success" || data?.status === "completed"
-			? labels?.communicationSuccess
-			: data?.status === "cancelled" || data?.status === "timeout" || data?.status === "aborted"
-				? labels?.communicationCancelled
-				: data?.status === "waiting" || data?.awaitReply
-					? labels?.communicationWaiting
-					: labels?.communicationRunning;
-	const mode = data?.awaitReply ? labels?.sendAwaitReply : labels?.sendNoAwaitReply;
-	const meta = [mode, status].filter(Boolean).join(" · ");
+	const state =
+		data?.deliveryState ??
+		deriveCommunicationState({
+			targets: data?.recipients,
+			awaitReply: data?.awaitReply,
+			status: failed ? "error" : data?.status,
+		});
+	const meta = formatCommunicationState(state, labels);
 	return (
 		<div data-vlist-communication-row style={{ display: "flex", justifyContent: "flex-start" }}>
 			<div
@@ -110,7 +115,7 @@ export function RenderCommunicationBubble({
 							<>
 								{data?.broadcast ? (
 									<span
-										title={data.recipients?.map((recipient) => recipient.label).join(", ")}
+										title={data.recipients?.map(communicationTargetLabel).join(", ")}
 										style={chipStyle}
 									>
 										@{labels?.communicationBroadcast ?? "all"}
@@ -129,11 +134,11 @@ export function RenderCommunicationBubble({
 												}}
 												style={{ ...chipStyle, cursor: "pointer" }}
 											>
-												@{recipient.label}
+												@{communicationTargetLabel(recipient)}
 											</button>
 										) : (
 											<span key={recipient.id ?? recipient.label} style={chipStyle}>
-												@{recipient.label}
+												@{communicationTargetLabel(recipient)}
 											</span>
 										),
 									)}

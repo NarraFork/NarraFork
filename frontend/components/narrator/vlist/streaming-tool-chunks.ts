@@ -24,6 +24,13 @@
  * Pure: mutates the passed store and returns whether the caller should re-render.
  */
 
+import {
+	isCommunicationTool,
+	knownSendDeliveryTargets,
+	mergeSendDeliveryTargetCount,
+	mergeSendDeliveryTargets,
+	type SendDeliveryReceipt,
+} from "@shared/communication-tool";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import {
 	completeStreamingFieldRanges,
@@ -48,56 +55,70 @@ export function applyStreamingSendDelivery(
 	store: StreamingToolStore,
 	event: {
 		toolUseId: string;
-		targets: Array<{ id: string; deliveryMessageId: string }>;
+		targets: SendDeliveryReceipt[];
 		toolCallBinding?: { toolCallId: string; attempt: number };
+		targetCount?: number;
 	},
 ): boolean {
 	if (!event.toolUseId || !Array.isArray(event.targets)) return false;
 	const existing = store.get(event.toolUseId);
 	if (
 		existing &&
-		((existing.toolName !== "Send" && existing.toolName !== UNKNOWN_TOOL_NAME) ||
-			[
-				"success",
-				"completed",
-				"fail",
-				"failed",
-				"error",
-				"cancelled",
-				"aborted",
-				"timeout",
-			].includes(existing._status ?? "") ||
-			existing._output != null)
+		existing.toolName !== UNKNOWN_TOOL_NAME &&
+		!isCommunicationTool({ toolName: existing.toolName, inputJson: existing._input })
 	)
 		return false;
 	const binding = existing?._sendDeliveryBinding;
+	const matchesBinding =
+		!!binding &&
+		!!event.toolCallBinding &&
+		binding.toolCallId === event.toolCallBinding.toolCallId &&
+		binding.attempt === event.toolCallBinding.attempt;
+	if (binding && event.toolCallBinding && !matchesBinding) return false;
+	const terminal =
+		(LIVE_TOOL_PHASE_RANK[existing?._status ?? ""] ?? 0) >= 3 || existing?._output != null;
+	if (terminal && !matchesBinding) return false;
+	const incoming = event.targets.filter(
+		(target) => typeof target?.deliveryMessageId === "string" && !!target.deliveryMessageId.trim(),
+	);
+	// Legacy consumption has no attempt identity. It may enrich an existing exact
+	// receipt, never seed or replace navigation on the currently running attempt.
+	const unboundConsumption =
+		!event.toolCallBinding && incoming.some((target) => target.injectionConsumedAt !== undefined);
+	const matchingReceiptsOnly = terminal || unboundConsumption;
+	const prior = knownSendDeliveryTargets({
+		_metadata: existing?._metadata,
+		outputJson: existing?._output,
+		_sendDeliveryTargets: existing?._sendDeliveryTargets,
+	});
+	const next = mergeSendDeliveryTargets(prior, incoming, matchingReceiptsOnly);
+	const targetCount = mergeSendDeliveryTargetCount(
+		existing?._sendDeliveryTargetCount,
+		unboundConsumption ? undefined : event.targetCount,
+	);
 	if (
-		binding &&
-		event.toolCallBinding &&
-		(binding.toolCallId !== event.toolCallBinding.toolCallId ||
-			binding.attempt !== event.toolCallBinding.attempt)
+		(!next.length && targetCount === undefined) ||
+		(JSON.stringify(next) === JSON.stringify(existing?._sendDeliveryTargets ?? []) &&
+			targetCount === existing?._sendDeliveryTargetCount)
 	)
 		return false;
-	const targets = new Map<string, { id: string; deliveryMessageId: string }>();
-	for (const target of [...(existing?._sendDeliveryTargets ?? []), ...event.targets]) {
-		if (
-			typeof target?.id !== "string" ||
-			!target.id.trim() ||
-			typeof target.deliveryMessageId !== "string" ||
-			!target.deliveryMessageId.trim()
+	// Terminal and unbound consumption frames cannot seed another attempt's navigation.
+	if (
+		matchingReceiptsOnly &&
+		!incoming.some((target) =>
+			prior.some(
+				(prior) => prior.id === target.id && prior.deliveryMessageId === target.deliveryMessageId,
+			),
 		)
-			continue;
-		targets.set(target.id, { id: target.id, deliveryMessageId: target.deliveryMessageId });
-	}
-	const next = [...targets.values()];
-	if (!next.length || JSON.stringify(next) === JSON.stringify(existing?._sendDeliveryTargets))
+	)
 		return false;
 	store.set(event.toolUseId, {
 		toolUseId: event.toolUseId,
 		inputCharsTotal: 0,
 		...existing,
-		toolName: "Send",
+		toolName: existing?.toolName === "TeamStatus" ? "TeamStatus" : "Send",
 		_sendDeliveryTargets: next,
+		...(targetCount !== undefined ? { _sendDeliveryTargetCount: targetCount } : {}),
 		...(event.toolCallBinding ? { _sendDeliveryBinding: event.toolCallBinding } : {}),
 	});
 	return true;

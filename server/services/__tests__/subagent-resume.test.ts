@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import type { SQL } from "drizzle-orm";
 import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
+import { cleanDb } from "../../../tests/setup";
 
 const originToolUseId = "origin-tool-use";
 const parentNarratorId = "parent-narrator";
@@ -313,6 +314,39 @@ beforeAll(async () => {
 				await startupAdmissionBarrier.wait;
 			}
 			const subagentId = String(input.subagentId);
+			// The fake model runner still performs real durable run admission. Publication
+			// must not be mocked away merely because model execution is controlled here.
+			const { narrators } = await import("../../db/schema");
+			const { runtimePublication } = await import("../agent-runtime/publication");
+			const recipientId = String(input.parentNarratorId);
+			const now = new Date().toISOString();
+			realDb
+				.insert(narrators)
+				.values({
+					id: recipientId,
+					type: "primary",
+					variant: "primary",
+					createdAt: now,
+					updatedAt: now,
+				})
+				.onConflictDoNothing()
+				.run();
+			realDb
+				.insert(narrators)
+				.values({
+					id: subagentId,
+					type: "subagent",
+					variant: "subagent:general",
+					parentNarratorId: recipientId,
+					createdAt: now,
+					updatedAt: now,
+				})
+				.onConflictDoNothing()
+				.run();
+			const publicationRun = runtimePublication.startAgentRun({
+				narratorId: subagentId,
+				parentNarratorId: recipientId,
+			});
 			const completion = new Promise<string>((resolve) => {
 				foregroundResolvers.set(subagentId, resolve);
 			});
@@ -329,7 +363,14 @@ beforeAll(async () => {
 				takeResumedBackgroundAnnouncement: () =>
 					!input.skipConclusionDelivery &&
 					(standaloneSubagentIds.has(subagentId) || databaseNarratorIds.has(subagentId))
-						? { subagentId }
+						? {
+								subagentId,
+								parentNarratorId: recipientId,
+								logicalRunId: publicationRun.logicalRunId,
+								status: "completed",
+								wakeParent: true,
+								locale: input.locale,
+							}
 						: undefined,
 				userMessage: {
 					id: `user-message-${startCalls.length}`,
@@ -576,6 +617,8 @@ afterEach(async () => {
 	clearManualOverrideRuntimes();
 	foregroundResolvers.clear();
 	terminalResolvers.clear();
+	const { sqlite } = await import("../../db");
+	cleanDb(sqlite);
 });
 
 afterAll(() => {
@@ -655,7 +698,7 @@ describe("resumeSubagent status reconciliation", () => {
 describe("resumeSubagent", () => {
 	test("real plugin creation persists provenance across database reads and repeated resumes", async () => {
 		const { db } = await import("../../db");
-		const { narrators, narratorMessages } = await import("../../db/schema");
+		const { narrators, narratorMessages, narratorMessageRefs } = await import("../../db/schema");
 		const { eq } = await import("drizzle-orm");
 		const { createNarratorForPlugin } = await import("../narrator-session");
 		const { narratorService } = await import("../narrator-service");
@@ -717,6 +760,7 @@ describe("resumeSubagent", () => {
 			).rejects.toThrow("cannot have an Agent tool-call origin");
 		} finally {
 			for (const id of childIds) {
+				await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, id));
 				await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, id));
 				await db.delete(narrators).where(eq(narrators.id, id));
 			}
@@ -876,6 +920,7 @@ describe("resumeSubagent", () => {
 			await db.delete(narratorToolCalls).where(eq(narratorToolCalls.id, toolCallId));
 			await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, messageId));
 			await db.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
+			await db.delete(narrators).where(eq(narrators.id, subagentId));
 			await db.delete(narrators).where(eq(narrators.id, parentNarratorId));
 		}
 	});

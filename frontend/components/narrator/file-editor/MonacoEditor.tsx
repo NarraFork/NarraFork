@@ -72,8 +72,14 @@ interface Runtime {
 /** Resolve Mantine variables to actual CSS colours, which Monaco's theme parser requires. */
 function updateTheme(api: MonacoAPI, host: HTMLElement, dark: boolean): void {
 	const style = host.ownerDocument.defaultView?.getComputedStyle(host);
-	const color = (variable: string, fallback: string) =>
-		style?.getPropertyValue(variable).trim() || fallback;
+	const color = (variable: string, fallback: string) => {
+		const value = style?.getPropertyValue(variable).trim() || fallback;
+		// Monaco also feeds editor foreground/background into its token colour map,
+		// which accepts six/eight hex digits, but rejects valid CSS shorthand like #000.
+		if (/^#[\da-f]{3,4}$/i.test(value))
+			return `#${[...value.slice(1)].map((digit) => digit + digit).join("")}`;
+		return /^#[\da-f]{6}(?:[\da-f]{2})?$/i.test(value) ? value : fallback;
+	};
 	api.editor.defineTheme("narrafork", {
 		base: dark ? "vs-dark" : "vs",
 		inherit: true,

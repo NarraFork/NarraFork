@@ -159,6 +159,8 @@ export interface NarratorPanelProps {
 	narrator?: NarratorPanelSnapshot;
 	onForkFromMessage?: (messageId: string) => void;
 	highlightMessageId?: string;
+	/** Re-arm a message jump without remounting the session. */
+	highlightRequestId?: string;
 	onSendToTerminal?: (text: string) => void;
 	appendInputRef?: React.MutableRefObject<((text: string) => void) | null>;
 	terminalOpen?: boolean;

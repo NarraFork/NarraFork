@@ -355,7 +355,8 @@ export type NarratorServerMessage =
 			type: "send_delivery_resolved";
 			narratorId: string;
 			toolUseId: string;
-			targets: Array<{ id: string; deliveryMessageId: string }>;
+			targets: import("@shared/communication-tool").SendDeliveryReceipt[];
+			targetCount?: number;
 			toolCallBinding?: { toolCallId: string; attempt: number };
 			parentToolUseId?: string;
 	  }

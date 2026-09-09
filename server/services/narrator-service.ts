@@ -110,7 +110,11 @@ import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./
 // `bumpParentNarratorMessageVersion` is deliberately NOT imported any more: the bump
 // now happens inside `persistUserMessage`/`persistSystemMessage`, so every writer of a
 // child row gets it rather than only the subagent entry point that remembered to call it.
-import { appendMessageRef, narratorPersistence } from "./narrator-persistence";
+import {
+	appendMessageRef,
+	deleteRecipientMessageRefs,
+	narratorPersistence,
+} from "./narrator-persistence";
 import { materializeChildrenOf } from "./narrator-refs-backfill";
 import { specVfsService } from "./spec-vfs-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
@@ -1657,6 +1661,7 @@ export const narratorService = {
 			createdBy?: string | null;
 			origin?: MessageOriginOptions;
 			delivery?: import("./agent-message-delivery").AgentMessageDelivery;
+			mailboxClaim?: import("./agent-runtime/mailbox-types").MailboxClaim;
 		},
 	) {
 		const delivery = options?.delivery;
@@ -1700,7 +1705,11 @@ export const narratorService = {
 			options?.commandText ?? null,
 			options?.createdBy ?? null,
 			origin,
-			{ parentToolUseId, messageId: delivery?.recipientMessageId },
+			{
+				parentToolUseId,
+				messageId: delivery?.recipientMessageId,
+				mailboxClaim: options?.mailboxClaim ?? delivery?.mailboxClaim,
+			},
 		);
 		// See (2) above: withheld here rather than in the shared entry point, so the
 		// row's `created_by` survives as audit data while the rendered author does not
@@ -1879,7 +1888,7 @@ export const narratorService = {
 			tx.delete(backgroundTasks).where(eq(backgroundTasks.subagentNarratorId, narratorId)).run();
 			tx.delete(backgroundTasks).where(eq(backgroundTasks.parentNarratorId, narratorId)).run();
 			tx.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId)).run();
-			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, narratorId)).run();
+			deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.narratorId, narratorId)).run();
 
 			const sharedRows = tx
 				.select({
@@ -2800,6 +2809,8 @@ export const narratorService = {
 	getCompactSummary: narratorMessageQueries.getCompactSummary.bind(narratorMessageQueries),
 	deleteCompactMessage: narratorMessageQueries.deleteCompactMessage.bind(narratorMessageQueries),
 	deleteMessage: narratorMessageQueries.deleteMessage.bind(narratorMessageQueries),
+	deleteEmptyRetryPlaceholder:
+		narratorMessageQueries.deleteEmptyRetryPlaceholder.bind(narratorMessageQueries),
 	deleteDanglingReasoningMessage:
 		narratorMessageQueries.deleteDanglingReasoningMessage.bind(narratorMessageQueries),
 	dismissSpecCarryoverMessage:

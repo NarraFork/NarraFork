@@ -196,7 +196,8 @@ export interface TopLevelStreamingChunk {
 	_streamingOutput?: string;
 	/** Latest determinate progress measurement (drives a real progress bar). */
 	_structuredProgress?: ToolProgressPayload;
-	_sendDeliveryTargets?: Array<{ id: string; deliveryMessageId: string }>;
+	_sendDeliveryTargets?: import("@shared/communication-tool").SendDeliveryTarget[];
+	_sendDeliveryTargetCount?: number;
 	_sendDeliveryBinding?: { toolCallId: string; attempt: number };
 }
 
@@ -344,6 +345,9 @@ export function topLevelStreamingChunkToToolFields(
 ): Record<string, unknown> {
 	const receipts = {
 		...(chunk._sendDeliveryTargets ? { _sendDeliveryTargets: chunk._sendDeliveryTargets } : {}),
+		...(chunk._sendDeliveryTargetCount !== undefined
+			? { _sendDeliveryTargetCount: chunk._sendDeliveryTargetCount }
+			: {}),
 		...(chunk._sendDeliveryBinding
 			? {
 					tcId: chunk._sendDeliveryBinding.toolCallId,
@@ -546,12 +550,15 @@ export function buildTopLevelStreamingChunksMsg(
 				} as (typeof toolCalls)[number];
 			}
 		}
-		if (chunk._sendDeliveryTargets) {
+		if (chunk._sendDeliveryTargets || chunk._sendDeliveryTargetCount !== undefined) {
 			const index = toolCalls.findIndex((tc) => tc.toolUseId === chunk.toolUseId);
 			if (index >= 0)
 				toolCalls[index] = {
 					...toolCalls[index],
 					_sendDeliveryTargets: chunk._sendDeliveryTargets,
+					...(chunk._sendDeliveryTargetCount !== undefined
+						? { _sendDeliveryTargetCount: chunk._sendDeliveryTargetCount }
+						: {}),
 					...(chunk._sendDeliveryBinding
 						? {
 								tcId: chunk._sendDeliveryBinding.toolCallId,

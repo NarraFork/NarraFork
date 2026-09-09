@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { JsonRpcNotification, ProviderStreamEvent } from "@server/lib/plugins/protocol";
 import {
 	PluginProviderRpcClient,
@@ -425,6 +425,76 @@ describe("credit, cancellation, and late events", () => {
 });
 
 describe("operation limits and crash semantics", () => {
+	it("defaults to a 300000ms stream idle budget while retaining the total timeout", async () => {
+		const client = new PluginProviderRpcClient({ transport: new MockTransport() });
+		clients.push(client);
+		await client.describe();
+		const timer = spyOn(globalThis, "setTimeout");
+		try {
+			await client.chat(chatParams());
+			expect(timer.mock.calls.map((call) => call[1])).toEqual([30 * 60_000, 300_000]);
+		} finally {
+			timer.mockRestore();
+		}
+	});
+
+	it.each([
+		false,
+		true,
+	])("preserves idle timeout after cancelled done (partial output: %s)", async (partialOutput) => {
+		const streamIdleTimeoutMs = 20;
+		const { client, transport } = await setup({ limits: { streamIdleTimeoutMs } });
+		clients.push(client);
+		const operation = await client.chat(chatParams());
+		expect(operation.accepted).toBe(true);
+		const stream = operation.events();
+		let seq = 1;
+		if (partialOutput) {
+			transport.emit(
+				notification(operation.operationId, seq++, { type: "text.delta", text: "partial" }),
+			);
+			await expect(stream.next()).resolves.toMatchObject({
+				value: { type: "text.delta", text: "partial" },
+			});
+		}
+		const request = transport.request.bind(transport);
+		transport.request = <T = unknown>(
+			method: string,
+			params?: unknown,
+			options?: ProviderRpcRequestOptions,
+		) => {
+			const result = request<T>(method, params, options);
+			if (method === "provider.cancel") {
+				transport.emit(
+					notification(operation.operationId, seq++, {
+						type: "done",
+						status: "cancelled",
+						stopReason: "cancelled",
+					}),
+				);
+			}
+			return result;
+		};
+		await expect(stream.next()).resolves.toMatchObject({
+			done: false,
+			value: { type: "done", status: "cancelled" },
+		});
+		await expect(stream.next()).rejects.toMatchObject({
+			code: "STREAM_IDLE_TIMEOUT",
+			message: `Provider stream idle timeout after ${streamIdleTimeoutMs}ms`,
+			operationId: operation.operationId,
+			requestId: operation.requestId,
+		});
+		const cancellations = transport.requests.filter((item) => item.method === "provider.cancel");
+		expect(cancellations).toHaveLength(1);
+		expect(cancellations[0].params).toMatchObject({
+			operationId: operation.operationId,
+			reason: "timeout",
+		});
+		expect(transport.killed).toHaveLength(0);
+		expect(client.getDiagnostics().activeOperations).toBe(0);
+	});
+
 	it("rejects tool calls from generate as a protocol error", async () => {
 		const { client, transport } = await setup();
 		clients.push(client);

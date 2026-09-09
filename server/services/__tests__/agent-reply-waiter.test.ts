@@ -7,9 +7,12 @@ import {
 	getPendingAgentReplyCount,
 	getRunningAgentReplyWaitRunSnapshot,
 	hasPendingAgentReply,
+	isPreparedAgentReplyPending,
+	preparePendingAgentReply,
 	registerAgentReplyWait,
 	registerAgentReplyWaitFromSnapshot,
 	resolvePendingAgentReply,
+	settlePreparedAgentReply,
 	waitForAgentReplyWaitRunStability,
 } from "../agent-reply-waiter";
 
@@ -23,6 +26,49 @@ afterEach(() => {
 });
 
 describe("agent Send reply waiter", () => {
+	test("read-only prepared match cannot settle a replacement with the same request ID", async () => {
+		const first = registerAgentReplyWait({
+			requesterId: REQUESTER_ID,
+			responderId: RESPONDER_ID,
+			scope: TEAM_SCOPE,
+			requestId: "replacement-reply",
+		});
+		const prepared = preparePendingAgentReply({
+			fromNarratorId: RESPONDER_ID,
+			toNarratorId: REQUESTER_ID,
+			scope: TEAM_SCOPE,
+		});
+		expect(prepared.matched).toBe(true);
+		expect(getPendingAgentReplyCount(REQUESTER_ID, RESPONDER_ID, TEAM_SCOPE)).toBe(1);
+		if (!prepared.matched) throw new Error("expected prepared reply");
+		expect(isPreparedAgentReplyPending(prepared.prepared)).toBe(true);
+		const replacement = registerAgentReplyWait({
+			requesterId: REQUESTER_ID,
+			responderId: RESPONDER_ID,
+			scope: TEAM_SCOPE,
+			requestId: first.requestId,
+		});
+		expect(isPreparedAgentReplyPending(prepared.prepared)).toBe(false);
+		expect(settlePreparedAgentReply(prepared.prepared, "stale response")).toMatchObject({
+			matched: false,
+		});
+		expect(getPendingAgentReplyCount(REQUESTER_ID, RESPONDER_ID, TEAM_SCOPE)).toBe(1);
+		expect((await first.promise).status).toBe("cancelled");
+		const fresh = preparePendingAgentReply({
+			fromNarratorId: RESPONDER_ID,
+			toNarratorId: REQUESTER_ID,
+			scope: TEAM_SCOPE,
+			replyTo: first.requestId,
+		});
+		if (!fresh.matched) throw new Error("expected fresh reply");
+		expect(settlePreparedAgentReply(fresh.prepared, "fresh response")).toMatchObject({
+			matched: true,
+		});
+		expect(await replacement.promise).toMatchObject({
+			status: "replied",
+			message: "fresh response",
+		});
+	});
 	test("matches an explicit request id and consumes only that waiter", async () => {
 		const first = registerAgentReplyWait({
 			requesterId: REQUESTER_ID,

@@ -28,7 +28,14 @@ type AnthropicProviderLike = {
 		model: string,
 		systemInstruction?: string,
 		options?: { onTextDelta?: (delta: string) => void | Promise<void> },
-	): Promise<{ text: string; usage?: unknown }>;
+	): Promise<{ text: string; usage?: unknown; outputTruncated?: boolean }>;
+	generateWithHistoryWithMeta(
+		systemInstruction: string,
+		content: string,
+		model: string,
+		locale?: string,
+		options?: { onTextDelta?: (delta: string) => void | Promise<void> },
+	): Promise<{ text: string; usage?: unknown; outputTruncated?: boolean }>;
 };
 
 let AnthropicProvider: new (config: Record<string, unknown>) => AnthropicProviderLike;
@@ -243,6 +250,132 @@ describe("Anthropic lightweight generation invalidState handling", () => {
 			globalThis.fetch = originalFetch;
 		}
 	});
+});
+
+describe("Anthropic lightweight partial output regression", () => {
+	const usage = {
+		input_tokens: 11,
+		output_tokens: 7,
+		cache_read_input_tokens: 3,
+		cache_creation_input_tokens: 5,
+		cache_creation: { ephemeral_5m_input_tokens: 2, ephemeral_1h_input_tokens: 3 },
+	};
+	const partialText = "  partial\ntext\t";
+
+	for (const method of ["generateWithMeta", "generateWithHistoryWithMeta"] as const) {
+		for (const transport of ["SSE", "JSON"] as const) {
+			async function run(withText: boolean, withError = false) {
+				const provider = new AnthropicProvider({
+					id: "test-anthropic",
+					name: "Test Anthropic",
+					prefix: "anthropic",
+					apiKey: "test-key",
+					baseUrl: "https://example.com/v1",
+					defaultModel: "claude-test",
+				});
+				const error = { type: "overloaded_error", message: "upstream unavailable max_tokens" };
+				const frames: Record<string, unknown>[] = [
+					{
+						type: "message_start",
+						message: { id: "msg_1", usage: { ...usage, output_tokens: 0 } },
+					},
+					...(withText
+						? [
+								{
+									type: "content_block_delta",
+									index: 0,
+									delta: { type: "text_delta", text: partialText },
+								},
+							]
+						: []),
+					{
+						type: "message_delta",
+						delta: { stop_reason: "max_tokens" },
+						usage: { output_tokens: 1 },
+					},
+					// Final accounting may arrive after the completion-limit event.
+					{ type: "message_delta", delta: {}, usage },
+					...(withError ? [{ type: "error", error }] : [{ type: "message_stop" }]),
+				];
+				const body =
+					transport === "SSE"
+						? frames
+								.map((frame) => `event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`)
+								.join("")
+						: JSON.stringify({
+								content: withText ? [{ type: "text", text: partialText }] : [],
+								stop_reason: "max_tokens",
+								usage,
+								...(withError && { error }),
+							});
+				const originalFetch = globalThis.fetch;
+				globalThis.fetch = (async () =>
+					new Response(body, {
+						headers: {
+							"content-type": transport === "SSE" ? "text/event-stream" : "application/json",
+						},
+					})) as unknown as typeof fetch;
+				const deltas: string[] = [];
+				const options = {
+					onTextDelta: async (delta: string) => {
+						deltas.push(delta);
+					},
+				};
+				try {
+					const result =
+						method === "generateWithMeta"
+							? await provider.generateWithMeta(
+									"prompt",
+									"anthropic:claude-test",
+									"system",
+									options,
+								)
+							: await provider.generateWithHistoryWithMeta(
+									"system",
+									"prompt",
+									"anthropic:claude-test",
+									"en",
+									options,
+								);
+					return { result, deltas };
+				} finally {
+					globalThis.fetch = originalFetch;
+				}
+			}
+
+			test(`${method} ${transport} retains partial text and full trailing usage`, async () => {
+				const { result, deltas } = await run(true);
+				expect(result).toMatchObject({
+					text: partialText,
+					outputTruncated: true,
+					usage: {
+						inputTokens: 11,
+						outputTokens: 7,
+						cachedInputTokens: 3,
+						cacheCreationInputTokens: 5,
+						cacheCreation5mInputTokens: 2,
+						cacheCreation1hInputTokens: 3,
+					},
+				});
+				expect(deltas).toEqual([partialText]);
+			});
+
+			test(`${method} ${transport} still rejects a completion limit without text`, async () => {
+				await expect(run(false)).rejects.toMatchObject({
+					reason: "max_tokens",
+					classification: "completion_limit",
+					retryable: false,
+				});
+			});
+
+			test(`${method} ${transport} does not swallow a real error after partial output`, async () => {
+				await expect(run(true, true)).rejects.toMatchObject({
+					reason: "overloaded_error",
+					message: expect.stringContaining("upstream unavailable max_tokens"),
+				});
+			});
+		}
+	}
 });
 
 describe("parseAnthropicSSEStream end-to-end error surfacing", () => {

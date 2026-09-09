@@ -1,16 +1,20 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import {
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { cleanDb, getTestDb } from "../../../tests/setup";
+import { narrators } from "../../db/schema";
+import type { ActiveNarrator } from "../narrator-session-state";
+
+const { db, sqlite } = getTestDb();
+const realDb = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+const {
 	clearBufferedMessageSoftStopIfIdle,
 	evaluateSoftStopRequest,
 	rearmCutInSoftStopBeforeContinuing,
 	requestBufferedMessageSoftStop,
-} from "../narrator-session";
-import {
-	type ActiveNarrator,
-	activeNarrators,
-	type BufferedMessage,
-	bufferedMessages,
-} from "../narrator-session-state";
+} = await import("../narrator-session");
+const { activeNarrators } = await import("../narrator-session-state");
+const { clearBufferedMessages, getBufferedMessages, pushBufferedMessage, removeBufferedMessage } =
+	await import("../narrator-buffer");
 
 const NARRATOR_ID = "soft-stop-test-narrator";
 
@@ -28,9 +32,9 @@ function registerActiveNarrator(): ActiveNarrator {
  * cut-in message through: the stop was granted (so `_bufferSoftStop` is spent) and
  * recorded as taken, while the message itself is still queued.
  */
-function grantedCutInStop(): ActiveNarrator {
+async function grantedCutInStop(): Promise<ActiveNarrator> {
 	const active = registerActiveNarrator();
-	queueMessage();
+	await queueMessage();
 	requestBufferedMessageSoftStop(NARRATOR_ID);
 	const decision = evaluateSoftStopRequest({
 		bufferSoftStop: active._bufferSoftStop,
@@ -41,15 +45,31 @@ function grantedCutInStop(): ActiveNarrator {
 	return active;
 }
 
-function queueMessage(id = "queued-1"): void {
-	const entry = { id, text: "cut in", bufferedAt: new Date().toISOString() } as BufferedMessage;
-	bufferedMessages.set(NARRATOR_ID, [entry]);
+async function queueMessage(text = "cut in"): Promise<string> {
+	const entry = await pushBufferedMessage(NARRATOR_ID, text);
+	expect(entry.ok).toBe(true);
+	expect(getBufferedMessages(NARRATOR_ID).some((message) => message.id === entry.id)).toBe(true);
+	return entry.id;
 }
 
-afterEach(() => {
-	activeNarrators.delete(NARRATOR_ID);
-	bufferedMessages.delete(NARRATOR_ID);
+beforeEach(() => {
+	cleanDb(sqlite);
+	const now = new Date().toISOString();
+	db.insert(narrators)
+		.values({
+			id: NARRATOR_ID,
+			type: "primary",
+			variant: "primary",
+			createdAt: now,
+			updatedAt: now,
+		})
+		.run();
 });
+afterEach(() => {
+	clearBufferedMessages(NARRATOR_ID);
+	activeNarrators.delete(NARRATOR_ID);
+});
+afterAll(() => mock.module("../../db", () => realDb));
 
 describe("evaluateSoftStopRequest", () => {
 	test("permission feedback always stops and consumes its flag", () => {
@@ -127,14 +147,14 @@ describe("evaluateSoftStopRequest", () => {
 });
 
 describe("rearmCutInSoftStopBeforeContinuing", () => {
-	test("a producer that starts a new pass gives the still-queued cut-in its boundary back", () => {
+	test("a producer that starts a new pass gives the still-queued cut-in its boundary back", async () => {
 		// Regression: the injection drain / chained permission feedback / review
 		// git-state guard each `continue` into a FRESH pass before the buffer consumer
 		// is reached. `evaluateSoftStopRequest` had already spent `_bufferSoftStop` to
 		// grant this stop, so without re-arming the new pass runs with shouldStop()
 		// permanently false and the queued message is stranded until the whole loop
 		// ends — reported as "it says it cut in but nothing happened for ages".
-		const active = grantedCutInStop();
+		const active = await grantedCutInStop();
 		expect(active._bufferSoftStop).toBe(false);
 		expect(active._bufferSoftStopTaken).toBe(true);
 
@@ -146,8 +166,8 @@ describe("rearmCutInSoftStopBeforeContinuing", () => {
 		expect(active._bufferSoftStopTaken).toBe(false);
 	});
 
-	test("the re-armed request stops the very next tool boundary", () => {
-		const active = grantedCutInStop();
+	test("the re-armed request stops the very next tool boundary", async () => {
+		const active = await grantedCutInStop();
 		rearmCutInSoftStopBeforeContinuing(active);
 
 		expect(
@@ -158,11 +178,11 @@ describe("rearmCutInSoftStopBeforeContinuing", () => {
 		).toBe(true);
 	});
 
-	test("a cancelled cut-in is not re-armed", () => {
+	test("a cancelled cut-in is not re-armed", async () => {
 		// Re-arming a stop with nothing left to deliver would end the next pass at its
 		// first tool call for no reason.
-		const active = grantedCutInStop();
-		bufferedMessages.delete(NARRATOR_ID);
+		const active = await grantedCutInStop();
+		clearBufferedMessages(NARRATOR_ID);
 
 		rearmCutInSoftStopBeforeContinuing(active);
 
@@ -170,9 +190,9 @@ describe("rearmCutInSoftStopBeforeContinuing", () => {
 		expect(active._bufferSoftStopTaken).toBe(true);
 	});
 
-	test("does nothing when no cut-in stop was taken", () => {
+	test("does nothing when no cut-in stop was taken", async () => {
 		const active = registerActiveNarrator();
-		queueMessage();
+		await queueMessage();
 
 		rearmCutInSoftStopBeforeContinuing(active);
 
@@ -181,25 +201,27 @@ describe("rearmCutInSoftStopBeforeContinuing", () => {
 });
 
 describe("clearBufferedMessageSoftStopIfIdle", () => {
-	test("clears the pending soft stop once the queue is empty", () => {
+	test("clears the pending soft stop once the queue is empty", async () => {
 		const active = registerActiveNarrator();
-		queueMessage();
+		await queueMessage();
 		expect(requestBufferedMessageSoftStop(NARRATOR_ID)).toBe(true);
 		expect(active._bufferSoftStop).toBe(true);
 
-		bufferedMessages.delete(NARRATOR_ID);
+		clearBufferedMessages(NARRATOR_ID);
 		clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
 
 		expect(active._bufferSoftStop).toBe(false);
 	});
 
-	test("keeps the soft stop while other queued messages remain", () => {
+	test("keeps the soft stop while other queued messages remain", async () => {
 		const active = registerActiveNarrator();
-		queueMessage("queued-a");
+		const first = await queueMessage("queued-a");
 		requestBufferedMessageSoftStop(NARRATOR_ID);
 
 		// One of several queued messages was cancelled; the rest still need the boundary.
-		queueMessage("queued-b");
+		await queueMessage("queued-b");
+		expect(removeBufferedMessage(NARRATOR_ID, first)).toBe(true);
+		expect(getBufferedMessages(NARRATOR_ID).map((message) => message.text)).toEqual(["queued-b"]);
 		clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
 
 		expect(active._bufferSoftStop).toBe(true);

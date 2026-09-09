@@ -1,5 +1,11 @@
 {
 	"you": "You",
+	"queuedFailed": "Message failed",
+	"queuedFailureUnknown": "No failure reason was provided.",
+	"queuedRetry": "Retry",
+	"queuedRetrySuccess": "Message requeued.",
+	"queuedRetryFailed": "Retry request failed: {{error}}",
+	"queuedFailedCount": "{{count}} failed",
 	"publicShares": {
 		"title": "Public share links",
 		"distinction": "These links allow viewing without signing in. This is separate from visibility for all signed-in users above. Only the owner or an administrator can manage links.",
@@ -33,7 +39,11 @@
 	"communicationBroadcast": "All members",
 	"communicationRecipientUnknown": "Narrator",
 	"communicationRunning": "Sending",
+	"communicationNoRecipients": "No recipients",
 	"communicationSuccess": "Sent",
+	"communicationReceived": "Received",
+	"communicationReplyReceived": "Reply received",
+	"communicationTimeout": "Timed out",
 	"communicationError": "Delivery failed",
 	"communicationCancelled": "Cancelled",
 	"communicationViewFull": "View full message",

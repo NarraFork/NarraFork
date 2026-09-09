@@ -254,10 +254,12 @@ export function extractDataRevision(data: unknown): string | undefined {
 			rev += `|cr:${JSON.stringify(
 				d.recipients.map((recipient) => {
 					const r = recipient as Record<string, unknown>;
-					return [r.id, r.label, r.deliveryMessageId];
+					return [r.id, r.title, r.label, r.deliveryMessageId, r.injectionConsumedAt];
 				}),
 			)}|ca:${d.awaitReply === true}|cb:${d.broadcast === true}`;
 		}
+		// Receipt/reply state is height-neutral but ExactRow also keys paint by this object.
+		if (d.deliveryState) rev += `|cs:${JSON.stringify(d.deliveryState)}`;
 	}
 	if (Array.isArray(d.attachments)) {
 		// Locator data is painted/clicked from cached blocks, including equal labels

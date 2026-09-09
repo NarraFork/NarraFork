@@ -75,7 +75,8 @@ export interface ToolCallData {
 	 */
 	_awaitAgentNarratorId?: string;
 	/** Accepted/queued delivery receipts, independent of the eventual tool result. */
-	_sendDeliveryTargets?: Array<{ id: string; deliveryMessageId: string }>;
+	_sendDeliveryTargets?: import("@shared/communication-tool").SendDeliveryTarget[];
+	_sendDeliveryTargetCount?: number;
 	/**
 	 * The subagent this call waits on is TAKEN OVER by the user, so the call is
 	 * blocked until the takeover stops.

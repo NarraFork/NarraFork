@@ -130,6 +130,7 @@ const selectionChange = mock((_selection: unknown, _explicit: boolean) => {});
 let api: loader.MonacoAPI;
 let frames = new Map<number, FrameRequestCallback>();
 let frameSequence = 0;
+let themeColors: Record<string, string> | null = null;
 function flushFrames(): void {
 	for (let cycles = 0; frames.size; cycles++) {
 		if (cycles > 4) throw new Error("Unbounded Monaco layout retry");
@@ -142,10 +143,14 @@ function flushFrames(): void {
 beforeEach(() => {
 	frames = new Map();
 	frameSequence = 0;
+	themeColors = null;
 	const { window } = parseHTML("<html><body></body></html>");
 	Object.defineProperty(window, "getComputedStyle", {
 		configurable: true,
-		value: () => ({ getPropertyValue: () => "#242424", visibility: "visible" }),
+		value: () => ({
+			getPropertyValue: (name: string) => (themeColors ? (themeColors[name] ?? "") : "#242424"),
+			visibility: "visible",
+		}),
 	});
 	Object.defineProperty(window, "matchMedia", {
 		configurable: true,
@@ -190,7 +195,12 @@ beforeEach(() => {
 		KeyMod: { CtrlCmd: 2048 },
 		KeyCode: { KeyF: 36, KeyS: 49 },
 		editor: {
-			defineTheme() {},
+			defineTheme(_name: string, theme: editor.IStandaloneThemeData) {
+				for (const color of Object.values(theme.colors)) {
+					if (!/^#[\da-f]{6}(?:[\da-f]{2})?$/i.test(color))
+						throw new Error(`Illegal value for token color: ${color}`);
+				}
+			},
 			setTheme() {},
 			setModelLanguage() {},
 			CursorChangeReason: { ContentFlush: 1, RecoverFromMarkers: 2 },
@@ -246,6 +256,60 @@ async function render(
 		);
 	});
 }
+
+test.each([
+	{
+		name: "light shorthand",
+		scheme: "light" as const,
+		values: ["#fff", " #000 ", "#abc"],
+		expected: ["#ffffff", "#000000", "#aabbcc"],
+	},
+	{
+		name: "OLED shorthand with alpha",
+		scheme: "dark" as const,
+		values: ["#000", "#fff", "#789a"],
+		expected: ["#000000", "#ffffff", "#778899aa"],
+	},
+	{
+		name: "full hex",
+		scheme: "dark" as const,
+		values: ["#123456", "#abcdef", "#12345678"],
+		expected: ["#123456", "#abcdef", "#12345678"],
+	},
+	{
+		name: "invalid CSS fallback",
+		scheme: "dark" as const,
+		values: ["invalid", "var(--missing)", ""],
+		expected: ["#242424", "#c9c9c9", "#828282"],
+	},
+])("normalizes $name theme colours before creating the editor", async ({
+	scheme,
+	values,
+	expected,
+}) => {
+	const names = ["--mantine-color-body", "--mantine-color-text", "--mantine-color-dimmed"];
+	themeColors = Object.fromEntries(names.map((name, index) => [name, values[index]]));
+	const theme = spyOn(api.editor, "defineTheme");
+	const onError = mock((_error: Error) => {});
+	try {
+		await render({ onError }, scheme);
+		expect(handle?.getModel()).toBeTruthy();
+		expect(onError).not.toHaveBeenCalled();
+		expect(theme.mock.calls.at(-1)?.[1].colors).toMatchObject({
+			"editor.background": expected[0],
+			"editor.foreground": expected[1],
+			"editorLineNumber.foreground": expected[2],
+			"editorGutter.background": expected[0],
+			"editorCursor.foreground": expected[1],
+		});
+		const model = handle?.getModel();
+		await render({ onError }, scheme === "light" ? "dark" : "light");
+		expect(handle?.getModel()).toBe(model);
+		expect(onError).not.toHaveBeenCalled();
+	} finally {
+		theme.mockRestore();
+	}
+});
 
 test("long-line display protection toggles without replacing text, cursor or history", async () => {
 	const text = `${"x".repeat(20_000)}😀END`;

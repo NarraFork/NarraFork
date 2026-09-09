@@ -186,14 +186,26 @@ function registerPendingSubagentPermission(options?: {
 	});
 }
 
+function clearPersistedFeedbackFixture(): void {
+	// Public cancellation intentionally retains delivery tombstones. Test teardown
+	// must remove the durable mailbox before refs/messages and their actor FKs,
+	// otherwise reusing the same narrator ID replays a previous test's feedback.
+	sqlite.transaction(() => {
+		for (const table of [
+			"narrator_buffered_messages",
+			"narrator_message_refs",
+			"narrator_tool_calls",
+			"narrator_messages",
+		])
+			sqlite.run(`DELETE FROM "${table}"`);
+		sqlite.run('DELETE FROM "narrators" WHERE id = ?', [SUBAGENT_ID]);
+		sqlite.run('DELETE FROM "narrators" WHERE id = ?', [PARENT_ID]);
+		sqlite.run('DELETE FROM "users" WHERE id = ?', [APPROVER_ID]);
+	})();
+}
+
 beforeEach(async () => {
-	sqlite.run("PRAGMA foreign_keys = OFF");
-	for (const table of ["narrator_tool_calls", "narrator_messages", "narrator_message_refs"]) {
-		sqlite.run(`DELETE FROM "${table}"`);
-	}
-	sqlite.run(`DELETE FROM "narrators"`);
-	sqlite.run(`DELETE FROM "users"`);
-	sqlite.run("PRAGMA foreign_keys = ON");
+	clearPersistedFeedbackFixture();
 	pendingPermissions.clear();
 	pendingFeedback.clear();
 	activeNarrators.delete(SUBAGENT_ID);
@@ -208,6 +220,7 @@ afterEach(() => {
 	clearSubagentBufferedMessages(SUBAGENT_ID);
 	unregisterActiveSubagent(SUBAGENT_ID);
 	activeNarrators.delete(SUBAGENT_ID);
+	clearPersistedFeedbackFixture();
 });
 
 describe("approval feedback for a subagent permission request", () => {

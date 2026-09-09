@@ -178,6 +178,48 @@ afterAll(() => {
 	cleanDb(sqlite);
 });
 
+describe("own question wait capability", () => {
+	test("Await(question) still reads an existing own answer but rejects another session's question", async () => {
+		const { awaitTool } = await import("../../lib/agent/tools/await");
+		const { resolveToolFilter } = await import("../subagent-tools");
+		const { toolCallId, toolUseId } = await seedToolCall();
+		const { record } = await createAsyncQuestion({
+			narratorId: NARRATOR_ID,
+			toolCallId,
+			toolUseId,
+			questions: QUESTIONS,
+		});
+		const answer = await answerAsyncQuestion(record.id, {
+			answers: { "cache-layer": "Redis" },
+			userId: "user-1",
+			locale: "en",
+		});
+		expect(answer.ok).toBe(true);
+		const filter = resolveToolFilter("general");
+		expect(filter?.({ ...awaitTool, name: "AskUserQuestion" })).toBe(true);
+		expect(filter?.(awaitTool)).toBe(true);
+		const context = {
+			narratorId: NARRATOR_ID,
+			parentNarratorId: "legacy-parent",
+			currentToolUseId: "legacy-question-wait",
+			signal: new AbortController().signal,
+		} as import("../../lib/agent/types").ToolContext;
+		const own = await awaitTool.execute({ type: "question", id: record.id }, context);
+		expect(own.isError).not.toBe(true);
+		expect(own.output).toContain("Redis");
+		expect(own.metadata?.status).toBe("answered");
+		const foreign = await awaitTool.execute(
+			{ type: "question", id: record.id },
+			{
+				...context,
+				narratorId: OTHER_NARRATOR_ID,
+			},
+		);
+		expect(foreign.isError).toBe(true);
+		expect(foreign.output).toContain("not an async question belonging to this session");
+	});
+});
+
 describe("createAsyncQuestion", () => {
 	test("records one open question and announces it", async () => {
 		const { toolCallId, toolUseId } = await seedToolCall();

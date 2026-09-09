@@ -99,23 +99,36 @@ test("navigation recenters only Monaco scroll offsets within visible ancestor bo
 	expect(reveals).toBe(1);
 });
 
-test("wheel and touch stay inside editor, their default handling remains enabled", () => {
+test("wheel stays inside editor without disabling its default handling", () => {
 	let outerEvents = 0;
 	dock.addEventListener("wheel", () => outerEvents++);
-	dock.addEventListener("touchmove", () => outerEvents++);
 	const remove = installMonacoScrollBoundary(host);
 	const win = host.ownerDocument.defaultView;
 	if (!win) throw new Error("Test window unavailable");
-	for (const type of ["wheel", "touchmove"]) {
-		const event = new win.Event(type, {
-			bubbles: true,
-			cancelable: true,
-		});
-		host.dispatchEvent(event);
-		expect(event.defaultPrevented).toBe(false);
-	}
+	const event = new win.Event("wheel", { bubbles: true, cancelable: true });
+	host.dispatchEvent(event);
+	expect(event.defaultPrevented).toBe(false);
 	expect(outerEvents).toBe(0);
 	remove();
 	host.dispatchEvent(new win.Event("wheel", { bubbles: true }));
 	expect(outerEvents).toBe(1);
+});
+
+test("touch lifecycle reaches Monaco's document listener, which owns scroll prevention", () => {
+	const win = host.ownerDocument.defaultView;
+	if (!win) throw new Error("Test window unavailable");
+	const seen: string[] = [];
+	const remove = installMonacoScrollBoundary(host);
+	for (const type of ["touchstart", "touchmove", "touchend"]) {
+		host.ownerDocument.addEventListener(type, (event) => {
+			seen.push(event.type);
+			// Monaco's Gesture decides whether a target consumed this touch.
+			event.preventDefault();
+		});
+		const event = new win.Event(type, { bubbles: true, cancelable: true });
+		host.dispatchEvent(event);
+		expect(event.defaultPrevented).toBe(true);
+	}
+	expect(seen).toEqual(["touchstart", "touchmove", "touchend"]);
+	remove();
 });

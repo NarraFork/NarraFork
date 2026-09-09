@@ -1,4 +1,10 @@
 {
+	"dockTabs": {
+		"all": "Close all (keep main narrators)",
+		"left": "Close tabs to the left",
+		"right": "Close tabs to the right",
+		"auxiliary": "Close auxiliary tabs (keep all narrators)"
+	},
 	"scrollbar": {
 		"vertical": "Vertical scrollbar",
 		"horizontal": "Horizontal scrollbar"

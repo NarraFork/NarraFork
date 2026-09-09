@@ -32,7 +32,11 @@ import {
 } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { parseErrorDiagnostics } from "./error-diagnostics";
-import { isConnectionClosedError, ProviderInvalidStateError } from "./error-handling";
+import {
+	isCompletionLimitReason,
+	isConnectionClosedError,
+	ProviderInvalidStateError,
+} from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
@@ -956,15 +960,10 @@ async function parseAnthropicGenerateResponse(
 		let text = "";
 		let usage: GenerateMetaResult["usage"] = null;
 		let contextPercent: number | undefined;
+		let reportedContextPercent: number | undefined;
+		let outputTruncated = false;
 		const contextWindow = getAnthropicEffectiveContextWindow(model, config);
 		for await (const event of parseAnthropicSSEStream(response.body, contextWindow)) {
-			if (event.invalidState) {
-				throw new ProviderInvalidStateError(
-					event.invalidState.reason,
-					`Anthropic API error: ${event.invalidState.message}`,
-					{ diagnostics: event.invalidState.diagnostics },
-				);
-			}
 			if (event.text != null) {
 				text += event.text;
 				await options?.onTextDelta?.(event.text);
@@ -974,12 +973,30 @@ async function parseAnthropicGenerateResponse(
 				usage = parsedAnthropicUsageToUsageData(event.usage);
 				const promptTokens = event.usage.promptTokens;
 				const effectiveWindow = event.usage.contextWindow ?? contextWindow;
-				if (promptTokens != null && effectiveWindow) {
+				if (reportedContextPercent == null && promptTokens != null && effectiveWindow) {
 					contextPercent = Math.min((promptTokens / effectiveWindow) * 100, 100);
 				}
 			}
+			// Window occupancy is independent of token accounting. In particular,
+			// trailing placeholder usage must not replace a gateway measurement.
+			if (event.contextUsagePercentage != null && Number.isFinite(event.contextUsagePercentage)) {
+				reportedContextPercent = Math.min(Math.max(event.contextUsagePercentage, 0), 100);
+				contextPercent = reportedContextPercent;
+			}
+			if (event.invalidState) {
+				if (text && isCompletionLimitReason(event.invalidState.reason)) {
+					// Keep paid-for output and drain trailing usage instead of failing the helper.
+					outputTruncated = true;
+					continue;
+				}
+				throw new ProviderInvalidStateError(
+					event.invalidState.reason,
+					`Anthropic API error: ${event.invalidState.message}`,
+					{ diagnostics: event.invalidState.diagnostics },
+				);
+			}
 		}
-		return { text, contextPercent, usage };
+		return { text, contextPercent, usage, ...(outputTruncated && { outputTruncated }) };
 	}
 
 	// Compatibility fallback for relays that ignore stream=true and still return JSON.
@@ -999,7 +1016,13 @@ async function parseAnthropicGenerateResponse(
 		? String(json.error.code ?? json.error.type ?? "api_error")
 		: undefined;
 	const invalidReason = jsonErrorReason ?? specialStopReason;
-	if (invalidReason) {
+	const text =
+		json.content
+			?.filter((content) => content.type === "text")
+			.map((content) => content.text ?? "")
+			.join("") ?? "";
+	const outputTruncated = !json.error && stopReason === "max_tokens" && text.length > 0;
+	if (invalidReason && !outputTruncated) {
 		const message =
 			json.error?.message ??
 			(invalidReason === "max_tokens"
@@ -1019,14 +1042,10 @@ async function parseAnthropicGenerateResponse(
 			diagnostics,
 		});
 	}
-	const text =
-		json.content
-			?.filter((content) => content.type === "text")
-			.map((content) => content.text ?? "")
-			.join("") ?? "";
 	if (text) await options?.onTextDelta?.(text);
 	return {
 		text,
+		...(outputTruncated && { outputTruncated }),
 		contextPercent: calculateAnthropicContextPercent(json.usage, model, config),
 		usage: json.usage ? extractAnthropicUsage(json.usage) : null,
 	};

@@ -1,3 +1,4 @@
+import type { RuntimePolicy } from "@server/services/agent-runtime/policy";
 import type {
 	AgentToolUse,
 	ApiRequestDiagnosticSource,
@@ -104,6 +105,8 @@ export interface ToolContext {
 	skillScopeKey?: string;
 	/** Skills blocked by narrator custom traits. `all` blocks every skill. */
 	blockedSkills?: { all: boolean; names: string[] } | null;
+	/** Server-resolved capability ceiling, copied from AgentConfig, never tool input. */
+	runtimePolicy?: RuntimePolicy;
 	/** Parent narrator ID — set for subagents, used for Team file-change tracking */
 	parentNarratorId?: string;
 	/**
@@ -819,6 +822,8 @@ export interface AgentConfig {
 	signal: AbortSignal;
 	/** Chapter ID the narrator belongs to (passed through to ToolContext) */
 	chapterId?: string;
+	/** Resolved by server runtime assembly; DB authorization remains the final authority. */
+	runtimePolicy?: RuntimePolicy;
 	/** Parent narrator ID — set for subagents, passed through to ToolContext for Team tracking */
 	parentNarratorId?: string;
 	/** Parent Agent/Task/Send tool_use that spawned this subagent. */
@@ -987,7 +992,12 @@ export interface AgentConfig {
 	 *
 	 * Called once per turn, after tool results are settled.
 	 */
-	getAfterToolsInjections?: () => Promise<string> | string;
+	getAfterToolsInjections?: () =>
+		| Promise<string | { text: string; onConsumed?: () => void }>
+		| string
+		| { text: string; onConsumed?: () => void };
+	/** Exact source history adopted at the provider-input boundary, never during preparation. */
+	onModelInputConsumed?: (sourceHistory: unknown[], content: string) => void;
 	/**
 	 * Persist a reminder the LOOP itself produced as its own message row.
 	 *

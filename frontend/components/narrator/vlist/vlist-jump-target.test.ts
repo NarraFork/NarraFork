@@ -13,6 +13,7 @@ import { buildPretextLayoutIndex } from "@shared/pretext-layout/index";
 import {
 	jumpTargetItemIndex,
 	jumpTargetMessageId,
+	jumpTargetScrollTop,
 	mountedJumpTarget,
 	resolveJumpTargetSeq,
 } from "./vlist-jump-target";
@@ -79,6 +80,94 @@ describe("exact Send row navigation", () => {
 		const row = {} as HTMLElement;
 		const root = fakeRoot({ '[id="msg-owner"]': { closest: () => row } });
 		expect(mountedJumpTarget(root, [], ["owner"])).toBe(row);
+	});
+});
+
+describe("dock message jump wiring", () => {
+	it("keeps the session identity stable and passes repeat requests into the existing list", async () => {
+		const dock = await Bun.file(new URL("../dock/panels.tsx", import.meta.url)).text();
+		const child = dock.slice(
+			dock.indexOf("export function SubagentSessionPanelContent"),
+			dock.indexOf("export function SubagentDockPanel"),
+		);
+		expect(child).toContain("key={subagentNarratorId}");
+		expect(child).toContain("highlightRequestId={highlightRequestId}");
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: assert source text, not interpolation
+		expect(child).not.toContain("`${subagentNarratorId}:${highlightRequestId}`");
+		const panel = await Bun.file(new URL("../NarratorPanel.tsx", import.meta.url)).text();
+		expect(panel).toContain("highlightRequestId={highlightRequestId}");
+		const list = await Bun.file(new URL("./PretextExactMessageList.tsx", import.meta.url)).text();
+		expect(list).toContain("JSON.stringify([narratorId, highlightMessageId, highlightRequestId])");
+		expect(list).toContain(
+			"[documentReady, highlightMessageId, highlightRequestId, narratorId, scrollToMessageTarget]",
+		);
+	});
+});
+
+describe("jumpTargetScrollTop", () => {
+	function fixture(contentTop: number, height = 100, scale = 1) {
+		const viewport = {
+			scrollTop: 300,
+			scrollHeight: 2000,
+			clientHeight: 400,
+			clientTop: 2,
+			// Asymmetric borders plus a horizontal scrollbar are outside clientHeight.
+			offsetHeight: 420,
+			getBoundingClientRect: () => ({ top: 120, height: 420 * scale }),
+		} as HTMLElement;
+		const target = {
+			getBoundingClientRect: () => ({
+				top: 120 + (2 + contentTop - viewport.scrollTop) * scale,
+				height: height * scale,
+			}),
+			scrollIntoView: () => {
+				throw new Error("must not scroll ancestors");
+			},
+		} as unknown as HTMLElement;
+		return { viewport, target };
+	}
+
+	it("centers using viewport-local coordinates, accounting for its border", () => {
+		const { viewport, target } = fixture(800);
+		expect(jumpTargetScrollTop(viewport, target)).toBe(650);
+		expect(viewport.scrollTop).toBe(300);
+	});
+
+	it("repeated positioning stays at the same offset without a native reveal", () => {
+		const { viewport, target } = fixture(800);
+		viewport.scrollTop = jumpTargetScrollTop(viewport, target);
+		for (let i = 0; i < 5; i++) {
+			expect(jumpTargetScrollTop(viewport, target)).toBe(650);
+		}
+	});
+
+	for (const scale of [0.5, 2]) {
+		it(`centers and repeatedly locates in layout units at scale ${scale}`, () => {
+			const { viewport, target } = fixture(800, 100, scale);
+			for (let i = 0; i < 5; i++) {
+				expect(jumpTargetScrollTop(viewport, target)).toBe(650);
+				viewport.scrollTop = jumpTargetScrollTop(viewport, target);
+			}
+			for (const [top, height, expected] of [
+				[0, 100, 0],
+				[1950, 50, 1600],
+				[800, 600, 900],
+			]) {
+				const scaled = fixture(top, height, scale);
+				expect(jumpTargetScrollTop(scaled.viewport, scaled.target)).toBe(expected);
+			}
+		});
+	}
+
+	it("clamps targets at both ends and supports rows taller than the viewport", () => {
+		for (const [top, height, expected] of [
+			[0, 100, 0],
+			[1950, 50, 1600],
+			[800, 600, 900],
+		]) {
+			const { viewport, target } = fixture(top, height);
+			expect(jumpTargetScrollTop(viewport, target)).toBe(expected);
+		}
 	});
 });
 

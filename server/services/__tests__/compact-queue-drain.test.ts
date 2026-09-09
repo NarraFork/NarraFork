@@ -46,10 +46,18 @@ mock.module("../narrator-session", () => ({
 }));
 
 const { getBufferedMessages, pushBufferedMessage } = await import("../narrator-buffer");
-const { bufferedMessages, compactLocks } = await import("../narrator-session-state");
+const { compactLocks } = await import("../narrator-session-state");
 const { drainQueuedMessagesAfterCompact } = await import("../compact-queue-drain");
 
 const NARRATOR_ID = "compact-queue-narrator";
+const { narrators } = await import("../../db/schema");
+db.insert(narrators)
+	.values({
+		id: NARRATOR_ID,
+		createdAt: new Date().toISOString(),
+		updatedAt: new Date().toISOString(),
+	})
+	.run();
 
 /**
  * Install a compact lock the way `runCustomCompact` does, and hand back its settle
@@ -84,13 +92,11 @@ function installCompactLock(narratorId: string): {
 beforeEach(() => {
 	resumeCalls = [];
 	compactLocks.clear();
-	bufferedMessages.clear();
 	sqlite.run("DELETE FROM narrator_buffered_messages");
 });
 
 afterEach(() => {
 	compactLocks.clear();
-	bufferedMessages.clear();
 	sqlite.run("DELETE FROM narrator_buffered_messages");
 });
 

@@ -181,8 +181,10 @@ export function resolveInjectionUserId(
 	turnUserId: string | null | undefined,
 	parentNarratorId: string,
 ): string | null {
+	// null is a frozen anonymous execution, not permission to impersonate a later parent.
+	if (turnUserId !== undefined) return turnUserId;
 	const parentUserId = activeNarrators.get(parentNarratorId)?._currentUserId;
-	return resolveSubagentActingUserId(turnUserId, parentUserId);
+	return resolveSubagentActingUserId(undefined, parentUserId);
 }
 
 /** The heading each source contributes to the injected hint. */

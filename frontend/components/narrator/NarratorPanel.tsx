@@ -1716,6 +1716,7 @@ export function NarratorPanel({
 	narrator: narratorProp,
 	onForkFromMessage,
 	highlightMessageId,
+	highlightRequestId,
 	onSendToTerminal,
 	appendInputRef,
 	terminalOpen,
@@ -5864,6 +5865,16 @@ export function NarratorPanel({
 		});
 	};
 
+	const handleRetryQueued = useCallback(
+		async (messageId: string) => {
+			const result = await api.retryBufferedMessage(narratorId, messageId);
+			// Refresh authoritative state; do not resurrect a row already consumed over WS.
+			reconcileBufferedMessages();
+			return result;
+		},
+		[narratorId, reconcileBufferedMessages],
+	);
+
 	const sensors = useSensors(
 		useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
 		useSensor(TouchSensor, { activationConstraint: { delay: 200, tolerance: 5 } }),
@@ -7595,6 +7606,7 @@ export function NarratorPanel({
 																pruneDividerLabel={pruneDividerLabel}
 																hasChapter={hasChapter}
 																highlightMessageId={highlightMessageId}
+																highlightRequestId={highlightRequestId}
 																tailFooter={
 																	isSubagent &&
 																	narrator &&
@@ -7931,6 +7943,13 @@ export function NarratorPanel({
 									<Text size="xs" c="blue" fw={500} style={{ flexShrink: 0 }}>
 										{t("queuedCount", { count: queuedMessages.length })}
 									</Text>
+									{queuedMessages.some((msg) => msg.state === "failed") && (
+										<Badge color="red" size="xs" style={{ flexShrink: 0 }}>
+											{t("queuedFailedCount", {
+												count: queuedMessages.filter((msg) => msg.state === "failed").length,
+											})}
+										</Badge>
+									)}
 									<QueuedAttachmentPreview
 										images={queuedMessages[0].images ?? []}
 										textFiles={queuedMessages[0].textFiles ?? []}
@@ -7983,6 +8002,7 @@ export function NarratorPanel({
 													onCancelEdit={handleCancelEditQueued}
 													onStartEdit={handleStartEditQueued}
 													onRemove={handleRemoveQueued}
+													onRetry={handleRetryQueued}
 													cancelBufferLabel={t("cancelBuffer")}
 													editLabel={tc("edit")}
 													priorityLabel={t("queuedPriority")}

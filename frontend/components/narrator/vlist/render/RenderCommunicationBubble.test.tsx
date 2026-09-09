@@ -21,6 +21,9 @@ const labels = {
 	communicationError: "发送失败",
 	communicationCancelled: "已取消",
 	communicationWaiting: "等待中",
+	communicationReceived: "已收到",
+	communicationReplyReceived: "已等到回复",
+	communicationTimeout: "已超时",
 	communicationViewFull: "查看全文",
 	sendAwaitReply: "等待回复",
 	sendNoAwaitReply: "不等待回复",
@@ -79,9 +82,7 @@ describe("outgoing communication bubble", () => {
 		expect(document.querySelector("[data-vlist-communication-body]")?.textContent).not.toContain(
 			"**Hello**",
 		);
-		expect(document.querySelector("[data-vlist-communication-meta]")?.textContent).toBe(
-			"不等待回复 · 已发送",
-		);
+		expect(document.querySelector("[data-vlist-communication-meta]")?.textContent).toBe("已发送");
 		expect(
 			document.querySelector("[data-vlist-communication-meta]")?.getAttribute("style"),
 		).toContain("--mantine-color-dimmed");
@@ -152,10 +153,10 @@ describe("outgoing communication bubble", () => {
 		expect(
 			render({ data: { ...data, broadcast: true, recipients: [], awaitReply: true } }).body
 				.textContent,
-		).toContain("@全体等待回复");
+		).toContain("@全体发送中");
 		expect(
 			render({ data: { ...data, recipients: [], status: "cancelled" } }).body.textContent,
-		).toContain("@未知收件人不等待回复 · 已取消");
+		).toContain("@未知收件人已取消");
 	});
 
 	test("real fail status renders failure, never sending, with or without extracted output text", () => {
@@ -163,7 +164,7 @@ describe("outgoing communication bubble", () => {
 			const failed = { ...data, status: "fail", error };
 			const document = render({ data: failed, measured: measureCommunicationBubble(failed, 800) });
 			expect(document.querySelector("[data-vlist-communication-meta]")?.textContent).toBe(
-				"不等待回复 · 发送失败",
+				"发送失败",
 			);
 			expect(document.querySelector("[data-vlist-communication-error]")?.textContent).toBe(
 				error ?? "发送失败",
@@ -185,9 +186,7 @@ describe("outgoing communication bubble", () => {
 		expect(document.querySelector("[data-vlist-communication-warning]")?.textContent).toBe(
 			warningData.warning,
 		);
-		expect(document.querySelector("[data-vlist-communication-meta]")?.textContent).toBe(
-			"不等待回复 · 已发送",
-		);
+		expect(document.querySelector("[data-vlist-communication-meta]")?.textContent).toBe("已发送");
 		const failed = { ...warningData, error: "Delivery failed" };
 		const failedDoc = render({ measured: measureCommunicationBubble(failed, 800), data: failed });
 		expect(failedDoc.querySelector("[data-vlist-communication-warning]")).toBeNull();
@@ -196,17 +195,65 @@ describe("outgoing communication bubble", () => {
 		);
 	});
 
-	test("awaited running messages wait, while timeouts and aborts never look successful", () => {
-		const waiting = render({ data: { ...data, status: "running", awaitReply: true } });
+	test("awaited running messages need enqueue evidence; timeout differs from cancellation", () => {
+		const sending = render({ data: { ...data, status: "running", awaitReply: true } });
+		expect(sending.querySelector("[data-vlist-communication-meta]")?.textContent).toBe("发送中");
+		const waiting = render({
+			data: {
+				...data,
+				status: "running",
+				awaitReply: true,
+				recipients: [{ label: "worker", deliveryMessageId: "m" }],
+			},
+		});
 		expect(waiting.querySelector("[data-vlist-communication-meta]")?.textContent).toBe(
-			"等待回复 · 等待中",
+			"已发送 · 等待中",
 		);
-		for (const status of ["timeout", "aborted"]) {
+		for (const [status, expected] of [
+			["timeout", "已超时"],
+			["aborted", "已取消"],
+		]) {
 			const document = render({ data: { ...data, status, awaitReply: true } });
-			expect(document.querySelector("[data-vlist-communication-meta]")?.textContent).toBe(
-				"等待回复 · 已取消",
-			);
+			expect(document.querySelector("[data-vlist-communication-meta]")?.textContent).toBe(expected);
 		}
+	});
+
+	test("paints only consumed receipts and matched reply counts, with current target titles", () => {
+		const baseState = {
+			targetCount: 3,
+			sentCount: 3,
+			receivedCount: 2,
+			replyCount: 0,
+			awaitReply: false,
+		};
+		const recipients = [
+			{ id: "r1", label: "Alias", title: "Current", deliveryMessageId: "receipt" },
+		];
+		const partial = render({ data: { ...data, recipients, deliveryState: baseState } });
+		expect(partial.querySelector("[data-vlist-communication-recipients]")?.textContent).toContain(
+			"@Current",
+		);
+		expect(partial.querySelector("[data-vlist-communication-meta]")?.textContent).toBe(
+			"已收到 2/3",
+		);
+		for (const [replyCount, expected] of [
+			[0, "已收到 · 等待中"],
+			[2, "已收到 · 已等到回复 2/3"],
+			[3, "已收到 · 已等到回复"],
+		] as const) {
+			const document = render({
+				data: {
+					...data,
+					deliveryState: { ...baseState, awaitReply: true, receivedCount: 3, replyCount },
+				},
+			});
+			expect(document.querySelector("[data-vlist-communication-meta]")?.textContent).toBe(expected);
+		}
+		const async = render({
+			data: { ...data, deliveryState: { ...baseState, receivedCount: 3, replyCount: 3 } },
+		});
+		expect(async.querySelector("[data-vlist-communication-meta]")?.textContent).toBe("已收到");
+		expect(async.body.textContent).not.toContain("回复");
 	});
 
 	test("narrow rows bound the header and preserve all individual recipient controls", () => {

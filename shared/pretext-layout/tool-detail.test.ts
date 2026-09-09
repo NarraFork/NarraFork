@@ -792,22 +792,28 @@ describe("classifyToolDetail — await", () => {
 
 describe("classifyToolDetail — send", () => {
 	it.each([
-		[{ await: true }, undefined, "等待回复"],
-		[{ await: false }, undefined, "不等待回复"],
-		[{}, undefined, "不等待回复"],
-		[{ await: false }, { await: true }, "不等待回复"],
-		[{ _truncated: true, preview: "{}" }, { await: true }, "等待回复"],
-		[{ _truncated: true, preview: "{}" }, { await: false }, "不等待回复"],
-	])("measures the localized reply mode for %j / %j", (inputJson, metadata, expected) => {
+		[{ await: true }, undefined],
+		[{ await: false }, undefined],
+		[{}, undefined],
+		[{ await: false }, { await: true }],
+		[{ _truncated: true, preview: "{}" }, { await: true }],
+		[{ _truncated: true, preview: "{}" }, { await: false }],
+	])("does not show mode labels before enqueueing for %j / %j", (inputJson, metadata) => {
 		const d = classifyToolDetail({
 			previewId: "send-mode",
 			toolName: "Send",
 			category: "send",
 			inputJson,
 			metadata,
-			labels: { sendAwaitReply: "等待回复", sendNoAwaitReply: "不等待回复" },
+			labels: {
+				communicationRunning: "发送中",
+				sendAwaitReply: "等待回复",
+				sendNoAwaitReply: "不等待回复",
+			},
 		});
-		expect(metaBadgeLabels(d)).toContain(expected);
+		expect(metaBadgeLabels(d)).toContain("发送中");
+		expect(metaBadgeLabels(d)).not.toContain("不等待回复");
+		expect(metaBadgeLabels(d)).not.toContain("等待回复");
 	});
 	it("splits message / delivery / result into labelled sections", () => {
 		const d = classifyToolDetail({
@@ -824,10 +830,10 @@ describe("classifyToolDetail — send", () => {
 		// Delivery keeps per-target structure instead of "sent · Agent A" text.
 		const delivery = sectionBody(d, "delivery") as ToolStructuredDetail;
 		expect(delivery.entries).toEqual([
-			{ title: "Agent A", badges: [{ label: "sent", color: "green" }] },
+			{ title: "Agent A", badges: [{ label: "Sent", color: "green" }] },
 		]);
 		expect((sectionBody(d, "result") as ToolCappedDetail).text).toBe("delivered");
-		expect(metaBadgeLabels(d)).toEqual(["→ Agent A", "Do not wait for reply"]);
+		expect(metaBadgeLabels(d)).toEqual(["→ Agent A", "Sent"]);
 	});
 	it("marks a failed delivery and carries its error", () => {
 		const d = classifyToolDetail({
@@ -839,7 +845,7 @@ describe("classifyToolDetail — send", () => {
 		});
 		const delivery = sectionBody(d, "delivery") as ToolStructuredDetail;
 		expect(delivery.entries?.[0]?.badges).toEqual([
-			{ label: "failed", color: "red" },
+			{ label: "Send failed", color: "red" },
 			{ label: "interrupted", color: "orange" },
 		]);
 		expect(delivery.entries?.[0]?.snippet).toBe("gone");
@@ -851,9 +857,10 @@ describe("classifyToolDetail — send", () => {
 			category: "send",
 			inputJson: { message: "hi", await: true, doInterrupt: true },
 			outputJson: "pong",
+			metadata: { targets: [{ id: "a", status: "completed", awaited: true }] },
 		});
 		expect(hasSection(d, "reply")).toBe(true);
-		expect(metaBadgeLabels(d)).toContain("Wait for reply");
+		expect(metaBadgeLabels(d)).toContain("Sent · Reply received");
 		expect(metaBadgeLabels(d)).toContain("interrupt");
 	});
 });

@@ -42,9 +42,16 @@ import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { getSubagentType, isSubagentVariant } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import { sideCarBodyWithText } from "../lib/sidecar-templates";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import {
+	assertRuntimeCanAskQuestion,
+	type RuntimePolicy,
+	resolveRuntimePolicy,
+} from "./agent-runtime/policy";
+import { customSubagentService } from "./custom-subagent-service";
 import { notifyHumanAttentionChanged } from "./human-attention-events";
 import { type DeliverInjectionOptions, deliverInjection } from "./narrator-injection";
 
@@ -65,6 +72,25 @@ export interface AsyncQuestionAnnotation {
 
 export type AsyncQuestionStatus = "open" | "answered" | "dismissed" | "withdrawn";
 export type AsyncQuestionOrigin = "agent_async" | "user_deferred";
+
+/** A captured execution identity, independent of the user who eventually answers.
+ * Outer null/absence means legacy unknown; {userId:null} is a real anonymous principal. */
+export interface QuestionExecutionPrincipal {
+	version: 1;
+	userId: string | null;
+}
+
+export function parseQuestionExecutionPrincipal(value: unknown): QuestionExecutionPrincipal | null {
+	if (!value || typeof value !== "object") return null;
+	const snapshot = value as Record<string, unknown>;
+	if (
+		snapshot.version !== 1 ||
+		(snapshot.userId !== null &&
+			(typeof snapshot.userId !== "string" || snapshot.userId.length === 0))
+	)
+		return null;
+	return { version: 1, userId: snapshot.userId as string | null };
+}
 
 /**
  * What a pushed change tells the client.
@@ -226,7 +252,7 @@ function coerceAnnotations(value: unknown): Record<string, AsyncQuestionAnnotati
 	return Object.keys(out).length > 0 ? out : null;
 }
 
-function toRecord(row: QuestionRow): AsyncQuestionRecord {
+function toRecord(row: Omit<QuestionRow, "executionPrincipalJson">): AsyncQuestionRecord {
 	return {
 		id: row.id,
 		narratorId: row.narratorId,
@@ -263,18 +289,69 @@ async function broadcastChange(
 	// the wait started (which is what the `awaited` / `await_ended` transitions carry)
 	// would report the state from before the very transition being announced.
 	const awaited = isAsyncQuestionAwaited(record.id);
-	seam.broadcastToNarrator(record.narratorId, {
-		type: "async_question_changed",
+	const event = {
+		type: "async_question_changed" as const,
 		narratorId: record.narratorId,
 		change,
 		question: { ...record, awaited },
 		awaited,
+	};
+	seam.broadcastToNarrator(record.narratorId, event);
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, record.narratorId),
+		columns: { variant: true, parentNarratorId: true },
 	});
+	if (narrator && isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
+		// Parent visibility is an event about the child, never a synthetic user answer
+		// in the parent's history. The actual answer remains owned by the child.
+		seam.broadcastToNarrator(narrator.parentNarratorId, event);
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Creation
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** Resolve question authority from persisted identity, never a model-supplied parent hint. */
+export async function resolveNarratorQuestionPolicy(narratorId: string): Promise<RuntimePolicy> {
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { variant: true },
+	});
+	if (!narrator) throw new Error("Question narrator not found.");
+	const subagentType = getSubagentType(narrator.variant);
+	const builtin = ["explore", "plan", "review", "search", "general"];
+	const customDefinition =
+		subagentType && !builtin.includes(subagentType)
+			? await customSubagentService.loadByName(subagentType)
+			: undefined;
+	return resolveRuntimePolicy({
+		variant: isSubagentVariant(narrator.variant) ? "subagent" : "primary",
+		subagentType: subagentType ?? undefined,
+		customDefinition,
+	});
+}
+
+export async function assertNarratorCanAskQuestion(
+	narratorId: string,
+	input: unknown,
+): Promise<RuntimePolicy> {
+	const policy = await resolveNarratorQuestionPolicy(narratorId);
+	assertRuntimeCanAskQuestion(policy, input);
+	return policy;
+}
+
+/** Exact question ownership is required; the snapshot is intentionally not in public records. */
+export async function getAsyncQuestionExecutionPrincipal(
+	questionId: string,
+	narratorId: string,
+): Promise<QuestionExecutionPrincipal | null> {
+	const row = await db.query.narratorQuestions.findFirst({
+		where: and(eq(narratorQuestions.id, questionId), eq(narratorQuestions.narratorId, narratorId)),
+		columns: { executionPrincipalJson: true },
+	});
+	return parseQuestionExecutionPrincipal(row?.executionPrincipalJson);
+}
 
 export interface CreateAsyncQuestionArgs {
 	narratorId: string;
@@ -282,6 +359,8 @@ export interface CreateAsyncQuestionArgs {
 	toolUseId: string;
 	questions: AsyncQuestionDefinition[];
 	origin?: AsyncQuestionOrigin;
+	/** Trusted server execution snapshot; never inferred from answers or tool arguments. */
+	executionPrincipal?: QuestionExecutionPrincipal;
 }
 
 /**
@@ -295,6 +374,21 @@ export interface CreateAsyncQuestionArgs {
 export async function createAsyncQuestion(
 	args: CreateAsyncQuestionArgs,
 ): Promise<{ record: AsyncQuestionRecord; created: boolean }> {
+	await assertNarratorCanAskQuestion(args.narratorId, {
+		async: true,
+		questions: args.questions,
+		...(args.origin === "user_deferred" ? { deferredByUser: true } : {}),
+	});
+	const call = await db.query.narratorToolCalls.findFirst({
+		where: and(
+			eq(narratorToolCalls.id, args.toolCallId),
+			eq(narratorToolCalls.narratorId, args.narratorId),
+			eq(narratorToolCalls.toolUseId, args.toolUseId),
+			eq(narratorToolCalls.toolName, "AskUserQuestion"),
+		),
+		columns: { id: true },
+	});
+	if (!call) throw new Error("Question tool call does not belong to this narrator.");
 	const existing = await db.query.narratorQuestions.findFirst({
 		where: eq(narratorQuestions.toolCallId, args.toolCallId),
 	});
@@ -306,6 +400,7 @@ export async function createAsyncQuestion(
 		toolCallId: args.toolCallId,
 		toolUseId: args.toolUseId,
 		questionsJson: args.questions,
+		executionPrincipalJson: parseQuestionExecutionPrincipal(args.executionPrincipal),
 		answersJson: null,
 		annotationsJson: null,
 		status: "open" as const,
@@ -653,13 +748,30 @@ async function deliverDecision(
 				: record.questions.map((q) => ({ header: q.header, answer: "" })),
 	};
 	const { content } = sideCarBodyWithText("async_question", body, locale);
+	const executionPrincipal = await getAsyncQuestionExecutionPrincipal(record.id, record.narratorId);
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, record.narratorId),
+		columns: { variant: true },
+	});
+	const unknownChildPrincipal =
+		!!narrator && isSubagentVariant(narrator.variant) && !executionPrincipal;
+	if (unknownChildPrincipal)
+		logger.warn(
+			"Automatic wake withheld for legacy child question: execution principal is unknown",
+			{ narratorId: record.narratorId, questionId: record.id },
+		);
 
 	const result = await seam.deliverInjection(record.narratorId, {
 		content,
 		source: "async_question",
 		body,
 		role: "user",
-		schedule: seam.isLoopRunning(record.narratorId) ? "interject" : "wakeIfIdle",
+		schedule: unknownChildPrincipal
+			? "none"
+			: seam.isLoopRunning(record.narratorId)
+				? "interject"
+				: "wakeIfIdle",
+		...(executionPrincipal ? { executionPrincipal } : {}),
 		locale,
 		createdBy: userId,
 		onPersist,

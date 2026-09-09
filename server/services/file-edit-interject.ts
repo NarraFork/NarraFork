@@ -167,7 +167,7 @@ export async function interjectFileEditAsUserMessage(
 	const trackKey = interjectKey(narratorId, notification.filePath);
 	const trackedId = fileEditInterjectIds.get(trackKey);
 	if (trackedId && getBufferedMessages(narratorId).some((msg) => msg.id === trackedId)) {
-		if (updateBufferedMessage(narratorId, trackedId, text)) {
+		if (await updateBufferedMessage(narratorId, trackedId, text)) {
 			requestBufferedMessageSoftStop(narratorId);
 			broadcastBufferSnapshot(narratorId);
 			return { delivered: "interjected" };

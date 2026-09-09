@@ -4,6 +4,7 @@
  * without any grouping / splitting logic of its own.
  */
 
+import { mergeSendDeliveryTargetCount, mergeSendDeliveryTargets } from "@shared/communication-tool";
 import type { FileReferenceContext } from "@shared/file-reference";
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import { isEmptyReasoningBlock } from "@shared/reasoning-content";
@@ -120,6 +121,16 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 		const isEnriched = block.status !== undefined;
 		const matchingTc = msg.toolCalls?.find((t: ToolCallRow) => t.toolUseId === (block.id ?? ""));
 		const tc = isEnriched ? null : matchingTc;
+		// Receipt facts can arrive after the enriched lifecycle snapshot. Only join
+		// the matching persisted attempt, even when ordinary row fallback is disabled.
+		const deliveryTc =
+			matchingTc &&
+			(block.tcId == null || matchingTc.id == null || block.tcId === matchingTc.id) &&
+			(block.executionAttempt == null ||
+				matchingTc.executionAttempt == null ||
+				block.executionAttempt === matchingTc.executionAttempt)
+				? matchingTc
+				: undefined;
 		const status = block.status ?? tc?.status ?? "running";
 		const createdAt = block.tcCreatedAt ?? matchingTc?.createdAt;
 		const persistedStartedAt = (matchingTc as (ToolCallRow & { startedAt?: unknown }) | undefined)
@@ -173,8 +184,17 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			// mapping is an explicit field list, so omitting it here would silently
 			// drop the only source that exists before the wait returns.
 			// Queued Send receipts must survive both enriched-block and row projections.
-			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
-			_sendDeliveryTargets: block._sendDeliveryTargets ?? (tc as any)?._sendDeliveryTargets,
+			_sendDeliveryTargets:
+				block._sendDeliveryTargets || deliveryTc?._sendDeliveryTargets
+					? mergeSendDeliveryTargets(
+							deliveryTc?._sendDeliveryTargets ?? [],
+							block._sendDeliveryTargets ?? [],
+						)
+					: undefined,
+			_sendDeliveryTargetCount: mergeSendDeliveryTargetCount(
+				deliveryTc?._sendDeliveryTargetCount,
+				block._sendDeliveryTargetCount,
+			),
 			_awaitAgentNarratorId:
 				// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 				block._awaitAgentNarratorId ?? (tc as any)?._awaitAgentNarratorId,

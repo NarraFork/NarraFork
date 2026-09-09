@@ -267,12 +267,12 @@ describe("acting-user resolution reuses the existing subagent decision", () => {
 		}
 	});
 
-	test("a turn with no user falls back to the parent session's user", () => {
+	test("only an omitted legacy user falls back; explicit null stays anonymous", () => {
 		// This is the case that matters for a `Send` from the parent and for recovery
 		// restarts: the message carries no `createdBy`, but the chain still has a human.
 		activeNarrators.set(parentNarratorId, { _currentUserId: clearedUserId } as never);
 		try {
-			expect(resolveInjectionUserId(null, parentNarratorId)).toBe(clearedUserId);
+			expect(resolveInjectionUserId(null, parentNarratorId)).toBeNull();
 			expect(resolveInjectionUserId(undefined, parentNarratorId)).toBe(clearedUserId);
 		} finally {
 			activeNarrators.delete(parentNarratorId);
@@ -293,10 +293,21 @@ describe("agent-to-agent messages are scanned under the acting human's permissio
 		try {
 			const result = await scan({
 				text: `sibling reports a ${SECRET_KW} anomaly`,
-				turnUserId: null,
+				turnUserId: undefined,
 				source: "team_message",
 			});
 			expect(result?.record.hits.map((h) => h.entryId)).toContain(secretEntryId);
+		} finally {
+			activeNarrators.delete(parentNarratorId);
+		}
+	});
+
+	test("an explicitly anonymous run cannot inherit the parent's classified access", async () => {
+		activeNarrators.set(parentNarratorId, { _currentUserId: clearedUserId } as never);
+		try {
+			expect(
+				await scan({ text: `about ${SECRET_KW}`, turnUserId: null, source: "team_message" }),
+			).toBeNull();
 		} finally {
 			activeNarrators.delete(parentNarratorId);
 		}
@@ -309,7 +320,7 @@ describe("agent-to-agent messages are scanned under the acting human's permissio
 		try {
 			const result = await scan({
 				text: `sibling reports a ${SECRET_KW} anomaly`,
-				turnUserId: null,
+				turnUserId: undefined,
 				source: "team_message",
 			});
 			expect(result).toBeNull();
@@ -414,7 +425,7 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 		});
 		const text = `BUFFERED_REQUEST_MARKER inspect ${keyword}`;
 		const userId = authorized ? clearedUserId : unclearedUserId;
-		pushSubagentBufferedMessage(narratorId, text, { createdBy: userId });
+		await pushSubagentBufferedMessage(narratorId, text, { createdBy: userId });
 		const requests: Pick<ExecuteLoopOptions, "userText" | "history" | "trailingToolResults">[] = [];
 		const executor = spyOn(narratorExecutor, "executeAgentLoop").mockImplementation(
 			async (input) => {

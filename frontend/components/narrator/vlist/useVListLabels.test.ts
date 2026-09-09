@@ -122,10 +122,13 @@ describe("adapter chrome keys — every fallback has an injected translation", (
 	it("forwards communication chrome and receipt labels through adapter data", () => {
 		const keys = [
 			"sendAwaitReply",
-			"sendNoAwaitReply",
+			"communicationReceived",
+			"communicationReplyReceived",
+			"communicationTimeout",
 			"communicationBroadcast",
 			"communicationRecipientUnknown",
 			"communicationRunning",
+			"communicationNoRecipients",
 			"communicationSuccess",
 			"communicationError",
 			"communicationCancelled",

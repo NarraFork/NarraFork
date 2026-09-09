@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import type { ToolContext } from "../../../server/lib/agent/types";
 import { AppError } from "../../../server/lib/errors";
 import type { McpServerConfig } from "../../../server/lib/settings";
 
@@ -48,7 +49,16 @@ const mcpManagerMock = {
 mock.module("../../../server/lib/settings", () => ({
 	...actualSettingsModule,
 	settings: settingsState,
-	saveSettings: () => {
+	loadSettings: () => ({
+		...actualSettingsModule.getDefaults(),
+		mcpServers: structuredClone(settingsState.mcpServers),
+	}),
+	saveSettings: (value: { mcpServers?: McpServerConfig[] }) => {
+		actualSettingsModule.normalizeMcpServerIds({
+			...actualSettingsModule.getDefaults(),
+			mcpServers: value.mcpServers,
+		});
+		settingsState.mcpServers = value.mcpServers ?? [];
 		saveSettingsCalls++;
 	},
 }));
@@ -117,6 +127,67 @@ afterAll(() => {
 	mock.module("../../../server/lib/mcp/manager", () => actualManagerModule);
 	mock.module("../../../server/lib/mcp/tool-bridge", () => actualToolBridgeModule);
 	mock.restore();
+});
+
+describe("agent-created MCP servers remain manageable through the UI API", () => {
+	const ctx = {
+		narratorId: "mcp-route-test",
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		locale: "en",
+		userId: "mcp-test-user",
+		requestPermission: async () => ({ behavior: "allow" as const }),
+	} as ToolContext;
+
+	it("assigns IDs to raw NarraForkAdmin configurations so list, edit and delete work", async () => {
+		role = "admin";
+		const { narraforkAdminTool } = await import("../../../server/lib/agent/tools/narrafork-admin");
+		const result = await narraforkAdminTool.execute(
+			{
+				action: "update_settings",
+				value: {
+					mcpServers: [
+						{
+							name: "intellij-index",
+							transport: "sse",
+							url: "http://localhost:1234/sse",
+							enabled: false,
+						},
+						{ id: 42, name: "numeric-id", transport: "stdio", enabled: false },
+					],
+				},
+			},
+			ctx,
+		);
+		expect(result.isError).toBeFalsy();
+		const listed = await (await request("/servers")).json();
+		expect(listed.servers).toHaveLength(2);
+		for (const server of listed.servers) {
+			expect(typeof server.id).toBe("string");
+			expect(server.id.length).toBeGreaterThan(0);
+			expect((await jsonRequest(`/servers/${server.id}`, "PATCH", { name: "edited" })).status).toBe(
+				200,
+			);
+			expect((await request(`/servers/${server.id}`, { method: "DELETE" })).status).toBe(200);
+		}
+		expect(settingsState.mcpServers).toEqual([]);
+	});
+
+	it("writes McpAdmin additions through the real settings adapter before UI deletion", async () => {
+		role = "admin";
+		const { createMcpAdminTool } = await import("../../../server/lib/agent/tools/mcp-admin");
+		const tool = createMcpAdminTool({ isAdminUser: () => true });
+		const result = await tool.execute(
+			{ action: "add", name: "agent-server", command: "demo", enabled: false },
+			ctx,
+		);
+		expect(result.isError).toBeFalsy();
+		const added = JSON.parse(result.output);
+		expect(settingsState.mcpServers.map((server) => server.id)).toContain(added.id);
+		expect(saveSettingsCalls).toBe(1);
+		expect((await request(`/servers/${added.id}`, { method: "DELETE" })).status).toBe(200);
+		expect(settingsState.mcpServers.map((server) => server.id)).toEqual(["existing"]);
+	});
 });
 
 describe("MCP external server management authorization", () => {

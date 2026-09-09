@@ -1,4 +1,3 @@
-import { SHELL_TOOL_NAME } from "@server/lib/agent/tools/bash";
 import type { ToolDefinition } from "@server/lib/agent/types";
 import {
 	getSubagentParentReportingHint,
@@ -7,54 +6,14 @@ import {
 	type SubagentType,
 } from "@server/lib/prompt-i18n";
 import { settings } from "@server/lib/settings";
+import {
+	isRuntimeToolAllowed,
+	type RuntimePolicy,
+	resolveRuntimePolicy,
+	runtimeInteractionHint,
+} from "./agent-runtime/policy";
 import { type CustomSubagentDef, customSubagentService } from "./custom-subagent-service";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
-
-/** Tools available to explore/plan subagents (strictly read-only). */
-const EXPLORE_PLAN_TOOLS = new Set([
-	"Read",
-	"Glob",
-	"Grep",
-	"WebSearch",
-	"WebFetch",
-	SHELL_TOOL_NAME,
-	"TeamStatus",
-	"Await",
-	"ContextAsk",
-	"Send",
-]);
-
-/** Tools available to search subagents. Native web_search is provider-side; WebFetch is for follow-up URLs. */
-const SEARCH_TOOLS = new Set(["WebFetch", "TeamStatus", "Await", "ContextAsk", "Send"]);
-
-/** Review is explicitly read-only; Bash is constrained to local Git inspection by permission policy. */
-const REVIEW_TOOLS = new Set([
-	"Read",
-	"Glob",
-	"Grep",
-	SHELL_TOOL_NAME,
-	"WebSearch",
-	"WebFetch",
-	"TeamStatus",
-	"Await",
-	"ContextAsk",
-	"Send",
-]);
-
-/** Tools that are never available inside subagents. */
-const DISALLOWED_SUBAGENT_TOOLS = new Set(["AskUserQuestion"]);
-
-/** Tools available to general subagents (read/write + non-interactive helpers, no nesting/plan/forking). */
-const GENERAL_TOOLS = new Set([...EXPLORE_PLAN_TOOLS, "Write", "Edit", "Skill"]);
-
-function isBuiltinToolAllowedForSubagent(toolName: string): boolean {
-	return !DISALLOWED_SUBAGENT_TOOLS.has(toolName);
-}
-
-/** MCP tools use the naming convention `mcp__<server>__<tool>` */
-function isMcpTool(tool: ToolDefinition): boolean {
-	return tool.name.startsWith("mcp__");
-}
 
 function normalizeMcpToolBehavior(behavior: string | null | undefined): string | null {
 	return behavior === "allow" ? "readWrite" : (behavior ?? null);
@@ -84,21 +43,9 @@ function resolveMcpToolBehavior(tool: ToolDefinition): string | null {
 	return normalizeMcpToolBehavior(serverConfig.defaultBehavior);
 }
 
-/**
- * Check if an MCP tool should be included for a given subagent type.
- * - explore/plan (read-only): only readOnly MCP tools
- * - general (read-write): all MCP tools except explicit deny
- * - deny MCP tools are always excluded
- * - MCP tools with no explicit config or "ask" are available to general subagents
- */
-function isMcpToolAllowedForSubagent(tool: ToolDefinition, subagentType: string): boolean {
-	const behavior = resolveMcpToolBehavior(tool);
-	if (behavior === "deny") return false;
-	if (subagentType === "explore" || subagentType === "plan") {
-		return behavior === "readOnly";
-	}
-	// general / custom with general access
-	return true;
+/** Common visibility projection for primary and child assembly; MCP config is read live. */
+export function runtimeToolFilter(policy: RuntimePolicy): (tool: ToolDefinition) => boolean {
+	return (tool) => isRuntimeToolAllowed(policy, tool.name, resolveMcpToolBehavior(tool));
 }
 
 /**
@@ -106,61 +53,26 @@ function isMcpToolAllowedForSubagent(tool: ToolDefinition, subagentType: string)
  * Only excludes tools with "deny" behavior.
  */
 export function isMcpToolAllowedForNarrator(tool: ToolDefinition): boolean {
-	const behavior = resolveMcpToolBehavior(tool);
-	return behavior !== "deny";
+	return runtimeToolFilter(resolveRuntimePolicy({ variant: "primary" }))(tool);
 }
-
-/** Tool filter factories per built-in subagent type */
-const BUILTIN_TOOL_FILTERS: Record<string, (tool: ToolDefinition) => boolean> = {
-	explore: (tool) =>
-		isBuiltinToolAllowedForSubagent(tool.name) &&
-		(EXPLORE_PLAN_TOOLS.has(tool.name) ||
-			(isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "explore"))),
-	plan: (tool) =>
-		isBuiltinToolAllowedForSubagent(tool.name) &&
-		(EXPLORE_PLAN_TOOLS.has(tool.name) ||
-			(isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "plan"))),
-	general: (tool) =>
-		isBuiltinToolAllowedForSubagent(tool.name) &&
-		(GENERAL_TOOLS.has(tool.name) ||
-			(isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "general"))),
-	search: (tool) => isBuiltinToolAllowedForSubagent(tool.name) && SEARCH_TOOLS.has(tool.name),
-	review: (tool) =>
-		isBuiltinToolAllowedForSubagent(tool.name) &&
-		(REVIEW_TOOLS.has(tool.name) ||
-			(isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "explore"))),
-};
 
 /**
  * Resolve the tool filter for a subagent type.
- * For built-in types, returns the static filter.
- * For custom types, builds a filter based on the custom definition's toolAccess.
+ * Projects the shared built-in/custom capability policy into tool visibility.
+ * MCP configuration remains live and execution permission gates remain mandatory.
  * Accepts an optional pre-loaded customDef to avoid redundant I/O.
  */
 export function resolveToolFilter(
 	subagentType: string,
 	customDef?: CustomSubagentDef | null,
 ): ((tool: ToolDefinition) => boolean) | undefined {
-	const builtin = BUILTIN_TOOL_FILTERS[subagentType];
-	if (builtin) return builtin;
-
-	if (!customDef) return BUILTIN_TOOL_FILTERS.explore; // fallback: deny write access when definition is missing
-
-	switch (customDef.toolAccess) {
-		case "readOnly":
-			return BUILTIN_TOOL_FILTERS.explore;
-		case "general":
-			return BUILTIN_TOOL_FILTERS.general;
-		case "custom": {
-			const allowed = new Set(customDef.customTools);
-			return (tool) =>
-				isBuiltinToolAllowedForSubagent(tool.name) &&
-				allowed.has(tool.name) &&
-				(!isMcpTool(tool) || isMcpToolAllowedForSubagent(tool, "general"));
-		}
-		default:
-			return BUILTIN_TOOL_FILTERS.explore;
-	}
+	return runtimeToolFilter(
+		resolveRuntimePolicy({
+			variant: "subagent",
+			subagentType,
+			customDefinition: customDef,
+		}),
+	);
 }
 
 /**
@@ -179,6 +91,7 @@ export async function buildSubagentSystemPrompt(
 	contextSummary?: string | null,
 	customPrompt?: string | null,
 	canReportToParent = false,
+	runtimePolicy?: RuntimePolicy,
 ): Promise<string> {
 	// Try built-in prompt first
 	let basePrompt = getSubagentPrompt(subagentType, locale);
@@ -205,7 +118,14 @@ export async function buildSubagentSystemPrompt(
 	// subagents additionally receive permission to report interim progress to the
 	// parent; foreground subagents are told that their final result is returned
 	// automatically when they finish.
-	basePrompt = `${basePrompt}\n\n${getSubagentParentReportingHint(locale, canReportToParent)}`;
+	const customDefinition = !["explore", "plan", "review", "search", "general"].includes(
+		subagentType,
+	)
+		? await customSubagentService.loadByName(subagentType)
+		: undefined;
+	const policy =
+		runtimePolicy ?? resolveRuntimePolicy({ variant: "subagent", subagentType, customDefinition });
+	basePrompt = `${basePrompt}\n\n${getSubagentParentReportingHint(locale, canReportToParent)}\n${runtimeInteractionHint(policy, locale)}`;
 
 	const { prompt } = await buildEffectiveSystemPrompt({
 		basePrompt,

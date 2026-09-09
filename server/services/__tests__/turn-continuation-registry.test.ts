@@ -32,6 +32,7 @@ import {
 	listContinuationSourceIds,
 	listHandledContinuationSourceIds,
 	NON_SOURCE_ASYMMETRIES,
+	selectPassRecoverySource,
 } from "../turn-continuation-registry";
 
 const SERVICES_DIR = join(import.meta.dir, "..");
@@ -262,86 +263,69 @@ describe("checkContinuationMarkerSequence", () => {
 	});
 });
 
-describe("loop bodies match the registry", () => {
-	// The actual drift guard. If this fails, either a loop grew a continuation branch that
-	// the registry does not know about, or a registry entry claims a handler that no longer
-	// exists — both of which are the bug class this refactor targets.
-	const cases: Array<{ audience: "primary" | "subagent"; file: string }> = [
-		{ audience: "primary", file: "narrator-session.ts" },
-		{ audience: "subagent", file: "subagent-executor.ts" },
-	];
-
-	for (const { audience, file } of cases) {
-		test(`${file} carries exactly the ${audience} sources, in order`, () => {
-			const markers = extractContinuationMarkers(readService(file));
-			const result = checkContinuationMarkerSequence(audience, markers);
-			expect(
-				result,
-				`markers found: ${JSON.stringify(markers)}\n` +
-					`missing: ${JSON.stringify(result.missing)}\n` +
-					`notDeclared: ${JSON.stringify(result.notDeclared)}\n` +
-					`unknown: ${JSON.stringify(result.unknown)}\n` +
-					`outOfOrder: ${JSON.stringify(result.outOfOrder)}`,
-			).toMatchObject({ ok: true });
-		});
-	}
-
-	test("removing one real marker from a real loop body is caught", () => {
-		// End-to-end proof that the guard bites on the actual files, not just on synthetic
-		// id arrays: take the real source text, delete one marker in memory, and confirm the
-		// check fails naming that source. Done in memory on purpose — mutating the file on
-		// disk to test a test would risk clobbering concurrent edits to a core loop.
-		const text = readService("subagent-executor.ts");
-		const marker = continuationMarker("buffered-message");
-		expect(text).toContain(marker);
-		const withoutMarker = text.replace(marker, "");
-		const result = checkContinuationMarkerSequence(
-			"subagent",
-			extractContinuationMarkers(withoutMarker),
+describe("executable shared recovery registry", () => {
+	const completed = { finalText: "", hasError: false, shouldUpdateTitle: false };
+	test("abort wins over payment and retry, except intentional plan approval", () => {
+		const result = {
+			...completed,
+			aborted: true,
+			retryableError: "transient",
+			paymentRequired: { message: "pay", resumeAction: "retry" as const },
+		};
+		expect(selectPassRecoverySource(result, { aborted: false, planApproved: false })).toBe(
+			"abort-before-recovery",
 		);
-		expect(result.ok).toBe(false);
-		expect(result.missing).toEqual(["buffered-message"]);
-	});
-
-	test("reordering two real markers in a real loop body is caught", () => {
-		// The other half of the guarantee: the order is enforced against the file, not merely
-		// declared. Swapping the two drain/consume markers must fail, since that pair's order
-		// is the fix for a real bug (a message arriving at the turn boundary waited for the
-		// next wake).
-		const text = readService("narrator-session.ts");
-		const drain = continuationMarker("injection-drain");
-		const buffered = continuationMarker("buffered-message");
-		const placeholder = "[[SWAP]]";
-		const swapped = text
-			.replace(drain, placeholder)
-			.replace(buffered, drain)
-			.replace(placeholder, buffered);
-		const result = checkContinuationMarkerSequence("primary", extractContinuationMarkers(swapped));
-		expect(result.ok).toBe(false);
-		expect(result.outOfOrder).toContainEqual({
-			earlier: "buffered-message",
-			later: "injection-drain",
-		});
-	});
-
-	test("neither loop marks a source the other audience owns exclusively", () => {
-		// Cross-check: a copy-pasted marker would otherwise satisfy its own file's test while
-		// silently claiming a handler that does not exist.
-		const primaryMarkers = new Set(extractContinuationMarkers(readService("narrator-session.ts")));
-		const subagentMarkers = new Set(
-			extractContinuationMarkers(readService("subagent-executor.ts")),
+		expect(selectPassRecoverySource(result, { aborted: false, planApproved: true })).toBe(
+			"payment-required",
 		);
-		for (const source of CONTINUATION_SOURCES) {
-			if (source.dispositions.primary.kind !== "handled") {
-				expect(primaryMarkers.has(source.id), `${source.id} marked in narrator-session`).toBe(
-					false,
-				);
-			}
-			if (source.dispositions.subagent.kind !== "handled") {
-				expect(subagentMarkers.has(source.id), `${source.id} marked in subagent-executor`).toBe(
-					false,
-				);
-			}
-		}
+	});
+	test("payment and request refusal are terminal/recovery sources before ordinary errors", () => {
+		const control = { aborted: false, planApproved: false };
+		expect(
+			selectPassRecoverySource(
+				{
+					...completed,
+					hasError: true,
+					paymentRequired: { message: "pay", resumeAction: "retry" },
+				},
+				control,
+			),
+		).toBe("payment-required");
+		expect(
+			selectPassRecoverySource(
+				{ ...completed, contextLengthExceeded: true, retryableError: "retry" },
+				control,
+			),
+		).toBe("context-overflow");
+		expect(
+			selectPassRecoverySource(
+				{
+					...completed,
+					modelUnavailable: { message: "disabled", provider: "test", model: "test:model" },
+				},
+				control,
+			),
+		).toBe("model-unavailable");
+	});
+	test("transient and silent disconnect share one ordered retry family", () => {
+		const control = { aborted: false, planApproved: false };
+		expect(
+			selectPassRecoverySource(
+				{ ...completed, retryableError: "retry", silentDisconnect: true },
+				control,
+			),
+		).toBe("transient-error");
+		expect(selectPassRecoverySource({ ...completed, silentDisconnect: true }, control)).toBe(
+			"silent-disconnect",
+		);
+		expect(selectPassRecoverySource(completed, control)).toBe("completed");
+	});
+	test("entry adapters cannot retain the former private next-pass loops", () => {
+		expect(readService("narrator-session.ts")).not.toContain("while (active.alive)");
+		expect(readService("subagent-executor.ts")).not.toContain("while (true)");
+		expect(readService("subagent-runner.ts")).not.toContain("while (true)");
+		const runtime = readService("agent-runtime/orchestrator.ts");
+		expect(runtime).toContain("selectRuntimeRecovery(");
+		expect(runtime).toContain("executeAgentLoop({");
 	});
 });

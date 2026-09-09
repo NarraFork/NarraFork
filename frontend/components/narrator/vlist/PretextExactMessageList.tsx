@@ -207,6 +207,7 @@ import {
 import {
 	jumpTargetItemIndex,
 	jumpTargetMessageId,
+	jumpTargetScrollTop,
 	mountedJumpTarget,
 	resolveJumpTargetSeq,
 } from "./vlist-jump-target";
@@ -416,6 +417,8 @@ type PretextExactMessageListProps = {
 	 * so no state crosses the boundary and no row re-renders for it.
 	 */
 	highlightMessageId?: string;
+	/** A new request repeats the jump while retaining this list's loaded window. */
+	highlightRequestId?: string;
 	tailFooter?: ReactNode;
 };
 
@@ -2222,6 +2225,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			pruneDividerLabel,
 			hasChapter,
 			highlightMessageId,
+			highlightRequestId,
 			tailFooter,
 		} = props;
 		const lod = useRenderLod() as RenderLod;
@@ -2554,24 +2558,40 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 					inputJson?: unknown;
 					_metadata?: unknown;
 					outputJson?: unknown;
+					status?: string;
+					_sendDeliveryTargets?: unknown;
+					_sendDeliveryTargetCount?: number;
 				};
 				if (typeof call.toolName !== "string") return "";
 				const outputMetadata =
 					call.outputJson && typeof call.outputJson === "object" && !Array.isArray(call.outputJson)
 						? (call.outputJson as { _metadata?: unknown })._metadata
 						: undefined;
-				const metadata = outputMetadata ?? call._metadata;
-				return getSummary(
-					call.toolName,
-					call.inputJson,
-					metadata && typeof metadata === "object"
-						? (metadata as Record<string, unknown>)
-						: undefined,
-					{
-						sendAwaitReply: t("sendAwaitReply"),
-						sendNoAwaitReply: t("sendNoAwaitReply"),
-					},
-				);
+				const sourceMetadata = outputMetadata ?? call._metadata;
+				const metadata =
+					sourceMetadata && typeof sourceMetadata === "object"
+						? (sourceMetadata as Record<string, unknown>)
+						: undefined;
+				const summaryMetadata =
+					call.toolName === "Send"
+						? {
+								...metadata,
+								status: call.status,
+								_sendDeliveryTargets: call._sendDeliveryTargets,
+								targetCount: call._sendDeliveryTargetCount ?? metadata?.targetCount,
+							}
+						: metadata;
+				return getSummary(call.toolName, call.inputJson, summaryMetadata, {
+					communicationRunning: t("communicationRunning"),
+					communicationNoRecipients: t("communicationNoRecipients"),
+					communicationSuccess: t("communicationSuccess"),
+					communicationReceived: t("communicationReceived"),
+					communicationWaiting: t("communicationWaiting"),
+					communicationReplyReceived: t("communicationReplyReceived"),
+					communicationTimeout: t("communicationTimeout"),
+					communicationCancelled: t("communicationCancelled"),
+					communicationError: t("communicationError"),
+				});
 			},
 			[t],
 		);
@@ -5580,10 +5600,9 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 					if (!element) return false;
 					pinnedToBottomRef.current = false;
 					setPinnedToBottom(false);
-					element.scrollIntoView?.({ block: "center", behavior: "instant" });
-					// Native reveals bypass writeScrollTop. Record the settled position
-					// so their scroll event cannot masquerade as a history-loading drag.
-					writeScrollTop(node.scrollTop);
+					// Restrict the reveal to this list, including repeated jumps to a mounted
+					// row. Native scrollIntoView can also scroll the panel/page ancestors.
+					writeScrollTop(jumpTargetScrollTop(node, element));
 					// Highlight the exact tool row, not its message's earlier text/alias.
 					if (highlightId) highlightRef.current.flash(element);
 					return true;
@@ -5717,15 +5736,10 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			],
 		);
 
-		// Deep-link / search jump: reveal the target once per (narrator, target) pair.
-		//
-		// Gated on a READY document rather than retried per rebuild. The jump now reaches
-		// history above the loaded window by paging toward it itself, so the only thing
-		// it cannot do is start before there is a window at all — and a retry loop over a
-		// path that fetches (and can report failure to the reader) would fire a request
-		// and a notice on every intermediate commit. Only a SUCCESSFUL reveal is
-		// recorded, so returning to the same target later (a repeated search hit)
-		// re-flashes because the panel hands the id back as a fresh mount.
+		// Deep-link / search jump: once per (narrator, target, request). A new request
+		// repeats the jump without remounting the panel or discarding loaded history.
+		// Wait for a READY document; missing history is paged by the jump itself.
+		// Latch each attempt so intermediate rebuilds do not duplicate fetches/notices.
 		const jumpedHighlightRef = useRef<string | null>(null);
 		const documentReady = pretextDocument.status === "ready";
 		useEffect(() => {
@@ -5734,7 +5748,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				return;
 			}
 			if (!documentReady) return;
-			const key = `${narratorId}:${highlightMessageId}`;
+			const key = JSON.stringify([narratorId, highlightMessageId, highlightRequestId]);
 			if (jumpedHighlightRef.current === key) return;
 			// Latch BEFORE awaiting: a failed deep-link jump has already told the reader
 			// why (the notice inside scrollToMessageTarget), and re-running it on the next
@@ -5745,7 +5759,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				targetIds: [highlightMessageId],
 				highlightId: highlightMessageId,
 			});
-		}, [documentReady, highlightMessageId, narratorId, scrollToMessageTarget]);
+		}, [documentReady, highlightMessageId, highlightRequestId, narratorId, scrollToMessageTarget]);
 
 		// A flash outlives its row's mount (the reader can scroll away mid-animation),
 		// so the controller is stopped explicitly on unmount.

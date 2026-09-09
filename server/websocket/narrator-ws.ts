@@ -61,7 +61,6 @@ import {
 	clearBufferedMessages,
 	getBufferedMessages,
 	pushBufferedMessage,
-	removeBufferedMessage,
 	resolveDecisionNarratorId,
 	resolvePermissionOrDangerReflection,
 	toBufferSummary,
@@ -392,22 +391,9 @@ function safeSend(ws: NarratorWS, message: Record<string, unknown>): boolean {
 	}
 }
 
-/**
- * Broadcast the post-mutation buffer queue, reading it from whichever map owns
- * this narrator's queue. Primary narrators and subagents keep their queues in
- * separate maps, so the caller reports which one it just mutated.
- */
-async function broadcastBufferQueueForNarrator(
-	narratorId: string,
-	fromSubagentQueue: boolean,
-): Promise<void> {
-	let messages: ReturnType<typeof toBufferSummary>;
-	if (fromSubagentQueue) {
-		const { getSubagentBufferedMessages } = await import("../services/narrator-subagent");
-		messages = toBufferSummary(getSubagentBufferedMessages(narratorId));
-	} else {
-		messages = toBufferSummary(getBufferedMessages(narratorId));
-	}
+/** Both actor types expose the same persistent user mailbox projection. */
+async function broadcastBufferQueueForNarrator(narratorId: string): Promise<void> {
+	const messages = toBufferSummary(getBufferedMessages(narratorId));
 	broadcastToNarrator(narratorId, { type: "buffer_set", narratorId, messages });
 }
 
@@ -1739,7 +1725,7 @@ export const handleNarratorWS = {
 						const { bufferSubagentUserMessage, isTakenOver } = await import(
 							"../services/narrator-subagent"
 						);
-						bufResult = bufferSubagentUserMessage(msg.narratorId, bufferText, {
+						bufResult = await bufferSubagentUserMessage(msg.narratorId, bufferText, {
 							commandText,
 							createdBy: userId,
 							requestSoftStop: !isTakenOver(msg.narratorId),
@@ -1790,42 +1776,16 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "update_buffer": {
-				let ok = updateBufferedMessage(msg.narratorId, msg.messageId, msg.text);
-				let usedSubagentQueue = false;
-				// Fallback: subagent queues live in a separate map, so a taken-over
-				// subagent's queued message is invisible to the primary-narrator path.
-				if (!ok) {
-					try {
-						const { updateSubagentBufferedMessage } = await import("../services/narrator-subagent");
-						ok = updateSubagentBufferedMessage(msg.narratorId, msg.messageId, msg.text);
-						usedSubagentQueue = ok;
-					} catch {
-						// ignore
-					}
-				}
-				if (ok) {
-					await broadcastBufferQueueForNarrator(msg.narratorId, usedSubagentQueue);
-				}
+				const ok = await updateBufferedMessage(msg.narratorId, msg.messageId, msg.text);
+				if (ok) await broadcastBufferQueueForNarrator(msg.narratorId);
 				break;
 			}
 			case "remove_buffer": {
-				let ok = removeBufferedMessage(msg.narratorId, msg.messageId);
-				let usedSubagentQueue = false;
+				const { removeSubagentBufferedMessage } = await import("../services/narrator-subagent");
+				const ok = removeSubagentBufferedMessage(msg.narratorId, msg.messageId);
 				if (ok) {
 					clearBufferedMessageSoftStopIfIdle(msg.narratorId);
-				} else {
-					// removeSubagentBufferedMessage drops the subagent soft stop itself
-					// once the queue empties.
-					try {
-						const { removeSubagentBufferedMessage } = await import("../services/narrator-subagent");
-						ok = removeSubagentBufferedMessage(msg.narratorId, msg.messageId);
-						usedSubagentQueue = ok;
-					} catch {
-						// ignore
-					}
-				}
-				if (ok) {
-					await broadcastBufferQueueForNarrator(msg.narratorId, usedSubagentQueue);
+					await broadcastBufferQueueForNarrator(msg.narratorId);
 				}
 				break;
 			}

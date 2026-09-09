@@ -1,9 +1,10 @@
-import { Database } from "bun:sqlite";
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import type { FileReference, FileReferenceSnapshot } from "@shared/file-reference";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { getTestDb } from "../../../tests/setup";
+import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
 import {
 	parseFileReferenceSnapshotsJson,
@@ -27,33 +28,29 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 		expect(result.status).toBe(0);
 	}, 65_000);
 } else {
-	// No real DB module is imported and no migration is run. Only these two small
-	// tables exist, exposing every column the services under test may read/write.
-	const sqlite = new Database(":memory:");
-	sqlite.exec(`
-CREATE TABLE narrator_drafts (
- id TEXT PRIMARY KEY, user_id TEXT NOT NULL, narrator_id TEXT NOT NULL,
- text TEXT NOT NULL DEFAULT '', file_references_json TEXT,
- source_id TEXT, revision INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
- UNIQUE(user_id, narrator_id)
-);
-CREATE TABLE narrator_buffered_messages (
- id TEXT PRIMARY KEY, narrator_id TEXT NOT NULL, text TEXT NOT NULL,
- images_json TEXT, text_file_paths_json TEXT, file_references_json TEXT,
- command_text TEXT, bash_command TEXT, created_by TEXT, creator_json TEXT,
- priority INTEGER NOT NULL DEFAULT 0, seq INTEGER NOT NULL, buffered_at TEXT NOT NULL
-);
-`);
+	// Isolated in-memory schema includes the durable mailbox identity columns.
+	const { sqlite } = getTestDb();
 	const queries: string[] = [];
 	const db = drizzle({
 		client: sqlite,
-		schema,
+		schema: { ...schema, ...relations },
 		logger: {
 			logQuery(query) {
 				queries.push(query);
 			},
 		},
 	});
+	db.insert(schema.narrators)
+		.values({ id: "n", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+		.run();
+	db.insert(schema.users)
+		.values({
+			id: "u",
+			username: "fixture",
+			passwordHash: "fixture",
+			createdAt: new Date().toISOString(),
+		})
+		.run();
 	mock.module("../../db", () => ({ db, sqlite }));
 	const drafts = await import("../narrator-draft-service");
 	const buffer = await import("../narrator-buffer");
@@ -107,12 +104,10 @@ CREATE TABLE narrator_buffered_messages (
 
 	beforeEach(() => {
 		sqlite.exec("DELETE FROM narrator_drafts; DELETE FROM narrator_buffered_messages;");
-		state.bufferedMessages.clear();
 		state.compactLocks.clear();
 		queries.length = 0;
 	});
 	afterAll(() => {
-		state.bufferedMessages.clear();
 		state.compactLocks.clear();
 		sqlite.close();
 	});
@@ -209,9 +204,9 @@ CREATE TABLE narrator_buffered_messages (
 				"CREATE TRIGGER fail_queue_update BEFORE UPDATE ON narrator_buffered_messages BEGIN SELECT RAISE(ABORT, 'fixture update failed'); END",
 			);
 			try {
-				expect(() =>
+				await expect(
 					buffer.updateBufferedMessage("n", pushed.id, "changed", { fileReferences: [] }),
-				).toThrow();
+				).rejects.toThrow();
 				expect(buffer.getBufferedMessages("n")[0]).toMatchObject({
 					text: "original",
 					fileReferences: [snapshot()],
@@ -267,15 +262,17 @@ CREATE TABLE narrator_buffered_messages (
 		test("text-only edit keeps bytes, replacement swaps them, [] clears metadata and payload", async () => {
 			makeBusy();
 			const pushed = await push("initial", [snapshot()]);
-			buffer.updateBufferedMessage("n", pushed.id, "edited");
+			await buffer.updateBufferedMessage("n", pushed.id, "edited");
 			expect(parseFileReferenceSnapshotsJson(queueRow(pushed.id)?.fileReferencesJson)).toEqual([
 				snapshot(),
 			]);
 			const replacement = snapshot("new");
-			buffer.updateBufferedMessage("n", pushed.id, "new text", { fileReferences: [replacement] });
+			await buffer.updateBufferedMessage("n", pushed.id, "new text", {
+				fileReferences: [replacement],
+			});
 			replacement.snapshotText = "mutated caller";
 			expect(buffer.getBufferedMessages("n")[0].fileReferences).toEqual([snapshot("new")]);
-			buffer.updateBufferedMessage("n", pushed.id, "no refs", { fileReferences: [] });
+			await buffer.updateBufferedMessage("n", pushed.id, "no refs", { fileReferences: [] });
 			expect(queueRow(pushed.id)?.fileReferencesJson).toBeNull();
 			expect(buffer.toBufferSummary(buffer.getBufferedMessages("n"))[0].fileReferences).toEqual([]);
 		});
@@ -292,11 +289,15 @@ CREATE TABLE narrator_buffered_messages (
 			expect(row).toBeDefined();
 			// Same parser as recoverOnStartup, then the normal failed-dispatch restore.
 			const accepted = parseFileReferenceSnapshotsJson(row?.fileReferencesJson);
-			const current = buffer.getBufferedMessages("n").shift();
+			const { createMailboxStore } = await import("../agent-runtime/mailbox");
+			const [claimed] = createMailboxStore(db).claimBatch(
+				"n",
+				{ token: "owner", epoch: "storage-test" },
+				{ count: 1 },
+			);
+			const current = buffer.projectMailboxUserMessage(claimed);
 			expect(current).toBeDefined();
-			if (!current) throw new Error("missing queue row");
-			buffer.dbConsumeBufferedRow(current.id);
-			buffer.restoreBufferedMessage("n", { ...current, fileReferences: accepted });
+			buffer.restoreBufferedMessage("n", current);
 			expect(parseFileReferenceSnapshotsJson(queueRow(priority.id)?.fileReferencesJson)).toEqual([
 				snapshot("first"),
 			]);

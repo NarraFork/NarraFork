@@ -12,9 +12,11 @@ mock.module("@server/services/agent-communication", () => ({
 	...realCommunication,
 	sendSubagentMessageDetailed: async (input: {
 		onTargetResolved?: (id: string) => void;
+		onTargetsResolved?: (count: number) => void;
 		onDeliveryResolved?: (target: { id: string; deliveryMessageId: string }) => void;
 	}) => {
 		input.onTargetResolved?.("resolved-child");
+		if (deliveryTargets.length) input.onTargetsResolved?.(deliveryTargets.length);
 		for (const target of deliveryTargets) input.onDeliveryResolved?.(target);
 		await new Promise<void>((resolve) => {
 			release = resolve;
@@ -82,7 +84,7 @@ test("queued receipts stream before completion and remain in final target metada
 	];
 	const received = new Promise<void>((resolve) => {
 		frameReceived = () => {
-			if (frames.length === 2) resolve();
+			if (frames.length === 3) resolve();
 		};
 	});
 	let completed = false;
@@ -99,21 +101,17 @@ test("queued receipts stream before completion and remain in final target metada
 		});
 	await received;
 	expect(completed).toBe(false);
-	expect(frames).toEqual([
-		{
+	expect(frames).toEqual(
+		[[], [deliveryTargets[0]], [deliveryTargets[1]]].map((targets) => ({
 			type: "send_delivery_resolved",
 			narratorId: "primary",
 			toolUseId: "send-fanout",
-			targets: [deliveryTargets[0]],
-		},
-		{
-			type: "send_delivery_resolved",
-			narratorId: "primary",
-			toolUseId: "send-fanout",
-			targets: deliveryTargets,
-		},
-	]);
+			targetCount: 2,
+			targets,
+		})),
+	);
 	release?.();
 	const result = await waiting;
 	expect(result.metadata?.targets).toEqual(deliveryTargets);
+	expect(result.metadata?.targetCount).toBe(2);
 });

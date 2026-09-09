@@ -193,6 +193,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		}
 		const removeAbort = this.listenForAbort(operation, params.signal);
 		let requestStarted = false;
+		let cancelled = false;
 		try {
 			for await (const event of operation.events()) {
 				if (event.type === "request_started") {
@@ -213,9 +214,14 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 					activeReasoningSource: this.activeReasoningSource,
 				});
 				if (mapped === undefined) continue;
-				if (mapped === CANCELLED) throw createAbortError(params.signal.reason);
+				if (mapped === CANCELLED) {
+					// Drain the RPC generator so its post-done error takes precedence.
+					cancelled = true;
+					continue;
+				}
 				yield mapped;
 			}
+			if (cancelled) throw createAbortError(params.signal.reason);
 		} finally {
 			removeAbort();
 		}
@@ -552,6 +558,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		let text = "";
 		let usage: ProviderUsage | undefined;
 		let credentialId: string | undefined;
+		let cancelled = false;
 		try {
 			for await (const event of operation.events()) {
 				if (event.type.startsWith("tool_call.")) {
@@ -578,7 +585,11 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 							activeReasoningSource: this.activeReasoningSource,
 						});
 					case "done":
-						if (event.status === "cancelled") throw createAbortError(input.options?.signal?.reason);
+						if (event.status === "cancelled") {
+							// Cancellation can precede the RPC generator's original failure.
+							cancelled = true;
+							break;
+						}
 						if (event.status === "failed") {
 							throw new Error(`Provider generation failed (${event.stopReason})`);
 						}
@@ -597,6 +608,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		} finally {
 			removeAbort();
 		}
+		if (cancelled) throw createAbortError(input.options?.signal?.reason);
 		throw new Error("Provider generation ended without a done event");
 	}
 

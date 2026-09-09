@@ -1,6 +1,7 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { clearTimeout as clearNativeTimeout, setTimeout as setNativeTimeout } from "node:timers";
 import { MantineProvider } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import type { FileReference } from "@shared/file-reference";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
@@ -8,6 +9,7 @@ import { parseHTML } from "linkedom";
 import { act, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { api } from "../../lib/api";
 import en from "../../locales/en/narrator.json";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { MessageEditorPanel, type MessageEditorPanelProps } from "./MessageEditorPanel";
@@ -320,6 +322,7 @@ for (const mode of ["message", "queued"] as const) {
 							return false;
 						}}
 						onRemove={() => {}}
+						onRetry={async () => ({ ok: true, resumed: false })}
 						cancelBufferLabel="Cancel"
 						editLabel="Edit"
 						priorityLabel="Priority"
@@ -467,6 +470,173 @@ describe("message reference attachment editor", () => {
 	});
 });
 
+function queueRow(overrides: Partial<ComponentProps<typeof QueuedMessageRow>> = {}) {
+	return (
+		<QueuedMessageRow
+			msg={{
+				id: "queue-message",
+				text: "Original input",
+				bufferedAt: "now",
+				imageCount: 0,
+				state: "failed",
+				error: "Provider refused request",
+				fileReferences: [reference],
+			}}
+			index={0}
+			isEditing={false}
+			onStartEdit={() => {}}
+			onCancelEdit={() => {}}
+			onSaveEdit={async () => false}
+			onRemove={() => {}}
+			onRetry={(id) => api.retryBufferedMessage("target-narrator", id)}
+			cancelBufferLabel="Cancel"
+			editLabel="Edit"
+			priorityLabel="Priority"
+			priorityNextRequestLabel="Next"
+			{...overrides}
+		/>
+	);
+}
+
+describe("failed queued message retry UI", () => {
+	test("failed rows show full reason, input, attachments and explicit retry; queued/legacy rows do not", async () => {
+		await render(queueRow());
+		expect(document.body.textContent).toContain(en.queuedFailed);
+		expect(document.body.textContent).toContain("Provider refused request");
+		expect(document.body.textContent).toContain("Original input");
+		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+		expect(button(en.queuedRetry).disabled).toBe(false);
+		for (const state of ["queued", undefined] as const) {
+			await render(
+				queueRow({
+					msg: {
+						id: "queue-message",
+						text: "Still queued",
+						bufferedAt: "now",
+						imageCount: 0,
+						state,
+					},
+				}),
+			);
+			expect(document.body.textContent).toContain("Still queued");
+			expect(document.body.textContent).not.toContain(en.queuedFailed);
+			expect(document.body.textContent).not.toContain(en.queuedRetry);
+		}
+	});
+
+	test("missing failure reason gets a visible fallback", async () => {
+		await render(
+			queueRow({
+				msg: {
+					id: "queue-message",
+					text: "Input",
+					bufferedAt: "now",
+					imageCount: 0,
+					state: "failed",
+					error: null,
+				},
+			}),
+		);
+		expect(document.body.textContent).toContain(en.queuedFailureUnknown);
+	});
+
+	test("POST targets narrator/message once while pending, failure preserves data and resumed=false only says requeued", async () => {
+		const originalFetch = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+		const originalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+		const notice = spyOn(notifications, "show").mockImplementation(() => "notice");
+		const requests: { url: string; method: string | undefined }[] = [];
+		let respond: ((response: Response) => void) | undefined;
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: { getItem: () => null },
+		});
+		Object.defineProperty(globalThis, "fetch", {
+			configurable: true,
+			value: (url: string, init: RequestInit) => {
+				requests.push({ url, method: init.method });
+				return new Promise<Response>((resolve) => {
+					respond = resolve;
+				});
+			},
+		});
+		try {
+			await render(queueRow());
+			const retry = button(en.queuedRetry);
+			await act(async () => {
+				retry.dispatchEvent(new Event("click", { bubbles: true }));
+				retry.dispatchEvent(new Event("click", { bubbles: true }));
+				await flush();
+			});
+			expect(requests).toEqual([
+				{ url: "/api/narrators/target-narrator/buffer/queue-message/retry", method: "POST" },
+			]);
+			expect(retry.disabled).toBe(true);
+			await act(async () => {
+				respond?.(Response.json({ error: "Retry network failure" }, { status: 503 }));
+				await flush();
+			});
+			expect(retry.disabled).toBe(false);
+			expect(document.body.textContent).toContain("Retry network failure");
+			expect(document.body.textContent).toContain("Provider refused request");
+			expect(document.body.textContent).toContain("Original input");
+			expect(document.body.textContent).toContain("#file:a.ts:2-2");
+			expect(notice).not.toHaveBeenCalled();
+			await click(retry);
+			expect(requests).toHaveLength(2);
+			await act(async () => {
+				respond?.(Response.json({ ok: true, resumed: false }));
+				await flush();
+			});
+			expect(notice).toHaveBeenCalledWith({ color: "blue", message: "Message requeued." });
+			expect(document.body.textContent).not.toContain("Retry network failure");
+		} finally {
+			notice.mockRestore();
+			for (const [key, descriptor] of [
+				["fetch", originalFetch],
+				["localStorage", originalStorage],
+			] as const) {
+				if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+				else Reflect.deleteProperty(globalThis, key);
+			}
+		}
+	});
+
+	test("editing a failed row preserves its reason and draft on save failure without retrying", async () => {
+		const retry = mock(async () => ({ ok: true as const, resumed: false }));
+		const save = mock(async () => false);
+		await render(queueRow({ isEditing: true, onRetry: retry, onSaveEdit: save }));
+		await editRange(0, "Original input".length, "Changed draft");
+		await editorKey("Enter");
+		expect(save).toHaveBeenCalledTimes(1);
+		expect(textareaProps().textarea.value).toBe("Changed draft");
+		expect(document.body.textContent).toContain("Provider refused request");
+		expect(retry).not.toHaveBeenCalled();
+	});
+
+	test("saving a failed edit does not retry; cancel still removes the same message", async () => {
+		const retry = mock(async () => ({ ok: true as const, resumed: false }));
+		const cancelEdit = mock(() => {});
+		const remove = mock(() => {});
+		await render(
+			queueRow({
+				isEditing: true,
+				onRetry: retry,
+				onSaveEdit: async () => true,
+				onCancelEdit: cancelEdit,
+			}),
+		);
+		await editorKey("Enter");
+		expect(cancelEdit).toHaveBeenCalledTimes(1);
+		expect(retry).not.toHaveBeenCalled();
+		await render(queueRow({ onRetry: retry, onRemove: remove }));
+		const cancel = document.querySelector('button[title="Cancel"]');
+		if (!cancel) throw new Error("Cancel button missing");
+		await click(cancel);
+		expect(remove).toHaveBeenCalledWith("queue-message");
+		expect(retry).not.toHaveBeenCalled();
+	});
+});
+
 describe("queued reference attachment editor", () => {
 	test("collapsed preview shows reference-only attachments", async () => {
 		await render(
@@ -496,6 +666,7 @@ describe("queued reference attachment editor", () => {
 					return false;
 				}}
 				onRemove={() => {}}
+				onRetry={async () => ({ ok: true, resumed: false })}
 				cancelBufferLabel="Cancel"
 				editLabel="Edit"
 				priorityLabel="Priority"

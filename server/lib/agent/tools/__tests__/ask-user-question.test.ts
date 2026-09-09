@@ -128,7 +128,11 @@ describe("AskUserQuestion — async mode predicates", () => {
 		// Without this the async mode is a one-way street: the agent can defer a question
 		// but has no documented way to block on it when the answer finally does decide its
 		// next step, so it either guesses or re-asks synchronously.
-		expect(askUserQuestionTool.description).toContain('Await({ type: "question"');
+		const description =
+			typeof askUserQuestionTool.description === "function"
+				? askUserQuestionTool.description({} as import("../../types").AgentConfig)
+				: askUserQuestionTool.description;
+		expect(description).toContain('Await({ type: "question"');
 	});
 
 	test("a user-deferred call is validated like any other async submission", () => {

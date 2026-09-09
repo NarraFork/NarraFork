@@ -19,7 +19,17 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { planResumedBackgroundTaskNotice } from "../subagent-runner";
+import { eq } from "drizzle-orm";
+import { cleanDb } from "../../../tests/setup";
+import { db, sqlite } from "../../db";
+import { narratorBufferedMessages, narrators } from "../../db/schema";
+import { runtimePublication } from "../agent-runtime/publication";
+import { projectPendingInjection } from "../parent-injection-queue";
+import {
+	announceResumedBackgroundTask,
+	commitResumedBackgroundTaskAnnouncement,
+	planResumedBackgroundTaskNotice,
+} from "../subagent-runner";
 
 describe("planResumedBackgroundTaskNotice", () => {
 	it("delivers and wakes for an ordinary manual continuation", () => {
@@ -132,15 +142,65 @@ describe("the announcement is handed to the caller, not fired by the runner", ()
 		expect(announce).toBeGreaterThan(conclusion);
 	});
 
-	it("carries no result text, so the output is not duplicated in one request", async () => {
-		const source = await Bun.file(new URL("../subagent-runner.ts", import.meta.url)).text();
-		const start = source.indexOf("export async function announceResumedBackgroundTask");
-		expect(start).toBeGreaterThan(-1);
-		const body = source.slice(start, source.indexOf("\n}", start));
-		// The rewritten tool result is the delivery channel for the output itself; this
-		// row only says the run ended and points at where to read it.
-		expect(body).not.toContain("finalText");
-		expect(body).not.toContain("pushBgCompletionNotification");
-		expect(body).toContain('schedule: wakeParent ? "wakeIfIdle" : "none"');
-	});
+	for (const status of ["completed", "cancelled"] as const) {
+		it(`projects only the conclusion pointer and ${status === "completed" ? "wakes once" : "does not wake after stop"}`, async () => {
+			cleanDb(sqlite);
+			// Step the actual worker explicitly; no provider request or timing race.
+			runtimePublication.stop();
+			let wakes = 0;
+			runtimePublication.setWake(() => {
+				wakes++;
+			});
+			const time = new Date().toISOString();
+			db.insert(narrators)
+				.values([
+					{ id: "notice-parent", createdAt: time, updatedAt: time },
+					{
+						id: "notice-child",
+						parentNarratorId: "notice-parent",
+						type: "subagent",
+						variant: "subagent:general",
+						createdAt: time,
+						updatedAt: time,
+					},
+				])
+				.run();
+			const run = runtimePublication.startAgentRun({
+				narratorId: "notice-child",
+				parentNarratorId: "notice-parent",
+			});
+			const notice = {
+				subagentId: "notice-child",
+				parentNarratorId: "notice-parent",
+				logicalRunId: run.logicalRunId,
+				status,
+				wakeParent: status === "completed",
+				locale: "en" as const,
+			};
+			const result = "PRIVATE FINAL RESULT MUST NOT BE INJECTED AGAIN";
+			try {
+				db.transaction((tx) => commitResumedBackgroundTaskAnnouncement(notice, result, tx));
+				await announceResumedBackgroundTask(notice);
+				runtimePublication.flushRecipient("notice-parent");
+				await announceResumedBackgroundTask(notice);
+				runtimePublication.flushRecipient("notice-parent");
+				const rows = db
+					.select()
+					.from(narratorBufferedMessages)
+					.where(eq(narratorBufferedMessages.narratorId, "notice-parent"))
+					.all();
+				expect(rows).toHaveLength(1);
+				expect(rows[0].text).not.toContain(result);
+				const projected = projectPendingInjection(rows[0]);
+				expect(projected.kind).toBe("bg_agent");
+				if (projected.kind !== "bg_agent") throw new Error("Expected task notice projection");
+				expect(projected.task.result).toBeUndefined();
+				expect(projected.task.resultPreview).not.toContain(result);
+				expect(wakes).toBe(status === "completed" ? 1 : 0);
+			} finally {
+				runtimePublication.setWake(undefined);
+				cleanDb(sqlite);
+			}
+		});
+	}
 });

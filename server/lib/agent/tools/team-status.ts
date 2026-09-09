@@ -1,5 +1,23 @@
 import { z } from "zod/v4";
-import type { ToolDefinition, ToolResult } from "../types";
+import type { ToolContext, ToolDefinition, ToolResult } from "../types";
+
+async function reportTeamSendTargetCount(ctx: ToolContext, count: number): Promise<void> {
+	if (!ctx.currentToolUseId) return;
+	try {
+		const { broadcastSendDeliveryResolved } = await import(
+			"@server/services/send-delivery-resolution"
+		);
+		await broadcastSendDeliveryResolved(
+			ctx.narratorId,
+			ctx.currentToolUseId,
+			[],
+			ctx.toolCallBinding,
+			count,
+		);
+	} catch {
+		// Display metadata must not prevent a message from being sent.
+	}
+}
 
 type TeamAction = "list" | "list_agents" | "list_bash" | "file_changes" | "broadcast" | "send";
 
@@ -328,10 +346,12 @@ export const teamStatusTool: ToolDefinition = {
 							broadcast: true,
 							await: false,
 							targets: [],
+							targetCount: 0,
 							warning: `No ${targetKind} to broadcast to.`,
 						},
 					};
 				}
+				await reportTeamSendTargetCount(ctx, targets.length);
 				const senderType = teamMemberType(sender.variant);
 				const now = new Date().toISOString();
 				const msg: TeamMessage = {
@@ -340,6 +360,7 @@ export const teamStatusTool: ToolDefinition = {
 					fromLabel: agentLabelFromNarrator(sender, parentNarratorId),
 					fromType: senderType,
 					fromToolUseId: ctx.currentToolUseId,
+					fromToolCallBinding: ctx.toolCallBinding,
 					text: message,
 					timestamp: now,
 					isBroadcast: true,
@@ -371,6 +392,7 @@ export const teamStatusTool: ToolDefinition = {
 									warning: `${nonWorking.length} target(s) not currently working — messages may not be received`,
 								}
 							: {}),
+						targetCount: targets.length,
 						targets: targets.map((target) => ({
 							id: target.id,
 							deliveryMessageId: deliveryIds.get(target.id),
@@ -405,6 +427,7 @@ export const teamStatusTool: ToolDefinition = {
 						isError: true,
 					};
 				}
+				await reportTeamSendTargetCount(ctx, 1);
 				const sendSenderType = teamMemberType(sender.variant);
 				const now = new Date().toISOString();
 				const msg: TeamMessage = {
@@ -413,6 +436,7 @@ export const teamStatusTool: ToolDefinition = {
 					fromLabel: agentLabelFromNarrator(sender, parentNarratorId),
 					fromType: sendSenderType,
 					fromToolUseId: ctx.currentToolUseId,
+					fromToolCallBinding: ctx.toolCallBinding,
 					text: message,
 					timestamp: now,
 					isBroadcast: false,
@@ -430,6 +454,7 @@ export const teamStatusTool: ToolDefinition = {
 						kind: "send",
 						broadcast: false,
 						await: false,
+						targetCount: 1,
 						...(warning ? { warning: warning.trim() } : {}),
 						targets: [
 							{

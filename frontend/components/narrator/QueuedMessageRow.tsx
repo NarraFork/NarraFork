@@ -21,6 +21,7 @@ import {
 	ActionIcon,
 	Badge,
 	Box,
+	Button,
 	CloseButton,
 	Group,
 	Stack,
@@ -87,6 +88,7 @@ export interface QueuedMessageRowProps {
 		payload: QueuedEditPayload,
 	) => Promise<boolean>;
 	onRemove: (id: string) => void;
+	onRetry: (id: string) => Promise<{ ok: true; resumed: boolean }>;
 	cancelBufferLabel: string;
 	editLabel: string;
 	priorityLabel: string;
@@ -151,6 +153,7 @@ export function QueuedMessageRow({
 	onCancelEdit,
 	onSaveEdit,
 	onRemove,
+	onRetry,
 	cancelBufferLabel,
 	editLabel,
 	priorityLabel,
@@ -166,6 +169,41 @@ export function QueuedMessageRow({
 		opacity: isDragging ? 0.5 : 1,
 	};
 	const priorityText = index === 0 ? priorityNextRequestLabel : priorityLabel;
+	const failed = msg.state === "failed";
+	const [retrying, setRetrying] = useState(false);
+	const retryingRef = useRef(false);
+	const [retryError, setRetryError] = useState<string | null>(null);
+	const retry = async () => {
+		if (retryingRef.current || !failed) return;
+		retryingRef.current = true;
+		setRetrying(true);
+		setRetryError(null);
+		try {
+			await onRetry(msg.id);
+			// Admission may leave this queued without waking a narrator. Never claim execution.
+			notifications.show({ color: "blue", message: t("queuedRetrySuccess") });
+		} catch (error) {
+			setRetryError(error instanceof Error ? error.message : String(error));
+		} finally {
+			retryingRef.current = false;
+			setRetrying(false);
+		}
+	};
+	const failureNotice = failed ? (
+		<Stack gap={2}>
+			<Text size="xs" c="red" fw={500}>
+				{t("queuedFailed")}
+			</Text>
+			<Text size="xs" c="red" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+				{msg.error || t("queuedFailureUnknown")}
+			</Text>
+			{retryError && (
+				<Text size="xs" c="red" role="alert" style={{ overflowWrap: "anywhere" }}>
+					{t("queuedRetryFailed", { error: retryError })}
+				</Text>
+			)}
+		</Stack>
+	) : null;
 
 	const [text, setText] = useState(msg.text);
 	const [keptImages, setKeptImages] = useState<BufferedImageSummary[]>([]);
@@ -410,14 +448,30 @@ export function QueuedMessageRow({
 						{priorityText}
 					</Badge>
 				)}
-				<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
-					{msg.text}
-				</Text>
+				<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
+					<Text size="xs" c="blue" truncate>
+						{msg.text}
+					</Text>
+					{failureNotice}
+				</Stack>
+				{failed && (
+					<Button
+						size="compact-xs"
+						color="red"
+						variant="light"
+						loading={retrying}
+						disabled={retrying}
+						onClick={() => void retry()}
+					>
+						{t("queuedRetry")}
+					</Button>
+				)}
 				<ActionIcon
 					size="xs"
 					variant="subtle"
 					color="blue"
 					onClick={() => onStartEdit(msg)}
+					disabled={retrying}
 					title={editLabel}
 				>
 					<IconPencil size={12} />
@@ -447,6 +501,7 @@ export function QueuedMessageRow({
 				</Text>,
 			)}
 			<Stack gap={6} style={{ flex: 1, minWidth: 0 }}>
+				{failureNotice}
 				<Textarea
 					ref={textareaRef}
 					size="xs"

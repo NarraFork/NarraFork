@@ -12,9 +12,9 @@ import {
 	projectFileReferenceText,
 } from "../lib/agent/file-reference-projection";
 import type { ToolCallBinding, ToolUpdateExecutionLease } from "../lib/agent/types";
-import { ValidationError } from "../lib/errors";
+import { withDbRetry } from "../lib/db-resilience";
+import { AppError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
-import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
@@ -35,14 +35,21 @@ import {
 } from "../lib/settings";
 import { type ImageRef, saveTextFileToWorktree, type TextFileRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import type { RuntimeForegroundControl } from "./agent-runtime/input";
+import {
+	createRuntimeMapView,
+	type ExecutionOwner,
+	setExecutionSuspended,
+	tryClaimExecution,
+} from "./agent-runtime/ownership";
+import { resolveRuntimePolicy } from "./agent-runtime/policy";
+import { publicationEvent, runtimePublication } from "./agent-runtime/publication";
+import type { PublicationRun } from "./agent-runtime/publication-outbox";
 import { backgroundTaskService, getBackgroundTaskTerminalVersion } from "./background-task-service";
 import { pushBgCompletionNotification } from "./bg-completion-queue";
 import { customSubagentService } from "./custom-subagent-service";
 import { narratorService } from "./narrator-service";
-import {
-	getSubagentResultMessageId,
-	startBackgroundCompletionContinuationIfPossible,
-} from "./narrator-session";
+import { getSubagentResultMessageId } from "./narrator-session";
 import { withNarratorStartAdmission, withNarratorWorkAdmission } from "./narrator-session-state";
 import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
 import {
@@ -64,14 +71,10 @@ import {
 } from "./subagent-executor";
 import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentLabelFromNarrator, agentResultTag, resolveAgentLabel } from "./subagent-label";
-import { resumeManualOverride, waitForManualOverride } from "./subagent-manual-override";
 import {
-	beginSubagentInterruptSuspension,
 	clearTakenOver,
 	consumePendingBackgroundFinalize,
-	consumePendingStopTakeover,
 	isBackgroundTakenOver,
-	isTakenOver,
 } from "./subagent-takeover";
 import { broadcastSubagentTakeoverChanged } from "./subagent-takeover-broadcast";
 import { clearTeamInbox } from "./subagent-team";
@@ -100,16 +103,19 @@ export interface RunningSubagentExecutionSnapshot {
 	timeoutMs: number | null;
 	executionDeadlineAt: string | null;
 	background: boolean;
+	logicalRunId?: string;
 }
 
 interface RunningSubagentExecutionEntry extends RunningSubagentExecutionSnapshot {
 	token: string;
 }
 
-const runningSubagentExecutions = hotSafe<Map<string, RunningSubagentExecutionEntry>>(
-	"narrafork:runningSubagentExecutions",
-	() => new Map(),
-);
+const runningSubagentExecutions = createRuntimeMapView("subagentExecution");
+runtimePublication.setLegacyRuntimeAdmissionReader("agent", (source) => {
+	const admitted = runningSubagentExecutions.get(source.taskId);
+	if (!admitted || admitted.parentNarratorId !== source.recipientId) return undefined;
+	return { ...source, startedAtMs: admitted.startedAt };
+});
 
 export function listRunningSubagentExecutions(): RunningSubagentExecutionSnapshot[] {
 	return [...runningSubagentExecutions.values()].map(({ token: _token, ...entry }) => entry);
@@ -247,7 +253,11 @@ async function finalizeBackgroundCompletion(
 	locale: Locale = "en",
 	timeoutMs?: number,
 	expectedAbortController?: AbortController,
+	deferPublication = false,
 ): Promise<void> {
+	// Await/event waiters are part of terminal publication too. Keep the task running
+	// until the outer exact-origin transaction commits, not only its mailbox notice.
+	if (deferPublication) return;
 	const timeoutText = timeoutMs
 		? `Background task timed out after ${timeoutMs}ms`
 		: "Background task timed out";
@@ -263,6 +273,7 @@ async function finalizeBackgroundCompletion(
 						storedText,
 						undefined,
 						expectedAbortController,
+						{ deferPublication },
 					)
 				: outcome === "failed"
 					? await backgroundTaskService.markFailed(
@@ -270,26 +281,43 @@ async function finalizeBackgroundCompletion(
 							storedText,
 							undefined,
 							expectedAbortController,
+							{ deferPublication },
 						)
 					: await backgroundTaskService.markCompleted(
 							narratorId,
 							storedText,
 							undefined,
 							expectedAbortController,
+							{ deferPublication },
 						);
 		if (!transitioned) return;
 	}
 
 	const now = new Date().toISOString();
-	await db
-		.update(narrators)
-		.set({
-			backgroundStatus: outcome === "completed" ? "completed" : "failed",
-			backgroundResult: storedText,
-			backgroundCompletedAt: now,
-			updatedAt: now,
-		})
-		.where(eq(narrators.id, narratorId));
+	db.transaction((tx) => {
+		tx.update(narrators)
+			.set({
+				backgroundStatus: outcome === "completed" ? "completed" : "failed",
+				backgroundResult: storedText,
+				backgroundCompletedAt: now,
+				updatedAt: now,
+			})
+			.where(eq(narrators.id, narratorId))
+			.run();
+		// Old detached runners may have no task projection. They still publish atomically.
+		if (!task && !deferPublication) {
+			const run = runtimePublication.getAgentRun(narratorId, parentNarratorId, tx);
+			runtimePublication.commit(
+				{
+					...run,
+					eventKind: publicationEvent(outcome),
+					resultRef: runtimePublication.persistResult(run, storedText, tx),
+					summary: `[System] Background agent (ID: ${narratorId}) ${outcome}. Use Await({ type: "agent", id: "${narratorId}" }) to read its stored result.`,
+				},
+				tx,
+			);
+		}
+	});
 
 	const subNarrator = await narratorService.getById(narratorId).catch(() => null);
 	const title = subNarrator?.title ?? narratorId;
@@ -361,13 +389,8 @@ async function finalizeBackgroundCompletion(
 		});
 	}
 
-	startBackgroundCompletionContinuationIfPossible(parentNarratorId, locale).catch((err) => {
-		logger.warn("Failed to start parent narrator for background task completion", {
-			parentNarratorId,
-			taskNarratorId: narratorId,
-			error: err instanceof Error ? err.message : String(err),
-		});
-	});
+	void locale;
+	runtimePublication.schedule();
 }
 
 async function isBackgroundTaskCancelled(taskId: string): Promise<boolean> {
@@ -394,6 +417,7 @@ export interface ResumedBackgroundTaskNoticePlan {
 
 /** What the resume path needs to announce an ended continuation, once it is safe to. */
 export interface ResumedBackgroundTaskAnnouncement {
+	logicalRunId?: string;
 	subagentId: string;
 	parentNarratorId: string;
 	status: ResumedBackgroundTaskNoticePlan["status"];
@@ -447,6 +471,8 @@ export function planResumedBackgroundTaskNotice(input: {
 	preserveBackground?: boolean;
 	/** True when this run does NOT rewrite the historical Agent tool result. */
 	skipConclusionDelivery?: boolean;
+	/** Result publication is owned by the outer exact-origin conclusion transaction. */
+	deferCompletionPublication?: boolean;
 	timedOut: boolean;
 	interrupted: boolean;
 	hasError: boolean;
@@ -460,7 +486,9 @@ export function planResumedBackgroundTaskNotice(input: {
 				: "completed";
 	return {
 		status,
-		deliver: input.preserveBackground !== true && input.skipConclusionDelivery !== true,
+		deliver:
+			(input.preserveBackground !== true || input.deferCompletionPublication === true) &&
+			input.skipConclusionDelivery !== true,
 		wakeParent: !input.interrupted,
 	};
 }
@@ -486,7 +514,7 @@ async function notifyParentOfResumedBackgroundTask(
 	notice: ResumedBackgroundTaskNotice,
 ): Promise<void> {
 	const { subagentId, parentNarratorId, subagent, locale } = notice;
-	try {
+	{
 		const alias = agentLabelFromNarrator(subagent, parentNarratorId);
 		const title = subagent.title?.trim() || alias;
 		const isZh = locale === "zh-CN";
@@ -495,23 +523,19 @@ async function notifyParentOfResumedBackgroundTask(
 				`它先前的结果已经作废；请用 Await({ type: "agent", id: "${alias}" }) 获取新的结果。`
 			: `[System] Background agent "${title}" (ID: ${alias}) has been restarted and is running again. ` +
 				`Its earlier result is superseded; use Await({ type: "agent", id: "${alias}" }) for the new one.`;
-		const { deliverInjection } = await import("./narrator-injection");
-		await deliverInjection(parentNarratorId, {
-			content,
-			// Same producer tag as the completion notice: to a reader this row belongs to
-			// the same background-agent stream, and reusing the tag means no new copy and
-			// no new card path.
-			source: "bg_agent",
-			body: { kind: "prose", text: content },
-			schedule: "none",
-			locale,
-		});
-	} catch (err) {
-		logger.warn("Failed to notify parent about a resumed background task", {
-			parentNarratorId,
-			subagentId,
-			error: err instanceof Error ? err.message : String(err),
-		});
+		const run = runtimePublication.getAgentRun(subagentId, parentNarratorId);
+		db.transaction((tx) =>
+			runtimePublication.commit(
+				{
+					...run,
+					eventKind: "started",
+					resultRef: `narrator:${subagentId}:${run.logicalRunId}`,
+					summary: content,
+				},
+				tx,
+			),
+		);
+		runtimePublication.schedule();
 	}
 }
 
@@ -539,41 +563,51 @@ async function notifyParentOfResumedBackgroundTask(
 export async function announceResumedBackgroundTask(
 	notice: ResumedBackgroundTaskAnnouncement,
 ): Promise<void> {
-	const { subagentId, parentNarratorId, status, wakeParent, locale } = notice;
+	// Both task status/control waiters and the content notice follow the same commit.
 	try {
-		const subNarrator = await narratorService.getById(subagentId).catch(() => null);
-		const alias = subNarrator
-			? agentLabelFromNarrator(subNarrator, parentNarratorId)
-			: await resolveAgentLabel(parentNarratorId, subagentId);
-		const title = subNarrator?.title?.trim() || alias;
-		// Same vocabulary the background path uses, so the model reads one wording for
-		// "this background agent ended this way" regardless of who drove the run.
-		const statusWord = status === "timeout" ? "timed out" : status;
-		const content =
-			locale === "zh-CN"
-				? `[系统] 子代理"${title}"（ID: ${alias}）的重新运行已结束（${statusWord}）。` +
-					`它的结果已写回原来的 Agent 工具调用结果中；如需完整内容可用 ` +
-					`Await({ type: "agent", id: "${alias}" }) 查看。`
-				: `[System] Subagent "${title}" (ID: ${alias}) finished its restarted run (${statusWord}). ` +
-					`Its result has been written back into the original Agent tool result; use ` +
-					`Await({ type: "agent", id: "${alias}" }) for the stored output.`;
-		const { deliverInjection } = await import("./narrator-injection");
-		await deliverInjection(parentNarratorId, {
-			// Same producer tag as the restart notice and the ordinary completion path, so
-			// this row reads as part of one background-agent stream.
-			source: "bg_agent",
-			content,
-			body: { kind: "prose", text: content },
-			schedule: wakeParent ? "wakeIfIdle" : "none",
-			locale,
-		});
-	} catch (err) {
-		logger.warn("Failed to deliver a resumed background task result to the parent", {
-			parentNarratorId,
-			subagentId,
-			error: err instanceof Error ? err.message : String(err),
-		});
+		await backgroundTaskService.announcePersistedAgentTerminal(
+			notice.subagentId,
+			notice.logicalRunId,
+		);
+	} finally {
+		runtimePublication.schedule();
 	}
+}
+
+export function commitResumedBackgroundTaskAnnouncement(
+	notice: ResumedBackgroundTaskAnnouncement,
+	finalText: string,
+	tx: import("./agent-runtime/mailbox-types").RuntimeTx,
+): void {
+	const run = runtimePublication.getAgentRun(notice.subagentId, notice.parentNarratorId, tx);
+	if (notice.logicalRunId && notice.logicalRunId !== run.logicalRunId) {
+		throw new ValidationError("Stale resumed task publication");
+	}
+	const source = tx
+		.select({ id: narrators.id, traits: narrators.traits, title: narrators.title })
+		.from(narrators)
+		.where(eq(narrators.id, notice.subagentId))
+		.get();
+	const alias = source
+		? agentLabelFromNarrator(source, notice.parentNarratorId)
+		: notice.subagentId;
+	const title = source?.title?.slice(0, 80) ?? alias;
+	backgroundTaskService.commitResumedPublicationTask(
+		notice.subagentId,
+		run.logicalRunId,
+		notice.status,
+		finalText,
+		tx,
+	);
+	runtimePublication.commit(
+		{
+			...run,
+			eventKind: publicationEvent(notice.status),
+			resultRef: `conclusion:${runtimePublication.persistResult(run, finalText, tx)}`,
+			summary: `[System] Agent "${title}" (ID: ${alias}) ${notice.status}. Its restarted run has ended; use Await({ type: "agent", id: "${alias}" }) for the stored result.`,
+		},
+		tx,
+	);
 }
 
 /**
@@ -600,16 +634,28 @@ async function finalizeTakenOverBackgroundSubagentUnlocked(
 	locale: Locale = "en",
 ): Promise<void> {
 	const now = new Date().toISOString();
-	await db
-		.update(narrators)
-		.set({
-			isBackground: true,
-			backgroundStatus: hasError ? "failed" : "completed",
-			backgroundResult: finalText || "(no output)",
-			backgroundCompletedAt: now,
-			updatedAt: now,
-		})
-		.where(eq(narrators.id, narratorId));
+	db.transaction((tx) => {
+		tx.update(narrators)
+			.set({
+				isBackground: true,
+				backgroundStatus: hasError ? "failed" : "completed",
+				backgroundResult: finalText || "(no output)",
+				backgroundCompletedAt: now,
+				updatedAt: now,
+			})
+			.where(eq(narrators.id, narratorId))
+			.run();
+		const run = runtimePublication.getAgentRun(narratorId, parentNarratorId, tx);
+		runtimePublication.commit(
+			{
+				...run,
+				eventKind: hasError ? "failed" : "completed",
+				resultRef: runtimePublication.persistResult(run, finalText || "(no output)", tx),
+				summary: `[System] Background agent (ID: ${narratorId}) ${hasError ? "failed" : "completed"}. Use Await({ type: "agent", id: "${narratorId}" }) to read the stored result.`,
+			},
+			tx,
+		);
+	});
 
 	// Restore the background task row (set to "cancelled" during takeover) to its
 	// real terminal result so the parent's Await path returns the actual output
@@ -677,13 +723,8 @@ async function finalizeTakenOverBackgroundSubagentUnlocked(
 		});
 	}
 
-	startBackgroundCompletionContinuationIfPossible(parentNarratorId, locale).catch((err) => {
-		logger.warn("Failed to start parent narrator for taken-over background completion", {
-			parentNarratorId,
-			taskNarratorId: narratorId,
-			error: err instanceof Error ? err.message : String(err),
-		});
-	});
+	void locale;
+	runtimePublication.schedule();
 }
 
 /**
@@ -799,11 +840,50 @@ export function broadcastSubagentStarted(
  * Updates narrator status and broadcasts events on completion/failure.
  */
 export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<void> {
-	return withNarratorWorkAdmission(opts.narratorId, () => executeBackgroundTaskUnlocked(opts));
+	const launch = await withNarratorStartAdmission(opts.narratorId, async () => {
+		const owner = claimSubagentExecution(opts.narratorId);
+		const wakePolicy = { allowInboxWake: false };
+		return {
+			completion: withNarratorWorkAdmission(opts.narratorId, () =>
+				executeBackgroundTaskUnlocked(opts, owner, wakePolicy),
+			).finally(() => releaseSubagentPublicationOwner(owner, wakePolicy.allowInboxWake)),
+		};
+	});
+	return launch.completion;
 }
 
-async function executeBackgroundTaskUnlocked(opts: SubagentExecOptions): Promise<void> {
+function releaseSubagentPublicationOwner(owner: ExecutionOwner, allowInboxWake: boolean): void {
+	const narratorId = owner.narratorId;
+	if (!owner.isCurrent()) return;
+	owner.release();
+	// Failed/runtime-paused turns retain queued input until an explicit retry.
+	if (!allowInboxWake) return;
+	void import("./agent-runtime/inbox")
+		.then(({ wakeInboxIfEligible }) => wakeInboxIfEligible(narratorId))
+		.catch((error) =>
+			logger.warn("Deferred subagent inbox wake after publication", {
+				narratorId,
+				error: String(error),
+			}),
+		);
+}
+
+/** Reject before installing runner controls or entering error-to-publication handling. */
+function claimSubagentExecution(narratorId: string): ExecutionOwner {
+	const owner = tryClaimExecution(narratorId, "subagent");
+	if (!owner) {
+		throw new AppError("Narrator already has an execution owner", 409, "NARRATOR_EXECUTION_BUSY");
+	}
+	return owner;
+}
+
+async function executeBackgroundTaskUnlocked(
+	opts: SubagentExecOptions,
+	owner: ExecutionOwner,
+	wakePolicy: { allowInboxWake: boolean },
+): Promise<void> {
 	const { narratorId, parentNarratorId, toolUseId, locale, updateLease } = opts;
+	const publicationRun = runtimePublication.getAgentRun(narratorId, parentNarratorId);
 	const backgroundAbortController = getBackgroundAbortControllers().get(narratorId);
 	const executionStartedAt = Date.now();
 	const {
@@ -834,6 +914,7 @@ async function executeBackgroundTaskUnlocked(opts: SubagentExecOptions): Promise
 		timeoutMs: timeoutLabelMs ?? null,
 		executionDeadlineAt,
 		background: true,
+		logicalRunId: publicationRun.logicalRunId,
 	});
 	let timedOut = false;
 	const onTimeout = () => {
@@ -844,11 +925,15 @@ async function executeBackgroundTaskUnlocked(opts: SubagentExecOptions): Promise
 	if (executionTimeout?.signal.aborted) onTimeout();
 
 	try {
-		const result = await executeSubagent({
-			...opts,
-			fileChangeStartedAt: new Date(executionStartedAt).toISOString(),
-		});
+		const result = await executeSubagent(
+			{
+				...opts,
+				fileChangeStartedAt: new Date(executionStartedAt).toISOString(),
+			},
+			owner,
+		);
 
+		wakePolicy.allowInboxWake = result.allowInboxWake;
 		const timeoutText = timeoutLabelMs
 			? `Background task timed out after ${timeoutLabelMs}ms`
 			: "Background task timed out";
@@ -869,7 +954,7 @@ async function executeBackgroundTaskUnlocked(opts: SubagentExecOptions): Promise
 		});
 		const hasError = outcome !== "completed";
 
-		if (await isBackgroundTaskCancelled(narratorId)) return;
+		if ((await isBackgroundTaskCancelled(narratorId)) || !owner.isCurrent()) return;
 
 		// Background takeover: the user claimed this task's result. Do NOT
 		// finalize/notify as completed/failed — transition to the idle takeover
@@ -903,9 +988,10 @@ async function executeBackgroundTaskUnlocked(opts: SubagentExecOptions): Promise
 			toolUseId,
 			hasError,
 			hasError ? finalText : null,
-			{ timedOut },
+			{ timedOut, owner },
 		);
 
+		if (!owner.isCurrent()) return;
 		await finalizeBackgroundCompletion(
 			narratorId,
 			parentNarratorId,
@@ -917,7 +1003,8 @@ async function executeBackgroundTaskUnlocked(opts: SubagentExecOptions): Promise
 			backgroundAbortController,
 		);
 	} catch (err) {
-		if (await isBackgroundTaskCancelled(narratorId)) return;
+		wakePolicy.allowInboxWake = false;
+		if ((await isBackgroundTaskCancelled(narratorId)) || !owner.isCurrent()) return;
 
 		// Background takeover during execution — same as above, including the
 		// already-released case.
@@ -947,7 +1034,11 @@ async function executeBackgroundTaskUnlocked(opts: SubagentExecOptions): Promise
 			timedOut,
 		});
 
-		await finalizeSubagent(narratorId, parentNarratorId, toolUseId, true, errorText, { timedOut });
+		await finalizeSubagent(narratorId, parentNarratorId, toolUseId, true, errorText, {
+			timedOut,
+			owner,
+		});
+		if (!owner.isCurrent()) return;
 		await finalizeBackgroundCompletion(
 			narratorId,
 			parentNarratorId,
@@ -971,7 +1062,7 @@ async function executeBackgroundTaskUnlocked(opts: SubagentExecOptions): Promise
 
 		// Resolve attach waiter if any (legacy attach path for a run_in_background task)
 		const attachWaiter = getAttachWaitersMap().get(narratorId);
-		if (attachWaiter) {
+		if (attachWaiter && owner.isCurrent()) {
 			// Determine final result — on success path use the outer scope vars,
 			// on catch path the DB was already updated so read from there.
 			const nar = await narratorService.getById(narratorId).catch(() => null);
@@ -1126,6 +1217,9 @@ export function waitForBackgroundTask(
 // === Foreground subagent execution loop ===
 
 interface ForegroundLoopInput {
+	deferCompletionPublication?: boolean;
+	prePromptBashCommand?: string;
+	publicationRun?: PublicationRun;
 	subagentId: string;
 	parentNarratorId: string;
 	toolUseId: string;
@@ -1153,6 +1247,7 @@ interface ForegroundLoopInput {
 
 export interface ForegroundRunTerminal {
 	runId: string;
+	allowInboxWake: boolean;
 	output: string;
 	finalText: string;
 	hasError: boolean;
@@ -1177,13 +1272,25 @@ export interface ForegroundRunHandle {
  * The foreground publication and terminal completion are deliberately separate:
  * detach may hand control back to the parent without pretending the run finished.
  */
-export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHandle {
+export function startForegroundRun(
+	input: ForegroundLoopInput,
+	borrowedOwner?: ExecutionOwner,
+): ForegroundRunHandle {
 	const runId = generateId();
-	const admitted = withNarratorWorkAdmission(
-		input.subagentId,
-		async () => startForegroundRunUnlocked(input, runId),
-		(run) => run.terminal,
-	);
+	const admitted = withNarratorStartAdmission(input.subagentId, async () => {
+		const owner = borrowedOwner ?? claimSubagentExecution(input.subagentId);
+		if (owner.narratorId !== input.subagentId || owner.kind !== "subagent" || !owner.isCurrent()) {
+			throw new AppError("Subagent execution owner expired", 409, "NARRATOR_EXECUTION_BUSY");
+		}
+		return withNarratorWorkAdmission(
+			input.subagentId,
+			async () => startForegroundRunUnlocked(input, runId, owner, !borrowedOwner),
+			(run) => run.terminal,
+		).catch((error) => {
+			if (!borrowedOwner) owner.release();
+			throw error;
+		});
+	});
 	const terminal = admitted.then((run) => run.terminal);
 	// Legacy callers only await foreground; admission rejection must not leave an
 	// unobserved second rejection, while terminal still rejects for structured callers.
@@ -1194,7 +1301,15 @@ export function startForegroundRun(input: ForegroundLoopInput): ForegroundRunHan
 function startForegroundRunUnlocked(
 	input: ForegroundLoopInput,
 	runId: string,
+	owner: ExecutionOwner,
+	releaseOnTerminal: boolean,
 ): ForegroundRunHandle {
+	const publicationRun =
+		input.publicationRun ??
+		runtimePublication.startAgentRun({
+			narratorId: input.subagentId,
+			parentNarratorId: input.parentNarratorId,
+		});
 	const {
 		subagentId,
 		parentNarratorId,
@@ -1217,13 +1332,14 @@ function startForegroundRunUnlocked(
 	let finalText = "";
 	let hasError = false;
 	let wasInterrupted = false;
-	let currentPrompt = input.prompt;
-	let currentHistory: unknown[] = input.initialHistory;
-	let currentTrailingToolResults: unknown[] | undefined = input.initialTrailingToolResults;
-	let currentUserId = input.userId ?? null;
-	let currentModel = model;
-	let currentProvider = provider;
-	let currentSystemPrompt = systemPrompt;
+	const currentPrompt = input.prompt;
+	const currentPrePromptBashCommand = input.prePromptBashCommand;
+	const currentHistory: unknown[] = input.initialHistory;
+	const currentTrailingToolResults: unknown[] | undefined = input.initialTrailingToolResults;
+	const currentUserId = input.userId ?? null;
+	const currentModel = model;
+	const currentProvider = provider;
+	const currentSystemPrompt = systemPrompt;
 	const executionStartedAt = Date.now();
 	const { remainingTimeoutMs, timeoutLabelMs, executionDeadlineAt, expiredAtMount } =
 		resolveSubagentExecutionTiming({
@@ -1248,6 +1364,7 @@ function startForegroundRunUnlocked(
 		timeoutMs: timeoutLabelMs ?? null,
 		executionDeadlineAt,
 		background: false,
+		logicalRunId: publicationRun.logicalRunId,
 	});
 	let timedOut = false;
 	const timeoutMessage = timeoutLabelMs
@@ -1258,14 +1375,22 @@ function startForegroundRunUnlocked(
 		finalText = timeoutMessage;
 		hasError = true;
 	};
-	const controlSignal = executionTimeout
+	const _controlSignal = executionTimeout
 		? AbortSignal.any([signal, executionTimeout.signal])
 		: signal;
 
-	const { promise: foregroundPromise, resolve: resolveForeground } =
-		Promise.withResolvers<ForegroundRunPublication>();
-	const { promise: terminalPromise, resolve: resolveTerminal } =
-		Promise.withResolvers<ForegroundRunTerminal>();
+	const {
+		promise: foregroundPromise,
+		resolve: resolveForeground,
+		reject: rejectForeground,
+	} = Promise.withResolvers<ForegroundRunPublication>();
+	const {
+		promise: terminalPromise,
+		resolve: resolveTerminal,
+		reject: rejectTerminal,
+	} = Promise.withResolvers<ForegroundRunTerminal>();
+	let allowInboxWake = false;
+	let publicationCommitError: unknown;
 	let foregroundPublished = false;
 	let terminalPublished = false;
 	const publishHandoff = (output: string): boolean => {
@@ -1274,10 +1399,20 @@ function startForegroundRunUnlocked(
 		resolveForeground({ kind: "handoff", runId, output });
 		return true;
 	};
-	const publishTerminal = (terminal: Omit<ForegroundRunTerminal, "runId">): boolean => {
+	const publishTerminal = (
+		terminal: Omit<ForegroundRunTerminal, "runId" | "allowInboxWake">,
+	): boolean => {
 		if (terminalPublished) return false;
 		terminalPublished = true;
-		const publication: ForegroundRunTerminal = { runId, ...terminal };
+		// All async cleanup/publication above has settled; detach handoffs never release.
+		// A continued runner has an additional publication chain that owns the release.
+		if (releaseOnTerminal) {
+			// A foreground run reserved capacity in case it detached. A normal foreground
+			// return needs no extra notice; pending terminal intents are never removed here.
+			runtimePublication.store.releaseUnusedRunSlots(publicationRun);
+			releaseSubagentPublicationOwner(owner, allowInboxWake);
+		}
+		const publication: ForegroundRunTerminal = { runId, allowInboxWake, ...terminal };
 		resolveTerminal(publication);
 		if (!foregroundPublished) {
 			foregroundPublished = true;
@@ -1291,100 +1426,15 @@ function startForegroundRunUnlocked(
 	let detachReadyPromise: Promise<DetachSetupResult> | undefined;
 	let currentForegroundAbortController: AbortController | undefined;
 
-	/**
-	 * Hand a still-queued user message to the suspension we just registered.
-	 *
-	 * A taken-over subagent is driven by the user, so its queued messages are
-	 * pushed WITHOUT a soft-stop request — interrupting the user's own turn would
-	 * be wrong. That leaves nobody to drain the queue: the loop reaches the
-	 * takeover suspension and blocks in waitForManualOverride, which only wakes on
-	 * an HTTP action and never inspects the buffer. A message sent during the turn
-	 * would be stranded forever: never persisted, never displayed, never answered.
-	 *
-	 * The drain must run AFTER the manual-override entry is registered, not before.
-	 * Draining first leaves a window where a concurrent send sees a non-blocked
-	 * subagent and starts a second, competing run. Resolving the registered entry
-	 * instead reuses the ordinary resume path, so the queued message becomes the
-	 * next turn through exactly the same plumbing as an interactive send.
-	 */
-	const feedQueuedMessageIntoSuspension = async (): Promise<void> => {
-		const queued = await consumeNextBufferedSubagentMessage({
-			narratorId: subagentId,
-			parentNarratorId,
-			toolUseId,
-			model: currentModel,
-			provider: currentProvider,
-			cwd,
-		});
-		if (!queued) return;
-		// A user action may have settled the suspension while the drain was in
-		// flight; resumeManualOverride then returns false and the message stays in
-		// the persisted history, to be picked up by the resumed turn's context.
-		resumeManualOverride(subagentId, {
-			prompt: queued.prompt,
-			history: queued.history,
-			trailingToolResults: queued.trailingToolResults,
-			userId: queued.userId ?? null,
-		});
-	};
-
-	const suspendForUserControl = async (substatus: string[]) => {
-		await narratorService.updateStatus(subagentId, "idle", { substatus });
-		broadcastToNarrator(parentNarratorId, {
-			type: "subagent_suspended",
-			narratorId: parentNarratorId,
-			subagentNarratorId: subagentId,
-			toolUseId,
-		});
-		broadcastToNarrator(subagentId, {
-			type: "status_change",
-			narratorId: subagentId,
-			status: "idle",
-			substatus,
-		});
-		// waitForManualOverride registers its entry synchronously, so the drain
-		// below can never observe an unregistered suspension.
-		const control = waitForManualOverride(subagentId, controlSignal, parentNarratorId, toolUseId);
-		await feedQueuedMessageIntoSuspension().catch((err) => {
-			logger.warn("Failed to consume queued subagent message on suspend", {
-				subagentId,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		});
-		return control;
-	};
-
-	const applyControlResult = async (
-		result: Awaited<ReturnType<typeof waitForManualOverride>>,
-	): Promise<"resume" | "finish"> => {
-		if (result.action === "resume") {
-			currentPrompt = result.prompt;
-			currentHistory = result.history;
-			currentTrailingToolResults = result.trailingToolResults;
-			currentUserId = result.userId ?? null;
-			const fresh = await narratorService.getById(subagentId);
-			currentModel = resolveEffectiveModel(fresh.model);
-			currentProvider = resolveProvider(currentModel);
-			if (rebuildSystemPrompt) {
-				currentSystemPrompt = await rebuildSystemPrompt(fresh.contextSummary);
-			}
-			finalText = "";
-			hasError = false;
-			await narratorService.updateStatus(subagentId, "working");
-			broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, currentModel);
-			return "resume";
-		}
-		finalText = result.finalText;
-		hasError = result.hasError;
-		if (result.interrupted) {
-			wasInterrupted = true;
-			hasError = false;
-		}
-		return "finish";
-	};
-
 	const runLoop = async () => {
 		const proxy = new ProxyAbortController();
+		const runtimeControl: RuntimeForegroundControl = {
+			proxy,
+			parentSignal: signal,
+			timeoutSignal: executionTimeout?.signal,
+			turnAbort: new AbortController(),
+			detached: false,
+		};
 
 		try {
 			// Register detach entry so the API can detach this subagent
@@ -1392,6 +1442,7 @@ function startForegroundRunUnlocked(
 				runId,
 				markDetached: (setup) => {
 					detached = true;
+					runtimeControl.detached = true;
 					detachReadyPromise = setup;
 				},
 				publishHandoff,
@@ -1403,22 +1454,16 @@ function startForegroundRunUnlocked(
 				subagentId,
 			});
 
-			while (true) {
-				const fgAbort = new AbortController();
-				currentForegroundAbortController = fgAbort;
-				getForegroundAbortControllers().set(subagentId, fgAbort);
-
-				// Update detach entry's fgAbort reference
-				const detachEntry = getDetachableMap().get(subagentId);
-				if (detachEntry) detachEntry.fgAbort = fgAbort;
-
-				// Keep the execution deadline separate from the swappable parent source so
-				// detach can replace parent cancellation without losing the deadline.
-				proxy.dispose();
-				proxy.listenTo(signal, fgAbort.signal);
-				if (executionTimeout) proxy.listenTo(executionTimeout.signal);
-
-				const result = await executeSubagent({
+			const fgAbort = runtimeControl.turnAbort;
+			currentForegroundAbortController = fgAbort;
+			getForegroundAbortControllers().set(subagentId, fgAbort);
+			const detachEntry = getDetachableMap().get(subagentId);
+			if (detachEntry) detachEntry.fgAbort = fgAbort;
+			proxy.listenTo(signal, fgAbort.signal);
+			if (executionTimeout) proxy.listenTo(executionTimeout.signal);
+			const result = await executeSubagent(
+				{
+					initialPrePromptBashCommand: currentPrePromptBashCommand,
 					narratorId: subagentId,
 					parentNarratorId,
 					toolUseId,
@@ -1429,6 +1474,7 @@ function startForegroundRunUnlocked(
 					provider: currentProvider,
 					locale,
 					signal: proxy.signal,
+					control: runtimeControl,
 					fileChangeStartedAt: new Date(executionStartedAt).toISOString(),
 					timeoutMs: remainingTimeoutMs,
 					userId: currentUserId,
@@ -1438,130 +1484,23 @@ function startForegroundRunUnlocked(
 					customDef,
 					rebuildSystemPrompt,
 					updateLease,
-				});
-				finalText = result.contextLengthExceeded
-					? "Error: context length exceeded"
-					: result.finalText;
-				hasError = result.hasError || !!result.contextLengthExceeded;
-				if (executionTimeout?.didTimeout() && !signal.aborted) {
-					markTimedOut();
-				} else if (result.aborted && signal.aborted) {
-					wasInterrupted = true;
+				},
+				owner,
+			);
+			allowInboxWake = result.allowInboxWake;
+			finalText = result.contextLengthExceeded
+				? "Error: context length exceeded"
+				: result.finalText;
+			hasError = result.hasError || !!result.contextLengthExceeded;
+			if (executionTimeout?.didTimeout() && !signal.aborted) markTimedOut();
+			else if (result.aborted) {
+				wasInterrupted = true;
+				if (signal.aborted)
 					finalText = "Subagent interrupted because parent narrator was interrupted";
-					hasError = false;
-				}
-				if (getForegroundAbortControllers().get(subagentId) === fgAbort) {
-					getForegroundAbortControllers().delete(subagentId);
-				}
-
-				if (timedOut) break;
-
-				const hardSubagentInterrupt = consumeForegroundSubagentHardInterrupt(subagentId);
-
-				// Check if we were detached during execution
-				if (detached) {
-					// Loop continues running in background mode.
-					// The foreground handoff was already published by detachSubagent().
-					// Continue to finally block for background completion.
-					break;
-				}
-
-				if (hardSubagentInterrupt && fgAbort.signal.aborted && !signal.aborted) {
-					wasInterrupted = true;
-					finalText = "Subagent interrupted by user";
-					hasError = false;
-					break;
-				}
-
-				const continueAfterInterrupt =
-					!hasError &&
-					fgAbort.signal.aborted &&
-					!signal.aborted &&
-					(await consumeNextBufferedSubagentMessage({
-						narratorId: subagentId,
-						parentNarratorId,
-						toolUseId,
-						model: currentModel,
-						provider: currentProvider,
-						cwd,
-					}));
-				if (continueAfterInterrupt) {
-					currentPrompt = continueAfterInterrupt.prompt;
-					currentHistory = continueAfterInterrupt.history;
-					currentTrailingToolResults = continueAfterInterrupt.trailingToolResults;
-					currentUserId = continueAfterInterrupt.userId ?? null;
-					finalText = "";
-					continue;
-				}
-				// Detect subagent-only interrupt (not parent abort)
-				if (!hasError && fgAbort.signal.aborted && !signal.aborted) {
-					// --- Suspend: block until the user resolves (Update Conclusion)
-					// or, for an explicit takeover, until the user stops takeover. ---
-					// An interrupt arriving inside a takeover is the user stopping a turn
-					// they are driving themselves, so it must suspend as `taken_over`; a
-					// plain `manual_override` here would make the takeover UI vanish while
-					// the hold is still in force, leaving the parent blocked with no
-					// visible way to release it.
-					const { heldByTakeover } = beginSubagentInterruptSuspension(subagentId);
-
-					// The user may have clicked "Stop takeover" while this turn was still
-					// running; the route records a pending marker rather than failing.
-					// Consume it here: skip the manual-override wait entirely and let the
-					// finalizer hand this turn's result straight back to the blocked
-					// parent. clearTakenOver must run before finalizeSubagent so
-					// preserveTakenOverSubstatus does not re-inject the taken_over tag.
-					if (
-						heldByTakeover &&
-						(consumePendingStopTakeover(subagentId) || consumePendingBackgroundFinalize(subagentId))
-					) {
-						clearTakenOver(subagentId);
-						break;
-					}
-
-					const control = await suspendForUserControl(
-						heldByTakeover ? ["taken_over"] : ["manual_override"],
-					);
-					if ((await applyControlResult(control)) === "resume") continue;
-					if (executionTimeout?.didTimeout() && !signal.aborted) {
-						markTimedOut();
-						break;
-					}
-					if (signal.aborted) {
-						wasInterrupted = true;
-						finalText = "Subagent interrupted because parent narrator was interrupted";
-						hasError = false;
-					}
-				} else if (isTakenOver(subagentId) && !hasError && !signal.aborted) {
-					// A turn that ENDED NORMALLY while the subagent is taken over. This is
-					// the ordinary entry into the hold — taking over does not stop the turn,
-					// so the very first hold of a takeover arrives here, as does every later
-					// turn the user drives to completion themselves. Keep this foreground
-					// runner alive and wait for the next user command instead of handing the
-					// result to the parent or switching to the generic session engine.
-					// A background takeover can resume inside this foreground driver.
-					// Accept a release recorded during that engine's settling window too.
-					if (
-						consumePendingStopTakeover(subagentId) ||
-						consumePendingBackgroundFinalize(subagentId)
-					) {
-						clearTakenOver(subagentId);
-						break;
-					}
-					const control = await suspendForUserControl(["taken_over"]);
-					if ((await applyControlResult(control)) === "resume") continue;
-					if (executionTimeout?.didTimeout() && !signal.aborted) {
-						markTimedOut();
-					}
-					clearTakenOver(subagentId);
-				} else if (isTakenOver(subagentId)) {
-					// Taken over, but this turn ended in an error or a parent abort: there is
-					// nothing left to hold, so release the takeover rather than parking the
-					// subagent in a state the user cannot act on.
-					clearTakenOver(subagentId);
-				}
-				break;
+				hasError = false;
 			}
 		} catch (err) {
+			allowInboxWake = false;
 			if (executionTimeout?.didTimeout() && !signal.aborted) {
 				markTimedOut();
 			} else {
@@ -1573,6 +1512,9 @@ function startForegroundRunUnlocked(
 				error: err instanceof Error ? err.message : String(err),
 			});
 		} finally {
+			currentForegroundAbortController = runtimeControl.turnAbort;
+			runtimeControl.cleanupTurnAbort?.();
+			setExecutionSuspended(owner, false);
 			const registeredDetach = getDetachableMap().get(subagentId);
 			if (registeredDetach?.runId === runId) getDetachableMap().delete(subagentId);
 			proxy.dispose();
@@ -1582,7 +1524,7 @@ function startForegroundRunUnlocked(
 			) {
 				getForegroundAbortControllers().delete(subagentId);
 			}
-			consumeForegroundSubagentHardInterrupt(subagentId);
+			if (owner.isCurrent()) consumeForegroundSubagentHardInterrupt(subagentId);
 
 			let detachSetupSucceeded = detached;
 			if (detached) {
@@ -1605,106 +1547,136 @@ function startForegroundRunUnlocked(
 				? getBackgroundAbortControllers().get(subagentId)
 				: undefined;
 
-			try {
-				await finalizeSubagent(
-					subagentId,
-					parentNarratorId,
-					toolUseId,
-					hasError,
-					hasError ? finalText : null,
-					{ interrupted: wasInterrupted, timedOut },
-				);
-
-				// Bind the result to the subagent's last assistant message
-				const resultMsgId = await getSubagentResultMessageId(subagentId);
-				if (resultMsgId) {
-					const { narratorPersistence } = await import("./narrator-persistence");
-					const reference = await narratorPersistence.resolveSubagentConclusionReference(
+			if (owner.isCurrent()) {
+				// The shared runtime returns only after control is settled. Terminal
+				// publication must not preserve a takeover tag from an earlier pass.
+				clearTakenOver(subagentId);
+				try {
+					await finalizeSubagent(
 						subagentId,
 						parentNarratorId,
 						toolUseId,
+						hasError,
+						hasError ? finalText : null,
+						{ interrupted: wasInterrupted, timedOut, owner },
 					);
-					await db
-						.update(narratorToolCalls)
-						.set({ resultMessageId: resultMsgId })
-						.where(eq(narratorToolCalls.id, reference.toolCallId));
-				}
-			} catch {
-				// Non-critical — don't fail the whole flow
-			}
-			await restorePendingSubagentModel(subagentId).catch((err) => {
-				logger.warn("Failed to restore temporary subagent model", {
-					subagentId,
-					error: err instanceof Error ? err.message : String(err),
-				});
-			});
 
-			if (detachSetupSucceeded) {
-				try {
-					// Background completion path — use shared helper
-					try {
-						await finalizeBackgroundCompletion(
+					// Bind the result to the subagent's last assistant message
+					const resultMsgId = await getSubagentResultMessageId(subagentId);
+					if (resultMsgId) {
+						const { narratorPersistence } = await import("./narrator-persistence");
+						const reference = await narratorPersistence.resolveSubagentConclusionReference(
 							subagentId,
 							parentNarratorId,
 							toolUseId,
-							timedOut ? "timeout" : hasError ? "failed" : "completed",
-							finalText,
-							locale as Locale,
-							timeoutLabelMs ?? undefined,
-							detachedAbortController,
 						);
-					} catch {
-						// Non-critical
+						await db
+							.update(narratorToolCalls)
+							.set({ resultMessageId: resultMsgId })
+							.where(eq(narratorToolCalls.id, reference.toolCallId));
 					}
+				} catch {
+					// Non-critical — don't fail the whole flow
+				}
+				await restorePendingSubagentModel(subagentId).catch((err) => {
+					logger.warn("Failed to restore temporary subagent model", {
+						subagentId,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				});
 
-					// Notify attach waiter if any (background → foreground transition)
-					const attachWaiter = getAttachWaitersMap().get(subagentId);
-					if (attachWaiter) {
-						attachWaiter.resolve({ finalText, hasError });
-						getAttachWaitersMap().delete(subagentId);
-					}
+				if (detachSetupSucceeded) {
+					try {
+						// Background completion path — use shared helper
+						try {
+							await withDbRetry(
+								async () =>
+									finalizeBackgroundCompletion(
+										subagentId,
+										parentNarratorId,
+										toolUseId,
+										timedOut ? "timeout" : hasError ? "failed" : "completed",
+										finalText,
+										locale as Locale,
+										timeoutLabelMs ?? undefined,
+										detachedAbortController,
+										input.deferCompletionPublication,
+									),
+								{ label: "detached_task_publication", maxRetries: 3 },
+							);
+						} catch (error) {
+							// This is source+intent persistence, not a best-effort WS notification.
+							// Finish every lease/timer cleanup below, then reject the terminal handle.
+							publicationCommitError = error;
+						}
 
-					// Clean up team tracking
-					clearTeamInbox(subagentId);
-				} finally {
-					if (getBackgroundAbortControllers().get(subagentId) === detachedAbortController) {
-						getBackgroundAbortControllers().delete(subagentId);
-					}
-					if (detachedAbortController) {
-						backgroundTaskService.unregisterAbortController(subagentId, detachedAbortController);
+						// Notify attach waiter if any (background → foreground transition)
+						const attachWaiter = getAttachWaitersMap().get(subagentId);
+						if (attachWaiter) {
+							attachWaiter.resolve({
+								finalText: publicationCommitError
+									? `Result publication failed: ${String(publicationCommitError)}`
+									: finalText,
+								hasError: !!publicationCommitError || hasError,
+							});
+							getAttachWaitersMap().delete(subagentId);
+						}
+
+						// Clean up team tracking
+						clearTeamInbox(subagentId);
+					} finally {
+						if (getBackgroundAbortControllers().get(subagentId) === detachedAbortController) {
+							getBackgroundAbortControllers().delete(subagentId);
+						}
+						if (detachedAbortController) {
+							backgroundTaskService.unregisterAbortController(subagentId, detachedAbortController);
+						}
 					}
 				}
 			}
-
 			updateLease?.release();
 			executionTimeout?.dispose();
 			unregisterRunningExecution();
 			backgroundTaskService.notifyDerivedStatusChanged(parentNarratorId, subagentId);
-			publishTerminal({
-				output: await appendSubagentFileChanges(
-					{
-						parentNarratorId,
-						childNarratorId: subagentId,
-						scope: {
-							sourceToolUseId: toolUseId,
-							startedAt: new Date(executionStartedAt).toISOString(),
-							completedAt: new Date().toISOString(),
+			if (publicationCommitError) {
+				terminalPublished = true;
+				if (releaseOnTerminal) releaseSubagentPublicationOwner(owner, false);
+				rejectTerminal(publicationCommitError);
+				if (!foregroundPublished) rejectForeground(publicationCommitError);
+			} else
+				publishTerminal({
+					output: await appendSubagentFileChanges(
+						{
+							parentNarratorId,
+							childNarratorId: subagentId,
+							scope: {
+								sourceToolUseId: toolUseId,
+								startedAt: new Date(executionStartedAt).toISOString(),
+								completedAt: new Date().toISOString(),
+							},
 						},
-					},
-					agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId)) +
-						(finalText || "(no output)"),
-				),
-				finalText: finalText || "(no output)",
-				hasError,
-				interrupted: wasInterrupted,
-				timedOut,
-			});
+						agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId)) +
+							(finalText || "(no output)"),
+					),
+					finalText: finalText || "(no output)",
+					hasError,
+					interrupted: wasInterrupted,
+					timedOut,
+				});
 		}
 	};
 
 	// Start the loop without awaiting: foreground may publish a detach handoff first,
 	// while terminal remains pending until all finalization is complete.
 	runLoop().catch(async (err) => {
+		allowInboxWake = false;
+		if (publicationCommitError) {
+			terminalPublished = true;
+			if (releaseOnTerminal) releaseSubagentPublicationOwner(owner, false);
+			rejectTerminal(err);
+			if (!foregroundPublished) rejectForeground(err);
+			return;
+		}
 		const finalText = `Subagent error: ${err instanceof Error ? err.message : String(err)}`;
 		publishTerminal({
 			// The CRASH outlet needs the file summary most: a subagent that died partway
@@ -1819,6 +1791,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			// Only background subagents can report progress to the parent; a
 			// foreground subagent blocks the parent until it finishes.
 			background ?? false,
+			resolveRuntimePolicy({ variant: "subagent", subagentType, customDefinition: customDef }),
 		);
 	const systemPrompt = await rebuildSystemPrompt();
 
@@ -1994,22 +1967,15 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			getBackgroundAbortControllers().set(subagentId, bgAbort);
 			backgroundTaskService.registerAbortController(subagentId, bgAbort);
 
-			await backgroundTaskService
-				.createAgentTask({
-					id: subagentId,
-					parentNarratorId,
-					subagentNarratorId: subagentId,
-					subagentType,
-					toolUseId,
-					alias: aliasRegistration.alias,
-					title,
-				})
-				.catch((err) => {
-					logger.warn("Failed to register background task in DB", {
-						narratorId: subagentId,
-						error: err instanceof Error ? err.message : String(err),
-					});
-				});
+			await backgroundTaskService.createAgentTask({
+				id: subagentId,
+				parentNarratorId,
+				subagentNarratorId: subagentId,
+				subagentType,
+				toolUseId,
+				alias: aliasRegistration.alias,
+				title,
+			});
 		} catch (error) {
 			updateLease.release();
 			throw error;
@@ -2086,6 +2052,11 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 // === Continue subagent ===
 
 export interface ContinueSubagentInput {
+	mailboxInput?: boolean;
+	/** The resume adapter owns the final exact-origin publication chain. */
+	deferPublicationRelease?: boolean;
+	/** Planned-update recovery alone reuses the persisted logical run. */
+	resumeLogicalRunId?: string;
 	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	fileReferences?: FileReferenceSnapshot[];
 	subagentId: string;
@@ -2133,6 +2104,8 @@ export interface ContinueSubagentInput {
 }
 
 export interface StartedSubagentContinuation {
+	/** Idempotent release after the caller's exact-origin publication has settled. */
+	releasePublication?: () => void;
 	runId: string;
 	/** Legacy foreground boundary: may settle with a detach handoff. */
 	completion: Promise<string>;
@@ -2284,6 +2257,7 @@ async function startContinuedSubagentUnlocked(
 			// Send({ id: "parent" }); user/manual-override continuations keep the
 			// original foreground semantics.
 			input.canReportToParent ?? false,
+			resolveRuntimePolicy({ variant: "subagent", subagentType, customDefinition: customDef }),
 		);
 	const systemPrompt = await rebuildSystemPrompt(original.contextSummary);
 
@@ -2299,6 +2273,8 @@ async function startContinuedSubagentUnlocked(
 	}
 
 	let run: ReturnType<typeof startForegroundRun>;
+	let publicationRun!: PublicationRun;
+	let executionOwner: ExecutionOwner | undefined;
 	let userMessage: StartedSubagentContinuation["userMessage"];
 	let leaseTransferred = false;
 	let continuationRegistered = false;
@@ -2312,6 +2288,13 @@ async function startContinuedSubagentUnlocked(
 		backgroundTaskService.unregisterAbortController(subagentId, backgroundAbortController);
 	};
 	try {
+		executionOwner = claimSubagentExecution(subagentId);
+		publicationRun = runtimePublication.startAgentRun({
+			narratorId: subagentId,
+			parentNarratorId,
+			resumeRunId: input.resumeLogicalRunId,
+			started: !!priorTaskVersion,
+		});
 		// 2. Mark subagent as working (in-place, no fork)
 		if (original.isBackground && !input.preserveBackground) {
 			const now = new Date().toISOString();
@@ -2362,18 +2345,34 @@ async function startContinuedSubagentUnlocked(
 			original.reasoningEffort ?? resolveDefaultReasoningEffort(provider, model),
 		);
 
-		const currentInput = projectFileReferenceText(
-			userMessage?.contentText ?? prompt ?? "",
-			input.persistPrompt !== false ? acceptedReferences : [],
-		);
+		const mailboxInput = input.mailboxInput
+			? await consumeNextBufferedSubagentMessage({
+					narratorId: subagentId,
+					parentNarratorId,
+					toolUseId,
+					model,
+					provider,
+					cwd,
+					locale,
+				})
+			: null;
+		if (input.mailboxInput && !mailboxInput)
+			throw new ValidationError("Mailbox head is not available for this wake");
+		const currentInput =
+			mailboxInput?.prompt ??
+			projectFileReferenceText(
+				userMessage?.contentText ?? prompt ?? "",
+				input.persistPrompt !== false ? acceptedReferences : [],
+			);
 		// 5. Load full subagent history unless the resume service already prepared it.
 		const rebuilt =
-			input.initialHistory && input.initialTrailingToolResults
+			mailboxInput ??
+			(input.initialHistory && input.initialTrailingToolResults
 				? {
 						history: input.initialHistory,
 						trailingToolResults: input.initialTrailingToolResults,
 					}
-				: await loadSubagentHistory(subagentId, model, provider, undefined, currentInput);
+				: await loadSubagentHistory(subagentId, model, provider, undefined, currentInput));
 
 		// 6. Run via the structured foreground handle (same subagentId).
 		if (priorTaskVersion) {
@@ -2389,7 +2388,7 @@ async function startContinuedSubagentUnlocked(
 			// `<background_task_id>` tool result and has no way to learn that the task is
 			// running again. Told without waking it — "someone took this over" is not
 			// actionable, so spending a turn on it would be noise.
-			void notifyParentOfResumedBackgroundTask({
+			await notifyParentOfResumedBackgroundTask({
 				subagentId,
 				parentNarratorId,
 				subagent: original,
@@ -2401,32 +2400,51 @@ async function startContinuedSubagentUnlocked(
 			backgroundTaskService.registerAbortController(subagentId, backgroundAbortController);
 			backgroundAbortRegistered = true;
 		}
-		run = startForegroundRun({
-			subagentId,
-			parentNarratorId,
-			toolUseId,
-			subagentType,
-			prompt: currentInput,
-			cwd,
-			model,
-			provider,
-			locale,
-			signal: runSignal,
-			timeoutMs: input.timeoutMs,
-			executionDeadlineAt: input.executionDeadlineAt,
-			executionTimeoutMs: input.executionTimeoutMs,
-			userId: input.userId ?? input.createdBy ?? null,
-			systemPrompt,
-			initialHistory: rebuilt.history,
-			initialTrailingToolResults: rebuilt.trailingToolResults,
-			customDef,
-			rebuildSystemPrompt,
-			updateLease,
-		});
+		run = startForegroundRun(
+			{
+				publicationRun,
+				deferCompletionPublication: input.skipConclusionDelivery !== true,
+				prePromptBashCommand: mailboxInput?.prePromptBashCommand,
+				subagentId,
+				parentNarratorId,
+				toolUseId,
+				subagentType,
+				prompt: currentInput,
+				cwd,
+				model,
+				provider,
+				locale,
+				signal: runSignal,
+				timeoutMs: input.timeoutMs,
+				executionDeadlineAt: input.executionDeadlineAt,
+				executionTimeoutMs: input.executionTimeoutMs,
+				userId:
+					mailboxInput && !mailboxInput.preservePrincipal
+						? (mailboxInput.userId ?? null)
+						: input.userId !== undefined
+							? input.userId
+							: (input.createdBy ?? null),
+				systemPrompt,
+				initialHistory: rebuilt.history,
+				initialTrailingToolResults: rebuilt.trailingToolResults,
+				customDef,
+				rebuildSystemPrompt,
+				updateLease,
+			},
+			executionOwner,
+		);
 		leaseTransferred = true;
 	} catch (err) {
 		unregisterBackgroundAbort();
 		if (continuationRegistered) backgroundTaskService.endAgentContinuation(subagentId);
+		try {
+			// Until startForegroundRun returns, this scope owns the reservations.
+			// Release only unused slots: persisted publication events must survive.
+			if (!leaseTransferred && publicationRun)
+				runtimePublication.store.releaseUnusedRunSlots(publicationRun);
+		} finally {
+			executionOwner?.release();
+		}
 		throw err;
 	} finally {
 		if (!leaseTransferred) updateLease.release();
@@ -2438,8 +2456,11 @@ async function startContinuedSubagentUnlocked(
 	 * persisted the conclusion; see that function for why the ordering matters.
 	 */
 	let pendingAnnouncement: ResumedBackgroundTaskAnnouncement | undefined;
+	let allowInboxWake = false;
 	const terminalCompletion = run.terminal
 		.then(async (terminal) => {
+			allowInboxWake = terminal.allowInboxWake;
+			if (!executionOwner?.isCurrent()) return terminal.output;
 			if (input.preserveBackground) {
 				await finalizeBackgroundCompletion(
 					subagentId,
@@ -2450,6 +2471,7 @@ async function startContinuedSubagentUnlocked(
 					locale as Locale,
 					input.executionTimeoutMs ?? undefined,
 					backgroundAbortController,
+					input.skipConclusionDelivery !== true,
 				);
 			}
 			// Notification ownership is independent of the optional task projection:
@@ -2457,6 +2479,8 @@ async function startContinuedSubagentUnlocked(
 			const plan = planResumedBackgroundTaskNotice({
 				preserveBackground: input.preserveBackground,
 				skipConclusionDelivery: input.skipConclusionDelivery,
+				deferCompletionPublication:
+					input.preserveBackground && input.skipConclusionDelivery !== true,
 				timedOut: terminal.timedOut,
 				interrupted: terminal.interrupted,
 				hasError: terminal.hasError,
@@ -2482,6 +2506,7 @@ async function startContinuedSubagentUnlocked(
 			// persisted the conclusion, even when there was no background task row.
 			if (plan.deliver) {
 				pendingAnnouncement = {
+					logicalRunId: publicationRun.logicalRunId,
 					subagentId,
 					parentNarratorId,
 					status: plan.status,
@@ -2492,12 +2517,28 @@ async function startContinuedSubagentUnlocked(
 			return terminal.output;
 		})
 		.finally(() => {
-			unregisterBackgroundAbort();
-			if (priorTaskVersion) backgroundTaskService.endAgentContinuation(subagentId);
+			try {
+				if (input.skipConclusionDelivery && !input.preserveBackground)
+					runtimePublication.store.releaseUnusedRunSlots(publicationRun);
+				unregisterBackgroundAbort();
+				if (!input.deferPublicationRelease && priorTaskVersion && executionOwner?.isCurrent())
+					backgroundTaskService.endAgentContinuation(subagentId);
+			} finally {
+				if (!input.deferPublicationRelease && executionOwner)
+					releaseSubagentPublicationOwner(executionOwner, allowInboxWake);
+			}
 		});
 	return {
+		releasePublication: () => {
+			if (executionOwner?.isCurrent()) {
+				if (priorTaskVersion) backgroundTaskService.endAgentContinuation(subagentId);
+				releaseSubagentPublicationOwner(executionOwner, allowInboxWake);
+			}
+		},
 		runId: run.runId,
-		completion: run.foreground.then((publication) => publication.output),
+		completion: run.foreground.then((publication) =>
+			publication.kind === "terminal" ? terminalCompletion : publication.output,
+		),
 		terminalCompletion,
 		userMessage,
 		takeResumedBackgroundAnnouncement: () => {

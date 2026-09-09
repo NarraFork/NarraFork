@@ -94,6 +94,59 @@ describe("anthropic provider consuming NUG gateway streams", () => {
 		expect(contextPercent).toBe(34.5);
 	});
 
+	test("drains gateway measurements after message_stop", async () => {
+		const events = await collect(
+			`${MIXED_SSE}event: contextUsageEvent\ndata: {"contextUsagePercentage":42}\n\n` +
+				'event: meteringEvent\ndata: {"usage":15}\n\n',
+		);
+		expect(events.filter((event) => event.contextUsagePercentage != null).at(-1)).toEqual({
+			contextUsagePercentage: 42,
+		});
+		expect(events.filter((event) => event.metering != null).at(-1)?.metering?.usage).toBe(15);
+	});
+
+	test.each([
+		34.5, 0, 125, -5,
+	])("helper preserves gateway occupancy %s across trailing token usage", async (percentage) => {
+		installStream(
+			MIXED_SSE.replace('"contextUsagePercentage":34.5', `"contextUsagePercentage":${percentage}`),
+		);
+		const provider = new AnthropicProvider({
+			id: "nugtest",
+			prefix: "nugtest",
+			baseUrl: "https://gateway.invalid/v1",
+			apiKey: "test-key",
+			officialApi: false,
+			models: [{ id: "claude-sonnet-4.5", name: "Sonnet" }],
+		} as never);
+		const result = await provider.generateWithMeta("hello", MODEL);
+		expect(result.text).toBe("Hello world.");
+		expect(result.contextPercent).toBe(Math.min(Math.max(percentage, 0), 100));
+		// Occupancy must not be presented as measured token consumption.
+		expect(result.usage?.inputTokens ?? 0).toBe(0);
+	});
+
+	test("helper keeps actual tokens independent of gateway occupancy", async () => {
+		installStream(
+			`${MIXED_SSE.replace(
+				'"output_tokens":0}}\n\nevent: message_stop',
+				'"input_tokens":2000,"output_tokens":20}}\n\nevent: message_stop',
+			)}event: contextUsageEvent\ndata: {"contextUsagePercentage":42}\n\n`,
+		);
+		const provider = new AnthropicProvider({
+			id: "nugtest",
+			prefix: "nugtest",
+			baseUrl: "https://gateway.invalid/v1",
+			apiKey: "test-key",
+			officialApi: false,
+			models: [{ id: "claude-sonnet-4.5", name: "Sonnet" }],
+		} as never);
+		const result = await provider.generateWithMeta("hello", MODEL);
+		expect(result.contextPercent).toBe(42);
+		expect(result.usage?.inputTokens).toBe(2000);
+		expect(result.usage?.outputTokens).toBe(20);
+	});
+
 	test("still parses the surrounding protocol events", async () => {
 		const events = await collect(MIXED_SSE);
 

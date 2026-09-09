@@ -1,3 +1,9 @@
+import {
+	type RuntimeAwaitTarget,
+	runtimeAwaitTargets,
+	runtimePolicyForContext,
+} from "@server/services/agent-runtime/policy";
+import { SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR } from "@server/services/subagent-communication-policy";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
@@ -18,7 +24,7 @@ export { DEFAULT_TIMEOUT_MS as DEFAULT_AWAIT_TIMEOUT_MS };
 // reloads don't lose references to in-flight timers.
 
 /** What an Await call is waiting on. */
-export type AwaitTargetType = "agent" | "bash" | "transfer" | "question";
+export type AwaitTargetType = RuntimeAwaitTarget;
 
 interface RunningAwaitEntry {
 	startedAt: number;
@@ -97,21 +103,22 @@ export async function broadcastAwaitAgentResolved(
 }
 
 function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
-	const subagent = Boolean(config?.parentNarratorId);
+	const policy = runtimePolicyForContext(config);
+	const targets = runtimeAwaitTargets(policy);
+	const questionHint =
+		policy.capabilities.askUserQuestion === "disabled"
+			? "question waits only on an existing own question; AskUserQuestion is unavailable."
+			: "question waits on an async AskUserQuestion belonging to this session.";
 	return {
 		type: "object",
 		properties: {
 			type: {
-				description: subagent
-					? 'What to await: "bash", "transfer", or "question" (subagents cannot await other agents).'
-					: 'What to await: "agent" (primary narrator only), "bash", "transfer" (a background device file transfer), or "question" (an async AskUserQuestion).',
+				description: `What to await: ${targets.join(", ")}. ${questionHint}${
+					policy.capabilities.awaitAgent ? "" : " Subagents cannot await other agents."
+				}`,
 				type: "string",
-				// `question` is available to subagents too: a subagent can ask
-				// asynchronously, so it must be able to wait for its own answer. Only
-				// `agent` is withheld (a subagent awaiting a sibling is what deadlocks).
-				enum: subagent
-					? ["bash", "transfer", "question"]
-					: ["agent", "bash", "transfer", "question"],
+				// Legacy own-question waits remain available independently of question creation.
+				enum: targets,
 			},
 			id: {
 				description: "The task/subagent ID, alias, accessible subagent name, or async question id.",
@@ -183,6 +190,15 @@ export const awaitTool: ToolDefinition = {
 			max: MAX_AWAIT_TIMEOUT_MS,
 		});
 
+		if (!runtimeAwaitTargets(runtimePolicyForContext(ctx)).includes(type)) {
+			return {
+				output:
+					type === "agent"
+						? `Await error: ${SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR}`
+						: `Await error: unsupported wait type "${type}".`,
+				isError: true,
+			};
+		}
 		if (!id) return { output: "Error: id is required.", isError: true };
 		const timeoutMs = timeout ?? DEFAULT_TIMEOUT_MS;
 

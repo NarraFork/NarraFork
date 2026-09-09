@@ -453,6 +453,10 @@ export const narrators = sqliteTable(
 		id: text("id").primaryKey(),
 		chapterId: text("chapter_id").references(() => chapters.id),
 		apiConversationId: text("api_conversation_id"),
+		/** Durable logical run identity; recovery keeps it, a genuine new start replaces it. */
+		logicalRunId: text("logical_run_id"),
+		/** Mailbox arrival counter; capacity reservations never increment it. */
+		inboxSequence: integer("inbox_sequence").notNull().default(0),
 		// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages
 		forkMessageId: text("fork_message_id").references((): any => narratorMessages.id),
 		type: text("type", { enum: ["primary", "subagent"] })
@@ -1426,6 +1430,8 @@ export const narratorMessageRefs = sqliteTable(
 		prunedPercent: integer("pruned_percent"),
 		/** Points to the segment-compact summary message that hides this ref. */
 		segmentCompactId: text("segment_compact_id"),
+		/** Set only when the recipient loop adopts this injection into model input. */
+		injectionConsumedAt: integer("injection_consumed_at", { mode: "timestamp_ms" }),
 	},
 	(table) => [
 		uniqueIndex("idx_narrator_refs_unique").on(table.narratorId, table.messageId),
@@ -1639,6 +1645,11 @@ export const narratorQuestions = sqliteTable(
 		toolUseId: text("tool_use_id").notNull(),
 		/** Question definitions, same shape as AskUserQuestion's `questions` input. */
 		questionsJson: text("questions_json", { mode: "json" }).notNull(),
+		/** Trusted execution principal at creation; NULL means unknown legacy provenance. */
+		executionPrincipalJson: text("execution_principal_json", { mode: "json" }).$type<{
+			version: 1;
+			userId: string | null;
+		}>(),
 		/** null while unanswered. Same shape as the synchronous path's `answers`. */
 		answersJson: text("answers_json", { mode: "json" }),
 		annotationsJson: text("annotations_json", { mode: "json" }),
@@ -3220,8 +3231,103 @@ export const narratorBufferedMessages = sqliteTable(
 		priority: integer("priority", { mode: "boolean" }).notNull().default(false),
 		seq: integer("seq").notNull(),
 		bufferedAt: text("buffered_at").notNull(),
+		kind: text("kind", { enum: ["user_input", "agent_message", "task_notice"] })
+			.notNull()
+			.default("user_input"),
+		noticeKind: text("notice_kind", { enum: ["agent", "bash"] }),
+		envelopeVersion: integer("envelope_version").notNull().default(1),
+		metadataJson: text("metadata_json"),
+		sourceNarratorId: text("source_narrator_id"),
+		sourceToolCallId: text("source_tool_call_id"),
+		sourceAttempt: integer("source_attempt"),
+		sourceKey: text("source_key"),
+		dedupeKey: text("dedupe_key"),
+		deliveryId: text("delivery_id"),
+		recipientMessageId: text("recipient_message_id"),
+		recipientRefId: text("recipient_ref_id"),
+		currentMessageId: text("current_message_id"),
+		contentRevision: integer("content_revision").notNull().default(1),
+		adoptedRevision: integer("adopted_revision"),
+		adoptedAt: text("adopted_at"),
+		/** Receiver-side semantic edits have adoption facts separate from the original delivery. */
+		currentRevision: integer("current_revision").notNull().default(1),
+		currentAdoptedRevision: integer("current_adopted_revision"),
+		currentAdoptedAt: text("current_adopted_at"),
+		receiptDisposition: text("receipt_disposition", {
+			enum: ["active", "superseded", "recipient_deleted"],
+		})
+			.notNull()
+			.default("active"),
+		arrivalSeq: integer("arrival_seq"),
+		state: text("state", { enum: ["queued", "claimed", "materialized", "failed", "cancelled"] })
+			.notNull()
+			.default("queued"),
+		claimToken: text("claim_token"),
+		claimEpoch: text("claim_epoch"),
+		claimedAt: text("claimed_at"),
+		claimAttempts: integer("claim_attempts").notNull().default(0),
+		lastError: text("last_error"),
+		byteSize: integer("byte_size").notNull().default(0),
+		projectedByteSize: integer("projected_byte_size").notNull().default(0),
+		payloadRefJson: text("payload_ref_json"),
+		dedupeExpiresAt: text("dedupe_expires_at"),
+		updatedAt: text("updated_at"),
 	},
-	(table) => [index("idx_nbm_narrator_seq").on(table.narratorId, table.seq)],
+	(table) => [
+		index("idx_nbm_narrator_seq").on(table.narratorId, table.seq),
+		index("idx_nbm_state_arrival").on(table.narratorId, table.state, table.arrivalSeq),
+		index("idx_nbm_claim_recovery").on(table.state, table.id),
+		index("idx_nbm_quota").on(table.narratorId, table.kind, table.noticeKind, table.state),
+		index("idx_nbm_legacy").on(table.narratorId, table.arrivalSeq, table.seq),
+		uniqueIndex("idx_nbm_dedupe").on(table.narratorId, table.dedupeKey),
+		uniqueIndex("idx_nbm_delivery").on(table.deliveryId),
+		index("idx_nbm_ref").on(table.narratorId, table.recipientRefId),
+		index("idx_nbm_reserved").on(table.narratorId, table.recipientMessageId),
+		index("idx_nbm_source").on(table.sourceNarratorId, table.sourceToolCallId, table.sourceAttempt),
+	],
+);
+
+/** Bounded notification slots: reserved rows have no arrival sequence or content. */
+export const runtimePublicationOutbox = sqliteTable(
+	"runtime_publication_outbox",
+	{
+		id: text("id").primaryKey(),
+		producerKind: text("producer_kind", { enum: ["agent", "bash"] }).notNull(),
+		taskId: text("task_id").notNull(),
+		logicalRunId: text("logical_run_id").notNull(),
+		eventKind: text("event_kind", {
+			enum: ["started", "completed", "failed", "timed_out", "cancelled", "terminal"],
+		}).notNull(),
+		recipientId: text("recipient_id").notNull(),
+		state: text("state", { enum: ["reserved", "pending", "failed"] })
+			.notNull()
+			.default("reserved"),
+		arrivalSeq: integer("arrival_seq"),
+		resultRef: text("result_ref"),
+		summary: text("summary"),
+		deliveryId: text("delivery_id").notNull(),
+		dedupeKey: text("dedupe_key").notNull(),
+		lastError: text("last_error"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_runtime_outbox_event").on(
+			table.producerKind,
+			table.taskId,
+			table.logicalRunId,
+			table.eventKind,
+			table.recipientId,
+		),
+		index("idx_runtime_outbox_order").on(
+			table.recipientId,
+			table.producerKind,
+			table.state,
+			table.arrivalSeq,
+		),
+		index("idx_runtime_outbox_recipient").on(table.recipientId),
+		index("idx_runtime_outbox_state").on(table.state, table.id),
+	],
 );
 
 // === hooks ===
@@ -3390,6 +3496,8 @@ export const backgroundTasks = sqliteTable(
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
 		type: text("type", { enum: ["bash", "agent", "transfer"] }).notNull(),
+		/** Durable publication run identity. NULL marks legacy tasks awaiting explicit registration. */
+		logicalRunId: text("logical_run_id"),
 		status: text("status", {
 			/**
 			 * `paused` exists only for `transfer` rows: a device transfer keeps a resume

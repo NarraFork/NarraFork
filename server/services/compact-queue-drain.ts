@@ -21,7 +21,7 @@
 import { getUserLanguage, getUserReplyInLanguage } from "../lib/i18n";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
-import { bufferedMessages } from "./narrator-session-state";
+import { getBufferedMessages } from "./narrator-buffer";
 
 /**
  * Resolve the locale/reply-language for the queue owner.
@@ -34,7 +34,7 @@ import { bufferedMessages } from "./narrator-session-state";
 async function resolveQueueOwnerLocale(
 	narratorId: string,
 ): Promise<{ locale: Locale; replyInUserLanguage: boolean }> {
-	const createdBy = bufferedMessages.get(narratorId)?.[0]?.createdBy;
+	const createdBy = getBufferedMessages(narratorId)?.[0]?.createdBy;
 	if (!createdBy) return { locale: "en", replyInUserLanguage: false };
 	try {
 		const [locale, replyInUserLanguage] = await Promise.all([
@@ -60,7 +60,7 @@ async function resolveQueueOwnerLocale(
  * every compact that nobody typed into.
  */
 export async function drainQueuedMessagesAfterCompact(narratorId: string): Promise<void> {
-	if ((bufferedMessages.get(narratorId)?.length ?? 0) === 0) return;
+	if ((getBufferedMessages(narratorId)?.length ?? 0) === 0) return;
 	try {
 		const { locale, replyInUserLanguage } = await resolveQueueOwnerLocale(narratorId);
 		const { resumeBufferedMessagesIfIdle } = await import("./narrator-session");

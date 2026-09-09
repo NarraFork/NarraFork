@@ -25,7 +25,11 @@ import {
 } from "./codex-websocket";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { parseErrorDiagnostics, parseUpstreamErrorEnvelope } from "./error-diagnostics";
-import { classifyInvalidState, ProviderInvalidStateError } from "./error-handling";
+import {
+	classifyInvalidState,
+	isCompletionLimitReason,
+	ProviderInvalidStateError,
+} from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { buildImageGenerationSavedPathInstruction } from "./image-generation";
 import { buildOpencodeSessionHeader } from "./opencode-session";
@@ -1251,9 +1255,20 @@ export class OpenAIProvider implements ProviderAdapter {
 			const raw = await response.text();
 			const json = parseResponsesJson(raw);
 			const text = extractResponsesText(json.output);
+			// Reuse stream error precedence: a policy/API failure is not a truncation.
+			const invalid = parseResponsesAPIEvent({ response: json }, new Map(), new Map()).find(
+				(event) => event.invalidState,
+			)?.invalidState;
+			const outputTruncated = !!text && !!invalid && isCompletionLimitReason(invalid.reason);
+			if (invalid && !outputTruncated) {
+				throw new ProviderInvalidStateError(invalid.reason, invalid.message, {
+					diagnostics: invalid.diagnostics,
+				});
+			}
 			if (text) await options?.onTextDelta?.(text);
 			return {
 				text,
+				...(outputTruncated && { outputTruncated }),
 				usage: parsedUsageToUsageData(json.usage),
 			};
 		}
@@ -1264,6 +1279,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		let text = "";
 		let usage: GenerateMetaResult["usage"] = null;
+		let outputTruncated = false;
 		for await (const evt of _parseResponsesAPIStream(response.body)) {
 			if (evt.text) {
 				text += evt.text;
@@ -1272,6 +1288,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (evt.reasoning) await options?.onReasoningDelta?.(evt.reasoning);
 			if (evt.usage) usage = parsedUsageToUsageData(evt.usage);
 			if (evt.invalidState) {
+				if (text && isCompletionLimitReason(evt.invalidState.reason)) {
+					outputTruncated = true;
+					continue;
+				}
 				throw new ProviderInvalidStateError(
 					evt.invalidState.reason,
 					`OpenAI Responses stream error (${evt.invalidState.reason}): ${evt.invalidState.message}`,
@@ -1279,7 +1299,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				);
 			}
 		}
-		return { text, usage };
+		return { text, usage, ...(outputTruncated && { outputTruncated }) };
 	}
 
 	private async requestChatCompletionsTextWithMeta(
@@ -1308,7 +1328,8 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (contentType.includes("application/json")) {
 			const raw = await response.text();
 			const json = parseJsonWithPreview<{
-				choices?: Array<{ message?: { content?: string } }>;
+				choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+				error?: unknown;
 				usage?: {
 					prompt_tokens?: number;
 					completion_tokens?: number;
@@ -1317,9 +1338,26 @@ export class OpenAIProvider implements ProviderAdapter {
 				};
 			}>(raw, "OpenAI chat/completions returned non-JSON payload");
 			const text = json.choices?.[0]?.message?.content ?? "";
+			const finishReason = json.choices?.[0]?.finish_reason;
+			const error = parseUpstreamErrorEnvelope(json);
+			if (error) {
+				throw new ProviderInvalidStateError(error.code ?? "api_error", error.message);
+			}
+			const outputTruncated = !!finishReason && isCompletionLimitReason(finishReason);
+			if (
+				(outputTruncated && !text) ||
+				finishReason === "content_filter" ||
+				finishReason === "model_context_window_exceeded"
+			) {
+				throw new ProviderInvalidStateError(
+					finishReason ?? "api_error",
+					`OpenAI Chat Completions stopped: ${finishReason}`,
+				);
+			}
 			if (text) await options?.onTextDelta?.(text);
 			return {
 				text,
+				...(outputTruncated && { outputTruncated }),
 				contextPercent: undefined,
 				usage: json.usage ? extractOpenAIUsage(json.usage) : null,
 			};
@@ -1331,6 +1369,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		let text = "";
 		let usage: GenerateMetaResult["usage"] = null;
+		let outputTruncated = false;
 		for await (const evt of parseSSEStream(response.body)) {
 			if (evt.text) {
 				text += evt.text;
@@ -1339,6 +1378,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (evt.reasoning) await options?.onReasoningDelta?.(evt.reasoning);
 			if (evt.usage) usage = parsedUsageToUsageData(evt.usage);
 			if (evt.invalidState) {
+				if (text && isCompletionLimitReason(evt.invalidState.reason)) {
+					outputTruncated = true;
+					continue;
+				}
 				throw new ProviderInvalidStateError(
 					evt.invalidState.reason,
 					`OpenAI Chat Completions stream error (${evt.invalidState.reason}): ${evt.invalidState.message}`,
@@ -1346,7 +1389,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				);
 			}
 		}
-		return { text, contextPercent: undefined, usage };
+		return { text, contextPercent: undefined, usage, ...(outputTruncated && { outputTruncated }) };
 	}
 
 	/**
@@ -1720,6 +1763,7 @@ async function* _parseResponsesAPIStream(
 	let lineCount = 0;
 	let sawResponsesEvent = false;
 	let completed = false;
+	let completionLimited = false;
 	let terminalError = false;
 	let lastParseError: { error: string; preview: string } | undefined;
 
@@ -1777,8 +1821,13 @@ async function* _parseResponsesAPIStream(
 			sawResponsesEvent = true;
 		}
 		const events = parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum);
-		if (events.some((evt) => evt.invalidState)) terminalError = true;
-		else if (type === "response.completed") completed = true;
+		for (const evt of events) {
+			if (!evt.invalidState) continue;
+			// Output limits end generation, not accounting: relays can still send usage.
+			if (isCompletionLimitReason(evt.invalidState.reason)) completionLimited = true;
+			else terminalError = true;
+		}
+		if (type === "response.completed") completed = true;
 		return events;
 	};
 
@@ -1832,7 +1881,7 @@ async function* _parseResponsesAPIStream(
 				yield evt;
 			}
 		}
-		if (terminalError) return;
+		if (terminalError || completionLimited) return;
 		if (!completed) {
 			const parseDetail = lastParseError
 				? ` Last malformed SSE data: ${lastParseError.error}; preview=${lastParseError.preview}`

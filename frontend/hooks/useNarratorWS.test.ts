@@ -358,8 +358,13 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		const receipts: unknown[] = [];
 		function Harness(): ReactNode {
 			useNarratorWS(narratorId, {
-				onSendDeliveryResolved: (toolUseId, targets, parentToolUseId, toolCallBinding) =>
-					receipts.push({ toolUseId, targets, parentToolUseId, toolCallBinding }),
+				onSendDeliveryResolved: (
+					toolUseId,
+					targets,
+					parentToolUseId,
+					toolCallBinding,
+					targetCount,
+				) => receipts.push({ toolUseId, targets, parentToolUseId, toolCallBinding, targetCount }),
 				onTitleUpdated:
 					narratorId === "n1" ? (title) => oldWrites.push(title) : (title) => newWrites.push(title),
 			});
@@ -398,7 +403,15 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			expect(newListener).toBeFunction();
 			newListener?.({ type: "title_updated", narratorId: "n2", title: "fresh-new-frame" });
 			expect(newWrites).toEqual(["fresh-new-frame"]);
-			const targets = [{ id: "child", deliveryMessageId: "reserved" }];
+			const targets = [
+				{
+					id: "child",
+					deliveryMessageId: "reserved",
+					title: "Worker",
+					injectionConsumedAt: "2026-07-18T00:00:00.000Z",
+				},
+			];
+			const targetCount = 3;
 			const toolCallBinding = { toolCallId: "row", attempt: 2 };
 			newListener?.({
 				type: "send_delivery_resolved",
@@ -406,9 +419,16 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 				toolUseId: "send-tool",
 				targets,
 				toolCallBinding,
+				targetCount,
 			});
 			expect(receipts).toEqual([
-				{ toolUseId: "send-tool", targets, parentToolUseId: undefined, toolCallBinding },
+				{
+					toolUseId: "send-tool",
+					targets,
+					parentToolUseId: undefined,
+					toolCallBinding,
+					targetCount,
+				},
 			]);
 			oldListener?.({
 				type: "send_delivery_resolved",

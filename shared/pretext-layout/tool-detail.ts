@@ -22,6 +22,13 @@ import {
 	readToolProgressPayload,
 } from "../tool-progress";
 import {
+	communicationSelectors,
+	communicationTargetLabel,
+	deriveCommunicationState,
+	formatCommunicationState,
+	resolveCommunicationTargets,
+} from "./communication-state";
+import {
 	countDiffLineStats,
 	createDiffDocument,
 	type DiffDocument,
@@ -892,7 +899,7 @@ function classifyByCategory(
 		case "await":
 			return classifyAwait(inputJson, outputJson, metadata);
 		case "send":
-			return classifySend(inputJson, outputJson, metadata, input.labels);
+			return classifySend(inputJson, outputJson, metadata, input.labels, status);
 		case "ask":
 			return classifyAsk(inputJson, input.hasPendingPermission === true, input.labels);
 		case "plan":
@@ -1590,11 +1597,12 @@ function classifySend(
 	outputJson: unknown,
 	metadata: Record<string, unknown> | null,
 	labels: Record<string, string> | undefined,
+	status: string | null | undefined,
 ): ToolDetailData | null {
 	const input = asObject(inputJson);
 	const message = readLeafText(input?.message);
 	const output = resolveDisplayText(outputJson);
-	const targets = Array.isArray(metadata?.targets) ? (metadata.targets as unknown[]) : [];
+	const targets = resolveCommunicationTargets(metadata, metadata?._sendDeliveryTargets);
 	const isAwait =
 		!isTruncated(inputJson) && typeof input?.await === "boolean"
 			? input.await
@@ -1602,36 +1610,36 @@ function classifySend(
 	const doInterrupt = isTruncated(inputJson)
 		? metadata?.doInterrupt === true
 		: input?.doInterrupt === true || metadata?.doInterrupt === true;
+	const selectors = communicationSelectors(inputJson);
+	const state = deriveCommunicationState({
+		targets,
+		targetCount: metadata?.targetCount,
+		selectorCount: Array.isArray(metadata?.targets) ? 0 : selectors.length,
+		awaitReply: isAwait,
+		status,
+	});
+	const targetLabels = targets.length > 0 ? targets.map(communicationTargetLabel) : selectors;
 	const badges: ToolStructuredBadge[] =
-		targets.length > 0
-			? targets.map((t) => {
-					const to = asObject(t) ?? {};
-					const label = readLeafText(to.title) ?? readLeafText(to.id) ?? "target";
-					return { label: `→ ${label}`, color: "blue" };
-				})
+		targetLabels.length > 0
+			? targetLabels.map((label) => ({ label: `→ ${label}`, color: "blue" }))
 			: [{ label: "Subagent message", color: "blue" }];
 	badges.push({
-		label: isAwait
-			? (labels?.sendAwaitReply ?? "Wait for reply")
-			: (labels?.sendNoAwaitReply ?? "Do not wait for reply"),
-		color: isAwait ? "indigo" : "gray",
+		label: formatCommunicationState(state, labels),
+		color: state.outcome ? "red" : "gray",
 	});
 	if (doInterrupt) badges.push({ label: "interrupt", color: "orange" });
 
 	// Delivery rows keep their per-target structure (status badge + label +
 	// interrupted/error suffix) instead of collapsing to "sent · Agent A" text.
-	const deliveryEntries: ToolStructuredEntry[] = targets.map((t) => {
-		const to = asObject(t) ?? {};
-		const label = readLeafText(to.title) ?? readLeafText(to.id) ?? "target";
-		const st = readLeafText(to.status) ?? "sent";
-		const error = readLeafText(to.error);
+	const deliveryEntries: ToolStructuredEntry[] = targets.map((target) => {
+		const targetState = deriveCommunicationState({ targets: [target], awaitReply: isAwait });
 		return {
-			title: label,
+			title: communicationTargetLabel(target),
 			badges: chips([
-				chip(st, st === "failed" || error ? "red" : "green"),
-				chip(to.interrupted === true ? "interrupted" : undefined, "orange"),
+				chip(formatCommunicationState(targetState, labels), targetState.outcome ? "red" : "green"),
+				chip(target.interrupted === true ? "interrupted" : undefined, "orange"),
 			]),
-			...(error ? { snippet: error } : {}),
+			...(target.error ? { snippet: target.error } : {}),
 		};
 	});
 
@@ -1649,7 +1657,7 @@ function classifySend(
 				? { kind: "structured", badgeRows: 0, bodyLines: [], entries: deliveryEntries }
 				: null,
 		),
-		textSection("output.main", outputJson, isAwait ? "reply" : "result", {
+		textSection("output.main", outputJson, state.replyCount > 0 ? "reply" : "result", {
 			contentLines: countLines(output),
 			text: output,
 			format: "markdown",

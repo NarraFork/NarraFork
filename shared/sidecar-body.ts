@@ -116,6 +116,12 @@ export interface SideCarInboundMessage {
 	fromMessageId?: string | null;
 	/** Exact sending tool call in the sender's session. Reader-only, never model-facing. */
 	fromToolUseId?: string;
+	/** Exact sender execution attempt for consumption receipts; never model-facing. */
+	fromToolCallBinding?: { toolCallId: string; attempt: number };
+	/** Stable original recipient/revision. A fork never gains acknowledgement authority. */
+	deliveryId?: string;
+	recipientNarratorId?: string;
+	revision?: number;
 	/** Team channel only: the message went to everyone. */
 	isBroadcast?: boolean;
 	text: string;

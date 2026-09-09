@@ -120,6 +120,8 @@ export interface GenerateOptions {
 
 export interface GenerateMetaResult {
 	text: string;
+	/** Partial text retained after an output-token limit; not a complete response. */
+	outputTruncated?: boolean;
 	contextPercent?: number;
 	usage?: UsageData | null;
 	credentialId?: string;

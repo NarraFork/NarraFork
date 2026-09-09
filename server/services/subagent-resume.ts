@@ -33,6 +33,8 @@ import {
 import {
 	announceResumedBackgroundTask,
 	combineSubagentAbortSignals,
+	commitResumedBackgroundTaskAnnouncement,
+	type ResumedBackgroundTaskAnnouncement,
 	type SubagentUpdateExecutionLease,
 	startContinuedSubagent,
 } from "./subagent-runner";
@@ -46,6 +48,10 @@ export type SubagentResumeIntent =
 export type SubagentResumeActor = "user" | "parent_agent";
 
 export interface ResumeSubagentInput {
+	/** Trusted automatic-continuation identity, separate from message audit author. */
+	executionPrincipal?: import("./narrator-question-service").QuestionExecutionPrincipal;
+	/** Wake an already accepted mailbox head without creating a second user message. */
+	mailboxInput?: boolean;
 	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	subagentId: string;
 	intent: SubagentResumeIntent;
@@ -94,6 +100,8 @@ export interface ResumeSubagentInput {
 	skipConclusionDelivery?: boolean;
 	/** Keep a recovered Agent checkpointable by subsequent planned updates. */
 	resumableUpdateLease?: boolean;
+	/** Persisted logical run from the planned-update checkpoint, never an execution epoch. */
+	resumeLogicalRunId?: string;
 	/** Remaining execution timeout passed to the continued runner. */
 	timeoutMs?: number;
 	/** Absolute execution deadline preserved by planned-update recovery. */
@@ -294,6 +302,7 @@ async function deliverCompletedResume(
 	publicationClaimId: string,
 	originToolUseId: string,
 	completionOutput: string,
+	announcement?: ResumedBackgroundTaskAnnouncement,
 ): Promise<void> {
 	let lastError: unknown;
 	for (let attempt = 1; attempt <= 3; attempt++) {
@@ -319,6 +328,10 @@ async function deliverCompletedResume(
 					) {
 						throw new ValidationError("Standalone worker creation binding has changed");
 					}
+					if (announcement)
+						db.transaction((tx) =>
+							commitResumedBackgroundTaskAnnouncement(announcement, completionOutput, tx),
+						);
 					active.delivered = true;
 					activeResumeRuns.delete(subagentId);
 					return;
@@ -357,6 +370,9 @@ async function deliverCompletedResume(
 					messageId: reference.messageId,
 					toolCallId: reference.toolCallId,
 					resultMessageId,
+					onPersist: announcement
+						? (tx) => commitResumedBackgroundTaskAnnouncement(announcement, finalText, tx)
+						: undefined,
 				});
 				active.delivered = true;
 				activeResumeRuns.delete(subagentId);
@@ -373,6 +389,18 @@ async function deliverCompletedResume(
 }
 
 export async function resumeSubagent(input: ResumeSubagentInput): Promise<ResumeSubagentResult> {
+	// Freeze accepted caller-owned snapshots before admission's first async boundary.
+	input = {
+		...input,
+		fileReferences:
+			input.fileReferences === undefined
+				? undefined
+				: freezeFileReferenceSnapshots(input.fileReferences),
+		editFileReferences:
+			input.editFileReferences === undefined
+				? undefined
+				: freezeFileReferenceSnapshots(input.editFileReferences),
+	};
 	return withNarratorStartAdmission(input.subagentId, () =>
 		withNarratorWorkAdmission(
 			input.subagentId,
@@ -580,7 +608,9 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 					prompt: currentInput,
 					history: rebuilt.history,
 					trailingToolResults: rebuilt.trailingToolResults,
-					userId: input.createdBy ?? null,
+					userId: input.executionPrincipal
+						? input.executionPrincipal.userId
+						: (input.createdBy ?? null),
 				});
 				if (!resumed) {
 					throw new ValidationError("Subagent suspension ended before it could be resumed");
@@ -618,6 +648,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 		});
 		try {
 			const started = await startContinuedSubagent({
+				deferPublicationRelease: true,
 				subagentId: input.subagentId,
 				parentNarratorId: original.parentNarratorId,
 				toolUseId: originToolUseId,
@@ -628,13 +659,14 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 				delivery: input.delivery,
 				commandText: input.commandText,
 				createdBy: input.createdBy,
-				userId: input.createdBy,
+				userId: input.executionPrincipal ? input.executionPrincipal.userId : input.createdBy,
 				canReportToParent: input.actor === "parent_agent",
 				signal: runSignal,
 				abortController,
 				updateExecutionLease: input.updateExecutionLease,
 				locale: input.locale,
-				persistPrompt: prepared.persistPrompt,
+				persistPrompt: input.mailboxInput ? false : prepared.persistPrompt,
+				mailboxInput: input.mailboxInput,
 				initialHistory: prepared.initialHistory,
 				initialTrailingToolResults: prepared.initialTrailingToolResults,
 				allowRunningRestart: input.allowRunningRestart || neverStarted,
@@ -644,6 +676,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 				// will be rewritten (i.e. whether the parent already has the output).
 				skipConclusionDelivery: input.skipConclusionDelivery,
 				resumableUpdateLease: input.resumableUpdateLease,
+				resumeLogicalRunId: input.resumeLogicalRunId,
 				timeoutMs: input.timeoutMs,
 				executionDeadlineAt: input.executionDeadlineAt,
 				executionTimeoutMs: input.executionTimeoutMs,
@@ -656,40 +689,47 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 			if (started.userMessage) {
 				broadcastUserMessage(input.subagentId, original.parentNarratorId, started.userMessage);
 			}
-			const terminalCompletion = started.terminalCompletion.then(async (output) => {
-				if (!input.skipConclusionDelivery && !runSignal.aborted) {
-					await deliverCompletedResume(
-						input.subagentId,
-						token,
-						started.runId,
-						publicationClaimId,
-						originToolUseId,
-						output,
-					);
-				} else {
-					await withSubagentResumeLock(input.subagentId, async () => {
-						const active = activeResumeRuns.get(input.subagentId);
-						if (active?.token === token && active.runId === started.runId) {
-							activeResumeRuns.delete(input.subagentId);
-						}
-					});
-				}
-				// AFTER the conclusion above, never before: this wakes the parent, and a turn
-				// started while the historical Agent tool result still held the previous run's
-				// output would be built from a result this continuation just superseded.
-				// Failure here must not fail the run — the notice is an affordance, the
-				// conclusion is the record.
-				const announcement = started.takeResumedBackgroundAnnouncement?.();
-				if (announcement) {
-					await announceResumedBackgroundTask(announcement).catch((err) => {
-						logger.warn("Failed to announce a resumed background task", {
-							subagentId: input.subagentId,
-							error: err instanceof Error ? err.message : String(err),
+			const terminalCompletion = started.terminalCompletion
+				.then(async (output) => {
+					const announcement = started.takeResumedBackgroundAnnouncement?.();
+					if (!input.skipConclusionDelivery && !runSignal.aborted) {
+						await deliverCompletedResume(
+							input.subagentId,
+							token,
+							started.runId,
+							publicationClaimId,
+							originToolUseId,
+							output,
+							announcement,
+						);
+					} else {
+						await withSubagentResumeLock(input.subagentId, async () => {
+							const active = activeResumeRuns.get(input.subagentId);
+							if (active?.token === token && active.runId === started.runId) {
+								if (announcement)
+									db.transaction((tx) =>
+										commitResumedBackgroundTaskAnnouncement(announcement, output, tx),
+									);
+								activeResumeRuns.delete(input.subagentId);
+							}
 						});
-					});
-				}
-				return output;
-			});
+					}
+					// AFTER the conclusion above, never before: this wakes the parent, and a turn
+					// started while the historical Agent tool result still held the previous run's
+					// output would be built from a result this continuation just superseded.
+					// Failure here must not fail the run — the notice is an affordance, the
+					// conclusion is the record.
+					if (announcement) {
+						await announceResumedBackgroundTask(announcement).catch((err) => {
+							logger.warn("Failed to announce a resumed background task", {
+								subagentId: input.subagentId,
+								error: err instanceof Error ? err.message : String(err),
+							});
+						});
+					}
+					return output;
+				})
+				.finally(() => started.releasePublication?.());
 			const settledCompletion = terminalCompletion.catch(async (error) => {
 				logger.error("Resumed subagent run failed", {
 					subagentId: input.subagentId,

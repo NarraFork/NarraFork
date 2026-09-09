@@ -59,6 +59,7 @@ describe("continued subagent completion ownership", () => {
 				const execute = spyOn(executor, "executeSubagent").mockResolvedValue({
 					finalText: "verified final result",
 					hasError: false,
+					allowInboxWake: true,
 				});
 				let timer: ReturnType<typeof setTimeout> | undefined;
 				let run: Awaited<ReturnType<typeof startContinuedSubagent>> | undefined;

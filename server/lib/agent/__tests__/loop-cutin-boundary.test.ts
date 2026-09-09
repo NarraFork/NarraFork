@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod/v4";
 import type { ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
@@ -184,6 +184,202 @@ async function runTurnWithCutIn(overrides: Partial<AgentConfig> = {}): Promise<{
 		softStopAsks,
 	};
 }
+
+describe("model input adoption boundary", () => {
+	async function runInput(overrides: Partial<AgentConfig>, history: unknown[] = []) {
+		for await (const _event of agentLoop(
+			{
+				narratorId: "n-consumption",
+				conversationId: "conv-consumption",
+				model: "test:model",
+				provider: "test",
+				cwd: ".",
+				signal: new AbortController().signal,
+				permissionHandler: async () => ({ behavior: "allow" }),
+				...overrides,
+			},
+			"initial",
+			history,
+		)) {
+			/* Drain to the real provider-input boundary. */
+		}
+	}
+
+	test("aborted initial input is not acknowledged", async () => {
+		const abort = new AbortController();
+		abort.abort();
+		let adopted = 0;
+		await runInput({
+			signal: abort.signal,
+			onModelInputConsumed: () => {
+				adopted++;
+			},
+		});
+		expect(adopted).toBe(0);
+	});
+
+	test("runtime authorization failure cannot acknowledge input", async () => {
+		let consumed = 0;
+		const chat = spyOn(testProvider, "chat");
+		try {
+			await runInput({
+				maxTransientRetries: 0,
+				runtimeAuthorizationGuard: async () => {
+					throw new Error("403 authorization revoked");
+				},
+				onModelInputConsumed: () => {
+					consumed++;
+				},
+			});
+			expect(consumed).toBe(0);
+			expect(chat).not.toHaveBeenCalled();
+		} finally {
+			chat.mockRestore();
+		}
+	});
+
+	test("after-tools preparation is acknowledged only when its bytes enter the following request", async () => {
+		let calls = 0;
+		let prepared = false;
+		let consumed = 0;
+		const chat = spyOn(testProvider, "chat").mockImplementation(async function* (params) {
+			calls++;
+			if (calls === 1) {
+				expect(prepared).toBe(false);
+				expect(consumed).toBe(0);
+				yield {
+					toolUses: [{ toolUseId: "consume-tool", name: FAST, input: { value: "injection" } }],
+				};
+			} else {
+				expect(params.content).toContain("inbound message");
+				expect(consumed).toBe(1);
+				yield { text: "received" };
+			}
+		});
+		try {
+			await runInput({
+				getAfterToolsInjections: () => {
+					prepared = true;
+					expect(consumed).toBe(0);
+					return {
+						text: "inbound message",
+						onConsumed: () => {
+							consumed++;
+						},
+					};
+				},
+			});
+			expect(calls).toBe(2);
+			expect(consumed).toBe(1);
+		} finally {
+			chat.mockRestore();
+		}
+	});
+
+	test("interrupt after persisting an injection leaves its receipt unconsumed", async () => {
+		const abort = new AbortController();
+		let consumed = 0;
+		let calls = 0;
+		const chat = spyOn(testProvider, "chat").mockImplementation(async function* () {
+			calls++;
+			yield {
+				toolUses: [{ toolUseId: "interrupted-consume", name: FAST, input: { value: "injection" } }],
+			};
+		});
+		try {
+			await runInput({
+				signal: abort.signal,
+				getAfterToolsInjections: () => {
+					abort.abort();
+					return {
+						text: "persisted but never adopted",
+						onConsumed: () => {
+							consumed++;
+						},
+					};
+				},
+			});
+			expect(calls).toBe(1);
+			expect(consumed).toBe(0);
+		} finally {
+			chat.mockRestore();
+		}
+	});
+
+	test("an upstream failure after adoption does not retract the receipt", async () => {
+		let consumed = 0;
+		const chat = spyOn(testProvider, "chat").mockImplementation(async function* () {
+			expect(consumed).toBe(1);
+			yield { text: "partial reply" };
+			throw new Error("403 upstream rejected request");
+		});
+		try {
+			await runInput({
+				maxTransientRetries: 0,
+				onModelInputConsumed: () => {
+					consumed++;
+				},
+			});
+			expect(consumed).toBe(1);
+		} finally {
+			chat.mockRestore();
+		}
+	});
+
+	test("a rebuilt history replaces the old receipt source before the next request", async () => {
+		const original: unknown[] = [];
+		const replacement: unknown[] = [];
+		const adopted: unknown[][] = [];
+		let calls = 0;
+		const chat = spyOn(testProvider, "chat").mockImplementation(async function* () {
+			calls++;
+			if (calls === 1)
+				yield {
+					toolUses: [{ toolUseId: "replace-history", name: FAST, input: { value: "rebuild" } }],
+				};
+			else yield { text: "rebuilt" };
+		});
+		try {
+			await runInput(
+				{
+					onModelInputConsumed: (history) => {
+						adopted.push(history);
+					},
+					onBeforeTurn: async () => ({ history: replacement, pendingToolResults: [] }),
+				},
+				original,
+			);
+			expect(adopted).toHaveLength(2);
+			expect(adopted[0]).toBe(original);
+			expect(adopted[1]).toBe(replacement);
+		} finally {
+			chat.mockRestore();
+		}
+	});
+
+	test("receipt callback failure cannot retract input or make the loop retry it", async () => {
+		let calls = 0;
+		const initialHistory: unknown[] = [{ role: "user", content: "history input" }];
+		const chat = spyOn(testProvider, "chat").mockImplementation(async function* () {
+			calls++;
+			yield { text: "received" };
+		});
+		try {
+			await runInput(
+				{
+					onModelInputConsumed: (history) => {
+						expect(history).toBe(initialHistory);
+						throw new Error("receipt unavailable");
+					},
+				},
+				initialHistory,
+			);
+			expect(calls).toBe(1);
+		} finally {
+			chat.mockRestore();
+		}
+	});
+});
 
 describe("cut-in queued while a tool is running", () => {
 	test("no later tool of the turn runs once the cut-in is queued", async () => {

@@ -422,10 +422,24 @@ export function useVListStreamingMessage(
 			// On a parent page an event carrying a parentToolUseId describes a CHILD
 			// tool; the parent card's activity summary is maintained by the document
 			// patch channel, so it must not become a top-level card here.
-			onSendDeliveryResolved: (toolUseId, targets, rawParentToolUseId, toolCallBinding) => {
+			onSendDeliveryResolved: (
+				toolUseId,
+				targets,
+				rawParentToolUseId,
+				toolCallBinding,
+				targetCount,
+			) => {
 				if (!isSubagent && rawParentToolUseId) return;
+				// A late consumption frame belongs to the persisted patch channel once
+				// hand-off retired this tool; do not resurrect a duplicate synthetic Send.
+				if (persistedToolUseIds.has(toolUseId) && !toolStoreRef.current.has(toolUseId)) return;
 				if (
-					applyStreamingSendDelivery(toolStoreRef.current, { toolUseId, targets, toolCallBinding })
+					applyStreamingSendDelivery(toolStoreRef.current, {
+						toolUseId,
+						targets,
+						toolCallBinding,
+						targetCount,
+					})
 				)
 					flush();
 			},

@@ -478,6 +478,75 @@ describe("RemoteProviderAdapter", () => {
 		expect(cancelled).toBe(true);
 	});
 
+	for (const kind of ["chat", "generate"] as const) {
+		const run = (adapter: RemoteProviderAdapter, signal = new AbortController().signal) =>
+			kind === "chat"
+				? collect(adapter.chat(chatParams({ signal })))
+				: adapter.generateWithMeta("hello", "remote:model-1", undefined, { signal });
+
+		for (const code of ["STREAM_IDLE_TIMEOUT", "OUTPUT_LIMIT"] as const) {
+			test(`${kind} preserves ${code} thrown after cancelled done`, async () => {
+				const original = new ProviderRpcError(code, "original transport failure", {
+					retryable: true,
+				});
+				const events = async function* () {
+					yield event("done", { status: "cancelled", stopReason: "cancelled" });
+					throw original;
+				};
+				await expect(run(makeAdapter(makeRpc(events, events)))).rejects.toBe(original);
+			});
+		}
+
+		test(`${kind} surfaces AbortError for cancelled done without an original error`, async () => {
+			let drained = false;
+			const events = async function* () {
+				yield event("done", { status: "cancelled", stopReason: "cancelled" });
+				drained = true;
+			};
+			await expect(run(makeAdapter(makeRpc(events, events)))).rejects.toMatchObject({
+				name: "AbortError",
+			});
+			expect(drained).toBe(true);
+		});
+
+		test(`${kind} preserves active user cancellation and its reason`, async () => {
+			const controller = new AbortController();
+			let notifyStarted: () => void = () => undefined;
+			const started = new Promise<void>((resolve) => {
+				notifyStarted = resolve;
+			});
+			let release: () => void = () => undefined;
+			const cancelled = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let cancelCalls = 0;
+			const operation = makeOperation(
+				async function* () {
+					notifyStarted();
+					await cancelled;
+					yield event("done", { status: "cancelled", stopReason: "cancelled" });
+				},
+				kind,
+				async () => {
+					cancelCalls++;
+					release();
+				},
+			);
+			const adapter = makeAdapter({
+				chat: async () => operation,
+				generate: async () => operation,
+			});
+			const pending = run(adapter, controller.signal);
+			await started;
+			controller.abort(new Error("Stopped by user"));
+			await expect(pending).rejects.toMatchObject({
+				name: "AbortError",
+				message: "Stopped by user",
+			});
+			expect(cancelCalls).toBe(1);
+		});
+	}
+
 	test("generate accumulates text and returns final usage metadata", async () => {
 		const rpc = makeRpc(
 			[event("request_started", { credentialId: "cred-generate" })],

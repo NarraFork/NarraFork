@@ -528,7 +528,8 @@ export interface BaseContentBlock {
 	 */
 	_awaitAgentNarratorId?: string;
 	/** Accepted/queued Send receipts; message location must confirm persistence. */
-	_sendDeliveryTargets?: Array<{ id: string; deliveryMessageId: string }>;
+	_sendDeliveryTargets?: import("@shared/communication-tool").SendDeliveryTarget[];
+	_sendDeliveryTargetCount?: number;
 	/**
 	 * The subagent this call is waiting on is currently TAKEN OVER by the user, so
 	 * the call is blocked until the takeover is stopped.
@@ -558,6 +559,9 @@ export type ContentBlock = BaseContentBlock;
 
 export interface ToolCallRecord {
 	id?: string;
+	executionAttempt?: number;
+	_sendDeliveryTargets?: import("@shared/communication-tool").SendDeliveryTarget[];
+	_sendDeliveryTargetCount?: number;
 	toolUseId: string;
 	toolName: string;
 	inputJson?: unknown;
@@ -779,6 +783,8 @@ export interface BufferedTextFileSummary {
 
 export interface BufferMessageSummary {
 	id: string;
+	state?: "queued" | "failed";
+	error?: string | null;
 	text: string;
 	bufferedAt: string;
 	imageCount: number;

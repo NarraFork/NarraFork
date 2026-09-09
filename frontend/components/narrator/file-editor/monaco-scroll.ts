@@ -90,13 +90,13 @@ export function revealMonacoPosition(
 	return true;
 }
 
-/** Prevent wheel/touch bubbling to the dock without disabling Monaco's default handling. */
+/** Contain wheel bubbling; touch must reach Monaco's document-level gesture listeners. */
 export function installMonacoScrollBoundary(host: HTMLElement): () => void {
 	const stop = (event: Event) => event.stopPropagation();
 	host.addEventListener("wheel", stop, { passive: true });
-	host.addEventListener("touchmove", stop, { passive: true });
+	// Do not stop touchmove here: Gesture listens on document, then prevents the
+	// browser's default scroll after dispatching the gesture to Monaco's viewport.
 	return () => {
 		host.removeEventListener("wheel", stop);
-		host.removeEventListener("touchmove", stop);
 	};
 }

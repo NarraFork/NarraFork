@@ -6,7 +6,7 @@ import { settings } from "@server/lib/settings";
 import type { Locale } from "@shared/i18n-locales";
 import { z } from "zod";
 import type { CustomSubagentDef } from "../custom-subagent-service";
-import { resolveToolFilter } from "../subagent-tools";
+import { isMcpToolAllowedForNarrator, resolveToolFilter } from "../subagent-tools";
 
 const originalMcpServers = settings.mcpServers;
 
@@ -76,6 +76,21 @@ afterAll(() => {
 });
 
 describe("resolveToolFilter", () => {
+	test("primary and child policies read the same live MCP deny configuration", () => {
+		const general = getFilter("general");
+		const readOnly = getFilter("explore");
+		for (const tool of [mcpReadTool, mcpWriteTool, mcpAskTool, mcpUnsetTool]) {
+			expect(isMcpToolAllowedForNarrator(tool)).toBe(true);
+		}
+		expect(isMcpToolAllowedForNarrator(mcpDeniedTool)).toBe(false);
+		const server = settings.mcpServers?.find((entry) => entry.id === "configured");
+		if (!server) throw new Error("missing MCP fixture");
+		server.toolPermissions = [{ toolName: "read", behavior: "deny" }];
+		expect(isMcpToolAllowedForNarrator(mcpReadTool)).toBe(false);
+		expect(general(mcpReadTool)).toBe(false);
+		expect(readOnly(mcpReadTool)).toBe(false);
+	});
+
 	test("explore and plan subagents only include readOnly MCP tools", () => {
 		for (const subagentType of ["explore", "plan"]) {
 			const filter = getFilter(subagentType);
@@ -84,7 +99,7 @@ describe("resolveToolFilter", () => {
 			expect(filter(contextAskTool)).toBe(true);
 			expect(filter(makeTool("Write"))).toBe(false);
 			expect(filter(makeTool("Edit"))).toBe(false);
-			expect(filter(askUserQuestionTool)).toBe(false);
+			expect(filter(askUserQuestionTool)).toBe(true);
 			expect(filter(mcpWriteTool)).toBe(false);
 			expect(filter(mcpAskTool)).toBe(false);
 			expect(filter(mcpDeniedTool)).toBe(false);
@@ -117,7 +132,7 @@ describe("resolveToolFilter", () => {
 		expect(filter(makeTool("Edit"))).toBe(true);
 		expect(filter(mcpReadTool)).toBe(true);
 		expect(filter(contextAskTool)).toBe(true);
-		expect(filter(askUserQuestionTool)).toBe(false);
+		expect(filter(askUserQuestionTool)).toBe(true);
 		expect(filter(mcpWriteTool)).toBe(true);
 		expect(filter(mcpAskTool)).toBe(true);
 		expect(filter(mcpUnsetTool)).toBe(true);
@@ -145,7 +160,7 @@ describe("resolveToolFilter", () => {
 		expect(filter(readTool)).toBe(true);
 		expect(filter(grepTool)).toBe(false);
 		expect(filter(contextAskTool)).toBe(false);
-		expect(filter(askUserQuestionTool)).toBe(false);
+		expect(filter(askUserQuestionTool)).toBe(true);
 		expect(filter(mcpWriteTool)).toBe(true);
 		expect(filter(mcpUnsetTool)).toBe(true);
 		expect(filter(mcpAskTool)).toBe(false);

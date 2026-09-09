@@ -3,6 +3,12 @@ import type { AsyncQuestion, HumanAttentionDetail } from "@frontend/types/narrat
 import { MantineProvider } from "@mantine/core";
 import type { HumanAttentionItem, HumanAttentionPage } from "@shared/human-attention";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+	createMemoryHistory,
+	createRootRoute,
+	createRouter,
+	RouterContextProvider,
+} from "@tanstack/react-router";
 import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
 import { act, type ReactNode } from "react";
@@ -70,6 +76,13 @@ function question(row: HumanAttentionItem): AsyncQuestion {
 		createdAt: row.createdAt,
 	};
 }
+function testRouter() {
+	return createRouter({
+		routeTree: createRootRoute(),
+		history: createMemoryHistory({ initialEntries: ["/narrators/parent"] }),
+	});
+}
+let router: ReturnType<typeof testRouter>;
 let qc: QueryClient;
 let root: Root;
 let container: HTMLDivElement;
@@ -156,6 +169,8 @@ beforeEach(() => {
 	listPage = { items: [], nextCursor: null };
 	details = new Map();
 	restorers = [];
+	router = testRouter();
+	track(spyOn(router, "navigate").mockResolvedValue(undefined));
 	track(spyOn(api, "getHumanAttention").mockImplementation(async () => listPage));
 	track(
 		spyOn(api, "getHumanAttentionDetail").mockImplementation(async (id) => {
@@ -185,7 +200,9 @@ async function render(node: ReactNode) {
 		root.render(
 			<QueryClientProvider client={qc}>
 				<I18nextProvider i18n={i18n}>
-					<MantineProvider env="test">{node}</MantineProvider>
+					<RouterContextProvider router={router}>
+						<MantineProvider env="test">{node}</MantineProvider>
+					</RouterContextProvider>
 				</I18nextProvider>
 			</QueryClientProvider>,
 		),
@@ -320,9 +337,11 @@ describe("human attention global listener and pagination", () => {
 		expect(detail).toHaveBeenCalledTimes(1);
 		expect(detail.mock.calls[0][0]).toBe(child.id);
 		expect(row(child.id).textContent).toContain("Decision owner: background-child");
-		expect(row(child.id).querySelector("a")?.getAttribute("href")).toBe(
-			"/narrators/background-child",
-		);
+		await click(narratorEn.humanAttentionOpenSession, row(child.id));
+		expect(router.navigate).toHaveBeenCalledWith({
+			to: "/narrators/$narratorId",
+			params: { narratorId: "background-child" },
+		});
 		await click("Load more");
 		expect(list.mock.calls.at(-1)?.[0]?.cursor).toBe("next/opaque");
 		expect(row(other.id).closest('[data-attention-scope="others"]')).not.toBeNull();
@@ -344,6 +363,99 @@ describe("human attention global listener and pagination", () => {
 		list.mockResolvedValue({ items: [item("retry")], nextCursor: null });
 		await click("Could not load human decisions");
 		expect(row("permission:retry")).toBeDefined();
+	});
+});
+
+describe("child async questions from the parent attention entry", () => {
+	test("global notification opens child question from parent, navigates to owner and answers only the child endpoint", async () => {
+		const child = item("child-question", {
+			id: "question:child-question",
+			source: "question",
+			kind: "async_question",
+			toolName: "AskUserQuestion",
+			narratorId: "actual-child",
+			parentNarratorId: "parent",
+			rootNarratorId: "parent",
+			blocking: false,
+		});
+		const childQuestion = question(child);
+		const parentQuestions = { items: [], openCount: 0, nextCursor: null };
+		qc.setQueryData(["async-questions", "parent"], parentQuestions);
+		const subscriptions = track(spyOn(narratorWSManager, "subscribe"));
+		const fetchSpy = track(
+			spyOn(globalThis, "fetch")
+				.mockResolvedValueOnce(Response.json({ error: "Child answer denied" }, { status: 403 }))
+				.mockResolvedValueOnce(
+					Response.json({ ok: true, question: { ...childQuestion, status: "answered" } }),
+				),
+		);
+		await render(<HumanAttentionInboxButton currentNarratorId="parent" />);
+		expect(document.querySelector("button")).toBeNull();
+		listPage = { items: [child], nextCursor: null };
+		details.set(child.id, { item: child, question: childQuestion });
+		writeSession("ask-draft", child.requestId, draft);
+		await act(async () =>
+			narratorWSManager.dispatchLocalFrame({ type: "human_attention_changed" }),
+		);
+		await settle();
+		expect(document.body.textContent).toContain("1 decision");
+		await click("decision(s)");
+		expect(row(child.id).closest('[data-attention-scope="current"]')).not.toBeNull();
+		await click(narratorEn.humanAttentionOpenSession, row(child.id));
+		expect(router.navigate).toHaveBeenCalledWith({
+			to: "/narrators/$narratorId",
+			params: { narratorId: "actual-child" },
+		});
+		await click("Review decision", row(child.id));
+		expect(row(child.id).textContent).toContain("Decision owner: actual-child");
+		expect(row(child.id).querySelector("textarea")?.value).toBe("Keep this answer");
+		await click(narratorEn.submitAnswer, row(child.id));
+		expect(row(child.id).textContent).toContain("Child answer denied");
+		expect(readSession("ask-draft", child.toolCallId)).not.toBeNull();
+		listPage = { items: [], nextCursor: null };
+		await click(narratorEn.submitAnswer, row(child.id));
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+		for (const [url, init] of fetchSpy.mock.calls) {
+			expect(url).toBe("/api/narrators/actual-child/questions/child-question/answer");
+			expect(init?.method).toBe("POST");
+			expect(JSON.parse(String(init?.body))).toEqual({ answers: { notes: "Keep this answer" } });
+		}
+		expect(document.querySelector("[data-attention-id]")).toBeNull();
+		expect(qc.getQueryData<typeof parentQuestions>(["async-questions", "parent"])).toEqual(
+			parentQuestions,
+		);
+		expect(subscriptions).not.toHaveBeenCalled();
+	});
+
+	test("child detail ACL wins over parent grouping and prevents both answer and dismiss", async () => {
+		const child = item("readonly-child", {
+			id: "question:readonly-child",
+			source: "question",
+			kind: "async_question",
+			toolName: "AskUserQuestion",
+			narratorId: "readonly-child-owner",
+			parentNarratorId: "parent",
+			rootNarratorId: "parent",
+			blocking: false,
+		});
+		listPage = { items: [child], nextCursor: null };
+		details.set(child.id, { item: { ...child, canAct: false }, question: question(child) });
+		const answer = track(spyOn(api, "answerAsyncQuestion"));
+		const dismiss = track(spyOn(api, "dismissAsyncQuestion"));
+		await render(<HumanAttentionInboxButton currentNarratorId="parent" />);
+		await click("decision(s)");
+		await click("Review decision", row(child.id));
+		expect(row(child.id).textContent).toContain("do not have permission");
+		expect(row(child.id).querySelector("textarea")).toBeNull();
+		expect(row(child.id).textContent).not.toContain(narratorEn.submitAnswer);
+		expect(row(child.id).textContent).not.toContain(narratorEn.asyncQuestionDismiss);
+		await click(narratorEn.humanAttentionOpenSession, row(child.id));
+		expect(router.navigate).toHaveBeenCalledWith({
+			to: "/narrators/$narratorId",
+			params: { narratorId: "readonly-child-owner" },
+		});
+		expect(answer).not.toHaveBeenCalled();
+		expect(dismiss).not.toHaveBeenCalled();
 	});
 });
 
@@ -484,21 +596,11 @@ describe("human attention decisions", () => {
 		expect(row(edit.id).textContent).toContain("Missing completion evidence");
 		expect(row(edit.id).textContent).toContain("Remove protected task");
 		expect(actions).toHaveLength(0);
-		const opened: string[] = [];
-		const original = Object.getOwnPropertyDescriptor(window, "open");
-		Object.defineProperty(window, "open", {
-			configurable: true,
-			value: (url: string) => {
-				opened.push(url);
-			},
+		await click(narratorEn.fileMod_viewInPanel, row(write.id));
+		expect(router.navigate).toHaveBeenCalledWith({
+			to: "/narrators/$narratorId",
+			params: { narratorId: "child-owner" },
 		});
-		try {
-			await click(narratorEn.fileMod_viewInPanel, row(write.id));
-			expect(opened).toEqual(["/narrators/child-owner"]);
-		} finally {
-			if (original) Object.defineProperty(window, "open", original);
-			else Reflect.deleteProperty(window, "open");
-		}
 	});
 
 	test("read-only and oversized forms cannot submit, while the owner session remains reachable", async () => {
@@ -515,9 +617,11 @@ describe("human attention decisions", () => {
 		expect(row(readonly.id).textContent).toContain("do not have permission");
 		expect(row(oversized.id).textContent).toContain("too large");
 		expect(row(oversized.id).querySelector("fieldset")).toBeNull();
-		expect(row(oversized.id).querySelector("a")?.getAttribute("href")).toBe(
-			"/narrators/owner-oversized",
-		);
+		await click(narratorEn.humanAttentionOpenSession, row(oversized.id));
+		expect(router.navigate).toHaveBeenCalledWith({
+			to: "/narrators/$narratorId",
+			params: { narratorId: "owner-oversized" },
+		});
 		expect(approve).not.toHaveBeenCalled();
 	});
 

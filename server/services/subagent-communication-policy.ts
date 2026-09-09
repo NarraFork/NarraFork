@@ -1,9 +1,7 @@
-/**
- * Communication rules that prevent subagents from creating synchronous wait chains.
- *
- * Keep this module dependency-free so the same policy can be enforced by Send,
- * Await, and unit tests without loading the full narrator communication service.
- */
+import { resolveRuntimePolicy } from "./agent-runtime/policy";
+
+/** Legacy service adapters: trusted caller identity is resolved by the communication
+ * service; capability decisions share the tool-schema policy without loading services. */
 
 export const SUBAGENT_SEND_ASYNC_ONLY_ERROR =
 	"Subagents may only use asynchronous Send. Do not set await=true; send a later Send message instead.";
@@ -16,14 +14,16 @@ export function assertSubagentSendIsAsync(
 	callerIsSubagent: boolean,
 	shouldAwait: boolean | undefined,
 ): void {
-	if (callerIsSubagent && shouldAwait === true) {
+	const policy = resolveRuntimePolicy({ variant: callerIsSubagent ? "subagent" : "primary" });
+	if (!policy.capabilities.sendAwait && shouldAwait === true) {
 		throw new Error(SUBAGENT_SEND_ASYNC_ONLY_ERROR);
 	}
 }
 
 /** Reject an agent-to-agent Await issued by a subagent. */
 export function assertSubagentCanAwaitAgent(callerIsSubagent: boolean): void {
-	if (callerIsSubagent) {
+	const policy = resolveRuntimePolicy({ variant: callerIsSubagent ? "subagent" : "primary" });
+	if (!policy.capabilities.awaitAgent) {
 		throw new Error(SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR);
 	}
 }

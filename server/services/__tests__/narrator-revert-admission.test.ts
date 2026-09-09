@@ -95,7 +95,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	state.bufferedMessages.clear();
 	db.delete(narratorBufferedMessages).run();
 	for (const release of pendingReleases.splice(0)) release();
 	state.activeNarrators.clear();
@@ -323,13 +322,38 @@ test("release drains preserved buffered input exactly once", async () => {
 	await committed.promise;
 	await state.waitForNarratorAdmissionWork(ROOT, AbortSignal.timeout(5_000));
 	expect(state.bufferedMessages.get(ROOT)).toBeUndefined();
-	expect(await db.select().from(narratorBufferedMessages)).toEqual([]);
+	expectMaterializedUserInput();
 	expect(
 		(await db.select().from(narratorMessages)).filter(
 			(message) => message.role === "user" && message.contentText === "deliver once after revert",
 		),
 	).toHaveLength(1);
 });
+
+function expectMaterializedUserInput() {
+	// Delivery tombstones survive consumption; no pending payload or claim may remain.
+	const rows = db.select().from(narratorBufferedMessages).all();
+	expect(rows).toHaveLength(1);
+	const row = rows[0];
+	expect(row).toMatchObject({
+		narratorId: ROOT,
+		kind: "user_input",
+		state: "materialized",
+		text: "",
+		byteSize: 0,
+		claimToken: null,
+		claimEpoch: null,
+		payloadRefJson: null,
+	});
+	expect(row.recipientRefId).toBeString();
+	if (!row.recipientRefId) throw new Error("Materialized user input must retain its ref identity");
+	const ref = db
+		.select()
+		.from(narratorMessageRefs)
+		.where(eq(narratorMessageRefs.id, row.recipientRefId))
+		.get();
+	expect(ref).toMatchObject({ narratorId: ROOT, messageId: row.currentMessageId });
+}
 
 async function seedAwaitReexecution(recovery: boolean, suffix = "") {
 	const messageId = `rerun-message${suffix}`;
@@ -375,6 +399,32 @@ async function seedAwaitReexecution(recovery: boolean, suffix = "") {
 for (const recovery of [false, true]) {
 	test(`${recovery ? "recovery" : "denied retry"} Await releases the start mutex for independent child Send(parent)`, async () => {
 		const row = await seedAwaitReexecution(recovery);
+		const childSendBinding = { toolCallId: "child-send-row", attempt: 1 };
+		await db.insert(narratorMessages).values({
+			id: "child-send-message",
+			narratorId: CHILD,
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: "child-send", name: "Send", input: { id: "parent" } }],
+			createdAt: new Date().toISOString(),
+		});
+		await db.insert(narratorMessageRefs).values({
+			id: "child-send-ref",
+			narratorId: CHILD,
+			messageId: "child-send-message",
+			seq: 1,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: childSendBinding.toolCallId,
+			narratorId: CHILD,
+			messageId: "child-send-message",
+			toolUseId: "child-send",
+			toolName: "Send",
+			inputJson: { id: "parent", message: "independent child is ready" },
+			executionIdentityVersion: 1,
+			executionAttempt: childSendBinding.attempt,
+			status: "running",
+			createdAt: new Date().toISOString(),
+		});
 		await db.update(narrators).set({ isBackground: true }).where(eq(narrators.id, CHILD));
 		const entered = deferred();
 		const sendNow = deferred();
@@ -387,6 +437,7 @@ for (const recovery of [false, true]) {
 				id: "parent",
 				message: "independent child is ready",
 				toolUseId: "child-send",
+				toolCallBinding: childSendBinding,
 				signal: new AbortController().signal,
 				locale: "en",
 			});
@@ -629,7 +680,7 @@ for (const timeout of [false, true]) {
 			await committed.promise;
 			await state.waitForNarratorAdmissionWork(ROOT, AbortSignal.timeout(5_000));
 			expect(state.bufferedMessages.get(ROOT)).toBeUndefined();
-			expect(await db.select().from(narratorBufferedMessages)).toEqual([]);
+			expectMaterializedUserInput();
 			expect(
 				(await db.select().from(narratorMessages)).filter(
 					(message) => message.role === "user" && message.contentText === text,

@@ -670,22 +670,30 @@ describe("live event → patch field mapping", () => {
 			input: { id: "worker", message: "same", await: true },
 		};
 		applyStreamingToolStarted(store, started);
-		const target = { id: "child", deliveryMessageId: "reserved" };
+		const target = {
+			id: "child",
+			deliveryMessageId: "reserved",
+			title: "Worker title",
+			injectionConsumedAt: "2026-07-18T00:00:00.000Z",
+		};
 		expect(
 			applyStreamingSendDelivery(store, {
 				toolUseId: "live-send",
 				targets: [target],
+				targetCount: 3,
 				toolCallBinding: { toolCallId: "row", attempt: 1 },
 			}),
 		).toBe(true);
 		applyStreamingToolStarted(store, started);
 		const chunk = [...store.values()][0];
 		expect(topLevelStreamingChunkToToolFields(chunk)._sendDeliveryTargets).toEqual([target]);
+		expect(topLevelStreamingChunkToToolFields(chunk)._sendDeliveryTargetCount).toBe(3);
 		expect(topLevelStreamingChunkToToolFields(chunk)).not.toHaveProperty("outputJson");
 		const msg = buildTopLevelStreamingChunksMsg([...store.values()], "n1", null);
 		if (!msg) throw new Error("Expected live Send message");
 		const tc = resolveAllToolCallsFromMsg(msg)[0];
 		expect(tc._sendDeliveryTargets).toEqual([target]);
+		expect(tc._sendDeliveryTargetCount).toBe(3);
 		const rows = adaptSegment(
 			{
 				kind: "tool-run",
@@ -695,8 +703,12 @@ describe("live event → patch field mapping", () => {
 			{ lod: 5 },
 		);
 		expect((rows[0].data as { recipients: unknown[] }).recipients).toEqual([
-			{ ...target, label: "worker" },
+			{ ...target, label: "Worker title" },
 		]);
+		expect((rows[0].data as { deliveryState: unknown }).deliveryState).toMatchObject({
+			targetCount: 3,
+			receivedCount: 1,
+		});
 		expect(
 			applyStreamingSendDelivery(store, {
 				toolUseId: "live-send",
@@ -704,6 +716,362 @@ describe("live event → patch field mapping", () => {
 				toolCallBinding: { toolCallId: "old-row", attempt: 0 },
 			}),
 		).toBe(false);
+	});
+
+	it("consumption after Send success enriches only matching receipts and stays monotonic", async () => {
+		const { sendDeliveryResolvedPatch, toolCompletedPatch } = await import("./vlist-live-events");
+		const doc = toolDoc("tu-1", "running");
+		Object.assign(block(doc), { name: "Send", tcId: "row", executionAttempt: 1 });
+		const toolCallBinding = { toolCallId: "row", attempt: 1 };
+		const target = { id: "child", deliveryMessageId: "receipt", title: "Worker" };
+		const seeded = sendDeliveryResolvedPatch({
+			toolUseId: "tu-1",
+			targets: [target],
+			toolCallBinding,
+			targetCount: 3,
+		})(doc);
+		const completed = toolCompletedPatch({
+			toolUseId: "tu-1",
+			status: "success",
+			output: "queued",
+		})(seeded.messages);
+		const received = { ...target, injectionConsumedAt: "2026-07-18T00:00:00.000Z" };
+		const event = { toolUseId: "tu-1", targets: [received], toolCallBinding };
+		const consumed = sendDeliveryResolvedPatch(event)(completed.messages);
+		expect(consumed.changed).toBe(true);
+		expect(block(consumed.messages)).toMatchObject({
+			status: "success",
+			outputJson: "queued",
+			_sendDeliveryTargets: [received],
+			_sendDeliveryTargetCount: 3,
+		});
+		expect(sendDeliveryResolvedPatch(event)(consumed.messages).changed).toBe(false);
+		expect(
+			sendDeliveryResolvedPatch({
+				...event,
+				targets: [{ id: "child", deliveryMessageId: "receipt" }],
+				targetCount: 1,
+			})(consumed.messages).changed,
+		).toBe(false);
+		for (const invalid of [
+			{ ...event, toolCallBinding: undefined },
+			{ ...event, toolCallBinding: { toolCallId: "row", attempt: 2 } },
+			{ ...event, targets: [{ ...received, deliveryMessageId: "other-receipt" }] },
+		])
+			expect(sendDeliveryResolvedPatch(invalid)(consumed.messages).changed).toBe(false);
+	});
+
+	it("parent history updates an exact completed child attempt, never the reused newer row", async () => {
+		const { sendDeliveryResolvedPatch } = await import("./vlist-live-events");
+		const old = toolDoc("same", "success");
+		const recent = toolDoc("same", "running");
+		const target = { id: "child", deliveryMessageId: "receipt" };
+		Object.assign(block(old), {
+			name: "Send",
+			tcId: "old",
+			executionAttempt: 1,
+			_sendDeliveryTargets: [target],
+		});
+		Object.assign(block(recent), { name: "Send", tcId: "new", executionAttempt: 2 });
+		const parent = toolDoc("parent", "running");
+		parent[0] = { ...parent[0], children: [...old, ...recent] };
+		const received = { ...target, injectionConsumedAt: "2026-07-18T00:00:00.000Z" };
+		const event = {
+			toolUseId: "same",
+			targets: [received],
+			toolCallBinding: { toolCallId: "old", attempt: 1 },
+		};
+		const result = sendDeliveryResolvedPatch(event)(parent);
+		expect(result.changed).toBe(true);
+		expect(block(result.messages[0].children ?? [])._sendDeliveryTargets).toEqual([received]);
+		expect(result.messages[0].children?.[1]).toBe(recent[0]);
+		expect(
+			sendDeliveryResolvedPatch({ ...event, toolCallBinding: { toolCallId: "new", attempt: 2 } })(
+				old,
+			).changed,
+		).toBe(false);
+	});
+
+	it("completed streaming Send accepts consumption but rejects wrong attempts and receipts", async () => {
+		const {
+			applyStreamingToolStarted,
+			applyStreamingToolCompleted,
+			applyStreamingSendDelivery,
+			createStreamingToolStore,
+		} = await import("./streaming-tool-chunks");
+		const store = createStreamingToolStore();
+		applyStreamingToolStarted(store, {
+			toolUseId: "send",
+			toolName: "Send",
+			input: { id: "child" },
+		});
+		const target = { id: "child", deliveryMessageId: "receipt", title: "Worker" };
+		const toolCallBinding = { toolCallId: "row", attempt: 1 };
+		applyStreamingSendDelivery(store, {
+			toolUseId: "send",
+			targets: [target],
+			toolCallBinding,
+			targetCount: 3,
+		});
+		applyStreamingToolCompleted(store, { toolUseId: "send", status: "success", output: "queued" });
+		const received = { ...target, injectionConsumedAt: "2026-07-18T00:00:00.000Z" };
+		const event = { toolUseId: "send", targets: [received], toolCallBinding };
+		expect(applyStreamingSendDelivery(store, event)).toBe(true);
+		expect(applyStreamingSendDelivery(store, event)).toBe(false);
+		expect(
+			applyStreamingSendDelivery(store, {
+				...event,
+				targets: [{ id: "child", deliveryMessageId: "receipt" }],
+				targetCount: 1,
+			}),
+		).toBe(false);
+		for (const invalid of [
+			{ ...event, toolCallBinding: undefined },
+			{ ...event, toolCallBinding: { toolCallId: "row", attempt: 2 } },
+			{ ...event, targets: [{ ...received, deliveryMessageId: "other" }] },
+		])
+			expect(applyStreamingSendDelivery(store, invalid)).toBe(false);
+		expect(store.get("send")).toMatchObject({
+			_status: "success",
+			_output: "queued",
+			_sendDeliveryTargets: [received],
+			_sendDeliveryTargetCount: 3,
+		});
+	});
+
+	it("unbound consumption cannot create or replace a running attempt's receipt", async () => {
+		const { sendDeliveryResolvedPatch } = await import("./vlist-live-events");
+		const { applyStreamingSendDelivery, applyStreamingToolStarted, createStreamingToolStore } =
+			await import("./streaming-tool-chunks");
+		const binding = { toolCallId: "row", attempt: 2 };
+		const current = { id: "child", deliveryMessageId: "r2", title: "Current" };
+		const oldConsumed = {
+			id: "child",
+			deliveryMessageId: "r1",
+			injectionConsumedAt: "2026-07-18T00:00:00.000Z",
+		};
+		for (const hasReceipt of [false, true]) {
+			const doc = toolDoc("send", "running");
+			Object.assign(block(doc), {
+				name: "Send",
+				tcId: "row",
+				executionAttempt: 2,
+				...(hasReceipt ? { _sendDeliveryTargets: [current] } : {}),
+				_sendDeliveryTargetCount: 2,
+			});
+			const store = createStreamingToolStore();
+			applyStreamingToolStarted(store, {
+				toolUseId: "send",
+				toolName: "Send",
+				input: { id: "child" },
+			});
+			applyStreamingSendDelivery(store, {
+				toolUseId: "send",
+				targets: hasReceipt ? [current] : [],
+				targetCount: 2,
+				toolCallBinding: binding,
+			});
+			const previous = store.get("send");
+			const stale = { toolUseId: "send", targets: [oldConsumed], targetCount: 99 };
+			expect(sendDeliveryResolvedPatch(stale)(doc).changed).toBe(false);
+			expect(applyStreamingSendDelivery(store, stale)).toBe(false);
+			expect(store.get("send")).toBe(previous);
+			const same = {
+				toolUseId: "send",
+				targets: [{ ...current, injectionConsumedAt: oldConsumed.injectionConsumedAt }],
+				targetCount: 99,
+			};
+			const patched = sendDeliveryResolvedPatch(same)(doc);
+			expect(patched.changed).toBe(hasReceipt);
+			expect(applyStreamingSendDelivery(store, same)).toBe(hasReceipt);
+			if (hasReceipt) {
+				expect(block(patched.messages)._sendDeliveryTargets).toEqual(same.targets);
+				expect(block(patched.messages)._sendDeliveryTargetCount).toBe(2);
+				expect(store.get("send")?._sendDeliveryTargets).toEqual(same.targets);
+				expect(store.get("send")?._sendDeliveryTargetCount).toBe(2);
+			}
+		}
+		const empty = createStreamingToolStore();
+		expect(
+			applyStreamingSendDelivery(empty, {
+				toolUseId: "send",
+				targets: [oldConsumed],
+				targetCount: 99,
+			}),
+		).toBe(false);
+		expect(empty.size).toBe(0);
+	});
+
+	it("completed communication tools recognize final metadata receipts without runtime navigation", async () => {
+		const { sendDeliveryResolvedPatch } = await import("./vlist-live-events");
+		const {
+			applyStreamingSendDelivery,
+			applyStreamingToolStarted,
+			applyStreamingToolCompleted,
+			createStreamingToolStore,
+		} = await import("./streaming-tool-chunks");
+		const binding = { toolCallId: "row", attempt: 2 };
+		const receipt = { id: "child", deliveryMessageId: "receipt", title: "Child" };
+		const received = { ...receipt, injectionConsumedAt: "2026-07-18T00:00:00.000Z" };
+		const metadata = {
+			targetCount: 1,
+			targets: [{ ...receipt, status: "queued", awaited: false }],
+		};
+		const output = { _text: "queued", _metadata: metadata };
+		for (const toolName of ["Send", "TeamStatus"]) {
+			for (const action of ["send", "broadcast"]) {
+				const input = { action, id: "child", message: "hello" };
+				const event = { toolUseId: "send", targets: [received], toolCallBinding: binding };
+				for (const final of [{ _metadata: metadata }, { outputJson: output }]) {
+					const doc = toolDoc("send", "success");
+					Object.assign(block(doc), {
+						name: toolName,
+						inputJson: input,
+						input,
+						tcId: "row",
+						executionAttempt: 2,
+						...final,
+					});
+					const patched = sendDeliveryResolvedPatch(event)(doc);
+					expect(patched.changed).toBe(true);
+					expect(block(patched.messages)).toMatchObject({
+						name: toolName,
+						status: "success",
+						_sendDeliveryTargets: [received],
+						...final,
+					});
+					expect(
+						sendDeliveryResolvedPatch({
+							...event,
+							toolCallBinding: { toolCallId: "row", attempt: 1 },
+						})(doc).changed,
+					).toBe(false);
+				}
+				const store = createStreamingToolStore();
+				applyStreamingToolStarted(store, { toolUseId: "send", toolName, input });
+				applyStreamingSendDelivery(store, {
+					toolUseId: "send",
+					targets: [],
+					targetCount: 1,
+					toolCallBinding: binding,
+				});
+				applyStreamingToolCompleted(store, { toolUseId: "send", status: "success", output });
+				expect(applyStreamingSendDelivery(store, event)).toBe(true);
+				expect(store.get("send")).toMatchObject({
+					toolName,
+					_status: "success",
+					_sendDeliveryTargets: [received],
+					_output: output,
+				});
+				expect(store.get("send")?._output).toBe(output);
+			}
+		}
+		const list = toolDoc("send", "running");
+		Object.assign(block(list), {
+			name: "TeamStatus",
+			inputJson: { action: "list" },
+			tcId: "row",
+			executionAttempt: 2,
+		});
+		expect(
+			sendDeliveryResolvedPatch({
+				toolUseId: "send",
+				targets: [receipt],
+				toolCallBinding: binding,
+			})(list).changed,
+		).toBe(false);
+		const listStore = createStreamingToolStore();
+		applyStreamingToolStarted(listStore, {
+			toolUseId: "send",
+			toolName: "TeamStatus",
+			input: { action: "list" },
+		});
+		expect(
+			applyStreamingSendDelivery(listStore, {
+				toolUseId: "send",
+				targets: [receipt],
+				toolCallBinding: binding,
+			}),
+		).toBe(false);
+	});
+
+	it("count-only target resolution survives partial fanout and every projection", async () => {
+		const { sendDeliveryResolvedPatch } = await import("./vlist-live-events");
+		const { applyStreamingSendDelivery, createStreamingToolStore } = await import(
+			"./streaming-tool-chunks"
+		);
+		const { buildTopLevelStreamingChunksMsg } = await import("../narrator-message-helpers");
+		const { resolveAllToolCallsFromMsg } = await import("../message-segments");
+		const event = {
+			toolUseId: "tu-1",
+			targets: [],
+			targetCount: 4,
+			toolCallBinding: { toolCallId: "row", attempt: 1 },
+		};
+		const store = createStreamingToolStore();
+		expect(applyStreamingSendDelivery(store, event)).toBe(true);
+		expect(applyStreamingSendDelivery(store, event)).toBe(false);
+		const msg = buildTopLevelStreamingChunksMsg([...store.values()], "n", null);
+		if (!msg) throw new Error("Expected count-only live Send");
+		expect(resolveAllToolCallsFromMsg(msg)[0]._sendDeliveryTargetCount).toBe(4);
+		const doc = toolDoc("tu-1", "running");
+		Object.assign(block(doc), { name: "Send", tcId: "row", executionAttempt: 1 });
+		const countOnly = sendDeliveryResolvedPatch(event)(doc);
+		expect(countOnly.changed).toBe(true);
+		expect(sendDeliveryResolvedPatch(event)(countOnly.messages).changed).toBe(false);
+		const partial = sendDeliveryResolvedPatch({
+			...event,
+			targetCount: undefined,
+			targets: [{ id: "child", deliveryMessageId: "receipt" }],
+		})(countOnly.messages);
+		expect(block(partial.messages)._sendDeliveryTargetCount).toBe(4);
+	});
+
+	it("segmentation preserves a consumed row beneath an older enriched navigation block", async () => {
+		const { resolveAllToolCallsFromMsg } = await import("../message-segments");
+		const doc = toolDoc("tu-1", "success");
+		const received = {
+			id: "child",
+			deliveryMessageId: "receipt",
+			title: "Worker",
+			injectionConsumedAt: "2026-07-18T00:00:00.000Z",
+		};
+		Object.assign(block(doc), {
+			name: "Send",
+			_sendDeliveryTargets: [{ id: "child" }],
+			_sendDeliveryTargetCount: 1,
+		});
+		doc[0] = {
+			...doc[0],
+			toolCalls: [
+				{
+					toolUseId: "tu-1",
+					toolName: "Send",
+					_sendDeliveryTargets: [received],
+					_sendDeliveryTargetCount: 4,
+				},
+			],
+		};
+		const tool = resolveAllToolCallsFromMsg(doc[0] as never)[0];
+		expect(tool._sendDeliveryTargets).toEqual([received]);
+		expect(tool._sendDeliveryTargetCount).toBe(4);
+	});
+
+	it("title-only navigation snapshots cannot erase consumption or borrow another receipt's fact", async () => {
+		const { mergeSendDeliveryTargets } = await import("@shared/communication-tool");
+		const received = {
+			id: "child",
+			deliveryMessageId: "receipt",
+			title: "Worker",
+			injectionConsumedAt: "2026-07-18T00:00:00.000Z",
+		};
+		expect(mergeSendDeliveryTargets([received], [{ id: "child" }])).toEqual([received]);
+		expect(mergeSendDeliveryTargets([received], [{ id: "child", title: null }])).toEqual([
+			received,
+		]);
+		expect(
+			mergeSendDeliveryTargets([received], [{ id: "child", deliveryMessageId: "new" }]),
+		).toEqual([{ id: "child", deliveryMessageId: "new", title: "Worker" }]);
 	});
 
 	it("Send receipt bindings reject delayed frames from a different attempt", async () => {

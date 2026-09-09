@@ -2,6 +2,24 @@ import { describe, expect, test } from "bun:test";
 import { openCommunicationRecipient } from "./communication-navigation";
 
 describe("Send receipt navigation", () => {
+	test("deleted recipient tombstone cannot navigate to a retained fork's shared message", async () => {
+		const notices: string[] = [];
+		await openCommunicationRecipient(
+			{ id: "child", deliveryMessageId: "old", receiptDisposition: "recipient_deleted" },
+			{
+				locate: async () => {
+					throw new Error("Must not resolve a tombstone");
+				},
+				open: () => {
+					throw new Error("Must not navigate a tombstone");
+				},
+				notify: (reason) => {
+					notices.push(reason);
+				},
+			},
+		);
+		expect(notices).toEqual(["unavailable"]);
+	});
 	test("opens the received message, not the sender's message or session tail", async () => {
 		const opened: unknown[] = [];
 		const located: unknown[] = [];

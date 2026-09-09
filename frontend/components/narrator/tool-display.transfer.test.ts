@@ -1,26 +1,22 @@
 import { describe, expect, it } from "bun:test";
 import { getCategory, getCategoryColor, getSummary } from "./tool-display";
 
-describe("Send reply-mode header summary", () => {
+describe("Send delivery-state header summary", () => {
 	it.each([
-		[{ await: true }, "Wait for reply", "等待回复"],
-		[{ await: false }, "Do not wait for reply", "不等待回复"],
-		[{}, "Do not wait for reply", "不等待回复"],
-	])("shows an explicit mode for %j in both languages", (input, english, chinese) => {
-		expect(getSummary("Send", { id: "parent", ...input })).toContain(english);
+		{ await: true },
+		{ await: false },
+		{},
+	])("shows sending rather than a mode before queueing for %j", (input) => {
+		expect(getSummary("Send", { id: "parent", ...input })).toBe("to parent · Sending");
 		expect(
-			getSummary("Send", { id: "parent", ...input }, undefined, {
-				sendAwaitReply: "等待回复",
-				sendNoAwaitReply: "不等待回复",
-			}),
-		).toContain(chinese);
+			getSummary("Send", { id: "parent", ...input }, undefined, { communicationRunning: "发送中" }),
+		).toBe("to parent · 发送中");
 	});
 
 	it("uses projected metadata but preserves an explicit false input", () => {
-		expect(getSummary("Send", { _truncated: true }, { await: true })).toContain("Wait for reply");
-		expect(getSummary("Send", { await: false }, { await: true })).toContain(
-			"Do not wait for reply",
-		);
+		const metadata = { await: true, targets: [{ id: "parent", status: "queued" }] };
+		expect(getSummary("Send", { _truncated: true }, metadata)).toBe("to parent · Sent · Waiting");
+		expect(getSummary("Send", { await: false }, metadata)).toBe("to parent · Sent");
 	});
 });
 

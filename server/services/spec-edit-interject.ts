@@ -157,7 +157,7 @@ export async function interjectSpecEditAsUserMessage(
 	// into one message at its original position rather than stacking in reverse.
 	const trackedId = specEditInterjectIds.get(narratorId);
 	if (trackedId && getBufferedMessages(narratorId).some((msg) => msg.id === trackedId)) {
-		if (updateBufferedMessage(narratorId, trackedId, text)) {
+		if (await updateBufferedMessage(narratorId, trackedId, text)) {
 			requestBufferedMessageSoftStop(narratorId);
 			broadcastBufferSnapshot(narratorId);
 			return { delivered: "interjected" };

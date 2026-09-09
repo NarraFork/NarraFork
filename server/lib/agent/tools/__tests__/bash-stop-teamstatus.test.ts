@@ -610,6 +610,7 @@ describe("TeamStatus actions", () => {
 			kind: "send",
 			broadcast: true,
 			await: false,
+			targetCount: 1,
 			targets: [{ id: "sub-1", label: "worker", title: "Worker", status: "queued" }],
 		});
 		expect(deliveredMessages).toHaveLength(1);
@@ -655,6 +656,7 @@ describe("TeamStatus actions", () => {
 			kind: "send",
 			broadcast: false,
 			await: false,
+			targetCount: 1,
 			targets: [{ id: "sub-1", label: "explorer", title: "Explorer", status: "queued" }],
 			warning: "(warning: target is idle, message may not be received)",
 		});

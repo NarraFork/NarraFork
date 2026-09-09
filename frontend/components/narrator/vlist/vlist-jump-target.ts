@@ -22,6 +22,26 @@ export function jumpTargetItemIndex(index: PretextLayoutIndex, target: string): 
 	return index.itemByKey(`tool-${id}`)?.index ?? index.itemIndicesForSourceMessageId(id)[0];
 }
 
+/** Center inside this viewport only; native scrollIntoView also moves ancestors. */
+export function jumpTargetScrollTop(viewport: HTMLElement, target: HTMLElement): number {
+	const viewportRect = viewport.getBoundingClientRect();
+	const targetRect = target.getBoundingClientRect();
+	// Rects are visual pixels under classic graph zoom; scroll metrics are layout
+	// pixels. offsetHeight includes borders (and scrollbars), just like the rect.
+	const measuredScale = viewport.offsetHeight ? viewportRect.height / viewport.offsetHeight : 1;
+	const scale = Number.isFinite(measuredScale) && measuredScale > 0 ? measuredScale : 1;
+	return Math.max(
+		0,
+		Math.min(
+			viewport.scrollHeight - viewport.clientHeight,
+			viewport.scrollTop +
+				(targetRect.top - viewportRect.top) / scale -
+				viewport.clientTop -
+				(viewport.clientHeight - targetRect.height / scale) / 2,
+		),
+	);
+}
+
 /** Look only inside this list: docked sessions can render the same message ids. */
 export function mountedJumpTarget(
 	root: HTMLElement,

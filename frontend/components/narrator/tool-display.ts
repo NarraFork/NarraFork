@@ -1,3 +1,11 @@
+import {
+	communicationSelectors,
+	communicationTargetLabel,
+	deriveCommunicationState,
+	formatCommunicationState,
+	resolveCommunicationTargets,
+} from "@shared/pretext-layout/communication-state";
+
 export type ToolCategory =
 	| "read"
 	| "file"
@@ -241,20 +249,6 @@ export function getFilePath(input: unknown): string {
 	return extractField(input, "file_path", "filePath", "path");
 }
 
-function getSendTargetLabels(input: unknown): string[] {
-	if (!input || isTruncated(input) || typeof input !== "object") return [];
-	const obj = input as Record<string, unknown>;
-	const labels: string[] = [];
-	const push = (value: unknown) => {
-		if (typeof value === "string" && value.trim()) labels.push(value.trim());
-	};
-	push(obj.id);
-	push(obj.name);
-	if (Array.isArray(obj.ids)) obj.ids.forEach(push);
-	if (Array.isArray(obj.names)) obj.names.forEach(push);
-	return [...new Set(labels)];
-}
-
 function short(value: string, max: number): string {
 	return value.length > max ? `${value.slice(0, Math.max(0, max - 3))}...` : value;
 }
@@ -415,21 +409,27 @@ export function getSummary(
 				: `${awaitType}: ${id}`;
 		}
 		case "send": {
-			const targets = getSendTargetLabels(input).map((target) => formatAgentIdForDisplay(target));
-			const targetLabel = targets.length === 1 ? targets[0] : `${targets.length} targets`;
+			const selectors = communicationSelectors(input);
+			const targets = resolveCommunicationTargets(metadata, metadata?._sendDeliveryTargets);
+			const targetLabels =
+				Array.isArray(metadata?.targets) || targets.length
+					? targets.map(communicationTargetLabel)
+					: selectors.map((target) => formatAgentIdForDisplay(target));
+			const targetLabel = targetLabels.length > 0 ? targetLabels.join(", ") : "subagent";
 			const obj =
 				!isTruncated(input) && typeof input === "object" && input
 					? (input as Record<string, unknown>)
 					: undefined;
-			const isAwait = typeof obj?.await === "boolean" ? obj.await : metadata?.await === true;
-			const flags = [
-				isAwait
-					? (labels?.sendAwaitReply ?? "Wait for reply")
-					: (labels?.sendNoAwaitReply ?? "Do not wait for reply"),
-			];
+			const state = deriveCommunicationState({
+				targets,
+				targetCount: metadata?.targetCount,
+				selectorCount: Array.isArray(metadata?.targets) ? 0 : selectors.length,
+				awaitReply: typeof obj?.await === "boolean" ? obj.await : metadata?.await === true,
+				status: typeof metadata?.status === "string" ? metadata.status : undefined,
+			});
+			const flags = [formatCommunicationState(state, labels)];
 			if (obj?.doInterrupt || metadata?.doInterrupt) flags.push("interrupt");
-			const base = `to ${targetLabel || "subagent"}`;
-			return flags.length > 0 ? `${base} · ${flags.join(" · ")}` : base;
+			return `to ${targetLabel} · ${flags.join(" · ")}`;
 		}
 		case "ask": {
 			// Field-level projection keeps the `questions` array intact (the schema

@@ -10,7 +10,9 @@ import { isSubagentVariant } from "../lib/narrator-utils";
 import { normalizePathForComparison } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
 import type { ImageRef } from "../lib/uploads";
+import { createRuntimeMapView, executionAdmissions } from "./agent-runtime/ownership";
 import type { FrozenExecutionTarget } from "./execution-policy/types";
+import { getBufferedMessages } from "./narrator-buffer";
 import type { TokenUsageSnapshot } from "./narrator-event-handler";
 
 // === ActiveNarrator interface ===
@@ -312,6 +314,12 @@ export interface BufferedMessage {
 	priority?: boolean;
 	/** Paths of text files persisted to disk (for DB recovery). */
 	_savedFiles?: SavedBufferedFile[];
+	/** Mailbox-owned staging directory identity (not the mailbox row id). */
+	_stagingId?: string;
+	_recipientMessageId?: string;
+	state?: "queued" | "failed";
+	error?: string | null;
+	_mailboxClaim?: import("./agent-runtime/mailbox-types").MailboxClaim;
 }
 
 // === NarratorEvent type ===
@@ -337,10 +345,8 @@ export type NarratorEvent =
 
 // === Module-level state (hotSafe) ===
 
-export const activeNarrators = hotSafe<Map<string, ActiveNarrator>>(
-	"narrafork.activeNarrators",
-	() => new Map(),
-);
+/** Session settings/cache view, not an independent execution authority. */
+export const activeNarrators = createRuntimeMapView("session");
 
 export interface NarratorRuntimeModel {
 	requestedModel: string;
@@ -525,10 +531,7 @@ export interface ActiveSubagentSettings {
 	reasoningEffort: ReasoningEffort | null;
 }
 
-export const activeSubagentSettings = hotSafe<Map<string, ActiveSubagentSettings>>(
-	"narrafork.activeSubagentSettings",
-	() => new Map(),
-);
+export const activeSubagentSettings = createRuntimeMapView("subagentSettings");
 
 export function registerActiveSubagent(
 	narratorId: string,
@@ -742,10 +745,7 @@ export function hasNarratorRuntimeClaim(narratorId: string): boolean {
  * `broadcastTargetId` merely points here belongs to a subagent, and a subagent's
  * pause is not the parent's work.
  */
-export const narratorLoopAdmissions = hotSafe<Set<string>>(
-	"narrafork.narratorLoopAdmissions",
-	() => new Set(),
-);
+export const narratorLoopAdmissions = executionAdmissions;
 
 export function isNarratorRuntimeBusy(narratorId: string): boolean {
 	if (narratorLoopAdmissions.has(narratorId)) return true;
@@ -761,10 +761,16 @@ export function isNarratorRuntimeBusy(narratorId: string): boolean {
 	return false;
 }
 
-export const bufferedMessages = hotSafe<Map<string, BufferedMessage[]>>(
-	"narrafork.bufferedMessages",
-	() => new Map(),
-);
+/** Deprecated read-only view; the mailbox is the sole queue authority. */
+export const bufferedMessages = {
+	get(narratorId: string): BufferedMessage[] | undefined {
+		const messages = getBufferedMessages(narratorId);
+		return messages.length ? messages : undefined;
+	},
+	has(narratorId: string): boolean {
+		return getBufferedMessages(narratorId).length > 0;
+	},
+};
 
 // === Shared start/history/revert admission ===
 

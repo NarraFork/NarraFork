@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod/v4";
+import { resolveRuntimePolicy } from "../../../services/agent-runtime/policy";
 import {
 	extractToolPaths,
 	MAX_PLAN_FILE_BYTES,
@@ -39,6 +40,7 @@ import {
 } from "../loop";
 import { classifyToolUpdateExecution, executeTool, preAdmitToolExecution } from "../tool-executor";
 import { toolRegistry } from "../tool-registry";
+import { askUserQuestionTool } from "../tools/ask-user-question";
 import { browserTool } from "../tools/browser";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
 import { EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME } from "../tools/exit-plan-reflection";
@@ -120,6 +122,96 @@ function stubAdmissionPersistence(records: Array<Record<string, unknown>>): void
 		return input as never;
 	}) as typeof toolContinuationService.upsert;
 }
+
+describe("executeTool trusted runtime policy", () => {
+	test("passes the exact server policy to ToolContext and cannot be overwritten by tool input", async () => {
+		const policy = resolveRuntimePolicy({
+			variant: "subagent",
+			subagentType: "custom",
+			customDefinition: { toolAccess: "custom", customTools: ["Read"] },
+		});
+		const forgedPolicy = resolveRuntimePolicy({ variant: "primary" });
+		let receivedPolicy: unknown;
+		let receivedInput: unknown;
+		toolRegistry.register({
+			name: TEST_TOOL_NAME,
+			description: "Test policy context",
+			parameters: z.object({ runtimePolicy: z.unknown() }),
+			execute: async (input, ctx) => {
+				receivedPolicy = ctx.runtimePolicy;
+				receivedInput = input.runtimePolicy;
+				return { output: "policy received" };
+			},
+		});
+		const config = makeConfig(async () => ({ behavior: "allow" }));
+		config.parentNarratorId = "trusted-parent";
+		config.runtimePolicy = policy;
+		const result = await executeTool(
+			{ toolUseId: "policy-probe", name: TEST_TOOL_NAME, input: { runtimePolicy: forgedPolicy } },
+			config,
+		);
+		expect(result.isError).not.toBe(true);
+		expect(result.output).toBe("policy received");
+		expect(receivedPolicy).toBe(policy);
+		expect(receivedInput).toEqual(forgedPolicy);
+		expect(policy.capabilities.askUserQuestion).toBe("disabled");
+	});
+
+	test("a custom restriction survives real execution even when parent inference would allow async Ask", async () => {
+		const previous = toolRegistry.get("AskUserQuestion");
+		toolRegistry.register(askUserQuestionTool);
+		try {
+			const config = makeConfig(async () => ({ behavior: "allow" }));
+			config.parentNarratorId = "trusted-parent";
+			config.runtimePolicy = resolveRuntimePolicy({
+				variant: "subagent",
+				subagentType: "custom",
+				customDefinition: { toolAccess: "custom", customTools: ["Read", "Await"] },
+			});
+			const result = await executeTool(
+				{
+					toolUseId: "policy-ask-denied",
+					name: "AskUserQuestion",
+					input: {
+						async: true,
+						questions: [{ question: "direction", header: "Which direction?", options: [] }],
+						runtimePolicy: resolveRuntimePolicy({ variant: "primary" }),
+					},
+				},
+				config,
+			);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("not available under this runtime policy");
+		} finally {
+			if (previous) toolRegistry.register(previous);
+			else toolRegistry.unregister("AskUserQuestion");
+		}
+	});
+
+	test("server child policy rejects synchronous Ask even when a legacy config has no parent hint", async () => {
+		const previous = toolRegistry.get("AskUserQuestion");
+		toolRegistry.register(askUserQuestionTool);
+		try {
+			const config = makeConfig(async () => ({ behavior: "allow" }));
+			config.runtimePolicy = resolveRuntimePolicy({ variant: "subagent", subagentType: "general" });
+			const result = await executeTool(
+				{
+					toolUseId: "policy-sync-denied",
+					name: "AskUserQuestion",
+					input: {
+						questions: [{ question: "direction", header: "Which direction?", options: [] }],
+					},
+				},
+				config,
+			);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("async: true");
+		} finally {
+			if (previous) toolRegistry.register(previous);
+			else toolRegistry.unregister("AskUserQuestion");
+		}
+	});
+});
 
 describe("executeTool update admission gate", () => {
 	test("classifies background Bash and resumable agent routes", () => {

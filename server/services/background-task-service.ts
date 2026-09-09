@@ -14,11 +14,13 @@ import {
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import {
 	and,
+	asc,
 	type Column,
 	count,
 	desc,
 	eq,
 	getTableColumns,
+	gt,
 	inArray,
 	like,
 	lt,
@@ -39,8 +41,13 @@ import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { escapeLikeNeedle } from "../lib/sql-like";
+import type { RuntimeTx } from "./agent-runtime/mailbox-types";
+import {
+	publicationEvent,
+	runtimePublication,
+	taskPublicationRun,
+} from "./agent-runtime/publication";
 import { TRANSFER_RESTART_PAUSE_NOTICE } from "./device-transfer-task-store";
-import { pushPendingInjection } from "./parent-injection-queue";
 
 // === Types ===
 
@@ -369,6 +376,20 @@ class BackgroundTaskService {
 		this.listVersions = hotSafe("narrafork:bg-task:listVersions", () => new Map<string, number>());
 		this._broadcastFn = null;
 		this._livenessFn = null;
+		runtimePublication.setLegacyRuntimeAdmissionReader("bash", (source) => {
+			if (!this.abortControllers.has(source.taskId) && !this.killHandlers.has(source.taskId))
+				return undefined;
+			const task = db
+				.select({
+					parentNarratorId: backgroundTasks.parentNarratorId,
+					startedAt: backgroundTasks.startedAt,
+				})
+				.from(backgroundTasks)
+				.where(eq(backgroundTasks.id, source.taskId))
+				.get();
+			if (!task || task.parentNarratorId !== source.recipientId) return undefined;
+			return { ...source, startedAtMs: Date.parse(task.startedAt) };
+		});
 	}
 
 	// ── List version / delta broadcast ──────────────────────────────────
@@ -550,8 +571,10 @@ class BackgroundTaskService {
 			throw new ValidationError("Invalid background Bash execution binding");
 		}
 		const now = new Date().toISOString();
+		const publicationRun = runtimePublication.newBashRun(opts.id, opts.parentNarratorId);
 		const row: typeof backgroundTasks.$inferInsert = {
 			id: opts.id,
+			logicalRunId: publicationRun.logicalRunId,
 			parentNarratorId: opts.parentNarratorId,
 			type: "bash",
 			status: "running",
@@ -575,6 +598,7 @@ class BackgroundTaskService {
 		// This records provenance only: it cannot claim/replay a call, prove the
 		// process exited, or authorize writes after cancellation/restart.
 		db.transaction((tx) => {
+			runtimePublication.reserve(publicationRun, tx);
 			if (binding) {
 				// One primary-key lookup of metadata, never input/output/target-plan JSON.
 				const source = tx
@@ -656,6 +680,17 @@ class BackgroundTaskService {
 		title?: string;
 	}): Promise<BackgroundTaskRecord> {
 		const now = new Date().toISOString();
+		const source = db
+			.select({ logicalRunId: narrators.logicalRunId })
+			.from(narrators)
+			.where(eq(narrators.id, opts.subagentNarratorId))
+			.get();
+		const publicationRun = source?.logicalRunId
+			? runtimePublication.getAgentRun(opts.subagentNarratorId, opts.parentNarratorId)
+			: runtimePublication.startAgentRun({
+					narratorId: opts.subagentNarratorId,
+					parentNarratorId: opts.parentNarratorId,
+				});
 		const existing = await this.getById(opts.id);
 		if (existing) {
 			const existingSubagentId = existing.subagentNarratorId ?? existing.id;
@@ -674,6 +709,7 @@ class BackgroundTaskService {
 				.update(backgroundTasks)
 				.set({
 					status: "running",
+					logicalRunId: publicationRun.logicalRunId,
 					command: null,
 					exitCode: null,
 					subagentNarratorId: opts.subagentNarratorId,
@@ -715,6 +751,7 @@ class BackgroundTaskService {
 			parentNarratorId: opts.parentNarratorId,
 			type: "agent",
 			status: "running",
+			logicalRunId: publicationRun.logicalRunId,
 			subagentNarratorId: opts.subagentNarratorId,
 			subagentType: opts.subagentType,
 			toolUseId: opts.toolUseId ?? null,
@@ -891,11 +928,64 @@ class BackgroundTaskService {
 
 	// ── Status updates ──────────────────────────────────────────────────
 
+	/** The terminal CAS and its durable notification must succeed or roll back together. */
+	private commitTerminalTask(
+		taskId: string,
+		write: (tx: RuntimeTx) => BackgroundTaskRecord | undefined,
+		fullOutput?: string | null,
+		deferPublication = false,
+	) {
+		const task = db.transaction((tx) => {
+			const before = tx
+				.select({
+					id: backgroundTasks.id,
+					type: backgroundTasks.type,
+					parentNarratorId: backgroundTasks.parentNarratorId,
+					logicalRunId: backgroundTasks.logicalRunId,
+				})
+				.from(backgroundTasks)
+				.where(eq(backgroundTasks.id, taskId))
+				.get();
+			if (before && before.type !== "transfer" && !before.logicalRunId) {
+				runtimePublication.store.registerLegacyRunningRunSlots(
+					{
+						producerKind: before.type,
+						taskId,
+						recipientId: before.parentNarratorId,
+					},
+					{ kind: "runtime" },
+					{},
+					tx,
+				);
+			}
+			const task = write(tx);
+			if (!task || task.type === "transfer" || deferPublication) return task;
+			const run = taskPublicationRun(task);
+			runtimePublication.commit(
+				{
+					...run,
+					eventKind: publicationEvent(task.status),
+					resultRef: runtimePublication.persistResult(
+						run,
+						fullOutput ?? task.output ?? "(no output)",
+						tx,
+					),
+					summary: `[System] Background ${task.type} "${task.title ?? task.alias ?? task.id}" (ID: ${task.alias ?? task.id}) ${task.status}. Use Await({ type: "${task.type}", id: "${task.alias ?? task.id}" }) to read the stored result.`,
+				},
+				tx,
+			);
+			return task;
+		});
+		if (task) runtimePublication.schedule();
+		return task;
+	}
+
 	async markCompleted(
 		taskId: string,
 		output: string,
 		exitCode?: number,
 		expectedAbortController?: AbortController,
+		publicationOptions?: { deferPublication?: boolean },
 	): Promise<boolean> {
 		if (!this.ownsAbortController(taskId, expectedAbortController)) return false;
 		const now = new Date().toISOString();
@@ -903,19 +993,26 @@ class BackgroundTaskService {
 		const truncated = outputBytes > MAX_OUTPUT_BYTES;
 		const storedOutput = truncated ? truncateToBytes(output, MAX_OUTPUT_BYTES) : output;
 
-		const [task] = await db
-			.update(backgroundTasks)
-			.set({
-				status: "completed",
-				output: storedOutput,
-				outputBytes,
-				outputTruncated: truncated,
-				exitCode: exitCode ?? null,
-				completedAt: now,
-				updatedAt: now,
-			})
-			.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
-			.returning();
+		const task = this.commitTerminalTask(
+			taskId,
+			(tx) =>
+				tx
+					.update(backgroundTasks)
+					.set({
+						status: "completed",
+						output: storedOutput,
+						outputBytes,
+						outputTruncated: truncated,
+						exitCode: exitCode ?? null,
+						completedAt: now,
+						updatedAt: now,
+					})
+					.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
+					.returning()
+					.get(),
+			output,
+			publicationOptions?.deferPublication,
+		);
 
 		if (!task) {
 			this.cleanupRuntime(taskId, expectedAbortController);
@@ -956,6 +1053,7 @@ class BackgroundTaskService {
 		error: string,
 		exitCode?: number,
 		expectedAbortController?: AbortController,
+		publicationOptions?: { deferPublication?: boolean },
 	): Promise<boolean> {
 		if (!this.ownsAbortController(taskId, expectedAbortController)) return false;
 		const now = new Date().toISOString();
@@ -964,19 +1062,26 @@ class BackgroundTaskService {
 		const truncated = errorBytes > MAX_OUTPUT_BYTES;
 		const storedError = truncated ? truncateToBytes(error, MAX_OUTPUT_BYTES) : error;
 
-		const [task] = await db
-			.update(backgroundTasks)
-			.set({
-				status: "failed",
-				output: storedError,
-				outputBytes: errorBytes,
-				outputTruncated: truncated,
-				exitCode: exitCode ?? null,
-				completedAt: now,
-				updatedAt: now,
-			})
-			.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
-			.returning();
+		const task = this.commitTerminalTask(
+			taskId,
+			(tx) =>
+				tx
+					.update(backgroundTasks)
+					.set({
+						status: "failed",
+						output: storedError,
+						outputBytes: errorBytes,
+						outputTruncated: truncated,
+						exitCode: exitCode ?? null,
+						completedAt: now,
+						updatedAt: now,
+					})
+					.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
+					.returning()
+					.get(),
+			error,
+			publicationOptions?.deferPublication,
+		);
 
 		if (!task) {
 			this.cleanupRuntime(taskId, expectedAbortController);
@@ -1018,6 +1123,7 @@ class BackgroundTaskService {
 		error: string,
 		exitCode?: number,
 		expectedAbortController?: AbortController,
+		publicationOptions?: { deferPublication?: boolean },
 	): Promise<boolean> {
 		if (!this.ownsAbortController(taskId, expectedAbortController)) return false;
 		const now = new Date().toISOString();
@@ -1025,19 +1131,26 @@ class BackgroundTaskService {
 		const truncated = errorBytes > MAX_OUTPUT_BYTES;
 		const storedError = truncated ? truncateToBytes(error, MAX_OUTPUT_BYTES) : error;
 
-		const [task] = await db
-			.update(backgroundTasks)
-			.set({
-				status: "timeout",
-				output: storedError,
-				outputBytes: errorBytes,
-				outputTruncated: truncated,
-				exitCode: exitCode ?? null,
-				completedAt: now,
-				updatedAt: now,
-			})
-			.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
-			.returning();
+		const task = this.commitTerminalTask(
+			taskId,
+			(tx) =>
+				tx
+					.update(backgroundTasks)
+					.set({
+						status: "timeout",
+						output: storedError,
+						outputBytes: errorBytes,
+						outputTruncated: truncated,
+						exitCode: exitCode ?? null,
+						completedAt: now,
+						updatedAt: now,
+					})
+					.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
+					.returning()
+					.get(),
+			error,
+			publicationOptions?.deferPublication,
+		);
 
 		if (!task) {
 			this.cleanupRuntime(taskId, expectedAbortController);
@@ -1085,18 +1198,21 @@ class BackgroundTaskService {
 				: output
 			: null;
 
-		const [task] = await db
-			.update(backgroundTasks)
-			.set({
-				status: "cancelled",
-				...(storedOutput !== null
-					? { output: storedOutput, outputBytes, outputTruncated: truncated }
-					: {}),
-				completedAt: now,
-				updatedAt: now,
-			})
-			.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
-			.returning();
+		const task = this.commitTerminalTask(taskId, (tx) =>
+			tx
+				.update(backgroundTasks)
+				.set({
+					status: "cancelled",
+					...(storedOutput !== null
+						? { output: storedOutput, outputBytes, outputTruncated: truncated }
+						: {}),
+					completedAt: now,
+					updatedAt: now,
+				})
+				.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
+				.returning()
+				.get(),
+		);
 
 		if (!task) {
 			this.cleanupRuntime(taskId, expectedAbortController);
@@ -1155,6 +1271,90 @@ class BackgroundTaskService {
 		if (!task) return false;
 		this.broadcastListStatus(task.parentNarratorId, task.id, opts.status, storedOutput);
 		return true;
+	}
+
+	/** Called only inside the exact parent conclusion transaction, before its outbox intent. */
+	commitResumedPublicationTask(
+		taskId: string,
+		logicalRunId: string,
+		status: "completed" | "failed" | "cancelled" | "timeout",
+		output: string,
+		tx: RuntimeTx,
+	): void {
+		const now = new Date().toISOString();
+		const outputBytes = Buffer.byteLength(output);
+		const outputTruncated = outputBytes > MAX_OUTPUT_BYTES;
+		const storedOutput = outputTruncated ? truncateToBytes(output, MAX_OUTPUT_BYTES) : output;
+		tx.update(backgroundTasks)
+			.set({
+				status,
+				output: storedOutput,
+				outputBytes,
+				outputTruncated,
+				completedAt: now,
+				updatedAt: now,
+			})
+			.where(
+				and(
+					eq(backgroundTasks.id, taskId),
+					eq(backgroundTasks.type, "agent"),
+					eq(backgroundTasks.logicalRunId, logicalRunId),
+				),
+			)
+			.run();
+		tx.update(narrators)
+			.set({
+				backgroundStatus:
+					status === "completed" ? "completed" : status === "cancelled" ? "cancelled" : "failed",
+				backgroundResult: storedOutput,
+				backgroundCompletedAt: now,
+				updatedAt: now,
+			})
+			.where(
+				and(
+					eq(narrators.id, taskId),
+					eq(narrators.logicalRunId, logicalRunId),
+					eq(narrators.isBackground, true),
+				),
+			)
+			.run();
+	}
+
+	/** Control-plane completion follows the successful exact-origin commit, never its preparation. */
+	async announcePersistedAgentTerminal(taskId: string, logicalRunId?: string): Promise<void> {
+		const task = await this.getById(taskId);
+		if (
+			!task ||
+			task.type !== "agent" ||
+			task.status === "running" ||
+			(logicalRunId && task.logicalRunId !== logicalRunId)
+		)
+			return;
+		if (task.status === "completed")
+			eventBus.emit({
+				type: "background_task:completed",
+				taskId,
+				parentNarratorId: task.parentNarratorId,
+				taskType: "agent",
+				output: task.output ?? "",
+			});
+		else if (task.status === "cancelled")
+			eventBus.emit({
+				type: "background_task:cancelled",
+				taskId,
+				parentNarratorId: task.parentNarratorId,
+				taskType: "agent",
+			});
+		else
+			eventBus.emit({
+				type: "background_task:failed",
+				taskId,
+				parentNarratorId: task.parentNarratorId,
+				taskType: "agent",
+				status: task.status === "timeout" ? "timeout" : "failed",
+				error: task.output ?? "",
+			});
+		this.broadcastStatus(task.parentNarratorId, taskId, task.status, task.output, task.toolUseId);
 	}
 
 	// ── Query ───────────────────────────────────────────────────────────
@@ -2197,18 +2397,24 @@ class BackgroundTaskService {
 		const outputBytes = Buffer.byteLength(output, "utf-8");
 		const truncated = outputBytes > MAX_OUTPUT_BYTES;
 		const storedOutput = truncated ? truncateToBytes(output, MAX_OUTPUT_BYTES) : output;
-		const [updated] = await db
-			.update(backgroundTasks)
-			.set({
-				status: hasError ? "failed" : "completed",
-				output: storedOutput,
-				outputBytes,
-				outputTruncated: truncated,
-				completedAt: now,
-				updatedAt: now,
-			})
-			.where(eq(backgroundTasks.id, taskId))
-			.returning({ parentNarratorId: backgroundTasks.parentNarratorId });
+		const updated = this.commitTerminalTask(
+			taskId,
+			(tx) =>
+				tx
+					.update(backgroundTasks)
+					.set({
+						status: hasError ? "failed" : "completed",
+						output: storedOutput,
+						outputBytes,
+						outputTruncated: truncated,
+						completedAt: now,
+						updatedAt: now,
+					})
+					.where(eq(backgroundTasks.id, taskId))
+					.returning()
+					.get(),
+			output,
+		);
 		this.cleanupRuntime(taskId);
 		if (updated) this.queueTaskUpsert(updated.parentNarratorId, taskId);
 	}
@@ -2517,7 +2723,10 @@ class BackgroundTaskService {
 		parentNarratorId: string,
 		notification: CompletedNotification,
 	): void {
-		pushPendingInjection(parentNarratorId, { kind: "bg_bash", task: notification });
+		// Result + intent already committed in commitTerminalTask. This is only a wake hint.
+		void parentNarratorId;
+		void notification;
+		runtimePublication.schedule();
 	}
 
 	// ── Recovery / continuation guards ──────────────────────────────────
@@ -2565,23 +2774,39 @@ class BackgroundTaskService {
 	 */
 	async recoverStaleTasksAfterRestart(
 		protectedTaskIds: ReadonlySet<string> = new Set(),
+		afterId?: string,
 	): Promise<number> {
-		const staleTasks = (
-			await db
-				.select({
-					id: backgroundTasks.id,
-					type: backgroundTasks.type,
-					parentNarratorId: backgroundTasks.parentNarratorId,
-					subagentNarratorId: backgroundTasks.subagentNarratorId,
-				})
-				.from(backgroundTasks)
-				.where(eq(backgroundTasks.status, "running"))
-				.all()
-		)
+		const page = await db
+			.select({
+				id: backgroundTasks.id,
+				type: backgroundTasks.type,
+				parentNarratorId: backgroundTasks.parentNarratorId,
+				subagentNarratorId: backgroundTasks.subagentNarratorId,
+				logicalRunId: backgroundTasks.logicalRunId,
+				toolCallId: backgroundTasks.toolCallId,
+				executionAttempt: backgroundTasks.executionAttempt,
+			})
+			.from(backgroundTasks)
+			.where(
+				and(
+					eq(backgroundTasks.status, "running"),
+					afterId ? gt(backgroundTasks.id, afterId) : undefined,
+				),
+			)
+			.orderBy(asc(backgroundTasks.id))
+			.limit(101)
+			.all();
+		const scanned = page.slice(0, 100);
+		const nextPage = async () => {
+			if (page.length <= 100) return 0;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			return this.recoverStaleTasksAfterRestart(protectedTaskIds, scanned.at(-1)?.id);
+		};
+		const staleTasks = scanned
 			// Only an agent row can be protected — see the note above on why a bash row
 			// has no resume path to protect.
 			.filter((task) => task.type === "bash" || !protectedTaskIds.has(task.id));
-		if (staleTasks.length === 0) return 0;
+		if (staleTasks.length === 0) return nextPage();
 
 		const now = new Date().toISOString();
 		// A transfer is the one kind that SURVIVES a restart. Its owning
@@ -2608,10 +2833,51 @@ class BackgroundTaskService {
 				);
 		}
 		if (endedIds.length > 0) {
-			await db
-				.update(backgroundTasks)
-				.set({ status: "cancelled", completedAt: now, updatedAt: now })
-				.where(and(inArray(backgroundTasks.id, endedIds), eq(backgroundTasks.status, "running")));
+			for (const task of staleTasks) {
+				if (task.type === "transfer") continue;
+				const producerKind = task.type;
+				db.transaction((tx) => {
+					const source = {
+						producerKind,
+						taskId: task.id,
+						recipientId: task.parentNarratorId,
+					};
+					const run = task.logicalRunId
+						? taskPublicationRun(task)
+						: task.type === "bash" && !task.toolCallId && !task.executionAttempt
+							? runtimePublication.store.registerLegacyUnknownBashFailure(source, tx)
+							: runtimePublication.store.registerLegacyRunningRunSlots(
+									source,
+									{ kind: "persisted_task" },
+									{},
+									tx,
+								);
+					const text =
+						task.type === "bash"
+							? "Execution outcome unknown after restart; the command was not rerun."
+							: "Background task was interrupted by a server restart.";
+					tx.update(backgroundTasks)
+						.set({
+							status: task.type === "bash" ? "failed" : "cancelled",
+							output: text,
+							outputBytes: Buffer.byteLength(text),
+							completedAt: now,
+							updatedAt: now,
+						})
+						.where(and(eq(backgroundTasks.id, task.id), eq(backgroundTasks.status, "running")))
+						.run();
+					runtimePublication.commit(
+						{
+							...run,
+							eventKind: task.type === "bash" ? "failed" : "cancelled",
+							resultRef: runtimePublication.persistResult(run, text, tx),
+							summary: text,
+						},
+						tx,
+					);
+				});
+			}
+			runtimePublication.schedule();
 		}
 
 		// Only agent tasks carry a subagent narrator whose background fields describe the
@@ -2643,6 +2909,17 @@ class BackgroundTaskService {
 			// is merely paused would tell the model the transfer is over. An Await that
 			// waits out its timeout is recoverable; a wrong terminal answer is not.
 			if (task.type === "transfer") continue;
+			if (task.type === "bash") {
+				eventBus.emit({
+					type: "background_task:failed",
+					taskId: task.id,
+					parentNarratorId: task.parentNarratorId,
+					taskType: "bash",
+					status: "failed",
+					error: "Execution outcome unknown after restart; the command was not rerun.",
+				});
+				continue;
+			}
 			eventBus.emit({
 				type: "background_task:cancelled",
 				taskId: task.id,
@@ -2666,7 +2943,7 @@ class BackgroundTaskService {
 			// how an operator tells "work was destroyed" from "work is resumable".
 			transferPaused: transferIds.length,
 		});
-		return staleTasks.length;
+		return staleTasks.length + (await nextPage());
 	}
 
 	/**
@@ -2688,10 +2965,11 @@ class BackgroundTaskService {
 	 */
 	async cleanupCompleted(olderThanMs: number = CLEANUP_RETENTION_MS): Promise<number> {
 		const cutoff = new Date(Date.now() - olderThanMs).toISOString();
-		// Count first, then delete — Drizzle's delete() returns void for SQLite
+		// A bounded source-retention pass. Pending outbox/mailbox pointers keep their result alive.
 		const rows = await db
 			.select({
 				id: backgroundTasks.id,
+				logicalRunId: backgroundTasks.logicalRunId,
 				parentNarratorId: backgroundTasks.parentNarratorId,
 				type: backgroundTasks.type,
 			})
@@ -2727,8 +3005,15 @@ class BackgroundTaskService {
 					),
 				),
 			)
+			.limit(100)
 			.all();
-		const deletable = rows.filter((row) => !this.activeAgentContinuations.has(row.id));
+		const deletable = rows.filter(
+			(row) =>
+				!this.activeAgentContinuations.has(row.id) &&
+				(!row.logicalRunId ||
+					row.type === "transfer" ||
+					!runtimePublication.hasPendingSource(taskPublicationRun(row))),
+		);
 
 		if (deletable.length === 0) return 0;
 

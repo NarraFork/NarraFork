@@ -203,6 +203,7 @@ import {
 } from "../lib/validators/narrators";
 import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
 import { requireAdmin } from "../middleware/auth";
+import { isExecutionSuspended } from "../services/agent-runtime/ownership";
 import { generateAskUserQuestionAnswers } from "../services/ask-user-question-reflection";
 import {
 	hasBrokenModelMigrationUndo,
@@ -256,8 +257,8 @@ import {
 import { filterReadableNarrators, narratorReadableWhere } from "../services/narrator-acl";
 import {
 	deleteBufferedTextFile,
-	loadBufferedTextFiles,
 	persistAdditionalBufferedTextFiles,
+	retryBufferedMessage,
 } from "../services/narrator-buffer";
 import {
 	getNarratorDraft,
@@ -312,7 +313,6 @@ import {
 	cancelCompact,
 	cancelPendingExitPlanMode,
 	clearBufferedMessageSoftStopIfIdle,
-	clearBufferedMessages,
 	closeNarrator,
 	continueNarrator,
 	editAndRegenerate,
@@ -329,7 +329,6 @@ import {
 	pushBufferedMessage,
 	reconcileRunningStatus,
 	reExecuteDeniedToolCall,
-	removeBufferedMessage,
 	reorderBufferedMessages,
 	reprocessAllPendingPermissions,
 	requestBufferedMessageSoftStop,
@@ -375,7 +374,6 @@ import {
 	transferNarratorOwner,
 	updateNarratorGrant,
 } from "../services/narrator-sharing";
-import type { SubagentBufferedMessage } from "../services/narrator-subagent";
 import {
 	buildRecoveryNotifyPrompt,
 	markRecoveryCardResolved,
@@ -1911,7 +1909,8 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// went stale to idle while the loop was still draining, which would otherwise
 		// let this message start a second concurrent loop instead of being buffered.
 		let narratorBusy =
-			narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
+			!isExecutionSuspended(id) &&
+			(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id));
 
 		// An idle narrator whose context is being compacted takes the same queue path as a
 		// busy one, so the turn runs against the summary that is about to replace its
@@ -1933,7 +1932,8 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			await awaitCompactCompletion(id);
 			narrator = await narratorService.getById(id);
 			narratorBusy =
-				narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
+				!isExecutionSuspended(id) &&
+				(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id));
 		}
 
 		if (queuedNewCommand && !narratorBusy) {
@@ -1993,7 +1993,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				const { bufferSubagentUserMessage, getSubagentBufferedMessages, isTakenOver } =
 					await import("../services/narrator-subagent");
 				const takenOver = isTakenOver(id);
-				const result = bufferSubagentUserMessage(id, finalMessage, {
+				const result = await bufferSubagentUserMessage(id, finalMessage, {
 					images: images.length > 0 ? images : undefined,
 					textFiles: textFiles.length > 0 ? textFiles : undefined,
 					commandText,
@@ -2690,18 +2690,9 @@ narratorRoutes.post("/:id/restore-message/:messageId", async (c) => {
 	return c.json({ ok: result.ok });
 });
 
-/**
- * Resolve the authoritative buffer queue for a narrator.
- *
- * Primary narrators and subagents keep their queues in two separate in-memory
- * maps, so every buffer read must check both. Only one of them can be non-empty
- * for a given narrator.
- */
+/** Primary and subagent user queues are projections of the same durable mailbox. */
 async function resolveBufferQueue(narratorId: string) {
-	const messages = toBufferSummary(getBufferedMessages(narratorId));
-	if (messages.length > 0) return messages;
-	const { getSubagentBufferedMessages } = await import("../services/narrator-subagent");
-	return toBufferSummary(getSubagentBufferedMessages(narratorId));
+	return toBufferSummary(getBufferedMessages(narratorId));
 }
 
 /** Broadcast the post-mutation buffer queue to every client on this narrator. */
@@ -2719,24 +2710,20 @@ narratorRoutes.get("/:id/buffer", async (c) => {
 	return c.json(await resolveBufferQueue(id));
 });
 
-/** One queued message plus which of the two queues it lives in. */
+/** Actor policy is separate from the shared mailbox storage. */
 interface LocatedBufferedMessage {
-	message: BufferedMessage | SubagentBufferedMessage;
-	/** True when it came from the taken-over-subagent map (in-memory, no DB). */
+	message: BufferedMessage;
 	fromSubagentQueue: boolean;
 }
 
-/** Find a queued message by id, checking the primary queue then the subagent queue. */
 async function locateBufferedMessage(
 	narratorId: string,
 	messageId: string,
 ): Promise<LocatedBufferedMessage | null> {
-	const primary = getBufferedMessages(narratorId).find((m) => m.id === messageId);
-	if (primary) return { message: primary, fromSubagentQueue: false };
-	const { getSubagentBufferedMessages } = await import("../services/narrator-subagent");
-	const subagent = getSubagentBufferedMessages(narratorId).find((m) => m.id === messageId);
-	if (subagent) return { message: subagent, fromSubagentQueue: true };
-	return null;
+	const message = getBufferedMessages(narratorId).find((m) => m.id === messageId);
+	if (!message) return null;
+	const narrator = await narratorService.getById(narratorId);
+	return { message, fromSubagentQueue: isSubagentVariant(narrator.variant) };
 }
 
 /**
@@ -2787,11 +2774,7 @@ function resolveKeptBufferAttachments(
  * queue's DB row carries), then the in-memory File objects a subagent queue holds.
  */
 function bufferedTextFileNames(located: LocatedBufferedMessage): string[] {
-	if (!located.fromSubagentQueue) {
-		const saved = (located.message as BufferedMessage)._savedFiles;
-		if (saved?.length) return saved.map((file) => file.filename);
-	}
-	return (located.message.textFiles ?? []).map((file) => file.name);
+	return (located.message._savedFiles ?? []).map((file) => file.filename);
 }
 
 /** Parse a form field that carries a JSON array of strings/objects. */
@@ -2912,16 +2895,10 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 
 	// The kept halves, resolved before anything is written so the compensating
 	// deletes below know exactly which old files this edit orphans.
-	const currentSavedFiles = located.fromSubagentQueue
-		? []
-		: ((located.message as BufferedMessage)._savedFiles ?? []);
-	const currentTextFiles = located.message.textFiles ?? [];
+	const currentSavedFiles = located.message._savedFiles ?? [];
 	const keptSavedFiles = currentSavedFiles.filter((_, index) =>
 		keptTextFileIndexes.includes(index),
 	);
-	const keptTextFileObjects = located.fromSubagentQueue
-		? currentTextFiles.filter((_, index) => keptTextFileIndexes.includes(index))
-		: loadBufferedTextFiles(keptSavedFiles);
 	const droppedSavedFiles = currentSavedFiles.filter(
 		(_, index) => !keptTextFileIndexes.includes(index),
 	);
@@ -2941,32 +2918,20 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 			newImages.push(saved);
 		}
 
-		let ok: boolean;
-		if (located.fromSubagentQueue) {
-			const { updateSubagentBufferedMessage } = await import("../services/narrator-subagent");
-			ok = updateSubagentBufferedMessage(id, mid, text, {
-				images: [...keptImages, ...newImages],
-				textFiles: [...keptTextFileObjects, ...newTextFiles],
-				fileReferences: snapshots,
-			});
-		} else {
-			// New files join the message's existing directory; reserving the kept
-			// names stops an upload from overwriting an attachment being kept.
-			createdSavedFiles = newTextFiles.length
-				? await persistAdditionalBufferedTextFiles(
-						mid,
-						newTextFiles,
-						keptSavedFiles.map((file) => file.filename),
-					)
-				: [];
-			const savedFiles = [...keptSavedFiles, ...createdSavedFiles];
-			ok = updateBufferedMessage(id, mid, text, {
-				images: [...keptImages, ...newImages],
-				textFiles: loadBufferedTextFiles(savedFiles),
-				savedFiles,
-				fileReferences: snapshots,
-			});
-		}
+		// Both actor types retain the same saved paths; never re-upload kept Files.
+		createdSavedFiles = newTextFiles.length
+			? await persistAdditionalBufferedTextFiles(
+					mid,
+					newTextFiles,
+					keptSavedFiles.map((file) => file.filename),
+				)
+			: [];
+		const savedFiles = [...keptSavedFiles, ...createdSavedFiles];
+		const ok = await updateBufferedMessage(id, mid, text, {
+			images: [...keptImages, ...newImages],
+			savedFiles,
+			fileReferences: snapshots,
+		});
 		if (!ok) throw new NotFoundError("Buffered message", mid);
 		committed = true;
 	} finally {
@@ -2987,22 +2952,34 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	return c.json({ ok: true });
 });
 
+// Explicit retry retains the stable mailbox/recipient identity and resets failed attempts.
+narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
+	const id = c.req.param("id");
+	const mid = c.req.param("mid");
+	let retried: boolean;
+	try {
+		retried = retryBufferedMessage(id, mid);
+	} catch (error) {
+		throw new ValidationError(
+			error instanceof Error ? error.message : "Buffered payload unavailable",
+		);
+	}
+	if (!retried) throw new ValidationError("Only a failed user message can be retried");
+	const { wakeInboxIfEligible } = await import("../services/agent-runtime/inbox");
+	const resumed = await wakeInboxIfEligible(id);
+	await broadcastBufferQueue(id);
+	return c.json({ ok: true, resumed });
+});
+
 // Remove a single queued buffered message
 narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	const id = c.req.param("id");
 	const mid = c.req.param("mid");
-	let ok = removeBufferedMessage(id, mid);
-	if (ok) {
-		// Cancelling the message that requested a post-tool cut-in must also drop the
-		// pending soft stop, otherwise the running turn would end at the next tool
-		// boundary with nothing left to resume.
-		clearBufferedMessageSoftStopIfIdle(id);
-	} else {
-		// Fallback: subagent queue. removeSubagentBufferedMessage drops the
-		// subagent soft stop itself once the queue empties.
-		const { removeSubagentBufferedMessage } = await import("../services/narrator-subagent");
-		ok = removeSubagentBufferedMessage(id, mid);
-	}
+	// The wrapper cancels from the shared mailbox and clears subagent soft-stop
+	// state; the primary counterpart is cleared below for the same queue identity.
+	const { removeSubagentBufferedMessage } = await import("../services/narrator-subagent");
+	const ok = removeSubagentBufferedMessage(id, mid);
+	if (ok) clearBufferedMessageSoftStopIfIdle(id);
 	if (!ok) throw new NotFoundError("Buffered message", mid);
 	await broadcastBufferQueue(id);
 	return c.json({ ok: true });
@@ -3014,11 +2991,7 @@ narratorRoutes.put("/:id/buffer/reorder", async (c) => {
 	const body = await c.req.json();
 	const parsed = reorderBufferSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	let ok = reorderBufferedMessages(id, parsed.data.orderedIds);
-	if (!ok) {
-		const { reorderSubagentBufferedMessages } = await import("../services/narrator-subagent");
-		ok = reorderSubagentBufferedMessages(id, parsed.data.orderedIds);
-	}
+	const ok = reorderBufferedMessages(id, parsed.data.orderedIds);
 	if (!ok) throw new ValidationError("Invalid reorder: ids do not match the current queue");
 	await broadcastBufferQueue(id);
 	return c.json({ ok: true });
@@ -3027,12 +3000,10 @@ narratorRoutes.put("/:id/buffer/reorder", async (c) => {
 // Clear entire buffer queue
 narratorRoutes.delete("/:id/buffer", async (c) => {
 	const id = c.req.param("id");
-	clearBufferedMessages(id);
-	clearBufferedMessageSoftStopIfIdle(id);
-	// Also clear the subagent queue (mirrors the cancel_buffer WS path); a
-	// taken-over subagent's queue lives in a separate map.
+	// One persistent cancellation, plus each actor adapter's ephemeral soft stop.
 	const { clearSubagentBufferedMessages } = await import("../services/narrator-subagent");
 	clearSubagentBufferedMessages(id);
+	clearBufferedMessageSoftStopIfIdle(id);
 	broadcastToNarrator(id, { type: "buffer_set", narratorId: id, messages: [] });
 	return c.json({ ok: true });
 });

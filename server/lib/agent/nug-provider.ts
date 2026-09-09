@@ -211,11 +211,12 @@ export class NugProvider implements ProviderAdapter {
 
 	prepareForModel(model: string): void {
 		const meta = this.resolveMeta(model);
+		const delegate = this.createDelegate(meta);
 		this.activeMeta = meta;
-		this.activeDelegate = this.createDelegate(meta);
+		this.activeDelegate = delegate;
 	}
 
-	private createDelegate(meta: ResolvedNugModelMeta): ProviderAdapter | null {
+	private createDelegate(meta: ResolvedNugModelMeta): ProviderAdapter {
 		const extraHeaders = this.modelHashHeaders();
 		const delegateBase = buildNugDelegateBaseConfig(this.config, meta, extraHeaders);
 		switch (meta.channelType) {
@@ -263,7 +264,9 @@ export class NugProvider implements ProviderAdapter {
 				return delegate;
 			}
 			default:
-				return null;
+				throw new Error(
+					`NUG protocol configuration error: unsupported channelType ${JSON.stringify(meta.channelType)} for model ${JSON.stringify(meta.routedModel)}. Refresh the model catalog and check gateway/client protocol compatibility.`,
+				);
 		}
 	}
 
@@ -288,11 +291,19 @@ export class NugProvider implements ProviderAdapter {
 		return undefined;
 	}
 
-	private ensureDelegateForModel(model: string): ProviderAdapter | null {
+	private ensureDelegateForModel(model: string): ProviderAdapter {
 		const meta = this.resolveMeta(model);
-		if (this.activeMeta?.routedModel === meta.routedModel) return this.activeDelegate;
+		if (
+			this.activeDelegate &&
+			this.activeMeta?.routedModel === meta.routedModel &&
+			this.activeMeta.channelType === meta.channelType &&
+			this.activeMeta.channel === meta.channel
+		) {
+			return this.activeDelegate;
+		}
+		const delegate = this.createDelegate(meta);
 		this.activeMeta = meta;
-		this.activeDelegate = this.createDelegate(meta);
+		this.activeDelegate = delegate;
 		return this.activeDelegate;
 	}
 
@@ -356,17 +367,14 @@ export class NugProvider implements ProviderAdapter {
 		narratorId?: string,
 	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
 		const meta = this.resolveMeta(model);
+		const delegate = this.createDelegate(meta);
 		this.activeMeta = meta;
-		this.activeDelegate = this.createDelegate(meta);
-		if (this.activeDelegate) {
-			// Delegates carry their own reasoning-source override (assigned in
-			// createDelegate: anthropic-family → thinking signatures, codex/openai/
-			// responses → encrypted_content), so no extra source plumbing is needed
-			// here.
-			return this.activeDelegate.buildHistory(dbMessages, this.modelForDelegate(meta), narratorId);
-		}
-		// Unreachable: all supported channel types create a delegate.
-		return { history: [], trailingToolResults: [] };
+		this.activeDelegate = delegate;
+		// Delegates carry their own reasoning-source override (assigned in
+		// createDelegate: anthropic-family → thinking signatures, codex/openai/
+		// responses → encrypted_content), so no extra source plumbing is needed
+		// here.
+		return delegate.buildHistory(dbMessages, this.modelForDelegate(meta), narratorId);
 	}
 
 	getActiveReasoningSource(): string | undefined {
@@ -383,7 +391,7 @@ export class NugProvider implements ProviderAdapter {
 		locale?: string,
 	): void {
 		const delegate = this.ensureDelegateForModel(model);
-		if (delegate && this.activeMeta) {
+		if (this.activeMeta) {
 			delegate.injectSystemPrompt(
 				history,
 				systemPrompt,
@@ -431,13 +439,9 @@ export class NugProvider implements ProviderAdapter {
 		};
 
 		const runOnce = (): AsyncGenerator<ParsedStreamEvent> =>
-			delegate
-				? this.filterModelCatalogEvents(
-						delegate.chat({ ...params, model: this.modelForDelegate(meta) }),
-					)
-				: (async function* () {
-						// Unreachable: all supported channel types create a delegate.
-					})();
+			this.filterModelCatalogEvents(
+				delegate.chat({ ...params, model: this.modelForDelegate(meta) }),
+			);
 
 		let yielded = false;
 		let cacheMiss = false;
@@ -491,7 +495,7 @@ export class NugProvider implements ProviderAdapter {
 		images?: Array<{ format: string; base64: string }>,
 	): void {
 		const delegate = this.ensureDelegateForModel(model);
-		if (delegate && this.activeMeta) {
+		if (this.activeMeta) {
 			delegate.pushUserTurn(
 				history,
 				content,
@@ -562,16 +566,7 @@ export class NugProvider implements ProviderAdapter {
 		const delegate = this.createDelegate(meta);
 		this.activeMeta = meta;
 		this.activeDelegate = delegate;
-		if (delegate) {
-			return delegate.generateWithMeta(
-				text,
-				this.modelForDelegate(meta),
-				systemInstruction,
-				options,
-			);
-		}
-		// Unreachable: all supported channel types create a delegate.
-		return { text: "" };
+		return delegate.generateWithMeta(text, this.modelForDelegate(meta), systemInstruction, options);
 	}
 
 	async generateWithHistory(
@@ -602,7 +597,7 @@ export class NugProvider implements ProviderAdapter {
 		const delegate = this.createDelegate(meta);
 		this.activeMeta = meta;
 		this.activeDelegate = delegate;
-		if (delegate?.generateWithHistoryWithMeta) {
+		if (delegate.generateWithHistoryWithMeta) {
 			return delegate.generateWithHistoryWithMeta(
 				systemInstruction,
 				content,
@@ -611,19 +606,15 @@ export class NugProvider implements ProviderAdapter {
 				options,
 			);
 		}
-		if (delegate) {
-			return {
-				text: await delegate.generateWithHistory(
-					systemInstruction,
-					content,
-					this.modelForDelegate(meta),
-					locale,
-					options,
-				),
-			};
-		}
-		// Unreachable: all supported channel types create a delegate.
-		return { text: "" };
+		return {
+			text: await delegate.generateWithHistory(
+				systemInstruction,
+				content,
+				this.modelForDelegate(meta),
+				locale,
+				options,
+			),
+		};
 	}
 
 	// === NUG-specific methods (for frontend proxy routes) ===

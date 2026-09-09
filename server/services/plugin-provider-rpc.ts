@@ -36,7 +36,7 @@ const DEFAULT_LIMITS: ProviderRpcLimits = {
 	maxEventsPerOperation: 100_000,
 	acceptedTimeoutMs: 5_000,
 	unaryTimeoutMs: 30_000,
-	streamIdleTimeoutMs: 120_000,
+	streamIdleTimeoutMs: 5 * 60_000,
 	operationTimeoutMs: 30 * 60_000,
 	cancelGraceMs: 5_000,
 	maxLateEvents: 3,
@@ -1488,10 +1488,14 @@ export class PluginProviderRpcClient {
 				record,
 				"timeout",
 				"Provider stream became idle",
-				new ProviderRpcError("STREAM_IDLE_TIMEOUT", "Provider stream idle timeout", {
-					operationId: record.operationId,
-					requestId: record.requestId,
-				}),
+				new ProviderRpcError(
+					"STREAM_IDLE_TIMEOUT",
+					`Provider stream idle timeout after ${this.limits.streamIdleTimeoutMs}ms`,
+					{
+						operationId: record.operationId,
+						requestId: record.requestId,
+					},
+				),
 			);
 		}, this.limits.streamIdleTimeoutMs);
 	}

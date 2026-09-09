@@ -25,23 +25,23 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { getTestDb } from "../../../tests/setup";
-import { narratorBufferedMessages } from "../../db/schema";
+import { narratorBufferedMessages, narrators } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
 const { getBufferedMessages, pushBufferedMessage } = await import("../narrator-buffer");
-const {
-	activeNarrators,
-	bufferedMessages,
-	claimNarratorRuntime,
-	pendingDangerReflections,
-	pendingPermissions,
-} = await import("../narrator-session-state");
+const { activeNarrators, claimNarratorRuntime, pendingDangerReflections, pendingPermissions } =
+	await import("../narrator-session-state");
 
 const NARRATOR_ID = "buffer-admission-narrator";
 const OTHER_ID = "buffer-admission-other";
+for (const id of [NARRATOR_ID, OTHER_ID]) {
+	db.insert(narrators)
+		.values({ id, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+		.run();
+}
 
 /** Register a live agent loop the way runAgentLoop does. */
 function registerLiveLoop(narratorId: string): void {
@@ -62,7 +62,6 @@ async function readPersistedTexts(narratorId: string): Promise<string[]> {
 
 afterEach(() => {
 	activeNarrators.clear();
-	bufferedMessages.clear();
 	pendingPermissions.clear();
 	pendingDangerReflections.clear();
 	sqlite.run("DELETE FROM narrator_buffered_messages");

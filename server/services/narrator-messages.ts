@@ -59,6 +59,7 @@ import {
 	resolveAwaitAgentIdsForToolCalls,
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
+import { deleteRecipientMessageRefs, updateRecipientMessageRef } from "./narrator-persistence";
 import {
 	ensureRefsCoverMessage,
 	ensureRefsCoverSeq,
@@ -69,7 +70,10 @@ import {
 	revertNarratorScopedForToolUses,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
-import { attachActiveSendDeliveryTargets } from "./send-delivery-resolution";
+import {
+	attachActiveSendDeliveryTargets,
+	attachSendTargetDetails,
+} from "./send-delivery-resolution";
 import {
 	commitSnapshotRevert,
 	DEFAULT_REVERT_SCOPE,
@@ -761,7 +765,7 @@ function applyBlockDeletionTx(
 		)
 		.map((block) => block.id);
 	if (remaining.length === 0) {
-		tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, ref.id)).run();
+		deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, ref.id)).run();
 		if (!isShared) deleteOrphanedMessages(tx, [message.id]);
 		return;
 	}
@@ -787,6 +791,10 @@ function applyBlockDeletionTx(
 			.set({ messageId: newId })
 			.where(eq(narratorMessageRefs.id, ref.id))
 			.run();
+		updateRecipientMessageRef(tx, narratorId, ref.id, {
+			kind: "semantic_edit",
+			messageId: newId,
+		});
 		const retainedIds = new Set(
 			remaining.filter((block) => block.type === "tool_use").map((block) => block.id),
 		);
@@ -810,6 +818,10 @@ function applyBlockDeletionTx(
 			.run();
 	} else {
 		tx.update(narratorMessages).set(patch).where(eq(narratorMessages.id, message.id)).run();
+		updateRecipientMessageRef(tx, narratorId, ref.id, {
+			kind: "semantic_edit",
+			messageId: message.id,
+		});
 		if (removedToolIds.length > 0) {
 			tx.delete(narratorToolCalls)
 				.where(
@@ -978,6 +990,94 @@ function assertNoRunningCompactRefsTx(tx: MessageTx, narratorId: string, refIds:
 			);
 		}
 	}
+}
+
+// Classification and single-ref removal share a transaction: never exempt a range.
+function deleteOutputlessAssistantMessage(
+	narratorId: string,
+	messageId: string,
+	kind: "reasoning-only" | "empty-placeholder",
+): boolean {
+	return db.transaction((tx) => {
+		const ref = tx.query.narratorMessageRefs
+			.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+			})
+			.sync();
+		if (!ref) return false;
+		const msg = tx.query.narratorMessages
+			.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				columns: {
+					role: true,
+					contentJson: true,
+					contentText: true,
+					parentToolUseId: true,
+					treeHashAfter: true,
+					snapshotCommitSha: true,
+				},
+				with: { toolCalls: { columns: { id: true }, limit: 1 } },
+			})
+			.sync();
+		if (!msg) return false;
+		const valid =
+			kind === "reasoning-only"
+				? isDanglingReasoningOnlyAssistantMessage(msg)
+				: msg.role === "assistant" &&
+					Array.isArray(msg.contentJson) &&
+					msg.contentJson.length === 0 &&
+					!msg.contentText?.trim() &&
+					msg.toolCalls.length === 0 &&
+					!msg.parentToolUseId &&
+					!msg.treeHashAfter &&
+					!msg.snapshotCommitSha &&
+					!ref.isCompact &&
+					!ref.segmentCompactId;
+		if (!valid) throw new ValidationError(`Message is not a ${kind} assistant record`);
+		if (kind === "empty-placeholder") {
+			const patch = tx.query.narratorPatches
+				.findFirst({
+					where: eq(narratorPatches.messageId, messageId),
+					columns: { id: true },
+				})
+				.sync();
+			const boundary = tx.query.narrators
+				.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { forkMessageId: true, pruneBoundaryMessageId: true },
+				})
+				.sync();
+			// Other narrators' shared refs retain the original record below.
+			if (
+				patch ||
+				boundary?.forkMessageId === messageId ||
+				boundary?.pruneBoundaryMessageId === messageId
+			)
+				throw new ValidationError("Retry placeholder has file or history boundaries");
+		}
+		assertNoRunningCompactRefsTx(tx, narratorId, [ref.id]);
+		deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, ref.id)).run();
+		const otherRef = tx.query.narratorMessageRefs
+			.findFirst({
+				where: eq(narratorMessageRefs.messageId, messageId),
+				columns: { id: true },
+			})
+			.sync();
+		if (!otherRef) tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
+		tx.update(narrators)
+			.set({
+				apiConversationId: null,
+				messageVersion: sql`${narrators.messageVersion} + 1`,
+				messageStructureVersion: sql`${narrators.messageStructureVersion} + 1`,
+				updatedAt: new Date().toISOString(),
+			})
+			.where(eq(narrators.id, narratorId))
+			.run();
+		return true;
+	});
 }
 
 function isCompactLifecycleMessage(message: { contentJson: unknown }): boolean {
@@ -1251,7 +1351,7 @@ async function deleteMessageRange(
 	const apply = (tx: MessageTx, planned: ReturnType<typeof planMessageRangeDeletion>) => {
 		if (planned.refs.length === 0) return;
 		insertFileHistoryCheckpoints(tx, narratorId, planned.checkpoints);
-		tx.delete(narratorMessageRefs)
+		deleteRecipientMessageRefs(tx)
 			.where(
 				and(
 					eq(narratorMessageRefs.narratorId, narratorId),
@@ -2517,7 +2617,9 @@ async function buildTreeFromTopLevelRefs(
 	// row can open the child's session before the wait returns.
 	const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMessages, ...childMessages]);
 	return attachTakenOverFlags(
-		attachActiveSendDeliveryTargets(attachAwaitAgentNarratorIds(enriched, awaitAgentIds)),
+		await attachSendTargetDetails(
+			attachActiveSendDeliveryTargets(attachAwaitAgentNarratorIds(enriched, awaitAgentIds)),
+		),
 		collectTakenOverToolUseIds(activities, awaitAgentIds),
 	);
 }
@@ -3878,14 +3980,16 @@ const narratorMessageQueriesUnlocked = {
 		});
 
 		return {
-			topLevel: tree,
-			orphanChildren: attachActiveSendDeliveryTargets(
-				attachTakenOverFlags(
-					attachAwaitAgentNarratorIds(
-						enrichToolUseBlocks(truncateToolIO(orphanChildren)),
-						awaitAgentIds,
+			topLevel: await attachSendTargetDetails(tree),
+			orphanChildren: await attachSendTargetDetails(
+				attachActiveSendDeliveryTargets(
+					attachTakenOverFlags(
+						attachAwaitAgentNarratorIds(
+							enrichToolUseBlocks(truncateToolIO(orphanChildren)),
+							awaitAgentIds,
+						),
+						takenOverToolUseIds,
 					),
-					takenOverToolUseIds,
 				),
 			),
 			subagentActivities,
@@ -4016,7 +4120,7 @@ const narratorMessageQueriesUnlocked = {
 
 			// Delete only this narrator's ref. A sibling fork keeps its own view of
 			// the shared marker and its message row remains alive while referenced.
-			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, currentRef.id)).run();
+			deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, currentRef.id)).run();
 			const remainingRef = tx.query.narratorMessageRefs
 				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
 				.sync();
@@ -4084,7 +4188,7 @@ const narratorMessageQueriesUnlocked = {
 		}
 
 		db.transaction((tx) => {
-			tx.delete(narratorMessageRefs)
+			deleteRecipientMessageRefs(tx)
 				.where(
 					and(
 						eq(narratorMessageRefs.narratorId, narratorId),
@@ -4148,7 +4252,7 @@ const narratorMessageQueriesUnlocked = {
 		}
 
 		db.transaction((tx) => {
-			tx.delete(narratorMessageRefs)
+			deleteRecipientMessageRefs(tx)
 				.where(
 					and(
 						eq(narratorMessageRefs.narratorId, narratorId),
@@ -4292,45 +4396,12 @@ const narratorMessageQueriesUnlocked = {
 	 * Throws when the target turns out not to be reasoning-only.
 	 */
 	async deleteDanglingReasoningMessage(narratorId: string, messageId: string): Promise<boolean> {
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
-		if (!ref) return false;
+		return deleteOutputlessAssistantMessage(narratorId, messageId, "reasoning-only");
+	},
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true, contentText: true },
-			with: { toolCalls: { columns: { id: true } } },
-		});
-		if (!msg) return false;
-		if (!isDanglingReasoningOnlyAssistantMessage(msg)) {
-			throw new ValidationError("Message is not a reasoning-only assistant record");
-		}
-
-		db.transaction((tx) => {
-			assertNoRunningCompactRefsTx(tx, narratorId, [ref.id]);
-			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, ref.id)).run();
-			const otherRef = tx.query.narratorMessageRefs
-				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
-				.sync();
-			if (!otherRef) {
-				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
-			}
-			tx.update(narrators)
-				.set({
-					// The provider-side conversation no longer matches the stored history.
-					apiConversationId: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					messageStructureVersion: sql`${narrators.messageStructureVersion} + 1`,
-					updatedAt: new Date().toISOString(),
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
-		});
-		return true;
+	/** Retry-only cleanup of one empty record without tool/file/history boundaries. */
+	async deleteEmptyRetryPlaceholder(narratorId: string, messageId: string): Promise<boolean> {
+		return deleteOutputlessAssistantMessage(narratorId, messageId, "empty-placeholder");
 	},
 
 	async dismissCwdRecoveryMessage(narratorId: string, messageId: string) {
@@ -4355,7 +4426,7 @@ const narratorMessageQueriesUnlocked = {
 		}
 
 		db.transaction((tx) => {
-			tx.delete(narratorMessageRefs)
+			deleteRecipientMessageRefs(tx)
 				.where(
 					and(
 						eq(narratorMessageRefs.narratorId, narratorId),
@@ -4422,7 +4493,7 @@ const narratorMessageQueriesUnlocked = {
 		// ref is NOT an error here: a non-atomic-write orphan still needs cleanup,
 		// and the user-facing dismiss must always succeed for a real error notice.
 		db.transaction((tx) => {
-			tx.delete(narratorMessageRefs)
+			deleteRecipientMessageRefs(tx)
 				.where(
 					and(
 						eq(narratorMessageRefs.narratorId, narratorId),
@@ -4513,7 +4584,7 @@ const narratorMessageQueriesUnlocked = {
 					"COMPACT_IN_PROGRESS",
 				);
 			}
-			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, ref.id)).run();
+			deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, ref.id)).run();
 			const remainingRef = tx.query.narratorMessageRefs
 				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
 				.sync();
@@ -4663,6 +4734,9 @@ export const narratorMessageQueries = {
 	deleteMessagesAfter: admittedMutation(narratorMessageQueriesUnlocked.deleteMessagesAfter),
 	deleteMessageBlock: admittedMutation(narratorMessageQueriesUnlocked.deleteMessageBlock),
 	deleteMessageBlocks: admittedMutation(narratorMessageQueriesUnlocked.deleteMessageBlocks),
+	deleteEmptyRetryPlaceholder: admittedMutation(
+		narratorMessageQueriesUnlocked.deleteEmptyRetryPlaceholder,
+	),
 	deleteDanglingReasoningMessage: admittedMutation(
 		narratorMessageQueriesUnlocked.deleteDanglingReasoningMessage,
 	),

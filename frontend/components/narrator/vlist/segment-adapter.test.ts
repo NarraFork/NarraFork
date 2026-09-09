@@ -128,6 +128,95 @@ describe("communication bubbles", () => {
 		).toEqual(settled);
 	});
 
+	it("merges current title and exact consumption into final reply results", () => {
+		const tc = {
+			outputJson: {
+				_metadata: {
+					targets: [
+						{
+							id: "child",
+							label: "alias",
+							title: "Old",
+							deliveryMessageId: "m",
+							status: "completed",
+							awaited: true,
+						},
+					],
+				},
+			},
+			_sendDeliveryTargets: [
+				{
+					id: "child",
+					title: "Current",
+					deliveryMessageId: "m",
+					injectionConsumedAt: "2026-09-09T00:00:00Z",
+				},
+			],
+		};
+		const result = data({ id: "alias", message: "hello", await: true }, tc);
+		expect(result.recipients).toEqual([
+			{
+				id: "child",
+				label: "Current",
+				title: "Current",
+				deliveryMessageId: "m",
+				injectionConsumedAt: "2026-09-09T00:00:00Z",
+			},
+		]);
+		expect(result.deliveryState).toMatchObject({ targetCount: 1, receivedCount: 1, replyCount: 1 });
+		expect(tc.outputJson._metadata.targets[0]?.title).toBe("Old");
+		const stale = data(
+			{ id: "alias", await: true },
+			{
+				...tc,
+				_sendDeliveryTargets: [{ ...tc._sendDeliveryTargets[0], deliveryMessageId: "other" }],
+			},
+		);
+		expect(stale.deliveryState?.receivedCount).toBe(0);
+		expect(stale.deliveryState?.replyCount).toBe(1);
+	});
+
+	it("uses selector/runtime counts before every target has reported", () => {
+		const _sendDeliveryTargets = [
+			{
+				id: "child",
+				title: "Current",
+				deliveryMessageId: "m",
+				injectionConsumedAt: "2026-09-09T00:00:00Z",
+			},
+		];
+		const partial = data(
+			{ ids: ["child", "second", "third"], await: true },
+			{ status: "running", _sendDeliveryTargets },
+		);
+		expect(partial.deliveryState).toMatchObject({
+			targetCount: 3,
+			receivedCount: 1,
+			sentCount: 1,
+			replyCount: 0,
+		});
+		const broadcast = data(
+			{ action: "broadcast" },
+			{
+				toolName: "TeamStatus",
+				status: "running",
+				_sendDeliveryTargets,
+				_sendDeliveryTargetCount: 4,
+			},
+		);
+		expect(broadcast.deliveryState).toMatchObject({ targetCount: 4, receivedCount: 1 });
+		const empty = data(
+			{ action: "broadcast" },
+			{ toolName: "TeamStatus", _metadata: { targets: [], targetCount: 0 } },
+		);
+		expect(empty.deliveryState).toMatchObject({
+			targetCount: 0,
+			receivedCount: 0,
+			replyCount: 0,
+			noRecipients: true,
+		});
+	});
+
 	it("uses authoritative targets, including an empty result, instead of guessing aliases", () => {
 		expect(
 			data(
@@ -264,7 +353,7 @@ describe("communication bubbles", () => {
 		).toMatchObject({ status: "success", warning: "Target is not currently working" });
 		expect(
 			data({}, { _metadata: { targets: [{ id: "parent", title: "Primary" }] } }).recipients,
-		).toEqual([{ label: "Primary" }]);
+		).toEqual([{ label: "Primary", title: "Primary" }]);
 	});
 
 	it("retains errors and normalized timing without substituting output for sent text", () => {

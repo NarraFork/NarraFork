@@ -64,6 +64,8 @@ async function check(
 		before.editor.revision === after.editor.revision &&
 		before.editor.canUndo === after.editor.canUndo &&
 		(!name.startsWith("readonly") || after.editor.readOnly) &&
+		(!name.endsWith("touch-scroll") || after.editor.top > before.editor.top + 20) &&
+		(name !== "touch-horizontal" || after.editor.left > before.editor.left + 20) &&
 		(!name.startsWith("long-line") || after.editor.left > 1000) &&
 		(searchMatch
 			? after.editor.selectionText === "SEARCH_TARGET"
@@ -346,6 +348,41 @@ try {
 	if (!(quickEnterDelayMs >= 0 && quickEnterDelayMs < 150))
 		errors.push(`Fast Enter not exercised: ${quickEnterDelayMs}ms`);
 	await check(page, "readonly-source-search-first", sourceOpened, await snapshot(page));
+	// Enable touch BEFORE reloading: Monaco detects touch support during module initialization.
+	await page.setViewport({ width: 1100, height: 800, hasTouch: true });
+	const touchSession = await page.createCDPSession();
+	for (const [name, options, horizontal] of [
+		["touch-scroll", {}, false],
+		["readonly-touch-scroll", { readOnly: true }, false],
+		["touch-horizontal", { longLine: true }, true],
+	] as const) {
+		const before = await reset(options);
+		const origin = await page.$eval(".monaco-editor .view-lines", (element) => {
+			const rect = element.getBoundingClientRect();
+			return { x: rect.left + 350, y: rect.top + 250 };
+		});
+		await touchSession.send("Input.dispatchTouchEvent", {
+			type: "touchStart",
+			touchPoints: [{ ...origin, id: 1 }],
+		});
+		for (let step = 1; step <= 8; step++) {
+			await touchSession.send("Input.dispatchTouchEvent", {
+				type: "touchMove",
+				touchPoints: [
+					{
+						id: 1,
+						x: origin.x - (horizontal ? step * 20 : 0),
+						y: origin.y - (horizontal ? 0 : step * 20),
+					},
+				],
+			});
+			await frames(page);
+		}
+		await touchSession.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+		await frames(page);
+		await check(page, name, before, await snapshot(page), false);
+	}
+	await touchSession.detach();
 	const bugConfirmed =
 		checks.some((item) => item.name === "activation-only-control" && item.pass) &&
 		checks.some((item) => item.name === "first-open" && item.pass) &&

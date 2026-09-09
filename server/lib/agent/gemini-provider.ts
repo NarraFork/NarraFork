@@ -7,6 +7,7 @@ import { parseModelId, settings } from "../settings";
 import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import type { UsageData } from "../usage-tracking";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
+import { isCompletionLimitReason } from "./error-handling";
 import type {
 	ChatParams,
 	DbMessage,
@@ -581,21 +582,26 @@ export class GeminiProvider implements ProviderAdapter {
 
 		let text = "";
 		let usage: UsageData | null = null;
+		let outputTruncated = false;
 		for await (const event of this.parseSSEStream(response.body)) {
-			if (event.invalidState) {
-				throw new ApiError(
-					invalidStateHttpStatus(event.invalidState.reason),
-					event.invalidState.message,
-				);
-			}
 			if (event.text) {
 				text += event.text;
 				await opts.onTextDelta?.(event.text);
 			}
 			if (event.reasoning) await opts.onReasoningDelta?.(event.reasoning);
 			if (event.usage) usage = usageFromStreamEvent(event.usage);
+			if (event.invalidState) {
+				if (text && isCompletionLimitReason(event.invalidState.reason)) {
+					outputTruncated = true;
+					continue;
+				}
+				throw new ApiError(
+					invalidStateHttpStatus(event.invalidState.reason),
+					event.invalidState.message,
+				);
+			}
 		}
-		return { text, usage };
+		return { text, usage, ...(outputTruncated && { outputTruncated }) };
 	}
 
 	private buildGeminiHistory(dbMessages: DbMessage[]): {
@@ -1113,14 +1119,25 @@ async function parseGenerateJsonFallback(
 		throw new ApiError(json.error.code ?? 500, `Gemini API error: ${json.error.message}`);
 	}
 
+	const candidate = json.candidates?.[0];
+	if (json.promptFeedback?.blockReason) {
+		throw new ApiError(422, `Request blocked by Gemini: ${json.promptFeedback.blockReason}`);
+	}
+	if (["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"].includes(candidate?.finishReason ?? "")) {
+		throw new ApiError(422, `Response blocked by Gemini (${candidate?.finishReason}).`);
+	}
 	let text = "";
-	for (const part of json.candidates?.[0]?.content?.parts ?? []) {
+	for (const part of candidate?.content?.parts ?? []) {
 		if (!part.text || part.thought) continue;
 		text += part.text;
 		assertByteLimit(text, GEMINI_GENERATE_MAX_TEXT_BYTES, "response text");
 		await onTextDelta?.(part.text);
 	}
-	return { text, usage: mapUsage(json.usageMetadata) };
+	const outputTruncated = candidate?.finishReason === "MAX_TOKENS";
+	if (outputTruncated && !text) {
+		throw new ApiError(422, "Response truncated: model reached maximum token limit.");
+	}
+	return { text, usage: mapUsage(json.usageMetadata), ...(outputTruncated && { outputTruncated }) };
 }
 
 function invalidStateHttpStatus(reason: string): number {

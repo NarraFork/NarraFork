@@ -3719,6 +3719,12 @@ export async function handlePermission(
 	}
 
 	if (toolName === "AskUserQuestion") {
+		try {
+			const { assertNarratorCanAskQuestion } = await import("./narrator-question-service");
+			await assertNarratorCanAskQuestion(narratorId, effectiveInput);
+		} catch (error) {
+			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
+		}
 		const askResult = await validateOrRepairAskUserQuestionInput(
 			narratorId,
 			toolUseId,
@@ -4559,7 +4565,11 @@ export interface SubagentFeedbackDelivery {
 	 * Queue the text as the subagent's next user turn and request a safe stop.
 	 * Returns false when the queue refused it (full, or no running subagent).
 	 */
-	deliver: (narratorId: string, text: string, options: { createdBy: string | null }) => boolean;
+	deliver: (
+		narratorId: string,
+		text: string,
+		options: { createdBy: string | null },
+	) => boolean | Promise<boolean>;
 }
 
 /** Lazily bound to the real subagent modules; replaced only by tests. */
@@ -4610,17 +4620,19 @@ async function deliverSubagentPermissionFeedback(
 			]);
 			delivery = {
 				isSubagentRunning: (id) => activeSubagentSettings.has(id),
-				deliver: (id, message, options) =>
-					bufferSubagentUserMessage(id, message, {
-						createdBy: options.createdBy,
-						// A taken-over subagent is driven by the user directly, so cutting
-						// short the turn they are steering would be wrong; the resume path
-						// drains the queue instead. Same rule every other subagent send obeys.
-						requestSoftStop: !isTakenOver(id),
-					}).ok,
+				deliver: async (id, message, options) =>
+					(
+						await bufferSubagentUserMessage(id, message, {
+							createdBy: options.createdBy,
+							// A taken-over subagent is driven by the user directly, so cutting
+							// short the turn they are steering would be wrong; the resume path
+							// drains the queue instead. Same rule every other subagent send obeys.
+							requestSoftStop: !isTakenOver(id),
+						})
+					).ok,
 			};
 		}
-		if (!delivery.deliver(narratorId, text, { createdBy: userId })) {
+		if (!(await delivery.deliver(narratorId, text, { createdBy: userId }))) {
 			logger.warn("Subagent permission feedback could not be queued", {
 				narratorId,
 				chars: text.length,

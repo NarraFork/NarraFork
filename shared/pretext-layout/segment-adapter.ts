@@ -34,6 +34,13 @@ import {
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 import { subagentResultText } from "../subagent-result-text";
+import {
+	type CommunicationState,
+	communicationSelectors,
+	communicationTargetLabel,
+	deriveCommunicationState,
+	resolveCommunicationTargets,
+} from "./communication-state";
 import type { VListElementKind } from "./element-kinds";
 import type { InjectionTarget } from "./injection-target";
 import type { RenderLod } from "./prepared-block";
@@ -2311,7 +2318,8 @@ function adaptSpokenInjection(
 	// A background task is an addressable, NAMED thing — `Bash` takes an `alias`
 	// precisely so a later `Await({ id })` can refer to it — so "run-tests finished,
 	// here is its output" has a subject in the same way a teammate's message does.
-	// The alias is what the reader launched it as, so it wins over the derived title.
+	// An agent completion identifies a subagent, so show its current narrator title;
+	// a Bash completion is instead addressed by its launch alias.
 	if (body.kind === "tasksDone") {
 		// One finished task per row (persistence delivers them singly now), so the key is
 		// the task id alone — no positional suffix.
@@ -2347,7 +2355,10 @@ function adaptSpokenInjection(
 				key: `${idBase}-b${blockIndex}-t-${task.id}`,
 				data: {
 					markdown,
-					speaker: task.alias?.trim() || task.title?.trim() || task.id,
+					speaker:
+						body.flavor === "agent"
+							? task.title?.trim() || task.alias?.trim() || task.id
+							: task.alias?.trim() || task.title?.trim() || task.id,
 					// A background task is addressable by id, which is what seeds its glyph.
 					speakerId: task.id ?? null,
 					speakerKind: task.status ?? null,
@@ -3047,7 +3058,14 @@ interface ToolRunContext {
 export interface CommunicationBubbleData {
 	toolUseId?: string;
 	toolName: string;
-	recipients: { label: string; id?: string; deliveryMessageId?: string }[];
+	recipients: {
+		label: string;
+		title?: string;
+		id?: string;
+		deliveryMessageId?: string;
+		injectionConsumedAt?: string;
+	}[];
+	deliveryState?: CommunicationState;
 	broadcast: boolean;
 	message: string;
 	messageTruncated: boolean;
@@ -3068,44 +3086,20 @@ function communicationRecipients(
 	metadata: Record<string, unknown>,
 	tc: AdapterToolItem["tc"],
 ): CommunicationBubbleData["recipients"] {
-	const selectors: string[] = [];
-	const add = (value: unknown) => {
-		if (typeof value === "string" && value.trim() && !selectors.includes(value.trim())) {
-			selectors.push(value.trim());
-		}
-	};
-	for (const field of ["id", "name", "target_id"]) add(input[field]);
-	for (const field of ["ids", "names"]) {
-		const values = input[field];
-		if (Array.isArray(values)) for (const value of values) add(value);
-	}
-	// Persisted targets are the resolved authoritative set (including an empty
-	// broadcast result); selectors may be aliases or prefixes, never guessed ids.
+	const selectors = communicationSelectors(input);
+	// Persisted targets define the complete set; live events may cover only a prefix.
 	const liveTargets = asObject(tc)._sendDeliveryTargets;
-	const targets = Array.isArray(metadata.targets)
-		? metadata.targets
-		: Array.isArray(liveTargets)
-			? liveTargets
-			: undefined;
-	if (targets) {
-		return targets.flatMap((target) => {
-			const value = asObject(target);
-			const id = readNonEmptyString(value, "id");
-			const deliveryMessageId = readNonEmptyString(value, "deliveryMessageId");
-			const label =
-				readNonEmptyString(value, "label") ??
-				readNonEmptyString(value, "title") ??
-				(!Array.isArray(metadata.targets) && selectors.length === 1 ? selectors[0] : undefined) ??
-				id;
-			return label
-				? [
-						{
-							label,
-							...(id && id !== "parent" && id !== "main" ? { id } : {}),
-							...(deliveryMessageId ? { deliveryMessageId } : {}),
-						},
-					]
-				: [];
+	if (Array.isArray(metadata.targets) || Array.isArray(liveTargets)) {
+		return resolveCommunicationTargets(metadata, liveTargets).map((target) => {
+			const { id, deliveryMessageId } = target;
+			const title = target.title?.trim();
+			return {
+				label: communicationTargetLabel(target),
+				...(title ? { title } : {}),
+				...(id && id !== "parent" && id !== "main" ? { id } : {}),
+				...(deliveryMessageId ? { deliveryMessageId } : {}),
+				...(target.injectionConsumedAt ? { injectionConsumedAt: target.injectionConsumedAt } : {}),
+			};
 		});
 	}
 	const resolved = readNonEmptyString(tc, "_awaitAgentNarratorId");
@@ -3127,7 +3121,17 @@ function buildCommunicationBubbleData(
 	const preview = limitCommunicationPreview(text);
 	const message = preview.text;
 	const messageTruncated = hasTruncatedLeaf(input.message) || preview.truncated;
-	const targets = Array.isArray(metadata.targets) ? metadata.targets.map(asObject) : [];
+	const targets = resolveCommunicationTargets(metadata, asObject(item.tc)._sendDeliveryTargets);
+	const awaitReply =
+		item.tc.toolName === "Send" &&
+		(typeof input.await === "boolean" ? input.await : metadata.await === true);
+	const deliveryState = deriveCommunicationState({
+		targets,
+		targetCount: metadata.targetCount ?? asObject(item.tc)._sendDeliveryTargetCount,
+		selectorCount: Array.isArray(metadata.targets) ? 0 : communicationSelectors(input).length,
+		awaitReply,
+		status: item.tc.status,
+	});
 	const failedTarget = targets.find(
 		(target) => target.status === "fail" || target.status === "failed" || target.status === "error",
 	);
@@ -3142,14 +3146,14 @@ function buildCommunicationBubbleData(
 			: (item.tc.status ?? "initializing");
 	const error =
 		readNonEmptyString(item.tc, "errorMessage") ??
-		(failedTarget ? readNonEmptyString(failedTarget, "error") : undefined) ??
+		failedTarget?.error?.trim() ??
 		(status === "fail" || status === "error" || status === "failed"
 			? (readLeafText(item.tc.outputJson) ?? readLeafText(asObject(item.tc.outputJson)._text))
 			: undefined);
 	const warning =
 		readNonEmptyString(metadata, "warning") ??
 		(interruptedTarget
-			? (readNonEmptyString(interruptedTarget, "error") ?? String(interruptedTarget.status))
+			? interruptedTarget.error?.trim() || String(interruptedTarget.status)
 			: undefined);
 	return {
 		toolUseId: item.tc.toolUseId,
@@ -3186,9 +3190,8 @@ function buildCommunicationBubbleData(
 				isStreaming: isStreamingToolItem(item),
 			},
 		),
-		awaitReply:
-			item.tc.toolName === "Send" &&
-			(typeof input.await === "boolean" ? input.await : metadata.await === true),
+		awaitReply,
+		deliveryState,
 		status,
 		...(error ? { error: error.slice(0, COMMUNICATION_ERROR_MAX_CHARS) } : {}),
 		...(warning ? { warning: warning.slice(0, COMMUNICATION_ERROR_MAX_CHARS) } : {}),
@@ -3533,7 +3536,14 @@ function buildToolCardData(
 			status: item.tc.status,
 			inputJson: applyPendingPlanFallback(inputJson, item, ctx),
 			outputJson,
-			metadata,
+			metadata: isCommunicationTool(item.tc)
+				? {
+						...asObject(metadata),
+						_sendDeliveryTargets: asObject(item.tc)._sendDeliveryTargets,
+						targetCount:
+							asObject(metadata).targetCount ?? asObject(item.tc)._sendDeliveryTargetCount,
+					}
+				: metadata,
 			isStreaming,
 			...(errorMessage ? { errorMessage } : {}),
 			// The reviewer's note on the permission decision lives in a TOP-LEVEL

@@ -759,9 +759,22 @@ describe("background completions — one bubble per task row", () => {
 		expect(specs[0]?.key).toBe("m1-b1-t-t1");
 	});
 
+	it("names an agent completion by its current subagent title", () => {
+		const specs = taskBubbleSpecs("bg_agent", "agent", [
+			{
+				id: "a1",
+				alias: "runtime-send-review",
+				title: "接入统一—持久化收件消息路径",
+				status: "success",
+				preview: "ok",
+			},
+		]);
+		expect((specs[0]?.data as { speaker: string }).speaker).toBe("接入统一—持久化收件消息路径");
+	});
+
 	it("names a bash task by the alias it was launched with", () => {
 		// The alias is what the reader typed and what `Await({ id })` refers to, so it
-		// wins over the derived title.
+		// wins over the derived command title.
 		const specs = taskBubbleSpecs("bg_bash", "bash", [
 			{ id: "b1", alias: "run-tests", title: "bun test", status: "success", preview: "ok" },
 		]);

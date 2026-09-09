@@ -56,6 +56,7 @@ interface TestGeminiProvider {
 		},
 	): Promise<{
 		text: string;
+		outputTruncated?: boolean;
 		usage?: {
 			inputTokens: number;
 			outputTokens: number;
@@ -64,6 +65,13 @@ interface TestGeminiProvider {
 			reasoningTokens?: number;
 		} | null;
 	}>;
+	generateWithHistoryWithMeta(
+		systemInstruction: string,
+		content: string,
+		model: string,
+		locale?: string,
+		options?: Parameters<TestGeminiProvider["generateWithMeta"]>[3],
+	): ReturnType<TestGeminiProvider["generateWithMeta"]>;
 }
 
 let GeminiProvider: new (config: Record<string, unknown>) => TestGeminiProvider;
@@ -323,6 +331,137 @@ describe("Gemini transport selection", () => {
 		expect(headers.get("Accept")).toBe("text/event-stream");
 		expect(signal).toBe(controller.signal);
 	});
+});
+
+describe("Gemini lightweight partial output regression", () => {
+	const partialText = "  partial\ntext\t";
+	for (const api of ["generateContent", "interactions"] as const) {
+		for (const transport of ["SSE", "JSON"] as const) {
+			for (const method of ["generateWithMeta", "generateWithHistoryWithMeta"] as const) {
+				async function run(withText: boolean, withError = false) {
+					const provider =
+						api === "generateContent" ? makeGenerateContentProvider() : makeProvider();
+					const model =
+						api === "generateContent"
+							? "gemini-generate-test:gemini-2.5-flash"
+							: "gemini-test:gemini-3-flash-preview";
+					const error = {
+						code: 503,
+						status: "UNAVAILABLE",
+						message: "upstream unavailable max_tokens",
+					};
+					const text = withText ? partialText : "";
+					const usage =
+						api === "generateContent"
+							? {
+									promptTokenCount: 11,
+									candidatesTokenCount: 7,
+									cachedContentTokenCount: 3,
+									thoughtsTokenCount: 2,
+								}
+							: {
+									total_input_tokens: 11,
+									total_output_tokens: 7,
+									total_cached_tokens: 3,
+									total_thought_tokens: 2,
+								};
+					const candidate = { content: { parts: [{ text }] }, finishReason: "MAX_TOKENS" };
+					const incomplete = {
+						status: "incomplete",
+						incomplete_details: { reason: "max_output_tokens" },
+					};
+					const frames: Array<{ event: string; data: unknown }> =
+						api === "generateContent"
+							? [
+									// The only text is carried by the finish chunk, with accounting following it.
+									{ event: "message", data: { candidates: [candidate] } },
+									{ event: "message", data: { usageMetadata: usage } },
+								]
+							: [
+									{
+										event: "step.start",
+										data: { index: 0, step: { type: "model_output", content: text } },
+									},
+									{ event: "interaction.incomplete", data: { interaction: incomplete } },
+									{
+										event: "interaction.incomplete",
+										data: { interaction: { ...incomplete, usage } },
+									},
+								];
+					if (withError) frames.push({ event: "error", data: { error } });
+					const json =
+						api === "generateContent"
+							? {
+									candidates: [candidate],
+									usageMetadata: usage,
+									...(withError && { error }),
+								}
+							: {
+									...incomplete,
+									steps: [{ type: "model_output", content: text }],
+									usage,
+									...(withError && { status: "failed", error }),
+								};
+					setOutboundFetchOverrideForTest(async () =>
+						transport === "SSE"
+							? sseResponse(frames)
+							: new Response(JSON.stringify(json), {
+									headers: { "content-type": "application/json" },
+								}),
+					);
+					const deltas: string[] = [];
+					const options = {
+						onTextDelta: async (delta: string) => {
+							deltas.push(delta);
+						},
+					};
+					const result =
+						method === "generateWithMeta"
+							? await provider.generateWithMeta("prompt", model, "system", options)
+							: await provider.generateWithHistoryWithMeta(
+									"system",
+									"prompt",
+									model,
+									"en",
+									options,
+								);
+					return { result, deltas };
+				}
+
+				test(`${api} ${method} ${transport} retains partial text and full trailing usage`, async () => {
+					const { result, deltas } = await run(true);
+					expect(result).toMatchObject({
+						text: partialText,
+						outputTruncated: true,
+						usage: {
+							inputTokens: 11,
+							outputTokens: 7,
+							cachedInputTokens: 3,
+							cacheCreationInputTokens: 0,
+							reasoningTokens: 2,
+						},
+					});
+					expect(deltas).toEqual([partialText]);
+				});
+
+				test(`${api} ${method} ${transport} still rejects a completion limit without text`, async () => {
+					await expect(run(false)).rejects.toMatchObject({
+						status: 422,
+						message:
+							api === "generateContent"
+								? "Response truncated: model reached maximum token limit."
+								: "Gemini interaction stopped after reaching its output budget.",
+					});
+				});
+
+				test(`${api} ${method} ${transport} does not swallow a real error after partial output`, async () => {
+					await expect(run(true, true)).rejects.toMatchObject({
+						message: expect.stringContaining("upstream unavailable max_tokens"),
+					});
+				});
+			}
+		}
+	}
 });
 
 describe("Gemini Interactions API provider", () => {

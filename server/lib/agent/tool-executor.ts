@@ -1065,6 +1065,7 @@ export async function executeTool(
 			skillScopeKey: config.skillScopeKey,
 			blockedSkills: config.blockedSkills,
 			parentNarratorId: config.parentNarratorId,
+			runtimePolicy: config.runtimePolicy,
 			userId: config.userId,
 			projectId: config.projectId,
 			requestPermission: (toolName, input, toolUseId) =>

@@ -40,7 +40,9 @@ for (const statement of [
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
-const { resolveContinuationTail, hasTrailingInjectionRow } = await import("../narrator-session");
+const { resolveContinuationTail, hasTrailingInjectionRow, resolveRetryTarget } = await import(
+	"../narrator-session"
+);
 const { narratorMessageQueries } = await import("../narrator-messages");
 
 const NOW = "2026-08-20T09:00:00.000Z";
@@ -226,6 +228,122 @@ describe("hasTrailingInjectionRow", () => {
 
 	test("false on empty history", () => {
 		expect(hasTrailingInjectionRow([])).toBe(false);
+	});
+});
+
+describe("retry empty placeholder cleanup", () => {
+	test("empty failed response without snapshots can be cleaned before retry range deletion", async () => {
+		await seedNarrator();
+		await seedMessage({ id: "u1", seq: 1, role: "user", contentText: "retry" });
+		await seedMessage({ id: "a1", seq: 2, role: "assistant" });
+		const rows = await db.query.narratorMessages.findMany({ with: { toolCalls: true } });
+		const resolved = resolveRetryTarget(rows);
+		expect(resolved.target?.id).toBe("u1");
+		if (!resolved.target) throw new Error("missing retry target");
+		for (const id of resolved.emptyAssistantIds) {
+			expect(await narratorMessageQueries.deleteEmptyRetryPlaceholder("n1", id)).toBe(true);
+		}
+		expect(
+			(await narratorMessageQueries.deleteMessagesAfter("n1", "u1")).deletedMessageIds,
+		).toEqual([]);
+		expect((await db.query.narrators.findFirst())?.messageStructureVersion).toBe(1);
+	});
+
+	test("remaining system traffic still requires the ordinary snapshot revert", async () => {
+		await seedNarrator();
+		await seedMessage({ id: "u1", seq: 1, role: "user", contentText: "retry" });
+		await seedMessage({ id: "a1", seq: 2, role: "assistant" });
+		await seedMessage({ id: "s1", seq: 3, role: "sys", contentText: "background notice" });
+		expect(await narratorMessageQueries.deleteEmptyRetryPlaceholder("n1", "a1")).toBe(true);
+		await expect(narratorMessageQueries.deleteMessagesAfter("n1", "u1")).rejects.toThrow();
+		expect(
+			(await db.query.narratorMessageRefs.findMany()).map((ref) => ref.messageId).sort(),
+		).toEqual(["s1", "u1"]);
+	});
+
+	test("real tool rows and malformed or textual replies are never placeholders", async () => {
+		await seedNarrator();
+		await seedMessage({ id: "a1", seq: 1, role: "assistant" });
+		await db.insert(narratorToolCalls).values({
+			id: "tc1",
+			narratorId: "n1",
+			messageId: "a1",
+			toolUseId: "tu1",
+			toolName: "Write",
+			inputJson: {},
+			status: "success",
+			createdAt: NOW,
+		});
+		await expect(narratorMessageQueries.deleteEmptyRetryPlaceholder("n1", "a1")).rejects.toThrow(
+			/empty-placeholder/,
+		);
+		const row = await db.query.narratorMessages.findFirst({ with: { toolCalls: true } });
+		if (!row) throw new Error("missing assistant");
+		expect(resolveRetryTarget([{ id: "u1", role: "user" }, row]).target).toBeNull();
+		for (const extra of [
+			{ contentJson: {} },
+			{ contentJson: [], contentText: "reply" },
+			{ contentJson: [{ type: "tool_use", id: "tu" }] },
+		]) {
+			expect(
+				resolveRetryTarget([
+					{ id: "u1", role: "user" },
+					{ id: "a", role: "assistant", ...extra },
+				]).target,
+			).toBeNull();
+		}
+		expect(await db.query.narratorToolCalls.findMany()).toHaveLength(1);
+	});
+
+	test("preserves shared records and unrelated system/subagent traffic", async () => {
+		await seedNarrator();
+		await seedNarrator("n2");
+		await seedMessage({ id: "a1", seq: 1, role: "assistant" });
+		await db
+			.insert(narratorMessageRefs)
+			.values({ id: "shared", narratorId: "n2", messageId: "a1", seq: 1 });
+		await seedMessage({ id: "s1", seq: 2, role: "sys", contentText: "background notice" });
+		await seedMessage({ id: "child", seq: 3, role: "assistant" });
+		sqlite.run(
+			"UPDATE narrator_messages SET parent_tool_use_id = 'parent-tool' WHERE id = 'child'",
+		);
+		expect(await narratorMessageQueries.deleteEmptyRetryPlaceholder("n1", "a1")).toBe(true);
+		expect(await db.query.narratorMessages.findMany()).toHaveLength(3);
+		expect(await db.query.narratorMessageRefs.findMany()).toHaveLength(3);
+		await expect(
+			narratorMessageQueries.deleteEmptyRetryPlaceholder("n1", "child"),
+		).rejects.toThrow();
+		await expect(narratorMessageQueries.deleteEmptyRetryPlaceholder("n1", "s1")).rejects.toThrow();
+	});
+
+	test("refuses snapshot, compact and fork/prune boundaries without deleting history", async () => {
+		await seedNarrator();
+		await seedMessage({ id: "a1", seq: 1, role: "assistant" });
+		for (const [set, clear] of [
+			[
+				"UPDATE narrator_messages SET tree_hash_after = 'tree'",
+				"UPDATE narrator_messages SET tree_hash_after = NULL",
+			],
+			[
+				"UPDATE narrator_message_refs SET is_compact = 1",
+				"UPDATE narrator_message_refs SET is_compact = 0",
+			],
+			[
+				"UPDATE narrators SET prune_boundary_message_id = 'a1'",
+				"UPDATE narrators SET prune_boundary_message_id = NULL",
+			],
+			[
+				"UPDATE narrators SET fork_message_id = 'a1'",
+				"UPDATE narrators SET fork_message_id = NULL",
+			],
+		]) {
+			sqlite.run(set);
+			await expect(
+				narratorMessageQueries.deleteEmptyRetryPlaceholder("n1", "a1"),
+			).rejects.toThrow();
+			expect(await db.query.narratorMessageRefs.findMany()).toHaveLength(1);
+			sqlite.run(clear);
+		}
 	});
 });
 

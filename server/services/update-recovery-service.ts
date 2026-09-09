@@ -1,6 +1,18 @@
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
-import { backgroundTasks, narratorMessages, narratorToolCalls } from "../db/schema";
+import { backgroundTasks, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
+import { flushRuntimePublications, runtimePublication } from "./agent-runtime/publication";
+
+function readAgentLogicalRunId(narratorId: string): string | undefined {
+	return (
+		db
+			.select({ logicalRunId: narrators.logicalRunId })
+			.from(narrators)
+			.where(eq(narrators.id, narratorId))
+			.get()?.logicalRunId ?? undefined
+	);
+}
+
 import {
 	groupToolExecutions,
 	isAgentDependentToolExecutionGroup,
@@ -87,7 +99,7 @@ function timestampMs(value: string | number | Date | null | undefined): number |
 	return Number.isFinite(parsed) ? parsed : null;
 }
 
-function sendAwaitSnapshotFromPayload(
+export function sendAwaitSnapshotFromPayload(
 	payload: Record<string, unknown> | null,
 ): AgentReplyWaitRunSnapshot | null {
 	const value = payload?.sendAwait;
@@ -101,6 +113,29 @@ function sendAwaitSnapshotFromPayload(
 		!Array.isArray(snapshot.prefixTargets)
 	) {
 		return null;
+	}
+	// Old checkpoints legitimately lack these fields. If present, validate without
+	// inferring revision from a current mailbox row or silently repairing malformed identity.
+	for (const target of [...snapshot.waiters, ...snapshot.prefixTargets]) {
+		if (!target || typeof target !== "object" || Array.isArray(target)) return null;
+		for (const key of ["deliveryId", "recipientRefId"] as const) {
+			const pointer = target[key];
+			if (
+				pointer !== undefined &&
+				(typeof pointer !== "string" || pointer.length === 0 || Buffer.byteLength(pointer) > 512)
+			)
+				return null;
+		}
+		if (
+			target.revision !== undefined &&
+			(!Number.isSafeInteger(target.revision) || target.revision < 1)
+		)
+			return null;
+		if (
+			(target.recipientRefId !== undefined || target.revision !== undefined) &&
+			target.deliveryId === undefined
+		)
+			return null;
 	}
 	return snapshot as AgentReplyWaitRunSnapshot;
 }
@@ -519,7 +554,11 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 				narratorId: toolCall.narratorId,
 				updateEpoch: snapshot.updateEpoch,
 				kind: "foreground_agent",
-				payloadJson: { subagentId, ...deadline },
+				payloadJson: {
+					subagentId,
+					logicalRunId: runtime?.logicalRunId ?? readAgentLogicalRunId(subagentId),
+					...deadline,
+				},
 			});
 			continue;
 		}
@@ -577,6 +616,8 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 			kind: "background_agent",
 			payloadJson: {
 				backgroundTaskId: task.id,
+				logicalRunId:
+					runtime?.logicalRunId ?? task.logicalRunId ?? readAgentLogicalRunId(subagentId),
 				backgroundTaskAlias: task.alias,
 				subagentId,
 				parentNarratorId: task.parentNarratorId,
@@ -775,6 +816,7 @@ async function continueOwnerWhenReady(
 		try {
 			const resumed = await resumeSubagent({
 				subagentId: owner.id,
+				resumeLogicalRunId: owner.logicalRunId ?? undefined,
 				intent: "continue_tool_results",
 				actor: "parent_agent",
 				locale: "en",
@@ -906,6 +948,13 @@ async function restoreAgent(
 		deadlineMs === null ? undefined : Math.max(deadlineMs - Date.now(), 0);
 	await waitForChildContinuationResults(subagentId, record.updateEpoch, signal);
 	const { resumeSubagent } = await import("./subagent-resume");
+	const resumeLogicalRunId =
+		payloadString(record.payloadJson, "logicalRunId") ??
+		readAgentLogicalRunId(subagentId) ??
+		runtimePublication.store.registerLegacyRunningRunSlots(
+			{ producerKind: "agent", taskId: subagentId, recipientId: record.narratorId },
+			{ kind: "checkpoint", checkpointId: record.id, updateEpoch: record.updateEpoch },
+		).logicalRunId;
 	const resumed = await resumeSubagent({
 		subagentId,
 		intent: "continue_tool_results",
@@ -917,6 +966,7 @@ async function restoreAgent(
 		preserveBackground: background,
 		skipConclusionDelivery: background,
 		resumableUpdateLease: true,
+		resumeLogicalRunId,
 		timeoutMs: remainingExecutionTimeoutMs,
 		executionDeadlineAt,
 		executionTimeoutMs,
@@ -1720,7 +1770,10 @@ export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
 	const startup = prepared ?? (await getPlannedUpdateStartupProtection());
 	const { snapshot, protection } = startup;
 	const severedNarratorIds = startup.severedNarratorIds ?? new Set<string>();
-	if (!snapshot) return null;
+	if (!snapshot) {
+		flushRuntimePublications();
+		return null;
+	}
 	const queue = (
 		await toolContinuationService.listRecoveryQueueByEpoch(snapshot.updateEpoch)
 	).filter(({ record }) => record.state !== "cancelled" && !isToolContinuationOwnerMounted(record));
@@ -1810,6 +1863,7 @@ export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
 			// consumed by whichever loop recovery started; a background-agents-only
 			// epoch starts no loop at all, so those queues would otherwise stay stuck.
 			await drainQueuedMessagesAfterRecovery(snapshot, [...parentControls.keys()]);
+			flushRuntimePublications();
 		}
 	})();
 	void completion.catch((error) => {

@@ -19,16 +19,27 @@
  * released the grant BEFORE the request became discoverable would still have passed.
  */
 
-import { describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../../tests/setup";
-import { narratorMessages, narrators, narratorToolCalls } from "../../../db/schema";
+import {
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+} from "../../../db/schema";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../../db")) };
 mock.module("../../../db", () => ({ ...realDbModule, db, sqlite }));
+afterAll(() => {
+	mock.module("../../../db", () => realDbModule);
+});
 
 const { toolContinuationService } = await import("@server/services/tool-continuation-service");
+// Initialize the service facade first, matching application import order.
+await import("@server/services/narrator-service");
+const { narratorPersistence } = await import("@server/services/narrator-persistence");
 const updateCoordinator = await import("@server/services/update-coordinator");
 const { checkpointPlannedUpdateContinuations } = await import(
 	"@server/services/update-recovery-service"
@@ -37,6 +48,7 @@ const { z } = await import("zod");
 const { executeTool } = await import("../tool-executor");
 const { toolRegistry } = await import("../tool-registry");
 type AgentConfig = import("../types").AgentConfig;
+type AgentToolUse = import("../types").AgentToolUse;
 
 const PERMISSION_TOOL_NAME = "__PermissionWaitRestartTest";
 const NARRATOR_ID = "narrator-self";
@@ -64,8 +76,16 @@ async function seedPendingPermissionRow(): Promise<void> {
 		contentJson: [{ type: "tool_use", id: TOOL_USE_ID, name: PERMISSION_TOOL_NAME, input: {} }],
 		createdAt: now,
 	});
+	await db.insert(narratorMessageRefs).values({
+		id: `${messageId}-ref`,
+		narratorId: NARRATOR_ID,
+		messageId,
+		seq: 1,
+	});
 	await db.insert(narratorToolCalls).values({
 		id: TOOL_CALL_ID,
+		executionAttempt: 1,
+		executionIdentityVersion: 1,
 		narratorId: NARRATOR_ID,
 		messageId,
 		toolUseId: TOOL_USE_ID,
@@ -117,7 +137,18 @@ describe("permission wait does not block a planned restart", () => {
 		 * variable stays narrowed to `null` and the assertion below cannot be written.
 		 */
 		const observed: { row: { status: string; inputJson: unknown } | null } = { row: null };
+		// Production binds the exact tool-use object to its persisted execution attempt.
+		// A seeded row alone cannot authorize deferred execution after the update fence.
+		const toolUse: AgentToolUse = {
+			toolUseId: TOOL_USE_ID,
+			name: PERMISSION_TOOL_NAME,
+			input: {},
+		};
 		const config: AgentConfig = {
+			requireToolCallBinding: true,
+			toolExecutionBindings: new WeakMap([[toolUse, { toolCallId: TOOL_CALL_ID, attempt: 1 }]]),
+			onToolExecutionStarting: (toolUseId, binding, startedAt) =>
+				narratorPersistence.claimToolCallExecution(NARRATOR_ID, toolUseId, binding, startedAt),
 			narratorId: NARRATOR_ID,
 			conversationId: "conversation-test",
 			model: "codex:gpt-5.5",
@@ -139,10 +170,7 @@ describe("permission wait does not block a planned restart", () => {
 		};
 
 		try {
-			const running = executeTool(
-				{ toolUseId: TOOL_USE_ID, name: PERMISSION_TOOL_NAME, input: {} },
-				config,
-			);
+			const running = executeTool(toolUse, config);
 			await waitForCondition(() => permissionAsked, "the permission request to be raised");
 
 			// The precondition for dropping the grant, checked at the moment it is dropped:

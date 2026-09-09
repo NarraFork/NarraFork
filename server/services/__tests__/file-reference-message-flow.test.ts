@@ -1,9 +1,8 @@
-import { Database } from "bun:sqlite";
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
-import { drizzle } from "drizzle-orm/bun-sqlite";
+import { getTestDb } from "../../../tests/setup";
 import * as schema from "../../db/schema";
 import {
 	getFileReferenceSnapshots,
@@ -29,16 +28,20 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 } else {
 	// A serialization fixture, not the application DB. Mock persistence writes the
 	// exact text/blocks the REAL send/edit/queue services supply, then reads JSON back.
-	const sqlite = new Database(":memory:");
+	const { sqlite, db: fixtureDb } = getTestDb();
 	sqlite.exec("CREATE TABLE saved_messages (id TEXT PRIMARY KEY, row_json TEXT NOT NULL)");
-	const fixtureDb = drizzle({ client: sqlite, schema });
+	for (const id of ["n", "child", "resume-official", "resume-child", "resume-followup"]) {
+		fixtureDb
+			.insert(schema.narrators)
+			.values({ id, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+			.run();
+	}
 	let idSeq = 0;
 	let failPersist = false;
 	let suppressLoop = false;
 	let includeTrailingSys = false;
 	let currentTarget = "";
 	const frames: unknown[] = [];
-	const state = await import("../narrator-session-state");
 
 	function allMessages(): DbMessage[] {
 		return (
@@ -78,7 +81,14 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 				if (key === "query")
 					return {
 						...target.query,
-						narrators: { findFirst: async () => ({ status: "idle", substatus: [] }) },
+						narrators: {
+							findFirst: async () => ({
+								id: "n",
+								variant: "primary",
+								status: "idle",
+								substatus: [],
+							}),
+						},
 						narratorMessageRefs: {
 							findFirst: async () => ({ narratorId: "n", messageId: currentTarget, seq: 1 }),
 						},
@@ -94,6 +104,9 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 			},
 		}),
 	}));
+	const state = await import("../narrator-session-state");
+	const { createMailboxStore } = await import("../agent-runtime/mailbox");
+	const mailboxStore = createMailboxStore(fixtureDb);
 	mock.module("../../websocket/narrator-ws", () => ({
 		broadcastToNarrator: (_id: string, frame: unknown) => frames.push(frame),
 		broadcastToAll: () => {},
@@ -136,14 +149,45 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 				id: string,
 				text: string,
 				toolUseId: string,
-				options?: { fileReferences?: FileReferenceSnapshot[] },
-			) =>
-				saveMessage(
-					id,
-					text,
-					[...(options?.fileReferences ?? []), { type: "text", text }],
-					toolUseId,
-				),
+				options?: {
+					fileReferences?: FileReferenceSnapshot[];
+					mailboxClaim?: import("../agent-runtime/mailbox-types").MailboxClaim;
+				},
+			) => {
+				const blocks = [...(options?.fileReferences ?? []), { type: "text", text }];
+				if (!options?.mailboxClaim) return saveMessage(id, text, blocks, toolUseId);
+				if (failPersist) throw new Error("fixture persistence failed");
+				let saved: DbMessage | undefined;
+				mailboxStore.materialize(options.mailboxClaim, (tx, row) => {
+					const messageId = row.recipientMessageId as string;
+					saved = saveRow({
+						id: messageId,
+						narratorId: id,
+						role: "user",
+						contentText: text,
+						contentJson: blocks,
+						parentToolUseId: toolUseId,
+						messageUuid: null,
+					});
+					tx.insert(schema.narratorMessages)
+						.values({
+							id: messageId,
+							narratorId: id,
+							role: "user",
+							contentText: text,
+							contentJson: blocks,
+							parentToolUseId: toolUseId,
+							createdAt: new Date().toISOString(),
+						})
+						.run();
+					const refId = `ref-${messageId}`;
+					tx.insert(schema.narratorMessageRefs)
+						.values({ id: refId, narratorId: id, messageId, seq: ++idSeq })
+						.run();
+					return { messageId, refId };
+				});
+				return saved;
+			},
 			getModelHistorySinceLastCompact: async () => {
 				const history = allMessages();
 				if (includeTrailingSys)
@@ -450,7 +494,9 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 				...provider,
 				officialApi: true,
 			}));
-			subagent.pushSubagentBufferedMessage("child", "inspect", { fileReferences: [snapshot()] });
+			await subagent.pushSubagentBufferedMessage("child", "inspect", {
+				fileReferences: [snapshot()],
+			});
 			const consumed = await subagent.consumeNextBufferedSubagentMessage({
 				narratorId: "child",
 				parentNarratorId: "n",
@@ -466,7 +512,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 		});
 
 		test("concurrent drains cannot dispatch one accepted snapshot twice", async () => {
-			subagent.pushSubagentBufferedMessage("child", "", { fileReferences: [snapshot()] });
+			await subagent.pushSubagentBufferedMessage("child", "", { fileReferences: [snapshot()] });
 			const options = {
 				narratorId: "child",
 				parentNarratorId: "n",
@@ -485,13 +531,13 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 
 		test("priority edits retain immutable snapshots and consume projects them once", async () => {
 			const input = snapshot();
-			const pushed = subagent.bufferSubagentUserMessage("child", "inspect", {
+			const pushed = await subagent.bufferSubagentUserMessage("child", "inspect", {
 				priority: true,
 				fileReferences: [input],
 			});
 			input.reference.path = "/changed";
 			input.snapshotText = "changed";
-			subagent.updateSubagentBufferedMessage("child", pushed.id, "edited text");
+			await subagent.updateSubagentBufferedMessage("child", pushed.id, "edited text");
 			const before = subagent.getSubagentBufferedMessages("child");
 			expect(before[0].fileReferences).toEqual([snapshot()]);
 			expect(toBufferSummary(before)[0].fileReferences).toEqual([snapshot().reference]);
@@ -512,7 +558,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 		});
 
 		test("failed consume keeps accepted snapshots queued for the retry", async () => {
-			subagent.pushSubagentBufferedMessage("child", "", { fileReferences: [snapshot()] });
+			await subagent.pushSubagentBufferedMessage("child", "", { fileReferences: [snapshot()] });
 			failPersist = true;
 			const options = {
 				narratorId: "child",

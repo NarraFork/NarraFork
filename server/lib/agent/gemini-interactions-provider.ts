@@ -7,6 +7,7 @@ import { parseModelId, settings } from "../settings";
 import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import type { UsageData } from "../usage-tracking";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
+import { isCompletionLimitReason } from "./error-handling";
 import type {
 	ChatParams,
 	DbMessage,
@@ -592,21 +593,26 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 
 		let text = "";
 		let usage: UsageData | null = null;
+		let outputTruncated = false;
 		for await (const event of this.parseSSEStream(response.body)) {
-			if (event.invalidState) {
-				throw new ApiError(
-					invalidStateHttpStatus(event.invalidState.reason),
-					event.invalidState.message,
-				);
-			}
 			if (event.text) {
 				text += event.text;
 				await options.onTextDelta?.(event.text);
 			}
 			if (event.reasoning) await options.onReasoningDelta?.(event.reasoning);
 			if (event.usage) usage = usageFromStreamEvent(event.usage);
+			if (event.invalidState) {
+				if (text && isCompletionLimitReason(event.invalidState.reason)) {
+					outputTruncated = true;
+					continue;
+				}
+				throw new ApiError(
+					invalidStateHttpStatus(event.invalidState.reason),
+					event.invalidState.message,
+				);
+			}
 		}
-		return { text, usage };
+		return { text, usage, ...(outputTruncated && { outputTruncated }) };
 	}
 
 	private buildGeminiHistory(dbMessages: DbMessage[]): {
@@ -1235,7 +1241,9 @@ async function parseInteractionJsonFallback(
 		throw new ApiError(502, "Gemini Interactions API returned invalid JSON");
 	}
 	const invalid = mapInteractionStatus(interaction);
-	if (invalid) throw new ApiError(statusToHttpCode(interaction.status), invalid.message);
+	if (invalid && !isCompletionLimitReason(invalid.reason)) {
+		throw new ApiError(statusToHttpCode(interaction.status), invalid.message);
+	}
 
 	let text = "";
 	for (const step of interaction.steps ?? []) {
@@ -1246,7 +1254,14 @@ async function parseInteractionJsonFallback(
 		assertByteLimit(text, GEMINI_MAX_TEXT_BYTES, "response text");
 		await onTextDelta?.(delta);
 	}
-	return { text, usage: mapUsage(interaction.usage) };
+	if (invalid && !text) {
+		throw new ApiError(statusToHttpCode(interaction.status), invalid.message);
+	}
+	return {
+		text,
+		usage: mapUsage(interaction.usage),
+		...(invalid && { outputTruncated: true }),
+	};
 }
 
 function invalidStateHttpStatus(reason: string): number {

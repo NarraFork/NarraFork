@@ -42,6 +42,15 @@ const {
 } = await import("../subagent-executor");
 
 const SUBAGENT_ID = "subagent-interrupt-test";
+db.insert(narrators)
+	.values({
+		id: SUBAGENT_ID,
+		type: "subagent",
+		variant: "subagent:general",
+		createdAt: new Date().toISOString(),
+		updatedAt: new Date().toISOString(),
+	})
+	.run();
 
 afterEach(() => {
 	getForegroundAbortControllers().clear();
@@ -57,7 +66,7 @@ afterAll(() => {
 });
 
 describe("foreground subagent interrupt semantics", () => {
-	test("plans a resumable-error continuation prompt instead of terminating", () => {
+	test("plans a resumable-error continuation prompt instead of terminating", async () => {
 		expect(
 			planSubagentInterruption(
 				{
@@ -75,7 +84,7 @@ describe("foreground subagent interrupt semantics", () => {
 		});
 	});
 
-	test("replays an interrupted tool-result turn without synthetic user text", () => {
+	test("replays an interrupted tool-result turn without synthetic user text", async () => {
 		expect(
 			planSubagentInterruption(
 				{
@@ -88,7 +97,7 @@ describe("foreground subagent interrupt semantics", () => {
 		).toEqual({ action: "replay", retries: 2, reason: "completion_limit" });
 	});
 
-	test("bounds repeated interrupted continuations and resets after success", () => {
+	test("bounds repeated interrupted continuations and resets after success", async () => {
 		expect(
 			planSubagentInterruption(
 				{ interrupted: true, interruptedReason: "resumable_error" },
@@ -105,10 +114,10 @@ describe("foreground subagent interrupt semantics", () => {
 		});
 	});
 
-	test("ordinary buffered messages preserve FIFO arrival order", () => {
-		pushSubagentBufferedMessage(SUBAGENT_ID, "first");
-		pushSubagentBufferedMessage(SUBAGENT_ID, "second");
-		pushSubagentBufferedMessage(SUBAGENT_ID, "third");
+	test("ordinary buffered messages preserve FIFO arrival order", async () => {
+		await pushSubagentBufferedMessage(SUBAGENT_ID, "first");
+		await pushSubagentBufferedMessage(SUBAGENT_ID, "second");
+		await pushSubagentBufferedMessage(SUBAGENT_ID, "third");
 
 		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
 			"first",
@@ -117,11 +126,11 @@ describe("foreground subagent interrupt semantics", () => {
 		]);
 	});
 
-	test("priority messages move ahead without reversing each other", () => {
-		pushSubagentBufferedMessage(SUBAGENT_ID, "ordinary-1");
-		pushSubagentBufferedMessage(SUBAGENT_ID, "priority-1", { position: "front" });
-		pushSubagentBufferedMessage(SUBAGENT_ID, "priority-2", { position: "front" });
-		pushSubagentBufferedMessage(SUBAGENT_ID, "ordinary-2");
+	test("priority messages move ahead without reversing each other", async () => {
+		await pushSubagentBufferedMessage(SUBAGENT_ID, "ordinary-1");
+		await pushSubagentBufferedMessage(SUBAGENT_ID, "priority-1", { position: "front" });
+		await pushSubagentBufferedMessage(SUBAGENT_ID, "priority-2", { position: "front" });
+		await pushSubagentBufferedMessage(SUBAGENT_ID, "ordinary-2");
 
 		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
 			"priority-1",
@@ -131,9 +140,9 @@ describe("foreground subagent interrupt semantics", () => {
 		]);
 	});
 
-	test("shared user-message helper preserves FIFO and requests soft-stop", () => {
-		bufferSubagentUserMessage(SUBAGENT_ID, "first");
-		bufferSubagentUserMessage(SUBAGENT_ID, "second");
+	test("shared user-message helper preserves FIFO and requests soft-stop", async () => {
+		await bufferSubagentUserMessage(SUBAGENT_ID, "first");
+		await bufferSubagentUserMessage(SUBAGENT_ID, "second");
 
 		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
 			"first",
@@ -142,8 +151,8 @@ describe("foreground subagent interrupt semantics", () => {
 		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
 	});
 
-	test("taken-over user messages can queue without requesting soft-stop", () => {
-		bufferSubagentUserMessage(SUBAGENT_ID, "manual", { requestSoftStop: false });
+	test("taken-over user messages can queue without requesting soft-stop", async () => {
+		await bufferSubagentUserMessage(SUBAGENT_ID, "manual", { requestSoftStop: false });
 
 		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
 			"manual",
@@ -151,17 +160,17 @@ describe("foreground subagent interrupt semantics", () => {
 		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
 	});
 
-	test("buffer soft-stop remains active while queued messages remain", () => {
-		pushSubagentBufferedMessage(SUBAGENT_ID, "first");
-		pushSubagentBufferedMessage(SUBAGENT_ID, "second");
+	test("buffer soft-stop remains active while queued messages remain", async () => {
+		await pushSubagentBufferedMessage(SUBAGENT_ID, "first");
+		await pushSubagentBufferedMessage(SUBAGENT_ID, "second");
 		requestSubagentBufferedMessageSoftStop(SUBAGENT_ID);
 
 		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
 		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
 	});
 
-	test("clearing the subagent buffer also clears its soft-stop request", () => {
-		pushSubagentBufferedMessage(SUBAGENT_ID, "queued");
+	test("clearing the subagent buffer also clears its soft-stop request", async () => {
+		await pushSubagentBufferedMessage(SUBAGENT_ID, "queued");
 		requestSubagentBufferedMessageSoftStop(SUBAGENT_ID);
 
 		clearSubagentBufferedMessages(SUBAGENT_ID);
@@ -177,34 +186,34 @@ describe("foreground subagent interrupt semantics", () => {
  * agent-to-agent Send back into a delayed mailbox with no error to notice.
  */
 describe("canDeliverBufferedMessageInPass", () => {
-	test("a plain message is carried by the current pass", () => {
+	test("a plain message is carried by the current pass", async () => {
 		expect(canDeliverBufferedMessageInPass({}, "user-1")).toBe(true);
 	});
 
 	// The regression this predicate was written for: Send stamps the sender's
 	// userId as createdBy, and the old condition rejected any createdBy at all, so
 	// every parent→child Send waited for the subagent's pass to finish.
-	test("a message from the user the pass already runs as is carried in-pass", () => {
+	test("a message from the user the pass already runs as is carried in-pass", async () => {
 		expect(canDeliverBufferedMessageInPass({ createdBy: "user-1" }, "user-1")).toBe(true);
 	});
 
-	test("a message from a different user waits for a pass built for that identity", () => {
+	test("a message from a different user waits for a pass built for that identity", async () => {
 		expect(canDeliverBufferedMessageInPass({ createdBy: "user-2" }, "user-1")).toBe(false);
 	});
 
 	// "No particular user" cannot conflict with the pass identity.
-	test("an unattributed message is carried even when the pass has a user", () => {
+	test("an unattributed message is carried even when the pass has a user", async () => {
 		expect(canDeliverBufferedMessageInPass({ createdBy: null }, "user-1")).toBe(true);
 		expect(canDeliverBufferedMessageInPass({}, null)).toBe(true);
 	});
 
-	test("an attributed message waits when the pass itself has no user", () => {
+	test("an attributed message waits when the pass itself has no user", async () => {
 		expect(canDeliverBufferedMessageInPass({ createdBy: "user-1" }, null)).toBe(false);
 	});
 
 	// In-pass delivery contributes text only, so anything whose payload is not
 	// text must go through the history-rebuilding path or be silently dropped.
-	test("attachments and pre-prompt commands still wait for the restart path", () => {
+	test("attachments and pre-prompt commands still wait for the restart path", async () => {
 		expect(
 			canDeliverBufferedMessageInPass({ images: [{ imageId: "img-1" }] as never }, "user-1"),
 		).toBe(false);
@@ -225,8 +234,8 @@ describe("canDeliverBufferedMessageInPass", () => {
  * removal back, so the card looked stuck.
  */
 describe("subagent buffer single-message mutations", () => {
-	test("removing the last queued message also drops the soft-stop request", () => {
-		const queued = pushSubagentBufferedMessage(SUBAGENT_ID, "only");
+	test("removing the last queued message also drops the soft-stop request", async () => {
+		const queued = await pushSubagentBufferedMessage(SUBAGENT_ID, "only");
 		requestSubagentBufferedMessageSoftStop(SUBAGENT_ID);
 
 		expect(removeSubagentBufferedMessage(SUBAGENT_ID, queued.id)).toBe(true);
@@ -236,9 +245,9 @@ describe("subagent buffer single-message mutations", () => {
 		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
 	});
 
-	test("removing one of several messages keeps the rest and the soft stop", () => {
-		const first = pushSubagentBufferedMessage(SUBAGENT_ID, "first");
-		pushSubagentBufferedMessage(SUBAGENT_ID, "second");
+	test("removing one of several messages keeps the rest and the soft stop", async () => {
+		const first = await pushSubagentBufferedMessage(SUBAGENT_ID, "first");
+		await pushSubagentBufferedMessage(SUBAGENT_ID, "second");
 		requestSubagentBufferedMessageSoftStop(SUBAGENT_ID);
 
 		expect(removeSubagentBufferedMessage(SUBAGENT_ID, first.id)).toBe(true);
@@ -247,25 +256,25 @@ describe("subagent buffer single-message mutations", () => {
 		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
 	});
 
-	test("unknown ids report a miss so the caller can fall back to the primary queue", () => {
-		pushSubagentBufferedMessage(SUBAGENT_ID, "queued");
+	test("unknown ids report a miss so the caller can fall back to the primary queue", async () => {
+		await pushSubagentBufferedMessage(SUBAGENT_ID, "queued");
 
 		expect(removeSubagentBufferedMessage(SUBAGENT_ID, "no-such-id")).toBe(false);
-		expect(updateSubagentBufferedMessage(SUBAGENT_ID, "no-such-id", "edited")).toBe(false);
+		expect(await updateSubagentBufferedMessage(SUBAGENT_ID, "no-such-id", "edited")).toBe(false);
 		expect(removeSubagentBufferedMessage("no-such-subagent", "no-such-id")).toBe(false);
 	});
 
-	test("editing a queued message replaces its text", () => {
-		const queued = pushSubagentBufferedMessage(SUBAGENT_ID, "before");
+	test("editing a queued message replaces its text", async () => {
+		const queued = await pushSubagentBufferedMessage(SUBAGENT_ID, "before");
 
-		expect(updateSubagentBufferedMessage(SUBAGENT_ID, queued.id, "after")).toBe(true);
+		expect(await updateSubagentBufferedMessage(SUBAGENT_ID, queued.id, "after")).toBe(true);
 
 		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((m) => m.text)).toEqual(["after"]);
 	});
 
-	test("reorder applies an exact permutation and rejects a mismatched id list", () => {
-		const first = pushSubagentBufferedMessage(SUBAGENT_ID, "first");
-		const second = pushSubagentBufferedMessage(SUBAGENT_ID, "second");
+	test("reorder applies an exact permutation and rejects a mismatched id list", async () => {
+		const first = await pushSubagentBufferedMessage(SUBAGENT_ID, "first");
+		const second = await pushSubagentBufferedMessage(SUBAGENT_ID, "second");
 
 		expect(reorderSubagentBufferedMessages(SUBAGENT_ID, [second.id, first.id])).toBe(true);
 		expect(getSubagentBufferedMessages(SUBAGENT_ID).map((m) => m.text)).toEqual([
@@ -284,7 +293,7 @@ describe("subagent buffer single-message mutations", () => {
 });
 
 describe("foreground subagent interrupt controls", () => {
-	test("soft interrupt aborts the foreground controller without marking a hard interrupt", () => {
+	test("soft interrupt aborts the foreground controller without marking a hard interrupt", async () => {
 		const ctrl = new AbortController();
 		getForegroundAbortControllers().set(SUBAGENT_ID, ctrl);
 
@@ -294,7 +303,7 @@ describe("foreground subagent interrupt controls", () => {
 		expect(consumeForegroundSubagentHardInterrupt(SUBAGENT_ID)).toBe(false);
 	});
 
-	test("hard interrupt marker is consumed exactly once", () => {
+	test("hard interrupt marker is consumed exactly once", async () => {
 		const ctrl = new AbortController();
 		getForegroundAbortControllers().set(SUBAGENT_ID, ctrl);
 

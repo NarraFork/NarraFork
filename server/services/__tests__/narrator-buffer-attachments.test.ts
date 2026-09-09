@@ -27,12 +27,12 @@
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { getTestDb } from "../../../tests/setup";
-import { narratorBufferedMessages } from "../../db/schema";
+import { narratorBufferedMessages, narrators } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -52,16 +52,22 @@ process.env.NARRAFORK_HOME = HOME;
 // after such a double is active. That is why there is deliberately no
 // beforeEach re-import here.
 const {
+	cleanupBufferedTextFiles,
+	enqueueBufferedMessage,
+	projectMailboxUserMessage,
+	releaseBufferedMessage,
+	reorderBufferedMessages,
 	dbClearAllBuffered,
 	deleteBufferedTextFile,
 	getBufferedMessages,
 	persistAdditionalBufferedTextFiles,
 	pushBufferedMessage,
 	removeBufferedMessage,
+	retryBufferedMessage,
 	toBufferSummary,
 	updateBufferedMessage,
 } = await import("../narrator-buffer");
-const { activeNarrators, bufferedMessages } = await import("../narrator-session-state");
+const { activeNarrators } = await import("../narrator-session-state");
 const { getImagePath, saveUploadedImage, setUploadsDirForTests } = await import(
 	"../../lib/uploads"
 );
@@ -74,6 +80,11 @@ const {
 
 const NARRATOR_ID = "buffer-attach-narrator";
 const SUBAGENT_ID = "buffer-attach-subagent";
+for (const id of [NARRATOR_ID, SUBAGENT_ID]) {
+	db.insert(narrators)
+		.values({ id, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+		.run();
+}
 
 beforeAll(() => {
 	setUploadsDirForTests(join(HOME, "uploads"));
@@ -129,7 +140,6 @@ async function readTextFilePathsJson(
 
 afterEach(() => {
 	activeNarrators.clear();
-	bufferedMessages.clear();
 	clearSubagentBufferedMessages(SUBAGENT_ID);
 	sqlite.run("DELETE FROM narrator_buffered_messages");
 });
@@ -175,8 +185,8 @@ describe("toBufferSummary — attachments are visible to clients", () => {
 		expect(summary.textFiles).toEqual([{ index: 0, filename: "notes.md", size: 10 }]);
 	});
 
-	test("a subagent queue has no persisted metadata, so File objects are read directly", () => {
-		pushSubagentBufferedMessage(SUBAGENT_ID, "queued", {
+	test("a subagent queue durably preserves same-named attachment contents", async () => {
+		await pushSubagentBufferedMessage(SUBAGENT_ID, "queued", {
 			textFiles: [textFile("dup.md", "aa"), textFile("dup.md", "bbbb")],
 		});
 
@@ -186,7 +196,7 @@ describe("toBufferSummary — attachments are visible to clients", () => {
 		// keep key is positional rather than name-based.
 		expect(summary.textFiles).toEqual([
 			{ index: 0, filename: "dup.md", size: 2 },
-			{ index: 1, filename: "dup.md", size: 4 },
+			{ index: 1, filename: expect.stringMatching(/^dup_.+\.md$/), size: 4 },
 		]);
 	});
 
@@ -210,7 +220,7 @@ describe("updateBufferedMessage — editing attachments", () => {
 		const pushed = await pushBufferedMessage(NARRATOR_ID, "before", [kept, dropped]);
 		const added = await saveUploadedImage(NARRATOR_ID, pngFile("added.png"));
 
-		const ok = updateBufferedMessage(NARRATOR_ID, pushed.id, "after", {
+		const ok = await updateBufferedMessage(NARRATOR_ID, pushed.id, "after", {
 			images: [kept, added],
 		});
 
@@ -229,7 +239,7 @@ describe("updateBufferedMessage — editing attachments", () => {
 		const image = await saveUploadedImage(NARRATOR_ID, pngFile("only.png"));
 		const pushed = await pushBufferedMessage(NARRATOR_ID, "text and image", [image]);
 
-		updateBufferedMessage(NARRATOR_ID, pushed.id, "text only", { images: [] });
+		await updateBufferedMessage(NARRATOR_ID, pushed.id, "text only", { images: [] });
 
 		expect(getBufferedMessages(NARRATOR_ID)[0].images).toBeUndefined();
 		expect(await readImagesJson(pushed.id)).toBeNull();
@@ -244,7 +254,7 @@ describe("updateBufferedMessage — editing attachments", () => {
 
 		// This is the long-standing text-only path (WS `update_buffer`); it must not
 		// drop attachments the caller never mentioned.
-		updateBufferedMessage(NARRATOR_ID, pushed.id, "after");
+		await updateBufferedMessage(NARRATOR_ID, pushed.id, "after");
 
 		const [message] = getBufferedMessages(NARRATOR_ID);
 		expect(message.text).toBe("after");
@@ -270,7 +280,7 @@ describe("updateBufferedMessage — editing attachments", () => {
 		expect(existsSync(keptFile.path)).toBe(true);
 		expect(existsSync(droppedFile.path)).toBe(true);
 
-		updateBufferedMessage(NARRATOR_ID, pushed.id, "one file", {
+		await updateBufferedMessage(NARRATOR_ID, pushed.id, "one file", {
 			textFiles: [],
 			savedFiles: [keptFile],
 		});
@@ -304,19 +314,19 @@ describe("updateBufferedMessage — editing attachments", () => {
 		registerLiveLoop(NARRATOR_ID);
 		await pushBufferedMessage(NARRATOR_ID, "queued");
 
-		expect(updateBufferedMessage(NARRATOR_ID, "no-such-id", "edited")).toBe(false);
-		expect(updateBufferedMessage("no-such-narrator", "no-such-id", "edited")).toBe(false);
+		expect(await updateBufferedMessage(NARRATOR_ID, "no-such-id", "edited")).toBe(false);
+		expect(await updateBufferedMessage("no-such-narrator", "no-such-id", "edited")).toBe(false);
 	});
 });
 
 describe("updateSubagentBufferedMessage — in-memory attachment overwrite", () => {
-	test("replaces images and text files", () => {
-		const queued = pushSubagentBufferedMessage(SUBAGENT_ID, "before", {
+	test("replaces images and text files", async () => {
+		const queued = await pushSubagentBufferedMessage(SUBAGENT_ID, "before", {
 			images: [{ imageId: "old", filename: "old.png", mediaType: "image/png" }],
 			textFiles: [textFile("old.md")],
 		});
 
-		const ok = updateSubagentBufferedMessage(SUBAGENT_ID, queued.id, "after", {
+		const ok = await updateSubagentBufferedMessage(SUBAGENT_ID, queued.id, "after", {
 			images: [{ imageId: "new", filename: "new.png", mediaType: "image/png" }],
 			textFiles: [textFile("new.md")],
 		});
@@ -328,12 +338,12 @@ describe("updateSubagentBufferedMessage — in-memory attachment overwrite", () 
 		expect(message.textFiles?.map((f) => f.name)).toEqual(["new.md"]);
 	});
 
-	test("a text-only edit leaves attachments in place", () => {
-		const queued = pushSubagentBufferedMessage(SUBAGENT_ID, "before", {
+	test("a text-only edit leaves attachments in place", async () => {
+		const queued = await pushSubagentBufferedMessage(SUBAGENT_ID, "before", {
 			images: [{ imageId: "keep", filename: "keep.png", mediaType: "image/png" }],
 		});
 
-		updateSubagentBufferedMessage(SUBAGENT_ID, queued.id, "after");
+		await updateSubagentBufferedMessage(SUBAGENT_ID, queued.id, "after");
 
 		expect(getSubagentBufferedMessages(SUBAGENT_ID)[0].images?.map((i) => i.imageId)).toEqual([
 			"keep",
@@ -386,8 +396,379 @@ describe("queue teardown must not delete uploaded images", () => {
 	});
 });
 
+describe("failed user recovery", () => {
+	test("failed payload stays visible, explicit retry preserves identity and materializes once", async () => {
+		const { createMailboxStore } = await import("../agent-runtime/mailbox");
+		const { narratorMessages, narratorMessageRefs } = await import("../../db/schema");
+		const store = createMailboxStore(db);
+		const accepted = await enqueueBufferedMessage(NARRATOR_ID, "retry me");
+		let oldClaim: Parameters<typeof store.failClaim>[0] | undefined;
+		for (let attempt = 0; attempt < 5; attempt++) {
+			const [row] = store.claimBatch(NARRATOR_ID, {
+				token: `owner-${attempt}`,
+				epoch: `epoch-${attempt}`,
+			});
+			const claim = projectMailboxUserMessage(row)._mailboxClaim;
+			if (!claim) throw new Error("missing claim");
+			oldClaim = claim;
+			store.failClaim(claim, "attachment preparation failed");
+		}
+		expect(toBufferSummary(getBufferedMessages(NARRATOR_ID))[0]).toMatchObject({
+			state: "failed",
+			error: "attachment preparation failed",
+			text: "retry me",
+		});
+		expect(store.claimBatch(NARRATOR_ID, { token: "blocked", epoch: "blocked" })).toHaveLength(0);
+		expect(await updateBufferedMessage(NARRATOR_ID, accepted.id, "fixed")).toBe(true);
+		expect(getBufferedMessages(NARRATOR_ID)[0].state).toBe("failed");
+		expect(retryBufferedMessage(NARRATOR_ID, accepted.id)).toBe(true);
+		expect(retryBufferedMessage(NARRATOR_ID, accepted.id)).toBe(false);
+		const [row] = store.claimBatch(NARRATOR_ID, { token: "new-owner", epoch: "new-epoch" });
+		const claim = projectMailboxUserMessage(row)._mailboxClaim;
+		if (!claim || !oldClaim) throw new Error("missing claim");
+		expect(() => store.failClaim(oldClaim, "stale")).toThrow();
+		store.materialize(claim, (tx, current) => {
+			const messageId = current.recipientMessageId as string;
+			const refId = `failed-test-${messageId}`;
+			tx.insert(narratorMessages)
+				.values({
+					id: messageId,
+					narratorId: NARRATOR_ID,
+					role: "user",
+					contentText: current.text,
+					contentJson: [{ type: "text", text: current.text }],
+					createdAt: new Date().toISOString(),
+				})
+				.run();
+			tx.insert(narratorMessageRefs)
+				.values({ id: refId, narratorId: NARRATOR_ID, messageId, seq: 1 })
+				.run();
+			return { messageId, refId };
+		});
+		expect(getBufferedMessages(NARRATOR_ID)).toHaveLength(0);
+		expect(store.getByDelivery(row.deliveryId as string)?.state).toBe("materialized");
+		expect(store.claimBatch(NARRATOR_ID, { token: "again", epoch: "again" })).toHaveLength(0);
+	});
+
+	test("missing failed attachment cannot retry and cancel retains shared uploads", async () => {
+		const { createMailboxStore } = await import("../agent-runtime/mailbox");
+		const store = createMailboxStore(db);
+		const image = await saveUploadedImage(NARRATOR_ID, pngFile("shared.png"));
+		const pushed = await enqueueBufferedMessage(NARRATOR_ID, "missing", [image], null, null, null, [
+			textFile("gone.md"),
+		]);
+		const message = getBufferedMessages(NARRATOR_ID)[0];
+		for (let attempt = 0; attempt < 5; attempt++) {
+			const [row] = store.claimBatch(NARRATOR_ID, { token: "owner", epoch: `missing-${attempt}` });
+			const claim = projectMailboxUserMessage(row)._mailboxClaim;
+			if (!claim) throw new Error("missing claim");
+			store.failClaim(claim, "file missing");
+		}
+		const saved = message._savedFiles?.[0];
+		if (!saved) throw new Error("missing saved file");
+		rmSync(saved.path);
+		expect(() => retryBufferedMessage(NARRATOR_ID, pushed.id)).toThrow("missing");
+		expect(getBufferedMessages(NARRATOR_ID)[0].state).toBe("failed");
+		expect(removeBufferedMessage(NARRATOR_ID, pushed.id)).toBe(true);
+		expect(existsSync(getImagePath(NARRATOR_ID, image.imageId) as string)).toBe(true);
+		expect(existsSync(join(HOME, "buffered-files", message._stagingId as string))).toBe(false);
+	});
+});
+
+describe("persistent staging ownership", () => {
+	test("manual mixed-priority reorder agrees with display, peek and claim", async () => {
+		const { createMailboxStore } = await import("../agent-runtime/mailbox");
+		const { peekInbox } = await import("../agent-runtime/inbox");
+		const store = createMailboxStore(db);
+		const normal = await enqueueBufferedMessage(NARRATOR_ID, "normal");
+		const priority = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"priority",
+			undefined,
+			null,
+			null,
+			null,
+			undefined,
+			"front",
+		);
+		const later = await enqueueBufferedMessage(NARRATOR_ID, "later");
+		expect(getBufferedMessages(NARRATOR_ID).map((row) => row.id)).toEqual([
+			priority.id,
+			normal.id,
+			later.id,
+		]);
+		expect(peekInbox(NARRATOR_ID)?.id).toBe(priority.id);
+		const desired = [normal.id, priority.id, later.id];
+		expect(reorderBufferedMessages(NARRATOR_ID, desired)).toBe(true);
+		expect(getBufferedMessages(NARRATOR_ID).map((row) => row.id)).toEqual(desired);
+		expect(toBufferSummary(getBufferedMessages(NARRATOR_ID)).every((row) => !row.priority)).toBe(
+			true,
+		);
+		for (const id of desired) {
+			expect(peekInbox(NARRATOR_ID)?.id).toBe(id);
+			const [claimed] = store.claimBatch(
+				NARRATOR_ID,
+				{ token: "sort", epoch: "sort" },
+				{ count: 1 },
+			);
+			expect(claimed.id).toBe(id);
+		}
+	});
+	test("back inputs retain global arrival order across task notices", async () => {
+		const { createMailboxStore } = await import("../agent-runtime/mailbox");
+		const store = createMailboxStore(db);
+		const old = await enqueueBufferedMessage(NARRATOR_ID, "old");
+		removeBufferedMessage(NARRATOR_ID, old.id);
+		store.enqueue({
+			narratorId: NARRATOR_ID,
+			kind: "task_notice",
+			noticeKind: "agent",
+			sourceKey: "global-order",
+			text: "notice",
+			projectedByteSize: 6,
+		});
+		await enqueueBufferedMessage(NARRATOR_ID, "later user");
+		const [row] = store.claimBatch(
+			NARRATOR_ID,
+			{ token: "global-order", epoch: "global-order" },
+			{ count: 1 },
+		);
+		expect(row.kind).toBe("task_notice");
+		expect(row.text).toBe("notice");
+	});
+	test("partial File preparation failure rolls back files and never enqueues", async () => {
+		const root = join(HOME, "buffered-files");
+		const before = existsSync(root) ? readdirSync(root).sort() : [];
+		const tooLarge = textFile("too-large.md");
+		Object.defineProperty(tooLarge, "size", { value: 101 * 1024 * 1024 });
+		await expect(
+			enqueueBufferedMessage(NARRATOR_ID, "failed", undefined, null, null, null, [
+				textFile("first.md"),
+				tooLarge,
+			]),
+		).rejects.toThrow("size limit");
+		expect(getBufferedMessages(NARRATOR_ID)).toEqual([]);
+		expect(readdirSync(root).sort()).toEqual(before);
+	});
+
+	test("clear cancels only pending user rows and preserves notice and tombstone", async () => {
+		const { createMailboxStore } = await import("../agent-runtime/mailbox");
+		const store = createMailboxStore(db);
+		const notice = store.enqueue({
+			narratorId: NARRATOR_ID,
+			kind: "task_notice",
+			noticeKind: "agent",
+			sourceKey: "notice-clear",
+			text: "completed",
+			projectedByteSize: 9,
+		});
+		expect(notice.status).toBe("accepted");
+		const removed = await enqueueBufferedMessage(NARRATOR_ID, "removed");
+		removeBufferedMessage(NARRATOR_ID, removed.id);
+		await enqueueBufferedMessage(NARRATOR_ID, "pending");
+		dbClearAllBuffered(NARRATOR_ID);
+		const rows = db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.narratorId, NARRATOR_ID))
+			.all();
+		expect(rows.find((row) => row.kind === "task_notice")?.state).toBe("queued");
+		expect(rows.find((row) => row.id === removed.id)?.state).toBe("cancelled");
+		expect(
+			rows.filter((row) => row.kind === "user_input").every((row) => row.state === "cancelled"),
+		).toBe(true);
+	});
+	test("row ids differ from staging ids and cancel removes the actual directory", async () => {
+		const pushed = await enqueueBufferedMessage(NARRATOR_ID, "cold", undefined, null, null, null, [
+			textFile("cold.md", "durable"),
+		]);
+		const [message] = getBufferedMessages(NARRATOR_ID);
+		expect(message.id).toBe(pushed.id);
+		expect(message._stagingId).not.toBe(message.id);
+		const path = message._savedFiles?.[0].path as string;
+		expect(await message.textFiles?.[0].text()).toBe("durable");
+		cleanupBufferedTextFiles(message._stagingId as string);
+		expect(existsSync(path)).toBe(true);
+		expect(removeBufferedMessage(NARRATOR_ID, pushed.id)).toBe(true);
+		expect(existsSync(path)).toBe(false);
+		const row = db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.id, pushed.id))
+			.get();
+		expect(row?.state).toBe("cancelled");
+	});
+
+	test("claim leases survive UI clear and cleanup; failed delivery returns the same files", async () => {
+		const { createMailboxStore } = await import("../agent-runtime/mailbox");
+		const store = createMailboxStore(db);
+		await enqueueBufferedMessage(NARRATOR_ID, "claimed", undefined, null, null, null, [
+			textFile("lease.md", "leased"),
+		]);
+		const [row] = store.claimBatch(NARRATOR_ID, { token: "owner", epoch: "epoch-1" }, { count: 1 });
+		const message = projectMailboxUserMessage(row);
+		const saved = message._savedFiles?.[0] as NonNullable<typeof message._savedFiles>[number];
+		dbClearAllBuffered(NARRATOR_ID);
+		cleanupBufferedTextFiles(message._stagingId as string);
+		deleteBufferedTextFile(saved);
+		expect(existsSync(saved.path)).toBe(true);
+		expect(removeBufferedMessage(NARRATOR_ID, row.id)).toBe(false);
+		expect(getBufferedMessages(NARRATOR_ID)).toHaveLength(0);
+		releaseBufferedMessage(message, "retry preparation");
+		expect(getBufferedMessages(NARRATOR_ID)[0].id).toBe(row.id);
+		expect(await getBufferedMessages(NARRATOR_ID)[0].textFiles?.[0].text()).toBe("leased");
+		expect(removeBufferedMessage(NARRATOR_ID, row.id)).toBe(true);
+		expect(existsSync(saved.path)).toBe(false);
+	});
+
+	test("large immutable references survive cold projection and async edits", async () => {
+		const snapshot = {
+			type: "file_reference" as const,
+			reference: { id: "ref", deviceId: "local", path: "/saved.ts", label: "saved.ts" },
+			snapshotText: "x".repeat(32 * 1024),
+			snapshotHash: "hash",
+			capturedAt: new Date().toISOString(),
+		};
+		const pushed = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"reference",
+			undefined,
+			null,
+			null,
+			null,
+			undefined,
+			"back",
+			null,
+			[snapshot],
+		);
+		const row = db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.id, pushed.id))
+			.get();
+		expect(row?.fileReferencesJson).toBeNull();
+		expect(JSON.parse(row?.metadataJson ?? "{}").fileReferencesPath).toBeString();
+		expect(getBufferedMessages(NARRATOR_ID)[0].fileReferences?.[0].snapshotText).toBe(
+			snapshot.snapshotText,
+		);
+		const body = "b".repeat(300 * 1024);
+		expect(
+			await updateBufferedMessage(NARRATOR_ID, pushed.id, body, { fileReferences: [snapshot] }),
+		).toBe(true);
+		expect(getBufferedMessages(NARRATOR_ID)[0].text).toBe(body);
+		expect(getBufferedMessages(NARRATOR_ID)[0].fileReferences?.[0].snapshotText).toBe(
+			snapshot.snapshotText,
+		);
+		const staging = getBufferedMessages(NARRATOR_ID)[0]._stagingId as string;
+		removeBufferedMessage(NARRATOR_ID, pushed.id);
+		expect(existsSync(join(HOME, "buffered-files", staging))).toBe(false);
+	});
+
+	test("long command and pre-prompt Bash survive the bounded row envelope", async () => {
+		const command = `/new ${"x".repeat(100_000)}`;
+		const bash = `echo ${"y".repeat(400_000)}`;
+		const pushed = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"display",
+			undefined,
+			command,
+			null,
+			null,
+			undefined,
+			"back",
+			bash,
+		);
+		const row = db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.id, pushed.id))
+			.get();
+		expect(row?.commandText).toBeNull();
+		expect(row?.bashCommand).toBeNull();
+		expect(getBufferedMessages(NARRATOR_ID)[0].commandText).toBe(command);
+		expect(getBufferedMessages(NARRATOR_ID)[0].bashCommand).toBe(bash);
+		await updateBufferedMessage(NARRATOR_ID, pushed.id, "edited display");
+		expect(getBufferedMessages(NARRATOR_ID)[0].commandText).toBe(command);
+		expect(getBufferedMessages(NARRATOR_ID)[0].bashCommand).toBe(bash);
+		removeBufferedMessage(NARRATOR_ID, pushed.id);
+	});
+
+	test("legacy rows initialize on removal and preserve saved files on cold read", async () => {
+		const id = "legacy-buffer-row";
+		const { persistBufferedTextFiles } = await import("../narrator-buffer");
+		const files = await persistBufferedTextFiles(id, [textFile("old.md", "legacy")]);
+		db.insert(narratorBufferedMessages)
+			.values({
+				id,
+				narratorId: NARRATOR_ID,
+				text: "old",
+				seq: 0,
+				bufferedAt: new Date().toISOString(),
+				textFilePathsJson: JSON.stringify(files),
+			})
+			.run();
+		expect(await getBufferedMessages(NARRATOR_ID)[0].textFiles?.[0].text()).toBe("legacy");
+		expect(removeBufferedMessage(NARRATOR_ID, id)).toBe(true);
+		expect(existsSync(files[0].path)).toBe(false);
+	});
+
+	test("primary front is LIFO while subagent priority remains FIFO", async () => {
+		for (const [id, frontOrder] of [
+			[NARRATOR_ID, "stack"],
+			[SUBAGENT_ID, "fifo"],
+		] as const) {
+			await enqueueBufferedMessage(id, "ordinary");
+			await enqueueBufferedMessage(
+				id,
+				"first",
+				undefined,
+				null,
+				null,
+				null,
+				undefined,
+				"front",
+				null,
+				undefined,
+				frontOrder,
+			);
+			await enqueueBufferedMessage(
+				id,
+				"second",
+				undefined,
+				null,
+				null,
+				null,
+				undefined,
+				"front",
+				null,
+				undefined,
+				frontOrder,
+			);
+			const expected =
+				frontOrder === "fifo" ? ["first", "second", "ordinary"] : ["second", "first", "ordinary"];
+			expect(getBufferedMessages(id).map((message) => message.text)).toEqual(expected);
+			const { createMailboxStore } = await import("../agent-runtime/mailbox");
+			const [claimed] = createMailboxStore(db).claimBatch(
+				id,
+				{ token: "priority-owner", epoch: "priority-epoch" },
+				{ count: 1 },
+			);
+			expect(claimed.text).toBe(expected[0]);
+		}
+	});
+
+	test("reorder rejects duplicate identities without changing durable order", async () => {
+		const a = await enqueueBufferedMessage(NARRATOR_ID, "a");
+		const b = await enqueueBufferedMessage(NARRATOR_ID, "b");
+		expect(reorderBufferedMessages(NARRATOR_ID, [a.id, a.id])).toBe(false);
+		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.id)).toEqual([a.id, b.id]);
+		expect(reorderBufferedMessages(NARRATOR_ID, [b.id, a.id])).toBe(true);
+		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.id)).toEqual([b.id, a.id]);
+	});
+});
+
 describe("unrelated files are untouched", () => {
-	test("deleteBufferedTextFile removes only the given path", () => {
+	test("deleteBufferedTextFile refuses a non-mailbox path", () => {
 		const dir = mkdtempSync(join(HOME, "single-"));
 		const target = join(dir, "target.md");
 		const neighbour = join(dir, "neighbour.md");
@@ -396,7 +777,7 @@ describe("unrelated files are untouched", () => {
 
 		deleteBufferedTextFile({ filename: "target.md", path: target, size: 1 });
 
-		expect(existsSync(target)).toBe(false);
+		expect(existsSync(target)).toBe(true);
 		expect(existsSync(neighbour)).toBe(true);
 	});
 });

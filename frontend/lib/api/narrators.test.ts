@@ -65,6 +65,25 @@ describe("narrators API", () => {
 		expect(signals[3]).toBe(signal);
 	});
 
+	test("retry buffer encodes both identifiers and preserves queued-without-wake response", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const requests: { url: string; method?: string }[] = [];
+		Object.defineProperty(g, "fetch", {
+			value: async (url: string, init?: RequestInit) => {
+				requests.push({ url, method: init?.method });
+				return Response.json({ ok: true, resumed: false });
+			},
+			configurable: true,
+		});
+		expect(await api.retryBufferedMessage("n/a?", "m/b#")).toEqual({ ok: true, resumed: false });
+		expect(requests).toEqual([
+			{ url: "/api/narrators/n%2Fa%3F/buffer/m%2Fb%23/retry", method: "POST" },
+		]);
+	});
+
 	test("keeps the edit draft unless the request explicitly succeeds", () => {
 		expect(shouldClearEditDraft(true)).toBe(true);
 		expect(shouldClearEditDraft(false)).toBe(false);

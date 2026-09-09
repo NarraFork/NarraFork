@@ -1,44 +1,35 @@
 /**
- * The single ordered list of reasons a finished agent-loop pass may be followed by
- * another one.
+ * Shared continuation vocabulary and executable recovery precedence.
  *
- * ## Why this file exists
- *
- * Two orchestration layers drive the same `executeAgentLoop`:
- *
- *   - the primary narrator, in `narrator-session.ts`'s `runAgentLoop` while-loop
- *   - a subagent, in `subagent-executor.ts`'s `runSubagentLoop` while-loop
- *
- * Every end-of-pass decision used to be hand-written in whichever loop the author
- * happened to be looking at, so "add a continuation source" meant "remember to edit
- * two files". Nobody remembers. The observed cost is a list of one-sided gaps found
- * only after they misbehaved in production: tree-snapshot hooks, `paymentRequired`,
- * `silentDisconnect`, the spec-continuation loop, max-turns handling.
- *
- * This registry does NOT execute anything. It is the *declaration* of what sources
- * exist, in what order they are consulted, and — the part that stops the drift — what
- * each audience does about each one. `dispositions` is a `Record` over every audience,
- * so a new source cannot be added without saying, in code, what the subagent side does
- * with it. "Nothing, because …" is a valid answer; silence is not.
- *
- * ## Why declaration rather than a shared executor
- *
- * The two loops carry genuinely different state (an `ActiveNarrator` with a DB-backed
- * status and a user watching, versus a run that owes its parent a `tool_result`), and
- * their handlers differ in more than parameters — a primary narrator can park itself in
- * `payment_required` and wait for a top-up, while a subagent must fail with a stated
- * reason or hang its parent forever. Forcing one executor over both would mean
- * rewriting the product's core path to serve a refactor. So the shape stays per-loop and
- * what gets unified is the thing that was actually drifting: the *inventory* and its
- * *order*.
- *
- * Enforcement is `turn-continuation-registry.test.ts`: each decision point in both loops
- * carries a `// [continuation-source: <id>]` marker, and the test extracts those markers
- * from the source files and compares them against this registry. A source handled on one
- * side but silently missing on the other fails the test; so does a marker appearing in an
- * order that contradicts the declared one, and so does a marker for a source that
- * audience declared not applicable.
+ * P3 has one outer loop in agent-runtime/orchestrator.ts. The legacy audience
+ * metadata and marker utilities below remain for diagnostics, not as proof of
+ * execution. selectPassRecoverySource is consumed by the real transition executor;
+ * behavioral orchestrator tests, rather than markers in two files, enforce parity.
  */
+import type { ExecuteLoopResult } from "./narrator-executor";
+
+export type PassRecoverySource =
+	| "abort-before-recovery"
+	| "payment-required"
+	| "model-unavailable"
+	| "context-overflow"
+	| "transient-error"
+	| "silent-disconnect"
+	| "completed";
+
+/** No variant argument: identity cannot silently select a different recovery order. */
+export function selectPassRecoverySource(
+	result: ExecuteLoopResult,
+	control: { aborted: boolean; planApproved: boolean },
+): PassRecoverySource {
+	if ((control.aborted || result.aborted) && !control.planApproved) return "abort-before-recovery";
+	if (result.paymentRequired) return "payment-required";
+	if (result.modelUnavailable) return "model-unavailable";
+	if (result.contextLengthExceeded) return "context-overflow";
+	if (result.retryableError) return "transient-error";
+	if (result.silentDisconnect) return "silent-disconnect";
+	return "completed";
+}
 
 /** Which loop is consuming the registry. */
 export type ContinuationAudience = "primary" | "subagent";
@@ -54,6 +45,8 @@ export const CONTINUATION_AUDIENCES: readonly ContinuationAudience[] = ["primary
  * that `parent-injection-queue` was built to fix).
  */
 export type ContinuationOutcome =
+	/** Performs bounded work without itself deciding whether another pass is needed. */
+	| "effect"
 	/** Ends the run. No further pass. */
 	| "terminal"
 	/** Re-sends the same turn (rebuilt history, no new user-visible content). */
@@ -321,33 +314,12 @@ export const CONTINUATION_SOURCES: readonly ContinuationSource[] = [
 	{
 		id: "post-turn-compact",
 		summary: "Context (or pruned ratio) crossed its threshold; start a background compact.",
-		outcome: "terminal",
+		outcome: "effect",
 		orderRationale:
 			"Runs after the turn is accounted for and before the queue drains, so a compact " +
 			"triggered here lands on the history the NEXT pass rebuilds rather than racing the " +
 			"pass that is about to be started.",
-		dispositions: {
-			primary: handled,
-			// Narrow by construction rather than absent by oversight. The primary's post-turn
-			// check is a FALLBACK for a threshold crossed without the mid-turn
-			// `onContextUsage` handler firing; a subagent runs that same handler (`ctxMgmt`
-			// is wired identically) and restarts on the compact's own completion signal
-			// (`compact-restart`, below). The residual hole is a pass that ends above the
-			// threshold and then continues, which enters the next pass uncompacted — and that
-			// pass re-evaluates on its first `context_usage` event.
-			//
-			// It is also the one source where firing it would COST something: a subagent's
-			// pass end is when its answer is handed back to a parent blocked on the tool call,
-			// so a fallback compact there delays the parent for work its own next pass would
-			// do anyway.
-			subagent: na(
-				"Covered by the mid-turn `onContextUsage` handler the subagent already runs plus " +
-					"`compact-restart`. The residual case (a pass ending above threshold that then " +
-					"continues) is re-evaluated on the next pass's first context_usage event, and " +
-					"firing a fallback compact at pass end would delay a parent blocked on the tool " +
-					"call.",
-			),
-		},
+		dispositions: { primary: handled, subagent: handled },
 	},
 	{
 		id: "injection-drain",
@@ -356,14 +328,7 @@ export const CONTINUATION_SOURCES: readonly ContinuationSource[] = [
 		orderRationale:
 			"Ahead of the buffered-message consumer: without it, a message that arrived at this " +
 			"exact moment waited for the next wake.",
-		dispositions: {
-			primary: handled,
-			subagent: na(
-				"A subagent has no parent-injection queue. The equivalent inputs (team mail, its " +
-					"own spec digest) are delivered inside the pass by `getAfterToolsInjections`, " +
-					"which is a mid-turn boundary rather than an end-of-pass source.",
-			),
-		},
+		dispositions: { primary: handled, subagent: handled },
 	},
 	{
 		id: "buffered-message",
@@ -397,14 +362,7 @@ export const CONTINUATION_SOURCES: readonly ContinuationSource[] = [
 			"Immediately after the buffer consumer, because it is precisely the case where that " +
 			"consumer found nothing: settling idle here would look like the narrator stopping on " +
 			"its own right after a tool call.",
-		dispositions: {
-			primary: handled,
-			subagent: na(
-				"A subagent's soft stop is only requested by direct user feedback on its own page, " +
-					"and its queue entries are not cancellable through the same path, so the " +
-					"'stopped for input that vanished' state has no producer here.",
-			),
-		},
+		dispositions: { primary: handled, subagent: handled },
 	},
 	{
 		id: "spec-continuation",
@@ -445,14 +403,7 @@ export const CONTINUATION_SOURCES: readonly ContinuationSource[] = [
 			"Deliberately duplicated at the very end: it closes the window where the row already " +
 			"reads `idle` (visible to clients and to route admission) while this loop is still " +
 			"running and about to pick up more work.",
-		dispositions: {
-			primary: handled,
-			subagent: na(
-				"Mirrors `injection-drain`: no parent-injection queue, and no persisted idle " +
-					"transition to race — a subagent's terminal status is written by finalizeSubagent " +
-					"after the loop returns.",
-			),
-		},
+		dispositions: { primary: handled, subagent: handled },
 	},
 	{
 		id: "compact-restart",
@@ -462,15 +413,7 @@ export const CONTINUATION_SOURCES: readonly ContinuationSource[] = [
 			"Last: it is the fallback for a compact that finished too late for the in-loop " +
 			"`onBeforeTurn` rebuild, so every source that could end the run legitimately gets " +
 			"to decide first.",
-		dispositions: {
-			primary: na(
-				"A primary narrator does not restart for a compact. `post-turn-compact` fires it " +
-					"and the next pass rebuilds history at the top of the loop anyway, so the pass " +
-					"that started it has nothing left to do. The subagent needs the explicit restart " +
-					"because its run ends when the pass returns.",
-			),
-			subagent: handled,
-		},
+		dispositions: { primary: handled, subagent: handled },
 	},
 ] as const;
 

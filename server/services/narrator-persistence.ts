@@ -8,9 +8,10 @@ import {
 	truncateCompactError,
 } from "@shared/compact-message";
 import type { MessageOriginOptions } from "@shared/message-origin";
-import { and, desc, eq, gte, inArray, isNull, like, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, like, type SQL, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -41,12 +42,88 @@ import { forcesRelaxedPlan, type PermissionMode } from "../lib/permission-modes"
 import { settings } from "../lib/settings";
 import { getMinPruneRatio } from "../lib/settings/provider";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { createMailboxStore } from "./agent-runtime/mailbox";
+import type { MailboxClaim } from "./agent-runtime/mailbox-types";
+import { getExecutionOwner } from "./agent-runtime/ownership";
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
 import { preserveTakenOverSubstatus } from "./subagent-takeover";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/** Recipient mutation also invalidates source pages, including child cards rendered in a parent. */
+export function updateRecipientMessageRef(
+	tx: DbTx,
+	narratorId: string,
+	refId: string,
+	change: Parameters<ReturnType<typeof createMailboxStore>["updateRecipientRef"]>[3],
+) {
+	const sources = tx
+		.select({ id: narratorBufferedMessages.sourceNarratorId })
+		.from(narratorBufferedMessages)
+		.where(
+			and(
+				eq(narratorBufferedMessages.narratorId, narratorId),
+				eq(narratorBufferedMessages.recipientRefId, refId),
+			),
+		)
+		.limit(100)
+		.all();
+	const changed = createMailboxStore(db).updateRecipientRef(tx, narratorId, refId, change);
+	if (!changed) return;
+	const ids = new Set(sources.flatMap((source) => (source.id ? [source.id] : [])));
+	if (!ids.size) return;
+	const parents = tx
+		.select({ id: narrators.parentNarratorId })
+		.from(narrators)
+		.where(and(inArray(narrators.id, [...ids]), eq(narrators.type, "subagent")))
+		.limit(100)
+		.all();
+	for (const parent of parents) if (parent.id) ids.add(parent.id);
+	tx.update(narrators)
+		.set({
+			messageVersion: sql`${narrators.messageVersion} + 1`,
+			updatedAt: new Date().toISOString(),
+		})
+		.where(inArray(narrators.id, [...ids]))
+		.run();
+}
+
+/** Preserve negative dedupe before removing recipient refs, in the caller's real transaction. */
+export function deleteRecipientMessageRefs(tx: DbTx) {
+	return {
+		where(predicate: SQL | undefined) {
+			return {
+				run() {
+					let changes = 0;
+					for (;;) {
+						const refs = tx
+							.select({ id: narratorMessageRefs.id, narratorId: narratorMessageRefs.narratorId })
+							.from(narratorMessageRefs)
+							.where(predicate)
+							.limit(100)
+							.all();
+						if (!refs.length) return { changes };
+						for (const ref of refs)
+							updateRecipientMessageRef(tx, ref.narratorId, ref.id, {
+								kind: "deleted",
+							});
+						tx.delete(narratorMessageRefs)
+							.where(
+								inArray(
+									narratorMessageRefs.id,
+									refs.map((ref) => ref.id),
+								),
+							)
+							.run();
+						changes += refs.length;
+					}
+				},
+			};
+		},
+	};
+}
 const toolAttemptCreationLock = new AsyncMutex();
 
 /** Compatibility callers may omit the PK only when there is exactly one possible row. */
@@ -683,7 +760,7 @@ export async function recoverStaleCompactingMessages(
 
 						if (!compactBlock || !hasRetryHistory) {
 							for (const ref of refs) {
-								tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, ref.id)).run();
+								deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, ref.id)).run();
 								tx.update(narrators)
 									.set({
 										messageVersion: sql`${narrators.messageVersion} + 1`,
@@ -798,6 +875,8 @@ export async function recoverStaleCompactingMessages(
 export interface MessagePlacementOptions {
 	/** Reserved by the exact agent delivery; never supplied by public input. */
 	messageId?: string;
+	/** Claimed durable input; user_input does not require an agent delivery envelope. */
+	mailboxClaim?: MailboxClaim;
 	/**
 	 * The `tool_use` id that owns this row — the Agent/Task call that spawned the
 	 * recipient subagent. Null/omitted writes a top-level row.
@@ -808,7 +887,51 @@ export interface MessagePlacementOptions {
 	 * Throwing rolls back all writes; the hook can run again after a SQLite busy retry.
 	 * No asynchronous work or external side effects are allowed here.
 	 */
-	onPersist?: (tx: DbTx, messageId: string) => undefined;
+	onPersist?: (tx: DbTx, messageId: string, refId: string) => undefined;
+}
+
+function placementMessageId(placement?: MessagePlacementOptions): string {
+	if (placement?.messageId) return placement.messageId;
+	if (!placement?.mailboxClaim) return generateId();
+	const row = db
+		.select({ messageId: narratorBufferedMessages.recipientMessageId })
+		.from(narratorBufferedMessages)
+		.where(eq(narratorBufferedMessages.id, placement.mailboxClaim.id))
+		.get();
+	if (!row?.messageId) throw new Error("Mailbox claim has no reserved recipient identity");
+	return row.messageId;
+}
+
+function persistPlacement(
+	tx: DbTx,
+	narratorId: string,
+	messageId: string,
+	placement?: MessagePlacementOptions,
+) {
+	if (!placement?.mailboxClaim && !placement?.onPersist) return;
+	const ref = tx
+		.select({ id: narratorMessageRefs.id })
+		.from(narratorMessageRefs)
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		)
+		.get();
+	if (!ref) throw new Error("Message placement did not persist a recipient ref");
+	if (placement.mailboxClaim) {
+		const owner = getExecutionOwner(narratorId);
+		if (!owner?.isCurrent() || owner.epoch !== placement.mailboxClaim.epoch)
+			throw new Error("Stale mailbox claim execution owner");
+		if (placement.mailboxClaim.narratorId !== narratorId)
+			throw new Error("Mailbox recipient mismatch");
+		createMailboxStore(db).materializeInTransaction(tx, placement.mailboxClaim, {
+			messageId,
+			refId: ref.id,
+		});
+	}
+	placement.onPersist?.(tx, messageId, ref.id);
 }
 
 // ── narratorPersistence object ─────────────────────────────────────────────
@@ -840,7 +963,7 @@ export const narratorPersistence = {
 		const parentToolUseId = placement?.parentToolUseId ?? null;
 		const msgWithSeq = await withDbRetry(
 			async () => {
-				const id = placement?.messageId ?? generateId();
+				const id = placementMessageId(placement);
 				const now = new Date().toISOString();
 				return db.transaction((tx) => {
 					const created = tx
@@ -861,7 +984,7 @@ export const narratorPersistence = {
 						.returning()
 						.get();
 					const seq = appendMessageRefSync(tx, narratorId, id);
-					placement?.onPersist?.(tx, id);
+					persistPlacement(tx, narratorId, id, placement);
 					return { ...created, seq };
 				});
 			},
@@ -936,7 +1059,7 @@ export const narratorPersistence = {
 		const msg = await withDbRetry(
 			async () =>
 				db.transaction((tx) => {
-					const id = placement?.messageId ?? generateId();
+					const id = placementMessageId(placement);
 					const now = new Date().toISOString();
 					const blocks: unknown[] = [{ type: "text", text }, ...(contentBlocks ?? [])];
 					const created = tx
@@ -957,12 +1080,12 @@ export const narratorPersistence = {
 						.get();
 
 					const seq = appendMessageRefSync(tx, narratorId, id);
-					placement?.onPersist?.(tx, id);
+					persistPlacement(tx, narratorId, id, placement);
 					return { ...created, seq };
 				}),
 			{ label: "persistSystemMessage", maxRetries: 5 },
 		);
-		if (placement?.messageId) {
+		if (placement?.messageId || placement?.mailboxClaim) {
 			await bumpParentNarratorMessageVersion(parentToolUseId).catch((error) => {
 				logger.warn("Committed injection parent-version notification failed", {
 					narratorId,
@@ -2934,6 +3057,8 @@ export const narratorPersistence = {
 			resultMessageId?: string;
 			bumpMessageVersion?: boolean;
 			preserveTiming?: boolean;
+			/** Commit publication intent with the exact tool result, synchronously. */
+			onPersist?: (tx: DbTx) => void;
 		},
 		messageId?: string,
 		toolCallId?: string,
@@ -2951,32 +3076,35 @@ export const narratorPersistence = {
 			})
 			.from(narratorToolCalls)
 			.where(and(...conditions));
-		await db
-			.update(narratorToolCalls)
-			.set({
-				outputJson: result.output ?? null,
-				status: result.status,
-				errorMessage: result.errorMessage ?? null,
-				permissionStartedAt:
-					typeof result.permissionStartedAt === "number"
-						? new Date(result.permissionStartedAt).toISOString()
-						: undefined,
-				executionStartedAt:
-					typeof result.executionStartedAt === "number"
-						? new Date(result.executionStartedAt).toISOString()
-						: undefined,
-				...(result.preserveTiming
-					? {}
-					: {
-							durationMs: result.durationMs ?? null,
-							completedAt:
-								typeof result.completedAt === "number"
-									? new Date(result.completedAt).toISOString()
-									: new Date().toISOString(),
-						}),
-				...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
-			})
-			.where(and(...conditions));
+		db.transaction((tx) => {
+			tx.update(narratorToolCalls)
+				.set({
+					outputJson: result.output ?? null,
+					status: result.status,
+					errorMessage: result.errorMessage ?? null,
+					permissionStartedAt:
+						typeof result.permissionStartedAt === "number"
+							? new Date(result.permissionStartedAt).toISOString()
+							: undefined,
+					executionStartedAt:
+						typeof result.executionStartedAt === "number"
+							? new Date(result.executionStartedAt).toISOString()
+							: undefined,
+					...(result.preserveTiming
+						? {}
+						: {
+								durationMs: result.durationMs ?? null,
+								completedAt:
+									typeof result.completedAt === "number"
+										? new Date(result.completedAt).toISOString()
+										: new Date().toISOString(),
+							}),
+					...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
+				})
+				.where(and(...conditions))
+				.run();
+			result.onPersist?.(tx);
+		});
 
 		// Announce the terminal state with bounded metadata only. External clients need to see
 		// "which tool ran on which device, how long it took, did it fail" to follow along; without
@@ -3121,6 +3249,9 @@ export const narratorPersistence = {
 			.from(narratorMessageRefs)
 			.where(eq(narratorMessageRefs.messageId, messageId));
 		const isShared = (refCount?.count ?? 0) > 1;
+		const semanticEdit =
+			overrides != null &&
+			(Object.hasOwn(overrides, "contentJson") || Object.hasOwn(overrides, "contentText"));
 		if (!isShared) {
 			if (overrides && Object.keys(overrides).length > 0) {
 				db.transaction((tx) => {
@@ -3128,6 +3259,11 @@ export const narratorPersistence = {
 						.set(overrides)
 						.where(eq(narratorMessages.id, messageId))
 						.run();
+					if (semanticEdit)
+						updateRecipientMessageRef(tx, narratorId, ref.id, {
+							kind: "semantic_edit",
+							messageId,
+						});
 					tx.update(narrators)
 						.set({
 							messageVersion: sql`${narrators.messageVersion} + 1`,
@@ -3170,6 +3306,11 @@ export const narratorPersistence = {
 					),
 				)
 				.run();
+
+			updateRecipientMessageRef(tx, narratorId, ref.id, {
+				kind: semanticEdit ? "semantic_edit" : "cow",
+				messageId: newMessageId,
+			});
 
 			const originalToolCalls = tx.query.narratorToolCalls
 				.findMany({
