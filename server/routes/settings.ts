@@ -87,6 +87,7 @@ import {
 import { closeAllExternalNarratorConnections } from "../websocket/oauth-connection-registry";
 import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
+import { dataDirectorySecurityRoutes } from "./data-directory-security";
 import { getGeminiCachedModelsGrouped, purgeGeminiProviderCache } from "./gemini";
 import { purgeNugProviderCache } from "./nug";
 import {
@@ -747,6 +748,7 @@ function normalizeLegacySettingsPatch(body: unknown): unknown {
 }
 
 export const settingsRoutes = new Hono();
+settingsRoutes.route("/data-directory-security", dataDirectorySecurityRoutes);
 
 /** Mask an API key for safe display (show last 4 chars). */
 function maskApiKey(key?: string): string {

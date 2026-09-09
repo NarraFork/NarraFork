@@ -99,6 +99,7 @@ import {
 import { setStreamAnimDurationMs } from "../lib/stream-anim-duration";
 import { BrandTitle } from "./common/BrandTitle";
 import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
+import { DataDirectorySecurityAlert } from "./DataDirectorySecurityAlert";
 import { GitMissingAlert } from "./GitMissingAlert";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
 import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
@@ -1071,6 +1072,7 @@ function AuthenticatedLayout() {
 			>
 				<GitMissingAlert />
 				<StartupRecoveryAlert />
+				<DataDirectorySecurityAlert />
 				<Outlet />
 			</AppShell.Main>
 

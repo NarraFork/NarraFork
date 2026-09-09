@@ -11,6 +11,9 @@ import { z } from "zod";
 import { legacyPermissionModeSchema } from "../permission-modes";
 import { commandSchema, localeSchema } from "./common";
 
+/** Repair only the configured directory, after explicit administrator confirmation. */
+export const dataDirectoryRepairSchema = z.object({ confirmed: z.literal(true) }).strict();
+
 export const defaultNarratorVisibilitySchema = z.enum(["auto", "private", "public"]);
 export const defaultNarratorWriteAudienceSchema = z.enum(["auto", "owner", "project", "public"]);
 

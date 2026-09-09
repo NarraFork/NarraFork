@@ -213,9 +213,9 @@ export function reloadSettings(): NarraForkSettings {
 }
 
 function loadSettingsFromDisk(): NarraForkSettings {
-	mkdirSync(narraforkDir, { recursive: true });
+	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (!existsSync(settingsPath)) {
-		writeFileSync(settingsPath, JSON.stringify(DEFAULTS, null, 2));
+		writeFileSync(settingsPath, JSON.stringify(DEFAULTS, null, 2), { mode: 0o600 });
 	}
 	const raw = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, "utf-8")) : {};
 	const merged = deepMerge(DEFAULTS, raw);
@@ -726,7 +726,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	normalizeSettingsProxyUrls(newSettings);
 	normalizeSearchSettings(newSettings);
 	normalizeMcpServerIds(newSettings);
-	mkdirSync(narraforkDir, { recursive: true });
+	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
 	try {
 		writeFileSync(tempPath, JSON.stringify(newSettings, null, 2), { mode: 0o600 });

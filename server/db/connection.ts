@@ -89,7 +89,7 @@ function assertNotRealDatabaseInTests(dbPath: string): void {
 export function openDatabase(dbPath?: string): Database {
 	const target = dbPath ?? getDbPath();
 	assertNotRealDatabaseInTests(target);
-	mkdirSync(getNarraforkHome(), { recursive: true });
+	mkdirSync(getNarraforkHome(), { recursive: true, mode: 0o700 });
 	const conn = new Database(target);
 	// WAL: concurrent readers + single writer; readers don't block the writer.
 	conn.run("PRAGMA journal_mode = WAL");

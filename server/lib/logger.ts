@@ -5,7 +5,7 @@ import { getNarraforkHome } from "./narrafork-home";
 type LogLevel = "debug" | "info" | "warn" | "error";
 
 const narraforkDir = getNarraforkHome();
-mkdirSync(narraforkDir, { recursive: true });
+mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 const logPath = resolve(narraforkDir, "server.log");
 
 const LEVEL_PRIORITY: Record<LogLevel, number> = {

@@ -1,4 +1,23 @@
 {
+	"dataDirectorySecurity": {
+		"check": "Check data directory permissions",
+		"handle": "Resolve",
+		"checking": "Checking data directory permissions…",
+		"healthy": "Data directory permissions are safe.",
+		"title": "Application data directory needs attention",
+		"description": "The application data directory is unavailable or its permissions are unsafe. Some operations may be blocked.",
+		"contactAdmin": "Please contact an administrator.",
+		"manual": "Automatic repair is unavailable. An administrator must handle the directory manually.",
+		"queryFailed": "Unable to check data directory security. Please try checking again.",
+		"details": "Diagnostic details",
+		"mode": "Permissions",
+		"repair": "Repair permissions",
+		"recheck": "Check again",
+		"confirmTitle": "Restrict application directory permissions?",
+		"confirmMessage": "This only restricts the application data directory itself to 700 (owner access only). It does not recurse, delete files, or change your home directory. Other operating-system users may lose access.",
+		"success": "Directory permissions repaired. Please retry your original operation manually.",
+		"repairFailed": "Repair did not complete successfully. Check again or handle the directory manually."
+	},
 	"dockTabs": {
 		"all": "Close all (keep main narrators)",
 		"left": "Close tabs to the left",

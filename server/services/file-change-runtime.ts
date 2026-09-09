@@ -24,6 +24,7 @@ import { type ExecutionBackend, LOCAL_DEVICE_ID } from "../lib/agent/execution/b
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { withWorkspaceWriteLock } from "../lib/agent/tools/write-serialization";
 import type { ToolContext, ToolResult } from "../lib/agent/types";
+import { requireApplicationDataDirectory } from "../lib/data-directory-security";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -1198,63 +1199,6 @@ function alreadyAttempted(operation: FileChangeOperationRecord): Error {
 	return new Error(
 		`File operation ${operation.id} is already ${operation.settlement}; no mutation was retried`,
 	);
-}
-
-/**
- * The application data directory is not itself a newly-created blob directory.
- * For example ~/ (0700) may contain an existing .narrafork (0775). No other uid
- * can traverse that private home, so group-write on this descendant does not
- * make it publicly replaceable. Validate the entire canonical ancestor chain,
- * including ownership and sticky shared parents, instead of chmod'ing user data
- * or dropping the OS trust boundary. This is not a sandbox against the owner.
- */
-async function requireApplicationDataDirectory(path: string): Promise<string> {
-	const canonical = resolve(path);
-	if (resolve(await realpath(canonical)) !== canonical)
-		throw new Error(`Application data directory must use its real canonical path: ${canonical}`);
-	const uid = process.geteuid?.();
-	const chain: { path: string; stat: Awaited<ReturnType<typeof directoryStat>> }[] = [];
-	for (let cursor = canonical; ; cursor = dirname(cursor)) {
-		if (chain.length >= 128) throw new Error("Application data directory ancestor limit exceeded");
-		chain.push({ path: cursor, stat: await directoryStat(cursor) });
-		if (dirname(cursor) === cursor) break;
-	}
-	let privateAncestor = false;
-	const digest = createHash("sha256");
-	for (const entry of chain.reverse()) {
-		const { stat } = entry;
-		if (!stat.isDirectory() || stat.isSymbolicLink())
-			throw new Error(`Application data ancestor must be a non-symlink directory: ${entry.path}`);
-		if (process.platform !== "win32") {
-			if (uid === undefined || (stat.uid !== BigInt(uid) && stat.uid !== 0n))
-				throw new Error(`Application data ancestor has an untrusted owner: ${entry.path}`);
-			const own = stat.uid === BigInt(uid);
-			if (
-				entry.path === canonical &&
-				(!own || (stat.mode & 0o002n) !== 0n || (!privateAncestor && (stat.mode & 0o020n) !== 0n))
-			)
-				throw new Error(
-					`Application data directory must be owner-controlled; shared write permissions require a private ancestor: ${canonical}`,
-				);
-			// /tmp (1777) is safe for an owned child because sticky-bit semantics
-			// prevent another uid from renaming that child. A plain shared writable
-			// ancestor is not safe, even if the leaf happens to be 0700.
-			if (!privateAncestor && (stat.mode & 0o022n) !== 0n && (stat.mode & 0o1000n) === 0n)
-				throw new Error(
-					`Application data directory is writable by others without a private ancestor: ${entry.path}`,
-				);
-			if (own && (stat.mode & 0o011n) === 0n) privateAncestor = true;
-		}
-		// Object identities do not change when a legitimate chmod occurs. A later
-		// permission check still has to establish the traversal boundary again.
-		const value = `${entry.path}\0${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
-		digest.update(`${Buffer.byteLength(value)}:`).update(value);
-	}
-	return digest.digest("hex");
-}
-
-function directoryStat(path: string) {
-	return lstat(path, { bigint: true });
 }
 
 async function requirePrivateDirectory(path: string): Promise<void> {

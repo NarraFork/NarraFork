@@ -1,4 +1,23 @@
 {
+	"dataDirectorySecurity": {
+		"check": "检查数据目录权限",
+		"handle": "处理",
+		"checking": "正在检查数据目录权限…",
+		"healthy": "数据目录权限安全。",
+		"title": "应用数据目录需要处理",
+		"description": "应用数据目录不可用或权限不安全，部分操作可能被阻止。",
+		"contactAdmin": "请联系管理员处理。",
+		"manual": "无法自动修复，请管理员人工处理目录。",
+		"queryFailed": "无法检查数据目录安全状态，请重新检查。",
+		"details": "诊断详情",
+		"mode": "权限模式",
+		"repair": "修复权限",
+		"recheck": "重新检查",
+		"confirmTitle": "收紧应用目录权限？",
+		"confirmMessage": "仅将应用数据目录本身的权限收紧为 700（仅所有者可访问）。不递归修改、不删除文件，也不修改 home 主目录。这可能影响其他操作系统用户访问该目录。",
+		"success": "目录权限已修复，请手动重试原来的操作。",
+		"repairFailed": "修复未成功完成，请重新检查或人工处理目录。"
+	},
 	"dockTabs": {
 		"all": "关闭全部（保留主叙述者）",
 		"left": "关闭左侧",

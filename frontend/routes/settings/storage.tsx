@@ -1,6 +1,7 @@
 import { Stack, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
+import { DataDirectorySecurityCheckButton } from "../../components/DataDirectorySecurityAlert";
 import { StorageSection } from "../../components/settings/StorageSection";
 
 export const Route = createFileRoute("/settings/storage")({
@@ -13,6 +14,7 @@ function SettingsStoragePage() {
 	return (
 		<Stack>
 			<Title order={3}>{t("storageSection")}</Title>
+			<DataDirectorySecurityCheckButton />
 			<StorageSection />
 		</Stack>
 	);

@@ -1,3 +1,4 @@
+import type { DataDirectorySecurityStatus } from "@shared/data-directory-security";
 import type { Locale } from "@shared/i18n-locales";
 import type {
 	PersistedRecentTab,
@@ -109,6 +110,13 @@ export interface ModelTestResponse {
 }
 
 export const settingsApi = {
+	getDataDirectorySecurity: (signal?: AbortSignal) =>
+		request<DataDirectorySecurityStatus>("/settings/data-directory-security", { signal }),
+	repairDataDirectorySecurity: () =>
+		request<DataDirectorySecurityStatus>("/settings/data-directory-security/repair", {
+			method: "POST",
+			body: JSON.stringify({ confirmed: true }),
+		}),
 	getSettings: () => request<ApiEntity>("/settings"),
 	getContextThresholds: (model: string, provider: string) =>
 		request<{ pruneStart: number; compactStart: number }>(
