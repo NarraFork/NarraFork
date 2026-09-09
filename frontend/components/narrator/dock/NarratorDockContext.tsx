@@ -38,6 +38,7 @@ import type {
 	FileModPanelExternalProps,
 	NarratorDetailsPanelExternalProps,
 } from "../narrator-panel-types";
+import { focusMessagePanel } from "../panels/focus-message-panel";
 import {
 	type FileOpenOptions,
 	type FilePanelParams,
@@ -356,76 +357,90 @@ export function NarratorDockProvider({
 		[narratorId],
 	);
 
-	const openSubagentPanel = useCallback((subagentNarratorId: string, messageId?: string) => {
-		const api = apiRef.current;
-		if (!api || !subagentNarratorId) return;
-		const id = subagentDockPanelId(subagentNarratorId);
-		const existing = api.getPanel(id);
-		if (existing) {
-			existing.api.setActive();
-			// An already-open panel is focused, and re-asked to jump. The nonce is what
-			// makes a SECOND click on the same row work: the panel's jump is latched per
-			// (narrator, target) so it fires once, and without a changing token the reader
-			// who scrolled away would click a live-looking control and see nothing.
-			if (messageId) {
-				existing.api.updateParameters({
-					panelType: "subagent",
-					subagentNarratorId,
-					highlightMessageId: messageId,
-					highlightRequestId: nextHighlightRequestId(),
-				} satisfies SubagentPanelParams);
+	const openSubagentPanel = useCallback(
+		(subagentNarratorId: string, messageId?: string) => {
+			const api = apiRef.current;
+			if (!api || !subagentNarratorId) return;
+			// Communication bubbles can point back to the host, not only to children.
+			// Never create a second copy of the primary session in the secondary area.
+			if (subagentNarratorId === narratorId) {
+				const primary = api.getPanel(dockPanelId("chat"));
+				if (primary) {
+					focusMessagePanel(api, primary, messageId, (id) =>
+						bridgesRef.current.scrollToMessage?.(id),
+					);
+				}
+				return;
 			}
-			return;
-		}
+			const id = subagentDockPanelId(subagentNarratorId);
+			const existing = api.getPanel(id);
+			if (existing) {
+				existing.api.setActive();
+				// An already-open panel is focused, and re-asked to jump. The nonce is what
+				// makes a SECOND click on the same row work: the panel's jump is latched per
+				// (narrator, target) so it fires once, and without a changing token the reader
+				// who scrolled away would click a live-looking control and see nothing.
+				if (messageId) {
+					existing.api.updateParameters({
+						panelType: "subagent",
+						subagentNarratorId,
+						highlightMessageId: messageId,
+						highlightRequestId: nextHighlightRequestId(),
+					} satisfies SubagentPanelParams);
+				}
+				return;
+			}
 
-		const existingSecondary = api.panels.find((panel) => {
-			const params = panel.params as NarratorDockPanelParams | undefined;
-			return params?.panelType !== "chat";
-		});
-		const chatPanel = api.getPanel(dockPanelId("chat"));
-		const params: NarratorDockPanelParams = {
-			panelType: "subagent",
-			subagentNarratorId,
-			// Carried as a PARAMETER rather than pushed through the `scrollToMessage`
-			// bridge because the panel does not exist yet at click time — there is nothing
-			// registered to call. The panel consumes it on mount.
-			...(messageId
-				? { highlightMessageId: messageId, highlightRequestId: nextHighlightRequestId() }
-				: {}),
-		};
-		const placement = resolveToolPlacement({
-			hasSecondaryGroup: !!existingSecondary?.group,
-			hasChatPanel: !!chatPanel,
-			surfaceWidth: api.width,
-		});
+			const existingSecondary = api.panels.find((panel) => {
+				const params = panel.params as NarratorDockPanelParams | undefined;
+				return params?.panelType !== "chat";
+			});
+			const chatPanel = api.getPanel(dockPanelId("chat"));
+			const params: NarratorDockPanelParams = {
+				panelType: "subagent",
+				subagentNarratorId,
+				// Carried as a PARAMETER rather than pushed through the `scrollToMessage`
+				// bridge because the panel does not exist yet at click time — there is nothing
+				// registered to call. The panel consumes it on mount.
+				...(messageId
+					? { highlightMessageId: messageId, highlightRequestId: nextHighlightRequestId() }
+					: {}),
+			};
+			const placement = resolveToolPlacement({
+				hasSecondaryGroup: !!existingSecondary?.group,
+				hasChatPanel: !!chatPanel,
+				surfaceWidth: api.width,
+			});
 
-		if (placement.mode === "within-secondary" && existingSecondary?.group) {
+			if (placement.mode === "within-secondary" && existingSecondary?.group) {
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT.subagent,
+					params,
+					position: { referenceGroup: existingSecondary.group },
+				});
+				return;
+			}
+
+			if (placement.mode === "split-right" && chatPanel) {
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT.subagent,
+					params,
+					initialWidth: placement.initialWidth,
+					position: { referencePanel: chatPanel.id, direction: "right" },
+				});
+				return;
+			}
+
 			api.addPanel<NarratorDockPanelParams>({
 				id,
 				component: NARRATOR_DOCK_COMPONENT.subagent,
 				params,
-				position: { referenceGroup: existingSecondary.group },
 			});
-			return;
-		}
-
-		if (placement.mode === "split-right" && chatPanel) {
-			api.addPanel<NarratorDockPanelParams>({
-				id,
-				component: NARRATOR_DOCK_COMPONENT.subagent,
-				params,
-				initialWidth: placement.initialWidth,
-				position: { referencePanel: chatPanel.id, direction: "right" },
-			});
-			return;
-		}
-
-		api.addPanel<NarratorDockPanelParams>({
-			id,
-			component: NARRATOR_DOCK_COMPONENT.subagent,
-			params,
-		});
-	}, []);
+		},
+		[narratorId],
+	);
 
 	// Same placement rule as the other secondary panels, but multi-instance: the
 	// panel id is derived from the path, so re-opening the same file focuses the

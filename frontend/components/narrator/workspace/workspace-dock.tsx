@@ -40,6 +40,7 @@ import type {
 	FileModPanelExternalProps,
 	NarratorDetailsPanelExternalProps,
 } from "../narrator-panel-types";
+import { focusMessagePanel } from "../panels/focus-message-panel";
 import {
 	type FileOpenOptions,
 	type FilePanelParams,
@@ -435,6 +436,18 @@ export class WorkspaceDockStore {
 	openSubagentPanel(hostNarratorId: string, subagentNarratorId: string, messageId?: string) {
 		const api = this.apiRef.current;
 		if (!api || !subagentNarratorId) return;
+		// A message can point to any primary already present in this workspace.
+		// Resolve by narrator identity, not panel id or the caller's host identity.
+		const primary = api.panels.find((panel) => {
+			const params = panel.params as WorkspacePanelParams | undefined;
+			return params?.panelType === "narrator" && params.narratorId === subagentNarratorId;
+		});
+		if (primary) {
+			focusMessagePanel(api, primary, messageId, (id) =>
+				this.scrollToMessage(subagentNarratorId, id),
+			);
+			return;
+		}
 		const id = workspaceSubagentPanelId(hostNarratorId, subagentNarratorId);
 		const existing = api.getPanel(id);
 		if (existing) {
