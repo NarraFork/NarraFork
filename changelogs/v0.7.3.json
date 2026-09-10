@@ -1,0 +1,6 @@
+{
+	"version": "0.7.3",
+	"date": "2026-09-10",
+	"en": "## Bug Fixes\n\n- Fix database upgrades failing when SQLite retains temporary table names in CHECK constraints.\n- Preserve hidden file checkpoints during history rollback and improve rollback handling of display-only messages.\n- Validate private plugin proxy grants against expiration, installation, scope and constraints, and surface missing permissions in settings.\n- Support longer provider-plugin histories and normalize oversized tool-call IDs when switching providers.\n- Resume model availability waits when the selected or default model changes.\n- Fix Markdown task checkbox layout and improve background-task notices, subagent navigation and asynchronous question forms.",
+	"zh-CN": "## 修复\n\n- 修复 SQLite 检查约束残留临时表名导致数据库升级失败的问题。\n- 修复历史回退遗漏隐藏文件检查点的问题，改善纯展示消息的回退处理。\n- 私有插件代理授权校验有效期、安装身份、作用域及约束，并在设置中展示待审批权限。\n- 支持插件提供商传输更长会话历史，修复切换提供商时超长工具调用 ID 导致的请求失败。\n- 切换当前模型或默认模型后及时唤醒模型可用性等待。\n- 修复 Markdown 任务复选框排版，改善后台任务提示、子代理导航和异步提问表单展示。"
+}
