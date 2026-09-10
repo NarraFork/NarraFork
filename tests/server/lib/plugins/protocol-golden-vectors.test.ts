@@ -4,7 +4,9 @@ import {
 	eventsPollParamsSchema,
 	eventsSubscribeParamsSchema,
 	hostInitializeParamsSchema,
+	jsonRpcEnvelopeSchema,
 	jsonRpcNotificationSchema,
+	jsonValueSchema,
 	NARRAFORK_RPC_PROTOCOL,
 	PLUGIN_TO_HOST_METHOD_REQUIRED_FEATURES,
 	PLUGIN_TO_HOST_NOTIFICATION_METHODS,
@@ -22,6 +24,53 @@ import {
 	rpcCreditNotificationSchema,
 	SNAPSHOT_LIVE_UNAVAILABLE,
 } from "@server/lib/plugins/protocol";
+
+describe("Plugin JSON payload validation", () => {
+	test("accepts long provider histories and large individual text blocks", () => {
+		const history = Array.from({ length: 12_000 }, (_, index) => ({
+			role: index % 2 ? "assistant" : "user",
+			content: [{ type: "text", text: `message ${index}` }],
+		}));
+		expect(
+			jsonRpcEnvelopeSchema.safeParse({
+				jsonrpc: "2.0",
+				id: "long-chat",
+				method: "provider.chat",
+				params: { history, current: "文".repeat(1_100_000) },
+			}).success,
+		).toBe(true);
+	});
+
+	test("accepts shared objects but rejects actual cycles", () => {
+		const content = { type: "text", text: "shared" };
+		expect(jsonValueSchema.safeParse({ a: content, b: content }).success).toBe(true);
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
+		expect(jsonValueSchema.safeParse(cyclic).success).toBe(false);
+		const array: unknown[] = [];
+		array.push(array);
+		expect(jsonValueSchema.safeParse(array).success).toBe(false);
+	});
+
+	test("keeps depth and non-JSON safeguards", () => {
+		let deep: unknown = null;
+		for (let index = 0; index < 130; index++) deep = { child: deep };
+		for (const invalid of [
+			deep,
+			undefined,
+			NaN,
+			Infinity,
+			1n,
+			new Date(),
+			{ missing: undefined },
+			JSON.parse('{"__proto__":{}}'),
+			JSON.parse('{"constructor":{}}'),
+			new Array(2),
+		]) {
+			expect(jsonValueSchema.safeParse(invalid).success).toBe(false);
+		}
+	});
+});
 
 describe("Plugin -> Host protocol golden vectors", () => {
 	test("keeps legacy hello compatible while negotiating an explicit feature allowlist", () => {

@@ -52,6 +52,8 @@ export interface PreparedBlockBase {
 	quoteRailLefts: number[];
 	/** Optional list/task marker text (bullet, "1.", checkbox) or null. */
 	markerText: string | null;
+	/** Structured task state; render a control, never a font-dependent glyph. */
+	taskMarker?: { checked: boolean; label: string };
 	/** Left offset (px) of the marker relative to the element, or null. */
 	markerLeft: number | null;
 	/** CSS class for the marker, or null. */

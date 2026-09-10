@@ -1,3 +1,4 @@
+import { MarkdownContentListItem } from "@frontend/components/common/MarkdownListMarker";
 import { MD_HEADING_SLUG_ATTR } from "@frontend/lib/markdown-anchor-scroll";
 import { Code, Divider, Table, Text } from "@mantine/core";
 import { reactChildrenToHeadingText, slugifyHeading } from "@shared/pretext-layout/markdown-anchor";
@@ -204,8 +205,10 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 		ol({ children }) {
 			return <ol>{children}</ol>;
 		},
-		li({ children }) {
-			return <li>{at(children)}</li>;
+		li({ children, className }) {
+			return (
+				<MarkdownContentListItem className={className}>{at(children)}</MarkdownContentListItem>
+			);
 		},
 		a({ href, children, title }) {
 			return (

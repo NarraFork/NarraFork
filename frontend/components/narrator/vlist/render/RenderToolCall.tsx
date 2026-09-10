@@ -2051,6 +2051,28 @@ export function RenderToolCall({
 						? cssColor("blue", 7)
 						: undefined;
 
+	// A live form stays visible on a folded card, but it must not force the
+	// measured command/output body, or the measured permission/reflection copy,
+	// open. A reflection notice still replaces the permission area
+	// (ToolCallCard.tsx:5419). The shell post-paints the slot.
+	const liveSlot = reflection ? null : (permissionSlot ?? null);
+	const measuredSlot = reflection ? (
+		<RenderReflectionNotice
+			measured={reflection}
+			labels={merged.reflection}
+			includeTopMargin
+			onTakeOver={onReflectionTakeOver}
+			takingOver={reflectionTakingOver}
+		/>
+	) : !permissionSlot && permission ? (
+		<RenderInlinePermission
+			measured={permission}
+			labels={merged.permission}
+			includeTopMargin
+			onAllow={onPermissionAllow}
+			onDeny={onPermissionDeny}
+		/>
+	) : null;
 	const body = (
 		<>
 			<ToolHeaderRow
@@ -2075,53 +2097,28 @@ export function RenderToolCall({
 				onTerminate={onTerminate}
 				terminateLabel={merged.terminate}
 			/>
-			{effectiveOpened ? (
-				<>
-					{detail ? (
-						<Box mt={DETAIL_TOP_MARGIN} style={{ position: "relative" }}>
-							{/* The detail region's own top block already carries the mt gap,
-							    so we render it flush and let its frame own the spacing. */}
-							<div style={{ marginTop: -DETAIL_TOP_MARGIN }}>
-								<DetailRegion
-									detail={detail}
-									availableWidth={contentWidth}
-									labels={merged}
-									narratorId={narratorId}
-									viewTargets={viewTargets}
-									viewControls={viewControls}
-									specTasksLive={specTasksLive}
-								/>
-							</div>
-						</Box>
-					) : null}
-					{/* A reflection notice REPLACES the permission area (chunked precedence,
-					    ToolCallCard.tsx:5419). It is fully MEASURED, so it renders on the
-					    pure path — no slot, no post-paint height correction. */}
-					{reflection ? (
-						<RenderReflectionNotice
-							measured={reflection}
-							labels={merged.reflection}
-							includeTopMargin
-							onTakeOver={onReflectionTakeOver}
-							takingOver={reflectionTakingOver}
+			{effectiveOpened && detail ? (
+				<Box mt={DETAIL_TOP_MARGIN} style={{ position: "relative" }}>
+					{/* The detail region's own top block already carries the mt gap,
+					    so we render it flush and let its frame own the spacing. */}
+					<div style={{ marginTop: -DETAIL_TOP_MARGIN }}>
+						<DetailRegion
+							detail={detail}
+							availableWidth={contentWidth}
+							labels={merged}
+							narratorId={narratorId}
+							viewTargets={viewTargets}
+							viewControls={viewControls}
+							specTasksLive={specTasksLive}
 						/>
-					) : (
-						/* Live permission form (integration layer) takes precedence over the
-						   zero-DOM copy: it is the real interactive component whose height is
-						   corrected after paint. The component carries its own top margin. */
-						(permissionSlot ??
-						(permission ? (
-							<RenderInlinePermission
-								measured={permission}
-								labels={merged.permission}
-								includeTopMargin
-								onAllow={onPermissionAllow}
-								onDeny={onPermissionDeny}
-							/>
-						) : null))
-					)}
-				</>
+					</div>
+				</Box>
 			) : null}
+			{/* A reflection notice REPLACES the permission area (chunked precedence,
+			    ToolCallCard.tsx:5419). It is fully MEASURED, so it renders on the
+			    pure path — no slot, no post-paint height correction. */}
+			{effectiveOpened ? measuredSlot : null}
+			{liveSlot}
 		</>
 	);
 

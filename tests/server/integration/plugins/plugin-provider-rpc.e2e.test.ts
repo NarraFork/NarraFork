@@ -250,7 +250,23 @@ describe("provider plugin over real stdio RPC", () => {
 					content: [{ type: "text" as const, text: block }],
 				}));
 			// Cross the former connection (1 MiB), writer (8 MiB) and receiver (16 MiB) ceilings.
-			for (const count of [4, 20, 40]) {
+			const sharedContent = [{ type: "text" as const, text: "shared history block" }];
+			const histories = [
+				...[4, 20, 40].map(history),
+				// Many small nodes, aliased content and a single >1M-character block
+				// used to fail JSON validation before reaching the frame budget.
+				[
+					...Array.from({ length: 12_000 }, () => ({
+						role: "user" as const,
+						content: sharedContent,
+					})),
+					{
+						role: "user" as const,
+						content: [{ type: "text" as const, text: "文".repeat(1_100_000) }],
+					},
+				],
+			];
+			for (const requestHistory of histories) {
 				const operation = await client.chat({
 					providerTypeId: entry.providerTypeId,
 					providerInstanceId: entry.providerInstanceId,
@@ -259,7 +275,7 @@ describe("provider plugin over real stdio RPC", () => {
 					config: {},
 					conversation: { conversationId: "long-history" },
 					request: {
-						history: history(count),
+						history: requestHistory,
 						current: { text: "hello", toolResults: [] },
 						tools: [],
 					},

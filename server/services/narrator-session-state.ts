@@ -37,6 +37,8 @@ export interface ActiveNarrator {
 	provider: string;
 	/** Settings revision used to derive `_modelRef` / `_reasoningEffortRef` into runtime values. */
 	_settingsRevision?: number;
+	/** Cancels a model-unavailable wait without aborting the narrator turn. */
+	_modelUnavailableWaitCancel?: () => void;
 	/** Raw narrator reasoning effort override from DB. Null/undefined means follow provider/global default. */
 	_reasoningEffortRef?: ReasoningEffort | null;
 	/** Runtime reasoning effort to apply before the next model request. Null/undefined means use provider default. */

@@ -6,30 +6,28 @@
  * somewhere the user did not choose, and that is worth testing without constructing a registry,
  * a client pool and a state store first.
  *
- * ## The case that motivates the shape
+ * `mode: "direct"` resolves to no proxy URL, but must still send an empty `outbound` so the
+ * plugin clears its previous proxy. No override and no global proxy means no hints to send.
  *
- * `mode: "direct"` resolves to *no* proxy URL. A resolver that returns `undefined` whenever it
- * has no URL would therefore report "nothing to say" for an explicit opt-out — and because the
- * plugin keeps the last proxy it was told about (see `applyHostHints` in the reference plugin),
- * that silently restores the global proxy the user just turned off.
+ * Proxy URLs come from the host's user-configured provider/global/system proxy policy, not
+ * plugin-supplied upstream request targets. Honor that choice, including LAN and loopback
+ * proxies, without a second opt-in. This is not an outbound-network sandbox or an SSRF
+ * validator for untrusted request destinations; only URL syntax and proxy schemes are checked.
  *
- * So the two cases are distinct:
- *
- * - **an override exists** → always speak, even if the answer is "no proxy". The returned
- *   `outbound` may be empty, which the plugin reads as "clear it".
- * - **no override** → fall back to the global policy, and stay silent when there is no global
- *   proxy either, so a host with no proxy configuration sends nothing on the wire.
- *
- * ## SSRF mitigation
- *
- * The resolved proxy URL is checked against private/reserved address ranges before being
- * handed to the plugin. A local-process plugin inherits the host's network stack, so
- * directing its traffic to 127.0.0.1, 169.254.x (cloud metadata), or RFC-1918 ranges
- * creates an SSRF surface. By default these are rejected; admins who intentionally use a
- * LAN proxy can set `plugins.allowPrivateProxyTarget = true` in settings.
+ * Private-target gate
+ * -------------------
+ * A separate concern from proxy URL validity: when the resolved proxy *target* itself is a
+ * private/reserved address (loopback, RFC 1918, link-local, IPv6 unique-local), forwarding it
+ * to the plugin lets the plugin route every upstream API call through an address on the LAN.
+ * That is a meaningful capability escalation — the plugin could reach internal services the
+ * host never intended to expose. `applyPrivateProxyGate` enforces `network.egress.allowlist`
+ * for such targets; `isPrivateProxyTarget` is the syntactic check (no DNS lookup).
  */
 
 import type { ProxyOverride } from "@server/lib/settings/types";
+
+/** The capability required to forward a private-network proxy to a plugin provider. */
+export const PRIVATE_PROXY_CAPABILITY = "network.egress.allowlist";
 
 export interface ProviderProxyDecision {
 	/** Hints to send, or `undefined` to send none. */
@@ -43,14 +41,6 @@ export interface ProviderProxyPolicyInput {
 	resolveOverride: (override: ProxyOverride) => string | undefined;
 	/** The host-wide proxy, used when there is no override. */
 	globalProxyUrl?: string;
-	/**
-	 * Whether private/reserved IP addresses are allowed as proxy targets.
-	 * Defaults to false (reject). Injected from `settings.plugins.allowPrivateProxyTarget`.
-	 *
-	 * Private deployments on internal networks may legitimately route through LAN proxies,
-	 * so this is an explicit opt-in rather than a hard-coded rejection.
-	 */
-	allowPrivateProxyTarget?: boolean;
 }
 
 /**
@@ -59,8 +49,7 @@ export interface ProviderProxyPolicyInput {
  * Returns `undefined` only when the host genuinely has no policy to communicate; an explicit
  * override always produces a value.
  *
- * @throws {ProxyTargetValidationError} when the resolved URL targets a private/reserved
- *   address and `allowPrivateProxyTarget` is false.
+ * @throws {ProxyTargetValidationError} for malformed URLs or unsupported proxy schemes.
  */
 export function decideProviderProxy(
 	input: ProviderProxyPolicyInput,
@@ -68,24 +57,16 @@ export function decideProviderProxy(
 	if (input.override) {
 		const proxyUrl = input.resolveOverride(input.override);
 		if (proxyUrl) {
-			validateProxyUrl(proxyUrl, input.allowPrivateProxyTarget ?? false);
+			validateProxyUrl(proxyUrl);
 		}
-		// Speak even with no URL: an absent `proxyUrl` inside a present `outbound` is how the
-		// host says "no proxy", which the plugin must apply rather than ignore.
+		// An absent `proxyUrl` inside a present `outbound` means "clear the previous proxy".
 		return { outbound: { ...(proxyUrl ? { proxyUrl } : {}) } };
 	}
 	if (!input.globalProxyUrl) return undefined;
-	validateProxyUrl(input.globalProxyUrl, input.allowPrivateProxyTarget ?? false);
+	validateProxyUrl(input.globalProxyUrl);
 	return { outbound: { proxyUrl: input.globalProxyUrl } };
 }
 
-// ─── SSRF validation ────────────────────────────────────────────────────────
-
-/**
- * Allowed URL schemes for proxy targets. `http:` / `https:` are obvious;
- * `socks5:` and `socks5h:` are used by curl-style proxy stacks and are accepted
- * in the existing `resolveGlobalProxyUrl` codepath.
- */
 const ALLOWED_PROXY_SCHEMES = new Set(["http:", "https:", "socks5:", "socks5h:"]);
 
 export class ProxyTargetValidationError extends Error {
@@ -95,15 +76,113 @@ export class ProxyTargetValidationError extends Error {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Private-target gate
+// ---------------------------------------------------------------------------
+
 /**
- * Validate a proxy URL: scheme whitelist + private-address rejection.
+ * Whether the host portion of `proxyUrl` is a private/reserved address.
  *
- * The check is intentionally strict by default: a proxy URL whose hostname resolves to a
- * private or reserved address creates an SSRF vector for a plugin process running on the
- * host network. DNS rebinding is out of scope here (we only check the literal hostname);
- * actual DNS-level protection requires netns isolation.
+ * Checks are purely syntactic (no DNS resolution): a hostname that *looks* public may
+ * still resolve to a private IP, but that is a DNS-level concern outside this policy
+ * layer. The gate is a defence-in-depth safeguard for the common case — users pasting
+ * LAN addresses — not a full SSRF firewall.
+ *
+ * Recognised private ranges:
+ *   - Loopback: 127.0.0.0/8, ::1, localhost / *.localhost
+ *   - Link-local: 169.254.0.0/16, fe80::/10
+ *   - RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+ *   - IPv6 unique-local: fc00::/7 (fc**::/8 + fd**::/8)
+ *   - Unspecified / reserved: 0.0.0.0/8, 0::0, multicast/Class D/E (≥ 224.0.0.0)
+ *
+ * Returns `false` for unparseable URLs (those fail `validateProxyUrl` before this is
+ * called).
  */
-function validateProxyUrl(url: string, allowPrivate: boolean): void {
+export function isPrivateProxyTarget(proxyUrl: string): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(proxyUrl);
+	} catch {
+		return false; // validateProxyUrl will surface the parse error separately.
+	}
+	const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+	return isPrivateHostname(hostname);
+}
+
+/** Syntactic private-address check for an already-lowercased, bracket-stripped hostname. */
+function isPrivateHostname(hostname: string): boolean {
+	// Named loopback
+	if (hostname === "localhost" || hostname.endsWith(".localhost")) return true;
+	// IPv6
+	if (hostname.includes(":")) {
+		return (
+			hostname === "::" ||
+			hostname === "::1" ||
+			hostname.startsWith("fe80:") || // link-local fe80::/10
+			hostname.startsWith("fc") || // unique-local fc00::/7
+			hostname.startsWith("fd")
+		);
+	}
+	// IPv4-mapped IPv6 (::ffff:1.2.3.4)
+	const ipv4Candidate = hostname.startsWith("::ffff:")
+		? hostname.slice("::ffff:".length)
+		: hostname;
+	return isPrivateIpv4(ipv4Candidate);
+}
+
+function isPrivateIpv4(ip: string): boolean {
+	if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return false;
+	const parts = ip.split(".").map((p) => Number.parseInt(p, 10));
+	if (parts.some((p) => !Number.isInteger(p) || p > 255)) return true; // Malformed — treat as private.
+	const [a, b] = parts as [number, number, number, number];
+	if (a === 0 || a >= 224) return true; // 0.0.0.0/8, multicast / reserved
+	if (a === 10) return true; // 10.0.0.0/8
+	if (a === 127) return true; // 127.0.0.0/8 loopback
+	if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
+	if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+	if (a === 192 && b === 168) return true; // 192.168.0.0/16
+	return false;
+}
+
+/**
+ * Outcome of `applyPrivateProxyGate`.
+ *
+ * `"allow"` — hints may be forwarded to the plugin unchanged.
+ * `"suppress"` — the proxy URL targets a private address and the plugin lacks
+ *                `network.egress.allowlist`; the caller must not send the hints and
+ *                should surface a pending-authorisation signal to the user.
+ */
+export type PrivateProxyGateOutcome = "allow" | "suppress";
+
+export interface PrivateProxyGateInput {
+	/**
+	 * The resolved proxy URL (after `decideProviderProxy`). When absent or empty the
+	 * gate is vacuously satisfied — there is nothing private to gate.
+	 */
+	proxyUrl?: string;
+	/** Capability strings already granted to this plugin installation. */
+	grantedCapabilities: readonly string[];
+}
+
+/**
+ * Decide whether a private-network proxy URL may be forwarded to the plugin.
+ *
+ * Public targets are unconditionally allowed regardless of capabilities (no regression for
+ * existing behaviour). Private targets require `network.egress.allowlist`.
+ *
+ * This is intentionally a pure synchronous function: `resolveProviderHostHints` runs on
+ * the hot request path and cannot await a permission-broker round-trip. The caller is
+ * responsible for firing off the async `addPendingRequest` side-effect on `"suppress"`.
+ */
+export function applyPrivateProxyGate(input: PrivateProxyGateInput): PrivateProxyGateOutcome {
+	if (!input.proxyUrl) return "allow";
+	if (!isPrivateProxyTarget(input.proxyUrl)) return "allow";
+	if (input.grantedCapabilities.includes(PRIVATE_PROXY_CAPABILITY)) return "allow";
+	return "suppress";
+}
+
+/** Validate the user-selected proxy without imposing a public-address requirement. */
+function validateProxyUrl(url: string): void {
 	let parsed: URL;
 	try {
 		parsed = new URL(url);
@@ -120,77 +199,4 @@ function validateProxyUrl(url: string, allowPrivate: boolean): void {
 				`Allowed: ${[...ALLOWED_PROXY_SCHEMES].join(", ")}.`,
 		);
 	}
-
-	if (!allowPrivate && isPrivateOrReservedHost(parsed.hostname)) {
-		throw new ProxyTargetValidationError(
-			`Proxy URL "${url}" targets a private or reserved address. ` +
-				"This is blocked to prevent SSRF. If you intentionally use a LAN proxy, " +
-				'set plugins.allowPrivateProxyTarget = true in settings (Settings → Plugins → "Allow private proxy target").',
-		);
-	}
-}
-
-/**
- * Check whether a hostname is a private, loopback, link-local, or metadata address.
- *
- * Handles:
- * - IPv4 literals: 127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x, 0.0.0.0
- * - IPv6 literals (bracket-stripped): ::1, fe80::, fc/fd (ULA), ::ffff:<private-v4>
- * - Hostnames: "localhost" and variants
- *
- * Does NOT do DNS resolution — only literal patterns. DNS-based SSRF requires network
- * namespace isolation (see docs/plugin-system/07-security-and-sandbox.md).
- */
-export function isPrivateOrReservedHost(hostname: string): boolean {
-	const host = hostname.toLowerCase().replace(/^\[/, "").replace(/]$/, "");
-
-	// Localhost aliases
-	if (host === "localhost" || host.endsWith(".localhost")) return true;
-
-	// IPv6
-	if (host.includes(":")) {
-		return isPrivateIPv6(host);
-	}
-
-	// IPv4 literal
-	const parts = host.split(".");
-	if (parts.length === 4 && parts.every((p) => /^\d{1,3}$/.test(p))) {
-		return isPrivateIPv4(parts.map(Number));
-	}
-
-	return false;
-}
-
-function isPrivateIPv4(octets: number[]): boolean {
-	const [a, b] = octets;
-	// 0.0.0.0/8 — "this" network
-	if (a === 0) return true;
-	// 10.0.0.0/8
-	if (a === 10) return true;
-	// 127.0.0.0/8 — loopback
-	if (a === 127) return true;
-	// 169.254.0.0/16 — link-local / cloud metadata (AWS 169.254.169.254)
-	if (a === 169 && b === 254) return true;
-	// 172.16.0.0/12
-	if (a === 172 && b >= 16 && b <= 31) return true;
-	// 192.168.0.0/16
-	if (a === 192 && b === 168) return true;
-	return false;
-}
-
-function isPrivateIPv6(addr: string): boolean {
-	// Normalize :: expansion is not needed for the patterns we check — the raw forms
-	// appearing in URLs are sufficient for the most common attacks.
-	// ::1 — loopback
-	if (addr === "::1" || addr === "0:0:0:0:0:0:0:1") return true;
-	// fe80::/10 — link-local
-	if (addr.startsWith("fe80:") || addr.startsWith("fe80")) return true;
-	// fc00::/7 — unique local (ULA)
-	if (addr.startsWith("fc") || addr.startsWith("fd")) return true;
-	// ::ffff:x.x.x.x — IPv4-mapped; check the embedded v4
-	const v4Mapped = /^::ffff:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(addr);
-	if (v4Mapped) {
-		return isPrivateIPv4(v4Mapped.slice(1).map(Number));
-	}
-	return false;
 }

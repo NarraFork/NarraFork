@@ -99,7 +99,8 @@ export const enterPlanModeTool: ToolDefinition = {
 		const locale = (ctx?.locale as Locale) ?? "en";
 		const planFilePath = ctx?.planFilePath as string | undefined;
 
-		// If we have a plan file path (set by session layer), return the detailed message
+		// Session layer injects the designated path; keep the receipt as a
+		// compact reminder rather than restating the tool description.
 		if (planFilePath) {
 			return {
 				output: getToolMessageWithParams("enterPlanModeOutputWithPath", locale, { planFilePath }),

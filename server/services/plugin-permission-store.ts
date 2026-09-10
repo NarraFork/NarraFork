@@ -553,6 +553,28 @@ export class PluginPermissionStore {
 			: this.emptySet(pluginId, installationId, revision);
 	}
 
+	/**
+	 * Fail-closed authorization for synchronous host hints, not a capability summary.
+	 * Hints carry no invocation scope and cannot enforce constraints (rates, bytes, etc.),
+	 * so only live, global, unrestricted grants can authorize them. An unloaded store denies.
+	 */
+	hasCachedUnrestrictedGlobalGrant(
+		pluginId: string,
+		installationId: string,
+		capability: string,
+	): boolean {
+		const now = this.now().getTime();
+		return (
+			this.document?.plugins[pluginId]?.[installationId]?.grants.some(
+				(grant) =>
+					grant.capability === capability &&
+					grant.scope.type === "global" &&
+					(grant.expiresAt === undefined || Date.parse(grant.expiresAt) > now) &&
+					(grant.constraints === undefined || Object.keys(grant.constraints).length === 0),
+			) ?? false
+		);
+	}
+
 	async get(pluginId: string, installationId: string): Promise<PluginPermissionSet> {
 		return this.getSet(pluginId, installationId);
 	}

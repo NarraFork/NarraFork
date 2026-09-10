@@ -49,6 +49,7 @@ import {
 import type { CSSProperties, ReactNode } from "react";
 import {
 	BADGE_ROW_HEIGHT,
+	BLOCK_PADDING_BOTTOM,
 	BLOCK_PADDING_X,
 	CARD_PADDING,
 	CHEVRON_SIZE,
@@ -101,6 +102,8 @@ export interface SubagentLabels {
 	recentCalls?: string;
 	/** "Open full session" button label. */
 	openSession?: string;
+	backgroundNotice?: string;
+	openInPanel?: string;
 	/** Prompt toggle label ("Prompt"). */
 	prompt?: string;
 	/** Pending-permission section title ("Waiting for permission"). */
@@ -150,6 +153,8 @@ export interface SubagentLabels {
 const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing">> = {
 	recentCalls: "Recent calls",
 	openSession: "Open full session",
+	backgroundNotice: "Started in the background. View progress and results in the panel.",
+	openInPanel: "Open in panel",
 	prompt: "Prompt",
 	pendingTitle: "Waiting for permission",
 	resolveOverride: "Resolve override",
@@ -740,6 +745,7 @@ function SubagentInner({
 					onTogglePrompt={onTogglePrompt}
 					onToggleFileChanges={onToggleFileChanges}
 					onResolveOverride={onResolveOverride}
+					onOpenSession={onOpenSession}
 					viewTargets={viewTargets}
 					viewControls={viewControls}
 				/>
@@ -778,6 +784,7 @@ function SubagentInner({
 function SubagentBody({
 	measured,
 	labels,
+	onOpenSession,
 	fileChanges,
 	onTogglePrompt,
 	onToggleFileChanges,
@@ -787,6 +794,7 @@ function SubagentBody({
 }: {
 	measured: MeasuredSubagent;
 	labels: ResolvedSubagentLabels;
+	onOpenSession?: () => void;
 	fileChanges?: SubagentFileChangesData;
 	onTogglePrompt?: () => void;
 	onToggleFileChanges?: () => void;
@@ -1110,6 +1118,47 @@ function SubagentBody({
 			</div>,
 		);
 		top += measured.fileChangesHeight;
+	}
+
+	if (measured.hasBackgroundNotice && measured.resultBlockHeight > 0) {
+		parts.push(
+			<Group
+				key="background-notice"
+				data-testid="subagent-background-notice"
+				wrap="nowrap"
+				gap="xs"
+				style={{
+					position: "absolute",
+					top,
+					left: BLOCK_PADDING_X,
+					right: BLOCK_PADDING_X,
+					height: measured.resultBlockHeight - BLOCK_PADDING_BOTTOM,
+				}}
+			>
+				<Text
+					size="xs"
+					c="dimmed"
+					truncate
+					style={{ flex: 1, minWidth: 0 }}
+					title={labels.backgroundNotice}
+				>
+					{labels.backgroundNotice}
+				</Text>
+				<Button
+					size="compact-xs"
+					variant="light"
+					style={{ flexShrink: 0 }}
+					disabled={!onOpenSession}
+					onClick={(event) => {
+						event.stopPropagation();
+						onOpenSession?.();
+					}}
+				>
+					{labels.openInPanel}
+				</Button>
+			</Group>,
+		);
+		top += measured.resultBlockHeight;
 	}
 
 	// resultText (ContentViewer maxHeight:300 markdown).

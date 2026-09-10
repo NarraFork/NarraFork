@@ -37,7 +37,11 @@ import {
 	findPluginProviderForModel,
 	listPluginProviderModelValues,
 } from "./plugin-provider-model-source";
-import { decideProviderProxy } from "./plugin-provider-proxy-policy";
+import {
+	applyPrivateProxyGate,
+	decideProviderProxy,
+	PRIVATE_PROXY_CAPABILITY,
+} from "./plugin-provider-proxy-policy";
 import {
 	pluginProviderRegistry as defaultPluginProviderRegistry,
 	type PluginProviderRegistry,
@@ -712,7 +716,69 @@ export function createPluginPlatformServices(
 			resolveOverride,
 			...(getOutboundProxy() ? { globalProxyUrl: getOutboundProxy() } : {}),
 		});
-		return decision as ProviderHostHints | undefined;
+		if (!decision) return undefined;
+
+		// Private-target gate: a proxy whose host is a loopback/RFC-1918/link-local address
+		// gives the plugin a route into the LAN.  That is a meaningful capability escalation
+		// — only allow it when the plugin holds `network.egress.allowlist`.
+		//
+		// `resolveProviderHostHints` is synchronous (called on every chat/generate request),
+		// so consult the complete cached permission set, never the display-only state summary.
+		// Without invocation scope or constraint enforcement, only a live unrestricted
+		// global grant is sufficient; missing context/cache must fail closed.
+		//
+		// On suppress we fire-and-forget `permissionStore.addPendingRequest`, which is
+		// idempotent — re-entrant hot-path calls for the same plugin will not stack up rows.
+		const proxyUrl = decision.outbound?.proxyUrl;
+		if (proxyUrl) {
+			const cachedState = context ? stateStore.getCachedState(context.pluginId) : undefined;
+			const installationId =
+				cachedState?.installationId ??
+				cachedState?.authorityInstallationId ??
+				cachedState?.current?.hash;
+			const grantedCapabilities =
+				context &&
+				installationId &&
+				permissionStore.hasCachedUnrestrictedGlobalGrant(
+					context.pluginId,
+					installationId,
+					PRIVATE_PROXY_CAPABILITY,
+				)
+					? [PRIVATE_PROXY_CAPABILITY]
+					: [];
+			const gate = applyPrivateProxyGate({ proxyUrl, grantedCapabilities });
+			if (gate === "suppress") {
+				logger.warn(
+					"plugin provider proxy suppressed: private target requires network.egress.allowlist",
+					{
+						pluginId: context?.pluginId,
+						providerInstanceId: context?.providerInstanceId,
+						capability: PRIVATE_PROXY_CAPABILITY,
+					},
+				);
+				// Fire-and-forget pending request so the admin UI can surface it.
+				// Requires a known installationId; skip silently if state is not yet cached.
+				if (installationId && context) {
+					void permissionStore
+						.addPendingRequest(context.pluginId, installationId, {
+							capability: PRIVATE_PROXY_CAPABILITY,
+							scope: { type: "global" },
+							source: "runtime",
+						})
+						.catch((err) => {
+							logger.warn("failed to record pending permission request for private proxy", {
+								pluginId: context.pluginId,
+								error: err instanceof Error ? err.message : String(err),
+							});
+						});
+				}
+				// Return the decision with the proxy URL stripped so the plugin clears any
+				// previously applied proxy rather than retaining a stale one.
+				return { outbound: {} } as ProviderHostHints;
+			}
+		}
+
+		return decision as ProviderHostHints;
 	};
 
 	/**

@@ -208,6 +208,7 @@ export function reloadSettings(): NarraForkSettings {
 	} else {
 		_cache.current = fresh;
 	}
+	for (const listener of settingsChangeListeners) listener();
 	// biome-ignore lint/style/noNonNullAssertion: guaranteed non-null after assignment above
 	return _cache.current!;
 }
@@ -592,6 +593,13 @@ export function purgeStaleAgentModelRefs(
 const _cache: { current: NarraForkSettings | null } = { current: null };
 
 let settingsRevision = 0;
+const settingsChangeListeners = new Set<() => void>();
+
+/** Subscribe to persisted settings after the runtime singleton has been updated. */
+export function subscribeSettingsChanges(listener: () => void): () => void {
+	settingsChangeListeners.add(listener);
+	return () => settingsChangeListeners.delete(listener);
+}
 
 export function getSettingsRevision(): number {
 	return settingsRevision;
@@ -754,6 +762,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 			(_cache.current as any)[key] = newSettings[key];
 		}
 	}
+	for (const listener of settingsChangeListeners) listener();
 }
 
 export const settings: NarraForkSettings = loadSettings();

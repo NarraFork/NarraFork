@@ -249,16 +249,18 @@ describe("retry empty placeholder cleanup", () => {
 		expect((await db.query.narrators.findFirst())?.messageStructureVersion).toBe(1);
 	});
 
-	test("remaining system traffic still requires the ordinary snapshot revert", async () => {
+	test("remaining system traffic is a no-op rollback, so retry can delete it", async () => {
 		await seedNarrator();
 		await seedMessage({ id: "u1", seq: 1, role: "user", contentText: "retry" });
 		await seedMessage({ id: "a1", seq: 2, role: "assistant" });
 		await seedMessage({ id: "s1", seq: 3, role: "sys", contentText: "background notice" });
 		expect(await narratorMessageQueries.deleteEmptyRetryPlaceholder("n1", "a1")).toBe(true);
-		await expect(narratorMessageQueries.deleteMessagesAfter("n1", "u1")).rejects.toThrow();
 		expect(
-			(await db.query.narratorMessageRefs.findMany()).map((ref) => ref.messageId).sort(),
-		).toEqual(["s1", "u1"]);
+			(await narratorMessageQueries.deleteMessagesAfter("n1", "u1")).deletedMessageIds,
+		).toEqual(["s1"]);
+		expect((await db.query.narratorMessageRefs.findMany()).map((ref) => ref.messageId)).toEqual([
+			"u1",
+		]);
 	});
 
 	test("real tool rows and malformed or textual replies are never placeholders", async () => {

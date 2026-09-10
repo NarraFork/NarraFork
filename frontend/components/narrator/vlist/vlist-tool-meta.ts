@@ -48,6 +48,10 @@ export interface VListToolMeta {
 	toolName?: string;
 	/** Subagent card: the child narrator id, when the activity summary knows it. */
 	subagentNarratorId?: string;
+	/** Active Await({type:"question"}): the inbox question id. */
+	awaitQuestionId?: string;
+	/** Message seq of the tool_use that owns awaitQuestionId (latest wait wins). */
+	awaitQuestionSeq?: number;
 	/** Await({type:"agent"}): the requested target id (id | alias | narratorId). */
 	awaitAgentTargetId?: string;
 	/** Await({type:"agent"}): the resolved child narrator id, when known. */
@@ -219,6 +223,11 @@ export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 
 	const meta: VListToolMeta = {};
 	if (toolName) meta.toolName = toolName;
+	if (toolName === "Await" && inputRecord.type === "question" && status === "running") {
+		meta.awaitQuestionId = nonEmpty(inputRecord.id);
+		const seq = record.seq ?? record.messageSeq;
+		if (typeof seq === "number" && Number.isFinite(seq)) meta.awaitQuestionSeq = seq;
+	}
 	const subagentNarratorId = nonEmpty(activity.subagentNarratorId);
 	if (subagentNarratorId) meta.subagentNarratorId = subagentNarratorId;
 	const awaitTargetId = deriveAwaitAgentTargetId(toolName, input, metadata);
@@ -261,7 +270,10 @@ export function buildToolMetaIndex(messages: readonly NarratorMsg[]): Map<string
 			if (!raw || typeof raw !== "object" || raw.type !== "tool_use") continue;
 			const toolUseId = typeof raw.id === "string" ? raw.id : undefined;
 			if (!toolUseId) continue;
-			const meta = deriveToolMeta(raw);
+			const meta = deriveToolMeta({
+				...raw,
+				seq: typeof raw.seq === "number" ? raw.seq : msg.seq,
+			} as ContentBlock);
 			if (meta) index.set(toolUseId, meta);
 		}
 	}

@@ -77,32 +77,16 @@ Latest TODO list from narrator state:
 		"zh-CN": "已进入计划模式。请先分析和规划，再进行修改。",
 	},
 	"tool.enterPlanModeOutputWithPath": {
-		en: `Entered plan mode. Your designated plan file is:
+		en: `Entered plan mode. Designated plan file:
 
 \`{planFilePath}\`
 
-**Next steps:**
-1. Thoroughly explore the codebase using Read, Glob, Grep
-2. Design your implementation approach
-3. **Write your complete plan to the plan file above** using the Write tool
-4. Call ExitPlanMode when ready for user approval
-
-In plan mode, Write/Edit operations are restricted to the plan file only.
-
-**Plan file location:** plan files always live under \`.narrafork/plans/\` in the working directory. Even in relaxed plan mode — where you may write other files while planning — the plan itself must stay in that directory. A \`plan_file_path\` resolving outside \`.narrafork/plans/\` is refused at submission, including via a symlink.`,
-		"zh-CN": `已进入计划模式。你的指定计划文件是：
+Write the complete plan there, then call ExitPlanMode for approval. The plan file must stay under \`.narrafork/plans/\` (including in relaxed mode). Other files may be edited while planning only in relaxed mode.`,
+		"zh-CN": `已进入计划模式。指定计划文件：
 
 \`{planFilePath}\`
 
-**下一步：**
-1. 使用 Read、Glob、Grep 全面探索代码库
-2. 设计你的实施方案
-3. **将完整计划写入上述计划文件**（使用 Write 工具）
-4. 准备好后调用 ExitPlanMode 提交用户批准
-
-在计划模式下，Write/Edit 操作被限制为只能写入计划文件。
-
-**计划文件位置：** 计划文件始终位于工作目录下的 \`.narrafork/plans/\` 中。即使处于宽松计划模式（规划期间允许修改其他文件），计划本身也必须留在该目录内。\`plan_file_path\` 解析结果落在 \`.narrafork/plans/\` 之外（包括通过符号链接）会在提交时被拒绝。`,
+将完整计划写入该文件，然后调用 ExitPlanMode 提交审批。计划文件必须位于 \`.narrafork/plans/\`（宽松模式同样适用）。仅宽松模式下可在规划期间修改其他文件。`,
 	},
 	"tool.exitPlanModeOutput": {
 		en: "Plan approved.",

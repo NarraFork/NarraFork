@@ -12,6 +12,8 @@ import { describe, expect, it } from "bun:test";
 import {
 	MAX_SUBAGENT_RESULT_TEXT_CHARS,
 	parseSubagentOutputText,
+	readBackgroundTaskId,
+	stripAwaitAgentEnvelope,
 	stripSubagentIdTag,
 	subagentResultText,
 } from "../subagent-result-text";
@@ -76,6 +78,36 @@ describe("stripSubagentIdTag", () => {
 		const text =
 			"<background_task_id>review-bubbles</background_task_id>\n\nBackground task started.";
 		expect(stripSubagentIdTag(text)).toBe(text);
+	});
+});
+
+describe("readBackgroundTaskId", () => {
+	it("reads only a leading runner envelope", () => {
+		expect(
+			readBackgroundTaskId("<background_task_id>review-bubbles</background_task_id>\nstarted"),
+		).toBe("review-bubbles");
+		expect(readBackgroundTaskId("Example: <background_task_id>quoted</background_task_id>")).toBe(
+			undefined,
+		);
+		expect(readBackgroundTaskId("<background_task_id>incomplete")).toBe(undefined);
+	});
+});
+
+describe("stripAwaitAgentEnvelope", () => {
+	it("drops a leading addressing tag and keeps an optional status line", () => {
+		expect(stripAwaitAgentEnvelope("<subagent_id>worker</subagent_id>\n\nStill running")).toBe(
+			"Still running",
+		);
+		expect(
+			stripAwaitAgentEnvelope(
+				"Agent worker status: completed\n\n<subagent_id>worker</subagent_id>\n\n# Result\nDone",
+			),
+		).toBe("Agent worker status: completed\n\n# Result\nDone");
+	});
+
+	it("does not rewrite tags quoted later in a report", () => {
+		const text = "Example:\n```xml\n<subagent_id>example</subagent_id>\n```";
+		expect(stripAwaitAgentEnvelope(text)).toBe(text);
 	});
 });
 

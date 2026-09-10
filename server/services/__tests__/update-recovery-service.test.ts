@@ -1122,7 +1122,7 @@ describe("planned update continuation scheduling", () => {
 		expect(updatedToolResults).toHaveLength(1);
 		expect(updatedToolResults[0]?.args[1] as Record<string, unknown>).toMatchObject({
 			output:
-				'<background_task_id>background-worker</background_task_id>\n\nBackground task started. Use Await({ type: "agent", id }) with this ID to get results, or Send({ id, message }) to continue.',
+				'<background_task_id>background-worker</background_task_id>\n\nBackground task started. Await({ type: "agent", id: "background-worker" })',
 			status: "success",
 		});
 		expect(
@@ -1133,13 +1133,15 @@ describe("planned update continuation scheduling", () => {
 		finishBackground("<subagent_id>child-background</subagent_id>\n\ndone");
 	});
 
-	test("does not rewrite an existing background Agent start ToolResult", async () => {
+	test.each([
+		'Background task started. Use Await({ type: "agent", id }) with this ID to get results, or Send({ id, message }) to continue.',
+		'Background task started. Await({ type: "agent", id: "background-worker" })',
+	])("does not rewrite an existing background Agent start ToolResult: %s", async (receipt) => {
 		let finishBackground = (_value: string) => {};
 		resumedAgentCompletion = new Promise<string>((resolve) => {
 			finishBackground = resolve;
 		});
-		const output =
-			'<background_task_id>background-worker</background_task_id>\n\nBackground task started. Use Await({ type: "agent", id }) with this ID to get results, or Send({ id, message }) to continue.';
+		const output = `<background_task_id>background-worker</background_task_id>\n\n${receipt}`;
 		const backgroundAgent = continuationRecord("tool-background-existing-start", "owner", {
 			kind: "background_agent",
 			state: "waiting",

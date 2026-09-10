@@ -119,6 +119,7 @@ import {
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
+import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
 import { useModelCardIndex } from "../../hooks/useModelCards";
@@ -1744,6 +1745,17 @@ export function NarratorPanel({
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
 	const narrator = narratorProp ?? fetchedNarrator;
+	const humanAttentionQuery = useHumanAttention(!workspacePreview);
+	const attentionItems = loadedHumanAttentionItems(humanAttentionQuery.data?.pages);
+	// Only synchronous decisions owned by this session already have a tail prompt.
+	// Async asks (even when awaited), child sessions and unknown pages still need the inbox.
+	const showHumanAttentionInbox =
+		humanAttentionQuery.isError ||
+		humanAttentionQuery.hasNextPage ||
+		attentionItems.length === 0 ||
+		attentionItems.some(
+			(item) => item.narratorId !== narratorId || item.source === "question" || !item.blocking,
+		);
 	const relaxedPlanForced = narrator?.permissionMode === "bypassPermissions";
 	const relaxedPlanEnabled = relaxedPlanForced || narrator?.relaxedPlan === true;
 
@@ -8842,7 +8854,7 @@ export function NarratorPanel({
 					    Renders nothing when no question is open anywhere, so it costs no space
 					    in the common case. Scoped to the current session for its label and
 					    grouping, but the drawer it opens spans every session. */}
-					{!isWorkspacePreview && (
+					{!isWorkspacePreview && showHumanAttentionInbox && (
 						<Box px="md" pb={4} style={{ flexShrink: 0 }}>
 							<HumanAttentionInboxButton currentNarratorId={narratorId} />
 						</Box>

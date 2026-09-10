@@ -176,4 +176,16 @@ describe("streaming markdown animation", () => {
 		expect(Array.from(segments).every((node) => node.tagName === "SPAN")).toBe(true);
 		expect(container.querySelector("span[style*='inline-block']")).toBeNull();
 	});
+
+	test("classic markdown task items use the SVG checkbox, not a native OS control", async () => {
+		await render(<MarkdownContent text={["- [x] 确认目录", "- [ ] 未完成"].join("\n")} />);
+		if (!container) throw new Error("test container is not initialized");
+		const items = container.querySelectorAll("li.md-task-item");
+		expect(items.length).toBeGreaterThanOrEqual(1);
+		expect(container.querySelectorAll(".vlist-task-checkbox svg").length).toBe(items.length);
+		expect(container.querySelector("input[type='checkbox']:not([disabled])")).toBeNull();
+		expect(container.querySelector("svg path")).not.toBeNull();
+		expect(container.textContent).toContain("确认目录");
+		expect(container.textContent ?? "").not.toMatch(/[\u2610\u2611]/u);
+	});
 });

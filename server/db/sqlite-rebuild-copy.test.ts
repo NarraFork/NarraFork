@@ -74,6 +74,9 @@ function expectRollback(db: Database, folder: string, error: RegExp): void {
 describe("canonical Drizzle rebuild-copy compatibility", () => {
 	test("real 0153 preserves two legacy 13-column attributions, NULLs seven new columns and repairs user deletion", () => {
 		const db = database();
+		// 0.6.6→0.7.2 failed here: Drizzle CHECKs name `__new_file_attributions.lines_added`,
+		// and legacy ALTER TABLE does not rewrite that qualifier on RENAME.
+		db.run("PRAGMA legacy_alter_table = ON");
 		db.run("CREATE TABLE users (id text PRIMARY KEY NOT NULL)");
 		db.run("CREATE TABLE narrators (id text PRIMARY KEY NOT NULL)");
 		for (const table of ["file_change_operations", "file_change_effects", "file_change_scopes"]) {
@@ -138,6 +141,97 @@ describe("canonical Drizzle rebuild-copy compatibility", () => {
 		expect(db.prepare("SELECT * FROM file_attributions ORDER BY id").all()).toEqual(
 			oldRows.map((row) => ({ ...row, ...newColumns, user_id: null })),
 		);
+	});
+
+	test("real 0153 renames under legacy_alter_table because CHECK no longer names __new_file_attributions", () => {
+		const db = database();
+		db.run("PRAGMA legacy_alter_table = ON");
+		db.run("CREATE TABLE users (id text PRIMARY KEY NOT NULL)");
+		db.run("CREATE TABLE narrators (id text PRIMARY KEY NOT NULL)");
+		for (const table of ["file_change_operations", "file_change_effects", "file_change_scopes"]) {
+			db.run(`CREATE TABLE ${table} (id text PRIMARY KEY NOT NULL)`);
+		}
+		db.exec(readFileSync(join(migrationsPath, "0044_bizarre_phalanx.sql"), "utf8"));
+		db.run("ALTER TABLE file_attributions ADD device_id text DEFAULT 'local' NOT NULL");
+		db.exec(readFileSync(join(migrationsPath, "0146_mysterious_phalanx.sql"), "utf8"));
+		db.exec(readFileSync(join(migrationsPath, "0147_easy_grey_gargoyle.sql"), "utf8"));
+		db.run(`INSERT INTO file_attributions
+			(id, device_id, workspace_path, file_path, narrator_id, user_id, subagent_type,
+			 action, tool_name, tool_use_id, lines_added, lines_removed, changed_at)
+			VALUES
+			('attr-1', 'local', '/work/one', 'src/one.ts', null, null, null,
+			 'edit', 'Edit', 'tool-1', 12, 4, '2026-09-01T10:00:00Z')`);
+		const sql = readFileSync(join(migrationsPath, "0153_tan_bushwacker.sql"), "utf8");
+		applyPendingMigrationsByHash(db, migrationsWith(sql, "0153_tan_bushwacker"));
+
+		const created = db
+			.query("SELECT sql FROM sqlite_master WHERE name = 'file_attributions'")
+			.get() as {
+			sql: string;
+		};
+		expect(created.sql).not.toContain("__new_file_attributions");
+		expect(created.sql).toContain("ck_file_attr_line_counts");
+		expect(db.query("SELECT id, lines_added, lines_removed FROM file_attributions").all()).toEqual([
+			{ id: "attr-1", lines_added: 12, lines_removed: 4 },
+		]);
+		expect(() =>
+			db.run(`INSERT INTO file_attributions
+				(id, device_id, workspace_path, file_path, action, changed_at, lines_added)
+				VALUES ('attr-bad', 'local', '/work', 'x.ts', 'edit', '2026-09-01T10:00:00Z', -1)`),
+		).toThrow(/ck_file_attr_line_counts|CHECK constraint/i);
+		expect(db.query("PRAGMA legacy_alter_table").get()).toEqual({ legacy_alter_table: 1 });
+	});
+
+	test("strips this __new_ table's CHECK qualifier without rewriting the same text inside a string", () => {
+		const db = database();
+		db.run("PRAGMA legacy_alter_table = ON");
+		createLegacyX(db);
+		const sql = [
+			`CREATE TABLE __new_x (
+				id text PRIMARY KEY NOT NULL,
+				payload text,
+				added text,
+				CONSTRAINT ck_own CHECK("__new_x"."added" IS NULL OR "__new_x"."added" <> 'no'),
+				CONSTRAINT ck_literal CHECK(payload IS NULL OR payload <> '__new_x.payload / other_table.payload')
+			);`,
+			'INSERT INTO __new_x("id", "payload", "added") SELECT "id", "payload", "added" FROM x;',
+			"DROP TABLE x;",
+			"ALTER TABLE __new_x RENAME TO x;",
+		].join(breakpoint);
+		applyPendingMigrationsByHash(db, migrationsWith(sql));
+		const created = db.query("SELECT sql FROM sqlite_master WHERE name = 'x'").get() as {
+			sql: string;
+		};
+		expect(created.sql).not.toMatch(/"__new_x"\s*\.\s*"added"/);
+		expect(created.sql).toContain("__new_x.payload / other_table.payload");
+		expect(db.query("SELECT * FROM x ORDER BY id").all()).toEqual([
+			{ id: "row-1", payload: "keep-me", added: null },
+			{ id: "row-2", payload: null, added: null },
+		]);
+	});
+
+	test("rewrites IF NOT EXISTS rebuild CHECKs the same way", () => {
+		const db = database();
+		db.run("PRAGMA legacy_alter_table = ON");
+		createLegacyX(db);
+		const sql = [
+			`CREATE TABLE IF NOT EXISTS __new_x (
+				id text PRIMARY KEY NOT NULL,
+				payload text,
+				added text,
+				CONSTRAINT ck_own CHECK("__new_x"."added" IS NULL OR "__new_x"."added" <> 'no')
+			);`,
+			'INSERT INTO __new_x("id", "payload", "added") SELECT "id", "payload", "added" FROM x;',
+			"DROP TABLE x;",
+			"ALTER TABLE __new_x RENAME TO x;",
+		].join(breakpoint);
+		applyPendingMigrationsByHash(db, migrationsWith(sql));
+		const created = db.query("SELECT sql FROM sqlite_master WHERE name = 'x'").get() as {
+			sql: string;
+		};
+		expect(created.sql).not.toMatch(/"__new_x"\s*\.\s*"added"/);
+		expect(created.sql).toContain("ck_own");
+		expect(db.query("SELECT id FROM x ORDER BY id").all()).toEqual([{ id: "row-1" }, { id: "row-2" }]);
 	});
 
 	test("omits new columns so text, numeric and expression defaults apply to every copied row", () => {

@@ -13,9 +13,11 @@ import {
 	Text,
 	TextInput,
 	Title,
+	Tooltip,
 } from "@mantine/core";
 import {
 	IconAlertCircle,
+	IconAlertTriangle,
 	IconArrowLeft,
 	IconCheck,
 	IconPlayerPlay,
@@ -188,6 +190,29 @@ function ContributionsTab({ plugin }: { plugin: PluginDetail }) {
 				))}
 			</Table.Tbody>
 		</Table>
+	);
+}
+
+// Capabilities that carry meaningful host-security implications and warrant an
+// inline warning. Shown both when approving a pending request and when the
+// manifest declares a capability that is not yet granted.
+const HIGH_RISK_CAPABILITIES: Record<string, string> = {
+	"network.egress.allowlist": "highRiskNetworkEgressAllowlist",
+};
+
+function HighRiskWarning({ capability }: { capability: string }) {
+	const { t } = useTranslation("plugins");
+	const key = HIGH_RISK_CAPABILITIES[capability];
+	if (!key) return null;
+	const label = t(`admin.detail.grants.highRisk.${key}`);
+	return (
+		<Tooltip label={label} multiline w={320} withArrow>
+			<IconAlertTriangle
+				size={15}
+				color="var(--mantine-color-orange-5)"
+				style={{ flexShrink: 0, cursor: "help" }}
+			/>
+		</Tooltip>
 	);
 }
 
@@ -411,7 +436,7 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 											{req.scope.type}
 											{req.scope.id ? `:${req.scope.id}` : ""}
 										</Badge>
-										{req.source === "upgrade" && (
+										{req.source === "upgrade" ? (
 											<Badge color="yellow" variant="light" size="sm">
 												{req.requestedForVersion
 													? t("admin.detail.grants.pendingSourceUpgradeVersion", {
@@ -419,7 +444,12 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 														})
 													: t("admin.detail.grants.pendingSourceUpgrade")}
 											</Badge>
+										) : (
+											<Badge color="blue" variant="light" size="sm">
+												{t("admin.detail.grants.pendingSourceRuntime")}
+											</Badge>
 										)}
+										<HighRiskWarning capability={req.capability} />
 										<Text size="xs" c="dimmed">
 											{formatLocaleDateTime(req.requestedAt)}
 										</Text>
@@ -489,6 +519,9 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 							<Paper key={grant.grantId} withBorder p="xs" radius="md">
 								<Group justify="space-between" wrap="nowrap">
 									<Group gap="sm" wrap="wrap">
+										<Badge color="green" variant="light" size="sm">
+											{t("admin.detail.grants.statusGranted")}
+										</Badge>
 										<Badge color="indigo" variant="light" size="sm">
 											{grant.capability}
 										</Badge>
@@ -496,6 +529,7 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 											{grant.scope.type}
 											{grant.scope.id ? `:${grant.scope.id}` : ""}
 										</Badge>
+										<HighRiskWarning capability={grant.capability} />
 										{grant.grantedBy && (
 											<Text size="xs" c="dimmed">
 												{t("admin.detail.grants.grantedBy")}: {grant.grantedBy}
@@ -527,9 +561,15 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 						{ungranted.map((capability) => (
 							<Paper key={capability} withBorder p="xs" radius="md">
 								<Group justify="space-between" wrap="nowrap">
-									<Badge color="orange" variant="light" size="sm">
-										{capability}
-									</Badge>
+									<Group gap="sm" wrap="wrap">
+										<Badge color="orange" variant="light" size="sm">
+											{t("admin.detail.grants.statusManifest")}
+										</Badge>
+										<Badge color="orange" variant="outline" size="sm">
+											{capability}
+										</Badge>
+										<HighRiskWarning capability={capability} />
+									</Group>
 									<Button
 										size="compact-xs"
 										variant="light"

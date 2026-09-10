@@ -60,6 +60,7 @@ import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-i
 import { BARE_ROW_HEIGHT, bareRowMetrics } from "@shared/pretext-layout/row-metrics";
 import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
 import { scaleFontSize } from "@shared/pretext-layout/typography";
+import { readBackgroundTaskId } from "@shared/subagent-result-text";
 import {
 	accumulateFrame,
 	DEFAULT_RENDER_LOD,
@@ -481,6 +482,8 @@ export interface MeasuredSubagent extends MeasuredElement {
 	resultMeasured: MeasuredToolBody<ToolCappedDetail> | null;
 	/** Result block height (min(content,300) + padding); 0 when absent. */
 	resultBlockHeight: number;
+	/** Replace a background launch acknowledgement with a compact panel shortcut. */
+	hasBackgroundNotice: boolean;
 	/** File-changes block height (title + attribution notices + rows + overflow). */
 	fileChangesHeight: number;
 	/** Shared title/notice/file/overflow line height at the measured typography. */
@@ -622,7 +625,12 @@ export function measureSubagentCard(
 	});
 
 	// ── Header (always shown) ──────────────────────────────────────────────────
-	const hasResultPreview = !effectiveExpanded && isTerminal && !!data.resultBody?.text;
+	// Background launch acknowledgements are protocol text, not user-facing output.
+	// Keep errors and actual results readable rather than hiding every background result.
+	// Detached foreground agents also return this envelope without run_in_background.
+	const hasBackgroundNotice = readBackgroundTaskId(data.resultBody?.text ?? "") !== undefined;
+	const hasResultPreview =
+		!hasBackgroundNotice && !effectiveExpanded && isTerminal && !!data.resultBody?.text;
 	const descInnerWidth = Math.max(1, contentWidth - CARD_PADDING * 2 - DESC_LEFT);
 	const descriptionMeasured = effectiveExpanded
 		? measureWrappedText(data.description, descInnerWidth, "vlist-sa-desc")
@@ -748,7 +756,11 @@ export function measureSubagentCard(
 			expandedHeight += fileChangesHeight;
 		}
 
-		if (data.resultBody) {
+		if (hasBackgroundNotice) {
+			resultBlockHeight =
+				Math.max(typographyMetrics().line.xs, BUTTON_COMPACT_XS) + BLOCK_PADDING_BOTTOM;
+			expandedHeight += resultBlockHeight;
+		} else if (data.resultBody) {
 			resultMeasured = measureToolBody(
 				data.resultBody,
 				Math.max(1, contentWidth - BLOCK_PADDING_X * 2),
@@ -792,6 +804,7 @@ export function measureSubagentCard(
 		toolUseId: data.toolUseId ?? null,
 		resultMeasured,
 		resultBlockHeight,
+		hasBackgroundNotice,
 		fileChangesHeight,
 		fileChangeRowHeight,
 		fileChangeNoticeRowCount,

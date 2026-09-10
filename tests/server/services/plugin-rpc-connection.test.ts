@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import type {
 	JsonRpcEnvelope,
 	JsonRpcNotification,
@@ -75,6 +75,46 @@ function notification(method: string, params?: unknown): JsonRpcNotification {
 }
 
 describe("PluginRpcConnection", () => {
+	it("serializes outbound bodies once and accounts for UTF-8 framing and control reserve", async () => {
+		const transport = new MemoryTransport();
+		const message = notification("bytes", { text: "中文" });
+		const bodyBytes = new TextEncoder().encode(JSON.stringify(message)).byteLength;
+		const frameBytes =
+			bodyBytes +
+			new TextEncoder().encode(
+				`Content-Length: ${bodyBytes}\r\nContent-Type: application/json; charset=utf-8\r\n\r\n`,
+			).byteLength;
+		const connection = new PluginRpcConnection({
+			transport,
+			maxOutboundFrameBytes: bodyBytes,
+			maxQueuedBytes: frameBytes + 1,
+			controlReserveBytes: 1,
+		});
+		let release!: () => void;
+		transport.send = () =>
+			new Promise<void>((resolve) => {
+				release = resolve;
+			});
+		const stringify = spyOn(JSON, "stringify");
+		let pending: Promise<void>;
+		try {
+			pending = connection.notify("bytes", { text: "中文" });
+			expect(stringify.mock.calls.filter(([value]) => value?.method === "bytes")).toHaveLength(1);
+		} finally {
+			stringify.mockRestore();
+		}
+		expect(connection.queuedBytes).toBe(frameBytes);
+		await expect(connection.notify("bytes", { text: "中文" })).rejects.toMatchObject({
+			code: "OUTBOUND_QUEUE_FULL",
+		});
+		release();
+		await pending;
+		await expect(connection.notify("bytes", { text: "中文a" })).rejects.toMatchObject({
+			code: "OUTBOUND_FRAME_LIMIT",
+		});
+		await connection.close();
+	});
+
 	it("keeps outbound and inbound request ids in separate maps", async () => {
 		const transport = new MemoryTransport();
 		const dispatcher = new PluginHostDispatcher({

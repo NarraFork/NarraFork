@@ -17,8 +17,8 @@
  *
  * The `<subagent_id>` prefix is stripped: it is addressing metadata the runner
  * prepends so the model can reply to the child, never something a reader wants
- * to see. `<background_task_id>` is deliberately KEPT — that line is the whole
- * message for a backgrounded task ("use Await with this ID").
+ * to see. `<background_task_id>` stays available to the card's launch-notice
+ * classifier; it must be rendered as a compact notice, not as result markdown.
  */
 
 import { readLeafText, stringifyForDisplay } from "./pretext-layout/tool-io-projection";
@@ -32,6 +32,21 @@ import { readLeafText, stringifyForDisplay } from "./pretext-layout/tool-io-proj
 export const MAX_SUBAGENT_RESULT_TEXT_CHARS = 120_000;
 
 const SUBAGENT_ID_RE = /<subagent_id>[^<]*<\/subagent_id>/g;
+
+/** Recognize only a leading runner envelope, never tags quoted in a result body. */
+export function readBackgroundTaskId(text: string): string | undefined {
+	return /^\s*<background_task_id>([^<\r\n]+)<\/background_task_id>(?:\s|$)/.exec(text)?.[1];
+}
+
+/** Await may prepend a status line before the runner's addressing envelope. */
+export function stripAwaitAgentEnvelope(text: string): string {
+	return text
+		.replace(
+			/^(\s*(?:Agent [^\r\n]+ status: [^\r\n]+\r?\n\s*)?)<subagent_id>[^<\r\n]*<\/subagent_id>\s*/,
+			"$1",
+		)
+		.trim();
+}
 
 function capText(text: string, maxChars: number): string {
 	return text.length > maxChars ? text.slice(0, maxChars) : text;

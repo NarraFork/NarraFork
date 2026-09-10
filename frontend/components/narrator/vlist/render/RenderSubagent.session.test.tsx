@@ -69,6 +69,49 @@ function renderCard(opts: { onOpenSession?: () => void; hasButton?: boolean }): 
 	);
 }
 
+it("shows a compact background notice and panel button without protocol output", () => {
+	const measured = measureSubagentCard(
+		{
+			agentType: "general",
+			description: "Background work",
+			isBackground: true,
+			resultBody: {
+				kind: "capped",
+				id: "background-result",
+				source: "output.main",
+				cap: "agent-result",
+				text: "<background_task_id>child</background_task_id>\nUse Await to get results.",
+				format: "markdown",
+				live: false,
+				followTarget: { kind: "end" },
+			},
+		},
+		WIDTH,
+		5,
+		{ opened: true },
+	);
+	for (const available of [true, false]) {
+		const root = parse(
+			renderToStaticMarkup(
+				<MantineProvider>
+					<RenderSubagent
+						measured={measured}
+						description="Background work"
+						isBackground
+						onOpenSession={available ? () => {} : undefined}
+					/>
+				</MantineProvider>,
+			),
+		);
+		const notice = root.querySelector('[data-testid="subagent-background-notice"]');
+		expect(notice?.textContent).toContain("Started in the background.");
+		expect(notice?.querySelector("button")?.textContent).toBe("Open in panel");
+		expect(notice?.querySelector("button")?.hasAttribute("disabled")).toBe(!available);
+		expect(root.textContent).not.toContain("background_task_id");
+		expect(root.textContent).not.toContain("Use Await");
+	}
+});
+
 const activityRows = (root: Element) =>
 	Array.from(root.querySelectorAll('[data-testid="subagent-activity"]'));
 

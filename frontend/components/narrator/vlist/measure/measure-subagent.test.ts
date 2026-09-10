@@ -761,6 +761,62 @@ describe("measureSubagent — file changes", () => {
 	});
 });
 
+describe("background launch notice", () => {
+	it("also recognizes detached foreground agents, but not quoted or incomplete tags", async () => {
+		const { measureSubagentCard } = await import("./measure-subagent");
+		for (const [text, expected] of [
+			["<background_task_id>child</background_task_id>\nMoved to background.", true],
+			["Example: <background_task_id>child</background_task_id>", false],
+			["<background_task_id>incomplete", false],
+		] as const) {
+			const measured = measureSubagentCard(
+				{ ...BASE, isBackground: false, resultBody: bodyFixture("output.main", text) },
+				WIDTH,
+				5,
+				{ opened: true },
+			);
+			expect(measured.hasBackgroundNotice).toBe(expected);
+		}
+	});
+	it("replaces protocol output with one fixed row and suppresses collapsed preview", async () => {
+		const { measureSubagentCard } = await import("./measure-subagent");
+		const data = {
+			...BASE,
+			isBackground: true,
+			resultBody: bodyFixture(
+				"output.main",
+				"<background_task_id>child</background_task_id>\nBackground task started.",
+			),
+		};
+		const expanded = measureSubagentCard(data, WIDTH, 5, { opened: true });
+		expect(expanded.hasBackgroundNotice).toBe(true);
+		expect(expanded.resultMeasured).toBeNull();
+		expect(expanded.resultBlockHeight).toBeGreaterThan(0);
+		expect(measureSubagentCard(data, 240, 5, { opened: true }).resultBlockHeight).toBe(
+			expanded.resultBlockHeight,
+		);
+		const collapsed = measureSubagentCard(data, WIDTH, 5, { opened: false });
+		expect(collapsed.hasResultPreview).toBe(false);
+		expect(collapsed.resultBlockHeight).toBe(0);
+	});
+
+	it("keeps background errors and ordinary results visible", async () => {
+		const { measureSubagentCard } = await import("./measure-subagent");
+		const measured = measureSubagentCard(
+			{
+				...BASE,
+				isBackground: true,
+				resultBody: bodyFixture("output.main", "Error: child could not start"),
+			},
+			WIDTH,
+			5,
+			{ opened: true },
+		);
+		expect(measured.hasBackgroundNotice).toBe(false);
+		expect(measured.resultMeasured).not.toBeNull();
+	});
+});
+
 function bodyFixture(
 	source: "input.prompt" | "output.main",
 	text: string,

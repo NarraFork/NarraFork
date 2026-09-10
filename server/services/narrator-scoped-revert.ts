@@ -7,9 +7,10 @@
  * unknown coverage before any filesystem work. M1–M3 supply the v2 planner.
  */
 import { isAbsolute, relative } from "node:path";
+import { NON_OPERATION_ROLES } from "@shared/file-change-protocol";
 import { and, asc, eq, gte, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
-import { narratorMessageRefs, narratorToolCalls } from "../db/schema";
+import { narratorMessageRefs, narratorMessages, narratorToolCalls } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import {
 	EMPTY_RESULT,
@@ -68,6 +69,64 @@ const MAX_OPERATION_ROWS = 1_000;
 const MAX_INPUT_METADATA_BYTES = 16 * 1024;
 /** Unknown/plugin tools are not silently classified as having no disk effects. */
 const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "WebFetch"]);
+type WindowCoverage =
+	| { kind: "empty" }
+	| { kind: "too_large" }
+	| { kind: "nothing_owned" }
+	| { kind: "incomplete_coverage" };
+
+/**
+ * Seq/message leftover cards: join roles in SQL and stay inside the operation-row budget.
+ * An empty leftover set is a no-op; an assistant without calls still refuses the window.
+ */
+async function classifyWindowWithoutOperations(
+	narratorId: string,
+	scope: Exclude<ScopedRevertSelector, { toolUses: Array<{ messageId: string; toolUseId: string }> }>,
+	knownMessageIds: ReadonlySet<string> = new Set(),
+): Promise<WindowCoverage> {
+	const rows = await db
+		.select({
+			messageId: narratorMessageRefs.messageId,
+			role: narratorMessages.role,
+		})
+		.from(narratorMessageRefs)
+		.leftJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				"messageIds" in scope
+					? inArray(narratorMessageRefs.messageId, scope.messageIds)
+					: gte(narratorMessageRefs.seq, scope.minSeq),
+				sql`NOT EXISTS (
+					SELECT 1 FROM ${narratorToolCalls}
+					WHERE ${narratorToolCalls.messageId} = ${narratorMessageRefs.messageId}
+				)`,
+			),
+		)
+		.limit(MAX_OPERATION_ROWS + 1);
+	if (rows.length > MAX_OPERATION_ROWS) return { kind: "too_large" };
+	if (rows.some((row) => row.role == null || !NON_OPERATION_ROLES.has(row.role))) {
+		return { kind: "incomplete_coverage" };
+	}
+	if ("messageIds" in scope) {
+		const found = new Set(rows.map((row) => row.messageId));
+		const missing = scope.messageIds.filter((id) => !knownMessageIds.has(id) && !found.has(id));
+		if (missing.length > 0) {
+			if (rows.length + missing.length > MAX_OPERATION_ROWS) return { kind: "too_large" };
+			const extra = await db
+				.select({ id: narratorMessages.id, role: narratorMessages.role })
+				.from(narratorMessages)
+				.where(inArray(narratorMessages.id, missing));
+			if (extra.length !== missing.length) return { kind: "incomplete_coverage" };
+			if (extra.some((row) => !NON_OPERATION_ROLES.has(row.role))) {
+				return { kind: "incomplete_coverage" };
+			}
+			return { kind: "nothing_owned" };
+		}
+	}
+	if (rows.length === 0) return { kind: "empty" };
+	return { kind: "nothing_owned" };
+}
 
 /** Keep the selection bounded before constructing SQL, including explicit selectors. */
 function selectorCondition(scope: ScopedRevertSelector) {
@@ -151,18 +210,33 @@ async function selectPairs(
 		.limit(MAX_OPERATION_ROWS + 1);
 
 	if (rows.length > MAX_OPERATION_ROWS) return { pairs: [], unavailable: "window_too_large" };
-	if (rows.length === 0) return { pairs: [], unavailable: "no_boundaries" };
-	if ("messageIds" in scope) {
-		const present = new Set(rows.map((row) => row.messageId));
-		// A missing target cannot be hidden by another message's no-op. In M0 a
-		// message with no call rows also lacks positive operation-coverage evidence.
-		if (scope.messageIds.some((messageId) => !present.has(messageId))) {
-			return { pairs: [], unavailable: "incomplete_coverage" };
-		}
+	if (rows.length === 0) {
+		// A tool-use selector with zero rows is still unknown history.
+		// Seq/message windows can be only injections or user turns (the cards
+		// written after an interrupt). Those roles never persist tool calls,
+		// so treat them as a no-op instead of REVERT_UNAVAILABLE.
+		if ("toolUses" in scope) return { pairs: [], unavailable: "no_boundaries" };
+		const coverage = await classifyWindowWithoutOperations(narratorId, scope);
+		if (coverage.kind === "empty") return { pairs: [], unavailable: "no_boundaries" };
+		if (coverage.kind === "too_large") return { pairs: [], unavailable: "window_too_large" };
+		return { pairs: [], unavailable: coverage.kind };
 	}
 	if ("toolUses" in scope) {
 		const present = new Set(rows.map((row) => `${row.messageId}\0${row.toolUseId}`));
 		if (scope.toolUses.some((target) => !present.has(`${target.messageId}\0${target.toolUseId}`))) {
+			return { pairs: [], unavailable: "incomplete_coverage" };
+		}
+	} else {
+		// Mixed windows still have leftover cards (task-guard, continuation,
+		// user turns). Those roles never own disk mutations; an assistant row
+		// without calls still can and must keep refusing the whole window.
+		const leftover = await classifyWindowWithoutOperations(
+			narratorId,
+			scope,
+			new Set(rows.map((row) => row.messageId)),
+		);
+		if (leftover.kind === "too_large") return { pairs: [], unavailable: "window_too_large" };
+		if (leftover.kind === "incomplete_coverage") {
 			return { pairs: [], unavailable: "incomplete_coverage" };
 		}
 	}

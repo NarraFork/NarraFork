@@ -31,6 +31,53 @@ beforeAll(async () => {
 	renderMod = await import("./RenderToolCall");
 });
 
+it("shows a live question slot even when the measured card is folded", () => {
+	const unique = "UNIQUE_FOLDED_BODY_SHOULD_STAY_HIDDEN";
+	const measured = {
+		...card({
+			toolName: "Bash",
+			status: "success",
+			detail: {
+				kind: "sections",
+				sections: [
+					{
+						key: "command",
+						body: {
+							kind: "capped",
+							id: "command-body",
+							source: "input.command",
+							format: "code",
+							live: false,
+							followTarget: { kind: "end" },
+							cap: "bash-cmd",
+							text: unique,
+						},
+					},
+				],
+			},
+		}),
+		effectiveOpened: false,
+	};
+	const root = render(
+		<renderMod.RenderToolCall
+			measured={measured}
+			permissionSlot={<form data-question="q1">Answer here</form>}
+		/>,
+	);
+	expect(root.querySelectorAll('form[data-question="q1"]').length).toBe(1);
+	expect(root.textContent).not.toContain(unique);
+	const opened = render(
+		<renderMod.RenderToolCall
+			measured={{ ...measured, effectiveOpened: true }}
+			permissionSlot={<form data-question="q1">Answer here</form>}
+		/>,
+	);
+	expect(opened.querySelectorAll('form[data-question="q1"]').length).toBe(1);
+	expect(opened.textContent).toContain(unique);
+	const settled = render(<renderMod.RenderToolCall measured={measured} />);
+	expect(settled.querySelectorAll("form").length).toBe(0);
+});
+
 const CONTENT_WIDTH = 600;
 
 /** Recognizable label bundle: every phase row is identifiable by its own token. */

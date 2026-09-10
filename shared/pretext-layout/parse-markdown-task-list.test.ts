@@ -15,7 +15,7 @@
  *     item text on the same line.
  *
  * Both walks now skip the token: the box is painted from `item.task` /
- * `item.checked` as the list marker (☐/☑), so the token carries no content.
+ * `item.checked` as structured task-marker state, so the token carries no content.
  *
  * Runs against real pretext with the deterministic canvas stub.
  */
@@ -38,6 +38,7 @@ async function load() {
 type AnyBlock = {
 	kind: string;
 	markerText: string | null;
+	taskMarker?: { checked: boolean; label: string };
 	flow?: unknown;
 };
 
@@ -62,8 +63,8 @@ describe("GFM task list items", () => {
 		// The regression painted FOUR blocks here: a "[ ] " fallback block plus the
 		// text block per item.
 		expect(blocks).toHaveLength(2);
-		expect(blocks[0]?.markerText).toBe("☐");
-		expect(blocks[1]?.markerText).toBe("☑");
+		expect(blocks[0]?.markerText).toBe("[ ]");
+		expect(blocks[1]?.markerText).toBe("[x]");
 		const first = visibleText(
 			blocks[0] as AnyBlock,
 			walkRichInlineLineRanges as never,
@@ -74,6 +75,8 @@ describe("GFM task list items", () => {
 			walkRichInlineLineRanges as never,
 			rest.materializeRichInlineLineRange as never,
 		);
+		expect(blocks[0]?.taskMarker).toEqual({ checked: false, label: "待办事项" });
+		expect(blocks[1]?.taskMarker).toEqual({ checked: true, label: "已完成" });
 		expect(first).toBe("待办事项");
 		expect(second).toBe("已完成");
 	});
@@ -86,8 +89,8 @@ describe("GFM task list items", () => {
 			"- [ ] item one\n\n- [x] item two\n",
 		) as AnyBlock[];
 		expect(blocks).toHaveLength(2);
-		expect(blocks[0]?.markerText).toBe("☐");
-		expect(blocks[1]?.markerText).toBe("☑");
+		expect(blocks[0]?.markerText).toBe("[ ]");
+		expect(blocks[1]?.markerText).toBe("[x]");
 		for (const [index, expected] of ["item one", "item two"].entries()) {
 			const text = visibleText(
 				blocks[index] as AnyBlock,
@@ -115,7 +118,7 @@ describe("GFM task list items", () => {
 		const items = blocks.filter((b) => b.markerText != null);
 		expect(items).toHaveLength(2);
 		for (const item of items) {
-			expect(item.markerText).toBe("☐");
+			expect(item.markerText).toBe("[ ]");
 			const text = visibleText(
 				item,
 				walkRichInlineLineRanges as never,

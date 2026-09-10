@@ -7,8 +7,48 @@
  */
 
 import type { ReflectionSuggestion } from "../narrator-message-helpers";
-import type { PendingPermission } from "../narrator-panel-types";
+import type { AsyncQuestionSlot, PendingPermission } from "../narrator-panel-types";
 import { resolveRowReflection, type VListReflectionSource } from "./vlist-reflection-index";
+import type { VListToolMeta } from "./vlist-tool-meta";
+
+function isNewerQuestionWait(candidate: VListToolMeta, current: VListToolMeta | undefined): boolean {
+	if (!current) return true;
+	const candidateSeq = candidate.awaitQuestionSeq;
+	const currentSeq = current.awaitQuestionSeq;
+	if (typeof candidateSeq === "number" && typeof currentSeq === "number") {
+		return candidateSeq >= currentSeq;
+	}
+	if (typeof candidateSeq === "number") return true;
+	if (typeof currentSeq === "number") return false;
+	return false;
+}
+
+/** Move, rather than copy, the live form to the newest still-running Await. */
+export function resolveAsyncQuestionHosts(
+	questions: ReadonlyMap<string, AsyncQuestionSlot> | undefined,
+	tools: ReadonlyMap<string, VListToolMeta> | undefined,
+	hostToolIds: ReadonlySet<string>,
+): ReadonlyMap<string, AsyncQuestionSlot> | undefined {
+	if (!questions?.size || !tools) return questions;
+	const result = new Map(questions);
+	const byId = new Map([...questions].map(([host, slot]) => [slot.id, { host, slot }]));
+	const newestByQuestion = new Map<string, { toolId: string; meta: VListToolMeta }>();
+	for (const [toolId, meta] of tools) {
+		if (!hostToolIds.has(toolId) || !meta.awaitQuestionId) continue;
+		if (!byId.has(meta.awaitQuestionId)) continue;
+		const current = newestByQuestion.get(meta.awaitQuestionId);
+		if (isNewerQuestionWait(meta, current?.meta)) {
+			newestByQuestion.set(meta.awaitQuestionId, { toolId, meta });
+		}
+	}
+	for (const [questionId, { toolId }] of newestByQuestion) {
+		const question = byId.get(questionId);
+		if (!question) continue;
+		result.delete(question.host);
+		result.set(toolId, question.slot);
+	}
+	return result;
+}
 
 /** Kinds whose card can host a pending-permission form. */
 export const PERMISSION_HOST_KINDS: ReadonlySet<string> = new Set(["tool-call", "subagent-card"]);

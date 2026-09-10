@@ -913,7 +913,7 @@ async function _runInBackground(
 	let output =
 		`<background_task_id>${alias}</background_task_id>\n\n` +
 		`Background bash task started: ${title}\n` +
-		`Use Await({ type: "bash", id: "${alias}" }) to check status or get results.`;
+		`Await({ type: "bash", id: "${alias}" })`;
 
 	if (conflicted) {
 		output +=

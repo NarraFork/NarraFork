@@ -35,15 +35,18 @@ import type {
 import {
 	decidePermissionSlot,
 	isPermissionHostRow,
+	resolveAsyncQuestionHosts,
 	toolUseIdFromSpecKey,
 } from "./vlist-permission-match";
 import type { VListItem } from "./vlist-pipeline";
 import type { VListReflectionSource } from "./vlist-reflection-index";
+import type { VListToolMeta } from "./vlist-tool-meta";
 
 export { findPendingForKey, toolUseIdFromSpecKey } from "./vlist-permission-match";
 
 interface UsePermissionSlotsArgs {
 	renderItems: readonly VListItem[];
+	tools?: ReadonlyMap<string, VListToolMeta>;
 	permCb?: PermissionCallbacks;
 	/** `toolUseId → reflection source`, derived from the loaded message tree. */
 	reflections?: ReadonlyMap<string, VListReflectionSource>;
@@ -82,6 +85,7 @@ export function usePermissionSlots({
 	permCb,
 	reflections,
 	asyncQuestions,
+	tools,
 }: UsePermissionSlotsArgs): Map<string, ReactNode> {
 	const pendingPermissions = permCb?.pendingPermissions;
 	const onPermissionDecision = permCb?.onPermissionDecision;
@@ -98,6 +102,19 @@ export function usePermissionSlots({
 		// zero-DOM body. A row carrying only a reflection needs no slot at all now
 		// that the notice is measured.
 		if (!hasPending && !hasAsync) return map;
+		const hostToolIds = new Set<string>();
+		for (const item of renderItems) {
+			if (!item || !isPermissionHostRow(item.spec.kind)) continue;
+			const id = toolUseIdFromSpecKey(item.spec.key);
+			const decision = decidePermissionSlot(
+				item.spec.kind,
+				item.spec.key,
+				pendingPermissions,
+				reflections,
+			);
+			if (id && decision.kind === "none") hostToolIds.add(id);
+		}
+		const questionHosts = resolveAsyncQuestionHosts(asyncQuestions, tools, hostToolIds);
 		for (const item of renderItems) {
 			if (!item) continue;
 			const decision = decidePermissionSlot(
@@ -127,7 +144,7 @@ export function usePermissionSlots({
 			// a non-hosting row, without the toolUseId that would gate it here.
 			if (!isPermissionHostRow(item.spec.kind)) continue;
 			const toolUseId = decision.toolUseId ?? toolUseIdFromSpecKey(item.spec.key);
-			const asyncSlot = toolUseId ? asyncQuestions?.get(toolUseId) : undefined;
+			const asyncSlot = toolUseId ? questionHosts?.get(toolUseId) : undefined;
 			if (asyncSlot) {
 				map.set(item.spec.key, buildAsyncQuestionNode(asyncSlot));
 			}
@@ -138,6 +155,7 @@ export function usePermissionSlots({
 		pendingPermissions,
 		reflections,
 		asyncQuestions,
+		tools,
 		onPermissionDecision,
 		onQuestionSubmit,
 		onQuestionReflect,

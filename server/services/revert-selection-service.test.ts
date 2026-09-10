@@ -19,7 +19,7 @@ CREATE INDEX idx_narrators_parent ON narrators(parent_narrator_id);
 CREATE INDEX idx_narrators_fork_message ON narrators(fork_message_id);
 CREATE INDEX idx_narrators_prune_boundary_message ON narrators(prune_boundary_message_id);
 CREATE TABLE narrator_messages (
- id TEXT PRIMARY KEY, narrator_id TEXT NOT NULL, parent_tool_use_id TEXT, content_json TEXT NOT NULL,
+ id TEXT PRIMARY KEY, narrator_id TEXT NOT NULL, parent_tool_use_id TEXT, role TEXT NOT NULL DEFAULT 'assistant', content_json TEXT NOT NULL,
  content_text TEXT, original_content_json TEXT, tree_hash_after TEXT, snapshot_commit_sha TEXT, created_at TEXT NOT NULL DEFAULT '2026-09-07'
 );
 CREATE INDEX idx_messages_parent_tool_use_lookup ON narrator_messages(parent_tool_use_id,created_at);
@@ -143,10 +143,11 @@ function message(
 	blocks: unknown[] = [{ type: "text", text: "hello" }],
 	narratorId = "root",
 	id = `msg-${serial++}`,
+	role = "assistant",
 ) {
 	sqlite
-		.query("INSERT INTO narrator_messages(id,narrator_id,content_json) VALUES(?,?,?)")
-		.run(id, narratorId, JSON.stringify(blocks));
+		.query("INSERT INTO narrator_messages(id,narrator_id,role,content_json) VALUES(?,?,?,?)")
+		.run(id, narratorId, role, JSON.stringify(blocks));
 	sqlite
 		.query("INSERT INTO narrator_message_refs(id,narrator_id,message_id,seq) VALUES(?,?,?,?)")
 		.run(`ref-${serial++}`, narratorId, id, seq);
@@ -493,6 +494,69 @@ describe("complete mutation candidates, not just successful writes", () => {
 		expect(result.noDiskTools).toContainEqual({ toolCallId: t.id, reason: "no_dispatch" });
 		sqlite.query("UPDATE file_change_operations SET reason=NULL WHERE id=?").run(op);
 		expect(hasIssue(await collect(), "OPERATION_UNRESOLVED")).toBe(true);
+	});
+	test("sys/user leftover cards in a mixed from_seq window do not veto file coverage", async () => {
+		const write = tool(1);
+		journal(write);
+		message(
+			2,
+			[{ type: "system_injection", source: "interrupt_task_guard" }],
+			"root",
+			"sys-card",
+			"sys",
+		);
+		message(3, [{ type: "text", text: "later user" }], "root", "user-card", "user");
+		const result = await collect({ kind: "from_seq", minSeq: 1 });
+		expect(result.history.messages.map((row) => row.id)).toEqual([
+			write.messageId,
+			"sys-card",
+			"user-card",
+		]);
+		expect(result.evidenceComplete).toBe(true);
+		expect(result.issues).toEqual([]);
+		expect(result.effects).toHaveLength(1);
+	});
+	for (const selector of [
+		{ kind: "all" },
+		{ kind: "messages", messageIds: ["checkpoint"] },
+		{ kind: "from_seq", minSeq: 1 },
+	] satisfies FileChangeRevertSelector[]) {
+		test(`disp file-history checkpoints retain file evidence for ${selector.kind}`, async () => {
+			const hidden = message(
+				1,
+				[{ type: "file_history_checkpoint" }],
+				"root",
+				"checkpoint",
+				"disp",
+			);
+			const t = tool(1, "Write", { messageId: hidden });
+			sqlite
+				.query("UPDATE narrator_tool_calls SET is_file_history_checkpoint=1 WHERE id=?")
+				.run(t.id);
+			const op = journal(t);
+			const result = await collect(selector);
+			expect(result.history.toolChanges).toContainEqual({ id: t.id, action: "delete" });
+			expect(result.tools.map((row) => row.id)).toEqual([t.id]);
+			expect(result.operations.map((row) => row.id)).toEqual([op]);
+			expect(result.effects).toHaveLength(1);
+			expect(result.evidenceComplete).toBe(true);
+			expect(result.issues).toEqual([]);
+
+			sqlite
+				.query("UPDATE narrator_tool_calls SET file_change_operation_id=NULL WHERE id=?")
+				.run(t.id);
+			const missing = await collect(selector);
+			expect(missing.evidenceComplete).toBe(false);
+			expect(missing.issues).toContainEqual({ code: "FILE_JOURNAL_MISSING", toolCallId: t.id });
+		});
+	}
+	test("a leftover assistant write without a journal still refuses mixed from_seq coverage", async () => {
+		const write = tool(1);
+		journal(write);
+		tool(2, "Write", { id: "assistant-gap-tool" });
+		const result = await collect({ kind: "from_seq", minSeq: 1 });
+		expect(result.evidenceComplete).toBe(false);
+		expect(hasIssue(result, "FILE_JOURNAL_MISSING")).toBe(true);
 	});
 	test("spec writes and real read-only tools are excluded independently of unknown disk evidence", async () => {
 		const read = tool(1, "Read");

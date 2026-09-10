@@ -4,6 +4,7 @@ import {
 	decidePermissionSlot,
 	findPendingForKey,
 	isPermissionHostRow,
+	resolveAsyncQuestionHosts,
 	toolUseIdFromSpecKey,
 } from "./vlist-permission-match";
 import type { VListReflectionSource } from "./vlist-reflection-index";
@@ -14,6 +15,48 @@ const perm = (overrides: Partial<PendingPermission>): PendingPermission => ({
 	toolUseId: overrides.toolUseId,
 	inputJson: overrides.inputJson ?? {},
 	...overrides,
+});
+
+describe("async question hosts", () => {
+	const slot = { id: "q1", questions: [], onSubmit() {}, onDismiss() {} };
+	const questions = new Map([["ask", slot]]);
+	it("moves the same form and draft to the active Await without duplicating it", () => {
+		const result = resolveAsyncQuestionHosts(
+			questions,
+			new Map([["wait", { awaitQuestionId: "q1" }]]),
+			new Set(["ask", "wait"]),
+		);
+		expect([...(result ?? [])]).toEqual([["wait", slot]]);
+		expect(questions.get("ask")).toBe(slot);
+	});
+	it("keeps the original form when Await cannot host it or has completed", () => {
+		expect([
+			...(resolveAsyncQuestionHosts(
+				questions,
+				new Map([["wait", { awaitQuestionId: "q1" }]]),
+				new Set(["ask"]),
+			) ?? []),
+		]).toEqual([["ask", slot]]);
+		expect([
+			...(resolveAsyncQuestionHosts(
+				questions,
+				new Map([["wait", { isTerminal: true }]]),
+				new Set(["wait"]),
+			) ?? []),
+		]).toEqual([["ask", slot]]);
+	});
+	it("only hosts one form on the newest still-running wait, ignores other question ids", () => {
+		const result = resolveAsyncQuestionHosts(
+			questions,
+			new Map([
+				["wait2", { awaitQuestionId: "q1", awaitQuestionSeq: 4 }],
+				["wait1", { awaitQuestionId: "q1", awaitQuestionSeq: 9 }],
+				["other", { awaitQuestionId: "q2", awaitQuestionSeq: 12 }],
+			]),
+			new Set(["wait1", "wait2", "other"]),
+		);
+		expect([...(result ?? [])]).toEqual([["wait1", slot]]);
+	});
 });
 
 describe("toolUseIdFromSpecKey", () => {
