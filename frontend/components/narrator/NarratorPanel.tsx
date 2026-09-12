@@ -4,21 +4,16 @@ import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import type { AsyncQuestion } from "@frontend/types/narrator";
 import {
 	ActionIcon,
-	Anchor,
 	Badge,
 	Box,
 	Button,
 	Center,
 	Drawer,
 	Group,
-	Indicator,
 	Loader,
 	Menu,
 	Modal,
-	Popover,
-	SegmentedControl,
 	Stack,
-	Switch,
 	Text,
 	TextInput,
 	Tooltip,
@@ -45,18 +40,13 @@ import {
 	IconArrowDown,
 	IconArrowLeft,
 	IconArrowsMinimize,
-	IconBolt,
 	IconCopy,
-	IconEraser,
 	IconExternalLink,
-	// TEMPORARY mock-stream harness icon (see ./mock/README-REMOVAL.md).
-	IconFlask,
 	IconGitBranch,
 	IconGitFork,
 	IconLock,
 	IconLockOpen,
 	IconPencil,
-	IconSettings,
 	IconSparkles,
 	IconTrash,
 	IconUpload,
@@ -138,7 +128,6 @@ import {
 	formatColonDuration,
 	formatFullLocaleDateTime,
 } from "../../lib/format";
-import { formatLocaleNumber } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
 import { formatRevertWarnings } from "../../lib/revert-warnings";
@@ -155,7 +144,6 @@ import { TruncatedPath } from "../common/TruncatedPath";
 import {
 	buildPluginDockPanelOpenRequest,
 	PluginContributionOptions,
-	PluginContributionPicker,
 } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
 import { toBannerQuestions } from "./async-question-questions";
@@ -184,10 +172,12 @@ import {
 	saveDraftImageAttachments,
 } from "./draft-image-attachments";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
-import { ExecutionDeviceMenu, ExecutionDeviceOptions } from "./ExecutionDeviceMenu";
+import { ExecutionDeviceOptions } from "./ExecutionDeviceMenu";
 import type { FileReferenceScopeValue } from "./FileReferenceScope";
 import { useFilePanelNavigation } from "./file-panel-navigation";
 import { trimFileReferenceInput } from "./file-reference-input";
+import { ContextUsageIndicator } from "./interaction/ContextUsageIndicator";
+import { FastModeControl } from "./interaction/FastModeControl";
 import { PathRulesPopover } from "./interaction/PathRulesPopover";
 import {
 	type BooleanOverride,
@@ -215,16 +205,14 @@ import type { MessageListHandle, MessageListTailMeta } from "./message-list-hand
 import { useMockStreamActive } from "./mock/mock-stream-store";
 import type { NarratorComposerHandle, NarratorRemoteDraft } from "./NarratorComposer";
 import { NarratorInteractionArea } from "./NarratorInteractionArea";
-import { NarratorLodMenu, NarratorLodOptions } from "./NarratorLodMenu";
+import { NarratorLodOptions } from "./NarratorLodMenu";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorStatusToolbarAction } from "./NarratorStatusToolbar";
-import { NarratorToolbarOverflowMenu } from "./NarratorToolbarOverflowMenu";
 import { NugRechargeDialog } from "./NugRechargeDialog";
 import {
 	HEADER_TITLE_MIN_WIDTH_PX,
 	HEADER_TITLE_SLOT_ATTR,
-	HEADER_TOOLBAR_FIXED_ATTR,
 	selectHeaderToolbarEntries,
 } from "./narrator-header-toolbar-capacity";
 import { revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
@@ -244,10 +232,7 @@ import {
 	resizeImageIfNeeded,
 } from "./narrator-panel-types";
 import { getNarratorStatusBarDisplay, planNarratorWorkIndicator } from "./narrator-status-bar";
-import {
-	type NarratorToolbarBadgeCounts,
-	resolveNarratorToolbarBadge,
-} from "./narrator-toolbar-badges";
+import type { NarratorToolbarBadgeCounts } from "./narrator-toolbar-badges";
 import type { NarratorToolbarHost, NarratorToolbarId } from "./narrator-toolbar-items";
 import { nextHighlightRequestId } from "./panels/panel-kind";
 import { compactProgressLabel } from "./progress-label";
@@ -264,6 +249,7 @@ import {
 	LatestTodosToolUseIdCtx,
 	PermEnterHintCtx,
 } from "./tool-call/tool-call-contexts";
+import { HeaderToolbar } from "./toolbar/HeaderToolbar";
 import { type PaymentRequiredInfo, useNarratorPanelWS } from "./useNarratorPanelWS";
 
 function parsePersistedPaymentRequired(value: unknown): Partial<PaymentRequiredInfo> | null {
@@ -2711,22 +2697,6 @@ export function NarratorPanel({
 		],
 	);
 
-	// --- Retry countdown ---
-	const [retryCountdown, setRetryCountdown] = useState<number>(0);
-	useEffect(() => {
-		if (!retryInfo) {
-			setRetryCountdown(0);
-			return;
-		}
-		const tick = () => {
-			const remaining = Math.max(0, Math.ceil((retryInfo.retryAt - Date.now()) / 1000));
-			setRetryCountdown(remaining);
-		};
-		tick();
-		const id = setInterval(tick, 1000);
-		return () => clearInterval(id);
-	}, [retryInfo]);
-
 	// --- Image management ---
 	const [imagePreviewUrls, setImagePreviewUrls] = useState<string[]>([]);
 	useEffect(() => {
@@ -4722,346 +4692,51 @@ export function NarratorPanel({
 	// fallback only keeps the template from interpolating "null".
 	const compactProgressFragment = compactProgressText ?? "";
 
-	// The single line the work indicator shows. Kept as a string (not inline JSX)
-	// so the status bar can hand the exact same text to the overflow tooltip.
-	const workIndicatorText = ((): string => {
-		switch (workIndicatorPlan.primary) {
-			case "retrying":
-				return retryCountdown > 0
-					? t("retryingCountdown", {
-							count: retryInfo?.retryCount,
-							max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
-							seconds: retryCountdown,
-						})
-					: t("retryingNow", {
-							count: retryInfo?.retryCount,
-							max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
-						});
-			case "blocking_compact":
-				return `${t("compacting")} · ${compactProgressFragment}`;
-			case "model_unavailable":
-				return t("status_model_unavailable");
-			case "spec_task":
-				return currentSpecTask?.text ?? t("thinking");
-			case "waiting":
-				return t("status_waiting");
-			case "planning":
-				return t("planning");
-			case "background_compact":
-				return `${t("backgroundCompacting")} · ${compactProgressFragment}`;
-			default:
-				return t("thinking");
-		}
-	})();
-
-	const hasContextData = contextPercent != null;
-	const contextIndicatorPercent = hasContextData ? Math.min(contextPercent, 100) : 0;
-	const contextIndicatorRadius = 9;
-	const contextIndicatorCirc = 2 * Math.PI * contextIndicatorRadius;
-	const contextIndicatorOffset = contextIndicatorCirc * (1 - contextIndicatorPercent / 100);
-	const contextStaleColor = "light-dark(var(--mantine-color-black), var(--mantine-color-dark-0))";
-	const contextIndicatorColor = contextStale
-		? contextStaleColor
-		: contextIndicatorPercent >= 99
-			? "var(--mantine-color-red-6)"
-			: contextIndicatorPercent >= 95
-				? "var(--mantine-color-yellow-6)"
-				: "var(--mantine-color-blue-6)";
-	const contextIndicatorLabel = contextStale
-		? t("contextStaleHint")
-		: hasContextData
-			? `Context: ${contextPercent.toFixed(1)}%`
-			: "Context";
-	const contextRingNode = (
-		<Box
-			style={{
-				position: "relative",
-				width: 24,
-				height: 24,
-				flexShrink: 0,
-				cursor: isWorkspacePreview ? "default" : "pointer",
-			}}
-			className="context-ring"
-		>
-			<svg width={24} height={24} viewBox="0 0 24 24" role="img" aria-label={contextIndicatorLabel}>
-				<title>{contextIndicatorLabel}</title>
-				<circle
-					cx={12}
-					cy={12}
-					r={contextIndicatorRadius}
-					fill="none"
-					stroke="light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))"
-					strokeWidth={2.5}
-				/>
-				{hasContextData && (
-					<circle
-						cx={12}
-						cy={12}
-						r={contextIndicatorRadius}
-						fill="none"
-						stroke={contextIndicatorColor}
-						strokeWidth={2.5}
-						strokeDasharray={contextIndicatorCirc}
-						strokeDashoffset={contextIndicatorOffset}
-						strokeLinecap="round"
-						transform="rotate(-90 12 12)"
-						style={{ transition: "stroke-dashoffset 0.3s ease" }}
-					/>
-				)}
-				{contextStale && (
-					<text
-						x={12}
-						y={12}
-						textAnchor="middle"
-						dominantBaseline="central"
-						fontSize={12}
-						fontWeight={700}
-						fill={contextStaleColor}
-					>
-						?
-					</text>
-				)}
-			</svg>
-		</Box>
-	);
-	const contextIndicator = isWorkspacePreview ? (
-		contextRingNode
-	) : (
-		<Menu position="top-start">
-			<Menu.Target>{contextRingNode}</Menu.Target>
-			<Menu.Dropdown>
-				{contextStale && (
-					<Menu.Label c="orange" fz={10} style={{ maxWidth: 240, whiteSpace: "normal" }}>
-						{t("contextStaleHint")}
-					</Menu.Label>
-				)}
-				<Menu.Label c="dimmed" fz={10}>
-					{t("activeThresholds", {
-						prune: activePruneStart ?? modelThresholds?.pruneStart,
-						compact: activeCompactStart ?? modelThresholds?.compactStart,
-						force: forceCompactPruneThreshold,
-					})}
-				</Menu.Label>
-				<Menu.Item
-					leftSection={<IconSettings size={14} />}
-					c="dimmed"
-					fz="xs"
-					onClick={handleOpenContextThresholdSettings}
-				>
-					{t("thresholdSettings")}
-				</Menu.Item>
-				<Menu.Divider />
-				{prunedPercent != null && (
-					<Menu.Label>{t("prunedPercent", { percent: prunedPercent })}</Menu.Label>
-				)}
-				{hasContextData && (
-					<Menu.Label>
-						{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
-					</Menu.Label>
-				)}
-				{promptTokens != null && (
-					<Menu.Label>
-						{contextWindow != null
-							? t("contextUsageTokensWithWindow", {
-									tokens: formatLocaleNumber(promptTokens),
-									window: formatLocaleNumber(contextWindow),
-								})
-							: t("contextUsageTokens", {
-									tokens: formatLocaleNumber(promptTokens),
-								})}
-						{isEstimated && <span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>}
-					</Menu.Label>
-				)}
-				<Menu.Divider />
-				<Tooltip label={t("pruneEnabledTooltip")} multiline w={260} withArrow position="top">
-					<Menu.Label>
-						<Stack gap={4}>
-							<Switch
-								size="xs"
-								label={t("pruneEnabled")}
-								checked={pruneEnabledEffective}
-								onChange={(e) => {
-									pruneEnabledMutation.mutate({
-										id: narratorId,
-										pruneEnabled: e.currentTarget.checked,
-									});
-								}}
-							/>
-							{pruneEnabledEffective && (
-								<Text size="xs" c="orange">
-									{t("pruneEnabledWarning")}
-								</Text>
-							)}
-							{pruneDiffersFromDefault && (
-								<Group justify="space-between" wrap="nowrap" style={{ width: "100%" }}>
-									<Anchor
-										component="button"
-										type="button"
-										size="xs"
-										c="dimmed"
-										style={{ textDecoration: "underline" }}
-										onClick={(event) => {
-											event.stopPropagation();
-											pruneEnabledMutation.mutate({
-												id: narratorId,
-												pruneEnabled: pruneEnabledGlobal,
-											});
-										}}
-									>
-										{t("pruneEnabledResetDefault")}
-									</Anchor>
-									<Anchor
-										component="button"
-										type="button"
-										size="xs"
-										c="dimmed"
-										style={{ textDecoration: "underline" }}
-										onClick={(event) => {
-											event.stopPropagation();
-											updateSettingsMutation.mutate({
-												agent: { defaultPruneEnabled: pruneEnabledEffective },
-											});
-										}}
-									>
-										{t("pruneEnabledSetDefault")}
-									</Anchor>
-								</Group>
-							)}
-						</Stack>
-					</Menu.Label>
-				</Tooltip>
-				<Menu.Divider />
-				<Menu.Item
-					leftSection={<IconArrowsMinimize size={14} />}
-					onClick={() => {
-						// Compacting state will arrive via substatus_change WS event
-						api.triggerCompact(narratorId).catch((err) => {
-							handleCompactError(err);
-						});
-					}}
-				>
-					{t("triggerCompact")}
-				</Menu.Item>
-				<Menu.Item
-					leftSection={<IconEraser size={14} />}
-					onClick={() => {
-						api.clearContext(narratorId).catch(() => {});
-					}}
-				>
-					{t("clearContext")}
-				</Menu.Item>
-			</Menu.Dropdown>
-		</Menu>
+	const contextIndicator = (
+		<ContextUsageIndicator
+			narratorId={narratorId}
+			contextPercent={contextPercent}
+			contextStale={contextStale}
+			isWorkspacePreview={isWorkspacePreview}
+			activePruneStart={activePruneStart}
+			activeCompactStart={activeCompactStart}
+			modelThresholds={modelThresholds}
+			forceCompactPruneThreshold={forceCompactPruneThreshold}
+			prunedPercent={prunedPercent}
+			promptTokens={promptTokens}
+			contextWindow={contextWindow}
+			isEstimated={isEstimated}
+			pruneEnabledEffective={pruneEnabledEffective}
+			pruneEnabledGlobal={pruneEnabledGlobal}
+			pruneDiffersFromDefault={pruneDiffersFromDefault}
+			onOpenThresholdSettings={handleOpenContextThresholdSettings}
+			onCompactError={handleCompactError}
+			pruneEnabledMutation={pruneEnabledMutation}
+			updateSettingsMutation={updateSettingsMutation}
+			t={t}
+		/>
 	);
 
 	const renderFastModeControl = (position: "top-end" | "bottom-end") => (
-		<Popover
-			opened={fastModeSettingsOpened}
-			onChange={setFastModeSettingsOpened}
-			onClose={closeFastModeSettings}
+		<FastModeControl
 			position={position}
-			width={fastModeUsesTapSettings ? 280 : 320}
-			shadow="md"
-			withinPortal
-		>
-			<Popover.Target>
-				<Group
-					gap={4}
-					wrap="nowrap"
-					onMouseEnter={fastModeUsesTapSettings ? undefined : openFastModeSettings}
-					onMouseLeave={fastModeUsesTapSettings ? undefined : scheduleFastModeSettingsClose}
-					style={{ flexShrink: 0 }}
-				>
-					<Tooltip
-						label={
-							fastModeOverride === "inherit"
-								? t("fast_mode_inherit_tooltip", {
-										state: fastModeDefault ? t("fast_mode_on") : t("fast_mode_off"),
-									})
-								: t("fast_mode_tooltip")
-						}
-						position={position.startsWith("top") ? "top" : "bottom"}
-						disabled={fastModeSettingsOpened}
-					>
-						<ActionIcon
-							variant="subtle"
-							color={fastModeEnabled ? "yellow" : "gray"}
-							size="sm"
-							aria-label={t("fast_mode")}
-							onPointerDown={startFastModeLongPress}
-							onPointerUp={clearFastModeLongPressTimer}
-							onPointerCancel={clearFastModeLongPressTimer}
-							onPointerLeave={clearFastModeLongPressTimer}
-							onContextMenu={(event) => event.preventDefault()}
-							onClick={(event) => {
-								if (fastModeLongPressFiredRef.current) {
-									event.preventDefault();
-									event.stopPropagation();
-									fastModeLongPressFiredRef.current = false;
-									return;
-								}
-								// Clicking pins this session against its current effective
-								// state; the popover restores "follow default".
-								fastModeMutation.mutate({
-									id: narratorId,
-									fastModeOverride: fastModeEnabled ? "off" : "on",
-								});
-							}}
-						>
-							<IconBolt size={16} />
-						</ActionIcon>
-					</Tooltip>
-				</Group>
-			</Popover.Target>
-			<Popover.Dropdown
-				onMouseEnter={fastModeUsesTapSettings ? undefined : openFastModeSettings}
-				onMouseLeave={fastModeUsesTapSettings ? undefined : scheduleFastModeSettingsClose}
-			>
-				<Stack gap={8}>
-					<Text size="sm" fw={600}>
-						{t("fast_mode")}
-					</Text>
-					<SegmentedControl
-						size="xs"
-						fullWidth
-						value={fastModeOverride}
-						onChange={(value) =>
-							fastModeMutation.mutate({
-								id: narratorId,
-								fastModeOverride: value as "inherit" | "on" | "off",
-							})
-						}
-						data={[
-							{
-								value: "inherit",
-								label: t("fast_mode_session_inherit", {
-									state: fastModeDefault ? t("fast_mode_on") : t("fast_mode_off"),
-								}),
-							},
-							{ value: "on", label: t("fast_mode_on") },
-							{ value: "off", label: t("fast_mode_off") },
-						]}
-					/>
-					<Text size="xs" c="dimmed">
-						{t("fast_mode_session_desc")}
-					</Text>
-					<Switch
-						size="sm"
-						checked={fastModeDefault}
-						onChange={(event) =>
-							updateUserPrefs.mutate({ fastModeDefault: event.currentTarget.checked })
-						}
-						label={t("fast_mode_default_switch")}
-					/>
-					<Text size="xs" c="dimmed">
-						{fastModeDefault ? t("fast_mode_default_on_desc") : t("fast_mode_default_off_desc")}
-					</Text>
-					<Text size="xs" c="dimmed">
-						{fastModeUsesTapSettings ? t("fast_mode_mobile_hint") : t("fast_mode_desktop_hint")}
-					</Text>
-				</Stack>
-			</Popover.Dropdown>
-		</Popover>
+			fastModeOverride={fastModeOverride}
+			fastModeDefault={fastModeDefault}
+			fastModeEnabled={fastModeEnabled}
+			fastModeUsesTapSettings={fastModeUsesTapSettings}
+			settingsOpened={fastModeSettingsOpened}
+			setSettingsOpened={setFastModeSettingsOpened}
+			openSettings={openFastModeSettings}
+			closeSettings={closeFastModeSettings}
+			scheduleSettingsClose={scheduleFastModeSettingsClose}
+			startLongPress={startFastModeLongPress}
+			clearLongPressTimer={clearFastModeLongPressTimer}
+			longPressFiredRef={fastModeLongPressFiredRef}
+			narratorId={narratorId}
+			fastModeMutation={fastModeMutation}
+			updateUserPrefs={updateUserPrefs}
+			t={t}
+		/>
 	);
 
 	// The terminal entry's availability, label and action now live with the header
@@ -5391,157 +5066,32 @@ export function NarratorPanel({
 							)}
 						</Group>
 						{!isWorkspacePreview && (
-							<Group ref={headerToolbarRef} gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
-								{/*
-								 * Registry-driven tool entries. The SET comes from the registry, the
-								 * ORDER from the user's saved layout, and how many are surfaced from
-								 * the measured width of this row (mobile additionally caps by count).
-								 * Entries that do not fit move into the overflow menu instead of
-								 * compressing the title, which is what the row used to do. Entries the
-								 * host cannot present are absent from both lists rather than rendered
-								 * disabled — but they stay in the layout, so they return on a surface
-								 * that supports them.
-								 */}
-								{toolbarVisibleDefs.map((def) => {
-									const Icon = def.icon;
-									const badge = resolveNarratorToolbarBadge(def.badge, toolbarBadgeCounts);
-									const active = toolbarEntryActive(def.id);
-									const label = t(def.labelKey, { ns: def.namespace ?? "narrator" });
-
-									// The device entry opens a list of targets rather than toggling a
-									// panel, so it renders its own Menu instead of a toggle button.
-									if (def.id === "device") {
-										return (
-											<ExecutionDeviceMenu
-												key={def.id}
-												label={t("executionDeviceSelector")}
-												localLabel={t("executionTargetLocal")}
-												offlineLabel={t("executionDeviceOffline")}
-												devices={executionDevicesQuery.data?.devices ?? []}
-												currentDeviceId={executionDevicesQuery.data?.defaultDeviceId ?? "local"}
-												pending={updateExecutionDeviceMutation.isPending}
-												onSelect={(deviceId) => updateExecutionDeviceMutation.mutate(deviceId)}
-											/>
-										);
-									}
-
-									if (def.id === "lodlevel") {
-										return (
-											<NarratorLodMenu
-												key={def.id}
-												lod={renderLod}
-												isDefault={renderLodIsDefault}
-												onSelectLod={handleSelectLod}
-												onSetAsDefault={setAsDefault}
-											/>
-										);
-									}
-
-									if (def.id === "plugins") {
-										return (
-											<PluginContributionPicker
-												key={def.id}
-												onPick={openPluginPanel}
-												surface="focus"
-												trigger={
-													<Tooltip label={label}>
-														<ActionIcon size="sm" variant="subtle" color="gray" aria-label={label}>
-															<Icon size={16} />
-														</ActionIcon>
-													</Tooltip>
-												}
-											/>
-										);
-									}
-
-									const button = (
-										<ActionIcon
-											size="sm"
-											variant={active ? "light" : "subtle"}
-											color={active ? "indigo" : "gray"}
-											aria-label={label}
-											onClick={() => activateToolbarEntry(def.id)}
-										>
-											<Icon size={16} />
-										</ActionIcon>
-									);
-
-									return (
-										<Tooltip key={def.id} label={label}>
-											{badge.count > 0 ? (
-												<Indicator
-													inline
-													// Running work reads as a state, not a quantity, so it pulses
-													// instead of printing a number (matches the old tasks button).
-													size={badge.processing ? 8 : 14}
-													offset={badge.processing ? 3 : 4}
-													label={badge.processing ? undefined : badge.label}
-													processing={badge.processing}
-													color={badge.processing ? "blue" : "teal"}
-													zIndex={1}
-													style={{
-														height: "var(--ai-size-sm)",
-														display: "flex",
-														alignItems: "center",
-													}}
-												>
-													{button}
-												</Indicator>
-											) : (
-												button
-											)}
-										</Tooltip>
-									);
-								})}
-								{/* TEMPORARY mock-stream harness entry — see ./mock/README-REMOVAL.md.
-								    Deliberately NOT in the registry: it is debug-only and due for
-								    removal, so it must not occupy a persisted layout id. */}
-								{dock && mockStreamEnabled && (
-									<Tooltip label="Mock stream (debug)">
-										<ActionIcon
-											{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
-											size="sm"
-											variant={dock.openToolTypes.has("mock") ? "light" : "subtle"}
-											color={dock.openToolTypes.has("mock") ? "indigo" : "gray"}
-											onClick={() => dock.toggleToolPanel("mock")}
-										>
-											<IconFlask size={16} />
-										</ActionIcon>
-									</Tooltip>
-								)}
-								{/*
-								 * Overflow menu: lists everything not on the row (tucked by the user or
-								 * collapsed for width), carries the aggregate badge so a hidden unread
-								 * count is not lost, and owns the reorder UI. Archive lives at its
-								 * bottom — a destructive action must not sit one mis-tap away from the
-								 * panel toggles.
-								 */}
-								<NarratorToolbarOverflowMenu
-									entries={toolbarEntries}
-									hiddenDefs={toolbarHiddenDefs}
-									noRoomIds={toolbarNoRoomIds}
-									onSaveLayout={saveToolbarLayout}
-									hostCapabilities={headerHostCapabilities}
-									badgeCounts={toolbarBadgeCounts}
-									onActivate={activateToolbarEntry}
-									renderInlineOptions={renderToolbarInlineOptions}
-									onArchive={openArchiveConfirm}
-									archiveLoading={archiveMutation.isPending}
-								/>
-								{onClose && (
-									<Tooltip label={t("closePanel")}>
-										<ActionIcon
-											{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
-											size="sm"
-											variant="subtle"
-											color="red"
-											onClick={onClose}
-										>
-											<IconX size={16} />
-										</ActionIcon>
-									</Tooltip>
-								)}
-							</Group>
+							<HeaderToolbar
+								headerToolbarRef={headerToolbarRef}
+								toolbarVisibleDefs={toolbarVisibleDefs}
+								toolbarBadgeCounts={toolbarBadgeCounts}
+								toolbarEntries={toolbarEntries}
+								toolbarHiddenDefs={toolbarHiddenDefs}
+								toolbarNoRoomIds={toolbarNoRoomIds}
+								headerHostCapabilities={headerHostCapabilities}
+								toolbarEntryActive={toolbarEntryActive}
+								activateToolbarEntry={activateToolbarEntry}
+								saveToolbarLayout={saveToolbarLayout}
+								renderToolbarInlineOptions={renderToolbarInlineOptions}
+								openArchiveConfirm={openArchiveConfirm}
+								archiveMutation={archiveMutation}
+								executionDevicesQuery={executionDevicesQuery}
+								updateExecutionDeviceMutation={updateExecutionDeviceMutation}
+								renderLod={renderLod}
+								renderLodIsDefault={renderLodIsDefault}
+								handleSelectLod={handleSelectLod}
+								setAsDefault={setAsDefault}
+								openPluginPanel={openPluginPanel}
+								dock={dock}
+								mockStreamEnabled={mockStreamEnabled}
+								onClose={onClose}
+								t={t}
+							/>
 						)}
 					</Group>
 
@@ -5888,12 +5438,12 @@ export function NarratorPanel({
 							workIndicator: {
 								show: showWorkIndicator,
 								color: workIndicatorColor,
-								text: workIndicatorText,
 								plan: workIndicatorPlan,
 								statusBarDisplay,
 								isRetrying,
 								isCompacting,
 								currentSpecTask,
+								retryInfo,
 								compactingMarkerMessageId,
 								compactFailure,
 								compactProgressFragment,

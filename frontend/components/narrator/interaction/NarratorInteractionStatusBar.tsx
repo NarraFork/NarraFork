@@ -16,7 +16,8 @@ import {
 } from "@mantine/core";
 import { IconLock, IconLockOpen, IconShield, IconTerminal } from "@tabler/icons-react";
 import type React from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { SpecTaskItem } from "../../../lib/api/spec";
 import {
 	AGG_MODEL_PREFIX,
 	FOLLOW_DEFAULT_MODEL,
@@ -40,6 +41,7 @@ import type {
 	getNarratorStatusBarDisplay,
 	planNarratorWorkIndicator,
 } from "../narrator-status-bar";
+import type { RetryInfo } from "../useNarratorPanelWS";
 import { InlineOverrideActions } from "./InlineOverrideActions";
 import { PathRulesPopover } from "./PathRulesPopover";
 import { PermissionMenuContent } from "./PermissionMenuContent";
@@ -90,12 +92,12 @@ export interface NarratorInteractionStatusBarProps {
 	workIndicator: {
 		show: boolean;
 		color: string;
-		text: string;
 		plan: WorkIndicatorPlan;
 		statusBarDisplay: StatusBarDisplay;
 		isRetrying: boolean;
 		isCompacting: boolean;
-		currentSpecTask: unknown;
+		currentSpecTask: SpecTaskItem | null;
+		retryInfo: RetryInfo | null;
 		compactingMarkerMessageId: string | null;
 		compactFailure: CompactFailureInfo | null;
 		compactProgressFragment: string;
@@ -287,6 +289,64 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 	}, [cancelQuotaDetailsClose]);
 	useEffect(() => () => cancelQuotaDetailsClose(), [cancelQuotaDetailsClose]);
 
+	// Retry countdown ticker. Only the work-indicator text below reads it, so it
+	// lives here rather than in NarratorPanel. Recomputes every second while a
+	// retry is scheduled; resets to 0 when there is no pending retry.
+	const { retryInfo } = workIndicator;
+	const [retryCountdown, setRetryCountdown] = useState<number>(0);
+	useEffect(() => {
+		if (!retryInfo) {
+			setRetryCountdown(0);
+			return;
+		}
+		const tick = () => {
+			const remaining = Math.max(0, Math.ceil((retryInfo.retryAt - Date.now()) / 1000));
+			setRetryCountdown(remaining);
+		};
+		tick();
+		const id = setInterval(tick, 1000);
+		return () => clearInterval(id);
+	}, [retryInfo]);
+
+	// The single line the work indicator shows. Kept as a string (not inline JSX)
+	// so the status bar can hand the exact same text to the overflow tooltip.
+	const workIndicatorText = useMemo<string>(() => {
+		switch (workIndicator.plan.primary) {
+			case "retrying":
+				return retryCountdown > 0
+					? t("retryingCountdown", {
+							count: retryInfo?.retryCount,
+							max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
+							seconds: retryCountdown,
+						})
+					: t("retryingNow", {
+							count: retryInfo?.retryCount,
+							max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
+						});
+			case "blocking_compact":
+				return `${t("compacting")} · ${workIndicator.compactProgressFragment}`;
+			case "model_unavailable":
+				return t("status_model_unavailable");
+			case "spec_task":
+				return workIndicator.currentSpecTask?.text ?? t("thinking");
+			case "waiting":
+				return t("status_waiting");
+			case "planning":
+				return t("planning");
+			case "background_compact":
+				return `${t("backgroundCompacting")} · ${workIndicator.compactProgressFragment}`;
+			default:
+				return t("thinking");
+		}
+	}, [
+		workIndicator.plan.primary,
+		workIndicator.compactProgressFragment,
+		workIndicator.currentSpecTask,
+		retryCountdown,
+		retryInfo,
+		t,
+	]);
+
 	return (
 		<>
 			<NarratorStatusBar
@@ -294,7 +354,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 				borderTop={props.borderTop}
 			>
 				{workIndicator.show && !isWorkspacePreview ? (
-					<UnstyledButtonWorkIndicator {...props} />
+					<UnstyledButtonWorkIndicator {...props} workIndicatorText={workIndicatorText} />
 				) : (
 					<Group gap={6} wrap="nowrap" style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
 						<Box
@@ -981,8 +1041,10 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
  * text + queue/compaction suffixes). Split out only to keep the main component's
  * JSX flatter; it reads the same grouped props.
  */
-function UnstyledButtonWorkIndicator(props: NarratorInteractionStatusBarProps) {
-	const { workIndicator, queue, t } = props;
+function UnstyledButtonWorkIndicator(
+	props: NarratorInteractionStatusBarProps & { workIndicatorText: string },
+) {
+	const { workIndicator, queue, t, workIndicatorText } = props;
 	return (
 		<UnstyledButton
 			disabled={
@@ -1010,7 +1072,7 @@ function UnstyledButtonWorkIndicator(props: NarratorInteractionStatusBarProps) {
 				<Loader size={14} color={workIndicator.color} style={{ flexShrink: 0 }} />
 				{/* The current task text can be long (spec task titles especially), so
 				    reveal the full string on hover/tap when the row clips it. */}
-				<TruncatedText size="xs" c={workIndicator.color} text={workIndicator.text} />
+				<TruncatedText size="xs" c={workIndicator.color} text={workIndicatorText} />
 				{((queue.positionValue != null && queue.positionValue > 0) || queue.messageValue) && (
 					<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 						·{" "}
