@@ -57,7 +57,6 @@ import { useNavigate } from "@tanstack/react-router";
 import {
 	lazy,
 	type ReactNode,
-	type SetStateAction,
 	Suspense,
 	useCallback,
 	useEffect,
@@ -165,18 +164,13 @@ import {
 	DEFAULT_MIN_PRUNE_RATIO,
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
-import {
-	clearDraftImageAttachments,
-	getDraftImageAttachmentKey,
-	loadDraftImageAttachments,
-	saveDraftImageAttachments,
-} from "./draft-image-attachments";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { ExecutionDeviceOptions } from "./ExecutionDeviceMenu";
 import type { FileReferenceScopeValue } from "./FileReferenceScope";
 import { useFilePanelNavigation } from "./file-panel-navigation";
 import { trimFileReferenceInput } from "./file-reference-input";
 import { HeaderToolbar } from "./header/HeaderToolbar";
+import { useTitleEditing } from "./header/use-title-editing";
 import { ContextUsageIndicator } from "./interaction/ContextUsageIndicator";
 import { FastModeControl } from "./interaction/FastModeControl";
 import { PathRulesPopover } from "./interaction/PathRulesPopover";
@@ -190,6 +184,8 @@ import {
 	resolveDangerReflectionLevel,
 } from "./interaction/reflection-types";
 import { SetGlobalModelModal } from "./interaction/SetGlobalModelModal";
+import { useComposerAttachments } from "./interaction/use-composer-attachments";
+import { useInterruptLongPress } from "./interaction/use-interrupt-long-press";
 import { useQueuedMessageActions } from "./interaction/use-queued-message-actions";
 import {
 	formatKimiBarText,
@@ -1410,186 +1406,23 @@ export function NarratorPanel({
 		[],
 	);
 
-	/*
-	 * Pending attachments — images and text files.
-	 *
-	 * Both kinds are persisted, and both share ONE set of bookkeeping refs below
-	 * (`attachmentDraftLocalVersionRef` / `attachmentDraftSaveSeqRef` /
-	 * `attachmentDraftHydratedKeyRef`) because they are stored in a SINGLE
-	 * IndexedDB record per `(user, narrator)`. Two independent version counters
-	 * would race on that one record: whichever kind saved last would write its own
-	 * fresh list beside the other kind's stale one.
-	 */
-	const [attachedImages, setAttachedImages] = useState<File[]>([]);
 	const openImageViewer = useImageViewer();
-	const attachedImagesRef = useRef<File[]>(attachedImages);
-	attachedImagesRef.current = attachedImages;
-	const attachmentDraftHydratedKeyRef = useRef<string | null>(null);
-	const attachmentDraftSaveSeqRef = useRef(0);
-	const attachmentDraftLocalVersionRef = useRef(0);
-	const [attachedTextFiles, setAttachedTextFiles] = useState<File[]>([]);
-	// Mirrors `attachedTextFiles` for the same reason `attachedImagesRef` exists:
-	// callers registered once (the user-chat forward bridge) must read the CURRENT
-	// attachments without re-registering on every change.
-	const attachedTextFilesRef = useRef<File[]>(attachedTextFiles);
-	attachedTextFilesRef.current = attachedTextFiles;
-	const [isDragging, setIsDragging] = useState(false);
-	const dragCounterRef = useRef(0);
-	const warnDraftAttachmentsPersistenceFailure = useCallback((action: string, err: unknown) => {
-		if (import.meta.env.DEV) {
-			console.warn(`[NarratorPanel] Failed to ${action} draft attachments:`, err);
-		}
-	}, []);
-	const updateAttachedImages = useCallback((next: SetStateAction<File[]>) => {
-		attachmentDraftLocalVersionRef.current++;
-		setAttachedImages((prev) => {
-			const resolved = typeof next === "function" ? (next as (prev: File[]) => File[])(prev) : next;
-			attachedImagesRef.current = resolved;
-			return resolved;
-		});
-	}, []);
-	/**
-	 * Text-file counterpart of `updateAttachedImages`.
-	 *
-	 * Every mutation of `attachedTextFiles` must go through this rather than the
-	 * raw setter: it is what bumps the shared local-version counter, without which
-	 * an in-flight hydrate would overwrite a file the user just attached.
-	 */
-	const updateAttachedTextFiles = useCallback((next: SetStateAction<File[]>) => {
-		attachmentDraftLocalVersionRef.current++;
-		setAttachedTextFiles((prev) => {
-			const resolved = typeof next === "function" ? (next as (prev: File[]) => File[])(prev) : next;
-			attachedTextFilesRef.current = resolved;
-			return resolved;
-		});
-	}, []);
-	const persistCurrentDraftAttachments = useCallback(
-		(targetUserId: string, targetNarratorId: string) => {
-			const seq = ++attachmentDraftSaveSeqRef.current;
-			void saveDraftImageAttachments(
-				targetUserId,
-				targetNarratorId,
-				attachedImagesRef.current,
-				attachedTextFilesRef.current,
-			).catch((err) => {
-				if (seq === attachmentDraftSaveSeqRef.current) {
-					warnDraftAttachmentsPersistenceFailure("save", err);
-				}
-			});
-		},
-		[warnDraftAttachmentsPersistenceFailure],
-	);
-	/**
-	 * Clear the on-screen attachments for an in-flight send, WITHOUT touching the
-	 * stored draft — a failed send restores them, and the record has to still be
-	 * there for that to mean anything.
-	 */
-	const hideAttachedFilesForSend = useCallback(() => {
-		attachmentDraftLocalVersionRef.current++;
-		attachedImagesRef.current = [];
-		attachedTextFilesRef.current = [];
-		setAttachedImages([]);
-		setAttachedTextFiles([]);
-	}, []);
-	const clearAttachedFilesAndDraft = useCallback(() => {
-		attachmentDraftLocalVersionRef.current++;
-		attachedImagesRef.current = [];
-		attachedTextFilesRef.current = [];
-		setAttachedImages([]);
-		setAttachedTextFiles([]);
-		if (!currentUserId) return;
-		const seq = ++attachmentDraftSaveSeqRef.current;
-		void clearDraftImageAttachments(currentUserId, narratorId).catch((err) => {
-			if (seq === attachmentDraftSaveSeqRef.current) {
-				warnDraftAttachmentsPersistenceFailure("clear", err);
-			}
-		});
-	}, [currentUserId, narratorId, warnDraftAttachmentsPersistenceFailure]);
-
-	useEffect(() => {
-		let cancelled = false;
-		const localVersionAtRequest = attachmentDraftLocalVersionRef.current;
-		const draftKey = currentUserId ? getDraftImageAttachmentKey(currentUserId, narratorId) : null;
-		attachmentDraftHydratedKeyRef.current = null;
-		attachedImagesRef.current = [];
-		attachedTextFilesRef.current = [];
-		setAttachedImages([]);
-		setAttachedTextFiles([]);
-		if (!currentUserId || !draftKey) return;
-
-		const persistLocalChanges = () => {
-			if (attachmentDraftLocalVersionRef.current !== localVersionAtRequest) {
-				persistCurrentDraftAttachments(currentUserId, narratorId);
-			}
-		};
-
-		void loadDraftImageAttachments(currentUserId, narratorId)
-			.then((loaded) => {
-				if (cancelled) return;
-				attachmentDraftHydratedKeyRef.current = draftKey;
-				if (attachmentDraftLocalVersionRef.current === localVersionAtRequest) {
-					attachedImagesRef.current = loaded.images;
-					attachedTextFilesRef.current = loaded.textFiles;
-					setAttachedImages(loaded.images);
-					setAttachedTextFiles(loaded.textFiles);
-					// An entry that was stored but cannot be rebuilt (blob evicted by the
-					// browser, unreadable record) must be reported: silently restoring
-					// two of three attachments looks like the user misremembered.
-					if (loaded.droppedCount > 0) {
-						notifications.show({
-							color: "yellow",
-							title: t("draftAttachmentsRestoreFailedTitle"),
-							message: t("draftAttachmentsRestoreFailed", { count: loaded.droppedCount }),
-						});
-					}
-				} else {
-					persistLocalChanges();
-				}
-			})
-			.catch((err) => {
-				if (cancelled) return;
-				warnDraftAttachmentsPersistenceFailure("load", err);
-				attachmentDraftHydratedKeyRef.current = draftKey;
-				persistLocalChanges();
-			});
-
-		return () => {
-			cancelled = true;
-		};
-	}, [
-		currentUserId,
-		narratorId,
-		persistCurrentDraftAttachments,
-		warnDraftAttachmentsPersistenceFailure,
-		t,
-	]);
-
-	useEffect(() => {
-		if (
-			!currentUserId ||
-			sendingRef.current ||
-			attachmentDraftHydratedKeyRef.current !==
-				getDraftImageAttachmentKey(currentUserId, narratorId)
-		)
-			return;
-		const seq = ++attachmentDraftSaveSeqRef.current;
-		void saveDraftImageAttachments(
-			currentUserId,
-			narratorId,
-			attachedImages,
-			attachedTextFiles,
-		).catch((err) => {
-			if (seq === attachmentDraftSaveSeqRef.current) {
-				warnDraftAttachmentsPersistenceFailure("save", err);
-			}
-		});
-	}, [
+	// Pending composer attachments (images + text files) + their IndexedDB draft
+	// persistence. The send flow (hide/clear/restore) and drag handlers below
+	// consume these; see the hook for why both kinds share one version counter.
+	const {
 		attachedImages,
 		attachedTextFiles,
-		currentUserId,
-		narratorId,
-		warnDraftAttachmentsPersistenceFailure,
-	]);
+		attachedImagesRef,
+		attachedTextFilesRef,
+		isDragging,
+		setIsDragging,
+		dragCounterRef,
+		updateAttachedImages,
+		updateAttachedTextFiles,
+		hideAttachedFilesForSend,
+		clearAttachedFilesAndDraft,
+	} = useComposerAttachments({ narratorId, currentUserId, sendingRef, t });
 
 	// --- Scroll state ---
 	const [isAtBottom, setIsAtBottom] = useState(true);
@@ -2708,10 +2541,17 @@ export function NarratorPanel({
 	}, [attachedImages]);
 
 	// --- Title editing ---
-	const [editingTitle, setEditingTitle] = useState(false);
-	const [titleValue, setTitleValue] = useState("");
-	const [generatingTitle, setGeneratingTitle] = useState(false);
-	const titleInputRef = useRef<HTMLInputElement>(null);
+	const {
+		editingTitle,
+		titleValue,
+		setTitleValue,
+		generatingTitle,
+		titleInputRef,
+		startEditingTitle,
+		saveTitle,
+		handleGenerateTitle,
+		handleTitleKeyDown,
+	} = useTitleEditing({ narratorId, narrator, t });
 	const fileInputRef = useRef<HTMLInputElement>(null);
 	// Visible send/upload feedback. `progress` is 0..1 while attachments upload,
 	// or null once the request body is sent and we're awaiting the server.
@@ -2737,140 +2577,14 @@ export function NarratorPanel({
 		sendAbortRef.current?.abort();
 	}, []);
 
-	const startEditingTitle = () => {
-		setTitleValue(narrator?.title || "");
-		setEditingTitle(true);
-	};
-	useEffect(() => {
-		if (editingTitle) {
-			titleInputRef.current?.focus();
-			titleInputRef.current?.select();
-		}
-	}, [editingTitle]);
-	const saveTitle = async () => {
-		if (generatingTitle) return;
-		const trimmed = titleValue.trim();
-		if (trimmed && trimmed !== narrator?.title) {
-			try {
-				await api.updateNarratorTitle(narratorId, trimmed);
-			} catch {
-				// Stay in edit mode: the text the user typed is only in this input, and
-				// leaving it would drop it. Without this the failure was invisible AND
-				// unrecoverable — every click-away re-fired the blur handler and failed
-				// again, so the field looked stuck for no stated reason.
-				notifications.show({ message: t("titleUpdateFailed"), color: "red", autoClose: 4000 });
-				return;
-			}
-			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
-		}
-		setEditingTitle(false);
-	};
-	const handleGenerateTitle = async () => {
-		setGeneratingTitle(true);
-		try {
-			const { title } = await api.generateNarratorTitle(narratorId);
-			setTitleValue(title);
-			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
-		} catch {
-			notifications.show({ message: t("generateTitleFailed"), color: "red", autoClose: 4000 });
-		} finally {
-			setGeneratingTitle(false);
-		}
-	};
-	const handleTitleKeyDown = (e: React.KeyboardEvent) => {
-		// See AskInPassingCard: Enter during IME composition is the candidate pick,
-		// not a submit.
-		if (e.key === "Enter" && !e.nativeEvent.isComposing) {
-			e.preventDefault();
-			saveTitle();
-		} else if (e.key === "Escape") {
-			setEditingTitle(false);
-		}
-	};
-
 	// --- Long-press interrupt ---
-	const [interruptProgress, setInterruptProgress] = useState(0);
-	const interruptTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-	const interruptFiredRef = useRef(false);
-	const clearInterruptTimer = useCallback(() => {
-		if (interruptTimerRef.current) {
-			clearInterval(interruptTimerRef.current);
-			interruptTimerRef.current = null;
-		}
-		setInterruptProgress(0);
-		interruptFiredRef.current = false;
-	}, []);
-	const interruptMutationRef = useRef(interruptMutation);
-	interruptMutationRef.current = interruptMutation;
-	const narratorIdRef = useRef(narratorId);
-	narratorIdRef.current = narratorId;
-	const clearInterruptTimerRef = useRef(clearInterruptTimer);
-	clearInterruptTimerRef.current = clearInterruptTimer;
-
-	const startInterruptPress = useCallback((_e: React.MouseEvent) => {
-		interruptFiredRef.current = false;
-		const start = Date.now();
-		const duration = 600;
-		interruptTimerRef.current = setInterval(() => {
-			const elapsed = Date.now() - start;
-			const pct = Math.min(elapsed / duration, 1);
-			setInterruptProgress(pct);
-			if (pct >= 1 && !interruptFiredRef.current) {
-				interruptFiredRef.current = true;
-				if (interruptTimerRef.current != null) clearInterval(interruptTimerRef.current);
-				interruptTimerRef.current = null;
-				interruptMutationRef.current.mutate(narratorIdRef.current);
-			}
-		}, 16);
-	}, []);
-	const interruptBtnCleanupRef = useRef<(() => void) | null>(null);
-	const interruptBtnRef = useCallback((btn: HTMLButtonElement | null) => {
-		if (interruptBtnCleanupRef.current) {
-			interruptBtnCleanupRef.current();
-			interruptBtnCleanupRef.current = null;
-		}
-		if (!btn) return;
-		const onTouchStart = (e: TouchEvent) => {
-			e.preventDefault();
-			interruptFiredRef.current = false;
-			const start = Date.now();
-			const duration = 600;
-			interruptTimerRef.current = setInterval(() => {
-				const elapsed = Date.now() - start;
-				const pct = Math.min(elapsed / duration, 1);
-				setInterruptProgress(pct);
-				if (pct >= 1 && !interruptFiredRef.current) {
-					interruptFiredRef.current = true;
-					if (interruptTimerRef.current != null) clearInterval(interruptTimerRef.current);
-					interruptTimerRef.current = null;
-					interruptMutationRef.current.mutate(narratorIdRef.current);
-				}
-			}, 16);
-		};
-		const onTouchEnd = () => handleInterruptMouseUpRef.current();
-		const onTouchCancel = () => clearInterruptTimerRef.current();
-		btn.addEventListener("touchstart", onTouchStart, { passive: false });
-		btn.addEventListener("touchend", onTouchEnd);
-		btn.addEventListener("touchcancel", onTouchCancel);
-		interruptBtnCleanupRef.current = () => {
-			btn.removeEventListener("touchstart", onTouchStart);
-			btn.removeEventListener("touchend", onTouchEnd);
-			btn.removeEventListener("touchcancel", onTouchCancel);
-		};
-	}, []);
-	const handleInterruptMouseUp = useCallback(() => {
-		if (!interruptFiredRef.current && interruptTimerRef.current) {
-			notifications.show({
-				message: t("interruptHoldHint"),
-				color: "yellow",
-			});
-		}
-		clearInterruptTimer();
-	}, [clearInterruptTimer, t]);
-	const handleInterruptMouseUpRef = useRef(handleInterruptMouseUp);
-	handleInterruptMouseUpRef.current = handleInterruptMouseUp;
-
-	useEffect(() => clearInterruptTimer, [clearInterruptTimer]);
+	const {
+		interruptProgress,
+		startInterruptPress,
+		interruptBtnRef,
+		handleInterruptMouseUp,
+		clearInterruptTimer,
+	} = useInterruptLongPress({ narratorId, interruptMutation, t });
 
 	// --- Message state from chunk tail ---
 	const narratorIsIdle = narrator?.status === "idle";
@@ -4058,6 +3772,9 @@ export function NarratorPanel({
 	 * attachments out with the forwarded text, then commit an empty draft to the
 	 * server.
 	 */
+	// attachedImagesRef/attachedTextFilesRef are stable RefObjects from
+	// useComposerAttachments; their `.current` reads must not be deps.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: stable refs from hook
 	const forwardTextToNarrator = useCallback(
 		(text: string) => {
 			const trimmed = text.trim();
