@@ -5,9 +5,9 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import type { ModelAggregation, ModelOption } from "../../lib/constants";
-import narratorLocale from "../../locales/en/narrator.json";
-import settingsLocale from "../../locales/en/settings.json";
+import type { ModelAggregation, ModelOption } from "../../../lib/constants";
+import narratorLocale from "../../../locales/en/narrator.json";
+import settingsLocale from "../../../locales/en/settings.json";
 import { ModelMenuItems } from "./ModelMenuItems";
 
 const aggregations: ModelAggregation[] = [

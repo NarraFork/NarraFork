@@ -11,7 +11,7 @@ import {
 	resolveBlockRange,
 	resolveSelectedBlockMeta,
 	resolveSelectedMessageIds,
-} from "../MessageSelectionCtx";
+} from "../message/MessageSelectionCtx";
 import {
 	getGlobalCloseSwipe,
 	setGlobalOnSelectionRange,

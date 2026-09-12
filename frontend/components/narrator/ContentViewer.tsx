@@ -48,14 +48,14 @@ import { CompactMenuSub } from "./CompactMenuSub";
 import { ContentBody } from "./ContentBody";
 import { useDetachFromBottom } from "./DetachFromBottomCtx";
 import { FileReferenceScopeProvider, type FileReferenceScopeValue } from "./FileReferenceScope";
-import { useMessageContextMenu } from "./MessageContextMenuCtx";
+import { useMessageContextMenu } from "./message/MessageContextMenuCtx";
 import {
 	BLOCK_ID_ATTR,
 	makeMessageBlockSelectionId,
 	NestedBlockCtx,
 	shouldIgnoreMessageBlockSelection,
 	useMessageSelection,
-} from "./MessageSelectionCtx";
+} from "./message/MessageSelectionCtx";
 import { useRenderInteractive } from "./RenderLodCtx";
 
 const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };

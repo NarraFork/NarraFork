@@ -25,7 +25,7 @@ import { NarratorDockContext, type NarratorDockContextValue } from "./dock/Narra
 
 const realReactI18nextModule = { ...(await import("react-i18next")) };
 const realUsePlatformModule = { ...(await import("@frontend/hooks/usePlatform")) };
-const realMessageSelectionModule = { ...(await import("./MessageSelectionCtx")) };
+const realMessageSelectionModule = { ...(await import("./message/MessageSelectionCtx")) };
 
 const closeSwipeMock = mock(() => {});
 const clipboardCopyMock = mock((_value: string) => {});
@@ -69,7 +69,7 @@ mock.module("react-i18next", () => ({
 	useTranslation: () => ({ t: (key: string) => key }),
 }));
 mock.module("./CompactMenuSub", () => ({ CompactMenuSub: () => null }));
-mock.module("./MessageSelectionCtx", () => ({
+mock.module("./message/MessageSelectionCtx", () => ({
 	...realMessageSelectionModule,
 	shouldIgnoreMessageBlockSelection: () => false,
 	useMessageSelection: () => ({
@@ -231,7 +231,7 @@ afterEach(async () => {
 afterAll(() => {
 	mock.module("react-i18next", () => realReactI18nextModule);
 	mock.module("@frontend/hooks/usePlatform", () => realUsePlatformModule);
-	mock.module("./MessageSelectionCtx", () => realMessageSelectionModule);
+	mock.module("./message/MessageSelectionCtx", () => realMessageSelectionModule);
 	mock.restore();
 });
 

@@ -30,8 +30,8 @@ import { useAllModels } from "../../hooks/useModels";
 import { api } from "../../lib/api";
 import type { RetryFailedCompactResponse } from "../../lib/api/narrators";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
-import { ModelMenuItems } from "./ModelMenuItems";
 import { MarkdownContent } from "./markdown/MarkdownContent";
+import { ModelMenuItems } from "./model/ModelMenuItems";
 
 export const COMPACTING_MARKER_ATTR = "data-compacting-marker";
 export const COMPACT_DETAIL_QUERY_GC_TIME_MS = 30_000;

@@ -21,7 +21,7 @@ import type {
 	SideCarInboundMessage,
 	SideCarKnowledgeHit,
 } from "@shared/sidecar-body";
-import type { RenderSegment } from "../message-segments";
+import type { RenderSegment } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits } from "../render-units";
 import { installCanvasStub } from "./measure/test-canvas-stub";

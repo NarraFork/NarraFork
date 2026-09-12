@@ -25,7 +25,7 @@ import { parseHTML } from "linkedom";
 import { createElement, useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { narratorsApi } from "../../../lib/api/narrators";
-import { segmentMessages } from "../message-segments";
+import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { type AdapterSegment, adaptSegments } from "./segment-adapter";
 import {

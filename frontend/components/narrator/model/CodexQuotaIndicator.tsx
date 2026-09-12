@@ -6,15 +6,15 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useProviderRuntimeCapability } from "../../hooks/usePlatform";
-import { api, type PublicCodexQuotaOverview, type PublicCodexQuotaSegment } from "../../lib/api";
-import { CODEX_TIER_STROKES, getCodexTierLabel } from "../../lib/codex-tiers";
-import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { useProviderRuntimeCapability } from "../../../hooks/usePlatform";
+import { api, type PublicCodexQuotaOverview, type PublicCodexQuotaSegment } from "../../../lib/api";
+import { CODEX_TIER_STROKES, getCodexTierLabel } from "../../../lib/codex-tiers";
+import { narratorWSManager } from "../../../lib/narrator-ws-manager";
 import {
 	CodexQuotaTrendChart,
 	formatAccountEquivalent,
 	formatResetTimestamp,
-} from "../providers/CodexQuotaTrendChart";
+} from "../../providers/CodexQuotaTrendChart";
 
 function clampRatio(value: number): number {
 	if (!Number.isFinite(value)) return 0;

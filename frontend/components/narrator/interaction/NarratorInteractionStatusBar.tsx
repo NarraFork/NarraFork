@@ -27,9 +27,9 @@ import {
 } from "../../../lib/constants";
 import { TruncatedText } from "../../common/TruncatedText";
 import { UserAvatar } from "../../UserAvatar";
-import { CodexQuotaIndicator } from "../CodexQuotaIndicator";
-import { ModelMenuItems } from "../ModelMenuItems";
-import { ModelPriceModal } from "../ModelPriceModal";
+import { CodexQuotaIndicator } from "../model/CodexQuotaIndicator";
+import { ModelMenuItems } from "../model/ModelMenuItems";
+import { ModelPriceModal } from "../model/ModelPriceModal";
 import {
 	BackgroundTasksStatusButton,
 	NarratorStatusBar,

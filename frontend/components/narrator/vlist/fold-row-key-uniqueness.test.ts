@@ -63,7 +63,7 @@ function reasoningMessage(messageId: string, text: string) {
 
 /** Every folded row emitted by the low-LOD pipeline, in order. */
 async function foldedRows(messages: unknown[]) {
-	const { segmentMessages } = await import("../message-segments");
+	const { segmentMessages } = await import("../message/message-segments");
 	const { groupRenderUnits } = await import("../render-units");
 	const { adaptRenderUnits } = await import("./segment-adapter");
 	const units = groupRenderUnits(segmentMessages(messages as never), true);
@@ -192,7 +192,7 @@ describe("hand-off across an activity-unit boundary", () => {
 		// persisted copy and the still-live synthetic one, putting them in two different
 		// traces. Rows in separate traces are not React siblings, so this would not
 		// OVERLAP — it would be worse in a quieter way: the same call listed twice.
-		const { segmentMessages } = await import("../message-segments");
+		const { segmentMessages } = await import("../message/message-segments");
 		const { groupRenderUnits } = await import("../render-units");
 		const { adaptRenderUnits } = await import("./segment-adapter");
 
@@ -283,7 +283,7 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 
 	/** Row keys grouped PER TRACE — a duplicate only overlaps within one trace. */
 	async function traceRowKeys(messages: unknown[]): Promise<string[][]> {
-		const { segmentMessages } = await import("../message-segments");
+		const { segmentMessages } = await import("../message/message-segments");
 		const { groupRenderUnits } = await import("../render-units");
 		const { adaptRenderUnits } = await import("./segment-adapter");
 		const units = groupRenderUnits(segmentMessages(messages as never), true);

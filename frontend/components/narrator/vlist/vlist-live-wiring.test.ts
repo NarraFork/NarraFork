@@ -613,7 +613,7 @@ describe("live event → patch field mapping", () => {
 
 	it("Send receipt WS patch survives message segmentation and reaches adapter recipients", async () => {
 		const { sendDeliveryResolvedPatch } = await import("./vlist-live-events");
-		const { resolveAllToolCallsFromMsg } = await import("../message-segments");
+		const { resolveAllToolCallsFromMsg } = await import("../message/message-segments");
 		const { adaptSegment } = await import("./segment-adapter");
 		const doc = toolDoc("tu-1", "running");
 		Object.assign(block(doc), {
@@ -661,7 +661,7 @@ describe("live event → patch field mapping", () => {
 		const { buildTopLevelStreamingChunksMsg, topLevelStreamingChunkToToolFields } = await import(
 			"../narrator-message-helpers"
 		);
-		const { resolveAllToolCallsFromMsg } = await import("../message-segments");
+		const { resolveAllToolCallsFromMsg } = await import("../message/message-segments");
 		const { adaptSegment } = await import("./segment-adapter");
 		const store = createStreamingToolStore();
 		const started = {
@@ -1001,7 +1001,7 @@ describe("live event → patch field mapping", () => {
 			"./streaming-tool-chunks"
 		);
 		const { buildTopLevelStreamingChunksMsg } = await import("../narrator-message-helpers");
-		const { resolveAllToolCallsFromMsg } = await import("../message-segments");
+		const { resolveAllToolCallsFromMsg } = await import("../message/message-segments");
 		const event = {
 			toolUseId: "tu-1",
 			targets: [],
@@ -1028,7 +1028,7 @@ describe("live event → patch field mapping", () => {
 	});
 
 	it("segmentation preserves a consumed row beneath an older enriched navigation block", async () => {
-		const { resolveAllToolCallsFromMsg } = await import("../message-segments");
+		const { resolveAllToolCallsFromMsg } = await import("../message/message-segments");
 		const doc = toolDoc("tu-1", "success");
 		const received = {
 			id: "child",

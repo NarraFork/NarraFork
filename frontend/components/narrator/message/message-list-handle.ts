@@ -7,7 +7,7 @@
  * list component.
  */
 
-import type { NarratorMsg } from "./narrator-panel-types";
+import type { NarratorMsg } from "../narrator-panel-types";
 
 export interface MessageListHandle {
 	scrollToMessageTarget: (args: {

@@ -19,7 +19,7 @@ import {
 import {
 	removeDeselectedPoolEfforts,
 	setPoolReasoningEffort,
-} from "../narrator/subagent-model-pool-state";
+} from "../narrator/model/subagent-model-pool-state";
 
 // Only loaded when the user opens the migration dialog from this section.
 const BrokenModelMigrationModal = lazy(() =>

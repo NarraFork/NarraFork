@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { segmentMessages } from "./message-segments";
+import { segmentMessages } from "./message/message-segments";
 import type { NarratorMsg } from "./narrator-panel-types";
 import { groupRenderUnits, groupToolRunItemsForLod } from "./render-units";
 

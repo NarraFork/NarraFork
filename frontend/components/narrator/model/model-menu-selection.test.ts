@@ -3,7 +3,7 @@ import {
 	buildAggModelValue,
 	FOLLOW_DEFAULT_MODEL,
 	type ModelAggregation,
-} from "../../lib/constants";
+} from "../../../lib/constants";
 import { centerModelMenuSelection, modelMenuSelection } from "./model-menu-selection";
 
 const aggregations: ModelAggregation[] = [

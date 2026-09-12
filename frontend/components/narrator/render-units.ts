@@ -32,7 +32,7 @@
  */
 
 import { isCommunicationTool } from "@shared/communication-tool";
-import type { RenderSegment, ToolRunItem } from "./message-segments";
+import type { RenderSegment, ToolRunItem } from "./message/message-segments";
 import type { ContentBlock, NarratorMsg } from "./narrator-panel-types";
 import { isReasoningBlock } from "./reasoning-segments";
 

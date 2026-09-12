@@ -2017,7 +2017,7 @@ describe("live → persisted hand-off is visually inert", () => {
 	};
 
 	const rowsFor = async (messageId: string, status: string, streaming: boolean) => {
-		const { segmentMessages } = await import("../message-segments");
+		const { segmentMessages } = await import("../message/message-segments");
 		const { groupRenderUnits } = await import("../render-units");
 		const { adaptRenderUnits } = await import("./segment-adapter");
 		const { getCategory, getCategoryColor } = await import("../tool-call/tool-display");
@@ -3758,7 +3758,7 @@ describe("reasoning steps: one identity across the L2/L3 boundary", () => {
 
 	/** Step identities as they reach the DOM (`data-nf-unit`) at one level. */
 	const stepUnitIdsAt = async (lod: number, message = twoStepMessage()) => {
-		const { segmentMessages } = await import("../message-segments");
+		const { segmentMessages } = await import("../message/message-segments");
 		const { groupRenderUnits } = await import("../render-units");
 		const { adaptRenderUnits } = await import("./segment-adapter");
 		// `enabled` mirrors the shell: the activity fold exists only at L1/L2.

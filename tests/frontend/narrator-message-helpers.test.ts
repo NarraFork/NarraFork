@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	buildToolUseIndex,
 	mergeFieldsByIndex,
-} from "../../frontend/components/narrator/message-tree-utils";
+} from "../../frontend/components/narrator/message/message-tree-utils";
 import {
 	hasToolUse,
 	isToolOnlyMessage,

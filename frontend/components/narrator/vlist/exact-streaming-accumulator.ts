@@ -18,7 +18,7 @@ export type {
 	StreamDeltaResult,
 } from "../streaming/streaming-delta-fold";
 
-import type { StreamingBlock } from "../message-segments";
+import type { StreamingBlock } from "../message/message-segments";
 import {
 	applyStreamingDelta,
 	applyStreamingSnapshotBlocks,

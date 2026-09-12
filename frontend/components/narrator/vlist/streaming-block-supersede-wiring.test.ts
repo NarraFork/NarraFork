@@ -18,7 +18,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import type { StreamingBlock } from "../message-segments";
+import type { StreamingBlock } from "../message/message-segments";
 import {
 	dropSupersededStreamingBlocks,
 	type SupersedeCandidateMessage,

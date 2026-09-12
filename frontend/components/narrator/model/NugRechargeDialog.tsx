@@ -18,9 +18,9 @@ import { IconCheck, IconExternalLink } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../../lib/api";
-import { createQrDataUrl } from "../../lib/qr";
-import type { PaymentRequiredInfo } from "./useNarratorPanelWS";
+import { api } from "../../../lib/api";
+import { createQrDataUrl } from "../../../lib/qr";
+import type { PaymentRequiredInfo } from "../useNarratorPanelWS";
 
 interface NugBillingOrder {
 	id: string;

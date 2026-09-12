@@ -7,7 +7,7 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { FileReferenceScopeProvider } from "../../FileReferenceScope";
-import { buildStreamingMsg, type StreamingBlock } from "../../message-segments";
+import { buildStreamingMsg, type StreamingBlock } from "../../message/message-segments";
 import type { NarratorMsg } from "../../narrator-panel-types";
 import {
 	applyStreamingDelta,

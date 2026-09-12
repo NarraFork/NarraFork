@@ -176,6 +176,7 @@ import { ExecutionDeviceOptions } from "./ExecutionDeviceMenu";
 import type { FileReferenceScopeValue } from "./FileReferenceScope";
 import { useFilePanelNavigation } from "./file-panel-navigation";
 import { trimFileReferenceInput } from "./file-reference-input";
+import { HeaderToolbar } from "./header/HeaderToolbar";
 import { ContextUsageIndicator } from "./interaction/ContextUsageIndicator";
 import { FastModeControl } from "./interaction/FastModeControl";
 import { PathRulesPopover } from "./interaction/PathRulesPopover";
@@ -197,19 +198,19 @@ import {
 } from "./kimi-usage-format";
 import { LeakedToolCallModal } from "./LeakedToolCallModal";
 import { LodSwitchToast } from "./LodSwitchToast";
-import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./MessageSelectionCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
-import type { MessageListHandle, MessageListTailMeta } from "./message-list-handle";
+import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./message/MessageSelectionCtx";
+import type { MessageListHandle, MessageListTailMeta } from "./message/message-list-handle";
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
+import { NugRechargeDialog } from "./model/NugRechargeDialog";
 import type { NarratorComposerHandle, NarratorRemoteDraft } from "./NarratorComposer";
 import { NarratorInteractionArea } from "./NarratorInteractionArea";
 import { NarratorLodOptions } from "./NarratorLodMenu";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorStatusToolbarAction } from "./NarratorStatusToolbar";
-import { NugRechargeDialog } from "./NugRechargeDialog";
 import {
 	HEADER_TITLE_MIN_WIDTH_PX,
 	HEADER_TITLE_SLOT_ATTR,
@@ -249,7 +250,6 @@ import {
 	LatestTodosToolUseIdCtx,
 	PermEnterHintCtx,
 } from "./tool-call/tool-call-contexts";
-import { HeaderToolbar } from "./toolbar/HeaderToolbar";
 import { type PaymentRequiredInfo, useNarratorPanelWS } from "./useNarratorPanelWS";
 
 function parsePersistedPaymentRequired(value: unknown): Partial<PaymentRequiredInfo> | null {

@@ -21,7 +21,7 @@
 
 import { groupReasoningRuns } from "@shared/pretext-layout/reasoning-segments";
 import { extractField } from "@shared/pretext-layout/tool-detail";
-import { makeMessageBlockSelectionId } from "./MessageSelectionCtx";
+import { makeMessageBlockSelectionId } from "./message/MessageSelectionCtx";
 import type { ContentBlock } from "./narrator-panel-types";
 
 /** Tools whose input carries a file path worth offering in the row menu. */

@@ -6,7 +6,7 @@ import {
 	type StreamingBlock,
 	upsertStreamingImageGenerationBlock,
 	upsertStreamingWebSearchBlock,
-} from "../../frontend/components/narrator/message-segments";
+} from "../../frontend/components/narrator/message/message-segments";
 import type { ContentBlock } from "../../frontend/lib/api";
 
 type StreamingMsg = ReturnType<typeof buildStreamingMsg>;

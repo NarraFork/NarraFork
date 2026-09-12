@@ -8,7 +8,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import { useToolCallDetail } from "../../../hooks/useNarrator";
 import { toolCallDetailQueryKey } from "../../../lib/api/narrators";
-import { segmentMessages } from "../message-segments";
+import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { TraceRowInteraction } from "../TraceRowInteraction";
 import { ToolCallInspector } from "./ToolCallInspector";

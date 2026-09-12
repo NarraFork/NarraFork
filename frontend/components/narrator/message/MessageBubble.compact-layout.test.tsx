@@ -22,8 +22,8 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import { api } from "../../lib/api";
-import narratorLocale from "../../locales/en/narrator.json";
+import { api } from "../../../lib/api";
+import narratorLocale from "../../../locales/en/narrator.json";
 
 const testI18n = i18next.createInstance();
 await testI18n.use(initReactI18next).init({
@@ -46,11 +46,11 @@ const i18nModule = () => ({
 	initI18n: async () => testI18n,
 	default: testI18n,
 });
-mock.module("../../lib/i18n", i18nModule);
+mock.module("../../../lib/i18n", i18nModule);
 mock.module("@frontend/lib/i18n", i18nModule);
 
-const realUseModels = { ...(await import("../../hooks/useModels")) };
-mock.module("../../hooks/useModels", () => ({
+const realUseModels = { ...(await import("../../../hooks/useModels")) };
+mock.module("../../../hooks/useModels", () => ({
 	...realUseModels,
 	useAllModels: () => ({
 		visibleModels: [{ value: "provider:model", label: "Model", provider: "provider" }],
@@ -58,7 +58,7 @@ mock.module("../../hooks/useModels", () => ({
 	}),
 }));
 
-const { CompactSummaryModal, compactSummaryQueryKey } = await import("./compact-summary-modal");
+const { CompactSummaryModal, compactSummaryQueryKey } = await import("../compact-summary-modal");
 
 class TestResizeObserver {
 	observe() {}
@@ -214,9 +214,9 @@ afterEach(async () => {
 });
 
 afterAll(() => {
-	mock.module("../../lib/i18n", i18nModule);
+	mock.module("../../../lib/i18n", i18nModule);
 	mock.module("@frontend/lib/i18n", i18nModule);
-	mock.module("../../hooks/useModels", () => realUseModels);
+	mock.module("../../../hooks/useModels", () => realUseModels);
 	mock.restore();
 });
 

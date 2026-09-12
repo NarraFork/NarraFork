@@ -1,5 +1,5 @@
 import { createContext, useContext } from "react";
-import { collectElementTextPreviewResult } from "../../lib/dom-text";
+import { collectElementTextPreviewResult } from "../../../lib/dom-text";
 
 /**
  * Attribute name placed on every selectable content block (ContentViewer / ToolCallCard).

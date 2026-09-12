@@ -79,7 +79,7 @@ import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { AutoFollowScroll } from "../../AutoFollowScroll";
-import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
+import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import { OPTION_CONTROL_SIZE } from "../measure/measure-permission";
 import {
 	CARD_HEADER_INNER_ICON,

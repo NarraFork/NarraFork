@@ -11,7 +11,7 @@
  * Pure + DOM-free so both render paths can share it.
  */
 
-import type { MessageContextMenuActions } from "./MessageContextMenuCtx";
+import type { MessageContextMenuActions } from "./message/MessageContextMenuCtx";
 
 /**
  * Panel handlers a trace row may bind. Names/signatures match the chunked

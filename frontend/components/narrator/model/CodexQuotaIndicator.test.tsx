@@ -4,9 +4,9 @@ import i18next, { type i18n } from "i18next";
 import { parseHTML } from "linkedom";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import type { PublicCodexQuotaOverview } from "../../lib/api/types";
-import narratorLocale from "../../locales/en/narrator.json";
-import settingsLocale from "../../locales/en/settings.json";
+import type { PublicCodexQuotaOverview } from "../../../lib/api/types";
+import narratorLocale from "../../../locales/en/narrator.json";
+import settingsLocale from "../../../locales/en/settings.json";
 import {
 	applyPublicCodexQuotaOverviewIfValid,
 	CodexQuotaIndicatorContent,

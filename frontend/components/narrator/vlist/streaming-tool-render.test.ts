@@ -28,7 +28,7 @@ async function load() {
 	const [chunks, helpers, segments, layout, cache] = await Promise.all([
 		import("./streaming-tool-chunks"),
 		import("../narrator-message-helpers"),
-		import("../message-segments"),
+		import("../message/message-segments"),
 		import("./pretext-document-layout"),
 		import("./measure-cache"),
 	]);

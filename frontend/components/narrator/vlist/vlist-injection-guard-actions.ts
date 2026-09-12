@@ -17,7 +17,7 @@ import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { removeMessagesFromCache } from "../messages-query-cache";
+import { removeMessagesFromCache } from "../message/messages-query-cache";
 import type { InjectionGuardActions } from "./render/RenderSystemText";
 import type { VListItem } from "./vlist-pipeline";
 

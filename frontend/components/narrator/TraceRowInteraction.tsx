@@ -54,13 +54,13 @@ import { lazy, type ReactNode, Suspense, useCallback, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { CompactMenuSub } from "./CompactMenuSub";
-import type { MessageContextMenuActions } from "./MessageContextMenuCtx";
+import type { MessageContextMenuActions } from "./message/MessageContextMenuCtx";
 import {
 	BLOCK_ID_ATTR,
 	BLOCK_INDICES_ATTR,
 	shouldIgnoreMessageBlockSelection,
 	useMessageSelection,
-} from "./MessageSelectionCtx";
+} from "./message/MessageSelectionCtx";
 import { useRenderInteractive } from "./RenderLodCtx";
 import type { TraceRowIdentity } from "./trace-row-identity";
 import { useToolEditNavigation } from "./useToolEditNavigation";

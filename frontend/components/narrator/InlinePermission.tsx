@@ -17,7 +17,7 @@ import { type CSSProperties, type ReactNode, useContext, useEffect, useRef, useS
 import { useTranslation } from "react-i18next";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
-import { MESSAGE_SELECTION_IGNORE_ATTR } from "./MessageSelectionCtx";
+import { MESSAGE_SELECTION_IGNORE_ATTR } from "./message/MessageSelectionCtx";
 import { FileModDrawerCtx, PermEnterHintCtx } from "./tool-call/tool-call-contexts";
 
 const noop = () => {};

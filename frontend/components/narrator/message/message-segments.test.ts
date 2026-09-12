@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import type { NarratorMsg } from "../narrator-panel-types";
 import {
 	mergeStreamingSnapshotBlocks,
 	resolveAllToolCallsFromMsg,
 	type StreamingBlock,
 	segmentMessages,
 } from "./message-segments";
-import type { NarratorMsg } from "./narrator-panel-types";
 
 describe("resolveAllToolCallsFromMsg", () => {
 	test("accepts numeric tcCreatedAt values", () => {

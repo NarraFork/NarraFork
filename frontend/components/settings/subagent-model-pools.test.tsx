@@ -28,7 +28,7 @@ import settingsZh from "../../locales/zh-CN/settings.json";
 import {
 	SubagentModelPoolEditor,
 	useSubagentModelPoolDraft,
-} from "../narrator/SubagentModelPoolEditor";
+} from "../narrator/model/SubagentModelPoolEditor";
 import { ModelsSection } from "./ModelsSection";
 
 let root: Root;

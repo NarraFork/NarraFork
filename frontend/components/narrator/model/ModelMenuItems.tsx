@@ -14,7 +14,7 @@ import {
 	type ModelAggregation,
 	type ModelOption,
 	parseAggModelValue,
-} from "../../lib/constants";
+} from "../../../lib/constants";
 import { centerModelMenuSelection, modelMenuSelection } from "./model-menu-selection";
 
 /**

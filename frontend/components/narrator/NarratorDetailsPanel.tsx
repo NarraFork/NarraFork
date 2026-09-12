@@ -106,9 +106,12 @@ import {
 	shouldRenderAdvancedSubsection,
 } from "./details-panel-sections";
 import { localizeNarratorError } from "./error-localization";
+import {
+	SubagentModelPoolEditor,
+	useSubagentModelPoolDraft,
+} from "./model/SubagentModelPoolEditor";
 import { NarratorAccessPanel } from "./NarratorAccessPanel";
 import { NarratorAvatar } from "./NarratorAvatar";
-import { SubagentModelPoolEditor, useSubagentModelPoolDraft } from "./SubagentModelPoolEditor";
 import type { ViewerInfo } from "./useNarratorPanelWS";
 
 export interface NarratorDetailsPanelProps {

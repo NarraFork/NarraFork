@@ -28,7 +28,7 @@ import {
 	type StreamingBlock,
 	upsertStreamingImageGenerationBlock,
 	upsertStreamingWebSearchBlock,
-} from "../message-segments";
+} from "../message/message-segments";
 import { buildTopLevelStreamingChunksMsg } from "../narrator-message-helpers";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { dropSupersededStreamingBlocks } from "../streaming/streaming-block-supersede";

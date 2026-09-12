@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ToolCallRecord, TreeMessage } from "../../../lib/api";
-import { mergeToolCallFieldsInTree } from "../message-tree-utils";
+import { mergeToolCallFieldsInTree } from "../message/message-tree-utils";
 import {
 	getSyntheticTopLevelStreamingChunks,
 	splitTopLevelStreamingChunksByPersistedToolUse,

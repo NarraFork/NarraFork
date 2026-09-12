@@ -15,7 +15,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import type { EditingMessageState } from "./EditingMessageCtx";
+import type { EditingMessageState } from "../EditingMessageCtx";
 
 /**
  * Replays the panel's two effects the way React would: a lifecycle effect keyed on the

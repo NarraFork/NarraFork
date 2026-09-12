@@ -5,7 +5,7 @@ import { useTranslation } from "react-i18next";
 import {
 	SubagentReasoningEffortSection,
 	SubagentReasoningEffortSelect,
-} from "../common/SubagentReasoningEffortSelect";
+} from "../../common/SubagentReasoningEffortSelect";
 import { selectPoolModels, updatePoolModel } from "./subagent-model-pool-state";
 
 const EMPTY_POOLS: SubagentModelPools = {};

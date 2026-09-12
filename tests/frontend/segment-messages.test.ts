@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { segmentMessages } from "../../frontend/components/narrator/message-segments";
+import { segmentMessages } from "../../frontend/components/narrator/message/message-segments";
 import { makeMessage } from "./narrator-timeline.fixtures";
 
 describe("segmentMessages", () => {

@@ -1,8 +1,8 @@
 import { Badge, Group, Modal, Stack, Text } from "@mantine/core";
 import { useTranslation } from "react-i18next";
-import type { ModelOption } from "../../lib/constants";
-import { formatLocaleNumber } from "../../lib/intl-format";
-import { Z } from "../../lib/z-index";
+import type { ModelOption } from "../../../lib/constants";
+import { formatLocaleNumber } from "../../../lib/intl-format";
+import { Z } from "../../../lib/z-index";
 
 /** Format a per-1M-token RMB price, trimming trailing zeros (max 6 decimals). */
 function fmtPrice(value: number | string | undefined, unit: string): string {

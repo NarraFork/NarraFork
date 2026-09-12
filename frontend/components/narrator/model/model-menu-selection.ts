@@ -3,7 +3,7 @@ import {
 	FOLLOW_DEFAULT_MODEL,
 	type ModelAggregation,
 	parseAggModelValue,
-} from "../../lib/constants";
+} from "../../../lib/constants";
 
 export function modelMenuSelection(
 	currentModel: string | null | undefined,

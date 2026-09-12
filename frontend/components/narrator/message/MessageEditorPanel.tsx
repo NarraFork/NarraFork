@@ -46,28 +46,32 @@ import {
 import { IconPaperclip } from "@tabler/icons-react";
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { RevertScope } from "../../lib/api/narrators";
-import { shouldClearEditDraft } from "../../lib/api/narrators";
-import { UserAvatar } from "../UserAvatar";
-import { ComposerFullscreenModal } from "./ComposerFullscreenModal";
-import { EditExistingImageThumb, EditNewImageThumb, EditTextFileChip } from "./EditAttachmentChips";
-import { EditingMessageCtx } from "./EditingMessageCtx";
+import type { RevertScope } from "../../../lib/api/narrators";
+import { shouldClearEditDraft } from "../../../lib/api/narrators";
+import { UserAvatar } from "../../UserAvatar";
+import { ComposerFullscreenModal } from "../ComposerFullscreenModal";
+import {
+	EditExistingImageThumb,
+	EditNewImageThumb,
+	EditTextFileChip,
+} from "../EditAttachmentChips";
+import { EditingMessageCtx } from "../EditingMessageCtx";
 import {
 	editFileReferenceInput,
 	type FileReferenceInput,
 	fileReferenceToken,
 	readFileReferences,
 	trimFileReferenceInput,
-} from "./file-reference-input";
-import { editRevertNeedsConfirm } from "./message-edit-text";
+} from "../file-reference-input";
 import {
 	ACCEPTED_TYPES,
 	MAX_IMAGE_LONG_EDGE,
 	MAX_IMAGE_SIZE,
 	resizeImageIfNeeded,
-} from "./narrator-panel-types";
-import { RevertScopeConfirmModal } from "./RevertScopeConfirmModal";
-import { TextareaOptimizeControls } from "./TextareaOptimizeControls";
+} from "../narrator-panel-types";
+import { RevertScopeConfirmModal } from "../RevertScopeConfirmModal";
+import { TextareaOptimizeControls } from "../TextareaOptimizeControls";
+import { editRevertNeedsConfirm } from "./message-edit-text";
 
 /**
  * Maximum attachments an edit may carry, per type. Images allow far more than

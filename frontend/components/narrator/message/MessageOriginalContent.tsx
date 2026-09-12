@@ -18,7 +18,7 @@ import { useDisclosure } from "@mantine/hooks";
 import { IconArrowBackUp, IconPencil } from "@tabler/icons-react";
 import { useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { formatLocaleDateTime } from "../../lib/intl-format";
+import { formatLocaleDateTime } from "../../../lib/intl-format";
 
 /** Join every text block of a captured original content payload. */
 export function collectOriginalText(originalContentJson?: unknown[] | null): string {

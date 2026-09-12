@@ -237,7 +237,7 @@ describe("low-LOD live turn: per-frame cost stays flat as the reply grows", () =
 	});
 
 	it("keeps the folded rows correct while the live row grows", async () => {
-		const { segmentMessages } = await import("../message-segments");
+		const { segmentMessages } = await import("../message/message-segments");
 		const { groupRenderUnits } = await import("../render-units");
 		const { adaptRenderUnits } = await import("./segment-adapter");
 

@@ -9,12 +9,12 @@ import { parseHTML } from "linkedom";
 import { act, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import { api } from "../../lib/api";
-import en from "../../locales/en/narrator.json";
-import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
+import { api } from "../../../lib/api";
+import en from "../../../locales/en/narrator.json";
+import { EditingMessageCtx, type EditingMessageState } from "../EditingMessageCtx";
+import { QueuedAttachmentPreview, QueuedMessageRow } from "../QueuedMessageRow";
+import type { QueuedEditPayload } from "../queued-attachment-edit";
 import { MessageEditorPanel, type MessageEditorPanelProps } from "./MessageEditorPanel";
-import { QueuedAttachmentPreview, QueuedMessageRow } from "./QueuedMessageRow";
-import type { QueuedEditPayload } from "./queued-attachment-edit";
 
 // Real React/Mantine components, no module mocks and no HTTP or service calls.
 const i18n = i18next.createInstance();

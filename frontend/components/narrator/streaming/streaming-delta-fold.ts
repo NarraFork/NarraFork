@@ -26,7 +26,7 @@ import {
 	getStreamingBlockOutputIndex,
 	mergeStreamingSnapshotBlocks,
 	type StreamingBlock,
-} from "../message-segments";
+} from "../message/message-segments";
 import { appendStreamingTextPreview } from "../narrator-message-helpers";
 
 /** A decoded `content_block_delta` stream event (the shape onStreamEvent passes). */

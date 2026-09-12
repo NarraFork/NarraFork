@@ -3,7 +3,7 @@ import {
 	type ContentBlockLike,
 	groupReasoningRuns,
 } from "@shared/pretext-layout/reasoning-segments";
-import { segmentMessages } from "../message-segments";
+import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits, type RenderUnit } from "../render-units";
 import type { RenderLod } from "./prepared-block";
