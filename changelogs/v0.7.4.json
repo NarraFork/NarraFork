@@ -1,0 +1,6 @@
+{
+	"version": "0.7.4",
+	"date": "2026-09-12",
+	"en": "## New Features\n\n- Add a durable asynchronous runtime with programmatic agents, audited Eval reads and event-driven task waiting.\n- Add safer file-change evidence, execution lineage tracking, workspace coordination and history rollback safeguards.\n- Improve narrator message rendering with native system injections, live subagent activity and a split file editor preview.\n\n## Bug Fixes\n\n- Improve database migration recovery and FTS consistency after interrupted or schema-rebuilding upgrades.",
+	"zh-CN": "## 新功能\n\n- 新增持久化异步运行时、程序化代理、可审计的 Eval 内部读取和事件驱动的任务等待。\n- 新增更可靠的文件变更证据、执行链路追踪、工作区协调和历史回退保护。\n- 改进叙述者消息渲染，支持原生系统注入、实时子代理活动和分栏文件编辑预览。\n\n## 修复\n\n- 改进数据库迁移恢复，并提升中断或重建表后 FTS 索引的一致性。"
+}
