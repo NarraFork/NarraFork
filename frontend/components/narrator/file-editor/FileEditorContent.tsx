@@ -458,14 +458,6 @@ function FileEditorDocument({
 	// trees have no anchors and keep the proportional fallback.
 	const lineAnchorsRef = useRef<LineAnchor[]>([]);
 	const syncGuardRef = useRef({ preview: 0, editor: 0 });
-	useLayoutEffect(() => {
-		if (mode !== "split" || previewText == null) {
-			lineAnchorsRef.current = [];
-			return;
-		}
-		const el = previewScrollRef.current;
-		lineAnchorsRef.current = el ? collectPreviewAnchors(el, previewText.split("\n").length) : [];
-	}, [mode, previewText]);
 	useEffect(() => {
 		if (mode !== "split" || !editor) return;
 		const previewEl = previewScrollRef.current;
@@ -505,16 +497,22 @@ function FileEditorDocument({
 			if (top == null) return false;
 			const next = editor.getTopForLineNumber(base + 2);
 			const lineHeight = next > top ? next - top : 0;
+			const nextScrollTop = top + (line - base) * lineHeight;
+			if (Math.abs(editor.getScrollTop() - nextScrollTop) < 1) return true;
 			syncGuardRef.current.editor++;
-			editor.setScrollTop(top + (line - base) * lineHeight);
+			editor.setScrollTop(nextScrollTop);
 			return true;
 		};
+		const refreshAnchors = () => {
+			const model = editor.getModel?.();
+			lineAnchorsRef.current = model ? collectPreviewAnchors(previewEl, model.getLineCount()) : [];
+		};
 		const onEditorScroll = throttle(() => {
+			refreshAnchors();
 			const anchors = lineAnchorsRef.current;
 			const line = anchors.length ? editorTopLine() : null;
 			const target = line != null ? scrollTopForLine(anchors, line) : null;
-			syncGuardRef.current.preview++;
-			previewEl.scrollTop =
+			const nextScrollTop =
 				target ??
 				fractionToScroll(
 					scrollFraction(
@@ -525,6 +523,9 @@ function FileEditorDocument({
 					previewEl.scrollHeight,
 					previewEl.clientHeight,
 				);
+			if (Math.abs(previewEl.scrollTop - nextScrollTop) < 1) return;
+			syncGuardRef.current.preview++;
+			previewEl.scrollTop = nextScrollTop;
 		}, 50);
 		const subscription = editor.onDidScrollChange(() => {
 			if (syncGuardRef.current.editor > 0) {
@@ -534,6 +535,7 @@ function FileEditorDocument({
 			onEditorScroll();
 		});
 		const onPreviewScroll = throttle(() => {
+			refreshAnchors();
 			const anchors = lineAnchorsRef.current;
 			const model = editor.getModel?.();
 			if (anchors.length && model) {
@@ -542,14 +544,14 @@ function FileEditorDocument({
 				)
 					return;
 			}
-			syncGuardRef.current.editor++;
-			editor.setScrollTop(
-				fractionToScroll(
-					scrollFraction(previewEl.scrollTop, previewEl.scrollHeight, previewEl.clientHeight),
-					editor.getScrollHeight(),
-					editor.getLayoutInfo().height,
-				),
+			const nextScrollTop = fractionToScroll(
+				scrollFraction(previewEl.scrollTop, previewEl.scrollHeight, previewEl.clientHeight),
+				editor.getScrollHeight(),
+				editor.getLayoutInfo().height,
 			);
+			if (Math.abs(editor.getScrollTop() - nextScrollTop) < 1) return;
+			syncGuardRef.current.editor++;
+			editor.setScrollTop(nextScrollTop);
 		}, 50);
 		const previewListener = () => {
 			if (syncGuardRef.current.preview > 0) {
@@ -559,9 +561,24 @@ function FileEditorDocument({
 			onPreviewScroll();
 		};
 		previewEl.addEventListener("scroll", previewListener, { passive: true });
+		refreshAnchors();
+		// FileEditorPreview is lazy and syntax highlighting/diagrams may add DOM
+		// after this effect. Recollect anchors whenever the rendered subtree changes,
+		// then align once the real anchors exist instead of permanently falling back
+		// to proportional syncing.
+		const mutationObserver =
+			typeof MutationObserver === "undefined"
+				? null
+				: new MutationObserver(() => {
+						const before = lineAnchorsRef.current.length;
+						refreshAnchors();
+						if (!before && lineAnchorsRef.current.length) onEditorScroll();
+					});
+		mutationObserver?.observe(previewEl, { childList: true, subtree: true });
 		return () => {
 			subscription.dispose();
 			previewEl.removeEventListener("scroll", previewListener);
+			mutationObserver?.disconnect();
 		};
 	}, [mode, editor]);
 	// Restore the fractional reading position once the regenerated preview renders.
