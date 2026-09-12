@@ -209,7 +209,6 @@ import { LeakedToolCallModal } from "./LeakedToolCallModal";
 import { LodSwitchToast } from "./LodSwitchToast";
 import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./MessageSelectionCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
-import { ModelPriceModal } from "./ModelPriceModal";
 import type { MessageListHandle, MessageListTailMeta } from "./message-list-handle";
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
@@ -596,14 +595,6 @@ export function NarratorPanel({
 	const [_messageRenderPhase, setMessageRenderPhase] = useState<"tail" | "full">(() =>
 		highlightMessageId ? "full" : "tail",
 	);
-	// Shared model price popup state. Hoisted here (a stable ancestor outside any
-	// Menu.Dropdown) so opening the popup is not unmounted when the model menu closes.
-	const [priceModel, setPriceModel] = useState<ModelOption | null>(null);
-	// Controlled open state for the two model-selector menus (desktop + mobile).
-	// While the price popup is open, ignore close requests so dismissing the
-	// popup (a click outside the menu) does not also close the model menu.
-	const [modelMenuOpenDesktop, setModelMenuOpenDesktop] = useState(false);
-	const [modelMenuOpenMobile, setModelMenuOpenMobile] = useState(false);
 	useEffect(() => {
 		if (highlightMessageId) setMessageRenderPhase("full");
 	}, [highlightMessageId]);
@@ -1904,22 +1895,6 @@ export function NarratorPanel({
 	);
 	const quotaDetailsText = detailedQuotaBalance?.trim() ? detailedQuotaBalance : null;
 	const hasQuotaDetailsPopover = Boolean(quotaDetailsText || shouldShowNugRechargeInQuotaDetails);
-	const [quotaDetailsOpened, setQuotaDetailsOpened] = useState(false);
-	const quotaDetailsCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const cancelQuotaDetailsClose = useCallback(() => {
-		if (quotaDetailsCloseTimer.current) {
-			clearTimeout(quotaDetailsCloseTimer.current);
-			quotaDetailsCloseTimer.current = null;
-		}
-	}, []);
-	const scheduleQuotaDetailsClose = useCallback(() => {
-		cancelQuotaDetailsClose();
-		quotaDetailsCloseTimer.current = setTimeout(() => {
-			setQuotaDetailsOpened(false);
-			quotaDetailsCloseTimer.current = null;
-		}, 150);
-	}, [cancelQuotaDetailsClose]);
-	useEffect(() => () => cancelQuotaDetailsClose(), [cancelQuotaDetailsClose]);
 
 	useEffect(() => {
 		if (paymentRequired) return;
@@ -5946,12 +5921,6 @@ export function NarratorPanel({
 								aggregations,
 								providerLabels,
 								defaultModelValue,
-								menuOpenDesktop: modelMenuOpenDesktop,
-								setMenuOpenDesktop: setModelMenuOpenDesktop,
-								menuOpenMobile: modelMenuOpenMobile,
-								setMenuOpenMobile: setModelMenuOpenMobile,
-								priceModel,
-								setPriceModel,
 								refreshProps: modelMenuRefreshProps,
 								mutation: modelMutation,
 								onEditDefaultModel: () => setGlobalModelEditTarget("default"),
@@ -6003,11 +5972,7 @@ export function NarratorPanel({
 							quota: {
 								balance: quotaBalance,
 								detailsText: quotaDetailsText,
-								detailsOpened: quotaDetailsOpened,
-								setDetailsOpened: setQuotaDetailsOpened,
 								hasDetailsPopover: hasQuotaDetailsPopover,
-								onCancelDetailsClose: cancelQuotaDetailsClose,
-								onScheduleDetailsClose: scheduleQuotaDetailsClose,
 								shouldShowNugRechargeButton,
 								shouldShowNugRechargeInQuotaDetails,
 								onOpenNugRecharge: openNugRecharge,
@@ -6290,11 +6255,6 @@ export function NarratorPanel({
 				onCancel={() => {
 					if (!revertHistorySubmitting) setPendingBlockDelete(null);
 				}}
-			/>
-			<ModelPriceModal
-				model={priceModel}
-				opened={priceModel != null}
-				onClose={() => setPriceModel(null)}
 			/>
 			<SetGlobalModelModal
 				opened={globalModelEditTarget != null}
