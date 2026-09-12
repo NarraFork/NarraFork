@@ -45,44 +45,40 @@ export function buildAnchors(entries: readonly AnchorEntry[]): LineAnchor[] {
 		if (unique.length > 0 && unique[unique.length - 1].line === entry.line) continue;
 		unique.push(entry);
 	}
-	return unique.map((entry, i) => ({
-		line: entry.line,
-		top: entry.top,
-		height: unique[i + 1] ? Math.max(1, unique[i + 1].top - entry.top) : Math.max(1, entry.height),
-	}));
+	return unique.map((entry, i) => {
+		const next = unique[i + 1];
+		// VS Code's getElementBounds only clips an element when the next anchored
+		// element is nested inside it. A real gap between sibling blocks is kept.
+		const height = next
+			? Math.min(Math.max(1, entry.height), Math.max(1, next.top - entry.top))
+			: Math.max(1, entry.height);
+		return { line: entry.line, top: entry.top, height };
+	});
 }
 
 /**
- * The scroller offset (top edge) that reveals `line`, interpolating between
- * the anchors bracketing it — exact at every block boundary, linear inside a
- * block's line span (a deliberate refinement over VS Code, which snaps integer
- * in-between lines to the block's end and so cannot round-trip).
- * Returns null when there is nothing anchored to go by.
+ * The scroller offset (top edge) that reveals `line`, using VS Code's
+ * previous/next anchor interpolation. Returns null when there is nothing
+ * anchored to go by.
  */
-export function scrollTopForLine(
-	anchors: readonly LineAnchor[],
-	line: number,
-	fallbackLineHeight?: number,
-): number | null {
+export function scrollTopForLine(anchors: readonly LineAnchor[], line: number): number | null {
 	if (anchors.length === 0) return null;
 	if (line <= 0) return 0;
-	const first = anchors[0];
-	if (line <= first.line) {
-		// Above the first anchor: scale the document head linearly.
-		return first.line > 0 ? (line / first.line) * first.top : first.top;
-	}
-	let previous = first;
+	let previous = anchors[0];
 	for (const anchor of anchors) {
 		if (anchor.line === line) return anchor.top;
 		if (anchor.line > line) {
 			const progress = (line - previous.line) / (anchor.line - previous.line);
-			return previous.top + progress * (anchor.top - previous.top);
+			const previousEnd = previous.top + previous.height;
+			const gap = Math.max(0, anchor.top - previousEnd);
+			return previousEnd + progress * gap;
 		}
 		previous = anchor;
 	}
-	// Below the last anchor: extend at the caller's tail line height (kept identical
-	// to lineForScrollTop's so the two directions round-trip), else the last block's.
-	return previous.top + (line - previous.line) * (fallbackLineHeight ?? previous.height);
+	// The collector adds a document-end sentinel, matching VS Code's final
+	// `data-line` marker. This fallback is only for callers that provide no sentinel.
+	const progressInElement = line - Math.floor(line);
+	return previous.top + previous.height * progressInElement;
 }
 
 /**
@@ -94,29 +90,36 @@ export function lineForScrollTop(
 	anchors: readonly LineAnchor[],
 	offset: number,
 	lineCount: number,
-	fallbackLineHeight: number,
+	_fallbackLineHeight = 1,
 ): number {
 	if (anchors.length === 0) return 0;
-	const first = anchors[0];
 	if (offset <= 0) return 0;
-	if (offset < first.top) {
-		return first.top > 0 ? first.line * (offset / first.top) : first.line;
-	}
-	let previous = first;
-	for (let i = 1; i < anchors.length; i++) {
-		const anchor = anchors[i];
-		if (offset < anchor.top) {
-			const progress = (offset - previous.top) / (anchor.top - previous.top);
-			return previous.line + progress * (anchor.line - previous.line);
+	for (let i = 0; i < anchors.length; i++) {
+		const previous = anchors[i];
+		const next = anchors[i + 1];
+		const end = previous.top + previous.height;
+		if (offset < previous.top) {
+			if (!i) return 0;
+			const before = anchors[i - 1];
+			const progress = (offset - before.top) / Math.max(1, previous.top - before.top);
+			return Math.min(lineCount, before.line + progress * (previous.line - before.line));
 		}
-		previous = anchor;
+		if (offset <= end || !next) {
+			if (!next) {
+				const progress = (offset - previous.top) / Math.max(1, previous.height);
+				return Math.min(lineCount, previous.line + progress);
+			}
+			// VS Code maps the whole interval from this block's top to the next
+			// block's top onto the source-line interval between their anchors.
+			const progress = (offset - previous.top) / Math.max(1, next.top - previous.top);
+			return Math.min(lineCount, previous.line + progress * (next.line - previous.line));
+		}
 	}
-	const tail = (offset - previous.top) / Math.max(1, fallbackLineHeight);
-	return Math.min(lineCount, previous.line + tail);
+	return lineCount;
 }
 
 /** Collect anchors from the rendered preview: every element carrying a source line. */
-export function collectPreviewAnchors(scroller: HTMLElement): LineAnchor[] {
+export function collectPreviewAnchors(scroller: HTMLElement, lineCount?: number): LineAnchor[] {
 	const scrollerRect = scroller.getBoundingClientRect();
 	const entries: AnchorEntry[] = [];
 	for (const element of scroller.querySelectorAll("[data-line]")) {
@@ -129,6 +132,9 @@ export function collectPreviewAnchors(scroller: HTMLElement): LineAnchor[] {
 			top: rect.top - scrollerRect.top + scroller.scrollTop,
 			height: rect.height,
 		});
+	}
+	if (lineCount != null && !entries.some((entry) => entry.line === lineCount)) {
+		entries.push({ line: lineCount, top: scroller.scrollHeight, height: 1 });
 	}
 	return buildAnchors(entries);
 }

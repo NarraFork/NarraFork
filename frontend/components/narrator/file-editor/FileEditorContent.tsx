@@ -464,7 +464,7 @@ function FileEditorDocument({
 			return;
 		}
 		const el = previewScrollRef.current;
-		lineAnchorsRef.current = el ? collectPreviewAnchors(el) : [];
+		lineAnchorsRef.current = el ? collectPreviewAnchors(el, previewText.split("\n").length) : [];
 	}, [mode, previewText]);
 	useEffect(() => {
 		if (mode !== "split" || !editor) return;
@@ -509,17 +509,10 @@ function FileEditorDocument({
 			editor.setScrollTop(top + (line - base) * lineHeight);
 			return true;
 		};
-		const tailLineHeight = (): number => {
-			const lineCount = editor.getModel?.()?.getLineCount() ?? 1;
-			return Math.max(
-				1,
-				(previewEl.scrollHeight - previewEl.clientHeight) / Math.max(1, lineCount),
-			);
-		};
 		const onEditorScroll = throttle(() => {
 			const anchors = lineAnchorsRef.current;
 			const line = anchors.length ? editorTopLine() : null;
-			const target = line != null ? scrollTopForLine(anchors, line, tailLineHeight()) : null;
+			const target = line != null ? scrollTopForLine(anchors, line) : null;
 			syncGuardRef.current.preview++;
 			previewEl.scrollTop =
 				target ??
@@ -545,9 +538,7 @@ function FileEditorDocument({
 			const model = editor.getModel?.();
 			if (anchors.length && model) {
 				if (
-					scrollEditorToLine(
-						lineForScrollTop(anchors, previewEl.scrollTop, model.getLineCount(), tailLineHeight()),
-					)
+					scrollEditorToLine(lineForScrollTop(anchors, previewEl.scrollTop, model.getLineCount()))
 				)
 					return;
 			}
