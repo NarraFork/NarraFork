@@ -31,7 +31,7 @@ import {
 } from "../message-segments";
 import { buildTopLevelStreamingChunksMsg } from "../narrator-message-helpers";
 import type { NarratorMsg } from "../narrator-panel-types";
-import { dropSupersededStreamingBlocks } from "../streaming-block-supersede";
+import { dropSupersededStreamingBlocks } from "../streaming/streaming-block-supersede";
 import {
 	applyExactStreamDelta,
 	applyExactStreamingSnapshot,

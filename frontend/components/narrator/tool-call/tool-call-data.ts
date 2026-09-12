@@ -7,8 +7,8 @@
  */
 
 import type { ToolProgressPayload } from "@shared/tool-progress";
-import type { SubagentActivitySummary } from "../../lib/api";
-import type { ExecutionTargetIdentity } from "../../lib/api/types";
+import type { SubagentActivitySummary } from "../../../lib/api";
+import type { ExecutionTargetIdentity } from "../../../lib/api/types";
 
 export interface ToolCallData {
 	id?: string;

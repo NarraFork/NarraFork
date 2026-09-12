@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { getSummary } from "../../frontend/components/narrator/tool-display";
+import { getSummary } from "../../frontend/components/narrator/tool-call/tool-display";
 import {
 	communicationTargetLabel,
 	deriveCommunicationState,

@@ -3,11 +3,11 @@ import type { ToolEditPreviewSide } from "@shared/tool-edit-preview";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../../lib/api";
-import { toolCallDetailQueryKey } from "../../lib/api/narrators";
-import { getShikiLang } from "../../lib/shiki-lang";
-import { DiffView } from "./DiffView";
-import { MonacoEditor } from "./file-editor/MonacoEditor";
+import { api } from "../../../lib/api";
+import { toolCallDetailQueryKey } from "../../../lib/api/narrators";
+import { getShikiLang } from "../../../lib/shiki-lang";
+import { DiffView } from "../diff/DiffView";
+import { MonacoEditor } from "../file-editor/MonacoEditor";
 import { buildToolEditDiff, toolEditSelection } from "./tool-edit-diff";
 import {
 	isToolEditReference,

@@ -30,7 +30,7 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
-import { DiffContent } from "@frontend/components/narrator/DiffContent";
+import { DiffContent } from "@frontend/components/narrator/diff/DiffContent";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import {

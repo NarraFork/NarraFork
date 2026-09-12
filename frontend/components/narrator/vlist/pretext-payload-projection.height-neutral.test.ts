@@ -177,7 +177,10 @@ function unprojected(): NarratorMsg[] {
 	return fixture({
 		withToolRows: true,
 		metadata: (itemId) => ({ openai: { itemId, reasoningEncryptedContent: CIPHERTEXT } }),
-		signedMetadata: { anthropic: { signature: SIGNATURE, blockIndex: 1 }, signatureSource: "anthropic" },
+		signedMetadata: {
+			anthropic: { signature: SIGNATURE, blockIndex: 1 },
+			signatureSource: "anthropic",
+		},
 	});
 }
 

@@ -4,12 +4,12 @@ import type { FileReferenceContext } from "@shared/file-reference";
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { DiffDocument } from "@shared/pretext-layout/diff-core";
 import { type CSSProperties, lazy, Suspense } from "react";
-import { DiffContent } from "./DiffContent";
+import { DiffContent } from "./diff/DiffContent";
 import { FileReferenceScopeProvider } from "./FileReferenceScope";
-import { MarkdownContent } from "./MarkdownContent";
+import { MarkdownContent } from "./markdown/MarkdownContent";
 
 const HighlightedCode = lazy(() =>
-	import("./HighlightedCode").then((module) => ({ default: module.HighlightedCode })),
+	import("./markdown/HighlightedCode").then((module) => ({ default: module.HighlightedCode })),
 );
 
 /** The painter has no scrollport, ref, follow state, or reader-progress listener. */

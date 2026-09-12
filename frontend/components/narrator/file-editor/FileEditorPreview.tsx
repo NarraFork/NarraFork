@@ -11,7 +11,7 @@ import {
 } from "../file-viewer/structured-parse";
 
 const MarkdownContent = lazy(() =>
-	import("../MarkdownContent").then((m) => ({ default: m.MarkdownContent })),
+	import("../markdown/MarkdownContent").then((m) => ({ default: m.MarkdownContent })),
 );
 const StructuredNodeTree = lazy(() =>
 	import("../file-viewer/StructuredNodeTree").then((m) => ({ default: m.StructuredNodeTree })),

@@ -333,7 +333,7 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 		// This also checks `measured.rows`, the list the renderer actually paints at
 		// absolute offsets — the layer where a duplicate becomes the visible overlap.
 		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
-		const { getCategory, getCategoryColor } = await import("../tool-display");
+		const { getCategory, getCategoryColor } = await import("../tool-call/tool-display");
 		const { recentRunSegmentMessageIds } = await import("../run-segments");
 
 		const withSeq = (message: Record<string, unknown>, seq: number) => ({ ...message, seq });
@@ -481,7 +481,7 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 		// offset — the exact shape of the reported overprint. Using measured geometry (not
 		// hand-written numbers) also proves `top`/`blockHeight` are populated as assumed.
 		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
-		const { getCategory, getCategoryColor } = await import("../tool-display");
+		const { getCategory, getCategoryColor } = await import("../tool-call/tool-display");
 		const { recentRunSegmentMessageIds } = await import("../run-segments");
 
 		const built = buildPretextDocumentLayout(

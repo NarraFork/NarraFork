@@ -47,7 +47,7 @@ import {
 } from "../../lib/safe-area";
 import { ContentViewer } from "./ContentViewer";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
-import { ToolCallInspector } from "./ToolCallInspector";
+import { ToolCallInspector } from "./tool-call/ToolCallInspector";
 import { useBackgroundTaskList } from "./useBackgroundTaskList";
 
 /** Poll interval for the live output tail of a running task. */

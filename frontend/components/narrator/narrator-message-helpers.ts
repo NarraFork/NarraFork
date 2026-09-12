@@ -17,7 +17,7 @@ import {
 } from "./message-tree-utils";
 import type { ContentBlock, NarratorMsg } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
-import { isSpecTasksToolUse } from "./tool-display";
+import { isSpecTasksToolUse } from "./tool-call/tool-display";
 
 /**
  * Reflection parsing lives in `@shared/pretext-layout/reflection` so the chunked

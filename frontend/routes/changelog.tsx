@@ -14,7 +14,7 @@ import { pickLocalizedValue } from "@shared/i18n-locales";
 import { IconArrowLeft, IconTag } from "@tabler/icons-react";
 import { createFileRoute, useRouter } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
-import { MarkdownContent } from "../components/narrator/MarkdownContent";
+import { MarkdownContent } from "../components/narrator/markdown/MarkdownContent";
 import { useChangelogs } from "../hooks/use-changelogs";
 import { normalizeLanguage } from "../lib/i18n";
 import { formatLocaleDate } from "../lib/intl-format";

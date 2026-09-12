@@ -1,7 +1,7 @@
 import { Code, useComputedColorScheme } from "@mantine/core";
 import { type CSSProperties, memo, useEffect, useRef, useState } from "react";
 import type { BundledLanguage } from "shiki";
-import { loadShiki } from "../../lib/shiki-loader";
+import { loadShiki } from "../../../lib/shiki-loader";
 import classes from "./HighlightedCode.module.css";
 import {
 	cacheKey,

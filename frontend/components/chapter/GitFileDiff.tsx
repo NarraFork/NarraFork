@@ -1,4 +1,4 @@
-import { DiffView } from "@frontend/components/narrator/DiffView";
+import { DiffView } from "@frontend/components/narrator/diff/DiffView";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import { Loader, Modal, Text } from "@mantine/core";
 import { parseUnifiedDiff } from "@shared/pretext-layout/parse-unified-diff";

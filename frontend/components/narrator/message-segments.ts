@@ -9,7 +9,7 @@ import type { FileReferenceContext } from "@shared/file-reference";
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import { isEmptyReasoningBlock } from "@shared/reasoning-content";
 import type { ContentBlock, NarratorMsg, ToolCallRow } from "./narrator-panel-types";
-import type { ToolCallData } from "./tool-call-data";
+import type { ToolCallData } from "./tool-call/tool-call-data";
 
 // ---------------------------------------------------------------------------
 // Legacy tool name mapping

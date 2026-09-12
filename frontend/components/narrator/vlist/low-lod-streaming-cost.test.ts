@@ -94,7 +94,7 @@ describe("low-LOD live turn: per-frame cost stays flat as the reply grows", () =
 	it("does not scale with the ACCUMULATED streaming text", async () => {
 		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
 		const { measureCache } = await import("./measure-cache");
-		const { getCategory, getCategoryColor } = await import("../tool-display");
+		const { getCategory, getCategoryColor } = await import("../tool-call/tool-display");
 		const { recentRunSegmentMessageIds } = await import("../run-segments");
 
 		/** One live frame through the REAL document layout (the shell's entry point). */

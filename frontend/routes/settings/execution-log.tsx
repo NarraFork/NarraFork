@@ -5,7 +5,7 @@ import {
 	toExecutionLogFilters,
 } from "@frontend/components/execution-log/ExecutionLogFilterBar";
 import { ExecutionLogTable } from "@frontend/components/execution-log/ExecutionLogTable";
-import { ToolCallInspector } from "@frontend/components/narrator/ToolCallInspector";
+import { ToolCallInspector } from "@frontend/components/narrator/tool-call/ToolCallInspector";
 import { executionLogApi } from "@frontend/lib/execution-log-api";
 import {
 	advanceExecutionLogCursor,

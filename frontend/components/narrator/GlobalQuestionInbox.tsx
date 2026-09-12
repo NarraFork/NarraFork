@@ -33,7 +33,7 @@ import { readSession, writeSession } from "../../lib/session-store";
 import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
 import { toBannerQuestions } from "./async-question-questions";
 import { InlinePermission } from "./InlinePermission";
-import { FileModDrawerCtx, PermEnterHintCtx } from "./tool-call-contexts";
+import { FileModDrawerCtx, PermEnterHintCtx } from "./tool-call/tool-call-contexts";
 
 /** A global-inbox row: the question plus enough context to say which session it is. */
 export interface GlobalQuestion extends AsyncQuestion {

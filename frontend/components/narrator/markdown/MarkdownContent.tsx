@@ -19,6 +19,7 @@ import type { Components } from "react-markdown";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Pluggable, PluggableList } from "unified";
+import { hasUnclosedFence, splitStableAndTail } from "../streaming/streaming-markdown-split";
 import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
 import classes from "./MarkdownContent.module.css";
 import { MarkdownLink } from "./MarkdownLink";
@@ -31,7 +32,6 @@ import {
 	normalizeMathDelimiters,
 } from "./markdown-detection";
 import { remarkLocalFileLinks } from "./remark-local-file-links";
-import { hasUnclosedFence, splitStableAndTail } from "./streaming-markdown-split";
 
 export { MD_PATTERN } from "./markdown-detection";
 

@@ -7,14 +7,14 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
-import { toolCallDetailQueryKey } from "../../lib/api/narrators";
-import en from "../../locales/en/narrator.json";
-import { mountedTestModels, TestMonacoEditor } from "./file-editor/file-editor-test-model";
-import * as monacoBoundary from "./file-editor/MonacoEditor";
+import { toolCallDetailQueryKey } from "../../../lib/api/narrators";
+import en from "../../../locales/en/narrator.json";
+import { mountedTestModels, TestMonacoEditor } from "../file-editor/file-editor-test-model";
+import * as monacoBoundary from "../file-editor/MonacoEditor";
 import { ToolEditFileViewer } from "./ToolEditFileViewer";
 import type { ToolEditReference } from "./tool-edit-reference";
 
-const { installCanvasStub } = await import("./vlist/measure/test-canvas-stub");
+const { installCanvasStub } = await import("../vlist/measure/test-canvas-stub");
 
 const reference: ToolEditReference = {
 	narratorId: "reader",

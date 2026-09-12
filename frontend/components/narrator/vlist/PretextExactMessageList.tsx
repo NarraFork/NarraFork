@@ -83,7 +83,7 @@ import {
 	getCategoryColor,
 	getSummary,
 	subagentRecentCallSummary,
-} from "../tool-display";
+} from "../tool-call/tool-display";
 import type { TraceRowIdentity } from "../trace-row-identity";
 import { openCommunicationRecipient } from "./communication-navigation";
 import type { MeasuredReasoning } from "./measure/measure-reasoning";

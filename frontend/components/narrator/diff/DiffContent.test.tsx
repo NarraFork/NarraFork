@@ -13,9 +13,9 @@ import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import { useLayoutEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { AutoFollowScroll, useContentViewport } from "./AutoFollowScroll";
+import { AutoFollowScroll, useContentViewport } from "../AutoFollowScroll";
+import { topLevelStreamingChunkToToolFields } from "../narrator-message-helpers";
 import { DiffContent } from "./DiffContent";
-import { topLevelStreamingChunkToToolFields } from "./narrator-message-helpers";
 
 const {
 	applyStreamingToolChunk,
@@ -23,9 +23,9 @@ const {
 	applyStreamingToolExecuting,
 	applyStreamingToolStarted,
 	createStreamingToolStore,
-} = await import("./vlist/streaming-tool-chunks");
+} = await import("../vlist/streaming-tool-chunks");
 
-const { installCanvasStub } = await import("./vlist/measure/test-canvas-stub");
+const { installCanvasStub } = await import("../vlist/measure/test-canvas-stub");
 installCanvasStub();
 const controllers = new Map<string, NonNullable<ReturnType<typeof useContentViewport>>>();
 let root: Root;

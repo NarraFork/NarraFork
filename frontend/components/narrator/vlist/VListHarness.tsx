@@ -973,7 +973,7 @@ function MarkdownActual({ width, md }: { width: number; md: string }) {
 	const [Comp, setComp] = useState<ComponentType<{ text: string }> | null>(null);
 	useLayoutEffect(() => {
 		let alive = true;
-		void import("../MarkdownContent").then((m) => {
+		void import("../markdown/MarkdownContent").then((m) => {
 			if (alive) setComp(() => m.MarkdownContent as ComponentType<{ text: string }>);
 		});
 		return () => {

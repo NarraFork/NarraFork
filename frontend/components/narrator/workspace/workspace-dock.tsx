@@ -48,7 +48,7 @@ import {
 	nextHighlightRequestId,
 } from "../panels/panel-kind";
 import { resolveFileBrowserPosition, resolveToolPlacement } from "../panels/tool-placement";
-import type { ToolEditReference } from "../tool-edit-reference";
+import type { ToolEditReference } from "../tool-call/tool-edit-reference";
 import { PANEL_COMPONENT, type WorkspacePanelParams } from "./panel-types";
 
 /** The published + bridged state we shard per narrator. */

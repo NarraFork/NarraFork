@@ -7,7 +7,7 @@ import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
 import { AutoFollowScroll } from "../../AutoFollowScroll";
-import { DiffContent } from "../../DiffContent";
+import { DiffContent } from "../../diff/DiffContent";
 import { measureToolCall } from "../measure/measure-tool-call";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 import { RenderToolCall } from "./RenderToolCall";

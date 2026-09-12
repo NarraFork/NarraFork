@@ -3,10 +3,12 @@ import { lazy, Suspense, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ToolCallDetailRef } from "../../lib/api/narrators";
 import { useFilePanelNavigation } from "./file-panel-navigation";
-import type { ToolEditReference } from "./tool-edit-reference";
+import type { ToolEditReference } from "./tool-call/tool-edit-reference";
 
 const ToolEditFileViewer = lazy(() =>
-	import("./ToolEditFileViewer").then((module) => ({ default: module.ToolEditFileViewer })),
+	import("./tool-call/ToolEditFileViewer").then((module) => ({
+		default: module.ToolEditFileViewer,
+	})),
 );
 
 /** Both right-click surfaces bind the persisted tool identity, not the active file/device. */

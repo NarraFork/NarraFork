@@ -2020,7 +2020,7 @@ describe("live → persisted hand-off is visually inert", () => {
 		const { segmentMessages } = await import("../message-segments");
 		const { groupRenderUnits } = await import("../render-units");
 		const { adaptRenderUnits } = await import("./segment-adapter");
-		const { getCategory, getCategoryColor } = await import("../tool-display");
+		const { getCategory, getCategoryColor } = await import("../tool-call/tool-display");
 		const units = groupRenderUnits(
 			segmentMessages([toolMessage(messageId, status, streaming)] as never),
 			true,

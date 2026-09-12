@@ -263,7 +263,7 @@ import {
 	FileModDrawerCtx,
 	LatestTodosToolUseIdCtx,
 	PermEnterHintCtx,
-} from "./tool-call-contexts";
+} from "./tool-call/tool-call-contexts";
 import { type PaymentRequiredInfo, useNarratorPanelWS } from "./useNarratorPanelWS";
 
 function parsePersistedPaymentRequired(value: unknown): Partial<PaymentRequiredInfo> | null {

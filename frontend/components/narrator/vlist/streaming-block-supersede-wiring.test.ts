@@ -22,7 +22,7 @@ import type { StreamingBlock } from "../message-segments";
 import {
 	dropSupersededStreamingBlocks,
 	type SupersedeCandidateMessage,
-} from "../streaming-block-supersede";
+} from "../streaming/streaming-block-supersede";
 import { commitGrowthSignature, type HandoffMessage } from "./streaming-handoff";
 import { resolveStreamingClearedTrimEdge } from "./vlist-head-trim";
 

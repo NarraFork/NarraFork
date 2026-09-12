@@ -30,7 +30,7 @@ import dashboardEn from "../../locales/en/dashboard.json";
 import narratorEn from "../../locales/en/narrator.json";
 import { NeedsAttention } from "../dashboard/NeedsAttention";
 import { HumanAttentionInboxButton, HumanAttentionInboxDrawer } from "./GlobalQuestionInbox";
-import { PermEnterHintCtx } from "./tool-call-contexts";
+import { PermEnterHintCtx } from "./tool-call/tool-call-contexts";
 
 const i18n = createInstance();
 await i18n.init({

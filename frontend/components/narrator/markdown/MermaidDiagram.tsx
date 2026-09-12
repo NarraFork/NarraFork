@@ -18,7 +18,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { PANZOOM_TOOLTIP_Z, PanZoomStage } from "../common/PanZoomStage";
+import { PANZOOM_TOOLTIP_Z, PanZoomStage } from "../../common/PanZoomStage";
 import classes from "./MarkdownContent.module.css";
 
 /**

@@ -19,7 +19,7 @@ import { createDiffDocument, projectDiffDocument } from "@shared/pretext-layout/
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
 import { AutoFollowScroll } from "../../AutoFollowScroll";
-import { DiffContent } from "../../DiffContent";
+import { DiffContent } from "../../diff/DiffContent";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 
 const disposeCanvas = installCanvasStub();

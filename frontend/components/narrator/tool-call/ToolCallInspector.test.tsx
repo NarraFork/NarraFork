@@ -6,18 +6,18 @@ import { parseHTML } from "linkedom";
 import { act, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
-import { useToolCallDetail } from "../../hooks/useNarrator";
-import { toolCallDetailQueryKey } from "../../lib/api/narrators";
-import { segmentMessages } from "./message-segments";
-import type { NarratorMsg } from "./narrator-panel-types";
+import { useToolCallDetail } from "../../../hooks/useNarrator";
+import { toolCallDetailQueryKey } from "../../../lib/api/narrators";
+import { segmentMessages } from "../message-segments";
+import type { NarratorMsg } from "../narrator-panel-types";
+import { TraceRowInteraction } from "../TraceRowInteraction";
 import { ToolCallInspector } from "./ToolCallInspector";
-import { TraceRowInteraction } from "./TraceRowInteraction";
 
-const { VListRowInteraction } = await import("./vlist/VListRowInteraction");
-const { adaptSegment, adaptActivityUnit } = await import("./vlist/segment-adapter");
-const { toolDetailRequestFromData } = await import("./vlist/useVListToolDetails");
-const { measureElementCached } = await import("./vlist/registry");
-const { measureCache } = await import("./vlist/measure-cache");
+const { VListRowInteraction } = await import("../vlist/VListRowInteraction");
+const { adaptSegment, adaptActivityUnit } = await import("../vlist/segment-adapter");
+const { toolDetailRequestFromData } = await import("../vlist/useVListToolDetails");
+const { measureElementCached } = await import("../vlist/registry");
+const { measureCache } = await import("../vlist/measure-cache");
 
 // Real Inspector + React Query + HTTP adapter: only fetch and browser primitives
 // are replaced. Null external data must not accidentally create a network request.
@@ -325,7 +325,7 @@ function toolItems() {
 	})) as unknown as NarratorMsg[];
 	const segment = segmentMessages(messages)[0];
 	if (segment?.kind !== "tool-run") throw new Error("expected tool segment");
-	return segment.items as unknown as import("./vlist/segment-adapter").AdapterToolItem[];
+	return segment.items as unknown as import("../vlist/segment-adapter").AdapterToolItem[];
 }
 
 async function rowAct(update: () => void) {
@@ -421,7 +421,7 @@ describe("row menu click → real Inspector fetch", () => {
 		false,
 		true,
 	])("folded trace (drilled=%s) gets exact refs through the real measure cache", async (drilled) => {
-		const { installCanvasStub } = await import("./vlist/measure/test-canvas-stub");
+		const { installCanvasStub } = await import("../vlist/measure/test-canvas-stub");
 		installCanvasStub();
 		const spec = adaptActivityUnit(
 			toolItems().map((item, index) => ({ ...item, kind: "tool" as const, dedupeSuffix: index })),
@@ -439,7 +439,7 @@ describe("row menu click → real Inspector fetch", () => {
 			spec.opts,
 			spec.key,
 			"doc",
-		) as import("./vlist/measure/measure-tool-run").MeasuredCollapsibleTrace;
+		) as import("../vlist/measure/measure-tool-run").MeasuredCollapsibleTrace;
 		await renderRowNodes(
 			measured.rows.map((row, index) => {
 				expect(Boolean(row.cardMeasured)).toBe(drilled);

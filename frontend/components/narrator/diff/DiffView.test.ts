@@ -6,7 +6,7 @@ import { type ComponentProps, createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { DiffView } from "./DiffView";
 
-const { installCanvasStub } = await import("./vlist/measure/test-canvas-stub");
+const { installCanvasStub } = await import("../vlist/measure/test-canvas-stub");
 const restoreCanvas = installCanvasStub();
 afterAll(restoreCanvas);
 

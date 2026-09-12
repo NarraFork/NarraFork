@@ -15,10 +15,10 @@ import { readLeafText, stringifyForDisplay } from "@shared/pretext-layout/tool-i
 import { IconCheck, IconCopy } from "@tabler/icons-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useToolCallDetail } from "../../hooks/useNarrator";
-import type { ExecutionTargetIdentity } from "../../lib/api/types";
-import { formatDurationText, formatFullLocaleDateTime } from "../../lib/format";
-import { ContentViewer } from "./ContentViewer";
+import { useToolCallDetail } from "../../../hooks/useNarrator";
+import type { ExecutionTargetIdentity } from "../../../lib/api/types";
+import { formatDurationText, formatFullLocaleDateTime } from "../../../lib/format";
+import { ContentViewer } from "../ContentViewer";
 
 const MAX_JSON_PREVIEW_CHARS = 80_000;
 

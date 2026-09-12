@@ -1,4 +1,4 @@
-import type { ToolCallDetailRef } from "../../lib/api/narrators";
+import type { ToolCallDetailRef } from "../../../lib/api/narrators";
 
 /** Historical resource identity, independent of the current file/device and host panel. */
 export interface ToolEditReference extends ToolCallDetailRef {

@@ -59,7 +59,7 @@ import {
 	type SubagentPanelParams,
 } from "../panels/panel-kind";
 import { usePanelCompact, usePanelHeaderDrag } from "../panels/shared";
-import { toolEditReferenceKey } from "../tool-edit-reference";
+import { toolEditReferenceKey } from "../tool-call/tool-edit-reference";
 import type { NarratorDockPanelType } from "./dock-panel-types";
 import { NarratorDockContext, useNarratorDockContext } from "./NarratorDockContext";
 
@@ -102,7 +102,7 @@ const FileEditorContent = lazy(() =>
 	import("../file-editor/FileEditorContent").then((m) => ({ default: m.FileEditorContent })),
 );
 const ToolEditFileViewer = lazy(() =>
-	import("../ToolEditFileViewer").then((m) => ({ default: m.ToolEditFileViewer })),
+	import("../tool-call/ToolEditFileViewer").then((m) => ({ default: m.ToolEditFileViewer })),
 );
 const FileViewerContent = lazy(() =>
 	import("../file-viewer/FileViewerContent").then((m) => ({ default: m.FileViewerContent })),

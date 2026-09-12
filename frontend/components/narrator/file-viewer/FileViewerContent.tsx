@@ -58,8 +58,8 @@ import {
 } from "../FilePreviewModal";
 import { FileReferenceScopeProvider, useFileReferenceScope } from "../FileReferenceScope";
 import { MonacoEditor } from "../file-editor/MonacoEditor";
-import { MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../highlight-cache";
-import { MarkdownContent } from "../MarkdownContent";
+import { MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../markdown/highlight-cache";
+import { MarkdownContent } from "../markdown/MarkdownContent";
 import { filePanelBaseName } from "../panels/panel-kind";
 import { availableModes, type FileViewerMode } from "./file-viewer-modes";
 import { StructuredNodeTree } from "./StructuredNodeTree";

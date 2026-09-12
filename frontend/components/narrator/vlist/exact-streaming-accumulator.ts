@@ -16,7 +16,7 @@
 export type {
 	StreamDeltaEvent,
 	StreamDeltaResult,
-} from "../streaming-delta-fold";
+} from "../streaming/streaming-delta-fold";
 
 import type { StreamingBlock } from "../message-segments";
 import {
@@ -24,7 +24,7 @@ import {
 	applyStreamingSnapshotBlocks,
 	type StreamDeltaEvent,
 	type StreamDeltaResult,
-} from "../streaming-delta-fold";
+} from "../streaming/streaming-delta-fold";
 
 /** Fold one `content_block_delta` into `blocks` (see applyStreamingDelta). */
 export function applyExactStreamDelta(

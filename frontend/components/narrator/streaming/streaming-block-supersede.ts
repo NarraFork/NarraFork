@@ -42,7 +42,7 @@
  * React, no DOM, no WS.
  */
 
-import { getStreamingBlockOutputIndex, type StreamingBlock } from "./message-segments";
+import { getStreamingBlockOutputIndex, type StreamingBlock } from "../message-segments";
 
 /** The subset of a committed message this module reads. */
 export interface SupersedeCandidateMessage {

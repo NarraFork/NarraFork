@@ -13,7 +13,7 @@ import type React from "react";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
-import { clearHighlightCache } from "../../components/narrator/highlight-cache";
+import { clearHighlightCache } from "../../components/narrator/markdown/highlight-cache";
 import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
 import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
 import { clearShikiTokenCache } from "../../lib/shiki-token-cache";

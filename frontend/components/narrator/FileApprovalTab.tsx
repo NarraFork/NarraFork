@@ -5,9 +5,9 @@ import { Box, Button, Center, Group, Loader, Tabs, Text, Textarea } from "@manti
 import { useCallback, useContext, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TruncatedPath } from "../common/TruncatedPath";
-import { DiffView } from "./DiffView";
+import { DiffView } from "./diff/DiffView";
 import type { PendingPermission } from "./narrator-panel-types";
-import { PermEnterHintCtx } from "./tool-call-contexts";
+import { PermEnterHintCtx } from "./tool-call/tool-call-contexts";
 
 const MAX_FULL_FILE_PREVIEW_CHARS = 120_000;
 /**

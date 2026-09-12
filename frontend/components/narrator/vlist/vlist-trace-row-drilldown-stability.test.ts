@@ -99,7 +99,7 @@ type PaintedTrace = {
  */
 async function frame(steps: number, openKeys: readonly string[], lod: 1 | 2 | 3 = 2) {
 	const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
-	const { getCategory, getCategoryColor } = await import("../tool-display");
+	const { getCategory, getCategoryColor } = await import("../tool-call/tool-display");
 	const { recentRunSegmentMessageIds } = await import("../run-segments");
 	const messages = [
 		live(reasoningAt(steps)),

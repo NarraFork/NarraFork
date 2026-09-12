@@ -31,7 +31,10 @@
 import type { SerializedDockview } from "dockview-react";
 import { filePanelIdentity } from "../../narrator/dock/dock-panel-types";
 import { filePanelResourceId, filePanelResourceParams } from "../../narrator/panels/panel-kind";
-import { isToolEditReference, type ToolEditReference } from "../../narrator/tool-edit-reference";
+import {
+	isToolEditReference,
+	type ToolEditReference,
+} from "../../narrator/tool-call/tool-edit-reference";
 import { type DetachablePanelKind, isDetachablePanelKind, isMultiInstanceKind } from "./detachable";
 
 /** Current envelope schema version. */

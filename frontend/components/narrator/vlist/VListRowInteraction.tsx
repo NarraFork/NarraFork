@@ -78,7 +78,7 @@ import type { VListToolMeta } from "./vlist-tool-meta";
 // (ToolCallInspector pulls ContentViewer + Timeline; FilePreviewModal pulls the
 // fs-preview fetch path and Shiki language resolution).
 const ToolCallInspector = lazy(() =>
-	import("../ToolCallInspector").then((m) => ({ default: m.ToolCallInspector })),
+	import("../tool-call/ToolCallInspector").then((m) => ({ default: m.ToolCallInspector })),
 );
 const FilePreviewModal = lazy(() =>
 	import("../FilePreviewModal").then((m) => ({ default: m.FilePreviewModal })),

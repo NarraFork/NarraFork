@@ -37,7 +37,7 @@ import { createRoot, type Root } from "react-dom/client";
  * is "inside a comment" until one closes it. Real Shiki does this; a stateless stub
  * could not show that splitting the sides is what fixes the leak.
  */
-const realShikiLoader = { ...(await import("../../lib/shiki-loader")) };
+const realShikiLoader = { ...(await import("../../../lib/shiki-loader")) };
 
 const FAKE_TOKEN_COLOR = "#ff00ff";
 const FAKE_COMMENT_COLOR = "#8b949e";
@@ -54,7 +54,7 @@ function tokenizeStatefully(code: string) {
 	});
 }
 
-mock.module("../../lib/shiki-loader", () => ({
+mock.module("../../../lib/shiki-loader", () => ({
 	...realShikiLoader,
 	loadShiki: async () => ({
 		bundledLanguages: { typescript: {} },
@@ -63,7 +63,7 @@ mock.module("../../lib/shiki-loader", () => ({
 	}),
 }));
 
-const { installCanvasStub } = await import("./vlist/measure/test-canvas-stub");
+const { installCanvasStub } = await import("../vlist/measure/test-canvas-stub");
 installCanvasStub();
 const { DiffView } = await import("./DiffView");
 
@@ -243,7 +243,7 @@ describe("DiffView", () => {
 		// `mock.module` is process-wide and survives `mock.restore()`, so the real
 		// loader has to be handed back or every later suite gets the fake tokeniser.
 		clearShikiTokenCache();
-		mock.module("../../lib/shiki-loader", () => realShikiLoader);
+		mock.module("../../../lib/shiki-loader", () => realShikiLoader);
 		mock.restore();
 	});
 

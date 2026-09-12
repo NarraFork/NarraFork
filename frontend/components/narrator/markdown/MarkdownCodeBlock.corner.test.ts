@@ -71,7 +71,7 @@ describe("leading fenced block vs the ContentViewer action bar", () => {
 		// paths would look different for identical content. The vlist decides from
 		// measured geometry; this path can only express the tall-panel case in CSS
 		// (see the note in the stylesheet about the `hidden` outcome).
-		const { resolveCodeCopyPlacement } = await import("./vlist/vlist-content-view-float");
+		const { resolveCodeCopyPlacement } = await import("../vlist/vlist-content-view-float");
 		expect(resolveCodeCopyPlacement(0, 200)).toBe("bottom-right");
 		expect(ruleBody(/> \.codeBlock:first-child \.codeCopy/)).toContain("bottom:");
 	});

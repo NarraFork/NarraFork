@@ -18,7 +18,7 @@ import {
 	type SubagentPanelParams,
 	dockPanelId as sharedDockPanelId,
 } from "../panels/panel-kind";
-import { type ToolEditReference, toolEditReferenceKey } from "../tool-edit-reference";
+import { type ToolEditReference, toolEditReferenceKey } from "../tool-call/tool-edit-reference";
 
 /** Panel type discriminator stored on each dockview panel's params. */
 export type NarratorDockPanelType = Exclude<PanelKind, "webview">;

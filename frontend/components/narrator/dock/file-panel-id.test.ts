@@ -567,7 +567,7 @@ describe("historical file panels", () => {
 			source.indexOf("export function FileDockPanel"),
 			source.indexOf("// ── File tree"),
 		);
-		expect(source).toContain('import("../ToolEditFileViewer")');
+		expect(source).toContain('import("../tool-call/ToolEditFileViewer")');
 		expect(body).toContain("{toolEdit ? (");
 		expect(body).toContain("reference={toolEdit}");
 		expect(body).toContain("key={toolEditReferenceKey(toolEdit)}");

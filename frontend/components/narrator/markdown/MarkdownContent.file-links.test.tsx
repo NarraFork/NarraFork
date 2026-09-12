@@ -6,10 +6,10 @@ import { fileTargetFromHref } from "@shared/markdown-file-path";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { FileReferenceScopeProvider, type FileReferenceScopeValue } from "./FileReferenceScope";
+import { FileReferenceScopeProvider, type FileReferenceScopeValue } from "../FileReferenceScope";
 import { MarkdownContent } from "./MarkdownContent";
 
-const { installCanvasStub } = await import("./vlist/measure/test-canvas-stub");
+const { installCanvasStub } = await import("../vlist/measure/test-canvas-stub");
 
 type Renderer = "flowing" | "prepared";
 const context = { deviceId: "CapturedDevice", cwd: "/repo" };
@@ -71,8 +71,8 @@ async function render(
 	text: string,
 	options: { scope?: FileReferenceScopeValue; streaming?: boolean; width?: number } = {},
 ) {
-	const { measureMarkdown } = await import("./vlist/measure/measure-markdown");
-	const { RenderMarkdown } = await import("./vlist/render/RenderMarkdown");
+	const { measureMarkdown } = await import("../vlist/measure/measure-markdown");
+	const { RenderMarkdown } = await import("../vlist/render/RenderMarkdown");
 	const content =
 		renderer === "flowing" ? (
 			<MarkdownContent text={text} streaming={options.streaming} />
