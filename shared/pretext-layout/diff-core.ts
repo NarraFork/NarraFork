@@ -439,8 +439,9 @@ function rowPoints(doc: DiffDocument, row: number) {
 	const run = runForRow(doc, row);
 	if (!run || row < 0 || row >= doc.totalRows) return null;
 	const relative = row - run.startRow;
-	const index = run.type === "paired" ? Math.floor(relative / 2) : relative;
-	const type = run.type === "paired" ? (relative % 2 ? "added" : "removed") : run.type;
+	const index = run.type === "paired" ? relative % run.count : relative;
+	const type =
+		run.type === "paired" ? (relative < run.count ? "removed" : "added") : run.type;
 	return {
 		run,
 		index,
@@ -548,7 +549,10 @@ export function resolveDiffSourcePoint(
 	if (!run) return fallback("side");
 	const inRun = index - run[sideStart];
 	const row =
-		run.startRow + (run.type === "paired" ? inRun * 2 + (point.side === "new" ? 1 : 0) : inRun);
+		run.startRow +
+		(run.type === "paired"
+			? (point.side === "old" ? inRun : run.count + inRun)
+			: inRun);
 	return { row, point: resolved, lost, reason: lost ? "range" : null };
 }
 
@@ -581,7 +585,7 @@ export function projectDiffDocument(
 		const { type, oldPoint, newPoint, run, index } = points;
 		let wordChanges: DiffWordChange[] | undefined;
 		if (run.type === "paired") {
-			const key = run.startRow + index * 2;
+			const key = run.startRow + index;
 			if (!words.has(key))
 				words.set(
 					key,

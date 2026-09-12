@@ -652,7 +652,6 @@ class Gateway {
 			permissionMode: gwPermMode,
 			messageCount: 0,
 			totalCostUsd: 0,
-			pruneEnabled: settings.agent.defaultPruneEnabled,
 			// 无人值守 IM 不跟随用户的 fastModeDefault，显式关闭以免意外走 priority 计费。
 			fastModeOverride: "off",
 			fastMode: false,

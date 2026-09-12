@@ -186,10 +186,11 @@ describe("deliverInjection — the persisted row", () => {
 		expect(row.role).toBe("sys");
 		expect(row.content_text).toBe(content);
 
-		// Providers project text blocks only, so the model-facing copy has to be the
-		// text block — byte-for-byte, boilerplate included.
+		// Native injections own the exact model-facing projection; there is no
+		// parallel sibling text block to fall back to.
 		const blocks = blocksOf(result.messageId as string);
-		expect(blocks[0]).toEqual({ type: "text", text: content });
+		expect(blocks).toHaveLength(1);
+		expect(blocks[0]).toMatchObject({ type: "system_injection", modelText: content });
 	});
 
 	test("carries the STRUCTURED body, not pre-worded reader text", async () => {
@@ -199,7 +200,7 @@ describe("deliverInjection — the persisted row", () => {
 			body: TASKS_BODY,
 		});
 
-		const injection = blocksOf(result.messageId as string)[1];
+		const injection = blocksOf(result.messageId as string)[0];
 		expect(injection.type).toBe("system_injection");
 		expect(injection.source).toBe("living_work_spec");
 		// Reader-facing wording lives in the frontend message tables, so it must NOT be
@@ -214,8 +215,12 @@ describe("deliverInjection — the persisted row", () => {
 			content: "a plain notice",
 			source: "some_source",
 		});
-		const injection = blocksOf(result.messageId as string)[1];
-		expect(injection).toEqual({ type: "system_injection", source: "some_source" });
+		const injection = blocksOf(result.messageId as string)[0];
+		expect(injection).toEqual({
+			type: "system_injection",
+			source: "some_source",
+			modelText: "a plain notice",
+		});
 	});
 
 	test("appends a producer's own card after the injection block", async () => {
@@ -225,11 +230,7 @@ describe("deliverInjection — the persisted row", () => {
 			extraBlocks: [{ type: "background_agents_completed", tasks: [] }],
 		});
 		const blocks = blocksOf(result.messageId as string);
-		expect(blocks.map((b) => b.type)).toEqual([
-			"text",
-			"system_injection",
-			"background_agents_completed",
-		]);
+		expect(blocks.map((b) => b.type)).toEqual(["system_injection", "background_agents_completed"]);
 	});
 
 	test("registers a history ref so the row is actually part of the conversation", async () => {
@@ -292,11 +293,14 @@ describe("deliverInjection — role", () => {
 			role: "user",
 			body: { kind: "prose", text: "user-weighted text" },
 		});
-		// persistUserMessage takes the full block list with no implicit text block, so
-		// this also pins that the text block was prepended rather than dropped.
+		// User-weighted injections use the same native self-contained block and do
+		// not need a sibling text block.
 		const blocks = blocksOf(result.messageId as string);
-		expect(blocks[0]).toEqual({ type: "text", text: "user-weighted text" });
-		expect(blocks[1].type).toBe("system_injection");
+		expect(blocks).toHaveLength(1);
+		expect(blocks[0]).toMatchObject({
+			type: "system_injection",
+			modelText: "user-weighted text",
+		});
 	});
 
 	test("an attribution label is recorded for display when a source is given", async () => {

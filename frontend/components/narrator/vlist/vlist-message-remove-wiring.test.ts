@@ -79,8 +79,6 @@ async function loaded(count = 30) {
 					hasNext: false,
 					hasPrev: true,
 					messageVersion: 7,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
 				};
 			},
 		},
@@ -191,8 +189,6 @@ describe("replaceMessage — the other half of a rollback", () => {
 						hasNext: false,
 						hasPrev: false,
 						messageVersion: 7,
-						pruneBoundaryMessageId: null,
-						prunedPercent: null,
 					};
 				},
 			},

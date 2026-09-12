@@ -1065,8 +1065,6 @@ export const LARGE_CONTEXT_BOUNDARY = 600_000;
 export { DEFAULT_CONTEXT_THRESHOLDS };
 
 export const DEFAULT_AUTO_COMPACT_KEEP_PAIRS = 2;
-export const DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD = 80;
-export const DEFAULT_MIN_PRUNE_RATIO = 30;
 
 /**
  * Resolve the summary model's effective context window (tokens).
@@ -1079,16 +1077,12 @@ export function getSummaryModelContextWindow(modelOverride?: string): number {
 	return getModelContextWindow(parsed.model, prov) ?? 128_000;
 }
 
-export function getContextThresholds(
-	model: string,
-	provider: string,
-): { pruneStart: number; compactStart: number } {
+export function getContextThresholds(model: string, provider: string): { compactStart: number } {
 	const ctxWin = getModelContextWindow(model, provider) ?? 128_000;
 	const tier = ctxWin > LARGE_CONTEXT_BOUNDARY ? "large" : "standard";
 	const userThresholds = s().agent.contextThresholds;
 	const cfg = userThresholds?.[tier] ?? DEFAULT_CONTEXT_THRESHOLDS[tier];
 	return {
-		pruneStart: cfg.pruneStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].pruneStart,
 		compactStart: cfg.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].compactStart,
 	};
 }
@@ -1099,27 +1093,6 @@ export function getAutoCompactKeepPairs(): number {
 		return DEFAULT_AUTO_COMPACT_KEEP_PAIRS;
 	}
 	return Math.max(1, Math.min(25, Math.floor(configured)));
-}
-
-export function getAutoCompactPruneThreshold(): number {
-	const configured = s().agent.autoCompactPruneThreshold;
-	if (typeof configured !== "number" || !Number.isFinite(configured)) {
-		return DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD;
-	}
-	return Math.max(0, Math.min(100, Math.floor(configured)));
-}
-
-/**
- * Minimum fraction (0–1) of remaining prunable messages to prune per pass.
- * Larger steps reduce prompt-cache prefix invalidations (lower cost) at the
- * expense of dropping more context at once.
- */
-export function getMinPruneRatio(): number {
-	const configured = s().agent.minPruneRatio;
-	if (typeof configured !== "number" || !Number.isFinite(configured)) {
-		return DEFAULT_MIN_PRUNE_RATIO / 100;
-	}
-	return Math.max(0, Math.min(100, Math.floor(configured))) / 100;
 }
 
 /**

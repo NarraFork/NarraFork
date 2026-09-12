@@ -2551,6 +2551,18 @@ class BackgroundTaskService {
 				cleanup();
 				resolve({ status: "timeout", output: this.getOutputBuffer(taskId) });
 			}, timeoutMs);
+
+			// Terminal events are not replayed to late listeners. Re-read after subscribing
+			// to close the gap between the initial check and listener registration.
+			void this.getById(taskId)
+				.then((fresh) => {
+					if (settled || !fresh || fresh.status === "running") return;
+					cleanup();
+					resolve({ status: toWaitStatus(fresh.status), output: fresh.output });
+				})
+				.catch(() => {
+					// Live lifecycle listeners remain authoritative if the recheck fails.
+				});
 		});
 	}
 
@@ -2652,6 +2664,30 @@ class BackgroundTaskService {
 				cleanup();
 				resolve({ status: "timeout", output: this.getOutputBuffer(taskId) });
 			}, timeoutMs);
+
+			// Output/terminal events are not replayed to late listeners. Re-read both the
+			// persisted row and the live tail after subscribing to close that gap.
+			void this.getById(taskId)
+				.then((fresh) => {
+					if (settled || !fresh) return;
+					if (fresh.status !== "running") {
+						const output = fresh.output ?? "";
+						cleanup();
+						resolve({
+							status: output.includes(text) ? "found" : toWaitStatus(fresh.status),
+							output: fresh.output,
+						});
+						return;
+					}
+					const currentBuf = this.getOutputBuffer(taskId) ?? "";
+					if (currentBuf.includes(text)) {
+						cleanup();
+						resolve({ status: "found", output: currentBuf });
+					}
+				})
+				.catch(() => {
+					// Live output/lifecycle listeners remain authoritative if the recheck fails.
+				});
 		});
 	}
 

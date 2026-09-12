@@ -99,7 +99,6 @@ const PURE_PATH_FILES = [
 	"measure/measure-reflection-notice.ts",
 	"measure/measure-subagent.ts",
 	"measure/measure-subagent-recovery.ts",
-	"measure/measure-misc.ts",
 ];
 
 /**

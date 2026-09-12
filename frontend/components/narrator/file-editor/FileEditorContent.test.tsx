@@ -265,7 +265,7 @@ function expectClean(hash: string, hasSelection = true) {
 	if (hasSelection) expect(currentSelection()).toMatchObject({ expectedHash: hash, dirty: false });
 	else expect(currentSelection()).toBeNull();
 }
-async function switchFileMode(mode: "raw" | "preview" | "node") {
+async function switchFileMode(mode: "raw" | "preview" | "node" | "split") {
 	const input = host.querySelector<HTMLInputElement>(`input[type="radio"][value="${mode}"]`);
 	if (!input) throw new Error(`Missing mode ${mode}`);
 	await act(async () => {
@@ -720,6 +720,110 @@ test("explicit reload resets model only once and installs new hash without reset
 	expect(model.text).toBe("c\nd\n");
 	expectClean("reload-hash", false);
 	setValue.mockRestore();
+});
+
+test("reload from disk keeps markdown preview mode and re-renders the new content", async () => {
+	const model = await mount({ filePath: "/work/a.md", selection: undefined });
+	await switchFileMode("preview");
+	expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
+	create.mockResolvedValue({ ...descriptor, baseHash: "reload-hash" });
+	read.mockResolvedValue("# Reloaded heading\n");
+	await click(iconButton("refresh"));
+	const body = host.querySelector("[data-file-editor-preview]");
+	expect(body).not.toBeNull();
+	expect(body?.textContent).toContain("Reloaded heading");
+	expect(model.text).toBe("# Reloaded heading\n");
+	expectClean("reload-hash", false);
+});
+
+test("reload from disk keeps json node mode and re-renders the new content", async () => {
+	const model = await mount({ filePath: "/work/a.json", selection: undefined });
+	await switchFileMode("node");
+	expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
+	create.mockResolvedValue({ ...descriptor, baseHash: "reload-hash" });
+	read.mockResolvedValue('{"reloaded":true}');
+	await click(iconButton("refresh"));
+	const body = host.querySelector("[data-file-editor-preview]");
+	expect(body).not.toBeNull();
+	expect(body?.textContent).toContain("reloaded");
+	expect(model.text).toBe('{"reloaded":true}');
+	expectClean("reload-hash", false);
+});
+
+test("reload keeps the current preview on screen until the reloaded content is ready", async () => {
+	const model = await mount({ filePath: "/work/a.md", selection: undefined });
+	await edit(model, "# Before reload");
+	await switchFileMode("preview");
+	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain("Before reload");
+	create.mockResolvedValue({ ...descriptor, baseHash: "reload-hash" });
+	const gate = deferred<string>();
+	read.mockReturnValue(gate.promise);
+	await click(iconButton("refresh"));
+	// While the disk read is still in flight, the old rendering stays mounted:
+	// no loader flash, no unmounted preview.
+	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain("Before reload");
+	gate.resolve("# After reload");
+	await act(async () => {});
+	expect(host.querySelector("[data-file-editor-preview]")?.textContent).toContain("After reload");
+	expect(model.text).toBe("# After reload");
+});
+
+test("split mode keeps the editor interactive beside a live-updating preview", async () => {
+	const model = await mount({ filePath: "/work/a.md", selection: undefined });
+	await edit(model, "# Split heading");
+	await switchFileMode("split");
+	const sourceBox = host.querySelector("[data-file-editor-source]");
+	expect(sourceBox?.hasAttribute("inert")).toBe(false);
+	const previewBox = host.querySelector("[data-file-editor-preview]");
+	expect(previewBox).not.toBeNull();
+	expect(previewBox?.textContent).toContain("Split heading");
+	// Split previews stamp data-line anchors on block elements for line-based
+	// scroll sync (plain preview mode does not).
+	expect(previewBox?.querySelector("[data-line]")).not.toBeNull();
+	// Split is a live view: edits regenerate the preview after a short debounce.
+	await edit(model, "# Edited live");
+	await act(async () => {
+		await new Promise((resolve) => setTimeout(resolve, 400));
+	});
+	expect(previewBox?.textContent).toContain("Edited live");
+	expect(model.text).toBe("# Edited live");
+});
+
+test("set-as-default link saves the mode and the next panel opens with it", async () => {
+	const store = new Map<string, string>();
+	const descriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+	restores.push(() => {
+		if (descriptor) Object.defineProperty(globalThis, "localStorage", descriptor);
+		else Reflect.deleteProperty(globalThis, "localStorage");
+	});
+	Object.defineProperty(globalThis, "localStorage", {
+		configurable: true,
+		value: {
+			getItem: (key: string) => store.get(key) ?? null,
+			setItem: (key: string, value: string) => void store.set(key, value),
+		},
+	});
+	const defaultLink = () =>
+		[...host.querySelectorAll("button")].find(
+			(el) => el.textContent === en["fileEditor.setAsDefaultMode"],
+		) as HTMLButtonElement | undefined;
+	await mount({ filePath: "/work/a.md", selection: undefined });
+	// raw IS the saved default, so no link is offered.
+	expect(defaultLink()).toBeUndefined();
+	await switchFileMode("split");
+	const link = defaultLink();
+	expect(link).toBeDefined();
+	await act(async () => {
+		link?.dispatchEvent(new Event("click", { bubbles: true }));
+	});
+	expect(store.get("narrafork_file_editor_mode")).toBe("split");
+	expect(defaultLink()).toBeUndefined();
+	// A fresh component (same panel reopened later) initializes from the saved default.
+	await act(async () => root?.render(null));
+	await mount({ filePath: "/work/a.md", selection: undefined });
+	expect(host.querySelector("[data-file-editor-source]")?.hasAttribute("inert")).toBe(false);
+	expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
+	expect(defaultLink()).toBeUndefined();
 });
 
 test("cancelled reload keeps dirty document, selection and undo history without reading", async () => {

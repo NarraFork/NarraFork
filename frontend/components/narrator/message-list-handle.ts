@@ -36,8 +36,6 @@ export interface MessageListTailMeta {
 	lastUserMessageId?: string;
 	contextPercent?: number | null;
 	turnUsageJson?: NarratorMsg["turnUsageJson"] | null;
-	pruneBoundaryMessageId?: string | null;
-	prunedPercent?: number | null;
 	/** Tool-use id of the most recent spec://tasks.json op; drives SpecTasksDetail spinner. */
 	latestSpecTasksToolUseId?: string | null;
 }

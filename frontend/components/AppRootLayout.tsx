@@ -777,10 +777,12 @@ function AuthenticatedLayout() {
 					</LazyOverlayBoundary>
 				) : (
 					<>
-						{/* Drag handle for resizing navbar */}
+						{/* Drag handle for resizing navbar. Pointer events so touch drags work;
+						    `touch-action: none` keeps the browser from claiming the gesture as a
+						    scroll (preventDefault on pointerdown cannot do that). */}
 						<Box
 							visibleFrom="sm"
-							onMouseDown={startNavResize}
+							onPointerDown={startNavResize}
 							style={{
 								position: "absolute",
 								top: 0,
@@ -788,6 +790,7 @@ function AuthenticatedLayout() {
 								width: 6,
 								height: "100%",
 								cursor: "col-resize",
+								touchAction: "none",
 								zIndex: 100,
 							}}
 						/>

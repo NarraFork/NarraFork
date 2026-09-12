@@ -46,13 +46,7 @@ const NARRATOR_ID = "n-timeout";
 
 /** A summary request that never resolves on its own but honors its AbortSignal. */
 function stubSummaryHangingUntilAborted(onStart: () => void): void {
-	narratorContext.generateCompactSummary = (
-		_narratorId,
-		_locale,
-		_messages,
-		_pruneBoundaryMessageId,
-		signal,
-	) => {
+	narratorContext.generateCompactSummary = (_narratorId, _locale, _messages, signal) => {
 		onStart();
 		return new Promise((_resolve, reject) => {
 			if (signal?.aborted) {

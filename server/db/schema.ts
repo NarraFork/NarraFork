@@ -549,12 +549,6 @@ export const narrators = sqliteTable(
 		 * permanent context-length failure.
 		 */
 		errorRetryable: integer("error_retryable", { mode: "boolean" }),
-		pruneBoundaryMessageId: text("prune_boundary_message_id").references(
-			// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages
-			(): any => narratorMessages.id,
-		),
-		prunedPercent: integer("pruned_percent"),
-		pruneEnabled: integer("prune_enabled", { mode: "boolean" }).notNull().default(true),
 		/**
 		 * Parent narrator this one still borrows older refs from (lazy fork).
 		 *
@@ -778,7 +772,6 @@ export const narrators = sqliteTable(
 		// these constraints per deleted row, which degrades to a full narrators scan without
 		// an index and dominates the whole delete transaction.
 		index("idx_narrators_fork_message").on(table.forkMessageId),
-		index("idx_narrators_prune_boundary_message").on(table.pruneBoundaryMessageId),
 		// Partial index over the lazily-forked narrators only. Deleting a narrator has
 		// to check this self-FK per row, and the search lineage CTE walks it; in both
 		// cases the set of interest is the small "still borrowing refs" subset.
@@ -1426,8 +1419,6 @@ export const narratorMessageRefs = sqliteTable(
 			.references(() => narratorMessages.id),
 		seq: integer("seq").notNull(),
 		isCompact: integer("is_compact").notNull().default(0),
-		/** Pruned percent at the time this message was sent (inherited on fork) */
-		prunedPercent: integer("pruned_percent"),
 		/** Points to the segment-compact summary message that hides this ref. */
 		segmentCompactId: text("segment_compact_id"),
 		/** Set only when the recipient loop adopts this injection into model input. */
@@ -1526,6 +1517,7 @@ export const narratorToolCalls = sqliteTable(
 		/** Zero means no durable execution attempt was allocated (including legacy rows). */
 		executionAttempt: integer("execution_attempt").notNull().default(0),
 		/** Actual operation reference; COW copies it without creating new evidence. */
+		executionSegmentId: text("execution_segment_id"),
 		fileChangeOperationId: text("file_change_operation_id").references(
 			(): AnySQLiteColumn => fileChangeOperations.id,
 			{ onDelete: "set null" },
@@ -3774,10 +3766,37 @@ export const fileChangeBlobReservations = sqliteTable(
 	],
 );
 
+// Global logical order; allocating a number never holds a transaction across file IO.
+export const fileHistoryClock = sqliteTable("file_history_clock", {
+	id: integer("id").primaryKey(),
+	lastSeq: integer("last_seq").notNull().default(0),
+});
+
+// Invocation provenance survives removal of its displayed messages.
+export const fileChangeExecutionSegments = sqliteTable(
+	"file_change_execution_segments",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id").notNull(),
+		parentSegmentId: text("parent_segment_id"),
+		sourceToolCallId: text("source_tool_call_id"),
+		sourceExecutionAttempt: integer("source_execution_attempt"),
+		sourceInputId: text("source_input_id"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_fc_segment_source").on(table.sourceToolCallId, table.sourceExecutionAttempt),
+		index("idx_fc_segment_parent").on(table.parentSegmentId),
+		index("idx_fc_segment_narrator").on(table.narratorId),
+	],
+);
+
 export const fileChangeOperations = sqliteTable(
 	"file_change_operations",
 	{
 		id: text("id").primaryKey(),
+		journalSeq: integer("journal_seq"),
+		executionSegmentId: text("execution_segment_id"),
 		evidenceVersion: integer("evidence_version").notNull().default(2),
 		sourceInstanceId: text("source_instance_id").notNull(),
 		sourceKind: text("source_kind", {
@@ -3840,6 +3859,8 @@ export const fileChangeOperations = sqliteTable(
 			table.sourceId,
 			table.attempt,
 		),
+		index("idx_fc_operation_sequence").on(table.sourceInstanceId, table.journalSeq),
+		index("idx_fc_operation_segment").on(table.executionSegmentId, table.journalSeq),
 		index("idx_fc_operation_narrator").on(table.narratorId, table.startedAt, table.id),
 		index("idx_fc_operation_actor").on(table.actorSubjectKey, table.startedAt, table.id),
 		index("idx_fc_operation_pending").on(table.settlement, table.updatedAt, table.id),
@@ -3855,6 +3876,7 @@ export const fileChangeEffects = sqliteTable(
 		operationId: text("operation_id")
 			.notNull()
 			.references(() => fileChangeOperations.id),
+		journalSeq: integer("journal_seq"),
 		scopeId: text("scope_id")
 			.notNull()
 			.references(() => fileChangeScopes.id),

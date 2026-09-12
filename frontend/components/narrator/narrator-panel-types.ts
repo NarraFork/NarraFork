@@ -53,8 +53,6 @@ export type MessagesPage = {
 	nextCursor: string | null;
 	hasMoreAfter?: boolean;
 	prevCursor?: string | null;
-	pruneBoundaryMessageId?: string | null;
-	prunedPercent?: number | null;
 };
 
 export type NarratorMsg = TreeMessage;

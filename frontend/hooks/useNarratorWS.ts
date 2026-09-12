@@ -532,10 +532,8 @@ interface NarratorWSCallbacks {
 		promptTokens?: number,
 		contextWindow?: number,
 		isEstimated?: boolean,
-		pruneStart?: number,
 		compactStart?: number,
 	) => void;
-	onPruneBoundary?: (boundaryMessageId: string | null, prunedPercent: number | null) => void;
 	onGitStatus?: (data: {
 		chapterId: string;
 		commitsAhead: number;
@@ -1250,16 +1248,9 @@ export function useNarratorWS(
 								data.promptTokens as number | undefined,
 								data.contextWindow as number | undefined,
 								data.isEstimated as boolean | undefined,
-								data.pruneStart as number | undefined,
 								data.compactStart as number | undefined,
 							);
 						}
-						break;
-					case "prune_boundary":
-						callbackOwner.callbacks.onPruneBoundary?.(
-							(data.boundaryMessageId as string) ?? null,
-							(data.prunedPercent as number) ?? null,
-						);
 						break;
 					case "git_status":
 						if (data.chapterId) {

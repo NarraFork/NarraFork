@@ -42,13 +42,14 @@ import * as React from "react";
 import * as JsxRuntime from "react/jsx-runtime";
 import * as ReactDOMClient from "react-dom/client";
 import { mantineTheme } from "../lib/mantine-theme";
+import { PLUGIN_UI_RUNTIME_VERSION } from "./contract";
 
 /**
  * Bumped only on a breaking change to this object's shape or to a major version of the
  * libraries it exposes. A plugin built against an incompatible runtime must fail with a
  * readable message instead of rendering half a page.
  */
-export const PLUGIN_UI_RUNTIME_VERSION = 1;
+export { PLUGIN_UI_RUNTIME_VERSION } from "./contract";
 
 export interface PluginUiRuntime {
 	readonly version: number;

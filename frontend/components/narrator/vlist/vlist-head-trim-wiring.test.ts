@@ -82,8 +82,6 @@ function page(messages: readonly TreeMessage[], messageVersion: number, hasPrev 
 	return {
 		messages: [...messages],
 		messageVersion,
-		pruneBoundaryMessageId: null,
-		prunedPercent: null,
 		hasPrev,
 		minSeq: Math.min(...seqs),
 		maxSeq: Math.max(...seqs),

@@ -108,7 +108,10 @@ export async function importProject(gitPath: string): Promise<ImportResult> {
 					continue;
 				}
 
-				const columns = getColumns(pdb, table);
+				// Older backups may contain retired columns. Import only columns supported
+				// by the current schema, leaving new columns to their database defaults.
+				const targetColumns = new Set(getColumns(sqlite, table));
+				const columns = getColumns(pdb, table).filter((column) => targetColumns.has(column));
 				const sql = buildInsertSql(table, columns);
 				const stmt = sqlite.prepare(sql);
 

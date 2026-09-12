@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { segmentMessages } from "../../frontend/components/narrator/message-segments";
+import {
+	collectSegmentTargetIds,
+	segmentMessages,
+} from "../../frontend/components/narrator/message-segments";
 import { makeMessage } from "./narrator-timeline.fixtures";
 
 describe("segmentMessages", () => {
@@ -203,7 +206,7 @@ describe("segmentMessages", () => {
 		expect(segs[0].kind).toBe("message");
 	});
 
-	test("prune divider is inserted", () => {
+	test("adjacent messages produce only their content segments", () => {
 		const m1 = makeMessage({
 			id: "u1",
 			role: "user",
@@ -214,11 +217,11 @@ describe("segmentMessages", () => {
 			role: "assistant",
 			contentJson: [{ type: "text", text: "hello" }],
 		});
-		const segs = segmentMessages([m1, m2], {
-			pruneBoundaryMessageId: "u1",
-			pruneDividerLabel: "pruned",
-		});
-		expect(segs.some((s) => s.kind === "prune-divider")).toBe(true);
+		const segs = segmentMessages([m1, m2]);
+		expect(segs).toHaveLength(2);
+		expect(segs.map((segment) => segment.kind)).toEqual(["message", "message"]);
+		expect(collectSegmentTargetIds(segs[0])).toEqual(["u1"]);
+		expect(collectSegmentTargetIds(segs[1])).toEqual(["a1"]);
 	});
 
 	test("streaming text + tool: text stays before tool", () => {

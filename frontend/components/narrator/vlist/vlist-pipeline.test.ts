@@ -30,21 +30,19 @@ const SEGMENTS: AdapterSegment[] = [
 		sourceMessages: [],
 		items: [{ blockIndex: 0, isSubagent: false, tc: { toolName: "Read", summary: "read file" } }],
 	},
-	{ kind: "prune-divider", label: "older" },
 ];
 
 describe("computeVListLayout", () => {
 	it("adapts, measures, and lays out a mixed segment list", async () => {
 		const { computeVListLayout } = await import("./vlist-pipeline");
 		const result = computeVListLayout(SEGMENTS, { contentWidth: 600, lod: 5 });
-		// user bubble + (reasoning + markdown) + tool-call + prune = 5 items
-		expect(result.items).toHaveLength(5);
+		// user bubble + (reasoning + markdown) + tool-call = 4 items
+		expect(result.items).toHaveLength(4);
 		expect(result.items.map((i) => i.spec.kind)).toEqual([
 			"message-bubble",
 			"reasoning",
 			"markdown",
 			"tool-call",
-			"prune-divider",
 		]);
 	});
 

@@ -215,7 +215,6 @@ export interface VListRenderLabels {
 		resolvedLabel: string;
 	};
 	planCard: string;
-	pruneDivider: string;
 }
 
 export interface VListLabels {
@@ -612,7 +611,6 @@ export function useVListLabels(): VListLabels {
 				resolvedLabel: t("askInPassing_resolvedLabel"),
 			},
 			planCard: t("perm_plan"),
-			pruneDivider: t("pruneBoundaryLabel"),
 		};
 	}, [t, tCommon]);
 

@@ -51,10 +51,6 @@ export type RenderSegment =
 			kind: "tool-run";
 			items: ToolRunItem[];
 			sourceMessages: NarratorMsg[];
-	  }
-	| {
-			kind: "prune-divider";
-			label?: string;
 	  };
 
 // ---------------------------------------------------------------------------
@@ -220,8 +216,6 @@ export function filterChildrenByToolUse(
 // ---------------------------------------------------------------------------
 
 export interface SegmentOptions {
-	pruneBoundaryMessageId?: string | null;
-	pruneDividerLabel?: string;
 	streamingMsg?: NarratorMsg | null;
 }
 
@@ -237,7 +231,7 @@ export function segmentMessages(
 	messages: NarratorMsg[],
 	opts: SegmentOptions = {},
 ): RenderSegment[] {
-	const { pruneBoundaryMessageId, pruneDividerLabel, streamingMsg } = opts;
+	const { streamingMsg } = opts;
 
 	const effectiveMessages = streamingMsg != null ? [...messages, streamingMsg] : messages;
 
@@ -247,7 +241,6 @@ export function segmentMessages(
 		| { lane: "tool"; msg: NarratorMsg; blockIndex: number };
 
 	const atoms: Atom[] = [];
-	const pruneBoundaryAtomIndices: number[] = [];
 
 	for (const msg of effectiveMessages) {
 		const atomStartIdx = atoms.length;
@@ -267,20 +260,9 @@ export function segmentMessages(
 				atoms.push({ lane: "content-whole", msg });
 			}
 		}
-
-		if (pruneBoundaryMessageId && msg.id === pruneBoundaryMessageId) {
-			pruneBoundaryAtomIndices.push(atoms.length - 1);
-		}
 	}
 
 	const segments: RenderSegment[] = [];
-	const pruneBoundaryAtomSet = new Set(pruneBoundaryAtomIndices);
-
-	const maybeInsertPruneDivider = (atomIdx: number) => {
-		if (pruneBoundaryAtomSet.has(atomIdx)) {
-			segments.push({ kind: "prune-divider", label: pruneDividerLabel });
-		}
-	};
 
 	let ai = 0;
 	while (ai < atoms.length) {
@@ -288,7 +270,6 @@ export function segmentMessages(
 
 		if (atom.lane === "content-whole") {
 			segments.push({ kind: "message", msg: atom.msg });
-			maybeInsertPruneDivider(ai);
 			ai++;
 			continue;
 		}
@@ -307,7 +288,6 @@ export function segmentMessages(
 				}
 			}
 			segments.push({ kind: "message", msg, visibleBlockIndices: indices });
-			for (let k = ai; k < aj; k++) maybeInsertPruneDivider(k);
 			ai = aj;
 			continue;
 		}
@@ -326,7 +306,6 @@ export function segmentMessages(
 			return tcs;
 		};
 
-		const runStartAtom = ai;
 		while (ai < atoms.length) {
 			const cur = atoms[ai];
 			if (cur.lane === "tool") {
@@ -366,7 +345,6 @@ export function segmentMessages(
 				sourceMessages: [...sourceMessagesSet],
 			});
 		}
-		for (let k = runStartAtom; k < ai; k++) maybeInsertPruneDivider(k);
 	}
 
 	return segments;
@@ -377,7 +355,6 @@ export function segmentMessages(
 // ---------------------------------------------------------------------------
 
 export function collectSegmentTargetIds(seg: RenderSegment): string[] {
-	if (seg.kind === "prune-divider") return [];
 	if (seg.kind === "message") return seg.msg.id ? [seg.msg.id] : [];
 	const ids = new Set<string>();
 	for (const item of seg.items) {

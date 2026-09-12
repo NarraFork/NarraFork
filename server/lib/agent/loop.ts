@@ -285,7 +285,7 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 		large: ["prompt"],
 	},
 	Task: { short: ["description", "subagent_type", "model", "reasoning_effort"], large: ["prompt"] },
-	Await: { short: ["type", "id", "timeout", "wait_for_text"], large: [] },
+	Await: { short: ["type", "id", "onlyWaitFor", "timeout", "wait_for_text"], large: [] },
 	Send: {
 		short: ["id", "ids", "name", "names", "doInterrupt", "await", "timeout"],
 		large: ["message"],
@@ -2350,12 +2350,10 @@ export async function* agentLoop(
 			rawJsonSchema: t.getRawJsonSchema ? t.getRawJsonSchema(config) : t.rawJsonSchema,
 		}));
 
-	if (config.reflectionLoop) {
-		const allowedTools = new Set(config.reflectionLoop.allowedTools);
-		allTools = allTools.filter((tool) => allowedTools.has(tool.name));
-	} else {
-		allTools = allTools.filter((tool) => !tool.reflectionOnly);
-	}
+	// Keep the wire-level tool list identical for primary and reflection requests so
+	// provider prompt caches can share the same prefix. Reflection permissions remain
+	// narrow: the reflection loop's permissionHandler and executeTool checks enforce
+	// `reflectionLoop.allowedTools` when the model actually attempts a call.
 
 	// Apply toolFilter if provided (used by subagents to restrict available tools)
 	if (config.toolFilter) {

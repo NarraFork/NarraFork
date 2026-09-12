@@ -119,8 +119,6 @@ function page(seqs: readonly number[], messageVersion = 3): PretextDocumentPageR
 		hasNext: false,
 		hasPrev: false,
 		messageVersion,
-		pruneBoundaryMessageId: null,
-		prunedPercent: null,
 	};
 }
 

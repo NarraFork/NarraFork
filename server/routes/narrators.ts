@@ -3034,7 +3034,7 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 				? expectedMessageVersion
 				: undefined,
 	});
-	// Read the prune metadata AFTER the page, never concurrently.
+	// Read the message version AFTER the page, never concurrently.
 	//
 	// The page builder materializes a lazy fork's missing refs on demand
 	// (`ensureRefsCoverSeq`), and that backfill bumps `messageVersion`. Run in
@@ -3046,20 +3046,16 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 	// says: another writer changed the narrator underneath us.
 	const narratorMeta = await db.query.narrators.findFirst({
 		where: eq(narrators.id, id),
-		columns: { pruneBoundaryMessageId: true, prunedPercent: true, messageVersion: true },
+		columns: { messageVersion: true },
 	});
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
 	if (narratorMeta.messageVersion !== result.messageVersion)
 		throw new AppError(
-			"Narrator prune metadata changed while the exact-layout page was being built",
+			"Narrator message version changed while the exact-layout page was being built",
 			409,
 			"PRETEXT_DOCUMENT_CHANGED",
 		);
-	return c.json({
-		...result,
-		pruneBoundaryMessageId: narratorMeta.pruneBoundaryMessageId ?? null,
-		prunedPercent: narratorMeta.prunedPercent ?? null,
-	});
+	return c.json(result);
 });
 
 // Resolve a message id to the document coordinate the exact-layout list jumps to.
@@ -4583,18 +4579,6 @@ narratorRoutes.patch("/:id/behavior-fence", async (c) => {
 	await narratorService.getById(id);
 	await narratorService.updateBehaviorFenceSettings(id, updates);
 	broadcastToNarrator(id, { type: "behavior_fence_settings_changed", narratorId: id, ...updates });
-	return c.json({ ok: true });
-});
-
-// Update prune enabled
-narratorRoutes.patch("/:id/prune-enabled", async (c) => {
-	const id = c.req.param("id");
-	const { pruneEnabled } = await c.req.json();
-	if (typeof pruneEnabled !== "boolean") {
-		throw new ValidationError("pruneEnabled must be a boolean");
-	}
-	await narratorService.getById(id);
-	await narratorService.updatePruneEnabled(id, pruneEnabled);
 	return c.json({ ok: true });
 });
 

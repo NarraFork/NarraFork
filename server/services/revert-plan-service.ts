@@ -68,11 +68,11 @@ export interface RevertPlanManifestProof {
 	orderedFilesDigest: string;
 	/** Sum of every expected + desired raw ref, conservatively counting repeats. */
 	fileEvidenceBytes: number;
-	computation: "complete";
-	selectorCoverage: "complete";
-	historyCoverage: "complete";
-	omittedFiles: 0;
-	unknownFiles: 0;
+	computation: "complete" | "partial";
+	selectorCoverage: "complete" | "partial";
+	historyCoverage: "complete" | "partial";
+	omittedFiles: number;
+	unknownFiles: number;
 }
 
 export interface BeginRevertPlan extends RevertPlanHeader {
@@ -505,7 +505,9 @@ export class RevertPlanService {
 		)
 			throw fail(
 				"INCOMPLETE_SET",
-				"Every declared file and its exact ordered metadata must match the complete manifest",
+				proof.computation === "partial"
+					? "The actionable file subset or its metadata changed"
+					: "Every declared file and its exact ordered metadata must match the complete manifest",
 			);
 		return this.transaction((tx) => {
 			const operation = requireOwner(tx, context, planId);
@@ -768,11 +770,11 @@ function normalizeProof(input: RevertPlanManifestProof): RevertPlanManifestProof
 	]);
 	if (
 		input.source !== "trusted_published_planner_v1" ||
-		input.computation !== "complete" ||
+		(input.computation !== "complete" && input.computation !== "partial") ||
 		input.selectorCoverage !== "complete" ||
-		input.historyCoverage !== "complete" ||
-		input.omittedFiles !== 0 ||
-		input.unknownFiles !== 0
+		(input.historyCoverage !== "complete" && input.historyCoverage !== "partial") ||
+		input.omittedFiles < 0 ||
+		input.unknownFiles < 0
 	)
 		throw fail(
 			"COVERAGE_UNPROVEN",

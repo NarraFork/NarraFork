@@ -222,13 +222,7 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 				});
 			}
 		}
-		const rebuilt = await loadSubagentHistory(
-			input.subagentId,
-			effectiveModel,
-			provider,
-			undefined,
-			prompt,
-		);
+		const rebuilt = await loadSubagentHistory(input.subagentId, effectiveModel, provider, prompt);
 		initialHistory = rebuilt.history;
 		initialTrailingToolResults = rebuilt.trailingToolResults;
 		persistPrompt = false;
@@ -593,7 +587,6 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 								input.subagentId,
 								resolveEffectiveModel(prepared.narrator.model),
 								resolveProvider(resolveEffectiveModel(prepared.narrator.model)),
-								undefined,
 								currentInput,
 							);
 

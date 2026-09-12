@@ -81,7 +81,10 @@ type WindowCoverage =
  */
 async function classifyWindowWithoutOperations(
 	narratorId: string,
-	scope: Exclude<ScopedRevertSelector, { toolUses: Array<{ messageId: string; toolUseId: string }> }>,
+	scope: Exclude<
+		ScopedRevertSelector,
+		{ toolUses: Array<{ messageId: string; toolUseId: string }> }
+	>,
 	knownMessageIds: ReadonlySet<string> = new Set(),
 ): Promise<WindowCoverage> {
 	const rows = await db

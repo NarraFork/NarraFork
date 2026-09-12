@@ -109,5 +109,8 @@
 	"attributionSubagentDetail": "{{name}} ({{type}} subagent)",
 	"attributionSubagentDetailWithParent": "{{name}} ({{type}} subagent of {{parent}})",
 	"attributionImprecise": "Recorded observations do not establish exclusive, measured ownership of changes",
-	"attributionWindowTruncated": "Attribution not fully loaded — some changes or paths fall outside the query window. Historical participant lists and warning flags may be incomplete; a missing badge does not mean nobody changed the file."
+	"attributionWindowTruncated": "Attribution not fully loaded — some changes or paths fall outside the query window. Historical participant lists and warning flags may be incomplete; a missing badge does not mean nobody changed the file.",
+	"attributionExplanationLabel": "Explain attribution labels",
+	"attributionIncompleteShort": "Incomplete",
+	"attributionIncompleteLabel": "Attribution is incomplete"
 }

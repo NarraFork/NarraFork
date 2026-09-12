@@ -22,7 +22,6 @@ import {
 	activeNarrators,
 	compactLocks,
 	markActiveHistoryCompactPending,
-	pruneLocks,
 	resetActiveUpstreamSession,
 	withNarratorWorkAdmission,
 } from "./narrator-session-state";
@@ -561,7 +560,7 @@ export function cancelCompact(narratorId: string): boolean {
 }
 
 // Re-export locks so narrator-session can access them
-export { compactLocks, pruneLocks };
+export { compactLocks };
 
 type MessageWithSeq = { id: string; seq?: number };
 
@@ -978,9 +977,8 @@ async function doRunCustomCompact({
 
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { pruneBoundaryMessageId: true, variant: true },
+		columns: { variant: true },
 	});
-	const pruneBoundaryMessageId = narrator?.pruneBoundaryMessageId ?? null;
 	const isSubagent = narrator?.variant ? narrator.variant.startsWith("subagent") : false;
 	const compactProgress = createCompactProgressReporter({
 		narratorId,
@@ -998,7 +996,6 @@ async function doRunCustomCompact({
 			narratorId,
 			locale,
 			messages,
-			pruneBoundaryMessageId,
 			signal,
 			selectedModel,
 			compactProgress.onTextDelta,
@@ -1046,7 +1043,6 @@ async function doRunCustomCompact({
 			);
 		}
 
-		await narratorService.clearPruneBoundary(narratorId);
 		resetActiveUpstreamSession(narratorId);
 		// Record that a history compact has completed but the active agent loop
 		// has not yet rebuilt its in-memory history from the new summary. This
@@ -1405,7 +1401,6 @@ async function doRunSegmentCompact({
 			narratorId,
 			locale,
 			messages,
-			null,
 			signal,
 			undefined,
 			compactProgress.onTextDelta,
@@ -1514,68 +1509,6 @@ export function shouldFinalizeAbortBeforeRecovery(
 	return (aborted || signalAborted) && planApprovedContinue == null;
 }
 
-// === pruneToolCalls ===
-
-/** Tool names whose tool_use + tool_result pairs should survive pruning. */
-const PRUNE_PROTECTED_TOOLS = new Set(["ExitPlanMode", "Skill"]);
-
-export function pruneToolCalls(
-	dbMessages: import("../lib/agent/provider").DbMessage[],
-	boundaryMessageId: string,
-): void {
-	const boundaryIdx = dbMessages.findIndex((m) => m.id === boundaryMessageId);
-	if (boundaryIdx < 0) return;
-
-	const pruneIds = new Set(dbMessages.slice(0, boundaryIdx + 1).map((m) => m.id));
-
-	for (const msg of dbMessages) {
-		if (!pruneIds.has(msg.id)) continue;
-
-		const keptToolCalls = msg.toolCalls?.length
-			? msg.toolCalls.filter((tc) => PRUNE_PROTECTED_TOOLS.has(tc.toolName))
-			: [];
-		msg.toolCalls = keptToolCalls.length > 0 ? keptToolCalls : [];
-
-		let hasProtectedToolContext = keptToolCalls.length > 0;
-		if (Array.isArray(msg.contentJson)) {
-			let mutated = false;
-			const keptToolUseIds = new Set(
-				keptToolCalls
-					.map((tc) => tc.toolUseId)
-					.filter((toolUseId): toolUseId is string => typeof toolUseId === "string"),
-			);
-			const blocks = msg.contentJson.filter((block) => {
-				if (!block || typeof block !== "object") return true;
-				const toolBlock = block as { type?: string; id?: string; name?: string };
-				if (toolBlock.type !== "tool_use") return true;
-				const keep =
-					(typeof toolBlock.id === "string" && keptToolUseIds.has(toolBlock.id)) ||
-					(typeof toolBlock.name === "string" && PRUNE_PROTECTED_TOOLS.has(toolBlock.name));
-				if (keep) hasProtectedToolContext = true;
-				if (!keep) mutated = true;
-				return keep;
-			});
-			if (mutated) {
-				msg.contentJson = blocks;
-			}
-
-			if (!hasProtectedToolContext) {
-				let reasoningMutated = false;
-				const prunedBlocks = msg.contentJson as Array<{ type: string; providerMetadata?: unknown }>;
-				for (const block of prunedBlocks) {
-					if (block.type === "reasoning" && block.providerMetadata) {
-						block.providerMetadata = undefined;
-						reasoningMutated = true;
-					}
-				}
-				if (reasoningMutated) {
-					msg.contentJson = [...prunedBlocks];
-				}
-			}
-		}
-	}
-}
-
 // === computeLineDiff ===
 
 /**
@@ -1660,7 +1593,7 @@ export function computeLineDiff(oldText: string, newText: string): string | null
 }
 
 /**
- * Run a plan compact: persist the plan text as a compact message and clear prune boundary.
+ * Run a plan compact: persist the plan text as a compact message.
  */
 export async function runPlanCompact(narratorId: string, planText: string): Promise<void> {
 	return withNarratorWorkAdmission(narratorId, () => runPlanCompactUnlocked(narratorId, planText));
@@ -1676,6 +1609,5 @@ async function runPlanCompactUnlocked(narratorId: string, planText: string): Pro
 		broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactMsg });
 	}
 
-	await narratorService.clearPruneBoundary(narratorId);
 	logger.info("Plan compact completed", { narratorId, summaryLength: planText.length });
 }

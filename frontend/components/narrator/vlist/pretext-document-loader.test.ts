@@ -29,8 +29,6 @@ function page(
 	flags: { hasNext?: boolean; hasPrev?: boolean } = {},
 	options: {
 		messageVersion?: number;
-		pruneBoundaryMessageId?: string | null;
-		prunedPercent?: number | null;
 	} = {},
 ): PretextDocumentPageResult {
 	return {
@@ -40,8 +38,6 @@ function page(
 		hasNext: flags.hasNext ?? false,
 		hasPrev: flags.hasPrev ?? false,
 		messageVersion: options.messageVersion ?? 7,
-		pruneBoundaryMessageId: options.pruneBoundaryMessageId ?? null,
-		prunedPercent: options.prunedPercent ?? null,
 	};
 }
 
@@ -52,7 +48,7 @@ describe("loadPretextDocumentTail", () => {
 			pageSize: 50,
 			fetchPage: async (_id, opts) => {
 				requests.push({ afterSeq: opts.afterSeq, beforeSeq: opts.beforeSeq, limit: opts.limit });
-				return page(8, 9, { hasPrev: true }, { pruneBoundaryMessageId: "m-8" });
+				return page(8, 9, { hasPrev: true }, {});
 			},
 		});
 		// A single tail request with no cursor — never the whole history.
@@ -60,7 +56,6 @@ describe("loadPretextDocumentTail", () => {
 		expect(result.messages.map((item) => item.seq)).toEqual([8, 9]);
 		expect(result.oldestLoadedSeq).toBe(8);
 		expect(result.hasPrev).toBe(true);
-		expect(result.pruneBoundaryMessageId).toBe("m-8");
 	});
 
 	it("rejects an invalid message version", async () => {
@@ -115,8 +110,6 @@ describe("loadPretextDocumentOlder", () => {
 	const base: PretextDocumentInput = {
 		messages: [message(8), message(9)],
 		messageVersion: 7,
-		pruneBoundaryMessageId: "m-8",
-		prunedPercent: 40,
 		oldestLoadedSeq: 8,
 		hasPrev: true,
 	};
@@ -127,7 +120,7 @@ describe("loadPretextDocumentOlder", () => {
 			pageSize: 50,
 			fetchPage: async (_id, opts) => {
 				requests.push({ beforeSeq: opts.beforeSeq, messageVersion: opts.messageVersion });
-				return page(6, 7, { hasPrev: true }, { pruneBoundaryMessageId: "m-8", prunedPercent: 40 });
+				return page(6, 7, { hasPrev: true }, {});
 			},
 		});
 		// The version is deliberately NOT pinned (see below); only the cursor is sent.
@@ -153,12 +146,7 @@ describe("loadPretextDocumentOlder", () => {
 			fetchPage: async (_id, opts) => {
 				// A pinned stale version is exactly what produced the 409.
 				expect(opts.messageVersion).toBeUndefined();
-				return page(
-					6,
-					7,
-					{ hasPrev: true },
-					{ messageVersion: 12, pruneBoundaryMessageId: "m-8", prunedPercent: 40 },
-				);
+				return page(6, 7, { hasPrev: true }, { messageVersion: 12 });
 			},
 		});
 		expect(next.messages.map((item) => item.seq)).toEqual([6, 7, 8, 9]);
@@ -166,17 +154,6 @@ describe("loadPretextDocumentOlder", () => {
 		// rows already on screen. Adopting the server's newer one here would discard
 		// the whole window's cached heights on every upward page.
 		expect(next.messageVersion).toBe(7);
-	});
-
-	it("still refuses to stitch pages across a prune-metadata change", () => {
-		// The check that actually matters for correctness stays: a different prune
-		// boundary means the two pages describe different documents.
-		expect(
-			loadPretextDocumentOlder("n1", base, {
-				fetchPage: async () =>
-					page(6, 7, { hasPrev: true }, { pruneBoundaryMessageId: "OTHER", prunedPercent: 40 }),
-			}),
-		).rejects.toThrow(/prune metadata changed/);
 	});
 
 	it("closes the upward window when the server returns no older rows", async () => {
@@ -188,8 +165,6 @@ describe("loadPretextDocumentOlder", () => {
 				hasNext: true,
 				hasPrev: false,
 				messageVersion: 7,
-				pruneBoundaryMessageId: "m-8",
-				prunedPercent: 40,
 			}),
 		});
 		expect(next.messages.map((item) => item.seq)).toEqual([8, 9]);
@@ -213,29 +188,19 @@ describe("loadPretextDocumentOlder", () => {
 		expect(next.messages.map((item) => item.seq)).toEqual([8, 9]);
 	});
 
-	it("rejects a page from a different document version", async () => {
-		await expect(
-			loadPretextDocumentOlder("n1", base, {
-				fetchPage: async () => page(6, 7, { hasPrev: true }, { messageVersion: 8 }),
-			}),
-		).rejects.toThrow("changed during pagination");
-	});
-
-	it("rejects prune metadata drift", async () => {
-		await expect(
-			loadPretextDocumentOlder("n1", base, {
-				fetchPage: async () =>
-					page(6, 7, { hasPrev: true }, { pruneBoundaryMessageId: "m-6", prunedPercent: 10 }),
-			}),
-		).rejects.toThrow("prune metadata changed");
+	it("keeps the loaded version when an older page has a newer version", async () => {
+		const result = await loadPretextDocumentOlder("n1", base, {
+			fetchPage: async () => page(6, 7, { hasPrev: true }, { messageVersion: 8 }),
+		});
+		expect(result.messageVersion).toBe(base.messageVersion);
+		expect(result.messages.map((item) => item.seq)).toEqual([6, 7, 8, 9]);
 	});
 
 	it("rejects an older page that overlaps the loaded window", async () => {
 		await expect(
 			loadPretextDocumentOlder("n1", base, {
 				// maxSeq 8 is not strictly older than oldestLoadedSeq 8.
-				fetchPage: async () =>
-					page(7, 8, { hasPrev: true }, { pruneBoundaryMessageId: "m-8", prunedPercent: 40 }),
+				fetchPage: async () => page(7, 8, { hasPrev: true }, {}),
 			}),
 		).rejects.toThrow("overlap");
 	});
@@ -244,8 +209,7 @@ describe("loadPretextDocumentOlder", () => {
 		await expect(
 			loadPretextDocumentOlder("n1", base, {
 				maxMessages: 3,
-				fetchPage: async () =>
-					page(4, 7, { hasPrev: true }, { pruneBoundaryMessageId: "m-8", prunedPercent: 40 }),
+				fetchPage: async () => page(4, 7, { hasPrev: true }, {}),
 			}),
 		).rejects.toThrow("exact-layout limit");
 	});
@@ -263,13 +227,8 @@ describe("loadPretextDocument (full fallback)", () => {
 					messageVersion: opts.messageVersion,
 				});
 				return opts.afterSeq != null && opts.afterSeq < 0
-					? page(0, 2, { hasNext: true }, { pruneBoundaryMessageId: "m-2", prunedPercent: 40 })
-					: page(
-							(opts.afterSeq ?? 0) + 1,
-							4,
-							{},
-							{ pruneBoundaryMessageId: "m-2", prunedPercent: 40 },
-						);
+					? page(0, 2, { hasNext: true }, {})
+					: page((opts.afterSeq ?? 0) + 1, 4, {}, {});
 			},
 		});
 		expect(requests).toEqual([
@@ -278,8 +237,6 @@ describe("loadPretextDocument (full fallback)", () => {
 		]);
 		expect(result.messages.map((item) => item.seq)).toEqual([0, 1, 2, 3, 4]);
 		expect(result.messageVersion).toBe(7);
-		expect(result.pruneBoundaryMessageId).toBe("m-2");
-		expect(result.prunedPercent).toBe(40);
 		expect(result.hasPrev).toBe(false);
 	});
 

@@ -57,7 +57,7 @@ export const STREAMING_MESSAGE_ID = "__streaming__";
  * vanishes.
  *
  * Length plus the newest id captures exactly the growth: an in-place patch changes
- * neither, while an append, a reload, an edit and a prune all change one of them.
+ * neither, while an append, a reload and an edit all change one of them.
  * Trailing synthetic rows are ignored so a published streaming row cannot mask the
  * persisted tail.
  */

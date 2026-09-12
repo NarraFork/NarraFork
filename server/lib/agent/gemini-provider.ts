@@ -1,4 +1,5 @@
 import { outputToText } from "@shared/agent-protocol/tool-output";
+import { modelTextFromContentBlocks } from "@shared/native-injection";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -751,10 +752,7 @@ export class GeminiProvider implements ProviderAdapter {
 				flushToolResults();
 
 				const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-				const textParts = content
-					.filter((b: { type: string }) => b.type === "text")
-					.map((b: { text: string }) => b.text);
-				const text = textParts.join("\n") || msg.contentText || "";
+				const text = modelTextFromContentBlocks(content) || msg.contentText || "";
 				// Gemini has no system role in contents; fold as a user turn.
 				if (text) history.push({ role: "user", parts: [{ text }] });
 			}

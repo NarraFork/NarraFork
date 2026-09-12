@@ -18,13 +18,10 @@
  * BOTH EVENT FAMILIES ARE OBSERVED, and that is not redundancy.
  * ------------------------------------------------------------
  * A pointer-only version of this module silently failed on the app's own side nav,
- * which resizes through `mousedown`/`mousemove`/`mouseup` (see
- * hooks/useResizableNav.ts) rather than pointer events. A physical mouse in a modern
- * browser does dispatch both families, so the pointer listener alone *should* have
- * covered it — but relying on that equivalence is exactly the kind of assumption
- * that produced the bug: any host (or synthetic/automated gesture) that emits only
- * mouse events becomes invisible, and the failure mode is silent (no error, just
- * jank returning).
+ * which then resized through `mousedown`/`mousemove`/`mouseup` (hooks/useResizableNav.ts
+ * has since moved to the pointer family, but the lesson stands): any host — or any
+ * synthetic/automated gesture — that emits only mouse events becomes invisible to a
+ * pointer-only tracker, and the failure mode is silent (no error, just jank returning).
  *
  * A real mouse press occupies two slots: its `pointerId` and MOUSE_ID. Normal
  * `mouseup` clears both. HTML5 drag/drop is DIFFERENT: the browser sends

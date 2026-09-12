@@ -5,6 +5,12 @@
  */
 export const FILE_CHANGE_EVIDENCE_VERSION = 2;
 
+export interface FileHistoryTarget {
+	deviceId: string;
+	pathFlavor: FileChangePathFlavor;
+	canonicalPath: string;
+}
+
 const MIB = 1024 * 1024;
 
 /** Shared admission budgets. Exceeding one never turns a prefix into complete evidence. */

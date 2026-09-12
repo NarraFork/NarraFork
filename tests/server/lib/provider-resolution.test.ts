@@ -147,7 +147,6 @@ describe("resolveProvider fallback order", () => {
 			expect(resolveProvider(model)).not.toBe("codex");
 		}
 	});
-
 });
 
 describe("getProvider fallback behavior", () => {
@@ -487,7 +486,6 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 			1_000_000,
 		);
 		expect(getContextThresholds("nug:antigravity:claude-opus-4-6-thinking", "nug")).toEqual({
-			pruneStart: 70,
 			compactStart: 75,
 		});
 	});
@@ -551,13 +549,12 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 			},
 		];
 		settings.agent.contextThresholds = {
-			standard: { pruneStart: 80, compactStart: 90 },
-			large: { pruneStart: 70, compactStart: 85 },
+			standard: { compactStart: 90 },
+			large: { compactStart: 85 },
 		};
 		// 成员是 1M 模型，应越过 LARGE_CONTEXT_BOUNDARY 落 large 档
 		expect(LARGE_CONTEXT_BOUNDARY).toBe(600_000);
 		expect(getContextThresholds("agglarge", "__agg__")).toEqual({
-			pruneStart: 70,
 			compactStart: 85,
 		});
 	});

@@ -222,7 +222,7 @@ export interface EventHooks {
 	onSnapshotAfter?: (toolUseId: string, toolName: string) => Promise<void> | void;
 	/** Completed tool result, after persistence and broadcast. */
 	onToolResult?: (event: Extract<AgentEvent, { type: "tool_result" }>) => Promise<void> | void;
-	/** Context usage event (prune + compact trigger) */
+	/** Context usage event (compact trigger) */
 	onContextUsage?: (percentage: number) => void;
 	/** Error cleanup (partial message removal, orphaned tool calls) */
 	onErrorCleanup?: (
@@ -2234,7 +2234,6 @@ export async function processEvent(
 				...(event.contextWindow != null && { contextWindow: event.contextWindow }),
 				...(event.isEstimated && { isEstimated: true }),
 				...(isSubagent && { isSubagent: true }),
-				pruneStart: activeThresholds.pruneStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].pruneStart,
 				compactStart:
 					activeThresholds.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].compactStart,
 			});
@@ -2245,13 +2244,12 @@ export async function processEvent(
 					...(event.promptTokens != null && { promptTokens: event.promptTokens }),
 					...(event.contextWindow != null && { contextWindow: event.contextWindow }),
 					...(event.isEstimated && { isEstimated: true }),
-					pruneStart: activeThresholds.pruneStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].pruneStart,
 					compactStart:
 						activeThresholds.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].compactStart,
 				},
 			});
 
-			// Main narrator: prune + compact trigger
+			// Main narrator: compact trigger
 			if (hooks?.onContextUsage) {
 				hooks.onContextUsage(event.percentage);
 			}

@@ -483,6 +483,72 @@ function isAlreadySatisfiedDropError(sqlite: Database, err: unknown, stmt: strin
 }
 
 /**
+ * Known historical index DDL superseded by a later table rebuild. Do not generalize
+ * this to every CREATE INDEX error: a missing required index must still abort startup.
+ * Source-built installs can have the final schema but missing historical hashes.
+ */
+const RETIRED_MIGRATION_INDEXES = [
+	{
+		name: "idx_narrators_prune_boundary_message",
+		table: "narrators",
+		column: "prune_boundary_message_id",
+	},
+] as const;
+
+function isRetiredIndexCreateError(
+	sqlite: Database,
+	err: unknown,
+	stmt: string,
+	laterMigrations: ReadonlyArray<{ sql: string[] }>,
+): boolean {
+	const missingColumn = missingColumnFromError(err);
+	if (missingColumn === null) return false;
+	// Only the original, non-unique, single-column index DDL is eligible.
+	const match = new RegExp(
+		String.raw`^\s*CREATE\s+INDEX\s+(${SQLITE_IDENTIFIER})\s+ON\s+(${SQLITE_IDENTIFIER})\s*\(\s*(${SQLITE_IDENTIFIER})\s*\)\s*;?\s*$`,
+		"i",
+	).exec(stmt);
+	if (!match) return false;
+	const name = normalizeObjectName(match[1]);
+	const table = normalizeObjectName(match[2]);
+	const column = normalizeObjectName(match[3]);
+	if (!sameObjectName(column, missingColumn)) return false;
+	if (
+		!RETIRED_MIGRATION_INDEXES.some(
+			(retired) =>
+				sameObjectName(retired.name, name) &&
+				sameObjectName(retired.table, table) &&
+				sameObjectName(retired.column, column),
+		)
+	)
+		return false;
+	if (!tableExists(sqlite, table) || columnExists(sqlite, table, column)) return false;
+
+	// Require the journal's later canonical retirement rebuild as evidence. A typo
+	// or an incomplete migration folder must never silently discard promised DDL.
+	return laterMigrations.some((migration) => {
+		if (!migrationDropsRealTables(migration.sql).some((target) => sameObjectName(target, table))) {
+			return false;
+		}
+		return migration.sql.some((statement) => {
+			const copy = CANONICAL_REBUILD_COPY.exec(statement);
+			if (
+				!copy ||
+				!sameObjectName(normalizeObjectName(copy[1]), `__new_${table}`) ||
+				!sameObjectName(normalizeObjectName(copy[4]), table)
+			)
+				return false;
+			return [copy[2], copy[3]].every(
+				(list) =>
+					!(list.match(new RegExp(SQLITE_IDENTIFIER, "g")) ?? []).some((identifier) =>
+						sameObjectName(normalizeObjectName(identifier), column),
+					),
+			);
+		});
+	});
+}
+
+/**
  * Apply pending migrations by hash-membership instead of Drizzle's `MAX(created_at)`
  * high-water mark. This replaces `migrate()` on the main path because the built-in SQLite
  * migrator (see `drizzle-orm/sqlite-core/dialect`) only compares the newest applied
@@ -596,6 +662,12 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 							// An index/column drop whose target is already gone: the statement's
 							// own goal is satisfied, verified against the live catalog.
 							if (isAlreadySatisfiedDropError(sqlite, err, stmt)) continue;
+							if (isRetiredIndexCreateError(sqlite, err, stmt, migrations.slice(index + 1))) {
+								logger.info("Skipped retired historical index DDL", {
+									folderMillis: migration.folderMillis,
+								});
+								continue;
+							}
 							// Scoped to the failing statement, not the whole migration: only a
 							// `DROP TABLE` whose own target is the table SQLite reports missing is
 							// harmless. Anything else failing with "no such table" means the

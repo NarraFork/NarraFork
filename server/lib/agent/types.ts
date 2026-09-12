@@ -75,9 +75,14 @@ export interface ToolUpdateExecutionLease {
 export interface ToolCallBinding {
 	readonly toolCallId: string;
 	readonly attempt: number;
+	/** Stable provenance segment for all file-changing calls in this execution lineage. */
+	readonly executionSegmentId?: string;
 }
 
 export interface ToolContext {
+	/** Eval-only audited Read bridge; never exposes the runner configuration. */
+	executeRead?: (input: Record<string, unknown>, signal: AbortSignal) => Promise<ToolResult>;
+	recheckAuthorization?: () => Promise<void>;
 	narratorId: string;
 	cwd: string;
 	signal: AbortSignal;
@@ -151,6 +156,8 @@ export interface ToolContext {
 	currentToolUseId?: string;
 	/** Durable identity of this execution; also retained by background tool closures. */
 	toolCallBinding?: ToolCallBinding;
+	/** Stable file-change provenance segment for this call and descendants. */
+	executionSegmentId?: string;
 	/** Context for bounded reflection loops, such as danger reflection review. */
 	reflectionLoop?: ReflectionLoopContext;
 	/**
@@ -828,6 +835,8 @@ export interface AgentConfig {
 	parentNarratorId?: string;
 	/** Parent Agent/Task/Send tool_use that spawned this subagent. */
 	parentToolUseId?: string;
+	/** Stable file-change provenance segment inherited by this run. */
+	executionSegmentId?: string;
 	maxTurns?: number;
 	planMode?: boolean;
 	/** Current narrator permission mode; used for relaxed-plan safety checks. */
@@ -910,6 +919,22 @@ export interface AgentConfig {
 	requireToolCallBinding?: boolean;
 	/** Object-keyed receipts populated by this loop's persistence barriers, not provider ids. */
 	toolExecutionBindings?: WeakMap<AgentToolUse, ToolCallBinding>;
+	onInternalReadAuthorization?: (
+		parentToolUseId: string,
+		binding: ToolCallBinding,
+	) => Promise<void>;
+	/** Internal Read rows share the parent's message without adding model history blocks. */
+	onInternalReadCreated?: (
+		parentToolUseId: string,
+		parentBinding: ToolCallBinding,
+		input: Record<string, unknown>,
+		sequence: number,
+	) => Promise<{ toolUseId: string; binding: ToolCallBinding }>;
+	onInternalReadCompleted?: (
+		toolUseId: string,
+		binding: ToolCallBinding,
+		result: ToolResult & { durationMs?: number },
+	) => Promise<void>;
 	/** Durable single-start claim immediately before tool.execute, after authorization. */
 	onToolExecutionStarting?: (
 		toolUseId: string,

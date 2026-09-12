@@ -51,6 +51,8 @@ scripts/lib/__tests__/*
 # Imported by tests/scripts/build-plugin.test.ts, so it has to be in the repo or
 # `bun test` fails on a missing module in a fresh clone.
 !scripts/build-plugin.ts
+# Standalone shared-runtime UI build pilot and its integration test entry.
+!scripts/build-plugin-ui.ts
 # The only way to produce the VS Code extension's .vsix. `scripts/*` above is a
 # blanket ignore, so without this line the script would silently be absent from a
 # fresh clone and `bun run package` inside vscode-extension/ would fail on a missing

@@ -39,6 +39,7 @@ await testI18n.init({
 });
 
 const { RenderLodCtx } = await import("../RenderLodCtx");
+const { NarratorPanelVisibilityProvider } = await import("../narrator-panel-visibility");
 const { AutoFollowScroll } = await import("../AutoFollowScroll");
 const { VListContentViewHost } = await import("./VListContentViewHost");
 type VListViewTarget = import("./vlist-content-view-target").VListViewTarget;
@@ -189,28 +190,31 @@ async function renderHost(opts: {
 	controls?: VListViewControls;
 	/** Render on a non-interactive surface (workspace preview). */
 	interactive?: boolean;
+	panelVisible?: boolean;
 }): Promise<void> {
 	await act(async () => {
 		root?.render(
 			<I18nextProvider i18n={testI18n}>
 				<MantineProvider>
 					<RenderLodCtx.Provider value={{ lod: 5, interactive: opts.interactive !== false }}>
-						<VListContentViewHost target={opts.target} controls={opts.controls}>
-							{(onReaderProgress) => {
-								readerProgress = onReaderProgress;
-								return (
-									<AutoFollowScroll
-										bodyId={opts.target?.id ?? "fixture-body"}
-										onReaderProgress={onReaderProgress}
-										viewportStyle={{ height: 200 }}
-									>
-										<div data-testid="body">
-											<div data-testid="nested-scrollbox">body</div>
-										</div>
-									</AutoFollowScroll>
-								);
-							}}
-						</VListContentViewHost>
+						<NarratorPanelVisibilityProvider value={opts.panelVisible !== false}>
+							<VListContentViewHost target={opts.target} controls={opts.controls}>
+								{(onReaderProgress) => {
+									readerProgress = onReaderProgress;
+									return (
+										<AutoFollowScroll
+											bodyId={opts.target?.id ?? "fixture-body"}
+											onReaderProgress={onReaderProgress}
+											viewportStyle={{ height: 200 }}
+										>
+											<div data-testid="body">
+												<div data-testid="nested-scrollbox">body</div>
+											</div>
+										</AutoFollowScroll>
+									);
+								}}
+							</VListContentViewHost>
+						</NarratorPanelVisibilityProvider>
 					</RenderLodCtx.Provider>
 				</MantineProvider>
 			</I18nextProvider>,
@@ -410,6 +414,13 @@ describe("VListContentViewHost — gating", () => {
 		expect(actionLabels()).toEqual([]);
 		await hover();
 		expect(actionLabels().length).toBeGreaterThan(0);
+	});
+
+	test("does not create a floating action bar for a hidden Dockview panel", async () => {
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls, panelVisible: false });
+		await hover();
+		expect(actionLabels()).toEqual([]);
 	});
 });
 

@@ -318,7 +318,7 @@ describe("retry empty placeholder cleanup", () => {
 		await expect(narratorMessageQueries.deleteEmptyRetryPlaceholder("n1", "s1")).rejects.toThrow();
 	});
 
-	test("refuses snapshot, compact and fork/prune boundaries without deleting history", async () => {
+	test("refuses snapshot, compact and fork boundaries without deleting history", async () => {
 		await seedNarrator();
 		await seedMessage({ id: "a1", seq: 1, role: "assistant" });
 		for (const [set, clear] of [
@@ -329,10 +329,6 @@ describe("retry empty placeholder cleanup", () => {
 			[
 				"UPDATE narrator_message_refs SET is_compact = 1",
 				"UPDATE narrator_message_refs SET is_compact = 0",
-			],
-			[
-				"UPDATE narrators SET prune_boundary_message_id = 'a1'",
-				"UPDATE narrators SET prune_boundary_message_id = NULL",
 			],
 			[
 				"UPDATE narrators SET fork_message_id = 'a1'",

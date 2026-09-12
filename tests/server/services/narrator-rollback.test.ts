@@ -145,14 +145,9 @@ async function simulateDeleteMessagesAfter(
 
 	if (refsToRemove.length === 0) return { deletedMessageIds: [] as string[] };
 
-	db.update(narrators)
-		.set({
-			...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
-			pruneBoundaryMessageId: null,
-			prunedPercent: null,
-		})
-		.where(eq(narrators.id, narratorId))
-		.run();
+	if (!opts?.preserveConversationId) {
+		db.update(narrators).set({ apiConversationId: null }).where(eq(narrators.id, narratorId)).run();
+	}
 
 	const refIds = refsToRemove.map((r) => r.id);
 	const messageIds = [...new Set(refsToRemove.map((r) => r.messageId))];

@@ -45,7 +45,6 @@ import { measureMarkdown } from "./measure/measure-markdown";
 import type { MediaBlockInput } from "./measure/measure-media";
 import { measureMedia } from "./measure/measure-media";
 import { measureMessageBubble } from "./measure/measure-message-bubble";
-import { measurePruneDivider } from "./measure/measure-misc";
 import {
 	type AskUserQuestionData,
 	type InlinePermissionData,
@@ -85,7 +84,6 @@ import { RenderAskInPassing } from "./render/RenderAskInPassing";
 import { RenderMarkdown } from "./render/RenderMarkdown";
 import { RenderMedia } from "./render/RenderMedia";
 import { RenderMessageBubble } from "./render/RenderMessageBubble";
-import { RenderPruneDivider } from "./render/RenderMisc";
 import { RenderAskUserQuestion, RenderInlinePermission } from "./render/RenderPermission";
 import { RenderPlanCard } from "./render/RenderPlanCard";
 import { RenderReasoning } from "./render/RenderReasoning";
@@ -923,13 +921,6 @@ const HARNESS_CASES: HarnessCase[] = [
 				isActive={false}
 			/>
 		),
-	),
-
-	// ── Prune divider ─────────────────────────────────────────────────────────
-	preview(
-		{ id: "prune-divider", label: "Prune divider @600", width: 600 },
-		(w) => measurePruneDivider(w),
-		(m) => <RenderPruneDivider measured={m} data={{ label: "Earlier context pruned" }} />,
 	),
 ];
 

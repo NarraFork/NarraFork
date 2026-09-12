@@ -11,7 +11,7 @@ const STD_INPUT_HANDLE = 0xfffffff6;
 const STD_OUTPUT_HANDLE = 0xfffffff5;
 const STD_ERROR_HANDLE = 0xfffffff4;
 
-type GetStdHandleFn = (stdHandle: number) => Pointer | null;
+type GetStdHandleFn = (stdHandle: number) => Pointer | bigint | null;
 type SetHandleInformationFn = (handle: Pointer, mask: number, flags: number) => number;
 
 let getStdHandle: GetStdHandleFn | null = null;
@@ -59,7 +59,10 @@ function clearInheritableWindowsHandles(phase: "after server bind" | "before spa
 		if (getStdHandle) {
 			for (const stdHandle of [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]) {
 				const handle = getStdHandle(stdHandle);
-				if (handle != null) stdHandles.add(handle);
+				// Only handles in the bounded scan can be visited; conversion is exact here.
+				if (handle != null && handle >= FIRST_NON_STD_HANDLE && handle <= MAX_HANDLE) {
+					stdHandles.add(Number(handle));
+				}
 			}
 		}
 

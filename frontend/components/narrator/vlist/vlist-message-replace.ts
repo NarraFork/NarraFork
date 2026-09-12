@@ -50,6 +50,14 @@ export interface ReplaceCandidate {
 	contentJson?: unknown;
 }
 
+/** Optional server alias for copy-on-write replacement events. */
+export interface ReplaceAliases {
+	oldMessageId?: unknown;
+	replacedMessageId?: unknown;
+	messageId?: unknown;
+	replacementMessageId?: unknown;
+}
+
 export type ReplaceRejection =
 	/** No usable id, so the target cannot be located. */
 	| "no-id"
@@ -110,13 +118,33 @@ function blocksEquivalent(a: unknown, b: unknown): boolean {
 export function replaceLoadedMessage<T extends ReplaceCandidate>(
 	loaded: readonly T[],
 	message: T,
+	aliases?: ReplaceAliases,
 ): ReplaceResult<T> {
 	const id = message.id;
 	if (typeof id !== "string" || id.length === 0) {
 		return { messages: loaded, replaced: false, reason: "no-id" };
 	}
-	const index = loaded.findIndex((existing) => existing.id === id);
+	const aliasIds = new Set<string>([id]);
+	for (const candidate of [
+		aliases?.oldMessageId,
+		aliases?.replacedMessageId,
+		aliases?.messageId,
+		aliases?.replacementMessageId,
+	]) {
+		if (typeof candidate === "string" && candidate.length > 0) aliasIds.add(candidate);
+	}
+	const index = loaded.findIndex(
+		(existing) => typeof existing.id === "string" && aliasIds.has(existing.id),
+	);
 	if (index < 0) return { messages: loaded, replaced: false, reason: "not-loaded" };
+
+	// COW replacements deliberately replace the entire row. The new id gives every
+	// block a fresh spec.key, so changed heights cannot hit the old row's cache.
+	if (loaded[index]?.id !== id) {
+		const messages = [...loaded];
+		messages[index] = message;
+		return { messages, replaced: true };
+	}
 
 	const previous = loaded[index];
 	const nextBlocks = message.contentJson;

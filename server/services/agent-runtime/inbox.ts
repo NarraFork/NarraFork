@@ -6,6 +6,7 @@ import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import type { Locale } from "../../lib/prompt-i18n";
 import type { AgentMessageDelivery } from "../agent-message-delivery";
+import { notifyAwaitWake } from "./await-wake";
 import { createMailboxStore, mailboxDedupeKey } from "./mailbox";
 import type { EligibleMailboxHead, MailboxClaim, MailboxKind, MailboxRow } from "./mailbox-types";
 import { getExecutionOwner, tryClaimExecution } from "./ownership";
@@ -164,6 +165,7 @@ export function enqueueInboxAgent(
 	delivery.deliveryId = result.delivery.deliveryId ?? undefined;
 	delivery.recipientRefId = result.delivery.recipientRefId ?? undefined;
 	delivery.revision = result.delivery.contentRevision;
+	if (result.status === "accepted") notifyAwaitWake(delivery.recipientNarratorId, "agent_message");
 	return result;
 }
 

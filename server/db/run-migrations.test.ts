@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -948,14 +948,37 @@ describe("narrator visibility backfill (real migration replay)", () => {
 	 */
 	async function databaseBeforeNarratorVisibility(): Promise<Database> {
 		const database = new Database(":memory:");
-		await runMigrations(database);
-		database.run("DROP INDEX IF EXISTS idx_narrators_visibility");
-		database.run("DROP INDEX IF EXISTS idx_narrators_owner");
-		database.run("ALTER TABLE narrators DROP COLUMN visibility");
-		database.run("ALTER TABLE narrators DROP COLUMN owner_user_id");
-		database.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [
-			NARRATOR_VISIBILITY_WHEN,
-		]);
+		// Replay the actual prefix, not a latest-schema database with columns removed.
+		// Later table rebuilds add real FKs on owner_user_id; stripping that column
+		// from today's schema is neither valid SQLite nor the pre-ACL upgrade state.
+		const source = new URL("../../drizzle/", import.meta.url);
+		const journal = JSON.parse(readFileSync(new URL("meta/_journal.json", source), "utf8")) as {
+			version: string;
+			dialect: string;
+			entries: Array<{ tag: string; when: number }>;
+		};
+		const targetIndex = journal.entries.findIndex(
+			(entry) => entry.when === NARRATOR_VISIBILITY_WHEN,
+		);
+		expect(targetIndex).toBeGreaterThan(0);
+		const prefix = journal.entries.slice(0, targetIndex);
+		const folder = mkdtempSync(join(tmpdir(), "narrafork-pre-acl-"));
+		try {
+			mkdirSync(join(folder, "meta"));
+			writeFileSync(
+				join(folder, "meta", "_journal.json"),
+				JSON.stringify({ ...journal, entries: prefix }),
+			);
+			for (const entry of prefix) {
+				writeFileSync(
+					join(folder, `${entry.tag}.sql`),
+					readFileSync(new URL(`${entry.tag}.sql`, source)),
+				);
+			}
+			applyPendingMigrationsByHash(database, folder);
+		} finally {
+			rmSync(folder, { recursive: true, force: true });
+		}
 		database.run("INSERT INTO narrators (id, created_at, updated_at) VALUES (?, ?, ?)", [
 			"narrator-legacy",
 			"now",
@@ -970,6 +993,17 @@ describe("narrator visibility backfill (real migration replay)", () => {
 		await runMigrations(sqlite);
 
 		expect(visibilityOf(sqlite, "narrator-legacy")).toBe("public");
+		expect(
+			(
+				sqlite.query("PRAGMA foreign_key_list(narrators)").all() as Array<{
+					from: string;
+					table: string;
+					on_delete: string;
+				}>
+			).some(
+				(fk) => fk.from === "owner_user_id" && fk.table === "users" && fk.on_delete === "SET NULL",
+			),
+		).toBe(true);
 	});
 
 	test("leaves the owner null so only admins can re-home a legacy narrator", async () => {
@@ -1227,7 +1261,11 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 		for (const folder of tempFolders.splice(0)) rmSync(folder, { recursive: true, force: true });
 	});
 
-	function migrationsFolderWith(tag: string, statements: readonly string[]): string {
+	function migrationsFolderWith(
+		tag: string,
+		statements: readonly string[],
+		laterStatements: readonly string[] = [],
+	): string {
 		const root = mkdtempSync(join(tmpdir(), "narrafork-drop-tolerance-"));
 		tempFolders.push(root);
 		const folder = join(root, "drizzle");
@@ -1237,10 +1275,29 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 			JSON.stringify({
 				version: "7",
 				dialect: "sqlite",
-				entries: [{ idx: 0, version: "6", when: 1_700_000_000_000, tag, breakpoints: true }],
+				entries: [
+					{ idx: 0, version: "6", when: 1_700_000_000_000, tag, breakpoints: true },
+					...(laterStatements.length
+						? [
+								{
+									idx: 1,
+									version: "6",
+									when: 1_700_000_000_001,
+									tag: `${tag}_retirement`,
+									breakpoints: true,
+								},
+							]
+						: []),
+				],
 			}),
 		);
 		writeFileSync(join(folder, `${tag}.sql`), statements.join("\n--> statement-breakpoint\n"));
+		if (laterStatements.length) {
+			writeFileSync(
+				join(folder, `${tag}_retirement.sql`),
+				laterStatements.join("\n--> statement-breakpoint\n"),
+			);
+		}
 		return folder;
 	}
 
@@ -1292,6 +1349,9 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 		sqlite = new Database(":memory:");
 		await runMigrations(sqlite);
 
+		sqlite.run(
+			"INSERT INTO narrators (id,title,created_at,updated_at) VALUES ('preserved','keep-title','now','now')",
+		);
 		// Worst case for a source-built machine: not a single recorded hash matches the
 		// released files, so every migration is replayed against its own end state.
 		sqlite.run("DELETE FROM __drizzle_migrations");
@@ -1299,10 +1359,87 @@ describe("already-satisfied drop tolerance (source-built upgrade holes)", () => 
 		await runMigrations(sqlite);
 
 		expect(stampedHashes(sqlite)).toBeGreaterThan(0);
+		expect(sqlite.prepare("SELECT title FROM narrators WHERE id='preserved'").get()).toEqual({
+			title: "keep-title",
+		});
+		expect(columnNames(sqlite, "narrators")).not.toContain("prune_boundary_message_id");
+		expect(
+			sqlite
+				.prepare("SELECT name FROM sqlite_master WHERE name='idx_narrators_prune_boundary_message'")
+				.get(),
+		).toBeNull();
 		expect(
 			sqlite.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='narrators'").get(),
 		).toBeTruthy();
 	});
+
+	const retiredIndexSql =
+		"CREATE INDEX `idx_narrators_prune_boundary_message` ON `narrators` (`prune_boundary_message_id`);";
+	const retirementSql = [
+		"CREATE TABLE `__new_narrators` (`id` text PRIMARY KEY, `title` text);",
+		"INSERT INTO `__new_narrators` (`id`, `title`) SELECT `id`, `title` FROM `narrators`;",
+		"DROP TABLE `narrators`;",
+		"ALTER TABLE `__new_narrators` RENAME TO `narrators`;",
+	];
+
+	test("heals a real 0093 hash hole after 0170 without restoring the retired column", async () => {
+		sqlite = new Database(":memory:");
+		await runMigrations(sqlite);
+		sqlite.run(
+			"INSERT INTO narrators (id,title,created_at,updated_at) VALUES ('kept','preserved','now','now')",
+		);
+		sqlite.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [1785085127123]);
+		const before = stampedHashes(sqlite);
+		await runMigrations(sqlite);
+		expect(stampedHashes(sqlite)).toBe(before + 1);
+		expect(sqlite.query("SELECT title FROM narrators WHERE id='kept'").get()).toEqual({
+			title: "preserved",
+		});
+		expect(columnNames(sqlite, "narrators")).not.toContain("prune_boundary_message_id");
+	});
+
+	test("skips only the retired index when the journal proves its later retirement", () => {
+		sqlite = new Database(":memory:");
+		sqlite.run("CREATE TABLE narrators (id text PRIMARY KEY, title text)");
+		sqlite.run("INSERT INTO narrators VALUES ('kept','preserved')");
+		const folder = migrationsFolderWith("0000_retired_index", [retiredIndexSql], retirementSql);
+		applyPendingMigrationsByHash(sqlite, folder);
+		expect(sqlite.prepare("SELECT * FROM narrators").all()).toEqual([
+			{ id: "kept", title: "preserved" },
+		]);
+		expect(stampedHashes(sqlite)).toBe(2);
+	});
+
+	test("does not skip even the known retired index without a later retirement migration", () => {
+		sqlite = new Database(":memory:");
+		sqlite.run("CREATE TABLE narrators (id text PRIMARY KEY, title text)");
+		const folder = migrationsFolderWith("0000_retired_without_proof", [retiredIndexSql]);
+		expect(() => applyPendingMigrationsByHash(sqlite as Database, folder)).toThrow(
+			/no such column/i,
+		);
+		expect(stampedHashes(sqlite)).toBe(0);
+	});
+
+	for (const indexSql of [
+		retiredIndexSql.replace("CREATE INDEX", "CREATE UNIQUE INDEX"),
+		retiredIndexSql.replace("idx_narrators_prune_boundary_message", "idx_required"),
+		retiredIndexSql.replace(
+			"(`prune_boundary_message_id`)",
+			"(`prune_boundary_message_id`, `title`)",
+		),
+		retiredIndexSql.replace("ON `narrators`", "ON `unrelated`"),
+	]) {
+		test(`does not forgive different index semantics: ${indexSql}`, () => {
+			sqlite = new Database(":memory:");
+			sqlite.run("CREATE TABLE narrators (id text PRIMARY KEY, title text)");
+			sqlite.run("CREATE TABLE unrelated (id text PRIMARY KEY, title text)");
+			const folder = migrationsFolderWith("0000_required_index", [indexSql], retirementSql);
+			expect(() => applyPendingMigrationsByHash(sqlite as Database, folder)).toThrow(
+				/no such column/i,
+			);
+			expect(stampedHashes(sqlite)).toBe(0);
+		});
+	}
 
 	test("skips a DROP INDEX whose index is already absent and keeps going", () => {
 		sqlite = new Database(":memory:");

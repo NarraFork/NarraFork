@@ -70,7 +70,6 @@ type Narrator = {
 	id: string;
 	message_version: number;
 	fork_message_id: string | null;
-	prune_boundary_message_id: string | null;
 };
 type Tool = {
 	id: string;
@@ -95,14 +94,6 @@ const ASSOCIATIONS: readonly AssociationRule[] = [
 		table: "narrators",
 		column: "fork_message_id",
 		index: "idx_narrators_fork_message",
-		target: "narrator_messages",
-		action: "null",
-		fk: "NO ACTION",
-	},
-	{
-		table: "narrators",
-		column: "prune_boundary_message_id",
-		index: "idx_narrators_prune_boundary_message",
 		target: "narrator_messages",
 		action: "null",
 		fk: "NO ACTION",
@@ -751,7 +742,7 @@ export class RevertHistoryCommitService {
 		for (const id of affected) {
 			const narrator = this.one<Narrator>(
 				work,
-				"SELECT id,message_version,fork_message_id,prune_boundary_message_id FROM narrators WHERE id=? LIMIT 1",
+				"SELECT id,message_version,fork_message_id FROM narrators WHERE id=? LIMIT 1",
 				[id],
 			);
 			if (narrator.message_version !== versions.get(id))
@@ -873,8 +864,6 @@ export class RevertHistoryCommitService {
 					{
 						...narratorPatches.get(id),
 						api_conversation_id: null,
-						prune_boundary_message_id: null,
-						pruned_percent: null,
 						message_version: narrator.message_version + 1,
 						updated_at: now,
 					},

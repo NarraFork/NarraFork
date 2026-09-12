@@ -74,8 +74,6 @@ export interface AgentSectionProps {
 	setDefaultStartInPlanMode: (v: boolean) => void;
 	defaultRelaxedPlan: boolean;
 	setDefaultRelaxedPlan: (v: boolean) => void;
-	defaultPruneEnabled: boolean;
-	setDefaultPruneEnabled: (v: boolean) => void;
 	planModeAllowInlinePlan: boolean;
 	setPlanModeAllowInlinePlan: (v: boolean) => void;
 	planReflectionAutoApprove: boolean;
@@ -129,19 +127,15 @@ export interface AgentSectionProps {
 		}>,
 	) => void;
 	contextThresholds: {
-		standard: { pruneStart: number; compactStart: number };
-		large: { pruneStart: number; compactStart: number };
+		standard: { compactStart: number };
+		large: { compactStart: number };
 	};
 	setContextThresholds: (v: {
-		standard: { pruneStart: number; compactStart: number };
-		large: { pruneStart: number; compactStart: number };
+		standard: { compactStart: number };
+		large: { compactStart: number };
 	}) => void;
 	autoCompactKeepPairs: number;
 	setAutoCompactKeepPairs: (v: number) => void;
-	autoCompactPruneThreshold: number;
-	setAutoCompactPruneThreshold: (v: number) => void;
-	minPruneRatio: number;
-	setMinPruneRatio: (v: number) => void;
 	queueDuringCompaction: boolean;
 	setQueueDuringCompaction: (v: boolean) => void;
 	globalWhitelistDirs: DirectoryWhitelistRuleInput[];
@@ -335,12 +329,6 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("defaultRelaxedPlanDesc")}
 				checked={props.defaultRelaxedPlan}
 				onChange={(e) => props.setDefaultRelaxedPlan(e.currentTarget.checked)}
-			/>
-			<Switch
-				label={t("defaultPruneEnabled")}
-				description={t("defaultPruneEnabledDesc")}
-				checked={props.defaultPruneEnabled}
-				onChange={(e) => props.setDefaultPruneEnabled(e.currentTarget.checked)}
 			/>
 			<Switch
 				label={t("planModeAllowInlinePlan")}
@@ -569,28 +557,6 @@ export function AgentSection(props: AgentSectionProps) {
 					max={25}
 					allowDecimal={false}
 				/>
-				<NumberInput
-					label={t("autoCompactPruneThreshold")}
-					description={t("autoCompactPruneThresholdDesc")}
-					value={props.autoCompactPruneThreshold}
-					onChange={(v) => props.setAutoCompactPruneThreshold(typeof v === "number" ? v : 80)}
-					min={0}
-					max={100}
-					allowDecimal={false}
-					suffix="%"
-				/>
-			</Group>
-			<Group grow>
-				<NumberInput
-					label={t("minPruneRatio")}
-					description={t("minPruneRatioDesc")}
-					value={props.minPruneRatio}
-					onChange={(v) => props.setMinPruneRatio(typeof v === "number" ? v : 30)}
-					min={0}
-					max={100}
-					allowDecimal={false}
-					suffix="%"
-				/>
 			</Group>
 			<Switch
 				label={t("queueDuringCompaction")}
@@ -602,24 +568,6 @@ export function AgentSection(props: AgentSectionProps) {
 				{t("contextThresholdsStandard")}
 			</Text>
 			<Group grow>
-				<NumberInput
-					label={t("pruneStart")}
-					description={t("pruneStartDesc")}
-					value={props.contextThresholds.standard.pruneStart}
-					onChange={(v) =>
-						props.setContextThresholds({
-							...props.contextThresholds,
-							standard: {
-								...props.contextThresholds.standard,
-								pruneStart:
-									typeof v === "number" ? v : DEFAULT_CONTEXT_THRESHOLDS.standard.pruneStart,
-							},
-						})
-					}
-					min={50}
-					max={100}
-					suffix="%"
-				/>
 				<NumberInput
 					label={t("compactStart")}
 					description={t("compactStartDesc")}
@@ -643,23 +591,6 @@ export function AgentSection(props: AgentSectionProps) {
 				{t("contextThresholdsLarge")}
 			</Text>
 			<Group grow>
-				<NumberInput
-					label={t("pruneStart")}
-					description={t("pruneStartDesc")}
-					value={props.contextThresholds.large.pruneStart}
-					onChange={(v) =>
-						props.setContextThresholds({
-							...props.contextThresholds,
-							large: {
-								...props.contextThresholds.large,
-								pruneStart: typeof v === "number" ? v : DEFAULT_CONTEXT_THRESHOLDS.large.pruneStart,
-							},
-						})
-					}
-					min={10}
-					max={100}
-					suffix="%"
-				/>
 				<NumberInput
 					label={t("compactStart")}
 					description={t("compactStartDesc")}

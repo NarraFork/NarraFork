@@ -108,7 +108,6 @@ function narrator(
 			title: id,
 			messageVersion: 7,
 			apiConversationId: "upstream",
-			prunedPercent: 30,
 			createdAt: time,
 			updatedAt: time,
 			...extra,
@@ -405,14 +404,8 @@ describe("fixed selector history application", () => {
 			expect(version()).toBe(8);
 			expect(version("fork")).toBe(7);
 			expect(result.affectedNarratorIds).toEqual(["root"]);
-			expect(
-				query(
-					"SELECT api_conversation_id,prune_boundary_message_id,pruned_percent FROM narrators WHERE id='root'",
-				)[0],
-			).toEqual({
+			expect(query("SELECT api_conversation_id FROM narrators WHERE id='root'")[0]).toEqual({
 				api_conversation_id: null,
-				prune_boundary_message_id: null,
-				pruned_percent: null,
 			});
 		});
 	test("after_block rewrites boundary and deletes following messages in the same apply", async () => {
@@ -475,7 +468,7 @@ describe("fixed selector history application", () => {
 	});
 	test("two selected shared tools cause ONE COW; preserve original owner, role, raw JSON and earliest execution origin", async () => {
 		const target = withTools(1, ["a", "b", "keep"]);
-		const ownerRef = ref(target.messageId, "fork", 1, { isCompact: 1, prunedPercent: 40 });
+		const ownerRef = ref(target.messageId, "fork", 1, { isCompact: 1 });
 		ref(target.messageId, "other", 1);
 		const kept = target.tools[2];
 		const op = operation(kept);
@@ -493,9 +486,7 @@ describe("fixed selector history application", () => {
 		sqlite
 			.query("UPDATE file_change_operations SET source_id=?,tool_call_id=? WHERE id=?")
 			.run("earliest-execution-pk", "earliest-execution-pk", op);
-		sqlite
-			.query("UPDATE narrators SET fork_message_id=?,prune_boundary_message_id=? WHERE id='fork'")
-			.run(target.messageId, target.messageId);
+		sqlite.query("UPDATE narrators SET fork_message_id=? WHERE id='fork'").run(target.messageId);
 		sqlite
 			.query(
 				"UPDATE narrator_messages SET role='disp',origin='system',original_content_json=?,turn_usage_json=? WHERE id=?",
@@ -553,9 +544,9 @@ describe("fixed selector history application", () => {
 		});
 		expect(count("file_change_operations")).toBe(1);
 		expect(count("file_change_effects")).toBe(1);
-		expect(
-			query("SELECT is_compact,pruned_percent FROM narrator_message_refs WHERE id=?", ownerRef)[0],
-		).toEqual({ is_compact: 1, pruned_percent: 40 });
+		expect(query("SELECT is_compact FROM narrator_message_refs WHERE id=?", ownerRef)[0]).toEqual({
+			is_compact: 1,
+		});
 		expect(
 			query<{ fork_message_id: string }>("SELECT fork_message_id FROM narrators WHERE id='fork'")[0]
 				.fork_message_id,
@@ -619,7 +610,7 @@ describe("fixed selector history application", () => {
 });
 
 describe("manifest associations and real FK behavior", () => {
-	test("explicit cascade rows, SET NULL and fork/prune pointers are included atomically", async () => {
+	test("explicit cascade rows, SET NULL and fork pointers are included atomically", async () => {
 		const target = withTools();
 		question(target.tools[0]);
 		db.insert(schema.narratorToolContinuations)
@@ -645,9 +636,7 @@ describe("manifest associations and real FK behavior", () => {
 				createdAt: time,
 			})
 			.run();
-		sqlite
-			.query("UPDATE narrators SET fork_message_id=?,prune_boundary_message_id=? WHERE id='fork'")
-			.run(target.messageId, target.messageId);
+		sqlite.query("UPDATE narrators SET fork_message_id=? WHERE id='fork'").run(target.messageId);
 		const selection = await select();
 		expect(selection.history.associations.map((r) => r.table)).toContain("narrator_patches");
 		apply(await service.prepare({ principal, fixedSelection: selection }));
@@ -659,9 +648,9 @@ describe("manifest associations and real FK behavior", () => {
 			"narrator_tool_continuations",
 		])
 			expect(count(table)).toBe(0);
-		expect(
-			query("SELECT fork_message_id,prune_boundary_message_id FROM narrators WHERE id='fork'")[0],
-		).toEqual({ fork_message_id: null, prune_boundary_message_id: null });
+		expect(query("SELECT fork_message_id FROM narrators WHERE id='fork'")[0]).toEqual({
+			fork_message_id: null,
+		});
 		expect(version()).toBe(8);
 		expect(version("fork")).toBe(8);
 	});

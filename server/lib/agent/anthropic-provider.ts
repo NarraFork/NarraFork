@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { outputToText } from "@shared/agent-protocol/tool-output";
+import { modelTextFromContentBlocks } from "@shared/native-injection";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
@@ -3178,10 +3179,7 @@ async function buildAnthropicHistory(
 			}
 
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const textParts = content
-				.filter((b: { type: string }) => b.type === "text")
-				.map((b: { text: string }) => b.text);
-			const text = textParts.join("\n") || msg.contentText || "";
+			const text = modelTextFromContentBlocks(content) || msg.contentText || "";
 
 			// Images attached to a past user turn have to be rebuilt from disk: the
 			// row stores an imageId, not the bytes. This branch previously read text
@@ -3219,14 +3217,7 @@ async function buildAnthropicHistory(
  */
 function dbMessageVisibleText(msg: DbMessage): string {
 	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	const texts = blocks
-		.filter((block): block is { type: string; text: string } => {
-			if (!block || typeof block !== "object") return false;
-			const candidate = block as { type?: unknown; text?: unknown };
-			return candidate.type === "text" && typeof candidate.text === "string";
-		})
-		.map((block) => block.text);
-	return texts.join("\n") || msg.contentText || "";
+	return modelTextFromContentBlocks(blocks) || msg.contentText || "";
 }
 
 /**

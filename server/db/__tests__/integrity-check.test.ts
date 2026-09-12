@@ -662,6 +662,8 @@ describe("ensureFts clean-shutdown detection", () => {
 		db.run("CREATE TABLE chapters (rowid integer primary key, title text, description text)");
 		db.run("CREATE TABLE narrators (rowid integer primary key, title text)");
 		db.run("CREATE TABLE narrator_messages (rowid integer primary key, content_text text)");
+		// A clean restart already has its FTS tables and sync triggers installed.
+		ensureFts(db, { wasClean: true });
 		return db;
 	}
 

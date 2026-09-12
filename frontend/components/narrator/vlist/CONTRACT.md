@@ -170,7 +170,7 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 进气泡（`FRAMED_SYSTEM_CARDS`）：`merge_summary`、`review_feedback`、`spec_continuation`、`spec_blocked_continuation`。
 
 **刻意排除**，三类各有理由：
-- `compact` / `segment_compact` / prune 分隔线 —— 关于对话的元信息（"这里之后历史被截断"），不是谁说的话。
+- `compact` / `segment_compact` —— 关于对话的元信息（"这里之后历史被截断"），不是谁说的话。
 - `spec_fork_carryover` / `spec_context_cleared` / `spec_goal_added` / `error` —— **带 live button**。shell 靠 `kind === "system-text"` 匹配来注入 `specCarryoverActions` / `errorNoticeActions`，改路由会让每个按钮静默失去 handler：照样画出来，点了没反应。**死按钮比缺一行说话人更糟**。要框它们得先让 action 注入能穿透到嵌套 payload。
 - `bash_command` / `tool_loaded` / `tool_unloaded` —— 用户**自己**动作的回执，归给另一个说话人是反的。
 - `ask_in_passing` / `subagent_recovery` / permission / question 表单 —— 是要**操作**的控件，不是读完的话；混成一个视觉语言会让"读消息"和"填表单"分不清。
@@ -232,7 +232,6 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
 - effectiveExpanded：lodExempt 恒展开；**L5 默认展开、显式折叠（`userCollapsed`）时折叠**（与 `effectiveOpened` 同一语义，见 §4 那条 ⚠️）；L4 近卡随 opened、旧卡折叠；L3 折叠。
 
 ### 其它列表级元素
-- prune-divider（Divider + label）🟢
 - AskUserQuestionBanner（Alert，**高度强动态**）：Alert padding + Stack gap md × 问题数 + 每问题(header🔴 + 选项Σ(label+desc)🔴 + Textarea 1-3行) + 倒计时行(条件) + 按钮行30。只读模式去掉输入/按钮。无折叠、不读 LOD。
 
 ## 4.5 Live patch —— 由服务端事件驱动的高度变更（新增来源）

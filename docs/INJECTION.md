@@ -296,21 +296,23 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 
 ---
 
-## 8. 尚未迁移到这个机制的生产者
+## 8. 结构化系统 block 的落库现状
 
-以下仍直接调 `narratorService.persistSystemMessage`。它们**不是 bug**——都是带自己结构化卡片 block 的 `schedule: "none"` 等价物，只是没有走统一入口，因此不享有 `role`/`schedule` 分离和读者向 body 投影：
+结构化系统卡片现在直接在自身 block 上保存 `modelText`，不再依赖旁边的 `text` 副本：
 
-| 位置 | block 类型 |
+| producer | block 类型 |
 |---|---|
-| `review-event-handler.ts` | `review_feedback` |
-| `merge-summary-service.ts` | `merge_summary` |
+| `narrator-session.ts`（两处） | `spec_blocked_continuation`、`spec_continuation` |
+| `agent-runtime/orchestrator.ts`（知识 point A） | `knowledge_hint` |
 | `container-event-handler.ts` | `container_ready` |
 | `browser-session-recovery.ts` | `browser_session_lost` |
-| `narrator-session.ts`（两处） | `spec_blocked_continuation`、`spec_continuation` |
-| `routes/narrators.ts`（三处） | 纯文本（浏览器 trace 被用户中止等） |
-| `narrator-session.ts`（知识注入 point A） | `knowledge_hint` |
+| `merge-summary-service.ts` | `merge_summary` |
 
-**知识注入 point A** 值得单独说：用户消息触发的知识注入走 `persistSystemMessage` + 自己的 `createKnowledgeHintBlock`，而 point B（工具输出触发）走 `queueLoopInjection` + `deliverInjection`。同一个概念两条路，是当前最值得收敛的一处不一致。
+`persistSystemMessage` 统一识别这些 native context block，并将其自身的 `modelText` 写入 `contentText`。历史 `[text, structuredBlock]` 行由共享 logical-block mapper 兼容读取和删除，因此删除外壳不会留下可重新投影的灰色卡片。
+
+三处路由级纯文本通知仍直接写普通 `text` block；它们没有第二个结构化投影，不需要再套 injection。compact、review 和权限/问题控制卡片也保持自己的生命周期与 renderer，不被错误合并为 injection。
+
+知识注入 point A 与 point B 现在都使用自包含模型投影；point A 仍在 durable message 成功后记录去重事件，避免消息写入失败时污染知识注入账本。
 
 ---
 

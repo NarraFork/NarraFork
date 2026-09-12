@@ -649,7 +649,6 @@ export async function loadSubagentHistory(
 	narratorId: string,
 	model: string,
 	provider: string,
-	pruneBoundaryId?: string | null,
 	currentInput?: string,
 ): Promise<import("../lib/agent/provider").BuiltHistory> {
 	return buildRuntimeHistory({
@@ -657,7 +656,6 @@ export async function loadSubagentHistory(
 		model,
 		provider,
 		profile: "subagent",
-		pruneBoundaryId,
 		currentInput,
 	});
 }
@@ -805,7 +803,6 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 	model: string;
 	provider: string;
 	cwd: string;
-	pruneBoundaryId?: string | null;
 	locale?: string;
 }): Promise<{
 	prompt: string;
@@ -840,7 +837,6 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 					opts.narratorId,
 					opts.model,
 					opts.provider,
-					opts.pruneBoundaryId,
 					text ?? undefined,
 				);
 				return {
@@ -860,7 +856,6 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 		if (!claimed) return null;
 		const { buffered, userMsg } = claimed;
 		const { narratorId, parentNarratorId, toolUseId, model, provider } = opts;
-		let { pruneBoundaryId } = opts;
 		// Point A for a message that could NOT be folded into the running pass (attachments, a
 		// pre-prompt command, or a different acting user). Scanned here rather than at the
 		// three call sites — the executor's pass restart, the runner's post-interrupt drain and
@@ -878,21 +873,11 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 			locale: opts.locale,
 		});
 
-		if (pruneBoundaryId === undefined) {
-			const freshNarrator = await narratorService.getById(narratorId);
-			pruneBoundaryId = freshNarrator.pruneBoundaryMessageId ?? null;
-		}
 		const modelText = projectFileReferenceText(
 			userMsg.contentText ?? buffered.text,
 			buffered.fileReferences,
 		);
-		const rebuilt = await loadSubagentHistory(
-			narratorId,
-			model,
-			provider,
-			pruneBoundaryId,
-			modelText,
-		);
+		const rebuilt = await loadSubagentHistory(narratorId, model, provider, modelText);
 		// Match the primary loop's currentTurnText: only prepend context the builder
 		// extracted. Official Anthropic keeps sys as system history, so replaying the
 		// persisted hint itself here would inject it twice.

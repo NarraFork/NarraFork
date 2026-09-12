@@ -25,8 +25,6 @@ export interface PretextDocumentLoadOptions {
 export interface PretextDocumentInput {
 	messages: TreeMessage[];
 	messageVersion: number;
-	pruneBoundaryMessageId: string | null;
-	prunedPercent: number | null;
 	/** Smallest loaded top-level seq; the `beforeSeq` cursor for the next older page. */
 	oldestLoadedSeq: number | null;
 	/** More (older) top-level messages exist above the loaded window. */
@@ -107,8 +105,6 @@ export async function loadPretextDocumentTail(
 	return {
 		messages: [...page.messages],
 		messageVersion: page.messageVersion,
-		pruneBoundaryMessageId: page.pruneBoundaryMessageId ?? null,
-		prunedPercent: page.prunedPercent ?? null,
 		oldestLoadedSeq: oldestSeqOf(page.messages),
 		hasPrev: page.hasPrev,
 	};
@@ -131,8 +127,8 @@ export async function loadPretextDocumentTail(
  * the canvas kept rendering the pages it already had.
  *
  * The version was never the property that mattered here. Prepending is safe as long
- * as the incoming page is STRICTLY OLDER than what is loaded and the prune metadata
- * still describes the same document — both checked below. Atomicity of the page
+ * as the incoming page is STRICTLY OLDER than what is loaded, checked below.
+ * Atomicity of the page
  * itself is enforced server-side (it re-checks its own version mid-build), so a page
  * spanning a mutation is still rejected there.
  *
@@ -152,11 +148,6 @@ export async function loadPretextDocumentOlder(
 		beforeSeq: previous.oldestLoadedSeq,
 		limit: pageSize,
 	});
-	if (
-		(page.pruneBoundaryMessageId ?? null) !== previous.pruneBoundaryMessageId ||
-		(page.prunedPercent ?? null) !== previous.prunedPercent
-	)
-		throw new Error("pretext document prune metadata changed during pagination");
 	if (page.messages.length === 0) {
 		// The server has no older rows after all; close the upward window.
 		return { ...previous, hasPrev: false };
@@ -200,8 +191,6 @@ export async function loadPretextDocument(
 	const messages: TreeMessage[] = [];
 	let fromSeq: number | undefined = FROM_START_AFTER_SEQ;
 	let messageVersion: number | undefined;
-	let pruneBoundaryMessageId: string | null = null;
-	let prunedPercent: number | null = null;
 	let previousMaxSeq: number | undefined;
 	for (;;) {
 		const page = await fetchPage(narratorId, {
@@ -209,21 +198,12 @@ export async function loadPretextDocument(
 			limit: pageSize,
 			...(messageVersion == null ? {} : { messageVersion }),
 		});
-		const pagePruneBoundaryMessageId = page.pruneBoundaryMessageId ?? null;
-		const pagePrunedPercent = page.prunedPercent ?? null;
 		if (messageVersion == null) {
 			assertValidMessageVersion(page.messageVersion);
 			messageVersion = page.messageVersion;
-			pruneBoundaryMessageId = pagePruneBoundaryMessageId;
-			prunedPercent = pagePrunedPercent;
 		} else {
 			if (page.messageVersion !== messageVersion)
 				throw new Error("pretext document changed during pagination");
-			if (
-				pagePruneBoundaryMessageId !== pruneBoundaryMessageId ||
-				pagePrunedPercent !== prunedPercent
-			)
-				throw new Error("pretext document prune metadata changed during pagination");
 		}
 		if (page.messages.length === 0) break;
 		const pageMinSeq = page.minSeq;
@@ -245,8 +225,6 @@ export async function loadPretextDocument(
 	return {
 		messages,
 		messageVersion: messageVersion ?? 0,
-		pruneBoundaryMessageId,
-		prunedPercent,
 		oldestLoadedSeq: oldestSeqOf(messages),
 		hasPrev: false,
 	};

@@ -9,6 +9,7 @@ import { chapters, containerInstances, narrators, projects } from "../db/schema"
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { buildProxyUrl } from "./container-proxy";
 import { narratorService } from "./narrator-service";
 import { loadOptionalTool } from "./narrator-session";
@@ -135,16 +136,30 @@ export function initContainerEventHandler(): void {
 				});
 			}
 
-			// 4. Inject system message with container URLs into narrator history
-			//    (uses role="user" so the model sees it in context)
+			// 4. Persist the system message with container URLs into narrator history.
 			const text = buildContainerReadyText(info, browserLoaded);
-			await narratorService.persistSystemMessage(narrator.id, text, [
+			const msg = await narratorService.persistSystemMessage(narrator.id, text, [
 				{
 					type: "container_ready",
 					services: info.services,
 					browserAutoEnabled: browserLoaded,
+					modelText: text,
 				},
 			]);
+			broadcastToNarrator(narrator.id, {
+				type: "message",
+				narratorId: narrator.id,
+				message: {
+					id: msg.id,
+					narratorId: narrator.id,
+					role: msg.role,
+					contentJson: msg.contentJson,
+					contentText: msg.contentText,
+					createdAt: msg.createdAt,
+					seq: msg.seq,
+					children: [],
+				},
+			});
 
 			logger.info("Container ready notification injected", {
 				narratorId: narrator.id,

@@ -88,8 +88,6 @@ function page(messages: readonly TreeMessage[]) {
 	return {
 		messages: [...messages],
 		messageVersion: 7,
-		pruneBoundaryMessageId: null,
-		prunedPercent: null,
 		hasPrev: false,
 		maxSeq: messages.length - 1,
 	};

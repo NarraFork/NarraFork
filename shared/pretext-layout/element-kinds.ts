@@ -35,5 +35,4 @@ export type VListElementKind =
 	| "ask-user-question"
 	| "inline-permission"
 	| "subagent-card"
-	| "prune-divider"
 	| "turn-usage";

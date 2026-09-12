@@ -120,6 +120,71 @@ describe("auto-continuation defaults", () => {
 });
 
 describe("stripObsoleteSettingsKeys", () => {
+	it("removes pruning settings while preserving custom compaction thresholds", () => {
+		const value: Record<string, unknown> = {
+			agent: {
+				defaultPruneEnabled: true,
+				minPruneRatio: 50,
+				autoCompactPruneThreshold: 80,
+				contextThresholds: {
+					standard: { pruneStart: 90, compactStart: 92 },
+					large: { pruneStart: 70, compactStart: 82 },
+				},
+			},
+		};
+		expect(stripObsoleteSettingsKeys(value)).toBe(true);
+		expect(value.agent).toEqual({
+			contextThresholds: { standard: { compactStart: 92 }, large: { compactStart: 82 } },
+		});
+		expect(stripObsoleteSettingsKeys(value)).toBe(false);
+	});
+
+	it("loads and saves old files without reviving pruning settings", () => {
+		const path = resolve(getNarraforkHome(), "settings.json");
+		const original = readFileSync(path, "utf8");
+		const snapshot = structuredClone(liveSettings);
+		const raw = getDefaults();
+		const legacyAgent = {
+			...raw.agent,
+			defaultPruneEnabled: true,
+			minPruneRatio: 50,
+			autoCompactPruneThreshold: 80,
+			contextThresholds: {
+				standard: { pruneStart: 90, compactStart: 91 },
+				large: { pruneStart: 70, compactStart: 81 },
+			},
+		};
+		try {
+			writeFileSync(path, JSON.stringify({ ...raw, agent: legacyAgent }));
+			for (const save of [false, true]) {
+				if (save) saveSettings({ ...raw, agent: structuredClone(legacyAgent) });
+				const loaded = reloadSettings();
+				expect(loaded.agent.contextThresholds).toEqual({
+					standard: { compactStart: 91 },
+					large: { compactStart: 81 },
+				});
+				const persisted = JSON.parse(readFileSync(path, "utf8"));
+				for (const agent of [loaded.agent, persisted.agent]) {
+					expect(agent).not.toHaveProperty("defaultPruneEnabled");
+					expect(agent).not.toHaveProperty("minPruneRatio");
+					expect(agent).not.toHaveProperty("autoCompactPruneThreshold");
+					expect(agent.contextThresholds.standard).not.toHaveProperty("pruneStart");
+					expect(agent.contextThresholds.large).not.toHaveProperty("pruneStart");
+				}
+			}
+		} finally {
+			saveSettings(snapshot);
+			writeFileSync(path, original);
+		}
+	});
+
+	it("defaults expose compaction thresholds only", () => {
+		expect(getDefaults().agent.contextThresholds).toEqual({
+			standard: { compactStart: 95 },
+			large: { compactStart: 75 },
+		});
+	});
+
 		const value: Record<string, unknown> = {
 			customApiProviders: [],
 			nugProviders: [],

@@ -2,6 +2,11 @@ import { parseCompactMessageBlock } from "@shared/compact-message";
 import { type FileReferenceDisplay, fileReferenceDisplay } from "@shared/file-reference";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
+import {
+	contextBlockViews,
+	injectionBlockViews,
+	modelTextFromContentBlocks,
+} from "@shared/native-injection";
 import { projectToolIO, TOOL_IO_BUDGETS } from "@shared/pretext-layout/tool-io-projection";
 import {
 	isDanglingReasoningOnlyAssistantMessage,
@@ -578,8 +583,17 @@ function planBlockDeletions(
 			}
 		}
 		const selected = new Set(indices);
+		const injectionViews = injectionBlockViews(blocks);
+		const contextViews = contextBlockViews(blocks);
+		for (const index of indices) {
+			const view =
+				injectionViews.find((candidate) => candidate.blockIndex === index) ??
+				contextViews.find((candidate) => candidate.blockIndex === index);
+			for (const sourceIndex of view?.sourceIndices ?? []) selected.add(sourceIndex);
+		}
 		const remaining = blocks.filter((_, index) => !selected.has(index));
-		const removed = indices.map((index) => blocks[index]);
+		const removed = [...selected].map((index) => blocks[index]);
+
 		const removedToolIds = new Set(
 			removed
 				.filter(
@@ -712,7 +726,6 @@ function collectHistoryDeleteAssociations(
 	// deleteOrphanedMessages. Otherwise a small selection can hide an unbounded tx.
 	return [
 		{ table: narrators, column: narrators.forkMessageId, ids: deletedMessageIds },
-		{ table: narrators, column: narrators.pruneBoundaryMessageId, ids: deletedMessageIds },
 		{ table: narratorPatches, column: narratorPatches.messageId, ids: deletedMessageIds },
 		{ table: apiRequests, column: apiRequests.messageId, ids: deletedMessageIds },
 		{
@@ -752,7 +765,7 @@ function applyBlockDeletionTx(
 	narratorId: string,
 	plan: BlockDeletionPlan,
 	opts?: BlockDeleteOptions,
-): void {
+): string | null {
 	const { message, ref, remaining, removed, isShared } = plan;
 	if (plan.checkpointToolCalls.length > 0) {
 		insertFileHistoryCheckpoints(tx, narratorId, [
@@ -767,12 +780,9 @@ function applyBlockDeletionTx(
 	if (remaining.length === 0) {
 		deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, ref.id)).run();
 		if (!isShared) deleteOrphanedMessages(tx, [message.id]);
-		return;
+		return null;
 	}
-	const contentText = remaining
-		.filter((block) => block.type === "text")
-		.map((block) => block.text ?? "")
-		.join("\n");
+	const contentText = modelTextFromContentBlocks(remaining);
 	const patch = {
 		contentJson: remaining,
 		contentText: contentText || null,
@@ -816,6 +826,7 @@ function applyBlockDeletionTx(
 			.set({ forkMessageId: newId })
 			.where(and(eq(narrators.id, narratorId), eq(narrators.forkMessageId, message.id)))
 			.run();
+		return newId;
 	} else {
 		tx.update(narratorMessages).set(patch).where(eq(narratorMessages.id, message.id)).run();
 		updateRecipientMessageRef(tx, narratorId, ref.id, {
@@ -832,6 +843,7 @@ function applyBlockDeletionTx(
 				)
 				.run();
 		}
+		return message.id;
 	}
 }
 
@@ -881,6 +893,10 @@ async function deleteBlockSelection(
 			);
 		}
 	}
+	const updatedMessageIds: Array<{ id: string; oldId?: string; seq: number }> = [];
+	const removedRefMessageIds = planned.plans
+		.filter((plan) => plan.remaining.length === 0)
+		.map((plan) => plan.message.id);
 	const mutate = () =>
 		db.transaction((tx) => {
 			// Recheck refs, content, tool evidence and narrator version after async rollback.
@@ -894,13 +910,19 @@ async function deleteBlockSelection(
 			}
 			insertFileHistoryCheckpoints(tx, narratorId, planned.derived.checkpoints);
 			deleteOrphanedMessages(tx, planned.derived.messageIds);
-			for (const plan of planned.plans) applyBlockDeletionTx(tx, narratorId, plan, opts);
+			for (const plan of planned.plans) {
+				const updatedId = applyBlockDeletionTx(tx, narratorId, plan, opts);
+				if (updatedId)
+					updatedMessageIds.push({
+						id: updatedId,
+						...(updatedId !== plan.message.id ? { oldId: plan.message.id } : {}),
+						seq: plan.ref.seq,
+					});
+			}
 			if (!opts?.skipNarratorUpdate) {
 				tx.update(narrators)
 					.set({
 						...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
-						pruneBoundaryMessageId: null,
-						prunedPercent: null,
 						messageVersion: sql`${narrators.messageVersion} + 1`,
 						updatedAt: new Date().toISOString(),
 					})
@@ -910,6 +932,42 @@ async function deleteBlockSelection(
 		});
 	if (snapshotRevert) await commitSnapshotRevert(snapshotRevert, mutate);
 	else mutate();
+
+	// Persisted block edits must reach already-open narrators. Broadcast the exact
+	// post-COW message row; a refresh remains the source of truth, while this keeps
+	// the live view from retaining the pre-delete projection.
+	try {
+		const uniqueUpdated = [...new Map(updatedMessageIds.map((item) => [item.id, item])).values()];
+		for (const item of uniqueUpdated) {
+			const message = db.query.narratorMessages
+				.findFirst({
+					where: eq(narratorMessages.id, item.id),
+					with: { toolCalls: true },
+				})
+				.sync();
+			if (!message) throw new Error("updated message disappeared after commit");
+			broadcastToNarrator(narratorId, {
+				type: "message_updated",
+				narratorId,
+				message: { ...message, seq: item.seq },
+				...(item.oldId ? { oldMessageId: item.oldId, replacedMessageId: item.oldId } : {}),
+			});
+		}
+	} catch (error) {
+		logger.warn("history deletion broadcast projection failed; requesting bounded reload", {
+			narratorId,
+			error,
+		});
+		broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
+	}
+	const deletedMessageIds = [...new Set([...planned.derived.messageIds, ...removedRefMessageIds])];
+	if (deletedMessageIds.length > 0) {
+		broadcastToNarrator(narratorId, {
+			type: "messages_deleted",
+			narratorId,
+			deletedMessageIds,
+		});
+	}
 	const results = planned.plans.flatMap(({ message, indices, remaining }) =>
 		indices.map((blockIndex) => ({
 			messageId: message.id,
@@ -955,14 +1013,11 @@ function copySharedCompactMessageTx(
 	const narrator = tx.query.narrators
 		.findFirst({
 			where: eq(narrators.id, narratorId),
-			columns: { forkMessageId: true, pruneBoundaryMessageId: true },
+			columns: { forkMessageId: true },
 		})
 		.sync();
 	const narratorUpdates: Partial<typeof narrators.$inferInsert> = {};
 	if (narrator?.forkMessageId === message.id) narratorUpdates.forkMessageId = newMessageId;
-	if (narrator?.pruneBoundaryMessageId === message.id) {
-		narratorUpdates.pruneBoundaryMessageId = newMessageId;
-	}
 	if (Object.keys(narratorUpdates).length > 0) {
 		tx.update(narrators).set(narratorUpdates).where(eq(narrators.id, narratorId)).run();
 	}
@@ -1047,15 +1102,11 @@ function deleteOutputlessAssistantMessage(
 			const boundary = tx.query.narrators
 				.findFirst({
 					where: eq(narrators.id, narratorId),
-					columns: { forkMessageId: true, pruneBoundaryMessageId: true },
+					columns: { forkMessageId: true },
 				})
 				.sync();
 			// Other narrators' shared refs retain the original record below.
-			if (
-				patch ||
-				boundary?.forkMessageId === messageId ||
-				boundary?.pruneBoundaryMessageId === messageId
-			)
+			if (patch || boundary?.forkMessageId === messageId)
 				throw new ValidationError("Retry placeholder has file or history boundaries");
 		}
 		assertNoRunningCompactRefsTx(tx, narratorId, [ref.id]);
@@ -1185,10 +1236,6 @@ function deleteOrphanedMessages(
 	tx.update(narrators)
 		.set({ forkMessageId: null })
 		.where(inArray(narrators.forkMessageId, orphanIds))
-		.run();
-	tx.update(narrators)
-		.set({ pruneBoundaryMessageId: null })
-		.where(inArray(narrators.pruneBoundaryMessageId, orphanIds))
 		.run();
 
 	tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds)).run();
@@ -1366,8 +1413,6 @@ async function deleteMessageRange(
 		tx.update(narrators)
 			.set({
 				...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
-				pruneBoundaryMessageId: null,
-				prunedPercent: null,
 				messageVersion: sql`${narrators.messageVersion} + 1`,
 				updatedAt: new Date().toISOString(),
 			})
@@ -4136,8 +4181,6 @@ const narratorMessageQueriesUnlocked = {
 						? {
 								contextSummary: null,
 								apiConversationId: null,
-								pruneBoundaryMessageId: null,
-								prunedPercent: null,
 							}
 						: {}),
 					messageVersion: sql`${narrators.messageVersion} + 1`,

@@ -44,7 +44,6 @@ const STUB_LABELS = {
 	askInPassing: { tag: "askInPassing" },
 	sidecar: { tag: "sidecar" },
 	planCard: "plan",
-	pruneDivider: "pruned",
 } as unknown as VListRenderLabels;
 
 /**
@@ -74,7 +73,6 @@ const NO_LABELS_KINDS: Record<string, string> = {
 	// ctx.labels; the adapter → registry test below pins that separate route.
 	"communication-bubble": "adapter injects data.labels; registry forwards extra.data",
 	"tool-call-group": "shell injects extra.label + extra.statusLabel",
-	"prune-divider": "shell injects extra.fallbackLabel",
 	// Count lines carry adapter-composed header text as DATA (it embeds the live
 	// count), mapped onto render labels by resolveRenderExtra.
 	"tool-run-count": "header text arrives as adapter data",

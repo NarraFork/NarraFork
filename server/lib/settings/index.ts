@@ -48,7 +48,6 @@ export {
 	anthropicProviderPrefix,
 	buildAggModelValue,
 	DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
-	DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD,
 	DEFAULT_CONTEXT_THRESHOLDS,
 	expandAllowedPoolForDisplay,
 	FOLLOW_DEFAULT_MODEL,
@@ -57,7 +56,6 @@ export {
 	getAggregation,
 	getAnthropicProviderConfig,
 	getAutoCompactKeepPairs,
-	getAutoCompactPruneThreshold,
 	getBuiltinCodexModels,
 	getBuiltinModelContextWindows,
 	getContextThresholds,
@@ -128,6 +126,26 @@ export function stripObsoleteSettingsKeys(settings: Record<string, unknown>): bo
 		if (key in settings) {
 			delete settings[key];
 			changed = true;
+		}
+	}
+	const agent = settings.agent;
+	if (agent && typeof agent === "object" && !Array.isArray(agent)) {
+		const values = agent as Record<string, unknown>;
+		for (const key of ["defaultPruneEnabled", "minPruneRatio", "autoCompactPruneThreshold"]) {
+			if (key in values) {
+				delete values[key];
+				changed = true;
+			}
+		}
+		const thresholds = values.contextThresholds;
+		if (thresholds && typeof thresholds === "object" && !Array.isArray(thresholds)) {
+			for (const tier of ["standard", "large"]) {
+				const value = (thresholds as Record<string, unknown>)[tier];
+				if (value && typeof value === "object" && "pruneStart" in value) {
+					delete (value as Record<string, unknown>).pruneStart;
+					changed = true;
+				}
+			}
 		}
 	}
 	return changed;

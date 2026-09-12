@@ -141,7 +141,6 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 			permissionMode: gwPermMode,
 			messageCount: 0,
 			totalCostUsd: 0,
-			pruneEnabled: settings.agent.defaultPruneEnabled,
 			// webhook 无人值守路径同样显式关闭 priority，不跟随用户默认值。
 			fastModeOverride: "off",
 			fastMode: false,

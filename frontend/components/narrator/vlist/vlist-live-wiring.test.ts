@@ -462,8 +462,6 @@ describe("live patches vs the structural reload", () => {
 				} as unknown as Msg,
 			],
 			messageVersion: 7,
-			pruneBoundaryMessageId: null,
-			prunedPercent: null,
 			minSeq: 0,
 			maxSeq: 0,
 			hasNext: false,

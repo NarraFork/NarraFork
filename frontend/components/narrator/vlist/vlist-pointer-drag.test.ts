@@ -158,11 +158,12 @@ describe("createPointerDragTracker", () => {
 
 	// ── The mouse family ────────────────────────────────────────────────────────
 	//
-	// The app's own side nav resizes through mousedown/mousemove/mouseup
-	// (hooks/useResizableNav.ts). A pointer-only tracker missed it entirely, so the
-	// drag freeze silently did not apply there — reported as "dragging the side nav
-	// has no effect".
-	it("sees a MOUSE-only drag (the side nav's resize handle)", () => {
+	// The app's own side nav USED to resize through mousedown/mousemove/mouseup
+	// (hooks/useResizableNav.ts; pointer events since the touch fix). A pointer-only
+	// tracker missed it entirely, so the drag freeze silently did not apply there —
+	// reported as "dragging the side nav has no effect". The tracker must stay
+	// family-agnostic against whatever the next host emits.
+	it("sees a MOUSE-only drag (the mouse-only host case)", () => {
 		let releases = 0;
 		const tracker = createPointerDragTracker(() => {
 			releases++;

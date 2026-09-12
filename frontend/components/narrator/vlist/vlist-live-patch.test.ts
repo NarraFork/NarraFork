@@ -513,6 +513,69 @@ describe("patchSubagentActivitySnapshots", () => {
 		expect(activity.latestToolCalls).toHaveLength(1);
 	});
 
+	it("preserves file changes when an incremental snapshot omits them, but honors explicit clearing", () => {
+		const messages = [assistantWithTools("m1", [{ toolUseId: "tu-parent" }])];
+		const seeded = patchSubagentActivitySnapshots(messages, [
+			{
+				parentToolUseId: "tu-parent",
+				activity: {
+					subagentNarratorId: "sub-1",
+					model: null,
+					fileChanges: {
+						files: [
+							{
+								filePath: "a.ts",
+								linesAdded: 1,
+								linesRemoved: 0,
+								editCount: 1,
+							},
+						],
+						totalFiles: 1,
+						totalUnmeasured: 0,
+						bashTouchedCount: 0,
+						countsTruncated: false,
+					},
+					latestToolCalls: [],
+				},
+			},
+		]);
+		const omitted = patchSubagentActivitySnapshots(seeded.messages, [
+			{
+				parentToolUseId: "tu-parent",
+				activity: { subagentNarratorId: "sub-1", model: null, latestToolCalls: [] },
+			},
+		]);
+		const omittedActivity = findBlock(omitted.messages, "tu-parent")?._subagentActivity;
+		expect(
+			omittedActivity && typeof omittedActivity === "object"
+				? (omittedActivity as { fileChanges?: { files?: unknown[] } }).fileChanges?.files
+				: undefined,
+		).toHaveLength(1);
+		const cleared = patchSubagentActivitySnapshots(omitted.messages, [
+			{
+				parentToolUseId: "tu-parent",
+				activity: {
+					subagentNarratorId: "sub-1",
+					model: null,
+					fileChanges: {
+						files: [],
+						totalFiles: 0,
+						totalUnmeasured: 0,
+						bashTouchedCount: 0,
+						countsTruncated: false,
+					},
+					latestToolCalls: [],
+				},
+			},
+		]);
+		const clearedActivity = findBlock(cleared.messages, "tu-parent")?._subagentActivity;
+		expect(
+			clearedActivity && typeof clearedActivity === "object"
+				? (clearedActivity as { fileChanges?: { files?: unknown[] } }).fileChanges?.files
+				: undefined,
+		).toEqual([]);
+	});
+
 	it("no-ops for an empty snapshot list", () => {
 		const messages = [assistantWithTools("m1", [{ toolUseId: "tu-parent" }])];
 		expect(patchSubagentActivitySnapshots(messages, []).messages).toBe(messages);

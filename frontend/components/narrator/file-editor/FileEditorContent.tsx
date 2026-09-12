@@ -1,6 +1,7 @@
 import {
 	ActionIcon,
 	Alert,
+	Anchor,
 	Badge,
 	Box,
 	Button,
@@ -25,7 +26,16 @@ import {
 	IconSearch,
 	IconTextWrap,
 } from "@tabler/icons-react";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+	lazy,
+	Suspense,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { request } from "../../../lib/api/client";
 import { fileReferenceApi } from "../../../lib/api/file-references";
@@ -33,8 +43,23 @@ import { saveBlobAsFile } from "../../../lib/file-download";
 import { getShikiLang } from "../../../lib/shiki-lang";
 import type { DiffLine } from "../DiffView";
 import { useFileReferenceScope } from "../FileReferenceScope";
-import { availableModes, type FileViewerMode } from "../file-viewer/file-viewer-modes";
+import { availableModes } from "../file-viewer/file-viewer-modes";
 import { filePanelBaseName } from "../panels/panel-kind";
+import {
+	type EditorMode,
+	fractionToScroll,
+	readEditorModePref,
+	resolveInitialMode,
+	scrollFraction,
+	splitRenderMode,
+	writeEditorModePref,
+} from "./editor-mode-prefs";
+import {
+	collectPreviewAnchors,
+	type LineAnchor,
+	lineForScrollTop,
+	scrollTopForLine,
+} from "./editor-scroll-sync";
 import {
 	EditorDocumentSession,
 	type EditorSessionState,
@@ -129,7 +154,18 @@ function FileEditorDocument({
 	const [editorSelection, setEditorSelection] = useState<FileSelection | null>(null);
 	const [lineWrapping, setLineWrapping] = useState(false);
 	const [searchOpen, setSearchOpen] = useState(false);
-	const [mode, setMode] = useState<FileViewerMode>("raw");
+	const readOnly = deviceId !== "local" || !narratorId;
+	const modes = useMemo(() => availableModes(filePath), [filePath]);
+	// The remembered default mode applies only where it makes sense for this file
+	// (resolveInitialMode); "设为默认" writes the current mode back to the same key.
+	const [savedModePref, setSavedModePref] = useState<EditorMode>(() => readEditorModePref());
+	const [mode, setMode] = useState<EditorMode>(() =>
+		resolveInitialMode(readEditorModePref(), availableModes(filePath)),
+	);
+	// applyContent runs inside the session (created before callbacks below exist), so
+	// both the current mode and the preview regenerator reach it through refs.
+	const modeRef = useRef(mode);
+	modeRef.current = mode;
 	const [previewText, setPreviewText] = useState<string | null>(null);
 	const [previewError, setPreviewError] = useState<string | null>(null);
 	const previewController = useRef<AbortController | null>(null);
@@ -141,8 +177,13 @@ function FileEditorDocument({
 	const [conflictRetry, setConflictRetry] = useState(0);
 	const [downloadingConflict, setDownloadingConflict] = useState(false);
 	const downloadController = useRef<AbortController | null>(null);
-	const readOnly = deviceId !== "local" || !narratorId;
-	const modes = useMemo(() => availableModes(filePath), [filePath]);
+	const regeneratePreviewRef = useRef<() => void>(() => {});
+	// Reading position kept across a disk reload: the preview keeps its fractional
+	// scroll, the raw editor keeps its absolute scroll line.
+	const previewScrollRef = useRef<HTMLDivElement | null>(null);
+	const previewScrollFraction = useRef<number | null>(null);
+	const splitContainerRef = useRef<HTMLDivElement | null>(null);
+	const [splitHorizontal, setSplitHorizontal] = useState(true);
 	const session = useMemo(
 		() =>
 			new EditorDocumentSession({
@@ -160,8 +201,19 @@ function FileEditorDocument({
 				applyContent: (text, document) => {
 					const model = editorRef.current?.getModel();
 					setEditorSelection(null);
-					setPreviewText(null);
-					setMode("raw");
+					if (modeRef.current === "raw") {
+						setPreviewText(null);
+						setPreviewError(null);
+					} else {
+						// Preview/node mode: remember the reading position and KEEP the current
+						// rendering on screen — the regenerated preview replaces it atomically,
+						// so a reload never flashes a loader over what the user was reading.
+						const el = previewScrollRef.current;
+						if (el) {
+							const range = el.scrollHeight - el.clientHeight;
+							previewScrollFraction.current = range > 0 ? el.scrollTop / range : 0;
+						}
+					}
 					if (!model) {
 						if (document)
 							documentKey.current = JSON.stringify([
@@ -172,7 +224,15 @@ function FileEditorDocument({
 						initialValue.current = text;
 						return null;
 					}
+					// model.setValue resets Monaco's view position; restore it afterwards so a
+					// reload does not teleport the raw editor back to the top of the file.
+					const editor = editorRef.current?.getEditor();
+					const scrollTop = editor?.getScrollTop?.() ?? null;
 					model.setValue(text);
+					if (scrollTop != null && scrollTop > 0) editor?.setScrollTop?.(scrollTop);
+					// Reloading from disk must not kick the user out of the rendered view:
+					// keep preview/node mode and regenerate it from the new content instead.
+					if (modeRef.current !== "raw") regeneratePreviewRef.current();
 					return {
 						revision: model.getVersionId(),
 						alternativeVersionId: model.getAlternativeVersionId(),
@@ -246,7 +306,7 @@ function FileEditorDocument({
 		if (!readOnly) void session.save();
 	}, [session, readOnly]);
 	const openSearch = useCallback(() => {
-		setMode("raw");
+		if (modeRef.current !== "split") setMode("raw");
 		setSearchOpen(true);
 	}, []);
 	const handleSelection = useCallback(
@@ -321,8 +381,12 @@ function FileEditorDocument({
 		return () => window.removeEventListener("beforeunload", beforeUnload);
 	}, [session]);
 	const navigationKey = JSON.stringify([deviceId, filePath, navigationRequestId, selection]);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: only explicit navigation returns to source
+	// Only a CHANGE of explicit navigation returns to source — running on mount would
+	// clobber a remembered non-raw default before the user ever sees it.
+	const navigationRef = useRef(navigationKey);
 	useEffect(() => {
+		if (navigationRef.current === navigationKey) return;
+		navigationRef.current = navigationKey;
 		setMode("raw");
 	}, [navigationKey]);
 	useEffect(() => {
@@ -331,13 +395,14 @@ function FileEditorDocument({
 			setPreviewText(null);
 		}
 	}, [mode]);
-	const switchMode = async (next: FileViewerMode) => {
+	// keepCurrent: a disk reload regenerates the preview behind the existing one;
+	// only an explicit mode switch or error replaces what is on screen.
+	const generatePreview = useCallback(async (keepCurrent = false) => {
 		previewController.current?.abort();
-		setMode(next);
-		setPreviewText(null);
-		setPreviewError(null);
-		if (next === "raw") return;
-		setSearchOpen(false);
+		if (!keepCurrent) {
+			setPreviewText(null);
+			setPreviewError(null);
+		}
 		const model = editorRef.current?.getModel();
 		if (!model) return;
 		// No snapshot/full-text work until the user explicitly requests a preview.
@@ -357,6 +422,175 @@ function FileEditorDocument({
 			if (!controller.signal.aborted)
 				setPreviewError(error instanceof Error ? error.message : String(error));
 		}
+	}, []);
+	regeneratePreviewRef.current = () => void generatePreview(true);
+	// A remembered non-raw default means the panel OPENS in preview/split: generate
+	// the first rendering once the model is ready, without waiting for a mode click.
+	const previewKickRef = useRef(false);
+	useEffect(() => {
+		if (previewKickRef.current || !editor || mode === "raw") return;
+		previewKickRef.current = true;
+		void generatePreview(true);
+	}, [editor, mode, generatePreview]);
+	// Split mode is a LIVE view: edits regenerate the preview behind the current one
+	// (keepCurrent) after a short debounce, so typing never flashes a loader.
+	useEffect(() => {
+		if (mode !== "split" || revision == null) return;
+		const timer = setTimeout(() => void generatePreview(true), 300);
+		return () => clearTimeout(timer);
+	}, [mode, revision, generatePreview]);
+	// Split direction follows the panel's own aspect ratio: wide panels split left/
+	// right, tall (or narrow dock) panels stack the preview below the editor.
+	useEffect(() => {
+		if (mode !== "split") return;
+		const el = splitContainerRef.current;
+		if (!el || typeof ResizeObserver === "undefined") return;
+		const update = () => setSplitHorizontal(el.clientWidth >= el.clientHeight);
+		update();
+		const observer = new ResizeObserver(update);
+		observer.observe(el);
+		return () => observer.disconnect();
+	}, [mode]);
+	// Bidirectional scroll sync. Markdown previews carry data-line anchors (VS
+	// Code's approach), so both directions interpolate SOURCE LINES between
+	// neighbouring block anchors — proportional height sync drifts by whole
+	// screens because rendered block height is not linear in line count. Node
+	// trees have no anchors and keep the proportional fallback.
+	const lineAnchorsRef = useRef<LineAnchor[]>([]);
+	const syncGuardRef = useRef({ preview: 0, editor: 0 });
+	useLayoutEffect(() => {
+		if (mode !== "split" || previewText == null) {
+			lineAnchorsRef.current = [];
+			return;
+		}
+		const el = previewScrollRef.current;
+		lineAnchorsRef.current = el ? collectPreviewAnchors(el) : [];
+	}, [mode, previewText]);
+	useEffect(() => {
+		if (mode !== "split" || !editor) return;
+		const previewEl = previewScrollRef.current;
+		if (!previewEl || !editor.onDidScrollChange) return;
+		const throttle = (fn: () => void, ms: number) => {
+			let last = 0;
+			let timer: ReturnType<typeof setTimeout> | null = null;
+			return () => {
+				const remaining = ms - (Date.now() - last);
+				if (remaining <= 0) {
+					last = Date.now();
+					fn();
+				} else if (!timer) {
+					timer = setTimeout(() => {
+						timer = null;
+						last = Date.now();
+						fn();
+					}, remaining);
+				}
+			};
+		};
+		// Fractional top line of the editor viewport — VS Code's getVisibleLine:
+		// the integer line plus the column's progress through it.
+		const editorTopLine = (): number | null => {
+			const model = editor.getModel?.();
+			const start = editor.getVisibleRanges?.()[0];
+			if (!model || !start) return null;
+			return (
+				start.startLineNumber -
+				1 +
+				(start.startColumn - 1) / (model.getLineLength(start.startLineNumber) + 2)
+			);
+		};
+		const scrollEditorToLine = (line: number): boolean => {
+			const base = Math.floor(line);
+			const top = editor.getTopForLineNumber?.(base + 1);
+			if (top == null) return false;
+			const next = editor.getTopForLineNumber(base + 2);
+			const lineHeight = next > top ? next - top : 0;
+			syncGuardRef.current.editor++;
+			editor.setScrollTop(top + (line - base) * lineHeight);
+			return true;
+		};
+		const tailLineHeight = (): number => {
+			const lineCount = editor.getModel?.()?.getLineCount() ?? 1;
+			return Math.max(
+				1,
+				(previewEl.scrollHeight - previewEl.clientHeight) / Math.max(1, lineCount),
+			);
+		};
+		const onEditorScroll = throttle(() => {
+			const anchors = lineAnchorsRef.current;
+			const line = anchors.length ? editorTopLine() : null;
+			const target = line != null ? scrollTopForLine(anchors, line, tailLineHeight()) : null;
+			syncGuardRef.current.preview++;
+			previewEl.scrollTop =
+				target ??
+				fractionToScroll(
+					scrollFraction(
+						editor.getScrollTop(),
+						editor.getScrollHeight(),
+						editor.getLayoutInfo().height,
+					),
+					previewEl.scrollHeight,
+					previewEl.clientHeight,
+				);
+		}, 50);
+		const subscription = editor.onDidScrollChange(() => {
+			if (syncGuardRef.current.editor > 0) {
+				syncGuardRef.current.editor--;
+				return;
+			}
+			onEditorScroll();
+		});
+		const onPreviewScroll = throttle(() => {
+			const anchors = lineAnchorsRef.current;
+			const model = editor.getModel?.();
+			if (anchors.length && model) {
+				if (
+					scrollEditorToLine(
+						lineForScrollTop(anchors, previewEl.scrollTop, model.getLineCount(), tailLineHeight()),
+					)
+				)
+					return;
+			}
+			syncGuardRef.current.editor++;
+			editor.setScrollTop(
+				fractionToScroll(
+					scrollFraction(previewEl.scrollTop, previewEl.scrollHeight, previewEl.clientHeight),
+					editor.getScrollHeight(),
+					editor.getLayoutInfo().height,
+				),
+			);
+		}, 50);
+		const previewListener = () => {
+			if (syncGuardRef.current.preview > 0) {
+				syncGuardRef.current.preview--;
+				return;
+			}
+			onPreviewScroll();
+		};
+		previewEl.addEventListener("scroll", previewListener, { passive: true });
+		return () => {
+			subscription.dispose();
+			previewEl.removeEventListener("scroll", previewListener);
+		};
+	}, [mode, editor]);
+	// Restore the fractional reading position once the regenerated preview renders.
+	// Fraction (not absolute pixels) because the new content may be longer or shorter.
+	useLayoutEffect(() => {
+		const el = previewScrollRef.current;
+		const fraction = previewScrollFraction.current;
+		if (previewText == null || !el || fraction == null) return;
+		previewScrollFraction.current = null;
+		el.scrollTop = fraction * (el.scrollHeight - el.clientHeight);
+	}, [previewText]);
+	const switchMode = (next: EditorMode) => {
+		previewController.current?.abort();
+		setMode(next);
+		setPreviewText(null);
+		setPreviewError(null);
+		previewScrollFraction.current = null;
+		if (next === "raw") return;
+		setSearchOpen(false);
+		void generatePreview();
 	};
 	const conflict = state?.conflict;
 	// biome-ignore lint/correctness/useExhaustiveDependencies: retry is an explicit bounded conflict-read request
@@ -430,6 +664,10 @@ function FileEditorDocument({
 			</Center>
 		);
 	const saving = state.phase !== "idle" && state.phase !== "unknown";
+	// Split keeps the editor fully interactive beside the preview; preview/node
+	// modes keep it mounted but inert behind the rendered overlay.
+	const split = mode === "split";
+	const editorActive = mode === "raw" || split;
 	return (
 		<Box
 			style={{ height: "100%", display: "flex", flexDirection: "column" }}
@@ -473,7 +711,7 @@ function FileEditorDocument({
 							variant="subtle"
 							size="sm"
 							aria-label={t("fileEditor.undo")}
-							disabled={readOnly || state.loading || mode !== "raw" || !history?.canUndo}
+							disabled={readOnly || state.loading || !editorActive || !history?.canUndo}
 							onClick={() => editorRef.current?.undo()}
 						>
 							<IconArrowBackUp size={14} />
@@ -484,7 +722,7 @@ function FileEditorDocument({
 							variant="subtle"
 							size="sm"
 							aria-label={t("fileEditor.redo")}
-							disabled={readOnly || state.loading || mode !== "raw" || !history?.canRedo}
+							disabled={readOnly || state.loading || !editorActive || !history?.canRedo}
 							onClick={() => editorRef.current?.redo()}
 						>
 							<IconArrowForwardUp size={14} />
@@ -506,7 +744,7 @@ function FileEditorDocument({
 							size="sm"
 							aria-label={t("fileEditor.wrap")}
 							aria-pressed={lineWrapping}
-							disabled={mode !== "raw" || history?.longLine}
+							disabled={!editorActive || history?.longLine}
 							onClick={() => setLineWrapping((old) => !old)}
 						>
 							<IconTextWrap size={14} />
@@ -565,20 +803,40 @@ function FileEditorDocument({
 				</Text>
 			)}
 			{modes.length > 1 && (
-				<Box px="xs" pb={6} style={{ flexShrink: 0 }}>
+				<Group gap={8} px="xs" pb={6} wrap="nowrap" style={{ flexShrink: 0 }}>
 					<SegmentedControl
 						size="xs"
 						value={mode}
-						onChange={(value) => void switchMode(value as FileViewerMode)}
-						data={["raw" as const, ...modes.filter((value) => value !== "raw")].map((value) => ({
+						onChange={(value) => void switchMode(value as EditorMode)}
+						data={[
+							"raw" as const,
+							"split" as const,
+							...modes.filter((value) => value !== "raw"),
+						].map((value) => ({
 							value,
 							label:
 								value === "raw"
 									? t(readOnly ? "fileViewer.mode_raw" : "fileEditor.edit")
-									: t(value === "preview" ? "fileViewer.mode_preview" : "fileViewer.mode_node"),
+									: value === "split"
+										? t("fileEditor.modeSplit")
+										: t(value === "preview" ? "fileViewer.mode_preview" : "fileViewer.mode_node"),
 						}))}
 					/>
-				</Box>
+					{mode !== savedModePref && (
+						<Anchor
+							component="button"
+							type="button"
+							size="xs"
+							style={{ flexShrink: 0, whiteSpace: "nowrap" }}
+							onClick={() => {
+								writeEditorModePref(mode);
+								setSavedModePref(mode);
+							}}
+						>
+							{t("fileEditor.setAsDefaultMode")}
+						</Anchor>
+					)}
+				</Group>
 			)}
 			{saving && (
 				<Group px="xs" pb="xs">
@@ -713,7 +971,7 @@ function FileEditorDocument({
 					</Group>
 				</Alert>
 			)}
-			{searchOpen && mode === "raw" && editor && (
+			{searchOpen && editorActive && editor && (
 				<MonacoSearchPanel
 					editor={editor}
 					readOnly={readOnly || state.loading}
@@ -721,16 +979,29 @@ function FileEditorDocument({
 					onClose={() => setSearchOpen(false)}
 				/>
 			)}
-			<Box style={{ flex: 1, minHeight: 0, position: "relative" }}>
+			<Box
+				ref={splitContainerRef}
+				style={{
+					flex: 1,
+					minHeight: 0,
+					position: "relative",
+					display: "flex",
+					flexDirection: split ? (splitHorizontal ? "row" : "column") : "column",
+				}}
+			>
 				<Box
 					data-file-editor-source
-					inert={mode !== "raw"}
-					aria-hidden={mode !== "raw"}
-					style={{
-						position: "absolute",
-						inset: 0,
-						visibility: mode === "raw" ? "inherit" : "hidden",
-					}}
+					inert={!editorActive}
+					aria-hidden={!editorActive}
+					style={
+						split
+							? { position: "relative", flex: 1, minWidth: 0, minHeight: 0 }
+							: {
+									position: "absolute",
+									inset: 0,
+									visibility: mode === "raw" ? "inherit" : "hidden",
+								}
+					}
 				>
 					<MonacoEditor
 						initialValue={initialValue.current}
@@ -746,13 +1017,30 @@ function FileEditorDocument({
 						navigationRequestId={navigationRequestId}
 						readOnly={readOnly || state.loading}
 						lineWrapping={lineWrapping}
-						visible={mode === "raw"}
+						visible={editorActive}
 					/>
 				</Box>
 				{mode !== "raw" && (
 					<Box
+						ref={previewScrollRef}
 						data-file-editor-preview={mode}
-						style={{ position: "absolute", inset: 0, overflow: "auto" }}
+						style={
+							split
+								? {
+										position: "relative",
+										flex: 1,
+										minWidth: 0,
+										minHeight: 0,
+										overflow: "auto",
+										borderLeft: splitHorizontal
+											? "1px solid var(--mantine-color-dark-4)"
+											: undefined,
+										borderTop: splitHorizontal
+											? undefined
+											: "1px solid var(--mantine-color-dark-4)",
+									}
+								: { position: "absolute", inset: 0, overflow: "auto" }
+						}
 					>
 						{previewError ? (
 							<Text size="sm" c="yellow" p="md">
@@ -772,10 +1060,11 @@ function FileEditorDocument({
 							>
 								<FileEditorPreview
 									text={previewText}
-									mode={mode}
+									mode={split ? splitRenderMode(modes) : mode}
 									filePath={filePath}
 									deviceId={deviceId}
 									narratorId={narratorId}
+									withSourceLines={split}
 								/>
 							</Suspense>
 						)}

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import en from "../locales/en/settings.json";
 import zh from "../locales/zh-CN/settings.json";
 
@@ -69,6 +70,39 @@ describe("default narrator write audience settings wiring", () => {
 			"有效可见性",
 		])
 			expect(zh.defaultNarratorWriteAudienceDesc).toContain(text);
+	});
+});
+
+describe("compaction-only context settings", () => {
+	test("uses shared standard 95 and large 75 defaults in both editors", () => {
+		const panel = readFileSync(
+			new URL("../components/narrator/NarratorPanel.tsx", import.meta.url),
+			"utf8",
+		);
+		expect(DEFAULT_CONTEXT_THRESHOLDS).toEqual({
+			standard: { compactStart: 95 },
+			large: { compactStart: 75 },
+		});
+		expect(hook).toContain("cloneDefaultContextThresholds()");
+		for (const size of ["standard", "large"]) {
+			expect(section).toContain(`DEFAULT_CONTEXT_THRESHOLDS.${size}.compactStart`);
+			expect(panel).toContain(`DEFAULT_CONTEXT_THRESHOLDS.${size}.compactStart`);
+		}
+		expect(panel).toContain("api.triggerCompact(narratorId)");
+		expect(panel).toContain('t("contextThresholdSettingsTitle")');
+		for (const source of [hook, page, section, panel]) {
+			expect(source).not.toMatch(/prun/i);
+		}
+	});
+
+	test("keeps bilingual compaction labels and unrelated avatar cropping", () => {
+		for (const locale of [en, zh]) {
+			expect(locale.compactStart).toBeTruthy();
+			expect(locale.compactStartDesc).toContain("95%");
+			expect(locale.compactStartDesc).toContain("75%");
+			expect(locale.avatarCropTitle).toBeTruthy();
+			expect(Object.keys(locale).filter((key) => /prun/i.test(key))).toEqual([]);
+		}
 	});
 });
 

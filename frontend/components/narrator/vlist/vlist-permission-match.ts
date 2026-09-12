@@ -11,7 +11,10 @@ import type { AsyncQuestionSlot, PendingPermission } from "../narrator-panel-typ
 import { resolveRowReflection, type VListReflectionSource } from "./vlist-reflection-index";
 import type { VListToolMeta } from "./vlist-tool-meta";
 
-function isNewerQuestionWait(candidate: VListToolMeta, current: VListToolMeta | undefined): boolean {
+function isNewerQuestionWait(
+	candidate: VListToolMeta,
+	current: VListToolMeta | undefined,
+): boolean {
 	if (!current) return true;
 	const candidateSeq = candidate.awaitQuestionSeq;
 	const currentSeq = current.awaitQuestionSeq;

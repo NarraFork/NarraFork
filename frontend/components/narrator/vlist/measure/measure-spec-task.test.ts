@@ -1,8 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import {
 	measureSpecTask,
-	SPEC_TASK_GLYPH,
-	SPEC_TASK_GLYPH_GAP,
 	SPEC_TASK_LINE_HEIGHT,
 	SPEC_TASK_LOCK,
 	SPEC_TASK_LOCK_GAP,
@@ -17,12 +15,11 @@ beforeAll(() => {
 });
 
 /**
- * The regression this pins: `measureInjectionBubble` overwrites the composite's
- * `contentWidth` with its own INNER width, so a render copy that used
- * `measured.contentWidth` as the text-column width and then placed the glyph/lock
- * lanes beside it produced a row `chromeWidth` wider than the frame — the task text
- * spilled past the bubble's right edge. The render layer must re-derive the text
- * column with `specTaskChromeWidth`, which is exactly what this asserts.
+ * The regression this pins: the measure pass and render pass must agree on the
+ * meaning of `contentWidth`. It is the bubble's INNER width; RenderSpecTask then
+ * subtracts the per-row glyph/lock chrome. Returning an already-reduced text
+ * column made render subtract the chrome twice, so the precomputed height was based
+ * on a wider column than the DOM painted and the task text was clipped.
  */
 describe("spec task row fits inside the bubble's inner width", () => {
 	for (const isProtected of [false, true]) {
@@ -33,8 +30,9 @@ describe("spec task row fits inside the bubble's inner width", () => {
 			// What the render layer computes for the text column.
 			const renderTextWidth = Math.max(1, innerWidth - chrome);
 			expect(chrome + renderTextWidth).toBeLessThanOrEqual(innerWidth);
-			// And it agrees with what the measure pass wrapped the text at.
-			expect(measureSpecTask(data, innerWidth).contentWidth).toBe(renderTextWidth);
+			// The measure pass exposes the bubble inner width; the renderer derives the
+			// same text column from it once, so both sides use the same geometry.
+			expect(measureSpecTask(data, innerWidth).contentWidth).toBe(innerWidth);
 		});
 	}
 
@@ -63,9 +61,9 @@ describe("measureSpecTask — glyph + lock + wrapping text", () => {
 		expect(m.height).toBeGreaterThan(SPEC_TASK_LINE_HEIGHT);
 	});
 
-	it("the text column is what's left after the glyph lane", () => {
+	it("contentWidth remains the bubble inner width for render-time chrome subtraction", () => {
 		const m = measureSpecTask({ text: "x", protected: false }, 600);
-		expect(m.contentWidth).toBe(600 - (SPEC_TASK_GLYPH + SPEC_TASK_GLYPH_GAP));
+		expect(m.contentWidth).toBe(600);
 	});
 
 	it("protected adds the lock lane to the chrome width", () => {

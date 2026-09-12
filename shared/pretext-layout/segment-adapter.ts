@@ -22,6 +22,11 @@ import { isCommunicationTool, limitCommunicationPreview } from "../communication
 import { type FileReference, fileReferenceDisplay } from "../file-reference";
 import { normalizeFileReferenceContext } from "../file-reference-context";
 import { knowledgeExcerpt } from "../knowledge-excerpt";
+import {
+	contextBlockViews,
+	injectionBlockViews,
+	isNativeModelContextBlock,
+} from "../native-injection";
 import { hasUsablePlanBody } from "../plan-reference";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
 import {
@@ -91,6 +96,8 @@ import { resolveTurnUsageLines, type TurnUsageJson, type UsageNumberFormatter } 
 export interface AdapterContentBlock {
 	type: string;
 	text?: string | null;
+	/** Native system injection's exact model-facing projection. */
+	modelText?: string | null;
 	thinking?: string | null;
 	translatedText?: string | null;
 	query?: string | null;
@@ -413,8 +420,7 @@ function nonEmptyTrimmed(value: unknown): string | undefined {
 
 export type AdapterSegment =
 	| { kind: "message"; msg: AdapterMessage; visibleBlockIndices?: number[] }
-	| { kind: "tool-run"; items: AdapterToolItem[]; sourceMessages: AdapterMessage[] }
-	| { kind: "prune-divider"; label?: string };
+	| { kind: "tool-run"; items: AdapterToolItem[]; sourceMessages: AdapterMessage[] };
 
 export type AdapterActivityInput =
 	| {
@@ -1195,11 +1201,64 @@ function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 // Public: segment → ElementSpec[]
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Render native/legacy context blocks independently while preserving physical order. */
+function adaptContextBlocks(
+	blocks: AdapterContentBlock[],
+	idBase: string,
+	msg: AdapterMessage,
+	ctx: AdapterContext,
+): ElementSpec[] {
+	const specs: ElementSpec[] = [];
+	const views = Array.from(
+		new Map(
+			[...contextBlockViews(blocks), ...injectionBlockViews(blocks)].map((view) => [
+				view.blockIndex,
+				view,
+			]),
+		).values(),
+	).sort((a, b) => a.blockIndex - b.blockIndex);
+	const owned = new Set(views.flatMap((view) => view.sourceIndices));
+	for (const view of views) {
+		const index = view.blockIndex;
+		const modelText = view.block.modelText ?? "";
+		const spoken = adaptSpokenInjection(
+			view.block as AdapterContentBlock,
+			idBase,
+			index,
+			modelText,
+			ctx,
+		);
+		if (spoken) {
+			specs.push(...spoken);
+			continue;
+		}
+		const framed = adaptFramedSystemCard(
+			view.block as AdapterContentBlock,
+			idBase,
+			index,
+			msg,
+			modelText,
+			ctx,
+		);
+		if (framed) {
+			specs.push(framed);
+			continue;
+		}
+		specs.push(
+			adaptSystemBlock(view.block.type, view.block as AdapterContentBlock, idBase, msg, ctx, index),
+		);
+	}
+	for (let index = 0; index < blocks.length; index++) {
+		const block = blocks[index];
+		if (!block || owned.has(index) || block.type !== "text" || !block.text?.trim()) continue;
+		specs.push({ kind: "markdown", key: `${idBase}-b${index}`, data: { text: block.text } });
+	}
+	return specs;
+}
+
 /** Adapt one RenderSegment to a list of element specs (measure-ready). */
 export function adaptSegment(seg: AdapterSegment, ctx: AdapterContext): ElementSpec[] {
 	switch (seg.kind) {
-		case "prune-divider":
-			return [{ kind: "prune-divider", key: "prune", data: { label: seg.label } }];
 		case "message":
 			return adaptMessage(seg.msg, seg.visibleBlockIndices, ctx);
 		case "tool-run":
@@ -1223,6 +1282,11 @@ function adaptMessage(
 	// than only the text ones. Dropping them here is what made an image the user
 	// sent silently disappear in the virtual list.
 	if (msg.role === "user") {
+		// Self-contained native context blocks are protocol cards, not human chat bubbles.
+		// Keep their physical indexes and render each block independently.
+		if (blocks.some((block) => isNativeModelContextBlock(block))) {
+			return adaptContextBlocks(blocks, idBase, msg, ctx);
+		}
 		// Some user-role messages are not chat bubbles at all: `/bash`, tool load /
 		// unload notices and the segment-compact marker are persisted with role=user
 		// but carry ONLY a system block and no text, so the bubble branch would paint
@@ -1230,7 +1294,16 @@ function adaptMessage(
 		// renderer uses (which matches these before it looks at the role at all).
 		const systemCardBlock = blocks.find((b) => USER_SYSTEM_CARD_TYPES.has(b.type));
 		if (systemCardBlock) {
-			return [adaptSystemBlock(systemCardBlock.type, systemCardBlock, idBase, msg, ctx)];
+			return [
+				adaptSystemBlock(
+					systemCardBlock.type,
+					systemCardBlock,
+					idBase,
+					msg,
+					ctx,
+					blocks.indexOf(systemCardBlock),
+				),
+			];
 		}
 		// A concluded review. The row is `role: "user"` because the findings ARE a request
 		// the model must answer, and it carries both projections of one conclusion: a `text`
@@ -1253,10 +1326,14 @@ function adaptMessage(
 		const injectionIndex = blocks.findIndex((b) => b.type === "system_injection");
 		const injection = blocks[injectionIndex];
 		if (msg.origin !== "user" && injection && readCommunicationInjection(injection)) {
-			const modelFacingText = blocks
-				.filter((b) => b.type === "text")
-				.map((b) => b.text ?? "")
-				.join("\n");
+			const modelFacingText =
+				blocks
+					.filter((b) => b.type === "text")
+					.map((b) => b.text ?? "")
+					.join("\n") ||
+				(blocks[injectionIndex]?.type === "system_injection"
+					? (blocks[injectionIndex]?.modelText ?? "")
+					: "");
 			const spoken = adaptSpokenInjection(injection, idBase, injectionIndex, modelFacingText, ctx);
 			if (spoken) return spoken;
 		}
@@ -1379,6 +1456,9 @@ function adaptMessage(
 	// NOT necessarily blocks[0] — a leading text block can precede it (e.g.
 	// [{text}, {knowledge_hint}]). Falls back to blocks[0] when none recognized.
 	if (msg.role === "system" || msg.role === "sys" || msg.role === "disp") {
+		if (blocks.some((block) => isNativeModelContextBlock(block))) {
+			return adaptContextBlocks(blocks, idBase, msg, ctx);
+		}
 		// Track the index too: an injection is ONE block per row now, and that index is
 		// the row's address for the selection system (msg-{id}-{blockIndex}).
 		const sysBlockIndex = blocks.findIndex((b) => isRecognizedSystemBlockType(b.type));
@@ -1388,7 +1468,10 @@ function adaptMessage(
 		// the chunk renderer uses. The context-menu inspector shows this so the reader can
 		// see exactly what the agent received, which the projected bubble body strips down.
 		const modelFacingText =
-			blocks.find((b) => b.type === "text" && (b.text ?? "").trim().length > 0)?.text ?? "";
+			blocks.find((b) => b.type === "text" && (b.text ?? "").trim().length > 0)?.text ??
+			blocks.find((b) => b.type === "system_injection" && typeof b.modelText === "string")
+				?.modelText ??
+			"";
 		const spoken = adaptSpokenInjection(sysBlock, idBase, blockIndex, modelFacingText, ctx);
 		if (spoken) return [...specs, ...spoken];
 		// Server-authored FACTS that still have an author (a person merged a branch, the
@@ -1398,7 +1481,7 @@ function adaptMessage(
 		// affordances the reader can use (branch names, a commit sha, badges).
 		const framed = adaptFramedSystemCard(sysBlock, idBase, blockIndex, msg, modelFacingText, ctx);
 		if (framed) return [...specs, framed];
-		specs.push(adaptSystemBlock(sysBlock.type, sysBlock, idBase, msg, ctx));
+		specs.push(adaptSystemBlock(sysBlock.type, sysBlock, idBase, msg, ctx, blockIndex));
 		return specs;
 	}
 
@@ -2073,8 +2156,8 @@ function compactProgressOpts(
  * platform events. That was wrong: `container_ready`'s own text says "**You can** use
  * the Browser tool to test these services" — it addresses the model, and the model
  * answers it. The real distinction is not subject-vs-no-subject but **an utterance in
- * the conversation vs a note about the conversation**. Compact markers and prune
- * dividers are the latter; everything here is the former.
+ * the conversation vs a note about the conversation**. Compact markers are the
+ * latter; everything here is the former.
  *
  * Interactive controls are deliberately excluded (see `FRAMED_SYSTEM_CARDS`): a
  * permission prompt or an ask-user form is something to OPERATE, not something somebody
@@ -2120,7 +2203,7 @@ function adaptFramedSystemCard(
 	}
 	// Reuse the card's own data projection verbatim: the bubble must not fork it, or the
 	// framed and standalone forms would drift.
-	const inner = adaptSystemBlock(kind, block, idBase, msg, ctx);
+	const inner = adaptSystemBlock(kind, block, idBase, msg, ctx, blockIndex);
 	return {
 		kind: "injection-bubble",
 		key: `${idBase}-b${blockIndex}-f-${kind}`,
@@ -2657,7 +2740,9 @@ function adaptSystemBlock(
 	idBase: string,
 	msg: AdapterMessage,
 	ctx: AdapterContext,
+	blockIndex = 0,
 ): ElementSpec {
+	const keyBase = `${idBase}-b${blockIndex}`;
 	// The message's leading text block is the chunk renderer's `contentText`
 	// fallback (goalBlock.task ?? message.contentText, etc.).
 	const contentText =
@@ -2732,7 +2817,7 @@ function adaptSystemBlock(
 		if (block.status === "failed") {
 			return {
 				kind: "system-text",
-				key: `${idBase}-sys`,
+				key: `${keyBase}-sys`,
 				data: {
 					kind: "segment_compact_failed",
 					text: block.error ?? block.summary ?? sysLabel(ctx, "segmentCompactFailedDesc"),
@@ -2745,7 +2830,7 @@ function adaptSystemBlock(
 		const segStatus = block.status === "compacting" ? "compacting" : "compacted";
 		return {
 			kind: "system-simple",
-			key: `${idBase}-sys`,
+			key: `${keyBase}-sys`,
 			data: {
 				kind: "segment_compact",
 				// The label is synthesized from status (parity with
@@ -2775,7 +2860,7 @@ function adaptSystemBlock(
 	if (SYSTEM_SIMPLE_SUBTYPES.has(blockType)) {
 		return {
 			kind: "system-simple",
-			key: `${idBase}-sys`,
+			key: `${keyBase}-sys`,
 			data: adaptSystemSimpleData(blockType, block, ctx),
 			...(blockType === "compact" && block.status === "compacting"
 				? compactProgressOpts(
@@ -2791,7 +2876,7 @@ function adaptSystemBlock(
 	if (SYSTEM_TEXT_SUBTYPES.has(blockType)) {
 		return {
 			kind: "system-text",
-			key: `${idBase}-sys`,
+			key: `${keyBase}-sys`,
 			data: adaptSystemTextData(blockType, block, contentText, ctx, msg.createdAt),
 		};
 	}
@@ -2799,7 +2884,7 @@ function adaptSystemBlock(
 	// where display notices keep their body (see the `info` case below).
 	return {
 		kind: "system-text",
-		key: `${idBase}-sys`,
+		key: `${keyBase}-sys`,
 		data: { kind: "info", text: block.message ?? block.text ?? contentText },
 	};
 }

@@ -5,7 +5,6 @@ import {
 } from "../../lib/agent/file-reference-projection";
 import type { BuiltHistory, DbMessage } from "../../lib/agent/provider";
 import { trackAgentMessageHistory } from "../agent-message-delivery";
-import { pruneToolCalls } from "../narrator-compact";
 
 export type RuntimeHistoryMessage = DbMessage & {
 	injectionConsumedAt?: Date | string | null;
@@ -19,13 +18,12 @@ export interface RuntimeHistoryOptions {
 	profile: "primary" | "subagent";
 	/** Already-authorized exact history page, when the caller also needs it for context preparation. */
 	sourceMessages?: readonly RuntimeHistoryMessage[];
-	pruneBoundaryId?: string | null;
 	/** Already accepted current input, with its original principal/attachment barrier. */
 	currentInput?: string;
 }
 
 export interface PreparedRuntimeHistory extends BuiltHistory {
-	/** Original rows for audit/context consumers; never mutated by pruning or provider projection. */
+	/** Original rows for audit/context consumers; never mutated by provider projection. */
 	sourceMessages: readonly RuntimeHistoryMessage[];
 	/** Detached rows that entered this particular provider build and receipt candidate registration. */
 	modelMessages: RuntimeHistoryMessage[];
@@ -69,8 +67,8 @@ export async function buildRuntimeHistory(
 		(await (
 			await import("../narrator-service")
 		).narratorService.getModelHistorySinceLastCompact(options.narratorId));
-	// pruneToolCalls changes row arrays and reasoning-block metadata. Detach both levels,
-	// not huge text payloads, so shared/COW source rows remain byte-for-byte unchanged.
+	// Detach mutable row arrays and block metadata, not huge text payloads,
+	// so shared/COW source rows remain unchanged during provider projection.
 	const modelMessages = sourceMessages.map((message) => ({
 		...message,
 		...(options.profile === "subagent" ? { parentToolUseId: null } : {}),
@@ -81,7 +79,6 @@ export async function buildRuntimeHistory(
 			: message.contentJson,
 		toolCalls: message.toolCalls?.map((call) => ({ ...call })),
 	}));
-	if (options.pruneBoundaryId) pruneToolCalls(modelMessages, options.pruneBoundaryId);
 	const built = await buildHistory(
 		modelMessages,
 		options.model,

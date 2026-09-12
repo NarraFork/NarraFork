@@ -130,7 +130,6 @@ export const FILTER_GRANULARITY = "section" as const;
 export const ADVANCED_SESSION_ROWS = [
 	"fastMode",
 	"relaxedPlan",
-	"pruneEnabled",
 	"planMode",
 	"backgroundStatus",
 	"pendingModelRestore",
@@ -143,7 +142,6 @@ export type AdvancedSessionRow = (typeof ADVANCED_SESSION_ROWS)[number];
 export interface AdvancedRowInput {
 	fastModeOverride?: unknown;
 	relaxedPlan?: unknown;
-	pruneEnabled?: unknown;
 	/** Precomputed by the panel: `planMode` flag OR the `plan` trait. */
 	planMode?: boolean;
 	backgroundStatus?: unknown;
@@ -169,8 +167,6 @@ export function shouldPromoteAdvancedRow(
 			return normalizeBooleanOverride(input.fastModeOverride) !== "inherit";
 		case "relaxedPlan":
 			return !!input.relaxedPlan;
-		case "pruneEnabled":
-			return !!input.pruneEnabled;
 		case "planMode":
 			return !!input.planMode;
 		case "backgroundStatus":

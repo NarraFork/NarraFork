@@ -81,8 +81,6 @@ function page(messages: readonly TreeMessage[], messageVersion: number) {
 	return {
 		messages: [...messages],
 		messageVersion,
-		pruneBoundaryMessageId: null,
-		prunedPercent: null,
 		hasPrev: true,
 		maxSeq: messages.length - 1,
 	};
@@ -158,7 +156,7 @@ describe("the streaming row does not disturb the persisted document", () => {
 		coordinator.setStreamingMessage(streamingRow(200), atBottom);
 		const after = coordinator.getSnapshot();
 		expect(after.items?.length).toBe((before.items?.length ?? 0) + 1);
-		// Pagination arithmetic and version/prune checks must never see the synthetic row.
+		// Pagination arithmetic and version checks must never see the synthetic row.
 		expect(after.input?.messages.length).toBe(history.length);
 		expect(after.input?.messageVersion).toBe(before.input?.messageVersion);
 		expect(after.hasPrev).toBe(before.hasPrev);

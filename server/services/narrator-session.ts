@@ -58,7 +58,6 @@ import { getBlockedTaskActionInstruction, getToolMessage, type Locale } from "..
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAutoCompactKeepPairs,
-	getAutoCompactPruneThreshold,
 	getContextThresholds,
 	getSettingsRevision,
 	resolveDefaultReasoningEffort,
@@ -111,6 +110,7 @@ import {
 	isExecutionSuspended,
 	tryClaimExecution,
 } from "./agent-runtime/ownership";
+import { flushRuntimePublications } from "./agent-runtime/publication";
 import { backgroundTaskService } from "./background-task-service";
 import { formatBackgroundCompletionNotifications } from "./bg-completion-queue";
 import { gitService } from "./git-service";
@@ -190,7 +190,6 @@ import {
 	pendingPlanCompact,
 	pendingPlanDiff,
 	planModeAskedOnce,
-	pruneLocks,
 	reserveNarratorRevertAdmission,
 	updateActiveSubagentModel,
 	updateActiveSubagentReasoningEffort,
@@ -856,13 +855,6 @@ async function resumeNextBufferedMessageUnlocked(
 // This prevents two idle checks from racing into concurrent loops and ensures uploads
 // cannot both materialize files before the narrator's turn-admission flag is set.
 const continuationStartLock = { acquire: withNarratorStartAdmission };
-
-export function isDynamicPruningWindowEnabled(thresholds: {
-	pruneStart: number;
-	compactStart: number;
-}): boolean {
-	return thresholds.compactStart > thresholds.pruneStart;
-}
 
 // === Narrator lifecycle ===
 
@@ -1566,6 +1558,7 @@ async function maybeStartSpecContinuation(
 				type: "spec_blocked_continuation",
 				task: blocked.text,
 				protected: blocked.protected === true,
+				modelText: prompt,
 			},
 		]);
 		broadcastToNarrator(active.narratorId, {
@@ -1615,7 +1608,12 @@ async function maybeStartSpecContinuation(
 			? `Dynamic Spec 自动续跑（系统消息，不是用户发言）。\n\n系统在 spec://tasks.json 仍有 doing 条目时自动发出这条消息。它只说明该条目尚未标记完成 —— 不代表系统判断你没做完，条目内容也可能已经过时。\n\n当前任务（仅这一条，不是完整任务列表；其余任务仍在 spec://tasks.json 中）：${current.text}${current.protected ? " [protected]" : ""}\n\n请先判断该任务的真实状态，再按实际情况选择其一：\n- 已经完成：在 spec://tasks.json 标记 done。这就是本回合的有效结果，不要因为这条提醒去返工已经正确的改动。\n- 未完成且能自主推进：继续执行。\n- 需要用户提供信息、权限、决策，或需要用户亲自操作：先做完不受阻的部分，再用 AskUserQuestion 提出一个精确问题并结束回合。\n- 已不符合当前实际：在保留用户原意图的前提下改写或删除该条目，并说明原因。\n\n改动 spec://tasks.json 时先读取再就地修改，不要按本消息重写整个文件。${protectedNote}`
 			: `Dynamic Spec auto-continuation (system message, not the user speaking).\n\nThe system emits this whenever spec://tasks.json still has a \`doing\` entry. It only means the entry is not marked finished — not that the system judged your work incomplete, and its content may be out of date.\n\nCurrent task (this one only — not the full task list; your other tasks are still in spec://tasks.json): ${current.text}${current.protected ? " [protected]" : ""}\n\nDecide what is actually true of this task, then take exactly one of these paths:\n- Already done: mark it done in spec://tasks.json. That is a valid result for this turn; do not rework a change that was already correct.\n- Unfinished and you can advance it: keep working.\n- Needs the user's information, permission, decision, or an action only they can perform: finish every unblocked part, then ask one precise question with AskUserQuestion and end the turn.\n- No longer matches reality: rewrite or remove the entry while preserving the user's original intent, and say why.\n\nWhen you change spec://tasks.json, read it first and edit in place; do not rewrite the file from this message.${protectedNote}`;
 	const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
-		{ type: "spec_continuation", task: current.text, protected: current.protected === true },
+		{
+			type: "spec_continuation",
+			task: current.text,
+			protected: current.protected === true,
+			modelText: prompt,
+		},
 	]);
 	broadcastToNarrator(active.narratorId, {
 		type: "message",
@@ -1922,21 +1920,6 @@ export async function deliverPendingInjection(
 				source: "bg_agent",
 				schedule,
 				locale,
-				// Preserved so the reader keeps the richer card this producer already had.
-				extraBlocks: [
-					{
-						type: "background_agents_completed",
-						tasks: [
-							{
-								id: task.id,
-								title: task.title,
-								status: task.status,
-								resultPreview: task.resultPreview,
-								resultTruncated: task.resultTruncated ?? false,
-							},
-						],
-					},
-				],
 			});
 			return turnText ?? content;
 		}
@@ -2372,9 +2355,6 @@ export interface ContextManagementOptions {
 	getProvider: () => string;
 	/** Whether this narrator is a subagent (all messages have parentToolUseId) */
 	isSubagent?: boolean;
-	/** Mutable getter/setter for the cached prune boundary */
-	getPruneBoundary: () => string | null;
-	setPruneBoundary: (id: string | null) => void;
 	/** Called after compact completes (e.g. reset conversationId, set restart flag) */
 	onCompactDone?: () => void;
 	/** Check whether a compact just finished and the next turn needs a full rebuild */
@@ -2386,7 +2366,7 @@ export interface ContextManagementOptions {
 }
 
 /**
- * Build reusable context management hooks (prune + compact) for both
+ * Build reusable context management hooks (compact) for both
  * main narrators and subagents.
  *
  * Returns an `onContextUsage` EventHook and an `onBeforeTurn` AgentConfig callback.
@@ -2404,8 +2384,6 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		getModel,
 		getProvider,
 		isSubagent: isSubagentNarrator,
-		getPruneBoundary,
-		setPruneBoundary,
 		onCompactDone,
 		isCompactDone,
 		clearCompactDone,
@@ -2434,138 +2412,12 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			return;
 		}
 		const thresholds = getContextThresholds(getModel(), getProvider());
-		const pruningWindowEnabled = isDynamicPruningWindowEnabled(thresholds);
-
-		// Dynamic pruning: pruneStart – (compactStart - 1)%. Once pruning reaches
-		// the configured ratio, start background compact immediately instead of
-		// waiting for compactStart. If compactStart <= pruneStart, the pruning window
-		// is disabled and compactStart acts as the direct compact trigger.
-		if (
-			pruningWindowEnabled &&
-			percentage >= thresholds.pruneStart &&
-			percentage < thresholds.compactStart &&
-			!pruneLocks.has(narratorId)
-		) {
-			const compactPruneThreshold = getAutoCompactPruneThreshold();
-			pruneLocks.add(narratorId);
-			narratorService
-				.computeAndUpdatePruneBoundary(narratorId, percentage, thresholds)
-				.then((result) => {
-					broadcastToNarrator(narratorId, {
-						type: "prune_boundary",
-						narratorId,
-						boundaryMessageId: result?.boundaryMessageId ?? null,
-						prunedPercent: result?.prunedPercent ?? null,
-					});
-
-					const prunedPct = result?.prunedPercent ?? 0;
-					if (prunedPct >= compactPruneThreshold) {
-						logger.info("Pruned percent reached threshold, triggering background compact", {
-							narratorId,
-							contextPct: percentage,
-							prunedPercent: prunedPct,
-							threshold: compactPruneThreshold,
-						});
-						triggerMidTurnCompact(narratorId, locale, onCompactDone, "background", percentage);
-					}
-				})
-				.catch((err) => {
-					logger.error("Failed to update prune boundary", {
-						narratorId,
-						contextPct: percentage,
-						error: String(err),
-					});
-				})
-				.finally(() => {
-					pruneLocks.delete(narratorId);
-				});
-		}
-
-		// ≥ compactStart%: force compact only after pruning reaches the configured
-		// ratio; otherwise keep advancing the prune boundary. Exceptions: when the
-		// pruning window is disabled (compactStart <= pruneStart), or pruning is
-		// disabled for this narrator, skip the prune gate and compact immediately.
-		if (
-			percentage >= thresholds.compactStart &&
-			!pruneLocks.has(narratorId) &&
-			!compactLocks.has(narratorId)
-		) {
-			if (!pruningWindowEnabled) {
-				logger.info("Pruning window disabled, triggering background compact", {
-					narratorId,
-					contextPct: percentage,
-					pruneStart: thresholds.pruneStart,
-					compactStart: thresholds.compactStart,
-				});
-				triggerMidTurnCompact(narratorId, locale, onCompactDone, "background", percentage);
-				return;
-			}
-
-			const compactPruneThreshold = getAutoCompactPruneThreshold();
-			pruneLocks.add(narratorId);
-			narratorService
-				.computeAndUpdatePruneBoundary(narratorId, percentage, thresholds)
-				.then(async (result) => {
-					broadcastToNarrator(narratorId, {
-						type: "prune_boundary",
-						narratorId,
-						boundaryMessageId: result?.boundaryMessageId ?? null,
-						prunedPercent: result?.prunedPercent ?? null,
-					});
-
-					// If prune returned null (e.g. pruning disabled), check the DB flag
-					// to decide whether to skip the prune gate entirely.
-					if (result == null) {
-						const row = await db.query.narrators.findFirst({
-							where: eq(narrators.id, narratorId),
-							columns: { pruneEnabled: true },
-						});
-						if (row && !row.pruneEnabled) {
-							// Pruning disabled — go straight to compact
-							triggerMidTurnCompact(narratorId, locale, onCompactDone, "background", percentage);
-							return;
-						}
-					}
-
-					const prunedPct = result?.prunedPercent ?? 0;
-					if (prunedPct < compactPruneThreshold) {
-						logger.info(
-							"Context above compactStart but prunedPercent below threshold, continuing prune",
-							{
-								narratorId,
-								contextPct: percentage,
-								prunedPercent: prunedPct,
-								threshold: compactPruneThreshold,
-							},
-						);
-						return; // stay in prune mode — don't compact yet
-					}
-					logger.info("Pruned percent reached threshold, triggering background compact", {
-						narratorId,
-						contextPct: percentage,
-						prunedPercent: prunedPct,
-						threshold: compactPruneThreshold,
-					});
-					triggerMidTurnCompact(narratorId, locale, onCompactDone, "background", percentage);
-				})
-				.catch((err) => {
-					logger.error("Failed to update prune boundary (pre-compact check)", {
-						narratorId,
-						contextPct: percentage,
-						error: String(err),
-					});
-				})
-				.finally(() => {
-					pruneLocks.delete(narratorId);
-				});
+		if (percentage >= thresholds.compactStart && !compactLocks.has(narratorId)) {
+			triggerMidTurnCompact(narratorId, locale, onCompactDone, "background", percentage);
 		}
 	};
 
-	const rebuildHistoryForCurrentContext = async (
-		boundary: string | null,
-		includeSystemPrompt: boolean,
-	) => {
-		setPruneBoundary(boundary);
+	const rebuildHistoryForCurrentContext = async (includeSystemPrompt: boolean) => {
 		const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId);
 		// The in-memory history is now rebuilt from the latest (post-compact)
 		// messages, so any pending-compact guard can be released.
@@ -2576,7 +2428,6 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			provider: getProvider(),
 			profile: isSubagentNarrator ? "subagent" : "primary",
 			sourceMessages: rawMsgs,
-			pruneBoundaryId: boundary,
 		});
 		const systemPrompt = includeSystemPrompt
 			? ((await rebuildSystemPrompt?.()) ?? undefined)
@@ -2647,7 +2498,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			clearCompactDone?.();
 		}
 
-		const replacement = await rebuildHistoryForCurrentContext(null, true);
+		const replacement = await rebuildHistoryForCurrentContext(true);
 		logger.info("Reasoning-only blocking compact applied to active history", {
 			narratorId,
 			contextUsagePercentage,
@@ -2662,13 +2513,10 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	) => {
 		// Check if a compact just finished — if so, force a full rebuild
 		// (history + system prompt) so the next API call uses compacted data.
-		// This takes priority over the prune-boundary check below because compact
-		// already clears the prune boundary and returns a fresh message set.
 		const compactJustDone = isCompactDone?.() ?? false;
 		if (compactJustDone) {
 			clearCompactDone?.();
-			// After compact, pruneBoundary is cleared — sync local cache
-			return rebuildHistoryForCurrentContext(null, true);
+			return rebuildHistoryForCurrentContext(true);
 		}
 
 		// Plan mode was toggled manually mid-pass. The rebuild carries TWO things the
@@ -2677,27 +2525,11 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		// (the in-memory history was built before it existed). Without it the model is
 		// never told it entered plan mode while the permission gate already enforces it.
 		if (consumePlanModePromptRebuild(narratorId)) {
-			return rebuildHistoryForCurrentContext(getPruneBoundary(), true);
+			return rebuildHistoryForCurrentContext(true);
 		}
 
-		const row = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { pruneBoundaryMessageId: true },
-		});
-		const thresholds = getContextThresholds(getModel(), getProvider());
-		let newBoundary = row?.pruneBoundaryMessageId ?? null;
-		if (!isDynamicPruningWindowEnabled(thresholds) && newBoundary) {
-			await narratorService.clearPruneBoundary(narratorId);
-			broadcastToNarrator(narratorId, {
-				type: "prune_boundary",
-				narratorId,
-				boundaryMessageId: null,
-				prunedPercent: null,
-			});
-			newBoundary = null;
-		}
-		if (!reason?.force && newBoundary === getPruneBoundary()) return null;
-		return rebuildHistoryForCurrentContext(newBoundary, reason?.force === true);
+		if (!reason?.force) return null;
+		return rebuildHistoryForCurrentContext(true);
 	};
 
 	return { onContextUsage, onBeforeTurn, onReasoningOnlyHighContext };
@@ -2846,6 +2678,10 @@ async function feedMessageUnlocked(
 	let userMsg: typeof narratorMessages.$inferSelect;
 	let effectivePrompt: string;
 	try {
+		// Materialize publication outbox entries before claiming the mailbox head. A pending
+		// publication is an ordering barrier; without flushing it here, an idle user send can
+		// be rejected even though the blocking task notice is still invisible in history.
+		flushRuntimePublications(narratorId);
 		const acceptedId =
 			internalOptions?.bufferedId ??
 			(
@@ -4796,6 +4632,13 @@ async function reExecuteDeniedToolCallUnlocked(
 						names: [...active._blockedSkills.names],
 					},
 					requireToolCallBinding: true,
+					onInternalReadAuthorization: async (toolUseId, binding) => {
+						await narratorPersistence.validateToolCallBinding(narratorId, toolUseId, binding);
+					},
+					onInternalReadCreated: (toolUseId, binding, input, sequence) =>
+						narratorPersistence.createInternalRead(narratorId, toolUseId, binding, input, sequence),
+					onInternalReadCompleted: (toolUseId, binding, result) =>
+						narratorPersistence.completeInternalRead(narratorId, toolUseId, binding, result),
 					onToolExecutionStarting: (resolvedToolUseId, binding, startedAt) =>
 						narratorPersistence.claimToolCallExecution(
 							narratorId,
@@ -7484,8 +7327,6 @@ export {
 	compactLocks,
 	isCompactInProgress,
 	markCompactAsBlocking,
-	pruneLocks,
-	pruneToolCalls,
 	retryFailedCompact,
 	runCustomCompact,
 	runSegmentCompact,

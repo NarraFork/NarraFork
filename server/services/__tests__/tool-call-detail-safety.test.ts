@@ -1008,7 +1008,7 @@ afterEach(() => {
 	}
 	if (createdNarrators.length > 0) {
 		db.update(narrators)
-			.set({ parentNarratorId: null, forkMessageId: null, pruneBoundaryMessageId: null })
+			.set({ parentNarratorId: null, forkMessageId: null })
 			.where(inArray(narrators.id, createdNarrators))
 			.run();
 		db.delete(narratorMessageRefs)

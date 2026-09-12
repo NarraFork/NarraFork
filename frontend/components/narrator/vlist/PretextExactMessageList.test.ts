@@ -250,9 +250,6 @@ describe("PretextExactMessageList", () => {
 		expect(source).toContain("createLodFocusPoint(clientY, node.getBoundingClientRect().top, now)");
 		expect(source).toContain("emit(dir, event.clientY)");
 		expect(source).toContain("emit(dir, pinchCenterY(Array.from(event.touches)))");
-		expect(source).toContain("pruneBoundaryMessageId: pretextDocument.pruneBoundaryMessageId");
-		expect(source).toContain("prunedPercent: pretextDocument.prunedPercent");
-		expect(source).toContain("onPruneBoundary: bumpMessageRevision");
 		// The alt-gesture preference is threaded through so the wheel handler can
 		// fall through to normal scrolling when the gesture is turned off.
 		expect(source).toContain("resolveWheelLodStep(event, lodAltGesture)");

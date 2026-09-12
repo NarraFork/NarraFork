@@ -569,14 +569,6 @@ describe("classifyContentBlock", () => {
 	});
 });
 
-describe("adaptSegment — prune divider", () => {
-	it("maps to prune-divider kind", () => {
-		const specs = adaptSegment({ kind: "prune-divider", label: "older" }, CTX);
-		expect(specs).toHaveLength(1);
-		expect(specs[0]!.kind).toBe("prune-divider");
-	});
-});
-
 describe("adaptSegment — user message", () => {
 	it("produces a single message-bubble with joined plain text", () => {
 		const seg: AdapterSegment = {
@@ -2647,7 +2639,6 @@ describe("LOD matrix adapter semantics", () => {
 describe("adaptSegments + registry integration", () => {
 	it("every produced kind exists in the registry", () => {
 		const segments: AdapterSegment[] = [
-			{ kind: "prune-divider" },
 			{
 				kind: "message",
 				msg: { id: "u", role: "user", contentJson: [{ type: "text", text: "hi" }] },

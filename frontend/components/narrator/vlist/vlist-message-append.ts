@@ -22,7 +22,7 @@
  * Appending is only valid for a message that goes at the TAIL of the loaded window
  * and does not restructure anything around it. A structural insert (compact marker,
  * ask-in-passing) lands mid-history and shifts every following seq; an edit, a
- * delete or a prune rewrites existing rows. Those keep the reload path.
+ * delete rewrites existing rows. Those keep the reload path.
  *
  * Pure: no React, no DOM, no network.
  */

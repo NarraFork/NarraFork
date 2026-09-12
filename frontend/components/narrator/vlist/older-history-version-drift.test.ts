@@ -96,8 +96,6 @@ function fakeServer(totalMessages: number, pageSize = 20) {
 			hasNext: false,
 			hasPrev: ((slice[0]?.seq as number) ?? 0) > 0,
 			messageVersion: state.version,
-			pruneBoundaryMessageId: null,
-			prunedPercent: null,
 		};
 	};
 	return { state, fetchPage };

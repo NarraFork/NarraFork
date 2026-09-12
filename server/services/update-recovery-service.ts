@@ -1,6 +1,11 @@
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
+import {
+	type AwaitAnyEventResult,
+	awaitAnyRuntimeEvent,
+	formatAwaitWakeResult,
+} from "./agent-runtime/await-coordinator";
 import { flushRuntimePublications, runtimePublication } from "./agent-runtime/publication";
 
 function readAgentLogicalRunId(narratorId: string): string | undefined {
@@ -562,15 +567,22 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 			});
 			continue;
 		}
+		if (toolCall.toolName !== "Await") continue;
 		const awaitEntry = runningAwaits.get(toolCall.toolUseId);
-		if (
-			toolCall.toolName === "Await" &&
-			(awaitEntry?.awaitType === "agent" || input?.type === "agent")
-		) {
+		const existingContinuation = await toolContinuationService.getByToolCallId(toolCall.id);
+		const hasOnlyWaitFor = !!input && Object.hasOwn(input, "onlyWaitFor");
+		const inputAwaitMode =
+			!hasOnlyWaitFor || input?.onlyWaitFor === true ? ("target" as const) : ("any" as const);
+		const awaitMode =
+			awaitEntry?.awaitMode ??
+			payloadString(existingContinuation?.payloadJson ?? null, "awaitMode") ??
+			inputAwaitMode;
+		if (awaitMode === "any" || awaitEntry?.awaitType === "agent" || input?.type === "agent") {
 			const targetId =
-				awaitEntry?.targetId ?? (typeof input?.id === "string" ? input.id : undefined);
-			if (!targetId) continue;
-			const existingContinuation = await toolContinuationService.getByToolCallId(toolCall.id);
+				awaitMode === "target"
+					? (awaitEntry?.targetId ?? (typeof input?.id === "string" ? input.id : undefined))
+					: undefined;
+			if (awaitMode === "target" && !targetId) continue;
 			const deadlineAt =
 				awaitEntry?.deadlineAt ??
 				payloadString(existingContinuation?.payloadJson ?? null, "awaitDeadlineAt") ??
@@ -584,7 +596,12 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 				kind: "await_agent",
 				state: "waiting",
 				deadlineAt,
-				payloadJson: { targetId, awaitDeadlineAt: deadlineAt },
+				payloadJson: {
+					awaitMode,
+					awaitType: typeof input?.type === "string" ? input.type : awaitEntry?.awaitType,
+					...(targetId ? { targetId } : {}),
+					awaitDeadlineAt: deadlineAt,
+				},
 			});
 		}
 	}
@@ -1016,6 +1033,32 @@ export function buildRecoveredAwaitToolOutput(
 	};
 }
 
+export function buildRecoveredAnyAwaitToolOutput(
+	input: { type?: string; id?: string },
+	result: AwaitAnyEventResult,
+): { _text: string; _metadata: Record<string, unknown> } {
+	const event = result.status === "event" ? result.event : undefined;
+	return {
+		_text: formatAwaitWakeResult(result),
+		_metadata: {
+			kind: "await",
+			awaitMode: "any",
+			awaitType: input.type,
+			targetId: input.id,
+			status: result.status,
+			...(event
+				? {
+						eventSource: event.source,
+						...(event.targetId ? { resolvedId: event.targetId } : {}),
+						...(event.taskId ? { taskId: event.taskId } : {}),
+						...(event.questionId ? { questionId: event.questionId } : {}),
+						...(event.mailboxKind ? { mailboxKind: event.mailboxKind } : {}),
+					}
+				: {}),
+		},
+	};
+}
+
 export function buildRecoveredSendAwaitToolOutput(
 	snapshot: AgentReplyWaitRunSnapshot,
 	result: { output: string; targets: unknown[] },
@@ -1036,13 +1079,52 @@ async function restoreAwait(
 	signal: AbortSignal,
 	onMounted: () => void,
 ): Promise<void> {
-	const targetId = payloadString(record.payloadJson, "targetId");
-	if (!targetId) throw new Error("Await continuation is missing targetId");
+	const awaitMode = payloadString(record.payloadJson, "awaitMode") ?? "target";
 	const awaitDeadlineAt = payloadString(record.payloadJson, "awaitDeadlineAt") ?? record.deadlineAt;
 	const remainingMs = Math.max(
 		(awaitDeadlineAt ? Date.parse(awaitDeadlineAt) : Date.now()) - Date.now(),
 		0,
 	);
+	if (awaitMode === "any") {
+		const toolCall = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, record.toolCallId),
+		});
+		if (!toolCall) throw new Error("Await tool call was deleted before recovery");
+		const input =
+			toolCall.inputJson &&
+			typeof toolCall.inputJson === "object" &&
+			!Array.isArray(toolCall.inputJson)
+				? (toolCall.inputJson as { type?: unknown; id?: unknown })
+				: {};
+		const waiting = awaitAnyRuntimeEvent({
+			narratorId: record.narratorId,
+			timeoutMs: remainingMs,
+			signal,
+		});
+		onMounted();
+		const result = await waiting;
+		if (signal.aborted) throw signal.reason ?? new Error("Await continuation recovery was aborted");
+		const { narratorService } = await import("./narrator-service");
+		await narratorService.updateToolCallResult(
+			toolCall.toolUseId,
+			{
+				output: buildRecoveredAnyAwaitToolOutput(
+					{
+						type: typeof input.type === "string" ? input.type : undefined,
+						id: typeof input.id === "string" ? input.id : undefined,
+					},
+					result,
+				),
+				status: "success",
+				completedAt: Date.now(),
+			},
+			toolCall.messageId,
+			toolCall.id,
+		);
+		return;
+	}
+	const targetId = payloadString(record.payloadJson, "targetId");
+	if (!targetId) throw new Error("Await continuation is missing targetId");
 	const { awaitAgentResultDetailed } = await import("./agent-communication");
 	const waiting = awaitAgentResultDetailed({
 		callerNarratorId: record.narratorId,

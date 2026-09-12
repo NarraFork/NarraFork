@@ -14,7 +14,6 @@ let awaitCompactCompletionCalls: number;
 let runCustomCompactCalls: number;
 let awaitCompactImpl: (narratorId: string, signal?: AbortSignal) => Promise<void>;
 let runCustomCompactImpl: () => Promise<boolean>;
-let computePruneImpl: () => Promise<{ boundaryMessageId: string; prunedPercent: number } | null>;
 
 function nextLatestCompactSeq(): number | null {
 	// Return the head of the queue, keeping the last value sticky for repeated reads.
@@ -28,8 +27,6 @@ mock.module("../narrator-service", () => ({
 	narratorService: {
 		...realNarratorService.narratorService,
 		getLatestCompactSeq: mock(async () => nextLatestCompactSeq()),
-		getById: mock(async (id: string) => ({ id, pruneBoundaryMessageId: null })),
-		computeAndUpdatePruneBoundary: mock(() => computePruneImpl()),
 		getCompactBoundaryMessage: mock(async () => "boundary-msg"),
 		getEmergencyCompactBoundaryMessage: mock(async () => null),
 	},
@@ -70,7 +67,6 @@ beforeEach(() => {
 	runCustomCompactCalls = 0;
 	awaitCompactImpl = async () => {};
 	runCustomCompactImpl = async () => true;
-	computePruneImpl = async () => null;
 	compactLocks.clear();
 });
 
@@ -156,14 +152,17 @@ describe("handleContextOverflow — wait for in-flight compact before spending r
 		expect(runCustomCompactCalls).toBe(0);
 	});
 
-	test("no in-flight compact and quota available starts a fresh emergency compact", async () => {
+	test.each([
+		"anthropic",
+		"codex",
+	])("%s starts emergency compact on the first overflow", async (provider) => {
 		latestCompactSeqQueue = [null];
 		runCustomCompactImpl = async () => true;
 
 		const result = await handleContextOverflow({
 			narratorId: NARRATOR_ID,
 			locale: "en",
-			provider: "anthropic",
+			provider,
 			model: "test-model",
 			overflowRetries: 0,
 			maxRetries: 2,

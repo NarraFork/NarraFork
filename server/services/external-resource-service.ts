@@ -1463,8 +1463,6 @@ export interface ExternalMessagePage {
 	detail: ExternalMessageDetail;
 	/** Present only when the served tier is below the requested one. */
 	detailRequested?: ExternalMessageDetail;
-	pruneBoundaryMessageId: string | null;
-	prunedPercent: number | null;
 }
 
 export async function listExternalNarratorMessages(
@@ -1548,7 +1546,7 @@ export async function listExternalNarratorMessages(
 
 	const narratorMeta = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { messageVersion: true, pruneBoundaryMessageId: true, prunedPercent: true },
+		columns: { messageVersion: true },
 	});
 	if (!narratorMeta) throw new NotFoundError("Narrator", narratorId);
 	const envelope = {
@@ -1556,8 +1554,6 @@ export async function listExternalNarratorMessages(
 		documentRevision: narratorMeta.messageVersion,
 		detail,
 		...(detail === requested ? {} : { detailRequested: requested }),
-		pruneBoundaryMessageId: narratorMeta.pruneBoundaryMessageId ?? null,
-		prunedPercent: narratorMeta.prunedPercent ?? null,
 	};
 
 	if (detail === "text") {

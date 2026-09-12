@@ -26,6 +26,7 @@ import {
 } from "../lib/browser/handoff";
 import { logger } from "../lib/logger";
 import { getToolMessageWithParams } from "../lib/prompt-i18n";
+import { broadcastToNarrator } from "../websocket/narrator-ws";
 
 /**
  * Capture and persist all active browser sessions so a replacement (post-update) process can
@@ -180,13 +181,28 @@ async function notifyFailedNarrators(
 				ids,
 				reason,
 			});
-			await narratorService.persistSystemMessage(narratorId, text, [
+			const msg = await narratorService.persistSystemMessage(narratorId, text, [
 				{
 					type: "browser_session_lost",
 					sessionIds: failures.map((f) => f.sessionId),
 					reasons: failures.map((f) => f.reason),
+					modelText: text,
 				},
 			]);
+			broadcastToNarrator(narratorId, {
+				type: "message",
+				narratorId,
+				message: {
+					id: msg.id,
+					narratorId,
+					role: msg.role,
+					contentJson: msg.contentJson,
+					contentText: msg.contentText,
+					createdAt: msg.createdAt,
+					seq: msg.seq,
+					children: [],
+				},
+			});
 		} catch (error) {
 			logger.warn("Failed to notify narrator of lost browser sessions", {
 				narratorId,

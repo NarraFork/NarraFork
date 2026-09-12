@@ -365,7 +365,7 @@ export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKi
 	}
 	if (
 		(tu.name === "Agent" && typeof tu.input.stop !== "string") ||
-		(tu.name === "Await" && tu.input.type === "agent") ||
+		(tu.name === "Await" && (tu.input.onlyWaitFor !== true || tu.input.type === "agent")) ||
 		(tu.name === "Send" && tu.input.await === true)
 	) {
 		return "resumable";
@@ -417,7 +417,11 @@ async function upsertDeferredTool(
 			permissionGranted,
 			...(executionTarget ? { executionTarget } : {}),
 			...(tu.name === "Await" && typeof tu.input.type === "string"
-				? { awaitType: tu.input.type }
+				? {
+						awaitType: tu.input.type,
+						awaitMode: tu.input.onlyWaitFor === true ? "target" : "any",
+						onlyWaitFor: tu.input.onlyWaitFor === true,
+					}
 				: {}),
 			...(tu.name === "Agent"
 				? {
@@ -1074,6 +1078,7 @@ export async function executeTool(
 				}),
 			currentToolUseId: tu.toolUseId,
 			toolCallBinding,
+			executionSegmentId: config.executionSegmentId ?? toolCallBinding?.executionSegmentId,
 			reflectionLoop: config.reflectionLoop?.context,
 			resolveBackend: (device?: string) => {
 				if (frozenExecution) {
@@ -1208,6 +1213,100 @@ export async function executeTool(
 		} catch (error) {
 			updateExecutionLease.release();
 			throw error;
+		}
+
+		if (
+			tu.name === "Eval" &&
+			ctx.toolCallBinding &&
+			config.onInternalReadCreated &&
+			config.onInternalReadCompleted &&
+			config.onInternalReadAuthorization &&
+			config.onToolExecutionStarting &&
+			config.onExecutionTargetResolved &&
+			config.onExecutionPlanResolved
+		) {
+			const parentBinding = ctx.toolCallBinding;
+			const create = config.onInternalReadCreated;
+			const complete = config.onInternalReadCompleted;
+			const authorize = config.onInternalReadAuthorization;
+			const claim = config.onToolExecutionStarting;
+			let sequence = 0;
+			const defaultDeviceId = config.defaultDeviceId;
+			ctx.recheckAuthorization = async () => {
+				config.signal.throwIfAborted();
+				await authorize(tu.toolUseId, parentBinding);
+				await config.runtimeAuthorizationGuard?.();
+			};
+			ctx.executeRead = async (input, signal) => {
+				// Metadata and identities are generated on the server, never accepted from script.
+				const readInput = Object.fromEntries(
+					Object.entries(input).filter(([key]) => key !== "__internalRead"),
+				);
+				const child = await create(tu.toolUseId, parentBinding, readInput, ++sequence);
+				let result: ToolExecResult;
+				let grant: UpdateToolStartGrant | undefined;
+				try {
+					const combinedSignal = AbortSignal.any([config.signal, signal]);
+					combinedSignal.throwIfAborted();
+					await ctx.recheckAuthorization?.();
+					const readTool = toolRegistry.get("Read");
+					if (!readTool || (config.toolFilter && !config.toolFilter(readTool))) {
+						throw new Error("Read is unavailable under this session's tool filter");
+					}
+					const childTu: AgentToolUse = {
+						name: "Read",
+						toolUseId: child.toolUseId,
+						input: readInput,
+					};
+					// The synchronous admission is irrevocable. Never wait behind the update gate
+					// while Eval holds the outer lease: that would deadlock update draining.
+					const admission = beginToolStartAdmission(
+						classifyToolUpdateExecution(childTu),
+						config.narratorId,
+						child.toolUseId,
+					);
+					if (admission.status !== "granted") {
+						admission.activity.release();
+						throw new Error("Internal Read refused: update admission is closed");
+					}
+					grant = admission.grant;
+					result = await executeTool(
+						childTu,
+						{
+							...config,
+							defaultDeviceId,
+							signal: combinedSignal,
+							permissionHandler: async (...args) => {
+								combinedSignal.throwIfAborted();
+								const permission = await config.permissionHandler(...args);
+								combinedSignal.throwIfAborted();
+								return permission;
+							},
+							onToolExecutionStarting: async (...args) => {
+								combinedSignal.throwIfAborted();
+								await ctx.recheckAuthorization?.();
+								const receipt = await claim(...args);
+								combinedSignal.throwIfAborted();
+								return receipt;
+							},
+						},
+						{
+							toolCallBinding: child.binding,
+							admissionState: { toolCallBinding: child.binding, startGrant: grant },
+						},
+					);
+				} catch (error) {
+					result = {
+						output: error instanceof Error ? error.message : String(error),
+						isError: true,
+						durationMs: 0,
+					};
+				} finally {
+					grant?.release();
+				}
+				await complete(child.toolUseId, child.binding, result);
+				return result;
+			};
 		}
 
 		// Progress starts only after final admission; a deferred tool remains visually pending.

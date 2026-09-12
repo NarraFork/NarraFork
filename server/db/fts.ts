@@ -70,10 +70,10 @@ const FORCE_FULL_FTS_REBUILD =
 /**
  * Probe an external-content FTS5 table for corruption without rebuilding it.
  *
- * `INSERT INTO <t>(<t>) VALUES('integrity-check')` verifies that the FTS index is internally
- * consistent with its content table and that its b-tree structure is well-formed. It is far
- * cheaper than a full 'rebuild' (no re-tokenization of the whole corpus), so on the common case
- * — an unclean shutdown that did NOT actually corrupt the index — we skip the expensive rebuild.
+ * `INSERT INTO <t>(<t>, rank) VALUES('integrity-check', 1)` verifies both the index and
+ * its external content. Without rank=1, SQLite only checks the index internally and misses
+ * rowid drift after a content-table rebuild. This can scan the content, so it is restricted
+ * to startup maintenance after an unclean shutdown, never the clean-start fast path.
  *
  * Returns `"ok"` when the probe passes, `"corrupt"` when it throws (SQLITE_CORRUPT_VTAB or a
  * "database disk image is malformed" style error), signalling the caller to rebuild that table.
@@ -86,7 +86,7 @@ const FORCE_FULL_FTS_REBUILD =
  */
 function probeFtsIntegrity(sqlite: Database, table: string): "ok" | "corrupt" {
 	try {
-		sqlite.run(`INSERT INTO ${table}(${table}) VALUES ('integrity-check')`);
+		sqlite.run(`INSERT INTO ${table}(${table}, rank) VALUES ('integrity-check', 1)`);
 		return "ok";
 	} catch (err) {
 		logger.warn("FTS integrity probe failed — table will be rebuilt", {
@@ -95,6 +95,28 @@ function probeFtsIntegrity(sqlite: Database, table: string): "ok" | "corrupt" {
 		});
 		return "corrupt";
 	}
+}
+
+/** Refill the rowid-bound draft index without relying on FTS5's external-content rebuild command. */
+function repopulateKnowledgeDraftsFts(sqlite: Database, hasKnowledgeEntries: boolean): void {
+	const refill = sqlite.transaction(() => {
+		sqlite.run("DELETE FROM knowledge_drafts_fts");
+		if (hasKnowledgeEntries) {
+			sqlite.run(`
+				INSERT INTO knowledge_drafts_fts(rowid, title, content)
+				SELECT d.rowid, COALESCE(e.title, d.title, ''), d.content
+				FROM knowledge_drafts d
+				LEFT JOIN knowledge_entries e ON e.id = d.entry_id
+			`);
+		} else {
+			sqlite.run(`
+				INSERT INTO knowledge_drafts_fts(rowid, title, content)
+				SELECT rowid, COALESCE(title, ''), content
+				FROM knowledge_drafts
+			`);
+		}
+	});
+	refill();
 }
 
 export function ensureFts(
@@ -211,6 +233,7 @@ export function ensureFts(
 	// populated even on a clean startup (a brand-new empty FTS table won't otherwise be
 	// caught by the unclean-shutdown rebuild path).
 	let draftsFtsFreshlyCreated = false;
+	let draftsFtsPopulated = false;
 	if (hasKnowledgeDrafts) {
 		const draftsFtsExists =
 			(
@@ -226,6 +249,101 @@ export function ensureFts(
 				title, content, tokenize='trigram'
 			)
 		`);
+	}
+
+	// A Drizzle content-table rebuild drops its triggers and can renumber rowids while
+	// leaving the external-content FTS index untouched (for example migration 0170).
+	// Check BEFORE reinstalling triggers, even on a clean startup. Missing triggers are
+	// also a durable retry signal: rebuild must succeed before that signal is removed.
+	// Only inspect the fixed set of schema objects; healthy clean starts scan no content.
+	const repairedContentIndexes = new Set<string>();
+	const contentIndexTriggerSets = [
+		{
+			table: "chapters_fts",
+			rebuild: true,
+			triggers: ["chapters_fts_insert", "chapters_fts_update", "chapters_fts_delete"],
+		},
+		{
+			table: "narrator_messages_fts",
+			rebuild: true,
+			triggers: [
+				"narrator_messages_fts_insert",
+				"narrator_messages_fts_update",
+				"narrator_messages_fts_delete",
+			],
+		},
+		{
+			table: "narrators_fts",
+			rebuild: true,
+			triggers: ["narrators_fts_insert", "narrators_fts_update", "narrators_fts_delete"],
+		},
+		...(hasKnowledgeEntries
+			? [
+					{
+						table: "knowledge_entries_fts",
+						rebuild: true,
+						triggers: [
+							"knowledge_entries_fts_insert",
+							"knowledge_entries_fts_update",
+							"knowledge_entries_fts_delete",
+						],
+					},
+				]
+			: []),
+		...(hasKnowledgeDrafts
+			? [
+					{
+						table: "knowledge_drafts_fts",
+						rebuild: false,
+						triggers: [
+							"knowledge_drafts_fts_insert",
+							"knowledge_drafts_fts_update",
+							"knowledge_drafts_fts_delete",
+							"knowledge_drafts_fts_entry_title",
+						],
+					},
+				]
+			: []),
+	] as const;
+	for (const { table, rebuild, triggers: requiredTriggers } of contentIndexTriggerSets) {
+		const placeholders = requiredTriggers.map(() => "?").join(", ");
+		const triggers = sqlite
+			.prepare(
+				`SELECT name FROM sqlite_master WHERE type = 'trigger' AND name IN (${placeholders})`,
+			)
+			.all(...requiredTriggers);
+		if (triggers.length === requiredTriggers.length) continue;
+		const startedAt = Date.now();
+		try {
+			if (table === "knowledge_drafts_fts") {
+				// This is a plain FTS table: refill it from the source rows before restoring any
+				// trigger, so a failed refill leaves both the old index and the missing-trigger
+				// retry signal intact.
+				repopulateKnowledgeDraftsFts(sqlite, hasKnowledgeEntries);
+				draftsFtsPopulated = true;
+			} else if (rebuild) {
+				sqlite.run(`INSERT INTO ${table}(${table}) VALUES ('rebuild')`);
+			}
+			repairedContentIndexes.add(table);
+			logger.info(
+				table === "knowledge_drafts_fts"
+					? "FTS index repopulated before restoring missing sync triggers"
+					: rebuild
+						? "FTS index rebuilt before restoring missing sync triggers"
+						: "FTS index marked for repopulation before restoring missing sync triggers",
+				{
+					table,
+					durationMs: Date.now() - startedAt,
+				},
+			);
+		} catch (error) {
+			logger.error("FTS content-table recovery failed; startup cannot continue", {
+				table,
+				durationMs: Date.now() - startedAt,
+				error: String(error),
+			});
+			throw error;
+		}
 	}
 
 	// --- Sync triggers: chapters ---
@@ -404,6 +522,7 @@ export function ensureFts(
 		const healthy: string[] = [];
 		try {
 			for (const table of ftsTables) {
+				if (repairedContentIndexes.has(table)) continue;
 				if (probeThenRebuild && probeFtsIntegrity(sqlite, table) === "ok") {
 					healthy.push(table);
 					continue;
@@ -429,19 +548,15 @@ export function ensureFts(
 	// Populate knowledge_drafts_fts when rebuilding OR when the table was just created
 	// (a brand-new empty table on a clean startup isn't covered by needsRebuild). It is a
 	// plain (non external-content) FTS table, so 'rebuild' is unavailable — refill manually
-	// with rowid bound to knowledge_drafts.rowid and title de-normalized from the entry.
-	if (hasKnowledgeDrafts && (needsRebuild || draftsFtsFreshlyCreated)) {
-		try {
-			sqlite.run("DELETE FROM knowledge_drafts_fts");
-			sqlite.run(`
-				INSERT INTO knowledge_drafts_fts(rowid, title, content)
-				SELECT d.rowid, COALESCE(e.title, d.title, ''), d.content
-				FROM knowledge_drafts d
-				LEFT JOIN knowledge_entries e ON e.id = d.entry_id
-			`);
-		} catch (err) {
-			logger.warn("knowledge_drafts_fts populate failed on startup", { error: String(err) });
-		}
+	// with rowid bound to knowledge_drafts.rowid and title de-normalized from the entry. A
+	// missing-trigger repair already performed this refill before trigger installation.
+	if (
+		hasKnowledgeDrafts &&
+		!draftsFtsPopulated &&
+		(needsRebuild || draftsFtsFreshlyCreated || repairedContentIndexes.has("knowledge_drafts_fts"))
+	) {
+		repopulateKnowledgeDraftsFts(sqlite, hasKnowledgeEntries);
+		draftsFtsPopulated = true;
 	}
 
 	// Clear the clean shutdown marker — it will be set again on clean exit.
@@ -449,5 +564,5 @@ export function ensureFts(
 	// process from being misclassified as a crashed previous process.
 	sqlite.run("PRAGMA application_id = 0");
 
-	return { rebuilt: needsRebuild };
+	return { rebuilt: needsRebuild || repairedContentIndexes.size > 0 };
 }

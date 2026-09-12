@@ -34,8 +34,6 @@ function input(
 	return {
 		messages,
 		messageVersion: 7,
-		pruneBoundaryMessageId: null,
-		prunedPercent: null,
 		oldestLoadedSeq: messages.length > 0 ? Math.min(...seqs) : null,
 		hasPrev: false,
 		...overrides,

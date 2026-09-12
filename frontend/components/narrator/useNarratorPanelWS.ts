@@ -128,8 +128,6 @@ interface InitialMessageStatus {
 	statusReady?: boolean;
 	contextPercent?: number | null;
 	turnUsageJson?: NarratorMsg["turnUsageJson"] | null;
-	pruneBoundaryMessageId?: string | null;
-	prunedPercent?: number | null;
 }
 
 /**
@@ -217,10 +215,7 @@ export interface UseNarratorPanelWSReturn {
 	promptTokens: number | null;
 	contextWindow: number | null;
 	isEstimated: boolean;
-	activePruneStart: number | null;
 	activeCompactStart: number | null;
-	pruneBoundaryMessageId: string | null;
-	prunedPercent: number | null;
 	compactProgress: CompactProgressState | null;
 	/**
 	 * Last compact failure observed over WS, kept until the next compact starts,
@@ -250,7 +245,7 @@ export interface UseNarratorPanelWSReturn {
 
 // --- Reducer for co-updated state ---
 // These fields are frequently set together in the same WS callback
-// (onStatusChange, onContextUsage, onPruneBoundary, onCompactDone, etc.).
+// (onStatusChange, onContextUsage, onCompactDone, etc.).
 // Merging them into a single useReducer avoids multiple independent re-renders
 // per callback since React batches reducer dispatches into one update.
 
@@ -261,10 +256,7 @@ interface StatusState {
 	promptTokens: number | null;
 	contextWindow: number | null;
 	isEstimated: boolean;
-	activePruneStart: number | null;
 	activeCompactStart: number | null;
-	pruneBoundaryMessageId: string | null;
-	prunedPercent: number | null;
 	compactProgress: CompactProgressState | null;
 	compactFailure: { error: string } | null;
 }
@@ -451,10 +443,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		promptTokens: null,
 		contextWindow: null,
 		isEstimated: false,
-		activePruneStart: null,
 		activeCompactStart: null,
-		pruneBoundaryMessageId: null,
-		prunedPercent: null,
 		compactProgress: null,
 		compactFailure: null,
 	});
@@ -465,10 +454,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		promptTokens,
 		contextWindow,
 		isEstimated,
-		activePruneStart,
 		activeCompactStart,
-		pruneBoundaryMessageId,
-		prunedPercent,
 		compactProgress,
 		compactFailure,
 	} = statusState;
@@ -553,7 +539,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// --- Viewers ---
 	const [viewers, setViewers] = useState<ViewerInfo[]>([]);
 
-	// --- Initialize context/prune state from initial message data ---
+	// --- Initialize context state from initial message data ---
 	// (handled below after WS section)
 
 	// --- Permission decision refs ---
@@ -1123,7 +1109,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, ...overrides } : old,
 				);
 			},
-			onContextUsage: (percentage, pTokens, ctxWindow, isEst, pruneStart, compactStart) => {
+			onContextUsage: (percentage, pTokens, ctxWindow, isEst, compactStart) => {
 				dispatchStatus({
 					type: "patch",
 					payload: {
@@ -1132,15 +1118,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						promptTokens: pTokens ?? null,
 						contextWindow: ctxWindow ?? null,
 						isEstimated: !!isEst,
-						activePruneStart: pruneStart ?? null,
 						activeCompactStart: compactStart ?? null,
 					},
-				});
-			},
-			onPruneBoundary: (boundaryMessageId, prunedPct) => {
-				dispatchStatus({
-					type: "patch",
-					payload: { pruneBoundaryMessageId: boundaryMessageId, prunedPercent: prunedPct },
 				});
 			},
 			onQuotaBalance: (balance, detailedBalance) => {
@@ -1316,8 +1295,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					type: "patch",
 					payload: {
 						substatus: nextSubstatus,
-						pruneBoundaryMessageId: null,
-						prunedPercent: null,
 						contextStale: true,
 						compactProgress: null,
 						// A successful compact clears any earlier failure; a FAILED compact
@@ -1531,7 +1508,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		statusState.substatus,
 	]);
 
-	// --- Initialize context/prune state from initial message data ---
+	// --- Initialize context state from initial message data ---
 	const contextInitRef = useRef(false);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reset only when narratorId changes
 	useEffect(() => {
@@ -1542,12 +1519,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		if (contextInitRef.current) return;
 		if (!initialMessageStatus?.statusReady) return;
 		const patch: Partial<StatusState> = {};
-		if (initialMessageStatus.pruneBoundaryMessageId !== undefined) {
-			patch.pruneBoundaryMessageId = initialMessageStatus.pruneBoundaryMessageId ?? null;
-		}
-		if (initialMessageStatus.prunedPercent !== undefined) {
-			patch.prunedPercent = initialMessageStatus.prunedPercent ?? null;
-		}
 		if (initialMessageStatus.contextPercent != null) {
 			patch.contextPercent = initialMessageStatus.contextPercent;
 			const tu = initialMessageStatus.turnUsageJson as Record<string, unknown> | null | undefined;
@@ -1585,10 +1556,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			promptTokens,
 			contextWindow,
 			isEstimated,
-			activePruneStart,
 			activeCompactStart,
-			pruneBoundaryMessageId,
-			prunedPercent,
 			compactProgress,
 			compactFailure,
 			quotaBalance,
@@ -1623,10 +1591,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			promptTokens,
 			contextWindow,
 			isEstimated,
-			activePruneStart,
 			activeCompactStart,
-			pruneBoundaryMessageId,
-			prunedPercent,
 			compactProgress,
 			compactFailure,
 			quotaBalance,

@@ -109,5 +109,8 @@
 	"attributionSubagentDetail": "{{name}}（{{type}} 子代理）",
 	"attributionSubagentDetailWithParent": "{{name}}（{{parent}} 的 {{type}} 子代理）",
 	"attributionImprecise": "观测记录不能证明改动的独占、实测归属",
-	"attributionWindowTruncated": "归因未完全加载 —— 部分改动或路径超出了查询窗口。历史参与者列表及风险标记可能不完整，没有徽章也不代表文件无人修改。"
+	"attributionWindowTruncated": "归因未完全加载 —— 部分改动或路径超出了查询窗口。历史参与者列表及风险标记可能不完整，没有徽章也不代表文件无人修改。",
+	"attributionExplanationLabel": "解释归因标签",
+	"attributionIncompleteShort": "不完整",
+	"attributionIncompleteLabel": "归因信息不完整"
 }

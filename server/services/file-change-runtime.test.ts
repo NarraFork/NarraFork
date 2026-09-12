@@ -372,6 +372,7 @@ describe("actual Write/Edit local evidence", () => {
 			settlement: "settled",
 			executionOutcome: "succeeded",
 			evidenceVersion: 2,
+			journalSeq: 1,
 		});
 		expect(db.select().from(schema.narratorToolCalls).get()?.fileChangeOperationId).toBe(
 			effect.operationId,
@@ -390,6 +391,17 @@ describe("actual Write/Edit local evidence", () => {
 			activeLeaseId: null,
 			activeMutationCount: 0,
 		});
+	});
+
+	test("allocates one instance sequence for each committed file operation and effect", async () => {
+		const first = join(workspace, "sequence-a.txt");
+		const second = join(workspace, "sequence-b.txt");
+		expect((await write(first, "a")).isError).toBeUndefined();
+		expect((await write(second, "b")).isError).toBeUndefined();
+		const operationRows = operations().sort((a, b) => (a.journalSeq ?? 0) - (b.journalSeq ?? 0));
+		const effectRows = effects().sort((a, b) => (a.journalSeq ?? 0) - (b.journalSeq ?? 0));
+		expect(operationRows.map((row) => row.journalSeq)).toEqual([1, 2]);
+		expect(effectRows.map((row) => row.journalSeq)).toEqual([1, 2]);
 	});
 
 	test("Write preserves CRLF; Edit captures intervening human hunk without claiming it", async () => {
@@ -1188,7 +1200,7 @@ describe("lazy namespace, coordination and cancellation", () => {
 		expect(await bytesFor(effects()[1].beforeStateJson)).toEqual(Buffer.from("two"));
 	});
 
-	test("known co-writer lowers only the initial attribution ceiling, not execution settlement", async () => {
+	test("known co-writer does not downgrade an independently journaled write", async () => {
 		const path = join(workspace, "ambiguous.txt");
 		await writeFile(path, "one");
 		io.apply = async (input) => {
@@ -1205,13 +1217,13 @@ describe("lazy namespace, coordination and cancellation", () => {
 		expect(result.isError).toBeUndefined();
 		expect(effects()[0]).toMatchObject({
 			settlement: "settled",
-			attributionGrade: "observed_ambiguous",
+			attributionGrade: "measured",
 			outcome: "changed",
-			linesAdded: null,
-			linesRemoved: null,
+			linesAdded: 1,
+			linesRemoved: 1,
 		});
 		expect(operations()[0]).toMatchObject({ executionOutcome: "succeeded", settlement: "settled" });
-		expect(result.metadata?.linesAdded).toBeUndefined();
+		expect(result.metadata?.linesAdded).toBe(1);
 	});
 
 	test("later metadata activity cannot downgrade the frozen receipt grade/counts", async () => {

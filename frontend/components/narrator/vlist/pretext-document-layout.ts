@@ -30,8 +30,6 @@ export interface BuildPretextDocumentLayoutOptions {
 	segmentGap?: number;
 	topPadding?: number;
 	bottomPadding?: number;
-	pruneBoundaryMessageId?: string | null;
-	pruneDividerLabel?: string;
 	isExpanded?: (key: string) => boolean | undefined;
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
@@ -271,10 +269,7 @@ export function buildPretextDocumentLayout(
 	options: BuildPretextDocumentLayoutOptions,
 ): BuiltPretextDocumentLayout {
 	const sourceMessages = messages as readonly SourceMessage[];
-	const segments = segmentMessages(messages as NarratorMsg[], {
-		pruneBoundaryMessageId: options.pruneBoundaryMessageId,
-		pruneDividerLabel: options.pruneDividerLabel,
-	});
+	const segments = segmentMessages(messages as NarratorMsg[], {});
 	// The pinned tasks card: one id, derived HERE — once per build, over the SAME
 	// message list being laid out (persisted window + live streaming row). It drives
 	// both fold gates below and the adapter's per-card forceExpanded flag, so the

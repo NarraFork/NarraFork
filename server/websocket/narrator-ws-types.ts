@@ -528,14 +528,7 @@ export type NarratorServerMessage =
 			promptTokens?: number;
 			contextWindow?: number;
 			isEstimated?: boolean;
-			pruneStart?: number;
 			compactStart?: number;
-	  }
-	| {
-			type: "prune_boundary";
-			narratorId: string;
-			boundaryMessageId: string | null;
-			prunedPercent: number | null;
 	  }
 	| {
 			type: "metering";

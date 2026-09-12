@@ -163,10 +163,19 @@ describe("selectRecoverableToolCalls — Await", () => {
 	// command is a separate design decision (idempotency), so it is out of scope.
 	test("skips bash awaits", () => {
 		const selected = selectRecoverableToolCalls(
-			[awaitCall("running", { type: "bash", id: "task-1" })],
+			[awaitCall("running", { type: "bash", id: "task-1", onlyWaitFor: true })],
 			new Map(),
 		);
 		expect(selected).toEqual([]);
+	});
+
+	test("recognizes an explicitly requested any-event Await during recovery", () => {
+		expect(
+			selectRecoverableToolCalls(
+				[awaitCall("running", { type: "bash", id: "task-1", onlyWaitFor: false })],
+				new Map(),
+			),
+		).toMatchObject([{ kind: "await", awaitMode: "any", awaitType: "bash" }]);
 	});
 
 	test("skips awaits with a missing id or malformed input", () => {
@@ -193,7 +202,11 @@ describe("selectRecoverableToolCalls — Await", () => {
 			[
 				awaitCall("fail", { type: "agent", id: "explore-1" }),
 				agentCall("running"),
-				awaitCall("running", { type: "bash", id: "bash-1" }, { toolUseId: "w2" }),
+				awaitCall(
+					"running",
+					{ type: "bash", id: "bash-1", onlyWaitFor: true },
+					{ toolUseId: "w2" },
+				),
 			],
 			map,
 		);

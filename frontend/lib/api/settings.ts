@@ -119,7 +119,7 @@ export const settingsApi = {
 		}),
 	getSettings: () => request<ApiEntity>("/settings"),
 	getContextThresholds: (model: string, provider: string) =>
-		request<{ pruneStart: number; compactStart: number }>(
+		request<{ compactStart: number }>(
 			`/settings/context-thresholds?model=${encodeURIComponent(model)}&provider=${encodeURIComponent(provider)}`,
 		),
 	updateSettings: (data: Record<string, unknown>) =>

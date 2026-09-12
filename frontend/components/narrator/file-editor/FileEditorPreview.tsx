@@ -27,12 +27,15 @@ export function FileEditorPreview({
 	filePath,
 	deviceId,
 	narratorId,
+	withSourceLines,
 }: {
 	text: string;
 	mode: Exclude<FileViewerMode, "raw">;
 	filePath: string;
 	deviceId: string;
 	narratorId?: string;
+	/** Stamp `data-line` anchors so the split view can scroll-sync by source line. */
+	withSourceLines?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	const tooLarge = text.length > MAX_EDITOR_PREVIEW_CHARS;
@@ -69,7 +72,7 @@ export function FileEditorPreview({
 			>
 				{mode === "preview" ? (
 					<Box p="xs">
-						<MarkdownContent text={text} />
+						<MarkdownContent text={text} sourceLines={withSourceLines} />
 					</Box>
 				) : parsed && !isStructuredParseError(parsed) ? (
 					<>

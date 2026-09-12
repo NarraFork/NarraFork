@@ -56,8 +56,6 @@ function SettingsAgentPage() {
 				setDefaultStartInPlanMode={is.setDefaultStartInPlanMode}
 				defaultRelaxedPlan={is.defaultRelaxedPlan}
 				setDefaultRelaxedPlan={is.setDefaultRelaxedPlan}
-				defaultPruneEnabled={is.defaultPruneEnabled}
-				setDefaultPruneEnabled={is.setDefaultPruneEnabled}
 				planModeAllowInlinePlan={is.planModeAllowInlinePlan}
 				setPlanModeAllowInlinePlan={is.setPlanModeAllowInlinePlan}
 				planReflectionAutoApprove={is.planReflectionAutoApprove}
@@ -98,10 +96,6 @@ function SettingsAgentPage() {
 				setContextThresholds={is.setContextThresholds}
 				autoCompactKeepPairs={is.autoCompactKeepPairs}
 				setAutoCompactKeepPairs={is.setAutoCompactKeepPairs}
-				autoCompactPruneThreshold={is.autoCompactPruneThreshold}
-				setAutoCompactPruneThreshold={is.setAutoCompactPruneThreshold}
-				minPruneRatio={is.minPruneRatio}
-				setMinPruneRatio={is.setMinPruneRatio}
 				queueDuringCompaction={is.queueDuringCompaction}
 				setQueueDuringCompaction={is.setQueueDuringCompaction}
 				globalWhitelistDirs={is.globalWhitelistDirs}

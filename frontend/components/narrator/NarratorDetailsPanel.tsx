@@ -786,7 +786,6 @@ export function NarratorDetailsPanel({
 	const advancedRowInput: AdvancedRowInput = {
 		fastModeOverride: narrator?.fastModeOverride,
 		relaxedPlan: narrator?.relaxedPlan,
-		pruneEnabled: narrator?.pruneEnabled,
 		planMode,
 		backgroundStatus: narrator?.backgroundStatus,
 		pendingModelRestore: narrator?.pendingModelRestore,
@@ -795,7 +794,6 @@ export function NarratorDetailsPanel({
 	const promoted = {
 		fastMode: shouldPromoteAdvancedRow("fastMode", advancedRowInput),
 		relaxedPlan: shouldPromoteAdvancedRow("relaxedPlan", advancedRowInput),
-		pruneEnabled: shouldPromoteAdvancedRow("pruneEnabled", advancedRowInput),
 		planMode: shouldPromoteAdvancedRow("planMode", advancedRowInput),
 		backgroundStatus: shouldPromoteAdvancedRow("backgroundStatus", advancedRowInput),
 		pendingModelRestore: shouldPromoteAdvancedRow("pendingModelRestore", advancedRowInput),
@@ -814,7 +812,6 @@ export function NarratorDetailsPanel({
 		t("details.dangerReflection"),
 		t("details.fastMode"),
 		t("details.relaxedPlan"),
-		t("details.pruneEnabled"),
 		t("details.planMode"),
 		t("details.backgroundStatus"),
 		t("details.pendingModelRestore"),
@@ -873,12 +870,6 @@ export function NarratorDetailsPanel({
 			<DetailRow
 				label={t("details.relaxedPlan")}
 				value={<Text size="sm">{formatBoolean(narrator?.relaxedPlan)}</Text>}
-			/>
-		),
-		pruneEnabled: (
-			<DetailRow
-				label={t("details.pruneEnabled")}
-				value={<Text size="sm">{formatBoolean(narrator?.pruneEnabled ?? false)}</Text>}
 			/>
 		),
 		planMode: (
@@ -1420,7 +1411,6 @@ export function NarratorDetailsPanel({
 							</Stack>
 						}
 					/>
-					{promoted.pruneEnabled ? advancedRowNodes.pruneEnabled : null}
 					{promoted.planMode ? advancedRowNodes.planMode : null}
 					{promoted.backgroundStatus ? advancedRowNodes.backgroundStatus : null}
 					{promoted.pendingModelRestore ? advancedRowNodes.pendingModelRestore : null}

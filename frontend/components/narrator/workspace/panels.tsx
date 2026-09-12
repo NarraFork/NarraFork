@@ -10,7 +10,7 @@
 
 import { Box, Center, Text } from "@mantine/core";
 import type { IDockviewPanelProps } from "dockview-react";
-import { lazy, Suspense, useCallback, useLayoutEffect } from "react";
+import { lazy, Suspense, useCallback, useLayoutEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { api as apiClient } from "../../../lib/api";
@@ -33,6 +33,7 @@ import {
 } from "../dock/panels";
 import { useFilePanelSourceOpener } from "../file-panel-navigation";
 import { NarratorPanel } from "../NarratorPanel";
+import { NarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
 import type {
 	FilePanelParams,
 	KnowledgePanelParams,
@@ -81,6 +82,13 @@ function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 	const { narratorId } = props.params;
 	const { ref, compact } = usePanelCompact();
 	const directorActive = useWorkspaceDirectorActive();
+	const [isActive, setIsActive] = useState(props.api.isActive);
+
+	useLayoutEffect(() => {
+		setIsActive(props.api.isActive);
+		const disposable = props.api.onDidActiveChange(() => setIsActive(props.api.isActive));
+		return () => disposable.dispose();
+	}, [props.api]);
 	const close = useCallback(() => props.api.close(), [props.api]);
 	const onHeaderPointerDown = usePanelHeaderDrag(
 		props as IDockviewPanelProps<WorkspacePanelParams>,
@@ -99,14 +107,16 @@ function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 	const content = (
 		<Box ref={ref} style={{ height: "100%", overflow: "hidden" }}>
 			{!directorActive && (
-				<NarratorPanel
-					key={narratorId}
-					narratorId={narratorId}
-					compact={compact}
-					onClose={close}
-					onHeaderPointerDown={onHeaderPointerDown}
-					onViewSubagentSession={dockValue?.openSubagentPanel}
-				/>
+				<NarratorPanelVisibilityProvider value={isActive}>
+					<NarratorPanel
+						key={narratorId}
+						narratorId={narratorId}
+						compact={compact}
+						onClose={close}
+						onHeaderPointerDown={onHeaderPointerDown}
+						onViewSubagentSession={dockValue?.openSubagentPanel}
+					/>
+				</NarratorPanelVisibilityProvider>
 			)}
 		</Box>
 	);

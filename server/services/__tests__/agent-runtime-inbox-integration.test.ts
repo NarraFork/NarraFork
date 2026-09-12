@@ -25,6 +25,7 @@ mock.module("../../lib/agent", () => ({
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
 }));
 const inbox = await import("../agent-runtime/inbox");
+const { awaitAnyRuntimeEvent } = await import("../agent-runtime/await-coordinator");
 const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");
 const { createAgentMessageDelivery } = await import("../agent-message-delivery");
 const { pushParentInboundMessage } = await import("../parent-inbound-queue");
@@ -102,7 +103,6 @@ function consume() {
 		model: "test",
 		provider: "anthropic",
 		cwd: ".",
-		pruneBoundaryId: null,
 	});
 }
 function state(id: string) {
@@ -115,6 +115,23 @@ function state(id: string) {
 function childMessages() {
 	return db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, "child")).all();
 }
+
+test("agent mailbox enqueue wakes any-event Await without consuming the row", async () => {
+	const waiting = awaitAnyRuntimeEvent({
+		narratorId: "parent",
+		timeoutMs: 1_000,
+		signal: new AbortController().signal,
+	});
+	const accepted = inbox.enqueueInboxAgent(delivery("parent", "wake me"), "wake me");
+	expect(accepted.status).toBe("accepted");
+	expect(await waiting).toMatchObject({
+		status: "event",
+		event: { source: "mailbox_pending", narratorId: "parent", mailboxKind: "agent_message" },
+	});
+	const rows = inbox.listInboxRows("parent", ["agent_message"]);
+	expect(rows).toHaveLength(1);
+	expect(rows[0]?.state).toBe("queued");
+});
 
 test("parent/team/child producers persist into the same mailbox, read projections do not consume", async () => {
 	const parent = delivery("parent");

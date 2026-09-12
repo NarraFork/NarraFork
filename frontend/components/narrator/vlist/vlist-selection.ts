@@ -23,6 +23,11 @@
 import { cleanAssistantText } from "@shared/citations";
 import type { FileReference } from "@shared/file-reference";
 import { fileReferenceLabel } from "@shared/file-reference-display";
+import {
+	contextBlockViews,
+	injectionBlockViews,
+	isNativeModelContextBlock,
+} from "@shared/native-injection";
 import { readCommunicationInjection } from "@shared/pretext-layout/segment-adapter";
 import { stringifyForDisplay } from "@shared/pretext-layout/tool-io-projection";
 import type { BlockMeta, CollectedSelectedText } from "../MessageSelectionCtx";
@@ -160,33 +165,38 @@ export function buildSelectionIndex(
 		// A communication row has two projections of ONE message: model text and the
 		// reader-facing injection. Register the visible block, not a hidden text row at
 		// index zero. The paired model text participates in deletion/selection too.
-		const injectionIndex = msg.contentJson.findIndex((block) => block.type === "system_injection");
-		const injection = msg.contentJson[injectionIndex];
-		const inbound = injection ? readCommunicationInjection(injection) : null;
-		if (
-			inbound &&
-			((msg.role === "user" &&
+		const contextViews = Array.from(
+			new Map(
+				[...contextBlockViews(msg.contentJson), ...injectionBlockViews(msg.contentJson)].map(
+					(view) => [view.blockIndex, view],
+				),
+			).values(),
+		).sort((a, b) => a.blockIndex - b.blockIndex);
+		const canUseContext =
+			(msg.role === "user" &&
 				(msg as NarratorMsg & { origin?: string | null }).origin !== "user") ||
-				msg.role === "sys" ||
-				msg.role === "system" ||
-				msg.role === "disp")
-		) {
-			const blockId = makeMessageBlockSelectionId(msg.id, injectionIndex);
-			const blockIndices = msg.contentJson.flatMap((block, index) =>
-				index === injectionIndex || block.type === "text" ? [index] : [],
-			);
-			const entry: SelectionEntry = {
-				blockId,
-				messageId: msg.id,
-				blockIndex: injectionIndex,
-				blockIndices,
-				seq,
-				chunkIndex: resolveChunkIndex?.(seq) ?? traversalIndex,
-				copyText: inbound.text,
-			};
-			index.entries.push(entry);
-			for (const pairedIndex of blockIndices) {
-				index.byBlockId.set(makeMessageBlockSelectionId(msg.id, pairedIndex), entry);
+			msg.role === "sys" ||
+			msg.role === "system" ||
+			msg.role === "disp";
+		if (canUseContext && contextViews.length > 0) {
+			for (const view of contextViews) {
+				const inbound = readCommunicationInjection(view.block);
+				const copyText = inbound?.text ?? view.block.modelText ?? "";
+				if (!copyText.trim() && !isNativeModelContextBlock(view.block)) continue;
+				const blockId = makeMessageBlockSelectionId(msg.id, view.blockIndex);
+				const entry: SelectionEntry = {
+					blockId,
+					messageId: msg.id,
+					blockIndex: view.blockIndex,
+					blockIndices: view.sourceIndices,
+					seq,
+					chunkIndex: resolveChunkIndex?.(seq) ?? traversalIndex,
+					copyText,
+				};
+				index.entries.push(entry);
+				for (const pairedIndex of view.sourceIndices) {
+					index.byBlockId.set(makeMessageBlockSelectionId(msg.id, pairedIndex), entry);
+				}
 			}
 			traversalIndex++;
 			continue;

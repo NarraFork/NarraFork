@@ -8,6 +8,7 @@ import { concludeReviewTool } from "./conclude-review";
 import { contextAskTool } from "./context-ask";
 import { dangerCancelTool, dangerConfirmTool } from "./danger-reflection";
 import { editTool } from "./edit";
+import { evalTool } from "./eval";
 import {
 	exitPlanConfirmAndCompactTool,
 	exitPlanConfirmTool,
@@ -53,6 +54,7 @@ import { writeTool } from "./write";
  * Map key = tool name as it appears in the registry (e.g. "Terminal").
  */
 export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
+	["Eval", evalTool],
 	["Terminal", terminalTool],
 	["ShareFile", shareFileTool],
 	["Recall", recallTool],

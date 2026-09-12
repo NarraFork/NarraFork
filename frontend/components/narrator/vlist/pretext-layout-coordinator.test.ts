@@ -30,8 +30,6 @@ function page(): PretextDocumentPageResult {
 		hasNext: false,
 		hasPrev: false,
 		messageVersion: 3,
-		pruneBoundaryMessageId: "m-0",
-		prunedPercent: 25,
 	};
 }
 
@@ -90,8 +88,6 @@ function compactPage(
 		hasNext: false,
 		hasPrev: false,
 		messageVersion: 3,
-		pruneBoundaryMessageId: null,
-		prunedPercent: null,
 	};
 }
 
@@ -121,9 +117,6 @@ describe("PretextLayoutCoordinator", () => {
 		expect(result.status).toBe("ready");
 		expect(result.index?.totalHeight).toBeGreaterThan(32);
 		expect(result.items ?? []).toHaveLength(result.manifest?.items.length ?? 0);
-		expect(result.input?.pruneBoundaryMessageId).toBe("m-0");
-		expect(result.input?.prunedPercent).toBe(25);
-		expect(result.items?.some((item) => item.spec.kind === "prune-divider")).toBe(true);
 		expect((result.items ?? []).map((item) => item.measured.height)).toEqual(
 			result.manifest?.items.map((item) => item.height) ?? [],
 		);
@@ -213,8 +206,6 @@ describe("PretextLayoutCoordinator", () => {
 					hasNext: false,
 					hasPrev: true,
 					messageVersion: 3,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
 				} as PretextDocumentPageResult;
 			}
 			return {
@@ -224,8 +215,6 @@ describe("PretextLayoutCoordinator", () => {
 				hasNext: true,
 				hasPrev: false,
 				messageVersion: 3,
-				pruneBoundaryMessageId: null,
-				prunedPercent: null,
 			} as PretextDocumentPageResult;
 		};
 		await coordinator.load("n1", { ...buildOptions, lod: 5 }, { fetchPage, pageSize: 100 });
@@ -375,8 +364,6 @@ describe("PretextLayoutCoordinator", () => {
 				hasNext: false,
 				hasPrev: false,
 				messageVersion: 3,
-				pruneBoundaryMessageId: null,
-				prunedPercent: null,
 			}),
 		});
 		const cardHeight = (snapshot: {
@@ -648,8 +635,6 @@ describe("PretextLayoutCoordinator", () => {
 					hasNext: false,
 					hasPrev: true,
 					messageVersion: 3,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
 				};
 			}
 			// One older page; nothing older remains after it.
@@ -660,8 +645,6 @@ describe("PretextLayoutCoordinator", () => {
 				hasNext: true,
 				hasPrev: false,
 				messageVersion: 3,
-				pruneBoundaryMessageId: null,
-				prunedPercent: null,
 			};
 		};
 
@@ -718,8 +701,6 @@ describe("PretextLayoutCoordinator", () => {
 						hasNext: false,
 						hasPrev: true,
 						messageVersion: 3,
-						pruneBoundaryMessageId: null,
-						prunedPercent: null,
 					}
 				: {
 						messages: [message(0, "one"), message(1, "two")],
@@ -728,8 +709,6 @@ describe("PretextLayoutCoordinator", () => {
 						hasNext: true,
 						hasPrev: false,
 						messageVersion: 3,
-						pruneBoundaryMessageId: null,
-						prunedPercent: null,
 					};
 		await coordinator.load("n1", buildOptions, { fetchPage });
 		// Pinned to the bottom (short first screen): fill must keep the bottom pinned.
@@ -773,8 +752,6 @@ describe("PretextLayoutCoordinator", () => {
 					hasNext: false,
 					hasPrev: true,
 					messageVersion: 3,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
 				};
 			}
 			if (failNext) {
@@ -788,8 +765,6 @@ describe("PretextLayoutCoordinator", () => {
 				hasNext: true,
 				hasPrev: false,
 				messageVersion: 3,
-				pruneBoundaryMessageId: null,
-				prunedPercent: null,
 			};
 		};
 		await coordinator.load("n1", buildOptions, { fetchPage });
@@ -829,8 +804,6 @@ describe("PretextLayoutCoordinator", () => {
 					hasNext: false,
 					hasPrev: true,
 					messageVersion: 3,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
 				};
 			}
 			olderFetches++;
@@ -844,8 +817,6 @@ describe("PretextLayoutCoordinator", () => {
 				hasNext: true,
 				hasPrev: false,
 				messageVersion: 3,
-				pruneBoundaryMessageId: null,
-				prunedPercent: null,
 			};
 		};
 		await coordinator.load("n1", buildOptions, { fetchPage });
@@ -876,8 +847,6 @@ describe("PretextLayoutCoordinator", () => {
 					hasNext: false,
 					hasPrev: true,
 					messageVersion: 3,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
 				};
 			}
 			await new Promise<void>((resolve) => {
@@ -890,8 +859,6 @@ describe("PretextLayoutCoordinator", () => {
 				hasNext: true,
 				hasPrev: false,
 				messageVersion: 3,
-				pruneBoundaryMessageId: null,
-				prunedPercent: null,
 			};
 		};
 		await coordinator.load("n1", buildOptions, { fetchPage });
@@ -949,8 +916,6 @@ function toolPage(status: string): PretextDocumentPageResult {
 		hasNext: false,
 		hasPrev: false,
 		messageVersion: 7,
-		pruneBoundaryMessageId: null,
-		prunedPercent: null,
 	};
 }
 
@@ -1153,8 +1118,6 @@ describe("PretextLayoutCoordinator — scrollTopSmoothFollow stamping", () => {
 						hasNext: false,
 						hasPrev: true,
 						messageVersion: 3,
-						pruneBoundaryMessageId: null,
-						prunedPercent: null,
 					}
 				: {
 						messages: [message(0, "one"), message(1, "two")],
@@ -1163,8 +1126,6 @@ describe("PretextLayoutCoordinator — scrollTopSmoothFollow stamping", () => {
 						hasNext: true,
 						hasPrev: false,
 						messageVersion: 3,
-						pruneBoundaryMessageId: null,
-						prunedPercent: null,
 					};
 		await coordinator.load("n1", buildOptions, { fetchPage });
 		await coordinator.loadOlder(buildOptions, pinnedView);

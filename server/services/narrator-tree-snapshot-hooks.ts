@@ -48,6 +48,53 @@ import {
 } from "./worktree-write-claims";
 
 /** The session state this module reads and updates. */
+type BashWindow = {
+	ids: Set<string>;
+	overlapped: boolean;
+};
+const bashWindows = new Map<string, BashWindow>();
+
+export interface BashCaptureWindow {
+	readonly eligible: boolean;
+	wasOverlapped(): boolean;
+	end(): void;
+}
+
+/**
+ * Reserve one Bash boundary. The loop hook calls this before taking `before`, and
+ * the Bash tool adopts the same token immediately before spawning. A second token
+ * never waits; it only makes both boundaries non-actionable.
+ */
+export function beginBashCaptureWindow(
+	worktreePath: string,
+	toolUseId = "__anonymous__",
+): BashCaptureWindow {
+	let current = bashWindows.get(worktreePath);
+	if (!current) {
+		current = { ids: new Set(), overlapped: false };
+		bashWindows.set(worktreePath, current);
+	}
+	let finished = false;
+	const adopted = current.ids.has(toolUseId);
+	if (!adopted) {
+		if (current.ids.size > 0) current.overlapped = true;
+		current.ids.add(toolUseId);
+	}
+	const eligible = current.ids.size === 1 && !current.overlapped;
+	let overlappedAtEnd = current.overlapped;
+	return {
+		eligible,
+		wasOverlapped: () => current?.overlapped ?? overlappedAtEnd,
+		end() {
+			if (finished) return;
+			finished = true;
+			current?.ids.delete(toolUseId);
+			overlappedAtEnd = current?.overlapped ?? overlappedAtEnd;
+			if (current && current.ids.size === 0) bashWindows.delete(worktreePath);
+		},
+	};
+}
+
 export interface TreeSnapshotSession {
 	cwd: string;
 	/** Execution device for the session; only local workspaces can be snapshotted. */

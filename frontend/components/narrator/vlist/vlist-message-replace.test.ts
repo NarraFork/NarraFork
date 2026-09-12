@@ -17,6 +17,16 @@ const target = msg("m2", [
 const loaded = [msg("m1", [block("text", "before")]), target, msg("m3", [block("text", "after")])];
 
 describe("replaceLoadedMessage — only a trailing truncation may land in place", () => {
+	it("replaces a copy-on-write row by oldMessageId without duplicating it", () => {
+		const result = replaceLoadedMessage(
+			loaded,
+			msg("m2-new", [block("text", "rewritten with different wrapping")]),
+			{ oldMessageId: "m2" },
+		);
+		expect(result.replaced).toBe(true);
+		expect(result.messages.map((item) => item.id)).toEqual(["m1", "m2-new", "m3"]);
+	});
+
 	it("accepts dropping trailing blocks, which is what a rollback does", () => {
 		const result = replaceLoadedMessage(loaded, msg("m2", [block("text", "kept")]));
 		expect(result.replaced).toBe(true);

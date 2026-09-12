@@ -1136,7 +1136,6 @@ function stateRef(state: FileChangeState) {
 type AssociationSpec = readonly [table: string, column: string, index: string];
 const MESSAGE_ASSOCIATIONS: readonly AssociationSpec[] = [
 	["narrators", "fork_message_id", "idx_narrators_fork_message"],
-	["narrators", "prune_boundary_message_id", "idx_narrators_prune_boundary_message"],
 	["chapter_commits", "narrator_message_id", "idx_chapter_commits_narrator_message"],
 	["spec_file_revisions", "source_message_id", "idx_spec_file_revisions_source_message"],
 	["narrator_patches", "message_id", "idx_patches_message"],

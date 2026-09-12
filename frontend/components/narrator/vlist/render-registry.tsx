@@ -23,7 +23,6 @@ import { RenderInjectionBubble } from "./render/RenderInjectionBubble";
 import { RenderMarkdown } from "./render/RenderMarkdown";
 import { RenderMedia } from "./render/RenderMedia";
 import { RenderMessageBubble } from "./render/RenderMessageBubble";
-import { RenderPruneDivider } from "./render/RenderMisc";
 import { RenderAskUserQuestion, RenderInlinePermission } from "./render/RenderPermission";
 import { RenderPlanCard } from "./render/RenderPlanCard";
 import { RenderReasoning } from "./render/RenderReasoning";
@@ -503,8 +502,6 @@ export function renderElement(
 					viewControls={extra.viewControls as never}
 				/>
 			);
-		case "prune-divider":
-			return <RenderPruneDivider measured={m} data={(extra.data as never) ?? { label: "" }} />;
 		case "turn-usage":
 			// Fully self-describing: the measured payload carries the exact lines to
 			// paint (composed by the adapter from the shared usage formatter), so this

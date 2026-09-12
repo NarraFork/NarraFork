@@ -1,4 +1,8 @@
 import {
+	awaitAnyRuntimeEvent,
+	formatAwaitWakeResult,
+} from "@server/services/agent-runtime/await-coordinator";
+import {
 	type RuntimeAwaitTarget,
 	runtimeAwaitTargets,
 	runtimePolicyForContext,
@@ -25,10 +29,12 @@ export { DEFAULT_TIMEOUT_MS as DEFAULT_AWAIT_TIMEOUT_MS };
 
 /** What an Await call is waiting on. */
 export type AwaitTargetType = RuntimeAwaitTarget;
+export type AwaitMode = "target" | "any";
 
 interface RunningAwaitEntry {
 	startedAt: number;
 	timeoutMs: number;
+	awaitMode: AwaitMode;
 	awaitType: AwaitTargetType;
 	targetId: string;
 	narratorId: string;
@@ -41,6 +47,7 @@ export interface RunningAwaitSnapshot {
 	startedAt: number;
 	timeoutMs: number;
 	deadlineAt: string;
+	awaitMode: AwaitMode;
 	awaitType: AwaitTargetType;
 	targetId: string;
 	narratorId: string;
@@ -52,6 +59,7 @@ export function listRunningAwaits(): RunningAwaitSnapshot[] {
 		startedAt: entry.startedAt,
 		timeoutMs: entry.timeoutMs,
 		deadlineAt: new Date(entry.startedAt + entry.timeoutMs).toISOString(),
+		awaitMode: entry.awaitMode,
 		awaitType: entry.awaitType,
 		targetId: entry.targetId,
 		narratorId: entry.narratorId,
@@ -113,7 +121,7 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 		type: "object",
 		properties: {
 			type: {
-				description: `What to await: ${targets.join(", ")}. ${questionHint}${
+				description: `Compatibility selector. When onlyWaitFor is true, await one of: ${targets.join(", ")}. Otherwise any supported asynchronous event may release the wait. ${questionHint}${
 					policy.capabilities.awaitAgent ? "" : " Subagents cannot await other agents."
 				}`,
 				type: "string",
@@ -121,8 +129,14 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 				enum: targets,
 			},
 			id: {
-				description: "The task/subagent ID, alias, accessible subagent name, or async question id.",
+				description:
+					"Required compatibility selector. Used as the target only when onlyWaitFor is true.",
 				type: "string",
+			},
+			onlyWaitFor: {
+				description:
+					"When true, wait only for the specified type/id target. Omit or use false to return on any supported asynchronous event.",
+				type: "boolean",
 			},
 			timeout: {
 				description: AWAIT_TIMEOUT_DESCRIPTION,
@@ -142,22 +156,22 @@ export const awaitTool: ToolDefinition = {
 	name: "Await",
 	description:
 		"Wait for an asynchronous task to complete and return its current status and output.\n\n" +
+		"By default, Await returns as soon as any supported asynchronous event for this narrator is " +
+		"observed, so another notification cannot be blocked behind an unrelated target wait. " +
+		"Pass `onlyWaitFor: true` to wait only for the specified `type` and `id` target. The required " +
+		"`type` and `id` fields are compatibility selectors and are ignored as a target in the default mode. " +
 		'Use `type: "agent"` to await a background or running subagent from a primary narrator. ' +
 		'Subagents cannot use `type: "agent"` to wait for other agents; use asynchronous Send instead. ' +
 		'Use `type: "bash"` to await a background bash task. ' +
 		'Use `type: "transfer"` to await a background device file transfer; a paused transfer ' +
 		"returns immediately as paused rather than waiting, so you can decide whether to resume it. " +
 		'Use `type: "question"` with a question id to wait for an answer to a question you submitted ' +
-		"via `AskUserQuestion({ async: true })`. Do this when you have reached the point where the answer " +
-		"actually decides your next step: awaiting notifies the user that you are now blocked on them, so " +
-		"only await when you genuinely cannot continue. If the wait times out the question stays open and " +
-		"you may await again, or proceed with your default. An already-answered question returns immediately. " +
-		"If an agent wait times out, the result includes its recent timestamped tool activity. " +
-		"A timeout ends only the current wait, not the task: if activity is recent, keep waiting with " +
-		"Await and a meaningful timeout instead of sending status checks or interrupting the agent. " +
-		"Prefer one meaningful wait over repeated short polling. Await defaults to `timeout: 600000` " +
-		"(10 minutes), suitable for general exploration tasks; use `timeout: 1800000` (30 minutes) for implementation " +
-		"tasks. For bash tasks, `wait_for_text` returns early once matching output appears.",
+		"via `AskUserQuestion({ async: true })`. In exact-target mode, if the wait times out the " +
+		"question/task remains available and you may await again. An already-settled target returns immediately. " +
+		"Any-event results contain a bounded event summary; the full durable notification is delivered by " +
+		"the next safe input boundary. Await defaults to `timeout: 600000` (10 minutes); use `timeout: 1800000` " +
+		"(30 minutes) for implementation tasks and avoid repeated short waits. For exact bash waits, " +
+		"`wait_for_text` returns early once matching output appears.",
 	parameters: z.object({
 		type: z
 			.enum(["agent", "bash", "transfer", "question"])
@@ -166,7 +180,15 @@ export const awaitTool: ToolDefinition = {
 			),
 		id: z
 			.string()
-			.describe("The task/subagent ID, alias, accessible subagent name, or async question id."),
+			.describe(
+				"Required compatibility selector; used as the target only when onlyWaitFor is true.",
+			),
+		onlyWaitFor: z
+			.boolean()
+			.optional()
+			.describe(
+				"When true, wait only for the specified type/id target; omit or use false for any event.",
+			),
 		timeout: looseNumber(AWAIT_TIMEOUT_DESCRIPTION),
 		wait_for_text: z
 			.string()
@@ -180,11 +202,13 @@ export const awaitTool: ToolDefinition = {
 		return buildRawJsonSchema(config);
 	},
 	async execute(args, ctx): Promise<ToolResult> {
-		const { type, id, wait_for_text } = args as {
+		const { type, id, onlyWaitFor, wait_for_text } = args as {
 			type: AwaitTargetType;
 			id: string;
+			onlyWaitFor?: boolean;
 			wait_for_text?: string;
 		};
+		const awaitMode: AwaitMode = onlyWaitFor === true ? "target" : "any";
 		const timeout = normalizeNumber((args as { timeout?: unknown }).timeout, {
 			min: 1000,
 			max: MAX_AWAIT_TIMEOUT_MS,
@@ -214,6 +238,7 @@ export const awaitTool: ToolDefinition = {
 		const runningEntry: RunningAwaitEntry = {
 			startedAt,
 			timeoutMs,
+			awaitMode,
 			awaitType: type,
 			targetId: id,
 			narratorId: ctx.narratorId,
@@ -234,6 +259,35 @@ export const awaitTool: ToolDefinition = {
 				: status;
 
 		try {
+			if (awaitMode === "any") {
+				const result = await awaitAnyRuntimeEvent({
+					narratorId: ctx.narratorId,
+					timeoutMs,
+					signal: ctx.signal,
+					timeoutSignal: timeoutController.signal,
+				});
+				const event = result.status === "event" ? result.event : undefined;
+				return {
+					output: formatAwaitWakeResult(result),
+					metadata: {
+						kind: "await",
+						awaitMode,
+						awaitType: type,
+						targetId: id,
+						status: result.status,
+						...(event
+							? {
+									eventSource: event.source,
+									...(event.targetId ? { resolvedId: event.targetId } : {}),
+									...(event.taskId ? { taskId: event.taskId } : {}),
+									...(event.questionId ? { questionId: event.questionId } : {}),
+									...(event.mailboxKind ? { mailboxKind: event.mailboxKind } : {}),
+								}
+							: {}),
+					},
+				};
+			}
+
 			if (type === "agent") {
 				const { awaitAgentResultDetailed } = await import("@server/services/agent-communication");
 				const result = await awaitAgentResultDetailed({
@@ -257,6 +311,7 @@ export const awaitTool: ToolDefinition = {
 					output: result.formatted,
 					metadata: {
 						kind: "await",
+						awaitMode,
 						awaitType: "agent",
 						targetId: id,
 						// Readable name for the header/badges; `subagentId` stays the real
@@ -292,6 +347,7 @@ export const awaitTool: ToolDefinition = {
 					output: formatQuestionResult(id, result.status, result.record),
 					metadata: {
 						kind: "await",
+						awaitMode,
 						awaitType: "question",
 						targetId: id,
 						targetLabel: result.record.questions[0]?.header ?? id,
@@ -351,6 +407,7 @@ export const awaitTool: ToolDefinition = {
 						`Resume it before awaiting again, or cancel it if it is no longer wanted.`,
 					metadata: {
 						kind: "await",
+						awaitMode,
 						awaitType: type,
 						targetId: id,
 						targetLabel: label,
@@ -382,6 +439,7 @@ export const awaitTool: ToolDefinition = {
 				output: formatResult(taskLabel, status, result.output),
 				metadata: {
 					kind: "await",
+					awaitMode,
 					awaitType: type,
 					targetId: id,
 					targetLabel: taskLabel,

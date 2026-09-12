@@ -443,12 +443,38 @@ export interface SubagentToolCallHeader {
 	inputSummary?: SubagentToolInputSummary;
 }
 
+export interface SubagentFileChanges {
+	files: {
+		subagentNarratorId?: string | null;
+		deviceId?: string | null;
+		workspacePath?: string | null;
+		filePath: string;
+		linesAdded: number | null;
+		linesRemoved: number | null;
+		editCount: number;
+		unmeasuredCount?: number;
+		outsideParentWorkspace?: boolean | null;
+	}[];
+	totalFiles: number;
+	totalUnmeasured: number;
+	bashTouchedCount: number;
+	countsTruncated: boolean;
+	attributionScope?: "legacy_unscoped";
+	scope?: {
+		sourceToolUseId: string | null;
+		startedAt?: string | null;
+		completedAt?: string | null;
+	};
+}
+
 export interface SubagentActivitySummary {
 	subagentNarratorId: string | null;
 	model: string | null;
 	/** Effective tier, already resolving a null narrator override through the global default. */
 	reasoningEffort?: string | null;
 	latestToolCalls: SubagentToolCallHeader[];
+	/** Bounded file-change summary projected for the child activity card. */
+	fileChanges?: SubagentFileChanges;
 	/**
 	 * The child is TAKEN OVER by the user (the parent's call is blocked until the
 	 * user stops it). Carried on the snapshot because the snapshot is the reconnect
@@ -870,8 +896,6 @@ export interface PretextDocumentPageResult {
 	/** More rows exist older than this page (drives reverse infinite scroll). */
 	hasPrev: boolean;
 	messageVersion: number;
-	pruneBoundaryMessageId?: string | null;
-	prunedPercent?: number | null;
 }
 
 export interface MessageLocationResult {

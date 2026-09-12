@@ -10,7 +10,7 @@
  *   append     a new message landed
  *              → structural reload, but COALESCED so a turn producing several
  *                messages costs one refetch instead of one per message
- *   structural edit / delete / prune / compact-done / full reload
+ *   structural edit / delete / compact-done / full reload
  *              → structural reload
  *
  * A structural reload replaces the whole loaded window with the tail page, so it

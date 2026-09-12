@@ -127,16 +127,25 @@ function isNativeTaskCheckbox(
 /** Replace GFM's native checkbox while keeping the item text. */
 export function MarkdownContentListItem({
 	className,
+	dataLine,
 	children,
 }: {
 	className?: string;
+	/** 0-based source line, present only when the body opted into scroll-sync anchors. */
+	dataLine?: string;
 	children: ReactNode;
 }) {
+	const lineAttr = dataLine ? { "data-line": dataLine } : {};
 	const nodes = Children.toArray(children);
 	const native = nodes.find(isNativeTaskCheckbox);
-	if (!native) return <li className={className}>{children}</li>;
+	if (!native)
+		return (
+			<li {...lineAttr} className={className}>
+				{children}
+			</li>
+		);
 	return (
-		<li className={[className, "md-task-item"].filter(Boolean).join(" ")}>
+		<li {...lineAttr} className={[className, "md-task-item"].filter(Boolean).join(" ")}>
 			<MarkdownTaskCheckbox checked={!!native.props.checked} />
 			<span className="md-task-item-body">
 				{nodes.filter((node) => !isNativeTaskCheckbox(node))}

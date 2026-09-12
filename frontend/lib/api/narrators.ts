@@ -1222,11 +1222,6 @@ export const narratorsApi = {
 			method: "PATCH",
 			body: JSON.stringify(data),
 		}),
-	updateNarratorPruneEnabled: (id: string, pruneEnabled: boolean) =>
-		request<{ ok: boolean }>(`/narrators/${id}/prune-enabled`, {
-			method: "PATCH",
-			body: JSON.stringify({ pruneEnabled }),
-		}),
 	getCompactSummary: (narratorId: string, messageId: string) =>
 		request<CompactMessageDetail>(`/narrators/${narratorId}/compact/${messageId}`),
 	retryFailedCompact: (narratorId: string, messageId: string, model?: string) =>

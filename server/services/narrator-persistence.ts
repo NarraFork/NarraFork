@@ -8,6 +8,7 @@ import {
 	truncateCompactError,
 } from "@shared/compact-message";
 import type { MessageOriginOptions } from "@shared/message-origin";
+import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
 import { and, desc, eq, gte, inArray, isNull, like, type SQL, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -40,17 +41,55 @@ import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { forcesRelaxedPlan, type PermissionMode } from "../lib/permission-modes";
 import { settings } from "../lib/settings";
-import { getMinPruneRatio } from "../lib/settings/provider";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { getExecutionOwner } from "./agent-runtime/ownership";
+import { createFileChangeExecutionSegmentsService } from "./file-change-execution-segments";
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
 import { preserveTakenOverSubstatus } from "./subagent-takeover";
+
+const executionSegments = createFileChangeExecutionSegmentsService(db);
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+type ExecutionSegmentParent = {
+	id: string;
+	executionAttempt: number;
+	executionSegmentId: string | null;
+};
+
+/** Resolve a parent tool across the child narrator boundary without guessing by provider ID. */
+async function findExecutionSegmentParent(
+	narratorId: string,
+	parentToolUseId: string | null | undefined,
+): Promise<ExecutionSegmentParent | null> {
+	if (!parentToolUseId) return null;
+	const local = await db.query.narratorToolCalls.findFirst({
+		where: and(
+			eq(narratorToolCalls.narratorId, narratorId),
+			eq(narratorToolCalls.toolUseId, parentToolUseId),
+		),
+		columns: { id: true, executionAttempt: true, executionSegmentId: true },
+	});
+	if (local) return local;
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { parentNarratorId: true },
+	});
+	if (!narrator?.parentNarratorId) return null;
+	return (
+		(await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narrator.parentNarratorId),
+				eq(narratorToolCalls.toolUseId, parentToolUseId),
+			),
+			columns: { id: true, executionAttempt: true, executionSegmentId: true },
+		})) ?? null
+	);
+}
 
 /** Recipient mutation also invalidates source pages, including child cards rendered in a parent. */
 export function updateRecipientMessageRef(
@@ -420,14 +459,11 @@ function copyMessageForNarratorTx(
 	const narrator = tx.query.narrators
 		.findFirst({
 			where: eq(narrators.id, narratorId),
-			columns: { forkMessageId: true, pruneBoundaryMessageId: true },
+			columns: { forkMessageId: true },
 		})
 		.sync();
 	const narratorUpdates: Partial<typeof narrators.$inferInsert> = {};
 	if (narrator?.forkMessageId === messageId) narratorUpdates.forkMessageId = newMessageId;
-	if (narrator?.pruneBoundaryMessageId === messageId) {
-		narratorUpdates.pruneBoundaryMessageId = newMessageId;
-	}
 	if (Object.keys(narratorUpdates).length > 0) {
 		tx.update(narrators).set(narratorUpdates).where(eq(narrators.id, narratorId)).run();
 	}
@@ -529,7 +565,6 @@ async function insertMessageRef(
 	messageId: string,
 	seq: number,
 	isCompact = 0,
-	prunedPercent?: number | null,
 ): Promise<void> {
 	await withDbRetry(
 		() =>
@@ -539,7 +574,6 @@ async function insertMessageRef(
 				messageId,
 				seq,
 				isCompact,
-				prunedPercent: prunedPercent ?? null,
 			}),
 		{ label: "insertMessageRef", maxRetries: 5 },
 	);
@@ -557,7 +591,6 @@ function appendMessageRefSync(
 	narratorId: string,
 	messageId: string,
 	isCompact = 0,
-	prunedPercent?: number | null,
 ): number {
 	const result = tx
 		.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
@@ -566,17 +599,6 @@ function appendMessageRefSync(
 		.all();
 	const seq = (result[0]?.maxSeq ?? -1) + 1;
 
-	let resolvedPrunedPercent = prunedPercent ?? null;
-	if (resolvedPrunedPercent == null) {
-		const narrator = tx.query.narrators
-			.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { prunedPercent: true },
-			})
-			.sync();
-		resolvedPrunedPercent = narrator?.prunedPercent ?? null;
-	}
-
 	tx.insert(narratorMessageRefs)
 		.values({
 			id: generateId(),
@@ -584,7 +606,6 @@ function appendMessageRefSync(
 			messageId,
 			seq,
 			isCompact,
-			prunedPercent: resolvedPrunedPercent,
 		})
 		.run();
 
@@ -612,13 +633,9 @@ async function appendMessageRef(
 	narratorId: string,
 	messageId: string,
 	isCompact = 0,
-	prunedPercent?: number | null,
 ): Promise<number> {
 	return withDbRetry(
-		async () =>
-			db.transaction((tx) =>
-				appendMessageRefSync(tx, narratorId, messageId, isCompact, prunedPercent),
-			),
+		async () => db.transaction((tx) => appendMessageRefSync(tx, narratorId, messageId, isCompact)),
 		{ label: "appendMessageRef", maxRetries: 5 },
 	);
 }
@@ -1061,7 +1078,11 @@ export const narratorPersistence = {
 				db.transaction((tx) => {
 					const id = placementMessageId(placement);
 					const now = new Date().toISOString();
-					const blocks: unknown[] = [{ type: "text", text }, ...(contentBlocks ?? [])];
+					const providedBlocks = contentBlocks ?? [];
+					const hasNativeModelContext = providedBlocks.some(isNativeModelContextBlock);
+					const blocks: unknown[] = hasNativeModelContext
+						? providedBlocks
+						: [{ type: "text", text }, ...providedBlocks];
 					const created = tx
 						.insert(narratorMessages)
 						.values({
@@ -1070,7 +1091,9 @@ export const narratorPersistence = {
 							parentToolUseId,
 							role: "sys",
 							contentJson: blocks,
-							contentText: text,
+							contentText: hasNativeModelContext
+								? modelTextFromContentBlocks(blocks) || text
+								: text,
 							createdBy: createdBy ?? null,
 							origin: origin?.origin ?? "system",
 							originLabel: origin?.originLabel ?? null,
@@ -1711,8 +1734,19 @@ export const narratorPersistence = {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const toolUseBlocks = content.filter((b: any) => b.type === "tool_use");
 		for (const block of toolUseBlocks) {
+			const parentToolCall = await findExecutionSegmentParent(
+				narratorId,
+				sdkMessage.parent_tool_use_id,
+			);
+			const toolCallId = generateId();
+			const segment = await executionSegments.create({
+				narratorId,
+				parentSegmentId: parentToolCall?.executionSegmentId ?? null,
+				sourceInputId: block.id,
+			});
 			await db.insert(narratorToolCalls).values({
-				id: generateId(),
+				executionSegmentId: segment.id,
+				id: toolCallId,
 				narratorId,
 				messageId: id,
 				toolUseId: block.id,
@@ -1847,7 +1881,7 @@ export const narratorPersistence = {
 	) {
 		const existing = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.id, messageId),
-			columns: { contentJson: true },
+			columns: { contentJson: true, parentToolUseId: true },
 		});
 		if (!existing) return;
 
@@ -1924,8 +1958,15 @@ export const narratorPersistence = {
 
 		if (block.type === "tool_use") {
 			const now = new Date().toISOString();
+			const parentToolCall = await findExecutionSegmentParent(narratorId, existing.parentToolUseId);
 			const toolCallId = generateId();
+			const segment = await executionSegments.create({
+				narratorId,
+				parentSegmentId: parentToolCall?.executionSegmentId ?? null,
+				sourceInputId: block.id,
+			});
 			await db.insert(narratorToolCalls).values({
+				executionSegmentId: segment.id,
 				id: toolCallId,
 				narratorId,
 				messageId,
@@ -2181,14 +2222,6 @@ export const narratorPersistence = {
 			.where(eq(narrators.id, narratorId));
 	},
 
-	async updatePruneEnabled(narratorId: string, pruneEnabled: boolean) {
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ pruneEnabled, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-	},
-
 	async updateStatus(
 		narratorId: string,
 		status: "idle" | "working" | "waiting" | "archived",
@@ -2354,15 +2387,12 @@ export const narratorPersistence = {
 									)
 									.get(narratorId) as { maxSeq: number | null } | undefined;
 								const seq = (maxSeqRow?.maxSeq ?? -1) + 1;
-								const prunedRow = sqlite
-									.prepare("SELECT pruned_percent AS prunedPercent FROM narrators WHERE id = ?")
-									.get(narratorId) as { prunedPercent: number | null } | undefined;
 								sqlite
 									.prepare(
-										`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact, pruned_percent)
-										 VALUES (?, ?, ?, ?, 0, ?)`,
+										`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact)
+										 VALUES (?, ?, ?, ?, 0)`,
 									)
-									.run(generateId(), narratorId, msgId, seq, prunedRow?.prunedPercent ?? null);
+									.run(generateId(), narratorId, msgId, seq);
 								sqlite
 									.prepare(
 										"UPDATE narrators SET message_version = message_version + 1 WHERE id = ?",
@@ -2620,6 +2650,7 @@ export const narratorPersistence = {
 				executionAttempt: true,
 				executionIdentityVersion: true,
 				executionOriginToolCallId: true,
+				executionSegmentId: true,
 			},
 		});
 		const ref = await db.query.narratorMessageRefs.findFirst({
@@ -2639,7 +2670,11 @@ export const narratorPersistence = {
 			throw new ValidationError(
 				"Tool execution receipt does not belong to the current narrator/message",
 			);
-		return Object.freeze({ toolCallId, attempt: row.executionAttempt });
+		return Object.freeze({
+			toolCallId,
+			attempt: row.executionAttempt,
+			executionSegmentId: row.executionSegmentId ?? toolCallId,
+		});
 	},
 
 	async validateToolCallBinding(narratorId: string, toolUseId: string, binding: ToolCallBinding) {
@@ -2656,6 +2691,75 @@ export const narratorPersistence = {
 			throw new ValidationError("Tool execution binding is stale or belongs to another narrator");
 		await this.getToolCallBinding(narratorId, row.messageId, toolUseId, binding.toolCallId);
 		return row.messageId;
+	},
+
+	async createInternalRead(
+		narratorId: string,
+		parentToolUseId: string,
+		parentBinding: ToolCallBinding,
+		input: Record<string, unknown>,
+		sequence: number,
+	) {
+		const messageId = await this.validateToolCallBinding(
+			narratorId,
+			parentToolUseId,
+			parentBinding,
+		);
+		const parent = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, parentBinding.toolCallId),
+			columns: { toolName: true, status: true },
+		});
+		if (
+			parent?.toolName !== "Eval" ||
+			parent.status !== "running" ||
+			!Number.isSafeInteger(sequence) ||
+			sequence < 1
+		) {
+			throw new ValidationError("Internal Read requires a running Eval parent");
+		}
+		const toolCallId = generateId();
+		const toolUseId = `internal_read_${generateId()}`;
+		await db.insert(narratorToolCalls).values({
+			id: toolCallId,
+			narratorId,
+			messageId,
+			toolUseId,
+			toolName: "Read",
+			inputJson: {
+				...input,
+				__internalRead: {
+					parentToolCallId: parentBinding.toolCallId,
+					parentAttempt: parentBinding.attempt,
+					sequence,
+				},
+			},
+			status: "initializing",
+			executionAttempt: 1,
+			executionIdentityVersion: 1,
+			createdAt: new Date().toISOString(),
+		});
+		return { toolUseId, binding: Object.freeze({ toolCallId, attempt: 1 }) };
+	},
+
+	async completeInternalRead(
+		narratorId: string,
+		toolUseId: string,
+		binding: ToolCallBinding,
+		result: import("../lib/agent/types").ToolResult & { durationMs?: number },
+	) {
+		const messageId = await this.validateToolCallBinding(narratorId, toolUseId, binding);
+		await this.updateToolCallResult(
+			toolUseId,
+			{
+				output: result,
+				status: result.isError ? "fail" : "success",
+				errorMessage: result.isError ? result.output : undefined,
+				durationMs: result.durationMs,
+				bumpMessageVersion: false,
+			},
+			messageId,
+			binding.toolCallId,
+		);
 	},
 
 	/** A retry of this claim cannot start tool I/O twice, including after process recovery. */
@@ -3335,14 +3439,11 @@ export const narratorPersistence = {
 			const narrator = tx.query.narrators
 				.findFirst({
 					where: eq(narrators.id, narratorId),
-					columns: { forkMessageId: true, pruneBoundaryMessageId: true },
+					columns: { forkMessageId: true },
 				})
 				.sync();
 			const narratorUpdates: Partial<typeof narrators.$inferInsert> = {};
 			if (narrator?.forkMessageId === messageId) narratorUpdates.forkMessageId = newMessageId;
-			if (narrator?.pruneBoundaryMessageId === messageId) {
-				narratorUpdates.pruneBoundaryMessageId = newMessageId;
-			}
 			tx.update(narrators)
 				.set({
 					...narratorUpdates,
@@ -3742,108 +3843,5 @@ export const narratorPersistence = {
 				.where(eq(narrators.id, narratorId))
 				.run();
 		});
-	},
-
-	// ── Dynamic pruning boundary ──────────────────────────────────────────────
-
-	async computeAndUpdatePruneBoundary(
-		narratorId: string,
-		contextPct: number,
-		thresholds: { pruneStart: number; compactStart: number },
-	): Promise<{ boundaryMessageId: string; prunedPercent: number } | null> {
-		const { narratorMessageQueries: nm } = await import("./narrator-messages");
-		const PRUNE_START = thresholds.pruneStart;
-		const PRUNE_END = thresholds.compactStart;
-
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { pruneBoundaryMessageId: true, pruneEnabled: true },
-		});
-
-		// compactStart <= pruneStart means there is no progressive pruning window.
-		// Clear any stale boundary from a previous configuration and let callers
-		// compact directly at compactStart.
-		if (PRUNE_END <= PRUNE_START) {
-			if (narrator?.pruneBoundaryMessageId) {
-				await this.clearPruneBoundary(narratorId);
-			}
-			return null;
-		}
-
-		if (narrator && !narrator.pruneEnabled) return null;
-
-		if (contextPct < PRUNE_START) {
-			if (narrator?.pruneBoundaryMessageId) {
-				await this.clearPruneBoundary(narratorId);
-			}
-			return null;
-		}
-
-		const t = Math.min((contextPct - PRUNE_START) / (PRUNE_END - PRUNE_START), 1);
-		const pruneRatio = t * t;
-
-		const includeChildMessages = await nm.isSubagentNarrator(narratorId);
-		const refs = await nm._getPostCompactTopLevelRefs(narratorId, {
-			includeChildMessages,
-		});
-
-		const compactKeepCount = 4;
-		if (refs.length < compactKeepCount + 2) return null;
-
-		const prunableRefs = refs.slice(0, refs.length - compactKeepCount);
-
-		const currentBoundaryIdx = narrator?.pruneBoundaryMessageId
-			? prunableRefs.findIndex((r) => r.messageId === narrator.pruneBoundaryMessageId)
-			: -1;
-
-		const alreadyPruned = currentBoundaryIdx + 1;
-		const remaining = prunableRefs.length - alreadyPruned;
-		if (remaining <= 0) {
-			const bid = narrator?.pruneBoundaryMessageId ?? null;
-			if (!bid) return null;
-			const prunedPercent = Math.round((alreadyPruned / refs.length) * 100);
-			return { boundaryMessageId: bid, prunedPercent };
-		}
-
-		const maxPruneThisPass = Math.max(1, Math.floor(remaining * 0.5));
-		const curveStep = Math.min(maxPruneThisPass, Math.max(1, Math.floor(pruneRatio * remaining)));
-		// Enforce a minimum prune step so each pass drops at least `minPruneRatio`
-		// of the remaining prunable messages. Pruning in larger steps means the
-		// prune boundary moves less often, which keeps the prompt-cache prefix
-		// stable for longer and reduces billing from repeated cache invalidation.
-		// The minimum is allowed to exceed the 50% soft cap above, since the whole
-		// point is to prune in fewer, bigger steps.
-		const minStep = Math.max(1, Math.ceil(getMinPruneRatio() * remaining));
-		const additionalPrune = Math.min(remaining, Math.max(curveStep, minStep));
-		const newBoundaryIdx = alreadyPruned + additionalPrune - 1;
-
-		const boundaryMessageId = prunableRefs[newBoundaryIdx].messageId;
-		const prunedPercent = Math.round(((newBoundaryIdx + 1) / refs.length) * 100);
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ pruneBoundaryMessageId: boundaryMessageId, prunedPercent, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-
-		logger.debug("Updated prune boundary", {
-			narratorId,
-			contextPct,
-			pruneRatio: Math.round(pruneRatio * 100),
-			additionalPrune,
-			remaining,
-			prunableTotal: prunableRefs.length,
-			boundaryMessageId,
-			prunedPercent,
-		});
-
-		return { boundaryMessageId, prunedPercent };
-	},
-
-	async clearPruneBoundary(narratorId: string): Promise<void> {
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ pruneBoundaryMessageId: null, prunedPercent: null, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
 	},
 };

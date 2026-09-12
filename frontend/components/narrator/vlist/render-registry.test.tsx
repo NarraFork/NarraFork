@@ -5,7 +5,6 @@ import type { MeasuredElement } from "./prepared-block";
 import { VLIST_ELEMENT_KINDS, type VListElementKind } from "./registry";
 import { RenderMarkdown } from "./render/RenderMarkdown";
 import { RenderMessageBubble } from "./render/RenderMessageBubble";
-import { RenderPruneDivider } from "./render/RenderMisc";
 import { RenderToolRun, RenderTraceCountLine } from "./render/RenderToolRun";
 import { type RenderExtra, renderElement } from "./render-registry";
 
@@ -51,9 +50,6 @@ describe("render-registry dispatch", () => {
 		expect(elementType(renderElement("reasoning-steps", STUB))).toBe(RenderToolRun);
 		expect(elementType(renderElement("tool-run-count", STUB))).toBe(RenderTraceCountLine);
 		expect(elementType(renderElement("reasoning-count", STUB))).toBe(RenderTraceCountLine);
-		expect(elementType(renderElement("prune-divider", STUB, { data: { label: "x" } }))).toBe(
-			RenderPruneDivider,
-		);
 	});
 
 	it("passes the message-bubble role through to props", () => {
@@ -326,8 +322,6 @@ function kindExtra(kind: VListElementKind): RenderExtra {
 			return { kind: "pending" };
 		case "subagent-card":
 			return { description: "desc" };
-		case "prune-divider":
-			return { data: { label: "x" } };
 		case "system-text":
 			return { kind: "info", data: { text: "" } };
 		default:

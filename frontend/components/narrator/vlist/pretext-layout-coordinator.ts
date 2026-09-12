@@ -44,7 +44,7 @@ import { trimClockNow, trimLoadedHead } from "./vlist-head-trim";
 import { appendLoadedMessage } from "./vlist-message-append";
 import { insertLoadedMessage } from "./vlist-message-insert";
 import { removeLoadedMessages } from "./vlist-message-remove";
-import { replaceLoadedMessage } from "./vlist-message-replace";
+import { type ReplaceAliases, replaceLoadedMessage } from "./vlist-message-replace";
 import type { VListItem } from "./vlist-pipeline";
 
 export type PretextLayoutCoordinatorStatus = "idle" | "loading" | "computing" | "ready" | "error";
@@ -64,7 +64,7 @@ export interface PretextLayoutCoordinatorSnapshot {
 	 *
 	 * Kept OUTSIDE `input` on purpose: `input` is the persisted, paginated snapshot
 	 * (its `messages.length`, `oldestLoadedSeq`, `hasPrev` and version drive
-	 * `loadOlder`'s prepend arithmetic and its version/prune consistency checks).
+	 * `loadOlder`'s prepend arithmetic and its version consistency checks).
 	 * A synthetic, unpersisted row must not participate in any of that.
 	 */
 	streamingMessage?: TreeMessage | null;
@@ -101,10 +101,7 @@ export interface PretextLayoutCoordinatorSnapshot {
 }
 
 export interface PretextLayoutBuildOptions
-	extends Omit<
-		BuildPretextDocumentLayoutOptions,
-		"layoutRevision" | "documentRevision" | "lod" | "pruneBoundaryMessageId"
-	> {
+	extends Omit<BuildPretextDocumentLayoutOptions, "layoutRevision" | "documentRevision" | "lod"> {
 	lod: RenderLod;
 }
 
@@ -737,9 +734,15 @@ export class PretextLayoutCoordinator {
 	 *
 	 * Returns false when nothing was replaced, so the caller can decide to reload.
 	 */
-	replaceMessage(message: TreeMessage, getView?: () => PrependView): boolean {
+	replaceMessage(
+		message: TreeMessage,
+		aliasesOrView?: ReplaceAliases | (() => PrependView),
+		maybeView?: () => PrependView,
+	): boolean {
 		if (!this.input || !this.lastBuildOptions) return false;
-		const result = replaceLoadedMessage(this.input.messages, message);
+		const aliases = typeof aliasesOrView === "function" ? undefined : aliasesOrView;
+		const getView = typeof aliasesOrView === "function" ? aliasesOrView : maybeView;
+		const result = replaceLoadedMessage(this.input.messages, message, aliases);
 		if (!result.replaced) return false;
 		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
 		// Replacement is prefix-truncation only (see above), so the math was usually
@@ -986,7 +989,6 @@ export class PretextLayoutCoordinator {
 		const messages = this.layoutMessages(input);
 		return buildPretextDocumentLayout(messages as unknown as NarratorMsg[], {
 			...buildOptions,
-			pruneBoundaryMessageId: input.pruneBoundaryMessageId,
 			// The loaded-message count keeps the revision distinct as the window
 			// grows upward within one document version (prepended older pages).
 			layoutRevision: `${input.messageVersion}:${input.messages.length}:${buildOptions.widthBucket}:${buildOptions.lod}:k${getKatexRevision()}:f${getFontRevision()}:t${getTypographyRevision()}`,

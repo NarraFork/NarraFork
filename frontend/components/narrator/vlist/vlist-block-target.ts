@@ -39,7 +39,6 @@ const AGGREGATE_KINDS = new Set<VListElementKind>(["tool-run-count", "activity-t
 
 /** Kinds that never participate in the single-block interaction menu. */
 const NON_INTERACTIVE_KINDS = new Set<VListElementKind>([
-	"prune-divider",
 	"tool-call-group",
 	"reasoning-count",
 	"ask-user-question",
@@ -64,11 +63,12 @@ const BLOCK_INDEXED_KINDS = new Set<VListElementKind>([
 	"ask-in-passing",
 ]);
 
-const BLOCK_INDEX_SUFFIX = /-b(\d+)$/;
+const BLOCK_INDEX_TOKEN = /-b(\d+)(?:-|$)/;
 
-/** Extract the trailing `-b{n}` block index from a spec key, or null. */
-function blockIndexFromKey(key: string): number | null {
-	const match = BLOCK_INDEX_SUFFIX.exec(key);
+/** Extract the stable `-b{n}` block index from a spec key, or null. */
+function blockIndexFromKey(key: string, messageId?: string): number | null {
+	const suffix = messageId && key.startsWith(`${messageId}-`) ? key.slice(messageId.length) : key;
+	const match = BLOCK_INDEX_TOKEN.exec(suffix);
 	if (!match) return null;
 	const n = Number(match[1]);
 	return Number.isInteger(n) && n >= 0 ? n : null;
@@ -80,8 +80,9 @@ function blockIndexFromKey(key: string): number | null {
  * `-b{n}-` segment rather than a trailing one.
  */
 const INJECTION_BLOCK_INDEX = /-b(\d+)-/;
-function injectionBlockIndexFromKey(key: string): number | null {
-	const match = INJECTION_BLOCK_INDEX.exec(key);
+function injectionBlockIndexFromKey(key: string, messageId?: string): number | null {
+	const suffix = messageId && key.startsWith(`${messageId}-`) ? key.slice(messageId.length) : key;
+	const match = INJECTION_BLOCK_INDEX.exec(suffix);
 	if (!match) return null;
 	const n = Number(match[1]);
 	return Number.isInteger(n) && n >= 0 ? n : null;
@@ -126,13 +127,13 @@ export function resolveVListBlockTarget(
 	// the row's address for delete / rollback / fork — the same operations a user's own
 	// message exposes.
 	if (kind === "injection-bubble") {
-		const blockIndex = injectionBlockIndexFromKey(key);
+		const blockIndex = injectionBlockIndexFromKey(key, messageId);
 		if (blockIndex == null) return null;
 		return { blockId: `msg-${messageId}-${blockIndex}`, messageId, blockIndex };
 	}
 
 	if (BLOCK_INDEXED_KINDS.has(kind)) {
-		const blockIndex = blockIndexFromKey(key);
+		const blockIndex = blockIndexFromKey(key, messageId);
 		if (blockIndex == null) return null;
 		return { blockId: `msg-${messageId}-${blockIndex}`, messageId, blockIndex };
 	}

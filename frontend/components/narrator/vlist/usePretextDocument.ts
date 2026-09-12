@@ -56,7 +56,6 @@ export interface UsePretextDocumentOptions {
 	segmentGap?: number;
 	topPadding?: number;
 	bottomPadding?: number;
-	pruneDividerLabel?: string;
 	isExpanded?: (key: string) => boolean | undefined;
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
@@ -149,8 +148,6 @@ export interface UsePretextDocumentResult {
 	 */
 	streamingMessage: TreeMessage | null;
 	messageVersion?: number;
-	pruneBoundaryMessageId: string | null;
-	prunedPercent: number | null;
 	manifest?: PretextLayoutManifest;
 	index?: PretextLayoutIndex;
 	items: readonly VListItem[];
@@ -256,7 +253,15 @@ export interface UsePretextDocumentResult {
 	 * edit, since a version-neutral rebuild would serve the surviving blocks' cached
 	 * heights.
 	 */
-	replaceMessage: (message: TreeMessage) => boolean;
+	replaceMessage: (
+		message: TreeMessage,
+		aliases?: {
+			oldMessageId?: string;
+			replacedMessageId?: string;
+			messageId?: string;
+			replacementMessageId?: string;
+		},
+	) => boolean;
 	/**
 	 * Drop the oldest `dropCount` loaded messages so a long session's window stays
 	 * bounded. The caller must obtain `dropCount` from `resolveHeadTrim`, which owns
@@ -335,7 +340,6 @@ export function usePretextDocument(
 			segmentGap: options.segmentGap,
 			topPadding: options.topPadding ?? 16,
 			bottomPadding: options.bottomPadding ?? 16,
-			pruneDividerLabel: options.pruneDividerLabel,
 			isExpanded: options.isExpanded,
 			isLodUserOverride: options.isLodUserOverride,
 			showEarlier: options.showEarlier,
@@ -388,7 +392,6 @@ export function usePretextDocument(
 			options.isLodUserOverride,
 			options.labels,
 			options.labelsRevision,
-			options.pruneDividerLabel,
 			options.recentMessageIds,
 			options.resolveRecentMessageIds,
 			options.lod,
@@ -730,8 +733,16 @@ export function usePretextDocument(
 		[coordinator, options.getCurrentView],
 	);
 	const replaceMessage = useCallback(
-		(message: TreeMessage) =>
-			coordinator?.replaceMessage(message, () => {
+		(
+			message: TreeMessage,
+			aliases?: {
+				oldMessageId?: string;
+				replacedMessageId?: string;
+				messageId?: string;
+				replacementMessageId?: string;
+			},
+		) =>
+			coordinator?.replaceMessage(message, aliases, () => {
 				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
 				return {
 					scrollTop: view.scrollTop,
@@ -775,8 +786,6 @@ export function usePretextDocument(
 		messages: snapshot.input?.messages ?? EMPTY_MESSAGES,
 		streamingMessage: snapshot.streamingMessage ?? null,
 		messageVersion: snapshot.input?.messageVersion,
-		pruneBoundaryMessageId: snapshot.input?.pruneBoundaryMessageId ?? null,
-		prunedPercent: snapshot.input?.prunedPercent ?? null,
 		manifest: snapshot.manifest,
 		index: snapshot.index,
 		items: snapshot.items ?? EMPTY_ITEMS,

@@ -64,8 +64,6 @@ export interface ActiveNarrator {
 	/** Set when ExitPlanMode completes — the loop should restart with a user message.
 	 *  "continue" = no compact; "compact" = compact was performed, needs fresh context. */
 	_planApprovedContinue?: "continue" | "compact";
-	/** Cached prune boundary from the start of the current agent loop iteration */
-	_pruneBoundaryMessageId?: string | null;
 	/** Cached chapter ID (set when narrator is bound to an active chapter) */
 	_chapterId?: string;
 	/** Cached project ID (set when narrator is bound to a chapter with a project) */
@@ -1015,7 +1013,7 @@ export function reserveNarratorRevertAdmission(narratorId: string): {
 	};
 }
 
-// === Compact/Prune locks ===
+// === Compact locks ===
 
 export type CompactLockKind = "history" | "history_probe" | "segment";
 export type CompactMode = "blocking" | "background";
@@ -1047,6 +1045,3 @@ export const compactLocks = hotSafe<Map<string, CompactLock>>(
 	"narrafork.compactLocks.v2",
 	() => new Map(),
 );
-
-/** Per-narrator lock to prevent concurrent prune boundary computations. */
-export const pruneLocks = hotSafe<Set<string>>("narrafork.pruneLocks", () => new Set());

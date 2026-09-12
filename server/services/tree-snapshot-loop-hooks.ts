@@ -40,6 +40,8 @@ import { logger } from "../lib/logger";
 import type { EventHooks } from "./narrator-event-handler";
 import {
 	abandonTreeSnapshot,
+	type BashCaptureWindow,
+	beginBashCaptureWindow,
 	declaredWorktreePaths,
 	recordTreeSnapshotAfter,
 	recordTreeSnapshotBefore,
@@ -67,6 +69,7 @@ export function buildTreeSnapshotEventHooks(opts: {
 	// Keep the accepted scope per attempt without mutating the session's default
 	// device to impersonate a per-call override. A remote cwd is not a local cwd.
 	const localCalls = new Map<string, string>();
+	const bashCaptureWindows = new Map<string, BashCaptureWindow>();
 
 	return {
 		// Capture the workspace state before a file-mutating tool runs. This is a
@@ -102,6 +105,17 @@ export function buildTreeSnapshotEventHooks(opts: {
 				return;
 			}
 			localCalls.set(toolUseId, session.cwd);
+			if (toolName === SHELL_TOOL_NAME) {
+				const window = beginBashCaptureWindow(session.cwd, toolUseId);
+				bashCaptureWindows.set(toolUseId, window);
+				if (!window.eligible) {
+					logger.info("Bash tree capture skipped because another Bash is active", {
+						narratorId,
+						toolUseId,
+					});
+					return;
+				}
+			}
 			await recordTreeSnapshotBefore(session, narratorId, toolUseId, declared);
 		},
 		// Capture the resulting state, persist both boundaries, and attribute the
@@ -110,6 +124,18 @@ export function buildTreeSnapshotEventHooks(opts: {
 			if (!FILE_MUTATING_TOOLS.has(toolName)) return;
 			const capturedCwd = localCalls.get(toolUseId);
 			localCalls.delete(toolUseId);
+			const bashWindow =
+				toolName === SHELL_TOOL_NAME ? bashCaptureWindows.get(toolUseId) : undefined;
+			bashCaptureWindows.delete(toolUseId);
+			bashWindow?.end();
+			if (
+				toolName === SHELL_TOOL_NAME &&
+				(bashWindow === undefined || !bashWindow.eligible || bashWindow.wasOverlapped())
+			) {
+				abandonTreeSnapshot(session, narratorId, toolUseId);
+				await recordTreeSnapshotAfter(session, narratorId, toolUseId, { unavailable: true });
+				return;
+			}
 			if (
 				capturedCwd !== session.cwd ||
 				(session._defaultDeviceId ?? LOCAL_DEVICE_ID) !== LOCAL_DEVICE_ID

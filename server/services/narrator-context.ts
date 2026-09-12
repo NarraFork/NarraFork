@@ -46,8 +46,6 @@ type CompactMessage = {
 interface CompactEntry {
 	message: CompactMessage;
 	text: string;
-	pruned: boolean;
-	dropped: boolean;
 }
 
 export type CompactSummaryTextDeltaHandler = (delta: string) => void | Promise<void>;
@@ -118,21 +116,6 @@ function messageToCompactText(m: CompactMessage): string | null {
 		text = text ? `${text}${toolBlock}` : toolBlock.trimStart();
 	}
 
-	if (!text) return null;
-	return `[${role}]: ${text}`;
-}
-
-/**
- * Strip tool call details from a message's compact text, keeping only the
- * plain text content. Used when pruning messages to reduce token count.
- */
-function messageToCompactTextPruned(m: CompactMessage): string | null {
-	if (m.role !== "user" && m.role !== "assistant") return null;
-	const tcs = m.toolCalls;
-	if (tcs?.length && tcs.some((tc) => IN_FLIGHT_STATUSES.has(tc.status))) return null;
-
-	const role = m.role === "assistant" ? "Assistant" : "User";
-	const text = (stripTodoReminderBlocks(m.contentText || "") as string) || "";
 	if (!text) return null;
 	return `[${role}]: ${text}`;
 }
@@ -229,17 +212,13 @@ export const narratorContext = {
 	 * as the "previous context summary" into the next chunk. The final chunk
 	 * produces the overall summary.
 	 *
-	 * Within each chunk, progressive fitting (prune tool calls → drop oldest
-	 * messages) is still applied as a safety net.
-	 *
-	 * @param pruneBoundaryMessageId  The main session's current prune boundary.
-	 *   Messages at or before this ID start with tool calls already stripped.
+	 * Oversized chunks are recursively split within a fixed depth budget, never
+	 * fitted by removing tool evidence or dropping complete messages.
 	 */
 	async generateCompactSummary(
 		narratorId: string,
 		locale: Locale = "en",
 		providedMessages?: CompactMessage[],
-		pruneBoundaryMessageId?: string | null,
 		signal?: AbortSignal,
 		modelOverride?: string,
 		onTextDelta?: CompactSummaryTextDeltaHandler,
@@ -258,18 +237,13 @@ export const narratorContext = {
 		}
 
 		// ── Build per-message compact text entries ──
-		const pruneBoundaryIdx = pruneBoundaryMessageId
-			? messages.findIndex((m) => m.id === pruneBoundaryMessageId)
-			: -1;
-
 		const entries: CompactEntry[] = [];
 
 		for (let i = 0; i < messages.length; i++) {
 			const m = messages[i];
-			const shouldPrune = i <= pruneBoundaryIdx;
-			const text = shouldPrune ? messageToCompactTextPruned(m) : messageToCompactText(m);
+			const text = messageToCompactText(m);
 			if (text == null) continue;
-			entries.push({ message: m, text, pruned: shouldPrune, dropped: false });
+			entries.push({ message: m, text });
 		}
 
 		// ── Compute fixed overhead ──
@@ -495,65 +469,17 @@ export const narratorContext = {
 		const fixedTokens = baseFixedTokens + estimateTokens(previousSummaryPrefix);
 		const contentBudget = tokenBudget - fixedTokens;
 
-		// ── Progressive fitting: alternate prune ↔ drop until within budget ──
-		let totalTokens = entries.reduce(
-			(sum, e) => (e.dropped ? sum : sum + estimateTokens(e.text)),
-			0,
-		);
-
-		let prunePtr = 0;
-		let dropPtr = 0;
-		let preferPrune = true;
-		const MAX_ITERATIONS = entries.length * 3;
-		let iterations = 0;
-
-		while (totalTokens > contentBudget && iterations < MAX_ITERATIONS) {
-			iterations++;
-			let madeProgress = false;
-
-			if (preferPrune) {
-				while (prunePtr < entries.length) {
-					const e = entries[prunePtr];
-					if (!e.dropped && !e.pruned) break;
-					prunePtr++;
-				}
-				if (prunePtr < entries.length) {
-					const e = entries[prunePtr];
-					const oldTokens = estimateTokens(e.text);
-					const newText = messageToCompactTextPruned(e.message);
-					if (newText && newText.length < e.text.length) {
-						totalTokens -= oldTokens;
-						e.text = newText;
-						e.pruned = true;
-						totalTokens += estimateTokens(newText);
-						madeProgress = true;
-					} else {
-						e.pruned = true;
-					}
-					prunePtr++;
-				}
-			}
-
-			if (!preferPrune || !madeProgress) {
-				while (dropPtr < entries.length) {
-					if (!entries[dropPtr].dropped) break;
-					dropPtr++;
-				}
-				if (dropPtr < entries.length) {
-					const e = entries[dropPtr];
-					totalTokens -= estimateTokens(e.text);
-					e.dropped = true;
-					dropPtr++;
-					madeProgress = true;
-				}
-			}
-
-			if (!madeProgress) break;
-			preferPrune = !preferPrune;
+		if (signal?.aborted) throw new DOMException("Compact summary aborted", "AbortError");
+		const totalTokens = entries.reduce((sum, entry) => sum + estimateTokens(entry.text), 0);
+		// Never fit a summary by silently deleting tool evidence or whole messages.
+		// The caller splits oversized chunks/text recursively with a bounded depth;
+		// if even fixed overhead cannot fit, fail without committing a lossy summary.
+		if (totalTokens > contentBudget) {
+			throw new Error("Compact input exceeds maximum context length");
 		}
 
 		// ── Assemble final conversation text ──
-		const activeTexts = entries.filter((e) => !e.dropped).map((e) => e.text);
+		const activeTexts = entries.map((entry) => entry.text);
 		let conversationText = activeTexts.join("\n\n");
 
 		if (previousSummaryPrefix) {
@@ -561,19 +487,6 @@ export const narratorContext = {
 		}
 
 		if (!conversationText.trim()) return { summary: "No conversation history." };
-
-		const droppedCount = entries.filter((e) => e.dropped).length;
-		const prunedCount = entries.filter((e) => e.pruned && !e.dropped).length;
-		if (droppedCount > 0 || prunedCount > 0) {
-			logger.info("Compact input fitted to summary model budget", {
-				narratorId,
-				totalEntries: entries.length,
-				droppedMessages: droppedCount,
-				prunedMessages: prunedCount,
-				estimatedTokens: totalTokens + fixedTokens,
-				tokenBudget,
-			});
-		}
 
 		const compactUserText = `<conversation>\n${conversationText}\n</conversation>\n\n${compactSuffix}`;
 
@@ -670,8 +583,7 @@ export const narratorContext = {
  * Subsequent chunks reserve space for an intermediate summary prefix
  * (estimated at a fixed size since we don't know the actual summary yet).
  *
- * Each chunk gets its own copy of entries (with fresh dropped/pruned state)
- * so that `_summarizeChunk` can mutate them independently.
+ * Each chunk gets its own entry list; text payloads are shared without copying.
  */
 function splitIntoChunks(
 	entries: CompactEntry[],
@@ -706,7 +618,7 @@ function splitIntoChunks(
 			if (chunk.length > 0 && chunkTokens + entryTokens > contentBudget) {
 				break;
 			}
-			// Clone entry so _summarizeChunk can mutate pruned/dropped independently
+			// Clone metadata only; retain each entry's complete text.
 			chunk.push({ ...entries[cursor] });
 			chunkTokens += entryTokens;
 			cursor++;

@@ -111,9 +111,8 @@ function mergeRoundOf(contentJson: unknown): number {
 export const mergeSummaryService = {
 	/**
 	 * Asynchronously generate a merge summary and inject it as a message
-	 * into the target chapter's primary narrator. Uses role="user" so the
-	 * SDK includes it in conversation history (role="system" is filtered
-	 * out by buildHistory). Fire-and-forget — errors are logged but never
+	 * into the target chapter's primary narrator. Uses the persisted system-message
+	 * path so the SDK includes it in conversation history. Fire-and-forget — errors are logged but never
 	 * propagated to the caller.
 	 */
 	async generateAndInject(input: MergeSummaryInput): Promise<void> {
@@ -260,9 +259,7 @@ export const mergeSummaryService = {
 			const header = `[${l("headerMerged")}] "${source.branch}" → "${target.branch}"${mergedByText} (${strategy})`;
 			const fullContent = `${header}\n\n${summary}`;
 
-			// Insert via persistSystemMessage (role="user" + text block) so the
-			// SDK includes it in conversation history. Append a structured
-			// merge_summary block for the UI to render as a card.
+			// Persist one self-contained structured block so the SDK and UI share the same message.
 			const msg = await narratorService.persistSystemMessage(
 				primaryNarrator.id,
 				fullContent,
@@ -278,6 +275,7 @@ export const mergeSummaryService = {
 						mergeRound,
 						isLatest: true,
 						summary,
+						modelText: fullContent,
 					},
 				],
 				userId,

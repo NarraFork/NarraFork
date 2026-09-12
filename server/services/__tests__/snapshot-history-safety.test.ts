@@ -22,7 +22,15 @@ const directories: string[] = [];
 const triggerNames: string[] = [];
 const now = "2026-09-07T00:00:00.000Z";
 
-type Block = { type: string; id?: string; name?: string; text?: string };
+type Block = {
+	type: string;
+	id?: string;
+	name?: string;
+	text?: string;
+	source?: string;
+	sourceBranch?: string;
+	modelText?: string;
+};
 
 function fixture() {
 	// Importing the real DB is safe only because bunfig's preload ran first.
@@ -51,10 +59,15 @@ function addNarrator(cwd: string) {
 	return narratorId;
 }
 
-function addMessage(narratorId: string, contentJson: Block[], seq = 1) {
+function addMessage(
+	narratorId: string,
+	contentJson: Block[],
+	seq = 1,
+	role: "assistant" | "sys" = "assistant",
+) {
 	const messageId = generateId();
 	db.insert(narratorMessages)
-		.values({ id: messageId, narratorId, role: "assistant", contentJson, createdAt: now })
+		.values({ id: messageId, narratorId, role, contentJson, createdAt: now })
 		.run();
 	db.insert(narratorMessageRefs).values({ id: generateId(), narratorId, messageId, seq }).run();
 	return messageId;
@@ -164,7 +177,7 @@ afterEach(() => {
 	for (const name of triggerNames.splice(0)) sqlite.run(`DROP TRIGGER IF EXISTS "${name}"`);
 	if (narratorIds.length > 0) {
 		db.update(narrators)
-			.set({ forkMessageId: null, pruneBoundaryMessageId: null, parentNarratorId: null })
+			.set({ forkMessageId: null, parentNarratorId: null })
 			.where(inArray(narrators.id, narratorIds))
 			.run();
 		db.delete(narratorMessageRefs)
@@ -552,6 +565,74 @@ describe("origin-bound derived history cleanup", () => {
 			).toHaveLength(0);
 		});
 	}
+});
+
+describe("native and legacy injection deletion", () => {
+	test("deleting a native injection removes the persisted block and ref", async () => {
+		const { narratorId } = fixture();
+		const messageId = addMessage(
+			narratorId,
+			[
+				{
+					type: "system_injection",
+					source: "bg_agent",
+					modelText: "finished",
+				},
+			],
+			1,
+			"sys",
+		);
+		await narratorService.deleteMessageBlock(narratorId, messageId, 0, { skipRevert: true });
+		expect(messageBlocks(messageId)).toBeUndefined();
+		expect(messageRefs(messageId)).toEqual([]);
+	});
+
+	test("deleting a legacy injection removes its explicit model-text sibling", async () => {
+		const { narratorId } = fixture();
+		const messageId = addMessage(
+			narratorId,
+			[
+				{ type: "text", text: "finished" },
+				{ type: "system_injection", source: "bg_agent" },
+			],
+			1,
+			"sys",
+		);
+		await narratorService.deleteMessageBlock(narratorId, messageId, 1, { skipRevert: true });
+		expect(messageBlocks(messageId)).toBeUndefined();
+		expect(messageRefs(messageId)).toEqual([]);
+	});
+
+	test("native injection deletion keeps an unrelated text block", async () => {
+		const { narratorId } = fixture();
+		const messageId = addMessage(
+			narratorId,
+			[
+				{ type: "text", text: "independent user content" },
+				{ type: "system_injection", source: "bg_agent", modelText: "finished" },
+			],
+			1,
+			"sys",
+		);
+		await narratorService.deleteMessageBlock(narratorId, messageId, 1, { skipRevert: true });
+		expect(messageBlocks(messageId)).toEqual([{ type: "text", text: "independent user content" }]);
+	});
+
+	test("deleting a legacy direct context card removes its text projection", async () => {
+		const { narratorId } = fixture();
+		const messageId = addMessage(
+			narratorId,
+			[
+				{ type: "text", text: "merge model context" },
+				{ type: "merge_summary", sourceBranch: "feature" },
+			],
+			1,
+			"sys",
+		);
+		await narratorService.deleteMessageBlock(narratorId, messageId, 1, { skipRevert: true });
+		expect(messageBlocks(messageId)).toBeUndefined();
+		expect(messageRefs(messageId)).toEqual([]);
+	});
 });
 
 describe("fixed block selection and shared-message COW", () => {

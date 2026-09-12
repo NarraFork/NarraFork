@@ -295,7 +295,6 @@ export interface CreateNarratorInput {
 	/** Tri-state priority-tier override. "inherit" follows the user's fastModeDefault. */
 	fastModeOverride?: BooleanOverride;
 	relaxedPlan?: boolean;
-	pruneEnabled?: boolean;
 	planReflectionAutoApproveOverride?: BooleanOverride;
 	dangerReflectionOverride?: DangerReflectionOverride;
 	autoContinuationOverride?: AutoContinuationOverride;
@@ -1321,7 +1320,6 @@ export async function prepareNarratorCreation(
 				explicit: input.relaxedPlan,
 				defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
 			}),
-			pruneEnabled: input.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 			planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride ?? "inherit",
 			dangerReflectionOverride: input.dangerReflectionOverride ?? "inherit",
 			autoContinuationOverride: input.autoContinuationOverride ?? "inherit",
@@ -1475,7 +1473,6 @@ export const narratorService = {
 				fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
 				fastMode: legacyFastModeMirror(parent.fastModeOverride),
 				relaxedPlan: resolvedRelaxedPlan,
-				pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 				planReflectionAutoApproveOverride:
 					input.planReflectionAutoApproveOverride ??
 					parent.planReflectionAutoApproveOverride ??
@@ -1941,10 +1938,6 @@ export const narratorService = {
 					.set({ forkMessageId: null })
 					.where(inArray(narrators.forkMessageId, orphanIds))
 					.run();
-				tx.update(narrators)
-					.set({ pruneBoundaryMessageId: null })
-					.where(inArray(narrators.pruneBoundaryMessageId, orphanIds))
-					.run();
 				tx.update(chapterCommits)
 					.set({ narratorMessageId: null })
 					.where(inArray(chapterCommits.narratorMessageId, orphanIds))
@@ -2056,7 +2049,6 @@ export const narratorService = {
 						explicit: parent.relaxedPlan ?? undefined,
 						defaultRelaxedPlan: false,
 					}),
-					pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 					planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
 					dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
 					autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
@@ -2186,7 +2178,6 @@ export const narratorService = {
 			messageId: string;
 			seq: number;
 			isCompact: number;
-			prunedPercent: number | null;
 			segmentCompactId: string | null;
 		}> = [];
 		let resolvedForkMessageId: string | null = null;
@@ -2250,7 +2241,6 @@ export const narratorService = {
 						explicit: parent.relaxedPlan ?? undefined,
 						defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
 					}),
-					pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 					planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
 					dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
 					autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
@@ -2318,7 +2308,6 @@ export const narratorService = {
 						messageId: narratorMessageRefs.messageId,
 						seq: narratorMessageRefs.seq,
 						isCompact: narratorMessageRefs.isCompact,
-						prunedPercent: narratorMessageRefs.prunedPercent,
 						segmentCompactId: narratorMessageRefs.segmentCompactId,
 					})
 					.from(narratorMessageRefs)
@@ -2356,7 +2345,6 @@ export const narratorService = {
 						messageId: narratorMessageRefs.messageId,
 						seq: narratorMessageRefs.seq,
 						isCompact: narratorMessageRefs.isCompact,
-						prunedPercent: narratorMessageRefs.prunedPercent,
 						segmentCompactId: narratorMessageRefs.segmentCompactId,
 					})
 					.from(narratorMessageRefs)
@@ -2414,7 +2402,7 @@ export const narratorService = {
 				//
 				// 注意: SQL 必须复现 prefixRows 的完整过滤条件（compact 边界、segment 排除、
 				// 进行中 compact 标记排除、上限截断），不能简化为 seq <= lastSeq，否则会错误
-				// 复制已 compact/prune 掉的历史 refs。
+				// 复制已 compact 掉的历史 refs。
 				//
 				// 这里刻意不 join narrator_messages: 进行中的 compact 标记已经在上面通过
 				// 部分索引解析成一个通常为空的 id 列表，join 消息表只会把整段历史的
@@ -2423,14 +2411,13 @@ export const narratorService = {
 				const firstSeq = prefixRows[0].seq;
 				const excludePendingRaw = excludePendingCompactRawCondition(pendingCompactIds);
 				tx.run(sql`
-					INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact, pruned_percent, segment_compact_id)
+					INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact, segment_compact_id)
 					SELECT
 						lower(hex(randomblob(16))),
 						${id},
 						refs.message_id,
 						refs.seq,
 						refs.is_compact,
-						refs.pruned_percent,
 						refs.segment_compact_id
 					FROM narrator_message_refs AS refs
 					WHERE refs.narrator_id = ${parentNarratorId}
@@ -2464,25 +2451,6 @@ export const narratorService = {
 						})
 						.where(eq(narrators.id, id))
 						.run();
-				}
-
-				if (parent.pruneBoundaryMessageId) {
-					const boundaryInPrefix = prefixRows.find(
-						(r) => r.messageId === parent.pruneBoundaryMessageId,
-					);
-					if (boundaryInPrefix) {
-						const boundaryIdx = prefixRows.indexOf(boundaryInPrefix);
-						const inheritedPrunedPercent = Math.round(
-							((boundaryIdx + 1) / prefixRows.length) * 100,
-						);
-						tx.update(narrators)
-							.set({
-								pruneBoundaryMessageId: parent.pruneBoundaryMessageId,
-								prunedPercent: inheritedPrunedPercent,
-							})
-							.where(eq(narrators.id, id))
-							.run();
-					}
 				}
 			}
 
@@ -2868,7 +2836,6 @@ export const narratorService = {
 		narratorPersistence.updateReflectionOverrides.bind(narratorPersistence),
 	updateBehaviorFenceSettings:
 		narratorPersistence.updateBehaviorFenceSettings.bind(narratorPersistence),
-	updatePruneEnabled: narratorPersistence.updatePruneEnabled.bind(narratorPersistence),
 	updateStatus: narratorPersistence.updateStatus.bind(narratorPersistence),
 	compareAndSetStatus: narratorPersistence.compareAndSetStatus.bind(narratorPersistence),
 	updateSubstatus: narratorPersistence.updateSubstatus.bind(narratorPersistence),
@@ -2898,7 +2865,4 @@ export const narratorService = {
 	getSegmentCompactSummary: narratorPersistence.getSegmentCompactSummary.bind(narratorPersistence),
 	updateSegmentCompactSummary:
 		narratorPersistence.updateSegmentCompactSummary.bind(narratorPersistence),
-	computeAndUpdatePruneBoundary:
-		narratorPersistence.computeAndUpdatePruneBoundary.bind(narratorPersistence),
-	clearPruneBoundary: narratorPersistence.clearPruneBoundary.bind(narratorPersistence),
 };

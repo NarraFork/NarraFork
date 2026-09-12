@@ -31,7 +31,6 @@ const BUILD_OPTIONS = {
 	widthBucket: "860",
 	contentWidth: 860,
 	viewportHeight: 720,
-	pruneBoundaryMessageId: null,
 };
 
 const CIPHERTEXT = "c".repeat(20_000);
@@ -177,7 +176,10 @@ function unprojected(): NarratorMsg[] {
 	return fixture({
 		withToolRows: true,
 		metadata: (itemId) => ({ openai: { itemId, reasoningEncryptedContent: CIPHERTEXT } }),
-		signedMetadata: { anthropic: { signature: SIGNATURE, blockIndex: 1 }, signatureSource: "anthropic" },
+		signedMetadata: {
+			anthropic: { signature: SIGNATURE, blockIndex: 1 },
+			signatureSource: "anthropic",
+		},
 	});
 }
 

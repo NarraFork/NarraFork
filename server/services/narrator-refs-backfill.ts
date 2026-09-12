@@ -171,14 +171,13 @@ function copyWindow(
 		// duplicated. Segment-compacted refs are excluded to match forkNarrator.
 		tx.run(sql`
 			INSERT INTO narrator_message_refs
-				(id, narrator_id, message_id, seq, is_compact, pruned_percent, segment_compact_id)
+				(id, narrator_id, message_id, seq, is_compact, segment_compact_id)
 			SELECT
 				lower(hex(randomblob(16))),
 				${narratorId},
 				refs.message_id,
 				refs.seq,
 				refs.is_compact,
-				refs.pruned_percent,
 				refs.segment_compact_id
 			FROM narrator_message_refs AS refs
 			WHERE refs.narrator_id = ${parentNarratorId}

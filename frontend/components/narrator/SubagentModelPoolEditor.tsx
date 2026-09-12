@@ -9,7 +9,8 @@ import {
 import { selectPoolModels, updatePoolModel } from "./subagent-model-pool-state";
 
 const EMPTY_POOLS: SubagentModelPools = {};
-const EDITABLE_TYPES = ["explore", "plan", "general"] as const;
+/** Every builtin pool type is editable; settings exposes the same five. */
+const EDITABLE_TYPES = SUBAGENT_POOL_TYPES;
 
 /** Keep this state above the details filter so hiding the section cannot discard a draft. */
 export function useSubagentModelPoolDraft(

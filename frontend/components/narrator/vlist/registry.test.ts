@@ -37,12 +37,6 @@ describe("vlist registry", () => {
 		expect(r.height).toBeGreaterThan(0);
 	});
 
-	it("dispatches a prune-divider (no data needed)", async () => {
-		const { measureElement } = await import("./registry");
-		const r = measureElement("prune-divider", null, 600, 5);
-		expect(r.height).toBeGreaterThan(0);
-	});
-
 	it("dispatches a web-search element", async () => {
 		const { measureElement } = await import("./registry");
 		const r = measureElement("web-search", { query: "cats", status: "completed" }, 600, 5);

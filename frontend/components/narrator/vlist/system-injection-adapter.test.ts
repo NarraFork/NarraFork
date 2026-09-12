@@ -61,15 +61,18 @@ function injectionSegment(
 	block: Record<string, unknown>,
 	over: Record<string, unknown> = {},
 ): AdapterSegment {
+	const native = over.native === true;
+	const { native: _native, ...messageOver } = over;
 	return {
 		kind: "message",
 		msg: {
 			id: "m1",
 			role: "sys",
 			createdAt: "2026-07-28T10:00:00.000Z",
-			// The real row shape: model text first, injection block second.
-			contentJson: [{ type: "text", text: MODEL_TEXT }, block] as never,
-			...over,
+			// Legacy rows have a sibling text block; native rows keep modelText on the
+			// injection itself and have no second projection to fall back to.
+			contentJson: (native ? [block] : [{ type: "text", text: MODEL_TEXT }, block]) as never,
+			...messageOver,
 		},
 	};
 }
@@ -107,6 +110,23 @@ describe("system_injection — routing", () => {
 		});
 		// No new element kind: the card is one the measure/render pair already covers.
 		expect(data.kind).toBe("origin_notice");
+	});
+
+	it("renders a native self-contained injection without a sibling text block", () => {
+		const specs = adaptSegment(
+			injectionSegment(
+				{
+					type: "system_injection",
+					source: CARD_SOURCE,
+					modelText: MODEL_TEXT,
+					body: TASKS_BODY,
+				},
+				{ native: true },
+			),
+			CTX,
+		);
+		expect(specs).toHaveLength(1);
+		expect(specs[0]?.kind).toBe("system-text");
 	});
 
 	it("the kind it routes to is registered, so it can actually be measured", () => {
@@ -1256,7 +1276,7 @@ describe("knowledge hits — bubbles only when there is an excerpt", () => {
 // The earlier cut asked "does it have a subject?" and answered no for platform events.
 // That was wrong: `container_ready`'s own text says "You can use the Browser tool…" — it
 // addresses the model and the model answers it. The real line is between an UTTERANCE in
-// the conversation and a NOTE about the conversation (compact markers, prune dividers).
+// the conversation and a NOTE about the conversation (compact markers).
 //
 // Option A: the card is not flattened to prose, it becomes the bubble's BODY, so branch
 // names / commit shas / badges keep their structure.

@@ -42,6 +42,7 @@ import {
 	useState,
 } from "react";
 import type { ContentViewportSnapshot } from "../AutoFollowScroll";
+import { useNarratorPanelVisible } from "../narrator-panel-visibility";
 import { useRenderInteractive } from "../RenderLodCtx";
 import { VListContentViewActions } from "./VListContentViewActions";
 import {
@@ -234,6 +235,7 @@ export function VListContentViewHost({
 	children,
 }: VListContentViewHostProps) {
 	const interactive = useRenderInteractive();
+	const panelVisible = useNarratorPanelVisible();
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const [pointerOverBody, setPointerOverBody] = useState(false);
 	const [pointerOverBar, setPointerOverBar] = useState(false);
@@ -245,7 +247,7 @@ export function VListContentViewHost({
 	// reached for a button. Either surface keeps it alive.
 	const hovered = pointerOverBody || pointerOverBar;
 	// Only tracked while the bar is actually on screen: an idle body pays nothing.
-	const enabled = !!target && !!controls && interactive;
+	const enabled = !!target && !!controls && interactive && panelVisible;
 	const { state: float, scrollToBodyTop } = useFloatState(hostRef, enabled && hovered && !isMobile);
 	const onReaderProgress = useReaderProgress(target, controls, interactive);
 

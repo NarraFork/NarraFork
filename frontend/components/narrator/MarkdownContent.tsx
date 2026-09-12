@@ -160,13 +160,26 @@ type AnimateTextFn = (children: any) => any;
  * When `animateText` is provided (streaming mode), text children are wrapped
  * with flowtoken's animation. Otherwise children render as-is.
  */
-function createMdComponents(animateText?: AnimateTextFn): Components {
+function createMdComponents(animateText?: AnimateTextFn, sourceLines = false): Components {
 	const at = animateText ?? ((c: ReactNode) => c);
+
+	/**
+	 * Opt-in source-line anchoring (file-editor split preview): block elements
+	 * get `data-line="<0-based source line>"` so the editor↔preview scroll sync
+	 * can interpolate real line numbers instead of guessing from total heights.
+	 * Off for chat bodies — they mount hundreds of trees with no use for it.
+	 */
+	// biome-ignore lint/suspicious/noExplicitAny: react-markdown hast node shape
+	const sourceLineAttr = (node: any): { "data-line"?: string } => {
+		const line = sourceLines ? node?.position?.start?.line : undefined;
+		return typeof line === "number" ? { "data-line": String(line - 1) } : {};
+	};
 
 	// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
 	function headingComponent({ children, node }: any) {
 		const tag = (node?.tagName ?? "h3") as "h1" | "h2" | "h3" | "h4" | "h5" | "h6";
 		const Tag = tag;
+		const sourceLine = sourceLineAttr(node);
 		// The slug a `[x](#…)` link in the same body resolves against. Read off the
 		// RENDERED children rather than the source, so a heading containing a link
 		// slugs its visible label instead of the destination url.
@@ -180,15 +193,21 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 		// hundreds of independent markdown bodies into one document and several
 		// legitimately repeat a heading, which as ids would be duplicates.
 		const slug = slugifyHeading(reactChildrenToHeadingText(children));
-		return <Tag {...(slug ? { [MD_HEADING_SLUG_ATTR]: slug } : {})}>{at(children)}</Tag>;
+		return (
+			<Tag {...sourceLine} {...(slug ? { [MD_HEADING_SLUG_ATTR]: slug } : {})}>
+				{at(children)}
+			</Tag>
+		);
 	}
 
 	return {
-		p({ children }) {
+		// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
+		p({ children, node }: any) {
+			const sourceLine = sourceLineAttr(node);
 			const text = extractText(children);
 			const isDiagram = DIAGRAM_PATTERN.test(text);
 			return (
-				<p className={isDiagram ? classes.mdDiagram : undefined}>
+				<p {...sourceLine} className={isDiagram ? classes.mdDiagram : undefined}>
 					{isDiagram ? children : at(children)}
 				</p>
 			);
@@ -205,9 +224,13 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 		ol({ children }) {
 			return <ol>{children}</ol>;
 		},
-		li({ children, className }) {
+		// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
+		li({ children, className, node }: any) {
+			const sourceLine = sourceLineAttr(node);
 			return (
-				<MarkdownContentListItem className={className}>{at(children)}</MarkdownContentListItem>
+				<MarkdownContentListItem className={className} dataLine={sourceLine["data-line"]}>
+					{at(children)}
+				</MarkdownContentListItem>
 			);
 		},
 		a({ href, children, title }) {
@@ -222,11 +245,19 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 				</MarkdownLink>
 			);
 		},
-		blockquote({ children }) {
-			return <blockquote className={classes.mdQuote}>{children}</blockquote>;
+		// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
+		blockquote({ children, node }: any) {
+			const sourceLine = sourceLineAttr(node);
+			return (
+				<blockquote {...sourceLine} className={classes.mdQuote}>
+					{children}
+				</blockquote>
+			);
 		},
 		// Code blocks: no text animation — code content should not be split/animated
-		code({ children, className }) {
+		// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
+		code({ children, className, node }: any) {
+			const sourceLine = sourceLineAttr(node);
 			const lang = className?.replace("language-", "");
 			const isBlock = className?.startsWith("language-");
 			if (isBlock) {
@@ -240,6 +271,7 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 				if (isDiagram) {
 					return (
 						<Code
+							{...sourceLine}
 							block
 							fz="xs"
 							style={{
@@ -253,20 +285,27 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 						</Code>
 					);
 				}
-				return <MarkdownCodeBlock language={lang ?? "text"}>{children}</MarkdownCodeBlock>;
+				return (
+					<MarkdownCodeBlock language={lang ?? "text"} dataLine={sourceLine["data-line"]}>
+						{children}
+					</MarkdownCodeBlock>
+				);
 			}
 			return <code className={classes.mdCode}>{children}</code>;
 		},
-		pre({ children }) {
+		// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
+		pre({ children, node }: any) {
 			// For fenced code blocks without a language tag, react-markdown renders
 			// <pre><code>...</code></pre> where the inner <code> has no className.
 			// Detect diagram content and force no-wrap on those blocks.
 			// Otherwise wrap in MarkdownCodeBlock for copy button + consistent styling.
+			const sourceLine = sourceLineAttr(node);
 			const text = extractText(children);
 			const isDiagram = DIAGRAM_PATTERN.test(text);
 			if (isDiagram) {
 				return (
 					<Code
+						{...sourceLine}
 						block
 						fz="xs"
 						style={{
@@ -301,14 +340,22 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 			if (typeof childClassName === "string" && childClassName.startsWith("language-")) {
 				return <>{children}</>;
 			}
-			return <MarkdownCodeBlock language="text">{text}</MarkdownCodeBlock>;
-		},
-		hr() {
-			return <Divider my={4} />;
-		},
-		table({ children }) {
 			return (
-				<div style={{ maxWidth: "100%", overflowX: "auto" }}>
+				<MarkdownCodeBlock language="text" dataLine={sourceLine["data-line"]}>
+					{text}
+				</MarkdownCodeBlock>
+			);
+		},
+		// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
+		hr({ node }: any) {
+			const sourceLine = sourceLineAttr(node);
+			return <Divider {...sourceLine} my={4} />;
+		},
+		// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
+		table({ children, node }: any) {
+			const sourceLine = sourceLineAttr(node);
+			return (
+				<div {...sourceLine} style={{ maxWidth: "100%", overflowX: "auto" }}>
 					<Table fz="sm" striped highlightOnHover style={{ margin: 0 }}>
 						{children}
 					</Table>
@@ -341,6 +388,8 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 
 /** Static components (no animation) — created once at module level */
 const staticComponents = createMdComponents();
+/** Same components with data-line anchors — the split preview's scroll-sync variant. */
+const staticSourceLineComponents = createMdComponents(undefined, true);
 
 /**
  * Lightweight replacement for flowtoken's optional streaming animation.
@@ -537,16 +586,18 @@ function StaticMarkdownTree({
 	source,
 	remarkPlugins,
 	rehypePlugins,
+	sourceLines,
 }: {
 	source: string;
 	remarkPlugins: PluggableList;
 	rehypePlugins: PluggableList;
+	sourceLines?: boolean;
 }) {
 	return (
 		<Markdown
 			remarkPlugins={remarkPlugins}
 			rehypePlugins={rehypePlugins}
-			components={staticComponents}
+			components={sourceLines ? staticSourceLineComponents : staticComponents}
 		>
 			{source}
 		</Markdown>
@@ -676,12 +727,15 @@ interface MarkdownContentProps {
 	wordWrap?: boolean;
 	/** Whether this content is currently being streamed (enables per-word animation) */
 	streaming?: boolean;
+	/** Stamp `data-line` source anchors on block elements (split-preview scroll sync). */
+	sourceLines?: boolean;
 }
 
 export const MarkdownContent = memo(function MarkdownContent({
 	text,
 	wordWrap = true,
 	streaming,
+	sourceLines,
 }: MarkdownContentProps) {
 	const trimmed = text.trim();
 
@@ -813,6 +867,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 						source={markdownSource}
 						remarkPlugins={remarkPlugins}
 						rehypePlugins={rehypePlugins}
+						sourceLines={sourceLines}
 					/>
 				</div>
 			</MermaidStreamingCtx.Provider>

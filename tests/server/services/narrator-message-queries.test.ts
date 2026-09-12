@@ -291,7 +291,7 @@ afterAll(() => {
 });
 
 describe("narratorService message query regressions", () => {
-	it("subagent narrator 的 prune/compact 边界计算应包含 child 消息", async () => {
+	it("subagent narrator 的 compact 边界计算应包含 child 消息", async () => {
 		seedBase("n-sub");
 		db.update(narrators)
 			.set({ type: "subagent", subagentType: "general", variant: "subagent:general" })
@@ -352,18 +352,6 @@ describe("narratorService message query regressions", () => {
 			contentJson: [{ type: "text", text: "sub asst 2" }],
 			contentText: "sub asst 2",
 		});
-
-		const prune = await narratorService.computeAndUpdatePruneBoundary("n-sub", 99, {
-			pruneStart: 95,
-			compactStart: 99,
-		});
-		expect(prune).not.toBeNull();
-		expect(prune?.boundaryMessageId).toBe("s-m0");
-		expect(prune?.prunedPercent).toBe(17);
-
-		const reloaded = await db.query.narrators.findFirst({ where: eq(narrators.id, "n-sub") });
-		expect(reloaded?.pruneBoundaryMessageId).toBe("s-m0");
-		expect(reloaded?.prunedPercent).toBe(17);
 
 		const compactBoundary = await narratorService.getCompactBoundaryMessage("n-sub", 2);
 		expect(compactBoundary).toBe("s-m2");
@@ -783,8 +771,6 @@ describe("narratorService message query regressions", () => {
 			.set({
 				contextSummary: "old summary",
 				apiConversationId: "old-conversation",
-				pruneBoundaryMessageId: "before",
-				prunedPercent: 42,
 			})
 			.where(eq(narrators.id, "n1"));
 
@@ -808,8 +794,6 @@ describe("narratorService message query regressions", () => {
 		expect(narrator).toMatchObject({
 			contextSummary: "old summary",
 			apiConversationId: "old-conversation",
-			pruneBoundaryMessageId: "before",
-			prunedPercent: 42,
 		});
 		let detail = await narratorService.getCompactSummary("n1", marker.id);
 		expect(detail.status).toBe("failed");
@@ -1068,7 +1052,6 @@ describe("narratorService message query regressions", () => {
 			_narratorId,
 			_locale,
 			_providedMessages,
-			_pruneBoundaryMessageId,
 			signal,
 		) => {
 			markStarted();
@@ -1115,8 +1098,6 @@ describe("narratorService message query regressions", () => {
 			.set({
 				contextSummary: "keep-summary",
 				apiConversationId: "keep-conversation",
-				pruneBoundaryMessageId: "target",
-				prunedPercent: 55,
 			})
 			.where(eq(narrators.id, "n1"));
 		const marker = await narratorService.persistCompactingMessage("n1", "target", "blocking", {
@@ -1143,8 +1124,6 @@ describe("narratorService message query regressions", () => {
 		expect(narrator).toMatchObject({
 			contextSummary: "keep-summary",
 			apiConversationId: "keep-conversation",
-			pruneBoundaryMessageId: "target",
-			prunedPercent: 55,
 		});
 		expect(
 			await db.query.narratorMessageRefs.findFirst({
@@ -1184,6 +1163,7 @@ describe("narratorService message query regressions", () => {
 	});
 
 	it("retryFailedCompact reports concurrent compact as HTTP 409 error", async () => {
+		seedBase();
 		compactLocks.set("n1", {
 			kind: "history",
 			mode: "blocking",
@@ -1468,13 +1448,7 @@ describe("narratorService message query regressions", () => {
 		const started = new Promise<void>((resolve) => {
 			markStarted = resolve;
 		});
-		narratorContext.generateCompactSummary = async (
-			_narratorId,
-			_locale,
-			_messages,
-			_pruneBoundaryMessageId,
-			_signal,
-		) => {
+		narratorContext.generateCompactSummary = async (_narratorId, _locale, _messages, _signal) => {
 			markStarted();
 			return new Promise((resolve) => {
 				resolveSummary = resolve;
@@ -1516,7 +1490,7 @@ describe("narratorService message query regressions", () => {
 		}
 	});
 
-	it("finalize CAS 失败时不得清 summary/prune 或成功返回", async () => {
+	it("finalize CAS 失败时不得清 summary 或成功返回", async () => {
 		seedBase();
 		insertMessage({
 			id: "before",
@@ -1536,8 +1510,6 @@ describe("narratorService message query regressions", () => {
 			.update(narrators)
 			.set({
 				contextSummary: "keep summary",
-				pruneBoundaryMessageId: "before",
-				prunedPercent: 37,
 			})
 			.where(eq(narrators.id, "n1"));
 
@@ -1602,8 +1574,6 @@ describe("narratorService message query regressions", () => {
 		const narrator = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
 		expect(narrator).toMatchObject({
 			contextSummary: "keep summary",
-			pruneBoundaryMessageId: "before",
-			prunedPercent: 37,
 		});
 	});
 
@@ -1625,7 +1595,7 @@ describe("narratorService message query regressions", () => {
 		});
 		await db
 			.update(narrators)
-			.set({ contextSummary: "keep summary", pruneBoundaryMessageId: "before" })
+			.set({ contextSummary: "keep summary" })
 			.where(eq(narrators.id, "n1"));
 
 		let resolveSummary!: (value: { summary: string; contextPercent: number }) => void;
@@ -1711,7 +1681,6 @@ describe("narratorService message query regressions", () => {
 		const narrator = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
 		expect(narrator).toMatchObject({
 			contextSummary: "keep summary",
-			pruneBoundaryMessageId: "before",
 		});
 	});
 

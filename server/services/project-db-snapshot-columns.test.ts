@@ -14,10 +14,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, projects } from "../db/schema";
+import { chapters, narrators, projects } from "../db/schema";
 import { generateId } from "../lib/id";
 import { projectDbManager } from "../lib/project-db";
 import { fullSync } from "./project-db-sync";
+import { importProject } from "./project-import";
 
 const tempDirs: string[] = [];
 const createdProjects: string[] = [];
@@ -47,6 +48,75 @@ const COORDINATES = {
 } as const;
 
 describe("project database snapshot columns", () => {
+	test("imports legacy narrator columns without restoring retired settings", async () => {
+		const gitPath = mkdtempSync(join(tmpdir(), "nf-pdb-legacy-"));
+		tempDirs.push(gitPath);
+		const now = new Date().toISOString();
+		const projectId = generateId();
+		const chapterId = generateId();
+		const narratorId = generateId();
+		createdProjects.push(projectId);
+		await db
+			.insert(projects)
+			.values({ id: projectId, name: "Legacy backup", gitPath, createdAt: now, updatedAt: now });
+		await db.insert(chapters).values({
+			id: chapterId,
+			projectId,
+			title: "Legacy",
+			branch: "legacy",
+			baseBranch: "main",
+			createdAt: now,
+			updatedAt: now,
+		});
+		await db.insert(narrators).values({
+			id: narratorId,
+			chapterId,
+			title: "Preserved narrator",
+			createdAt: now,
+			updatedAt: now,
+		});
+		try {
+			await fullSync(projectId);
+			const pdb = await projectDbManager.getDb(projectId);
+			if (!pdb) throw new Error("expected a project database");
+			const existingColumns = new Set(
+				(pdb.query("PRAGMA table_info(narrators)").all() as Array<{ name: string }>).map(
+					(column) => column.name,
+				),
+			);
+			for (const column of ["prune_enabled", "prune_boundary_message_id", "pruned_percent"]) {
+				expect(existingColumns.has(column)).toBe(false);
+			}
+			const refColumns = (
+				pdb.query("PRAGMA table_info(narrator_message_refs)").all() as Array<{ name: string }>
+			).map((column) => column.name);
+			expect(refColumns).not.toContain("pruned_percent");
+			for (const definition of [
+				"prune_enabled INTEGER",
+				"prune_boundary_message_id TEXT",
+				"pruned_percent INTEGER",
+			]) {
+				if (!existingColumns.has(definition.split(" ")[0])) {
+					pdb.run(`ALTER TABLE narrators ADD COLUMN ${definition}`);
+				}
+			}
+			pdb.run(
+				"UPDATE narrators SET prune_enabled=1,prune_boundary_message_id='obsolete',pruned_percent=75",
+			);
+			projectDbManager.close(projectId);
+			await db.delete(narrators).where(eq(narrators.id, narratorId));
+			await db.delete(chapters).where(eq(chapters.projectId, projectId));
+			await db.delete(projects).where(eq(projects.id, projectId));
+			const result = await importProject(gitPath);
+			expect(result.skipped).toBe(false);
+			expect(result.tables.narrators).toBe(1);
+			const restored = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+			expect(restored?.title).toBe("Preserved narrator");
+			expect(restored).not.toHaveProperty("prunedPercent");
+		} finally {
+			await db.delete(narrators).where(eq(narrators.id, narratorId));
+		}
+	});
 	test("every snapshot coordinate round-trips through a full sync", async () => {
 		const gitPath = mkdtempSync(join(tmpdir(), "nf-pdb-"));
 		tempDirs.push(gitPath);

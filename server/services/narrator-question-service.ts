@@ -1140,6 +1140,12 @@ const questionDecidedListeners = hotSafe(
 	() => new Set<QuestionDecidedListener>(),
 );
 
+/** Subscribe to every committed decision; callers must filter by narratorId. */
+export function subscribeAsyncQuestionDecisions(listener: QuestionDecidedListener): () => void {
+	questionDecidedListeners.add(listener);
+	return () => questionDecidedListeners.delete(listener);
+}
+
 /** Wake any waiter blocked on this question. Never throws into the decision path. */
 function notifyQuestionDecided(record: AsyncQuestionRecord): void {
 	for (const listener of [...questionDecidedListeners]) {

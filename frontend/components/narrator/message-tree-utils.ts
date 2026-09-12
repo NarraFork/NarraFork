@@ -116,9 +116,18 @@ export function replaceSubagentActivitySnapshot(
 	const reasoningEffort =
 		normalizeSubagentReasoningEffort(activity.reasoningEffort) ??
 		normalizeSubagentReasoningEffort(previous?.reasoningEffort);
+	const hasFileChanges = Object.hasOwn(activity, "fileChanges");
 	let normalized: SubagentActivitySummary = {
 		subagentNarratorId: activity.subagentNarratorId ?? null,
 		model: normalizeSubagentModel(activity.model) ?? normalizeSubagentModel(previous?.model),
+		// Incremental activity snapshots may omit fileChanges while the child is
+		// still running. Preserve the last known list in that case; an explicit
+		// empty array remains authoritative and clears it.
+		...(hasFileChanges
+			? { fileChanges: activity.fileChanges }
+			: previous?.fileChanges
+				? { fileChanges: previous.fileChanges }
+				: {}),
 		...(reasoningEffort ? { reasoningEffort } : {}),
 		// The snapshot is AUTHORITATIVE for takeover (the server reads the live
 		// in-memory Set when building it), so unlike `model` it must NOT fall back to

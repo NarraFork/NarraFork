@@ -26,7 +26,6 @@ import { measureInjectionBubble } from "./measure/measure-injection-bubble";
 import { measureMarkdown } from "./measure/measure-markdown";
 import { measureMedia } from "./measure/measure-media";
 import { measureMessageBubble } from "./measure/measure-message-bubble";
-import { measurePruneDivider } from "./measure/measure-misc";
 import { measureAskUserQuestion, measureInlinePermission } from "./measure/measure-permission";
 import { measurePlanCard } from "./measure/measure-plan-card";
 import {
@@ -240,12 +239,6 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		label: "Subagent card",
 		lodSensitive: true,
 		measure: (d, w, l, o) => measureSubagentCard(d as AnyData, w, l, o as AnyData),
-	},
-	"prune-divider": {
-		kind: "prune-divider",
-		label: "Prune divider",
-		lodSensitive: false,
-		measure: (_d, w) => measurePruneDivider(w),
 	},
 	"turn-usage": {
 		kind: "turn-usage",

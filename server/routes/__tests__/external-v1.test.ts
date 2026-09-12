@@ -172,8 +172,6 @@ interface MessagePage {
 	documentRevision?: number;
 	detail?: string;
 	detailRequested?: string;
-	pruneBoundaryMessageId?: string | null;
-	prunedPercent?: number | null;
 }
 
 interface LayeredMessage {

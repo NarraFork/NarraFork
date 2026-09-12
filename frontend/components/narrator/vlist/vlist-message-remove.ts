@@ -52,11 +52,7 @@ export type RemovalRejection =
 	 * either: answering this with a reload was pure waste.
 	 */
 	| "not-loaded"
-	/**
-	 * Every loaded message would be removed. An empty document has its own load
-	 * path (the shell's `hasIndex` branch owns it), so this is handed to the reload
-	 * rather than produced here.
-	 */
+	/** Every loaded message would be removed; the empty window is valid in place. */
 	| "empty-result";
 
 export interface RemovalResult<T extends RemoveCandidate> {
@@ -95,8 +91,6 @@ export function removeLoadedMessages<T extends RemoveCandidate>(
 	if (kept.length === loaded.length) {
 		return { messages: loaded, removed: false, reason: "not-loaded" };
 	}
-	if (kept.length === 0) {
-		return { messages: loaded, removed: false, reason: "empty-result" };
-	}
+	if (kept.length === 0) return { messages: kept, removed: true };
 	return { messages: kept, removed: true };
 }

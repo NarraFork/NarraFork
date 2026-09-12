@@ -77,7 +77,6 @@ export const DEFAULTS: NarraForkSettings = {
 		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
-		defaultPruneEnabled: false,
 		planModeAllowInlinePlan: true,
 		planReflectionAutoApprove: false,
 		planReflectionAllowAutoCompact: false,
@@ -102,8 +101,6 @@ export const DEFAULTS: NarraForkSettings = {
 		retryBackoffCeilMs: 20_000,
 		firstTokenTimeoutMs: 300_000,
 		autoCompactKeepPairs: 2,
-		autoCompactPruneThreshold: 80,
-		minPruneRatio: 30,
 		queueDuringCompaction: true,
 		contextThresholds: cloneDefaultContextThresholds(),
 	},
@@ -518,10 +515,6 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "新建叙述者的 relaxed plan 默认值。启用时 plan 模式下工具保持完全可用；禁用时 plan 模式限制为只读工具集合。",
 		type: "boolean",
 	},
-	"agent.defaultPruneEnabled": {
-		desc: "新建叙述者的自动裁剪默认值。默认关闭；开启可能导致提示词缓存失效、计费变贵。",
-		type: "boolean",
-	},
 	"agent.planModeAllowInlinePlan": {
 		desc: "是否允许 plan mode 内联计划（ExitPlanMode 的 inline_plan 参数）。关闭后仅支持 plan 文件形式，ExitPlanMode 的工具 schema、描述与计划模式系统提示会同步移除内联选项，计划内容只从指定的 plan 文件读取。默认开启。",
 		type: "boolean",
@@ -645,35 +638,17 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "思考强度黑名单。默认向所有模型发送思考强度（另有内置规则排除 4.6 之前的 Claude）；上游拒绝该参数时把模型加到这里。每项含 pattern、enabled；pattern 为不区分大小写的子串，或 /正则/flags。",
 		type: "array",
 	},
-	"agent.contextThresholds.standard.pruneStart": {
-		desc: "标准模型(≤600k tokens)开始裁剪的上下文使用百分比(0-100)。",
-		type: "number",
-	},
 	"agent.contextThresholds.standard.compactStart": {
-		desc: "标准模型开始压缩的上下文使用百分比(0-100)。达到此阈值时触发压缩检查；若小于等于 pruneStart，则禁用渐进裁剪并在该阈值直接压缩。",
-		type: "number",
-	},
-	"agent.contextThresholds.large.pruneStart": {
-		desc: "大模型(>600k tokens)开始裁剪的上下文使用百分比(0-100)。",
+		desc: "标准模型开始压缩的上下文使用百分比(0-100)。达到此阈值时触发压缩检查。",
 		type: "number",
 	},
 	"agent.contextThresholds.large.compactStart": {
-		desc: "大模型开始压缩的上下文使用百分比(0-100)；若小于等于 pruneStart，则禁用渐进裁剪并在该阈值直接压缩。",
+		desc: "大模型开始压缩的上下文使用百分比(0-100)。达到此阈值时触发压缩检查。",
 		type: "number",
 	},
 	"agent.autoCompactKeepPairs": {
 		desc: "自动压缩时在压缩摘要之后保留的最近 user/assistant 对话轮数。",
 		type: "number",
-	},
-	"agent.autoCompactPruneThreshold": {
-		desc: "最大裁剪百分比。已裁剪消息占总消息数达到此值时，强制启动后台上下文压缩；低于此值时继续渐进式裁剪。",
-		type: "number",
-		valid: "0-100, 默认 80",
-	},
-	"agent.minPruneRatio": {
-		desc: "最小裁剪比例。每次裁剪边界推进时，至少裁掉剩余可裁剪消息的该比例。值越大，单次裁剪幅度越大、裁剪次数越少，从而减少 prompt 缓存前缀失效、降低计费；代价是单次丢弃更多上下文。",
-		type: "number",
-		valid: "0-100, 默认 30",
 	},
 	"agent.queueDuringCompaction": {
 		desc: "叙述者正在进行上下文压缩时，新发送的用户消息是否排队等压缩完成后再执行。开启时消息进入队列（可编辑、可取消），压缩结束后自动开始该轮次；关闭时立即发送，与压缩并发。无论开关如何，用户都可以在发送菜单中选择插队立即执行。",

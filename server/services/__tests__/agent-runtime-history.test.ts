@@ -83,7 +83,7 @@ test.each([
 	}
 });
 
-test("child placement is projected only and source reasoning/pruning data is never mutated", async () => {
+test("child placement is projected while complete tools and reasoning metadata are retained", async () => {
 	const source = [message("old", "assistant", "reasoned", "origin")];
 	source[0].contentJson = [
 		{ type: "reasoning", text: "reason", providerMetadata: { opaque: "keep" } },
@@ -103,13 +103,15 @@ test("child placement is projected only and source reasoning/pruning data is nev
 	const child = await buildRuntimeHistory({
 		...options("subagent"),
 		sourceMessages: source,
-		pruneBoundaryId: "old",
 	});
 	expect(JSON.stringify(source)).toBe(before);
 	expect(child.sourceMessages).toBe(source);
 	expect(child.modelMessages[0].parentToolUseId).toBeNull();
 	expect(child.modelMessages[0].narratorId).toBe("primary");
-	expect(child.modelMessages[0].toolCalls).toEqual([]);
+	expect(child.modelMessages[0].toolCalls).toEqual(source[0].toolCalls);
+	expect(child.modelMessages[0].contentJson).toEqual(source[0].contentJson);
+	expect(child.trailingToolResults).toHaveLength(1);
+	expect(JSON.stringify(child.trailingToolResults)).toContain("large output");
 	expect(JSON.stringify(child.history)).toContain("reasoned");
 	const primary = await buildRuntimeHistory({ ...options(), sourceMessages: source });
 	expect(primary.history).toEqual([]);

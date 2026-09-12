@@ -1,4 +1,5 @@
 import { outputToText } from "@shared/agent-protocol/tool-output";
+import { modelTextFromContentBlocks } from "@shared/native-injection";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -750,13 +751,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 				const blocks = Array.isArray(message.contentJson)
 					? (message.contentJson as Array<{ type?: string; text?: string }>)
 					: [];
-				const text =
-					blocks
-						.filter((block) => block.type === "text" && block.text)
-						.map((block) => block.text)
-						.join("\n") ||
-					message.contentText ||
-					"";
+				const text = modelTextFromContentBlocks(blocks) || message.contentText || "";
 				if (text) history.push({ type: "user_input", content: text });
 			}
 		}

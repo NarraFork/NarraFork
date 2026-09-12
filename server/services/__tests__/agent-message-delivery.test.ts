@@ -174,7 +174,6 @@ async function consume() {
 		model: "test-model",
 		provider: "anthropic",
 		cwd: ".",
-		pruneBoundaryId: null,
 	});
 }
 

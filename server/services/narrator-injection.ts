@@ -58,6 +58,7 @@
  */
 
 import { formatOriginLabel, type MessageOriginSource } from "@shared/message-origin";
+import type { NativeInjectionBlock } from "@shared/native-injection";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
@@ -69,14 +70,13 @@ import { narratorService } from "./narrator-service";
 /**
  * Content block carried by an injected message row.
  *
- * The row's `contentJson` is `[{ type: "text", text }, injectionBlock]` — the shape
- * `persistSystemMessage` already produces. That split is load-bearing:
+ * New rows store one self-contained `system_injection` block. Its `modelText` is the
+ * exact model-facing projection and its `body` is the structured reader-facing payload.
+ * Legacy rows may still have `[{ type: "text", text }, system_injection]`; the shared
+ * logical-block mapper handles that shape only when the association is explicit.
  *
- *   - `text`             is what the MODEL reads. Providers project only text blocks
- *                        (`anthropic-provider.ts:2850`), so this stays the
- *                        model-facing copy verbatim, instruction boilerplate included.
- *   - `system_injection` is what the READER gets, and it deliberately carries the
- *                        STRUCTURED body rather than pre-worded text.
+ * Keeping both projections inside one logical block is load-bearing: deleting the
+ * injection cannot leave a model-text sibling that falls back into a gray system card.
  *
  * ## Why the block stores `body` and not Markdown
  *
@@ -92,17 +92,7 @@ import { narratorService } from "./narrator-service";
  * projections still cannot drift, because both derive from the same payload written
  * in one place.
  */
-export interface SystemInjectionBlock {
-	type: "system_injection";
-	/** Producer tag (`living_work_spec`, `bg_agent`, …). Drives the reader-facing label. */
-	source: string;
-	/**
-	 * Structured payload. Absent when the producer had none, in which case the reader
-	 * falls back to the row's model-facing text shown verbatim (never parsed — guessing
-	 * at a producer's discarded structure is the complexity this design removes).
-	 */
-	body?: SideCarBody;
-}
+export type SystemInjectionBlock = NativeInjectionBlock;
 
 /** What should happen to the narrator as a result of this injection. */
 export type InjectionSchedule =
@@ -186,7 +176,7 @@ export interface InjectionRecipientPlacement {
 export interface DeliverInjectionOptions {
 	/** Exact recipient row reserved by an inbound agent delivery. */
 	messageId?: string;
-	/** Model-facing text. Stored verbatim as the row's first text block. */
+	/** Model-facing text. Stored verbatim inside the native injection block. */
 	content: string;
 	/** Producer tag. */
 	source: string;
@@ -254,8 +244,14 @@ const EMPTY_RESULT: DeliverInjectionResult = {
 export function buildSystemInjectionBlock(
 	source: string,
 	body: SideCarBody | undefined,
+	modelText?: string,
 ): SystemInjectionBlock {
-	return { type: "system_injection", source, ...(body ? { body } : {}) };
+	return {
+		type: "system_injection",
+		source,
+		...(typeof modelText === "string" ? { modelText } : {}),
+		...(body ? { body } : {}),
+	};
 }
 
 /**
@@ -285,7 +281,7 @@ async function deliverInjectionUnlocked(
 	const locale = options.locale ?? "en";
 	const role = options.role ?? "sys";
 	const schedule = options.schedule ?? "none";
-	const block = buildSystemInjectionBlock(options.source, options.body);
+	const block = buildSystemInjectionBlock(options.source, options.body, content);
 	const blocks = [block, ...(options.extraBlocks ?? [])];
 	const origin = {
 		origin: role === "user" ? ("user" as const) : ("system" as const),
@@ -308,9 +304,11 @@ async function deliverInjectionUnlocked(
 			? await narratorService.persistUserMessage(
 					narratorId,
 					content,
-					// persistUserMessage takes the FULL block list (no implicit text block),
-					// so the model-facing text has to be prepended explicitly here.
-					[{ type: "text", text: content }, ...blocks],
+					// Native injection blocks carry their model-facing projection themselves;
+					// legacy user rows keep the historical sibling text block.
+					blocks[0]?.type === "system_injection"
+						? blocks
+						: [{ type: "text", text: content }, ...blocks],
 					null,
 					options.createdBy ?? null,
 					origin,

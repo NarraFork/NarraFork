@@ -36,12 +36,10 @@ describe("removeLoadedMessages — what may be dropped in place", () => {
 		expect(result.reason).toBe("not-loaded");
 	});
 
-	it("refuses to empty the document, handing that to the reload path", () => {
-		// An empty document has its own load path (the shell's hasIndex branch); the
-		// removal channel must not be the thing that produces it.
+	it("allows the loaded window to become empty immediately", () => {
 		const result = removeLoadedMessages(loaded, ["m1", "m2", "m3"]);
-		expect(result.removed).toBe(false);
-		expect(result.reason).toBe("empty-result");
+		expect(result.removed).toBe(true);
+		expect(result.messages).toEqual([]);
 	});
 
 	it("rejects an event carrying no usable id", () => {
@@ -54,7 +52,7 @@ describe("removeLoadedMessages — what may be dropped in place", () => {
 		// a fresh array with equal contents would cost a full re-measure per event.
 		expect(removeLoadedMessages(loaded, []).messages).toBe(loaded);
 		expect(removeLoadedMessages(loaded, ["nope"]).messages).toBe(loaded);
-		expect(removeLoadedMessages(loaded, ["m1", "m2", "m3"]).messages).toBe(loaded);
+		expect(removeLoadedMessages(loaded, ["m1", "m2", "m3"]).messages).toEqual([]);
 	});
 
 	it("tolerates messages without a usable id instead of dropping them", () => {

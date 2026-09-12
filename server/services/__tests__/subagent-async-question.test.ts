@@ -171,6 +171,29 @@ async function submit(ctx: ToolContext) {
 }
 
 describe("child async-only question integration", () => {
+	test("the default any-event Await releases when this narrator's question is answered", async () => {
+		const ctx = await seedCall();
+		const record = await submit(ctx);
+		const waiting = awaitTool.execute(
+			{ type: "question", id: record.id },
+			{ ...ctx, currentToolUseId: "p5-await-any-question" },
+		);
+		const answer = await questionService.answerAsyncQuestion(record.id, {
+			answers: { cache: "Disk" },
+			userId: USER,
+			locale: "en",
+		});
+		expect(answer.ok).toBe(true);
+		const result = await waiting;
+		expect(result.metadata).toMatchObject({
+			kind: "await",
+			awaitMode: "any",
+			eventSource: "async_question_decided",
+			questionId: record.id,
+		});
+		expect(result.output).toContain("async_question_decided");
+	});
+
 	test("principal snapshots distinguish unknown legacy identity from explicit anonymity", () => {
 		expect(questionService.parseQuestionExecutionPrincipal(null)).toBeNull();
 		expect(questionService.parseQuestionExecutionPrincipal(undefined)).toBeNull();

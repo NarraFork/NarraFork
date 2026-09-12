@@ -405,7 +405,6 @@ type PretextExactMessageListProps = {
 	 *  the chunked path's `permCb` (renderPermCb). Absent → permission rows fall
 	 *  back to the read-only zero-DOM copy (no interaction). */
 	permCb?: PermissionCallbacks;
-	pruneDividerLabel?: string;
 	/** Narrator is bound to a chapter (git) → user-edit offers the rollback option. */
 	hasChapter?: boolean;
 	/**
@@ -773,9 +772,6 @@ function injectRenderLabels(
 		// The grouped header tooltips its aggregate duration with the earliest start;
 		// it reuses the tool card's timing bundle rather than owning a second copy.
 		if (extra.timingLabels === undefined) extra.timingLabels = renderLabels.toolCall.timing;
-	}
-	if (kind === "prune-divider" && extra.fallbackLabel === undefined) {
-		extra.fallbackLabel = renderLabels.pruneDivider;
 	}
 }
 
@@ -2222,7 +2218,6 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			onSelectionResolverChange,
 			rowHandlers,
 			permCb,
-			pruneDividerLabel,
 			hasChapter,
 			highlightMessageId,
 			highlightRequestId,
@@ -3297,7 +3292,17 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		// history mutations (delete / trailing-block truncation).
 		const insertMessageRef = useRef<(message: TreeMessage) => boolean>(() => false);
 		const removeMessagesRef = useRef<(deletedIds: readonly string[]) => boolean>(() => false);
-		const replaceMessageRef = useRef<(message: TreeMessage) => boolean>(() => false);
+		const replaceMessageRef = useRef<
+			(
+				message: TreeMessage,
+				aliases?: {
+					oldMessageId?: string;
+					replacedMessageId?: string;
+					messageId?: string;
+					replacementMessageId?: string;
+				},
+			) => boolean
+		>(() => false);
 		// And for the generic live-patch channel, which applies a compact marker's
 		// status flip (compacting → compacted/failed) in place: the marker row's status
 		// is folded into the measure cache key, so the patched card re-measures and
@@ -3359,7 +3364,6 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			segmentGap: SEGMENT_GAP,
 			topPadding: PAGE_PADDING + olderHeaderHeight,
 			bottomPadding: PAGE_PADDING,
-			pruneDividerLabel,
 			isExpanded: resolveExpanded,
 			isLodUserOverride: resolveLodUserOverride,
 			showEarlier: resolveShowEarlier,
@@ -3542,8 +3546,16 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		// other update reloads, since a version-neutral rebuild would serve the
 		// surviving blocks' cached heights for changed content.
 		const replaceOrReload = useCallback(
-			(message: TreeMessage | undefined) => {
-				if (message && replaceMessageRef.current(message)) {
+			(
+				message: TreeMessage | undefined,
+				aliases?: {
+					oldMessageId?: string;
+					replacedMessageId?: string;
+					messageId?: string;
+					replacementMessageId?: string;
+				},
+			) => {
+				if (message && replaceMessageRef.current(message, aliases)) {
 					appliedMessageRevisionRef.current += 1;
 				} else if (
 					message &&
@@ -3604,7 +3616,6 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				// older message readable and a segment compact's hidden rows are already
 				// gone via `onSegmentCompactHide` above.
 				onCompactDone: () => bumpMessageRevision(),
-				onPruneBoundary: bumpMessageRevision,
 				onFullReload: bumpMessageRevision,
 				// Live compact-progress ticks patch the loaded compact marker in place
 				// (no refetch, no messageVersion bump) so the "…compacting · N chars"
@@ -3657,7 +3668,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		//
 		// A plain landed message is appended in place (see appendOrReload), and a
 		// lifecycle change is patched in place, so what still reaches here is only what
-		// genuinely restructures the loaded window: an edit, a delete, a prune, a compact
+		// genuinely restructures the loaded window: an edit, a delete, a compact
 		// marker, a mid-window insert, or a reconnect catch-up.
 		//
 		// For those the reload still defers while the reader has scrolled up — replacing
@@ -4978,18 +4989,11 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			() =>
 				buildTailMeta(pretextDocument.messages as readonly TailMetaMessage[], {
 					statusReady: pretextDocument.status === "ready",
-					pruneBoundaryMessageId: pretextDocument.pruneBoundaryMessageId,
-					prunedPercent: pretextDocument.prunedPercent,
 					streamingMsgId: STREAMING_PLACEHOLDER_ID,
 					findSpecTasksToolUseId: (messages) =>
 						findLatestSpecTasksToolUseId(messages as unknown as NarratorMsg[]),
 				}),
-			[
-				pretextDocument.messages,
-				pretextDocument.pruneBoundaryMessageId,
-				pretextDocument.prunedPercent,
-				pretextDocument.status,
-			],
+			[pretextDocument.messages, pretextDocument.status],
 		);
 
 		useEffect(() => {
@@ -5007,7 +5011,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		// from the applied revision is the number of structural events withheld.
 		//
 		// It is an APPROXIMATION, deliberately: one event can carry more than one message
-		// (a reconnect catch-up page), and an edit/delete/prune bumps the revision without
+		// (a reconnect catch-up page), and an edit/delete bumps the revision without
 		// adding anything to read. It is right for the common case (one landed message per
 		// event) and never reports 0 while the view is behind, which is what the affordance
 		// needs. `appliedMessageRevisionRef` is a ref, but the render pass already reads it

@@ -55,7 +55,6 @@ describe("resolveVListEditTarget", () => {
 			"tool-call-group",
 			"ask-user-question",
 			"inline-permission",
-			"prune-divider",
 		] as const) {
 			expect(resolveVListEditTarget(kind, undefined, MSG, ALL)).toBeNull();
 		}

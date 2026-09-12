@@ -1316,6 +1316,19 @@ describe("Await tool timeout guidance", () => {
 			expect(guidance.toLowerCase()).toContain("repeated short");
 		}
 	});
+
+	test("keeps type/id required and exposes optional onlyWaitFor", () => {
+		const generated = zodToJsonSchema(awaitTool.parameters) as TestJsonSchema;
+		const raw = requireRawJsonSchema(awaitTool);
+		expect(generated.properties?.onlyWaitFor).toBeDefined();
+		expect(raw.properties?.onlyWaitFor).toBeDefined();
+		expect(generated.required).toContain("type");
+		expect(generated.required).toContain("id");
+		expect(generated.required).not.toContain("onlyWaitFor");
+		expect(raw.required).toContain("type");
+		expect(raw.required).toContain("id");
+		expect(raw.required).not.toContain("onlyWaitFor");
+	});
 });
 
 describe("Skill tool rawJsonSchema", () => {

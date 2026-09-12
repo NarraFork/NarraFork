@@ -21,6 +21,7 @@ import {
 	fileChangeOperations,
 	fileChangeScopes,
 	fileChangeStorageBudgets,
+	fileHistoryClock,
 	narratorToolCalls,
 } from "../db/schema";
 import { targetPathSemantics } from "../lib/agent/execution/path-semantics";
@@ -68,6 +69,7 @@ export interface BeginFileChangeOperation {
 	ownerUserId?: string | null;
 	initiatorSubjectKey?: string | null;
 	parentOperationId?: string | null;
+	executionSegmentId?: string | null;
 }
 
 export interface FileChangeNoDispatchProof {
@@ -426,7 +428,21 @@ export class FileChangeEvidenceService {
 				return existing;
 			}
 			const timestamp = this.now();
-			const row = { ...values, id: generateId(), startedAt: timestamp, updatedAt: timestamp };
+			tx.insert(fileHistoryClock).values({ id: 1, lastSeq: 0 }).onConflictDoNothing().run();
+			const clock = tx
+				.update(fileHistoryClock)
+				.set({ lastSeq: sql`${fileHistoryClock.lastSeq} + 1` })
+				.where(eq(fileHistoryClock.id, 1))
+				.returning({ lastSeq: fileHistoryClock.lastSeq })
+				.get();
+			if (!clock) throw fail("JOURNAL_UNAVAILABLE", "File history clock is not initialized");
+			const row = {
+				...values,
+				id: generateId(),
+				journalSeq: clock.lastSeq,
+				startedAt: timestamp,
+				updatedAt: timestamp,
+			};
 			assertMetadata(row);
 			return boundedRecord(tx.insert(fileChangeOperations).values(row).returning().get());
 		});
@@ -491,6 +507,7 @@ export class FileChangeEvidenceService {
 				const timestamp = this.now();
 				const row = {
 					...values,
+					journalSeq: operation.journalSeq,
 					id: generateId(),
 					observedAfterStateJson: unknownAfter(),
 					createdAt: timestamp,
@@ -1110,6 +1127,7 @@ function normalizeOperation(input: BeginFileChangeOperation) {
 		ownerUserId: nullableId(input.ownerUserId),
 		initiatorSubjectKey: nullableId(input.initiatorSubjectKey),
 		parentOperationId: nullableId(input.parentOperationId),
+		executionSegmentId: nullableId(input.executionSegmentId),
 	};
 	assertMetadata(values);
 	return values;

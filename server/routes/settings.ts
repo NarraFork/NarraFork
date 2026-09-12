@@ -418,7 +418,6 @@ export const updateSettingsSchema = z
 				requestDumpEnabled: z.boolean(),
 				requestDumpErrorsOnly: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
-				defaultPruneEnabled: z.boolean(),
 				planModeAllowInlinePlan: z.boolean(),
 				planReflectionAutoApprove: z.boolean(),
 				planReflectionAllowAutoCompact: z.boolean(),
@@ -496,18 +495,14 @@ export const updateSettingsSchema = z
 				contextThresholds: z
 					.object({
 						standard: z.object({
-							pruneStart: z.number().min(50).max(100),
 							compactStart: z.number().min(50).max(100),
 						}),
 						large: z.object({
-							pruneStart: z.number().min(10).max(100),
 							compactStart: z.number().min(10).max(100),
 						}),
 					})
 					.optional(),
 				autoCompactKeepPairs: z.number().int().min(1).max(25).optional(),
-				autoCompactPruneThreshold: z.number().int().min(0).max(100).optional(),
-				minPruneRatio: z.number().int().min(0).max(100).optional(),
 				queueDuringCompaction: z.boolean().optional(),
 				webFetchPolicy: z
 					.object({

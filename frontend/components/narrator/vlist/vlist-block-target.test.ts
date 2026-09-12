@@ -91,7 +91,6 @@ describe("resolveVListBlockTarget", () => {
 	});
 
 	it("returns null for non-interactive chrome kinds", () => {
-		expect(target("prune-divider", "prune", [])).toBeNull();
 		expect(target("tool-call-group", "g1")).toBeNull();
 		expect(target("reasoning-count", `${MSG}-b1`)).toBeNull();
 		expect(target("ask-user-question", `${MSG}-auq`)).toBeNull();
@@ -113,6 +112,7 @@ describe("resolveVListBlockTarget", () => {
 
 	it("maps system card kinds via their block index suffix", () => {
 		expect(target("system-text", `${MSG}-b4`)?.blockId).toBe(`msg-${MSG}-4`);
+		expect(target("system-text", `${MSG}-b4-sys`)?.blockId).toBe(`msg-${MSG}-4`);
 		expect(target("knowledge-hint", `${MSG}-b6`)?.blockId).toBe(`msg-${MSG}-6`);
 		expect(target("plan-card", `${MSG}-b0`)?.blockId).toBe(`msg-${MSG}-0`);
 		expect(target("ask-in-passing", `${MSG}-b8`)?.blockId).toBe(`msg-${MSG}-8`);

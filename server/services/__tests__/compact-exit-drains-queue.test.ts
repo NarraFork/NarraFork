@@ -136,13 +136,7 @@ describe("runCustomCompact drains the queue on exit", () => {
 		const requestStarted = new Promise<void>((resolve) => {
 			started = resolve;
 		});
-		narratorContext.generateCompactSummary = (
-			_narratorId,
-			_locale,
-			_messages,
-			_pruneBoundaryMessageId,
-			signal,
-		) => {
+		narratorContext.generateCompactSummary = (_narratorId, _locale, _messages, signal) => {
 			started();
 			return new Promise((_resolve, reject) => {
 				signal?.addEventListener(

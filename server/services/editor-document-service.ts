@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { lstat, mkdir, open, unlink } from "node:fs/promises";
+import { join } from "node:path";
 import {
 	type CreateEditorDocumentInput,
 	type CreateEditorUploadInput,
@@ -147,7 +147,6 @@ export class EditorDocumentService {
 			if (
 				!stat.isDirectory() ||
 				stat.isSymbolicLink() ||
-				resolve(await realpath(this.deps.root)) !== resolve(this.deps.root) ||
 				(process.platform !== "win32" &&
 					((stat.mode & 0o077) !== 0 || stat.uid !== process.geteuid?.()))
 			)
@@ -183,7 +182,6 @@ export class EditorDocumentService {
 			stat.isSymbolicLink() ||
 			!stat.isDirectory() ||
 			`${stat.dev}:${stat.ino}` !== this.rootIdentity ||
-			resolve(await realpath(this.deps.root)) !== resolve(this.deps.root) ||
 			(process.platform !== "win32" &&
 				((stat.mode & 0o077) !== 0 || stat.uid !== process.geteuid?.()))
 		)

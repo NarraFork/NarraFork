@@ -58,10 +58,9 @@ const BAKED_DECL =
 /**
  * Every sanctioned way to resolve a text metric against the LIVE typography.
  *
- * Listed rather than hardcoding the two commonest names: `measure-misc` reads
- * `scaledLineBoxHeight` and nothing else, and an earlier version of this guard
- * reported it as an offender purely because it used a different (equally correct)
- * accessor. A guard that cries wolf gets suppressed, which is worse than no guard.
+ * Listed rather than hardcoding the two commonest names so that every equally
+ * valid accessor is recognized. A guard that cries wolf gets suppressed, which
+ * is worse than no guard.
  */
 const LIVE_TYPOGRAPHY_READS = [
 	"typographyMetrics()",

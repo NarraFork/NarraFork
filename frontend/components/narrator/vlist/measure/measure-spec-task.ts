@@ -147,16 +147,12 @@ export function measureSpecTask(data: SpecTaskData, innerWidth: number): Measure
 	const blocks: PreparedInlineBlock[] = [];
 	let height = 0;
 	let usedWidth = 0;
-	// The narrowest column across rows is what the render copy can safely paint every
-	// row at… but rows differ, so the render copy re-derives per row with the same
-	// helper. `contentWidth` reports the FIRST row's column for the single-task case
-	// (the continuation), which is what the existing geometry test pins.
-	let firstColumn = Math.max(1, innerWidth - specTaskChromeWidth(rows[0] ?? { text: "" }));
+	// Rows differ in chrome width, so the render copy re-derives each row's text
+	// column with the same helper.
 	for (let i = 0; i < rows.length; i++) {
 		const row = rows[i];
 		if (!row) continue;
 		const textWidth = Math.max(1, innerWidth - specTaskChromeWidth(row));
-		if (i === 0) firstColumn = textWidth;
 		const block = inlineBlock(row.text ?? "");
 		const frame = accumulateFrame([block], textWidth, pretextLineMetrics);
 		blocks.push(block);
@@ -171,8 +167,13 @@ export function measureSpecTask(data: SpecTaskData, innerWidth: number): Measure
 		blocks,
 		// The frame is synthesized: the render copy lays rows out with flex (each row's
 		// own wrap already decided its height), so per-block `top` values are unused.
+		// `contentWidth` is the bubble's INNER width, not the first row's text column:
+		// RenderSpecTask receives this value and subtracts each row's glyph/lock chrome
+		// itself. Returning `firstColumn` here made render subtract the chrome twice,
+		// so pretext measured at a wider column than the DOM painted and the fixed row
+		// height clipped the actual task text.
 		frame: { blocks: [], contentHeight: height, usedWidth },
-		contentWidth: firstColumn,
+		contentWidth: Math.max(1, innerWidth),
 		usedWidth,
 	};
 }

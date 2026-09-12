@@ -131,8 +131,6 @@ function page(): PretextDocumentPageResult {
 		hasNext: false,
 		hasPrev: false,
 		messageVersion: 3,
-		pruneBoundaryMessageId: null,
-		prunedPercent: null,
 	};
 }
 

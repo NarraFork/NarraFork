@@ -13,11 +13,10 @@ CREATE TABLE narrators (
  write_audience TEXT NOT NULL DEFAULT 'owner', type TEXT NOT NULL DEFAULT 'primary',
  acl_root_narrator_id TEXT, chapter_id TEXT, context_project_id TEXT, message_version INTEGER NOT NULL DEFAULT 7,
  refs_inherited_from TEXT, status TEXT NOT NULL DEFAULT 'idle', parent_narrator_id TEXT, origin_tool_call_id TEXT,
- fork_message_id TEXT, prune_boundary_message_id TEXT
+ fork_message_id TEXT
 );
 CREATE INDEX idx_narrators_parent ON narrators(parent_narrator_id);
 CREATE INDEX idx_narrators_fork_message ON narrators(fork_message_id);
-CREATE INDEX idx_narrators_prune_boundary_message ON narrators(prune_boundary_message_id);
 CREATE TABLE narrator_messages (
  id TEXT PRIMARY KEY, narrator_id TEXT NOT NULL, parent_tool_use_id TEXT, role TEXT NOT NULL DEFAULT 'assistant', content_json TEXT NOT NULL,
  content_text TEXT, original_content_json TEXT, tree_hash_after TEXT, snapshot_commit_sha TEXT, created_at TEXT NOT NULL DEFAULT '2026-09-07'

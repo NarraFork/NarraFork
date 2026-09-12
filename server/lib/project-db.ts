@@ -67,7 +67,6 @@ const PROJECT_DB_SCHEMA_PATCHES: Array<{
 			{ name: "is_ask_in_passing", type: "INTEGER NOT NULL DEFAULT 0" },
 			{ name: "turn_started_at", type: "TEXT" },
 			{ name: "message_version", type: "INTEGER NOT NULL DEFAULT 0" },
-			{ name: "prune_enabled", type: "INTEGER NOT NULL DEFAULT 1" },
 			{ name: "fast_mode", type: "INTEGER NOT NULL DEFAULT 0" },
 			{ name: "fast_mode_override", type: "TEXT NOT NULL DEFAULT 'inherit'" },
 			{ name: "relaxed_plan", type: "INTEGER NOT NULL DEFAULT 0" },
@@ -214,8 +213,6 @@ CREATE TABLE IF NOT EXISTS narrators (
 	plan_mode INTEGER NOT NULL DEFAULT 0,
 	cwd TEXT,
 	error_message TEXT,
-	prune_boundary_message_id TEXT,
-	pruned_percent INTEGER,
 	created_at TEXT NOT NULL,
 	substatus TEXT NOT NULL DEFAULT '[]',
 	variant TEXT NOT NULL DEFAULT 'primary',
@@ -227,7 +224,6 @@ CREATE TABLE IF NOT EXISTS narrators (
 	is_ask_in_passing INTEGER NOT NULL DEFAULT 0,
 	turn_started_at TEXT,
 	message_version INTEGER NOT NULL DEFAULT 0,
-	prune_enabled INTEGER NOT NULL DEFAULT 1,
 	fast_mode INTEGER NOT NULL DEFAULT 0,
 	fast_mode_override TEXT NOT NULL DEFAULT 'inherit',
 	relaxed_plan INTEGER NOT NULL DEFAULT 0,
@@ -270,8 +266,7 @@ CREATE TABLE IF NOT EXISTS narrator_message_refs (
 	narrator_id TEXT NOT NULL,
 	message_id TEXT NOT NULL,
 	seq INTEGER NOT NULL,
-	is_compact INTEGER NOT NULL DEFAULT 0,
-	pruned_percent INTEGER
+	is_compact INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS narrator_tool_calls (

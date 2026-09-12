@@ -1332,14 +1332,3 @@ export function useClearBlockedSkills() {
 		},
 	});
 }
-
-export function useUpdatePruneEnabled() {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: ({ id, pruneEnabled }: { id: string; pruneEnabled: boolean }) =>
-			api.updateNarratorPruneEnabled(id, pruneEnabled),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["narrators"] });
-		},
-	});
-}

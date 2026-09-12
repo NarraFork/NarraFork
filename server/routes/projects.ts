@@ -549,7 +549,6 @@ projectRoutes.delete("/:id", async (c) => {
 					.set({
 						parentNarratorId: null,
 						forkMessageId: null,
-						pruneBoundaryMessageId: null,
 						refsInheritedFrom: null,
 						refsBackfillCursor: null,
 					})

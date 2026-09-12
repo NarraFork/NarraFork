@@ -50,8 +50,18 @@
  *     without this every frame starts a fresh 200ms animation toward a target that
  *     has already moved, which both smears visually and multiplies the work.
  *
- * The drag listeners are attached on mousedown and removed on mouseup, rather than
- * living for the component's whole lifetime as they did before.
+ * The drag listeners are attached on pointerdown and removed on pointerup, rather
+ * than living for the component's whole lifetime as they did before.
+ *
+ * POINTER EVENTS, NOT MOUSE EVENTS
+ * --------------------------------
+ * The drag used to run on `mousedown`/`mousemove`/`mouseup`. On a touchscreen that
+ * is dead: a touch press fires a synthetic `mousedown`, but as soon as the finger
+ * moves the browser hands the gesture to scrolling and stops producing mouse
+ * events (plus the handle's own `preventDefault` on mousedown cannot stop that —
+ * scrolling is cancelled by `touch-action`, not by preventDefault). The pointer
+ * family covers mouse, touch, and pen with one API, and `touch-action: none` on
+ * the handle keeps the browser from interpreting the gesture as a scroll.
  */
 
 import { useSyncExternalStore } from "react";
@@ -90,7 +100,7 @@ function readStoredWidth(): number {
  * Persist the width, ignoring storage failures.
  *
  * `setItem` throws under Safari private mode and when the quota is exhausted. The
- * only caller that matters is `endDrag`, which runs as a `mouseup` HANDLER: an
+ * only caller that matters is `endDrag`, which runs as a `pointerup` HANDLER: an
  * exception escaping it would abort the rest of that handler (the listener teardown
  * has already run by then, but the snap write has not been observed by React) and
  * surface as an uncaught error. Losing the persisted width is the correct trade —
@@ -237,7 +247,7 @@ interface DragState {
 
 let drag: DragState | null = null;
 
-function onMouseMove(event: MouseEvent): void {
+function onPointerMove(event: PointerEvent): void {
 	if (!drag) return;
 	const raw = drag.startWidth + (event.clientX - drag.startX);
 	// CSS only: React hears nothing until the drag ends.
@@ -250,10 +260,10 @@ function endDrag(): void {
 	drag = null;
 	document.body.style.cursor = "";
 	document.body.style.userSelect = "";
-	window.removeEventListener("mousemove", onMouseMove);
-	window.removeEventListener("mouseup", endDrag);
+	window.removeEventListener("pointermove", onPointerMove);
+	window.removeEventListener("pointerup", endDrag);
 	// Abnormal terminations (see startNavResize). Removed here too so a normal
-	// mouseup does not leave a stale one-shot listener behind.
+	// release does not leave a stale one-shot listener behind.
 	window.removeEventListener("blur", endDrag);
 	window.removeEventListener("pointercancel", endDrag);
 	document.removeEventListener("visibilitychange", onVisibilityChange);
@@ -292,16 +302,16 @@ export function startNavResize(event: { clientX: number; preventDefault: () => v
 	document.body.style.cursor = "col-resize";
 	document.body.style.userSelect = "none";
 	setDragTransitionSuppressed(true);
-	window.addEventListener("mousemove", onMouseMove);
-	window.addEventListener("mouseup", endDrag);
+	window.addEventListener("pointermove", onPointerMove);
+	window.addEventListener("pointerup", endDrag);
 	// ── Abnormal terminations ──
 	//
-	// `mouseup` is not guaranteed to arrive. If the window loses focus while the
+	// `pointerup` is not guaranteed to arrive. If the window loses focus while the
 	// button is held (alt-tab, a native dialog, dragging out of the browser and
 	// releasing there), the release lands on another surface and this drag would stay
 	// open indefinitely: `drag` stays non-null AND `document.body.style.userSelect`
 	// stays "none", which makes TEXT UNSELECTABLE ACROSS THE WHOLE APP until the next
-	// mouseup anywhere. The width itself does not run away (no `mousemove` arrives
+	// pointerup anywhere. The width itself does not run away (no `pointermove` arrives
 	// without focus), so the leaked body style is the visible symptom.
 	//
 	// `blur` covers focus loss, `pointercancel` the browser taking the gesture over,

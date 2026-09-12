@@ -21,11 +21,14 @@ const MAX_MARKDOWN_CODE_RENDER_CHARS = 80_000;
 
 interface MarkdownCodeBlockProps {
 	language: string;
+	/** 0-based source line, present only when the body opted into scroll-sync anchors. */
+	dataLine?: string;
 	children: ReactNode;
 }
 
 export const MarkdownCodeBlock = memo(function MarkdownCodeBlock({
 	language,
+	dataLine,
 	children,
 }: MarkdownCodeBlockProps) {
 	const { t } = useTranslation("common");
@@ -41,7 +44,7 @@ export const MarkdownCodeBlock = memo(function MarkdownCodeBlock({
 		: classes.codeBlock;
 
 	return (
-		<div className={className}>
+		<div className={className} {...(dataLine ? { "data-line": dataLine } : {})}>
 			{hasLang && (
 				<Text className={classes.codeLang} component="span">
 					{language}

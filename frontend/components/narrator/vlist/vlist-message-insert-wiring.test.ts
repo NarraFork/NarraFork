@@ -88,8 +88,6 @@ async function loaded(count = 30, hasPrev = true) {
 					hasNext: false,
 					hasPrev,
 					messageVersion: 7,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
 				};
 			},
 		},

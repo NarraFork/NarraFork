@@ -3,8 +3,6 @@ import { buildTailMeta, type TailMetaMessage, type TailMetaOptions } from "./vli
 
 const OPTS: TailMetaOptions = {
 	statusReady: true,
-	pruneBoundaryMessageId: null,
-	prunedPercent: null,
 	streamingMsgId: "__streaming_tool_chunks__",
 	findSpecTasksToolUseId: () => null,
 };
@@ -42,16 +40,12 @@ describe("buildTailMeta", () => {
 		expect(meta.turnUsageJson).toEqual({ input_tokens: 2 });
 	});
 
-	it("passes through statusReady / prune fields", () => {
+	it("passes through statusReady", () => {
 		const meta = buildTailMeta([{ id: "a1", role: "assistant" }], {
 			...OPTS,
 			statusReady: false,
-			pruneBoundaryMessageId: "p1",
-			prunedPercent: 12,
 		});
 		expect(meta.statusReady).toBe(false);
-		expect(meta.pruneBoundaryMessageId).toBe("p1");
-		expect(meta.prunedPercent).toBe(12);
 	});
 
 	it("injects the spec-tasks tool-use id resolver", () => {

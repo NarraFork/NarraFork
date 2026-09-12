@@ -292,24 +292,35 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 
 			<ScrollArea style={{ flex: 1, minHeight: 0 }}>
 				<Stack gap="xs" pb="xs">
-					{modifications && (
-						<Text size="xs" c="dimmed">
-							{t(
-								modifications.currentDiff
-									? "attributionCurrentExplanation"
-									: "attributionObservationOnly",
+					{(modifications || attributionTruncated) && (
+						<Group gap={4} justify="flex-end">
+							{modifications && (
+								<Tooltip
+									label={t(
+										modifications.currentDiff
+											? "attributionCurrentExplanation"
+											: "attributionObservationOnly",
+									)}
+									multiline
+									withinPortal
+								>
+									<ActionIcon
+										size="xs"
+										variant="subtle"
+										aria-label={t("attributionExplanationLabel")}
+									>
+										<IconHelpCircle size={13} />
+									</ActionIcon>
+								</Tooltip>
 							)}
-						</Text>
-					)}
-					{/*
-					 * Stated once for the whole list rather than per row: the shortfall is a
-					 * property of the query window, not of any one file, and a missing badge on
-					 * its own would read as "nobody wrote this".
-					 */}
-					{attributionTruncated && (
-						<Text size="xs" c="dimmed">
-							{t("attributionWindowTruncated")}
-						</Text>
+							{attributionTruncated && (
+								<Tooltip label={t("attributionWindowTruncated")} multiline withinPortal>
+									<Text size="xs" c="orange" aria-label={t("attributionIncompleteLabel")}>
+										{t("attributionIncompleteShort")}
+									</Text>
+								</Tooltip>
+							)}
+						</Group>
 					)}
 
 					{/*

@@ -204,12 +204,15 @@ describe("own question wait capability", () => {
 			currentToolUseId: "legacy-question-wait",
 			signal: new AbortController().signal,
 		} as import("../../lib/agent/types").ToolContext;
-		const own = await awaitTool.execute({ type: "question", id: record.id }, context);
+		const own = await awaitTool.execute(
+			{ type: "question", id: record.id, onlyWaitFor: true },
+			context,
+		);
 		expect(own.isError).not.toBe(true);
 		expect(own.output).toContain("Redis");
 		expect(own.metadata?.status).toBe("answered");
 		const foreign = await awaitTool.execute(
-			{ type: "question", id: record.id },
+			{ type: "question", id: record.id, onlyWaitFor: true },
 			{
 				...context,
 				narratorId: OTHER_NARRATOR_ID,

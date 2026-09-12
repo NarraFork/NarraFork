@@ -1,5 +1,13 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { posix, win32 } from "node:path";
+
+export {
+	acquireFileHistoryCapture,
+	type FileHistoryTarget,
+	withFileHistoryCapture,
+	withFileHistoryWrite,
+} from "./file-history-locks";
+
 import { fileChangeScopes as scopes } from "@server/db/schema";
 import { hotSafe } from "@server/lib/hot-safe";
 import { generateId } from "@server/lib/id";
@@ -254,6 +262,7 @@ export interface WorkspaceWriteCoordinatorOptions {
  * Activity registration survives hot reload, not process death: startup recovery
  * must separately account for surviving external processes. No automatic recovery.
  */
+
 export class WorkspaceWriteCoordinator {
 	private readonly db: WorkspaceWriteCoordinatorDb;
 	private readonly readRuntime: WorkspaceWriteCoordinatorOptions["readRuntime"];

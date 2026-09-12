@@ -5,7 +5,7 @@
  * Derives the tail summary NarratorPanel consumes (retry/continue button state,
  * status bar, spec-tasks spinner): lastRealMessage / lastUserMessageId /
  * contextPercent / turnUsageJson / latestSpecTasksToolUseId, plus pass-through
- * pruneBoundaryMessageId / prunedPercent / statusReady.
+ * statusReady.
  *
  * Kept pure + DOM-free (findSpecTasksToolUseId injected) so it is unit-testable;
  * the shell injects the real helper from narrator-message-helpers.
@@ -26,15 +26,11 @@ export interface TailMetaResult {
 	lastUserMessageId?: string;
 	contextPercent?: number | null;
 	turnUsageJson?: unknown;
-	pruneBoundaryMessageId?: string | null;
-	prunedPercent?: number | null;
 	latestSpecTasksToolUseId?: string | null;
 }
 
 export interface TailMetaOptions {
 	statusReady: boolean;
-	pruneBoundaryMessageId: string | null;
-	prunedPercent: number | null;
 	/** The streaming placeholder message id (excluded from lastRealMessage). */
 	streamingMsgId: string;
 	/** Injected: latest spec://tasks.json tool-use id over the messages. */
@@ -88,8 +84,6 @@ export function buildTailMeta(
 		lastUserMessageId,
 		contextPercent,
 		turnUsageJson,
-		pruneBoundaryMessageId: opts.pruneBoundaryMessageId,
-		prunedPercent: opts.prunedPercent,
 		latestSpecTasksToolUseId,
 	};
 }

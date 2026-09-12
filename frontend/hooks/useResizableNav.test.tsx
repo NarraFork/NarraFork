@@ -106,21 +106,26 @@ afterEach(async () => {
 });
 
 /**
- * Dispatch a mouse-like event carrying clientX, flushing React synchronously.
+ * Dispatch a pointer-family event carrying clientX, flushing React synchronously.
+ *
+ * The nav drag is POINTER-driven (mousedown could not serve touchscreens: a touch
+ * press fires one synthetic mousedown, but moving the finger hands the gesture to
+ * scrolling and the browser stops producing mouse events). A plain Event retyped as
+ * "pointermove"/"pointerup" is enough — the handler reads only `clientX`.
  *
  * The `flushSync` is required, not cosmetic: a store notification outside React's
  * event system schedules the re-render asynchronously, so without it every render
  * count below reads zero and the tests fail while the implementation is correct
  * (verified against a probe — the store itself updated 250 → 290 either way).
  */
-function fireMouse(type: string, clientX: number): void {
+function firePointer(type: string, clientX: number): void {
 	const event = document.createEvent("Event");
 	event.initEvent(type, true, true);
 	Object.defineProperty(event, "clientX", { value: clientX, configurable: true });
 	flushSyncRef.current(() => window.dispatchEvent(event));
 }
 
-/** Set once react-dom is loaded; `fireMouse` runs before any import in some tests. */
+/** Set once react-dom is loaded; `firePointer` runs before any import in some tests. */
 const flushSyncRef: { current: (fn: () => void) => void } = { current: (fn) => fn() };
 
 describe("nav width store", () => {
@@ -130,11 +135,11 @@ describe("nav width store", () => {
 		);
 		resetNavWidthStoreForTest(250);
 		startNavResize({ clientX: 100, preventDefault: () => {} });
-		fireMouse("mousemove", 400); // +300 → clamps at MAX
+		firePointer("pointermove", 400); // +300 → clamps at MAX
 		const { useNavWidth } = await import("./useResizableNav");
 		void useNavWidth;
 		// Read through the public snapshot by mounting below; here assert via clamp math.
-		fireMouse("mouseup", 400);
+		firePointer("pointerup", 400);
 		// After release the snap keeps it within range.
 		const { NAV_WIDTH_CONSTANTS: c } = await import("./useResizableNav");
 		expect(c.MAX_WIDTH).toBe(NAV_WIDTH_CONSTANTS.MAX_WIDTH);
@@ -147,8 +152,8 @@ describe("nav width store", () => {
 		const { renderHookCounts } = await mountHarness(useNavCollapsed);
 		startNavResize({ clientX: 300, preventDefault: () => {} });
 		// Drag far left: below EXPANDED_MIN → snaps to the collapsed rail.
-		fireMouse("mousemove", 300 - (250 - NAV_WIDTH_CONSTANTS.COLLAPSED_WIDTH));
-		fireMouse("mouseup", 0);
+		firePointer("pointermove", 300 - (250 - NAV_WIDTH_CONSTANTS.COLLAPSED_WIDTH));
+		firePointer("pointerup", 0);
 		expect(renderHookCounts.lastValue).toBe(true);
 	});
 
@@ -160,8 +165,8 @@ describe("nav width store", () => {
 		const { renderHookCounts } = await mountHarness(useNavCollapsed);
 		expect(renderHookCounts.lastValue).toBe(true);
 		startNavResize({ clientX: 60, preventDefault: () => {} });
-		fireMouse("mousemove", 260); // +200 → well past the threshold
-		fireMouse("mouseup", 260);
+		firePointer("pointermove", 260); // +200 → well past the threshold
+		firePointer("pointerup", 260);
 		expect(renderHookCounts.lastValue).toBe(false);
 	});
 
@@ -169,7 +174,7 @@ describe("nav width store", () => {
 		const { toggleNavCollapsed, useNavCollapsed } = await import("./useResizableNav");
 		const { renderHookCounts } = await mountHarness(useNavCollapsed);
 		expect(renderHookCounts.lastValue).toBe(false);
-		// Same reason as fireMouse: the toggle notifies outside React's event system.
+		// Same reason as firePointer: the toggle notifies outside React's event system.
 		flushSyncRef.current(() => toggleNavCollapsed());
 		expect(renderHookCounts.lastValue).toBe(true);
 		flushSyncRef.current(() => toggleNavCollapsed());
@@ -226,7 +231,7 @@ describe("CSS-variable drag path", () => {
 		const baseRenders = renderHookCounts.renders;
 
 		startNavResize({ clientX: 300, preventDefault: () => {} });
-		for (let i = 1; i <= 30; i++) fireMouse("mousemove", 300 + i);
+		for (let i = 1; i <= 30; i++) firePointer("pointermove", 300 + i);
 
 		// CSS carries the live width...
 		expect(readNavWidthOverrideForTest()).toEqual({ width: "280px", offset: "280px" });
@@ -234,7 +239,7 @@ describe("CSS-variable drag path", () => {
 		expect(renderHookCounts.renders).toBe(baseRenders);
 		expect(renderHookCounts.lastValue).toBe(250);
 
-		fireMouse("mouseup", 330);
+		firePointer("pointerup", 330);
 		// Release hands over: React now holds the final width.
 		expect(renderHookCounts.lastValue).toBe(280);
 	});
@@ -242,12 +247,12 @@ describe("CSS-variable drag path", () => {
 	it("moves the navbar width AND the content offset together", async () => {
 		const { startNavResize, readNavWidthOverrideForTest } = await import("./useResizableNav");
 		startNavResize({ clientX: 100, preventDefault: () => {} });
-		fireMouse("mousemove", 160);
+		firePointer("pointermove", 160);
 		const override = readNavWidthOverrideForTest();
 		// Main pads by the offset and the alt-layout Header uses it as margin, so a
 		// width without a matching offset makes the sidebar overlap the content.
 		expect(override?.width).toBe(override?.offset);
-		fireMouse("mouseup", 160);
+		firePointer("pointerup", 160);
 	});
 
 	it("suppresses the AppShell transition for the duration of the drag", async () => {
@@ -261,7 +266,7 @@ describe("CSS-variable drag path", () => {
 		// Main transitions `padding`; leaving it on makes each frame animate toward a
 		// target that has already moved.
 		expect(readTransition()).toBe("0ms");
-		fireMouse("mouseup", 100);
+		firePointer("pointerup", 100);
 		expect(readTransition()).toBe("");
 	});
 
@@ -274,9 +279,9 @@ describe("CSS-variable drag path", () => {
 		startNavResize({ clientX: 300, preventDefault: () => {} });
 		// The boolean is a real React input (labels, tooltips, padding all change), so
 		// this one crossing must reach React even though widths do not.
-		fireMouse("mousemove", 300 - (250 - NAV_WIDTH_CONSTANTS.COLLAPSED_WIDTH));
+		firePointer("pointermove", 300 - (250 - NAV_WIDTH_CONSTANTS.COLLAPSED_WIDTH));
 		expect(renderHookCounts.lastValue).toBe(true);
-		fireMouse("mouseup", 0);
+		firePointer("pointerup", 0);
 	});
 });
 
@@ -321,8 +326,8 @@ describe("render isolation during a drag", () => {
 
 		// 30 frames of a drag that never crosses the collapse threshold.
 		startNavResize({ clientX: 300, preventDefault: () => {} });
-		for (let i = 1; i <= 30; i++) fireMouse("mousemove", 300 + i);
-		fireMouse("mouseup", 330);
+		for (let i = 1; i <= 30; i++) firePointer("pointermove", 300 + i);
+		firePointer("pointerup", 330);
 
 		const widthDelta = widthRenders - baseWidth;
 		const collapsedDelta = collapsedRenders - baseCollapsed;
@@ -347,9 +352,9 @@ describe("render isolation during a drag", () => {
 		startNavResize({ clientX: 300, preventDefault: () => {} });
 		// Walk down past the threshold in many small steps; only the crossing counts.
 		for (let x = 300; x >= 300 - (250 - NAV_WIDTH_CONSTANTS.COLLAPSED_WIDTH); x -= 5) {
-			fireMouse("mousemove", x);
+			firePointer("pointermove", x);
 		}
-		fireMouse("mouseup", 0);
+		firePointer("pointerup", 0);
 
 		expect(renderHookCounts.lastValue).toBe(true);
 		// One render for the flip; the snap on release lands on the same boolean, so a
@@ -365,39 +370,39 @@ describe("render isolation during a drag", () => {
 		);
 		startNavResize({ clientX: 100, preventDefault: () => {} });
 		// Push far beyond MAX: every further frame clamps to the same pixel.
-		fireMouse("mousemove", 100 + NAV_WIDTH_CONSTANTS.MAX_WIDTH + 200);
+		firePointer("pointermove", 100 + NAV_WIDTH_CONSTANTS.MAX_WIDTH + 200);
 		const atMax = readNavWidthOverrideForTest();
 		expect(atMax?.width).toBe(`${NAV_WIDTH_CONSTANTS.MAX_WIDTH}px`);
 		for (let i = 0; i < 10; i++) {
-			fireMouse("mousemove", 100 + NAV_WIDTH_CONSTANTS.MAX_WIDTH + 200 + i);
+			firePointer("pointermove", 100 + NAV_WIDTH_CONSTANTS.MAX_WIDTH + 200 + i);
 		}
 		// Still pinned at MAX — `writeWidth` bails on an unchanged value.
 		expect(readNavWidthOverrideForTest()).toEqual(atMax);
-		fireMouse("mouseup", 0);
+		firePointer("pointerup", 0);
 	});
 
 	it("removes its drag listeners on release", async () => {
 		const { startNavResize, useNavWidth } = await import("./useResizableNav");
 		const { renderHookCounts } = await mountHarness(useNavWidth);
 		startNavResize({ clientX: 300, preventDefault: () => {} });
-		fireMouse("mousemove", 320);
-		fireMouse("mouseup", 320);
+		firePointer("pointermove", 320);
+		firePointer("pointerup", 320);
 		const settled = renderHookCounts.renders;
 		// A stray move after release must be ignored (listeners detached).
-		fireMouse("mousemove", 500);
+		firePointer("pointermove", 500);
 		expect(renderHookCounts.renders).toBe(settled);
 	});
 });
 
 /**
- * A drag can end WITHOUT a `mouseup`.
+ * A drag can end WITHOUT a `pointerup`.
  *
- * If the window loses focus while the button is held (alt-tab, a native dialog, or
+ * If the window loses focus while the pointer is held (alt-tab, a native dialog, or
  * dragging out of the browser and releasing there), the release lands on another
  * surface. The drag then stayed open indefinitely: `drag` non-null AND
  * `document.body.style.userSelect === "none"`, which makes TEXT UNSELECTABLE ACROSS
- * THE WHOLE APP until the next mouseup anywhere in the document. The width itself
- * does not run away (no `mousemove` arrives without focus), so the leaked body style
+ * THE WHOLE APP until the next pointerup anywhere in the document. The width itself
+ * does not run away (no `pointermove` arrives without focus), so the leaked body style
  * is the whole visible symptom — and being invisible in the width is exactly why it
  * needs a test rather than a reviewer.
  */
@@ -411,12 +416,15 @@ describe("abnormal drag terminations", () => {
 
 	for (const scenario of [
 		{ name: "window blur (alt-tab, native dialog, release outside)", type: "blur" },
-		{ name: "pointercancel (the browser took the gesture over)", type: "pointercancel" },
+		{
+			name: "pointercancel (the browser took the gesture over — a touch scroll, an edge swipe)",
+			type: "pointercancel",
+		},
 	]) {
 		it(`releases the body style on ${scenario.name}`, async () => {
 			const { startNavResize } = await import("./useResizableNav");
 			startNavResize({ clientX: 300, preventDefault: () => {} });
-			fireMouse("mousemove", 320);
+			firePointer("pointermove", 320);
 			expect(document.body.style.userSelect).toBe("none");
 
 			fireOn(window, scenario.type);
@@ -428,11 +436,11 @@ describe("abnormal drag terminations", () => {
 		it(`ignores later moves after ${scenario.name}`, async () => {
 			const { startNavResize, readNavWidthOverrideForTest } = await import("./useResizableNav");
 			startNavResize({ clientX: 300, preventDefault: () => {} });
-			fireMouse("mousemove", 320);
+			firePointer("pointermove", 320);
 			fireOn(window, scenario.type);
 			const settled = readNavWidthOverrideForTest();
 			// The drag is over: a stray move must not resume it.
-			fireMouse("mousemove", 500);
+			firePointer("pointermove", 500);
 			expect(readNavWidthOverrideForTest()).toEqual(settled);
 		});
 	}
@@ -480,7 +488,7 @@ describe("abnormal drag terminations", () => {
  *
  * Safari's private mode and a blocked-cookies profile both make access throw. The
  * read runs inside a `useSyncExternalStore` snapshot (so a throw takes out the render
- * of every nav-width consumer) and the write runs inside the `mouseup` handler (so a
+ * of every nav-width consumer) and the write runs inside the `pointerup` handler (so a
  * throw surfaces as an uncaught error mid-release).
  */
 describe("storage failures cannot break the drag", () => {
@@ -529,13 +537,27 @@ describe("storage failures cannot break the drag", () => {
 			const { startNavResize, useNavWidth } = await import("./useResizableNav");
 			const { renderHookCounts } = await mountHarness(useNavWidth);
 			startNavResize({ clientX: 300, preventDefault: () => {} });
-			fireMouse("mousemove", 330);
+			firePointer("pointermove", 330);
 			// The release must not throw, and React must still receive the final width.
-			expect(() => fireMouse("mouseup", 330)).not.toThrow();
+			expect(() => firePointer("pointerup", 330)).not.toThrow();
 			expect(renderHookCounts.lastValue).toBe(280);
 			// ...and the drag really did end (body style released).
 			expect(document.body.style.userSelect).toBe("");
 		});
+	});
+
+	// Regression: the drag used to listen for mousemove/mouseup, which a touch
+	// screen stops producing once the finger moves — the handle felt dead. The
+	// pointer family is what makes touch drags work at all.
+	it("drags from a TOUCH pointer (touchscreen regression)", async () => {
+		const { startNavResize, readNavWidthOverrideForTest } = await import("./useResizableNav");
+		startNavResize({ clientX: 300, preventDefault: () => {} });
+		firePointer("pointermove", 380);
+		// Mid-drag: painted straight to CSS, exactly as a mouse drag does.
+		expect(readNavWidthOverrideForTest()).toEqual({ width: "330px", offset: "330px" });
+		firePointer("pointerup", 380);
+		// Release hands the width back to React and persists it.
+		expect(Number(localStorage.getItem("narrafork_nav_width"))).toBe(330);
 	});
 
 	it("completes the collapse toggle when persisting throws", async () => {

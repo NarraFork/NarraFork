@@ -100,10 +100,9 @@
   - InlinePermission：executionTarget 行 + Textarea(反馈 1-3 / ExitPlanMode 8-30 行) + PermButtonBar 动态按钮。
 - 验收：高度随问题/选项/按钮数线性；只读模式去输入/按钮。
 
-### P12 — SubagentCard + prune-divider — Wave B
-- 文件：`measure/measure-subagent.ts` + `render/RenderSubagent.tsx` + `measure/measure-misc.ts`（prune-divider）+ 测试。
+### P12 — SubagentCard — Wave B
+- 文件：`measure/measure-subagent.ts` + `render/RenderSubagent.tsx` + 测试。
 - SubagentCard 高度模型：Header(p=xs 20 + 徽标行 16.8 + description 折叠 truncate🟢/展开换行🔴 + 可选结果预览行) + Recent Calls(≤3×26.8🟢) + 展开体(prompt maxHeight:200🟡 + result maxHeight:300🟡 + permission 引用 P11)；直接读 LOD 决定 effectiveExpanded。
-- prune-divider：Divider + label ≈固定行 🟢。
 - 依赖：permission 部分引用 P11。
 - 验收：折叠≈55-75px；展开 = header + recent + min(prompt,200) + min(result,300)。
 
@@ -122,5 +121,4 @@
 
 - `message`（assistant/user 文本）→ measure-message-bubble ✅（已完成样板）+ 各 block 包 P1/P2/P3/P4/P5/P6/P7。
 - `tool-run`（ToolRunItem[]）→ P9(折叠形态) + P10(单卡/分组) + P12(subagent 卡)。
-- `prune-divider` → P12。
 - 权限/问题（跨 message 与 tool）→ P11。

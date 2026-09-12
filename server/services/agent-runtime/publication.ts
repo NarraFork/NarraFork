@@ -12,6 +12,7 @@ import { ValidationError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
+import { notifyAwaitWake } from "./await-wake";
 import { MAILBOX_LIMITS as L } from "./limits";
 import type { NoticeKind, RuntimeDb, RuntimeTx } from "./mailbox-types";
 import {
@@ -231,7 +232,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 	}
 
 	function notifyTransfer(recipientId: string, deliveryId?: string) {
-		if (!wake || !deliveryId) return;
+		if (!deliveryId) return;
 		const row = database
 			.select({ metadataJson: narratorBufferedMessages.metadataJson })
 			.from(narratorBufferedMessages)
@@ -242,6 +243,8 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 			: undefined;
 		// Restart/cancel notices are observable on the next pass, not permission to spend a turn.
 		if (event === "started" || event === "cancelled") return;
+		notifyAwaitWake(recipientId, "task_notice");
+		if (!wake) return;
 		try {
 			void Promise.resolve(wake(recipientId)).catch((error) =>
 				logger.warn("Publication wake deferred", { recipientId, error: String(error) }),

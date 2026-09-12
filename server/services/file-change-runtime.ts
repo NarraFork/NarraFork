@@ -1,3 +1,4 @@
+// biome-ignore-all lint/suspicious/noControlCharactersInRegex: JSON escaping requires these control-byte ranges.
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -50,6 +51,7 @@ import {
 	type WorkspaceRuntimeBinding,
 	WorkspaceWriteCoordinator,
 	type WorkspaceWriteCoordinatorState,
+	withFileHistoryWrite,
 } from "./workspace-write-coordinator";
 
 type RuntimeDb = typeof applicationDb;
@@ -155,6 +157,7 @@ type BoundFileChange<Result> = {
 	userId?: string | null;
 	actor: FileChangeActor;
 	subtype: string | null;
+	executionSegmentId?: string | null;
 	construct(
 		before: LocalFileObservation,
 	): PreparedFileChange<Result> | Promise<PreparedFileChange<Result>>;
@@ -510,6 +513,7 @@ export class LocalFileChangeRuntime {
 				parentSubjectKey: isSubagent && actorRow.parent ? `narrator:${actorRow.parent}` : null,
 			},
 			subtype: actorRow.subtype,
+			executionSegmentId: ctx.executionSegmentId ?? null,
 			construct: request.construct,
 			assertBinding: () => {
 				this.validateCall(request);
@@ -689,6 +693,11 @@ export class LocalFileChangeRuntime {
 			request.input,
 			signal,
 		);
+		const historyTarget = {
+			deviceId: LOCAL_DEVICE_ID,
+			pathFlavor: backend.pathFlavor,
+			canonicalPath,
+		};
 		try {
 			return await this.coordinator.withWrite(
 				{ scope, runtime: request.runtime, signal },
@@ -697,198 +706,211 @@ export class LocalFileChangeRuntime {
 				// Use the frozen cwd, NOT the evidence root: Bash and legacy tools key
 				// their mutex by this workspace spelling (normalized by the helper).
 				async (lease) =>
-					withWorkspaceWriteLock(
-						backend,
-						request.cwd,
-						async () => {
-							const repeated = this.existingOperation(namespace.sourceInstanceId, request);
-							if (repeated) throw alreadyAttempted(repeated);
-							const scopeRevision = this.evidence.getScope(scope.id)?.revision;
-							if (scopeRevision === undefined) throw new Error("Granted scope disappeared");
-							const operationInput: BeginFileChangeOperation = {
-								sourceInstanceId: namespace.sourceInstanceId,
-								sourceKind: request.sourceKind,
-								sourceId: request.sourceId,
-								toolCallId: request.sourceKind === "tool" ? request.sourceId : null,
-								toolUseId: request.toolUseId,
-								attempt: request.attempt,
-								requestDigest,
-								expectedEffectCount: 1,
-								actor: request.actor,
-								narratorId: request.narratorId,
-								projectId: request.projectId,
-								ownerUserId: request.userId,
-								executionBinding: lease.executionBinding,
-							};
-							const assertTarget = async () => {
-								await this.assertNamespaceDirectories(namespace);
-								await request.assertBinding();
-								lease.assertCurrent(lease.executionBinding);
-								const actual = await backend.resolvePathIdentity(lexicalPath);
-								if (
-									!backend.paths.equals(actual.canonicalPath, canonicalPath) ||
-									actual.runtimeGeneration !== request.runtime.runtimeGeneration ||
-									(await localDirectoryIdentity(root)) !== rootIdentity
-								)
-									throw new LocalFileValidationError("Frozen local target/root changed");
-								lease.assertCurrent(lease.executionBinding);
-							};
-							await assertTarget();
-							let before: LocalFileObservation;
-							let prepared: PreparedFileChange<Result>;
-							try {
-								before = await this.io.read(canonicalPath, signal);
-								// Reading awaits IO too: do not return a conflict body after its ACL or
-								// canonical target changed while those bytes were being collected.
-								if (request.sourceKind === "editor") await assertTarget();
-								if (before.mode !== null && (before.mode & 0o222) === 0)
-									throw new LocalFileValidationError("File is read-only");
-								prepared = await request.construct(before);
-								if (prepared.nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
-									throw new LocalFileValidationError("Output exceeds the 32 MiB evidence limit");
-							} catch (error) {
-								// Only construction/known validation failures qualify. Infrastructure
-								// failures are not evidence of a no-change operation.
-								request.recordNoDispatch?.(operationInput, error);
-								throw error;
-							}
-							const beforeState = await this.publish(namespace, before, signal);
-							const afterState = await this.publish(
-								namespace,
-								{
-									bytes: prepared.nextBytes,
-									mode: before.mode ?? 0o666 & ~process.umask(),
-									identity: null,
+					withFileHistoryWrite(
+						historyTarget,
+						() =>
+							withWorkspaceWriteLock(
+								backend,
+								request.cwd,
+								async () => {
+									const repeated = this.existingOperation(namespace.sourceInstanceId, request);
+									if (repeated) throw alreadyAttempted(repeated);
+									const scopeRevision = this.evidence.getScope(scope.id)?.revision;
+									if (scopeRevision === undefined) throw new Error("Granted scope disappeared");
+									const operationInput: BeginFileChangeOperation = {
+										sourceInstanceId: namespace.sourceInstanceId,
+										sourceKind: request.sourceKind,
+										sourceId: request.sourceId,
+										toolCallId: request.sourceKind === "tool" ? request.sourceId : null,
+										toolUseId: request.toolUseId,
+										attempt: request.attempt,
+										requestDigest,
+										expectedEffectCount: 1,
+										actor: request.actor,
+										narratorId: request.narratorId,
+										projectId: request.projectId,
+										ownerUserId: request.userId,
+										executionBinding: lease.executionBinding,
+										executionSegmentId: request.executionSegmentId ?? null,
+									};
+									const assertTarget = async () => {
+										await this.assertNamespaceDirectories(namespace);
+										await request.assertBinding();
+										lease.assertCurrent(lease.executionBinding);
+										const actual = await backend.resolvePathIdentity(lexicalPath);
+										if (
+											!backend.paths.equals(actual.canonicalPath, canonicalPath) ||
+											actual.runtimeGeneration !== request.runtime.runtimeGeneration ||
+											(await localDirectoryIdentity(root)) !== rootIdentity
+										)
+											throw new LocalFileValidationError("Frozen local target/root changed");
+										lease.assertCurrent(lease.executionBinding);
+									};
+									await assertTarget();
+									let before: LocalFileObservation;
+									let prepared: PreparedFileChange<Result>;
+									try {
+										before = await this.io.read(canonicalPath, signal);
+										// Reading awaits IO too: do not return a conflict body after its ACL or
+										// canonical target changed while those bytes were being collected.
+										if (request.sourceKind === "editor") await assertTarget();
+										if (before.mode !== null && (before.mode & 0o222) === 0)
+											throw new LocalFileValidationError("File is read-only");
+										prepared = await request.construct(before);
+										if (prepared.nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
+											throw new LocalFileValidationError(
+												"Output exceeds the 32 MiB evidence limit",
+											);
+									} catch (error) {
+										// Only construction/known validation failures qualify. Infrastructure
+										// failures are not evidence of a no-change operation.
+										request.recordNoDispatch?.(operationInput, error);
+										throw error;
+									}
+									const beforeState = await this.publish(namespace, before, signal);
+									const afterState = await this.publish(
+										namespace,
+										{
+											bytes: prepared.nextBytes,
+											mode: before.mode ?? 0o666 & ~process.umask(),
+											identity: null,
+										},
+										signal,
+									);
+									const operation = this.evidence.beginOperation(operationInput);
+									request.linkOperation?.(operation.id);
+									const effect = this.evidence.prepareEffects(operation.id, [
+										{
+											identity,
+											scopeRevision,
+											requestDigest,
+											before: beforeState,
+											intendedAfter: afterState,
+										},
+									])[0];
+									await this.evidence.finalizePreparation(operation.id, { signal });
+									const selector = {
+										operationId: operation.id,
+										mutationId: effect.mutationId,
+										requestDigest,
+									};
+									if (
+										!this.evidence.markApplying({
+											...selector,
+											executionBinding: lease.executionBinding,
+										}).mayExecute
+									)
+										throw alreadyAttempted(operation);
+									lease.registerMutation(effect.mutationId);
+									let dispatched = false;
+									let applied = false;
+									let ioError: unknown;
+									let observed: LocalFileObservation | undefined;
+									try {
+										await this.io.apply({
+											backend,
+											lexicalPath,
+											canonicalPath,
+											before,
+											nextBytes: prepared.nextBytes,
+											signal,
+											assertTarget,
+											onDispatch: () => {
+												dispatched = true;
+												request.onDispatch?.();
+											},
+										});
+										applied = true;
+									} catch (error) {
+										ioError = error;
+									}
+									// Cancellation cannot suppress the bounded after observation/settlement.
+									try {
+										await assertTarget();
+										observed = await this.io.read(canonicalPath, AbortSignal.timeout(5_000));
+									} catch (error) {
+										ioError ??= error;
+									}
+									// Sample once at the IO boundary. Metadata callbacks never resample or
+									// downgrade the grade or line counts of an immutable settled receipt.
+									// The exact before/after observation remains reversible even when a nearby
+									// Bash activity is intentionally skipped or ambiguous. Ambiguity belongs to
+									// that Bash operation, not to this independently journaled file write.
+									const attributionCeiling = "measured";
+									try {
+										const observedAfter: FileChangeState = !observed
+											? { kind: "unknown", reason: "missing_after" }
+											: observed.bytes !== null &&
+													observed.mode === afterStateMode(afterState) &&
+													Buffer.from(observed.bytes).equals(prepared.nextBytes)
+												? afterState
+												: sameObservedBytes(observed, before)
+													? beforeState
+													: await this.publish(namespace, observed, AbortSignal.timeout(5_000));
+										const receipt: FileChangeExecutionReceipt = {
+											receiptId: generateId(),
+											mutationId: effect.mutationId,
+											requestDigest,
+											executionBinding: lease.executionBinding,
+											observedAfter,
+											outcome: applied ? "applied" : dispatched ? "unknown" : "not_applied",
+											confirmed: applied || !dispatched,
+										};
+										const settled = this.evidence.settleEffect({
+											...selector,
+											receipt,
+											attributionCeiling,
+											linesAdded: prepared.lineStats?.added,
+											linesRemoved: prepared.lineStats?.removed,
+										});
+										const verified = applied && fileChangeStatesEqual(afterState, observedAfter);
+										this.evidence.finishOperation(
+											operation.id,
+											ioError || !verified
+												? signal.aborted
+													? "interrupted"
+													: "failed"
+												: "succeeded",
+										);
+										lease.settle(
+											effect.mutationId,
+											settled.settlement === "settled"
+												? applied
+													? "applied"
+													: "not_applied"
+												: "unknown",
+										);
+										// Unknown/failed-but-dispatched effects remain visible with unmeasured
+										// counts. A positively non-applied or identical rewrite is not a change.
+										if (settled.outcome !== "no_change")
+											this.project(request, operation, settled, scope);
+										if (ioError) throw ioError;
+										if (!verified)
+											throw new Error(
+												"Local after state did not match the durable intent; reconciliation required",
+											);
+										return {
+											result: prepared.result,
+											linesAdded: settled.linesAdded,
+											linesRemoved: settled.linesRemoved,
+											fileChangeEvidence: {
+												version: 2,
+												operationId: operation.id,
+												effectId: effect.id,
+												grade: settled.attributionGrade,
+												settlement: settled.settlement,
+												outcome: settled.outcome,
+											},
+										};
+									} catch (error) {
+										// A settled receipt stays frozen. Only unsettled persistence/IO needs
+										// quarantine; never retry a mutation or write a before-state here.
+										if (lease.pendingMutationCount > 0) lease.markUncertain();
+										throw error;
+									}
 								},
 								signal,
-							);
-							const operation = this.evidence.beginOperation(operationInput);
-							request.linkOperation?.(operation.id);
-							const effect = this.evidence.prepareEffects(operation.id, [
-								{
-									identity,
-									scopeRevision,
-									requestDigest,
-									before: beforeState,
-									intendedAfter: afterState,
-								},
-							])[0];
-							await this.evidence.finalizePreparation(operation.id, { signal });
-							const selector = {
-								operationId: operation.id,
-								mutationId: effect.mutationId,
-								requestDigest,
-							};
-							if (
-								!this.evidence.markApplying({
-									...selector,
-									executionBinding: lease.executionBinding,
-								}).mayExecute
-							)
-								throw alreadyAttempted(operation);
-							lease.registerMutation(effect.mutationId);
-							let dispatched = false;
-							let applied = false;
-							let ioError: unknown;
-							let observed: LocalFileObservation | undefined;
-							try {
-								await this.io.apply({
-									backend,
-									lexicalPath,
-									canonicalPath,
-									before,
-									nextBytes: prepared.nextBytes,
-									signal,
-									assertTarget,
-									onDispatch: () => {
-										dispatched = true;
-										request.onDispatch?.();
-									},
-								});
-								applied = true;
-							} catch (error) {
-								ioError = error;
-							}
-							// Cancellation cannot suppress the bounded after observation/settlement.
-							try {
-								await assertTarget();
-								observed = await this.io.read(canonicalPath, AbortSignal.timeout(5_000));
-							} catch (error) {
-								ioError ??= error;
-							}
-							// Sample once at the IO boundary. Metadata callbacks never resample or
-							// downgrade the grade or line counts of an immutable settled receipt.
-							const attributionCeiling = lease.overlappedUncoordinatedActivity
-								? "observed_ambiguous"
-								: "measured";
-							try {
-								const observedAfter: FileChangeState = !observed
-									? { kind: "unknown", reason: "missing_after" }
-									: observed.bytes !== null &&
-											observed.mode === afterStateMode(afterState) &&
-											Buffer.from(observed.bytes).equals(prepared.nextBytes)
-										? afterState
-										: sameObservedBytes(observed, before)
-											? beforeState
-											: await this.publish(namespace, observed, AbortSignal.timeout(5_000));
-								const receipt: FileChangeExecutionReceipt = {
-									receiptId: generateId(),
-									mutationId: effect.mutationId,
-									requestDigest,
-									executionBinding: lease.executionBinding,
-									observedAfter,
-									outcome: applied ? "applied" : dispatched ? "unknown" : "not_applied",
-									confirmed: applied || !dispatched,
-								};
-								const settled = this.evidence.settleEffect({
-									...selector,
-									receipt,
-									attributionCeiling,
-									linesAdded: prepared.lineStats?.added,
-									linesRemoved: prepared.lineStats?.removed,
-								});
-								const verified = applied && fileChangeStatesEqual(afterState, observedAfter);
-								this.evidence.finishOperation(
-									operation.id,
-									ioError || !verified ? (signal.aborted ? "interrupted" : "failed") : "succeeded",
-								);
-								lease.settle(
-									effect.mutationId,
-									settled.settlement === "settled"
-										? applied
-											? "applied"
-											: "not_applied"
-										: "unknown",
-								);
-								// Unknown/failed-but-dispatched effects remain visible with unmeasured
-								// counts. A positively non-applied or identical rewrite is not a change.
-								if (settled.outcome !== "no_change")
-									this.project(request, operation, settled, scope);
-								if (ioError) throw ioError;
-								if (!verified)
-									throw new Error(
-										"Local after state did not match the durable intent; reconciliation required",
-									);
-								return {
-									result: prepared.result,
-									linesAdded: settled.linesAdded,
-									linesRemoved: settled.linesRemoved,
-									fileChangeEvidence: {
-										version: 2,
-										operationId: operation.id,
-										effectId: effect.id,
-										grade: settled.attributionGrade,
-										settlement: settled.settlement,
-										outcome: settled.outcome,
-									},
-								};
-							} catch (error) {
-								// A settled receipt stays frozen. Only unsettled persistence/IO needs
-								// quarantine; never retry a mutation or write a before-state here.
-								if (lease.pendingMutationCount > 0) lease.markUncertain();
-								throw error;
-							}
-						},
+							),
 						signal,
 					),
 			);
@@ -1118,6 +1140,75 @@ function hash(parts: readonly string[]): string {
 	return identityHasher(parts).digest("hex");
 }
 
+/** Count UTF-8 bytes of JSON string content without allocating the escaped string. */
+function jsonStringContentByteLength(value: string, start: number, end: number): number {
+	const chunk = value.slice(start, end);
+	// The common path has no JSON escapes or surrogate code units; let native byte
+	// counting handle it without a JavaScript loop over every UTF-16 unit.
+	if (chunk.search(/[\u0000-\u001f\uD800-\uDFFF"\\]/) < 0) return Buffer.byteLength(chunk);
+	if (chunk.search(/[\uD800-\uDFFF]/) < 0) {
+		const rawBytes = Buffer.byteLength(chunk);
+		const quoteAndSlash = chunk.length - chunk.replace(/["\\]/g, "").length;
+		const shortEscapes =
+			chunk.length - chunk.replace(/[\u0008\u0009\u000a\u000c\u000d]/g, "").length;
+		const longEscapes =
+			chunk.length - chunk.replace(/[\u0000-\u0007\u000b\u000e-\u001f]/g, "").length;
+		return rawBytes + quoteAndSlash + shortEscapes + longEscapes * 5;
+	}
+	let bytes = 0;
+	for (let index = 0; index < chunk.length; index++) {
+		const code = chunk.charCodeAt(index);
+		if (
+			code === 0x22 ||
+			code === 0x5c ||
+			code === 0x08 ||
+			code === 0x09 ||
+			code === 0x0a ||
+			code === 0x0c ||
+			code === 0x0d
+		) {
+			bytes += 2;
+		} else if (code < 0x20) {
+			bytes += 6;
+		} else if (code >= 0xd800 && code <= 0xdbff) {
+			const next = index + 1 < chunk.length ? chunk.charCodeAt(index + 1) : 0;
+			if (next >= 0xdc00 && next <= 0xdfff) {
+				bytes += 4;
+				index++;
+			} else bytes += 6;
+		} else if (code >= 0xdc00 && code <= 0xdfff) {
+			bytes += 6;
+		} else if (code <= 0x7f) {
+			bytes++;
+		} else if (code <= 0x7ff) {
+			bytes += 2;
+		} else bytes += 3;
+	}
+	return bytes;
+}
+
+/** Yield the exact byte lengths of request JSON parts without creating them. */
+function* requestJsonPartByteLengths(
+	input: Readonly<Record<string, FileToolScalar>>,
+): Generator<number> {
+	yield 1; // {
+	let first = true;
+	for (const [key, value] of Object.entries(input)) {
+		if (!first) yield 1; // comma
+		first = false;
+		yield Buffer.byteLength(JSON.stringify(key));
+		yield 1; // colon
+		if (typeof value !== "string") {
+			yield Buffer.byteLength(JSON.stringify(value));
+			continue;
+		}
+		yield 1; // opening quote
+		yield jsonStringContentByteLength(value, 0, value.length);
+		yield 1; // closing quote
+	}
+	yield 1; // }
+}
+
 /**
  * Same length-prefixed JSON digest as the original path, without materializing
  * a potentially 96 MiB JSON string or hashing it in one event-loop turn. Inputs
@@ -1132,19 +1223,29 @@ export async function hashLocalFileChangeRequest(
 	const digest = identityHasher(identityParts);
 	const snapshot = snapshotFileToolInput(input);
 	let size = 0;
-	for (const part of requestJsonParts(snapshot)) {
+	let bytesSinceYield = 0;
+	for (const partBytes of requestJsonPartByteLengths(snapshot)) {
 		signal?.throwIfAborted();
-		size += Buffer.byteLength(part);
+		size += partBytes;
+		bytesSinceYield += partBytes;
 		if (size > FILE_CHANGE_LIMITS.fileToolRequestBytes)
 			throw new LocalFileValidationError("File-change request exceeds its bounded input budget");
-		await yieldToEventLoop();
+		if (bytesSinceYield >= FILE_CHANGE_LIMITS.streamChunkBytes) {
+			bytesSinceYield = 0;
+			await yieldToEventLoop();
+		}
 	}
 	signal?.throwIfAborted();
 	digest.update(`${size}:`);
+	bytesSinceYield = 0;
 	for (const part of requestJsonParts(snapshot)) {
 		signal?.throwIfAborted();
 		digest.update(part);
-		await yieldToEventLoop();
+		bytesSinceYield += Buffer.byteLength(part);
+		if (bytesSinceYield >= FILE_CHANGE_LIMITS.streamChunkBytes) {
+			bytesSinceYield = 0;
+			await yieldToEventLoop();
+		}
 	}
 	signal?.throwIfAborted();
 	return digest.digest("hex");

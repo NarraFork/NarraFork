@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { pruneToolCalls } from "../../../services/narrator-session";
 import type { OpenAIProviderConfig } from "../../settings";
 import { setUploadsDirForTests } from "../../uploads";
 import { isRetryableError } from "../error-handling";
@@ -733,7 +732,7 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(historyJson).toContain('"image_url":"data:image/png;base64,');
 	});
 
-	test("pruneToolCalls removes pruned non-protected tool_use blocks from responses history", async () => {
+	test("buildHistory preserves earlier tool details in responses history", async () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
 		const dbMessages: DbMessage[] = [
 			makeAssistantMessage({
@@ -760,15 +759,15 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 			}),
 		];
 
-		pruneToolCalls(dbMessages, "assistant-pruned");
 		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
 		const historyJson = JSON.stringify(result.history);
-		expect(historyJson).not.toContain('"call_id":"call_enter_plan"');
-		expect(historyJson).not.toContain('"type":"function_call_output"');
+		expect(historyJson).toContain('"call_id":"call_enter_plan"');
+		expect(historyJson).toContain('"type":"function_call_output"');
+		expect(historyJson).toContain("Entered plan mode");
 		expect(result.trailingToolResults).toEqual([]);
 	});
 
-	test("pruneToolCalls preserves protected tool pairs in responses history", async () => {
+	test("buildHistory preserves plan submission tool pairs in responses history", async () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
 		const dbMessages: DbMessage[] = [
 			makeAssistantMessage({
@@ -800,7 +799,6 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 			}),
 		];
 
-		pruneToolCalls(dbMessages, "assistant-protected");
 		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
 		const historyJson = JSON.stringify(result.history);
 		expect(historyJson).toContain('"type":"function_call"');

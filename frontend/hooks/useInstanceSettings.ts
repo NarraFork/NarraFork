@@ -64,7 +64,6 @@ export interface InstanceSettingsState {
 	defaultNarratorWriteAudience: DefaultNarratorWriteAudience;
 	defaultStartInPlanMode: boolean;
 	defaultRelaxedPlan: boolean;
-	defaultPruneEnabled: boolean;
 	planModeAllowInlinePlan: boolean;
 	planReflectionAutoApprove: boolean;
 	planReflectionAllowAutoCompact: boolean;
@@ -91,12 +90,10 @@ export interface InstanceSettingsState {
 		note?: string;
 	}>;
 	contextThresholds: {
-		standard: { pruneStart: number; compactStart: number };
-		large: { pruneStart: number; compactStart: number };
+		standard: { compactStart: number };
+		large: { compactStart: number };
 	};
 	autoCompactKeepPairs: number;
-	autoCompactPruneThreshold: number;
-	minPruneRatio: number;
 	queueDuringCompaction: boolean;
 	agentDefaultReasoningEffort: string;
 	/** Models excluded from receiving a reasoning-effort hint. */
@@ -183,7 +180,6 @@ function makeDefaults(): InstanceSettingsState {
 		defaultNarratorWriteAudience: "auto",
 		defaultStartInPlanMode: false,
 		defaultRelaxedPlan: false,
-		defaultPruneEnabled: false,
 		planModeAllowInlinePlan: true,
 		planReflectionAutoApprove: false,
 		planReflectionAllowAutoCompact: false,
@@ -204,8 +200,6 @@ function makeDefaults(): InstanceSettingsState {
 		customRetryRules: [],
 		contextThresholds: cloneDefaultContextThresholds(),
 		autoCompactKeepPairs: 2,
-		autoCompactPruneThreshold: 80,
-		minPruneRatio: 30,
 		queueDuringCompaction: true,
 		agentDefaultReasoningEffort: "",
 		reasoningEffortBlocklist: [],
@@ -293,7 +287,6 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				requestDumpEnabled: settings.agent?.requestDumpEnabled ?? false,
 				requestDumpErrorsOnly: settings.agent?.requestDumpErrorsOnly ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
-				defaultPruneEnabled: settings.agent?.defaultPruneEnabled ?? false,
 				planModeAllowInlinePlan: settings.agent?.planModeAllowInlinePlan ?? true,
 				planReflectionAutoApprove: settings.agent?.planReflectionAutoApprove ?? false,
 				planReflectionAllowAutoCompact: settings.agent?.planReflectionAllowAutoCompact ?? false,
@@ -318,8 +311,6 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				customRetryRules: settings.agent?.customRetryRules ?? [],
 				contextThresholds: settings.agent?.contextThresholds ?? cloneDefaultContextThresholds(),
 				autoCompactKeepPairs: settings.agent?.autoCompactKeepPairs ?? 2,
-				autoCompactPruneThreshold: settings.agent?.autoCompactPruneThreshold ?? 80,
-				minPruneRatio: settings.agent?.minPruneRatio ?? 30,
 				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? true,
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
 				reasoningEffortBlocklist: settings.agent?.reasoningEffortBlocklist ?? [],
@@ -424,7 +415,6 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					defaultNarratorWriteAudience: state.defaultNarratorWriteAudience,
 					defaultStartInPlanMode: state.defaultStartInPlanMode,
 					defaultRelaxedPlan: state.defaultRelaxedPlan,
-					defaultPruneEnabled: state.defaultPruneEnabled,
 					planModeAllowInlinePlan: state.planModeAllowInlinePlan,
 					planReflectionAutoApprove: state.planReflectionAutoApprove,
 					planReflectionAllowAutoCompact: state.planReflectionAllowAutoCompact,
@@ -460,8 +450,6 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					customRetryRules: state.customRetryRules,
 					contextThresholds: state.contextThresholds,
 					autoCompactKeepPairs: state.autoCompactKeepPairs,
-					autoCompactPruneThreshold: state.autoCompactPruneThreshold,
-					minPruneRatio: state.minPruneRatio,
 					queueDuringCompaction: state.queueDuringCompaction,
 					whitelistDirs: state.globalWhitelistDirs,
 					blacklistDirs: state.globalBlacklistDirs,

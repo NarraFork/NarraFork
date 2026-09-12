@@ -83,7 +83,6 @@ describe("advanced row promotion", () => {
 	const untouched: AdvancedRowInput = {
 		fastModeOverride: "inherit",
 		relaxedPlan: false,
-		pruneEnabled: false,
 		planMode: false,
 		backgroundStatus: null,
 		pendingModelRestore: null,
@@ -102,7 +101,6 @@ describe("advanced row promotion", () => {
 	> = [
 		["fastMode", { fastModeOverride: "on" }],
 		["relaxedPlan", { relaxedPlan: true }],
-		["pruneEnabled", { pruneEnabled: true }],
 		["planMode", { planMode: true }],
 		["backgroundStatus", { backgroundStatus: "completed" }],
 		["pendingModelRestore", { pendingModelRestore: "provider:model" }],
@@ -150,7 +148,6 @@ describe("advanced row promotion", () => {
 		const allSet: AdvancedRowInput = {
 			fastModeOverride: "on",
 			relaxedPlan: true,
-			pruneEnabled: true,
 			planMode: true,
 			backgroundStatus: "running",
 			pendingModelRestore: "provider:model",

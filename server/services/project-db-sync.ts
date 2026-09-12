@@ -254,12 +254,12 @@ async function syncNarrator(narratorId: string): Promise<void> {
 		 title, inherit_mode, parent_narrator_id, context_summary, model, system_prompt,
 		 permission_mode, message_count, total_cost_usd, last_message_at, status,
 		 plan_mode, cwd, error_message,
-		 prune_boundary_message_id, pruned_percent, created_at, substatus, variant, traits,
+		 created_at, substatus, variant, traits,
 		 is_background, background_status, background_result, background_completed_at,
-		 is_ask_in_passing, turn_started_at, message_version, prune_enabled, fast_mode,
+		 is_ask_in_passing, turn_started_at, message_version, fast_mode,
 		 fast_mode_override, relaxed_plan, reasoning_effort, previous_permission_mode, plan_file_id,
 		 updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			narrator.id,
 			narrator.chapterId,
@@ -281,8 +281,6 @@ async function syncNarrator(narratorId: string): Promise<void> {
 			Array.isArray(narrator.traits) && narrator.traits.includes("plan") ? 1 : 0,
 			narrator.cwd,
 			narrator.errorMessage,
-			narrator.pruneBoundaryMessageId,
-			narrator.prunedPercent,
 			narrator.createdAt,
 			narrator.substatus,
 			narrator.variant,
@@ -294,7 +292,6 @@ async function syncNarrator(narratorId: string): Promise<void> {
 			narrator.isAskInPassing ? 1 : 0,
 			narrator.turnStartedAt,
 			narrator.messageVersion,
-			narrator.pruneEnabled ? 1 : 0,
 			narrator.fastMode ? 1 : 0,
 			narrator.fastModeOverride,
 			narrator.relaxedPlan ? 1 : 0,
@@ -383,8 +380,8 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 	);
 	const refStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_message_refs
-		(id, narrator_id, message_id, seq, is_compact, pruned_percent)
-		VALUES (?, ?, ?, ?, ?, ?)`,
+		(id, narrator_id, message_id, seq, is_compact)
+		VALUES (?, ?, ?, ?, ?)`,
 	);
 	const tcStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_tool_calls
@@ -427,7 +424,7 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 			);
 		}
 		for (const r of newRefs) {
-			refStmt.run(r.id, r.narratorId, r.messageId, r.seq, r.isCompact, r.prunedPercent);
+			refStmt.run(r.id, r.narratorId, r.messageId, r.seq, r.isCompact);
 		}
 		for (const tc of allToolCalls) {
 			tcStmt.run(
@@ -585,8 +582,8 @@ async function fullSyncNarratorMessages(narratorId: string, pdb: Database): Prom
 	);
 	const refStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_message_refs
-		(id, narrator_id, message_id, seq, is_compact, pruned_percent)
-		VALUES (?, ?, ?, ?, ?, ?)`,
+		(id, narrator_id, message_id, seq, is_compact)
+		VALUES (?, ?, ?, ?, ?)`,
 	);
 	const tcStmt = pdb.prepare(
 		`INSERT OR REPLACE INTO narrator_tool_calls
@@ -635,7 +632,7 @@ async function fullSyncNarratorMessages(narratorId: string, pdb: Database): Prom
 			);
 		}
 		for (const r of refs) {
-			refStmt.run(r.id, r.narratorId, r.messageId, r.seq, r.isCompact, r.prunedPercent);
+			refStmt.run(r.id, r.narratorId, r.messageId, r.seq, r.isCompact);
 		}
 		for (const tc of allToolCalls) {
 			tcStmt.run(
