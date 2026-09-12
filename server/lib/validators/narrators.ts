@@ -699,3 +699,13 @@ export const narratorTransferOwnerSchema = z.object({
 	/** null hands the narrator back to "no owner" (admin-managed). */
 	userId: z.string().min(1).max(128).nullable(),
 });
+
+/**
+ * Optimize prompt input validation.
+ */
+export const optimizePromptSchema = z.object({
+	text: z.string().min(1).max(MAX_NARRATOR_DRAFT_CHARS),
+	style: z.enum(["clarify", "concise", "structured", "translate_en"]),
+	withContext: z.boolean().optional().default(false),
+	messageId: z.string().optional(),
+});

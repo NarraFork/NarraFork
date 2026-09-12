@@ -22,6 +22,7 @@
  */
 
 import { useEditRegeneratePreview } from "@frontend/hooks/useNarrator";
+import { usePromptOptimize } from "@frontend/hooks/usePromptOptimize";
 import {
 	ActionIcon,
 	Button,
@@ -33,6 +34,7 @@ import {
 	Textarea,
 	Tooltip,
 } from "@mantine/core";
+import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import type { FileReference } from "@shared/file-reference";
 import {
@@ -47,6 +49,7 @@ import { useTranslation } from "react-i18next";
 import type { RevertScope } from "../../lib/api/narrators";
 import { shouldClearEditDraft } from "../../lib/api/narrators";
 import { UserAvatar } from "../UserAvatar";
+import { ComposerFullscreenModal } from "./ComposerFullscreenModal";
 import { EditExistingImageThumb, EditNewImageThumb, EditTextFileChip } from "./EditAttachmentChips";
 import { EditingMessageCtx } from "./EditingMessageCtx";
 import {
@@ -64,6 +67,7 @@ import {
 	resizeImageIfNeeded,
 } from "./narrator-panel-types";
 import { RevertScopeConfirmModal } from "./RevertScopeConfirmModal";
+import { TextareaOptimizeControls } from "./TextareaOptimizeControls";
 
 /**
  * Maximum attachments an edit may carry, per type. Images allow far more than
@@ -174,8 +178,7 @@ export function MessageEditorPanel({
 			: [],
 	);
 	const [editNewImages, setEditNewImages] = useState<File[]>([]);
-	// Existing text_file blocks kept during editing (user can remove some) + newly
-	// added files. They are identified by filePath and mirror the image editing flow.
+	// Text file attachments (kept + new), similar pattern
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON text_file blocks
 	const [editKeptTextFiles, setEditKeptTextFiles] = useState<any[]>(() =>
 		isUser
@@ -186,22 +189,32 @@ export function MessageEditorPanel({
 			: [],
 	);
 	const [editNewTextFiles, setEditNewTextFiles] = useState<File[]>([]);
+	// File references (in-text markers like #file(...))
 	const [editFileReferences, setEditFileReferences] = useState<FileReference[]>(() =>
-		isUser
-			? readFileReferences(
-					blocks.filter((block) => block.type === "file_reference").map((block) => block.reference),
-				)
-			: [],
+		readFileReferences(initialText),
 	);
 	const [isSubmittingEdit, setIsSubmittingEdit] = useState(false);
+
+	// Refs
 	const isSubmittingEditRef = useRef(false);
-	// Mirror the kept-image count in a ref so the async add-images flow reads the
-	// LATEST value (the user may remove a kept image mid-resize) instead of a stale
-	// closure capture when computing remaining room.
 	const editKeptCountRef = useRef(0);
 	editKeptCountRef.current = editKeptImages.length;
 	const editFileInputRef = useRef<HTMLInputElement | null>(null);
 	const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+	// Fullscreen Modal state
+	const [fullscreenOpened, { open: openFullscreen, close: closeFullscreen }] = useDisclosure(false);
+
+	// Prompt optimization hook
+	const optimizeHook = usePromptOptimize({
+		narratorId: narratorId ?? "",
+		messageId,
+		textareaRef: editTextareaRef,
+		onOptimized: (text) => {
+			// Fallback: if execCommand fails, update state directly
+			setEditContent(text);
+		},
+	});
 	// Undo stack for the edit textarea. React controls the textarea `value`, which
 	// disables native Ctrl+Z, so we keep our own bounded stack of prior snapshots.
 	const editUndoStackRef = useRef<FileReferenceInput[]>([]);
@@ -555,6 +568,25 @@ export function MessageEditorPanel({
 						autosize
 						minRows={3}
 						maxRows={16}
+						rightSection={
+							<TextareaOptimizeControls
+								disabled={!editContent.trim() || optimizeHook.loading}
+								loading={optimizeHook.loading}
+								withContext={optimizeHook.withContext}
+								onToggleContext={optimizeHook.toggleContext}
+								onOptimize={optimizeHook.handleOptimize}
+								onExpand={openFullscreen}
+								contextMessageCount={optimizeHook.contextMessageCount}
+								onContextMessageCountChange={optimizeHook.setContextMessageCount}
+							/>
+						}
+						rightSectionWidth="auto"
+						styles={{
+							section: {
+								alignItems: "center",
+								paddingRight: 8,
+							},
+						}}
 					/>
 					<Text size="xs" c="dimmed">
 						{t("editAssistantHint")}
@@ -609,6 +641,25 @@ export function MessageEditorPanel({
 						autosize
 						minRows={2}
 						maxRows={10}
+						rightSection={
+							<TextareaOptimizeControls
+								disabled={!editContent.trim() || optimizeHook.loading || isSubmittingEdit}
+								loading={optimizeHook.loading}
+								withContext={optimizeHook.withContext}
+								onToggleContext={optimizeHook.toggleContext}
+								onOptimize={optimizeHook.handleOptimize}
+								onExpand={openFullscreen}
+								contextMessageCount={optimizeHook.contextMessageCount}
+								onContextMessageCountChange={optimizeHook.setContextMessageCount}
+							/>
+						}
+						rightSectionWidth="auto"
+						styles={{
+							section: {
+								alignItems: "center",
+								paddingRight: 8,
+							},
+						}}
 					/>
 					{hasEditImages && (
 						<Group gap="xs">
@@ -747,6 +798,19 @@ export function MessageEditorPanel({
 				onCancel={() => {
 					if (!isSubmittingEdit) setShowConfirmModal(false);
 				}}
+			/>
+			<ComposerFullscreenModal
+				opened={fullscreenOpened}
+				onClose={closeFullscreen}
+				initialText={editContent}
+				onSubmit={(text) => {
+					setEditContent(text);
+					closeFullscreen();
+					requestAnimationFrame(() => editTextareaRef.current?.focus());
+				}}
+				optimizeHook={optimizeHook}
+				narratorId={narratorId}
+				messageId={messageId}
 			/>
 		</>
 	);

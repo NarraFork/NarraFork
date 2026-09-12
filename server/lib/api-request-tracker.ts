@@ -26,6 +26,7 @@ export type ApiRequestKind =
 	| "merge_summary"
 	| "web_fetch_smart"
 	| "reflection"
+	| "optimize"
 	| "reasoning_translation"
 	| "settings_test"
 	| "git_summary"

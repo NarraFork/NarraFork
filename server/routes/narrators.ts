@@ -51,6 +51,7 @@ import {
 	users,
 } from "../db/schema";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
+import { summaryGenerate } from "../lib/agent";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
 import { redactSpillPointerPaths } from "../lib/api-request-dump-store";
@@ -138,7 +139,7 @@ import {
 	resolveSetupAuthorization,
 	selectActionableDependencies,
 } from "../lib/prompt-i18n";
-import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction, settings } from "../lib/settings";
+import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction, resolveEffectiveModel, settings } from "../lib/settings";
 import {
 	deleteAvatarImage,
 	deleteUploadedImage,
@@ -169,7 +170,6 @@ import {
 	narratorExportQuerySchema,
 	narratorGrantCreateSchema,
 	narratorGrantUpdateSchema,
-	narratorTransferOwnerSchema,
 	narratorVisibilitySchema,
 	narratorWriteAudienceSchema,
 	permissionDecisionSchema,
@@ -198,10 +198,15 @@ import {
 	applyRevertPlanSchema,
 	createRevertActionPreviewSchema,
 	createRevertPlanSchema,
+	optimizePromptSchema,
 	revertPlanFilesQuerySchema,
 	revertPlanIdSchema,
 } from "../lib/validators/narrators";
 import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
+import {
+	type PromptOptimizeStyle,
+	getPromptOptimizeInstruction,
+} from "../lib/prompts/prompt-optimize";
 import { requireAdmin } from "../middleware/auth";
 import { isExecutionSuspended } from "../services/agent-runtime/ownership";
 import { generateAskUserQuestionAnswers } from "../services/ask-user-question-reflection";
@@ -371,7 +376,6 @@ import {
 	revokeNarratorGrant,
 	setNarratorVisibility,
 	setNarratorWriteAudience,
-	transferNarratorOwner,
 	updateNarratorGrant,
 } from "../services/narrator-sharing";
 import {
@@ -1475,13 +1479,92 @@ narratorRoutes.delete("/:id/grants/:grantId", async (c) => {
 	return c.json({ ok: true });
 });
 
-narratorRoutes.post("/:id/transfer-owner", async (c) => {
-	const parsed = narratorTransferOwnerSchema.safeParse(await c.req.json().catch(() => ({})));
-	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return c.json(
-		await transferNarratorOwner(c.req.param("id"), parsed.data.userId, narratorPrincipalOf(c)),
-	);
+/**
+ * POST /:id/optimize-prompt — Optimize user's prompt text using configured model
+ */
+narratorRoutes.post("/:id/optimize-prompt", async (c) => {
+	const narratorId = c.req.param("id");
+	const userId = c.get("user").sub;
+
+	// ACL: narrator must exist and user must have access
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+	});
+	if (!narrator) throw new NotFoundError("Narrator", narratorId);
+	await requireAccessToNarratorRow(c, narrator, "read");
+
+	// Parse and validate input
+	const body = await c.req.json();
+	const { text, style, withContext, messageId } = optimizePromptSchema.parse(body);
+
+	// Get system instruction for the chosen style
+	const locale = await getUserLanguage(userId);
+	const systemInstruction = getPromptOptimizeInstruction(style as PromptOptimizeStyle, locale);
+
+	// Load context if requested
+	let contextText = "";
+	if (withContext) {
+		const { loadRecentMessages, formatMessagesAsContext, getMaxContextMessages } = await import(
+			"../lib/prompts/prompt-optimize-context"
+		);
+		const maxMessages = getMaxContextMessages();
+		const contextMessages = await loadRecentMessages(narratorId, messageId, maxMessages);
+		contextText = formatMessagesAsContext(contextMessages);
+	}
+
+	// Tag the user's text to prevent prompt injection
+	const taggedContent = contextText
+		? `${contextText}\n\n---\n\n<prompt>\n${text}\n</prompt>`
+		: `<prompt>\n${text}\n</prompt>`;
+
+	// Resolve the model (default follows summaryModel via __summary__)
+	const model = resolveEffectiveModel(settings.agent.promptOptimizeModel);
+
+	// Call LLM with 30s timeout
+	const signal = AbortSignal.timeout(30000);
+	let result: string;
+	try {
+		const generated = await summaryGenerate(
+			taggedContent,
+			systemInstruction,
+			{ narratorId, kind: "optimize" },
+			signal,
+			undefined,
+			model, // modelOverride parameter
+		);
+		result = generated.text;
+	} catch (err) {
+		if ((err as Error).name === "AbortError" || (err as Error).name === "TimeoutError") {
+			throw new ValidationError("Optimization timed out after 30 seconds");
+		}
+		throw err;
+	}
+
+	// Post-process: trim, remove wrapping quotes/code fences
+	result = result.trim();
+	// Remove wrapping quotes
+	if (
+		(result.startsWith('"') && result.endsWith('"')) ||
+		(result.startsWith("'") && result.endsWith("'"))
+	) {
+		result = result.slice(1, -1).trim();
+	}
+	// Remove code fences
+	if (result.startsWith("```") && result.endsWith("```")) {
+		const lines = result.split("\n");
+		if (lines.length > 2) {
+			result = lines.slice(1, -1).join("\n").trim();
+		}
+	}
+
+	// Fallback to original if result is empty
+	if (!result) {
+		result = text;
+	}
+
+	return c.json({ text: result, model });
 });
+
 
 // Get usage stats for this narrator, optionally including direct subagents.
 narratorRoutes.get("/:id/usage-stats", async (c) => {

@@ -48,6 +48,8 @@ export interface InstanceSettingsState {
 	permissionMode: string;
 	summaryModel: string;
 	translationModel: string;
+	promptOptimizeModel: string;
+	promptOptimizeContextMaxMessages: number;
 	maxTurns: number;
 	subagentExploreModel: string;
 	subagentPlanModel: string;
@@ -167,6 +169,8 @@ function makeDefaults(): InstanceSettingsState {
 		permissionMode: "acceptEdits",
 		summaryModel: "",
 		translationModel: "__summary__",
+		promptOptimizeModel: "__summary__",
+		promptOptimizeContextMaxMessages: 3,
 		maxTurns: 1000,
 		subagentExploreModel: "",
 		subagentPlanModel: "",
@@ -274,6 +278,10 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				translationModel: settings.agent?.translationModel?.startsWith("__")
 					? settings.agent.translationModel
 					: ensurePrefix(settings.agent?.translationModel ?? "__summary__"),
+				promptOptimizeModel: settings.agent?.promptOptimizeModel?.startsWith("__")
+					? settings.agent.promptOptimizeModel
+					: ensurePrefix(settings.agent?.promptOptimizeModel ?? "__summary__"),
+				promptOptimizeContextMaxMessages: settings.agent?.promptOptimizeContextMaxMessages ?? 3,
 				maxTurns: settings.agent?.maxTurns ?? 1000,
 				subagentExploreModel: ensurePrefix(settings.agent?.subagentModels?.explore ?? ""),
 				subagentPlanModel: ensurePrefix(settings.agent?.subagentModels?.plan ?? ""),
@@ -403,6 +411,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					defaultPermissionMode: state.permissionMode,
 					summaryModel: state.summaryModel,
 					translationModel: state.translationModel,
+					promptOptimizeModel: state.promptOptimizeModel,
+					promptOptimizeContextMaxMessages: state.promptOptimizeContextMaxMessages,
 					maxTurns: state.maxTurns,
 					subagentModels: {
 						explore: state.subagentExploreModel,

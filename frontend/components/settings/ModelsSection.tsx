@@ -1,5 +1,5 @@
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
-import { Button, MultiSelect, Select, Stack, Text } from "@mantine/core";
+import { Button, MultiSelect, NumberInput, Select, Stack, Text } from "@mantine/core";
 import {
 	isSubagentReasoningEffort,
 	SUBAGENT_POOL_TYPES,
@@ -63,6 +63,10 @@ export interface ModelsSectionProps {
 	setSummaryModel: (v: string) => void;
 	translationModel: string;
 	setTranslationModel: (v: string) => void;
+	promptOptimizeModel: string;
+	setPromptOptimizeModel: (v: string) => void;
+	promptOptimizeContextMaxMessages: number;
+	setPromptOptimizeContextMaxMessages: (v: number) => void;
 	subagentExploreModel: string;
 	setSubagentExploreModel: (v: string) => void;
 	subagentPlanModel: string;
@@ -90,6 +94,10 @@ export function ModelsSection({
 	setSummaryModel,
 	translationModel,
 	setTranslationModel,
+	promptOptimizeModel,
+	setPromptOptimizeModel,
+	promptOptimizeContextMaxMessages,
+	setPromptOptimizeContextMaxMessages,
 	subagentExploreModel,
 	setSubagentExploreModel,
 	subagentPlanModel,
@@ -236,6 +244,26 @@ export function ModelsSection({
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={translationModel}
 				onChange={(v) => setTranslationModel(v ?? FOLLOW_SUMMARY_MODEL)}
+			/>
+			<Select
+				label={t("promptOptimizeModel")}
+				description={t("promptOptimizeModelDesc")}
+				data={prefixedModels}
+				searchable
+				limit={MODEL_SELECT_OPTION_LIMIT}
+				value={promptOptimizeModel}
+				onChange={(v) => setPromptOptimizeModel(v ?? FOLLOW_SUMMARY_MODEL)}
+			/>
+			<NumberInput
+				label={t("promptOptimizeContextMaxMessages")}
+				description={t("promptOptimizeContextMaxMessagesDesc")}
+				value={promptOptimizeContextMaxMessages}
+				onChange={(v) => setPromptOptimizeContextMaxMessages(typeof v === "number" ? v : 10)}
+				min={1}
+				max={50}
+				step={1}
+				clampBehavior="strict"
+				allowDecimal={false}
 			/>
 			<Stack gap="xs">
 				<Text size="sm" fw={500}>

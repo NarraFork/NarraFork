@@ -1,10 +1,12 @@
-import { Box, Button, Group, Stack, Text, Textarea } from "@mantine/core";
+import { ActionIcon, Box, Button, Group, Stack, Text, Textarea, Tooltip } from "@mantine/core";
+import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import type { FileReference, FileReferenceCandidate } from "@shared/file-reference";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
 import { useQueryClient } from "@tanstack/react-query";
 import {
 	forwardRef,
+	type RefObject,
 	useCallback,
 	useEffect,
 	useImperativeHandle,
@@ -17,10 +19,13 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory, writeInputHistoryEntries } from "../../hooks/useInputHistory";
 import { useNamedNarrators } from "../../hooks/useNamedNarrator";
+import { usePromptOptimize } from "../../hooks/usePromptOptimize";
 import { ApiError, api } from "../../lib/api";
+import { narratorsApi } from "../../lib/api/narrators";
 import { formatLocaleNumber } from "../../lib/intl-format";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
+import { ComposerFullscreenModal } from "./ComposerFullscreenModal";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { FileReferencePopover } from "./FileReferencePopover";
 import { useFileReferenceScope } from "./FileReferenceScope";
@@ -45,6 +50,7 @@ import {
 	readNarratorInputDraft,
 	resolveHydratedNarratorDraft,
 } from "./narrator-draft-storage";
+import { TextareaOptimizeControls } from "./TextareaOptimizeControls";
 
 const INPUT_DRAFT_SYNC_DEBOUNCE_MS = 800;
 
@@ -106,23 +112,15 @@ export interface NarratorComposerHandle {
 
 export interface NarratorComposerProps {
 	narratorId: string;
-	/** Shared with the panel's send flow: draft sync must not fire mid-send. */
-	sendingRef: React.RefObject<boolean>;
-	/** External text-append bridge (e.g. "ask in passing" from a sibling panel). */
-	appendInputRef?: React.MutableRefObject<((text: string) => void) | null>;
-	/** True while a non-question pending permission owns the Enter key. */
+	sendingRef: RefObject<boolean>;
+	appendInputRef?: RefObject<((text: string) => void) | null>;
 	permEnterActive: boolean;
-	/** Panel-owned attachment counts, for the Enter-key sendability gate. */
 	hasAttachments: boolean;
-	/** Queue modes bound to Enter / Ctrl(Cmd)+Enter. */
-	enterMode: ComposerQueueMode;
-	ctrlEnterMode: ComposerQueueMode;
-	/** Panel send entry point; reads the text back via the handle. */
-	onSendWithMode: (mode: ComposerQueueMode) => void;
-	/** Fires only when the empty↔non-empty flag flips, never per keystroke. */
-	onTextFlagsChange: (hasText: boolean) => void;
-	/** Images pasted into the textarea; attachments are owned by the panel. */
-	onPasteImages: (files: File[]) => void;
+	enterMode: "turn" | "tool" | "interrupt";
+	ctrlEnterMode: "turn" | "tool" | "interrupt";
+	onSendWithMode: (mode: "turn" | "tool" | "interrupt") => void | Promise<void>;
+	onTextFlagsChange: (has: boolean) => void;
+	onPasteImages?: (files: File[]) => void;
 }
 
 /**
@@ -170,6 +168,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						fileScope.context.cwd,
 					])
 				: null;
+
+		// Fullscreen modal state
+		const [fullscreenOpened, { open: openFullscreen, close: closeFullscreen }] =
+			useDisclosure(false);
 
 		// Text and reference occurrences have one source of truth, local to this subtree.
 		const [inputState, setInputState] = useState<FileReferenceInput>({
@@ -250,6 +252,17 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			},
 			[applyInput, fileCacheScope, t],
 		);
+
+		// Prompt optimization hook
+		const optimizeHook = usePromptOptimize({
+			narratorId,
+			textareaRef,
+			onOptimized: (text) => {
+				// Fallback: if execCommand fails, update state directly
+				setText(text);
+			},
+		});
+
 		useEffect(() => {
 			if (!currentUserId || !draftHydrated || sendingRef.current) return;
 			persistNarratorInputDraft(
@@ -793,7 +806,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				}
 			}
 			if (imageFiles.length > 0) {
-				onPasteImages(imageFiles);
+				onPasteImages?.(imageFiles);
 			}
 		};
 
@@ -1080,6 +1093,37 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					autosize
 					minRows={1}
 					maxRows={6}
+					rightSection={
+						<TextareaOptimizeControls
+							disabled={!input.trim() || optimizeHook.loading}
+							loading={optimizeHook.loading}
+							withContext={optimizeHook.withContext}
+							onToggleContext={optimizeHook.toggleContext}
+							onOptimize={optimizeHook.handleOptimize}
+							onExpand={openFullscreen}
+							contextMessageCount={optimizeHook.contextMessageCount}
+							onContextMessageCountChange={optimizeHook.setContextMessageCount}
+						/>
+					}
+					rightSectionWidth="auto"
+					styles={{
+						section: {
+							alignItems: "center",
+							paddingRight: 8,
+						},
+					}}
+				/>
+				<ComposerFullscreenModal
+					opened={fullscreenOpened}
+					onClose={closeFullscreen}
+					initialText={input}
+					onSubmit={(text) => {
+						setText(text);
+						closeFullscreen();
+						requestAnimationFrame(() => textareaRef.current?.focus());
+					}}
+					optimizeHook={optimizeHook}
+					narratorId={narratorId}
 				/>
 			</Box>
 		);

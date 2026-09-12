@@ -558,6 +558,10 @@ export function purgeStaleAgentModelRefs(
 		settings.agent.translationModel = "__summary__";
 		dirty = true;
 	}
+	if (isStale(settings.agent.promptOptimizeModel)) {
+		settings.agent.promptOptimizeModel = "__summary__";
+		dirty = true;
+	}
 	for (const key of ["explore", "plan", "search", "review"] as const) {
 		if (isStale(settings.agent.subagentModels[key])) {
 			settings.agent.subagentModels[key] = "";

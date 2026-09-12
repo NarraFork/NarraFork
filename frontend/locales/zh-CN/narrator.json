@@ -1720,5 +1720,27 @@
 		"permission": "工具权限",
 		"plan_approval": "计划审批",
 		"reflection": "反思 · 已转人工"
-	}
+	},
+	"optimizePrompt": "优化提示词",
+	"optimizeStyleLabel": "选择优化风格",
+	"optimizeStyleClarify": "更详细",
+	"optimizeStyleConcise": "更简洁",
+	"optimizeStyleStructured": "更结构化",
+	"optimizeStyleTranslateEn": "翻译成英文",
+	"optimizeWithContext": "包含上下文",
+	"optimizeWithContextHint": "传入对话历史优化效果更好，但消耗更多 token",
+	"optimizeWithContextHintEnabled": "将包含最近 {{count}} 条消息作为上下文（约 2000-10000 tokens）",
+	"optimizeContextMessageCount": "上下文消息数量",
+	"optimizeContextMessageCountHint": "范围 1-50，更多上下文提升效果但消耗更多 token",
+	"optimizeSuccess": "提示词已优化",
+	"optimizeUndo": "撤销",
+	"optimizeFailed": "优化失败",
+	"optimizeFailedGeneric": "优化提示词时发生错误",
+	"optimizeTimeout": "优化请求超时",
+	"optimizeNoContext": "没有可用的上下文消息",
+	"fullscreenComposerTitle": "撰写消息",
+	"fullscreenComposerPlaceholder": "在此输入消息...",
+	"fullscreenStats": "{{chars}} 字符 · {{lines}} 行 · {{words}} 词",
+	"fullscreenHint": "Ctrl+Enter 应用 · Esc 取消",
+	"expandComposer": "全屏编辑"
 }

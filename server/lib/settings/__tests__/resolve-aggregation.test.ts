@@ -117,6 +117,25 @@ describe("resolveAggregation", () => {
 		expect(draft.agent.translationModel).toBe("__summary__");
 	});
 
+	test("prompt optimize model defaults to dynamically following the summary model", () => {
+		expect(DEFAULTS.agent.promptOptimizeModel).toBe("__summary__");
+		settings.agent.defaultModel = "provDefault:model";
+		settings.agent.summaryModel = "provSummary:model";
+
+		expect(resolveEffectiveModel(DEFAULTS.agent.promptOptimizeModel)).toBe("provSummary:model");
+		settings.agent.summaryModel = "provNext:model";
+		expect(resolveEffectiveModel(DEFAULTS.agent.promptOptimizeModel)).toBe("provNext:model");
+		expect(resolveEffectiveModel("provOptimize:model")).toBe("provOptimize:model");
+	});
+
+	test("stale prompt optimize model falls back to following the summary model", () => {
+		const draft = structuredClone(DEFAULTS);
+		draft.agent.promptOptimizeModel = "removed:model";
+
+		expect(purgeStaleAgentModelRefs(draft, (prefix) => prefix === "removed")).toBe(true);
+		expect(draft.agent.promptOptimizeModel).toBe("__summary__");
+	});
+
 	test("purging a stale summary model logs the previous value and prefix", async () => {
 		const { logger } = await import("../../logger");
 		const warnCalls: Array<Record<string, unknown> | undefined> = [];

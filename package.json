@@ -124,7 +124,7 @@
 		"check": "bunx @biomejs/biome check .",
 		"db:generate": "bunx drizzle-kit generate",
 		"db:migrate": "bun server/db/migrate.ts",
-		"dev": "bun run db:migrate; PORT=7779 bun run --hot server/index.ts",
+		"dev": "bun run db:migrate; PORT=7780 bun run --hot server/index.ts",
 		"dev:all": "bun server/dev-all.ts",
 		"dev:cold": "bun server/dev-all.ts --cold",
 		"dev:ts": "bun server/dev-all.ts",

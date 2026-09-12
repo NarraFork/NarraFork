@@ -1900,4 +1900,27 @@ export const narratorsApi = {
 			method: "POST",
 			body: JSON.stringify({ userId }),
 		}),
+
+	// ── Prompt optimization ────────────────────────────────────────────────────
+
+	optimizePrompt: (
+		narratorId: string,
+		text: string,
+		style: "clarify" | "concise" | "structured" | "translate_en",
+		options?: {
+			withContext?: boolean;
+			messageId?: string;
+			signal?: AbortSignal;
+		},
+	) =>
+		request<{ text: string; model: string }>(`/narrators/${narratorId}/optimize-prompt`, {
+			method: "POST",
+			body: JSON.stringify({
+				text,
+				style,
+				withContext: options?.withContext,
+				messageId: options?.messageId,
+			}),
+			signal: options?.signal,
+		}),
 };
