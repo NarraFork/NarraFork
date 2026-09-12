@@ -315,6 +315,154 @@ describe("M0 complete operation coverage", () => {
 		await expectRefused(f, "no_boundaries");
 	});
 
+	test("a system / user injection window has nothing to roll back", async () => {
+		const f = await fixture();
+		const now = new Date().toISOString();
+		for (const [id, role, seq] of [
+			["sys1", "sys", 1],
+			["user1", "user", 2],
+		] as const) {
+			await db.insert(narratorMessages).values({
+				id,
+				narratorId: f.narratorId,
+				role,
+				contentJson: [{ type: "text", text: role }],
+				createdAt: now,
+			});
+			await db.insert(narratorMessageRefs).values({
+				id: generateId(),
+				narratorId: f.narratorId,
+				messageId: id,
+				seq,
+			});
+		}
+		expect(await revertNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
+			reverted: false,
+			fileCount: 0,
+			failures: [],
+		});
+		expect(await previewNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
+			available: true,
+			reason: "nothing_owned",
+		});
+		expect(await revertNarratorScopedForMessages(f.narratorId, ["sys1", "user1"])).toMatchObject({
+			failures: [],
+		});
+	});
+
+	test("system / user cards in a mixed window do not veto file-rollback coverage", async () => {
+		const f = await fixture();
+		writeFileSync(join(f.repo, "a.txt"), "base\n");
+		const write = await call(f, () => writeFileSync(join(f.repo, "a.txt"), "changed\n"));
+		const now = new Date().toISOString();
+		for (const [id, role, seq] of [
+			["sys-card", "sys", 2],
+			["user-card", "user", 3],
+			["disp-card", "disp", 4],
+		] as const) {
+			await db.insert(narratorMessages).values({
+				id,
+				narratorId: f.narratorId,
+				role,
+				contentJson: [{ type: "system_injection", source: "interrupt_task_guard" }],
+				createdAt: now,
+			});
+			await db.insert(narratorMessageRefs).values({
+				id: generateId(),
+				narratorId: f.narratorId,
+				messageId: id,
+				seq,
+			});
+		}
+		// The write is still legacy; leftover cards must not rewrite that into unknown coverage.
+		await expectRefused(f, "legacy_unverified");
+		expect(
+			(
+				await revertNarratorScopedForMessages(f.narratorId, [
+					write.messageId,
+					"sys-card",
+					"user-card",
+				])
+			).failures[0]?.message,
+		).toContain("legacy_unverified");
+		expect(await previewNarratorScopedFromSeq(f.narratorId, 2)).toMatchObject({
+			available: true,
+			reason: "nothing_owned",
+		});
+		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("changed\n");
+	});
+
+	test("a leftover window past the operation-row budget is too large, not a no-op", async () => {
+		const f = await fixture();
+		const now = new Date().toISOString();
+		const messages = Array.from({ length: 1001 }, (_, index) => {
+			const seq = index + 1;
+			return {
+				id: `sys-${seq}`,
+				narratorId: f.narratorId,
+				role: "sys" as const,
+				contentJson: [{ type: "text", text: "injection" }],
+				createdAt: now,
+			};
+		});
+		const refs = messages.map((message, index) => ({
+			id: generateId(),
+			narratorId: f.narratorId,
+			messageId: message.id,
+			seq: index + 1,
+		}));
+		for (let i = 0; i < messages.length; i += 50) {
+			await db.insert(narratorMessages).values(messages.slice(i, i + 50));
+			await db.insert(narratorMessageRefs).values(refs.slice(i, i + 50));
+		}
+		await expectRefused(f, "window_too_large");
+	});
+
+	test("a leftover assistant without tool calls still refuses a mixed window", async () => {
+		const f = await fixture();
+		writeFileSync(join(f.repo, "a.txt"), "base\n");
+		const write = await call(f, () => writeFileSync(join(f.repo, "a.txt"), "changed\n"));
+		const now = new Date().toISOString();
+		await db.insert(narratorMessages).values({
+			id: "assistant-gap",
+			narratorId: f.narratorId,
+			role: "assistant",
+			contentJson: [{ type: "text", text: "no recorded calls" }],
+			createdAt: now,
+		});
+		await db.insert(narratorMessageRefs).values({
+			id: generateId(),
+			narratorId: f.narratorId,
+			messageId: "assistant-gap",
+			seq: 2,
+		});
+		await expectRefused(f, "incomplete_coverage");
+		expect(
+			(await revertNarratorScopedForMessages(f.narratorId, [write.messageId, "assistant-gap"]))
+				.failures[0]?.message,
+		).toContain("incomplete_coverage");
+		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("changed\n");
+	});
+
+	test("an assistant row without tool calls is still unknown coverage", async () => {
+		const f = await fixture();
+		const now = new Date().toISOString();
+		await db.insert(narratorMessages).values({
+			id: "a1",
+			narratorId: f.narratorId,
+			role: "assistant",
+			contentJson: [{ type: "text", text: "partial" }],
+			createdAt: now,
+		});
+		await db.insert(narratorMessageRefs).values({
+			id: generateId(),
+			narratorId: f.narratorId,
+			messageId: "a1",
+			seq: 1,
+		});
+		await expectRefused(f, "incomplete_coverage");
+	});
+
 	test("the operation cap includes unsuccessful calls with no hashes", async () => {
 		const f = await fixture();
 		const first = await call(f, () => {}, { toolName: "Read", capture: "none" });

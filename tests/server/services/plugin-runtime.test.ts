@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { join } from "node:path";
 import type { JsonRpcEnvelope } from "../../../server/lib/plugins/protocol";
 import {
@@ -301,6 +301,38 @@ describe("ContentLengthFrameParser", () => {
 });
 
 describe("LocalProcessRunner", () => {
+	it("encodes once and limits UTF-8 body bytes without counting headers", async () => {
+		const message: JsonRpcEnvelope = { jsonrpc: "2.0", method: "bytes", params: "中文" };
+		const bodyBytes = encoder.encode(JSON.stringify(message)).byteLength;
+		const raw = makeRawProcess();
+		const runner = new LocalProcessRunner({
+			spawn: () => raw.process,
+			maxOutboundBodyBytes: bodyBytes,
+			allowUnboundedResourceUsage: true,
+		});
+		const handle = await runner.start({ command: ["fixture"], cwd: fixtureCwd });
+		try {
+			const stringify = spyOn(JSON, "stringify");
+			try {
+				await handle.send(message);
+				expect(stringify).toHaveBeenCalledTimes(1);
+			} finally {
+				stringify.mockRestore();
+			}
+			expect(raw.writes).toEqual([message]);
+			await expect(handle.send({ ...message, params: "中文a" })).rejects.toMatchObject({
+				code: "OUTBOUND_FRAME_LIMIT",
+			});
+			const invalid = { jsonrpc: "2.0", method: "bytes", params: Number.NaN } as JsonRpcEnvelope;
+			expect(() => encodeContentLengthFrame(invalid)).toThrow("invalid JSON-RPC");
+			expect(() => handle.send(invalid)).toThrow("invalid JSON-RPC");
+			expect(raw.writes).toHaveLength(1);
+		} finally {
+			handle.kill();
+			await handle.exited;
+		}
+	});
+
 	it("uses argument arrays, controlled cwd and an environment allowlist", async () => {
 		let captured:
 			| {

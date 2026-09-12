@@ -754,6 +754,79 @@ describe("classifyToolDetail — agent/generic", () => {
 	});
 });
 
+describe("protocol receipts stay out of displayed tool output", () => {
+	it.each([
+		"<subagent_id>worker</subagent_id>\n\nStill running",
+		"Agent worker status: completed\n\n<subagent_id>worker</subagent_id>\n\n# Result\nDone",
+	])("unwraps agent await addressing without losing status or results", (text) => {
+		const d = classifyToolDetail({
+			previewId: "protocol-await",
+			toolName: "Await",
+			category: "await",
+			inputJson: { type: "agent", id: "worker" },
+			outputJson: { _text: text },
+			metadata: { subagentId: "real-id" },
+		});
+		const body = sectionBody(d, "result") as ToolCappedDetail;
+		expect(body.text).not.toContain("<subagent_id>");
+		expect(body.text).toContain(
+			text.includes("Still running") ? "Still running" : "# Result\nDone",
+		);
+		expect(metaTexts(d)).toContain("subagent: real-id");
+	});
+
+	it("does not strip tags quoted in reports or shell stdout", () => {
+		const text = "Example:\n```xml\n<subagent_id>example</subagent_id>\n```";
+		for (const type of ["agent", "bash"]) {
+			const d = classifyToolDetail({
+				previewId: "quoted-protocol",
+				toolName: "Await",
+				category: "await",
+				inputJson: { type },
+				outputJson: text,
+			});
+			expect((sectionBody(d, type === "bash" ? "output" : "result") as ToolCappedDetail).text).toBe(
+				text,
+			);
+		}
+	});
+
+	it("renders a localized background Bash receipt instead of XML and instructions", () => {
+		const d = classifyToolDetail({
+			previewId: "background-bash",
+			toolName: "Bash",
+			category: "bash",
+			status: "success",
+			inputJson: { command: "bun test", run_in_background: true },
+			outputJson: {
+				_text:
+					"<background_task_id>tests</background_task_id>\n\nBackground bash task started. Use Await...",
+			},
+			labels: { backgroundTaskStarted: "已在后台启动" },
+		});
+		expect(metaBadgeLabels(d)).toContain("tests");
+		expect(metaTexts(d)).toContain("已在后台启动");
+		expect(asSections(d).sections.some((part) => part.key === "output.main")).toBe(false);
+		expect((sectionBody(d, "command") as ToolCappedDetail).text).toBe("$ bun test");
+	});
+
+	it.each([
+		false,
+		true,
+	])("preserves shell stdout and launch errors (background=%s)", (background) => {
+		const text = "<background_task_id>example</background_task_id>\nlaunch error";
+		const d = classifyToolDetail({
+			previewId: "shell-protocol",
+			toolName: "Bash",
+			category: "bash",
+			status: background ? "fail" : "success",
+			inputJson: { command: "example", run_in_background: background },
+			outputJson: text,
+		});
+		expect((sectionBody(d, "output") as ToolCappedDetail).text).toBe(text);
+	});
+});
+
 describe("classifyToolDetail — await", () => {
 	it("uses a term-capped output section for bash await", () => {
 		const d = classifyToolDetail({

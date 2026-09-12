@@ -525,7 +525,7 @@ export async function detachSubagent(subagentId: string): Promise<boolean> {
 	const resultPrefix = `<background_task_id>${setup.alias}</background_task_id>\n\n`;
 	entry.publishHandoff(
 		resultPrefix +
-			`Subagent detached to background. Use Await({ type: "agent", id: "${setup.alias}" }) to get results, or Send({ id: "${setup.alias}", message }) to continue.`,
+			`Subagent detached to background. Await({ type: "agent", id: "${setup.alias}" })`,
 	);
 
 	eventBus.emit({
@@ -621,8 +621,7 @@ export async function attachSubagent(
 		const label = await resolveAgentLabel(parentNarratorId, subagentId);
 		return (
 			`<background_task_id>${label}</background_task_id>\n\n` +
-			`Attach interrupted. The subagent is still running in background. Use Await({ type: "agent", ` +
-			`id: "${label}" }) to get results or Send({ id: "${label}", message }) to continue it.`
+			`Attach interrupted; subagent still running in background. Await({ type: "agent", id: "${label}" })`
 		);
 	}
 

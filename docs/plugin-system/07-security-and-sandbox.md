@@ -166,7 +166,7 @@ effectiveCapabilities =
 >
 > 强制 allowlist 需要 Linux network namespace（netns + iptables owner-match）或 Podman runner 的 `--network` 隔离。这是独立的大型工程，不应依赖当前字段的存在而假设已有强制。
 >
-> 代理 URL 的 SSRF 缓解已在 `plugin-provider-proxy-policy.ts` 中实现（拒绝私有/保留地址，可通过 `settings.plugins.allowPrivateProxyTarget` 放行），但这只覆盖宿主主动推送给插件的代理配置，不限制插件自身的出站能力。
+> `plugin-provider-proxy-policy.ts` 仅校验代理 URL 格式与协议。代理来自用户配置的提供商覆盖或全局代理策略（包括显式选择的系统代理），因此直接沿用 LAN/本机代理，无需额外开启插件专用开关。这不是对不可信请求目标的 SSRF 校验，也不限制插件自身的出站能力；真正的网络隔离仍需 runner 沙箱实现。
 
 ### 6.1 默认策略
 

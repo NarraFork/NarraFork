@@ -30,6 +30,13 @@
  *     This surfaces as a hard failure on an *old* session with no bad turn in sight, and
  *     no amount of retrying or model switching within the channel clears it.
  *
+ *  3. **Too long.** Some upstreams mint wire-safe but very long ids (observed with
+ *     grok-4.6 behind an OpenAI-compatible proxy: 82 characters). The originating
+ *     channel accepts them, but the OpenAI Responses API caps `call_id` at 64 chars
+ *     and rejects the replayed history on the first turn after a channel switch:
+ *
+ *       `Invalid 'input[384].call_id': string too long. Expected maximum length 64`
+ *
  * Both are fixed at the two points where history is assembled:
  *
  *  - {@link uniquifyDbMessageToolUseIds} — rebuilds from DB rows (`buildHistory`). Runs on
@@ -54,6 +61,16 @@ import type { AgentToolUse } from "./types";
 const MAX_GENERATED_ID_CHARS = 56;
 /** Marker that makes a rewritten id recognizable in dumps and logs. */
 const RENAME_MARKER = "_nfdup";
+/**
+ * Maximum identifier length any routed-to API accepts on the wire.
+ *
+ * The OpenAI Responses API rejects `call_id` longer than 64 characters; other
+ * channels accept more, but a stored id must satisfy the strictest channel the
+ * session may later be switched to, so 64 is the ceiling for replayed history.
+ */
+const MAX_WIRE_ID_CHARS = 64;
+/** Marker for ids rewritten purely because of length. */
+const LENGTH_RENAME_MARKER = "_nfh";
 /** How many sequential suffixes to probe before falling back to a random tail. */
 const MAX_SEQUENTIAL_PROBES = 64;
 /**
@@ -100,23 +117,51 @@ const WIRE_SAFE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 /** Whether an identifier can be replayed to every channel as-is. */
 export function isWireSafeToolUseId(id: string): boolean {
-	return WIRE_SAFE_ID_PATTERN.test(id);
+	return id.length <= MAX_WIRE_ID_CHARS && WIRE_SAFE_ID_PATTERN.test(id);
 }
 
 /**
- * Coerce an identifier into the wire-safe character set.
+ * Deterministic short hash for length-truncated identifiers.
+ *
+ * Synchronous by design: this runs inside history rebuild on the server's only JS
+ * thread, so `crypto.subtle` (async) is not an option. FNV-1a is not collision-proof
+ * across adversarial inputs, but the result is only a disambiguation suffix — the
+ * caller still runs the renamed id through the uniqueness allocator, so a collision
+ * degrades to one extra rename, never a broken pairing.
+ */
+function fnv1aSuffix(value: string): string {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < value.length; i++) {
+		hash ^= value.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193);
+	}
+	return (hash >>> 0).toString(36).padStart(7, "0");
+}
+
+/**
+ * Coerce an identifier into the wire-safe character set and length bound.
  *
  * Pure and deterministic: the same upstream id always yields the same replacement, so an
  * id rewritten during one history rebuild keeps the same replacement on every later
  * rebuild. That stability is what lets the DB keep the original id — nothing has to
  * remember the mapping.
  *
+ * Over-length ids keep a recognizable head and gain a hash suffix over the *original*
+ * id, so two distinct long ids sharing a prefix do not truncate to the same string
+ * (and if the hashes still collide, the uniqueness allocator resolves it).
+ *
  * Does NOT consider uniqueness; callers combine it with {@link allocateUniqueToolUseId}.
  */
 export function toWireSafeToolUseId(rawId: string): string {
-	if (isWireSafeToolUseId(rawId)) return rawId;
-	const cleaned = rawId.replace(/[^A-Za-z0-9_-]/g, "_");
-	return cleaned.length > 0 ? cleaned : "tool";
+	let cleaned = rawId;
+	if (!WIRE_SAFE_ID_PATTERN.test(cleaned)) {
+		cleaned = cleaned.replace(/[^A-Za-z0-9_-]/g, "_");
+		if (cleaned.length === 0) cleaned = "tool";
+	}
+	if (cleaned.length <= MAX_WIRE_ID_CHARS) return cleaned;
+	const suffix = `${LENGTH_RENAME_MARKER}${fnv1aSuffix(rawId)}`;
+	const head = cleaned.slice(0, MAX_WIRE_ID_CHARS - suffix.length);
+	return `${head}${suffix}`;
 }
 
 /** Strip characters that some gateways reject in tool identifiers. */

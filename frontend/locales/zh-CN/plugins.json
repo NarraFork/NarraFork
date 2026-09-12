@@ -184,9 +184,15 @@
 				"pendingUpgradeHint": "更新声明了本安装从未授权过的能力。在你批准前这些能力不可用；此前已授权的能力照常工作。",
 				"pendingSourceUpgrade": "更新新增",
 				"pendingSourceUpgradeVersion": "{{version}} 新增",
+				"pendingSourceRuntime": "运行时请求",
 				"ungrantedTitle": "尚未授权",
 				"ungrantedEmpty": "manifest 声明的能力均已授权。",
-				"ungrantedGrant": "授权"
+				"ungrantedGrant": "授权",
+				"statusGranted": "已授权",
+				"statusManifest": "Manifest 声明",
+				"highRisk": {
+					"highRiskNetworkEgressAllowlist": "此能力允许插件发起出站网络请求，包括 LAN 地址、回环地址及链路本地地址（link-local）。若允许列表包含宽泛的 CIDR 范围（如 0.0.0.0/0、192.168.0.0/16），可能使插件访问内网服务或云元数据接口（如 169.254.169.254），进而通过代理泄露内部凭据或数据。批准前请仔细核查允许列表。"
+				}
 			},
 			"diagnostics": {
 				"title": "诊断",

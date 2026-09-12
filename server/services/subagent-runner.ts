@@ -85,12 +85,13 @@ import { tryAcquireFinalUpdateExecution, type UpdateExecutionLease } from "./upd
 /** Default wall-clock execution time for background Agent tasks (5 hours). */
 export const BACKGROUND_TASK_TIMEOUT_MS = 5 * 60 * 60 * 1000;
 
-const BACKGROUND_AGENT_STARTED_MESSAGE =
-	'Background task started. Use Await({ type: "agent", id }) with this ID to get results, or Send({ id, message }) to continue.';
-
 /** Stable Agent tool result emitted once a background runner is mounted. */
 export function buildBackgroundAgentStartOutput(taskIdOrAlias: string): string {
-	return `<background_task_id>${taskIdOrAlias}</background_task_id>\n\n${BACKGROUND_AGENT_STARTED_MESSAGE}`;
+	// update-recovery-service recognizes the exact "Background task started." sentence.
+	return (
+		`<background_task_id>${taskIdOrAlias}</background_task_id>\n\n` +
+		`Background task started. Await({ type: "agent", id: "${taskIdOrAlias}" })`
+	);
 }
 
 export type BackgroundCompletionOutcome = "completed" | "failed" | "timeout";

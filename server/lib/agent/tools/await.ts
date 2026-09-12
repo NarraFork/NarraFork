@@ -463,8 +463,8 @@ export function formatResult(taskId: string, status: string, output: string | nu
 		case "running":
 		case "timeout":
 			return (
-				`Background task ${taskId} is still running — the wait timed out but the task has not stopped. ` +
-				`Call Await again with the same id to keep waiting.` +
+				`Background task ${taskId} is still running — this wait timed out, not the task. ` +
+				`Await again with the same id.` +
 				(output ? `\n\nPartial output so far:\n${output}` : "")
 			);
 		case "completed":
@@ -483,8 +483,7 @@ export function formatResult(taskId: string, status: string, output: string | nu
 			);
 		case "aborted":
 			return (
-				`Await on background task ${taskId} was interrupted — only this wait was canceled, not the task. ` +
-				`It is still running in the background. Call Await again with the same id to keep waiting.` +
+				`Wait interrupted; background task ${taskId} is still running. Await again with the same id.` +
 				(output ? `\n\nPartial output so far:\n${output}` : "")
 			);
 		default:

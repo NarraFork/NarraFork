@@ -24,6 +24,7 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
+import { MarkdownListMarker } from "@frontend/components/common/MarkdownListMarker";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { MD_HEADING_SLUG_ATTR } from "@frontend/lib/markdown-anchor-scroll";
 import { Box } from "@mantine/core";
@@ -842,14 +843,7 @@ function InlineBlockView({
 					}}
 				/>
 			) : null}
-			{block.markerText != null && block.markerLeft != null ? (
-				<span
-					className={block.markerClassName ?? undefined}
-					style={{ position: "absolute", left: block.markerLeft, top: quoteContentTop }}
-				>
-					{block.markerText}
-				</span>
-			) : null}
+			<MarkdownListMarker block={block} top={quoteContentTop} />
 			{block.quoteRailLefts.map((railLeft, i) => (
 				<div
 					// biome-ignore lint/suspicious/noArrayIndexKey: rails are a stable ordered list

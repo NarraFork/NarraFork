@@ -411,7 +411,7 @@ function parseBlockTokens(tokens: readonly Token[], ctx: ParseContext): Prepared
 				// marked (gfm) unshifts a BLOCK-level checkbox token into a non-loose
 				// task item's tokens (loose items carry it inline instead — skipped in
 				// collectInlineLines). The box is already painted from item.task /
-				// item.checked as the list marker (☐/☑), so the token carries no
+				// item.checked as structured task-marker state, so the token carries no
 				// content of its own; the default fallback would print its raw "[ ] ".
 				continue;
 			case "paragraph": {
@@ -641,6 +641,12 @@ function buildListBlocks(token: Tokens.List, ctx: ParseContext): PreparedBlock[]
 		let itemBlocks = parseBlockTokens(item.tokens, itemCtx);
 		if (itemBlocks.length === 0) itemBlocks = buildPlainText(item.text, "body", itemCtx);
 		decorateListItem(itemBlocks, markerText(token, item, index), markerClassName(token, item));
+		if (item.task && itemBlocks[0]) {
+			itemBlocks[0] = {
+				...itemBlocks[0],
+				taskMarker: { checked: !!item.checked, label: item.text },
+			};
+		}
 		appendGroup(blocks, itemBlocks, 0);
 	}
 	return blocks;
@@ -680,7 +686,7 @@ function attachHeadingSlug(blocks: PreparedBlock[], slug: string): void {
 }
 
 function markerText(list: Tokens.List, item: Tokens.ListItem, index: number): string {
-	if (item.task) return item.checked ? "☑" : "☐";
+	if (item.task) return item.checked ? "[x]" : "[ ]";
 	if (list.ordered) {
 		const start = typeof list.start === "number" ? list.start : 1;
 		return `${start + index}.`;

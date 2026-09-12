@@ -35,6 +35,17 @@ export const FILE_CHANGE_LIMITS = Object.freeze({
 	remoteReceiptBytes: 64 * MIB,
 });
 
+/**
+ * Message roles that never persist tool calls or disk operations.
+ * Leftover sys/user/disp cards after an interrupt must not veto file coverage.
+ */
+export const NON_OPERATION_ROLES: ReadonlySet<string> = new Set([
+	"sys",
+	"disp",
+	"system",
+	"user",
+]);
+
 /** spec:// is deliberately not a disk-path flavor. */
 export type FileChangePathFlavor = "posix" | "windows";
 

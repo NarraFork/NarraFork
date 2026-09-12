@@ -170,8 +170,8 @@ export function appendSendReplyRequest(
 ): string {
 	const instruction =
 		locale === "zh-CN"
-			? `[请求回复 requestId=${requestId}] 请在有实质答复时调用 Send({ id: "${requesterId}", message: "<你的回复>", replyTo: "${requestId}" }) 回信。发送方等待的是你的 Send 回信，而不是等待你结束任务；不要仅为满足等待而中断当前工作。`
-			: `[Reply requested requestId=${requestId}] When you have a substantive response, reply with Send({ id: "${requesterId}", message: "<your reply>", replyTo: "${requestId}" }). The sender is waiting for your Send reply, not for your task to finish; do not interrupt ongoing work merely to satisfy the wait.`;
+			? `[请求回复 requestId=${requestId}] 有实质答复时调用 Send({ id: "${requesterId}", message: "<你的回复>", replyTo: "${requestId}" })。发送方等待的是你的 Send 回信，不是等待你结束任务；不要仅为满足等待而中断当前工作。`
+			: `[Reply requested requestId=${requestId}] Reply with Send({ id: "${requesterId}", message: "<your reply>", replyTo: "${requestId}" }). The sender is waiting for your Send reply, not for your task to finish; do not interrupt ongoing work.`;
 	return `${message}\n\n${instruction}`;
 }
 
@@ -687,17 +687,15 @@ export function formatAgentAwaitResult(
 		case "aborted":
 			return (
 				`${tag}\n\n` +
-				`Await on agent ${label} was interrupted — only this wait was canceled, not the subagent. ` +
-				`The subagent is still running in the background. Call Await again with the same id to ` +
-				`keep waiting for its result.` +
+				`Wait interrupted; agent ${label} is still running. Await again with the same id.` +
 				(partial ? `\n\nPartial output so far:\n${partial}` : "")
 			);
 		case "running":
 		case "timeout":
 			return (
 				`${tag}\n\n` +
-				`Agent ${label} is still running — the wait timed out but the subagent has not stopped. ` +
-				`Call Await again with the same id and a meaningful timeout to keep waiting. ` +
+				`Agent ${label} is still running — this wait timed out, not the subagent. ` +
+				`Await again with the same id. ` +
 				`Do not send a progress check or interrupt it merely because this wait expired.` +
 				activitySection +
 				(partial ? `\n\nPartial output so far:\n${partial}` : "")
@@ -711,9 +709,7 @@ export function formatAgentAwaitResult(
 		case "taken_over":
 			return (
 				`${tag}\n\n` +
-				`Agent ${label} is being taken over by the user. The user is operating it directly; ` +
-				`its result will be returned only when the user stops the takeover. ` +
-				`Call Await again later with the same id to retrieve the final result.` +
+				`Agent ${label} is being taken over by the user. Await again after takeover ends.` +
 				(partial ? `\n\nOutput so far:\n${partial}` : "")
 			);
 		default:
@@ -1252,7 +1248,7 @@ async function sendSubagentMessageDetailedWithRun(
 						? `Failed to send to parent: ${delivered.error}`
 						: delivered.status === "started"
 							? "Sent to parent; its next eligible turn was scheduled."
-							: "Sent to parent; durable message queued for a safe input boundary. It may remain unread while the parent waits for tools.",
+							: "Sent to parent; queued at a safe input boundary (reading not guaranteed).",
 				);
 				continue;
 			}

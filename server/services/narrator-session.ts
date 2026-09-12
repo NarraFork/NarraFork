@@ -6843,6 +6843,7 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 		const effectiveModel = resolveEffectiveModel(active._modelRef, active.provider);
 		active.model = effectiveModel;
 		active.provider = resolveProvider(effectiveModel);
+		active._modelUnavailableWaitCancel?.();
 		active.reasoningEffort = resolveRuntimeReasoningEffort(
 			active.provider,
 			active.model,

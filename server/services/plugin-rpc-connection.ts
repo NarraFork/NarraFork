@@ -229,9 +229,17 @@ export class PluginPriorityWriter {
 		return this.closed;
 	}
 
-	enqueue(message: JsonRpcEnvelope, priority: RpcMessagePriority = "unary"): Promise<void> {
+	enqueue(
+		message: JsonRpcEnvelope,
+		priority: RpcMessagePriority = "unary",
+		/** Validated body size supplied by the connection; standalone writers measure it. */
+		bodyBytes?: number,
+	): Promise<void> {
 		if (this.closed) return Promise.reject(this.closeError ?? closedError());
-		const bytes = encodedFrameBytes(message);
+		const bytes =
+			bodyBytes === undefined
+				? encodedFrameBytes(message)
+				: framedBodyBytes(positiveInteger(bodyBytes, "bodyBytes"));
 		const ordinary = priority !== "control";
 		const byteLimit = ordinary
 			? this.maxQueuedBytes - this.controlReserveBytes
@@ -1028,7 +1036,7 @@ export class PluginRpcConnection {
 				},
 			);
 		}
-		await this.writer.enqueue(message, priority);
+		await this.writer.enqueue(parsed.data, priority, bodyBytes);
 	}
 
 	private resolveWaiters(message: JsonRpcEnvelope): void {

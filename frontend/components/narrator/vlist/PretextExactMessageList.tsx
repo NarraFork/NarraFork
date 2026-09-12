@@ -3927,8 +3927,13 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		//
 		// Derived BEFORE the layout because the set of rows hosting a live form decides
 		// which height overrides may still apply (see below).
+		const rowToolMetaIndex = useMemo(
+			() => buildToolMetaIndex(pretextDocument.messages as unknown as NarratorMsg[]),
+			[pretextDocument.messages],
+		);
 		const permissionSlotByKey = usePermissionSlots({
 			renderItems,
+			tools: rowToolMetaIndex,
 			permCb,
 			reflections: reflectionIndex,
 			asyncQuestions: permCb?.asyncQuestions,
@@ -5915,10 +5920,6 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		// `tc-`/`sa-` + that id. ONE index shared by every per-row consumer: the
 		// element interactions below, the trace-row interaction slot, and the
 		// drilled-in card's action bindings.
-		const rowToolMetaIndex = useMemo(
-			() => buildToolMetaIndex(pretextDocument.messages as unknown as NarratorMsg[]),
-			[pretextDocument.messages],
-		);
 		const interactionReuseRef = useRef<RowPayloadReuseState<RowInteraction> | null>(null);
 		const interactionsByKey = useMemo(() => {
 			// The closures below capture these; a change must rebuild every payload

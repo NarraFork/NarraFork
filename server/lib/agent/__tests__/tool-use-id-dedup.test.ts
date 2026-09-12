@@ -202,6 +202,19 @@ describe("uniquifyDbMessageToolUseIds", () => {
 		expect(build().flatMap(toolUseIdsOf)).toEqual(build().flatMap(toolUseIdsOf));
 	});
 
+	test("超长 ID 在 DB 重建路径中被截断，tool_use 块与 tool call 保持配对", () => {
+		// End-to-end over the buildHistory path: the Responses API's 64-char call_id
+		// ceiling must hold for the whole replayed history, not just freshly minted ids.
+		const longId = `call_${"g".repeat(78)}`;
+		const messages = [assistantMessage("m1", [longId])];
+		const result = uniquifyDbMessageToolUseIds(messages);
+		expect(result).not.toBe(messages);
+		const [rewrittenId] = toolUseIdsOf(result[0]);
+		expect(rewrittenId.length).toBeLessThanOrEqual(64);
+		expect(rewrittenId).toMatch(WIRE_PATTERN);
+		expect(contentToolUseIdsOf(result[0])).toEqual([rewrittenId]);
+	});
+
 	test("已合法的历史保持同一数组引用（无额外拷贝）", () => {
 		const messages = [assistantMessage("m1", ["toolu_01a-b_c"]), assistantMessage("m2", ["x"])];
 		expect(uniquifyDbMessageToolUseIds(messages)).toBe(messages);
@@ -231,6 +244,34 @@ describe("toWireSafeToolUseId", () => {
 	test("点号也被视为非法（NUG 通道不接受）", () => {
 		expect(isWireSafeToolUseId("call.1")).toBe(false);
 		expect(toWireSafeToolUseId("call.1")).toMatch(WIRE_PATTERN);
+	});
+
+	test("超长 ID 被确定性截断到 64 字符以内", () => {
+		// Observed with grok-4.6 behind an OpenAI-compatible proxy: 82-char call ids that
+		// the originating channel accepts but the Responses API (64-char ceiling) rejects
+		// on replay after a channel switch.
+		const longId = `call_${"a".repeat(77)}`;
+		expect(longId.length).toBe(82);
+		expect(isWireSafeToolUseId(longId)).toBe(false);
+		const rewritten = toWireSafeToolUseId(longId);
+		expect(rewritten.length).toBeLessThanOrEqual(64);
+		expect(rewritten).toMatch(WIRE_PATTERN);
+		expect(rewritten).toContain("_nfh");
+		// Deterministic: history rebuilds must produce the same replacement every time.
+		expect(toWireSafeToolUseId(longId)).toBe(rewritten);
+	});
+
+	test("共享前缀的两个超长 ID 截断后仍然不同", () => {
+		// Plain truncation would collapse these; the hash suffix keeps them apart.
+		const first = toWireSafeToolUseId(`call_${"a".repeat(76)}x`);
+		const second = toWireSafeToolUseId(`call_${"a".repeat(76)}y`);
+		expect(first).not.toBe(second);
+	});
+
+	test("恰好 64 字符的合法 ID 原样返回", () => {
+		const id = "c".repeat(64);
+		expect(isWireSafeToolUseId(id)).toBe(true);
+		expect(toWireSafeToolUseId(id)).toBe(id);
 	});
 });
 

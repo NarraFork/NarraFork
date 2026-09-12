@@ -273,3 +273,20 @@ Flash 的第二次分页查询使用了 5 次 Eval，仍处于预算边界；模
 **按用户最新指示：先完成收敛，再调用 AskUserQuestion，等待用户处理其他未提交改动并明确继续。当前没有开始修改生产代码，没有注册生产 Eval、迁移真实数据库或重启服务。** 后续正式切片计划保留，但不得因为本轮通过而自动启动。
 
 证据：[资格 manifest](results/2026-09-06T17-22-14-368Z-qualification-manifest.json) · [逐条结果与统计](results/2026-09-06T17-22-14-368Z-qualification-comparison.json) · [冻结输入](results/2026-09-06T17-22-14-368Z-qualification-inputs.json) · [源码快照](results/2026-09-06T17-22-14-368Z-qualification-sources.json) · [独立资格审计](results/2026-09-06T17-22-14-368Z-qualification-audit.json)。
+
+## 首个生产底座切片（2026-09-10）
+
+已开始正式 NarraFork 实施，但保持默认 Eval 入口关闭。新增底座位于 `server/lib/agent/programmatic/`：
+
+- `protocol.ts`：版本化、有界 JSON/错误/RunContext/预算协议；
+- `mailbox.ts`：请求/响应独立 SAB 槽、CAS 状态、序号、粘性关闭和 waitAsync；
+- `gateway.ts`：宿主身份绑定、只读方法目录、授权/审计、单在途调用、取消和 drained；
+- `vm-runtime.ts` / `bootstrap.ts`：隔离 VM 的同步对象、RPC、自然结束/显式交付和封存保护；
+- `wire.ts` / `podman-driver.ts`：有界 NDJSON、rootless Podman、无网络、只读根、无能力、禁用 mounts.conf 自动挂载、实际 inspect 白名单核验；
+- `service.ts`：隔离启动、宿主网关编排、容量、取消、迟到回调和清理状态。
+
+验证：底座定向测试 **261 pass / 11 skip / 0 fail**；真实固定镜像 Podman 集成测试 **10/10**。覆盖了异步只读宿主调用、授权拒绝、取消和不配合回调、资源额度保留、无限循环/Atomics.wait、输出上限、交付后调用、源码全局隔离、容器配置核验和资源回收。
+
+明确未启用：没有注册 Eval 工具，没有连接真实 tasks 数据库，没有开放 Bash/Write/Task 修改、任意 service/SQL、生产审批/UI/WS 或跨平台驱动；没有数据库迁移、提交、推送或重启服务。全仓类型检查仍被并行修改中的 [RenderToolCall.timing.test.tsx](../frontend/components/narrator/vlist/render/RenderToolCall.timing.test.tsx#L45) 阻断，本切片自身定向检查通过。
+
+这只是“生产同步执行底座已实现”的首切片，不是完整团队任务系统上线或生产启用许可。

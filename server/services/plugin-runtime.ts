@@ -351,11 +351,18 @@ function parseEnvelope(body: string): JsonRpcEnvelope {
 }
 
 export function encodeContentLengthFrame(envelope: JsonRpcEnvelope): Uint8Array {
+	return frameEncodedBody(encodeJsonRpcBody(envelope));
+}
+
+function encodeJsonRpcBody(envelope: JsonRpcEnvelope): Uint8Array {
 	const result = jsonRpcEnvelopeSchema.safeParse(envelope);
 	if (!result.success) {
 		throw new TypeError("Cannot encode an invalid JSON-RPC envelope");
 	}
-	const body = textEncoder.encode(JSON.stringify(result.data));
+	return textEncoder.encode(JSON.stringify(result.data));
+}
+
+function frameEncodedBody(body: Uint8Array): Uint8Array {
 	const header = textEncoder.encode(
 		`Content-Length: ${body.byteLength}\r\nContent-Type: application/json; charset=utf-8\r\n\r\n`,
 	);
@@ -618,7 +625,7 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 				}),
 			);
 		}
-		const bodyBytes = textEncoder.encode(JSON.stringify(message));
+		const bodyBytes = encodeJsonRpcBody(message);
 		if (bodyBytes.byteLength > this.maxOutboundFrameBytes) {
 			return Promise.reject(
 				new PluginRuntimeError("Outbound RPC frame exceeded the body limit", {
@@ -628,7 +635,7 @@ class LocalProcessHandleImpl implements PluginProcessHandle {
 				}),
 			);
 		}
-		const frame = encodeContentLengthFrame(message);
+		const frame = frameEncodedBody(bodyBytes);
 		this.writeQueue = this.writeQueue.then(async () => {
 			const writer = this.process.stdin as {
 				write?: (data: Uint8Array) => number | Promise<number> | undefined;

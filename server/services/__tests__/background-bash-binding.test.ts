@@ -459,8 +459,11 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			const binding = await seedCall();
 			const updateExecutionLease = lease();
 			const result = await bounded(run(context(binding, { updateExecutionLease })));
-			expect(result.output).toContain("<background_task_id>bind-bash</background_task_id>");
-			expect(result.output).toContain('Await({ type: "bash", id: "bind-bash" })');
+			expect(result.output).toBe(
+				`<background_task_id>bind-bash</background_task_id>\n\n` +
+					`Background bash task started: ${result.title}\n` +
+					'Await({ type: "bash", id: "bind-bash" })',
+			);
 			expect(result.isError).toBeFalsy();
 			expect(updateExecutionLease.transfer).toHaveBeenCalledTimes(1);
 			expect(updateExecutionLease.release).not.toHaveBeenCalled();
@@ -617,8 +620,11 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 			expect(
 				await backgroundTaskService.recoverStaleTasksAfterRestart(new Set(["bash-direct"])),
 			).toBe(1);
+			// Restart cannot prove cancellation or replay a possibly executed command.
+			// The task projection records an unknown-outcome failure, not activity exit.
 			expect(taskRow()).toMatchObject({
-				status: "cancelled",
+				status: "failed",
+				output: "Execution outcome unknown after restart; the command was not rerun.",
 				toolCallId: binding.toolCallId,
 				executionAttempt: 1,
 			});

@@ -541,15 +541,6 @@ export interface NarraForkSettings {
 		 * setting them to "0"/"false" force-disables regardless of this setting).
 		 */
 		enabled: boolean;
-		/**
-		 * Allow proxy URLs targeting private/reserved IP addresses (127.x, 10.x, 172.16-31.x,
-		 * 192.168.x, 169.254.x, ::1, fe80::, etc.) to be forwarded to plugins.
-		 *
-		 * Defaults to false. Private deployments using a LAN proxy should enable this
-		 * explicitly. Without it, an SSRF surface exists where a plugin on the host network
-		 * could be directed to reach internal services or cloud metadata endpoints.
-		 */
-		allowPrivateProxyTarget: boolean;
 	};
 	agent: {
 		defaultModel: string;

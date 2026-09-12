@@ -65,9 +65,12 @@ export const pluginToHostRequestMethodSchema = z.enum(PLUGIN_TO_HOST_REQUEST_MET
 export const RPC_CANCEL_REQUEST_METHOD = "$/cancelRequest" as const;
 export const RPC_CREDIT_METHOD = "$/credit" as const;
 
-const MAX_JSON_DEPTH = 32;
-const MAX_JSON_NODES = 10_000;
-const MAX_JSON_STRING_LENGTH = 1_000_000;
+// Transport enforces the actual UTF-8 frame budget. These traversal guards must
+// accommodate long provider histories within the 32 MiB outbound frame limit:
+// even the smallest JSON array entry takes two bytes (value + separator).
+const MAX_JSON_DEPTH = 128;
+const MAX_JSON_NODES = 16 * 1024 * 1024;
+const MAX_JSON_STRING_LENGTH = 32 * 1024 * 1024;
 const FORBIDDEN_JSON_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 
 export type JsonPrimitive = string | number | boolean | null;
@@ -86,21 +89,34 @@ function isRestrictedJsonValue(
 	if (typeof value === "number") return Number.isFinite(value);
 	if (typeof value !== "object" || seen.has(value)) return false;
 
+	// Track ancestors, not every object ever visited: shared history/content
+	// objects are serializable JSON; only references back into the path are cycles.
 	seen.add(value);
-	if (Array.isArray(value)) {
-		if (value.length > MAX_JSON_NODES) return false;
-		return value.every((item) => isRestrictedJsonValue(item, seen, depth + 1, nodes));
-	}
+	try {
+		if (Array.isArray(value)) {
+			if (value.length > MAX_JSON_NODES - nodes.count) return false;
+			for (let index = 0; index < value.length; index++) {
+				if (!isRestrictedJsonValue(value[index], seen, depth + 1, nodes)) return false;
+			}
+			return true;
+		}
 
-	if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) {
-		return false;
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) return false;
+		// Avoid allocating an entries array and a [key, value] tuple per history field.
+		for (const key in value) {
+			if (!Object.hasOwn(value, key)) continue;
+			if (
+				FORBIDDEN_JSON_KEYS.has(key) ||
+				!isRestrictedJsonValue((value as Record<string, unknown>)[key], seen, depth + 1, nodes)
+			) {
+				return false;
+			}
+		}
+		return true;
+	} finally {
+		seen.delete(value);
 	}
-	const entries = Object.entries(value);
-	if (entries.length > MAX_JSON_NODES) return false;
-	return entries.every(
-		([key, item]) =>
-			!FORBIDDEN_JSON_KEYS.has(key) && isRestrictedJsonValue(item, seen, depth + 1, nodes),
-	);
 }
 
 function isRestrictedJsonObject(value: unknown): value is Record<string, JsonValue> {

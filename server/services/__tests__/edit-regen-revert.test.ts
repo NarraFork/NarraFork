@@ -77,7 +77,7 @@ mock.module("../../lib/uploads", () => ({
 	}),
 }));
 
-const { closeNarrator, editAndRegenerate, interruptAndWaitForIdle } = await import(
+const { closeNarrator, editAndRegenerate, interruptAndWaitForIdle, rollbackToBlock } = await import(
 	"../narrator-session"
 );
 const { narratorMessages, narratorMessageRefs, narrators } = schema;
@@ -183,5 +183,23 @@ describe("edit-and-regenerate file rollback", () => {
 			newTextFiles: [new File(["notes"], "added.txt", { type: "text/plain" })],
 		});
 		expect(eventLog).toEqual(["deleteMessagesAfter", "saveTextFileToWorktree"]);
+	});
+});
+
+describe("right-click rollback also truncates through deleteMessagesAfter", () => {
+	let cwd: string;
+	beforeEach(() => {
+		cwd = mkdtempSync(join(tmpdir(), "nf-rollback-path-"));
+		deleteCalls.length = 0;
+		eventLog.length = 0;
+		seed(cwd);
+	});
+
+	test("rollbackToBlock forwards the same delete-after selector as edit-retry", async () => {
+		await rollbackToBlock("n1", "m1", 0).catch(() => {});
+		expect(deleteCalls).toHaveLength(1);
+		expect(deleteCalls[0]?.messageId).toBe("m1");
+		expect(deleteCalls[0]?.opts?.skipRevert).toBeFalsy();
+		expect(deleteCalls[0]?.opts?.preserveConversationId).toBe(true);
 	});
 });

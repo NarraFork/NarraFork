@@ -9,6 +9,7 @@ import {
 	type FileChangeState,
 	hasConfirmedNoFileChange,
 	hasSettledMeasuredFileEffect,
+	NON_OPERATION_ROLES,
 } from "@shared/file-change-protocol";
 import { AppError } from "../lib/errors";
 import {
@@ -171,6 +172,7 @@ interface RefRow {
 	id: string;
 	narratorId: string;
 	seq: number;
+	role: string;
 	segmentCompactId: string | null;
 	contentBytes: number;
 	copyBytes: number;
@@ -617,6 +619,7 @@ export class RevertSelectionService {
 		for (const providerId of removedToolUses)
 			if (!tools.some((t) => t.toolUseId === providerId))
 				this.issue(state, { code: "TOOL_CALL_MISSING", messageId: ref.id });
+		const skipFileCoverage = NON_OPERATION_ROLES.has(ref.role) && !selectedIds;
 		for (const tool of tools) {
 			const selected = full || removedToolUses.has(tool.toolUseId);
 			const action = shared
@@ -635,6 +638,8 @@ export class RevertSelectionService {
 				!tool.isFileHistoryCheckpoint
 			)
 				this.issue(state, { code: "UNREPRESENTED_TOOL_CALL", toolCallId: tool.id });
+			// Hidden checkpoints carry real file evidence even on display-only messages.
+			if (skipFileCoverage && !tool.isFileHistoryCheckpoint) continue;
 			await this.tool(state, tool, ref.narratorId);
 		}
 		if (full && !shared) await this.associations(state, MESSAGE_ASSOCIATIONS, ref.id);
@@ -1030,7 +1035,7 @@ export class RevertSelectionService {
 
 const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "WebFetch"]);
 const REF_SELECT = `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrator_id AS narratorId, r.seq,
- r.segment_compact_id AS segmentCompactId, octet_length(m.content_json) AS contentBytes,
+ coalesce(m.role,'assistant') AS role, r.segment_compact_id AS segmentCompactId, octet_length(m.content_json) AS contentBytes,
  octet_length(m.content_json) + coalesce(octet_length(m.content_text),0) + coalesce(octet_length(m.original_content_json),0) AS copyBytes,
  m.tree_hash_after AS treeHashAfter, m.snapshot_commit_sha AS snapshotCommitSha
  FROM narrator_message_refs r LEFT JOIN narrator_messages m ON m.id = r.message_id`;

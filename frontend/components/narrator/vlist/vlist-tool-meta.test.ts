@@ -8,9 +8,66 @@ function toolBlock(props: Record<string, unknown>): ContentBlock {
 	return { type: "tool_use", id: "tu-1", ...props } as unknown as ContentBlock;
 }
 
-function msg(contentJson: ContentBlock[], id = "m1"): NarratorMsg {
-	return { id, seq: 1, role: "assistant", contentJson } as unknown as NarratorMsg;
+function msg(contentJson: ContentBlock[], id = "m1", seq = 1): NarratorMsg {
+	return { id, seq, role: "assistant", contentJson } as unknown as NarratorMsg;
 }
+
+describe("active question waits", () => {
+	it("exposes only running question waits, not completed or other waits", () => {
+		for (const status of ["running", "success", "fail", "cancelled", "pending", undefined]) {
+			const meta = deriveToolMeta(
+				toolBlock({ name: "Await", status, input: { type: "question", id: "q1" } }),
+			);
+			expect(meta?.awaitQuestionId).toBe(status === "running" ? "q1" : undefined);
+		}
+		expect(
+			deriveToolMeta(
+				toolBlock({ name: "Await", status: "running", input: { type: "bash", id: "q1" } }),
+			)?.awaitQuestionId,
+		).toBeUndefined();
+	});
+
+	it("carries the owning message seq so concurrent waits can pick the newest", () => {
+		expect(
+			deriveToolMeta(
+				toolBlock({
+					name: "Await",
+					status: "running",
+					seq: 7,
+					input: { type: "question", id: "q1" },
+				}),
+			),
+		).toMatchObject({ awaitQuestionId: "q1", awaitQuestionSeq: 7 });
+		expect(
+			buildToolMetaIndex([
+				msg(
+					[
+						toolBlock({
+							id: "wait-old",
+							name: "Await",
+							status: "running",
+							input: { type: "question", id: "q1" },
+						}),
+					],
+					"m-old",
+					3,
+				),
+				msg(
+					[
+						toolBlock({
+							id: "wait-new",
+							name: "Await",
+							status: "running",
+							input: { type: "question", id: "q1" },
+						}),
+					],
+					"m-new",
+					11,
+				),
+			]).get("wait-new"),
+		).toMatchObject({ awaitQuestionId: "q1", awaitQuestionSeq: 11 });
+	});
+});
 
 describe("running Send navigation", () => {
 	it("reads the live resolution without output or lifecycle mutation", () => {

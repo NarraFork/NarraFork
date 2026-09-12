@@ -184,9 +184,15 @@
 				"pendingUpgradeHint": "An update declares capabilities this installation was never granted. They stay unavailable until you approve them; everything you approved before keeps working.",
 				"pendingSourceUpgrade": "New in update",
 				"pendingSourceUpgradeVersion": "New in {{version}}",
+				"pendingSourceRuntime": "Runtime request",
 				"ungrantedTitle": "Not granted yet",
 				"ungrantedEmpty": "All declared capabilities are granted.",
-				"ungrantedGrant": "Grant"
+				"ungrantedGrant": "Grant",
+				"statusGranted": "Granted",
+				"statusManifest": "Manifest requested",
+				"highRisk": {
+					"highRiskNetworkEgressAllowlist": "This capability lets the plugin make outbound network requests, including to LAN addresses, loopback, and link-local ranges. An allowlist that includes broad CIDR ranges (e.g. 0.0.0.0/0, 192.168.0.0/16) may enable access to internal services or cloud metadata endpoints (e.g. 169.254.169.254). Review the allowlist carefully before approving."
+				}
 			},
 			"diagnostics": {
 				"title": "Diagnostics",

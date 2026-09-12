@@ -175,7 +175,7 @@
    1. inline-block prevents mid-token wrapping → override to inline.
    2. pre-wrap inside list items preserves stray \n between items as visible
       blank lines during streaming → override to normal inside <li>. */
-.root span[style*="inline-block"] {
+.root span[style*="inline-block"]:not(:global(.vlist-task-checkbox)) {
 	/* biome-ignore lint/complexity/noImportantStyles: flowtoken emits inline styles, so overriding requires !important. */
 	display: inline !important;
 }
@@ -201,6 +201,25 @@
 .root li,
 .rootNoWrap li {
 	white-space: normal;
+}
+
+:is(.root, .rootNoWrap) li:global(.md-task-item),
+:is(.root, .rootNoWrap) li:global(.task-list-item) {
+	list-style: none;
+	display: flex;
+	align-items: flex-start;
+	gap: 6px;
+}
+
+:is(.root, .rootNoWrap) li:global(.md-task-item) :global(.md-task-item-body),
+:is(.root, .rootNoWrap) li:global(.task-list-item) :global(.md-task-item-body) {
+	min-width: 0;
+	flex: 1;
+}
+
+:is(.root, .rootNoWrap) li:global(.md-task-item) > :global(.vlist-task-checkbox),
+:is(.root, .rootNoWrap) li:global(.task-list-item) > :global(.vlist-task-checkbox) {
+	margin-top: 4px;
 }
 
 /* Remove extra top-margin on nested lists inside list items */

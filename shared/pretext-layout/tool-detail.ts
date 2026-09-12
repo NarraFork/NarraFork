@@ -14,6 +14,7 @@
  */
 
 import { hasUsablePlanBody } from "../plan-reference";
+import { readBackgroundTaskId, stripAwaitAgentEnvelope } from "../subagent-result-text";
 import {
 	deriveToolProgress,
 	formatProgressBytes,
@@ -874,7 +875,14 @@ function classifyByCategory(
 		case "tasks":
 			return classifyTasks(toolName, inputJson, outputJson, metadata, input);
 		case "bash":
-			return classifyBash(status, inputJson, outputJson, metadata, input.isStreaming === true);
+			return classifyBash(
+				status,
+				inputJson,
+				outputJson,
+				metadata,
+				input.isStreaming === true,
+				input.labels,
+			);
 		case "search":
 			return classifySearch(status, inputJson, outputJson);
 		case "webSearch":
@@ -1322,6 +1330,7 @@ function classifyBash(
 	outputJson: unknown,
 	metadata: Record<string, unknown> | null,
 	inputStreaming: boolean,
+	labels?: Record<string, string>,
 ): ToolDetailData | null {
 	const awaitParam = isTruncated(inputJson) ? undefined : asObject(inputJson)?.await;
 	const awaitObj =
@@ -1350,9 +1359,27 @@ function classifyBash(
 	// Command and output are SEPARATE capped boxes in the chunked card (60px vs
 	// 200px caps, each with its own label); merging them into one string lost the
 	// boundary and the "Output" label.
-	const body = outputStr;
+	// Only launch receipts are protocol; never filter arbitrary shell stdout.
+	const backgroundTaskId =
+		!isFailStatus(status) && asObject(inputJson)?.run_in_background === true
+			? readBackgroundTaskId(outputStr)
+			: undefined;
+	const body = backgroundTaskId ? "" : outputStr;
 	return sections([
 		section("meta.await", undefined, metaRows([awaitRow])),
+		section(
+			"meta.background",
+			undefined,
+			backgroundTaskId
+				? metaRows([
+						badgeRow(
+							chips([chip(backgroundTaskId, "blue")]),
+							labels?.backgroundTaskStarted ??
+								"Started in the background; see Background tasks for progress.",
+						),
+					])
+				: null,
+		),
 		textSection(
 			"input.command",
 			hasCommand ? (asObject(inputJson)?.command ?? "") : undefined,
@@ -1368,7 +1395,7 @@ function classifyBash(
 				codeLang: "shellscript",
 			},
 		),
-		textSection("output.main", outputJson, "output", {
+		textSection("output.main", backgroundTaskId ? null : outputJson, "output", {
 			cap: streaming ? "streaming-bash" : "term",
 			contentLines: countLines(body),
 			text: body,
@@ -1558,8 +1585,9 @@ function classifyAwait(
 	outputJson: unknown,
 	metadata: Record<string, unknown> | null,
 ): ToolDetailData | null {
-	const output = resolveDisplayText(outputJson);
+	const rawOutput = resolveDisplayText(outputJson);
 	const awaitType = extractField(inputJson, "type") || (metadata?.awaitType as string) || "task";
+	const output = awaitType === "agent" ? stripAwaitAgentEnvelope(rawOutput) : rawOutput;
 	const isBash = awaitType === "bash";
 	// Badge row + waitFor / subagent lines (the chunked AwaitDetail header).
 	const targetId = extractField(inputJson, "id", "task_id", "taskId");

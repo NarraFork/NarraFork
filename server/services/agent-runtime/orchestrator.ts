@@ -56,6 +56,7 @@ import {
 	resolveEffectiveModel,
 	resolveProvider,
 	settings,
+	subscribeSettingsChanges,
 	usesCodexModel,
 	usesStatefulModel,
 } from "../../lib/settings";
@@ -205,6 +206,7 @@ import { createRuntimeEventContext, createRuntimeMessageWriters } from "./contex
 import { applyForegroundControl, resetForegroundTurn } from "./control";
 import { buildRuntimeHistory } from "./history";
 import { createRuntimeRunState, type RuntimeProfile, type RuntimeRunOutcome } from "./input";
+import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
 import { resolveRuntimePolicy } from "./policy";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
 import { selectRuntimeInterruption, selectRuntimeRecovery } from "./transition";
@@ -485,6 +487,8 @@ export async function runAgentLoopUnlocked(
 			runState.initialSettingsApplied = true;
 			active._settingsRevision = getSettingsRevision();
 			active.model = resolveEffectiveModel(active._modelRef, active.provider);
+			const turnModelRef = active._modelRef;
+			const turnEffectiveModel = active.model;
 			active.provider = resolveProvider(active.model);
 			active._reasoningEffortRef = freshNarrator.reasoningEffort ?? null;
 			active.reasoningEffort = resolveRuntimeReasoningEffort(
@@ -1443,15 +1447,26 @@ export async function runAgentLoopUnlocked(
 						diagnostics: mu.diagnostics,
 					});
 
-				const outcome =
-					mu.providerId && mu.nugModelId
-						? await nugAvailabilityPoller.waitForModelAvailable({
-								providerId: mu.providerId,
-								nugModelId: mu.nugModelId,
-								signal: active.abortController.signal,
-							})
-						: "aborted";
+				const outcome = await waitForModelAvailabilityOrChange({
+					target: active,
+					isCurrent: () => active.alive && owner.isCurrent(),
+					hasModelChanged: () =>
+						active._modelRef !== turnModelRef ||
+						active.model !== turnEffectiveModel ||
+						(turnModelRef === FOLLOW_DEFAULT_MODEL &&
+							resolveEffectiveModel(turnModelRef, active.provider) !== turnEffectiveModel),
+					subscribe: subscribeSettingsChanges,
+					wait: (signal) =>
+						mu.providerId && mu.nugModelId
+							? nugAvailabilityPoller.waitForModelAvailable({
+									providerId: mu.providerId,
+									nugModelId: mu.nugModelId,
+									signal,
+								})
+							: Promise.resolve("aborted"),
+				});
 
+				if (!active.alive || !owner.isCurrent()) return false;
 				if (active.abortController.signal.aborted || outcome === "aborted") {
 					await finalizeInterruptedRun(active, narratorId, undefined);
 					runState.wasInterrupted = true;

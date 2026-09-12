@@ -259,6 +259,66 @@ function compatibleRebuildCopyStatement(sqlite: Database, stmt: string): string 
 	return `INSERT INTO ${targetRef} (${keptTargets.join(", ")}) SELECT ${keptSources.join(", ")} FROM ${sourceRef};`;
 }
 
+const CREATE_NEW_TABLE = new RegExp(
+	String.raw`^\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(${SQLITE_IDENTIFIER})\s*\(`,
+	"i",
+);
+const QUALIFIED_NEW_COLUMN = new RegExp(
+	String.raw`(${SQLITE_IDENTIFIER})\s*\.\s*(${SQLITE_IDENTIFIER})`,
+	"g",
+);
+
+/** Rewrite only SQL outside `'...'` literals. SQLite escapes a quote as `''`. */
+function rewriteOutsideSqlStrings(sql: string, rewrite: (chunk: string) => string): string {
+	let out = "";
+	let i = 0;
+	while (i < sql.length) {
+		if (sql[i] === "'") {
+			const start = i;
+			i += 1;
+			while (i < sql.length) {
+				if (sql[i] !== "'") {
+					i += 1;
+					continue;
+				}
+				if (sql[i + 1] === "'") {
+					i += 2;
+					continue;
+				}
+				i += 1;
+				break;
+			}
+			out += sql.slice(start, i);
+			continue;
+		}
+		const start = i;
+		while (i < sql.length && sql[i] !== "'") i += 1;
+		out += rewrite(sql.slice(start, i));
+	}
+	return out;
+}
+
+/**
+ * Drizzle rebuilds SQLite tables as `CREATE __new_x` then `ALTER TABLE __new_x RENAME TO x`.
+ * Its CHECK expressions often table-qualify columns as `"__new_x"."col"`. Modern SQLite
+ * rewrites those names on rename, but `PRAGMA legacy_alter_table=ON` (and some older
+ * SQLite builds) leave the scratch-table qualifier in place. The rename then fails with
+ * `error in table x after rename: no such column: __new_x.col` — the 0.6.6→0.7.2
+ * `file_attributions` crash. Strip only a qualifier that names this same `__new_*`
+ * table, so the CHECK survives a rename without rewriting committed migration hashes.
+ */
+function rewriteQualifiedNewTableChecks(stmt: string): string {
+	const match = CREATE_NEW_TABLE.exec(stmt);
+	if (!match) return stmt;
+	const tableName = normalizeObjectName(match[1]);
+	if (!rebuildIdentifierKey(tableName).startsWith("__new_")) return stmt;
+	return rewriteOutsideSqlStrings(stmt, (chunk) =>
+		chunk.replace(QUALIFIED_NEW_COLUMN, (qualified, tableRef: string, columnRef: string) =>
+			sameObjectName(normalizeObjectName(tableRef), tableName) ? columnRef : qualified,
+		),
+	);
+}
+
 /** The names SQLite reported for a failure, including the DrizzleError-wrapped `cause`. */
 function errorMessages(err: unknown): string[] {
 	const messages = [String(err instanceof Error ? err.message : err)];
@@ -520,7 +580,8 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 						droppedTables,
 					});
 				} else {
-					for (const stmt of statements) {
+					for (const rawStmt of statements) {
+						const stmt = rewriteQualifiedNewTableChecks(rawStmt);
 						// Validate before SQLite can accept missing DQS names as literals. Neither
 						// compatibility failures nor repaired-copy failures are tolerable DDL errors.
 						const copyStatement = compatibleRebuildCopyStatement(sqlite, stmt);
