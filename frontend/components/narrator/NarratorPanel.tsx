@@ -1,47 +1,27 @@
-import {
-	closestCenter,
-	DndContext,
-	type DragEndEvent,
-	PointerSensor,
-	TouchSensor,
-	useSensor,
-	useSensors,
-} from "@dnd-kit/core";
-import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { fileReferenceApi } from "@frontend/lib/api/file-references";
 import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import type { AsyncQuestion } from "@frontend/types/narrator";
-import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
 import {
 	ActionIcon,
 	Anchor,
-	Avatar,
 	Badge,
 	Box,
 	Button,
 	Center,
-	CloseButton,
 	Drawer,
 	Group,
-	Image,
 	Indicator,
 	Loader,
 	Menu,
 	Modal,
-	NativeSelect,
-	NumberInput,
 	Popover,
-	Progress,
-	ScrollArea,
 	SegmentedControl,
-	Select,
 	Stack,
 	Switch,
 	Text,
 	TextInput,
 	Tooltip,
-	UnstyledButton,
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
@@ -66,32 +46,18 @@ import {
 	IconArrowLeft,
 	IconArrowsMinimize,
 	IconBolt,
-	IconCheck,
-	IconChevronDown,
-	IconChevronUp,
-	IconClock,
 	IconCopy,
-	IconDotsVertical,
 	IconEraser,
 	IconExternalLink,
-	IconFile,
 	// TEMPORARY mock-stream harness icon (see ./mock/README-REMOVAL.md).
 	IconFlask,
-	IconFolderPlus,
 	IconGitBranch,
 	IconGitFork,
 	IconLock,
 	IconLockOpen,
-	IconNotebook,
-	IconPaperclip,
 	IconPencil,
-	IconPlayerPlay,
-	IconPlayerTrackNext,
 	IconSettings,
-	IconShield,
 	IconSparkles,
-	IconTerminal,
-	IconTool,
 	IconTrash,
 	IconUpload,
 	IconX,
@@ -126,18 +92,7 @@ import { useModelCardIndex } from "../../hooks/useModelCards";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
-	useBlacklistDirs,
-	useCmdBlacklist,
-	useCmdWhitelist,
-	useCreateBlacklistDir,
-	useCreateCmdBlacklist,
-	useCreateCmdWhitelist,
 	useCreateNarrator,
-	useCreateWhitelistDir,
-	useDeleteBlacklistDir,
-	useDeleteCmdBlacklist,
-	useDeleteCmdWhitelist,
-	useDeleteWhitelistDir,
 	useEnterPlanMode,
 	useExitPlanMode,
 	useForkNarrator,
@@ -148,9 +103,6 @@ import {
 	useStartAskInPassing,
 	useStopTakeoverSubagent,
 	useTakeoverSubagent,
-	useUpdateBlacklistDir,
-	useUpdateCmdBlacklist,
-	useUpdateCmdWhitelist,
 	useUpdateFastMode,
 	useUpdateModel,
 	useUpdatePermissionMode,
@@ -159,8 +111,6 @@ import {
 	useUpdateReflectionOverrides,
 	useUpdateRelaxedPlan,
 	useUpdateSubagentConclusion,
-	useUpdateWhitelistDir,
-	useWhitelistDirs,
 } from "../../hooks/useNarrator";
 import { useNarratorHeaderToolbarCapacity } from "../../hooks/useNarratorHeaderToolbarCapacity";
 import { useNarratorLod } from "../../hooks/useNarratorLod";
@@ -173,7 +123,6 @@ import {
 	useNarratorRetryRecoveryCapability,
 	useNarratorRollbackEditRegenerateCapability,
 	useNarratorSubagentsCapability,
-	usePlatform,
 	useProviderModelRefreshCapability,
 	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
@@ -182,15 +131,7 @@ import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { ApiError, api, type BufferMessageSummary, isAbortError } from "../../lib/api";
 import type { RevertActionConfirmOptions, RevertScope } from "../../lib/api/narrators";
-import type { PathFlavor } from "../../lib/api/types";
-import {
-	AGG_MODEL_PREFIX,
-	FOLLOW_DEFAULT_MODEL,
-	type ModelOption,
-	parseAggModelValue,
-	resolveDisplayModel,
-	statusRegistry,
-} from "../../lib/constants";
+import { type ModelOption, resolveDisplayModel, statusRegistry } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import {
 	calculateEffectiveTurnElapsedMs,
@@ -211,20 +152,15 @@ import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { useImageViewer } from "../common/image-viewer-context";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
-import { TruncatedText } from "../common/TruncatedText";
-import { PermissionRuleEditor } from "../permissions/PermissionRuleEditor";
 import {
 	buildPluginDockPanelOpenRequest,
 	PluginContributionOptions,
 	PluginContributionPicker,
 } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
-import { UserAvatar } from "../UserAvatar";
 import { toBannerQuestions } from "./async-question-questions";
 import { BackgroundTasksDrawerHost, useBackgroundTasksButton } from "./BackgroundTasksDrawer";
-import { ChapterBar } from "./ChapterBar";
-import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
-import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
+import { ContentViewerEnvironmentProvider } from "./ContentViewer";
 import {
 	COMPACTING_MARKER_ATTR,
 	CompactSummaryModal,
@@ -232,6 +168,14 @@ import {
 	type CompactSummaryModalTarget,
 } from "./compact-summary-modal";
 import { hasSendableComposerContent } from "./composer-send-gate";
+import { ContextThresholdSettingsModal } from "./context-management/ContextThresholdSettingsModal";
+import {
+	type ContextManagementDraft,
+	DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
+	DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD,
+	DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
+	DEFAULT_MIN_PRUNE_RATIO,
+} from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import {
 	clearDraftImageAttachments,
@@ -244,7 +188,18 @@ import { ExecutionDeviceMenu, ExecutionDeviceOptions } from "./ExecutionDeviceMe
 import type { FileReferenceScopeValue } from "./FileReferenceScope";
 import { useFilePanelNavigation } from "./file-panel-navigation";
 import { trimFileReferenceInput } from "./file-reference-input";
-import { HumanAttentionInboxButton } from "./GlobalQuestionInbox";
+import { PathRulesPopover } from "./interaction/PathRulesPopover";
+import {
+	type BooleanOverride,
+	type DangerReflectionOverride,
+	normalizeBooleanOverride,
+	normalizeDangerReflectionLevel,
+	normalizeDangerReflectionOverride,
+	resolveBooleanOverride,
+	resolveDangerReflectionLevel,
+} from "./interaction/reflection-types";
+import { SetGlobalModelModal } from "./interaction/SetGlobalModelModal";
+import { useQueuedMessageActions } from "./interaction/use-queued-message-actions";
 import {
 	formatKimiBarText,
 	formatKimiDetailsText,
@@ -252,37 +207,19 @@ import {
 } from "./kimi-usage-format";
 import { LeakedToolCallModal } from "./LeakedToolCallModal";
 import { LodSwitchToast } from "./LodSwitchToast";
-import {
-	BLOCK_ID_ATTR,
-	collectSelectedText,
-	MessageSelectionCtx,
-	type MessageSelectionResolver,
-	type MessageSelectionState,
-	resolveBlockRange,
-	resolveSelectedBlockMeta,
-	resolveSelectedMessageIds,
-} from "./MessageSelectionCtx";
+import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./MessageSelectionCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
-import { ModelMenuItems } from "./ModelMenuItems";
 import { ModelPriceModal } from "./ModelPriceModal";
 import type { MessageListHandle, MessageListTailMeta } from "./message-list-handle";
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
-import {
-	NarratorComposer,
-	type NarratorComposerHandle,
-	type NarratorRemoteDraft,
-} from "./NarratorComposer";
+import type { NarratorComposerHandle, NarratorRemoteDraft } from "./NarratorComposer";
+import { NarratorInteractionArea } from "./NarratorInteractionArea";
 import { NarratorLodMenu, NarratorLodOptions } from "./NarratorLodMenu";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
-import {
-	BackgroundTasksStatusButton,
-	NarratorStatusBar,
-	NarratorStatusToolbar,
-	type NarratorStatusToolbarAction,
-} from "./NarratorStatusToolbar";
+import type { NarratorStatusToolbarAction } from "./NarratorStatusToolbar";
 import { NarratorToolbarOverflowMenu } from "./NarratorToolbarOverflowMenu";
 import { NugRechargeDialog } from "./NugRechargeDialog";
 import {
@@ -305,8 +242,6 @@ import {
 	MAX_IMAGE_LONG_EDGE,
 	MAX_IMAGE_SIZE,
 	MAX_TEXT_FILE_SIZE,
-	PERM_MODE_ICONS,
-	PERM_MODES,
 	resizeImageIfNeeded,
 } from "./narrator-panel-types";
 import { getNarratorStatusBarDisplay, planNarratorWorkIndicator } from "./narrator-status-bar";
@@ -317,20 +252,13 @@ import {
 import type { NarratorToolbarHost, NarratorToolbarId } from "./narrator-toolbar-items";
 import { nextHighlightRequestId } from "./panels/panel-kind";
 import { compactProgressLabel } from "./progress-label";
-import { QueuedAttachmentPreview, QueuedMessageRow } from "./QueuedMessageRow";
 import { type RenderLod, RenderLodCtx } from "./RenderLodCtx";
 import { RevertActionConfirmModal } from "./RevertScopeConfirmModal";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
+import { useMessageSelection } from "./selection/use-message-selection";
 import { resolveSelectionOverlayBlockId } from "./selection-anchor-overlay";
 import { revealSpecFile } from "./spec-file-reveal";
-import {
-	getGlobalCloseSwipe,
-	type SwipeAnchorInfo,
-	setGlobalOnSelectionRange,
-	setGlobalOnSwipeAnchorInfo,
-	setGlobalSwipeAnchor,
-	setGlobalToggleBlock,
-} from "./swipeState";
+import { type SwipeAnchorInfo, setGlobalOnSwipeAnchorInfo } from "./swipeState";
 import {
 	AllowRetryCtx,
 	FileModDrawerCtx,
@@ -338,9 +266,6 @@ import {
 	PermEnterHintCtx,
 } from "./tool-call-contexts";
 import { type PaymentRequiredInfo, useNarratorPanelWS } from "./useNarratorPanelWS";
-
-type ModelComboboxItem = string | { value: string; label: string };
-type ModelComboboxItemGroup = ComboboxItemGroup<ModelComboboxItem, string>;
 
 function parsePersistedPaymentRequired(value: unknown): Partial<PaymentRequiredInfo> | null {
 	if (typeof value !== "string" || !value.trim()) return null;
@@ -404,87 +329,6 @@ export function shouldRenderFileModificationsDrawer(
 	return opened || hasBeenOpened;
 }
 
-const PERM_MODE_DATA = PERM_MODES.map((m) => ({ value: m, label: `perm_${m}` }));
-const BOOLEAN_OVERRIDE_VALUES = ["inherit", "on", "off"] as const;
-type BooleanOverride = (typeof BOOLEAN_OVERRIDE_VALUES)[number];
-const DANGER_REFLECTION_LEVEL_VALUES = ["off", "light", "standard", "strict"] as const;
-type DangerReflectionLevel = (typeof DANGER_REFLECTION_LEVEL_VALUES)[number];
-const DANGER_REFLECTION_OVERRIDE_VALUES = [
-	"inherit",
-	"on",
-	...DANGER_REFLECTION_LEVEL_VALUES,
-] as const;
-type DangerReflectionOverride = (typeof DANGER_REFLECTION_OVERRIDE_VALUES)[number];
-
-type ContextThresholdsDraft = {
-	standard: { pruneStart: number; compactStart: number };
-	large: { pruneStart: number; compactStart: number };
-};
-
-type ContextManagementDraft = {
-	contextThresholds: ContextThresholdsDraft;
-	autoCompactKeepPairs: number;
-	autoCompactPruneThreshold: number;
-	minPruneRatio: number;
-};
-
-const DEFAULT_CONTEXT_THRESHOLDS_DRAFT: ContextThresholdsDraft = {
-	standard: { pruneStart: 95, compactStart: 99 },
-	large: { pruneStart: 95, compactStart: 99 },
-};
-const DEFAULT_AUTO_COMPACT_KEEP_PAIRS = 2;
-const DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD = 80;
-const DEFAULT_MIN_PRUNE_RATIO = 30;
-
-function normalizeBooleanOverride(value: unknown): BooleanOverride {
-	return BOOLEAN_OVERRIDE_VALUES.includes(value as BooleanOverride)
-		? (value as BooleanOverride)
-		: "inherit";
-}
-
-function normalizeDangerReflectionLevel(
-	value: unknown,
-	legacyEnabled = true,
-): DangerReflectionLevel {
-	return DANGER_REFLECTION_LEVEL_VALUES.includes(value as DangerReflectionLevel)
-		? (value as DangerReflectionLevel)
-		: legacyEnabled
-			? "standard"
-			: "off";
-}
-
-function normalizeDangerReflectionOverride(value: unknown): DangerReflectionOverride {
-	return DANGER_REFLECTION_OVERRIDE_VALUES.includes(value as DangerReflectionOverride)
-		? (value as DangerReflectionOverride)
-		: "inherit";
-}
-
-function resolveDangerReflectionLevel(
-	override: unknown,
-	globalLevel: DangerReflectionLevel,
-): DangerReflectionLevel {
-	const normalizedOverride = normalizeDangerReflectionOverride(override);
-	if (normalizedOverride === "inherit") return globalLevel;
-	if (normalizedOverride === "on") return globalLevel === "off" ? "standard" : globalLevel;
-	return normalizedOverride;
-}
-
-function formatDangerReflectionLevel(
-	level: DangerReflectionLevel,
-	t: (key: string) => string,
-): string {
-	return t(`dangerReflectionLevel_${level}`);
-}
-
-function resolveBooleanOverride(value: unknown, globalDefault: boolean): boolean {
-	const override = normalizeBooleanOverride(value);
-	if (override === "inherit") return globalDefault;
-	return override === "on";
-}
-
-/** Number of queued messages before the queue collapses into a summary bar. */
-const QUEUE_COLLAPSE_THRESHOLD = 2;
-
 /**
  * Stable empty list for the async-question inbox.
  *
@@ -524,944 +368,6 @@ function getMessageViewportScrollBottom(scroller: HTMLElement) {
 
 function _getMessageViewportDistanceFromBottom(scroller: HTMLElement) {
 	return getMessageViewportScrollBottom(scroller) - scroller.scrollTop;
-}
-
-/**
- * Modal with a searchable Select to change the global default or summary model.
- * Used from the per-narrator model menu so users with many models can filter by
- * typing instead of scrolling. Excludes meta sentinels (follow-default /
- * follow-summary) to avoid self/circular references.
- */
-function SetGlobalModelModal({
-	opened,
-	mode,
-	groupedModels,
-	currentValue,
-	saving,
-	onClose,
-	onConfirm,
-}: {
-	opened: boolean;
-	mode: "default" | "summary" | null;
-	groupedModels: ComboboxData;
-	currentValue: string | null | undefined;
-	saving: boolean;
-	onClose: () => void;
-	onConfirm: (model: string) => void;
-}) {
-	const { t } = useTranslation("narrator");
-	const [selected, setSelected] = useState<string | null>(null);
-
-	// Reset the selection to the current value whenever the modal (re)opens.
-	useEffect(() => {
-		if (opened) setSelected(currentValue ?? null);
-	}, [opened, currentValue]);
-
-	// Default picker must exclude both sentinels (summary follows default →
-	// circular); summary picker only excludes the summary sentinel.
-	const data = useMemo<ComboboxData>(() => {
-		const exclude =
-			mode === "default"
-				? ["__default__", "__summary__"]
-				: mode === "summary"
-					? ["__summary__"]
-					: [];
-		if (exclude.length === 0) return groupedModels;
-		return (groupedModels as ModelComboboxItemGroup[]).filter(
-			(g) => !g.items?.some?.((i) => exclude.includes(typeof i === "string" ? i : i.value)),
-		);
-	}, [groupedModels, mode]);
-
-	const title = mode === "summary" ? t("editSummaryModel") : t("editDefaultModel");
-
-	return (
-		<Modal opened={opened} onClose={onClose} title={title} centered size="md">
-			<Stack gap="md">
-				<Select
-					data={data}
-					searchable
-					limit={100}
-					placeholder={t("modelFilterPlaceholder")}
-					value={selected}
-					onChange={setSelected}
-					comboboxProps={{ withinPortal: true }}
-					nothingFoundMessage={t("noModelMatches")}
-				/>
-				<Group justify="flex-end">
-					<Button variant="default" onClick={onClose} disabled={saving}>
-						{t("cancel")}
-					</Button>
-					<Button
-						onClick={() => selected && onConfirm(selected)}
-						disabled={!selected || saving}
-						loading={saving}
-					>
-						{t("confirm")}
-					</Button>
-				</Group>
-			</Stack>
-		</Modal>
-	);
-}
-
-function PermModeMenuItems({
-	currentMode,
-	availableModes,
-	unavailableReason,
-	onSelect,
-	t,
-	renderAfterMode,
-}: {
-	currentMode: string;
-	availableModes: string[];
-	unavailableReason?: string;
-	onSelect: (mode: string) => void;
-	t: (key: string) => string;
-	renderAfterMode?: (mode: string) => React.ReactNode;
-}) {
-	const modes = PERM_MODES.filter((mode) => availableModes.includes(mode));
-	if (modes.length === 0) {
-		return (
-			<Menu.Item disabled title={unavailableReason}>
-				{t("permissionModesUnavailable")}
-			</Menu.Item>
-		);
-	}
-
-	return (
-		<>
-			{modes.map((mode) => {
-				const selected = currentMode === mode;
-				return (
-					<span key={mode}>
-						<Menu.Item
-							leftSection={PERM_MODE_ICONS[mode]}
-							onClick={() => onSelect(mode)}
-							rightSection={
-								<IconCheck size={14} style={{ visibility: selected ? "visible" : "hidden" }} />
-							}
-							fw={selected ? 600 : 400}
-						>
-							{t(`perm_${mode}`)}
-						</Menu.Item>
-						{renderAfterMode?.(mode)}
-					</span>
-				);
-			})}
-		</>
-	);
-}
-
-const QUEUE_MODE_ICONS: Record<string, React.ReactNode> = {
-	turn: <IconClock size={14} />,
-	tool: <IconTool size={14} />,
-	interrupt: <IconPlayerTrackNext size={14} />,
-};
-
-type QueueMode = "turn" | "tool" | "interrupt";
-const QUEUE_MODES: QueueMode[] = ["turn", "tool", "interrupt"];
-
-/**
- * The queue choices offered while an idle narrator is COMPACTING its context.
- *
- * Only two of the three modes mean anything here. There is no running turn and no
- * running tool call to cut in front of, so "wait for the turn to finish" and
- * "interrupt the turn" would both describe something that does not exist. What the
- * user actually decides is whether to wait for the compaction: waiting keeps the
- * turn on the post-compact summary, running now starts it against the current
- * history while the compaction continues in the background.
- *
- * Each entry maps onto the same `QueueMode` the rest of the composer speaks, so the
- * Enter / Ctrl+Enter bindings and the one-shot triggers keep working unchanged.
- */
-const COMPACT_QUEUE_MODES: Array<{ mode: QueueMode; labelKey: string; descKey: string }> = [
-	{
-		mode: "turn",
-		labelKey: "compactQueueMode_wait",
-		descKey: "compactQueueMode_wait_desc",
-	},
-	{
-		mode: "interrupt",
-		labelKey: "compactQueueMode_now",
-		descKey: "compactQueueMode_now_desc",
-	},
-];
-
-/**
- * A single queue-mode row: icon + label + description, with a right-side marker
- * that is either a check (this mode is the current binding) or a play icon
- * (clicking sends the current input with this mode right now).
- */
-function QueueModeMenuItem({
-	mode,
-	selected,
-	action,
-	labelKey,
-	descriptionKey,
-	onClick,
-	t,
-}: {
-	mode: QueueMode;
-	selected: boolean;
-	/** "configure" shows a check on the active mode; "trigger" shows a play icon. */
-	action: "configure" | "trigger";
-	/**
-	 * Label override. Defaults to the mode's generic name; the compacting menu
-	 * passes its own because "wait for the turn to finish" describes a turn that is
-	 * not running (see {@link COMPACT_QUEUE_MODES}).
-	 */
-	labelKey?: string;
-	descriptionKey: string;
-	onClick: () => void;
-	t: (key: string) => string;
-}) {
-	return (
-		<Menu.Item
-			leftSection={QUEUE_MODE_ICONS[mode]}
-			closeMenuOnClick
-			onClick={onClick}
-			rightSection={
-				action === "trigger" ? (
-					<IconPlayerPlay size={14} />
-				) : (
-					<IconCheck size={14} style={{ visibility: selected ? "visible" : "hidden" }} />
-				)
-			}
-			fw={action === "configure" && selected ? 600 : 400}
-		>
-			<Stack gap={0}>
-				<Text size="sm">{t(labelKey ?? `queueMode_${mode}`)}</Text>
-				<Text size="xs" c="dimmed">
-					{t(descriptionKey)}
-				</Text>
-			</Stack>
-		</Menu.Item>
-	);
-}
-
-/**
- * Dropdown content for the send-options menu (the three-dots left segment of the
- * split send button).
- *
- * - When the input is empty, it configures which queue behavior the Enter key
- *   and the Ctrl/Cmd+Enter key are each bound to (also used by short/long press
- *   on the active queue button). Shift+Enter always inserts a native newline.
- * - When the input has content, it becomes a one-shot trigger: each queue mode
- *   sends the current input with that behavior immediately (play icons).
- */
-function SendOptionsMenuContent({
-	enterQueueMode,
-	ctrlEnterQueueMode,
-	hasInput,
-	compacting,
-	onSelectEnterMode,
-	onSelectCtrlEnterMode,
-	onSendWithMode,
-	t,
-}: {
-	enterQueueMode: QueueMode;
-	ctrlEnterQueueMode: QueueMode;
-	hasInput: boolean;
-	/**
-	 * The narrator is idle but compacting, so the menu offers the two-way
-	 * wait-for-compaction choice instead of the three turn/tool/interrupt modes.
-	 */
-	compacting?: boolean;
-	onSelectEnterMode: (mode: QueueMode) => void;
-	onSelectCtrlEnterMode: (mode: QueueMode) => void;
-	onSendWithMode: (mode: QueueMode) => void;
-	t: (key: string) => string;
-}) {
-	// With a draft in hand during a compaction, the menu answers the only question that
-	// applies: wait for the compaction, or run now? The generic turn/tool/interrupt
-	// names would describe a turn and a tool call that are not running.
-	//
-	// With an EMPTY composer it falls through to the key-binding config below instead.
-	// Those bindings still govern the narrator's later busy turns, and offering send
-	// actions with nothing to send would present two items that quietly do nothing.
-	if (compacting && hasInput) {
-		return (
-			<>
-				<Menu.Label>{t("compactQueueSection")}</Menu.Label>
-				{COMPACT_QUEUE_MODES.map(({ mode, labelKey, descKey }) => (
-					<QueueModeMenuItem
-						key={mode}
-						mode={mode}
-						selected={false}
-						action="trigger"
-						labelKey={labelKey}
-						descriptionKey={descKey}
-						onClick={() => onSendWithMode(mode)}
-						t={t}
-					/>
-				))}
-			</>
-		);
-	}
-	if (hasInput) {
-		return (
-			<>
-				<Menu.Label>{t("sendCurrentInputSection")}</Menu.Label>
-				{QUEUE_MODES.map((mode) => (
-					<QueueModeMenuItem
-						key={mode}
-						mode={mode}
-						selected={false}
-						action="trigger"
-						descriptionKey={`queueMode_${mode}_desc`}
-						onClick={() => onSendWithMode(mode)}
-						t={t}
-					/>
-				))}
-			</>
-		);
-	}
-	return (
-		<>
-			<Menu.Label>{t("enterKeySection")}</Menu.Label>
-			{QUEUE_MODES.map((mode) => (
-				<QueueModeMenuItem
-					key={mode}
-					mode={mode}
-					selected={enterQueueMode === mode}
-					action="configure"
-					descriptionKey={`queueMode_${mode}_desc`}
-					onClick={() => onSelectEnterMode(mode)}
-					t={t}
-				/>
-			))}
-			<Menu.Divider />
-			<Menu.Label>{t("ctrlEnterKeySection")}</Menu.Label>
-			{QUEUE_MODES.map((mode) => (
-				<QueueModeMenuItem
-					key={mode}
-					mode={mode}
-					selected={ctrlEnterQueueMode === mode}
-					action="configure"
-					descriptionKey={`queueMode_${mode}_desc`}
-					onClick={() => onSelectCtrlEnterMode(mode)}
-					t={t}
-				/>
-			))}
-			<Menu.Divider />
-			<Menu.Item disabled>{t("shiftEnterNewlineHint")}</Menu.Item>
-		</>
-	);
-}
-
-/**
- * The three-dots send-options trigger rendered as the LEFT segment of a split
- * button that shares its border with the primary send/queue button. Uses
- * `Button.Group` so the two segments merge into one control (inner corners
- * squared, outer corners rounded, single shared border).
- */
-function SendOptionsSplitButton({
-	primaryButton,
-	enterQueueMode,
-	ctrlEnterQueueMode,
-	hasInput,
-	compacting,
-	color,
-	variant,
-	onSelectEnterMode,
-	onSelectCtrlEnterMode,
-	onSendWithMode,
-	t,
-}: {
-	primaryButton: React.ReactNode;
-	enterQueueMode: QueueMode;
-	ctrlEnterQueueMode: QueueMode;
-	hasInput: boolean;
-	/** Show the compaction wait/run-now chooser instead of the queue modes. */
-	compacting?: boolean;
-	/** Match the primary button's color/variant so the two segments look unified. */
-	color?: string;
-	variant?: string;
-	onSelectEnterMode: (mode: QueueMode) => void;
-	onSelectCtrlEnterMode: (mode: QueueMode) => void;
-	onSendWithMode: (mode: QueueMode) => void;
-	t: (key: string) => string;
-}) {
-	return (
-		<Button.Group>
-			<Menu position="top-end" withinPortal>
-				<Menu.Target>
-					<Button
-						color={color}
-						variant={variant}
-						px={6}
-						aria-label={t("sendOptions")}
-						onContextMenu={(e) => e.preventDefault()}
-					>
-						<IconDotsVertical size={16} />
-					</Button>
-				</Menu.Target>
-				<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto", maxWidth: 300 }}>
-					<SendOptionsMenuContent
-						enterQueueMode={enterQueueMode}
-						ctrlEnterQueueMode={ctrlEnterQueueMode}
-						hasInput={hasInput}
-						compacting={compacting}
-						onSelectEnterMode={onSelectEnterMode}
-						onSelectCtrlEnterMode={onSelectCtrlEnterMode}
-						onSendWithMode={onSendWithMode}
-						t={t}
-					/>
-				</Menu.Dropdown>
-			</Menu>
-			{primaryButton}
-		</Button.Group>
-	);
-}
-
-function InlineOverrideActions({
-	visible,
-	disabled,
-	onFollowDefault,
-	onSetAsDefault,
-	t,
-}: {
-	visible: boolean;
-	disabled: boolean;
-	onFollowDefault: () => void;
-	onSetAsDefault: () => void;
-	t: (key: string) => string;
-}) {
-	if (!visible) return null;
-	const linkStyle = {
-		textDecoration: "underline",
-		opacity: disabled ? 0.45 : 1,
-		pointerEvents: disabled ? "none" : "auto",
-	} as const;
-	return (
-		<Group justify="space-between" mt={4} wrap="nowrap" style={{ width: "100%" }}>
-			<Anchor
-				component="button"
-				type="button"
-				size="xs"
-				c="dimmed"
-				style={linkStyle}
-				onClick={(event) => {
-					event.stopPropagation();
-					onFollowDefault();
-				}}
-			>
-				{t("override_followDefault")}
-			</Anchor>
-			<Anchor
-				component="button"
-				type="button"
-				size="xs"
-				c="dimmed"
-				style={linkStyle}
-				onClick={(event) => {
-					event.stopPropagation();
-					onSetAsDefault();
-				}}
-			>
-				{t("override_setAsDefault")}
-			</Anchor>
-		</Group>
-	);
-}
-
-function PlanReflectionMenuControl({
-	visible,
-	override,
-	effective,
-	globalDefault,
-	disabled,
-	onChange,
-	onFollowDefault,
-	onSetAsDefault,
-	t,
-}: {
-	visible: boolean;
-	override: BooleanOverride;
-	effective: boolean;
-	globalDefault: boolean;
-	disabled: boolean;
-	onChange: (value: BooleanOverride) => void;
-	onFollowDefault: () => void;
-	onSetAsDefault: () => void;
-	t: (key: string) => string;
-}) {
-	if (!visible) return null;
-	return (
-		<Box px="sm" py={6} onClick={(event) => event.stopPropagation()}>
-			<Group justify="space-between" align="center" wrap="nowrap" gap="sm">
-				<Text size="xs" fw={600}>
-					{t("planReflectionShort")}
-				</Text>
-				<Switch
-					size="xs"
-					checked={effective}
-					disabled={disabled}
-					onChange={(event) => {
-						const checked = event.currentTarget.checked;
-						onChange(checked === globalDefault ? "inherit" : checked ? "on" : "off");
-					}}
-				/>
-			</Group>
-			<InlineOverrideActions
-				visible={override !== "inherit"}
-				disabled={disabled}
-				onFollowDefault={onFollowDefault}
-				onSetAsDefault={onSetAsDefault}
-				t={t}
-			/>
-		</Box>
-	);
-}
-
-function DangerReflectionMenuControl({
-	visible,
-	override,
-	effectiveLevel,
-	globalLevel,
-	disabled,
-	onChange,
-	onFollowDefault,
-	onSetAsDefault,
-	t,
-}: {
-	visible: boolean;
-	override: DangerReflectionOverride;
-	effectiveLevel: DangerReflectionLevel;
-	globalLevel: DangerReflectionLevel;
-	disabled: boolean;
-	onChange: (value: DangerReflectionOverride) => void;
-	onFollowDefault: () => void;
-	onSetAsDefault: () => void;
-	t: (key: string) => string;
-}) {
-	if (!visible) return null;
-	return (
-		<Box px="sm" pb={8} onClick={(event) => event.stopPropagation()}>
-			<Text size="xs" fw={600} mb={4}>
-				{t("dangerReflectionShort")}
-			</Text>
-			<SegmentedControl
-				size="xs"
-				fullWidth
-				value={effectiveLevel}
-				onChange={(value) => {
-					const level = value as DangerReflectionLevel;
-					onChange(level === globalLevel ? "inherit" : level);
-				}}
-				disabled={disabled}
-				data={DANGER_REFLECTION_LEVEL_VALUES.map((level) => ({
-					value: level,
-					label: formatDangerReflectionLevel(level, t),
-				}))}
-			/>
-			<InlineOverrideActions
-				visible={override !== "inherit"}
-				disabled={disabled}
-				onFollowDefault={onFollowDefault}
-				onSetAsDefault={onSetAsDefault}
-				t={t}
-			/>
-		</Box>
-	);
-}
-
-function PermissionMenuContent({
-	currentMode,
-	availablePermissionModes,
-	permissionModesUnavailableReason,
-	onSelectPermissionMode,
-	t,
-	hasPlanTrait,
-	onTogglePlanMode,
-	planModePending,
-	planModeSupported,
-	planModeUnsupportedReason,
-	showPlanReflectionAutoApproveToggle,
-	planReflectionAutoApproveOverride,
-	planReflectionAutoApproveEffective,
-	planReflectionAutoApproveGlobal,
-	onPlanReflectionAutoApproveChange,
-	onFollowDefaultPlanReflection,
-	onSetPlanReflectionAsDefault,
-	showDangerReflectionToggle,
-	dangerReflectionOverride,
-	dangerReflectionEffectiveLevel,
-	dangerReflectionGlobalLevel,
-	onDangerReflectionChange,
-	onFollowDefaultDangerReflection,
-	onSetDangerReflectionAsDefault,
-	reflectionSettingsDisabled,
-}: {
-	currentMode: string;
-	availablePermissionModes: string[];
-	permissionModesUnavailableReason?: string;
-	onSelectPermissionMode: (mode: string) => void;
-	t: (key: string) => string;
-	hasPlanTrait: boolean;
-	onTogglePlanMode: () => void;
-	planModePending: boolean;
-	planModeSupported: boolean;
-	planModeUnsupportedReason?: string;
-	showPlanReflectionAutoApproveToggle: boolean;
-	planReflectionAutoApproveOverride: BooleanOverride;
-	planReflectionAutoApproveEffective: boolean;
-	planReflectionAutoApproveGlobal: boolean;
-	onPlanReflectionAutoApproveChange: (value: BooleanOverride) => void;
-	onFollowDefaultPlanReflection: () => void;
-	onSetPlanReflectionAsDefault: () => void;
-	showDangerReflectionToggle: boolean;
-	dangerReflectionOverride: DangerReflectionOverride;
-	dangerReflectionEffectiveLevel: DangerReflectionLevel;
-	dangerReflectionGlobalLevel: DangerReflectionLevel;
-	onDangerReflectionChange: (value: DangerReflectionOverride) => void;
-	onFollowDefaultDangerReflection: () => void;
-	onSetDangerReflectionAsDefault: () => void;
-	reflectionSettingsDisabled: boolean;
-}) {
-	return (
-		<>
-			<Menu.Label>{t("permissionMode")}</Menu.Label>
-			<PermModeMenuItems
-				currentMode={currentMode}
-				availableModes={availablePermissionModes}
-				unavailableReason={permissionModesUnavailableReason}
-				onSelect={onSelectPermissionMode}
-				t={t}
-				renderAfterMode={(mode) =>
-					mode === "bypassPermissions" ? (
-						<DangerReflectionMenuControl
-							visible={showDangerReflectionToggle}
-							override={dangerReflectionOverride}
-							effectiveLevel={dangerReflectionEffectiveLevel}
-							globalLevel={dangerReflectionGlobalLevel}
-							disabled={reflectionSettingsDisabled}
-							onChange={onDangerReflectionChange}
-							onFollowDefault={onFollowDefaultDangerReflection}
-							onSetAsDefault={onSetDangerReflectionAsDefault}
-							t={t}
-						/>
-					) : null
-				}
-			/>
-			<Menu.Divider />
-			<Menu.Item
-				leftSection={<IconNotebook size={14} />}
-				onClick={onTogglePlanMode}
-				disabled={planModePending || !planModeSupported}
-				title={!planModeSupported ? planModeUnsupportedReason : undefined}
-			>
-				{!planModeSupported
-					? t("planModeUnavailable")
-					: hasPlanTrait
-						? t("exitPlanMode")
-						: t("enterPlanMode")}
-			</Menu.Item>
-			<PlanReflectionMenuControl
-				visible={showPlanReflectionAutoApproveToggle}
-				override={planReflectionAutoApproveOverride}
-				effective={planReflectionAutoApproveEffective}
-				globalDefault={planReflectionAutoApproveGlobal}
-				disabled={reflectionSettingsDisabled}
-				onChange={onPlanReflectionAutoApproveChange}
-				onFollowDefault={onFollowDefaultPlanReflection}
-				onSetAsDefault={onSetPlanReflectionAsDefault}
-				t={t}
-			/>
-		</>
-	);
-}
-
-function PathRulesPopover({
-	narratorId,
-	t,
-	triggerMode = "icon",
-}: {
-	narratorId: string;
-	t: (key: string) => string;
-	triggerMode?: "icon" | "menu";
-}) {
-	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
-	const platform = usePlatform();
-	const serverPathFlavor: PathFlavor = platform === "windows" ? "windows" : "posix";
-	const [opened, { toggle, close }] = useDisclosure(false);
-	const dropdownRef = useRef<HTMLDivElement>(null);
-
-	// Only fetch rules when the popover is open — avoids 4 API calls on every page load.
-	const enabledId = opened ? narratorId : "";
-	const { data: wlDirs = [] } = useWhitelistDirs(enabledId);
-	const createWl = useCreateWhitelistDir();
-	const updateWl = useUpdateWhitelistDir(narratorId);
-	const deleteWl = useDeleteWhitelistDir(narratorId);
-	const { data: blDirs = [] } = useBlacklistDirs(enabledId);
-	const createBl = useCreateBlacklistDir();
-	const updateBl = useUpdateBlacklistDir(narratorId);
-	const deleteBl = useDeleteBlacklistDir(narratorId);
-	const { data: cmdWl = [] } = useCmdWhitelist(enabledId);
-	const createCmdWl = useCreateCmdWhitelist();
-	const updateCmdWl = useUpdateCmdWhitelist(narratorId);
-	const deleteCmdWl = useDeleteCmdWhitelist(narratorId);
-	const { data: cmdBl = [] } = useCmdBlacklist(enabledId);
-	const createCmdBl = useCreateCmdBlacklist();
-	const updateCmdBl = useUpdateCmdBlacklist(narratorId);
-	const deleteCmdBl = useDeleteCmdBlacklist(narratorId);
-	const { data: execDevices } = useQuery({
-		queryKey: ["narratorExecutionDevices", narratorId],
-		queryFn: () => api.getNarratorExecutionDevices(narratorId),
-		enabled: opened,
-	});
-	const permissionDevices = useMemo(
-		() =>
-			(execDevices?.devices ?? []).map((device) => ({
-				id: device.id,
-				name: device.name || device.id,
-				status: device.online ? ("online" as const) : ("offline" as const),
-				platformOs: device.platform?.os ?? null,
-			})),
-		[execDevices],
-	);
-	const badgeCount = wlDirs.length + blDirs.length + cmdWl.length + cmdBl.length;
-
-	// Popover has no built-in outside-click handling here (closeOnClickOutside is
-	// off so nested overlays can't dismiss it), so it is emulated below. The Modal
-	// branch has its own overlay dismissal and must not run this.
-	const usesPopover = !isMobile && triggerMode !== "menu";
-
-	useEffect(() => {
-		if (!opened || !usesPopover) return;
-		const handler = (event: MouseEvent) => {
-			const target = event.target as HTMLElement | null;
-			if (!target || dropdownRef.current?.contains(target)) return;
-			// Any nested overlay opened from inside this popover (Select/Combobox
-			// dropdowns, the directory-browser Modal, nested Popovers) is rendered
-			// into Mantine's portal layer, not into our dropdown's DOM subtree.
-			// Matching on portal containers instead of per-component class names
-			// keeps this correct when a child switches widget type: enumerating
-			// `.mantine-Combobox-dropdown` used to miss `.mantine-Select-dropdown`,
-			// so picking a rule target counted as an outside click and tore down
-			// the whole popover (losing the in-progress draft rule with it).
-			if (target.closest("[data-portal], [data-mantine-shared-portal-node]")) return;
-			close();
-		};
-		document.addEventListener("mousedown", handler);
-		return () => document.removeEventListener("mousedown", handler);
-	}, [opened, usesPopover, close]);
-
-	const trigger =
-		triggerMode === "menu" ? (
-			<Menu.Item
-				key="path-rules"
-				leftSection={<IconFolderPlus size={16} />}
-				rightSection={badgeCount > 0 ? <Badge size="xs">{badgeCount}</Badge> : undefined}
-				onClick={toggle}
-			>
-				{t("path_rules")}
-			</Menu.Item>
-		) : (
-			<Tooltip label={t("path_rules")}>
-				<ActionIcon
-					variant="subtle"
-					color="gray"
-					size="sm"
-					aria-label={t("path_rules")}
-					onClick={toggle}
-				>
-					<IconFolderPlus size={16} />
-					{badgeCount > 0 && (
-						<Text
-							size="8px"
-							fw={700}
-							c="indigo"
-							style={{ position: "absolute", top: -2, right: -4 }}
-						>
-							{badgeCount}
-						</Text>
-					)}
-				</ActionIcon>
-			</Tooltip>
-		);
-
-	const content = (
-		<Stack gap="md">
-			<Stack gap={6}>
-				<Text size="xs" fw={600}>
-					{t("whitelist_dirs_title")}
-				</Text>
-				<PermissionRuleEditor
-					rules={wlDirs}
-					kind="directoryWhitelist"
-					devices={permissionDevices}
-					showOauthGroups={false}
-					serverPathFlavor={serverPathFlavor}
-					narratorId={narratorId}
-					defaultDeviceId={execDevices?.defaultDeviceId ?? null}
-					emptyLabel={t("whitelist_dirs_empty")}
-					placeholder={t("whitelist_dirs_placeholder")}
-					onCreate={(rule) =>
-						createWl.mutate({
-							narratorId,
-							path: rule.path ?? "",
-							pathFlavor: rule.pathFlavor ?? undefined,
-							accessLevel: rule.accessLevel ?? "readOnly",
-							enabled: rule.enabled,
-							selector: rule.selector,
-						})
-					}
-					onUpdate={(_index, rule) =>
-						updateWl.mutate({
-							dirId: rule.id ?? "",
-							path: rule.path,
-							pathFlavor: rule.pathFlavor ?? undefined,
-							accessLevel: rule.accessLevel,
-							enabled: rule.enabled,
-							selector: rule.selector,
-						})
-					}
-					onDelete={(_index, rule) => rule.id && deleteWl.mutate(rule.id)}
-				/>
-			</Stack>
-			<Stack gap={6}>
-				<Text size="xs" fw={600}>
-					{t("blacklist_dirs_title")}
-				</Text>
-				<PermissionRuleEditor
-					rules={blDirs}
-					kind="directoryBlacklist"
-					devices={permissionDevices}
-					showOauthGroups={false}
-					serverPathFlavor={serverPathFlavor}
-					narratorId={narratorId}
-					defaultDeviceId={execDevices?.defaultDeviceId ?? null}
-					emptyLabel={t("blacklist_dirs_empty")}
-					placeholder={t("blacklist_dirs_placeholder")}
-					onCreate={(rule) =>
-						createBl.mutate({
-							narratorId,
-							path: rule.path ?? "",
-							pathFlavor: rule.pathFlavor ?? undefined,
-							denyLevel: rule.denyLevel ?? "denyAll",
-							enabled: rule.enabled,
-							selector: rule.selector,
-						})
-					}
-					onUpdate={(_index, rule) =>
-						updateBl.mutate({
-							dirId: rule.id ?? "",
-							path: rule.path,
-							pathFlavor: rule.pathFlavor ?? undefined,
-							denyLevel: rule.denyLevel,
-							enabled: rule.enabled,
-							selector: rule.selector,
-						})
-					}
-					onDelete={(_index, rule) => rule.id && deleteBl.mutate(rule.id)}
-				/>
-			</Stack>
-			<Stack gap={6}>
-				<Text size="xs" fw={600}>
-					{t("cmd_whitelist_title")}
-				</Text>
-				<PermissionRuleEditor
-					rules={cmdWl}
-					kind="commandWhitelist"
-					devices={permissionDevices}
-					showOauthGroups={false}
-					serverPathFlavor={serverPathFlavor}
-					narratorId={narratorId}
-					defaultDeviceId={execDevices?.defaultDeviceId ?? null}
-					emptyLabel={t("cmd_whitelist_empty")}
-					placeholder={t("cmd_whitelist_placeholder")}
-					onCreate={(rule) =>
-						createCmdWl.mutate({
-							narratorId,
-							pattern: rule.pattern ?? "",
-							enabled: rule.enabled,
-							selector: rule.selector,
-						})
-					}
-					onUpdate={(_index, rule) =>
-						updateCmdWl.mutate({
-							entryId: rule.id ?? "",
-							pattern: rule.pattern,
-							enabled: rule.enabled,
-							selector: rule.selector,
-						})
-					}
-					onDelete={(_index, rule) => rule.id && deleteCmdWl.mutate(rule.id)}
-				/>
-			</Stack>
-			<Stack gap={6}>
-				<Text size="xs" fw={600}>
-					{t("cmd_blacklist_title")}
-				</Text>
-				<PermissionRuleEditor
-					rules={cmdBl}
-					kind="commandBlacklist"
-					devices={permissionDevices}
-					showOauthGroups={false}
-					serverPathFlavor={serverPathFlavor}
-					narratorId={narratorId}
-					defaultDeviceId={execDevices?.defaultDeviceId ?? null}
-					emptyLabel={t("cmd_blacklist_empty")}
-					placeholder={t("cmd_blacklist_placeholder")}
-					onCreate={(rule) =>
-						createCmdBl.mutate({
-							narratorId,
-							pattern: rule.pattern ?? "",
-							denyPrompt: rule.denyPrompt,
-							enabled: rule.enabled,
-							selector: rule.selector,
-						})
-					}
-					onUpdate={(_index, rule) =>
-						updateCmdBl.mutate({
-							entryId: rule.id ?? "",
-							pattern: rule.pattern,
-							denyPrompt: rule.denyPrompt,
-							enabled: rule.enabled,
-							selector: rule.selector,
-						})
-					}
-					onDelete={(_index, rule) => rule.id && deleteCmdBl.mutate(rule.id)}
-				/>
-			</Stack>
-		</Stack>
-	);
-
-	if (isMobile || triggerMode === "menu") {
-		return (
-			<>
-				{trigger}
-				<Modal
-					opened={opened}
-					onClose={close}
-					title={t("path_rules")}
-					fullScreen={isMobile}
-					size="lg"
-					scrollAreaComponent={ScrollArea.Autosize}
-				>
-					<Box p="md">{content}</Box>
-				</Modal>
-			</>
-		);
-	}
-
-	return (
-		<Popover
-			opened={opened}
-			onClose={close}
-			position="top-end"
-			width={520}
-			shadow="md"
-			withinPortal
-			closeOnClickOutside={false}
-		>
-			<Popover.Target>{trigger}</Popover.Target>
-			<Popover.Dropdown ref={dropdownRef} mah="70vh" style={{ overflowY: "auto" }}>
-				{content}
-			</Popover.Dropdown>
-		</Popover>
-	);
 }
 
 type ReasoningEffortValue = "none" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -1586,130 +492,6 @@ function normalizeReasoningEffortForModel(
 	if (!effort) return "";
 	if (isDeepSeekModel(model) && (effort === "low" || effort === "medium")) return "high";
 	return effort;
-}
-
-function ReasoningEffortMenuItems({
-	currentEffort,
-	options,
-	onSelect,
-	t,
-}: {
-	currentEffort: string | null | undefined;
-	options: readonly ReasoningEffortValue[];
-	onSelect: (effort: string) => void;
-	t: (key: string) => string;
-}) {
-	// No "auto" item: follow/override state is expressed by the inline
-	// "follow default / set as default" links below (matching the permission
-	// and reflection menus). Selecting a tier writes an explicit override.
-	return (
-		<>
-			<Menu.Label>{t("reasoningEffort")}</Menu.Label>
-			{options.map((effort) => {
-				const selected = currentEffort === effort;
-				return (
-					<Menu.Item
-						key={effort}
-						onClick={() => onSelect(effort)}
-						rightSection={
-							<IconCheck size={14} style={{ visibility: selected ? "visible" : "hidden" }} />
-						}
-						fw={selected ? 600 : 400}
-					>
-						{t(`reasoning_${effort}`)}
-					</Menu.Item>
-				);
-			})}
-		</>
-	);
-}
-
-function TurnElapsedTime({
-	text,
-	startedAtLabel,
-	isMobile,
-}: {
-	text: string;
-	startedAtLabel: string | null;
-	isMobile: boolean;
-}) {
-	const [opened, setOpened] = useState(false);
-	const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const cancelClose = useCallback(() => {
-		if (closeTimer.current) {
-			clearTimeout(closeTimer.current);
-			closeTimer.current = null;
-		}
-	}, []);
-	const scheduleClose = useCallback(() => {
-		cancelClose();
-		closeTimer.current = setTimeout(() => {
-			setOpened(false);
-			closeTimer.current = null;
-		}, 150);
-	}, [cancelClose]);
-	useEffect(() => () => cancelClose(), [cancelClose]);
-
-	// Without a popover the row has nothing else to reveal the clipped tail, so
-	// the text carries its own overflow tooltip. With a popover the full string
-	// goes into the dropdown instead — nesting a tooltip inside a popover target
-	// would open two overlapping bubbles for the same gesture.
-	if (!startedAtLabel)
-		return <TruncatedText size="xs" c="dimmed" text={text} style={{ maxWidth: "100%" }} />;
-
-	const elapsedText = (
-		<Text size="xs" c="dimmed" truncate style={{ minWidth: 0, maxWidth: "100%" }}>
-			{text}
-		</Text>
-	);
-
-	return (
-		<Popover opened={opened} onChange={setOpened} position="top" withArrow withinPortal shadow="md">
-			<Popover.Target>
-				<UnstyledButton
-					type="button"
-					onClick={(event) => {
-						event.stopPropagation();
-						cancelClose();
-						setOpened((opened) => !opened);
-					}}
-					onPointerDown={(event) => event.stopPropagation()}
-					onPointerEnter={() => {
-						if (!isMobile) {
-							cancelClose();
-							setOpened(true);
-						}
-					}}
-					onPointerLeave={() => {
-						if (!isMobile) scheduleClose();
-					}}
-					aria-label={`${text}, ${startedAtLabel}`}
-					style={{ display: "inline-flex", minWidth: 0, maxWidth: "100%", cursor: "pointer" }}
-				>
-					{elapsedText}
-				</UnstyledButton>
-			</Popover.Target>
-			<Popover.Dropdown
-				onPointerEnter={() => {
-					if (!isMobile) cancelClose();
-				}}
-				onPointerLeave={() => {
-					if (!isMobile) scheduleClose();
-				}}
-			>
-				{/* The inline label is the part the row clips, so repeat it in full here:
-				    the popover is the only reveal affordance this control has. */}
-				<Stack gap={2}>
-					<Text size="xs" style={{ overflowWrap: "anywhere" }}>
-						{text}
-					</Text>
-					<Text size="xs" c="dimmed">
-						{startedAtLabel}
-					</Text>
-				</Stack>
-			</Popover.Dropdown>
-		</Popover>
-	);
 }
 
 export function NarratorPanel({
@@ -1880,7 +662,6 @@ export function NarratorPanel({
 	);
 	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const { t: ts } = useTranslation("settings");
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const availablePermissionModes = narratorPermissionsCapability.supported
 		? narratorPermissionsCapability.modes
@@ -3277,8 +2058,6 @@ export function NarratorPanel({
 		contextThresholdSettingsOpened,
 		{ open: openContextThresholdSettingsModal, close: closeContextThresholdSettings },
 	] = useDisclosure(false);
-	const [contextThresholdDraft, setContextThresholdDraft] =
-		useState<ContextManagementDraft>(contextThresholdSettings);
 
 	const [fastModeSettingsOpened, setFastModeSettingsOpened] = useState(false);
 	const fastModeSettingsCloseTimerRef = useRef<number | null>(null);
@@ -3759,64 +2538,31 @@ export function NarratorPanel({
 		updateSettingsMutation,
 	]);
 	const handleOpenContextThresholdSettings = useCallback(() => {
-		setContextThresholdDraft(contextThresholdSettings);
+		// The modal seeds its own draft from `contextThresholdSettings` on open.
 		openContextThresholdSettingsModal();
-	}, [contextThresholdSettings, openContextThresholdSettingsModal]);
-	const handleSaveContextThresholdSettings = useCallback(() => {
-		const normalized: ContextManagementDraft = {
-			contextThresholds: {
-				standard: {
-					pruneStart: Math.max(
-						50,
-						Math.min(100, Math.round(contextThresholdDraft.contextThresholds.standard.pruneStart)),
-					),
-					compactStart: Math.max(
-						50,
-						Math.min(
-							100,
-							Math.round(contextThresholdDraft.contextThresholds.standard.compactStart),
-						),
-					),
+	}, [openContextThresholdSettingsModal]);
+	const handleSaveContextThresholdSettings = useCallback(
+		// `normalized` is already clamped/rounded by the modal.
+		(normalized: ContextManagementDraft) => {
+			updateSettingsMutation.mutate(
+				{
+					agent: {
+						contextThresholds: normalized.contextThresholds,
+						autoCompactKeepPairs: normalized.autoCompactKeepPairs,
+						autoCompactPruneThreshold: normalized.autoCompactPruneThreshold,
+						minPruneRatio: normalized.minPruneRatio,
+					},
 				},
-				large: {
-					pruneStart: Math.max(
-						10,
-						Math.min(100, Math.round(contextThresholdDraft.contextThresholds.large.pruneStart)),
-					),
-					compactStart: Math.max(
-						10,
-						Math.min(100, Math.round(contextThresholdDraft.contextThresholds.large.compactStart)),
-					),
+				{
+					onSuccess: () => {
+						closeContextThresholdSettings();
+						notifications.show({ message: t("contextThresholdSettingsSaved"), color: "teal" });
+					},
 				},
-			},
-			autoCompactKeepPairs: Math.max(
-				1,
-				Math.min(25, Math.round(contextThresholdDraft.autoCompactKeepPairs)),
-			),
-			autoCompactPruneThreshold: Math.max(
-				0,
-				Math.min(100, Math.round(contextThresholdDraft.autoCompactPruneThreshold)),
-			),
-			minPruneRatio: Math.max(0, Math.min(100, Math.round(contextThresholdDraft.minPruneRatio))),
-		};
-		updateSettingsMutation.mutate(
-			{
-				agent: {
-					contextThresholds: normalized.contextThresholds,
-					autoCompactKeepPairs: normalized.autoCompactKeepPairs,
-					autoCompactPruneThreshold: normalized.autoCompactPruneThreshold,
-					minPruneRatio: normalized.minPruneRatio,
-				},
-			},
-			{
-				onSuccess: () => {
-					setContextThresholdDraft(normalized);
-					closeContextThresholdSettings();
-					notifications.show({ message: t("contextThresholdSettingsSaved"), color: "teal" });
-				},
-			},
-		);
-	}, [closeContextThresholdSettings, contextThresholdDraft, t, updateSettingsMutation]);
+			);
+		},
+		[closeContextThresholdSettings, t, updateSettingsMutation],
+	);
 	const isPlanning = hasPlanTrait && narrator?.status === "working";
 	const isRetrying = !!retryInfo;
 	/*
@@ -4256,126 +3002,33 @@ export function NarratorPanel({
 	);
 	// --- Message rendering setup ---
 
-	// --- Multi-select state ---
-	const [selectionMode, setSelectionMode] = useState(false);
-	const [selectedBlockIds, setSelectedBlockIds] = useState<Set<string>>(new Set());
-	const [anchorBlockId, setAnchorBlockId] = useState<string | null>(null);
-	const [chunkSelectionResolver, setChunkSelectionResolver] =
-		useState<MessageSelectionResolver | null>(null);
-
-	const exitSelection = useCallback(() => {
-		setSelectionMode(false);
-		setSelectedBlockIds(new Set());
-		setAnchorBlockId(null);
-		setGlobalSwipeAnchor(null);
-		// Close any open swipe
-		const closeFn = getGlobalCloseSwipe();
-		if (closeFn) closeFn();
-	}, []);
-
-	const deselectBlock = useCallback((blockId: string) => {
-		setSelectedBlockIds((prev) => {
-			const next = new Set(prev);
-			next.delete(blockId);
-			if (next.size === 0) {
-				setSelectionMode(false);
-				setAnchorBlockId(null);
-				setGlobalSwipeAnchor(null);
-			}
-			return next;
-		});
-	}, []);
-
-	// Desktop: Ctrl/Cmd+Click toggles a single block
-	const toggleBlock = useCallback((blockId: string) => {
-		setSelectedBlockIds((prev) => {
-			const next = new Set(prev);
-			if (next.has(blockId)) {
-				next.delete(blockId);
-				if (next.size === 0) {
-					setSelectionMode(false);
-					setAnchorBlockId(null);
-					return next;
-				}
-			} else {
-				chunkListRef.current?.detachFromBottom();
-				next.add(blockId);
-				setSelectionMode(true);
-				setAnchorBlockId(blockId);
-			}
-			return next;
-		});
-	}, []);
-
-	const applyRangeSelection = useCallback(
-		(anchor: string, target: string, updateAnchor = false) => {
-			const applyDomFallback = () => {
-				const container = contentRef.current;
-				if (!container) return;
-				const range = resolveBlockRange(container, anchor, target);
-				if (!range) return;
-				chunkListRef.current?.detachFromBottom();
-				setSelectionMode(true);
-				setSelectedBlockIds(range);
-				if (updateAnchor) setAnchorBlockId(anchor);
-			};
-
-			const resolver = chunkSelectionResolver;
-			const resolved = resolver?.resolveRange?.(anchor, target);
-			if (!resolved) {
-				applyDomFallback();
-				return;
-			}
-			Promise.resolve(resolved)
-				.then((range) => {
-					if (!range) {
-						applyDomFallback();
-						return;
-					}
-					chunkListRef.current?.detachFromBottom();
-					setSelectionMode(true);
-					setSelectedBlockIds(range);
-					if (updateAnchor) setAnchorBlockId(anchor);
-				})
-				.catch(applyDomFallback);
-		},
-		[chunkSelectionResolver],
-	);
-
-	// Desktop: Shift+Click range-selects from anchor to target
-	const rangeSelectTo = useCallback(
-		(blockId: string) => {
-			const anchor = anchorBlockId;
-			if (!anchor) {
-				// No anchor yet — treat as single toggle
-				chunkListRef.current?.detachFromBottom();
-				setSelectionMode(true);
-				setSelectedBlockIds(new Set([blockId]));
-				setAnchorBlockId(blockId);
-				return;
-			}
-			applyRangeSelection(anchor, blockId);
-		},
-		[anchorBlockId, applyRangeSelection],
-	);
-
-	// Register the global range-selection callback so useSwipeMenu instances
-	// can trigger multi-select without prop drilling.
-	useEffect(() => {
-		const handler = (anchor: string, target: string) => applyRangeSelection(anchor, target, true);
-		setGlobalOnSelectionRange(handler);
-		return () => setGlobalOnSelectionRange(null);
-	}, [applyRangeSelection]);
-
-	// Register toggle callback so useSwipeMenu can add/remove blocks
-	// from the selection when multi-select mode is already active.
-	useEffect(() => {
-		if (selectionMode) {
-			setGlobalToggleBlock(toggleBlock);
-			return () => setGlobalToggleBlock(null);
-		}
-		setGlobalToggleBlock(null);
-	}, [selectionMode, toggleBlock]);
+	// --- Multi-select (state + range/toggle handlers + toolbar + batch actions) ---
+	const {
+		selectionMode,
+		selectedBlockIds,
+		setChunkSelectionResolver,
+		exitSelection,
+		handleBatchCopy,
+		handleBatchDelete,
+		handleBatchFork,
+		handleSegmentCompact,
+		selectionToolbarRef,
+		selectionToolbarParentRef,
+		selectionToolbarTop,
+		selectionCtxValue,
+	} = useMessageSelection({
+		narratorId,
+		contentRef,
+		viewportRef,
+		chunkListRef,
+		navigate,
+		t,
+		confirm,
+		compactSupported,
+		compactUnsupportedReason,
+		compactUsesFallbackSummary,
+		compactFallbackSummaryReason,
+	});
 
 	// --- Off-screen swipe/compacting anchor overlay state ---
 	const [swipeAnchorOverlay, setSwipeAnchorOverlay] = useState<SwipeAnchorInfo | null>(null);
@@ -4390,235 +3043,6 @@ export function NarratorPanel({
 		setGlobalOnSwipeAnchorInfo(setSwipeAnchorOverlay);
 		return () => setGlobalOnSwipeAnchorInfo(null);
 	}, []);
-
-	// Clear selection when narrator changes
-	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId is intentionally a dependency to reset selection on narrator switch
-	useEffect(() => {
-		exitSelection();
-	}, [narratorId, exitSelection]);
-
-	// Escape key exits multi-select mode
-	useEffect(() => {
-		if (!selectionMode) return;
-		const onKeyDown = (e: KeyboardEvent) => {
-			if (e.key === "Escape") {
-				e.preventDefault();
-				exitSelection();
-			}
-		};
-		window.addEventListener("keydown", onKeyDown);
-		return () => window.removeEventListener("keydown", onKeyDown);
-	}, [selectionMode, exitSelection]);
-
-	// --- Floating toolbar position — clamp to selected blocks' bounding box ---
-	const selectionToolbarRef = useRef<HTMLDivElement>(null);
-	const selectionToolbarParentRef = useRef<HTMLDivElement>(null);
-	const [selectionToolbarTop, setSelectionToolbarTop] = useState<number | null>(null);
-
-	useEffect(() => {
-		if (!selectionMode || selectedBlockIds.size === 0) {
-			setSelectionToolbarTop(null);
-			return;
-		}
-		const container = contentRef.current;
-		const scrollEl = viewportRef.current;
-		const parentEl = selectionToolbarParentRef.current;
-		if (!container || !scrollEl) return;
-
-		const reposition = () => {
-			const els = container.querySelectorAll<HTMLElement>(`[${BLOCK_ID_ATTR}]`);
-			let minTop = Number.POSITIVE_INFINITY;
-			let maxBottom = Number.NEGATIVE_INFINITY;
-			for (const el of els) {
-				const bid = el.getAttribute(BLOCK_ID_ATTR);
-				if (!bid || !selectedBlockIds.has(bid)) continue;
-				const r = el.getBoundingClientRect();
-				if (r.top < minTop) minTop = r.top;
-				if (r.bottom > maxBottom) maxBottom = r.bottom;
-			}
-			if (!Number.isFinite(minTop)) return;
-			const menuH = selectionToolbarRef.current?.offsetHeight ?? 160;
-			const half = menuH / 2;
-			// Clamp against the message-area container (not the viewport) so the
-			// toolbar never slides under the composer / status bar below it. The
-			// toolbar is absolutely positioned inside this container, so the final
-			// `top` must be expressed in the container's local coordinate space.
-			const parentRect = parentEl?.getBoundingClientRect();
-			const boundTop = parentRect?.top ?? 0;
-			const boundBottom = parentRect?.bottom ?? scrollEl.getBoundingClientRect().bottom;
-			const boundCenter = (boundTop + boundBottom) / 2;
-			// Prefer the container's vertical center, but stay within the selected
-			// blocks' bounds so the toolbar visually tracks the selection.
-			let top = Math.max(minTop + half, Math.min(boundCenter, maxBottom - half));
-			// Clamp so the whole menu stays inside the container (above the composer).
-			top = Math.max(boundTop + half, Math.min(top, boundBottom - half));
-			// Convert from viewport coordinates to the container's local space.
-			setSelectionToolbarTop(top - boundTop);
-		};
-
-		reposition();
-		scrollEl.addEventListener("scroll", reposition, { passive: true });
-		window.addEventListener("resize", reposition, { passive: true });
-		return () => {
-			scrollEl.removeEventListener("scroll", reposition);
-			window.removeEventListener("resize", reposition);
-		};
-	}, [selectionMode, selectedBlockIds]);
-
-	// --- Batch copy ---
-	const handleBatchCopy = useCallback(async () => {
-		if (selectedBlockIds.size === 0) return;
-		let selectedText = chunkSelectionResolver?.collectSelectedText
-			? chunkSelectionResolver.collectSelectedText(selectedBlockIds)
-			: contentRef.current
-				? collectSelectedText(contentRef.current, selectedBlockIds, handleRegistry)
-				: { text: "", truncated: false };
-		if (!selectedText.text && contentRef.current) {
-			selectedText = collectSelectedText(contentRef.current, selectedBlockIds, handleRegistry);
-		}
-		if (!selectedText.text) return;
-		try {
-			await navigator.clipboard.writeText(selectedText.text);
-			notifications.show({
-				message: t(selectedText.truncated ? "batchCopySuccessTruncated" : "batchCopySuccess", {
-					count: selectedBlockIds.size,
-				}),
-				color: selectedText.truncated ? "yellow" : "teal",
-			});
-		} catch {
-			// Fallback: some browsers block clipboard in non-secure contexts
-		}
-		exitSelection();
-	}, [selectedBlockIds, chunkSelectionResolver, exitSelection, t]);
-
-	// --- Batch delete ---
-	const handleBatchDelete = useCallback(async () => {
-		if (selectedBlockIds.size === 0) return;
-		let metas = chunkSelectionResolver?.resolveSelectedMeta
-			? chunkSelectionResolver.resolveSelectedMeta(selectedBlockIds)
-			: contentRef.current
-				? resolveSelectedBlockMeta(contentRef.current, selectedBlockIds)
-				: [];
-		if (metas.length === 0 && contentRef.current) {
-			metas = resolveSelectedBlockMeta(contentRef.current, selectedBlockIds);
-		}
-		if (metas.length === 0) return;
-		// Confirm
-		const ok = await confirm({ message: t("batchDeleteConfirm", { count: metas.length }) });
-		if (!ok) return;
-		exitSelection();
-		try {
-			const res = await api.deleteMessageBlocks(
-				narratorId,
-				metas.map((m) => ({ messageId: m.messageId, blockIndex: m.blockIndex })),
-			);
-			// Always re-fetch from server to ensure consistency
-			chunkListRef.current?.refreshStructure("full");
-			if (res.failed > 0) {
-				notifications.show({ message: t("batchDeleteFailed"), color: "orange" });
-			}
-		} catch {
-			// Network / unexpected error — re-fetch to reflect whatever actually happened
-			chunkListRef.current?.refreshStructure("full");
-			notifications.show({ message: t("batchDeleteFailed"), color: "red" });
-		}
-	}, [selectedBlockIds, chunkSelectionResolver, exitSelection, narratorId, t, confirm]);
-
-	// --- Batch fork ---
-	const handleBatchFork = useCallback(async () => {
-		if (selectedBlockIds.size === 0) return;
-		let messageIds = chunkSelectionResolver?.resolveSelectedMessageIds
-			? chunkSelectionResolver.resolveSelectedMessageIds(selectedBlockIds)
-			: contentRef.current
-				? resolveSelectedMessageIds(contentRef.current, selectedBlockIds)
-				: [];
-		if (messageIds.length === 0 && contentRef.current) {
-			messageIds = resolveSelectedMessageIds(contentRef.current, selectedBlockIds);
-		}
-		if (messageIds.length === 0) return;
-		exitSelection();
-		try {
-			const newNarrator = await api.forkFromMessages(narratorId, messageIds);
-			notifications.show({
-				message: t("batchForkSuccess", { count: messageIds.length }),
-				color: "teal",
-			});
-			navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarrator.id } });
-		} catch {
-			notifications.show({ message: t("batchForkFailed"), color: "red" });
-		}
-	}, [selectedBlockIds, chunkSelectionResolver, exitSelection, narratorId, navigate, t]);
-
-	// --- Segment compact ---
-	const handleSegmentCompact = useCallback(async () => {
-		if (!compactSupported) {
-			notifications.show({
-				title: t("compactUnsupportedTitle"),
-				message: compactUnsupportedReason,
-				color: "yellow",
-			});
-			return;
-		}
-		if (selectedBlockIds.size === 0) return;
-		let messageIds = chunkSelectionResolver?.resolveSelectedMessageIds
-			? chunkSelectionResolver.resolveSelectedMessageIds(selectedBlockIds)
-			: contentRef.current
-				? resolveSelectedMessageIds(contentRef.current, selectedBlockIds)
-				: [];
-		if (messageIds.length === 0 && contentRef.current) {
-			messageIds = resolveSelectedMessageIds(contentRef.current, selectedBlockIds);
-		}
-		if (messageIds.length === 0) return;
-		const segmentCompactConfirmMessage = compactUsesFallbackSummary
-			? `${t("segmentCompactConfirm", { count: messageIds.length })}\n\n${compactFallbackSummaryReason}`
-			: t("segmentCompactConfirm", { count: messageIds.length });
-		if (!(await confirm({ message: segmentCompactConfirmMessage }))) return;
-		exitSelection();
-		try {
-			// Compacting state will arrive via substatus_change WS event
-			await api.triggerSegmentCompact(narratorId, messageIds);
-		} catch (err) {
-			const isInProgress = err instanceof ApiError && err.status === 409;
-			notifications.show({
-				title: isInProgress ? t("compactInProgress") : t("segmentCompactFailed"),
-				message: isInProgress ? t("compactInProgressDesc") : t("segmentCompactFailedDesc"),
-				color: isInProgress ? "yellow" : "red",
-				autoClose: 5000,
-			});
-		}
-	}, [
-		selectedBlockIds,
-		exitSelection,
-		chunkSelectionResolver,
-		narratorId,
-		t,
-		confirm,
-		compactSupported,
-		compactUnsupportedReason,
-		compactUsesFallbackSummary,
-		compactFallbackSummaryReason,
-	]);
-
-	const selectionCtxValue = useMemo<MessageSelectionState>(
-		() => ({
-			selectionMode,
-			selectedBlockIds,
-			anchorBlockId,
-			exitSelection,
-			deselectBlock,
-			toggleBlock,
-			rangeSelectTo,
-		}),
-		[
-			selectionMode,
-			selectedBlockIds,
-			anchorBlockId,
-			exitSelection,
-			deselectBlock,
-			toggleBlock,
-			rangeSelectTo,
-		],
-	);
 
 	// --- vlist subagent-card / tool-card command actions ---
 	// The chunked SubagentCard owns these itself; the vlist renderers are pure, so
@@ -5455,8 +3879,9 @@ export function NarratorPanel({
 	 * no turn to cut into, but starting one now would race the summary that is about
 	 * to replace the history. The server queues it by default and consumes the queue
 	 * when the compact settles, so the only meaningful choice is wait-or-not — which
-	 * is what {@link COMPACT_QUEUE_MODES} offers. `mode` maps onto it as "turn" =
-	 * wait, anything else = run now (`priority` opts out of the server-side queue).
+	 * is what the compact queue modes (see SendOptionsSplitButton) offer. `mode` maps
+	 * onto it as "turn" = wait, anything else = run now (`priority` opts out of the
+	 * server-side queue).
 	 *
 	 * When the narrator is fully idle, `mode` is ignored and the message is sent
 	 * directly (an idle session is never interrupted). `/new` while active always
@@ -5728,10 +4153,6 @@ export function NarratorPanel({
 
 	// The active queue button mirrors the keyboard shortcuts: a short press uses
 	// Enter's mode, while a long press uses Ctrl/Cmd+Enter's mode.
-	const [queueHoldProgress, setQueueHoldProgress] = useState(0);
-	const queueHoldTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-	const queueHoldFiredRef = useRef(false);
-	const queueClickSuppressedRef = useRef(false);
 	const handleSendWithModeRef = useRef(handleSendWithMode);
 	handleSendWithModeRef.current = handleSendWithMode;
 	// Stable entry points handed to <NarratorComposer>: it re-renders per
@@ -5742,56 +4163,35 @@ export function NarratorPanel({
 	}, []);
 	const ctrlEnterQueueModeRef = useRef(userPrefs?.ctrlEnterQueueMode ?? "tool");
 	ctrlEnterQueueModeRef.current = userPrefs?.ctrlEnterQueueMode ?? "tool";
-	const clearQueueHoldTimer = useCallback(() => {
-		if (queueHoldTimerRef.current) {
-			clearInterval(queueHoldTimerRef.current);
-			queueHoldTimerRef.current = null;
-		}
-		setQueueHoldProgress(0);
-	}, []);
-	const startQueueHold = useCallback(
-		(event: React.PointerEvent<HTMLButtonElement>) => {
-			if (event.pointerType === "mouse" && event.button !== 0) return;
-			clearQueueHoldTimer();
-			queueHoldFiredRef.current = false;
-			queueClickSuppressedRef.current = false;
-			const start = Date.now();
-			const duration = 600;
-			queueHoldTimerRef.current = setInterval(() => {
-				const elapsed = Date.now() - start;
-				const pct = Math.min(elapsed / duration, 1);
-				setQueueHoldProgress(pct);
-				if (pct >= 1 && !queueHoldFiredRef.current) {
-					queueHoldFiredRef.current = true;
-					queueClickSuppressedRef.current = true;
-					if (queueHoldTimerRef.current != null) {
-						clearInterval(queueHoldTimerRef.current);
-						queueHoldTimerRef.current = null;
-					}
-					void handleSendWithModeRef.current(ctrlEnterQueueModeRef.current);
-				}
-			}, 16);
-		},
-		[clearQueueHoldTimer],
-	);
-	const cancelQueueHold = useCallback(() => {
-		if (queueHoldFiredRef.current) queueClickSuppressedRef.current = true;
-		clearQueueHoldTimer();
-		queueHoldFiredRef.current = false;
-	}, [clearQueueHoldTimer]);
-	const handleQueuePointerUp = useCallback(() => {
-		if (queueHoldFiredRef.current) queueClickSuppressedRef.current = true;
-		clearQueueHoldTimer();
-		queueHoldFiredRef.current = false;
-	}, [clearQueueHoldTimer]);
-	const handleQueueClick = useCallback(() => {
-		if (queueClickSuppressedRef.current) {
-			queueClickSuppressedRef.current = false;
-			return;
-		}
-		void handleSendRef.current();
-	}, []);
-	useEffect(() => cancelQueueHold, [cancelQueueHold]);
+
+	const {
+		queueHoldProgress,
+		startQueueHold,
+		cancelQueueHold,
+		handleQueuePointerUp,
+		handleQueueClick,
+		handleCancelAllQueued,
+		handleRemoveQueued,
+		handleRetryQueued,
+		handleDragEndQueued,
+		editingQueuedId,
+		queueExpanded,
+		setQueueExpanded,
+		handleStartEditQueued,
+		handleCancelEditQueued,
+		handleSaveEditQueued,
+	} = useQueuedMessageActions({
+		narratorId,
+		queuedMessages,
+		setQueuedMessages,
+		reconcileBufferedMessages,
+		cancelBuffer,
+		composerRef,
+		handleSendRef,
+		handleSendWithModeRef,
+		ctrlEnterQueueModeRef,
+		t,
+	});
 
 	const handleRetry = async () => {
 		if (!canRetryLastUserMessage) return;
@@ -5840,140 +4240,6 @@ export function NarratorPanel({
 			onAllowRetry: handleAllowRetryToolCall,
 		}),
 		[narratorIsIdle, allowRetryLatestAssistantMessageId, handleAllowRetryToolCall],
-	);
-
-	const handleCancelAllQueued = () => {
-		if (queuedMessages.length > 0) {
-			cancelBuffer(narratorId);
-			// Restore the first queued message text to the input
-			composerRef.current?.restoreInput(
-				queuedMessages[0].text,
-				(queuedMessages[0].fileReferences ?? []).map((reference) => ({
-					...reference,
-					inputRange: undefined,
-				})),
-			);
-			setQueuedMessages([]);
-		}
-	};
-
-	const handleRemoveQueued = (messageId: string) => {
-		const msg = queuedMessages.find((m) => m.id === messageId);
-		const snapshot = queuedMessages;
-		setQueuedMessages((prev) => prev.filter((m) => m.id !== messageId));
-		// If removing the only message, restore its text to input
-		if (queuedMessages.length === 1 && msg) {
-			composerRef.current?.restoreInput(
-				msg.text,
-				(msg.fileReferences ?? []).map((reference) => ({ ...reference, inputRange: undefined })),
-			);
-		}
-		api.removeBufferedMessage(narratorId, messageId).catch(() => {
-			// Rollback on failure
-			setQueuedMessages(snapshot);
-			if (queuedMessages.length === 1 && msg) {
-				composerRef.current?.restoreInput("", []);
-			}
-		});
-	};
-
-	const handleRetryQueued = useCallback(
-		async (messageId: string) => {
-			const result = await api.retryBufferedMessage(narratorId, messageId);
-			// Refresh authoritative state; do not resurrect a row already consumed over WS.
-			reconcileBufferedMessages();
-			return result;
-		},
-		[narratorId, reconcileBufferedMessages],
-	);
-
-	const sensors = useSensors(
-		useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
-		useSensor(TouchSensor, { activationConstraint: { delay: 200, tolerance: 5 } }),
-	);
-
-	const handleDragEndQueued = useCallback(
-		(event: DragEndEvent) => {
-			const { active, over } = event;
-			if (!over || active.id === over.id) return;
-			const oldIndex = queuedMessages.findIndex((m) => m.id === active.id);
-			const newIndex = queuedMessages.findIndex((m) => m.id === over.id);
-			if (oldIndex === -1 || newIndex === -1) return;
-			const newOrder = [...queuedMessages];
-			const [moved] = newOrder.splice(oldIndex, 1);
-			newOrder.splice(newIndex, 0, moved);
-			const snapshot = queuedMessages;
-			setQueuedMessages(newOrder);
-			api
-				.reorderBufferedMessages(
-					narratorId,
-					newOrder.map((m) => m.id),
-				)
-				.catch(() => {
-					setQueuedMessages(snapshot);
-				});
-		},
-		[queuedMessages, narratorId, setQueuedMessages],
-	);
-
-	const [editingQueuedId, setEditingQueuedId] = useState<string | null>(null);
-	const [queueExpanded, setQueueExpanded] = useState(false);
-
-	// Auto-reset expanded state when queue shrinks to ≤2
-	useEffect(() => {
-		if (queuedMessages.length <= QUEUE_COLLAPSE_THRESHOLD) setQueueExpanded(false);
-	}, [queuedMessages.length]);
-
-	const handleStartEditQueued = useCallback((msg: { id: string }) => {
-		setEditingQueuedId(msg.id);
-	}, []);
-
-	const handleCancelEditQueued = useCallback(() => {
-		setEditingQueuedId(null);
-	}, []);
-
-	/**
-	 * Persist an edited queued message.
-	 *
-	 * Only the text is updated optimistically. Attachments are not: the client
-	 * cannot invent the imageId of an upload the server has not accepted yet, and
-	 * a wrong guess would render a broken thumbnail. The authoritative
-	 * `buffer_set` broadcast that follows a successful edit carries the real set.
-	 *
-	 * Returns false on failure so the row keeps the draft open with the user's
-	 * selected files intact.
-	 */
-	const handleSaveEditQueued = useCallback(
-		async (
-			msg: BufferMessageSummary,
-			text: string,
-			payload: {
-				keepImageIds: string[];
-				keepTextFiles: { index: number; filename: string }[];
-				newImages: File[];
-				newTextFiles: File[];
-			},
-		): Promise<boolean> => {
-			const snapshot = queuedMessages;
-			setQueuedMessages((prev) =>
-				prev.map((m) =>
-					m.id === msg.id ? { ...m, text, bufferedAt: new Date().toISOString() } : m,
-				),
-			);
-			try {
-				await api.updateBufferedMessage(narratorId, msg.id, text, payload);
-				return true;
-			} catch (err) {
-				setQueuedMessages(snapshot);
-				notifications.show({
-					color: "red",
-					title: t("editQueuedFailed"),
-					message: err instanceof Error ? err.message : String(err),
-				});
-				return false;
-			}
-		},
-		[queuedMessages, setQueuedMessages, narratorId, t],
 	);
 
 	const addImages = async (files: File[]) => {
@@ -7351,198 +5617,15 @@ export function NarratorPanel({
 						onClose={closeCompactSummaryModal}
 					/>
 
-					<Modal
+					<ContextThresholdSettingsModal
 						opened={contextThresholdSettingsOpened}
 						onClose={closeContextThresholdSettings}
-						title={t("contextThresholdSettingsTitle")}
-						centered
-						size="lg"
-					>
-						<Stack gap="md">
-							<Text size="sm" c="dimmed">
-								{t("contextThresholdSettingsIntro")}
-							</Text>
-							<Group grow align="flex-start">
-								<NumberInput
-									label={ts("autoCompactKeepPairs")}
-									description={ts("autoCompactKeepPairsDesc")}
-									value={contextThresholdDraft.autoCompactKeepPairs}
-									onChange={(value) =>
-										setContextThresholdDraft((prev) => ({
-											...prev,
-											autoCompactKeepPairs:
-												typeof value === "number" ? value : DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
-										}))
-									}
-									min={1}
-									max={25}
-									allowDecimal={false}
-								/>
-								<NumberInput
-									label={ts("autoCompactPruneThreshold")}
-									description={ts("autoCompactPruneThresholdDesc")}
-									value={contextThresholdDraft.autoCompactPruneThreshold}
-									onChange={(value) =>
-										setContextThresholdDraft((prev) => ({
-											...prev,
-											autoCompactPruneThreshold:
-												typeof value === "number" ? value : DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD,
-										}))
-									}
-									min={0}
-									max={100}
-									allowDecimal={false}
-									suffix="%"
-								/>
-							</Group>
-							<Group grow>
-								<NumberInput
-									label={ts("minPruneRatio")}
-									description={ts("minPruneRatioDesc")}
-									value={contextThresholdDraft.minPruneRatio}
-									onChange={(value) =>
-										setContextThresholdDraft((prev) => ({
-											...prev,
-											minPruneRatio: typeof value === "number" ? value : DEFAULT_MIN_PRUNE_RATIO,
-										}))
-									}
-									min={0}
-									max={100}
-									allowDecimal={false}
-									suffix="%"
-								/>
-							</Group>
-							<Box style={{ borderTop: "1px solid var(--mantine-color-default-border)" }} />
-							<Stack gap="xs">
-								<Text size="sm" fw={600}>
-									{ts("contextThresholdsStandard")}
-								</Text>
-								<Text size="xs" c="dimmed">
-									{t("contextThresholdSettingsStandardDesc")}
-								</Text>
-								<Group grow align="flex-start">
-									<NumberInput
-										label={ts("pruneStart")}
-										description={ts("pruneStartDesc")}
-										value={contextThresholdDraft.contextThresholds.standard.pruneStart}
-										onChange={(value) =>
-											setContextThresholdDraft((prev) => ({
-												...prev,
-												contextThresholds: {
-													...prev.contextThresholds,
-													standard: {
-														...prev.contextThresholds.standard,
-														pruneStart: typeof value === "number" ? value : 95,
-													},
-												},
-											}))
-										}
-										min={50}
-										max={100}
-										allowDecimal={false}
-										suffix="%"
-									/>
-									<NumberInput
-										label={ts("compactStart")}
-										description={ts("compactStartDesc")}
-										value={contextThresholdDraft.contextThresholds.standard.compactStart}
-										onChange={(value) =>
-											setContextThresholdDraft((prev) => ({
-												...prev,
-												contextThresholds: {
-													...prev.contextThresholds,
-													standard: {
-														...prev.contextThresholds.standard,
-														compactStart: typeof value === "number" ? value : 99,
-													},
-												},
-											}))
-										}
-										min={50}
-										max={100}
-										allowDecimal={false}
-										suffix="%"
-									/>
-								</Group>
-							</Stack>
-							<Stack gap="xs">
-								<Text size="sm" fw={600}>
-									{ts("contextThresholdsLarge")}
-								</Text>
-								<Text size="xs" c="dimmed">
-									{t("contextThresholdSettingsLargeDesc")}
-								</Text>
-								<Group grow align="flex-start">
-									<NumberInput
-										label={ts("pruneStart")}
-										description={ts("pruneStartDesc")}
-										value={contextThresholdDraft.contextThresholds.large.pruneStart}
-										onChange={(value) =>
-											setContextThresholdDraft((prev) => ({
-												...prev,
-												contextThresholds: {
-													...prev.contextThresholds,
-													large: {
-														...prev.contextThresholds.large,
-														pruneStart: typeof value === "number" ? value : 95,
-													},
-												},
-											}))
-										}
-										min={10}
-										max={100}
-										allowDecimal={false}
-										suffix="%"
-									/>
-									<NumberInput
-										label={ts("compactStart")}
-										description={ts("compactStartDesc")}
-										value={contextThresholdDraft.contextThresholds.large.compactStart}
-										onChange={(value) =>
-											setContextThresholdDraft((prev) => ({
-												...prev,
-												contextThresholds: {
-													...prev.contextThresholds,
-													large: {
-														...prev.contextThresholds.large,
-														compactStart: typeof value === "number" ? value : 99,
-													},
-												},
-											}))
-										}
-										min={10}
-										max={100}
-										allowDecimal={false}
-										suffix="%"
-									/>
-								</Group>
-							</Stack>
-							<Group justify="space-between">
-								<Anchor
-									component="button"
-									type="button"
-									size="xs"
-									onClick={() => navigate({ to: "/settings/agent" })}
-									style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
-								>
-									{t("globalAgentSettings")}
-									<IconExternalLink size={12} />
-								</Anchor>
-								<Group gap="xs">
-									<Button variant="default" onClick={closeContextThresholdSettings}>
-										{tc("cancel")}
-									</Button>
-									<Button
-										onClick={handleSaveContextThresholdSettings}
-										loading={updateSettingsMutation.isPending}
-										disabled={!settingsData}
-									>
-										{tc("save")}
-									</Button>
-								</Group>
-							</Group>
-						</Stack>
-					</Modal>
+						current={contextThresholdSettings}
+						onSave={handleSaveContextThresholdSettings}
+						saving={updateSettingsMutation.isPending}
+						canSave={!!settingsData}
+						onOpenGlobalSettings={() => navigate({ to: "/settings/agent" })}
+					/>
 
 					{/* Keep the Details drawer mounted (only gate on context, not on
 					    `detailsOpened`) so Mantine plays its slide in/out transition —
@@ -7777,1410 +5860,257 @@ export function NarratorPanel({
 						)}
 					</Box>
 
-					{/* Image previews */}
-					{attachedImages.length > 0 && (
-						<Group
-							pt="xs"
-							px="md"
-							pb={6}
-							gap="xs"
-							style={{ borderTop: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
-						>
-							{attachedImages.map((file, i) => (
-								<Box
-									key={`${file.name}-${file.size}-${file.lastModified}-${file.type}`}
-									pos="relative"
-									style={{ display: "inline-block" }}
-								>
-									<Image
-										src={imagePreviewUrls[i]}
-										alt={file.name}
-										radius="sm"
-										h={60}
-										w={60}
-										fit="cover"
-										style={{ cursor: "pointer" }}
-										onClick={() =>
-											openImageViewer({
-												src: imagePreviewUrls[i],
-												filename: file.name,
-												alt: file.name,
-											})
-										}
-									/>
-									<CloseButton
-										size="xs"
-										radius="xl"
-										variant="filled"
-										color="dark"
-										style={{ position: "absolute", top: -6, right: -6 }}
-										onClick={() => updateAttachedImages((prev) => prev.filter((_, j) => j !== i))}
-										title={t("removeImage")}
-									/>
-								</Box>
-							))}
-						</Group>
-					)}
-
-					{/* Text file previews */}
-					{attachedTextFiles.length > 0 && (
-						<Group
-							pt="xs"
-							px="md"
-							pb={6}
-							gap={6}
-							wrap="wrap"
-							style={{
-								borderTop:
-									attachedImages.length > 0
-										? undefined
-										: "1px solid var(--mantine-color-default-border)",
-								flexShrink: 0,
-							}}
-						>
-							{attachedTextFiles.map((file, i) => (
-								<Group
-									key={`${file.name}-${file.size}-${file.lastModified}-${file.type}`}
-									gap={6}
-									px="xs"
-									py={4}
-									wrap="nowrap"
-									style={{
-										borderRadius: "var(--mantine-radius-sm)",
-										backgroundColor:
-											"light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
-										fontSize: "var(--mantine-font-size-xs)",
-									}}
-								>
-									<IconFile size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
-									<Text size="xs" truncate style={{ maxWidth: 160, minWidth: 0 }}>
-										{file.name}
-									</Text>
-									<Text size="xs" c="dimmed" style={{ flexShrink: 0, whiteSpace: "nowrap" }}>
-										{formatFileSize(file.size)}
-									</Text>
-									<CloseButton
-										size={16}
-										iconSize={12}
-										variant="transparent"
-										c="dimmed"
-										onClick={() =>
-											updateAttachedTextFiles((prev) => prev.filter((_, j) => j !== i))
-										}
-									/>
-								</Group>
-							))}
-						</Group>
-					)}
-
-					{/* Upload / send progress — shown while attachments are being uploaded
-					    so the input area doesn't look empty after the draft is cleared. */}
-					{sendingState && sendingState.attachmentCount > 0 && (
-						<Stack
-							gap={4}
-							pt="xs"
-							px="md"
-							pb={6}
-							style={{
-								borderTop: "1px solid var(--mantine-color-default-border)",
-								flexShrink: 0,
-							}}
-						>
-							<Group gap="xs" wrap="nowrap" justify="space-between">
-								{sendingState.progress !== null && sendingState.progress < 1 ? (
-									<Text size="xs" c="dimmed">
-										{t("uploadingAttachments", {
-											percent: Math.round(sendingState.progress * 100),
-										})}
-									</Text>
-								) : (
-									<Group gap="xs" wrap="nowrap">
-										<Loader size="xs" />
-										<Text size="xs" c="dimmed">
-											{t("sendingMessage")}
-										</Text>
-									</Group>
-								)}
-								{sendingState.canCancel && (
-									<Anchor
-										component="button"
-										type="button"
-										size="xs"
-										c="dimmed"
-										style={{ textDecoration: "underline", flexShrink: 0 }}
-										onClick={cancelSending}
-									>
-										{tc("cancel")}
-									</Anchor>
-								)}
-							</Group>
-							{sendingState.progress !== null && sendingState.progress < 1 && (
-								<Progress
-									value={sendingState.progress * 100}
-									size="sm"
-									radius="xl"
-									transitionDuration={150}
-								/>
-							)}
-						</Stack>
-					)}
-
-					{/* Queued messages indicator */}
-					{queuedMessages.length > 0 && (
-						<Stack
-							gap={0}
-							style={{
-								borderTop:
-									attachedImages.length > 0
-										? undefined
-										: "1px solid var(--mantine-color-default-border)",
-								flexShrink: 0,
-							}}
-						>
-							{queuedMessages.length > QUEUE_COLLAPSE_THRESHOLD && !queueExpanded ? (
-								/* Collapsed summary bar */
-								<Group
-									component="button"
-									px="md"
-									py={4}
-									gap="xs"
-									wrap="nowrap"
-									bg="var(--mantine-color-blue-light)"
-									style={{ cursor: "pointer", border: "none", width: "100%", textAlign: "left" }}
-									onClick={() => setQueueExpanded(true)}
-									aria-expanded={false}
-									aria-label={t("queuedCount", { count: queuedMessages.length })}
-								>
-									<IconChevronUp size={14} color="var(--mantine-color-blue-5)" />
-									<Text size="xs" c="blue" fw={500} style={{ flexShrink: 0 }}>
-										{t("queuedCount", { count: queuedMessages.length })}
-									</Text>
-									{queuedMessages.some((msg) => msg.state === "failed") && (
-										<Badge color="red" size="xs" style={{ flexShrink: 0 }}>
-											{t("queuedFailedCount", {
-												count: queuedMessages.filter((msg) => msg.state === "failed").length,
-											})}
-										</Badge>
-									)}
-									<QueuedAttachmentPreview
-										images={queuedMessages[0].images ?? []}
-										textFiles={queuedMessages[0].textFiles ?? []}
-									/>
-									{queuedMessages[0].priority && (
-										<Badge
-											size="xs"
-											color="orange"
-											variant="light"
-											leftSection={<IconBolt size={10} />}
-											style={{ flexShrink: 0 }}
-										>
-											{t("queuedPriorityNextRequest")}
-										</Badge>
-									)}
-									<Text size="xs" c="dimmed" truncate style={{ flex: 1 }}>
-										{queuedMessages[0].text}
-									</Text>
-									<Button
-										size="compact-xs"
-										variant="subtle"
-										color="red"
-										onClick={(e) => {
-											e.stopPropagation();
-											handleCancelAllQueued();
-										}}
-									>
-										{t("clearAllQueued")}
-									</Button>
-								</Group>
-							) : (
-								/* Expanded full list */
-								<>
-									<DndContext
-										sensors={sensors}
-										collisionDetection={closestCenter}
-										onDragEnd={handleDragEndQueued}
-									>
-										<SortableContext
-											items={queuedMessages.map((m) => m.id)}
-											strategy={verticalListSortingStrategy}
-										>
-											{queuedMessages.map((msg, index) => (
-												<QueuedMessageRow
-													key={msg.id}
-													msg={msg}
-													index={index}
-													isEditing={editingQueuedId === msg.id}
-													onSaveEdit={handleSaveEditQueued}
-													onCancelEdit={handleCancelEditQueued}
-													onStartEdit={handleStartEditQueued}
-													onRemove={handleRemoveQueued}
-													onRetry={handleRetryQueued}
-													cancelBufferLabel={t("cancelBuffer")}
-													editLabel={tc("edit")}
-													priorityLabel={t("queuedPriority")}
-													priorityNextRequestLabel={t("queuedPriorityNextRequest")}
-												/>
-											))}
-										</SortableContext>
-									</DndContext>
-									{queuedMessages.length > 1 && (
-										<Group
-											px="md"
-											py={2}
-											justify="flex-end"
-											gap="xs"
-											style={{ backgroundColor: "var(--mantine-color-blue-light)" }}
-										>
-											{queuedMessages.length > QUEUE_COLLAPSE_THRESHOLD && (
-												<Button
-													size="compact-xs"
-													variant="subtle"
-													color="blue"
-													onClick={() => setQueueExpanded(false)}
-													leftSection={<IconChevronDown size={12} />}
-													style={{ marginRight: "auto" }}
-												>
-													{t("collapseQueue")}
-												</Button>
-											)}
-											<Button
-												size="compact-xs"
-												variant="subtle"
-												color="red"
-												onClick={handleCancelAllQueued}
-											>
-												{t("clearAllQueued")}
-											</Button>
-										</Group>
-									)}
-								</>
-							)}
-						</Stack>
-					)}
-
-					{/* Chapter bar — clicking the info strip opens the Git view; off-dock
-					    (mobile) the same gesture routes into the MobileToolPanelHost drawer
-					    instead of the dock panel. */}
-					{narrator.chapterId && (
-						<ChapterBar
-							chapterId={narrator.chapterId}
-							onOpenGitPanel={
-								isWorkspacePreview
-									? undefined
-									: dock
-										? () => dock.openToolPanel("git")
-										: () => setMobileToolPanel("git")
-							}
-						/>
-					)}
-
-					{/* Status bar */}
-					<NarratorStatusBar
-						ownsHorizontalSafeArea={ownsHorizontalSafeArea}
-						borderTop={
-							attachedImages.length > 0 || queuedMessages.length > 0
+					{/* ═══════════════════ Bottom Interaction Area ═══════════════════ */}
+					<NarratorInteractionArea
+						attachedImages={attachedImages}
+						attachedTextFiles={attachedTextFiles}
+						imagePreviewUrls={imagePreviewUrls}
+						updateAttachedImages={updateAttachedImages}
+						updateAttachedTextFiles={updateAttachedTextFiles}
+						formatFileSize={formatFileSize}
+						openImageViewer={openImageViewer}
+						sendingState={sendingState}
+						cancelSending={cancelSending}
+						queuedMessages={queuedMessages}
+						queueExpanded={queueExpanded}
+						setQueueExpanded={setQueueExpanded}
+						editingQueuedId={editingQueuedId}
+						handleDragEndQueued={handleDragEndQueued}
+						handleSaveEditQueued={handleSaveEditQueued}
+						handleCancelEditQueued={handleCancelEditQueued}
+						handleStartEditQueued={handleStartEditQueued}
+						handleRemoveQueued={handleRemoveQueued}
+						handleRetryQueued={handleRetryQueued}
+						handleCancelAllQueued={handleCancelAllQueued}
+						chapterId={narrator.chapterId}
+						onOpenGitPanel={
+							isWorkspacePreview
 								? undefined
-								: "1px solid var(--mantine-color-default-border)"
+								: dock
+									? () => dock.openToolPanel("git")
+									: () => setMobileToolPanel("git")
 						}
-					>
-						{showWorkIndicator && !isWorkspacePreview ? (
-							<UnstyledButton
-								disabled={isRetrying || (!currentSpecTask && !isCompacting)}
-								onClick={() => {
-									if (isRetrying) return;
-									if (isCompacting) {
-										if (!compactingMarkerMessageId) return;
-										void scrollToMessageTarget({
-											domIds: [`msg-${compactingMarkerMessageId}`],
-											targetIds: [compactingMarkerMessageId],
-											highlightId: compactingMarkerMessageId,
+						isWorkspacePreview={isWorkspacePreview}
+						showHumanAttentionInbox={showHumanAttentionInbox}
+						narratorId={narratorId}
+						isChapterMerged={isChapterMerged}
+						statusBar={{
+							narratorId,
+							narrator,
+							ownsHorizontalSafeArea,
+							borderTop:
+								attachedImages.length > 0 || queuedMessages.length > 0
+									? undefined
+									: "1px solid var(--mantine-color-default-border)",
+							isWorkspacePreview,
+							compact,
+							isMobileViewport,
+							t,
+							tt,
+							contextIndicator,
+							viewers,
+							currentUser,
+							workIndicator: {
+								show: showWorkIndicator,
+								color: workIndicatorColor,
+								text: workIndicatorText,
+								plan: workIndicatorPlan,
+								statusBarDisplay,
+								isRetrying,
+								isCompacting,
+								currentSpecTask,
+								compactingMarkerMessageId,
+								compactFailure,
+								compactProgressFragment,
+								turnElapsedText,
+								turnStartedAtLabel,
+								onOpenSpecTool: openSpecTool,
+								onScrollToMessageTarget: scrollToMessageTarget,
+							},
+							queue: {
+								positionValue: queuePositionValue,
+								depthValue: queueDepthValue,
+								messageValue: queueMessageValue,
+							},
+							tasks: {
+								supported: tasksSupported,
+								buttonEnabled: tasksButtonEnabled,
+								runningCount: tasksRunningCount,
+								onOpenPanel: () => {
+									if (dock) dock.openToolPanel("tasks");
+									else setMobileTasksOpen(true);
+								},
+							},
+							model: {
+								allModels,
+								aggregations,
+								providerLabels,
+								defaultModelValue,
+								menuOpenDesktop: modelMenuOpenDesktop,
+								setMenuOpenDesktop: setModelMenuOpenDesktop,
+								menuOpenMobile: modelMenuOpenMobile,
+								setMenuOpenMobile: setModelMenuOpenMobile,
+								priceModel,
+								setPriceModel,
+								refreshProps: modelMenuRefreshProps,
+								mutation: modelMutation,
+								onEditDefaultModel: () => setGlobalModelEditTarget("default"),
+								onEditSummaryModel: () => setGlobalModelEditTarget("summary"),
+							},
+							reasoning: {
+								supported: supportsReasoningEffort,
+								displayed: displayedReasoningEffort,
+								options: reasoningEffortOptions,
+								followsDefault: reasoningFollowsDefault,
+								mutation: reasoningEffortMutation,
+								onFollowDefault: handleFollowDefaultReasoning,
+								onSetAsDefault: handleSetReasoningAsDefault,
+							},
+							permission: {
+								availableModes: availablePermissionModes,
+								unavailableReason: permissionModesUnavailableReason,
+								mutation: permModeMutation,
+								hasPlanTrait,
+								togglePlanMode,
+								planModePending: enterPlanModeMutation.isPending || exitPlanModeMutation.isPending,
+								planModeSupported,
+								planModeUnsupportedReason,
+								planReflection: {
+									supported: planReflectionSupported,
+									override: planReflectionAutoApproveOverride,
+									effective: planReflectionAutoApproveEffective,
+									global: planReflectionAutoApproveGlobal,
+									onChange: handlePlanReflectionAutoApproveOverride,
+									onFollowDefault: handleFollowDefaultPlanReflection,
+									onSetAsDefault: handleSetPlanReflectionAsDefault,
+								},
+								dangerReflection: {
+									supported: dangerReflectionSupported,
+									override: dangerReflectionOverride,
+									effectiveLevel: dangerReflectionEffectiveLevel,
+									globalLevel: dangerReflectionGlobalLevel,
+									onChange: handleDangerReflectionOverride,
+									onFollowDefault: handleFollowDefaultDangerReflection,
+									onSetAsDefault: handleSetDangerReflectionAsDefault,
+								},
+								reflectionSettingsDisabled,
+							},
+							codexControls: {
+								supportsCodexControls,
+								isBuiltInCodexModel,
+								renderFastModeControl,
+							},
+							quota: {
+								balance: quotaBalance,
+								detailsText: quotaDetailsText,
+								detailsOpened: quotaDetailsOpened,
+								setDetailsOpened: setQuotaDetailsOpened,
+								hasDetailsPopover: hasQuotaDetailsPopover,
+								onCancelDetailsClose: cancelQuotaDetailsClose,
+								onScheduleDetailsClose: scheduleQuotaDetailsClose,
+								shouldShowNugRechargeButton,
+								shouldShowNugRechargeInQuotaDetails,
+								onOpenNugRecharge: openNugRecharge,
+							},
+							relaxedPlan: {
+								enabled: relaxedPlanEnabled,
+								forced: relaxedPlanForced,
+								mutation: relaxedPlanMutation,
+							},
+							terminal: {
+								toolAvailable: terminalToolAvailable,
+								toolOpened: terminalToolOpened,
+								activeCount: activeTerminalCount,
+								onOpenPanel: onOpenTerminalPanel,
+								onToggle: toggleTerminalTool,
+							},
+							promote: {
+								show: !!narrator.isAskInPassing,
+								pending: promoteMutation.isPending,
+								onPromote: handlePromote,
+							},
+							mobile: {
+								actions: mobileToolbarActions,
+								measurementKey: mobileToolbarMeasurementKey,
+							},
+						}}
+						composerRowProps={{
+							fileInputRef,
+							composerRef,
+							sendingRef,
+							appendInputRef,
+							interruptBtnRef,
+							narratorId,
+							isActive,
+							composerHasText,
+							composerHasAttachments,
+							setComposerHasText,
+							effectiveFocusIndex,
+							enterQueueMode: userPrefs?.enterQueueMode ?? "turn",
+							ctrlEnterQueueMode: userPrefs?.ctrlEnterQueueMode ?? "tool",
+							onFileInputChange: (e) => {
+								if (e.target.files) {
+									const files = Array.from(e.target.files);
+									const imageFiles: File[] = [];
+									const textFileList: File[] = [];
+									const unsupported: string[] = [];
+									for (const f of files) {
+										if (ACCEPTED_TYPES.includes(f.type)) {
+											imageFiles.push(f);
+										} else if (isTextFile(f.name)) {
+											textFileList.push(f);
+										} else {
+											unsupported.push(f.name);
+										}
+									}
+									if (unsupported.length > 0) {
+										notifications.show({
+											title: t("unsupportedFileType"),
+											message: unsupported.join(", "),
+											color: "yellow",
 										});
-										return;
 									}
-									if (!currentSpecTask) return;
-									// Task state lives in the Dynamic Spec (spec://tasks.json); open the
-									// Spec panel instead of jumping to a (now-removed) todo tool call.
-									openSpecTool();
-								}}
-								style={{ minWidth: 0, flex: 1 }}
-							>
-								<Group gap={6} wrap="nowrap">
-									<Loader size={14} color={workIndicatorColor} style={{ flexShrink: 0 }} />
-									{/* The current task text can be long (spec task titles especially), so
-									    reveal the full string on hover/tap when the row clips it. */}
-									<TruncatedText size="xs" c={workIndicatorColor} text={workIndicatorText} />
-									{((queuePositionValue != null && queuePositionValue > 0) ||
-										queueMessageValue) && (
-										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
-											·{" "}
-											{queueMessageValue ??
-												t(
-													queueDepthValue != null && queueDepthValue > 0
-														? "queuePositionWithDepth"
-														: "queuePosition",
-													{ position: queuePositionValue, queueDepth: queueDepthValue },
-												)}
-										</Text>
-									)}
-									{workIndicatorPlan.showBackgroundCompactSuffix && (
-										<Text size="xs" c="orange" style={{ flexShrink: 0 }}>
-											· {t("backgroundCompactingShort")} · {compactProgressFragment}
-										</Text>
-									)}
-									{workIndicatorPlan.showCompactFailureSuffix && (
-										<Text
-											size="xs"
-											c="red"
-											style={{ flexShrink: 0 }}
-											title={compactFailure?.error || undefined}
-										>
-											· {t("compactFailed")}
-										</Text>
-									)}
-								</Group>
-							</UnstyledButton>
-						) : (
-							<Group gap={6} wrap="nowrap" style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
-								<Box
-									w={8}
-									h={8}
-									style={{
-										borderRadius: "50%",
-										backgroundColor: statusRegistry.accentVar(statusBarDisplay, "filled"),
-										flexShrink: 0,
-									}}
-								/>
-								<TruncatedText size="xs" c="dimmed" text={t(statusBarDisplay.labelKey)} />
-								{tasksSupported && tasksButtonEnabled && (
-									<BackgroundTasksStatusButton
-										runningCount={tasksRunningCount}
-										onOpen={() => {
-											// Reveal the panel, even if it is already open in an inactive tab.
-											if (dock) dock.openToolPanel("tasks");
-											else setMobileTasksOpen(true);
-										}}
-									/>
-								)}
-								{compactFailure && !isCompacting && (
-									<Text
-										size="xs"
-										c="red"
-										style={{ flexShrink: 0 }}
-										title={compactFailure.error || undefined}
-									>
-										· {t("compactFailed")}
-									</Text>
-								)}
-								{turnElapsedText && !isWorkspacePreview && (
-									<TurnElapsedTime
-										text={`· ${t("lastTurnDuration", { duration: turnElapsedText })}`}
-										startedAtLabel={turnStartedAtLabel}
-										isMobile={isMobileViewport}
-									/>
-								)}
-							</Group>
-						)}
-						{showWorkIndicator && !isWorkspacePreview && turnElapsedText && (
-							<TurnElapsedTime
-								text={turnElapsedText}
-								startedAtLabel={turnStartedAtLabel}
-								isMobile={isMobileViewport}
-							/>
-						)}
-
-						{isWorkspacePreview ? (
-							<Group gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
-								{contextIndicator}
-							</Group>
-						) : (
-							<>
-								{/* Model & Permission selectors */}
-								<Group gap={6} wrap="nowrap" style={{ flexShrink: 1, minWidth: 0 }}>
-									{/* Viewers */}
-									{viewers.length > 1 && (
-										<Tooltip
-											label={`${t("viewingNow")}: ${viewers.map((v) => v.username).join(", ")}`}
-										>
-											<Avatar.Group spacing="xs">
-												{viewers.slice(0, 3).map((v) => (
-													<UserAvatar
-														key={v.userId}
-														username={v.username}
-														avatarColor={v.avatarColor}
-														avatarImageId={v.avatarImageId}
-														userId={v.userId}
-														size={22}
-														showTooltip={false}
-													/>
-												))}
-												{viewers.length > 3 && (
-													<Avatar size={22} radius="xl">
-														+{viewers.length - 3}
-													</Avatar>
-												)}
-											</Avatar.Group>
-										</Tooltip>
-									)}
-									{contextIndicator}
-									<CodexQuotaIndicator
-										enabled={isBuiltInCodexModel && !isWorkspacePreview}
-										isAdmin={currentUser?.role === "admin"}
-										compact={isMobileViewport}
-									/>
-									{/* Generic gateway/API quota balance */}
-									{quotaBalance != null &&
-										(hasQuotaDetailsPopover ? (
-											<Popover
-												opened={quotaDetailsOpened}
-												onChange={setQuotaDetailsOpened}
-												position="top"
-												withArrow
-												withinPortal
-												shadow="md"
-											>
-												<Popover.Target>
-													<UnstyledButton
-														onClick={(event) => {
-															event.stopPropagation();
-															cancelQuotaDetailsClose();
-															setQuotaDetailsOpened((opened) => !opened);
-														}}
-														onPointerEnter={() => {
-															if (!isMobileViewport) {
-																cancelQuotaDetailsClose();
-																setQuotaDetailsOpened(true);
-															}
-														}}
-														onPointerLeave={() => {
-															if (!isMobileViewport) scheduleQuotaDetailsClose();
-														}}
-														style={{ flexShrink: 0, maxWidth: 120 }}
-													>
-														<Text
-															size="xs"
-															c="dimmed"
-															style={{
-																cursor: "pointer",
-																maxWidth: 120,
-																overflow: "hidden",
-																textOverflow: "ellipsis",
-																whiteSpace: "nowrap",
-															}}
-														>
-															{quotaBalance}
-														</Text>
-													</UnstyledButton>
-												</Popover.Target>
-												<Popover.Dropdown
-													maw={360}
-													onPointerEnter={() => {
-														if (!isMobileViewport) cancelQuotaDetailsClose();
-													}}
-													onPointerLeave={() => {
-														if (!isMobileViewport) scheduleQuotaDetailsClose();
-													}}
-												>
-													<Stack gap={6}>
-														{quotaDetailsText && (
-															<Text
-																size="xs"
-																style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
-															>
-																{quotaDetailsText}
-															</Text>
-														)}
-														{shouldShowNugRechargeInQuotaDetails && (
-															<Button
-																size="compact-xs"
-																variant="light"
-																onClick={() => {
-																	setQuotaDetailsOpened(false);
-																	openNugRecharge();
-																}}
-															>
-																{t("recharge.open")}
-															</Button>
-														)}
-													</Stack>
-												</Popover.Dropdown>
-											</Popover>
-										) : (
-											// No details popover here, so the clipped balance needs its own
-											// hover/tap reveal.
-											<TruncatedText
-												size="xs"
-												c="dimmed"
-												text={quotaBalance}
-												style={{ flexShrink: 0, maxWidth: 120 }}
-											/>
-										))}
-									{shouldShowNugRechargeButton && (
-										<Button size="compact-xs" variant="subtle" onClick={openNugRecharge}>
-											{t("recharge.open")}
-										</Button>
-									)}
-									{/* Desktop selects */}
-									{!compact && (
-										<Group gap={6} wrap="nowrap" visibleFrom="sm">
-											<Tooltip label={t("modelTooltip")}>
-												<Menu
-													position="top-end"
-													opened={modelMenuOpenDesktop}
-													onChange={(o) => {
-														// Don't let the price popup's outside-click close the menu.
-														if (!o && priceModel != null) return;
-														setModelMenuOpenDesktop(o);
-													}}
-												>
-													<Menu.Target>
-														<NativeSelect
-															size="xs"
-															// The menu renders the full catalog; the trigger only needs
-															// the selected option so native sizing ignores longer models.
-															data={allModels
-																.filter((m) => {
-																	const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
-																	const agg = parseAggModelValue(raw);
-																	return (
-																		m.value === (agg ? `${AGG_MODEL_PREFIX}${agg.aggId}` : raw)
-																	);
-																})
-																.map((m) => ({
-																	value: m.value,
-																	label:
-																		m.value === FOLLOW_DEFAULT_MODEL
-																			? t("followDefault", { model: defaultModelValue })
-																			: m.provider === "__agg__"
-																				? `⚡ ${m.label}`
-																				: m.provider
-																					? `${m.provider}:${m.label}`
-																					: m.label,
-																}))}
-															value={(() => {
-																const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
-																const agg = parseAggModelValue(raw);
-																// For pinned aggregation, map back to the base agg value
-																if (agg) return `${AGG_MODEL_PREFIX}${agg.aggId}`;
-																return raw;
-															})()}
-															onChange={() => {}}
-															onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-															style={{ pointerEvents: "auto" }}
-														/>
-													</Menu.Target>
-													<Menu.Dropdown
-														data-model-menu-scroll
-														style={{ maxHeight: "60vh", overflowY: "auto" }}
-													>
-														<ModelMenuItems
-															opened={modelMenuOpenDesktop}
-															aggregations={aggregations}
-															allModels={allModels}
-															currentModel={narrator.model}
-															totalCostUsd={narrator.totalCostUsd}
-															onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
-															onShowPrice={setPriceModel}
-															providerLabels={providerLabels}
-															onEditDefaultModel={() => setGlobalModelEditTarget("default")}
-															onEditSummaryModel={() => setGlobalModelEditTarget("summary")}
-															{...modelMenuRefreshProps}
-														/>
-													</Menu.Dropdown>
-												</Menu>
-											</Tooltip>
-
-											{/* Reasoning Effort (Codex + Anthropic providers) */}
-											{supportsReasoningEffort && (
-												<Menu position="top-end">
-													<Menu.Target>
-														<NativeSelect
-															size="xs"
-															data={[
-																{
-																	value: displayedReasoningEffort,
-																	label: t(`reasoning_${displayedReasoningEffort}`),
-																},
-															]}
-															value={displayedReasoningEffort}
-															onChange={() => {}}
-															onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-															style={{ pointerEvents: "auto" }}
-														/>
-													</Menu.Target>
-													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-														<ReasoningEffortMenuItems
-															currentEffort={displayedReasoningEffort}
-															options={reasoningEffortOptions}
-															onSelect={(e) =>
-																reasoningEffortMutation.mutate({
-																	id: narratorId,
-																	reasoningEffort: e,
-																})
-															}
-															t={t}
-														/>
-														{!reasoningFollowsDefault && (
-															<Box px="sm" py={4} onClick={(event) => event.stopPropagation()}>
-																<InlineOverrideActions
-																	visible
-																	disabled={reasoningEffortMutation.isPending}
-																	onFollowDefault={handleFollowDefaultReasoning}
-																	onSetAsDefault={handleSetReasoningAsDefault}
-																	t={t}
-																/>
-															</Box>
-														)}
-													</Menu.Dropdown>
-												</Menu>
-											)}
-											{/* Fast Mode toggle (only for Codex-mode providers) */}
-											{supportsCodexControls &&
-												!isMobileViewport &&
-												renderFastModeControl("top-end")}
-											<Tooltip
-												label={
-													narrator.isAskInPassing
-														? t("askInPassing_readOnlyHint")
-														: t("permissionMode")
-												}
-											>
-												{narrator.isAskInPassing ? (
-													<NativeSelect
-														size="xs"
-														leftSection={PERM_MODE_ICONS.readOnly ?? <IconShield size={14} />}
-														data={[{ value: "readOnly", label: t("perm_readOnly") }]}
-														value="readOnly"
-														onChange={() => {}}
-														disabled
-														style={{ pointerEvents: "auto", opacity: 0.6 }}
-													/>
-												) : (
-													<Menu position="top-end">
-														<Menu.Target>
-															<NativeSelect
-																size="xs"
-																leftSection={
-																	PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
-																		<IconShield size={14} />
-																	)
-																}
-																data={PERM_MODE_DATA.map((d) => ({
-																	value: d.value,
-																	label: t(d.label),
-																}))}
-																value={narrator.permissionMode ?? "default"}
-																onChange={() => {}}
-																onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-																style={{ pointerEvents: "auto" }}
-															/>
-														</Menu.Target>
-														<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-															<PermissionMenuContent
-																currentMode={narrator.permissionMode ?? "default"}
-																availablePermissionModes={availablePermissionModes}
-																permissionModesUnavailableReason={permissionModesUnavailableReason}
-																onSelectPermissionMode={(m) =>
-																	permModeMutation.mutate({ id: narratorId, permissionMode: m })
-																}
-																t={t}
-																hasPlanTrait={hasPlanTrait}
-																onTogglePlanMode={togglePlanMode}
-																planModePending={
-																	enterPlanModeMutation.isPending || exitPlanModeMutation.isPending
-																}
-																planModeSupported={planModeSupported}
-																planModeUnsupportedReason={planModeUnsupportedReason}
-																showPlanReflectionAutoApproveToggle={
-																	planReflectionSupported &&
-																	((narrator.permissionMode ?? "default") === "acceptEdits" ||
-																		(narrator.permissionMode ?? "default") === "bypassPermissions")
-																}
-																planReflectionAutoApproveOverride={
-																	planReflectionAutoApproveOverride
-																}
-																planReflectionAutoApproveEffective={
-																	planReflectionAutoApproveEffective
-																}
-																planReflectionAutoApproveGlobal={planReflectionAutoApproveGlobal}
-																onPlanReflectionAutoApproveChange={
-																	handlePlanReflectionAutoApproveOverride
-																}
-																onFollowDefaultPlanReflection={handleFollowDefaultPlanReflection}
-																onSetPlanReflectionAsDefault={handleSetPlanReflectionAsDefault}
-																showDangerReflectionToggle={dangerReflectionSupported}
-																dangerReflectionOverride={dangerReflectionOverride}
-																dangerReflectionEffectiveLevel={dangerReflectionEffectiveLevel}
-																dangerReflectionGlobalLevel={dangerReflectionGlobalLevel}
-																onDangerReflectionChange={handleDangerReflectionOverride}
-																onFollowDefaultDangerReflection={
-																	handleFollowDefaultDangerReflection
-																}
-																onSetDangerReflectionAsDefault={handleSetDangerReflectionAsDefault}
-																reflectionSettingsDisabled={reflectionSettingsDisabled}
-															/>
-														</Menu.Dropdown>
-													</Menu>
-												)}
-											</Tooltip>
-											{narrator.isAskInPassing && (
-												<Tooltip
-													label={
-														narrator.chapterId
-															? t("promote_chapter_hint")
-															: t("promote_standalone_hint")
-													}
-												>
-													<Button
-														size="xs"
-														variant="light"
-														color="teal"
-														loading={promoteMutation.isPending}
-														onClick={handlePromote}
-													>
-														{t("promote")}
-													</Button>
-												</Tooltip>
-											)}
-											<PathRulesPopover narratorId={narratorId} t={t} />
-											{/* Relaxed Plan toggle (only visible in plan mode) */}
-											{hasPlanTrait && (
-												<Tooltip
-													label={
-														relaxedPlanForced
-															? t("relaxed_plan_forced_tooltip")
-															: t("relaxed_plan_tooltip")
-													}
-												>
-													<ActionIcon
-														variant="subtle"
-														color={relaxedPlanEnabled ? "teal" : "gray"}
-														size="sm"
-														aria-label={t("relaxed_plan")}
-														disabled={relaxedPlanForced || relaxedPlanMutation.isPending}
-														onClick={() =>
-															relaxedPlanMutation.mutate({
-																id: narratorId,
-																relaxedPlan: !relaxedPlanEnabled,
-															})
-														}
-													>
-														{relaxedPlanEnabled ? (
-															<IconLockOpen size={16} />
-														) : (
-															<IconLock size={16} />
-														)}
-													</ActionIcon>
-												</Tooltip>
-											)}
-											{(terminalToolAvailable || onOpenTerminalPanel) && (
-												<Tooltip
-													label={
-														onOpenTerminalPanel
-															? tt("openTerminal")
-															: terminalToolOpened
-																? tt("closeTerminal")
-																: tt("openTerminal")
-													}
-												>
-													<Indicator
-														inline
-														label={activeTerminalCount}
-														size={14}
-														disabled={activeTerminalCount === 0}
-														offset={2}
-														color="blue"
-														style={{
-															height: "var(--ai-size-sm)",
-															display: "flex",
-															alignItems: "center",
-														}}
-													>
-														<ActionIcon
-															variant="subtle"
-															color={terminalToolOpened ? "blue" : "gray"}
-															size="sm"
-															aria-label={
-																onOpenTerminalPanel
-																	? tt("openTerminal")
-																	: terminalToolOpened
-																		? tt("closeTerminal")
-																		: tt("openTerminal")
-															}
-															onClick={onOpenTerminalPanel ?? toggleTerminalTool}
-														>
-															<IconTerminal size={16} />
-														</ActionIcon>
-													</Indicator>
-												</Tooltip>
-											)}
-										</Group>
-									)}
-									{/* Mobile: model & permission */}
-									<Box
-										style={{ minWidth: 0, width: "100%" }}
-										{...(compact ? {} : { hiddenFrom: "sm" as const })}
-									>
-										<NarratorStatusToolbar
-											leading={
-												<>
-													<Tooltip label={t("modelTooltip")}>
-														<Menu
-															position="bottom-end"
-															withinPortal
-															opened={modelMenuOpenMobile}
-															onChange={(o) => {
-																if (!o && priceModel != null) return;
-																setModelMenuOpenMobile(o);
-															}}
-														>
-															<Menu.Target>
-																<ActionIcon
-																	variant="subtle"
-																	color="gray"
-																	size="sm"
-																	aria-label={t("modelTooltip")}
-																>
-																	<Text size="xs" fw={600}>
-																		{(() => {
-																			if (
-																				narrator.model === FOLLOW_DEFAULT_MODEL ||
-																				!narrator.model
-																			)
-																				return "D";
-																			const m = allModels.find((x) => x.value === narrator.model);
-																			// charAt(0) is safe on empty strings ("" → ""); fall back to "?"
-																			// so an empty label never produces `undefined.toUpperCase()`.
-																			return (
-																				(m?.label || narrator.model || "?")
-																					.charAt(0)
-																					.toUpperCase() || "?"
-																			);
-																		})()}
-																	</Text>
-																</ActionIcon>
-															</Menu.Target>
-															<Menu.Dropdown
-																data-model-menu-scroll
-																style={{ maxHeight: "60vh", overflowY: "auto" }}
-															>
-																<ModelMenuItems
-																	opened={modelMenuOpenMobile}
-																	aggregations={aggregations}
-																	allModels={allModels}
-																	currentModel={narrator.model}
-																	totalCostUsd={narrator.totalCostUsd}
-																	onSelect={(v) =>
-																		modelMutation.mutate({ id: narratorId, model: v })
-																	}
-																	onShowPrice={setPriceModel}
-																	label={t("modelTooltip")}
-																	providerLabels={providerLabels}
-																	onEditDefaultModel={() => setGlobalModelEditTarget("default")}
-																	onEditSummaryModel={() => setGlobalModelEditTarget("summary")}
-																	{...modelMenuRefreshProps}
-																/>
-															</Menu.Dropdown>
-														</Menu>
-													</Tooltip>
-
-													{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
-													{supportsReasoningEffort && (
-														<Menu position="bottom-end" withinPortal>
-															<Menu.Target>
-																<ActionIcon
-																	variant="subtle"
-																	color="gray"
-																	size="sm"
-																	aria-label={t("reasoningEffort")}
-																>
-																	<Text size="xs" fw={600}>
-																		{(() => {
-																			const effortMap = {
-																				none: "O",
-																				low: "L",
-																				medium: "M",
-																				high: "H",
-																				xhigh: "X",
-																				max: "MX",
-																			};
-																			return (
-																				effortMap[
-																					displayedReasoningEffort as keyof typeof effortMap
-																				] ?? "A"
-																			);
-																		})()}
-																	</Text>
-																</ActionIcon>
-															</Menu.Target>
-															<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-																<ReasoningEffortMenuItems
-																	currentEffort={displayedReasoningEffort}
-																	options={reasoningEffortOptions}
-																	onSelect={(e) =>
-																		reasoningEffortMutation.mutate({
-																			id: narratorId,
-																			reasoningEffort: e,
-																		})
-																	}
-																	t={t}
-																/>
-																{!reasoningFollowsDefault && (
-																	<Box px="sm" py={4} onClick={(event) => event.stopPropagation()}>
-																		<InlineOverrideActions
-																			visible
-																			disabled={reasoningEffortMutation.isPending}
-																			onFollowDefault={handleFollowDefaultReasoning}
-																			onSetAsDefault={handleSetReasoningAsDefault}
-																			t={t}
-																		/>
-																	</Box>
-																)}
-															</Menu.Dropdown>
-														</Menu>
-													)}
-													{/* Fast Mode toggle (only for Codex-mode providers) - Mobile */}
-													{supportsCodexControls &&
-														(compact || isMobileViewport) &&
-														renderFastModeControl("bottom-end")}
-													<Tooltip
-														label={
-															narrator.isAskInPassing
-																? t("askInPassing_readOnlyHint")
-																: t("permissionMode")
-														}
-													>
-														{narrator.isAskInPassing ? (
-															<ActionIcon
-																variant="subtle"
-																color="gray"
-																size="sm"
-																aria-label={t("askInPassing_readOnlyHint")}
-																disabled
-																style={{ opacity: 0.6 }}
-															>
-																{PERM_MODE_ICONS.readOnly ?? <IconShield size={16} />}
-															</ActionIcon>
-														) : (
-															<Menu position="bottom-end" withinPortal>
-																<Menu.Target>
-																	<ActionIcon
-																		variant="subtle"
-																		color="gray"
-																		size="sm"
-																		aria-label={t("permissionMode")}
-																	>
-																		{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
-																			<IconShield size={16} />
-																		)}
-																	</ActionIcon>
-																</Menu.Target>
-																<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-																	<PermissionMenuContent
-																		currentMode={narrator.permissionMode ?? "default"}
-																		availablePermissionModes={availablePermissionModes}
-																		permissionModesUnavailableReason={
-																			permissionModesUnavailableReason
-																		}
-																		onSelectPermissionMode={(m) =>
-																			permModeMutation.mutate({ id: narratorId, permissionMode: m })
-																		}
-																		t={t}
-																		hasPlanTrait={hasPlanTrait}
-																		onTogglePlanMode={togglePlanMode}
-																		planModePending={
-																			enterPlanModeMutation.isPending ||
-																			exitPlanModeMutation.isPending
-																		}
-																		planModeSupported={planModeSupported}
-																		planModeUnsupportedReason={planModeUnsupportedReason}
-																		showPlanReflectionAutoApproveToggle={
-																			planReflectionSupported &&
-																			((narrator.permissionMode ?? "default") === "acceptEdits" ||
-																				(narrator.permissionMode ?? "default") ===
-																					"bypassPermissions")
-																		}
-																		planReflectionAutoApproveOverride={
-																			planReflectionAutoApproveOverride
-																		}
-																		planReflectionAutoApproveEffective={
-																			planReflectionAutoApproveEffective
-																		}
-																		planReflectionAutoApproveGlobal={
-																			planReflectionAutoApproveGlobal
-																		}
-																		onPlanReflectionAutoApproveChange={
-																			handlePlanReflectionAutoApproveOverride
-																		}
-																		onFollowDefaultPlanReflection={
-																			handleFollowDefaultPlanReflection
-																		}
-																		onSetPlanReflectionAsDefault={handleSetPlanReflectionAsDefault}
-																		showDangerReflectionToggle={dangerReflectionSupported}
-																		dangerReflectionOverride={dangerReflectionOverride}
-																		dangerReflectionEffectiveLevel={dangerReflectionEffectiveLevel}
-																		dangerReflectionGlobalLevel={dangerReflectionGlobalLevel}
-																		onDangerReflectionChange={handleDangerReflectionOverride}
-																		onFollowDefaultDangerReflection={
-																			handleFollowDefaultDangerReflection
-																		}
-																		onSetDangerReflectionAsDefault={
-																			handleSetDangerReflectionAsDefault
-																		}
-																		reflectionSettingsDisabled={reflectionSettingsDisabled}
-																	/>
-																</Menu.Dropdown>
-															</Menu>
-														)}
-													</Tooltip>
-												</>
-											}
-											actions={mobileToolbarActions}
-											moreLabel={t("moreActions")}
-											measurementKey={mobileToolbarMeasurementKey}
-										/>
-									</Box>
-								</Group>
-							</>
-						)}
-					</NarratorStatusBar>
-
-					{/* Question inbox, directly above the composer.
-					    This is where the user is when they are about to act, and an unanswered
-					    question IS an action. The two alternatives were worse: a banner in the
-					    message area scrolls away with the conversation, and the header toolbar
-					    has a capacity budget that DROPS entries when it overflows — a question
-					    waiting on the user must never be what gets dropped.
-
-					    Renders nothing when no question is open anywhere, so it costs no space
-					    in the common case. Scoped to the current session for its label and
-					    grouping, but the drawer it opens spans every session. */}
-					{!isWorkspacePreview && showHumanAttentionInbox && (
-						<Box px="md" pb={4} style={{ flexShrink: 0 }}>
-							<HumanAttentionInboxButton currentNarratorId={narratorId} />
-						</Box>
-					)}
-
-					{/* Input */}
-					{isWorkspacePreview ? null : isChapterMerged ? (
-						<Box
-							px="md"
-							py="sm"
-							style={{
-								flexShrink: 0,
-								backgroundColor:
-									"light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
-								opacity: 0.7,
-							}}
-						>
-							<Text size="sm" c="dimmed" ta="center">
-								{t("chapterMergedHint")}
-							</Text>
-						</Box>
-					) : (
-						<Box px="md" pb="xs" style={{ flexShrink: 0 }}>
-							<input
-								ref={fileInputRef}
-								type="file"
-								multiple
-								style={{ display: "none" }}
-								onChange={(e) => {
-									if (e.target.files) {
-										const files = Array.from(e.target.files);
-										const imageFiles: File[] = [];
-										const textFileList: File[] = [];
-										const unsupported: string[] = [];
-										for (const f of files) {
-											if (ACCEPTED_TYPES.includes(f.type)) {
-												imageFiles.push(f);
-											} else if (isTextFile(f.name)) {
-												textFileList.push(f);
-											} else {
-												unsupported.push(f.name);
-											}
-										}
-										if (unsupported.length > 0) {
-											notifications.show({
-												title: t("unsupportedFileType"),
-												message: unsupported.join(", "),
-												color: "yellow",
-											});
-										}
-										if (imageFiles.length > 0) addImages(imageFiles);
-										if (textFileList.length > 0) addTextFiles(textFileList);
-										e.target.value = "";
-									}
-								}}
-							/>
-							<Group gap="xs" align="end" wrap="nowrap">
-								<Tooltip label={t("attachFile")}>
-									<ActionIcon
-										variant="subtle"
-										color="gray"
-										onClick={() => fileInputRef.current?.click()}
-										mb={4}
-									>
-										<IconPaperclip size={18} />
-									</ActionIcon>
-								</Tooltip>
-								<NarratorComposer
-									ref={composerRef}
-									narratorId={narratorId}
-									sendingRef={sendingRef}
-									appendInputRef={appendInputRef}
-									permEnterActive={effectiveFocusIndex != null}
-									hasAttachments={composerHasAttachments}
-									enterMode={userPrefs?.enterQueueMode ?? "turn"}
-									ctrlEnterMode={userPrefs?.ctrlEnterQueueMode ?? "tool"}
-									onSendWithMode={composerSendWithMode}
-									onTextFlagsChange={setComposerHasText}
-									onPasteImages={handleComposerPasteImages}
-								/>
-								{(() => {
-									const hasInput = composerHasText;
-									const hasAttachments = composerHasAttachments;
-
-									// Takeover button: shown while a subagent is running and not yet
-									// taken over. Clicking it interrupts the current turn and hands
-									// direct control to the user (parent tool call stays blocked).
-									if (canTakeover && !hasInput && !hasAttachments && !editingMessageState) {
-										return (
-											<Button
-												key="takeover"
-												color="grape"
-												variant="light"
-												onClick={() => takeoverMutation.mutate(narratorId)}
-												loading={takeoverMutation.isPending}
-											>
-												{t("takeover")}
-											</Button>
-										);
-									}
-
-									// The primary action button (send / interrupt / retry / continue /
-									// queue / edit-submit). Extracted so it can be reused inside the
-									// takeover two-button layout.
-									const renderPrimaryActionButton = () => {
-										const showInterrupt =
-											isActive && !hasInput && !hasAttachments && retryRecoveryAllowsInterrupt;
-
-										// "Cut in line" describes a Stop that hands the turn over to the
-										// queued priority message. A taken-over subagent has no cut-in
-										// semantics (see `canCutInLine`): its queue is filled without a
-										// soft stop, so the label would name an action the server does
-										// not perform — and it sat on the one button whose hold gesture
-										// interrupts, which is how "cut in" got read as "interrupt".
-										const hasCutInMessage = !isTakenOver && !!queuedMessages[0]?.priority;
-										const showRetry =
-											!showInterrupt && !hasInput && !hasAttachments && canRetryLastUserMessage;
-										const showContinue =
-											!showInterrupt && !hasInput && !hasAttachments && canContinueNarrator;
-
-										// Wrap a primary button as the right segment of the split
-										// send-options control (three-dots menu on the left). Used for
-										// every send-flow state so the queue-behavior menu is always
-										// reachable. Not used for the modal edit-submit sub-state.
-										const withSendOptions = (
-											primaryButton: React.ReactNode,
-											opts?: { color?: string; variant?: string },
-										) => (
-											<SendOptionsSplitButton
-												enterQueueMode={userPrefs?.enterQueueMode ?? "turn"}
-												ctrlEnterQueueMode={userPrefs?.ctrlEnterQueueMode ?? "tool"}
-												hasInput={hasInput || hasAttachments}
-												compacting={showCompactQueueChoice}
-												color={opts?.color}
-												variant={opts?.variant}
-												onSelectEnterMode={(mode) =>
-													updateUserPrefs.mutate({ enterQueueMode: mode })
-												}
-												onSelectCtrlEnterMode={(mode) =>
-													updateUserPrefs.mutate({ ctrlEnterQueueMode: mode })
-												}
-												onSendWithMode={(mode) => {
-													void handleSendWithMode(mode);
-												}}
-												t={t}
-												primaryButton={primaryButton}
-											/>
-										);
-
-										// When a message is being edited, the send/retry button
-										// should trigger the edit submit instead. No send options here —
-										// queue behaviors don't apply to editing a message.
-										if (editingMessageState && !showInterrupt) {
-											return (
-												<Button
-													key="edit-submit"
-													onClick={editingMessageState.submit}
-													disabled={!editingMessageState.canSubmit}
-													loading={editingMessageState.isSubmitting}
-												>
-													{t("editSubmit")}
-												</Button>
-											);
-										}
-										if (showInterrupt) {
-											return withSendOptions(
-												<Button
-													key="interrupt"
-													ref={interruptBtnRef}
-													color="red"
-													variant="light"
-													onMouseDown={startInterruptPress}
-													onMouseUp={handleInterruptMouseUp}
-													onMouseLeave={clearInterruptTimer}
-													onContextMenu={(e) => e.preventDefault()}
-													loading={interruptMutation.isPending}
-													style={{
-														position: "relative",
-														overflow: "hidden",
-														userSelect: "none",
-														touchAction: "none",
-													}}
-												>
-													{interruptProgress > 0 && interruptProgress < 1 && (
-														<div
-															style={{
-																position: "absolute",
-																inset: 0,
-																background: "var(--mantine-color-red-filled)",
-																opacity: 0.25,
-																transformOrigin: "left",
-																transform: `scaleX(${interruptProgress})`,
-																pointerEvents: "none",
-															}}
-														/>
-													)}
-													<span style={{ position: "relative" }}>
-														{hasCutInMessage ? t("interruptCutInLine") : t("interrupt")}
-													</span>
-												</Button>,
-												{ color: "red", variant: "light" },
-											);
-										}
-										if (showRetry) {
-											return withSendOptions(
-												<Button key="retry" onClick={handleRetry}>
-													{t("retry")}
-												</Button>,
-											);
-										}
-										if (showContinue) {
-											return withSendOptions(
-												<Button key="continue" onClick={handleContinue}>
-													{t("continue")}
-												</Button>,
-											);
-										}
-										// Idle but compacting: the message will be QUEUED (the server holds
-										// it until the compaction settles), so the button says so rather
-										// than promising an immediate send. No hold gesture here — the
-										// alternative is a single "run now" item in the split menu, and a
-										// long-press that silently bypassed the compaction would be a
-										// surprising default for a two-way choice.
-										if (showCompactQueueChoice) {
-											return withSendOptions(
-												<Button
-													key="send-compact-queue"
-													onClick={handleSend}
-													disabled={!hasInput && !hasAttachments}
-													loading={isSending}
-												>
-													{queuedMessages.length > 0
-														? `${t("queue")} (${queuedMessages.length})`
-														: t("queue")}
-												</Button>,
-											);
-										}
-										return canCutInLine
-											? withSendOptions(
-													<Tooltip
-														label={t("queueButtonPressHint", {
-															shortMode: t(`queueMode_${userPrefs?.enterQueueMode ?? "turn"}`),
-															longMode: t(`queueMode_${userPrefs?.ctrlEnterQueueMode ?? "tool"}`),
-														})}
-														position="top"
-													>
-														<Button
-															key="send-priority"
-															disabled={!hasInput && !hasAttachments}
-															loading={isSending}
-															onPointerDown={(event) => {
-																if (!hasInput && !hasAttachments) return;
-																startQueueHold(event);
-															}}
-															onPointerUp={handleQueuePointerUp}
-															onPointerCancel={cancelQueueHold}
-															onPointerLeave={cancelQueueHold}
-															onClick={handleQueueClick}
-															onContextMenu={(e) => e.preventDefault()}
-															style={{
-																position: "relative",
-																overflow: "hidden",
-																userSelect: "none",
-																touchAction: "none",
-															}}
-														>
-															{queueHoldProgress > 0 && queueHoldProgress < 1 && (
-																<div
-																	style={{
-																		position: "absolute",
-																		inset: 0,
-																		background: "var(--mantine-color-indigo-filled)",
-																		opacity: 0.25,
-																		transformOrigin: "left",
-																		transform: `scaleX(${queueHoldProgress})`,
-																		pointerEvents: "none",
-																	}}
-																/>
-															)}
-															<span style={{ position: "relative" }}>
-																{queuedMessages.length > 0
-																	? `${t("queue")} (${queuedMessages.length})`
-																	: t("queue")}
-															</span>
-														</Button>
-													</Tooltip>,
-												)
-											: withSendOptions(
-													<Button
-														key="send"
-														onClick={handleSend}
-														disabled={!hasInput && !hasAttachments}
-														loading={isSending}
-													>
-														{tc("send")}
-													</Button>,
-												);
-									};
-
-									// Takeover mode: the user operates the subagent like an
-									// independent narrator (send/interrupt/queue/continue) plus a
-									// dedicated "Stop takeover" button to hand the result back.
-									if (isTakenOver) {
-										return (
-											<Group gap="xs" align="end" wrap="nowrap">
-												{renderPrimaryActionButton()}
-												<Tooltip label={t("stopTakeoverHint")} position="top">
-													<Button
-														key="stop-takeover"
-														color="grape"
-														variant="outline"
-														onClick={() => stopTakeoverMutation.mutate(narratorId)}
-														loading={stopTakeoverMutation.isPending}
-													>
-														{t("stopTakeover")}
-													</Button>
-												</Tooltip>
-											</Group>
-										);
-									}
-
-									return renderPrimaryActionButton();
-								})()}
-							</Group>
-						</Box>
-					)}
+									if (imageFiles.length > 0) addImages(imageFiles);
+									if (textFileList.length > 0) addTextFiles(textFileList);
+									e.target.value = "";
+								}
+							},
+							onComposerPasteImages: handleComposerPasteImages,
+							onSendWithMode: composerSendWithMode,
+							onSend: handleSend,
+							onRetry: handleRetry,
+							onContinue: handleContinue,
+							onTakeover: () => takeoverMutation.mutate(narratorId),
+							onStopTakeover: () => stopTakeoverMutation.mutate(narratorId),
+							queuedMessagesCount: queuedMessages.length,
+							showCompactQueueChoice,
+							canCutInLine,
+							hasCutInMessage: !isTakenOver && !!queuedMessages[0]?.priority,
+							canTakeover,
+							isTakenOver,
+							canRetryLastUserMessage,
+							canContinueNarrator,
+							retryRecoveryAllowsInterrupt,
+							editingMessageState,
+							isSending,
+							takeoverMutationPending: takeoverMutation.isPending,
+							stopTakeoverMutationPending: stopTakeoverMutation.isPending,
+							interruptMutationPending: interruptMutation.isPending,
+							interruptProgress,
+							queueHoldProgress,
+							startInterruptPress,
+							handleInterruptMouseUp,
+							clearInterruptTimer,
+							startQueueHold,
+							handleQueuePointerUp,
+							cancelQueueHold,
+							handleQueueClick,
+							onUpdateEnterQueueMode: (mode) => updateUserPrefs.mutate({ enterQueueMode: mode }),
+							onUpdateCtrlEnterQueueMode: (mode) =>
+								updateUserPrefs.mutate({ ctrlEnterQueueMode: mode }),
+						}}
+					/>
+					{/* ═══════════════════ End Bottom Interaction Area ═══════════════════ */}
 
 					{/* Only mount the lazy Drawer after its first open (mobile / workspace). */}
 					{!dock &&
