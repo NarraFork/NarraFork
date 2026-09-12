@@ -6,7 +6,7 @@ import { parseHTML } from "linkedom";
 import { act, StrictMode, useLayoutEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import narratorLocale from "../../locales/en/narrator.json";
+import narratorLocale from "../../../locales/en/narrator.json";
 import { AutoFollowScroll, type ContentRowTarget, useContentViewport } from "./AutoFollowScroll";
 
 let root: Root;

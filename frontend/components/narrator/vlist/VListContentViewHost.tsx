@@ -41,8 +41,8 @@ import {
 	useRef,
 	useState,
 } from "react";
-import type { ContentViewportSnapshot } from "../AutoFollowScroll";
-import { useRenderInteractive } from "../RenderLodCtx";
+import { useRenderInteractive } from "../lod/RenderLodCtx";
+import type { ContentViewportSnapshot } from "../scroll/AutoFollowScroll";
 import { VListContentViewActions } from "./VListContentViewActions";
 import {
 	type FloatState,

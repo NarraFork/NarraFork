@@ -25,7 +25,7 @@ const NarratorTerminal = lazy(() =>
 	})),
 );
 const SpecPanel = lazy(() =>
-	import("../../components/narrator/SpecPanel").then((m) => ({
+	import("../../components/narrator/spec/SpecPanel").then((m) => ({
 		default: m.SpecPanel,
 	})),
 );

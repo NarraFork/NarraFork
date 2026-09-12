@@ -78,8 +78,8 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
-import { AutoFollowScroll } from "../../AutoFollowScroll";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
+import { AutoFollowScroll } from "../../scroll/AutoFollowScroll";
 import { OPTION_CONTROL_SIZE } from "../measure/measure-permission";
 import {
 	CARD_HEADER_INNER_ICON,

@@ -6,7 +6,7 @@ import { type AdapterMessage, adaptSegments } from "@shared/pretext-layout/segme
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { FileReferenceScopeProvider } from "../../FileReferenceScope";
+import { FileReferenceScopeProvider } from "../../composer/FileReferenceScope";
 import { buildStreamingMsg, type StreamingBlock } from "../../message/message-segments";
 import type { NarratorMsg } from "../../narrator-panel-types";
 import {

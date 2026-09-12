@@ -18,7 +18,10 @@ import { layoutWithLines } from "@chenglou/pretext";
 import type { FileReference } from "@shared/file-reference";
 import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
 import { useId, useMemo } from "react";
-import { FileReferenceScopeProvider, useFileReferenceScope } from "../../FileReferenceScope";
+import {
+	FileReferenceScopeProvider,
+	useFileReferenceScope,
+} from "../../composer/FileReferenceScope";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import {
 	ASSISTANT_PAD_X,

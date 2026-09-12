@@ -1,5 +1,5 @@
-import { ApiError, authorizedFetch, readFetchError } from "../../lib/api";
-import { apiUrl, isApiUrl, resolveServerUrl } from "../../lib/base-path";
+import { ApiError, authorizedFetch, readFetchError } from "../../../lib/api";
+import { apiUrl, isApiUrl, resolveServerUrl } from "../../../lib/base-path";
 
 export const MAX_INLINE_IMAGE_SOURCE_CHARS = 16 * 1024 * 1024;
 export const MAX_IMAGE_CLIPBOARD_BLOB_BYTES = 25 * 1024 * 1024;

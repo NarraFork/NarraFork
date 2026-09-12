@@ -10,7 +10,7 @@ import {
 import { foldHandle, HANDLE_CHAR_RE, HANDLE_START_RE } from "@shared/narrator-handle";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Z } from "../../lib/z-index";
+import { Z } from "../../../lib/z-index";
 
 export interface MentionCandidate {
 	id: string;

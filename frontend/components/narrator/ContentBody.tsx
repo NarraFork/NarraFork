@@ -4,8 +4,8 @@ import type { FileReferenceContext } from "@shared/file-reference";
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { DiffDocument } from "@shared/pretext-layout/diff-core";
 import { type CSSProperties, lazy, Suspense } from "react";
+import { FileReferenceScopeProvider } from "./composer/FileReferenceScope";
 import { DiffContent } from "./diff/DiffContent";
-import { FileReferenceScopeProvider } from "./FileReferenceScope";
 import { MarkdownContent } from "./markdown/MarkdownContent";
 
 const HighlightedCode = lazy(() =>

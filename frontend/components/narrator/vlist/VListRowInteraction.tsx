@@ -61,6 +61,7 @@ import { lazy, type ReactNode, Suspense, useCallback, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { CompactMenuSub } from "../CompactMenuSub";
+import { useRenderInteractive } from "../lod/RenderLodCtx";
 import type { MessageContextMenuActions } from "../message/MessageContextMenuCtx";
 import {
 	BLOCK_ID_ATTR,
@@ -68,7 +69,6 @@ import {
 	shouldIgnoreMessageBlockSelection,
 	useMessageSelection,
 } from "../message/MessageSelectionCtx";
-import { useRenderInteractive } from "../RenderLodCtx";
 import { useToolEditNavigation } from "../useToolEditNavigation";
 import type { VListRowToolActions } from "./vlist-row-actions";
 import type { VListToolMeta } from "./vlist-tool-meta";

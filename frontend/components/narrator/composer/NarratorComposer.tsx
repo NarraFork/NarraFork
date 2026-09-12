@@ -15,18 +15,18 @@ import {
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { useCurrentUser } from "../../hooks/useAuth";
-import { useNarratorCommands } from "../../hooks/useCommands";
-import { useInputHistory, writeInputHistoryEntries } from "../../hooks/useInputHistory";
-import { useNamedNarrators } from "../../hooks/useNamedNarrator";
-import { usePromptOptimize } from "../../hooks/usePromptOptimize";
-import { ApiError, api } from "../../lib/api";
-import { narratorsApi } from "../../lib/api/narrators";
-import { formatLocaleNumber } from "../../lib/intl-format";
+import { useCurrentUser } from "../../../hooks/useAuth";
+import { useNarratorCommands } from "../../../hooks/useCommands";
+import { useInputHistory, writeInputHistoryEntries } from "../../../hooks/useInputHistory";
+import { useNamedNarrators } from "../../../hooks/useNamedNarrator";
+import { usePromptOptimize } from "../../../hooks/usePromptOptimize";
+import { ApiError, api } from "../../../lib/api";
+import { narratorsApi } from "../../../lib/api/narrators";
+import { formatLocaleNumber } from "../../../lib/intl-format";
+import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ComposerFullscreenModal } from "./ComposerFullscreenModal";
-import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { FileReferencePopover } from "./FileReferencePopover";
 import { useFileReferenceScope } from "./FileReferenceScope";
 import {

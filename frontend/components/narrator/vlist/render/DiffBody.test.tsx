@@ -18,8 +18,8 @@ import { MantineProvider } from "@mantine/core";
 import { createDiffDocument, projectDiffDocument } from "@shared/pretext-layout/diff-core";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
-import { AutoFollowScroll } from "../../AutoFollowScroll";
 import { DiffContent } from "../../diff/DiffContent";
+import { AutoFollowScroll } from "../../scroll/AutoFollowScroll";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 
 const disposeCanvas = installCanvasStub();

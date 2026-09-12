@@ -1,7 +1,7 @@
 import {
 	copyGeneratedImageToClipboard,
 	fetchImageBlob,
-} from "../components/narrator/image-clipboard";
+} from "../components/narrator/composer/image-clipboard";
 
 export interface ImageActionSource {
 	/** Directly-displayable URL (blob:/data:/http(s)/relative /api path). */

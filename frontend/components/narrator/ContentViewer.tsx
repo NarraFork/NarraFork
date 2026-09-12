@@ -43,11 +43,13 @@ import {
 	safeAreaFullscreenModalBodyStyle,
 } from "../../lib/safe-area";
 import { Z } from "../../lib/z-index";
-import { AutoFollowScroll, type ContentViewportLayout } from "./AutoFollowScroll";
 import { CompactMenuSub } from "./CompactMenuSub";
 import { ContentBody } from "./ContentBody";
-import { useDetachFromBottom } from "./DetachFromBottomCtx";
-import { FileReferenceScopeProvider, type FileReferenceScopeValue } from "./FileReferenceScope";
+import {
+	FileReferenceScopeProvider,
+	type FileReferenceScopeValue,
+} from "./composer/FileReferenceScope";
+import { useRenderInteractive } from "./lod/RenderLodCtx";
 import { useMessageContextMenu } from "./message/MessageContextMenuCtx";
 import {
 	BLOCK_ID_ATTR,
@@ -56,7 +58,8 @@ import {
 	shouldIgnoreMessageBlockSelection,
 	useMessageSelection,
 } from "./message/MessageSelectionCtx";
-import { useRenderInteractive } from "./RenderLodCtx";
+import { AutoFollowScroll, type ContentViewportLayout } from "./scroll/AutoFollowScroll";
+import { useDetachFromBottom } from "./scroll/DetachFromBottomCtx";
 
 const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
 const INLINE_FULL_CONTENT_MAX_CHARS = 20_000;

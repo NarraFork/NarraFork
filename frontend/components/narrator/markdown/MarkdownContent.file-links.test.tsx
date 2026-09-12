@@ -6,7 +6,10 @@ import { fileTargetFromHref } from "@shared/markdown-file-path";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { FileReferenceScopeProvider, type FileReferenceScopeValue } from "../FileReferenceScope";
+import {
+	FileReferenceScopeProvider,
+	type FileReferenceScopeValue,
+} from "../composer/FileReferenceScope";
 import { MarkdownContent } from "./MarkdownContent";
 
 const { installCanvasStub } = await import("../vlist/measure/test-canvas-stub");

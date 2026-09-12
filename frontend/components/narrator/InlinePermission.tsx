@@ -16,8 +16,8 @@ import { IconFileCode } from "@tabler/icons-react";
 import { type CSSProperties, type ReactNode, useContext, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
-import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "./message/MessageSelectionCtx";
+import { AskUserQuestionBanner, coerceQuestions } from "./question/AskUserQuestionBanner";
 import { FileModDrawerCtx, PermEnterHintCtx } from "./tool-call/tool-call-contexts";
 
 const noop = () => {};

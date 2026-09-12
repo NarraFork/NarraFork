@@ -23,7 +23,7 @@ import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "@front
 import { apiUrl, resolveServerUrl } from "@frontend/lib/base-path";
 import { useCallback, useEffect, useState } from "react";
 import { useImageViewer } from "../../../common/image-viewer-context";
-import { MAX_INLINE_IMAGE_SOURCE_CHARS } from "../../image-clipboard";
+import { MAX_INLINE_IMAGE_SOURCE_CHARS } from "../../composer/image-clipboard";
 
 /** Cap a preview blob so a runaway file never balloons memory (25 MB). */
 const MAX_PREVIEW_BLOB_BYTES = 25 * 1024 * 1024;

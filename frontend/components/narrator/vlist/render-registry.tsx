@@ -14,7 +14,7 @@
  */
 
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
-import { FileReferenceScopeProvider } from "../FileReferenceScope";
+import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
 import type { VListElementKind } from "./registry";
 import { RenderAskInPassing } from "./render/RenderAskInPassing";

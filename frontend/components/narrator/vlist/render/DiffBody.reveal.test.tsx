@@ -6,8 +6,8 @@ import { createDiffDocument, MAX_DIFF_LINES } from "@shared/pretext-layout/diff-
 import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
-import { AutoFollowScroll } from "../../AutoFollowScroll";
 import { DiffContent } from "../../diff/DiffContent";
+import { AutoFollowScroll } from "../../scroll/AutoFollowScroll";
 import { measureToolCall } from "../measure/measure-tool-call";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 import { RenderToolCall } from "./RenderToolCall";

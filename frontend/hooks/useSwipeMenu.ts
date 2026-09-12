@@ -7,7 +7,7 @@ import {
 	getGlobalToggleBlock,
 	setGlobalCloseSwipe,
 	setGlobalSwipeAnchor,
-} from "../components/narrator/swipeState";
+} from "../components/narrator/scroll/swipeState";
 import { collectElementTextPreview, compactWhitespacePreview } from "../lib/dom-text";
 import { findVerticalScrollParent, resolveSwipeAnchorOffScreen } from "./scroll-parent";
 

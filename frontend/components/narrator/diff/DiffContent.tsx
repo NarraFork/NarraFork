@@ -41,7 +41,7 @@ import {
 	useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { useContentViewport } from "../AutoFollowScroll";
+import { useContentViewport } from "../scroll/AutoFollowScroll";
 import { DiffWordTokens } from "./DiffWordTokens";
 
 export interface DiffContentProps {

@@ -8,7 +8,8 @@ import {
 } from "../../plugins/PluginContributionPicker";
 import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
 import { ExecutionDeviceMenu } from "../ExecutionDeviceMenu";
-import { NarratorLodMenu } from "../NarratorLodMenu";
+import { NarratorLodMenu } from "../lod/NarratorLodMenu";
+import type { RenderLod } from "../lod/RenderLodCtx";
 import { NarratorToolbarOverflowMenu } from "../NarratorToolbarOverflowMenu";
 import { HEADER_TOOLBAR_FIXED_ATTR } from "../narrator-header-toolbar-capacity";
 import {
@@ -20,7 +21,6 @@ import type {
 	NarratorToolbarId,
 	NarratorToolbarItemDef,
 } from "../narrator-toolbar-items";
-import type { RenderLod } from "../RenderLodCtx";
 
 // biome-ignore lint/suspicious/noExplicitAny: react-query result passthrough from NarratorPanel.
 type QueryLike = any;

@@ -23,7 +23,7 @@ import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { RenderLodCtx } from "../../RenderLodCtx";
+import { RenderLodCtx } from "../../lod/RenderLodCtx";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 
 const CONTENT_WIDTH = 800;

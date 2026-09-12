@@ -4,7 +4,7 @@ import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { BufferMessageSummary } from "../../../lib/api";
 import { api } from "../../../lib/api";
-import type { NarratorComposerHandle } from "../NarratorComposer";
+import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 
 /** Number of queued messages before the queue collapses into a summary bar. */
 const QUEUE_COLLAPSE_THRESHOLD = 2;

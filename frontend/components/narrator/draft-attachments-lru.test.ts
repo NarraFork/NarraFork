@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	type DraftAttachmentRecordStat,
 	selectDraftAttachmentsToEvict,
-} from "./draft-image-attachments";
+} from "./composer/draft-image-attachments";
 
 const NOW = 1_800_000_000_000;
 const DAY_MS = 24 * 60 * 60 * 1000;

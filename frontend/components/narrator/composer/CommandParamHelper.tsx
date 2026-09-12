@@ -1,7 +1,7 @@
 import { Badge, Group, Paper, ScrollArea, Stack, Text } from "@mantine/core";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { Z } from "../../lib/z-index";
+import { Z } from "../../../lib/z-index";
 import type { CommandItem, CommandParam } from "./CommandPopover";
 
 interface CommandParamHelperProps {

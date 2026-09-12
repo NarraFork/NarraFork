@@ -18,7 +18,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { globalQuestionsQueryKey } from "../../hooks/useAsyncQuestions";
+import { globalQuestionsQueryKey } from "../../../hooks/useAsyncQuestions";
 import {
 	groupHumanAttentionByScope,
 	humanAttentionListKey,
@@ -27,13 +27,13 @@ import {
 	loadedHumanAttentionItems,
 	useHumanAttention,
 	useHumanAttentionDetail,
-} from "../../hooks/useHumanAttention";
-import { api } from "../../lib/api";
-import { readSession, writeSession } from "../../lib/session-store";
+} from "../../../hooks/useHumanAttention";
+import { api } from "../../../lib/api";
+import { readSession, writeSession } from "../../../lib/session-store";
+import { InlinePermission } from "../InlinePermission";
+import { FileModDrawerCtx, PermEnterHintCtx } from "../tool-call/tool-call-contexts";
 import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
 import { toBannerQuestions } from "./async-question-questions";
-import { InlinePermission } from "./InlinePermission";
-import { FileModDrawerCtx, PermEnterHintCtx } from "./tool-call/tool-call-contexts";
 
 /** A global-inbox row: the question plus enough context to say which session it is. */
 export interface GlobalQuestion extends AsyncQuestion {
@@ -41,7 +41,7 @@ export interface GlobalQuestion extends AsyncQuestion {
 	chapterId: string | null;
 }
 
-export { globalQuestionsQueryKey } from "../../hooks/useAsyncQuestions";
+export { globalQuestionsQueryKey } from "../../../hooks/useAsyncQuestions";
 
 export function useGlobalAsyncQuestions(enabled = true) {
 	return useQuery({

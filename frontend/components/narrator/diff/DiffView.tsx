@@ -1,7 +1,7 @@
 import { createDiffDocument, type DiffLine } from "@shared/pretext-layout/diff-core";
 import type { ParsedDiffHunk } from "@shared/pretext-layout/parse-unified-diff";
 import { memo, useId, useMemo } from "react";
-import { AutoFollowScroll, type ContentViewportLayout } from "../AutoFollowScroll";
+import { AutoFollowScroll, type ContentViewportLayout } from "../scroll/AutoFollowScroll";
 import { DiffContent } from "./DiffContent";
 
 export type { DiffLine } from "@shared/pretext-layout/diff-core";

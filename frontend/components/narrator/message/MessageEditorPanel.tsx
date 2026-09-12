@@ -49,20 +49,21 @@ import { useTranslation } from "react-i18next";
 import type { RevertScope } from "../../../lib/api/narrators";
 import { shouldClearEditDraft } from "../../../lib/api/narrators";
 import { UserAvatar } from "../../UserAvatar";
-import { ComposerFullscreenModal } from "../ComposerFullscreenModal";
+import { ComposerFullscreenModal } from "../composer/ComposerFullscreenModal";
 import {
 	EditExistingImageThumb,
 	EditNewImageThumb,
 	EditTextFileChip,
-} from "../EditAttachmentChips";
-import { EditingMessageCtx } from "../EditingMessageCtx";
+} from "../composer/EditAttachmentChips";
 import {
 	editFileReferenceInput,
 	type FileReferenceInput,
 	fileReferenceToken,
 	readFileReferences,
 	trimFileReferenceInput,
-} from "../file-reference-input";
+} from "../composer/file-reference-input";
+import { TextareaOptimizeControls } from "../composer/TextareaOptimizeControls";
+import { EditingMessageCtx } from "../EditingMessageCtx";
 import {
 	ACCEPTED_TYPES,
 	MAX_IMAGE_LONG_EDGE,
@@ -70,7 +71,6 @@ import {
 	resizeImageIfNeeded,
 } from "../narrator-panel-types";
 import { RevertScopeConfirmModal } from "../RevertScopeConfirmModal";
-import { TextareaOptimizeControls } from "../TextareaOptimizeControls";
 import { editRevertNeedsConfirm } from "./message-edit-text";
 
 /**

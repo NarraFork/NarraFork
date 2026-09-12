@@ -6,7 +6,7 @@ import {
 	getDraftImageAttachmentKey,
 	loadDraftImageAttachments,
 	saveDraftImageAttachments,
-} from "../draft-image-attachments";
+} from "../composer/draft-image-attachments";
 
 export interface UseComposerAttachmentsOptions {
 	narratorId: string;

@@ -4,9 +4,9 @@ import { createDiffDocument, type DiffDocument } from "@shared/pretext-layout/di
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import type { ContentViewportLayout } from "./AutoFollowScroll";
 import { ContentViewer, handleRegistry } from "./ContentViewer";
-import { RenderLodCtx } from "./RenderLodCtx";
+import { RenderLodCtx } from "./lod/RenderLodCtx";
+import type { ContentViewportLayout } from "./scroll/AutoFollowScroll";
 
 const { installCanvasStub } = await import("./vlist/measure/test-canvas-stub");
 const { VListViewBody } = await import("./vlist/vlist-content-view-body");

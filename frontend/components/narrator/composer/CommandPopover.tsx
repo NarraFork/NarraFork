@@ -9,7 +9,7 @@ import {
 } from "@mantine/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Z } from "../../lib/z-index";
+import { Z } from "../../../lib/z-index";
 
 export interface CommandParam {
 	name: string;

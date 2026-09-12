@@ -4,9 +4,9 @@ import { IconArrowRight, IconMessageQuestion } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useAskInPassing, useCancelAskInPassing } from "../../hooks/useNarrator";
+import { useAskInPassing, useCancelAskInPassing } from "../../../hooks/useNarrator";
+import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { resolveAskInPassingOpenPlan } from "./ask-in-passing-open-target";
-import { useNarratorDockContext } from "./dock/NarratorDockContext";
 
 const CARD_BG = "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))";
 

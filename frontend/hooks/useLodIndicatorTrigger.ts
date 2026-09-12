@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { isAltKey } from "../components/narrator/lod-indicator";
+import { isAltKey } from "../components/narrator/lod/lod-indicator";
 
 /**
  * useLodIndicatorTrigger — "is Alt held with the pointer over THIS panel?"

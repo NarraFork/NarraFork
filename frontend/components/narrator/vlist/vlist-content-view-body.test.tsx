@@ -5,7 +5,7 @@ import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import type { CSSProperties } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { ContentViewportLayout } from "../AutoFollowScroll";
+import type { ContentViewportLayout } from "../scroll/AutoFollowScroll";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VListViewBody } from "./vlist-content-view-body";
 import type { VListViewTarget } from "./vlist-content-view-target";

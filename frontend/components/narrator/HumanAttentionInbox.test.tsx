@@ -29,7 +29,10 @@ import commonEn from "../../locales/en/common.json";
 import dashboardEn from "../../locales/en/dashboard.json";
 import narratorEn from "../../locales/en/narrator.json";
 import { NeedsAttention } from "../dashboard/NeedsAttention";
-import { HumanAttentionInboxButton, HumanAttentionInboxDrawer } from "./GlobalQuestionInbox";
+import {
+	HumanAttentionInboxButton,
+	HumanAttentionInboxDrawer,
+} from "./question/GlobalQuestionInbox";
 import { PermEnterHintCtx } from "./tool-call/tool-call-contexts";
 
 const i18n = createInstance();

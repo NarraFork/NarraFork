@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { ApiError } from "../../lib/api";
+import { ApiError } from "../../../lib/api";
 import { copyGeneratedImageToClipboard } from "./image-clipboard";
 
 describe("copyGeneratedImageToClipboard", () => {

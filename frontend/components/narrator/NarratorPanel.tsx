@@ -145,7 +145,6 @@ import {
 	PluginContributionOptions,
 } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
-import { toBannerQuestions } from "./async-question-questions";
 import { BackgroundTasksDrawerHost, useBackgroundTasksButton } from "./BackgroundTasksDrawer";
 import { ContentViewerEnvironmentProvider } from "./ContentViewer";
 import {
@@ -154,7 +153,10 @@ import {
 	CompactSummaryModalCtx,
 	type CompactSummaryModalTarget,
 } from "./compact-summary-modal";
-import { hasSendableComposerContent } from "./composer-send-gate";
+import { hasSendableComposerContent } from "./composer/composer-send-gate";
+import type { FileReferenceScopeValue } from "./composer/FileReferenceScope";
+import { trimFileReferenceInput } from "./composer/file-reference-input";
+import type { NarratorComposerHandle, NarratorRemoteDraft } from "./composer/NarratorComposer";
 import { ContextThresholdSettingsModal } from "./context-management/ContextThresholdSettingsModal";
 import {
 	type ContextManagementDraft,
@@ -166,9 +168,7 @@ import {
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { ExecutionDeviceOptions } from "./ExecutionDeviceMenu";
-import type { FileReferenceScopeValue } from "./FileReferenceScope";
 import { useFilePanelNavigation } from "./file-panel-navigation";
-import { trimFileReferenceInput } from "./file-reference-input";
 import { HeaderToolbar } from "./header/HeaderToolbar";
 import { useTitleEditing } from "./header/use-title-editing";
 import { ContextUsageIndicator } from "./interaction/ContextUsageIndicator";
@@ -193,7 +193,9 @@ import {
 	isKimiProviderBaseUrl,
 } from "./kimi-usage-format";
 import { LeakedToolCallModal } from "./LeakedToolCallModal";
-import { LodSwitchToast } from "./LodSwitchToast";
+import { LodSwitchToast } from "./lod/LodSwitchToast";
+import { NarratorLodOptions } from "./lod/NarratorLodMenu";
+import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
 import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./message/MessageSelectionCtx";
 import type { MessageListHandle, MessageListTailMeta } from "./message/message-list-handle";
@@ -201,9 +203,7 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
-import type { NarratorComposerHandle, NarratorRemoteDraft } from "./NarratorComposer";
 import { NarratorInteractionArea } from "./NarratorInteractionArea";
-import { NarratorLodOptions } from "./NarratorLodMenu";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorStatusToolbarAction } from "./NarratorStatusToolbar";
@@ -233,13 +233,13 @@ import type { NarratorToolbarBadgeCounts } from "./narrator-toolbar-badges";
 import type { NarratorToolbarHost, NarratorToolbarId } from "./narrator-toolbar-items";
 import { nextHighlightRequestId } from "./panels/panel-kind";
 import { compactProgressLabel } from "./progress-label";
-import { type RenderLod, RenderLodCtx } from "./RenderLodCtx";
+import { toBannerQuestions } from "./question/async-question-questions";
 import { RevertActionConfirmModal } from "./RevertScopeConfirmModal";
-import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
+import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
+import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
+import { type SwipeAnchorInfo, setGlobalOnSwipeAnchorInfo } from "./scroll/swipeState";
 import { useMessageSelection } from "./selection/use-message-selection";
-import { resolveSelectionOverlayBlockId } from "./selection-anchor-overlay";
-import { revealSpecFile } from "./spec-file-reveal";
-import { type SwipeAnchorInfo, setGlobalOnSwipeAnchorInfo } from "./swipeState";
+import { revealSpecFile } from "./spec/spec-file-reveal";
 import {
 	AllowRetryCtx,
 	FileModDrawerCtx,
@@ -275,7 +275,7 @@ const NarratorDetailsPanel = lazy(() =>
 );
 
 const SpecPanel = lazy(() =>
-	import("./SpecPanel").then((module) => ({ default: module.SpecPanel })),
+	import("./spec/SpecPanel").then((module) => ({ default: module.SpecPanel })),
 );
 const FileModificationsDrawer = lazy(() =>
 	import("./FileModificationsDrawer").then((module) => ({

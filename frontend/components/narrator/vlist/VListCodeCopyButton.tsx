@@ -27,8 +27,8 @@ import { ActionIcon, CopyButton, Tooltip } from "@mantine/core";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
 import { type CSSProperties, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useRenderInteractive } from "../lod/RenderLodCtx";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
-import { useRenderInteractive } from "../RenderLodCtx";
 import { type CodeCopyPlacement, VIEW_ACTION_BAR_GAP } from "./vlist-content-view-float";
 
 const ICON_SIZE = 12;

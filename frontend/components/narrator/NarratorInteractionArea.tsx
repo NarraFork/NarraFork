@@ -27,13 +27,13 @@ import { useTranslation } from "react-i18next";
 import { startBottomSpacingResize, useBottomSpacing } from "../../hooks/useResizableBottomSpacing";
 import type { BufferMessageSummary } from "../../lib/api";
 import { ChapterBar } from "./ChapterBar";
-import { HumanAttentionInboxButton } from "./GlobalQuestionInbox";
+import { NarratorComposerRow, type NarratorComposerRowProps } from "./composer/NarratorComposerRow";
 import {
 	NarratorInteractionStatusBar,
 	type NarratorInteractionStatusBarProps,
 } from "./interaction/NarratorInteractionStatusBar";
-import { NarratorComposerRow, type NarratorComposerRowProps } from "./NarratorComposerRow";
 import { QueuedAttachmentPreview, QueuedMessageRow } from "./QueuedMessageRow";
+import { HumanAttentionInboxButton } from "./question/GlobalQuestionInbox";
 
 /** Number of queued messages before the queue collapses into a summary bar. */
 const QUEUE_COLLAPSE_THRESHOLD = 2;

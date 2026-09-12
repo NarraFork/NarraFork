@@ -58,6 +58,7 @@ import {
 	useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useRenderLod } from "../lod/RenderLodCtx";
 import { ManualOlderHistoryLoad } from "../ManualOlderHistoryLoad";
 import {
 	type MessageContextMenuActions,
@@ -77,9 +78,8 @@ import {
 	resolveOlderHistoryAutoLoad,
 	resolveOlderHistoryAutoLoadEnabled,
 } from "../older-history-auto-load";
-import { useRenderLod } from "../RenderLodCtx";
 import { recentRunSegmentMessageIds } from "../run-segments";
-import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../swipeState";
+import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../scroll/swipeState";
 import { TraceRowInteraction } from "../TraceRowInteraction";
 import {
 	getCategory,

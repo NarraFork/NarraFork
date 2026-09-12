@@ -43,8 +43,8 @@ import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
 import type { PluginDockPanelProps } from "../../plugins/types";
+import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import { getFilePreviewType } from "../FilePreviewModal";
-import { FileReferenceScopeProvider } from "../FileReferenceScope";
 import {
 	FilePanelNavigationProvider,
 	type FilePanelOpener,
@@ -81,7 +81,7 @@ const BrowserPanel = lazy(() =>
 const FileModificationsPanel = lazy(() =>
 	import("../FileModificationsDrawer").then((m) => ({ default: m.FileModificationsPanel })),
 );
-const SpecPanel = lazy(() => import("../SpecPanel").then((m) => ({ default: m.SpecPanel })));
+const SpecPanel = lazy(() => import("../spec/SpecPanel").then((m) => ({ default: m.SpecPanel })));
 const AppearancePanel = lazy(() =>
 	import("../AppearancePanel").then((m) => ({ default: m.AppearancePanel })),
 );

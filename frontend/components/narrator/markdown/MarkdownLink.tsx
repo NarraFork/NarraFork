@@ -11,7 +11,7 @@ import {
 	localFileHref,
 } from "@shared/markdown-file-path";
 import type { ComponentPropsWithoutRef } from "react";
-import { useFileReferenceScope } from "../FileReferenceScope";
+import { useFileReferenceScope } from "../composer/FileReferenceScope";
 
 /** Shared by flowing markdown and every measured visual fragment of a vlist link. */
 export function MarkdownLink({

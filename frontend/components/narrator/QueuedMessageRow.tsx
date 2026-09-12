@@ -49,12 +49,16 @@ import type {
 	BufferMessageSummary,
 } from "../../lib/api/types";
 import { UserAvatar } from "../UserAvatar";
-import { EditNewImageThumb, EditTextFileChip, QueuedImageThumb } from "./EditAttachmentChips";
+import {
+	EditNewImageThumb,
+	EditTextFileChip,
+	QueuedImageThumb,
+} from "./composer/EditAttachmentChips";
 import {
 	editFileReferenceInput,
 	type FileReferenceInput,
 	fileReferenceToken,
-} from "./file-reference-input";
+} from "./composer/file-reference-input";
 import {
 	ACCEPTED_TYPES,
 	MAX_IMAGE_LONG_EDGE,

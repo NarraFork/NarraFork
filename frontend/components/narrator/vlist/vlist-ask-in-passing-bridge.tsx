@@ -29,7 +29,7 @@
  */
 
 import { type ReactNode, useMemo } from "react";
-import { AskInPassingPendingCard, useOpenAskInPassingNarrator } from "../AskInPassingCard";
+import { AskInPassingPendingCard, useOpenAskInPassingNarrator } from "../question/AskInPassingCard";
 import {
 	resolveVListAskInPassingTarget,
 	type VListAskInPassingTarget,

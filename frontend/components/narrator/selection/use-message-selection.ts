@@ -17,7 +17,7 @@ import {
 	setGlobalOnSelectionRange,
 	setGlobalSwipeAnchor,
 	setGlobalToggleBlock,
-} from "../swipeState";
+} from "../scroll/swipeState";
 
 interface ChunkListLike {
 	detachFromBottom: () => void;

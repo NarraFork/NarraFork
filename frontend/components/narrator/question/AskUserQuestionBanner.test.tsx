@@ -12,15 +12,15 @@ import {
 	useApplyAsyncQuestionChange,
 	useAsyncQuestions,
 	useDismissAsyncQuestion,
-} from "../../hooks/useAsyncQuestions";
-import { humanAttentionListKey } from "../../hooks/useHumanAttention";
-import { api } from "../../lib/api";
+} from "../../../hooks/useAsyncQuestions";
+import { humanAttentionListKey } from "../../../hooks/useHumanAttention";
+import { api } from "../../../lib/api";
 import {
 	flush,
 	readSession,
 	resetSessionStoreForTest,
 	writeSession,
-} from "../../lib/session-store";
+} from "../../../lib/session-store";
 import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
 import {
 	AsyncQuestionInboxButton,
@@ -28,7 +28,7 @@ import {
 	type GlobalQuestion,
 } from "./GlobalQuestionInbox";
 
-const { buildAsyncQuestionNode } = await import("./vlist/vlist-permission-bridge");
+const { buildAsyncQuestionNode } = await import("../vlist/vlist-permission-bridge");
 
 const questions = [{ question: "notes", header: "Notes?", options: [] }];
 const deferredQuestion: GlobalQuestion = {

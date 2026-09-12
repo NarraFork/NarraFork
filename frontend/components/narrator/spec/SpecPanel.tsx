@@ -21,11 +21,11 @@ import {
 	useNarrator,
 	useUpdateBehaviorFence,
 	useUpdateReflectionOverrides,
-} from "../../hooks/useNarrator";
-import { useSpecFile, useSpecFiles, useSpecTasks, useUpdateSpecFile } from "../../hooks/useSpec";
-import { api } from "../../lib/api";
-import type { SpecTaskItem } from "../../lib/api/spec";
-import { MarkdownContent } from "./markdown/MarkdownContent";
+} from "../../../hooks/useNarrator";
+import { useSpecFile, useSpecFiles, useSpecTasks, useUpdateSpecFile } from "../../../hooks/useSpec";
+import { api } from "../../../lib/api";
+import type { SpecTaskItem } from "../../../lib/api/spec";
+import { MarkdownContent } from "../markdown/MarkdownContent";
 import { SpecTaskBoard } from "./SpecTaskBoard";
 import { registerSpecFileSelector } from "./spec-file-reveal";
 

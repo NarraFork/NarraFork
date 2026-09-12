@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { getMentionQuery } from "../MentionPopover";
+import { getMentionQuery } from "../composer/MentionPopover";
 
 describe("getMentionQuery", () => {
 	test("detects a mention at the start of input", () => {

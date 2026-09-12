@@ -31,8 +31,8 @@ import { request } from "../../../lib/api/client";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import { saveBlobAsFile } from "../../../lib/file-download";
 import { getShikiLang } from "../../../lib/shiki-lang";
+import { useFileReferenceScope } from "../composer/FileReferenceScope";
 import type { DiffLine } from "../diff/DiffView";
-import { useFileReferenceScope } from "../FileReferenceScope";
 import { availableModes, type FileViewerMode } from "../file-viewer/file-viewer-modes";
 import { filePanelBaseName } from "../panels/panel-kind";
 import {

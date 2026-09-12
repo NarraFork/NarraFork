@@ -42,8 +42,8 @@ import {
 } from "@tabler/icons-react";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { SpecCompiledTasks, SpecTaskItem } from "../../lib/api/spec";
-import { useConfirmDialog } from "../common/confirm-dialog-context";
+import type { SpecCompiledTasks, SpecTaskItem } from "../../../lib/api/spec";
+import { useConfirmDialog } from "../../common/confirm-dialog-context";
 
 export type SpecTaskStatus = SpecTaskItem["status"];
 

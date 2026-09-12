@@ -2,7 +2,7 @@ import { Box, Center, Loader, Text } from "@mantine/core";
 import { localFileDirectory } from "@shared/markdown-file-path";
 import { lazy, Suspense, useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { FileReferenceScopeProvider } from "../FileReferenceScope";
+import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { FileViewerMode } from "../file-viewer/file-viewer-modes";
 import {
 	detectStructuredFormat,

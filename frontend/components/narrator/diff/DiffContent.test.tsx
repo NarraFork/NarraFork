@@ -13,8 +13,8 @@ import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import { useLayoutEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { AutoFollowScroll, useContentViewport } from "../AutoFollowScroll";
 import { topLevelStreamingChunkToToolFields } from "../narrator-message-helpers";
+import { AutoFollowScroll, useContentViewport } from "../scroll/AutoFollowScroll";
 import { DiffContent } from "./DiffContent";
 
 const {

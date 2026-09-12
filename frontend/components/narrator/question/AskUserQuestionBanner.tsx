@@ -18,8 +18,8 @@ import { IconClockHour4, IconSettings } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../../lib/api";
-import { readSession, removeSession, writeSession } from "../../lib/session-store";
+import { api } from "../../../lib/api";
+import { readSession, removeSession, writeSession } from "../../../lib/session-store";
 import {
 	coerceQuestions,
 	formatHMS,
