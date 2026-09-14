@@ -42,7 +42,6 @@ import {
 import type { CustomSubagentDef } from "./custom-subagent-service";
 import { knowledgeService } from "./knowledge-service";
 import {
-	type BufferedHistoryMessage,
 	cleanupBufferedTextFiles,
 	clearBufferedMessages,
 	deleteBufferedTextFile,
@@ -56,7 +55,6 @@ import {
 } from "./narrator-buffer";
 import type { EventHandlerContext } from "./narrator-event-handler";
 import type { ExecuteLoopResult } from "./narrator-executor";
-import { publishHistoryMessage } from "./narrator-history-publisher";
 import { deliverInjection } from "./narrator-injection";
 import { narratorService } from "./narrator-service";
 import { toBufferSummary } from "./narrator-session";
@@ -458,14 +456,7 @@ export async function pushSubagentBufferedMessage(
 	subagentId: string,
 	text: string,
 	options?: SubagentBufferedMessageOptions,
-): Promise<{
-	ok: boolean;
-	bufferedAt: string;
-	id: string;
-	full?: boolean;
-	duplicate?: boolean;
-	message?: BufferedHistoryMessage;
-}> {
+): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean; duplicate?: boolean }> {
 	if (options?.delivery) {
 		const result = enqueueInboxAgent(options.delivery, text, { createdBy: options.createdBy });
 		if (result.delivery.state === "cancelled" || result.delivery.state === "failed")
@@ -500,13 +491,7 @@ export async function bufferSubagentUserMessage(
 		priority?: boolean;
 		requestSoftStop?: boolean;
 	},
-): Promise<{
-	ok: boolean;
-	bufferedAt: string;
-	id: string;
-	full?: boolean;
-	message?: BufferedHistoryMessage;
-}> {
+): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
 	const { priority = false, requestSoftStop = true, ...messageOptions } = options ?? {};
 	const result = await pushSubagentBufferedMessage(subagentId, text, {
 		...messageOptions,
@@ -736,16 +721,16 @@ async function persistNextBufferedSubagentMessage(opts: {
 		throw error;
 	}
 	try {
-		publishHistoryMessage(
-			parentNarratorId,
-			fileReferenceMessageForDisplay(userMsg),
-			"user_message",
-		);
-		publishHistoryMessage(
+		broadcastToNarrator(parentNarratorId, {
+			type: "user_message",
+			narratorId: parentNarratorId,
+			message: fileReferenceMessageForDisplay(userMsg),
+		});
+		broadcastToNarrator(narratorId, {
+			type: "user_message",
 			narratorId,
-			fileReferenceMessageForDisplay({ ...userMsg, parentToolUseId: null }),
-			"user_message",
-		);
+			message: fileReferenceMessageForDisplay({ ...userMsg, parentToolUseId: null }),
+		});
 		if (buffered._stagingId) cleanupBufferedTextFiles(buffered._stagingId);
 		if (!getBufferedMessages(narratorId).length) clearRuntimeBufferSoftStop(narratorId);
 		const remaining = toBufferSummary(getSubagentBufferedMessages(narratorId));

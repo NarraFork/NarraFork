@@ -160,20 +160,10 @@ describe("toBufferSummary — attachments are visible to clients", () => {
 			[textFile("notes.md", "0123456789")],
 		);
 		expect(pushed.ok).toBe(true);
-		expect(pushed.message?.contentJson).toEqual([
-			expect.objectContaining({ type: "image" }),
-			expect.objectContaining({ type: "image" }),
-			{ type: "text_file", filename: "notes.md", size: 10 },
-			{ type: "text", text: "look at these" },
-		]);
-		expect(pushed.message?.deliveryId).toBeString();
-		expect(pushed.message?.seq).toBeNumber();
 
 		const [summary] = toBufferSummary(getBufferedMessages(NARRATOR_ID));
 
 		expect(summary.imageCount).toBe(2);
-		expect(summary.messageId).toBe(pushed.message?.id as string);
-		expect(summary.deliveryId).toBe(pushed.message?.deliveryId as string);
 		expect(summary.images).toEqual([
 			{
 				imageId: imageA.imageId,

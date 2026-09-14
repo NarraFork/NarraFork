@@ -85,9 +85,7 @@ describe("real task producers use publication outbox", () => {
 			`background_task:last:${(await tasks.getById("last"))?.logicalRunId}`,
 		);
 		expect((await tasks.getById("last"))?.output).toBe("complete result");
-		// Every accepted task notice is canonical history immediately; the 101st
-		// completion remains pending in the outbox but its projection is already visible.
-		expect(db.select().from(narratorMessages).all()).toHaveLength(101);
+		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
 		expect(intent.summary).not.toContain("complete result");
 	});
 
@@ -130,8 +128,7 @@ describe("real task producers use publication outbox", () => {
 		publisher.flushRecipient("parent");
 		expect(pending("bash")).toHaveLength(1);
 		expect((await tasks.getById("atomic"))?.output).toBe("output");
-		// The committed publication creates its canonical task-notice row before transfer.
-		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
+		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
 	});
 
 	test.each([
@@ -223,9 +220,7 @@ describe("real task producers use publication outbox", () => {
 		const task = await tasks.getById("large");
 		expect(Buffer.byteLength(task?.output ?? "")).toBe(512 * 1024);
 		expect(task?.outputTruncated).toBe(true);
-		// Bash keeps the full output in the background task; the mailbox gets only
-		// the bounded canonical task-notice projection.
-		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
+		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
 	});
 
 	test("Agent retains full source and stores only a bounded immutable display receipt", async () => {
@@ -251,9 +246,7 @@ describe("real task producers use publication outbox", () => {
 			.values({ id: "assistant-ref", narratorId: "child", messageId: "assistant-result", seq: 1 })
 			.run();
 		await tasks.markCompleted("child", text);
-		// Existing source history, the bounded source receipt, and the eager parent
-		// task-notice projection are three distinct canonical rows.
-		expect(db.select().from(narratorMessages).all()).toHaveLength(3);
+		expect(db.select().from(narratorMessages).all()).toHaveLength(2);
 		const pointer = db.select().from(runtimePublicationOutbox).all()[0].resultRef ?? "";
 		expect(pointer).toStartWith("message-original:publication-result:");
 		const receipt = db

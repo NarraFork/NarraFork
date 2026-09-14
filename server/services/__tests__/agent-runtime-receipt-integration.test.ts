@@ -40,20 +40,17 @@ beforeEach(() => {
 });
 afterAll(() => sqlite.close());
 
-test("SQL materialization failure cannot leave a partial mailbox transition", async () => {
+test("SQL ref-insert failure cannot leave an orphan history message", async () => {
 	const { row, claim } = enqueue();
-	// Acceptance already created the canonical row/ref. Fail the materialization
-	// update so the eager projection must remain visible but unmaterialized.
 	sqlite.exec(
-		"CREATE TEMP TRIGGER fail_receipt_materialize BEFORE UPDATE OF current_message_id ON narrator_buffered_messages BEGIN SELECT RAISE(ABORT, 'materialization fault'); END",
+		"CREATE TEMP TRIGGER fail_receipt_ref BEFORE INSERT ON narrator_message_refs BEGIN SELECT RAISE(ABORT, 'ref insertion fault'); END",
 	);
 	try {
-		await expect(persist(row, claim)).rejects.toThrow("materialization fault");
+		await expect(persist(row, claim)).rejects.toThrow("ref insertion fault");
 	} finally {
-		sqlite.exec("DROP TRIGGER fail_receipt_materialize");
+		sqlite.exec("DROP TRIGGER fail_receipt_ref");
 	}
-	expect(db.select().from(narratorMessages).all()).toHaveLength(1);
-	expect(ref(row.recipientMessageId as string)?.deliveryState).toBe("claimed");
+	expect(db.select().from(narratorMessages).all()).toHaveLength(0);
 	expect(store.getByDelivery(row.deliveryId as string)?.state).toBe("claimed");
 	await persist(row, claim);
 	expect(db.select().from(narratorMessages).all()).toHaveLength(1);
@@ -93,9 +90,7 @@ test("semantic block deletion keeps original adopted fact and invalidates sender
 		receiptDisposition: "superseded",
 		adoptedAt,
 	});
-	// Full semantic deletion removes the recipient ref; the mailbox keeps the
-	// adopted timestamp and marks the original delivery superseded.
-	expect(ref(message.id)).toBeUndefined();
+	expect(ref(message.id)?.injectionConsumedAt).toBeNull();
 	const [target] = await loadSendTargetDetails(
 		[
 			{
@@ -624,10 +619,8 @@ test("fault after mailbox materialization rolls message/ref/mailbox back togethe
 			},
 		),
 	).rejects.toThrow("injected transaction failure");
-	// Canonical history was admitted eagerly; the failed adoption must leave it
-	// visible and the mailbox/ref projection claimed for a retry.
-	expect(ref(row.recipientMessageId as string)?.deliveryState).toBe("claimed");
-	expect(db.select().from(narratorMessages).all()).toHaveLength(1);
+	expect(ref(row.recipientMessageId as string)).toBeUndefined();
+	expect(db.select().from(narratorMessages).all()).toHaveLength(0);
 	expect(store.getByDelivery(row.deliveryId as string)?.state).toBe("claimed");
 	await narratorPersistence.persistUserMessage(
 		"recipient",
@@ -647,16 +640,16 @@ test("released owner cannot materialize even while its persistent claim token re
 	const successor = tryClaimExecution("recipient", "primary");
 	expect(successor?.epoch).not.toBe(claim.epoch);
 	await expect(persist(row, claim)).rejects.toThrow("Stale mailbox claim execution owner");
-	expect(ref(row.recipientMessageId as string)?.deliveryState).toBe("claimed");
+	expect(ref(row.recipientMessageId as string)).toBeUndefined();
 	expect(store.getByDelivery(row.deliveryId as string)?.state).toBe("claimed");
 });
 
-test("stale claim cannot materialize a pre-projected recipient history row", async () => {
+test("stale claim cannot leave a recipient history row", async () => {
 	const { row, claim } = enqueue();
 	await expect(persist(row, { ...claim, epoch: "obsolete" })).rejects.toThrow(
 		"Stale mailbox claim",
 	);
-	expect(ref(row.recipientMessageId as string)?.deliveryState).toBe("claimed");
+	expect(ref(row.recipientMessageId as string)).toBeUndefined();
 });
 
 test("structural recipient COW resolves stable navigation and adopts the original revision", async () => {

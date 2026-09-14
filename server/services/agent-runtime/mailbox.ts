@@ -1,24 +1,12 @@
-import { type FileReferenceSnapshot, isFileReferenceSnapshot } from "@shared/file-reference";
-import { formatOriginLabel } from "@shared/message-origin";
-import { and, asc, desc, eq, gt, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, sql } from "drizzle-orm";
 import {
 	narratorBufferedMessages as mailbox,
 	narratorMessageRefs,
 	narrators,
-	narratorToolCalls,
 	runtimePublicationOutbox as outbox,
 } from "../../db/schema";
 import { generateId } from "../../lib/id";
-import { type ImageRef, imageRefToContentBlock } from "../../lib/uploads";
-import {
-	type CanonicalMessageDraft,
-	deleteCanonicalProjectionTx,
-	insertCanonicalMessageTx,
-	readCanonicalMessageTreeTx,
-	updateCanonicalMessageTx,
-} from "../narrator-history-projection";
 import { MAILBOX_LIMITS as L } from "./limits";
-import { mirrorDeliveryStateTx } from "./mailbox-transitions";
 import type {
 	EligibleMailboxHead,
 	EnqueueResult,
@@ -64,7 +52,6 @@ function pointer(value: string): string {
 }
 export function mailboxDedupeKey(input: MailboxInput): string {
 	pointer(input.narratorId);
-	if (input.deliveryId !== undefined) pointer(input.deliveryId);
 	if (input.kind === "agent_message") {
 		if (input.recipientMessageId !== undefined) pointer(input.recipientMessageId);
 		if (!Number.isSafeInteger(input.sourceAttempt) || input.sourceAttempt < 1)
@@ -146,344 +133,6 @@ export function initializeLegacyMailbox(tx: RuntimeStoreDb, narratorId: string):
 	}
 	return rows.length <= L.pageSize;
 }
-function defaultHistory(input: MailboxInput, deliveryId: string, messageId: string) {
-	if (input.history) {
-		return {
-			...input.history,
-			narratorId: input.narratorId,
-			messageId,
-			deliveryId,
-			deliveryKind: input.kind,
-			deliveryState: "queued" as const,
-		};
-	}
-	const role: "user" | "sys" = input.kind === "task_notice" ? "sys" : "user";
-	return {
-		narratorId: input.narratorId,
-		messageId,
-		role,
-		contentJson: [{ type: "text", text: input.text }],
-		contentText: input.text,
-		commandText: input.kind === "user_input" ? (input.commandText ?? null) : null,
-		createdBy: input.createdBy ?? null,
-		origin: role === "user" ? ("user" as const) : ("system" as const),
-		deliveryId,
-		deliveryKind: input.kind,
-		deliveryState: "queued" as const,
-	};
-}
-
-// The old buffer writer caps every managed body at 2 MiB before accepting it. Keep the
-// compatibility reader bounded by the same ceiling; a damaged row must not turn a startup
-// projection into an unbounded synchronous file read.
-const LEGACY_PAYLOAD_MAX_BYTES = 2 * 1024 * 1024;
-const LEGACY_HISTORY_MAX_BYTES = LEGACY_PAYLOAD_MAX_BYTES + L.metadataBytes;
-const LEGACY_PAYLOAD_UNAVAILABLE_TEXT =
-	"[Queued message body unavailable after restart: durable payload exceeded the recovery limit; edit and resend it.]";
-
-type LegacyProjectionRow = Pick<
-	MailboxRow,
-	| "kind"
-	| "text"
-	| "metadataJson"
-	| "createdBy"
-	| "imagesJson"
-	| "creatorJson"
-	| "textFilePathsJson"
-	| "fileReferencesJson"
-	| "commandText"
-	| "payloadRefJson"
-	| "narratorId"
-	| "sourceNarratorId"
-	| "sourceToolCallId"
-	| "sourceAttempt"
-	| "deliveryId"
-	| "contentRevision"
-	| "bufferedAt"
->;
-
-type LegacyDelivery = {
-	recipientNarratorId?: unknown;
-	recipientMessageId?: unknown;
-	sender?: unknown;
-	fromToolUseId?: unknown;
-	senderToolCallBinding?: unknown;
-};
-
-function record(value: unknown): Record<string, unknown> | null {
-	return value && typeof value === "object" && !Array.isArray(value)
-		? (value as Record<string, unknown>)
-		: null;
-}
-
-function parseJsonValue(value: string | null): unknown {
-	if (!value) return undefined;
-	try {
-		return JSON.parse(value);
-	} catch {
-		return undefined;
-	}
-}
-
-function parseJsonArray<T>(value: string | null): T[] {
-	const parsed = parseJsonValue(value);
-	return Array.isArray(parsed) ? (parsed as T[]) : [];
-}
-
-function legacyPayloadText(row: LegacyProjectionRow): { text: string; degraded: boolean } {
-	const payload = record(parseJsonValue(row.payloadRefJson));
-	if (!payload || typeof payload.path !== "string") return { text: row.text, degraded: false };
-	const declaredBytes = payload.byteSize;
-	if (
-		(typeof declaredBytes === "number" &&
-			(!Number.isSafeInteger(declaredBytes) || declaredBytes > LEGACY_PAYLOAD_MAX_BYTES)) ||
-		(payload.storage !== undefined && payload.storage !== "buffered_file")
-	)
-		return {
-			text: row.text || LEGACY_PAYLOAD_UNAVAILABLE_TEXT,
-			degraded: !row.text,
-		};
-	// Legacy payload files are deliberately not read from the synchronous mailbox repair
-	// transaction. Preserve the inline fallback and make an unavailable body explicit rather
-	// than blocking the request thread on a potentially multi-megabyte file.
-	return { text: row.text || LEGACY_PAYLOAD_UNAVAILABLE_TEXT, degraded: !row.text };
-}
-
-function legacyFileReferenceJson(row: LegacyProjectionRow): string | null {
-	return row.fileReferencesJson;
-}
-
-function legacyCommandText(row: LegacyProjectionRow): string | null {
-	return row.commandText;
-}
-
-function legacyImageBlocks(value: string | null): unknown[] {
-	return parseJsonArray<Partial<ImageRef>>(value).flatMap((image) => {
-		if (
-			!image ||
-			typeof image.imageId !== "string" ||
-			typeof image.filename !== "string" ||
-			typeof image.mediaType !== "string"
-		)
-			return [];
-		return [imageRefToContentBlock(image as ImageRef)];
-	});
-}
-
-function legacyFileReferenceBlocks(value: string | null): FileReferenceSnapshot[] {
-	return parseJsonArray<unknown>(value).filter(isFileReferenceSnapshot);
-}
-
-function legacyTextFileBlocks(value: string | null): unknown[] {
-	return parseJsonArray<unknown>(value).flatMap((file) => {
-		const item = record(file);
-		if (
-			!item ||
-			typeof item.filename !== "string" ||
-			!Number.isSafeInteger(item.size) ||
-			(item.size as number) < 0
-		)
-			return [];
-		return [{ type: "text_file", filename: item.filename, size: item.size }];
-	});
-}
-
-function boundedLegacyContent(
-	contentJson: unknown[],
-	text: string,
-): {
-	contentJson: unknown[];
-	contentText: string;
-} {
-	let bytes: number;
-	try {
-		bytes = Buffer.byteLength(JSON.stringify(contentJson));
-	} catch {
-		bytes = LEGACY_HISTORY_MAX_BYTES + 1;
-	}
-	if (bytes <= LEGACY_HISTORY_MAX_BYTES) return { contentJson, contentText: text };
-	return {
-		contentJson: [{ type: "text", text: LEGACY_PAYLOAD_UNAVAILABLE_TEXT }],
-		contentText: LEGACY_PAYLOAD_UNAVAILABLE_TEXT,
-	};
-}
-
-function legacyAgentParentToolUseId(tx: RuntimeTx, row: LegacyProjectionRow): string | null {
-	const recipient = tx
-		.select({ variant: narrators.variant, originToolCallId: narrators.originToolCallId })
-		.from(narrators)
-		.where(eq(narrators.id, row.narratorId))
-		.get();
-	if (!recipient?.variant?.startsWith("subagent:") || !recipient.originToolCallId) return null;
-	return (
-		tx
-			.select({ toolUseId: narratorToolCalls.toolUseId })
-			.from(narratorToolCalls)
-			.where(eq(narratorToolCalls.id, recipient.originToolCallId))
-			.get()?.toolUseId ?? null
-	);
-}
-
-function legacyAgentHistory(
-	tx: RuntimeTx,
-	row: LegacyProjectionRow,
-	metadata: Record<string, unknown>,
-): Pick<
-	CanonicalMessageDraft,
-	| "role"
-	| "contentJson"
-	| "contentText"
-	| "parentToolUseId"
-	| "commandText"
-	| "createdBy"
-	| "origin"
-	| "originLabel"
-> {
-	const rawDelivery = record(metadata.delivery) as LegacyDelivery | null;
-	const projection = record(metadata.projection);
-	const bodyText = row.text;
-	const prefix = typeof projection?.prefix === "string" ? projection.prefix : "";
-	const suffix = typeof projection?.suffix === "string" ? projection.suffix : "";
-	const modelText = `${prefix}${bodyText}${suffix}`;
-	const rawSender = record(rawDelivery?.sender);
-	const senderId =
-		typeof rawSender?.id === "string" ? rawSender.id : (row.sourceNarratorId ?? "legacy-agent");
-	const senderLabel = typeof rawSender?.label === "string" ? rawSender.label : senderId;
-	const senderTitle = typeof rawSender?.title === "string" ? rawSender.title : null;
-	const senderType = typeof rawSender?.type === "string" ? rawSender.type : null;
-	const fromToolUseId =
-		typeof rawDelivery?.fromToolUseId === "string"
-			? rawDelivery.fromToolUseId
-			: (row.sourceToolCallId ?? undefined);
-	const rawBinding = record(rawDelivery?.senderToolCallBinding);
-	const binding =
-		typeof rawBinding?.toolCallId === "string" && Number.isSafeInteger(rawBinding.attempt)
-			? { toolCallId: rawBinding.toolCallId, attempt: rawBinding.attempt }
-			: row.sourceToolCallId && Number.isSafeInteger(row.sourceAttempt)
-				? { toolCallId: row.sourceToolCallId, attempt: row.sourceAttempt }
-				: undefined;
-	const item: Record<string, unknown> = {
-		fromId: senderId,
-		fromTitle: senderTitle,
-		fromLabel: senderLabel,
-		fromType: senderType,
-		...(fromToolUseId ? { fromToolUseId } : {}),
-		...(row.deliveryId
-			? {
-					deliveryId: row.deliveryId,
-					recipientNarratorId: row.narratorId,
-					revision: row.contentRevision,
-				}
-			: {}),
-		...(binding ? { fromToolCallBinding: binding } : {}),
-		text: bodyText,
-	};
-	const body = { kind: "messages", items: [item] };
-	const bounded = boundedLegacyContent(
-		[
-			{ type: "text", text: modelText },
-			{ type: "system_injection", source: "subagent_message", modelText, body },
-		],
-		modelText,
-	);
-	const isSubagentRecipient =
-		tx
-			.select({ variant: narrators.variant })
-			.from(narrators)
-			.where(eq(narrators.id, row.narratorId))
-			.get()
-			?.variant?.startsWith("subagent:") === true;
-	return {
-		role: isSubagentRecipient ? "user" : "sys",
-		contentJson: bounded.contentJson,
-		contentText: bounded.contentText,
-		parentToolUseId: legacyAgentParentToolUseId(tx, row),
-		commandText: null,
-		createdBy: row.createdBy ?? null,
-		origin: "assistant",
-		originLabel: formatOriginLabel("agentMessage", senderTitle?.trim() || senderLabel),
-	};
-}
-
-function legacyHistory(
-	tx: RuntimeTx,
-	row: LegacyProjectionRow,
-): Pick<
-	CanonicalMessageDraft,
-	| "role"
-	| "contentJson"
-	| "contentText"
-	| "parentToolUseId"
-	| "commandText"
-	| "createdBy"
-	| "origin"
-	| "originLabel"
-> {
-	const metadata = record(parseJsonValue(row.metadataJson)) ?? {};
-	const candidate = record(metadata.history) ?? metadata;
-	const candidateContentJson = Array.isArray(candidate.contentJson)
-		? candidate.contentJson
-		: undefined;
-	const payload = legacyPayloadText(row);
-	const commandText = legacyCommandText(row);
-	if (row.kind === "agent_message" && !candidateContentJson)
-		return legacyAgentHistory(tx, row, metadata);
-	const contentJson = candidateContentJson
-		? boundedLegacyContent(
-				candidateContentJson,
-				typeof candidate.contentText === "string" ? candidate.contentText : payload.text,
-			)
-		: boundedLegacyContent(
-				[
-					...legacyImageBlocks(row.imagesJson),
-					...legacyFileReferenceBlocks(legacyFileReferenceJson(row)),
-					...legacyTextFileBlocks(row.textFilePathsJson),
-					{ type: "text", text: payload.text },
-				],
-				payload.text,
-			);
-	const role =
-		candidate.role === "user" || candidate.role === "sys"
-			? candidate.role
-			: row.kind === "user_input"
-				? "user"
-				: "sys";
-	const parentToolUseId =
-		typeof candidate.parentToolUseId === "string"
-			? candidate.parentToolUseId
-			: row.kind === "agent_message"
-				? legacyAgentParentToolUseId(tx, row)
-				: null;
-	return {
-		role,
-		contentJson: contentJson.contentJson,
-		contentText:
-			typeof candidate.contentText === "string" ? candidate.contentText : contentJson.contentText,
-		parentToolUseId,
-		commandText:
-			typeof candidate.commandText === "string" || candidate.commandText === null
-				? candidate.commandText
-				: commandText,
-		createdBy: row.createdBy ?? null,
-		origin:
-			candidate.origin === "assistant" ||
-			candidate.origin === "system" ||
-			candidate.origin === "user"
-				? candidate.origin
-				: row.kind === "agent_message"
-					? ("assistant" as const)
-					: role === "user"
-						? ("user" as const)
-						: ("system" as const),
-		originLabel:
-			typeof candidate.originLabel === "string"
-				? candidate.originLabel
-				: row.kind === "agent_message"
-					? (legacyAgentHistory(tx, row, metadata).originLabel ?? null)
-					: null,
-	};
-}
-
 function validate(input: MailboxInput) {
 	pointer(input.narratorId);
 	const inlineBytes = Buffer.byteLength(input.text);
@@ -542,186 +191,15 @@ export function createMailboxStore(db: RuntimeDb) {
 	function getByDelivery(deliveryId: string, tx: RuntimeStoreDb = db) {
 		return tx.select().from(mailbox).where(eq(mailbox.deliveryId, deliveryId)).get();
 	}
-	function cancelPendingUserProjection(tx: RuntimeTx, row: MailboxRow): void {
-		if (row.kind !== "user_input" || row.state === "materialized" || !row.recipientRefId) return;
-		deleteCanonicalProjectionTx(tx, row.narratorId, row.recipientRefId);
-		tx.update(mailbox)
-			.set({
-				recipientRefId: null,
-				currentMessageId: null,
-				receiptDisposition: "recipient_deleted",
-				updatedAt: now(),
-			})
-			.where(eq(mailbox.id, row.id))
-			.run();
-	}
-	function ensureLegacyProjectionTx(
-		tx: RuntimeTx,
-		row: Pick<
-			MailboxRow,
-			| "id"
-			| "narratorId"
-			| "kind"
-			| "state"
-			| "text"
-			| "metadataJson"
-			| "imagesJson"
-			| "creatorJson"
-			| "textFilePathsJson"
-			| "fileReferencesJson"
-			| "payloadRefJson"
-			| "commandText"
-			| "createdBy"
-			| "sourceNarratorId"
-			| "sourceToolCallId"
-			| "sourceAttempt"
-			| "contentRevision"
-			| "bufferedAt"
-			| "deliveryId"
-			| "recipientMessageId"
-			| "recipientRefId"
-			| "currentMessageId"
-			| "receiptDisposition"
-		>,
-	): void {
-		// A cancelled/deleted recipient is a negative tombstone, never a reason to resurrect history.
-		if (
-			row.state === "cancelled" ||
-			row.receiptDisposition === "recipient_deleted" ||
-			(row.recipientRefId && row.currentMessageId)
-		)
-			return;
-		if (!row.deliveryId) return;
-		const history = legacyHistory(tx, row);
-		const projection = insertCanonicalMessageTx(tx, {
-			narratorId: row.narratorId,
-			messageId: row.recipientMessageId ?? generateId(),
-			...history,
-			createdAt: row.bufferedAt,
-			deliveryId: row.deliveryId,
-			deliveryKind: row.kind,
-			deliveryState: row.state,
-		});
-		tx.update(mailbox)
-			.set({
-				recipientMessageId: projection.message.id,
-				recipientRefId: projection.ref.id,
-				currentMessageId: projection.message.id,
-			})
-			.where(eq(mailbox.id, row.id))
-			.run();
-	}
-	function hasLegacyProjectionWork(narratorId: string): boolean {
-		return Boolean(
-			db
-				.select({ id: mailbox.id })
-				.from(mailbox)
-				.where(
-					and(
-						eq(mailbox.narratorId, narratorId),
-						or(
-							isNull(mailbox.arrivalSeq),
-							and(
-								ne(mailbox.state, "cancelled"),
-								ne(mailbox.receiptDisposition, "recipient_deleted"),
-								or(isNull(mailbox.recipientRefId), isNull(mailbox.currentMessageId)),
-							),
-						),
-					),
-				)
-				.limit(1)
-				.get(),
-		);
-	}
-	function repairLegacyProjections(narratorId: string): number {
-		return db.transaction((tx) => {
-			initializeLegacyMailbox(tx, narratorId);
-			const rows = tx
-				.select({
-					id: mailbox.id,
-					narratorId: mailbox.narratorId,
-					deliveryId: mailbox.deliveryId,
-					recipientMessageId: mailbox.recipientMessageId,
-					recipientRefId: mailbox.recipientRefId,
-					currentMessageId: mailbox.currentMessageId,
-					receiptDisposition: mailbox.receiptDisposition,
-					kind: mailbox.kind,
-					state: mailbox.state,
-					text: sql<string>`substr(${mailbox.text}, 1, ${LEGACY_PAYLOAD_MAX_BYTES})`,
-					imagesJson: sql<string | null>`substr(${mailbox.imagesJson}, 1, ${L.metadataBytes})`,
-					creatorJson: sql<string | null>`substr(${mailbox.creatorJson}, 1, ${L.metadataBytes})`,
-					textFilePathsJson: sql<
-						string | null
-					>`substr(${mailbox.textFilePathsJson}, 1, ${L.metadataBytes})`,
-					fileReferencesJson: sql<
-						string | null
-					>`substr(${mailbox.fileReferencesJson}, 1, ${LEGACY_HISTORY_MAX_BYTES})`,
-					payloadRefJson: sql<
-						string | null
-					>`substr(${mailbox.payloadRefJson}, 1, ${L.metadataBytes})`,
-					commandText: sql<
-						string | null
-					>`substr(${mailbox.commandText}, 1, ${LEGACY_PAYLOAD_MAX_BYTES})`,
-					metadataJson: sql<string>`substr(${mailbox.metadataJson}, 1, ${L.metadataBytes})`,
-					createdBy: mailbox.createdBy,
-					sourceNarratorId: mailbox.sourceNarratorId,
-					sourceToolCallId: mailbox.sourceToolCallId,
-					sourceAttempt: mailbox.sourceAttempt,
-					contentRevision: mailbox.contentRevision,
-					bufferedAt: mailbox.bufferedAt,
-				})
-				.from(mailbox)
-				.where(
-					and(
-						eq(mailbox.narratorId, narratorId),
-						ne(mailbox.state, "cancelled"),
-						ne(mailbox.receiptDisposition, "recipient_deleted"),
-						or(isNull(mailbox.recipientRefId), isNull(mailbox.currentMessageId)),
-					),
-				)
-				.orderBy(asc(mailbox.arrivalSeq), asc(mailbox.id))
-				.limit(L.pageSize)
-				.all();
-			for (const row of rows) ensureLegacyProjectionTx(tx, row);
-			return rows.length;
-		});
-	}
-	function prepareLegacyProjection(narratorId: string): void {
-		// Identity initialization and content projection are separate bounded pages so a
-		// large old queue can be resumed without a monolithic transaction.
-		db.transaction((tx) => initializeLegacyMailbox(tx, narratorId));
-		repairLegacyProjections(narratorId);
-	}
 	function enqueue(input: MailboxInput, tx?: RuntimeTx): EnqueueResult {
 		if (!tx) return db.transaction((inner) => enqueue(input, inner));
 		const dedupeKey = mailboxDedupeKey(input);
-		let existing = tx
+		const existing = tx
 			.select()
 			.from(mailbox)
 			.where(and(eq(mailbox.narratorId, input.narratorId), eq(mailbox.dedupeKey, dedupeKey)))
 			.get();
-		if (existing && (!existing.deliveryId || !existing.recipientMessageId)) {
-			initializeLegacyMailbox(tx, input.narratorId);
-			existing = tx
-				.select()
-				.from(mailbox)
-				.where(and(eq(mailbox.narratorId, input.narratorId), eq(mailbox.dedupeKey, dedupeKey)))
-				.get();
-		}
-		if (existing?.deliveryId && (!existing.recipientRefId || !existing.currentMessageId)) {
-			ensureLegacyProjectionTx(tx, existing);
-			existing = tx
-				.select()
-				.from(mailbox)
-				.where(and(eq(mailbox.narratorId, input.narratorId), eq(mailbox.dedupeKey, dedupeKey)))
-				.get();
-		}
-		if (existing) {
-			const message = existing.deliveryId
-				? readCanonicalMessageTreeTx(tx, input.narratorId, existing.deliveryId)
-				: null;
-			return { status: "duplicate", delivery: existing, ...(message ? { message } : {}) };
-		}
+		if (existing) return { status: "duplicate", delivery: existing };
 		// Lost confirmations replay the original receipt even if the sender was subsequently deleted.
 		// Only a first acceptance must prove its referenced source exists in this same transaction.
 		if (
@@ -771,7 +249,7 @@ export function createMailboxStore(db: RuntimeDb) {
 				kind: input.kind,
 				noticeKind: input.kind === "task_notice" ? input.noticeKind : null,
 				dedupeKey,
-				deliveryId: input.deliveryId ?? generateId(),
+				deliveryId: generateId(),
 				recipientMessageId:
 					input.kind === "agent_message"
 						? (input.recipientMessageId ?? generateId())
@@ -805,27 +283,7 @@ export function createMailboxStore(db: RuntimeDb) {
 			})
 			.returning()
 			.get();
-		if (!delivery.deliveryId || !delivery.recipientMessageId)
-			throw new Error("Mailbox delivery identity missing");
-		const projection = insertCanonicalMessageTx(
-			tx,
-			defaultHistory(input, delivery.deliveryId, delivery.recipientMessageId),
-		);
-		tx.update(mailbox)
-			.set({ recipientRefId: projection.ref.id, currentMessageId: projection.message.id })
-			.where(eq(mailbox.id, delivery.id))
-			.run();
-		const updatedDelivery = {
-			...delivery,
-			recipientRefId: projection.ref.id,
-			currentMessageId: projection.message.id,
-		};
-		const message = readCanonicalMessageTreeTx(tx, input.narratorId, delivery.deliveryId);
-		return {
-			status: "accepted" as const,
-			delivery: updatedDelivery,
-			...(message ? { message } : {}),
-		};
+		return { status: "accepted", delivery };
 	}
 	function claimWhere(claim: MailboxClaim) {
 		return and(
@@ -847,9 +305,8 @@ export function createMailboxStore(db: RuntimeDb) {
 		binding: MaterializedBinding,
 	) {
 		const row = requireClaim(tx, claim);
-		const expectedMessageId = row.currentMessageId ?? row.recipientMessageId;
-		if (binding.messageId !== expectedMessageId)
-			throw new Error("Materializer must use the current reserved message identity");
+		if (binding.messageId !== row.recipientMessageId)
+			throw new Error("Materializer must use reserved message identity");
 		const ref = tx
 			.select({ id: narratorMessageRefs.id })
 			.from(narratorMessageRefs)
@@ -862,7 +319,7 @@ export function createMailboxStore(db: RuntimeDb) {
 			)
 			.get();
 		if (!ref) throw new Error("Materializer did not persist the recipient ref in this transaction");
-		const materialized = tx
+		return tx
 			.update(mailbox)
 			.set({
 				state: "materialized",
@@ -880,8 +337,6 @@ export function createMailboxStore(db: RuntimeDb) {
 			.where(claimWhere(claim))
 			.returning()
 			.get();
-		mirrorDeliveryStateTx(tx, row.narratorId, row.deliveryId, "materialized");
-		return materialized;
 	}
 	/** Current edited content is acknowledged independently; this never changes the original Send receipt. */
 	function ackCurrentRevision(
@@ -987,45 +442,6 @@ export function createMailboxStore(db: RuntimeDb) {
 			.all();
 	}
 	/** Predicate and exact-ID claim use the same transaction and the same publication-aware head. */
-	function hasPendingWork(narratorId: string): boolean {
-		if (
-			db
-				.select({ id: mailbox.id })
-				.from(mailbox)
-				.where(
-					and(eq(mailbox.narratorId, narratorId), inArray(mailbox.state, ["queued", "claimed"])),
-				)
-				.limit(1)
-				.get()
-		)
-			return true;
-		return !!db
-			.select({ id: outbox.id })
-			.from(outbox)
-			.where(and(eq(outbox.recipientId, narratorId), eq(outbox.state, "pending")))
-			.limit(1)
-			.get();
-	}
-	function peekEligibleHead(narratorId: string): MailboxRow | undefined {
-		prepareLegacyProjection(narratorId);
-		return db.transaction((tx) => {
-			initializeLegacyMailbox(tx, narratorId);
-			const head = eligibleHeads(tx, narratorId, 1)[0];
-			return head
-				? tx
-						.select()
-						.from(mailbox)
-						.where(
-							and(
-								eq(mailbox.id, head.id),
-								eq(mailbox.narratorId, narratorId),
-								eq(mailbox.state, "queued"),
-							),
-						)
-						.get()
-				: undefined;
-		});
-	}
 	function claimEligibleHead(
 		narratorId: string,
 		owner: { token: string; epoch: string },
@@ -1033,12 +449,11 @@ export function createMailboxStore(db: RuntimeDb) {
 	): MailboxRow | undefined {
 		pointer(owner.token);
 		pointer(owner.epoch);
-		prepareLegacyProjection(narratorId);
 		return db.transaction((tx) => {
 			if (!initializeLegacyMailbox(tx, narratorId)) return undefined;
 			const head = eligibleHeads(tx, narratorId, 1)[0];
 			if (!head || accepts(head) !== true) return undefined;
-			const claimed = tx
+			return tx
 				.update(mailbox)
 				.set({
 					state: "claimed",
@@ -1057,8 +472,6 @@ export function createMailboxStore(db: RuntimeDb) {
 				)
 				.returning()
 				.get();
-			if (claimed) mirrorDeliveryStateTx(tx, claimed.narratorId, claimed.deliveryId, "claimed");
-			return claimed;
 		});
 	}
 	/** Only call under the single-instance lock during cold bootstrap, before admitting owners.
@@ -1083,7 +496,6 @@ export function createMailboxStore(db: RuntimeDb) {
 					narratorId: mailbox.narratorId,
 					claimToken: mailbox.claimToken,
 					claimEpoch: mailbox.claimEpoch,
-					deliveryId: mailbox.deliveryId,
 				})
 				.from(mailbox)
 				.where(
@@ -1100,7 +512,7 @@ export function createMailboxStore(db: RuntimeDb) {
 				if (row.claimToken?.startsWith(prefix)) continue;
 				const hasProcessIdentity = /^process:[A-Za-z0-9_-]+:.+$/.test(row.claimToken ?? "");
 				if (!hasProcessIdentity && options.legacyOwnerTerminated?.(row) !== true) continue;
-				const changed = tx
+				recovered += tx
 					.update(mailbox)
 					.set({
 						state: "queued",
@@ -1123,10 +535,6 @@ export function createMailboxStore(db: RuntimeDb) {
 					)
 					.returning({ id: mailbox.id })
 					.all().length;
-				if (changed) {
-					mirrorDeliveryStateTx(tx, row.narratorId, row.deliveryId, "queued");
-					recovered += changed;
-				}
 			}
 			return { recovered, nextAfterId: page.length > limit ? page[limit - 1]?.id : undefined };
 		});
@@ -1134,8 +542,6 @@ export function createMailboxStore(db: RuntimeDb) {
 	return {
 		enqueue,
 		getByDelivery,
-		hasPendingWork,
-		peekEligibleHead,
 		claimEligibleHead,
 		recoverForeignProcessClaims,
 		materializeInTransaction,
@@ -1173,8 +579,6 @@ export function createMailboxStore(db: RuntimeDb) {
 		initializeLegacy(narratorId: string) {
 			return db.transaction((tx) => initializeLegacyMailbox(tx, narratorId));
 		},
-		hasLegacyProjectionWork,
-		repairLegacyProjections,
 		/** Body/attachment columns are deliberately absent. */
 		list(
 			narratorId: string,
@@ -1195,8 +599,6 @@ export function createMailboxStore(db: RuntimeDb) {
 					priority: mailbox.priority,
 					byteSize: mailbox.byteSize,
 					deliveryId: mailbox.deliveryId,
-					recipientRefId: mailbox.recipientRefId,
-					currentMessageId: mailbox.currentMessageId,
 					receiptDisposition: mailbox.receiptDisposition,
 					lastError: mailbox.lastError,
 				})
@@ -1220,7 +622,6 @@ export function createMailboxStore(db: RuntimeDb) {
 		) {
 			pointer(owner.token);
 			pointer(owner.epoch);
-			prepareLegacyProjection(narratorId);
 			return db.transaction((tx) => {
 				if (!initializeLegacyMailbox(tx, narratorId)) return [];
 				const rows = eligibleHeads(
@@ -1254,7 +655,6 @@ export function createMailboxStore(db: RuntimeDb) {
 						.returning()
 						.get();
 					if (row) {
-						mirrorDeliveryStateTx(tx, row.narratorId, row.deliveryId, "claimed");
 						claimed.push(row);
 						bytes += row.projectedByteSize;
 					}
@@ -1266,21 +666,7 @@ export function createMailboxStore(db: RuntimeDb) {
 		materialize(claim: MailboxClaim, materializer: Materializer) {
 			return db.transaction((tx) => {
 				const row = requireClaim(tx, claim);
-				const existing = row.recipientRefId
-					? tx
-							.select({ id: narratorMessageRefs.id, messageId: narratorMessageRefs.messageId })
-							.from(narratorMessageRefs)
-							.where(
-								and(
-									eq(narratorMessageRefs.id, row.recipientRefId),
-									eq(narratorMessageRefs.narratorId, row.narratorId),
-								),
-							)
-							.get()
-					: undefined;
-				const binding = existing
-					? { messageId: existing.messageId, refId: existing.id, revision: row.contentRevision }
-					: materializer(tx, row);
+				const binding = materializer(tx, row);
 				if (binding && typeof (binding as unknown as { then?: unknown }).then === "function")
 					throw new Error("Materializer must be synchronous");
 				return materializeInTransaction(tx, claim, binding);
@@ -1289,12 +675,11 @@ export function createMailboxStore(db: RuntimeDb) {
 		failClaim(claim: MailboxClaim, error: string) {
 			return db.transaction((tx) => {
 				const row = requireClaim(tx, claim);
-				const state = row.claimAttempts >= L.claimMaxAttempts ? "failed" : "queued";
-				const changed =
+				return (
 					tx
 						.update(mailbox)
 						.set({
-							state,
+							state: row.claimAttempts >= L.claimMaxAttempts ? "failed" : "queued",
 							claimToken: null,
 							claimEpoch: null,
 							claimedAt: null,
@@ -1303,9 +688,8 @@ export function createMailboxStore(db: RuntimeDb) {
 						})
 						.where(claimWhere(claim))
 						.returning({ id: mailbox.id })
-						.all().length === 1;
-				if (changed) mirrorDeliveryStateTx(tx, row.narratorId, row.deliveryId, state);
-				return changed;
+						.all().length === 1
+				);
 			});
 		},
 		recoverClaims(narratorId: string, terminatedEpoch: string, proof: { ownerTerminated: true }) {
@@ -1313,11 +697,7 @@ export function createMailboxStore(db: RuntimeDb) {
 				throw new Error("Owner termination proof required; elapsed time is insufficient");
 			return db.transaction((tx) => {
 				const rows = tx
-					.select({
-						id: mailbox.id,
-						narratorId: mailbox.narratorId,
-						deliveryId: mailbox.deliveryId,
-					})
+					.select({ id: mailbox.id })
 					.from(mailbox)
 					.where(
 						and(
@@ -1328,7 +708,7 @@ export function createMailboxStore(db: RuntimeDb) {
 					)
 					.limit(L.pageSize)
 					.all();
-				for (const row of rows) {
+				for (const row of rows)
 					tx.update(mailbox)
 						.set({
 							state: "queued",
@@ -1339,65 +719,52 @@ export function createMailboxStore(db: RuntimeDb) {
 						})
 						.where(and(eq(mailbox.id, row.id), eq(mailbox.claimEpoch, terminatedEpoch)))
 						.run();
-					mirrorDeliveryStateTx(tx, row.narratorId, row.deliveryId, "queued");
-				}
 				return rows.length;
 			});
 		},
 		retryFailed(deliveryId: string) {
-			return db.transaction((tx) => {
-				const row = tx.select().from(mailbox).where(eq(mailbox.deliveryId, deliveryId)).get();
-				if (row) ensureLegacyProjectionTx(tx, row);
-				const changed =
-					tx
-						.update(mailbox)
-						.set({ state: "queued", claimAttempts: 0, lastError: null, updatedAt: now() })
-						.where(and(eq(mailbox.deliveryId, deliveryId), eq(mailbox.state, "failed")))
-						.returning({ id: mailbox.id })
-						.all().length === 1;
-				if (changed && row) mirrorDeliveryStateTx(tx, row.narratorId, deliveryId, "queued");
-				return changed;
-			});
+			return (
+				db
+					.update(mailbox)
+					.set({ state: "queued", claimAttempts: 0, lastError: null, updatedAt: now() })
+					.where(and(eq(mailbox.deliveryId, deliveryId), eq(mailbox.state, "failed")))
+					.returning({ id: mailbox.id })
+					.all().length === 1
+			);
 		},
 		/** Never unlinks files: uploaded/history files may be shared. Claimed payload cannot be cancelled here. */
 		cancel(deliveryId: string, reason: string) {
-			return db.transaction((tx) => {
-				const row = tx.select().from(mailbox).where(eq(mailbox.deliveryId, deliveryId)).get();
-				if (!row || row.state === "materialized" || !["queued", "failed"].includes(row.state))
-					return false;
-				const changed =
-					tx
-						.update(mailbox)
-						.set({
-							state: "cancelled",
-							text: "",
-							imagesJson: null,
-							textFilePathsJson: null,
-							fileReferencesJson: null,
-							payloadRefJson: null,
-							metadataJson: null,
-							creatorJson: null,
-							commandText: null,
-							bashCommand: null,
-							byteSize: 0,
-							projectedByteSize: 0,
-							lastError: boundedError(reason),
-							updatedAt: now(),
-						})
-						.where(and(eq(mailbox.id, row.id), inArray(mailbox.state, ["queued", "failed"])))
-						.returning({ id: mailbox.id })
-						.all().length === 1;
-				if (!changed) return false;
-				if (row.kind === "user_input") cancelPendingUserProjection(tx, row);
-				else mirrorDeliveryStateTx(tx, row.narratorId, deliveryId, "cancelled");
-				return true;
-			});
+			return (
+				db
+					.update(mailbox)
+					.set({
+						state: "cancelled",
+						text: "",
+						imagesJson: null,
+						textFilePathsJson: null,
+						fileReferencesJson: null,
+						payloadRefJson: null,
+						metadataJson: null,
+						creatorJson: null,
+						commandText: null,
+						bashCommand: null,
+						byteSize: 0,
+						projectedByteSize: 0,
+						lastError: boundedError(reason),
+						updatedAt: now(),
+					})
+					.where(
+						and(eq(mailbox.deliveryId, deliveryId), inArray(mailbox.state, ["queued", "failed"])),
+					)
+					.returning({ id: mailbox.id })
+					.all().length === 1
+			);
 		},
 		/** Revert/cancel owner uses its exact claim; arbitrary UI cancellation cannot release another owner's payload. */
 		cancelClaim(claim: MailboxClaim, reason: string) {
 			return db.transaction((tx) => {
-				const row = requireClaim(tx, claim);
-				const changed =
+				requireClaim(tx, claim);
+				return (
 					tx
 						.update(mailbox)
 						.set({
@@ -1411,26 +778,15 @@ export function createMailboxStore(db: RuntimeDb) {
 						})
 						.where(claimWhere(claim))
 						.returning({ id: mailbox.id })
-						.all().length === 1;
-				if (changed) {
-					if (row.kind === "user_input") cancelPendingUserProjection(tx, row);
-					else mirrorDeliveryStateTx(tx, row.narratorId, row.deliveryId, "cancelled");
-				}
-				return changed;
+						.all().length === 1
+				);
 			});
 		},
 		/** Legacy clear is a user-only projection, not DELETE WHERE narrator_id. Each call handles one page. */
 		cancelUserPage(narratorId: string, reason: string) {
 			return db.transaction((tx) => {
 				const rows = tx
-					.select({
-						id: mailbox.id,
-						narratorId: mailbox.narratorId,
-						deliveryId: mailbox.deliveryId,
-						recipientRefId: mailbox.recipientRefId,
-						kind: mailbox.kind,
-						state: mailbox.state,
-					})
+					.select({ id: mailbox.id })
 					.from(mailbox)
 					.where(
 						and(
@@ -1442,7 +798,7 @@ export function createMailboxStore(db: RuntimeDb) {
 					.limit(L.pageSize)
 					.all();
 				if (!rows.length) return [];
-				const changed = tx
+				return tx
 					.update(mailbox)
 					.set({
 						...releasedPayload,
@@ -1462,12 +818,6 @@ export function createMailboxStore(db: RuntimeDb) {
 					)
 					.returning({ id: mailbox.id })
 					.all();
-				for (const row of rows) {
-					if (!changed.some((item) => item.id === row.id)) continue;
-					if (row.kind === "user_input") cancelPendingUserProjection(tx, row as MailboxRow);
-					else mirrorDeliveryStateTx(tx, row.narratorId, row.deliveryId, "cancelled");
-				}
-				return changed;
 			});
 		},
 		/** Only unclaimed user entries are editable. Delivery dedupe identity is not rewritten. */
@@ -1481,10 +831,15 @@ export function createMailboxStore(db: RuntimeDb) {
 				text: patch.text,
 				projectedByteSize: patch.projectedByteSize,
 			});
-			return db.transaction((tx) => {
-				const row = tx
-					.select()
-					.from(mailbox)
+			return (
+				db
+					.update(mailbox)
+					.set({
+						...patch,
+						byteSize: Buffer.byteLength(patch.text),
+						contentRevision: sql`${mailbox.contentRevision} + 1`,
+						updatedAt: now(),
+					})
 					.where(
 						and(
 							eq(mailbox.deliveryId, deliveryId),
@@ -1493,34 +848,9 @@ export function createMailboxStore(db: RuntimeDb) {
 							isNull(mailbox.payloadRefJson),
 						),
 					)
-					.get();
-				if (!row) return false;
-				const projection = row.recipientRefId
-					? updateCanonicalMessageTx(tx, {
-							narratorId: row.narratorId,
-							deliveryId,
-							contentJson: [{ type: "text", text: patch.text }],
-							contentText: patch.text,
-							commandText: row.commandText,
-						})
-					: null;
-				if (row.recipientRefId && !projection)
-					throw new Error("Buffered message history projection is missing");
-				const changed = tx
-					.update(mailbox)
-					.set({
-						...patch,
-						byteSize: Buffer.byteLength(patch.text),
-						contentRevision: row.contentRevision + 1,
-						currentRevision: row.currentRevision + 1,
-						currentMessageId: projection?.message.id ?? row.currentMessageId,
-						updatedAt: now(),
-					})
-					.where(and(eq(mailbox.id, row.id), eq(mailbox.state, "queued")))
 					.returning({ id: mailbox.id })
-					.all().length;
-				return changed === 1;
-			});
+					.all().length === 1
+			);
 		},
 		/** Call inside the history COW/edit/delete transaction, never for a fork's newly-created ref. */
 		updateRecipientRef(
@@ -1530,7 +860,6 @@ export function createMailboxStore(db: RuntimeDb) {
 			change:
 				| { kind: "cow"; messageId: string }
 				| { kind: "semantic_edit"; messageId: string }
-				| { kind: "superseded" }
 				| { kind: "deleted" },
 		) {
 			if (change.kind !== "deleted") {
@@ -1541,9 +870,7 @@ export function createMailboxStore(db: RuntimeDb) {
 						and(
 							eq(narratorMessageRefs.id, refId),
 							eq(narratorMessageRefs.narratorId, narratorId),
-							change.kind === "superseded"
-								? undefined
-								: eq(narratorMessageRefs.messageId, change.messageId),
+							eq(narratorMessageRefs.messageId, change.messageId),
 						),
 					)
 					.get();
@@ -1555,33 +882,11 @@ export function createMailboxStore(db: RuntimeDb) {
 						.where(eq(narratorMessageRefs.id, refId))
 						.run();
 			}
-			const delivery = tx
-				.select()
-				.from(mailbox)
-				.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.recipientRefId, refId)))
-				.get();
-			if (!delivery) return 0;
-			const shouldCancel =
-				(delivery.state === "queued" ||
-					delivery.state === "claimed" ||
-					delivery.state === "failed") &&
-				(change.kind === "deleted" || change.kind === "superseded");
 			return tx
 				.update(mailbox)
 				.set({
-					...(shouldCancel
-						? {
-								...releasedPayload,
-								state: "cancelled" as const,
-								claimToken: null,
-								claimEpoch: null,
-								claimedAt: null,
-							}
-						: {}),
-					recipientRefId: change.kind === "deleted" || change.kind === "superseded" ? null : refId,
-					currentMessageId:
-						change.kind === "deleted" || change.kind === "superseded" ? null : change.messageId,
-					...(change.kind === "semantic_edit" || change.kind === "superseded"
+					currentMessageId: change.kind === "deleted" ? null : change.messageId,
+					...(change.kind === "semantic_edit"
 						? {
 								receiptDisposition: "superseded" as const,
 								currentRevision: sql`max(${mailbox.currentRevision}, ${mailbox.contentRevision}) + 1`,
@@ -1593,7 +898,13 @@ export function createMailboxStore(db: RuntimeDb) {
 							: {}),
 					updatedAt: now(),
 				})
-				.where(and(eq(mailbox.id, delivery.id), eq(mailbox.recipientRefId, refId)))
+				.where(
+					and(
+						eq(mailbox.narratorId, narratorId),
+						eq(mailbox.recipientRefId, refId),
+						eq(mailbox.state, "materialized"),
+					),
+				)
 				.returning({ id: mailbox.id })
 				.all().length;
 		},

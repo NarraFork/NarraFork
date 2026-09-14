@@ -62,22 +62,6 @@ test("cold bootstrap releases only previous-process or proven legacy claims, nev
 	expect(state(current.id)?.state).toBe("claimed");
 });
 
-test("pending publication counts as mailbox work before its notice is materialized", () => {
-	db.insert(narrators).values({ id: "outbox-only", createdAt: time, updatedAt: time }).run();
-	const outbox = createPublicationOutbox(db);
-	const run = {
-		producerKind: "agent" as const,
-		taskId: "sender",
-		recipientId: "outbox-only",
-		logicalRunId: "pending-publication",
-	};
-	outbox.reserveRunSlots(run);
-	outbox.commitIntent({ ...run, eventKind: "completed", resultRef: "result", summary: "waiting" });
-
-	expect(inbox.hasPendingInboxWork("outbox-only")).toBe(true);
-	expect(inbox.peekEligibleInboxHead("outbox-only")).toBeUndefined();
-});
-
 test("predicate runs against publication-eligible head, never claims a different row than checked", () => {
 	const early = store.enqueue({
 		kind: "agent_message",
@@ -111,8 +95,6 @@ test("predicate runs against publication-eligible head, never claims a different
 	if (!("delivery" in user)) throw new Error("full");
 	tryClaimExecution("barrier", "primary");
 	expect(inbox.peekInbox("barrier")?.id).toBe(user.delivery.id);
-	expect(inbox.peekEligibleInboxHead("barrier")?.id).toBe(early.delivery.id);
-	expect(inbox.hasPendingInboxWork("barrier")).toBe(true);
 	expect(
 		inbox.claimInboxHead(
 			"barrier",

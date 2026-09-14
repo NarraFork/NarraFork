@@ -204,7 +204,6 @@ import {
 } from "../lib/validators/narrators";
 import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
 import { requireAdmin } from "../middleware/auth";
-import { hasPendingInboxWork, wakeInboxIfEligible } from "../services/agent-runtime/inbox";
 import { isExecutionSuspended } from "../services/agent-runtime/ownership";
 import { generateAskUserQuestionAnswers } from "../services/ask-user-question-reflection";
 import {
@@ -264,7 +263,6 @@ import {
 import { filterReadableNarrators, narratorReadableWhere } from "../services/narrator-acl";
 import {
 	deleteBufferedTextFile,
-	enqueueBufferedMessage,
 	persistAdditionalBufferedTextFiles,
 	retryBufferedMessage,
 } from "../services/narrator-buffer";
@@ -276,15 +274,9 @@ import {
 } from "../services/narrator-draft-service";
 import { buildExportFileName, streamNarratorExport } from "../services/narrator-export";
 import {
-	publishHistoryDeletion,
-	publishHistoryMessage,
-	publishHistoryUpdate,
-} from "../services/narrator-history-publisher";
-import {
 	countNarratorMessageRefs,
 	countNarratorMessageRefsBatch,
 } from "../services/narrator-message-count";
-import { narratorMessageQueries as narratorMessageService } from "../services/narrator-messages";
 import {
 	deferPendingQuestion,
 	disarmQuestionReflection,
@@ -1834,7 +1826,6 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			// does: appending the protected task now and starting its Spec turn would run
 			// that turn against the history the compact is replacing.
 			const goalNarratorBusy =
-				hasPendingInboxWork(id) ||
 				narrator.status === "working" ||
 				narrator.status === "waiting" ||
 				isLoopRunning(id) ||
@@ -1849,9 +1840,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					rawCommand,
 					userId,
 				);
-				publishHistoryMessage(
-					id,
-					{
+				broadcastToNarrator(id, {
+					type: "user_message",
+					narratorId: id,
+					message: {
 						id: userMsg.id,
 						narratorId: id,
 						role: "user",
@@ -1863,8 +1855,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 						children: [],
 						creator: userMsg.creator ?? null,
 					},
-					"user_message",
-				);
+				});
 				const { added, written } = await appendProtectedSpecTask(id, objective);
 				if (added) {
 					broadcastSpecChanged(
@@ -1923,19 +1914,9 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// in-memory check is authoritative: it catches the case where the DB status
 		// went stale to idle while the loop was still draining, which would otherwise
 		// let this message start a second concurrent loop instead of being buffered.
-		const pendingMailboxWork = hasPendingInboxWork(id);
-		const wakeQueuedInbox = () => {
-			void wakeInboxIfEligible(id).catch((error) => {
-				logger.warn("Queued narrator input wake deferred", {
-					narratorId: id,
-					error: String(error),
-				});
-			});
-		};
 		let narratorBusy =
-			pendingMailboxWork ||
-			(!isExecutionSuspended(id) &&
-				(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id)));
+			!isExecutionSuspended(id) &&
+			(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id));
 
 		// An idle narrator whose context is being compacted takes the same queue path as a
 		// busy one, so the turn runs against the summary that is about to replace its
@@ -2033,14 +2014,12 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					throw new ValidationError("Subagent is not running in foreground");
 				}
 				uploadsAccepted = true;
-				if (result.message) publishHistoryMessage(id, result.message, "user_message");
 				const messages = toBufferSummary(getSubagentBufferedMessages(id));
 				broadcastToNarrator(id, {
 					type: "buffer_set",
 					narratorId: id,
 					messages,
 				});
-				wakeQueuedInbox();
 				return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
 			}
 
@@ -2060,34 +2039,20 @@ narratorRoutes.post("/:id/messages", async (c) => {
 						avatarImageId: user.avatarImageId,
 					}
 				: null;
-			const result = pendingMailboxWork
-				? await enqueueBufferedMessage(
-						id,
-						finalMessage,
-						images.length > 0 ? images : undefined,
-						commandText,
-						userId,
-						creator,
-						textFiles.length > 0 ? textFiles : undefined,
-						priority ? "front" : undefined,
-						prePromptBashCommand,
-						snapshots,
-					)
-				: await pushBufferedMessage(
-						id,
-						finalMessage,
-						images.length > 0 ? images : undefined,
-						commandText,
-						userId,
-						creator,
-						textFiles.length > 0 ? textFiles : undefined,
-						priority ? "front" : undefined,
-						prePromptBashCommand,
-						snapshots,
-					);
+			const result = await pushBufferedMessage(
+				id,
+				finalMessage,
+				images.length > 0 ? images : undefined,
+				commandText,
+				userId,
+				creator,
+				textFiles.length > 0 ? textFiles : undefined,
+				priority ? "front" : undefined,
+				prePromptBashCommand,
+				snapshots,
+			);
 			if (result.ok) {
 				uploadsAccepted = true;
-				if (result.message) publishHistoryMessage(id, result.message, "user_message");
 				const messages = toBufferSummary(getBufferedMessages(id));
 				broadcastToNarrator(id, {
 					type: "buffer_set",
@@ -2100,10 +2065,6 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				if (priority) {
 					requestBufferedMessageSoftStop(id);
 				}
-				// This queue may have been admitted because an older durable mailbox item is
-				// waiting while the narrator looks idle (for example after a restart). Re-drive
-				// the publication-aware head instead of waiting for another user action.
-				wakeQueuedInbox();
 				return c.json(
 					{
 						buffered: true,
@@ -2284,7 +2245,11 @@ narratorRoutes.post("/:id/continue", async (c) => {
 	const dismissRecoveryMessage = async () => {
 		if (!recoveryMessageId) return;
 		await narratorService.dismissCwdRecoveryMessage(id, recoveryMessageId);
-		publishHistoryDeletion(id, [recoveryMessageId]);
+		broadcastToNarrator(id, {
+			type: "messages_deleted",
+			narratorId: id,
+			deletedMessageIds: [recoveryMessageId],
+		});
 	};
 	if (isSubagentVariant(narrator.variant)) {
 		await resumeSubagent({
@@ -2990,13 +2955,6 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	for (const file of droppedSavedFiles) deleteBufferedTextFile(file);
 
 	await broadcastBufferQueue(id);
-	const updatedCanonicalId = (await resolveBufferQueue(id)).find(
-		(message) => message.id === mid,
-	)?.messageId;
-	if (updatedCanonicalId) {
-		const updatedMessage = await narratorMessageService.getMessageById(id, updatedCanonicalId);
-		if (updatedMessage) publishHistoryUpdate(id, updatedMessage);
-	}
 	return c.json({ ok: true });
 });
 
@@ -3016,13 +2974,6 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 	const { wakeInboxIfEligible } = await import("../services/agent-runtime/inbox");
 	const resumed = await wakeInboxIfEligible(id);
 	await broadcastBufferQueue(id);
-	const retriedCanonicalId = (await resolveBufferQueue(id)).find(
-		(message) => message.id === mid,
-	)?.messageId;
-	if (retriedCanonicalId) {
-		const retriedMessage = await narratorMessageService.getMessageById(id, retriedCanonicalId);
-		if (retriedMessage) publishHistoryUpdate(id, retriedMessage);
-	}
 	return c.json({ ok: true, resumed });
 });
 
@@ -3032,14 +2983,10 @@ narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	const mid = c.req.param("mid");
 	// The wrapper cancels from the shared mailbox and clears subagent soft-stop
 	// state; the primary counterpart is cleared below for the same queue identity.
-	const canonicalId = (await resolveBufferQueue(id)).find(
-		(message) => message.id === mid,
-	)?.messageId;
 	const { removeSubagentBufferedMessage } = await import("../services/narrator-subagent");
 	const ok = removeSubagentBufferedMessage(id, mid);
 	if (ok) clearBufferedMessageSoftStopIfIdle(id);
 	if (!ok) throw new NotFoundError("Buffered message", mid);
-	if (canonicalId) publishHistoryDeletion(id, [canonicalId]);
 	await broadcastBufferQueue(id);
 	return c.json({ ok: true });
 });
@@ -3060,13 +3007,9 @@ narratorRoutes.put("/:id/buffer/reorder", async (c) => {
 narratorRoutes.delete("/:id/buffer", async (c) => {
 	const id = c.req.param("id");
 	// One persistent cancellation, plus each actor adapter's ephemeral soft stop.
-	const canonicalIds = (await resolveBufferQueue(id))
-		.map((message) => message.messageId)
-		.filter((messageId): messageId is string => Boolean(messageId));
 	const { clearSubagentBufferedMessages } = await import("../services/narrator-subagent");
 	clearSubagentBufferedMessages(id);
 	clearBufferedMessageSoftStopIfIdle(id);
-	publishHistoryDeletion(id, canonicalIds);
 	broadcastToNarrator(id, { type: "buffer_set", narratorId: id, messages: [] });
 	return c.json({ ok: true });
 });
@@ -3416,7 +3359,11 @@ narratorRoutes.delete("/:id/compact/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	const result = await narratorService.deleteCompactMessage(narratorId, messageId);
-	publishHistoryDeletion(narratorId, [messageId]);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
 	broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 	return c.json({ ok: true, ...result });
 });
@@ -3506,7 +3453,11 @@ narratorRoutes.delete("/:id/spec-carryover-messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	await narratorService.dismissSpecCarryoverMessage(narratorId, messageId);
-	publishHistoryDeletion(narratorId, [messageId]);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
 	return c.json({ ok: true, deletedMessageIds: [messageId] });
 });
 
@@ -3542,7 +3493,11 @@ narratorRoutes.post("/:id/review-feedback/:messageId/apply", async (c) => {
 	const claim = await narratorService.markReviewFeedbackApplied(narratorId, messageId);
 	if (claim.alreadyApplied) return c.json({ ok: true, started: false, reason: "already_applied" });
 	if (claim.message) {
-		publishHistoryUpdate(narratorId, claim.message);
+		broadcastToNarrator(narratorId, {
+			type: "message_updated",
+			narratorId,
+			message: claim.message,
+		});
 	}
 
 	// Read BEFORE trying to start: afterwards a loop this call started is itself busy,
@@ -3568,7 +3523,11 @@ narratorRoutes.post("/:id/review-feedback/:messageId/apply", async (c) => {
 				.releaseReviewFeedbackClaim(narratorId, messageId)
 				.catch(() => undefined);
 			if (released) {
-				publishHistoryUpdate(narratorId, released);
+				broadcastToNarrator(narratorId, {
+					type: "message_updated",
+					narratorId,
+					message: released,
+				});
 			}
 		}
 	}
@@ -3584,7 +3543,11 @@ narratorRoutes.delete("/:id/cwd-recovery-messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	await narratorService.dismissCwdRecoveryMessage(narratorId, messageId);
-	publishHistoryDeletion(narratorId, [messageId]);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
 	return c.json({ ok: true, deletedMessageIds: [messageId] });
 });
 
@@ -3593,7 +3556,11 @@ narratorRoutes.delete("/:id/interrupt-task-guard-messages/:messageId", async (c)
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	await narratorService.dismissInterruptTaskGuardMessage(narratorId, messageId);
-	publishHistoryDeletion(narratorId, [messageId]);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
 	return c.json({ ok: true, deletedMessageIds: [messageId] });
 });
 
@@ -3602,7 +3569,11 @@ narratorRoutes.delete("/:id/error-messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	await narratorService.dismissErrorMessage(narratorId, messageId);
-	publishHistoryDeletion(narratorId, [messageId]);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
 	return c.json({ ok: true, deletedMessageIds: [messageId] });
 });
 
@@ -3662,7 +3633,7 @@ narratorRoutes.post("/:id/clear-context", async (c) => {
 		? await narratorService.clearContextBefore(narratorId, beforeMessageId)
 		: await narratorService.clearContext(narratorId);
 	resetActiveUpstreamSession(narratorId);
-	publishHistoryMessage(narratorId, msg);
+	broadcastToNarrator(narratorId, { type: "message", narratorId, message: msg });
 	broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 	// On a full context clear (no anchor), the Dynamic Spec tasks.json is left
 	// intact. If tasks remain, surface a UI-only card so the user can clear the
@@ -3728,7 +3699,11 @@ narratorRoutes.delete("/:id/segment-compact/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	await narratorService.deleteSegmentCompact(narratorId, messageId);
-	publishHistoryDeletion(narratorId, [messageId]);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
 	broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 	return c.json({ ok: true });
 });
@@ -4455,7 +4430,11 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 		with: { toolCalls: true },
 	});
 	if (fullMsg) {
-		publishHistoryMessage(id, { ...fullMsg, seq: msg.seq });
+		broadcastToNarrator(id, {
+			type: "message",
+			narratorId: id,
+			message: { ...fullMsg, seq: msg.seq },
+		});
 	}
 
 	// Make the running loop pick all of this up at its next turn boundary.
@@ -4512,7 +4491,11 @@ narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 	}
 
 	const msg = await narratorService.persistSystemMessage(id, message, undefined, userId);
-	publishHistoryMessage(id, msg);
+	broadcastToNarrator(id, {
+		type: "message",
+		narratorId: id,
+		message: msg,
+	});
 
 	// Same reason as the enter route: the row above is invisible to a pass whose history was
 	// built before it, and the stale prompt still carries the plan-mode constraint. The
@@ -4976,7 +4959,11 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 	});
 
 	// Broadcast so the UI updates in real-time
-	publishHistoryMessage(id, msg);
+	broadcastToNarrator(id, {
+		type: "message",
+		narratorId: id,
+		message: msg,
+	});
 
 	return c.json({ messageId: msgId }, 201);
 });
@@ -5067,7 +5054,11 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	});
 
 	// Broadcast the update
-	publishHistoryUpdate(id, updatedMsg);
+	broadcastToNarrator(id, {
+		type: "message_updated",
+		narratorId: id,
+		message: updatedMsg,
+	});
 
 	return c.json(publicNarratorResponse(newNarrator), 201);
 });
@@ -5111,7 +5102,11 @@ narratorRoutes.delete("/:id/ask-in-passing/:messageId", async (c) => {
 	});
 
 	// Broadcast deletion
-	publishHistoryDeletion(narratorId, [messageId]);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
 
 	return c.json({ ok: true });
 });
@@ -6930,14 +6925,18 @@ narratorRoutes.delete("/:id/browser-sessions/:sessionId", async (c) => {
 			`[System] Browser session ${sessionId} was closed by the user while performance tracing was active. ` +
 			`The trace data was discarded. If you need a trace, start a new session and recording.`;
 		const msg = await narratorService.persistSystemMessage(narratorId, text);
-		publishHistoryMessage(narratorId, {
-			id: msg.id,
+		broadcastToNarrator(narratorId, {
+			type: "message",
 			narratorId,
-			role: "sys",
-			contentJson: msg.contentJson,
-			contentText: msg.contentText,
-			createdAt: msg.createdAt,
-			children: [],
+			message: {
+				id: msg.id,
+				narratorId,
+				role: "sys",
+				contentJson: msg.contentJson,
+				contentText: msg.contentText,
+				createdAt: msg.createdAt,
+				children: [],
+			},
 		});
 	}
 
@@ -7055,14 +7054,18 @@ narratorRoutes.post("/:id/browser-sessions/:sessionId/stop-tracing", async (c) =
 		`[System] Performance tracing on browser session ${sessionId} was stopped by the user from the management panel. ` +
 		`The trace data was discarded. If you need a trace, start a new recording with perf_start.`;
 	const msg = await narratorService.persistSystemMessage(narratorId, text);
-	publishHistoryMessage(narratorId, {
-		id: msg.id,
+	broadcastToNarrator(narratorId, {
+		type: "message",
 		narratorId,
-		role: "sys",
-		contentJson: msg.contentJson,
-		contentText: msg.contentText,
-		createdAt: msg.createdAt,
-		children: [],
+		message: {
+			id: msg.id,
+			narratorId,
+			role: "sys",
+			contentJson: msg.contentJson,
+			contentText: msg.contentText,
+			createdAt: msg.createdAt,
+			children: [],
+		},
 	});
 
 	return c.json({ ok: true });

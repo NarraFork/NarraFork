@@ -57,11 +57,6 @@ import { resolveDefaultReasoningEffort, resolveProvider } from "../lib/settings"
 import { toolCallWithExecutionTargets } from "../lib/tool-execution-target-projection";
 import { MAX_BATCH_DELETE_BLOCKS } from "../lib/validators/narrators";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import { createMailboxStore } from "./agent-runtime/mailbox";
-import {
-	hasPendingPublicationProjection,
-	repairPendingPublicationProjections,
-} from "./agent-runtime/publication-outbox";
 import {
 	AWAIT_AGENT_RESOLVED_FIELD,
 	attachAwaitAgentNarratorIds,
@@ -70,7 +65,6 @@ import {
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
-import { publishHistoryDeletion, publishHistoryUpdate } from "./narrator-history-publisher";
 import { deleteRecipientMessageRefs, updateRecipientMessageRef } from "./narrator-persistence";
 import {
 	ensureRefsCoverMessage,
@@ -785,8 +779,7 @@ function applyBlockDeletionTx(
 		)
 		.map((block) => block.id);
 	if (remaining.length === 0) {
-		const disposition = ref.deliveryKind === "agent_message" ? "superseded" : "deleted";
-		deleteRecipientMessageRefs(tx, disposition).where(eq(narratorMessageRefs.id, ref.id)).run();
+		deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, ref.id)).run();
 		if (!isShared) deleteOrphanedMessages(tx, [message.id]);
 		return null;
 	}
@@ -954,11 +947,12 @@ async function deleteBlockSelection(
 				})
 				.sync();
 			if (!message) throw new Error("updated message disappeared after commit");
-			publishHistoryUpdate(
+			broadcastToNarrator(narratorId, {
+				type: "message_updated",
 				narratorId,
-				{ ...message, seq: item.seq },
-				item.oldId ? { oldMessageId: item.oldId, replacedMessageId: item.oldId } : undefined,
-			);
+				message: { ...message, seq: item.seq },
+				...(item.oldId ? { oldMessageId: item.oldId, replacedMessageId: item.oldId } : {}),
+			});
 		}
 	} catch (error) {
 		logger.warn("history deletion broadcast projection failed; requesting bounded reload", {
@@ -969,7 +963,11 @@ async function deleteBlockSelection(
 	}
 	const deletedMessageIds = [...new Set([...planned.derived.messageIds, ...removedRefMessageIds])];
 	if (deletedMessageIds.length > 0) {
-		publishHistoryDeletion(narratorId, deletedMessageIds);
+		broadcastToNarrator(narratorId, {
+			type: "messages_deleted",
+			narratorId,
+			deletedMessageIds,
+		});
 	}
 	const results = planned.plans.flatMap(({ message, indices, remaining }) =>
 		indices.map((blockIndex) => ({
@@ -1513,37 +1511,6 @@ function attachMessageSeqs<T extends { id: string }>(
 		if (seq != null) {
 			(msg as T & { seq?: number }).seq = seq;
 		}
-	}
-}
-
-type DeliveryRefProjection = {
-	messageId: string;
-	seq: number;
-	deliveryId: string | null;
-	deliveryKind: string | null;
-	deliveryState: string | null;
-};
-
-function modelEligibleDeliveryRef() {
-	return or(
-		isNull(narratorMessageRefs.deliveryState),
-		eq(narratorMessageRefs.deliveryState, "materialized"),
-	);
-}
-
-function attachDeliveryProjections<T extends { id: string }>(
-	messages: T[],
-	rows: readonly DeliveryRefProjection[],
-): void {
-	const byMessage = new Map(rows.map((row) => [row.messageId, row]));
-	for (const message of messages) {
-		const row = byMessage.get(message.id);
-		if (!row?.deliveryId) continue;
-		Object.assign(message, {
-			deliveryId: row.deliveryId,
-			deliveryKind: row.deliveryKind,
-			deliveryState: row.deliveryState,
-		});
 	}
 }
 
@@ -2660,13 +2627,7 @@ function attachSubagentActivities(
  */
 async function buildTreeFromTopLevelRefs(
 	narratorId: string,
-	refRows: Array<{
-		messageId: string;
-		seq: number;
-		deliveryId: string | null;
-		deliveryKind: string | null;
-		deliveryState: string | null;
-	}>,
+	refRows: Array<{ messageId: string; seq: number }>,
 	isSubagent: boolean,
 	ioBudget: number,
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -2681,7 +2642,6 @@ async function buildTreeFromTopLevelRefs(
 	const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 	topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 	attachMessageSeqs(topMessages, seqMap);
-	attachDeliveryProjections(topMessages, refRows);
 	if (isSubagent) {
 		for (const message of topMessages) message.parentToolUseId = null;
 	}
@@ -2980,13 +2940,7 @@ function getToolCallDetailTx(
 const narratorMessageQueriesUnlocked = {
 	async getMessages(narratorId: string, limit = 100, offset = 0) {
 		const refRows = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-				deliveryId: narratorMessageRefs.deliveryId,
-				deliveryKind: narratorMessageRefs.deliveryKind,
-				deliveryState: narratorMessageRefs.deliveryState,
-			})
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
 			.where(eq(narratorMessageRefs.narratorId, narratorId))
 			.orderBy(narratorMessageRefs.seq)
@@ -3001,44 +2955,10 @@ const narratorMessageQueriesUnlocked = {
 		});
 		const seqMap = new Map(refRows.map((row) => [row.messageId, row.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-		attachDeliveryProjections(messages, refRows);
 		return messages.map((message) => ({
 			...message,
 			toolCalls: latestToolCallAttempts(message.toolCalls),
 		}));
-	},
-
-	/** Load one message through its narrator-owned ref, without a page-size assumption. */
-	async getMessageById(narratorId: string, messageId: string) {
-		const ref = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-				deliveryId: narratorMessageRefs.deliveryId,
-				deliveryKind: narratorMessageRefs.deliveryKind,
-				deliveryState: narratorMessageRefs.deliveryState,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, messageId),
-				),
-			)
-			.limit(1)
-			.get();
-		if (!ref) return null;
-		const message = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			with: { toolCalls: true },
-		});
-		if (!message) return null;
-		attachDeliveryProjections([message], [ref]);
-		return {
-			...message,
-			seq: ref.seq,
-			toolCalls: latestToolCallAttempts(message.toolCalls),
-		};
 	},
 
 	async getLatestCompactSeq(narratorId: string): Promise<number | null> {
@@ -3057,13 +2977,7 @@ const narratorMessageQueriesUnlocked = {
 		const compactSeq = await this.getLatestCompactSeq(narratorId);
 
 		const refRows = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-				deliveryId: narratorMessageRefs.deliveryId,
-				deliveryKind: narratorMessageRefs.deliveryKind,
-				deliveryState: narratorMessageRefs.deliveryState,
-			})
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
 			.where(
 				and(
@@ -3095,7 +3009,6 @@ const narratorMessageQueriesUnlocked = {
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-		attachDeliveryProjections(messages, refRows);
 		return messages.map((message) => ({
 			...message,
 			toolCalls: latestToolCallAttempts(message.toolCalls),
@@ -3128,10 +3041,6 @@ const narratorMessageQueriesUnlocked = {
 					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
 					ne(narratorMessages.role, "disp"),
 					isNull(narratorMessageRefs.segmentCompactId),
-					or(
-						isNull(narratorMessageRefs.deliveryState),
-						eq(narratorMessageRefs.deliveryState, "materialized"),
-					),
 					sql`NOT EXISTS (
 						SELECT 1
 						FROM json_each(${narratorMessages.contentJson}) AS compact_block
@@ -3307,10 +3216,6 @@ const narratorMessageQueriesUnlocked = {
 					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
 					ne(narratorMessages.role, "disp"),
 					isNull(narratorMessageRefs.segmentCompactId),
-					or(
-						isNull(narratorMessageRefs.deliveryState),
-						eq(narratorMessageRefs.deliveryState, "materialized"),
-					),
 				),
 			)
 			.orderBy(narratorMessageRefs.seq);
@@ -3406,7 +3311,6 @@ const narratorMessageQueriesUnlocked = {
 					lowerBound,
 					lt(narratorMessageRefs.seq, targetRef.seq),
 					isNull(narratorMessageRefs.segmentCompactId),
-					modelEligibleDeliveryRef(),
 				),
 			)
 			.orderBy(narratorMessageRefs.seq);
@@ -3447,7 +3351,6 @@ const narratorMessageQueriesUnlocked = {
 					eq(narratorMessageRefs.narratorId, narratorId),
 					inArray(narratorMessages.role, ["user", "assistant"]),
 					isNotNull(narratorMessages.contentText),
-					modelEligibleDeliveryRef(),
 				),
 			)
 			.orderBy(narratorMessageRefs.seq)
@@ -3485,7 +3388,6 @@ const narratorMessageQueriesUnlocked = {
 					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
 					inArray(narratorMessages.role, ["user", "assistant"]),
 					isNull(narratorMessageRefs.segmentCompactId),
-					modelEligibleDeliveryRef(),
 					...(includeChildMessages ? [] : [isNull(narratorMessages.parentToolUseId)]),
 				),
 			)
@@ -3543,7 +3445,6 @@ const narratorMessageQueriesUnlocked = {
 					eq(narratorMessageRefs.narratorId, narratorId),
 					inArray(narratorMessages.role, ["user", "assistant"]),
 					isNotNull(narratorMessages.contentText),
-					modelEligibleDeliveryRef(),
 				),
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -3583,7 +3484,6 @@ const narratorMessageQueriesUnlocked = {
 					eq(narratorMessages.role, "assistant"),
 					isNotNull(narratorMessages.contentText),
 					isNull(narratorMessageRefs.segmentCompactId),
-					modelEligibleDeliveryRef(),
 				),
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -3765,15 +3665,6 @@ const narratorMessageQueriesUnlocked = {
 		opts: { afterSeq?: number; beforeSeq?: number; limit?: number; messageVersion?: number } = {},
 	) {
 		const limit = Math.min(Math.max(Math.trunc(opts.limit ?? 100), 1), 100);
-		// New deliveries project at ingress; probe the indexed repair candidates first so a
-		// normal exact-layout page stays read-only when no legacy work remains.
-		const mailboxStore = createMailboxStore(db);
-		if (mailboxStore.hasLegacyProjectionWork(narratorId)) {
-			mailboxStore.repairLegacyProjections(narratorId);
-		}
-		if (hasPendingPublicationProjection(db, narratorId)) {
-			repairPendingPublicationProjections(db, narratorId);
-		}
 		// A lazy fork only materialized the refs after its parent's last compact.
 		// Reading older than `beforeSeq` means reading rows BELOW it, so the backfill
 		// must cover the whole requested page — and it must happen BEFORE the
@@ -3819,13 +3710,7 @@ const narratorMessageQueriesUnlocked = {
 		}
 
 		const refRows = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-				deliveryId: narratorMessageRefs.deliveryId,
-				deliveryKind: narratorMessageRefs.deliveryKind,
-				deliveryState: narratorMessageRefs.deliveryState,
-			})
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 			.where(and(...conditions))
@@ -4023,7 +3908,7 @@ const narratorMessageQueriesUnlocked = {
 		// already know we're over the threshold, so we can short-circuit to a
 		// full reload without reading any large message payloads. This avoids the
 		// expensive count(*) range scan when the catch-up anchor is far behind.
-		let refRows: DeliveryRefProjection[] = [];
+		let refRows: Array<{ messageId: string; seq: number }> = [];
 		if (parentAnchorSeq != null) {
 			const rowConditions = [
 				eq(narratorMessageRefs.narratorId, narratorId),
@@ -4035,9 +3920,6 @@ const narratorMessageQueriesUnlocked = {
 				.select({
 					messageId: narratorMessageRefs.messageId,
 					seq: narratorMessageRefs.seq,
-					deliveryId: narratorMessageRefs.deliveryId,
-					deliveryKind: narratorMessageRefs.deliveryKind,
-					deliveryState: narratorMessageRefs.deliveryState,
 				})
 				.from(narratorMessageRefs)
 				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
@@ -4046,14 +3928,11 @@ const narratorMessageQueriesUnlocked = {
 				.limit(limit + 1);
 		}
 
-		const childRefRows: DeliveryRefProjection[] = childWhere
+		const childRefRows: Array<{ messageId: string; seq: number }> = childWhere
 			? await db
 					.select({
 						messageId: narratorMessageRefs.messageId,
 						seq: narratorMessageRefs.seq,
-						deliveryId: narratorMessageRefs.deliveryId,
-						deliveryKind: narratorMessageRefs.deliveryKind,
-						deliveryState: narratorMessageRefs.deliveryState,
 					})
 					.from(narratorMessageRefs)
 					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
@@ -4088,7 +3967,6 @@ const narratorMessageQueriesUnlocked = {
 		const seqMap = new Map(allRefRows.map((r) => [r.messageId, r.seq]));
 		allMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 		attachMessageSeqs(allMessages, seqMap);
-		attachDeliveryProjections(allMessages, allRefRows);
 
 		const topMsgs = [] as typeof allMessages;
 		const childMsgs = [] as typeof allMessages;

@@ -239,18 +239,16 @@ test("child real consumer retains mailbox payload after SQL failure and retries 
 	const accepted = await pushSubagentBufferedMessage("child", `[sender] ${d.text}`, {
 		delivery: d,
 	});
-	// Acceptance eagerly creates the visible canonical row; fail the later mailbox
-	// materialization update to verify the row remains retryable and model-hidden.
 	sqlite.exec(
-		"CREATE TEMP TRIGGER fail_inbox_materialize BEFORE UPDATE OF current_message_id ON narrator_buffered_messages BEGIN SELECT RAISE(ABORT, 'inbox materialization fault'); END",
+		"CREATE TEMP TRIGGER fail_inbox_ref BEFORE INSERT ON narrator_message_refs BEGIN SELECT RAISE(ABORT, 'inbox ref fault'); END",
 	);
 	try {
-		await expect(consume()).rejects.toThrow("inbox materialization fault");
+		await expect(consume()).rejects.toThrow("inbox ref fault");
 	} finally {
-		sqlite.exec("DROP TRIGGER fail_inbox_materialize");
+		sqlite.exec("DROP TRIGGER fail_inbox_ref");
 	}
 	expect(state(accepted.id)).toMatchObject({ state: "queued", text: d.text });
-	expect(childMessages()).toHaveLength(1);
+	expect(childMessages()).toHaveLength(0);
 	await consume();
 	expect(state(accepted.id)).toMatchObject({ state: "materialized", text: "", adoptedAt: null });
 	expect(childMessages()).toHaveLength(1);
@@ -444,15 +442,9 @@ test("late claim callback cannot materialize after shared owner replacement", as
 		}),
 	).rejects.toThrow("Stale mailbox execution owner");
 	expect(state(row.id)?.state).toBe("claimed");
-	// The canonical row/ref was created at acceptance and remains visible; only
-	// materialization is fenced by the stale execution epoch.
 	expect(
 		db.select().from(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, "parent")).all(),
-	).toHaveLength(1);
-	expect(
-		db.select().from(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, "parent")).get()
-			?.deliveryState,
-	).toBe("claimed");
+	).toHaveLength(0);
 	inbox.runtimeInbox.recoverClaims("parent", oldOwner.epoch, { ownerTerminated: true });
 	expect(state(row.id)?.state).toBe("queued");
 });

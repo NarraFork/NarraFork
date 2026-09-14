@@ -2,7 +2,6 @@ import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import {
 	backgroundTasks,
 	narratorBufferedMessages as mailbox,
-	narratorMessageRefs,
 	narrators,
 	narratorToolCalls,
 	narratorToolContinuations,
@@ -10,7 +9,6 @@ import {
 } from "../../db/schema";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
-import { insertCanonicalMessageTx } from "../narrator-history-projection";
 import { MAILBOX_LIMITS as L } from "./limits";
 import {
 	allocateArrivalSequence,
@@ -19,7 +17,6 @@ import {
 	initializeLegacyMailbox,
 	mailboxHasCapacity,
 } from "./mailbox";
-import { setDeliveryProjectionStateTx } from "./mailbox-transitions";
 import type { NoticeKind, RuntimeDb, RuntimeStoreDb, RuntimeTx } from "./mailbox-types";
 
 export type PublicationEvent = "started" | "completed" | "failed" | "timed_out" | "cancelled";
@@ -122,62 +119,7 @@ function assertRun(run: PublicationRun) {
 		if (typeof pointer !== "string" || !pointer || Buffer.byteLength(pointer) > 256)
 			throw new Error("Invalid publication pointer");
 }
-/** Cheap indexed probe used to avoid entering a write transaction on every history page. */
-export function hasPendingPublicationProjection(database: RuntimeDb, recipientId: string): boolean {
-	return Boolean(
-		database
-			.select({ id: outbox.id })
-			.from(outbox)
-			.where(and(eq(outbox.recipientId, recipientId), eq(outbox.state, "pending")))
-			.limit(1)
-			.get(),
-	);
-}
-
 /** No timers or task re-execution. The publisher schedules bounded retries after this returns. */
-export function repairPendingPublicationProjections(
-	database: RuntimeDb,
-	recipientId: string,
-): number {
-	return database.transaction((tx) => {
-		const rows = tx
-			.select({
-				deliveryId: outbox.deliveryId,
-				taskId: outbox.taskId,
-				eventKind: outbox.eventKind,
-				summary: outbox.summary,
-				createdAt: outbox.createdAt,
-			})
-			.from(outbox)
-			.where(and(eq(outbox.recipientId, recipientId), eq(outbox.state, "pending")))
-			.orderBy(asc(outbox.arrivalSeq), asc(outbox.id))
-			.limit(L.pageSize)
-			.all();
-		for (const row of rows) {
-			if (
-				tx
-					.select({ id: narratorMessageRefs.id })
-					.from(narratorMessageRefs)
-					.where(eq(narratorMessageRefs.deliveryId, row.deliveryId))
-					.get()
-			)
-				continue;
-			insertCanonicalMessageTx(tx, {
-				narratorId: recipientId,
-				messageId: generateId(),
-				role: "sys",
-				contentJson: [{ type: "text", text: row.summary ?? "(queued task notice)" }],
-				contentText: row.summary ?? "(queued task notice)",
-				createdAt: row.createdAt,
-				deliveryId: row.deliveryId,
-				deliveryKind: "task_notice",
-				deliveryState: "queued",
-			});
-		}
-		return rows.length;
-	});
-}
-
 export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutboxOptions = {}) {
 	const boundary = legacyBoundary(db);
 	const readLegacyRuntimeAdmission = options.readLegacyRuntimeAdmission;
@@ -808,36 +750,6 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 		if (!recipientFailure && !initializeLegacyMailbox(tx, intent.recipientId))
 			throw new Error("Legacy mailbox initialization requires another page");
 		const arrivalSeq = recipientFailure ? null : allocateArrivalSequence(tx, intent.recipientId);
-		if (!recipientFailure) {
-			insertCanonicalMessageTx(tx, {
-				narratorId: intent.recipientId,
-				messageId: generateId(),
-				role: "sys",
-				contentJson: [
-					{
-						type: "system_injection",
-						source: `bg_${intent.producerKind}`,
-						modelText: intent.summary,
-						body: {
-							kind: "tasksDone",
-							flavor: intent.producerKind,
-							items: [
-								{
-									id: intent.taskId,
-									title: intent.taskId,
-									status: intent.eventKind,
-									preview: intent.summary,
-								},
-							],
-						},
-					},
-				],
-				contentText: intent.summary,
-				deliveryId: slot.deliveryId,
-				deliveryKind: "task_notice",
-				deliveryState: "queued",
-			});
-		}
 		tx.update(outbox)
 			.set({
 				eventKind: intent.eventKind,
@@ -914,25 +826,6 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 				},
 				L.publicationBytes,
 			);
-			const projection = tx
-				.select({ messageId: narratorMessageRefs.messageId, refId: narratorMessageRefs.id })
-				.from(narratorMessageRefs)
-				.where(eq(narratorMessageRefs.deliveryId, row.deliveryId))
-				.get();
-			let canonical = projection;
-			if (!canonical) {
-				const inserted = insertCanonicalMessageTx(tx, {
-					narratorId: recipientId,
-					messageId: generateId(),
-					role: "sys",
-					contentJson: [{ type: "text", text: row.summary ?? "" }],
-					contentText: row.summary ?? "",
-					deliveryId: row.deliveryId,
-					deliveryKind: "task_notice",
-					deliveryState: "queued",
-				});
-				canonical = { messageId: inserted.message.id, refId: inserted.ref.id };
-			}
 			tx.insert(mailbox)
 				.values({
 					id: generateId(),
@@ -944,9 +837,7 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 					sourceKey: row.dedupeKey,
 					dedupeKey: row.dedupeKey,
 					deliveryId: row.deliveryId,
-					recipientMessageId: canonical.messageId,
-					recipientRefId: canonical.refId,
-					currentMessageId: canonical.messageId,
+					recipientMessageId: generateId(),
 					arrivalSeq: row.arrivalSeq,
 					seq: row.arrivalSeq,
 					byteSize: Buffer.byteLength(row.summary ?? ""),
@@ -1024,7 +915,7 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 		failRecipient(recipientId: string, reason: string) {
 			return db.transaction((tx) => {
 				const rows = tx
-					.select({ id: outbox.id, state: outbox.state, deliveryId: outbox.deliveryId })
+					.select({ id: outbox.id, state: outbox.state })
 					.from(outbox)
 					.where(
 						and(
@@ -1037,7 +928,7 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 					)
 					.limit(L.pageSize)
 					.all();
-				for (const row of rows) {
+				for (const row of rows)
 					tx.update(outbox)
 						.set({
 							state: row.state === "reserved" ? "reserved" : "failed",
@@ -1046,9 +937,6 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 						})
 						.where(eq(outbox.id, row.id))
 						.run();
-					if (row.state === "pending")
-						setDeliveryProjectionStateTx(tx, recipientId, row.deliveryId, "failed");
-				}
 				return rows.length;
 			});
 		},

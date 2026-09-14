@@ -32,11 +32,6 @@ function intent(
 function reserve(key: string) {
 	expect(publisher.reserveRunSlots(run(key), { started: true }).status).toBe("reserved");
 }
-function deleteRecipientForTest() {
-	db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, "recipient")).run();
-	db.delete(narratorMessages).where(eq(narratorMessages.narratorId, "recipient")).run();
-	db.delete(narrators).where(eq(narrators.id, "recipient")).run();
-}
 function fill() {
 	for (let i = 0; i < L.noticePending; i++)
 		mailbox.enqueue({
@@ -317,7 +312,7 @@ describe("transactional publication outbox", () => {
 	});
 	test("recipient deleted before terminal commit still records a permanent failed intent", () => {
 		reserve("deleted");
-		deleteRecipientForTest();
+		db.delete(narrators).where(eq(narrators.id, "recipient")).run();
 		expect(publisher.commitIntent(intent("deleted"))).toMatchObject({
 			status: "committed",
 			arrivalSeq: null,
@@ -338,7 +333,7 @@ describe("transactional publication outbox", () => {
 		db.insert(narrators).values({ id: "source", createdAt: time, updatedAt: time }).run();
 		reserve("running");
 		publisher.commitIntent(intent("running", "started"));
-		if (deleted) deleteRecipientForTest();
+		if (deleted) db.delete(narrators).where(eq(narrators.id, "recipient")).run();
 		expect(publisher.failRecipient("recipient", "recipient permanently unavailable")).toBe(2);
 		const slots = db.select().from(runtimePublicationOutbox).all();
 		expect(slots.find((row) => row.eventKind === "started")?.state).toBe("failed");
@@ -418,7 +413,7 @@ describe("transactional publication outbox", () => {
 		).toThrow("Metadata");
 		expect(publisher.listPending()).toHaveLength(0);
 		publisher.commitIntent(intent("invalid"));
-		deleteRecipientForTest();
+		db.delete(narrators).where(eq(narrators.id, "recipient")).run();
 		expect(publisher.transferNext("recipient", "agent").status).toBe("recipient_failed");
 		expect(publisher.listPending()).toHaveLength(0);
 		expect(

@@ -9,11 +9,9 @@ import {
 	runtimePublicationOutbox,
 } from "../../db/schema";
 import { ValidationError } from "../../lib/errors";
-import { eventBus } from "../../lib/event-bus";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
-import type { NarratorServerMessage } from "../../websocket/narrator-ws-types";
 import { notifyAwaitWake } from "./await-wake";
 import { MAILBOX_LIMITS as L } from "./limits";
 import type { NoticeKind, RuntimeDb, RuntimeTx } from "./mailbox-types";
@@ -68,46 +66,6 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 	let retry = 0;
 	let stopped = false;
 	let cursor: string | undefined;
-	const pendingProjectionBroadcasts = new Map<string, { narratorId: string; deliveryId: string }>();
-
-	function broadcastProjection(narratorId: string, deliveryId: string): void {
-		const row = database
-			.select({
-				narratorId: narratorMessageRefs.narratorId,
-				id: narratorMessages.id,
-				role: narratorMessages.role,
-				contentJson: narratorMessages.contentJson,
-				contentText: narratorMessages.contentText,
-				parentToolUseId: narratorMessages.parentToolUseId,
-				createdAt: narratorMessages.createdAt,
-				seq: narratorMessageRefs.seq,
-				deliveryId: narratorMessageRefs.deliveryId,
-				deliveryKind: narratorMessageRefs.deliveryKind,
-				deliveryState: narratorMessageRefs.deliveryState,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.deliveryId, deliveryId),
-				),
-			)
-			.get();
-		if (!row) return;
-		const message: NarratorServerMessage = {
-			type: "message",
-			narratorId: row.narratorId,
-			message: { ...row, children: [], toolCalls: [] },
-		};
-		eventBus.emit({ type: "narrator:ws_broadcast", narratorId: row.narratorId, message });
-	}
-
-	function flushProjectionBroadcasts(): void {
-		for (const { narratorId, deliveryId } of pendingProjectionBroadcasts.values())
-			broadcastProjection(narratorId, deliveryId);
-		pendingProjectionBroadcasts.clear();
-	}
 
 	function reserve(run: PublicationRun, tx: RuntimeTx, started = false) {
 		if (store.reserveRunSlots(run, { started }, tx).status === "full") {
@@ -270,16 +228,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 
 	/** Source result mutation and intent are committed by the caller's SAME synchronous transaction. */
 	function commit(intent: PublicationIntent, tx: RuntimeTx) {
-		const result = store.commitIntent(
-			{ ...intent, summary: publicationSummary(intent.summary) },
-			tx,
-		);
-		if (result.status === "committed" && result.deliveryId)
-			pendingProjectionBroadcasts.set(`${intent.recipientId}:${result.deliveryId}`, {
-				narratorId: intent.recipientId,
-				deliveryId: result.deliveryId,
-			});
-		return result;
+		return store.commitIntent({ ...intent, summary: publicationSummary(intent.summary) }, tx);
 	}
 
 	function notifyTransfer(recipientId: string, deliveryId?: string) {
@@ -307,7 +256,6 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 
 	/** All fast and retry paths grant the next vacancy to the earliest durable intent. */
 	function flushRecipient(recipientId: string): number {
-		flushProjectionBroadcasts();
 		let transferred = 0;
 		for (const kind of ["agent", "bash"] as const) {
 			for (let i = 0; i < L.pageSize / 2; i++) {
@@ -322,7 +270,6 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 
 	/** One bounded page per turn. Full mailboxes release the worker immediately. */
 	function flushPage(): boolean {
-		flushProjectionBroadcasts();
 		const page = store.listPending({ afterId: cursor, limit: L.pageSize });
 		const rows = page.slice(0, L.pageSize);
 		// At most one transfer per listed row: a page never expands to pageSize² work.
@@ -340,7 +287,6 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 
 	function schedule(reset = true) {
 		if (stopped) return;
-		flushProjectionBroadcasts();
 		if (reset) retry = 0;
 		if (timer) return;
 		timer = setTimeout(

@@ -1423,23 +1423,12 @@ export const narratorMessageRefs = sqliteTable(
 		segmentCompactId: text("segment_compact_id"),
 		/** Set only when the recipient loop adopts this injection into model input. */
 		injectionConsumedAt: integer("injection_consumed_at", { mode: "timestamp_ms" }),
-		/** Stable delivery identity for an eagerly projected mailbox/outbox message. */
-		deliveryId: text("delivery_id"),
-		deliveryKind: text("delivery_kind", {
-			enum: ["user_input", "agent_message", "task_notice"],
-		}),
-		/** Queue lifecycle projection; null means an ordinary non-queued history ref. */
-		deliveryState: text("delivery_state", {
-			enum: ["queued", "claimed", "materialized", "failed", "cancelled"],
-		}),
 	},
 	(table) => [
 		uniqueIndex("idx_narrator_refs_unique").on(table.narratorId, table.messageId),
-		uniqueIndex("idx_narrator_refs_delivery").on(table.narratorId, table.deliveryId),
 		index("idx_narrator_refs_seq").on(table.narratorId, table.seq),
 		index("idx_narrator_refs_compact_seq").on(table.narratorId, table.isCompact, table.seq),
 		index("idx_narrator_refs_message").on(table.messageId),
-		index("idx_narrator_refs_delivery_state").on(table.narratorId, table.deliveryState, table.seq),
 		index("idx_narrator_refs_segment_compact").on(table.segmentCompactId),
 	],
 );

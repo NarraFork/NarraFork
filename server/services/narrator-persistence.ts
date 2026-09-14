@@ -9,7 +9,7 @@ import {
 } from "@shared/compact-message";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
-import { and, desc, eq, gte, inArray, isNull, like, or, type SQL, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, like, type SQL, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	narratorBufferedMessages,
@@ -46,7 +46,6 @@ import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { getExecutionOwner } from "./agent-runtime/ownership";
 import { createFileChangeExecutionSegmentsService } from "./file-change-execution-segments";
-import { publishHistoryMessage } from "./narrator-history-publisher";
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
 import { preserveTakenOverSubstatus } from "./subagent-takeover";
 
@@ -130,11 +129,8 @@ export function updateRecipientMessageRef(
 		.run();
 }
 
-/** Preserve delivery facts before removing recipient refs, in the caller's real transaction. */
-export function deleteRecipientMessageRefs(
-	tx: DbTx,
-	disposition: "deleted" | "superseded" = "deleted",
-) {
+/** Preserve negative dedupe before removing recipient refs, in the caller's real transaction. */
+export function deleteRecipientMessageRefs(tx: DbTx) {
 	return {
 		where(predicate: SQL | undefined) {
 			return {
@@ -150,7 +146,7 @@ export function deleteRecipientMessageRefs(
 						if (!refs.length) return { changes };
 						for (const ref of refs)
 							updateRecipientMessageRef(tx, ref.narratorId, ref.id, {
-								kind: disposition,
+								kind: "deleted",
 							});
 						tx.delete(narratorMessageRefs)
 							.where(
@@ -915,47 +911,12 @@ function placementMessageId(placement?: MessagePlacementOptions): string {
 	if (placement?.messageId) return placement.messageId;
 	if (!placement?.mailboxClaim) return generateId();
 	const row = db
-		.select({
-			currentMessageId: narratorBufferedMessages.currentMessageId,
-			recipientMessageId: narratorBufferedMessages.recipientMessageId,
-		})
+		.select({ messageId: narratorBufferedMessages.recipientMessageId })
 		.from(narratorBufferedMessages)
 		.where(eq(narratorBufferedMessages.id, placement.mailboxClaim.id))
 		.get();
-	const messageId = row?.currentMessageId ?? row?.recipientMessageId;
-	if (!messageId) throw new Error("Mailbox claim has no reserved recipient identity");
-	return messageId;
-}
-
-function attachDeliveryProjection<T extends { id: string }>(
-	tx: DbTx,
-	narratorId: string,
-	message: T,
-): T & {
-	deliveryId: string | null;
-	deliveryKind: string | null;
-	deliveryState: string | null;
-} {
-	const ref = tx
-		.select({
-			deliveryId: narratorMessageRefs.deliveryId,
-			deliveryKind: narratorMessageRefs.deliveryKind,
-			deliveryState: narratorMessageRefs.deliveryState,
-		})
-		.from(narratorMessageRefs)
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, message.id),
-			),
-		)
-		.get();
-	return {
-		...message,
-		deliveryId: ref?.deliveryId ?? null,
-		deliveryKind: ref?.deliveryKind ?? null,
-		deliveryState: ref?.deliveryState ?? null,
-	};
+	if (!row?.messageId) throw new Error("Mailbox claim has no reserved recipient identity");
+	return row.messageId;
 }
 
 function persistPlacement(
@@ -990,70 +951,6 @@ function persistPlacement(
 	placement.onPersist?.(tx, messageId, ref.id);
 }
 
-function adoptCanonicalMessageTx(
-	tx: DbTx,
-	narratorId: string,
-	id: string,
-	existing: typeof narratorMessages.$inferSelect,
-	placement: MessagePlacementOptions | undefined,
-	parentToolUseId: string | null,
-) {
-	if (existing.role !== "user" && existing.role !== "sys") return null;
-	const eagerMailbox = placement?.mailboxClaim
-		? tx
-				.select({
-					currentMessageId: narratorBufferedMessages.currentMessageId,
-					state: narratorBufferedMessages.state,
-				})
-				.from(narratorBufferedMessages)
-				.where(
-					and(
-						eq(narratorBufferedMessages.id, placement.mailboxClaim.id),
-						eq(narratorBufferedMessages.narratorId, narratorId),
-					),
-				)
-				.get()
-		: undefined;
-	const canonicalDeliveryRef = placement?.messageId
-		? tx
-				.select({ deliveryKind: narratorMessageRefs.deliveryKind })
-				.from(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, id),
-					),
-				)
-				.get()
-		: undefined;
-	const isEagerDelivery =
-		(eagerMailbox?.currentMessageId === id &&
-			(eagerMailbox.state === "claimed" ||
-				eagerMailbox.state === "queued" ||
-				eagerMailbox.state === "materialized")) ||
-		canonicalDeliveryRef?.deliveryKind != null;
-	if (!isEagerDelivery) return null;
-	const placed =
-		parentToolUseId && existing.role === "user" && existing.parentToolUseId == null
-			? tx
-					.update(narratorMessages)
-					.set({ parentToolUseId })
-					.where(eq(narratorMessages.id, id))
-					.returning()
-					.get()
-			: existing;
-	const ref = tx
-		.select({ seq: narratorMessageRefs.seq })
-		.from(narratorMessageRefs)
-		.where(
-			and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.messageId, id)),
-		)
-		.get();
-	if (!ref) throw new ValidationError("Mailbox message ref missing");
-	persistPlacement(tx, narratorId, id, placement);
-	return { ...attachDeliveryProjection(tx, narratorId, placed), seq: ref.seq };
-}
-
 // ── narratorPersistence object ─────────────────────────────────────────────
 
 export const narratorPersistence = {
@@ -1086,51 +983,6 @@ export const narratorPersistence = {
 				const id = placementMessageId(placement);
 				const now = new Date().toISOString();
 				return db.transaction((tx) => {
-					const existing = tx
-						.select()
-						.from(narratorMessages)
-						.where(and(eq(narratorMessages.id, id), eq(narratorMessages.narratorId, narratorId)))
-						.get();
-					if (existing) {
-						const adopted = adoptCanonicalMessageTx(
-							tx,
-							narratorId,
-							id,
-							existing,
-							placement,
-							parentToolUseId,
-						);
-						if (adopted) return adopted;
-						if (existing.role !== "user")
-							throw new ValidationError("Mailbox message role mismatch");
-						const updated = tx
-							.update(narratorMessages)
-							.set({
-								parentToolUseId,
-								contentJson: contentBlocks ?? [{ type: "text", text }],
-								contentText: text,
-								commandText: commandText ?? null,
-								createdBy: createdBy ?? null,
-								origin: origin?.origin ?? existing.origin,
-								originLabel: origin?.originLabel ?? existing.originLabel,
-							})
-							.where(eq(narratorMessages.id, id))
-							.returning()
-							.get();
-						const ref = tx
-							.select({ seq: narratorMessageRefs.seq })
-							.from(narratorMessageRefs)
-							.where(
-								and(
-									eq(narratorMessageRefs.narratorId, narratorId),
-									eq(narratorMessageRefs.messageId, id),
-								),
-							)
-							.get();
-						if (!ref) throw new ValidationError("Mailbox message ref missing");
-						persistPlacement(tx, narratorId, id, placement);
-						return { ...attachDeliveryProjection(tx, narratorId, updated), seq: ref.seq };
-					}
 					const created = tx
 						.insert(narratorMessages)
 						.values({
@@ -1150,7 +1002,7 @@ export const narratorPersistence = {
 						.get();
 					const seq = appendMessageRefSync(tx, narratorId, id);
 					persistPlacement(tx, narratorId, id, placement);
-					return { ...attachDeliveryProjection(tx, narratorId, created), seq };
+					return { ...created, seq };
 				});
 			},
 			{ label: "persistUserMessage", maxRetries: 5 },
@@ -1231,51 +1083,6 @@ export const narratorPersistence = {
 					const blocks: unknown[] = hasNativeModelContext
 						? providedBlocks
 						: [{ type: "text", text }, ...providedBlocks];
-					const existing = tx
-						.select()
-						.from(narratorMessages)
-						.where(and(eq(narratorMessages.id, id), eq(narratorMessages.narratorId, narratorId)))
-						.get();
-					if (existing) {
-						const adopted = adoptCanonicalMessageTx(
-							tx,
-							narratorId,
-							id,
-							existing,
-							placement,
-							parentToolUseId,
-						);
-						if (adopted) return adopted;
-						if (existing.role !== "sys") throw new ValidationError("Mailbox message role mismatch");
-						const updated = tx
-							.update(narratorMessages)
-							.set({
-								parentToolUseId,
-								contentJson: blocks,
-								contentText: hasNativeModelContext
-									? modelTextFromContentBlocks(blocks) || text
-									: text,
-								createdBy: createdBy ?? existing.createdBy,
-								origin: origin?.origin ?? existing.origin,
-								originLabel: origin?.originLabel ?? existing.originLabel,
-							})
-							.where(eq(narratorMessages.id, id))
-							.returning()
-							.get();
-						const ref = tx
-							.select({ seq: narratorMessageRefs.seq })
-							.from(narratorMessageRefs)
-							.where(
-								and(
-									eq(narratorMessageRefs.narratorId, narratorId),
-									eq(narratorMessageRefs.messageId, id),
-								),
-							)
-							.get();
-						if (!ref) throw new ValidationError("Mailbox message ref missing");
-						persistPlacement(tx, narratorId, id, placement);
-						return { ...attachDeliveryProjection(tx, narratorId, updated), seq: ref.seq };
-					}
 					const created = tx
 						.insert(narratorMessages)
 						.values({
@@ -1297,7 +1104,7 @@ export const narratorPersistence = {
 
 					const seq = appendMessageRefSync(tx, narratorId, id);
 					persistPlacement(tx, narratorId, id, placement);
-					return { ...attachDeliveryProjection(tx, narratorId, created), seq };
+					return { ...created, seq };
 				}),
 			{ label: "persistSystemMessage", maxRetries: 5 },
 		);
@@ -1349,15 +1156,19 @@ export const narratorPersistence = {
 				}),
 			{ label: "persistDisplayMessage", maxRetries: 5 },
 		);
-		publishHistoryMessage(narratorId, {
-			id: msg.id,
+		broadcastToNarrator(narratorId, {
+			type: "message",
 			narratorId,
-			role: "disp",
-			contentJson: msg.contentJson,
-			contentText: msg.contentText,
-			createdAt: msg.createdAt,
-			seq,
-			children: [],
+			message: {
+				id: msg.id,
+				narratorId,
+				role: "disp",
+				contentJson: msg.contentJson,
+				contentText: msg.contentText,
+				createdAt: msg.createdAt,
+				seq,
+				children: [],
+			},
 		});
 		return { ...msg, seq };
 	},
@@ -2605,14 +2416,18 @@ export const narratorPersistence = {
 					// Broadcast only after the transaction has committed, so a
 					// visible error card always has a backing ref the user can
 					// dismiss.
-					publishHistoryMessage(narratorId, {
-						id: msgId,
+					broadcastToNarrator(narratorId, {
+						type: "message",
 						narratorId,
-						role: "system",
-						contentJson,
-						contentText,
-						createdAt: now,
-						children: [],
+						message: {
+							id: msgId,
+							narratorId,
+							role: "system",
+							contentJson,
+							contentText,
+							createdAt: now,
+							children: [],
+						},
 					});
 				} catch (e) {
 					logger.warn("Failed to persist error system message", {
@@ -3729,18 +3544,11 @@ export const narratorPersistence = {
 				and(
 					eq(narratorMessageRefs.narratorId, narratorId),
 					inArray(narratorMessageRefs.messageId, messageIds),
-					or(
-						isNull(narratorMessageRefs.deliveryState),
-						eq(narratorMessageRefs.deliveryState, "materialized"),
-					),
 				),
 			)
 			.orderBy(narratorMessageRefs.seq);
 
-		const requestedIds = new Set(messageIds);
 		if (refs.length === 0) throw new ValidationError("No matching messages found");
-		if (refs.length !== requestedIds.size)
-			throw new ValidationError("Only model-eligible messages can be compacted");
 
 		const insertSeq = refs[0].seq;
 
@@ -3819,10 +3627,6 @@ export const narratorPersistence = {
 				and(
 					eq(narratorMessageRefs.narratorId, narratorId),
 					inArray(narratorMessageRefs.messageId, messageIds),
-					or(
-						isNull(narratorMessageRefs.deliveryState),
-						eq(narratorMessageRefs.deliveryState, "materialized"),
-					),
 				),
 			)
 			.orderBy(narratorMessageRefs.seq);

@@ -1297,26 +1297,17 @@ getPlannedUpdateStartupProtection()
 		if (plannedRecovery) startupReadiness.markRecovering();
 		else startupReadiness.markReady();
 		startupReadiness.settle({ ok: true });
-		const wakeQueuedInboxes = () =>
-			import("./services/agent-runtime/inbox")
-				.then(({ wakeQueuedInboxesOnColdStartup }) => wakeQueuedInboxesOnColdStartup())
-				.catch((err) => {
-					logger.warn("Queued mailbox startup wake failed", { error: String(err) });
-				});
 		if (plannedRecovery) {
 			plannedRecovery.completion
 				.then(() => {
 					startupReadiness.markReady();
 					logger.info("Planned-update background continuation recovery completed");
-					void wakeQueuedInboxes();
 				})
 				.catch((err) => {
 					const error = err instanceof Error ? err.message : String(err);
 					startupReadiness.markFailed(error);
 					logger.error("Planned-update background continuation recovery failed", { error });
 				});
-		} else {
-			void wakeQueuedInboxes();
 		}
 	})
 	.catch((err) => {

@@ -15,7 +15,6 @@ import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { resolveEffectiveModel, resolveProvider } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import { publishHistoryDeletion, publishHistoryMessage } from "./narrator-history-publisher";
 import { narratorService } from "./narrator-service";
 import {
 	withNarratorMutationAdmission,
@@ -183,10 +182,7 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 	const provider = resolveProvider(effectiveModel);
 
 	let prompt = input.prompt ?? "";
-	// A mailbox wake already has its durable user/agent input in the mailbox. The
-	// prompt is consumed later by startContinuedSubagent, so it must not go through
-	// the ordinary follow-up "non-empty prompt" validation here.
-	let persistPrompt = !input.mailboxInput && input.intent === "follow_up";
+	let persistPrompt = input.intent === "follow_up";
 	let initialHistory: unknown[] | undefined;
 	let initialTrailingToolResults: unknown[] | undefined;
 
@@ -213,9 +209,17 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 			{ skipRevert: input.retryRevertFiles === false },
 		);
 		if (deletedMessageIds.length > 0) {
-			publishHistoryDeletion(input.subagentId, deletedMessageIds);
+			broadcastToNarrator(input.subagentId, {
+				type: "messages_deleted",
+				narratorId: input.subagentId,
+				deletedMessageIds,
+			});
 			if (narrator.parentNarratorId) {
-				publishHistoryDeletion(narrator.parentNarratorId, deletedMessageIds);
+				broadcastToNarrator(narrator.parentNarratorId, {
+					type: "messages_deleted",
+					narratorId: narrator.parentNarratorId,
+					deletedMessageIds,
+				});
 			}
 		}
 		const rebuilt = await loadSubagentHistory(input.subagentId, effectiveModel, provider, prompt);
@@ -259,16 +263,16 @@ function broadcastUserMessage(
 	parentNarratorId: string,
 	userMessage: Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>,
 ): void {
-	publishHistoryMessage(
-		parentNarratorId,
-		fileReferenceMessageForDisplay(userMessage),
-		"user_message",
-	);
-	publishHistoryMessage(
-		subagentId,
-		fileReferenceMessageForDisplay({ ...userMessage, parentToolUseId: null }),
-		"user_message",
-	);
+	broadcastToNarrator(parentNarratorId, {
+		type: "user_message",
+		narratorId: parentNarratorId,
+		message: fileReferenceMessageForDisplay(userMessage),
+	});
+	broadcastToNarrator(subagentId, {
+		type: "user_message",
+		narratorId: subagentId,
+		message: fileReferenceMessageForDisplay({ ...userMessage, parentToolUseId: null }),
+	});
 }
 
 async function restoreTemporaryModel(subagentId: string): Promise<void> {

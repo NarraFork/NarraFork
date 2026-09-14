@@ -375,8 +375,7 @@ describe("Send exact delivery receipts", () => {
 			fromToolUseId: "send-call",
 		};
 		await markAgentMessageConsumed(delivery);
-		expect(row(id)).not.toBeNull();
-		expect(consumedAt(id)).toBeNull();
+		expect(row(id)).toBeNull();
 		await consume();
 		await markAgentMessageConsumed(delivery);
 		expect(consumedAt(id)).toBeNumber();
@@ -557,7 +556,7 @@ describe("Send exact delivery receipts", () => {
 		expect(consumedAt(id)).toBeNull();
 	});
 
-	test("busy child receipt points to the eagerly projected row before actual drain", async () => {
+	test("busy child receipt remains nonexistent until actual drain, then points to the one persisted/broadcast row", async () => {
 		const notifications: unknown[] = [];
 		const result = await send("parent", "child", {
 			onDeliveryResolved: (receipt) => notifications.push(receipt),
@@ -565,7 +564,7 @@ describe("Send exact delivery receipts", () => {
 		const id = result.targets[0].deliveryMessageId;
 		expect(result.targets[0].status).toBe("queued");
 		expect(id).toBeString();
-		expect(row(id)).not.toBeNull();
+		expect(row(id)).toBeNull();
 		const envelope = agentQueued()[0].delivery;
 		expect(notifications).toEqual([
 			expect.objectContaining({
@@ -584,7 +583,6 @@ describe("Send exact delivery receipts", () => {
 		expect(JSON.parse(row(id)?.content_json ?? "[]")[1]).toEqual({
 			type: "system_injection",
 			source: "subagent_message",
-			modelText: "[Message from the parent narrator]\nsame words",
 			body: agentMessageDeliveryBody(envelope as NonNullable<typeof envelope>),
 		});
 		const received = broadcasts.filter(({ event }) => event.type === "user_message");
@@ -645,21 +643,18 @@ describe("Send exact delivery receipts", () => {
 		expect(actual.content_text).not.toContain("human correction");
 	});
 
-	test("queue capacity failures expose no receipt and do not create another canonical row", async () => {
+	test("queue capacity failures expose no receipt and do not create a row", async () => {
 		for (let i = 0; i < 50; i++) {
 			expect((await send()).targets[0].status).toBe("queued");
 		}
 		// User quota is independent of the full agent-message quota.
 		expect((await pushSubagentBufferedMessage("child", "pending")).ok).toBe(true);
-		const before = sqlite
-			.prepare("SELECT id FROM narrator_messages WHERE id NOT LIKE 'source-message-%'")
-			.all();
 		const result = await send();
 		expect(result.targets[0].status).toBe("failed");
 		expect(result.targets[0].deliveryMessageId).toBeUndefined();
 		expect(
 			sqlite.prepare("SELECT id FROM narrator_messages WHERE id NOT LIKE 'source-message-%'").all(),
-		).toEqual(before);
+		).toHaveLength(0);
 	});
 
 	test("idle child passes its exact envelope into resume and returns the receiving row", async () => {
@@ -689,7 +684,7 @@ describe("Send exact delivery receipts", () => {
 	test("child-to-parent keeps sys injection semantics and reuses its reserved receiving ID", async () => {
 		const result = await send("child", "parent");
 		const id = result.targets[0].deliveryMessageId;
-		expect(row(id)).not.toBeNull();
+		expect(row(id)).toBeNull();
 		expect(tryClaimExecution("parent", "primary")).not.toBeNull();
 		const claimed = claimInboxHead("parent", (row) => row.kind === "agent_message");
 		if (!claimed) throw new Error("Expected parent mailbox claim");
@@ -756,7 +751,6 @@ describe("Send exact delivery receipts", () => {
 				deliveryMessageId: result.targets[0].deliveryMessageId,
 				title: null,
 				deliveryId: result.targets[0].deliveryId,
-				recipientRefId: expect.any(String),
 				revision: 1,
 			},
 		]);
@@ -895,14 +889,8 @@ describe("Send exact delivery receipts", () => {
 			expect(getSubagentBufferedMessages("child")).toHaveLength(0);
 			expect(await consumeInPass()).toBeNull();
 			expect(await consume()).toBeNull();
-			expect(row(result.targets[0].deliveryMessageId)).not.toBeNull();
+			expect(row(result.targets[0].deliveryMessageId)).toBeNull();
 			expect(childRows()).toEqual([
-				{
-					id: expect.any(String),
-					origin: "assistant",
-					content_text: "[Message from the parent narrator]\nsame words",
-					created_by: "editor",
-				},
 				{
 					id: expect.any(String),
 					origin: "user",
@@ -910,10 +898,10 @@ describe("Send exact delivery receipts", () => {
 					created_by: "editor",
 				},
 			]);
-			expect(sqlite.prepare("SELECT id FROM narrator_message_refs").all()).toHaveLength(2);
+			expect(sqlite.prepare("SELECT id FROM narrator_message_refs").all()).toHaveLength(1);
 			expect(
 				sqlite.prepare("SELECT message_version FROM narrators WHERE id = 'child'").get(),
-			).toEqual({ message_version: 3 });
+			).toEqual({ message_version: 1 });
 			expect(
 				sqlite.prepare("SELECT message_version FROM narrators WHERE id = 'parent'").get(),
 			).toEqual({ message_version: failure.startsWith("parent") ? 0 : 1 });
@@ -924,7 +912,7 @@ describe("Send exact delivery receipts", () => {
 					creator: failure.startsWith("creator") ? null : { id: "editor", username: "Editor" },
 				});
 			}
-			if (failure === "creator lookup") expect(rowsAtCreatorFailure).toBe(2);
+			if (failure === "creator lookup") expect(rowsAtCreatorFailure).toBe(1);
 		} finally {
 			for (const restore of restores) restore();
 		}
@@ -949,35 +937,34 @@ describe("Send exact delivery receipts", () => {
 				toolUseId: "origin",
 				cwd: ".",
 			});
-		sqlite.run(`CREATE TEMP TRIGGER fail_materialization BEFORE UPDATE OF state ON narrator_buffered_messages
-			WHEN NEW.state = 'materialized'
-			BEGIN SELECT RAISE(ABORT, 'materialization unavailable'); END`);
+		sqlite.run(`CREATE TEMP TRIGGER fail_message_ref BEFORE INSERT ON narrator_message_refs
+			BEGIN SELECT RAISE(ABORT, 'ref insertion unavailable'); END`);
 		try {
 			expect(await consumeInPass()).toBeNull();
 			expect(getSubagentBufferedMessages("child")).toEqual([
-				{ ...edited, error: expect.stringContaining("materialization unavailable") },
+				{ ...edited, error: expect.stringContaining("ref insertion unavailable") },
 			]);
 			expect(
 				sqlite
 					.prepare("SELECT id FROM narrator_messages WHERE id NOT LIKE 'source-message-%'")
 					.all(),
-			).toHaveLength(2);
-			expect(sqlite.prepare("SELECT id FROM narrator_message_refs").all()).toHaveLength(2);
+			).toHaveLength(0);
+			expect(sqlite.prepare("SELECT id FROM narrator_message_refs").all()).toHaveLength(0);
 			expect(
 				sqlite.prepare("SELECT message_version FROM narrators WHERE id = 'child'").get(),
-			).toEqual({ message_version: 3 });
+			).toEqual({ message_version: 0 });
 			expect(broadcasts.filter(({ event }) => event.type === "user_message")).toHaveLength(0);
 		} finally {
-			sqlite.run("DROP TRIGGER fail_materialization");
+			sqlite.run("DROP TRIGGER fail_message_ref");
 		}
 		expect((await consumeInPass())?.text).toBe("retry human correction");
 		expect(await consumeInPass()).toBeNull();
 		expect(getSubagentBufferedMessages("child")).toHaveLength(0);
-		expect(row(result.targets[0].deliveryMessageId)).not.toBeNull();
+		expect(row(result.targets[0].deliveryMessageId)).toBeNull();
 		expect(
 			sqlite.prepare("SELECT id FROM narrator_messages WHERE id NOT LIKE 'source-message-%'").all(),
-		).toHaveLength(2);
-		expect(sqlite.prepare("SELECT id FROM narrator_message_refs").all()).toHaveLength(2);
+		).toHaveLength(1);
+		expect(sqlite.prepare("SELECT id FROM narrator_message_refs").all()).toHaveLength(1);
 		expect(broadcasts.filter(({ event }) => event.type === "user_message")).toHaveLength(2);
 	});
 
@@ -1054,7 +1041,7 @@ describe("Send exact delivery receipts", () => {
 				systemPrompt: "Test subagent",
 			});
 			expect(firstText ?? "").not.toContain("same words");
-			expect(persistedAtFirstBoundary).toBe(true);
+			expect(persistedAtFirstBoundary).toBe(false);
 			expect(queuedAfterFailure).toBe(1);
 			expect(secondText).toBe("[Message from the parent narrator]\nsame words");
 			expect(thirdText ?? "").not.toContain("same words");
@@ -1109,7 +1096,6 @@ describe("Send exact delivery receipts", () => {
 				deliveryMessageId: result.targets[0].deliveryMessageId,
 				title: null,
 				deliveryId: result.targets[0].deliveryId,
-				recipientRefId: expect.any(String),
 				revision: 1,
 			},
 		]);
@@ -1117,7 +1103,7 @@ describe("Send exact delivery receipts", () => {
 		expect(drainPendingInjections("parent")).toHaveLength(0);
 		expect(
 			sqlite.prepare("SELECT id FROM narrator_messages WHERE id NOT LIKE 'source-message-%'").all(),
-		).toHaveLength(3);
+		).toHaveLength(2);
 	});
 
 	test("TeamStatus broadcast reserves separate IDs and keeps independent inbox scheduling", async () => {
@@ -1144,7 +1130,7 @@ describe("Send exact delivery receipts", () => {
 		expect(childMessage.delivery?.recipientMessageId).toBe(first);
 		expect(childMessage.delivery?.senderToolCallBinding).toEqual(message.fromToolCallBinding);
 		expect(drainTeamInbox("sibling")[0].delivery?.recipientMessageId).toBe(second);
-		expect(row(first)).not.toBeNull();
+		expect(row(first)).toBeNull();
 		expect(getSubagentBufferedMessages("child")).toHaveLength(0);
 		const injection = await deliverInjection("child", {
 			messageId: first,
@@ -1180,7 +1166,7 @@ describe("Send exact delivery receipts", () => {
 		consumeAgentMessageHistory(history, injection.turnText ?? "");
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(consumedAt(first)).toBeNumber();
-		expect(row(second)).not.toBeNull();
+		expect(row(second)).toBeNull();
 		expect(consumedAt(second, "sibling")).toBeNull();
 	});
 });

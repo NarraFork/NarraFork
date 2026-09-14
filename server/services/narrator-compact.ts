@@ -20,11 +20,6 @@ import {
 } from "./compact-live-state";
 import { drainQueuedMessagesAfterCompact } from "./compact-queue-drain";
 import { narratorContext } from "./narrator-context";
-import {
-	publishHistoryDeletion,
-	publishHistoryMessage,
-	publishHistoryUpdate,
-} from "./narrator-history-publisher";
 import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
 import { narratorService } from "./narrator-service";
 import type { CompactLock, CompactLockResult, CompactMode } from "./narrator-session-state";
@@ -887,11 +882,13 @@ async function retryFailedCompactUnlocked(
 		// the async summary request, whose first frame carries the new ID.
 		const replacedMessageId = prepared.replacedMessageId ?? prepared.oldMessageId;
 		if (replacedMessageId && replacedMessageId !== prepared.id) {
-			publishHistoryDeletion(
+			const replacementEvent = {
+				type: "messages_deleted" as const,
 				narratorId,
-				[replacedMessageId],
-				compactReplacementFields({ preparedRetryMessage: prepared }),
-			);
+				deletedMessageIds: [replacedMessageId],
+				...compactReplacementFields({ preparedRetryMessage: prepared }),
+			};
+			broadcastToNarrator(narratorId, replacementEvent);
 		}
 
 		// runCustomCompact installs the real history lock synchronously before this
@@ -973,7 +970,13 @@ async function doRunCustomCompact({
 				{ status: "failed", error, mode, expectedAttempt },
 			);
 			if (failedMsg) {
-				publishHistoryUpdate(narratorId, failedMsg, replacementFields);
+				const failedMessageEvent = {
+					type: "message_updated" as const,
+					narratorId,
+					message: failedMsg,
+					...replacementFields,
+				};
+				broadcastToNarrator(narratorId, failedMessageEvent);
 			}
 			const compactFailedEvent = {
 				type: "compact_failed" as const,
@@ -997,11 +1000,13 @@ async function doRunCustomCompact({
 		}));
 	expectedAttempt = compactAttemptNumber(compactingMsg);
 	expectedSeq = compactingMsg.seq;
-	if (options?.preparedRetryMessage) {
-		publishHistoryUpdate(narratorId, compactingMsg, replacementFields);
-	} else {
-		publishHistoryMessage(narratorId, compactingMsg);
-	}
+	const compactStartEvent = {
+		type: options?.preparedRetryMessage ? ("message_updated" as const) : ("message" as const),
+		narratorId,
+		message: compactingMsg,
+		...replacementFields,
+	};
+	broadcastToNarrator(narratorId, compactStartEvent);
 	await setCompactingSubstatus(narratorId, mode, true);
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode });
 
@@ -1088,7 +1093,13 @@ async function doRunCustomCompact({
 		if (compactedMsg) {
 			const estimated = await attachBuildHistoryTokenEstimate(narratorId, locale, compactedMsg);
 			contextPercentAfter = estimated.contextPercent ?? contextPercentAfter;
-			publishHistoryUpdate(narratorId, estimated.message, replacementFields);
+			const compactUpdatedEvent = {
+				type: "message_updated" as const,
+				narratorId,
+				message: estimated.message,
+				...replacementFields,
+			};
+			broadcastToNarrator(narratorId, compactUpdatedEvent);
 		}
 
 		// Clear the compacting tag before compact_done so clients never process
@@ -1155,7 +1166,13 @@ async function doRunCustomCompact({
 					},
 				);
 				if (cancelledMsg) {
-					publishHistoryUpdate(narratorId, cancelledMsg, replacementFields);
+					const cancelledMessageEvent = {
+						type: "message_updated" as const,
+						narratorId,
+						message: cancelledMsg,
+						...replacementFields,
+					};
+					broadcastToNarrator(narratorId, cancelledMessageEvent);
 				} else {
 					cancellationSettled = false;
 				}
@@ -1192,7 +1209,11 @@ async function doRunCustomCompact({
 							},
 						);
 					if (deleted) {
-						publishHistoryDeletion(narratorId, [cancelledMsg.id]);
+						broadcastToNarrator(narratorId, {
+							type: "messages_deleted",
+							narratorId,
+							deletedMessageIds: [cancelledMsg.id],
+						});
 					} else {
 						cancellationSettled = false;
 					}
@@ -1238,7 +1259,13 @@ async function doRunCustomCompact({
 			});
 
 		if (failedMsg) {
-			publishHistoryUpdate(narratorId, failedMsg, replacementFields);
+			const compactFailedMessageEvent = {
+				type: "message_updated" as const,
+				narratorId,
+				message: failedMsg,
+				...replacementFields,
+			};
+			broadcastToNarrator(narratorId, compactFailedMessageEvent);
 		}
 
 		if (failureMode === "blocking") {
@@ -1377,7 +1404,7 @@ async function doRunSegmentCompact({
 
 	const { message: markerMsg, hiddenMessageIds } =
 		await narratorService.persistSegmentCompactMarker(narratorId, messageIds);
-	publishHistoryMessage(narratorId, markerMsg);
+	broadcastToNarrator(narratorId, { type: "message", narratorId, message: markerMsg });
 	await setCompactingSubstatus(narratorId, "blocking", true);
 	broadcastToNarrator(narratorId, {
 		type: "segment_compact_hide",
@@ -1445,7 +1472,11 @@ async function doRunSegmentCompact({
 		if (finalizedMsg) {
 			const estimated = await attachBuildHistoryTokenEstimate(narratorId, locale, finalizedMsg);
 			contextPercentAfter = estimated.contextPercent ?? contextPercentAfter;
-			publishHistoryUpdate(narratorId, estimated.message);
+			broadcastToNarrator(narratorId, {
+				type: "message_updated",
+				narratorId,
+				message: estimated.message,
+			});
 		}
 
 		logger.info("Segment compact completed", {
@@ -1495,7 +1526,11 @@ async function doRunSegmentCompact({
 			});
 
 		if (failedMsg) {
-			publishHistoryUpdate(narratorId, failedMsg);
+			broadcastToNarrator(narratorId, {
+				type: "message_updated",
+				narratorId,
+				message: failedMsg,
+			});
 		}
 
 		await setCompactingSubstatus(narratorId, "blocking", false).catch(() => {});
@@ -1618,7 +1653,7 @@ async function runPlanCompactUnlocked(narratorId: string, planText: string): Pro
 	// and updates narrator's contextSummary + clears apiConversationId.
 	const compactMsg = await narratorService.persistPlanMessage(narratorId, planText);
 	if (compactMsg) {
-		publishHistoryMessage(narratorId, compactMsg);
+		broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactMsg });
 	}
 
 	logger.info("Plan compact completed", { narratorId, summaryLength: planText.length });

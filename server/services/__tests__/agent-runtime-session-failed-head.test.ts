@@ -61,7 +61,6 @@ test("real session resume ignores failed UI head and executes the next claimed q
 		.where(eq(narratorMessages.narratorId, "recipient"))
 		.all();
 	expect(rows.filter((row) => row.role === "user").map((row) => row.contentText)).toEqual([
-		"failed remains visible",
 		"/goal queued work",
 	]);
 	expect(
@@ -107,10 +106,9 @@ test("real ordinary feed reuses the claimed queued input and cannot enqueue it t
 		.from(narratorMessages)
 		.where(eq(narratorMessages.narratorId, "recipient"))
 		.all();
-	expect(messages.find((row) => row.id === expectedId)).toMatchObject({
-		contentText: "ordinary queued text",
-		createdBy: null,
-	});
+	expect(messages.filter((row) => row.role === "user")).toMatchObject([
+		{ id: expectedId, contentText: "ordinary queued text", createdBy: null },
+	]);
 	expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(2);
 	expect(getBufferedMessages("recipient").map((row) => row.id)).toEqual([failed.id]);
 });
@@ -143,7 +141,5 @@ test("real session resume does not cross an earlier agent message to reach a use
 			.where(eq(narratorBufferedMessages.id, queued.id))
 			.get()?.state,
 	).toBe("queued");
-	// Failed, agent, and queued user inputs are all visible canonical history rows;
-	// only the queued user input remains unmaterialized for execution.
-	expect(db.select().from(narratorMessages).all()).toHaveLength(3);
+	expect(db.select().from(narratorMessages).all()).toHaveLength(0);
 });

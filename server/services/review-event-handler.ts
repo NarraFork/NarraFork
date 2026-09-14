@@ -26,7 +26,7 @@ import { db } from "../db";
 import { narrators, reviewConclusions } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import { publishHistoryMessage } from "./narrator-history-publisher";
+import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 
 // === Finding type (mirrors schema) ===
@@ -148,7 +148,11 @@ export function initReviewEventHandler(): void {
 			);
 
 			// 5. Broadcast so an open panel shows the card without a refetch.
-			publishHistoryMessage(sourceNarrator.id, msg, "user_message");
+			broadcastToNarrator(sourceNarrator.id, {
+				type: "user_message",
+				narratorId: sourceNarrator.id,
+				message: msg,
+			});
 
 			logger.info("Review conclusion written to the source narrator's history", {
 				sourceNarratorId: sourceNarrator.id,
