@@ -7,7 +7,7 @@ import {
 	parseReasoningSegments,
 	type ReasoningSegment,
 	resolveReasoningRunActionIndices,
-} from "../reasoning-segments";
+} from "../trace/reasoning-segments";
 
 /** Join codex-style parts the way openai-provider persists them. */
 function joinParts(parts: string[]): string {

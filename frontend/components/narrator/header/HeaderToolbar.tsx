@@ -6,17 +6,17 @@ import {
 	PluginContributionPicker,
 } from "../../plugins/PluginContributionPicker";
 import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
-import { ExecutionDeviceMenu } from "../ExecutionDeviceMenu";
+import { ExecutionDeviceMenu } from "../model/ExecutionDeviceMenu";
 import { NarratorLodMenu } from "../lod/NarratorLodMenu";
 import type { RenderLod } from "../lod/RenderLodCtx";
 import type { MobileToolPanelKind } from "../MobileToolPanelHost";
-import { NarratorToolbarOverflowMenu } from "../NarratorToolbarOverflowMenu";
-import { HEADER_TOOLBAR_FIXED_ATTR } from "../narrator-header-toolbar-capacity";
+import { NarratorToolbarOverflowMenu } from "./NarratorToolbarOverflowMenu";
+import { HEADER_TOOLBAR_FIXED_ATTR } from "./narrator-header-toolbar-capacity";
 import {
 	type NarratorToolbarBadgeCounts,
 	resolveNarratorToolbarBadge,
-} from "../narrator-toolbar-badges";
-import type { NarratorToolbarHost } from "../narrator-toolbar-items";
+} from "./narrator-toolbar-badges";
+import type { NarratorToolbarHost } from "./narrator-toolbar-items";
 import { useHeaderToolbar } from "./use-header-toolbar";
 
 // biome-ignore lint/suspicious/noExplicitAny: react-query result passthrough from NarratorPanel.

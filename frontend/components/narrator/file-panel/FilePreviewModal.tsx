@@ -23,7 +23,7 @@ import { ApiError, authorizedFetch, readFetchError } from "../../../lib/api";
 import { apiUrl } from "../../../lib/base-path";
 import { getShikiLang } from "../../../lib/shiki-lang";
 import { useImageViewer } from "../../common/image-viewer-context";
-import { ContentViewer } from "../ContentViewer";
+import { ContentViewer } from "../content/ContentViewer";
 
 const IMAGE_EXTS = new Set([
 	".jpg",

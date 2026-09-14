@@ -30,7 +30,7 @@ import {
 } from "../../../hooks/useHumanAttention";
 import { api } from "../../../lib/api";
 import { readSession, writeSession } from "../../../lib/session-store";
-import { InlinePermission } from "../InlinePermission";
+import { InlinePermission } from "../permission/InlinePermission";
 import { FileModDrawerCtx, PermEnterHintCtx } from "../tool-call/tool-call-contexts";
 import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
 import { toBannerQuestions } from "./async-question-questions";

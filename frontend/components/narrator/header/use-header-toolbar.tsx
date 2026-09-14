@@ -15,19 +15,19 @@ import {
 	type PluginContributionPick,
 } from "../../plugins/PluginContributionPicker";
 import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
-import { ExecutionDeviceOptions } from "../ExecutionDeviceMenu";
+import { ExecutionDeviceOptions } from "../model/ExecutionDeviceMenu";
 import { NarratorLodOptions } from "../lod/NarratorLodMenu";
 import type { RenderLod } from "../lod/RenderLodCtx";
 import type { MobileToolPanelKind } from "../MobileToolPanelHost";
 import {
 	HEADER_TITLE_MIN_WIDTH_PX,
 	selectHeaderToolbarEntries,
-} from "../narrator-header-toolbar-capacity";
+} from "./narrator-header-toolbar-capacity";
 import type {
 	NarratorToolbarHost,
 	NarratorToolbarId,
 	NarratorToolbarItemDef,
-} from "../narrator-toolbar-items";
+} from "./narrator-toolbar-items";
 
 // biome-ignore lint/suspicious/noExplicitAny: react-query result passthrough from NarratorPanel.
 type QueryLike = any;

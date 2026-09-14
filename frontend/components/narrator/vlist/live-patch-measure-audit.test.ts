@@ -611,7 +611,7 @@ describe("low-LOD folds: a fold that grows must re-key", () => {
 	 */
 	async function probeFolds(messages: Msg[], lod: 1 | 2 | 3) {
 		const { segmentMessages } = await import("../message/message-segments");
-		const { groupRenderUnits } = await import("../render-units");
+		const { groupRenderUnits } = await import("../trace/render-units");
 		const { adaptRenderUnits } = await import("./segment-adapter");
 		const { VLIST_REGISTRY } = await import("./registry");
 		const { buildCacheKey, extractDataRevision } = await cacheMod();

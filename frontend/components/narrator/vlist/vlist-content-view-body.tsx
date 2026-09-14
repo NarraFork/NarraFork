@@ -1,5 +1,5 @@
 import type { CSSProperties } from "react";
-import { ContentBody } from "../ContentBody";
+import { ContentBody } from "../content/ContentBody";
 import { AutoFollowScroll, type ContentViewportLayout } from "../scroll/AutoFollowScroll";
 import type { VListViewTarget } from "./vlist-content-view-target";
 

@@ -70,13 +70,13 @@ const NarratorPanel = lazy(() =>
 	import("../NarratorPanel").then((m) => ({ default: m.NarratorPanel })),
 );
 const NarratorDetailsPanel = lazy(() =>
-	import("../NarratorDetailsPanel").then((m) => ({ default: m.NarratorDetailsPanel })),
+	import("../details/NarratorDetailsPanel").then((m) => ({ default: m.NarratorDetailsPanel })),
 );
 const BackgroundTasksPanel = lazy(() =>
-	import("../BackgroundTasksDrawer").then((m) => ({ default: m.BackgroundTasksPanel })),
+	import("../background/BackgroundTasksDrawer").then((m) => ({ default: m.BackgroundTasksPanel })),
 );
 const BrowserPanel = lazy(() =>
-	import("../BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
+	import("../browser/BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
 );
 const FileModificationsPanel = lazy(() =>
 	import("../file-panel/FileModificationsDrawer").then((m) => ({

@@ -40,7 +40,7 @@ import type {
 } from "../panels/panel-kind";
 import { usePanelCompact, usePanelHeaderDrag } from "../panels/shared";
 import type { WebviewLeafConfig } from "../split-tree";
-import { WebviewPanel } from "../WebviewPanel";
+import { WebviewPanel } from "../browser/WebviewPanel";
 import {
 	type NarratorPanelParams,
 	type NarratorToolPanelParams,

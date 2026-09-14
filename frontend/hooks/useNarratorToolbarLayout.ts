@@ -11,7 +11,7 @@
 import type {
 	NarratorToolbarHost,
 	NarratorToolbarId,
-} from "@frontend/components/narrator/narrator-toolbar-items";
+} from "@frontend/components/narrator/header/narrator-toolbar-items";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
 import type { api } from "../lib/api";

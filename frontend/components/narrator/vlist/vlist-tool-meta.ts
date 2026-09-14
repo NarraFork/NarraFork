@@ -27,7 +27,7 @@
 
 import { extractField, isTruncated, resolveDisplayText } from "@shared/pretext-layout/tool-detail";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
-import { runningSendTargetNarratorId } from "../trace-row-identity";
+import { runningSendTargetNarratorId } from "../trace/trace-row-identity";
 
 /** Tools whose input carries a file path worth offering in the menu. */
 const FILE_TOOLS = new Set(["Read", "Write", "Edit"]);

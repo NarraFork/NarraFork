@@ -5,7 +5,7 @@ import {
 } from "@shared/pretext-layout/reasoning-segments";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
-import { groupRenderUnits, type RenderUnit } from "../render-units";
+import { groupRenderUnits, type RenderUnit } from "../trace/render-units";
 import type { RenderLod } from "./prepared-block";
 import { buildPretextLayoutManifest } from "./pretext-layout-manifest";
 import type {

@@ -27,20 +27,20 @@ import {
 } from "../../../lib/constants";
 import { TruncatedText } from "../../common/TruncatedText";
 import { UserAvatar } from "../../UserAvatar";
-import { CodexQuotaIndicator } from "../model/CodexQuotaIndicator";
-import { ModelMenuItems } from "../model/ModelMenuItems";
-import { ModelPriceModal } from "../model/ModelPriceModal";
 import {
 	BackgroundTasksStatusButton,
 	NarratorStatusBar,
 	NarratorStatusToolbar,
 	type NarratorStatusToolbarAction,
-} from "../NarratorStatusToolbar";
-import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
+} from "../header/NarratorStatusToolbar";
 import type {
 	getNarratorStatusBarDisplay,
 	planNarratorWorkIndicator,
-} from "../narrator-status-bar";
+} from "../header/narrator-status-bar";
+import { CodexQuotaIndicator } from "../model/CodexQuotaIndicator";
+import { ModelMenuItems } from "../model/ModelMenuItems";
+import { ModelPriceModal } from "../model/ModelPriceModal";
+import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
 import { InlineOverrideActions } from "./InlineOverrideActions";
 import { PathRulesPopover } from "./PathRulesPopover";

@@ -2,7 +2,7 @@ import { notifications } from "@mantine/notifications";
 import type { useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api } from "../../../lib/api";
-import { handleRegistry } from "../ContentViewer";
+import { handleRegistry } from "../content/ContentViewer";
 import {
 	BLOCK_ID_ATTR,
 	collectSelectedText,

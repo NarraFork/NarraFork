@@ -32,7 +32,7 @@ import {
 } from "../message/MessageSelectionCtx";
 import { filterChildrenByToolUse } from "../message/message-segments";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
-import { groupReasoningRuns } from "../reasoning-segments";
+import { groupReasoningRuns } from "../trace/reasoning-segments";
 
 export interface SelectionEntry extends BlockMeta {
 	seq: number;

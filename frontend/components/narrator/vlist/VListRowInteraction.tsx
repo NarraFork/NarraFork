@@ -60,7 +60,7 @@ import {
 import { lazy, type ReactNode, Suspense, useCallback, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { CompactMenuSub } from "../CompactMenuSub";
+import { CompactMenuSub } from "../compact/CompactMenuSub";
 import { useRenderInteractive } from "../lod/RenderLodCtx";
 import type { MessageContextMenuActions } from "../message/MessageContextMenuCtx";
 import {
@@ -84,7 +84,7 @@ const FilePreviewModal = lazy(() =>
 	import("../file-panel/FilePreviewModal").then((m) => ({ default: m.FilePreviewModal })),
 );
 const ContentInspector = lazy(() =>
-	import("../ContentInspector").then((m) => ({ default: m.ContentInspector })),
+	import("../content/ContentInspector").then((m) => ({ default: m.ContentInspector })),
 );
 
 const SWIPE_REVEAL_WIDTH = 180;

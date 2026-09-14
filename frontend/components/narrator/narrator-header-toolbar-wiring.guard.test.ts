@@ -20,7 +20,7 @@ function read(name: string): Promise<string> {
 }
 
 const narratorPanel = () => read("./NarratorPanel.tsx");
-const overflowMenu = () => read("./NarratorToolbarOverflowMenu.tsx");
+const overflowMenu = () => read("./header/NarratorToolbarOverflowMenu.tsx");
 const capacityHook = () => read("../../hooks/useNarratorHeaderToolbarCapacity.ts");
 // The toolbar row markup lives in HeaderToolbar; the availability / layout /
 // activation / inline-options logic lives in its co-located hook.

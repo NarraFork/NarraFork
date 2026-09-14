@@ -23,7 +23,7 @@ import type {
 } from "@shared/sidecar-body";
 import type { RenderSegment } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
-import { groupRenderUnits } from "../render-units";
+import { groupRenderUnits } from "../trace/render-units";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
 import { type AdapterContext, type AdapterSegment, adaptSegment } from "./segment-adapter";

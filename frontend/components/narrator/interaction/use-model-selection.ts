@@ -9,11 +9,7 @@ import {
 } from "@shared/reasoning-effort-support";
 import { useCallback, useMemo } from "react";
 import type { useModelCardIndex } from "../../../hooks/useModelCards";
-import {
-	type ModelAggregation,
-	type ModelOption,
-	resolveDisplayModel,
-} from "../../../lib/constants";
+import type { ModelOption } from "../../../lib/constants";
 
 type ModelCardIndex = ReturnType<typeof useModelCardIndex>;
 
@@ -165,11 +161,11 @@ interface UpdateSettingsMutation {
 
 export interface UseModelSelectionOptions {
 	narratorId: string;
-	narratorModel: string | null | undefined;
+	/** Effective model + its parse, resolved up front by useResolvedModel. */
+	resolvedModel: string;
+	resolvedBareModel: string;
+	resolvedModelOption: ModelOption | undefined;
 	narratorReasoningEffort: string | null | undefined;
-	defaultModelValue: string | undefined;
-	aggregations: ModelAggregation[] | undefined;
-	allModels: ModelOption[];
 	settingsData: ModelSelectionSettings | undefined;
 	modelCardIndex: ModelCardIndex;
 	reasoningEffortMutation: ReasoningEffortMutation;
@@ -177,10 +173,6 @@ export interface UseModelSelectionOptions {
 }
 
 export interface UseModelSelectionResult {
-	resolvedModel: string;
-	resolvedProvider: string;
-	resolvedBareModel: string;
-	resolvedModelOption: ModelOption | undefined;
 	codexCapableProviders: Set<string>;
 	isCodexChannelModel: boolean;
 	supportsCodexControls: boolean;
@@ -207,32 +199,15 @@ export interface UseModelSelectionResult {
 export function useModelSelection(options: UseModelSelectionOptions): UseModelSelectionResult {
 	const {
 		narratorId,
-		narratorModel,
+		resolvedModel,
+		resolvedBareModel,
+		resolvedModelOption,
 		narratorReasoningEffort,
-		defaultModelValue,
-		aggregations,
-		allModels,
 		settingsData,
 		modelCardIndex,
 		reasoningEffortMutation,
 		updateSettingsMutation,
 	} = options;
-
-	const resolvedModel = useMemo(
-		() => resolveDisplayModel(narratorModel, { defaultModelValue, aggregations }),
-		[narratorModel, defaultModelValue, aggregations],
-	);
-
-	const { resolvedProvider, resolvedBareModel } = useMemo(() => {
-		const idx = resolvedModel.indexOf(":");
-		if (idx > 0) {
-			return {
-				resolvedProvider: resolvedModel.slice(0, idx),
-				resolvedBareModel: resolvedModel.slice(idx + 1),
-			};
-		}
-		return { resolvedProvider: "", resolvedBareModel: resolvedModel };
-	}, [resolvedModel]);
 
 	const codexCapableProviders = useMemo(() => {
 		const providers = new Set<string>();
@@ -244,10 +219,6 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 		}
 		return providers;
 	}, [settingsData]);
-	const resolvedModelOption = useMemo(
-		() => allModels.find((m) => m.value === resolvedModel),
-		[allModels, resolvedModel],
-	);
 	const isCodexChannelModel =
 		resolvedModelOption?.channelType?.toLowerCase() === "codex" ||
 		resolvedBareModel.startsWith("codex:");
@@ -407,10 +378,6 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 	}, [narratorReasoningEffort, narratorId, reasoningEffortMutation, updateSettingsMutation]);
 
 	return {
-		resolvedModel,
-		resolvedProvider,
-		resolvedBareModel,
-		resolvedModelOption,
 		codexCapableProviders,
 		isCodexChannelModel,
 		supportsCodexControls,

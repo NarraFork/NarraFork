@@ -25,7 +25,7 @@
  */
 
 import { type ReactNode, useMemo } from "react";
-import { InlinePermission } from "../InlinePermission";
+import { InlinePermission } from "../permission/InlinePermission";
 import type {
 	AsyncQuestionSlot,
 	PendingPermission,

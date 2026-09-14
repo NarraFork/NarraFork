@@ -118,14 +118,14 @@ import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
-import { BackgroundTasksDrawerHost, useBackgroundTasksButton } from "./BackgroundTasksDrawer";
-import { ContentViewerEnvironmentProvider } from "./ContentViewer";
+import { BackgroundTasksDrawerHost, useBackgroundTasksButton } from "./background/BackgroundTasksDrawer";
+import { ContentViewerEnvironmentProvider } from "./content/ContentViewer";
 import {
 	COMPACTING_MARKER_ATTR,
 	CompactSummaryModal,
 	CompactSummaryModalCtx,
 	type CompactSummaryModalTarget,
-} from "./compact-summary-modal";
+} from "./compact/compact-summary-modal";
 
 import type { FileReferenceScopeValue } from "./composer/FileReferenceScope";
 
@@ -141,9 +141,16 @@ import {
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { HeaderToolbar } from "./header/HeaderToolbar";
+import type { NarratorStatusToolbarAction } from "./header/NarratorStatusToolbar";
+import { HEADER_TITLE_SLOT_ATTR } from "./header/narrator-header-toolbar-capacity";
+import {
+	getNarratorStatusBarDisplay,
+	planNarratorWorkIndicator,
+} from "./header/narrator-status-bar";
+import type { NarratorToolbarBadgeCounts } from "./header/narrator-toolbar-badges";
+import type { NarratorToolbarHost } from "./header/narrator-toolbar-items";
 import { useTitleEditing } from "./header/use-title-editing";
 import { ContextUsageIndicator } from "./interaction/ContextUsageIndicator";
-
 import { PathRulesPopover } from "./interaction/PathRulesPopover";
 import {
 	normalizeBooleanOverride,
@@ -152,22 +159,20 @@ import {
 } from "./interaction/reflection-types";
 import { SetGlobalModelModal } from "./interaction/SetGlobalModelModal";
 import { useComposerAttachments } from "./interaction/use-composer-attachments";
-import { useFastModeControl } from "./interaction/use-fast-mode-control";
 import { useInternalFileViewer } from "./interaction/use-internal-file-viewer";
 import { useInterruptLongPress } from "./interaction/use-interrupt-long-press";
 import { useMessageRevertConfirm } from "./interaction/use-message-revert-confirm";
-import { useModelSelection } from "./interaction/use-model-selection";
 import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions";
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
-import { usePermissionModeControl } from "./interaction/use-permission-mode-control";
 import { useQueuedMessageActions } from "./interaction/use-queued-message-actions";
+import { useResolvedModel } from "./interaction/use-resolved-model";
 import {
 	formatKimiBarText,
 	formatKimiDetailsText,
 	isKimiProviderBaseUrl,
-} from "./kimi-usage-format";
-import { LeakedToolCallModal } from "./LeakedToolCallModal";
+} from "./model/kimi-usage-format";
+import { LeakedToolCallModal } from "./permission/LeakedToolCallModal";
 import { LodSwitchToast } from "./lod/LodSwitchToast";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
@@ -181,9 +186,6 @@ import { useNugQuota } from "./model/use-nug-quota";
 import { NarratorInteractionArea } from "./NarratorInteractionArea";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
-import type { NarratorStatusToolbarAction } from "./NarratorStatusToolbar";
-import { HEADER_TITLE_SLOT_ATTR } from "./narrator-header-toolbar-capacity";
-
 import type {
 	AsyncQuestionSlot,
 	ContentBlock,
@@ -199,12 +201,9 @@ import {
 	MAX_TEXT_FILE_SIZE,
 	resizeImageIfNeeded,
 } from "./narrator-panel-types";
-import { getNarratorStatusBarDisplay, planNarratorWorkIndicator } from "./narrator-status-bar";
-import type { NarratorToolbarBadgeCounts } from "./narrator-toolbar-badges";
-import type { NarratorToolbarHost } from "./narrator-toolbar-items";
 import { compactProgressLabel } from "./progress-label";
 import { toBannerQuestions } from "./question/async-question-questions";
-import { RevertActionConfirmModal } from "./RevertScopeConfirmModal";
+import { RevertActionConfirmModal } from "./permission/RevertScopeConfirmModal";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
 import { type SwipeAnchorInfo, setGlobalOnSwipeAnchorInfo } from "./scroll/swipeState";
@@ -241,7 +240,7 @@ function parsePersistedPaymentRequired(value: unknown): Partial<PaymentRequiredI
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
 const NarratorDetailsPanel = lazy(() =>
-	import("./NarratorDetailsPanel").then((module) => ({ default: module.NarratorDetailsPanel })),
+	import("./details/NarratorDetailsPanel").then((module) => ({ default: module.NarratorDetailsPanel })),
 );
 
 const SpecPanel = lazy(() =>
@@ -723,33 +722,12 @@ export function NarratorPanel({
 	// model value; when using a model aggregation, resolve to a representative
 	// concrete member so capability/context-window lookups work (the backend
 	// resolves the actual member at request time).
-	// Model resolution + reasoning-effort menu subsystem. Kept lifted here:
-	// resolvedModel feeds the NUG quota, Kimi usage and context-threshold queries
-	// below, plus the big status-bar control-menu object.
-	const {
-		resolvedModel,
-		resolvedProvider,
-		resolvedBareModel,
-		supportsCodexControls,
-		isBuiltInCodexModel,
-		supportsReasoningEffort,
-		reasoningEffortOptions,
-		reasoningFollowsDefault,
-		displayedReasoningEffort,
-		handleFollowDefaultReasoning,
-		handleSetReasoningAsDefault,
-	} = useModelSelection({
-		narratorId,
-		narratorModel: narrator?.model,
-		narratorReasoningEffort: narrator?.reasoningEffort,
-		defaultModelValue,
-		aggregations,
-		allModels,
-		settingsData,
-		modelCardIndex,
-		reasoningEffortMutation,
-		updateSettingsMutation,
-	});
+	// Only the model *resolution* stays in the panel: resolvedModel feeds the NUG
+	// quota, Kimi usage and context-threshold queries and the WS state below. The
+	// reasoning/codex/fast-mode/permission control derivations moved down into the
+	// status bar (see useStatusBarProps), which is where they are consumed.
+	const { resolvedModel, resolvedProvider, resolvedBareModel, resolvedModelOption } =
+		useResolvedModel(narrator?.model, defaultModelValue, aggregations, allModels);
 
 	// Fetch context thresholds for the current model (used as fallback when WS hasn't pushed yet)
 	const { data: modelThresholds } = useQuery({
@@ -1404,19 +1382,6 @@ export function NarratorPanel({
 		{ open: openContextThresholdSettingsModal, close: closeContextThresholdSettings },
 	] = useDisclosure(false);
 
-	// Fast-mode toggle + settings popover (open state, hover-close debounce, and
-	// the coarse-pointer long-press timer). Kept lifted here: the rendered control
-	// is threaded into the status-bar control-menu object built below.
-	const { renderFastModeControl } = useFastModeControl({
-		narratorId,
-		narratorFastModeOverride: narrator?.fastModeOverride,
-		fastModeDefault,
-		fastModeUsesTapSettings,
-		fastModeMutation,
-		updateUserPrefs,
-		t,
-	});
-
 	const detailsPanelExternalProps = useMemo(
 		() => ({
 			narratorId,
@@ -1737,40 +1702,9 @@ export function NarratorPanel({
 	const hasPlanTrait = Array.isArray(narrator?.traits)
 		? narrator.traits.includes("plan")
 		: !!narrator?.planMode;
-	// Plan-mode toggle + plan/danger reflection override controls. Kept lifted:
-	// outputs feed the status-bar control-menu object, and hasPlanTrait (read by
-	// several other panel consumers) is injected rather than owned here.
-	const {
-		planReflectionAutoApproveOverride,
-		dangerReflectionOverride,
-		planReflectionAutoApproveEffective,
-		dangerReflectionEffectiveLevel,
-		togglePlanMode,
-		handlePlanReflectionAutoApproveOverride,
-		handleFollowDefaultPlanReflection,
-		handleSetPlanReflectionAsDefault,
-		handleDangerReflectionOverride,
-		handleFollowDefaultDangerReflection,
-		handleSetDangerReflectionAsDefault,
-	} = usePermissionModeControl({
-		narratorId,
-		narratorPlanReflectionAutoApproveOverride: narrator?.planReflectionAutoApproveOverride,
-		narratorDangerReflectionOverride: narrator?.dangerReflectionOverride,
-		hasPlanTrait,
-		planModeSupported,
-		planReflectionSupported,
-		dangerReflectionSupported,
-		planReflectionAutoApproveGlobal,
-		dangerReflectionGlobal,
-		dangerReflectionGlobalLevel,
-		settingsLoaded: !!settingsData,
-		enterPlanModeMutation,
-		exitPlanModeMutation,
-		reflectionOverridesMutation,
-		updateSettingsMutation,
-		confirm,
-		t,
-	});
+	// (Plan-mode toggle + plan/danger reflection controls moved into the status bar
+	// via useStatusBarProps; hasPlanTrait above stays in the panel for isPlanning /
+	// detailsPanelExternalProps.)
 	const handleOpenContextThresholdSettings = useCallback(() => {
 		// The modal seeds its own draft from `contextThresholdSettings` on open.
 		openContextThresholdSettingsModal();
@@ -2745,6 +2679,37 @@ export function NarratorPanel({
 		}
 	};
 
+	// File picker change: classify the selection into images / text files and
+	// warn about anything unsupported. Co-located with addImages/addTextFiles
+	// rather than inlined in the composer-row props object.
+	const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+		if (e.target.files) {
+			const files = Array.from(e.target.files);
+			const imageFiles: File[] = [];
+			const textFileList: File[] = [];
+			const unsupported: string[] = [];
+			for (const f of files) {
+				if (ACCEPTED_TYPES.includes(f.type)) {
+					imageFiles.push(f);
+				} else if (isTextFile(f.name)) {
+					textFileList.push(f);
+				} else {
+					unsupported.push(f.name);
+				}
+			}
+			if (unsupported.length > 0) {
+				notifications.show({
+					title: t("unsupportedFileType"),
+					message: unsupported.join(", "),
+					color: "yellow",
+				});
+			}
+			if (imageFiles.length > 0) addImages(imageFiles);
+			if (textFileList.length > 0) addTextFiles(textFileList);
+			e.target.value = "";
+		}
+	};
+
 	// Stable paste bridge for <NarratorComposer> (it re-renders per keystroke, so
 	// every callback prop must hold its identity).
 	const addImagesRef = useRef(addImages);
@@ -3591,7 +3556,7 @@ export function NarratorPanel({
 						showHumanAttentionInbox={showHumanAttentionInbox}
 						narratorId={narratorId}
 						isChapterMerged={isChapterMerged}
-						statusBar={{
+						statusBarInputs={{
 							narratorId,
 							narrator,
 							ownsHorizontalSafeArea,
@@ -3648,49 +3613,6 @@ export function NarratorPanel({
 								onEditDefaultModel: () => setGlobalModelEditTarget("default"),
 								onEditSummaryModel: () => setGlobalModelEditTarget("summary"),
 							},
-							reasoning: {
-								supported: supportsReasoningEffort,
-								displayed: displayedReasoningEffort,
-								options: reasoningEffortOptions,
-								followsDefault: reasoningFollowsDefault,
-								mutation: reasoningEffortMutation,
-								onFollowDefault: handleFollowDefaultReasoning,
-								onSetAsDefault: handleSetReasoningAsDefault,
-							},
-							permission: {
-								availableModes: availablePermissionModes,
-								unavailableReason: permissionModesUnavailableReason,
-								mutation: permModeMutation,
-								hasPlanTrait,
-								togglePlanMode,
-								planModePending: enterPlanModeMutation.isPending || exitPlanModeMutation.isPending,
-								planModeSupported,
-								planModeUnsupportedReason,
-								planReflection: {
-									supported: planReflectionSupported,
-									override: planReflectionAutoApproveOverride,
-									effective: planReflectionAutoApproveEffective,
-									global: planReflectionAutoApproveGlobal,
-									onChange: handlePlanReflectionAutoApproveOverride,
-									onFollowDefault: handleFollowDefaultPlanReflection,
-									onSetAsDefault: handleSetPlanReflectionAsDefault,
-								},
-								dangerReflection: {
-									supported: dangerReflectionSupported,
-									override: dangerReflectionOverride,
-									effectiveLevel: dangerReflectionEffectiveLevel,
-									globalLevel: dangerReflectionGlobalLevel,
-									onChange: handleDangerReflectionOverride,
-									onFollowDefault: handleFollowDefaultDangerReflection,
-									onSetAsDefault: handleSetDangerReflectionAsDefault,
-								},
-								reflectionSettingsDisabled,
-							},
-							codexControls: {
-								supportsCodexControls,
-								isBuiltInCodexModel,
-								renderFastModeControl,
-							},
 							quota: {
 								balance: quotaBalance,
 								detailsText: quotaDetailsText,
@@ -3720,6 +3642,40 @@ export function NarratorPanel({
 								actions: mobileToolbarActions,
 								measurementKey: mobileToolbarMeasurementKey,
 							},
+							// Inputs for the control sub-objects assembled by useStatusBarProps.
+							resolvedModel,
+							resolvedBareModel,
+							resolvedModelOption,
+							narratorReasoningEffort: narrator.reasoningEffort,
+							settingsData,
+							modelCardIndex,
+							reasoningEffortMutation,
+							updateSettingsMutation,
+							narratorFastModeOverride: narrator.fastModeOverride,
+							fastModeDefault,
+							fastModeUsesTapSettings,
+							fastModeMutation,
+							updateUserPrefs,
+							availablePermissionModes,
+							permissionModesUnavailableReason,
+							permModeMutation,
+							hasPlanTrait,
+							planModePending: enterPlanModeMutation.isPending || exitPlanModeMutation.isPending,
+							planModeSupported,
+							planModeUnsupportedReason,
+							planReflectionSupported,
+							dangerReflectionSupported,
+							narratorPlanReflectionAutoApproveOverride: narrator.planReflectionAutoApproveOverride,
+							narratorDangerReflectionOverride: narrator.dangerReflectionOverride,
+							planReflectionAutoApproveGlobal,
+							dangerReflectionGlobal,
+							dangerReflectionGlobalLevel,
+							settingsLoaded: !!settingsData,
+							enterPlanModeMutation,
+							exitPlanModeMutation,
+							reflectionOverridesMutation,
+							confirm,
+							reflectionSettingsDisabled,
 						}}
 						composerRowProps={{
 							fileInputRef,
@@ -3735,33 +3691,7 @@ export function NarratorPanel({
 							effectiveFocusIndex,
 							enterQueueMode: userPrefs?.enterQueueMode ?? "turn",
 							ctrlEnterQueueMode: userPrefs?.ctrlEnterQueueMode ?? "tool",
-							onFileInputChange: (e) => {
-								if (e.target.files) {
-									const files = Array.from(e.target.files);
-									const imageFiles: File[] = [];
-									const textFileList: File[] = [];
-									const unsupported: string[] = [];
-									for (const f of files) {
-										if (ACCEPTED_TYPES.includes(f.type)) {
-											imageFiles.push(f);
-										} else if (isTextFile(f.name)) {
-											textFileList.push(f);
-										} else {
-											unsupported.push(f.name);
-										}
-									}
-									if (unsupported.length > 0) {
-										notifications.show({
-											title: t("unsupportedFileType"),
-											message: unsupported.join(", "),
-											color: "yellow",
-										});
-									}
-									if (imageFiles.length > 0) addImages(imageFiles);
-									if (textFileList.length > 0) addTextFiles(textFileList);
-									e.target.value = "";
-								}
-							},
+							onFileInputChange: handleFileInputChange,
 							onComposerPasteImages: handleComposerPasteImages,
 							onSendWithMode: composerSendWithMode,
 							onSend: handleSend,

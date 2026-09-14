@@ -18,7 +18,7 @@ import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../../hooks/useNarrator";
 import type { ExecutionTargetIdentity } from "../../../lib/api/types";
 import { formatDurationText, formatFullLocaleDateTime } from "../../../lib/format";
-import { ContentViewer } from "../ContentViewer";
+import { ContentViewer } from "../content/ContentViewer";
 
 const MAX_JSON_PREVIEW_CHARS = 80_000;
 

@@ -10,7 +10,7 @@ import { useToolCallDetail } from "../../../hooks/useNarrator";
 import { toolCallDetailQueryKey } from "../../../lib/api/narrators";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
-import { TraceRowInteraction } from "../TraceRowInteraction";
+import { TraceRowInteraction } from "../trace/TraceRowInteraction";
 import { ToolCallInspector } from "./ToolCallInspector";
 
 const { VListRowInteraction } = await import("../vlist/VListRowInteraction");

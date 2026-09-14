@@ -70,7 +70,7 @@ import {
 	MAX_IMAGE_SIZE,
 	resizeImageIfNeeded,
 } from "../narrator-panel-types";
-import { RevertScopeConfirmModal } from "../RevertScopeConfirmModal";
+import { RevertScopeConfirmModal } from "../permission/RevertScopeConfirmModal";
 import { editRevertNeedsConfirm } from "./message-edit-text";
 
 /**

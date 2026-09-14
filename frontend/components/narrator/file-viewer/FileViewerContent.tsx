@@ -50,7 +50,7 @@ import { formatLocaleNumber } from "../../../lib/intl-format";
 import { getShikiLang } from "../../../lib/shiki-lang";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { TruncatedText } from "../../common/TruncatedText";
-import { ContentViewer } from "../ContentViewer";
+import { ContentViewer } from "../content/ContentViewer";
 import { FileReferenceScopeProvider, useFileReferenceScope } from "../composer/FileReferenceScope";
 import { MonacoEditor } from "../file-editor/MonacoEditor";
 import {

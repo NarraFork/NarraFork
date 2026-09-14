@@ -34,7 +34,7 @@ const NarratorSearchPanel = lazy(() =>
 	import("./NarratorSearchPanel").then((m) => ({ default: m.NarratorSearchPanel })),
 );
 const BrowserPanel = lazy(() =>
-	import("./BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
+	import("./browser/BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
 );
 const NarratorUserChatPanel = lazy(() =>
 	import("../chat/NarratorUserChatPanel").then((m) => ({ default: m.NarratorUserChatPanel })),

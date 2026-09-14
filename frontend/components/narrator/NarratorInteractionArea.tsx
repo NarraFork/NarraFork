@@ -26,12 +26,13 @@ import type React from "react";
 import { useTranslation } from "react-i18next";
 import { startBottomSpacingResize, useBottomSpacing } from "../../hooks/useResizableBottomSpacing";
 import type { BufferMessageSummary } from "../../lib/api";
-import { ChapterBar } from "./ChapterBar";
 import { NarratorComposerRow, type NarratorComposerRowProps } from "./composer/NarratorComposerRow";
+import { ChapterBar } from "./header/ChapterBar";
+import { NarratorInteractionStatusBar } from "./interaction/NarratorInteractionStatusBar";
 import {
-	NarratorInteractionStatusBar,
-	type NarratorInteractionStatusBarProps,
-} from "./interaction/NarratorInteractionStatusBar";
+	type UseStatusBarPropsOptions,
+	useStatusBarProps,
+} from "./interaction/use-status-bar-props";
 import { QueuedAttachmentPreview, QueuedMessageRow } from "./QueuedMessageRow";
 import { HumanAttentionInboxButton } from "./question/GlobalQuestionInbox";
 
@@ -84,8 +85,10 @@ export interface NarratorInteractionAreaProps {
 	chapterId?: string | null;
 	onOpenGitPanel?: () => void;
 
-	// ── Status bar (fully described by the grouped-props contract) ──
-	statusBar: NarratorInteractionStatusBarProps;
+	// ── Status bar — raw inputs; the props are assembled here via useStatusBarProps
+	//    (model / reasoning / codex / permission control sub-objects are computed
+	//    from the control hooks rather than in NarratorPanel). ──
+	statusBarInputs: UseStatusBarPropsOptions;
 
 	// ── Human-attention inbox ──
 	isWorkspacePreview: boolean;
@@ -103,6 +106,9 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const bottomSpacing = useBottomSpacing();
+	// Assemble the status-bar props here (computing the model/reasoning/codex/
+	// permission control sub-objects via the control hooks) instead of in the panel.
+	const statusBar = useStatusBarProps(props.statusBarInputs);
 
 	const sensors = useSensors(
 		useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -409,7 +415,7 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 			)}
 
 			{/* Status bar */}
-			<NarratorInteractionStatusBar {...props.statusBar} />
+			<NarratorInteractionStatusBar {...statusBar} />
 
 			{/* Question inbox, directly above the composer. */}
 			{!props.isWorkspacePreview && props.showHumanAttentionInbox && (

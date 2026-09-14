@@ -59,7 +59,7 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { useRenderLod } from "../lod/RenderLodCtx";
-import { ManualOlderHistoryLoad } from "../ManualOlderHistoryLoad";
+import { ManualOlderHistoryLoad } from "../history/ManualOlderHistoryLoad";
 import {
 	type MessageContextMenuActions,
 	MessageContextMenuCtx,
@@ -77,17 +77,17 @@ import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
 import {
 	resolveOlderHistoryAutoLoad,
 	resolveOlderHistoryAutoLoadEnabled,
-} from "../older-history-auto-load";
-import { recentRunSegmentMessageIds } from "../run-segments";
+} from "../history/older-history-auto-load";
 import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../scroll/swipeState";
-import { TraceRowInteraction } from "../TraceRowInteraction";
 import {
 	getCategory,
 	getCategoryColor,
 	getSummary,
 	subagentRecentCallSummary,
 } from "../tool-call/tool-display";
-import type { TraceRowIdentity } from "../trace-row-identity";
+import { recentRunSegmentMessageIds } from "../trace/run-segments";
+import { TraceRowInteraction } from "../trace/TraceRowInteraction";
+import type { TraceRowIdentity } from "../trace/trace-row-identity";
 import { openCommunicationRecipient } from "./communication-navigation";
 import type { MeasuredReasoning } from "./measure/measure-reasoning";
 import type { MeasuredSubagent } from "./measure/measure-subagent";

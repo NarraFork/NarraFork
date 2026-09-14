@@ -10,6 +10,7 @@ import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { api, type BufferMessageSummary } from "../../lib/api";
 import { statusRegistry } from "../../lib/status-registry";
 import { localizeNarratorError } from "./error-localization";
+import { withQueueSubstatus } from "./header/narrator-status-bar";
 import {
 	isActiveReflectionPermissionLike,
 	isReflectionPermissionLike,
@@ -20,7 +21,6 @@ import type {
 	PendingPermission,
 	PermissionCallbacks,
 } from "./narrator-panel-types";
-import { withQueueSubstatus } from "./narrator-status-bar";
 import {
 	clearAllReflectionProgress,
 	clearReflectionProgress,
