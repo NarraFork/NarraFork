@@ -2,7 +2,7 @@ import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { foldHandle } from "@shared/narrator-handle";
-import { and, desc, eq, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	apiRequests,
@@ -105,6 +105,7 @@ import type {
 import { getAvailableOptionalToolIds } from "./command-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
+import { publishHistoryMessage } from "./narrator-history-publisher";
 import { buildSystemInjectionBlock, type SystemInjectionBlock } from "./narrator-injection";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
 // `bumpParentNarratorMessageVersion` is deliberately NOT imported any more: the bump
@@ -500,10 +501,9 @@ export async function handleLoadToolCommand(
 			})
 			.returning();
 		await appendMessageRef(narratorId, id);
-		broadcastToNarrator(narratorId, {
-			type: "user_message",
+		publishHistoryMessage(
 			narratorId,
-			message: {
+			{
 				id: msg.id,
 				narratorId,
 				role: "user",
@@ -512,7 +512,8 @@ export async function handleLoadToolCommand(
 				createdAt: msg.createdAt,
 				children: [],
 			},
-		});
+			"user_message",
+		);
 	}
 
 	return { toolName: displayToolName, loaded: true, alreadyLoaded };
@@ -570,10 +571,9 @@ export async function handleUnloadToolCommand(
 			})
 			.returning();
 		await appendMessageRef(narratorId, id);
-		broadcastToNarrator(narratorId, {
-			type: "user_message",
+		publishHistoryMessage(
 			narratorId,
-			message: {
+			{
 				id: msg.id,
 				narratorId,
 				role: "user",
@@ -582,7 +582,8 @@ export async function handleUnloadToolCommand(
 				createdAt: msg.createdAt,
 				children: [],
 			},
-		});
+			"user_message",
+		);
 	}
 
 	return { toolName: displayToolName, unloaded: !notLoaded && !unknownTool, notLoaded };
@@ -881,10 +882,9 @@ export async function handleBashCommand(
 			rawCommand,
 			userId,
 		);
-		broadcastToNarrator(narratorId, {
-			type: "user_message",
+		publishHistoryMessage(
 			narratorId,
-			message: {
+			{
 				id: userMsg.id,
 				narratorId,
 				role: "user",
@@ -896,7 +896,8 @@ export async function handleBashCommand(
 				children: [],
 				creator: userMsg.creator ?? null,
 			},
-		});
+			"user_message",
+		);
 	}
 
 	const { bashTool } = await import("../lib/agent/tools/bash");
@@ -940,29 +941,25 @@ export async function handleBashCommand(
 		createdAt: now,
 	});
 
-	broadcastToNarrator(narratorId, {
-		type: "message",
+	publishHistoryMessage(narratorId, {
+		id: assistantMsg.id,
 		narratorId,
-		message: {
-			id: assistantMsg.id,
-			narratorId,
-			role: "assistant",
-			contentJson: assistantMsg.contentJson,
-			contentText: assistantMsg.contentText,
-			createdAt: assistantMsg.createdAt,
-			seq: assistantSeq,
-			children: [],
-			toolCalls: [
-				{
-					id: toolCallId,
-					toolUseId,
-					toolName: "Bash",
-					inputJson: toolInput,
-					status: "running",
-					streamStartedAt: streamStartedAtIso,
-				},
-			],
-		},
+		role: "assistant",
+		contentJson: assistantMsg.contentJson,
+		contentText: assistantMsg.contentText,
+		createdAt: assistantMsg.createdAt,
+		seq: assistantSeq,
+		children: [],
+		toolCalls: [
+			{
+				id: toolCallId,
+				toolUseId,
+				toolName: "Bash",
+				inputJson: toolInput,
+				status: "running",
+				streamStartedAt: streamStartedAtIso,
+			},
+		],
 	});
 	broadcastToNarrator(narratorId, {
 		type: "tool_started",
@@ -2081,6 +2078,9 @@ export const narratorService = {
 					messageId: narratorMessageRefs.messageId,
 					seq: narratorMessageRefs.seq,
 					isCompact: narratorMessageRefs.isCompact,
+					deliveryId: narratorMessageRefs.deliveryId,
+					deliveryKind: narratorMessageRefs.deliveryKind,
+					deliveryState: narratorMessageRefs.deliveryState,
 				})
 				.from(narratorMessageRefs)
 				.where(
@@ -2088,6 +2088,10 @@ export const narratorService = {
 						eq(narratorMessageRefs.narratorId, parentNarratorId),
 						inArray(narratorMessageRefs.messageId, messageIds),
 						excludePendingCompactCondition(pendingCompactIds),
+						or(
+							isNull(narratorMessageRefs.deliveryState),
+							eq(narratorMessageRefs.deliveryState, "materialized"),
+						),
 					),
 				)
 				.orderBy(narratorMessageRefs.seq)
@@ -2098,7 +2102,10 @@ export const narratorService = {
 				narratorId: id,
 				messageId: row.messageId,
 				seq: i + 1,
-				isCompact: 0,
+				isCompact: row.isCompact,
+				deliveryId: row.deliveryId,
+				deliveryKind: row.deliveryKind,
+				deliveryState: row.deliveryState,
 			}));
 			insertRefsBatched(tx, dupRefValues);
 
@@ -2309,6 +2316,9 @@ export const narratorService = {
 						seq: narratorMessageRefs.seq,
 						isCompact: narratorMessageRefs.isCompact,
 						segmentCompactId: narratorMessageRefs.segmentCompactId,
+						deliveryId: narratorMessageRefs.deliveryId,
+						deliveryKind: narratorMessageRefs.deliveryKind,
+						deliveryState: narratorMessageRefs.deliveryState,
 					})
 					.from(narratorMessageRefs)
 					.where(
@@ -2320,6 +2330,10 @@ export const narratorService = {
 							sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
 							sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
 							excludePending,
+							or(
+								isNull(narratorMessageRefs.deliveryState),
+								eq(narratorMessageRefs.deliveryState, "materialized"),
+							),
 						),
 					)
 					.orderBy(narratorMessageRefs.seq)
@@ -2346,6 +2360,9 @@ export const narratorService = {
 						seq: narratorMessageRefs.seq,
 						isCompact: narratorMessageRefs.isCompact,
 						segmentCompactId: narratorMessageRefs.segmentCompactId,
+						deliveryId: narratorMessageRefs.deliveryId,
+						deliveryKind: narratorMessageRefs.deliveryKind,
+						deliveryState: narratorMessageRefs.deliveryState,
 					})
 					.from(narratorMessageRefs)
 					.where(
@@ -2356,6 +2373,10 @@ export const narratorService = {
 								: undefined,
 							sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
 							excludePending,
+							or(
+								isNull(narratorMessageRefs.deliveryState),
+								eq(narratorMessageRefs.deliveryState, "materialized"),
+							),
 						),
 					)
 					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -2411,19 +2432,25 @@ export const narratorService = {
 				const firstSeq = prefixRows[0].seq;
 				const excludePendingRaw = excludePendingCompactRawCondition(pendingCompactIds);
 				tx.run(sql`
-					INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact, segment_compact_id)
+					INSERT INTO narrator_message_refs
+						(id, narrator_id, message_id, seq, is_compact, segment_compact_id,
+						 delivery_id, delivery_kind, delivery_state)
 					SELECT
 						lower(hex(randomblob(16))),
 						${id},
 						refs.message_id,
 						refs.seq,
 						refs.is_compact,
-						refs.segment_compact_id
+						refs.segment_compact_id,
+						refs.delivery_id,
+						refs.delivery_kind,
+						refs.delivery_state
 					FROM narrator_message_refs AS refs
 					WHERE refs.narrator_id = ${parentNarratorId}
 						AND refs.seq >= ${firstSeq}
 						AND refs.seq <= ${lastSeq}
 						AND refs.segment_compact_id IS NULL
+						AND (refs.delivery_state IS NULL OR refs.delivery_state = 'materialized')
 						${excludePendingRaw}
 					ORDER BY refs.seq
 				`);
@@ -2439,6 +2466,10 @@ export const narratorService = {
 						and(
 							eq(narratorMessageRefs.narratorId, parentNarratorId),
 							sql`${narratorMessageRefs.seq} < ${firstSeq}`,
+							or(
+								isNull(narratorMessageRefs.deliveryState),
+								eq(narratorMessageRefs.deliveryState, "materialized"),
+							),
 						),
 					)
 					.limit(1)

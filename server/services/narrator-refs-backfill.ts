@@ -16,7 +16,7 @@
  * ranged insert with no renumbering, and the child's seq space stays aligned
  * with its ancestors'.
  */
-import { and, eq, gte, inArray, lt, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narrators } from "../db/schema";
 import { narratorRefsBackfillLock } from "../lib/async-mutex";
@@ -171,19 +171,24 @@ function copyWindow(
 		// duplicated. Segment-compacted refs are excluded to match forkNarrator.
 		tx.run(sql`
 			INSERT INTO narrator_message_refs
-				(id, narrator_id, message_id, seq, is_compact, segment_compact_id)
+				(id, narrator_id, message_id, seq, is_compact, segment_compact_id,
+				 delivery_id, delivery_kind, delivery_state)
 			SELECT
 				lower(hex(randomblob(16))),
 				${narratorId},
 				refs.message_id,
 				refs.seq,
 				refs.is_compact,
-				refs.segment_compact_id
+				refs.segment_compact_id,
+				refs.delivery_id,
+				refs.delivery_kind,
+				refs.delivery_state
 			FROM narrator_message_refs AS refs
 			WHERE refs.narrator_id = ${parentNarratorId}
 				AND refs.seq >= ${fromSeq}
 				AND refs.seq < ${untilSeq}
 				AND refs.segment_compact_id IS NULL
+				AND (refs.delivery_state IS NULL OR refs.delivery_state = 'materialized')
 			ORDER BY refs.seq
 			ON CONFLICT (narrator_id, message_id) DO NOTHING
 		`);
@@ -198,6 +203,10 @@ function copyWindow(
 				and(
 					eq(narratorMessageRefs.narratorId, parentNarratorId),
 					lt(narratorMessageRefs.seq, fromSeq),
+					or(
+						isNull(narratorMessageRefs.deliveryState),
+						eq(narratorMessageRefs.deliveryState, "materialized"),
+					),
 				),
 			)
 			.limit(1)

@@ -165,13 +165,16 @@ export const narratorContext = {
 		options?: { throwOnFailure?: boolean },
 	): Promise<string> {
 		const narrator = await narratorService.getById(narratorId);
-		const messages = await narratorService.getMessages(narratorId, SUMMARY_MAX_MESSAGES);
+		const messages = await narratorService.getModelHistorySinceLastCompact(
+			narratorId,
+			SUMMARY_MAX_MESSAGES,
+		);
 
 		if (messages.length === 0 && !narrator.contextSummary) return "No conversation history.";
 
 		let conversationText = messages
 			.map((m) => {
-				const role = m.role === "assistant" ? "Assistant" : "User";
+				const role = m.role === "assistant" ? "Assistant" : m.role === "sys" ? "System" : "User";
 				const text = m.contentText || JSON.stringify(m.contentJson);
 				return `[${role}]: ${text}`;
 			})

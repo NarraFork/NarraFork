@@ -34,6 +34,11 @@ export interface AppendCandidate {
 	role?: unknown;
 	parentToolUseId?: unknown;
 	contentJson?: unknown;
+	children?: readonly unknown[];
+	toolCalls?: readonly unknown[];
+	deliveryId?: unknown;
+	deliveryKind?: unknown;
+	deliveryState?: unknown;
 }
 
 export type AppendRejection =
@@ -144,4 +149,51 @@ export function appendLoadedMessage<T extends AppendCandidate>(
 	const decision = resolveMessageAppend({ message, loaded, isSubagent });
 	if (!decision.append) return { messages: loaded, appended: false, reason: decision.reason };
 	return { messages: [...loaded, message], appended: true };
+}
+
+/**
+ * Merge one realtime/catch-up message by its canonical id and seq.
+ *
+ * A duplicate id is not necessarily a no-op: delivery state, creator metadata and
+ * edited content can advance after the first event. Conversely, a different id at an
+ * already occupied seq is an out-of-order replay and must not mint a second row.
+ */
+export function upsertLoadedMessage<T extends AppendCandidate>(
+	loaded: readonly T[],
+	message: T,
+	isSubagent: boolean,
+): { messages: readonly T[]; changed: boolean; appended: boolean; reason?: AppendRejection } {
+	if (typeof message.id !== "string" || message.id.length === 0)
+		return { messages: loaded, changed: false, appended: false, reason: "no-id" };
+	const sameId = loaded.findIndex((existing) => existing.id === message.id);
+	if (sameId >= 0) {
+		if (loaded[sameId] === message) return { messages: loaded, changed: false, appended: false };
+		const previous = loaded[sameId];
+		const messages = [...loaded];
+		messages[sameId] = {
+			...previous,
+			...message,
+			// Projection broadcasts intentionally omit aggregate children/tool calls; retain
+			// the already-loaded rich tree while still applying canonical body/state fields.
+			children: message.children?.length ? message.children : previous.children,
+			toolCalls: message.toolCalls?.length ? message.toolCalls : previous.toolCalls,
+		} as T;
+		return { messages, changed: true, appended: false };
+	}
+	const seq = seqOf(message);
+	if (seq != null) {
+		const sameSeq = loaded.findIndex((existing) => seqOf(existing) === seq);
+		if (sameSeq >= 0) {
+			// A canonical id is authoritative; do not overwrite another row merely because
+			// an old catch-up payload reused a stale seq.
+			return { messages: loaded, changed: false, appended: false, reason: "duplicate" };
+		}
+	}
+	const appended = appendLoadedMessage(loaded, message, isSubagent);
+	return {
+		messages: appended.messages,
+		changed: appended.appended,
+		appended: appended.appended,
+		reason: appended.reason,
+	};
 }

@@ -6,6 +6,7 @@
 	"queuedRetrySuccess": "Message requeued.",
 	"queuedRetryFailed": "Retry request failed: {{error}}",
 	"queuedFailedCount": "{{count}} failed",
+	"queuedExecutionOnly": "Execution queue",
 	"publicShares": {
 		"title": "Public share links",
 		"distinction": "These links allow viewing without signing in. This is separate from visibility for all signed-in users above. Only the owner or an administrator can manage links.",
@@ -153,6 +154,10 @@
 		"failed": "Failed"
 	},
 	"compactRetryModel": "Model for this retry",
+	"saveSummaryModel": "Use as permanent summary model",
+	"saveSummaryModelFailed": "Failed to save summary model",
+	"compactElapsed": "Elapsed {{elapsed}}",
+	"compactModelMeta": "Model: {{model}} · Thinking: {{effort}}",
 	"compactLifecycleMeta": "Mode: {{mode}} · Trigger: {{trigger}} · Context: {{before}}% → {{after}}%",
 	"compactSummaryTitle": "Compact Summary",
 	"triggerCompact": "Compact now",
@@ -267,7 +272,6 @@
 	"resumeContentFollow": "Resume following",
 	"contentViewport": "Scrollable content",
 	"contentSourceIncomplete": "[Only the retained source preview is available. Copy includes this available content, not the missing source.]",
-
 	"diffReadRangeExpired": "Reading position is outside the retained source range.",
 	"diffReadVersionChanged": "Source version changed; showing the first available row.",
 	"diffSourcePreview": "Bounded diff preview; some source content is unavailable.",
@@ -1506,7 +1510,10 @@
 			"completed": "Execution completed",
 			"total": "Total {{duration}}",
 			"permissionWait": "Permission wait {{duration}}",
-			"execution": "Execution {{duration}}"
+			"execution": "Execution {{duration}}",
+			"streamCompleted": "Tool streaming completed",
+			"streaming": "Streaming duration: {{duration}}",
+			"postStreamingWait": "Wait after streaming: {{duration}}"
 		}
 	},
 	"toolbar": {

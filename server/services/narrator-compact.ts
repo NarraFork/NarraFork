@@ -11,10 +11,20 @@ import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
-import { getAutoCompactKeepPairs, settings } from "../lib/settings";
+import { getAutoCompactKeepPairs, resolveDefaultReasoningEffort, settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import {
+	appendLiveCompactDelta,
+	finishLiveCompactProgress,
+	startLiveCompactProgress,
+} from "./compact-live-state";
 import { drainQueuedMessagesAfterCompact } from "./compact-queue-drain";
 import { narratorContext } from "./narrator-context";
+import {
+	publishHistoryDeletion,
+	publishHistoryMessage,
+	publishHistoryUpdate,
+} from "./narrator-history-publisher";
 import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
 import { narratorService } from "./narrator-service";
 import type { CompactLock, CompactLockResult, CompactMode } from "./narrator-session-state";
@@ -81,7 +91,10 @@ interface CompactProgressReporter {
 	 * say "retrying (N)" instead of an unexplained 0-char spinner.
 	 */
 	reportRetry: (retryCount: number, error: string) => void;
+	/** Stop progress ticks while final persistence completes. */
 	finish: () => void;
+	/** Close the on-demand text stream after the final marker state is persisted. */
+	close: (status: "compacted" | "failed") => void;
 }
 
 /**
@@ -254,6 +267,9 @@ export function createCompactProgressReporter(options: {
 	narratorId: string;
 	messageId: string;
 	mode: CompactMode;
+	model?: string;
+	reasoningEffort?: string;
+	startedAt?: string;
 	isSegment?: boolean;
 	/**
 	 * Called on every non-empty delta, BEFORE throttling. The stall watchdog uses
@@ -266,6 +282,11 @@ export function createCompactProgressReporter(options: {
 	// The retry broadcast carries the CURRENT counts, so the reporter mirrors the
 	// last published snapshot (the throttled accumulator does not expose one).
 	let lastSnapshot: ProgressSnapshot = { phase: "thinking", thinkingChars: 0, outputChars: 0 };
+	startLiveCompactProgress(options.messageId, {
+		model: options.model ?? "",
+		...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+		startedAt: options.startedAt ?? new Date().toISOString(),
+	});
 	const reporter = createThrottledProgressReporter((snapshot) => {
 		lastSnapshot = snapshot;
 		broadcastToNarrator(options.narratorId, {
@@ -276,6 +297,9 @@ export function createCompactProgressReporter(options: {
 			thinkingChars: snapshot.thinkingChars,
 			outputChars: snapshot.outputChars,
 			mode: options.mode,
+			...(options.model ? { model: options.model } : {}),
+			...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+			...(options.startedAt ? { startedAt: options.startedAt } : {}),
 			...(options.isSegment ? { isSegment: true } : {}),
 		});
 	}, COMPACT_PROGRESS_THROTTLE_MS);
@@ -294,25 +318,41 @@ export function createCompactProgressReporter(options: {
 		});
 	};
 	const onActivity = options.onActivity;
-	if (!onActivity) {
-		return {
-			onTextDelta: reporter.addOutput,
-			onReasoningDelta: reporter.addThinking,
-			reportRetry,
-			finish: reporter.finish,
-		};
-	}
+	let outputChars = 0;
+	let thinkingChars = 0;
+	const addOutput = (delta: string) => {
+		if (delta) {
+			outputChars += delta.length;
+			appendLiveCompactDelta(options.messageId, "output", delta, {
+				outputChars,
+				thinkingChars,
+			});
+			onActivity?.();
+		}
+		reporter.addOutput(delta);
+	};
+	const addThinking = (delta: string) => {
+		if (delta) {
+			thinkingChars += delta.length;
+			appendLiveCompactDelta(options.messageId, "thinking", delta, {
+				outputChars,
+				thinkingChars,
+			});
+			onActivity?.();
+		}
+		reporter.addThinking(delta);
+	};
+	let closed = false;
 	return {
-		onTextDelta: (delta) => {
-			if (delta) onActivity();
-			reporter.addOutput(delta);
-		},
-		onReasoningDelta: (delta) => {
-			if (delta) onActivity();
-			reporter.addThinking(delta);
-		},
+		onTextDelta: addOutput,
+		onReasoningDelta: addThinking,
 		reportRetry,
-		finish: reporter.finish,
+		finish: () => reporter.finish(),
+		close: (status: "compacted" | "failed") => {
+			if (closed) return;
+			closed = true;
+			finishLiveCompactProgress(options.messageId, status);
+		},
 	};
 }
 
@@ -847,13 +887,11 @@ async function retryFailedCompactUnlocked(
 		// the async summary request, whose first frame carries the new ID.
 		const replacedMessageId = prepared.replacedMessageId ?? prepared.oldMessageId;
 		if (replacedMessageId && replacedMessageId !== prepared.id) {
-			const replacementEvent = {
-				type: "messages_deleted" as const,
+			publishHistoryDeletion(
 				narratorId,
-				deletedMessageIds: [replacedMessageId],
-				...compactReplacementFields({ preparedRetryMessage: prepared }),
-			};
-			broadcastToNarrator(narratorId, replacementEvent);
+				[replacedMessageId],
+				compactReplacementFields({ preparedRetryMessage: prepared }),
+			);
 		}
 
 		// runCustomCompact installs the real history lock synchronously before this
@@ -935,13 +973,7 @@ async function doRunCustomCompact({
 				{ status: "failed", error, mode, expectedAttempt },
 			);
 			if (failedMsg) {
-				const failedMessageEvent = {
-					type: "message_updated" as const,
-					narratorId,
-					message: failedMsg,
-					...replacementFields,
-				};
-				broadcastToNarrator(narratorId, failedMessageEvent);
+				publishHistoryUpdate(narratorId, failedMsg, replacementFields);
 			}
 			const compactFailedEvent = {
 				type: "compact_failed" as const,
@@ -965,13 +997,11 @@ async function doRunCustomCompact({
 		}));
 	expectedAttempt = compactAttemptNumber(compactingMsg);
 	expectedSeq = compactingMsg.seq;
-	const compactStartEvent = {
-		type: options?.preparedRetryMessage ? ("message_updated" as const) : ("message" as const),
-		narratorId,
-		message: compactingMsg,
-		...replacementFields,
-	};
-	broadcastToNarrator(narratorId, compactStartEvent);
+	if (options?.preparedRetryMessage) {
+		publishHistoryUpdate(narratorId, compactingMsg, replacementFields);
+	} else {
+		publishHistoryMessage(narratorId, compactingMsg);
+	}
 	await setCompactingSubstatus(narratorId, mode, true);
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode });
 
@@ -984,6 +1014,9 @@ async function doRunCustomCompact({
 		narratorId,
 		messageId: compactingMsg.id,
 		mode,
+		model: selectedModel,
+		reasoningEffort: resolveDefaultReasoningEffort(undefined, selectedModel),
+		startedAt: "createdAt" in compactingMsg ? compactingMsg.createdAt : new Date().toISOString(),
 		...(hooks?.beat ? { onActivity: hooks.beat } : {}),
 	});
 
@@ -1055,13 +1088,7 @@ async function doRunCustomCompact({
 		if (compactedMsg) {
 			const estimated = await attachBuildHistoryTokenEstimate(narratorId, locale, compactedMsg);
 			contextPercentAfter = estimated.contextPercent ?? contextPercentAfter;
-			const compactUpdatedEvent = {
-				type: "message_updated" as const,
-				narratorId,
-				message: estimated.message,
-				...replacementFields,
-			};
-			broadcastToNarrator(narratorId, compactUpdatedEvent);
+			publishHistoryUpdate(narratorId, estimated.message, replacementFields);
 		}
 
 		// Clear the compacting tag before compact_done so clients never process
@@ -1094,6 +1121,7 @@ async function doRunCustomCompact({
 			...(isRetry ? { messageId: compactedMsg.id } : {}),
 			...replacementFields,
 		});
+		compactProgress.close("compacted");
 		return true;
 	} catch (err) {
 		compactProgress.finish();
@@ -1127,13 +1155,7 @@ async function doRunCustomCompact({
 					},
 				);
 				if (cancelledMsg) {
-					const cancelledMessageEvent = {
-						type: "message_updated" as const,
-						narratorId,
-						message: cancelledMsg,
-						...replacementFields,
-					};
-					broadcastToNarrator(narratorId, cancelledMessageEvent);
+					publishHistoryUpdate(narratorId, cancelledMsg, replacementFields);
 				} else {
 					cancellationSettled = false;
 				}
@@ -1170,11 +1192,7 @@ async function doRunCustomCompact({
 							},
 						);
 					if (deleted) {
-						broadcastToNarrator(narratorId, {
-							type: "messages_deleted",
-							narratorId,
-							deletedMessageIds: [cancelledMsg.id],
-						});
+						publishHistoryDeletion(narratorId, [cancelledMsg.id]);
 					} else {
 						cancellationSettled = false;
 					}
@@ -1191,6 +1209,7 @@ async function doRunCustomCompact({
 					...replacementFields,
 				});
 			}
+			compactProgress.close("failed");
 			throw err;
 		}
 
@@ -1219,13 +1238,7 @@ async function doRunCustomCompact({
 			});
 
 		if (failedMsg) {
-			const compactFailedMessageEvent = {
-				type: "message_updated" as const,
-				narratorId,
-				message: failedMsg,
-				...replacementFields,
-			};
-			broadcastToNarrator(narratorId, compactFailedMessageEvent);
+			publishHistoryUpdate(narratorId, failedMsg, replacementFields);
 		}
 
 		if (failureMode === "blocking") {
@@ -1260,6 +1273,7 @@ async function doRunCustomCompact({
 			...replacementFields,
 		};
 		broadcastToNarrator(narratorId, compactFailedEvent);
+		compactProgress.close("failed");
 		throw err;
 	} finally {
 		await setCompactingSubstatus(
@@ -1363,7 +1377,7 @@ async function doRunSegmentCompact({
 
 	const { message: markerMsg, hiddenMessageIds } =
 		await narratorService.persistSegmentCompactMarker(narratorId, messageIds);
-	broadcastToNarrator(narratorId, { type: "message", narratorId, message: markerMsg });
+	publishHistoryMessage(narratorId, markerMsg);
 	await setCompactingSubstatus(narratorId, "blocking", true);
 	broadcastToNarrator(narratorId, {
 		type: "segment_compact_hide",
@@ -1375,6 +1389,9 @@ async function doRunSegmentCompact({
 		narratorId,
 		messageId: markerMsg.id,
 		mode: "blocking",
+		model: settings.agent.summaryModel,
+		reasoningEffort: resolveDefaultReasoningEffort(undefined, settings.agent.summaryModel),
+		startedAt: "createdAt" in markerMsg ? markerMsg.createdAt : new Date().toISOString(),
 		isSegment: true,
 		...(hooks?.beat ? { onActivity: hooks.beat } : {}),
 	});
@@ -1390,6 +1407,7 @@ async function doRunSegmentCompact({
 				isSegment: true,
 				mode: "blocking",
 			});
+			compactProgress.close("compacted");
 
 			return false;
 		}
@@ -1427,11 +1445,7 @@ async function doRunSegmentCompact({
 		if (finalizedMsg) {
 			const estimated = await attachBuildHistoryTokenEstimate(narratorId, locale, finalizedMsg);
 			contextPercentAfter = estimated.contextPercent ?? contextPercentAfter;
-			broadcastToNarrator(narratorId, {
-				type: "message_updated",
-				narratorId,
-				message: estimated.message,
-			});
+			publishHistoryUpdate(narratorId, estimated.message);
 		}
 
 		logger.info("Segment compact completed", {
@@ -1450,6 +1464,7 @@ async function doRunSegmentCompact({
 			isSegment: true,
 			mode: "blocking",
 		});
+		compactProgress.close("compacted");
 		return true;
 	} catch (err) {
 		compactProgress.finish();
@@ -1480,11 +1495,7 @@ async function doRunSegmentCompact({
 			});
 
 		if (failedMsg) {
-			broadcastToNarrator(narratorId, {
-				type: "message_updated",
-				narratorId,
-				message: failedMsg,
-			});
+			publishHistoryUpdate(narratorId, failedMsg);
 		}
 
 		await setCompactingSubstatus(narratorId, "blocking", false).catch(() => {});
@@ -1495,6 +1506,7 @@ async function doRunSegmentCompact({
 			mode: "blocking",
 			error: errorMsg,
 		});
+		compactProgress.close("failed");
 		throw err;
 	}
 }
@@ -1606,7 +1618,7 @@ async function runPlanCompactUnlocked(narratorId: string, planText: string): Pro
 	// and updates narrator's contextSummary + clears apiConversationId.
 	const compactMsg = await narratorService.persistPlanMessage(narratorId, planText);
 	if (compactMsg) {
-		broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactMsg });
+		publishHistoryMessage(narratorId, compactMsg);
 	}
 
 	logger.info("Plan compact completed", { narratorId, summaryLength: planText.length });

@@ -20,6 +20,7 @@ mock.module("../../db", () => ({ db, sqlite }));
 
 const { narratorService } = await import("../narrator-service");
 const { narratorMessageQueries } = await import("../narrator-messages");
+const { deleteCanonicalProjectionTx } = await import("../narrator-history-projection");
 
 const now = "2026-07-17T10:00:00.000Z";
 
@@ -70,6 +71,87 @@ afterAll(() => {
 });
 
 describe("narrator model history projection", () => {
+	test("eager mailbox projections are visible but not model-readable before adoption", async () => {
+		await seedNarrator();
+		const { createMailboxStore } = await import("../agent-runtime/mailbox");
+		const store = createMailboxStore(db);
+		const accepted = store.enqueue({
+			kind: "user_input",
+			narratorId: "n1",
+			text: "queued before next turn",
+			projectedByteSize: Buffer.byteLength("queued before next turn"),
+			requestKey: "eager-history",
+			history: {
+				role: "user",
+				contentJson: [{ type: "text", text: "queued before next turn" }],
+				contentText: "queued before next turn",
+			},
+		});
+		if (accepted.status !== "accepted") throw new Error(accepted.status);
+
+		const visible = await narratorService.getPretextDocumentPage("n1", { limit: 10 });
+		expect(visible.messages).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: accepted.delivery.recipientMessageId,
+					deliveryId: accepted.delivery.deliveryId,
+					deliveryState: "queued",
+				}),
+			]),
+		);
+		expect(await narratorService.getModelHistorySinceLastCompact("n1")).toEqual([]);
+
+		const [claimed] = store.claimBatch("n1", { token: "token", epoch: "epoch" });
+		if (!claimed?.deliveryId || !claimed.claimToken || !claimed.claimEpoch)
+			throw new Error("missing eager mailbox claim");
+		store.materialize(
+			{ id: claimed.id, narratorId: "n1", token: claimed.claimToken, epoch: claimed.claimEpoch },
+			() => {
+				throw new Error("eager projection should not call the legacy materializer");
+			},
+		);
+		expect(await narratorService.getModelHistorySinceLastCompact("n1")).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: accepted.delivery.recipientMessageId }),
+			]),
+		);
+	});
+
+	test("loads one canonical message by id without a page-window limit", async () => {
+		await seedNarrator();
+		for (let seq = 1; seq <= 105; seq++) {
+			await seedMessage({
+				id: `m-${seq}`,
+				narratorId: "n1",
+				seq,
+				role: "user",
+				contentText: `message-${seq}`,
+			});
+		}
+
+		const message = await narratorMessageQueries.getMessageById("n1", "m-105");
+		expect(message).toMatchObject({ id: "m-105", seq: 105, contentText: "message-105" });
+	});
+
+	test("deleting one canonical projection bumps its narrator version once", async () => {
+		await seedNarrator();
+		await seedMessage({ id: "delete-me", narratorId: "n1", seq: 1, role: "user" });
+		const before = (
+			sqlite.prepare("SELECT message_version AS value FROM narrators WHERE id = ?").get("n1") as {
+				value: number;
+			}
+		).value;
+
+		await db.transaction((tx) => deleteCanonicalProjectionTx(tx, "n1", "ref-delete-me"));
+
+		const after = (
+			sqlite.prepare("SELECT message_version AS value FROM narrators WHERE id = ?").get("n1") as {
+				value: number;
+			}
+		).value;
+		expect(after - before).toBe(1);
+	});
+
 	test("loads post-compact history with narrow fields", async () => {
 		await seedNarrator();
 		await seedMessage({

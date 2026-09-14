@@ -742,14 +742,19 @@ export interface LivePatchQueueHost {
  *    matching toolUseId) but a provider toolUseId can legitimately recur across
  *    narrators, which is the same reuse `patchReflection` already guards against.
  */
+interface QueuedLivePatch {
+	patch: LivePatch;
+	onMiss?: () => void;
+}
+
 export class LivePatchQueue {
-	private queue: LivePatch[] = [];
+	private queue: QueuedLivePatch[] = [];
 	private queuedFor: string | undefined;
 	private handle = 0;
 
 	constructor(private host: LivePatchQueueHost) {}
 
-	enqueue(patch: LivePatch | null): void {
+	enqueue(patch: LivePatch | null, onMiss?: () => void): void {
 		if (!patch) return;
 		const narratorId = this.host.currentNarratorId();
 		// A queue stamped for another narrator can only be a leftover from the switch;
@@ -758,7 +763,7 @@ export class LivePatchQueue {
 			this.queue = [];
 			this.queuedFor = narratorId;
 		}
-		this.queue.push(patch);
+		this.queue.push({ patch, onMiss });
 		if (this.handle) return;
 		this.handle = this.host.schedule(() => this.flush());
 	}
@@ -771,7 +776,10 @@ export class LivePatchQueue {
 		this.queuedFor = undefined;
 		if (queued.length === 0) return;
 		if (queuedFor !== this.host.currentNarratorId()) return;
-		this.host.apply(composeLivePatches(queued));
+		const applied = this.host.apply(composeLivePatches(queued.map((entry) => entry.patch)));
+		if (!applied) {
+			for (const entry of queued) entry.onMiss?.();
+		}
 	}
 
 	/** Discard everything pending (unmount / narrator switch). */

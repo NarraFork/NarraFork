@@ -1707,6 +1707,7 @@ describe("measureToolCall — lifecycle stamps reach the renderer", () => {
 	const STAMPS = {
 		startedAt: 1_000,
 		streamStartedAt: 900,
+		streamCompletedAt: 1_000,
 		permissionStartedAt: 1_100,
 		executionStartedAt: 1_500,
 		completedAt: 4_000,
@@ -1724,6 +1725,7 @@ describe("measureToolCall — lifecycle stamps reach the renderer", () => {
 		expect(measureToolCall(baseCard(), 600, 4).timing).toEqual({
 			startedAt: null,
 			streamStartedAt: null,
+			streamCompletedAt: null,
 			permissionStartedAt: null,
 			executionStartedAt: null,
 			completedAt: null,

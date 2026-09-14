@@ -29,6 +29,7 @@ import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../hooks/useModels";
 import { api } from "../../lib/api";
 import type { RetryFailedCompactResponse } from "../../lib/api/narrators";
+import { consumeCompactLiveStream } from "../../lib/compact-live-stream";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { MarkdownContent } from "./MarkdownContent";
 import { ModelMenuItems } from "./ModelMenuItems";
@@ -199,7 +200,9 @@ export function CompactSummaryModal({
 	const [editText, setEditText] = useState("");
 	const [saving, setSaving] = useState(false);
 	const [retrying, setRetrying] = useState(false);
+	const [savingSummaryModel, setSavingSummaryModel] = useState(false);
 	const [retryModel, setRetryModel] = useState<string | null>(null);
+	const [now, setNow] = useState(() => Date.now());
 	const [retryModelMenuOpened, setRetryModelMenuOpened] = useState(false);
 	const sourceTargetKey = target ? `${target.kind}:${target.narratorId}:${target.messageId}` : null;
 	const [retryTargetOverride, setRetryTargetOverride] = useState<{
@@ -323,14 +326,37 @@ export function CompactSummaryModal({
 					"messages_deleted",
 					"message_replaced",
 					"message_updated",
+					"compact_progress",
 					"compact_done",
 					"compact_failed",
 				],
 			},
-			applyCompactReplacement,
+			(event) => {
+				if (event.type === "compact_progress") {
+					const current = activeTargetRef.current;
+					if (current?.kind === "context" && event.messageId === current.messageId) {
+						queryClient.setQueryData<CompactMessageDetail>(
+							compactSummaryQueryKey(current.narratorId, current.messageId),
+							(previous) => ({
+								...(previous ?? { status: "compacting", summary: "", attempts: [] }),
+								status: "compacting",
+								...(typeof event.model === "string" ? { model: event.model } : {}),
+								...(typeof event.reasoningEffort === "string"
+									? { reasoningEffort: event.reasoningEffort }
+									: {}),
+								...(typeof event.startedAt === "string" ? { startedAt: event.startedAt } : {}),
+								outputChars: typeof event.outputChars === "number" ? event.outputChars : 0,
+								thinkingChars: typeof event.thinkingChars === "number" ? event.thinkingChars : 0,
+							}),
+						);
+					}
+					return;
+				}
+				applyCompactReplacement(event);
+			},
 		);
 		return () => narratorWSManager.removeListener(listener);
-	}, [applyCompactReplacement, target?.narratorId]);
+	}, [applyCompactReplacement, queryClient, target?.narratorId]);
 
 	const { data, isLoading, error, refetch } = useQuery({
 		queryKey,
@@ -342,12 +368,81 @@ export function CompactSummaryModal({
 		},
 		enabled: !!activeTarget,
 		gcTime: COMPACT_DETAIL_QUERY_GC_TIME_MS,
-		refetchInterval: (query) =>
-			!isSegment && (query.state.data as CompactMessageDetail | undefined)?.status === "compacting"
-				? 1_000
-				: false,
 	});
 	const compactDetail = !isSegment ? (data as CompactMessageDetail | undefined) : undefined;
+	const compactDetailRef = useRef<CompactMessageDetail | undefined>(compactDetail);
+	compactDetailRef.current = compactDetail;
+	const compactLiveStreamTrigger = `${targetKey ?? ""}:${compactDetail?.status ?? ""}`;
+
+	useEffect(() => {
+		const currentTarget = activeTargetRef.current;
+		const currentDetail = compactDetailRef.current;
+		if (
+			!compactLiveStreamTrigger ||
+			isSegment ||
+			!currentTarget ||
+			currentTarget.kind !== "context" ||
+			currentDetail?.status !== "compacting"
+		) {
+			return;
+		}
+		const controller = new AbortController();
+		const outputOffset = currentDetail.output?.length ?? 0;
+		const thinkingOffset = currentDetail.thinking?.length ?? 0;
+		const queryKeyForStream = compactSummaryQueryKey(
+			currentTarget.narratorId,
+			currentTarget.messageId,
+		);
+		void (async () => {
+			try {
+				const response = await api.streamCompactSummary(
+					currentTarget.narratorId,
+					currentTarget.messageId,
+					{ output: outputOffset, thinking: thinkingOffset },
+				);
+				if (!response.ok) return;
+				await consumeCompactLiveStream(
+					response,
+					(event) => {
+						if (event.kind === "finished") {
+							void queryClient.invalidateQueries({ queryKey: queryKeyForStream, exact: true });
+							return;
+						}
+						if (event.kind === "heartbeat") {
+							queryClient.setQueryData<CompactMessageDetail>(queryKeyForStream, (previous) =>
+								previous
+									? {
+											...previous,
+											status: "compacting",
+											outputChars: event.outputChars,
+											thinkingChars: event.thinkingChars,
+										}
+									: previous,
+							);
+							return;
+						}
+						queryClient.setQueryData<CompactMessageDetail>(queryKeyForStream, (previous) => {
+							if (!previous) return previous;
+							const field = event.channel === "output" ? "output" : "thinking";
+							return {
+								...previous,
+								status: "compacting",
+								[field]: `${previous[field] ?? ""}${event.delta}`,
+								outputChars: event.outputChars,
+								thinkingChars: event.thinkingChars,
+							};
+						});
+					},
+					controller.signal,
+				);
+			} catch {
+				// The ordinary compact status/count events remain usable when the detail stream
+				// is interrupted; the next explicit open starts a fresh bounded catch-up.
+			}
+		})();
+		return () => controller.abort();
+	}, [compactLiveStreamTrigger, isSegment, queryClient]);
+
 	const failed = compactDetail?.status === "failed";
 	const canRetry = compactDetail ? isCompactRetryableDetail(compactDetail) : false;
 	const selectedRetryModel = visibleModels.find((model) => model.value === retryModel);
@@ -357,6 +452,12 @@ export function CompactSummaryModal({
 			: selectedRetryModel.label
 		: (retryModel ?? t("compactRetryModel"));
 	const previousSourceTargetKeyRef = useRef(sourceTargetKey);
+
+	useEffect(() => {
+		if (compactDetail?.status !== "compacting") return;
+		const timer = window.setInterval(() => setNow(Date.now()), 1000);
+		return () => window.clearInterval(timer);
+	}, [compactDetail?.status]);
 
 	useEffect(() => {
 		if (previousSourceTargetKeyRef.current === sourceTargetKey) return;
@@ -424,6 +525,13 @@ export function CompactSummaryModal({
 		setEditing(true);
 	}, [activeTarget?.autoEdit, isLoading, data?.summary]);
 
+	const startedAtMs = compactDetail?.startedAt ? Date.parse(compactDetail.startedAt) : NaN;
+	const finishedAtMs = compactDetail?.finishedAt ? Date.parse(compactDetail.finishedAt) : NaN;
+	const elapsedMs = Number.isFinite(startedAtMs)
+		? Math.max(0, (Number.isFinite(finishedAtMs) ? finishedAtMs : now) - startedAtMs)
+		: 0;
+	const elapsedLabel = `${Math.floor(elapsedMs / 60_000)}:${String(Math.floor((elapsedMs % 60_000) / 1000)).padStart(2, "0")}`;
+
 	const handleClose = () => {
 		pendingRetryMigrationRef.current = null;
 		setRetryTargetOverride(null);
@@ -486,6 +594,24 @@ export function CompactSummaryModal({
 			});
 		} finally {
 			setSaving(false);
+		}
+	};
+
+	const handleSaveSummaryModel = async () => {
+		if (!retryModel) return;
+		setSavingSummaryModel(true);
+		try {
+			await api.updateSettings({ agent: { summaryModel: retryModel } });
+			await queryClient.invalidateQueries({ queryKey: ["settings"] });
+			notifications.show({ title: t("summaryModelUpdated"), message: t("summaryModelUpdated") });
+		} catch (err) {
+			notifications.show({
+				title: t("saveSummaryModelFailed"),
+				message: err instanceof Error ? err.message : t("saveSummaryModelFailed"),
+				color: "red",
+			});
+		} finally {
+			setSavingSummaryModel(false);
 		}
 	};
 
@@ -588,6 +714,14 @@ export function CompactSummaryModal({
 							{compactDetail.error || t("compactFailedDesc")}
 						</Text>
 						<Text size="xs" c="dimmed">
+							{t("compactModelMeta", {
+								model: compactDetail.model ?? compactDetail.attempts.at(-1)?.model ?? "-",
+								effort: compactDetail.reasoningEffort ?? "-",
+							})}
+							{" · "}
+							{t("compactElapsed", { elapsed: elapsedLabel })}
+						</Text>
+						<Text size="xs" c="dimmed">
 							{t("compactLifecycleMeta", {
 								mode: compactDetail.mode ?? "-",
 								trigger: compactDetail.trigger ?? "-",
@@ -655,6 +789,15 @@ export function CompactSummaryModal({
 										/>
 									</Menu.Dropdown>
 								</Menu>
+								<Button
+									size="xs"
+									variant="subtle"
+									loading={savingSummaryModel}
+									disabled={!retryModel}
+									onClick={handleSaveSummaryModel}
+								>
+									{t("saveSummaryModel")}
+								</Button>
 							</Stack>
 						)}
 					</Stack>
@@ -669,10 +812,29 @@ export function CompactSummaryModal({
 				) : data?.summary || compactDetail?.status === "compacting" ? (
 					<Stack gap="md">
 						{compactDetail?.status === "compacting" && (
-							<Group gap="xs">
-								<Loader size="xs" />
-								<Text size="sm">{t("compacting")}</Text>
-							</Group>
+							<Stack gap="xs">
+								<Group gap="xs">
+									<Loader size="xs" />
+									<Text size="sm">{t("compacting")}</Text>
+									<Text size="xs" c="dimmed">
+										{t("compactElapsed", { elapsed: elapsedLabel })}
+									</Text>
+								</Group>
+								<Text size="xs" c="dimmed">
+									{t("compactModelMeta", {
+										model: compactDetail.model ?? "-",
+										effort: compactDetail.reasoningEffort ?? "-",
+									})}
+								</Text>
+								{compactDetail.thinking && (
+									<Paper p="xs" withBorder>
+										<Text size="xs" style={{ whiteSpace: "pre-wrap" }}>
+											{compactDetail.thinking}
+										</Text>
+									</Paper>
+								)}
+								{compactDetail.output && <MarkdownContent text={compactDetail.output} />}
+							</Stack>
 						)}
 						{data?.summary && <MarkdownContent text={data.summary} />}
 						{compactDetail && compactDetail.status !== "compacting" && (

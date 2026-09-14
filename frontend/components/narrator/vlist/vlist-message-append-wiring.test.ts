@@ -157,6 +157,34 @@ describe("appendMessage — no refetch, one row measured", () => {
 	});
 });
 
+describe("upsertMessage — canonical id + seq idempotency", () => {
+	it("updates delivery state in place without creating a second row", async () => {
+		const { coordinator, count } = await loaded();
+		const queued = {
+			...message(count),
+			deliveryId: "delivery-1",
+			deliveryKind: "user_input",
+			deliveryState: "queued",
+		} as unknown as TreeMessage;
+		const claimed = { ...queued, deliveryState: "claimed" } as unknown as TreeMessage;
+		expect(coordinator.upsertMessage(queued, false, atBottom)).toBe(true);
+		expect(coordinator.upsertMessage(claimed, false, atBottom)).toBe(true);
+		const rows = coordinator.getSnapshot().input?.messages ?? [];
+		expect(rows.filter((row) => row.id === queued.id)).toHaveLength(1);
+		expect(rows.find((row) => row.id === queued.id)?.deliveryState).toBe("claimed");
+	});
+
+	it("replays the same canonical event without a second row", async () => {
+		const { coordinator, count } = await loaded();
+		const next = message(count);
+		expect(coordinator.upsertMessage(next, false, atBottom)).toBe(true);
+		expect(coordinator.upsertMessage({ ...next }, false, atBottom)).toBe(true);
+		expect(
+			coordinator.getSnapshot().input?.messages.filter((row) => row.id === next.id),
+		).toHaveLength(1);
+	});
+});
+
 describe("appendMessage — what falls back to a reload", () => {
 	it("refuses a duplicate and a mid-window insert, but appends a tail compact marker", async () => {
 		const { coordinator, count } = await loaded();

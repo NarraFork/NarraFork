@@ -587,18 +587,17 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			const boxRect = swipeBoxRef.current?.getBoundingClientRect();
 			const half = menuHeight / 2;
 
-			// Determine the visible area — use the scroll container if found, else viewport
+			// Determine the visible area — only an ancestor that actually scrolls can
+			// define the menu's viewport. Clipped row bodies may overflow while using
+			// overflow:hidden; treating them as the viewport shifts long menus away from
+			// the message at the bottom of the panel.
 			let visibleTop = 0;
 			let visibleBottom = window.innerHeight;
-			let el: HTMLElement | null = swipeBoxRef.current?.parentElement ?? null;
-			while (el) {
-				if (el.scrollHeight > el.clientHeight && el.clientHeight > 0) {
-					const cr = el.getBoundingClientRect();
-					visibleTop = Math.max(visibleTop, cr.top);
-					visibleBottom = Math.min(visibleBottom, cr.bottom);
-					break;
-				}
-				el = el.parentElement;
+			const scrollParent = findVerticalScrollParent(swipeBoxRef.current?.parentElement ?? null);
+			if (scrollParent) {
+				const cr = scrollParent.getBoundingClientRect();
+				visibleTop = Math.max(visibleTop, cr.top);
+				visibleBottom = Math.min(visibleBottom, cr.bottom);
 			}
 
 			// Prefer center of visible area, clamp to block bounds

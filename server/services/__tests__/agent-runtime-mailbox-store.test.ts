@@ -279,6 +279,145 @@ describe("durable mailbox storage against generated migrations", () => {
 		expect(store.getByDelivery(first.deliveryId as string)?.text).toBe("");
 		expect(db.select().from(narratorMessages).all()).toHaveLength(3);
 	});
+	test("enqueue returns a visible canonical TreeMessage and duplicate reuses every identity", () => {
+		const history = {
+			role: "user" as const,
+			parentToolUseId: "parent-tool",
+			contentJson: [{ type: "text", text: "canonical" }],
+			contentText: "canonical",
+			origin: "assistant" as const,
+		};
+		const firstResult = store.enqueue(input("tree", { history, text: "transport" }));
+		expect(firstResult.status).toBe("accepted");
+		if (firstResult.status !== "accepted") throw new Error("expected acceptance");
+		expect(firstResult.message).toMatchObject({
+			id: firstResult.delivery.currentMessageId,
+			seq: expect.any(Number),
+			deliveryId: firstResult.delivery.deliveryId,
+			deliveryKind: "agent_message",
+			deliveryState: "queued",
+			role: "user",
+			parentToolUseId: "parent-tool",
+			children: [],
+			toolCalls: [],
+		});
+		const duplicate = store.enqueue(input("tree", { history, text: "different transport" }));
+		expect(duplicate.status).toBe("duplicate");
+		if (duplicate.status !== "duplicate") throw new Error("expected duplicate");
+		expect(duplicate.message?.id).toBe(firstResult.message?.id);
+		expect(duplicate.message?.seq).toEqual(firstResult.message?.seq);
+		expect(duplicate.message?.deliveryId).toBe(firstResult.delivery.deliveryId);
+		expect(duplicate.message?.contentText).toBe("canonical");
+	});
+	test("queued user edit uses COW for a fork-shared message and keeps the recipient ref", () => {
+		const row = accepted(
+			store.enqueue({
+				kind: "user_input",
+				narratorId: "recipient",
+				requestKey: "cow-user",
+				text: "before",
+				projectedByteSize: 6,
+			}),
+		);
+		db.insert(narratorMessageRefs)
+			.values({
+				id: "fork-ref",
+				narratorId: "fork",
+				messageId: row.currentMessageId as string,
+				seq: 0,
+			})
+			.run();
+		expect(store.editUser(row.deliveryId as string, { text: "after", projectedByteSize: 5 })).toBe(
+			true,
+		);
+		const recipient = store.getByDelivery(row.deliveryId as string);
+		expect(recipient?.currentMessageId).not.toBe(row.currentMessageId);
+		expect(
+			db
+				.select({ contentText: narratorMessages.contentText })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, row.currentMessageId as string))
+				.get()?.contentText,
+		).toBe("before");
+		expect(
+			db
+				.select({ contentText: narratorMessages.contentText })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, recipient?.currentMessageId as string))
+				.get()?.contentText,
+		).toBe("after");
+		expect(
+			db
+				.select({ messageId: narratorMessageRefs.messageId })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.id, "fork-ref"))
+				.get()?.messageId,
+		).toBe(row.currentMessageId as string);
+	});
+	test("queued COW materializes the current message identity", () => {
+		const row = accepted(
+			store.enqueue({
+				kind: "user_input",
+				narratorId: "recipient",
+				requestKey: "cow-materialize",
+				text: "before",
+				projectedByteSize: 6,
+			}),
+		);
+		db.insert(narratorMessageRefs)
+			.values({
+				id: "fork-materialize-ref",
+				narratorId: "fork",
+				messageId: row.currentMessageId as string,
+				seq: 0,
+			})
+			.run();
+		expect(store.editUser(row.deliveryId as string, { text: "after", projectedByteSize: 5 })).toBe(
+			true,
+		);
+		const edited = store.getByDelivery(row.deliveryId as string);
+		if (!edited?.currentMessageId || !edited.recipientRefId)
+			throw new Error("queued COW did not retain its current identity");
+		const [claimed] = store.claimBatch("recipient", { token: "cow-token", epoch: "cow-epoch" });
+		if (!claimed) throw new Error("queued COW was not claimable");
+		const materialized = store.materialize(claim(claimed), () => {
+			throw new Error("eager COW projection should not invoke the legacy materializer");
+		});
+		expect(materialized.state).toBe("materialized");
+		expect(materialized.recipientMessageId).toBe(row.recipientMessageId);
+		expect(materialized.currentMessageId).toBe(edited.currentMessageId);
+		expect(
+			db
+				.select({ deliveryState: narratorMessageRefs.deliveryState })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.id, edited.recipientRefId))
+				.get()?.deliveryState,
+		).toBe("materialized");
+	});
+	test("cancelling a queued user removes its recipient ref but keeps the dedupe tombstone", () => {
+		const row = accepted(
+			store.enqueue({
+				kind: "user_input",
+				narratorId: "recipient",
+				requestKey: "cancel-user",
+				text: "remove",
+				projectedByteSize: 6,
+			}),
+		);
+		expect(store.cancel(row.deliveryId as string, "removed")).toBe(true);
+		expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({ state: "cancelled" });
+		expect(db.select().from(narratorMessageRefs).all()).toHaveLength(0);
+		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
+		expect(
+			store.enqueue({
+				kind: "user_input",
+				narratorId: "recipient",
+				requestKey: "cancel-user",
+				text: "different",
+				projectedByteSize: 9,
+			}).status,
+		).toBe("duplicate");
+	});
 	test("acceptance rollback rolls counter and row back", () => {
 		expect(() =>
 			db.transaction((tx) => {
@@ -296,43 +435,36 @@ describe("durable mailbox storage against generated migrations", () => {
 		).toBe(0);
 		expect(store.enqueue(input()).status).toBe("accepted");
 	});
-	test("message success/ref failure and mailbox callback failure are atomic", () => {
-		accepted(store.enqueue(input()));
+	test("eager projection is atomic and materialize never rewrites content", () => {
+		const acceptedRow = accepted(store.enqueue(input()));
+		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
+		expect(db.select().from(narratorMessageRefs).all()).toHaveLength(1);
 		const row = store.claimBatch("recipient", { token: "token", epoch: "epoch" })[0] as MailboxRow;
-		expect(() =>
-			store.materialize(claim(row), (tx, item) => {
-				tx.insert(narratorMessages)
-					.values({
-						id: item.recipientMessageId as string,
-						narratorId: item.narratorId,
-						role: "user",
-						contentJson: [],
-						createdAt: time,
-					})
-					.run();
-				throw new Error("ref write failed");
-			}),
-		).toThrow("ref write failed");
-		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
-		expect(store.getByDelivery(row.deliveryId as string)?.state).toBe("claimed");
-		expect(() =>
-			store.materialize(claim(row), (tx, item) => {
-				persist(tx, item);
-				return { messageId: "wrong", refId: "wrong" };
-			}),
-		).toThrow("reserved message");
-		expect(db.select().from(narratorMessageRefs).all()).toHaveLength(0);
-		store.failClaim(claim(row), "retry");
-		expect(materializeOne().state).toBe("materialized");
+		let callbackCalled = false;
+		const before = db.select().from(narratorMessages).all()[0];
+		const materialized = store.materialize(claim(row), () => {
+			callbackCalled = true;
+			throw new Error("materializer must not run for an eager projection");
+		});
+		expect(callbackCalled).toBe(false);
+		expect(materialized.state).toBe("materialized");
+		expect(db.select().from(narratorMessages).all()).toEqual([before]);
+		expect(store.getByDelivery(acceptedRow.deliveryId as string)?.currentMessageId).toBe(
+			acceptedRow.currentMessageId,
+		);
 	});
-	test("existing persistence onPersist transaction can bind ref and mailbox atomically", () => {
+	test("existing persistence binding adopts the eager ref without inserting a second row", () => {
 		store.enqueue(input());
 		const row = store.claimBatch("recipient", { token: "token", epoch: "epoch" })[0] as MailboxRow;
 		db.transaction((tx) => {
-			const binding = persist(tx, row);
-			store.materializeInTransaction(tx, claim(row), binding);
+			store.materializeInTransaction(tx, claim(row), {
+				messageId: row.recipientMessageId as string,
+				refId: row.recipientRefId as string,
+			});
 		});
 		expect(store.getByDelivery(row.deliveryId as string)?.state).toBe("materialized");
+		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
+		expect(db.select().from(narratorMessageRefs).all()).toHaveLength(1);
 	});
 	test("only terminated execution epoch can recover claims; stale owner cannot commit or clear", () => {
 		store.enqueue(input());
@@ -350,6 +482,34 @@ describe("durable mailbox storage against generated migrations", () => {
 		expect(() => store.failClaim(claim(old), "stale finally")).toThrow("Stale");
 		expect(store.recoverClaims("recipient", "old-epoch", { ownerTerminated: true })).toBe(0);
 		expect(store.materialize(claim(current), persist)?.state).toBe("materialized");
+	});
+	test("failed agent retry preserves canonical identity and failed content", () => {
+		const row = accepted(store.enqueue(input("failed-retry", { text: "failure body" })));
+		const beforeMessageCount = db.select().from(narratorMessages).all().length;
+		for (let retry = 0; retry < L.claimMaxAttempts; retry++) {
+			const claimed = store.claimBatch(
+				"recipient",
+				{ token: "retry-token", epoch: `retry-${retry}` },
+				{ count: 1 },
+			)[0] as MailboxRow;
+			store.failClaim(claim(claimed), "failed delivery");
+		}
+		const failed = store.getByDelivery(row.deliveryId as string);
+		expect(failed).toMatchObject({ state: "failed", currentMessageId: row.currentMessageId });
+		expect(
+			db
+				.select({ state: narratorMessageRefs.deliveryState })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.id, row.recipientRefId as string))
+				.get()?.state,
+		).toBe("failed");
+		expect(store.retryFailed(row.deliveryId as string)).toBe(true);
+		expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+			state: "queued",
+			currentMessageId: row.currentMessageId,
+		});
+		expect(db.select().from(narratorMessages).all()).toHaveLength(beforeMessageCount);
+		expect(db.select().from(narratorMessageRefs).all()).toHaveLength(1);
 	});
 	test("failed payloads retain quota, explicit cancellation keeps a negative receipt", () => {
 		for (let i = 0; i < L.agentPending; i++) store.enqueue(input(`key-${i}`));
@@ -601,6 +761,39 @@ describe("durable mailbox storage against generated migrations", () => {
 		expect(rows.map((row) => row.id)).toEqual(["old-first", "old-second"]);
 		expect(rows.every((row) => row.kind === "user_input" && !("text" in row))).toBe(true);
 		expect(store.claimBatch("recipient", { token: "t", epoch: "e" })).toHaveLength(1);
+	});
+	test("legacy repair preserves the stored role and parent binding within one bounded page", () => {
+		db.insert(narratorBufferedMessages)
+			.values({
+				id: "legacy-agent",
+				narratorId: "recipient",
+				kind: "agent_message",
+				text: "body",
+				seq: 1,
+				bufferedAt: time,
+				metadataJson: JSON.stringify({
+					history: {
+						role: "user",
+						parentToolUseId: "send-tool",
+						contentJson: [{ type: "text", text: "body" }],
+						contentText: "body",
+					},
+				}),
+			})
+			.run();
+		expect(store.repairLegacyProjections("recipient")).toBe(1);
+		const row = db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.id, "legacy-agent"))
+			.get();
+		const message = db
+			.select()
+			.from(narratorMessages)
+			.where(eq(narratorMessages.id, row?.currentMessageId as string))
+			.get();
+		expect(message).toMatchObject({ role: "user", parentToolUseId: "send-tool" });
+		expect(db.select().from(narratorMessageRefs).all()).toHaveLength(1);
 	});
 	test("large user payload uses references, cancellation never unlinks shared files", () => {
 		const row = accepted(

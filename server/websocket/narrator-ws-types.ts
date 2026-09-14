@@ -481,6 +481,9 @@ export type NarratorServerMessage =
 			outputChars: number;
 			isSegment?: boolean;
 			mode?: "blocking" | "background";
+			model?: string;
+			reasoningEffort?: string;
+			startedAt?: string;
 			/**
 			 * 1-based ordinal of the retry now in flight, present only on the
 			 * immediate broadcast emitted when a failed summary attempt is
@@ -601,6 +604,7 @@ export type NarratorServerMessage =
 			toolName: string;
 			input?: unknown;
 			streamStartedAt?: number;
+			streamCompletedAt?: number;
 			parentToolUseId?: string;
 			/**
 			 * Child-row label for the parent card's "recent calls" list. Only sent on the
@@ -896,6 +900,7 @@ export type NarratorServerMessage =
 				executing?: boolean;
 				input?: unknown;
 				streamStartedAt?: number;
+				streamCompletedAt?: number;
 				streamingOutput?: string;
 				/**
 				 * Latest determinate progress measurement, so a client that connects

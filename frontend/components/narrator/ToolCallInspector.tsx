@@ -32,6 +32,7 @@ interface ToolCallLike {
 	status?: string;
 	durationMs?: number | null;
 	streamStartedAt?: string | number | null;
+	streamCompletedAt?: string | number | null;
 	permissionStartedAt?: string | number | null;
 	executionStartedAt?: string | number | null;
 	completedAt?: string | number | null;
@@ -236,6 +237,7 @@ function LazyCopyJsonIconButton({ value, label }: { value: unknown; label: strin
 function TimingTimeline({ toolCall }: { toolCall: ToolCallLike }) {
 	const { t } = useTranslation("narrator");
 	const streamStarted = parseTime(toolCall.streamStartedAt) ?? parseTime(toolCall.createdAt);
+	const streamCompleted = parseTime(toolCall.streamCompletedAt);
 	const permissionStarted = parseTime(toolCall.permissionStartedAt);
 	const executionStarted = parseTime(toolCall.executionStartedAt);
 	const completed = parseTime(toolCall.completedAt);
@@ -246,6 +248,11 @@ function TimingTimeline({ toolCall }: { toolCall: ToolCallLike }) {
 			: null);
 	const steps = [
 		{ key: "stream", label: t("toolCallInspector.timing.streamStarted"), time: streamStarted },
+		{
+			key: "streamCompleted",
+			label: t("toolCallInspector.timing.streamCompleted"),
+			time: streamCompleted,
+		},
 		{
 			key: "permission",
 			label: t("toolCallInspector.timing.permissionStarted"),
@@ -287,10 +294,27 @@ function TimingTimeline({ toolCall }: { toolCall: ToolCallLike }) {
 				})}
 			</Timeline>
 			<Group gap="xs" wrap="wrap">
+				{streamStarted != null && streamCompleted != null && (
+					<Badge size="sm" variant="light" color="green">
+						{t("toolCallInspector.timing.streaming", {
+							duration: formatDurationText(streamCompleted - streamStarted, { style: "precise" }),
+						})}
+					</Badge>
+				)}
 				{streamStarted != null && totalEnd != null && (
 					<Badge size="sm" variant="light">
 						{t("toolCallInspector.timing.total", {
 							duration: formatDurationText(totalEnd - streamStarted, { style: "precise" }),
+						})}
+					</Badge>
+				)}
+				{streamCompleted != null && (permissionStarted != null || executionStarted != null) && (
+					<Badge size="sm" variant="light" color="orange">
+						{t("toolCallInspector.timing.postStreamingWait", {
+							duration: formatDurationText(
+								(permissionStarted ?? executionStarted ?? streamCompleted) - streamCompleted,
+								{ style: "precise" },
+							),
 						})}
 					</Badge>
 				)}

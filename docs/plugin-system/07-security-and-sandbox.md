@@ -267,7 +267,9 @@ effectiveCapabilities =
 
 ### 9.1 协议和队列
 
-**[设计建议]** 初始基线与 `02-host-architecture.md` 对齐：
+**[设计建议]** 初始基线与 `02-host-architecture.md` 对齐。下表是宿主通用 IPC 资源安全预算，保护
+runtime/transport；它不读取或强制执行 provider descriptor 的 `maxConcurrentChat` /
+`maxConcurrentGenerate`，后者由插件负责 provider 业务并发、排队与节流：
 
 | 资源 | 建议基线 | 处理 |
 |---|---:|---|

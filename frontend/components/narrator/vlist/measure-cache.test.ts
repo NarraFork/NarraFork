@@ -172,6 +172,39 @@ describe("bounded source retention", () => {
 });
 
 describe("canonical body revision", () => {
+	it("re-keys fixed-height headers when canonical delivery state changes", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const base = {
+			role: "user",
+			text: "queued input",
+			deliveryId: "delivery-1",
+			deliveryKind: "user_input",
+			deliveryState: "queued",
+		};
+		expect(extractDataRevision(base)).not.toBe(
+			extractDataRevision({ ...base, deliveryState: "materialized" }),
+		);
+		expect(extractDataRevision(base)).not.toBe(
+			extractDataRevision({ ...base, deliveryId: "delivery-2" }),
+		);
+	});
+
+	it("re-keys injection speaker/body passthroughs for same-id edits", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const base = {
+			markdown: "hello",
+			modelFacing: "hello",
+			speaker: "worker",
+			source: "subagent_message",
+		};
+		expect(extractDataRevision(base)).not.toBe(
+			extractDataRevision({ ...base, markdown: "updated" }),
+		);
+		expect(extractDataRevision(base)).not.toBe(
+			extractDataRevision({ ...base, speaker: "reviewer" }),
+		);
+	});
+
 	it("tracks format/live/source/range/revision even with identical painted text", async () => {
 		const { extractDataRevision } = await import("./measure-cache");
 		const { createSourceText } = await import("@shared/pretext-layout/source-text");

@@ -9,8 +9,8 @@ import { chapters, containerInstances, narrators, projects } from "../db/schema"
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
-import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { buildProxyUrl } from "./container-proxy";
+import { publishHistoryMessage } from "./narrator-history-publisher";
 import { narratorService } from "./narrator-service";
 import { loadOptionalTool } from "./narrator-session";
 
@@ -146,19 +146,15 @@ export function initContainerEventHandler(): void {
 					modelText: text,
 				},
 			]);
-			broadcastToNarrator(narrator.id, {
-				type: "message",
+			publishHistoryMessage(narrator.id, {
+				id: msg.id,
 				narratorId: narrator.id,
-				message: {
-					id: msg.id,
-					narratorId: narrator.id,
-					role: msg.role,
-					contentJson: msg.contentJson,
-					contentText: msg.contentText,
-					createdAt: msg.createdAt,
-					seq: msg.seq,
-					children: [],
-				},
+				role: msg.role,
+				contentJson: msg.contentJson,
+				contentText: msg.contentText,
+				createdAt: msg.createdAt,
+				seq: msg.seq,
+				children: [],
 			});
 
 			logger.info("Container ready notification injected", {

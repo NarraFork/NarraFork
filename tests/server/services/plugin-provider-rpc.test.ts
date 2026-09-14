@@ -310,7 +310,7 @@ describe("accepted streaming and operation registry", () => {
 		const stream = operation.events();
 		transport.emit(notification(operation.operationId, 2, { type: "text.delta", text: "bad" }));
 		await expect(stream.next()).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
-		expect(transport.killed.length).toBe(1);
+		expect(transport.killed.length).toBe(0);
 		expect(client.getDiagnostics().protocolErrors).toBe(1);
 	});
 
@@ -329,6 +329,51 @@ describe("accepted streaming and operation registry", () => {
 		);
 		await expect(pending).resolves.toMatchObject({ value: { type: "done" }, done: false });
 		await expect(stream.next()).resolves.toMatchObject({ done: true });
+	});
+
+	it("does not enforce the provider-declared generate concurrency limit in the host", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		const first = await client.generate(generateParams());
+		const second = await client.generate(generateParams());
+
+		expect(first.operationId).not.toBe(second.operationId);
+		expect(
+			transport.requests.filter((request) => request.method === "provider.generate"),
+		).toHaveLength(2);
+		expect(client.getDiagnostics().activeOperations).toBe(2);
+
+		for (const operation of [first, second]) {
+			const stream = operation.events();
+			transport.emit(
+				notification(operation.operationId, 1, {
+					type: "done",
+					status: "completed",
+					stopReason: "end_turn",
+				}),
+			);
+			await expect(stream.next()).resolves.toMatchObject({ value: { type: "done" }, done: false });
+			await expect(stream.next()).resolves.toMatchObject({ done: true });
+		}
+
+		expect(client.getDiagnostics().activeOperations).toBe(0);
+	});
+
+	it("releases a failed operation even when its event iterator is idle", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		const operation = await client.generate(generateParams());
+		const stream = operation.events();
+		transport.emit(notification(operation.operationId, 1, { type: "text.delta", text: "partial" }));
+		await expect(stream.next()).resolves.toMatchObject({
+			value: { type: "text.delta" },
+			done: false,
+		});
+
+		transport.crash(new Error("plugin exited"));
+
+		expect(client.getDiagnostics().activeOperations).toBe(0);
+		await expect(stream.next()).rejects.toMatchObject({ code: "UNKNOWN_RESULT" });
 	});
 });
 
@@ -409,6 +454,24 @@ describe("credit, cancellation, and late events", () => {
 		await new Promise((resolve) => queueMicrotask(resolve));
 		expect(client.getDiagnostics().lateEvents).toBe(1);
 		await expect(stream.next()).resolves.toMatchObject({ done: true });
+	});
+
+	it("validates malformed provider.event notifications instead of silently dropping them", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		transport.emit({ jsonrpc: "2.0", method: "provider.event", params: {} });
+		await new Promise((resolve) => queueMicrotask(resolve));
+		expect(client.getDiagnostics()).toMatchObject({ protocolErrors: 1, transportKilled: true });
+		expect(transport.killed).toHaveLength(1);
+	});
+
+	it("records an unknown operation event as late instead of silently dropping it", async () => {
+		const { client, transport } = await setup();
+		clients.push(client);
+		transport.emit(notification("unknown-operation", 1, { type: "text.delta", text: "unknown" }));
+		await new Promise((resolve) => queueMicrotask(resolve));
+		expect(client.getDiagnostics()).toMatchObject({ lateEvents: 1, protocolErrors: 0 });
+		expect(transport.killed).toHaveLength(0);
 	});
 
 	it("kills the transport after cancel grace when the plugin never sends done", async () => {
@@ -509,7 +572,7 @@ describe("operation limits and crash semantics", () => {
 			}),
 		);
 		await expect(stream.next()).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
-		expect(transport.killed).toHaveLength(1);
+		expect(transport.killed).toHaveLength(0);
 	});
 
 	it("cancels on operation output limits and preserves terminal reserve", async () => {
@@ -709,7 +772,7 @@ describe("operation limits and crash semantics", () => {
 		transport.acceptOperationRequest();
 		await expect(operationPromise).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
 		expect(client.getDiagnostics().activeOperations).toBe(0);
-		expect(transport.killed).toHaveLength(1);
+		expect(transport.killed).toHaveLength(0);
 	});
 
 	it.each([
@@ -731,7 +794,7 @@ describe("operation limits and crash semantics", () => {
 		transport.acceptOperationRequest();
 		await expect(operationPromise).rejects.toMatchObject({ code: "QUEUE_LIMIT" });
 		expect(client.getDiagnostics().activeOperations).toBe(0);
-		expect(transport.killed).toHaveLength(1);
+		expect(transport.killed).toHaveLength(0);
 	});
 
 	it("still rejects failed done without error when flushing", async () => {
@@ -747,7 +810,7 @@ describe("operation limits and crash semantics", () => {
 		transport.acceptOperationRequest();
 		const operation = await operationPromise;
 		await expect(operation.events().next()).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
-		expect(transport.killed).toHaveLength(1);
+		expect(transport.killed).toHaveLength(0);
 	});
 
 	it("disposes crashed operations without replacing their unknown-result safety metadata", async () => {

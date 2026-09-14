@@ -1,5 +1,6 @@
 import type { db } from "../../db";
 import type { narratorBufferedMessages } from "../../db/schema";
+import type { CanonicalMessageDraft, CanonicalTreeMessage } from "../narrator-history-projection";
 
 export type RuntimeDb = typeof db;
 export type RuntimeTx = Parameters<Parameters<RuntimeDb["transaction"]>[0]>[0];
@@ -8,6 +9,7 @@ export type MailboxRow = typeof narratorBufferedMessages.$inferSelect;
 export type MailboxKind = MailboxRow["kind"];
 export type NoticeKind = "agent" | "bash";
 export type MailboxState = MailboxRow["state"];
+export type DeliveryState = "queued" | "claimed" | "materialized" | "failed" | "cancelled";
 export interface PayloadReference {
 	storage: "buffered_file" | "upload";
 	path: string;
@@ -22,6 +24,13 @@ interface InputBase {
 	metadata?: Record<string, unknown>;
 	payloadRef?: PayloadReference;
 	createdBy?: string | null;
+	/** Reserved before canonical history construction so the envelope is self-identifying. */
+	deliveryId?: string;
+	/** Optional richer canonical row projection; runtime producers should provide it. */
+	history?: Omit<
+		CanonicalMessageDraft,
+		"narratorId" | "messageId" | "deliveryId" | "deliveryKind" | "deliveryState"
+	>;
 }
 export type MailboxInput = InputBase &
 	(
@@ -64,7 +73,7 @@ export interface MaterializedBinding {
 	revision?: number;
 }
 export type EnqueueResult =
-	| { status: "accepted" | "duplicate"; delivery: MailboxRow }
+	| { status: "accepted" | "duplicate"; delivery: MailboxRow; message?: CanonicalTreeMessage }
 	| { status: "full" | "publication_pending" };
 export type Materializer = (tx: RuntimeTx, row: MailboxRow) => MaterializedBinding;
 export type EligibleMailboxHead = Pick<

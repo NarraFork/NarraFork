@@ -60,6 +60,9 @@
 import { formatOriginLabel, type MessageOriginSource } from "@shared/message-origin";
 import type { NativeInjectionBlock } from "@shared/native-injection";
 import type { SideCarBody } from "@shared/sidecar-body";
+import { and, eq } from "drizzle-orm";
+import { db } from "../db";
+import { narratorMessages } from "../db/schema";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
@@ -279,7 +282,20 @@ async function deliverInjectionUnlocked(
 	if (!content) return EMPTY_RESULT;
 
 	const locale = options.locale ?? "en";
-	const role = options.role ?? "sys";
+	const existingRole = options.messageId
+		? db
+				.select({ role: narratorMessages.role })
+				.from(narratorMessages)
+				.where(
+					and(
+						eq(narratorMessages.id, options.messageId),
+						eq(narratorMessages.narratorId, narratorId),
+					),
+				)
+				.get()?.role
+		: undefined;
+	const role =
+		options.role ?? (existingRole === "user" || existingRole === "sys" ? existingRole : "sys");
 	const schedule = options.schedule ?? "none";
 	const block = buildSystemInjectionBlock(options.source, options.body, content);
 	const blocks = [block, ...(options.extraBlocks ?? [])];

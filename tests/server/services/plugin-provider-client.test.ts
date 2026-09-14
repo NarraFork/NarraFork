@@ -96,14 +96,16 @@ class CloseableRuntime implements ProviderRuntimeLike {
 		for (const handler of [...this.closeHandlers]) handler(error);
 	}
 
+	emitNotification(notification: JsonRpcNotification, bodyBytes?: number): void {
+		for (const handler of this.notificationHandlers) handler(notification, bodyBytes);
+	}
+
 	emit(operationId: string, seq: number, event: ProviderStreamEvent): void {
-		for (const handler of this.notificationHandlers) {
-			handler({
-				jsonrpc: "2.0",
-				method: "provider.event",
-				params: { protocolVersion: "1.0", operationId, seq, event },
-			});
-		}
+		this.emitNotification({
+			jsonrpc: "2.0",
+			method: "provider.event",
+			params: { protocolVersion: "1.0", operationId, seq, event },
+		});
 	}
 }
 
@@ -170,6 +172,79 @@ describe("PluginProviderClientPool runtime lifecycle", () => {
 		expect(runtime.notificationHandlers.size).toBe(1);
 		await expectHealthyStream(second, runtime);
 		expect(first.getDiagnostics().lateEvents).toBe(0);
+	});
+
+	it("routes malformed and unknown events through one runtime sink while isolating operation events", async () => {
+		const runtime = new CloseableRuntime();
+		const { pool, deferred: firstDeferred } = createPool(async () => runtime);
+		const secondDeferred = pool.get({
+			pluginId,
+			providerTypeId,
+			providerInstanceId: `${providerInstanceId}/second`,
+		});
+		const first = await firstDeferred.acquire();
+		const second = await secondDeferred.acquire();
+
+		runtime.emitNotification({
+			jsonrpc: "2.0",
+			method: "provider.event",
+			params: {},
+		});
+		await new Promise((resolve) => queueMicrotask(resolve));
+		expect(first.getDiagnostics()).toMatchObject({ protocolErrors: 0 });
+		expect(second.getDiagnostics()).toMatchObject({ protocolErrors: 1 });
+
+		runtime.emit("unknown-operation", 1, { type: "text.delta", text: "unknown" });
+		await new Promise((resolve) => queueMicrotask(resolve));
+		expect(first.getDiagnostics()).toMatchObject({ lateEvents: 0 });
+		expect(second.getDiagnostics()).toMatchObject({ lateEvents: 1 });
+
+		const operation = await first.chat(chatParams());
+		const stream = operation.events();
+		runtime.emit(operation.operationId, 1, {
+			type: "done",
+			status: "completed",
+			stopReason: "end_turn",
+		});
+		await expect(stream.next()).resolves.toMatchObject({ value: { type: "done" } });
+		await expect(stream.next()).resolves.toMatchObject({ done: true });
+		runtime.emit(operation.operationId, 2, { type: "text.delta", text: "late" });
+		await new Promise((resolve) => queueMicrotask(resolve));
+		expect(first.getDiagnostics()).toMatchObject({ lateEvents: 1 });
+		expect(second.getDiagnostics()).toMatchObject({ lateEvents: 1 });
+	});
+
+	it("routes active operation events only to their owning client", async () => {
+		const runtime = new CloseableRuntime();
+		const { pool, deferred: firstDeferred } = createPool(async () => runtime);
+		const secondDeferred = pool.get({
+			pluginId,
+			providerTypeId,
+			providerInstanceId: `${providerInstanceId}/second`,
+		});
+		const first = await firstDeferred.acquire();
+		const second = await secondDeferred.acquire();
+		const firstOperation = await first.chat(chatParams());
+		const secondOperation = await second.chat(chatParams());
+		const firstStream = firstOperation.events();
+		const secondStream = secondOperation.events();
+
+		runtime.emit(firstOperation.operationId, 1, {
+			type: "done",
+			status: "completed",
+			stopReason: "end_turn",
+		});
+		runtime.emit(secondOperation.operationId, 1, {
+			type: "done",
+			status: "completed",
+			stopReason: "end_turn",
+		});
+		await expect(firstStream.next()).resolves.toMatchObject({ value: { type: "done" } });
+		await expect(secondStream.next()).resolves.toMatchObject({ value: { type: "done" } });
+		await expect(firstStream.next()).resolves.toMatchObject({ done: true });
+		await expect(secondStream.next()).resolves.toMatchObject({ done: true });
+		expect(first.getDiagnostics()).toMatchObject({ lateEvents: 0, protocolErrors: 0 });
+		expect(second.getDiagnostics()).toMatchObject({ lateEvents: 0, protocolErrors: 0 });
 	});
 
 	it.each(["reset", "evict", "clear"])("releases all subscriptions on %s", async (action) => {

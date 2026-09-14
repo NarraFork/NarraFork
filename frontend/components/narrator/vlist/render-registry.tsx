@@ -88,6 +88,9 @@ export function resolveRenderExtra(spec: {
 			// the badge lives inside the already-reserved header row.
 			if ("origin" in data) extra.origin = data.origin;
 			if ("originLabel" in data) extra.originLabel = data.originLabel;
+			if ("deliveryId" in data) extra.deliveryId = data.deliveryId;
+			if ("deliveryKind" in data) extra.deliveryKind = data.deliveryKind;
+			if ("deliveryState" in data) extra.deliveryState = data.deliveryState;
 			// Slash-command bubbles fold their expansion behind a toggle; mark them so
 			// the integration layer wires onToggle (plain bubbles get no toggle).
 			if ("commandText" in data && data.commandText) extra.commandText = data.commandText;
@@ -100,6 +103,9 @@ export function resolveRenderExtra(spec: {
 			// Producer tag drives the accent rail; the speaker header is built by the
 			// integration layer (this layer imports no avatar), same as a user bubble.
 			if ("source" in data) extra.source = data.source;
+			if ("deliveryId" in data) extra.deliveryId = data.deliveryId;
+			if ("deliveryKind" in data) extra.deliveryKind = data.deliveryKind;
+			if ("deliveryState" in data) extra.deliveryState = data.deliveryState;
 			if ("speaker" in data) extra.speaker = data.speaker;
 			// Identicon seed for the header's avatar (a sender / task / entry id).
 			// Height-neutral: the header row is a fixed single line either way.

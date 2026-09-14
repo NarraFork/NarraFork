@@ -265,6 +265,8 @@ export interface ToolChunkSnapshot {
 	input?: unknown;
 	/** Timestamp from tool_started */
 	streamStartedAt?: number;
+	/** Timestamp sampled when the provider finished streaming tool input. */
+	streamCompletedAt?: number;
 	/** Latest streaming output from bash tool */
 	streamingOutput?: string;
 	/**
@@ -1008,6 +1010,7 @@ export async function processEvent(
 					...(!ctx.parentToolUseId && { input: event.input }),
 					...summaryField,
 					streamStartedAt: event.streamStartedAt,
+					streamCompletedAt: event.streamCompletedAt,
 				});
 			}
 			const selfMessage: NarratorServerMessage = {
@@ -1018,6 +1021,7 @@ export async function processEvent(
 				toolName: event.toolName,
 				input: event.input,
 				streamStartedAt: event.streamStartedAt,
+				streamCompletedAt: event.streamCompletedAt,
 			};
 			dualBroadcast(
 				ctx,
@@ -1030,6 +1034,7 @@ export async function processEvent(
 							toolUseId: event.toolUseId,
 							toolName: event.toolName,
 							streamStartedAt: event.streamStartedAt,
+							streamCompletedAt: event.streamCompletedAt,
 							...summaryField,
 						}
 					: selfMessage,
@@ -1288,6 +1293,7 @@ export async function processEvent(
 					name: block.name,
 					input: block.input,
 					streamStartedAt: block.streamStartedAt,
+					streamCompletedAt: block.streamCompletedAt,
 					outputIndex: block.outputIndex,
 					...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {}),
 				});

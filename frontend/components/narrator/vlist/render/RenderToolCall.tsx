@@ -749,6 +749,7 @@ export interface ToolTimingLabels {
 	title: string;
 	started: string;
 	streamStarted: string;
+	streamCompleted?: string;
 	permissionStarted: string;
 	executionStarted: string;
 	completed: string;
@@ -767,6 +768,7 @@ const DEFAULT_TIMING_LABELS: ToolTimingLabels = {
 	title: "Timing",
 	started: "Started",
 	streamStarted: "Tool streaming started",
+	streamCompleted: "Tool streaming completed",
 	permissionStarted: "Permission wait started",
 	executionStarted: "Execution started",
 	completed: "Execution completed",
@@ -793,6 +795,7 @@ function hasTimingDetails(timing: ToolTimingStamps | null | undefined): boolean 
 		timing.startedAt != null ||
 		timing.createdAt != null ||
 		timing.streamStartedAt != null ||
+		timing.streamCompletedAt != null ||
 		timing.permissionStartedAt != null ||
 		timing.executionStartedAt != null ||
 		timing.completedAt != null
@@ -824,7 +827,7 @@ function ToolTimingBreakdown({
 		(value): value is number => value != null,
 	);
 	const explicitStarted = explicitCandidates.length > 0 ? Math.min(...explicitCandidates) : null;
-	const { streamStartedAt, permissionStartedAt, executionStartedAt } = timing;
+	const { streamStartedAt, streamCompletedAt, permissionStartedAt, executionStartedAt } = timing;
 	const finalDurationMs = timing.durationMs ?? displayDurationMs ?? null;
 	const completed =
 		timing.completedAt ??
@@ -845,6 +848,15 @@ function ToolTimingBreakdown({
 		[
 			{ key: "started", label: labels.started, time: genericStarted },
 			{ key: "stream", label: labels.streamStarted, time: streamStartedAt },
+			...(streamCompletedAt != null
+				? [
+						{
+							key: "streamCompleted",
+							label: labels.streamCompleted ?? "Tool streaming completed",
+							time: streamCompletedAt,
+						},
+					]
+				: []),
 			{ key: "permission", label: labels.permissionStarted, time: permissionStartedAt },
 			{ key: "execution", label: labels.executionStarted, time: executionStartedAt },
 			{ key: "completed", label: labels.completed, time: completed },

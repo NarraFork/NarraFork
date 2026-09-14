@@ -67,6 +67,7 @@ export {
 	getOpenaiProviderConfig,
 	getQueueDuringCompaction,
 	getReasoningEffortBlocklist,
+	getSubagentVisibleModels,
 	getSummaryModelContextWindow,
 	getVisibleModels,
 	hasConfiguredGeminiProvider,

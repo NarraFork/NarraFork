@@ -90,6 +90,7 @@ import {
 	processEvent,
 } from "../narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "../narrator-executor";
+import { publishHistoryMessage } from "../narrator-history-publisher";
 import { deliverInjection } from "../narrator-injection";
 import { isFirstUserTurn } from "../narrator-message-count";
 import { handlePermission } from "../narrator-permission";
@@ -1364,19 +1365,15 @@ export async function runAgentLoopUnlocked(
 									},
 								],
 							);
-							broadcastToNarrator(narratorId, {
-								type: "message",
+							publishHistoryMessage(narratorId, {
+								id: knowledgeMessage.id,
 								narratorId,
-								message: {
-									id: knowledgeMessage.id,
-									narratorId,
-									role: knowledgeMessage.role,
-									contentJson: knowledgeMessage.contentJson,
-									contentText: knowledgeMessage.contentText,
-									createdAt: knowledgeMessage.createdAt,
-									seq: knowledgeMessage.seq,
-									children: [],
-								},
+								role: knowledgeMessage.role,
+								contentJson: knowledgeMessage.contentJson,
+								contentText: knowledgeMessage.contentText,
+								createdAt: knowledgeMessage.createdAt,
+								seq: knowledgeMessage.seq,
+								children: [],
 							});
 							knowledgeService.recordInjectionEvents({
 								narratorId,
@@ -1872,14 +1869,11 @@ export async function runAgentLoopUnlocked(
 							originLabel: formatOriginLabel("autoContinuation"),
 						},
 					);
-					broadcastToNarrator(narratorId, {
-						type: "user_message",
-						narratorId,
-						message: fileReferenceMessageForDisplay(userMsg),
-					});
+					const displayUserMessage = fileReferenceMessageForDisplay(userMsg);
+					publishHistoryMessage(narratorId, displayUserMessage, "user_message");
 					active.events.emit("event", {
 						type: "user_message",
-						data: fileReferenceMessageForDisplay(userMsg),
+						data: displayUserMessage,
 					});
 					await narratorService.updateStatus(narratorId, "working");
 					runState.input.text = continueText;
@@ -1956,14 +1950,11 @@ export async function runAgentLoopUnlocked(
 					createdBy,
 					originOptions,
 				);
-				broadcastToNarrator(narratorId, {
-					type: "user_message",
-					narratorId,
-					message: fileReferenceMessageForDisplay(userMsg),
-				});
+				const displayUserMessage = fileReferenceMessageForDisplay(userMsg);
+				publishHistoryMessage(narratorId, displayUserMessage, "user_message");
 				active.events.emit("event", {
 					type: "user_message",
-					data: fileReferenceMessageForDisplay(userMsg),
+					data: displayUserMessage,
 				});
 				await narratorService.updateStatus(narratorId, "working");
 				runState.input.text = promptText;
@@ -2000,14 +1991,11 @@ export async function runAgentLoopUnlocked(
 					fb.userId ?? undefined,
 					{ origin: "user" },
 				);
-				broadcastToNarrator(narratorId, {
-					type: "user_message",
-					narratorId,
-					message: fileReferenceMessageForDisplay(userMsg),
-				});
+				const displayUserMessage = fileReferenceMessageForDisplay(userMsg);
+				publishHistoryMessage(narratorId, displayUserMessage, "user_message");
 				active.events.emit("event", {
 					type: "user_message",
-					data: fileReferenceMessageForDisplay(userMsg),
+					data: displayUserMessage,
 				});
 				await narratorService.updateStatus(narratorId, "working");
 				runState.input.text = fb.feedbackText;
@@ -2032,14 +2020,11 @@ export async function runAgentLoopUnlocked(
 						undefined,
 						{ origin: "system", originLabel: formatOriginLabel("review") },
 					);
-					broadcastToNarrator(narratorId, {
-						type: "user_message",
-						narratorId,
-						message: fileReferenceMessageForDisplay(userMsg),
-					});
+					const displayUserMessage = fileReferenceMessageForDisplay(userMsg);
+					publishHistoryMessage(narratorId, displayUserMessage, "user_message");
 					active.events.emit("event", {
 						type: "user_message",
-						data: fileReferenceMessageForDisplay(userMsg),
+						data: displayUserMessage,
 					});
 					await narratorService.updateStatus(narratorId, "working");
 					runState.input.text = gitCheck.message;
@@ -2312,14 +2297,11 @@ export async function runAgentLoopUnlocked(
 					);
 					pendingBufferedDelivery = undefined;
 					cleanupBufferedTextFiles(buffered._stagingId ?? buffered.id);
-					broadcastToNarrator(narratorId, {
-						type: "user_message",
-						narratorId,
-						message: fileReferenceMessageForDisplay(userMsg),
-					});
+					const displayUserMessage = fileReferenceMessageForDisplay(userMsg);
+					publishHistoryMessage(narratorId, displayUserMessage, "user_message");
 					active.events.emit("event", {
 						type: "user_message",
-						data: fileReferenceMessageForDisplay(userMsg),
+						data: displayUserMessage,
 					});
 					await narratorService.updateStatus(narratorId, "working");
 					// runBashFirst flow: run the Bash command as an assistant tool card after the

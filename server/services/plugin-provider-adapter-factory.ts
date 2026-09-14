@@ -56,10 +56,13 @@ export interface PluginProviderAdapterFactoryOptions {
 	 */
 	resolveConfig?: (providerInstanceId: string) => Promise<Record<string, JsonValue>>;
 	/**
-	 * Resolve host-provided hints (proxy URL, concurrency budget) for each request.
+	 * Resolve host-provided hints (proxy URL and optional cooperative upstream-concurrency hint)
+	 * for each request.
 	 *
 	 * Called per-request so that settings changes take effect immediately. Returns
 	 * undefined when there is nothing to communicate; an empty object is never sent.
+	 * Provider-specific queuing/throttling remains plugin-owned; this resolver never turns
+	 * descriptor `maxConcurrent*` declarations into host admission checks.
 	 *
 	 * Receives the provider instance the call belongs to, so a per-provider policy can be
 	 * applied. Without it the host could only offer one global proxy for every plugin
@@ -84,9 +87,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Descriptor limit defaults, kept identical to the values `plugin-provider-rpc`
- * applies when normalizing a `provider.describe` result. Matching them means a
- * manifest-derived descriptor and an RPC-derived one agree on the unset case.
+ * Provider-declared descriptor defaults, kept identical to the values `plugin-provider-rpc`
+ * applies when normalizing a `provider.describe` result. The maxConcurrent* defaults describe
+ * plugin-side provider policy for the unset case; they are not host admission limits.
  */
 const DEFAULT_PROVIDER_LIMITS = {
 	maxConcurrentChat: 1,
@@ -102,9 +105,9 @@ const DEFAULT_PROVIDER_LIMITS = {
  * promises, so activation hides behind them without breaking the adapter's
  * synchronous construction contract.
  *
- * This class also injects `hostHints` (proxy URL, concurrency budget) into every
- * outgoing request. The hints are resolved per-call so settings changes and
- * concurrency state take effect immediately.
+ * This class also injects `hostHints` (proxy URL and optional cooperative upstream-concurrency
+ * hint) into every outgoing request. The hints are resolved per-call so host policy changes take
+ * effect immediately; provider-specific concurrency remains plugin-owned.
  */
 class PooledProviderRpcClient implements RemoteProviderRpcClient {
 	constructor(
@@ -141,8 +144,9 @@ class PooledProviderRpcClient implements RemoteProviderRpcClient {
 		if (!this.resolveHostHints || !this.hintsContext) return params;
 		const hints = this.resolveHostHints(this.hintsContext);
 		if (!hints) return params;
-		// Only attach if there is at least one meaningful hint
-		if (!hints.outbound?.proxyUrl && !hints.concurrency?.maxConcurrentUpstream) return params;
+		// Attach when a field is present, including an empty outbound object that explicitly
+		// clears a previously cached proxy inside the plugin.
+		if (!("outbound" in hints) && !("concurrency" in hints)) return params;
 		return { ...params, hostHints: hints };
 	}
 }

@@ -28,12 +28,14 @@ import {
 const textEncoder = new TextEncoder();
 const DEFAULT_MAX_HEADER_BYTES = 8 * 1024;
 const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
-const DEFAULT_MAX_STDOUT_BYTES = 8 * 1024 * 1024;
+// Framing and queue limits remain the primary protection. Lifetime output totals are only
+// enforced when an embedding explicitly supplies a finite value; a healthy resident plugin
+// must not be killed merely because it has served enough requests over time.
+const DEFAULT_MAX_STDOUT_BYTES = Number.MAX_SAFE_INTEGER;
 const DEFAULT_STDERR_RING_BYTES = 1024 * 1024;
-const DEFAULT_MAX_STDERR_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_STDERR_BYTES = Number.MAX_SAFE_INTEGER;
 const DEFAULT_MAX_STDERR_BYTES_PER_SECOND = 1024 * 1024;
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60_000;
-const DEFAULT_TOTAL_TIMEOUT_MS = 60 * 60_000;
 const DEFAULT_SPAWN_TIMEOUT_MS = 15_000;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000;
 const DEFAULT_ACTIVATION_TIMEOUT_MS = 30_000;
@@ -514,8 +516,9 @@ export class LocalProcessRunner {
 			...this.options,
 			...options,
 			idleTimeoutMs: options.idleTimeoutMs ?? this.options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
-			totalTimeoutMs:
-				options.totalTimeoutMs ?? this.options.totalTimeoutMs ?? DEFAULT_TOTAL_TIMEOUT_MS,
+			...((options.totalTimeoutMs ?? this.options.totalTimeoutMs)
+				? { totalTimeoutMs: options.totalTimeoutMs ?? this.options.totalTimeoutMs }
+				: {}),
 			maxBodyBytes: this.options.maxBodyBytes ?? DEFAULT_MAX_FRAME_BYTES,
 			maxOutboundBodyBytes,
 			maxStdoutBytes: this.options.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES,
@@ -1479,7 +1482,11 @@ export class PluginRuntime {
 	async request<T = unknown>(
 		method: string,
 		params?: unknown,
-		options: { signal?: AbortSignal; timeoutMs?: number } = {},
+		options: {
+			signal?: AbortSignal;
+			timeoutMs?: number;
+			priority?: "control" | "unary" | "stream";
+		} = {},
 	): Promise<T> {
 		if (!this.acceptingRequests || this._state !== "active") {
 			throw new PluginRuntimeError("Plugin runtime is not active", {
@@ -1499,7 +1506,7 @@ export class PluginRuntime {
 			const response = await this.connection.request(method, params, {
 				timeoutMs: options.timeoutMs ?? this.timeouts.rpcMs,
 				signal: options.signal,
-				priority: "unary",
+				priority: options.priority ?? "unary",
 			});
 			if ("error" in response) {
 				throw new PluginRuntimeError(response.error.message, {
@@ -1523,7 +1530,11 @@ export class PluginRuntime {
 		}
 	}
 
-	async notify(method: string, params?: unknown): Promise<void> {
+	async notify(
+		method: string,
+		params?: unknown,
+		options: { priority?: "control" | "unary" | "stream" } = {},
+	): Promise<void> {
 		if (!this.handle || (!this.acceptingRequests && this._state !== "draining")) {
 			throw new PluginRuntimeError("Plugin runtime is not writable", {
 				code: "RUNTIME_NOT_WRITABLE",
@@ -1536,7 +1547,7 @@ export class PluginRuntime {
 				kind: "transport",
 			});
 		}
-		await this.connection.notify(method, params);
+		await this.connection.notify(method, params, options);
 	}
 
 	async drain(timeoutMs = this.timeouts.drainMs): Promise<void> {

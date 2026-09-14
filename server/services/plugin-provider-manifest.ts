@@ -97,8 +97,10 @@ function capabilitiesFor(provider: ManifestProvider): Partial<ProviderTypeCapabi
 
 function limitsFor(provider: ManifestProvider): ProviderTypeLimits | undefined {
 	const declared = provider.limits;
-	// `maxConcurrency` is the older, coarser manifest field; treat it as the chat
-	// ceiling when the finer-grained `limits` block does not override it.
+	// `maxConcurrency` is the older, coarser manifest field; preserve it as the plugin's chat
+	// concurrency policy when the finer-grained `limits` block does not override it. These
+	// maxConcurrent* fields remain compatibility metadata and are not host admission limits;
+	// generic IPC safety budgets are enforced separately by the provider RPC client.
 	const maxConcurrentChat = declared?.maxConcurrentChat ?? provider.maxConcurrency;
 	const result: ProviderTypeLimits = {};
 	if (maxConcurrentChat !== undefined) result.maxConcurrentChat = maxConcurrentChat;
@@ -113,15 +115,24 @@ function limitsFor(provider: ManifestProvider): ProviderTypeLimits | undefined {
 }
 
 /**
- * A manifest `configSchema` is the *properties* map, not a whole JSON Schema
- * document, so wrap it into the object schema the registry validates against.
- * `additionalProperties: false` keeps unknown config keys from silently passing.
+ * Accept both the legacy properties-map form and a complete JSON Schema document.
+ * Complete schemas are passed through unchanged so the plugin, not the host, controls
+ * required fields and additional-property behavior.
  */
 function configSchemaFor(provider: ManifestProvider): Record<string, JsonValue> | undefined {
 	if (!provider.configSchema) return undefined;
+	const schema = provider.configSchema as Record<string, JsonValue>;
+	const isCompleteSchema =
+		"type" in schema ||
+		"properties" in schema ||
+		"required" in schema ||
+		"additionalProperties" in schema ||
+		"$defs" in schema ||
+		"$ref" in schema;
+	if (isCompleteSchema) return structuredClone(schema);
 	return {
 		type: "object",
-		properties: provider.configSchema as Record<string, JsonValue>,
+		properties: structuredClone(schema),
 		additionalProperties: false,
 	};
 }

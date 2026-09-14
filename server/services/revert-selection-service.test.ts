@@ -34,7 +34,7 @@ CREATE TABLE narrator_tool_calls (
  tool_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'success', is_background INTEGER NOT NULL DEFAULT 0,
  execution_identity_version INTEGER NOT NULL DEFAULT 1, execution_origin_tool_call_id TEXT, execution_attempt INTEGER NOT NULL DEFAULT 1,
  file_change_operation_id TEXT, execution_device_id TEXT DEFAULT 'local', execution_path_flavor TEXT DEFAULT 'posix',
- resolved_file_path TEXT, canonical_file_path TEXT, runtime_generation INTEGER DEFAULT 1, is_file_history_checkpoint INTEGER NOT NULL DEFAULT 0,
+ resolved_file_path TEXT, canonical_file_path TEXT, runtime_generation INTEGER DEFAULT 1, execution_segment_id TEXT, is_file_history_checkpoint INTEGER NOT NULL DEFAULT 0,
  input_json TEXT, output_json TEXT, execution_targets_json TEXT
 );
 CREATE INDEX idx_toolcalls_message ON narrator_tool_calls(message_id);
@@ -49,7 +49,7 @@ CREATE TABLE file_change_scopes (
 );
 INSERT INTO file_change_scopes VALUES('scope','installation','local','workspace','posix','/repo','active');
 CREATE TABLE file_change_operations (
- id TEXT PRIMARY KEY, evidence_version INTEGER NOT NULL DEFAULT 2, source_instance_id TEXT NOT NULL DEFAULT 'installation',
+ id TEXT PRIMARY KEY, execution_segment_id TEXT, evidence_version INTEGER NOT NULL DEFAULT 2, source_instance_id TEXT NOT NULL DEFAULT 'installation',
  source_kind TEXT NOT NULL DEFAULT 'tool', source_id TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 1,
  tool_call_id TEXT, narrator_id TEXT, project_id TEXT, request_digest TEXT,
  execution_binding_json TEXT DEFAULT '{"deviceId":"local","runtimeEpoch":"test","runtimeGeneration":1,"fencingToken":0}',
@@ -68,6 +68,8 @@ CREATE TABLE file_change_effects (
  identity_json TEXT NOT NULL, before_state_json TEXT NOT NULL, intended_after_state_json TEXT NOT NULL, observed_after_state_json TEXT NOT NULL, execution_receipt_json TEXT
 );
 CREATE UNIQUE INDEX idx_fc_effect_operation_file ON file_change_effects(operation_id,file_key,phase);
+CREATE TABLE file_change_execution_segments (id TEXT PRIMARY KEY, narrator_id TEXT NOT NULL, parent_segment_id TEXT);
+CREATE INDEX idx_fc_segment_parent ON file_change_execution_segments(parent_segment_id);
 CREATE TABLE chapter_commits (id TEXT PRIMARY KEY, narrator_message_id TEXT);
 CREATE INDEX idx_chapter_commits_narrator_message ON chapter_commits(narrator_message_id);
 CREATE TABLE spec_file_revisions (id TEXT PRIMARY KEY, source_message_id TEXT);
@@ -155,7 +157,13 @@ function message(
 function tool(
 	seq: number,
 	name = "Write",
-	options: { messageId?: string; narratorId?: string; providerId?: string; id?: string } = {},
+	options: {
+		messageId?: string;
+		narratorId?: string;
+		providerId?: string;
+		id?: string;
+		segment?: string;
+	} = {},
 ) {
 	const id = options.id ?? `tool-${serial++}`;
 	const providerId = options.providerId ?? `provider-${serial++}`;
@@ -168,7 +176,18 @@ function tool(
 			"INSERT INTO narrator_tool_calls(id,narrator_id,message_id,tool_use_id,tool_name,resolved_file_path,canonical_file_path) VALUES(?,?,?,?,?,?,?)",
 		)
 		.run(id, narratorId, messageId, providerId, name, `/repo/${id}`, `/repo/${id}`);
+	if (options.segment)
+		sqlite
+			.query("UPDATE narrator_tool_calls SET execution_segment_id=? WHERE id=?")
+			.run(options.segment, id);
 	return { id, messageId, providerId, narratorId };
+}
+function segment(id: string, narratorId: string, parentId: string | null = null) {
+	sqlite
+		.query(
+			"INSERT INTO file_change_execution_segments(id,narrator_id,parent_segment_id) VALUES(?,?,?)",
+		)
+		.run(id, narratorId, parentId);
 }
 function journal(t: ReturnType<typeof tool>, count = 1, origin = t.id) {
 	const id = `op-${serial++}`;
@@ -477,7 +496,10 @@ describe("complete mutation candidates, not just successful writes", () => {
 		const result = await collect();
 		expect(result.tools.map((t) => t.id)).toEqual([unknown.id, pending.id]);
 		expect(result.evidenceComplete).toBe(false);
-		expect(hasIssue(result, "FILE_JOURNAL_MISSING")).toBe(true);
+		expect(result.noDiskTools).toContainEqual({
+			toolCallId: unknown.id,
+			reason: "non_file_change",
+		});
 		expect(hasIssue(result, "EFFECT_UNRESOLVED")).toBe(true);
 	});
 	test("explicit fixed no-dispatch zero-effect terminal is distinct from a missing effect journal", async () => {
@@ -582,11 +604,12 @@ describe("complete mutation candidates, not just successful writes", () => {
 			)
 			.run(t.id);
 		let result = await collect();
-		expect(hasIssue(result, "BACKGROUND_UNRESOLVED")).toBe(true);
-		expect(hasIssue(result, "FILE_JOURNAL_MISSING")).toBe(true);
+		expect(hasIssue(result, "BACKGROUND_UNRESOLVED")).toBe(false);
+		expect(result.evidenceComplete).toBe(true);
+		expect(result.noDiskTools).toContainEqual({ toolCallId: t.id, reason: "non_file_change" });
 		sqlite.query("UPDATE background_tasks SET status='failed'").run();
 		result = await collect();
-		expect(result.evidenceComplete).toBe(false);
+		expect(result.evidenceComplete).toBe(true);
 		expect(result.tools).toHaveLength(1);
 	});
 	test("operation binding/expected count and reverse pins are not silently trusted", async () => {
@@ -662,6 +685,50 @@ describe("derived history requires actual origins and fresh authorization", () =
 			.run(parent.providerId, child.messageId);
 		return { parent, child };
 	}
+	test("parent Task selects child initial segment and recursively includes grandchild", async () => {
+		const parent = tool(1, "Task", { segment: "parent" });
+		segment("parent", "root");
+		narrator("child");
+		sqlite
+			.query(
+				"UPDATE narrators SET type='subagent',parent_narrator_id='root',origin_tool_call_id=? WHERE id='child'",
+			)
+			.run(parent.id);
+		segment("child-initial", "child", "parent");
+		const child = tool(1, "Task", { narratorId: "child", segment: "child-initial" });
+		narrator("grandchild");
+		sqlite
+			.query(
+				"UPDATE narrators SET type='subagent',parent_narrator_id='child',origin_tool_call_id=? WHERE id='grandchild'",
+			)
+			.run(child.id);
+		segment("grandchild-initial", "grandchild", "child-initial");
+		const grandchild = tool(1, "Write", {
+			narratorId: "grandchild",
+			segment: "grandchild-initial",
+		});
+		journal(grandchild);
+		const result = await collect();
+		expect(result.effects).toHaveLength(1);
+	});
+	test("child writes in another segment are excluded explicitly", async () => {
+		const { parent, child } = childFixture();
+		segment("parent", "root");
+		sqlite
+			.query("UPDATE narrator_tool_calls SET execution_segment_id='parent' WHERE id=?")
+			.run(parent.id);
+		segment("child-initial", "child", "parent");
+		sqlite
+			.query("UPDATE narrator_tool_calls SET execution_segment_id='child-initial' WHERE id=?")
+			.run(child.id);
+		const later = tool(2, "Write", { narratorId: "child", segment: "other" });
+		journal(later);
+		const result = await collect();
+		expect(result.noDiskTools).toContainEqual({
+			toolCallId: later.id,
+			reason: "outside_selected_call",
+		});
+	});
 	test("exact child origin recursively includes child refs/tools/effects and COW budget", async () => {
 		const { parent, child } = childFixture();
 		const result = await collect();

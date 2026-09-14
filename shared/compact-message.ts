@@ -60,6 +60,17 @@ export interface CompactMessageDetail {
 	error?: string;
 	mode?: CompactMessageMode;
 	trigger?: CompactMessageTrigger | string;
+	model?: string;
+	reasoningEffort?: string;
+	startedAt?: string;
+	finishedAt?: string;
+	/** Live text is returned only by the on-demand detail/stream endpoints. */
+	output?: string;
+	thinking?: string;
+	outputChars?: number;
+	thinkingChars?: number;
+	outputTruncated?: boolean;
+	thinkingTruncated?: boolean;
 	contextPercentBefore?: number;
 	contextPercentAfter?: number;
 	attempts: CompactAttempt[];

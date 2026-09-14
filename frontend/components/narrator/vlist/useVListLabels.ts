@@ -80,6 +80,7 @@ export interface VListTimingLabels {
 	title: string;
 	started: string;
 	streamStarted: string;
+	streamCompleted: string;
 	permissionStarted: string;
 	executionStarted: string;
 	completed: string;
@@ -477,6 +478,7 @@ export function useVListLabels(): VListLabels {
 			title: t("toolCallInspector.timing.title"),
 			started: t("toolCallInspector.timing.started"),
 			streamStarted: t("toolCallInspector.timing.streamStarted"),
+			streamCompleted: t("toolCallInspector.timing.streamCompleted"),
 			permissionStarted: t("toolCallInspector.timing.permissionStarted"),
 			executionStarted: t("toolCallInspector.timing.executionStarted"),
 			completed: t("toolCallInspector.timing.completed"),

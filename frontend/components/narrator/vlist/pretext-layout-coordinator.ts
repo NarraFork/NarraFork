@@ -41,7 +41,7 @@ import {
 	type PretextDocumentLoadOptions,
 } from "./pretext-document-loader";
 import { trimClockNow, trimLoadedHead } from "./vlist-head-trim";
-import { appendLoadedMessage } from "./vlist-message-append";
+import { appendLoadedMessage, upsertLoadedMessage } from "./vlist-message-append";
 import { insertLoadedMessage } from "./vlist-message-insert";
 import { removeLoadedMessages } from "./vlist-message-remove";
 import { type ReplaceAliases, replaceLoadedMessage } from "./vlist-message-replace";
@@ -536,6 +536,32 @@ export class PretextLayoutCoordinator {
 			view?.viewportHeight ?? this.lastViewportHeight,
 			generation,
 			true,
+		);
+		return true;
+	}
+
+	/**
+	 * Apply a realtime/catch-up canonical message exactly once by id + seq.
+	 * Existing rows are replaced in place so delivery-state transitions repaint without
+	 * creating a second bubble; genuinely new tail rows use the append path's geometry.
+	 */
+	upsertMessage(message: TreeMessage, isSubagent: boolean, getView?: () => PrependView): boolean {
+		if (!this.input || !this.lastBuildOptions) return false;
+		const result = upsertLoadedMessage(this.input.messages, message, isSubagent);
+		if (!result.changed) return false;
+		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
+		this.scheduleKatexForSyncPath([message], getView);
+		const view = getView?.();
+		const anchor =
+			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
+		const generation = ++this.generation;
+		this.commitLayout(
+			this.input,
+			this.lastBuildOptions,
+			anchor,
+			view?.viewportHeight ?? this.lastViewportHeight,
+			generation,
+			result.appended,
 		);
 		return true;
 	}

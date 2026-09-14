@@ -51,6 +51,7 @@ import {
 import type { Locale } from "../lib/prompt-i18n";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundTaskService } from "./background-task-service";
+import { publishHistoryMessage, publishHistoryUpdate } from "./narrator-history-publisher";
 import { narratorService } from "./narrator-service";
 import { parseTurnPauseTiming } from "./narrator-turn-timing";
 import { registerAndPersistSubagentAlias } from "./subagent-alias";
@@ -1329,11 +1330,7 @@ export async function markRecoveryCardResolved(input: {
 		where: eq(narratorMessages.id, input.messageId),
 	});
 	if (!updated) return;
-	broadcastToNarrator(input.narratorId, {
-		type: "message_updated",
-		narratorId: input.narratorId,
-		message: { ...updated, children: [] },
-	});
+	publishHistoryUpdate(input.narratorId, { ...updated, children: [] });
 }
 
 export function buildRecoveryNotifyPrompt(entries: Array<{ alias: string }>): string {
@@ -1391,10 +1388,10 @@ export async function startRecoveryAwaitBatch(input: {
 	for (const call of persisted?.toolCalls ?? []) {
 		toolCallIdByUseId.set(call.toolUseId, call.id);
 	}
-	broadcastToNarrator(input.narratorId, {
-		type: "message",
-		narratorId: input.narratorId,
-		message: { ...(persisted ?? message), seq: message.seq, children: [] },
+	publishHistoryMessage(input.narratorId, {
+		...(persisted ?? message),
+		seq: message.seq,
+		children: [],
 	});
 	for (const block of blocks) {
 		broadcastToNarrator(input.narratorId, {

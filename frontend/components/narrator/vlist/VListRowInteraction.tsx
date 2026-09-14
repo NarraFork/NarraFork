@@ -54,6 +54,7 @@ import {
 	IconMessageQuestion,
 	IconPencil,
 	IconPlayerStop,
+	IconRefresh,
 	IconTrash,
 	IconX,
 } from "@tabler/icons-react";
@@ -257,6 +258,8 @@ export function VListRowInteraction({
 		msgCtx.onDeleteBlock ||
 		msgCtx.onRollbackToBlock ||
 		msgCtx.onEditMessage ||
+		msgCtx.onCancelQueued ||
+		msgCtx.onRetryQueued ||
 		onViewOriginal;
 
 	// Card-specific (command-style) items, mirroring what the chunked
@@ -421,6 +424,29 @@ export function VListRowInteraction({
 					}}
 				>
 					{tNarrator("contextMenu_edit")}
+				</Menu.Item>
+			)}
+			{msgCtx.onRetryQueued && (
+				<Menu.Item
+					leftSection={<IconRefresh size={14} />}
+					onClick={() => {
+						msgCtx.onRetryQueued?.();
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("queuedRetry")}
+				</Menu.Item>
+			)}
+			{msgCtx.onCancelQueued && (
+				<Menu.Item
+					color="red"
+					leftSection={<IconPlayerStop size={14} />}
+					onClick={() => {
+						msgCtx.onCancelQueued?.();
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("cancelBuffer")}
 				</Menu.Item>
 			)}
 			{msgCtx.onRollbackToBlock && blockIndex != null && (

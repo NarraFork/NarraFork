@@ -61,12 +61,14 @@ export type ReflectionDecision = "allow" | "deny" | "aborted" | (string & {});
 export function toolStartedPatch(opts: {
 	toolUseId: string;
 	streamStartedAt?: number;
+	streamCompletedAt?: number;
 	input?: Record<string, unknown>;
 }): LivePatch {
 	const fields: Record<string, unknown> = {
 		status: "initializing",
 		startedAt: opts.streamStartedAt ?? Date.now(),
 		...(opts.streamStartedAt != null ? { streamStartedAt: opts.streamStartedAt } : {}),
+		...(opts.streamCompletedAt != null ? { streamCompletedAt: opts.streamCompletedAt } : {}),
 		...(opts.input ? { inputJson: opts.input } : {}),
 	};
 	// Await-style tools carry their own timeout on the input; the header shows it.

@@ -2140,6 +2140,31 @@ export function applyExactScrollCorrection(
 }
 
 /**
+ * Resolve the revision deltas for one reconnect catch-up batch.
+ *
+ * A batch emits one message revision even when it carries multiple top-level
+ * messages. Only a batch with at least one locally applied top-level message
+ * advances the applied revision; the other cases preserve the existing
+ * initial-sync/orphan/subagent behavior.
+ */
+export function resolveExactCatchUpRevisionDelta(input: {
+	initialSync: boolean;
+	topLevelCount: number;
+	applied: boolean;
+	orphanChildrenCount: number;
+	subagentActivitiesCount: number;
+}): { messageRevisionDelta: 0 | 1; appliedRevisionDelta: 0 | 1 } {
+	const shouldBump =
+		input.applied ||
+		input.topLevelCount > 0 ||
+		(!input.initialSync && (input.orphanChildrenCount > 0 || input.subagentActivitiesCount > 0));
+	return {
+		messageRevisionDelta: shouldBump ? 1 : 0,
+		appliedRevisionDelta: input.applied ? 1 : 0,
+	};
+}
+
+/**
  * Thin boolean view of {@link resolveExactReloadDecision}, retained so existing
  * callers/tests keep a stable entry point. The shell itself uses the full decision
  * because it also needs the `deferred` flag to drive the unread affordance.
@@ -3286,8 +3311,8 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		// Latest-value ref for the in-place append. The WS handlers below are registered
 		// once, so they must not close over one render's callback. Declared before
 		// usePretextDocument because the assignment reads that hook's result.
-		const appendMessageRef = useRef<(message: TreeMessage) => boolean>(() => false);
-		// Same latest-value contract as appendMessageRef, for the mid-window structural
+		const upsertMessageRef = useRef<(message: TreeMessage) => boolean>(() => false);
+		// Same latest-value contract as upsertMessageRef, for the mid-window structural
 		// insert (a compact marker the append path declines) and the two in-place
 		// history mutations (delete / trailing-block truncation).
 		const insertMessageRef = useRef<(message: TreeMessage) => boolean>(() => false);
@@ -3393,7 +3418,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			onScrollTopCorrection,
 			isSubagent,
 		});
-		appendMessageRef.current = pretextDocument.appendMessage;
+		upsertMessageRef.current = pretextDocument.upsertMessage;
 		insertMessageRef.current = pretextDocument.insertMessage;
 		removeMessagesRef.current = pretextDocument.removeMessages;
 		replaceMessageRef.current = pretextDocument.replaceMessage;
@@ -3481,25 +3506,14 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			initialRevisionSyncRef.current = true;
 		}, [revisionSubscriptionId]);
 
-		// A landed message EXTENDS the loaded window in place when it can (see
-		// vlist-message-append): the body arrives in the event, so answering it with a
-		// tail refetch bought nothing but latency — and because a reload replaces the
-		// whole window it had to be deferred while the reader was scrolled up, which is
-		// what made the view knowingly fall behind during a live turn.
-		//
-		// Anything the append rules do not accept falls through to the structural
-		// reload, which is always correct — with ONE class of exception: a compact
-		// marker that lands mid-window (a segment compact, or a custom compact with a
-		// `beforeMessageId`) is placed exactly by the in-place insert, so the reader
-		// watching that segment sees the marker appear where it belongs instead of
-		// after they scroll back to the bottom. `appendMessage`/`insertMessage`
-		// returning false is that signal.
-		const appendOrReload = useCallback(
+		// Every realtime/catch-up message is a canonical projection, not a one-shot
+		// append. Upsert by id + seq first so a duplicate event cannot create a second
+		// bubble, while a later delivery-state or edit event still replaces the loaded row.
+		// New mid-window rows fall back to the structural reload; compact markers keep
+		// their existing exact insert fast path.
+		const upsertOrReload = useCallback(
 			(message: TreeMessage | undefined) => {
-				if (message && appendMessageRef.current(message)) {
-					// Applied locally: keep the applied revision in step so the reload gate
-					// does not see this message as still pending (which would surface a false
-					// "new messages" affordance and then refetch what is already on screen).
+				if (message && upsertMessageRef.current(message)) {
 					appliedMessageRevisionRef.current += 1;
 				} else if (
 					message &&
@@ -3555,7 +3569,12 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 					replacementMessageId?: string;
 				},
 			) => {
-				if (message && replaceMessageRef.current(message, aliases)) {
+				// Same-id updates (including queued → claimed/materialized/failed and
+				// canonical user edits) use the id+seq upsert path. Alias-bearing COW
+				// replacements still use the legacy replacement guard below.
+				if (message && !aliases && upsertMessageRef.current(message)) {
+					appliedMessageRevisionRef.current += 1;
+				} else if (message && replaceMessageRef.current(message, aliases)) {
 					appliedMessageRevisionRef.current += 1;
 				} else if (
 					message &&
@@ -3582,9 +3601,9 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			revisionSubscriptionId,
 			{
 				onMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
-					appendOrReload(wsData.message),
+					upsertOrReload(wsData.message),
 				onUserMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
-					appendOrReload(wsData.message),
+					upsertOrReload(wsData.message),
 				onMessageUpdated: replaceOrReload,
 				onMessagesDeleted: removeOrReload,
 				// A segment compact hides its compressed messages through this dedicated
@@ -3626,12 +3645,19 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
 					const initialSync = initialRevisionSyncRef.current;
 					initialRevisionSyncRef.current = false;
-					if (
-						topLevel.length > 0 ||
-						(!initialSync && (orphanChildren.length > 0 || subagentActivities.length > 0))
-					) {
-						bumpMessageRevision();
+					let applied = false;
+					for (const message of topLevel) {
+						if (upsertMessageRef.current(message)) applied = true;
 					}
+					const revisionDelta = resolveExactCatchUpRevisionDelta({
+						initialSync,
+						topLevelCount: topLevel.length,
+						applied,
+						orphanChildrenCount: orphanChildren.length,
+						subagentActivitiesCount: subagentActivities.length,
+					});
+					appliedMessageRevisionRef.current += revisionDelta.appliedRevisionDelta;
+					if (revisionDelta.messageRevisionDelta > 0) bumpMessageRevision();
 				},
 				onSyncOk: () => {
 					initialRevisionSyncRef.current = false;
@@ -3662,6 +3688,12 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			enabled: !!revisionSubscriptionId,
 			isSubagent: !!isSubagent,
 			applyLivePatch: pretextDocument.applyLivePatch,
+			// A terminal event can race the initial exact-document load: the synthetic
+			// streaming row has the completed output, but the persisted message is not
+			// in the coordinator yet, so an in-place patch necessarily misses. Re-run
+			// the normal authoritative load instead of leaving the later expansion with
+			// the pre-completion empty detail.
+			onUnappliedToolCompletion: bumpMessageRevision,
 		});
 
 		// Structural reload gate — now the FALLBACK, not the normal path.
@@ -5975,8 +6007,9 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 					},
 				);
 				const specKey = item.spec.key;
+				const queued = handlers.resolveQueuedMessage?.(messageId);
 				const actions = buildRowCtxActions(
-					{ messageId, blockIndex, blockIndices, editable: !!editTarget },
+					{ messageId, blockIndex, blockIndices, editable: !!editTarget, queued },
 					editTarget
 						? {
 								...handlers,

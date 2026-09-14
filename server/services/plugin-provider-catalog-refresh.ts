@@ -49,6 +49,8 @@ export interface ProviderCatalogRefreshResult {
 	error?: string;
 	/** True when the provider does not support model discovery at all. */
 	skipped?: boolean;
+	/** True when the catalog had another page but the refresh page budget stopped early. */
+	truncated?: boolean;
 }
 
 export interface PluginProviderCatalogRefresherOptions {
@@ -226,6 +228,7 @@ export class PluginProviderCatalogRefresher {
 			let catalogVersion: string | undefined;
 			let stale = false;
 			let pagesFetched = 0;
+			let truncated = false;
 
 			// The plugin may need credentials from config to enumerate models. Resolved once
 			// for the whole pagination run: the pages form a single logical operation, and
@@ -268,6 +271,7 @@ export class PluginProviderCatalogRefresher {
 				seenCursors.add(next);
 				cursor = next;
 			}
+			truncated = Boolean(cursor);
 			const collected = [...models.values()];
 
 			this.registry.updateModelCatalog(entry.providerInstanceId, collected, {
@@ -294,6 +298,7 @@ export class PluginProviderCatalogRefresher {
 				modelCount: collected.length,
 				...(catalogVersion ? { catalogVersion } : {}),
 				stale,
+				...(truncated ? { truncated: true } : {}),
 			};
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);

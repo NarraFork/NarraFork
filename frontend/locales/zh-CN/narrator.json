@@ -6,6 +6,7 @@
 	"queuedRetrySuccess": "消息已重新排队。",
 	"queuedRetryFailed": "重试请求失败：{{error}}",
 	"queuedFailedCount": "{{count}} 条失败",
+	"queuedExecutionOnly": "执行队列",
 	"publicShares": {
 		"title": "公开分享链接",
 		"distinction": "持链接者无需登录即可查看，与上方“所有已登录用户可见”是独立设置。只有所有者或管理员能管理链接。",
@@ -153,6 +154,10 @@
 		"failed": "失败"
 	},
 	"compactRetryModel": "本次重试模型",
+	"saveSummaryModel": "永久使用此摘要模型",
+	"saveSummaryModelFailed": "保存摘要模型失败",
+	"compactElapsed": "已用时 {{elapsed}}",
+	"compactModelMeta": "模型：{{model}} · 思考强度：{{effort}}",
 	"compactLifecycleMeta": "模式：{{mode}} · 触发：{{trigger}} · 上下文：{{before}}% → {{after}}%",
 	"compactSummaryTitle": "压缩摘要",
 	"triggerCompact": "立即压缩",
@@ -266,7 +271,6 @@
 	"resumeContentFollow": "恢复跟随",
 	"contentViewport": "可滚动内容",
 	"contentSourceIncomplete": "[当前仅有保留的源预览。复制包含这些可用内容，不包含缺失的原文。]",
-
 	"diffReadRangeExpired": "阅读位置已超出保留的源范围。",
 	"diffReadVersionChanged": "源版本已变化，现显示首个可用行。",
 	"diffSourcePreview": "当前为有界差异预览，部分源内容不可用。",
@@ -1505,7 +1509,10 @@
 			"completed": "执行完毕",
 			"total": "总耗时 {{duration}}",
 			"permissionWait": "权限等待 {{duration}}",
-			"execution": "执行 {{duration}}"
+			"execution": "执行 {{duration}}",
+			"streamCompleted": "流式输出完毕",
+			"streaming": "流式耗时：{{duration}}",
+			"postStreamingWait": "流式结束后等待：{{duration}}"
 		}
 	},
 	"toolbar": {

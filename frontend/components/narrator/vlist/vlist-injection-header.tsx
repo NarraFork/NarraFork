@@ -145,6 +145,17 @@ export function isKnowledgeSource(source: string | null | undefined): boolean {
 	return !!source && KNOWLEDGE_SOURCES.has(source);
 }
 
+type DeliveryState = "queued" | "claimed" | "materialized" | "failed" | "cancelled";
+
+function resolveDeliveryBadge(state: DeliveryState | null | undefined, t: (key: string) => string) {
+	if (state === "queued" || state === "claimed") {
+		return { label: t("status_queued"), color: "yellow" as const };
+	}
+	if (state === "failed") return { label: t("communicationError"), color: "red" as const };
+	if (state === "cancelled") return { label: t("communicationCancelled"), color: "gray" as const };
+	return null;
+}
+
 export function InjectionSpeakerHeader({
 	speaker,
 	speakerId,
@@ -152,6 +163,7 @@ export function InjectionSpeakerHeader({
 	isBroadcast,
 	creator,
 	source,
+	deliveryState,
 	onOpenSession,
 	openSessionLabel,
 	narratorId,
@@ -180,6 +192,8 @@ export function InjectionSpeakerHeader({
 	 * otherwise would be the mirror image of the "System" bug this replaced.
 	 */
 	creator?: BubbleCreator | null;
+	/** Canonical mailbox/outbox lifecycle, shown only while delivery is unresolved. */
+	deliveryState?: DeliveryState | null;
 	/** Producer tag, used only to recognize platform-authored rows. */
 	source?: string | null;
 	/**
@@ -197,6 +211,7 @@ export function InjectionSpeakerHeader({
 	narratorId?: string;
 }) {
 	const { t } = useTranslation("narrator");
+	const deliveryBadge = resolveDeliveryBadge(deliveryState, t);
 	// Identity resolution, in priority order:
 	//   1. a real account (merge_summary) → that person's name and avatar
 	//   2. the platform (container / scheduler / browser) → one shared NarraFork identity
@@ -309,6 +324,11 @@ export function InjectionSpeakerHeader({
 			{isBroadcast ? (
 				<Badge size="xs" variant="light" color="gray" style={{ flexShrink: 0 }}>
 					{t("sidecar.body.messageBroadcast")}
+				</Badge>
+			) : null}
+			{deliveryBadge ? (
+				<Badge size="xs" variant="light" color={deliveryBadge.color} style={{ flexShrink: 0 }}>
+					{deliveryBadge.label}
 				</Badge>
 			) : null}
 		</Group>
@@ -437,6 +457,7 @@ export function injectInjectionBubbleChrome(
 			speakerKind={(extra.speakerKind as string | null | undefined) ?? null}
 			isBroadcast={extra.isBroadcast === true}
 			creator={(extra.creator as BubbleCreator | null | undefined) ?? null}
+			deliveryState={(extra.deliveryState as DeliveryState | null | undefined) ?? null}
 			source={(extra.source as string | null | undefined) ?? null}
 			onOpenSession={openSession}
 			openSessionLabel={target ? navigation?.labels?.[target.kind] : undefined}

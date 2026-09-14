@@ -661,7 +661,15 @@ export default defineConfig(({ mode, command }) => {
 		},
 		server: {
 			port: vitePort,
+			// Keep the configured port stable so Vite's HMR client can use it as the
+			// client-side port without falling back to its wildcard-host target
+			// (which Vite resolves to localhost when host is 0.0.0.0).
+			strictPort: true,
 			host: "0.0.0.0",
+			// A non-null clientPort disables Vite's direct HMR fallback. The initial
+			// connection still uses the page's host/protocol and the configured base,
+			// so a reverse proxy never gets a localhost fallback URL.
+			hmr: { clientPort: vitePort },
 			allowedHosts: [
 				"narraforkhotreloadorigin.narrafork.dev",
 				"nfgotest1.narrafork.dev",

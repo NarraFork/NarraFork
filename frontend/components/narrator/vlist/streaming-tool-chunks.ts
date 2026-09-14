@@ -176,6 +176,7 @@ export interface ToolStartedEvent {
 	toolUseId: string;
 	toolName: string;
 	streamStartedAt?: number;
+	streamCompletedAt?: number;
 	input?: Record<string, unknown>;
 	metadata?: Record<string, unknown>;
 }
@@ -280,6 +281,7 @@ export function applyStreamingToolStarted(
 				}
 			: {}),
 		...(event.streamStartedAt != null ? { _startedAt: event.streamStartedAt } : {}),
+		...(event.streamCompletedAt != null ? { streamCompletedAt: event.streamCompletedAt } : {}),
 		...(event.metadata ? { _metadata: event.metadata } : {}),
 	});
 	return true;

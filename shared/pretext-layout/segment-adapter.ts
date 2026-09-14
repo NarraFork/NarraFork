@@ -212,6 +212,19 @@ export interface AdapterMessage {
 	tokensIn?: number | null;
 	costUsd?: number | null;
 	meterUsage?: number | null;
+	/** Eager mailbox/outbox delivery lifecycle projected onto the canonical message. */
+	deliveryId?: string | null;
+	deliveryKind?: "user_input" | "agent_message" | "task_notice" | null;
+	deliveryState?: "queued" | "claimed" | "materialized" | "failed" | "cancelled" | null;
+}
+
+function deliveryProjection(message?: AdapterMessage): Record<string, unknown> {
+	if (!message?.deliveryId) return {};
+	return {
+		deliveryId: message.deliveryId,
+		deliveryKind: message.deliveryKind ?? null,
+		deliveryState: message.deliveryState ?? null,
+	};
 }
 
 /** A tool-run item (structural subset of message-segments ToolRunItem).
@@ -1226,6 +1239,7 @@ function adaptContextBlocks(
 			idBase,
 			index,
 			modelText,
+			msg,
 			ctx,
 		);
 		if (spoken) {
@@ -1334,7 +1348,14 @@ function adaptMessage(
 				(blocks[injectionIndex]?.type === "system_injection"
 					? (blocks[injectionIndex]?.modelText ?? "")
 					: "");
-			const spoken = adaptSpokenInjection(injection, idBase, injectionIndex, modelFacingText, ctx);
+			const spoken = adaptSpokenInjection(
+				injection,
+				idBase,
+				injectionIndex,
+				modelFacingText,
+				msg,
+				ctx,
+			);
 			if (spoken) return spoken;
 		}
 		// Older Send rows have attribution but no structured body. Keep their COMPLETE
@@ -1427,6 +1448,9 @@ function adaptMessage(
 					// the "计划反思" identity instead of falling back to "you" on the right.
 					origin: msg.origin ?? null,
 					originLabel: msg.originLabel ?? null,
+					...(msg.deliveryId ? { deliveryId: msg.deliveryId } : {}),
+					...(msg.deliveryKind ? { deliveryKind: msg.deliveryKind } : {}),
+					...(msg.deliveryState ? { deliveryState: msg.deliveryState } : {}),
 					...(commandText ? { commandText } : {}),
 					...(attachments.length > 0 ? { attachments } : {}),
 				},
@@ -1472,7 +1496,7 @@ function adaptMessage(
 			blocks.find((b) => b.type === "system_injection" && typeof b.modelText === "string")
 				?.modelText ??
 			"";
-		const spoken = adaptSpokenInjection(sysBlock, idBase, blockIndex, modelFacingText, ctx);
+		const spoken = adaptSpokenInjection(sysBlock, idBase, blockIndex, modelFacingText, msg, ctx);
 		if (spoken) return [...specs, ...spoken];
 		// Server-authored FACTS that still have an author (a person merged a branch, the
 		// platform brought a container up). Those are statements in the conversation, so
@@ -2336,6 +2360,7 @@ function adaptSpokenInjection(
 	idBase: string,
 	blockIndex: number,
 	modelFacingText: string,
+	msg: AdapterMessage,
 	ctx: AdapterContext,
 ): ElementSpec[] | null {
 	if (block.type !== "system_injection") return null;
@@ -2367,6 +2392,7 @@ function adaptSpokenInjection(
 				// key stable across a same-block re-projection.
 				key: `${idBase}-b${blockIndex}-m-${message.fromId ?? "anon"}`,
 				data: {
+					...deliveryProjection(msg),
 					markdown: rawSideCarToMarkdown(text),
 					speaker: spokenSpeakerLabel(message),
 					// The sender's own id seeds the deterministic identicon in the header.
@@ -2437,6 +2463,7 @@ function adaptSpokenInjection(
 				kind: "injection-bubble",
 				key: `${idBase}-b${blockIndex}-t-${task.id}`,
 				data: {
+					...deliveryProjection(msg),
 					markdown,
 					speaker:
 						body.flavor === "agent"
@@ -2511,6 +2538,7 @@ function adaptSpokenInjection(
 			kind: "injection-bubble" as const,
 			key: `${idBase}-b${blockIndex}-k-${hit.entryId}`,
 			data: {
+				...deliveryProjection(msg),
 				// PLAIN text, escaped rather than parsed: the excerpt is prose by
 				// construction now, and any `#`/`>`/`-` still in it is debris from the
 				// flattening, not authored structure.
@@ -2586,6 +2614,7 @@ function adaptSpokenInjection(
 				kind: "injection-bubble",
 				key: `${idBase}-b${blockIndex}-p-${source}`,
 				data: {
+					...deliveryProjection(msg),
 					payload: {
 						kind: "spec-task",
 						data: {
@@ -3706,12 +3735,14 @@ function toolTimingStamps(source: Record<string, unknown>): Record<string, numbe
 	const out: Record<string, number> = {};
 	const startedAt = parseEpochMs(source.startedAt);
 	const streamStartedAt = parseEpochMs(source.streamStartedAt);
+	const streamCompletedAt = parseEpochMs(source.streamCompletedAt);
 	const permissionStartedAt = parseEpochMs(source.permissionStartedAt);
 	const executionStartedAt = parseEpochMs(source.executionStartedAt);
 	const completedAt = parseEpochMs(source.completedAt);
 	const createdAt = parseEpochMs(source.createdAt);
 	if (startedAt != null) out.startedAt = startedAt;
 	if (streamStartedAt != null) out.streamStartedAt = streamStartedAt;
+	if (streamCompletedAt != null) out.streamCompletedAt = streamCompletedAt;
 	if (permissionStartedAt != null) out.permissionStartedAt = permissionStartedAt;
 	if (executionStartedAt != null) out.executionStartedAt = executionStartedAt;
 	if (completedAt != null) out.completedAt = completedAt;

@@ -5,7 +5,8 @@ import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import type { Locale } from "../../lib/prompt-i18n";
-import type { AgentMessageDelivery } from "../agent-message-delivery";
+import { type AgentMessageDelivery, agentMessageDeliveryBody } from "../agent-message-delivery";
+import { buildAgentMessageOrigin } from "../agent-message-origin";
 import { notifyAwaitWake } from "./await-wake";
 import { createMailboxStore, mailboxDedupeKey } from "./mailbox";
 import type { EligibleMailboxHead, MailboxClaim, MailboxKind, MailboxRow } from "./mailbox-types";
@@ -48,7 +49,7 @@ export function inboxConsumption(
 	return {
 		deliveryId: row.deliveryId,
 		recipientNarratorId: row.narratorId,
-		recipientMessageId: row.recipientMessageId ?? undefined,
+		recipientMessageId: row.currentMessageId ?? row.recipientMessageId ?? undefined,
 		recipientRefId: row.recipientRefId ?? undefined,
 		revision: row.contentRevision,
 	};
@@ -133,11 +134,30 @@ export function enqueueInboxAgent(
 		throw new Error("Agent message execution receipt is stale or missing");
 	const index = modelText.indexOf(delivery.text);
 	if (index < 0) throw new Error("Agent model projection must contain its reader-facing body");
-	const { text, ...coordinates } = delivery;
+	const recipient = db
+		.select({ variant: narrators.variant, originToolCallId: narrators.originToolCallId })
+		.from(narrators)
+		.where(eq(narrators.id, delivery.recipientNarratorId))
+		.get();
+	const recipientIsSubagent = recipient?.variant?.startsWith("subagent:") === true;
+	const recipientParentToolUseId =
+		recipientIsSubagent && recipient?.originToolCallId
+			? (db
+					.select({ toolUseId: narratorToolCalls.toolUseId })
+					.from(narratorToolCalls)
+					.where(eq(narratorToolCalls.id, recipient.originToolCallId))
+					.get()?.toolUseId ?? null)
+			: null;
+	// Reserve the delivery identity before constructing canonical history so the stored
+	// injection envelope can be replayed by History without consulting mailbox payload.
+	const reservedDeliveryId = generateId();
+	const canonicalDelivery = { ...delivery, deliveryId: reservedDeliveryId, revision: 1 };
+	const { text, ...coordinates } = canonicalDelivery;
 	const result = runtimeInbox.enqueue({
 		kind: "agent_message",
 		narratorId: delivery.recipientNarratorId,
 		text,
+		deliveryId: reservedDeliveryId,
 		projectedByteSize: Math.max(Buffer.byteLength(modelText), Buffer.byteLength(text)) + 4096,
 		sourceNarratorId: delivery.sender.id,
 		sourceToolCallId: binding.toolCallId,
@@ -154,6 +174,23 @@ export function enqueueInboxAgent(
 			channel: options.channel ?? "buffer",
 			isBroadcast: options.isBroadcast,
 			fromMessageId: options.fromMessageId,
+		},
+		history: {
+			role: recipientIsSubagent ? "user" : "sys",
+			parentToolUseId: recipientParentToolUseId,
+			contentJson: [
+				{ type: "text", text: modelText },
+				{
+					type: "system_injection",
+					source: "subagent_message",
+					modelText,
+					body: agentMessageDeliveryBody(canonicalDelivery),
+				},
+			],
+			contentText: modelText,
+			createdBy: options.createdBy,
+			origin: "assistant",
+			originLabel: buildAgentMessageOrigin(delivery.sender).originLabel,
 		},
 	});
 	if (!("delivery" in result)) throw new Error("Target message queue is full");
@@ -220,7 +257,16 @@ export function hasInboxKind(narratorId: string, kinds: MailboxKind[]): boolean 
 		.limit(1)
 		.get();
 }
-/** The predicate is checked against the global head, never used to skip a principal barrier. */
+/** True when any durable queue row or pending publication can block a new turn. */
+export function hasPendingInboxWork(narratorId: string): boolean {
+	return runtimeInbox.hasPendingWork(narratorId);
+}
+
+/** Peek the same publication-aware head that claimInboxHead would claim, without claiming it. */
+export function peekEligibleInboxHead(narratorId: string): MailboxRow | undefined {
+	return runtimeInbox.peekEligibleHead(narratorId);
+}
+
 export function claimInboxHead(
 	narratorId: string,
 	accepts: (row: EligibleMailboxHead) => boolean,
@@ -334,6 +380,23 @@ export function recoverInboxClaimsOnColdStartup(): Promise<number> {
 	return run;
 }
 
+/** Re-drive a bounded set of queued recipients after startup, including rows left by an older build. */
+export async function wakeQueuedInboxesOnColdStartup(): Promise<number> {
+	const recipients = db
+		.select({ narratorId: mailbox.narratorId })
+		.from(mailbox)
+		.where(eq(mailbox.state, "queued"))
+		.groupBy(mailbox.narratorId)
+		.limit(100)
+		.all();
+	let started = 0;
+	for (const { narratorId } of recipients) {
+		if (await wakeInboxIfEligible(narratorId)) started++;
+	}
+	if (started) logger.info("Woke queued narrator inboxes after startup", { started });
+	return started;
+}
+
 const pendingWakes = hotSafe(
 	"narrafork.runtime-inbox-wakes",
 	() => new Map<string, Promise<boolean>>(),
@@ -392,7 +455,7 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 			}
 			const { startParentInboundContinuationIfPossible, resumeBufferedMessagesIfIdle } =
 				await import("../narrator-session");
-			const first = peekInbox(narratorId);
+			const first = peekEligibleInboxHead(narratorId);
 			if (first?.kind === "user_input")
 				return (await resumeBufferedMessagesIfIdle(narratorId)).resumed;
 			return (await startParentInboundContinuationIfPossible(narratorId, "en")).started;

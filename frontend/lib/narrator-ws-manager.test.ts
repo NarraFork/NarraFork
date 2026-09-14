@@ -1209,6 +1209,81 @@ describe("reconnect resilience", () => {
 		});
 	});
 
+	test("restores subscriptions before notifying reconnect listeners", () => {
+		withMockBrowserGlobals(() => {
+			const manager = new NarratorWSManager();
+			const handle = manager.subscribe(["n1"], { kind: "list" });
+			try {
+				let callbackSawSubscribe = false;
+				manager.onConnectionChange((connected, isReconnect) => {
+					if (connected && isReconnect) {
+						callbackSawSubscribe =
+							MockWebSocket.instances
+								.at(-1)
+								?.sent.some((payload) => JSON.parse(payload).type === "subscribe") === true;
+					}
+				});
+				manager.connect();
+				const ws = MockWebSocket.instances.at(-1);
+				if (!ws) return;
+				ws.readyState = MockWebSocket.OPEN;
+				ws.onopen?.();
+				ws.readyState = MockWebSocket.CLOSED;
+				ws.onclose?.({ code: 1006 });
+				manager.reconnect();
+				const reconnecting = MockWebSocket.instances.at(-1);
+				if (!reconnecting) return;
+				reconnecting.readyState = MockWebSocket.OPEN;
+				reconnecting.onopen?.();
+				expect(callbackSawSubscribe).toBeTrue();
+			} finally {
+				manager.unsubscribe(handle);
+				manager.disconnect();
+			}
+		});
+	});
+
+	test("an error schedules recovery even when close is never delivered", () => {
+		withMockBrowserGlobals(() => {
+			const manager = new NarratorWSManager();
+			try {
+				manager.connect();
+				const ws = MockWebSocket.instances.at(-1);
+				if (!ws) return;
+				ws.onerror?.();
+				expect(manager.connected).toBe(false);
+				expect(reconnectInternals(manager).reconnectTimer).toBeDefined();
+			} finally {
+				manager.disconnect();
+			}
+		});
+	});
+
+	test("an error keeps the later graceful close code authoritative", () => {
+		withMockBrowserGlobals(() => {
+			const manager = new NarratorWSManager();
+			try {
+				manager.connect();
+				const ws = MockWebSocket.instances.at(-1);
+				if (!ws) return;
+				const internals = reconnectInternals(manager);
+				internals.reconnectAttempts = 5;
+				ws.onerror?.();
+				expect(internals.reconnectAttempts).toBe(6);
+
+				ws.readyState = MockWebSocket.CLOSED;
+				ws.onclose?.({ code: 1001 });
+
+				// The graceful close resets the backoff even though error scheduled a
+				// recovery first. This proves onclose was not detached by onerror.
+				expect(internals.reconnectAttempts).toBe(1);
+				expect(internals.reconnectTimer).toBeDefined();
+			} finally {
+				manager.disconnect();
+			}
+		});
+	});
+
 	test("an abnormal close keeps the existing backoff position", () => {
 		withMockBrowserGlobals(() => {
 			const manager = new NarratorWSManager();
@@ -1232,6 +1307,25 @@ describe("reconnect resilience", () => {
 		});
 	});
 
+	test("restarts backoff after a server heartbeat timeout", () => {
+		withMockBrowserGlobals(() => {
+			const manager = new NarratorWSManager();
+			try {
+				manager.connect();
+				const ws = MockWebSocket.instances.at(-1);
+				if (!ws) return;
+				const internals = reconnectInternals(manager);
+				internals.reconnectAttempts = 8;
+				ws.readyState = MockWebSocket.CLOSED;
+				ws.onclose?.({ code: 1000, reason: "heartbeat timeout" });
+				expect(internals.reconnectAttempts).toBe(1);
+				expect(internals.reconnectTimer).toBeDefined();
+			} finally {
+				manager.disconnect();
+			}
+		});
+	});
+
 	test("keeps a capped reconnect timer running past the old give-up limit", () => {
 		withMockBrowserGlobals(() => {
 			const manager = new NarratorWSManager();
@@ -1246,6 +1340,23 @@ describe("reconnect resilience", () => {
 				expect(internals.reconnectAttempts).toBe(501);
 			} finally {
 				manager.disconnect();
+			}
+		});
+	});
+
+	test("continues probing when the browser reports offline and misses online", () => {
+		withMockBrowserGlobals(() => {
+			const navigatorPatch = patchGlobal("navigator", { onLine: false });
+			const manager = new NarratorWSManager();
+			try {
+				manager.connect();
+				const internals = reconnectInternals(manager);
+				expect(MockWebSocket.instances).toHaveLength(0);
+				expect(internals.reconnectTimer).toBeDefined();
+				expect(internals.reconnectAttempts).toBe(1);
+			} finally {
+				manager.disconnect();
+				restoreGlobal(navigatorPatch);
 			}
 		});
 	});

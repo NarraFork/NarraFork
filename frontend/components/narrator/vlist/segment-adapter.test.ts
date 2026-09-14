@@ -623,6 +623,28 @@ describe("adaptSegment — user message", () => {
 		expect(data.createdAt).toBeNull();
 	});
 
+	it("passes canonical delivery fields through the fixed-height user header", () => {
+		const specs = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "queued-user",
+					role: "user",
+					contentJson: [{ type: "text", text: "queued" }],
+					deliveryId: "delivery-1",
+					deliveryKind: "user_input",
+					deliveryState: "claimed",
+				},
+			} as AdapterSegment,
+			CTX,
+		);
+		expect(specs[0]!.data).toMatchObject({
+			deliveryId: "delivery-1",
+			deliveryKind: "user_input",
+			deliveryState: "claimed",
+		});
+	});
+
 	// Regression: only `type === "text"` blocks used to survive, so an image the
 	// user sent was dropped entirely — the virtual list showed the caption alone
 	// while the classic renderer showed the picture.

@@ -409,6 +409,7 @@ export interface RuntimeScanResult {
 export interface SubagentToolCallTiming {
 	startedAt?: string | number | null;
 	streamStartedAt?: string | number | null;
+	streamCompletedAt?: string | number | null;
 	permissionStartedAt?: string | number | null;
 	executionStartedAt?: string | number | null;
 	completedAt?: string | number | null;
@@ -516,6 +517,7 @@ export interface BaseContentBlock {
 	durationMs?: number;
 	startedAt?: string | number | null;
 	streamStartedAt?: string | number | null;
+	streamCompletedAt?: string | number | null;
 	permissionStartedAt?: string | number | null;
 	executionStartedAt?: string | number | null;
 	completedAt?: string | number | null;
@@ -595,6 +597,7 @@ export interface ToolCallRecord {
 	status?: string;
 	durationMs?: number;
 	streamStartedAt?: string | number | null;
+	streamCompletedAt?: string | number | null;
 	permissionStartedAt?: string | number | null;
 	executionStartedAt?: string | number | null;
 	completedAt?: string | number | null;
@@ -808,7 +811,12 @@ export interface BufferedTextFileSummary {
 }
 
 export interface BufferMessageSummary {
+	/** Mailbox control row id; this remains the id used by edit/remove/retry APIs. */
 	id: string;
+	/** Canonical timeline message id, when supplied by a new server. */
+	messageId?: string | null;
+	/** Optional delivery identity for matching a canonical row. */
+	deliveryId?: string | null;
 	state?: "queued" | "failed";
 	error?: string | null;
 	text: string;
@@ -864,6 +872,10 @@ export interface TreeMessage {
 	} | null;
 	/** Stable top-level ordering from narrator_message_refs.seq. */
 	seq?: number;
+	/** Eager mailbox/outbox projection identity and lifecycle, when present. */
+	deliveryId?: string | null;
+	deliveryKind?: "user_input" | "agent_message" | "task_notice" | null;
+	deliveryState?: "queued" | "claimed" | "materialized" | "failed" | "cancelled" | null;
 	createdAt: string;
 	children: TreeMessage[];
 	/** Maps each index in the (possibly filtered/reordered) contentJson back to its index in the original contentJson. */

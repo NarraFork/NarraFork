@@ -402,6 +402,7 @@ export type AgentEvent =
 			toolName: string;
 			input: Record<string, unknown>;
 			streamStartedAt?: number;
+			streamCompletedAt?: number;
 	  }
 	| {
 			type: "tool_result";
@@ -747,6 +748,7 @@ export type ContentBlock =
 			name: string;
 			input: Record<string, unknown>;
 			streamStartedAt?: number;
+			streamCompletedAt?: number;
 			outputIndex?: number;
 			/** Gemini 3 thought signature for this functionCall part (echoed back on replay). */
 			thoughtSignature?: string;

@@ -120,6 +120,11 @@ import {
 	type EventHooks,
 	type TokenUsageSnapshot,
 } from "./narrator-event-handler";
+import {
+	publishHistoryDeletion,
+	publishHistoryMessage,
+	publishHistoryUpdate,
+} from "./narrator-history-publisher";
 import { deliverInjection } from "./narrator-injection";
 import { isFirstUserTurn } from "./narrator-message-count";
 import { resolveNarratorProjectId as resolveSharedNarratorProjectId } from "./narrator-project";
@@ -660,11 +665,7 @@ export async function executeQueuedGoalCommand(
 			throw error;
 		}
 	});
-	broadcastToNarrator(narratorId, {
-		type: "user_message",
-		narratorId,
-		message: fileReferenceMessageForDisplay(userMsg),
-	});
+	publishHistoryMessage(narratorId, fileReferenceMessageForDisplay(userMsg), "user_message");
 	const { added, written } = await specVfsService.appendProtectedSpecTask(narratorId, objective);
 	if (added) {
 		broadcastSpecChanged(
@@ -696,7 +697,7 @@ export async function executeQueuedGoalCommand(
 export async function resumeNextBufferedMessage(
 	active: ActiveNarrator,
 	locale: Locale,
-): Promise<void> {
+): Promise<boolean> {
 	return withNarratorStartAdmission(active.narratorId, () =>
 		resumeNextBufferedMessageUnlocked(active, locale),
 	);
@@ -705,15 +706,15 @@ export async function resumeNextBufferedMessage(
 async function resumeNextBufferedMessageUnlocked(
 	active: ActiveNarrator,
 	locale: Locale,
-): Promise<void> {
+): Promise<boolean> {
 	const narratorId = active.narratorId;
-	if (isLoopRunning(narratorId)) return;
+	if (isLoopRunning(narratorId)) return false;
 	const inputOwner = tryClaimExecution(narratorId, "tool-replay");
-	if (!inputOwner) return;
+	if (!inputOwner) return false;
 	let claimedRow: import("./agent-runtime/mailbox-types").MailboxRow | undefined;
 	try {
 		claimedRow = claimInboxHead(narratorId, (candidate) => candidate.kind === "user_input");
-		if (!claimedRow) return;
+		if (!claimedRow) return false;
 		const first = projectMailboxUserMessage(claimedRow);
 		// Parsed before consuming, because the two kinds of item are consumed
 		// differently: a terminal command owns its attachments from here on, while a
@@ -822,11 +823,11 @@ async function resumeNextBufferedMessageUnlocked(
 					// queued copies are finally safe to drop.
 					cleanupBufferedTextFiles(first.id);
 					if (!userBroadcasted) {
-						broadcastToNarrator(narratorId, {
-							type: "user_message",
+						publishHistoryMessage(
 							narratorId,
-							message: fileReferenceMessageForDisplay(userMsg),
-						});
+							fileReferenceMessageForDisplay(userMsg),
+							"user_message",
+						);
 					}
 				})
 				.catch((err) => {
@@ -842,6 +843,7 @@ async function resumeNextBufferedMessageUnlocked(
 					return handleTerminalCommandError("auto-resume message", err);
 				});
 		}
+		return true;
 	} finally {
 		try {
 			if (claimedRow) releaseInboxClaim(claimedRow, "Buffered resume did not commit");
@@ -1218,21 +1220,16 @@ async function broadcastInterruptedPartialMessage(
 				parentNarratorId = self?.parentNarratorId ?? undefined;
 			}
 			if (parentNarratorId && parentNarratorId !== narratorId) {
-				broadcastToNarrator(parentNarratorId, {
-					type: "message",
-					narratorId: parentNarratorId,
-					message: fileReferenceMessageForDisplay(processed),
-				});
+				publishHistoryMessage(parentNarratorId, fileReferenceMessageForDisplay(processed));
 			}
 		}
 
 		// Primary broadcast to this narrator's own subscribers. Strip
 		// parentToolUseId so the subagent page treats it as a top-level message.
-		broadcastToNarrator(narratorId, {
-			type: "message",
+		publishHistoryMessage(
 			narratorId,
-			message: fileReferenceMessageForDisplay({ ...processed, parentToolUseId: null }),
-		});
+			fileReferenceMessageForDisplay({ ...processed, parentToolUseId: null }),
+		);
 	} catch (err) {
 		logger.warn("Failed to broadcast interrupted partial message", {
 			narratorId,
@@ -1561,19 +1558,15 @@ async function maybeStartSpecContinuation(
 				modelText: prompt,
 			},
 		]);
-		broadcastToNarrator(active.narratorId, {
-			type: "message",
+		publishHistoryMessage(active.narratorId, {
+			id: msg.id,
 			narratorId: active.narratorId,
-			message: {
-				id: msg.id,
-				narratorId: active.narratorId,
-				role: msg.role,
-				contentJson: fileReferenceContentForDisplay(msg.contentJson),
-				contentText: msg.contentText,
-				createdAt: msg.createdAt,
-				seq: msg.seq,
-				children: [],
-			},
+			role: msg.role,
+			contentJson: fileReferenceContentForDisplay(msg.contentJson),
+			contentText: msg.contentText,
+			createdAt: msg.createdAt,
+			seq: msg.seq,
+			children: [],
 		});
 		active._continuationTurn = "blocked";
 		return prompt;
@@ -1615,19 +1608,15 @@ async function maybeStartSpecContinuation(
 			modelText: prompt,
 		},
 	]);
-	broadcastToNarrator(active.narratorId, {
-		type: "message",
+	publishHistoryMessage(active.narratorId, {
+		id: msg.id,
 		narratorId: active.narratorId,
-		message: {
-			id: msg.id,
-			narratorId: active.narratorId,
-			role: msg.role,
-			contentJson: fileReferenceContentForDisplay(msg.contentJson),
-			contentText: msg.contentText,
-			createdAt: msg.createdAt,
-			seq: msg.seq,
-			children: [],
-		},
+		role: msg.role,
+		contentJson: fileReferenceContentForDisplay(msg.contentJson),
+		contentText: msg.contentText,
+		createdAt: msg.createdAt,
+		seq: msg.seq,
+		children: [],
 	});
 	active._continuationTurn = "task";
 	return prompt;
@@ -1808,7 +1797,7 @@ async function deliverPendingInjectionsInOrder(
 				const entry = {
 					...projectPendingInjection(row),
 					mailboxClaim: inboxClaim(row),
-					recipientMessageId: row.recipientMessageId ?? undefined,
+					recipientMessageId: row.currentMessageId ?? row.recipientMessageId ?? undefined,
 				};
 				const text = await deliverPendingInjection(
 					narratorId,
@@ -2854,11 +2843,7 @@ async function feedMessageUnlocked(
 			// Broadcast the persisted user message before Bash starts. In chunk mode the
 			// frontend renders directly from WS events (not the query optimistic cache),
 			// so delaying this until sendMessage() returns would show the Bash card first.
-			broadcastToNarrator(narratorId, {
-				type: "user_message",
-				narratorId,
-				message: fileReferenceMessageForDisplay(userMsg),
-			});
+			publishHistoryMessage(narratorId, fileReferenceMessageForDisplay(userMsg), "user_message");
 			await handleBashCommand(
 				narratorId,
 				preBashCommand,
@@ -3195,11 +3180,7 @@ export async function sendMessage(
 		acceptedReferences,
 	);
 	if (!userBroadcasted) {
-		broadcastToNarrator(narratorId, {
-			type: "user_message",
-			narratorId,
-			message: fileReferenceMessageForDisplay(userMsg),
-		});
+		publishHistoryMessage(narratorId, fileReferenceMessageForDisplay(userMsg), "user_message");
 	}
 	return userMsg;
 }
@@ -3855,8 +3836,7 @@ export async function resumeBufferedMessagesIfIdle(
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning) return { resumed: false };
 
-		await resumeNextBufferedMessage(active, locale);
-		return { resumed: true };
+		return { resumed: await resumeNextBufferedMessage(active, locale) };
 	});
 }
 
@@ -4078,20 +4058,12 @@ async function retryLastMessageUnlocked(
 	// Publish each removal immediately: a later protected range can refuse deletion.
 	for (const messageId of resolved.emptyAssistantIds) {
 		if (await narratorService.deleteEmptyRetryPlaceholder(narratorId, messageId)) {
-			broadcastToNarrator(narratorId, {
-				type: "messages_deleted",
-				narratorId,
-				deletedMessageIds: [messageId],
-			});
+			publishHistoryDeletion(narratorId, [messageId]);
 		}
 	}
 	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, lastMsg.id);
 	if (deletedMessageIds.length > 0) {
-		broadcastToNarrator(narratorId, {
-			type: "messages_deleted",
-			narratorId,
-			deletedMessageIds,
-		});
+		publishHistoryDeletion(narratorId, deletedMessageIds);
 	}
 
 	const imageRefs = extractImageRefs(lastMsg.contentJson, lastMsg.narratorId);
@@ -4193,11 +4165,7 @@ async function continueNarratorUnlocked(
 				narratorId,
 				count: deletedMessageIds.length,
 			});
-			broadcastToNarrator(narratorId, {
-				type: "messages_deleted",
-				narratorId,
-				deletedMessageIds,
-			});
+			publishHistoryDeletion(narratorId, deletedMessageIds);
 		}
 	}
 
@@ -4227,11 +4195,7 @@ async function continueNarratorUnlocked(
 					}
 				: undefined,
 		);
-		broadcastToNarrator(narratorId, {
-			type: "user_message",
-			narratorId,
-			message: fileReferenceMessageForDisplay(userMsg),
-		});
+		publishHistoryMessage(narratorId, fileReferenceMessageForDisplay(userMsg), "user_message");
 		return { ok: true };
 	}
 
@@ -5034,11 +4998,7 @@ async function rollbackToBlockUnlocked(
 		},
 	);
 	if (deletedMessageIds.length > 0) {
-		broadcastToNarrator(narratorId, {
-			type: "messages_deleted",
-			narratorId,
-			deletedMessageIds,
-		});
+		publishHistoryDeletion(narratorId, deletedMessageIds);
 	}
 
 	// Step 2: Delete blocks after the effective rollback boundary in the target message
@@ -5065,22 +5025,14 @@ async function rollbackToBlockUnlocked(
 			(r) => r.messageId === messageId && r.messageDeleted,
 		);
 		if (targetMessageDeleted) {
-			broadcastToNarrator(narratorId, {
-				type: "messages_deleted",
-				narratorId,
-				deletedMessageIds: [messageId],
-			});
+			publishHistoryDeletion(narratorId, [messageId]);
 		} else {
 			// Broadcast the updated message
 			const updatedMsg = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, messageId),
 			});
 			if (updatedMsg) {
-				broadcastToNarrator(narratorId, {
-					type: "message_updated",
-					narratorId,
-					message: fileReferenceMessageForDisplay(updatedMsg),
-				});
+				publishHistoryUpdate(narratorId, fileReferenceMessageForDisplay(updatedMsg));
 			}
 		}
 	}
@@ -5531,11 +5483,7 @@ async function editAndRegenerateUnlocked(
 		},
 	);
 	if (deletedMessageIds.length > 0) {
-		broadcastToNarrator(narratorId, {
-			type: "messages_deleted",
-			narratorId,
-			deletedMessageIds,
-		});
+		publishHistoryDeletion(narratorId, deletedMessageIds);
 	}
 
 	const createdImageIds: string[] = [];
@@ -5619,11 +5567,7 @@ async function editAndRegenerateUnlocked(
 		where: eq(narratorMessages.id, privateMessageId),
 	});
 	if (updatedMsg) {
-		broadcastToNarrator(narratorId, {
-			type: "message_updated",
-			narratorId,
-			message: fileReferenceMessageForDisplay(updatedMsg),
-		});
+		publishHistoryUpdate(narratorId, fileReferenceMessageForDisplay(updatedMsg));
 		if (privateMessageId !== messageId) {
 			broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
 		}
@@ -5773,11 +5717,7 @@ async function editAssistantMessageUnlocked(
 		where: eq(narratorMessages.id, privateMessageId),
 	});
 	if (updatedMsg) {
-		broadcastToNarrator(narratorId, {
-			type: "message_updated",
-			narratorId,
-			message: fileReferenceMessageForDisplay(updatedMsg),
-		});
+		publishHistoryUpdate(narratorId, fileReferenceMessageForDisplay(updatedMsg));
 		if (privateMessageId !== messageId) {
 			broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
 		}
@@ -5852,11 +5792,7 @@ async function restoreAssistantMessageUnlocked(
 		where: eq(narratorMessages.id, privateMessageId),
 	});
 	if (updatedMsg) {
-		broadcastToNarrator(narratorId, {
-			type: "message_updated",
-			narratorId,
-			message: fileReferenceMessageForDisplay(updatedMsg),
-		});
+		publishHistoryUpdate(narratorId, fileReferenceMessageForDisplay(updatedMsg));
 		if (privateMessageId !== messageId) {
 			broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
 		}
@@ -5919,12 +5855,9 @@ export async function* startSession(
 
 	// Emit user_message AFTER subscribing so it's not lost
 	// Broadcast to all WS subscribers so other clients see the user message in real-time
-	broadcastToNarrator(narratorId, {
-		type: "user_message",
-		narratorId,
-		message: fileReferenceMessageForDisplay(userMsg),
-	});
-	yield { type: "user_message", data: fileReferenceMessageForDisplay(userMsg) };
+	const displayUserMessage = fileReferenceMessageForDisplay(userMsg);
+	publishHistoryMessage(narratorId, displayUserMessage, "user_message");
+	yield { type: "user_message", data: displayUserMessage };
 
 	try {
 		while (!done) {

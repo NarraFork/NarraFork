@@ -57,6 +57,8 @@ describe("compact progress reporter", () => {
 			outputChars: 0,
 			mode: "blocking",
 		});
+		expect(broadcasts[0]).not.toHaveProperty("output");
+		expect(broadcasts[0]).not.toHaveProperty("thinking");
 	});
 
 	test("routes text deltas to the output phase and keeps the thinking total", async () => {

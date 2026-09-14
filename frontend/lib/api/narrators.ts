@@ -1224,6 +1224,20 @@ export const narratorsApi = {
 		}),
 	getCompactSummary: (narratorId: string, messageId: string) =>
 		request<CompactMessageDetail>(`/narrators/${narratorId}/compact/${messageId}`),
+	streamCompactSummary: (
+		narratorId: string,
+		messageId: string,
+		offsets: { output: number; thinking: number },
+	) => {
+		const params = new URLSearchParams({
+			outputOffset: String(Math.max(0, offsets.output)),
+			thinkingOffset: String(Math.max(0, offsets.thinking)),
+		});
+		return authorizedFetch(
+			`${apiBase()}/narrators/${encodeURIComponent(narratorId)}/compact/${encodeURIComponent(messageId)}/live?${params}`,
+			{ headers: { Accept: "text/event-stream" } },
+		);
+	},
 	retryFailedCompact: (narratorId: string, messageId: string, model?: string) =>
 		request<RetryFailedCompactResponse>(`/narrators/${narratorId}/compact/${messageId}/retry`, {
 			method: "POST",

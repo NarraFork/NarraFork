@@ -414,8 +414,8 @@ Content-Type: application/json; charset=utf-8\r\n
 
 **设计建议**：
 
-- 在返回 `{ accepted: true }` 前，插件应完成参数结构检查、provider type 检查、并发额度检查和明显的
-  model/config 检查；
+- 在返回 `{ accepted: true }` 前，插件应完成参数结构检查、provider type 检查、插件自身的并发策略检查
+  （必要时排队/节流或返回 busy）和明显的 model/config 检查；
 - 接受前失败使用 JSON-RPC error response；
 - 接受后失败必须发送 `provider.event` 的 `error`，随后发送 `done`；
 - 宿主必须先登记 operation，再写入请求，以免插件快速回事件时出现未登记竞态；
@@ -500,7 +500,8 @@ interface ProviderDescribeResult {
   `provider.<contributionId>.<field>` 可预测；
 - 响应不得包含密钥默认值；
 - secret 的实际下发方式见 26 节 D-04（已决策：按请求在 `config` 中注入解析值）；
-- `maxConcurrent*` 未声明时默认 1；
+- `maxConcurrent*` 未声明时，插件侧对 chat/generate 各采用默认并发 1；这只是插件自身的业务并发策略，
+  不是宿主的请求准入限制；
 - `mayLeakXmlToolCalls` 默认 false，v1 强烈建议插件始终发送结构化工具事件。
 
 ### 8.3 版本不兼容
@@ -728,13 +729,17 @@ interface ProviderHostHints {
 协作式并发提示，建议插件限制自身到上游 API 的最大并发连接数。
 
 - **性质：提示，非强制**。宿主无法阻止插件超出此值（插件进程自主发起 TCP 连接）。
-- **与 `descriptor.limits.maxConcurrentChat` 的区别**：
-  - `maxConcurrentChat`（descriptor 中）= 宿主侧硬限制，宿主**拒绝**超额请求；
-  - `maxConcurrentUpstream`（hostHints 中）= 建议插件自我节流的上游连接数。
-- **当前状态：宿主不下发此字段**。原因：宿主当前唯一可用的值就是插件自己在 manifest 中声明的
-  `maxConcurrentChat`，将其回送给插件是纯噪音。真正有价值的场景是"插件与宿主内置路径共享同一
-  上游账号额度"——此时宿主需要知道内置路径正在消耗多少并发，而该信息来自 provider 专有的并发控制状态，
-  不应注入通用插件协议。当跨路径并发预算协调机制实现后，此字段将成为下发载体。
+- **与 `descriptor.limits.maxConcurrentChat` / `maxConcurrentGenerate` 的区别**：
+  - `maxConcurrent*`（descriptor 中）是插件声明并负责执行的 provider 业务/上游并发策略，包含插件侧
+    排队、节流和 busy 判定；宿主不会据此拒绝请求；
+  - `maxConcurrentUpstream`（hostHints 中）是宿主可选下发的协作提示，供插件调整自己的上游连接池。
+- **不要与宿主通用 IPC 预算混淆**：`maxInFlightOperations`、frame/queue/request/response bytes
+  等预算由宿主 RPC client 强制执行，用来保护 transport/runtime 资源；它们不代表某个 provider 的
+  上游业务并发。
+- **当前状态：宿主不下发此字段**。原因：宿主当前唯一可用的值就是插件自己声明的 provider 并发策略，
+  将其回送给插件是纯噪音。真正有价值的场景是"插件与宿主内置路径共享同一上游账号额度"——此时宿主需要
+  知道内置路径正在消耗多少并发，而该信息来自 provider 专有的并发控制状态，不应注入通用插件协议。
+  当跨路径并发预算协调机制存在后，此字段将成为下发载体。
 
 ### 10B.4 向后兼容
 
@@ -1698,12 +1703,15 @@ interface ProviderRegistryEntry {
 
 **设计建议**：
 
-- descriptor 未声明时 chat/generate 并发各为 1；
-- 超过额度时宿主可有界排队，不能无限排队；
-- 排队等待也计入调用方 timeout；
+- `descriptor.limits.maxConcurrentChat` / `maxConcurrentGenerate` 是插件声明的 provider 业务并发策略；未声明时，
+  插件侧对 chat/generate 各采用默认并发 1；
+- 插件负责按自身策略排队、节流或快速返回 busy，并将排队等待计入调用方 timeout；宿主不因
+  `descriptor.limits.maxConcurrent*` 超额而拒绝请求；
+- 宿主只强制执行通用 IPC 资源安全预算，例如 `maxInFlightOperations`、frame/queue/request/response bytes、
+  operation timeout 和 output limits；这些预算与 provider-specific 上游并发相互独立；
 - 插件返回 `-32005` 时，宿主按 busy/unavailable 分类；
 - 同一个 operation 的事件严格有序，不要求不同 operation 之间有全局顺序；
-- stateful session 是否允许同一 `stickySessionKey` 并发由插件 descriptor 扩展声明，默认禁止。
+- stateful session 是否允许同一 `stickySessionKey` 并发由插件自己的 provider 策略决定，默认行为由插件实现。
 
 ### 21.2 重试所有权
 
@@ -1767,7 +1775,7 @@ interface ProviderRegistryEntry {
 - pluginId/localId 不一致；
 - 重复 provider type；
 - 非法 config schema；
-- 未声明并发限制时使用安全默认值。
+- 未声明 `maxConcurrent*` 时由插件侧使用 chat/generate 各为 1 的默认 provider 并发策略；这不改变宿主通用 IPC 预算。
 
 ### 23.3 `RemoteProviderAdapter` 契约
 
@@ -1852,7 +1860,7 @@ handling 测试，确保加入 Registry 后：
 - 流序号：每 operation 从 1 严格递增；
 - 背压：64 events / 256KiB normal credit + 2 events / 64KiB terminal reserve；
 - 未声明 session mode：按 stateful；
-- 未声明并发：chat 1、generate 1；
+- 未声明 `maxConcurrent*` 时，插件侧 provider 并发默认 chat 1、generate 1；
 - stdout 只允许协议，日志只走 stderr；
 - `RemoteProviderAdapter` 在宿主侧构造 canonical history/tools；
 - 工具执行、权限、重试和 Agent Loop done 判断始终归宿主；

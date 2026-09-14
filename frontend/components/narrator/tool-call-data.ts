@@ -21,6 +21,7 @@ export interface ToolCallData {
 	status: string;
 	durationMs?: number;
 	streamStartedAt?: string | number | null;
+	streamCompletedAt?: string | number | null;
 	permissionStartedAt?: string | number | null;
 	executionStartedAt?: string | number | null;
 	completedAt?: string | number | null;

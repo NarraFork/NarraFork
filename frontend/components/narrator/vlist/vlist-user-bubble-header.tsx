@@ -23,7 +23,7 @@ import {
 } from "@frontend/components/narrator/MessageOriginBadge";
 import { UserAvatar } from "@frontend/components/UserAvatar";
 import { formatShortMessageTime } from "@frontend/lib/intl-format";
-import { Group, Text } from "@mantine/core";
+import { Badge, Group, Text } from "@mantine/core";
 import { parseOriginLabel } from "@shared/message-origin";
 import { useTranslation } from "react-i18next";
 import type { VListElementKind } from "./registry";
@@ -42,6 +42,17 @@ export function formatBubbleTime(createdAt: string): string {
 	return formatShortMessageTime(createdAt);
 }
 
+type DeliveryState = "queued" | "claimed" | "materialized" | "failed" | "cancelled";
+
+function deliveryBadge(state: DeliveryState | null | undefined, t: (key: string) => string) {
+	if (state === "queued" || state === "claimed") {
+		return { label: t("status_queued"), color: "yellow" as const };
+	}
+	if (state === "failed") return { label: t("communicationError"), color: "red" as const };
+	if (state === "cancelled") return { label: t("communicationCancelled"), color: "gray" as const };
+	return null;
+}
+
 /**
  * User bubble header row (avatar + username + timestamp), injected into the vlist
  * message-bubble render via `extra.header`. Mirrors MessageBubble's user header so
@@ -52,13 +63,16 @@ export function UserBubbleHeader({
 	createdAt,
 	origin,
 	originLabel,
+	deliveryState,
 }: {
 	creator?: BubbleCreator | null;
 	createdAt?: string | null;
 	origin?: string | null;
 	originLabel?: string | null;
+	deliveryState?: DeliveryState | null;
 }) {
 	const { t } = useTranslation("narrator");
+	const badge = deliveryBadge(deliveryState, t);
 	return (
 		<Group gap={6} wrap="nowrap" h="100%" align="center">
 			{creator ? (
@@ -73,11 +87,16 @@ export function UserBubbleHeader({
 			) : (
 				<OriginAvatar originLabel={originLabel} size={20} />
 			)}
-			<Text size="xs" fw={600} c="indigo" style={{ whiteSpace: "nowrap" }}>
+			<Text size="xs" fw={600} c="indigo" truncate style={{ minWidth: 0, whiteSpace: "nowrap" }}>
 				{resolveUserBubbleName({ creator, origin, originLabel }, t)}
 			</Text>
 			{/* Icon-only marker; sits inside the reserved 20px row so height is unchanged. */}
 			<MessageOriginBadge origin={origin} originLabel={originLabel} />
+			{badge ? (
+				<Badge size="xs" variant="light" color={badge.color} style={{ flexShrink: 0 }}>
+					{badge.label}
+				</Badge>
+			) : null}
 			{createdAt ? (
 				<Text size="xs" c="dimmed" ml="auto" style={{ whiteSpace: "nowrap" }}>
 					{formatBubbleTime(createdAt)}
@@ -128,6 +147,7 @@ export function injectUserBubbleHeader(kind: VListElementKind, extra: RenderExtr
 			createdAt={(extra.createdAt as string | null | undefined) ?? null}
 			origin={(extra.origin as string | null | undefined) ?? null}
 			originLabel={(extra.originLabel as string | null | undefined) ?? null}
+			deliveryState={(extra.deliveryState as DeliveryState | null | undefined) ?? null}
 		/>
 	);
 }

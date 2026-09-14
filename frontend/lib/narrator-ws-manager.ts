@@ -1359,9 +1359,21 @@ export class NarratorWSManager {
 		if (this.cancelled) return;
 		this.reconnectTimer = undefined;
 		this._clearSyncProbe();
+		// An error may have left the old socket without a close event. Retire it only
+		// when the fallback reconnect actually wins, so close-code handling still has
+		// priority when the browser delivers onclose in time.
+		const staleWs = this.ws;
+		if (staleWs) {
+			this.ws = null;
+			safeCloseWs(staleWs);
+		}
 		if (this._isNetworkOffline()) {
 			this.networkOffline = true;
 			this._setConnected(false, false, true);
+			// Do not rely solely on the browser's `online` event. Some browsers and
+			// embedded webviews miss that event after a transient network outage, which
+			// would otherwise strand the manager forever with no socket or timer.
+			this._scheduleReconnect();
 			return;
 		}
 
@@ -1389,9 +1401,13 @@ export class NarratorWSManager {
 			const isReconnect = this.hasConnectedOnce || this.reconnectAttempts > 0;
 			this.hasConnectedOnce = true;
 			this.reconnectAttempts = 0;
-			this._setConnected(true, isReconnect);
 			this._resetPingTimeout();
+			// Restore subscriptions before announcing the connection. Consumers such as
+			// RecentTabs use the reconnect callback to reconcile REST state; sending the
+			// subscribe frames first prevents that reconciliation from racing the first
+			// request-scoped snapshot after a reconnect.
 			this._restoreSubscriptions();
+			this._setConnected(true, isReconnect);
 		};
 
 		ws.onmessage = (event) => {
@@ -1511,23 +1527,38 @@ export class NarratorWSManager {
 			// 4001 = the session token this socket was opened with expired. HTTP
 			// sliding renewal has very likely already stored a fresh one, so retry
 			// immediately with whatever is in localStorage instead of backing off.
-			if (ev.code === SESSION_EXPIRED_CLOSE_CODE || ev.code === SERVER_SHUTDOWN_CLOSE_CODE) {
+			if (
+				ev.code === SESSION_EXPIRED_CLOSE_CODE ||
+				ev.code === SERVER_SHUTDOWN_CLOSE_CODE ||
+				(ev.code === 1000 && ev.reason === "heartbeat timeout")
+			) {
+				clearTimeout(this.reconnectTimer);
+				this.reconnectTimer = undefined;
 				this.reconnectAttempts = 0;
 			}
 			this._scheduleReconnect();
 		};
 
 		ws.onerror = () => {
-			// onclose will fire after this
+			// Browsers normally deliver close after error, but a half-open proxy can
+			// omit it. Keep onclose attached so a meaningful close code is still used;
+			// _doConnect closes this failed socket if the fallback timer wins first.
+			if (this.cancelled || this.ws !== ws) return;
+			clearTimeout(this.pingTimeoutTimer);
+			this.pingTimeoutTimer = undefined;
+			this._clearSyncProbe();
+			this._setConnected(false, false, true);
+			this._scheduleReconnect();
 		};
 	}
 
 	private _scheduleReconnect(): void {
-		if (this.cancelled) return;
+		if (this.cancelled || this.reconnectTimer !== undefined) return;
 		if (this._isNetworkOffline()) {
 			this.networkOffline = true;
 			this._setConnected(false, false, true);
-			return;
+			// Keep a capped probe running even when `online` is missed. The next
+			// attempt will re-check navigator state before opening a socket.
 		}
 		if (this.reconnectAttempts >= DISCONNECTED_THRESHOLD && !this._disconnected) {
 			this._setConnected(false, false, true);
@@ -1550,8 +1581,16 @@ export class NarratorWSManager {
 	private _resetPingTimeout(): void {
 		clearTimeout(this.pingTimeoutTimer);
 		this.pingTimeoutTimer = setTimeout(() => {
-			if (!this.cancelled && this.ws?.readyState === WebSocket.OPEN) {
-				this.ws.close(4000, "ping timeout");
+			const ws = this.ws;
+			if (!this.cancelled && ws?.readyState === WebSocket.OPEN) {
+				// Do not wait for browsers to deliver `close` for a half-open socket.
+				// Detach it and schedule the next connection ourselves; otherwise a stale
+				// OPEN socket can leave the entire application without a retry trigger.
+				this.ws = null;
+				this.pingTimeoutTimer = undefined;
+				this._setConnected(false, false, true);
+				safeCloseWs(ws);
+				this._scheduleReconnect();
 			}
 		}, CLIENT_PING_TIMEOUT_MS);
 	}
@@ -1601,7 +1640,11 @@ export class NarratorWSManager {
 		// asked for them, and multiple panels may watch the same narrator.
 		for (const record of this.subscriptions.values()) {
 			if (record.narratorIds.length === 0) continue;
-			this._scheduleSubscribe(
+			// All listeners for an existing handle survive the socket lifecycle, so the
+			// restore path can send immediately. The microtask deferral remains necessary
+			// for a brand-new subscribe() call, where the hook registers its listener just
+			// after creating the handle.
+			this._sendSubscribe(
 				{ _id: record.id, _narratorIds: record.narratorIds, _kind: record.kind },
 				record.narratorIds,
 			);

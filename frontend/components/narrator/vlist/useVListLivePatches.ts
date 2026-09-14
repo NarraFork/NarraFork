@@ -69,6 +69,8 @@ export interface UseVListLivePatchesOptions {
 			changed: boolean;
 		},
 	) => boolean;
+	/** Revalidate when a terminal event arrived before its message was loaded. */
+	onUnappliedToolCompletion?: () => void;
 }
 
 /**
@@ -106,7 +108,7 @@ export function useVListLivePatches(
 	narratorId: string | undefined,
 	options: UseVListLivePatchesOptions,
 ): void {
-	const { enabled, isSubagent, applyLivePatch } = options;
+	const { enabled, isSubagent, applyLivePatch, onUnappliedToolCompletion } = options;
 	const applyRef = useRef(applyLivePatch);
 	applyRef.current = applyLivePatch;
 	// Read fresh on every enqueue AND every flush: the queue rejects a batch whose
@@ -131,8 +133,8 @@ export function useVListLivePatches(
 		});
 	}
 
-	const enqueue = useCallback((patch: LivePatch | null) => {
-		queueRef.current?.enqueue(patch);
+	const enqueue = useCallback((patch: LivePatch | null, onMiss?: () => void) => {
+		queueRef.current?.enqueue(patch, onMiss);
 	}, []);
 
 	// Drop anything still queued on unmount / narrator switch: those patches target
@@ -233,7 +235,15 @@ export function useVListLivePatches(
 		enabled ? narratorId : undefined,
 		{
 			// ── Tool lifecycle ──────────────────────────────────────────────────
-			onToolStarted: (toolUseId, toolName, streamStartedAt, input, rawParent, meta) => {
+			onToolStarted: (
+				toolUseId,
+				toolName,
+				streamStartedAt,
+				streamCompletedAt,
+				input,
+				rawParent,
+				meta,
+			) => {
 				const parentToolUseId = routeParent(rawParent);
 				if (parentToolUseId) {
 					enqueue(
@@ -256,6 +266,7 @@ export function useVListLivePatches(
 					toolStartedPatch({
 						toolUseId,
 						...(streamStartedAt != null ? { streamStartedAt } : {}),
+						...(streamCompletedAt != null ? { streamCompletedAt } : {}),
 						...(input ? { input } : {}),
 					}),
 				);
@@ -297,6 +308,7 @@ export function useVListLivePatches(
 						...(updatedInput ? { updatedInput } : {}),
 						...(metadata ? { metadata } : {}),
 					}),
+					onUnappliedToolCompletion,
 				);
 			},
 

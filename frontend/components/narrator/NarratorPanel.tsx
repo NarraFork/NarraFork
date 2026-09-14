@@ -4816,6 +4816,25 @@ export function NarratorPanel({
 		[narratorId],
 	);
 
+	// Queue controls are declared through refs because the vlist handler bundle is
+	// built before the queue editor callbacks below. The resolver returns mailbox-row
+	// actions only when a canonical timeline message points at a queued summary.
+	const queuedEditRef = useRef<(id: string) => void>(() => {});
+	const queuedCancelRef = useRef<(id: string) => void>(() => {});
+	const queuedRetryRef = useRef<(id: string) => void>(() => {});
+	const resolveQueuedMessage = useCallback(
+		(messageId: string) => {
+			const queued = queuedMessages.find((item) => item.messageId === messageId);
+			if (!queued) return undefined;
+			return {
+				onEdit: () => queuedEditRef.current(queued.id),
+				onCancel: () => queuedCancelRef.current(queued.id),
+				...(queued.state === "failed" ? { onRetry: () => queuedRetryRef.current(queued.id) } : {}),
+			};
+		},
+		[queuedMessages],
+	);
+
 	// Single-block action handlers for the vlist message list. Memoized so the
 	// object identity is stable across renders — the vlist interaction layer
 	// keys its per-row payloads off this and must not rebuild them every render.
@@ -4832,6 +4851,7 @@ export function NarratorPanel({
 			// Message editing: same gating as the chunked branch below — the user
 			// flow requires provider support, the assistant text edit does not.
 			onEditAndRegenerate: rollbackEditRegenerateSupported ? handleEditAndRegenerate : undefined,
+			resolveQueuedMessage,
 			onEditAssistantMessage: handleEditAssistantMessage,
 			onRestoreAssistantMessage: handleRestoreAssistantMessage,
 			onViewSubagentSession: handleVlistViewSubagentSession,
@@ -4859,6 +4879,7 @@ export function NarratorPanel({
 			rollbackEditRegenerateSupported,
 			handleRollback,
 			handleEditAndRegenerate,
+			resolveQueuedMessage,
 			handleEditAssistantMessage,
 			handleRestoreAssistantMessage,
 			handleVlistViewSubagentSession,
@@ -5942,6 +5963,11 @@ export function NarratorPanel({
 		},
 		[queuedMessages, setQueuedMessages, narratorId, t],
 	);
+	queuedEditRef.current = (id) => setEditingQueuedId(id);
+	queuedCancelRef.current = handleRemoveQueued;
+	queuedRetryRef.current = (id) => {
+		void handleRetryQueued(id);
+	};
 
 	const addImages = async (files: File[]) => {
 		const valid = files.filter((f) => {
@@ -7811,8 +7837,16 @@ export function NarratorPanel({
 											{t("queuedPriorityNextRequest")}
 										</Badge>
 									)}
-									<Text size="xs" c="dimmed" truncate style={{ flex: 1 }}>
-										{queuedMessages[0].text}
+									<Badge
+										size="xs"
+										variant="light"
+										color={queuedMessages[0].state === "failed" ? "red" : "blue"}
+										style={{ flexShrink: 0 }}
+									>
+										{queuedMessages[0].state === "failed" ? t("queuedFailed") : t("status_queued")}
+									</Badge>
+									<Text size="xs" c="dimmed" style={{ flex: 1 }}>
+										{t("queuedExecutionOnly")}
 									</Text>
 									<Button
 										size="compact-xs"

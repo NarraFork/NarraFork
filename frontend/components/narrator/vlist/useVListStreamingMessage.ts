@@ -474,13 +474,22 @@ export function useVListStreamingMessage(
 				)
 					flush();
 			},
-			onToolStarted: (toolUseId, toolName, streamStartedAt, input, rawParentToolUseId, meta) => {
+			onToolStarted: (
+				toolUseId,
+				toolName,
+				streamStartedAt,
+				streamCompletedAt,
+				input,
+				rawParentToolUseId,
+				meta,
+			) => {
 				if (!isSubagent && rawParentToolUseId) return;
 				if (
 					applyStreamingToolStarted(toolStoreRef.current, {
 						toolUseId,
 						toolName,
 						...(streamStartedAt != null ? { streamStartedAt } : {}),
+						...(streamCompletedAt != null ? { streamCompletedAt } : {}),
 						...(input ? { input } : {}),
 						...(meta ? { metadata: meta as Record<string, unknown> } : {}),
 					})

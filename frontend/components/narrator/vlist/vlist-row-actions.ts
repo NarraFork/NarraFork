@@ -38,6 +38,14 @@ export interface VListRowHandlers {
 	 * owns the editing row state); absent → the item is hidden.
 	 */
 	onEditMessage?: (messageId: string) => void;
+	/** Resolve mailbox controls for a canonical queued user message. */
+	resolveQueuedMessage?: (messageId: string) =>
+		| {
+				onEdit: () => void;
+				onCancel: () => void;
+				onRetry?: () => void;
+		  }
+		| undefined;
 	/**
 	 * Persist an edited USER message and regenerate from there (optionally
 	 * rolling the worktree back). Same signature as ChunkedMessageList's prop;
@@ -167,6 +175,12 @@ export function buildRowToolActions(
 export interface VListRowActionTarget {
 	/** Owning message id (authoritative, from the selection entry when present). */
 	messageId: string;
+	/** Mailbox controls for a canonical queued user row, when one is present. */
+	queued?: {
+		onEdit: () => void;
+		onCancel: () => void;
+		onRetry?: () => void;
+	};
 	/** Primary block index of this row. */
 	blockIndex: number;
 	/**
@@ -226,7 +240,11 @@ export function buildRowCtxActions(
 	if (handlers.onRollbackToBlock) {
 		actions.onRollbackToBlock = (bi) => handlers.onRollbackToBlock?.(messageId, bi);
 	}
-	if (target.editable !== false && handlers.onEditMessage) {
+	if (target.queued) {
+		actions.onEditMessage = target.queued.onEdit;
+		actions.onCancelQueued = target.queued.onCancel;
+		if (target.queued.onRetry) actions.onRetryQueued = target.queued.onRetry;
+	} else if (target.editable !== false && handlers.onEditMessage) {
 		actions.onEditMessage = () => handlers.onEditMessage?.(messageId);
 	}
 

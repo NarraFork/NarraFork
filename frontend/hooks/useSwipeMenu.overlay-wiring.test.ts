@@ -27,6 +27,14 @@ const SHELL = readFileSync(
 );
 
 describe("off-screen anchor overlay wiring", () => {
+	it("uses the overflow-aware scroll parent for menu geometry too", () => {
+		const positionStart = HOOK.indexOf("const getSwipeMenuPosition");
+		const positionEnd = HOOK.indexOf("\n\treturn {", positionStart);
+		const positionSource = HOOK.slice(positionStart, positionEnd);
+		expect(positionSource).toContain("findVerticalScrollParent(");
+		expect(positionSource).not.toContain("scrollHeight > el.clientHeight");
+	});
+
 	it("reports the overlay through the global anchor-info channel", () => {
 		// The panel renders SwipeAnchorOverlay from whatever this pushes.
 		expect(HOOK).toContain("getGlobalOnSwipeAnchorInfo()?.({");

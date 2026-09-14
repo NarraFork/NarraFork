@@ -591,6 +591,7 @@ export interface ToolCallData {
 	 * header had a duration but no breakdown of where the time went.
 	 */
 	streamStartedAt?: number | null;
+	streamCompletedAt?: number | null;
 	permissionStartedAt?: number | null;
 	executionStartedAt?: number | null;
 	completedAt?: number | null;
@@ -634,6 +635,7 @@ export interface ToolCallData {
 export interface ToolTimingStamps {
 	startedAt: number | null;
 	streamStartedAt: number | null;
+	streamCompletedAt?: number | null;
 	permissionStartedAt: number | null;
 	executionStartedAt: number | null;
 	completedAt: number | null;
@@ -656,6 +658,7 @@ function stampOf(value: unknown): number | null {
 export function resolveToolTimingStamps(source: {
 	startedAt?: number | null;
 	streamStartedAt?: number | null;
+	streamCompletedAt?: number | null;
 	permissionStartedAt?: number | null;
 	executionStartedAt?: number | null;
 	completedAt?: number | null;
@@ -665,6 +668,7 @@ export function resolveToolTimingStamps(source: {
 	return {
 		startedAt: stampOf(source.startedAt),
 		streamStartedAt: stampOf(source.streamStartedAt),
+		streamCompletedAt: stampOf(source.streamCompletedAt),
 		permissionStartedAt: stampOf(source.permissionStartedAt),
 		executionStartedAt: stampOf(source.executionStartedAt),
 		completedAt: stampOf(source.completedAt),

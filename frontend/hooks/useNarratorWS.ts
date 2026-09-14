@@ -49,6 +49,9 @@ export function subagentToolEventMeta(data: Record<string, unknown>): SubagentTo
 		...(data.streamStartedAt != null
 			? { streamStartedAt: data.streamStartedAt as string | number }
 			: {}),
+		...(data.streamCompletedAt != null
+			? { streamCompletedAt: data.streamCompletedAt as string | number }
+			: {}),
 		...(data.permissionStartedAt != null
 			? { permissionStartedAt: data.permissionStartedAt as string | number }
 			: {}),
@@ -197,6 +200,11 @@ export interface CompactProgressEvent extends ProgressSnapshot {
 	messageId: string;
 	isSegment: boolean;
 	mode: "blocking" | "background";
+	model?: string;
+	reasoningEffort?: string;
+	startedAt?: string;
+	output?: string;
+	thinking?: string;
 	/** 1-based ordinal of the retry now in flight (0 = not retrying). */
 	retryCount: number;
 	/** Error that triggered the current retry, when retryCount > 0. */
@@ -219,6 +227,11 @@ export function coerceCompactProgressEvent(
 		...coerceProgressSnapshot(data),
 		isSegment: data.isSegment === true,
 		mode: data.mode === "background" ? "background" : "blocking",
+		...(typeof data.model === "string" ? { model: data.model } : {}),
+		...(typeof data.reasoningEffort === "string" ? { reasoningEffort: data.reasoningEffort } : {}),
+		...(typeof data.startedAt === "string" ? { startedAt: data.startedAt } : {}),
+		...(typeof data.output === "string" ? { output: data.output } : {}),
+		...(typeof data.thinking === "string" ? { thinking: data.thinking } : {}),
 		// Older servers never broadcast retry state, which normalizes to "not
 		// retrying" — exactly their pre-existing behaviour.
 		retryCount,
@@ -417,6 +430,7 @@ interface NarratorWSCallbacks {
 		toolUseId: string,
 		toolName: string,
 		streamStartedAt?: number,
+		streamCompletedAt?: number,
 		input?: Record<string, unknown>,
 		parentToolUseId?: string,
 		meta?: SubagentToolEventMeta,
@@ -1043,6 +1057,7 @@ export function useNarratorWS(
 							data.toolUseId as string,
 							data.toolName as string,
 							data.streamStartedAt as number | undefined,
+							data.streamCompletedAt as number | undefined,
 							data.input as Record<string, unknown> | undefined,
 							data.parentToolUseId as string | undefined,
 							subagentToolEventMeta(data),
@@ -1631,6 +1646,7 @@ export function useNarratorWS(
 								executing?: boolean;
 								input?: unknown;
 								streamStartedAt?: number;
+								streamCompletedAt?: number;
 								streamingOutput?: string;
 								structuredProgress?: ToolProgressPayload;
 								toolCallId?: string | null;

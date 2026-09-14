@@ -152,6 +152,7 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			status,
 			durationMs: block.durationMs ?? tc?.durationMs,
 			streamStartedAt: block.streamStartedAt ?? matchingTc?.streamStartedAt,
+			streamCompletedAt: block.streamCompletedAt ?? matchingTc?.streamCompletedAt,
 			permissionStartedAt: block.permissionStartedAt ?? matchingTc?.permissionStartedAt,
 			executionStartedAt: block.executionStartedAt ?? matchingTc?.executionStartedAt,
 			completedAt: block.completedAt ?? matchingTc?.completedAt,

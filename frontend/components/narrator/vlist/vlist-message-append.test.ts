@@ -3,6 +3,7 @@ import {
 	type AppendCandidate,
 	appendLoadedMessage,
 	resolveMessageAppend,
+	upsertLoadedMessage,
 } from "./vlist-message-append";
 
 function msg(id: string, seq: number, extra: Partial<AppendCandidate> = {}): AppendCandidate {
@@ -112,6 +113,32 @@ describe("resolveMessageAppend — what may extend the loaded window", () => {
 		expect(
 			resolveMessageAppend({ message: msg("d", 4), loaded: messy, isSubagent: false }),
 		).toEqual({ append: false, reason: "not-tail" });
+	});
+});
+
+describe("upsertLoadedMessage", () => {
+	it("replaces a same-id row so delivery state is not dropped", () => {
+		const next = msg("m2", 2, { deliveryState: "materialized" });
+		const result = upsertLoadedMessage(loaded, next, false);
+		expect(result.changed).toBe(true);
+		expect(result.appended).toBe(false);
+		expect(result.messages).toHaveLength(3);
+		expect(result.messages[1]).toMatchObject(next);
+		expect(result.messages[1]).not.toBe(loaded[1]);
+	});
+
+	it("does not add a second row when a catch-up payload repeats id + seq", () => {
+		const result = upsertLoadedMessage(loaded, msg("m2", 2), false);
+		expect(result.messages).toHaveLength(3);
+		expect(result.changed).toBe(true);
+		expect(result.messages.filter((entry) => entry.id === "m2")).toHaveLength(1);
+	});
+
+	it("appends a new tail row and rejects a conflicting occupied seq", () => {
+		expect(upsertLoadedMessage(loaded, msg("m4", 4), false).appended).toBe(true);
+		const conflict = upsertLoadedMessage(loaded, msg("other", 2), false);
+		expect(conflict.changed).toBe(false);
+		expect(conflict.reason).toBe("duplicate");
 	});
 });
 

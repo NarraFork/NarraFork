@@ -12,6 +12,7 @@ export interface ExecutionLogRecord {
 	startedAt: string;
 	createdAt: string;
 	streamStartedAt: string | null;
+	streamCompletedAt: string | null;
 	permissionStartedAt: string | null;
 	executionStartedAt: string | null;
 	completedAt: string | null;

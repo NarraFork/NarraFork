@@ -152,6 +152,7 @@ describe("LivePatchQueue", () => {
 		const drains: (() => void)[] = [];
 		const applied: LivePatch[] = [];
 		let cancelled = 0;
+		let applyResult = true;
 		let current = narratorId;
 		return {
 			applied,
@@ -164,6 +165,9 @@ describe("LivePatchQueue", () => {
 			setNarrator: (next: string | undefined) => {
 				current = next;
 			},
+			setApplyResult: (next: boolean) => {
+				applyResult = next;
+			},
 			frame: () => {
 				const drain = drains.shift();
 				drain?.();
@@ -172,7 +176,7 @@ describe("LivePatchQueue", () => {
 				currentNarratorId: () => current,
 				apply: (patch: LivePatch) => {
 					applied.push(patch);
-					return true;
+					return applyResult;
 				},
 				schedule: (drain: () => void) => {
 					drains.push(drain);
@@ -209,6 +213,19 @@ describe("LivePatchQueue", () => {
 		// The single composed patch really carries all three.
 		const result = h.applied[0]?.([]);
 		expect(result?.messages).toHaveLength(3);
+	});
+
+	it("notifies terminal-event fallbacks when the loaded document cannot be patched", async () => {
+		const { LivePatchQueue } = await import("./vlist-live-patch");
+		const h = harness("n1");
+		h.setApplyResult(false);
+		const queue = new LivePatchQueue(h.host);
+		let missed = 0;
+		queue.enqueue(marker("completion"), () => {
+			missed += 1;
+		});
+		h.frame();
+		expect(missed).toBe(1);
 	});
 
 	it("drops a batch whose narrator changed before the frame drained", async () => {

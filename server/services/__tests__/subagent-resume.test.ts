@@ -696,6 +696,24 @@ describe("resumeSubagent status reconciliation", () => {
 });
 
 describe("resumeSubagent", () => {
+	test("mailbox wake skips ordinary follow-up payload validation", async () => {
+		const result = await resumeSubagent({
+			subagentId: "mailbox-wake",
+			intent: "follow_up",
+			actor: "parent_agent",
+			mailboxInput: true,
+			locale: "en",
+		});
+
+		expect(result.started).toBe(true);
+		expect(startCalls[0]).toMatchObject({
+			mailboxInput: true,
+			persistPrompt: false,
+		});
+		await finishRun("mailbox-wake");
+		await expect(result.terminalCompletion).resolves.toContain("done");
+	});
+
 	test("real plugin creation persists provenance across database reads and repeated resumes", async () => {
 		const { db } = await import("../../db");
 		const { narrators, narratorMessages, narratorMessageRefs } = await import("../../db/schema");
@@ -764,6 +782,8 @@ describe("resumeSubagent", () => {
 				await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, id));
 				await db.delete(narrators).where(eq(narrators.id, id));
 			}
+			await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, parentId));
+			await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, parentId));
 			await db.delete(narrators).where(eq(narrators.id, parentId));
 		}
 	});

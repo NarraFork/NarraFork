@@ -9,7 +9,7 @@ import { parseModelId } from "@shared/model-id";
 import { getCodexManager } from "../codex-manager";
 import { AppError } from "../errors";
 import { modelCardContextWindow, modelCardMaxCompletionTokens } from "../model-cards";
-import { resolveNugModelMeta } from "../nug-model-cache";
+import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
 import type {
 	AnthropicProviderConfig,
 	GeminiProviderConfig,
@@ -592,6 +592,23 @@ export function getVisibleModels(): string[] {
 		result.push(v);
 	}
 	return result;
+}
+
+/**
+ * Models that may be exposed to the subagent tool. Unlike the regular picker,
+ * subagents should not be offered NUG models explicitly marked unavailable.
+ * Unknown cache state remains visible for compatibility with legacy gateways.
+ */
+export function getSubagentVisibleModels(): string[] {
+	return getVisibleModels().filter((model) => {
+		const colon = model.indexOf(":");
+		if (colon <= 0) return true;
+		const prefix = model.slice(0, colon);
+		const config = getNugProviderConfig(prefix);
+		if (!config) return true;
+		const nugModelId = model.slice(colon + 1);
+		return isNugCachedModelAvailable(config.id, nugModelId) !== false;
+	});
 }
 
 // ---------------------------------------------------------------------------

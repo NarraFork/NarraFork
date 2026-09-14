@@ -11,6 +11,9 @@ export interface MessageContextMenuActions {
 	onDeleteBlock?: (blockIndex: number) => Promise<void> | void;
 	onRollbackToBlock?: (blockIndex: number) => void;
 	onEditMessage?: () => void;
+	/** Queue-control actions use the mailbox row id, not the canonical message id. */
+	onCancelQueued?: () => void;
+	onRetryQueued?: () => void;
 	onJumpToSource?: () => void;
 	onRetryCompact?: () => void;
 	onDismissFailedCompact?: () => void;

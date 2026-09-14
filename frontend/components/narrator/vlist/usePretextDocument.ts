@@ -233,6 +233,8 @@ export interface UsePretextDocumentResult {
 	 * marker, duplicate), so the caller falls back to a structural reload.
 	 */
 	appendMessage: (message: TreeMessage) => boolean;
+	/** Apply a canonical realtime/catch-up message by id + seq without duplicating it. */
+	upsertMessage: (message: TreeMessage) => boolean;
 	/**
 	 * Insert a mid-window structural marker (a segment-compact marker, or a custom
 	 * compact with a `beforeMessageId`) into the loaded window in place. Returns
@@ -705,6 +707,18 @@ export function usePretextDocument(
 	// Same live-view contract as appendMessage: the anchor is captured from the
 	// CURRENT scroll position at insert time, so a scroll in flight cannot desync
 	// it from the correction that follows.
+	const upsertMessage = useCallback(
+		(message: TreeMessage) =>
+			coordinator?.upsertMessage(message, options.isSubagent === true, () => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			}) ?? false,
+		[coordinator, options.getCurrentView, options.isSubagent],
+	);
 	const insertMessage = useCallback(
 		(message: TreeMessage) =>
 			coordinator?.insertMessage(message, () => {
@@ -805,6 +819,7 @@ export function usePretextDocument(
 		applyLivePatch,
 		setStreamingMessage,
 		appendMessage,
+		upsertMessage,
 		insertMessage,
 		removeMessages,
 		replaceMessage,

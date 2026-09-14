@@ -10,7 +10,7 @@ import { toolRegistry } from "./agent/tool-registry";
 import { OPTIONAL_TOOLS, REVIEW_TOOLS } from "./agent/tools/index";
 import type { ToolDefinition } from "./agent/types";
 import { parseTraits } from "./narrator-utils";
-import { getVisibleModels, resolveAllowedModelCandidateMatch, settings } from "./settings";
+import { getSubagentVisibleModels, resolveAllowedModelCandidateMatch, settings } from "./settings";
 import { expandAllowedPoolForDisplay } from "./settings/provider";
 
 export const SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX = "custom-subagent-models:";
@@ -377,6 +377,7 @@ export function formatSubagentModelRestrictionDescription(traits: unknown): stri
 	const restriction = parseSubagentModelRestrictionTrait(traits);
 	if (!restriction) return null;
 	const parts: string[] = [];
+	const visibleModels = new Set(getSubagentVisibleModels());
 	const keys = Object.keys(restriction.pools).sort((a, b) => {
 		const order = ["explore", "plan", "search", "review", "general"];
 		return (
@@ -385,7 +386,9 @@ export function formatSubagentModelRestrictionDescription(traits: unknown): stri
 		);
 	});
 	for (const key of keys) {
-		const entries = restriction.pools[key] ?? [];
+		const entries = (restriction.pools[key] ?? []).filter((entry) =>
+			visibleModels.has(entry.model),
+		);
 		if (entries.length === 0) {
 			parts.push(`${key}: (no models allowed)`);
 			continue;
@@ -397,7 +400,7 @@ export function formatSubagentModelRestrictionDescription(traits: unknown): stri
 }
 
 export function getVisibleModelUses(): SubagentModelUse[] {
-	return getVisibleModels().map((model) => ({ model }));
+	return getSubagentVisibleModels().map((model) => ({ model }));
 }
 
 /** Shape returned by the narrator custom-traits API + `custom_traits_changed` WS event. */

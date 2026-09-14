@@ -3,7 +3,7 @@ import { isSubagentReasoningEffort, SUBAGENT_POOL_TYPES } from "@shared/subagent
 import { z } from "zod/v4";
 import { resolvePath } from "../../platform-path";
 import { shouldUseNativeSearch } from "../../search/native";
-import { expandAllowedPoolForDisplay, getVisibleModels, settings } from "../../settings";
+import { expandAllowedPoolForDisplay, getSubagentVisibleModels, settings } from "../../settings";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
 
@@ -18,11 +18,16 @@ import baseDescription from "./task.txt" with { type: "text" };
 
 /** Build a dynamic model list string from all visible models. */
 function getAvailableModelsList(): string {
-	const models = getVisibleModels();
+	const models = getSubagentVisibleModels();
 	if (models.length > 0) {
 		return models.join(", ");
 	}
 	return "(no models configured yet)";
+}
+
+function filterSubagentModels(models: string[]): string[] {
+	const visible = new Set(getSubagentVisibleModels());
+	return models.filter((model) => visible.has(model));
 }
 
 const MODEL_PARAM_BASE =
@@ -42,17 +47,18 @@ function getModelParameterDescription(config?: AgentConfig): string {
 		for (const type of SUBAGENT_POOL_TYPES) {
 			const pool = pools[type];
 			if (pool && pool.length > 0) {
+				const availablePool = filterSubagentModels(pool);
 				const efforts = settings.agent.subagentModelReasoningEfforts?.[type];
 				// Keep the old compact display untouched when this pool has no fixed tiers.
-				const models = pool.some((model) => isSubagentReasoningEffort(efforts?.[model]))
-					? pool.map((model) => {
+				const models = availablePool.some((model) => isSubagentReasoningEffort(efforts?.[model]))
+					? availablePool.map((model) => {
 							const display = expandAllowedPoolForDisplay([model]).join(", ");
 							const effort = efforts?.[model];
 							return isSubagentReasoningEffort(effort)
 								? `${display} [fixed reasoning_effort=${effort}]`
 								: display;
 						})
-					: expandAllowedPoolForDisplay(pool);
+					: expandAllowedPoolForDisplay(availablePool);
 				restrictedParts.push(`${type}: ${models.join(", ")}`);
 			} else {
 				unrestrictedTypes.push(type);

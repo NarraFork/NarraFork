@@ -83,6 +83,26 @@ describe("buildRowCtxActions", () => {
 		expect(actions.onEditMessage).toBeUndefined();
 	});
 
+	it("binds mailbox controls instead of generic history editing for queued rows", () => {
+		const seen: string[] = [];
+		const actions = buildRowCtxActions(
+			{
+				messageId: MSG,
+				blockIndex: 0,
+				queued: {
+					onEdit: () => seen.push("edit"),
+					onCancel: () => seen.push("cancel"),
+					onRetry: () => seen.push("retry"),
+				},
+			},
+			{ onEditMessage: () => seen.push("history-edit") },
+		);
+		actions.onEditMessage?.();
+		actions.onCancelQueued?.();
+		actions.onRetryQueued?.();
+		expect(seen).toEqual(["edit", "cancel", "retry"]);
+	});
+
 	it("hides onEditMessage when no handler is supplied", () => {
 		expect(
 			buildRowCtxActions({ messageId: MSG, blockIndex: 0, editable: true }, {}).onEditMessage,

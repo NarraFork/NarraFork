@@ -57,6 +57,13 @@ export interface ProviderTypeCapabilities {
 	mayLeakXmlToolCalls?: boolean;
 }
 
+/**
+ * Provider-declared policy/payload limits retained by the registry.
+ *
+ * `maxConcurrentChat` and `maxConcurrentGenerate` describe plugin-owned provider/business
+ * concurrency (including any plugin queue or throttle); they are not host admission limits.
+ * Generic IPC safety budgets are enforced by the provider RPC client instead.
+ */
 export interface ProviderTypeLimits {
 	maxConcurrentChat?: number;
 	maxConcurrentGenerate?: number;

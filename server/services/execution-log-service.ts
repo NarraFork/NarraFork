@@ -123,6 +123,7 @@ export interface ExecutionLogRecord {
 	startedAt: string;
 	createdAt: string;
 	streamStartedAt: string | null;
+	streamCompletedAt: string | null;
 	permissionStartedAt: string | null;
 	executionStartedAt: string | null;
 	completedAt: string | null;
@@ -207,6 +208,7 @@ const LIST_COLUMNS = {
 	startedAt: narratorToolCalls.startedAt,
 	createdAt: narratorToolCalls.createdAt,
 	streamStartedAt: narratorToolCalls.streamStartedAt,
+	streamCompletedAt: narratorToolCalls.streamCompletedAt,
 	permissionStartedAt: narratorToolCalls.permissionStartedAt,
 	executionStartedAt: narratorToolCalls.executionStartedAt,
 	completedAt: narratorToolCalls.completedAt,
@@ -525,6 +527,7 @@ export class ExecutionLogService {
 			startedAt: (row.startedAt as string | null) ?? (row.createdAt as string),
 			createdAt: row.createdAt as string,
 			streamStartedAt: (row.streamStartedAt as string | null) ?? null,
+			streamCompletedAt: (row.streamCompletedAt as string | null) ?? null,
 			permissionStartedAt: (row.permissionStartedAt as string | null) ?? null,
 			executionStartedAt: (row.executionStartedAt as string | null) ?? null,
 			completedAt: (row.completedAt as string | null) ?? null,

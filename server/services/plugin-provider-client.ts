@@ -12,6 +12,7 @@
  */
 
 import { logger } from "@server/lib/logger";
+import type { JsonRpcNotification } from "@server/lib/plugins/protocol";
 import { PluginProviderRpcClient, PluginRuntimeProviderTransport } from "./plugin-provider-rpc";
 
 /** The runtime surface the provider transport needs. */
@@ -19,11 +20,17 @@ export interface ProviderRuntimeLike {
 	request<T = unknown>(
 		method: string,
 		params?: unknown,
-		options?: { signal?: AbortSignal; timeoutMs?: number },
+		options?: {
+			signal?: AbortSignal;
+			timeoutMs?: number;
+			priority?: "control" | "unary" | "stream";
+		},
 	): Promise<T>;
 	notify(method: string, params?: unknown): Promise<void>;
 	quarantine(reason: string): void;
-	onNotification?(handler: (notification: never, bodyBytes?: number) => void): () => void;
+	onNotification?(
+		handler: (notification: JsonRpcNotification, bodyBytes?: number) => void,
+	): () => void;
 	onClose?(handler: (error?: Error) => void): () => void;
 }
 
@@ -41,6 +48,88 @@ export type ProviderRuntimeResolver = (
 export interface ProviderClientHost {
 	name?: string;
 	version?: string;
+}
+
+type ProviderNotificationHandler = (notification: JsonRpcNotification, bodyBytes?: number) => void;
+type ProviderClientLookup = () => PluginProviderRpcClient | undefined;
+
+interface ProviderNotificationSubscription {
+	lookupClient: ProviderClientLookup;
+	handler: ProviderNotificationHandler;
+}
+
+/**
+ * One notification subscription per shared runtime, with operation-aware fan-out.
+ *
+ * A runtime can back several provider clients. Valid events are routed only to the client that
+ * owns (or recently closed) their operation. Events without a routable operation are sent to one
+ * current client so malformed and unknown events still reach `handleNotification` exactly once,
+ * rather than being silently discarded or counted as foreign late events by every client.
+ */
+class SharedProviderNotificationDispatcher {
+	private readonly subscriptions = new Set<ProviderNotificationSubscription>();
+	private lastSubscription?: ProviderNotificationSubscription;
+	private readonly unsubscribeRuntime: () => void;
+
+	constructor(private readonly runtime: ProviderRuntimeLike) {
+		this.unsubscribeRuntime =
+			runtime.onNotification?.((notification, bodyBytes) => {
+				this.dispatch(notification, bodyBytes);
+			}) ?? (() => undefined);
+	}
+
+	subscribe(lookupClient: ProviderClientLookup, handler: ProviderNotificationHandler): () => void {
+		const subscription = { lookupClient, handler };
+		this.subscriptions.add(subscription);
+		this.lastSubscription = subscription;
+		return () => {
+			if (!this.subscriptions.delete(subscription)) return;
+			if (this.lastSubscription === subscription) {
+				this.lastSubscription = [...this.subscriptions].at(-1);
+			}
+			if (this.subscriptions.size === 0) {
+				this.unsubscribeRuntime();
+				dispatchers.delete(this.runtime as object);
+			}
+		};
+	}
+
+	private dispatch(notification: JsonRpcNotification, bodyBytes?: number): void {
+		if (notification.method !== "provider.event") return;
+		const operationId = providerEventOperationId(notification);
+		if (operationId) {
+			const owners = [...this.subscriptions].filter((subscription) =>
+				subscription.lookupClient()?.acceptsOperationNotification(operationId),
+			);
+			if (owners.length > 0) {
+				for (const owner of owners) owner.handler(notification, bodyBytes);
+				return;
+			}
+		}
+		// There is no safe operation-based owner for malformed/unknown events. Use one active
+		// subscription as the runtime-level protocol sink instead of broadcasting it to every client.
+		this.lastSubscription?.handler(notification, bodyBytes);
+	}
+}
+
+const dispatchers = new WeakMap<object, SharedProviderNotificationDispatcher>();
+
+function sharedProviderNotificationDispatcher(
+	runtime: ProviderRuntimeLike,
+): SharedProviderNotificationDispatcher {
+	const key = runtime as object;
+	const existing = dispatchers.get(key);
+	if (existing) return existing;
+	const created = new SharedProviderNotificationDispatcher(runtime);
+	dispatchers.set(key, created);
+	return created;
+}
+
+function providerEventOperationId(notification: JsonRpcNotification): string | undefined {
+	const params = notification.params;
+	if (typeof params !== "object" || params === null || Array.isArray(params)) return undefined;
+	const operationId = (params as Record<string, unknown>).operationId;
+	return typeof operationId === "string" && operationId.length > 0 ? operationId : undefined;
 }
 
 /**
@@ -99,17 +188,24 @@ export class DeferredProviderClient {
 		if (generation !== this.generation) {
 			throw new Error("Provider client activation was reset");
 		}
-		const subscribeNotifications = runtime.onNotification?.bind(runtime);
 		const subscribeClose = runtime.onClose?.bind(runtime);
+		let client: PluginProviderRpcClient | undefined;
+		const dispatcher = runtime.onNotification
+			? sharedProviderNotificationDispatcher(runtime)
+			: undefined;
+		const subscribeNotifications = dispatcher
+			? (handler: ProviderNotificationHandler) => dispatcher.subscribe(() => client, handler)
+			: undefined;
 		const transport = new PluginRuntimeProviderTransport(runtime, {
 			...(subscribeNotifications ? { subscribeNotifications } : {}),
 			...(subscribeClose ? { subscribeClose } : {}),
 		});
-		const client = new PluginProviderRpcClient({
+		const createdClient = new PluginProviderRpcClient({
 			transport,
 			expectedPluginId: this.pluginId,
 			host: { name: this.host.name ?? "narrafork", version: this.host.version ?? "unknown" },
 		});
+		client = createdClient;
 		let runtimeClosed = false;
 		let released = false;
 		let unsubscribeRuntimeClose: (() => void) | undefined;
@@ -119,10 +215,11 @@ export class DeferredProviderClient {
 			unsubscribeRuntimeClose?.();
 			// dispose detaches subscriptions synchronously, including notifications retained
 			// by PluginRuntime across restarts of the same runtime object.
-			void client.dispose().catch((error: unknown) => {
+			void createdClient.dispose().catch((error: unknown) => {
 				logger.warn("plugin provider client disposal failed", { pluginId: this.pluginId, error });
 			});
 		};
+
 		// Track the client before describe settles: reset/close must also release a pending
 		// activation. A stale close or handshake must never clear its replacement.
 		this.releaseClient = release;
@@ -133,17 +230,17 @@ export class DeferredProviderClient {
 				if (generation === this.generation) this.reset();
 			});
 			// `provider.describe` negotiates and caches the protocol required by all calls.
-			await client.describe({});
+			await createdClient.describe({});
 			if (runtimeClosed) throw new Error("Provider runtime closed during activation");
 			if (generation !== this.generation) {
 				throw new Error("Provider client activation was reset");
 			}
-			this.client = client;
+			this.client = createdClient;
 			logger.debug("plugin provider client activated", {
 				pluginId: this.pluginId,
 				providerTypeId: this.providerTypeId,
 			});
-			return client;
+			return createdClient;
 		} catch (error) {
 			release();
 			if (this.releaseClient === release) this.releaseClient = undefined;

@@ -686,7 +686,8 @@ export function createPluginPlatformServices(
 	const resolveProviderConfig = (providerInstanceId: string) =>
 		providerCredentialResolver.resolve(providerInstanceId);
 	/**
-	 * Resolve host-provided hints (proxy, concurrency budget) for plugin provider requests.
+	 * Resolve host-provided hints (proxy and optional cooperative upstream-concurrency hint) for
+	 * plugin provider requests.
 	 *
 	 * Read per-call so a settings or override change takes effect without restarting plugins.
 	 *
@@ -702,9 +703,11 @@ export function createPluginPlatformServices(
 	 * case, carrying an absent proxy, which `applyHostHints` on the plugin side reads as
 	 * "clear it".
 	 *
-	 * Concurrency budget is intentionally not populated: the only value the host could send
-	 * is the plugin's own declared maxConcurrentChat, which is noise. Real cross-path budget
-	 * sharing requires provider-specific state that doesn't belong in the generic plugin path.
+	 * Provider-specific concurrency is intentionally not enforced by the host. The plugin owns
+	 * upstream queuing and limits; generic host-side accounting must not reject a request based
+	 * on a plugin-declared maxConcurrentChat/maxConcurrentGenerate value. The separate provider
+	 * RPC client still enforces generic IPC safety budgets such as maxInFlightOperations and frame/
+	 * queue/request/response byte limits.
 	 */
 	const resolveProviderHostHints = (
 		context?: ProviderHostHintsContext,

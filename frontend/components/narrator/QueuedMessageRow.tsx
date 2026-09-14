@@ -449,9 +449,14 @@ export function QueuedMessageRow({
 					</Badge>
 				)}
 				<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
-					<Text size="xs" c="blue" truncate>
-						{msg.text}
-					</Text>
+					<Badge
+						size="xs"
+						variant="light"
+						color={failed ? "red" : "blue"}
+						style={{ alignSelf: "flex-start" }}
+					>
+						{failed ? t("queuedFailed") : t("status_queued")}
+					</Badge>
 					{failureNotice}
 				</Stack>
 				{failed && (

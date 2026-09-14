@@ -975,29 +975,26 @@ export const providerOutboundHintsSchema = z
 	.strict();
 
 /**
- * Concurrency budget hint the host attaches to streaming provider methods.
+ * Optional cooperative upstream-concurrency hint for provider methods.
  *
- * ## Design rationale
+ * Provider concurrency has two distinct layers:
  *
- * The host already enforces a hard ceiling via `descriptor.limits.maxConcurrentChat` — it
- * simply rejects requests above that count. But that only limits plugin-to-host concurrency;
- * it does not prevent the plugin from opening more connections *to the upstream API* than the
- * shared account can tolerate (free-tier 429s, rate-limit bans).
+ * 1. Host-owned generic IPC safety budgets (`maxInFlightOperations`, frame/queue/request bytes,
+ *    and related time/output limits). The host enforces these budgets to protect the runtime and
+ *    the host event loop.
+ * 2. Provider-specific business concurrency (`descriptor.limits.maxConcurrentChat` /
+ *    `maxConcurrentGenerate` and upstream connection limits). The plugin owns this policy,
+ *    including queuing, throttling, and deciding when to return a provider-busy result. The host
+ *    does not reject a request because of a plugin-declared provider concurrency value.
  *
- * This hint tells the plugin how many concurrent upstream connections it should open. The
- * host cannot enforce this (the plugin process makes its own TCP connections), so this is a
- * cooperative protocol, documented honestly here. A well-behaved plugin should use this to
- * cap its own outbound semaphore/pool.
- *
- * ## Distinction from maxConcurrentChat
- *
- * `maxConcurrentChat` (in descriptor.limits) = host-side hard limit; host REJECTS over-budget.
- * `concurrencyBudget` (in request params) = hint to plugin; plugin SHOULD self-throttle.
+ * This hint is only for the second layer: it tells the plugin how many concurrent upstream
+ * connections it should target. The host cannot enforce it (the plugin process makes its own TCP
+ * connections), so a well-behaved plugin should apply it to its own outbound semaphore/pool.
  *
  * ## When absent
  *
- * Absent means the host has no opinion on upstream concurrency. The plugin should fall back
- * to its own default (typically the value it declares in `descriptor.limits.maxConcurrentChat`).
+ * Absent means the host has no opinion on upstream concurrency. The plugin should fall back to
+ * its own policy, including any defaults associated with its declared provider limits.
  */
 export const providerConcurrencyBudgetSchema = z
 	.object({
@@ -1011,14 +1008,14 @@ export const providerConcurrencyBudgetSchema = z
 		 * ## Current delivery status
 		 *
 		 * The host does NOT currently populate this field. The only per-provider concurrency
-		 * value the host knows is `descriptor.limits.maxConcurrentChat`, which the plugin itself
-		 * declared — sending it back would be pure noise since the plugin already has it.
+		 * value the host knows is `descriptor.limits.maxConcurrentChat`, which is plugin-declared
+		 * policy metadata rather than a host admission limit; sending it back would be pure noise.
 		 *
 		 * Meaningful delivery requires the host to know how much of a shared upstream quota is
-		 * being consumed by OTHER paths (e.g. a built-in adapter sharing the same
-		 * account). That information lives in provider-specific concurrency-control state and should
-		 * not leak into the generic plugin protocol. When a cross-path budget coordination
-		 * mechanism exists, this field becomes the delivery vehicle.
+		 * being consumed by OTHER paths (e.g. a built-in adapter sharing the same account). That
+		 * information lives in provider-specific concurrency-control state and should not leak into
+		 * the generic plugin protocol. When a cross-path budget coordination mechanism exists, this
+		 * field becomes the delivery vehicle.
 		 */
 		maxConcurrentUpstream: z.number().int().min(1).max(1_000).optional(),
 	})

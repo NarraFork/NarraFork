@@ -20,10 +20,14 @@ import {
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
-import type { ImageRef } from "../lib/uploads";
+import { type ImageRef, imageRefToContentBlock } from "../lib/uploads";
 import { MAILBOX_LIMITS } from "./agent-runtime/limits";
 import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxRow } from "./agent-runtime/mailbox-types";
+import {
+	readCanonicalMessageTreeTx,
+	updateCanonicalMessageTx,
+} from "./narrator-history-projection";
 import {
 	activeNarrators,
 	type BufferCreator,
@@ -120,6 +124,13 @@ function json<T>(value: string | null, fallback: T): T {
 function rowById(id: string): MailboxRow | undefined {
 	return db.select().from(mailbox).where(eq(mailbox.id, id)).get();
 }
+function projectedHistoryMessage(deliveryId: string, narratorId: string) {
+	if (!deliveryId) return undefined;
+	return db.transaction(
+		(tx) => readCanonicalMessageTreeTx(tx, narratorId, deliveryId) ?? undefined,
+	);
+}
+export type BufferedHistoryMessage = NonNullable<ReturnType<typeof projectedHistoryMessage>>;
 function ensureStagingDirectory(id: string): string {
 	const dir = stagingPath(id);
 	mkdirSync(dir, { recursive: true });
@@ -262,7 +273,13 @@ export function loadBufferedTextFiles(saved: SavedBufferedFile[]): File[] {
 		return [new File([Bun.file(s.path)], s.filename, { type: "text/plain" })];
 	});
 }
-export function projectMailboxUserMessage(row: MailboxRow): BufferedMessage {
+type BufferedMessageWithProjection = BufferedMessage & {
+	_canonicalMessageId?: string;
+	_deliveryId?: string;
+	_recipientRefId?: string;
+};
+
+export function projectMailboxUserMessage(row: MailboxRow): BufferedMessageWithProjection {
 	if (row.kind !== "user_input") throw new Error("Expected user mailbox input");
 	const saved = json<SavedBufferedFile[]>(row.textFilePathsJson, []);
 	const payload = json<{ path: string } | null>(row.payloadRefJson, null);
@@ -288,6 +305,9 @@ export function projectMailboxUserMessage(row: MailboxRow): BufferedMessage {
 		_savedFiles: saved.length ? saved : undefined,
 		_stagingId: json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id,
 		_recipientMessageId: row.recipientMessageId ?? undefined,
+		_canonicalMessageId: row.currentMessageId ?? undefined,
+		_deliveryId: row.deliveryId ?? undefined,
+		_recipientRefId: row.recipientRefId ?? undefined,
 		bufferedAt: row.bufferedAt,
 		get commandText() {
 			return metadata.commandTextPath ? readManagedText(metadata.commandTextPath) : row.commandText;
@@ -311,6 +331,7 @@ export function projectMailboxUserMessage(row: MailboxRow): BufferedMessage {
 	};
 }
 export function getBufferedMessages(narratorId: string): BufferedMessage[] {
+	if (store.hasLegacyProjectionWork(narratorId)) store.repairLegacyProjections(narratorId);
 	return db
 		.select()
 		.from(mailbox)
@@ -347,7 +368,13 @@ export async function enqueueBufferedMessage(
 	bashCommand?: string | null,
 	fileReferences?: FileReferenceSnapshot[],
 	frontOrder: "stack" | "fifo" = "stack",
-): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
+): Promise<{
+	ok: boolean;
+	bufferedAt: string;
+	id: string;
+	full?: boolean;
+	message?: ReturnType<typeof projectedHistoryMessage>;
+}> {
 	const stagingId = generateShortId();
 	const refs = freezeFileReferenceSnapshots(fileReferences);
 	images = images?.map((image) => ({ ...image }));
@@ -427,6 +454,24 @@ export async function enqueueBufferedMessage(
 					creatorJson: creator ? JSON.stringify(creator) : null,
 					textFilePathsJson: saved.length ? JSON.stringify(saved) : null,
 					fileReferencesJson,
+					history: {
+						role: "user",
+						contentJson: [
+							...(images ?? []).map((image) => imageRefToContentBlock(image)),
+							...refs,
+							...(saved.length
+								? saved.map((file) => ({
+										type: "text_file",
+										filename: file.filename,
+										size: file.size,
+									}))
+								: []),
+							{ type: "text", text },
+						],
+						contentText: text,
+						commandText,
+						createdBy,
+					},
 				},
 				tx,
 			);
@@ -464,7 +509,13 @@ export async function enqueueBufferedMessage(
 			cleanupBufferedTextFiles(stagingId);
 			return { ok: false, bufferedAt: "", id: "", full: true };
 		}
-		return { ok: true, bufferedAt: result.delivery.bufferedAt, id: result.delivery.id };
+		return {
+			ok: true,
+			bufferedAt: result.delivery.bufferedAt,
+			id: result.delivery.id,
+			message:
+				result.message ?? projectedHistoryMessage(result.delivery.deliveryId ?? "", narratorId),
+		};
 	} catch (error) {
 		cleanupBufferedTextFiles(stagingId);
 		throw error;
@@ -482,6 +533,7 @@ export async function updateBufferedMessage(
 	text: string,
 	opts: BufferedMessageAttachmentUpdate = {},
 ): Promise<boolean> {
+	if (store.hasLegacyProjectionWork(narratorId)) store.repairLegacyProjections(narratorId);
 	const row = rowById(messageId);
 	if (
 		!row ||
@@ -551,6 +603,22 @@ export async function updateBufferedMessage(
 					? JSON.stringify(opts.savedFiles)
 					: null;
 		const metadataJson = JSON.stringify({ ...metadata, stagingId });
+		const historyFileReferences = metadata.fileReferencesPath
+			? JSON.parse(readManagedText(metadata.fileReferencesPath))
+			: json<FileReferenceSnapshot[]>(fileReferencesJson ?? row.fileReferencesJson, []);
+		const historyContentJson = [
+			...json<ImageRef[]>(imagesJson, []).map((image) => imageRefToContentBlock(image)),
+			...historyFileReferences,
+			...json<SavedBufferedFile[]>(textFilePathsJson, []).map((file) => ({
+				type: "text_file",
+				filename: file.filename,
+				size: file.size,
+			})),
+			{ type: "text", text },
+		];
+		const historyCommandText = metadata.commandTextPath
+			? readManagedText(metadata.commandTextPath)
+			: row.commandText;
 		if (
 			[
 				imagesJson,
@@ -566,39 +634,56 @@ export async function updateBufferedMessage(
 		)
 			throw new Error("Attachment metadata exceeds mailbox budget");
 		const ok = db.transaction((tx) => {
-			const changed =
-				tx
-					.update(mailbox)
-					.set({
-						text: payloadRefJson ? "" : text,
-						payloadRefJson,
-						byteSize: bytes,
-						projectedByteSize: bytes,
-						bufferedAt: new Date().toISOString(),
-						updatedAt: new Date().toISOString(),
-						imagesJson,
-						textFilePathsJson,
-						fileReferencesJson,
-						metadataJson,
-						contentRevision: row.contentRevision + 1,
-					})
-					.where(
-						and(
-							eq(mailbox.id, messageId),
-							eq(mailbox.narratorId, narratorId),
-							eq(mailbox.kind, "user_input"),
-							inArray(mailbox.state, pending),
-							eq(mailbox.contentRevision, row.contentRevision),
-						),
-					)
-					.returning({ id: mailbox.id })
-					.all().length === 1;
-			if (changed && prepared.length)
+			const updated = tx
+				.update(mailbox)
+				.set({
+					text: payloadRefJson ? "" : text,
+					payloadRefJson,
+					byteSize: bytes,
+					projectedByteSize: bytes,
+					bufferedAt: new Date().toISOString(),
+					updatedAt: new Date().toISOString(),
+					imagesJson,
+					textFilePathsJson,
+					fileReferencesJson,
+					metadataJson,
+					contentRevision: row.contentRevision + 1,
+					currentRevision: row.currentRevision + 1,
+				})
+				.where(
+					and(
+						eq(mailbox.id, messageId),
+						eq(mailbox.narratorId, narratorId),
+						eq(mailbox.kind, "user_input"),
+						inArray(mailbox.state, pending),
+						eq(mailbox.contentRevision, row.contentRevision),
+					),
+				)
+				.returning()
+				.get();
+			if (!updated) return false;
+			let projection = null;
+			if (updated.deliveryId) {
+				projection = updateCanonicalMessageTx(tx, {
+					narratorId,
+					deliveryId: updated.deliveryId,
+					contentJson: historyContentJson,
+					contentText: text,
+					commandText: historyCommandText,
+				});
+				if (!projection) throw new Error("Buffered message history projection is missing");
+				if (projection.message.id !== updated.currentMessageId)
+					tx.update(mailbox)
+						.set({ currentMessageId: projection.message.id })
+						.where(eq(mailbox.id, updated.id))
+						.run();
+			}
+			if (prepared.length)
 				writeFileSync(
 					join(stagingPath(stagingId), STAGING_OWNER_FILE),
 					JSON.stringify({ rowId: row.id }),
 				);
-			return changed;
+			return true;
 		});
 		if (!ok) {
 			for (const path of prepared) if (ownedPath(path)) rmSync(path, { force: true });
@@ -614,7 +699,7 @@ export async function updateBufferedMessage(
 	}
 }
 export function removeBufferedMessage(narratorId: string, messageId: string): boolean {
-	store.initializeLegacy(narratorId);
+	store.repairLegacyProjections(narratorId);
 	const row = rowById(messageId);
 	if (!row || row.narratorId !== narratorId || row.kind !== "user_input" || !row.deliveryId)
 		return false;
@@ -669,6 +754,7 @@ export function clearBufferedMessages(narratorId: string): void {
 }
 /** Explicit user intent only. Missing staging remains failed instead of spinning a new run. */
 export function retryBufferedMessage(narratorId: string, messageId: string): boolean {
+	store.repairLegacyProjections(narratorId);
 	const row = rowById(messageId);
 	if (
 		!row ||
@@ -729,7 +815,12 @@ export interface BufferedTextFileSummary {
 export interface BufferMessageSummary {
 	state?: "queued" | "failed";
 	error?: string | null;
+	/** Mailbox identity remains the row id used by edit/remove/reorder APIs. */
 	id: string;
+	/** Current canonical message identity, which can change after COW. */
+	messageId?: string;
+	/** Stable delivery identity used for retry/dedupe and frontend sync. */
+	deliveryId?: string;
 	text: string;
 	bufferedAt: string;
 	imageCount: number;
@@ -739,24 +830,28 @@ export interface BufferMessageSummary {
 	creator?: BufferCreator | null;
 	priority?: boolean;
 }
-export function toBufferSummary(
-	msgs: readonly Pick<
-		BufferedMessage,
-		| "state"
-		| "error"
-		| "id"
-		| "text"
-		| "bufferedAt"
-		| "images"
-		| "textFiles"
-		| "_savedFiles"
-		| "creator"
-		| "priority"
-		| "fileReferences"
-	>[],
-): BufferMessageSummary[] {
+type BufferSummaryInput = Pick<
+	BufferedMessage,
+	| "state"
+	| "error"
+	| "id"
+	| "text"
+	| "bufferedAt"
+	| "images"
+	| "textFiles"
+	| "_savedFiles"
+	| "creator"
+	| "priority"
+	| "fileReferences"
+> & {
+	_canonicalMessageId?: string;
+	_deliveryId?: string;
+};
+export function toBufferSummary(msgs: readonly BufferSummaryInput[]): BufferMessageSummary[] {
 	return msgs.map((m) => ({
 		id: m.id,
+		...(m._canonicalMessageId ? { messageId: m._canonicalMessageId } : {}),
+		...(m._deliveryId ? { deliveryId: m._deliveryId } : {}),
 		state: m.state,
 		error: m.error,
 		text: (() => {
