@@ -1,0 +1,6 @@
+{
+	"version": "0.7.5",
+	"date": "2026-09-14",
+	"en": "## Bug Fixes\n\n- Improve narrator runtime reliability across message delivery, history projection, mailbox, and WebSocket boundaries.\n- Preserve queued messages and attachments when delivery fails, and fix background-task await races.\n- Keep editor line endings intact on Windows and improve file history, rollback, and change evidence handling.\n- Add OpenCode Go session headers to improve prompt-cache reuse and gateway compatibility.\n- Fix frontend interaction stalls, failed-action feedback, IME submission handling, reconnect recovery, and missing translations.\n- Refresh preview scroll anchors after delayed rendering.",
+	"zh-CN": "## 修复\n\n- 提升叙述者运行时可靠性，完善消息投递、历史投影、邮箱与 WebSocket 的边界处理。\n- 投递失败时保留排队消息和附件，并修复后台任务等待竞态。\n- Windows 编辑器保持原有行尾格式，改进文件历史、回退安全与变更证据。\n- 为 OpenCode Go 补发会话请求头，提升提示缓存复用和网关兼容性。\n- 修复前端交互卡死、失败反馈、输入法提交、重连恢复及多处翻译缺口。\n- 修复延迟渲染后预览滚动定位失效。"
+}
