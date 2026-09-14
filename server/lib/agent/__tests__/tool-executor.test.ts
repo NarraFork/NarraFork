@@ -238,20 +238,6 @@ describe("executeTool update admission gate", () => {
 		).toBe("resumable");
 		expect(
 			classifyToolUpdateExecution({
-				toolUseId: "classify-await-any",
-				name: "Await",
-				input: { type: "bash", id: "legacy-target" },
-			}),
-		).toBe("resumable");
-		expect(
-			classifyToolUpdateExecution({
-				toolUseId: "classify-await-target-bash",
-				name: "Await",
-				input: { type: "bash", id: "target", onlyWaitFor: true },
-			}),
-		).toBe("ordinary");
-		expect(
-			classifyToolUpdateExecution({
 				toolUseId: "classify-background-agent",
 				name: "Agent",
 				input: { run_in_background: true },

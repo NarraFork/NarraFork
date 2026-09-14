@@ -384,7 +384,6 @@ mock.module("../agent-communication", () => ({
 }));
 
 const {
-	buildRecoveredAnyAwaitToolOutput,
 	buildRecoveredAwaitToolOutput,
 	buildRecoveredSendAwaitToolOutput,
 	getPlannedUpdateStartupProtection,
@@ -1471,32 +1470,6 @@ describe("planned update continuation scheduling", () => {
 				resolvedId: "child-1",
 				subagentId: "child-1",
 				status: "completed",
-			},
-		});
-	});
-
-	test("recovered any-event Await keeps only a bounded wake summary", () => {
-		const output = buildRecoveredAnyAwaitToolOutput(
-			{ type: "question", id: "legacy-selector" },
-			{
-				status: "event",
-				event: {
-					source: "mailbox_pending",
-					narratorId: "owner",
-					mailboxKind: "agent_message",
-				},
-			},
-		);
-		expect(output).toEqual({
-			_text: expect.stringContaining("mailbox_pending"),
-			_metadata: {
-				kind: "await",
-				awaitMode: "any",
-				awaitType: "question",
-				targetId: "legacy-selector",
-				status: "event",
-				eventSource: "mailbox_pending",
-				mailboxKind: "agent_message",
 			},
 		});
 	});

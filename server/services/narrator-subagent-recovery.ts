@@ -96,9 +96,6 @@ export interface RecoverableToolCall {
 	messageId: string | null;
 	/** Subagent id for `agent`, or the Await target id/alias for `await`. */
 	targetId: string;
-	/** Await mode persisted by the tool; old records default to target mode. */
-	awaitMode?: "target" | "any";
-	awaitType?: string;
 }
 
 /** Extract the plain text from a persisted tool output (`string` or `{_text}`). */
@@ -114,21 +111,12 @@ function hasUnfinishedSubstatus(substatus: string | null | undefined): boolean {
 	return UNFINISHED_SUBSTATUS_TAGS.some((tag) => tags.includes(tag));
 }
 
-function readAwaitInput(inputJson: unknown): {
-	type?: string;
-	id?: string;
-	awaitMode: "target" | "any";
-} {
-	if (!inputJson || typeof inputJson !== "object" || Array.isArray(inputJson))
-		return { awaitMode: "target" };
-	const raw = inputJson as { type?: unknown; id?: unknown; onlyWaitFor?: unknown };
-	const hasOnlyWaitFor = Object.hasOwn(raw, "onlyWaitFor");
+function readAwaitInput(inputJson: unknown): { type?: string; id?: string } {
+	if (!inputJson || typeof inputJson !== "object" || Array.isArray(inputJson)) return {};
+	const raw = inputJson as { type?: unknown; id?: unknown };
 	return {
 		type: typeof raw.type === "string" ? raw.type : undefined,
 		id: typeof raw.id === "string" ? raw.id : undefined,
-		// A missing field identifies a pre-feature persisted call, whose historical
-		// semantics were target-specific. Explicit false is the new any-event mode.
-		awaitMode: raw.onlyWaitFor === true || !hasOnlyWaitFor ? "target" : "any",
 	};
 }
 
@@ -179,9 +167,9 @@ export function selectRecoverableToolCalls(
 		if (tc.toolName === "Await") {
 			// A successful Await already carries its result; nothing to redo.
 			if (!nonTerminal && tc.status !== "fail") continue;
-			const { type, id, awaitMode } = readAwaitInput(tc.inputJson);
+			const { type, id } = readAwaitInput(tc.inputJson);
 			if (!id) continue;
-			if (awaitMode === "target" && type !== "agent") {
+			if (type !== "agent") {
 				// Background bash tasks die with the process; re-running the original
 				// command is a separate design (idempotency). Deliberately skipped.
 				logger.debug("Skipping non-agent Await during subagent recovery", {
@@ -196,8 +184,6 @@ export function selectRecoverableToolCalls(
 				toolUseId: tc.toolUseId,
 				messageId: tc.messageId ?? null,
 				targetId: id,
-				awaitMode,
-				awaitType: type,
 			});
 		}
 	}
@@ -820,34 +806,20 @@ async function driveRecoveryCandidate(
 
 		const [
 			{ awaitAgentResultDetailed },
-			{ awaitAnyRuntimeEvent },
-			{ buildRecoveredAnyAwaitToolOutput, buildRecoveredAwaitToolOutput },
+			{ buildRecoveredAwaitToolOutput },
 			{ DEFAULT_AWAIT_TIMEOUT_MS },
 		] = await Promise.all([
 			import("./agent-communication"),
-			import("./agent-runtime/await-coordinator"),
 			import("./update-recovery-service"),
 			import("../lib/agent/tools/await"),
 		]);
-		if (candidate.awaitMode === "any") {
-			const result = await awaitAnyRuntimeEvent({
-				narratorId,
-				timeoutMs: DEFAULT_AWAIT_TIMEOUT_MS,
-				signal,
-			});
-			output = buildRecoveredAnyAwaitToolOutput(
-				{ type: candidate.awaitType, id: candidate.targetId },
-				result,
-			);
-		} else {
-			const result = await awaitAgentResultDetailed({
-				callerNarratorId: narratorId,
-				id: candidate.targetId,
-				timeoutMs: DEFAULT_AWAIT_TIMEOUT_MS,
-				signal,
-			});
-			output = buildRecoveredAwaitToolOutput(candidate.targetId, result);
-		}
+		const result = await awaitAgentResultDetailed({
+			callerNarratorId: narratorId,
+			id: candidate.targetId,
+			timeoutMs: DEFAULT_AWAIT_TIMEOUT_MS,
+			signal,
+		});
+		output = buildRecoveredAwaitToolOutput(candidate.targetId, result);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		status = "fail";
