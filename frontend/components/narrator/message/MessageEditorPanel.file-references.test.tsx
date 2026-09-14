@@ -12,7 +12,7 @@ import { I18nextProvider, initReactI18next } from "react-i18next";
 import { api } from "../../../lib/api";
 import en from "../../../locales/en/narrator.json";
 import { EditingMessageCtx, type EditingMessageState } from "../EditingMessageCtx";
-import { QueuedAttachmentPreview, QueuedMessageRow } from "../QueuedMessageRow";
+import { QueuedAttachmentPreview, QueuedMessageRow } from "../interaction/QueuedMessageRow";
 import type { QueuedEditPayload } from "../queued-attachment-edit";
 import { MessageEditorPanel, type MessageEditorPanelProps } from "./MessageEditorPanel";
 

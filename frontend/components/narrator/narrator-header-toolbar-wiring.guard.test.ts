@@ -20,6 +20,9 @@ function read(name: string): Promise<string> {
 }
 
 const narratorPanel = () => read("./NarratorPanel.tsx");
+// The title slot moved into its own component (it owns useTitleEditing); the
+// capacity marker lives there now, not inline in the panel.
+const headerTitle = () => read("./header/NarratorPanelHeaderTitle.tsx");
 const overflowMenu = () => read("./header/NarratorToolbarOverflowMenu.tsx");
 const capacityHook = () => read("../../hooks/useNarratorHeaderToolbarCapacity.ts");
 // The toolbar row markup lives in HeaderToolbar; the availability / layout /
@@ -41,7 +44,7 @@ describe("header capacity measurement is wired to the DOM", () => {
 	});
 
 	it("marks the title slot so its width is budgeted, not measured", async () => {
-		const source = await narratorPanel();
+		const source = await headerTitle();
 		// The slot is `flex: 1`, so its measured width is whatever the tool row left
 		// over. Measuring it would make the budget a function of its own result.
 		expect(source).toContain('{...{ [HEADER_TITLE_SLOT_ATTR]: "" }}');

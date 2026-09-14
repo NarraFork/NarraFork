@@ -1,53 +1,49 @@
-import {
-	closestCenter,
-	DndContext,
-	type DragEndEvent,
-	PointerSensor,
-	TouchSensor,
-	useSensor,
-	useSensors,
-} from "@dnd-kit/core";
-import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
-import {
-	Anchor,
-	Badge,
-	Box,
-	Button,
-	CloseButton,
-	Group,
-	Image,
-	Loader,
-	Progress,
-	Stack,
-	Text,
-} from "@mantine/core";
-import { IconBolt, IconChevronDown, IconChevronUp, IconFile } from "@tabler/icons-react";
+import { Box, Text } from "@mantine/core";
 import type React from "react";
 import { useTranslation } from "react-i18next";
 import { startBottomSpacingResize, useBottomSpacing } from "../../hooks/useResizableBottomSpacing";
-import type { BufferMessageSummary } from "../../lib/api";
 import { NarratorComposerRow, type NarratorComposerRowProps } from "./composer/NarratorComposerRow";
 import { ChapterBar } from "./header/ChapterBar";
+import { AttachmentPreviews } from "./interaction/AttachmentPreviews";
 import { NarratorInteractionStatusBar } from "./interaction/NarratorInteractionStatusBar";
+import { QueuedMessagesPanel } from "./interaction/QueuedMessagesPanel";
+import { UploadProgressBar } from "./interaction/UploadProgressBar";
+import {
+	type UseQueuedMessageActionsOptions,
+	useQueuedMessageActions,
+} from "./interaction/use-queued-message-actions";
 import {
 	type UseStatusBarPropsOptions,
 	useStatusBarProps,
 } from "./interaction/use-status-bar-props";
-import { QueuedAttachmentPreview, QueuedMessageRow } from "./QueuedMessageRow";
 import { HumanAttentionInboxButton } from "./question/GlobalQuestionInbox";
 
-/** Number of queued messages before the queue collapses into a summary bar. */
-const QUEUE_COLLAPSE_THRESHOLD = 2;
+/**
+ * Context shared by several of the interaction area's sub-regions (status bar,
+ * queue hook, composer, inbox, merged hint). Passed ONCE and merged locally into
+ * the grouped prop objects, rather than repeated inside each of statusBarInputs /
+ * queueDeps / composerRowProps by the panel.
+ */
+export interface NarratorInteractionCommon {
+	narratorId: string;
+	narrator: UseStatusBarPropsOptions["narrator"];
+	isWorkspacePreview: boolean;
+	compact: boolean | undefined;
+	isMobileViewport: boolean;
+}
 
 export interface NarratorInteractionAreaProps {
+	// ── Shared context, passed once (see NarratorInteractionCommon). ──
+	common: NarratorInteractionCommon;
+
 	// ── Attachments ──
+	// imagePreviewUrls, formatFileSize and openImageViewer are no longer passed in:
+	// the preview URLs are derived here from attachedImages, formatFileSize is a
+	// pure util imported directly, and the image viewer comes from context.
 	attachedImages: File[];
 	attachedTextFiles: File[];
-	imagePreviewUrls: string[];
 	updateAttachedImages: React.Dispatch<React.SetStateAction<File[]>>;
 	updateAttachedTextFiles: React.Dispatch<React.SetStateAction<File[]>>;
-	formatFileSize: (size: number) => string;
-	openImageViewer: (opts: { src: string; filename: string; alt: string }) => void;
 
 	// ── Send / upload progress ──
 	sendingState: {
@@ -57,29 +53,12 @@ export interface NarratorInteractionAreaProps {
 	} | null;
 	cancelSending: () => void;
 
-	// ── Queue state ──
-	queuedMessages: BufferMessageSummary[];
-	queueExpanded: boolean;
-	setQueueExpanded: (expanded: boolean) => void;
-	editingQueuedId: string | null;
-
-	// ── Queue actions ──
-	handleDragEndQueued: (event: DragEndEvent) => void;
-	handleSaveEditQueued: (
-		msg: BufferMessageSummary,
-		text: string,
-		payload: {
-			keepImageIds: string[];
-			keepTextFiles: { index: number; filename: string }[];
-			newImages: File[];
-			newTextFiles: File[];
-		},
-	) => Promise<boolean>;
-	handleCancelEditQueued: () => void;
-	handleStartEditQueued: (msg: BufferMessageSummary) => void;
-	handleRemoveQueued: (id: string) => void;
-	handleRetryQueued: (id: string) => Promise<{ ok: true; resumed: boolean }>;
-	handleCancelAllQueued: () => void;
+	// ── Queue — the hook is CALLED HERE (not in the panel): all of its outputs
+	//    are consumed only within this subtree (the queued-messages panel + the
+	//    composer's press-and-hold gesture), so the panel only supplies the stable
+	//    refs/setters the hook depends on. `t` is provided locally. ──
+	//    `narratorId` comes from `common`, so it is omitted here.
+	queueDeps: Omit<UseQueuedMessageActionsOptions, "t" | "narratorId">;
 
 	// ── ChapterBar ──
 	chapterId?: string | null;
@@ -87,16 +66,29 @@ export interface NarratorInteractionAreaProps {
 
 	// ── Status bar — raw inputs; the props are assembled here via useStatusBarProps
 	//    (model / reasoning / codex / permission control sub-objects are computed
-	//    from the control hooks rather than in NarratorPanel). ──
-	statusBarInputs: UseStatusBarPropsOptions;
+	//    from the control hooks rather than in NarratorPanel). The shared context
+	//    fields (narratorId/narrator/isWorkspacePreview/compact/isMobileViewport)
+	//    come from `common` and are omitted here. ──
+	statusBarInputs: Omit<
+		UseStatusBarPropsOptions,
+		"narratorId" | "narrator" | "isWorkspacePreview" | "compact" | "isMobileViewport"
+	>;
 
 	// ── Human-attention inbox ──
-	isWorkspacePreview: boolean;
 	showHumanAttentionInbox: boolean;
-	narratorId: string;
 
-	// ── Composer row ──
-	composerRowProps: NarratorComposerRowProps;
+	// ── Composer row — the queue press-and-hold gesture fields are injected here
+	//    from the local useQueuedMessageActions call, not threaded from the panel;
+	//    `narratorId` comes from `common`. ──
+	composerRowProps: Omit<
+		NarratorComposerRowProps,
+		| "narratorId"
+		| "queueHoldProgress"
+		| "startQueueHold"
+		| "handleQueuePointerUp"
+		| "cancelQueueHold"
+		| "handleQueueClick"
+	>;
 
 	// ── Merged-chapter read-only state ──
 	isChapterMerged: boolean;
@@ -104,16 +96,29 @@ export interface NarratorInteractionAreaProps {
 
 export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 	const { t } = useTranslation("narrator");
-	const { t: tc } = useTranslation("common");
 	const bottomSpacing = useBottomSpacing();
 	// Assemble the status-bar props here (computing the model/reasoning/codex/
 	// permission control sub-objects via the control hooks) instead of in the panel.
-	const statusBar = useStatusBarProps(props.statusBarInputs);
-
-	const sensors = useSensors(
-		useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
-		useSensor(TouchSensor, { activationConstraint: { delay: 100, tolerance: 5 } }),
-	);
+	const statusBar = useStatusBarProps({ ...props.common, ...props.statusBarInputs });
+	// Queue buffer interactions live here rather than in the panel: every output
+	// below is consumed only within this component's subtree.
+	const {
+		queueHoldProgress,
+		startQueueHold,
+		cancelQueueHold,
+		handleQueuePointerUp,
+		handleQueueClick,
+		handleCancelAllQueued,
+		handleRemoveQueued,
+		handleRetryQueued,
+		handleDragEndQueued,
+		editingQueuedId,
+		queueExpanded,
+		setQueueExpanded,
+		handleStartEditQueued,
+		handleCancelEditQueued,
+		handleSaveEditQueued,
+	} = useQueuedMessageActions({ narratorId: props.common.narratorId, ...props.queueDeps, t });
 
 	const hasImages = props.attachedImages.length > 0;
 
@@ -134,280 +139,32 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 				}}
 			/>
 
-			{/* Image previews */}
-			{hasImages && (
-				<Group
-					pt="xs"
-					px="md"
-					pb={6}
-					gap="xs"
-					style={{ borderTop: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
-				>
-					{props.attachedImages.map((file, i) => (
-						<Box
-							key={`${file.name}-${file.size}-${file.lastModified}-${file.type}`}
-							pos="relative"
-							style={{ display: "inline-block" }}
-						>
-							<Image
-								src={props.imagePreviewUrls[i]}
-								alt={file.name}
-								radius="sm"
-								h={60}
-								w={60}
-								fit="cover"
-								style={{ cursor: "pointer" }}
-								onClick={() =>
-									props.openImageViewer({
-										src: props.imagePreviewUrls[i],
-										filename: file.name,
-										alt: file.name,
-									})
-								}
-							/>
-							<CloseButton
-								size="xs"
-								radius="xl"
-								variant="filled"
-								color="dark"
-								style={{ position: "absolute", top: -6, right: -6 }}
-								onClick={() => props.updateAttachedImages((prev) => prev.filter((_, j) => j !== i))}
-								title={t("removeImage")}
-							/>
-						</Box>
-					))}
-				</Group>
-			)}
+			{/* Staged image + text-file previews (owns its own object-URL previews). */}
+			<AttachmentPreviews
+				attachedImages={props.attachedImages}
+				attachedTextFiles={props.attachedTextFiles}
+				updateAttachedImages={props.updateAttachedImages}
+				updateAttachedTextFiles={props.updateAttachedTextFiles}
+			/>
 
-			{/* Text file previews */}
-			{props.attachedTextFiles.length > 0 && (
-				<Group
-					pt="xs"
-					px="md"
-					pb={6}
-					gap={6}
-					wrap="wrap"
-					style={{
-						borderTop: hasImages ? undefined : "1px solid var(--mantine-color-default-border)",
-						flexShrink: 0,
-					}}
-				>
-					{props.attachedTextFiles.map((file, i) => (
-						<Group
-							key={`${file.name}-${file.size}-${file.lastModified}-${file.type}`}
-							gap={6}
-							px="xs"
-							py={4}
-							wrap="nowrap"
-							style={{
-								borderRadius: "var(--mantine-radius-sm)",
-								backgroundColor:
-									"light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
-								fontSize: "var(--mantine-font-size-xs)",
-							}}
-						>
-							<IconFile size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
-							<Text size="xs" truncate style={{ maxWidth: 160, minWidth: 0 }}>
-								{file.name}
-							</Text>
-							<Text size="xs" c="dimmed" style={{ flexShrink: 0, whiteSpace: "nowrap" }}>
-								{props.formatFileSize(file.size)}
-							</Text>
-							<CloseButton
-								size={16}
-								iconSize={12}
-								variant="transparent"
-								c="dimmed"
-								onClick={() =>
-									props.updateAttachedTextFiles((prev) => prev.filter((_, j) => j !== i))
-								}
-							/>
-						</Group>
-					))}
-				</Group>
-			)}
-
-			{/* Upload / send progress — shown while attachments are being uploaded
-			    so the input area doesn't look empty after the draft is cleared. */}
-			{props.sendingState && props.sendingState.attachmentCount > 0 && (
-				<Stack
-					gap={4}
-					pt="xs"
-					px="md"
-					pb={6}
-					style={{
-						borderTop: "1px solid var(--mantine-color-default-border)",
-						flexShrink: 0,
-					}}
-				>
-					<Group gap="xs" wrap="nowrap" justify="space-between">
-						{props.sendingState.progress !== null && props.sendingState.progress < 1 ? (
-							<Text size="xs" c="dimmed">
-								{t("uploadingAttachments", {
-									percent: Math.round(props.sendingState.progress * 100),
-								})}
-							</Text>
-						) : (
-							<Group gap="xs" wrap="nowrap">
-								<Loader size="xs" />
-								<Text size="xs" c="dimmed">
-									{t("sendingMessage")}
-								</Text>
-							</Group>
-						)}
-						{props.sendingState.canCancel && (
-							<Anchor
-								component="button"
-								type="button"
-								size="xs"
-								c="dimmed"
-								style={{ textDecoration: "underline", flexShrink: 0 }}
-								onClick={props.cancelSending}
-							>
-								{tc("cancel")}
-							</Anchor>
-						)}
-					</Group>
-					{props.sendingState.progress !== null && props.sendingState.progress < 1 && (
-						<Progress
-							value={props.sendingState.progress * 100}
-							size="sm"
-							radius="xl"
-							transitionDuration={150}
-						/>
-					)}
-				</Stack>
-			)}
+			{/* Upload / send progress while attachments upload. */}
+			<UploadProgressBar sendingState={props.sendingState} cancelSending={props.cancelSending} />
 
 			{/* Queued messages indicator */}
-			{props.queuedMessages.length > 0 && (
-				<Stack
-					gap={0}
-					style={{
-						borderTop: hasImages ? undefined : "1px solid var(--mantine-color-default-border)",
-						flexShrink: 0,
-					}}
-				>
-					{props.queuedMessages.length > QUEUE_COLLAPSE_THRESHOLD && !props.queueExpanded ? (
-						/* Collapsed summary bar */
-						<Group
-							component="button"
-							px="md"
-							py={4}
-							gap="xs"
-							wrap="nowrap"
-							bg="var(--mantine-color-blue-light)"
-							style={{ cursor: "pointer", border: "none", width: "100%", textAlign: "left" }}
-							onClick={() => props.setQueueExpanded(true)}
-							aria-expanded={false}
-							aria-label={t("queuedCount", { count: props.queuedMessages.length })}
-						>
-							<IconChevronUp size={14} color="var(--mantine-color-blue-5)" />
-							<Text size="xs" c="blue" fw={500} style={{ flexShrink: 0 }}>
-								{t("queuedCount", { count: props.queuedMessages.length })}
-							</Text>
-							{props.queuedMessages.some((msg) => msg.state === "failed") && (
-								<Badge color="red" size="xs" style={{ flexShrink: 0 }}>
-									{t("queuedFailedCount", {
-										count: props.queuedMessages.filter((msg) => msg.state === "failed").length,
-									})}
-								</Badge>
-							)}
-							<QueuedAttachmentPreview
-								images={props.queuedMessages[0].images ?? []}
-								textFiles={props.queuedMessages[0].textFiles ?? []}
-							/>
-							{props.queuedMessages[0].priority && (
-								<Badge
-									size="xs"
-									color="orange"
-									variant="light"
-									leftSection={<IconBolt size={10} />}
-									style={{ flexShrink: 0 }}
-								>
-									{t("queuedPriorityNextRequest")}
-								</Badge>
-							)}
-							<Text size="xs" c="dimmed" truncate style={{ flex: 1 }}>
-								{props.queuedMessages[0].text}
-							</Text>
-							<Button
-								size="compact-xs"
-								variant="subtle"
-								color="red"
-								onClick={(e) => {
-									e.stopPropagation();
-									props.handleCancelAllQueued();
-								}}
-							>
-								{t("clearAllQueued")}
-							</Button>
-						</Group>
-					) : (
-						/* Expanded full list */
-						<>
-							<DndContext
-								sensors={sensors}
-								collisionDetection={closestCenter}
-								onDragEnd={props.handleDragEndQueued}
-							>
-								<SortableContext
-									items={props.queuedMessages.map((m) => m.id)}
-									strategy={verticalListSortingStrategy}
-								>
-									{props.queuedMessages.map((msg, index) => (
-										<QueuedMessageRow
-											key={msg.id}
-											msg={msg}
-											index={index}
-											isEditing={props.editingQueuedId === msg.id}
-											onSaveEdit={props.handleSaveEditQueued}
-											onCancelEdit={props.handleCancelEditQueued}
-											onStartEdit={props.handleStartEditQueued}
-											onRemove={props.handleRemoveQueued}
-											onRetry={props.handleRetryQueued}
-											cancelBufferLabel={t("cancelBuffer")}
-											editLabel={tc("edit")}
-											priorityLabel={t("queuedPriority")}
-											priorityNextRequestLabel={t("queuedPriorityNextRequest")}
-										/>
-									))}
-								</SortableContext>
-							</DndContext>
-							{props.queuedMessages.length > 1 && (
-								<Group
-									px="md"
-									py={2}
-									justify="flex-end"
-									gap="xs"
-									style={{ backgroundColor: "var(--mantine-color-blue-light)" }}
-								>
-									{props.queuedMessages.length > QUEUE_COLLAPSE_THRESHOLD && (
-										<Button
-											size="compact-xs"
-											variant="subtle"
-											color="blue"
-											onClick={() => props.setQueueExpanded(false)}
-											leftSection={<IconChevronDown size={12} />}
-											style={{ marginRight: "auto" }}
-										>
-											{t("collapseQueue")}
-										</Button>
-									)}
-									<Button
-										size="compact-xs"
-										variant="subtle"
-										color="red"
-										onClick={props.handleCancelAllQueued}
-									>
-										{t("clearAllQueued")}
-									</Button>
-								</Group>
-							)}
-						</>
-					)}
-				</Stack>
-			)}
+			<QueuedMessagesPanel
+				queuedMessages={props.queueDeps.queuedMessages}
+				queueExpanded={queueExpanded}
+				setQueueExpanded={setQueueExpanded}
+				editingQueuedId={editingQueuedId}
+				hasImages={hasImages}
+				handleDragEndQueued={handleDragEndQueued}
+				handleSaveEditQueued={handleSaveEditQueued}
+				handleCancelEditQueued={handleCancelEditQueued}
+				handleStartEditQueued={handleStartEditQueued}
+				handleRemoveQueued={handleRemoveQueued}
+				handleRetryQueued={handleRetryQueued}
+				handleCancelAllQueued={handleCancelAllQueued}
+			/>
 
 			{/* Chapter bar — clicking the info strip opens the Git view. */}
 			{props.chapterId && (
@@ -418,14 +175,14 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 			<NarratorInteractionStatusBar {...statusBar} />
 
 			{/* Question inbox, directly above the composer. */}
-			{!props.isWorkspacePreview && props.showHumanAttentionInbox && (
+			{!props.common.isWorkspacePreview && props.showHumanAttentionInbox && (
 				<Box px="md" pb={4} style={{ flexShrink: 0 }}>
-					<HumanAttentionInboxButton currentNarratorId={props.narratorId} />
+					<HumanAttentionInboxButton currentNarratorId={props.common.narratorId} />
 				</Box>
 			)}
 
 			{/* Input */}
-			{props.isWorkspacePreview ? null : props.isChapterMerged ? (
+			{props.common.isWorkspacePreview ? null : props.isChapterMerged ? (
 				<Box
 					px="md"
 					py="sm"
@@ -440,7 +197,15 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 					</Text>
 				</Box>
 			) : (
-				<NarratorComposerRow {...props.composerRowProps} />
+				<NarratorComposerRow
+					{...props.composerRowProps}
+					narratorId={props.common.narratorId}
+					queueHoldProgress={queueHoldProgress}
+					startQueueHold={startQueueHold}
+					handleQueuePointerUp={handleQueuePointerUp}
+					cancelQueueHold={cancelQueueHold}
+					handleQueueClick={handleQueueClick}
+				/>
 			)}
 
 			{/* Resizable bottom spacing (shared across all sub-regions). */}

@@ -14,7 +14,6 @@ import {
 	Modal,
 	Stack,
 	Text,
-	TextInput,
 	Tooltip,
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
@@ -32,14 +31,8 @@ import {
 	IconArrowsMinimize,
 	IconCopy,
 	IconExternalLink,
-	IconGitBranch,
 	IconGitFork,
-	IconLock,
-	IconLockOpen,
-	IconPencil,
-	IconSparkles,
 	IconTrash,
-	IconUpload,
 	IconX,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -113,23 +106,23 @@ import {
 } from "../../lib/safe-area";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
-import { useImageViewer } from "../common/image-viewer-context";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
-import { BackgroundTasksDrawerHost, useBackgroundTasksButton } from "./background/BackgroundTasksDrawer";
-import { ContentViewerEnvironmentProvider } from "./content/ContentViewer";
+import {
+	BackgroundTasksDrawerHost,
+	useBackgroundTasksButton,
+} from "./background/BackgroundTasksDrawer";
 import {
 	COMPACTING_MARKER_ATTR,
 	CompactSummaryModal,
 	CompactSummaryModalCtx,
-	type CompactSummaryModalTarget,
 } from "./compact/compact-summary-modal";
-
+import { useCompactSummaryModal } from "./compact/use-compact-summary-modal";
 import type { FileReferenceScopeValue } from "./composer/FileReferenceScope";
-
 import type { NarratorComposerHandle, NarratorRemoteDraft } from "./composer/NarratorComposer";
+import { ContentViewerEnvironmentProvider } from "./content/ContentViewer";
 import { ContextThresholdSettingsModal } from "./context-management/ContextThresholdSettingsModal";
 import {
 	type ContextManagementDraft,
@@ -141,17 +134,18 @@ import {
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { HeaderToolbar } from "./header/HeaderToolbar";
-import type { NarratorStatusToolbarAction } from "./header/NarratorStatusToolbar";
-import { HEADER_TITLE_SLOT_ATTR } from "./header/narrator-header-toolbar-capacity";
+import { NarratorPanelHeaderTitle } from "./header/NarratorPanelHeaderTitle";
+
 import {
 	getNarratorStatusBarDisplay,
 	planNarratorWorkIndicator,
 } from "./header/narrator-status-bar";
 import type { NarratorToolbarBadgeCounts } from "./header/narrator-toolbar-badges";
 import type { NarratorToolbarHost } from "./header/narrator-toolbar-items";
-import { useTitleEditing } from "./header/use-title-editing";
+
 import { ContextUsageIndicator } from "./interaction/ContextUsageIndicator";
-import { PathRulesPopover } from "./interaction/PathRulesPopover";
+import { DropOverlay } from "./interaction/DropOverlay";
+import { buildMobileToolbarActions } from "./interaction/mobile-toolbar-actions";
 import {
 	normalizeBooleanOverride,
 	normalizeDangerReflectionLevel,
@@ -159,20 +153,14 @@ import {
 } from "./interaction/reflection-types";
 import { SetGlobalModelModal } from "./interaction/SetGlobalModelModal";
 import { useComposerAttachments } from "./interaction/use-composer-attachments";
+import { useComposerFileIngest } from "./interaction/use-composer-file-ingest";
 import { useInternalFileViewer } from "./interaction/use-internal-file-viewer";
 import { useInterruptLongPress } from "./interaction/use-interrupt-long-press";
 import { useMessageRevertConfirm } from "./interaction/use-message-revert-confirm";
 import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions";
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
-import { useQueuedMessageActions } from "./interaction/use-queued-message-actions";
 import { useResolvedModel } from "./interaction/use-resolved-model";
-import {
-	formatKimiBarText,
-	formatKimiDetailsText,
-	isKimiProviderBaseUrl,
-} from "./model/kimi-usage-format";
-import { LeakedToolCallModal } from "./permission/LeakedToolCallModal";
 import { LodSwitchToast } from "./lod/LodSwitchToast";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
@@ -181,29 +169,22 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
+import {
+	formatKimiBarText,
+	formatKimiDetailsText,
+	isKimiProviderBaseUrl,
+} from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
+import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
 import { NarratorInteractionArea } from "./NarratorInteractionArea";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
-import type {
-	AsyncQuestionSlot,
-	ContentBlock,
-	NarratorMsg,
-	NarratorPanelProps,
-} from "./narrator-panel-types";
-import {
-	ACCEPTED_TYPES,
-	formatFileSize,
-	isTextFile,
-	MAX_IMAGE_LONG_EDGE,
-	MAX_IMAGE_SIZE,
-	MAX_TEXT_FILE_SIZE,
-	resizeImageIfNeeded,
-} from "./narrator-panel-types";
+import type { AsyncQuestionSlot, NarratorPanelProps } from "./narrator-panel-types";
+import { LeakedToolCallModal } from "./permission/LeakedToolCallModal";
+import { RevertActionConfirmModal } from "./permission/RevertScopeConfirmModal";
 import { compactProgressLabel } from "./progress-label";
 import { toBannerQuestions } from "./question/async-question-questions";
-import { RevertActionConfirmModal } from "./permission/RevertScopeConfirmModal";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
 import { type SwipeAnchorInfo, setGlobalOnSwipeAnchorInfo } from "./scroll/swipeState";
@@ -215,32 +196,14 @@ import {
 	LatestTodosToolUseIdCtx,
 	PermEnterHintCtx,
 } from "./tool-call/tool-call-contexts";
-import { type PaymentRequiredInfo, useNarratorPanelWS } from "./useNarratorPanelWS";
-
-function parsePersistedPaymentRequired(value: unknown): Partial<PaymentRequiredInfo> | null {
-	if (typeof value !== "string" || !value.trim()) return null;
-	try {
-		const parsed = JSON.parse(value) as Record<string, unknown>;
-		if (parsed.type !== "payment_required") return null;
-		const resumeAction = parsed.resumeAction === "continue" ? "continue" : "retry";
-		const balance = typeof parsed.balance === "number" ? parsed.balance : undefined;
-		const required = typeof parsed.required === "number" ? parsed.required : undefined;
-		return {
-			providerId: typeof parsed.providerId === "string" ? parsed.providerId : undefined,
-			providerPrefix: typeof parsed.providerPrefix === "string" ? parsed.providerPrefix : undefined,
-			balance,
-			required,
-			resumeAction,
-		};
-	} catch {
-		return null;
-	}
-}
+import { useNarratorPanelWS } from "./useNarratorPanelWS";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
 const NarratorDetailsPanel = lazy(() =>
-	import("./details/NarratorDetailsPanel").then((module) => ({ default: module.NarratorDetailsPanel })),
+	import("./details/NarratorDetailsPanel").then((module) => ({
+		default: module.NarratorDetailsPanel,
+	})),
 );
 
 const SpecPanel = lazy(() =>
@@ -288,19 +251,6 @@ export function shouldRenderFileModificationsDrawer(
 const EMPTY_ASYNC_QUESTIONS: AsyncQuestion[] = [];
 
 type CompactingMarkerKind = "context" | "segment";
-
-function _getCompactingMarkerKind(
-	message: Pick<NarratorMsg, "contentJson">,
-): CompactingMarkerKind | null {
-	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
-	const block = blocks.find(
-		(block: ContentBlock) =>
-			(block.type === "compact" || block.type === "segment_compact") &&
-			block.status === "compacting",
-	);
-	if (!block) return null;
-	return block.type === "segment_compact" ? "segment" : "context";
-}
 
 function getMessageViewportScrollBottom(scroller: HTMLElement) {
 	return Math.max(0, scroller.scrollHeight - scroller.clientHeight);
@@ -696,7 +646,6 @@ export function NarratorPanel({
 		});
 	}, [promoteMutation, narratorId, t, navigate]);
 
-	const displayTitle = narrator?.title || t("untitled");
 	/**
 	 * A chapter node's header already shows this title and owns the edit / generate
 	 * actions, so drawing them again here is not just redundant — this header's dozen
@@ -886,20 +835,12 @@ export function NarratorPanel({
 
 	// Hoist compact-summary modals above the virtualized message rows so a message
 	// append/stream update cannot unmount the row and implicitly close the modal.
-	const [compactSummaryModalTarget, setCompactSummaryModalTarget] =
-		useState<CompactSummaryModalTarget | null>(null);
-	const compactSummaryModalCtxValue = useMemo(
-		() => ({
-			open: (target: CompactSummaryModalTarget) => setCompactSummaryModalTarget(target),
-		}),
-		[],
-	);
-	const closeCompactSummaryModal = useCallback(() => setCompactSummaryModalTarget(null), []);
-	useEffect(() => {
-		setCompactSummaryModalTarget((current) =>
-			current?.narratorId === narratorId ? current : null,
-		);
-	}, [narratorId]);
+	const {
+		compactSummaryModalTarget,
+		setCompactSummaryModalTarget,
+		compactSummaryModalCtxValue,
+		closeCompactSummaryModal,
+	} = useCompactSummaryModal(narratorId);
 
 	// --- Composer (text input) ---
 	// The text-input state lives in <NarratorComposer>: it changes on every
@@ -918,7 +859,6 @@ export function NarratorPanel({
 		[],
 	);
 
-	const openImageViewer = useImageViewer();
 	// Pending composer attachments (images + text files) + their IndexedDB draft
 	// persistence. The send flow (hide/clear/restore) and drag handlers below
 	// consume these; see the hook for why both kinds share one version counter.
@@ -1232,39 +1172,25 @@ export function NarratorPanel({
 		viewers,
 	} = wsState;
 	setUnreadCountRef.current = setUnreadCount;
-	const nugBalanceNumber =
-		nugProviderInfo?.providerId && quotaBalance != null ? Number(quotaBalance) : Number.NaN;
-	const shouldShowNugRechargeButton = Boolean(
-		nugProviderInfo?.providerId &&
-			(paymentRequired || !Number.isFinite(nugBalanceNumber) || nugBalanceNumber <= 0),
-	);
-	const shouldShowNugRechargeInQuotaDetails = Boolean(
-		nugProviderInfo?.providerId && Number.isFinite(nugBalanceNumber) && nugBalanceNumber > 0,
-	);
-	const quotaDetailsText = detailedQuotaBalance?.trim() ? detailedQuotaBalance : null;
-	const hasQuotaDetailsPopover = Boolean(quotaDetailsText || shouldShowNugRechargeInQuotaDetails);
-
-	useEffect(() => {
-		if (paymentRequired) return;
-		if (!narratorSubstatus.includes("payment_required")) return;
-		const persisted = parsePersistedPaymentRequired(narrator?.errorMessage);
-		const providerId = nugProviderInfo?.providerId ?? persisted?.providerId;
-		if (!providerId) return;
-		setPaymentRequired({
-			providerId,
-			providerPrefix: nugProviderInfo?.providerPrefix ?? persisted?.providerPrefix,
-			balance: persisted?.balance,
-			required: persisted?.required,
-			resumeAction: persisted?.resumeAction ?? "retry",
-		});
-	}, [
-		narrator?.errorMessage,
-		narratorSubstatus,
-		nugProviderInfo?.providerId,
-		nugProviderInfo?.providerPrefix,
+	// Quota display + NUG recharge derivations (flags, dialog disclosure, and the
+	// payment-required reconstruction / auto-open effects) live in useNarratorQuota.
+	const {
+		quotaDetailsText,
+		hasQuotaDetailsPopover,
+		shouldShowNugRechargeButton,
+		shouldShowNugRechargeInQuotaDetails,
+		nugRechargeOpened,
+		openNugRecharge,
+		closeNugRecharge,
+	} = useNarratorQuota({
+		nugProviderInfo,
+		quotaBalance,
+		detailedQuotaBalance,
 		paymentRequired,
 		setPaymentRequired,
-	]);
+		narratorSubstatus,
+		narratorErrorMessage: narrator?.errorMessage,
+	});
 
 	const handleCompactError = useCallback(
 		(err: unknown) => {
@@ -1342,12 +1268,10 @@ export function NarratorPanel({
 					handleCompactError(err);
 				});
 		},
-		[narratorId, handleCompactError],
+		[narratorId, handleCompactError, setCompactSummaryModalTarget],
 	);
 
 	const [archiveConfirmOpened, { open: openArchiveConfirm, close: closeArchiveConfirm }] =
-		useDisclosure(false);
-	const [nugRechargeOpened, { open: openNugRecharge, close: closeNugRecharge }] =
 		useDisclosure(false);
 	const [internalDetailsOpened, { toggle: toggleInternalDetails, close: closeInternalDetails }] =
 		useDisclosure(false);
@@ -1374,9 +1298,6 @@ export function NarratorPanel({
 		}
 		closeInternalDetails();
 	}, [dock, closeInternalDetails, onToggleDetailsPanel]);
-	useEffect(() => {
-		if (paymentRequired) openNugRecharge();
-	}, [openNugRecharge, paymentRequired]);
 	const [
 		contextThresholdSettingsOpened,
 		{ open: openContextThresholdSettingsModal, close: closeContextThresholdSettings },
@@ -1852,27 +1773,8 @@ export function NarratorPanel({
 	});
 
 	// --- Image management ---
-	const [imagePreviewUrls, setImagePreviewUrls] = useState<string[]>([]);
-	useEffect(() => {
-		const urls = attachedImages.map((file) => URL.createObjectURL(file));
-		setImagePreviewUrls(urls);
-		return () => {
-			for (const url of urls) URL.revokeObjectURL(url);
-		};
-	}, [attachedImages]);
 
-	// --- Title editing ---
-	const {
-		editingTitle,
-		titleValue,
-		setTitleValue,
-		generatingTitle,
-		titleInputRef,
-		startEditingTitle,
-		saveTitle,
-		handleGenerateTitle,
-		handleTitleKeyDown,
-	} = useTitleEditing({ narratorId, narrator, t });
+	// Title editing now lives in <NarratorPanelHeaderTitle> (it owns useTitleEditing).
 	const fileInputRef = useRef<HTMLInputElement>(null);
 	// Visible send/upload feedback. `progress` is 0..1 while attachments upload,
 	// or null once the request body is sent and we're awaiting the server.
@@ -2572,34 +2474,11 @@ export function NarratorPanel({
 		t,
 	});
 
-	const {
-		queueHoldProgress,
-		startQueueHold,
-		cancelQueueHold,
-		handleQueuePointerUp,
-		handleQueueClick,
-		handleCancelAllQueued,
-		handleRemoveQueued,
-		handleRetryQueued,
-		handleDragEndQueued,
-		editingQueuedId,
-		queueExpanded,
-		setQueueExpanded,
-		handleStartEditQueued,
-		handleCancelEditQueued,
-		handleSaveEditQueued,
-	} = useQueuedMessageActions({
-		narratorId,
-		queuedMessages,
-		setQueuedMessages,
-		reconcileBufferedMessages,
-		cancelBuffer,
-		composerRef,
-		handleSendRef,
-		handleSendWithModeRef,
-		ctrlEnterQueueModeRef,
-		t,
-	});
+	// The queue-buffer interaction hook (useQueuedMessageActions) is no longer
+	// called here: its entire output set is consumed only inside
+	// NarratorInteractionArea's subtree (the queued-messages panel + the composer
+	// hold gesture), so the hook is called there. The panel only forwards the
+	// stable refs/setters it depends on via the `queueDeps` group below.
 
 	const handleAllowRetryToolCall = useCallback(
 		async (toolUseId: string) => {
@@ -2630,149 +2509,18 @@ export function NarratorPanel({
 		[narratorIsIdle, allowRetryLatestAssistantMessageId, handleAllowRetryToolCall],
 	);
 
-	const addImages = async (files: File[]) => {
-		const valid = files.filter((f) => {
-			if (!ACCEPTED_TYPES.includes(f.type)) return false;
-			if (f.size > MAX_IMAGE_SIZE) return false;
-			return true;
-		});
-		if (valid.length === 0) return;
-		const processed: File[] = [];
-		for (const f of valid) {
-			// GIF: skip resize (may be animated)
-			if (f.type === "image/gif") {
-				processed.push(f);
-				continue;
-			}
-			try {
-				const resized = await resizeImageIfNeeded(f, MAX_IMAGE_LONG_EDGE);
-				processed.push(resized);
-			} catch {
-				processed.push(f); // fallback to original on error
-			}
-		}
-		updateAttachedImages((prev) => [...prev, ...processed]);
-	};
-
-	const addTextFiles = (files: File[]) => {
-		const valid = files.filter((f) => {
-			if (!isTextFile(f.name)) {
-				notifications.show({
-					title: t("unsupportedFileType"),
-					message: f.name,
-					color: "yellow",
-				});
-				return false;
-			}
-			if (f.size > MAX_TEXT_FILE_SIZE) {
-				notifications.show({
-					title: t("textFileTooLarge"),
-					message: `${f.name} (${(f.size / 1024 / 1024).toFixed(1)} MB)`,
-					color: "yellow",
-				});
-				return false;
-			}
-			return true;
-		});
-		if (valid.length > 0) {
-			updateAttachedTextFiles((prev) => [...prev, ...valid]);
-		}
-	};
-
-	// File picker change: classify the selection into images / text files and
-	// warn about anything unsupported. Co-located with addImages/addTextFiles
-	// rather than inlined in the composer-row props object.
-	const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-		if (e.target.files) {
-			const files = Array.from(e.target.files);
-			const imageFiles: File[] = [];
-			const textFileList: File[] = [];
-			const unsupported: string[] = [];
-			for (const f of files) {
-				if (ACCEPTED_TYPES.includes(f.type)) {
-					imageFiles.push(f);
-				} else if (isTextFile(f.name)) {
-					textFileList.push(f);
-				} else {
-					unsupported.push(f.name);
-				}
-			}
-			if (unsupported.length > 0) {
-				notifications.show({
-					title: t("unsupportedFileType"),
-					message: unsupported.join(", "),
-					color: "yellow",
-				});
-			}
-			if (imageFiles.length > 0) addImages(imageFiles);
-			if (textFileList.length > 0) addTextFiles(textFileList);
-			e.target.value = "";
-		}
-	};
-
-	// Stable paste bridge for <NarratorComposer> (it re-renders per keystroke, so
-	// every callback prop must hold its identity).
-	const addImagesRef = useRef(addImages);
-	addImagesRef.current = addImages;
-	const handleComposerPasteImages = useCallback((files: File[]) => addImagesRef.current(files), []);
-
-	const isFileDragEvent = (e: React.DragEvent) => e.dataTransfer.types.includes("Files");
-
-	const handleDragEnter = (e: React.DragEvent) => {
-		if (!isFileDragEvent(e)) return;
-		e.preventDefault();
-		e.stopPropagation();
-		dragCounterRef.current++;
-		setIsDragging(true);
-	};
-
-	const handleDragLeave = (e: React.DragEvent) => {
-		if (!isFileDragEvent(e)) return;
-		e.preventDefault();
-		e.stopPropagation();
-		dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
-		if (dragCounterRef.current === 0) {
-			setIsDragging(false);
-		}
-	};
-
-	const handleDragOver = (e: React.DragEvent) => {
-		if (!isFileDragEvent(e)) return;
-		e.preventDefault();
-		e.stopPropagation();
-		e.dataTransfer.dropEffect = "copy";
-	};
-
-	const handleDrop = (e: React.DragEvent) => {
-		if (!isFileDragEvent(e)) return;
-		e.preventDefault();
-		e.stopPropagation();
-		dragCounterRef.current = 0;
-		setIsDragging(false);
-		const files = Array.from(e.dataTransfer.files);
-		if (files.length === 0) return;
-		const imageFiles: File[] = [];
-		const textFileList: File[] = [];
-		const unsupported: string[] = [];
-		for (const f of files) {
-			if (ACCEPTED_TYPES.includes(f.type)) {
-				imageFiles.push(f);
-			} else if (isTextFile(f.name)) {
-				textFileList.push(f);
-			} else {
-				unsupported.push(f.name);
-			}
-		}
-		if (unsupported.length > 0) {
-			notifications.show({
-				title: t("unsupportedFileType"),
-				message: unsupported.join(", "),
-				color: "yellow",
-			});
-		}
-		if (imageFiles.length > 0) addImages(imageFiles);
-		if (textFileList.length > 0) addTextFiles(textFileList);
-	};
+	// Composer file ingestion (image/text validation + resize, file picker, paste
+	// bridge, and the whole-panel dropzone handlers). The dropzone stays wired to
+	// the panel root below, so the hook is called here rather than sunk into a child.
+	const { handleFileInputChange, handleComposerPasteImages, dropZoneProps } = useComposerFileIngest(
+		{
+			updateAttachedImages,
+			updateAttachedTextFiles,
+			setIsDragging,
+			dragCounterRef,
+			t,
+		},
+	);
 
 	/*
 	 * ── Header toolbar: entries, layout and activation ──
@@ -2860,125 +2608,21 @@ export function NarratorPanel({
 		/>
 	);
 
-	// The terminal entry's availability, label and action now live with the header
-	// registry (`toolbarEntryEnabled` / `activateToolbarEntry`), which is also what
-	// supplies its off-dock fallback.
-	// This array is rebuilt every render (a hook is not an option below the
-	// skeleton early-return above). NarratorStatusToolbar derives its
-	// measurement identity from the action keys, not from array identity.
-	const mobileToolbarActions: NarratorStatusToolbarAction[] = [
-		{
-			key: "path-rules",
-			collapsePriority: 10,
-			// Inline reserve only. A vertical reserve cannot protect this badge: it is
-			// painted inside the ActionIcon, which clips its own overflow, so padding
-			// on the wrapper would only push the button off the row's centre line.
-			visualOverflow: { inlineEnd: 4 },
-			render: (mode) => (
-				<PathRulesPopover
-					narratorId={narratorId}
-					t={t}
-					triggerMode={mode === "menu" ? "menu" : "icon"}
-				/>
-			),
-		},
-		...(hasPlanTrait
-			? ([
-					{
-						key: "relaxed-plan",
-						collapsePriority: 20,
-						render: (mode: "inline" | "menu") =>
-							mode === "menu" ? (
-								<Menu.Item
-									key="relaxed-plan"
-									leftSection={
-										relaxedPlanEnabled ? <IconLockOpen size={16} /> : <IconLock size={16} />
-									}
-									disabled={relaxedPlanForced || relaxedPlanMutation.isPending}
-									onClick={() =>
-										relaxedPlanMutation.mutate({
-											id: narratorId,
-											relaxedPlan: !relaxedPlanEnabled,
-										})
-									}
-								>
-									{t("relaxed_plan")}
-								</Menu.Item>
-							) : (
-								<Tooltip
-									label={
-										relaxedPlanForced ? t("relaxed_plan_forced_tooltip") : t("relaxed_plan_tooltip")
-									}
-								>
-									<ActionIcon
-										variant="subtle"
-										color={relaxedPlanEnabled ? "teal" : "gray"}
-										size="sm"
-										aria-label={t("relaxed_plan")}
-										disabled={relaxedPlanForced || relaxedPlanMutation.isPending}
-										onClick={() =>
-											relaxedPlanMutation.mutate({
-												id: narratorId,
-												relaxedPlan: !relaxedPlanEnabled,
-											})
-										}
-									>
-										{relaxedPlanEnabled ? <IconLockOpen size={16} /> : <IconLock size={16} />}
-									</ActionIcon>
-								</Tooltip>
-							),
-					},
-				] satisfies NarratorStatusToolbarAction[])
-			: []),
-		...(narrator.isAskInPassing
-			? ([
-					{
-						key: "promote",
-						collapsePriority: 30,
-						render: (mode: "inline" | "menu") =>
-							mode === "menu" ? (
-								<Menu.Item
-									key="promote"
-									leftSection={<IconGitBranch size={16} />}
-									disabled={promoteMutation.isPending}
-									onClick={handlePromote}
-								>
-									{t("promote")}
-								</Menu.Item>
-							) : (
-								<Tooltip
-									label={
-										narrator.chapterId ? t("promote_chapter_hint") : t("promote_standalone_hint")
-									}
-								>
-									<Button
-										size="compact-xs"
-										variant="light"
-										color="teal"
-										loading={promoteMutation.isPending}
-										onClick={handlePromote}
-									>
-										{t("promote")}
-									</Button>
-								</Tooltip>
-							),
-					},
-				] satisfies NarratorStatusToolbarAction[])
-			: []),
-		/*
-		 * The terminal entry deliberately does NOT appear here any more.
-		 *
-		 * It is a tool entry, so it belongs to the registry-driven header row
-		 * (`narrator-toolbar-items.tsx`) together with git / search / browser / the
-		 * rest. Keeping a copy here would put the same control in two places at once
-		 * on mobile — the header AND this status row — which is precisely the split
-		 * that made the old mobile layout confusing to navigate.
-		 *
-		 * What stays in this row is session CONFIGURATION (path rules, relaxed plan,
-		 * promote), which modifies the state shown beside it rather than opening a
-		 * panel.
-		 */
-	];
+	// Mobile status-row actions (path rules / relaxed plan / promote) live in
+	// useMobileToolbarActions. The terminal entry deliberately is NOT here — it is
+	// a tool entry owned by the header registry (narrator-toolbar-items).
+	const mobileToolbarActions = buildMobileToolbarActions({
+		narratorId,
+		t,
+		hasPlanTrait,
+		relaxedPlanEnabled,
+		relaxedPlanForced,
+		relaxedPlanMutation,
+		isAskInPassing: narrator.isAskInPassing,
+		chapterId: narrator.chapterId,
+		promoteMutation,
+		handlePromote,
+	});
 	// Only inputs that change an action's own rendered width belong here. The
 	// leading controls (model, reasoning effort, fast mode, permission mode) are
 	// re-measured every pass, so including them would needlessly drop the cache
@@ -2996,10 +2640,7 @@ export function NarratorPanel({
 					h="100%"
 					gap={0}
 					style={{ overflow: "hidden", position: "relative" }}
-					onDragEnter={handleDragEnter}
-					onDragLeave={handleDragLeave}
-					onDragOver={handleDragOver}
-					onDrop={handleDrop}
+					{...dropZoneProps}
 				>
 					<NugRechargeDialog
 						opened={nugRechargeOpened}
@@ -3011,29 +2652,7 @@ export function NarratorPanel({
 						onPaymentRequiredChange={setPaymentRequired}
 					/>
 					{/* Drop overlay */}
-					{isDragging && (
-						<Box
-							style={{
-								position: "absolute",
-								inset: 0,
-								zIndex: 100,
-								display: "flex",
-								alignItems: "center",
-								justifyContent: "center",
-								backgroundColor: "rgba(0, 0, 0, 0.5)",
-								border: "2px dashed var(--mantine-color-indigo-5)",
-								borderRadius: "var(--mantine-radius-md)",
-								pointerEvents: "none",
-							}}
-						>
-							<Stack align="center" gap="xs">
-								<IconUpload size={40} color="var(--mantine-color-indigo-4)" />
-								<Text size="lg" fw={500} c="white">
-									{t("dropFilesHere")}
-								</Text>
-							</Stack>
-						</Box>
-					)}
+					<DropOverlay visible={isDragging} />
 					{/* Header */}
 					<Group
 						ref={headerRowRef}
@@ -3118,61 +2737,12 @@ export function NarratorPanel({
 							 * budgets it by policy instead of reading a width this element derives
 							 * from whatever the tool row left over.
 							 */}
-							<Group
-								{...{ [HEADER_TITLE_SLOT_ATTR]: "" }}
-								gap={4}
-								style={{ flex: 1, minWidth: 0 }}
-								wrap="nowrap"
-							>
-								{hostOwnsTitle ? null : editingTitle && !isWorkspacePreview ? (
-									<TextInput
-										ref={titleInputRef}
-										value={titleValue}
-										onChange={(e) => setTitleValue(e.currentTarget.value)}
-										onKeyDown={handleTitleKeyDown}
-										onBlur={saveTitle}
-										size="xs"
-										style={{ flex: 1, maxWidth: 500 }}
-									/>
-								) : (
-									<Text
-										size="sm"
-										fw={500}
-										onDoubleClick={isWorkspacePreview ? undefined : startEditingTitle}
-										style={{
-											cursor: isWorkspacePreview ? "default" : "pointer",
-											overflow: "hidden",
-											textOverflow: "ellipsis",
-											whiteSpace: "nowrap",
-											maxWidth: 500,
-										}}
-										title={displayTitle}
-									>
-										{displayTitle}
-									</Text>
-								)}
-								{!isWorkspacePreview && !hostOwnsTitle && (
-									<>
-										<ActionIcon
-											size="xs"
-											variant="subtle"
-											onClick={startEditingTitle}
-											title={t("editTitle")}
-										>
-											<IconPencil size={12} />
-										</ActionIcon>
-										<ActionIcon
-											size="xs"
-											variant="subtle"
-											onClick={handleGenerateTitle}
-											loading={generatingTitle}
-											title={t("generateTitle")}
-										>
-											<IconSparkles size={12} />
-										</ActionIcon>
-									</>
-								)}
-							</Group>
+							<NarratorPanelHeaderTitle
+								narratorId={narratorId}
+								narrator={narrator}
+								hostOwnsTitle={hostOwnsTitle}
+								isWorkspacePreview={isWorkspacePreview}
+							/>
 							{disconnected && !isWorkspacePreview && (
 								<Badge
 									size="xs"
@@ -3524,26 +3094,23 @@ export function NarratorPanel({
 
 					{/* ═══════════════════ Bottom Interaction Area ═══════════════════ */}
 					<NarratorInteractionArea
+						common={{ narratorId, narrator, isWorkspacePreview, compact, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}
-						imagePreviewUrls={imagePreviewUrls}
 						updateAttachedImages={updateAttachedImages}
 						updateAttachedTextFiles={updateAttachedTextFiles}
-						formatFileSize={formatFileSize}
-						openImageViewer={openImageViewer}
 						sendingState={sendingState}
 						cancelSending={cancelSending}
-						queuedMessages={queuedMessages}
-						queueExpanded={queueExpanded}
-						setQueueExpanded={setQueueExpanded}
-						editingQueuedId={editingQueuedId}
-						handleDragEndQueued={handleDragEndQueued}
-						handleSaveEditQueued={handleSaveEditQueued}
-						handleCancelEditQueued={handleCancelEditQueued}
-						handleStartEditQueued={handleStartEditQueued}
-						handleRemoveQueued={handleRemoveQueued}
-						handleRetryQueued={handleRetryQueued}
-						handleCancelAllQueued={handleCancelAllQueued}
+						queueDeps={{
+							queuedMessages,
+							setQueuedMessages,
+							reconcileBufferedMessages,
+							cancelBuffer,
+							composerRef,
+							handleSendRef,
+							handleSendWithModeRef,
+							ctrlEnterQueueModeRef,
+						}}
 						chapterId={narrator.chapterId}
 						onOpenGitPanel={
 							isWorkspacePreview
@@ -3552,21 +3119,14 @@ export function NarratorPanel({
 									? () => dock.openToolPanel("git")
 									: () => setMobileToolPanel("git")
 						}
-						isWorkspacePreview={isWorkspacePreview}
 						showHumanAttentionInbox={showHumanAttentionInbox}
-						narratorId={narratorId}
 						isChapterMerged={isChapterMerged}
 						statusBarInputs={{
-							narratorId,
-							narrator,
 							ownsHorizontalSafeArea,
 							borderTop:
 								attachedImages.length > 0 || queuedMessages.length > 0
 									? undefined
 									: "1px solid var(--mantine-color-default-border)",
-							isWorkspacePreview,
-							compact,
-							isMobileViewport,
 							t,
 							tt,
 							contextIndicator,
@@ -3683,7 +3243,6 @@ export function NarratorPanel({
 							sendingRef,
 							appendInputRef,
 							interruptBtnRef,
-							narratorId,
 							isActive,
 							composerHasText,
 							composerHasAttachments,
@@ -3714,14 +3273,12 @@ export function NarratorPanel({
 							stopTakeoverMutationPending: stopTakeoverMutation.isPending,
 							interruptMutationPending: interruptMutation.isPending,
 							interruptProgress,
-							queueHoldProgress,
 							startInterruptPress,
 							handleInterruptMouseUp,
 							clearInterruptTimer,
-							startQueueHold,
-							handleQueuePointerUp,
-							cancelQueueHold,
-							handleQueueClick,
+							// queueHoldProgress / startQueueHold / handleQueuePointerUp /
+							// cancelQueueHold / handleQueueClick are injected by
+							// NarratorInteractionArea from its local useQueuedMessageActions.
 							onUpdateEnterQueueMode: (mode) => updateUserPrefs.mutate({ enterQueueMode: mode }),
 							onUpdateCtrlEnterQueueMode: (mode) =>
 								updateUserPrefs.mutate({ ctrlEnterQueueMode: mode }),
