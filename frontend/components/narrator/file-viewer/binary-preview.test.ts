@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { getFilePreviewType, MAX_FILE_PREVIEW_BLOB_BYTES } from "../FilePreviewModal";
+import { getFilePreviewType, MAX_FILE_PREVIEW_BLOB_BYTES } from "../file-panel/FilePreviewModal";
 import { readBinaryPreview } from "./FileViewerContent";
 
 describe("panel binary previews", () => {

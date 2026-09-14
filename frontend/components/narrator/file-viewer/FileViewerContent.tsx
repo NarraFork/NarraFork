@@ -52,12 +52,12 @@ import { useImageViewer } from "../../common/image-viewer-context";
 import { TruncatedText } from "../../common/TruncatedText";
 import { ContentViewer } from "../ContentViewer";
 import { FileReferenceScopeProvider, useFileReferenceScope } from "../composer/FileReferenceScope";
+import { MonacoEditor } from "../file-editor/MonacoEditor";
 import {
 	getFilePreviewType,
 	MAX_FILE_PREVIEW_BLOB_BYTES,
 	readTextPreview,
-} from "../FilePreviewModal";
-import { MonacoEditor } from "../file-editor/MonacoEditor";
+} from "../file-panel/FilePreviewModal";
 import { MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../markdown/highlight-cache";
 import { MarkdownContent } from "../markdown/MarkdownContent";
 import { filePanelBaseName } from "../panels/panel-kind";

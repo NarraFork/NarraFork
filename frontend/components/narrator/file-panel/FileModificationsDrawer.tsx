@@ -3,16 +3,16 @@ import { ActionIcon, Box, Drawer, Group, Tabs, Text } from "@mantine/core";
 import { IconFileCode, IconX } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
+import { useNarratorPermissionsCapability } from "../../../hooks/usePlatform";
 import {
 	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
 	SAFE_AREA_DRAWER_BODY_STYLE,
 	safeAreaDrawerBodyHeight,
-} from "../../lib/safe-area";
+} from "../../../lib/safe-area";
+import type { PendingPermission } from "../narrator-panel-types";
 import { FileApprovalTab } from "./FileApprovalTab";
 import { FileDeletePreviewTab } from "./FileDeletePreviewTab";
 import { FileSummaryTab } from "./FileSummaryTab";
-import type { PendingPermission } from "./narrator-panel-types";
 
 const EDIT_TOOLS = new Set(["Write", "Edit"]);
 

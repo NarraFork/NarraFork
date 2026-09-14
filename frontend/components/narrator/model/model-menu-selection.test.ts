@@ -66,12 +66,16 @@ describe("dropdown-only centering", () => {
 });
 
 test("both statusbar variants wire aggregation controls inside the model dropdown", async () => {
-	const panel = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
-	expect(panel).not.toContain("AggProviderSwitcher");
-	expect(panel.match(/data-model-menu-scroll/g)).toHaveLength(2);
+	// The model dropdown lives in the interaction status bar (both desktop and
+	// mobile variants), not NarratorPanel.
+	const statusBar = await Bun.file(
+		new URL("../interaction/NarratorInteractionStatusBar.tsx", import.meta.url),
+	).text();
+	expect(statusBar).not.toContain("AggProviderSwitcher");
+	expect(statusBar.match(/data-model-menu-scroll/g)).toHaveLength(2);
 	expect(
-		panel.match(
-			/<ModelMenuItems\s+opened=\{modelMenuOpen(?:Desktop|Mobile)\}\s+aggregations=\{aggregations\}/g,
+		statusBar.match(
+			/<ModelMenuItems\s+opened=\{menuOpen(?:Desktop|Mobile)\}\s+aggregations=\{model\.aggregations\}/g,
 		),
 	).toHaveLength(2);
 });

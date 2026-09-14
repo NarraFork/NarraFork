@@ -3,7 +3,7 @@ import { notifications } from "@mantine/notifications";
 import type { FileTarget } from "@shared/file-reference";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useFilePanelNavigation } from "../file-panel-navigation";
+import { useFilePanelNavigation } from "../file-panel/file-panel-navigation";
 import { nextHighlightRequestId } from "../panels/panel-kind";
 
 export interface UseInternalFileViewerOptions {

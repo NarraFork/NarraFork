@@ -15,8 +15,8 @@ import {
 import { IconChevronDown, IconChevronRight, IconFile, IconTrash } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { TruncatedPath } from "../common/TruncatedPath";
-import { DiffView } from "./diff/DiffView";
+import { TruncatedPath } from "../../common/TruncatedPath";
+import { DiffView } from "../diff/DiffView";
 
 const MAX_DELETE_PREVIEW_FILES = 1_000;
 

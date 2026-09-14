@@ -18,12 +18,12 @@
 import { Box, Group, Loader, Modal, Text } from "@mantine/core";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useFileSystemCapability } from "../../hooks/usePlatform";
-import { ApiError, authorizedFetch, readFetchError } from "../../lib/api";
-import { apiUrl } from "../../lib/base-path";
-import { getShikiLang } from "../../lib/shiki-lang";
-import { useImageViewer } from "../common/image-viewer-context";
-import { ContentViewer } from "./ContentViewer";
+import { useFileSystemCapability } from "../../../hooks/usePlatform";
+import { ApiError, authorizedFetch, readFetchError } from "../../../lib/api";
+import { apiUrl } from "../../../lib/base-path";
+import { getShikiLang } from "../../../lib/shiki-lang";
+import { useImageViewer } from "../../common/image-viewer-context";
+import { ContentViewer } from "../ContentViewer";
 
 const IMAGE_EXTS = new Set([
 	".jpg",

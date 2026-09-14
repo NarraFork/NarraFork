@@ -1,7 +1,6 @@
 import { ActionIcon, Group, Indicator, Tooltip } from "@mantine/core";
 import { IconFlask, IconX } from "@tabler/icons-react";
-import type { ReactNode, RefObject } from "react";
-import type { NarratorToolbarEntry } from "../../../hooks/narrator-toolbar-layout";
+import type { Dispatch, RefObject, SetStateAction } from "react";
 import {
 	type PluginContributionPick,
 	PluginContributionPicker,
@@ -10,17 +9,15 @@ import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
 import { ExecutionDeviceMenu } from "../ExecutionDeviceMenu";
 import { NarratorLodMenu } from "../lod/NarratorLodMenu";
 import type { RenderLod } from "../lod/RenderLodCtx";
+import type { MobileToolPanelKind } from "../MobileToolPanelHost";
 import { NarratorToolbarOverflowMenu } from "../NarratorToolbarOverflowMenu";
 import { HEADER_TOOLBAR_FIXED_ATTR } from "../narrator-header-toolbar-capacity";
 import {
 	type NarratorToolbarBadgeCounts,
 	resolveNarratorToolbarBadge,
 } from "../narrator-toolbar-badges";
-import type {
-	NarratorToolbarHost,
-	NarratorToolbarId,
-	NarratorToolbarItemDef,
-} from "../narrator-toolbar-items";
+import type { NarratorToolbarHost } from "../narrator-toolbar-items";
+import { useHeaderToolbar } from "./use-header-toolbar";
 
 // biome-ignore lint/suspicious/noExplicitAny: react-query result passthrough from NarratorPanel.
 type QueryLike = any;
@@ -28,23 +25,43 @@ type QueryLike = any;
 type MutationLike = any;
 
 export interface HeaderToolbarProps {
-	/** Width-measurement anchor for the capacity ResizeObserver in NarratorPanel. */
+	// ── Layout measurement anchors (also read by the toolbar hook) ──
+	/** Width-measurement anchor for the capacity ResizeObserver. */
 	headerToolbarRef: RefObject<HTMLDivElement | null>;
-	/** Entries surfaced on the row (set by registry, ordered by layout, capped by width). */
-	toolbarVisibleDefs: readonly NarratorToolbarItemDef[];
+	headerRowRef: RefObject<HTMLDivElement | null>;
+	headerLeadingRef: RefObject<HTMLDivElement | null>;
+	hostOwnsTitle: boolean;
+	isWorkspacePreview: boolean;
+	isMobileViewport: boolean;
+
 	toolbarBadgeCounts: NarratorToolbarBadgeCounts;
-	/** Full flat layout (both zones) for the overflow drag list. */
-	toolbarEntries: readonly NarratorToolbarEntry[];
-	/** Entries not on the row (tucked or collapsed for width). */
-	toolbarHiddenDefs: readonly NarratorToolbarItemDef[];
-	/** Ids above the divider the row could not fit (marked in the overflow menu). */
-	toolbarNoRoomIds: readonly string[];
 	headerHostCapabilities: readonly NarratorToolbarHost[];
-	/** Whether an entry's panel is currently open (drives active styling). */
-	toolbarEntryActive: (id: NarratorToolbarId) => boolean;
-	activateToolbarEntry: (id: string) => void;
-	saveToolbarLayout: (entries: NarratorToolbarEntry[]) => void;
-	renderToolbarInlineOptions: (id: string, close: () => void) => ReactNode;
+
+	// ── Per-entry availability inputs (drive which entries the row offers) ──
+	chapterId: string | null | undefined;
+	tasksSupported: boolean;
+	tasksButtonEnabled: boolean;
+	specToolAvailable: boolean;
+	terminalToolAvailable: boolean;
+	onOpenTerminalPanel: (() => void) | undefined;
+	browserSessionsSupported: boolean | undefined;
+
+	// ── Active-state inputs (drive active styling) ──
+	mobileTasksOpen: boolean;
+	mobileToolPanel: MobileToolPanelKind | null;
+	fileModDrawerOpened: boolean;
+	detailsOpened: boolean;
+	terminalToolOpened: boolean;
+	specToolOpened: boolean;
+
+	// ── Activation actions ──
+	setMobileTasksOpen: Dispatch<SetStateAction<boolean>>;
+	setMobileToolPanel: Dispatch<SetStateAction<MobileToolPanelKind | null>>;
+	setFileModDrawerOpened: Dispatch<SetStateAction<boolean>>;
+	toggleDetails: () => void;
+	toggleTerminalTool: () => void;
+	toggleSpecTool: () => void;
+
 	openArchiveConfirm: () => void;
 	archiveMutation: MutationLike;
 	// Device entry
@@ -76,16 +93,8 @@ export interface HeaderToolbarProps {
 export function HeaderToolbar(props: HeaderToolbarProps) {
 	const {
 		headerToolbarRef,
-		toolbarVisibleDefs,
 		toolbarBadgeCounts,
-		toolbarEntries,
-		toolbarHiddenDefs,
-		toolbarNoRoomIds,
 		headerHostCapabilities,
-		toolbarEntryActive,
-		activateToolbarEntry,
-		saveToolbarLayout,
-		renderToolbarInlineOptions,
 		openArchiveConfirm,
 		archiveMutation,
 		executionDevicesQuery,
@@ -100,6 +109,56 @@ export function HeaderToolbar(props: HeaderToolbarProps) {
 		onClose,
 		t,
 	} = props;
+
+	// The toolbar's availability / layout / activation / inline-options logic lives
+	// here now (co-located with the row it drives), fed the raw capability, active
+	// state and action inputs the panel used to pre-compute into props.
+	const {
+		toolbarEntries,
+		toolbarVisibleDefs,
+		toolbarHiddenDefs,
+		toolbarNoRoomIds,
+		saveToolbarLayout,
+		toolbarEntryActive,
+		activateToolbarEntry,
+		renderToolbarInlineOptions,
+	} = useHeaderToolbar({
+		headerRowRef: props.headerRowRef,
+		headerToolbarRef,
+		headerLeadingRef: props.headerLeadingRef,
+		headerHostCapabilities,
+		hostOwnsTitle: props.hostOwnsTitle,
+		isWorkspacePreview: props.isWorkspacePreview,
+		isMobileViewport: props.isMobileViewport,
+		dock,
+		chapterId: props.chapterId,
+		tasksSupported: props.tasksSupported,
+		tasksButtonEnabled: props.tasksButtonEnabled,
+		specToolAvailable: props.specToolAvailable,
+		terminalToolAvailable: props.terminalToolAvailable,
+		onOpenTerminalPanel: props.onOpenTerminalPanel,
+		browserSessionsSupported: props.browserSessionsSupported,
+		executionDevicesQuery,
+		mobileTasksOpen: props.mobileTasksOpen,
+		mobileToolPanel: props.mobileToolPanel,
+		fileModDrawerOpened: props.fileModDrawerOpened,
+		detailsOpened: props.detailsOpened,
+		terminalToolOpened: props.terminalToolOpened,
+		specToolOpened: props.specToolOpened,
+		setMobileTasksOpen: props.setMobileTasksOpen,
+		setMobileToolPanel: props.setMobileToolPanel,
+		setFileModDrawerOpened: props.setFileModDrawerOpened,
+		toggleDetails: props.toggleDetails,
+		toggleTerminalTool: props.toggleTerminalTool,
+		toggleSpecTool: props.toggleSpecTool,
+		updateExecutionDeviceMutation,
+		renderLod,
+		renderLodIsDefault,
+		handleSelectLod,
+		setAsDefault,
+		openPluginPanel,
+		t,
+	});
 
 	return (
 		<Group ref={headerToolbarRef} gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>

@@ -31,7 +31,7 @@ import {
 	TerminalDockPanel as TerminalToolAdapter,
 	UserChatDockPanel as UserChatToolAdapter,
 } from "../dock/panels";
-import { useFilePanelSourceOpener } from "../file-panel-navigation";
+import { useFilePanelSourceOpener } from "../file-panel/file-panel-navigation";
 import { NarratorPanel } from "../NarratorPanel";
 import type {
 	FilePanelParams,

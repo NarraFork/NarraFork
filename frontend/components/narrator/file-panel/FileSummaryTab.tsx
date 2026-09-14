@@ -24,8 +24,8 @@ import {
 import { useCallback, useMemo, useState } from "react";
 
 import { useTranslation } from "react-i18next";
-import { TruncatedPath } from "../common/TruncatedPath";
-import { DiffView, normalizeDiffLineEndings } from "./diff/DiffView";
+import { TruncatedPath } from "../../common/TruncatedPath";
+import { DiffView, normalizeDiffLineEndings } from "../diff/DiffView";
 
 const MAX_FILE_SUMMARY_FILES = 1_000;
 const fileKey = (deviceId: string, filePath: string) => JSON.stringify([deviceId, filePath]);

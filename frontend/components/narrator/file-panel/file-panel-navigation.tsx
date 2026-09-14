@@ -1,5 +1,5 @@
 import { createContext, useContext, useMemo } from "react";
-import { type NarratorDockContextValue, useNarratorDockContext } from "./dock/NarratorDockContext";
+import { type NarratorDockContextValue, useNarratorDockContext } from "../dock/NarratorDockContext";
 
 export type FilePanelOpener = NonNullable<NarratorDockContextValue["openFilePanel"]>;
 

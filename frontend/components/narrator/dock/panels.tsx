@@ -44,12 +44,12 @@ import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
 import type { PluginDockPanelProps } from "../../plugins/types";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
-import { getFilePreviewType } from "../FilePreviewModal";
+import { getFilePreviewType } from "../file-panel/FilePreviewModal";
 import {
 	FilePanelNavigationProvider,
 	type FilePanelOpener,
 	useFilePanelSourceOpener,
-} from "../file-panel-navigation";
+} from "../file-panel/file-panel-navigation";
 import {
 	type FilePanelParams,
 	filePanelBaseName,
@@ -79,7 +79,9 @@ const BrowserPanel = lazy(() =>
 	import("../BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
 );
 const FileModificationsPanel = lazy(() =>
-	import("../FileModificationsDrawer").then((m) => ({ default: m.FileModificationsPanel })),
+	import("../file-panel/FileModificationsDrawer").then((m) => ({
+		default: m.FileModificationsPanel,
+	})),
 );
 const SpecPanel = lazy(() => import("../spec/SpecPanel").then((m) => ({ default: m.SpecPanel })));
 const AppearancePanel = lazy(() =>

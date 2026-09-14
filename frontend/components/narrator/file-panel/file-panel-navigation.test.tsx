@@ -4,14 +4,14 @@ import {
 	NarratorDockContext,
 	type NarratorDockContextValue,
 	useNarratorDockContext,
-} from "./dock/NarratorDockContext";
+} from "../dock/NarratorDockContext";
+import { useToolEditNavigation } from "../useToolEditNavigation";
 import {
 	FilePanelNavigationProvider,
 	type FilePanelOpener,
 	useFilePanelNavigation,
 	useFilePanelSourceOpener,
 } from "./file-panel-navigation";
-import { useToolEditNavigation } from "./useToolEditNavigation";
 
 function probeIsolatedChild(hostOpen: FilePanelOpener | undefined) {
 	const observations: {
@@ -122,9 +122,11 @@ describe("isolated child file navigation", () => {
 	});
 
 	test("focus and workspace adapters forward only the file capability across the isolation boundary", async () => {
-		const focus = await Bun.file(new URL("./dock/panels.tsx", import.meta.url)).text();
-		const workspace = await Bun.file(new URL("./workspace/panels.tsx", import.meta.url)).text();
-		const panel = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
+		const focus = await Bun.file(new URL("../dock/panels.tsx", import.meta.url)).text();
+		const workspace = await Bun.file(new URL("../workspace/panels.tsx", import.meta.url)).text();
+		const panel = await Bun.file(
+			new URL("../interaction/use-internal-file-viewer.ts", import.meta.url),
+		).text();
 		expect(focus).toMatch(
 			/useFilePanelSourceOpener\(\s*hostDock\?\.openFilePanel,\s*props.api.id,\s*props.params.subagentNarratorId,/,
 		);
@@ -138,7 +140,7 @@ describe("isolated child file navigation", () => {
 		);
 		expect(panel).toContain("const dockOpenFilePanel = useFilePanelNavigation();");
 		expect(panel).toContain(
-			"const useInternalFileViewer = !dockOpenFilePanel && !isWorkspacePreview;",
+			"const useInternalViewer = !dockOpenFilePanel && !isWorkspacePreview;",
 		);
 		expect(panel).toContain("fileReferenceApi.resolve(narratorId, [target], controller.signal)");
 	});

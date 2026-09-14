@@ -72,7 +72,7 @@ const ToolCallInspector = lazy(() =>
 	import("./tool-call/ToolCallInspector").then((m) => ({ default: m.ToolCallInspector })),
 );
 const FilePreviewModal = lazy(() =>
-	import("./FilePreviewModal").then((m) => ({ default: m.FilePreviewModal })),
+	import("./file-panel/FilePreviewModal").then((m) => ({ default: m.FilePreviewModal })),
 );
 
 const SWIPE_REVEAL_WIDTH = 180;

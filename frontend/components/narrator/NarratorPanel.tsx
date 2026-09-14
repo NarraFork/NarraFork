@@ -25,15 +25,7 @@ import type {
 	FileReferenceContext,
 	FileReferenceEditorSelection,
 } from "@shared/file-reference";
-import { cardEffortLevels, lookupModelCard } from "@shared/model-card";
-import { MOBILE_TOOLBAR_VISIBLE_LIMIT } from "@shared/narrator-toolbar";
-import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
-import {
-	claudeVersionAtLeast,
-	GENERIC_REASONING_EFFORT_TIERS,
-	modelAcceptsReasoningEffort,
-	parseClaudeModel,
-} from "@shared/reasoning-effort-support";
+
 import {
 	IconArrowDown,
 	IconArrowLeft,
@@ -52,16 +44,7 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import {
-	lazy,
-	type ReactNode,
-	Suspense,
-	useCallback,
-	useEffect,
-	useMemo,
-	useRef,
-	useState,
-} from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import {
@@ -96,9 +79,7 @@ import {
 	useUpdateRelaxedPlan,
 	useUpdateSubagentConclusion,
 } from "../../hooks/useNarrator";
-import { useNarratorHeaderToolbarCapacity } from "../../hooks/useNarratorHeaderToolbarCapacity";
 import { useNarratorLod } from "../../hooks/useNarratorLod";
-import { useNarratorToolbarLayout } from "../../hooks/useNarratorToolbarLayout";
 import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorCompactCapability,
@@ -115,7 +96,7 @@ import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { ApiError, api } from "../../lib/api";
 import type { RevertScope } from "../../lib/api/narrators";
-import { type ModelOption, resolveDisplayModel, statusRegistry } from "../../lib/constants";
+import { statusRegistry } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import {
 	calculateEffectiveTurnElapsedMs,
@@ -135,10 +116,7 @@ import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { useImageViewer } from "../common/image-viewer-context";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
-import {
-	buildPluginDockPanelOpenRequest,
-	PluginContributionOptions,
-} from "../plugins/PluginContributionPicker";
+import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
 import { BackgroundTasksDrawerHost, useBackgroundTasksButton } from "./BackgroundTasksDrawer";
 import { ContentViewerEnvironmentProvider } from "./ContentViewer";
@@ -162,29 +140,27 @@ import {
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
-import { ExecutionDeviceOptions } from "./ExecutionDeviceMenu";
 import { HeaderToolbar } from "./header/HeaderToolbar";
 import { useTitleEditing } from "./header/use-title-editing";
 import { ContextUsageIndicator } from "./interaction/ContextUsageIndicator";
-import { FastModeControl } from "./interaction/FastModeControl";
+
 import { PathRulesPopover } from "./interaction/PathRulesPopover";
 import {
-	type BooleanOverride,
-	type DangerReflectionOverride,
 	normalizeBooleanOverride,
 	normalizeDangerReflectionLevel,
 	normalizeDangerReflectionOverride,
-	resolveBooleanOverride,
-	resolveDangerReflectionLevel,
 } from "./interaction/reflection-types";
 import { SetGlobalModelModal } from "./interaction/SetGlobalModelModal";
 import { useComposerAttachments } from "./interaction/use-composer-attachments";
+import { useFastModeControl } from "./interaction/use-fast-mode-control";
 import { useInternalFileViewer } from "./interaction/use-internal-file-viewer";
 import { useInterruptLongPress } from "./interaction/use-interrupt-long-press";
 import { useMessageRevertConfirm } from "./interaction/use-message-revert-confirm";
+import { useModelSelection } from "./interaction/use-model-selection";
 import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions";
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
+import { usePermissionModeControl } from "./interaction/use-permission-mode-control";
 import { useQueuedMessageActions } from "./interaction/use-queued-message-actions";
 import {
 	formatKimiBarText,
@@ -193,7 +169,6 @@ import {
 } from "./kimi-usage-format";
 import { LeakedToolCallModal } from "./LeakedToolCallModal";
 import { LodSwitchToast } from "./lod/LodSwitchToast";
-import { NarratorLodOptions } from "./lod/NarratorLodMenu";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
 import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./message/MessageSelectionCtx";
@@ -207,11 +182,7 @@ import { NarratorInteractionArea } from "./NarratorInteractionArea";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorStatusToolbarAction } from "./NarratorStatusToolbar";
-import {
-	HEADER_TITLE_MIN_WIDTH_PX,
-	HEADER_TITLE_SLOT_ATTR,
-	selectHeaderToolbarEntries,
-} from "./narrator-header-toolbar-capacity";
+import { HEADER_TITLE_SLOT_ATTR } from "./narrator-header-toolbar-capacity";
 
 import type {
 	AsyncQuestionSlot,
@@ -230,7 +201,7 @@ import {
 } from "./narrator-panel-types";
 import { getNarratorStatusBarDisplay, planNarratorWorkIndicator } from "./narrator-status-bar";
 import type { NarratorToolbarBadgeCounts } from "./narrator-toolbar-badges";
-import type { NarratorToolbarHost, NarratorToolbarId } from "./narrator-toolbar-items";
+import type { NarratorToolbarHost } from "./narrator-toolbar-items";
 import { compactProgressLabel } from "./progress-label";
 import { toBannerQuestions } from "./question/async-question-questions";
 import { RevertActionConfirmModal } from "./RevertScopeConfirmModal";
@@ -277,7 +248,7 @@ const SpecPanel = lazy(() =>
 	import("./spec/SpecPanel").then((module) => ({ default: module.SpecPanel })),
 );
 const FileModificationsDrawer = lazy(() =>
-	import("./FileModificationsDrawer").then((module) => ({
+	import("./file-panel/FileModificationsDrawer").then((module) => ({
 		default: module.FileModificationsDrawer,
 	})),
 );
@@ -338,130 +309,6 @@ function getMessageViewportScrollBottom(scroller: HTMLElement) {
 
 function _getMessageViewportDistanceFromBottom(scroller: HTMLElement) {
 	return getMessageViewportScrollBottom(scroller) - scroller.scrollTop;
-}
-
-type ReasoningEffortValue = "none" | "low" | "medium" | "high" | "xhigh" | "max";
-
-/**
- * Fallback tiers for a Codex model missing from the catalog below. Kept
- * separate from GENERIC_REASONING_EFFORT_TIERS: Codex models have no `max`
- * tier, so an unknown one must not offer it.
- */
-const DEFAULT_CODEX_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
-	"none",
-	"low",
-	"medium",
-	"high",
-];
-
-/** DeepSeek only supports two effective tiers: high and max (mapped from xhigh). */
-const DEEPSEEK_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
-	"none",
-	"high",
-	"xhigh",
-];
-
-/**
- * Gemini exposes a three-tier thinking level (low/medium/high) plus "none" to
- * disable thinking. NarraFork's higher tiers (xhigh/max) collapse onto "high"
- * upstream, so they are not offered here.
- */
-const GEMINI_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
-	"none",
-	"low",
-	"medium",
-	"high",
-];
-
-/**
- * Anthropic effort tiers for 4.6-era models (official API and
- * Anthropic-compatible relays). The `xhigh` tier only arrived with Opus 4.7,
- * so these models expose low/medium/high/max plus "none" to disable thinking.
- */
-const ANTHROPIC_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
-	"none",
-	"low",
-	"medium",
-	"high",
-	"max",
-];
-
-/**
- * Anthropic effort tiers for models with the `xhigh` tier — Opus 4.7/4.8, the
- * 5 series (Opus 5 / Sonnet 5) and Fable/Mythos.
- */
-const ANTHROPIC_XHIGH_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
-	"none",
-	"low",
-	"medium",
-	"high",
-	"xhigh",
-	"max",
-];
-
-const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortValue[]> = {
-	// GPT-6 Astra requires reasoning, so it intentionally omits `none`.
-	"gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
-	"gpt-5.6-sol": ["none", "low", "medium", "high", "xhigh", "max"],
-	"gpt-5.6-terra": ["none", "low", "medium", "high", "xhigh", "max"],
-	"gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
-	"gpt-5.5": ["none", "low", "medium", "high", "xhigh"],
-};
-
-function getBareModelForReasoning(model?: string, modelOption?: ModelOption): string {
-	if (modelOption?.bareModel) return modelOption.bareModel;
-	if (!model) return "";
-	const modelWithoutProvider = model.includes(":") ? model.split(":").slice(1).join(":") : model;
-	const channel = modelOption?.channel ?? modelWithoutProvider.split(":")[0];
-	if (channel) {
-		const channelPrefix = `${channel}:`;
-		if (modelWithoutProvider.startsWith(channelPrefix)) {
-			return modelWithoutProvider.slice(channelPrefix.length);
-		}
-	}
-	return modelWithoutProvider.startsWith("codex:")
-		? modelWithoutProvider.slice("codex:".length)
-		: modelWithoutProvider;
-}
-
-function getCodexReasoningEffortOptions(
-	model?: string,
-	modelOption?: ModelOption,
-): readonly ReasoningEffortValue[] {
-	const bareModel = getBareModelForReasoning(model, modelOption);
-	return CODEX_REASONING_OPTIONS_BY_MODEL[bareModel] ?? DEFAULT_CODEX_REASONING_EFFORT_OPTIONS;
-}
-
-function codexModelSupportsReasoningDisabled(model?: string, modelOption?: ModelOption): boolean {
-	return getBareModelForReasoning(model, modelOption) !== "gpt-6-astra";
-}
-
-function isDeepSeekModel(model?: string): boolean {
-	if (!model) return false;
-	return model.toLowerCase().includes("deepseek");
-}
-
-/**
- * Whether an Anthropic model has the `xhigh` tier (Opus 4.7+ / 5 series).
- * A tier question, not an access question — the parsing it relies on lives in
- * @shared/reasoning-effort-support alongside the backend's copy.
- */
-function anthropicModelSupportsXhigh(model?: string): boolean {
-	if (!model) return false;
-	const parsed = parseClaudeModel(model);
-	if (!parsed) return false;
-	if (parsed.family === "fable" || parsed.family === "mythos") return true;
-	if (parsed.family !== "sonnet" && parsed.family !== "opus") return false;
-	return claudeVersionAtLeast(parsed, 4, 7);
-}
-
-function normalizeReasoningEffortForModel(
-	model: string | undefined,
-	effort: string | null | undefined,
-): string {
-	if (!effort) return "";
-	if (isDeepSeekModel(model) && (effort === "low" || effort === "medium")) return "high";
-	return effort;
 }
 
 export function NarratorPanel({
@@ -596,11 +443,6 @@ export function NarratorPanel({
 	const { data: userPrefs } = useUserPreferences();
 	const updateUserPrefs = useUpdateUserPreferences();
 	const fastModeDefault = userPrefs?.fastModeDefault ?? false;
-	// "inherit" follows the default, so the default switch below also changes what
-	// this session actually does — matching the server-side per-turn resolution.
-	const fastModeOverride = narrator?.fastModeOverride ?? "inherit";
-	const fastModeEnabled =
-		fastModeOverride === "inherit" ? fastModeDefault : fastModeOverride === "on";
 	const isMobileViewport = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const isCoarsePointer = useMediaQuery("(hover: none), (pointer: coarse)") ?? false;
 	const fastModeUsesTapSettings = isMobileViewport || isCoarsePointer;
@@ -881,26 +723,33 @@ export function NarratorPanel({
 	// model value; when using a model aggregation, resolve to a representative
 	// concrete member so capability/context-window lookups work (the backend
 	// resolves the actual member at request time).
-	const resolvedModel = useMemo(
-		() =>
-			resolveDisplayModel(narrator?.model, {
-				defaultModelValue,
-				aggregations,
-			}),
-		[narrator?.model, defaultModelValue, aggregations],
-	);
-
-	// Parse provider:model for context threshold lookup
-	const { resolvedProvider, resolvedBareModel } = useMemo(() => {
-		const idx = resolvedModel.indexOf(":");
-		if (idx > 0) {
-			return {
-				resolvedProvider: resolvedModel.slice(0, idx),
-				resolvedBareModel: resolvedModel.slice(idx + 1),
-			};
-		}
-		return { resolvedProvider: "", resolvedBareModel: resolvedModel };
-	}, [resolvedModel]);
+	// Model resolution + reasoning-effort menu subsystem. Kept lifted here:
+	// resolvedModel feeds the NUG quota, Kimi usage and context-threshold queries
+	// below, plus the big status-bar control-menu object.
+	const {
+		resolvedModel,
+		resolvedProvider,
+		resolvedBareModel,
+		supportsCodexControls,
+		isBuiltInCodexModel,
+		supportsReasoningEffort,
+		reasoningEffortOptions,
+		reasoningFollowsDefault,
+		displayedReasoningEffort,
+		handleFollowDefaultReasoning,
+		handleSetReasoningAsDefault,
+	} = useModelSelection({
+		narratorId,
+		narratorModel: narrator?.model,
+		narratorReasoningEffort: narrator?.reasoningEffort,
+		defaultModelValue,
+		aggregations,
+		allModels,
+		settingsData,
+		modelCardIndex,
+		reasoningEffortMutation,
+		updateSettingsMutation,
+	});
 
 	// Fetch context thresholds for the current model (used as fallback when WS hasn't pushed yet)
 	const { data: modelThresholds } = useQuery({
@@ -939,178 +788,6 @@ export function NarratorPanel({
 		staleTime: 30_000,
 		refetchInterval: 60_000,
 	});
-
-	const codexCapableProviders = useMemo(() => {
-		const providers = new Set<string>();
-		if (settingsData?.codexAvailable) providers.add("codex");
-		for (const provider of settingsData?.openaiProviders ?? []) {
-			if (provider?.prefix && (provider.apiMode ?? "responses") === "codex") {
-				providers.add(provider.prefix);
-			}
-		}
-		return providers;
-	}, [settingsData]);
-	const resolvedModelOption = useMemo(
-		() => allModels.find((m) => m.value === resolvedModel),
-		[allModels, resolvedModel],
-	);
-	const isCodexChannelModel =
-		resolvedModelOption?.channelType?.toLowerCase() === "codex" ||
-		resolvedBareModel.startsWith("codex:");
-	const supportsCodexControls = useMemo(() => {
-		const providerPrefix = resolvedModel?.split(":")[0];
-		return (!!providerPrefix && codexCapableProviders.has(providerPrefix)) || isCodexChannelModel;
-	}, [codexCapableProviders, isCodexChannelModel, resolvedModel]);
-	const isBuiltInCodexModel = resolvedModel?.split(":")[0] === "codex";
-
-	/**
-	 * Whether to offer the reasoning-effort menu at all.
-	 *
-	 * Blacklist policy, mirroring the backend: effort is near-universal, so any
-	 * configured model gets the menu unless it is excluded. The previous
-	 * whitelist demanded a recognizable Claude/Codex/Gemini/DeepSeek id, which
-	 * hid the menu for every third-party model behind a generic relay (GLM,
-	 * Kimi, MiniMax, ...) even though those upstreams accept the parameter.
-	 *
-	 * Two exclusions, both shared with the backend via
-	 * `modelAcceptsReasoningEffort`: pre-4.6 Claude, and the user's
-	 * `agent.reasoningEffortBlocklist`.
-	 */
-	const supportsReasoningEffort = useMemo(() => {
-		const providerPrefix = resolvedModel?.split(":")[0];
-		if (!providerPrefix) return false;
-		// Codex always has tiers, regardless of the model id.
-		if (codexCapableProviders.has(providerPrefix) || isCodexChannelModel) return true;
-		return modelAcceptsReasoningEffort(
-			getBareModelForReasoning(resolvedModel, resolvedModelOption),
-			settingsData?.agent?.reasoningEffortBlocklist,
-		);
-	}, [
-		codexCapableProviders,
-		isCodexChannelModel,
-		resolvedModelOption,
-		settingsData?.agent?.reasoningEffortBlocklist,
-		resolvedModel,
-	]);
-	const reasoningEffortOptions = useMemo(() => {
-		if (!resolvedModel) return GENERIC_REASONING_EFFORT_TIERS;
-		// DeepSeek: only two effective tiers (high / max mapped from xhigh)
-		if (isDeepSeekModel(resolvedModel)) return DEEPSEEK_REASONING_EFFORT_OPTIONS;
-		// Model cards: the editable replacement for the hardcoded per-model tables.
-		// `none` is appended here rather than stored on the card, because on a card
-		// it would become a clamp target able to silently turn a requested `low`
-		// into thinking switched off.
-		const cardTiers = modelCardIndex
-			? cardEffortLevels(
-					lookupModelCard(
-						getBareModelForReasoning(resolvedModel, resolvedModelOption),
-						modelCardIndex,
-					)?.card,
-				)
-			: undefined;
-		if (cardTiers?.length) {
-			return codexModelSupportsReasoningDisabled(resolvedModel, resolvedModelOption)
-				? (["none", ...cardTiers] as readonly ReasoningEffortValue[])
-				: (cardTiers as readonly ReasoningEffortValue[]);
-		}
-		const providerPrefix = resolvedModel.split(":")[0];
-		if (providerPrefix && (codexCapableProviders.has(providerPrefix) || isCodexChannelModel)) {
-			return getCodexReasoningEffortOptions(resolvedModel, resolvedModelOption);
-		}
-		// Anthropic (official, compatible/cc relay, or NUG anthropic channel).
-		// Opus 4.7+ and the 5 series add the xhigh tier; 4.6 stays on four tiers.
-		const isAnthropic =
-			resolvedModelOption?.channelType === "anthropic" ||
-			(!!providerPrefix &&
-				(settingsData?.anthropicProviders ?? []).some(
-					(p: { prefix?: string }) => p.prefix === providerPrefix,
-				));
-		if (isAnthropic) {
-			return anthropicModelSupportsXhigh(
-				getBareModelForReasoning(resolvedModel, resolvedModelOption),
-			)
-				? ANTHROPIC_XHIGH_REASONING_EFFORT_OPTIONS
-				: ANTHROPIC_REASONING_EFFORT_OPTIONS;
-		}
-		// Gemini (gemini-compatible): low/medium/high plus none.
-		const isGemini =
-			!!providerPrefix &&
-			(settingsData?.geminiProviders ?? []).some(
-				(p: { prefix?: string }) => p.prefix === providerPrefix,
-			);
-		if (isGemini) {
-			return GEMINI_REASONING_EFFORT_OPTIONS;
-		}
-		// Everything else — a third-party model on a generic relay, with no tier
-		// table of its own. Uses the shared generic ladder (none/low/medium/high/
-		// max) that the backend clamps against, so the menu cannot offer a tier
-		// the request path would silently rewrite.
-		return GENERIC_REASONING_EFFORT_TIERS;
-	}, [
-		codexCapableProviders,
-		isCodexChannelModel,
-		modelCardIndex,
-		resolvedModel,
-		resolvedModelOption,
-		settingsData?.anthropicProviders,
-		settingsData?.geminiProviders,
-	]);
-
-	// The global default reasoning effort (single source of truth). Applied to
-	// every model when the narrator has no explicit override.
-	const globalDefaultReasoningEffort = useMemo<ReasoningEffort>(() => {
-		const raw = settingsData?.agent?.defaultReasoningEffort;
-		return (raw as ReasoningEffort) || "max";
-	}, [settingsData?.agent?.defaultReasoningEffort]);
-
-	// Whether the narrator is following the global default (no explicit override).
-	const reasoningFollowsDefault = narrator?.reasoningEffort == null;
-
-	// The effective reasoning effort to highlight in the menu. Always shows the
-	// tier that will actually be used: the narrator's own override (clamped to
-	// the model), or — when following default — the clamped global default.
-	// Mirrors the permission/reflection menus, which show the effective value and
-	// express the follow/override state only via the inline links below.
-	const displayedReasoningEffort = useMemo(() => {
-		const options = reasoningEffortOptions as readonly ReasoningEffort[];
-		const desired = reasoningFollowsDefault
-			? globalDefaultReasoningEffort
-			: (normalizeReasoningEffortForModel(
-					resolvedModel,
-					narrator?.reasoningEffort,
-				) as ReasoningEffort);
-		if (!desired) return "";
-		return clampReasoningEffort(desired, options);
-	}, [
-		resolvedModel,
-		narrator?.reasoningEffort,
-		reasoningEffortOptions,
-		reasoningFollowsDefault,
-		globalDefaultReasoningEffort,
-	]);
-
-	// "Follow default": clear the narrator's override so it tracks the global
-	// default again.
-	const handleFollowDefaultReasoning = useCallback(() => {
-		reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: null });
-	}, [narratorId, reasoningEffortMutation]);
-
-	// "Set as default": promote the narrator's explicit override to the global
-	// default (writing the raw desired value, NOT the per-model clamped one), then
-	// reset the narrator to follow the default. Only meaningful when an override
-	// exists, so the inline link is hidden while following default.
-	const handleSetReasoningAsDefault = useCallback(() => {
-		const desired = narrator?.reasoningEffort;
-		if (!desired) return;
-		updateSettingsMutation.mutate(
-			{ agent: { defaultReasoningEffort: desired } },
-			{
-				onSuccess: () => {
-					reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: null });
-				},
-			},
-		);
-	}, [narrator?.reasoningEffort, narratorId, reasoningEffortMutation, updateSettingsMutation]);
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -1727,64 +1404,18 @@ export function NarratorPanel({
 		{ open: openContextThresholdSettingsModal, close: closeContextThresholdSettings },
 	] = useDisclosure(false);
 
-	const [fastModeSettingsOpened, setFastModeSettingsOpened] = useState(false);
-	const fastModeSettingsCloseTimerRef = useRef<number | null>(null);
-	const fastModeLongPressTimerRef = useRef<number | null>(null);
-	const fastModeLongPressFiredRef = useRef(false);
-
-	const clearFastModeSettingsCloseTimer = useCallback(() => {
-		if (fastModeSettingsCloseTimerRef.current != null) {
-			window.clearTimeout(fastModeSettingsCloseTimerRef.current);
-			fastModeSettingsCloseTimerRef.current = null;
-		}
-	}, []);
-
-	const clearFastModeLongPressTimer = useCallback(() => {
-		if (fastModeLongPressTimerRef.current != null) {
-			window.clearTimeout(fastModeLongPressTimerRef.current);
-			fastModeLongPressTimerRef.current = null;
-		}
-	}, []);
-
-	const openFastModeSettings = useCallback(() => {
-		clearFastModeSettingsCloseTimer();
-		setFastModeSettingsOpened(true);
-	}, [clearFastModeSettingsCloseTimer]);
-
-	const closeFastModeSettings = useCallback(() => {
-		clearFastModeSettingsCloseTimer();
-		setFastModeSettingsOpened(false);
-	}, [clearFastModeSettingsCloseTimer]);
-
-	const scheduleFastModeSettingsClose = useCallback(() => {
-		if (fastModeUsesTapSettings) return;
-		clearFastModeSettingsCloseTimer();
-		fastModeSettingsCloseTimerRef.current = window.setTimeout(() => {
-			setFastModeSettingsOpened(false);
-			fastModeSettingsCloseTimerRef.current = null;
-		}, 180);
-	}, [clearFastModeSettingsCloseTimer, fastModeUsesTapSettings]);
-
-	const startFastModeLongPress = useCallback(
-		(event: React.PointerEvent) => {
-			fastModeLongPressFiredRef.current = false;
-			if (!fastModeUsesTapSettings || event.pointerType === "mouse") return;
-			clearFastModeLongPressTimer();
-			fastModeLongPressTimerRef.current = window.setTimeout(() => {
-				fastModeLongPressFiredRef.current = true;
-				fastModeLongPressTimerRef.current = null;
-				openFastModeSettings();
-			}, 550);
-		},
-		[clearFastModeLongPressTimer, fastModeUsesTapSettings, openFastModeSettings],
-	);
-
-	useEffect(() => {
-		return () => {
-			clearFastModeSettingsCloseTimer();
-			clearFastModeLongPressTimer();
-		};
-	}, [clearFastModeLongPressTimer, clearFastModeSettingsCloseTimer]);
+	// Fast-mode toggle + settings popover (open state, hover-close debounce, and
+	// the coarse-pointer long-press timer). Kept lifted here: the rendered control
+	// is threaded into the status-bar control-menu object built below.
+	const { renderFastModeControl } = useFastModeControl({
+		narratorId,
+		narratorFastModeOverride: narrator?.fastModeOverride,
+		fastModeDefault,
+		fastModeUsesTapSettings,
+		fastModeMutation,
+		updateUserPrefs,
+		t,
+	});
 
 	const detailsPanelExternalProps = useMemo(
 		() => ({
@@ -2106,105 +1737,40 @@ export function NarratorPanel({
 	const hasPlanTrait = Array.isArray(narrator?.traits)
 		? narrator.traits.includes("plan")
 		: !!narrator?.planMode;
-	const planReflectionAutoApproveOverride = normalizeBooleanOverride(
-		narrator?.planReflectionAutoApproveOverride,
-	);
-	const dangerReflectionOverride = normalizeDangerReflectionOverride(
-		narrator?.dangerReflectionOverride,
-	);
-	const planReflectionAutoApproveEffective = resolveBooleanOverride(
+	// Plan-mode toggle + plan/danger reflection override controls. Kept lifted:
+	// outputs feed the status-bar control-menu object, and hasPlanTrait (read by
+	// several other panel consumers) is injected rather than owned here.
+	const {
 		planReflectionAutoApproveOverride,
-		planReflectionAutoApproveGlobal,
-	);
-	const dangerReflectionEffectiveLevel = resolveDangerReflectionLevel(
 		dangerReflectionOverride,
-		dangerReflectionGlobalLevel,
-	);
-	const togglePlanMode = useCallback(() => {
-		if (!narratorId || !planModeSupported) return;
-		if (hasPlanTrait) {
-			exitPlanModeMutation.mutate(narratorId);
-		} else {
-			enterPlanModeMutation.mutate(narratorId);
-		}
-	}, [enterPlanModeMutation, exitPlanModeMutation, hasPlanTrait, narratorId, planModeSupported]);
-	const handlePlanReflectionAutoApproveOverride = useCallback(
-		(value: BooleanOverride) => {
-			if (!planReflectionSupported) return;
-			reflectionOverridesMutation.mutate({
-				id: narratorId,
-				planReflectionAutoApproveOverride: value,
-			});
-		},
-		[narratorId, planReflectionSupported, reflectionOverridesMutation],
-	);
-	const handleFollowDefaultPlanReflection = useCallback(() => {
-		handlePlanReflectionAutoApproveOverride("inherit");
-	}, [handlePlanReflectionAutoApproveOverride]);
-	const handleSetPlanReflectionAsDefault = useCallback(() => {
-		if (!settingsData || !planReflectionSupported) return;
-		updateSettingsMutation.mutate({
-			agent: { planReflectionAutoApprove: planReflectionAutoApproveEffective },
-		});
-		reflectionOverridesMutation.mutate({
-			id: narratorId,
-			planReflectionAutoApproveOverride: "inherit",
-		});
-	}, [
-		narratorId,
 		planReflectionAutoApproveEffective,
-		planReflectionSupported,
-		reflectionOverridesMutation,
-		settingsData,
-		updateSettingsMutation,
-	]);
-	const handleDangerReflectionOverride = useCallback(
-		async (value: DangerReflectionOverride) => {
-			if (!dangerReflectionSupported) return;
-			const nextLevel = resolveDangerReflectionLevel(value, dangerReflectionGlobalLevel);
-			if (nextLevel === "off" && dangerReflectionEffectiveLevel !== "off") {
-				const ok = await confirm({ message: t("dangerReflectionDisableWarning") });
-				if (!ok) return;
-			}
-			reflectionOverridesMutation.mutate({ id: narratorId, dangerReflectionOverride: value });
-		},
-		[
-			confirm,
-			dangerReflectionEffectiveLevel,
-			dangerReflectionGlobalLevel,
-			dangerReflectionSupported,
-			narratorId,
-			reflectionOverridesMutation,
-			t,
-		],
-	);
-	const handleFollowDefaultDangerReflection = useCallback(() => {
-		handleDangerReflectionOverride("inherit");
-	}, [handleDangerReflectionOverride]);
-	const handleSetDangerReflectionAsDefault = useCallback(async () => {
-		if (!settingsData || !dangerReflectionSupported) return;
-		if (dangerReflectionEffectiveLevel === "off" && dangerReflectionGlobal) {
-			const ok = await confirm({ message: t("dangerReflectionDisableWarning") });
-			if (!ok) return;
-		}
-		updateSettingsMutation.mutate({
-			agent: {
-				dangerReflectionLevel: dangerReflectionEffectiveLevel,
-				dangerReflectionEnabled: dangerReflectionEffectiveLevel !== "off",
-			},
-		});
-		reflectionOverridesMutation.mutate({ id: narratorId, dangerReflectionOverride: "inherit" });
-	}, [
-		confirm,
 		dangerReflectionEffectiveLevel,
-		dangerReflectionGlobal,
-		dangerReflectionSupported,
+		togglePlanMode,
+		handlePlanReflectionAutoApproveOverride,
+		handleFollowDefaultPlanReflection,
+		handleSetPlanReflectionAsDefault,
+		handleDangerReflectionOverride,
+		handleFollowDefaultDangerReflection,
+		handleSetDangerReflectionAsDefault,
+	} = usePermissionModeControl({
 		narratorId,
+		narratorPlanReflectionAutoApproveOverride: narrator?.planReflectionAutoApproveOverride,
+		narratorDangerReflectionOverride: narrator?.dangerReflectionOverride,
+		hasPlanTrait,
+		planModeSupported,
+		planReflectionSupported,
+		dangerReflectionSupported,
+		planReflectionAutoApproveGlobal,
+		dangerReflectionGlobal,
+		dangerReflectionGlobalLevel,
+		settingsLoaded: !!settingsData,
+		enterPlanModeMutation,
+		exitPlanModeMutation,
 		reflectionOverridesMutation,
-		settingsData,
-		t,
 		updateSettingsMutation,
-	]);
+		confirm,
+		t,
+	});
 	const handleOpenContextThresholdSettings = useCallback(() => {
 		// The modal seeds its own draft from `contextThresholdSettings` on open.
 		openContextThresholdSettingsModal();
@@ -3277,288 +2843,6 @@ export function NarratorPanel({
 		[tasksRunningCount, wsState.browserSessionCount, userChatUnread, activeTerminalCount],
 	);
 
-	/**
-	 * Which entries this narrator can actually offer right now, beyond what the
-	 * host supports. Distinct from `hosts` in the registry: that answers "can this
-	 * surface present the panel at all", this answers "does this narrator have the
-	 * thing" (a chapter for git, spec support, a terminal route, remote devices).
-	 */
-	const toolbarEntryEnabled = useCallback(
-		(id: NarratorToolbarId): boolean => {
-			switch (id) {
-				case "tasks":
-					return tasksSupported && tasksButtonEnabled;
-				case "spec":
-					return specToolAvailable;
-				case "terminal":
-					// Same condition as `terminalActionAvailable` further down, inlined so
-					// this hook does not depend on a value defined after the early return.
-					return terminalToolAvailable || !!onOpenTerminalPanel;
-				case "git":
-					// The git panel needs a chapter; a standalone narrator has none.
-					return !!chapterId;
-				case "browser":
-					return browserSessionsCapability.supported !== false;
-				case "device":
-					// Only meaningful with at least one remote device — otherwise "local"
-					// is the only choice and the control is decoration.
-					return (executionDevicesQuery.data?.devices.length ?? 0) > 0;
-				case "plugins":
-					return !!dock;
-				default:
-					return true;
-			}
-		},
-		[
-			tasksSupported,
-			tasksButtonEnabled,
-			specToolAvailable,
-			terminalToolAvailable,
-			onOpenTerminalPanel,
-			chapterId,
-			browserSessionsCapability.supported,
-			executionDevicesQuery.data?.devices.length,
-			dock,
-		],
-	);
-
-	const {
-		entries: toolbarEntries,
-		visible: toolbarSurfacedDefs,
-		overflow: toolbarTuckedDefs,
-		saveLayout: saveToolbarLayout,
-	} = useNarratorToolbarLayout({
-		// Uncapped on purpose: the cap depends on how many entries are SURFACEABLE,
-		// which is what this partition computes. Capping here would make the count
-		// fed to the measurement depend on the measurement's own result.
-		visibleLimit: null,
-		hostCapabilities: headerHostCapabilities,
-		// Per-narrator availability is applied INSIDE the partition (before the cap),
-		// so a capped row back-fills past disabled entries instead of showing fewer
-		// buttons than the cap allows.
-		entryEnabled: toolbarEntryEnabled,
-	});
-
-	/**
-	 * Width the title keeps before any entry collapses. Zero when the host draws
-	 * the title itself (a graph node), so the entries may claim that space —
-	 * previously the only way to stop the icon row from crushing the title was to
-	 * hide the title entirely, which is what `hostOwnsTitle` was doing.
-	 */
-	const headerTitleSlotMinWidth = useMemo(() => {
-		if (hostOwnsTitle || isWorkspacePreview) return 0;
-		// Plus the pencil / sparkles pair beside the title (ActionIcon size="xs" =
-		// 18px each, gap 4).
-		return HEADER_TITLE_MIN_WIDTH_PX + 2 * 18 + 2 * 4;
-	}, [hostOwnsTitle, isWorkspacePreview]);
-
-	const headerCapacity = useNarratorHeaderToolbarCapacity({
-		rowRef: headerRowRef,
-		toolbarRef: headerToolbarRef,
-		leadingRef: headerLeadingRef,
-		titleSlotMinWidth: headerTitleSlotMinWidth,
-		itemCount: toolbarSurfacedDefs.length,
-		// The measurement may not save a phone from itself: at ~360px a readable
-		// title plus two entries is the honest maximum, whatever the arithmetic says.
-		maxCapacity: isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null,
-		enabled: !isWorkspacePreview,
-	});
-
-	/**
-	 * `null` capacity = no successful measurement yet (first frame, no
-	 * ResizeObserver). Falling back to the mobile cap / "show everything" keeps the
-	 * previous behaviour rather than briefly emptying the row.
-	 */
-	const headerVisibleLimit =
-		headerCapacity ?? (isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null);
-	const headerSelection = useMemo(
-		() => selectHeaderToolbarEntries(toolbarSurfacedDefs, headerVisibleLimit),
-		[toolbarSurfacedDefs, headerVisibleLimit],
-	);
-	const toolbarVisibleDefs = headerSelection.visible;
-	/**
-	 * Everything not on the row: entries collapsed for width, plus the ones the
-	 * reader tucked away. Layout order is preserved so the menu reads as a
-	 * continuation of the row. This is also what the overflow button's aggregate
-	 * badge counts — without it, an entry collapsed for width would take its unread
-	 * count off screen with no trace.
-	 */
-	const toolbarHiddenDefs = useMemo(
-		() => [...headerSelection.hidden, ...toolbarTuckedDefs],
-		[headerSelection.hidden, toolbarTuckedDefs],
-	);
-	/** Ids collapsed for width — the menu marks these so "shown in header" stays honest. */
-	const toolbarNoRoomIds = useMemo(
-		() => headerSelection.hidden.map((def) => def.id as string),
-		[headerSelection.hidden],
-	);
-
-	/** Whether an entry's panel is currently open (drives the active styling). */
-	const toolbarEntryActive = useCallback(
-		(id: NarratorToolbarId): boolean => {
-			switch (id) {
-				case "tasks":
-					return dock ? dock.openToolTypes.has("tasks") : mobileTasksOpen;
-				case "filemod":
-					return fileModDrawerOpened;
-				case "details":
-					return detailsOpened;
-				case "terminal":
-					return terminalToolOpened;
-				case "spec":
-					return specToolOpened;
-				case "git":
-					return dock?.openToolTypes.has("git") ?? false;
-				case "search":
-					return dock ? dock.openToolTypes.has("search") : mobileToolPanel === "search";
-				case "browser":
-					return dock ? dock.openToolTypes.has("browser") : mobileToolPanel === "browser";
-				case "userchat":
-					return dock ? dock.openToolTypes.has("userchat") : mobileToolPanel === "userchat";
-				case "filetree":
-					return dock?.openToolTypes.has("filetree") ?? false;
-				default:
-					return false;
-			}
-		},
-		[
-			dock,
-			mobileTasksOpen,
-			fileModDrawerOpened,
-			detailsOpened,
-			terminalToolOpened,
-			specToolOpened,
-			mobileToolPanel,
-		],
-	);
-
-	/**
-	 * Activate an entry, preferring the dock panel and falling back to a drawer.
-	 *
-	 * The fallback is the whole point: on mobile `dock` is null, so git / search /
-	 * browser / discussion route into `MobileToolPanelHost` instead of silently
-	 * doing nothing.
-	 */
-	const activateToolbarEntry = useCallback(
-		(id: string) => {
-			switch (id) {
-				case "tasks":
-					if (dock) dock.toggleToolPanel("tasks");
-					else setMobileTasksOpen((v) => !v);
-					return;
-				case "filemod":
-					setFileModDrawerOpened((v: boolean) => !v);
-					return;
-				case "details":
-					toggleDetails();
-					return;
-				case "terminal":
-					(onOpenTerminalPanel ?? toggleTerminalTool)();
-					return;
-				case "spec":
-					toggleSpecTool();
-					return;
-				case "git":
-				case "search":
-				case "browser":
-				case "userchat":
-					if (dock) dock.toggleToolPanel(id);
-					else setMobileToolPanel((current) => (current === id ? null : id));
-					return;
-				case "filetree":
-					dock?.toggleToolPanel("filetree");
-					return;
-				// Dock-only (registry `hosts: ["dock"]`): the panel exists to sit beside the
-				// transcript while a slider moves, so there is no drawer fallback to offer.
-				case "appearance":
-					dock?.toggleToolPanel("appearance");
-					return;
-				default:
-					return;
-			}
-		},
-		[
-			dock,
-			setFileModDrawerOpened,
-			toggleDetails,
-			onOpenTerminalPanel,
-			toggleTerminalTool,
-			toggleSpecTool,
-		],
-	);
-
-	/**
-	 * Options the overflow menu expands inline for a self-contained control.
-	 *
-	 * These three render their own Menu in the header, so there is nothing for
-	 * `activateToolbarEntry` to toggle. Before this, the menu listed them as a dead
-	 * row labelled "header only" — and on a phone the header keeps two icons while
-	 * everything else lives in that menu, so the detail level and the execution
-	 * device had NO reachable entry point at all. Returning the same option rows the
-	 * header's dropdown uses keeps the two surfaces in step by construction.
-	 *
-	 * Every id whose registry entry is `selfContained` must be handled here; an
-	 * unhandled one silently reverts to the informational row.
-	 */
-	const renderToolbarInlineOptions = useCallback(
-		(id: string, close: () => void): ReactNode => {
-			switch (id) {
-				case "device":
-					return (
-						<ExecutionDeviceOptions
-							label={t("executionDeviceSelector")}
-							localLabel={t("executionTargetLocal")}
-							offlineLabel={t("executionDeviceOffline")}
-							devices={executionDevicesQuery.data?.devices ?? []}
-							currentDeviceId={executionDevicesQuery.data?.defaultDeviceId ?? "local"}
-							onSelect={(deviceId) => {
-								close();
-								updateExecutionDeviceMutation.mutate(deviceId);
-							}}
-							withLabel={false}
-						/>
-					);
-				case "lodlevel":
-					return (
-						<NarratorLodOptions
-							lod={renderLod}
-							isDefault={renderLodIsDefault}
-							onSelectLod={(next) => {
-								close();
-								handleSelectLod(next);
-							}}
-							onSetAsDefault={() => {
-								close();
-								setAsDefault();
-							}}
-							withLabel={false}
-						/>
-					);
-				case "plugins":
-					return (
-						<PluginContributionOptions
-							onPick={(pick) => {
-								close();
-								openPluginPanel(pick);
-							}}
-						/>
-					);
-				default:
-					return null;
-			}
-		},
-		[
-			t,
-			executionDevicesQuery.data,
-			updateExecutionDeviceMutation,
-			renderLod,
-			renderLodIsDefault,
-			handleSelectLod,
-			setAsDefault,
-			openPluginPanel,
-		],
-	);
-
 	if (!narrator) return <NarratorPanelSkeleton />;
 
 	const statusBarDisplay = getNarratorStatusBarDisplay({
@@ -3607,28 +2891,6 @@ export function NarratorPanel({
 			onCompactError={handleCompactError}
 			pruneEnabledMutation={pruneEnabledMutation}
 			updateSettingsMutation={updateSettingsMutation}
-			t={t}
-		/>
-	);
-
-	const renderFastModeControl = (position: "top-end" | "bottom-end") => (
-		<FastModeControl
-			position={position}
-			fastModeOverride={fastModeOverride}
-			fastModeDefault={fastModeDefault}
-			fastModeEnabled={fastModeEnabled}
-			fastModeUsesTapSettings={fastModeUsesTapSettings}
-			settingsOpened={fastModeSettingsOpened}
-			setSettingsOpened={setFastModeSettingsOpened}
-			openSettings={openFastModeSettings}
-			closeSettings={closeFastModeSettings}
-			scheduleSettingsClose={scheduleFastModeSettingsClose}
-			startLongPress={startFastModeLongPress}
-			clearLongPressTimer={clearFastModeLongPressTimer}
-			longPressFiredRef={fastModeLongPressFiredRef}
-			narratorId={narratorId}
-			fastModeMutation={fastModeMutation}
-			updateUserPrefs={updateUserPrefs}
 			t={t}
 		/>
 	);
@@ -3962,16 +3224,32 @@ export function NarratorPanel({
 						{!isWorkspacePreview && (
 							<HeaderToolbar
 								headerToolbarRef={headerToolbarRef}
-								toolbarVisibleDefs={toolbarVisibleDefs}
+								headerRowRef={headerRowRef}
+								headerLeadingRef={headerLeadingRef}
+								hostOwnsTitle={hostOwnsTitle}
+								isWorkspacePreview={isWorkspacePreview}
+								isMobileViewport={isMobileViewport}
 								toolbarBadgeCounts={toolbarBadgeCounts}
-								toolbarEntries={toolbarEntries}
-								toolbarHiddenDefs={toolbarHiddenDefs}
-								toolbarNoRoomIds={toolbarNoRoomIds}
 								headerHostCapabilities={headerHostCapabilities}
-								toolbarEntryActive={toolbarEntryActive}
-								activateToolbarEntry={activateToolbarEntry}
-								saveToolbarLayout={saveToolbarLayout}
-								renderToolbarInlineOptions={renderToolbarInlineOptions}
+								chapterId={chapterId}
+								tasksSupported={tasksSupported}
+								tasksButtonEnabled={tasksButtonEnabled}
+								specToolAvailable={specToolAvailable}
+								terminalToolAvailable={terminalToolAvailable}
+								onOpenTerminalPanel={onOpenTerminalPanel}
+								browserSessionsSupported={browserSessionsCapability.supported}
+								mobileTasksOpen={mobileTasksOpen}
+								mobileToolPanel={mobileToolPanel}
+								fileModDrawerOpened={fileModDrawerOpened}
+								detailsOpened={detailsOpened}
+								terminalToolOpened={terminalToolOpened}
+								specToolOpened={specToolOpened}
+								setMobileTasksOpen={setMobileTasksOpen}
+								setMobileToolPanel={setMobileToolPanel}
+								setFileModDrawerOpened={setFileModDrawerOpened}
+								toggleDetails={toggleDetails}
+								toggleTerminalTool={toggleTerminalTool}
+								toggleSpecTool={toggleSpecTool}
 								openArchiveConfirm={openArchiveConfirm}
 								archiveMutation={archiveMutation}
 								executionDevicesQuery={executionDevicesQuery}
