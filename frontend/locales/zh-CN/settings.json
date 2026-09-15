@@ -37,7 +37,7 @@
 	"terminalsSection": "终端管理",
 	"devicesSection": "远端设备",
 	"grammarsSection": "结构化解析",
-	"grammarsIntro": "StructView 工具按结构读取文件——大纲、符号正文、对外 API。精确结果需要对应语言的 tree-sitter grammar，它按需下载而不内置在二进制里。未安装时 StructView 会回落到文本启发式，并在输出中说明。",
+	"grammarsIntro": "StructView 按结构读取文件——大纲、符号正文、对外 API，StructSed 则用同一套地址修改文件。精确结果需要对应语言的 tree-sitter grammar，它按需下载而不内置在二进制里。未安装时 StructView 会回落到文本启发式并在输出中说明，StructSed 的符号寻址则不可用（行地址与正则地址仍然可用）。",
 	"grammarsTierVerified": "精确支持",
 	"grammarsTierVerifiedHint": "这些语言有手写的声明表，因此大纲与符号提取是精确的。",
 	"grammarsTierGeneric": "通用支持",

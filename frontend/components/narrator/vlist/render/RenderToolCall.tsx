@@ -242,6 +242,8 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	// Same cyan as search: both answer a question about code rather than returning its
 	// contents. The mode chip on the card distinguishes them.
 	structure: "cyan",
+	// Violet like the other file-mutating tools, not search's cyan: this one writes.
+	structureEdit: "violet",
 	webSearch: "teal",
 	webFetch: "teal",
 	tasks: "teal",

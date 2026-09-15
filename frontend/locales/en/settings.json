@@ -37,7 +37,7 @@
 	"terminalsSection": "Terminals",
 	"devicesSection": "Remote Devices",
 	"grammarsSection": "Structural Parsing",
-	"grammarsIntro": "The StructView tool reads files by their structure — outlines, symbol bodies, public APIs. Accurate results need the language's tree-sitter grammar, which is downloaded on demand instead of shipped in the binary. Without it, StructView falls back to text heuristics and says so.",
+	"grammarsIntro": "StructView reads files by their structure — outlines, symbol bodies, public APIs — and StructSed changes them at the same addresses. Accurate results need the language's tree-sitter grammar, which is downloaded on demand instead of shipped in the binary. Without it, StructView falls back to text heuristics and says so, and StructSed's symbol addressing is unavailable (line and regex addresses still work).",
 	"grammarsTierVerified": "Exact support",
 	"grammarsTierVerifiedHint": "These languages have a hand-written declaration table, so outlines and symbol extraction are exact.",
 	"grammarsTierGeneric": "Generic support",

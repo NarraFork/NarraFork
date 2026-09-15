@@ -14,6 +14,13 @@ import {
 } from "../db/schema";
 import { LOCAL_DEVICE_ID, type PathFlavor } from "../lib/agent/execution/backend";
 import { targetPathSemantics } from "../lib/agent/execution/path-resolve";
+import {
+	appendAfter,
+	deleteRange,
+	insertBefore,
+	replaceRange,
+	substituteInRange,
+} from "../lib/agent/structural/edit-ops";
 import { replace } from "../lib/agent/tools/edit";
 import {
 	applyLineEnding,
@@ -601,7 +608,107 @@ export function applyToolCall(
 		}
 	}
 
+	if (toolCall.toolName === "StructSed") {
+		return applyStructSedCall(currentContent, toolCall, input);
+	}
+
 	return currentContent;
+}
+
+/**
+ * Replay a StructSed mutation from its recorded input.
+ *
+ * Replays by the RESOLVED LINE RANGE the tool stored, never by re-running `locate`: the
+ * reconstructed content differs from what the tool saw, a same-named symbol may have moved,
+ * and the machine doing the rebuild may not even have the grammar installed. The range is
+ * the only address that still means the same thing here.
+ *
+ * Every failure path throws. Returning `currentContent` for something unreplayable is how
+ * a rollback silently produces a file in which this edit never happened — the surrounding
+ * Write/Edit calls would still replay, so the result looks plausible and is wrong.
+ */
+function applyStructSedCall(
+	currentContent: string | null,
+	toolCall: OrderedToolCall,
+	input: Record<string, unknown>,
+): string | null {
+	const command = input.command;
+	const startLine = input.resolvedStartLine;
+	const endLine = input.resolvedEndLine;
+	if (typeof command !== "string") {
+		throw new ReplayDivergedError(
+			`StructSed call ${toolCall.toolUseId} has no recorded command to replay.`,
+			toolCall.toolUseId,
+		);
+	}
+	if (typeof startLine !== "number" || typeof endLine !== "number") {
+		throw new ReplayDivergedError(
+			`StructSed call ${toolCall.toolUseId} has no recorded line range to replay.`,
+			toolCall.toolUseId,
+		);
+	}
+	if (currentContent === null) {
+		throw new ReplayDivergedError(
+			`StructSed call ${toolCall.toolUseId} expects existing content but the baseline is missing.`,
+			toolCall.toolUseId,
+		);
+	}
+
+	const content = normalizeLineEndings(currentContent);
+	const range = { startLine, endLine };
+	try {
+		switch (command) {
+			case "delete":
+				return applyLineEnding(deleteRange(content, range), detectLineEnding(currentContent));
+			case "replace":
+			case "insert":
+			case "append": {
+				const text = input.content;
+				if (typeof text !== "string") {
+					throw new ReplayDivergedError(
+						`StructSed ${command} call ${toolCall.toolUseId} has no recorded content to replay.`,
+						toolCall.toolUseId,
+					);
+				}
+				const normalized = normalizeLineEndings(text);
+				const next =
+					command === "replace"
+						? replaceRange(content, range, normalized)
+						: command === "insert"
+							? insertBefore(content, range, normalized)
+							: appendAfter(content, range, normalized);
+				return applyLineEnding(next, detectLineEnding(currentContent));
+			}
+			case "substitute": {
+				const pattern = input.pattern;
+				const replacement = input.replacement;
+				if (typeof pattern !== "string" || typeof replacement !== "string") {
+					throw new ReplayDivergedError(
+						`StructSed substitute call ${toolCall.toolUseId} has no recorded pattern/replacement to replay.`,
+						toolCall.toolUseId,
+					);
+				}
+				const result = substituteInRange(content, range, pattern, replacement, {
+					...(typeof input.flags === "string" ? { flags: input.flags } : {}),
+				});
+				return applyLineEnding(result.text, detectLineEnding(currentContent));
+			}
+			default:
+				throw new ReplayDivergedError(
+					`StructSed call ${toolCall.toolUseId} has an unknown command "${command}".`,
+					toolCall.toolUseId,
+				);
+		}
+	} catch (error) {
+		if (error instanceof ReplayDivergedError) throw error;
+		// An out-of-range line range means the reconstructed content no longer matches
+		// what the tool edited, which is divergence, not a recoverable condition.
+		throw new ReplayDivergedError(
+			`StructSed call ${toolCall.toolUseId} no longer applies to the reconstructed content: ` +
+				`${error instanceof Error ? error.message : String(error)}`,
+			toolCall.toolUseId,
+		);
+	}
 }
 
 /** Device-aware grouping used by all rebuild operations. */

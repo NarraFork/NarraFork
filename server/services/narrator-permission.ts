@@ -1112,7 +1112,14 @@ function areUnsafeCommandsWhitelistedForDanger(
 
 // ── Protected path checks (hard-deny, no bypass) ─────────
 
-const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit"]);
+/**
+ * Tools whose `file_path` input is a write target.
+ *
+ * Membership is SECURITY-RELEVANT in two places, and in both an omission fails open:
+ * the `.git` write ban below, and the OAuth read-only device policy. A file-modifying
+ * tool missing from this set gets neither check and is silently allowed through.
+ */
+const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "StructSed"]);
 const DESTRUCTIVE_COMMANDS = new Set(["rm", "rmdir", "shred"]);
 
 function executionPathOS(backend?: ExecutionBackend): string {

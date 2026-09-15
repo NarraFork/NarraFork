@@ -12,6 +12,7 @@ export type ToolCategory =
 	| "bash"
 	| "search"
 	| "structure"
+	| "structureEdit"
 	| "webSearch"
 	| "webFetch"
 	| "tasks"
@@ -47,6 +48,15 @@ const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
  * showing just the bare tool name, so a reader could not see which file or mode.
  */
 const STRUCTURE_TOOLS = new Set(["StructView"]);
+/**
+ * StructSed is separate from `structure` for the same reason StructView is separate from
+ * `search`: the inputs do not line up. It carries `command`, not `mode`, so the structure
+ * formatter would report every call as "outline" — a delete would read as a read.
+ *
+ * It is also a WRITE, and a reader scanning a run must be able to tell a structural edit
+ * from a structural inspection at a glance.
+ */
+const STRUCTURE_EDIT_TOOLS = new Set(["StructSed"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
 const WEB_FETCH_TOOLS = new Set(["WebFetch"]);
 const SPEC_TASKS_URI = "spec://tasks.json";
@@ -106,6 +116,7 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (FILE_TOOLS.has(name)) return "file";
 	if (BASH_TOOLS.has(name)) return "bash";
 	if (STRUCTURE_TOOLS.has(name)) return "structure";
+	if (STRUCTURE_EDIT_TOOLS.has(name)) return "structureEdit";
 	if (SEARCH_TOOLS.has(name)) return "search";
 	if (WEB_SEARCH_TOOLS.has(name)) return "webSearch";
 	if (WEB_FETCH_TOOLS.has(name)) return "webFetch";
@@ -157,6 +168,11 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 		// reading as the same kind of step. The mode chip in the card disambiguates.
 		case "structure":
 			return "cyan";
+		// NOT search's cyan: this one writes. It takes `file` violet so a reader scanning a
+		// run groups it with Write and Edit, rather than reading as another inspection step
+		// that happens to carry a different chip.
+		case "structureEdit":
+			return "violet";
 		case "webSearch":
 		case "webFetch":
 		case "browser":
@@ -411,6 +427,20 @@ export function getSummary(
 				default:
 					return short(`${base} · ${mode}`, 60);
 			}
+		}
+		case "structureEdit": {
+			const fp = getFilePath(input);
+			const base = fp ? basename(fp) : "";
+			if (!base) return toolName;
+			// The command is the load-bearing word here: a reader must be able to tell a
+			// delete from an insert without expanding the card. No default is substituted —
+			// unlike StructView's `mode`, `command` is required, so an absent one means the
+			// argument is still streaming and inventing "replace" would misreport it.
+			const command = extractField(input, "command");
+			// Whichever address form was used; they are mutually exclusive.
+			const target = extractField(input, "symbol") || extractField(input, "address");
+			if (!command) return base;
+			return short(target ? `${base} · ${command} ${target}` : `${base} · ${command}`, 60);
 		}
 		case "webSearch": {
 			const q = extractField(input, "query");

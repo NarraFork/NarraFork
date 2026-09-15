@@ -186,6 +186,7 @@ export type ToolCategory =
 	| "bash"
 	| "search"
 	| "structure"
+	| "structureEdit"
 	| "webSearch"
 	| "webFetch"
 	| "tasks"

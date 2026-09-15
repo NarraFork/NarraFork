@@ -17,6 +17,7 @@ import {
 	IconDatabaseEdit,
 	IconDatabaseSearch,
 	IconEye,
+	IconFilePencil,
 	IconFilter,
 	IconGavel,
 	IconGitFork,
@@ -78,6 +79,10 @@ export function categoryIcon(cat: ToolCategory, toolName?: string): ComponentTyp
 		// scanning for a pattern, and the distinction is the reason this category exists.
 		case "structure":
 			return IconSitemap;
+		// The same tree, with a pencil: it addresses code by shape like StructView, but it
+		// changes it. Reusing the bare sitemap would make an edit look like an inspection.
+		case "structureEdit":
+			return IconFilePencil;
 		case "webSearch":
 			return IconWorldSearch;
 		case "webFetch":

@@ -139,6 +139,16 @@ export class EditorFileChangeUncertainError extends Error {
 	}
 }
 
+/**
+ * Tools that go through the local file-change pipeline.
+ *
+ * Adding a name here is not enough on its own: the replay path (`applyToolCall` in
+ * file-state-rebuild.ts) dispatches on this same name and SILENTLY treats an unknown one
+ * as "no change", which would reconstruct a file as though the edit never happened. Any
+ * new member needs a replay branch there too.
+ */
+export type FileChangeToolName = "Write" | "Edit" | "StructSed";
+
 type BoundFileChange<Result> = {
 	backend: ExecutionBackend;
 	cwd: string;
@@ -150,7 +160,7 @@ type BoundFileChange<Result> = {
 	sourceKind: "tool" | "editor";
 	sourceId: string;
 	attempt: number;
-	toolName?: "Write" | "Edit";
+	toolName?: FileChangeToolName;
 	toolUseId?: string;
 	narratorId: string;
 	projectId?: string | null;
@@ -170,7 +180,7 @@ type BoundFileChange<Result> = {
 export interface LocalFileChangeRequest {
 	ctx: ToolContext;
 	backend: ExecutionBackend;
-	toolName: "Write" | "Edit";
+	toolName: FileChangeToolName;
 	filePath: string;
 	/** Only this tool's actual input, hashed with the frozen target. Never stored as a body. */
 	input: Record<string, unknown>;

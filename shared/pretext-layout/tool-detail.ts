@@ -900,6 +900,8 @@ function classifyByCategory(
 			return classifySearch(status, inputJson, outputJson);
 		case "structure":
 			return classifyStructure(status, inputJson, outputJson, metadata);
+		case "structureEdit":
+			return classifyStructureEdit(status, inputJson, outputJson, metadata);
 		case "webSearch":
 			return classifyWebSearch(inputJson, outputJson);
 		case "webFetch":
@@ -1653,6 +1655,101 @@ function classifyStructure(
 			...(isSource ? {} : { customHighlight: "struct-view" as const }),
 		}),
 	]);
+}
+
+/** Chip colour per StructSed command, split by whether the command removes content. */
+const STRUCTURE_EDIT_COMMAND_COLORS: Record<string, string> = {
+	// Rewrites in place.
+	replace: "violet",
+	substitute: "violet",
+	// Adds without removing — the safest shapes, so they read differently.
+	insert: "teal",
+	append: "teal",
+	// Removal is the one command with no recoverable content in its own input.
+	delete: "red",
+};
+
+/**
+ * StructSed's detail card.
+ *
+ * Separate from `classifyStructure` because the inputs do not line up: StructSed carries
+ * `command`, not `mode`, so reusing that classifier would label every call "outline" — a
+ * delete would present as a read.
+ *
+ * The body is the tool's own report (a dry-run preview, or the applied summary), which is
+ * line-numbered and column-aligned, so it takes the same bespoke tokenizer as StructView's
+ * reports rather than a language grammar.
+ */
+function classifyStructureEdit(
+	status: string | null | undefined,
+	inputJson: unknown,
+	outputJson: unknown,
+	metadata: Record<string, unknown> | null,
+): ToolDetailData | null {
+	const filePath = filePathOf(inputJson);
+	const command = extractField(inputJson, "command");
+	const output = resolveDisplayText(outputJson);
+
+	// Whichever address form was used; the tool rejects both at once, so at most one shows.
+	const symbol = extractField(inputJson, "symbol");
+	const address = extractField(inputJson, "address");
+
+	const detailChips = chips([
+		chip(command, command ? (STRUCTURE_EDIT_COMMAND_COLORS[command] ?? "violet") : "violet"),
+		chip(symbol, "grape"),
+		chip(address, "grape"),
+		chip(extractField(inputJson, "kind"), "grape"),
+		// A preview did not touch the file. That has to be visible on the card: reading an
+		// applied edit as a preview (or the reverse) misstates whether the work happened.
+		metadata?.dryRun === true ? chip("dry run", "yellow") : null,
+	]);
+
+	const statChips = chips([
+		countChip(metadata, "replacements", "replaced"),
+		lineRangeChip(metadata),
+	]);
+
+	const headerSection = section(
+		"meta.target",
+		undefined,
+		metaRows([
+			pathRow(filePath, { dimmed: false }),
+			badgeRow(detailChips),
+			statChips.length > 0 ? badgeRow(statChips) : null,
+		]),
+	);
+
+	// Header first even on failure, so a failed call still shows what was attempted.
+	if (isFailStatus(status) && !output) {
+		return sections([
+			headerSection,
+			section("meta.error", undefined, {
+				kind: "error",
+				text: filePath ? `StructSed failed on ${filePath}` : "StructSed failed",
+			}),
+		]);
+	}
+
+	return sections([
+		headerSection,
+		textSection("output.main", outputJson, "output", {
+			// A dry run prints before AND after, so it needs more room than a one-line
+			// applied summary; the taller cap covers the case that actually has content.
+			cap: metadata?.dryRun === true ? "agent-result" : "code",
+			contentLines: countLines(output),
+			text: output,
+			format: "code" as const,
+			customHighlight: "struct-view" as const,
+		}),
+	]);
+}
+
+/** `L12-40`-style chip from the resolved range the tool reports. */
+function lineRangeChip(metadata: Record<string, unknown> | null): ToolStructuredBadge | null {
+	const start = metadata?.startLine;
+	const end = metadata?.endLine;
+	if (typeof start !== "number" || typeof end !== "number") return null;
+	return chip(start === end ? `L${start}` : `L${start}-${end}`, "gray");
 }
 
 /** A `12 decl`-style chip from a numeric metadata field, or null when absent/zero. */

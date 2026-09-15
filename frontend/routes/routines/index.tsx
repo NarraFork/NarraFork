@@ -1456,6 +1456,7 @@ const AVAILABLE_TOOLS = [
 	"Bash",
 	"Write",
 	"Edit",
+	"StructSed",
 	"AskUserQuestion",
 	"Skill",
 	"ShareFile",
