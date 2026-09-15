@@ -15,6 +15,7 @@ import { Hono } from "hono";
 import {
 	clearOutlineCache,
 	downloadGrammar,
+	EXCLUDED_GRAMMARS,
 	grammarCacheSize,
 	invalidateParser,
 	isKnownGrammarLanguage,
@@ -35,10 +36,13 @@ function requireKnownLanguage(lang: string | undefined): string {
 	return lang;
 }
 
-/** GET /api/grammars — supported languages, install state, cache size. */
+/** GET /api/grammars — supported languages, install state, cache size, exclusions. */
 grammarRoutes.get("/", async (c) => {
 	const [grammars, cacheBytes] = await Promise.all([listGrammarStatus(), grammarCacheSize()]);
-	return c.json({ grammars, cacheBytes });
+	// `excluded` is returned so the UI can explain why a language the user expected is
+	// absent. Without it, a missing entry is indistinguishable from an oversight, and the
+	// next person would re-add the ones that actively break.
+	return c.json({ grammars, cacheBytes, excluded: EXCLUDED_GRAMMARS });
 });
 
 /** POST /api/grammars/:lang/download — fetch, verify and cache one grammar. */

@@ -25,7 +25,9 @@ registerStructureProviders();
 
 export type { Address, AddressBlock } from "./address";
 export { AddressError, parseAddress, resolveAddress } from "./address";
+export type { GrammarTier } from "./grammar-manifest";
 export {
+	EXCLUDED_GRAMMARS,
 	GRAMMAR_MANIFEST,
 	GRAMMAR_PACKAGE_VERSION,
 	getGrammarEntry,

@@ -233,6 +233,9 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	file: "violet",
 	bash: "orange",
 	search: "cyan",
+	// Same cyan as search: both answer a question about code rather than returning its
+	// contents. The mode chip on the card distinguishes them.
+	structure: "cyan",
 	webSearch: "teal",
 	webFetch: "teal",
 	tasks: "teal",

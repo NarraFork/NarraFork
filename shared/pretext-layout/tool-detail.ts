@@ -885,6 +885,8 @@ function classifyByCategory(
 			);
 		case "search":
 			return classifySearch(status, inputJson, outputJson);
+		case "structure":
+			return classifyStructure(status, inputJson, outputJson, metadata);
 		case "webSearch":
 			return classifyWebSearch(inputJson, outputJson);
 		case "webFetch":
@@ -1451,6 +1453,126 @@ function classifySearch(
 			text: output,
 		}),
 	]);
+}
+
+/** Chip colour per StructView mode, grouped by what the mode is for. */
+const STRUCTURE_MODE_COLORS: Record<string, string> = {
+	// Reading structure.
+	outline: "indigo",
+	api: "indigo",
+	extract: "indigo",
+	imports: "indigo",
+	enclosing: "indigo",
+	tree: "indigo",
+	// Analysing it.
+	report: "teal",
+	refs: "teal",
+	calls: "teal",
+	// Raw text, no parsing involved.
+	print: "gray",
+};
+
+/**
+ * StructView's detail card.
+ *
+ * Separate from `classifySearch` because the two share no input fields: routing
+ * StructView through the search classifier made it read `pattern`/`glob`/`path`, find
+ * nothing, and drop its entire header — leaving a bare wall of output with no
+ * indication of which file or mode produced it.
+ *
+ * The counts rendered here all come from metadata the tool already emits, so this adds
+ * no server work.
+ */
+function classifyStructure(
+	status: string | null | undefined,
+	inputJson: unknown,
+	outputJson: unknown,
+	metadata: Record<string, unknown> | null,
+): ToolDetailData | null {
+	const filePath = filePathOf(inputJson);
+	// Absent mode means the tool's default, matching getSummary so the card and the
+	// collapsed row cannot disagree while arguments are still streaming.
+	const mode = extractField(inputJson, "mode") || "outline";
+	const output = resolveDisplayText(outputJson);
+
+	const detailChips = chips([
+		chip(mode, STRUCTURE_MODE_COLORS[mode] ?? "indigo"),
+		chip(extractField(inputJson, "symbol"), "grape"),
+		chip(extractField(inputJson, "address"), "gray"),
+		chip(extractField(inputJson, "position"), "gray"),
+		chip(extractField(inputJson, "kind"), "cyan"),
+		chip(extractField(inputJson, "filter"), "cyan"),
+		// A degraded result means heuristics, not parsing. That qualifier has to be
+		// visible on the card itself — burying it in a trailing note inside the output
+		// is how an approximate answer gets read as an exact one.
+		metadata?.support === "degraded" ? chip("approximate", "yellow") : null,
+		// Several matches means the tool listed candidates instead of extracting one.
+		metadata?.ambiguous === true ? chip("ambiguous", "orange") : null,
+	]);
+
+	const statChips = chips([
+		countChip(metadata, "declarations", "decl"),
+		countChip(metadata, "exports", "exports"),
+		countChip(metadata, "imports", "imports"),
+		countChip(metadata, "elements", "elements"),
+		countChip(metadata, "distinctCalls", "callees"),
+		countChip(metadata, "singleReference", "refs:1"),
+		countChip(metadata, "blocks", "blocks"),
+		countChip(metadata, "printedLines", "lines"),
+	]);
+
+	const providerLabel = nonEmptyString(metadata?.provider);
+	const languageLabel = nonEmptyString(metadata?.languageId);
+
+	// Header first, even on failure: `classifySearch` dropped it entirely when a call
+	// failed, which removed the only clue about what had been attempted.
+	const headerSection = section(
+		"meta.target",
+		undefined,
+		metaRows([
+			pathRow(filePath, { dimmed: false }),
+			badgeRow(detailChips),
+			statChips.length > 0 ? badgeRow(statChips) : null,
+			languageLabel || providerLabel
+				? {
+						text: [languageLabel, providerLabel].filter(Boolean).join(" · "),
+						dimmed: true,
+					}
+				: null,
+		]),
+	);
+
+	if (isFailStatus(status) && !output) {
+		return sections([
+			headerSection,
+			section("meta.error", undefined, {
+				kind: "error",
+				text: filePath ? `StructView failed on ${filePath}` : "StructView failed",
+			}),
+		]);
+	}
+
+	return sections([
+		headerSection,
+		// `code` cap, not prose: outline/report output is a column-aligned table, and
+		// prose reflowing would destroy the alignment that makes it readable.
+		textSection("output.main", outputJson, "output", {
+			cap: "code",
+			contentLines: countLines(output),
+			text: output,
+		}),
+	]);
+}
+
+/** A `12 decl`-style chip from a numeric metadata field, or null when absent/zero. */
+function countChip(
+	metadata: Record<string, unknown> | null,
+	key: string,
+	label: string,
+): ToolStructuredBadge | null {
+	const value = metadata?.[key];
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
+	return { label: `${value} ${label}`, color: "gray" };
 }
 
 function classifyWebSearch(inputJson: unknown, outputJson: unknown): ToolDetailData | null {

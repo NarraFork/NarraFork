@@ -40,6 +40,17 @@ export interface DeclarationRule {
 	 * so `extract` on a decorated method includes its decorators.
 	 */
 	includeLeadingSiblings?: string[];
+	/**
+	 * Where to look when there is no `name` field.
+	 *
+	 * - `"positional"`: first identifier-ish child. Kotlin and Swift need this — their
+	 *   node types are named exactly as expected but expose no `name` field at all, so a
+	 *   field-only read yields ZERO declarations with no error to explain why.
+	 * - `"declarator"`: descend through a nested declarator before looking. C/C++ wrap
+	 *   the function name in `function_declarator`, itself possibly behind a pointer
+	 *   declarator.
+	 */
+	nameFallback?: "positional" | "declarator";
 }
 
 export interface LanguageSpec {
@@ -106,6 +117,12 @@ const ECMASCRIPT_DECLARATIONS: Record<string, DeclarationRule> = {
 	property_signature: { kind: "property", signatureFields: ["type"] },
 	internal_module: { kind: "namespace" },
 	module: { kind: "namespace" },
+	// `{ key: value }` inside an object literal. Included because whole modules are
+	// written this way — a Hono handler map, a Pinia store, any `export default { … }`
+	// — and without it those files' members are invisible while the local variables
+	// inside their method bodies leak into the outline as if they were top level.
+	// The name lives in `key`, not `name`, and the reported kind comes from the value.
+	pair: { kind: "property", nameField: "key" },
 	// `const x = () => {}` is a function in every way that matters to a reader, so
 	// variable_declarator is included and the initializer decides the reported kind.
 	variable_declarator: { kind: "variable", signatureFields: ["type"] },
@@ -126,6 +143,10 @@ const ECMASCRIPT_CONTAINERS = [
 	"object_type",
 	"enum_body",
 	"declaration_list",
+	// Object literals hold members worth outlining (see the `pair` rule). Descending
+	// into them is also what stops the leak: without this the walk fell through the
+	// object into method BODIES and reported their local variables at the wrong level.
+	"object",
 ];
 
 export const LANGUAGE_SPECS: Record<string, LanguageSpec> = {
@@ -224,6 +245,169 @@ export const LANGUAGE_SPECS: Record<string, LanguageSpec> = {
 		importTypes: ["use_declaration"],
 		exportRule: "visibility-modifier",
 		commentTypes: ["line_comment", "block_comment"],
+	},
+	c: {
+		id: "c",
+		declarations: {
+			// The name lives inside `function_declarator` (possibly behind a pointer
+			// declarator), not in a `name` field — hence the declarator fallback.
+			function_definition: {
+				kind: "function",
+				nameFallback: "declarator",
+				signatureFields: ["type"],
+			},
+			declaration: { kind: "unknown", transparent: true },
+			type_definition: { kind: "type", nameField: "declarator" },
+			struct_specifier: { kind: "struct" },
+			union_specifier: { kind: "struct" },
+			enum_specifier: { kind: "enum" },
+			field_declaration: { kind: "field", nameField: "declarator", signatureFields: ["type"] },
+			preproc_function_def: { kind: "function" },
+			preproc_def: { kind: "constant" },
+		},
+		containerTypes: ["translation_unit", "field_declaration_list", "enumerator_list"],
+		importTypes: ["preproc_include"],
+		// C has no visibility keyword; `static` means the opposite of exported, which the
+		// modifier list already records, so nothing is claimed here.
+		commentTypes: ["comment"],
+	},
+	cpp: {
+		id: "cpp",
+		declarations: {
+			function_definition: {
+				kind: "function",
+				nameFallback: "declarator",
+				signatureFields: ["type"],
+			},
+			declaration: { kind: "unknown", transparent: true },
+			type_definition: { kind: "type", nameField: "declarator" },
+			class_specifier: { kind: "class" },
+			struct_specifier: { kind: "struct" },
+			union_specifier: { kind: "struct" },
+			enum_specifier: { kind: "enum" },
+			namespace_definition: { kind: "namespace" },
+			template_declaration: { kind: "unknown", transparent: true },
+			field_declaration: { kind: "field", nameField: "declarator", signatureFields: ["type"] },
+			function_declarator: { kind: "function", nameFallback: "positional" },
+		},
+		containerTypes: [
+			"translation_unit",
+			"field_declaration_list",
+			"declaration_list",
+			"enumerator_list",
+		],
+		importTypes: ["preproc_include"],
+		commentTypes: ["comment"],
+	},
+	c_sharp: {
+		id: "c_sharp",
+		declarations: {
+			namespace_declaration: { kind: "namespace" },
+			file_scoped_namespace_declaration: { kind: "namespace" },
+			class_declaration: { kind: "class", signatureFields: ["type_parameters"] },
+			struct_declaration: { kind: "struct" },
+			interface_declaration: { kind: "interface", signatureFields: ["type_parameters"] },
+			record_declaration: { kind: "struct", signatureFields: ["parameters"] },
+			enum_declaration: { kind: "enum" },
+			delegate_declaration: { kind: "type", signatureFields: ["parameters"] },
+			method_declaration: {
+				kind: "method",
+				signatureFields: ["type_parameters", "parameters", "type"],
+			},
+			constructor_declaration: { kind: "constructor", signatureFields: ["parameters"] },
+			property_declaration: { kind: "property", signatureFields: ["type"] },
+			field_declaration: { kind: "unknown", transparent: true },
+			event_declaration: { kind: "property" },
+			variable_declarator: { kind: "field" },
+		},
+		containerTypes: ["compilation_unit", "declaration_list", "enum_member_declaration_list"],
+		importTypes: ["using_directive"],
+		exportRule: "java-modifiers",
+		commentTypes: ["comment"],
+	},
+	php: {
+		id: "php",
+		declarations: {
+			namespace_definition: { kind: "namespace" },
+			class_declaration: { kind: "class" },
+			interface_declaration: { kind: "interface" },
+			trait_declaration: { kind: "trait" },
+			enum_declaration: { kind: "enum" },
+			function_definition: { kind: "function", signatureFields: ["parameters", "return_type"] },
+			method_declaration: { kind: "method", signatureFields: ["parameters", "return_type"] },
+			property_declaration: { kind: "property" },
+			const_declaration: { kind: "constant" },
+		},
+		containerTypes: ["program", "declaration_list", "compound_statement", "enum_declaration_list"],
+		importTypes: ["namespace_use_declaration"],
+		exportRule: "java-modifiers",
+		commentTypes: ["comment"],
+	},
+	ruby: {
+		id: "ruby",
+		declarations: {
+			// Ruby's nodes carry no `_declaration` suffix at all — they are plainly
+			// `class`, `module`, `method`.
+			module: { kind: "module" },
+			class: { kind: "class", signatureFields: ["superclass"] },
+			singleton_class: { kind: "class" },
+			method: { kind: "method", signatureFields: ["parameters"] },
+			singleton_method: { kind: "method", signatureFields: ["parameters"] },
+		},
+		containerTypes: ["program", "body_statement", "begin_block"],
+		importTypes: [],
+		// Ruby's `private`/`public` are runtime calls rather than declaration modifiers,
+		// so visibility cannot be read syntactically; the capitalisation convention for
+		// constants/classes is the only reliable signal.
+		exportRule: "uppercase-initial",
+		commentTypes: ["comment"],
+	},
+	kotlin: {
+		id: "kotlin",
+		declarations: {
+			// No `name` field anywhere in this grammar: every entry needs the positional
+			// fallback, and without it the whole language reported zero declarations.
+			class_declaration: { kind: "class", nameFallback: "positional" },
+			object_declaration: { kind: "class", nameFallback: "positional" },
+			function_declaration: {
+				kind: "function",
+				nameFallback: "positional",
+				signatureFields: ["function_value_parameters"],
+			},
+			property_declaration: { kind: "property", nameFallback: "positional" },
+			type_alias: { kind: "type", nameFallback: "positional" },
+			enum_entry: { kind: "constant", nameFallback: "positional" },
+			secondary_constructor: { kind: "constructor" },
+			companion_object: { kind: "class" },
+		},
+		containerTypes: ["source_file", "class_body", "enum_class_body"],
+		importTypes: ["import_header"],
+		exportRule: "java-modifiers",
+		commentTypes: ["line_comment", "multiline_comment", "comment"],
+	},
+	swift: {
+		id: "swift",
+		declarations: {
+			class_declaration: { kind: "class", nameFallback: "positional" },
+			protocol_declaration: { kind: "trait", nameFallback: "positional" },
+			function_declaration: {
+				kind: "function",
+				nameFallback: "positional",
+				signatureFields: ["parameters"],
+			},
+			protocol_function_declaration: { kind: "method", nameFallback: "positional" },
+			property_declaration: { kind: "property", nameFallback: "positional" },
+			typealias_declaration: { kind: "type", nameFallback: "positional" },
+			init_declaration: { kind: "constructor" },
+			deinit_declaration: { kind: "method" },
+			associatedtype_declaration: { kind: "type", nameFallback: "positional" },
+		},
+		// Swift's grammar models struct/enum/actor through `class_declaration` too, so
+		// the single entry above covers them; the body node names differ per form.
+		containerTypes: ["source_file", "class_body", "protocol_body", "enum_class_body", "statements"],
+		importTypes: ["import_declaration"],
+		exportRule: "java-modifiers",
+		commentTypes: ["comment", "multiline_comment"],
 	},
 	java: {
 		id: "java",

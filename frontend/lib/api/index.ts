@@ -76,7 +76,7 @@ export {
 	readFetchErrorMessage,
 	setToken,
 } from "./client";
-export type { GrammarListResponse, GrammarStatus } from "./grammars";
+export type { GrammarListResponse, GrammarStatus, GrammarTier } from "./grammars";
 export type {
 	IntegrationAttentionItem,
 	IntegrationAttentionSeverity,

@@ -7,7 +7,7 @@
  * itself only prints lines — the same walk has to be able to hand StructSed an
  * editable range later.
  */
-import { getLanguageSpec, type LanguageSpec } from "./languages";
+import { type DeclarationRule, getLanguageSpec, type LanguageSpec } from "./languages";
 import type { OutlineNode, StructKind } from "./provider";
 
 /** Structural node shape we need from web-tree-sitter, kept minimal for testability. */
@@ -189,7 +189,7 @@ function visit(node: SyntaxNode, state: WalkState, ctx: WalkContext): RichOutlin
 		return [];
 	}
 
-	const name = readName(node, rule.nameField ?? "name");
+	const name = readName(node, rule.nameField ?? "name", rule.nameFallback);
 	// An unnamed declaration is real in some grammars (Rust `impl`), so it gets a
 	// synthesized label rather than being dropped.
 	const label = name ?? synthesizeName(node, state.spec);
@@ -200,7 +200,7 @@ function visit(node: SyntaxNode, state: WalkState, ctx: WalkContext): RichOutlin
 	const modifiers = readModifiers(node);
 	const symbolPath = ctx.symbolPrefix ? `${ctx.symbolPrefix}.${label}` : label;
 
-	const nameNode = node.childForFieldName(rule.nameField ?? "name");
+	const nameNode = resolveNameNode(node, rule.nameField ?? "name", rule.nameFallback);
 	const bindings = nameNode ? readBindings(nameNode) : null;
 	const initializer = readInitializer(node);
 
@@ -246,8 +246,32 @@ function visit(node: SyntaxNode, state: WalkState, ctx: WalkContext): RichOutlin
 	return [outlineNode];
 }
 
-/** Body/member-list child, if this declaration has one. */
+/**
+ * Body/member-list child, if this declaration has one.
+ *
+ * Statement blocks ARE traversed: a function's locals and its statement-level hooks
+ * are wanted in the outline (that is how `useEffect` entries and nested helpers get
+ * reported). The only special case is `pair`, below.
+ */
 function findBody(node: SyntaxNode): SyntaxNode | null {
+	// `pair` and `variable_declarator` reach their contents through the VALUE rather
+	// than a `body` field, so without this an object literal's members are unreachable:
+	// the object is the value, and the walk never looks there.
+	if (node.type === "pair" || node.type === "variable_declarator") {
+		const value = node.childForFieldName("value");
+		if (value?.type === "object") return value;
+		if (
+			value?.type === "arrow_function" ||
+			value?.type === "function_expression" ||
+			value?.type === "function"
+		) {
+			// The function's statements, so locals and hooks inside `const f = () => {…}`
+			// are reported under `f` instead of being lost.
+			return value.childForFieldName("body");
+		}
+		return null;
+	}
+
 	const body = node.childForFieldName("body");
 	if (body) return body;
 	// Rust `impl`/`trait` and Go grouped declarations expose their members through a
@@ -271,8 +295,57 @@ function findBody(node: SyntaxNode): SyntaxNode | null {
 /** How many destructured bindings to name before collapsing the rest to a count. */
 const MAX_SHOWN_BINDINGS = 4;
 
-function readName(node: SyntaxNode, field: string): string | null {
-	const nameNode = node.childForFieldName(field);
+/** Identifier node types used by the positional name fallback. */
+const IDENTIFIER_TYPE = /(^|_)identifier$/;
+
+/**
+ * Resolve a declaration's name node, applying the rule's fallback when there is no
+ * `name` field.
+ *
+ * Kotlin and Swift are why the fallback exists: their declaration node types are
+ * conventional, but the identifier is positional with no field, so a field-only read
+ * silently returns nothing for every declaration in the file.
+ */
+function resolveNameNode(
+	node: SyntaxNode,
+	field: string,
+	fallback: DeclarationRule["nameFallback"],
+): SyntaxNode | null {
+	const direct = node.childForFieldName(field);
+	if (direct) return direct;
+	if (!fallback) return null;
+
+	if (fallback === "declarator") {
+		// C/C++: `int f(void)` puts `f` inside function_declarator, sometimes wrapped in
+		// a pointer declarator. Walk declarators until an identifier turns up.
+		let cursor: SyntaxNode | null = node.childForFieldName("declarator");
+		for (let depth = 0; cursor && depth < 5; depth++) {
+			const inner = cursor.childForFieldName("declarator");
+			const identifier = firstIdentifierChild(cursor);
+			if (identifier) return identifier;
+			cursor = inner;
+		}
+		return null;
+	}
+
+	return firstIdentifierChild(node);
+}
+
+function firstIdentifierChild(node: SyntaxNode): SyntaxNode | null {
+	for (let i = 0; i < node.childCount; i++) {
+		const child = node.child(i);
+		if (!child?.isNamed) continue;
+		if (IDENTIFIER_TYPE.test(child.type)) return child;
+	}
+	return null;
+}
+
+function readName(
+	node: SyntaxNode,
+	field: string,
+	fallback?: DeclarationRule["nameFallback"],
+): string | null {
+	const nameNode = resolveNameNode(node, field, fallback);
 	if (!nameNode) return null;
 	// A destructuring pattern is not a name. Taking its text verbatim put 30 lines of
 	// raw source (newlines and tabs included) into the `name` field, which made the
@@ -390,6 +463,21 @@ function synthesizeName(node: SyntaxNode, spec: LanguageSpec): string | null {
  * modern JS/TS code declares functions.
  */
 function refineKind(node: SyntaxNode, base: StructKind, spec: LanguageSpec): StructKind {
+	// `{ handler: () => {} }` is a method to anyone reading the object, while
+	// `{ retries: 3 }` is a property. Reporting both as "property" would flatten the
+	// distinction that makes a handler map readable.
+	if (node.type === "pair") {
+		const value = node.childForFieldName("value");
+		if (
+			value?.type === "arrow_function" ||
+			value?.type === "function_expression" ||
+			value?.type === "function"
+		) {
+			return "method";
+		}
+		return base;
+	}
+
 	if (node.type === "variable_declarator" && spec.id !== "java") {
 		const value = node.childForFieldName("value");
 		if (value) {
@@ -475,10 +563,12 @@ function readSignature(
 	// declarator, so a declarator refined into a function reads through to the value.
 	// Without this, the dominant modern way of declaring a function shows up in the
 	// outline with no signature at all.
-	const source =
-		kind === "function" && node.type === "variable_declarator"
-			? (node.childForFieldName("value") ?? node)
-			: node;
+	// Same for `{ handler: (req) => {} }`: the signature lives on the value, not on the
+	// pair, so a pair refined into a method reads through as well.
+	const readsThroughValue =
+		(kind === "function" && node.type === "variable_declarator") ||
+		(kind === "method" && node.type === "pair");
+	const source = readsThroughValue ? (node.childForFieldName("value") ?? node) : node;
 	const effectiveFields =
 		source === node ? fields : ["type_parameters", "parameters", "return_type"];
 

@@ -25,8 +25,10 @@ import {
 	GRAMMAR_MANIFEST,
 	GRAMMAR_PACKAGE_VERSION,
 	type GrammarManifestEntry,
+	type GrammarTier,
 	getGrammarEntry,
 } from "./grammar-manifest";
+import { createTreeSitterParser, loadTreeSitterLanguage } from "./tree-sitter-runtime";
 
 /** Cache directory for downloaded grammar wasm files. */
 export const GRAMMAR_DIR = join(narraforkDir, "grammars");
@@ -58,6 +60,12 @@ export interface GrammarStatus {
 	id: string;
 	label: string;
 	extensions: string[];
+	/** Exact (hand-written table) vs rule-based structure. */
+	tier: GrammarTier;
+	/** Known limitation for this language, shown in the settings UI. */
+	note?: string;
+	/** Language ABI observed when this grammar was verified. */
+	abi: number;
 	installed: boolean;
 	/** Actual on-disk size when installed. */
 	sizeBytes?: number;
@@ -87,6 +95,9 @@ export async function listGrammarStatus(): Promise<GrammarStatus[]> {
 			id: entry.id,
 			label: entry.label,
 			extensions: entry.extensions,
+			tier: entry.tier,
+			...(entry.note ? { note: entry.note } : {}),
+			abi: entry.abi,
 			installed: sizeBytes !== undefined,
 			...(sizeBytes !== undefined ? { sizeBytes } : {}),
 			expectedBytes: entry.bytes,
@@ -143,6 +154,11 @@ export interface DownloadGrammarOptions {
 	urlTemplates?: string[];
 	/** Injected for tests so the suite never touches the network. */
 	fetchImpl?: typeof fetch;
+	/**
+	 * Load and parse-test the grammar before caching it. Defaults to true; only tests
+	 * that supply synthetic bytes turn it off.
+	 */
+	verifyParse?: boolean;
 }
 
 /**
@@ -199,6 +215,25 @@ export async function downloadGrammar(
 				});
 				continue;
 			}
+			// Verify the grammar actually PARSES before keeping it. A correct digest only
+			// proves we received the intended bytes, not that the engine can run them: the
+			// YAML grammar loads, reports its ABI, and then throws from inside wasm on the
+			// first parse. Discovering that during a tool call would mean a crash on the
+			// single-threaded server, where tree-sitter's synchronous wasm parse cannot yield.
+			// This check runs only on the explicit user-triggered download path.
+			if (options.verifyParse !== false) {
+				const failure = await verifyGrammarParses(bytes);
+				if (failure) {
+					errors.push(`${url}: downloaded but unusable (${failure})`);
+					logger.warn("Rejected tree-sitter grammar that failed its parse check", {
+						languageId: entry.id,
+						url,
+						error: failure,
+					});
+					continue;
+				}
+			}
+
 			writeAtomically(path, bytes);
 			logger.info("Downloaded tree-sitter grammar", {
 				languageId: entry.id,
@@ -270,6 +305,33 @@ async function fetchGrammarBytes(doFetch: typeof fetch, url: string): Promise<Ui
 		return bytes;
 	} finally {
 		clearTimeout(timeout);
+	}
+}
+
+/**
+ * Load the grammar and parse a trivial input, returning an error string on failure.
+ *
+ * Deliberately catches everything: the failure being guarded against originates inside
+ * wasm and surfaces as an ordinary `TypeError`, so a narrow catch would let it through.
+ * A grammar that cannot parse a two-character document will not parse a real file, and
+ * keeping it would arm a crash for a later tool call.
+ */
+async function verifyGrammarParses(bytes: Uint8Array): Promise<string | null> {
+	try {
+		const language = await loadTreeSitterLanguage(bytes);
+		const parser = await createTreeSitterParser(language);
+		const tree = parser.parse("x\n");
+		if (!tree) return "parser returned no tree";
+		try {
+			// Touching the root is part of the check: some failures only appear when the
+			// tree is walked rather than when it is created.
+			void tree.rootNode.type;
+		} finally {
+			tree.delete();
+		}
+		return null;
+	} catch (err) {
+		return err instanceof Error ? err.message : String(err);
 	}
 }
 

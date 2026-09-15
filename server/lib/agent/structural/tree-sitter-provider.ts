@@ -11,6 +11,7 @@
  * can tell the user where to install it.
  */
 import { buildElementTree } from "./element-tree";
+import { buildGenericOutline } from "./generic-language";
 import { getGrammarEntry, isKnownGrammarLanguage } from "./grammar-manifest";
 import { getLanguageSpec } from "./languages";
 import { enclosingInOutline, locateInOutline } from "./locate";
@@ -54,7 +55,11 @@ export const treeSitterProvider: StructureProvider = {
 
 	async supports(doc: StructDocument): Promise<ProviderSupport> {
 		if (!doc.languageId || !isKnownGrammarLanguage(doc.languageId)) return "no";
-		if (!getLanguageSpec(doc.languageId)) return "no";
+		// A grammar with no declaration table used to be rejected here, which made
+		// downloading one a no-op: it parsed fine and reported nothing. Generic-tier
+		// languages now fall through to the type-name heuristics instead, and
+		// `explainLimitation` says the results are rule-based rather than exact.
+		if (!getLanguageSpec(doc.languageId) && !isGenericTier(doc.languageId)) return "no";
 		if (byteLength(doc.text) > MAX_PARSE_BYTES) return "degraded";
 		const lease = await acquireParser(doc.languageId);
 		return lease.ok ? "full" : "degraded";
@@ -119,7 +124,19 @@ export const treeSitterProvider: StructureProvider = {
 			);
 		}
 		const lease = await acquireParser(doc.languageId);
-		if (lease.ok) return null;
+		if (lease.ok) {
+			// Parsing succeeded, but for a generic-tier language the STRUCTURE came from
+			// cross-language type-name rules rather than a table for this grammar. Staying
+			// silent here would let a rule-based outline read as an authoritative one.
+			if (!getLanguageSpec(doc.languageId)) {
+				return (
+					`${entry.label} has no declaration table, so structure was inferred from generic ` +
+					`node-type rules — some declaration forms may be missing.` +
+					(entry.note ? ` ${entry.note}` : "")
+				);
+			}
+			return null;
+		}
 		switch (lease.reason) {
 			case "not-installed":
 				return (
@@ -176,10 +193,15 @@ async function parseOutline(
 	// safe to keep after the tree is freed, and safe to cache. Never put a SyntaxNode
 	// in here: it would read as ERROR/garbage once the tree is gone.
 	const result = await withParsedTree(doc, (root, languageId) =>
-		buildOutline(root, languageId, {
-			maxNodes: MAX_OUTLINE_NODES,
-			...(doc.signal ? { signal: doc.signal } : {}),
-		}),
+		getLanguageSpec(languageId)
+			? buildOutline(root, languageId, {
+					maxNodes: MAX_OUTLINE_NODES,
+					...(doc.signal ? { signal: doc.signal } : {}),
+				})
+			: buildGenericOutline(root, {
+					maxNodes: MAX_OUTLINE_NODES,
+					...(doc.signal ? { signal: doc.signal } : {}),
+				}),
 	);
 	if (!result) return { nodes: [], truncated: false };
 
@@ -298,6 +320,11 @@ function stripQuotes(text: string): string {
 
 function byteLength(text: string): number {
 	return Buffer.byteLength(text, "utf8");
+}
+
+/** Whether this language is offered without a hand-written declaration table. */
+function isGenericTier(languageId: string): boolean {
+	return getGrammarEntry(languageId)?.tier === "generic";
 }
 
 /** Drop cached parse results. Used after a grammar install/remove, and by tests. */

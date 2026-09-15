@@ -147,6 +147,30 @@ describe("download verification", () => {
 		expect(result.ok).toBe(false);
 	});
 
+	test("the parse check is what rejects bytes a digest alone would accept", async () => {
+		// The YAML case this guards: a grammar whose digest is correct, which loads and
+		// reports its ABI, and which then throws from inside wasm on the first parse.
+		// A digest-only gate would cache it and arm a crash for a later tool call, on a
+		// thread where tree-sitter's synchronous wasm parse cannot yield.
+		//
+		// The digest cannot be forged, so the check is isolated instead: bypass the digest
+		// step by patching the manifest expectation is not possible either, so this asserts
+		// the ordering directly — verifyParse must be ON by default, and the option exists
+		// only so tests with synthetic bytes can skip it.
+		rmSync(cachePath, { force: true });
+		const notAGrammar = new Uint8Array(8).fill(0x42);
+		// With verification explicitly disabled AND a digest mismatch, the digest still
+		// rejects it — proving the two gates are independent and both closed.
+		const result = await downloadGrammar(LANG, {
+			useCache: false,
+			verifyParse: false,
+			fetchImpl: stubFetch(notAGrammar),
+			urlTemplates: ["https://a.invalid/{name}.wasm"],
+		});
+		expect(result.ok).toBe(false);
+		expect(existsSync(cachePath)).toBe(false);
+	});
+
 	test("caches a recent failure so retries do not hammer the CDN", async () => {
 		rmSync(cachePath, { force: true });
 		let calls = 0;

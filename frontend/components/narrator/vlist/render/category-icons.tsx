@@ -31,6 +31,7 @@ import {
 	IconSearch,
 	IconShare,
 	IconShieldLock,
+	IconSitemap,
 	IconTerminal2,
 	IconTransfer,
 	IconWand,
@@ -73,6 +74,10 @@ export function categoryIcon(cat: ToolCategory, toolName?: string): ComponentTyp
 			return IconTerminal2;
 		case "search":
 			return IconSearch;
+		// A tree glyph, not the magnifier: StructView reads a file's shape rather than
+		// scanning for a pattern, and the distinction is the reason this category exists.
+		case "structure":
+			return IconSitemap;
 		case "webSearch":
 			return IconWorldSearch;
 		case "webFetch":

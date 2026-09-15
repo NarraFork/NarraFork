@@ -54,10 +54,16 @@ describeWithGrammar("parse tree lifecycle", () => {
 
 		tree.delete();
 
-		// THIS is why extraction must finish before the free: the node still answers,
-		// but with a lie. If this assertion ever starts throwing instead, the upstream
-		// library became fail-loud and the strict ordering could be relaxed.
-		expect(child?.type).toBe("ERROR");
+		// THIS is why extraction must finish before the free: the node still ANSWERS,
+		// but with whatever now occupies that wasm memory. Observed values include
+		// "ERROR" and — once another parse had reused the region — "private", a real node
+		// type from an unrelated file. Both are lies; neither throws.
+		//
+		// The assertion is therefore "not the truth", not a specific wrong value: pinning
+		// the garbage would make this test depend on allocator behaviour. If it ever
+		// starts THROWING, the library became fail-loud and the strict ordering in
+		// withParsedTree could be relaxed.
+		expect(child?.type).not.toBe("import_statement");
 	});
 
 	test("outline results survive the tree being freed", async () => {

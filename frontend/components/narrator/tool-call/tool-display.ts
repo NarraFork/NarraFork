@@ -11,6 +11,7 @@ export type ToolCategory =
 	| "file"
 	| "bash"
 	| "search"
+	| "structure"
 	| "webSearch"
 	| "webFetch"
 	| "tasks"
@@ -36,10 +37,16 @@ const FILE_TOOLS = new Set(["Read", "Write", "Edit"]);
 // "Shell" is a legacy alias kept only so older stored history still classifies as
 // a shell call; the server always mints "Bash".
 const BASH_TOOLS = new Set(["Bash", "Shell", "Execute"]);
-// StructView is grouped with search rather than read: like Grep it answers a
-// question about a file (what's in it, where does this symbol live) instead of
-// handing back a file's contents, so the search glyph matches what the row means.
-const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find", "StructView"]);
+const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
+/**
+ * StructView gets its own category rather than sharing `search`.
+ *
+ * Its input has NO overlap with Grep's: `file_path` + `mode` versus `pattern` + `path`.
+ * While it was classified as a search, the detail card read `pattern`/`glob`/`path`,
+ * found nothing, and dropped its entire header — and the collapsed row fell through to
+ * showing just the bare tool name, so a reader could not see which file or mode.
+ */
+const STRUCTURE_TOOLS = new Set(["StructView"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
 const WEB_FETCH_TOOLS = new Set(["WebFetch"]);
 const SPEC_TASKS_URI = "spec://tasks.json";
@@ -98,6 +105,7 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (READ_TOOLS.has(name)) return "read";
 	if (FILE_TOOLS.has(name)) return "file";
 	if (BASH_TOOLS.has(name)) return "bash";
+	if (STRUCTURE_TOOLS.has(name)) return "structure";
 	if (SEARCH_TOOLS.has(name)) return "search";
 	if (WEB_SEARCH_TOOLS.has(name)) return "webSearch";
 	if (WEB_FETCH_TOOLS.has(name)) return "webFetch";
@@ -143,6 +151,11 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 		case "bash":
 			return "orange";
 		case "search":
+			return "cyan";
+		// Shares search's cyan: both answer a question about code rather than returning
+		// its contents, and a reader scanning a run benefits from grep and StructView
+		// reading as the same kind of step. The mode chip in the card disambiguates.
+		case "structure":
 			return "cyan";
 		case "webSearch":
 		case "webFetch":
@@ -374,6 +387,30 @@ export function getSummary(
 			const searchPath = extractField(input, "path");
 			if (!pat && !searchPath) return toolName;
 			return short(`${pat || toolName}${searchPath ? ` in ${basename(searchPath)}` : ""}`, 60);
+		}
+		case "structure": {
+			const fp = getFilePath(input);
+			const base = fp ? basename(fp) : "";
+			// Absent `mode` means the tool's own default, so the row reads the same before
+			// and after the argument finishes streaming instead of changing under the reader.
+			const mode = extractField(input, "mode") || "outline";
+			if (!base) return toolName;
+			switch (mode) {
+				case "extract": {
+					const symbol = extractField(input, "symbol");
+					return symbol ? short(`${base} › ${symbol}`, 60) : `${base} · extract`;
+				}
+				case "enclosing": {
+					const position = extractField(input, "position");
+					return position ? `${base}:${position}` : `${base} · enclosing`;
+				}
+				case "print": {
+					const address = extractField(input, "address");
+					return address ? short(`${base} · ${address}`, 60) : `${base} · print`;
+				}
+				default:
+					return short(`${base} · ${mode}`, 60);
+			}
 		}
 		case "webSearch": {
 			const q = extractField(input, "query");

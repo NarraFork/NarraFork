@@ -1,4 +1,5 @@
 import {
+	Accordion,
 	Alert,
 	Badge,
 	Button,
@@ -37,6 +38,7 @@ export function StructuralGrammarsSection() {
 	const { t } = useTranslation("settings");
 	const confirm = useConfirmDialog();
 	const [grammars, setGrammars] = useState<GrammarStatus[] | null>(null);
+	const [excluded, setExcluded] = useState<Array<{ id: string; reason: string }>>([]);
 	const [cacheBytes, setCacheBytes] = useState(0);
 	const [loading, setLoading] = useState(true);
 	const [busyLang, setBusyLang] = useState<string | null>(null);
@@ -47,6 +49,7 @@ export function StructuralGrammarsSection() {
 		try {
 			const result = await api.listGrammars();
 			setGrammars(result.grammars);
+			setExcluded(result.excluded ?? []);
 			setCacheBytes(result.cacheBytes);
 			setError(null);
 		} catch (err) {
@@ -139,87 +142,144 @@ export function StructuralGrammarsSection() {
 						<Loader size="sm" />
 					</Group>
 				) : (
-					<Table highlightOnHover>
-						<Table.Thead>
-							<Table.Tr>
-								<Table.Th>{t("grammarsLanguage")}</Table.Th>
-								<Table.Th>{t("grammarsExtensions")}</Table.Th>
-								<Table.Th>{t("grammarsStatus")}</Table.Th>
-								<Table.Th>{t("grammarsSize")}</Table.Th>
-								<Table.Th />
-							</Table.Tr>
-						</Table.Thead>
-						<Table.Tbody>
-							{(grammars ?? []).map((grammar) => (
-								<Table.Tr key={grammar.id}>
-									<Table.Td>
-										<Text size="sm">{grammar.label}</Text>
-										<Text size="xs" c="dimmed">
-											{grammar.id} · v{grammar.version}
+					<Stack gap="lg">
+						{/* Grouped by tier because the difference is not cosmetic: a generic-tier
+						    grammar parses correctly but infers structure from cross-language
+						    rules, so some declarations will be missing. Listing both together
+						    would imply the same fidelity. */}
+						{(["verified", "generic"] as const).map((tier) => {
+							const rows = (grammars ?? []).filter((g) => g.tier === tier);
+							if (rows.length === 0) return null;
+							return (
+								<Stack key={tier} gap="xs">
+									<div>
+										<Text size="sm" fw={600}>
+											{tier === "verified" ? t("grammarsTierVerified") : t("grammarsTierGeneric")}
 										</Text>
-									</Table.Td>
-									<Table.Td>
 										<Text size="xs" c="dimmed">
-											{grammar.extensions.join(" ")}
+											{tier === "verified"
+												? t("grammarsTierVerifiedHint")
+												: t("grammarsTierGenericHint")}
 										</Text>
-									</Table.Td>
-									<Table.Td>
-										{grammar.digestMismatch ? (
-											<Tooltip label={t("grammarsDigestMismatchHint")}>
-												<Badge color="yellow" variant="light">
-													{t("grammarsDigestMismatch")}
-												</Badge>
-											</Tooltip>
-										) : grammar.installed ? (
-											<Badge color="green" variant="light">
-												{t("grammarsInstalled")}
-											</Badge>
-										) : (
-											<Badge color="gray" variant="light">
-												{t("grammarsNotInstalled")}
-											</Badge>
-										)}
-									</Table.Td>
-									<Table.Td>
-										<Text size="xs" c="dimmed">
-											{formatBytes(grammar.sizeBytes ?? grammar.expectedBytes)}
-										</Text>
-									</Table.Td>
-									<Table.Td>
-										<Group gap="xs" justify="flex-end">
-											{(!grammar.installed || grammar.digestMismatch) && (
-												<Button
-													size="xs"
-													variant="light"
-													leftSection={<IconDownload size={14} />}
-													loading={busyLang === grammar.id}
-													disabled={busyLang !== null && busyLang !== grammar.id}
-													onClick={() => void handleDownload(grammar)}
-												>
-													{grammar.digestMismatch ? t("grammarsRedownload") : t("grammarsDownload")}
-												</Button>
-											)}
-											{grammar.installed && (
-												<Button
-													size="xs"
-													variant="subtle"
-													color="red"
-													leftSection={<IconTrash size={14} />}
-													loading={busyLang === grammar.id}
-													disabled={busyLang !== null && busyLang !== grammar.id}
-													onClick={() => void handleRemove(grammar)}
-												>
-													{t("grammarsRemove")}
-												</Button>
-											)}
-										</Group>
-									</Table.Td>
-								</Table.Tr>
-							))}
-						</Table.Tbody>
-					</Table>
+									</div>
+									<Table highlightOnHover>
+										<Table.Thead>
+											<Table.Tr>
+												<Table.Th>{t("grammarsLanguage")}</Table.Th>
+												<Table.Th>{t("grammarsExtensions")}</Table.Th>
+												<Table.Th>{t("grammarsStatus")}</Table.Th>
+												<Table.Th>{t("grammarsSize")}</Table.Th>
+												<Table.Th />
+											</Table.Tr>
+										</Table.Thead>
+										<Table.Tbody>
+											{rows.map((grammar) => (
+												<Table.Tr key={grammar.id}>
+													<Table.Td>
+														<Text size="sm">{grammar.label}</Text>
+														<Text size="xs" c="dimmed">
+															{grammar.id} · v{grammar.version}
+														</Text>
+														{grammar.note && (
+															<Text size="xs" c="yellow.6" mt={2}>
+																{grammar.note}
+															</Text>
+														)}
+													</Table.Td>
+													<Table.Td>
+														<Text size="xs" c="dimmed">
+															{grammar.extensions.join(" ")}
+														</Text>
+													</Table.Td>
+													<Table.Td>
+														{grammar.digestMismatch ? (
+															<Tooltip label={t("grammarsDigestMismatchHint")}>
+																<Badge color="yellow" variant="light">
+																	{t("grammarsDigestMismatch")}
+																</Badge>
+															</Tooltip>
+														) : grammar.installed ? (
+															<Badge color="green" variant="light">
+																{t("grammarsInstalled")}
+															</Badge>
+														) : (
+															<Badge color="gray" variant="light">
+																{t("grammarsNotInstalled")}
+															</Badge>
+														)}
+													</Table.Td>
+													<Table.Td>
+														<Text size="xs" c="dimmed">
+															{formatBytes(grammar.sizeBytes ?? grammar.expectedBytes)}
+														</Text>
+													</Table.Td>
+													<Table.Td>
+														<Group gap="xs" justify="flex-end">
+															{(!grammar.installed || grammar.digestMismatch) && (
+																<Button
+																	size="xs"
+																	variant="light"
+																	leftSection={<IconDownload size={14} />}
+																	loading={busyLang === grammar.id}
+																	disabled={busyLang !== null && busyLang !== grammar.id}
+																	onClick={() => void handleDownload(grammar)}
+																>
+																	{grammar.digestMismatch
+																		? t("grammarsRedownload")
+																		: t("grammarsDownload")}
+																</Button>
+															)}
+															{grammar.installed && (
+																<Button
+																	size="xs"
+																	variant="subtle"
+																	color="red"
+																	leftSection={<IconTrash size={14} />}
+																	loading={busyLang === grammar.id}
+																	disabled={busyLang !== null && busyLang !== grammar.id}
+																	onClick={() => void handleRemove(grammar)}
+																>
+																	{t("grammarsRemove")}
+																</Button>
+															)}
+														</Group>
+													</Table.Td>
+												</Table.Tr>
+											))}
+										</Table.Tbody>
+									</Table>
+								</Stack>
+							);
+						})}
+					</Stack>
 				)}
 			</Paper>
+
+			{/* Why a language is absent, rather than leaving the reader to assume oversight —
+			    some of these break the parser and must not be re-added casually. */}
+			{excluded.length > 0 && (
+				<Accordion variant="contained">
+					<Accordion.Item value="excluded">
+						<Accordion.Control>
+							<Text size="sm">{t("grammarsExcludedTitle", { count: excluded.length })}</Text>
+						</Accordion.Control>
+						<Accordion.Panel>
+							<Stack gap="xs">
+								{excluded.map((item) => (
+									<div key={item.id}>
+										<Text size="sm" ff="monospace">
+											{item.id}
+										</Text>
+										<Text size="xs" c="dimmed">
+											{item.reason}
+										</Text>
+									</div>
+								))}
+							</Stack>
+						</Accordion.Panel>
+					</Accordion.Item>
+				</Accordion>
+			)}
 
 			<Text size="xs" c="dimmed">
 				{t("grammarsSourceNote")}
