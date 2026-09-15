@@ -3,9 +3,11 @@ import {
 	appendAfter,
 	deleteRange,
 	EditOpError,
+	extractBlock,
 	insertBefore,
 	MAX_SUBSTITUTE_MATCHES,
 	reindentBlock,
+	relocateRange,
 	replaceRange,
 	substituteInRange,
 } from "@server/lib/agent/structural/edit-ops";
@@ -163,6 +165,107 @@ describe("substituteInRange", () => {
 		const result = substituteInRange("a\n", { startLine: 1, endLine: 1 }, "zzz", "y");
 		expect(result.text).toBe("a\n");
 		expect(result.replacements).toBe(0);
+	});
+});
+
+describe("relocateRange (same-file copy/move)", () => {
+	const NUMBERED = "a\nb\nc\nd\ne\n";
+
+	test("move to a later anchor keeps every other line exactly once", () => {
+		// The failure this guards: inserting first shifts the lines below, so deleting the
+		// source by its ORIGINAL numbers removes the wrong ones. Result looks plausible.
+		const out = relocateRange(NUMBERED, { startLine: 1, endLine: 2 }, {
+			anchor: { startLine: 4, endLine: 4 },
+			placement: "after",
+			removeSource: true,
+		});
+		expect(out).toBe("c\nd\na\nb\ne\n");
+	});
+
+	test("move to an earlier anchor", () => {
+		const out = relocateRange(NUMBERED, { startLine: 4, endLine: 5 }, {
+			anchor: { startLine: 1, endLine: 1 },
+			placement: "before",
+			removeSource: true,
+		});
+		expect(out).toBe("d\ne\na\nb\nc\n");
+	});
+
+	test("copy leaves the source in place", () => {
+		const out = relocateRange(NUMBERED, { startLine: 1, endLine: 1 }, {
+			anchor: { startLine: 3, endLine: 3 },
+			placement: "after",
+			removeSource: false,
+		});
+		expect(out).toBe("a\nb\nc\na\nd\ne\n");
+	});
+
+	test("no anchor appends at end of file", () => {
+		const out = relocateRange(NUMBERED, { startLine: 1, endLine: 1 }, { removeSource: true });
+		expect(out).toBe("b\nc\nd\ne\na\n");
+	});
+
+	test("every original line survives a move", () => {
+		// A cheap invariant that catches both duplication and loss.
+		const out = relocateRange(NUMBERED, { startLine: 2, endLine: 3 }, {
+			anchor: { startLine: 5, endLine: 5 },
+			placement: "after",
+			removeSource: true,
+		});
+		expect(out.trim().split("\n").sort()).toEqual(["a", "b", "c", "d", "e"]);
+	});
+
+	test("an anchor inside the source range is rejected", () => {
+		// "Move these lines to between these lines" has no meaningful answer.
+		expect(() =>
+			relocateRange(NUMBERED, { startLine: 1, endLine: 3 }, {
+				anchor: { startLine: 2, endLine: 2 },
+				placement: "after",
+				removeSource: true,
+			}),
+		).toThrow(/overlaps/);
+	});
+
+	test("an anchor overlapping the source from outside is also rejected", () => {
+		expect(() =>
+			relocateRange(NUMBERED, { startLine: 2, endLine: 3 }, {
+				anchor: { startLine: 1, endLine: 2 },
+				placement: "before",
+				removeSource: true,
+			}),
+		).toThrow(/overlaps/);
+	});
+
+	test("a method moved into a deeper scope is re-indented", () => {
+		const src = "helper() {\n\treturn 1;\n}\nclass A {\n\tfoo() {}\n}\n";
+		const out = relocateRange(src, { startLine: 1, endLine: 3 }, {
+			anchor: { startLine: 5, endLine: 5 },
+			placement: "after",
+			removeSource: true,
+		});
+		expect(out).toBe("class A {\n\tfoo() {}\n\thelper() {\n\t\treturn 1;\n\t}\n}\n");
+	});
+
+	test("a file with no trailing newline stays that way", () => {
+		const out = relocateRange("a\nb\nc", { startLine: 1, endLine: 1 }, { removeSource: true });
+		expect(out).toBe("b\nc\na");
+	});
+});
+
+describe("extractBlock (cross-file payload)", () => {
+	test("returns the lines rebased to column 0", () => {
+		// The destination decides the final indent; carrying the source's would nest the
+		// block by however deep it happened to be.
+		const src = "class A {\n\tfoo() {\n\t\treturn 1;\n\t}\n}\n";
+		expect(extractBlock(src, { startLine: 2, endLine: 4 })).toBe("foo() {\n\treturn 1;\n}");
+	});
+
+	test("a single line comes back without a trailing newline", () => {
+		expect(extractBlock("a\nb\n", { startLine: 2, endLine: 2 })).toBe("b");
+	});
+
+	test("an out-of-range source is rejected", () => {
+		expect(() => extractBlock("a\n", { startLine: 9, endLine: 9 })).toThrow(/past the end/);
 	});
 });
 

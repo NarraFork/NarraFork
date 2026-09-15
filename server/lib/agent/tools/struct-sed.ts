@@ -43,10 +43,14 @@ import {
 } from "../structural";
 import {
 	appendAfter,
+	applyBatch,
+	type BatchOperation,
 	deleteRange,
 	EditOpError,
 	insertBefore,
 	type LineRange,
+	type MovePlacement,
+	relocateRange,
 	replaceRange,
 	substituteInRange,
 } from "../structural/edit-ops";
@@ -60,14 +64,25 @@ import {
 } from "./encoding";
 import { replacementLineStats } from "./file-diff-stats";
 
-const COMMANDS = ["replace", "substitute", "delete", "insert", "append"] as const;
+const COMMANDS = ["replace", "substitute", "delete", "insert", "append", "copy", "move"] as const;
 type Command = (typeof COMMANDS)[number];
+
+/** Commands that relocate a block rather than rewriting one in place. */
+const RELOCATION_COMMANDS = new Set<Command>(["copy", "move"]);
 
 /** Same ceiling StructView uses, so an addressable file is always an editable one. */
 const MAX_FILE_BYTES = 2_000_000;
 
 /** Preview budget: enough to see the change, not enough to flood the context. */
 const MAX_PREVIEW_LINES = 80;
+
+/**
+ * Cap on operations per batch.
+ *
+ * Bounds both the resolution work (each operation may run `locate`) and the preview size.
+ * A larger refactor should be split into several calls, so a dry run stays readable.
+ */
+const MAX_BATCH_OPERATIONS = 50;
 
 const DESCRIPTION = `Change a file by STRUCTURE rather than by quoting its text.
 
@@ -80,12 +95,19 @@ Commands:
 - insert: put \`content\` immediately before the selection
 - append: put \`content\` immediately after the selection
 - substitute: regex-replace inside the selection only (\`pattern\` + \`replacement\`, flags g/i)
+- copy: duplicate the selection to another position in the SAME file
+- move: relocate the selection to another position in the SAME file
 
 Addressing (give exactly ONE):
 - \`symbol\` — a declaration name, \`Class.method\` for a member, \`name#2\` to disambiguate.
   Needs a parsed language; run StructView first to see what is available.
 - \`address\` — sed-style and grammar-free: \`42\`, \`10,20\`, \`10,$\`, \`$\`, \`/regex/\`,
   \`/from/,/to/\`. Works on any text file.
+
+For copy/move, the destination is \`to_symbol\` or \`to_address\` (same syntax), with
+\`placement: "before" | "after"\` (default "after"). Omit both to append at end of file.
+A destination overlapping the source is refused. A moved block keeps its doc comment and
+decorators, and is re-indented to its destination.
 
 \`content\` is re-indented to the selection's own indent, so a block written at column 0
 lands correctly inside a nested class. Internal relative indentation is preserved.
@@ -123,6 +145,22 @@ const rawJsonSchema = {
 			description: "New text for replace/insert/append. Re-indented to the selection.",
 			type: "string",
 		},
+		to_symbol: {
+			description:
+				"For copy/move: destination declaration name (same syntax as `symbol`). Mutually exclusive with `to_address`.",
+			type: "string",
+		},
+		to_address: {
+			description:
+				"For copy/move: destination line/regex address (same syntax as `address`). Mutually exclusive with `to_symbol`.",
+			type: "string",
+		},
+		placement: {
+			description:
+				'For copy/move: put the block before or after the destination. Defaults to "after".',
+			type: "string",
+			enum: ["before", "after"],
+		},
 		pattern: {
 			description: "For substitute: the regex to match inside the selection.",
 			type: "string",
@@ -140,8 +178,14 @@ const rawJsonSchema = {
 				"Preview instead of writing. Defaults to TRUE; pass false to actually apply the change.",
 			type: "boolean",
 		},
+		operations: {
+			description:
+				"Apply SEVERAL operations to this file as one unit. Each entry takes the same fields as a single call (command, symbol/address, content, pattern, replacement, flags, to_symbol/to_address, placement). Every address is relative to the file as it is NOW, not to the result of earlier entries; overlapping ranges are rejected. Either all operations apply or none do. When present, the top-level command/address fields are ignored.",
+			type: "array",
+			items: { type: "object" },
+		},
 	},
-	required: ["file_path", "command"],
+	required: ["file_path"],
 	additionalProperties: false,
 };
 
@@ -168,6 +212,219 @@ function previewRegion(text: string, range: LineRange): string {
 	return numbered.join("\n");
 }
 
+/**
+ * Resolve one address (structural or sed-style) to a line range.
+ *
+ * Shared by the source and the copy/move destination so the two cannot diverge: a
+ * destination written the same way as a source must select the same lines.
+ *
+ * Returns `{ error }` rather than throwing, because every failure here is a message for the
+ * model (ambiguous symbol, no match, no parser) rather than an exception.
+ */
+async function resolveToRange(input: {
+	symbol: string;
+	address: string;
+	role: "source" | "destination";
+	filePath: string;
+	resolvedPath: string;
+	text: string;
+	kind?: unknown;
+	signal?: AbortSignal;
+}): Promise<{ range: LineRange; label: string } | { error: ToolResult }> {
+	const { symbol, address, role, filePath, resolvedPath, text } = input;
+	const field = role === "source" ? "symbol" : "to_symbol";
+	const addressField = role === "source" ? "address" : "to_address";
+
+	if (symbol) {
+		const languageId = languageIdForExtension(extname(resolvedPath));
+		const doc: StructDocument = {
+			filePath: resolvedPath,
+			text,
+			languageId,
+			...(input.signal ? { signal: input.signal } : {}),
+		};
+		const resolved = await resolveProvider(doc);
+		if (!resolved) {
+			return {
+				error: {
+					output: `No structure provider could handle ${filePath}. Use \`${addressField}\` for a line or regex range instead.`,
+					isError: true,
+				},
+			};
+		}
+		const parsed = parseSymbolSelector(symbol);
+		const kinds = parseKinds(input.kind);
+		const matches = await resolved.provider.locate(doc, {
+			symbol: parsed.symbol,
+			...(parsed.nth != null ? { nth: parsed.nth } : {}),
+			...(kinds ? { kinds } : {}),
+		});
+		if (matches.length === 0) {
+			// The advice depends on WHY there was no match. With a real parse, the symbol
+			// simply is not there and the outline shows what is. Without one (an unknown
+			// language answered by the heuristic provider), pointing at the outline sends
+			// the model to a guess — an address is the tool that actually works there.
+			const advice =
+				resolved.support === "full"
+					? "Run StructView mode=outline to see what is there."
+					: `${languageId ? `No parser is installed for ${languageId}` : "This file has no known language"}, so structural addressing is unreliable here. Use \`${addressField}\` with a line or regex range instead.`;
+			return {
+				error: {
+					output: `No ${role} symbol matching "${symbol}" in ${filePath}. ${advice}`,
+					isError: true,
+					title: filePath,
+				},
+			};
+		}
+		// Ambiguity is reported, never resolved by picking: editing the wrong overload
+		// looks exactly like a successful edit.
+		if (matches.length > 1) {
+			const list = matches
+				.map((m, i) => `  #${i + 1}  L${m.startLine}-${m.endLine}  ${m.kind} ${m.symbolPath}`)
+				.join("\n");
+			return {
+				error: {
+					output: `\`${field}\` "${symbol}" matches ${matches.length} declarations in ${filePath}. Disambiguate with "${symbol}#N" or \`kind\`:\n${list}`,
+					isError: true,
+					title: filePath,
+				},
+			};
+		}
+		const hit = matches[0];
+		if (!hit) {
+			return { error: { output: `Could not resolve "${symbol}".`, isError: true } };
+		}
+		return {
+			range: { startLine: hit.startLine, endLine: hit.endLine },
+			label: `${hit.kind} ${hit.symbolPath} (L${hit.startLine}-${hit.endLine})`,
+		};
+	}
+
+	const lines = text.split("\n");
+	try {
+		const parsed = parseAddress(address);
+		const result = resolveAddress(parsed, lines, { maxBlocks: 1 });
+		const block = result.blocks[0];
+		if (!block) {
+			return {
+				error: {
+					output: `${role === "source" ? "Address" : "Destination address"} "${address}" matched nothing in ${filePath}.`,
+					isError: true,
+					title: filePath,
+				},
+			};
+		}
+		return {
+			range: { startLine: block.startLine, endLine: block.endLine },
+			label: `L${block.startLine}-${block.endLine}`,
+		};
+	} catch (err) {
+		return {
+			error: {
+				output:
+					err instanceof AddressError
+						? `Invalid ${addressField}: ${err.message}`
+						: `Error resolving ${addressField}: ${err instanceof Error ? err.message : String(err)}`,
+				isError: true,
+			},
+		};
+	}
+}
+
+/** One operation after field-level validation, before its address is resolved. */
+interface ValidatedSpec {
+	index: number;
+	command: Command;
+	isRelocation: boolean;
+	symbol: string;
+	address: string;
+	toSymbol: string;
+	toAddress: string;
+	placement: MovePlacement;
+	kind?: unknown;
+	content?: string;
+	pattern?: string;
+	replacement?: string;
+	flags?: string;
+}
+
+/**
+ * Validate one operation's fields.
+ *
+ * Shared by the single-call and batch shapes so a batch entry cannot accept something a
+ * single call rejects. `batched` only affects the wording, so an error inside a batch says
+ * which entry it came from.
+ */
+function validateSpec(
+	spec: Record<string, unknown>,
+	index: number,
+	batched: boolean,
+): { spec: ValidatedSpec } | { error: ToolResult } {
+	const at = batched ? ` (operation ${index})` : "";
+	const fail = (output: string): { error: ToolResult } => ({
+		error: { output: `${output}${at}`, isError: true },
+	});
+
+	const command = spec.command as Command;
+	if (!COMMANDS.includes(command)) {
+		return fail(
+			`Unknown command "${String(spec.command)}". Expected one of: ${COMMANDS.join(", ")}.`,
+		);
+	}
+
+	const symbol = typeof spec.symbol === "string" ? spec.symbol.trim() : "";
+	const address = typeof spec.address === "string" ? spec.address.trim() : "";
+	// Both given is an ambiguous request, not a choice to make on the model's behalf:
+	// picking one silently could delete a different range than the one it named.
+	if (symbol && address) {
+		return fail(
+			"Give either `symbol` or `address`, not both - they select different things and there is no safe way to guess which one you meant.",
+		);
+	}
+	if (!symbol && !address) {
+		return fail(
+			"An address is required: pass `symbol` for a declaration, or `address` for a line/regex range.",
+		);
+	}
+
+	const isRelocation = RELOCATION_COMMANDS.has(command);
+	const toSymbol = typeof spec.to_symbol === "string" ? spec.to_symbol.trim() : "";
+	const toAddress = typeof spec.to_address === "string" ? spec.to_address.trim() : "";
+	if (toSymbol && toAddress) {
+		return fail("Give either `to_symbol` or `to_address`, not both.");
+	}
+	// A destination on a command that does not relocate is a misunderstanding worth naming:
+	// silently ignoring it would leave the model believing the block moved.
+	if (!isRelocation && (toSymbol || toAddress)) {
+		return fail(
+			`command=${command} does not take a destination. Use copy or move to relocate a block.`,
+		);
+	}
+	if (!isRelocation && spec.placement !== undefined) {
+		return fail(
+			`command=${command} does not take \`placement\`; it only applies to copy and move.`,
+		);
+	}
+
+	return {
+		spec: {
+			index,
+			command,
+			isRelocation,
+			symbol,
+			address,
+			toSymbol,
+			toAddress,
+			placement: spec.placement === "before" ? "before" : "after",
+			...(spec.kind !== undefined ? { kind: spec.kind } : {}),
+			...(typeof spec.content === "string" ? { content: spec.content } : {}),
+			...(typeof spec.pattern === "string" ? { pattern: spec.pattern } : {}),
+			...(typeof spec.replacement === "string" ? { replacement: spec.replacement } : {}),
+			...(typeof spec.flags === "string" ? { flags: spec.flags } : {}),
+		},
+	};
+}
+
 /** Apply the command to LF-normalized text. Throws `EditOpError` on an invalid request. */
 function applyCommand(
 	command: Command,
@@ -178,11 +435,23 @@ function applyCommand(
 		pattern?: string;
 		replacement?: string;
 		flags?: string;
+		/** Resolved destination for copy/move; absent means end of file. */
+		anchor?: LineRange;
+		placement?: MovePlacement;
 	},
 ): { text: string; replacements?: number } {
 	switch (command) {
 		case "delete":
 			return { text: deleteRange(text, range) };
+		case "copy":
+		case "move":
+			return {
+				text: relocateRange(text, range, {
+					...(args.anchor ? { anchor: args.anchor } : {}),
+					placement: args.placement ?? "after",
+					removeSource: command === "move",
+				}),
+			};
 		case "replace": {
 			if (typeof args.content !== "string") {
 				throw new EditOpError("command=replace requires `content`.");
@@ -239,46 +508,69 @@ export const structSedTool: ToolDefinition = {
 	},
 	parameters: z.object({
 		file_path: z.string().describe("Absolute path to the file to change."),
-		command: z.enum(COMMANDS).describe("Which mutation to apply."),
+		command: z
+			.enum(COMMANDS)
+			.optional()
+			.describe("Which mutation to apply. Required unless `operations` is given."),
 		symbol: z.string().optional().describe("Structural address: declaration name."),
 		kind: z.string().optional().describe("Restrict the structural address to these kinds."),
 		address: z.string().optional().describe("Line/regex address; needs no grammar."),
 		content: z.string().optional().describe("New text for replace/insert/append."),
+		to_symbol: z.string().optional().describe("For copy/move: destination declaration name."),
+		to_address: z.string().optional().describe("For copy/move: destination line/regex address."),
+		placement: z
+			.enum(["before", "after"])
+			.optional()
+			.describe('For copy/move: side of the destination. Defaults to "after".'),
 		pattern: z.string().optional().describe("For substitute: the regex to match."),
 		replacement: z.string().optional().describe("For substitute: the replacement text."),
 		flags: z.string().optional().describe('For substitute: flags, "g" and "i" only.'),
 		dry_run: z.boolean().optional().describe("Preview instead of writing. Defaults to true."),
+		operations: z
+			.array(z.record(z.string(), z.unknown()))
+			.optional()
+			.describe("Several operations applied to this file as one unit, or none at all."),
 	}),
 
 	async execute(args, ctx): Promise<ToolResult> {
 		const filePath = typeof args.file_path === "string" ? args.file_path : "";
 		if (!filePath) return { output: "file_path is required.", isError: true };
 
-		const command = args.command as Command;
-		if (!COMMANDS.includes(command)) {
+		// A single call is treated as a batch of ONE, so the two shapes cannot drift apart:
+		// identical validation, resolution, application and replay code runs either way.
+		const rawBatch = Array.isArray(args.operations) ? args.operations : null;
+		if (rawBatch && rawBatch.length === 0) {
+			return { output: "`operations` was empty; give at least one operation.", isError: true };
+		}
+		if (rawBatch && rawBatch.length > MAX_BATCH_OPERATIONS) {
 			return {
-				output: `Unknown command "${String(args.command)}". Expected one of: ${COMMANDS.join(", ")}.`,
+				output: `A batch is limited to ${MAX_BATCH_OPERATIONS} operations; this call has ${rawBatch.length}. Split it into several calls.`,
+				isError: true,
+			};
+		}
+		// Top-level command fields alongside `operations` are ambiguous: the model may believe
+		// either one applies. Naming it beats silently ignoring half the request.
+		if (
+			rawBatch &&
+			(args.command !== undefined || args.symbol !== undefined || args.address !== undefined)
+		) {
+			return {
+				output:
+					"Give either `operations` or the top-level command/symbol/address fields, not both - put every operation inside `operations`.",
 				isError: true,
 			};
 		}
 
-		const rawSymbol = typeof args.symbol === "string" ? args.symbol.trim() : "";
-		const rawAddress = typeof args.address === "string" ? args.address.trim() : "";
-		// Both given is an ambiguous request, not a choice to make on the model's behalf:
-		// picking one silently could delete a different range than the one it named.
-		if (rawSymbol && rawAddress) {
-			return {
-				output:
-					"Give either `symbol` or `address`, not both — they select different things and there is no safe way to guess which one you meant.",
-				isError: true,
-			};
-		}
-		if (!rawSymbol && !rawAddress) {
-			return {
-				output:
-					"An address is required: pass `symbol` for a declaration, or `address` for a line/regex range.",
-				isError: true,
-			};
+		const isBatch = rawBatch !== null;
+		const specs: Array<Record<string, unknown>> = rawBatch
+			? rawBatch.map((entry) => (entry ?? {}) as Record<string, unknown>)
+			: [args as Record<string, unknown>];
+
+		const validated: ValidatedSpec[] = [];
+		for (const [i, spec] of specs.entries()) {
+			const result = validateSpec(spec, i + 1, isBatch);
+			if ("error" in result) return result.error;
+			validated.push(result.spec);
 		}
 
 		const backend = getToolBackend(ctx, (args as { device?: string }).device);
@@ -325,109 +617,102 @@ export const structSedTool: ToolDefinition = {
 
 		const normalized = normalizeLineEndings(originalText);
 
-		// Resolve the address to a line range. Structural goes through the provider;
-		// line/regex is grammar-free and handled directly.
-		let range: LineRange;
-		let addressLabel: string;
-		if (rawSymbol) {
-			const languageId = languageIdForExtension(extname(resolvedPath));
-			const doc: StructDocument = {
-				filePath: resolvedPath,
+		// `kind` is per-operation: a batch may filter each address differently.
+		const resolveOne = (
+			symbol: string,
+			address: string,
+			role: "source" | "destination",
+			kind: unknown,
+		) =>
+			resolveToRange({
+				symbol,
+				address,
+				role,
+				filePath,
+				resolvedPath,
 				text: normalized,
-				languageId,
+				kind,
 				...(ctx.signal ? { signal: ctx.signal } : {}),
-			};
-			const resolved = await resolveProvider(doc);
-			if (!resolved) {
-				return {
-					output: `No structure provider could handle ${filePath}. Use \`address\` for a line or regex range instead.`,
-					isError: true,
-				};
-			}
-			const parsed = parseSymbolSelector(rawSymbol);
-			const kinds = parseKinds(args.kind);
-			const matches = await resolved.provider.locate(doc, {
-				symbol: parsed.symbol,
-				...(parsed.nth != null ? { nth: parsed.nth } : {}),
-				...(kinds ? { kinds } : {}),
 			});
-			if (matches.length === 0) {
-				// The advice depends on WHY there was no match. With a real parse, the symbol
-				// simply is not there and the outline shows what is. Without one (an unknown
-				// language answered by the heuristic provider), pointing at the outline sends
-				// the model to a guess — `address` is the tool that actually works there.
-				const advice =
-					resolved.support === "full"
-						? "Run StructView mode=outline to see what is there."
-						: `${languageId ? `No parser is installed for ${languageId}` : "This file has no known language"}, so structural addressing is unreliable here. Use \`address\` with a line or regex range instead.`;
-				return {
-					output: `No symbol matching "${rawSymbol}" in ${filePath}. ${advice}`,
-					isError: true,
-					title: filePath,
-				};
+
+		// Resolve every operation's addresses against the ORIGINAL text. That is what makes
+		// batch addresses predictable: no address shifts because of another operation.
+		interface ResolvedOp {
+			spec: ValidatedSpec;
+			range: LineRange;
+			anchor?: LineRange;
+			label: string;
+		}
+		const resolvedOps: ResolvedOp[] = [];
+		for (const spec of validated) {
+			const source = await resolveOne(spec.symbol, spec.address, "source", spec.kind);
+			if ("error" in source) return source.error;
+			let anchor: LineRange | undefined;
+			let anchorLabel = "end of file";
+			if (spec.isRelocation && (spec.toSymbol || spec.toAddress)) {
+				const destination = await resolveOne(
+					spec.toSymbol,
+					spec.toAddress,
+					"destination",
+					spec.kind,
+				);
+				if ("error" in destination) return destination.error;
+				anchor = destination.range;
+				anchorLabel = destination.label;
 			}
-			// Ambiguity is reported, never resolved by picking: editing the wrong overload
-			// looks exactly like a successful edit.
-			if (matches.length > 1) {
-				const list = matches
-					.map((m, i) => `  #${i + 1}  L${m.startLine}-${m.endLine}  ${m.kind} ${m.symbolPath}`)
-					.join("\n");
-				return {
-					output: `"${rawSymbol}" matches ${matches.length} declarations in ${filePath}. Disambiguate with "${rawSymbol}#N" or \`kind\`:\n${list}`,
-					isError: true,
-					title: filePath,
-				};
-			}
-			const hit = matches[0];
-			if (!hit) {
-				return { output: `Could not resolve "${rawSymbol}".`, isError: true };
-			}
-			range = { startLine: hit.startLine, endLine: hit.endLine };
-			addressLabel = `${hit.kind} ${hit.symbolPath} (L${hit.startLine}-${hit.endLine})`;
-		} else {
-			const lines = normalized.split("\n");
-			try {
-				const address = parseAddress(rawAddress);
-				const result = resolveAddress(address, lines, { maxBlocks: 1 });
-				const block = result.blocks[0];
-				if (!block) {
-					return {
-						output: `Address "${rawAddress}" matched nothing in ${filePath}.`,
-						isError: true,
-						title: filePath,
-					};
-				}
-				range = { startLine: block.startLine, endLine: block.endLine };
-				addressLabel = `L${block.startLine}-${block.endLine}`;
-			} catch (err) {
-				return {
-					output:
-						err instanceof AddressError
-							? `Invalid address: ${err.message}`
-							: `Error resolving address: ${err instanceof Error ? err.message : String(err)}`,
-					isError: true,
-				};
-			}
+			// A relocation names both ends. Reporting only the source would leave the reader
+			// unable to tell where the block actually went.
+			const label = spec.isRelocation
+				? `${source.label} → ${spec.placement} ${anchorLabel}`
+				: source.label;
+			resolvedOps.push({ spec, range: source.range, ...(anchor ? { anchor } : {}), label });
 		}
 
-		// Compute the result once, before deciding whether to write it.
-		let nextText: string;
+		const first = resolvedOps[0];
+		if (!first) return { output: "No operation to apply.", isError: true };
+		const addressLabel = isBatch
+			? `${resolvedOps.length} operations`
+			: `${first.spec.command} on ${first.label}`;
+
+		// Substitute reports how many replacements it made. Summed across the batch, since a
+		// batch reports one figure for the whole call.
 		let replacements: number | undefined;
-		try {
-			const applied = applyCommand(command, normalized, range, {
-				...(typeof args.content === "string" ? { content: args.content } : {}),
-				...(typeof args.pattern === "string" ? { pattern: args.pattern } : {}),
-				...(typeof args.replacement === "string" ? { replacement: args.replacement } : {}),
-				...(typeof args.flags === "string" ? { flags: args.flags } : {}),
+		const runOne = (op: ResolvedOp, text: string, range: LineRange): string => {
+			const applied = applyCommand(op.spec.command, text, range, {
+				...(op.spec.content !== undefined ? { content: op.spec.content } : {}),
+				...(op.spec.pattern !== undefined ? { pattern: op.spec.pattern } : {}),
+				...(op.spec.replacement !== undefined ? { replacement: op.spec.replacement } : {}),
+				...(op.spec.flags !== undefined ? { flags: op.spec.flags } : {}),
+				...(op.anchor ? { anchor: op.anchor } : {}),
+				...(op.spec.isRelocation ? { placement: op.spec.placement } : {}),
 			});
-			nextText = applied.text;
-			replacements = applied.replacements;
+			if (applied.replacements != null) {
+				replacements = (replacements ?? 0) + applied.replacements;
+			}
+			return applied.text;
+		};
+
+		// Built from one function so the preview and the write cannot disagree about what the
+		// call does — an earlier version assembled the arguments separately and the copy/move
+		// anchor was missing from both, so the block would have appended at EOF while the card
+		// reported the requested destination.
+		const buildOperations = (): BatchOperation[] =>
+			resolvedOps.map((op) => ({
+				index: op.spec.index,
+				label: op.spec.command,
+				range: op.range,
+				apply: (text: string, range: LineRange) => runOne(op, text, range),
+			}));
+
+		let nextText: string;
+		try {
+			nextText = applyBatch(normalized, buildOperations());
 		} catch (err) {
 			return {
 				output:
 					err instanceof EditOpError
 						? err.message
-						: `Error applying ${command}: ${err instanceof Error ? err.message : String(err)}`,
+						: `Error applying ${addressLabel}: ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,
 				title: filePath,
 			};
@@ -435,19 +720,43 @@ export const structSedTool: ToolDefinition = {
 
 		if (nextText === normalized) {
 			return {
-				output: `No changes: ${command} on ${addressLabel} produced identical content.`,
+				output: `No changes: ${addressLabel} produced identical content.`,
 				title: filePath,
 			};
 		}
 
+		const range = first.range;
+		const command = first.spec.command;
 		const oldRegion = normalized
 			.split("\n")
 			.slice(range.startLine - 1, range.endLine)
 			.join("\n");
-		const stats = replacementLineStats(
-			oldRegion,
-			typeof args.content === "string" ? args.content : "",
-		);
+		const stats = replacementLineStats(oldRegion, first.spec.content ?? "");
+
+		/** One operation's replayable record: selector for readability, range for replay. */
+		const recordOne = (op: (typeof resolvedOps)[number]): Record<string, unknown> => ({
+			command: op.spec.command,
+			...(op.spec.symbol ? { symbol: op.spec.symbol } : {}),
+			...(op.spec.address ? { address: op.spec.address } : {}),
+			...(op.spec.content !== undefined ? { content: op.spec.content } : {}),
+			...(op.spec.pattern !== undefined ? { pattern: op.spec.pattern } : {}),
+			...(op.spec.replacement !== undefined ? { replacement: op.spec.replacement } : {}),
+			...(op.spec.flags !== undefined ? { flags: op.spec.flags } : {}),
+			resolvedStartLine: op.range.startLine,
+			resolvedEndLine: op.range.endLine,
+			// The destination is recorded resolved for the same reason as the source: replay
+			// must not re-run `locate` against content that has since changed.
+			...(op.anchor
+				? { resolvedToStartLine: op.anchor.startLine, resolvedToEndLine: op.anchor.endLine }
+				: {}),
+			...(op.spec.isRelocation ? { placement: op.spec.placement } : {}),
+		});
+
+		// A single call keeps the flat shape it has always had, so existing recorded history
+		// stays replayable by the same branch; a batch adds `operations`.
+		const recordedInput: Record<string, unknown> = isBatch
+			? { operations: resolvedOps.map(recordOne) }
+			: (recordOne(first) as Record<string, unknown>);
 
 		// Default-on preview. The model sees the resolved range and the result before
 		// anything is written, which is the check a structural address does not carry.
@@ -457,10 +766,15 @@ export const structSedTool: ToolDefinition = {
 				command === "delete"
 					? { startLine: Math.max(1, range.startLine - 1), endLine: range.startLine }
 					: { startLine: range.startLine, endLine: range.endLine + 4 };
+			// A batch lists every operation, because the whole point of previewing one is
+			// seeing all of what it will do before any of it happens.
+			const plan = isBatch
+				? `${resolvedOps.map((op) => `  ${op.spec.index}. ${op.spec.command} → ${op.label}`).join("\n")}\n`
+				: `${addressLabel}\n`;
 			return {
 				output:
 					`DRY RUN — nothing written. Pass dry_run: false to apply.\n\n` +
-					`${command} → ${addressLabel}\n` +
+					plan +
 					(replacements != null ? `${replacements} replacement(s)\n` : "") +
 					`\nBefore:\n${previewRegion(normalized, range)}\n` +
 					`\nAfter:\n${previewRegion(nextText, afterRange)}`,
@@ -470,6 +784,7 @@ export const structSedTool: ToolDefinition = {
 					command,
 					startLine: range.startLine,
 					endLine: range.endLine,
+					...(isBatch ? { operations: resolvedOps.length } : {}),
 					...(replacements != null ? { replacements } : {}),
 				},
 			};
@@ -481,19 +796,11 @@ export const structSedTool: ToolDefinition = {
 				backend,
 				toolName: "StructSed",
 				filePath,
-				// The RESOLVED range travels with the input so rebuild can replay by line
-				// number without re-running `locate` against changed content.
-				input: {
-					command,
-					...(rawSymbol ? { symbol: rawSymbol } : {}),
-					...(rawAddress ? { address: rawAddress } : {}),
-					...(typeof args.content === "string" ? { content: args.content } : {}),
-					...(typeof args.pattern === "string" ? { pattern: args.pattern } : {}),
-					...(typeof args.replacement === "string" ? { replacement: args.replacement } : {}),
-					...(typeof args.flags === "string" ? { flags: args.flags } : {}),
-					resolvedStartLine: range.startLine,
-					resolvedEndLine: range.endLine,
-				},
+				// Every operation is recorded with its RESOLVED range so rebuild can replay by
+				// line number without re-running `locate` against changed content. A batch
+				// records ALL of them: recording only the first would replay a multi-operation
+				// call as a single edit, silently dropping the rest.
+				input: recordedInput,
 				construct(before) {
 					if (before.bytes === null) {
 						throw new LocalFileValidationError(`File not found: ${filePath}`);
@@ -503,14 +810,12 @@ export const structSedTool: ToolDefinition = {
 					// Re-apply against the bytes observed under the write lock rather than
 					// trusting the earlier read: the file may have changed in between, and
 					// writing the stale result would clobber that change.
-					let applied: { text: string };
+					// The SAME batch the preview ran, so the two cannot disagree, and so a batch
+					// is applied as one unit here too: `applyBatch` returns a single string, so
+					// a failure part-way through throws and nothing is written.
+					let appliedText: string;
 					try {
-						applied = applyCommand(command, current, range, {
-							...(typeof args.content === "string" ? { content: args.content } : {}),
-							...(typeof args.pattern === "string" ? { pattern: args.pattern } : {}),
-							...(typeof args.replacement === "string" ? { replacement: args.replacement } : {}),
-							...(typeof args.flags === "string" ? { flags: args.flags } : {}),
-						});
+						appliedText = applyBatch(current, buildOperations());
 					} catch (error) {
 						throw new LocalFileValidationError(
 							error instanceof Error ? error.message : String(error),
@@ -518,7 +823,7 @@ export const structSedTool: ToolDefinition = {
 					}
 					const ending = detectLineEnding(decoded.text);
 					return {
-						nextBytes: encodeFileBytes(applyLineEnding(applied.text, ending), decoded.encoding),
+						nextBytes: encodeFileBytes(applyLineEnding(appliedText, ending), decoded.encoding),
 						lineStats: stats,
 						result: {
 							output:

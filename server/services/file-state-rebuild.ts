@@ -18,6 +18,7 @@ import {
 	appendAfter,
 	deleteRange,
 	insertBefore,
+	relocateRange,
 	replaceRange,
 	substituteInRange,
 } from "../lib/agent/structural/edit-ops";
@@ -660,6 +661,20 @@ function applyStructSedCall(
 		switch (command) {
 			case "delete":
 				return applyLineEnding(deleteRange(content, range), detectLineEnding(currentContent));
+			case "copy":
+			case "move": {
+				// The destination travelled resolved, like the source. Its absence is a real
+				// state (append at end of file), not missing data, so it does not diverge.
+				const toStart = input.resolvedToStartLine;
+				const toEnd = input.resolvedToEndLine;
+				const hasAnchor = typeof toStart === "number" && typeof toEnd === "number";
+				const next = relocateRange(content, range, {
+					...(hasAnchor ? { anchor: { startLine: toStart, endLine: toEnd } } : {}),
+					placement: input.placement === "before" ? "before" : "after",
+					removeSource: command === "move",
+				});
+				return applyLineEnding(next, detectLineEnding(currentContent));
+			}
 			case "replace":
 			case "insert":
 			case "append": {

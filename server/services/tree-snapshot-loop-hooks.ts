@@ -48,8 +48,15 @@ import {
 	type TreeSnapshotSession,
 } from "./narrator-tree-snapshot-hooks";
 
-/** Tools that may modify files on disk, i.e. the ones worth a boundary pair. */
-export const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", SHELL_TOOL_NAME]);
+/**
+ * Tools that may modify files on disk, i.e. the ones worth a boundary pair.
+ *
+ * A file-mutating tool missing from this set gets NO tree snapshot boundary, so the
+ * preferred revert path cannot cover it and `narrator-scoped-revert` reports
+ * `incomplete_coverage` for the whole range. That fails closed rather than pretending a
+ * revert succeeded, but the capability is simply absent until the name is listed here.
+ */
+export const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", "StructSed", SHELL_TOOL_NAME]);
 
 /**
  * Build the snapshot hook pair for one agent loop.

@@ -85,6 +85,47 @@ function declare(cwd: string, relPath: string): string[] {
 	return declaredWorktreePaths(cwd, { file_path: join(cwd, relPath) });
 }
 
+describe("declared paths", () => {
+	const cwd = process.platform === "win32" ? "E:\\repo" : "/repo";
+
+	test("a single-target tool declares just its file", () => {
+		expect(declaredWorktreePaths(cwd, { file_path: join(cwd, "a", "b.ts") })).toEqual(["a/b.ts"]);
+	});
+
+	test("a move/copy declares BOTH its source and its destination", () => {
+		// StructSed writes two files in one turn. An undeclared destination means its tree
+		// delta is attributed to nobody, so a rollback would miss it.
+		expect(
+			declaredWorktreePaths(cwd, {
+				file_path: join(cwd, "src", "big.ts"),
+				to: join(cwd, "src", "types.ts"),
+			}),
+		).toEqual(["src/big.ts", "src/types.ts"]);
+	});
+
+	test("a destination equal to the source is not declared twice", () => {
+		expect(
+			declaredWorktreePaths(cwd, { file_path: join(cwd, "a.ts"), to: join(cwd, "a.ts") }),
+		).toEqual(["a.ts"]);
+	});
+
+	test("a destination outside the worktree is dropped, keeping the source", () => {
+		const outside = process.platform === "win32" ? "E:\\elsewhere\\x.ts" : "/elsewhere/x.ts";
+		expect(declaredWorktreePaths(cwd, { file_path: join(cwd, "a.ts"), to: outside })).toEqual([
+			"a.ts",
+		]);
+	});
+
+	test("a spec:// target declares nothing, because nothing reaches the worktree", () => {
+		expect(declaredWorktreePaths(cwd, { file_path: "spec://tasks.json" })).toEqual([]);
+	});
+
+	test("a malformed input yields no declaration rather than throwing", () => {
+		expect(declaredWorktreePaths(cwd, null)).toEqual([]);
+		expect(declaredWorktreePaths(cwd, { file_path: 42 })).toEqual([]);
+	});
+});
+
 afterEach(async () => {
 	for (const narratorId of createdNarrators.splice(0)) {
 		await db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId));

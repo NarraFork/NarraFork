@@ -121,22 +121,38 @@ export interface TreeSnapshotSession {
  * Never throws: a malformed input must not break the tool's turn.
  */
 export function declaredWorktreePaths(cwd: string, input: unknown): string[] {
-	const filePath = (input as Record<string, unknown> | null)?.file_path;
-	if (typeof filePath !== "string" || filePath.length === 0) return [];
+	const args = input as Record<string, unknown> | null;
+	// `file_path` is the primary target for every file tool. `to` is StructSed's move/copy
+	// destination: a tool that writes two files must declare BOTH, or the tree delta on the
+	// undeclared one is attributed to nobody and a rollback misses it.
+	const declared: string[] = [];
+	for (const candidate of [args?.file_path, args?.to]) {
+		const rel = worktreeRelativePath(cwd, candidate);
+		if (rel && !declared.includes(rel)) declared.push(rel);
+	}
+	return declared;
+}
+
+/**
+ * One path as a forward-slashed worktree-relative path, or null when it is not inside this
+ * worktree (or is not a real disk path at all).
+ */
+function worktreeRelativePath(cwd: string, value: unknown): string | null {
+	if (typeof value !== "string" || value.length === 0) return null;
 	// Dynamic Spec URIs are virtual: nothing reaches the worktree, so there is
 	// nothing a rollback could restore. This is what previously showed up as
 	// `before === after` and is now stated directly.
-	if (specVfsService.isSpecUri(filePath)) return [];
+	if (specVfsService.isSpecUri(value)) return null;
 	try {
-		const rel = relative(cwd, resolve(cwd, filePath));
+		const rel = relative(cwd, resolve(cwd, value));
 		// Empty means the root itself; a parent component or a different Windows
 		// drive escapes the scope. A filename beginning with '..' does not.
-		if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return [];
+		if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
 		// Only the local platform's separator is a separator. A backslash is a real
 		// filename byte on POSIX, not a Windows path to reinterpret.
-		return [rel.split(sep).join("/")];
+		return rel.split(sep).join("/");
 	} catch {
-		return [];
+		return null;
 	}
 }
 

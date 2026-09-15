@@ -30,6 +30,11 @@ export interface LineRange {
 	endLine: number;
 }
 
+/** Do two inclusive line ranges share any line? */
+export function rangesOverlap(a: LineRange, b: LineRange): boolean {
+	return a.startLine <= b.endLine && b.startLine <= a.endLine;
+}
+
 /**
  * Split into lines, remembering whether the text ended with a newline.
  *
@@ -153,6 +158,102 @@ export function appendAfter(text: string, range: LineRange, content: string): st
 	return joinLines(next, trailingNewline);
 }
 
+/** Where a same-file copy/move puts the block, relative to an anchor range. */
+export type MovePlacement = "before" | "after";
+
+export interface MoveOptions {
+	/** Anchor to place the block at. Omit to append at end of file. */
+	anchor?: LineRange;
+	placement?: MovePlacement;
+	/** Remove the source range (a move); false copies it. */
+	removeSource: boolean;
+}
+
+/**
+ * Copy or move a line range to another position in the SAME file.
+ *
+ * Computed as ONE pass over the original lines, never as "insert then delete by the old
+ * line numbers": inserting shifts every line below it, so a subsequent delete addressed
+ * against the pre-insert numbering removes the wrong lines. That failure is silent —
+ * plausible-looking output with a neighbouring function truncated — which is why the
+ * source and destination are resolved together here rather than composed from the
+ * single-range helpers.
+ *
+ * An anchor inside the source range is rejected: "move these lines to somewhere between
+ * these lines" has no meaningful result, and picking one would be a guess.
+ */
+export function relocateRange(text: string, source: LineRange, options: MoveOptions): string {
+	const { lines, trailingNewline } = splitLines(text);
+	assertRange(source, lines.length);
+	const sourceEnd = Math.min(source.endLine, lines.length);
+	const block = lines.slice(source.startLine - 1, sourceEnd);
+	if (block.length === 0) {
+		throw new EditOpError(`Source range ${source.startLine}-${source.endLine} selected no lines.`);
+	}
+
+	const anchor = options.anchor;
+	if (anchor) {
+		assertRange(anchor, lines.length);
+		const anchorEnd = Math.min(anchor.endLine, lines.length);
+		// Overlap in either direction is ambiguous, not just anchor-inside-source.
+		const overlaps = anchor.startLine <= sourceEnd && source.startLine <= anchorEnd;
+		if (overlaps) {
+			throw new EditOpError(
+				`Destination ${anchor.startLine}-${anchorEnd} overlaps the source ${source.startLine}-${sourceEnd}; ` +
+					"pick a destination outside the range being moved.",
+			);
+		}
+	}
+
+	// The insertion point in ORIGINAL line numbering (0-based index to insert before).
+	const insertAt = anchor
+		? options.placement === "after"
+			? Math.min(anchor.endLine, lines.length)
+			: anchor.startLine - 1
+		: lines.length;
+
+	// Indent the block to its destination, so a method moved into a deeper scope lands
+	// correctly rather than keeping the source's indentation.
+	const anchorIndent = anchor
+		? indentOf(lines[anchor.startLine - 1])
+		: indentOf(lines[insertAt - 1]);
+	const placed = splitLines(reindentBlock(joinLines(block, false), anchorIndent)).lines;
+
+	const out: string[] = [];
+	for (let i = 0; i <= lines.length; i++) {
+		if (i === insertAt) out.push(...placed);
+		if (i === lines.length) break;
+		// Skipping the source here is what makes this one pass: the destination index was
+		// computed against the original numbering and is honoured above regardless.
+		const inSource = i >= source.startLine - 1 && i < sourceEnd;
+		if (options.removeSource && inSource) continue;
+		const line = lines[i];
+		if (line !== undefined) out.push(line);
+	}
+
+	if (out.length === 0) return "";
+	return joinLines(out, trailingNewline);
+}
+
+/**
+ * The block a cross-file copy/move sends to another file, indented at column 0.
+ *
+ * Returned separately from the destination write because the two files are two distinct
+ * authorized writes; this is just the payload.
+ */
+export function extractBlock(text: string, source: LineRange): string {
+	const { lines } = splitLines(text);
+	assertRange(source, lines.length);
+	const end = Math.min(source.endLine, lines.length);
+	const block = lines.slice(source.startLine - 1, end);
+	if (block.length === 0) {
+		throw new EditOpError(`Source range ${source.startLine}-${source.endLine} selected no lines.`);
+	}
+	// Rebased to column 0: the destination decides the final indent, and carrying the
+	// source's leading whitespace would nest the block by however deep it used to be.
+	return reindentBlock(joinLines(block, false), "");
+}
+
 export interface SubstituteOptions {
 	/** Regex flags; `g` and `i` are honoured, others rejected. */
 	flags?: string;
@@ -236,4 +337,76 @@ export function substituteInRange(
 	}
 
 	return { text: joinLines(next, trailingNewline), replacements };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Batch application.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** One already-addressed operation in a batch. */
+export interface BatchOperation {
+	/** Resolved source range, in ORIGINAL file line numbers. */
+	range: LineRange;
+	apply: (text: string, range: LineRange) => string;
+	/** For error messages: which operation this was, 1-based as the caller listed it. */
+	index: number;
+	/** For error messages: what it does, e.g. `delete` or `replace`. */
+	label: string;
+}
+
+/**
+ * Apply several operations to one text as a single unit.
+ *
+ * ── Why every address is relative to the ORIGINAL file ───────────────────────────────
+ * Applying in the caller's order makes each operation's address depend on how much the
+ * previous ones shifted the file — the model would have to predict the intermediate state
+ * to write the second address, which is not something it can do reliably. So operations are
+ * applied from the BOTTOM UP: a change below never moves the lines above it, so every
+ * address means what it meant when the batch was written. This is the only predictable
+ * semantics, and it is what the tool documents.
+ *
+ * ── Why overlaps are rejected outright ───────────────────────────────────────────────
+ * Two operations touching the same line have no defined combined result: whichever runs
+ * second sees text the first rewrote, so the outcome depends on ordering the caller did not
+ * choose. Rejecting the whole batch is the honest answer; picking an order would produce a
+ * plausible file that nobody asked for.
+ *
+ * Atomicity is structural rather than transactional: this returns ONE final string, so a
+ * failure part-way through throws and no intermediate state is ever written to disk.
+ */
+export function applyBatch(text: string, operations: readonly BatchOperation[]): string {
+	if (operations.length === 0) throw new EditOpError("A batch needs at least one operation.");
+
+	const { lines } = splitLines(text);
+	for (const op of operations) assertRange(op.range, lines.length);
+
+	// Sorted by start line so overlap detection only has to compare neighbours.
+	const ordered = [...operations].sort((a, b) => a.range.startLine - b.range.startLine);
+	for (let i = 1; i < ordered.length; i++) {
+		const previous = ordered[i - 1];
+		const current = ordered[i];
+		if (!previous || !current) continue;
+		if (rangesOverlap(previous.range, current.range)) {
+			throw new EditOpError(
+				`Operations ${previous.index} (${previous.label}, L${previous.range.startLine}-${previous.range.endLine}) and ` +
+					`${current.index} (${current.label}, L${current.range.startLine}-${current.range.endLine}) overlap. ` +
+					"Every address in a batch is relative to the original file, so overlapping ranges have no defined result — split them into separate calls.",
+			);
+		}
+	}
+
+	let result = text;
+	// Bottom-up: this is what keeps the remaining addresses valid.
+	for (let i = ordered.length - 1; i >= 0; i--) {
+		const op = ordered[i];
+		if (!op) continue;
+		try {
+			result = op.apply(result, op.range);
+		} catch (error) {
+			throw new EditOpError(
+				`Operation ${op.index} (${op.label}) failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+	return result;
 }
