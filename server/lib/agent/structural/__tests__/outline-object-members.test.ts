@@ -55,7 +55,10 @@ describeWithGrammar("object literal members", () => {
 		const memberNames = provider?.children?.map((c) => c.name) ?? [];
 		expect(memberNames).toContain("supports");
 		expect(memberNames).toContain("outline");
-		expect(memberNames).toContain("id");
+		// `id: "tree-sitter"` is a data key, deliberately NOT an outline row: including
+		// scalars recursed JSON-schema-shaped literals into dozens of `*.description` /
+		// `*.type` entries. Behaviour is structure; values are not.
+		expect(memberNames).not.toContain("id");
 	});
 
 	test("a method's locals nest under the method, not beside the object", async () => {
@@ -73,20 +76,54 @@ describeWithGrammar("object literal members", () => {
 		expect(run?.children?.map((c) => c.name)).toEqual(["leaked"]);
 	});
 
-	test("a function-valued key reads as a method, a data key as a property", async () => {
+	test("function-valued keys are methods; data keys are omitted entirely", async () => {
 		const nodes = flatten(
 			await outlineOf(`const config = {
 	handler: (req: Request) => respond(req),
 	fallback: function named() {},
 	retries: 3,
 	label: "x",
+	tags: ["a", "b"],
 };
 `),
 		);
 		expect(nodes.find((n) => n.name === "handler")?.kind).toBe("method");
 		expect(nodes.find((n) => n.name === "fallback")?.kind).toBe("method");
-		expect(nodes.find((n) => n.name === "retries")?.kind).toBe("property");
-		expect(nodes.find((n) => n.name === "label")?.kind).toBe("property");
+		// Scalars and arrays carry no behaviour, so they are values rather than structure.
+		expect(nodes.find((n) => n.name === "retries")).toBeUndefined();
+		expect(nodes.find((n) => n.name === "label")).toBeUndefined();
+		expect(nodes.find((n) => n.name === "tags")).toBeUndefined();
+	});
+
+	test("a data-only object literal produces no member rows at all", async () => {
+		// The motivating case: a JSON-schema literal used to expand into
+		// `schema.properties.file_path.description` and dozens of siblings.
+		const nodes = flatten(
+			await outlineOf(`const schema = {
+	type: "object",
+	properties: {
+		file_path: { description: "a path", type: "string" },
+		mode: { description: "a mode", type: "string" },
+	},
+	required: ["file_path"],
+};
+`),
+		);
+		expect(nodes.map((n) => n.name)).toEqual(["schema"]);
+	});
+
+	test("a nested object is kept when it contains behaviour", async () => {
+		const nodes = await outlineOf(`const routes = {
+	api: {
+		health() {},
+	},
+	config: { retries: 3 },
+};
+`);
+		const members = nodes[0]?.children?.map((c) => c.name) ?? [];
+		// `api` earns its row by giving `health` context; `config` holds only data.
+		expect(members).toContain("api");
+		expect(members).not.toContain("config");
 	});
 
 	test("a function-valued key shows the value's signature, not the pair's", async () => {

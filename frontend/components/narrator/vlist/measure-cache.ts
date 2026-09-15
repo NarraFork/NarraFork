@@ -760,6 +760,7 @@ function leafTextRevision(d: Record<string, unknown>): string {
 		"cap",
 		"codeLang",
 		"codeLangPath",
+		"customHighlight",
 		"sourcePath",
 		"kind",
 	] as const) {

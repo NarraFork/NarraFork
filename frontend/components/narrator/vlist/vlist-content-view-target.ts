@@ -26,6 +26,7 @@ export interface VListViewTarget {
 	text: string;
 	codeLang?: string;
 	codeLangPath?: string;
+	customHighlight?: "struct-view";
 	truncated?: boolean;
 	rowShowsPrefix?: boolean;
 	sourceInline?: boolean;
@@ -63,6 +64,7 @@ function targetFromModel(
 		...(title ? { title } : {}),
 		...(model.codeLang ? { codeLang: model.codeLang } : {}),
 		...(model.codeLangPath ? { codeLangPath: model.codeLangPath } : {}),
+		...(model.customHighlight ? { customHighlight: model.customHighlight } : {}),
 		...(model.textTruncated ? { truncated: true } : {}),
 		...(rowShowsPrefix ? { rowShowsPrefix: true } : {}),
 		...(model.format === "markdown" ? { sourceInline: true } : {}),

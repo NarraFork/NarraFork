@@ -34,6 +34,11 @@ import { DiffContent } from "@frontend/components/narrator/diff/DiffContent";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import {
+	STRUCT_THEME_DARK,
+	STRUCT_THEME_LIGHT,
+	tokenizeStructViewBody,
+} from "@frontend/lib/struct-view-tokens";
+import {
 	Badge,
 	Box,
 	Button,
@@ -49,6 +54,7 @@ import {
 	ThemeIcon,
 	Tooltip,
 	UnstyledButton,
+	useComputedColorScheme,
 } from "@mantine/core";
 import {
 	CARD_SHIMMER_CLASS,
@@ -1405,6 +1411,27 @@ function HighlightedBody({ text, lang }: { text: string; lang: string | undefine
 }
 
 /**
+ * The same body, coloured by a report tokenizer instead of a language grammar.
+ *
+ * A separate component rather than a branch inside `HighlightedBody` because the two
+ * routes use different hooks and hooks cannot be called conditionally. Both end at
+ * `TokenFlowText`, so the exactness check and the plain-text fallback apply identically.
+ */
+function CustomHighlightedBody({ text, kind }: { text: string; kind: "struct-view" }) {
+	const dark = useComputedColorScheme("dark") !== "light";
+	// Synchronous: unlike Shiki there is no grammar or WASM to fetch, so there is nothing
+	// to cache and no pending state to render around.
+	const tokens = useMemo(
+		() =>
+			kind === "struct-view"
+				? tokenizeStructViewBody(text, dark ? STRUCT_THEME_DARK : STRUCT_THEME_LIGHT)
+				: null,
+		[text, kind, dark],
+	);
+	return <TokenFlowText text={text} tokens={tokens} />;
+}
+
+/**
  * Test-only handle on the timing breakdown body. Mantine's Popover dropdown is
  * portaled and only mounts while open, so a static render of the header cannot
  * reach the breakdown — exported so RenderToolCall.timing.test.tsx can assert the
@@ -1875,6 +1902,8 @@ export function RenderToolBody({
 								}}
 							/>
 						</div>
+					) : model.customHighlight && !showSource ? (
+						<CustomHighlightedBody text={model.text ?? ""} kind={model.customHighlight} />
 					) : (
 						<HighlightedBody
 							text={model.text ?? ""}

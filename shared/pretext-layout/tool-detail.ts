@@ -193,6 +193,19 @@ export interface ToolCappedDetail {
 	 * Height-neutral.
 	 */
 	codeLangPath?: string;
+	/**
+	 * RENDER-ONLY: colour this body with a bespoke tokenizer instead of a language
+	 * grammar.
+	 *
+	 * For bodies that are structured REPORTS rather than code. A language grammar
+	 * highlights those confidently wrongly — on StructView `outline` rows it painted our
+	 * `exported`/`refs:3` annotations with the function-name colour, left `variable`
+	 * entirely grey (not a TS keyword), and split `L13-27` into a subtraction.
+	 *
+	 * A string rather than a boolean so a second report-shaped tool can add its own
+	 * tokenizer without another field. Height-neutral, like the two fields above.
+	 */
+	customHighlight?: "struct-view";
 }
 
 /** One SpecTasks row: text drives wrapping; status/protected drive the glyph. */
@@ -1473,6 +1486,74 @@ const STRUCTURE_MODE_COLORS: Record<string, string> = {
 };
 
 /**
+ * Body height cap per StructView mode.
+ *
+ * The cap is the scroll box's MAX height, so it should match how long a mode's output
+ * typically is. Everything used to share `code` (200px, ~13 lines), which put a 68-line
+ * report and a 330-line outline into the same small window — defeating the point of
+ * `report`, whose whole value is seeing five sections at once.
+ *
+ * Only the existing cap tiers are reused; adding a per-tool tier would turn
+ * `DETAIL_CAPS` into a registry.
+ */
+const STRUCTURE_MODE_CAPS: Record<string, DetailCapKind> = {
+	// Pinpoint lookups: short by construction.
+	extract: "code",
+	print: "code",
+	enclosing: "code",
+	imports: "code",
+	// Listings: routinely dozens to hundreds of lines. 300px rather than 400 because
+	// past a certain point a taller box only costs screen without showing the end.
+	outline: "agent-result",
+	api: "agent-result",
+	refs: "agent-result",
+	calls: "agent-result",
+	tree: "agent-result",
+	// The one mode designed to be read in full.
+	report: "knowledge",
+};
+
+/**
+ * Modes whose body is real source of the target file, so a LANGUAGE grammar applies.
+ *
+ * Only these two. The `   109│` line-number prefix does not disturb highlighting —
+ * verified against the real tokenizer, the remaining tokens come out identical to the
+ * un-prefixed text, with `109` merely coloured as a numeric literal, the same thing
+ * `Read` already does.
+ *
+ * Every other mode emits a structured report and goes to the bespoke tokenizer instead.
+ * An earlier version sent the table-shaped modes here on the grounds that their rows
+ * contain real signature fragments; that held for the simplest row and broke on the rest
+ * (`variable flat` uncoloured while `refs` was coloured, `exported` painted as a function
+ * name, `L13-27` split on the hyphen).
+ */
+const STRUCTURE_SOURCE_MODES = new Set(["extract", "print"]);
+
+/** Counts that are meaningful per mode, so a card only shows what its mode produced. */
+const STRUCTURE_MODE_COUNTS: Record<string, ReadonlyArray<[string, string]>> = {
+	outline: [["declarations", "decl"]],
+	api: [["exports", "exports"]],
+	imports: [
+		["imports", "imports"],
+		["exports", "exports"],
+	],
+	tree: [["elements", "elements"]],
+	refs: [
+		["declarations", "decl"],
+		["singleReference", "refs:1"],
+	],
+	calls: [["distinctCalls", "callees"]],
+	print: [
+		["blocks", "blocks"],
+		["printedLines", "lines"],
+		["totalLines", "of"],
+	],
+	report: [["declarations", "decl"]],
+	extract: [],
+	enclosing: [],
+};
+
+/**
  * StructView's detail card.
  *
  * Separate from `classifySearch` because the two share no input fields: routing
@@ -1495,13 +1576,16 @@ function classifyStructure(
 	const mode = extractField(inputJson, "mode") || "outline";
 	const output = resolveDisplayText(outputJson);
 
+	// Three chip colour groups, so one glance separates "which mode" from "with what
+	// argument" from "how big the result". Arguments previously split across gray and
+	// cyan, which collided with the mode chip and the count chips respectively.
 	const detailChips = chips([
 		chip(mode, STRUCTURE_MODE_COLORS[mode] ?? "indigo"),
 		chip(extractField(inputJson, "symbol"), "grape"),
-		chip(extractField(inputJson, "address"), "gray"),
-		chip(extractField(inputJson, "position"), "gray"),
-		chip(extractField(inputJson, "kind"), "cyan"),
-		chip(extractField(inputJson, "filter"), "cyan"),
+		chip(extractField(inputJson, "address"), "grape"),
+		chip(extractField(inputJson, "position"), "grape"),
+		chip(extractField(inputJson, "kind"), "grape"),
+		chip(extractField(inputJson, "filter"), "grape"),
 		// A degraded result means heuristics, not parsing. That qualifier has to be
 		// visible on the card itself — burying it in a trailing note inside the output
 		// is how an approximate answer gets read as an exact one.
@@ -1510,16 +1594,12 @@ function classifyStructure(
 		metadata?.ambiguous === true ? chip("ambiguous", "orange") : null,
 	]);
 
-	const statChips = chips([
-		countChip(metadata, "declarations", "decl"),
-		countChip(metadata, "exports", "exports"),
-		countChip(metadata, "imports", "imports"),
-		countChip(metadata, "elements", "elements"),
-		countChip(metadata, "distinctCalls", "callees"),
-		countChip(metadata, "singleReference", "refs:1"),
-		countChip(metadata, "blocks", "blocks"),
-		countChip(metadata, "printedLines", "lines"),
-	]);
+	// Only the counts this mode actually produces. Previously every numeric metadata key
+	// was tried and zero/absent ones filtered out, which worked but stated no intent —
+	// a `print` card would have shown a declaration count if one ever leaked in.
+	const statChips = chips(
+		(STRUCTURE_MODE_COUNTS[mode] ?? []).map(([key, label]) => countChip(metadata, key, label)),
+	);
 
 	const providerLabel = nonEmptyString(metadata?.provider);
 	const languageLabel = nonEmptyString(metadata?.languageId);
@@ -1552,14 +1632,25 @@ function classifyStructure(
 		]);
 	}
 
+	// Two highlighting routes, never both: real source gets a language grammar, reports get
+	// the tokenizer written for their own grammar.
+	const isSource = STRUCTURE_SOURCE_MODES.has(mode);
+
 	return sections([
 		headerSection,
-		// `code` cap, not prose: outline/report output is a column-aligned table, and
-		// prose reflowing would destroy the alignment that makes it readable.
+		// `format: "code"` throughout: every mode's output is column-aligned, and prose
+		// reflowing would destroy the alignment that makes it readable. Highlighting is
+		// render-only and height-neutral (it colours characters inside the same box), so
+		// neither route affects the cap or the measured height.
 		textSection("output.main", outputJson, "output", {
-			cap: "code",
+			cap: STRUCTURE_MODE_CAPS[mode] ?? "code",
 			contentLines: countLines(output),
 			text: output,
+			format: "code" as const,
+			// The PATH, not a resolved language id: this layer is purity-guarded and cannot
+			// import the frontend's `getShikiLang`.
+			...(isSource && filePath ? { codeLangPath: filePath } : {}),
+			...(isSource ? {} : { customHighlight: "struct-view" as const }),
 		}),
 	]);
 }

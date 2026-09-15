@@ -189,6 +189,14 @@ function visit(node: SyntaxNode, state: WalkState, ctx: WalkContext): RichOutlin
 		return [];
 	}
 
+	// An object-literal key is only structure when it carries behaviour. Including data
+	// keys recursed a JSON-schema literal into pure noise: 40 of one file's 200 entries
+	// were things like `rawJsonSchema.properties.file_path.description`, which nobody
+	// wants in an outline, and it pushed the report's top-level section to 50 rows.
+	if (node.type === "pair" && !isStructuralPair(node)) {
+		return walkChildren(node, state, ctx);
+	}
+
 	const name = readName(node, rule.nameField ?? "name", rule.nameFallback);
 	// An unnamed declaration is real in some grammars (Rust `impl`), so it gets a
 	// synthesized label rather than being dropped.
@@ -244,6 +252,50 @@ function visit(node: SyntaxNode, state: WalkState, ctx: WalkContext): RichOutlin
 	}
 
 	return [outlineNode];
+}
+
+/** Function-valued node types, i.e. the ones that make an object key behaviour. */
+const FUNCTION_VALUE_TYPES = new Set(["arrow_function", "function_expression", "function"]);
+
+/** How deep to look for a function inside a nested object before giving up. */
+const STRUCTURAL_PAIR_MAX_DEPTH = 3;
+
+/**
+ * Does this object-literal key carry behaviour worth an outline row?
+ *
+ * Yes for a function value (`{ handler: () => {} }`) and for a nested object that
+ * contains one somewhere (`{ routes: { get() {} } }`) — in the latter the intermediate
+ * key is the only thing giving those methods context.
+ *
+ * No for scalars, arrays and data-only objects. Those are values, not structure, and
+ * treating them as declarations is what turned a JSON-schema literal into dozens of
+ * meaningless `*.description` / `*.type` rows.
+ *
+ * Depth-bounded because the alternative is an unbounded scan of an arbitrarily deep data
+ * structure on every pair.
+ */
+function isStructuralPair(node: SyntaxNode): boolean {
+	const value = node.childForFieldName("value");
+	if (!value) return false;
+	if (FUNCTION_VALUE_TYPES.has(value.type)) return true;
+	if (value.type === "object") return containsFunctionMember(value, 0);
+	return false;
+}
+
+function containsFunctionMember(objectNode: SyntaxNode, depth: number): boolean {
+	if (depth > STRUCTURAL_PAIR_MAX_DEPTH) return false;
+	for (let i = 0; i < objectNode.childCount; i++) {
+		const child = objectNode.child(i);
+		if (!child?.isNamed) continue;
+		// A shorthand method (`{ foo() {} }`) is already a function member.
+		if (child.type === "method_definition") return true;
+		if (child.type !== "pair") continue;
+		const value = child.childForFieldName("value");
+		if (!value) continue;
+		if (FUNCTION_VALUE_TYPES.has(value.type)) return true;
+		if (value.type === "object" && containsFunctionMember(value, depth + 1)) return true;
+	}
+	return false;
 }
 
 /**

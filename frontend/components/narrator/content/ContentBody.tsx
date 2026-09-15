@@ -1,12 +1,18 @@
 import { getShikiLang } from "@frontend/lib/shiki-lang";
-import { Code } from "@mantine/core";
+import {
+	STRUCT_THEME_DARK,
+	STRUCT_THEME_LIGHT,
+	tokenizeStructViewBody,
+} from "@frontend/lib/struct-view-tokens";
+import { Code, useComputedColorScheme } from "@mantine/core";
 import type { FileReferenceContext } from "@shared/file-reference";
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { DiffDocument } from "@shared/pretext-layout/diff-core";
-import { type CSSProperties, lazy, Suspense } from "react";
+import { type CSSProperties, lazy, Suspense, useMemo } from "react";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import { DiffContent } from "../diff/DiffContent";
 import { MarkdownContent } from "../markdown/MarkdownContent";
+import { TokenFlowText } from "../vlist/render/TokenLines";
 
 const HighlightedCode = lazy(() =>
 	import("../markdown/HighlightedCode").then((module) => ({ default: module.HighlightedCode })),
@@ -21,6 +27,8 @@ export interface ContentBodyProps {
 	showSource?: boolean;
 	language?: string;
 	codeLangPath?: string;
+	/** Colour a structured report by its own grammar instead of a language's. */
+	customHighlight?: "struct-view";
 	contentWidth?: number;
 	streaming?: boolean;
 	maxHighlightChars?: number;
@@ -31,6 +39,19 @@ export interface ContentBodyProps {
 export function contentLanguage(language?: string, path?: string): string | undefined {
 	const resolved = language || (path ? getShikiLang(path) : undefined);
 	return resolved === "text" ? undefined : resolved;
+}
+
+/** Report colours for the chunked surface; the vlist has its own copy of this pairing. */
+function CustomHighlightedContent({ text, kind }: { text: string; kind: "struct-view" }) {
+	const dark = useComputedColorScheme("dark") !== "light";
+	const tokens = useMemo(
+		() =>
+			kind === "struct-view"
+				? tokenizeStructViewBody(text, dark ? STRUCT_THEME_DARK : STRUCT_THEME_LIGHT)
+				: null,
+		[text, kind, dark],
+	);
+	return <TokenFlowText text={text} tokens={tokens} />;
 }
 
 export function contentWrapStyle(wordWrap: boolean): CSSProperties {
@@ -47,6 +68,7 @@ export function ContentBody({
 	showSource = false,
 	language,
 	codeLangPath,
+	customHighlight,
 	contentWidth,
 	streaming,
 	maxHighlightChars,
@@ -94,6 +116,16 @@ export function ContentBody({
 			{text}
 		</Code>
 	);
+	// A report body is coloured by its own tokenizer, not a language grammar. Kept in sync
+	// with the vlist path on purpose: two card surfaces showing the same body in different
+	// colours would be worse than leaving one of them plain.
+	if (customHighlight && !showSource && format !== "markdown") {
+		return (
+			<Code block style={paintStyle}>
+				<CustomHighlightedContent text={text} kind={customHighlight} />
+			</Code>
+		);
+	}
 	return lang && format !== "markdown" ? (
 		<Suspense fallback={plain}>
 			<HighlightedCode
