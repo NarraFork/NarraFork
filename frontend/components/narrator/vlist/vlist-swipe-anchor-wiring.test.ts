@@ -21,7 +21,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const SHELL = readFileSync(join(import.meta.dir, "PretextExactMessageList.tsx"), "utf8");
-const SWIPE_STATE = readFileSync(join(import.meta.dir, "..", "swipeState.ts"), "utf8");
+const SWIPE_STATE = readFileSync(join(import.meta.dir, "..", "scroll", "swipeState.ts"), "utf8");
 
 describe("vlist swipe-anchor pinning", () => {
 	it("pins the swipe anchor's row into the mounted window", () => {

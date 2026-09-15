@@ -19,6 +19,16 @@ let frames: Map<number, FrameRequestCallback>;
 let positions: WeakMap<object, number>;
 let writes: number[];
 let restore: Map<string, PropertyDescriptor | undefined>;
+/**
+ * linkedom shares ONE `HTMLElement.prototype` across every `parseHTML` window, so
+ * the geometry stubs below are process-global. Without restoring them, later test
+ * FILES inherit this file's fake layout — and the ones that assert "no geometry is
+ * read" then fail on a stub they never installed. Which files break depends purely
+ * on enumeration order, so the damage is invisible until a rename shuffles it.
+ */
+let protoRestore: Map<string, PropertyDescriptor | undefined>;
+/** The exact prototype the stubs were installed on (globals are restored first). */
+let stubbedProto: object;
 let nowSpy: ReturnType<typeof spyOn>;
 let observers: Observer[];
 class Observer {
@@ -81,7 +91,15 @@ beforeEach(async () => {
 		restore.set(key, descriptor);
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
-	Object.defineProperties(window.HTMLElement.prototype, {
+	const geometryProto = window.HTMLElement.prototype;
+	stubbedProto = geometryProto;
+	protoRestore = new Map(
+		["clientHeight", "clientWidth", "offsetWidth", "scrollHeight", "scrollTop"].map((key) => [
+			key,
+			Object.getOwnPropertyDescriptor(geometryProto, key),
+		]),
+	);
+	Object.defineProperties(geometryProto, {
 		clientHeight: { configurable: true, get: () => 200 },
 		clientWidth: { configurable: true, get: () => 400 },
 		offsetWidth: { configurable: true, get: () => 400 },
@@ -129,6 +147,12 @@ afterEach(async () => {
 	for (const [key, descriptor] of restore) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
+	}
+	// The prototype is shared process-wide (see protoRestore): hand it back exactly
+	// as found so the next test file measures its own DOM, not this file's stubs.
+	for (const [key, descriptor] of protoRestore) {
+		if (descriptor) Object.defineProperty(stubbedProto, key, descriptor);
+		else Reflect.deleteProperty(stubbedProto, key);
 	}
 });
 

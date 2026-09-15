@@ -19,7 +19,15 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const COMPONENT_DIR = join(import.meta.dir, "..", "..", "frontend", "components", "narrator");
+const COMPONENT_DIR = join(
+	import.meta.dir,
+	"..",
+	"..",
+	"frontend",
+	"components",
+	"narrator",
+	"file-panel",
+);
 
 /** Every component that renders inside the "File modifications" panel. */
 const PANEL_COMPONENTS = [

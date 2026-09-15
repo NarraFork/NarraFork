@@ -40,7 +40,7 @@
 
 - **[当前事实]** `container-service.ts` 通过 rootless Podman/compose 管理章节容器，包含 Podman 检测、rootless 环境、compose 启停、端口分配和代理模式；它的输入是章节 worktree 中的 compose 配置。
 - **[当前事实]** `benchmark-container.ts` 另有直接 `podman run -d` 的生命周期，支持 bind mount、memory limit、`exec`、超时和销毁；这说明直接 Podman runner 可行，但该服务不是插件授权/审计实现。
-- **[当前事实]** `frontend/components/narrator/WebviewPanel.tsx` 的普通 webview sandbox 使用 `allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox`，并允许用户编辑任意 HTTP(S) URL；它面向用户网页，不能作为第三方插件 iframe 默认策略。
+- **[当前事实]** `frontend/components/narrator/browser/WebviewPanel.tsx` 的普通 webview sandbox 使用 `allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox`，并允许用户编辑任意 HTTP(S) URL；它面向用户网页，不能作为第三方插件 iframe 默认策略。
 - **[当前事实]** 现有 shares HTML 响应设置了受限 CSP，但包含用户文件分享场景的策略，不能直接代替插件 asset shell 的 CSP。
 
 ## 2. 威胁模型

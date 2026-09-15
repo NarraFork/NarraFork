@@ -456,7 +456,7 @@ export interface ToolSectionsDetail {
 export type ToolDetailData = ToolSectionsDetail;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Pure helpers (mirrored in frontend/components/narrator/tool-display.ts — keep
+// Pure helpers (mirrored in frontend/components/narrator/tool-call/tool-display.ts — keep
 // the two copies in sync). Truncation is FIELD-LEVEL: the wrapper shape is
 // unchanged but it now sits on the oversized string LEAF, so these readers work
 // on ordinary fields instead of scraping a preview blob.
@@ -1728,7 +1728,7 @@ function nonEmptyString(value: unknown): string | undefined {
 
 /**
  * Split a multi-select answer (`"Alpha, Beta"`) into its parts. Mirrors
- * `splitAnswerParts` in frontend/components/narrator/ask-user-question-utils.ts
+ * `splitAnswerParts` in frontend/components/narrator/question/ask-user-question-utils.ts
  * (which this file cannot import — purity guard).
  */
 function askAnswerParts(answer: string): string[] {

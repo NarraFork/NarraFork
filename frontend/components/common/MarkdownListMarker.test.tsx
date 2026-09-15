@@ -16,7 +16,7 @@ function block(checked: boolean) {
 
 describe("MarkdownListMarker", () => {
 	it("preserves task marker classes through CSS Modules and excludes flowtoken overrides", async () => {
-		const file = new URL("../narrator/MarkdownContent.module.css", import.meta.url);
+		const file = new URL("../narrator/markdown/MarkdownContent.module.css", import.meta.url);
 		const config = await resolveConfig(
 			{
 				configFile: false,

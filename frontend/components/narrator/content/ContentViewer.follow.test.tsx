@@ -55,7 +55,17 @@ beforeEach(() => {
 	);
 	for (const [key, value] of Object.entries(values))
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
-	Object.defineProperties(window.HTMLElement.prototype, {
+	// linkedom shares one HTMLElement.prototype across every parseHTML window, so
+	// these stubs are process-global: leaving them installed hands this file's fake
+	// layout to later test FILES, breaking the ones that assert no geometry is read.
+	const geometryProto = window.HTMLElement.prototype;
+	const previousGeometry = new Map(
+		["scrollTop", "clientHeight", "clientWidth", "scrollHeight"].map((key) => [
+			key,
+			Object.getOwnPropertyDescriptor(geometryProto, key),
+		]),
+	);
+	Object.defineProperties(geometryProto, {
 		scrollTop: { configurable: true, writable: true, value: 0 },
 		clientHeight: {
 			configurable: true,
@@ -80,6 +90,10 @@ beforeEach(() => {
 		for (const [key, descriptor] of previous) {
 			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 			else Reflect.deleteProperty(globalThis, key);
+		}
+		for (const [key, descriptor] of previousGeometry) {
+			if (descriptor) Object.defineProperty(geometryProto, key, descriptor);
+			else Reflect.deleteProperty(geometryProto, key);
 		}
 	};
 	frames.clear();

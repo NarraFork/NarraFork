@@ -15,7 +15,7 @@
  * coalescing and quota handling) rather than IndexedDB.
  *
  * Narrator attachments are the opposite case: never uploaded, so their bytes
- * have nowhere else to live. See `narrator/draft-image-attachments.ts`.
+ * have nowhere else to live. See `narrator/composer/draft-image-attachments.ts`.
  */
 
 import { readSession, removeSession, writeSession } from "@frontend/lib/session-store";

@@ -2,7 +2,7 @@
  * Single source of truth for the customizable narrator-header toolbar ids.
  *
  * Mirrors `shared/nav-layout.ts` deliberately: the frontend registry
- * (frontend/components/narrator/narrator-toolbar-items.tsx) and the server
+ * (frontend/components/narrator/header/narrator-toolbar-items.tsx) and the server
  * validator (server/lib/validators/settings.ts) both derive from this list, so
  * they cannot drift. In the nav case an id present on the frontend but missing
  * from the server enum made the layout silently unsavable (PATCH
@@ -14,7 +14,7 @@
  * the divider (i.e. eligible to be surfaced) and the *host* decides how many
  * actually fit: the desktop header MEASURES its available width and collapses
  * the rest into the overflow menu (see
- * `frontend/components/narrator/narrator-header-toolbar-capacity.ts`), while the
+ * `frontend/components/narrator/header/narrator-header-toolbar-capacity.ts`), while the
  * mobile header additionally applies the fixed cap below. Earlier the desktop
  * row rendered every surfaced entry and let the title compress instead, which
  * squeezed long titles down to a few characters.

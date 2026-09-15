@@ -34,7 +34,7 @@ NarraFork（Bun + Hono + SQLite/Drizzle 后端，React19 + Mantine v7 + TanStack
 - `frontend/routes/knowledge/index.tsx`：主页（浏览/审核中心/ACL admin 三 Tab + 新建集合/条目 Modal）。
 - `frontend/routes/knowledge/$entryId.tsx`：条目详情（正文直编 / 版本历史对比 / 我的草稿+实时diff+提交 / 提交审核面板）。
 - `frontend/components/knowledge/SubmissionReviewPanel.tsx`、`AclAdminPanel.tsx`。
-- 复用 `frontend/components/narrator/DiffView.tsx`（props：`oldStr` / `newStr` / `language` / `maxHeight` / `wordWrap`）。
+- 复用 `frontend/components/narrator/diff/DiffView.tsx`（props：`oldStr` / `newStr` / `language` / `maxHeight` / `wordWrap`）。
 - i18n：`frontend/lib/i18n.ts` 已注册 `knowledge` 命名空间 + 路由映射；`locales/{en,zh-CN}/knowledge.json` 已建；`nav.json` 已加 `knowledge` 键。
 - 导航：`AppRootLayout.tsx` 已加「知识库」NavLink（`IconDatabase`，指向 `/knowledge`）。
 

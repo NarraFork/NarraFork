@@ -22,7 +22,7 @@ import { join } from "node:path";
 
 const DIR = import.meta.dir;
 const SHELL = readFileSync(join(DIR, "PretextExactMessageList.tsx"), "utf8");
-const TRACE_ROW = readFileSync(join(DIR, "..", "TraceRowInteraction.tsx"), "utf8");
+const TRACE_ROW = readFileSync(join(DIR, "..", "trace", "TraceRowInteraction.tsx"), "utf8");
 const TOOL_META = readFileSync(join(DIR, "vlist-tool-meta.ts"), "utf8");
 
 /** The body of the shell's `resolveTraceRowIdentity`. */

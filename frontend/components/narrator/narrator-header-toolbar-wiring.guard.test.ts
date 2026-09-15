@@ -96,7 +96,7 @@ describe("header capacity measurement is wired to the DOM", () => {
 	 * trigger in, and that trigger IS inside the scanned loop.
 	 */
 	it("keeps the self-contained controls' own triggers at the same width", async () => {
-		for (const path of ["./ExecutionDeviceMenu.tsx", "./lod/NarratorLodMenu.tsx"]) {
+		for (const path of ["./model/ExecutionDeviceMenu.tsx", "./lod/NarratorLodMenu.tsx"]) {
 			const source = await read(path);
 			const triggers = source.split("<ActionIcon").slice(1);
 			expect(triggers.length).toBeGreaterThan(0);

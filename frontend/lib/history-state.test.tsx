@@ -648,7 +648,7 @@ describe("mobile Back sentinel entries", () => {
 			[
 				"../components/AppRootLayout.tsx",
 				"../routes/narrators/$narratorId.tsx",
-				"../components/narrator/ContentViewer.tsx",
+				"../components/narrator/content/ContentViewer.tsx",
 			].map((path) => Bun.file(new URL(path, import.meta.url)).text()),
 		);
 

@@ -272,7 +272,12 @@ function installIsolatedDom() {
 		requestAnimationFrame: { configurable: true, value: requestAnimationFrame },
 		cancelAnimationFrame: { configurable: true, value: cancelAnimationFrame },
 	});
-	Object.defineProperty(window.HTMLElement.prototype, "getBoundingClientRect", {
+	// linkedom shares one HTMLElement.prototype across every parseHTML window, so this
+	// stub is process-global and is handed back in restoreGlobals below — otherwise
+	// later test FILES inherit these fake rects instead of measuring their own DOM.
+	const geometryProto = window.HTMLElement.prototype;
+	const previousRect = Object.getOwnPropertyDescriptor(geometryProto, "getBoundingClientRect");
+	Object.defineProperty(geometryProto, "getBoundingClientRect", {
 		configurable: true,
 		value(this: HTMLElement) {
 			const explicitWidth = Number(this.getAttribute("data-measure-width"));
@@ -355,6 +360,8 @@ function installIsolatedDom() {
 			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 			else Reflect.deleteProperty(globalThis, key);
 		}
+		if (previousRect) Object.defineProperty(geometryProto, "getBoundingClientRect", previousRect);
+		else Reflect.deleteProperty(geometryProto, "getBoundingClientRect");
 	};
 }
 

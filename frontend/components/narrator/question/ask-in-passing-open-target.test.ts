@@ -24,7 +24,7 @@ import { resolveAskInPassingOpenPlan } from "./ask-in-passing-open-target";
 
 const CARD = readFileSync(join(import.meta.dir, "AskInPassingCard.tsx"), "utf8");
 const BRIDGE = readFileSync(
-	join(import.meta.dir, "vlist", "vlist-ask-in-passing-bridge.tsx"),
+	join(import.meta.dir, "..", "vlist", "vlist-ask-in-passing-bridge.tsx"),
 	"utf8",
 );
 

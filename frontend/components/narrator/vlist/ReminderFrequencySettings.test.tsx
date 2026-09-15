@@ -19,6 +19,8 @@ await i18n.init({
 let root: Root;
 let qc: QueryClient;
 const globals = new Map<string, PropertyDescriptor | undefined>();
+/** Undoes the shared-prototype geometry stubs installed in beforeEach. */
+let restoreGeometry: (() => void) | undefined;
 let makeEvent: (name: string) => Event;
 let setValue: (input: HTMLInputElement, value: string) => void;
 let settings = { agent: { tasksReminderInterval: 15, silentToolCallThreshold: 50 } };
@@ -46,7 +48,24 @@ beforeEach(() => {
 		detachEvent: { value() {}, configurable: true },
 		setSelectionRange: { value() {}, configurable: true },
 	});
-	Object.defineProperties(window.HTMLElement.prototype, {
+	// linkedom shares ONE HTMLElement.prototype across every parseHTML window, so these
+	// stubs are process-global. Leaving them installed hands this file's fake rects to
+	// later test FILES — including the ones asserting that no geometry is read at all,
+	// which then fail on a stub they never installed.
+	const geometryProto = window.HTMLElement.prototype;
+	const previousGeometry = new Map(
+		["getBoundingClientRect", "getClientRects"].map((key) => [
+			key,
+			Object.getOwnPropertyDescriptor(geometryProto, key),
+		]),
+	);
+	restoreGeometry = () => {
+		for (const [key, descriptor] of previousGeometry) {
+			if (descriptor) Object.defineProperty(geometryProto, key, descriptor);
+			else Reflect.deleteProperty(geometryProto, key);
+		}
+	};
+	Object.defineProperties(geometryProto, {
 		getBoundingClientRect: {
 			value: () => ({ x: 0, y: 0, top: 0, left: 0, right: 20, bottom: 20, width: 20, height: 20 }),
 			configurable: true,
@@ -116,6 +135,8 @@ afterEach(async () => {
 		else Reflect.deleteProperty(globalThis, key);
 	}
 	globals.clear();
+	restoreGeometry?.();
+	restoreGeometry = undefined;
 });
 
 async function render(source: string, narratorId: string | undefined = "owner") {

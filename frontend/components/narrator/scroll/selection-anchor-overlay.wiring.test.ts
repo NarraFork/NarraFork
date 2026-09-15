@@ -12,7 +12,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const PANEL = readFileSync(join(import.meta.dir, "NarratorPanel.tsx"), "utf8");
+const PANEL = readFileSync(join(import.meta.dir, "..", "NarratorPanel.tsx"), "utf8");
 
 describe("selection anchor overlay wiring", () => {
 	it("gates the producer through the tested pure rule", () => {

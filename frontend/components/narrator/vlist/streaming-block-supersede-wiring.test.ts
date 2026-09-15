@@ -3,7 +3,7 @@
  * surrounding machinery, not just its own decision table.
  *
  * The decision rules are pinned in
- * `frontend/components/narrator/streaming-block-supersede.test.ts`. What is pinned
+ * `frontend/components/narrator/streaming/streaming-block-supersede.test.ts`. What is pinned
  * HERE is what the fix could break elsewhere:
  *
  * 1. Ordinary streaming (no backgrounding) still shows the paragraph exactly once —

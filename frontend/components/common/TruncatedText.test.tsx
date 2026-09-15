@@ -82,7 +82,17 @@ function installIsolatedDom() {
 		Number(setTimeout(() => callback(0), 0));
 	const cancelAnimationFrame = (id: number) => clearTimeout(id);
 
-	Object.defineProperties(window.HTMLElement.prototype, {
+	// linkedom shares one HTMLElement.prototype across every parseHTML window, so
+	// these stubs are process-global and are handed back in restoreGlobals below —
+	// otherwise later test FILES inherit this file's fake text metrics.
+	const geometryProto = window.HTMLElement.prototype;
+	const previousGeometry = new Map(
+		["clientWidth", "scrollWidth"].map((key) => [
+			key,
+			Object.getOwnPropertyDescriptor(geometryProto, key),
+		]),
+	);
+	Object.defineProperties(geometryProto, {
 		clientWidth: { configurable: true, get: () => FAKE_BOX_WIDTH },
 		scrollWidth: {
 			configurable: true,
@@ -131,6 +141,10 @@ function installIsolatedDom() {
 		for (const [key, descriptor] of descriptors) {
 			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 			else Reflect.deleteProperty(globalThis, key);
+		}
+		for (const [key, descriptor] of previousGeometry) {
+			if (descriptor) Object.defineProperty(geometryProto, key, descriptor);
+			else Reflect.deleteProperty(geometryProto, key);
 		}
 	};
 }

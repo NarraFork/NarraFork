@@ -258,7 +258,7 @@ describe("mobile safe-area layout contract", () => {
 		}
 
 		const source = await Bun.file(
-			new URL("../components/narrator/ContentViewer.tsx", import.meta.url),
+			new URL("../components/narrator/content/ContentViewer.tsx", import.meta.url),
 		).text();
 		expect(source).toContain("fullScreen");
 		expect(source).toContain("content: SAFE_AREA_FULLSCREEN_MODAL_CONTENT_STYLE");
@@ -1055,7 +1055,7 @@ describe("mobile safe-area layout contract", () => {
 			loginRoute,
 		] = await Promise.all([
 			Bun.file(new URL("../components/AppRootLayout.tsx", import.meta.url)).text(),
-			Bun.file(new URL("../components/narrator/ContentViewer.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../components/narrator/content/ContentViewer.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/chapters/$chapterId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/settings.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/settings/oauth-apps.tsx", import.meta.url)).text(),
@@ -1101,6 +1101,15 @@ describe("mobile safe-area layout contract", () => {
 			Bun.file(new URL("../components/narrator/NarratorPanel.tsx", import.meta.url)).text(),
 			Bun.file(new URL("./safe-area.ts", import.meta.url)).text(),
 		]);
+		// The status row itself was extracted out of NarratorPanel; the panel now only
+		// FORWARDS the ownership flag into it. Both halves are checked, so neither the
+		// forwarding nor the single owner of the inset style can be dropped silently.
+		const statusBarHost = await Bun.file(
+			new URL(
+				"../components/narrator/interaction/NarratorInteractionStatusBar.tsx",
+				import.meta.url,
+			),
+		).text();
 
 		expect(appShell).toContain("installAuthenticatedAppShellRootLock()");
 		expect(appShell).toContain("className={APP_SHELL_CLASSNAME}");
@@ -1133,11 +1142,14 @@ describe("mobile safe-area layout contract", () => {
 		expect(narratorRoute).not.toContain('h="calc(100dvh - 60px)"');
 		expect(terminalPanel).not.toContain("kbHeight");
 		expect(terminalPanel).not.toContain("window.visualViewport");
-		expect(narratorPanel).toContain("<NarratorStatusBar");
-		expect(narratorPanel).toContain("ownsHorizontalSafeArea={ownsHorizontalSafeArea}");
-		expect(narratorPanel).not.toContain("getNarratorStatusInlineStyle");
-		expect(narratorPanel).not.toContain("env(safe-area-inset-left");
-		expect(narratorPanel).not.toContain("env(safe-area-inset-right");
+		expect(statusBarHost).toContain("<NarratorStatusBar");
+		expect(statusBarHost).toContain("ownsHorizontalSafeArea={props.ownsHorizontalSafeArea}");
+		expect(narratorPanel).toContain("ownsHorizontalSafeArea,");
+		for (const source of [narratorPanel, statusBarHost]) {
+			expect(source).not.toContain("getNarratorStatusInlineStyle");
+			expect(source).not.toContain("env(safe-area-inset-left");
+			expect(source).not.toContain("env(safe-area-inset-right");
+		}
 		expect(safeArea).toContain('visualViewport?.addEventListener("resize"');
 		expect(safeArea).toContain('visualViewport?.addEventListener("scroll"');
 		expect(safeArea).toContain('targetWindow.addEventListener("resize"');

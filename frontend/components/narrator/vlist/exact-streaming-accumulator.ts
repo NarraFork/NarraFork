@@ -2,7 +2,7 @@
  * exact-streaming-accumulator.ts — the exact shell's view of the shared text /
  * reasoning delta fold.
  *
- * The fold itself moved to `../streaming-delta-fold.ts` so the ALWAYS-ON chunked path
+ * The fold itself moved to `../streaming/streaming-delta-fold.ts` so the ALWAYS-ON chunked path
  * can share it: that path may not statically import `vlist/` (see
  * `vlist-isolation.guard.test.ts` — with the flag off, vlist code must never even be
  * fetched), while vlist importing outward is fine. Two copies of the fold is how the

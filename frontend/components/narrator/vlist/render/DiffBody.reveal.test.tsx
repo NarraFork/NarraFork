@@ -129,7 +129,7 @@ describe("source projection replaces the old prefix reveal chain", () => {
 	});
 	it("does not retain a second painter or IntersectionObserver reveal implementation", () => {
 		const tool = readFileSync(join(import.meta.dir, "RenderToolCall.tsx"), "utf8");
-		const diff = readFileSync(join(import.meta.dir, "../../DiffContent.tsx"), "utf8");
+		const diff = readFileSync(join(import.meta.dir, "../../diff/DiffContent.tsx"), "utf8");
 		for (const name of [
 			"__TEST__DiffLines",
 			"function DiffBody",
