@@ -36,7 +36,10 @@ const FILE_TOOLS = new Set(["Read", "Write", "Edit"]);
 // "Shell" is a legacy alias kept only so older stored history still classifies as
 // a shell call; the server always mints "Bash".
 const BASH_TOOLS = new Set(["Bash", "Shell", "Execute"]);
-const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
+// StructView is grouped with search rather than read: like Grep it answers a
+// question about a file (what's in it, where does this symbol live) instead of
+// handing back a file's contents, so the search glyph matches what the row means.
+const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find", "StructView"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
 const WEB_FETCH_TOOLS = new Set(["WebFetch"]);
 const SPEC_TASKS_URI = "spec://tasks.json";

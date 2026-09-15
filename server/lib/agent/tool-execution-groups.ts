@@ -6,6 +6,7 @@ const PARALLEL_SAFE_TOOL_NAMES = new Set([
 	"Read",
 	"Glob",
 	"Grep",
+	"StructView",
 	"WebSearch",
 	"WebFetch",
 	"Await",

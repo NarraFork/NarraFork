@@ -632,6 +632,7 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"Read",
 	"Grep",
 	"Glob",
+	"StructView",
 	"WebSearch",
 	"WebFetch",
 	"Await",

@@ -785,6 +785,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Edit",
 	"Glob",
 	"Grep",
+	"StructView",
 	"WebSearch",
 	"WebFetch",
 	"EnterPlanMode",

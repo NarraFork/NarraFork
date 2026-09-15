@@ -214,6 +214,7 @@
 	"tpToolDescEdit": "Perform exact string replacements in files.",
 	"tpToolDescGlob": "Fast file pattern matching using glob patterns.",
 	"tpToolDescGrep": "Search file contents using regex patterns.",
+	"tpToolDescStructView": "Read a file by its structure: outline, symbol bodies, public API.",
 	"tpToolDescWebSearch": "Search the web for current information.",
 	"tpToolDescWebFetch": "Fetch and extract content from web page URLs.",
 	"tpToolDescAgent": "Launch a subagent to handle isolated tasks.",

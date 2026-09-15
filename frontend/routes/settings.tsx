@@ -33,6 +33,7 @@ import {
 	IconServer,
 	IconShield,
 	IconShieldLock,
+	IconSitemap,
 	IconTerminal2,
 	IconUser,
 	IconUsers,
@@ -134,6 +135,9 @@ function SettingsLayout() {
 		// Personal, not instance-wide: a user registers their own machines here and
 		// sees only the devices they registered. Admins still get the full list.
 		{ to: "/settings/devices", label: t("devicesSection"), icon: <IconDeviceLaptop size={18} /> },
+		// Not admin-only: the grammar cache is a shared parser asset (like ripgrep),
+		// and gating it would leave non-admins stuck with heuristic structural output.
+		{ to: "/settings/grammars", label: t("grammarsSection"), icon: <IconSitemap size={18} /> },
 	];
 
 	const instanceItems: NavItem[] = [

@@ -36,6 +36,7 @@ const READ_TOOLS = Object.freeze([
 	"Read",
 	"Glob",
 	"Grep",
+	"StructView",
 	"WebSearch",
 	"WebFetch",
 	BASH_TOOL_NAME,

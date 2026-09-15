@@ -68,7 +68,14 @@ const MAX_OPERATION_ROWS = 1_000;
 // Larger inputs remain unknown unless frozen execution metadata identifies them.
 const MAX_INPUT_METADATA_BYTES = 16 * 1024;
 /** Unknown/plugin tools are not silently classified as having no disk effects. */
-const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "WebFetch"]);
+const READ_ONLY_TOOLS = new Set([
+	"Read",
+	"Glob",
+	"Grep",
+	"StructView",
+	"WebSearch",
+	"WebFetch",
+]);
 type WindowCoverage =
 	| { kind: "empty" }
 	| { kind: "too_large" }

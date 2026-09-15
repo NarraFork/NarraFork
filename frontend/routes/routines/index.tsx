@@ -1451,6 +1451,7 @@ const AVAILABLE_TOOLS = [
 	"Read",
 	"Glob",
 	"Grep",
+	"StructView",
 	"WebSearch",
 	"Bash",
 	"Write",

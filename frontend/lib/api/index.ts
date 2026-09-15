@@ -4,6 +4,7 @@ import { chatApi } from "./chat";
 import { apiBase } from "./client";
 import { devicesApi } from "./devices";
 import { gitApi } from "./git";
+import { grammarsApi } from "./grammars";
 import { integrationsApi } from "./integrations";
 import { knowledgeApi } from "./knowledge";
 import { miscApi } from "./misc";
@@ -32,6 +33,7 @@ export const api = {
 	...terminalsApi,
 	...settingsApi,
 	...gitApi,
+	...grammarsApi,
 	...integrationsApi,
 	...miscApi,
 	...modelCardsApi,
@@ -74,6 +76,7 @@ export {
 	readFetchErrorMessage,
 	setToken,
 } from "./client";
+export type { GrammarListResponse, GrammarStatus } from "./grammars";
 export type {
 	IntegrationAttentionItem,
 	IntegrationAttentionSeverity,

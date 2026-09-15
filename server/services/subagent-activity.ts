@@ -94,6 +94,8 @@ export function summarizeSubagentToolCall(
 		case "Write":
 		case "Edit":
 			return filePath || undefined;
+		case "StructView":
+			return joinParts(mode || undefined, filePath || undefined);
 		case "Grep":
 		case "Glob":
 			return joinParts(pattern || undefined, searchPath ? `in ${searchPath}` : undefined);

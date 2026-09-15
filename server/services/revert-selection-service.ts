@@ -1113,7 +1113,14 @@ export class RevertSelectionService {
 	}
 }
 
-const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "WebFetch"]);
+const READ_ONLY_TOOLS = new Set([
+	"Read",
+	"Glob",
+	"Grep",
+	"StructView",
+	"WebSearch",
+	"WebFetch",
+]);
 const REF_SELECT = `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrator_id AS narratorId, r.seq,
  coalesce(m.role,'assistant') AS role, r.segment_compact_id AS segmentCompactId, octet_length(m.content_json) AS contentBytes,
  octet_length(m.content_json) + coalesce(octet_length(m.content_text),0) + coalesce(octet_length(m.original_content_json),0) AS copyBytes,

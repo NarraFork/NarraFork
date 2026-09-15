@@ -5,14 +5,17 @@
  * 并根据白名单 + 危险模式检测判断是否可以自动放行。
  */
 
+// Embed the bash grammar for compiled single-executable mode. `import ... with
+// { type: "file" }` gives Bun an explicit asset edge so the WASM is available both
+// in dev and in packaged binaries. The core engine wasm is embedded the same way,
+// inside tree-sitter-runtime.ts.
 import embeddedBashWasm from "tree-sitter-bash/tree-sitter-bash.wasm" with { type: "file" };
-
-// Embed WASM files for compiled single-executable mode.
-// `import ... with { type: "file" }` gives Bun an explicit asset edge so the
-// WASM files are available both in dev and in packaged binaries.
-import embeddedTreeSitterWasm from "web-tree-sitter/tree-sitter.wasm" with { type: "file" };
 import { toForwardSlash } from "../platform-path";
 import { localPathSemantics, type TargetPathSemantics } from "./execution/path-semantics";
+import {
+	createTreeSitterParser,
+	loadTreeSitterLanguage,
+} from "./structural/tree-sitter-runtime";
 
 // ── 类型定义 ──────────────────────────────────────────────
 
@@ -1618,53 +1621,14 @@ async function getParser(): Promise<TreeSitterParser> {
 }
 
 async function initParser(): Promise<TreeSitterParser> {
-	const TreeSitter = await import("web-tree-sitter");
-	const Parser = (TreeSitter.Parser ?? TreeSitter.default) as TreeSitterParserCtor;
-	type TreeSitterModuleLike = {
-		Language?: { load(path: string | Uint8Array): Promise<unknown> };
-		default?: { Language?: { load(path: string | Uint8Array): Promise<unknown> } };
-	};
-	type TreeSitterParserCtor = {
-		init(options: { locateFile(): string }): Promise<void>;
-		new (): {
-			setLanguage(language: unknown): void;
-			parse(input: string): { rootNode: TreeSitterNode };
-		};
-	};
-	const treeSitterLike = TreeSitter as TreeSitterModuleLike;
-	const Language = treeSitterLike.Language ?? treeSitterLike.default?.Language;
-	if (!Language) {
-		throw new Error("web-tree-sitter Language API is unavailable");
-	}
-
-	// Parser.init ultimately lets Emscripten read tree-sitter.wasm through Node fs.
-	// In compiled single-executable mode Bun exposes imported assets via virtual
-	// $bunfs/~BUN paths, while require.resolve may still resolve to the build
-	// machine's node_modules path.  Materialize the explicitly imported assets into
-	// a real temp directory so dev and packaged binaries take the same path.
-	const { mkdtempSync, writeFileSync } = await import("node:fs");
-	const { tmpdir } = await import("node:os");
-	const { join } = await import("node:path");
-	const tmpDir = mkdtempSync(join(tmpdir(), "narrafork-wasm-"));
-
-	const tsWasmBuf = await Bun.file(embeddedTreeSitterWasm).arrayBuffer();
-	const treeSitterWasmPath = join(tmpDir, "tree-sitter.wasm");
-	writeFileSync(treeSitterWasmPath, new Uint8Array(tsWasmBuf));
-
-	// tree-sitter-bash.wasm — Language.load accepts Uint8Array directly.
+	// Engine bootstrap (including materializing the embedded core wasm out of
+	// $bunfs) lives in tree-sitter-runtime.ts because `Parser.init` is a
+	// process-wide singleton with an unguarded init check: two callers racing it
+	// would each build an Emscripten module, and languages loaded against the
+	// losing one would hold pointers into an abandoned heap.
 	const bashBuf = await Bun.file(embeddedBashWasm).arrayBuffer();
-	const bashWasmBytes = new Uint8Array(bashBuf);
-
-	await Parser.init({
-		locateFile() {
-			return treeSitterWasmPath;
-		},
-	});
-
-	const bashLanguage = await Language.load(bashWasmBytes);
-
-	const parser = new Parser();
-	parser.setLanguage(bashLanguage);
+	const bashLanguage = await loadTreeSitterLanguage(new Uint8Array(bashBuf));
+	const parser = await createTreeSitterParser(bashLanguage);
 	return parser as unknown as TreeSitterParser;
 }
 

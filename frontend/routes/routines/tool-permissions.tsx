@@ -48,6 +48,7 @@ const BUILTIN_TOOLS: ToolMeta[] = [
 	{ name: "Edit", descKey: "tpToolDescEdit", category: "default" },
 	{ name: "Glob", descKey: "tpToolDescGlob", category: "read-only" },
 	{ name: "Grep", descKey: "tpToolDescGrep", category: "read-only" },
+	{ name: "StructView", descKey: "tpToolDescStructView", category: "read-only" },
 	{ name: "WebSearch", descKey: "tpToolDescWebSearch", category: "always-allow" },
 	{ name: "WebFetch", descKey: "tpToolDescWebFetch", category: "default" },
 	{ name: "Agent", descKey: "tpToolDescAgent", category: "default" },

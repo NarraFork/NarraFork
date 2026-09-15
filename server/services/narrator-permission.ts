@@ -151,6 +151,7 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		case "Write":
 		case "Edit":
 		case "NotebookEdit":
+		case "StructView":
 			return typeof input.file_path === "string" ? [input.file_path] : [];
 		case "ShareFile":
 			return typeof input.path === "string" ? [input.path] : [];
@@ -859,13 +860,22 @@ const ALWAYS_ALLOW_TOOLS = [
 	"PackDeactivate",
 ];
 
-const ACCEPT_EDITS_AUTO_ALLOW = ["Edit", "Write", "NotebookEdit", "Read", "Glob", "Grep"];
+const ACCEPT_EDITS_AUTO_ALLOW = [
+	"Edit",
+	"Write",
+	"NotebookEdit",
+	"Read",
+	"Glob",
+	"Grep",
+	"StructView",
+];
 
 /** Tools that don't modify the project worktree — safe to auto-allow in readOnly mode. */
 const READ_ONLY_TOOLS = [
 	"Read",
 	"Grep",
 	"Glob",
+	"StructView",
 	"ShareFile",
 	"ContextAsk",
 	"Await",
@@ -3220,7 +3230,12 @@ function permissionPrimaryPath(
 	toolName: string,
 	input: Record<string, unknown>,
 ): string | undefined {
-	if (toolName === "Read" || toolName === "Write" || toolName === "Edit") {
+	if (
+		toolName === "Read" ||
+		toolName === "Write" ||
+		toolName === "Edit" ||
+		toolName === "StructView"
+	) {
 		return typeof input.file_path === "string" ? input.file_path : undefined;
 	}
 	if (toolName === "Glob" || toolName === "Grep") {

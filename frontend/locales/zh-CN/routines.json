@@ -214,6 +214,7 @@
 	"tpToolDescEdit": "在文件中执行精确字符串替换。",
 	"tpToolDescGlob": "使用 glob 模式快速匹配文件。",
 	"tpToolDescGrep": "使用正则表达式搜索文件内容。",
+	"tpToolDescStructView": "按结构读取文件：大纲、符号正文、对外 API。",
 	"tpToolDescWebSearch": "搜索网络获取最新信息。",
 	"tpToolDescWebFetch": "从网页 URL 获取和提取内容。",
 	"tpToolDescAgent": "启动子代理处理隔离任务。",
