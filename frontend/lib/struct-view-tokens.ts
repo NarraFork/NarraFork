@@ -250,7 +250,7 @@ const ENCLOSING_ROW = /^(→\s*)([a-z_]+)(\s+)(\S+)(\s*)(\(L[\d-]+\))?\s*$/;
 /** `Imports (97):` / `Calls:` / `STRUCTURE (top level, …)` — a section heading. */
 const HEADING = /^([A-Z][A-Za-z]*(?:[ -][A-Za-z]+)*)(\s*\(.*?\))?(:)?(\s*(?:—|-)\s.*)?$/;
 
-/** `path  [tsx, via tree-sitter]  3480 lines · 133 KB` — the body header. */
+/** `path  [tsx, via exact]  3480 lines · 133 KB` — the body header. */
 const HEADER = /^(\S.*?)(\s+\[[^\]]+\])(\s+.*)?$/;
 
 function tokenizeRow(line: string, theme: StructTokenTheme): ShikiToken[] {

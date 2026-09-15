@@ -34,6 +34,18 @@ const MAX_VISITED_NODES = 400_000;
 export interface ReferenceStats {
 	/** identifier text → number of occurrences in the file (definition included). */
 	identifiers: Map<string, number>;
+	/**
+	 * identifier text → the 1-based lines it appears on, ascending, each line listed once.
+	 *
+	 * A count alone cannot answer the question that matters when splitting a file: "are
+	 * all 7 references inside the range I want to extract, or do some live outside it?"
+	 * That is a distribution, not a scalar, and without it the only way to find out is to
+	 * leave the structural tools and grep.
+	 *
+	 * Lines are DEDUPED, so `lines.length` is at most the count — two references on one
+	 * line collapse to a single entry here while still counting twice above.
+	 */
+	identifierLines: Map<string, number[]>;
 	/** called function text (`useState`, `obj.method`) → call count. */
 	calls: Map<string, number>;
 	/** JSX element name → usage count. Empty for non-JSX languages. */
@@ -61,6 +73,17 @@ export function collectReferenceStats(root: SyntaxNode): ReferenceStats {
 		map.set(key, (map.get(key) ?? 0) + 1);
 	};
 
+	// Sets while walking, arrays at the end: the walk order is not positional (an explicit
+	// stack visits siblings back-to-front), so appending would produce jumbled line lists,
+	// and a linear "is it already there" check would be quadratic on hot identifiers.
+	const lineSets = new Map<string, Set<number>>();
+	const noteLine = (key: string, line: number): void => {
+		if (key.length === 0) return;
+		const existing = lineSets.get(key);
+		if (existing) existing.add(line);
+		else lineSets.set(key, new Set([line]));
+	};
+
 	const stack: SyntaxNode[] = [root];
 	while (stack.length > 0) {
 		const node = stack.pop();
@@ -71,7 +94,9 @@ export function collectReferenceStats(root: SyntaxNode): ReferenceStats {
 		}
 
 		if (IDENTIFIER_TYPES.has(node.type)) {
-			bump(identifiers, node.text.trim());
+			const name = node.text.trim();
+			bump(identifiers, name);
+			noteLine(name, node.startPosition.row + 1);
 		} else if (node.type === "call_expression" || node.type === "call") {
 			const fn = node.childForFieldName("function");
 			if (fn) bump(calls, normalizeCallee(fn.text));
@@ -89,7 +114,15 @@ export function collectReferenceStats(root: SyntaxNode): ReferenceStats {
 		}
 	}
 
-	return { identifiers, calls, elements, truncated };
+	const identifierLines = new Map<string, number[]>();
+	for (const [name, lines] of lineSets) {
+		identifierLines.set(
+			name,
+			[...lines].sort((a, b) => a - b),
+		);
+	}
+
+	return { identifiers, identifierLines, calls, elements, truncated };
 }
 
 /** Collapse whitespace inside a callee expression (`foo\n  .bar` → `foo .bar`). */
@@ -145,4 +178,45 @@ export function referenceCountFor(
 	// A call entry's "name" is a callee, not a declared symbol; its identifier tally
 	// would answer a different question, so it is left unset.
 	return stats.identifiers.get(node.name);
+}
+
+/**
+ * The lines one declaration is referenced on, ascending.
+ *
+ * Mirrors `referenceCountFor` for the destructuring case, but UNIONS the bindings' lines
+ * instead of taking a maximum: the question here is "where is this touched", and every
+ * binding's position is part of that answer.
+ */
+export function referenceLinesFor(
+	stats: ReferenceStats,
+	node: { name: string; bindings?: string[] },
+): number[] | undefined {
+	if (node.bindings && node.bindings.length > 0) {
+		const union = new Set<number>();
+		for (const binding of node.bindings) {
+			for (const line of stats.identifierLines.get(binding) ?? []) union.add(line);
+		}
+		return union.size > 0 ? [...union].sort((a, b) => a - b) : undefined;
+	}
+	return stats.identifierLines.get(node.name);
+}
+
+/**
+ * Split a symbol's reference lines by whether they fall inside a range.
+ *
+ * This is the primitive behind "can I extract this range?": `outside.length === 0` means
+ * the symbol is self-contained and can move with the block, while a non-empty `outside`
+ * means extracting it would break those callers unless the symbol is exported.
+ */
+export function partitionByRange(
+	lines: readonly number[],
+	range: { startLine: number; endLine: number },
+): { inside: number[]; outside: number[] } {
+	const inside: number[] = [];
+	const outside: number[] = [];
+	for (const line of lines) {
+		if (line >= range.startLine && line <= range.endLine) inside.push(line);
+		else outside.push(line);
+	}
+	return { inside, outside };
 }

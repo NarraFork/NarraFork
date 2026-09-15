@@ -181,14 +181,25 @@ describe("classifyStructure", () => {
 		expect(labels.some((l) => l.includes("decl"))).toBe(false);
 	});
 
-	test("language and provider are reported", () => {
+	test("language and precision are reported, not the parser's internal id", () => {
+		const detail = classify({
+			inputJson: { file_path: FILE, mode: "outline" },
+			metadata: { languageId: "typescript", provider: "tree-sitter", precision: "exact" },
+		});
+		const texts = rowTexts(detail);
+		expect(texts.some((t) => t.includes("typescript") && t.includes("exact"))).toBe(true);
+		// The parser id must not leak onto the card.
+		expect(texts.some((t) => t.includes("tree-sitter"))).toBe(false);
+	});
+
+	test("an older record without precision falls back to the provider string", () => {
+		// Backward compatibility: cards rendered before `precision` existed still show
+		// something rather than a blank line.
 		const detail = classify({
 			inputJson: { file_path: FILE, mode: "outline" },
 			metadata: { languageId: "typescript", provider: "tree-sitter" },
 		});
-		expect(
-			rowTexts(detail).some((t) => t.includes("typescript") && t.includes("tree-sitter")),
-		).toBe(true);
+		expect(rowTexts(detail).some((t) => t.includes("tree-sitter"))).toBe(true);
 	});
 
 	test("a failed call keeps its header instead of showing only an error", () => {

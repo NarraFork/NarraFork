@@ -154,7 +154,12 @@ export interface ImportExportInfo {
 
 /** Lexical tallies for one file. Counts are single-file and name-collapsing. */
 export interface FileStatistics {
-	identifiers: Array<{ name: string; count: number }>;
+	/**
+	 * Identifier tallies. `lines` holds the 1-based lines the name appears on, ascending
+	 * and deduped, so callers can ask WHERE a symbol is used rather than only how often —
+	 * the distinction between "7 references" and "7 references, all inside L2177-2418".
+	 */
+	identifiers: Array<{ name: string; count: number; lines?: number[] }>;
 	calls: Array<{ name: string; count: number }>;
 	elements: Array<{ name: string; count: number }>;
 	/** Counts are lower bounds because the walk hit its node cap. */

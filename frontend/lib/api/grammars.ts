@@ -8,7 +8,7 @@ import { request } from "./client";
  */
 export type GrammarTier = "verified" | "generic";
 
-/** Install state of one tree-sitter grammar. */
+/** Install state of one language parser. */
 export interface GrammarStatus {
 	id: string;
 	label: string;
@@ -19,6 +19,8 @@ export interface GrammarStatus {
 	/** Language ABI observed when the grammar was verified. */
 	abi: number;
 	installed: boolean;
+	/** Ships with the app: always available, cannot be downloaded or removed. */
+	builtin?: boolean;
 	sizeBytes?: number;
 	expectedBytes: number;
 	version: string;

@@ -1603,7 +1603,11 @@ function classifyStructure(
 		(STRUCTURE_MODE_COUNTS[mode] ?? []).map(([key, label]) => countChip(metadata, key, label)),
 	);
 
-	const providerLabel = nonEmptyString(metadata?.provider);
+	// Show the RESULT'S precision, not the parser's internal id. `provider` is "tree-sitter"
+	// / "heuristic" — an implementation detail the reader does not need and should not have
+	// to decode. `precision` ("exact" / "approximate") is the thing that changes how far to
+	// trust the card. Older records without `precision` fall back to the provider string.
+	const precisionLabel = nonEmptyString(metadata?.precision) ?? nonEmptyString(metadata?.provider);
 	const languageLabel = nonEmptyString(metadata?.languageId);
 
 	// Header first, even on failure: `classifySearch` dropped it entirely when a call
@@ -1615,9 +1619,9 @@ function classifyStructure(
 			pathRow(filePath, { dimmed: false }),
 			badgeRow(detailChips),
 			statChips.length > 0 ? badgeRow(statChips) : null,
-			languageLabel || providerLabel
+			languageLabel || precisionLabel
 				? {
-						text: [languageLabel, providerLabel].filter(Boolean).join(" · "),
+						text: [languageLabel, precisionLabel].filter(Boolean).join(" · "),
 						dimmed: true,
 					}
 				: null,
@@ -1726,6 +1730,37 @@ function classifyStructureEdit(
 			section("meta.error", undefined, {
 				kind: "error",
 				text: filePath ? `StructSed failed on ${filePath}` : "StructSed failed",
+			}),
+		]);
+	}
+
+	// A dry run carries the changed region as before/after text. Rendering that as a real
+	// diff — the same widget Edit uses — shows which lines move at a glance, where the
+	// struct-view tokenizer (built for the report's line-numbered syntax) would leave the
+	// source unhighlighted. The tool omits the diff for a change too large to show that way,
+	// in which case the text preview below is what remains.
+	const diffBefore = typeof metadata?.diffBefore === "string" ? metadata.diffBefore : null;
+	const diffAfter = typeof metadata?.diffAfter === "string" ? metadata.diffAfter : null;
+	if (diffBefore != null && diffAfter != null) {
+		const diffStartLine =
+			typeof metadata?.diffStartLine === "number" ? metadata.diffStartLine : undefined;
+		const diffDocument = createDiffDocument({
+			oldText: diffBefore,
+			newText: diffAfter,
+			focusSide: "new",
+			...(diffStartLine != null ? { startLine: diffStartLine } : {}),
+		});
+		return sections([
+			headerSection,
+			textSection("output.main", outputJson, "output", {
+				cap: "diff",
+				format: "diff",
+				diffDocument,
+				revision: diffDocument.revision,
+				text: output,
+				followTarget: { kind: "diff-row", focus: diffDocument.focus },
+				textTruncated: diffDocument.truncated,
+				...(filePath ? { codeLangPath: filePath } : {}),
 			}),
 		]);
 	}

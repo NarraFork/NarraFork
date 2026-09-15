@@ -25,6 +25,17 @@ registerStructureProviders();
 
 export type { Address, AddressBlock } from "./address";
 export { AddressError, parseAddress, resolveAddress } from "./address";
+export type {
+	CrossFileUsageResult,
+	RawFileHit,
+	UsageFile,
+} from "./cross-file-usages";
+export { assembleUsages, CROSS_FILE_PRECISION_NOTE } from "./cross-file-usages";
+export type {
+	ExtractionInterface,
+	InterfaceSymbol,
+} from "./extraction-interface";
+export { analyzeExtraction, straddlingDeclarations } from "./extraction-interface";
 export type { GrammarTier } from "./grammar-manifest";
 export {
 	EXCLUDED_GRAMMARS,
@@ -44,6 +55,8 @@ export {
 	removeGrammar,
 } from "./grammar-store";
 export { heuristicProvider } from "./heuristic-provider";
+export type { Landmark, LandmarkKind } from "./landmarks";
+export { countByTag, scanLandmarks } from "./landmarks";
 export { parsePosition, parseSymbolSelector } from "./locate";
 export { invalidateParser } from "./parser-pool";
 export type {
@@ -68,9 +81,10 @@ export {
 	resolveProvider,
 } from "./provider";
 export type { RankedEntry } from "./references";
-export { rank, referenceCountFor } from "./references";
+export { partitionByRange, rank, referenceCountFor, referenceLinesFor } from "./references";
 export {
 	clearOutlineCache,
 	referenceCounts,
+	referenceLines,
 	treeSitterProvider,
 } from "./tree-sitter-provider";

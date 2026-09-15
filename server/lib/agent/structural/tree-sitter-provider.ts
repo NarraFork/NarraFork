@@ -50,8 +50,12 @@ const statsCache = new Map<string, FileStatistics>();
 const MAX_CACHE_ENTRIES = 8;
 
 export const treeSitterProvider: StructureProvider = {
+	// The id stays as-is: it is an internal key, used by settings and diagnostics.
 	id: "tree-sitter",
-	label: "tree-sitter",
+	// The LABEL reaches the model on every call, in `[tsx, via …]`. It answers the only
+	// question that changes how results should be read — are they exact or guessed — so it
+	// names the precision rather than the parsing library behind it.
+	label: "exact",
 
 	async supports(doc: StructDocument): Promise<ProviderSupport> {
 		if (!doc.languageId || !isKnownGrammarLanguage(doc.languageId)) return "no";
@@ -232,8 +236,13 @@ async function parseStatistics(doc: StructDocument): Promise<FileStatistics | nu
 		const stats = collectReferenceStats(root);
 		// Ranked into plain arrays inside the scope, so nothing tied to the tree escapes
 		// and the tool layer never has to re-derive an order.
+		// Line lists are attached here, inside the scope: they are plain numbers, so unlike
+		// the nodes they came from they remain valid after the tree is released.
 		return {
-			identifiers: rank(stats.identifiers),
+			identifiers: rank(stats.identifiers).map((entry) => {
+				const lines = stats.identifierLines.get(entry.name);
+				return lines ? { ...entry, lines } : entry;
+			}),
 			calls: rank(stats.calls),
 			elements: rank(stats.elements),
 			truncated: stats.truncated,
@@ -256,6 +265,24 @@ export async function referenceCounts(
 	const stats = await parseStatistics(doc);
 	if (!stats) return null;
 	return new Map(stats.identifiers.map((entry) => [entry.name, entry.count]));
+}
+
+/**
+ * Reference LINES keyed by identifier.
+ *
+ * Separate from `referenceCounts` so the outline annotation path keeps allocating one
+ * small map; callers that need positions ask for them explicitly.
+ */
+export async function referenceLines(
+	doc: StructDocument,
+): Promise<ReadonlyMap<string, number[]> | null> {
+	const stats = await parseStatistics(doc);
+	if (!stats) return null;
+	const map = new Map<string, number[]>();
+	for (const entry of stats.identifiers) {
+		if (entry.lines) map.set(entry.name, entry.lines);
+	}
+	return map;
 }
 
 function cacheKey(doc: StructDocument): string {

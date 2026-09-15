@@ -67,6 +67,18 @@ export interface GrammarManifestEntry {
 	abi: number;
 	/** Known limitation, surfaced in the settings UI. */
 	note?: string;
+	/**
+	 * Shipped inside the binary rather than downloaded.
+	 *
+	 * Only shell qualifies: bash command analysis needs it on every tool call, so the
+	 * package is a pinned dependency and the wasm is embedded as an asset. Such a grammar
+	 * is always available, is never fetched, and cannot be removed — deleting it would
+	 * break bash analysis while freeing nothing, since the bytes live in the executable.
+	 *
+	 * NOTE: `sha256`/`bytes` describe the CDN build, which is a DIFFERENT build from the
+	 * embedded one. They are not used to verify a builtin grammar.
+	 */
+	builtin?: boolean;
 }
 
 /**
@@ -247,6 +259,8 @@ export const GRAMMAR_MANIFEST: readonly GrammarManifestEntry[] = [
 		tier: "generic",
 		abi: 14,
 		note: "Function definitions are detected; shell has little other declaration structure.",
+		// Embedded: bash analysis parses every command line, so this one ships in the binary.
+		builtin: true,
 	},
 	{
 		id: "scala",

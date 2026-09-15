@@ -92,26 +92,26 @@ describe("declared paths", () => {
 		expect(declaredWorktreePaths(cwd, { file_path: join(cwd, "a", "b.ts") })).toEqual(["a/b.ts"]);
 	});
 
-	test("a move/copy declares BOTH its source and its destination", () => {
-		// StructSed writes two files in one turn. An undeclared destination means its tree
-		// delta is attributed to nobody, so a rollback would miss it.
+	test("a cross-file move/copy declares BOTH its source and its destination", () => {
+		// StructSed writes two files in one turn via `to_file`. An undeclared destination
+		// means its tree delta is attributed to nobody, so a rollback would miss it.
 		expect(
 			declaredWorktreePaths(cwd, {
 				file_path: join(cwd, "src", "big.ts"),
-				to: join(cwd, "src", "types.ts"),
+				to_file: join(cwd, "src", "types.ts"),
 			}),
 		).toEqual(["src/big.ts", "src/types.ts"]);
 	});
 
 	test("a destination equal to the source is not declared twice", () => {
 		expect(
-			declaredWorktreePaths(cwd, { file_path: join(cwd, "a.ts"), to: join(cwd, "a.ts") }),
+			declaredWorktreePaths(cwd, { file_path: join(cwd, "a.ts"), to_file: join(cwd, "a.ts") }),
 		).toEqual(["a.ts"]);
 	});
 
 	test("a destination outside the worktree is dropped, keeping the source", () => {
 		const outside = process.platform === "win32" ? "E:\\elsewhere\\x.ts" : "/elsewhere/x.ts";
-		expect(declaredWorktreePaths(cwd, { file_path: join(cwd, "a.ts"), to: outside })).toEqual([
+		expect(declaredWorktreePaths(cwd, { file_path: join(cwd, "a.ts"), to_file: outside })).toEqual([
 			"a.ts",
 		]);
 	});

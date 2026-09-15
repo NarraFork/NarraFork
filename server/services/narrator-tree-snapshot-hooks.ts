@@ -122,11 +122,13 @@ export interface TreeSnapshotSession {
  */
 export function declaredWorktreePaths(cwd: string, input: unknown): string[] {
 	const args = input as Record<string, unknown> | null;
-	// `file_path` is the primary target for every file tool. `to` is StructSed's move/copy
-	// destination: a tool that writes two files must declare BOTH, or the tree delta on the
-	// undeclared one is attributed to nobody and a rollback misses it.
+	// `file_path` is the primary target for every file tool. `to_file` is StructSed's
+	// cross-file move/copy destination: a tool that writes two files must declare BOTH, or
+	// the tree delta on the undeclared one is attributed to nobody and a rollback misses it.
+	// (Same-file move uses `to_symbol`/`to_address`, which resolve inside `file_path` and so
+	// need no separate declaration.)
 	const declared: string[] = [];
-	for (const candidate of [args?.file_path, args?.to]) {
+	for (const candidate of [args?.file_path, args?.to_file]) {
 		const rel = worktreeRelativePath(cwd, candidate);
 		if (rel && !declared.includes(rel)) declared.push(rel);
 	}

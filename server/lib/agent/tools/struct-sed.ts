@@ -138,7 +138,7 @@ const rawJsonSchema = {
 		},
 		address: {
 			description:
-				'Line/regex address: "42", "10,20", "10,$", "$", "/regex/", "/from/,/to/". Needs no grammar. Mutually exclusive with `symbol`.',
+				'Line/regex address: "42", "10,20", "10,$", "$", "/regex/", "/from/,/to/". Needs no parser. Mutually exclusive with `symbol`.',
 			type: "string",
 		},
 		content: {
@@ -196,6 +196,58 @@ function parseKinds(raw: unknown): StructKind[] | null {
 		.map((k) => k.trim())
 		.filter(Boolean) as StructKind[];
 	return kinds.length > 0 ? kinds : null;
+}
+
+/** Context lines kept around a change when building the card's diff. */
+const DIFF_CONTEXT_LINES = 3;
+
+/**
+ * Largest changed span (in lines) for which a diff card is built.
+ *
+ * Beyond this the diff is more overwhelming than the text preview — a move from the top of
+ * a file to the bottom spans the whole file — so the card falls back to the preview instead.
+ */
+const MAX_DIFF_SPAN_LINES = 400;
+
+/**
+ * The window that actually changed between two texts, for the card's before/after diff.
+ *
+ * Computed by comparing the texts directly rather than from the command's range, so it is
+ * correct for every command uniformly — including move/copy (two edited regions) and a
+ * batch (many) — without reasoning about where each one writes. Returns null when nothing
+ * changed or when the change is too large to show as a diff.
+ */
+function diffWindow(
+	before: string,
+	after: string,
+): { oldText: string; newText: string; startLine: number } | null {
+	const b = before.split("\n");
+	const a = after.split("\n");
+
+	let first = 0;
+	while (first < b.length && first < a.length && b[first] === a[first]) first++;
+
+	let bEnd = b.length - 1;
+	let aEnd = a.length - 1;
+	while (bEnd >= first && aEnd >= first && b[bEnd] === a[aEnd]) {
+		bEnd--;
+		aEnd--;
+	}
+
+	// No divergence: identical texts are handled by the caller before this runs.
+	if (bEnd < first && aEnd < first) return null;
+
+	const span = Math.max(bEnd, aEnd) - first;
+	if (span > MAX_DIFF_SPAN_LINES) return null;
+
+	const winStart = Math.max(0, first - DIFF_CONTEXT_LINES);
+	const bWinEnd = Math.min(b.length - 1, bEnd + DIFF_CONTEXT_LINES);
+	const aWinEnd = Math.min(a.length - 1, aEnd + DIFF_CONTEXT_LINES);
+	return {
+		oldText: b.slice(winStart, bWinEnd + 1).join("\n"),
+		newText: a.slice(winStart, aWinEnd + 1).join("\n"),
+		startLine: winStart + 1,
+	};
 }
 
 /** A bounded excerpt of the changed region, so a preview cannot flood the context. */
@@ -514,7 +566,7 @@ export const structSedTool: ToolDefinition = {
 			.describe("Which mutation to apply. Required unless `operations` is given."),
 		symbol: z.string().optional().describe("Structural address: declaration name."),
 		kind: z.string().optional().describe("Restrict the structural address to these kinds."),
-		address: z.string().optional().describe("Line/regex address; needs no grammar."),
+		address: z.string().optional().describe("Line/regex address; needs no parser."),
 		content: z.string().optional().describe("New text for replace/insert/append."),
 		to_symbol: z.string().optional().describe("For copy/move: destination declaration name."),
 		to_address: z.string().optional().describe("For copy/move: destination line/regex address."),
@@ -771,6 +823,10 @@ export const structSedTool: ToolDefinition = {
 			const plan = isBatch
 				? `${resolvedOps.map((op) => `  ${op.spec.index}. ${op.spec.command} → ${op.label}`).join("\n")}\n`
 				: `${addressLabel}\n`;
+			// The card renders this as a real before/after diff. Computed from the two texts
+			// (not the command's range) so it is correct for move/copy and batches too, and
+			// omitted for a change too large to diff — the card then keeps its text preview.
+			const window = diffWindow(normalized, nextText);
 			return {
 				output:
 					`DRY RUN — nothing written. Pass dry_run: false to apply.\n\n` +
@@ -786,6 +842,13 @@ export const structSedTool: ToolDefinition = {
 					endLine: range.endLine,
 					...(isBatch ? { operations: resolvedOps.length } : {}),
 					...(replacements != null ? { replacements } : {}),
+					...(window
+						? {
+								diffBefore: window.oldText,
+								diffAfter: window.newText,
+								diffStartLine: window.startLine,
+							}
+						: {}),
 				},
 			};
 		}

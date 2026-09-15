@@ -633,6 +633,80 @@ function applyStructSedCall(
 	toolCall: OrderedToolCall,
 	input: Record<string, unknown>,
 ): string | null {
+	if (currentContent === null) {
+		throw new ReplayDivergedError(
+			`StructSed call ${toolCall.toolUseId} expects existing content but the baseline is missing.`,
+			toolCall.toolUseId,
+		);
+	}
+
+	// A batch recorded every operation with its own resolved range. Replaying only the
+	// first would silently rebuild the file as though the rest never happened.
+	const batch = input.operations;
+	if (Array.isArray(batch)) {
+		if (batch.length === 0) {
+			throw new ReplayDivergedError(
+				`StructSed call ${toolCall.toolUseId} recorded an empty batch.`,
+				toolCall.toolUseId,
+			);
+		}
+		let text = normalizeLineEndings(currentContent);
+		// Bottom-up, matching how the tool applied them: every recorded address is relative
+		// to the original file, so a change below must not shift the ones above it.
+		const ordered = [...batch].sort(
+			(a, b) => structSedStartLine(b, toolCall) - structSedStartLine(a, toolCall),
+		);
+		for (const entry of ordered) {
+			const applied = applyStructSedOperation(
+				text,
+				toolCall,
+				entry as Record<string, unknown>,
+				false,
+			);
+			if (applied === null) {
+				throw new ReplayDivergedError(
+					`StructSed call ${toolCall.toolUseId} could not replay one of its batched operations.`,
+					toolCall.toolUseId,
+				);
+			}
+			text = applied;
+		}
+		return applyLineEnding(text, detectLineEnding(currentContent));
+	}
+
+	return applyStructSedOperation(currentContent, toolCall, input, true);
+}
+
+/**
+ * The recorded start line of one batch entry, used only for ordering.
+ *
+ * A missing range is divergence rather than a default: sorting an unaddressed operation to
+ * an arbitrary position would apply it somewhere nobody asked for.
+ */
+function structSedStartLine(entry: unknown, toolCall: OrderedToolCall): number {
+	const line = (entry as Record<string, unknown> | null)?.resolvedStartLine;
+	if (typeof line !== "number") {
+		throw new ReplayDivergedError(
+			`StructSed call ${toolCall.toolUseId} has a batched operation with no recorded line range.`,
+			toolCall.toolUseId,
+		);
+	}
+	return line;
+}
+
+/**
+ * Replay ONE recorded operation.
+ *
+ * `restoreLineEnding` is false for batch entries: the intermediate steps stay LF-normalized
+ * and the caller restores the file's original ending once, at the end. Doing it per step
+ * would re-detect the ending from partially rewritten text.
+ */
+function applyStructSedOperation(
+	currentContent: string,
+	toolCall: OrderedToolCall,
+	input: Record<string, unknown>,
+	restoreLineEnding: boolean,
+): string | null {
 	const command = input.command;
 	const startLine = input.resolvedStartLine;
 	const endLine = input.resolvedEndLine;
@@ -648,19 +722,15 @@ function applyStructSedCall(
 			toolCall.toolUseId,
 		);
 	}
-	if (currentContent === null) {
-		throw new ReplayDivergedError(
-			`StructSed call ${toolCall.toolUseId} expects existing content but the baseline is missing.`,
-			toolCall.toolUseId,
-		);
-	}
 
 	const content = normalizeLineEndings(currentContent);
 	const range = { startLine, endLine };
+	const applyLineEnding_ = (text: string): string =>
+		restoreLineEnding ? applyLineEnding(text, detectLineEnding(currentContent)) : text;
 	try {
 		switch (command) {
 			case "delete":
-				return applyLineEnding(deleteRange(content, range), detectLineEnding(currentContent));
+				return applyLineEnding_(deleteRange(content, range));
 			case "copy":
 			case "move": {
 				// The destination travelled resolved, like the source. Its absence is a real
@@ -673,7 +743,7 @@ function applyStructSedCall(
 					placement: input.placement === "before" ? "before" : "after",
 					removeSource: command === "move",
 				});
-				return applyLineEnding(next, detectLineEnding(currentContent));
+				return applyLineEnding_(next);
 			}
 			case "replace":
 			case "insert":
@@ -692,7 +762,7 @@ function applyStructSedCall(
 						: command === "insert"
 							? insertBefore(content, range, normalized)
 							: appendAfter(content, range, normalized);
-				return applyLineEnding(next, detectLineEnding(currentContent));
+				return applyLineEnding_(next);
 			}
 			case "substitute": {
 				const pattern = input.pattern;
@@ -706,7 +776,7 @@ function applyStructSedCall(
 				const result = substituteInRange(content, range, pattern, replacement, {
 					...(typeof input.flags === "string" ? { flags: input.flags } : {}),
 				});
-				return applyLineEnding(result.text, detectLineEnding(currentContent));
+				return applyLineEnding_(result.text);
 			}
 			default:
 				throw new ReplayDivergedError(

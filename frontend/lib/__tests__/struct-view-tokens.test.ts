@@ -60,8 +60,7 @@ const SAMPLES: Record<string, string> = {
 	headingPlain: "TOP CALLS",
 	headingWithProse: "SINGLE-REFERENCE SYMBOLS (5) — defined but never used in this file.",
 	prose: "Cross-file usage is invisible here; confirm with Grep before deleting.",
-	header:
-		"frontend/components/narrator/NarratorPanel.tsx  [tsx, via tree-sitter]  3480 lines · 133 KB",
+	header: "frontend/components/narrator/NarratorPanel.tsx  [tsx, via exact]  3480 lines · 133 KB",
 	largest: "largest: function NarratorPanel L261-3479 (93% of file)",
 	sectionLabel: "refs  line     declaration",
 	callsLabel: "Calls:",

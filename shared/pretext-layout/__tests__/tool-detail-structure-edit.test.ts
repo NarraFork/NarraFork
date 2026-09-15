@@ -206,13 +206,82 @@ describe("resolved range and counts", () => {
 });
 
 describe("body highlighting", () => {
-	test("the report uses the bespoke tokenizer, not a language grammar", () => {
+	test("a report with no diff data uses the bespoke tokenizer, not a language grammar", () => {
 		// The body is StructSed's own line-numbered report, not source of the target file.
 		const body = outputBody(
 			classify({ inputJson: { file_path: FILE, command: "delete" }, outputJson: "DRY RUN" }),
 		);
 		expect(body?.customHighlight).toBe("struct-view");
 		expect(body?.codeLangPath).toBeUndefined();
+		expect(body?.format).toBe("code");
+	});
+});
+
+describe("dry-run diff rendering", () => {
+	const diffMeta = {
+		dryRun: true,
+		command: "replace",
+		startLine: 2,
+		endLine: 2,
+		diffBefore: "one\ntwo\nthree",
+		diffAfter: "one\nTWO\nthree",
+		diffStartLine: 1,
+	};
+
+	test("before/after metadata renders as a diff, not the tokenizer", () => {
+		// This is the fix: the struct-view tokenizer highlights the report's syntax, so
+		// real source in a Before/After block came out unhighlighted. A diff pairs the
+		// lines and marks exactly what changed.
+		const body = outputBody(
+			classify({
+				inputJson: { file_path: FILE, command: "replace", content: "TWO" },
+				outputJson: "DRY RUN — nothing written.",
+				metadata: diffMeta,
+			}),
+		);
+		expect(body?.format).toBe("diff");
+		expect(body?.customHighlight).toBeUndefined();
+		expect(body?.diffDocument).toBeDefined();
+	});
+
+	test("the diff carries the file's language path so it highlights as source", () => {
+		const body = outputBody(
+			classify({
+				inputJson: { file_path: FILE, command: "replace", content: "TWO" },
+				metadata: diffMeta,
+			}),
+		);
+		expect(body?.codeLangPath).toBe(FILE);
+	});
+
+	test("the diff is numbered from the reported start line", () => {
+		const body = outputBody(classify({ inputJson: { file_path: FILE }, metadata: diffMeta }));
+		const doc = body?.diffDocument as { startLine?: number } | undefined;
+		expect(doc?.startLine).toBe(1);
+	});
+
+	test("a dry run WITHOUT diff data still falls back to the preview", () => {
+		// The tool omits the diff for a change too large to show that way; the card must
+		// keep working, not blank out.
+		const body = outputBody(
+			classify({
+				inputJson: { file_path: FILE, command: "move" },
+				outputJson: "DRY RUN — nothing written.",
+				metadata: { dryRun: true, command: "move", startLine: 1, endLine: 1 },
+			}),
+		);
+		expect(body?.format).toBe("code");
+		expect(body?.customHighlight).toBe("struct-view");
+	});
+
+	test("an applied (non-dry-run) call has no diff and uses the summary tokenizer", () => {
+		const body = outputBody(
+			classify({
+				inputJson: { file_path: FILE, command: "replace" },
+				outputJson: "replace applied to file → L2",
+				metadata: { command: "replace", startLine: 2, endLine: 2 },
+			}),
+		);
 		expect(body?.format).toBe("code");
 	});
 });

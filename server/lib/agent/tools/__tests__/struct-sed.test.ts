@@ -156,6 +156,39 @@ describe("dry run is the default", () => {
 		expect(result.output).toContain("BRAVO");
 	});
 
+	test("the preview carries before/after text for the card's diff", async () => {
+		// The card renders these as a real diff; the changed region plus context, numbered
+		// from where it starts. The output text stays for the model.
+		const result = await run({
+			file_path: plainFile,
+			command: "replace",
+			address: "2",
+			content: "BRAVO",
+		});
+		expect(typeof result.metadata?.diffBefore).toBe("string");
+		expect(typeof result.metadata?.diffAfter).toBe("string");
+		expect(result.metadata?.diffBefore).toContain("bravo");
+		expect(result.metadata?.diffAfter).toContain("BRAVO");
+		expect(typeof result.metadata?.diffStartLine).toBe("number");
+	});
+
+	test("a change spanning the whole file omits the diff so the card keeps the preview", async () => {
+		// A move from the top of a large file to the bottom would diff the entire file,
+		// which is more overwhelming than the preview it would replace.
+		const big = join(workDir, "big.txt");
+		writeFileSync(big, Array.from({ length: 900 }, (_, i) => `line ${i + 1}`).join("\n"), "utf8");
+		const result = await run({
+			file_path: big,
+			command: "move",
+			address: "1",
+			to_address: "900",
+			placement: "after",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.metadata?.diffBefore).toBeUndefined();
+		expect(result.output).toContain("Before:");
+	});
+
 	test("substitute reports its replacement count", async () => {
 		const result = await run({
 			file_path: plainFile,

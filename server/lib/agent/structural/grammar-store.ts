@@ -19,6 +19,9 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
+// Bun rewrites this to a real file path in dev and inside the packaged binary — the same
+// mechanism bash-analyze.ts uses to reach this grammar.
+import embeddedBashWasm from "tree-sitter-bash/tree-sitter-bash.wasm" with { type: "file" };
 import { logger } from "../../logger";
 import { narraforkDir } from "../../settings";
 import {
@@ -32,6 +35,29 @@ import { createTreeSitterParser, loadTreeSitterLanguage } from "./tree-sitter-ru
 
 /** Cache directory for downloaded grammar wasm files. */
 export const GRAMMAR_DIR = join(narraforkDir, "grammars");
+
+/**
+ * Embedded grammar assets, by language id.
+ *
+ * Deliberately a lookup rather than a computed path: an embedded asset has to be a static
+ * import for Bun to include it in the binary, so building the specifier at runtime would
+ * resolve to something that was never packaged.
+ */
+const BUILTIN_GRAMMAR_ASSETS: Record<string, string> = {
+	bash: embeddedBashWasm,
+};
+
+/** Read a builtin grammar's embedded bytes. */
+async function readBuiltinGrammar(languageId: string): Promise<Uint8Array | null> {
+	const asset = BUILTIN_GRAMMAR_ASSETS[languageId];
+	if (!asset) return null;
+	try {
+		return new Uint8Array(await Bun.file(asset).arrayBuffer());
+	} catch (err) {
+		logger.warn("Failed to read embedded grammar", { languageId, error: String(err) });
+		return null;
+	}
+}
 
 const DEFAULT_CDN_TEMPLATE =
 	"https://unpkg.com/tree-sitter-wasms@{version}/out/tree-sitter-{name}.wasm";
@@ -50,9 +76,14 @@ export function grammarCachePath(languageId: string): string {
 	return join(GRAMMAR_DIR, `tree-sitter-${languageId}.wasm`);
 }
 
-/** Whether a grammar is present in the local cache. */
+/** Whether a grammar is available: shipped in the binary, or present in the local cache. */
 export function isGrammarInstalled(languageId: string): boolean {
-	if (!getGrammarEntry(languageId)) return false;
+	const entry = getGrammarEntry(languageId);
+	if (!entry) return false;
+	// A builtin grammar's bytes live in the executable, so there is nothing on disk to
+	// look for. Checking the cache would report shell as missing while it is in fact
+	// always loadable, and offer a download that would fetch a second copy.
+	if (entry.builtin) return true;
 	return existsSync(grammarCachePath(languageId));
 }
 
@@ -67,6 +98,11 @@ export interface GrammarStatus {
 	/** Language ABI observed when this grammar was verified. */
 	abi: number;
 	installed: boolean;
+	/**
+	 * Shipped in the binary: always available, never downloaded, cannot be removed.
+	 * The settings UI shows these without a download or delete action.
+	 */
+	builtin?: boolean;
 	/** Actual on-disk size when installed. */
 	sizeBytes?: number;
 	/** Expected size from the manifest, shown before download. */
@@ -98,22 +134,40 @@ export async function listGrammarStatus(): Promise<GrammarStatus[]> {
 			tier: entry.tier,
 			...(entry.note ? { note: entry.note } : {}),
 			abi: entry.abi,
-			installed: sizeBytes !== undefined,
+			// Builtin grammars are always available and have no cache file to measure.
+			installed: entry.builtin === true || sizeBytes !== undefined,
+			...(entry.builtin ? { builtin: true } : {}),
 			...(sizeBytes !== undefined ? { sizeBytes } : {}),
 			expectedBytes: entry.bytes,
 			version: GRAMMAR_PACKAGE_VERSION,
 			// Size is a cheap proxy here on purpose: hashing every grammar on every
 			// settings page load would read ~7 MB off disk for a status list.
-			...(sizeBytes !== undefined && sizeBytes !== entry.bytes ? { digestMismatch: true } : {}),
+			// Skipped for builtins: the manifest digest describes the CDN build, so
+			// comparing it against a stray cache file would flag a phantom mismatch.
+			...(!entry.builtin && sizeBytes !== undefined && sizeBytes !== entry.bytes
+				? { digestMismatch: true }
+				: {}),
 		});
 	}
 	return results;
 }
 
-/** Read a cached grammar's bytes, verifying the digest first. */
+/**
+ * Read a grammar's bytes: from the embedded asset for a builtin, otherwise from the
+ * cache after verifying its digest.
+ */
 export async function readInstalledGrammar(languageId: string): Promise<Uint8Array | null> {
 	const entry = getGrammarEntry(languageId);
 	if (!entry) return null;
+
+	if (entry.builtin) {
+		const bytes = await readBuiltinGrammar(entry.id);
+		if (bytes) return bytes;
+		// Fall through: a packaging error should not make shell unparseable if a cached
+		// copy happens to exist.
+		logger.warn("Builtin grammar unavailable; falling back to cache", { languageId });
+	}
+
 	const path = grammarCachePath(languageId);
 	if (!existsSync(path)) return null;
 
@@ -175,6 +229,12 @@ export async function downloadGrammar(
 	const entry = getGrammarEntry(languageId);
 	if (!entry) {
 		return { ok: false, languageId, error: `Unknown grammar: ${languageId}` };
+	}
+
+	// Nothing to fetch: the bytes are already in the executable. Reported as success
+	// because the caller's goal ("make this grammar usable") is already satisfied.
+	if (entry.builtin) {
+		return { ok: true, languageId: entry.id, path: "<built in>", sizeBytes: 0 };
 	}
 
 	const path = grammarCachePath(entry.id);
@@ -250,9 +310,15 @@ export async function downloadGrammar(
 	return { ok: false, languageId: entry.id, error: errors.join("; ") };
 }
 
-/** Delete a cached grammar. Returns false when nothing was there. */
+/**
+ * Delete a cached grammar. Returns false when nothing was there.
+ *
+ * A builtin grammar cannot be removed: its bytes are in the executable, so deleting
+ * would free nothing while breaking bash command analysis.
+ */
 export function removeGrammar(languageId: string): boolean {
-	if (!getGrammarEntry(languageId)) return false;
+	const entry = getGrammarEntry(languageId);
+	if (!entry || entry.builtin) return false;
 	const path = grammarCachePath(languageId);
 	if (!existsSync(path)) return false;
 	try {

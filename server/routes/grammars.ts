@@ -16,6 +16,7 @@ import {
 	clearOutlineCache,
 	downloadGrammar,
 	EXCLUDED_GRAMMARS,
+	getGrammarEntry,
 	grammarCacheSize,
 	invalidateParser,
 	isKnownGrammarLanguage,
@@ -64,6 +65,12 @@ grammarRoutes.post("/:lang/download", async (c) => {
 /** DELETE /api/grammars/:lang — drop the cached grammar. */
 grammarRoutes.delete("/:lang", async (c) => {
 	const lang = requireKnownLanguage(c.req.param("lang"));
+	// A builtin cannot be removed. Refused explicitly rather than reported as
+	// `removed: false`, which reads like "there was nothing there" — and without
+	// dropping a working parser from the pool on the way out.
+	if (getGrammarEntry(lang)?.builtin) {
+		throw new ValidationError(`${lang} ships with the app and cannot be removed.`);
+	}
 	const removed = removeGrammar(lang);
 	invalidateParser(lang);
 	clearOutlineCache();

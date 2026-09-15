@@ -1,3 +1,197 @@
+/** Ceilings for the cross-file usage scan, so one call cannot fan out unbounded. */
+const MAX_USAGE_CANDIDATES = 200;
+const MAX_USAGE_FILE_BYTES = 2_000_000;
+const USAGE_GREP_TIMEOUT_MS = 15_000;
+const USAGE_GREP_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * `usages` — where a symbol is referenced in OTHER files.
+ *
+ * Two stages, because neither alone is both fast and honest: ripgrep narrows thousands of
+ * files to the few whose text contains the name, then the parser confirms each hit is a
+ * real identifier rather than a mention in a comment or string. See cross-file-usages.ts
+ * for why the result is labelled structural rather than semantic.
+ */
+async function runUsages(
+	filePath: string,
+	doc: StructDocument,
+	resolved: Resolved,
+	args: Record<string, unknown>,
+	notes: string[],
+	io: {
+		backend: ReturnType<typeof getToolBackend>;
+		baseCwd: string;
+		ioPath: string;
+		signal?: AbortSignal;
+	},
+): Promise<ToolResult> {
+	// Resolve the name being traced. A symbol is taken verbatim; an address resolves to the
+	// declaration whose name we then search for.
+	const rawSymbol = typeof args.symbol === "string" ? args.symbol.trim() : "";
+	let name = "";
+	if (rawSymbol) {
+		const parsed = parseSymbolSelector(rawSymbol);
+		const matches = await resolved.provider.locate(doc, {
+			symbol: parsed.symbol,
+			...(parsed.nth != null ? { nth: parsed.nth } : {}),
+		});
+		const located = matches[0];
+		// The bare final segment: `Class.method` is searched as `method`, since that is the
+		// identifier that appears at call sites.
+		name = located ? located.name : (parsed.symbol.split(".").pop() ?? parsed.symbol);
+	} else {
+		return {
+			output:
+				'mode=usages needs a `symbol` to trace across files (e.g. symbol: "resolveSelectionOverlayBlockId").',
+			isError: true,
+			title: filePath,
+		};
+	}
+
+	if (!/^[A-Za-z_$][\w$]*$/.test(name)) {
+		return {
+			output: `"${name}" is not a plain identifier, so a cross-file name search would be unreliable. Trace a named declaration instead.`,
+			isError: true,
+			title: filePath,
+		};
+	}
+
+	// Stage 1: ripgrep prefilter. `\bNAME\b` keeps the candidate set to files that mention
+	// the name at all; the parser does the real work in stage 2.
+	let candidatePaths: string[];
+	let candidatesCapped = false;
+	try {
+		const grepResult = await io.backend.grep({
+			pattern: `\\b${name}\\b`,
+			searchPath: io.baseCwd,
+			cwd: io.baseCwd,
+			outputMode: "files_with_matches",
+			showLineNumbers: false,
+			maxBytes: USAGE_GREP_MAX_BYTES,
+			timeoutMs: USAGE_GREP_TIMEOUT_MS,
+			...(io.signal ? { signal: io.signal } : {}),
+		});
+		if (grepResult.unavailable) {
+			return {
+				output:
+					"No search backend (ripgrep/grep) is available, so cross-file usages cannot be found.",
+				isError: true,
+				title: filePath,
+			};
+		}
+		const decoded = new TextDecoder().decode(grepResult.stdoutBytes).trim();
+		const all = decoded.length > 0 ? decoded.split(/\r?\n/) : [];
+		// Drop the file being inspected: this mode answers "who ELSE uses it".
+		const others = all.filter((p) => {
+			const abs = resolveBackendPath(io.backend, io.baseCwd, p);
+			return abs !== io.ioPath && p !== filePath;
+		});
+		candidatesCapped = grepResult.truncatedByBytes === true || others.length > MAX_USAGE_CANDIDATES;
+		candidatePaths = others.slice(0, MAX_USAGE_CANDIDATES);
+	} catch (err) {
+		return {
+			output: `Cross-file search failed: ${err instanceof Error ? err.message : String(err)}`,
+			isError: true,
+			title: filePath,
+		};
+	}
+
+	// Stage 2: parse each candidate and keep only real identifier lines.
+	const hits: RawFileHit[] = [];
+	let skipped = 0;
+	for (const relPath of candidatePaths) {
+		if (io.signal?.aborted) break;
+		try {
+			const abs = resolveBackendPath(io.backend, io.baseCwd, relPath);
+			const read = await io.backend.readFileBytes(abs, {
+				maxBytes: MAX_USAGE_FILE_BYTES,
+				...(io.signal ? { signal: io.signal } : {}),
+			});
+			if (read.truncated) {
+				skipped++;
+				continue;
+			}
+			const { text: candidateText } = decodeFileBytes(read.bytes);
+			const candidateDoc: StructDocument = {
+				filePath: abs,
+				text: candidateText,
+				languageId: languageIdForExtension(extname(abs)),
+				...(io.signal ? { signal: io.signal } : {}),
+			};
+			const lines = await referenceLines(candidateDoc);
+			if (!lines) {
+				// No parser for this language: fall back to reporting it as a text match, so a
+				// hit in an unsupported file is not silently dropped.
+				hits.push({ path: relPath, lines: [] });
+				skipped++;
+				continue;
+			}
+			hits.push({ path: relPath, lines: lines.get(name) ?? [] });
+		} catch {
+			skipped++;
+		}
+	}
+
+	const result = assembleUsages(hits, { candidatesCapped, skipped });
+
+	if (result.files.length === 0) {
+		const why =
+			result.textOnlyFiles > 0
+				? ` The name appears in ${result.textOnlyFiles} other file(s) but only in comments or strings.`
+				: "";
+		return {
+			output: withFooter(
+				`${header(filePath, doc, resolved)}\nusages of ${name}`,
+				`No cross-file identifier usages found.${why}\n\n${CROSS_FILE_PRECISION_NOTE}`,
+				notes,
+			),
+			title: filePath,
+			metadata: { mode: "usages", provider: resolved.provider.id, files: 0 },
+		};
+	}
+
+	const totalRefs = result.files.reduce((n, f) => n + f.lines.length, 0);
+	const body = result.files
+		.map((file) => {
+			const shown = file.lines.map((l) => `L${l}`).join(", ");
+			return `  ${file.path}  (${file.lines.length})  ${shown}`;
+		})
+		.join("\n");
+
+	const caveats: string[] = [];
+	if (result.candidatesCapped) {
+		caveats.push(
+			`Candidate files were capped at ${MAX_USAGE_CANDIDATES}; narrow with a more specific name if results look incomplete.`,
+		);
+	}
+	if (result.skipped > 0) {
+		caveats.push(`${result.skipped} candidate(s) skipped (too large, unreadable, or no parser).`);
+	}
+	if (result.textOnlyFiles > 0) {
+		caveats.push(
+			`${result.textOnlyFiles} file(s) matched only in comments/strings and were excluded.`,
+		);
+	}
+
+	return {
+		output: withFooter(
+			`${header(filePath, doc, resolved)}\n${result.files.length} file(s) reference ${name} (${totalRefs} identifier occurrence(s))`,
+			`${body}\n\n${CROSS_FILE_PRECISION_NOTE}${caveats.length > 0 ? `\n${caveats.join("\n")}` : ""}`,
+			notes,
+		),
+		title: filePath,
+		metadata: {
+			mode: "usages",
+			provider: resolved.provider.id,
+			precision: precisionOf(resolved),
+			files: result.files.length,
+			occurrences: totalRefs,
+			textOnlyFiles: result.textOnlyFiles,
+			...(result.candidatesCapped ? { candidatesCapped: true } : {}),
+		},
+	};
+}
+
 /**
  * StructView — read a file by its structure instead of by line windows.
  *
@@ -19,18 +213,28 @@ import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
 import {
 	AddressError,
+	analyzeExtraction,
+	assembleUsages,
+	CROSS_FILE_PRECISION_NOTE,
+	countByTag,
 	type ElementNode,
+	type InterfaceSymbol,
+	type LandmarkKind,
 	type LocatedNode,
 	languageIdForExtension,
 	type OutlineNode,
 	parseAddress,
 	parsePosition,
 	parseSymbolSelector,
+	type RawFileHit,
 	referenceCounts,
+	referenceLines,
 	resolveAddress,
 	resolveProvider,
 	type StructDocument,
 	type StructKind,
+	scanLandmarks,
+	straddlingDeclarations,
 } from "../structural";
 import type { ToolDefinition, ToolResult } from "../types";
 import { decodeFileBytes } from "./encoding";
@@ -49,6 +253,12 @@ const DEFAULT_DEPTH = 2;
 const MAX_PRINT_BLOCKS = 200;
 const MAX_PRINT_LINES = 2000;
 
+/** Landmarks shown before suggesting a higher `limit`. */
+const MAX_LANDMARKS = 120;
+
+/** Landmark kinds accepted by the `kind` filter. */
+const LANDMARK_KINDS = ["section", "region", "marker"] as const;
+
 type Mode =
 	| "outline"
 	| "extract"
@@ -59,7 +269,10 @@ type Mode =
 	| "tree"
 	| "refs"
 	| "calls"
-	| "report";
+	| "report"
+	| "landmarks"
+	| "interface"
+	| "usages";
 
 const MODES: Mode[] = [
 	"outline",
@@ -72,10 +285,22 @@ const MODES: Mode[] = [
 	"refs",
 	"calls",
 	"report",
+	"landmarks",
+	"interface",
+	"usages",
 ];
 
 /** Rows shown by the ranking modes before the tail is summarized. */
 const MAX_RANKED_ROWS = 25;
+
+/**
+ * Reference positions shown per symbol before collapsing to "+N more".
+ *
+ * A hot identifier can appear hundreds of times; printing every line would bury the rows
+ * that matter under one symbol's noise. The full list stays available in the stats for
+ * range analysis, which needs all of them.
+ */
+const MAX_REF_POSITIONS = 20;
 
 /** Hard cap on report output; the point is to be cheaper than 6 separate calls. */
 const MAX_REPORT_LINES = 800;
@@ -97,14 +322,17 @@ Modes:
 - enclosing: given a line (from Grep output, a stack trace, a diff), which function/class it belongs to. Returns the symbol chain, e.g. "PaymentService.charge".
 - imports: the file's imports plus its exported symbols.
 - tree: nested element (JSX) skeleton — which components are rendered, how deep, and which are behind a condition or a .map. Attribute values are omitted. Answers what outline cannot for UI files, whose render block is often most of the file.
-- refs: every declaration with how many times its name appears in this file, fewest first. \`refs: 1\` means "defined and never used here" — the fastest dead-code signal available.
+- refs: every declaration with how many times its name appears in this file AND the lines it appears on, fewest first. \`refs: 1\` means "defined and never used here" — the fastest dead-code signal available. The positions answer the follow-up a bare count cannot: whether all uses sit inside a range you mean to extract.
 - calls: call frequency inside the file, with \`filter\` for a prefix (\`filter: "use"\` for hooks). Also lists JSX component usage counts.
-- print: sed-style line/regex output filtering. Needs no grammar, so it works on any text file (config, log, unsupported language).
+- landmarks: the boundaries the AUTHOR drew — section banners (\`// --- Scroll state ---\`), \`#region\` blocks, and TODO/FIXME/HACK markers. outline reports what a file declares; this reports where its writer thought the seams were, which is the better starting point for splitting a long file. Needs no parser.
+- interface: given a line range (\`address\`) or a \`symbol\`, what extracting it would require — which outside symbols it uses (become parameters), which of its own symbols are used outside (must be exported), and which are self-contained (move with it). Answers "is this a clean seam and what's the signature", the question outline cannot.
+- usages: where a \`symbol\` is referenced in OTHER files. ripgrep prefilters, then the parser drops comment/string matches. Structural not semantic — a same-named different symbol is included and an aliased import is missed — so confirm before renaming or deleting. This is the cross-file view refs/report cannot give.
+- print: sed-style line/regex output filtering. Needs no parser, so it works on any text file (config, log, unsupported language).
 
 Addresses for print: \`42\` (one line), \`10,20\` (range), \`10,$\` (to EOF), \`$\` (last line), \`/regex/\` (each matching line), \`/from/,/to/\` (block).
 
 Notes:
-- Accurate structure needs the language's tree-sitter grammar (installed under Settings → Structural Parsing). Without it, outline/extract fall back to text heuristics and say so; tree/refs/calls/report require a real grammar and report that plainly rather than guessing.
+- Accurate structure needs the language's parser installed (Settings → Structural Parsing). Without it, outline/extract fall back to text heuristics and say so; tree/refs/calls/report need the parser and report that plainly rather than guessing.
 - Counts and structure are syntactic and single-file: two same-named symbols collapse together, and a symbol used only in OTHER files still shows refs: 1. Confirm cross-file usage with Grep before deleting anything.`;
 
 const rawJsonSchema: Record<string, unknown> = {
@@ -127,7 +355,7 @@ const rawJsonSchema: Record<string, unknown> = {
 		},
 		kind: {
 			description:
-				'Comma-separated declaration kinds to keep (e.g. "function,method" or "interface,type"). Applies to outline, extract and api.',
+				'Comma-separated declaration kinds to keep (e.g. "function,method" or "interface,type"). Applies to outline, extract and api. For mode=landmarks it filters landmark kinds instead: "section", "region", "marker".',
 			type: "string",
 		},
 		depth: {
@@ -137,7 +365,7 @@ const rawJsonSchema: Record<string, unknown> = {
 		},
 		with_refs: {
 			description:
-				"For mode=outline: annotate each entry with how many times its name appears in this file (definition included). Requires an installed grammar.",
+				"For mode=outline: annotate each entry with how many times its name appears in this file (definition included). Requires an installed language parser.",
 			type: "boolean",
 		},
 		filter: {
@@ -250,10 +478,16 @@ export const structViewTool: ToolDefinition = {
 		}
 
 		// `print` is intentionally decided before any language detection: line and
-		// regex addresses need no grammar, so it must work on a log or a config file
+		// regex addresses need no parser, so it must work on a log or a config file
 		// exactly as it does on TypeScript.
 		if (mode === "print") {
 			return runPrint(filePath, text, args, truncatedRead);
+		}
+
+		// Same reasoning: landmarks are a comment convention, so they resolve without a
+		// parser and stay available exactly where structural help is scarcest.
+		if (mode === "landmarks") {
+			return runLandmarks(filePath, text, args, truncatedRead);
 		}
 
 		const languageId = languageIdForExtension(extname(resolvedPath));
@@ -301,6 +535,15 @@ export const structViewTool: ToolDefinition = {
 				return runEnclosing(filePath, doc, resolved, args, notes);
 			case "imports":
 				return runImports(filePath, doc, resolved, notes);
+			case "interface":
+				return runInterface(filePath, doc, resolved, args, notes);
+			case "usages":
+				return runUsages(filePath, doc, resolved, args, notes, {
+					backend,
+					baseCwd: toolBaseCwd(backend, ctx.cwd),
+					ioPath,
+					signal: ctx.signal,
+				});
 			case "tree":
 				return runElementTree(filePath, doc, resolved, args, notes);
 			case "refs":
@@ -316,6 +559,19 @@ export const structViewTool: ToolDefinition = {
 };
 
 type Resolved = NonNullable<Awaited<ReturnType<typeof resolveProvider>>>;
+
+/**
+ * The display-facing precision of a result: whether the structure is exact or a heuristic
+ * approximation.
+ *
+ * Kept separate from `provider.id` on purpose. The id ("tree-sitter", "heuristic") is an
+ * internal fact used by tests and diagnostics; the card and the model only need to know how
+ * far to trust the answer. Emitting the precision as its own metadata field lets the card
+ * show "exact" without exposing — or losing — the parser identity behind it.
+ */
+function precisionOf(resolved: Resolved): "exact" | "approximate" {
+	return resolved.support === "full" ? "exact" : "approximate";
+}
 
 // ── modes ────────────────────────────────────────────────────────────
 
@@ -336,7 +592,7 @@ async function runOutline(
 		if (counts) annotated = annotateRefs(nodes, counts);
 		else {
 			notes.push(
-				"Reference counts need an installed grammar for this language, so they were omitted.",
+				"Reference counts need an installed parser for this language, so they were omitted.",
 			);
 		}
 	}
@@ -348,7 +604,12 @@ async function runOutline(
 		return {
 			output: renderEmpty(filePath, doc, resolved, notes, "No declarations found."),
 			title: filePath,
-			metadata: { mode: "outline", provider: resolved.provider.id, declarations: 0 },
+			metadata: {
+				mode: "outline",
+				provider: resolved.provider.id,
+				precision: precisionOf(resolved),
+				declarations: 0,
+			},
 		};
 	}
 
@@ -363,6 +624,7 @@ async function runOutline(
 		metadata: {
 			mode: "outline",
 			provider: resolved.provider.id,
+			precision: precisionOf(resolved),
 			support: resolved.support,
 			languageId: doc.languageId,
 			declarations: countNodes(filtered),
@@ -393,7 +655,12 @@ async function runApi(
 				"No exported declarations found. The module may export nothing, or exports may be indirect (re-exports, dynamic assignment).",
 			),
 			title: filePath,
-			metadata: { mode: "api", provider: resolved.provider.id, exports: 0 },
+			metadata: {
+				mode: "api",
+				provider: resolved.provider.id,
+				precision: precisionOf(resolved),
+				exports: 0,
+			},
 		};
 	}
 
@@ -405,6 +672,7 @@ async function runApi(
 		metadata: {
 			mode: "api",
 			provider: resolved.provider.id,
+			precision: precisionOf(resolved),
 			support: resolved.support,
 			exports: countNodes(filtered),
 		},
@@ -477,6 +745,7 @@ async function runExtract(
 		metadata: {
 			mode: "extract",
 			provider: resolved.provider.id,
+			precision: precisionOf(resolved),
 			support: resolved.support,
 			symbolPath: node.symbolPath,
 			kind: node.kind,
@@ -512,7 +781,12 @@ async function runEnclosing(
 				notes,
 			),
 			title: filePath,
-			metadata: { mode: "enclosing", provider: resolved.provider.id, depth: 0 },
+			metadata: {
+				mode: "enclosing",
+				provider: resolved.provider.id,
+				precision: precisionOf(resolved),
+				depth: 0,
+			},
 		};
 	}
 
@@ -535,6 +809,7 @@ async function runEnclosing(
 		metadata: {
 			mode: "enclosing",
 			provider: resolved.provider.id,
+			precision: precisionOf(resolved),
 			support: resolved.support,
 			symbolPath: innermost.symbolPath,
 			kind: innermost.kind,
@@ -580,6 +855,7 @@ async function runImports(
 		metadata: {
 			mode: "imports",
 			provider: resolved.provider.id,
+			precision: precisionOf(resolved),
 			imports: info.imports.length,
 			exports: info.exports.length,
 		},
@@ -676,6 +952,264 @@ function runPrint(
 	};
 }
 
+/**
+ * `interface` — what extracting a range would require.
+ *
+ * Accepts either an `address` (a line range) or a `symbol`, because both phrasings of the
+ * same question come up: "can I pull L2177-2418 out" and "can I pull this method out".
+ */
+async function runInterface(
+	filePath: string,
+	doc: StructDocument,
+	resolved: Resolved,
+	args: Record<string, unknown>,
+	notes: string[],
+): Promise<ToolResult> {
+	const lines = await referenceLines(doc);
+	if (!lines) {
+		return {
+			output: unsupportedModeMessage("interface", doc, resolved),
+			isError: true,
+			title: filePath,
+		};
+	}
+
+	// Resolve the range from whichever form the caller used.
+	let range: { startLine: number; endLine: number } | null = null;
+	let label = "";
+	const rawSymbol = typeof args.symbol === "string" ? args.symbol.trim() : "";
+	const rawAddress = typeof args.address === "string" ? args.address.trim() : "";
+	if (rawSymbol && rawAddress) {
+		return {
+			output:
+				"Give either `symbol` or `address`, not both — they select different ranges and guessing which one you meant could analyse the wrong block.",
+			isError: true,
+			title: filePath,
+		};
+	}
+
+	const outline = flattenPublic(await resolved.provider.outline(doc));
+
+	if (rawSymbol) {
+		const parsed = parseSymbolSelector(rawSymbol);
+		const matches = await resolved.provider.locate(doc, {
+			symbol: parsed.symbol,
+			...(parsed.nth != null ? { nth: parsed.nth } : {}),
+		});
+		const located = matches[0];
+		if (!located) {
+			return {
+				output: `No symbol matching "${rawSymbol}" in ${filePath}. Use mode=outline to see what this file declares.`,
+				isError: true,
+				title: filePath,
+			};
+		}
+		range = { startLine: located.startLine, endLine: located.endLine };
+		label = `${located.kind} ${located.name}`;
+	} else if (rawAddress) {
+		try {
+			const resolvedBlocks = resolveAddress(parseAddress(rawAddress), doc.text.split("\n"));
+			const first = resolvedBlocks.blocks[0];
+			const last = resolvedBlocks.blocks[resolvedBlocks.blocks.length - 1];
+			if (!first || !last) {
+				return {
+					output: `Address "${rawAddress}" matched nothing in ${filePath}.`,
+					isError: true,
+					title: filePath,
+				};
+			}
+			range = { startLine: first.startLine, endLine: last.endLine };
+			label = `L${range.startLine}-${range.endLine}`;
+		} catch (err) {
+			return {
+				output: err instanceof AddressError ? `Invalid address: ${err.message}` : String(err),
+				isError: true,
+				title: filePath,
+			};
+		}
+	} else {
+		return {
+			output:
+				'mode=interface needs a range: pass `address` for lines (e.g. "2177,2418") or `symbol` for a declaration.',
+			isError: true,
+			title: filePath,
+		};
+	}
+
+	const straddling = straddlingDeclarations(range, outline);
+	const analysis = analyzeExtraction(range, outline, lines, {
+		...(normalizeNumber(args.limit, { min: 1 }) != null
+			? { limit: normalizeNumber(args.limit, { min: 1 }) as number }
+			: {}),
+	});
+
+	const rangeLines = range.endLine - range.startLine + 1;
+	const sections: string[] = [];
+
+	// A declaration cut in half comes first: no interface analysis makes extracting the
+	// middle of a function work, so saying it up front prevents acting on the rest.
+	if (straddling.length > 0) {
+		sections.push(
+			`⚠ RANGE SPLITS ${straddling.length} DECLARATION(S) — extracting this would cut them in half.\n` +
+				straddling
+					.slice(0, 10)
+					.map((n) => `  L${n.startLine}-${n.endLine}  ${n.kind} ${n.name}`)
+					.join("\n") +
+				"\nAdjust the range to whole declarations, or use mode=enclosing to find their bounds.",
+		);
+	}
+
+	const renderGroup = (
+		title: string,
+		entries: readonly InterfaceSymbol[],
+		hint: string,
+	): string => {
+		if (entries.length === 0) return `${title}: none.`;
+		const rows = entries
+			.map((symbol) => {
+				const at = symbol.declaredAt != null ? `L${symbol.declaredAt}` : "elsewhere";
+				const kind = symbol.kind ? `${symbol.kind} ` : "";
+				const crossings =
+					symbol.outside.length > 0
+						? ` · used outside at ${symbol.outside
+								.slice(0, 6)
+								.map((l) => `L${l}`)
+								.join(", ")}${symbol.outside.length > 6 ? ` +${symbol.outside.length - 6}` : ""}`
+						: ` · ${symbol.inside.length} use(s) inside`;
+				return `  ${kind}${symbol.name}  (declared ${at})${crossings}${symbol.exported ? " [already exported]" : ""}`;
+			})
+			.join("\n");
+		return `${title} (${entries.length}) — ${hint}\n${rows}`;
+	};
+
+	sections.push(
+		renderGroup(
+			"NEEDS INPUT",
+			analysis.needsInput,
+			"defined outside the range: these become parameters or imports.",
+		),
+	);
+	sections.push(
+		renderGroup(
+			"NEEDS EXPORT",
+			analysis.needsExport,
+			"defined inside but used outside: export these or those callers break.",
+		),
+	);
+	sections.push(
+		renderGroup(
+			"SELF-CONTAINED",
+			analysis.selfContained,
+			"defined and used only inside: they move with the block.",
+		),
+	);
+
+	const verdict =
+		straddling.length > 0
+			? "Not extractable as given: the range splits declarations."
+			: analysis.needsExport.length === 0
+				? `Clean seam: nothing outside depends on this range's internals. It needs ${analysis.needsInput.length} input(s).`
+				: `Extractable, but ${analysis.needsExport.length} symbol(s) must be exported and ${analysis.needsInput.length} supplied.`;
+
+	return {
+		output: withFooter(
+			`${header(filePath, doc, resolved)}\nInterface for ${label} (${rangeLines} lines, ${analysis.declarationsInRange.length} whole declaration(s))`,
+			`${sections.join("\n\n")}\n\n${verdict}\nName-based and single-file: same-named symbols collapse, and cross-file usage is invisible.`,
+			notes,
+		),
+		title: filePath,
+		metadata: {
+			mode: "interface",
+			provider: resolved.provider.id,
+			precision: precisionOf(resolved),
+			startLine: range.startLine,
+			endLine: range.endLine,
+			needsInput: analysis.needsInput.length,
+			needsExport: analysis.needsExport.length,
+			selfContained: analysis.selfContained.length,
+			straddling: straddling.length,
+		},
+	};
+}
+
+/**
+ * `landmarks` — the boundaries the author wrote down.
+ *
+ * Reported as a flat, line-ordered list rather than grouped by kind: the value is seeing
+ * where the seams fall relative to each other, and grouping would scatter a file's running
+ * order across three lists.
+ */
+function runLandmarks(
+	filePath: string,
+	text: string,
+	args: Record<string, unknown>,
+	truncatedRead: boolean,
+): ToolResult {
+	const limit = normalizeNumber(args.limit, { min: 1 }) ?? MAX_LANDMARKS;
+	// `kind` is the same comma-separated string the other modes take, so "section,marker"
+	// works here exactly as "function,method" does there.
+	const requested =
+		typeof args.kind === "string"
+			? args.kind
+					.split(",")
+					.map((part) => part.trim().toLowerCase())
+					.filter((part): part is LandmarkKind => LANDMARK_KINDS.includes(part as never))
+			: null;
+
+	const marks = scanLandmarks(text, {
+		limit: limit + 1,
+		...(requested && requested.length > 0 ? { kinds: requested } : {}),
+	});
+	const total = text.split("\n").length;
+	const shown = marks.slice(0, limit);
+
+	if (shown.length === 0) {
+		return {
+			output:
+				`${filePath}  ${total} lines\n\n` +
+				"No landmarks found: no section banners, #region blocks or TODO/FIXME markers.\n" +
+				"Try mode=outline for declared structure, or mode=report for a summary.",
+			title: filePath,
+			metadata: { mode: "landmarks", landmarks: 0, totalLines: total },
+		};
+	}
+
+	const body = shown
+		.map((mark) => {
+			const at = `L${String(mark.line).padEnd(6)}`;
+			if (mark.kind === "marker") return `${at} ${mark.tag}  ${mark.label}`;
+			const label = mark.label.length > 0 ? mark.label : "(rule)";
+			return `${at} ${mark.kind === "region" ? "region" : "──────"}  ${label}`;
+		})
+		.join("\n");
+
+	const tags = countByTag(shown);
+	const tagSummary =
+		tags.size > 0
+			? ` Markers: ${[...tags]
+					.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+					.map(([tag, count]) => `${tag} ${count}`)
+					.join(", ")}.`
+			: "";
+	const sections = shown.filter((m) => m.kind !== "marker").length;
+	const summary =
+		`${shown.length} landmark(s) across ${total} lines; ${sections} mark section boundaries.` +
+		tagSummary +
+		(marks.length > shown.length ? " More exist (raise `limit`)." : "") +
+		(truncatedRead ? " The file was read only in part, so later landmarks are missing." : "");
+
+	return {
+		output: `${filePath}  ${total} lines\nline    kind    label\n${body}\n\n${summary}`,
+		title: filePath,
+		metadata: {
+			mode: "landmarks",
+			landmarks: shown.length,
+			sections,
+			totalLines: total,
+		},
+	};
+}
+
 async function runElementTree(
 	filePath: string,
 	doc: StructDocument,
@@ -708,7 +1242,12 @@ async function runElementTree(
 	return {
 		output: withFooter(header(filePath, doc, resolved), clampOutput(lines.join("\n")), notes),
 		title: filePath,
-		metadata: { mode: "tree", provider: resolved.provider.id, elements: countElements(roots) },
+		metadata: {
+			mode: "tree",
+			provider: resolved.provider.id,
+			precision: precisionOf(resolved),
+			elements: countElements(roots),
+		},
 	};
 }
 
@@ -748,11 +1287,23 @@ async function runRefs(
 
 	const unused = rows.filter((row) => row.refs <= 1);
 	const shown = rows.slice(0, limit);
+	// Positions, not just counts: "7 references" cannot tell you whether they all sit
+	// inside the range you mean to extract, and without them the only way to find out is
+	// to leave these tools and grep.
+	const lines = await referenceLines(doc);
 	const body = shown
-		.map(
-			(row) =>
-				`${String(row.refs).padStart(4)}  L${String(row.node.startLine).padEnd(6)} ${row.node.kind} ${row.node.name}`,
-		)
+		.map((row) => {
+			const base = `${String(row.refs).padStart(4)}  L${String(row.node.startLine).padEnd(6)} ${row.node.kind} ${row.node.name}`;
+			const at = refLinesForNode(row.node, lines);
+			if (!at || at.length === 0) return base;
+			// The definition's own line is dropped: it is already the row's L-number, and
+			// repeating it makes a one-reference symbol look like it has a use somewhere.
+			const uses = at.filter((line) => line !== row.node.startLine);
+			if (uses.length === 0) return base;
+			const head = uses.slice(0, MAX_REF_POSITIONS).map((line) => `L${line}`);
+			const rest = uses.length - head.length;
+			return `${base}  · ${head.join(", ")}${rest > 0 ? ` +${rest} more` : ""}`;
+		})
 		.join("\n");
 
 	const summary =
@@ -771,6 +1322,7 @@ async function runRefs(
 		metadata: {
 			mode: "refs",
 			provider: resolved.provider.id,
+			precision: precisionOf(resolved),
 			declarations: rows.length,
 			singleReference: unused.length,
 		},
@@ -836,6 +1388,7 @@ async function runCalls(
 		metadata: {
 			mode: "calls",
 			provider: resolved.provider.id,
+			precision: precisionOf(resolved),
 			distinctCalls: stats.calls.length,
 		},
 	};
@@ -899,24 +1452,52 @@ async function runReport(
 
 	// 4. Dead-code candidates.
 	if (counts) {
-		const single = flat
+		const singleRef = flat
 			.filter((node) => node.kind !== "call")
 			.map((node) => ({ node, refs: refsForNode(node, counts) }))
 			.filter((row) => row.refs === 1);
+
+		// An exported symbol's callers are, by definition, in other files. Listing it as a
+		// dead-code candidate is a category error, not merely noise: `export function
+		// NarratorPanel` appeared on this list while being the component's only entry point.
+		const single = singleRef.filter((row) => !row.node.exported);
+		// An underscore prefix is a convention meaning "kept on purpose", and a convention is
+		// not a fact — `_foo` can equally be a leftover. So these are separated rather than
+		// dropped: the signal stays visible without diluting the main list.
+		const intentional = single.filter((row) => isIntentionallyKept(row.node.name));
+		const candidates = single.filter((row) => !isIntentionallyKept(row.node.name));
+		const exportedCount = singleRef.length - single.length;
 		const orphanBindings = unusedBindings(flat, counts);
 
 		const parts: string[] = [];
-		if (single.length > 0) {
+		if (candidates.length > 0) {
 			parts.push(
-				`SINGLE-REFERENCE SYMBOLS (${single.length}) — defined but never used in this file.\n` +
-					`Cross-file usage is invisible here; confirm with Grep before deleting.\n${single
+				`SINGLE-REFERENCE SYMBOLS (${candidates.length}) — defined but never used in this file.\n` +
+					`Cross-file usage is invisible here; confirm with Grep before deleting.\n${candidates
 						.slice(0, 30)
 						.map((row) => `  L${row.node.startLine}  ${row.node.kind} ${row.node.name}`)
 						.join("\n")}` +
-					(single.length > 30 ? `\n  … ${single.length - 30} more` : ""),
+					(candidates.length > 30 ? `\n  … ${candidates.length - 30} more` : ""),
 			);
 		} else {
-			parts.push("SINGLE-REFERENCE SYMBOLS: none — every declaration is used at least twice here.");
+			parts.push(
+				"SINGLE-REFERENCE SYMBOLS: none — every non-exported declaration is used at least twice here.",
+			);
+		}
+		if (intentional.length > 0) {
+			parts.push(
+				`INTENTIONALLY KEPT (${intentional.length}) — underscore-prefixed, so the author marked them as deliberate.\n` +
+					`Listed separately because the prefix states intent, not proof; verify before removing.\n${intentional
+						.slice(0, 20)
+						.map((row) => `  L${row.node.startLine}  ${row.node.kind} ${row.node.name}`)
+						.join("\n")}` +
+					(intentional.length > 20 ? `\n  … ${intentional.length - 20} more` : ""),
+			);
+		}
+		if (exportedCount > 0) {
+			parts.push(
+				`${exportedCount} exported symbol(s) referenced once here were excluded: their callers live in other files by design.`,
+			);
 		}
 		if (orphanBindings.length > 0) {
 			parts.push(
@@ -941,7 +1522,7 @@ async function runReport(
 
 	if (!stats) {
 		notes.push(
-			"Call counts and reference counts need an installed grammar for this language and were omitted.",
+			"Call counts and reference counts need an installed parser for this language and were omitted.",
 		);
 	}
 
@@ -958,6 +1539,7 @@ async function runReport(
 		metadata: {
 			mode: "report",
 			provider: resolved.provider.id,
+			precision: precisionOf(resolved),
 			declarations: flat.length,
 			hasStatistics: stats != null,
 			hasRenderTree: (elements?.length ?? 0) > 0,
@@ -975,10 +1557,9 @@ async function runReport(
  */
 function header(filePath: string, doc: StructDocument, resolved: Resolved): string {
 	const lang = doc.languageId ?? "unknown";
-	const via =
-		resolved.support === "full"
-			? resolved.provider.label
-			: `${resolved.provider.label}, approximate`;
+	// Provider labels already state precision ("exact", "text heuristics"), so a degraded
+	// exact provider is reported as "approximate" outright rather than "exact, approximate".
+	const via = resolved.support === "full" ? resolved.provider.label : "approximate";
 	const lineCount = doc.text.split("\n").length;
 	const kb = Math.round(Buffer.byteLength(doc.text, "utf8") / 1024);
 	return `${filePath}  [${lang}, via ${via}]  ${lineCount} lines · ${kb} KB`;
@@ -1021,7 +1602,7 @@ function unsupportedModeMessage(mode: string, doc: StructDocument, resolved: Res
 	return (
 		`mode=${mode} needs parsed structure, which is unavailable for ${lang} ` +
 		`(currently using ${resolved.provider.label}). ` +
-		`Install the grammar under Settings → Structural Parsing, or use mode=outline / mode=print, which work without one.`
+		`Install the parser under Settings → Structural Parsing, or use mode=outline / mode=print, which work without one.`
 	);
 }
 
@@ -1083,6 +1664,38 @@ function refsForNode(node: OutlineNode, counts: ReadonlyMap<string, number>): nu
 		return max > 0 ? max : undefined;
 	}
 	return counts.get(node.name);
+}
+
+/**
+ * Reference lines for one outline row.
+ *
+ * Unlike `refsForNode`, a destructuring declaration UNIONS its bindings' lines rather than
+ * taking a maximum: the question is "where is this touched", and every binding's position
+ * belongs in that answer.
+ */
+/**
+ * Whether a name carries the "kept on purpose" convention.
+ *
+ * A single leading underscore is the widespread signal for a deliberately unused binding.
+ * Dunder names (`__proto__`) and the bare `_` placeholder are covered by the same rule.
+ */
+function isIntentionallyKept(name: string): boolean {
+	return name.startsWith("_");
+}
+
+function refLinesForNode(
+	node: OutlineNode,
+	lines: ReadonlyMap<string, number[]> | null,
+): number[] | undefined {
+	if (!lines) return undefined;
+	if (node.bindings && node.bindings.length > 0) {
+		const union = new Set<number>();
+		for (const binding of node.bindings) {
+			for (const line of lines.get(binding) ?? []) union.add(line);
+		}
+		return union.size > 0 ? [...union].sort((a, b) => a - b) : undefined;
+	}
+	return lines.get(node.name);
 }
 
 /**

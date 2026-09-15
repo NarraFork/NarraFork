@@ -192,7 +192,13 @@ export function StructuralGrammarsSection() {
 														</Text>
 													</Table.Td>
 													<Table.Td>
-														{grammar.digestMismatch ? (
+														{grammar.builtin ? (
+															<Tooltip label={t("grammarsBuiltinHint")}>
+																<Badge color="blue" variant="light">
+																	{t("grammarsBuiltin")}
+																</Badge>
+															</Tooltip>
+														) : grammar.digestMismatch ? (
 															<Tooltip label={t("grammarsDigestMismatchHint")}>
 																<Badge color="yellow" variant="light">
 																	{t("grammarsDigestMismatch")}
@@ -210,26 +216,35 @@ export function StructuralGrammarsSection() {
 													</Table.Td>
 													<Table.Td>
 														<Text size="xs" c="dimmed">
-															{formatBytes(grammar.sizeBytes ?? grammar.expectedBytes)}
+															{/* A builtin uses no cache space, and its embedded build differs
+															    in size from the downloadable one, so a figure here would be
+															    wrong in both readings. */}
+															{grammar.builtin
+																? "—"
+																: formatBytes(grammar.sizeBytes ?? grammar.expectedBytes)}
 														</Text>
 													</Table.Td>
 													<Table.Td>
 														<Group gap="xs" justify="flex-end">
-															{(!grammar.installed || grammar.digestMismatch) && (
-																<Button
-																	size="xs"
-																	variant="light"
-																	leftSection={<IconDownload size={14} />}
-																	loading={busyLang === grammar.id}
-																	disabled={busyLang !== null && busyLang !== grammar.id}
-																	onClick={() => void handleDownload(grammar)}
-																>
-																	{grammar.digestMismatch
-																		? t("grammarsRedownload")
-																		: t("grammarsDownload")}
-																</Button>
-															)}
-															{grammar.installed && (
+															{/* A builtin has nothing to fetch and nothing to delete: its bytes
+														    are inside the app. Offering either action would download a
+														    second copy or appear to free space it does not occupy. */}
+															{!grammar.builtin &&
+																(!grammar.installed || grammar.digestMismatch) && (
+																	<Button
+																		size="xs"
+																		variant="light"
+																		leftSection={<IconDownload size={14} />}
+																		loading={busyLang === grammar.id}
+																		disabled={busyLang !== null && busyLang !== grammar.id}
+																		onClick={() => void handleDownload(grammar)}
+																	>
+																		{grammar.digestMismatch
+																			? t("grammarsRedownload")
+																			: t("grammarsDownload")}
+																	</Button>
+																)}
+															{grammar.installed && !grammar.builtin && (
 																<Button
 																	size="xs"
 																	variant="subtle"

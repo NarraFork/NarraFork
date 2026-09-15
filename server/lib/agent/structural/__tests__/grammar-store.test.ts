@@ -254,3 +254,63 @@ test("cache is restored for the dev environment", () => {
 	restoreCache();
 	expect(realBytes ? isGrammarInstalled(LANG) : true).toBe(true);
 });
+
+/**
+ * Builtin grammars.
+ *
+ * Shell is embedded in the binary because bash analysis parses every command NarraFork is
+ * about to run. Before this was modelled, the manifest listed it as downloadable and
+ * `isGrammarInstalled` only looked at the cache: shell showed as "not installed", a click
+ * fetched a second (differently built) copy from the CDN, and the structural parser never
+ * reached the embedded one at all.
+ */
+describe("builtin grammars", () => {
+	test("bash is the ONLY builtin", () => {
+		// Guards the packaging invariant: every other grammar is downloaded on demand, so a
+		// new `builtin: true` without a matching embedded asset would report a grammar as
+		// always-available while nothing can load it.
+		const builtins = GRAMMAR_MANIFEST.filter((e) => e.builtin).map((e) => e.id);
+		expect(builtins).toEqual(["bash"]);
+	});
+
+	test("reports installed without any cache file", () => {
+		const path = grammarCachePath("bash");
+		if (existsSync(path)) rmSync(path);
+		expect(isGrammarInstalled("bash")).toBe(true);
+	});
+
+	test("loads real bytes from the embedded asset", async () => {
+		const bytes = await readInstalledGrammar("bash");
+		expect(bytes).not.toBeNull();
+		// A wasm module, not an error page or a stub.
+		expect(bytes && bytes.byteLength > 100_000).toBe(true);
+		expect(bytes?.[0]).toBe(0x00);
+		expect(bytes?.[1]).toBe(0x61); // "asm"
+	});
+
+	test("cannot be removed", () => {
+		expect(removeGrammar("bash")).toBe(false);
+		expect(isGrammarInstalled("bash")).toBe(true);
+	});
+
+	test("download is a no-op success and makes no request", async () => {
+		let called = false;
+		const result = await downloadGrammar("bash", {
+			fetchImpl: (async () => {
+				called = true;
+				throw new Error("a builtin grammar must never be fetched");
+			}) as unknown as typeof fetch,
+		});
+		expect(result.ok).toBe(true);
+		expect(called).toBe(false);
+	});
+
+	test("status marks it builtin and installed, with no digest mismatch", async () => {
+		const status = (await listGrammarStatus()).find((s) => s.id === "bash");
+		expect(status?.builtin).toBe(true);
+		expect(status?.installed).toBe(true);
+		// The manifest digest describes the CDN build, which differs from the embedded one;
+		// comparing them would raise a permanent phantom mismatch.
+		expect(status?.digestMismatch).toBeUndefined();
+	});
+});
