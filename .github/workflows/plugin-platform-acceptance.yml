@@ -99,7 +99,7 @@ jobs:
 
       - name: Run plugin acceptance tests
         run: >-
-          bun test
+          bun test --isolate
           tests/server/integration/plugins
           tests/server/services/plugin-*.test.ts
           server/services/__tests__/plugin-*.test.ts
@@ -122,7 +122,7 @@ jobs:
 
       - name: Run upgrade and rollback tests
         run: >-
-          bun test
+          bun test --isolate
           tests/server/services/plugin-manager.test.ts
           tests/server/services/plugin-package-store.test.ts
           server/services/__tests__/plugin-upgrade-coordinator.test.ts
@@ -163,7 +163,7 @@ jobs:
 
       - name: Run path and runner security tests
         run: >-
-          bun test
+          bun test --isolate
           server/lib/agent/execution/__tests__/local-backend-read.test.ts
           tests/server/services/plugin-manager.test.ts
           server/services/__tests__/plugin-podman-runner.test.ts
@@ -188,7 +188,7 @@ jobs:
 
       - name: Run release integrity tests
         run: >-
-          bun test
+          bun test --isolate
           tests/scripts/release.test.ts
           tests/scripts/validate-plugin-release.test.ts
           tests/scripts/release-baseline.test.ts
