@@ -55,7 +55,7 @@ import {
 } from "../composer/EditAttachmentChips";
 import { fileReferenceToken } from "../composer/file-reference-input";
 import { ACCEPTED_TYPES } from "../narrator-panel-types";
-import type { QueuedEditPayload } from "../queued-attachment-edit";
+import type { QueuedEditPayload } from "./queued-attachment-edit";
 import { useQueuedMessageEdit } from "./use-queued-message-edit";
 
 /** Thumbnails shown inline before collapsing the rest into a "+N" badge. */

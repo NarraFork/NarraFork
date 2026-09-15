@@ -24,7 +24,7 @@ import {
 	remainingImageRoom,
 	remainingTextFileRoom,
 	seedQueuedEditAttachments,
-} from "../queued-attachment-edit";
+} from "./queued-attachment-edit";
 
 export interface UseQueuedMessageEditOptions {
 	msg: BufferMessageSummary;

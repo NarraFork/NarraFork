@@ -63,7 +63,6 @@ import {
 	trimFileReferenceInput,
 } from "../composer/file-reference-input";
 import { TextareaOptimizeControls } from "../composer/TextareaOptimizeControls";
-import { EditingMessageCtx } from "../EditingMessageCtx";
 import {
 	ACCEPTED_TYPES,
 	MAX_IMAGE_LONG_EDGE,
@@ -71,6 +70,7 @@ import {
 	resizeImageIfNeeded,
 } from "../narrator-panel-types";
 import { RevertScopeConfirmModal } from "../permission/RevertScopeConfirmModal";
+import { EditingMessageCtx } from "./EditingMessageCtx";
 import { editRevertNeedsConfirm } from "./message-edit-text";
 
 /**

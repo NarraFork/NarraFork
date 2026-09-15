@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import type { BufferMessageSummary } from "../../lib/api/types";
+import type { BufferMessageSummary } from "../../../lib/api/types";
 import {
 	buildQueuedEditPayload,
 	canSubmitQueuedEdit,

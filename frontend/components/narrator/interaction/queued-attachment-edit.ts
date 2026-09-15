@@ -22,8 +22,8 @@ import type {
 	BufferedImageSummary,
 	BufferedTextFileSummary,
 	BufferMessageSummary,
-} from "../../lib/api/types";
-import { trimFileReferenceInput } from "./composer/file-reference-input";
+} from "../../../lib/api/types";
+import { trimFileReferenceInput } from "../composer/file-reference-input";
 
 /**
  * Attachments a queued message may carry, per type; mirrors the server limits.

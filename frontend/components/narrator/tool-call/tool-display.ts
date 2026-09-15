@@ -225,7 +225,7 @@ import {
 	type SubagentToolInputSummary,
 	subagentSummaryToPartialInput,
 } from "@shared/subagent-tool-summary";
-import { agentTargetDisplay, formatAgentIdForDisplay } from "../agent-id-display";
+import { agentTargetDisplay, formatAgentIdForDisplay } from "./agent-id-display";
 
 /**
  * The `task.name` field of a ScheduledTask call, if the nested object survived

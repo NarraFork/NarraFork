@@ -132,17 +132,14 @@ import {
 	DEFAULT_MIN_PRUNE_RATIO,
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
-import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { HeaderToolbar } from "./header/HeaderToolbar";
 import { NarratorPanelHeaderTitle } from "./header/NarratorPanelHeaderTitle";
-
 import {
 	getNarratorStatusBarDisplay,
 	planNarratorWorkIndicator,
 } from "./header/narrator-status-bar";
 import type { NarratorToolbarBadgeCounts } from "./header/narrator-toolbar-badges";
 import type { NarratorToolbarHost } from "./header/narrator-toolbar-items";
-
 import { ContextUsageIndicator } from "./interaction/ContextUsageIndicator";
 import { DropOverlay } from "./interaction/DropOverlay";
 import { buildMobileToolbarActions } from "./interaction/mobile-toolbar-actions";
@@ -164,6 +161,7 @@ import { useResolvedModel } from "./interaction/use-resolved-model";
 import { LodSwitchToast } from "./lod/LodSwitchToast";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
+import { EditingMessageCtx, type EditingMessageState } from "./message/EditingMessageCtx";
 import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./message/MessageSelectionCtx";
 import type { MessageListHandle, MessageListTailMeta } from "./message/message-list-handle";
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
