@@ -88,6 +88,15 @@ export {
 } from "./provider";
 export type { RankedEntry } from "./references";
 export { partitionByRange, rank, referenceCountFor, referenceLinesFor } from "./references";
+export type { StashEntry, StashFailure } from "./stash";
+export {
+	dropStash,
+	formatStashSize,
+	peekStash,
+	putStash,
+	StashTooLargeError,
+	takeStash,
+} from "./stash";
 export {
 	clearOutlineCache,
 	referenceCounts,

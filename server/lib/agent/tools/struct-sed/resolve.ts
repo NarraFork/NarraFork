@@ -19,7 +19,13 @@ import {
 } from "../../structural";
 import type { LineRange, MovePlacement } from "../../structural/edit-ops";
 import type { ToolResult } from "../../types";
-import { COMMANDS, type Command, RELOCATION_COMMANDS } from "./commands";
+import {
+	COMMANDS,
+	CONTENT_COMMANDS,
+	type Command,
+	RELOCATION_COMMANDS,
+	STASH_RANGE_COMMANDS,
+} from "./commands";
 
 /** Parse a comma-separated `kind` filter into a list, or null when absent/empty. */
 export function parseKinds(raw: unknown): StructKind[] | null {
@@ -162,6 +168,10 @@ export interface ValidatedSpec {
 	placement: MovePlacement;
 	kind?: unknown;
 	content?: string;
+	/** Stash handle; consumed after a successful write. */
+	fromStash?: string;
+	/** True when the stash supplies the RANGE rather than the content (delete). */
+	stashSuppliesRange?: boolean;
 	pattern?: string;
 	replacement?: string;
 	flags?: string;
@@ -193,6 +203,12 @@ export function validateSpec(
 
 	const symbol = typeof spec.symbol === "string" ? spec.symbol.trim() : "";
 	const address = typeof spec.address === "string" ? spec.address.trim() : "";
+	const fromStash = typeof spec.from_stash === "string" ? spec.from_stash.trim() : "";
+	// A stash carries its own range, so for the commands that use it that way it IS the
+	// address. Checked before the "address required" rule below, which would otherwise
+	// reject the very call this feature exists to enable.
+	const stashSuppliesRange = fromStash !== "" && STASH_RANGE_COMMANDS.has(command);
+
 	// Both given is an ambiguous request, not a choice to make on the model's behalf:
 	// picking one silently could delete a different range than the one it named.
 	if (symbol && address) {
@@ -200,7 +216,16 @@ export function validateSpec(
 			"Give either `symbol` or `address`, not both - they select different things and there is no safe way to guess which one you meant.",
 		);
 	}
-	if (!symbol && !address) {
+	// Two sources of truth for the same range is exactly how the wrong lines get deleted:
+	// the stash knows where its text is now, an address written earlier may not.
+	if (stashSuppliesRange && (symbol || address)) {
+		return fail(
+			`command=${command} with \`from_stash\` takes its range from the stash, so \`${
+				symbol ? "symbol" : "address"
+			}\` must be omitted — two ranges cannot both be right.`,
+		);
+	}
+	if (!symbol && !address && !stashSuppliesRange) {
 		return fail(
 			"An address is required: pass `symbol` for a declaration, or `address` for a line/regex range.",
 		);
@@ -232,8 +257,24 @@ export function validateSpec(
 	if (spec.to_file !== undefined) {
 		return fail(
 			"StructSed cannot write two files in one call, so `to_file` is not supported. " +
-				"To move a symbol across files: StructView mode=extract with line_numbers=false, " +
-				"then StructSed append with create_if_missing on the target, then delete here.",
+				"To move a range across files: StructView mode=stash on the source, then " +
+				"StructSed append with from_stash (and keep: true) on the target, then " +
+				"delete with from_stash here.",
+		);
+	}
+
+	// Both given is ambiguous in the same way `symbol`+`address` is: the two carry
+	// different text and there is no defensible way to pick one.
+	if (fromStash && typeof spec.content === "string") {
+		return fail("Give either `content` or `from_stash`, not both — they supply different text.");
+	}
+	// A stash is content for the commands that write one, and a range for the commands that
+	// remove one. Anything else would ignore the handle while the caller believed it had
+	// been used — so name it instead.
+	if (fromStash && !CONTENT_COMMANDS.has(command) && !STASH_RANGE_COMMANDS.has(command)) {
+		return fail(
+			`command=${command} does not take \`from_stash\`. It supplies content for replace, ` +
+				"insert and append, or the range for delete.",
 		);
 	}
 
@@ -249,6 +290,8 @@ export function validateSpec(
 			placement: spec.placement === "before" ? "before" : "after",
 			...(spec.kind !== undefined ? { kind: spec.kind } : {}),
 			...(typeof spec.content === "string" ? { content: spec.content } : {}),
+			...(fromStash ? { fromStash } : {}),
+			...(stashSuppliesRange ? { stashSuppliesRange: true } : {}),
 			...(typeof spec.pattern === "string" ? { pattern: spec.pattern } : {}),
 			...(typeof spec.replacement === "string" ? { replacement: spec.replacement } : {}),
 			...(typeof spec.flags === "string" ? { flags: spec.flags } : {}),

@@ -25,6 +25,7 @@ import { MAX_FILE_BYTES, MODES, type Mode, REPO_MODES } from "./constants";
 import { runCalls, runRefs, runReport } from "./modes/analysis";
 import { runFind } from "./modes/find";
 import { runApi, runEnclosing, runExtract, runImports, runOutline } from "./modes/outline-api";
+import { runStash } from "./modes/stash";
 import { runElementTree, runInterface, runUsages } from "./modes/structure";
 import { runLandmarks, runPrint } from "./modes/text";
 import { parseKinds } from "./nodes";
@@ -49,6 +50,7 @@ Modes:
 - interface: given a line range (\`address\`) or a \`symbol\`, what extracting it would require — which outside symbols it uses (become parameters), which of its own symbols are used outside (must be exported), and which are self-contained (move with it). Answers "is this a clean seam and what's the signature", the question outline cannot.
 - usages: where a \`symbol\` is referenced in OTHER files. ripgrep prefilters, then the parser drops comment/string matches. Results split into **confirmed** (the file imports the name from this module, aliases followed to their local name) and **unverified** (same name, no import this check could tie to the definition — possibly a different symbol, possibly reached via a re-export). Still name-based, not type-resolved, so confirm before renaming or deleting. This is the cross-file view refs/report cannot give.
 - find: WHICH FILE declares a \`symbol\`, across the whole repo — the one mode that needs no \`file_path\`. **Start here when you do not yet know where something lives, instead of grepping for it.** ripgrep narrows the candidates, then each is parsed and only real declarations are kept, so call sites, comments and strings drop out and each hit reports its kind and line. Feed the result straight into another mode's \`file_path\`.
+- stash: hold a range (by \`address\` or \`symbol\`) server-side and get back a handle. **This is how you move code between files.** The content never enters your context, so nothing has to be retyped — pass the handle to StructSed as \`from_stash\`, which supplies the content when writing and the verified range when deleting the original. Also the only way to move a block larger than this tool's output cap, since a truncated block would corrupt the target. Stashing does NOT modify the source; remove the original with a separate StructSed delete.
 - print: sed-style line/regex output filtering. Needs no parser, so it works on any text file (config, log, unsupported language).
 
 Addresses for print: \`42\` (one line), \`10,20\` (range), \`10,$\` (to EOF), \`$\` (last line), \`/regex/\` (each matching line), \`/from/,/to/\` (block). Range endpoints mix freely, so \`/section marker/,$\` takes a landmark to EOF and \`/start/,120\` or \`10,/end/\` anchor one end only.
@@ -201,6 +203,7 @@ export const structViewTool: ToolDefinition = {
 		const ioPath = canonicalPath ?? resolvedPath;
 
 		let text: string;
+		let encoding = "utf-8";
 		let truncatedRead = false;
 		try {
 			const stat = await backend.statFile(ioPath);
@@ -216,7 +219,7 @@ export const structViewTool: ToolDefinition = {
 				signal: ctx.signal,
 			});
 			truncatedRead = read.truncated;
-			({ text } = decodeFileBytes(read.bytes));
+			({ text, encoding } = decodeFileBytes(read.bytes));
 		} catch (err) {
 			return {
 				output: `Error reading ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
@@ -250,6 +253,13 @@ export const structViewTool: ToolDefinition = {
 		};
 
 		const resolved = await resolveProvider(doc);
+		// `stash` is the one structural mode that must survive a missing provider: with an
+		// `address` it needs no grammar at all, and refusing the call would deny the relay
+		// exactly where it is most needed — a file whose language cannot be parsed is one
+		// whose ranges can only be named by line.
+		if (mode === "stash") {
+			return runStash(filePath, text, doc, resolved, args, ctx.narratorId, encoding, []);
+		}
 		if (!resolved) {
 			return {
 				output: `No structure provider could handle ${filePath}. Use Read or StructView mode=print instead.`,

@@ -233,8 +233,10 @@ describe("cross-file destinations", () => {
 		});
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("to_file");
-		// The refusal has to name the path that does work.
-		expect(result.output).toContain("create_if_missing");
+		// The refusal has to name the path that does work — now the stash relay, which
+		// keeps the moved text out of the context entirely.
+		expect(result.output).toContain("mode=stash");
+		expect(result.output).toContain("from_stash");
 		expect(result.output).not.toContain("overlaps");
 	});
 });

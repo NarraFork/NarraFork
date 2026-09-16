@@ -36,6 +36,13 @@ import {
 	EditOpError,
 	type LineRange,
 } from "../../structural/edit-ops";
+import {
+	dropStash,
+	locateStashRange,
+	peekStash,
+	type StashEntry,
+	type StashFailure,
+} from "../../structural/stash";
 import type { ToolDefinition, ToolResult } from "../../types";
 import {
 	applyLineEnding,
@@ -75,11 +82,19 @@ For copy/move, the destination is \`to_symbol\` or \`to_address\` (same syntax),
 A destination overlapping the source is refused. A moved block keeps its doc comment and
 decorators, and is re-indented to its destination.
 
-MOVING A SYMBOL TO A DIFFERENT FILE takes three calls, and needs no Read/Write:
-  1. \`StructView mode=extract symbol=X line_numbers=false\` — bare source, doc comment included.
-  2. \`StructSed command=append address="1" create_if_missing=true content=<that output>\` on the target.
-  3. \`StructSed command=delete symbol=X\` on the source.
-Not atomic: if step 3 fails the symbol exists in both files, which is the safe direction
+MOVING A RANGE TO A DIFFERENT FILE — use the stash, not a copy-paste through your context:
+  1. \`StructView mode=stash file_path=src.ts address="1495,$"\` → returns a handle.
+  2. \`StructSed command=append file_path=dest.ts address="1" from_stash=<handle> keep=true create_if_missing=true dry_run=false\`
+  3. \`StructSed command=delete file_path=src.ts from_stash=<handle> dry_run=false\`
+The text goes straight from one file to the other; it never passes through the
+conversation, so nothing is retyped and no output cap applies. Works by line address as
+well as by symbol.
+\`keep: true\` in step 2 matters: a handle is released once written, and step 3 still needs
+it. Step 3 takes its RANGE from the stash and verifies the text is still there, so it
+cannot delete the wrong lines if the file shifted in between — re-typing the address is
+what used to make that happen. It relocates and says so, or refuses; either way the
+delete releases the handle.
+Not atomic: if step 3 fails the range exists in both files, which is the safe direction
 (nothing is lost). One call cannot write two files — the write pipeline freezes a single
 path per tool call.
 
@@ -153,6 +168,23 @@ const rawJsonSchema = {
 				"Preview instead of writing. Defaults to TRUE; pass false to actually apply the change.",
 			type: "boolean",
 		},
+		from_stash: {
+			description:
+				"Stash handle from StructView mode=stash. For replace/insert/append it supplies the " +
+				"CONTENT instead of `content` — the text stays server-side and never passes through " +
+				"the context, which is how a range moves between files without being retyped. For " +
+				"delete it supplies the RANGE instead of `address`/`symbol`, verified against the " +
+				"file's current text so a shifted file cannot cause the wrong lines to be removed. " +
+				"Released once written; a dry run does not consume it.",
+			type: "string",
+		},
+		keep: {
+			description:
+				"Keep the `from_stash` handle after a successful write, so one stash can be used " +
+				"again — needed when an append is followed by a delete that removes the original. " +
+				"Defaults to false (released on use).",
+			type: "boolean",
+		},
 		create_if_missing: {
 			description:
 				"Create the file when it does not exist, instead of failing. Defaults to false. " +
@@ -212,6 +244,17 @@ export const structSedTool: ToolDefinition = {
 		replacement: z.string().optional().describe("For substitute: the replacement text."),
 		flags: z.string().optional().describe('For substitute: flags, "g" and "i" only.'),
 		dry_run: z.boolean().optional().describe("Preview instead of writing. Defaults to true."),
+		from_stash: z
+			.string()
+			.optional()
+			.describe(
+				"Stash handle from StructView mode=stash: the content for replace/insert/append, " +
+					"or the verified range for delete. Released on use.",
+			),
+		keep: z
+			.boolean()
+			.optional()
+			.describe("Keep the from_stash handle after writing. Defaults to false."),
 		create_if_missing: z
 			.boolean()
 			.optional()
@@ -264,6 +307,32 @@ export const structSedTool: ToolDefinition = {
 			const result = validateSpec(spec, i + 1, isBatch);
 			if ("error" in result) return result.error;
 			validated.push(result.spec);
+		}
+
+		// Resolve stash handles before anything else. For content commands the text is
+		// injected as an ordinary `content`, so every downstream path — preview, batch,
+		// apply, recorded input — needs no knowledge of the stash. Read with `peek`, never
+		// `take`: consuming here would spend the handle on a dry run, so the first real
+		// write would always fail.
+		const consumedHandles: string[] = [];
+		const stashRanges = new Map<number, StashEntry>();
+		for (const spec of validated) {
+			if (!spec.fromStash) continue;
+			const found = peekStash(spec.fromStash, ctx.narratorId);
+			if ("failure" in found) {
+				return {
+					output: stashFailureMessage(spec.fromStash, found.failure, isBatch ? spec.index : null),
+					isError: true,
+				};
+			}
+			if (spec.stashSuppliesRange) {
+				// The range cannot be resolved yet: it is verified against the file's CURRENT
+				// content, which has not been read at this point. Deferred to just after the read.
+				stashRanges.set(spec.index, found.entry);
+			} else {
+				spec.content = found.entry.text;
+			}
+			consumedHandles.push(spec.fromStash);
 		}
 
 		const backend = getToolBackend(ctx, (args as { device?: string }).device);
@@ -362,7 +431,44 @@ export const structSedTool: ToolDefinition = {
 			label: string;
 		}
 		const resolvedOps: ResolvedOp[] = [];
+		const relocationNotes: string[] = [];
 		for (const spec of validated) {
+			const stashed = stashRanges.get(spec.index);
+			if (stashed) {
+				// The recorded line numbers are only a hint; they are verified against the file as
+				// it is NOW. Acting on a stale range would delete whatever moved into those lines.
+				const located = locateStashRange(normalized, stashed);
+				if (located.kind === "ambiguous") {
+					return {
+						output:
+							`stash ${spec.fromStash} holds text that appears ${located.candidates.length} ` +
+							`times in ${filePath} (lines ${located.candidates.join(", ")}), so the original ` +
+							"occurrence cannot be identified. Delete by explicit `address` instead.",
+						isError: true,
+						title: filePath,
+					};
+				}
+				if (located.kind === "missing") {
+					return {
+						output:
+							`stash ${spec.fromStash} was taken from ${stashed.filePath}:` +
+							`${stashed.startLine}-${stashed.endLine}, but that text is no longer in ` +
+							`${filePath} — it was probably rewritten or already removed. Nothing was ` +
+							"changed. Re-stash the current range, or delete by explicit `address`.",
+						isError: true,
+						title: filePath,
+					};
+				}
+				if (located.kind === "relocated") {
+					relocationNotes.push(
+						`stash range moved: L${located.fromStartLine}-${located.fromEndLine} → ` +
+							`L${located.startLine}-${located.endLine} (lines shifted since it was stashed).`,
+					);
+				}
+				const range: LineRange = { startLine: located.startLine, endLine: located.endLine };
+				resolvedOps.push({ spec, range, label: `L${range.startLine}-${range.endLine}` });
+				continue;
+			}
 			const source = await resolveOne(spec.symbol, spec.address, "source", spec.kind);
 			if ("error" in source) return source.error;
 			let anchor: LineRange | undefined;
@@ -498,6 +604,9 @@ export const structSedTool: ToolDefinition = {
 			return {
 				output:
 					`DRY RUN — nothing written. Pass dry_run: false to apply.\n\n` +
+					// A silently corrected range would hide that the file shifted underneath the
+					// stash, which is exactly what the caller needs to know before applying.
+					(relocationNotes.length > 0 ? `${relocationNotes.join("\n")}\n\n` : "") +
 					plan +
 					(replacements != null ? `${replacements} replacement(s)\n` : "") +
 					`\nBefore:\n${previewRegion(normalized, range)}\n` +
@@ -562,7 +671,8 @@ export const structSedTool: ToolDefinition = {
 						result: {
 							output:
 								`${command} applied to ${filePath} → ${addressLabel}` +
-								(replacements != null ? ` (${replacements} replacement(s))` : ""),
+								(replacements != null ? ` (${replacements} replacement(s))` : "") +
+								(relocationNotes.length > 0 ? `\n${relocationNotes.join("\n")}` : ""),
 							title: filePath,
 							metadata: {
 								command,
@@ -593,6 +703,12 @@ export const structSedTool: ToolDefinition = {
 					title: filePath,
 				};
 			}
+			// Released only now, after the bytes are actually on disk. Releasing earlier would
+			// discard the only copy of the text if the write then failed. `keep: true` holds it
+			// so one stash can be written to several places.
+			if (args.keep !== true) {
+				for (const handle of consumedHandles) dropStash(handle, ctx.narratorId);
+			}
 			return recorded;
 		} catch (err) {
 			return {
@@ -603,3 +719,36 @@ export const structSedTool: ToolDefinition = {
 		}
 	},
 };
+
+/**
+ * Why a stash handle could not be used, and what to do about it.
+ *
+ * Every branch names a recovery, because the text is still in the source file — stashing
+ * never removed it. A bare "invalid handle" would leave the caller unsure whether their
+ * code had gone somewhere.
+ */
+function stashFailureMessage(
+	handle: string,
+	failure: StashFailure,
+	operationIndex: number | null,
+): string {
+	const where = operationIndex === null ? "" : `Operation ${operationIndex}: `;
+	switch (failure) {
+		case "expired":
+			return (
+				`${where}stash ${handle} has expired. Nothing was lost — the range is still in its ` +
+				"source file. Run StructView mode=stash again to get a fresh handle."
+			);
+		case "wrong_narrator":
+			return (
+				`${where}stash ${handle} belongs to a different narrator and cannot be used here. ` +
+				"Run StructView mode=stash in this session to create your own."
+			);
+		default:
+			return (
+				`${where}stash ${handle} is not held. Either it was already written (a handle is ` +
+				"released on use unless keep: true), or it was evicted. The source file still has " +
+				"the range — run StructView mode=stash again."
+			);
+	}
+}

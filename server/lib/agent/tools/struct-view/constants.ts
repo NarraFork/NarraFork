@@ -38,7 +38,8 @@ export type Mode =
 	| "landmarks"
 	| "interface"
 	| "usages"
-	| "find";
+	| "find"
+	| "stash";
 
 export const MODES: Mode[] = [
 	"outline",
@@ -55,6 +56,7 @@ export const MODES: Mode[] = [
 	"interface",
 	"usages",
 	"find",
+	"stash",
 ];
 
 /** Modes that search the repository instead of one file, so `file_path` is optional. */
