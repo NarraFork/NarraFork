@@ -135,8 +135,14 @@ function SettingsLayout() {
 		// Personal, not instance-wide: a user registers their own machines here and
 		// sees only the devices they registered. Admins still get the full list.
 		{ to: "/settings/devices", label: t("devicesSection"), icon: <IconDeviceLaptop size={18} /> },
-		// Not admin-only: the grammar cache is a shared parser asset (like ripgrep),
-		// and gating it would leave non-admins stuck with heuristic structural output.
+	];
+
+	// Capability toggles rather than personal preferences. Grammar caching sat among
+	// account/notification/appearance settings, where it read as a preference; it decides
+	// whether structural tooling works at all, which is a different kind of thing.
+	// Still not admin-only: the grammar cache is a shared parser asset (like ripgrep), and
+	// gating it would leave non-admins stuck with heuristic structural output.
+	const enhancementItems: NavItem[] = [
 		{ to: "/settings/grammars", label: t("grammarsSection"), icon: <IconSitemap size={18} /> },
 	];
 
@@ -184,7 +190,11 @@ function SettingsLayout() {
 		{ to: "/settings/about", label: t("versionSection"), icon: <IconInfoCircle size={18} /> },
 	];
 
-	const allVisibleItems = isAdmin ? [...personalItems, ...instanceItems] : personalItems;
+	// Enhancements belong here for every user, not just admins: forgetting a group in this
+	// list is what makes the mobile picker and the active-item highlight silently skip it.
+	const allVisibleItems = isAdmin
+		? [...personalItems, ...enhancementItems, ...instanceItems]
+		: [...personalItems, ...enhancementItems];
 
 	// Find current page label for mobile back header
 	const currentItem = allVisibleItems.find((item) => pathname === item.to);
@@ -224,6 +234,21 @@ function SettingsLayout() {
 							{t("personalGroup")}
 						</Text>
 						{personalItems.map((item) => (
+							<NavLink
+								key={item.to}
+								component={Link}
+								to={item.to}
+								label={item.label}
+								leftSection={item.icon}
+								active={pathname === item.to}
+								variant="light"
+							/>
+						))}
+
+						<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
+							{t("enhancementsGroup")}
+						</Text>
+						{enhancementItems.map((item) => (
 							<NavLink
 								key={item.to}
 								component={Link}

@@ -56,6 +56,13 @@ export const readTool: ToolDefinition = {
 	description:
 		"Reads a file from the local filesystem or the narrator's Dynamic Spec virtual files. You can access any file directly by using this tool.\n" +
 		"Assume this tool is able to read all local files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\n" +
+		"FOR A LARGE SOURCE FILE, PREFER StructView: `mode=report` or `mode=outline` gives the " +
+		"structure in a fraction of the tokens, then `mode=extract symbol=X` returns just the " +
+		"declaration you need, and `mode=find` locates a symbol when you do not yet know which " +
+		"file holds it. Paging through thousands of lines here to find one function is the " +
+		"expensive way to answer a question StructView answers directly. Read remains the right " +
+		"tool for small files, config, data, logs, images and PDFs, and whenever you genuinely " +
+		"need the complete contents.\n\n" +
 		"Usage:\n" +
 		"- The file_path parameter must be an absolute local path, or a spec:// URI for Dynamic Spec virtual files\n" +
 		"- Dynamic Spec examples: spec://tasks.json, spec://index.md, spec://behavior_fence. spec:// paths are virtual and do not need to be absolute.\n" +

@@ -2,6 +2,7 @@
 	"title": "设置",
 	"subagentPoolReasoningEffortHelp": "只影响之后新建的子代理；指定后覆盖主代理传入的等级，实际请求按模型支持情况适配。不指定表示不施加池级覆盖，不等于 none（关闭思考）。",
 	"personalGroup": "个人设置",
+	"enhancementsGroup": "增强功能",
 	"instanceGroup": "实例管理",
 	"instanceAdminOnlyTitle": "仅管理员可配置",
 	"instanceAdminOnlyHint": "当前账户不是管理员账户。提供商管理等实例配置仅管理员账户可见，请使用管理员账户登录进行配置。",

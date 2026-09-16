@@ -212,7 +212,9 @@ export async function runFind(
 			output: withFooter(
 				`find ${name}`,
 				`No declaration of "${name}" found in ${candidatePaths.length} candidate file(s).\n` +
-					"The name may only appear at call sites or in comments — mode=usages traces those.",
+					"The name may only appear at call sites or in comments — mode=usages traces those. " +
+					"It may also come from a dependency (node_modules is not scanned), or from a " +
+					"language whose grammar is not installed.",
 				notes,
 			),
 			title: `find ${name}`,

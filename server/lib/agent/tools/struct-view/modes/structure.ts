@@ -6,7 +6,7 @@
  * rather than simply listing what a file declares.
  */
 
-import { extname } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 import { resolveBackendPath } from "../../../execution/path-resolve";
 import type { getToolBackend } from "../../../execution/tool-backend";
 import {
@@ -279,37 +279,148 @@ export async function runInterface(
 /**
  * Whether a candidate file imports `name` from the file that declares it.
  *
- * Any failure resolves to `unverified`, never to "not a usage": a language with no
- * import support, a re-export chain, a dynamic import or a path alias this heuristic
- * cannot follow all leave a genuine reference that must still be reported. The label
- * describes what could be PROVEN, not what exists.
+ * Any failure resolves to `unverified`, never to "not a usage": a language with no import
+ * support, a dynamic import or a path alias this heuristic cannot follow all leave a
+ * genuine reference that must still be reported. The label describes what could be PROVEN,
+ * not what exists.
+ *
+ * Barrels are followed ONE hop. Most of a codebase imports through an `index.ts` rather
+ * than naming the defining file, so without this the common case — the normal, encouraged
+ * import style — was reported as unverifiable, which made the whole distinction close to
+ * useless. A second hop is not followed: it needs another file read per candidate, the cost
+ * grows with the repo, and barrel chains deeper than one level are rare. Two hops stay
+ * `unverified`, and the caveat says so rather than implying full resolution.
  */
 async function classifyImport(
 	candidateDoc: StructDocument,
 	name: string,
 	definingPath: string,
-): Promise<{ confidence: UsageConfidence; alias?: string }> {
+	io: {
+		backend: ReturnType<typeof getToolBackend>;
+		baseCwd: string;
+		signal?: AbortSignal;
+	},
+): Promise<{ confidence: UsageConfidence; alias?: string; viaBarrel?: string }> {
 	try {
 		const resolved = await resolveProvider(candidateDoc);
 		if (!resolved?.provider.imports) return { confidence: "unverified" };
 		const info = await resolved.provider.imports(candidateDoc);
+
+		const barrelCandidates: string[] = [];
 		for (const entry of info.imports) {
 			if (!entry.names?.length) continue;
-			if (!importMayReferTo(entry.module, definingPath)) continue;
+			const direct = importMayReferTo(entry.module, definingPath);
 			for (const imported of entry.names) {
-				// Imported under its own name.
-				if (imported.local === name && !imported.original) return { confidence: "confirmed" };
-				// Renamed on import: the local name is what appears at the use sites.
-				if (imported.original === name) {
-					return { confidence: "aliased", alias: imported.local };
+				if (imported.local !== name && imported.original !== name) continue;
+				if (direct) {
+					// Renamed on import: the local name is what appears at the use sites.
+					if (imported.original === name && imported.local !== name) {
+						return { confidence: "aliased", alias: imported.local };
+					}
+					return { confidence: "confirmed" };
 				}
-				if (imported.local === name) return { confidence: "confirmed" };
+				// Right name, wrong module — the module may be a barrel that forwards it.
+				barrelCandidates.push(entry.module);
 			}
+		}
+
+		for (const specifier of barrelCandidates) {
+			const forwarded = await barrelForwards(specifier, name, definingPath, candidateDoc, io);
+			if (forwarded) return { confidence: "confirmed", viaBarrel: specifier };
 		}
 		return { confidence: "unverified" };
 	} catch {
 		return { confidence: "unverified" };
 	}
+}
+
+/**
+ * Does `specifier`, resolved relative to the importing file, re-export `name` from the
+ * module that declares it?
+ *
+ * Only the shapes a barrel actually takes are accepted: `export { name } from "./def"`, a
+ * renamed forward of it, or `export * from "./def"`. A star export is credited without
+ * reading the far module — it forwards everything by definition, so if it points at the
+ * defining file it necessarily forwards the symbol.
+ */
+async function barrelForwards(
+	specifier: string,
+	name: string,
+	definingPath: string,
+	importingDoc: StructDocument,
+	io: {
+		backend: ReturnType<typeof getToolBackend>;
+		baseCwd: string;
+		signal?: AbortSignal;
+	},
+): Promise<boolean> {
+	const barrelPath = await resolveModuleFile(specifier, importingDoc.filePath, io);
+	if (!barrelPath) return false;
+	try {
+		const read = await io.backend.readFileBytes(barrelPath, {
+			maxBytes: MAX_USAGE_FILE_BYTES,
+			...(io.signal ? { signal: io.signal } : {}),
+		});
+		if (read.truncated) return false;
+		const { text } = decodeFileBytes(read.bytes);
+		const doc: StructDocument = {
+			filePath: barrelPath,
+			text,
+			languageId: languageIdForExtension(extname(barrelPath)),
+			...(io.signal ? { signal: io.signal } : {}),
+		};
+		const resolved = await resolveProvider(doc);
+		if (!resolved?.provider.imports) return false;
+		const info = await resolved.provider.imports(doc);
+		for (const entry of info.exports) {
+			// `from` is what marks a pass-through; a declaration in the barrel is a different
+			// symbol that merely shares the name.
+			if (!entry.from) continue;
+			if (!importMayReferTo(entry.from, definingPath)) continue;
+			if (entry.name === "*" || entry.name === name) return true;
+		}
+		return false;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Resolve a relative module specifier to a real file.
+ *
+ * Only relative specifiers are attempted. A bare or aliased specifier needs the build
+ * system's own resolution (tsconfig paths, package exports), and guessing at it would
+ * produce confident wrong answers — the thing the precision labelling exists to prevent.
+ */
+async function resolveModuleFile(
+	specifier: string,
+	importingFile: string,
+	io: { backend: ReturnType<typeof getToolBackend>; signal?: AbortSignal },
+): Promise<string | null> {
+	if (!specifier.startsWith(".")) return null;
+	const base = resolve(dirname(importingFile), specifier);
+	const candidates = [
+		base,
+		`${base}.ts`,
+		`${base}.tsx`,
+		`${base}.js`,
+		`${base}.jsx`,
+		`${base}.mts`,
+		`${base}.cts`,
+		join(base, "index.ts"),
+		join(base, "index.tsx"),
+		join(base, "index.js"),
+	];
+	for (const candidate of candidates) {
+		if (io.signal?.aborted) return null;
+		try {
+			const stat = await io.backend.statFile(candidate);
+			if (stat && !stat.isDirectory) return candidate;
+		} catch {
+			// Try the next spelling.
+		}
+	}
+	return null;
 }
 
 export async function runUsages(
@@ -429,7 +540,7 @@ export async function runUsages(
 			// Import check: does this file actually pull the name from the defining module?
 			// Cheap (the parse is already done and cached) and it is what separates "uses the
 			// symbol" from "happens to contain a same-named identifier".
-			const verdict = await classifyImport(candidateDoc, name, io.ioPath);
+			const verdict = await classifyImport(candidateDoc, name, io.ioPath, io);
 			const own = lines.get(name) ?? [];
 			// An alias means the local name differs, so the original name's lines are not the
 			// usages — the alias's are.
@@ -439,6 +550,7 @@ export async function runUsages(
 				lines: effective,
 				confidence: verdict.confidence,
 				...(verdict.alias ? { alias: verdict.alias } : {}),
+				...(verdict.viaBarrel ? { viaBarrel: verdict.viaBarrel } : {}),
 			});
 		} catch {
 			skipped++;
@@ -467,7 +579,9 @@ export async function runUsages(
 	const row = (file: (typeof result.files)[number]): string => {
 		const shown = file.lines.map((l) => `L${l}`).join(", ");
 		const alias = file.alias ? `  [imported as ${file.alias}]` : "";
-		return `  ${file.path}  (${file.lines.length})  ${shown}${alias}`;
+		// Naming the barrel matters for a rename: the edit may belong in the barrel, not here.
+		const via = file.viaBarrel ? `  [via ${file.viaBarrel}]` : "";
+		return `  ${file.path}  (${file.lines.length})  ${shown}${alias}${via}`;
 	};
 	// Two groups, because the difference is actionable: a rename must update the confirmed
 	// files, while an unverified one has to be read first. A single flat list forced that

@@ -923,6 +923,11 @@ export function computeDefaultOpen(data: ToolCallData, pendingPermission: boolea
 		"plan",
 		"knowledge",
 		"file",
+		// StructSed edits a file just as Write and Edit do, so it opens like them. Its
+		// own category exists to carry a different chip and colour, not a lesser status —
+		// leaving it out meant a structural rewrite arrived folded while the equivalent
+		// Edit arrived showing its diff.
+		"structureEdit",
 	];
 	if (autoOpen.includes(data.category)) return true;
 	if ((data.category === "await" || data.category === "bash") && data.detail != null) return true;

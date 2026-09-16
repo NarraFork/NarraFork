@@ -170,3 +170,71 @@ describeWithGrammar("import name extraction", () => {
 		expect(imports[0]?.names?.map((n) => n.local)).toEqual(["a"]);
 	});
 });
+
+/**
+ * Re-exports were invisible to the provider: neither an import statement nor an outline
+ * declaration, so a symbol reached through a barrel could not be tied back to the module
+ * declaring it. That made the normal way a codebase imports things — via `index.ts` —
+ * report every usage as unverifiable.
+ */
+describeWithGrammar("re-export collection", () => {
+	async function exportsOf(text: string) {
+		clearOutlineCache();
+		const read = treeSitterProvider.imports;
+		if (!read) throw new Error("tree-sitter provider no longer implements imports()");
+		const info = await read.call(treeSitterProvider, {
+			filePath: "/tmp/barrel.ts",
+			languageId: "typescript",
+			text,
+		});
+		return info.exports;
+	}
+
+	test("a named re-export records the name and its source module", async () => {
+		const found = await exportsOf('export { target } from "./def";\n');
+		expect(found).toEqual([{ name: "target", kind: "unknown", line: 1, from: "./def" }]);
+	});
+
+	test("a renamed re-export records the name as re-exported", async () => {
+		// `export { a as b }` publishes `b`; a consumer imports that, not `a`.
+		const found = await exportsOf('export { a as b } from "./c";\n');
+		expect(found[0]).toMatchObject({ name: "b", from: "./c" });
+	});
+
+	test("a star re-export says everything, rather than inventing a name list", async () => {
+		// Which names this covers cannot be known without reading the other module.
+		const found = await exportsOf('export * from "./other";\n');
+		expect(found).toEqual([{ name: "*", kind: "unknown", line: 1, from: "./other" }]);
+	});
+
+	test("a plain export is a declaration, not a pass-through", async () => {
+		// No source module, so it must not gain a `from` — that field is what distinguishes
+		// "this file re-exports it" from "this file declares it".
+		const found = await exportsOf("export function own() {\n\treturn 1;\n}\n");
+		expect(found).toHaveLength(1);
+		expect(found[0]?.from).toBeUndefined();
+		expect(found[0]?.kind).toBe("function");
+	});
+
+	test("declarations and re-exports coexist in one file", async () => {
+		const found = await exportsOf(
+			'export { a } from "./m";\nexport const own = 1;\nexport * from "./n";\n',
+		);
+		expect(found.filter((e) => e.from !== undefined)).toHaveLength(2);
+		expect(found.filter((e) => e.from === undefined)).toHaveLength(1);
+	});
+
+	test("a re-export does not appear as an import", async () => {
+		// It binds no local name, so listing it as an import would claim this file uses the
+		// symbol when it only forwards it.
+		clearOutlineCache();
+		const read = treeSitterProvider.imports;
+		if (!read) throw new Error("imports() missing");
+		const info = await read.call(treeSitterProvider, {
+			filePath: "/tmp/barrel.ts",
+			languageId: "typescript",
+			text: 'export { a } from "./m";\n',
+		});
+		expect(info.imports).toHaveLength(0);
+	});
+});

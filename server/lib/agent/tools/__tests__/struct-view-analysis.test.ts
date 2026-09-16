@@ -134,7 +134,9 @@ describeWithGrammar("mode=refs", () => {
 		const result = await run({ file_path: tsFile, mode: "refs" });
 		// `neverUsedHere` is exported; deleting it on this evidence alone would be wrong.
 		expect(result.output).toContain("OTHER files");
-		expect(result.output).toContain("Grep");
+		// Points at mode=usages rather than Grep: usages does the same check structurally,
+		// and sending the reader to Grep undercuts the tool that exists for this.
+		expect(result.output).toContain("mode=usages");
 	});
 
 	test("a heavily used symbol is not flagged", async () => {

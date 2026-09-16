@@ -447,6 +447,12 @@ export const editTool: ToolDefinition = {
 	},
 	description:
 		"Performs exact string replacements in local files or the narrator's Dynamic Spec virtual files.\n\n" +
+		'FOR A WHOLE DECLARATION OR A LINE RANGE, PREFER StructSed: `symbol: "Class.method"` ' +
+		"rewrites that method without you quoting its entire body back, and an `address` like " +
+		"`/marker/,$` edits a region by position. It also moves code between files without the " +
+		"text passing through the conversation (StructView mode=stash, then StructSed " +
+		"from_stash), which Edit cannot do. Edit stays right for a small, surgical replacement " +
+		"where you already know the exact old text.\n\n" +
 		"Usage:\n" +
 		"- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file. \n" +
 		"- Dynamic Spec support: file_path may be a spec:// URI such as spec://tasks.json or spec://index.md. Keep spec://tasks.json to only tasks[].text/status/protected. Every open task must be finite and executable.\n" +

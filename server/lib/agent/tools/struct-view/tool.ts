@@ -36,6 +36,14 @@ Use this INSTEAD of paging through a large file with Read, and instead of \`grep
 counting things inside one file — the AST counts are exact where a regex silently
 undercounts (e.g. \`grep -c 'useState('\` misses the generic form \`useState<T>(\`).
 
+Reach for this first when you are about to:
+- **grep for where something is defined** → \`mode=find\` (needs no file_path; returns real declarations, not call sites or comments)
+- **read a long file to understand it** → \`mode=report\`, then \`mode=extract\` for the one symbol
+- **grep to see who uses a symbol** → \`mode=usages\` (parses each hit; follows one barrel re-export)
+- **copy code out of one file to put it in another** → \`mode=stash\`, then StructSed \`from_stash\`
+
+Grep is still better for free-text search across files (log messages, config values, strings); this tool answers questions about CODE STRUCTURE.
+
 Modes:
 - report: START HERE for an unfamiliar file. One call returns the summary, layered skeleton, top calls, single-reference (likely dead) symbols and the largest symbols. Replaces the 6-8 calls that analysis otherwise takes.
 - outline (default): declaration skeleton — classes/functions/methods/types with line ranges, plus statement-level structural calls (useEffect, describe, app.route) with their dependency arrays. Add \`with_refs: true\` to annotate each entry with its in-file reference count.
@@ -262,7 +270,12 @@ export const structViewTool: ToolDefinition = {
 		}
 		if (!resolved) {
 			return {
-				output: `No structure provider could handle ${filePath}. Use Read or StructView mode=print instead.`,
+				// Naming the remedy matters: without it this reads as "this file is unsupported"
+				// when the actual cause is usually a grammar that was never downloaded.
+				output:
+					`No structure provider could handle ${filePath}. Its language grammar may not be ` +
+					"installed — check Settings → Enhancements → Structural Parsing. Meanwhile " +
+					"mode=print and mode=landmarks work without a parser, or use Read.",
 				isError: true,
 			};
 		}

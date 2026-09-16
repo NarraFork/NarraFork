@@ -86,21 +86,26 @@ export const treeSitterProvider: StructureProvider = {
 	},
 
 	async imports(doc: StructDocument): Promise<ImportExportInfo> {
-		const imports = await withParsedTree(doc, (root, languageId) => {
+		const collectedBoth = await withParsedTree(doc, (root, languageId) => {
 			const spec = getLanguageSpec(languageId);
-			if (!spec) return [];
-			const collected: ImportExportInfo["imports"] = [];
-			collectImports(root, spec.importTypes, collected);
-			return collected;
+			if (!spec) return null;
+			const imports: ImportExportInfo["imports"] = [];
+			const reExports: ImportExportInfo["exports"] = [];
+			collectImports(root, spec.importTypes, imports);
+			collectReExports(root, reExports);
+			return { imports, reExports };
 		});
-		if (!imports) return { imports: [], exports: [] };
+		if (!collectedBoth) return { imports: [], exports: [] };
 
 		const { nodes } = await parseOutline(doc);
-		const exports = flattenOutline(nodes as RichOutlineNode[])
+		const own = flattenOutline(nodes as RichOutlineNode[])
 			.filter((node) => node.exported)
 			.map((node) => ({ name: node.symbolPath, kind: node.kind, line: node.startLine }));
 
-		return { imports, exports };
+		// Re-exports are listed alongside the file's own exports because that is what they
+		// are — part of its public surface. They carry `from`, which is how a caller can
+		// tell a pass-through from a declaration and follow the chain one hop.
+		return { imports: collectedBoth.imports, exports: [...own, ...collectedBoth.reExports] };
 	},
 
 	async statistics(doc: StructDocument): Promise<FileStatistics | null> {
@@ -317,6 +322,44 @@ function collectImports(
 		// there is no need to descend into declaration bodies.
 		if (child.childCount > 0 && child.type.endsWith("_declaration")) {
 			collectImports(child, importTypes, out);
+		}
+	}
+}
+
+/**
+ * Collect `export … from "module"` statements — the barrel pattern.
+ *
+ * These were invisible before: a re-export is neither an `import_statement` (so
+ * `collectImports` skipped it) nor a declaration in the outline (so it produced no export
+ * entry either). The result was that a file reached through a barrel — the normal way most
+ * of a codebase imports anything — could not be tied back to the module that declares the
+ * symbol, and every such usage was reported as unverified.
+ *
+ * A plain `export function x` is deliberately excluded: it has no source string, so it is
+ * a declaration the outline already reports, not a pass-through.
+ *
+ * `export * from "m"` yields one entry named `*`, meaning "everything from m". A caller
+ * cannot know which names that covers without reading `m`, and saying so beats inventing
+ * a list.
+ */
+function collectReExports(node: SyntaxNode, out: ImportExportInfo["exports"]): void {
+	for (let i = 0; i < node.childCount; i++) {
+		const child = node.child(i);
+		if (!child?.isNamed) continue;
+		// Grammar-neutral shape check: an export that names a source module. Keyed on the
+		// presence of that source rather than on a node-type list, so a grammar spelling the
+		// statement differently still works as long as it carries the module string.
+		if (!child.type.startsWith("export")) continue;
+		const moduleName = extractModuleName(child);
+		if (!moduleName) continue;
+		const line = child.startPosition.row + 1;
+		const names = extractImportedNames(child);
+		if (names.length === 0) {
+			out.push({ name: "*", kind: "unknown", line, from: moduleName });
+			continue;
+		}
+		for (const named of names) {
+			out.push({ name: named.local, kind: "unknown", line, from: moduleName });
 		}
 	}
 }

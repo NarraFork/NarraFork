@@ -126,6 +126,62 @@ describeWithGrammar("usages mode", () => {
 		expect(r.output).toMatch(/renamer\.ts {2}\([1-9]/);
 	});
 
+	test("follows a barrel re-export one hop and names the barrel", async () => {
+		// The reported "fatal" defect: importing through an index.ts — the normal style in
+		// most codebases — made every such usage unverifiable, which left the whole
+		// confirmed/unverified split close to useless.
+		writeFileSync(join(workDir, "barrel.ts"), 'export { target } from "./def";\n', "utf8");
+		writeFileSync(
+			join(workDir, "viaBarrel.ts"),
+			'import { target } from "./barrel";\n\nexport const b = target();\n',
+			"utf8",
+		);
+		const r = await run({ file_path: "def.ts", mode: "usages", symbol: "target" });
+		const confirmed = r.output.slice(r.output.indexOf("confirmed"), r.output.indexOf("unverified"));
+		expect(confirmed).toContain("viaBarrel.ts");
+		// The barrel is named because a rename may belong there, not at the use site.
+		expect(confirmed).toContain("[via ./barrel]");
+	});
+
+	test("a star re-export also forwards the symbol", async () => {
+		// `export * from` forwards everything by definition, so it needs no name check.
+		writeFileSync(join(workDir, "starBarrel.ts"), 'export * from "./def";\n', "utf8");
+		writeFileSync(
+			join(workDir, "viaStar.ts"),
+			'import { target } from "./starBarrel";\n\nexport const s = target();\n',
+			"utf8",
+		);
+		const r = await run({ file_path: "def.ts", mode: "usages", symbol: "target" });
+		const confirmed = r.output.slice(r.output.indexOf("confirmed"), r.output.indexOf("unverified"));
+		expect(confirmed).toContain("viaStar.ts");
+	});
+
+	test("two hops stay unverified rather than being claimed as resolved", async () => {
+		// The declared boundary: a second hop costs another read per candidate. Reporting it
+		// as confirmed would overstate what was actually checked.
+		writeFileSync(join(workDir, "hop1.ts"), 'export { target } from "./def";\n', "utf8");
+		writeFileSync(join(workDir, "hop2.ts"), 'export { target } from "./hop1";\n', "utf8");
+		writeFileSync(
+			join(workDir, "viaTwoHops.ts"),
+			'import { target } from "./hop2";\n\nexport const t = target();\n',
+			"utf8",
+		);
+		const r = await run({ file_path: "def.ts", mode: "usages", symbol: "target" });
+		const unverified = r.output.slice(r.output.indexOf("unverified —"));
+		expect(unverified).toContain("viaTwoHops.ts");
+		// And the caveat has to say the limit out loud.
+		expect(r.output).toContain("ONE barrel re-export");
+	});
+
+	test("the barrel itself is not counted as a user of the symbol", async () => {
+		// It forwards the name without using it; listing it as a usage would inflate the
+		// count a rename has to reckon with.
+		writeFileSync(join(workDir, "pure-barrel.ts"), 'export { target } from "./def";\n', "utf8");
+		const r = await run({ file_path: "def.ts", mode: "usages", symbol: "target" });
+		const confirmed = r.output.slice(r.output.indexOf("confirmed"), r.output.indexOf("unverified"));
+		expect(confirmed).not.toContain("pure-barrel.ts");
+	});
+
 	test("missing symbol is a clear error, not an empty scan", async () => {
 		const r = await run({ file_path: "def.ts", mode: "usages" });
 		expect(r.isError).toBe(true);

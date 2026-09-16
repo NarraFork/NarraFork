@@ -2,6 +2,7 @@
 	"title": "Settings",
 	"subagentPoolReasoningEffortHelp": "Only affects newly created subagents. A specified tier overrides the agent's input and is adapted to model support. Not specified applies no pool override; it is not none (thinking off).",
 	"personalGroup": "Personal",
+	"enhancementsGroup": "Enhancements",
 	"instanceGroup": "Instance",
 	"instanceAdminOnlyTitle": "Admin only",
 	"instanceAdminOnlyHint": "Your account is not an administrator. Instance configuration such as provider management is only available to admin accounts. Please sign in with an admin account to configure it.",

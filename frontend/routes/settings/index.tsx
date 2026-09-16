@@ -22,6 +22,7 @@ import {
 	IconServer,
 	IconShield,
 	IconShieldLock,
+	IconSitemap,
 	IconTerminal2,
 	IconUser,
 	IconUsers,
@@ -83,6 +84,12 @@ function MobileSettingsNav() {
 		{ to: "/settings/plugins", label: t("pluginsSection"), icon: <IconPuzzle size={20} /> },
 	];
 
+	// Grammar caching was missing from this list entirely, so on a phone the page could not
+	// be reached at all — the sidebar it lived in is hidden below `sm`.
+	const enhancementItems = [
+		{ to: "/settings/grammars", label: t("grammarsSection"), icon: <IconSitemap size={20} /> },
+	];
+
 	const instanceItems = [
 		{ to: "/settings/providers", label: t("providersSection"), icon: <IconCloud size={20} /> },
 		{ to: "/settings/models", label: t("modelsSection"), icon: <IconCpu size={20} /> },
@@ -139,6 +146,21 @@ function MobileSettingsNav() {
 				{t("personalGroup")}
 			</Text>
 			{personalItems.map((item) => (
+				<NavLink
+					key={item.to}
+					component={Link}
+					to={item.to}
+					label={item.label}
+					leftSection={item.icon}
+					rightSection={<IconChevronRight size={16} stroke={1.5} />}
+					variant="subtle"
+				/>
+			))}
+
+			<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
+				{t("enhancementsGroup")}
+			</Text>
+			{enhancementItems.map((item) => (
 				<NavLink
 					key={item.to}
 					component={Link}

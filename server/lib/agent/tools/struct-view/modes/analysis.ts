@@ -94,13 +94,20 @@ export async function runRefs(
 	const summary =
 		`${unused.length} of ${rows.length} declarations appear only once (defined, never used in this file).` +
 		(unused.length > 0
-			? " A symbol used only from OTHER files also looks like this — confirm with Grep before deleting."
+			? " A symbol used only from OTHER files also looks like this — check mode=usages before deleting."
 			: "");
+
+	// The count and the current cap, not just "raise limit": knowing 30 of 177 are shown is
+	// what tells a caller whether raising it is worth another call.
+	const truncated =
+		rows.length > shown.length
+			? `\n…  ${shown.length} of ${rows.length} shown (limit=${shown.length}); pass a higher \`limit\` for the rest`
+			: "";
 
 	return {
 		output: withFooter(
 			`${header(filePath, doc, resolved)}\nrefs  line     declaration`,
-			`${body}${rows.length > shown.length ? `\n…  ${rows.length - shown.length} more (raise \`limit\`)` : ""}\n\n${summary}`,
+			`${body}${truncated}\n\n${summary}`,
 			notes,
 		),
 		title: filePath,
@@ -139,27 +146,34 @@ export async function runCalls(
 
 	const limit = normalizeNumber(args.limit, { min: 1 }) ?? MAX_RANKED_ROWS;
 	const filter = typeof args.filter === "string" ? args.filter.toLowerCase() : undefined;
-	const calls = (
-		filter ? stats.calls.filter((c) => c.name.toLowerCase().includes(filter)) : stats.calls
-	).slice(0, limit);
+	const matching = filter
+		? stats.calls.filter((c) => c.name.toLowerCase().includes(filter))
+		: stats.calls;
+	const calls = matching.slice(0, limit);
+
+	// Ranked output is frequency-ordered, so a silent cut hides exactly the low-frequency
+	// callees a reader may be looking for (a single clearTimeout matters as much as the 70th
+	// useRef). Say how many were held back rather than letting the list look complete.
+	const omitted = (total: number, shown: number): string =>
+		total > shown ? `\n…  ${shown} of ${total} shown; pass a higher \`limit\` for the rest` : "";
 
 	const sections: string[] = [];
 	if (calls.length > 0) {
 		sections.push(
 			`Calls${filter ? ` matching "${filter}"` : ""}:\n${calls
 				.map((c) => `${String(c.count).padStart(5)}  ${c.name}`)
-				.join("\n")}`,
+				.join("\n")}${omitted(matching.length, calls.length)}`,
 		);
 	} else {
 		sections.push(filter ? `No calls matching "${filter}".` : "No calls found.");
 	}
 
 	if (!filter && stats.elements.length > 0) {
+		const elements = stats.elements.slice(0, limit);
 		sections.push(
-			`Elements rendered:\n${stats.elements
-				.slice(0, limit)
+			`Elements rendered:\n${elements
 				.map((e) => `${String(e.count).padStart(5)}  ${e.name}`)
-				.join("\n")}`,
+				.join("\n")}${omitted(stats.elements.length, elements.length)}`,
 		);
 	}
 

@@ -61,6 +61,13 @@ const DESCRIPTION = `Change a file by STRUCTURE rather than by quoting its text.
 Addresses the same way StructView reads, so a symbol you just inspected can be rewritten
 without re-quoting it: \`symbol: "PaymentService.charge"\` selects that method's full body.
 
+Prefer this over Edit when the change is a WHOLE declaration or a positional range —
+replacing a 200-line method needs its name here, not its entire old body quoted back — and
+over a Read-then-Write round trip, which sends the file through the conversation twice.
+Prefer it over \`sed\`/\`awk\` in Bash: this runs the same addressing with a dry-run preview,
+snapshot evidence and revert support. Edit is still right for a small, surgical string
+replacement you can name exactly.
+
 Commands:
 - replace: swap the selected node/range's body for \`content\`
 - delete: remove the selected node/range (whole lines)

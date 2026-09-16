@@ -43,6 +43,8 @@ export interface UsageFile {
 	confidence?: UsageConfidence;
 	/** Local name the symbol was imported as, when it was renamed. */
 	alias?: string;
+	/** Module specifier of the barrel the import went through, when it was indirect. */
+	viaBarrel?: string;
 }
 
 export interface CrossFileUsageResult {
@@ -62,6 +64,7 @@ export interface RawFileHit {
 	lines: readonly number[];
 	confidence?: UsageConfidence;
 	alias?: string;
+	viaBarrel?: string;
 }
 
 export interface AssembleOptions {
@@ -97,6 +100,7 @@ export function assembleUsages(
 			lines: lines.slice(0, maxPerFile),
 			...(hit.confidence ? { confidence: hit.confidence } : {}),
 			...(hit.alias ? { alias: hit.alias } : {}),
+			...(hit.viaBarrel ? { viaBarrel: hit.viaBarrel } : {}),
 		});
 	}
 
@@ -119,10 +123,12 @@ export function assembleUsages(
 /** The mandatory precision caveat, kept in one place so every caller states it identically. */
 export const CROSS_FILE_PRECISION_NOTE =
 	"Structural, not semantic. `confirmed` files import the name from the defining module, " +
-	"and an `import { x as y }` alias is followed to its local name. `unverified` files " +
-	"carry the same name with no import this check could tie to the definition, so they may " +
-	"be a different symbol entirely — or a usage reached through a re-export or a path " +
-	"alias. Nothing here resolves types, so confirm before renaming or deleting.";
+	"directly or through ONE barrel re-export (`[via …]`); an `import { x as y }` alias is " +
+	"followed to its local name. `unverified` files carry the same name with no import this " +
+	"check could tie to the definition — a different symbol entirely, or a usage reached " +
+	"through a longer re-export chain, a path alias, or a dynamic import. Nothing here " +
+	"resolves types, so a same-named unrelated symbol still reads as a match: confirm " +
+	"before renaming or deleting.";
 
 /**
  * Does an import specifier plausibly refer to `definingPath`?
