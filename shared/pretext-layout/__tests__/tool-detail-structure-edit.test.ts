@@ -274,7 +274,9 @@ describe("dry-run diff rendering", () => {
 		expect(body?.customHighlight).toBe("struct-view");
 	});
 
-	test("an applied (non-dry-run) call has no diff and uses the summary tokenizer", () => {
+	test("an applied call with no diff data uses the summary tokenizer", () => {
+		// Falls back to the text summary only when the tool omitted the diff (e.g. a change
+		// too large to show that way).
 		const body = outputBody(
 			classify({
 				inputJson: { file_path: FILE, command: "replace" },
@@ -283,5 +285,75 @@ describe("dry-run diff rendering", () => {
 			}),
 		);
 		expect(body?.format).toBe("code");
+	});
+});
+
+describe("preview vs applied are told apart", () => {
+	// Both now render an identical red/green diff. The ONLY signal that a preview has not
+	// touched the file is the banner — this is the fix for "the dry-run diff looked like it
+	// had already been applied".
+	const diffFields = {
+		diffBefore: "one\ntwo\nthree",
+		diffAfter: "one\nTWO\nthree",
+		diffStartLine: 1,
+	};
+
+	function noticeTexts(detail: unknown): string[] {
+		const texts: string[] = [];
+		const visit = (value: unknown): void => {
+			if (!value || typeof value !== "object") return;
+			if (Array.isArray(value)) {
+				for (const item of value) visit(item);
+				return;
+			}
+			const record = value as Record<string, unknown>;
+			if (record.kind === "error" && typeof record.text === "string") texts.push(record.text);
+			for (const child of Object.values(record)) visit(child);
+		};
+		visit(detail);
+		return texts;
+	}
+
+	test("a dry run leads with a 'nothing written' notice", () => {
+		const detail = classify({
+			inputJson: { file_path: FILE, command: "replace", content: "TWO" },
+			outputJson: "DRY RUN — nothing written.",
+			metadata: { dryRun: true, command: "replace", ...diffFields },
+		});
+		expect(noticeTexts(detail).some((t) => /nothing was written/i.test(t))).toBe(true);
+	});
+
+	test("the dry-run notice is a warning tone, not an error", () => {
+		// Yellow, not red: a preview is not a failure.
+		const detail = JSON.stringify(
+			classify({
+				inputJson: { file_path: FILE, command: "replace" },
+				metadata: { dryRun: true, command: "replace", ...diffFields },
+			}),
+		);
+		expect(detail).toContain("warning");
+	});
+
+	test("an APPLIED edit renders a diff too, with NO preview notice", () => {
+		// The applied path now carries diff metadata (without dryRun), so a real edit shows
+		// the same diff — but must not claim it is only a preview.
+		const detail = classify({
+			inputJson: { file_path: FILE, command: "replace" },
+			outputJson: "replace applied to file → L2",
+			metadata: { command: "replace", startLine: 2, ...diffFields },
+		});
+		const body = outputBody(detail);
+		expect(body?.format).toBe("diff");
+		expect(noticeTexts(detail).some((t) => /nothing was written/i.test(t))).toBe(false);
+	});
+
+	test("an applied edit shows no 'dry run' chip", () => {
+		const labels = badgeLabels(
+			classify({
+				inputJson: { file_path: FILE, command: "replace" },
+				metadata: { command: "replace", startLine: 2, ...diffFields },
+			}),
+		);
+		expect(labels).not.toContain("dry run");
 	});
 });

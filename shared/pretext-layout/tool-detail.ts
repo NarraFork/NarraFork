@@ -1750,8 +1750,22 @@ function classifyStructureEdit(
 			focusSide: "new",
 			...(diffStartLine != null ? { startLine: diffStartLine } : {}),
 		});
+		// A preview and an applied edit now BOTH render a diff — visually identical red/green
+		// rows. A dry run therefore leads with an explicit "not written" banner so the diff
+		// is not mistaken for a completed change; the applied edit has no banner.
+		const isDryRun = metadata?.dryRun === true;
 		return sections([
 			headerSection,
+			...(isDryRun
+				? [
+						section("output.notice", undefined, {
+							kind: "error" as const,
+							// Yellow, not red: this is a notice, not a failure.
+							tone: "warning" as const,
+							text: "Preview only — nothing was written. Re-run with dry_run: false to apply.",
+						}),
+					]
+				: []),
 			textSection("output.main", outputJson, "output", {
 				cap: "diff",
 				format: "diff",
