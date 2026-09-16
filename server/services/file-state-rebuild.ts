@@ -628,6 +628,56 @@ export function applyToolCall(
  * a rollback silently produces a file in which this edit never happened — the surrounding
  * Write/Edit calls would still replay, so the result looks plausible and is wrong.
  */
+/**
+ * The batched operations of a StructSed call, in either recorded shape.
+ *
+ * Current writes record `operations: <count>` plus one JSON string per operation (`op1`,
+ * `op2`…), because the recorded input admits only scalar fields. Older rows — written while
+ * an array was still being attempted — carry `operations` as the array itself. Both are read
+ * here so history from before the change stays replayable; dropping the array branch would
+ * make those reverts fail rather than merely be unavailable.
+ *
+ * Returns null when this is not a batch at all (the ordinary single-operation shape).
+ */
+function readStructSedBatch(
+	input: Record<string, unknown>,
+	toolCall: OrderedToolCall,
+): Record<string, unknown>[] | null {
+	const recorded = input.operations;
+	// Legacy shape: the operations travelled inline as objects.
+	if (Array.isArray(recorded)) {
+		return recorded.map((entry) => (entry ?? {}) as Record<string, unknown>);
+	}
+	if (typeof recorded !== "number") return null;
+	const out: Record<string, unknown>[] = [];
+	for (let index = 1; index <= recorded; index++) {
+		const raw = input[`op${index}`];
+		if (typeof raw !== "string") {
+			throw new ReplayDivergedError(
+				`StructSed call ${toolCall.toolUseId} recorded ${recorded} batched operation(s) but op${index} is missing.`,
+				toolCall.toolUseId,
+			);
+		}
+		try {
+			const parsed: unknown = JSON.parse(raw);
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+				throw new Error("not an object");
+			}
+			out.push(parsed as Record<string, unknown>);
+		} catch (error) {
+			// A malformed entry cannot be skipped: replaying the rest would rebuild the file as
+			// though this operation never happened, which is a wrong result presented as a
+			// successful revert.
+			throw new ReplayDivergedError(
+				`StructSed call ${toolCall.toolUseId} has an unreadable batched operation op${index}: ` +
+					`${error instanceof Error ? error.message : String(error)}`,
+				toolCall.toolUseId,
+			);
+		}
+	}
+	return out;
+}
+
 function applyStructSedCall(
 	currentContent: string | null,
 	toolCall: OrderedToolCall,
@@ -642,7 +692,7 @@ function applyStructSedCall(
 
 	// A batch recorded every operation with its own resolved range. Replaying only the
 	// first would silently rebuild the file as though the rest never happened.
-	const batch = input.operations;
+	const batch = readStructSedBatch(input, toolCall);
 	if (Array.isArray(batch)) {
 		if (batch.length === 0) {
 			throw new ReplayDivergedError(
@@ -657,12 +707,7 @@ function applyStructSedCall(
 			(a, b) => structSedStartLine(b, toolCall) - structSedStartLine(a, toolCall),
 		);
 		for (const entry of ordered) {
-			const applied = applyStructSedOperation(
-				text,
-				toolCall,
-				entry as Record<string, unknown>,
-				false,
-			);
+			const applied = applyStructSedOperation(text, toolCall, entry, false);
 			if (applied === null) {
 				throw new ReplayDivergedError(
 					`StructSed call ${toolCall.toolUseId} could not replay one of its batched operations.`,

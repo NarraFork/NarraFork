@@ -92,9 +92,12 @@ export type { StashEntry, StashFailure } from "./stash";
 export {
 	dropStash,
 	formatStashSize,
+	listStashes,
 	peekStash,
 	putStash,
+	StashNameError,
 	StashTooLargeError,
+	stashTtlRemainingMs,
 	takeStash,
 } from "./stash";
 export {

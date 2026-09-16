@@ -309,9 +309,15 @@ export async function runImports(
 		);
 	}
 	if (info.exports.length > 0) {
+		// A re-export has no declaration here, so the provider leaves its kind `unknown` —
+		// printing that raw read as an error state for what is a perfectly normal barrel
+		// entry. Say what it actually is, and name the module it forwards to: that is the
+		// file a reader has to open next, and `from` was already being collected.
+		const describe = (exp: (typeof info.exports)[number]): string =>
+			exp.from ? `re-export ${exp.name} from "${exp.from}"` : `${exp.kind} ${exp.name}`;
 		sections.push(
 			`Exports (${info.exports.length}):\n` +
-				info.exports.map((exp) => `  L${exp.line}  ${exp.kind} ${exp.name}`).join("\n"),
+				info.exports.map((exp) => `  L${exp.line}  ${describe(exp)}`).join("\n"),
 		);
 	}
 	if (sections.length === 0) sections.push("No imports or exports detected.");

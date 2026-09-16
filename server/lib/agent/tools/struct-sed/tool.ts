@@ -38,6 +38,7 @@ import {
 } from "../../structural/edit-ops";
 import {
 	dropStash,
+	formatStashSize,
 	locateStashRange,
 	peekStash,
 	type StashEntry,
@@ -218,8 +219,11 @@ export const structSedTool: ToolDefinition = {
 			const path = typeof input.file_path === "string" ? input.file_path : undefined;
 			return {
 				key: "primary",
-				// A dry run still only reads, but routing is resolved before the flag is
-				// known to be trustworthy; declaring `write` keeps the stricter path.
+				// Routing stays `write` even for a dry run: it decides path freezing and the
+				// OAuth write-capability check, and taking the stricter side there costs a
+				// preview nothing. Interactive approval is what should not fire for a
+				// preview, and that is decided separately by `isReadOnlyCall`, which reads
+				// the same `dry_run` this call carries.
 				operation: "write",
 				...(typeof input.device === "string" ? { deviceId: input.device } : {}),
 				...(path ? { path } : {}),
@@ -340,6 +344,36 @@ export const structSedTool: ToolDefinition = {
 				spec.content = found.entry.text;
 			}
 			consumedHandles.push(spec.fromStash);
+		}
+		// What a from_stash write is ABOUT to put in the file. The preview shows a window
+		// around the edit, so on a large block its trailing edge is off-screen and the caller
+		// cannot tell whether the range carried one line too many. Summarising the source
+		// range and the declarations it contains answers that without echoing the content —
+		// which is the whole reason the text is held server-side.
+		const stashSummaries: string[] = [];
+		for (const spec of validated) {
+			if (!spec.fromStash) continue;
+			const held = peekStash(spec.fromStash, ctx.narratorId);
+			if ("failure" in held) continue;
+			const { entry } = held;
+			// Top-level `name`-bearing lines, by indentation: a parser is not available for
+			// every language here, and a wrong list would be worse than a coarse one.
+			const declared = entry.text
+				.split("\n")
+				.filter((line) =>
+					/^(export\s+)?(async\s+)?(function|class|const|let|var|interface|type|enum)\s/.test(line),
+				)
+				.map(
+					(line) =>
+						line.replace(/^(export\s+)?(async\s+)?\w+\s+/, "").match(/^[A-Za-z_$][\w$]*/)?.[0],
+				)
+				.filter((name): name is string => !!name);
+			const where = isBatch ? `Operation ${spec.index}: ` : "";
+			stashSummaries.push(
+				`${where}${spec.fromStash} ← ${entry.filePath}:${entry.startLine}-${entry.endLine} ` +
+					`(${entry.lineCount} line(s), ${formatStashSize(entry.bytes)})` +
+					(declared.length > 0 ? `\n  declares: ${declared.join(", ")}` : ""),
+			);
 		}
 
 		const backend = getToolBackend(ctx, (args as { device?: string }).device);
@@ -584,9 +618,23 @@ export const structSedTool: ToolDefinition = {
 		});
 
 		// A single call keeps the flat shape it has always had, so existing recorded history
-		// stays replayable by the same branch; a batch adds `operations`.
+		// stays replayable by the same branch.
+		//
+		// A batch cannot: the recorded input admits only SCALAR fields (see
+		// `file-change-runtime`), so an `operations` ARRAY was rejected outright — every
+		// batched write failed with "File-change input must contain only JSON scalar fields",
+		// which made the whole batch feature unusable outside a dry run.
+		//
+		// So each operation travels as ONE JSON string. Per-operation scalar columns
+		// (`op1_command`, `op1_start`…) would blow the 16-field budget at five operations,
+		// while this stays at `operations` + N and keeps every field's value a string.
 		const recordedInput: Record<string, unknown> = isBatch
-			? { operations: resolvedOps.map(recordOne) }
+			? {
+					operations: resolvedOps.length,
+					...Object.fromEntries(
+						resolvedOps.map((op) => [`op${op.spec.index}`, JSON.stringify(recordOne(op))]),
+					),
+				}
 			: (recordOne(first) as Record<string, unknown>);
 
 		// Default-on preview. The model sees the resolved range and the result before
@@ -614,6 +662,7 @@ export const structSedTool: ToolDefinition = {
 					// A silently corrected range would hide that the file shifted underneath the
 					// stash, which is exactly what the caller needs to know before applying.
 					(relocationNotes.length > 0 ? `${relocationNotes.join("\n")}\n\n` : "") +
+					(stashSummaries.length > 0 ? `${stashSummaries.join("\n")}\n\n` : "") +
 					plan +
 					(replacements != null ? `${replacements} replacement(s)\n` : "") +
 					`\nBefore:\n${previewRegion(normalized, range)}\n` +

@@ -1514,6 +1514,60 @@ describe("OAuth remote runtime permission constraints", () => {
 		).toBe("allow");
 	});
 
+	// A StructSed dry run resolves the address and renders a diff without writing a byte, so
+	// it is a read. `dry_run` DEFAULTS to true, which made the most common call shape the one
+	// being sent for approval.
+	test("a StructSed dry run is auto-allowed in default mode", () => {
+		const structSed = (input: Record<string, unknown>, permMode: "default" | "readOnly") =>
+			resolvePermissionDecision({
+				toolName: "StructSed",
+				input: { file_path: "/workspace/file.ts", ...input },
+				permMode,
+				cwd: "/workspace",
+			});
+
+		// Omitting the flag is the default preview — the branch most easily broken by writing
+		// `=== true` instead of `!== false`.
+		expect(structSed({ command: "replace", symbol: "foo", content: "x" }, "default")).toBe("allow");
+		expect(structSed({ command: "replace", dry_run: true }, "default")).toBe("allow");
+		// Read-only mode (what strict plan mode maps to) previously DENIED previews outright.
+		expect(structSed({ command: "replace", dry_run: true }, "readOnly")).toBe("allow");
+	});
+
+	test("an applied StructSed write still requires approval", () => {
+		// The safety-critical half: classifying a real write as read-only would let it through
+		// unprompted. `dry_run: false` is the only way to write, so it must still ask.
+		expect(
+			resolvePermissionDecision({
+				toolName: "StructSed",
+				input: { file_path: "/workspace/file.ts", command: "replace", dry_run: false },
+				permMode: "default",
+				cwd: "/workspace",
+			}),
+		).toBe("ask");
+		// And read-only mode must refuse it rather than merely prompt.
+		expect(
+			resolvePermissionDecision({
+				toolName: "StructSed",
+				input: { file_path: "/workspace/file.ts", command: "replace", dry_run: false },
+				permMode: "readOnly",
+				cwd: "/workspace",
+			}),
+		).toBe("deny");
+	});
+
+	test("the dry-run allowance does not leak to other write tools", () => {
+		// `dry_run` is meaningless to Edit; carrying it must not buy an exemption.
+		expect(
+			resolvePermissionDecision({
+				toolName: "Edit",
+				input: { file_path: "/workspace/file.ts", dry_run: true },
+				permMode: "default",
+				cwd: "/workspace",
+			}),
+		).toBe("ask");
+	});
+
 	test("SwitchDevice is always allowed regardless of permission mode", () => {
 		for (const permMode of [
 			"readOnly",

@@ -4,6 +4,7 @@
  * Split out so `apply`, `resolve` and the tool shell can all import the command set and the
  * limits without depending on each other.
  */
+import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 
 export const COMMANDS = [
 	"replace",
@@ -53,8 +54,14 @@ export const MAX_PREVIEW_LINES = 80;
  *
  * Bounds both the resolution work (each operation may run `locate`) and the preview size.
  * A larger refactor should be split into several calls, so a dry run stays readable.
+ *
+ * The hard ceiling is the recorded input's field budget: a batch records one field per
+ * operation plus the `operations` count, and `FILE_CHANGE_LIMITS.fileToolRequestFields`
+ * admits 16 fields total. Exceeding it does not degrade — the write is refused outright —
+ * so the cap is derived from that budget rather than set to a number that looks generous
+ * and then fails at write time.
  */
-export const MAX_BATCH_OPERATIONS = 50;
+export const MAX_BATCH_OPERATIONS = FILE_CHANGE_LIMITS.fileToolRequestFields - 1;
 
 /** Context lines kept around a change when building the card's diff. */
 export const DIFF_CONTEXT_LINES = 3;

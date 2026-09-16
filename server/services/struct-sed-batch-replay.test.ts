@@ -43,6 +43,64 @@ describe("batch replay", () => {
 		).toBe("b\nc\ne\n");
 	});
 
+	// The recorded input admits only SCALAR fields, so an `operations` array was refused at
+	// write time — every batched write failed with "must contain only JSON scalar fields" and
+	// the batch feature only ever worked in dry run. Operations now travel as one JSON string
+	// each (`op1`, `op2`…) with `operations` holding the count.
+	test("replays the scalar recorded shape a real batched write produces", () => {
+		expect(
+			applyToolCall(
+				FIVE,
+				call({
+					operations: 2,
+					op1: JSON.stringify({ command: "delete", resolvedStartLine: 1, resolvedEndLine: 1 }),
+					op2: JSON.stringify({ command: "delete", resolvedStartLine: 4, resolvedEndLine: 4 }),
+				}),
+			),
+		).toBe("b\nc\ne\n");
+	});
+
+	test("the scalar shape is still ordered bottom-up", () => {
+		// Same property as the array shape: a growing edit below must not shift the ones above.
+		expect(
+			applyToolCall(
+				FIVE,
+				call({
+					operations: 2,
+					op1: JSON.stringify({
+						command: "replace",
+						resolvedStartLine: 1,
+						resolvedEndLine: 1,
+						content: "x\ny\nz",
+					}),
+					op2: JSON.stringify({
+						command: "replace",
+						resolvedStartLine: 3,
+						resolvedEndLine: 3,
+						content: "C",
+					}),
+				}),
+			),
+		).toBe("x\ny\nz\nb\nC\nd\ne\n");
+	});
+
+	test("a missing or unreadable operation diverges instead of replaying a partial batch", () => {
+		// Skipping it would rebuild the file as though that edit never happened and report
+		// success — a wrong result dressed as a completed revert.
+		expect(() =>
+			applyToolCall(
+				FIVE,
+				call({
+					operations: 2,
+					op1: JSON.stringify({ command: "delete", resolvedStartLine: 1, resolvedEndLine: 1 }),
+				}),
+			),
+		).toThrow(ReplayDivergedError);
+		expect(() => applyToolCall(FIVE, call({ operations: 1, op1: "{not json" }))).toThrow(
+			ReplayDivergedError,
+		);
+	});
+
 	test("addresses stay relative to the original file when content grows", () => {
 		// L1 becomes three lines. Replayed top-down, the L3 replace would land on the
 		// inserted text instead of the original "c".

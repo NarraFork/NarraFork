@@ -66,14 +66,44 @@ describe("stash mode", () => {
 		expect(readFileSync(srcFile, "utf8")).toBe(SOURCE);
 	});
 
-	test("refuses address and symbol together, and neither", async () => {
+	test("refuses address and symbol together", async () => {
 		resetStash();
 		const both = await stash({ address: "1", symbol: "moved" });
 		expect(both.isError).toBe(true);
 		expect(both.output).toContain("not both");
-		const neither = await stash({});
-		expect(neither.isError).toBe(true);
-		expect(neither.output).toContain("`address`");
+	});
+
+	// Neither argument used to be an error. It now means "what am I holding?", which is the
+	// only way to recover an opaque handle after a compaction.
+	test("with neither argument it lists what is held instead of erroring", async () => {
+		resetStash();
+		const empty = await stash({});
+		expect(empty.isError).toBeFalsy();
+		expect(empty.output).toContain("No stashes held");
+
+		await stash({ address: "1,3" });
+		const listed = await stash({});
+		expect(listed.isError).toBeFalsy();
+		expect(listed.output).toContain("1 stash(es) held");
+		expect(listed.output).toContain("stash_");
+		// A listing must never carry the content — that is the point of holding it server-side.
+		expect(listed.output).not.toContain(SOURCE.split("\n")[0]);
+	});
+
+	test("a named handle is readable, and a name in use is refused not overwritten", async () => {
+		resetStash();
+		const named = await stash({ address: "1,3", name: "scroll-fns" });
+		expect(named.isError).toBeFalsy();
+		expect(named.metadata?.handle).toBe("stash_scroll-fns");
+
+		// Overwriting would silently invalidate a handle its holder still believes is good.
+		const clash = await stash({ address: "1,3", name: "scroll-fns" });
+		expect(clash.isError).toBe(true);
+		expect(clash.output).toContain("already holds");
+
+		const bad = await stash({ address: "1,3", name: "no spaces allowed" });
+		expect(bad.isError).toBe(true);
+		expect(bad.output).toContain("not usable");
 	});
 
 	test("an address matching nothing is an error, not an empty stash", async () => {
@@ -100,6 +130,27 @@ describe("from_stash", () => {
 		expect(r.isError).toBeFalsy();
 		// The preview shows what would be written; that is the one place content is expected.
 		expect(r.output).toContain("DRY RUN");
+	});
+
+	// The preview window only shows lines around the edit, so on a large block its trailing
+	// edge is off-screen and a caller cannot tell whether the range took one line too many.
+	test("a dry run summarises the stash source and what it declares", async () => {
+		resetStash();
+		const held = await stash({ address: "1,$", name: "whole-file" });
+		const target = join(workDir, "summary-target.ts");
+		const r = await sed({
+			file_path: target,
+			command: "append",
+			address: "1",
+			from_stash: held.metadata?.handle as string,
+			create_if_missing: true,
+		});
+		expect(r.isError).toBeFalsy();
+		// Where it came from and how big it is, so the range can be checked without reading it.
+		expect(r.output).toContain("stash_whole-file ←");
+		expect(r.output).toContain("line(s)");
+		// The declarations carried along, which is what confirms the right range was taken.
+		expect(r.output).toContain("declares:");
 	});
 
 	test("a dry run does not consume the handle", async () => {

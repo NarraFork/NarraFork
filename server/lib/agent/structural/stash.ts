@@ -86,9 +86,23 @@ export interface StashInput {
 	startLine: number;
 	endLine: number;
 	encoding?: string;
+	/**
+	 * Caller-chosen suffix, so a handle can say what it holds (`stash_scroll-fns`).
+	 * Rejected on collision rather than overwritten: overwriting would silently invalidate
+	 * the earlier handle while its holder still believed it was good.
+	 */
+	name?: string;
 }
 
 export class StashTooLargeError extends Error {}
+
+/**
+ * An unusable or already-taken stash name.
+ *
+ * Distinct from `StashTooLargeError` because the remedy is different (rename vs stash less)
+ * and because a caller branching on the size error should not be handed a naming failure.
+ */
+export class StashNameError extends Error {}
 
 /**
  * Store a range and return its entry.
@@ -103,8 +117,27 @@ export function putStash(input: StashInput): StashEntry {
 			`Range is ${bytes} bytes; the stash limit is ${MAX_STASH_BYTES}. Stash a narrower range.`,
 		);
 	}
+	// A name must survive being pasted back as a handle, so keep it to the same shape a
+	// generated id has. Anything else would produce a handle that cannot be typed reliably.
+	let handle = `stash_${generateShortId()}`;
+	if (input.name !== undefined) {
+		if (!/^[A-Za-z0-9._-]{1,40}$/.test(input.name)) {
+			throw new StashNameError(
+				`Stash name "${input.name}" is not usable. Use 1-40 characters of A-Z, a-z, 0-9, dot, dash or underscore.`,
+			);
+		}
+		handle = `stash_${input.name}`;
+		const existing = store.get(handle);
+		if (existing && now() - existing.createdAt <= STASH_TTL_MS) {
+			throw new StashNameError(
+				`Stash ${handle} already holds ${existing.filePath}:${existing.startLine}-${existing.endLine}. ` +
+					"Write or drop it first, or choose another name — reusing the name would silently " +
+					"replace content someone still holds a handle to.",
+			);
+		}
+	}
 	const entry: StashEntry = {
-		handle: `stash_${generateShortId()}`,
+		handle,
 		narratorId: input.narratorId,
 		text: input.text,
 		filePath: input.filePath,
@@ -158,6 +191,40 @@ export function dropStash(handle: string, narratorId: string): boolean {
 	const entry = store.get(handle);
 	if (!entry || entry.narratorId !== narratorId) return false;
 	return store.delete(handle);
+}
+
+/**
+ * A narrator's live entries, newest first, WITHOUT their text.
+ *
+ * A handle is otherwise opaque: `stash_9nmlswfx` says nothing about what it holds, so after a
+ * compaction or an interruption the only record of "which handle was which" was whatever the
+ * caller happened to write down in conversation. Two handles in flight is enough for a
+ * mispaste to write the wrong block into the wrong file.
+ *
+ * Text is deliberately excluded — keeping the content out of the context is the entire reason
+ * the stash exists, and a listing that inlined it would defeat that.
+ *
+ * Expired entries are dropped here as well, so listing never advertises a handle that the
+ * next call would reject.
+ */
+export function listStashes(narratorId: string): Array<Omit<StashEntry, "text" | "narratorId">> {
+	const current = now();
+	const mine: Array<Omit<StashEntry, "text" | "narratorId">> = [];
+	for (const entry of [...store.values()]) {
+		if (entry.narratorId !== narratorId) continue;
+		if (current - entry.createdAt > STASH_TTL_MS) {
+			store.delete(entry.handle);
+			continue;
+		}
+		const { text: _text, narratorId: _owner, ...rest } = entry;
+		mine.push(rest);
+	}
+	return mine.sort((a, b) => b.createdAt - a.createdAt);
+}
+
+/** Remaining lifetime, so a listing can say how long a handle is still good for. */
+export function stashTtlRemainingMs(createdAt: number): number {
+	return Math.max(0, STASH_TTL_MS - (now() - createdAt));
 }
 
 /** Oldest-first eviction once a narrator exceeds either ceiling. */

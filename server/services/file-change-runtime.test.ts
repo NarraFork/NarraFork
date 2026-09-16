@@ -26,6 +26,7 @@ import * as schema from "../db/schema";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { editTool } from "../lib/agent/tools/edit";
 import { decodeFileBytes } from "../lib/agent/tools/encoding";
+import { MAX_BATCH_OPERATIONS } from "../lib/agent/tools/struct-sed/commands";
 import { writeTool } from "../lib/agent/tools/write";
 import { withBashWriteLock, withWorkspaceWriteLock } from "../lib/agent/tools/write-serialization";
 import type { ToolContext, ToolExecutionTarget } from "../lib/agent/types";
@@ -324,6 +325,7 @@ describe("bounded immutable request digest", () => {
 			]),
 		);
 		await expect(hashLocalFileChangeRequest(["Write"], fields)).rejects.toThrow("fields exceed");
+		expect(MAX_BATCH_OPERATIONS + 1).toBeLessThanOrEqual(FILE_CHANGE_LIMITS.fileToolRequestFields);
 	});
 
 	test("large hashing yields so cancellation can stop it before any completed digest", async () => {

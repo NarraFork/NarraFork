@@ -720,7 +720,7 @@ export function resolvePermissionDecision(
 
 	// readOnly mode
 	if (effectiveMode === "readOnly") {
-		if (READ_ONLY_TOOLS.includes(toolName)) {
+		if (isReadOnlyCall(toolName, input)) {
 			const toolPaths = getToolPolicyPaths(toolName, input, cwd, bashAnalysis, context);
 			const hasExternalPath =
 				toolPaths.length > 0 &&
@@ -786,7 +786,7 @@ export function resolvePermissionDecision(
 
 	if (!hasExternalPath) {
 		if (effectiveMode === "default") {
-			return READ_ONLY_TOOLS.includes(toolName) ? "allow" : "ask";
+			return isReadOnlyCall(toolName, input) ? "allow" : "ask";
 		}
 		if (effectiveMode === "acceptEdits" && ACCEPT_EDITS_AUTO_ALLOW.includes(toolName))
 			return "allow";
@@ -794,7 +794,7 @@ export function resolvePermissionDecision(
 
 	if (
 		hasExternalPath &&
-		READ_ONLY_TOOLS.includes(toolName) &&
+		isReadOnlyCall(toolName, input) &&
 		toolPaths.every((path) => isInsideDecisionTruncateDir(cwd, path, context))
 	) {
 		return "allow";
@@ -883,6 +883,30 @@ const READ_ONLY_TOOLS = [
 	"KnowledgeRead",
 	"KnowledgeLibrary",
 ];
+
+/**
+ * Whether THIS CALL only reads, which is not always decidable from the tool name.
+ *
+ * StructSed with `dry_run` resolves the address and renders a diff without writing a byte,
+ * so a preview is a read. Its default is `dry_run: true`, so the most common call shape was
+ * the one being sent for approval.
+ *
+ * The flag is trustworthy here: execution reads `args.dry_run !== false` from the same input
+ * this sees (`effectiveInput = permission.updatedInput ?? tu.input`), and `updatedInput` only
+ * ever carries AskUserQuestion answers, an ExitPlanMode plan, or an async deferral — it never
+ * rewrites `dry_run`.
+ *
+ * `!== false` mirrors the tool's own check verbatim. Writing `=== true` here would classify an
+ * omitted `dry_run` as a write; the two predicates disagreeing about one call is the dangerous
+ * direction, so they must stay identical.
+ *
+ * Per-call classification is the established shape in this file, not a new idea: the blacklist
+ * decision below already splits `Agent` by `subagent_type` and Bash by its parsed command.
+ */
+function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boolean {
+	if (READ_ONLY_TOOLS.includes(toolName)) return true;
+	return toolName === "StructSed" && input.dry_run !== false;
+}
 
 /** Tools that always require user approval regardless of permission mode. */
 const ALWAYS_ASK_TOOLS = ["ExitPlanMode", "AskUserQuestion"];
@@ -2302,7 +2326,9 @@ export function classifyDanger(
 		);
 	}
 
-	if (READ_ONLY_TOOLS.includes(toolName)) {
+	// A dry run reads, so it earns no write-risk notice: warning about out-of-worktree writes
+	// for a preview that writes nothing is noise that dulls the real warnings.
+	if (isReadOnlyCall(toolName, input)) {
 		return null;
 	}
 

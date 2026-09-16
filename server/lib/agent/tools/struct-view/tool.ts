@@ -58,7 +58,7 @@ Modes:
 - interface: given a line range (\`address\`) or a \`symbol\`, what extracting it would require — which outside symbols it uses (become parameters), which of its own symbols are used outside (must be exported), and which are self-contained (move with it). Answers "is this a clean seam and what's the signature", the question outline cannot.
 - usages: where a \`symbol\` is referenced in OTHER files. ripgrep prefilters, then the parser drops comment/string matches. Results split into **confirmed** (the file imports the name from this module, aliases followed to their local name) and **unverified** (same name, no import this check could tie to the definition — possibly a different symbol, possibly reached via a re-export). Still name-based, not type-resolved, so confirm before renaming or deleting. This is the cross-file view refs/report cannot give.
 - find: WHICH FILE declares a \`symbol\`, across the whole repo — the one mode that needs no \`file_path\`. **Start here when you do not yet know where something lives, instead of grepping for it.** ripgrep narrows the candidates, then each is parsed and only real declarations are kept, so call sites, comments and strings drop out and each hit reports its kind and line. Feed the result straight into another mode's \`file_path\`.
-- stash: hold a range (by \`address\` or \`symbol\`) server-side and get back a handle. **This is how you move code between files.** The content never enters your context, so nothing has to be retyped — pass the handle to StructSed as \`from_stash\`, which supplies the content when writing and the verified range when deleting the original. Also the only way to move a block larger than this tool's output cap, since a truncated block would corrupt the target. Stashing does NOT modify the source; remove the original with a separate StructSed delete.
+- stash: hold a range (by \`address\` or \`symbol\`) server-side and get back a handle. **This is how you move code between files.** The content never enters your context, so nothing has to be retyped — pass the handle to StructSed as \`from_stash\`, which supplies the content when writing and the verified range when deleting the original. Also the only way to move a block larger than this tool's output cap, since a truncated block would corrupt the target. Stashing does NOT modify the source; remove the original with a separate StructSed delete. Pass \`name\` for a readable handle (\`stash_scroll-fns\`) instead of an opaque id; a name already in use is refused, not overwritten. Called with NEITHER \`address\` nor \`symbol\`, it LISTS what you are currently holding (source range, size, expiry — never the content), which is how you recover a handle you no longer recognise.
 - print: sed-style line/regex output filtering. Needs no parser, so it works on any text file (config, log, unsupported language).
 
 Addresses for print: \`42\` (one line), \`10,20\` (range), \`10,$\` (to EOF), \`$\` (last line), \`/regex/\` (each matching line), \`/from/,/to/\` (block). Range endpoints mix freely, so \`/section marker/,$\` takes a landmark to EOF and \`/start/,120\` or \`10,/end/\` anchor one end only.
@@ -84,6 +84,11 @@ const rawJsonSchema: Record<string, unknown> = {
 		symbol: {
 			description:
 				'For mode=extract: the symbol to return. "Class.method" targets a member; a bare name matches at any depth. Append "#N" to pick the Nth match among duplicates. For mode=find/usages: the bare name to locate across the repository.',
+			type: "string",
+		},
+		name: {
+			description:
+				'For mode=stash: an optional readable name for the handle (e.g. "scroll-fns" → stash_scroll-fns), so two handles in flight cannot be confused. 1-40 chars of A-Z a-z 0-9 . - _. A name already in use is rejected rather than overwritten.',
 			type: "string",
 		},
 		kind: {
@@ -167,6 +172,10 @@ export const structViewTool: ToolDefinition = {
 			.string()
 			.optional()
 			.describe("For mode=extract/usages/find: the symbol to return or locate."),
+		name: z
+			.string()
+			.optional()
+			.describe("For mode=stash: optional readable handle name (stash_<name>)."),
 		kind: z.string().optional().describe("Comma-separated declaration kinds to keep."),
 		depth: looseNumber("For mode=outline/tree: maximum nesting depth."),
 		address: z.string().optional().describe("For mode=print: line/range/regex address."),

@@ -218,11 +218,58 @@ export async function runInterface(
 		return `${title} (${entries.length}) — ${hint}\n${rows}`;
 	};
 
+	// A flat NEEDS INPUT list mixes three things that need completely different responses,
+	// and on a large range it runs to dozens of rows in which the one that matters is easy
+	// to miss. The split is derivable from what the analysis already carries: `declaredAt`
+	// says whether it is declared in this file at all, and the file's own imports say
+	// whether an undeclared name arrives by import or is simply ambient.
+	const imported = new Set<string>();
+	if (resolved.provider.imports) {
+		try {
+			const info = await resolved.provider.imports(doc);
+			for (const imp of info.imports) {
+				for (const named of imp.names ?? []) imported.add(named.local);
+			}
+		} catch {
+			// A provider that cannot report imports only costs the finer grouping; the names
+			// still appear, just under the ambient heading.
+		}
+	}
+
+	const globals: InterfaceSymbol[] = [];
+	const importedInputs: InterfaceSymbol[] = [];
+	const crossFunction: InterfaceSymbol[] = [];
+	for (const symbol of analysis.needsInput) {
+		if (symbol.declaredAt != null) crossFunction.push(symbol);
+		else if (imported.has(symbol.name)) importedInputs.push(symbol);
+		else globals.push(symbol);
+	}
+
+	// Deliberately ordered by how much work each implies, cheapest first, so the expensive
+	// one lands last where it is read rather than first where it is skimmed.
 	sections.push(
 		renderGroup(
-			"NEEDS INPUT",
-			analysis.needsInput,
-			"defined outside the range: these become parameters or imports.",
+			"NEEDS INPUT · ambient",
+			globals,
+			"not declared in this file and not imported here — language/DOM globals and " +
+				"the like usually need nothing. Anything project-specific in this list means " +
+				"the provider could not see where it comes from.",
+		),
+	);
+	sections.push(
+		renderGroup(
+			"NEEDS INPUT · imported",
+			importedInputs,
+			"imported by this file: carry the same imports into the new one.",
+		),
+	);
+	sections.push(
+		renderGroup(
+			"NEEDS INPUT · declared in this file",
+			crossFunction,
+			"declared here but OUTSIDE the range: each becomes a parameter or an import — " +
+				"and several of them usually means the range is cut in the wrong place and " +
+				"should grow to include what it depends on.",
 		),
 	);
 	sections.push(

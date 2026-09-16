@@ -475,6 +475,26 @@ describeWithGrammar("tree-sitter provider (typescript grammar installed)", () =>
 		expect(result.output).toContain("validateCard");
 		expect(result.metadata?.imports).toBe(1);
 	});
+
+	// A barrel's entries have no declaration in this file, so the provider leaves their kind
+	// `unknown`. Printing that raw made a normal re-export look like a failed parse.
+	test("imports labels a re-export as one and names the module it forwards to", async () => {
+		const barrel = join(workDir, "barrel.ts");
+		writeFileSync(
+			barrel,
+			'export { validateCard, applyDiscount } from "./payment";\nexport * from "./order";\nexport const localOwn = 1;\n',
+			"utf8",
+		);
+		const result = await run({ file_path: barrel, mode: "imports" });
+		expect(result.output).toContain('re-export validateCard from "./payment"');
+		// A star re-export forwards everything; `*` is the honest name for that.
+		expect(result.output).toContain('re-export * from "./order"');
+		// A real declaration in this file keeps its own kind rather than being relabelled.
+		expect(result.output).toContain("localOwn");
+		expect(result.output).not.toContain("re-export localOwn");
+		// The word that made this look broken must be gone.
+		expect(result.output).not.toContain("unknown");
+	});
 });
 
 test("cleanup", () => {

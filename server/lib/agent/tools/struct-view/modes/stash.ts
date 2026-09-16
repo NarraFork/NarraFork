@@ -17,16 +17,61 @@
 import {
 	AddressError,
 	formatStashSize,
+	listStashes,
 	parseAddress,
 	parseSymbolSelector,
 	putStash,
 	resolveAddress,
+	StashNameError,
 	StashTooLargeError,
 	type StructDocument,
+	stashTtlRemainingMs,
 } from "../../../structural";
 import type { ToolResult } from "../../../types";
 import type { Resolved } from "../render";
 import { withFooter } from "../render";
+
+/**
+ * What the narrator is currently holding — metadata only, never the text.
+ *
+ * Listing the content would defeat the point of the stash (keeping big blocks out of the
+ * context), so this reports where each block came from and how big it is, which is what a
+ * caller needs to pick the right handle.
+ */
+function listHeldStashes(narratorId: string, notes: string[]): ToolResult {
+	const held = listStashes(narratorId);
+	if (held.length === 0) {
+		return {
+			output: withFooter(
+				"No stashes held",
+				'mode=stash with `address` (e.g. "1495,$") or `symbol` holds a range server-side and ' +
+					"returns a handle for StructSed's from_stash. Called with neither, as here, it lists " +
+					"what you are already holding.",
+				notes,
+			),
+			title: "stash list",
+			metadata: { mode: "stash", action: "list", count: 0 },
+		};
+	}
+	const rows = held.map((entry) => {
+		const minutes = Math.round(stashTtlRemainingMs(entry.createdAt) / 60000);
+		return (
+			`  ${entry.handle}  ${entry.filePath}:${entry.startLine}-${entry.endLine}  ` +
+			`${entry.lineCount} line(s), ${formatStashSize(entry.bytes)}, expires in ~${minutes}m`
+		);
+	});
+	return {
+		output: withFooter(
+			`${held.length} stash(es) held`,
+			`${rows.join("\n")}\n\nContent is not shown — that is what keeps it out of the context. ` +
+				"Write one with StructSed `from_stash`, and pass keep: true if a delete of the " +
+				"original still needs the handle afterwards.",
+			notes,
+		),
+		title: "stash list",
+		metadata: { mode: "stash", action: "list", count: held.length },
+	};
+}
 
 export async function runStash(
 	filePath: string,
@@ -50,14 +95,11 @@ export async function runStash(
 			title: filePath,
 		};
 	}
+	// No range asked for means "tell me what I am already holding". A handle is otherwise
+	// opaque, so this is the only way to recover which one holds what after a compaction or
+	// an interruption — previously that record existed only in conversation notes.
 	if (!rawAddress && !rawSymbol) {
-		return {
-			output:
-				'mode=stash needs `address` (e.g. "1495,$") or `symbol` (e.g. "PaymentService"). ' +
-				"It holds that range server-side and returns a handle for StructSed's from_stash.",
-			isError: true,
-			title: filePath,
-		};
+		return listHeldStashes(narratorId, notes);
 	}
 
 	const lines = text.split("\n");
@@ -137,8 +179,22 @@ export async function runStash(
 
 	let entry: ReturnType<typeof putStash>;
 	try {
-		entry = putStash({ narratorId, text: body, filePath, startLine, endLine, encoding });
+		entry = putStash({
+			narratorId,
+			text: body,
+			filePath,
+			startLine,
+			endLine,
+			encoding,
+			// A caller-chosen name makes the handle self-describing, which matters as soon as
+			// two are in flight: `stash_scroll-fns` cannot be mixed up the way `stash_9nmlswfx`
+			// can. Collisions are rejected inside putStash rather than silently overwritten.
+			...(typeof args.name === "string" && args.name.trim() ? { name: args.name.trim() } : {}),
+		});
 	} catch (err) {
+		if (err instanceof StashNameError) {
+			return { output: err.message, isError: true, title: filePath };
+		}
 		if (err instanceof StashTooLargeError) {
 			return { output: err.message, isError: true, title: filePath };
 		}

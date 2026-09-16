@@ -69,6 +69,38 @@ describeWithGrammar("interface mode", () => {
 		expect(r.output).toMatch(/NEEDS EXPORT[\s\S]*exported/);
 	});
 
+		// A flat NEEDS INPUT list mixed language globals, imports and this file's own
+		// declarations, so the row that actually signals a bad seam was easy to miss.
+		test("splits NEEDS INPUT by what each name actually requires", async () => {
+			const file = write(
+				"classified.ts",
+				'import { helper } from "./helper";\n' +
+					"const outerConst = 1;\n" +
+					"function region() {\n" +
+					"	const seen = new Map();\n" +
+					"	return helper(outerConst) + seen.size;\n" +
+					"}\n",
+			);
+			const r = await run({ file_path: file, mode: "interface", symbol: "region" });
+			expect(r.isError).toBeFalsy();
+
+			// Declared in this file but outside the range — the signal that the seam is wrong.
+			expect(r.output).toMatch(/NEEDS INPUT · declared in this file[\s\S]*outerConst/);
+			// Arrives by import: the new file needs the same import, nothing more.
+			expect(r.output).toMatch(/NEEDS INPUT · imported[\s\S]*helper/);
+			// `Map` is neither declared here nor imported, so it lands in ambient.
+			expect(r.output).toMatch(/NEEDS INPUT · ambient[\s\S]*Map/);
+			// An import must not also appear under "declared in this file": that would send the
+			// reader looking for a declaration this file does not contain. Checked on the group's
+			// own line rather than across the whole report, which any loose pattern would match.
+			const declaredGroup = r.output
+				.split("NEEDS INPUT · declared in this file")[1]
+				?.split("NEEDS EXPORT")[0];
+			expect(declaredGroup).toBeDefined();
+			expect(declaredGroup).toContain("outerConst");
+			expect(declaredGroup).not.toContain("helper");
+		});
+
 	test("accepts a line-range address", async () => {
 		const file = write("sample.ts", SOURCE);
 		const r = await run({ file_path: file, mode: "interface", address: "7,14" });
