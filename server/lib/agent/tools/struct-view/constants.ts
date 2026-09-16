@@ -37,7 +37,8 @@ export type Mode =
 	| "report"
 	| "landmarks"
 	| "interface"
-	| "usages";
+	| "usages"
+	| "find";
 
 export const MODES: Mode[] = [
 	"outline",
@@ -53,7 +54,11 @@ export const MODES: Mode[] = [
 	"landmarks",
 	"interface",
 	"usages",
+	"find",
 ];
+
+/** Modes that search the repository instead of one file, so `file_path` is optional. */
+export const REPO_MODES: ReadonlySet<Mode> = new Set<Mode>(["find"]);
 
 /** Rows shown by the ranking modes before the tail is summarized. */
 export const MAX_RANKED_ROWS = 25;
@@ -78,3 +83,12 @@ export const MAX_USAGE_CANDIDATES = 200;
 export const MAX_USAGE_FILE_BYTES = 2_000_000;
 export const USAGE_GREP_TIMEOUT_MS = 15_000;
 export const USAGE_GREP_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Declaration rows `find` prints before summarizing the tail.
+ *
+ * Lower than the usage caps on purpose: a name declared in 40 places is nearly
+ * always a common word, and the answer to "where does X live" is useless if the
+ * caller has to read 200 rows to find it.
+ */
+export const MAX_FIND_ROWS = 40;

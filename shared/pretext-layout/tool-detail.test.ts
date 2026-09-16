@@ -2572,6 +2572,26 @@ describe("resolveFileDiffStats — tool metadata (authoritative)", () => {
 		).toEqual({ added: 240, removed: 0 });
 	});
 
+	it("reads StructSed's counts, which the server measures at execution", () => {
+		// A structural rewrite changes the file as much as the equivalent Edit, so its
+		// folded row carries the same figure rather than reading as a lesser step.
+		expect(
+			resolveFileDiffStats(
+				"StructSed",
+				{ command: "replace", symbol: "handler" },
+				{ linesAdded: 8, linesRemoved: 20 },
+			),
+		).toEqual({ added: 8, removed: 20 });
+	});
+
+	it("refuses to invent a figure for StructSed without metadata", () => {
+		// Its input names a range, never the text being replaced, so there is nothing to
+		// diff locally. Undefined is the only honest answer.
+		expect(
+			resolveFileDiffStats("StructSed", { command: "delete", address: "10,20" }, {}),
+		).toBeUndefined();
+	});
+
 	it("prefers metadata over a local computation", () => {
 		// The local diff of these two strings would say 1/1; metadata wins because only
 		// the server saw the untruncated payload.

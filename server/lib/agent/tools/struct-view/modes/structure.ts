@@ -15,14 +15,17 @@ import {
 	assembleUsages,
 	CROSS_FILE_PRECISION_NOTE,
 	type InterfaceSymbol,
+	importMayReferTo,
 	languageIdForExtension,
 	parseAddress,
 	parseSymbolSelector,
 	type RawFileHit,
 	referenceLines,
 	resolveAddress,
+	resolveProvider,
 	type StructDocument,
 	straddlingDeclarations,
+	type UsageConfidence,
 } from "../../../structural";
 import type { ToolResult } from "../../../types";
 import { decodeFileBytes } from "../../encoding";
@@ -273,6 +276,42 @@ export async function runInterface(
  * real identifier rather than a mention in a comment or string. See cross-file-usages.ts
  * for why the result is labelled structural rather than semantic.
  */
+/**
+ * Whether a candidate file imports `name` from the file that declares it.
+ *
+ * Any failure resolves to `unverified`, never to "not a usage": a language with no
+ * import support, a re-export chain, a dynamic import or a path alias this heuristic
+ * cannot follow all leave a genuine reference that must still be reported. The label
+ * describes what could be PROVEN, not what exists.
+ */
+async function classifyImport(
+	candidateDoc: StructDocument,
+	name: string,
+	definingPath: string,
+): Promise<{ confidence: UsageConfidence; alias?: string }> {
+	try {
+		const resolved = await resolveProvider(candidateDoc);
+		if (!resolved?.provider.imports) return { confidence: "unverified" };
+		const info = await resolved.provider.imports(candidateDoc);
+		for (const entry of info.imports) {
+			if (!entry.names?.length) continue;
+			if (!importMayReferTo(entry.module, definingPath)) continue;
+			for (const imported of entry.names) {
+				// Imported under its own name.
+				if (imported.local === name && !imported.original) return { confidence: "confirmed" };
+				// Renamed on import: the local name is what appears at the use sites.
+				if (imported.original === name) {
+					return { confidence: "aliased", alias: imported.local };
+				}
+				if (imported.local === name) return { confidence: "confirmed" };
+			}
+		}
+		return { confidence: "unverified" };
+	} catch {
+		return { confidence: "unverified" };
+	}
+}
+
 export async function runUsages(
 	filePath: string,
 	doc: StructDocument,
@@ -387,7 +426,20 @@ export async function runUsages(
 				skipped++;
 				continue;
 			}
-			hits.push({ path: relPath, lines: lines.get(name) ?? [] });
+			// Import check: does this file actually pull the name from the defining module?
+			// Cheap (the parse is already done and cached) and it is what separates "uses the
+			// symbol" from "happens to contain a same-named identifier".
+			const verdict = await classifyImport(candidateDoc, name, io.ioPath);
+			const own = lines.get(name) ?? [];
+			// An alias means the local name differs, so the original name's lines are not the
+			// usages — the alias's are.
+			const effective = verdict.alias ? (lines.get(verdict.alias) ?? own) : own;
+			hits.push({
+				path: relPath,
+				lines: effective,
+				confidence: verdict.confidence,
+				...(verdict.alias ? { alias: verdict.alias } : {}),
+			});
 		} catch {
 			skipped++;
 		}
@@ -412,12 +464,28 @@ export async function runUsages(
 	}
 
 	const totalRefs = result.files.reduce((n, f) => n + f.lines.length, 0);
-	const body = result.files
-		.map((file) => {
-			const shown = file.lines.map((l) => `L${l}`).join(", ");
-			return `  ${file.path}  (${file.lines.length})  ${shown}`;
-		})
-		.join("\n");
+	const row = (file: (typeof result.files)[number]): string => {
+		const shown = file.lines.map((l) => `L${l}`).join(", ");
+		const alias = file.alias ? `  [imported as ${file.alias}]` : "";
+		return `  ${file.path}  (${file.lines.length})  ${shown}${alias}`;
+	};
+	// Two groups, because the difference is actionable: a rename must update the confirmed
+	// files, while an unverified one has to be read first. A single flat list forced that
+	// judgement onto the reader with nothing to base it on.
+	const confirmed = result.files.filter((f) => f.confidence !== "unverified");
+	const unverified = result.files.filter((f) => f.confidence === "unverified");
+	const sections: string[] = [];
+	if (confirmed.length > 0) {
+		sections.push(
+			`confirmed — imports ${name} from this module:\n${confirmed.map(row).join("\n")}`,
+		);
+	}
+	if (unverified.length > 0) {
+		sections.push(
+			`unverified — same name, no visible import from this module:\n${unverified.map(row).join("\n")}`,
+		);
+	}
+	const body = sections.join("\n\n");
 
 	const caveats: string[] = [];
 	if (result.candidatesCapped) {

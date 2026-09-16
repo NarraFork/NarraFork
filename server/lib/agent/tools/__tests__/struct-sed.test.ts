@@ -11,7 +11,7 @@
  */
 
 import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureGrammarFixture } from "../../structural/__tests__/grammar-fixture";
@@ -216,6 +216,72 @@ describe("dry run is the default", () => {
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("recorded tool call");
 		expect(readFileSync(plainFile, "utf8")).toBe(before);
+	});
+});
+
+describe("cross-file destinations", () => {
+	test("refuses to_file instead of silently ignoring it", async () => {
+		// Ignoring it resolved the destination inside the SOURCE file, so a same-line
+		// target reported "destination overlaps the source" — an error about the wrong
+		// file, leaving the caller to believe the cross-file move had happened.
+		const result = await run({
+			file_path: tsFile,
+			command: "move",
+			symbol: "PaymentService",
+			to_file: join(workDir, "elsewhere.ts"),
+			to_address: "1",
+		});
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("to_file");
+		// The refusal has to name the path that does work.
+		expect(result.output).toContain("create_if_missing");
+		expect(result.output).not.toContain("overlaps");
+	});
+});
+
+describe("create_if_missing", () => {
+	test("a missing file is an error unless creation was requested", async () => {
+		const target = join(workDir, "does-not-exist.ts");
+		const result = await run({
+			file_path: target,
+			command: "append",
+			address: "1",
+			content: "export const a = 1;",
+		});
+		expect(result.isError).toBe(true);
+		expect(existsSync(target)).toBe(false);
+	});
+
+	test("previews creating a new file without writing it", async () => {
+		const target = join(workDir, "fresh-module.ts");
+		const result = await run({
+			file_path: target,
+			command: "append",
+			address: "1",
+			content: "export const fresh = 1;",
+			create_if_missing: true,
+		});
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("DRY RUN");
+		// A preview must not bring the file into existence.
+		expect(existsSync(target)).toBe(false);
+	});
+
+	test("refuses to create a file with a command that needs existing text", async () => {
+		// delete/substitute/move describe a transformation; on a missing file there is
+		// nothing to transform, and creating an empty file would not be what was asked.
+		for (const command of ["delete", "substitute", "move"]) {
+			const result = await run({
+				file_path: join(workDir, `nope-${command}.ts`),
+				command,
+				address: "1",
+				create_if_missing: true,
+				...(command === "substitute" ? { pattern: "a", replacement: "b" } : {}),
+				...(command === "move" ? { to_address: "2" } : {}),
+			});
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("create_if_missing");
+		}
 	});
 });
 

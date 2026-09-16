@@ -578,8 +578,16 @@ function asObject(val: unknown): Record<string, unknown> | null {
 // `+N -N` line statistics for a file tool's header / folded row.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** File tools whose header can carry a `+N -N` figure. */
-const DIFF_STATS_TOOLS = new Set(["Write", "Edit"]);
+/**
+ * File tools whose header can carry a `+N -N` figure.
+ *
+ * StructSed belongs here for the same reason Edit does: it rewrites part of a file and
+ * the server measures both sides at execution time, so the count comes from the
+ * authoritative metadata path below. Leaving it out made a structural rewrite read as a
+ * lesser kind of step than the equivalent Edit while folded, despite changing the file
+ * just as much.
+ */
+const DIFF_STATS_TOOLS = new Set(["Write", "Edit", "StructSed"]);
 
 /**
  * Added / removed line counts for a Write or Edit, or undefined when unknown.

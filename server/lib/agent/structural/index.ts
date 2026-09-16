@@ -28,9 +28,14 @@ export { AddressError, parseAddress, resolveAddress } from "./address";
 export type {
 	CrossFileUsageResult,
 	RawFileHit,
+	UsageConfidence,
 	UsageFile,
 } from "./cross-file-usages";
-export { assembleUsages, CROSS_FILE_PRECISION_NOTE } from "./cross-file-usages";
+export {
+	assembleUsages,
+	CROSS_FILE_PRECISION_NOTE,
+	importMayReferTo,
+} from "./cross-file-usages";
 export type {
 	ExtractionInterface,
 	InterfaceSymbol,
@@ -63,6 +68,7 @@ export type {
 	ElementNode,
 	FileStatistics,
 	ImportExportInfo,
+	ImportedName,
 	LocatedNode,
 	OutlineNode,
 	ProviderSupport,

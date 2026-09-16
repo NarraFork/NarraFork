@@ -67,12 +67,21 @@ Addressing (give exactly ONE):
 - \`symbol\` — a declaration name, \`Class.method\` for a member, \`name#2\` to disambiguate.
   Needs a parsed language; run StructView first to see what is available.
 - \`address\` — sed-style and grammar-free: \`42\`, \`10,20\`, \`10,$\`, \`$\`, \`/regex/\`,
-  \`/from/,/to/\`. Works on any text file.
+  \`/from/,/to/\`. Endpoints mix, so \`/section marker/,$\` means "this landmark to EOF"
+  and \`/start/,120\` / \`10,/end/\` anchor one end only. Works on any text file.
 
 For copy/move, the destination is \`to_symbol\` or \`to_address\` (same syntax), with
 \`placement: "before" | "after"\` (default "after"). Omit both to append at end of file.
 A destination overlapping the source is refused. A moved block keeps its doc comment and
 decorators, and is re-indented to its destination.
+
+MOVING A SYMBOL TO A DIFFERENT FILE takes three calls, and needs no Read/Write:
+  1. \`StructView mode=extract symbol=X line_numbers=false\` — bare source, doc comment included.
+  2. \`StructSed command=append address="1" create_if_missing=true content=<that output>\` on the target.
+  3. \`StructSed command=delete symbol=X\` on the source.
+Not atomic: if step 3 fails the symbol exists in both files, which is the safe direction
+(nothing is lost). One call cannot write two files — the write pipeline freezes a single
+path per tool call.
 
 \`content\` is re-indented to the selection's own indent, so a block written at column 0
 lands correctly inside a nested class. Internal relative indentation is preserved.
@@ -103,7 +112,8 @@ const rawJsonSchema = {
 		},
 		address: {
 			description:
-				'Line/regex address: "42", "10,20", "10,$", "$", "/regex/", "/from/,/to/". Needs no parser. Mutually exclusive with `symbol`.',
+				'Line/regex address: "42", "10,20", "10,$", "$", "/regex/", "/from/,/to/", or a mixed ' +
+				'range like "/from/,$", "/from/,120", "10,/to/". Needs no parser. Mutually exclusive with `symbol`.',
 			type: "string",
 		},
 		content: {
@@ -141,6 +151,13 @@ const rawJsonSchema = {
 		dry_run: {
 			description:
 				"Preview instead of writing. Defaults to TRUE; pass false to actually apply the change.",
+			type: "boolean",
+		},
+		create_if_missing: {
+			description:
+				"Create the file when it does not exist, instead of failing. Defaults to false. " +
+				"Only replace/insert/append may create a file (they carry their own content); use " +
+				'address "1" to write into the new empty file.',
 			type: "boolean",
 		},
 		operations: {
@@ -195,6 +212,13 @@ export const structSedTool: ToolDefinition = {
 		replacement: z.string().optional().describe("For substitute: the replacement text."),
 		flags: z.string().optional().describe('For substitute: flags, "g" and "i" only.'),
 		dry_run: z.boolean().optional().describe("Preview instead of writing. Defaults to true."),
+		create_if_missing: z
+			.boolean()
+			.optional()
+			.describe(
+				"Create the file when absent instead of failing. Defaults to false. " +
+					"replace/insert/append only.",
+			),
 		operations: z
 			.array(z.record(z.string(), z.unknown()))
 			.optional()
@@ -259,24 +283,49 @@ export const structSedTool: ToolDefinition = {
 		const canonicalPath = ctx.executionTarget?.canonicalPath;
 		const ioPath = canonicalPath ?? resolvedPath;
 
+		// Creating a file is opt-in. Default-off because a typo'd path would otherwise
+		// silently produce a new file instead of reporting that the target is missing,
+		// and the caller would go on believing they edited something real.
+		const createIfMissing = args.create_if_missing === true;
+
 		let originalText: string;
 		try {
 			const stat = await backend.statFile(ioPath);
 			if (stat?.isDirectory) {
 				return { output: `${filePath} is a directory.`, isError: true };
 			}
-			const read = await backend.readFileBytes(ioPath, {
-				maxBytes: MAX_FILE_BYTES,
-				...(canonicalPath ? { expectedResolvedPath: canonicalPath } : {}),
-				signal: ctx.signal,
-			});
-			if (read.truncated) {
-				return {
-					output: `${filePath} is larger than ${MAX_FILE_BYTES} bytes; StructSed will not edit a partially read file.`,
-					isError: true,
-				};
+			if (stat === null && createIfMissing) {
+				// Only commands that supply their own complete content can build a file from
+				// nothing. `delete`/`substitute`/`move` describe a transformation of existing
+				// text, so on a missing file they have nothing to transform and are refused
+				// rather than quietly creating an empty file.
+				const offending = validated.find(
+					(spec) =>
+						spec.command !== "replace" && spec.command !== "insert" && spec.command !== "append",
+				);
+				if (offending) {
+					return {
+						output:
+							`${filePath} does not exist. create_if_missing can only build a new file with ` +
+							`replace/insert/append, which carry their own content; \`${offending.command}\` needs existing text to act on.`,
+						isError: true,
+					};
+				}
+				originalText = "";
+			} else {
+				const read = await backend.readFileBytes(ioPath, {
+					maxBytes: MAX_FILE_BYTES,
+					...(canonicalPath ? { expectedResolvedPath: canonicalPath } : {}),
+					signal: ctx.signal,
+				});
+				if (read.truncated) {
+					return {
+						output: `${filePath} is larger than ${MAX_FILE_BYTES} bytes; StructSed will not edit a partially read file.`,
+						isError: true,
+					};
+				}
+				({ text: originalText } = decodeFileBytes(read.bytes));
 			}
-			({ text: originalText } = decodeFileBytes(read.bytes));
 		} catch (err) {
 			return {
 				output: `Error reading ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
@@ -478,10 +527,16 @@ export const structSedTool: ToolDefinition = {
 				// call as a single edit, silently dropping the rest.
 				input: recordedInput,
 				construct(before) {
-					if (before.bytes === null) {
+					// Absent under the write lock but present at read time (or vice versa) is a
+					// real race, so the creation decision is re-made here rather than trusting
+					// the earlier stat.
+					if (before.bytes === null && !createIfMissing) {
 						throw new LocalFileValidationError(`File not found: ${filePath}`);
 					}
-					const decoded = decodeFileBytes(before.bytes);
+					const decoded =
+						before.bytes === null
+							? { text: "", encoding: "utf-8" as const }
+							: decodeFileBytes(before.bytes);
 					const current = normalizeLineEndings(decoded.text);
 					// Re-apply against the bytes observed under the write lock rather than
 					// trusting the earlier read: the file may have changed in between, and
@@ -497,7 +552,10 @@ export const structSedTool: ToolDefinition = {
 							error instanceof Error ? error.message : String(error),
 						);
 					}
-					const ending = detectLineEnding(decoded.text);
+					// A new file has no existing text to inherit from, so the written content
+					// decides its own ending — matching Write, rather than forcing LF onto a
+					// file whose sibling modules all use CRLF.
+					const ending = detectLineEnding(before.bytes === null ? appliedText : decoded.text);
 					return {
 						nextBytes: encodeFileBytes(applyLineEnding(appliedText, ending), decoded.encoding),
 						lineStats: stats,

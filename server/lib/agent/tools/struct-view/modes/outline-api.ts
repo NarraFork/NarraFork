@@ -194,12 +194,17 @@ export async function runExtract(
 		return { output: `No symbol matching "${rawSymbol}" in ${filePath}.`, isError: true };
 	}
 	const snippet = doc.text.slice(node.startIndex, node.endIndex);
-	const numbered = numberLines(snippet.split("\n"), node.startLine);
+	// `line_numbers: false` yields the bare source, so an extracted symbol can be
+	// handed straight to StructSed's `content` when moving it to another file.
+	// Numbered output is still the default: when reading, the numbers are what make
+	// a later address possible.
+	const raw = args.line_numbers === false;
+	const body = raw ? snippet : numberLines(snippet.split("\n"), node.startLine);
 
 	return {
 		output: withFooter(
 			`${filePath}  ${node.kind} ${node.symbolPath}  (L${node.startLine}-${node.endLine})`,
-			clampOutput(numbered),
+			clampOutput(body),
 			notes,
 		),
 		title: `${filePath} → ${node.symbolPath}`,
@@ -213,6 +218,7 @@ export async function runExtract(
 			startLine: node.startLine,
 			endLine: node.endLine,
 			exported: node.exported,
+			lineNumbers: !raw,
 		},
 	};
 }

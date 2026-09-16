@@ -174,29 +174,41 @@ describe("relocateRange (same-file copy/move)", () => {
 	test("move to a later anchor keeps every other line exactly once", () => {
 		// The failure this guards: inserting first shifts the lines below, so deleting the
 		// source by its ORIGINAL numbers removes the wrong ones. Result looks plausible.
-		const out = relocateRange(NUMBERED, { startLine: 1, endLine: 2 }, {
-			anchor: { startLine: 4, endLine: 4 },
-			placement: "after",
-			removeSource: true,
-		});
+		const out = relocateRange(
+			NUMBERED,
+			{ startLine: 1, endLine: 2 },
+			{
+				anchor: { startLine: 4, endLine: 4 },
+				placement: "after",
+				removeSource: true,
+			},
+		);
 		expect(out).toBe("c\nd\na\nb\ne\n");
 	});
 
 	test("move to an earlier anchor", () => {
-		const out = relocateRange(NUMBERED, { startLine: 4, endLine: 5 }, {
-			anchor: { startLine: 1, endLine: 1 },
-			placement: "before",
-			removeSource: true,
-		});
+		const out = relocateRange(
+			NUMBERED,
+			{ startLine: 4, endLine: 5 },
+			{
+				anchor: { startLine: 1, endLine: 1 },
+				placement: "before",
+				removeSource: true,
+			},
+		);
 		expect(out).toBe("d\ne\na\nb\nc\n");
 	});
 
 	test("copy leaves the source in place", () => {
-		const out = relocateRange(NUMBERED, { startLine: 1, endLine: 1 }, {
-			anchor: { startLine: 3, endLine: 3 },
-			placement: "after",
-			removeSource: false,
-		});
+		const out = relocateRange(
+			NUMBERED,
+			{ startLine: 1, endLine: 1 },
+			{
+				anchor: { startLine: 3, endLine: 3 },
+				placement: "after",
+				removeSource: false,
+			},
+		);
 		expect(out).toBe("a\nb\nc\na\nd\ne\n");
 	});
 
@@ -207,42 +219,58 @@ describe("relocateRange (same-file copy/move)", () => {
 
 	test("every original line survives a move", () => {
 		// A cheap invariant that catches both duplication and loss.
-		const out = relocateRange(NUMBERED, { startLine: 2, endLine: 3 }, {
-			anchor: { startLine: 5, endLine: 5 },
-			placement: "after",
-			removeSource: true,
-		});
+		const out = relocateRange(
+			NUMBERED,
+			{ startLine: 2, endLine: 3 },
+			{
+				anchor: { startLine: 5, endLine: 5 },
+				placement: "after",
+				removeSource: true,
+			},
+		);
 		expect(out.trim().split("\n").sort()).toEqual(["a", "b", "c", "d", "e"]);
 	});
 
 	test("an anchor inside the source range is rejected", () => {
 		// "Move these lines to between these lines" has no meaningful answer.
 		expect(() =>
-			relocateRange(NUMBERED, { startLine: 1, endLine: 3 }, {
-				anchor: { startLine: 2, endLine: 2 },
-				placement: "after",
-				removeSource: true,
-			}),
+			relocateRange(
+				NUMBERED,
+				{ startLine: 1, endLine: 3 },
+				{
+					anchor: { startLine: 2, endLine: 2 },
+					placement: "after",
+					removeSource: true,
+				},
+			),
 		).toThrow(/overlaps/);
 	});
 
 	test("an anchor overlapping the source from outside is also rejected", () => {
 		expect(() =>
-			relocateRange(NUMBERED, { startLine: 2, endLine: 3 }, {
-				anchor: { startLine: 1, endLine: 2 },
-				placement: "before",
-				removeSource: true,
-			}),
+			relocateRange(
+				NUMBERED,
+				{ startLine: 2, endLine: 3 },
+				{
+					anchor: { startLine: 1, endLine: 2 },
+					placement: "before",
+					removeSource: true,
+				},
+			),
 		).toThrow(/overlaps/);
 	});
 
 	test("a method moved into a deeper scope is re-indented", () => {
 		const src = "helper() {\n\treturn 1;\n}\nclass A {\n\tfoo() {}\n}\n";
-		const out = relocateRange(src, { startLine: 1, endLine: 3 }, {
-			anchor: { startLine: 5, endLine: 5 },
-			placement: "after",
-			removeSource: true,
-		});
+		const out = relocateRange(
+			src,
+			{ startLine: 1, endLine: 3 },
+			{
+				anchor: { startLine: 5, endLine: 5 },
+				placement: "after",
+				removeSource: true,
+			},
+		);
 		expect(out).toBe("class A {\n\tfoo() {}\n\thelper() {\n\t\treturn 1;\n\t}\n}\n");
 	});
 
@@ -284,8 +312,15 @@ describe("range validation", () => {
 });
 
 describe("edge-case inputs", () => {
-	test("an empty file rejects any range", () => {
-		expect(() => deleteRange("", { startLine: 1, endLine: 1 })).toThrow(/past the end/);
+	test("line 1 of an empty file is addressable, and beyond that is not", () => {
+		// "Line 1" of nothing is the only way to name where content goes in an empty
+		// file, so the content commands accept it and delete is a coherent no-op.
+		expect(appendAfter("", { startLine: 1, endLine: 1 }, "a")).toBe("a");
+		expect(insertBefore("", { startLine: 1, endLine: 1 }, "a")).toBe("a");
+		expect(replaceRange("", { startLine: 1, endLine: 1 }, "a")).toBe("a");
+		expect(deleteRange("", { startLine: 1, endLine: 1 })).toBe("");
+		// Line 2 of an empty file still names nothing.
+		expect(() => deleteRange("", { startLine: 2, endLine: 2 })).toThrow(/past the end/);
 	});
 
 	test("a single-line file with no newline round-trips", () => {

@@ -95,6 +95,37 @@ describeWithGrammar("usages mode", () => {
 		expect(r.output).toMatch(/same name/i);
 	});
 
+	test("separates files that import the symbol from files that merely share the name", async () => {
+		// The distinction is the point: a rename must touch the importer and must NOT touch
+		// the unrelated local declaration, and a flat list cannot express that.
+		writeFileSync(join(workDir, "shadow.ts"), "function target() {\n\treturn 9;\n}\n", "utf8");
+		const r = await run({ file_path: "def.ts", mode: "usages", symbol: "target" });
+		expect(r.isError).toBeFalsy();
+		expect(r.output).toContain("confirmed");
+		expect(r.output).toContain("unverified");
+		const confirmedAt = r.output.indexOf("confirmed");
+		const unverifiedAt = r.output.indexOf("unverified —");
+		// user.ts imports it; shadow.ts declares its own.
+		expect(r.output.indexOf("user.ts")).toBeGreaterThan(confirmedAt);
+		expect(r.output.indexOf("user.ts")).toBeLessThan(unverifiedAt);
+		expect(r.output.indexOf("shadow.ts")).toBeGreaterThan(unverifiedAt);
+	});
+
+	test("follows an aliased import to the local name it was renamed to", async () => {
+		// This was the documented blind spot: `import { target as renamed }` meant every
+		// usage in the file was invisible, because the original name never appears in it.
+		writeFileSync(
+			join(workDir, "renamer.ts"),
+			'import { target as renamed } from "./def";\n\nexport const v = renamed() + renamed();\n',
+			"utf8",
+		);
+		const r = await run({ file_path: "def.ts", mode: "usages", symbol: "target" });
+		expect(r.output).toContain("renamer.ts");
+		expect(r.output).toContain("imported as renamed");
+		// The alias's own lines are reported, not an empty list.
+		expect(r.output).toMatch(/renamer\.ts {2}\([1-9]/);
+	});
+
 	test("missing symbol is a clear error, not an empty scan", async () => {
 		const r = await run({ file_path: "def.ts", mode: "usages" });
 		expect(r.isError).toBe(true);

@@ -14,14 +14,30 @@
  *   `$`           last line
  *   `/re/`        every line matching the regex
  *   `/re/,/re2/`  from a line matching the first regex to one matching the second
+ *   `/re/,$`      from a line matching the regex to end of file
+ *   `/re/,120`    from a line matching the regex to line 120
+ *   `10,/re/`     from line 10 to the next line matching the regex
+ *
+ * The last three are MIXED ranges: each endpoint is independently a line number,
+ * `$`, or a regex. They exist because the common shape of a structural edit is
+ * "from this landmark to the end of the file" — `/rendering helpers/,$` — and
+ * requiring both endpoints to be the same kind forced callers back to counting
+ * line numbers by hand, which goes stale on the first edit above the region.
  */
+
+/** One end of a range: a fixed line, end-of-file, or the first matching line. */
+export type AddressEndpoint =
+	| { kind: "line"; line: number }
+	| { kind: "last" }
+	| { kind: "regex"; pattern: string; flags: string };
 
 export type Address =
 	| { kind: "line"; line: number }
 	| { kind: "range"; start: number; end: number | "last" }
 	| { kind: "last" }
 	| { kind: "regex"; pattern: string; flags: string }
-	| { kind: "regex-range"; from: string; to: string; flags: string };
+	| { kind: "regex-range"; from: string; to: string; flags: string }
+	| { kind: "mixed-range"; from: AddressEndpoint; to: AddressEndpoint };
 
 export interface AddressBlock {
 	/** 1-based inclusive. */
@@ -72,9 +88,80 @@ export function parseAddress(raw: string): Address {
 		return { kind: "line", line };
 	}
 
+	// Mixed range: exactly one endpoint is a regex, the other a line or `$`. Tried
+	// last so every pure form above keeps its own dedicated branch and behavior.
+	const mixed = parseMixedRange(input);
+	if (mixed) return mixed;
+
 	throw new AddressError(
-		`unrecognized address "${raw}". Use a line number, "start,end", "$", "/regex/", or "/from/,/to/".`,
+		`unrecognized address "${raw}". Use a line number, "start,end", "$", "/regex/", ` +
+			`"/from/,/to/", or a mixed range like "/from/,$", "/from/,120" or "10,/to/".`,
 	);
+}
+
+/**
+ * Split `a,b` where at least one side is a regex.
+ *
+ * Hand-scanned rather than regex-matched: finding the separating comma means
+ * knowing whether a comma sits inside a `/…/` literal, and a pattern like
+ * `/a{1,2}/,$` has one that does. A slash-aware scan gets that right; a single
+ * regex over the whole address would either miss the case or split at the wrong
+ * comma and report a confusing "invalid regex".
+ */
+function parseMixedRange(input: string): Address | null {
+	const comma = findTopLevelComma(input);
+	if (comma === null) return null;
+
+	const left = input.slice(0, comma).trim();
+	const right = input.slice(comma + 1).trim();
+	if (left.length === 0 || right.length === 0) return null;
+
+	const from = parseEndpoint(left);
+	const to = parseEndpoint(right);
+	if (!from || !to) return null;
+	// Both-numeric and both-regex are handled by the dedicated branches above; if
+	// neither side is a regex this is not a mixed range and must not be claimed here.
+	if (from.kind !== "regex" && to.kind !== "regex") return null;
+
+	if (from.kind === "last") {
+		throw new AddressError('"$" cannot start a range — it already means the last line');
+	}
+	return { kind: "mixed-range", from, to };
+}
+
+/** Index of the comma separating the two endpoints, ignoring commas inside `/…/`. */
+function findTopLevelComma(input: string): number | null {
+	let inRegex = false;
+	for (let i = 0; i < input.length; i++) {
+		const ch = input[i];
+		if (ch === "\\") {
+			i++; // Skip the escaped character, including an escaped slash.
+			continue;
+		}
+		if (ch === "/") {
+			inRegex = !inRegex;
+			continue;
+		}
+		if (ch === "," && !inRegex) return i;
+	}
+	return null;
+}
+
+function parseEndpoint(raw: string): AddressEndpoint | null {
+	if (raw === "$") return { kind: "last" };
+
+	const regex = /^\/((?:[^/\\]|\\.)*)\/([a-z]*)$/.exec(raw);
+	if (regex?.[1] !== undefined) {
+		return { kind: "regex", pattern: regex[1], flags: sanitizeFlags(regex[2]) };
+	}
+
+	const line = /^(\d+)$/.exec(raw);
+	if (line?.[1]) {
+		const value = Number(line[1]);
+		if (value < 1) throw new AddressError("line numbers are 1-based");
+		return { kind: "line", line: value };
+	}
+	return null;
 }
 
 export interface ResolveAddressOptions {
@@ -152,6 +239,52 @@ export function resolveAddress(
 			// An unterminated range runs to EOF, matching sed.
 			if (open !== null) blocks.push({ startLine: open, endLine: scanLimit });
 			return { blocks, truncated: false };
+		}
+		case "mixed-range": {
+			if (total === 0) return { blocks: [], truncated: false };
+			const start = resolveEndpoint(address.from, lines, scanLimit, total, 1);
+			if (start === null) return { blocks: [], truncated: false };
+			// The end is searched from the line AFTER the start: a regex end that also
+			// matches the start line would otherwise collapse the range to one line.
+			const end = resolveEndpoint(address.to, lines, scanLimit, total, start + 1);
+			// No end match runs to EOF, matching sed's unterminated range.
+			return {
+				blocks: [{ startLine: start, endLine: end === null ? total : end }],
+				truncated: false,
+			};
+		}
+	}
+}
+
+/**
+ * First line satisfying an endpoint at or after `searchFrom`, or null.
+ *
+ * A line-number endpoint before `searchFrom` yields null rather than clamping:
+ * `80,/x/` where the only `x` sits at line 12 describes a range that runs
+ * backwards, and quietly turning that into a forward range would edit a region
+ * the caller never named.
+ */
+function resolveEndpoint(
+	endpoint: AddressEndpoint,
+	lines: readonly string[],
+	scanLimit: number,
+	total: number,
+	searchFrom: number,
+): number | null {
+	switch (endpoint.kind) {
+		case "line":
+			if (endpoint.line > total || endpoint.line < searchFrom) return null;
+			return endpoint.line;
+		case "last":
+			return total < searchFrom ? null : total;
+		case "regex": {
+			const regex = compile(endpoint.pattern, endpoint.flags);
+			for (let i = searchFrom - 1; i < scanLimit; i++) {
+				const line = lines[i];
+				if (line === undefined) continue;
+				if (regex.test(line)) return i + 1;
+			}
+			return null;
 		}
 	}
 }

@@ -8,7 +8,12 @@
  * to remove.
  */
 import { describe, expect, test } from "bun:test";
-import { assembleUsages, CROSS_FILE_PRECISION_NOTE, type RawFileHit } from "../cross-file-usages";
+import {
+	assembleUsages,
+	CROSS_FILE_PRECISION_NOTE,
+	importMayReferTo,
+	type RawFileHit,
+} from "../cross-file-usages";
 
 describe("assembleUsages", () => {
 	test("lists files that have real identifier lines", () => {
@@ -72,6 +77,46 @@ describe("assembleUsages", () => {
 		const result = assembleUsages([]);
 		expect(result.files).toHaveLength(0);
 		expect(result.textOnlyFiles).toBe(0);
+	});
+
+	test("confirmed files sort ahead of unverified ones", () => {
+		// A rename has to update the files that provably use the symbol; the same-named
+		// ones have to be read first. Ordering puts the actionable group on top.
+		const result = assembleUsages([
+			{ path: "maybe.ts", lines: [1, 2, 3, 4], confidence: "unverified" },
+			{ path: "certain.ts", lines: [7], confidence: "confirmed" },
+		]);
+		expect(result.files.map((f) => f.path)).toEqual(["certain.ts", "maybe.ts"]);
+	});
+
+	test("an alias is carried through so the local name is visible", () => {
+		const result = assembleUsages([
+			{ path: "renamer.ts", lines: [1, 2], confidence: "aliased", alias: "renamed" },
+		]);
+		expect(result.files[0]?.alias).toBe("renamed");
+		expect(result.files[0]?.confidence).toBe("aliased");
+	});
+
+	test("importMayReferTo matches a direct path, a barrel and an index", () => {
+		const def = "/repo/server/lib/structural/cross-file-usages.ts";
+		// Direct: the specifier names the file.
+		expect(importMayReferTo("./cross-file-usages", def)).toBe(true);
+		expect(importMayReferTo("../../structural/cross-file-usages.ts", def)).toBe(true);
+		// Barrel: the specifier names the directory the file lives in, which is how most
+		// of a codebase reaches a symbol.
+		expect(importMayReferTo("../../structural", def)).toBe(true);
+		expect(importMayReferTo("@server/lib/structural", def)).toBe(true);
+		// Unrelated module.
+		expect(importMayReferTo("./address", def)).toBe(false);
+		expect(importMayReferTo("node:path", def)).toBe(false);
+		expect(importMayReferTo("", def)).toBe(false);
+	});
+
+	test("importMayReferTo resolves a directory import to its index file", () => {
+		const def = "/repo/server/tools/struct-view/index.ts";
+		expect(importMayReferTo("../struct-view", def)).toBe(true);
+		expect(importMayReferTo("./index", def)).toBe(true);
+		expect(importMayReferTo("../struct-sed", def)).toBe(false);
 	});
 
 	test("the precision note names both known blind spots", () => {

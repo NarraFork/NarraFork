@@ -28,8 +28,13 @@ export function useToolEditNavigation({
 	const openFilePanel = useFilePanelNavigation();
 	const { t } = useTranslation("narrator");
 	const [opened, setOpened] = useState(false);
+	// StructSed qualifies alongside Edit: the preview is built from the tool call's tree
+	// snapshot hashes, which it records the same way, so nothing here is Edit-specific.
+	// Excluding it only denied a structural rewrite the review affordance its equivalent
+	// Edit already had.
 	const reference = useMemo<ToolEditReference | null>(() => {
-		if (toolName !== "Edit" || !narratorId || !toolUseId || !filePath) return null;
+		if ((toolName !== "Edit" && toolName !== "StructSed") || !narratorId || !toolUseId || !filePath)
+			return null;
 		return {
 			narratorId,
 			toolUseId,

@@ -21,8 +21,9 @@ import { languageIdForExtension, resolveProvider, type StructDocument } from "..
 import type { ToolDefinition, ToolResult } from "../../types";
 import { decodeFileBytes } from "../encoding";
 import { looseNumber } from "../number-param";
-import { MAX_FILE_BYTES, MODES, type Mode } from "./constants";
+import { MAX_FILE_BYTES, MODES, type Mode, REPO_MODES } from "./constants";
 import { runCalls, runRefs, runReport } from "./modes/analysis";
+import { runFind } from "./modes/find";
 import { runApi, runEnclosing, runExtract, runImports, runOutline } from "./modes/outline-api";
 import { runElementTree, runInterface, runUsages } from "./modes/structure";
 import { runLandmarks, runPrint } from "./modes/text";
@@ -37,7 +38,7 @@ undercounts (e.g. \`grep -c 'useState('\` misses the generic form \`useState<T>(
 Modes:
 - report: START HERE for an unfamiliar file. One call returns the summary, layered skeleton, top calls, single-reference (likely dead) symbols and the largest symbols. Replaces the 6-8 calls that analysis otherwise takes.
 - outline (default): declaration skeleton — classes/functions/methods/types with line ranges, plus statement-level structural calls (useEffect, describe, app.route) with their dependency arrays. Add \`with_refs: true\` to annotate each entry with its in-file reference count.
-- extract: the full body of one symbol. \`symbol: "Class.method"\` targets a member; a bare name matches at any depth; \`symbol: "name#2"\` picks among duplicates. Destructured names are searchable too.
+- extract: the full body of one symbol. \`symbol: "Class.method"\` targets a member; a bare name matches at any depth; \`symbol: "name#2"\` picks among duplicates. Destructured names are searchable too. Pass \`line_numbers: false\` for bare source with no \`123│\` prefixes — that output can go straight into StructSed's \`content\`, so moving a symbol needs no manual de-numbering.
 - api: exported/public declarations, signatures only, bodies hidden.
 - enclosing: given a line (from Grep output, a stack trace, a diff), which function/class it belongs to. Returns the symbol chain, e.g. "PaymentService.charge".
 - imports: the file's imports plus its exported symbols.
@@ -46,10 +47,11 @@ Modes:
 - calls: call frequency inside the file, with \`filter\` for a prefix (\`filter: "use"\` for hooks). Also lists JSX component usage counts.
 - landmarks: the boundaries the AUTHOR drew — section banners (\`// --- Scroll state ---\`), \`#region\` blocks, and TODO/FIXME/HACK markers. outline reports what a file declares; this reports where its writer thought the seams were, which is the better starting point for splitting a long file. Needs no parser.
 - interface: given a line range (\`address\`) or a \`symbol\`, what extracting it would require — which outside symbols it uses (become parameters), which of its own symbols are used outside (must be exported), and which are self-contained (move with it). Answers "is this a clean seam and what's the signature", the question outline cannot.
-- usages: where a \`symbol\` is referenced in OTHER files. ripgrep prefilters, then the parser drops comment/string matches. Structural not semantic — a same-named different symbol is included and an aliased import is missed — so confirm before renaming or deleting. This is the cross-file view refs/report cannot give.
+- usages: where a \`symbol\` is referenced in OTHER files. ripgrep prefilters, then the parser drops comment/string matches. Results split into **confirmed** (the file imports the name from this module, aliases followed to their local name) and **unverified** (same name, no import this check could tie to the definition — possibly a different symbol, possibly reached via a re-export). Still name-based, not type-resolved, so confirm before renaming or deleting. This is the cross-file view refs/report cannot give.
+- find: WHICH FILE declares a \`symbol\`, across the whole repo — the one mode that needs no \`file_path\`. **Start here when you do not yet know where something lives, instead of grepping for it.** ripgrep narrows the candidates, then each is parsed and only real declarations are kept, so call sites, comments and strings drop out and each hit reports its kind and line. Feed the result straight into another mode's \`file_path\`.
 - print: sed-style line/regex output filtering. Needs no parser, so it works on any text file (config, log, unsupported language).
 
-Addresses for print: \`42\` (one line), \`10,20\` (range), \`10,$\` (to EOF), \`$\` (last line), \`/regex/\` (each matching line), \`/from/,/to/\` (block).
+Addresses for print: \`42\` (one line), \`10,20\` (range), \`10,$\` (to EOF), \`$\` (last line), \`/regex/\` (each matching line), \`/from/,/to/\` (block). Range endpoints mix freely, so \`/section marker/,$\` takes a landmark to EOF and \`/start/,120\` or \`10,/end/\` anchor one end only.
 
 Notes:
 - Accurate structure needs the language's parser installed (Settings → Structural Parsing). Without it, outline/extract fall back to text heuristics and say so; tree/refs/calls/report need the parser and report that plainly rather than guessing.
@@ -59,7 +61,8 @@ const rawJsonSchema: Record<string, unknown> = {
 	type: "object",
 	properties: {
 		file_path: {
-			description: "Absolute path to the file to inspect.",
+			description:
+				"Absolute path to the file to inspect. Omit for mode=find, which searches the repository.",
 			type: "string",
 		},
 		mode: {
@@ -70,7 +73,7 @@ const rawJsonSchema: Record<string, unknown> = {
 		},
 		symbol: {
 			description:
-				'For mode=extract: the symbol to return. "Class.method" targets a member; a bare name matches at any depth. Append "#N" to pick the Nth match among duplicates.',
+				'For mode=extract: the symbol to return. "Class.method" targets a member; a bare name matches at any depth. Append "#N" to pick the Nth match among duplicates. For mode=find/usages: the bare name to locate across the repository.',
 			type: "string",
 		},
 		kind: {
@@ -104,11 +107,14 @@ const rawJsonSchema: Record<string, unknown> = {
 		},
 		address: {
 			description:
-				'For mode=print: line number, "start,end", "start,$", "$", "/regex/", or "/from/,/to/".',
+				'For mode=print: line number, "start,end", "start,$", "$", "/regex/", "/from/,/to/", ' +
+				'or a mixed range like "/from/,$", "/from/,120", "10,/to/".',
 			type: "string",
 		},
 		line_numbers: {
-			description: "For mode=print: prefix output lines with their numbers. Defaults to true.",
+			description:
+				"For mode=print and mode=extract: prefix output lines with their numbers. " +
+				"Defaults to true. Set false on extract to get bare source suitable for StructSed content.",
 			type: "boolean",
 		},
 		position: {
@@ -116,7 +122,9 @@ const rawJsonSchema: Record<string, unknown> = {
 			type: "string",
 		},
 	},
-	required: ["file_path"],
+	// `file_path` is deliberately NOT required: mode=find searches the repository and has
+	// no file to name. The execute path enforces it for every other mode.
+	required: [],
 	additionalProperties: false,
 };
 
@@ -140,13 +148,25 @@ export const structViewTool: ToolDefinition = {
 		return withDeviceParam(rawJsonSchema, config);
 	},
 	parameters: z.object({
-		file_path: z.string().describe("Absolute path to the file to inspect."),
+		file_path: z
+			.string()
+			.optional()
+			.describe("Absolute path to the file to inspect. Not needed for mode=find."),
 		mode: z.enum(MODES).optional().describe("What to return. Defaults to 'outline'."),
-		symbol: z.string().optional().describe("For mode=extract: the symbol to return."),
+		symbol: z
+			.string()
+			.optional()
+			.describe("For mode=extract/usages/find: the symbol to return or locate."),
 		kind: z.string().optional().describe("Comma-separated declaration kinds to keep."),
 		depth: looseNumber("For mode=outline/tree: maximum nesting depth."),
 		address: z.string().optional().describe("For mode=print: line/range/regex address."),
-		line_numbers: z.boolean().optional().describe("For mode=print: prefix line numbers."),
+		line_numbers: z
+			.boolean()
+			.optional()
+			.describe(
+				"For mode=print and mode=extract: prefix line numbers. Defaults to true. " +
+					"Set false on extract to get bare source you can pass to StructSed's content.",
+			),
 		position: z.string().optional().describe('For mode=enclosing: line number or "line:column".'),
 		with_refs: z.boolean().optional().describe("For mode=outline: annotate reference counts."),
 		filter: z.string().optional().describe("For mode=calls: substring filter on the callee."),
@@ -157,12 +177,23 @@ export const structViewTool: ToolDefinition = {
 
 	async execute(args, ctx): Promise<ToolResult> {
 		const filePath = typeof args.file_path === "string" ? args.file_path : "";
-		if (!filePath) {
-			return { output: "file_path is required.", isError: true };
-		}
 		const mode: Mode = MODES.includes(args.mode as Mode) ? (args.mode as Mode) : "outline";
 
+		// Repo-wide modes are the ones that answer "which file?", so requiring a file_path
+		// would defeat them. Checked before the requirement rather than inside it.
+		if (!filePath && !REPO_MODES.has(mode)) {
+			return { output: "file_path is required.", isError: true };
+		}
+
 		const backend = getToolBackend(ctx, typeof args.device === "string" ? args.device : undefined);
+
+		if (mode === "find") {
+			return runFind(args, {
+				backend,
+				baseCwd: toolBaseCwd(backend, ctx.cwd),
+				...(ctx.signal ? { signal: ctx.signal } : {}),
+			});
+		}
 		const resolvedPath =
 			ctx.executionTarget?.lexicalPath ??
 			resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), filePath);

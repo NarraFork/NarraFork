@@ -54,13 +54,22 @@ function joinLines(lines: readonly string[], trailingNewline: boolean): string {
 	return lines.join("\n") + (trailingNewline ? "\n" : "");
 }
 
-/** Validate a range against the text, with a message naming the actual bounds. */
+/**
+ * Validate a range against the text, with a message naming the actual bounds.
+ *
+ * Line 1 of an EMPTY file is accepted: `splitLines("")` is legitimately zero lines,
+ * but "line 1" of nothing is the only way to name where content goes, and every
+ * operation handles it coherently (a slice of an empty array inserts at the start).
+ * Rejecting it made an empty file — including a file being created — impossible to
+ * write into at all, while reporting the misleading "past the end of the file".
+ */
 function assertRange(range: LineRange, total: number): void {
 	if (range.startLine < 1 || range.endLine < range.startLine) {
 		throw new EditOpError(
 			`Invalid line range ${range.startLine}-${range.endLine}: start must be >= 1 and end >= start.`,
 		);
 	}
+	if (total === 0 && range.startLine === 1) return;
 	if (range.startLine > total) {
 		throw new EditOpError(`Line ${range.startLine} is past the end of the file (${total} lines).`);
 	}

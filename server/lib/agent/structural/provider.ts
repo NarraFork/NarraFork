@@ -133,12 +133,26 @@ export interface StructDocument {
 }
 
 /** Import/export inventory for a single file. */
+/**
+ * One name an import binds into the local scope.
+ *
+ * `local` is the name that appears in the file's body; `original` is only set when the
+ * import renamed it. That direction matters: a cross-file search looks for the name as
+ * written at the use site, so storing only the exported name would miss every aliased
+ * import — which is exactly the blind spot this type exists to close.
+ */
+export interface ImportedName {
+	local: string;
+	/** The exported name, when `local` is an alias for it. */
+	original?: string;
+}
+
 export interface ImportExportInfo {
 	imports: Array<{
 		/** Module specifier as written. */
 		module: string;
 		/** Imported names, when the provider can see them. */
-		names?: string[];
+		names?: ImportedName[];
 		line: number;
 		/** `import x from "y"` vs `require("y")` vs `from y import x`… */
 		form?: string;

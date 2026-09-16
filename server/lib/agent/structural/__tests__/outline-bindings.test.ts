@@ -127,3 +127,46 @@ describeWithGrammar("destructuring declarations", () => {
 		expect(located[0]?.symbolPath).toBe("Component.plain");
 	});
 });
+
+/**
+ * `collectImports` recorded each import's module and line but never its NAMES, even
+ * though the interface declared the field. Every alias was therefore invisible, which is
+ * what made cross-file usage tracing miss `import { x as y }` entirely.
+ */
+describeWithGrammar("import name extraction", () => {
+	async function importsOf(text: string) {
+		clearOutlineCache();
+		// `imports` is optional on the provider contract; the tree-sitter one implements it,
+		// and a regression that dropped it should fail loudly here rather than skip.
+		const read = treeSitterProvider.imports;
+		if (!read) throw new Error("tree-sitter provider no longer implements imports()");
+		const info = await read.call(treeSitterProvider, {
+			filePath: "/tmp/imports.ts",
+			languageId: "typescript",
+			text,
+		});
+		return info.imports;
+	}
+
+	test("records the local name, and the original when renamed", async () => {
+		const imports = await importsOf(
+			'import { a, b as c } from "./m";\nimport def from "./d";\nimport * as ns from "./n";\n',
+		);
+		const byModule = new Map(imports.map((i) => [i.module, i.names ?? []]));
+		expect(byModule.get("./m")).toEqual([{ local: "a" }, { local: "c", original: "b" }]);
+		// A default and a namespace import each bind exactly one name.
+		expect(byModule.get("./d")).toEqual([{ local: "def" }]);
+		expect(byModule.get("./n")).toEqual([{ local: "ns" }]);
+	});
+
+	test("a type-only import binds a name like any other", async () => {
+		const imports = await importsOf('import type { T as U } from "./t";\n');
+		expect(imports[0]?.names).toEqual([{ local: "U", original: "T" }]);
+	});
+
+	test("the module specifier is never reported as a bound name", async () => {
+		// It is a string, not an identifier; listing it would make `./m` look imported.
+		const imports = await importsOf('import { a } from "./m";\n');
+		expect(imports[0]?.names?.map((n) => n.local)).toEqual(["a"]);
+	});
+});

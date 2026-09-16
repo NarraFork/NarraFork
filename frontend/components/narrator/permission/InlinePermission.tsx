@@ -24,7 +24,7 @@ const noop = () => {};
 
 // Mirrors the tool taxonomy in ToolCallCard.tsx: permission for these tools may
 // surface the file-modifications drawer entry point.
-const EDIT_TOOLS = new Set(["Edit", "Write"]);
+const EDIT_TOOLS = new Set(["Edit", "Write", "StructSed"]);
 
 // --- "Review in panel" button for Write/Edit permissions ---
 

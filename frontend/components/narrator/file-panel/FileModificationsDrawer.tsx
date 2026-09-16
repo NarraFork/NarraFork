@@ -14,7 +14,7 @@ import { FileApprovalTab } from "./FileApprovalTab";
 import { FileDeletePreviewTab } from "./FileDeletePreviewTab";
 import { FileSummaryTab } from "./FileSummaryTab";
 
-const EDIT_TOOLS = new Set(["Write", "Edit"]);
+const EDIT_TOOLS = new Set(["Write", "Edit", "StructSed"]);
 
 export interface FileModificationsPanelProps {
 	narratorId: string;

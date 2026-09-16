@@ -21,6 +21,7 @@ import type {
 	ElementNode,
 	FileStatistics,
 	ImportExportInfo,
+	ImportedName,
 	LocatedNode,
 	OutlineNode,
 	ProviderSupport,
@@ -303,10 +304,12 @@ function collectImports(
 		if (!child?.isNamed) continue;
 		if (importTypes.includes(child.type)) {
 			const moduleName = extractModuleName(child);
+			const names = extractImportedNames(child);
 			out.push({
 				module: moduleName ?? child.text.trim().slice(0, 120),
 				line: child.startPosition.row + 1,
 				form: child.type,
+				...(names.length > 0 ? { names } : {}),
 			});
 			continue;
 		}
@@ -316,6 +319,114 @@ function collectImports(
 			collectImports(child, importTypes, out);
 		}
 	}
+}
+
+/**
+ * Names an import statement binds into the local scope.
+ *
+ * The LOCAL name is what gets recorded, which for `import { a as b }` is `b`: a caller
+ * asking "does this file reference the symbol under some other name" needs the name
+ * that appears in the file's body, not the one the module exported. The original is
+ * kept alongside as `original` so an alias can still be traced back.
+ *
+ * Two grammar shapes, both real:
+ *  - JS/TS `import_specifier` carries `name`/`alias` FIELDS.
+ *  - Python `aliased_import` has POSITIONAL children (original, then alias) and no
+ *    fields, so a field-only reader silently returns nothing for every Python file.
+ *
+ * The module specifier is skipped: it is a string, not a bound name, and including it
+ * would make `"./m"` look like an imported identifier.
+ */
+function extractImportedNames(node: SyntaxNode): ImportedName[] {
+	const names: ImportedName[] = [];
+	const seen = new Set<string>();
+	const push = (local: string | undefined, original?: string): void => {
+		const trimmed = local?.trim();
+		if (!trimmed || seen.has(trimmed)) return;
+		seen.add(trimmed);
+		names.push({
+			local: trimmed,
+			...(original && original.trim() !== trimmed ? { original: original.trim() } : {}),
+		});
+	};
+
+	const walk = (current: SyntaxNode, depth: number): void => {
+		if (depth > 6) return;
+		for (let i = 0; i < current.childCount; i++) {
+			const child = current.child(i);
+			if (!child?.isNamed) continue;
+			switch (child.type) {
+				// `{ a }` / `{ a as b }` — fields are reliable here.
+				case "import_specifier":
+				case "export_specifier": {
+					const name = child.childForFieldName("name")?.text;
+					const alias = child.childForFieldName("alias")?.text;
+					if (alias) push(alias, name);
+					else push(name);
+					continue;
+				}
+				// Python `b as c`, and Rust's `use x as y`: positional, no fields.
+				case "aliased_import":
+				case "use_as_clause": {
+					const first = firstIdentifierText(child, 0);
+					const last = lastIdentifierText(child);
+					if (last && last !== first) push(last, first);
+					else push(first);
+					continue;
+				}
+				// `import * as ns` / `import def from`.
+				case "namespace_import":
+				case "import_require_clause": {
+					push(firstIdentifierText(child, 0));
+					continue;
+				}
+				case "identifier":
+				case "type_identifier": {
+					push(child.text);
+					continue;
+				}
+				case "dotted_name": {
+					// In `from mod import a`, the FIRST dotted_name is the module. Only the
+					// ones inside the import list bind a name, and those sit after it.
+					push(child.text);
+					continue;
+				}
+				case "string":
+				case "string_literal":
+				case "interpreted_string_literal":
+					continue;
+				default:
+					walk(child, depth + 1);
+			}
+		}
+	};
+	walk(node, 0);
+
+	// `from mod import a` records `mod` first because both are dotted_names; the module
+	// is already reported separately, so drop it rather than presenting it as a binding.
+	const moduleName = extractModuleName(node);
+	return moduleName ? names.filter((n) => n.local !== moduleName) : names;
+}
+
+function firstIdentifierText(node: SyntaxNode, depth: number): string | undefined {
+	if (depth > 4) return undefined;
+	for (let i = 0; i < node.childCount; i++) {
+		const child = node.child(i);
+		if (!child?.isNamed) continue;
+		if (child.type === "identifier" || child.type === "dotted_name") return child.text;
+		const nested = firstIdentifierText(child, depth + 1);
+		if (nested) return nested;
+	}
+	return undefined;
+}
+
+function lastIdentifierText(node: SyntaxNode): string | undefined {
+	for (let i = node.childCount - 1; i >= 0; i--) {
+		const child = node.child(i);
+		if (!child?.isNamed) continue;
+		if (child.type === "identifier" || child.type === "dotted_name") return child.text;
+	}
+	return undefined;
 }
 
 function extractModuleName(node: SyntaxNode): string | null {

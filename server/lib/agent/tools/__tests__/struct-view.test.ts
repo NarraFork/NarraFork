@@ -132,10 +132,76 @@ describe("address parsing (grammar-independent)", () => {
 		]);
 	});
 
-	test("out-of-range addresses match nothing instead of erroring", () => {
-		const lines = ["a", "b"];
-		expect(resolveAddress(parseAddress("99"), lines).blocks).toEqual([]);
-		expect(resolveAddress(parseAddress("99,120"), lines).blocks).toEqual([]);
+	test("parses mixed ranges where only one endpoint is a regex", () => {
+		expect(parseAddress("/helpers/,$")).toEqual({
+			kind: "mixed-range",
+			from: { kind: "regex", pattern: "helpers", flags: "" },
+			to: { kind: "last" },
+		});
+		expect(parseAddress("/helpers/,120")).toEqual({
+			kind: "mixed-range",
+			from: { kind: "regex", pattern: "helpers", flags: "" },
+			to: { kind: "line", line: 120 },
+		});
+		expect(parseAddress("10,/end/")).toEqual({
+			kind: "mixed-range",
+			from: { kind: "line", line: 10 },
+			to: { kind: "regex", pattern: "end", flags: "" },
+		});
+	});
+
+	test("finds the separating comma outside regex literals", () => {
+		// `{1,2}` contains a comma that must not be read as the endpoint separator.
+		expect(parseAddress("/a{1,2}/,$")).toEqual({
+			kind: "mixed-range",
+			from: { kind: "regex", pattern: "a{1,2}", flags: "" },
+			to: { kind: "last" },
+		});
+	});
+
+	test("rejects a range that starts at end-of-file", () => {
+		// `$,/x/` cannot run forwards; clamping it would edit an unnamed region.
+		expect(() => parseAddress("$,/x/")).toThrow(AddressError);
+	});
+
+	test("resolves mixed ranges, searching the end after the start", () => {
+		const lines = ["one", "// helpers", "three", "four", "end here"];
+		expect(resolveAddress(parseAddress("/helpers/,$"), lines).blocks).toEqual([
+			{ startLine: 2, endLine: 5 },
+		]);
+		expect(resolveAddress(parseAddress("/helpers/,4"), lines).blocks).toEqual([
+			{ startLine: 2, endLine: 4 },
+		]);
+		expect(resolveAddress(parseAddress("2,/end/"), lines).blocks).toEqual([
+			{ startLine: 2, endLine: 5 },
+		]);
+	});
+
+	test("a mixed range whose end regex also matches the start does not collapse", () => {
+		const lines = ["open", "mark", "middle", "mark", "close"];
+		expect(resolveAddress(parseAddress("/mark/,/mark/"), lines).blocks).toEqual([
+			{ startLine: 2, endLine: 4 },
+		]);
+		expect(resolveAddress(parseAddress("/mark/,$"), lines).blocks).toEqual([
+			{ startLine: 2, endLine: 5 },
+		]);
+	});
+
+	test("an unmatched mixed-range end runs to EOF, and an unmatched start matches nothing", () => {
+		const lines = ["one", "start here", "three"];
+		expect(resolveAddress(parseAddress("/start/,/never/"), lines).blocks).toEqual([
+			{ startLine: 2, endLine: 3 },
+		]);
+		expect(resolveAddress(parseAddress("/absent/,$"), lines).blocks).toEqual([]);
+	});
+
+	test("a mixed-range end only counts when it follows the start", () => {
+		// The only `x` precedes line 3, so the end is never found after the start and
+		// the range runs to EOF — it must not reach backwards to line 1.
+		const lines = ["x here", "two", "three"];
+		expect(resolveAddress(parseAddress("3,/x/"), lines).blocks).toEqual([
+			{ startLine: 3, endLine: 3 },
+		]);
 	});
 
 	test("caps the number of returned blocks", () => {
@@ -309,6 +375,29 @@ describeWithGrammar("tree-sitter provider (typescript grammar installed)", () =>
 		const start = result.metadata?.startLine as number;
 		const lines = TS_SOURCE.split("\n");
 		expect(lines[start - 1]).toContain("export function validateCard");
+	});
+
+	test("extract with line_numbers:false yields bare source usable as edit content", async () => {
+		const numbered = await run({ file_path: tsFile, mode: "extract", symbol: "validateCard" });
+		const bare = await run({
+			file_path: tsFile,
+			mode: "extract",
+			symbol: "validateCard",
+			line_numbers: false,
+		});
+		expect(bare.isError).toBeFalsy();
+		// The numbered form carries `123│` gutters; the bare form must carry none, or it
+		// cannot be handed to StructSed as replacement content.
+		expect(numbered.output).toMatch(/\d+│/);
+		expect(bare.output).not.toMatch(/\d+│/);
+		expect(bare.metadata?.lineNumbers).toBe(false);
+		// Byte-for-byte the region the file actually holds.
+		const start = bare.metadata?.startLine as number;
+		const end = bare.metadata?.endLine as number;
+		const expected = TS_SOURCE.split("\n")
+			.slice(start - 1, end)
+			.join("\n");
+		expect(bare.output).toContain(expected);
 	});
 
 	test("extract resolves a member by Class.method and by bare name", async () => {

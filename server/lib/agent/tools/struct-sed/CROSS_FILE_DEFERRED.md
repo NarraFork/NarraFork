@@ -21,6 +21,31 @@
 `workspace-write-coordinator.ts` 的 durable-lease 核心——本会话已两次因进程崩溃留下未回收
 租约、堵死所有写入并需要人工清理，风险等级高。
 
+### multi 路由复查（已完成，结论：不改核心就走不通）
+
+后续专门复查过「能否借 multi 路由绕开」，结论是**不能**，且卡点比原先记录的更靠底层。四个
+独立障碍，任一存在就足以否决，全部有行号：
+
+1. **`validateCall` 比对的是 tool-call 行的扁平列，不是执行计划。**
+   `file-change-runtime.ts` 约 L403-426 逐字段核对 `row.lexical`/`row.canonical`/`row.cwd`
+   与 `target`，再校验 `resolve(target.cwd, request.filePath)` 必须等于 `target.lexicalPath`，
+   否则抛 `Tool input changed its frozen path`。**一行只能存一个路径**。
+2. **`expectedEffectCount: 1`**（约 L726）——operation 契约就是「一次调用一个效果」。
+3. **`sourceId: frozen.row.id`**（L506）对同一次调用是**同一个值**，而 `executeBound` 入口
+   （L678）和写锁内（L715）都会用它查 `existingOperation`，命中即抛 `alreadyAttempted`。
+   所以「同一次调用里顺序写第二个文件」会被去重逻辑当成重复尝试直接拒绝。
+4. **租约 scope 是按文件各自的 root 推导的**（`prepareWorkspaceScope`，L648-654：
+   `canonicalRoot: root` + `workspaceInstanceId: hash([...root, rootIdentity])`）。两个文件
+   若不在同一 root 下，就是两个 scope、两把锁，跨 scope 原子性需要协调器支持多 scope 事务。
+
+值得记下的一点：**`executionTargetsJson` 列已经持久化完整 `ToolExecutionPlan`**
+（`schema.ts` L1478-1481），所以「存不下两个目标」并不是障碍——障碍是 `validateCall` 只读扁平
+列、以及 2/3/4 三条 operation 与租约层的单效果假设。真要做 Plan A，改动面是
+`validateCall` + operation 效果计数 + sourceId 去重键 + 多 scope 租约，全在写入管线核心。
+
+**因此按计划的决策规则选择方案 B：不改核心，接受非原子的三步路径**（下方「三步替代路径」
+一节）。失败方向是安全的那一侧——留下两份，不会丢代码。
+
 ## 回退（revert）可行性：两条机制的结论
 
 1. **Tree 快照（首选路径）——支持跨文件。**
@@ -75,3 +100,47 @@
 - `mode=usages`（跨文件反向引用，两段式 ripgrep + AST 精筛）已实现并有测试。
 - 同文件 copy/move、批量事务（`operations`）、批量重放均已实现并有测试。
 - `declaredWorktreePaths` 的双路径声明已就位，等跨文件写入可行时即可生效。
+
+## 三步替代路径（已可用，非原子）
+
+后续新增的两项能力让「把符号搬到另一个文件」不再需要退回 Read/Write，纯结构三步即可完成：
+
+1. `StructView mode=extract symbol=X line_numbers=false` — 拿到**不带 `123│` 行号前缀**的裸
+   源码（含其文档注释，因为 `startIndex` 已包含附着注释）。这是关键一步：此前 extract 无条件
+   加行号，导致输出无法直接当内容用。
+2. `StructSed command=append address="1" create_if_missing=true content=<上一步输出>` — 目标
+   文件不存在时创建。只有 replace/insert/append 可创建文件（它们自带完整内容）。
+3. `StructSed command=delete symbol=X` — 从原文件移除。
+
+**这条路径不是原子的**：第 2 步成功、第 3 步失败会留下「两个文件都有该符号」，而不是丢失代码
+（失败方向是安全的那一侧）。真正的原子跨文件仍需前述 multi 路由/租约改造，未做。
+
+另外修掉一个连带 bug：`assertRange` 曾拒绝空文件的第 1 行，导致 StructSed **无法向任何空文件
+写入**（不止新建文件）。现在空文件的第 1 行可寻址，第 2 行仍报错。
+
+## usages 别名盲区已关闭，AST rename 的前置条件变了
+
+本文档下方「AST rename」一节曾把「缺少别名信息」列为障碍。该前置缺口已修复：
+
+- `collectImports`（`tree-sitter-provider.ts`）此前**只填 module/line/form，从不填 `names`**，
+  尽管 `ImportExportInfo` 接口早已声明该字段。因此 `import { x as y }` 在整个系统里不可见。
+- 现在提取为 `ImportedName { local, original? }`。**记录的是 local（文件正文里出现的名字）**，
+  别名时才附 `original`——方向很重要：跨文件搜索要找的是使用处写的名字。
+- 两种语法形态都处理：JS/TS 的 `import_specifier` 有 `name`/`alias` **字段**；Python 的
+  `aliased_import` 是**位置子节点、没有字段**，只按字段读会让每个 Python 文件静默返回空。
+- `mode=usages` 现在分 `confirmed`（能证明从定义模块导入，别名会跟到 local 名）和
+  `unverified`（同名但找不到可关联的 import）两组，别名文件标 `[imported as X]`。
+- `importMayReferTo` 是**按文件名的启发式，不是解析器**（tsconfig paths/package exports 需要
+  构建系统自己的逻辑，半实现会给出自信的错误答案）。**桶导入算命中**——本仓库大多数消费方
+  是 `from "../../structural"` 而非具体文件，排除它们会把真实用法丢进 unverified，等于在上
+  一层重犯同一个错误。
+
+**AST rename 仍未做**，但现在缺的只是「改写」那一半：别名信息和 confirmed/unverified 判定已
+可用，rename 的候选集合可以先用 usages 得到。仍未解决的是缺列位置（provider 只给行不给列）。
+
+## `mode=find` 已实现，定位不再依赖 grep
+
+原先每个 StructView 模式都要求已知 `file_path`，"这个符号在哪个文件"只能 grep，而 grep 会把
+声明、调用点、注释、同名无关符号混在一起。`mode=find`（`modes/find.ts`）用同样的两段式
+（ripgrep 预过滤 → 逐候选 outline 精筛）只保留**真实声明**，输出工作区相对路径 + kind + 行号，
+可直接作为下一次调用的 `file_path`。精度仍标 `structural`（按名字、单仓库、无类型解析）。

@@ -22,10 +22,27 @@
  * something that was actually in use.
  */
 
+/**
+ * How much confidence a hit deserves.
+ *
+ * `confirmed` — the file imports the name from the module that declares it, so the
+ *   identifier almost certainly IS the symbol being traced.
+ * `unverified` — the name matches but no import ties it to the definition. Could be a
+ *   same-named local, a different module's export, or a same-file reference. Reported
+ *   rather than dropped, because an import this reader cannot see (a re-export chain, a
+ *   dynamic import, a language whose imports are not parsed) still leaves a real usage.
+ * `aliased` — the file imports the symbol under a DIFFERENT local name, so the lines
+ *   listed for the original name are not the whole story.
+ */
+export type UsageConfidence = "confirmed" | "unverified" | "aliased";
+
 /** One file's hits: the path and the 1-based lines the identifier appears on. */
 export interface UsageFile {
 	path: string;
 	lines: number[];
+	confidence?: UsageConfidence;
+	/** Local name the symbol was imported as, when it was renamed. */
+	alias?: string;
 }
 
 export interface CrossFileUsageResult {
@@ -43,6 +60,8 @@ export interface RawFileHit {
 	path: string;
 	/** Identifier lines from the position index; empty means text-only (no real usage). */
 	lines: readonly number[];
+	confidence?: UsageConfidence;
+	alias?: string;
 }
 
 export interface AssembleOptions {
@@ -73,12 +92,21 @@ export function assembleUsages(
 			textOnly++;
 			continue;
 		}
-		files.push({ path: hit.path, lines: lines.slice(0, maxPerFile) });
+		files.push({
+			path: hit.path,
+			lines: lines.slice(0, maxPerFile),
+			...(hit.confidence ? { confidence: hit.confidence } : {}),
+			...(hit.alias ? { alias: hit.alias } : {}),
+		});
 	}
 
-	// Most-referenced first: the files that use a symbol most are the ones a rename or a
-	// deletion has to reckon with first.
-	files.sort((a, b) => b.lines.length - a.lines.length || a.path.localeCompare(b.path));
+	// Confirmed first, then most-referenced: a caller planning a rename needs the files
+	// that provably use this symbol before the ones that merely share its name.
+	const rank = (f: UsageFile): number =>
+		f.confidence === "confirmed" || f.confidence === "aliased" ? 0 : 1;
+	files.sort(
+		(a, b) => rank(a) - rank(b) || b.lines.length - a.lines.length || a.path.localeCompare(b.path),
+	);
 
 	return {
 		files,
@@ -90,6 +118,52 @@ export function assembleUsages(
 
 /** The mandatory precision caveat, kept in one place so every caller states it identically. */
 export const CROSS_FILE_PRECISION_NOTE =
-	"Structural, not semantic: matches the name as an identifier, so a different symbol " +
-	"with the same name is included and an `import { x as y }` alias is missed. Confirm " +
-	"before renaming or deleting.";
+	"Structural, not semantic. `confirmed` files import the name from the defining module, " +
+	"and an `import { x as y }` alias is followed to its local name. `unverified` files " +
+	"carry the same name with no import this check could tie to the definition, so they may " +
+	"be a different symbol entirely — or a usage reached through a re-export or a path " +
+	"alias. Nothing here resolves types, so confirm before renaming or deleting.";
+
+/**
+ * Does an import specifier plausibly refer to `definingPath`?
+ *
+ * Deliberately a heuristic on the FILE NAME, not a resolver: honouring tsconfig paths,
+ * package exports, index resolution and extension order needs the build system's own
+ * logic, and half-implementing it would produce confident wrong answers. So the test is
+ * narrow — the specifier's last meaningful segment must equal the defining file's base
+ * name — and everything it cannot prove stays `unverified` rather than being called a
+ * mismatch.
+ *
+ * `./tools/struct-view` matches `struct-view.ts` and `struct-view/index.ts`; a bare
+ * `@server/lib/agent/tools/struct-view` matches the same way, since only the tail is
+ * compared.
+ *
+ * BARREL IMPORTS COUNT. A specifier naming the defining file's own DIRECTORY resolves to
+ * that directory's index, which is how most of a codebase reaches a symbol — importing
+ * `../../structural` rather than `../../structural/cross-file-usages`. Excluding those
+ * left genuine usages sitting in the unverified group, which is the same failure this
+ * check was added to fix, one level up. The residual risk is a barrel that re-exports a
+ * DIFFERENT same-named symbol from a sibling file; the caveat already says matching is
+ * name-based, and that beats calling every barrel import unverifiable.
+ */
+export function importMayReferTo(specifier: string, definingPath: string): boolean {
+	const spec = specifier.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+	if (spec.length === 0) return false;
+	const normalizedDef = definingPath.replace(/\\/g, "/");
+	const defFile = normalizedDef.split("/").pop() ?? "";
+	const defBase = defFile.replace(/\.[^.]+$/, "");
+	if (defBase.length === 0) return false;
+	const parentDir = normalizedDef.split("/").at(-2) ?? "";
+
+	const segments = spec.split("/").filter((s) => s.length > 0 && s !== "." && s !== "..");
+	let tail = segments[segments.length - 1] ?? "";
+	tail = tail.replace(/\.[^.]+$/, "");
+	if (tail.length === 0) return false;
+
+	// A directory import resolves to its index file, so the directory name is what should
+	// match. An explicit `./index` names the same file directly and counts too.
+	if (defBase === "index") return tail === parentDir || tail === "index";
+	if (tail === defBase) return true;
+	// Barrel: the specifier names the directory the defining file lives in.
+	return parentDir.length > 0 && tail === parentDir;
+}

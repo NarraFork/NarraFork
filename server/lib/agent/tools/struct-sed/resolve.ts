@@ -224,6 +224,18 @@ export function validateSpec(
 			`command=${command} does not take \`placement\`; it only applies to copy and move.`,
 		);
 	}
+	// `to_file` reads like the obvious way to move a symbol between files, and it is the
+	// name reserved for that if it ever ships. Until then it must be REFUSED, not ignored:
+	// silently dropping it resolved the destination inside the source file, which for a
+	// same-line target produced "destination overlaps the source" — an error about the
+	// wrong file entirely, leaving the caller to conclude the move had happened.
+	if (spec.to_file !== undefined) {
+		return fail(
+			"StructSed cannot write two files in one call, so `to_file` is not supported. " +
+				"To move a symbol across files: StructView mode=extract with line_numbers=false, " +
+				"then StructSed append with create_if_missing on the target, then delete here.",
+		);
+	}
 
 	return {
 		spec: {
