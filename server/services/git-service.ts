@@ -1,8 +1,14 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { lstat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+	GIT_WORKSPACE_MAX_BYTES,
+	GIT_WORKSPACE_WRITE_TIMEOUT_MS,
+} from "../lib/agent/execution/git-workspace-rpc";
 import { worktreeLock } from "../lib/async-mutex";
-import { GitAuthError, GitError } from "../lib/errors";
+import { AppError, GitAuthError, GitError } from "../lib/errors";
 import type { GitIdentityEnv } from "../lib/git-identity";
 import { mergeGitTrees, requireCompleteMergeTree } from "../lib/git-tree-merge";
 import { logger } from "../lib/logger";
@@ -10,6 +16,19 @@ import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { DEV_NULL } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
 import { WORKTREES_DIR_NAME } from "./worktree-tree-snapshot";
+
+const gitRequestContext = new AsyncLocalStorage<{
+	signal?: AbortSignal;
+	beforeWrite?: () => Promise<void>;
+}>();
+/** HTTP management budget without changing long-running lifecycle/network callers. */
+export function withGitRequestContext<T>(
+	signal: AbortSignal | undefined,
+	run: () => Promise<T>,
+	beforeWrite?: () => Promise<void>,
+): Promise<T> {
+	return gitRequestContext.run({ signal, beforeWrite }, run);
+}
 
 interface ExecResult {
 	stdout: string;
@@ -167,7 +186,24 @@ function commitLogIndexMaxOutputBytes(searchLimit: number): number {
  * `*Unlocked` variants below address; see the note above them.
  */
 async function withWorktreeLock<T>(worktreePath: string, fn: () => Promise<T>): Promise<T> {
-	return worktreeLock.acquire(worktreePath, fn);
+	const request = gitRequestContext.getStore();
+	if (!request) return worktreeLock.acquire(worktreePath, fn);
+	const result = await worktreeLock.tryAcquire(
+		worktreePath,
+		async () => {
+			request.signal?.throwIfAborted();
+			await request.beforeWrite?.();
+			return fn();
+		},
+		500,
+	);
+	if (!result.acquired)
+		throw new AppError(
+			"Git working tree is busy; retry after the current operation completes",
+			409,
+			"GIT_WORKSPACE_BUSY",
+		);
+	return result.value;
 }
 
 /**
@@ -225,6 +261,8 @@ export interface GitStatusFile {
 }
 
 export interface GitStatusSummary {
+	/** The displayed files/statistics are incomplete when any subprocess hits its byte budget. */
+	truncated?: boolean;
 	hasChanges: boolean;
 	staged: number;
 	unstaged: number;
@@ -300,13 +338,34 @@ async function exec(
 ): Promise<ExecResult> {
 	const { silent, optionalLocks, timeout, maxOutputBytes, identity } =
 		normalizeExecOptions(options);
-	const cmd = optionalLocks ? ["git", ...args] : ["git", "--no-optional-locks", ...args];
+	const request = gitRequestContext.getStore();
+	request?.signal?.throwIfAborted();
+	if (request && args[0] === "diff")
+		args = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", ...args.slice(1)];
+	const prefix = request
+		? [
+				"git",
+				"--literal-pathspecs",
+				"-c",
+				"core.fsmonitor=false",
+				"-c",
+				"diff.external=",
+				"-c",
+				"diff.trustExitCode=false",
+			]
+		: ["git"];
+	const cmd = optionalLocks ? [...prefix, ...args] : [...prefix, "--no-optional-locks", ...args];
 	try {
 		const result = await safeSpawn({
 			cmd,
 			cwd,
-			timeout,
-			maxOutputBytes,
+			timeout: request
+				? Math.min(timeout ?? GIT_WORKSPACE_WRITE_TIMEOUT_MS, GIT_WORKSPACE_WRITE_TIMEOUT_MS)
+				: timeout,
+			maxOutputBytes: request
+				? Math.min(maxOutputBytes ?? GIT_WORKSPACE_MAX_BYTES, GIT_WORKSPACE_MAX_BYTES)
+				: maxOutputBytes,
+			signal: request?.signal,
 			// `Bun.spawn`'s `env` REPLACES the environment rather than merging into it,
 			// so an identity has to be layered over `process.env` explicitly — passing
 			// the four `GIT_*` variables alone would strip PATH/HOME and break git.
@@ -323,10 +382,10 @@ async function exec(
 		);
 		if (result.exitCode !== 0 && !silent) {
 			logger.error("git command failed", {
-				args: args.join(" "),
-				cwd,
-				stdout: trimmedStdout ? truncateGitFailureOutput(trimmedStdout) : undefined,
-				stderr: trimmedStderr ? truncateGitFailureOutput(trimmedStderr) : undefined,
+				args: request ? args[0] : args.join(" "),
+				cwd: request ? undefined : cwd,
+				stdout: !request && trimmedStdout ? truncateGitFailureOutput(trimmedStdout) : undefined,
+				stderr: !request && trimmedStderr ? truncateGitFailureOutput(trimmedStderr) : undefined,
 				exitCode: result.exitCode,
 				optionalLocks,
 				truncated: truncated || undefined,
@@ -346,6 +405,8 @@ async function exec(
 			truncated,
 		};
 	} catch (err) {
+		request?.signal?.throwIfAborted();
+		if (request) throw err;
 		// When silent, swallow spawn errors (e.g. git not found) and return a
 		// synthetic failure result so callers that check exitCode still work.
 		if (silent) {
@@ -490,30 +551,31 @@ async function getUntrackedLineStatsMap(
 	worktreePath: string,
 	files: string[],
 ): Promise<Map<string, LineStats>> {
-	// Cap the number of files to avoid reading thousands of files into memory
 	const capped = files.slice(0, MAX_UNTRACKED_LINE_COUNT_FILES);
-	const entries = await Promise.all(
-		capped.map(async (file) => {
-			try {
-				const filePath = join(worktreePath, file);
-				const bunFile = Bun.file(filePath);
-				const size = bunFile.size;
-				// Skip files that are too large (likely binary or generated)
-				if (size > MAX_UNTRACKED_FILE_SIZE) {
+	const entries = new Map<string, LineStats>();
+	// Ten bounded files at once, never a 200 MiB all-files burst on the HTTP thread.
+	for (let start = 0; start < capped.length; start += 10) {
+		gitRequestContext.getStore()?.signal?.throwIfAborted();
+		const batch = await Promise.all(
+			capped.slice(start, start + 10).map(async (file) => {
+				try {
+					const filePath = join(worktreePath, file);
+					const metadata = await lstat(filePath);
+					// The link itself is a Git entry, not permission to read its referent.
+					if (!metadata.isFile() || metadata.size > MAX_UNTRACKED_FILE_SIZE)
+						return [file, { added: 0, removed: 0 }] as const;
+					if (metadata.size > 0 && (await isBinaryFile(filePath, metadata.size)))
+						return [file, { added: 0, removed: 0 }] as const;
+					const content = await Bun.file(filePath).slice(0, MAX_UNTRACKED_FILE_SIZE).text();
+					return [file, { added: countTextLines(content), removed: 0 }] as const;
+				} catch {
 					return [file, { added: 0, removed: 0 }] as const;
 				}
-				// Binary detection: sample first bytes for null byte (VSCode approach)
-				if (size > 0 && (await isBinaryFile(filePath, size))) {
-					return [file, { added: 0, removed: 0 }] as const;
-				}
-				const content = await bunFile.text();
-				return [file, { added: countTextLines(content), removed: 0 }] as const;
-			} catch {
-				return [file, { added: 0, removed: 0 }] as const;
-			}
-		}),
-	);
-	return new Map(entries);
+			}),
+		);
+		for (const [path, stats] of batch) entries.set(path, stats);
+	}
+	return entries;
 }
 
 function parseNumstatZ(
@@ -1140,6 +1202,8 @@ export const gitService = {
 			execRead(["diff", "--numstat", "-z", "--", "."], worktreePath, true),
 			execRead(["ls-files", "--others", "--exclude-standard", "-z", "--", "."], worktreePath, true),
 		]);
+		if (statusResult.exitCode !== 0)
+			throw new GitError(gitFailureMessage("Git status failed", statusResult));
 		const pathPrefix = prefixResult.exitCode === 0 ? prefixResult.stdout : "";
 
 		const stagedLineStats =
@@ -1218,17 +1282,26 @@ export const gitService = {
 			totalLinesRemoved += stats.removed;
 		}
 
+		const truncated =
+			entries.length > files.length ||
+			[statusResult, stagedNumstat, unstagedNumstat, untrackedResult].some(
+				(result) => result.truncated,
+			);
 		return {
-			hasChanges: entries.length > 0,
+			hasChanges: entries.length > 0 || truncated,
 			staged,
 			unstaged,
 			untracked,
 			files,
 			totalFiles: entries.length,
-			headSha: headResult.stdout,
-			branch: branchResult.stdout,
+			headSha: headResult.exitCode === 0 ? headResult.stdout : "",
+			branch:
+				branchResult.exitCode === 0
+					? branchResult.stdout
+					: (await execRead(["symbolic-ref", "--short", "HEAD"], worktreePath, true)).stdout,
 			linesAdded: totalLinesAdded,
 			linesRemoved: totalLinesRemoved,
+			truncated,
 		};
 	},
 
@@ -1244,7 +1317,11 @@ export const gitService = {
 		// one makes git print usage and exit 129, which silently emptied every diff
 		// this method produced, including the one the review agent reads.
 		// -D/--irreversible-delete: omit full content of deleted files.
-		const diffResult = await execRead(["diff", "HEAD", "-D", "--no-color"], worktreePath, true);
+		const diffResult = await execRead(
+			["diff", (await hasNoCommits(worktreePath)) ? "--cached" : "HEAD", "-D", "--no-color"],
+			worktreePath,
+			true,
+		);
 		const parts: string[] = [];
 		let totalLen = 0;
 
@@ -1266,11 +1343,11 @@ export const gitService = {
 
 		// List untracked files and show their content (skip binary files)
 		const untrackedResult = await execRead(
-			["ls-files", "--others", "--exclude-standard"],
+			["ls-files", "--others", "--exclude-standard", "-z"],
 			worktreePath,
 			true,
 		);
-		const untrackedFiles = untrackedResult.stdout.split("\n").filter(Boolean);
+		const untrackedFiles = parseNulSeparatedPaths(untrackedResult.stdout);
 		// Cap the number of untracked files we diff to avoid spawning too many processes
 		const MAX_UNTRACKED_DIFFS = 50;
 		const filesToDiff = untrackedFiles.slice(0, MAX_UNTRACKED_DIFFS);
@@ -1278,7 +1355,7 @@ export const gitService = {
 			// --no-index always exits 1 when diff is found — silence the expected error log.
 			// Binary files again produce only a "Binary files ... differ" line by default.
 			const showResult = await execRead(
-				["diff", "--no-index", "--no-color", DEV_NULL, file],
+				["diff", "--no-index", "--no-color", "--", DEV_NULL, file],
 				worktreePath,
 				true,
 			);
@@ -1604,7 +1681,10 @@ export const gitService = {
 	/** {@link unstageFiles} for callers already holding the worktree lock. */
 	async unstageFilesUnlocked(worktreePath: string, files: string[]): Promise<void> {
 		if (files.length === 0) return;
-		const result = await exec(["reset", "HEAD", "--", ...files], worktreePath);
+		const args = (await hasNoCommits(worktreePath))
+			? ["rm", "--cached", "-r", "--ignore-unmatch", "--", ...files]
+			: ["reset", "HEAD", "--", ...files];
+		const result = await exec(args, worktreePath);
 		if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
 	},
 
@@ -1614,7 +1694,10 @@ export const gitService = {
 
 	/** {@link unstageAll} for callers already holding the worktree lock. */
 	async unstageAllUnlocked(worktreePath: string): Promise<void> {
-		const result = await exec(["reset", "HEAD"], worktreePath);
+		const result = await exec(
+			(await hasNoCommits(worktreePath)) ? ["read-tree", "--empty"] : ["reset", "HEAD"],
+			worktreePath,
+		);
 		if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
 	},
 
@@ -1730,6 +1813,9 @@ export const gitService = {
 			worktreePath,
 			true,
 		);
+		if (result.truncated) throw new GitError("Git stash list exceeds its output budget");
+		if (result.exitCode !== 0)
+			throw new GitError(gitFailureMessage("Git stash list failed", result));
 		if (!result.stdout.trim()) return [];
 		return result.stdout
 			.trim()
@@ -1769,19 +1855,26 @@ export const gitService = {
 		const statusLine = statusResult.stdout.trim();
 
 		let diff: string;
+		let truncated = statusResult.truncated ?? false;
 		if (statusLine.startsWith("??")) {
 			// Untracked file — show full content as "new file" diff
-			const r = await execRead(["diff", "--no-index", DEV_NULL, filePath], worktreePath, true);
+			const r = await execRead(
+				["diff", "--no-index", "--", DEV_NULL, filePath],
+				worktreePath,
+				true,
+			);
 			diff = r.stdout;
+			truncated ||= r.truncated ?? false;
 		} else if (staged) {
 			const r = await execRead(["diff", "--cached", "--", filePath], worktreePath, true);
 			diff = r.stdout;
+			truncated ||= r.truncated ?? false;
 		} else {
 			const r = await execRead(["diff", "--", filePath], worktreePath, true);
 			diff = r.stdout;
+			truncated ||= r.truncated ?? false;
 		}
 
-		let truncated = false;
 		if (diff.length > maxBytes) {
 			diff = diff.slice(0, maxBytes);
 			truncated = true;
@@ -1894,6 +1987,12 @@ export const gitService = {
 		];
 		if (opts.branch) args.push(opts.branch);
 		const result = await execRead(args, worktreePath, true);
+		if (result.truncated)
+			throw new GitError("Git history exceeds its output budget; reduce the page size");
+		if (result.exitCode !== 0) {
+			if (await hasNoCommits(worktreePath)) return [];
+			throw new GitError(gitFailureMessage("Git history failed", result));
+		}
 		if (!result.stdout.trim()) return [];
 		return result.stdout
 			.trim()

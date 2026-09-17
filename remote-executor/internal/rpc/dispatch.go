@@ -71,6 +71,8 @@ func (d *Dispatcher) Dispatch(
 		return d.h.GitStatus(params)
 	case "git.diff":
 		return d.h.GitDiff(params)
+	case "git.workspace":
+		return d.h.GitWorkspace(ctx, params)
 	case "pty.open":
 		return d.h.PtyOpen(ctx, params, stream)
 	case "pty.write":

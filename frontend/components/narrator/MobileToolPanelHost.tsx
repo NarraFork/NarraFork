@@ -89,7 +89,7 @@ export interface MobileToolPanelHostProps {
 	kind: MobileToolPanelKind | null;
 	onClose: () => void;
 	narratorId: string;
-	/** Required by the git panel; when absent the git entry reports "no chapter". */
+	/** Optional legacy chapter association; Git resolves the narrator's actual workspace. */
 	chapterId?: string | null;
 	/** Live browser session count, forwarded so the panel matches the dock's props. */
 	browserSessionCount?: number;
@@ -108,7 +108,6 @@ export function MobileToolPanelHost({
 	kind,
 	onClose,
 	narratorId,
-	chapterId,
 	browserSessionCount,
 	browserVisualChange,
 	onJumpToMessage,
@@ -147,19 +146,11 @@ export function MobileToolPanelHost({
 			    a chat room subscription), so keeping the inactive ones mounted would hold
 			    subscriptions open for panels the reader closed. */}
 			{kind === "git" ? (
-				chapterId ? (
-					<Box style={{ height: "100%" }}>
-						<PanelBoundary>
-							<GitPanel chapterId={chapterId} />
-						</PanelBoundary>
-					</Box>
-				) : (
-					<Center h="100%">
-						<Text size="sm" c="dimmed">
-							{tGit("panel.noChapter")}
-						</Text>
-					</Center>
-				)
+				<Box style={{ height: "100%" }}>
+					<PanelBoundary>
+						<GitPanel narratorId={narratorId} />
+					</PanelBoundary>
+				</Box>
 			) : null}
 			{kind === "search" ? (
 				<PanelBoundary>

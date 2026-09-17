@@ -32,6 +32,9 @@ const FeatureGlobBoundedV1 = "glob.bounded.v1"
 // bounded chunks and revalidates canonical identity and file size before returning.
 const FeatureFsReadBoundedV1 = "fs.read.bounded.v1"
 
+// FeatureGitWorkspaceV1 covers structured, bounded, cancellable full Git management.
+const FeatureGitWorkspaceV1 = "git.workspace.v1"
+
 // ── Frame envelope ────────────────────────────────────────────────────────────
 
 // Frame is the common shape used to peek at a message's type before decoding
@@ -94,6 +97,7 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 		FeatureFsWriteAtomicResolvedPathV1,
 		FeatureGlobBoundedV1,
 		FeatureFsReadBoundedV1,
+		FeatureGitWorkspaceV1,
 	} {
 		seen := false
 		for _, feature := range features {

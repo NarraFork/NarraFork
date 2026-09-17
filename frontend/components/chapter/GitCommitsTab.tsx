@@ -13,6 +13,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useGitLog, useGitReset } from "../../hooks/useGit";
 import { useChapterSplitCapability } from "../../hooks/usePlatform";
+import { type GitTarget, gitCanWrite } from "../../lib/api/git";
 import { formatRelativeTime } from "../../lib/format";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { ChapterSplitModal } from "./ChapterSplitModal";
@@ -27,7 +28,15 @@ function clampGitCommitListText(value: string | null | undefined): string {
 		: value;
 }
 
-export function GitCommitsTab({ chapterId }: { chapterId: string }) {
+export function GitCommitsTab({
+	chapterId,
+	target = chapterId ?? "",
+}: {
+	chapterId?: string;
+	target?: GitTarget;
+}) {
+	const canWrite = gitCanWrite(target);
+	const splitChapterId = typeof target === "string" ? target : target.chapterId;
 	const { t } = useTranslation("git");
 	const confirm = useConfirmDialog();
 	const chapterSplitCapability = useChapterSplitCapability();
@@ -36,11 +45,19 @@ export function GitCommitsTab({ chapterId }: { chapterId: string }) {
 		: chapterSplitCapability.reason || t("splitUnsupported");
 	const [skip, setSkip] = useState(0);
 	const [splitTarget, setSplitTarget] = useState<{ sha: string; message: string } | null>(null);
-	const { data: commits, isLoading } = useGitLog(chapterId, LIMIT, skip);
-	const reset = useGitReset(chapterId);
+	const { data: commits, isLoading, error } = useGitLog(target, LIMIT, skip);
+	const reset = useGitReset(target);
 
 	async function handleReset(sha: string, mode: "soft" | "hard") {
-		if (mode === "hard" && !(await confirm({ message: t("resetConfirm") }))) return;
+		if (!canWrite) return;
+		const scope =
+			typeof target === "string" ? "" : `\n${t("workspace.scope", { root: target.rootPath })}`;
+		if (
+			!(await confirm({
+				message: `${t(mode === "hard" ? "resetConfirm" : "resetSoftConfirm")}${scope}`,
+			}))
+		)
+			return;
 		reset.mutate({ target: sha, mode });
 	}
 
@@ -48,7 +65,14 @@ export function GitCommitsTab({ chapterId }: { chapterId: string }) {
 		return <Loader size="sm" />;
 	}
 
-	if (!commits || commits.length === 0) {
+	if (error)
+		return (
+			<Text c="red" size="sm">
+				{error.message}
+			</Text>
+		);
+
+	if (!commits || (commits.length === 0 && skip === 0)) {
 		return (
 			<Text size="sm" c="dimmed" py="md" ta="center">
 				{t("commitEmpty")}
@@ -58,6 +82,16 @@ export function GitCommitsTab({ chapterId }: { chapterId: string }) {
 
 	return (
 		<>
+			{reset.error && (
+				<Text c="red" size="xs">
+					{reset.error.message}
+				</Text>
+			)}
+			{reset.error && (
+				<Text c="dimmed" size="xs">
+					{t("workspace.writeFailureHint")}
+				</Text>
+			)}
 			{/* Fills the dock panel: the tab body hands down its full height. */}
 			<ScrollArea style={{ flex: 1, minHeight: 0 }}>
 				<Stack gap={2}>
@@ -82,18 +116,29 @@ export function GitCommitsTab({ chapterId }: { chapterId: string }) {
 									</UnstyledButton>
 								</Menu.Target>
 								<Menu.Dropdown>
+									{splitChapterId && (
+										<Menu.Item
+											disabled={!canWrite || !chapterSplitCapability.supported}
+											title={splitUnsupportedReason}
+											onClick={() => {
+												if (!chapterSplitCapability.supported) return;
+												setSplitTarget({ sha: c.sha, message: c.message });
+											}}
+										>
+											{t("splitHere")}
+										</Menu.Item>
+									)}
 									<Menu.Item
-										disabled={!chapterSplitCapability.supported}
-										title={splitUnsupportedReason}
-										onClick={() => {
-											if (!chapterSplitCapability.supported) return;
-											setSplitTarget({ sha: c.sha, message: c.message });
-										}}
+										disabled={!canWrite || reset.isPending}
+										onClick={() => handleReset(c.sha, "soft")}
 									>
-										{t("splitHere")}
+										{t("resetSoft")}
 									</Menu.Item>
-									<Menu.Item onClick={() => handleReset(c.sha, "soft")}>{t("resetSoft")}</Menu.Item>
-									<Menu.Item color="red" onClick={() => handleReset(c.sha, "hard")}>
+									<Menu.Item
+										disabled={!canWrite || reset.isPending}
+										color="red"
+										onClick={() => handleReset(c.sha, "hard")}
+									>
 										{t("resetHard")}
 									</Menu.Item>
 								</Menu.Dropdown>
@@ -101,6 +146,15 @@ export function GitCommitsTab({ chapterId }: { chapterId: string }) {
 						</Group>
 					))}
 
+					{skip > 0 && (
+						<Button
+							size="compact-xs"
+							variant="subtle"
+							onClick={() => setSkip((value) => Math.max(0, value - LIMIT))}
+						>
+							{t("previousPage")}
+						</Button>
+					)}
 					{commits.length === LIMIT && (
 						<Button
 							size="compact-xs"
@@ -113,13 +167,15 @@ export function GitCommitsTab({ chapterId }: { chapterId: string }) {
 					)}
 				</Stack>
 			</ScrollArea>
-			<ChapterSplitModal
-				chapterId={chapterId}
-				commitSha={splitTarget?.sha ?? null}
-				commitMessage={splitTarget?.message}
-				opened={!!splitTarget}
-				onClose={() => setSplitTarget(null)}
-			/>
+			{splitChapterId && (
+				<ChapterSplitModal
+					chapterId={splitChapterId}
+					commitSha={splitTarget?.sha ?? null}
+					commitMessage={splitTarget?.message}
+					opened={!!splitTarget}
+					onClose={() => setSplitTarget(null)}
+				/>
+			)}
 		</>
 	);
 }

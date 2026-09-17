@@ -130,6 +130,7 @@ export type RpcMethod =
 	| "exec.kill"
 	| "git.status"
 	| "git.diff"
+	| "git.workspace"
 	| "pty.open"
 	| "pty.write"
 	| "pty.resize"

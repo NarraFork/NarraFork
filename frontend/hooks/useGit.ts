@@ -1,20 +1,27 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import type { CurrentDiffView } from "../../server/services/git-current-diff-view";
 import type {
 	FileChangeActorKind,
 	FileChangeAttributionGrade,
 	FileChangeProjectionCompleteness,
 } from "../../shared/file-change-protocol";
-import { api } from "../lib/api";
+import { type ApiError, api } from "../lib/api";
+import { type GitTarget, type GitWorkspace, gitTargetKey } from "../lib/api/git";
+import { type ListenerHandle, narratorWSManager } from "../lib/narrator-ws-manager";
+import { useNarrator } from "./useNarrator";
 
 export type {
 	CurrentDiffFile,
 	CurrentDiffTarget,
 	CurrentDiffView,
 } from "../../server/services/git-current-diff-view";
+export type { GitTarget, GitWorkspace } from "../lib/api/git";
 
 // Types
 export interface GitStatusSummary {
+	/** The executor reached its output budget; counts may be lower bounds. */
+	truncated?: boolean;
 	hasChanges: boolean;
 	staged: number;
 	unstaged: number;
@@ -105,171 +112,264 @@ export interface WorkspaceModificationView {
 	baselineStatus: "unverified";
 }
 
-// Queries
-
+// Workspace facts share a cache across narrators, never across devices/worktrees.
 const GIT_QUERY_GC_TIME_MS = 60_000;
+export const GIT_FACT_QUERIES = [
+	"gitStatus",
+	"gitModifications",
+	"gitDiff",
+	"gitLog",
+	"gitStashList",
+];
 
-/**
- * Prefix of the attribution query key.
- *
- * Deliberately two segments while the query itself is keyed with a third (`"uncommitted"`):
- * invalidations mean "every scope for this chapter", so adding a scope later cannot leave a
- * stale badge behind.
- */
-function gitAttributionKey(chapterId: string): unknown[] {
-	return ["gitModifications", chapterId];
+export function gitWorkspaceTarget(narratorId: string, workspace?: GitWorkspace): GitTarget | null {
+	if (workspace?.state !== "ready" || !workspace.capabilities.read || !workspace.workspaceKey)
+		return null;
+	return {
+		narratorId,
+		workspaceKey: workspace.workspaceKey,
+		repositoryKey: workspace.repositoryKey,
+		canWrite: workspace.capabilities.write,
+		rootPath: workspace.rootPath,
+		chapterId: workspace.chapterId,
+	};
 }
 
-/**
- * Invalidate everything that describes the working tree.
- *
- * Status and attribution are one fact split across two queries: a commit moves each file's
- * per-path attribution boundary, and stage/discard changes which files are in the diff at
- * all. Refreshing only status left the badges showing contributors filtered by the previous
- * boundary until the 30s poll caught up.
- */
+// One permission subscription per QueryClient, shared by all mounted workspace consumers.
+const gitAccessSubscriptions = new WeakMap<
+	QueryClient,
+	{ count: number; handle: ListenerHandle }
+>();
+function subscribeGitAccess(qc: QueryClient) {
+	let entry = gitAccessSubscriptions.get(qc);
+	if (!entry) {
+		const handle = narratorWSManager.addListener(
+			{ narratorIds: "*", types: ["narrator_access_changed"] },
+			() => {
+				qc.resetQueries({ queryKey: ["gitWorkspace"] });
+				qc.removeQueries({ predicate: (q) => GIT_FACT_QUERIES.includes(String(q.queryKey[0])) });
+			},
+		);
+		entry = { count: 0, handle };
+		gitAccessSubscriptions.set(qc, entry);
+	}
+	entry.count++;
+	return () => {
+		if (--entry.count === 0) {
+			narratorWSManager.removeListener(entry.handle);
+			gitAccessSubscriptions.delete(qc);
+		}
+	};
+}
+
+async function readWorkspace<T>(
+	qc: QueryClient,
+	target: GitTarget | null | undefined,
+	read: () => Promise<T>,
+): Promise<T> {
+	try {
+		return await read();
+	} catch (error) {
+		if (
+			target &&
+			typeof target !== "string" &&
+			[401, 403, 409, 503].includes((error as ApiError)?.status)
+		) {
+			qc.resetQueries({ queryKey: ["gitWorkspace", target.narratorId] });
+		}
+		throw error;
+	}
+}
+
+/** The execution-context revision is a cache key, not a client-supplied path. */
+export function useGitWorkspace(narratorId: string | null | undefined, revision?: unknown) {
+	const qc = useQueryClient();
+	const { data: narrator } = useNarrator(narratorId ?? "");
+	useEffect(() => (narratorId ? subscribeGitAccess(qc) : undefined), [qc, narratorId]);
+	const context = revision ?? [
+		narrator?.cwd,
+		narrator?.chapterId,
+		narrator?.contextProjectId,
+		narrator?.defaultDeviceId,
+	];
+	const query = useQuery({
+		queryKey: ["gitWorkspace", narratorId, context],
+		queryFn: ({ signal }) => api.getGitWorkspace(narratorId as string, signal),
+		enabled: !!narratorId,
+		retry: false,
+		staleTime: 5_000,
+		refetchInterval: 30_000,
+		gcTime: GIT_QUERY_GC_TIME_MS,
+	});
+	// Do not leave private facts visible after an authorization/capability failure.
+	useEffect(() => {
+		if (!query.isError && query.data?.capabilities.read !== false) return;
+		qc.removeQueries({ predicate: (q) => GIT_FACT_QUERIES.includes(String(q.queryKey[0])) });
+	}, [qc, query.isError, query.data?.capabilities.read]);
+	return query;
+}
+
 export function invalidateWorkspaceQueries(
 	qc: ReturnType<typeof useQueryClient>,
-	chapterId: string,
+	target: GitTarget,
 ): void {
-	qc.invalidateQueries({ queryKey: ["gitStatus", chapterId] });
-	qc.invalidateQueries({ queryKey: gitAttributionKey(chapterId) });
+	const keys = new Set([gitTargetKey(target)]);
+	const workspaces = qc
+		.getQueriesData<GitWorkspace>({ queryKey: ["gitWorkspace"] })
+		.map(([, workspace]) => workspace);
+	const chapterId = typeof target === "string" ? target : target.chapterId;
+	const repositoryKey =
+		typeof target === "string"
+			? workspaces.find((workspace) => workspace?.chapterId === target)?.repositoryKey
+			: target.repositoryKey;
+	if (chapterId) {
+		keys.add(chapterId);
+		qc.invalidateQueries({ queryKey: ["chapterGitStatus", chapterId] });
+	}
+	for (const workspace of workspaces) {
+		if (
+			workspace?.workspaceKey &&
+			((repositoryKey && workspace.repositoryKey === repositoryKey) ||
+				(chapterId && workspace.chapterId === chapterId))
+		) {
+			keys.add(workspace.workspaceKey);
+			if (workspace.chapterId) keys.add(workspace.chapterId);
+		}
+	}
+	for (const key of keys) {
+		for (const prefix of GIT_FACT_QUERIES) qc.invalidateQueries({ queryKey: [prefix, key] });
+	}
+	// Re-probe after success AND failure: remote writes may have completed before disconnecting.
+	if (typeof target !== "string")
+		qc.invalidateQueries({ queryKey: ["gitWorkspace", target.narratorId] });
 }
 
-export function useGitStatus(chapterId: string | undefined | null) {
+export function useGitStatus(target: GitTarget | undefined | null) {
+	const qc = useQueryClient();
 	return useQuery<GitStatusSummary>({
-		queryKey: ["gitStatus", chapterId],
-		queryFn: () => api.getGitStatus(chapterId as string),
-		enabled: !!chapterId,
+		queryKey: ["gitStatus", gitTargetKey(target)],
+		queryFn: ({ signal }) =>
+			readWorkspace(qc, target, () => api.getGitStatus(target as GitTarget, signal)),
+		enabled: !!target,
+		retry: false,
 		refetchInterval: 30_000,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
 
-/**
- * Recent historical observations for paths in the current diff. The per-file last-commit
- * timestamp is only a filter hint: without a verified baseline epoch/fingerprint it
- * cannot establish which actor's changes still survive in HEAD/index/worktree.
- */
-export function useGitModifications(chapterId: string | undefined | null) {
+export function useGitModifications(target: GitTarget | undefined | null) {
+	const qc = useQueryClient();
 	return useQuery<WorkspaceModificationView>({
-		queryKey: ["gitModifications", chapterId, "uncommitted"],
-		queryFn: () =>
-			api.getGitModifications(chapterId as string, {
-				scope: "uncommitted",
-				// The badge reads `byFile` only. The event-by-event `timeline` is the larger half
-				// of this response and nothing renders it, so it is not asked for.
-				projection: "byFile",
-			}) as Promise<WorkspaceModificationView>,
-		enabled: !!chapterId,
+		queryKey: ["gitModifications", gitTargetKey(target), "uncommitted"],
+		queryFn: ({ signal }) =>
+			readWorkspace(
+				qc,
+				target,
+				() =>
+					api.getGitModifications(
+						target as GitTarget,
+						{
+							scope: "uncommitted",
+							projection: "byFile",
+						},
+						signal,
+					) as Promise<WorkspaceModificationView>,
+			),
+		enabled: !!target,
+		retry: false,
 		refetchInterval: 30_000,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
 
-export function useGitLog(chapterId: string | undefined | null, limit = 50, skip = 0) {
+export function useGitLog(target: GitTarget | undefined | null, limit = 50, skip = 0) {
+	const qc = useQueryClient();
 	return useQuery<GitLogEntry[]>({
-		queryKey: ["gitLog", chapterId, limit, skip],
-		queryFn: () => api.getGitLog(chapterId as string, limit, skip),
-		enabled: !!chapterId,
+		queryKey: ["gitLog", gitTargetKey(target), limit, skip],
+		queryFn: ({ signal }) =>
+			readWorkspace(qc, target, () => api.getGitLog(target as GitTarget, limit, skip, signal)),
+		enabled: !!target,
+		retry: false,
+		refetchInterval: 30_000,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
 
-export function useGitStashList(chapterId: string | undefined | null) {
+export function useGitStashList(target: GitTarget | undefined | null) {
+	const qc = useQueryClient();
 	return useQuery<GitStashEntry[]>({
-		queryKey: ["gitStashList", chapterId],
-		queryFn: () => api.getGitStashList(chapterId as string),
-		enabled: !!chapterId,
+		queryKey: ["gitStashList", gitTargetKey(target)],
+		queryFn: ({ signal }) =>
+			readWorkspace(qc, target, () => api.getGitStashList(target as GitTarget, signal)),
+		enabled: !!target,
+		retry: false,
+		refetchInterval: 30_000,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
 
 export function useGitDiff(
-	chapterId: string | undefined | null,
+	target: GitTarget | undefined | null,
 	file: string | null,
 	staged = false,
 ) {
+	const qc = useQueryClient();
 	return useQuery({
-		queryKey: ["gitDiff", chapterId, file, staged],
-		queryFn: () => api.getGitDiff(chapterId as string, file as string, staged),
-		enabled: !!chapterId && !!file,
+		queryKey: ["gitDiff", gitTargetKey(target), file, staged],
+		queryFn: ({ signal }) =>
+			readWorkspace(qc, target, () =>
+				api.getGitDiff(target as GitTarget, file as string, staged, signal),
+			),
+		enabled: !!target && !!file,
+		retry: false,
+		refetchInterval: 30_000,
 		gcTime: 30_000,
 	});
 }
 
-// Mutations
-
-export function useGitStage(chapterId: string) {
+function useGitMutation<T, R>(target: GitTarget, run: (value: T) => Promise<R>, graph = false) {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: (body: { files?: string[]; all?: boolean }) => api.gitStage(chapterId, body),
-		onSuccess: () => {
-			invalidateWorkspaceQueries(qc, chapterId);
+		mutationFn: run,
+		retry: false,
+		onSettled: () => {
+			invalidateWorkspaceQueries(qc, target);
+			if (graph) qc.invalidateQueries({ queryKey: ["narraFlow"] });
 		},
 	});
 }
 
-export function useGitUnstage(chapterId: string) {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: (body: { files?: string[]; all?: boolean }) => api.gitUnstage(chapterId, body),
-		onSuccess: () => {
-			invalidateWorkspaceQueries(qc, chapterId);
-		},
-	});
+export function useGitStage(target: GitTarget) {
+	return useGitMutation(target, (body: { files?: string[]; all?: boolean }) =>
+		api.gitStage(target, body),
+	);
 }
-
-export function useGitCommit(chapterId: string) {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: (message: string) => api.gitCommit(chapterId, message),
-		onSuccess: () => {
-			invalidateWorkspaceQueries(qc, chapterId);
-			qc.invalidateQueries({ queryKey: ["gitLog", chapterId] });
-			qc.invalidateQueries({ queryKey: ["gitStashList", chapterId] });
-			qc.invalidateQueries({ queryKey: ["narraFlow"] });
-		},
-	});
+export function useGitUnstage(target: GitTarget) {
+	return useGitMutation(target, (body: { files?: string[]; all?: boolean }) =>
+		api.gitUnstage(target, body),
+	);
 }
-
-export function useGitDiscard(chapterId: string) {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: (body: { files?: string[]; all?: boolean }) => api.gitDiscard(chapterId, body),
-		onSuccess: () => {
-			invalidateWorkspaceQueries(qc, chapterId);
-		},
-	});
+export function useGitCommit(target: GitTarget) {
+	return useGitMutation(target, (message: string) => api.gitCommit(target, message), true);
 }
-
-export function useGitStash(chapterId: string) {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: (body: { action: string; message?: string; index?: number }) =>
-			api.gitStash(chapterId, body),
-		onSuccess: () => {
-			invalidateWorkspaceQueries(qc, chapterId);
-			qc.invalidateQueries({ queryKey: ["gitStashList", chapterId] });
-		},
-	});
+export function useGitDiscard(target: GitTarget) {
+	return useGitMutation(target, (body: { files?: string[]; all?: boolean }) =>
+		api.gitDiscard(target, body),
+	);
 }
-
-export function useGitReset(chapterId: string) {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: (params: { target: string; mode: "soft" | "hard" }) =>
-			api.gitReset(chapterId, params.target, params.mode),
-		onSuccess: () => {
-			invalidateWorkspaceQueries(qc, chapterId);
-			qc.invalidateQueries({ queryKey: ["gitLog", chapterId] });
-			qc.invalidateQueries({ queryKey: ["narraFlow"] });
-		},
-	});
+export function useGitStash(target: GitTarget) {
+	return useGitMutation(target, (body: { action: string; message?: string; index?: number }) =>
+		api.gitStash(target, body),
+	);
 }
-
-export function useGitAiCommitMessage(chapterId: string) {
-	return useMutation({
-		mutationFn: () => api.gitAiCommitMessage(chapterId),
-	});
+export function useGitReset(target: GitTarget) {
+	return useGitMutation(
+		target,
+		(params: { target: string; mode: "soft" | "hard" }) =>
+			api.gitReset(target, params.target, params.mode),
+		true,
+	);
+}
+export function useGitAiCommitMessage(target: GitTarget) {
+	return useGitMutation<void, { message: string }>(target, () => api.gitAiCommitMessage(target));
 }

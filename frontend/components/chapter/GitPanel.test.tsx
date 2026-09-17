@@ -1,13 +1,15 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
-import type { GitStatusSummary } from "../../hooks/useGit";
+import { type GitStatusSummary, invalidateWorkspaceQueries } from "../../hooks/useGit";
 import { __resetGitFolderPrefsCache } from "../../hooks/useGitFolderPrefs";
 import { api } from "../../lib/api";
+import { type GitTarget, type GitWorkspace, gitTargetKey } from "../../lib/api/git";
+import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
@@ -761,6 +763,273 @@ describe("GitPanel", () => {
 		expect(container.querySelector("input")?.value).toBe("fix: update file");
 
 		queryClient.clear();
+	});
+
+	function readyWorkspace(overrides: Partial<GitWorkspace> = {}): GitWorkspace {
+		return {
+			workspaceKey: "local:/repo",
+			repositoryKey: "local:/repo/.git",
+			deviceId: "local",
+			cwd: "/repo/sub",
+			rootPath: "/repo",
+			state: "ready",
+			capabilities: { read: true, write: true },
+			...overrides,
+		};
+	}
+
+	async function renderNarratorWorkspace(initial: GitWorkspace) {
+		let workspace = initial;
+		const calls: Array<{ name: string; target?: GitTarget }> = [];
+		const original = {
+			getGitWorkspace: api.getGitWorkspace,
+			getGitStatus: api.getGitStatus,
+			getGitModifications: api.getGitModifications,
+			getGitDiff: api.getGitDiff,
+			gitStage: api.gitStage,
+			gitDiscard: api.gitDiscard,
+			gitAiCommitMessage: api.gitAiCommitMessage,
+			getGitLog: api.getGitLog,
+			getGitStashList: api.getGitStashList,
+		};
+		api.getGitWorkspace = async () => workspace;
+		api.getGitStatus = async () => makeStatus();
+		api.getGitModifications = async () => ({ byFile: [], actors: [], hasMore: false });
+		api.getGitDiff = async () => ({ diff: "", truncated: false });
+		api.gitStage = async (target) => {
+			calls.push({ name: "stage", target });
+			return makeStatus();
+		};
+		api.gitDiscard = async (target) => {
+			calls.push({ name: "discard", target });
+			return makeStatus();
+		};
+		api.gitAiCommitMessage = async (target) => {
+			calls.push({ name: "ai", target });
+			return { message: "old workspace draft" };
+		};
+		api.getGitLog = async () => [];
+		api.getGitStashList = async () => [];
+		restoreGitApi = () => Object.assign(api, original);
+		const queryClient = new QueryClient({
+			defaultOptions: {
+				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
+				mutations: { retry: false },
+			},
+		});
+		const narratorId = "standalone-workspace";
+		queryClient.setQueryData(["narrators", narratorId], {
+			id: narratorId,
+			cwd: "/repo/sub",
+			chapterId: null,
+			contextProjectId: "project-context",
+		});
+		const workspaceQueryKey = [
+			"gitWorkspace",
+			narratorId,
+			["/repo/sub", null, "project-context", undefined],
+		];
+		queryClient.setQueryData(workspaceQueryKey, workspace);
+		if (workspace.workspaceKey)
+			queryClient.setQueryData(["gitStatus", workspace.workspaceKey], makeStatus());
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+		root.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider>
+					<QueryClientProvider client={queryClient}>
+						<ConfirmDialogProvider>
+							<GitPanel narratorId={narratorId} />
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+		await flushRender();
+		await flushRender();
+		return {
+			container,
+			queryClient,
+			calls,
+			update(next: GitWorkspace) {
+				workspace = next;
+				if (next.workspaceKey)
+					queryClient.setQueryData(["gitStatus", next.workspaceKey], makeStatus());
+				queryClient.setQueryData(workspaceQueryKey, next);
+			},
+		};
+	}
+
+	test("standalone narrator with context project exposes the full workspace panel", async () => {
+		const { container, queryClient, calls } = await renderNarratorWorkspace(readyWorkspace());
+		expect(container.textContent).toContain("Git root: /repo");
+		expect(container.textContent).toContain("Working directory: /repo/sub");
+		expect(container.textContent).toContain("entire shared working tree");
+		buttonByText(container, "Stage All").click();
+		await flushRender();
+		expect(calls[0]?.target).toMatchObject({
+			narratorId: "standalone-workspace",
+			workspaceKey: "local:/repo",
+		});
+		expect(container.textContent).toContain("Commits");
+		expect(container.textContent).toContain("Stash");
+		queryClient.clear();
+	});
+
+	for (const state of [
+		"not_git",
+		"missing_directory",
+		"git_unavailable",
+		"access_denied",
+		"device_offline",
+		"unsupported",
+	] as const) {
+		test(`unavailable ${state} explains failure rather than showing a clean tree`, async () => {
+			const { container, queryClient } = await renderNarratorWorkspace(
+				readyWorkspace({
+					state,
+					workspaceKey: null,
+					rootPath: null,
+					capabilities: { read: false, write: false },
+				}),
+			);
+			expect(container.textContent).toContain(i18n.t(`git:workspace.${state}`));
+			expect(container.textContent).not.toContain("Working tree clean");
+			expect(buttonByText(container, "Refresh")).toBeTruthy();
+			queryClient.clear();
+		});
+	}
+
+	test("read-only workspace keeps status and diff but disables write actions", async () => {
+		const { container, queryClient, calls } = await renderNarratorWorkspace(
+			readyWorkspace({ capabilities: { read: true, write: false } }),
+		);
+		expect(container.textContent).toContain("Read-only workspace");
+		for (const label of ["Stage All", "Unstage All", "Discard All"])
+			expect(buttonByText(container, label).hasAttribute("disabled")).toBe(true);
+		expect(
+			Array.from(container.querySelectorAll("button"))
+				.find((button) => button.textContent === "Commit")
+				?.hasAttribute("disabled"),
+		).toBe(true);
+		expect(buttonByLabel(container, "AI Generate").hasAttribute("disabled")).toBe(true);
+		expect(calls).toEqual([]);
+		queryClient.clear();
+	});
+
+	test("workspace switch closes old confirmations and clears unfinished input", async () => {
+		const { container, queryClient, calls, update } = await renderNarratorWorkspace(
+			readyWorkspace(),
+		);
+		buttonByLabel(container, "AI Generate").click();
+		await flushRender();
+		await flushRender();
+		expect(container.querySelector("input")?.value).toBe("old workspace draft");
+		buttonByText(container, "Discard All").click();
+		await flushRender();
+		await flushRender();
+		await flushRender();
+		expect(document.body.textContent).toContain("permanently discard");
+		update(readyWorkspace({ workspaceKey: "remote:/repo", deviceId: "remote", rootPath: "/repo" }));
+		await flushRender();
+		await flushRender();
+		expect(container.querySelector("input")?.value).toBe("");
+		expect(document.body.textContent).not.toContain("permanently discard");
+		expect(calls.filter((call) => call.name === "discard")).toHaveLength(0);
+		queryClient.clear();
+	});
+
+	test("permission revocation drops private facts and unmount releases its listener", async () => {
+		const add = spyOn(narratorWSManager, "addListener");
+		const remove = spyOn(narratorWSManager, "removeListener");
+		try {
+			const { container, queryClient } = await renderNarratorWorkspace(readyWorkspace());
+			const subscription = add.mock.calls.find(([options]) =>
+				options.types?.includes("narrator_access_changed"),
+			);
+			expect(subscription).toBeDefined();
+			api.getGitWorkspace = async () =>
+				readyWorkspace({ state: "access_denied", capabilities: { read: false, write: false } });
+			subscription?.[1]({ type: "narrator_access_changed", narratorId: "standalone-workspace" });
+			await flushRender();
+			await flushRender();
+			await flushRender();
+			expect(container.textContent).toContain("do not have access");
+			expect(queryClient.getQueryData(["gitStatus", "local:/repo"])).toBeUndefined();
+			root?.unmount();
+			root = undefined;
+			expect(remove).toHaveBeenCalled();
+			queryClient.clear();
+		} finally {
+			add.mockRestore();
+			remove.mockRestore();
+		}
+	});
+
+	test("migrates chapter view preferences only when the server confirms the same worktree", async () => {
+		sessionStorage.setItem(
+			"narrafork_git_expanded_folders",
+			JSON.stringify({ legacy: { staged: ["src"], unstaged: ["src"] } }),
+		);
+		sessionStorage.setItem("narrafork_git_status_filter", JSON.stringify({ legacy: ["M"] }));
+		const { container, queryClient, update } = await renderNarratorWorkspace(
+			readyWorkspace({ chapterId: "legacy" }),
+		);
+		await flushRender();
+		expect(
+			JSON.parse(sessionStorage.getItem("narrafork_git_expanded_folders") ?? "{}")["local:/repo"]
+				.staged,
+		).toEqual(["src"]);
+		expect(JSON.parse(sessionStorage.getItem("narrafork_git_status_filter") ?? "{}")).toEqual({
+			"local:/repo": ["M"],
+		});
+		buttonByLabel(container, "Clear filter").click();
+		await flushRender();
+		update(readyWorkspace({ chapterId: "legacy", capabilities: { read: true, write: false } }));
+		await flushRender();
+		await flushRender();
+		expect(JSON.parse(sessionStorage.getItem("narrafork_git_status_filter") ?? "{}")).toEqual({});
+		queryClient.clear();
+	});
+
+	test("an explicit cwd in another repository does not import the old chapter preferences", async () => {
+		sessionStorage.setItem("narrafork_git_status_filter", JSON.stringify({ legacy: ["D"] }));
+		const { container, queryClient } = await renderNarratorWorkspace(readyWorkspace());
+		expect(container.textContent).not.toContain("No files match");
+		expect(JSON.parse(sessionStorage.getItem("narrafork_git_status_filter") ?? "{}")).toEqual({
+			legacy: ["D"],
+		});
+		queryClient.clear();
+	});
+
+	test("workspace cache shares roots, isolates devices, and refreshes repository peers", () => {
+		const qc = new QueryClient();
+		const target = {
+			narratorId: "n1",
+			workspaceKey: "local:/repo",
+			repositoryKey: "common",
+			canWrite: true,
+		};
+		expect(gitTargetKey({ ...target, narratorId: "n2" })).toBe(gitTargetKey(target));
+		expect(gitTargetKey({ ...target, workspaceKey: "remote:/repo" })).not.toBe(
+			gitTargetKey(target),
+		);
+		qc.setQueryData(
+			["gitWorkspace", "n2"],
+			readyWorkspace({ workspaceKey: "local:/worktree", repositoryKey: "common" }),
+		);
+		for (const key of ["local:/repo", "local:/worktree", "remote:/repo"]) {
+			for (const prefix of ["gitStatus", "gitModifications", "gitDiff", "gitLog", "gitStashList"])
+				qc.setQueryData([prefix, key], { data: true });
+		}
+		invalidateWorkspaceQueries(qc, target);
+		for (const prefix of ["gitStatus", "gitModifications", "gitDiff", "gitLog", "gitStashList"]) {
+			expect(qc.getQueryState([prefix, "local:/repo"])?.isInvalidated).toBe(true);
+			expect(qc.getQueryState([prefix, "local:/worktree"])?.isInvalidated).toBe(true);
+			expect(qc.getQueryState([prefix, "remote:/repo"])?.isInvalidated).toBe(false);
+		}
+		qc.clear();
 	});
 
 	const LONG_BRANCH = "chapter/very-long-branch-name-Bo_bRv";

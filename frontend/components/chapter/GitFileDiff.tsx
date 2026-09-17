@@ -4,20 +4,27 @@ import { Loader, Modal, Text } from "@mantine/core";
 import { parseUnifiedDiff } from "@shared/pretext-layout/parse-unified-diff";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useGitDiff } from "../../hooks/useGit";
+import { type GitTarget, useGitDiff } from "../../hooks/useGit";
 
 const DIFF_SEGMENT_ROWS = 500;
 
 interface GitFileDiffProps {
-	chapterId: string;
+	chapterId?: string;
+	target?: GitTarget;
 	file: string | null;
 	staged?: boolean;
 	onClose: () => void;
 }
 
-export function GitFileDiff({ chapterId, file, staged = false, onClose }: GitFileDiffProps) {
+export function GitFileDiff({
+	chapterId,
+	target = chapterId,
+	file,
+	staged = false,
+	onClose,
+}: GitFileDiffProps) {
 	const { t } = useTranslation("git");
-	const { data, dataUpdatedAt, isLoading } = useGitDiff(chapterId, file, staged);
+	const { data, dataUpdatedAt, isLoading, error } = useGitDiff(target, file, staged);
 
 	// Git already computed this diff, so the rows are parsed from the patch rather
 	// than recomputed from two texts. That keeps the real file line numbers the
@@ -68,7 +75,12 @@ export function GitFileDiff({ chapterId, file, staged = false, onClose }: GitFil
 		<Modal opened={!!file} onClose={onClose} title={file ? t("diffTitle", { file }) : ""} size="xl">
 			{isLoading && <Loader size="sm" />}
 
-			{!isLoading && !data?.diff && (
+			{error && (
+				<Text c="red" size="sm">
+					{error.message}
+				</Text>
+			)}
+			{!error && !isLoading && !data?.diff && (
 				<Text size="sm" c="dimmed">
 					{t("noDiff")}
 				</Text>

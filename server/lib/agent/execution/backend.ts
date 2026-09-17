@@ -17,6 +17,7 @@
  * tools used before, so behaviour on the local machine is unchanged.
  */
 
+import type { GitWorkspaceRequest, GitWorkspaceResult } from "./git-workspace-rpc";
 import type { PathFlavor, TargetPathSemantics } from "./path-semantics";
 
 export type { PathFlavor, TargetPathSemantics } from "./path-semantics";
@@ -284,6 +285,9 @@ export interface GitDiffParams {
  * `RemoteBackend` forwards each call to a remote executor via RPC.
  */
 export interface ExecutionBackend {
+	/** Feature-negotiated structured remote Git; absent on local/legacy backends. */
+	readonly supportsGitWorkspace?: boolean;
+	gitWorkspace?(request: GitWorkspaceRequest, signal?: AbortSignal): Promise<GitWorkspaceResult>;
 	readonly deviceId: string;
 	readonly kind: "local" | "remote";
 	/** Pure lexical path operations for this target. */

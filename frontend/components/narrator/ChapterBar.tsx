@@ -1,6 +1,7 @@
 import { useChapterGitStatus } from "@frontend/hooks/useChapterGitStatus";
 import { useChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
 import { useContainers } from "@frontend/hooks/useContainers";
+import { gitWorkspaceTarget, useGitStatus, useGitWorkspace } from "@frontend/hooks/useGit";
 import { useChapterContainersCapability } from "@frontend/hooks/usePlatform";
 import { type ApiError, api } from "@frontend/lib/api";
 import { CHAPTER_ROLE_ICONS, statusRegistry } from "@frontend/lib/constants";
@@ -51,8 +52,59 @@ const PodmanInstallModal = lazy(() =>
 	})),
 );
 
+/** Always reachable, including unavailable targets, so discovery failures can be retried. */
+export function NarratorGitBar({
+	narratorId,
+	onOpenGitPanel,
+}: {
+	narratorId: string;
+	onOpenGitPanel: () => void;
+}) {
+	const { t } = useTranslation("git");
+	const workspace = useGitWorkspace(narratorId);
+	const target = !workspace.isError ? gitWorkspaceTarget(narratorId, workspace.data) : null;
+	const status = useGitStatus(target);
+	return (
+		<Group px="md" py={4} gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
+			<Text
+				size="xs"
+				role="button"
+				tabIndex={0}
+				style={{ cursor: "pointer", userSelect: "text" }}
+				onClick={() => {
+					if (!isTextSelectionGesture(window.getSelection())) onOpenGitPanel();
+				}}
+				onKeyDown={(event) => {
+					if (isActivationKey(event.key)) {
+						event.preventDefault();
+						onOpenGitPanel();
+					}
+				}}
+			>
+				{t("panel.title")} ·{" "}
+				{target
+					? status.data?.branch || t("workspace.ready")
+					: t(
+							`workspace.${workspace.isPending ? "loading" : workspace.isError ? "error" : (workspace.data?.state ?? "error")}`,
+						)}
+			</Text>
+			{status.data && (
+				<Badge size="xs" variant="light">
+					{status.data.staged + status.data.unstaged + status.data.untracked}
+				</Badge>
+			)}
+			{target && !workspace.data?.capabilities.write && (
+				<Text size="xs" c="dimmed">
+					{t("workspace.readOnly")}
+				</Text>
+			)}
+		</Group>
+	);
+}
+
 interface ChapterBarProps {
 	chapterId: string;
+	narratorId?: string;
 	/**
 	 * Open the Git view for this chapter. NarratorPanel routes the gesture: dock
 	 * panel when a dock surface exists, the mobile Drawer host otherwise. The raw
@@ -62,13 +114,24 @@ interface ChapterBarProps {
 	onOpenGitPanel?: () => void;
 }
 
-export function ChapterBar({ chapterId, onOpenGitPanel }: ChapterBarProps) {
+export function ChapterBar({ chapterId, narratorId, onOpenGitPanel }: ChapterBarProps) {
 	const { t } = useTranslation("chapters");
 	const { t: tn } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const navigate = useNavigate();
 	const { data: chapter } = useChapter(chapterId);
-	const { data: gitStatus } = useChapterGitStatus(chapterId);
+	const workspaceQuery = useGitWorkspace(narratorId);
+	const { data: workspaceStatus } = useGitStatus(
+		narratorId && !workspaceQuery.isError
+			? gitWorkspaceTarget(narratorId, workspaceQuery.data)
+			: null,
+	);
+	const { data: chapterStatus } = useChapterGitStatus(narratorId ? null : chapterId);
+	const gitStatus = narratorId
+		? workspaceStatus
+			? { ...workspaceStatus, commitsAhead: 0, baseBranch: "" }
+			: undefined
+		: chapterStatus;
 	// Git lives in the dockview surface (right side), not in a collapse below this
 	// bar. The prop wins because the caller knows the mobile Drawer host; the raw
 	// dock context is only a fallback for surfaces that render the bar standalone.
@@ -175,7 +238,7 @@ export function ChapterBar({ chapterId, onOpenGitPanel }: ChapterBarProps) {
 						·
 					</Text>
 					<Text size="xs" c="dimmed" ff="monospace" truncate>
-						{chapter.branch}
+						{narratorId ? workspaceStatus?.branch || "Git" : chapter.branch}
 					</Text>
 					{gitStatus &&
 						(gitStatus.commitsAhead > 0 ||

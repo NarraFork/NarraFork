@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import {
 	clearStatusFilter,
 	GIT_STATUS_FILTER_KEY,
@@ -104,12 +104,23 @@ if (import.meta.hot) {
  * An empty set means UNFILTERED, not "hide everything": a mis-click must never
  * leave the panel looking empty and broken.
  */
-export function useGitStatusFilter(chapterId: string): {
+export function useGitStatusFilter(
+	chapterId: string,
+	legacyChapterId?: string | null,
+): {
 	selected: Set<GitStatusFilterChar>;
 	toggle: (char: GitStatusFilterChar) => void;
 	clear: () => void;
 } {
 	const prefs = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+	useEffect(() => {
+		if (!legacyChapterId || legacyChapterId === chapterId) return;
+		const previous = getSnapshot();
+		if (!Object.hasOwn(previous, legacyChapterId)) return;
+		// Move once, rather than copy: clearing the new filter must not re-import the old one.
+		const { [legacyChapterId]: legacy, ...rest } = previous;
+		persist(Object.hasOwn(rest, chapterId) ? rest : { ...rest, [chapterId]: legacy });
+	}, [chapterId, legacyChapterId]);
 	const selected = useMemo(() => readStatusFilter(prefs, chapterId), [prefs, chapterId]);
 	const toggle = useCallback(
 		(char: GitStatusFilterChar) => {
