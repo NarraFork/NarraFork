@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import {
 	GIT_FOLDER_PREFS_KEY,
 	type GitFolderSection,
@@ -93,8 +93,22 @@ export function __resetGitFolderPrefsCache() {
 export function useGitFolderPrefs(
 	chapterId: string,
 	section: GitFolderSection,
+	legacyChapterId?: string | null,
 ): { expanded: Set<string>; toggle: (path: string) => void } {
 	const prefs = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+	useEffect(() => {
+		if (!legacyChapterId || legacyChapterId === chapterId) return;
+		const previous = getSnapshot();
+		if (!Object.hasOwn(previous, legacyChapterId)) return;
+		const { [legacyChapterId]: legacy, ...rest } = previous;
+		const next = Object.hasOwn(rest, chapterId) ? rest : { ...rest, [chapterId]: legacy };
+		try {
+			sessionStorage.setItem(GIT_FOLDER_PREFS_KEY, JSON.stringify(next));
+		} catch {
+			return;
+		}
+		notify();
+	}, [chapterId, legacyChapterId]);
 	const expanded = useMemo(
 		() => readExpanded(prefs, chapterId, section),
 		[prefs, chapterId, section],

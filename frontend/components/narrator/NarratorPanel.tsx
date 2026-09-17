@@ -120,6 +120,7 @@ import {
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
+import { useGitWorkspace } from "../../hooks/useGit";
 import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
@@ -222,7 +223,7 @@ import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
 import { UserAvatar } from "../UserAvatar";
 import { toBannerQuestions } from "./async-question-questions";
 import { BackgroundTasksDrawerHost, useBackgroundTasksButton } from "./BackgroundTasksDrawer";
-import { ChapterBar } from "./ChapterBar";
+import { ChapterBar, NarratorGitBar } from "./ChapterBar";
 import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
 import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
 import {
@@ -1777,6 +1778,7 @@ export function NarratorPanel({
 	const takeoverMutation = useTakeoverSubagent();
 	const stopTakeoverMutation = useStopTakeoverSubagent();
 	const isWorkspacePreview = workspacePreview === true;
+	const gitWorkspaceQuery = useGitWorkspace(isWorkspacePreview ? null : narratorId);
 	// Chunk mode is the only live message-list implementation. Workspace
 	// previews use a separate lightweight tail-chunk query below.
 	const [chunkTailMeta, setMessageListTailMeta] = useState<MessageListTailMeta>({
@@ -1936,7 +1938,8 @@ export function NarratorPanel({
 		mutationFn: (deviceId: string | null) => api.updateNarratorDefaultDevice(narratorId, deviceId),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narratorExecutionDevices", narratorId] });
-			qc.invalidateQueries({ queryKey: ["narrator", narratorId] });
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+			qc.resetQueries({ queryKey: ["gitWorkspace", narratorId] });
 		},
 		onError: (error) =>
 			notifications.show({
@@ -6169,7 +6172,7 @@ export function NarratorPanel({
 	 * Which entries this narrator can actually offer right now, beyond what the
 	 * host supports. Distinct from `hosts` in the registry: that answers "can this
 	 * surface present the panel at all", this answers "does this narrator have the
-	 * thing" (a chapter for git, spec support, a terminal route, remote devices).
+	 * thing" (a resolved Git workspace, spec support, a terminal route, remote devices).
 	 */
 	const toolbarEntryEnabled = useCallback(
 		(id: NarratorToolbarId): boolean => {
@@ -6183,8 +6186,11 @@ export function NarratorPanel({
 					// this hook does not depend on a value defined after the early return.
 					return terminalToolAvailable || !!onOpenTerminalPanel;
 				case "git":
-					// The git panel needs a chapter; a standalone narrator has none.
-					return !!chapterId;
+					return (
+						!gitWorkspaceQuery.isError &&
+						gitWorkspaceQuery.data?.state === "ready" &&
+						gitWorkspaceQuery.data.capabilities.read
+					);
 				case "browser":
 					return browserSessionsCapability.supported !== false;
 				case "device":
@@ -6203,7 +6209,8 @@ export function NarratorPanel({
 			specToolAvailable,
 			terminalToolAvailable,
 			onOpenTerminalPanel,
-			chapterId,
+			gitWorkspaceQuery.data,
+			gitWorkspaceQuery.isError,
 			browserSessionsCapability.supported,
 			executionDevicesQuery.data?.devices.length,
 			dock,
@@ -7931,6 +7938,7 @@ export function NarratorPanel({
 					    instead of the dock panel. */}
 					{narrator.chapterId && (
 						<ChapterBar
+							narratorId={narratorId}
 							chapterId={narrator.chapterId}
 							onOpenGitPanel={
 								isWorkspacePreview
@@ -7938,6 +7946,15 @@ export function NarratorPanel({
 									: dock
 										? () => dock.openToolPanel("git")
 										: () => setMobileToolPanel("git")
+							}
+						/>
+					)}
+
+					{!narrator.chapterId && !isWorkspacePreview && (
+						<NarratorGitBar
+							narratorId={narratorId}
+							onOpenGitPanel={
+								dock ? () => dock.openToolPanel("git") : () => setMobileToolPanel("git")
 							}
 						/>
 					)}

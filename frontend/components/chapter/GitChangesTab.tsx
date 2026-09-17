@@ -24,6 +24,7 @@ import {
 	IconMinus,
 	IconPlus,
 	IconSparkles,
+	IconTrash,
 } from "@tabler/icons-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -42,6 +43,7 @@ import {
 } from "../../hooks/useGit";
 import { useGitFolderPrefs } from "../../hooks/useGitFolderPrefs";
 import { useGitStatusFilter } from "../../hooks/useGitStatusFilter";
+import { type GitTarget, gitCanWrite, gitTargetKey } from "../../lib/api/git";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { buildAttributionBadge, buildCurrentAttributionBadge } from "./attribution-label";
 import { GitFileDiff } from "./GitFileDiff";
@@ -86,6 +88,7 @@ interface DisplayFile {
 
 /** Everything a tree row needs that does not change per node. */
 interface TreeContext {
+	canWrite: boolean;
 	keyPrefix: string;
 	action: "stage" | "unstage";
 	/**
@@ -104,6 +107,7 @@ interface TreeContext {
 	onToggle: (path: string) => void;
 	onAction: (files: string[]) => void;
 	onOpenFile: (path: string) => void;
+	onDiscard?: (path: string) => void;
 	attrByPath: Map<string, FileModificationGroup>;
 	currentByPath: Map<string, CurrentDiffFile>;
 	currentDiff?: CurrentDiffView;
@@ -116,28 +120,37 @@ function collectFiles(node: GitFileTreeNode<DisplayFile>): DisplayFile[] {
 	return node.children.flatMap(collectFiles);
 }
 
-export function GitChangesTab({ chapterId }: { chapterId: string }) {
+export function GitChangesTab({
+	chapterId,
+	target = chapterId ?? "",
+}: {
+	chapterId?: string;
+	target?: GitTarget;
+}) {
+	const canWrite = gitCanWrite(target);
+	const preferenceKey = gitTargetKey(target) ?? "";
+	const legacyChapterId = typeof target === "string" ? undefined : target.chapterId;
 	const { t } = useTranslation("git");
 	const confirm = useConfirmDialog();
-	const { data: status, isLoading } = useGitStatus(chapterId);
-	const { data: modifications } = useGitModifications(chapterId);
-	const stage = useGitStage(chapterId);
-	const unstage = useGitUnstage(chapterId);
-	const commit = useGitCommit(chapterId);
-	const discard = useGitDiscard(chapterId);
-	const aiMsg = useGitAiCommitMessage(chapterId);
+	const { data: status, isLoading, error } = useGitStatus(target);
+	const { data: modifications } = useGitModifications(target);
+	const stage = useGitStage(target);
+	const unstage = useGitUnstage(target);
+	const commit = useGitCommit(target);
+	const discard = useGitDiscard(target);
+	const aiMsg = useGitAiCommitMessage(target);
 
 	const [message, setMessage] = useState("");
 	const [diffFile, setDiffFile] = useState<string | null>(null);
 	const [diffStaged, setDiffStaged] = useState(false);
 	// Which status letters the user wants to see. Empty = unfiltered; see
 	// `git-status-filter.ts` for why that is the empty representation.
-	const statusFilter = useGitStatusFilter(chapterId);
+	const statusFilter = useGitStatusFilter(preferenceKey, legacyChapterId);
 	// Folders start COLLAPSED and remember what the user opened across reloads.
-	// Keyed per chapter and per section, because `src/` under Staged and under
+	// Keyed per device/worktree and section, because `src/` under Staged and under
 	// Changes are independent rows.
-	const stagedFolders = useGitFolderPrefs(chapterId, "staged");
-	const unstagedFolders = useGitFolderPrefs(chapterId, "unstaged");
+	const stagedFolders = useGitFolderPrefs(preferenceKey, "staged", legacyChapterId);
+	const unstagedFolders = useGitFolderPrefs(preferenceKey, "unstaged", legacyChapterId);
 
 	// path → historical observations for this path. An absent group proves neither no
 	// writer nor no current changes; the current net diff comes from git status, not
@@ -158,6 +171,13 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	if (isLoading) {
 		return <Loader size="sm" />;
 	}
+
+	if (error)
+		return (
+			<Text c="red" size="sm">
+				{error.message}
+			</Text>
+		);
 
 	if (!status?.hasChanges) {
 		return (
@@ -232,7 +252,7 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	}
 
 	function handleCommit() {
-		if (!message.trim()) return;
+		if (!canWrite || !message.trim()) return;
 		commit.mutate(message.trim(), {
 			onSuccess: () => setMessage(""),
 		});
@@ -260,7 +280,10 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 		const confirmMessage = files
 			? t("filter.discardMatchedConfirm", { count: files.length })
 			: t("discardConfirm");
-		if (!(await confirm({ message: confirmMessage }))) return;
+		if (!canWrite) return;
+		const scope =
+			typeof target === "string" ? "" : `\n${t("workspace.scope", { root: target.rootPath })}`;
+		if (!(await confirm({ message: confirmMessage + scope }))) return;
 		if (files) {
 			if (files.length > 0) discard.mutate({ files });
 			return;
@@ -270,6 +293,16 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 
 	return (
 		<Box style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+			{(stage.error || unstage.error || commit.error || discard.error || aiMsg.error) && (
+				<Text c="red" size="xs">
+					{(stage.error || unstage.error || commit.error || discard.error || aiMsg.error)?.message}
+				</Text>
+			)}
+			{(stage.error || unstage.error || commit.error || discard.error) && (
+				<Text c="dimmed" size="xs">
+					{t("workspace.writeFailureHint")}
+				</Text>
+			)}
 			{/*
 			 * Only the file list scrolls. The commit box lives outside it so it stays
 			 * reachable no matter how many files changed — inside the scroller it sat
@@ -281,6 +314,11 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 			 * list is long, and inside the scroller it would scroll away exactly when
 			 * the user needs it most.
 			 */}
+			{status.truncated && (
+				<Text size="xs" c="yellow">
+					{t("workspace.statusTruncated")}
+				</Text>
+			)}
 			<StatusFilterBar
 				chars={filterChars}
 				counts={badgeCounts}
@@ -361,6 +399,7 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 											? unstage.mutate({ files: matchedStaged.map((f) => f.path) })
 											: unstage.mutate({ all: true })
 									}
+									disabled={!canWrite}
 									loading={unstage.isPending}
 								>
 									{filterActive ? t("filter.unstageMatched") : t("unstageAll")}
@@ -370,6 +409,7 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 								nodes={stagedTree}
 								depth={0}
 								ctx={{
+									canWrite,
 									keyPrefix: "s",
 									action: "unstage",
 									section: "staged",
@@ -414,6 +454,7 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 												? stage.mutate({ files: matchedUnstaged.map((f) => f.path) })
 												: stage.mutate({ all: true })
 										}
+										disabled={!canWrite}
 										loading={stage.isPending}
 									>
 										{filterActive ? t("filter.stageMatched") : t("stageAll")}
@@ -423,6 +464,7 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 										variant="subtle"
 										color="red"
 										onClick={handleDiscardAll}
+										disabled={!canWrite}
 										loading={discard.isPending}
 									>
 										{filterActive ? t("filter.discardMatched") : t("discardAll")}
@@ -433,12 +475,22 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 								nodes={unstagedTree}
 								depth={0}
 								ctx={{
+									canWrite,
 									keyPrefix: "u",
 									action: "stage",
 									section: "unstaged",
 									expandedFolders: unstagedFolders.expanded,
 									onToggle: unstagedFolders.toggle,
 									onAction: (files) => stage.mutate({ files }),
+									onDiscard: async (file) => {
+										if (!canWrite) return;
+										const scope =
+											typeof target === "string"
+												? ""
+												: `\n${t("workspace.scope", { root: target.rootPath })}`;
+										if (await confirm({ message: t("discardFileConfirm", { file }) + scope }))
+											discard.mutate({ files: [file] });
+									},
 									onOpenFile: (path) => {
 										setDiffFile(path);
 										setDiffStaged(false);
@@ -486,6 +538,7 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 						variant="subtle"
 						size="sm"
 						onClick={handleAiGenerate}
+						disabled={!canWrite}
 						loading={aiMsg.isPending}
 					>
 						<IconSparkles size={14} />
@@ -496,14 +549,14 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 					leftSection={<IconCheck size={14} />}
 					onClick={handleCommit}
 					loading={commit.isPending}
-					disabled={!message.trim() || status.staged === 0}
+					disabled={!canWrite || !message.trim() || status.staged === 0}
 				>
 					{t("commitButton")}
 				</Button>
 			</Group>
 
 			<GitFileDiff
-				chapterId={chapterId}
+				target={target}
 				file={diffFile}
 				staged={diffStaged}
 				onClose={() => setDiffFile(null)}
@@ -758,6 +811,7 @@ function DirectoryRow({
 						size="xs"
 						variant="subtle"
 						aria-label={actionLabel}
+						disabled={!ctx.canWrite}
 						onClick={(e) => {
 							e.stopPropagation();
 							ctx.onAction(files.map((f) => f.path));
@@ -838,11 +892,29 @@ function FileRow({
 				/>
 			)}
 			<LineStats added={file.displayLinesAdded} removed={file.displayLinesRemoved} />
+			{ctx.onDiscard && (
+				<Tooltip label={ctx.t("discardFile")}>
+					<ActionIcon
+						size="xs"
+						variant="subtle"
+						color="red"
+						disabled={!ctx.canWrite}
+						aria-label={ctx.t("discardFile")}
+						onClick={(event) => {
+							event.stopPropagation();
+							ctx.onDiscard?.(file.path);
+						}}
+					>
+						<IconTrash size={12} />
+					</ActionIcon>
+				</Tooltip>
+			)}
 			<Tooltip label={actionLabel}>
 				<ActionIcon
 					size="xs"
 					variant="subtle"
 					aria-label={actionLabel}
+					disabled={!ctx.canWrite}
 					onClick={(e) => {
 						e.stopPropagation();
 						ctx.onAction([file.path]);

@@ -32,12 +32,15 @@ export async function trackFileChange(
 	try {
 		if (ctx.parentNarratorId) {
 			const { recordTeamFileChange } = await import("@server/services/narrator-subagent");
+			const remoteCwd = ctx.executionTarget?.cwd ?? backend.defaultCwd;
 			recordTeamFileChange(ctx.parentNarratorId, ctx.narratorId, filePath, {
 				deviceId: backend.deviceId,
 				workspacePath:
 					backend.kind === "local"
 						? ctx.cwd
-						: (ctx.executionTarget?.cwd ?? backend.defaultCwd ?? null),
+						: remoteCwd
+							? backend.paths.identityKey(remoteCwd)
+							: null,
 			});
 		}
 	} catch {
@@ -56,7 +59,7 @@ export async function trackFileChange(
 		const isLocal = backend.kind === "local";
 		const workspacePath = isLocal
 			? ctx.cwd
-			: (ctx.executionTarget?.cwd ?? backend.defaultCwd ?? filePath);
+			: backend.paths.identityKey(ctx.executionTarget?.cwd ?? backend.defaultCwd ?? filePath);
 		const attributedPath = isLocal
 			? toForwardSlash(relative(ctx.cwd, resolve(ctx.cwd, filePath))) || filePath
 			: backend.paths.identityKey(filePath);

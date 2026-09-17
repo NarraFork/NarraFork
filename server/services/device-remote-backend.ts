@@ -23,6 +23,13 @@ import type {
 	ReadBytesResult,
 	WriteBytesOptions,
 } from "../lib/agent/execution/backend";
+import {
+	FEATURE_GIT_WORKSPACE_V1,
+	GIT_WORKSPACE_MAX_BYTES,
+	GIT_WORKSPACE_TIMEOUT_MS,
+	type GitWorkspaceRequest,
+	type GitWorkspaceResult,
+} from "../lib/agent/execution/git-workspace-rpc";
 import { platformPathFlavor, targetPathSemantics } from "../lib/agent/execution/path-semantics";
 import type {
 	ExecStartResult,
@@ -375,6 +382,26 @@ export class RemoteBackend implements ExecutionBackend {
 			timeoutMs,
 			this.maxBytes,
 		);
+	}
+
+	get supportsGitWorkspace(): boolean {
+		return hasDeviceProtocolFeature(this.deviceId, FEATURE_GIT_WORKSPACE_V1);
+	}
+
+	async gitWorkspace(
+		request: GitWorkspaceRequest,
+		signal?: AbortSignal,
+	): Promise<GitWorkspaceResult> {
+		const timeoutMs = request.timeoutMs ?? GIT_WORKSPACE_TIMEOUT_MS;
+		return (await this.rpc(
+			"git.workspace",
+			{
+				...request,
+				timeoutMs,
+				maxBytes: Math.min(request.maxBytes ?? GIT_WORKSPACE_MAX_BYTES, this.maxBytes),
+			},
+			{ signal, timeoutMs: timeoutMs + 5_000, requiredFeatures: [FEATURE_GIT_WORKSPACE_V1] },
+		)) as GitWorkspaceResult;
 	}
 
 	async gitStatus(cwd: string, signal?: AbortSignal): Promise<string> {

@@ -732,9 +732,18 @@ describe("current Git targets matched against actual v2 writes", () => {
 			combined.currentDiff.byFile[0].worktree.effectId,
 		);
 		expect(currentAfterPaging.byFile[0]?.worktree.continuity).toBe("unverified");
-		const cancelled = await app.request(
-			new Request(`${route}?scope=uncommitted`, { signal: AbortSignal.abort() }),
-		);
-		expect((await cancelled.json()).currentDiff.byFile[0].worktree.reason).toBe("cancelled");
+		const snapshot = spyOn(gitCurrentBaselineReader, "snapshot");
+		try {
+			const cancelled = await app.request(
+				new Request(`${route}?scope=uncommitted`, { signal: AbortSignal.abort() }),
+			);
+			const body = await cancelled.json();
+			expect(body.currentDiff).toMatchObject({ baselineStatus: "unavailable", byFile: [] });
+			expect(body.byFile).toEqual([]);
+			expect(body.timeline).toEqual([]);
+			expect(snapshot).not.toHaveBeenCalled();
+		} finally {
+			snapshot.mockRestore();
+		}
 	});
 });

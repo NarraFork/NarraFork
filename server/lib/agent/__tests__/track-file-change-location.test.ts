@@ -14,6 +14,7 @@ describe("trackFileChange team location forwarding", () => {
 			import { mock } from "bun:test";
 			import assert from "node:assert/strict";
 			const membership = {
+				$client: {},
 				select() { return this; }, from() { return this; }, where() { return this; },
 				get() { return { type: "subagent", variant: "subagent:general", parentId: "parent" }; },
 			};
@@ -25,8 +26,8 @@ describe("trackFileChange team location forwarding", () => {
 			mock.module("@server/services/file-attribution-service", () => ({
 				recordAttribution: async (entry) => { attributed.push(entry); },
 			}));
-			const backend = (kind, deviceId, defaultCwd) => ({
-				kind, deviceId, defaultCwd, paths: { identityKey: (path) => path },
+			const backend = (kind, deviceId, defaultCwd, identityKey = (path) => path) => ({
+				kind, deviceId, defaultCwd, paths: { identityKey },
 			});
 			const local = backend("local", "local", "/ignored-local-default");
 			mock.module("@server/lib/agent/execution/local-backend", () => ({ localBackend: local }));
@@ -43,7 +44,12 @@ describe("trackFileChange team location forwarding", () => {
 			const ctx = { narratorId: "child", parentNarratorId: "parent", cwd: "/local-root" };
 			const path = "/same/file.ts";
 			await trackFileChange({ ...ctx, executionTarget: { cwd: "/stale-target" } }, path, "edit", local);
-			await trackFileChange({ ...ctx, executionTarget: { deviceId: "stale", cwd: "/actual" } }, path, "write", backend("remote", "device-a", "/default"));
+			await trackFileChange(
+				{ ...ctx, executionTarget: { deviceId: "stale", cwd: "C:/Repo/Actual" } },
+				path,
+				"write",
+				backend("remote", "device-a", "C:/Repo", (value) => value.toLowerCase()),
+			);
 			await trackFileChange({ ...ctx, executionTarget: { cwd: "/actual" } }, path, "edit", backend("remote", "device-b", "/default"));
 			await trackFileChange(ctx, path, "bash", backend("remote", "device-default", "/default"));
 			await trackFileChange(ctx, path, "edit", backend("remote", "device-unknown", undefined));
@@ -51,7 +57,7 @@ describe("trackFileChange team location forwarding", () => {
 			await trackFileChange({ ...ctx, executionTarget: { cwd: "/other" } }, path, "edit", backend("remote", "device-a", "/default"));
 			const expected = [
 				{ deviceId: "local", workspacePath: "/local-root" },
-				{ deviceId: "device-a", workspacePath: "/actual" },
+				{ deviceId: "device-a", workspacePath: "c:/repo/actual" },
 				{ deviceId: "device-b", workspacePath: "/actual" },
 				{ deviceId: "device-default", workspacePath: "/default" },
 				{ deviceId: "device-unknown", workspacePath: null },

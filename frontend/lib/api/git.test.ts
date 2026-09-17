@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { clearToken, setToken } from "./client";
+import { type GitTarget, gitTargetKey } from "./git";
 import { api } from "./index";
 
 describe("git APIs", () => {
@@ -33,6 +34,90 @@ describe("git APIs", () => {
 		});
 		return store;
 	}
+
+	test("narrator routes preserve all suffixes and pin every write to the observed workspace", async () => {
+		installLocalStorage();
+		setToken("git-token");
+		const calls: Array<{ url: string; body?: string; signal?: AbortSignal | null }> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (input: RequestInfo | URL, init?: RequestInit) => {
+				calls.push({
+					url: String(input),
+					body: typeof init?.body === "string" ? init.body : undefined,
+					signal: init?.signal,
+				});
+				return Response.json({});
+			},
+		});
+		const target: GitTarget = {
+			narratorId: "independent",
+			workspaceKey: "device-a:/repo",
+			repositoryKey: "device-a:/repo/.git",
+			canWrite: true,
+		};
+		const controller = new AbortController();
+		await api.getGitWorkspace("independent", controller.signal);
+		await api.getGitStatus(target, controller.signal);
+		await api.getGitModifications(
+			target,
+			{ scope: "uncommitted", projection: "byFile" },
+			controller.signal,
+		);
+		await api.getGitDiff(target, "sub/file one.ts", true, controller.signal);
+		await api.getGitLog(target, 50, 50, controller.signal);
+		await api.getGitStashList(target, controller.signal);
+		await api.gitStage(target, { all: true });
+		await api.gitUnstage(target, { files: ["file"] });
+		await api.gitCommit(target, "message");
+		await api.gitDiscard(target, { files: ["file"] });
+		await api.gitStash(target, { action: "push" });
+		await api.gitStash(target, { action: "pop", index: 0 });
+		await api.gitStash(target, { action: "drop", index: 0 });
+		await api.gitReset(target, "HEAD", "soft");
+		await api.gitAiCommitMessage(target);
+		expect(calls.every((call) => call.url.startsWith("/api/narrators/independent/git/"))).toBe(
+			true,
+		);
+		controller.abort();
+		expect(calls.slice(0, 6).every((call) => call.signal?.aborted)).toBe(true);
+		expect(
+			calls
+				.slice(1, 6)
+				.every(
+					(call) =>
+						new URL(call.url, "http://localhost").searchParams.get("workspaceKey") ===
+						"device-a:/repo",
+				),
+		).toBe(true);
+		expect(
+			calls
+				.slice(6)
+				.every((call) => JSON.parse(call.body ?? "{}").workspaceKey === "device-a:/repo"),
+		).toBe(true);
+		expect(gitTargetKey({ ...target, narratorId: "another" })).toBe(gitTargetKey(target));
+		expect(gitTargetKey({ ...target, workspaceKey: "device-b:/repo" })).not.toBe(
+			gitTargetKey(target),
+		);
+		expect(() => api.gitStage({ ...target, canWrite: false }, { all: true })).toThrow("read-only");
+		clearToken();
+	});
+
+	test("a stale workspace conflict is surfaced without replaying the write", async () => {
+		installLocalStorage();
+		let calls = 0;
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async () => {
+				calls++;
+				return Response.json({ error: "Workspace changed" }, { status: 409 });
+			},
+		});
+		await expect(
+			api.gitCommit({ narratorId: "n", workspaceKey: "old", canWrite: true }, "message"),
+		).rejects.toMatchObject({ status: 409 });
+		expect(calls).toBe(1);
+	});
 
 	test("routes all git panel API calls without throwing", async () => {
 		installLocalStorage();

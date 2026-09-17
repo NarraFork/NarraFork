@@ -28,6 +28,7 @@ func TestCapabilitiesAdvertiseSafePlanReadFeatures(t *testing.T) {
 		FeatureFsWriteAtomicResolvedPathV1,
 		FeatureGlobBoundedV1,
 		FeatureFsReadBoundedV1,
+		FeatureGitWorkspaceV1,
 	} {
 		if !containsFeature(decoded.Features, feature) {
 			t.Fatalf("updated executor did not advertise %q: %s", feature, encoded)

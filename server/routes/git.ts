@@ -1,6 +1,9 @@
-import { Hono } from "hono";
-import { ValidationError } from "../lib/errors";
+import { type Context, Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
+import { AppError, ValidationError } from "../lib/errors";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
+import { logger } from "../lib/logger";
+import { narratorPrincipalOf, requireNarratorAccess } from "../lib/narrator-access";
 import { requireChapterAccess } from "../lib/project-access";
 import {
 	gitCommitSchema,
@@ -15,181 +18,391 @@ import {
 } from "../lib/validators";
 import { commitSyncService } from "../services/commit-sync-service";
 import { getCommitBoundariesCached } from "../services/git-commit-boundary-cache";
-import { gitService } from "../services/git-service";
-import { getStatusSummaryCached, invalidateStatus } from "../services/git-status-cache";
-import { resolveWorkspaceFromChapter } from "../services/git-workspace";
+import {
+	gitAttributionScopes,
+	gitManagementService,
+	invalidateGitWorkspace,
+	validateGitFileTargets,
+} from "../services/git-management-service";
+import { withGitRequestContext } from "../services/git-service";
+import { getStatusSummaryCached } from "../services/git-status-cache";
+import { assertGitWorkspaceKey, type GitWorkspaceTarget } from "../services/git-workspace";
+import { authorizeGitTarget, requireReadyGitTarget } from "../services/git-workspace-access";
+import {
+	collectGitAttributionScopes,
+	redactGitModificationView,
+} from "../services/git-workspace-attribution";
 import { getWorkspaceModificationView } from "../services/workspace-modification-view";
 
-export const gitRoutes = new Hono();
+export { validateFilePaths } from "../services/git-management-service";
 
-/**
- * Access gate for every git endpoint.
- *
- * All twelve are `/:chapterId/git/...`, and a chapter inherits its project's verdict
- * (the worktrees share one repository, so chapter-level isolation is not real). One
- * middleware therefore covers the whole surface, including endpoints added later.
- *
- * GET is read; the mutating ones stage, commit, discard, stash and reset — they
- * rewrite the shared repository, so they need project write.
- */
-gitRoutes.use("/:chapterId/git/*", async (c, next) => {
-	const chapterId = c.req.param("chapterId");
-	if (!chapterId) return next();
-	await requireChapterAccess(c, chapterId, c.req.method === "GET" ? "read" : "write");
-	return next();
-});
+type GitEnv = { Variables: { gitTarget: GitWorkspaceTarget } };
+// No waiting queue: shared refs/stash mutations fail quickly across linked worktrees.
+const writingRepositories = new Set<string>();
 
-/**
- * Resolve chapter → worktreePath, throwing if not available.
- *
- * Returns `rawPath`, not `workspacePath`, and deliberately does not expose both.
- * Everything downstream — `gitService` write methods, `getStatusSummaryCached`,
- * `invalidateStatus` — takes a raw path and derives its own normalized key
- * internally, so a second field here would be unused at best and, at worst,
- * would tempt a future caller into passing a case-folded path to git as a cwd.
- * That breaks on case-sensitive filesystems, where `/srv/WT` and `/srv/wt` are
- * different directories.
- */
-async function resolveWorktree(chapterId: string) {
-	const ws = await resolveWorkspaceFromChapter(chapterId);
-	return { chapter: { id: chapterId }, worktreePath: ws.rawPath };
-}
-
-/**
- * Fetch a status summary through the shared cache.
- * After write operations, callers should `invalidateStatus(worktreePath)`
- * first so the next read reflects the mutation.
- */
-function statusSummary(worktreePath: string) {
-	return getStatusSummaryCached(worktreePath);
-}
-
-/**
- * Reject paths that could act outside the worktree.
- *
- * Traversal is judged per SEGMENT, not by substring. `f.includes("..")` also rejected
- * `some..file.ts` and `v1..v2/notes.md` — ordinary filenames that contain two dots without
- * naming a parent directory — so staging or discarding them was impossible. Only a segment
- * that IS `..` climbs, which is what this checks.
- *
- * A leading `/` or `\` is refused separately: those are absolute (or, doubled, a UNC path)
- * and would escape without any `..` at all. Both separators are treated as such regardless
- * of platform, because git accepts `/` everywhere and a Windows client may send `\`.
- *
- * NUL is refused because it terminates a C string: a path that git or the filesystem reads
- * as a prefix of what was validated is a different path than the one that was checked.
- *
- * Exported for tests: it guards every mutating git route, so the boundary deserves direct
- * cases rather than being exercised only through a route's happy path.
- */
-export function validateFilePaths(files: string[]): void {
-	for (const f of files) {
-		const segments = f.split(/[\\/]/);
-		if (
-			segments.some((segment) => segment === "..") ||
-			f.startsWith("/") ||
-			f.startsWith("\\") ||
-			f.includes("\0")
-		) {
-			throw new ValidationError(`Invalid file path: ${f}`);
-		}
-	}
-}
-
-// --- Status ---
-
-gitRoutes.get("/:chapterId/git/status", async (c) => {
-	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	const summary = await statusSummary(worktreePath);
-	return c.json(summary);
-});
-
-/**
- * Unified modification view for the whole worktree.
- *
- * Unlike the per-narrator file views, this covers every actor that wrote to the
- * directory — all narrators, their subagents, and external edits — because that is
- * what has to be understood before reverting anything. Returns metadata only, never
- * file contents.
- */
-gitRoutes.get("/:chapterId/git/modifications", async (c) => {
-	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	// Parsed rather than forwarded raw: `since`/`until` are compared as STRINGS against
-	// `file_attributions.changed_at`, so an unparseable value is not rejected by SQLite —
-	// it just compares as text and silently returns an empty window. Same for `narratorId`,
-	// where a malformed id matches no row. Both used to look like "this file has no
-	// attribution", which is the failure mode this endpoint exists to remove.
-	const query = gitModificationsQuerySchema.parse(c.req.query());
-
-	// History stays a bounded observation window. Current evidence is a separate live
-	// HEAD/index/worktree fingerprint; commit timestamps cannot establish ownership.
-	const scope =
-		query.scope === "uncommitted" ? await resolveUncommittedScope(worktreePath, false) : null;
-
+function modificationCursor(c: Context) {
 	const cursorAt = c.req.query("cursorAt");
 	const cursorRowId = c.req.query("cursorRowId");
 	if (
 		(cursorAt === undefined) !== (cursorRowId === undefined) ||
 		(cursorAt?.length ?? 0) > 64 ||
 		(cursorRowId?.length ?? 0) > 64
-	) {
+	)
 		throw new ValidationError("A bounded cursorAt/cursorRowId pair is required");
-	}
 	if (
 		cursorRowId !== undefined &&
 		(!/^[1-9]\d*$/.test(cursorRowId) || !Number.isSafeInteger(Number(cursorRowId)))
-	) {
+	)
 		throw new ValidationError("Invalid historical row cursor");
-	}
-	// Reuse only the timestamp validator. The validated rowId is a page position,
-	// never a narrator/business ID or evidence of execution order within a timestamp.
-	const cursorQuery =
-		cursorAt !== undefined && cursorRowId !== undefined
-			? gitModificationsQuerySchema.parse({ until: cursorAt })
-			: null;
-	const view = await getWorkspaceModificationView(worktreePath, {
-		currentDiff: query.scope === "uncommitted",
-		signal: c.req.raw.signal,
-		...(cursorQuery?.until && cursorRowId
-			? { cursor: { changedAt: cursorQuery.until, rowId: cursorRowId } }
-			: {}),
-		...(query.limit !== undefined ? { limit: query.limit } : {}),
-		...(query.since ? { since: query.since } : {}),
-		...(query.until ? { until: query.until } : {}),
-		...(query.narratorId ? { narratorId: query.narratorId } : {}),
-		// `projection` is opt-in so an existing client keeps receiving the timeline.
-		...(query.projection ? { projection: query.projection } : {}),
-		...(scope ?? {}),
-	});
-	return c.json(view);
-});
+	const cursorUntil = cursorAt
+		? gitModificationsQuerySchema.parse({ until: cursorAt }).until
+		: undefined;
+	return cursorUntil && cursorRowId ? { changedAt: cursorUntil, rowId: cursorRowId } : undefined;
+}
 
-/**
- * Scope options describing "the current uncommitted change".
- *
- * Three pieces: the paths git reports as changed, where each one's current change begins,
- * and how a renamed file's two names relate.
- *
- * The boundary must be per path — a single repository-wide HEAD timestamp is not it,
- * because a file's last commit is usually older than HEAD (in this repository, 90 of 127
- * changed files, by a median of 164 hours), and using HEAD dropped real contributors.
- *
- * Paths with no boundary are left unbounded, which is correct for a file that has never
- * been committed. Paths the walk did not reach fall back to its oldest commit: being newer
- * than the true boundary, that can only under-count, and over-crediting a file with
- * unrelated history is the failure that matters here.
- *
- * Renames are queried under BOTH names. Attribution rows carry the path that was written
- * at the time, so everything a session did before the rename lives under the old path —
- * which is not in the current diff. Asking for the new path only meant a renamed file's
- * whole history was missing from the window and the row fell through to the
- * `oldestInWindow` fallback: the "Unknown" badge, one shape removed. The alias map tells
- * the view to fold those rows into the current path's group.
- *
- * Exported for tests only. Its behaviour depends on real porcelain output (rename
- * detection, untracked reporting) and on the boundary walk, so the only honest test runs
- * it against a throwaway repository rather than a hand-built status object.
- */
+function cancelledCurrentDiff(filePaths: string[]) {
+	const target = (kind: "index" | "worktree") => ({
+		source: "current_diff" as const,
+		target: kind,
+		status: "unknown" as const,
+		actor: null,
+		effectId: null,
+		reason: "cancelled" as const,
+		baselineVersion: "",
+		historyComplete: false,
+		modeScope: kind === "index" ? ("git_executable_bit" as const) : ("filesystem" as const),
+		continuity: "unverified" as const,
+	});
+	return {
+		source: "current_diff" as const,
+		baselineStatus: "unavailable" as const,
+		version: null,
+		headSha: null,
+		clean: null,
+		complete: false,
+		scope: null,
+		byFile: filePaths.slice(0, 200).map((filePath) => ({
+			filePath,
+			index: target("index"),
+			worktree: target("worktree"),
+		})),
+	};
+}
+
+async function cancelledModificationResponse(c: Context, source: "chapter" | "narrator") {
+	const id = (source === "chapter" ? c.req.param("chapterId") : c.req.param("id")) ?? "";
+	const query = gitModificationsQuerySchema.parse(c.req.query());
+	modificationCursor(c);
+	if (source === "narrator") await requireNarratorAccess(c, id, "read");
+	else await requireChapterAccess(c, id, "read");
+	return c.json({
+		source: "history",
+		...(query.scope === "uncommitted" ? { currentDiff: cancelledCurrentDiff([]) } : {}),
+		nextCursor: null,
+		workspacePath: "",
+		deviceId: "",
+		...((query.projection ?? "all") === "all" ? { timeline: [] } : {}),
+		byFile: [],
+		hasMore: true,
+		windowCount: 0,
+		actors: [],
+		completeness: {
+			fileHistoryComplete: false,
+			contributorsTruncated: true,
+			countsLowerBound: true,
+			warningScanComplete: false,
+			asOfRevision: null,
+		},
+		evidence: "legacy",
+		baselineStatus: "unverified",
+	});
+}
+
+/** One implementation, two authenticated domain adapters. No path comes from the client. */
+export function createGitRoutes(source: "chapter" | "narrator") {
+	const routes = new Hono<GitEnv>();
+	const prefix = source === "chapter" ? "/:chapterId/git" : "/:id/git";
+	routes.use(`${prefix}/*`, bodyLimit({ maxSize: 1024 * 1024 }));
+	routes.use(`${prefix}/*`, async (c, next) => {
+		const need = c.req.method === "GET" ? "read" : "write";
+		const workspaceRequest = c.req.method === "GET" && c.req.path.endsWith("/workspace");
+		const origin =
+			source === "chapter"
+				? { chapterId: c.req.param("chapterId") ?? "" }
+				: { narratorId: c.req.param("id") ?? "" };
+		if (c.req.method === "GET" && c.req.path.endsWith("/modifications") && c.req.raw.signal.aborted)
+			return cancelledModificationResponse(c, source);
+		const target = await authorizeGitTarget(c, origin, need);
+		if (!workspaceRequest) {
+			if (need === "write") {
+				// Hono caches parsed JSON: each handler still uses its existing Zod schema.
+				const body = await c.req.json().catch(() => ({}));
+				if (source === "narrator" || body.workspaceKey !== undefined)
+					assertGitWorkspaceKey(target.workspace, body.workspaceKey);
+			} else if (c.req.query("workspaceKey") !== undefined)
+				assertGitWorkspaceKey(target.workspace, c.req.query("workspaceKey"));
+			requireReadyGitTarget(target, need);
+		}
+		target.beforeWrite = async () => {
+			const fresh = await authorizeGitTarget(c, origin, "write");
+			assertGitWorkspaceKey(fresh.workspace, target.workspace.workspaceKey);
+			requireReadyGitTarget(fresh, "write");
+			if (fresh.backend?.runtimeGeneration !== target.backend?.runtimeGeneration)
+				throw new AppError(
+					"Git device connection changed; refresh before retrying",
+					409,
+					"GIT_WORKSPACE_CHANGED",
+				);
+			// A chapter rebound mid-request cannot inherit the completed operation.
+			if (fresh.workspace.chapterId !== target.workspace.chapterId)
+				throw new AppError(
+					"Git chapter binding changed; refresh before retrying",
+					409,
+					"GIT_WORKSPACE_CHANGED",
+				);
+		};
+		const lockKey = need === "write" ? target.workspace.repositoryKey : null;
+		if (lockKey && writingRepositories.has(lockKey))
+			throw new AppError(
+				"Another Git write is in progress in this repository",
+				409,
+				"GIT_WORKSPACE_BUSY",
+			);
+		if (lockKey) writingRepositories.add(lockKey);
+		c.set("gitTarget", target);
+		const started = performance.now();
+		try {
+			await withGitRequestContext(c.req.raw.signal, next, target.beforeWrite);
+		} finally {
+			if (lockKey) writingRepositories.delete(lockKey);
+			if (need === "write" || performance.now() - started > 1000)
+				logger.info("Git workspace request", {
+					operation: c.req.path.split("/").pop(),
+					workspaceKey: target.workspace.workspaceKey,
+					deviceId: target.workspace.deviceId,
+					elapsedMs: Math.round(performance.now() - started),
+				});
+		}
+	});
+	const access = (c: Context<GitEnv>) => {
+		const target = c.get("gitTarget");
+		const path = target.workspace.rootPath;
+		if (!path) throw new ValidationError("Git workspace root is unavailable");
+		return { target, path, git: gitManagementService(target, c.req.raw.signal) };
+	};
+	const summary = async (c: Context<GitEnv>) => {
+		const { git, path } = access(c);
+		// Management reads are bounded and fresh. Legacy watcher consumers retain their cache.
+		return git.getStatusSummary(path);
+	};
+	const changed = (c: Context<GitEnv>) => invalidateGitWorkspace(c.get("gitTarget"));
+
+	routes.get(`${prefix}/workspace`, (c) => c.json(c.get("gitTarget").workspace));
+	routes.get(`${prefix}/status`, async (c) => c.json(await summary(c)));
+	routes.get(`${prefix}/modifications`, async (c) => {
+		const { target, path, git } = access(c);
+		const query = gitModificationsQuerySchema.parse(c.req.query());
+		if (query.narratorId && query.narratorId !== "external")
+			await requireNarratorAccess(c, query.narratorId, "read");
+		const cursor = modificationCursor(c);
+		const status = query.scope === "uncommitted" ? await git.getStatusSummary(path) : null;
+		const pathAliases = new Map<string, string>();
+		for (const file of status?.files ?? [])
+			if (file.oldPath) pathAliases.set(file.oldPath, file.path);
+		const directScopes = gitAttributionScopes(target, status?.files.map((file) => file.path) ?? []);
+		const discoveredScopes = await collectGitAttributionScopes(target, c.req.raw.signal);
+		const scopeMap = new Map(
+			[...directScopes.scopes, ...discoveredScopes.scopes].map((scope) => [
+				scope.workspacePath,
+				scope,
+			]),
+		);
+		const mergedScopes = [...scopeMap.values()];
+		const scopesTruncated =
+			directScopes.truncated ||
+			discoveredScopes.truncated ||
+			status?.truncated === true ||
+			mergedScopes.length > 32;
+		const view = await getWorkspaceModificationView(path, {
+			deviceId: target.workspace.deviceId,
+			additionalScopes: mergedScopes.slice(0, 32),
+			additionalScopesTruncated: scopesTruncated,
+			currentDiff: query.scope === "uncommitted",
+			signal: c.req.raw.signal,
+			cursor,
+			limit: query.limit,
+			since: query.since,
+			until: query.until,
+			narratorId: query.narratorId,
+			projection: query.projection,
+			...(status
+				? {
+						filePaths: [...status.files.map((file) => file.path), ...pathAliases.keys()],
+						pathAliases,
+					}
+				: {}),
+		});
+		if (scopesTruncated) {
+			view.hasMore = true;
+			view.completeness = {
+				...view.completeness,
+				fileHistoryComplete: false,
+				contributorsTruncated: true,
+				countsLowerBound: true,
+				warningScanComplete: false,
+			};
+		}
+		return c.json(await redactGitModificationView(view, narratorPrincipalOf(c)));
+	});
+	for (const operation of ["stage", "unstage", "discard"] as const) {
+		routes.post(`${prefix}/${operation}`, async (c) => {
+			const { target, path, git } = access(c);
+			const schema =
+				operation === "stage"
+					? gitStageSchema
+					: operation === "unstage"
+						? gitUnstageSchema
+						: gitDiscardSchema;
+			const body = schema.parse(await c.req.json());
+			if (body.files) await validateGitFileTargets(target, body.files);
+			if (operation === "stage") {
+				if (body.all) await git.stageAll(path);
+				else {
+					if (!body.files) throw new ValidationError("files or all is required");
+					await git.stageFiles(path, body.files);
+				}
+			} else if (operation === "unstage") {
+				if (body.all) await git.unstageAll(path);
+				else {
+					if (!body.files) throw new ValidationError("files or all is required");
+					await git.unstageFiles(path, body.files);
+				}
+			} else {
+				if (body.all) await git.discardAll(path);
+				else {
+					if (!body.files) throw new ValidationError("files or all is required");
+					await git.discardFiles(path, body.files);
+				}
+			}
+			changed(c);
+			return c.json(await summary(c));
+		});
+	}
+	routes.post(`${prefix}/commit`, async (c) => {
+		const { target, path, git } = access(c);
+		const { message } = gitCommitSchema.parse(await c.req.json());
+		const sha = await git.commit(path, message, await resolveUserGitIdentityEnv(c.get("user").sub));
+		changed(c);
+		if (target.workspace.chapterId) {
+			try {
+				await commitSyncService.recordCommit({
+					chapterId: target.workspace.chapterId,
+					sha,
+					message,
+					source: "manual",
+				});
+			} catch {
+				logger.warn("Git commit completed; chapter synchronization failed", {
+					workspaceKey: target.workspace.workspaceKey,
+				});
+			}
+		}
+		// A failed follow-up read must never invite replaying an already successful commit.
+		let status: Awaited<ReturnType<typeof summary>> | undefined;
+		try {
+			status = await summary(c);
+		} catch {
+			/* commit remains successful */
+		}
+		return c.json({ commitSha: sha, status });
+	});
+	routes.get(`${prefix}/diff`, async (c) => {
+		const { target, path, git } = access(c);
+		const { file, staged } = gitDiffQuerySchema.parse(c.req.query());
+		await validateGitFileTargets(target, [file]);
+		return c.json(await git.getFileDiff(path, file, staged));
+	});
+	routes.get(`${prefix}/stash/list`, async (c) => {
+		const { path, git } = access(c);
+		return c.json(await git.stashList(path));
+	});
+	routes.post(`${prefix}/stash`, async (c) => {
+		const { path, git } = access(c);
+		const body = gitStashSchema.parse(await c.req.json());
+		let hasConflicts = false;
+		if (body.action === "push")
+			await git.stash(path, body.message, await resolveUserGitIdentityEnv(c.get("user").sub));
+		else if (body.action === "pop") hasConflicts = (await git.stashPop(path)).hasConflicts;
+		else await git.stashDrop(path, body.index ?? 0);
+		changed(c);
+		return c.json({ hasConflicts, status: await summary(c) });
+	});
+	routes.get(`${prefix}/log`, async (c) => {
+		const { path, git } = access(c);
+		return c.json(await git.getLog(path, gitLogQuerySchema.parse(c.req.query())));
+	});
+	routes.post(`${prefix}/reset`, async (c) => {
+		const { target, path, git } = access(c);
+		const { target: ref, mode } = gitResetSchema.parse(await c.req.json());
+		if (mode === "hard") await git.resetHard(path, ref);
+		else await git.resetSoft(path, ref);
+		changed(c);
+		if (target.workspace.chapterId) {
+			try {
+				await commitSyncService.syncChapterCommits(target.workspace.chapterId);
+			} catch {
+				logger.warn("Git reset completed; chapter synchronization failed", {
+					workspaceKey: target.workspace.workspaceKey,
+				});
+			}
+		}
+		return c.json(await summary(c));
+	});
+	routes.post(`${prefix}/ai-commit-message`, async (c) => {
+		const { path, git } = access(c);
+		const diff = await git.getFullDiff(path);
+		if (!diff.trim()) return c.json({ message: "" });
+		return c.json({ message: await generateCommitMessage(diff, c.req.raw.signal) });
+	});
+	return routes;
+}
+
+export const gitRoutes = createGitRoutes("chapter");
+export const narratorGitRoutes = createGitRoutes("narrator");
+
+async function generateCommitMessage(diff: string, requestSignal: AbortSignal): Promise<string> {
+	const { summaryGenerateWithHistory } = await import("../lib/agent");
+	const systemPrompt = `You are a git commit message generator. Given a git diff, generate a concise Conventional Commits message (<type>(<optional scope>): <description>). Use lowercase imperative mood, no period, under 72 characters. Reply with ONLY the commit message.`;
+	const controller = new AbortController();
+	const relay = () => controller.abort(requestSignal.reason);
+	requestSignal.addEventListener("abort", relay, { once: true });
+	if (requestSignal.aborted) relay();
+	const timer = setTimeout(
+		() => controller.abort(new Error("AI commit message generation timed out")),
+		30_000,
+	);
+	let message: string;
+	try {
+		message = await summaryGenerateWithHistory(
+			systemPrompt,
+			`<diff>\n${diff}\n</diff>`,
+			"en",
+			{ kind: "git_summary" },
+			{ signal: controller.signal },
+		);
+	} finally {
+		clearTimeout(timer);
+		requestSignal.removeEventListener("abort", relay);
+	}
+	message = message
+		.trim()
+		.replace(/^["'`\u201c\u201d]+|["'`\u201c\u201d]+$/g, "")
+		.split("\n")[0]
+		.trim();
+	return !message || message.length > 200 ? "chore: update files" : message;
+}
+
+/** Legacy boundary helper retained for chapter consumers and its regression tests. */
 export async function resolveUncommittedScope(
 	worktreePath: string,
 	includeTimestampHints = true,
@@ -199,265 +412,30 @@ export async function resolveUncommittedScope(
 	pathAliases: Map<string, string>;
 }> {
 	const status = await getStatusSummaryCached(worktreePath);
-	// Old paths participate in the query; only the current path is ever displayed.
 	const pathAliases = new Map<string, string>();
-	for (const file of status.files) {
+	for (const file of status.files)
 		if (file.oldPath && file.oldPath !== file.path) pathAliases.set(file.oldPath, file.path);
-	}
 	const filePaths = [...status.files.map((file) => file.path), ...pathAliases.keys()];
-	// Current-diff uses content fingerprints, so its historical companion must not be
-	// cut at a guessed commit time. Keep the legacy hint helper for other callers.
-	if (filePaths.length === 0 || !includeTimestampHints) {
+	if (!filePaths.length || !includeTimestampHints)
 		return { filePaths, sinceByPath: new Map(), pathAliases };
-	}
-
 	const { byPath, oldestInWindow } = await getCommitBoundariesCached(
 		worktreePath,
 		status.headSha,
 		filePaths,
 	);
-
-	// Boundaries are keyed by DISPLAY path, matching how the view looks them up: a rename's
-	// pre-rename rows are folded onto the current path and must be judged against the
-	// window git resolved for the file as a whole. Taking the older of the two names' own
-	// boundaries keeps that window from cutting off history the rename carried over.
 	const sinceByPath = new Map<string, string>();
 	for (const [path, boundary] of byPath) {
 		const displayPath = pathAliases.get(path) ?? path;
 		const existing = sinceByPath.get(displayPath);
 		if (existing === undefined || boundary < existing) sinceByPath.set(displayPath, boundary);
 	}
-
 	if (oldestInWindow) {
 		const untracked = new Set(
 			status.files.filter((file) => file.status.startsWith("?")).map((file) => file.path),
 		);
-		for (const file of status.files) {
-			// An untracked file has no commit to bound it, so it must stay unbounded rather
-			// than inherit the window fallback.
-			if (!sinceByPath.has(file.path) && !untracked.has(file.path)) {
+		for (const file of status.files)
+			if (!sinceByPath.has(file.path) && !untracked.has(file.path))
 				sinceByPath.set(file.path, oldestInWindow);
-			}
-		}
 	}
-
 	return { filePaths, sinceByPath, pathAliases };
 }
-
-// --- Stage ---
-
-gitRoutes.post("/:chapterId/git/stage", async (c) => {
-	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	const body = gitStageSchema.parse(await c.req.json());
-	if (body.all) {
-		await gitService.stageAll(worktreePath);
-	} else if (body.files) {
-		validateFilePaths(body.files);
-		await gitService.stageFiles(worktreePath, body.files);
-	}
-	invalidateStatus(worktreePath);
-	const summary = await statusSummary(worktreePath);
-	return c.json(summary);
-});
-
-// --- Unstage ---
-
-gitRoutes.post("/:chapterId/git/unstage", async (c) => {
-	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	const body = gitUnstageSchema.parse(await c.req.json());
-	if (body.all) {
-		await gitService.unstageAll(worktreePath);
-	} else if (body.files) {
-		validateFilePaths(body.files);
-		await gitService.unstageFiles(worktreePath, body.files);
-	}
-	invalidateStatus(worktreePath);
-	const summary = await statusSummary(worktreePath);
-	return c.json(summary);
-});
-
-// --- Commit ---
-
-gitRoutes.post("/:chapterId/git/commit", async (c) => {
-	const chapterId = c.req.param("chapterId");
-	const { worktreePath } = await resolveWorktree(chapterId);
-	const { message } = gitCommitSchema.parse(await c.req.json());
-
-	const sha = await gitService.commit(
-		worktreePath,
-		message,
-		await resolveUserGitIdentityEnv(c.get("user").sub),
-	);
-
-	// Record commit
-	try {
-		await commitSyncService.recordCommit({
-			chapterId,
-			sha,
-			message,
-			source: "manual",
-		});
-	} catch {
-		// Non-fatal — commit already happened
-	}
-
-	invalidateStatus(worktreePath);
-	const summary = await statusSummary(worktreePath);
-	return c.json({ commitSha: sha, status: summary });
-});
-
-// --- Discard ---
-
-gitRoutes.post("/:chapterId/git/discard", async (c) => {
-	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	const body = gitDiscardSchema.parse(await c.req.json());
-	if (body.all) {
-		await gitService.discardAll(worktreePath);
-	} else if (body.files) {
-		validateFilePaths(body.files);
-		await gitService.discardFiles(worktreePath, body.files);
-	}
-	invalidateStatus(worktreePath);
-	const summary = await statusSummary(worktreePath);
-	return c.json(summary);
-});
-
-// --- Diff ---
-
-gitRoutes.get("/:chapterId/git/diff", async (c) => {
-	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	const { file, staged } = gitDiffQuerySchema.parse(c.req.query());
-	validateFilePaths([file]);
-	const result = await gitService.getFileDiff(worktreePath, file, staged);
-	return c.json(result);
-});
-
-// --- Stash ---
-
-gitRoutes.get("/:chapterId/git/stash/list", async (c) => {
-	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	const list = await gitService.stashList(worktreePath);
-	return c.json(list);
-});
-
-gitRoutes.post("/:chapterId/git/stash", async (c) => {
-	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	const body = gitStashSchema.parse(await c.req.json());
-
-	switch (body.action) {
-		case "push":
-			await gitService.stash(
-				worktreePath,
-				body.message,
-				await resolveUserGitIdentityEnv(c.get("user").sub),
-			);
-			break;
-		case "pop": {
-			const result = await gitService.stashPop(worktreePath);
-			if (result.hasConflicts) {
-				invalidateStatus(worktreePath);
-				const summary = await statusSummary(worktreePath);
-				return c.json({ hasConflicts: true, status: summary });
-			}
-			break;
-		}
-		case "drop":
-			await gitService.stashDrop(worktreePath, body.index ?? 0);
-			break;
-	}
-
-	invalidateStatus(worktreePath);
-	const summary = await statusSummary(worktreePath);
-	return c.json({ hasConflicts: false, status: summary });
-});
-
-// --- Log ---
-
-gitRoutes.get("/:chapterId/git/log", async (c) => {
-	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	const { limit, skip } = gitLogQuerySchema.parse(c.req.query());
-	const log = await gitService.getLog(worktreePath, { limit, skip });
-	return c.json(log);
-});
-
-// --- Reset ---
-
-gitRoutes.post("/:chapterId/git/reset", async (c) => {
-	const chapterId = c.req.param("chapterId");
-	const { worktreePath } = await resolveWorktree(chapterId);
-	const { target, mode } = gitResetSchema.parse(await c.req.json());
-
-	if (mode === "hard") {
-		await gitService.resetHard(worktreePath, target);
-	} else {
-		await gitService.resetSoft(worktreePath, target);
-	}
-
-	// Sync commits after reset (history may have changed)
-	try {
-		await commitSyncService.syncChapterCommits(chapterId);
-	} catch {
-		// Non-fatal
-	}
-
-	invalidateStatus(worktreePath);
-	const summary = await statusSummary(worktreePath);
-	return c.json(summary);
-});
-
-// --- AI commit message ---
-
-gitRoutes.post("/:chapterId/git/ai-commit-message", async (c) => {
-	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	const diff = await gitService.getFullDiff(worktreePath);
-	if (!diff.trim()) {
-		return c.json({ message: "" });
-	}
-
-	// Lazy import to avoid circular dependency
-	const { summaryGenerateWithHistory } = await import("../lib/agent");
-
-	const systemPrompt = `You are a git commit message generator. Given a git diff, generate a concise commit message following the Conventional Commits format.
-Rules:
-- Use format: <type>(<optional scope>): <description>
-- Types: feat, fix, refactor, style, docs, test, chore, perf, ci, build
-- Description should be lowercase, imperative mood, no period at end
-- If the diff covers multiple changes, summarize the primary change
-- Keep the message under 72 characters
-- Reply with ONLY the commit message, nothing else`;
-
-	const AI_TIMEOUT_MS = 30_000;
-	const generatePromise = summaryGenerateWithHistory(
-		systemPrompt,
-		`<diff>\n${diff}\n</diff>`,
-		"en",
-		{ kind: "git_summary" },
-	);
-
-	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-	const timeoutPromise = new Promise<never>((_, reject) => {
-		timeoutHandle = setTimeout(
-			() => reject(new Error("AI commit message generation timed out")),
-			AI_TIMEOUT_MS,
-		);
-	});
-
-	let message: string;
-	try {
-		message = await Promise.race([generatePromise, timeoutPromise]);
-	} finally {
-		clearTimeout(timeoutHandle);
-	}
-
-	message = message
-		.trim()
-		.replace(/^["'`\u201c\u201d]+|["'`\u201c\u201d]+$/g, "")
-		.split("\n")[0]
-		.trim();
-
-	if (!message || message.length > 200) {
-		message = "chore: update files";
-	}
-
-	return c.json({ message });
-});

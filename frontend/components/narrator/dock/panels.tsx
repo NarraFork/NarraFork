@@ -8,7 +8,7 @@
  *   - details  → NarratorDetailsPanel (inline) — props from dock context
  *   - filemod  → FileModificationsPanel — props from dock context
  *   - spec     → SpecPanel
- *   - git      → GitPanel (needs chapterId)
+ *   - git      → GitPanel (resolves narrator workspace; chapter adapter retained)
  *   - browser  → BrowserPanel — session info from dock context
  *
  * Tool panels take their cross-panel state from NarratorDockContext (published
@@ -648,6 +648,7 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams
 	const { t } = useTranslation("git");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
+	const narratorId = dock?.narratorId ?? props.params.narratorId;
 	const chapterId = dock?.chapterId ?? props.params.chapterId;
 	const icon = <IconGitBranch size={16} color="var(--mantine-color-dimmed)" />;
 
@@ -659,7 +660,7 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams
 		}
 	}, [t, props.api]);
 
-	if (!chapterId) {
+	if (!narratorId && !chapterId) {
 		return (
 			<ToolPanelShell
 				title={t("panel.title")}
@@ -670,7 +671,7 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams
 			>
 				<Center h="100%">
 					<Text size="sm" c="dimmed">
-						No chapter
+						{t("workspace.error")}
 					</Text>
 				</Center>
 			</ToolPanelShell>
@@ -685,7 +686,7 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams
 			detachKind="git"
 		>
 			<LazyPanelBoundary>
-				<GitPanel chapterId={chapterId} />
+				<GitPanel narratorId={narratorId} chapterId={chapterId} />
 			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);

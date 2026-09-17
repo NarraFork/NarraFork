@@ -1,25 +1,77 @@
+import type { GitWorkspace } from "@shared/git-workspace";
 import { request } from "./client";
 import type { ApiEntity } from "./types";
 
+export type { GitWorkspace } from "@shared/git-workspace";
+
+/** Strings remain the legacy chapter adapter; new callers carry a resolved workspace. */
+export type GitTarget =
+	| string
+	| {
+			narratorId: string;
+			workspaceKey: string;
+			repositoryKey?: string | null;
+			canWrite: boolean;
+			rootPath?: string | null;
+			chapterId?: string | null;
+	  };
+
+export function gitTargetKey(target: GitTarget | null | undefined): string | undefined {
+	return typeof target === "string" ? target : target?.workspaceKey;
+}
+
+export function gitCanWrite(target: GitTarget): boolean {
+	return typeof target === "string" || target.canWrite;
+}
+
+export function gitBasePath(target: GitTarget): string {
+	return typeof target === "string"
+		? `/chapters/${encodeURIComponent(target)}/git`
+		: `/narrators/${encodeURIComponent(target.narratorId)}/git`;
+}
+
+/** Pin reads too, so a late response cannot cache the new root under an old identity. */
+function gitReadPath(target: GitTarget, suffix: string): string {
+	const path = `${gitBasePath(target)}${suffix}`;
+	return typeof target === "string"
+		? path
+		: `${path}${suffix.includes("?") ? "&" : "?"}workspaceKey=${encodeURIComponent(target.workspaceKey)}`;
+}
+
+function writeBody(target: GitTarget, body: object = {}): string {
+	if (typeof target !== "string" && (!target.workspaceKey || !target.canWrite)) {
+		throw new Error("Git workspace is read-only or unavailable");
+	}
+	return JSON.stringify(
+		typeof target === "string" ? body : { ...body, workspaceKey: target.workspaceKey },
+	);
+}
+
+/** HTTP ceiling includes workspace probing plus the server's bounded Git/AI operation. */
+export const GIT_HTTP_TIMEOUT_MS = 180_000;
+function gitRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
+	const timeout = AbortSignal.timeout(GIT_HTTP_TIMEOUT_MS);
+	const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+	return request<T>(path, { ...options, signal });
+}
+
+// Reads are cancellable by React Query; writes are never retried automatically.
 export const gitApi = {
-	getGitStatus: (chapterId: string) => request<ApiEntity>(`/chapters/${chapterId}/git/status`),
+	getGitWorkspace: (narratorId: string, signal?: AbortSignal) =>
+		gitRequest<GitWorkspace>(`/narrators/${encodeURIComponent(narratorId)}/git/workspace`, {
+			signal,
+		}),
+	getGitStatus: (target: GitTarget, signal?: AbortSignal) =>
+		gitRequest<ApiEntity>(gitReadPath(target, "/status"), { signal }),
 	getGitModifications: (
-		chapterId: string,
+		target: GitTarget,
 		opts?: {
 			scope?: "uncommitted";
 			limit?: number;
-			/** nextCursor from the historical (unscoped) response; never a current baseline. */
 			cursor?: { changedAt: string; rowId: string };
-			/**
-			 * `"byFile"` drops the per-event timeline from the response; no caller renders it.
-			 * `"all"` keeps it, and is what the server assumes when the parameter is absent.
-			 *
-			 * These are the server's spellings (`gitModificationsQuerySchema`), not a
-			 * client-side vocabulary: the value is forwarded verbatim as a query parameter, so
-			 * a name the enum does not list is rejected as a 400 rather than degrading.
-			 */
 			projection?: "byFile" | "all";
 		},
+		signal?: AbortSignal,
 	) => {
 		const params = new URLSearchParams();
 		if (opts?.scope) params.set("scope", opts.scope);
@@ -30,48 +82,52 @@ export const gitApi = {
 			params.set("cursorRowId", opts.cursor.rowId);
 		}
 		const qs = params.toString();
-		return request<ApiEntity>(`/chapters/${chapterId}/git/modifications${qs ? `?${qs}` : ""}`);
+		return gitRequest<ApiEntity>(gitReadPath(target, `/modifications${qs ? `?${qs}` : ""}`), {
+			signal,
+		});
 	},
-	gitStage: (chapterId: string, body: { files?: string[]; all?: boolean }) =>
-		request<ApiEntity>(`/chapters/${chapterId}/git/stage`, {
+	gitStage: (target: GitTarget, body: { files?: string[]; all?: boolean }) =>
+		gitRequest<ApiEntity>(`${gitBasePath(target)}/stage`, {
 			method: "POST",
-			body: JSON.stringify(body),
+			body: writeBody(target, body),
 		}),
-	gitUnstage: (chapterId: string, body: { files?: string[]; all?: boolean }) =>
-		request<ApiEntity>(`/chapters/${chapterId}/git/unstage`, {
+	gitUnstage: (target: GitTarget, body: { files?: string[]; all?: boolean }) =>
+		gitRequest<ApiEntity>(`${gitBasePath(target)}/unstage`, {
 			method: "POST",
-			body: JSON.stringify(body),
+			body: writeBody(target, body),
 		}),
-	gitCommit: (chapterId: string, message: string) =>
-		request<ApiEntity>(`/chapters/${chapterId}/git/commit`, {
+	gitCommit: (target: GitTarget, message: string) =>
+		gitRequest<ApiEntity>(`${gitBasePath(target)}/commit`, {
 			method: "POST",
-			body: JSON.stringify({ message }),
+			body: writeBody(target, { message }),
 		}),
-	gitDiscard: (chapterId: string, body: { files?: string[]; all?: boolean }) =>
-		request<ApiEntity>(`/chapters/${chapterId}/git/discard`, {
+	gitDiscard: (target: GitTarget, body: { files?: string[]; all?: boolean }) =>
+		gitRequest<ApiEntity>(`${gitBasePath(target)}/discard`, {
 			method: "POST",
-			body: JSON.stringify(body),
+			body: writeBody(target, body),
 		}),
-	getGitDiff: (chapterId: string, file: string, staged = false) =>
-		request<ApiEntity>(
-			`/chapters/${chapterId}/git/diff?file=${encodeURIComponent(file)}&staged=${staged}`,
+	getGitDiff: (target: GitTarget, file: string, staged = false, signal?: AbortSignal) =>
+		gitRequest<ApiEntity>(
+			gitReadPath(target, `/diff?file=${encodeURIComponent(file)}&staged=${staged}`),
+			{ signal },
 		),
-	getGitStashList: (chapterId: string) =>
-		request<ApiEntity[]>(`/chapters/${chapterId}/git/stash/list`),
-	gitStash: (chapterId: string, body: { action: string; message?: string; index?: number }) =>
-		request<ApiEntity>(`/chapters/${chapterId}/git/stash`, {
+	getGitStashList: (target: GitTarget, signal?: AbortSignal) =>
+		gitRequest<ApiEntity[]>(gitReadPath(target, "/stash/list"), { signal }),
+	gitStash: (target: GitTarget, body: { action: string; message?: string; index?: number }) =>
+		gitRequest<ApiEntity>(`${gitBasePath(target)}/stash`, {
 			method: "POST",
-			body: JSON.stringify(body),
+			body: writeBody(target, body),
 		}),
-	getGitLog: (chapterId: string, limit = 50, skip = 0) =>
-		request<ApiEntity[]>(`/chapters/${chapterId}/git/log?limit=${limit}&skip=${skip}`),
-	gitReset: (chapterId: string, target: string, mode: "soft" | "hard") =>
-		request<ApiEntity>(`/chapters/${chapterId}/git/reset`, {
+	getGitLog: (target: GitTarget, limit = 50, skip = 0, signal?: AbortSignal) =>
+		gitRequest<ApiEntity[]>(gitReadPath(target, `/log?limit=${limit}&skip=${skip}`), { signal }),
+	gitReset: (target: GitTarget, commit: string, mode: "soft" | "hard") =>
+		gitRequest<ApiEntity>(`${gitBasePath(target)}/reset`, {
 			method: "POST",
-			body: JSON.stringify({ target, mode }),
+			body: writeBody(target, { target: commit, mode }),
 		}),
-	gitAiCommitMessage: (chapterId: string) =>
-		request<{ message: string }>(`/chapters/${chapterId}/git/ai-commit-message`, {
+	gitAiCommitMessage: (target: GitTarget) =>
+		gitRequest<{ message: string }>(`${gitBasePath(target)}/ai-commit-message`, {
 			method: "POST",
+			body: writeBody(target),
 		}),
 };
