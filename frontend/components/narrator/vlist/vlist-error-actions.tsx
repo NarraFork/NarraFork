@@ -35,10 +35,10 @@ import { useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ModelTestDialog } from "../../providers/ModelTestDialog";
-import { removeMessagesFromCache } from "../messages-query-cache";
-import { RetryRuleModal } from "../RetryRuleModal";
-import { useCodexImageGenerationFix } from "../useCodexImageGenerationFix";
-import { useNarratorModelTest } from "../useNarratorModelTest";
+import { removeMessagesFromCache } from "../message/messages-query-cache";
+import { useCodexImageGenerationFix } from "../model/useCodexImageGenerationFix";
+import { useNarratorModelTest } from "../model/useNarratorModelTest";
+import { RetryRuleModal } from "../permission/RetryRuleModal";
 import type { ErrorNoticeActions } from "./render/RenderSystemText";
 import type { VListItem } from "./vlist-pipeline";
 

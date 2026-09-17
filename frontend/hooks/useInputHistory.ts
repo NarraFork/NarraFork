@@ -3,7 +3,7 @@ import {
 	readFileReferences,
 	sameFileReferenceInput,
 	trimFileReferenceInput,
-} from "@frontend/components/narrator/file-reference-input";
+} from "@frontend/components/narrator/composer/file-reference-input";
 import { readSession, removeSession, writeSession } from "@frontend/lib/session-store";
 import type { FileReference } from "@shared/file-reference";
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";

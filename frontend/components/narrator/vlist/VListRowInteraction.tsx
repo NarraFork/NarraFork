@@ -61,15 +61,15 @@ import {
 import { lazy, type ReactNode, Suspense, useCallback, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { CompactMenuSub } from "../CompactMenuSub";
-import type { MessageContextMenuActions } from "../MessageContextMenuCtx";
+import { CompactMenuSub } from "../compact/CompactMenuSub";
+import { useRenderInteractive } from "../lod/RenderLodCtx";
+import type { MessageContextMenuActions } from "../message/MessageContextMenuCtx";
 import {
 	BLOCK_ID_ATTR,
 	BLOCK_INDICES_ATTR,
 	shouldIgnoreMessageBlockSelection,
 	useMessageSelection,
-} from "../MessageSelectionCtx";
-import { useRenderInteractive } from "../RenderLodCtx";
+} from "../message/MessageSelectionCtx";
 import { useToolEditNavigation } from "../useToolEditNavigation";
 import type { VListRowToolActions } from "./vlist-row-actions";
 import type { VListToolMeta } from "./vlist-tool-meta";
@@ -79,13 +79,13 @@ import type { VListToolMeta } from "./vlist-tool-meta";
 // (ToolCallInspector pulls ContentViewer + Timeline; FilePreviewModal pulls the
 // fs-preview fetch path and Shiki language resolution).
 const ToolCallInspector = lazy(() =>
-	import("../ToolCallInspector").then((m) => ({ default: m.ToolCallInspector })),
+	import("../tool-call/ToolCallInspector").then((m) => ({ default: m.ToolCallInspector })),
 );
 const FilePreviewModal = lazy(() =>
-	import("../FilePreviewModal").then((m) => ({ default: m.FilePreviewModal })),
+	import("../file-panel/FilePreviewModal").then((m) => ({ default: m.FilePreviewModal })),
 );
 const ContentInspector = lazy(() =>
-	import("../ContentInspector").then((m) => ({ default: m.ContentInspector })),
+	import("../content/ContentInspector").then((m) => ({ default: m.ContentInspector })),
 );
 
 const SWIPE_REVEAL_WIDTH = 180;

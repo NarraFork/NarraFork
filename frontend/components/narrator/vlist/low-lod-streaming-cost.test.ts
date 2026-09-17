@@ -94,8 +94,8 @@ describe("low-LOD live turn: per-frame cost stays flat as the reply grows", () =
 	it("does not scale with the ACCUMULATED streaming text", async () => {
 		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
 		const { measureCache } = await import("./measure-cache");
-		const { getCategory, getCategoryColor } = await import("../tool-display");
-		const { recentRunSegmentMessageIds } = await import("../run-segments");
+		const { getCategory, getCategoryColor } = await import("../tool-call/tool-display");
+		const { recentRunSegmentMessageIds } = await import("../trace/run-segments");
 
 		/** One live frame through the REAL document layout (the shell's entry point). */
 		const renderFrame = (text: string) => {
@@ -199,7 +199,7 @@ describe("low-LOD live turn: per-frame cost stays flat as the reply grows", () =
 	it("keeps the measurement cache bounded across a long turn", async () => {
 		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
 		const { measureCache } = await import("./measure-cache");
-		const { recentRunSegmentMessageIds } = await import("../run-segments");
+		const { recentRunSegmentMessageIds } = await import("../trace/run-segments");
 
 		const renderFrame = (text: string) =>
 			buildPretextDocumentLayout([...HISTORY, streamingMessage(text)] as never[], {
@@ -237,8 +237,8 @@ describe("low-LOD live turn: per-frame cost stays flat as the reply grows", () =
 	});
 
 	it("keeps the folded rows correct while the live row grows", async () => {
-		const { segmentMessages } = await import("../message-segments");
-		const { groupRenderUnits } = await import("../render-units");
+		const { segmentMessages } = await import("../message/message-segments");
+		const { groupRenderUnits } = await import("../trace/render-units");
 		const { adaptRenderUnits } = await import("./segment-adapter");
 
 		// A cost optimisation must never drop or reorder rows: the whole point of the

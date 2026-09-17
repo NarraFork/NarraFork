@@ -29,7 +29,7 @@ import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { MD_HEADING_SLUG_ATTR } from "@frontend/lib/markdown-anchor-scroll";
 import { Box } from "@mantine/core";
 import { Fragment, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
-import { MarkdownLink } from "../../MarkdownLink";
+import { MarkdownLink } from "../../markdown/MarkdownLink";
 import { MEASURE_MARKDOWN_CODE_PADDING } from "../measure/measure-markdown";
 import { pretextLineMetrics } from "../measure/pretext-metrics";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
@@ -125,7 +125,7 @@ function mathBaseFontSize(): number {
  * so the vlist shell never statically depends on the heavy mermaid bundle
  * path at first paint. Failures fall back to a monospaced source box. */
 const LazyMermaidDiagram = lazy(() =>
-	import("../../MermaidDiagram").then((m) => ({ default: m.MermaidDiagram })),
+	import("../../markdown/MermaidDiagram").then((m) => ({ default: m.MermaidDiagram })),
 );
 
 interface RenderMarkdownProps {

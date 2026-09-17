@@ -16,7 +16,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:tes
 import {
 	type FileReferenceInput,
 	insertFileReference,
-} from "@frontend/components/narrator/file-reference-input";
+} from "@frontend/components/narrator/composer/file-reference-input";
 import { flush, readSession, resetSessionStoreForTest } from "@frontend/lib/session-store";
 import type { FileReference } from "@shared/file-reference";
 import { parseHTML } from "linkedom";

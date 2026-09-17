@@ -110,7 +110,7 @@ describe("stored LOD migration (v1 1..6 → v2 1..5)", () => {
 
 	it("falls back to the global default, then to DEFAULT_RENDER_LOD", async () => {
 		const { readOpeningLod } = await import("./useNarratorLod");
-		const { DEFAULT_RENDER_LOD } = await import("../components/narrator/RenderLodCtx");
+		const { DEFAULT_RENDER_LOD } = await import("../components/narrator/lod/RenderLodCtx");
 
 		// A narrator with no memory of its own opens at the (migrated) global default.
 		installStorage({ [DEFAULT_KEY]: "6" });

@@ -109,6 +109,10 @@ function SettingsModelsPage() {
 				setSummaryModel={is.setSummaryModel}
 				translationModel={is.translationModel}
 				setTranslationModel={is.setTranslationModel}
+				promptOptimizeModel={is.promptOptimizeModel}
+				setPromptOptimizeModel={is.setPromptOptimizeModel}
+				promptOptimizeContextMaxMessages={is.promptOptimizeContextMaxMessages}
+				setPromptOptimizeContextMaxMessages={is.setPromptOptimizeContextMaxMessages}
 				subagentExploreModel={is.subagentExploreModel}
 				setSubagentExploreModel={is.setSubagentExploreModel}
 				subagentPlanModel={is.subagentPlanModel}

@@ -1,7 +1,7 @@
 import { pickLocalizedValue } from "@shared/i18n-locales";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import type { CommandItem } from "../components/narrator/CommandPopover";
+import type { CommandItem } from "../components/narrator/composer/CommandPopover";
 import { api } from "../lib/api";
 
 const NARRATOR_COMMANDS_GC_TIME_MS = 60_000;

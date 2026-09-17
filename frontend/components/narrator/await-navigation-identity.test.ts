@@ -13,7 +13,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { traceRowAwaitAgentNarratorId } from "./trace-row-identity";
+import { traceRowAwaitAgentNarratorId } from "./trace/trace-row-identity";
 
 // The vlist implementation lives in vlist/, which non-vlist files may not import
 // statically (vlist-isolation.guard.test.ts keeps the flag-OFF path from loading

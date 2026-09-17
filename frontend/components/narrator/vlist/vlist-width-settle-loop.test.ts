@@ -655,7 +655,7 @@ describe("scrollbar feedback through the real measure stack", () => {
 		const { installCanvasStub } = await import("./measure/test-canvas-stub");
 		installCanvasStub();
 		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
-		const { recentRunSegmentMessageIds } = await import("../run-segments");
+		const { recentRunSegmentMessageIds } = await import("../trace/run-segments");
 		const { resolveNarratorColumnWidth } = await import("@frontend/lib/narrator-content-column");
 		return { buildPretextDocumentLayout, recentRunSegmentMessageIds, resolveNarratorColumnWidth };
 	}
@@ -825,7 +825,7 @@ describe("layout height is monotone in width for TEXT-shaped content", () => {
 		const { installCanvasStub } = await import("./measure/test-canvas-stub");
 		installCanvasStub();
 		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
-		const { recentRunSegmentMessageIds } = await import("../run-segments");
+		const { recentRunSegmentMessageIds } = await import("../trace/run-segments");
 
 		const tableRows = Array.from(
 			{ length: 6 },

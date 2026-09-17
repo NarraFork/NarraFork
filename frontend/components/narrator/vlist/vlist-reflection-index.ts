@@ -30,7 +30,7 @@ import {
 	type ReflectionSuggestion,
 } from "../narrator-message-helpers";
 import type { ContentBlock, NarratorMsg, PendingPermission } from "../narrator-panel-types";
-import type { ToolCallData } from "../tool-call-data";
+import type { ToolCallData } from "../tool-call/tool-call-data";
 
 /**
  * The reflection-relevant facts of one tool call. Mirrors exactly the fields the

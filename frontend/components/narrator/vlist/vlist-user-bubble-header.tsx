@@ -20,7 +20,7 @@ import {
 	MessageOriginBadge,
 	OriginAvatar,
 	resolveUserBubbleName,
-} from "@frontend/components/narrator/MessageOriginBadge";
+} from "@frontend/components/narrator/message/MessageOriginBadge";
 import { UserAvatar } from "@frontend/components/UserAvatar";
 import { formatShortMessageTime } from "@frontend/lib/intl-format";
 import { Badge, Group, Text } from "@mantine/core";

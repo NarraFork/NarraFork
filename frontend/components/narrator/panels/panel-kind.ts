@@ -20,7 +20,7 @@ import type { FileSelection } from "@shared/file-reference";
 import { localFileDirectory } from "@shared/markdown-file-path";
 import type { PluginDockPanelParams } from "../../plugins/protocol";
 import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
-import { isToolEditReference, type ToolEditReference } from "../tool-edit-reference";
+import { isToolEditReference, type ToolEditReference } from "../tool-call/tool-edit-reference";
 
 /**
  * Every panel kind that can appear on any surface.

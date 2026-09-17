@@ -17,7 +17,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
-import { resolveOlderHistoryAutoLoad } from "../older-history-auto-load";
+import { resolveOlderHistoryAutoLoad } from "../history/older-history-auto-load";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {

@@ -15,7 +15,7 @@
  * avatar component for both would claim an account that does not exist.
  */
 
-import { NarratorAvatar } from "@frontend/components/narrator/NarratorAvatar";
+import { NarratorAvatar } from "@frontend/components/narrator/header/NarratorAvatar";
 import { UserAvatar } from "@frontend/components/UserAvatar";
 import { Badge, Box, Group, Text, ThemeIcon } from "@mantine/core";
 import {

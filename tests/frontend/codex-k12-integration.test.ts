@@ -84,9 +84,9 @@ describe("Codex K12 shared tier metadata integration", () => {
 	});
 
 	test("narrator quota indicator imports shared metadata separately from chart helpers", async () => {
-		const source = await readSource("frontend/components/narrator/CodexQuotaIndicator.tsx");
-		const sharedImport = getNamedImport(source, "../../lib/codex-tiers");
-		const chartImport = getNamedImport(source, "../providers/CodexQuotaTrendChart");
+		const source = await readSource("frontend/components/narrator/model/CodexQuotaIndicator.tsx");
+		const sharedImport = getNamedImport(source, "../../../lib/codex-tiers");
+		const chartImport = getNamedImport(source, "../../providers/CodexQuotaTrendChart");
 
 		expect(sharedImport).toContain("CODEX_TIER_STROKES");
 		expect(sharedImport).toContain("getCodexTierLabel");

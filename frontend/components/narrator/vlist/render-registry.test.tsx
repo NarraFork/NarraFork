@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { isValidElement } from "react";
-import { FileReferenceScopeProvider } from "../FileReferenceScope";
+import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
 import { VLIST_ELEMENT_KINDS, type VListElementKind } from "./registry";
 import { RenderMarkdown } from "./render/RenderMarkdown";

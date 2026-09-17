@@ -5,7 +5,7 @@ import {
 	MAX_RENDER_LOD,
 	MIN_RENDER_LOD,
 	type RenderLod,
-} from "../components/narrator/RenderLodCtx";
+} from "../components/narrator/lod/RenderLodCtx";
 
 const DEFAULT_KEY = "narrafork_lod_default";
 const storageKey = (narratorId: string) => `narrafork_lod:${narratorId}`;

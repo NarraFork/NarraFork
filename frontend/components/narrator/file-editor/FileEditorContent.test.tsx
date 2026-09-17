@@ -27,7 +27,10 @@ import {
 	useNarratorDockContext,
 } from "../dock/NarratorDockContext";
 import { FileDockPanel, useFilePanelSelectionPublisher } from "../dock/panels";
-import { type FilePanelOpener, useFilePanelSourceOpener } from "../file-panel-navigation";
+import {
+	type FilePanelOpener,
+	useFilePanelSourceOpener,
+} from "../file-panel/file-panel-navigation";
 import { stripIdentityFromLayout, stripNavigationFromLayout } from "../panels/layout-envelope";
 import type { FilePanelParams } from "../panels/panel-kind";
 import { WorkspaceDockStore } from "../workspace/workspace-dock";

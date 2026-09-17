@@ -8,7 +8,7 @@ import {
 	updateToolUseIndex,
 	upsertStreamingToolBlock,
 	upsertSubagentStreamingChunk,
-} from "../../frontend/components/narrator/message-tree-utils";
+} from "../../frontend/components/narrator/message/message-tree-utils";
 import type { TreeMessage } from "../../frontend/lib/api";
 import { makeMessage } from "./narrator-timeline.fixtures";
 

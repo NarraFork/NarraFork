@@ -16,7 +16,7 @@ import {
 	HEADER_TITLE_MIN_WIDTH_PX,
 	resolveHeaderToolbarBudget,
 	resolveHeaderToolbarCapacity,
-} from "@frontend/components/narrator/narrator-header-toolbar-capacity";
+} from "@frontend/components/narrator/header/narrator-header-toolbar-capacity";
 import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 export interface UseNarratorHeaderToolbarCapacityOptions {

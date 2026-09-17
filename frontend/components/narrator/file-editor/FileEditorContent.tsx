@@ -41,8 +41,8 @@ import { request } from "../../../lib/api/client";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import { saveBlobAsFile } from "../../../lib/file-download";
 import { getShikiLang } from "../../../lib/shiki-lang";
-import type { DiffLine } from "../DiffView";
-import { useFileReferenceScope } from "../FileReferenceScope";
+import { useFileReferenceScope } from "../composer/FileReferenceScope";
+import type { DiffLine } from "../diff/DiffView";
 import { availableModes } from "../file-viewer/file-viewer-modes";
 import { filePanelBaseName } from "../panels/panel-kind";
 import {
@@ -77,7 +77,7 @@ import { MonacoSearchPanel } from "./MonacoSearchPanel";
 import { monacoHostVisible } from "./monaco-scroll";
 import { type EditorState, isDirty, reloaded } from "./save-state";
 
-const DiffView = lazy(() => import("../DiffView").then((m) => ({ default: m.DiffView })));
+const DiffView = lazy(() => import("../diff/DiffView").then((m) => ({ default: m.DiffView })));
 const FileEditorPreview = lazy(() =>
 	import("./FileEditorPreview").then((m) => ({ default: m.FileEditorPreview })),
 );

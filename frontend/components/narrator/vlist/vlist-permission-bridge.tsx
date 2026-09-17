@@ -25,13 +25,13 @@
  */
 
 import { type ReactNode, useMemo } from "react";
-import { AskUserQuestionBanner, coerceQuestions } from "../AskUserQuestionBanner";
-import { InlinePermission } from "../InlinePermission";
 import type {
 	AsyncQuestionSlot,
 	PendingPermission,
 	PermissionCallbacks,
 } from "../narrator-panel-types";
+import { InlinePermission } from "../permission/InlinePermission";
+import { AskUserQuestionBanner, coerceQuestions } from "../question/AskUserQuestionBanner";
 import {
 	decidePermissionSlot,
 	isPermissionHostRow,

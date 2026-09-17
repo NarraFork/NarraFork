@@ -6,8 +6,8 @@ import { createDiffDocument, MAX_DIFF_LINES } from "@shared/pretext-layout/diff-
 import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
-import { AutoFollowScroll } from "../../AutoFollowScroll";
-import { DiffContent } from "../../DiffContent";
+import { DiffContent } from "../../diff/DiffContent";
+import { AutoFollowScroll } from "../../scroll/AutoFollowScroll";
 import { measureToolCall } from "../measure/measure-tool-call";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 import { RenderToolCall } from "./RenderToolCall";
@@ -129,7 +129,7 @@ describe("source projection replaces the old prefix reveal chain", () => {
 	});
 	it("does not retain a second painter or IntersectionObserver reveal implementation", () => {
 		const tool = readFileSync(join(import.meta.dir, "RenderToolCall.tsx"), "utf8");
-		const diff = readFileSync(join(import.meta.dir, "../../DiffContent.tsx"), "utf8");
+		const diff = readFileSync(join(import.meta.dir, "../../diff/DiffContent.tsx"), "utf8");
 		for (const name of [
 			"__TEST__DiffLines",
 			"function DiffBody",

@@ -312,7 +312,7 @@ describe("live-patch audit: EXHAUSTIVE — a height change always changes the ke
 	}
 
 	async function probe(messages: readonly Msg[]): Promise<Map<string, Probe>> {
-		const { segmentMessages } = await import("../message-segments");
+		const { segmentMessages } = await import("../message/message-segments");
 		const { adaptSegments } = await import("./segment-adapter");
 		const { VLIST_REGISTRY } = await import("./registry");
 		const { buildCacheKey, extractDataRevision } = await cacheMod();
@@ -610,8 +610,8 @@ describe("low-LOD folds: a fold that grows must re-key", () => {
 	 * because that is precisely the situation these paths create.
 	 */
 	async function probeFolds(messages: Msg[], lod: 1 | 2 | 3) {
-		const { segmentMessages } = await import("../message-segments");
-		const { groupRenderUnits } = await import("../render-units");
+		const { segmentMessages } = await import("../message/message-segments");
+		const { groupRenderUnits } = await import("../trace/render-units");
 		const { adaptRenderUnits } = await import("./segment-adapter");
 		const { VLIST_REGISTRY } = await import("./registry");
 		const { buildCacheKey, extractDataRevision } = await cacheMod();

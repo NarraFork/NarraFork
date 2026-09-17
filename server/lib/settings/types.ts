@@ -551,10 +551,14 @@ export interface NarraForkSettings {
 		defaultNarratorWriteAudience: "auto" | "owner" | "project" | "public";
 		/** Whether newly-created narrators should start with the plan trait enabled. */
 		defaultStartInPlanMode: boolean;
-		summaryModel: string;
-		/** Model used to translate reasoning blocks. "__summary__" follows summaryModel dynamically. */
-		translationModel: string;
-		customModels: ModelOption[];
+	summaryModel: string;
+	/** Model used to translate reasoning blocks. "__summary__" follows summaryModel dynamically. */
+	translationModel: string;
+	/** Model used for prompt optimization. "__summary__" follows summaryModel dynamically. */
+	promptOptimizeModel: string;
+	/** Maximum number of context messages for prompt optimization. Default 10. */
+	promptOptimizeContextMaxMessages?: number;
+	customModels: ModelOption[];
 		hiddenModels: string[];
 		maxTurns: number;
 		subagentModels: {

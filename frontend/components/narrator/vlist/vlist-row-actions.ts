@@ -18,7 +18,7 @@
  */
 
 import type { RevertScope } from "../../../lib/api/narrators";
-import type { MessageContextMenuActions } from "../MessageContextMenuCtx";
+import type { MessageContextMenuActions } from "../message/MessageContextMenuCtx";
 import type { VListToolMeta } from "./vlist-tool-meta";
 
 /**

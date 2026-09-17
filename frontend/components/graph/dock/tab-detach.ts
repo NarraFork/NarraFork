@@ -28,7 +28,7 @@
  */
 
 import { filePanelResourceId } from "../../narrator/panels/panel-kind";
-import { isToolEditReference } from "../../narrator/tool-edit-reference";
+import { isToolEditReference } from "../../narrator/tool-call/tool-edit-reference";
 import { type DetachablePanelKind, isDetachablePanelKind } from "./detachable";
 import { getChapterDock, getSurfaceChapterId, listSurfaceIds } from "./dock-registry";
 

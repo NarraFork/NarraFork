@@ -94,7 +94,7 @@ const BODY = (chars: number) => `**分析步骤**\n\n${"长文本".repeat(Math.c
 /** Build one frame through the REAL document path and return its first item. */
 async function frameItem(text: string) {
 	const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
-	const { recentRunSegmentMessageIds } = await import("../run-segments");
+	const { recentRunSegmentMessageIds } = await import("../trace/run-segments");
 	const built = buildPretextDocumentLayout([...HISTORY, streamingMessage(text)] as never[], {
 		layoutRevision: "r1",
 		documentRevision: "v1",
@@ -247,7 +247,7 @@ describe("the live tail reaches the DOM across the row memo", () => {
 			children: [],
 		};
 		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
-		const { recentRunSegmentMessageIds } = await import("../run-segments");
+		const { recentRunSegmentMessageIds } = await import("../trace/run-segments");
 		const built = buildPretextDocumentLayout([...HISTORY, settled] as never[], {
 			layoutRevision: "r1",
 			documentRevision: "v1",

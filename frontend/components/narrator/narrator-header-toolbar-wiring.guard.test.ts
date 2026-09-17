@@ -20,8 +20,15 @@ function read(name: string): Promise<string> {
 }
 
 const narratorPanel = () => read("./NarratorPanel.tsx");
-const overflowMenu = () => read("./NarratorToolbarOverflowMenu.tsx");
+// The title slot moved into its own component (it owns useTitleEditing); the
+// capacity marker lives there now, not inline in the panel.
+const headerTitle = () => read("./header/NarratorPanelHeaderTitle.tsx");
+const overflowMenu = () => read("./header/NarratorToolbarOverflowMenu.tsx");
 const capacityHook = () => read("../../hooks/useNarratorHeaderToolbarCapacity.ts");
+// The toolbar row markup lives in HeaderToolbar; the availability / layout /
+// activation / inline-options logic lives in its co-located hook.
+const headerToolbar = () => read("./header/HeaderToolbar.tsx");
+const headerToolbarHook = () => read("./header/use-header-toolbar.tsx");
 
 describe("header capacity measurement is wired to the DOM", () => {
 	it("attaches all three refs the budget calculation needs", async () => {
@@ -31,28 +38,30 @@ describe("header capacity measurement is wired to the DOM", () => {
 		// which is exactly the pre-fix behaviour.
 		expect(source).toContain("ref={headerRowRef}");
 		expect(source).toContain("ref={headerLeadingRef}");
-		expect(source).toContain("ref={headerToolbarRef}");
+		// The tool row anchor is applied inside HeaderToolbar (on the row it measures).
+		const toolbar = await headerToolbar();
+		expect(toolbar).toContain("ref={headerToolbarRef}");
 	});
 
 	it("marks the title slot so its width is budgeted, not measured", async () => {
-		const source = await narratorPanel();
+		const source = await headerTitle();
 		// The slot is `flex: 1`, so its measured width is whatever the tool row left
 		// over. Measuring it would make the budget a function of its own result.
 		expect(source).toContain('{...{ [HEADER_TITLE_SLOT_ATTR]: "" }}');
 	});
 
 	it("marks every always-present trailing control as fixed", async () => {
-		const panel = await narratorPanel();
+		const toolbar = await headerToolbar();
 		const menu = await overflowMenu();
-		// Close button and the debug mock entry live in the panel; the overflow
+		// Close button and the debug mock entry live in HeaderToolbar; the overflow
 		// trigger owns its own marker. A missing marker overstates the budget by one
 		// button's width, so the row keeps one entry too many and clips it.
-		expect(panel.match(/\[HEADER_TOOLBAR_FIXED_ATTR\]/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
+		expect(toolbar.match(/\[HEADER_TOOLBAR_FIXED_ATTR\]/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
 		expect(menu).toContain("[HEADER_TOOLBAR_FIXED_ATTR]");
 	});
 
 	it("feeds the measured capacity into the visible limit", async () => {
-		const source = await narratorPanel();
+		const source = await headerToolbarHook();
 		expect(source).toContain("headerCapacity ?? (isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT");
 		// The partition must stay uncapped: capping there would make the item count
 		// fed to the measurement depend on the measurement's own answer.
@@ -60,7 +69,7 @@ describe("header capacity measurement is wired to the DOM", () => {
 	});
 
 	it("keeps every registry entry at the width the constant assumes", async () => {
-		const source = await narratorPanel();
+		const source = await headerToolbar();
 		// HEADER_TOOLBAR_ITEM_WIDTH_PX is `ActionIcon size="sm"`. The registry loop
 		// renders one button per entry plus three special-cased controls; each must
 		// stay size="sm" or the arithmetic silently drifts.
@@ -87,8 +96,8 @@ describe("header capacity measurement is wired to the DOM", () => {
 	 * trigger in, and that trigger IS inside the scanned loop.
 	 */
 	it("keeps the self-contained controls' own triggers at the same width", async () => {
-		for (const name of ["ExecutionDeviceMenu", "NarratorLodMenu"]) {
-			const source = await read(`./${name}.tsx`);
+		for (const path of ["./model/ExecutionDeviceMenu.tsx", "./lod/NarratorLodMenu.tsx"]) {
+			const source = await read(path);
 			const triggers = source.split("<ActionIcon").slice(1);
 			expect(triggers.length).toBeGreaterThan(0);
 			for (const trigger of triggers) {
@@ -100,13 +109,13 @@ describe("header capacity measurement is wired to the DOM", () => {
 
 describe("entries collapsed for width stay accounted for", () => {
 	it("the overflow menu takes the hidden list from the header, not the divider", async () => {
-		const panel = await narratorPanel();
+		const toolbar = await headerToolbar();
 		const menu = await overflowMenu();
 		// Deriving it from the divider would count only entries the reader tucked
 		// away, so an entry collapsed for width would take its unread badge off
 		// screen with nothing to show it.
-		expect(panel).toContain("hiddenDefs={toolbarHiddenDefs}");
-		expect(panel).toContain("noRoomIds={toolbarNoRoomIds}");
+		expect(toolbar).toContain("hiddenDefs={toolbarHiddenDefs}");
+		expect(toolbar).toContain("noRoomIds={toolbarNoRoomIds}");
 		expect(menu).toContain("aggregateOverflowBadge(hiddenDefs ?? tuckedDefs, badgeCounts)");
 	});
 
@@ -182,12 +191,13 @@ describe("self-contained controls are reachable from the overflow menu", () => {
 		}
 	});
 
-	it("the panel supplies options for every self-contained registry id", async () => {
-		const panel = await narratorPanel();
-		expect(panel).toContain("renderInlineOptions={renderToolbarInlineOptions}");
-		const start = panel.indexOf("const renderToolbarInlineOptions");
+	it("the header supplies options for every self-contained registry id", async () => {
+		const toolbar = await headerToolbar();
+		expect(toolbar).toContain("renderInlineOptions={renderToolbarInlineOptions}");
+		const hook = await headerToolbarHook();
+		const start = hook.indexOf("const renderToolbarInlineOptions");
 		expect(start).toBeGreaterThan(-1);
-		const body = panel.slice(start, panel.indexOf("if (!narrator) return", start));
+		const body = hook.slice(start);
 		// An unhandled id falls through to `null`, which silently restores the dead row.
 		for (const id of ["device", "lodlevel", "plugins"]) {
 			expect(body).toContain(`case "${id}":`);
@@ -213,7 +223,7 @@ describe("self-contained controls are reachable from the overflow menu", () => {
 
 describe("the file-tree toolbar entry is wired to Dockview", () => {
 	it("tracks the Dockview panel's active state", async () => {
-		const source = await narratorPanel();
+		const source = await headerToolbarHook();
 		const start = source.indexOf("const toolbarEntryActive");
 		const end = source.indexOf("/**\n\t * Activate an entry", start);
 		const body = source.slice(start, end);
@@ -222,7 +232,7 @@ describe("the file-tree toolbar entry is wired to Dockview", () => {
 	});
 
 	it("activates the file-tree panel instead of falling through", async () => {
-		const source = await narratorPanel();
+		const source = await headerToolbarHook();
 		const start = source.indexOf("const activateToolbarEntry");
 		const end = source.indexOf("/**\n\t * Options the overflow menu", start);
 		const body = source.slice(start, end);

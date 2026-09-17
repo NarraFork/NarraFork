@@ -11,7 +11,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { MAX_INLINE_IMAGE_SOURCE_CHARS } from "../../image-clipboard";
+import { MAX_INLINE_IMAGE_SOURCE_CHARS } from "../../composer/image-clipboard";
 import { inlineImageSrcFromResult } from "./vlist-image";
 
 describe("inlineImageSrcFromResult", () => {

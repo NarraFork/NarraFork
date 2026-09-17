@@ -48,6 +48,8 @@ export const DEFAULTS: NarraForkSettings = {
 		// fresh install.
 		summaryModel: "",
 		translationModel: "__summary__",
+		promptOptimizeModel: "__summary__",
+		promptOptimizeContextMaxMessages: 3,
 		customModels: [],
 		hiddenModels: [],
 		maxTurns: 1000,
@@ -427,6 +429,15 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"agent.translationModel": {
 		desc: "用于翻译 reasoning/thinking 块的模型。默认 __summary__，动态跟随 summaryModel。",
 		type: "string",
+	},
+	"agent.promptOptimizeModel": {
+		desc: "用于提示词一键优化的模型。默认 __summary__，动态跟随 summaryModel。",
+		type: "string",
+	},
+	"agent.promptOptimizeContextMaxMessages": {
+		desc: "提示词优化时包含的最大上下文消息数量。默认 10 条。",
+		type: "number",
+		valid: "1-50, 默认 10",
 	},
 	"agent.customModels": {
 		desc: '自定义模型列表，添加到 UI 模型选择器。每项包含 value("provider:modelId")、label(显示名)、provider(可选)。',

@@ -23,8 +23,8 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import type { RenderLod } from "../lod/RenderLodCtx";
 import type { NarratorMsg } from "../narrator-panel-types";
-import type { RenderLod } from "../RenderLodCtx";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { buildPretextDocumentLayout } from "./pretext-document-layout";
 

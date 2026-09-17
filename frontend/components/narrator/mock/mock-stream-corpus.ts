@@ -358,7 +358,7 @@ const WRITE_CONTENT = `/**
  * resolve-measure-key.ts — One canonical cache key for a measured block.
  */
 
-import type { RenderLod } from "./RenderLodCtx";
+import type { RenderLod } from "../lod/RenderLodCtx";
 import type { MeasureCacheKey } from "./measure-cache";
 
 /**

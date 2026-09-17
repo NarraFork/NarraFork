@@ -58,33 +58,36 @@ import {
 	useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { ManualOlderHistoryLoad } from "../ManualOlderHistoryLoad";
-import { type MessageContextMenuActions, MessageContextMenuCtx } from "../MessageContextMenuCtx";
+import { ManualOlderHistoryLoad } from "../history/ManualOlderHistoryLoad";
+import {
+	resolveOlderHistoryAutoLoad,
+	resolveOlderHistoryAutoLoadEnabled,
+} from "../history/older-history-auto-load";
+import { useRenderLod } from "../lod/RenderLodCtx";
+import {
+	type MessageContextMenuActions,
+	MessageContextMenuCtx,
+} from "../message/MessageContextMenuCtx";
 import {
 	type MessageSelectionResolver,
 	makeMessageBlockSelectionId,
 	useMessageSelection,
-} from "../MessageSelectionCtx";
-import { resolveEditorInitialText } from "../message-edit-text";
-import type { MessageListHandle, MessageListTailMeta } from "../message-list-handle";
+} from "../message/MessageSelectionCtx";
+import { resolveEditorInitialText } from "../message/message-edit-text";
+import type { MessageListHandle, MessageListTailMeta } from "../message/message-list-handle";
 import { NarratorMessageListSkeleton } from "../NarratorMessageListSkeleton";
 import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
-import {
-	resolveOlderHistoryAutoLoad,
-	resolveOlderHistoryAutoLoadEnabled,
-} from "../older-history-auto-load";
-import { useRenderLod } from "../RenderLodCtx";
-import { recentRunSegmentMessageIds } from "../run-segments";
-import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../swipeState";
-import { TraceRowInteraction } from "../TraceRowInteraction";
+import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../scroll/swipeState";
 import {
 	getCategory,
 	getCategoryColor,
 	getSummary,
 	subagentRecentCallSummary,
-} from "../tool-display";
-import type { TraceRowIdentity } from "../trace-row-identity";
+} from "../tool-call/tool-display";
+import { recentRunSegmentMessageIds } from "../trace/run-segments";
+import { TraceRowInteraction } from "../trace/TraceRowInteraction";
+import type { TraceRowIdentity } from "../trace/trace-row-identity";
 import { openCommunicationRecipient } from "./communication-navigation";
 import type { MeasuredReasoning } from "./measure/measure-reasoning";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
@@ -337,10 +340,10 @@ import {
 // Editing chrome is lazy: a list that is only being read never pays for the
 // editor's module graph (attachment thumbs, upload flow) or the modal.
 const MessageEditorPanel = lazy(() =>
-	import("../MessageEditorPanel").then((m) => ({ default: m.MessageEditorPanel })),
+	import("../message/MessageEditorPanel").then((m) => ({ default: m.MessageEditorPanel })),
 );
 const OriginalContentModal = lazy(() =>
-	import("../MessageOriginalContent").then((m) => ({ default: m.OriginalContentModal })),
+	import("../message/MessageOriginalContent").then((m) => ({ default: m.OriginalContentModal })),
 );
 
 const ITEM_OVERSCAN = 600;

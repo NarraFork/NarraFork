@@ -24,7 +24,7 @@ import { join } from "node:path";
 
 /** Modules that consume a tool call's inputJson / outputJson. */
 const PAYLOAD_CONSUMERS = [
-	"ToolCallInspector.tsx",
+	"tool-call/ToolCallInspector.tsx",
 	"narrator-message-helpers.ts",
 	"vlist/segment-adapter.ts",
 	"vlist/vlist-selection.ts",

@@ -50,16 +50,16 @@ import { formatLocaleNumber } from "../../../lib/intl-format";
 import { getShikiLang } from "../../../lib/shiki-lang";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { TruncatedText } from "../../common/TruncatedText";
-import { ContentViewer } from "../ContentViewer";
+import { FileReferenceScopeProvider, useFileReferenceScope } from "../composer/FileReferenceScope";
+import { ContentViewer } from "../content/ContentViewer";
+import { MonacoEditor } from "../file-editor/MonacoEditor";
 import {
 	getFilePreviewType,
 	MAX_FILE_PREVIEW_BLOB_BYTES,
 	readTextPreview,
-} from "../FilePreviewModal";
-import { FileReferenceScopeProvider, useFileReferenceScope } from "../FileReferenceScope";
-import { MonacoEditor } from "../file-editor/MonacoEditor";
-import { MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../highlight-cache";
-import { MarkdownContent } from "../MarkdownContent";
+} from "../file-panel/FilePreviewModal";
+import { MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../markdown/highlight-cache";
+import { MarkdownContent } from "../markdown/MarkdownContent";
 import { filePanelBaseName } from "../panels/panel-kind";
 import { availableModes, type FileViewerMode } from "./file-viewer-modes";
 import { StructuredNodeTree } from "./StructuredNodeTree";

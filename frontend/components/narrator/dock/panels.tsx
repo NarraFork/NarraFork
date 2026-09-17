@@ -43,13 +43,13 @@ import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
 import type { PluginDockPanelProps } from "../../plugins/types";
-import { getFilePreviewType } from "../FilePreviewModal";
-import { FileReferenceScopeProvider } from "../FileReferenceScope";
+import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
+import { getFilePreviewType } from "../file-panel/FilePreviewModal";
 import {
 	FilePanelNavigationProvider,
 	type FilePanelOpener,
 	useFilePanelSourceOpener,
-} from "../file-panel-navigation";
+} from "../file-panel/file-panel-navigation";
 import {
 	type FilePanelParams,
 	filePanelBaseName,
@@ -59,7 +59,7 @@ import {
 	type SubagentPanelParams,
 } from "../panels/panel-kind";
 import { usePanelCompact, usePanelHeaderDrag } from "../panels/shared";
-import { toolEditReferenceKey } from "../tool-edit-reference";
+import { toolEditReferenceKey } from "../tool-call/tool-edit-reference";
 import type { NarratorDockPanelType } from "./dock-panel-types";
 import { NarratorDockContext, useNarratorDockContext } from "./NarratorDockContext";
 
@@ -70,18 +70,20 @@ const NarratorPanel = lazy(() =>
 	import("../NarratorPanel").then((m) => ({ default: m.NarratorPanel })),
 );
 const NarratorDetailsPanel = lazy(() =>
-	import("../NarratorDetailsPanel").then((m) => ({ default: m.NarratorDetailsPanel })),
+	import("../details/NarratorDetailsPanel").then((m) => ({ default: m.NarratorDetailsPanel })),
 );
 const BackgroundTasksPanel = lazy(() =>
-	import("../BackgroundTasksDrawer").then((m) => ({ default: m.BackgroundTasksPanel })),
+	import("../background/BackgroundTasksDrawer").then((m) => ({ default: m.BackgroundTasksPanel })),
 );
 const BrowserPanel = lazy(() =>
-	import("../BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
+	import("../browser/BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
 );
 const FileModificationsPanel = lazy(() =>
-	import("../FileModificationsDrawer").then((m) => ({ default: m.FileModificationsPanel })),
+	import("../file-panel/FileModificationsDrawer").then((m) => ({
+		default: m.FileModificationsPanel,
+	})),
 );
-const SpecPanel = lazy(() => import("../SpecPanel").then((m) => ({ default: m.SpecPanel })));
+const SpecPanel = lazy(() => import("../spec/SpecPanel").then((m) => ({ default: m.SpecPanel })));
 const AppearancePanel = lazy(() =>
 	import("../AppearancePanel").then((m) => ({ default: m.AppearancePanel })),
 );
@@ -102,7 +104,7 @@ const FileEditorContent = lazy(() =>
 	import("../file-editor/FileEditorContent").then((m) => ({ default: m.FileEditorContent })),
 );
 const ToolEditFileViewer = lazy(() =>
-	import("../ToolEditFileViewer").then((m) => ({ default: m.ToolEditFileViewer })),
+	import("../tool-call/ToolEditFileViewer").then((m) => ({ default: m.ToolEditFileViewer })),
 );
 const FileViewerContent = lazy(() =>
 	import("../file-viewer/FileViewerContent").then((m) => ({ default: m.FileViewerContent })),

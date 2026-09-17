@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import { segmentMessages } from "../message-segments";
+import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
-import { groupRenderUnits } from "../render-units";
+import { groupRenderUnits } from "../trace/render-units";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import type { AdapterRenderUnit, AdapterSegment } from "./segment-adapter";
 

@@ -352,7 +352,7 @@ describe("background task list HTTP compatibility", () => {
 		expect(first.tasks.map((task) => task.id)).toEqual(["newer"]);
 		expect(first.activeTasks?.map((task) => task.id)).toEqual(["newer", "older"]);
 		const { flattenBackgroundTaskList, toBackgroundTaskListState } = await import(
-			"../../../frontend/components/narrator/background-task-list-state"
+			"../../../frontend/components/narrator/background/background-task-list-state"
 		);
 		const currentTasks: BackgroundTaskListItem[] = flattenBackgroundTaskList(
 			toBackgroundTaskListState([first]),

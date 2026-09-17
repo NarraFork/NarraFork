@@ -15,8 +15,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { createHighlighterCore } from "shiki/core";
 import { createOnigurumaEngine } from "shiki/engine/oniguruma";
 import * as shikiLoader from "../../../lib/shiki-loader";
-import { HighlightedCode } from "../HighlightedCode";
-import { clearHighlightCache, MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../highlight-cache";
+import { HighlightedCode } from "../markdown/HighlightedCode";
+import { clearHighlightCache, MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../markdown/highlight-cache";
 
 let core: Awaited<ReturnType<typeof createHighlighterCore>>;
 let root: Root;

@@ -1,4 +1,7 @@
-import { getCategory, getCategoryColor } from "@frontend/components/narrator/tool-display";
+import {
+	getCategory,
+	getCategoryColor,
+} from "@frontend/components/narrator/tool-call/tool-display";
 import {
 	formatDurationText,
 	formatFullLocaleDateTime,

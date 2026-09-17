@@ -44,7 +44,7 @@ import {
 	usePersonalEntry,
 	useUpdatePersonalEntryContent,
 } from "../../../hooks/useKnowledge";
-import { MarkdownContent } from "../MarkdownContent";
+import { MarkdownContent } from "../markdown/MarkdownContent";
 import type { KnowledgeEntryScope } from "../panels/panel-kind";
 import {
 	canEditKnowledgeEntry,

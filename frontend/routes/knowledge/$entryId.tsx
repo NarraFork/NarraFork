@@ -45,8 +45,8 @@ import { ReviewScopeNotice } from "../../components/knowledge/ReviewScopeNotice"
 import { SubmissionAuthorActions } from "../../components/knowledge/SubmissionAuthorActions";
 import { SubmissionReviewPanel } from "../../components/knowledge/SubmissionReviewPanel";
 import { TransferOwnerModal } from "../../components/knowledge/TransferOwnerModal";
-import { DiffView } from "../../components/narrator/DiffView";
-import { MarkdownContent } from "../../components/narrator/MarkdownContent";
+import { DiffView } from "../../components/narrator/diff/DiffView";
+import { MarkdownContent } from "../../components/narrator/markdown/MarkdownContent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import {
 	useAddKnowledgeRevision,

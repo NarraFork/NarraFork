@@ -30,14 +30,14 @@ import {
 } from "@shared/native-injection";
 import { readCommunicationInjection } from "@shared/pretext-layout/segment-adapter";
 import { stringifyForDisplay } from "@shared/pretext-layout/tool-io-projection";
-import type { BlockMeta, CollectedSelectedText } from "../MessageSelectionCtx";
+import type { BlockMeta, CollectedSelectedText } from "../message/MessageSelectionCtx";
 import {
 	MAX_COLLECTED_SELECTED_TEXT_CHARS,
 	makeMessageBlockSelectionId,
-} from "../MessageSelectionCtx";
-import { filterChildrenByToolUse } from "../message-segments";
+} from "../message/MessageSelectionCtx";
+import { filterChildrenByToolUse } from "../message/message-segments";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
-import { groupReasoningRuns } from "../reasoning-segments";
+import { groupReasoningRuns } from "../trace/reasoning-segments";
 
 export interface SelectionEntry extends BlockMeta {
 	seq: number;

@@ -70,7 +70,7 @@ type Tails = ReadonlyMap<string, { charCount: number; tail: string }> | undefine
 async function frameTails(messages: unknown[]): Promise<Tails> {
 	const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
 	const { resolveRenderExtra } = await import("./render-registry");
-	const { recentRunSegmentMessageIds } = await import("../run-segments");
+	const { recentRunSegmentMessageIds } = await import("../trace/run-segments");
 	const built = buildPretextDocumentLayout(messages as never[], {
 		layoutRevision: "r1",
 		documentRevision: "v1",
@@ -140,7 +140,7 @@ describe("the scrolling tail does not leak measurement-cache entries", () => {
 		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
 		const { resolveRenderExtra } = await import("./render-registry");
 		const { measureCache } = await import("./measure-cache");
-		const { recentRunSegmentMessageIds } = await import("../run-segments");
+		const { recentRunSegmentMessageIds } = await import("../trace/run-segments");
 
 		const renderFrame = (text: string) =>
 			buildPretextDocumentLayout([...HISTORY, streamingMessage(text)] as never[], {

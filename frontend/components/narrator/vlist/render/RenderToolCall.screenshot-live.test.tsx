@@ -25,7 +25,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ImageViewerProvider } from "../../../common/ImageViewerProvider";
-import { segmentMessages } from "../../message-segments";
+import { segmentMessages } from "../../message/message-segments";
 import type { NarratorMsg } from "../../narrator-panel-types";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "../registry";

@@ -38,13 +38,13 @@ await testI18n.init({
 	react: { useSuspense: false },
 });
 
-const { RenderLodCtx } = await import("../RenderLodCtx");
+const { RenderLodCtx } = await import("../lod/RenderLodCtx");
 const { NarratorPanelVisibilityProvider } = await import("../narrator-panel-visibility");
-const { AutoFollowScroll } = await import("../AutoFollowScroll");
+const { AutoFollowScroll } = await import("../scroll/AutoFollowScroll");
 const { VListContentViewHost } = await import("./VListContentViewHost");
 type VListViewTarget = import("./vlist-content-view-target").VListViewTarget;
 type VListViewControls = import("./VListContentViewHost").VListViewControls;
-type ContentViewportSnapshot = import("../AutoFollowScroll").ContentViewportSnapshot;
+type ContentViewportSnapshot = import("../scroll/AutoFollowScroll").ContentViewportSnapshot;
 let readerProgress: ((node: HTMLElement, snapshot?: ContentViewportSnapshot) => void) | undefined;
 
 let root: Root | undefined;

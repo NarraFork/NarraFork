@@ -42,7 +42,7 @@ import { useCreateNarrator } from "../../hooks/useNarrator";
 import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { DirectoryPicker } from "../common/DirectoryPicker";
-import { resolveCwdPrefill } from "./create-narrator-cwd-prefill";
+import { resolveCwdPrefill } from "./composer/create-narrator-cwd-prefill";
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 const CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS = 60_000;

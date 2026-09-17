@@ -51,7 +51,7 @@ import {
 	IconTool,
 } from "@tabler/icons-react";
 import { useEffect, useRef, useState } from "react";
-import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
+import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import {
 	CARD_HEADER_INNER_ICON,
 	HEADER_CELL_GAP,

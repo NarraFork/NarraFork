@@ -1938,7 +1938,7 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
  * `outputJson` alone was 11-15%.
  *
  * The renderer never needs the array on this path. `segmentMessages`
- * (frontend/components/narrator/message-segments.ts) builds each `ToolCallData`
+ * (frontend/components/narrator/message/message-segments.ts) builds each `ToolCallData`
  * as `block.<field> ?? tc?.<field>` for every field it reads — the block is
  * always preferred and the row is only a fallback — and `enrichToolUseBlocks`
  * writes all of those fields onto the block (with `id`/`createdAt` landing as

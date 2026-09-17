@@ -125,7 +125,7 @@
 		"check": "bunx @biomejs/biome check .",
 		"db:generate": "bunx drizzle-kit generate",
 		"db:migrate": "bun server/db/migrate.ts",
-		"dev": "bun run db:migrate; PORT=7779 bun run --hot server/index.ts",
+		"dev": "bun run db:migrate; PORT=7780 bun run --hot server/index.ts",
 		"dev:all": "bun server/dev-all.ts",
 		"dev:cold": "bun server/dev-all.ts --cold",
 		"dev:ts": "bun server/dev-all.ts",
@@ -134,12 +134,13 @@
 		"i18n:check": "bun server/scripts/check-i18n.ts",
 		"start": "NODE_ENV=production bun run db:migrate && NODE_ENV=production bun server/index.ts",
 		"start:dev": "NODE_ENV=production bun run db:migrate && (NODE_ENV=production bun server/index.ts &) && VITE_PORT=41221 BACKEND_PORT=7778 bunx vite --config frontend/vite.config.ts --mode production",
-		"test": "bun test",
+		"test": "bun test --isolate",
+		"test:fast": "bun test",
 		"smoke:dock": "bun scripts/smoke-narrator-dock.ts",
 		"smoke:dock:visual": "bun scripts/visualize-dock-drag.ts",
 		"benchmark:narrator-history": "bun server/scripts/benchmark-narrator-history.ts",
 		"typecheck": "tsgo --noEmit",
-		"test:watch": "bun test --watch"
+		"test:watch": "bun test --isolate --watch"
 	},
 	"trustedDependencies": [
 		"@parcel/watcher",

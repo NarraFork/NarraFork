@@ -14,7 +14,7 @@ import type {
 	TreeMessage,
 } from "../../lib/api";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "../../lib/responsive";
-import type { Question } from "./ask-user-question-utils";
+import type { Question } from "./question/ask-user-question-utils";
 
 // Inject highlight blink animation
 if (typeof document !== "undefined") {

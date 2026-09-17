@@ -29,7 +29,7 @@ import { parseHTML } from "linkedom";
 import type { ReactNode } from "react";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
+import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
 import { measureReasoning } from "../measure/measure-reasoning";
 import { measureToolCall } from "../measure/measure-tool-call";
 import { measureActivityTrace } from "../measure/measure-tool-run";

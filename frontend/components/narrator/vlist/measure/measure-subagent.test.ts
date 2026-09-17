@@ -373,6 +373,7 @@ describe("measureSubagentCard — timing passthrough (header + recent rows)", ()
 		expect(m.timing).toEqual({
 			startedAt: null,
 			streamStartedAt: null,
+			streamCompletedAt: null,
 			permissionStartedAt: null,
 			executionStartedAt: 1_000,
 			completedAt: 4_000,

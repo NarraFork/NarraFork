@@ -6,10 +6,13 @@ import { type AdapterMessage, adaptSegments } from "@shared/pretext-layout/segme
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { FileReferenceScopeProvider } from "../../FileReferenceScope";
-import { buildStreamingMsg, type StreamingBlock } from "../../message-segments";
+import { FileReferenceScopeProvider } from "../../composer/FileReferenceScope";
+import { buildStreamingMsg, type StreamingBlock } from "../../message/message-segments";
 import type { NarratorMsg } from "../../narrator-panel-types";
-import { applyStreamingDelta, applyStreamingSnapshotBlocks } from "../../streaming-delta-fold";
+import {
+	applyStreamingDelta,
+	applyStreamingSnapshotBlocks,
+} from "../../streaming/streaming-delta-fold";
 import { TEXT_FILE_HEIGHT } from "../measure/measure-media";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 import { buildCacheKey, extractDataRevision } from "../measure-cache";

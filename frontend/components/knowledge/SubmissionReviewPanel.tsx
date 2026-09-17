@@ -24,7 +24,7 @@ import type {
 	KnowledgeSubmissionDetail,
 	KnowledgeVerdict,
 } from "../../lib/api";
-import { DiffView } from "../narrator/DiffView";
+import { DiffView } from "../narrator/diff/DiffView";
 
 interface Props {
 	submission: KnowledgeSubmissionDetail;

@@ -27,10 +27,10 @@ import {
 import { type PluginDockPanelHostApi, PluginDockPanelView } from "../../plugins/PluginDockPanel";
 import { PluginUiSurfaceProvider } from "../../plugins/PluginUiSurfaceContext";
 import type { PluginDockPanelParams } from "../../plugins/protocol";
+import { WebviewPanel } from "../browser/WebviewPanel";
 import { NarratorPanel } from "../NarratorPanel";
 import { usePanelCompact } from "../panels/shared";
 import type { WebviewLeafConfig } from "../split-tree";
-import { WebviewPanel } from "../WebviewPanel";
 import {
 	computeDirectorFrames,
 	DIRECTOR_DIVIDER_HIT_SIZE,

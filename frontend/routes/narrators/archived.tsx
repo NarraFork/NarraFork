@@ -6,13 +6,13 @@ import { useTranslation } from "react-i18next";
 import {
 	NarratorListCard,
 	type NarratorListItem,
-} from "../../components/narrator/NarratorListCard";
+} from "../../components/narrator/list/NarratorListCard";
 import {
 	NarratorListControls,
 	NarratorListExtraFiltersButton,
 	NarratorListLoadMoreButton,
 	NarratorListLocalSearchSummary,
-} from "../../components/narrator/NarratorListControls";
+} from "../../components/narrator/list/NarratorListControls";
 import {
 	buildNarratorListQueryOptions,
 	filterNarratorsByLocalQuery,
@@ -21,7 +21,7 @@ import {
 	normalizeNarratorListSearchPatch,
 	useNarratorInfiniteScroll,
 	validateNarratorListSearch,
-} from "../../components/narrator/narrator-list-utils";
+} from "../../components/narrator/list/narrator-list-utils";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	useDeleteNarrator,

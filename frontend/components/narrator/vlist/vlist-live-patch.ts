@@ -66,7 +66,7 @@ import {
 	replaceSubagentActivitySnapshot,
 	updateSubagentActivityInMessages,
 	upsertSubagentToolCallHeader,
-} from "../message-tree-utils";
+} from "../message/message-tree-utils";
 import { isLiveToolStatusRegression } from "./streaming-tool-chunks";
 
 /** Result of one patch attempt over the loaded document. */

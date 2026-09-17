@@ -273,7 +273,7 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 
 **能力按种类分别 gate**（`InjectionNavigation`）：每个 opener 独立可选，宿主够不到某种目标就让那些行保持惰性，而不是回落到另一种 opener——把 spec 行交给叙述者 opener 会路由到错误的地方。`coerceInjectionTarget` 还会拒收畸形目标（缺 id、未知 kind），因为**缺 id 的目标正是那种"画出一个看起来能点、点了跳到 undefined"的形状**。
 
-**Spec 文件的跳转走一个小注册表**（`frontend/components/narrator/spec-file-reveal.ts`），不是 dock context 也不是冒泡事件：点击时 Spec 面板通常还不存在（打开它正是这次点击的第一个效果），所以 dock context 无法承载第二步；而 dock 面板不是 chat viewport 的 DOM 后代，`spec-open-tasks` 那种冒泡事件到不了它。注册表带**有界**重试（面板挂载需要一两帧），到期安静放弃——真正的失败模式是"这个 surface 没有 Spec 面板"。选择走 `handleSelectFile` 而非裸 `setSelectedUri`，因为未保存编辑的确认对话框在那个 handler 里，绕过它会静默丢弃读者正在打的字。
+**Spec 文件的跳转走一个小注册表**（`frontend/components/narrator/spec/spec-file-reveal.ts`），不是 dock context 也不是冒泡事件：点击时 Spec 面板通常还不存在（打开它正是这次点击的第一个效果），所以 dock context 无法承载第二步；而 dock 面板不是 chat viewport 的 DOM 后代，`spec-open-tasks` 那种冒泡事件到不了它。注册表带**有界**重试（面板挂载需要一两帧），到期安静放弃——真正的失败模式是"这个 surface 没有 Spec 面板"。选择走 `handleSelectFile` 而非裸 `setSelectedUri`，因为未保存编辑的确认对话框在那个 handler 里，绕过它会静默丢弃读者正在打的字。
 
 **跳转请求是请求，不是状态。** `SubagentPanelParams.highlightMessageId` 走 panel **参数**而非 `scrollToMessage` 桥，因为点击时面板通常还不存在、没有注册者可调。它与 `highlightRequestId` 一起被 `stripIdentityFromLayout` 剥掉：恢复布局必须把会话停在读者上次离开的位置，而不是重放上一次访问的跳转。`highlightRequestId` 的存在是因为 `NarratorPanel` 按 (narrator, target) latch 一次跳转（刻意如此，否则会跟读者自己的滚动打架）——没有这个变化的 token，读者滚开后再点同一行会静默无反应。
 
@@ -347,7 +347,7 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 | `frontend/components/narrator/vlist/system-injection-adapter.test.ts` | 路由（`origin_notice` vs `injection-bubble`）、拆气泡与 key 稳定性、读者向 body、标题标签回退、六种导航目标 + 三种刻意不给（`bg_bash` / 多文件 spec / 任务摘要）、缺 message id 仍可开、高度中性 |
 | `frontend/components/narrator/vlist/vlist-injection-header.test.tsx` | 说话人身份/头像分型，以及可点 header：四种目标各自透传、**每种只用自己的 opener**、**不按 identicon 种子导航**、畸形目标被拒、按种类取 label |
 | `shared/pretext-layout/__tests__/injection-target.test.ts` | `coerceInjectionTarget`：接受合法目标、null/空串 message id 归一、scope 兜底 global、拒收缺 id / 未知 kind / 非对象 |
-| `frontend/components/narrator/spec-file-reveal.test.ts` | 面板已挂载即同步选中、点击后才挂载的等待、可取消、到期放弃、remount 的 last-write-wins 与**陈旧 unregister 不清活跃 selector** |
+| `frontend/components/narrator/spec/spec-file-reveal.test.ts` | 面板已挂载即同步选中、点击后才挂载的等待、可取消、到期放弃、remount 的 last-write-wins 与**陈旧 unregister 不清活跃 selector** |
 | `frontend/components/narrator/dock/narrator-dock-layout.test.ts` | 布局持久化剥掉一次性跳转请求，保留 subagent 资源身份 |
 | `frontend/components/narrator/vlist/measure/measure-injection-bubble.test.ts` | 气泡几何：shrink-wrap 宽度纪律、header/note 固定行、字符硬顶 |
 | `frontend/components/narrator/vlist/render/RenderInjectionBubble.test.tsx` | measure/render parity：画在测量宽度上、header/note 只在预留时画 |

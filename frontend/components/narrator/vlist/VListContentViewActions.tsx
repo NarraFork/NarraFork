@@ -34,7 +34,7 @@ import {
 import type { CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { MESSAGE_SELECTION_IGNORE_ATTR } from "../MessageSelectionCtx";
+import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
 import { isMarkdownTarget } from "./vlist-content-view-body";
 import type { VListViewTarget } from "./vlist-content-view-target";
 

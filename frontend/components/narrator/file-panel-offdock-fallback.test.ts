@@ -21,29 +21,43 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const PANEL = readFileSync(join(import.meta.dir, "NarratorPanel.tsx"), "utf8");
+/**
+ * The route SELECTION (dock panel vs off-dock drawer) now lives in this hook; the
+ * panel keeps only the Drawer that hosts the viewer. Both halves are asserted, so
+ * neither the routing rule nor the drawer host can be dropped unnoticed.
+ */
+const VIEWER_HOOK = readFileSync(
+	join(import.meta.dir, "interaction", "use-internal-file-viewer.ts"),
+	"utf8",
+);
 
 describe("off-dock file viewer fallback", () => {
 	it("keeps the dock panel as the preferred route", () => {
 		// A dockview host must still open a real tab beside the chat rather than a
 		// drawer that covers the conversation it was opened from.
-		expect(PANEL).toContain(
+		expect(VIEWER_HOOK).toContain(
 			"if (dockOpenFilePanel) return (filePath: string) => dockOpenFilePanel(filePath);",
 		);
 	});
 
 	it("falls back to the internal drawer when there is no dock", () => {
-		expect(PANEL).toContain(
-			"const useInternalFileViewer = !dockOpenFilePanel && !isWorkspacePreview;",
+		expect(VIEWER_HOOK).toContain(
+			"const useInternalViewer = !dockOpenFilePanel && !isWorkspacePreview;",
 		);
-		expect(PANEL).toMatch(
-			/if \(useInternalFileViewer\)[\s\S]*?setInternalFileViewerTarget\(null\);[\s\S]*?setInternalFileViewerPath\(filePath\);/,
+		expect(VIEWER_HOOK).toMatch(
+			/if \(useInternalViewer\)[\s\S]*?setInternalFileViewerTarget\(null\);[\s\S]*?setInternalFileViewerPath\(filePath\);/,
 		);
 	});
 
 	it("still leaves workspace previews without a viewer", () => {
 		// Previews stay lightweight (same rule as the internal spec drawer), so their
 		// rows hide the affordance instead of opening a drawer inside a thumbnail.
-		expect(PANEL).toMatch(/useInternalFileViewer = !dockOpenFilePanel && !isWorkspacePreview/);
+		expect(VIEWER_HOOK).toMatch(/useInternalViewer = !dockOpenFilePanel && !isWorkspacePreview/);
+		// The panel's own affordance gate must keep the preview exclusion too — the
+		// hook returning a handler is not enough if the panel offered it anyway.
+		expect(VIEWER_HOOK).toContain(
+			"const canOpenReferencedFile = !isWorkspacePreview && (!!dockOpenFilePanel || useInternalViewer);",
+		);
 	});
 
 	it("mounts the drawer only while a path is selected", () => {

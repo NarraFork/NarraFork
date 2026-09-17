@@ -18,7 +18,7 @@ import {
 	type NarratorToolbarHost,
 	type NarratorToolbarItemDef,
 	narratorToolbarItem,
-} from "../components/narrator/narrator-toolbar-items";
+} from "../components/narrator/header/narrator-toolbar-items";
 
 export { MOBILE_TOOLBAR_VISIBLE_LIMIT, NARRATOR_TOOLBAR_DIVIDER_ID };
 

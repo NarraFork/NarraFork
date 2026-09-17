@@ -41,7 +41,7 @@ import {
 } from "../lib/update-state";
 import { CopyButton } from "./common/CopyButton";
 import { useConfirmDialog } from "./common/confirm-dialog-context";
-import { MarkdownContent } from "./narrator/MarkdownContent";
+import { MarkdownContent } from "./narrator/markdown/MarkdownContent";
 
 function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes} B`;

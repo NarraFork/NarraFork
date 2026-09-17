@@ -15,6 +15,7 @@ import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { api as apiClient } from "../../../lib/api";
 import { PluginDockPanel } from "../../plugins/PluginDockPanel";
+import { WebviewPanel } from "../browser/WebviewPanel";
 import { NarratorDockContext } from "../dock/NarratorDockContext";
 import {
 	BrowserDockPanel as BrowserToolAdapter,
@@ -31,7 +32,7 @@ import {
 	TerminalDockPanel as TerminalToolAdapter,
 	UserChatDockPanel as UserChatToolAdapter,
 } from "../dock/panels";
-import { useFilePanelSourceOpener } from "../file-panel-navigation";
+import { useFilePanelSourceOpener } from "../file-panel/file-panel-navigation";
 import { NarratorPanel } from "../NarratorPanel";
 import { NarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
 import type {
@@ -41,7 +42,6 @@ import type {
 } from "../panels/panel-kind";
 import { usePanelCompact, usePanelHeaderDrag } from "../panels/shared";
 import type { WebviewLeafConfig } from "../split-tree";
-import { WebviewPanel } from "../WebviewPanel";
 import {
 	type NarratorPanelParams,
 	type NarratorToolPanelParams,

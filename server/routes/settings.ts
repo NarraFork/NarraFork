@@ -391,6 +391,8 @@ export const updateSettingsSchema = z
 				defaultStartInPlanMode: z.boolean(),
 				summaryModel: z.string(),
 				translationModel: z.string(),
+				promptOptimizeModel: z.string(),
+				promptOptimizeContextMaxMessages: z.number().int().min(1).max(50),
 				customModels: z.array(modelOptionSchema),
 				hiddenModels: z.array(z.string()),
 				maxTurns: z.number().int().min(1).max(1000),

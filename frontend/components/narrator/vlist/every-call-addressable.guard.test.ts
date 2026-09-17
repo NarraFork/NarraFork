@@ -19,10 +19,10 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { AdapterContext, AdapterRenderUnit } from "@shared/pretext-layout/segment-adapter";
-import { segmentMessages } from "../message-segments";
+import { MAX_RENDER_LOD, MIN_RENDER_LOD, type RenderLod } from "../lod/RenderLodCtx";
+import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
-import { MAX_RENDER_LOD, MIN_RENDER_LOD, type RenderLod } from "../RenderLodCtx";
-import { groupRenderUnits } from "../render-units";
+import { groupRenderUnits } from "../trace/render-units";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {

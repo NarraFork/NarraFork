@@ -30,7 +30,7 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
-import { DiffContent } from "@frontend/components/narrator/DiffContent";
+import { DiffContent } from "@frontend/components/narrator/diff/DiffContent";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import {
@@ -78,8 +78,8 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
-import { AutoFollowScroll } from "../../AutoFollowScroll";
-import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
+import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
+import { AutoFollowScroll } from "../../scroll/AutoFollowScroll";
 import { OPTION_CONTROL_SIZE } from "../measure/measure-permission";
 import {
 	CARD_HEADER_INNER_ICON,

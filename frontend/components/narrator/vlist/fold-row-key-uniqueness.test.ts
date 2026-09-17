@@ -63,8 +63,8 @@ function reasoningMessage(messageId: string, text: string) {
 
 /** Every folded row emitted by the low-LOD pipeline, in order. */
 async function foldedRows(messages: unknown[]) {
-	const { segmentMessages } = await import("../message-segments");
-	const { groupRenderUnits } = await import("../render-units");
+	const { segmentMessages } = await import("../message/message-segments");
+	const { groupRenderUnits } = await import("../trace/render-units");
 	const { adaptRenderUnits } = await import("./segment-adapter");
 	const units = groupRenderUnits(segmentMessages(messages as never), true);
 	const specs = adaptRenderUnits(units as never, { lod: 2 });
@@ -192,8 +192,8 @@ describe("hand-off across an activity-unit boundary", () => {
 		// persisted copy and the still-live synthetic one, putting them in two different
 		// traces. Rows in separate traces are not React siblings, so this would not
 		// OVERLAP — it would be worse in a quieter way: the same call listed twice.
-		const { segmentMessages } = await import("../message-segments");
-		const { groupRenderUnits } = await import("../render-units");
+		const { segmentMessages } = await import("../message/message-segments");
+		const { groupRenderUnits } = await import("../trace/render-units");
 		const { adaptRenderUnits } = await import("./segment-adapter");
 
 		const units = groupRenderUnits(
@@ -283,8 +283,8 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 
 	/** Row keys grouped PER TRACE — a duplicate only overlaps within one trace. */
 	async function traceRowKeys(messages: unknown[]): Promise<string[][]> {
-		const { segmentMessages } = await import("../message-segments");
-		const { groupRenderUnits } = await import("../render-units");
+		const { segmentMessages } = await import("../message/message-segments");
+		const { groupRenderUnits } = await import("../trace/render-units");
 		const { adaptRenderUnits } = await import("./segment-adapter");
 		const units = groupRenderUnits(segmentMessages(messages as never), true);
 		const specs = adaptRenderUnits(units as never, { lod: 2 });
@@ -333,8 +333,8 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 		// This also checks `measured.rows`, the list the renderer actually paints at
 		// absolute offsets — the layer where a duplicate becomes the visible overlap.
 		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
-		const { getCategory, getCategoryColor } = await import("../tool-display");
-		const { recentRunSegmentMessageIds } = await import("../run-segments");
+		const { getCategory, getCategoryColor } = await import("../tool-call/tool-display");
+		const { recentRunSegmentMessageIds } = await import("../trace/run-segments");
 
 		const withSeq = (message: Record<string, unknown>, seq: number) => ({ ...message, seq });
 		const textMessage = (messageId: string, seq: number) => ({
@@ -431,7 +431,7 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 		// header, but the run holding live output stays open — otherwise a "no duplicate
 		// painted rows" pass would be vacuously true because nothing was painted.
 		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
-		const { recentRunSegmentMessageIds } = await import("../run-segments");
+		const { recentRunSegmentMessageIds } = await import("../trace/run-segments");
 
 		const built = buildPretextDocumentLayout(
 			[
@@ -481,8 +481,8 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 		// offset — the exact shape of the reported overprint. Using measured geometry (not
 		// hand-written numbers) also proves `top`/`blockHeight` are populated as assumed.
 		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
-		const { getCategory, getCategoryColor } = await import("../tool-display");
-		const { recentRunSegmentMessageIds } = await import("../run-segments");
+		const { getCategory, getCategoryColor } = await import("../tool-call/tool-display");
+		const { recentRunSegmentMessageIds } = await import("../trace/run-segments");
 
 		const built = buildPretextDocumentLayout(
 			[

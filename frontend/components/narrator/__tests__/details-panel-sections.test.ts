@@ -22,7 +22,7 @@ import {
 	sectionStorageKey,
 	shouldPromoteAdvancedRow,
 	shouldRenderAdvancedSubsection,
-} from "../details-panel-sections";
+} from "../details/details-panel-sections";
 
 describe("section identity", () => {
 	test("settings sections open by default, diagnostics do not", () => {

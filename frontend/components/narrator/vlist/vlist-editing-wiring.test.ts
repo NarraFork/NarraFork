@@ -48,7 +48,7 @@ describe("vlist inline editing wiring", () => {
 		expect(SHELL).toMatch(/const OriginalContentModal = lazy\(\(\) =>\s*\n?\s*import\("\.\.\//);
 		// The pure text helper may be imported statically (it carries no component
 		// graph); the editor component itself must NOT be.
-		expect(SHELL).toContain('from "../message-edit-text"');
+		expect(SHELL).toContain('from "../message/message-edit-text"');
 		expect(SHELL).not.toMatch(/^import \{[^}]*MessageEditorPanel[^}]*\} from/m);
 	});
 

@@ -1725,5 +1725,27 @@
 		"permission": "Tool permission",
 		"plan_approval": "Plan approval",
 		"reflection": "Reflection · human decision"
-	}
+	},
+	"optimizePrompt": "Optimize prompt",
+	"optimizeStyleLabel": "Choose optimization style",
+	"optimizeStyleClarify": "Make it clearer",
+	"optimizeStyleConcise": "Make it concise",
+	"optimizeStyleStructured": "Add structure",
+	"optimizeStyleTranslateEn": "Translate to English",
+	"optimizeWithContext": "Include context",
+	"optimizeWithContextHint": "Better results with conversation history, but uses more tokens",
+	"optimizeWithContextHintEnabled": "Will include up to {{count}} recent messages as context (~2000-10000 tokens)",
+	"optimizeContextMessageCount": "Context message count",
+	"optimizeContextMessageCountHint": "Range 1-50, more context improves quality but uses more tokens",
+	"optimizeSuccess": "Prompt optimized",
+	"optimizeUndo": "Undo",
+	"optimizeFailed": "Optimization failed",
+	"optimizeFailedGeneric": "An error occurred while optimizing the prompt",
+	"optimizeTimeout": "Optimization request timed out",
+	"optimizeNoContext": "No context messages available",
+	"fullscreenComposerTitle": "Compose message",
+	"fullscreenComposerPlaceholder": "Write your message here...",
+	"fullscreenStats": "{{chars}} characters · {{lines}} lines · {{words}} words",
+	"fullscreenHint": "Ctrl+Enter to apply · Esc to cancel",
+	"expandComposer": "Expand to fullscreen"
 }
