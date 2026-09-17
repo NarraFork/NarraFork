@@ -1,10 +1,11 @@
 import { realpath } from "node:fs/promises";
-import { eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, or, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { db } from "../db";
 import { chapters, projects, remoteDevices } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { isSecretPlatformPath, isSecretUserPath } from "../lib/fs-secret-paths";
+import { logger } from "../lib/logger";
 import { narratorPrincipalOf, requireNarratorAccess } from "../lib/narrator-access";
 import { getHome } from "../lib/platform";
 import { requireChapterAccess } from "../lib/project-access";
@@ -18,6 +19,7 @@ import {
 	resolveChapterGitTarget,
 	resolveNarratorGitTarget,
 } from "./git-workspace";
+import { ACCESS_PAGE_SIZE, GitAccessScan } from "./git-workspace-access-scan";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { canWriteNarrator } from "./narrator-acl";
 import { resolveOAuthDeviceRuntimeAuthorization } from "./oauth-device-runtime-policy";
@@ -100,7 +102,7 @@ function ancestors(path: string, target: GitWorkspaceTarget): string[] {
 }
 
 /** Bound both rows and fields. Standalone cwd must not bypass a protected project's ACL. */
-async function relatedProjects(target: GitWorkspaceTarget) {
+async function relatedProjects(target: GitWorkspaceTarget, scan: GitAccessScan) {
 	if (!target.backend || target.backend.kind !== "local" || !target.workspace.rootPath) return [];
 	const root = target.workspace.rootPath;
 	const candidates = new Set([
@@ -111,75 +113,75 @@ async function relatedProjects(target: GitWorkspaceTarget) {
 			: []),
 	]);
 	const escaped = `${root.replace(/[\\%_]/g, "\\$&")}/%`;
-	const rows = await db
-		.select({
-			id: projects.id,
-			ownerUserId: projects.ownerUserId,
-			visibility: projects.visibility,
-			gitPath: projects.gitPath,
-		})
-		.from(projects)
-		.where(
-			or(
-				inArray(projects.gitPath, [...candidates]),
-				sql`${projects.gitPath} like ${escaped} escape '\\'`,
-			),
-		)
-		.limit(257);
-	const chapterRows = await db
-		.select({ projectId: chapters.projectId })
-		.from(chapters)
-		.where(inArray(chapters.worktreePath, [...candidates]))
-		.limit(257);
-	if (rows.length > 256 || chapterRows.length > 256) throw denied();
-	const missing = [...new Set(chapterRows.map((row) => row.projectId))].filter(
-		(id) => !rows.some((row) => row.id === id),
-	);
-	if (missing.length)
-		rows.push(
-			...(await db
-				.select({
-					id: projects.id,
-					ownerUserId: projects.ownerUserId,
-					visibility: projects.visibility,
-					gitPath: projects.gitPath,
-				})
-				.from(projects)
-				.where(inArray(projects.id, missing))
-				.limit(256)),
-		);
-	// A project may have been registered through a symlink. Lexical SQL matching
-	// alone would let a standalone narrator use its physical spelling to bypass ACL.
-	// Bound metadata and asynchronous canonicalization; never read project content.
-	const aliases = await db
-		.select({
-			id: projects.id,
-			ownerUserId: projects.ownerUserId,
-			visibility: projects.visibility,
-			gitPath: projects.gitPath,
-		})
-		.from(projects)
-		.limit(257);
-	if (aliases.length > 256) throw denied();
-	for (let start = 0; start < aliases.length; start += 8) {
-		const canonical = await Promise.all(
-			aliases.slice(start, start + 8).map(async (project) => ({
-				project,
-				path: project.gitPath ? await realpath(project.gitPath).catch(() => null) : null,
-			})),
-		);
-		for (const item of canonical) {
-			if (!item.path || rows.some((row) => row.id === item.project.id)) continue;
-			const paths = target.backend.paths;
-			if (
-				paths.contains(item.path, root) ||
-				paths.contains(root, item.path) ||
-				(target.repositoryPath && paths.contains(item.path, target.repositoryPath))
+	const fields = {
+		id: projects.id,
+		ownerUserId: projects.ownerUserId,
+		visibility: projects.visibility,
+		gitPath: projects.gitPath,
+	};
+	type Project = Pick<typeof projects.$inferSelect, keyof typeof fields>;
+	const matches = new Map<string, Project>();
+	for await (const page of scan.pagesOf((cursor) =>
+		db
+			.select(fields)
+			.from(projects)
+			.where(
+				and(
+					cursor ? gt(projects.id, cursor) : undefined,
+					or(
+						inArray(projects.gitPath, [...candidates]),
+						sql`${projects.gitPath} like ${escaped} escape '\\'`,
+					),
+				),
 			)
-				rows.push(item.project);
-		}
+			.orderBy(asc(projects.id))
+			.limit(ACCESS_PAGE_SIZE),
+	)) {
+		for (const row of page) matches.set(row.id, row);
 	}
-	return rows;
+	for await (const page of scan.pagesOf((cursor) =>
+		db
+			.select({ id: chapters.id, projectId: chapters.projectId })
+			.from(chapters)
+			.where(
+				and(
+					cursor ? gt(chapters.id, cursor) : undefined,
+					inArray(chapters.worktreePath, [...candidates]),
+				),
+			)
+			.orderBy(asc(chapters.id))
+			.limit(ACCESS_PAGE_SIZE),
+	)) {
+		const missing = [...new Set(page.map((row) => row.projectId))].filter((id) => !matches.has(id));
+		if (!missing.length) continue;
+		const rows = await scan.run(() =>
+			db.select(fields).from(projects).where(inArray(projects.id, missing)).limit(ACCESS_PAGE_SIZE),
+		);
+		for (const row of rows) matches.set(row.id, row);
+	}
+	// Registered symlink aliases can occur anywhere in the project table.
+	const paths = target.backend.paths;
+	for await (const page of scan.pagesOf((cursor) =>
+		db
+			.select(fields)
+			.from(projects)
+			.where(cursor ? gt(projects.id, cursor) : undefined)
+			.orderBy(asc(projects.id))
+			.limit(ACCESS_PAGE_SIZE),
+	)) {
+		await scan.canonicalize(
+			page.filter((row) => !matches.has(row.id)),
+			(project, path) => {
+				if (
+					paths.contains(path, root) ||
+					paths.contains(root, path) ||
+					(target.repositoryPath && paths.contains(path, target.repositoryPath))
+				)
+					matches.set(project.id, project);
+			},
+		);
+	}
+	return [...matches.values()];
 }
 
 export async function authorizeGitTarget(
@@ -302,12 +304,13 @@ export async function authorizeGitTarget(
 		return target;
 	}
 	const root = workspace.rootPath;
+	const scan = new GitAccessScan(signal);
 	try {
-		for (const project of await relatedProjects(target)) {
-			if (!(await hasProjectAccess(project, principal, "read"))) throw denied();
-			canWrite &&= await hasProjectAccess(project, principal, "write");
+		for (const project of await relatedProjects(target, scan)) {
+			if (!(await scan.run(() => hasProjectAccess(project, principal, "read")))) throw denied();
+			canWrite &&= await scan.run(() => hasProjectAccess(project, principal, "write"));
 		}
-		await requireSafeLocalGitPath(target, root);
+		await scan.run(() => requireSafeLocalGitPath(target, root));
 		if ("narratorId" in source) {
 			const context = narratorExecution.context;
 			const compiled = narratorExecution.policy;
@@ -328,10 +331,20 @@ export async function authorizeGitTarget(
 			}
 		}
 		if (need === "write" && !canWrite) throw denied();
+		scan.check();
 		workspace.capabilities = { read: true, write: canWrite };
 	} catch (error) {
 		if (!(error instanceof AppError) || error.statusCode !== 403) throw error;
 		redactDeniedTarget(target);
+	} finally {
+		scan.dispose();
+		const elapsedMs = Math.round(performance.now() - scan.started);
+		if (elapsedMs >= 1000)
+			logger.warn("Slow Git workspace access check", {
+				elapsedMs,
+				pages: scan.pages,
+				rows: scan.rows,
+			});
 	}
 	return target;
 }

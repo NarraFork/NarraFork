@@ -137,6 +137,58 @@ test("truncated remote status is incomplete rather than falsely clean", () => {
 	expect(partialRename.files).toEqual([]);
 });
 
+for (const count of [200, 201]) {
+	for (const upstreamTruncated of [false, true]) {
+		test(`remote status preserves counts at ${count} files with upstream truncation ${upstreamTruncated}`, async () => {
+			const f = backendFixture();
+			const paths = Array.from({ length: count }, (_, index) => `file-${index}.txt`);
+			f.respond({
+				outputs: {
+					status: paths.map((path) => `MM ${path}\0`).join(""),
+					stagedNumstat: paths.map((path) => `2\t1\t${path}\0`).join(""),
+					unstagedNumstat: paths.map((path) => `3\t2\t${path}\0`).join(""),
+				},
+				truncated: upstreamTruncated,
+			});
+			const summary = await createRemoteGitService(f.backend).getStatusSummary("/repo");
+			expect(summary).toMatchObject({
+				hasChanges: true,
+				totalFiles: count,
+				staged: count,
+				unstaged: count,
+				untracked: 0,
+				linesAdded: count * 5,
+				linesRemoved: count * 3,
+				truncated: upstreamTruncated || count > 200,
+			});
+			expect(summary.files).toHaveLength(200);
+			expect(summary.files.map((file) => file.path)).toEqual(paths.slice(0, 200));
+			expect(f.calls).toHaveLength(1);
+			expect(f.calls[0]?.request.operation).toBe("status");
+		});
+	}
+}
+
+test("remote status retains upstream byte-budget truncation below the file cap", async () => {
+	const f = backendFixture();
+	const git = createRemoteGitService(f.backend);
+	for (const status of ["", "?? captured.txt\0", "R  incomplete-rename\0"]) {
+		f.respond({ outputs: { status }, truncated: true });
+		const summary = await git.getStatusSummary("/repo");
+		expect(summary.truncated).toBe(true);
+		expect(summary.hasChanges).toBe(true);
+		expect(summary.totalFiles).toBe(summary.files.length);
+		expect(summary.files).toHaveLength(status.startsWith("??") ? 1 : 0);
+	}
+	f.respond({ outputs: { status: "" }, truncated: false });
+	expect(await git.getStatusSummary("/repo")).toMatchObject({
+		hasChanges: false,
+		truncated: false,
+		totalFiles: 0,
+		files: [],
+	});
+});
+
 test("remote NUL status handles rename, whitespace and separate staged/unstaged totals", () => {
 	const result = parseRemoteGitStatus({
 		outputs: {

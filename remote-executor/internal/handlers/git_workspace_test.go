@@ -121,6 +121,81 @@ func TestGitWorkspaceLifecycle(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceDeletedParentDirectories(t *testing.T) {
+	for _, removed := range []string{"dir", "dir/nested"} {
+		t.Run(removed, func(t *testing.T) {
+			root, h := newGitFixture(t)
+			path := "dir/nested/file.txt"
+			absolute := filepath.Join(root, filepath.FromSlash(path))
+			if err := os.MkdirAll(filepath.Dir(absolute), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(absolute, []byte("tracked content\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			gitTestRun(t, root, "add", "--", path)
+			gitTestRun(t, root, "commit", "-m", "tracked nested file")
+			files := map[string]any{"files": []any{path}}
+			for _, staged := range []bool{false, true} {
+				if err := os.RemoveAll(filepath.Join(root, filepath.FromSlash(removed))); err != nil {
+					t.Fatal(err)
+				}
+				diff := gitCall(t, h, root, "diff", files)["stdout"].(string)
+				if !strings.Contains(diff, "deleted file mode") || !strings.Contains(diff, "-tracked content") {
+					t.Fatalf("deleted file diff: %q", diff)
+				}
+				if staged {
+					gitCall(t, h, root, "stage", files)
+					if got := gitTestRun(t, root, "diff", "--cached", "--name-status"); got != "D\t"+path {
+						t.Fatalf("staged deletion: %q", got)
+					}
+					diff = gitCall(t, h, root, "diff", map[string]any{"files": []any{path}, "staged": true})["stdout"].(string)
+					if !strings.Contains(diff, "deleted file mode") {
+						t.Fatalf("staged deleted file diff: %q", diff)
+					}
+				}
+				gitCall(t, h, root, "discard", files)
+				content, err := os.ReadFile(absolute)
+				if err != nil || string(content) != "tracked content\n" {
+					t.Fatalf("restore deleted directory: %q, %v", content, err)
+				}
+				if got := gitTestRun(t, root, "status", "--porcelain"); got != "" {
+					t.Fatalf("discard left changes: %q", got)
+				}
+			}
+		})
+	}
+}
+
+func TestGitWorkspaceMissingParentSecurity(t *testing.T) {
+	root, h := newGitFixture(t)
+	paths := []string{"../missing/file", "missing/../../outside", "missing/../file", "missing/.git/config", "missing/.GIT/config"}
+	if runtime.GOOS != "windows" {
+		for _, link := range []struct{ name, target string }{
+			{"outside-link", t.TempDir()},
+			{"inside-link", root},
+			{"dangling-link", filepath.Join(t.TempDir(), "absent")},
+		} {
+			if err := os.Symlink(link.target, filepath.Join(root, link.name)); err != nil {
+				t.Fatal(err)
+			}
+			paths = append(paths, link.name+"/missing/file")
+		}
+	}
+	for _, operation := range []string{"diff", "stage", "discard"} {
+		for _, path := range paths {
+			t.Run(operation+"/"+path, func(t *testing.T) {
+				_, err := h.GitWorkspace(context.Background(), map[string]any{
+					"operation": operation, "cwd": root, "expectedRoot": root, "files": []any{path},
+				})
+				if err == nil || (!strings.Contains(err.Error(), "unsafe relative Git file path") && !strings.Contains(err.Error(), "traverse symbolic links")) {
+					t.Fatalf("unsafe missing-parent path was not rejected by validation: %v", err)
+				}
+			})
+		}
+	}
+}
+
 func TestGitWorkspaceProbeAndSecurity(t *testing.T) {
 	root, h := newGitFixture(t)
 	sub := filepath.Join(root, "sub")

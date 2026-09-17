@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GitWorkspace } from "@shared/git-workspace";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import { chapters, narrators, projects, remoteDevices, users } from "../db/schema";
@@ -25,6 +25,8 @@ import { gitPathPolicyAllows } from "./git-workspace-access";
 import { type ActiveNarrator, activeNarrators } from "./narrator-session-state";
 
 let root: string, repo: string, owner: string, narratorId: string;
+const scanProjectIds: string[] = [];
+const scanChapterIds: string[] = [];
 const now = () => new Date().toISOString();
 async function git(cwd: string, ...args: string[]) {
 	const r = await safeSpawn({
@@ -133,6 +135,10 @@ beforeEach(async () => {
 afterEach(async () => {
 	activeNarrators.delete(narratorId);
 	setRemoteBackendResolver(null);
+	if (scanChapterIds.length)
+		await db.delete(chapters).where(inArray(chapters.id, scanChapterIds.splice(0)));
+	if (scanProjectIds.length)
+		await db.delete(projects).where(inArray(projects.id, scanProjectIds.splice(0)));
 	await rm(root, { recursive: true, force: true });
 });
 
@@ -211,6 +217,69 @@ describe("Git workspace discovery", () => {
 		await git(root, "init", "--bare", bare);
 		expect((await probeLocalGitWorkspace(bare)).state).toBe("unsupported");
 	});
+});
+
+describe("Git workspace project scan pagination", () => {
+	async function fixtures(mode: "unrelated" | "lexical" | "chapter") {
+		const unrelated = join(root, "unrelated");
+		await mkdir(unrelated);
+		const values = Array.from({ length: 300 }, (_, index) => ({
+			id: `scan-${owner}-${String(index).padStart(4, "0")}`,
+			name: "Scan fixture",
+			gitPath: mode === "lexical" ? repo : unrelated,
+			ownerUserId: owner,
+			visibility: "private" as const,
+			createdAt: now(),
+			updatedAt: now(),
+		}));
+		scanProjectIds.push(...values.map((row) => row.id));
+		// Small inserts avoid SQLite parameter limits as well as oversized test transactions.
+		for (let start = 0; start < values.length; start += 50)
+			await db.insert(projects).values(values.slice(start, start + 50));
+		if (mode === "chapter") {
+			for (const [index, row] of values.entries()) {
+				const id = `scan-chapter-${owner}-${String(index).padStart(4, "0")}`;
+				scanChapterIds.push(id);
+				await db.insert(chapters).values({
+					id,
+					projectId: row.id,
+					title: "Scan chapter",
+					branch: `scan-${index}`,
+					baseBranch: "main",
+					worktreePath: repo,
+					status: "active",
+					createdAt: now(),
+					updatedAt: now(),
+				});
+			}
+		}
+		return values[values.length - 1].id;
+	}
+
+	test("more than 256 unrelated registered projects do not deny a workspace", async () => {
+		await fixtures("unrelated");
+		expect((await workspace()).state).toBe("ready");
+	});
+
+	test("a private symlink alias after row 256 still denies access", async () => {
+		const lastId = await fixtures("unrelated");
+		const alias = join(root, "private-alias");
+		await symlink(repo, alias);
+		await db
+			.update(projects)
+			.set({ gitPath: alias, ownerUserId: null })
+			.where(eq(projects.id, lastId));
+		expect((await workspace()).state).toBe("access_denied");
+	});
+
+	for (const mode of ["lexical", "chapter"] as const) {
+		test(`${mode} associations paginate completely and enforce the final private project`, async () => {
+			const lastId = await fixtures(mode);
+			expect((await workspace()).state).toBe("ready");
+			await db.update(projects).set({ ownerUserId: null }).where(eq(projects.id, lastId));
+			expect((await workspace()).state).toBe("access_denied");
+		});
+	}
 });
 
 describe("authenticated Git management", () => {

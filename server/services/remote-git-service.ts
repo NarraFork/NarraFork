@@ -117,7 +117,8 @@ export function parseRemoteGitStatus(
 		branch: (outputs.branch ?? "").trim(),
 		linesAdded,
 		linesRemoved,
-		truncated,
+		// Both the upstream byte budget and this adapter's file cap make the list incomplete.
+		truncated: truncated || totalFiles > files.length,
 	};
 }
 

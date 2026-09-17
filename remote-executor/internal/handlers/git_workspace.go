@@ -149,6 +149,10 @@ func (h *Handlers) checkGitEntryPath(root, path string) (string, error) {
 	}
 	components := strings.Split(relative, string(filepath.Separator))
 	current := root
+	// Deleted files may have no remaining parent directories. Validate the
+	// nearest existing ancestor, while inspecting every existing component
+	// on the way so intermediate symlinks cannot bypass the entry checks.
+	existingParent := root
 	for index, component := range components {
 		current = filepath.Join(current, component)
 		metadata, statErr := os.Lstat(current)
@@ -170,9 +174,10 @@ func (h *Handlers) checkGitEntryPath(root, path string) (string, error) {
 			if resolveErr != nil || !pathWithin(root, resolved) {
 				return "", fmt.Errorf("Git file path escapes the authorized worktree")
 			}
+			existingParent = current
 		}
 	}
-	parent, err := h.guard.CheckExisting(filepath.Dir(joined))
+	parent, err := h.guard.CheckExisting(existingParent)
 	if err != nil || !pathWithin(root, parent) {
 		return "", fmt.Errorf("Git file path escapes the authorized worktree")
 	}
