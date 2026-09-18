@@ -27,8 +27,9 @@ const testHome = mkdtempSync(join(tmpdir(), "narrafork-project-acl-gate-"));
 process.env.NARRAFORK_HOME = testHome;
 process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 
-const { projectRoutes } = await import("../projects");
-const { chapterRoutes } = await import("../chapters");
+const { projectRoutes, requireSqliteProjectMutation } = await import("../projects");
+const { chapterRoutes, createChapterMutationAdmissionMiddleware, requireSqliteChapterMutation } =
+	await import("../chapters");
 const { gitRoutes } = await import("../git");
 const { db } = await import("../../db");
 const { aclGrants, chapters, projects, users } = await import("../../db/schema");
@@ -247,6 +248,136 @@ describe("chapters inherit the project", () => {
 	test("chapter listing requires project read", async () => {
 		expect((await request(OUTSIDER, `/chapters?projectId=${privateProject}`)).status).toBe(404);
 		expect((await request(READER, `/chapters?projectId=${privateProject}`)).status).toBe(200);
+	});
+});
+
+describe("PostgreSQL mutation admission", () => {
+	test("project mutations fail closed before any host-side work", () => {
+		for (const operation of [
+			"Project creation",
+			"Project updates",
+			"Project deletion",
+			"Project membership changes",
+			"Project ownership transfers",
+		]) {
+			expect(() => requireSqliteProjectMutation(operation, "postgres")).toThrowError(
+				new AppError(
+					`${operation} is not yet supported on the PostgreSQL backend`,
+					503,
+					"POSTGRES_UNSUPPORTED",
+				),
+			);
+		}
+		expect(() => requireSqliteProjectMutation("Project creation", "sqlite")).not.toThrow();
+	});
+
+	const chapterMutationContracts = [
+		["POST", "/chapters"],
+		["PATCH", "/chapters/chapter-id"],
+		["DELETE", "/chapters/chapter-id"],
+		["PUT", "/chapters/chapter-id/dock-layout"],
+		["PUT", "/chapters/chapter-id/detached-panels"],
+		["POST", "/chapters/chapter-id/fork"],
+		["POST", "/chapters/chapter-id/split"],
+		["POST", "/chapters/chapter-id/review"],
+		["POST", "/chapters/chapter-id/merge"],
+		["POST", "/chapters/chapter-id/ai-resolve"],
+		["POST", "/chapters/chapter-id/unmerge"],
+		["POST", "/chapters/chapter-id/dormant"],
+		["POST", "/chapters/chapter-id/wake"],
+		["POST", "/chapters/cleanup"],
+		["POST", "/chapters/batch-merge"],
+		["POST", "/chapters/chapter-id/containers/start"],
+		["POST", "/chapters/chapter-id/containers/stop"],
+		["POST", "/chapters/chapter-id/containers/pause"],
+		["POST", "/chapters/chapter-id/containers/unpause"],
+		["POST", "/chapters/chapter-id/containers/remove"],
+	] as const;
+
+	function admissionApp(backend: "postgres" | "sqlite") {
+		const calls = { acl: 0, handler: 0 };
+		const app = new Hono();
+		app.onError((error) => {
+			if (error instanceof AppError) {
+				return new Response(JSON.stringify({ error: error.message, code: error.code }), {
+					status: error.statusCode,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response(JSON.stringify({ error: String(error) }), { status: 500 });
+		});
+		app.use("*", createChapterMutationAdmissionMiddleware(backend));
+		app.use("*", async (_c, next) => {
+			calls.acl++;
+			await next();
+		});
+		app.all("*", (c) => {
+			calls.handler++;
+			return c.json({ ok: true });
+		});
+		return { app, calls };
+	}
+
+	test("all chapter lifecycle mutations fail closed before ACL or handlers on PostgreSQL", async () => {
+		const { app, calls } = admissionApp("postgres");
+		for (const [method, path] of chapterMutationContracts) {
+			const response = await app.request(`http://localhost${path}`, { method });
+			expect(response.status, `${method} ${path}`).toBe(503);
+			expect(await response.json(), `${method} ${path}`).toEqual({
+				error: "Chapter mutation is not yet supported on the PostgreSQL backend",
+				code: "POSTGRES_UNSUPPORTED",
+			});
+		}
+		expect(calls).toEqual({ acl: 0, handler: 0 });
+	});
+
+	test("the centralized gate runs before body parsing", async () => {
+		let bodyParsed = false;
+		const app = new Hono();
+		app.onError((error) => {
+			if (error instanceof AppError) {
+				return new Response(JSON.stringify({ code: error.code }), { status: error.statusCode });
+			}
+			return new Response(null, { status: 500 });
+		});
+		app.use("*", createChapterMutationAdmissionMiddleware("postgres"));
+		app.post("*", async (c) => {
+			bodyParsed = true;
+			await c.req.json();
+			return c.body(null, 204);
+		});
+
+		const response = await app.request("http://localhost/chapters/chapter-id/fork", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: "not-json",
+		});
+		expect(response.status).toBe(503);
+		expect(bodyParsed).toBe(false);
+	});
+
+	test("SQLite mutations and database-independent Podman routes remain admitted", async () => {
+		const sqlite = admissionApp("sqlite");
+		for (const [method, path] of chapterMutationContracts) {
+			const response = await sqlite.app.request(`http://localhost${path}`, { method });
+			expect(response.status, `${method} ${path}`).toBe(200);
+		}
+		expect(sqlite.calls).toEqual({
+			acl: chapterMutationContracts.length,
+			handler: chapterMutationContracts.length,
+		});
+
+		const postgres = admissionApp("postgres");
+		for (const [method, path] of [
+			["POST", "/chapters/podman/install"],
+			["GET", "/chapters/podman/status"],
+			["GET", "/chapters/chapter-id"],
+		] as const) {
+			const response = await postgres.app.request(`http://localhost${path}`, { method });
+			expect(response.status, `${method} ${path}`).toBe(200);
+		}
+		expect(postgres.calls).toEqual({ acl: 3, handler: 3 });
+		expect(() => requireSqliteChapterMutation("Chapter creation", "sqlite")).not.toThrow();
 	});
 });
 

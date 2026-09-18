@@ -1,9 +1,9 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
-import { and, eq, inArray } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
-import { db } from "../db";
+import { activeDatabaseBackend, db } from "../db";
 import {
 	chapters,
 	containerInstances,
@@ -19,7 +19,7 @@ import {
 	terminals,
 	terminalViewState,
 } from "../db/schema";
-import { GitAuthError, NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, GitAuthError, NotFoundError, ValidationError } from "../lib/errors";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -39,7 +39,6 @@ import { containerService } from "../services/container-service";
 import { gitService } from "../services/git-service";
 import { integrationResourceBindingService } from "../services/integration-resource-binding-service";
 import { propagateOAuthProjectRemoval } from "../services/oauth-runtime-revocation";
-import { projectReadableWhere } from "../services/project-acl";
 import { ensureGitignoreEntry } from "../services/project-db-sync";
 import {
 	getProjectAccess,
@@ -48,28 +47,67 @@ import {
 	setProjectVisibility,
 	transferProjectOwner,
 } from "../services/project-membership";
+import { projectReadAdapter } from "../services/read";
+import { collectAllPages, parseLimitQuery, singlePage } from "../services/read/read-collect";
 import { terminalService } from "../services/terminal-service";
 import { removeTabFromAllUsers } from "../services/user-preferences-service";
 
 export const projectRoutes = new Hono();
 
+/**
+ * Project mutations below still use the legacy SQLite-shaped domain and/or host-side git cleanup.
+ * Refuse them before access checks, git, container, worktree, or SQLite-proxy activity in PG mode.
+ */
+export function requireSqliteProjectMutation(
+	operation: string,
+	backend: string = activeDatabaseBackend,
+): void {
+	if (backend === "postgres") {
+		throw new AppError(
+			`${operation} is not yet supported on the PostgreSQL backend`,
+			503,
+			"POSTGRES_UNSUPPORTED",
+		);
+	}
+}
+
 const validStatuses = ["active", "archived"] as const;
 
+/**
+ * The project list: a bare JSON array, most-recently-updated first.
+ *
+ * Three properties are contractual, and moving this onto the read adapter broke the first two
+ * in ways no error revealed:
+ *
+ *  - ORDER is `updatedAt` descending. The dashboard reads the head of the list as "what I
+ *    worked on last". Ascending order with a 100-row default handed a user with many projects
+ *    their hundred OLDEST projects and nothing else.
+ *  - A request with NO paging parameters returns everything the caller may read. Every client
+ *    calls it that way, so a silent 100-row page is indistinguishable from "you have 100
+ *    projects".
+ *  - The underlying SQL stays bounded either way: `collectAllPages` walks bounded pages
+ *    instead of issuing one unbounded query.
+ *
+ * `?limit`/`?cursor` serve a caller that does want one page. Continuation is reported in
+ * `X-Next-Cursor`, with `X-Read-Truncated` for a client that reads no cursor — headers rather
+ * than an envelope, because the array shape is what every existing caller consumes and
+ * wrapping it would break all of them to serve a case none of them have.
+ */
 projectRoutes.get("/", async (c) => {
 	const status = c.req.query("status");
-	const where =
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		status && validStatuses.includes(status as any)
-			? eq(projects.status, status as (typeof validStatuses)[number])
-			: undefined;
-	// The visibility predicate is pushed into SQL rather than applied afterwards, so
-	// this stays one indexed query no matter how many projects exist. Returns
-	// undefined for admins, which `and(...)` treats as no extra restriction.
-	const result = await db.query.projects.findMany({
-		where: and(where, projectReadableWhere(projectPrincipalOf(c))),
-		orderBy: (projects, { desc }) => [desc(projects.updatedAt)],
-	});
-	return c.json(result);
+	const principal = projectPrincipalOf(c);
+	const statusFilter =
+		status && validStatuses.includes(status as (typeof validStatuses)[number]) ? status : undefined;
+	const limit = parseLimitQuery(c.req.query("limit"));
+	const cursor = c.req.query("cursor");
+	const adapter = projectReadAdapter();
+	const result =
+		limit === undefined && !cursor
+			? await collectAllPages((page) => adapter.listProjects(principal, page, statusFilter))
+			: singlePage(await adapter.listProjects(principal, { limit, cursor }, statusFilter));
+	if (result.nextCursor) c.header("X-Next-Cursor", result.nextCursor);
+	if (result.truncated) c.header("X-Read-Truncated", "1");
+	return c.json(result.rows);
 });
 
 /**
@@ -90,17 +128,18 @@ projectRoutes.get("/hidden-existence", async (c) => {
 	const principal = projectPrincipalOf(c);
 	// Admins see everything, so nothing can be hidden from them.
 	if (principal.isAdmin) return c.json({ hasHidden: false });
-	const visible = await db.query.projects.findFirst({
-		where: projectReadableWhere(principal),
-		columns: { id: true },
-	});
+	// Both halves go through the read adapter. Asking SQLite here while PostgreSQL serves
+	// the list would compare two different datasets and answer "no projects exist" with
+	// full confidence.
+	const adapter = projectReadAdapter();
+	const visible = await adapter.listProjects(principal, { limit: 1 });
 	// Only meaningful when the caller sees nothing; a non-empty list needs no hint.
-	if (visible) return c.json({ hasHidden: false });
-	const any = await db.query.projects.findFirst({ columns: { id: true } });
-	return c.json({ hasHidden: !!any });
+	if (visible.rows.length > 0) return c.json({ hasHidden: false });
+	return c.json({ hasHidden: await adapter.anyProjectExists() });
 });
 
 projectRoutes.post("/", async (c) => {
+	requireSqliteProjectMutation("Project creation");
 	const parsed = createProjectSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const body = parsed.data;
@@ -327,6 +366,7 @@ projectRoutes.get("/:id/access", async (c) => {
 });
 
 projectRoutes.patch("/:id/visibility", async (c) => {
+	requireSqliteProjectMutation("Project visibility changes");
 	const id = c.req.param("id");
 	await requireProjectAccess(c, id, "read");
 	const parsed = projectVisibilitySchema.safeParse(await c.req.json().catch(() => ({})));
@@ -335,6 +375,7 @@ projectRoutes.patch("/:id/visibility", async (c) => {
 });
 
 projectRoutes.post("/:id/members", async (c) => {
+	requireSqliteProjectMutation("Project membership changes");
 	const id = c.req.param("id");
 	await requireProjectAccess(c, id, "read");
 	const parsed = projectMembersSchema.safeParse(await c.req.json().catch(() => ({})));
@@ -347,6 +388,7 @@ projectRoutes.post("/:id/members", async (c) => {
 });
 
 projectRoutes.delete("/:id/members/:userId", async (c) => {
+	requireSqliteProjectMutation("Project membership changes");
 	const id = c.req.param("id");
 	await requireProjectAccess(c, id, "read");
 	await removeProjectMember(id, c.req.param("userId"), projectPrincipalOf(c));
@@ -354,6 +396,7 @@ projectRoutes.delete("/:id/members/:userId", async (c) => {
 });
 
 projectRoutes.post("/:id/transfer-owner", async (c) => {
+	requireSqliteProjectMutation("Project ownership transfers");
 	const id = c.req.param("id");
 	await requireProjectAccess(c, id, "read");
 	const parsed = projectTransferOwnerSchema.safeParse(await c.req.json().catch(() => ({})));
@@ -365,11 +408,13 @@ projectRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
 	// Denial and absence are both NotFoundError, so this cannot be used to discover
 	// which project ids exist.
-	const project = await requireProjectAccess(c, id, "read");
+	const project = await projectReadAdapter().getProject(id, projectPrincipalOf(c));
+	if (!project) throw new NotFoundError("Project", id);
 	return c.json(project);
 });
 
 projectRoutes.patch("/:id", async (c) => {
+	requireSqliteProjectMutation("Project updates");
 	const id = c.req.param("id");
 	// Project settings (git path, proxy domain, chapter defaults) shape how everyone
 	// in the project works, so editing them is a management action rather than a
@@ -426,6 +471,7 @@ projectRoutes.patch("/:id", async (c) => {
 });
 
 projectRoutes.delete("/:id", async (c) => {
+	requireSqliteProjectMutation("Project deletion");
 	const id = c.req.param("id");
 	// Deletion cascades through every chapter, worktree, container, port allocation
 	// and conversation, so it sits in the management tier rather than write.

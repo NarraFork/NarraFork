@@ -14,7 +14,10 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { db } from "../../db";
 import { users } from "../../db/schema";
 import { generateId } from "../../lib/id";
-import { knowledgeBranchService } from "../knowledge-branch-service";
+import {
+	knowledgeBranchService,
+	requireSqliteKnowledgeBranchMutation,
+} from "../knowledge-branch-service";
 import { knowledgeService } from "../knowledge-service";
 
 let collectionId: string;
@@ -22,6 +25,19 @@ let userId: string;
 const principal = { userId: "", role: "user" as const };
 
 const TAG = Date.now();
+
+describe("PostgreSQL branch admission", () => {
+	test("refuses branching and rebasing before legacy SQLite reads", () => {
+		for (const operation of ["Knowledge draft branching", "Knowledge draft rebasing"]) {
+			expect(() => requireSqliteKnowledgeBranchMutation(operation, "postgres")).toThrow(
+				/PostgreSQL backend/,
+			);
+		}
+		expect(() =>
+			requireSqliteKnowledgeBranchMutation("Knowledge draft branching", "sqlite"),
+		).not.toThrow();
+	});
+});
 
 beforeAll(async () => {
 	const now = new Date().toISOString();
@@ -258,7 +274,7 @@ describe("search flags drifted draft hits", () => {
 		// Advance main so the draft drifts.
 		await knowledgeService.addRevision(entry.id, { content: "totally new main content\n" });
 
-		const res = knowledgeService.search({ q: driftTerm, collectionId, draftUserId: userId });
+		const res = await knowledgeService.search({ q: driftTerm, collectionId, draftUserId: userId });
 		const hit = res.find((r) => r.id === entry.id) as
 			| { fromDraft?: boolean; drifted?: boolean }
 			| undefined;

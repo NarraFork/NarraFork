@@ -17,10 +17,12 @@
  * with its ancestors'.
  */
 import { and, eq, gte, inArray, lt, sql } from "drizzle-orm";
-import { db } from "../db";
+import { activeDatabaseBackend, db } from "../db";
 import { narratorMessageRefs, narrators } from "../db/schema";
 import { narratorRefsBackfillLock } from "../lib/async-mutex";
+import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { initializeRefSeqFloor } from "./narrator-refs/seq-store";
 
 /**
  * Refs pulled in per backfill step. The exact-layout page asks for up to 100
@@ -43,6 +45,23 @@ type LazyRefsState = {
 
 /** Non-null only while the narrator still borrows older refs from a parent. */
 type ActiveLazyState = { parentNarratorId: string; cursor: number };
+
+/**
+ * Lazy inherited-ref materialization is still SQLite-specific (including synchronous transactions
+ * and SQLite SQL). Refuse the fallback before its first query when PostgreSQL is active.
+ */
+export function requireSqliteLazyRefsBackfill(
+	operation: string = "Lazy narrator refs fallback",
+	backend: string = activeDatabaseBackend,
+): void {
+	if (backend === "postgres") {
+		throw new AppError(
+			`${operation} is not yet supported on the PostgreSQL backend`,
+			503,
+			"POSTGRES_UNSUPPORTED",
+		);
+	}
+}
 
 function toActive(state: LazyRefsState | null | undefined): ActiveLazyState | null {
 	if (!state?.refsInheritedFrom || state.refsBackfillCursor == null) return null;
@@ -78,6 +97,7 @@ export type LineageStep = {
  * Used by search to widen its scope across the chain without materializing it.
  */
 export async function resolveLazyLineage(narratorId: string): Promise<LineageStep[]> {
+	requireSqliteLazyRefsBackfill();
 	const steps: LineageStep[] = [];
 	const seen = new Set<string>([narratorId]);
 	let currentId = narratorId;
@@ -117,6 +137,7 @@ export async function hasUnmaterializedRefsBelow(
 	narratorId: string,
 	seq: number,
 ): Promise<boolean> {
+	requireSqliteLazyRefsBackfill();
 	const lineage = await resolveLazyLineage(narratorId);
 	for (const step of lineage) {
 		const ceiling = Math.min(step.upperBoundSeq, seq);
@@ -188,6 +209,7 @@ function copyWindow(
 			ON CONFLICT (narrator_id, message_id) DO NOTHING
 		`);
 
+		initializeRefSeqFloor(tx, narratorId);
 		const inserted = countRefsInRange(tx, narratorId, fromSeq, untilSeq) - before;
 
 		// Is there anything left below the window we just consumed?
@@ -283,6 +305,7 @@ async function relinkToGrandparent(
  * Pass `targetSeq = 0` to materialize the whole inherited history.
  */
 export async function ensureRefsCoverSeq(narratorId: string, targetSeq: number): Promise<void> {
+	requireSqliteLazyRefsBackfill();
 	// Cheap pre-check outside the lock: most narrators return here.
 	const initial = await readLazyState(narratorId);
 	if (!initial || targetSeq >= initial.cursor) return;
@@ -379,6 +402,7 @@ export async function ensureRefsCoverSeq(narratorId: string, targetSeq: number):
  * message (a genuinely unrelated id).
  */
 export async function ensureRefsCoverMessage(narratorId: string, messageId: string): Promise<void> {
+	requireSqliteLazyRefsBackfill();
 	const lineage = await resolveLazyLineage(narratorId);
 	if (lineage.length === 0) return;
 
@@ -433,6 +457,7 @@ export async function ensureAllRefsMaterialized(narratorId: string): Promise<voi
  * a dangling link and silently unreachable history.
  */
 export async function materializeChildrenOf(parentNarratorId: string): Promise<string[]> {
+	requireSqliteLazyRefsBackfill("Materializing inherited narrator refs");
 	const children = await db
 		.select({ id: narrators.id })
 		.from(narrators)

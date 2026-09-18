@@ -14,8 +14,11 @@ import {
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import {
+	activeDatabaseBackend,
+	closePostgresRuntime,
 	db,
 	markDatabaseCleanShutdown,
+	postgresRuntime,
 	releaseDatabaseInstanceLockOnly,
 	startupShutdownState,
 } from "./db";
@@ -35,6 +38,7 @@ import { logger } from "./lib/logger";
 import { mcpManager } from "./lib/mcp/manager";
 import { syncMcpTools } from "./lib/mcp/tool-bridge";
 import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
+import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
 import { validateAccessTokenById } from "./lib/oauth-provider";
 import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { projectDbManager } from "./lib/project-db";
@@ -67,6 +71,10 @@ import {
 } from "./lib/windows-excluded-ports";
 import { pluginManager } from "./services/plugin-manager";
 import { pluginProviderRegistry } from "./services/plugin-provider-registry";
+import {
+	activatePostgresRuntimeQueue,
+	composePostgresStores,
+} from "./services/postgres-composition";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
@@ -112,6 +120,7 @@ import { worktreeWatcher } from "./services/worktree-watcher";
 import { canAcceptExternalNarratorConnection } from "./websocket/oauth-connection-registry";
 import {
 	closeAllConnections,
+	narratorWebSocketBackendRefusal,
 	resolveExternalNarratorWSData,
 	resolveWSData,
 	startHeartbeat,
@@ -131,6 +140,19 @@ const unregisterExternalProviderResolver = registerExternalProviderResolver((_pr
 // A mismatched journal intentionally fails startup rather than serving mixed model references.
 recoverProviderPrefixMigrationOnStartup();
 
+// When the PostgreSQL backend is active, inject every PG-capable store from the single
+// composition seam — one runtime, one client, all-or-nothing. `./db` has already finished
+// the fail-fast runtime startup (connect → migrate → FTS) by the time this body runs.
+if (postgresRuntime) {
+	composePostgresStores(postgresRuntime);
+	// Queue activation is a startup GATE, awaited before Bun.serve() accepts work: the
+	// information_schema probe and the insert_seq boundary capture run exactly once,
+	// here, after the full migration journal. Missing columns, cancellation or a
+	// timeout fail the process closed with a diagnosable error — the request hot path
+	// never re-probes the catalog, and there is no SQLite fallback.
+	await activatePostgresRuntimeQueue();
+}
+
 // Track event-loop stalls early so blocking operations are visible in logs/diagnostics.
 startEventLoopMonitor();
 
@@ -138,7 +160,14 @@ startEventLoopMonitor();
 // HTTP/login or the administrator's repair UI. This reads directory metadata only.
 void inspectApplicationDataDirectory(getNarraforkHome())
 	.then((status) => {
-		if (status.status !== "ok") {
+		// "unknown" means the probe did not finish, not that permissions are wrong;
+		// logging it as a fault sends operators to inspect a healthy directory.
+		if (status.status === "unknown") {
+			logger.info("Application data directory check was inconclusive", {
+				canRepair: status.canRepair,
+				...status.details,
+			});
+		} else if (status.status !== "ok") {
 			logger.warn("Application data directory needs attention; check Settings > Storage", {
 				status: status.status,
 				canRepair: status.canRepair,
@@ -810,13 +839,26 @@ function startServer(listenPort: number) {
 					headers.delete("content-length");
 					headers.set("content-type", "application/json; charset=UTF-8");
 					return new Response(
-						JSON.stringify(buildHealthPayload(healthPayload, startupReadiness.state)),
+						JSON.stringify({
+							...buildHealthPayload(healthPayload, startupReadiness.state),
+							// Which database backend this process wired at startup. A monitor that
+							// watches a PostgreSQL deployment must be able to tell it actually came
+							// up on PostgreSQL — a silent fallback would report a healthy SQLite.
+							database: { backend: activeDatabaseBackend },
+						}),
 						{
 							status: healthStatusCode(startupReadiness.state, healthResponse.status),
 							headers,
 						},
 					);
 				}
+
+				const narratorWsRefusal = narratorWebSocketBackendRefusal(
+					url.pathname,
+					activeDatabaseBackend,
+				);
+				if (narratorWsRefusal) return narratorWsRefusal;
+
 				// Wait for recovery to reach a terminal outcome so restored narrators observe a
 				// consistent state, but never turn a recovery failure into a dead server: the
 				// frontend, auth and settings routes are what the user needs to repair whatever
@@ -1205,7 +1247,13 @@ async function openAsApp(url: string) {
 // whole-database PRAGMA scan on the single JS thread made startup take minutes on a large DB. The
 // probe now runs in a read-only subprocess and only records a repair marker; the repair itself
 // happens on the next startup, before any request is accepted.
-scheduleBackgroundIntegrityCheck(startupShutdownState);
+//
+// SQLite-only: the probe spawns a `bun:sqlite` read-only subprocess against the local database
+// file, which does not exist on the PostgreSQL backend (and `startupShutdownState.wasClean`
+// there is the "cannot skip verification" answer). A server-managed engine verifies itself.
+if (activeDatabaseBackend === "sqlite") {
+	scheduleBackgroundIntegrityCheck(startupShutdownState);
+}
 
 // Start WebSocket heartbeat (ping/pong) to detect stale connections
 startHeartbeat();
@@ -1215,11 +1263,19 @@ initDeviceConnectionService();
 // Wire the file-transfer chunk-frame receiver.
 initDeviceTransferService();
 // Migrate OAuth authorities first, then stable resource provenance, in bounded yielding batches.
-backfillOAuthGrantAuthoritiesOnStartup()
-	.then(() => backfillIntegrationResourceBindingsOnStartup())
-	.catch((err) => {
-		logger.warn("Integration startup backfill failed", { error: String(err) });
-	});
+// These services still use the SQLite proxy, so PostgreSQL explicitly gates the legacy path
+// instead of letting a fire-and-forget promise hit that proxy and swallow the failure.
+if (activeDatabaseBackend === "postgres") {
+	logger.warn("OAuth/integration startup backfills are not yet migrated to PostgreSQL; path gated");
+} else {
+	try {
+		await backfillOAuthGrantAuthoritiesOnStartup();
+		await backfillIntegrationResourceBindingsOnStartup();
+	} catch (error) {
+		logger.error("OAuth/integration startup backfill failed", { error: String(error) });
+		throw error;
+	}
+}
 
 startVNetUdpRendezvous(settings.vnet).catch((err) => {
 	logger.warn("VNet UDP rendezvous startup failed", { error: String(err) });
@@ -1460,6 +1516,11 @@ reconcileContainerStates().catch((err) => {
 	logger.warn("Container state reconciliation failed", { error: String(err) });
 });
 
+// Establish client-egress relay channels for NUG providers configured with
+// local egress (docs/CODEX_CLIENT_RELAY.md). Idempotent; also reconciled after
+// every settings save.
+reconcileNugRelayClients(settings.nugProviders ?? []);
+
 // Start container proxy if enabled
 if (settings.containers.proxy?.enabled) {
 	startContainerProxy().catch((err) => {
@@ -1605,6 +1666,10 @@ async function performGracefulShutdown(
 		// Read workers hold their own read-only SQLite connections; terminate them before the clean
 		// marker is written so no thread is still touching the database afterwards.
 		await shutdownStep(tracker, "dbWorkerPool.shutdown", () => shutdownDbWorkerPool());
+		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
+		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite
+		// backend, so the SQLite teardown sequence is neither extended nor bypassed.
+		await shutdownStep(tracker, "postgresRuntime.close", () => closePostgresRuntime());
 		await shutdownStep(tracker, "vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
 		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown());
 		unregisterExternalProviderResolver();

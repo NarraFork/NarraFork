@@ -1,11 +1,15 @@
 import { eq } from "drizzle-orm";
-import { Hono } from "hono";
-import { db } from "../db";
+import { Hono, type MiddlewareHandler } from "hono";
+import { activeDatabaseBackend, db } from "../db";
 import { chapters, projects } from "../db/schema";
-import { catalogError, NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, catalogError, NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { getContainerUnsupportedReason, supportsContainers } from "../lib/platform";
-import { requireChapterAccess, requireProjectAccess } from "../lib/project-access";
+import {
+	projectPrincipalOf,
+	requireChapterAccess,
+	requireProjectAccess,
+} from "../lib/project-access";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { safeSpawn } from "../lib/spawn";
@@ -42,9 +46,59 @@ import {
 } from "../services/container-service";
 import { gitService } from "../services/git-service";
 import { syncTitleToNarrator } from "../services/narrator-title";
+import { projectReadAdapter } from "../services/read";
+import { collectAllPages, parseLimitQuery, singlePage } from "../services/read/read-collect";
 import { reviewService } from "../services/review-service";
 
 export const chapterRoutes = new Hono();
+
+/**
+ * Chapter lifecycle routes still combine host-side git/worktree/container work with legacy SQLite
+ * reads. Refuse those mutations before access checks or any host-side effect while PG is active.
+ */
+export function requireSqliteChapterMutation(
+	operation: string,
+	backend: string = activeDatabaseBackend,
+): void {
+	if (backend === "postgres") {
+		throw new AppError(
+			`${operation} is not yet supported on the PostgreSQL backend`,
+			503,
+			"POSTGRES_UNSUPPORTED",
+		);
+	}
+}
+
+const CHAPTER_MUTATION_SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+function isPodmanInstallPath(pathname: string): boolean {
+	const segments = pathname.split("/").filter(Boolean);
+	return segments.at(-2) === "podman" && segments.at(-1) === "install";
+}
+
+/**
+ * Reject every chapter-router mutation by default while PostgreSQL is active. This broad policy
+ * makes newly added lifecycle endpoints fail closed instead of relying on each handler to remember
+ * a guard. Podman installation is deliberately exempt: it is an admin-only host operation with no
+ * chapter/project database dependency.
+ */
+export function createChapterMutationAdmissionMiddleware(
+	backend: string = activeDatabaseBackend,
+): MiddlewareHandler {
+	return async (c, next) => {
+		if (
+			!CHAPTER_MUTATION_SAFE_METHODS.has(c.req.method.toUpperCase()) &&
+			!isPodmanInstallPath(c.req.path)
+		) {
+			requireSqliteChapterMutation("Chapter mutation", backend);
+		}
+		return next();
+	};
+}
+
+// This must remain the first router middleware: PostgreSQL refusal has to happen before body
+// parsing, project/chapter ACL lookup, or any git/worktree/container side effect.
+chapterRoutes.use("*", createChapterMutationAdmissionMiddleware());
 
 /**
  * Access gate for every `/:id/...` route in this router.
@@ -94,18 +148,50 @@ function containerUnsupportedPayload() {
 	};
 }
 
+/**
+ * A project's chapters, as a bare JSON array.
+ *
+ * `requireProjectAccess` is not redundant with the adapter's ACL predicate, and dropping it
+ * was a change of ANSWER rather than of status code: the predicate makes an unreadable project
+ * return `[]`, which is exactly what a real, readable, empty project returns. Without this the
+ * endpoint stopped distinguishing "not yours" — 404, with no confirmation the id exists — from
+ * "no chapters yet".
+ *
+ * Paging matches the project list: no parameters returns the whole readable set assembled from
+ * bounded pages, `?limit`/`?cursor` returns one page, and a ceiling reached is reported in
+ * `X-Next-Cursor`/`X-Read-Truncated` rather than silently dropped. That matters here because
+ * the merge modal builds its target list from this array — a chapter missing from it looks like
+ * a chapter that cannot be merged into.
+ */
 chapterRoutes.get("/", async (c) => {
 	const projectId = c.req.query("projectId");
 	const status = c.req.query("status");
 	if (!projectId) return c.json({ error: "projectId is required" }, 400);
-	// Listing a project's chapters exposes its whole structure, so it needs the same
-	// read access as opening the project.
 	await requireProjectAccess(c, projectId, "read");
-	const result = await chapterService.listByProject(projectId, status ?? undefined);
-	return c.json(result);
+	const principal = projectPrincipalOf(c);
+	const limit = parseLimitQuery(c.req.query("limit"));
+	const cursor = c.req.query("cursor");
+	const adapter = projectReadAdapter();
+	const result =
+		limit === undefined && !cursor
+			? await collectAllPages((page) =>
+					adapter.listChaptersPage(projectId, principal, page, status ?? undefined),
+				)
+			: singlePage(
+					await adapter.listChaptersPage(
+						projectId,
+						principal,
+						{ limit, cursor },
+						status ?? undefined,
+					),
+				);
+	if (result.nextCursor) c.header("X-Next-Cursor", result.nextCursor);
+	if (result.truncated) c.header("X-Read-Truncated", "1");
+	return c.json(result.rows);
 });
 
 chapterRoutes.post("/", async (c) => {
+	requireSqliteChapterMutation("Chapter creation");
 	const parsed = createChapterSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	// Creating a chapter creates a branch and a worktree in the project's repository,
@@ -133,11 +219,13 @@ chapterRoutes.get("/container-setup", async (c) => {
 
 chapterRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
-	const chapter = await chapterService.getById(id);
+	const chapter = await projectReadAdapter().getChapter(id, projectPrincipalOf(c));
+	if (!chapter) throw new NotFoundError("Chapter", id);
 	return c.json(chapter);
 });
 
 chapterRoutes.patch("/:id", async (c) => {
+	requireSqliteChapterMutation("Chapter updates");
 	const id = c.req.param("id");
 	const parsed = updateChapterSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -154,6 +242,7 @@ chapterRoutes.patch("/:id", async (c) => {
 });
 
 chapterRoutes.delete("/:id", async (c) => {
+	requireSqliteChapterMutation("Chapter deletion");
 	const id = c.req.param("id");
 	await chapterService.remove(id);
 	return c.json({ ok: true });
@@ -178,6 +267,7 @@ chapterRoutes.get("/:id/dock-layout", async (c) => {
 });
 
 chapterRoutes.put("/:id/dock-layout", async (c) => {
+	requireSqliteChapterMutation("Chapter dock layout updates");
 	const id = c.req.param("id");
 	const parsed = updateChapterDockLayoutSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -209,6 +299,7 @@ chapterRoutes.get("/:id/detached-panels", async (c) => {
 });
 
 chapterRoutes.put("/:id/detached-panels", async (c) => {
+	requireSqliteChapterMutation("Chapter detached panel updates");
 	const id = c.req.param("id");
 	const parsed = updateChapterDetachedPanelsSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);

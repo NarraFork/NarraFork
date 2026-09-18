@@ -56,6 +56,31 @@ export type WSData =
 	| ({ channel: "vnet" } & VNetWSData)
 	| ({ channel: "device" } & DeviceWSData);
 
+const POSTGRES_UNSUPPORTED_NARRATOR_WS_PATHS = new Set([
+	"/ws/narrator",
+	"/ws/external/v1/narrators",
+]);
+
+/**
+ * Refuse narrator WebSocket upgrades while their subscribe/send paths still depend on the
+ * SQLite-shaped narrator domain. This is called at the Bun upgrade boundary before JWT/OAuth
+ * validation, user lookup, ticket consumption, or `server.upgrade`; unrelated WS channels remain
+ * available on PostgreSQL.
+ */
+export function narratorWebSocketBackendRefusal(
+	pathname: string,
+	backend: string,
+): Response | null {
+	if (backend !== "postgres" || !POSTGRES_UNSUPPORTED_NARRATOR_WS_PATHS.has(pathname)) return null;
+	return Response.json(
+		{
+			error: "Narrator WebSocket is not yet supported on the PostgreSQL backend",
+			code: "POSTGRES_UNSUPPORTED",
+		},
+		{ status: 503 },
+	);
+}
+
 let acceptingWebSocketMessages = true;
 const activeWebSocketHandlers = new Set<Promise<void>>();
 

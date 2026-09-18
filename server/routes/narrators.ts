@@ -33,7 +33,7 @@ import {
 import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
-import { db } from "../db";
+import { activeDatabaseBackend, db } from "../db";
 import {
 	apiRequests,
 	chapters,
@@ -51,8 +51,8 @@ import {
 	terminals,
 	users,
 } from "../db/schema";
-import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
 import { summaryGenerate } from "../lib/agent";
+import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
 import { redactSpillPointerPaths } from "../lib/api-request-dump-store";
@@ -140,7 +140,16 @@ import {
 	resolveSetupAuthorization,
 	selectActionableDependencies,
 } from "../lib/prompt-i18n";
-import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction, resolveEffectiveModel, settings } from "../lib/settings";
+import {
+	getPromptOptimizeInstruction,
+	type PromptOptimizeStyle,
+} from "../lib/prompts/prompt-optimize";
+import {
+	FOLLOW_DEFAULT_MODEL,
+	getQueueDuringCompaction,
+	resolveEffectiveModel,
+	settings,
+} from "../lib/settings";
 import {
 	deleteAvatarImage,
 	deleteUploadedImage,
@@ -204,10 +213,6 @@ import {
 	revertPlanIdSchema,
 } from "../lib/validators/narrators";
 import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
-import {
-	type PromptOptimizeStyle,
-	getPromptOptimizeInstruction,
-} from "../lib/prompts/prompt-optimize";
 import { requireAdmin } from "../middleware/auth";
 import { isExecutionSuspended } from "../services/agent-runtime/ownership";
 import { generateAskUserQuestionAnswers } from "../services/ask-user-question-reflection";
@@ -300,7 +305,11 @@ import {
 	listAllOpenAsyncQuestionsForPrincipal,
 	listAsyncQuestions,
 } from "../services/narrator-question-service";
-import { resolveLazyLineage } from "../services/narrator-refs-backfill";
+import { claimShiftInsertSlot } from "../services/narrator-refs/seq-store";
+import {
+	requireSqliteLazyRefsBackfill,
+	resolveLazyLineage,
+} from "../services/narrator-refs-backfill";
 import {
 	previewNarratorScopedForToolUses,
 	previewNarratorScopedFromSeq,
@@ -328,7 +337,7 @@ import {
 	continueNarrator,
 	editAndRegenerate,
 	editAssistantMessage,
-	getBufferedMessages,
+	getBufferedMessagesAsync,
 	getNarratorExecutionDeviceState,
 	interruptAndWaitForIdle,
 	interruptNarrator,
@@ -531,6 +540,26 @@ export async function parseMessageRequest(
 
 export const narratorRoutes = new Hono();
 
+/**
+ * The narrator HTTP surface still depends on the SQLite-shaped narrator domain, session, ACL, and
+ * event-handler services. Reject PostgreSQL requests before body parsing, access checks, uploads,
+ * or session admission until a complete narrator read/session port exists.
+ */
+export function requireSqliteNarratorSurface(backend: string = activeDatabaseBackend): void {
+	if (backend === "postgres") {
+		throw new AppError(
+			"Narrator HTTP API is not yet supported on the PostgreSQL backend",
+			503,
+			"POSTGRES_UNSUPPORTED",
+		);
+	}
+}
+
+narratorRoutes.use("*", async (_c, next) => {
+	requireSqliteNarratorSurface();
+	return next();
+});
+
 // This smaller guard MUST run before the general attachment-body middleware below.
 // Preview inputs contain only bounded selectors, never tool bodies or raw evidence.
 const boundedRevertRequest = bodyLimit({
@@ -618,6 +647,21 @@ const NARRATOR_ID_GATE_EXEMPT_SEGMENTS = new Set([
 // Resolving a target reads metadata only; it still requires this narrator's read ACL.
 const READ_ONLY_WRITE_SUBPATHS = new Set(["leave", "file-references/resolve"]);
 
+// Search traverses lazy inherited refs. Keep the refusal ahead of the general ACL/work admission
+// middleware so PG never reaches the legacy SQLite lineage query first. The pretext tail page is
+// a normal read; its service only calls the backfill helper for an older-window request.
+for (const subPath of ["search"]) {
+	narratorRoutes.use(`/:id/${subPath}`, async (_c, next) => {
+		requireSqliteLazyRefsBackfill(`Narrator ${subPath} fallback`);
+		return next();
+	});
+}
+narratorRoutes.use("/:id/pretext-document", async (c, next) => {
+	if (c.req.query("beforeSeq") !== undefined)
+		requireSqliteLazyRefsBackfill("Narrator pretext older-window fallback");
+	return next();
+});
+
 /** The path after `/api/narrators/:id/`, or "" when there is none. */
 function narratorSubPath(requestPath: string, id: string): string {
 	const marker = `/${encodeURIComponent(id)}/`;
@@ -641,8 +685,9 @@ narratorRoutes.use("/:id/*", async (c, next) => {
 			? ("read" as const)
 			: ("write" as const);
 	await requireNarratorAccess(c, id, need);
-	// Direct route SQL must not race the guarded executor. Apply owns its exclusive
-	// admission through whenSettled; wrapping it in shared work would deadlock it.
+	// Apply owns its exclusive admission through whenSettled; wrapping it in shared
+	// work would deadlock it. Preview remains a shared read/selection operation and
+	// must not interrupt an active narrator before confirmation.
 	if (need === "write" && !/^revert-plans\/[^/]+\/apply$/.test(subPath))
 		return withNarratorWorkAdmission(id, next);
 	return next();
@@ -1571,7 +1616,6 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 	return c.json({ text: result, model });
 });
 
-
 // Get usage stats for this narrator, optionally including direct subagents.
 narratorRoutes.get("/:id/usage-stats", async (c) => {
 	const narratorId = c.req.param("id");
@@ -2079,8 +2123,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					);
 				}
 
-				const { bufferSubagentUserMessage, getSubagentBufferedMessages, isTakenOver } =
-					await import("../services/narrator-subagent");
+				const { bufferSubagentUserMessage, isTakenOver } = await import(
+					"../services/narrator-subagent"
+				);
+				const { getSubagentBufferedMessagesAsync } = await import("../services/subagent-executor");
 				const takenOver = isTakenOver(id);
 				const result = await bufferSubagentUserMessage(id, finalMessage, {
 					images: images.length > 0 ? images : undefined,
@@ -2097,7 +2143,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					throw new ValidationError("Subagent is not running in foreground");
 				}
 				uploadsAccepted = true;
-				const messages = toBufferSummary(getSubagentBufferedMessages(id));
+				const messages = toBufferSummary(await getSubagentBufferedMessagesAsync(id));
 				broadcastToNarrator(id, {
 					type: "buffer_set",
 					narratorId: id,
@@ -2136,7 +2182,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			);
 			if (result.ok) {
 				uploadsAccepted = true;
-				const messages = toBufferSummary(getBufferedMessages(id));
+				const messages = toBufferSummary(await getBufferedMessagesAsync(id));
 				broadcastToNarrator(id, {
 					type: "buffer_set",
 					narratorId: id,
@@ -2781,7 +2827,7 @@ narratorRoutes.post("/:id/restore-message/:messageId", async (c) => {
 
 /** Primary and subagent user queues are projections of the same durable mailbox. */
 async function resolveBufferQueue(narratorId: string) {
-	return toBufferSummary(getBufferedMessages(narratorId));
+	return toBufferSummary(await getBufferedMessagesAsync(narratorId));
 }
 
 /** Broadcast the post-mutation buffer queue to every client on this narrator. */
@@ -2809,7 +2855,7 @@ async function locateBufferedMessage(
 	narratorId: string,
 	messageId: string,
 ): Promise<LocatedBufferedMessage | null> {
-	const message = getBufferedMessages(narratorId).find((m) => m.id === messageId);
+	const message = (await getBufferedMessagesAsync(narratorId)).find((m) => m.id === messageId);
 	if (!message) return null;
 	const narrator = await narratorService.getById(narratorId);
 	return { message, fromSubagentQueue: isSubagentVariant(narrator.variant) };
@@ -3047,7 +3093,7 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 	const mid = c.req.param("mid");
 	let retried: boolean;
 	try {
-		retried = retryBufferedMessage(id, mid);
+		retried = await retryBufferedMessage(id, mid);
 	} catch (error) {
 		throw new ValidationError(
 			error instanceof Error ? error.message : "Buffered payload unavailable",
@@ -3067,7 +3113,7 @@ narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	// The wrapper cancels from the shared mailbox and clears subagent soft-stop
 	// state; the primary counterpart is cleared below for the same queue identity.
 	const { removeSubagentBufferedMessage } = await import("../services/narrator-subagent");
-	const ok = removeSubagentBufferedMessage(id, mid);
+	const ok = await removeSubagentBufferedMessage(id, mid);
 	if (ok) clearBufferedMessageSoftStopIfIdle(id);
 	if (!ok) throw new NotFoundError("Buffered message", mid);
 	await broadcastBufferQueue(id);
@@ -3080,7 +3126,7 @@ narratorRoutes.put("/:id/buffer/reorder", async (c) => {
 	const body = await c.req.json();
 	const parsed = reorderBufferSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const ok = reorderBufferedMessages(id, parsed.data.orderedIds);
+	const ok = await reorderBufferedMessages(id, parsed.data.orderedIds);
 	if (!ok) throw new ValidationError("Invalid reorder: ids do not match the current queue");
 	await broadcastBufferQueue(id);
 	return c.json({ ok: true });
@@ -3091,7 +3137,7 @@ narratorRoutes.delete("/:id/buffer", async (c) => {
 	const id = c.req.param("id");
 	// One persistent cancellation, plus each actor adapter's ephemeral soft stop.
 	const { clearSubagentBufferedMessages } = await import("../services/narrator-subagent");
-	clearSubagentBufferedMessages(id);
+	await clearSubagentBufferedMessages(id);
 	clearBufferedMessageSoftStopIfIdle(id);
 	broadcastToNarrator(id, { type: "buffer_set", narratorId: id, messages: [] });
 	return c.json({ ok: true });
@@ -3166,7 +3212,7 @@ narratorRoutes.get("/:id/search", async (c) => {
 	// there too — otherwise a fork would appear to have lost its earlier transcript.
 	// Each step carries the seq bound that keeps the ancestor's post-fork messages out.
 	const lineage = await resolveLazyLineage(id);
-	const results = searchService.searchNarratorMessages(
+	const results = await searchService.searchNarratorMessages(
 		id,
 		q.trim(),
 		limit,
@@ -3849,6 +3895,22 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 		if (narrator.status === "working" || narrator.status === "waiting") {
 			await narratorService.updateStatus(id, "idle", { substatus: ["interrupted"] });
 			interrupted = true;
+		}
+	}
+
+	// The ordinary Stop route remains fire-and-forget for compatibility. The
+	// interrupt-and-insert composer path opts into waiting so the loop's complete
+	// finalizer (including interrupt_task_guard persistence) finishes before the
+	// replacement user message is accepted.
+	if (c.req.query("waitForIdle") === "1") {
+		const narrator = await narratorService.getById(id);
+		if (!isSubagentVariant(narrator.variant)) {
+			// The narrator may have become idle between the UI's active-state check
+			// and this request. That is already a safe boundary for replacement input.
+			if (!interrupted) return c.json({ interrupted: false, settled: true });
+			const settled = await interruptAndWaitForIdle(id);
+			if (!settled) return c.json({ interrupted: true, settled: false }, 409);
+			return c.json({ interrupted: true, settled: true });
 		}
 	}
 	return c.json({ interrupted });
@@ -5018,11 +5080,24 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 			.returning()
 			.get();
 
-		const insertSeq = ref.seq + 1;
-		tx.update(narratorMessageRefs)
-			.set({ seq: sql`${narratorMessageRefs.seq} + 1` })
-			.where(and(eq(narratorMessageRefs.narratorId, id), gte(narratorMessageRefs.seq, insertSeq)))
-			.run();
+		// Single seq authority (narrator-refs/seq-store.ts): the shift consumes one
+		// top-of-history slot; the primitive owns both the shift and, once
+		// `narrators.next_seq` exists, the counter claim that serializes it against
+		// concurrent appends on the narrators row.
+		// The async membership check above can predate another insertion. Resolve
+		// the source again inside the same transaction as the shift/version claim.
+		const currentRef = tx.query.narratorMessageRefs
+			.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, id),
+					eq(narratorMessageRefs.messageId, sourceMessageId),
+				),
+				columns: { seq: true },
+			})
+			.sync();
+		if (!currentRef) throw new ValidationError("Source message not found in this narrator");
+		const insertSeq = currentRef.seq + 1;
+		claimShiftInsertSlot(tx, id, insertSeq);
 
 		tx.insert(narratorMessageRefs)
 			.values({
@@ -5033,12 +5108,14 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 			})
 			.run();
 
-		tx.update(narrators)
+		const version = tx
+			.update(narrators)
 			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
 			.where(eq(narrators.id, id))
-			.run();
+			.returning({ value: narrators.messageVersion })
+			.get();
 
-		return { ...insertedMsg, seq: insertSeq };
+		return { ...insertedMsg, seq: insertSeq, askInsertVersion: version?.value };
 	});
 
 	// Broadcast so the UI updates in real-time
@@ -5048,7 +5125,7 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 		message: msg,
 	});
 
-	return c.json({ messageId: msgId }, 201);
+	return c.json({ messageId: msgId, message: msg }, 201);
 });
 
 // Resolve: fork + send question + update pending message to resolved
@@ -5143,7 +5220,7 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 		message: updatedMsg,
 	});
 
-	return c.json(publicNarratorResponse(newNarrator), 201);
+	return c.json({ ...publicNarratorResponse(newNarrator), message: updatedMsg }, 201);
 });
 
 // Cancel: delete a pending message

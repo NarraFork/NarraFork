@@ -23,6 +23,7 @@ const {
 	ensureAllRefsMaterialized,
 	ensureRefsCoverSeq,
 	hasUnmaterializedRefsBelow,
+	requireSqliteLazyRefsBackfill,
 	resolveLazyLineage,
 } = await import("../narrator-refs-backfill");
 
@@ -373,6 +374,17 @@ describe("lineage scopes handed to search", () => {
 		seedNarrator("solo");
 		await seedMessage({ id: "solo-1", narratorId: "solo", seq: 0 });
 		expect(await resolveLazyLineage("solo")).toEqual([]);
+	});
+});
+
+describe("PostgreSQL lazy-ref admission", () => {
+	test("refuses before querying or mutating the SQLite-shaped store", () => {
+		expect(() => requireSqliteLazyRefsBackfill("Lazy narrator refs fallback", "postgres")).toThrow(
+			/503|PostgreSQL backend/,
+		);
+		expect(() =>
+			requireSqliteLazyRefsBackfill("Lazy narrator refs fallback", "sqlite"),
+		).not.toThrow();
 	});
 });
 
