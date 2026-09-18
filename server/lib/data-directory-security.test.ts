@@ -128,6 +128,23 @@ describe("application data directory permissions", () => {
 		expect(await mode(data)).toBe(0o777);
 	});
 
+	test("a timed-out check is unknown, never reported as a permission fault", async () => {
+		// A slow filesystem says nothing about permissions. Reporting it as "restricted"
+		// sent admins to inspect a directory that was fine.
+		const real = Date.now;
+		let calls = 0;
+		const spy = spyOn(Date, "now").mockImplementation(() => real() + (calls++ > 1 ? 60_000 : 0));
+		restorers.push(() => spy.mockRestore());
+		const status = await inspectApplicationDataDirectory(data);
+		spy.mockRestore();
+		expect(status).toMatchObject({
+			status: "unknown",
+			canRepair: false,
+			details: { code: "check_incomplete" },
+		});
+		expect(await mode(data)).toBe(0o700);
+	});
+
 	test("missing directory is unavailable, never healthy or automatically created", async () => {
 		const missing = join(root, "missing");
 		expect(await inspectApplicationDataDirectory(missing)).toMatchObject({

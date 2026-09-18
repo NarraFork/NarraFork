@@ -32,12 +32,35 @@ test("scrollTopForLine is exact at anchor lines", () => {
 	expect(scrollTopForLine(anchors, 14)).toBe(550);
 });
 
-test("scrollTopForLine follows VS Code's block-boundary mapping", () => {
-	// VS Code reveals the preceding block's end, then interpolates only through
-	// the actual gap before the next block (not through the block's full height).
-	expect(scrollTopForLine(anchors, 8)).toBe(250);
-	expect(scrollTopForLine(anchors, 4)).toBe(250);
+test("scrollTopForLine interpolates inside a block's pixel span", () => {
+	// Lines inside a multi-line block reveal the block's own midway pixels, so
+	// walking the source through the block walks the preview through it.
+	expect(scrollTopForLine(anchors, 8)).toBe(175);
+	expect(scrollTopForLine(anchors, 4)).toBe(115);
 	expect(scrollTopForLine(anchors, -5)).toBe(0);
+});
+
+test("a multi-source-line table no longer collapses to a single jump", () => {
+	// Table: source lines 10..29 rendered as ONE anchored wrapper 400px tall,
+	// paragraph anchors on either side. The old block-end+gap mapping pinned
+	// the preview to the table's bottom edge for every line inside it.
+	const tableAnchors = buildAnchors([
+		{ line: 0, top: 0, height: 50 },
+		{ line: 10, top: 50, height: 400 },
+		{ line: 30, top: 450, height: 40 },
+		{ line: 40, top: 490, height: 1 },
+	]);
+	expect(scrollTopForLine(tableAnchors, 10)).toBe(50);
+	expect(scrollTopForLine(tableAnchors, 20)).toBe(250);
+	expect(scrollTopForLine(tableAnchors, 29)).toBeCloseTo(50 + (19 / 20) * 400, 5);
+});
+
+test("scrollTopForLine and lineForScrollTop round-trip", () => {
+	for (const line of [0, 1, 3, 4.5, 8, 12.9, 13, 13.5, 14]) {
+		const top = scrollTopForLine(anchors, line);
+		expect(top).not.toBeNull();
+		expect(lineForScrollTop(anchors, top as number, 15, 10)).toBeCloseTo(line, 5);
+	}
 });
 
 test("lineForScrollTop interpolates the visible block interval", () => {

@@ -21,11 +21,25 @@ export class DataDirectorySecurityError extends Error {
 	}
 }
 
+/**
+ * The probe ran out of budget, so nothing was decided about the directory.
+ * Reported as `unknown`, never as a permission fault: a slow or hung filesystem
+ * used to surface as "permissions are unsafe", sending admins to inspect a
+ * directory that turned out to be perfectly fine.
+ */
+export class DataDirectoryCheckIncompleteError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "DataDirectoryCheckIncompleteError";
+	}
+}
+
 type DirectoryEntry = { path: string; stat: BigIntStats };
 type DirectoryChain = { canonical: string; entries: DirectoryEntry[]; uid: number | undefined };
 
 function checkDeadline(deadline: number) {
-	if (Date.now() > deadline) throw new Error("Data directory permission check timed out");
+	if (Date.now() > deadline)
+		throw new DataDirectoryCheckIncompleteError("Data directory permission check timed out");
 }
 
 /** Only metadata on a bounded ancestor chain: never enumerate application files. */
@@ -123,10 +137,20 @@ function errorStatus(
 	const badPath = error instanceof DataDirectorySecurityError ? error.path : resolve(path);
 	const entry = chain?.entries.find((item) => item.path === badPath);
 	return {
-		status: error instanceof DataDirectorySecurityError ? "restricted" : "unavailable",
+		status:
+			error instanceof DataDirectorySecurityError
+				? "restricted"
+				: error instanceof DataDirectoryCheckIncompleteError
+					? "unknown"
+					: "unavailable",
 		canRepair,
 		details: {
-			code: error instanceof DataDirectorySecurityError ? error.code : "check_failed",
+			code:
+				error instanceof DataDirectorySecurityError
+					? error.code
+					: error instanceof DataDirectoryCheckIncompleteError
+						? "check_incomplete"
+						: "check_failed",
 			path: badPath,
 			message: error instanceof Error ? error.message : "Data directory permission check failed",
 			...(entry
@@ -150,6 +174,7 @@ export async function inspectApplicationDataDirectory(
 		validateChain(chain);
 		return { status: "ok", canRepair: false };
 	} catch (error) {
+		// An inconclusive probe is reported as such; it is not evidence of a fault.
 		return errorStatus(path, error, chain);
 	} finally {
 		if (Date.now() - start > 1_000)

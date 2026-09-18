@@ -4,6 +4,7 @@ import {
 	MAX_FILE_REFERENCE_SEARCH_BYTES,
 	MAX_FILE_REFERENCE_SOURCE_BYTES,
 } from "@shared/file-reference";
+import { MAX_FILE_REFERENCE_IMAGE_BYTES } from "@shared/file-reference-image";
 import { fileReferenceApi } from "./file-references";
 
 const originalFetch = globalThis.fetch;
@@ -27,6 +28,113 @@ function mockFetch(fn: (url: string, options?: RequestInit) => Response | Promis
 }
 
 describe("file reference API contracts and budgets", () => {
+	test("imagePreview encodes explicit targets and returns a typed binary Blob", async () => {
+		let sentUrl = "";
+		mockFetch((url) => {
+			sentUrl = url;
+			return new Response(new Uint8Array([0, 255, 1]), {
+				headers: { "Content-Type": "image/png" },
+			});
+		});
+		const image = await fileReferenceApi.imagePreview("a/b", {
+			deviceId: "RemoteABC",
+			path: "C:\\中文 files\\a.png",
+		});
+		expect(image).toBeInstanceOf(Blob);
+		expect(image.type).toBe("image/png");
+		expect(new Uint8Array(await image.arrayBuffer())).toEqual(new Uint8Array([0, 255, 1]));
+		const url = new URL(sentUrl, "http://test");
+		expect(url.pathname).toBe("/api/narrators/a%2Fb/file-references/image-preview");
+		expect(Object.fromEntries(url.searchParams)).toEqual({
+			deviceId: "RemoteABC",
+			path: "C:\\中文 files\\a.png",
+		});
+	});
+	test("imagePreview rejects oversized headers and chunked bodies with cancellation", async () => {
+		for (const header of [false, true]) {
+			let canceled = false;
+			mockFetch(
+				() =>
+					new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								if (!header) controller.enqueue(new Uint8Array(MAX_FILE_REFERENCE_IMAGE_BYTES + 1));
+							},
+							cancel() {
+								canceled = true;
+							},
+						}),
+						{
+							headers: {
+								"content-type": "image/png",
+								...(header ? { "content-length": String(MAX_FILE_REFERENCE_IMAGE_BYTES + 1) } : {}),
+							},
+						},
+					),
+			);
+			await expect(
+				fileReferenceApi.imagePreview("n", { deviceId: "local", path: "/a.png" }),
+			).rejects.toThrow("byte limit");
+			expect(canceled).toBe(true);
+		}
+	});
+	test("imagePreview permits SVG img blobs, rejects HTML and preserves API failures", async () => {
+		mockFetch(() => new Response("<svg/>", { headers: { "content-type": "image/svg+xml" } }));
+		expect(
+			(await fileReferenceApi.imagePreview("n", { deviceId: "local", path: "/a.svg" })).type,
+		).toBe("image/svg+xml");
+		mockFetch(() => new Response("<html/>", { headers: { "content-type": "text/html" } }));
+		await expect(
+			fileReferenceApi.imagePreview("n", { deviceId: "local", path: "/a.png" }),
+		).rejects.toThrow("MIME");
+		mockFetch(() => Response.json({ error: "DENIED", reason: "Read denied" }, { status: 403 }));
+		await expect(
+			fileReferenceApi.imagePreview("n", { deviceId: "local", path: "/a.png" }),
+		).rejects.toMatchObject({ status: 403, message: "Read denied" });
+	});
+	test("imagePreview bounds JSON error bodies before parsing", async () => {
+		let canceled = false;
+		mockFetch(
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(new Uint8Array(MAX_FILE_REFERENCE_METADATA_BYTES + 1));
+						},
+						cancel() {
+							canceled = true;
+						},
+					}),
+					{ status: 403, headers: { "content-type": "application/json" } },
+				),
+		);
+		await expect(
+			fileReferenceApi.imagePreview("n", { deviceId: "local", path: "/a.png" }),
+		).rejects.toThrow("byte limit");
+		expect(canceled).toBe(true);
+	});
+	test("imagePreview abort cancels a stalled body", async () => {
+		let canceled = false;
+		const controller = new AbortController();
+		mockFetch(
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						pull() {
+							controller.abort(new Error("image canceled"));
+						},
+						cancel() {
+							canceled = true;
+						},
+					}),
+					{ headers: { "content-type": "image/png" } },
+				),
+		);
+		await expect(
+			fileReferenceApi.imagePreview("n", { deviceId: "local", path: "/a.png" }, controller.signal),
+		).rejects.toThrow("image canceled");
+		expect(canceled).toBe(true);
+	});
 	test("search encodes narrator, query, device and directory while forwarding cancellation", async () => {
 		let sentUrl = "";
 		let signal: AbortSignal | null | undefined;

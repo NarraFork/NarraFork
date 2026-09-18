@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { FileReference, FileSelection } from "@shared/file-reference";
 import { MAX_FILE_REFERENCE_POSITION } from "@shared/file-reference";
+import { MAX_FILE_REFERENCE_IMAGE_BYTES } from "@shared/file-reference-image";
 import type {
 	ExecutionBackend,
 	GlobMatches,
@@ -205,6 +206,158 @@ function fixture(
 		},
 	};
 }
+
+describe("image file reference previews", () => {
+	for (const remote of [false, true]) {
+		test(`bounded binary image read through ${remote ? "remote" : "local"} backend, without widening snapshots`, async () => {
+			const f = fixture({ remote });
+			f.files.set("/work/image.PNG", "\0binary");
+			const target = { deviceId: f.id, path: "/work/image.PNG" };
+			const result = await f.service.previewFileReferenceImage("narrator", "visitor", target);
+			expect(result.mimeType).toBe("image/png");
+			expect(result.bytes).toEqual(new TextEncoder().encode("\0binary"));
+			expect(f.reads[0].opts?.maxBytes).toBe(MAX_FILE_REFERENCE_IMAGE_BYTES);
+			expect(f.reads[0].opts?.expectedResolvedPath).toBe(target.path);
+			expect(f.reads[0].opts?.signal).toBeInstanceOf(AbortSignal);
+			expect(f.reads[0].opts?.timeoutMs).toBeLessThanOrEqual(10_000);
+			expect(f.access.every((entry) => entry.need === "read")).toBe(true);
+			expect(f.events[0]).toMatchObject({ operation: "image-preview", failed: false });
+			await expect(
+				f.service.captureFileReferences("narrator", "visitor", [
+					ref(target.path, { deviceId: f.id }),
+				]),
+			).rejects.toMatchObject({ code: "FILE_REFERENCE_BINARY" });
+		});
+	}
+	test("MIME whitelist uses canonical extension, including SVG but never HTML", async () => {
+		const f = fixture();
+		for (const [extension, mime] of [
+			["svg", "image/svg+xml"],
+			["jpeg", "image/jpeg"],
+			["gif", "image/gif"],
+			["webp", "image/webp"],
+			["bmp", "image/bmp"],
+			["ico", "image/x-icon"],
+			["avif", "image/avif"],
+		]) {
+			const path = `/work/image.${extension}`;
+			f.files.set(path, "image");
+			expect(
+				(await f.service.previewFileReferenceImage("narrator", "visitor", { deviceId: f.id, path }))
+					.mimeType,
+			).toBe(mime);
+		}
+		f.files.set("/work/page.html", "<html/>");
+		f.aliases.set("/work/fake.png", "/work/page.html");
+		await expect(
+			f.service.previewFileReferenceImage("narrator", "visitor", {
+				deviceId: f.id,
+				path: "/work/fake.png",
+			}),
+		).rejects.toMatchObject({ statusCode: 415 });
+	});
+	test("preflight cap and post-read growth/truncation/actual byte cap reject partial images", async () => {
+		const f = fixture();
+		const target = { deviceId: f.id, path: "/work/image.png" };
+		f.files.set(target.path, "x".repeat(MAX_FILE_REFERENCE_IMAGE_BYTES + 1));
+		await expect(
+			f.service.previewFileReferenceImage("narrator", "visitor", target),
+		).rejects.toMatchObject({ statusCode: 413 });
+		expect(f.reads).toHaveLength(0);
+		f.files.set(target.path, "x");
+		for (const result of [
+			{ bytes: new Uint8Array(1), totalSize: MAX_FILE_REFERENCE_IMAGE_BYTES + 1, truncated: false },
+			{ bytes: new Uint8Array(1), totalSize: 1, truncated: true },
+			{ bytes: new Uint8Array(MAX_FILE_REFERENCE_IMAGE_BYTES + 1), totalSize: 1, truncated: false },
+		]) {
+			f.setReadHook(async () => ({ ...result, resolvedPath: target.path }));
+			await expect(
+				f.service.previewFileReferenceImage("narrator", "visitor", target),
+			).rejects.toMatchObject({ statusCode: 413 });
+		}
+	});
+	test("permissions, secret paths, reconnect and canonical mismatch remain fail-closed", async () => {
+		for (const scenario of [
+			"ask",
+			"deny",
+			"secret",
+			"escape",
+			"reconnect",
+			"mismatch",
+			"missing",
+			"revoked",
+			"policy-change",
+			"offline",
+			"capability",
+		] as const) {
+			const f = fixture({ remote: true });
+			const target = { deviceId: f.id, path: "/work/image.png" };
+			f.files.set(target.path, "image");
+			if (scenario === "ask" || scenario === "deny") f.setDecision(scenario);
+			if (scenario === "secret" || scenario === "escape")
+				f.aliases.set(
+					target.path,
+					scenario === "secret" ? "/work/secret.png" : "/outside/image.png",
+				);
+			if (scenario === "offline") f.scope.devices = [{ ...f.scope.devices[0], online: false }];
+			if (scenario === "capability") f.backend.supportsFsReadBounded = false;
+			f.setReadHook(async () => {
+				if (scenario === "reconnect") f.reconnect();
+				if (scenario === "revoked") f.revoke();
+				if (scenario === "policy-change") f.setDecision("deny");
+				return {
+					bytes: new Uint8Array(1),
+					totalSize: 1,
+					truncated: false,
+					resolvedPath:
+						scenario === "missing"
+							? undefined
+							: scenario === "mismatch"
+								? "/work/other.png"
+								: target.path,
+				};
+			});
+			await expect(
+				f.service.previewFileReferenceImage("narrator", "visitor", target),
+			).rejects.toBeInstanceOf(AppError);
+		}
+	});
+	test("Windows image paths and the exact 25 MiB boundary are accepted without text decoding", async () => {
+		const f = fixture({ remote: true, windows: true });
+		const target = { deviceId: f.id, path: "C:\\work\\image.png" };
+		f.files.set(target.path, "x");
+		f.deps.decode = async () => {
+			throw new Error("Image must not decode as text");
+		};
+		f.setReadHook(async () => ({
+			bytes: new Uint8Array(MAX_FILE_REFERENCE_IMAGE_BYTES),
+			totalSize: MAX_FILE_REFERENCE_IMAGE_BYTES,
+			truncated: false,
+			resolvedPath: target.path,
+		}));
+		expect(
+			(await f.service.previewFileReferenceImage("narrator", "visitor", target)).bytes.byteLength,
+		).toBe(MAX_FILE_REFERENCE_IMAGE_BYTES);
+		expect(f.reads[0].opts?.expectedResolvedPath).toBe(target.path);
+	});
+	test("deadline and cancellation abort the backend and report failure", async () => {
+		for (const cancel of [false, true]) {
+			const f = fixture({ readTimeoutMs: 30 });
+			const target = { deviceId: f.id, path: "/work/image.png" };
+			f.files.set(target.path, "image");
+			const controller = new AbortController();
+			f.setReadHook(async () => {
+				if (cancel) controller.abort();
+				return new Promise(() => {});
+			});
+			await expect(
+				f.service.previewFileReferenceImage("narrator", "visitor", target, controller.signal),
+			).rejects.toMatchObject({ statusCode: cancel ? 499 : 408 });
+			expect(f.reads[0].opts?.signal?.aborted).toBe(true);
+			expect(f.events[0]).toMatchObject({ operation: "image-preview", failed: true });
+		}
+	});
+});
 
 function oauthFixture(deviceClass: ExecutionDeviceClass, rules: LegacyExecutionPolicyRuleSet = {}) {
 	const f = fixture({ remote: deviceClass !== "host" });

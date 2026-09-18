@@ -34,6 +34,10 @@ function appFor(userId: string | null = "requesting-user", failure?: AppError) {
 			record("resolve", args);
 			return [{ deviceId: "ExplicitDevice", path: "/workspace/src/a.ts" }];
 		},
+		async previewFileReferenceImage(...args) {
+			record("image-preview", args);
+			return { bytes: new TextEncoder().encode("<svg/>"), mimeType: "image/svg+xml" };
+		},
 		async previewFileReference(...args) {
 			record("preview", args);
 			return {
@@ -119,6 +123,39 @@ describe("narrator file-reference routes", () => {
 		expect(
 			(await app.request(`${base}/preview?deviceId=local&path=a.ts&selection=%7B%7D`)).status,
 		).toBe(400);
+	});
+	test("image preview forwards principal/target/signal and returns non-sniffable sandboxed image bytes", async () => {
+		const { app, calls } = appFor();
+		const response = await app.request(`${base}/image-preview?deviceId=ExplicitDevice&path=a.svg`);
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("<svg/>");
+		expect(response.headers.get("Content-Type")).toBe("image/svg+xml");
+		expect(response.headers.get("Content-Length")).toBe("6");
+		expect(response.headers.get("Cache-Control")).toBe("no-store");
+		expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
+		expect(response.headers.get("Content-Security-Policy")).toBe("default-src 'none'; sandbox");
+		expect(calls[0].args.slice(0, 3)).toEqual([
+			"narrator-123",
+			"requesting-user",
+			{ deviceId: "ExplicitDevice", path: "a.svg" },
+		]);
+		expect(calls[0].args[3]).toBeInstanceOf(AbortSignal);
+		for (const query of [
+			"path=a.svg",
+			"deviceId=local&path=a.svg&selection=%7B%7D",
+			"deviceId=local&path=a.svg&userId=owner",
+		])
+			expect((await app.request(`${base}/image-preview?${query}`)).status).toBe(400);
+		expect(calls).toHaveLength(1);
+		expect(
+			(await appFor(null).app.request(`${base}/image-preview?deviceId=local&path=a.svg`)).status,
+		).toBe(401);
+		for (const status of [403, 404, 408, 409, 413, 415, 422, 499, 503]) {
+			const failed = appFor("requesting-user", new AppError("denied", status, "TEST"));
+			expect(
+				(await failed.app.request(`${base}/image-preview?deviceId=local&path=a.svg`)).status,
+			).toBe(status);
+		}
 	});
 	test("authentication and service authorization errors propagate without partial success", async () => {
 		const anon = appFor(null);

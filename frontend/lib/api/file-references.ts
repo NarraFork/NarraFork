@@ -11,6 +11,10 @@ import {
 	MAX_FILE_REFERENCE_SEARCH_BYTES,
 	MAX_FILE_REFERENCE_SOURCE_BYTES,
 } from "@shared/file-reference";
+import {
+	FILE_REFERENCE_IMAGE_MIME_TYPES,
+	MAX_FILE_REFERENCE_IMAGE_BYTES,
+} from "@shared/file-reference-image";
 import { ApiError, authorizedFetch, readFetchError } from "./client";
 
 function basePath(narratorId: string): string {
@@ -23,6 +27,7 @@ async function boundedRequest<T>(
 	maxBytes: number,
 	timeoutMs: number,
 	options: RequestInit = {},
+	decode?: (buffer: Uint8Array<ArrayBuffer>, response: Response) => T,
 ): Promise<T> {
 	const controller = new AbortController();
 	const abort = () => controller.abort(options.signal?.reason);
@@ -32,10 +37,7 @@ async function boundedRequest<T>(
 	let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 	try {
 		const response = await authorizedFetch(path, { ...options, signal: controller.signal });
-		if (!response.ok) {
-			const error = await readFetchError(response);
-			throw new ApiError(error.message, response.status, error.data);
-		}
+		const responseLimit = response.ok ? maxBytes : MAX_FILE_REFERENCE_METADATA_BYTES;
 		reader = response.body?.getReader();
 		if (!reader) throw new Error("Empty file reference response");
 		const cancelRead = () => {
@@ -43,7 +45,7 @@ async function boundedRequest<T>(
 		};
 		controller.signal.addEventListener("abort", cancelRead, { once: true });
 		try {
-			if (Number(response.headers.get("content-length")) > maxBytes)
+			if (Number(response.headers.get("content-length")) > responseLimit)
 				throw new Error("File reference response exceeds the byte limit");
 			const chunks: Uint8Array[] = [];
 			let bytes = 0;
@@ -53,7 +55,8 @@ async function boundedRequest<T>(
 				controller.signal.throwIfAborted();
 				if (chunk.done) break;
 				bytes += chunk.value.byteLength;
-				if (bytes > maxBytes) throw new Error("File reference response exceeds the byte limit");
+				if (bytes > responseLimit)
+					throw new Error("File reference response exceeds the byte limit");
 				chunks.push(chunk.value);
 			}
 			const buffer = new Uint8Array(bytes);
@@ -62,7 +65,19 @@ async function boundedRequest<T>(
 				buffer.set(chunk, offset);
 				offset += chunk.byteLength;
 			}
-			return JSON.parse(new TextDecoder().decode(buffer)) as T;
+			if (!response.ok) {
+				const error = await readFetchError(
+					new Response(buffer, {
+						status: response.status,
+						statusText: response.statusText,
+						headers: response.headers,
+					}),
+				);
+				throw new ApiError(error.message, response.status, error.data);
+			}
+			return decode
+				? decode(buffer, response)
+				: (JSON.parse(new TextDecoder().decode(buffer)) as T);
 		} finally {
 			controller.signal.removeEventListener("abort", cancelRead);
 		}
@@ -123,6 +138,27 @@ export const fileReferenceApi = {
 				body,
 				headers: { "Content-Type": "application/json" },
 				signal,
+			},
+		);
+	},
+	/** Returned Blob is for an img object URL only, especially for SVG; never embed as HTML. */
+	imagePreview(narratorId: string, target: FileTarget, signal?: AbortSignal): Promise<Blob> {
+		if (target.path.length > MAX_FILE_REFERENCE_PATH_CHARS)
+			return Promise.reject(new Error("File path exceeds the limit"));
+		const query = new URLSearchParams({ deviceId: target.deviceId, path: target.path });
+		return boundedRequest(
+			`${basePath(narratorId)}/image-preview?${query}`,
+			MAX_FILE_REFERENCE_IMAGE_BYTES,
+			FILE_REFERENCE_READ_TIMEOUT_MS,
+			{ signal },
+			(buffer, response) => {
+				const mime = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+				if (
+					!mime ||
+					!Object.values(FILE_REFERENCE_IMAGE_MIME_TYPES).some((value) => value === mime)
+				)
+					throw new Error("Unsupported file reference image MIME type");
+				return new Blob([buffer], { type: mime });
 			},
 		);
 	},

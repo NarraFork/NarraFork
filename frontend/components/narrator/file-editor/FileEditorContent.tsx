@@ -76,6 +76,7 @@ import { type MonacoDocumentStatus, MonacoEditor, type MonacoEditorHandle } from
 import { MonacoSearchPanel } from "./MonacoSearchPanel";
 import { monacoHostVisible } from "./monaco-scroll";
 import { type EditorState, isDirty, reloaded } from "./save-state";
+import { createScrollFollower } from "./scroll-follower";
 
 const DiffView = lazy(() => import("../diff/DiffView").then((m) => ({ default: m.DiffView })));
 const FileEditorPreview = lazy(() =>
@@ -455,30 +456,33 @@ function FileEditorDocument({
 	// Code's approach), so both directions interpolate SOURCE LINES between
 	// neighbouring block anchors — proportional height sync drifts by whole
 	// screens because rendered block height is not linear in line count. Node
-	// trees have no anchors and keep the proportional fallback.
+	// trees have no anchors and keep the proportional fallback. Targets are
+	// approached through rAF followers (exponential ease) instead of throttled
+	// instant writes, so the following pane glides at display refresh rate.
 	const lineAnchorsRef = useRef<LineAnchor[]>([]);
-	const syncGuardRef = useRef({ preview: 0, editor: 0 });
 	useEffect(() => {
 		if (mode !== "split" || !editor) return;
 		const previewEl = previewScrollRef.current;
 		if (!previewEl || !editor.onDidScrollChange) return;
-		const throttle = (fn: () => void, ms: number) => {
-			let last = 0;
-			let timer: ReturnType<typeof setTimeout> | null = null;
-			return () => {
-				const remaining = ms - (Date.now() - last);
-				if (remaining <= 0) {
-					last = Date.now();
-					fn();
-				} else if (!timer) {
-					timer = setTimeout(() => {
-						timer = null;
-						last = Date.now();
-						fn();
-					}, remaining);
-				}
-			};
-		};
+		// Programmatic writes are recognized by matching the value the follower
+		// last wrote; any other scroll event is the user taking over that side.
+		// (A write counter desyncs when the follower emits dozens of writes per
+		// second and when native momentum scrolling interleaves.)
+		const lastWritten = { preview: Number.NaN, editor: Number.NaN };
+		const previewFollower = createScrollFollower(
+			() => previewEl.scrollTop,
+			(value) => {
+				lastWritten.preview = value;
+				previewEl.scrollTop = value;
+			},
+		);
+		const editorFollower = createScrollFollower(
+			() => editor.getScrollTop(),
+			(value) => {
+				lastWritten.editor = value;
+				editor.setScrollTop(value);
+			},
+		);
 		// Fractional top line of the editor viewport — VS Code's getVisibleLine:
 		// the integer line plus the column's progress through it.
 		const editorTopLine = (): number | null => {
@@ -491,24 +495,24 @@ function FileEditorDocument({
 				(start.startColumn - 1) / (model.getLineLength(start.startLineNumber) + 2)
 			);
 		};
-		const scrollEditorToLine = (line: number): boolean => {
+		/** Document-space editor offset for a fractional source line. */
+		const editorScrollTopForLine = (line: number): number | null => {
 			const base = Math.floor(line);
 			const top = editor.getTopForLineNumber?.(base + 1);
-			if (top == null) return false;
+			if (top == null) return null;
 			const next = editor.getTopForLineNumber(base + 2);
 			const lineHeight = next > top ? next - top : 0;
-			const nextScrollTop = top + (line - base) * lineHeight;
-			if (Math.abs(editor.getScrollTop() - nextScrollTop) < 1) return true;
-			syncGuardRef.current.editor++;
-			editor.setScrollTop(nextScrollTop);
-			return true;
+			return top + (line - base) * lineHeight;
 		};
+		// Anchors are layout-derived and scroll-independent, so they are collected
+		// once and invalidated by DOM/layout observers — collecting on every
+		// scroll event (querySelectorAll + getBoundingClientRect per anchor)
+		// forced a synchronous layout read in the middle of scrolling.
 		const refreshAnchors = () => {
 			const model = editor.getModel?.();
 			lineAnchorsRef.current = model ? collectPreviewAnchors(previewEl, model.getLineCount()) : [];
 		};
-		const onEditorScroll = throttle(() => {
-			refreshAnchors();
+		const syncPreviewToEditor = () => {
 			const anchors = lineAnchorsRef.current;
 			const line = anchors.length ? editorTopLine() : null;
 			const target = line != null ? scrollTopForLine(anchors, line) : null;
@@ -523,62 +527,69 @@ function FileEditorDocument({
 					previewEl.scrollHeight,
 					previewEl.clientHeight,
 				);
-			if (Math.abs(previewEl.scrollTop - nextScrollTop) < 1) return;
-			syncGuardRef.current.preview++;
-			previewEl.scrollTop = nextScrollTop;
-		}, 50);
-		const subscription = editor.onDidScrollChange(() => {
-			if (syncGuardRef.current.editor > 0) {
-				syncGuardRef.current.editor--;
-				return;
-			}
-			onEditorScroll();
-		});
-		const onPreviewScroll = throttle(() => {
-			refreshAnchors();
+			if (Math.abs(previewEl.scrollTop - nextScrollTop) < 1 && !previewFollower.active) return;
+			previewFollower.setTarget(nextScrollTop);
+		};
+		const syncEditorToPreview = () => {
 			const anchors = lineAnchorsRef.current;
 			const model = editor.getModel?.();
-			if (anchors.length && model) {
-				if (
-					scrollEditorToLine(lineForScrollTop(anchors, previewEl.scrollTop, model.getLineCount()))
-				)
-					return;
-			}
-			const nextScrollTop = fractionToScroll(
-				scrollFraction(previewEl.scrollTop, previewEl.scrollHeight, previewEl.clientHeight),
-				editor.getScrollHeight(),
-				editor.getLayoutInfo().height,
-			);
-			if (Math.abs(editor.getScrollTop() - nextScrollTop) < 1) return;
-			syncGuardRef.current.editor++;
-			editor.setScrollTop(nextScrollTop);
-		}, 50);
+			const anchored =
+				anchors.length && model
+					? editorScrollTopForLine(
+							lineForScrollTop(anchors, previewEl.scrollTop, model.getLineCount()),
+						)
+					: null;
+			const nextScrollTop =
+				anchored ??
+				fractionToScroll(
+					scrollFraction(previewEl.scrollTop, previewEl.scrollHeight, previewEl.clientHeight),
+					editor.getScrollHeight(),
+					editor.getLayoutInfo().height,
+				);
+			if (Math.abs(editor.getScrollTop() - nextScrollTop) < 1 && !editorFollower.active) return;
+			editorFollower.setTarget(nextScrollTop);
+		};
+		const subscription = editor.onDidScrollChange(() => {
+			if (Math.abs(editor.getScrollTop() - lastWritten.editor) < 1) return;
+			editorFollower.cancel();
+			syncPreviewToEditor();
+		});
 		const previewListener = () => {
-			if (syncGuardRef.current.preview > 0) {
-				syncGuardRef.current.preview--;
-				return;
-			}
-			onPreviewScroll();
+			if (Math.abs(previewEl.scrollTop - lastWritten.preview) < 1) return;
+			previewFollower.cancel();
+			syncEditorToPreview();
 		};
 		previewEl.addEventListener("scroll", previewListener, { passive: true });
 		refreshAnchors();
 		// FileEditorPreview is lazy and syntax highlighting/diagrams may add DOM
-		// after this effect. Recollect anchors whenever the rendered subtree changes,
-		// then align once the real anchors exist instead of permanently falling back
-		// to proportional syncing.
+		// after this effect. Recollect anchors when the rendered subtree changes
+		// (debounced — highlighting arrives in bursts), then realign: the two
+		// maps are exact inverses, so realigning after a live-preview refresh is
+		// a drift correction, never a fight with the side the user is scrolling.
+		let realignTimer: ReturnType<typeof setTimeout> | null = null;
+		const scheduleRealign = () => {
+			if (realignTimer) return;
+			realignTimer = setTimeout(() => {
+				realignTimer = null;
+				refreshAnchors();
+				if (lineAnchorsRef.current.length) syncPreviewToEditor();
+			}, 100);
+		};
 		const mutationObserver =
-			typeof MutationObserver === "undefined"
-				? null
-				: new MutationObserver(() => {
-						const before = lineAnchorsRef.current.length;
-						refreshAnchors();
-						if (!before && lineAnchorsRef.current.length) onEditorScroll();
-					});
+			typeof MutationObserver === "undefined" ? null : new MutationObserver(scheduleRealign);
 		mutationObserver?.observe(previewEl, { childList: true, subtree: true });
+		// Split-direction flips and pane resizes change rendered block heights.
+		const resizeObserver =
+			typeof ResizeObserver === "undefined" ? null : new ResizeObserver(scheduleRealign);
+		resizeObserver?.observe(previewEl);
 		return () => {
 			subscription.dispose();
 			previewEl.removeEventListener("scroll", previewListener);
 			mutationObserver?.disconnect();
+			resizeObserver?.disconnect();
+			if (realignTimer) clearTimeout(realignTimer);
+			previewFollower.dispose();
+			editorFollower.dispose();
 		};
 	}, [mode, editor]);
 	// Restore the fractional reading position once the regenerated preview renders.

@@ -6,7 +6,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { renderToStaticMarkup } from "react-dom/server";
 import { api, clearToken, setToken } from "../lib/api";
 import { ConfirmDialogContext } from "./common/confirm-dialog-context";
 
@@ -15,9 +14,7 @@ mock.module("react-i18next", () => ({
 	...realI18n,
 	useTranslation: () => ({ t: (key: string) => key }),
 }));
-const { DataDirectorySecurityAlert, DataDirectorySecurityCheckButton } = await import(
-	"./DataDirectorySecurityAlert"
-);
+const { DataDirectorySecurityCheckButton } = await import("./DataDirectorySecurityAlert");
 const restricted: DataDirectorySecurityStatus = {
 	status: "restricted",
 	canRepair: true,
@@ -108,7 +105,7 @@ async function settle() {
 		await new Promise((resolve) => setTimeout(resolve, 15));
 	});
 }
-async function render(role: "admin" | "user" = "admin", loggedIn = true, entry = false) {
+async function render(role: "admin" | "user" = "admin", loggedIn = true) {
 	if (loggedIn) client.setQueryData(["auth", "me"], { id: role, role });
 	else clearToken();
 	await act(async () =>
@@ -116,19 +113,12 @@ async function render(role: "admin" | "user" = "admin", loggedIn = true, entry =
 			<QueryClientProvider client={client}>
 				<MantineProvider env="test">
 					<ConfirmDialogContext.Provider value={{ confirm }}>
-						<DataDirectorySecurityAlert />
-						{entry && <DataDirectorySecurityCheckButton />}
+						<DataDirectorySecurityCheckButton />
 					</ConfirmDialogContext.Provider>
 				</MantineProvider>
 			</QueryClientProvider>,
 		),
 	);
-	await settle();
-}
-async function openModal() {
-	const message = toast.mock.calls[0]?.[0].message as { props: { children: unknown[] } };
-	const action = message.props.children.at(-1) as { props: { onClick: () => void } };
-	await act(async () => action.props.onClick());
 	await settle();
 }
 function button(key: string) {
@@ -142,62 +132,82 @@ async function click(key: string) {
 	await act(async () => node?.click());
 	await settle();
 }
-
-test("notification has no layout placeholder and is deduplicated after refetch and remount", async () => {
-	await render();
-	expect(container.querySelector('[role="alert"]')).toBeNull();
-	expect(container.textContent).not.toContain("dataDirectorySecurity");
-	expect(toast).toHaveBeenCalledTimes(1);
-	expect(toast.mock.calls[0]?.[0].id).toBe("data-directory-security");
-	const notice = renderToStaticMarkup(
-		<MantineProvider env="test">{toast.mock.calls[0]?.[0].message}</MantineProvider>,
-	);
-	expect(notice).not.toContain("/private/app");
-	expect(notice).not.toContain("unsafe_mode");
-	notifications.hide("data-directory-security");
-	await act(async () => {
-		await client.refetchQueries({ queryKey: ["data-directory-security"] });
-	});
-	await settle();
-	await act(async () => root.render(null));
-	await render();
-	expect(toast).toHaveBeenCalledTimes(1);
-});
-
-test("JWT renewal does not re-show a dismissed notice", async () => {
-	await render();
-	expect(toast).toHaveBeenCalledTimes(1);
-	notifications.hide("data-directory-security");
-	setToken("renewed-session-token");
-	await act(async () => {
-		await client.refetchQueries({ queryKey: ["data-directory-security"] });
-	});
-	await render();
-	expect(toast).toHaveBeenCalledTimes(1);
-});
-
-test("storage check entry reopens the same flow and refreshes without another notification", async () => {
-	await render("admin", true, true);
+/** The only way in: the operator asks for the check from Settings > Storage. */
+async function openModal() {
 	await click("check");
-	expect(get).toHaveBeenCalledTimes(2);
+}
+
+test("mounting never probes and never raises a notification", async () => {
+	await render();
+	expect(get).not.toHaveBeenCalled();
+	expect(toast).not.toHaveBeenCalled();
+	expect(document.querySelector('[role="dialog"]')).toBeNull();
+	expect(document.body.textContent).not.toContain("dataDirectorySecurity.description");
+});
+
+test("a restricted directory still raises no notification when never asked about", async () => {
+	get.mockResolvedValue(restricted);
+	await render();
+	await settle();
+	expect(get).not.toHaveBeenCalled();
+	expect(toast).not.toHaveBeenCalled();
+});
+
+test("an unreachable check raises no notification and never claims a permission fault", async () => {
+	get.mockRejectedValue(new Error("offline"));
+	await render();
+	expect(toast).not.toHaveBeenCalled();
+	await openModal();
+	expect(document.body.textContent).toContain("queryFailed");
+	expect(document.body.textContent).not.toContain("dataDirectorySecurity.description");
+	expect(document.body.textContent).not.toContain("whyPermissions");
+	expect(button("repair")).toBeUndefined();
+});
+
+test("an inconclusive check reports unknown, not a permission problem", async () => {
+	get.mockResolvedValue({
+		status: "unknown",
+		canRepair: false,
+		details: { code: "check_incomplete", path: "/private/app", message: "timed out" },
+	});
+	await render();
+	await openModal();
+	expect(document.body.textContent).toContain("inconclusive");
+	expect(document.body.textContent).not.toContain("dataDirectorySecurity.description");
+	expect(document.body.textContent).not.toContain("manual");
+	expect(document.body.textContent).not.toContain("whyPermissions");
+	expect(button("repair")).toBeUndefined();
+	expect(toast).not.toHaveBeenCalled();
+});
+
+test("explicit check probes once and can be refreshed", async () => {
+	await render();
+	await openModal();
+	expect(get).toHaveBeenCalledTimes(1);
 	expect(document.querySelector('[role="dialog"]') !== null).toBe(true);
-	expect(toast).toHaveBeenCalledTimes(1);
+	expect(document.body.textContent).toContain("dataDirectorySecurity.description");
+	await click("recheck");
+	expect(get).toHaveBeenCalledTimes(2);
+	expect(toast).not.toHaveBeenCalled();
 	expect(repair).not.toHaveBeenCalled();
 });
 
-test("healthy status is invisible", async () => {
+test("healthy status is only stated after an explicit check", async () => {
 	get.mockResolvedValue({ status: "ok", canRepair: false });
 	await render();
-	expect(container.querySelector('[role="alert"]')).toBeNull();
-	expect(get).toHaveBeenCalledTimes(1);
-	expect(toast).not.toHaveBeenCalled();
-	expect(container.textContent).not.toContain("dataDirectorySecurity");
+	expect(get).not.toHaveBeenCalled();
+	await openModal();
+	expect(document.body.textContent).toContain("healthy");
+	expect(button("repair")).toBeUndefined();
 });
+
 test("logged out does not probe or display cached details", async () => {
 	await render("admin", false);
+	await openModal();
 	expect(get).not.toHaveBeenCalled();
-	expect(container.querySelector('[role="alert"]')).toBeNull();
+	expect(document.body.textContent).not.toContain("/private/app");
 });
+
 test("ordinary users see contact advice but no path or repair", async () => {
 	await render("user");
 	await openModal();
@@ -205,6 +215,7 @@ test("ordinary users see contact advice but no path or repair", async () => {
 	expect(document.body.textContent).not.toContain("/private/app");
 	expect(button("repair")).toBeUndefined();
 });
+
 test("admin details are collapsed and unrepairable state requires manual handling", async () => {
 	get.mockResolvedValue({ ...restricted, canRepair: false });
 	await render();
@@ -215,6 +226,7 @@ test("admin details are collapsed and unrepairable state requires manual handlin
 	expect(document.body.textContent).toContain("manual");
 	expect(button("repair")).toBeUndefined();
 });
+
 test("pending confirmation sends no POST and cancellation leaves the modal usable", async () => {
 	let decide!: (value: boolean) => void;
 	confirm.mockImplementation(
@@ -242,6 +254,7 @@ test("cancel sends no repair request", async () => {
 	expect(confirm).toHaveBeenCalledTimes(1);
 	expect(repair).not.toHaveBeenCalled();
 });
+
 test("confirmed repair runs once, disables repeats and closes modal with retry toast", async () => {
 	let finish!: (result: DataDirectorySecurityStatus) => void;
 	repair.mockImplementation(
@@ -259,9 +272,10 @@ test("confirmed repair runs once, disables repeats and closes modal with retry t
 	expect(repair).toHaveBeenCalledTimes(1);
 	await act(async () => finish({ status: "ok", canRepair: false }));
 	await settle();
-	expect(container.querySelector('[role="alert"]')).toBeNull();
+	expect(document.querySelector('[role="dialog"]')).toBeNull();
 	expect(toast).toHaveBeenCalledWith({ color: "green", message: "dataDirectorySecurity.success" });
 });
+
 test.each([
 	"restricted",
 	"unavailable",
@@ -272,8 +286,9 @@ test.each([
 	await click("repair");
 	expect(document.body.textContent).toContain("repairFailed");
 	expect(document.body.textContent).toContain("manual");
-	expect(toast).toHaveBeenCalledTimes(1);
+	expect(toast).not.toHaveBeenCalled();
 });
+
 test("HTTP repair failure remains visible without disclosing raw errors", async () => {
 	repair.mockRejectedValue(new Error("/secret/error"));
 	await render();
@@ -286,7 +301,8 @@ test("HTTP repair failure remains visible without disclosing raw errors", async 
 	expect(repair).toHaveBeenCalledTimes(2);
 	expect(document.querySelector('[role="dialog"]') === null).toBe(true);
 });
-test("query failure warns and manual recheck recovers", async () => {
+
+test("manual recheck recovers from an unreachable check", async () => {
 	get.mockRejectedValue(new Error("offline"));
 	await render();
 	await openModal();

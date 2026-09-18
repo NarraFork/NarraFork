@@ -5,8 +5,8 @@ import { useTranslation } from "react-i18next";
 import { Z } from "../../lib/z-index";
 
 /**
- * A fullscreen pan/zoom overlay shared by the image viewer and the mermaid
- * diagram fullscreen view. It owns the transform state and all gesture handling
+ * A fullscreen overlay or embedded pan/zoom stage shared by the image viewer
+ * and the mermaid diagram fullscreen view. It owns the transform state and all gesture handling
  * (mouse-wheel zoom, drag-pan, two-finger pinch-zoom/pan, keyboard shortcuts)
  * and renders arbitrary `children` as the zoomable content. Feature-specific
  * toolbar buttons are supplied via `renderToolbarExtra`, which receives imperative
@@ -53,7 +53,9 @@ export const PANZOOM_TOOLTIP_Z = Z.imageViewer + 1;
 export interface PanZoomStageProps {
 	/** Zoomable content (an <img>, inline SVG host, etc.). */
 	children: ReactNode;
-	onClose: () => void;
+	onClose?: () => void;
+	/** Fit the parent panel without locking document scrolling or global shortcuts. */
+	embedded?: boolean;
 	/** Extra toolbar buttons inserted between the reset button and close. */
 	renderToolbarExtra?: (controls: PanZoomControls) => ReactNode;
 	/** Enable the `r` / `Shift+r` rotate keyboard shortcut. Default false. */
@@ -67,6 +69,7 @@ export interface PanZoomStageProps {
 export function PanZoomStage({
 	children,
 	onClose,
+	embedded = false,
 	renderToolbarExtra,
 	enableRotateKey = false,
 	closeOnBackdropClick = false,
@@ -74,6 +77,7 @@ export function PanZoomStage({
 }: PanZoomStageProps) {
 	const { t } = useTranslation("common");
 	const [transform, setTransform] = useState<Transform>(IDENTITY);
+	const stageRef = useRef<HTMLDivElement | null>(null);
 	const containerRef = useRef<HTMLDivElement | null>(null);
 	const transformRef = useRef(transform);
 	transformRef.current = transform;
@@ -156,7 +160,21 @@ export function PanZoomStage({
 	// Keyboard shortcuts
 	useEffect(() => {
 		const onKey = (e: KeyboardEvent) => {
-			if (e.key === "Escape") {
+			if (embedded) {
+				const target = e.target instanceof Element ? e.target : null;
+				if (
+					!stageRef.current?.contains(document.activeElement) ||
+					document.querySelector('[data-panzoom-mode="fullscreen"]') ||
+					e.ctrlKey ||
+					e.metaKey ||
+					e.altKey ||
+					target?.closest(
+						'input, textarea, select, [contenteditable]:not([contenteditable="false"])',
+					)
+				)
+					return;
+			}
+			if (e.key === "Escape" && onClose) {
 				e.preventDefault();
 				onClose();
 			} else if (e.key === "+" || e.key === "=") {
@@ -175,16 +193,17 @@ export function PanZoomStage({
 		};
 		window.addEventListener("keydown", onKey);
 		return () => window.removeEventListener("keydown", onKey);
-	}, [onClose, zoomByFactor, reset, rotate, enableRotateKey]);
+	}, [onClose, zoomByFactor, reset, rotate, enableRotateKey, embedded]);
 
 	// Lock background scroll while the overlay is open
 	useEffect(() => {
+		if (embedded) return;
 		const prev = document.body.style.overflow;
 		document.body.style.overflow = "hidden";
 		return () => {
 			document.body.style.overflow = prev;
 		};
-	}, []);
+	}, [embedded]);
 
 	const handleWheel = useCallback(
 		(e: React.WheelEvent) => {
@@ -295,7 +314,7 @@ export function PanZoomStage({
 				// button that happens to overlap the release point).
 				if (!wasDrag && closeOnBackdropClick && wasBackdropCandidate) {
 					const releaseTarget = document.elementFromPoint(e.clientX, e.clientY);
-					if (releaseTarget === containerRef.current) onClose();
+					if (releaseTarget === containerRef.current) onClose?.();
 				}
 			}
 		},
@@ -319,10 +338,20 @@ export function PanZoomStage({
 
 	return (
 		<Box
+			ref={stageRef}
+			tabIndex={embedded ? 0 : undefined}
+			data-panzoom-mode={embedded ? "embedded" : "fullscreen"}
+			onPointerDownCapture={
+				embedded ? () => stageRef.current?.focus({ preventScroll: true }) : undefined
+			}
 			style={{
-				position: "fixed",
-				inset: 0,
-				zIndex: Z.imageViewer,
+				position: embedded ? "relative" : "fixed",
+				inset: embedded ? undefined : 0,
+				width: embedded ? "100%" : undefined,
+				height: embedded ? "100%" : undefined,
+				minHeight: 0,
+				overflow: "hidden",
+				zIndex: embedded ? undefined : Z.imageViewer,
 				background: "rgba(0, 0, 0, 0.85)",
 				backdropFilter: "blur(2px)",
 				display: "flex",
@@ -335,7 +364,14 @@ export function PanZoomStage({
 				px="md"
 				py="xs"
 				justify="center"
-				style={{ position: "absolute", top: 0, left: 0, right: 0, zIndex: 2 }}
+				style={{
+					position: embedded ? "relative" : "absolute",
+					flexShrink: 0,
+					top: 0,
+					left: 0,
+					right: 0,
+					zIndex: 2,
+				}}
 				onPointerDown={(e) => e.stopPropagation()}
 			>
 				<Group
@@ -380,16 +416,18 @@ export function PanZoomStage({
 						</ActionIcon>
 					</Tooltip>
 					{renderToolbarExtra?.(controls)}
-					<Tooltip label={t("imageViewer_close")} withinPortal zIndex={PANZOOM_TOOLTIP_Z}>
-						<ActionIcon
-							variant="subtle"
-							color="gray"
-							onClick={onClose}
-							aria-label={t("imageViewer_close")}
-						>
-							<IconX size={18} />
-						</ActionIcon>
-					</Tooltip>
+					{onClose && (
+						<Tooltip label={t("imageViewer_close")} withinPortal zIndex={PANZOOM_TOOLTIP_Z}>
+							<ActionIcon
+								variant="subtle"
+								color="gray"
+								onClick={onClose}
+								aria-label={t("imageViewer_close")}
+							>
+								<IconX size={18} />
+							</ActionIcon>
+						</Tooltip>
+					)}
 				</Group>
 			</Group>
 
@@ -405,6 +443,9 @@ export function PanZoomStage({
 				onContextMenu={onContextMenu}
 				style={{
 					flex: 1,
+					minHeight: 0,
+					minWidth: 0,
+					containerType: embedded ? "size" : undefined,
 					display: "flex",
 					alignItems: "center",
 					justifyContent: "center",

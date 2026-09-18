@@ -11,6 +11,15 @@
  * and BOTH directions interpolate line numbers linearly BETWEEN neighbouring
  * anchors — exact at every block boundary, approximately right inside a block.
  *
+ * Deviation from VS Code: the forward map interpolates the source-line
+ * interval over the block's OWN pixel span, not over the gap after it. Multi-
+ * source-line blocks (tables, code fences, math) carry only their start-line
+ * anchor, so VS Code's "block end + gap" mapping pins the preview to the
+ * block's bottom edge for every line inside it — scrolling the source through
+ * a 30-line table jumps the preview past the whole table in one frame. The
+ * mapping here is the exact inverse of `lineForScrollTop`, so the two scroll
+ * directions agree at every pixel/line instead of drifting on round-trips.
+ *
  * The math below is DOM-free and unit-tested; the two collectors that build
  * anchors from pixels are the only DOM-touching part.
  */
@@ -57,9 +66,11 @@ export function buildAnchors(entries: readonly AnchorEntry[]): LineAnchor[] {
 }
 
 /**
- * The scroller offset (top edge) that reveals `line`, using VS Code's
- * previous/next anchor interpolation. Returns null when there is nothing
- * anchored to go by.
+ * The scroller offset (top edge) that reveals `line`. The source-line interval
+ * between two anchors maps linearly onto the pixel interval between their tops,
+ * so walking the source THROUGH a multi-line block (table, code fence) walks
+ * the preview through the block's own pixels. This is the exact inverse of
+ * `lineForScrollTop`. Returns null when there is nothing anchored to go by.
  */
 export function scrollTopForLine(anchors: readonly LineAnchor[], line: number): number | null {
 	if (anchors.length === 0) return null;
@@ -69,9 +80,7 @@ export function scrollTopForLine(anchors: readonly LineAnchor[], line: number): 
 		if (anchor.line === line) return anchor.top;
 		if (anchor.line > line) {
 			const progress = (line - previous.line) / (anchor.line - previous.line);
-			const previousEnd = previous.top + previous.height;
-			const gap = Math.max(0, anchor.top - previousEnd);
-			return previousEnd + progress * gap;
+			return previous.top + progress * (anchor.top - previous.top);
 		}
 		previous = anchor;
 	}

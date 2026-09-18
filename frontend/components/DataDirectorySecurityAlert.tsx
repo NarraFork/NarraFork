@@ -1,29 +1,23 @@
 import { Alert, Button, Code, Group, Modal, Stack, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { IconAlertTriangle } from "@tabler/icons-react";
-import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { IconAlertTriangle, IconLock } from "@tabler/icons-react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../hooks/useAuth";
 import { api, getToken } from "../lib/api";
 import { useConfirmDialog } from "./common/confirm-dialog-context";
 
-const notificationId = "data-directory-security";
-const openEvent = "narrafork:check-data-directory-security";
-// Session JWTs rotate during normal use; a renewal must not re-show a dismissed notice.
-const sessions = new WeakMap<QueryClient, { userId: string; seen: Set<string> }>();
-
+/**
+ * Data directory permissions are checked only when an operator asks for it, from
+ * Settings > Storage. The earlier design probed in the background on every login and
+ * raised a notification for any non-ok result — including a probe that merely timed
+ * out on a slow filesystem. That reported a permission fault where there was none,
+ * and admins who followed the alert found a healthy directory. Real permission
+ * problems still surface where they matter: the operation that needs the directory
+ * fails with an error that points here.
+ */
 export function DataDirectorySecurityCheckButton() {
-	const { t } = useTranslation("common");
-	return (
-		<Button variant="light" size="xs" onClick={() => window.dispatchEvent(new Event(openEvent))}>
-			{t("dataDirectorySecurity.check")}
-		</Button>
-	);
-}
-
-/** Notifications and a portal only: never occupies space in the authenticated shell. */
-export function DataDirectorySecurityAlert() {
 	const { t } = useTranslation("common");
 	const { data: user } = useCurrentUser();
 	const confirm = useConfirmDialog();
@@ -38,69 +32,12 @@ export function DataDirectorySecurityAlert() {
 	const query = useQuery({
 		queryKey,
 		queryFn: ({ signal }) => api.getDataDirectorySecurity(signal),
-		enabled: enabled && !busy,
+		// Never probes on mount: the operator's explicit request opens the modal.
+		enabled: enabled && opened && !busy,
 		staleTime: 60_000,
 		retry: false,
-		refetchOnWindowFocus: true,
+		refetchOnWindowFocus: false,
 	});
-
-	useEffect(() => {
-		if (!enabled) return;
-		const open = () => {
-			setOpened(true);
-			if (!inFlight.current) void query.refetch();
-		};
-		window.addEventListener(openEvent, open);
-		return () => window.removeEventListener(openEvent, open);
-	}, [enabled, query.refetch]);
-
-	useEffect(() => {
-		if (!enabled || (!query.isError && (!query.data || query.data.status === "ok"))) return;
-		if (!user?.id) return;
-		let session = sessions.get(queryClient);
-		if (!session || session.userId !== user.id) {
-			session = { userId: user.id, seen: new Set() };
-			sessions.set(queryClient, session);
-		}
-		const issue = query.isError
-			? "query-error"
-			: `${query.data?.status}:${query.data?.details?.code ?? ""}`;
-		if (session.seen.has(issue)) return;
-		session.seen.add(issue);
-		if (opened) return;
-		notifications.show({
-			id: notificationId,
-			color: "yellow",
-			autoClose: false,
-			title: t("dataDirectorySecurity.title"),
-			message: (
-				<Stack gap="xs">
-					<Text size="sm">
-						{t(
-							query.isError
-								? "dataDirectorySecurity.queryFailed"
-								: "dataDirectorySecurity.description",
-						)}
-					</Text>
-					{!isAdmin && <Text size="sm">{t("dataDirectorySecurity.contactAdmin")}</Text>}
-					<Button size="compact-xs" variant="light" onClick={() => setOpened(true)}>
-						{t(isAdmin ? "dataDirectorySecurity.handle" : "dataDirectorySecurity.recheck")}
-					</Button>
-				</Stack>
-			),
-		});
-	}, [enabled, isAdmin, opened, query.data, query.isError, queryClient, t, user?.id]);
-
-	useEffect(() => {
-		if (!enabled || (!query.isError && query.data?.status === "ok"))
-			notifications.hide(notificationId);
-	}, [enabled, query.data?.status, query.isError]);
-	useEffect(
-		() => () => {
-			notifications.hide(notificationId);
-		},
-		[],
-	);
 
 	async function repair() {
 		if (inFlight.current || !enabled || !isAdmin || !query.data?.canRepair) return;
@@ -133,91 +70,113 @@ export function DataDirectorySecurityAlert() {
 		}
 	}
 
-	if (!enabled || !opened) return null;
+	const status = query.isError ? undefined : query.data?.status;
+	// An inconclusive probe is neither healthy nor a fault; it says nothing at all.
+	const inconclusive = query.isError || status === "unknown";
+	const faulty = status !== undefined && status !== "ok" && status !== "unknown";
 	const details = isAdmin ? query.data?.details : undefined;
+
 	return (
-		<Modal
-			opened={opened}
-			onClose={() => {
-				if (!busy) setOpened(false);
-			}}
-			title={t("dataDirectorySecurity.title")}
-			size="sm"
-			closeOnClickOutside={!busy}
-			closeOnEscape={!busy}
-			withCloseButton={!busy}
-		>
-			<Alert
-				color={query.data?.status === "ok" && !query.isError ? "green" : "yellow"}
-				radius={0}
-				icon={<IconAlertTriangle size={18} />}
-				title={t("dataDirectorySecurity.title")}
+		<>
+			<Group>
+				<Button variant="light" size="xs" onClick={() => setOpened(true)}>
+					{t("dataDirectorySecurity.check")}
+				</Button>
+			</Group>
+			<Modal
+				opened={opened}
+				onClose={() => {
+					if (!busy) setOpened(false);
+				}}
+				// "needs attention" is only claimed once a check actually said so.
+				title={t(faulty ? "dataDirectorySecurity.title" : "dataDirectorySecurity.statusTitle")}
+				size="sm"
+				closeOnClickOutside={!busy}
+				closeOnEscape={!busy}
+				withCloseButton={!busy}
 			>
-				<Stack gap="xs">
-					<Text size="sm">
-						{t(
-							query.isError
-								? "dataDirectorySecurity.queryFailed"
-								: query.isFetching
+				<Alert
+					color={faulty ? "yellow" : status === "ok" ? "green" : "gray"}
+					radius={0}
+					icon={faulty ? <IconAlertTriangle size={18} /> : <IconLock size={18} />}
+					title={t(faulty ? "dataDirectorySecurity.title" : "dataDirectorySecurity.statusTitle")}
+				>
+					<Stack gap="xs">
+						<Text size="sm">
+							{t(
+								query.isFetching
 									? "dataDirectorySecurity.checking"
-									: query.data?.status === "ok"
-										? "dataDirectorySecurity.healthy"
-										: "dataDirectorySecurity.description",
-						)}
-					</Text>
-					{!isAdmin && (query.isError || query.data?.status !== "ok") ? (
-						<Text size="sm">{t("dataDirectorySecurity.contactAdmin")}</Text>
-					) : query.data?.status !== "ok" && !query.data?.canRepair && !query.isError ? (
-						<Text size="sm">{t("dataDirectorySecurity.manual")}</Text>
-					) : null}
-					{repairFailed && (
-						<Text size="sm" c="red">
-							{t("dataDirectorySecurity.repairFailed")}
+									: query.isError
+										? "dataDirectorySecurity.queryFailed"
+										: status === "unknown"
+											? "dataDirectorySecurity.inconclusive"
+											: status === "ok"
+												? "dataDirectorySecurity.healthy"
+												: faulty
+													? "dataDirectorySecurity.description"
+													: "dataDirectorySecurity.checking",
+							)}
 						</Text>
-					)}
-					{details && (
-						<details>
-							<summary>{t("dataDirectorySecurity.details")}</summary>
-							<Code block style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
-								{[
-									details.path,
-									details.mode && `${t("dataDirectorySecurity.mode")}: ${details.mode}`,
-									`${details.code}: ${details.message}`,
-									details.ownerUid !== undefined && `ownerUid: ${details.ownerUid}`,
-									details.serviceUid !== undefined && `serviceUid: ${details.serviceUid}`,
-								]
-									.filter((line) => line !== false && line !== undefined)
-									.join("\n")}
-							</Code>
-						</details>
-					)}
-					<Group gap="xs">
-						{isAdmin && query.data?.canRepair && (
+						{faulty && (
+							<Alert color="blue" variant="light" icon={<IconLock size={18} />}>
+								<Text size="sm">{t("dataDirectorySecurity.whyPermissions")}</Text>
+							</Alert>
+						)}
+						{!isAdmin && (faulty || inconclusive) ? (
+							<Text size="sm">{t("dataDirectorySecurity.contactAdmin")}</Text>
+						) : faulty && !query.data?.canRepair ? (
+							<Text size="sm">{t("dataDirectorySecurity.manual")}</Text>
+						) : null}
+						{repairFailed && (
+							<Text size="sm" c="red">
+								{t("dataDirectorySecurity.repairFailed")}
+							</Text>
+						)}
+						{details && (
+							<details>
+								<summary>{t("dataDirectorySecurity.details")}</summary>
+								<Code block style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+									{[
+										details.path,
+										details.mode && `${t("dataDirectorySecurity.mode")}: ${details.mode}`,
+										`${details.code}: ${details.message}`,
+										details.ownerUid !== undefined && `ownerUid: ${details.ownerUid}`,
+										details.serviceUid !== undefined && `serviceUid: ${details.serviceUid}`,
+									]
+										.filter((line) => line !== false && line !== undefined)
+										.join("\n")}
+								</Code>
+							</details>
+						)}
+						<Group gap="sm" mt="sm">
+							{isAdmin && faulty && query.data?.canRepair && (
+								<Button
+									size="md"
+									color="orange"
+									leftSection={<IconLock size={18} />}
+									loading={busy}
+									disabled={busy || query.isFetching}
+									onClick={() => void repair()}
+								>
+									{t("dataDirectorySecurity.repair")}
+								</Button>
+							)}
 							<Button
 								size="compact-sm"
-								color="orange"
-								loading={busy}
+								variant="light"
+								loading={query.isFetching}
 								disabled={busy || query.isFetching}
-								onClick={() => void repair()}
+								onClick={() => {
+									setRepairFailed(false);
+									void query.refetch();
+								}}
 							>
-								{t("dataDirectorySecurity.repair")}
+								{t("dataDirectorySecurity.recheck")}
 							</Button>
-						)}
-						<Button
-							size="compact-sm"
-							variant="light"
-							loading={query.isFetching}
-							disabled={busy || query.isFetching}
-							onClick={() => {
-								setRepairFailed(false);
-								void query.refetch();
-							}}
-						>
-							{t("dataDirectorySecurity.recheck")}
-						</Button>
-					</Group>
-				</Stack>
-			</Alert>
-		</Modal>
+						</Group>
+					</Stack>
+				</Alert>
+			</Modal>
+		</>
 	);
 }

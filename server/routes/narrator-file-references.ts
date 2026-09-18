@@ -81,6 +81,22 @@ export function createFileReferenceRoutes(service: FileReferenceService = fileRe
 			),
 		);
 	});
+	routes.get("/image-preview", async (c) => {
+		const parsed = previewFileReferenceSchema.safeParse(c.req.query());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		const image = await service.previewFileReferenceImage(
+			c.req.param("id") ?? "",
+			c.get("user").sub,
+			parsed.data,
+			c.req.raw.signal,
+		);
+		c.header("Content-Type", image.mimeType);
+		c.header("Content-Length", String(image.bytes.byteLength));
+		c.header("X-Content-Type-Options", "nosniff");
+		// Defense in depth for direct navigation. Consumers must use img, never iframe/HTML.
+		c.header("Content-Security-Policy", "default-src 'none'; sandbox");
+		return c.body(new Uint8Array(image.bytes));
+	});
 	return routes;
 }
 

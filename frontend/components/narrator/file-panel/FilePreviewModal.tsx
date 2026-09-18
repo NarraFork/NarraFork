@@ -16,6 +16,7 @@
  */
 
 import { Box, Group, Loader, Modal, Text } from "@mantine/core";
+import { getFileReferenceImageMimeType } from "@shared/file-reference-image";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useFileSystemCapability } from "../../../hooks/usePlatform";
@@ -25,17 +26,6 @@ import { getShikiLang } from "../../../lib/shiki-lang";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { ContentViewer } from "../content/ContentViewer";
 
-const IMAGE_EXTS = new Set([
-	".jpg",
-	".jpeg",
-	".png",
-	".gif",
-	".webp",
-	".svg",
-	".avif",
-	".bmp",
-	".ico",
-]);
 const PDF_EXTS = new Set([".pdf"]);
 export const MAX_FILE_PREVIEW_TEXT_CHARS = 120_000;
 export const MAX_FILE_PREVIEW_BLOB_BYTES = 25 * 1024 * 1024;
@@ -79,7 +69,7 @@ export function getFilePreviewType(filePath: string): "image" | "pdf" | "text" {
 	const dot = filePath.lastIndexOf(".");
 	if (dot === -1) return "text";
 	const ext = filePath.slice(dot).toLowerCase();
-	if (IMAGE_EXTS.has(ext)) return "image";
+	if (getFileReferenceImageMimeType(filePath)) return "image";
 	if (PDF_EXTS.has(ext)) return "pdf";
 	return "text";
 }

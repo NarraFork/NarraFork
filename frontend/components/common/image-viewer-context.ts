@@ -30,6 +30,8 @@ import { createSharedContext } from "../../lib/shared-context";
  */
 export interface ImageViewerOptions {
 	src: string;
+	/** Fullscreen creates its own object URL so the source panel can unmount safely. */
+	blob?: Blob;
 	/** Optional server file path fetched via /api/fs/preview for copy/download. */
 	savedPath?: string | null;
 	/** Suggested download filename (extension optional). */

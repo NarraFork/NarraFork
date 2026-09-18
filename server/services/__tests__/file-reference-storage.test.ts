@@ -297,7 +297,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 			);
 			const current = buffer.projectMailboxUserMessage(claimed);
 			expect(current).toBeDefined();
-			buffer.restoreBufferedMessage("n", current);
+			await buffer.restoreBufferedMessage("n", current);
 			expect(parseFileReferenceSnapshotsJson(queueRow(priority.id)?.fileReferencesJson)).toEqual([
 				snapshot("first"),
 			]);

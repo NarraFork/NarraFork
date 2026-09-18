@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { getFilePreviewType, MAX_FILE_PREVIEW_BLOB_BYTES } from "../file-panel/FilePreviewModal";
-import { readBinaryPreview } from "./FileViewerContent";
+import { fileViewerUsesText, readBinaryPreview } from "./FileViewerContent";
 
 describe("panel binary previews", () => {
 	test("recognizes images and PDF without changing text handling", () => {
@@ -9,6 +9,31 @@ describe("panel binary previews", () => {
 		}
 		expect(getFilePreviewType("C:\\work\\report.PDF")).toBe("pdf");
 		expect(getFilePreviewType("/work/code.ts")).toBe("text");
+	});
+
+	test("image links open previews on either device while text and PDF policies stay unchanged", () => {
+		for (const device of ["local", "remote-device"]) {
+			for (const referenceOrigin of [true, false]) {
+				expect(fileViewerUsesText("image", undefined, referenceOrigin, device)).toBe(false);
+				expect(fileViewerUsesText("text", undefined, referenceOrigin, device)).toBe(true);
+			}
+		}
+		expect(fileViewerUsesText("pdf", undefined, false, "local")).toBe(false);
+		expect(fileViewerUsesText("pdf", undefined, true, "local")).toBe(true);
+		expect(fileViewerUsesText("pdf", undefined, false, "remote-device")).toBe(true);
+		expect(
+			fileViewerUsesText(
+				"image",
+				{
+					startLineNumber: 1,
+					startColumn: 1,
+					endLineNumber: 1,
+					endColumn: 2,
+				},
+				true,
+				"local",
+			),
+		).toBe(true);
 	});
 
 	test("preserves binary bytes and content type", async () => {

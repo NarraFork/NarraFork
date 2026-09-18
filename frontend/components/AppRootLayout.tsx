@@ -99,7 +99,6 @@ import {
 import { setStreamAnimDurationMs } from "../lib/stream-anim-duration";
 import { BrandTitle } from "./common/BrandTitle";
 import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
-import { DataDirectorySecurityAlert } from "./DataDirectorySecurityAlert";
 import { GitMissingAlert } from "./GitMissingAlert";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
 import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
@@ -1073,9 +1072,13 @@ function AuthenticatedLayout() {
 				className={APP_SHELL_MAIN_CLASSNAME}
 				style={{ paddingBottom: APP_SHELL_MAIN_PADDING_BOTTOM }}
 			>
+				{/*
+				 * No data-directory permission probe here: it ran on every login and turned an
+				 * inconclusive check (slow filesystem, timeout) into a permission warning.
+				 * The check lives in Settings > Storage, where an operator asks for it.
+				 */}
 				<GitMissingAlert />
 				<StartupRecoveryAlert />
-				<DataDirectorySecurityAlert />
 				<Outlet />
 			</AppShell.Main>
 

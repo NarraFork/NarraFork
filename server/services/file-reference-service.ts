@@ -17,6 +17,10 @@ import {
 	MAX_FILE_REFERENCE_TEXT_BYTES,
 	MAX_FILE_REFERENCE_TOTAL_TEXT_BYTES,
 } from "@shared/file-reference";
+import {
+	getFileReferenceImageMimeType,
+	MAX_FILE_REFERENCE_IMAGE_BYTES,
+} from "@shared/file-reference-image";
 import type { DeviceSummary, ExecutionBackend, FileStat } from "../lib/agent/execution/backend";
 import { AppError, NotFoundError, zodValidationError } from "../lib/errors";
 import { isPlanModeTrait } from "../lib/narrator-utils";
@@ -56,6 +60,12 @@ export interface FileReferenceService {
 		target: FileTarget,
 		signal?: AbortSignal,
 	): Promise<FileReferencePreview>;
+	previewFileReferenceImage(
+		narratorId: string,
+		userId: string,
+		target: FileTarget,
+		signal?: AbortSignal,
+	): Promise<{ bytes: Uint8Array; mimeType: string }>;
 	searchFileReferences(
 		narratorId: string,
 		userId: string,
@@ -671,6 +681,54 @@ export function createFileReferenceService(
 					fileName: file.context.paths.basename(file.target.path),
 				};
 			});
+		},
+		async previewFileReferenceImage(narratorId, userId, target, signal) {
+			const parsed = fileTargetSchema.safeParse(target);
+			if (!parsed.success) throw zodValidationError(parsed.error);
+			return run(
+				"image-preview",
+				narratorId,
+				userId,
+				"read",
+				signal,
+				async (scope, op, devices) => {
+					const file = await authorize(scope, parsed.data, op, devices);
+					const mimeType = getFileReferenceImageMimeType(file.target.path);
+					if (!mimeType)
+						throw failure(
+							"UNSUPPORTED_IMAGE",
+							"File extension is not an allowed image format",
+							415,
+						);
+					if (file.stat.size > MAX_FILE_REFERENCE_IMAGE_BYTES)
+						throw failure("SOURCE_TOO_LARGE", "Image exceeds 25 MiB", 413);
+					const result = await op.wait(() =>
+						file.device.backend.readFileBytes(file.context.target.lexicalPath as string, {
+							maxBytes: MAX_FILE_REFERENCE_IMAGE_BYTES,
+							expectedResolvedPath: file.target.path,
+							signal: op.signal,
+							timeoutMs: op.remaining,
+						}),
+					);
+					if (
+						!result.resolvedPath ||
+						!file.context.paths.equals(result.resolvedPath, file.target.path) ||
+						file.device.backend.runtimeGeneration !== file.device.generation
+					)
+						throw failure("IDENTITY_CHANGED", "Atomic image read identity changed", 409);
+					if (
+						result.truncated ||
+						result.totalSize > MAX_FILE_REFERENCE_IMAGE_BYTES ||
+						result.bytes.byteLength > MAX_FILE_REFERENCE_IMAGE_BYTES
+					)
+						throw failure(
+							"SOURCE_TOO_LARGE",
+							"Image exceeds 25 MiB; partial images are not accepted",
+							413,
+						);
+					return { bytes: result.bytes, mimeType };
+				},
+			);
 		},
 		async searchFileReferences(narratorId, userId, input, signal) {
 			const parsed = searchFileReferencesSchema.safeParse(input);
