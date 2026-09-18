@@ -1,19 +1,11 @@
-import { and, eq, isNull, ne, or } from "drizzle-orm";
-import { db } from "../db";
-import {
-	aclGrants,
-	knowledgeCollections,
-	knowledgeEntries,
-	type knowledgeGrants,
-	knowledgeLevels,
-	knowledgeTags,
-	knowledgeTagTypes,
-	users,
-} from "../db/schema";
+import type { knowledgeGrants } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import type { KnowledgeLevelRow } from "./knowledge/read-store";
+import { knowledgeReadStore, knowledgeWriteStore } from "./knowledge/store";
+import { type AclGrantRowWrite, WriteConflictError } from "./knowledge/write-store";
 import { recordKnowledgeAclEvent } from "./knowledge-audit";
 
 /** A user's role as stored on the JWT/users table. */
@@ -74,17 +66,19 @@ function asStringArray(v: unknown): string[] {
 }
 
 // Cache the level name→rank map briefly; levels rarely change.
-let levelCache: { at: number; map: Map<string, number> } | null = null;
+let levelCache: { at: number; store: typeof knowledgeReadStore; map: Map<string, number> } | null =
+	null;
 const LEVEL_TTL_MS = 30_000;
 
 async function levelRankMap(): Promise<Map<string, number>> {
-	if (levelCache && Date.now() - levelCache.at < LEVEL_TTL_MS) return levelCache.map;
-	const rows = await db.query.knowledgeLevels.findMany();
+	if (levelCache?.store === knowledgeReadStore && Date.now() - levelCache.at < LEVEL_TTL_MS)
+		return levelCache.map;
+	const rows = await knowledgeReadStore.listKnowledgeLevels();
 	const map = new Map<string, number>();
 	// public always resolves to 0 even if not seeded.
 	map.set("public", 0);
 	for (const r of rows) map.set(r.name, r.rank);
-	levelCache = { at: Date.now(), map };
+	levelCache = { at: Date.now(), store: knowledgeReadStore, map };
 	return map;
 }
 
@@ -198,28 +192,14 @@ export async function resolvePrincipalCaps(principal: Principal): Promise<Princi
 async function loadKnowledgeGrantRows(
 	principal: Principal,
 ): Promise<(typeof knowledgeGrants.$inferSelect)[]> {
-	const rows = await db
-		.select({
-			id: aclGrants.id,
-			scopeType: aclGrants.scopeType,
-			scopeId: aclGrants.scopeId,
-			principalType: aclGrants.principalType,
-			principalId: aclGrants.principalId,
-			capability: aclGrants.capability,
-			domainKind: aclGrants.domainKind,
-			domainValue: aclGrants.domainValue,
-			createdAt: aclGrants.createdAt,
-		})
-		.from(aclGrants)
-		.where(
-			and(
-				knowledgeGrantWhere(),
-				or(
-					and(eq(aclGrants.principalType, "user"), eq(aclGrants.principalId, principal.userId)),
-					and(eq(aclGrants.principalType, "role"), eq(aclGrants.principalId, principal.role)),
-				),
-			),
-		);
+	// User grants ∪ role grants, in the knowledge scopes only. The OR over the two
+	// principal tuples is expressed as a principal LIST at the port boundary.
+	const rows = await knowledgeReadStore.listKnowledgeAclGrantRows({
+		principals: [
+			{ principalType: "user", principalId: principal.userId },
+			{ principalType: "role", principalId: principal.role },
+		],
+	});
 	return rows.map(toKnowledgeGrantRow);
 }
 
@@ -232,8 +212,6 @@ async function loadKnowledgeGrantRows(
  * helpers are the only place that translation lives, so the rest of this file keeps
  * working in its own vocabulary and the two-axis rules are untouched.
  */
-const KNOWLEDGE_SCOPE_TYPES = ["global", "knowledge_collection"] as const;
-
 /** The `acl_grants` scope for a (possibly absent) collection id. */
 function knowledgeScopeOf(collectionId: string | null | undefined): {
 	scopeType: "global" | "knowledge_collection";
@@ -244,27 +222,22 @@ function knowledgeScopeOf(collectionId: string | null | undefined): {
 		: { scopeType: "global", scopeId: null };
 }
 
-/** Match every knowledge-scoped grant row, optionally narrowed to one principal. */
-function knowledgeGrantWhere(principal?: { principalType: string; principalId: string }) {
-	const scope = or(
-		eq(aclGrants.scopeType, KNOWLEDGE_SCOPE_TYPES[0]),
-		eq(aclGrants.scopeType, KNOWLEDGE_SCOPE_TYPES[1]),
-	);
-	if (!principal) return scope;
-	return and(
-		scope,
-		eq(aclGrants.principalType, principal.principalType as "user"),
-		eq(aclGrants.principalId, principal.principalId),
-	);
-}
+// The knowledge-scope row filter (`global` ∪ `knowledge_collection`, optionally
+// principal-narrowed) lives in the read/write stores now — see
+// `listKnowledgeAclGrantRows` / `deleteUserKnowledgeGrants` — so this service keeps
+// working in the knowledge vocabulary and never spells a scope condition itself.
 
 /**
  * Project an `acl_grants` row back into the legacy grant shape the folding and
  * reporting code understands.
  *
  * `id` is preserved so the grant CRUD endpoints keep addressing rows by id.
+ *
+ * Exported (not just module-private) so the dual-backend write suites can prove the
+ * row shape the PostgreSQL store writes projects to exactly the credentials the ACL
+ * layer consumes — the projection IS the read-side contract of the grant tables.
  */
-function toKnowledgeGrantRow(row: {
+export function toKnowledgeGrantRow(row: {
 	id: string;
 	scopeType: string;
 	scopeId: string | null;
@@ -294,30 +267,20 @@ async function selectKnowledgeGrants(principal?: {
 	principalType: string;
 	principalId: string;
 }): Promise<(typeof knowledgeGrants.$inferSelect)[]> {
-	const rows = await db
-		.select({
-			id: aclGrants.id,
-			scopeType: aclGrants.scopeType,
-			scopeId: aclGrants.scopeId,
-			principalType: aclGrants.principalType,
-			principalId: aclGrants.principalId,
-			capability: aclGrants.capability,
-			domainKind: aclGrants.domainKind,
-			domainValue: aclGrants.domainValue,
-			createdAt: aclGrants.createdAt,
-		})
-		.from(aclGrants)
-		.where(knowledgeGrantWhere(principal));
+	const rows = await knowledgeReadStore.listKnowledgeAclGrantRows(
+		principal ? { principals: [principal] } : undefined,
+	);
 	return rows.map(toKnowledgeGrantRow);
 }
 
 /**
- * The `acl_grants` rows one logical knowledge grant becomes.
+ * The `acl_grants` rows one logical knowledge grant becomes, in the port's plain-data
+ * shape (`AclGrantRowWrite`).
  *
  * A credential grant that also carries `canWrite` produces TWO rows, because the
- * unified table keeps capabilities and credentials in separate rows. `INSERT OR
- * IGNORE` semantics are the caller's business; the unique index collapses a repeated
- * write row for the same principal and scope.
+ * unified table keeps capabilities and credentials in separate rows. Conflict
+ * semantics are the store's business; the unique index collapses a repeated write
+ * row for the same principal and scope.
  */
 function knowledgeGrantRowsFor(input: {
 	collectionId?: string | null;
@@ -330,12 +293,12 @@ function knowledgeGrantRowsFor(input: {
 	grantedBy?: string | null;
 	id?: string;
 	createdAt?: string;
-}): (typeof aclGrants.$inferInsert)[] {
+}): AclGrantRowWrite[] {
 	const scope = knowledgeScopeOf(input.collectionId);
 	const createdAt = input.createdAt ?? nowIso();
 	const domainValue =
 		input.grantType === "clearance" ? (input.clearanceLevel ?? null) : (input.tagId ?? null);
-	const rows: (typeof aclGrants.$inferInsert)[] = [];
+	const rows: AclGrantRowWrite[] = [];
 	if (domainValue) {
 		rows.push({
 			id: input.id ?? generateId(),
@@ -404,10 +367,7 @@ export async function resolveCapsForAllUsers(
 ): Promise<BatchCaps> {
 	const cap = Math.max(1, Math.min(limit, BATCH_CAPS_USER_LIMIT));
 	// limit + 1 detects "more than the cap" without a COUNT(*) over the whole table.
-	let rows = await db.query.users.findMany({
-		columns: { id: true, role: true },
-		limit: cap + 1,
-	});
+	let rows = await knowledgeReadStore.listUserIdsAndRoles({ limit: cap + 1 });
 	let truncated = rows.length > cap;
 
 	// Read from the unified table via the shared projection; the limit still guards the
@@ -416,11 +376,7 @@ export async function resolveCapsForAllUsers(
 	if (grants.length > BATCH_CAPS_GRANT_LIMIT) truncated = true;
 
 	if (truncated) {
-		rows = await db.query.users.findMany({
-			columns: { id: true, role: true },
-			where: eq(users.role, "admin"),
-			limit: cap,
-		});
+		rows = await knowledgeReadStore.listUserIdsAndRoles({ role: "admin", limit: cap });
 	}
 
 	const userGrants = new Map<string, typeof grants>();
@@ -484,12 +440,9 @@ export async function resolveCapsByUserId(
 	userId: string | null | undefined,
 ): Promise<PrincipalCaps> {
 	if (!userId) return anonymousCaps();
-	const row = await db.query.users.findFirst({
-		where: eq(users.id, userId),
-		columns: { id: true, role: true },
-	});
+	const row = await knowledgeReadStore.getUserRoleById(userId);
 	if (!row) return anonymousCaps();
-	return resolvePrincipalCaps({ userId: row.id, role: row.role });
+	return resolvePrincipalCaps({ userId: row.id, role: row.role as Role });
 }
 
 /**
@@ -614,20 +567,17 @@ function nowIso(): string {
 }
 
 async function listLevels() {
-	return db.query.knowledgeLevels.findMany({ orderBy: (l, { asc }) => [asc(l.rank)] });
+	return knowledgeReadStore.listKnowledgeLevels();
 }
 
 async function createLevel(input: { name: string; rank: number; label?: string }) {
-	const [row] = await db
-		.insert(knowledgeLevels)
-		.values({
-			id: generateId(),
-			name: input.name,
-			rank: input.rank,
-			label: input.label ?? null,
-			createdAt: nowIso(),
-		})
-		.returning();
+	const row = await knowledgeWriteStore.insertKnowledgeLevel({
+		id: generateId(),
+		name: input.name,
+		rank: input.rank,
+		label: input.label ?? null,
+		now: nowIso(),
+	});
 	invalidateLevelCache();
 	return row;
 }
@@ -635,70 +585,42 @@ async function createLevel(input: { name: string; rank: number; label?: string }
 async function updateLevel(
 	id: string,
 	input: { name?: string; rank?: number; label?: string | null },
-): Promise<typeof knowledgeLevels.$inferSelect> {
-	const existing = await db.query.knowledgeLevels.findFirst({
-		where: eq(knowledgeLevels.id, id),
-	});
+): Promise<KnowledgeLevelRow> {
+	const existing = await knowledgeReadStore.getKnowledgeLevelById(id);
 	if (!existing) throw new NotFoundError("Knowledge level", id);
 
 	const renaming = input.name !== undefined && input.name !== existing.name;
 	const reranking = input.rank !== undefined && input.rank !== existing.rank;
 
 	// Pre-check unique constraints (name + rank both have UNIQUE indexes) so we
-	// surface a clean 400 instead of leaking a raw SQLite constraint error as a 500.
+	// surface a clean 400 instead of leaking a raw constraint error as a 500.
 	if (renaming) {
-		const clash = await db.query.knowledgeLevels.findFirst({
-			where: and(eq(knowledgeLevels.name, input.name as string), ne(knowledgeLevels.id, id)),
-			columns: { id: true },
-		});
+		const clash = await knowledgeReadStore.findKnowledgeLevelByName(input.name as string, id);
 		if (clash) throw new ValidationError(`Level name already in use: ${input.name}`);
 	}
 	if (reranking) {
-		const clash = await db.query.knowledgeLevels.findFirst({
-			where: and(eq(knowledgeLevels.rank, input.rank as number), ne(knowledgeLevels.id, id)),
-			columns: { id: true },
-		});
+		const clash = await knowledgeReadStore.findKnowledgeLevelByRank(input.rank as number, id);
 		if (clash) throw new ValidationError(`Level rank already in use: ${input.rank}`);
 	}
 
-	const updates: Partial<typeof knowledgeLevels.$inferInsert> = {};
+	const updates: { name?: string; rank?: number; label?: string | null } = {};
 	if (input.name !== undefined) updates.name = input.name;
 	if (input.rank !== undefined) updates.rank = input.rank;
 	if (input.label !== undefined) updates.label = input.label;
 
-	// Apply the level row update AND any reference renames in a SINGLE transaction.
+	// Apply the level row update AND any reference renames as ONE store operation.
 	// Levels are referenced BY NAME (not id) from entries/collections/grants, so a
 	// partial write (references renamed but the level row not, or vice versa) would
 	// make rankOf() fail-closed on the dangling name and abruptly lock those entries
-	// to admin-only. Atomicity keeps the name in lock-step with its references.
-	db.transaction((tx) => {
-		if (renaming) {
-			const newName = input.name as string;
-			tx.update(knowledgeEntries)
-				.set({ classificationLevel: newName })
-				.where(eq(knowledgeEntries.classificationLevel, existing.name))
-				.run();
-			tx.update(knowledgeCollections)
-				.set({ defaultLevel: newName })
-				.where(eq(knowledgeCollections.defaultLevel, existing.name))
-				.run();
-			tx.update(knowledgeCollections)
-				.set({ classificationLevel: newName })
-				.where(eq(knowledgeCollections.classificationLevel, existing.name))
-				.run();
-			// Clearance levels are referenced by NAME, so a rename has to rewrite every
-			// credential row in the same transaction. Missing one would make `rankOf` fail
-			// closed on it and lock the content to admins — which is why this stays inside
-			// the rename transaction rather than becoming a follow-up job.
-			tx.update(aclGrants)
-				.set({ domainValue: newName })
-				.where(and(eq(aclGrants.domainKind, "clearance"), eq(aclGrants.domainValue, existing.name)))
-				.run();
-		}
-		tx.update(knowledgeLevels).set(updates).where(eq(knowledgeLevels.id, id)).run();
+	// to admin-only. The store keeps the name in lock-step with its references
+	// atomically on both backends.
+	await knowledgeWriteStore.renameKnowledgeLevel({
+		levelId: id,
+		updates,
+		rename: renaming ? { from: existing.name, to: input.name as string } : null,
 	});
 
-	const row = await db.query.knowledgeLevels.findFirst({ where: eq(knowledgeLevels.id, id) });
+	const row = await knowledgeReadStore.getKnowledgeLevelById(id);
 	invalidateLevelCache();
 	if (!row) throw new NotFoundError("Knowledge level", id);
 	return row;
@@ -707,9 +629,7 @@ async function updateLevel(
 async function deleteLevel(
 	id: string,
 ): Promise<{ ok: true } | { ok: false; reason: string; refs?: number }> {
-	const level = await db.query.knowledgeLevels.findFirst({
-		where: eq(knowledgeLevels.id, id),
-	});
+	const level = await knowledgeReadStore.getKnowledgeLevelById(id);
 	if (!level) return { ok: false, reason: "not_found" };
 	// "public" is the baseline level relied on throughout the ACL logic.
 	if (level.name === "public") return { ok: false, reason: "builtin" };
@@ -717,29 +637,11 @@ async function deleteLevel(
 	// Reference check: levels are referenced BY NAME (not id) from these places.
 	// Deleting a still-referenced level would, under fail-closed rankOf, abruptly
 	// lock every referencing entry/collection to admin-only — so refuse and surface it.
-	const [entryRefs, collectionDefaultRefs, collectionClassRefs, grantRefs] = await Promise.all([
-		db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.classificationLevel, level.name),
-			columns: { id: true },
-		}),
-		db.query.knowledgeCollections.findFirst({
-			where: eq(knowledgeCollections.defaultLevel, level.name),
-			columns: { id: true },
-		}),
-		db.query.knowledgeCollections.findFirst({
-			where: eq(knowledgeCollections.classificationLevel, level.name),
-			columns: { id: true },
-		}),
-		db.query.aclGrants.findFirst({
-			where: and(eq(aclGrants.domainKind, "clearance"), eq(aclGrants.domainValue, level.name)),
-			columns: { id: true },
-		}),
-	]);
-	if (entryRefs || collectionDefaultRefs || collectionClassRefs || grantRefs) {
+	if (await knowledgeReadStore.knowledgeLevelInUse(level.name)) {
 		return { ok: false, reason: "in_use" };
 	}
 
-	await db.delete(knowledgeLevels).where(eq(knowledgeLevels.id, id));
+	await knowledgeWriteStore.deleteKnowledgeLevel({ levelId: id });
 	invalidateLevelCache();
 	return { ok: true };
 }
@@ -761,27 +663,17 @@ async function updateCollectionAcl(
 	actor?: { userId?: string | null; role?: string | null },
 ) {
 	// Read the BEFORE state for the audit diff (small, ACL-only projection — no content).
-	const existing = await db.query.knowledgeCollections.findFirst({
-		where: eq(knowledgeCollections.id, id),
-		columns: {
-			id: true,
-			classificationLevel: true,
-			controlledTagsJson: true,
-			ownerUserId: true,
-		},
-	});
+	const existing = await knowledgeReadStore.getCollectionAclById(id);
 	if (!existing) throw new Error("Knowledge collection not found");
-	await db
-		.update(knowledgeCollections)
-		.set({
-			...(input.classificationLevel !== undefined
-				? { classificationLevel: input.classificationLevel }
-				: {}),
-			...(input.controlledTags !== undefined ? { controlledTagsJson: input.controlledTags } : {}),
-			...(input.ownerUserId !== undefined ? { ownerUserId: input.ownerUserId } : {}),
-			updatedAt: nowIso(),
-		})
-		.where(eq(knowledgeCollections.id, id));
+	await knowledgeWriteStore.updateCollectionFields({
+		collectionId: id,
+		...(input.classificationLevel !== undefined
+			? { classificationLevel: input.classificationLevel }
+			: {}),
+		...(input.controlledTags !== undefined ? { controlledTagsJson: input.controlledTags } : {}),
+		...(input.ownerUserId !== undefined ? { ownerUserId: input.ownerUserId } : {}),
+		now: nowIso(),
+	});
 	// Post-write: this changed who can read a whole collection, so it is exactly the kind of
 	// change that must be answerable after the fact. Level names + tag ids only.
 	recordKnowledgeAclEvent({
@@ -809,16 +701,11 @@ async function updateCollectionAcl(
 			},
 		},
 	});
-	return db.query.knowledgeCollections.findFirst({ where: eq(knowledgeCollections.id, id) });
+	return knowledgeReadStore.getCollectionById(id);
 }
 
 async function listTags(collectionId?: string) {
-	if (collectionId) {
-		return db.query.knowledgeTags.findMany({
-			where: eq(knowledgeTags.collectionId, collectionId),
-		});
-	}
-	return db.query.knowledgeTags.findMany();
+	return knowledgeReadStore.listKnowledgeTags(collectionId);
 }
 
 async function createTag(input: {
@@ -827,80 +714,63 @@ async function createTag(input: {
 	controlled?: boolean;
 	typeId?: string;
 }) {
-	const [row] = await db
-		.insert(knowledgeTags)
-		.values({
-			id: generateId(),
-			name: input.name,
-			collectionId: input.collectionId ?? null,
-			typeId: input.typeId ?? null,
-			controlled: input.controlled ?? false,
-			createdAt: nowIso(),
-		})
-		.returning();
-	return row;
+	return knowledgeWriteStore.insertKnowledgeTag({
+		id: generateId(),
+		name: input.name,
+		collectionId: input.collectionId ?? null,
+		typeId: input.typeId ?? null,
+		controlled: input.controlled ?? false,
+		now: nowIso(),
+	});
 }
 
 async function updateTag(
 	id: string,
 	input: { name?: string; controlled?: boolean; typeId?: string | null },
 ) {
-	await db
-		.update(knowledgeTags)
-		.set({
-			...(input.name !== undefined ? { name: input.name } : {}),
-			...(input.controlled !== undefined ? { controlled: input.controlled } : {}),
-			...(input.typeId !== undefined ? { typeId: input.typeId } : {}),
-		})
-		.where(eq(knowledgeTags.id, id));
-	return db.query.knowledgeTags.findFirst({ where: eq(knowledgeTags.id, id) });
+	await knowledgeWriteStore.updateKnowledgeTag({
+		tagId: id,
+		...(input.name !== undefined ? { name: input.name } : {}),
+		...(input.controlled !== undefined ? { controlled: input.controlled } : {}),
+		...(input.typeId !== undefined ? { typeId: input.typeId } : {}),
+	});
+	return knowledgeReadStore.getKnowledgeTagById(id);
 }
 
 async function deleteTag(id: string) {
-	await db.delete(knowledgeTags).where(eq(knowledgeTags.id, id));
+	await knowledgeWriteStore.deleteKnowledgeTag({ tagId: id });
 	return { ok: true as const };
 }
 
 // ─── Tag types ───
 async function listTagTypes() {
-	return db.query.knowledgeTagTypes.findMany({
-		orderBy: (tt, { asc }) => [asc(tt.sortOrder), asc(tt.createdAt)],
-	});
+	return knowledgeReadStore.listKnowledgeTagTypes();
 }
 
 async function createTagType(input: { name: string; sortOrder?: number }) {
-	const [row] = await db
-		.insert(knowledgeTagTypes)
-		.values({
-			id: generateId(),
-			name: input.name,
-			builtin: false,
-			sortOrder: input.sortOrder ?? 100,
-			createdAt: nowIso(),
-		})
-		.returning();
-	return row;
+	return knowledgeWriteStore.insertKnowledgeTagType({
+		id: generateId(),
+		name: input.name,
+		sortOrder: input.sortOrder ?? 100,
+		now: nowIso(),
+	});
 }
 
 async function updateTagType(id: string, input: { name?: string; sortOrder?: number }) {
-	await db
-		.update(knowledgeTagTypes)
-		.set({
-			...(input.name !== undefined ? { name: input.name } : {}),
-			...(input.sortOrder !== undefined ? { sortOrder: input.sortOrder } : {}),
-		})
-		.where(eq(knowledgeTagTypes.id, id));
-	return db.query.knowledgeTagTypes.findFirst({ where: eq(knowledgeTagTypes.id, id) });
+	await knowledgeWriteStore.updateKnowledgeTagType({
+		tagTypeId: id,
+		...(input.name !== undefined ? { name: input.name } : {}),
+		...(input.sortOrder !== undefined ? { sortOrder: input.sortOrder } : {}),
+	});
+	return knowledgeReadStore.getKnowledgeTagTypeById(id);
 }
 
 async function deleteTagType(id: string): Promise<{ ok: true } | { ok: false; reason: string }> {
-	const tt = await db.query.knowledgeTagTypes.findFirst({
-		where: eq(knowledgeTagTypes.id, id),
-	});
+	const tt = await knowledgeReadStore.getKnowledgeTagTypeById(id);
 	if (!tt) return { ok: false, reason: "not_found" };
 	if (tt.builtin) return { ok: false, reason: "builtin" };
 	// Tags referencing this type get typeId set to null via FK onDelete: "set null".
-	await db.delete(knowledgeTagTypes).where(eq(knowledgeTagTypes.id, id));
+	await knowledgeWriteStore.deleteKnowledgeTagType({ tagTypeId: id });
 	return { ok: true };
 }
 
@@ -912,12 +782,6 @@ async function listGrants(opts: { principalType?: string; principalId?: string }
 			(!ptype || g.principalType === ptype) &&
 			(!opts.principalId || g.principalId === opts.principalId),
 	);
-}
-
-/** Detect a SQLite UNIQUE-index violation without depending on the driver's error class. */
-function isUniqueConstraintError(error: unknown): boolean {
-	const message = error instanceof Error ? error.message : String(error);
-	return /UNIQUE constraint failed/i.test(message);
 }
 
 async function createGrant(
@@ -950,17 +814,17 @@ async function createGrant(
 		if (rows.length === 0) {
 			throw new ValidationError("Grant must specify a clearance level or a tag");
 		}
-		await db.insert(aclGrants).values(rows);
+		await knowledgeWriteStore.insertAclGrantRows(rows);
 		const row = toKnowledgeGrantRow({
-			id: rows[0].id as string,
-			scopeType: rows[0].scopeType as string,
-			scopeId: (rows[0].scopeId ?? null) as string | null,
-			principalType: rows[0].principalType as string,
-			principalId: rows[0].principalId as string,
-			capability: rows[0].capability as string,
-			domainKind: (rows[0].domainKind ?? null) as string | null,
-			domainValue: (rows[0].domainValue ?? null) as string | null,
-			createdAt: rows[0].createdAt as string,
+			id: rows[0].id,
+			scopeType: rows[0].scopeType,
+			scopeId: rows[0].scopeId,
+			principalType: rows[0].principalType,
+			principalId: rows[0].principalId,
+			capability: rows[0].capability,
+			domainKind: rows[0].domainKind,
+			domainValue: rows[0].domainValue,
+			createdAt: rows[0].createdAt,
 		});
 		emitAclChanged(input.principalType, input.principalId, "grant_added");
 		recordKnowledgeAclEvent({
@@ -981,10 +845,10 @@ async function createGrant(
 		});
 		return row;
 	} catch (error) {
-		// `idx_kgrant_unique_tuple` makes the (collection, principal, grantType, tag)
-		// tuple unique, so a duplicate create must surface as a client error rather
-		// than bubbling a raw SQLite error into a generic 500.
-		if (isUniqueConstraintError(error)) {
+		// The unique indexes on the (scope, principal, capability, domain) tuple make a
+		// duplicate create surface as port vocabulary, which maps to a client error
+		// rather than bubbling a raw driver error into a generic 500.
+		if (error instanceof WriteConflictError) {
 			throw new ValidationError("A grant already exists for this principal, grant type and scope");
 		}
 		throw error;
@@ -994,48 +858,34 @@ async function createGrant(
 async function deleteGrant(id: string, actor?: { userId?: string | null; role?: string | null }) {
 	// Read the row BEFORE deleting: afterwards there is nothing left to route the notification by
 	// or to describe in the audit entry, and a revocation is precisely what an audit trail is for.
-	const existing = await db.query.aclGrants.findFirst({
-		where: eq(aclGrants.id, id),
-		columns: {
-			id: true,
-			scopeType: true,
-			scopeId: true,
-			principalType: true,
-			principalId: true,
-			capability: true,
-			domainKind: true,
-			domainValue: true,
-			createdAt: true,
-		},
-	});
+	const existing = await knowledgeReadStore.getAclGrantById(id);
 	// Deleting the credential row also drops the sibling write row for the same
 	// principal and scope: they represented one grant in the knowledge vocabulary, and
 	// leaving a stray write behind would keep authority the admin just revoked.
 	const existingRow = existing ? toKnowledgeGrantRow(existing) : null;
-	await db.delete(aclGrants).where(eq(aclGrants.id, id));
-	if (existing && existingRow && !existingRow.canWrite) {
-		await db
-			.delete(aclGrants)
-			.where(
-				and(
-					eq(aclGrants.scopeType, existing.scopeType),
-					existing.scopeId === null
-						? isNull(aclGrants.scopeId)
-						: eq(aclGrants.scopeId, existing.scopeId),
-					eq(aclGrants.principalType, existing.principalType),
-					eq(aclGrants.principalId, existing.principalId),
-					eq(aclGrants.capability, "write"),
-					isNull(aclGrants.domainKind),
-				),
-			);
-	}
+	await knowledgeWriteStore.deleteAclGrantWithWriteSibling({
+		grantId: id,
+		writeSibling:
+			existing && existingRow && !existingRow.canWrite
+				? {
+						scopeType: existing.scopeType,
+						scopeId: existing.scopeId,
+						principalType: existing.principalType,
+						principalId: existing.principalId,
+					}
+				: null,
+	});
 	if (existing) {
-		emitAclChanged(existing.principalType, existing.principalId, "grant_removed");
+		emitAclChanged(
+			existing.principalType as "user" | "role",
+			existing.principalId,
+			"grant_removed",
+		);
 		recordKnowledgeAclEvent({
 			actorUserId: actor?.userId ?? null,
 			actorRole: actor?.role ?? null,
 			eventType: "grant_removed",
-			subjectType: existing.principalType,
+			subjectType: existing.principalType as "user" | "role",
 			subjectId: existing.principalId,
 			targetType: "grant",
 			targetId: id,
@@ -1079,9 +929,8 @@ function emitAclChanged(
 			userIds = [principalId];
 		} else {
 			// Role grant → everyone with that role, bounded.
-			const rows = await db.query.users.findMany({
-				where: (u, { eq: e }) => e(u.role, principalId as "admin" | "user"),
-				columns: { id: true },
+			const rows = await knowledgeReadStore.listUserIdsAndRoles({
+				role: principalId,
 				limit: ACL_NOTIFY_MAX_USERS,
 			});
 			userIds = rows.map((r) => r.id);
@@ -1142,31 +991,20 @@ async function bulkGrant(
 
 	// ── Pre-transaction validation (bounded, indexed lookups) ──
 	if (input.grantType === "clearance") {
-		const level = await db.query.knowledgeLevels.findFirst({
-			where: eq(knowledgeLevels.name, input.clearanceLevel as string),
-			columns: { id: true },
-		});
+		const level = await knowledgeReadStore.findKnowledgeLevelByName(input.clearanceLevel as string);
 		if (!level) throw new ValidationError(`Unknown clearance level: ${input.clearanceLevel}`);
 	} else {
-		const tag = await db.query.knowledgeTags.findFirst({
-			where: eq(knowledgeTags.id, input.tagId as string),
-			columns: { id: true },
-		});
+		const tag = await knowledgeReadStore.getKnowledgeTagById(input.tagId as string);
 		if (!tag) throw new NotFoundError("Knowledge tag", input.tagId ?? "");
 	}
 	if (input.collectionId) {
-		const col = await db.query.knowledgeCollections.findFirst({
-			where: eq(knowledgeCollections.id, input.collectionId),
-			columns: { id: true },
-		});
-		if (!col) throw new NotFoundError("Knowledge collection", input.collectionId);
+		if (!(await knowledgeReadStore.collectionExists(input.collectionId))) {
+			throw new NotFoundError("Knowledge collection", input.collectionId);
+		}
 	}
 
 	// Existence check for the target users, in ONE query rather than N.
-	const existing = await db.query.users.findMany({
-		where: (u, { inArray }) => inArray(u.id, userIds),
-		columns: { id: true },
-	});
+	const existing = await knowledgeReadStore.listExistingUserIds(userIds);
 	const knownUsers = new Set(existing.map((u) => u.id));
 
 	// Already-held identical grants → reported as skipped instead of duplicated. Scoped to the
@@ -1218,13 +1056,9 @@ async function bulkGrant(
 		results.push({ userId, status: "granted", grantId: id });
 	}
 
-	// Single transaction: either every row lands or none does.
+	// Single store operation: either every row lands or none does.
 	if (toInsert.length > 0) {
-		db.transaction((tx) => {
-			for (const g of toInsert) {
-				for (const row of knowledgeGrantRowsFor(g)) tx.insert(aclGrants).values(row).run();
-			}
-		});
+		await knowledgeWriteStore.insertAclGrantRows(toInsert.flatMap((g) => knowledgeGrantRowsFor(g)));
 		// One event for the whole batch (all targets are users here) rather than N events.
 		const grantedUserIds = results.filter((r) => r.status === "granted").map((r) => r.userId);
 		if (grantedUserIds.length > 0) {
@@ -1275,27 +1109,11 @@ async function getCollectionAcl(id: string): Promise<{
 	ownerUserId: string | null;
 	ownerUsername: string | null;
 }> {
-	const col = await db.query.knowledgeCollections.findFirst({
-		where: eq(knowledgeCollections.id, id),
-		columns: {
-			id: true,
-			name: true,
-			slug: true,
-			defaultLevel: true,
-			classificationLevel: true,
-			controlledTagsJson: true,
-			ownerUserId: true,
-		},
-	});
+	const col = await knowledgeReadStore.getCollectionSummaryById(id);
 	if (!col) throw new NotFoundError("Knowledge collection", id);
 	// Resolve the owner's display name so the UI doesn't have to fetch the whole user list
 	// just to render one id.
-	const owner = col.ownerUserId
-		? await db.query.users.findFirst({
-				where: eq(users.id, col.ownerUserId),
-				columns: { username: true },
-			})
-		: null;
+	const owner = col.ownerUserId ? await knowledgeReadStore.getUsernameById(col.ownerUserId) : null;
 	return {
 		collectionId: col.id,
 		name: col.name,
@@ -1397,16 +1215,14 @@ async function setUserAcl(
 			createdAt: now,
 		});
 	}
-	db.transaction((tx) => {
-		// Scoped to knowledge grants: the unified table also holds this user's project and
-		// narrator memberships, and replacing their knowledge ACL must not silently evict
-		// them from projects.
-		tx.delete(aclGrants)
-			.where(and(knowledgeGrantWhere({ principalType: "user", principalId: userId })))
-			.run();
-		for (const g of newGrants) {
-			for (const row of knowledgeGrantRowsFor(g)) tx.insert(aclGrants).values(row).run();
-		}
+	// One store operation: the delete is scoped to KNOWLEDGE grants only (the unified
+	// table also holds this user's project and narrator memberships, and replacing
+	// their knowledge ACL must not silently evict them), then the replacement rows
+	// land in the same section.
+	await knowledgeWriteStore.replaceUserKnowledgeGrants({
+		principalType: "user",
+		principalId: userId,
+		rows: newGrants.flatMap((g) => knowledgeGrantRowsFor(g)),
 	});
 	// Replace-in-place: the user's whole credential set may have moved in either direction.
 	emitAclChanged("user", userId, "user_acl_replaced");
@@ -1430,10 +1246,10 @@ async function setUserAcl(
 
 /** Remove ALL grants for a user (called when the user is deleted). */
 async function purgeUserGrants(userId: string): Promise<void> {
-	await db
-		.delete(aclGrants)
-		// Knowledge scope only — see the note in setUserAcl.
-		.where(knowledgeGrantWhere({ principalType: "user", principalId: userId }));
+	await knowledgeWriteStore.deleteUserKnowledgeGrants({
+		principalType: "user",
+		principalId: userId,
+	});
 }
 
 /**
@@ -1448,33 +1264,13 @@ async function getEntryAccessibleUsers(entryId: string): Promise<
 		reason: "admin" | "owner" | "grant";
 	}[]
 > {
-	const entry = await db.query.knowledgeEntries.findFirst({
-		where: eq(knowledgeEntries.id, entryId),
-		columns: {
-			id: true,
-			collectionId: true,
-			ownerUserId: true,
-			classificationLevel: true,
-			controlledTagsJson: true,
-		},
-	});
+	const entry = await knowledgeReadStore.getEntryAclById(entryId);
 	if (!entry) return [];
 
-	const collection = await db.query.knowledgeCollections.findFirst({
-		where: eq(knowledgeCollections.id, entry.collectionId),
-		columns: {
-			id: true,
-			defaultLevel: true,
-			classificationLevel: true,
-			controlledTagsJson: true,
-			ownerUserId: true,
-		},
-	});
+	const collection = await knowledgeReadStore.getCollectionAclById(entry.collectionId);
 	if (!collection) return [];
 
-	const allUsers = await db.query.users.findMany({
-		columns: { id: true, username: true, role: true },
-	});
+	const allUsers = await knowledgeReadStore.listUsersDetailed();
 
 	const aclCol: AclCollection = {
 		id: collection.id,

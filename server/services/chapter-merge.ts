@@ -25,6 +25,7 @@ import {
 	revalidateSnapshotConflictPlan,
 } from "./chapter-merge-snapshot";
 import { advanceChapterSnapshot, ensureChapterSnapshot } from "./chapter-snapshot-ref";
+import { chapterWriteStore } from "./chapter-write/store";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
 import { collectMergeContext, mergeSummaryService } from "./merge-summary-service";
@@ -287,13 +288,11 @@ async function persistParkedWork(
 	parked: { commitSha: string; baseTree: string },
 ): Promise<void> {
 	try {
-		await db
-			.update(chapters)
-			.set({
-				parkedSnapshotCommitSha: parked.commitSha,
-				parkedSnapshotBaseTree: parked.baseTree,
-			})
-			.where(eq(chapters.id, chapterId));
+		await chapterWriteStore.setChapterParkedWork({
+			chapterId,
+			commitSha: parked.commitSha,
+			baseTree: parked.baseTree,
+		});
 	} catch (err) {
 		logger.error("Could not record where uncommitted work was parked", {
 			chapterId,
@@ -312,10 +311,7 @@ async function persistParkedWork(
  */
 async function clearPersistedParkedWork(chapterId: string): Promise<void> {
 	try {
-		await db
-			.update(chapters)
-			.set({ parkedSnapshotCommitSha: null, parkedSnapshotBaseTree: null })
-			.where(eq(chapters.id, chapterId));
+		await chapterWriteStore.setChapterParkedWork({ chapterId, commitSha: null, baseTree: null });
 	} catch (err) {
 		logger.error("Could not clear a chapter's parked-work coordinates", {
 			chapterId,
@@ -627,20 +623,16 @@ async function markMergedSnapshot(
 	const now = new Date().toISOString();
 	let warning: string | undefined;
 
-	await db
-		.update(chapters)
-		.set({
-			status: "merged",
-			worktreePath: null,
-			mergedIntoChapterId: targetChapterId,
-			mergeStrategy: strategy as "merge" | "squash" | "cherry-pick",
-			mergeSnapshotCommitSha: snapshot.mergeSnapshotCommitSha,
-			preMergeTargetSnapshotSha: snapshot.preMergeTargetSnapshotSha,
-			mergedSourceSnapshotSha: snapshot.mergedSourceSnapshotSha,
-			preMergeTargetSha: snapshot.preMergeTargetSha,
-			updatedAt: now,
-		})
-		.where(eq(chapters.id, sourceChapterId));
+	await chapterWriteStore.recordChapterSnapshotMerge({
+		sourceChapterId,
+		targetChapterId,
+		strategy,
+		mergeSnapshotCommitSha: snapshot.mergeSnapshotCommitSha,
+		preMergeTargetSnapshotSha: snapshot.preMergeTargetSnapshotSha,
+		mergedSourceSnapshotSha: snapshot.mergedSourceSnapshotSha,
+		preMergeTargetSha: snapshot.preMergeTargetSha,
+		now,
+	});
 
 	if (source?.worktreePath) {
 		// The snapshot was already taken while planning the merge; re-verify rather
@@ -1908,26 +1900,23 @@ export const chapterMerge = {
 
 		// Update DB FIRST — if this fails the worktree is still intact and the
 		// chapter remains active, so the user doesn't lose their working directory.
-		await db
-			.update(chapters)
-			.set({
-				status: "merged",
-				worktreePath: null,
-				mergedIntoChapterId: targetChapterId,
-				mergeCommitSha: commitSha,
-				mergeStrategy: strategy as "merge" | "squash" | "cherry-pick",
-				preMergeTargetSha: preMergeTargetSha ?? null,
-				// This merge produced a real git commit, so any snapshot coordinate on the
-				// row belongs to an earlier commit-free merge that has since been undone.
-				// Leaving it would route this merge's unmerge down the snapshot path — with
-				// a base and a pre-merge tree from a merge that no longer exists — and
-				// reverse a merge that never happened over the target's current work. The
-				// paths a chapter can take here (merge → unmerge → merge in the other mode)
-				// make this reachable, not theoretical.
-				...clearedSnapshotMergeFields(),
-				updatedAt: now,
-			})
-			.where(eq(chapters.id, sourceChapterId));
+		//
+		// The snapshot-merge fields are cleared by the store in the same statement:
+		// this merge produced a real git commit, so any snapshot coordinate on the row
+		// belongs to an earlier commit-free merge that has since been undone. Leaving
+		// it would route this merge's unmerge down the snapshot path — with a base and
+		// a pre-merge tree from a merge that no longer exists — and reverse a merge
+		// that never happened over the target's current work. The paths a chapter can
+		// take here (merge → unmerge → merge in the other mode) make this reachable,
+		// not theoretical.
+		await chapterWriteStore.recordChapterMerge({
+			sourceChapterId,
+			targetChapterId,
+			strategy,
+			mergeCommitSha: commitSha ?? null,
+			preMergeTargetSha: preMergeTargetSha ?? null,
+			now,
+		});
 
 		// Clean up source chapter's worktree AFTER DB update — merged chapters
 		// don't need one.  Failure here is non-fatal: the worktree is orphaned
@@ -2186,19 +2175,12 @@ export const chapterMerge = {
 		// Step 4: Update source chapter DB state
 		const now = new Date().toISOString();
 		try {
-			await db
-				.update(chapters)
-				.set({
-					status: "active",
-					worktreePath,
-					mergedIntoChapterId: null,
-					mergeCommitSha: null,
-					mergeStrategy: null,
-					preMergeTargetSha: null,
-					lastAccessedAt: now,
-					updatedAt: now,
-				})
-				.where(eq(chapters.id, sourceChapterId));
+			await chapterWriteStore.restoreMergedChapter({
+				chapterId: sourceChapterId,
+				worktreePath,
+				clearSnapshotMergeFields: false,
+				now,
+			});
 		} catch (dbErr) {
 			// Clean up orphan worktree on DB failure
 			try {
@@ -2344,20 +2326,12 @@ export const chapterMerge = {
 		// Step 3: source chapter is active again, and this merge's coordinates are gone.
 		const now = new Date().toISOString();
 		try {
-			await db
-				.update(chapters)
-				.set({
-					status: "active",
-					worktreePath,
-					mergedIntoChapterId: null,
-					mergeCommitSha: null,
-					mergeStrategy: null,
-					preMergeTargetSha: null,
-					...clearedSnapshotMergeFields(),
-					lastAccessedAt: now,
-					updatedAt: now,
-				})
-				.where(eq(chapters.id, source.id));
+			await chapterWriteStore.restoreMergedChapter({
+				chapterId: source.id,
+				worktreePath,
+				clearSnapshotMergeFields: true,
+				now,
+			});
 		} catch (dbErr) {
 			try {
 				await gitService.removeWorktree(gitPath, worktreePath);

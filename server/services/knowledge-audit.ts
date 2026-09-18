@@ -18,12 +18,16 @@
  *  - **Bounded reads.** Listing is admin-only and cursor-paginated; `detailJson` is small by
  *    construction so there is no large-field concern.
  */
-import { and, eq, lt, or, sql } from "drizzle-orm";
-import { db } from "../db";
-import { aclEvents, type knowledgeAclEvents } from "../db/schema";
-// Row generation, fire-and-forget semantics and failure logging now live in the shared
-// audit implementation; this module only translates the knowledge vocabulary.
-import { recordAclEvent } from "./acl/acl-audit";
+// The legacy table's SELECT type still names the row shape this module reports; the
+// storage move to the unified `acl_events` table predates the port (type-only import).
+import type { knowledgeAclEvents } from "../db/schema";
+import { generateId } from "../lib/id";
+import { logger } from "../lib/logger";
+// Row shape and fire-and-forget semantics mirror the shared audit implementation
+// (`acl/acl-audit.ts`), but the write/read both go through the knowledge stores so a
+// PostgreSQL deployment never crosses back to SQLite on this path. The translation
+// between the knowledge vocabulary and the unified table stays HERE.
+import { knowledgeReadStore, knowledgeWriteStore } from "./knowledge/store";
 
 /**
  * The fixed vocabulary used by the writers. The column is free text so a new ACL surface can be
@@ -75,22 +79,34 @@ export function recordKnowledgeAclEvent(input: KnowledgeAclAuditInput): void {
 	//
 	// The signature is unchanged, and the knowledge vocabulary is preserved: the
 	// event type keeps a `knowledge_` prefix and the old `targetType`/`targetId` pair
-	// maps onto the generic `scopeType`/`scopeId`. Fire-and-forget and the redaction
-	// rules come from the shared implementation.
-	recordAclEvent({
-		actor: input.actorUserId
-			? { userId: input.actorUserId, isAdmin: input.actorRole === "admin" }
-			: null,
-		eventType: prefixKnowledgeEventType(input.eventType),
-		subject:
-			input.subjectType && input.subjectId
-				? { type: input.subjectType, id: input.subjectId }
-				: undefined,
-		scopeType: mapTargetToScopeType(input.targetType),
-		scopeId: input.targetId ?? null,
-		outcome: outcomeOf(input.eventType),
-		detail: input.detail ?? undefined,
-	});
+	// maps onto the generic `scopeType`/`scopeId`. The row shape below mirrors
+	// `acl/acl-audit.ts` field-for-field (same table, same vocabulary); the insert
+	// itself goes through the knowledge write store so the audit lands in the same
+	// database the audited write just committed to. Fire-and-forget: a full disk
+	// must not fail the ACL operation this describes, and an un-awaited rejection
+	// must never crash the process.
+	const eventType = prefixKnowledgeEventType(input.eventType);
+	void knowledgeWriteStore
+		.insertAclAuditEvent({
+			id: generateId(),
+			actorUserId: input.actorUserId ?? null,
+			actorRole: input.actorUserId ? (input.actorRole === "admin" ? "admin" : "user") : null,
+			eventType,
+			subjectType: input.subjectType && input.subjectId ? input.subjectType : null,
+			subjectId: input.subjectType && input.subjectId ? input.subjectId : null,
+			scopeType: mapTargetToScopeType(input.targetType),
+			scopeId: input.targetId ?? null,
+			outcome: outcomeOf(eventType),
+			detailJson: input.detail ?? null,
+			createdAt: new Date().toISOString(),
+		})
+		.catch((err: unknown) => {
+			logger.error("Failed to record ACL audit event", {
+				eventType,
+				scopeType: mapTargetToScopeType(input.targetType),
+				error: String(err),
+			});
+		});
 }
 
 /**
@@ -167,30 +183,18 @@ export async function listKnowledgeAclEvents(opts: ListKnowledgeAclEventsOptions
 	const limit = Math.min(Math.max(opts.limit ?? 50, 1), AUDIT_LIST_MAX);
 	// Reads the unified table but keeps returning the knowledge-shaped rows the admin
 	// UI already renders, so the storage move is invisible to callers. Only knowledge
-	// scopes are considered: this endpoint is the knowledge audit view, and leaking
-	// project membership changes into it would be a disclosure, not a feature.
-	const conds = [sql`${aclEvents.scopeType} LIKE 'knowledge%'`];
-	if (opts.eventType) {
-		conds.push(eq(aclEvents.eventType, prefixKnowledgeEventType(opts.eventType)));
-	}
-	if (opts.subjectId) conds.push(eq(aclEvents.subjectId, opts.subjectId));
-	if (opts.targetId) conds.push(eq(aclEvents.scopeId, opts.targetId));
-	if (opts.actorUserId) conds.push(eq(aclEvents.actorUserId, opts.actorUserId));
-	if (opts.cursorCreatedAt && opts.cursorId) {
-		// Strictly "older than the cursor": either an earlier timestamp, or the same
-		// timestamp with a smaller id (the tie-breaker that makes the order total).
-		conds.push(
-			or(
-				lt(aclEvents.createdAt, opts.cursorCreatedAt),
-				and(eq(aclEvents.createdAt, opts.cursorCreatedAt), lt(aclEvents.id, opts.cursorId)),
-			) as never,
-		);
-	}
-
-	const rows = await db.query.aclEvents.findMany({
-		where: and(...conds),
-		orderBy: (e, { desc }) => [desc(e.createdAt), desc(e.id)],
+	// scopes are considered (the read store's `knowledge%` scope filter): this endpoint
+	// is the knowledge audit view, and leaking project membership changes into it would
+	// be a disclosure, not a feature.
+	const rows = await knowledgeReadStore.listKnowledgeAclEventRows({
 		limit: limit + 1,
+		...(opts.eventType ? { eventType: prefixKnowledgeEventType(opts.eventType) } : {}),
+		...(opts.subjectId ? { subjectId: opts.subjectId } : {}),
+		...(opts.targetId ? { scopeId: opts.targetId } : {}),
+		...(opts.actorUserId ? { actorUserId: opts.actorUserId } : {}),
+		...(opts.cursorCreatedAt && opts.cursorId
+			? { cursor: { createdAt: opts.cursorCreatedAt, id: opts.cursorId } }
+			: {}),
 	});
 
 	const hasMore = rows.length > limit;

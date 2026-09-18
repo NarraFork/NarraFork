@@ -16,6 +16,7 @@ import { slugify } from "../lib/slug";
 import { safeSpawn } from "../lib/spawn";
 import { chapterEdgeService } from "./chapter-edge-service";
 import { ensureChapterSnapshot } from "./chapter-snapshot-ref";
+import { chapterWriteStore } from "./chapter-write/store";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
 import { FileHistoryError, rebuildFileStatesAtMessage } from "./file-state-rebuild";
@@ -588,45 +589,42 @@ export const chapterFork = {
 			}
 
 			// Create DB record
-			const [chapter] = await db
-				.insert(chapters)
-				.values({
-					id,
-					projectId: parent.projectId,
-					title,
-					description: input.description,
-					status: "active",
-					role: input.role ?? "branch",
-					branch: branchName,
-					worktreePath,
-					baseBranch: parent.branch,
-					parentChapterId,
-					forkPoint,
-					startCommitSha: commitSha,
-					// The narrative state this chapter starts from, independent of commits.
-					// `snapshotShadowKey` is recorded here rather than left to the first tool
-					// call so the ownership guard protects this worktree's lineage immediately —
-					// a chapter made dormant before running anything would otherwise have its
-					// shadow repository swept as an orphan.
-					snapshotCommitSha: baseSnapshotCommit,
-					snapshotShadowKey:
-						worktreeSource === "workspace" ? treeSnapshotKey(LOCAL_DEVICE_ID, worktreePath) : null,
-					anchorCommitSha,
-					axisOffset,
-					crossOffset,
-					// Classic coordinates are stored only when the caller supplied them.
-					// Left null the chapter is simply unplaced on that canvas and gets
-					// auto-laid-out, which is the right default — there is no meaningful
-					// way to derive a React Flow position from a ruler tick offset.
-					graphX: input.graphX ?? null,
-					graphY: input.graphY ?? null,
-					lastAccessedAt: now,
-					createdAt: now,
-					updatedAt: now,
-				})
-				.returning();
+			const chapter = await chapterWriteStore.insertChapter({
+				id,
+				projectId: parent.projectId,
+				title,
+				description: input.description ?? null,
+				status: "active",
+				role: input.role ?? "branch",
+				branch: branchName,
+				worktreePath,
+				baseBranch: parent.branch,
+				parentChapterId,
+				forkPoint,
+				startCommitSha: commitSha,
+				// The narrative state this chapter starts from, independent of commits.
+				// `snapshotShadowKey` is recorded here rather than left to the first tool
+				// call so the ownership guard protects this worktree's lineage immediately —
+				// a chapter made dormant before running anything would otherwise have its
+				// shadow repository swept as an orphan.
+				snapshotCommitSha: baseSnapshotCommit,
+				snapshotShadowKey:
+					worktreeSource === "workspace" ? treeSnapshotKey(LOCAL_DEVICE_ID, worktreePath) : null,
+				anchorCommitSha,
+				axisOffset,
+				crossOffset,
+				// Classic coordinates are stored only when the caller supplied them.
+				// Left null the chapter is simply unplaced on that canvas and gets
+				// auto-laid-out, which is the right default — there is no meaningful
+				// way to derive a React Flow position from a ruler tick offset.
+				graphX: input.graphX ?? null,
+				graphY: input.graphY ?? null,
+				lastAccessedAt: now,
+				createdAt: now,
+				updatedAt: now,
+			});
 			rollback.push(async () => {
-				await db.delete(chapters).where(eq(chapters.id, id));
+				await chapterWriteStore.deleteChapter(id);
 			});
 
 			// Create fork edge in chapter_edges
@@ -686,10 +684,11 @@ export const chapterFork = {
 
 			// Step 5: Start containers (if parent has containerConfig)
 			if (parent.containerConfig) {
-				await db
-					.update(chapters)
-					.set({ containerConfig: parent.containerConfig, updatedAt: now })
-					.where(eq(chapters.id, id));
+				await chapterWriteStore.updateChapterContainerConfig({
+					chapterId: id,
+					containerConfig: parent.containerConfig,
+					now,
+				});
 				try {
 					await containerService.startChapterContainers(id);
 					rollback.push(async () => {

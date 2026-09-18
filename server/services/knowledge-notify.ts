@@ -18,12 +18,10 @@
  *  - **Off the request path.** Handlers are async and never awaited by the emitter; a
  *    failure logs and is dropped rather than failing the publish/review that triggered it.
  */
-import { eq } from "drizzle-orm";
-import { db } from "../db";
-import { knowledgeCollections, knowledgeEntries, knowledgeSubmissions } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
+import { knowledgeReadStore } from "./knowledge/store";
 import {
 	type AclCollection,
 	type AclEntry,
@@ -64,12 +62,14 @@ function deliver(userId: string, message: NarratorServerMessage): void {
 	});
 }
 
-function toAclEntry(
-	entry: Pick<
-		typeof knowledgeEntries.$inferSelect,
-		"id" | "collectionId" | "ownerUserId" | "classificationLevel" | "controlledTagsJson"
-	> & { reviewTagsJson?: unknown },
-): AclEntry {
+function toAclEntry(entry: {
+	id: string;
+	collectionId: string;
+	ownerUserId?: string | null;
+	classificationLevel?: string | null;
+	controlledTagsJson?: unknown;
+	reviewTagsJson?: unknown;
+}): AclEntry {
 	return {
 		id: entry.id,
 		collectionId: entry.collectionId,
@@ -80,12 +80,13 @@ function toAclEntry(
 	};
 }
 
-function toAclCollection(
-	c: Pick<
-		typeof knowledgeCollections.$inferSelect,
-		"id" | "defaultLevel" | "classificationLevel" | "controlledTagsJson" | "ownerUserId"
-	>,
-): AclCollection {
+function toAclCollection(c: {
+	id: string;
+	defaultLevel: string;
+	classificationLevel?: string | null;
+	controlledTagsJson?: unknown;
+	ownerUserId?: string | null;
+}): AclCollection {
 	return {
 		id: c.id,
 		defaultLevel: c.defaultLevel,
@@ -117,42 +118,14 @@ export async function resolveReviewerUserIds(input: {
 	let aclCollection: AclCollection | null = null;
 
 	if (input.entryId) {
-		const entry = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, input.entryId),
-			columns: {
-				id: true,
-				collectionId: true,
-				ownerUserId: true,
-				classificationLevel: true,
-				controlledTagsJson: true,
-				reviewTagsJson: true,
-			},
-		});
+		const entry = await knowledgeReadStore.getEntryAclById(input.entryId);
 		if (!entry) return [];
-		const collection = await db.query.knowledgeCollections.findFirst({
-			where: eq(knowledgeCollections.id, entry.collectionId),
-			columns: {
-				id: true,
-				defaultLevel: true,
-				classificationLevel: true,
-				controlledTagsJson: true,
-				ownerUserId: true,
-			},
-		});
+		const collection = await knowledgeReadStore.getCollectionAclById(entry.collectionId);
 		if (!collection) return [];
 		aclEntry = toAclEntry(entry);
 		aclCollection = toAclCollection(collection);
 	} else if (input.collectionId) {
-		const collection = await db.query.knowledgeCollections.findFirst({
-			where: eq(knowledgeCollections.id, input.collectionId),
-			columns: {
-				id: true,
-				defaultLevel: true,
-				classificationLevel: true,
-				controlledTagsJson: true,
-				ownerUserId: true,
-			},
-		});
+		const collection = await knowledgeReadStore.getCollectionAclById(input.collectionId);
 		if (!collection) return [];
 		aclCollection = toAclCollection(collection);
 	} else {
@@ -176,16 +149,7 @@ export async function resolveReviewerUserIds(input: {
 
 /** Load the routing scalars for a submission (no proposedContent). */
 async function loadSubmissionRouting(submissionId: string) {
-	return db.query.knowledgeSubmissions.findFirst({
-		where: eq(knowledgeSubmissions.id, submissionId),
-		columns: {
-			id: true,
-			entryId: true,
-			collectionId: true,
-			submitterUserId: true,
-			status: true,
-		},
-	});
+	return knowledgeReadStore.getSubmissionRoutingById(submissionId);
 }
 
 async function onSubmissionCreated(event: {
@@ -311,12 +275,10 @@ const DRIFT_NOTIFY_MAX_HOLDERS = 200;
  */
 export function emitEntryDrifted(entryId: string, excludeUserId: string | null): void {
 	void (async () => {
-		const holders = await db.query.knowledgeDrafts.findMany({
-			where: (d, { and: a, eq: e, inArray: ia, isNotNull }) =>
-				a(e(d.entryId, entryId), ia(d.status, ["active"]), isNotNull(d.baseRevisionId)),
-			columns: { authorUserId: true },
-			limit: DRIFT_NOTIFY_MAX_HOLDERS,
-		});
+		const holders = await knowledgeReadStore.listActiveDraftHolderIds(
+			entryId,
+			DRIFT_NOTIFY_MAX_HOLDERS,
+		);
 		const userIds = [
 			...new Set(
 				holders

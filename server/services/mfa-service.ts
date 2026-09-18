@@ -1,20 +1,24 @@
 /**
  * MFA service — all database-backed TOTP and backup-code operations.
  *
- * Tables:
+ * Tables (behind `AuthMfaStore`, so the service itself names none of them):
  * - `user_totp`           : one row per user; pending during enrollment,
  *                           active once a code confirms the authenticator.
  * - `user_mfa_backup_codes`: one-time recovery codes (bcrypt-hashed).
  *
  * The plaintext backup codes are returned exactly once, at activation time.
  * Afterwards only their hashes are stored and they can never be retrieved.
+ *
+ * Storage goes through `authMfaStore` (`services/auth/store.ts`): this module holds no
+ * transaction handle and no dialect, so a second backend implements the same capability
+ * rather than reproducing SQLite's transaction shape. CPU work that must stay outside
+ * any atomic section — bcrypt hashing of new backup codes, TOTP code verification —
+ * stays here, and the store's atomic sections contain database writes only.
  */
 import { randomInt } from "node:crypto";
-import { db } from "@server/db";
-import { userMfaBackupCodes, userPasskeys, users, userTotp } from "@server/db/schema";
 import { generateId } from "@server/lib/id";
 import { generateTotpSecret, verifyTotpCode } from "@server/lib/totp";
-import { and, eq, isNull } from "drizzle-orm";
+import { authMfaStore as store } from "./auth/store";
 
 /** Number of one-time backup codes generated on activation. */
 const BACKUP_CODE_COUNT = 10;
@@ -46,25 +50,22 @@ export interface MfaStatus {
 export const mfaService = {
 	/** Whether the user has an ACTIVE TOTP factor (gates the login MFA step). */
 	async isTotpActive(userId: string): Promise<boolean> {
-		const row = await db.query.userTotp.findFirst({
-			where: and(eq(userTotp.userId, userId), eq(userTotp.status, "active")),
-			columns: { id: true },
-		});
-		return !!row;
+		return (await store.findTotp(userId, "active")) !== null;
 	},
 
 	/** Whether the user has opted into requiring a second factor at login. */
 	async isMfaEnabled(userId: string): Promise<boolean> {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { mfaEnabled: true },
-		});
-		return !!row?.mfaEnabled;
+		return await store.findMfaEnabled(userId);
 	},
 
 	/** Set the login-time second-factor requirement flag. */
 	async setMfaEnabled(userId: string, enabled: boolean): Promise<void> {
-		await db.update(users).set({ mfaEnabled: enabled }).where(eq(users.id, userId));
+		await store.setMfaEnabled(userId, enabled);
+	},
+
+	/** Whether the user has at least one enrolled passkey (a usable second factor). */
+	async hasAnyPasskey(userId: string): Promise<boolean> {
+		return await store.hasAnyPasskey(userId);
 	},
 
 	/**
@@ -74,16 +75,10 @@ export const mfaService = {
 	 */
 	async hasAnyFactor(userId: string): Promise<boolean> {
 		const [totp, passkey] = await Promise.all([
-			db.query.userTotp.findFirst({
-				where: and(eq(userTotp.userId, userId), eq(userTotp.status, "active")),
-				columns: { id: true },
-			}),
-			db.query.userPasskeys.findFirst({
-				where: eq(userPasskeys.userId, userId),
-				columns: { id: true },
-			}),
+			store.findTotp(userId, "active"),
+			store.hasAnyPasskey(userId),
 		]);
-		return !!totp || !!passkey;
+		return totp !== null || passkey;
 	},
 
 	/**
@@ -102,23 +97,16 @@ export const mfaService = {
 
 	/** Full MFA status for the security settings page. */
 	async getStatus(userId: string): Promise<MfaStatus> {
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { mfaEnabled: true },
-		});
-		const mfaEnabled = !!user?.mfaEnabled;
-		const totp = await db.query.userTotp.findFirst({
-			where: and(eq(userTotp.userId, userId), eq(userTotp.status, "active")),
-			columns: { id: true },
-		});
+		const mfaEnabled = await store.findMfaEnabled(userId);
+		const totp = await store.findTotp(userId, "active");
 		if (!totp) {
 			return { mfaEnabled, totpEnabled: false, backupCodesRemaining: 0 };
 		}
-		const unused = await db.query.userMfaBackupCodes.findMany({
-			where: and(eq(userMfaBackupCodes.userId, userId), isNull(userMfaBackupCodes.usedAt)),
-			columns: { id: true },
-		});
-		return { mfaEnabled, totpEnabled: true, backupCodesRemaining: unused.length };
+		return {
+			mfaEnabled,
+			totpEnabled: true,
+			backupCodesRemaining: await store.countUnusedBackupCodes(userId),
+		};
 	},
 
 	/**
@@ -128,29 +116,16 @@ export const mfaService = {
 	 * already active.
 	 */
 	async beginSetup(userId: string): Promise<{ secret: string } | { alreadyActive: true }> {
-		const existing = await db.query.userTotp.findFirst({
-			where: eq(userTotp.userId, userId),
-			columns: { id: true, status: true },
-		});
-		if (existing?.status === "active") {
-			return { alreadyActive: true };
-		}
 		const secret = generateTotpSecret();
-		const now = new Date().toISOString();
-		if (existing) {
-			await db
-				.update(userTotp)
-				.set({ secret, status: "pending", activatedAt: null, createdAt: now })
-				.where(eq(userTotp.userId, userId));
-		} else {
-			await db.insert(userTotp).values({
-				id: generateId(),
-				userId,
-				secret,
-				status: "pending",
-				createdAt: now,
-			});
-		}
+		// The active-enrollment check and the pending-secret write are one atomic
+		// decision inside the store: an active factor is never silently replaced.
+		const outcome = await store.savePendingTotp({
+			id: generateId(),
+			userId,
+			secret,
+			nowIso: new Date().toISOString(),
+		});
+		if (outcome === "alreadyActive") return { alreadyActive: true };
 		return { secret };
 	},
 
@@ -163,18 +138,12 @@ export const mfaService = {
 		userId: string,
 		code: string,
 	): Promise<{ ok: false } | { ok: true; backupCodes: string[] }> {
-		const pending = await db.query.userTotp.findFirst({
-			where: and(eq(userTotp.userId, userId), eq(userTotp.status, "pending")),
-			columns: { secret: true },
-		});
+		const pending = await store.findTotp(userId, "pending");
 		if (!pending) return { ok: false };
+		// Code verification is CPU work, deliberately outside any atomic section.
 		if (!verifyTotpCode(pending.secret, code)) return { ok: false };
 
-		const now = new Date().toISOString();
-		await db
-			.update(userTotp)
-			.set({ status: "active", activatedAt: now })
-			.where(eq(userTotp.userId, userId));
+		await store.activateTotp(userId, new Date().toISOString());
 
 		const backupCodes = await this.regenerateBackupCodes(userId);
 		return { ok: true, backupCodes };
@@ -184,10 +153,12 @@ export const mfaService = {
 	async regenerateBackupCodes(userId: string): Promise<string[]> {
 		const codes = Array.from({ length: BACKUP_CODE_COUNT }, randomBackupCode);
 		const now = new Date().toISOString();
+		// Hashing is deliberately outside the atomic section: it is ~100ms of CPU per
+		// code, and holding a transaction open across it would serialize unrelated
+		// writes for no benefit.
 		const rows = await Promise.all(
 			codes.map(async (code) => ({
 				id: generateId(),
-				userId,
 				codeHash: await Bun.password.hash(normalizeBackupCode(code), {
 					algorithm: "bcrypt",
 					cost: BCRYPT_COST,
@@ -195,21 +166,15 @@ export const mfaService = {
 				createdAt: now,
 			})),
 		);
-		db.transaction((tx) => {
-			tx.delete(userMfaBackupCodes).where(eq(userMfaBackupCodes.userId, userId)).run();
-			tx.insert(userMfaBackupCodes).values(rows).run();
-		});
+		await store.replaceBackupCodes(userId, rows);
 		return codes;
 	},
 
 	/** Verify a TOTP code against the user's ACTIVE secret. */
 	async verifyTotp(userId: string, code: string): Promise<boolean> {
-		const row = await db.query.userTotp.findFirst({
-			where: and(eq(userTotp.userId, userId), eq(userTotp.status, "active")),
-			columns: { secret: true },
-		});
-		if (!row) return false;
-		return verifyTotpCode(row.secret, code);
+		const enrollment = await store.findTotp(userId, "active");
+		if (!enrollment) return false;
+		return verifyTotpCode(enrollment.secret, code);
 	},
 
 	/**
@@ -219,19 +184,13 @@ export const mfaService = {
 	 */
 	async consumeBackupCode(userId: string, code: string): Promise<boolean> {
 		const normalized = normalizeBackupCode(code);
-		const unused = await db.query.userMfaBackupCodes.findMany({
-			where: and(eq(userMfaBackupCodes.userId, userId), isNull(userMfaBackupCodes.usedAt)),
-			columns: { id: true, codeHash: true },
-		});
+		const unused = await store.findUnusedBackupCodes(userId);
 		for (const row of unused) {
+			// The bcrypt comparison picks the row OUTSIDE any atomic section; the
+			// consumption itself is the store's guarded update, which a concurrent
+			// redemption of the same code cannot also win.
 			if (await Bun.password.verify(normalized, row.codeHash)) {
-				const consumed = await db
-					.update(userMfaBackupCodes)
-					.set({ usedAt: new Date().toISOString() })
-					.where(and(eq(userMfaBackupCodes.id, row.id), isNull(userMfaBackupCodes.usedAt)))
-					.returning({ id: userMfaBackupCodes.id })
-					.get();
-				if (consumed) return true;
+				if (await store.markBackupCodeUsed(row.id, new Date().toISOString())) return true;
 			}
 		}
 		return false;
@@ -239,9 +198,6 @@ export const mfaService = {
 
 	/** Fully disable TOTP and remove all backup codes. */
 	async disable(userId: string): Promise<void> {
-		db.transaction((tx) => {
-			tx.delete(userTotp).where(eq(userTotp.userId, userId)).run();
-			tx.delete(userMfaBackupCodes).where(eq(userMfaBackupCodes.userId, userId)).run();
-		});
+		await store.clearFactors(userId);
 	},
 };

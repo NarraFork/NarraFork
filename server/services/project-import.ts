@@ -1,11 +1,48 @@
-import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
+/**
+ * Importing a project from its portable `project.db` archive.
+ *
+ * WHAT CHANGED IN PHASE 2, AND WHY IT WAS NOT COSMETIC
+ * ---------------------------------------------------
+ * This module used to reach into the main database directly: `sqlite.run("BEGIN TRANSACTION")`,
+ * a loop of `sqlite.prepare(...)`, then `"COMMIT"` or `"ROLLBACK"` on the shared handle, plus
+ * `PRAGMA table_info` against it to discover columns. Three problems, in increasing order of
+ * severity:
+ *
+ *   1. Raw `BEGIN`/`COMMIT` on the shared connection composes with nothing. It cannot nest, and
+ *      an unrelated transaction already open on that handle turns the `BEGIN` into an error or,
+ *      worse, makes the `COMMIT` end SOMEBODY ELSE's transaction.
+ *   2. It read every row of every table into the heap before writing any of them —
+ *      `SELECT * FROM narrator_messages` with no bound, including `content_json`.
+ *   3. It made the import's correctness depend on the main database being SQLite, so a second
+ *      backend would have had to reproduce the statement shape rather than the requirement.
+ *
+ * The requirement is now stated in `project-archive/main-store.ts` and satisfied by
+ * `project-archive/store.ts`. The atomicity guarantee is unchanged in strength and stronger in
+ * kind: one transaction the store owns, entered and left in one place.
+ *
+ * WHAT DELIBERATELY DID NOT CHANGE
+ * --------------------------------
+ * `ImportResult` and its `tables` counts, the skip-if-already-present behavior, the `git_path`
+ * rewrite, the `INSERT OR IGNORE` merge rule, and the table order. The route's responses and
+ * every caller keep working exactly as before; `tables[…]` still counts rows OFFERED per table,
+ * not rows inserted, which is what it always counted.
+ *
+ * THE HONEST LIMIT
+ * ----------------
+ * Two databases are not one transaction. The main database is all-or-nothing here. The archive
+ * file is never written at all (opened read-only), so a failure cannot damage the user's backup
+ * — which is the asymmetry that actually matters, since the archive is what they would retry
+ * from.
+ */
 import { eq } from "drizzle-orm";
-import { db, sqlite } from "../db";
+import { db } from "../db";
 import { projects } from "../db/schema";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
-import { getProjectDbPath } from "../lib/project-db";
+import { ProjectArchiveFile } from "./project-archive/archive-file";
+import type { ArchiveBatch, ArchiveRow } from "./project-archive/main-store";
+import { ARCHIVE_TABLE_ORDER, type ArchiveTable } from "./project-archive/manifest";
+import { projectArchiveMainStore } from "./project-archive/store";
 
 export interface ImportResult {
 	projectId: string;
@@ -14,69 +51,183 @@ export interface ImportResult {
 	skipped: boolean;
 }
 
-/**
- * Table import order — respects dependency chain.
- * Project DB uses no foreign keys, but main DB does, so order matters.
- */
-const IMPORT_ORDER = [
-	"projects",
-	"exploration_groups",
-	"chapters",
-	"chapter_edges",
-	"narrators",
-	"narrator_messages",
-	"narrator_message_refs",
-	"narrator_tool_calls",
-	"narrator_patches",
-	"chapter_commits",
-	"merge_sessions",
-] as const;
-
-/** Read all rows from a project DB table. */
-function readAll(pdb: Database, table: string): Record<string, unknown>[] {
-	try {
-		return pdb.prepare(`SELECT * FROM ${table}`).all() as Record<string, unknown>[];
-	} catch {
-		return [];
-	}
-}
-
-/** Build an INSERT OR IGNORE statement for a table based on its columns. */
-function buildInsertSql(table: string, columns: string[]): string {
-	const placeholders = columns.map(() => "?").join(", ");
-	return `INSERT OR IGNORE INTO ${table} (${columns.join(", ")}) VALUES (${placeholders})`;
-}
-
-/** Get column names for a table from the project DB. */
-function getColumns(pdb: Database, table: string): string[] {
-	const info = pdb.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
-	return info.map((col) => col.name);
+export interface ProjectImportLimits {
+	/** Retained rows across every table, including the project row. */
+	readonly maxTotalRows: number;
+	/** Sum of retained batches' JSON-array UTF-8 byte sizes. */
+	readonly maxTotalSerializedBytes: number;
+	/** One normalized archive row's JSON-object UTF-8 byte size. */
+	readonly maxRowSerializedBytes: number;
+	/** Rows retained in one batch passed to the main-store transaction. */
+	readonly maxBatchRows: number;
+	/** One retained batch's JSON-array UTF-8 byte size. */
+	readonly maxBatchSerializedBytes: number;
 }
 
 /**
- * Import a project from its project database into the main database.
- * Only reads from the project DB — the project DB is the backup source.
+ * Hard production ceilings. Test-only overrides may tighten, never increase, these values.
+ *
+ * The byte budget controls payload size while the row budget controls object/key overhead for
+ * projects made of many tiny rows. Batches stay small enough that the synchronous SQLite
+ * transaction never receives one giant array, while the 4 MiB row ceiling still permits large
+ * conversation/tool payloads.
  */
-export async function importProject(gitPath: string): Promise<ImportResult> {
-	const dbPath = getProjectDbPath(gitPath);
-	if (!existsSync(dbPath)) {
-		throw new NotFoundError("Project database", dbPath);
+export const PROJECT_IMPORT_LIMITS: ProjectImportLimits = Object.freeze({
+	maxTotalRows: 100_000,
+	maxTotalSerializedBytes: 64 * 1024 * 1024,
+	maxRowSerializedBytes: 4 * 1024 * 1024,
+	maxBatchRows: 500,
+	maxBatchSerializedBytes: 8 * 1024 * 1024,
+});
+
+/**
+ * Read every archive table into bounded batches, narrowed to columns BOTH sides support.
+ *
+ * Reading remains outside the main-store transaction because archive I/O may be asynchronous in
+ * future implementations, while the SQLite transaction callback must stay strictly synchronous.
+ * The cost of preserving whole-import atomicity is therefore buffering, but the total row and
+ * serialized-byte ceilings below make that cost explicit and finite.
+ */
+async function collectBatches(
+	archive: ProjectArchiveFile,
+	projectRow: ArchiveRow,
+	gitPath: string,
+	limits: ProjectImportLimits,
+): Promise<{ batches: ArchiveBatch[]; counts: Record<string, number> }> {
+	const batches: ArchiveBatch[] = [];
+	const counts: Record<string, number> = {};
+	const budget = { rows: 0, serializedBytes: 0 };
+
+	for (const table of ARCHIVE_TABLE_ORDER) {
+		const supported = new Set(await projectArchiveMainStore.supportedColumns(table));
+		const columns = archive.columnsFor(table).filter((column) => supported.has(column));
+		counts[table] = 0;
+		if (columns.length === 0) continue;
+
+		if (table === "projects") {
+			const row: Record<string, ArchiveRow[string]> = {};
+			for (const column of columns) {
+				row[column] = column === "git_path" ? gitPath : (projectRow[column] ?? null);
+			}
+			const rowBytes = Buffer.byteLength(JSON.stringify(row), "utf8");
+			if (rowBytes > limits.maxRowSerializedBytes) {
+				throw new ValidationError(
+					`Archive row "projects.${String(row.id)}" exceeds the ${limits.maxRowSerializedBytes}-byte serialized row limit`,
+					"PROJECT_ARCHIVE_LIMIT_EXCEEDED",
+				);
+			}
+			const rows = [row];
+			retainBatch(batches, budget, limits, table, columns, rows, rowBytes + 2);
+			counts[table] = 1;
+			continue;
+		}
+
+		let after: string | null = null;
+		for (;;) {
+			const page = archive.readTable(table, columns, {
+				limit: limits.maxBatchRows,
+				after,
+				maxRowSerializedBytes: limits.maxRowSerializedBytes,
+				maxBatchSerializedBytes: limits.maxBatchSerializedBytes,
+			});
+			if (page.rows.length > 0) {
+				retainBatch(batches, budget, limits, table, columns, page.rows, page.serializedBytes);
+				counts[table] += page.rows.length;
+			}
+			if (page.nextCursor === null) break;
+			if (page.nextCursor === after) {
+				throw new ValidationError(
+					`Archive table "${table}" has a non-advancing cursor at ${after}`,
+				);
+			}
+			after = page.nextCursor;
+		}
 	}
 
-	// Open project DB directly (read-only for import)
-	const pdb = new Database(dbPath, { readonly: true });
+	return { batches, counts };
+}
+
+function retainBatch(
+	batches: ArchiveBatch[],
+	budget: { rows: number; serializedBytes: number },
+	limits: ProjectImportLimits,
+	table: ArchiveTable,
+	columns: readonly string[],
+	rows: readonly ArchiveRow[],
+	serializedBytes: number,
+): void {
+	if (rows.length > limits.maxBatchRows) {
+		throw new ValidationError(
+			`Archive batch for "${table}" exceeds the ${limits.maxBatchRows}-row batch limit`,
+			"PROJECT_ARCHIVE_LIMIT_EXCEEDED",
+		);
+	}
+	if (serializedBytes > limits.maxBatchSerializedBytes) {
+		throw new ValidationError(
+			`Archive batch for "${table}" exceeds the ${limits.maxBatchSerializedBytes}-byte serialized batch limit`,
+			"PROJECT_ARCHIVE_LIMIT_EXCEEDED",
+		);
+	}
+	const nextRows = budget.rows + rows.length;
+	if (nextRows > limits.maxTotalRows) {
+		throw new ValidationError(
+			`Project archive exceeds the ${limits.maxTotalRows}-row import limit`,
+			"PROJECT_ARCHIVE_LIMIT_EXCEEDED",
+		);
+	}
+	const nextBytes = budget.serializedBytes + serializedBytes;
+	if (nextBytes > limits.maxTotalSerializedBytes) {
+		throw new ValidationError(
+			`Project archive exceeds the ${limits.maxTotalSerializedBytes}-byte serialized import limit`,
+			"PROJECT_ARCHIVE_LIMIT_EXCEEDED",
+		);
+	}
+	budget.rows = nextRows;
+	budget.serializedBytes = nextBytes;
+	batches.push({ table, columns, rows });
+}
+
+function resolveImportLimits(overrides: Partial<ProjectImportLimits>): ProjectImportLimits {
+	const resolved = { ...PROJECT_IMPORT_LIMITS };
+	for (const key of Object.keys(PROJECT_IMPORT_LIMITS) as Array<keyof ProjectImportLimits>) {
+		const value = overrides[key];
+		if (value === undefined) continue;
+		if (!Number.isSafeInteger(value) || value < 1 || value > PROJECT_IMPORT_LIMITS[key]) {
+			throw new ValidationError(
+				`Invalid project archive import limit ${key}: expected an integer from 1 to ${PROJECT_IMPORT_LIMITS[key]}`,
+			);
+		}
+		resolved[key] = value;
+	}
+	return resolved;
+}
+
+/**
+ * Import a project from its archive into the main database.
+ *
+ * Only reads the archive — it is the backup source and is opened read-only, so a failure here
+ * cannot damage it.
+ */
+export async function importProject(
+	gitPath: string,
+	limitOverrides: Partial<ProjectImportLimits> = {},
+): Promise<ImportResult> {
+	const limits = resolveImportLimits(limitOverrides);
+	const archive = ProjectArchiveFile.open(gitPath);
 
 	try {
-		// Read project record
-		const projectRows = readAll(pdb, "projects");
-		if (projectRows.length === 0) {
+		const projectPage = archive.readTable("projects", archive.columnsFor("projects"), {
+			limit: 1,
+			maxRowSerializedBytes: limits.maxRowSerializedBytes,
+			maxBatchSerializedBytes: limits.maxBatchSerializedBytes,
+		});
+		const projectRow = projectPage.rows[0];
+		if (!projectRow) {
 			throw new ValidationError("Project database contains no project record");
 		}
-		const projectRow = projectRows[0];
 		const projectId = projectRow.id as string;
 		const projectName = projectRow.name as string;
 
-		// Check if project already exists in main DB
 		const existing = await db.query.projects.findFirst({
 			where: eq(projects.id, projectId),
 			columns: { id: true, gitPath: true },
@@ -88,53 +239,19 @@ export async function importProject(gitPath: string): Promise<ImportResult> {
 				existingGitPath: existing.gitPath,
 				importGitPath: gitPath,
 			});
-			pdb.close();
 			return { projectId, projectName, tables: {}, skipped: true };
 		}
 
-		// Update gitPath to the current location (may differ from backup)
-		projectRow.git_path = gitPath;
+		// The project may have moved since the archive was written, so the current location wins.
+		const { batches, counts } = await collectBatches(archive, projectRow, gitPath, limits);
 
-		// Import all tables in dependency order using main DB's raw sqlite connection
-		const counts: Record<string, number> = {};
-
-		sqlite.run("BEGIN TRANSACTION");
-		try {
-			for (const table of IMPORT_ORDER) {
-				// For projects table, use the already-loaded row with updated git_path
-				const rows = table === "projects" ? [projectRow] : readAll(pdb, table);
-				if (rows.length === 0) {
-					counts[table] = 0;
-					continue;
-				}
-
-				// Older backups may contain retired columns. Import only columns supported
-				// by the current schema, leaving new columns to their database defaults.
-				const targetColumns = new Set(getColumns(sqlite, table));
-				const columns = getColumns(pdb, table).filter((column) => targetColumns.has(column));
-				const sql = buildInsertSql(table, columns);
-				const stmt = sqlite.prepare(sql);
-
-				for (const row of rows) {
-					const values = columns.map((col) => {
-						const val = row[col];
-						if (val === undefined) return null;
-						return val as string | number | null;
-					});
-					stmt.run(...values);
-				}
-
-				counts[table] = rows.length;
-			}
-			sqlite.run("COMMIT");
-		} catch (err) {
-			sqlite.run("ROLLBACK");
-			throw err;
-		}
+		// One indivisible change. On failure the main database is exactly as it was found — see
+		// the store's contract; nothing partial is left behind for the user to clean up.
+		await projectArchiveMainStore.importRows({ batches, conflictPolicy: "skip" });
 
 		logger.info("Project imported from backup", { projectId, projectName, gitPath, counts });
 		return { projectId, projectName, tables: counts, skipped: false };
 	} finally {
-		pdb.close();
+		archive.close();
 	}
 }

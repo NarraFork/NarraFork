@@ -1,9 +1,6 @@
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
-import { count, eq } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import QRCode from "qrcode";
-import { db } from "../db";
-import { users } from "../db/schema";
 import { buildSessionResult, loginUser, registerUser } from "../lib/auth";
 import { type AuthAttemptBlocked, authAttemptLimiter } from "../lib/auth-attempt-limiter";
 import { getClientIp } from "../lib/client-ip";
@@ -33,8 +30,10 @@ import {
 	updateProfileSchema,
 } from "../lib/validators";
 import { requireSessionAuth } from "../middleware/auth";
+import { authSessionStore } from "../services/auth/store";
 import { mfaService } from "../services/mfa-service";
 import { passkeyService } from "../services/passkey-service";
+import { registrationAccountStore } from "../services/registration/store";
 import { ssoService } from "../services/sso-service";
 
 export const authRoutes = new Hono();
@@ -80,8 +79,10 @@ authRoutes.post("/register", async (c) => {
 
 	// An instance with no users yet is exempt from the instance-wide interval: the
 	// bootstrap admin is often created after a couple of validation failures, and
-	// there is no account to attack (and no code to guess) before it exists.
-	const [{ value: userCount }] = await db.select({ value: count() }).from(users);
+	// there is no account to attack (and no code to guess) before it exists. The
+	// count comes from the same store the registration itself writes through, so
+	// the check can never observe a different database than the signup lands in.
+	const userCount = await registrationAccountStore.countAccounts();
 	const lease = authAttemptLimiter.beginRegistration(getClientIp(c), {
 		skipGlobalInterval: userCount === 0,
 	});
@@ -276,20 +277,11 @@ authRoutes.post("/mfa/passkey/verify", async (c) => {
 
 authRoutes.get("/me", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
-	const user = await db.query.users.findFirst({
-		where: eq(users.id, payload.sub),
-		columns: {
-			id: true,
-			username: true,
-			role: true,
-			avatarColor: true,
-			avatarImageId: true,
-			gitUsername: true,
-			gitEmail: true,
-			createdAt: true,
-		},
-	});
-	if (!user) return c.json({ error: "User not found" }, 404);
+	const profile = await authSessionStore.findSessionProfile(payload.sub);
+	if (!profile) return c.json({ error: "User not found" }, 404);
+	// tokenVersion and language stay out of the payload: one is an internal
+	// revocation counter, the other is delivered by the session result.
+	const { tokenVersion, language, ...user } = profile;
 	return c.json(user);
 });
 
@@ -305,7 +297,7 @@ authRoutes.patch("/me", requireSessionAuth, async (c) => {
 		update.gitEmail = parsed.data.gitEmail || null;
 	}
 	if (Object.keys(update).length > 0) {
-		await db.update(users).set(update).where(eq(users.id, payload.sub));
+		await authSessionStore.updateProfile(payload.sub, update);
 		// The commit identity is memoized for a short window, so evict it here:
 		// otherwise a user fixes their name and their next commits still carry the
 		// old one, with nothing to indicate why.
@@ -322,16 +314,40 @@ authRoutes.patch("/me/avatar", requireSessionAuth, async (c) => {
 		throw new ValidationError("No file provided");
 	}
 
+	const previousAvatarImageId =
+		(await authSessionStore.findSessionProfile(payload.sub))?.avatarImageId ?? null;
 	const { imageId } = await saveAvatarImage(payload.sub, file);
-	await db.update(users).set({ avatarImageId: imageId }).where(eq(users.id, payload.sub));
+	try {
+		await authSessionStore.setAvatarImage(payload.sub, imageId);
+	} catch (error) {
+		// The old database reference remains authoritative. Remove only the newly written
+		// file; deleting the whole directory would destroy the still-valid old avatar.
+		deleteAvatarImage(payload.sub, imageId);
+		throw error;
+	}
+
+	// The database now points at the new file, so the old file is no longer reachable.
+	// Keep cleanup best-effort: a cleanup failure must not turn a successful replacement
+	// into an error or remove the newly referenced avatar.
+	if (previousAvatarImageId && previousAvatarImageId !== imageId) {
+		try {
+			deleteAvatarImage(payload.sub, previousAvatarImageId);
+		} catch (error) {
+			logger.warn("Failed to remove replaced avatar", {
+				userId: payload.sub,
+				imageId: previousAvatarImageId,
+				error: String(error),
+			});
+		}
+	}
 
 	return c.json({ ok: true, avatarImageId: imageId });
 });
 
 authRoutes.delete("/me/avatar", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
+	await authSessionStore.setAvatarImage(payload.sub, null);
 	deleteAvatarImage(payload.sub);
-	await db.update(users).set({ avatarImageId: null }).where(eq(users.id, payload.sub));
 	return c.json({ ok: true });
 });
 
@@ -381,10 +397,7 @@ authRoutes.patch("/me/mfa", requireSessionAuth, async (c) => {
  */
 authRoutes.post("/me/totp/setup", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
-	const user = await db.query.users.findFirst({
-		where: eq(users.id, payload.sub),
-		columns: { username: true },
-	});
+	const user = await authSessionStore.findSessionProfile(payload.sub);
 	if (!user) throw new AppError("User not found", 404, "NOT_FOUND");
 
 	const result = await mfaService.beginSetup(payload.sub);
@@ -434,12 +447,9 @@ authRoutes.delete("/me/totp", requireSessionAuth, async (c) => {
 			(await mfaService.consumeBackupCode(payload.sub, parsed.data.code));
 	}
 	if (!verified && parsed.data.password) {
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, payload.sub),
-			columns: { passwordHash: true },
-		});
-		if (user) {
-			verified = await Bun.password.verify(parsed.data.password, user.passwordHash);
+		const passwordHash = await authSessionStore.findPasswordHash(payload.sub);
+		if (passwordHash) {
+			verified = await Bun.password.verify(parsed.data.password, passwordHash);
 		}
 	}
 
@@ -467,10 +477,7 @@ authRoutes.get("/me/passkeys", requireSessionAuth, async (c) => {
 /** Issue registration options for adding a new passkey. */
 authRoutes.post("/me/passkeys/register/options", requireSessionAuth, async (c) => {
 	const payload = c.get("user");
-	const user = await db.query.users.findFirst({
-		where: eq(users.id, payload.sub),
-		columns: { username: true },
-	});
+	const user = await authSessionStore.findSessionProfile(payload.sub);
 	if (!user) throw new AppError("User not found", 404, "NOT_FOUND");
 	const options = await passkeyService.registrationOptions({
 		userId: payload.sub,

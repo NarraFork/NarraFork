@@ -28,7 +28,7 @@ searchRoutes.get("/", async (c) => {
 	const principal = { userId: user.sub, isAdmin: user.role === "admin" };
 	const query = q.trim();
 
-	const results = searchService.search({
+	const results = await searchService.search({
 		query,
 		entities,
 		limit,
@@ -37,8 +37,8 @@ searchRoutes.get("/", async (c) => {
 		principal,
 	});
 
-	// Knowledge lives on its own async path: its visibility gate reads grants, so it
-	// cannot ride along in the synchronous SQL search. Merged here and re-sorted with
+	// Knowledge lives on its own path: its visibility gate reads grants, so it
+	// cannot ride along in the SQL search. Merged here and re-sorted with
 	// the shared comparator so one ordering governs the whole response.
 	if (entities.includes("knowledge")) {
 		const knowledgeResults = await searchService.searchKnowledge({ query, limit, principal });

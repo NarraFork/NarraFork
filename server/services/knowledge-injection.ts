@@ -1,7 +1,8 @@
 import { KNOWLEDGE_EXCERPT_MAX_CHARS, knowledgeExcerpt } from "@shared/knowledge-excerpt";
 import { settings } from "../lib/settings";
+import { knowledgeReadStore } from "./knowledge/store";
 import { knowledgeAcl } from "./knowledge-acl";
-import { knowledgeService } from "./knowledge-service";
+import { knowledgeInjectionReads, knowledgeService } from "./knowledge-service";
 
 export interface InjectionHit {
 	entryId: string;
@@ -46,7 +47,9 @@ function summarize(text: string, title?: string): string {
 	return knowledgeExcerpt(text, { title, maxChars: MAX_SUMMARY_CHARS });
 }
 
-type KeywordCandidate = ReturnType<typeof knowledgeService.listKeywordInjectionCandidates>[number];
+type KeywordCandidate = Awaited<
+	ReturnType<typeof knowledgeInjectionReads.listKeywordInjectionCandidates>
+>[number];
 
 interface KeywordNeedle {
 	keyword: string;
@@ -155,6 +158,7 @@ function compileMatcher(candidates: KeywordCandidate[]): CompiledMatcher {
  * signature so a cached matcher is reused until the underlying entries change.
  */
 interface MatcherCacheEntry {
+	store: typeof knowledgeReadStore;
 	signature: string;
 	matcher: CompiledMatcher;
 }
@@ -165,13 +169,17 @@ function matcherCacheKey(opts: { collectionId?: string; projectId?: string }): s
 	return `${opts.collectionId ?? ""}|${opts.projectId ?? ""}`;
 }
 
-function getCompiledMatcher(opts: { collectionId?: string; projectId?: string }): CompiledMatcher {
+async function getCompiledMatcher(opts: {
+	collectionId?: string;
+	projectId?: string;
+}): Promise<CompiledMatcher> {
 	const key = matcherCacheKey(opts);
-	const signature = knowledgeService.keywordInjectionCandidatesSignature(opts);
+	const store = knowledgeReadStore;
+	const signature = await knowledgeInjectionReads.keywordInjectionCandidatesSignature(opts);
 	const cached = matcherCache.get(key);
-	if (cached && cached.signature === signature) return cached.matcher;
+	if (cached?.store === store && cached.signature === signature) return cached.matcher;
 
-	const candidates = knowledgeService.listKeywordInjectionCandidates(opts);
+	const candidates = await knowledgeInjectionReads.listKeywordInjectionCandidates(opts);
 	const matcher = compileMatcher(candidates);
 	// Simple size guard: evict the oldest scope when the cache grows too large. Scopes
 	// are (collection, project) tuples, so 64 covers realistic deployments comfortably.
@@ -179,7 +187,7 @@ function getCompiledMatcher(opts: { collectionId?: string; projectId?: string })
 		const oldest = matcherCache.keys().next().value;
 		if (oldest !== undefined) matcherCache.delete(oldest);
 	}
-	matcherCache.set(key, { signature, matcher });
+	matcherCache.set(key, { store, signature, matcher });
 	return matcher;
 }
 
@@ -261,7 +269,7 @@ export async function resolveInjections(
 
 	let matcher: CompiledMatcher;
 	try {
-		matcher = getCompiledMatcher({
+		matcher = await getCompiledMatcher({
 			collectionId: opts.collectionId,
 			projectId: opts.projectId,
 		});
@@ -284,7 +292,7 @@ export async function resolveInjections(
 	}
 	if (selected.length === 0) return [];
 
-	const snippets = knowledgeService.snippetsByEntryIds(selected.map((r) => r.id));
+	const snippets = await knowledgeInjectionReads.snippetsByEntryIds(selected.map((r) => r.id));
 	return selected.map((r) => ({
 		entryId: r.id,
 		entryRevisionId: r.entryRevisionId,

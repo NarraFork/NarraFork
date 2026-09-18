@@ -48,6 +48,8 @@ import { slugify } from "../lib/slug";
 import { chapterEdgeService } from "./chapter-edge-service";
 import { chapterFork } from "./chapter-fork";
 import { chapterService } from "./chapter-service";
+import { chapterWriteStore } from "./chapter-write/store";
+import type { ChapterRow } from "./chapter-write/write-store";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
 import { ensureRefsCoverMessage } from "./narrator-refs-backfill";
@@ -68,9 +70,9 @@ export interface SplitChapterInput {
 export type SplitFallback = Record<string, unknown>;
 
 export interface SplitChapterResult {
-	prefixChapter: typeof chapters.$inferSelect;
-	continuationChapter: typeof chapters.$inferSelect;
-	newForkChapter: Record<string, unknown>;
+	prefixChapter: ChapterRow;
+	continuationChapter: ChapterRow;
+	newForkChapter: ChapterRow | (ChapterRow & { warnings: string[] });
 	commitSha: string;
 	warnings?: string[];
 	fallbacks?: SplitFallback[];
@@ -426,48 +428,45 @@ export const chapterSplit = {
 				});
 
 				// Step 2: the prefix chapter row.
-				const [prefixChapter] = await db
-					.insert(chapters)
-					.values({
-						id: prefixId,
-						projectId: original.projectId,
-						title: prefixTitle,
-						description: original.description,
-						status: prefixStatus,
-						role: original.role,
-						branch: prefixBranch,
-						// Dormant means "no worktree on disk", and the column is what every
-						// reader consults to decide whether one exists.
-						worktreePath: prefixStatus === "active" ? prefixWorktreePath : null,
-						baseBranch: original.baseBranch,
-						// The prefix takes over the original's place in the graph: whatever O
-						// descended from, the prefix now descends from.
-						parentChapterId: original.parentChapterId,
-						forkPoint: original.forkPoint,
-						// The prefix owns the window [O's original start, C]; the continuation
-						// takes over from C.
-						startCommitSha: original.startCommitSha,
-						headCommitSha: commitSha,
-						anchorCommitSha: commitSha,
-						// Same lane as the original so the split reads as one timeline cut in
-						// two rather than a branch off to the side.
-						axisOffset: 0,
-						crossOffset: original.crossOffset ?? 0,
-						// Recorded at insert rather than left to the first tool call so the
-						// shadow-repo ownership guard protects this lineage immediately —
-						// a chapter with no worktree would otherwise have its snapshots swept
-						// as an orphan (see chapter-fork.ts for the same reasoning).
-						snapshotShadowKey: treeSnapshotKey(LOCAL_DEVICE_ID, prefixWorktreePath),
-						// Deliberately not carried over: exploration membership, review
-						// coordinates, merge coordinates and container config all describe the
-						// chapter that keeps evolving, which is the continuation.
-						lastAccessedAt: now,
-						createdAt: now,
-						updatedAt: now,
-					})
-					.returning();
+				const prefixChapter = await chapterWriteStore.insertChapter({
+					id: prefixId,
+					projectId: original.projectId,
+					title: prefixTitle,
+					description: original.description,
+					status: prefixStatus,
+					role: original.role,
+					branch: prefixBranch,
+					// Dormant means "no worktree on disk", and the column is what every
+					// reader consults to decide whether one exists.
+					worktreePath: prefixStatus === "active" ? prefixWorktreePath : null,
+					baseBranch: original.baseBranch,
+					// The prefix takes over the original's place in the graph: whatever O
+					// descended from, the prefix now descends from.
+					parentChapterId: original.parentChapterId,
+					forkPoint: original.forkPoint,
+					// The prefix owns the window [O's original start, C]; the continuation
+					// takes over from C.
+					startCommitSha: original.startCommitSha,
+					headCommitSha: commitSha,
+					anchorCommitSha: commitSha,
+					// Same lane as the original so the split reads as one timeline cut in
+					// two rather than a branch off to the side.
+					axisOffset: 0,
+					crossOffset: original.crossOffset ?? 0,
+					// Recorded at insert rather than left to the first tool call so the
+					// shadow-repo ownership guard protects this lineage immediately —
+					// a chapter with no worktree would otherwise have its snapshots swept
+					// as an orphan (see chapter-fork.ts for the same reasoning).
+					snapshotShadowKey: treeSnapshotKey(LOCAL_DEVICE_ID, prefixWorktreePath),
+					// Deliberately not carried over: exploration membership, review
+					// coordinates, merge coordinates and container config all describe the
+					// chapter that keeps evolving, which is the continuation.
+					lastAccessedAt: now,
+					createdAt: now,
+					updatedAt: now,
+				});
 				rollback.push(async () => {
-					await db.delete(chapters).where(eq(chapters.id, prefixId));
+					await chapterWriteStore.deleteChapter(prefixId);
 				});
 
 				// Step 3: the prefix's narrator — the original's conversation cut at the
@@ -518,14 +517,12 @@ export const chapterSplit = {
 					);
 					fallbacks.push({ step: "commitHistoryCopy", mode: "skipped", error: String(err) });
 				}
-				await db
-					.update(chapters)
-					.set({
-						startCommitSha: original.startCommitSha,
-						headCommitSha: commitSha,
-						updatedAt: now,
-					})
-					.where(eq(chapters.id, prefixId));
+				await chapterWriteStore.updateSplitPrefixHead({
+					prefixId,
+					startCommitSha: original.startCommitSha,
+					headCommitSha: commitSha,
+					now,
+				});
 
 				if (project.copyFiles && prefixStatus !== "active") {
 					// `chapterFork.fork` copies these from the parent's worktree, and the
@@ -608,37 +605,22 @@ export const chapterSplit = {
 
 				// Step 7: rewrite the original into the continuation.
 				//
-				// Last, and in one synchronous transaction, so the window in which the
-				// original claims a lineage that may still be rolled back is as small as
-				// it can be. `parentChapterId` is `ON DELETE SET NULL`, so even a crash
-				// between this commit and a later prefix deletion degrades to "no parent"
-				// rather than a dangling pointer.
+				// Last, and in one atomic section of the chapter write store, so the
+				// window in which the original claims a lineage that may still be
+				// rolled back is as small as it can be. `parentChapterId` is
+				// `ON DELETE SET NULL`, so even a crash between this commit and a later
+				// prefix deletion degrades to "no parent" rather than a dangling
+				// pointer.
 				//
 				// The commit records are recomputed, never deleted: the UI lists them and
 				// they are the chapter's only local record of its own history.
-				const continuationChapter = db.transaction((tx) => {
-					const counted = tx
-						.select({ total: sql<number>`COUNT(*)` })
-						.from(chapterCommits)
-						.where(eq(chapterCommits.chapterId, chapterId))
-						.get();
-					const updated = tx
-						.update(chapters)
-						.set({
-							parentChapterId: prefixId,
-							startCommitSha: commitSha,
-							forkPoint: {
-								commitSha,
-								...(truncation ? { narratorMessageId: truncation.messageId } : {}),
-							},
-							commitCount: counted?.total ?? original.commitCount ?? 0,
-							updatedAt: now,
-						})
-						.where(eq(chapters.id, chapterId))
-						.returning()
-						.get();
-					if (!updated) throw new NotFoundError("Chapter", chapterId);
-					return updated;
+				const continuationChapter = await chapterWriteStore.rewriteSplitContinuation({
+					chapterId,
+					prefixId,
+					commitSha,
+					...(truncation ? { narratorMessageId: truncation.messageId } : {}),
+					fallbackCommitCount: original.commitCount ?? null,
+					now,
 				});
 
 				logger.info("Chapter split", {

@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { knowledgePackActivations, narratorWhitelistDirs } from "../db/schema";
+import { knowledgePackActivations } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -16,6 +16,7 @@ import {
 import { isInsidePath } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import { extractZipArchive } from "../lib/zip-archive";
+import { knowledgeWriteStore } from "./knowledge/store";
 import type { Principal } from "./knowledge-acl";
 import { knowledgePackService, type Pack } from "./knowledge-pack-service";
 
@@ -124,12 +125,6 @@ function inspectExtraction(destDir: string): { files: string[]; totalBytes: numb
 	return { files, totalBytes };
 }
 
-/** Remove a whitelist row by id (best-effort). */
-async function removeWhitelistRow(whitelistDirId: string | null): Promise<void> {
-	if (!whitelistDirId) return;
-	await db.delete(narratorWhitelistDirs).where(eq(narratorWhitelistDirs.id, whitelistDirId));
-}
-
 /** Find an active activation row for (narrator, pack), if any. */
 async function findActiveActivation(narratorId: string, packId: string) {
 	return db.query.knowledgePackActivations.findFirst({
@@ -207,47 +202,24 @@ async function activate(
 		throw err;
 	}
 
-	// Register the extract dir as a narrator whitelist entry (readWrite). This is the
-	// single mechanism that grants the agent access — file tools + safe bash commands
-	// targeting this dir are auto-allowed by resolvePermissionDecision. Script execution
-	// (./x.sh) still triggers user approval via isPathExecution (intentional).
+	// Register the extract dir as a narrator whitelist entry (readWrite) AND record the
+	// activation as ONE store operation: the agent must never hold a whitelist entry
+	// whose activation record is missing (or vice versa). This is the single mechanism
+	// that grants the agent access — file tools + safe bash commands targeting this dir
+	// are auto-allowed by resolvePermissionDecision. Script execution (./x.sh) still
+	// triggers user approval via isPathExecution (intentional).
 	const whitelistDirId = generateId();
 	const now = new Date().toISOString();
 	const activationId = generateId();
 
-	await db.transaction((tx) => {
-		// Upsert-style: a unique (narratorId, path) index exists, so delete any prior row
-		// for this exact path first (e.g. left over from an unclean release).
-		tx.delete(narratorWhitelistDirs)
-			.where(
-				and(
-					eq(narratorWhitelistDirs.narratorId, narratorId),
-					eq(narratorWhitelistDirs.path, destDir),
-				),
-			)
-			.run();
-		tx.insert(narratorWhitelistDirs)
-			.values({
-				id: whitelistDirId,
-				narratorId,
-				path: destDir,
-				accessLevel: "readWrite",
-				enabled: true,
-				createdAt: now,
-			})
-			.run();
-		tx.insert(knowledgePackActivations)
-			.values({
-				id: activationId,
-				packId,
-				narratorId,
-				extractDir: destDir,
-				whitelistDirId,
-				archiveHash: pack.archiveHash,
-				status: "active",
-				createdAt: now,
-			})
-			.run();
+	await knowledgeWriteStore.recordPackActivation({
+		activationId,
+		whitelistDirId,
+		packId,
+		narratorId,
+		extractDir: destDir,
+		archiveHash: pack.archiveHash,
+		now,
 	});
 
 	logger.info("Pack activated", { packId, narratorId, files: files.length });
@@ -260,18 +232,21 @@ async function activate(
 	};
 }
 
-/** Release a single activation: remove whitelist row, delete dir, mark released. */
+/** Release a single activation: delete dir, then drop whitelist row + mark released atomically. */
 async function releaseActivation(
 	activationId: string,
 	whitelistDirId: string | null,
 	extractDir: string,
 ): Promise<void> {
-	await removeWhitelistRow(whitelistDirId);
+	// The directory goes first: if removing it fails, nothing has changed and the
+	// activation is still intact. The two database writes are one store operation, so
+	// the whitelist row and the released marker can never disagree.
 	if (existsSync(extractDir)) rmSync(extractDir, { recursive: true, force: true });
-	await db
-		.update(knowledgePackActivations)
-		.set({ status: "released", releasedAt: new Date().toISOString() })
-		.where(eq(knowledgePackActivations.id, activationId));
+	await knowledgeWriteStore.releasePackActivation({
+		activationId,
+		whitelistDirId,
+		now: new Date().toISOString(),
+	});
 }
 
 /** Deactivate a pack for a narrator (idempotent): release the active activation if any. */

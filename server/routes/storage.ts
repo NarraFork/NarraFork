@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { z } from "zod/v4";
+import { recoverWorkspaceBarrierSchema } from "../lib/validators/workspace-recovery";
 import { requireAdmin } from "../middleware/auth";
 import { databaseCleanupService } from "../services/database-cleanup-service";
 import {
@@ -8,6 +9,11 @@ import {
 	startStorageScan,
 } from "../services/storage-scan-job";
 import { storageService } from "../services/storage-service";
+import {
+	listWorkspaceBarriers,
+	observeWorkspaceBarrier,
+	recoverWorkspaceBarrier,
+} from "../services/workspace-scope-recovery";
 
 export const storageRoutes = new Hono();
 
@@ -156,4 +162,48 @@ storageRoutes.post("/database/vacuum", requireAdmin, async (c) => {
 	const result = await databaseCleanupService.vacuumDatabase();
 	storageService.invalidateStorageCache();
 	return c.json(result);
+});
+
+/**
+ * GET /api/storage/workspace-barriers — List durable workspace write barriers
+ * awaiting external recovery: quarantined scopes (uncertain writes) and dead
+ * leases from crashed runs (admin only).
+ */
+storageRoutes.get("/workspace-barriers", requireAdmin, async (c) => {
+	return c.json(await listWorkspaceBarriers());
+});
+
+/**
+ * POST /api/storage/workspace-barriers/:scopeId/observe — Re-observe every
+ * unsettled effect's physical file and return per-effect verdicts. Read-only;
+ * the confirmation UI uses this as its preview (admin only).
+ */
+storageRoutes.post("/workspace-barriers/:scopeId/observe", requireAdmin, async (c) => {
+	const scopeId = c.req.param("scopeId");
+	if (!scopeId) return c.json({ error: "Missing scopeId" }, 400);
+	return c.json(await observeWorkspaceBarrier(scopeId, c.req.raw.signal));
+});
+
+/**
+ * POST /api/storage/workspace-barriers/:scopeId/recover — Human-confirmed
+ * recovery: re-observes (TOCTOU guard), closes the evidence books, then clears
+ * the durable barrier. Never writes to the physical workspace (admin only).
+ */
+storageRoutes.post("/workspace-barriers/:scopeId/recover", requireAdmin, async (c) => {
+	const scopeId = c.req.param("scopeId");
+	if (!scopeId) return c.json({ error: "Missing scopeId" }, 400);
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = recoverWorkspaceBarrierSchema.safeParse(body);
+	if (!parsed.success) {
+		return c.json({ error: "Invalid workspace barrier recovery request" }, 400);
+	}
+	return c.json(
+		await recoverWorkspaceBarrier({
+			scopeId,
+			recoveredByUserId: c.get("user").sub,
+			acknowledgements: parsed.data.acknowledgements,
+			acknowledgeInspected: parsed.data.acknowledgeInspected,
+			signal: c.req.raw.signal,
+		}),
+	);
 });

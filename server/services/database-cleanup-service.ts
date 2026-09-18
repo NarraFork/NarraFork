@@ -1,5 +1,6 @@
 import { stat, unlink } from "node:fs/promises";
-import { sqlite } from "@server/db";
+import { databaseMaintenance, sqlite } from "@server/db";
+import { describeUnsupported, type ReusableSpaceReport } from "@server/db/backend";
 import { getDbPath } from "@server/db/connection";
 import {
 	isServableDumpFilePath,
@@ -33,7 +34,6 @@ import {
 	type DatabaseTableKind,
 	getDatabaseStorageCategory,
 	numberFromRow,
-	readFreelistSummary,
 	type SessionAggregateStats,
 	type SessionOwnedTableRelation,
 } from "./storage-scan-queries";
@@ -676,19 +676,60 @@ function logSlowDatabaseStep(
 	}
 }
 
+/**
+ * Page/freelist accounting, or an `AppError` explaining why the backend cannot provide it.
+ *
+ * `AppError` rather than the port's `UnsupportedCapabilityError` because this reaches an admin HTTP
+ * route: 501 says "valid request, absent capability", which is neither a client mistake nor an
+ * internal fault, and it stops a client from retrying something that will never work.
+ */
+function requireReusableSpace(mainBytes: number): ReusableSpaceReport {
+	const measured = databaseMaintenance.measureReusableSpace(mainBytes);
+	if (!measured.supported) {
+		logger.warn("Reusable-space measurement is unavailable on this backend", {
+			code: measured.code,
+			reason: measured.reason,
+		});
+		throw new AppError(
+			`Reusable-space measurement is unavailable: ${describeUnsupported(measured)}`,
+			501,
+			"DATABASE_SPACE_REPORT_UNSUPPORTED",
+		);
+	}
+	return measured.value;
+}
+
+/**
+ * Lightweight post-cleanup maintenance. Returns whether a space-reclaiming rewrite ran — always
+ * false here, and deliberately so.
+ *
+ * VACUUM is NOT run on this path: on large databases it freezes the main thread long enough to make
+ * the backend appear dead, and this code runs inside an HTTP request. Space reclamation is a
+ * separate, admin-confirmed maintenance window (`vacuumDatabase`).
+ *
+ * Both steps go through the maintenance port, which reports failure rather than throwing — a
+ * checkpoint hiccup must not cost the caller its cleanup result. An unsupported capability is
+ * skipped quietly at debug level: on a backend with no WAL there is genuinely nothing to flush, and
+ * warning about it on every cleanup would train operators to ignore the log.
+ */
 function compactDatabaseIfNeeded(changed: boolean): boolean {
 	if (!changed) return false;
 	const startedAt = performance.now();
 	try {
-		// Avoid running VACUUM synchronously in the HTTP request path: on large SQLite
-		// files it can freeze Bun's main thread long enough to make the backend appear dead.
-		// Keep only lightweight best-effort maintenance here; a future background job can
-		// run full compaction outside request handling.
-		sqlite.run("PRAGMA wal_checkpoint(PASSIVE)");
-		sqlite.run("PRAGMA optimize");
-		return false;
-	} catch (error) {
-		logger.warn("Database cleanup maintenance failed", { error: String(error) });
+		const checkpoint = databaseMaintenance.checkpoint({ truncate: false });
+		if (!checkpoint.supported) {
+			logger.debug("Database cleanup checkpoint unavailable", {
+				code: checkpoint.code,
+				reason: checkpoint.reason,
+			});
+		}
+		const optimized = databaseMaintenance.refreshPlannerStatistics();
+		if (!optimized.supported) {
+			logger.debug("Database cleanup planner refresh unavailable", {
+				code: optimized.code,
+				reason: optimized.reason,
+			});
+		}
 		return false;
 	} finally {
 		logSlowDatabaseStep("maintenance", startedAt, { vacuumSkipped: true });
@@ -909,48 +950,71 @@ export const databaseCleanupService = {
 				const beforeBytes = totalDatabaseBytes(beforeSizes);
 				// Pragmas only. A full object scan here would read every table just to keep one number,
 				// and would itself contend with the writer we are about to hand an exclusive lock to.
-				const beforeStorage = readFreelistSummary(sqlite, beforeSizes.mainBytes);
+				//
+				// A refusal rather than a silent zero: an operator who explicitly asked for space
+				// reclamation must be told the backend cannot measure it, not handed a report full of
+				// zeroes that reads like "nothing to reclaim".
+				const beforeStorage = requireReusableSpace(beforeSizes.mainBytes);
 				let checkpointRan = false;
 				let optimized = false;
 
-				try {
-					sqlite.run("PRAGMA wal_checkpoint(TRUNCATE)");
-					checkpointRan = true;
-				} catch (error) {
-					logger.warn("Database checkpoint before VACUUM failed", { error: String(error) });
-				}
+				/**
+				 * Whether the step actually did its work.
+				 *
+				 * `supported` alone is not enough: the port reports a best-effort step that FAILED as
+				 * `supported: { ok: false }`, because an absent capability and a failed one are different
+				 * facts. Reporting `checkpointRan: true` for a checkpoint that threw would tell the
+				 * operator the WAL was flushed when it was not.
+				 */
+				const ran = (result: ReturnType<typeof databaseMaintenance.checkpoint>): boolean =>
+					result.supported && result.value.ok;
+
+				// Truncating checkpoint before the rewrite: PASSIVE cannot shrink the WAL, and WAL bytes
+				// left behind would show up as "freed nothing" after a VACUUM that did work.
+				checkpointRan = ran(databaseMaintenance.checkpoint({ truncate: true }));
 
 				try {
-					sqlite.run("VACUUM");
+					const reclaimed = databaseMaintenance.reclaimSpace();
+					if (!reclaimed.supported) {
+						// "This backend cannot reclaim space" is a different answer from "the rewrite
+						// failed", and conflating them would tell the operator to retry something that will
+						// never work. 501 rather than 500: the request was valid, the capability is absent.
+						logger.warn("Database space reclamation is unavailable on this backend", {
+							code: reclaimed.code,
+							reason: reclaimed.reason,
+						});
+						throw new AppError(
+							`Space reclamation is unavailable: ${describeUnsupported(reclaimed)}`,
+							501,
+							"DATABASE_VACUUM_UNSUPPORTED",
+						);
+					}
 				} catch (error) {
-					// Previously unguarded, so a lock conflict surfaced as a bare 500. Report it as a
-					// retryable conflict instead, and keep the message actionable.
-					const message = String(error);
-					logger.warn("Database VACUUM failed", { error: message });
+					if (error instanceof AppError) throw error;
+					// Previously unguarded, so a lock conflict surfaced as a bare 500. The port classifies
+					// the failure so this decision no longer depends on SQLite error strings.
+					const failure = databaseMaintenance.classifyFailure(error);
+					logger.warn("Database space reclamation failed", {
+						kind: failure.kind,
+						error: failure.message,
+					});
 					throw new AppError(
-						`VACUUM could not run: ${message}`,
-						/SQLITE_BUSY|SQLITE_LOCKED|database is locked/i.test(message) ? 409 : 500,
+						`VACUUM could not run: ${failure.message}`,
+						failure.kind === "conflict" ? 409 : 500,
 						"DATABASE_VACUUM_FAILED",
 					);
 				}
 
-				try {
-					sqlite.run("PRAGMA optimize");
-					optimized = true;
-				} catch (error) {
-					logger.warn("Database optimize after VACUUM failed", { error: String(error) });
-				}
-
-				try {
-					sqlite.run("PRAGMA wal_checkpoint(TRUNCATE)");
-					checkpointRan = true;
-				} catch (error) {
-					logger.warn("Database checkpoint after VACUUM failed", { error: String(error) });
-				}
+				optimized = ran(databaseMaintenance.refreshPlannerStatistics());
+				// Checkpoint again: VACUUM leaves its work in the WAL, so without this the file on disk
+				// has not actually shrunk yet and the after-size would understate what was reclaimed.
+				// `||` keeps the flag true when the first checkpoint succeeded and this one did not:
+				// the field means "a checkpoint ran", matching the pre-refactor behaviour.
+				checkpointRan = ran(databaseMaintenance.checkpoint({ truncate: true })) || checkpointRan;
 
 				const afterSizes = await getDatabaseFileSizes();
 				const afterBytes = totalDatabaseBytes(afterSizes);
-				const afterStorage = readFreelistSummary(sqlite, afterSizes.mainBytes);
+				const afterStorage = requireReusableSpace(afterSizes.mainBytes);
 				const result: DatabaseVacuumResult = {
 					ok: true,
 					beforeBytes,

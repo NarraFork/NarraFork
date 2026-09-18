@@ -1,12 +1,16 @@
 import { createHash } from "node:crypto";
-import { and, desc, eq } from "drizzle-orm";
-import { db, sqlite } from "../db";
-import { knowledgeCollections, knowledgeEntries, knowledgeRevisions, users } from "../db/schema";
-import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
+import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import type { KnowledgeEntryRow } from "./knowledge/read-store";
+import {
+	knowledgeReadStore,
+	knowledgeWriteStore,
+	synchronousKnowledgeInjectionReads,
+} from "./knowledge/store";
+import { type KnowledgeCollectionRow, WriteConflictError } from "./knowledge/write-store";
 import {
 	type AclCollection,
 	type AclEntry,
@@ -22,6 +26,9 @@ import {
 } from "./knowledge-acl";
 import { recordKnowledgeAclEvent } from "./knowledge-audit";
 import { emitEntryDrifted } from "./knowledge-notify";
+import { searchStore } from "./search/backend";
+import { canUseIndex, sanitizeQuery } from "./search/query";
+import type { KnowledgeSearchRow, SearchStrategy } from "./search/types";
 
 type Format = "markdown" | "text" | "json";
 
@@ -69,11 +76,13 @@ function toAclCollection(c: {
 	};
 }
 
-/** True for SQLite UNIQUE-constraint violations (used to convert TOCTOU slug/version races). */
-function isUniqueConstraintError(err: unknown): boolean {
-	const msg = err instanceof Error ? err.message : String(err);
-	return /UNIQUE constraint failed|SQLITE_CONSTRAINT/i.test(msg);
-}
+/**
+ * Uniqueness conflicts reach this service as PORT VOCABULARY (`WriteConflictError`),
+ * never as driver text: the write store's implementations classify them structurally
+ * (SQLite extended result codes / SQLSTATE 23505 via `server/db/pg-errors.ts`) and
+ * translate before the error crosses the boundary. The service — the only code that
+ * knows whether "already exists" is a validation error — maps it to a clean 400.
+ */
 
 /**
  * Load an entry + its collection and assert the principal may READ it.
@@ -84,14 +93,10 @@ function isUniqueConstraintError(err: unknown): boolean {
 async function loadReadableEntry(
 	entryId: string,
 	principal: Principal,
-): Promise<{ entry: typeof knowledgeEntries.$inferSelect; caps: PrincipalCaps }> {
-	const entry = await db.query.knowledgeEntries.findFirst({
-		where: eq(knowledgeEntries.id, entryId),
-	});
+): Promise<{ entry: KnowledgeEntryRow; caps: PrincipalCaps }> {
+	const entry = await knowledgeReadStore.getEntryById(entryId);
 	if (!entry) throw new NotFoundError("Knowledge entry", entryId);
-	const collection = await db.query.knowledgeCollections.findFirst({
-		where: eq(knowledgeCollections.id, entry.collectionId),
-	});
+	const collection = await knowledgeReadStore.getCollectionById(entry.collectionId);
 	const caps = await resolvePrincipalCaps(principal);
 	// Same fail-closed rule as `filterReadable`: `collectionId` is NOT NULL behind a
 	// cascading FK, so a missing collection row is an anomaly, not an unclassified entry.
@@ -112,7 +117,7 @@ async function loadReadableEntry(
 async function loadWritableEntry(
 	entryId: string,
 	principal: Principal,
-): Promise<typeof knowledgeEntries.$inferSelect> {
+): Promise<KnowledgeEntryRow> {
 	const { entry, caps } = await loadReadableEntry(entryId, principal);
 	if (!canWriteMain(caps, toAclEntry(entry))) {
 		throw new ValidationError(
@@ -135,27 +140,6 @@ function slugify(input: string): string {
 		.replace(/^-+|-+$/g, "")
 		.slice(0, 200);
 	return slug || generateId(8);
-}
-
-/** Remove FTS5 special chars to prevent injection (mirrors search-service). */
-function sanitizeQuery(query: string): string {
-	return query.replace(/['"*(){}[\]^~@:;!&|,<>\\]/g, "").trim();
-}
-
-/** Build an FTS5 prefix query from sanitized input.
- *  match="and" (default) requires all terms; match="or" matches any term
- *  (used for passive injection, where the input is a natural-language sentence).
- *  field, when set, restricts the match to a single FTS column (e.g. "current_keywords"
- *  so passive injection only fires on author-declared keywords, never body text). */
-function buildFtsQuery(safeQuery: string, match: "and" | "or" = "and", field?: string): string {
-	const terms = safeQuery
-		.split(/\s+/)
-		.filter(Boolean)
-		.map((w) => `"${w}"*`);
-	if (terms.length === 0) return "";
-	const joined = terms.join(match === "or" ? " OR " : " ");
-	// FTS5 column filter: `{col} : (expr)` restricts the whole expression to one column.
-	return field ? `{${field}} : (${joined})` : joined;
 }
 
 function parseTags(tagsJson: unknown): string[] {
@@ -198,11 +182,9 @@ function keywordsMirror(keywords: string[]): string | null {
 	return keywords.length > 0 ? keywords.join(" ") : null;
 }
 
-/** Escape LIKE wildcards (% _) and the escape char itself so user-typed wildcards
- *  match literally instead of broadening the pattern. Pair with `ESCAPE '\'` in SQL. */
-function escapeLike(s: string): string {
-	return s.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-}
+// LIKE-wildcard escaping now lives with the statements that pair it with `ESCAPE '\'`
+// (`services/search/sqlite-expressions.ts`). Keeping a copy here would be a second spelling
+// of the same rule with no statement to enforce it against.
 
 // ═══════════════════════════════════════════════════════════════════════
 // Collections
@@ -219,16 +201,10 @@ function escapeLike(s: string): string {
 const COLLECTION_LIST_MAX = 500;
 
 async function listCollections(projectId?: string, principal?: Principal) {
-	const rows = projectId
-		? await db.query.knowledgeCollections.findMany({
-				where: eq(knowledgeCollections.projectId, projectId),
-				orderBy: (c, { asc }) => [asc(c.name)],
-				limit: COLLECTION_LIST_MAX,
-			})
-		: await db.query.knowledgeCollections.findMany({
-				orderBy: (c, { asc }) => [asc(c.name)],
-				limit: COLLECTION_LIST_MAX,
-			});
+	const rows = await knowledgeReadStore.listCollections({
+		...(projectId !== undefined ? { projectId } : {}),
+		limit: COLLECTION_LIST_MAX,
+	});
 	// When a principal is supplied, hide collections they cannot read (don't leak
 	// existence of restricted collections). admin sees all.
 	if (!principal) return rows;
@@ -250,35 +226,26 @@ async function createCollection(input: {
 	ownerUserId?: string | null;
 }) {
 	const slug = input.slug ?? slugify(input.name);
-	const existing = await db.query.knowledgeCollections.findFirst({
-		where: input.projectId
-			? and(
-					eq(knowledgeCollections.projectId, input.projectId),
-					eq(knowledgeCollections.slug, slug),
-				)
-			: eq(knowledgeCollections.slug, slug),
+	const existing = await knowledgeReadStore.findCollectionBySlug({
+		projectId: input.projectId ?? null,
+		slug,
 	});
 	if (existing) throw new ValidationError(`Collection slug already exists: ${slug}`);
 
 	const id = generateId();
 	const now = nowIso();
 	try {
-		const [created] = await db
-			.insert(knowledgeCollections)
-			.values({
-				id,
-				name: input.name,
-				slug,
-				description: input.description ?? null,
-				projectId: input.projectId ?? null,
-				ownerUserId: input.ownerUserId ?? null,
-				createdAt: now,
-				updatedAt: now,
-			})
-			.returning();
-		return created;
+		return await knowledgeWriteStore.createCollection({
+			id,
+			name: input.name,
+			slug,
+			description: input.description ?? null,
+			projectId: input.projectId ?? null,
+			ownerUserId: input.ownerUserId ?? null,
+			now,
+		});
 	} catch (err) {
-		if (isUniqueConstraintError(err)) {
+		if (err instanceof WriteConflictError) {
 			throw new ValidationError(`Collection slug already exists: ${slug}`);
 		}
 		throw err;
@@ -286,9 +253,7 @@ async function createCollection(input: {
 }
 
 async function getCollection(id: string) {
-	const collection = await db.query.knowledgeCollections.findFirst({
-		where: eq(knowledgeCollections.id, id),
-	});
+	const collection = await knowledgeReadStore.getCollectionById(id);
 	if (!collection) throw new NotFoundError("Knowledge collection", id);
 	return collection;
 }
@@ -298,7 +263,7 @@ async function getCollection(id: string) {
 async function assertCanManageCollection(
 	id: string,
 	principal: Principal,
-): Promise<{ collection: typeof knowledgeCollections.$inferSelect; caps: PrincipalCaps }> {
+): Promise<{ collection: KnowledgeCollectionRow; caps: PrincipalCaps }> {
 	const collection = await getCollection(id);
 	const caps = await resolvePrincipalCaps(principal);
 	// Unreadable → NotFound (don't leak); readable-but-not-manager → Validation.
@@ -318,14 +283,12 @@ async function updateCollection(
 ) {
 	if (principal) await assertCanManageCollection(id, principal);
 	else await getCollection(id);
-	await db
-		.update(knowledgeCollections)
-		.set({
-			...(input.name !== undefined ? { name: input.name } : {}),
-			...(input.description !== undefined ? { description: input.description } : {}),
-			updatedAt: nowIso(),
-		})
-		.where(eq(knowledgeCollections.id, id));
+	await knowledgeWriteStore.updateCollectionFields({
+		collectionId: id,
+		...(input.name !== undefined ? { name: input.name } : {}),
+		...(input.description !== undefined ? { description: input.description } : {}),
+		now: nowIso(),
+	});
 	return getCollection(id);
 }
 
@@ -335,7 +298,7 @@ async function deleteCollection(id: string, principal?: Principal) {
 	const collection = principal
 		? (await assertCanManageCollection(id, principal)).collection
 		: await getCollection(id);
-	await db.delete(knowledgeCollections).where(eq(knowledgeCollections.id, id));
+	await knowledgeWriteStore.deleteCollection({ collectionId: id });
 	// Deleting a collection cascades to every entry in it — the single most destructive act on this
 	// surface, and reachable by a collection owner rather than admin only. Redacted as everywhere
 	// else: the gate (level name, tag ids) and the owner, never entry titles or content.
@@ -358,11 +321,9 @@ async function deleteCollection(id: string, principal?: Principal) {
 
 /** Verify a user id exists (transfer target must be a real user). */
 async function assertUserExists(userId: string): Promise<void> {
-	const row = await db.query.users.findFirst({
-		where: eq(users.id, userId),
-		columns: { id: true },
-	});
-	if (!row) throw new ValidationError(`User not found: ${userId}`);
+	if (!(await knowledgeReadStore.userExists(userId))) {
+		throw new ValidationError(`User not found: ${userId}`);
+	}
 }
 
 /**
@@ -386,10 +347,11 @@ async function transferCollectionOwner(
 		await assertUserExists(newOwnerUserId);
 	}
 	const previousOwnerUserId = (await getCollection(id)).ownerUserId ?? null;
-	await db
-		.update(knowledgeCollections)
-		.set({ ownerUserId: newOwnerUserId, updatedAt: nowIso() })
-		.where(eq(knowledgeCollections.id, id));
+	await knowledgeWriteStore.updateCollectionFields({
+		collectionId: id,
+		ownerUserId: newOwnerUserId,
+		now: nowIso(),
+	});
 	// Ownership is an ACL short-circuit, so this silently changed what both parties can see.
 	eventBus.emit({
 		type: "knowledge:owner_transferred",
@@ -420,54 +382,18 @@ const LIST_MAX_LIMIT = 200;
 
 const LIST_DEFAULT_LIMIT = 100;
 
-/** The only entry columns the dual-axis read gate needs (see `toAclEntry`). Narrower than
- *  ENTRY_LIST_COLUMNS: ACL filtering never renders a row, it only decides visibility, so it
- *  must not pull title/slug — let alone the currentContent blob — off disk for every
- *  candidate. Used by `filterReadable`, which every list and search response passes through. */
-const ENTRY_ACL_COLUMNS = {
-	id: true,
-	collectionId: true,
-	ownerUserId: true,
-	classificationLevel: true,
-	controlledTagsJson: true,
-	reviewTagsJson: true,
-} as const;
-
-/** The only collection columns the collection gate needs (see `toAclCollection`). */
-const COLLECTION_ACL_COLUMNS = {
-	id: true,
-	defaultLevel: true,
-	classificationLevel: true,
-	controlledTagsJson: true,
-	ownerUserId: true,
-} as const;
-
-/** Columns safe to return in list views — explicitly EXCLUDES the large
- *  currentContent / metadataJson blobs so they're never read off disk in bulk. */
-const ENTRY_LIST_COLUMNS = {
-	id: true,
-	collectionId: true,
-	title: true,
-	slug: true,
-	currentRevisionId: true,
-	tagsJson: true,
-	classificationLevel: true,
-	controlledTagsJson: true,
-	reviewTagsJson: true,
-	ownerUserId: true,
-	status: true,
-	createdAt: true,
-	updatedAt: true,
-} as const;
+// The column projections these reads use (ACL gate fields, list view, graph
+// endpoints) live with the read stores — `knowledge/sqlite-read-store.ts` and its
+// PostgreSQL twin — so the narrowing rule ("never the content blob on a list/filter
+// path") is stated once per backend instead of per call site.
 
 async function listEntries(opts: { collectionId?: string; tag?: string; limit?: number }) {
 	const limit = Math.min(opts.limit ?? LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT);
-	const rows = await db.query.knowledgeEntries.findMany({
-		where: opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
-		// SQL-layer column projection: the large currentContent/metadataJson blobs
-		// are never selected, so list views can't pull big bodies into the main thread.
-		columns: ENTRY_LIST_COLUMNS,
-		orderBy: (e, { desc: d }) => [d(e.updatedAt)],
+	// SQL-layer column projection happens in the read store: the large
+	// currentContent/metadataJson blobs are never selected, so list views can't pull
+	// big bodies into the main thread.
+	const rows = await knowledgeReadStore.listEntries({
+		...(opts.collectionId !== undefined ? { collectionId: opts.collectionId } : {}),
 		limit,
 	});
 	const tag = opts.tag;
@@ -478,18 +404,14 @@ async function getEntry(
 	id: string,
 	opts: { withContent?: boolean; principal?: Principal; projectId?: string } = {},
 ) {
-	const entry = await db.query.knowledgeEntries.findFirst({
-		where: eq(knowledgeEntries.id, id),
-	});
+	const entry = await knowledgeReadStore.getEntryById(id);
 	if (!entry) throw new NotFoundError("Knowledge entry", id);
 
 	// Project context is an independent boundary from user ACL. Admin/owner may
 	// bypass the knowledge ACL, but never another narrator's project context.
 	const collection =
 		opts.principal || opts.projectId
-			? await db.query.knowledgeCollections.findFirst({
-					where: eq(knowledgeCollections.id, entry.collectionId),
-				})
+			? await knowledgeReadStore.getCollectionById(entry.collectionId)
 			: undefined;
 	if (opts.projectId && collection?.projectId && collection.projectId !== opts.projectId) {
 		throw new NotFoundError("Knowledge entry", id);
@@ -547,12 +469,7 @@ async function createEntry(input: {
 	}
 
 	const slug = input.slug ?? slugify(input.title);
-	const dup = await db.query.knowledgeEntries.findFirst({
-		where: and(
-			eq(knowledgeEntries.collectionId, input.collectionId),
-			eq(knowledgeEntries.slug, slug),
-		),
-	});
+	const dup = await knowledgeReadStore.findEntryBySlug(input.collectionId, slug);
 	if (dup) throw new ValidationError(`Entry slug already exists in collection: ${slug}`);
 
 	const entryId = generateId();
@@ -563,48 +480,30 @@ async function createEntry(input: {
 	const keywords = normalizeKeywords(input.keywords);
 
 	try {
-		db.transaction((tx) => {
-			// Insert the entry first: revisions.entryId has an FK to entries, and
-			// entries.currentRevisionId has no FK (avoids a circular dependency), so this order
-			// satisfies both constraints.
-			tx.insert(knowledgeEntries)
-				.values({
-					id: entryId,
-					collectionId: input.collectionId,
-					title: input.title,
-					slug,
-					currentRevisionId: revisionId,
-					currentContent: content,
-					currentKeywords: keywordsMirror(keywords),
-					tagsJson: input.tags ?? [],
-					keywordsJson: keywords,
-					metadataJson: input.metadata ?? null,
-					// Default the owner to the creator so they retain read/write/review
-					// authority over their own entry without a separate grant.
-					ownerUserId: input.ownerUserId ?? input.authorUserId ?? null,
-					status: "active",
-					createdAt: now,
-					updatedAt: now,
-				})
-				.run();
-			tx.insert(knowledgeRevisions)
-				.values({
-					id: revisionId,
-					entryId,
-					version: 1,
-					format,
-					content,
-					contentHash: hashContent(content),
-					changeNote: input.changeNote ?? null,
-					authorUserId: input.authorUserId ?? null,
-					createdAt: now,
-				})
-				.run();
+		await knowledgeWriteStore.createEntryWithFirstRevision({
+			entryId,
+			revisionId,
+			collectionId: input.collectionId,
+			title: input.title,
+			slug,
+			content,
+			format,
+			contentHash: hashContent(content),
+			currentKeywords: keywordsMirror(keywords),
+			tagsJson: input.tags ?? [],
+			keywordsJson: keywords,
+			metadataJson: input.metadata ?? null,
+			// Default the owner to the creator so they retain read/write/review
+			// authority over their own entry without a separate grant.
+			ownerUserId: input.ownerUserId ?? input.authorUserId ?? null,
+			changeNote: input.changeNote ?? null,
+			authorUserId: input.authorUserId ?? null,
+			now,
 		});
 	} catch (err) {
 		// Lost the slug race between the pre-check and insert → surface as a clean
-		// validation error instead of a raw SQLite constraint failure.
-		if (isUniqueConstraintError(err)) {
+		// validation error instead of a raw constraint failure.
+		if (err instanceof WriteConflictError) {
 			throw new ValidationError(`Entry slug already exists in collection: ${slug}`);
 		}
 		throw err;
@@ -626,25 +525,23 @@ async function updateEntryMeta(
 ) {
 	await loadWritableEntry(id, principal);
 	const keywords = input.keywords !== undefined ? normalizeKeywords(input.keywords) : undefined;
-	await db
-		.update(knowledgeEntries)
-		.set({
-			...(input.title !== undefined ? { title: input.title } : {}),
-			...(input.tags !== undefined ? { tagsJson: input.tags } : {}),
-			...(keywords !== undefined
-				? { keywordsJson: keywords, currentKeywords: keywordsMirror(keywords) }
-				: {}),
-			...(input.metadata !== undefined ? { metadataJson: input.metadata } : {}),
-			...(input.status !== undefined ? { status: input.status } : {}),
-			updatedAt: nowIso(),
-		})
-		.where(eq(knowledgeEntries.id, id));
+	await knowledgeWriteStore.updateEntryMeta({
+		entryId: id,
+		...(input.title !== undefined ? { title: input.title } : {}),
+		...(input.tags !== undefined ? { tagsJson: input.tags } : {}),
+		...(keywords !== undefined
+			? { keywordsJson: keywords, currentKeywords: keywordsMirror(keywords) }
+			: {}),
+		...(input.metadata !== undefined ? { metadataJson: input.metadata } : {}),
+		...(input.status !== undefined ? { status: input.status } : {}),
+		now: nowIso(),
+	});
 	return getEntry(id, { withContent: true, principal });
 }
 
 async function deleteEntry(id: string, principal: Principal) {
 	await loadWritableEntry(id, principal);
-	await db.delete(knowledgeEntries).where(eq(knowledgeEntries.id, id));
+	await knowledgeWriteStore.deleteEntry({ entryId: id });
 	return { ok: true as const };
 }
 
@@ -657,15 +554,11 @@ async function deleteEntry(id: string, principal: Principal) {
 async function assertCanManageEntry(
 	id: string,
 	principal: Principal,
-): Promise<{ entry: typeof knowledgeEntries.$inferSelect; caps: PrincipalCaps }> {
-	const entry = await db.query.knowledgeEntries.findFirst({
-		where: eq(knowledgeEntries.id, id),
-	});
+): Promise<{ entry: KnowledgeEntryRow; caps: PrincipalCaps }> {
+	const entry = await knowledgeReadStore.getEntryById(id);
 	if (!entry) throw new NotFoundError("Knowledge entry", id);
 	const caps = await resolvePrincipalCaps(principal);
-	const collection = await db.query.knowledgeCollections.findFirst({
-		where: eq(knowledgeCollections.id, entry.collectionId),
-	});
+	const collection = await knowledgeReadStore.getCollectionById(entry.collectionId);
 	// Fail closed on a missing collection row (see getEntry): unverifiable gate, not a
 	// public one.
 	if (!collection) throw new NotFoundError("Knowledge entry", id);
@@ -699,17 +592,12 @@ async function transferEntryOwner(id: string, newOwnerUserId: string | null, pri
 	} else {
 		await assertUserExists(newOwnerUserId);
 	}
-	const previousOwnerUserId =
-		(
-			await db.query.knowledgeEntries.findFirst({
-				where: eq(knowledgeEntries.id, id),
-				columns: { ownerUserId: true },
-			})
-		)?.ownerUserId ?? null;
-	await db
-		.update(knowledgeEntries)
-		.set({ ownerUserId: newOwnerUserId, updatedAt: nowIso() })
-		.where(eq(knowledgeEntries.id, id));
+	const previousOwnerUserId = (await knowledgeReadStore.getEntryAclById(id))?.ownerUserId ?? null;
+	await knowledgeWriteStore.updateEntryAclFields({
+		entryId: id,
+		ownerUserId: newOwnerUserId,
+		now: nowIso(),
+	});
 	// Both parties' effective access just changed (owner is an ACL short-circuit).
 	eventBus.emit({
 		type: "knowledge:owner_transferred",
@@ -745,28 +633,18 @@ async function updateEntryAcl(
 	actor?: { userId?: string | null; role?: string | null },
 ) {
 	// BEFORE state for the audit diff. Classification + tags + owner only; no content.
-	const before = await db.query.knowledgeEntries.findFirst({
-		where: eq(knowledgeEntries.id, id),
-		columns: {
-			classificationLevel: true,
-			controlledTagsJson: true,
-			reviewTagsJson: true,
-			ownerUserId: true,
-		},
-	});
+	const before = await knowledgeReadStore.getEntryAclById(id);
 	await getEntry(id);
-	await db
-		.update(knowledgeEntries)
-		.set({
-			...(input.classificationLevel !== undefined
-				? { classificationLevel: input.classificationLevel }
-				: {}),
-			...(input.controlledTags !== undefined ? { controlledTagsJson: input.controlledTags } : {}),
-			...(input.reviewTags !== undefined ? { reviewTagsJson: input.reviewTags } : {}),
-			...(input.ownerUserId !== undefined ? { ownerUserId: input.ownerUserId } : {}),
-			updatedAt: nowIso(),
-		})
-		.where(eq(knowledgeEntries.id, id));
+	await knowledgeWriteStore.updateEntryAclFields({
+		entryId: id,
+		...(input.classificationLevel !== undefined
+			? { classificationLevel: input.classificationLevel }
+			: {}),
+		...(input.controlledTags !== undefined ? { controlledTagsJson: input.controlledTags } : {}),
+		...(input.reviewTags !== undefined ? { reviewTagsJson: input.reviewTags } : {}),
+		...(input.ownerUserId !== undefined ? { ownerUserId: input.ownerUserId } : {}),
+		now: nowIso(),
+	});
 	// Changing an entry's level or controlled tags changes who may read it — the single most
 	// audit-worthy operation in the knowledge base. Names/ids only, never the body.
 	recordKnowledgeAclEvent({
@@ -813,9 +691,7 @@ async function addRevision(
 		principal?: Principal;
 	},
 ) {
-	const entryRow = await db.query.knowledgeEntries.findFirst({
-		where: eq(knowledgeEntries.id, entryId),
-	});
+	const entryRow = await knowledgeReadStore.getEntryById(entryId);
 	if (!entryRow) throw new NotFoundError("Knowledge entry", entryId);
 
 	// Gate direct main writes. When a principal is supplied, enforce the COLLECTION READ
@@ -825,9 +701,7 @@ async function addRevision(
 	// (admin / entry owner / write grant via canWriteMain).
 	if (input.principal) {
 		const caps = await resolvePrincipalCaps(input.principal);
-		const collection = await db.query.knowledgeCollections.findFirst({
-			where: eq(knowledgeCollections.id, entryRow.collectionId),
-		});
+		const collection = await knowledgeReadStore.getCollectionById(entryRow.collectionId);
 		// Fail closed on a missing collection row (see getEntry).
 		if (!collection) throw new NotFoundError("Knowledge entry", entryId);
 		const aclCol = toAclCollection(collection);
@@ -849,47 +723,21 @@ async function addRevision(
 	const now = nowIso();
 	const format = input.format ?? "markdown";
 
-	// Compute the next version INSIDE the transaction so the MAX(version) read and
-	// the insert are atomic — two concurrent writers can't both pick the same
-	// version. The unique index (entry_id, version) is the last line of defence;
-	// withDbRetry handles the rare lost race by retrying with a fresh max.
-	const version = await withDbRetry(
-		async () =>
-			db.transaction((tx) => {
-				const row = tx
-					.select({ v: knowledgeRevisions.version })
-					.from(knowledgeRevisions)
-					.where(eq(knowledgeRevisions.entryId, entryId))
-					.orderBy(desc(knowledgeRevisions.version))
-					.limit(1)
-					.get();
-				const nextVersion = (row?.v ?? 0) + 1;
-				tx.insert(knowledgeRevisions)
-					.values({
-						id: revisionId,
-						entryId,
-						version: nextVersion,
-						format,
-						content: input.content,
-						contentHash: hashContent(input.content),
-						changeNote: input.changeNote ?? null,
-						authorUserId: input.authorUserId ?? null,
-						baseRevisionId: null,
-						createdAt: now,
-					})
-					.run();
-				tx.update(knowledgeEntries)
-					.set({
-						currentRevisionId: revisionId,
-						currentContent: input.content,
-						updatedAt: now,
-					})
-					.where(eq(knowledgeEntries.id, entryId))
-					.run();
-				return nextVersion;
-			}),
-		{ label: "knowledge.addRevision", maxRetries: 5 },
-	);
+	// The version is claimed by the write store under the entry row's allocation
+	// authority (see knowledge/revision-version.ts): SQLite claims MAX(version)+1
+	// inside the same single-writer transaction; PostgreSQL takes the entry row lock
+	// first. Neither backend performs an unguarded check-then-insert, so two
+	// concurrent writers can't both pick the same version.
+	const { version } = await knowledgeWriteStore.appendRevision({
+		entryId,
+		revisionId,
+		content: input.content,
+		format,
+		contentHash: hashContent(input.content),
+		changeNote: input.changeNote ?? null,
+		authorUserId: input.authorUserId ?? null,
+		now,
+	});
 
 	// Post-commit: main moved, so anyone else holding an active personal version of this entry is
 	// now based on a stale revision. They previously had no way to learn this without opening the
@@ -913,32 +761,11 @@ async function listRevisions(entryId: string, principal: Principal, opts: { limi
 	// Enforces dual-axis read ACL on the parent entry (throws NotFound if unreadable).
 	await loadReadableEntry(entryId, principal);
 	const limit = Math.min(opts.limit ?? LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT);
-	return db.query.knowledgeRevisions.findMany({
-		where: eq(knowledgeRevisions.entryId, entryId),
-		columns: {
-			id: true,
-			entryId: true,
-			version: true,
-			format: true,
-			contentHash: true,
-			changeNote: true,
-			authorUserId: true,
-			authorNarratorId: true,
-			baseRevisionId: true,
-			createdAt: true,
-		},
-		extras: (r, { sql }) => ({
-			contentLength: sql<number>`length(${r.content})`.as("content_length"),
-		}),
-		orderBy: [desc(knowledgeRevisions.version)],
-		limit,
-	});
+	return knowledgeReadStore.listRevisionMeta(entryId, limit);
 }
 
 async function getRevision(revisionId: string, principal: Principal) {
-	const rev = await db.query.knowledgeRevisions.findFirst({
-		where: eq(knowledgeRevisions.id, revisionId),
-	});
+	const rev = await knowledgeReadStore.getRevisionById(revisionId);
 	if (!rev) throw new NotFoundError("Knowledge revision", revisionId);
 	// A revision is only readable if its parent entry is readable. Enforce ACL on
 	// the entry; unreadable → NotFound (don't leak the revision's existence/content).
@@ -950,35 +777,21 @@ async function getRevision(revisionId: string, principal: Principal) {
 // Search (FTS5 with LIKE fallback for short queries)
 // ═══════════════════════════════════════════════════════════════════════
 
-interface EntryRow {
-	id: string;
-	collection_id: string;
-	title: string;
-	slug: string;
-	tags_json: string | null;
-	status: string;
-	created_at: string;
-	updated_at: string;
-	snippet?: string;
-	/** Set by the draft search branch — this row reflects the caller's own draft. */
-	fromDraft?: boolean;
-	/** Set by the draft search branch — 1 when the draft's fork point is behind main. */
-	drifted?: number | boolean;
-}
-
-function mapRow(row: EntryRow) {
+function mapRow(row: KnowledgeSearchRow) {
 	return {
 		id: row.id,
-		collectionId: row.collection_id,
+		collectionId: row.collectionId,
 		title: row.title,
 		slug: row.slug,
-		tags: parseTags(row.tags_json ? JSON.parse(row.tags_json) : []),
+		// Tags stay encoded across the search port and are parsed here, so a row reached
+		// through search reports the same tags as a row reached any other way.
+		tags: parseTags(row.tagsJson ? JSON.parse(row.tagsJson) : []),
 		status: row.status,
-		createdAt: row.created_at,
-		updatedAt: row.updated_at,
-		snippet: row.snippet ?? "",
-		fromDraft: row.fromDraft ?? false,
-		drifted: !!row.drifted,
+		createdAt: row.createdAt,
+		updatedAt: row.updatedAt,
+		snippet: row.snippet,
+		fromDraft: row.fromDraft,
+		drifted: row.drifted,
 	};
 }
 
@@ -990,34 +803,6 @@ const SHORT_QUERY_FALLBACK_LIMIT = 50;
 const ACTIVE_DRAFT_STATUS = "active";
 /** Hard cap on how many of a user's drafts participate in a single shadowed search. */
 const DRAFT_SHADOW_MAX = 200;
-
-/** Whether a sanitized query can use the trigram FTS index.
- *  The trigram tokenizer requires ≥3 characters to form a token — this holds
- *  for CJK too (verified: 2 Han chars never match trigram FTS). Shorter queries
- *  must use the LIKE fallback. */
-function canUseFts(safe: string): boolean {
-	return safe.length >= 3;
-}
-
-/** Entry ids the given user has an ACTIVE draft on — these get shadowed by the draft. */
-function activeDraftEntryIds(draftUserId: string): string[] {
-	const rows = sqlite
-		.prepare(
-			`SELECT DISTINCT entry_id FROM knowledge_drafts
-			 WHERE author_user_id = ? AND status = ? AND entry_id IS NOT NULL
-			 LIMIT ?`,
-		)
-		.all(draftUserId, ACTIVE_DRAFT_STATUS, DRAFT_SHADOW_MAX) as { entry_id: string }[];
-	return rows.map((r) => r.entry_id);
-}
-
-/** Build `AND e.id NOT IN (?,?,…)` + its bound params. Empty set → no clause, no params.
- *  The ids are bound as positional params (never interpolated) to prevent injection. */
-function buildExcludeClause(excludeEntryIds: string[]): { clause: string; params: string[] } {
-	if (excludeEntryIds.length === 0) return { clause: "", params: [] };
-	const placeholders = excludeEntryIds.map(() => "?").join(",");
-	return { clause: `AND e.id NOT IN (${placeholders})`, params: excludeEntryIds };
-}
 
 type SearchOpts = {
 	q?: string;
@@ -1033,153 +818,67 @@ type SearchOpts = {
 	draftUserId?: string;
 };
 
-/** Search the MAIN (committed) versions, optionally excluding shadowed entries. */
-function searchMain(
-	opts: SearchOpts,
-	limit: number,
-	projectClause: string,
-	excludeEntryIds: string[],
-): EntryRow[] {
-	const query = (opts.q ?? "").trim();
-	const safe = sanitizeQuery(query);
-	const { clause: excludeClause, params: excludeParams } = buildExcludeClause(excludeEntryIds);
-
-	if (canUseFts(safe)) {
-		const ftsQuery = buildFtsQuery(safe, opts.match ?? "and", opts.field);
-		const params: (string | number | null)[] = [
-			ftsQuery,
-			opts.collectionId ?? null,
-			opts.collectionId ?? null,
-		];
-		if (opts.projectId) params.push(opts.projectId);
-		params.push(...excludeParams);
-		params.push(limit);
-		return sqlite
-			.prepare(
-				`SELECT e.id, e.collection_id, e.title, e.slug, e.tags_json, e.status,
-				  e.created_at, e.updated_at,
-				  snippet(knowledge_entries_fts, 1, '[', ']', '...', 96) as snippet
-				 FROM knowledge_entries_fts
-				 JOIN knowledge_entries e ON e.rowid = knowledge_entries_fts.rowid
-				 WHERE knowledge_entries_fts MATCH ?
-				   AND (? IS NULL OR e.collection_id = ?)
-				   ${projectClause}
-				   ${excludeClause}
-				 ORDER BY rank LIMIT ?`,
-			)
-			.all(...params) as EntryRow[];
-	}
-
-	// Short-query fallback (1-2 chars, e.g. a 2-character CJK term that the trigram index
-	// can't tokenize). Matches with a TIGHT limit so the unindexed scan can't run away on
-	// the main thread. When field is restricted (passive injection → "current_keywords"),
-	// only that column is matched so body text never triggers a hit.
-	const fallbackLimit = Math.min(limit, SHORT_QUERY_FALLBACK_LIMIT);
-	const like = `%${escapeLike(query)}%`;
-	const matchExpr =
-		opts.field === "current_keywords"
-			? `e.current_keywords LIKE ? ESCAPE '\\'`
-			: `e.title LIKE ? ESCAPE '\\' OR e.current_content LIKE ? ESCAPE '\\'`;
-	const params: (string | number | null)[] = [query];
-	// One LIKE param for the keyword-only column, two for the title+content default.
-	if (opts.field === "current_keywords") params.push(like);
-	else params.push(like, like);
-	params.push(opts.collectionId ?? null, opts.collectionId ?? null);
-	if (opts.projectId) params.push(opts.projectId);
-	params.push(...excludeParams);
-	params.push(fallbackLimit);
-	return sqlite
-		.prepare(
-			`SELECT e.id, e.collection_id, e.title, e.slug, e.tags_json, e.status,
-			  e.created_at, e.updated_at,
-			  substr(COALESCE(e.current_content, e.title), 1, 240) as snippet
-			 FROM knowledge_entries e
-			 WHERE (? = '' OR ${matchExpr})
-			   AND (? IS NULL OR e.collection_id = ?)
-			   ${projectClause}
-			   ${excludeClause}
-			 ORDER BY e.updated_at DESC LIMIT ?`,
-		)
-		.all(...params) as EntryRow[];
+/**
+ * The two needles a knowledge search carries, and which retrieval path it takes.
+ *
+ * The two differ on purpose and always have: the index path matches the SANITIZED query,
+ * while the substring path matches the caller's TRIMMED RAW query, so a term containing an
+ * FTS operator still matches literally there. Deriving both in one place keeps that
+ * distinction from being re-decided (differently) in each branch.
+ *
+ * The substring path also takes a TIGHTER limit, because it is unindexed and runs on the main
+ * thread — an unbounded contains-scan is exactly the shape the performance rules forbid.
+ */
+function searchNeedles(opts: SearchOpts, limit: number) {
+	const raw = (opts.q ?? "").trim();
+	const safe = sanitizeQuery(raw);
+	const strategy: SearchStrategy = canUseIndex(safe) ? "index" : "substring";
+	return {
+		indexText: safe,
+		substringText: raw,
+		strategy,
+		limit: strategy === "index" ? limit : Math.min(limit, SHORT_QUERY_FALLBACK_LIMIT),
+	};
 }
 
-/** Search the caller's own ACTIVE drafts (title de-normalized + content). Rows are tagged
- *  fromDraft. JOINs the FTS rowid back to knowledge_drafts.rowid, then to the parent entry. */
-function searchDrafts(
+/** Search the MAIN (committed) versions, optionally excluding shadowed entries. */
+async function searchMain(
+	opts: SearchOpts,
+	limit: number,
+	excludeEntryIds: string[],
+): Promise<KnowledgeSearchRow[]> {
+	return searchStore.searchKnowledgeEntries({
+		...searchNeedles(opts, limit),
+		collectionId: opts.collectionId,
+		projectId: opts.projectId,
+		match: opts.match ?? "and",
+		field: opts.field,
+		excludeEntryIds,
+	});
+}
+
+/** Search the caller's own ACTIVE drafts (title de-normalized + content). Rows come back
+ *  tagged `fromDraft`, with `drifted` set when the draft's base revision is behind main. */
+async function searchDrafts(
 	opts: SearchOpts,
 	draftUserId: string,
 	limit: number,
-	projectClause: string,
-): EntryRow[] {
-	const query = (opts.q ?? "").trim();
-	const safe = sanitizeQuery(query);
-	let rows: EntryRow[];
-
-	if (canUseFts(safe)) {
-		const ftsQuery = buildFtsQuery(safe, opts.match ?? "and");
-		const params: (string | number | null)[] = [
-			ftsQuery,
-			draftUserId,
-			ACTIVE_DRAFT_STATUS,
-			opts.collectionId ?? null,
-			opts.collectionId ?? null,
-		];
-		if (opts.projectId) params.push(opts.projectId);
-		params.push(limit);
-		rows = sqlite
-			.prepare(
-				`SELECT e.id, e.collection_id, e.title, e.slug, e.tags_json, e.status,
-				  e.created_at, e.updated_at,
-				  (d.base_revision_id IS NOT NULL AND d.base_revision_id != e.current_revision_id) as drifted,
-				  snippet(knowledge_drafts_fts, 1, '[', ']', '...', 96) as snippet
-				 FROM knowledge_drafts_fts
-				 JOIN knowledge_drafts d ON d.rowid = knowledge_drafts_fts.rowid
-				 JOIN knowledge_entries e ON e.id = d.entry_id
-				 WHERE knowledge_drafts_fts MATCH ?
-				   AND d.author_user_id = ?
-				   AND d.status = ?
-				   AND (? IS NULL OR e.collection_id = ?)
-				   ${projectClause}
-				 ORDER BY rank LIMIT ?`,
-			)
-			.all(...params) as EntryRow[];
-	} else {
-		const fallbackLimit = Math.min(limit, SHORT_QUERY_FALLBACK_LIMIT);
-		const like = `%${escapeLike(query)}%`;
-		const params: (string | number | null)[] = [
-			query,
-			like,
-			like,
-			draftUserId,
-			ACTIVE_DRAFT_STATUS,
-			opts.collectionId ?? null,
-			opts.collectionId ?? null,
-		];
-		if (opts.projectId) params.push(opts.projectId);
-		params.push(fallbackLimit);
-		rows = sqlite
-			.prepare(
-				`SELECT e.id, e.collection_id, e.title, e.slug, e.tags_json, e.status,
-				  e.created_at, e.updated_at,
-				  (d.base_revision_id IS NOT NULL AND d.base_revision_id != e.current_revision_id) as drifted,
-				  substr(COALESCE(d.content, e.title), 1, 240) as snippet
-				 FROM knowledge_drafts d
-				 JOIN knowledge_entries e ON e.id = d.entry_id
-				 WHERE (? = '' OR e.title LIKE ? ESCAPE '\\' OR d.content LIKE ? ESCAPE '\\')
-				   AND d.author_user_id = ?
-				   AND d.status = ?
-				   AND (? IS NULL OR e.collection_id = ?)
-				   ${projectClause}
-				 ORDER BY d.updated_at DESC LIMIT ?`,
-			)
-			.all(...params) as EntryRow[];
-	}
-	for (const r of rows) r.fromDraft = true;
-	return rows;
+): Promise<KnowledgeSearchRow[]> {
+	return searchStore.searchKnowledgeDrafts({
+		...searchNeedles(opts, limit),
+		collectionId: opts.collectionId,
+		projectId: opts.projectId,
+		match: opts.match ?? "and",
+		authorUserId: draftUserId,
+		draftStatus: ACTIVE_DRAFT_STATUS,
+	});
 }
 
-function parseStringArrayJson(raw: string | null): string[] {
-	if (!raw) return [];
+function parseStringArrayJson(raw: unknown): string[] {
+	if (Array.isArray(raw)) {
+		return raw.filter((value): value is string => typeof value === "string");
+	}
+	if (typeof raw !== "string" || !raw) return [];
 	try {
 		const parsed = JSON.parse(raw);
 		return Array.isArray(parsed)
@@ -1200,43 +899,21 @@ function parseStringArrayJson(raw: string | null): string[] {
 const KEYWORD_INJECTION_CANDIDATE_LIMIT = 5000;
 
 function listKeywordInjectionCandidates(opts: { collectionId?: string; projectId?: string } = {}) {
-	const projectClause = opts.projectId
-		? `AND e.collection_id IN (
-				SELECT id FROM knowledge_collections WHERE project_id = ? OR project_id IS NULL
-			)`
-		: "";
-	const params: (string | number | null)[] = [opts.collectionId ?? null, opts.collectionId ?? null];
-	if (opts.projectId) params.push(opts.projectId);
-	params.push(KEYWORD_INJECTION_CANDIDATE_LIMIT);
-	const rows = sqlite
-		.prepare(
-			`SELECT e.id, e.collection_id, e.title, e.current_revision_id, e.tags_json, e.keywords_json, e.updated_at
-			 FROM knowledge_entries e
-			 WHERE e.status = 'active'
-			   AND e.current_keywords IS NOT NULL
-			   AND (? IS NULL OR e.collection_id = ?)
-			   ${projectClause}
-			 ORDER BY e.updated_at DESC LIMIT ?`,
-		)
-		.all(...params) as {
-		id: string;
-		collection_id: string;
-		title: string;
-		tags_json: string | null;
-		keywords_json: string | null;
-		updated_at: string;
-		current_revision_id: string | null;
-	}[];
+	const rows = synchronousKnowledgeInjectionReads().listKeywordInjectionCandidates({
+		...(opts.collectionId !== undefined ? { collectionId: opts.collectionId } : {}),
+		...(opts.projectId !== undefined ? { projectId: opts.projectId } : {}),
+		limit: KEYWORD_INJECTION_CANDIDATE_LIMIT,
+	});
 
 	return rows
 		.map((row) => ({
 			id: row.id,
-			collectionId: row.collection_id,
+			collectionId: row.collectionId,
 			title: row.title,
-			entryRevisionId: row.current_revision_id,
-			tags: parseStringArrayJson(row.tags_json),
-			keywords: parseStringArrayJson(row.keywords_json),
-			updatedAt: row.updated_at,
+			entryRevisionId: row.currentRevisionId,
+			tags: parseStringArrayJson(row.tagsJson),
+			keywords: parseStringArrayJson(row.keywordsJson),
+			updatedAt: row.updatedAt,
 		}))
 		.filter((row) => row.keywords.length > 0);
 }
@@ -1253,24 +930,10 @@ function listKeywordInjectionCandidates(opts: { collectionId?: string; projectId
 function keywordInjectionCandidatesSignature(
 	opts: { collectionId?: string; projectId?: string } = {},
 ): string {
-	const projectClause = opts.projectId
-		? `AND e.collection_id IN (
-				SELECT id FROM knowledge_collections WHERE project_id = ? OR project_id IS NULL
-			)`
-		: "";
-	const params: (string | null)[] = [opts.collectionId ?? null, opts.collectionId ?? null];
-	if (opts.projectId) params.push(opts.projectId);
-	const row = sqlite
-		.prepare(
-			`SELECT COUNT(*) as cnt, COALESCE(MAX(e.updated_at), '') as max_updated
-			 FROM knowledge_entries e
-			 WHERE e.status = 'active'
-			   AND e.current_keywords IS NOT NULL
-			   AND (? IS NULL OR e.collection_id = ?)
-			   ${projectClause}`,
-		)
-		.get(...params) as { cnt: number; max_updated: string };
-	return `${row.cnt}:${row.max_updated}`;
+	return synchronousKnowledgeInjectionReads().keywordInjectionCandidatesSignature({
+		...(opts.collectionId !== undefined ? { collectionId: opts.collectionId } : {}),
+		...(opts.projectId !== undefined ? { projectId: opts.projectId } : {}),
+	});
 }
 
 /** Fetch bounded snippets only for final injected hits, avoiding large-field reads in the scan. */
@@ -1289,13 +952,7 @@ function snippetsByEntryIds(entryIds: string[]): Map<string, string> {
 	const out = new Map<string, string>();
 	const ids = entryIds.slice(0, SNIPPETS_LOOKUP_MAX);
 	if (ids.length === 0) return out;
-	const placeholders = ids.map(() => "?").join(",");
-	const rows = sqlite
-		.prepare(
-			`SELECT id, substr(COALESCE(current_content, title), 1, ${SNIPPET_SOURCE_CHARS}) as snippet
-			 FROM knowledge_entries WHERE id IN (${placeholders})`,
-		)
-		.all(...ids) as { id: string; snippet: string | null }[];
+	const rows = synchronousKnowledgeInjectionReads().snippetsByEntryIds(ids, SNIPPET_SOURCE_CHARS);
 	for (const row of rows) out.set(row.id, row.snippet ?? "");
 	return out;
 }
@@ -1303,13 +960,8 @@ function snippetsByEntryIds(entryIds: string[]): Map<string, string> {
 type KnowledgeInjectionSource = "user_message" | "tool_output" | "system_continuation";
 
 function listInjectedEntryIds(narratorId: string, compactSeq: number): Set<string> {
-	const rows = sqlite
-		.prepare(
-			`SELECT entry_id FROM knowledge_injection_events
-			 WHERE narrator_id = ? AND compact_seq = ?`,
-		)
-		.all(narratorId, compactSeq) as { entry_id: string }[];
-	return new Set(rows.map((row) => row.entry_id));
+	const ids = synchronousKnowledgeInjectionReads().listInjectedEntryIds(narratorId, compactSeq);
+	return new Set(ids);
 }
 
 function recordInjectionEvents(input: {
@@ -1325,49 +977,51 @@ function recordInjectionEvents(input: {
 	}>;
 }): void {
 	if (input.hits.length === 0) return;
-	const now = nowIso();
-	const stmt = sqlite.prepare(
-		`INSERT OR IGNORE INTO knowledge_injection_events
-		 (id, narrator_id, compact_seq, entry_id, entry_revision_id, source,
-		  trigger_message_id, trigger_tool_call_id, summary, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-	);
-	const tx = sqlite.transaction(() => {
-		for (const hit of input.hits) {
-			stmt.run(
-				generateId(),
-				input.narratorId,
-				input.compactSeq,
-				hit.entryId,
-				hit.entryRevisionId ?? null,
-				input.source,
-				input.triggerMessageId ?? null,
-				input.triggerToolCallId ?? null,
-				hit.summary ?? null,
-				now,
-			);
-		}
-	});
-	tx();
+	// Not awaited ON PURPOSE: the SQLite store executes its section synchronously
+	// inside the call, so the rows are durable before this returns (the historical
+	// contract the agent-runtime callers rely on), and the Promise only shapes the
+	// boundary. The dedupe on (narrator, compact_seq, entry) is ON CONFLICT DO
+	// NOTHING — the portable spelling both backends share.
+	//
+	// Failures are logged, never thrown: before the port this function threw
+	// synchronously and every caller swallowed the error into a warn — recording
+	// must not fail the turn it describes. With the store being Promise-shaped the
+	// swallow moves here so an un-awaited rejection can never crash the process.
+	void knowledgeWriteStore
+		.recordInjectionEvents({
+			narratorId: input.narratorId,
+			compactSeq: input.compactSeq,
+			source: input.source,
+			triggerMessageId: input.triggerMessageId ?? null,
+			triggerToolCallId: input.triggerToolCallId ?? null,
+			now: nowIso(),
+			hits: input.hits.map((hit) => ({
+				id: generateId(),
+				entryId: hit.entryId,
+				entryRevisionId: hit.entryRevisionId ?? null,
+				summary: hit.summary ?? null,
+			})),
+		})
+		.catch((err) => {
+			logger.warn("Failed to record knowledge injection events", {
+				narratorId: input.narratorId,
+				error: String(err),
+			});
+		});
 }
 
-function search(opts: SearchOpts) {
+async function search(opts: SearchOpts) {
 	const limit = Math.min(opts.limit ?? 30, SEARCH_MAX_LIMIT);
 
-	// Project-isolation clause: when a projectId is given, restrict entries to
-	// collections belonging to that project OR global collections (project_id IS NULL).
-	// Keeps a narrator from surfacing knowledge scoped to OTHER projects.
-	const projectClause = opts.projectId
-		? `AND e.collection_id IN (
-				SELECT id FROM knowledge_collections WHERE project_id = ? OR project_id IS NULL
-			)`
-		: "";
+	// Project isolation (`opts.projectId`) is applied by the search backend: entries are
+	// restricted to that project's collections plus global ones, which keeps a narrator from
+	// surfacing knowledge scoped to OTHER projects.
 
 	// No draft context → plain main-version search. A column-restricted match (field) also
 	// forces the main-only path: the drafts FTS has no matching column and personal drafts
 	// should not shadow searches over main-version-only indexes.
 	if (!opts.draftUserId || opts.field) {
-		const rows = searchMain(opts, limit, projectClause, []);
+		const rows = await searchMain(opts, limit, []);
 		const mapped = rows.map(mapRow);
 		const tag = opts.tag;
 		return tag ? mapped.filter((r) => r.tags.includes(tag)) : mapped;
@@ -1376,20 +1030,24 @@ function search(opts: SearchOpts) {
 	// Working-copy view: the caller's active drafts shadow the main version. The shadowed
 	// set (their draft entry ids) is excluded from the main search and supplied by the draft
 	// search instead — the two sets are identical, so the results never overlap (no dedup).
-	const shadowedEntryIds = activeDraftEntryIds(opts.draftUserId);
+	const shadowedEntryIds = await searchStore.listShadowedEntryIds({
+		authorUserId: opts.draftUserId,
+		draftStatus: ACTIVE_DRAFT_STATUS,
+		limit: DRAFT_SHADOW_MAX,
+	});
 
 	// Fast path: the user has no active drafts → nothing to shadow. Fall back to the plain
 	// main-version search (one cheap indexed lookup above instead of a second FTS query).
 	// This keeps the hot passive-injection path cheap for the common no-draft case.
 	if (shadowedEntryIds.length === 0) {
-		const rows = searchMain(opts, limit, projectClause, []);
+		const rows = await searchMain(opts, limit, []);
 		const mapped = rows.map(mapRow);
 		const tag = opts.tag;
 		return tag ? mapped.filter((r) => r.tags.includes(tag)) : mapped;
 	}
 
-	const draftRows = searchDrafts(opts, opts.draftUserId, limit, projectClause);
-	const mainRows = searchMain(opts, limit, projectClause, shadowedEntryIds);
+	const draftRows = await searchDrafts(opts, opts.draftUserId, limit);
+	const mainRows = await searchMain(opts, limit, shadowedEntryIds);
 
 	// Draft hits first, then main hits; truncate to the caller's limit.
 	const mapped = [...draftRows, ...mainRows].map(mapRow);
@@ -1426,18 +1084,13 @@ async function filterReadable<T extends { id: string; collectionId?: string }>(
 	// Batch-load the entries (with ACL fields) + their collections' default levels.
 	const ids = rows.map((r) => r.id);
 	if (ids.length === 0) return rows;
-	const entries = await db.query.knowledgeEntries.findMany({
-		where: (e, { inArray }) => inArray(e.id, ids),
-		// ACL-only projection: this runs on every list/search response, so it must not read
-		// the currentContent blob (or any render field) just to decide visibility.
-		columns: ENTRY_ACL_COLUMNS,
-	});
+	// ACL-only projections in the read store: this runs on every list/search response,
+	// so it must not read the currentContent blob (or any render field) just to decide
+	// visibility.
+	const entries = await knowledgeReadStore.getEntriesAclByIds(ids);
 	const entryById = new Map(entries.map((e) => [e.id, e]));
 	const colIds = [...new Set(entries.map((e) => e.collectionId))];
-	const cols = await db.query.knowledgeCollections.findMany({
-		where: (c, { inArray }) => inArray(c.id, colIds),
-		columns: COLLECTION_ACL_COLUMNS,
-	});
+	const cols = await knowledgeReadStore.getCollectionsAclByIds(colIds);
 	// Cache the FULL collection row (not just defaultLevel) so the collection gate
 	// in canRead has classificationLevel / controlledTags / owner — otherwise the
 	// gate silently degrades to public (iron rule A).
@@ -1457,6 +1110,42 @@ async function filterReadable<T extends { id: string; collectionId?: string }>(
 	}
 	return out;
 }
+
+/** Promise-shaped injection seam. The legacy synchronous API remains for the
+ * narrator/runtime callers not yet migrated; these methods always follow the live
+ * read binding and are usable on both engines. */
+export const knowledgeInjectionReads = {
+	async listKeywordInjectionCandidates(opts: { collectionId?: string; projectId?: string } = {}) {
+		const rows = await knowledgeReadStore.listKeywordInjectionCandidates({
+			...opts,
+			limit: KEYWORD_INJECTION_CANDIDATE_LIMIT,
+		});
+		return rows
+			.map((row) => ({
+				id: row.id,
+				collectionId: row.collectionId,
+				title: row.title,
+				entryRevisionId: row.currentRevisionId,
+				tags: parseStringArrayJson(row.tagsJson),
+				keywords: parseStringArrayJson(row.keywordsJson),
+				updatedAt: row.updatedAt,
+			}))
+			.filter((row) => row.keywords.length > 0);
+	},
+	keywordInjectionCandidatesSignature(opts: { collectionId?: string; projectId?: string } = {}) {
+		return knowledgeReadStore.keywordInjectionCandidatesSignature(opts);
+	},
+	async snippetsByEntryIds(ids: string[]) {
+		const rows = await knowledgeReadStore.snippetsByEntryIds(
+			ids.slice(0, SNIPPETS_LOOKUP_MAX),
+			SNIPPET_SOURCE_CHARS,
+		);
+		return new Map(rows.map((row) => [row.id, row.snippet ?? ""]));
+	},
+	async listInjectedEntryIds(narratorId: string, compactSeq: number) {
+		return new Set(await knowledgeReadStore.listInjectedEntryIds(narratorId, compactSeq));
+	},
+};
 
 export const knowledgeService = {
 	listCollections,

@@ -1,33 +1,73 @@
+/**
+ * Exporting the main database into each project's portable `project.db` archive.
+ *
+ * WHAT CHANGED IN PHASE 2
+ * -----------------------
+ * The main-database reads now go through `ProjectArchiveMainStore` (`project-archive/`), and the
+ * archive writes through `ArchiveTableWriter`. What that replaced was ten hand-maintained
+ * positional `INSERT` statements — 38 placeholders for `narrators`, 36 for `narrator_messages` —
+ * each paired with a hand-ordered array of Drizzle row fields. Nothing checked that the two
+ * lists lined up, so inserting a column in the middle of one and appending it to the other
+ * type-checks, formats, runs, and silently stores every subsequent value in the wrong column.
+ * The old snapshot test had to assert an unrelated `merge_commit_sha` was still null purely to
+ * catch that class of drift.
+ *
+ * Column list and value list are now derived from the same column-keyed row, so they cannot
+ * disagree. The archive FORMAT is unchanged: same tables, same columns, same
+ * `INSERT OR REPLACE`, same delete-then-insert scopes, same debounce.
+ *
+ * READS ARE PAGED
+ * ---------------
+ * Rows are read one page at a time, so peak memory is one page rather than a whole table. That
+ * matters for `narrator_messages`, whose `content_json` holds full conversation content; the
+ * predecessor of this code built arrays of every matching row of every table first.
+ *
+ * A REPLACEMENT IS ATOMIC ON THE ARCHIVE SIDE — VIA STAGING, NOT VIA A HELD TRANSACTION
+ * ------------------------------------------------------------------------------------
+ * Every delete-then-insert here goes through `replaceTables`, which stages the paged rows in a
+ * TEMP table and then runs the DELETEs and the load in ONE synchronous archive transaction. A
+ * reader of the portable file therefore sees the complete previous contents or the complete new
+ * ones, and a failure at any point (an unreadable page, a rejected row, cancellation, timeout)
+ * leaves the archive exactly as it was.
+ *
+ * That mechanism is what the paging forced. A `bun:sqlite` transaction commits when its callback
+ * RETURNS, so it cannot be held across the `await` between two pages — writing page-by-page
+ * inside "one transaction" would in fact commit the DELETE by itself and leave the refill
+ * unprotected.
+ *
+ * WHAT IS STILL NOT ATOMIC, STATED PLAINLY
+ * ----------------------------------------
+ * Two databases cannot be one transaction, and `fullSync` performs SEVERAL replacements
+ * (chapters, edges, each narrator's conversation, …). An export interrupted between them leaves
+ * earlier scopes replaced and later ones stale — each internally whole, never half-replaced. The
+ * main database is only ever read. That residue is acceptable for the reason it always was: the
+ * archive is a backup the next `fullSync` replaces wholesale, and every sync path here is
+ * best-effort by design (a failed archive write must never fail the user operation that
+ * triggered it).
+ */
 import type { Database } from "bun:sqlite";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { eq, inArray } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { db } from "../db";
-import {
-	chapterCommits,
-	chapterEdges,
-	chapters,
-	explorationGroups,
-	mergeSessions,
-	narratorMessageRefs,
-	narratorMessages,
-	narrators,
-	narratorToolCalls,
-	projects,
-} from "../db/schema";
+import { chapters, explorationGroups, mergeSessions, narrators } from "../db/schema";
 import type { NarraForkEvent } from "../lib/event-bus";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { projectDbManager } from "../lib/project-db";
+import {
+	copyTable,
+	distinctIds,
+	type ExportControl,
+	exportDeadline,
+	type ReplaceScope,
+	readAllRows,
+	replaceTables,
+} from "./project-archive/export-rows";
+import type { ArchiveTable } from "./project-archive/manifest";
+import { projectArchiveMainStore as mainStore } from "./project-archive/store";
 
 // === Helpers ===
-
-/** Stringify a value for SQLite TEXT column (JSON fields). */
-function jsonCol(val: unknown): string | null {
-	if (val == null) return null;
-	if (typeof val === "string") return val;
-	return JSON.stringify(val);
-}
 
 /** Get the projectId for a chapter. */
 async function projectIdForChapter(chapterId: string): Promise<string | null> {
@@ -68,248 +108,113 @@ async function getProjectDb(projectId: string): Promise<Database | null> {
 	}
 }
 
+/**
+ * APPEND the rows of one archive table matching `column IN values`.
+ *
+ * For scopes that only add or overwrite by primary key. Anything that must also REMOVE what the
+ * archive holds goes through {@link replaceById} instead, so the delete and the refill land in
+ * one commit.
+ */
+async function copyById(
+	pdb: Database,
+	table: ArchiveTable,
+	column: string,
+	values: readonly string[],
+	control: ExportControl = {},
+): Promise<number> {
+	const { rows } = await copyTable(mainStore, pdb, table, {
+		filter: { column, values },
+		...control,
+	});
+	return rows;
+}
+
+/** REPLACE one scope atomically: `clear` and the refilled rows share a single commit. */
+async function replaceById(
+	pdb: Database,
+	table: ArchiveTable,
+	column: string,
+	values: readonly string[],
+	clear: readonly { sql: string; params?: (string | number | null)[] }[],
+	control: ExportControl = {},
+): Promise<number> {
+	const { rows } = await replaceTables(
+		mainStore,
+		pdb,
+		[{ table, filter: { column, values }, clear }],
+		control,
+	);
+	return rows[0] ?? 0;
+}
+
 // === Sync functions ===
 
 /** Sync a single project record. */
 async function syncProject(projectId: string): Promise<void> {
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
-	const row = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
-	if (!row) return;
-	pdb.run(
-		`INSERT OR REPLACE INTO projects
-		(id, name, description, status, git_path, remote_url, default_branch,
-		 startup_script, copy_files, chapter_settings, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		[
-			row.id,
-			row.name,
-			row.description,
-			row.status,
-			row.gitPath,
-			row.remoteUrl,
-			row.defaultBranch,
-			row.startupScript,
-			row.copyFiles,
-			jsonCol(row.chapterSettings),
-			row.createdAt,
-			row.updatedAt,
-		],
-	);
+	await copyById(pdb, "projects", "id", [projectId]);
 }
 
 /** Sync a single chapter record. */
 async function syncChapter(chapterId: string): Promise<void> {
-	const row = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
-	if (!row) return;
-	const pdb = await getProjectDb(row.projectId);
+	const projectId = await projectIdForChapter(chapterId);
+	if (!projectId) return;
+	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
-	pdb.run(
-		`INSERT OR REPLACE INTO chapters
-		(id, project_id, title, description, status, role, branch, worktree_path,
-		 base_branch, parent_chapter_id, fork_point, merged_into_chapter_id,
-		 merge_commit_sha, merge_strategy, container_config, exploration_group_id,
-		 is_root, head_commit_sha, start_commit_sha, commit_count, color, group_label,
-		 pinned, anchor_commit_sha, axis_offset, cross_offset, last_accessed_at, created_at, updated_at,
-		 snapshot_commit_sha, snapshot_shadow_key, dormant_snapshot_commit_sha,
-		 pre_merge_target_sha, merge_snapshot_commit_sha, pre_merge_target_snapshot_sha,
-		 merged_source_snapshot_sha)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-		 ?, ?, ?, ?, ?, ?, ?)`,
-		[
-			row.id,
-			row.projectId,
-			row.title,
-			row.description,
-			row.status,
-			row.role,
-			row.branch,
-			row.worktreePath,
-			row.baseBranch,
-			row.parentChapterId,
-			jsonCol(row.forkPoint),
-			row.mergedIntoChapterId,
-			row.mergeCommitSha,
-			row.mergeStrategy,
-			jsonCol(row.containerConfig),
-			row.explorationGroupId,
-			row.isRoot,
-			row.headCommitSha,
-			row.startCommitSha,
-			row.commitCount,
-			row.color,
-			row.groupLabel,
-			row.pinned,
-			row.anchorCommitSha,
-			row.axisOffset,
-			row.crossOffset,
-			row.lastAccessedAt,
-			row.createdAt,
-			row.updatedAt,
-			// Snapshot coordinates. A commit-free merge writes nothing to the user's git
-			// history, so these are the only record of it: dropping them here would make a
-			// re-imported chapter read as "merged, no merge commit", which both `unmerge`
-			// and `wake` reject outright.
-			//
-			// `parkedSnapshotCommitSha` / `parkedSnapshotBaseTree` are deliberately not
-			// carried: they describe a rebase still in flight on THIS machine, pointing at
-			// its shadow repository. Imported elsewhere, the next rebase would try to settle
-			// them, resolve nothing, and report `lostParkedSnapshot` — telling the user they
-			// lost work that was never on that machine. See `project-db.ts`.
-			row.snapshotCommitSha,
-			row.snapshotShadowKey,
-			row.dormantSnapshotCommitSha,
-			row.preMergeTargetSha,
-			row.mergeSnapshotCommitSha,
-			row.preMergeTargetSnapshotSha,
-			row.mergedSourceSnapshotSha,
-		],
-	);
+	await copyById(pdb, "chapters", "id", [chapterId]);
 }
 
 /** Sync chapter edges for a project (delete-then-insert to handle removals). */
 async function syncChapterEdgesForProject(projectId: string): Promise<void> {
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
-	const rows = await db.select().from(chapterEdges).where(eq(chapterEdges.projectId, projectId));
-	const stmt = pdb.prepare(
-		`INSERT OR REPLACE INTO chapter_edges
-		(id, project_id, source_id, target_id, type, metadata, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	await replaceById(
+		pdb,
+		"chapter_edges",
+		"project_id",
+		[projectId],
+		[{ sql: "DELETE FROM chapter_edges WHERE project_id = ?", params: [projectId] }],
 	);
-	const tx = pdb.transaction(() => {
-		pdb.run("DELETE FROM chapter_edges WHERE project_id = ?", [projectId]);
-		for (const row of rows) {
-			stmt.run(
-				row.id,
-				row.projectId,
-				row.sourceId,
-				row.targetId,
-				row.type,
-				jsonCol(row.metadata),
-				row.createdAt,
-			);
-		}
-	});
-	tx();
 }
 
 /** Sync chapter commits for a single chapter (delete-then-insert). */
-async function syncChapterCommits(chapterId: string): Promise<void> {
+async function syncChapterCommits(chapterId: string, control: ExportControl = {}): Promise<void> {
 	const projectId = await projectIdForChapter(chapterId);
 	if (!projectId) return;
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
-	const rows = await db
-		.select()
-		.from(chapterCommits)
-		.where(eq(chapterCommits.chapterId, chapterId));
-	const stmt = pdb.prepare(
-		`INSERT OR REPLACE INTO chapter_commits
-		(id, chapter_id, sha, message, full_message, author_name, author_email,
-		 authored_at, source, narrator_id, narrator_message_id,
-		 files_changed, lines_added, lines_removed, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	await replaceById(
+		pdb,
+		"chapter_commits",
+		"chapter_id",
+		[chapterId],
+		[{ sql: "DELETE FROM chapter_commits WHERE chapter_id = ?", params: [chapterId] }],
+		control,
 	);
-	const tx = pdb.transaction(() => {
-		pdb.run("DELETE FROM chapter_commits WHERE chapter_id = ?", [chapterId]);
-		for (const row of rows) {
-			stmt.run(
-				row.id,
-				row.chapterId,
-				row.sha,
-				row.message,
-				row.fullMessage,
-				row.authorName,
-				row.authorEmail,
-				row.authoredAt,
-				row.source,
-				row.narratorId,
-				row.narratorMessageId,
-				row.filesChanged,
-				row.linesAdded,
-				row.linesRemoved,
-				row.createdAt,
-			);
-		}
-	});
-	tx();
 }
 
-/** Sync a single narrator and all its messages/refs/tool_calls/patches. */
+/** Sync a single narrator record. */
 async function syncNarrator(narratorId: string): Promise<void> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
+		columns: { chapterId: true },
 	});
 	if (!narrator?.chapterId) return;
 	const projectId = await projectIdForChapter(narrator.chapterId);
 	if (!projectId) return;
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
-
-	// Sync narrator record
-	pdb.run(
-		`INSERT OR REPLACE INTO narrators
-		(id, chapter_id, api_conversation_id, fork_message_id, type, subagent_type,
-		 title, inherit_mode, parent_narrator_id, context_summary, model, system_prompt,
-		 permission_mode, message_count, total_cost_usd, last_message_at, status,
-		 plan_mode, cwd, error_message,
-		 created_at, substatus, variant, traits,
-		 is_background, background_status, background_result, background_completed_at,
-		 is_ask_in_passing, turn_started_at, message_version, fast_mode,
-		 fast_mode_override, relaxed_plan, reasoning_effort, previous_permission_mode, plan_file_id,
-		 updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		[
-			narrator.id,
-			narrator.chapterId,
-			narrator.apiConversationId,
-			narrator.forkMessageId,
-			narrator.type,
-			narrator.subagentType,
-			narrator.title,
-			narrator.inheritMode,
-			narrator.parentNarratorId,
-			narrator.contextSummary,
-			narrator.model,
-			narrator.systemPrompt,
-			narrator.permissionMode,
-			narrator.messageCount,
-			narrator.totalCostUsd,
-			narrator.lastMessageAt,
-			narrator.status,
-			Array.isArray(narrator.traits) && narrator.traits.includes("plan") ? 1 : 0,
-			narrator.cwd,
-			narrator.errorMessage,
-			narrator.createdAt,
-			narrator.substatus,
-			narrator.variant,
-			jsonCol(narrator.traits),
-			narrator.isBackground ? 1 : 0,
-			narrator.backgroundStatus,
-			narrator.backgroundResult,
-			narrator.backgroundCompletedAt,
-			narrator.isAskInPassing ? 1 : 0,
-			narrator.turnStartedAt,
-			narrator.messageVersion,
-			narrator.fastMode ? 1 : 0,
-			narrator.fastModeOverride,
-			narrator.relaxedPlan ? 1 : 0,
-			narrator.reasoningEffort,
-			narrator.previousPermissionMode,
-			narrator.planFileId,
-			narrator.updatedAt,
-		],
-	);
+	await copyById(pdb, "narrators", "id", [narratorId]);
 }
 
 /**
- * Sync messages for a narrator (incremental: only new refs since last sync).
+ * Sync messages for a narrator (incremental: only refs the archive does not have yet).
  *
- * Note: shared messages (from fork) may have narrator_id pointing to a narrator
- * not in this project DB (e.g. standalone narrator). This is acceptable since
- * the project DB has no foreign key constraints, and the message content is
- * still correctly preserved. Full data integrity is restored on import.
+ * Note: shared messages (from fork) may have narrator_id pointing to a narrator not in this
+ * project DB (e.g. a standalone narrator). That is acceptable since the archive has no foreign
+ * key constraints, and the message content is still correctly preserved. Full data integrity is
+ * restored on import.
  */
 async function syncNarratorMessages(narratorId: string): Promise<void> {
 	const narrator = await db.query.narrators.findFirst({
@@ -322,12 +227,12 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
 
-	// Which refs does the project DB already have?
+	// Which refs does the archive already have?
 	//
-	// A MAX(seq) high-water mark is not usable here: a lazily-forked narrator gains
-	// *older* refs over time (see narrator-refs-backfill), so backfilled rows sit
-	// below the mark and would be skipped forever. Compare by message id instead —
-	// the ids are narrow, indexed, and bounded by the narrator's own ref count.
+	// A MAX(seq) high-water mark is not usable here: a lazily-forked narrator gains *older* refs
+	// over time (see narrator-refs-backfill), so backfilled rows sit below the mark and would be
+	// skipped forever. Compare by message id instead — the ids are narrow, indexed, and bounded
+	// by the narrator's own ref count.
 	const syncedIds = new Set(
 		(
 			pdb
@@ -336,163 +241,44 @@ async function syncNarratorMessages(narratorId: string): Promise<void> {
 		).map((row) => row.message_id),
 	);
 
-	const allRefs = await db
-		.select()
-		.from(narratorMessageRefs)
-		.where(eq(narratorMessageRefs.narratorId, narratorId));
-	const newRefs = allRefs.filter((ref) => !syncedIds.has(ref.messageId));
+	const allRefs = await readAllRows(mainStore, "narrator_message_refs", {
+		filter: { column: "narrator_id", values: [narratorId] },
+	});
+	const newRefs = allRefs.filter((ref) => !syncedIds.has(String(ref.message_id)));
 	if (newRefs.length === 0) return;
 
-	const messageIds = [...new Set(newRefs.map((r) => r.messageId))];
+	const messageIds = distinctIds(newRefs, "message_id");
 
-	// Load messages in batches
-	const BATCH = 500;
-	const allMessages: (typeof narratorMessages.$inferSelect)[] = [];
-	for (let i = 0; i < messageIds.length; i += BATCH) {
-		const batch = messageIds.slice(i, i + BATCH);
-		const rows = await db
-			.select()
-			.from(narratorMessages)
-			.where(inArray(narratorMessages.id, batch));
-		allMessages.push(...rows);
-	}
-
-	// Load tool calls for these messages
-	const allToolCalls: (typeof narratorToolCalls.$inferSelect)[] = [];
-	for (let i = 0; i < messageIds.length; i += BATCH) {
-		const batch = messageIds.slice(i, i + BATCH);
-		const rows = await db
-			.select()
-			.from(narratorToolCalls)
-			.where(inArray(narratorToolCalls.messageId, batch));
-		allToolCalls.push(...rows);
-	}
-
-	// Write all to project DB in a single transaction
-	const msgStmt = pdb.prepare(
-		`INSERT OR REPLACE INTO narrator_messages
-		(id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json,
-		 content_text, tokens_in, cost_usd, turn_usage_json, provider, model,
-		 output_tokens, cached_input_tokens, cache_creation_input_tokens,
-		 cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_tokens,
-		 ttft_ms, duration_ms, context_percent, meter_usage, meter_unit, commit_sha, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-	);
-	const refStmt = pdb.prepare(
-		`INSERT OR REPLACE INTO narrator_message_refs
-		(id, narrator_id, message_id, seq, is_compact)
-		VALUES (?, ?, ?, ?, ?)`,
-	);
-	const tcStmt = pdb.prepare(
-		`INSERT OR REPLACE INTO narrator_tool_calls
-		(id, narrator_id, message_id, tool_use_id, tool_name, input_json, output_json,
-		 execution_device_id, execution_cwd, execution_path_flavor, resolved_file_path,
-		 canonical_file_path, runtime_generation, execution_targets_json, device_selection_source,
-		 status, duration_ms, error_message, permission_decided_by, permission_decided_at,
-		 permission_deny_message, permission_decision_reason, permission_suggestions, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-	);
-
-	const tx = pdb.transaction(() => {
-		for (const m of allMessages) {
-			msgStmt.run(
-				m.id,
-				m.narratorId,
-				m.messageUuid,
-				m.parentToolUseId,
-				m.role,
-				jsonCol(m.contentJson),
-				m.contentText,
-				m.tokensIn,
-				m.costUsd,
-				jsonCol(m.turnUsageJson),
-				m.provider,
-				m.model,
-				m.outputTokens,
-				m.cachedInputTokens,
-				m.cacheCreationInputTokens,
-				m.cacheCreation5mTokens,
-				m.cacheCreation1hTokens,
-				m.reasoningTokens,
-				m.ttftMs,
-				m.durationMs,
-				m.contextPercent,
-				m.meterUsage,
-				m.meterUnit,
-				m.commitSha,
-				m.createdAt,
-			);
-		}
-		for (const r of newRefs) {
-			refStmt.run(r.id, r.narratorId, r.messageId, r.seq, r.isCompact);
-		}
-		for (const tc of allToolCalls) {
-			tcStmt.run(
-				tc.id,
-				tc.narratorId,
-				tc.messageId,
-				tc.toolUseId,
-				tc.toolName,
-				jsonCol(tc.inputJson),
-				jsonCol(tc.outputJson),
-				tc.executionDeviceId,
-				tc.executionCwd,
-				tc.executionPathFlavor,
-				tc.resolvedFilePath,
-				tc.canonicalFilePath,
-				tc.runtimeGeneration,
-				jsonCol(tc.executionTargetsJson),
-				tc.deviceSelectionSource,
-				tc.status,
-				tc.durationMs,
-				tc.errorMessage,
-				tc.permissionDecidedBy,
-				tc.permissionDecidedAt,
-				tc.permissionDenyMessage,
-				tc.permissionDecisionReason,
-				jsonCol(tc.permissionSuggestions),
-				tc.createdAt,
-			);
-		}
+	await copyTable(mainStore, pdb, "narrator_messages", {
+		filter: { column: "id", values: messageIds },
 	});
-	tx();
+	await copyTable(mainStore, pdb, "narrator_message_refs", {
+		filter: { column: "id", values: distinctIds(newRefs, "id") },
+	});
+	await copyTable(mainStore, pdb, "narrator_tool_calls", {
+		filter: { column: "message_id", values: messageIds },
+	});
 }
 
 /** Sync exploration groups for a project (delete-then-insert). */
-async function syncExplorationGroups(projectId: string): Promise<void> {
+async function syncExplorationGroups(
+	projectId: string,
+	control: ExportControl = {},
+): Promise<number> {
 	const pdb = await getProjectDb(projectId);
-	if (!pdb) return;
-	const rows = await db
-		.select()
-		.from(explorationGroups)
-		.where(eq(explorationGroups.projectId, projectId));
-	const stmt = pdb.prepare(
-		`INSERT OR REPLACE INTO exploration_groups
-		(id, project_id, title, description, base_chapter_id, status,
-		 decided_chapter_id, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	if (!pdb) return 0;
+	return replaceById(
+		pdb,
+		"exploration_groups",
+		"project_id",
+		[projectId],
+		[{ sql: "DELETE FROM exploration_groups WHERE project_id = ?", params: [projectId] }],
+		control,
 	);
-	const tx = pdb.transaction(() => {
-		pdb.run("DELETE FROM exploration_groups WHERE project_id = ?", [projectId]);
-		for (const row of rows) {
-			stmt.run(
-				row.id,
-				row.projectId,
-				row.title,
-				row.description,
-				row.baseChapterId,
-				row.status,
-				row.decidedChapterId,
-				row.createdAt,
-				row.updatedAt,
-			);
-		}
-	});
-	tx();
 }
 
 /** Sync merge sessions for a project (delete-then-insert via target chapter). */
-async function syncMergeSessions(projectId: string): Promise<void> {
+async function syncMergeSessions(projectId: string, control: ExportControl = {}): Promise<void> {
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
 	const chapterRows = await db
@@ -501,172 +287,71 @@ async function syncMergeSessions(projectId: string): Promise<void> {
 		.where(eq(chapters.projectId, projectId));
 	if (chapterRows.length === 0) return;
 	const chapterIds = chapterRows.map((c) => c.id);
-	const rows = await db
-		.select()
-		.from(mergeSessions)
-		.where(inArray(mergeSessions.targetChapterId, chapterIds));
-	const stmt = pdb.prepare(
-		`INSERT OR REPLACE INTO merge_sessions
-		(id, target_chapter_id, source_chapter_ids, strategy, status,
-		 current_index, merged_count, current_source_chapter_id,
-		 conflict_files, error, locale, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-	);
-	// Build placeholders for DELETE IN clause
+	// Placeholders for the DELETE IN clause. chapterIds are nanoid strings from a DB query.
 	const ph = chapterIds.map(() => "?").join(",");
-	const tx = pdb.transaction(() => {
-		pdb.run(`DELETE FROM merge_sessions WHERE target_chapter_id IN (${ph})`, chapterIds);
-		for (const row of rows) {
-			stmt.run(
-				row.id,
-				row.targetChapterId,
-				jsonCol(row.sourceChapterIds),
-				row.strategy,
-				row.status,
-				row.currentIndex,
-				row.mergedCount,
-				row.currentSourceChapterId,
-				jsonCol(row.conflictFiles),
-				row.error,
-				row.locale,
-				row.createdAt,
-				row.updatedAt,
-			);
-		}
-	});
-	tx();
+	await replaceById(
+		pdb,
+		"merge_sessions",
+		"target_chapter_id",
+		chapterIds,
+		[
+			{
+				sql: `DELETE FROM merge_sessions WHERE target_chapter_id IN (${ph})`,
+				params: chapterIds,
+			},
+		],
+		control,
+	);
 }
 
 /**
- * Full sync of narrator messages (delete-then-insert).
- * Used by fullSync to ensure deleted messages are cleaned up.
+ * Full sync of one narrator's conversation (delete-then-insert), as ONE atomic replacement.
+ *
+ * Used by `fullSync` so refs and tool calls deleted in the main database are cleaned up here too.
+ * The three tables go into a single `replaceTables` call rather than three, because they describe
+ * one thing: a reader that caught the refs deleted but not yet reloaded would see a conversation
+ * with no messages, and one that caught refs reloaded without their tool calls would see calls
+ * that vanished. Staging all three and committing once removes both windows.
+ *
+ * `narrator_messages` is deliberately NOT cleared: a message can be shared with another narrator
+ * (fork copies the shared prefix), so deleting by narrator would remove rows another narrator
+ * still references. Orphans are swept at the end of `fullSync` instead.
  */
-async function fullSyncNarratorMessages(narratorId: string, pdb: Database): Promise<void> {
-	// Get all refs for this narrator from main DB
-	const refs = await db
-		.select()
-		.from(narratorMessageRefs)
-		.where(eq(narratorMessageRefs.narratorId, narratorId));
-
-	const messageIds = [...new Set(refs.map((r) => r.messageId))];
-
-	const BATCH = 500;
-	const allMessages: (typeof narratorMessages.$inferSelect)[] = [];
-	for (let i = 0; i < messageIds.length; i += BATCH) {
-		const batch = messageIds.slice(i, i + BATCH);
-		const rows = await db
-			.select()
-			.from(narratorMessages)
-			.where(inArray(narratorMessages.id, batch));
-		allMessages.push(...rows);
-	}
-
-	const allToolCalls: (typeof narratorToolCalls.$inferSelect)[] = [];
-	for (let i = 0; i < messageIds.length; i += BATCH) {
-		const batch = messageIds.slice(i, i + BATCH);
-		const rows = await db
-			.select()
-			.from(narratorToolCalls)
-			.where(inArray(narratorToolCalls.messageId, batch));
-		allToolCalls.push(...rows);
-	}
-
-	const msgStmt = pdb.prepare(
-		`INSERT OR REPLACE INTO narrator_messages
-		(id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json,
-		 content_text, tokens_in, cost_usd, turn_usage_json, provider, model,
-		 output_tokens, cached_input_tokens, cache_creation_input_tokens,
-		 cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_tokens,
-		 ttft_ms, duration_ms, context_percent, meter_usage, meter_unit, commit_sha, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-	);
-	const refStmt = pdb.prepare(
-		`INSERT OR REPLACE INTO narrator_message_refs
-		(id, narrator_id, message_id, seq, is_compact)
-		VALUES (?, ?, ?, ?, ?)`,
-	);
-	const tcStmt = pdb.prepare(
-		`INSERT OR REPLACE INTO narrator_tool_calls
-		(id, narrator_id, message_id, tool_use_id, tool_name, input_json, output_json,
-		 execution_device_id, execution_cwd, execution_path_flavor, resolved_file_path,
-		 canonical_file_path, runtime_generation, execution_targets_json, device_selection_source,
-		 status, duration_ms, error_message, permission_decided_by, permission_decided_at,
-		 permission_deny_message, permission_decision_reason, permission_suggestions, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-	);
-
-	const tx = pdb.transaction(() => {
-		// Delete existing data for this narrator first
-		pdb.run("DELETE FROM narrator_tool_calls WHERE narrator_id = ?", [narratorId]);
-		pdb.run("DELETE FROM narrator_message_refs WHERE narrator_id = ?", [narratorId]);
-		// Don't delete narrator_messages here — they may be shared with other narrators.
-		// Orphan messages will be cleaned up at the end of fullSync.
-
-		for (const m of allMessages) {
-			msgStmt.run(
-				m.id,
-				m.narratorId,
-				m.messageUuid,
-				m.parentToolUseId,
-				m.role,
-				jsonCol(m.contentJson),
-				m.contentText,
-				m.tokensIn,
-				m.costUsd,
-				jsonCol(m.turnUsageJson),
-				m.provider,
-				m.model,
-				m.outputTokens,
-				m.cachedInputTokens,
-				m.cacheCreationInputTokens,
-				m.cacheCreation5mTokens,
-				m.cacheCreation1hTokens,
-				m.reasoningTokens,
-				m.ttftMs,
-				m.durationMs,
-				m.contextPercent,
-				m.meterUsage,
-				m.meterUnit,
-				m.commitSha,
-				m.createdAt,
-			);
-		}
-		for (const r of refs) {
-			refStmt.run(r.id, r.narratorId, r.messageId, r.seq, r.isCompact);
-		}
-		for (const tc of allToolCalls) {
-			tcStmt.run(
-				tc.id,
-				tc.narratorId,
-				tc.messageId,
-				tc.toolUseId,
-				tc.toolName,
-				jsonCol(tc.inputJson),
-				jsonCol(tc.outputJson),
-				tc.executionDeviceId,
-				tc.executionCwd,
-				tc.executionPathFlavor,
-				tc.resolvedFilePath,
-				tc.canonicalFilePath,
-				tc.runtimeGeneration,
-				jsonCol(tc.executionTargetsJson),
-				tc.deviceSelectionSource,
-				tc.status,
-				tc.durationMs,
-				tc.errorMessage,
-				tc.permissionDecidedBy,
-				tc.permissionDecidedAt,
-				tc.permissionDenyMessage,
-				tc.permissionDecisionReason,
-				jsonCol(tc.permissionSuggestions),
-				tc.createdAt,
-			);
-		}
+async function fullSyncNarratorMessages(
+	narratorId: string,
+	pdb: Database,
+	control: ExportControl = {},
+): Promise<void> {
+	const refs = await readAllRows(mainStore, "narrator_message_refs", {
+		filter: { column: "narrator_id", values: [narratorId] },
+		...control,
 	});
-	tx();
+	const messageIds = distinctIds(refs, "message_id");
+
+	const scopes: ReplaceScope[] = [
+		{
+			table: "narrator_messages",
+			filter: { column: "id", values: messageIds },
+		},
+		{
+			table: "narrator_message_refs",
+			filter: { column: "id", values: distinctIds(refs, "id") },
+			clear: [
+				{ sql: "DELETE FROM narrator_message_refs WHERE narrator_id = ?", params: [narratorId] },
+			],
+		},
+		{
+			table: "narrator_tool_calls",
+			filter: { column: "message_id", values: messageIds },
+			clear: [
+				{ sql: "DELETE FROM narrator_tool_calls WHERE narrator_id = ?", params: [narratorId] },
+			],
+		},
+	];
+	await replaceTables(mainStore, pdb, scopes, control);
 }
 
-/** Clean up orphan messages in project DB (messages not referenced by any narrator_message_refs). */
+/** Clean up orphan messages in the archive (not referenced by any narrator_message_refs). */
 function cleanupOrphanMessages(pdb: Database): void {
 	pdb.run(`
 		DELETE FROM narrator_messages WHERE id NOT IN (
@@ -676,26 +361,26 @@ function cleanupOrphanMessages(pdb: Database): void {
 }
 
 /**
- * Delete a chapter and all its associated data from the project database.
+ * Delete a chapter and all its associated data from the archive.
  * Handles two scenarios:
  * - cleanup: chapter still exists in main DB (status → abandoned), just sync it
- * - remove: chapter already deleted from main DB, purge from project DB
+ * - remove: chapter already deleted from main DB, purge from the archive
  */
 async function deleteChapterFromProjectDb(chapterId: string, projectId: string): Promise<void> {
-	// If chapter still exists in main DB (cleanup scenario), just sync the updated status
+	// If the chapter still exists in the main DB (cleanup scenario), just sync the updated status.
 	const row = await db.query.chapters.findFirst({
 		where: eq(chapters.id, chapterId),
+		columns: { id: true },
 	});
 	if (row) {
 		await syncChapter(chapterId);
 		return;
 	}
 
-	// Chapter already deleted from main DB — purge from project DB
+	// Chapter already deleted from the main DB — purge from the archive.
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
 
-	// Find narrators belonging to this chapter in project DB
 	const narratorRows = pdb
 		.prepare("SELECT id FROM narrators WHERE chapter_id = ?")
 		.all(chapterId) as { id: string }[];
@@ -736,78 +421,121 @@ async function deleteChapterFromProjectDb(chapterId: string, projectId: string):
 
 // === Full sync ===
 
-/** Full sync: export all project data from main DB to project DB. */
-export async function fullSync(projectId: string): Promise<{ tables: Record<string, number> }> {
+/**
+ * How a caller may stop a full sync.
+ *
+ * There is deliberately NO default deadline. A legitimately large project takes as long as it
+ * takes, and inventing a clock here would turn "your backup is big" into "your backup fails",
+ * which is worse than slow — the bounds that protect the process are the page size, the staging
+ * ceilings and the fact that nothing is held across an `await`. A caller that DOES have a budget
+ * (a request that can be abandoned, a shutdown in progress) passes it and every page boundary
+ * honors it.
+ */
+export interface FullSyncOptions {
+	readonly signal?: AbortSignal;
+	/** Relative budget in ms, converted to an absolute deadline once, at entry. */
+	readonly timeoutMs?: number;
+}
+
+/** Full sync: export all project data from the main DB to the archive. */
+export async function fullSync(
+	projectId: string,
+	options: FullSyncOptions = {},
+): Promise<{ tables: Record<string, number> }> {
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) throw new Error(`Cannot open project DB for project ${projectId}`);
 
+	// One deadline for the whole export rather than one per table: a per-table budget would let a
+	// project with many tables run for an unbounded total.
+	const control: ExportControl = {
+		signal: options.signal,
+		deadline: exportDeadline(options.timeoutMs),
+	};
 	const counts: Record<string, number> = {};
 
 	// 1. Project
 	await syncProject(projectId);
 	counts.projects = 1;
 
-	// 2. Chapters — delete-then-insert to handle removed chapters
-	const chapterRows = await db.select().from(chapters).where(eq(chapters.projectId, projectId));
+	// 2. Chapters — replaced, so chapters removed from the main DB disappear here too.
+	const chapterRows = await db
+		.select({ id: chapters.id })
+		.from(chapters)
+		.where(eq(chapters.projectId, projectId));
 	const chapterIds = chapterRows.map((c) => c.id);
-	// Delete chapters in project DB that no longer exist in main DB
-	pdb.run("DELETE FROM chapters WHERE project_id = ?", [projectId]);
-	for (const ch of chapterRows) {
-		await syncChapter(ch.id);
-	}
-	counts.chapters = chapterRows.length;
+	counts.chapters = await replaceById(
+		pdb,
+		"chapters",
+		"project_id",
+		[projectId],
+		[{ sql: "DELETE FROM chapters WHERE project_id = ?", params: [projectId] }],
+		control,
+	);
 
-	// 3. Chapter edges (already delete-then-insert)
-	await syncChapterEdgesForProject(projectId);
-	const edgeRows = await db
-		.select({ id: chapterEdges.id })
-		.from(chapterEdges)
-		.where(eq(chapterEdges.projectId, projectId));
-	counts.chapter_edges = edgeRows.length;
+	// 3. Chapter edges — replaced. The count is what was COPIED, i.e. the main database's row
+	// count, which is what this field always reported (it used to come from a second `SELECT id`
+	// against the main DB; the copy already knows the answer).
+	counts.chapter_edges = await replaceById(
+		pdb,
+		"chapter_edges",
+		"project_id",
+		[projectId],
+		[{ sql: "DELETE FROM chapter_edges WHERE project_id = ?", params: [projectId] }],
+		control,
+	);
 
-	// 4. Exploration groups (already delete-then-insert)
-	await syncExplorationGroups(projectId);
-	const egRows = await db
-		.select({ id: explorationGroups.id })
-		.from(explorationGroups)
-		.where(eq(explorationGroups.projectId, projectId));
-	counts.exploration_groups = egRows.length;
+	// 4. Exploration groups — replaced
+	counts.exploration_groups = await syncExplorationGroups(projectId, control);
 
-	// 5. Narrators + messages (via chapters) — delete-then-insert for full accuracy
-	// First, delete narrators in project DB that no longer exist
+	// 5. Narrators + messages (via chapters).
+	//
+	// The narrators scope is ONE replacement: its clear removes archive narrators that no longer
+	// belong to a live chapter, and the refill rewrites the ones that do. Running that DELETE on
+	// its own — as this did before — is exactly the window the replacement exists to close: a
+	// reader between the delete and the refill finds the project's narrators missing, and a
+	// failure while reading them leaves the archive permanently short of narrators the main
+	// database still has.
+	const narratorClear =
+		chapterIds.length > 0
+			? [
+					{
+						// chapterIds are nanoid strings from a DB query — safe to interpolate as
+						// placeholders.
+						sql: `DELETE FROM narrators WHERE chapter_id NOT IN (${chapterIds
+							.map(() => "?")
+							.join(",")}) OR chapter_id IS NULL`,
+						params: chapterIds,
+					},
+				]
+			: [{ sql: "DELETE FROM narrators", params: [] }];
+
+	// Ids come from the MAIN database, so `counts.narrators` keeps meaning "narrators the main
+	// database has" rather than "rows the archive ended up with".
+	let narratorIds: string[] = [];
 	if (chapterIds.length > 0) {
-		const ph = chapterIds.map(() => "?").join(",");
-		pdb.run(
-			`DELETE FROM narrators WHERE chapter_id NOT IN (${ph}) OR chapter_id IS NULL`,
-			chapterIds,
-		);
-	} else {
-		pdb.run("DELETE FROM narrators");
+		narratorIds = (
+			await readAllRows(mainStore, "narrators", {
+				filter: { column: "chapter_id", values: chapterIds },
+				...control,
+			})
+		).map((row) => String(row.id));
 	}
-
-	let narratorRows: { id: string }[] = [];
-	if (chapterIds.length > 0) {
-		narratorRows = await db
-			.select({ id: narrators.id })
-			.from(narrators)
-			.where(inArray(narrators.chapterId, chapterIds));
+	await replaceById(pdb, "narrators", "id", narratorIds, narratorClear, control);
+	for (const narratorId of narratorIds) {
+		await fullSyncNarratorMessages(narratorId, pdb, control);
 	}
-	for (const n of narratorRows) {
-		await syncNarrator(n.id);
-		await fullSyncNarratorMessages(n.id, pdb);
-	}
-	counts.narrators = narratorRows.length;
+	counts.narrators = narratorIds.length;
 
 	// Clean up orphan messages (messages no longer referenced by any narrator)
 	cleanupOrphanMessages(pdb);
 
 	// 6. Chapter commits
 	for (const ch of chapterRows) {
-		await syncChapterCommits(ch.id);
+		await syncChapterCommits(ch.id, control);
 	}
 
-	// 7. Merge sessions (already delete-then-insert)
-	await syncMergeSessions(projectId);
+	// 7. Merge sessions
+	await syncMergeSessions(projectId, control);
 
 	logger.info("Project DB full sync completed", { projectId, counts });
 	return { tables: counts };
@@ -893,7 +621,7 @@ async function handleEvent(event: NarraForkEvent): Promise<void> {
 		case "exploration:decided":
 		case "exploration:abandoned":
 		case "exploration:chapter_added": {
-			// We need the projectId — get it from the group's first chapter or the group itself
+			// We need the projectId — get it from the group itself
 			const groupId = event.groupId;
 			const group = await db.query.explorationGroups.findFirst({
 				where: eq(explorationGroups.id, groupId),

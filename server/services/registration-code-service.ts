@@ -18,6 +18,10 @@ import { db } from "@server/db";
 import { registrationCodes, users } from "@server/db/schema";
 import { AppError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
+import {
+	assertInvitationRedeemable,
+	type RedeemableInvitation,
+} from "@server/services/registration/invitation-rules";
 import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 
 /** Transaction handle as produced by `db.transaction((tx) => ...)`. */
@@ -263,31 +267,16 @@ export const registrationCodeService = {
 	resolveUsableCodeInTransaction(
 		tx: DbTransaction,
 		params: { code: string; username: string; nowIso: string },
-	): { id: string; role: "admin" | "user" } {
+	): RedeemableInvitation {
 		const hash = hashRegistrationCode(params.code);
 		const row = tx.query.registrationCodes
 			.findFirst({ where: eq(registrationCodes.codeHash, hash) })
 			.sync();
-		if (!row) {
-			throw new AppError("Invalid registration code", 400, "CODE_INVALID");
-		}
-		if (row.revokedAt) {
-			throw new AppError("This registration code was revoked", 400, "CODE_REVOKED");
-		}
-		if (row.usedAt) {
-			throw new AppError("This registration code has already been used", 409, "CODE_ALREADY_USED");
-		}
-		if (Date.parse(row.expiresAt) <= Date.parse(params.nowIso)) {
-			throw new AppError("This registration code has expired", 400, "CODE_EXPIRED");
-		}
-		if (row.boundUsername && row.boundUsername !== params.username) {
-			throw new AppError(
-				"This registration code was issued for a different username",
-				400,
-				"CODE_USERNAME_MISMATCH",
-			);
-		}
-		return { id: row.id, role: row.role };
+		// The lookup is SQLite's job; deciding whether the invitation may be used is not.
+		// `assertInvitationRedeemable` holds the rules and their error identities so a second
+		// backend storing invitations elsewhere answers identically instead of re-deriving
+		// the precedence between revoked/used/expired.
+		return assertInvitationRedeemable(row ?? null, params);
 	},
 
 	/**

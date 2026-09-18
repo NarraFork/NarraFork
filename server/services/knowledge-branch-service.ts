@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { applyPatch, createPatch, structuredPatch } from "diff";
-import { and, desc, eq, inArray } from "drizzle-orm";
-import { db } from "../db";
+import { eq } from "drizzle-orm";
+import { activeDatabaseBackend, db } from "../db";
 import {
 	knowledgeCollections,
 	knowledgeDrafts,
@@ -9,11 +9,12 @@ import {
 	knowledgeRevisions,
 	knowledgeSubmissions,
 } from "../db/schema";
-import { withDbRetry } from "../lib/db-resilience";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { slugify } from "../lib/slug";
+import { knowledgeWriteStore } from "./knowledge/store";
+import { WITHDRAWABLE_SUBMISSION_STATUSES } from "./knowledge/write-store";
 import {
 	type AclCollection,
 	type AclEntry,
@@ -44,78 +45,17 @@ type PersonalEntryStatus = "active" | "archived";
 const ACTIVE_DRAFT_STATUSES: PersonalEntryStatus[] = ["active"];
 
 /**
- * Upper bound when listing a draft's open submissions before auto-invalidating them.
- * `submitForReview` refuses a second open submission per draft, so in practice this is
- * 1; the cap only guarantees the read stays bounded if historical data has more.
+ * Every multi-statement write below goes through `knowledgeWriteStore`
+ * (`services/knowledge/store.ts`), which owns the atomic sections: the status sets
+ * that drive auto-closure (`SUPERSEDABLE_SUBMISSION_STATUSES`,
+ * `CLOSED_ON_ENTRY_DELETE_STATUSES`, `WITHDRAWABLE_SUBMISSION_STATUSES`) are port
+ * vocabulary now — `pending`-only supersede because a `conflict` must never be
+ * silently dropped, wider close-on-delete because the target is going away. The
+ * sections themselves (guard re-checks, version claims, slug resolution) live in the
+ * two store implementations; what stays here is authorization, merge logic, and the
+ * POST-COMMIT event emissions (never inside a transaction, and after the store's
+ * Promise resolves — the exactly-once boundary under whole-section replay).
  */
-const OPEN_SUBMISSION_SCAN_LIMIT = 20;
-
-/**
- * Statuses that an author's own edit may auto-close.
- *
- * Deliberately `pending` ONLY. A `conflict` submission is NOT auto-closed: a conflict means
- * main and the proposal diverged and a human has to decide the merged text, so silently
- * dropping it when the author edits their draft would hide an unresolved divergence. The
- * author must withdraw it (or a reviewer must resolve it) explicitly.
- */
-const SUPERSEDABLE_STATUSES = ["pending"] as const;
-
-/**
- * Statuses closed when the author RETIRES the personal entry itself ({@link deletePersonalEntry}).
- *
- * Broader than SUPERSEDABLE_STATUSES because the target is going away, not just changing:
- * - `conflict` — there is nothing left to resolve the conflict against.
- * - `changes_requested` — the author can no longer make the requested changes (the entry it
- *   would have changed is retired), so leaving it open would strand a request whose only
- *   transition (`resubmit`) has become impossible. Without this it became an orphan row
- *   pointing at an archived draft, still listed as awaiting the author.
- */
-const CLOSED_ON_DELETE_STATUSES = ["pending", "conflict", "changes_requested"] as const;
-
-/** Transaction handle type of `db.transaction((tx) => …)`, for shared transaction helpers. */
-type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
-
-/**
- * Close the draft's open PENDING submissions as `superseded` and return the affected rows.
- *
- * `superseded` (not `rejected`) is the whole point: it distinguishes "the author replaced the
- * proposed content, so this proposal no longer describes anything" from "a reviewer refused
- * the change". No `verdict` is written either — nobody reviewed it.
- *
- * Bounded by OPEN_SUBMISSION_SCAN_LIMIT. Runs inside the caller's transaction; the returned
- * rows are for post-commit event emission (never emit inside a transaction).
- */
-function supersedeOpenSubmissions(
-	tx: Tx,
-	draftId: string,
-	now: string,
-): { id: string; submitterUserId: string }[] {
-	const stale = tx
-		.select({
-			id: knowledgeSubmissions.id,
-			submitterUserId: knowledgeSubmissions.submitterUserId,
-		})
-		.from(knowledgeSubmissions)
-		.where(
-			and(
-				eq(knowledgeSubmissions.draftId, draftId),
-				inArray(knowledgeSubmissions.status, [...SUPERSEDABLE_STATUSES]),
-			),
-		)
-		.limit(OPEN_SUBMISSION_SCAN_LIMIT)
-		.all();
-	if (stale.length === 0) return stale;
-	tx.update(knowledgeSubmissions)
-		.set({ status: "superseded", reviewedAt: now })
-		.where(
-			and(
-				eq(knowledgeSubmissions.draftId, draftId),
-				inArray(knowledgeSubmissions.status, [...SUPERSEDABLE_STATUSES]),
-			),
-		)
-		.run();
-	return stale;
-}
 
 async function loadEntryAndCollection(entryId: string) {
 	const entry = await db.query.knowledgeEntries.findFirst({
@@ -178,50 +118,42 @@ async function assertCanRead(principal: Principal, entryId: string) {
 
 // ─── Drafts ───────────────────────────────────────────────────────────
 
+/**
+ * Draft branching and rebasing still perform legacy SQLite reads around the write store. Refuse
+ * those mutations before touching the fail-closed SQLite handle while PostgreSQL is active.
+ */
+export function requireSqliteKnowledgeBranchMutation(
+	operation: string,
+	backend: string = activeDatabaseBackend,
+): void {
+	if (backend === "postgres") {
+		throw new AppError(
+			`${operation} is not yet supported on the PostgreSQL backend`,
+			503,
+			"POSTGRES_UNSUPPORTED",
+		);
+	}
+}
+
 /** Create (or return existing active) personal draft forked from the entry's current revision. */
 async function createDraft(principal: Principal, entryId: string, input: { name?: string }) {
+	requireSqliteKnowledgeBranchMutation("Knowledge draft branching");
 	const { entry } = await assertCanRead(principal, entryId);
 
-	const id = generateId();
-	const now = nowIso();
 	const content = entry.currentContent ?? "";
 
-	// Atomic "get-or-create": re-check for an active draft INSIDE the transaction
-	// so two concurrent createDraft calls can't both insert a second active draft.
-	// bun:sqlite runs the transaction body synchronously under a write lock.
-	return db.transaction((tx) => {
-		const existingActive = tx
-			.select()
-			.from(knowledgeDrafts)
-			.where(
-				and(
-					eq(knowledgeDrafts.entryId, entryId),
-					eq(knowledgeDrafts.authorUserId, principal.userId),
-					inArray(knowledgeDrafts.status, ACTIVE_DRAFT_STATUSES),
-				),
-			)
-			.limit(1)
-			.get();
-		if (existingActive) return existingActive;
-
-		const draft = tx
-			.insert(knowledgeDrafts)
-			.values({
-				id,
-				entryId,
-				authorUserId: principal.userId,
-				name: input.name ?? null,
-				baseRevisionId: entry.currentRevisionId ?? null,
-				content,
-				contentHash: hashContent(content),
-				format: "markdown",
-				status: "active",
-				createdAt: now,
-				updatedAt: now,
-			})
-			.returning()
-			.get();
-		return draft;
+	// Atomic "get-or-create": the store re-checks for an active draft INSIDE the
+	// section (under the entry row's lock on PostgreSQL) so two concurrent createDraft
+	// calls can't both insert a second active draft.
+	return knowledgeWriteStore.getOrCreateActiveDraft({
+		draftId: generateId(),
+		entryId,
+		authorUserId: principal.userId,
+		name: input.name ?? null,
+		baseRevisionId: entry.currentRevisionId ?? null,
+		content,
+		contentHash: hashContent(content),
+		now: nowIso(),
 	});
 }
 
@@ -438,39 +370,11 @@ async function deletePersonalEntry(principal: Principal, draftId: string) {
 		return { ok: true as const, id: draftId, alreadyArchived: true as const };
 	}
 	const now = nowIso();
-	// Capture WHICH open submissions this delete closed (bounded read, mirroring
-	// updateDraft) so the notify listener can tell the submitter — emitted after the
-	// transaction commits, never inside it.
-	const invalidated = db.transaction((tx) => {
-		const stale = tx
-			.select({
-				id: knowledgeSubmissions.id,
-				submitterUserId: knowledgeSubmissions.submitterUserId,
-			})
-			.from(knowledgeSubmissions)
-			.where(
-				and(
-					eq(knowledgeSubmissions.draftId, draftId),
-					inArray(knowledgeSubmissions.status, [...CLOSED_ON_DELETE_STATUSES]),
-				),
-			)
-			.limit(OPEN_SUBMISSION_SCAN_LIMIT)
-			.all();
-		tx.update(knowledgeDrafts)
-			.set({ status: "archived", updatedAt: now })
-			.where(eq(knowledgeDrafts.id, draftId))
-			.run();
-		tx.update(knowledgeSubmissions)
-			.set({ status: "withdrawn", reviewedAt: now })
-			.where(
-				and(
-					eq(knowledgeSubmissions.draftId, draftId),
-					inArray(knowledgeSubmissions.status, [...CLOSED_ON_DELETE_STATUSES]),
-				),
-			)
-			.run();
-		return stale;
-	});
+	// The store closes the open submissions in the SAME section (statuses:
+	// CLOSED_ON_ENTRY_DELETE_STATUSES — wider than updateDraft's pending-only supersede
+	// because the entry itself is going away) and returns which rows it closed, so the
+	// notify listener can tell the submitter — emitted after commit, never inside it.
+	const invalidated = await knowledgeWriteStore.archivePersonalEntry({ draftId, now });
 	for (const sub of invalidated) {
 		eventBus.emit({
 			type: "knowledge:submission_invalidated",
@@ -497,27 +401,17 @@ async function updateDraft(
 		throw new ValidationError("Personal entry is archived and can no longer be edited");
 	}
 	const now = nowIso();
-	const invalidated = db.transaction((tx) => {
-		tx.update(knowledgeDrafts)
-			.set({
-				content: input.content,
-				contentHash: hashContent(input.content),
-				...(input.name !== undefined ? { name: input.name } : {}),
-				// The entry stays `active`; the publish-request lifecycle lives on submissions.
-				updatedAt: now,
-			})
-			.where(eq(knowledgeDrafts.id, draftId))
-			.run();
-		// Keep submission state consistent: a PENDING submission for this entry is now stale
-		// because the proposed content changed, so it is closed as `superseded` (see
-		// SUPERSEDABLE_STATUSES for why `conflict` is deliberately left open, and why the
-		// status is not `rejected`).
-		//
-		// Capture WHICH rows were invalidated (bounded by the open-submission guard in
-		// submitForReview, so at most a handful) so the notify listener can tell the
-		// submitter — emitted after the transaction commits, never inside it.
-		const stale = supersedeOpenSubmissions(tx, draftId, now);
-		return stale;
+	// The store keeps submission state consistent in the same section: a PENDING
+	// submission for this entry is now stale because the proposed content changed, so
+	// it is closed as `superseded` (see SUPERSEDABLE_SUBMISSION_STATUSES for why
+	// `conflict` is deliberately left open, and why the status is not `rejected`).
+	// The closed rows come back for the post-commit notification.
+	const invalidated = await knowledgeWriteStore.updateDraftContent({
+		draftId,
+		content: input.content,
+		contentHash: hashContent(input.content),
+		...(input.name !== undefined ? { name: input.name } : {}),
+		now,
 	});
 	for (const sub of invalidated) {
 		eventBus.emit({
@@ -690,6 +584,7 @@ async function rebaseDraft(
 	draftId: string,
 	opts: { strategy?: RebaseStrategy } = {},
 ) {
+	requireSqliteKnowledgeBranchMutation("Knowledge draft rebasing");
 	const strategy: RebaseStrategy = opts.strategy ?? "merge";
 	const draft = await loadOwnDraft(principal, draftId);
 	if (draft.status === "archived") {
@@ -733,22 +628,16 @@ async function rebaseDraft(
 	}
 
 	const now = nowIso();
-	const invalidated = db.transaction((tx) => {
-		tx.update(knowledgeDrafts)
-			.set({
-				content: merged as string,
-				contentHash: hashContent(merged as string),
-				baseRevisionId: currentRevisionId,
-				// Entry stays `active`; rebasing only updates content + fork point.
-				updatedAt: now,
-			})
-			.where(eq(knowledgeDrafts.id, draftId))
-			.run();
-		// A PENDING submission is now stale (proposed content changed) — close it as
-		// `superseded`. Mirrors updateDraft exactly, including leaving `conflict` submissions
-		// open and capturing the affected rows for the post-commit notification.
-		const stale = supersedeOpenSubmissions(tx, draftId, now);
-		return stale;
+	// A PENDING submission is now stale (proposed content changed) — the store closes
+	// it as `superseded` in the same section. Mirrors updateDraft exactly, including
+	// leaving `conflict` submissions open and returning the closed rows for the
+	// post-commit notification.
+	const invalidated = await knowledgeWriteStore.rebaseDraftContent({
+		draftId,
+		content: merged,
+		contentHash: hashContent(merged),
+		baseRevisionId: currentRevisionId,
+		now,
 	});
 	for (const sub of invalidated) {
 		eventBus.emit({
@@ -823,76 +712,42 @@ async function submitForReview(
 	}
 	const id = generateId();
 	const now = nowIso();
-	let submission: typeof knowledgeSubmissions.$inferSelect | undefined;
-	db.transaction((tx) => {
-		// Guard against duplicate/concurrent submissions: refuse if this entry already
-		// has an open (pending/conflict) submission awaiting review. Checked inside the
-		// transaction so two concurrent submits can't both pass.
-		const open = tx
-			.select({ id: knowledgeSubmissions.id, status: knowledgeSubmissions.status })
-			.from(knowledgeSubmissions)
-			.where(
-				and(
-					eq(knowledgeSubmissions.draftId, draftId),
-					inArray(knowledgeSubmissions.status, ["pending", "conflict"]),
-				),
-			)
-			.limit(1)
-			.get();
-		if (open) {
-			// Name the way out, or the author is stuck. A `conflict` request in particular is
-			// NOT auto-closed by editing (unlike `pending`), so without this hint the author
-			// sees "awaiting review" with no visible next step.
-			throw new ValidationError(
-				open.status === "conflict"
-					? `This personal entry has a publish request in conflict (${open.id}). ` +
-							"Withdraw it and publish again, or ask a reviewer to resolve the conflict."
-					: `This personal entry already has a publish request awaiting review (${open.id}). ` +
-							"Withdraw it first if you want to replace it.",
-			);
-		}
-		[submission] = tx
-			.insert(knowledgeSubmissions)
-			.values({
-				id,
-				draftId,
-				entryId: draft.entryId,
-				// Standalone publish target (NULL for linked entries).
-				collectionId: draft.entryId ? null : draft.targetCollectionId,
-				title: draft.entryId ? null : draft.title,
-				submitterUserId: principal.userId,
-				baseRevisionId: draft.baseRevisionId,
-				proposedContent: draft.content,
-				// Standalone publish carries the draft's keywords to the new global entry on
-				// approve; linked entries keep their existing global keywords (NULL here).
-				keywordsJson: draft.entryId ? null : (draft.keywordsJson ?? null),
-				changeNote: input.changeNote ?? null,
-				// Resubmit chain metadata (both NULL/1 for a first-round submission), so a
-				// reviewer sees "attempt N, previous attempt X" instead of an unrelated proposal.
-				previousSubmissionId: input.previousSubmissionId ?? null,
-				round: input.round && input.round > 0 ? input.round : 1,
-				status: "pending",
-				createdAt: now,
-			})
-			.returning()
-			.all();
-		// The personal entry stays `active`; the publish-request lifecycle lives on the submission.
+	// The store guards against duplicate/concurrent submissions INSIDE the section
+	// (under the draft row's lock on PostgreSQL): a draft with an open
+	// (pending/conflict) request is refused with a ValidationError naming the way out.
+	const submission = await knowledgeWriteStore.createSubmissionGuarded({
+		submissionId: id,
+		draftId,
+		entryId: draft.entryId,
+		// Standalone publish target (NULL for linked entries).
+		collectionId: draft.entryId ? null : draft.targetCollectionId,
+		title: draft.entryId ? null : draft.title,
+		submitterUserId: principal.userId,
+		baseRevisionId: draft.baseRevisionId,
+		proposedContent: draft.content,
+		// Standalone publish carries the draft's keywords to the new global entry on
+		// approve; linked entries keep their existing global keywords (NULL here).
+		keywordsJson: draft.entryId ? null : (draft.keywordsJson ?? null),
+		changeNote: input.changeNote ?? null,
+		// Resubmit chain metadata (both NULL/1 for a first-round submission), so a
+		// reviewer sees "attempt N, previous attempt X" instead of an unrelated proposal.
+		previousSubmissionId: input.previousSubmissionId ?? null,
+		round: input.round && input.round > 0 ? input.round : 1,
+		now,
 	});
 	// Post-commit: tell candidate reviewers there is something to review. Emitting inside
 	// the transaction would let listener callbacks extend the write lock.
-	if (submission) {
-		eventBus.emit({
-			type: "knowledge:submission_created",
-			submissionId: submission.id,
-			entryId: submission.entryId ?? null,
-			collectionId: submission.collectionId ?? null,
-			submitterUserId: submission.submitterUserId,
-		});
-	}
+	eventBus.emit({
+		type: "knowledge:submission_created",
+		submissionId: submission.id,
+		entryId: submission.entryId ?? null,
+		collectionId: submission.collectionId ?? null,
+		submitterUserId: submission.submitterUserId,
+	});
 	// `driftWarning` is additive on the existing submission shape: present only when the
 	// proposal is based on a stale main, so callers can surface "rebase first" without a
 	// second round-trip. Absent (null) is the normal, up-to-date case.
-	return submission ? { ...submission, driftWarning } : submission;
+	return { ...submission, driftWarning };
 }
 
 async function loadSubmission(submissionId: string) {
@@ -980,17 +835,13 @@ async function review(
 			: input.verdict === "reject"
 				? "rejected"
 				: sub.status;
-	db.transaction((tx) => {
-		tx.update(knowledgeSubmissions)
-			.set({
-				status: newStatus,
-				verdict: input.verdict,
-				findingsJson: findings,
-				reviewerUserId: principal.userId,
-				reviewedAt: now,
-			})
-			.where(eq(knowledgeSubmissions.id, submissionId))
-			.run();
+	await knowledgeWriteStore.setSubmissionReviewVerdict({
+		submissionId,
+		status: newStatus,
+		verdict: input.verdict,
+		findingsJson: findings,
+		reviewerUserId: principal.userId,
+		now,
 	});
 	// Post-commit: the submitter learns the verdict without polling /submissions.
 	eventBus.emit({
@@ -1058,27 +909,14 @@ async function approveAndMerge(
 
 	if (merged === false) {
 		// Conflict: cannot auto-merge. Mark and surface three-way content for manual resolve.
-		// Re-check status inside the transaction so a concurrent reviewer who already
-		// merged isn't overwritten back to "conflict".
-		db.transaction((tx) => {
-			const fresh = tx
-				.select({ status: knowledgeSubmissions.status })
-				.from(knowledgeSubmissions)
-				.where(eq(knowledgeSubmissions.id, sub.id))
-				.get();
-			if (!fresh || (fresh.status !== "pending" && fresh.status !== "conflict")) {
-				throw new ValidationError("Submission was already reviewed by someone else");
-			}
-			tx.update(knowledgeSubmissions)
-				.set({
-					status: "conflict",
-					verdict: "approve",
-					findingsJson: findings,
-					reviewerUserId,
-					reviewedAt: now,
-				})
-				.where(eq(knowledgeSubmissions.id, sub.id))
-				.run();
+		// The store re-checks the status inside the section (under the submission row's
+		// lock) so a concurrent reviewer who already merged isn't overwritten back to
+		// "conflict".
+		await knowledgeWriteStore.markSubmissionConflict({
+			submissionId: sub.id,
+			findingsJson: findings,
+			reviewerUserId,
+			now,
 		});
 		// Post-commit: a conflict needs the submitter's attention (rebase or manual resolve).
 		eventBus.emit({
@@ -1128,89 +966,28 @@ async function approveStandalone(
 	const revisionId = generateId();
 	const baseSlug = slugify(title);
 
-	await withDbRetry(
-		async () =>
-			db.transaction((tx) => {
-				const fresh = tx
-					.select({ status: knowledgeSubmissions.status })
-					.from(knowledgeSubmissions)
-					.where(eq(knowledgeSubmissions.id, sub.id))
-					.get();
-				if (!fresh || (fresh.status !== "pending" && fresh.status !== "conflict")) {
-					throw new ValidationError("Submission was already reviewed by someone else");
-				}
-
-				// Resolve a unique slug within the collection (append -2, -3, … on collision).
-				let slug = baseSlug;
-				let n = 1;
-				while (
-					tx
-						.select({ id: knowledgeEntries.id })
-						.from(knowledgeEntries)
-						.where(
-							and(
-								eq(knowledgeEntries.collectionId, sub.collectionId as string),
-								eq(knowledgeEntries.slug, slug),
-							),
-						)
-						.get()
-				) {
-					n += 1;
-					slug = `${baseSlug}-${n}`;
-				}
-
-				tx.insert(knowledgeEntries)
-					.values({
-						id: entryId,
-						collectionId: sub.collectionId as string,
-						title,
-						slug,
-						currentRevisionId: revisionId,
-						currentContent: sub.proposedContent,
-						tagsJson: [],
-						// Carry the standalone draft's keywords onto the new global entry so it
-						// participates in passive injection (currentKeywords mirrors keywordsJson
-						// for the FTS keyword column).
-						keywordsJson: stdKeywords,
-						currentKeywords: stdKeywords.length > 0 ? stdKeywords.join(" ") : null,
-						ownerUserId: sub.submitterUserId,
-						status: "active",
-						createdAt: now,
-						updatedAt: now,
-					})
-					.run();
-				tx.insert(knowledgeRevisions)
-					.values({
-						id: revisionId,
-						entryId,
-						version: 1,
-						format: "markdown",
-						content: sub.proposedContent,
-						contentHash: hashContent(sub.proposedContent),
-						changeNote: sub.changeNote ?? null,
-						authorUserId: sub.submitterUserId,
-						createdAt: now,
-					})
-					.run();
-				tx.update(knowledgeSubmissions)
-					.set({
-						status: "approved",
-						entryId,
-						reviewerUserId,
-						reviewedAt: now,
-						findingsJson: findings,
-						mergedRevisionId: revisionId,
-					})
-					.where(eq(knowledgeSubmissions.id, sub.id))
-					.run();
-				// Link the personal entry to the new global entry and archive it (published).
-				tx.update(knowledgeDrafts)
-					.set({ entryId, status: "archived", updatedAt: now })
-					.where(eq(knowledgeDrafts.id, sub.draftId))
-					.run();
-			}),
-		{ label: "knowledge.approveStandalone", maxRetries: 5 },
-	);
+	// The store owns the whole section: the claimable-status guard (under the
+	// submission row's lock), the in-section unique-slug resolution, the new global
+	// entry + first revision, the submission close, and the personal entry's
+	// link-and-archive — all atomic, so a second reviewer can't double-create.
+	await knowledgeWriteStore.approveStandalonePublish({
+		submissionId: sub.id,
+		draftId: sub.draftId,
+		entryId,
+		revisionId,
+		collectionId: sub.collectionId,
+		title,
+		baseSlug,
+		proposedContent: sub.proposedContent,
+		contentHash: hashContent(sub.proposedContent),
+		keywords: stdKeywords,
+		changeNote: sub.changeNote ?? null,
+		baseRevisionId: sub.baseRevisionId,
+		submitterUserId: sub.submitterUserId,
+		reviewerUserId,
+		findingsJson: findings,
+		now,
+	});
 	// Post-commit: the standalone publish became a brand-new global entry.
 	eventBus.emit({
 		type: "knowledge:submission_reviewed",
@@ -1276,68 +1053,24 @@ async function commitMergedRevision(
 	if (!targetEntryId) throw new ValidationError("Submission has no target entry");
 	const revisionId = generateId();
 
-	await withDbRetry(
-		async () =>
-			db.transaction((tx) => {
-				// Re-read the submission status INSIDE the transaction and refuse to proceed
-				// unless it is still claimable. bun:sqlite runs the transaction body
-				// synchronously under a write lock, so this select-check-update sequence is
-				// atomic w.r.t. other transactions — a concurrent reviewer who already merged
-				// flips the status to "approved", and this guard then aborts (no dup revision).
-				const fresh = tx
-					.select({ status: knowledgeSubmissions.status })
-					.from(knowledgeSubmissions)
-					.where(eq(knowledgeSubmissions.id, sub.id))
-					.get();
-				if (!fresh || (fresh.status !== "pending" && fresh.status !== "conflict")) {
-					throw new ValidationError("Submission was already reviewed by someone else");
-				}
-
-				// Version is computed inside the transaction so concurrent merges on the
-				// same entry can't pick the same version number.
-				const row = tx
-					.select({ v: knowledgeRevisions.version })
-					.from(knowledgeRevisions)
-					.where(eq(knowledgeRevisions.entryId, targetEntryId))
-					.orderBy(desc(knowledgeRevisions.version))
-					.limit(1)
-					.get();
-				const nextVersion = (row?.v ?? 0) + 1;
-
-				tx.insert(knowledgeRevisions)
-					.values({
-						id: revisionId,
-						entryId: targetEntryId,
-						version: nextVersion,
-						format: "markdown",
-						content,
-						contentHash: hashContent(content),
-						changeNote: sub.changeNote ?? null,
-						authorUserId: sub.submitterUserId,
-						baseRevisionId: sub.baseRevisionId,
-						createdAt: now,
-					})
-					.run();
-				tx.update(knowledgeEntries)
-					.set({ currentRevisionId: revisionId, currentContent: content, updatedAt: now })
-					.where(eq(knowledgeEntries.id, targetEntryId))
-					.run();
-				tx.update(knowledgeSubmissions)
-					.set({
-						status: "approved",
-						reviewerUserId,
-						reviewedAt: now,
-						mergedRevisionId: revisionId,
-					})
-					.where(eq(knowledgeSubmissions.id, sub.id))
-					.run();
-				tx.update(knowledgeDrafts)
-					.set({ status: "archived", updatedAt: now })
-					.where(eq(knowledgeDrafts.id, sub.draftId))
-					.run();
-			}),
-		{ label: "knowledge.commitMergedRevision", maxRetries: 5 },
-	);
+	// The store owns the whole section: the claimable-status guard (under the
+	// submission row's lock — a concurrent reviewer who already merged flips the
+	// status and this guard aborts, no duplicate revision), the version claim (under
+	// the entry row's allocation authority — see knowledge/revision-version.ts), the
+	// revision insert, the pointer switch, and the draft close. All atomic.
+	await knowledgeWriteStore.commitMergedRevision({
+		submissionId: sub.id,
+		draftId: sub.draftId,
+		entryId: targetEntryId,
+		revisionId,
+		content,
+		contentHash: hashContent(content),
+		changeNote: sub.changeNote ?? null,
+		baseRevisionId: sub.baseRevisionId,
+		submitterUserId: sub.submitterUserId,
+		reviewerUserId,
+		now,
+	});
 	// Post-commit: the proposal is now main. Covers both approveAndMerge (clean
 	// three-way merge) and resolveConflict (reviewer-supplied merged content).
 	eventBus.emit({
@@ -1698,8 +1431,8 @@ async function listSubmissionsForDraft(
 // ─── Author-side state machine closure (withdraw / resubmit) ─────────────
 
 /**
- * Statuses a submitter may withdraw. Nothing has been merged in any of them, so retracting is
- * always safe:
+ * Statuses a submitter may withdraw (`WITHDRAWABLE_SUBMISSION_STATUSES` in the port):
+ * nothing has been merged in any of them, so retracting is always safe:
  *
  * - `pending` / `conflict` — the request is still open and awaiting a reviewer.
  * - `changes_requested` — the reviewer bounced it back, so the ball is in the AUTHOR's court.
@@ -1708,7 +1441,6 @@ async function listSubmissionsForDraft(
  *   both the author's and the reviewer's lists forever. Withdrawing says "I'm dropping this",
  *   which is exactly the author-side decision that was missing.
  */
-const WITHDRAWABLE_STATUSES = ["pending", "conflict", "changes_requested"] as const;
 
 /**
  * Withdraw one of the caller's OWN unmerged publish requests → `withdrawn`.
@@ -1735,39 +1467,25 @@ async function withdrawSubmission(
 	if (sub.submitterUserId !== principal.userId && principal.role !== "admin") {
 		throw new NotFoundError("Knowledge submission", submissionId);
 	}
-	if (!(WITHDRAWABLE_STATUSES as readonly string[]).includes(sub.status)) {
+	if (!(WITHDRAWABLE_SUBMISSION_STATUSES as readonly string[]).includes(sub.status)) {
 		throw new ValidationError(
 			`Submission is ${sub.status} and can no longer be withdrawn ` +
 				`(only pending, conflict, or changes_requested requests can)`,
 		);
 	}
 	const now = nowIso();
-	const changed = db.transaction((tx) => {
-		// Re-check the status INSIDE the transaction so a reviewer who just approved isn't
-		// overwritten back to a non-terminal state (bun:sqlite runs the body synchronously
-		// under a write lock, so select-check-update is atomic w.r.t. other transactions).
-		const fresh = tx
-			.select({ status: knowledgeSubmissions.status })
-			.from(knowledgeSubmissions)
-			.where(eq(knowledgeSubmissions.id, submissionId))
-			.get();
-		if (!fresh || !(WITHDRAWABLE_STATUSES as readonly string[]).includes(fresh.status)) {
-			return false;
-		}
-		tx.update(knowledgeSubmissions)
-			.set({
-				status: "withdrawn",
-				reviewedAt: now,
-				// Keep any reviewer note; only append the author's own reason when given.
-				...(input.reason?.trim()
-					? {
-							changeNote: `${sub.changeNote ? `${sub.changeNote}\n` : ""}[withdrawn] ${input.reason.trim()}`,
-						}
-					: {}),
-			})
-			.where(eq(knowledgeSubmissions.id, submissionId))
-			.run();
-		return true;
+	// The store re-checks the status INSIDE the section (under the submission row's
+	// lock) so a reviewer who just approved isn't overwritten back to a non-terminal
+	// state; false means someone else already closed it.
+	const changed = await knowledgeWriteStore.withdrawSubmissionGuarded({
+		submissionId,
+		// Keep any reviewer note; only append the author's own reason when given.
+		...(input.reason?.trim()
+			? {
+					changeNote: `${sub.changeNote ? `${sub.changeNote}\n` : ""}[withdrawn] ${input.reason.trim()}`,
+				}
+			: {}),
+		now,
 	});
 	if (!changed) {
 		throw new ValidationError("Submission was already reviewed by someone else");

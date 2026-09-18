@@ -24,10 +24,14 @@ import { logger } from "../lib/logger";
 import { getNarraforkHome, getNarraforkPath } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
-import { databaseCleanupService } from "./database-cleanup-service";
 import { dropRecentlyAttributed } from "./file-attribution-service";
 import { gitService } from "./git-service";
 import { dropStatus } from "./git-status-cache";
+import {
+	DatabaseStorageScanCancelledError,
+	DatabaseStorageUnsupportedError,
+} from "./storage/database-storage-port";
+import { databaseStoragePort } from "./storage/store";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -41,6 +45,15 @@ export interface StorageCategoryResult {
 	 * mislead an operator judging whether a category is worth cleaning up.
 	 */
 	truncated?: boolean;
+	/**
+	 * Set when the category could NOT be measured, which is not the same as measuring zero.
+	 *
+	 * `sizeBytes` is then meaningless and must not be summed into a total or rendered as a
+	 * quantity — the whole reason this field exists is that a category reporting `0` with no
+	 * explanation reads as "nothing here", so an operator would conclude a multi-gigabyte
+	 * database weighed nothing rather than that nobody measured it.
+	 */
+	unavailable?: { backend: string; reason: string };
 	details?: Record<string, unknown>;
 }
 
@@ -218,19 +231,65 @@ export function buildReferencedUploadOwnerIds(
 
 // ── Scan functions (each returns one category) ─────────────────────────────
 
+/**
+ * The "nobody measured this" database category.
+ *
+ * One helper for both routes to it (the capability check and the port's rejection) so the two can
+ * never drift into reporting the same situation differently — a category that is `unavailable` on
+ * one path and a bare `0` on the other is precisely the misreading this field exists to prevent.
+ */
+function unmeasurableDatabaseCategory(backend: string, reason: string): StorageCategoryResult {
+	logger.info("Database storage measurement is unavailable on this backend", { backend, reason });
+	return { key: "database", sizeBytes: 0, unavailable: { backend, reason } };
+}
+
+/**
+ * The database category, measured through {@link databaseStoragePort}.
+ *
+ * Goes through the port rather than calling the cleanup service directly so this scan states what
+ * it needs (a byte total, serializable detail, progress, cancellation) instead of what SQLite
+ * happens to offer. The port also owns the wall-clock budget, so this step always settles.
+ *
+ * A backend that cannot measure itself produces an `unavailable` category, NOT a zero: the total
+ * below deliberately excludes it and the UI can say "not measurable on this backend". Every other
+ * failure still propagates — an unreadable database is a problem to report, not to paper over.
+ *
+ * Both routes to `unavailable` are live and neither is redundant. `capabilities.breakdown` is read
+ * FIRST so a backend that cannot measure is never asked to (the port guarantees such a call only
+ * rejects, and a scan step that exists to produce a rejection is wasted work on the request path).
+ * The rejection is still handled, because the adapter reads its capabilities at access time: the
+ * flag can stop being true between the check and the call — the SQLite adapter loses
+ * `offRequestThreadScan` exactly that way when the pool is torn down mid-scan.
+ */
 async function scanDatabase(
 	onTableProgress?: (progress: { done: number; total: number; tableName: string }) => void,
 	signal?: AbortSignal,
 ): Promise<StorageCategoryResult> {
-	const breakdown = await databaseCleanupService.scanDatabaseBreakdown({
-		onProgress: onTableProgress,
-		signal,
-	});
-	return {
-		key: "database",
-		sizeBytes: breakdown.mainBytes + breakdown.walBytes + breakdown.shmBytes,
-		details: breakdown as unknown as Record<string, unknown>,
-	};
+	const capabilities = databaseStoragePort.capabilities;
+	if (!capabilities.breakdown) {
+		return unmeasurableDatabaseCategory(capabilities.backend, "breakdown");
+	}
+
+	try {
+		const report = await databaseStoragePort.scanBreakdown({
+			onProgress: onTableProgress,
+			signal,
+		});
+		return {
+			key: "database",
+			sizeBytes: report.sizeBytes,
+			...(report.incomplete ? { truncated: true } : {}),
+			details: report.details,
+		};
+	} catch (err) {
+		if (err instanceof DatabaseStorageUnsupportedError) {
+			return unmeasurableDatabaseCategory(err.backend, err.capability);
+		}
+		// A cancelled scan is the caller's own abort coming back; re-shape it into the error the
+		// generator's callers already understand rather than reporting a failed category.
+		if (err instanceof DatabaseStorageScanCancelledError) throw new StorageScanAbortedError();
+		throw err;
+	}
 }
 
 /**
@@ -693,10 +752,14 @@ export async function* scanStorage(
 	throwIfAborted(signal);
 
 	const truncated = categories.some((c) => c.truncated === true);
+	// An unmeasurable category contributes nothing to the total AND makes the total a lower bound.
+	// Adding its placeholder zero would be arithmetically harmless and semantically wrong: the sum
+	// would read as complete while a whole category was missing from it.
+	const unavailable = categories.filter((c) => c.unavailable);
 	const result: StorageScanResult = {
 		categories,
-		totalBytes: categories.reduce((sum, c) => sum + c.sizeBytes, 0),
-		...(truncated ? { truncated } : {}),
+		totalBytes: categories.filter((c) => !c.unavailable).reduce((sum, c) => sum + c.sizeBytes, 0),
+		...(truncated || unavailable.length > 0 ? { truncated: true } : {}),
 		scannedAt: Date.now(),
 	};
 	cachedResult = result;

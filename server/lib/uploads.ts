@@ -814,10 +814,9 @@ export async function saveAvatarImage(userId: string, file: File): Promise<Image
 		throw new ValidationError("Invalid user ID");
 	}
 
-	// Remove old avatar files before saving new one
-	if (existsSync(dir)) {
-		rmSync(dir, { recursive: true, force: true });
-	}
+	// Keep the current avatar in place until the caller has durably switched the
+	// database reference. The auth route removes the old file only after that write
+	// succeeds; a failed write can therefore clean up just this new file.
 	mkdirSync(dir, { recursive: true });
 	ensureUploadDirWritable(dir);
 
@@ -840,7 +839,7 @@ export function getAvatarPath(userId: string, imageId: string): string | null {
 	if (!existsSync(dir)) return null;
 
 	const files = readdirSync(dir);
-	const match = files.find((f) => f.startsWith(imageId));
+	const match = files.find((f) => f === imageId || f.startsWith(`${imageId}.`));
 	if (!match) return null;
 
 	const filePath = resolve(dir, match);
@@ -848,10 +847,18 @@ export function getAvatarPath(userId: string, imageId: string): string | null {
 	return filePath;
 }
 
-export function deleteAvatarImage(userId: string): void {
+export function deleteAvatarImage(userId: string, imageId?: string): void {
 	const avatarsDir = getAvatarsDir();
 	const dir = resolve(avatarsDir, userId);
 	if (!isWithinDir(avatarsDir, dir)) return;
+	if (imageId !== undefined) {
+		const filePath = getAvatarPath(userId, imageId);
+		if (filePath) {
+			rmSync(filePath, { force: true });
+			logger.info("Avatar file deleted", { userId, imageId });
+		}
+		return;
+	}
 	if (existsSync(dir)) {
 		rmSync(dir, { recursive: true, force: true });
 		logger.info("Avatar deleted", { userId });

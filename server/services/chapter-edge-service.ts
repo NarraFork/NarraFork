@@ -1,10 +1,10 @@
 import { db } from "@server/db";
-import { chapterEdges, chapters } from "@server/db/schema";
-import { NotFoundError, ValidationError } from "@server/lib/errors";
+import { chapterEdges } from "@server/db/schema";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import type { ForkWorktreeSource } from "@shared/chapter-fork";
 import { and, eq, or } from "drizzle-orm";
+import { chapterWriteStore } from "./chapter-write/store";
 
 // Safety cap: prevent unbounded result sets from blocking the main thread
 // during serialization. 2000 edges covers any realistic project while
@@ -51,12 +51,15 @@ class ChapterEdgeService {
 	 * Internal: create a fork edge (called automatically during chapter fork).
 	 * Idempotent: if the same (source, target, "fork") edge already exists, update it in place.
 	 *
-	 * The lookup and the write share ONE synchronous `db.transaction`. `chapter_edges` has no
-	 * UNIQUE constraint on (source, target, type) — only a plain index — so the database cannot
-	 * reject a duplicate for us. Splitting this into `await findFirst()` + `await insert()` would
-	 * leave an await point between the check and the write, and two concurrent forks of the same
-	 * parent could both observe "no edge" and each insert one, silently doubling the graph edge.
-	 * A synchronous bun:sqlite transaction has no such interleaving point.
+	 * The lookup and the write share ONE atomic section inside the chapter write
+	 * store (`services/chapter-write/`). `chapter_edges` has no UNIQUE constraint on
+	 * (source, target, type) — only a plain index — so the database cannot reject a
+	 * duplicate for us, and splitting this into `await findFirst()` + `await insert()`
+	 * would leave an await point between the check and the write: two concurrent
+	 * forks of the same parent could both observe "no edge" and each insert one,
+	 * silently doubling the graph edge. How the section closes that race is the
+	 * backend's business (SQLite: one strictly synchronous transaction; PostgreSQL:
+	 * the source chapter's row lock) — the port header states the contract.
 	 */
 	async createForkEdge(
 		projectId: string,
@@ -70,57 +73,24 @@ class ChapterEdgeService {
 			narratorMessageId?: string;
 		},
 	) {
-		const id = generateId();
-		const now = new Date().toISOString();
-
-		return db.transaction((tx) => {
-			const existing = tx
-				.select({ id: chapterEdges.id })
-				.from(chapterEdges)
-				.where(
-					and(
-						eq(chapterEdges.sourceId, sourceId),
-						eq(chapterEdges.targetId, targetId),
-						eq(chapterEdges.type, "fork"),
-					),
-				)
-				.limit(1)
-				.get();
-
-			if (existing) {
-				return tx
-					.update(chapterEdges)
-					.set({ metadata })
-					.where(eq(chapterEdges.id, existing.id))
-					.returning()
-					.get();
-			}
-
-			return tx
-				.insert(chapterEdges)
-				.values({
-					id,
-					projectId,
-					sourceId,
-					targetId,
-					type: "fork",
-					metadata,
-					createdAt: now,
-				})
-				.returning()
-				.get();
+		return chapterWriteStore.upsertForkEdge({
+			id: generateId(),
+			projectId,
+			sourceId,
+			targetId,
+			metadata,
+			now: new Date().toISOString(),
 		});
 	}
 
 	/**
 	 * Internal: create a merge edge (called automatically during chapter merge).
 	 *
-	 * Upserted inside ONE synchronous `bun:sqlite` transaction, for the same reason
-	 * `createForkEdge` is: a sync transaction has no await point, so two concurrent
-	 * merges cannot both observe "no edge" and both insert. Reading with `await` first
-	 * and then inserting leaves exactly that window — a double-clicked merge button, or
-	 * two batch-merge passes touching the same pair, produced duplicate merge edges,
-	 * which the graph then draws twice.
+	 * Upserted inside ONE atomic section of the chapter write store, for the same
+	 * reason `createForkEdge` is: without it two concurrent merges could both observe
+	 * "no edge" and both insert — a double-clicked merge button, or two batch-merge
+	 * passes touching the same pair, produced duplicate merge edges, which the graph
+	 * then draws twice.
 	 */
 	async createMergeEdge(
 		projectId: string,
@@ -137,45 +107,13 @@ class ChapterEdgeService {
 			status?: "pending" | "completed";
 		},
 	) {
-		const id = generateId();
-		const now = new Date().toISOString();
-
-		return db.transaction((tx) => {
-			const existing = tx
-				.select({ id: chapterEdges.id })
-				.from(chapterEdges)
-				.where(
-					and(
-						eq(chapterEdges.sourceId, sourceId),
-						eq(chapterEdges.targetId, targetId),
-						eq(chapterEdges.type, "merge"),
-					),
-				)
-				.limit(1)
-				.get();
-
-			if (existing) {
-				return tx
-					.update(chapterEdges)
-					.set({ metadata })
-					.where(eq(chapterEdges.id, existing.id))
-					.returning()
-					.get();
-			}
-
-			return tx
-				.insert(chapterEdges)
-				.values({
-					id,
-					projectId,
-					sourceId,
-					targetId,
-					type: "merge",
-					metadata,
-					createdAt: now,
-				})
-				.returning()
-				.get();
+		return chapterWriteStore.upsertMergeEdge({
+			id: generateId(),
+			projectId,
+			sourceId,
+			targetId,
+			metadata,
+			now: new Date().toISOString(),
 		});
 	}
 
@@ -200,34 +138,16 @@ class ChapterEdgeService {
 	 * keep consistent.
 	 */
 	async redirectForkEdgeTarget(id: string, newTargetId: string): Promise<string> {
-		const edge = await db.query.chapterEdges.findFirst({
-			where: eq(chapterEdges.id, id),
+		const previousTargetId = await chapterWriteStore.retargetForkEdge({
+			edgeId: id,
+			newTargetId,
 		});
-		if (!edge) throw new NotFoundError("ChapterEdge", id);
-		if (edge.type !== "fork") {
-			throw new ValidationError("Only fork edges can be retargeted");
+
+		// Post-commit, deliberately: the store's resolved Promise is the exactly-once
+		// boundary, and a replayed section must not emit the log line twice.
+		if (previousTargetId !== newTargetId) {
+			logger.debug("Fork edge retargeted", { edgeId: id, previousTargetId, newTargetId });
 		}
-		if (edge.sourceId === newTargetId) {
-			// Would make the edge a self-loop, which the graph renders as an
-			// unremovable artifact and every traversal treats as a cycle.
-			throw new ValidationError("Cannot retarget a fork edge to its own source");
-		}
-
-		const target = await db.query.chapters.findFirst({
-			where: eq(chapters.id, newTargetId),
-			columns: { id: true, projectId: true },
-		});
-		if (!target) throw new NotFoundError("Chapter", newTargetId);
-		if (target.projectId !== edge.projectId) {
-			throw new ValidationError("Cannot retarget a fork edge across projects");
-		}
-
-		const previousTargetId = edge.targetId;
-		if (previousTargetId === newTargetId) return previousTargetId;
-
-		await db.update(chapterEdges).set({ targetId: newTargetId }).where(eq(chapterEdges.id, id));
-
-		logger.debug("Fork edge retargeted", { edgeId: id, previousTargetId, newTargetId });
 		return previousTargetId;
 	}
 
@@ -236,9 +156,7 @@ class ChapterEdgeService {
 	 * Called when waking a merged chapter to remove stale merge lines.
 	 */
 	async deleteMergeEdgesBySource(chapterId: string) {
-		await db
-			.delete(chapterEdges)
-			.where(and(eq(chapterEdges.sourceId, chapterId), eq(chapterEdges.type, "merge")));
+		await chapterWriteStore.deleteMergeEdgesBySource(chapterId);
 	}
 
 	/**

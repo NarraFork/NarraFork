@@ -97,7 +97,7 @@ function grantClearance(projectId: string, userId: string) {
 		.run();
 }
 
-function search(userId: string, query: string, isAdmin = false) {
+async function search(userId: string, query: string, isAdmin = false) {
 	return searchService.search({
 		query,
 		entities: ["chapters"],
@@ -128,35 +128,35 @@ afterEach(() => {
 });
 
 describe("chapter search project gate (FTS path)", () => {
-	it("hides chapters of a private project from a stranger", () => {
-		const ids = search(STRANGER, "Zephyr").map((r) => r.id);
+	it("hides chapters of a private project from a stranger", async () => {
+		const ids = (await search(STRANGER, "Zephyr")).map((r) => r.id);
 		expect(ids).toEqual(["chap-public"]);
 	});
 
-	it("shows them to the project owner", () => {
-		const ids = search(OWNER, "Zephyr").map((r) => r.id);
+	it("shows them to the project owner", async () => {
+		const ids = (await search(OWNER, "Zephyr")).map((r) => r.id);
 		expect(ids.sort()).toEqual(["chap-private", "chap-public"]);
 	});
 
-	it("shows them to a user holding a project read grant", () => {
+	it("shows them to a user holding a project read grant", async () => {
 		grantProjectRead("proj-private", MEMBER);
-		const ids = search(MEMBER, "Zephyr").map((r) => r.id);
+		const ids = (await search(MEMBER, "Zephyr")).map((r) => r.id);
 		expect(ids.sort()).toEqual(["chap-private", "chap-public"]);
 	});
 
-	it("does not treat a knowledge clearance row as project access", () => {
+	it("does not treat a knowledge clearance row as project access", async () => {
 		grantClearance("proj-private", MEMBER);
-		const ids = search(MEMBER, "Zephyr").map((r) => r.id);
+		const ids = (await search(MEMBER, "Zephyr")).map((r) => r.id);
 		expect(ids).toEqual(["chap-public"]);
 	});
 
-	it("shows everything to an admin", () => {
-		const ids = search("some-admin", "Zephyr", true).map((r) => r.id);
+	it("shows everything to an admin", async () => {
+		const ids = (await search("some-admin", "Zephyr", true)).map((r) => r.id);
 		expect(ids.sort()).toEqual(["chap-private", "chap-public"]);
 	});
 
-	it("leaks nothing through the description snippet either", () => {
-		const results = search(STRANGER, "secret");
+	it("leaks nothing through the description snippet either", async () => {
+		const results = await search(STRANGER, "secret");
 		expect(results).toEqual([]);
 	});
 });
@@ -169,19 +169,19 @@ describe("chapter search project gate (LIKE fallback path)", () => {
 		seedChapter("chap-public-short", "proj-public", "Qx public");
 	});
 
-	it("hides chapters of a private project from a stranger", () => {
-		const ids = search(STRANGER, "Qx").map((r) => r.id);
+	it("hides chapters of a private project from a stranger", async () => {
+		const ids = (await search(STRANGER, "Qx")).map((r) => r.id);
 		expect(ids).toEqual(["chap-public-short"]);
 	});
 
-	it("shows them to the project owner", () => {
-		const ids = search(OWNER, "Qx").map((r) => r.id);
+	it("shows them to the project owner", async () => {
+		const ids = (await search(OWNER, "Qx")).map((r) => r.id);
 		expect(ids.sort()).toEqual(["chap-private-short", "chap-public-short"]);
 	});
 
-	it("does not treat a knowledge clearance row as project access", () => {
+	it("does not treat a knowledge clearance row as project access", async () => {
 		grantClearance("proj-private", MEMBER);
-		const ids = search(MEMBER, "Qx").map((r) => r.id);
+		const ids = (await search(MEMBER, "Qx")).map((r) => r.id);
 		expect(ids).toEqual(["chap-public-short"]);
 	});
 });

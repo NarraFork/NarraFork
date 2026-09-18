@@ -1,13 +1,8 @@
-import { and, eq, inArray, or } from "drizzle-orm";
-import { db } from "../db";
-import {
-	knowledgeCollections,
-	knowledgeEntries,
-	knowledgeEntryLinks,
-	knowledgeRevisions,
-} from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import type { KnowledgeCollectionAclRow, KnowledgeEntryGraphRow } from "./knowledge/read-store";
+import { knowledgeReadStore, knowledgeWriteStore } from "./knowledge/store";
+import { WriteConflictError } from "./knowledge/write-store";
 import {
 	type AclCollection,
 	type AclEntry,
@@ -32,33 +27,21 @@ export type LinkDirection = "out" | "in" | "both";
  * The only entry fields this service needs: 4 display fields for a graph node/endpoint plus
  * the dual-axis ACL gate fields. Deliberately NOT the full row — graph traversal loads up to
  * MAX_LINKS_PER_HOP endpoints per hop, and pulling `currentContent` for each would read that
- * many full document bodies on the main thread to render titles.
+ * many full document bodies on the main thread to render titles. The projection itself lives
+ * with the read stores (one spelling per backend); the port row type is the contract here.
  */
-type EntryRow = Pick<
-	typeof knowledgeEntries.$inferSelect,
-	| "id"
-	| "title"
-	| "slug"
-	| "collectionId"
-	| "ownerUserId"
-	| "classificationLevel"
-	| "controlledTagsJson"
-	| "reviewTagsJson"
->;
+type EntryRow = KnowledgeEntryGraphRow;
 
-/** SQL projection matching {@link EntryRow}. */
-const ENTRY_GRAPH_COLUMNS = {
-	id: true,
-	title: true,
-	slug: true,
-	collectionId: true,
-	ownerUserId: true,
-	classificationLevel: true,
-	controlledTagsJson: true,
-	reviewTagsJson: true,
-} as const;
-
-type LinkRow = typeof knowledgeEntryLinks.$inferSelect;
+type LinkRow = {
+	id: string;
+	fromEntryId: string;
+	toEntryId: string;
+	linkType: string;
+	label: string | null;
+	toRevisionId: string | null;
+	createdByUserId: string | null;
+	createdAt: string;
+};
 
 /** Lightweight endpoint shape returned alongside links (no body). */
 export interface LinkEndpoint {
@@ -127,11 +110,8 @@ function toEndpoint(entry: EntryRow): LinkEndpoint {
 	return { id: entry.id, title: entry.title, slug: entry.slug, collectionId: entry.collectionId };
 }
 
-/** Collection fields needed for the ACL collection gate. */
-type CollectionAclRow = Pick<
-	typeof knowledgeCollections.$inferSelect,
-	"id" | "defaultLevel" | "classificationLevel" | "controlledTagsJson" | "ownerUserId"
->;
+/** Collection fields needed for the ACL collection gate (the read store's projection). */
+type CollectionAclRow = KnowledgeCollectionAclRow;
 
 /** Map a collection row to AclCollection with ALL gate fields (never drop to public). */
 function toAclCollection(c: CollectionAclRow): AclCollection {
@@ -160,10 +140,7 @@ class ReadResolver {
 	async preload(entryIds: string[]): Promise<void> {
 		const missing = entryIds.filter((id) => !this.entryCache.has(id));
 		if (missing.length === 0) return;
-		const rows = await db.query.knowledgeEntries.findMany({
-			where: inArray(knowledgeEntries.id, missing),
-			columns: ENTRY_GRAPH_COLUMNS,
-		});
+		const rows = await knowledgeReadStore.getEntriesGraphByIds(missing);
 		for (const r of rows) this.entryCache.set(r.id, r);
 		// Mark not-found ids so we don't re-query them.
 		for (const id of missing) if (!this.entryCache.has(id)) this.entryCache.set(id, null);
@@ -172,16 +149,7 @@ class ReadResolver {
 			...new Set(rows.map((r) => r.collectionId).filter((c) => !this.collectionById.has(c))),
 		];
 		if (colIds.length > 0) {
-			const cols = await db.query.knowledgeCollections.findMany({
-				where: inArray(knowledgeCollections.id, colIds),
-				columns: {
-					id: true,
-					defaultLevel: true,
-					classificationLevel: true,
-					controlledTagsJson: true,
-					ownerUserId: true,
-				},
-			});
+			const cols = await knowledgeReadStore.getCollectionsAclByIds(colIds);
 			for (const c of cols) this.collectionById.set(c.id, c);
 		}
 	}
@@ -215,13 +183,9 @@ class ReadResolver {
 
 /** Load an entry and assert the principal can read it; otherwise NotFound (don't leak existence). */
 async function assertReadableEntry(caps: PrincipalCaps, entryId: string): Promise<EntryRow> {
-	const entry = await db.query.knowledgeEntries.findFirst({
-		where: eq(knowledgeEntries.id, entryId),
-	});
+	const entry = await knowledgeReadStore.getEntryGraphById(entryId);
 	if (!entry) throw new NotFoundError("Knowledge entry", entryId);
-	const collection = await db.query.knowledgeCollections.findFirst({
-		where: eq(knowledgeCollections.id, entry.collectionId),
-	});
+	const collection = await knowledgeReadStore.getCollectionAclById(entry.collectionId);
 	// Fail closed on a missing collection row rather than assuming a public gate.
 	if (!collection) throw new NotFoundError("Knowledge entry", entryId);
 	const ok = await canRead(caps, toAclEntry(entry), toAclCollection(collection));
@@ -257,29 +221,25 @@ async function addLink(
 
 	// If pinning to a target revision, it must belong to the target entry.
 	if (input.toRevisionId) {
-		const rev = await db.query.knowledgeRevisions.findFirst({
-			where: eq(knowledgeRevisions.id, input.toRevisionId),
-		});
+		const rev = await knowledgeReadStore.getRevisionEntryId(input.toRevisionId);
 		if (!rev || rev.entryId !== input.toEntryId) {
 			throw new ValidationError("toRevisionId does not belong to the target entry");
 		}
 	}
 
 	// Dedup on (from, to, linkType) — mirrors the unique index, with a friendly error.
-	const existing = await db.query.knowledgeEntryLinks.findFirst({
-		where: and(
-			eq(knowledgeEntryLinks.fromEntryId, input.fromEntryId),
-			eq(knowledgeEntryLinks.toEntryId, input.toEntryId),
-			eq(knowledgeEntryLinks.linkType, input.linkType),
-		),
+	const existing = await knowledgeReadStore.findEntryLink({
+		fromEntryId: input.fromEntryId,
+		toEntryId: input.toEntryId,
+		linkType: input.linkType,
 	});
 	if (existing) {
 		throw new ValidationError("A link of this type already exists between these entries");
 	}
 
-	const [created] = await db
-		.insert(knowledgeEntryLinks)
-		.values({
+	let created: LinkRow;
+	try {
+		created = await knowledgeWriteStore.createEntryLink({
 			id: generateId(),
 			fromEntryId: input.fromEntryId,
 			toEntryId: input.toEntryId,
@@ -287,12 +247,19 @@ async function addLink(
 			label: input.label ?? null,
 			toRevisionId: input.toRevisionId ?? null,
 			createdByUserId: principal.userId,
-			createdAt: nowIso(),
-		})
-		.returning();
+			now: nowIso(),
+		});
+	} catch (error) {
+		// Lost the dedup race between the pre-check and the insert — surface as the same
+		// validation error, never a raw constraint failure.
+		if (error instanceof WriteConflictError) {
+			throw new ValidationError("A link of this type already exists between these entries");
+		}
+		throw error;
+	}
 
 	return {
-		...(created as LinkRow),
+		...created,
 		linkType: created.linkType as LinkType,
 		direction: "out",
 		fromEntry: toEndpoint(fromEntry),
@@ -305,14 +272,12 @@ async function addLink(
  * the source side); an unreadable/absent source is reported as NotFound to avoid leaking existence.
  */
 async function removeLink(principal: Principal, linkId: string): Promise<{ ok: true }> {
-	const link = await db.query.knowledgeEntryLinks.findFirst({
-		where: eq(knowledgeEntryLinks.id, linkId),
-	});
+	const link = await knowledgeReadStore.getEntryLinkById(linkId);
 	if (!link) throw new NotFoundError("Knowledge entry link", linkId);
 	const caps = await resolvePrincipalCaps(principal);
 	// Reuse the readability gate on the source entry (throws NotFound if unreadable).
 	await assertReadableEntry(caps, link.fromEntryId);
-	await db.delete(knowledgeEntryLinks).where(eq(knowledgeEntryLinks.id, linkId));
+	await knowledgeWriteStore.deleteEntryLink({ linkId });
 	return { ok: true as const };
 }
 
@@ -329,14 +294,7 @@ async function listLinks(
 	// Anchor entry must itself be readable.
 	await assertReadableEntry(caps, entryId);
 
-	const links = await db.query.knowledgeEntryLinks.findMany({
-		where: (l, { eq: e, or: o }) => {
-			if (direction === "out") return e(l.fromEntryId, entryId);
-			if (direction === "in") return e(l.toEntryId, entryId);
-			return o(e(l.fromEntryId, entryId), e(l.toEntryId, entryId));
-		},
-		orderBy: (l, { desc }) => [desc(l.createdAt)],
-	});
+	const links = await knowledgeReadStore.listEntryLinks(entryId, direction);
 	if (links.length === 0) return [];
 
 	const resolver = new ReadResolver(caps);
@@ -396,13 +354,7 @@ async function getGraph(
 	for (let d = 0; d < depth && frontier.length > 0; d++) {
 		if (nodes.size >= MAX_GRAPH_NODES) break;
 		// Pull every link touching the frontier in one query (bounded per hop).
-		const links = await db.query.knowledgeEntryLinks.findMany({
-			where: or(
-				inArray(knowledgeEntryLinks.fromEntryId, frontier),
-				inArray(knowledgeEntryLinks.toEntryId, frontier),
-			),
-			limit: MAX_LINKS_PER_HOP,
-		});
+		const links = await knowledgeReadStore.listEntryLinksTouching(frontier, MAX_LINKS_PER_HOP);
 		for (const id of frontier) expanded.add(id);
 
 		// Preload all endpoints for readability checks.
@@ -440,12 +392,7 @@ async function getGraph(
 
 /** Fallback single-entry loader for the root node (when not already in the resolver cache). */
 async function loadEndpoint(entryId: string): Promise<EntryRow | null> {
-	return (
-		(await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, entryId),
-			columns: ENTRY_GRAPH_COLUMNS,
-		})) ?? null
-	);
+	return knowledgeReadStore.getEntryGraphById(entryId);
 }
 
 export const knowledgeLinkService = {

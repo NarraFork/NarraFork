@@ -133,7 +133,7 @@ knowledgeRoutes.get("/entries", async (c) => {
 	const q = c.req.query("q");
 	const principal = principalOf(c);
 	if (q?.trim()) {
-		const results = knowledgeService.search({ q, collectionId, tag });
+		const results = await knowledgeService.search({ q, collectionId, tag });
 		return c.json(await knowledgeService.filterReadable(principal, results));
 	}
 	const entries = await knowledgeService.listEntries({ collectionId, tag });
@@ -406,7 +406,7 @@ knowledgeRoutes.get("/search", async (c) => {
 		limit: c.req.query("limit"),
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const results = knowledgeService.search(parsed.data);
+	const results = await knowledgeService.search(parsed.data);
 	return c.json(await knowledgeService.filterReadable(principalOf(c), results));
 });
 

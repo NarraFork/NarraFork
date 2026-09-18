@@ -1,10 +1,20 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	rmSync,
+	statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { getNarraforkPath } from "../narrafork-home";
 import {
 	contentJsonHasImageBlocks,
+	deleteAvatarImage,
+	getAvatarPath,
 	getUploadedImageInfo,
 	getUploadsDir,
 	MAX_IMAGE_DIMENSION,
@@ -309,6 +319,68 @@ describe("uploads helpers", () => {
 				/Image dimensions too large/,
 			);
 		} finally {
+			rmSync(testDir, { recursive: true, force: true });
+		}
+	});
+
+	test("avatar replacement keeps the old file until the new reference is committed", async () => {
+		const testDir = mkdtempSync(resolve(tmpdir(), "narrafork-avatar-replacement-"));
+		try {
+			setUploadsDirForTests(testDir);
+			const userId = "avatar-user";
+			const oldAvatar = await saveAvatarImage(
+				userId,
+				new File([fileBytes(pngHeader(16, 16))], "old.png", { type: "image/png" }),
+			);
+			const oldPath = getAvatarPath(userId, oldAvatar.imageId);
+			expect(oldPath).not.toBeNull();
+
+			const newAvatar = await saveAvatarImage(
+				userId,
+				new File([fileBytes(pngHeader(32, 24))], "new.png", { type: "image/png" }),
+			);
+			expect(getAvatarPath(userId, oldAvatar.imageId)).toBe(oldPath);
+			expect(getAvatarPath(userId, newAvatar.imageId)).not.toBeNull();
+
+			// This is the auth route's DB-failure cleanup path: remove only the uncommitted
+			// file, never the still-authoritative old avatar.
+			deleteAvatarImage(userId, newAvatar.imageId);
+			expect(getAvatarPath(userId, newAvatar.imageId)).toBeNull();
+			expect(getAvatarPath(userId, oldAvatar.imageId)).toBe(oldPath);
+		} finally {
+			rmSync(testDir, { recursive: true, force: true });
+		}
+	});
+
+	test("avatar write failure cleans the new file and preserves the old file", async () => {
+		const testDir = mkdtempSync(resolve(tmpdir(), "narrafork-avatar-write-failure-"));
+		const runtimeBun = Bun as unknown as { write: typeof Bun.write };
+		const originalWrite = runtimeBun.write;
+		try {
+			setUploadsDirForTests(testDir);
+			const userId = "avatar-write-failure";
+			const oldAvatar = await saveAvatarImage(
+				userId,
+				new File([fileBytes(pngHeader(16, 16))], "old.png", { type: "image/png" }),
+			);
+			const oldPath = getAvatarPath(userId, oldAvatar.imageId);
+			expect(oldPath).not.toBeNull();
+
+			runtimeBun.write = (async () => {
+				throw new Error("disk full");
+			}) as typeof Bun.write;
+			await expect(
+				saveAvatarImage(
+					userId,
+					new File([fileBytes(pngHeader(32, 24))], "new.png", { type: "image/png" }),
+				),
+			).rejects.toThrow();
+			expect(getAvatarPath(userId, oldAvatar.imageId)).toBe(oldPath);
+			expect(readdirSync(resolve(testDir, "avatars", userId))).toEqual([
+				`${oldAvatar.imageId}.png`,
+			]);
+		} finally {
+			runtimeBun.write = originalWrite;
 			rmSync(testDir, { recursive: true, force: true });
 		}
 	});
