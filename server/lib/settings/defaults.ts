@@ -11,6 +11,10 @@ import type { FieldDoc, NarraForkSettings } from "./types";
 export const DEFAULTS: NarraForkSettings = {
 	server: { port: 7778, host: "localhost", openBrowser: "browser", allowedOrigins: [] },
 	proxy: { mode: "direct" },
+	// SQLite by default. Selecting "postgres" additionally requires NF_DATABASE_URL /
+	// DATABASE_URL from the environment — the connection URL is never read from this file
+	// (see the `database` field comment in types.ts).
+	database: { backend: "sqlite" },
 	paths: {
 		defaultProjectDir: resolve(homedir(), "projects"),
 		// Empty by default, and that is the safe zero value: with no entry here the
@@ -149,6 +153,7 @@ export const DEFAULTS: NarraForkSettings = {
 	routines: {
 		disabledRoutines: [],
 		enabledRoutines: [],
+		toolModes: {},
 	},
 	customApiProviders: [],
 	openaiProviders: [],
@@ -257,6 +262,21 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"server.tls.caFile": {
 		desc: "CA 证书文件路径，覆盖系统默认信任的 CA。可选。",
 		type: "string",
+	},
+
+	// ── database ────────────────────────────────────────────────────────
+	"database.backend": {
+		desc: '数据库后端选择。默认 "sqlite"；设为 "postgres" 时必须同时在环境变量中提供 NF_DATABASE_URL（或 DATABASE_URL），连接串不允许写入本文件（设置接口对所有登录用户可见）。缺失或未知的值会在启动时报错拒绝，不会静默回退。重启后生效。',
+		type: "string",
+		valid: '"sqlite" | "postgres"',
+	},
+	"database.postgres.max": {
+		desc: "PostgreSQL 连接池上限（非敏感调优项）。仅在 backend 为 postgres 时生效。",
+		type: "number",
+	},
+	"database.postgres.connectTimeout": {
+		desc: "PostgreSQL 连接超时（秒，非敏感调优项）。仅在 backend 为 postgres 时生效。",
+		type: "number",
 	},
 
 	// ── proxy ───────────────────────────────────────────────────────────
@@ -548,7 +568,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "10000-3600000，默认 300000",
 	},
 	"agent.dangerReflectionLevel": {
-		desc: "全部允许模式下危险反思的全局档位：off 关闭；light 只拦截明确危险操作，放行未知/未分类 Bash；standard 拦截中高风险；strict 拦截所有已分类风险。",
+		desc: "全部允许模式下危险反思的全局档位：off 关闭；light 只拦截明确危险操作，放行未知/未分类 Bash 和仅写入系统临时目录（如 /tmp）的操作；standard 拦截中高风险；strict 拦截所有已分类风险。",
 		type: "off | light | standard | strict",
 	},
 	"agent.dangerReflectionEnabled": {
@@ -556,7 +576,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 	"agent.dangerSkipReadOnlyConfirmations": {
-		desc: "危险反思模式下跳过只读操作的二次确认；Edit 视为可恢复操作，不触发安全暂停；删除、明确危险执行模式、环境注入、无法分析/未分类 Bash 和外部写入等仍按当前档位判断。",
+		desc: "危险反思模式下跳过只读操作的二次确认；Edit 视为可恢复操作，不触发安全暂停；删除、明确危险执行模式、环境注入、无法分析/未分类 Bash、混合了用户路径的外部写入等仍按当前档位判断；仅写入系统临时目录（如 /tmp）的外部写入按 medium 处理，宽松档不再暂停。",
 		type: "boolean",
 	},
 	"agent.autoContinuationMode": {
@@ -791,8 +811,13 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "string[]",
 	},
 	"routines.enabledRoutines": {
-		desc: "全局启用的例程 ID 白名单。用于显式启用默认关闭的例程（defaultEnabled: false 的例程）。",
+		desc: '全局启用的例程 ID 白名单。用于显式启用默认关闭的例程（defaultEnabled: false 的例程）。对工具类例程而言，出现在此列表等价于 routines.toolModes 里的 "resident"（常驻）。',
 		type: "string[]",
+	},
+	"routines.toolModes": {
+		desc: '工具类例程的三段式模式表，键为例程 ID（如 "terminal"、"browser"）。"manual" 仅可通过 /load 临时加载；"auto" 预留给未来的 toolsearch 机制，当前行为等同 manual；"resident" 每个新会话默认加载。未列出的例程按 enabledRoutines/disabledRoutines 推导。',
+		type: "Record<string, string>",
+		valid: '"manual" | "auto" | "resident"',
 	},
 
 	// ── codex ───────────────────────────────────────────────────────────

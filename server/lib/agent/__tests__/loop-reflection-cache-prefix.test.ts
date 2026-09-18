@@ -18,12 +18,20 @@ import type { AgentConfig } from "../types";
 
 const DECISION_TOOL_NAME = "CachePrefixDecisionTool";
 const SYSTEM_PROMPT = "PARENT_SYSTEM_PROMPT";
+let emittedTool = DECISION_TOOL_NAME;
+let decisions = 0;
 
 /** Requests the fake provider saw, in order. */
-let captured: Array<{ history: unknown[]; content: string }> = [];
+let captured: Array<{ history: unknown[]; content: string; tools: unknown[]; identity: unknown }> =
+	[];
 
 const testProvider: ProviderAdapter = {
-	formatTools: (tools) => tools.map((t) => ({ name: t.name })),
+	formatTools: (tools) =>
+		tools.map((t) => ({
+			name: t.name,
+			description: t.description,
+			input_schema: t.rawJsonSchema ?? z.toJSONSchema(t.parameters),
+		})),
 	// Mirrors the real providers: prepend a marker entry representing the system prompt.
 	injectSystemPrompt: (history, systemPrompt) => {
 		(history as unknown[]).unshift({ role: "system", content: systemPrompt });
@@ -34,9 +42,16 @@ const testProvider: ProviderAdapter = {
 		captured.push({
 			history: JSON.parse(JSON.stringify(params.history)),
 			content: params.content,
+			tools: JSON.parse(JSON.stringify(params.tools)),
+			identity: {
+				conversationId: params.conversationId,
+				stickySessionKey: params.stickySessionKey,
+				metadata: params.metadata,
+				model: params.model,
+			},
 		});
 		yield {
-			toolUses: [{ toolUseId: "tu_decide", name: DECISION_TOOL_NAME, input: { value: "ok" } }],
+			toolUses: [{ toolUseId: "tu_decide", name: emittedTool, input: { value: "ok" } }],
 		};
 	},
 	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
@@ -60,14 +75,17 @@ mock.module("../provider", () => ({
 	}),
 }));
 
-const { runReflectionLoop } = await import("../loop");
+const { agentLoop, runReflectionLoop } = await import("../loop");
 
 toolRegistry.register({
 	name: DECISION_TOOL_NAME,
 	description: "Fake reflection decision tool",
 	reflectionOnly: true,
 	parameters: z.object({ value: z.string() }),
-	execute: async () => ({ output: "decided" }),
+	execute: async () => {
+		decisions++;
+		return { output: "decided" };
+	},
 });
 
 afterAll(() => {
@@ -125,6 +143,92 @@ function systemEntries(history: unknown[]): string[] {
 }
 
 describe("reflection loop cacheable prefix", () => {
+	test("ordinary loops cannot execute reflection decisions", async () => {
+		const before = decisions;
+		for await (const _event of agentLoop({ ...parentConfig(), maxTurns: 1 }, "normal", [])) {
+			/* drain */
+		}
+		expect(decisions).toBe(before);
+	});
+
+	test("reflection rejects ordinary tools even with an allowing parent handler", async () => {
+		let executed = false;
+		const name = "CacheForbiddenTool";
+		toolRegistry.register({
+			name,
+			description: "ordinary",
+			parameters: z.object({ value: z.string() }),
+			execute: async () => {
+				executed = true;
+				return { output: "bad" };
+			},
+		});
+		emittedTool = name;
+		try {
+			const result = await runReflectionLoop({
+				parentConfig: parentConfig(),
+				history: parentHistory(),
+				prompt: "reflect",
+				reflectionLoop: {
+					allowedTools: [DECISION_TOOL_NAME],
+					context: { kind: "taskReflection", requestId: "denial" },
+				},
+			});
+			expect(executed).toBe(false);
+			expect(result.toolResults.some((r) => r.toolName === name && r.isError)).toBe(true);
+		} finally {
+			emittedTool = DECISION_TOOL_NAME;
+			toolRegistry.unregister(name);
+		}
+	});
+	for (const planMode of [false, true]) {
+		test(`inherits complete ordered parent tools (planMode=${planMode})`, async () => {
+			const dynamicName = "CacheDynamicTool";
+			let resolutions = 0;
+			toolRegistry.register({
+				name: dynamicName,
+				description: (config) => `${config.systemPrompt}:${++resolutions}`,
+				getRawJsonSchema: (config) => ({
+					type: "object",
+					description: config.systemPrompt,
+					properties: { value: { const: resolutions } },
+				}),
+				parameters: z.object({}),
+				execute: async () => {
+					throw new Error("Must not execute");
+				},
+			});
+			try {
+				captured = [];
+				const config = {
+					...parentConfig(),
+					maxTurns: 1,
+					planMode,
+					toolFilter: (tool: { name: string }) => tool.name === dynamicName,
+				};
+				for await (const _event of agentLoop(config, "parent", [])) {
+					/* drain */
+				}
+				const parentTools = captured[0].tools;
+				expect(parentTools.map((t) => (t as { name: string }).name)).toContain(DECISION_TOOL_NAME);
+				await runReflectionLoop({
+					parentConfig: config,
+					history: parentHistory(),
+					prompt: "reflect",
+					reflectionLoop: {
+						allowedTools: [DECISION_TOOL_NAME],
+						context: { kind: "taskReflection", requestId: "snapshot" },
+					},
+				});
+				expect(JSON.stringify(captured[1].tools)).toBe(JSON.stringify(parentTools));
+				expect(captured[1].identity).toEqual(captured[0].identity);
+				expect(resolutions).toBe(1);
+			} finally {
+				toolRegistry.unregister(dynamicName);
+			}
+		});
+	}
+
 	test("does not duplicate the system prompt already present in the parent history", async () => {
 		const history = await runReflection(parentHistory());
 

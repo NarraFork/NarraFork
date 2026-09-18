@@ -51,6 +51,17 @@ const KIMI_CLI_USER_AGENT = "KimiCLI/1.6";
 const FETCH_TIMEOUT_MS = 15_000;
 const SAVE_DEBOUNCE_MS = 250;
 
+/**
+ * Age at which a cached entry counts as stale, in ms.
+ *
+ * The app's global cadence for this endpoint: the HTTP route revalidates entries
+ * older than this, so N readers polling at any rate cannot produce more than one
+ * upstream call per provider per window. Exported because a second reader — the
+ * quota-wall resolver in `kimi-quota-wait.ts` — must not raise that rate, and
+ * sharing the number is what keeps the two from drifting apart.
+ */
+export const KIMI_USAGES_STALE_MS = 60_000;
+
 const cacheDir = getNarraforkHome();
 const cachePath = resolve(cacheDir, "kimi-usages.json");
 

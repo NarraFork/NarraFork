@@ -19,6 +19,7 @@ import type {
 } from "./provider";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
+import { parseJsonTextWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 
@@ -1229,12 +1230,13 @@ async function parseInteractionJsonFallback(
 	responseText: string,
 	onTextDelta: GenerateOptions["onTextDelta"],
 ): Promise<GenerateMetaResult> {
-	let interaction: GeminiInteraction;
-	try {
-		interaction = JSON.parse(responseText) as GeminiInteraction;
-	} catch {
-		throw new ApiError(502, "Gemini Interactions API returned invalid JSON");
-	}
+	// Keep the body: "invalid JSON" alone cannot distinguish a malformed payload
+	// from a proxy's HTML error page.
+	const interaction = parseJsonTextWithBody<GeminiInteraction>(responseText, {
+		label: "Gemini Interactions API",
+		status: 200,
+		contentType: "application/json",
+	});
 	const invalid = mapInteractionStatus(interaction);
 	if (invalid && !isCompletionLimitReason(invalid.reason)) {
 		throw new ApiError(statusToHttpCode(interaction.status), invalid.message);

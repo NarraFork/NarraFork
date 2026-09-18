@@ -50,6 +50,7 @@ import type {
 } from "./provider";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { sanitizeHeaders } from "./request-dump";
+import { parseJsonResponseWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
 	type AgentToolUse,
@@ -1000,8 +1001,15 @@ async function parseAnthropicGenerateResponse(
 		return { text, contextPercent, usage, ...(outputTruncated && { outputTruncated }) };
 	}
 
-	// Compatibility fallback for relays that ignore stream=true and still return JSON.
-	const json = (await response.json()) as AnthropicGenerateJsonResponse;
+	// Compatibility fallback for relays that ignore stream=true and still return
+	// JSON. Parsed through parseJsonResponseWithBody because the same 200-with-a
+	// -non-JSON-body shape is how WAFs, reverse proxies, and captive portals
+	// answer; `response.json()` would consume the page and report only that JSON
+	// parsing failed.
+	const json = await parseJsonResponseWithBody<AnthropicGenerateJsonResponse>(
+		response,
+		"Anthropic API",
+	);
 	const stopReason = json.stop_reason ?? undefined;
 	const specialStopReason =
 		stopReason === "max_tokens"

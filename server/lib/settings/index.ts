@@ -99,6 +99,7 @@ export {
 	resolveEffectiveModel,
 	resolveModelContextWindow,
 	resolveProvider,
+	resolveTranslationModelOverride,
 	usesCodexApiMode,
 	usesCodexModel,
 	usesStatefulApi,

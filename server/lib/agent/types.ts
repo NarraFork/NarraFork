@@ -317,7 +317,7 @@ export interface ToolDefinition {
 	execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
 	/** If provided, tool is only included when this returns true */
 	isAvailable?: () => boolean;
-	/** Hide this tool from normal sessions; reflection loops may opt in via allowedTools. */
+	/** Always declared, but executable only in an active reflection loop's allowedTools. */
 	reflectionOnly?: boolean;
 	/** Optional metadata for tool provenance (e.g. MCP server origin). */
 	metadata?: {
@@ -605,12 +605,21 @@ export type AgentEvent =
 	  }
 	| {
 			/**
-			 * The requested NUG model is temporarily unavailable because its whole
-			 * credential pool is disabled (recoverable exhaustion). Unlike
-			 * `retryable_error` (retry the full request repeatedly, re-uploading
-			 * history) this asks the caller to SUSPEND the turn and wait for the
-			 * model to recover via the shared instance-level availability poller,
-			 * then resume with one fresh request. Only emitted for NUG providers.
+			 * The turn cannot proceed, but the condition clears on its own, so the
+			 * caller must SUSPEND the turn rather than replay the full request (which
+			 * re-uploads the whole history every attempt) or fail it.
+			 *
+			 * Two causes share this event; `waitKind` separates them because only the
+			 * caller can act on either — the agent loop has no suspension of its own.
+			 *
+			 *  - `credentials` (default): a NUG model's entire credential pool is
+			 *    disabled. When it comes back is unknowable, so the caller parks on the
+			 *    shared availability poller and resumes when the model reports available.
+			 *  - `quota`: a Kimi coding-plan allowance is used up. The reset instant is
+			 *    published upstream, so `resumeAt` carries it and the caller sleeps to
+			 *    it instead of polling — unless the reset lies beyond the wait budget,
+			 *    in which case `resumeAt` is absent while `quotaResetAt` is not, and the
+			 *    caller reports the wall with that instant attached.
 			 */
 			type: "model_unavailable";
 			message: string;
@@ -620,6 +629,21 @@ export type AgentEvent =
 			providerPrefix?: string;
 			/** `channel:bareModel` id used to match this model in `/v1/models`. */
 			nugModelId?: string;
+			/** How recovery is awaited; `credentials` when omitted. */
+			waitKind?: "credentials" | "quota";
+			/**
+			 * Epoch ms at which the turn may be replayed. Present for a `quota` wait
+			 * whose reset is inside the wait budget — its ABSENCE on a `quota` wall
+			 * means the reset is known but too far out, and the caller must report the
+			 * wall instead of parking on it.
+			 */
+			resumeAt?: number;
+			/**
+			 * Epoch ms the quota window resets at, whenever upstream published one —
+			 * including when the wall is too far out to wait for, so the caller can
+			 * tell the user when the allowance returns.
+			 */
+			quotaResetAt?: number;
 			diagnostics?: ApiRequestDiagnostics;
 	  }
 	| {

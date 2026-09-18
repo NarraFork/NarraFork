@@ -111,6 +111,85 @@ describe("OpenAIProvider HTTP dump", () => {
 	}
 });
 
+describe("OpenAIProvider offline reflection request shape", () => {
+	test("keeps Codex stable body and headers identical outside the input tail", async () => {
+		const captured: Array<{ body: Record<string, unknown>; headers: Record<string, string> }> = [];
+		globalThis.fetch = (async (_input, init) => {
+			captured.push({
+				body: JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>,
+				headers: Object.fromEntries(new Headers((init as RequestInit).headers).entries()),
+			});
+			return new Response("offline verification", { status: 500 });
+		}) as typeof fetch;
+
+		const provider = new OpenAIProvider({
+			...AGENT_IDENTITY_CONFIG,
+			apiKey: "offline-test-key",
+			codexWebSearch: true,
+			codexImageGeneration: true,
+		});
+		const history = [
+			{ role: "developer", content: "stable system prompt" },
+			{ role: "user", content: "parent request" },
+		];
+		const tools = [
+			{
+				type: "function",
+				name: "Read",
+				description: "read",
+				parameters: { type: "object", properties: {} },
+				strict: false,
+			},
+			{
+				type: "function",
+				name: "DangerConfirm",
+				description: "confirm",
+				parameters: { type: "object", properties: {} },
+				strict: false,
+			},
+		];
+		const base = minimalChatParams({
+			model: "codex:gpt-6-astra",
+			history,
+			tools,
+			conversationId: "conv-offline-reflection",
+			stickySessionKey: "narrator-offline",
+			reasoningEffort: "high",
+			serviceTier: "priority",
+		});
+
+		for (const content of ["parent request", "danger reflection prompt"]) {
+			const iterator = provider.chat({
+				...base,
+				content,
+				requestDump: new ApiRequestDumpCollector(),
+			})[Symbol.asyncIterator]();
+			await expect(iterator.next()).rejects.toThrow("offline verification");
+		}
+
+		expect(captured).toHaveLength(2);
+		const [parent, reflection] = captured;
+		const withoutInput = (body: Record<string, unknown>) => {
+			const copy = { ...body };
+			delete copy.input;
+			return copy;
+		};
+		expect(withoutInput(reflection.body)).toEqual(withoutInput(parent.body));
+		expect(reflection.headers).toEqual(parent.headers);
+		expect(reflection.body.prompt_cache_key).toBe("conv-offline-reflection");
+		expect((reflection.body.client_metadata as Record<string, unknown>).session_id).toBe(
+			"conv-offline-reflection",
+		);
+		expect((reflection.body.client_metadata as Record<string, unknown>).thread_id).toBe(
+			"conv-offline-reflection",
+		);
+		expect(reflection.body.tools).toEqual(parent.body.tools);
+		expect((reflection.body.input as unknown[]).slice(0, -1)).toEqual(
+			(parent.body.input as unknown[]).slice(0, -1),
+		);
+	});
+});
+
 describe("OpenAIProvider Agent Identity empty apiKey handling", () => {
 	test("chat() does not throw 'API key not configured' when authorizationHeader is set", async () => {
 		mockFetchCapturingAuth();

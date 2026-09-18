@@ -1,13 +1,20 @@
 import type { Statement } from "bun:sqlite";
 import { z } from "zod/v4";
 import { sqlite } from "../../../db";
-import { buildFtsQuery, sanitizeQuery } from "../../../services/search-service";
+import { searchStore } from "../../../services/search/backend";
+import { canUseIndex, sanitizeQuery } from "../../../services/search/query";
+import type { RecallMessageRow } from "../../../services/search/types";
 import { isBashToolName } from "../tool-name";
 import type { ToolDefinition, ToolResult } from "../types";
 
 /**
  * Recall — optional agent tool for full-text search and browsing of the
  * current narrator conversation stored in NarraFork.
+ *
+ * The message SEARCH runs through the search port (`services/search/`), so its FTS5
+ * expression, snippet markup and time filtering live with the other search statements rather
+ * than in a second copy here. The conversation and tool-call READS below are ordinary
+ * indexed lookups by id — no full-text involved — so they stay as direct queries.
  */
 
 const MAX_SEARCH_LIMIT = 50;
@@ -20,11 +27,7 @@ const MAX_TOOL_CALL_OUTPUT = 4000;
 
 // --- Cached prepared statements (lazy-initialized) ---
 // Avoids creating a new Statement object on every Recall tool invocation.
-// Search statements vary along three axes (mode × kind × time filter), so they
-// are cached in a single Map keyed by a composite string instead of dozens of
-// individually-named slots.
 
-const _searchStmtCache = new Map<string, Statement>();
 let _getNarrator: Statement | null = null;
 let _getRefSeq: Statement | null = null;
 let _msgsAround: Statement | null = null;
@@ -32,87 +35,6 @@ let _msgsLatest: Statement | null = null;
 let _getToolCall: Statement | null = null;
 let _getToolCallAny: Statement | null = null;
 
-function timeWhereSuffix(filter: TimeFilter): string {
-	if (filter.from && filter.to) return " AND m.created_at >= ? AND m.created_at <= ?";
-	if (filter.from) return " AND m.created_at >= ?";
-	if (filter.to) return " AND m.created_at <= ?";
-	return "";
-}
-
-function timeFilterKey(filter: TimeFilter): string {
-	if (filter.from && filter.to) return "range";
-	if (filter.from) return "from";
-	if (filter.to) return "to";
-	return "none";
-}
-
-/**
- * Build the FTS search statement.
- * - scoped (allNarrators=false): join narrator_message_refs and filter by the
- *   current narrator, so fork-shared messages remain visible to this narrator.
- * - global (allNarrators=true): join on the owning narrator (narrator_id column)
- *   like search-service, deduplicating fork-shared messages to their origin.
- */
-function buildSearchFtsSql(allNarrators: boolean, whereSuffix: string): string {
-	if (allNarrators) {
-		return `SELECT m.id, n.id AS narrator_id, m.role, m.created_at,
-		        n.title AS narrator_title, n.chapter_id,
-		        snippet(narrator_messages_fts, 0, '>>>', '<<<', '...', 64) AS snippet
-		 FROM narrator_messages_fts
-		 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
-		 JOIN narrators n ON n.id = m.narrator_id
-		 WHERE narrator_messages_fts MATCH ?${whereSuffix}
-		 ORDER BY rank
-		 LIMIT ?`;
-	}
-	return `SELECT m.id, r.narrator_id, m.role, m.created_at,
-		        n.title AS narrator_title, n.chapter_id,
-		        snippet(narrator_messages_fts, 0, '>>>', '<<<', '...', 64) AS snippet
-		 FROM narrator_messages_fts
-		 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
-		 JOIN narrator_message_refs r ON r.message_id = m.id
-		 JOIN narrators n ON n.id = r.narrator_id
-		 WHERE narrator_messages_fts MATCH ? AND r.narrator_id = ?${whereSuffix}
-		 ORDER BY rank
-		 LIMIT ?`;
-}
-
-function buildSearchLikeSql(allNarrators: boolean, whereSuffix: string): string {
-	if (allNarrators) {
-		return `SELECT m.id, n.id AS narrator_id, m.role, m.created_at,
-		        n.title AS narrator_title, n.chapter_id,
-		        substr(m.content_text, 1, ?) AS snippet
-		 FROM narrator_messages m
-		 JOIN narrators n ON n.id = m.narrator_id
-		 WHERE m.content_text LIKE ?${whereSuffix}
-		 ORDER BY m.created_at DESC
-		 LIMIT ?`;
-	}
-	return `SELECT m.id, r.narrator_id, m.role, m.created_at,
-		        n.title AS narrator_title, n.chapter_id,
-		        substr(m.content_text, 1, ?) AS snippet
-		 FROM narrator_messages m
-		 JOIN narrator_message_refs r ON r.message_id = m.id
-		 JOIN narrators n ON n.id = r.narrator_id
-		 WHERE m.content_text LIKE ? AND r.narrator_id = ?${whereSuffix}
-		 ORDER BY m.created_at DESC
-		 LIMIT ?`;
-}
-
-function searchStmt(kind: "fts" | "like", allNarrators: boolean, filter: TimeFilter): Statement {
-	const cacheKey = `${kind}:${allNarrators ? "global" : "scoped"}:${timeFilterKey(filter)}`;
-	let stmt = _searchStmtCache.get(cacheKey);
-	if (!stmt) {
-		const suffix = timeWhereSuffix(filter);
-		const sql =
-			kind === "fts"
-				? buildSearchFtsSql(allNarrators, suffix)
-				: buildSearchLikeSql(allNarrators, suffix);
-		stmt = sqlite.prepare(sql);
-		_searchStmtCache.set(cacheKey, stmt);
-	}
-	return stmt;
-}
 function getNarratorStmt() {
 	if (!_getNarrator) {
 		_getNarrator = sqlite.prepare(
@@ -310,7 +232,7 @@ export const recallTool: ToolDefinition = {
 			const queryList: string[] = [];
 			let errorCount = 0;
 			for (const q of queries) {
-				const result = handleSearch(q, limit, timeFilter, currentNarratorId, allNarrators);
+				const result = await handleSearch(q, limit, timeFilter, currentNarratorId, allNarrators);
 				if (result.isError) errorCount++;
 				sections.push(result.output);
 				// Collect structured results from each sub-search
@@ -548,13 +470,6 @@ function buildTimeFilter(input: {
 	return { filter: { from: parsed.from, to: parsed.to, timeRange: input.timeRange } };
 }
 
-function timeFilterParams(filter: TimeFilter): string[] {
-	if (filter.from && filter.to) return [filter.from, filter.to];
-	if (filter.from) return [filter.from];
-	if (filter.to) return [filter.to];
-	return [];
-}
-
 function describeTimeFilter(filter: TimeFilter | undefined): string {
 	if (!filter) return "";
 	const parts: string[] = [];
@@ -563,13 +478,13 @@ function describeTimeFilter(filter: TimeFilter | undefined): string {
 	return parts.length > 0 ? ` ${parts.join(" ")}` : "";
 }
 
-function handleSearch(
+async function handleSearch(
 	query: string | undefined,
 	limit: number | undefined,
 	timeFilter: TimeFilter | undefined,
 	currentNarratorId: string,
 	allNarrators: boolean,
-): ToolResult {
+): Promise<ToolResult> {
 	if (!query) {
 		return { output: 'Parameter "query" is required for action "search".', isError: true };
 	}
@@ -580,26 +495,20 @@ function handleSearch(
 	}
 
 	const cap = Math.min(Math.max(limit ?? DEFAULT_SEARCH_LIMIT, 1), MAX_SEARCH_LIMIT);
-	const useFts = safeQuery.length >= 3;
-
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic SQL rows
-	let rows: any[];
-
 	const filter = timeFilter ?? {};
-	const timeParams = timeFilterParams(filter);
-	if (useFts) {
-		const ftsExpr = buildFtsQuery(safeQuery);
-		const stmt = searchStmt("fts", allNarrators, filter);
-		rows = allNarrators
-			? stmt.all(ftsExpr, ...timeParams, cap)
-			: stmt.all(ftsExpr, currentNarratorId, ...timeParams, cap);
-	} else {
-		const like = `%${safeQuery}%`;
-		const stmt = searchStmt("like", allNarrators, filter);
-		rows = allNarrators
-			? stmt.all(SNIPPET_CHARS, like, ...timeParams, cap)
-			: stmt.all(SNIPPET_CHARS, like, currentNarratorId, ...timeParams, cap);
-	}
+
+	const rows: RecallMessageRow[] = await searchStore.searchRecallMessages({
+		text: safeQuery,
+		strategy: canUseIndex(safeQuery) ? "index" : "substring",
+		limit: cap,
+		// `null` widens the search to every narrator. The tool's permission flow has already
+		// approved that before this point; scoped mode resolves through the narrator's own
+		// refs so fork-shared history stays visible to it.
+		narratorId: allNarrators ? null : currentNarratorId,
+		...(filter.from ? { createdFrom: filter.from } : {}),
+		...(filter.to ? { createdTo: filter.to } : {}),
+		previewChars: SNIPPET_CHARS,
+	});
 
 	if (rows.length === 0) {
 		return {
@@ -614,13 +523,13 @@ function handleSearch(
 	}
 
 	const results: SearchResultItem[] = rows.map((row) => ({
-		id: row.id,
-		narratorId: row.narrator_id,
-		narratorTitle: row.narrator_title ?? null,
-		chapterId: row.chapter_id ?? null,
+		id: row.messageId,
+		narratorId: row.narratorId,
+		narratorTitle: row.narratorTitle,
+		chapterId: row.chapterId,
 		role: row.role,
-		createdAt: row.created_at,
-		snippet: (row.snippet ?? "").replace(/\n/g, " ").slice(0, SNIPPET_CHARS),
+		createdAt: row.createdAt,
+		snippet: row.snippet.replace(/\n/g, " ").slice(0, SNIPPET_CHARS),
 	}));
 
 	const lines: string[] = [

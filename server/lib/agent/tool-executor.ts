@@ -711,6 +711,17 @@ export async function executeTool(
 			};
 		}
 
+		if (
+			(config.reflectionLoop && !config.reflectionLoop.allowedTools.includes(tu.name)) ||
+			(tool.reflectionOnly && !config.reflectionLoop)
+		) {
+			return {
+				output: `Tool is not allowed in the current reflection context: ${tu.name}`,
+				isError: true,
+				durationMs: 0,
+			};
+		}
+
 		const allowedTools =
 			config.allowedTools instanceof Set
 				? config.allowedTools

@@ -366,10 +366,12 @@ export const teamStatusTool: ToolDefinition = {
 					isBroadcast: true,
 				};
 				const deliveryIds = new Map(
-					targets.map((target) => [
-						target.id,
-						deliverTeamMessage(target.id, msg, parentNarratorId),
-					]),
+					await Promise.all(
+						targets.map(
+							async (target) =>
+								[target.id, await deliverTeamMessage(target.id, msg, parentNarratorId)] as const,
+						),
+					),
 				);
 				const nonWorking = targets.filter(
 					(t: { id: string; status: string }) => t.status !== "working",
@@ -443,7 +445,7 @@ export const teamStatusTool: ToolDefinition = {
 				};
 				// Inbox keys are real narrator ids; delivering under an alias would drop the
 				// message into an inbox nobody drains.
-				const deliveryMessageId = deliverTeamMessage(resolvedTargetId, msg, parentNarratorId);
+				const deliveryMessageId = await deliverTeamMessage(resolvedTargetId, msg, parentNarratorId);
 				const warning =
 					target.status !== "working"
 						? ` (warning: target is ${target.status}, message may not be received)`

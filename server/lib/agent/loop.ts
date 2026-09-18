@@ -6,7 +6,13 @@ import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec
 import { specVfsService } from "../../services/spec-vfs-service";
 import { beginNarratorResponseActivity } from "../../services/update-coordinator";
 import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
-import { type DangerReflectionLevel, resolveBooleanOverride } from "../boolean-override";
+import {
+	type BooleanOverride,
+	type DangerReflectionLevel,
+	normalizeBooleanOverride,
+	resolveBooleanOverride,
+} from "../boolean-override";
+import { resolveKimiQuotaWait } from "../kimi-quota-wait";
 import { logger } from "../logger";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
@@ -1316,6 +1322,19 @@ async function recordUnfinishedReflectionApiRequests(
  * The nested loop gets an isolated tool allowlist and no parent event/prompt hooks,
  * so callers can reuse the pattern without hand-rolling another agentLoop wrapper.
  */
+// Wire declarations are independent of execution policy. Capture the actual parent
+// request, including its adapter/model, rather than re-resolving dynamic definitions.
+const requestToolSnapshots = new WeakMap<
+	AgentConfig,
+	{
+		adapter: ReturnType<typeof resolveProviderAndModel>["adapter"];
+		provider: string;
+		model: string;
+		tools: unknown[];
+	}
+>();
+const inheritedPromptConfigs = new WeakSet<AgentConfig>();
+
 export async function runReflectionLoop(
 	options: ReflectionLoopRunOptions,
 ): Promise<ReflectionLoopObservation> {
@@ -1366,10 +1385,9 @@ export async function runReflectionLoop(
 			signal: abortController.signal,
 			maxTurns,
 			reflectionLoop,
-			// See inheritsInjectedSystemPrompt above: the inherited history already
-			// carries the parent's system prompt, so clearing it here keeps the
-			// reflection request byte-identical to the parent prefix.
-			...(inheritsInjectedSystemPrompt ? { systemPrompt: undefined } : {}),
+			// Keep systemPrompt available to dynamic tool definitions; suppress only injection.
+			getRuntimeSettingsOverride: undefined,
+			getModelOverride: undefined,
 			// Reflection is an auxiliary call: follow the user's retry policy but
 			// hard-cap attempts (e.g. don't inherit an infinite/-1 or oversized
 			// maxTransientRetries from the parent primary loop).
@@ -1385,13 +1403,8 @@ export async function runReflectionLoop(
 			onCompletedToolCount: undefined,
 			silentToolCallThreshold: -1,
 			shouldStop: undefined,
-			toolFilter: undefined,
-			// The parent's hard allow-list (e.g. an OAuth narrator's runtime tool ceiling) is
-			// dropped here: it never contains the reflection decision tools, and executeTool
-			// enforces it before the permission handler runs, so inheriting it would make every
-			// reflection loop fail to decide and fail closed. reflectionLoop.allowedTools below
-			// is this loop's only tool boundary, and it is strictly narrower.
-			allowedTools: undefined,
+			// Declaration filtering remains inherited; execution uses the gate's hard ceiling.
+			allowedTools: new Set(reflectionLoop.allowedTools),
 			disabledTools: undefined,
 			permissionHandler: async (toolName) => {
 				if (allowedTools.has(toolName)) return { behavior: "allow" };
@@ -1404,6 +1417,9 @@ export async function runReflectionLoop(
 				};
 			},
 		};
+		if (inheritsInjectedSystemPrompt) inheritedPromptConfigs.add(reflectionConfig);
+		const snapshot = requestToolSnapshots.get(parentConfig);
+		if (snapshot) requestToolSnapshots.set(reflectionConfig, snapshot);
 		for await (const event of agentLoop(reflectionConfig, prompt, [...history])) {
 			if (event.type === "api_request_start") {
 				pendingApiRequests.set(
@@ -1484,7 +1500,7 @@ export async function runReflectionLoop(
 				narratorId: parentConfig.narratorId,
 				kind: reflectionLoop.context.kind,
 				requestId: reflectionLoop.context.requestId,
-				allowedTools: reflectionLoop.allowedTools,
+				allowedTools: [...reflectionLoop.allowedTools],
 				...observed,
 			});
 		}
@@ -1900,6 +1916,80 @@ export function shouldRunExitPlanModeReflection(
 	);
 }
 
+type PlanReflectionOverrideRow = {
+	planReflectionAutoApproveOverride?: unknown;
+};
+
+type PlanReflectionOverrideLoader = (
+	narratorId: string,
+) => Promise<PlanReflectionOverrideRow | null>;
+
+/**
+ * Test seam for the ExitPlanMode reflection gate's decision-time DB reload.
+ * Production always uses narratorService.getById; tests inject a loader to pin
+ * the "pass-start snapshot vs live override" split without a real database.
+ */
+let planReflectionOverrideLoader: PlanReflectionOverrideLoader | null = null;
+
+export function setPlanReflectionOverrideLoaderForTests(
+	loader: PlanReflectionOverrideLoader | null,
+): void {
+	planReflectionOverrideLoader = loader;
+}
+
+async function loadLivePlanReflectionAutoApproveOverride(
+	narratorId: string,
+): Promise<BooleanOverride | undefined> {
+	// undefined = reload failed / narrator missing → keep the pass-start snapshot.
+	const loader: PlanReflectionOverrideLoader =
+		planReflectionOverrideLoader ??
+		(async (id) => {
+			const { narratorService } = await import("../../services/narrator-service");
+			return narratorService.getById(id);
+		});
+	try {
+		const row = await loader(narratorId);
+		if (!row) return undefined;
+		return normalizeBooleanOverride(row.planReflectionAutoApproveOverride);
+	} catch (err) {
+		logger.debug("Live plan-reflection override reload failed; using pass snapshot", {
+			narratorId,
+			err: err instanceof Error ? err.message : String(err),
+		});
+		return undefined;
+	}
+}
+
+/**
+ * Decision-time gate for ExitPlanMode plan reflection.
+ *
+ * AgentConfig freezes `planReflectionAutoApproveOverride` when a pass starts, so
+ * flipping the permission-menu switch mid-turn used to leave ExitPlanMode running
+ * reflection under the old snapshot. This wrapper re-reads the narrator row at the
+ * tool-routing decision point (option B): a successful reload always wins over the
+ * frozen config; a failed reload falls back to the snapshot so the gate still works
+ * when the DB is briefly unavailable.
+ */
+export async function shouldRunExitPlanModeReflectionLive(
+	config: Pick<
+		AgentConfig,
+		| "narratorId"
+		| "reflectionLoop"
+		| "permissionMode"
+		| "planReflectionAutoApprove"
+		| "planReflectionAutoApproveOverride"
+	>,
+): Promise<boolean> {
+	const liveOverride = await loadLivePlanReflectionAutoApproveOverride(config.narratorId);
+	return shouldRunExitPlanModeReflection({
+		reflectionLoop: config.reflectionLoop,
+		permissionMode: config.permissionMode,
+		planReflectionAutoApprove: config.planReflectionAutoApprove,
+		planReflectionAutoApproveOverride:
+			liveOverride !== undefined ? liveOverride : config.planReflectionAutoApproveOverride,
+	});
+}
+
 export function shouldRunTaskReflection(config: Pick<AgentConfig, "reflectionLoop">): boolean {
 	return !config.reflectionLoop;
 }
@@ -2173,7 +2263,9 @@ async function executeToolAfterReflections(
 			});
 		};
 
-		if (tu.name === "ExitPlanMode" && shouldRunExitPlanModeReflection(config)) {
+		// Decision-time reload: the permission-menu "计划反思" switch must apply to a
+		// still-running pass, not only to the next AgentConfig snapshot.
+		if (tu.name === "ExitPlanMode" && (await shouldRunExitPlanModeReflectionLive(config))) {
 			const reflectionConfig = preFrozenExecution
 				? {
 						...config,
@@ -2300,7 +2392,8 @@ export async function* agentLoop(
 		}
 		executionBindings.set(tu, Object.freeze({ ...binding }));
 	};
-	const resolvedProvider = resolveProviderAndModel(config.model);
+	const inheritedTools = config.reflectionLoop ? requestToolSnapshots.get(config) : undefined;
+	const resolvedProvider = inheritedTools ?? resolveProviderAndModel(config.model);
 	let provider = resolvedProvider.adapter;
 	let effectiveModel = resolvedProvider.model;
 	let effectiveProvider = resolvedProvider.provider;
@@ -2329,8 +2422,7 @@ export async function* agentLoop(
 		return run;
 	};
 
-	let allTools: ResolvedToolDefinition[] = toolRegistry
-		.all()
+	let allTools: ResolvedToolDefinition[] = (inheritedTools ? [] : toolRegistry.all())
 		.filter((t) => t.name && (!t.isAvailable || t.isAvailable()))
 		// Last line of defence before the wire. Providers validate the whole `tools`
 		// array and reject the entire request when one name breaks their alphabet
@@ -2358,7 +2450,7 @@ export async function* agentLoop(
 
 	// Apply toolFilter if provided (used by subagents to restrict available tools)
 	if (config.toolFilter) {
-		allTools = allTools.filter(config.toolFilter);
+		allTools = allTools.filter((tool) => tool.reflectionOnly || config.toolFilter?.(tool));
 	}
 
 	// Keep SwitchDevice available for a stale remote default so the model can
@@ -2415,7 +2507,9 @@ export async function* agentLoop(
 		return resolved;
 	}
 
-	let tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
+	let tools =
+		inheritedTools?.tools ??
+		provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
 	/**
 	 * The plan-mode tool-description state `tools` was formatted with.
 	 *
@@ -2656,8 +2750,8 @@ export async function* agentLoop(
 	// Shallow-copy to avoid mutating the caller's array
 	history = [...history];
 
-	// Inject system prompt via provider-specific mechanism
-	if (config.systemPrompt) {
+	// Inherited reflection history already contains this prompt.
+	if (config.systemPrompt && !inheritedPromptConfigs.has(config)) {
 		provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
 	}
 
@@ -2824,7 +2918,7 @@ export async function* agentLoop(
 				// the forbidden tools carry (or drop) the disabled description. Checked after
 				// onBeforeTurn because a model switch there already re-formatted the tools.
 				const planModeDisabledNow = planModeDisablesTools();
-				if (planModeDisabledNow !== toolsPlanModeDisabled) {
+				if (!inheritedTools && planModeDisabledNow !== toolsPlanModeDisabled) {
 					toolsPlanModeDisabled = planModeDisabledNow;
 					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
 					logger.info("Re-formatted tools after a mid-loop plan-mode change", {
@@ -3667,6 +3761,9 @@ export async function* agentLoop(
 				return outputIndex == null ? "__default" : `output:${outputIndex}`;
 			}
 
+			// Settle every completed call through the normal permission/serial execution path
+			// before handing the interruption back to the caller's bounded retry budget.
+			let pendingResumableError: Extract<AgentEvent, { type: "resumable_error" }> | undefined;
 			chatRetryLoop: for (;;) {
 				// Reset per-attempt accumulators so a retry starts with a clean slate.
 				// (On the first attempt these are already empty; on retries they may
@@ -3798,6 +3895,12 @@ export async function* agentLoop(
 							}
 						}
 					}
+					requestToolSnapshots.set(config, {
+						adapter: provider,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						tools,
+					});
 					const stream = provider.chat({
 						conversationId: config.conversationId,
 						content,
@@ -4749,6 +4852,42 @@ export async function* agentLoop(
 									return;
 								}
 							}
+							// Guard first, so a turn that already ran tools does not pay for a
+							// usage lookup it could never act on.
+							if (!hasStartedEarlyToolExecution()) {
+								// Kimi coding-plan allowance used up (403 "usage limit"). Unlike
+								// the NUG case above this is NOT unknowable: the window's reset
+								// instant is published, so the caller waits on the clock rather
+								// than on a poller.
+								//
+								// A wall whose reset is beyond the wait budget is forwarded too
+								// (`quotaResetAt` without `resumeAt`): the caller then reports it
+								// WITH the recovery time, because "spent, returns at T" is
+								// actionable and an opaque 403 is not.
+								const kimiQuota = await resolveKimiQuotaWait(
+									effectiveProvider,
+									`${message}\n${requestDiagnostics?.responseSnippet ?? ""}`,
+								);
+								if (kimiQuota.kind !== "none") {
+									const { providerId, providerPrefix, resetAt } =
+										kimiQuota.kind === "wait" ? kimiQuota.wait : kimiQuota.refusal;
+									yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+									yield* finishRequest(message);
+									yield {
+										type: "model_unavailable",
+										message,
+										provider: effectiveProvider,
+										model: effectiveModel,
+										providerId,
+										providerPrefix,
+										waitKind: "quota",
+										resumeAt: kimiQuota.kind === "wait" ? kimiQuota.wait.resumeAt : undefined,
+										quotaResetAt: resetAt,
+										diagnostics: requestDiagnostics,
+									};
+									return;
+								}
+							}
 							// Resumable but nothing landed locally: the gateway counted some
 							// non-content event as forwarded payload, so it refuses a wholesale
 							// retry, yet we have no visible output and no tool side effect to
@@ -4917,25 +5056,15 @@ export async function* agentLoop(
 										startedToolCount: earlyExecMap.size,
 										settledToolCount: settledResults.size,
 									});
-									// Drain and persist the completed work, then end the turn as
-									// RESUMABLE rather than as a hard failure.
-									//
-									// `resumable_error` is the only exit that both preserves the work and
-									// stays bounded. `invalid_state` / `retryable_error` end the run for a
-									// stateless provider (narrator-executor sets hasError; narrator-session
-									// gives up once in-loop retries are exhausted), stranding tool calls
-									// that already had side effects behind a hard failure. Simply breaking
-									// out of the retry loop to "finish normally" is worse: the upstream is
-									// still failing, so the turn loop would immediately try again with no
-									// budget of its own and spin. Both executors treat `resumable_error` as
-									// an interrupted pass and cap the continuations
-									// (MAX_INTERRUPTION_RETRIES), so the completed tool results reach
-									// history and the retry count is finite.
-									yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-									yield* drainStartedEarlyToolResults();
-									yield* finishRequest(message);
-									yield { type: "resumable_error", message, diagnostics: requestDiagnostics };
-									return;
+									// Draining eager calls alone strands completed deferred calls (Browser,
+									// strict-serial tools). Execute them normally, but never start another
+									// provider turn here: the caller owns the interruption retry budget.
+									pendingResumableError = {
+										type: "resumable_error",
+										message,
+										diagnostics: requestDiagnostics,
+									};
+									break chatRetryLoop;
 								}
 								// In-loop retry: skip block_complete persistence and retry
 								// the same chat() call with identical parameters.
@@ -5201,6 +5330,41 @@ export async function* agentLoop(
 						};
 						return;
 					}
+					// Kimi coding-plan allowance used up (403 "usage limit"). Same suspend-
+					// and-replay contract as the NUG branch above, but the reset instant is
+					// published, so the caller waits on the clock rather than on a poller.
+					// Mirrors the invalidState branch earlier in this loop.
+					{
+						// Kimi coding-plan allowance used up (403 "usage limit"). Same
+						// contract as the NUG branch above, but the reset instant is
+						// published, so the caller waits on the clock rather than on a
+						// poller — or, when the reset is beyond the wait budget, reports the
+						// wall with that instant attached (`quotaResetAt` without `resumeAt`).
+						// Mirrors the invalidState branch earlier in this loop.
+						const kimiQuota = await resolveKimiQuotaWait(
+							effectiveProvider,
+							`${msg}\n${requestDiagnostics?.responseSnippet ?? ""}`,
+						);
+						if (kimiQuota.kind !== "none") {
+							const { providerId, providerPrefix, resetAt } =
+								kimiQuota.kind === "wait" ? kimiQuota.wait : kimiQuota.refusal;
+							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+							yield* finishRequest(msg);
+							yield {
+								type: "model_unavailable",
+								message: msg,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								providerId,
+								providerPrefix,
+								waitKind: "quota",
+								resumeAt: kimiQuota.kind === "wait" ? kimiQuota.wait.resumeAt : undefined,
+								quotaResetAt: resetAt,
+								diagnostics: requestDiagnostics,
+							};
+							return;
+						}
+					}
 					// Detect upstream API context length exceeded (HTTP 400)
 					if (
 						err &&
@@ -5372,17 +5536,14 @@ export async function* agentLoop(
 								startedToolCount: earlyExecMap.size,
 								settledToolCount: settledResults.size,
 							});
-							// Same exit as the matching invalidState branch above: drain and persist
-							// the completed work, then end the turn as RESUMABLE. Keeps the tool
-							// results (a hard failure would strand side effects that already
-							// happened) while staying bounded — both executors cap resumable
-							// continuations, whereas finishing "normally" against a still-failing
-							// upstream would let the turn loop spin without a budget.
-							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-							yield* drainStartedEarlyToolResults();
-							yield* finishRequest(msg);
-							yield { type: "resumable_error", message: msg, diagnostics: requestDiagnostics };
-							return;
+							// Share normal settlement with the invalidState path, including calls
+							// whose input completed but which were not eligible for eager execution.
+							pendingResumableError = {
+								type: "resumable_error",
+								message: msg,
+								diagnostics: requestDiagnostics,
+							};
+							break;
 						}
 						// In-loop retry for stateless providers
 						// -1 means infinite retries (consistent with handleTransientError)
@@ -6022,8 +6183,8 @@ export async function* agentLoop(
 				};
 			}
 
-			// Emit API request end event
-			yield* finishRequest();
+			// Emit API request end event, retaining the failed stream's diagnostics.
+			yield* finishRequest(pendingResumableError?.message);
 
 			// Reset retry counters after a successful turn so the next turn's
 			// backoff starts from the base delay instead of the ceiling.
@@ -6586,6 +6747,15 @@ export async function* agentLoop(
 			// request: direct user feedback may arrive while after-tools injections are drained.
 			if (observeSoftStopForTurn()) {
 				yield { type: "turn_complete", turnIndex };
+				return;
+			}
+
+			if (pendingResumableError) {
+				if (config.signal.aborted) {
+					yield { type: "error", message: "Aborted" };
+				} else {
+					yield pendingResumableError;
+				}
 				return;
 			}
 

@@ -1623,7 +1623,7 @@ class Gateway {
 		// exactly what that user would see in the web UI — never more. With no
 		// resolvable user (fresh install), the empty id matches nothing private.
 		const appUserId = await this.resolveAppUserId();
-		const results = searchService.search({
+		const results = await searchService.search({
 			query,
 			entities: ["narrators"],
 			limit: 10,

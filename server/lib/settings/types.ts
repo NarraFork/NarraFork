@@ -74,6 +74,19 @@ export interface CustomApiProviderConfig {
 	extraHeaders?: Record<string, string>;
 }
 
+/**
+ * Client-egress relay modes for NUG providers (see docs/CODEX_CLIENT_RELAY.md).
+ * The codex account credentials stay on NUG; only the network egress to OpenAI
+ * comes from this machine.
+ */
+export type NugEgressMode =
+	/** Default: NUG connects to OpenAI directly (status quo). */
+	| "nug"
+	/** This nf dials chatgpt.com with its own IP and relays ciphertext for NUG. */
+	| "local-direct"
+	/** Same, but dialing through a local proxy (e.g. clash) instead. */
+	| "local-proxy";
+
 export interface OpenAIProviderConfig {
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
@@ -122,6 +135,13 @@ export interface OpenAIProviderConfig {
 	proxy?: ProxyOverride;
 	/** Internal: additional request headers injected by provider adapters such as NUG. */
 	extraHeaders?: Record<string, string>;
+	/**
+	 * Internal: per-request dynamic headers, called at request-build time so
+	 * values that change at runtime (e.g. the NUG client-relay channel id,
+	 * which rotates on every reconnect) are always current. Merged after
+	 * extraHeaders, so dynamic values win. Not persisted in settings.
+	 */
+	dynamicHeaders?: () => Record<string, string>;
 	/** Which User-Agent to present on outbound requests. Absent = narrafork UA default. */
 	userAgentMode?: UserAgentMode;
 	/** Custom User-Agent string, used when userAgentMode === "custom". */
@@ -213,6 +233,21 @@ export interface NUGProviderConfig {
 	oauthCallbackUrl?: string;
 	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
 	proxy?: ProxyOverride;
+	/**
+	 * Client-egress relay mode (docs/CODEX_CLIENT_RELAY.md). Absent/"nug" = NUG
+	 * dials upstream directly (status quo). "local-direct"/"local-proxy" make
+	 * this nf lend its own egress to NUG for codex requests; credentials stay
+	 * on NUG and are never visible to this process.
+	 */
+	egressMode?: NugEgressMode;
+	/** Local proxy URL for egressMode "local-proxy", e.g. "http://127.0.0.1:7890". */
+	egressProxyUrl?: string;
+	/**
+	 * When the local relay channel is down, allow requests to fall back to
+	 * NUG-direct egress. Default false: fail loudly instead of silently
+	 * switching egress IP mid-conversation.
+	 */
+	egressAllowDirectFallback?: boolean;
 }
 
 export interface GeminiProviderConfig {
@@ -449,6 +484,27 @@ export interface OidcProviderConfig {
 export interface NarraForkSettings {
 	/** Instance-wide, monotonic setup completion; absent until legacy preferences are migrated. */
 	setupWizardCompleted?: boolean;
+	/**
+	 * Database backend selection. SQLite is the default and needs nothing here.
+	 *
+	 * Selecting PostgreSQL requires `backend: "postgres"` (or NF_DATABASE_BACKEND) AND a
+	 * connection URL from the ENVIRONMENT (NF_DATABASE_URL or DATABASE_URL). The URL is
+	 * deliberately NOT read from this file: the settings object is served by GET /api/settings
+	 * to any authenticated user and a connection string carries credentials, so a
+	 * `database.postgres.url` key is rejected as a configuration error rather than ignored.
+	 * `postgres` below carries only non-secret pool tuning.
+	 */
+	database?: {
+		/** Exact "sqlite" (default) or "postgres"; anything else is a startup error. */
+		backend?: "sqlite" | "postgres";
+		/** Non-secret pool tuning. Numbers only; positive; seconds for the timeouts. */
+		postgres?: {
+			max?: number;
+			idleTimeout?: number;
+			maxLifetime?: number;
+			connectTimeout?: number;
+		};
+	};
 	server: {
 		port: number;
 		host: string;
@@ -886,6 +942,14 @@ export interface NarraForkSettings {
 		disabledRoutines: string[];
 		/** Explicitly enabled routine IDs (for routines with defaultEnabled: false). */
 		enabledRoutines: string[];
+		/**
+		 * Three-position mode per optional tool routine: "manual" | "auto" | "resident".
+		 *
+		 * Authoritative when present; the two lists above are kept in sync as the
+		 * legacy on/off projection (`resident` ↔ enabled, `manual` ↔ disabled) so
+		 * older config files and readers stay correct. See `lib/routine-modes.ts`.
+		 */
+		toolModes?: Record<string, string>;
 	};
 	/** Canonical custom API providers shared by Anthropic/OpenAI/Codex-compatible protocols. */
 	customApiProviders?: CustomApiProviderConfig[];

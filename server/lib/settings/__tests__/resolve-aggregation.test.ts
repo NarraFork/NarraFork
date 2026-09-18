@@ -4,6 +4,7 @@ import {
 	purgeStaleAgentModelRefs,
 	resolveAggregation,
 	resolveEffectiveModel,
+	resolveTranslationModelOverride,
 	settings,
 } from "../index";
 import type { ModelAggregation } from "../types";
@@ -26,12 +27,14 @@ describe("resolveAggregation", () => {
 	let originalDisabledProviders: string[] | undefined;
 	let originalDefaultModel: string;
 	let originalSummaryModel: string;
+	let originalTranslationModel: string;
 
 	beforeEach(() => {
 		originalAggregations = settings.agent?.modelAggregations;
 		originalDisabledProviders = settings.agent?.disabledProviders;
 		originalDefaultModel = settings.agent.defaultModel;
 		originalSummaryModel = settings.agent.summaryModel;
+		originalTranslationModel = settings.agent.translationModel;
 		if (settings.agent) settings.agent.disabledProviders = [];
 	});
 
@@ -41,6 +44,7 @@ describe("resolveAggregation", () => {
 			settings.agent.disabledProviders = originalDisabledProviders;
 			settings.agent.defaultModel = originalDefaultModel;
 			settings.agent.summaryModel = originalSummaryModel;
+			settings.agent.translationModel = originalTranslationModel;
 		}
 	});
 
@@ -107,6 +111,41 @@ describe("resolveAggregation", () => {
 		settings.agent.summaryModel = "provNext:model";
 		expect(resolveEffectiveModel(DEFAULTS.agent.translationModel)).toBe("provNext:model");
 		expect(resolveEffectiveModel("provTranslation:model")).toBe("provTranslation:model");
+	});
+
+	// The translation setting only takes effect through this resolver: reasoning
+	// translation passes its return value as summaryGenerate's `modelOverride`.
+	// It must return `undefined` (not the resolved summary model) while following,
+	// because an override pins the model at call time and would freeze the binding.
+	test("translation override is undefined while following the summary model", () => {
+		settings.agent.defaultModel = "provDefault:model";
+		settings.agent.summaryModel = "provSummary:model";
+
+		settings.agent.translationModel = "__summary__";
+		expect(resolveTranslationModelOverride()).toBeUndefined();
+
+		// A provider-qualified sentinel is the same instruction, not a real model.
+		settings.agent.translationModel = "provA:__summary__";
+		expect(resolveTranslationModelOverride()).toBeUndefined();
+
+		// Empty means "unconfigured", which also follows the summary model.
+		settings.agent.translationModel = "";
+		expect(resolveTranslationModelOverride()).toBeUndefined();
+	});
+
+	test("a configured translation model is returned verbatim, not resolved", () => {
+		settings.agent.defaultModel = "provDefault:model";
+		settings.agent.summaryModel = "provSummary:model";
+
+		settings.agent.translationModel = "provTranslation:model";
+		expect(resolveTranslationModelOverride()).toBe("provTranslation:model");
+
+		// Meta references other than __summary__ pass through untouched — the
+		// generate path resolves them, so they keep following their own target.
+		settings.agent.translationModel = "__default__";
+		expect(resolveTranslationModelOverride()).toBe("__default__");
+		settings.agent.translationModel = `__agg__:${AGG_ID}`;
+		expect(resolveTranslationModelOverride()).toBe(`__agg__:${AGG_ID}`);
 	});
 
 	test("stale translation model falls back to following the summary model", () => {

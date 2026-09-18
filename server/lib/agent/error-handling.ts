@@ -154,7 +154,14 @@ const RETRYABLE_ERROR_CODES = new Set([
 const USAGE_LIMIT_PATTERN = /usage[\s_-]*limit/;
 const USAGE_CONSUMED_PATTERN = /reach|exceed|exhaust|hit/;
 
-function isHardUsageLimitText(text: string): boolean {
+/**
+ * Exported so a provider-specific recovery path can recognize the same wording
+ * family instead of re-deriving it. The Kimi coding-plan quota wall
+ * (`kimi-quota-wait.ts`) is one: it is a usage limit like any other, but unlike
+ * the billing walls this function also matches, it is recoverable on a published
+ * schedule, so it may wait instead of terminating the turn.
+ */
+export function isHardUsageLimitText(text: string): boolean {
 	return USAGE_LIMIT_PATTERN.test(text) && USAGE_CONSUMED_PATTERN.test(text);
 }
 

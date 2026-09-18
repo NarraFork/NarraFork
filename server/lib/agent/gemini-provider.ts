@@ -19,6 +19,7 @@ import type {
 } from "./provider";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
+import { parseJsonTextWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 
@@ -1107,12 +1108,13 @@ async function parseGenerateJsonFallback(
 	responseText: string,
 	onTextDelta: GenerateOptions["onTextDelta"],
 ): Promise<GenerateMetaResult> {
-	let json: GeminiStreamChunk;
-	try {
-		json = JSON.parse(responseText) as GeminiStreamChunk;
-	} catch {
-		throw new ApiError(502, "Gemini API returned invalid JSON");
-	}
+	// The body is already in hand here, so keep it: reporting only "invalid JSON"
+	// discards the one thing that identifies an HTML error page as such.
+	const json = parseJsonTextWithBody<GeminiStreamChunk>(responseText, {
+		label: "Gemini API",
+		status: 200,
+		contentType: "application/json",
+	});
 	if (json.error) {
 		throw new ApiError(json.error.code ?? 500, `Gemini API error: ${json.error.message}`);
 	}

@@ -11,6 +11,17 @@
 
 import { access, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import {
+	applyToolRoutineMode,
+	clearToolRoutineMode,
+	isPreloadedMode,
+	type RoutineModeConfig,
+	resolveEffectiveToolRoutineMode,
+	resolveProjectToolRoutineModeOverride,
+	resolveToolRoutineMode,
+	type ToolRoutineMode,
+	type ToolRoutineModeOverride,
+} from "@shared/routine-modes";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { projects, userPreferences } from "../db/schema";
@@ -74,39 +85,34 @@ export interface RoutineStatus {
 	descriptionEn: string;
 	descriptionZh: string;
 	enabled: boolean;
+	/**
+	 * Three-position mode. Only meaningful for `type: "tool"` routines; command and
+	 * skill routines stay a plain on/off and report `undefined`.
+	 *
+	 * `enabled` remains the projection `mode === "resident"`, so existing callers
+	 * (and older clients) keep working.
+	 */
+	mode?: ToolRoutineMode;
 }
 
-/** Check if a routine is globally enabled (not in the disabled list). */
-function isGloballyEnabled(routineId: string): boolean {
+/** The global settings layer, in the shape the mode resolver expects. */
+function globalRoutineConfig(): RoutineModeConfig {
+	return settings.routines ?? {};
+}
+
+/** Check if a routine is enabled for a specific project (project layer wins). */
+function isProjectEnabled(routineId: string, projectRoutines?: RoutineModeConfig): boolean {
 	const routine = getBuiltinRoutine(routineId);
-	const disabled = settings.routines?.disabledRoutines ?? [];
-	// Routines default to off (defaultEnabled omitted or false).
-	// They require explicit opt-in via the enabledRoutines whitelist.
-	// Routines with defaultEnabled: true use the legacy blacklist approach.
-	if (!routine?.defaultEnabled) {
-		const enabled = settings.routines?.enabledRoutines ?? [];
-		return enabled.includes(routineId);
-	}
-	return !disabled.includes(routineId);
+	if (!routine) return false;
+	const { mode } = resolveEffectiveToolRoutineMode(routine, globalRoutineConfig(), projectRoutines);
+	return isPreloadedMode(mode);
 }
 
-/** Check if a routine is enabled for a specific project. */
-function isProjectEnabled(
-	routineId: string,
-	projectRoutines?: { disabledRoutines?: string[]; enabledRoutines?: string[] },
-): boolean {
-	const globalEnabled = isGloballyEnabled(routineId);
-	if (!projectRoutines) return globalEnabled;
-
-	// Project-level enable overrides global disable
-	if (projectRoutines.enabledRoutines?.includes(routineId)) return true;
-	// Project-level disable overrides global enable
-	if (projectRoutines.disabledRoutines?.includes(routineId)) return false;
-
-	return globalEnabled;
-}
-
-function routineToStatus(r: BuiltinRoutine, enabled: boolean): RoutineStatus {
+function routineToStatus(
+	r: BuiltinRoutine,
+	enabled: boolean,
+	mode?: ToolRoutineMode,
+): RoutineStatus {
 	const def = r.type === "command" ? r.command : r.type === "skill" ? r.skill : r.tool;
 	if (!def) throw new ValidationError(`Routine ${r.id} missing definition`);
 	return {
@@ -117,32 +123,83 @@ function routineToStatus(r: BuiltinRoutine, enabled: boolean): RoutineStatus {
 		descriptionEn: def.descriptionEn,
 		descriptionZh: def.descriptionZh,
 		enabled,
+		...(r.type === "tool" && mode ? { mode } : {}),
 	};
 }
 
 /** Get all routines with their global enabled status. */
 export function getGlobalRoutineStatuses(): RoutineStatus[] {
-	return getAllBuiltinRoutines().map((r) => routineToStatus(r, isGloballyEnabled(r.id)));
+	const config = globalRoutineConfig();
+	return getAllBuiltinRoutines().map((r) => {
+		const mode = resolveToolRoutineMode(r, config);
+		return routineToStatus(r, isPreloadedMode(mode), mode);
+	});
 }
 
 /** Get all routines with their effective status for a project. */
-export function getProjectRoutineStatuses(projectRoutines?: {
-	disabledRoutines?: string[];
-	enabledRoutines?: string[];
-}): RoutineStatus[] {
-	return getAllBuiltinRoutines().map((r) =>
-		routineToStatus(r, isProjectEnabled(r.id, projectRoutines)),
-	);
+export function getProjectRoutineStatuses(projectRoutines?: RoutineModeConfig): RoutineStatus[] {
+	const config = globalRoutineConfig();
+	return getAllBuiltinRoutines().map((r) => {
+		const { mode } = resolveEffectiveToolRoutineMode(r, config, projectRoutines);
+		return routineToStatus(r, isPreloadedMode(mode), mode);
+	});
 }
 
 // ---------------------------------------------------------------------------
 // Enable / Disable — Global
 // ---------------------------------------------------------------------------
 
+/** Persist a whole routine config layer into global settings. */
+async function saveGlobalRoutineConfig(next: RoutineModeConfig): Promise<void> {
+	const { saveSettings } = await import("../lib/settings");
+	saveSettings({
+		...settings,
+		routines: {
+			...settings.routines,
+			disabledRoutines: next.disabledRoutines ?? [],
+			enabledRoutines: next.enabledRoutines ?? [],
+			toolModes: next.toolModes ?? {},
+		},
+	});
+}
+
+/** Assert a routine exists and is a tool routine (the only kind with modes). */
+function requireToolRoutine(routineId: string): BuiltinRoutine {
+	const routine = getBuiltinRoutine(routineId);
+	if (!routine) throw new NotFoundError("Routine", routineId);
+	if (routine.type !== "tool") {
+		throw new ValidationError(`Routine ${routineId} is not a tool routine and has no mode`);
+	}
+	return routine;
+}
+
+/**
+ * Set the global three-position mode for a tool routine.
+ *
+ * Tool routines need no materialization (no command entry, no SKILL.md file) —
+ * the stored mode is the whole effect, read back by `ensureActive` when a session
+ * is built.
+ */
+export async function setToolRoutineModeGlobal(
+	routineId: string,
+	mode: ToolRoutineMode,
+): Promise<void> {
+	requireToolRoutine(routineId);
+	await saveGlobalRoutineConfig(applyToolRoutineMode(globalRoutineConfig(), routineId, mode));
+	logger.info("Tool routine mode set globally", { routineId, mode });
+}
+
 /** Enable a routine globally: write command/skill to filesystem/DB. */
 export async function enableRoutineGlobal(routineId: string, userId: string): Promise<void> {
 	const routine = getBuiltinRoutine(routineId);
 	if (!routine) throw new NotFoundError("Routine", routineId);
+
+	// Tool routines are mode-driven; "enabled" is the `resident` position. Routing
+	// through the same writer keeps the legacy lists and `toolModes` from drifting.
+	if (routine.type === "tool") {
+		await setToolRoutineModeGlobal(routineId, "resident");
+		return;
+	}
 
 	// Remove from disabled list, add to enabled list in settings
 	const disabled = settings.routines?.disabledRoutines ?? [];
@@ -173,6 +230,12 @@ export async function enableRoutineGlobal(routineId: string, userId: string): Pr
 export async function disableRoutineGlobal(routineId: string, userId: string): Promise<void> {
 	const routine = getBuiltinRoutine(routineId);
 	if (!routine) throw new NotFoundError("Routine", routineId);
+
+	// Tool routines: "disabled" is the `manual` position (loadable via /load only).
+	if (routine.type === "tool") {
+		await setToolRoutineModeGlobal(routineId, "manual");
+		return;
+	}
 
 	// Add to disabled list, remove from enabled list in settings
 	const disabled = settings.routines?.disabledRoutines ?? [];
@@ -210,10 +273,50 @@ export async function disableRoutineGlobal(routineId: string, userId: string): P
 // Enable / Disable — Project
 // ---------------------------------------------------------------------------
 
+/**
+ * Set (or clear) the project-level three-position mode for a tool routine.
+ *
+ * `"global"` removes the project's opinion so the global mode applies again.
+ * Like the global setter, nothing is materialized: tool routines take effect
+ * purely through the stored mode.
+ */
+export async function setToolRoutineModeForProject(
+	routineId: string,
+	projectId: string,
+	mode: ToolRoutineModeOverride,
+): Promise<void> {
+	requireToolRoutine(routineId);
+
+	const project = await db.query.projects.findFirst({
+		where: eq(projects.id, projectId),
+		columns: { id: true, chapterSettings: true },
+	});
+	if (!project) throw new NotFoundError("Project", projectId);
+
+	const cs = parseChapterSettings(project.chapterSettings);
+	cs.routines =
+		mode === "global"
+			? clearToolRoutineMode(cs.routines ?? {}, routineId)
+			: applyToolRoutineMode(cs.routines ?? {}, routineId, mode);
+
+	await db
+		.update(projects)
+		.set({ chapterSettings: JSON.stringify(cs), updatedAt: new Date().toISOString() })
+		.where(eq(projects.id, projectId));
+
+	logger.info("Tool routine mode set for project", { routineId, projectId, mode });
+}
+
 /** Enable a routine for a project. */
 export async function enableRoutineForProject(routineId: string, projectId: string): Promise<void> {
 	const routine = getBuiltinRoutine(routineId);
 	if (!routine) throw new NotFoundError("Routine", routineId);
+
+	// Tool routines are mode-driven — "enabled" means `resident` for this project.
+	if (routine.type === "tool") {
+		await setToolRoutineModeForProject(routineId, projectId, "resident");
+		return;
+	}
 
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, projectId),
@@ -252,6 +355,12 @@ export async function disableRoutineForProject(
 	const routine = getBuiltinRoutine(routineId);
 	if (!routine) throw new NotFoundError("Routine", routineId);
 
+	// Tool routines are mode-driven — "disabled" means `manual` for this project.
+	if (routine.type === "tool") {
+		await setToolRoutineModeForProject(routineId, projectId, "manual");
+		return;
+	}
+
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, projectId),
 		columns: { id: true, gitPath: true, chapterSettings: true },
@@ -287,6 +396,12 @@ export async function disableRoutineForProject(
 export async function resetRoutineForProject(routineId: string, projectId: string): Promise<void> {
 	const routine = getBuiltinRoutine(routineId);
 	if (!routine) throw new NotFoundError("Routine", routineId);
+
+	// Tool routines are mode-driven — "reset" means follow the global mode.
+	if (routine.type === "tool") {
+		await setToolRoutineModeForProject(routineId, projectId, "global");
+		return;
+	}
 
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, projectId),
@@ -335,26 +450,36 @@ export interface ProjectRoutineStatus extends RoutineStatus {
 	/** "global" = follows global, "enabled" = project override on, "disabled" = project override off */
 	override: "global" | "enabled" | "disabled";
 	globalEnabled: boolean;
+	/**
+	 * Project override expressed as a mode, or "global" when the project has no
+	 * opinion. Only present for `type: "tool"` routines.
+	 *
+	 * `override` above stays a tri-state on/off so command and skill rows (and older
+	 * clients) are unaffected; a tool pinned to `auto` reports `override: "disabled"`
+	 * because it is not preloaded, with `modeOverride: "auto"` carrying the detail.
+	 */
+	modeOverride?: ToolRoutineModeOverride;
+	/** The global mode this routine would follow. Only present for tool routines. */
+	globalMode?: ToolRoutineMode;
 }
 
-export function getProjectRoutineStatusesWithOverride(projectRoutines?: {
-	disabledRoutines?: string[];
-	enabledRoutines?: string[];
-}): ProjectRoutineStatus[] {
+export function getProjectRoutineStatusesWithOverride(
+	projectRoutines?: RoutineModeConfig,
+): ProjectRoutineStatus[] {
+	const config = globalRoutineConfig();
 	return getAllBuiltinRoutines().map((r) => {
-		const globalEnabled = isGloballyEnabled(r.id);
-		const isOverrideEnabled = projectRoutines?.enabledRoutines?.includes(r.id) ?? false;
-		const isOverrideDisabled = projectRoutines?.disabledRoutines?.includes(r.id) ?? false;
-		const override: "global" | "enabled" | "disabled" = isOverrideEnabled
-			? "enabled"
-			: isOverrideDisabled
-				? "disabled"
-				: "global";
-		const effective = isProjectEnabled(r.id, projectRoutines);
+		const globalMode = resolveToolRoutineMode(r, config);
+		const globalEnabled = isPreloadedMode(globalMode);
+		const modeOverride = resolveProjectToolRoutineModeOverride(r, projectRoutines);
+		const { mode: effectiveMode } = resolveEffectiveToolRoutineMode(r, config, projectRoutines);
+		const effective = isPreloadedMode(effectiveMode);
+		const override: "global" | "enabled" | "disabled" =
+			modeOverride === "global" ? "global" : isPreloadedMode(modeOverride) ? "enabled" : "disabled";
 		return {
-			...routineToStatus(r, effective),
+			...routineToStatus(r, effective, effectiveMode),
 			override,
 			globalEnabled,
+			...(r.type === "tool" ? { modeOverride, globalMode } : {}),
 		};
 	});
 }
@@ -518,10 +643,7 @@ async function removeProjectSkill(routine: BuiltinRoutine, gitPath: string): Pro
 interface ChapterSettingsObj {
 	autoCreateNarrator?: boolean;
 	commands?: Command[];
-	routines?: {
-		disabledRoutines?: string[];
-		enabledRoutines?: string[];
-	};
+	routines?: RoutineModeConfig;
 	[key: string]: unknown;
 }
 

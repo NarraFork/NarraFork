@@ -140,6 +140,25 @@ describe("Read", () => {
 		expect(result.isError).toBe(true);
 	});
 
+	test("describes bounded reads and restricts read-all mode", () => {
+		expect(readTool.description).toContain("provide both offset and a positive limit");
+		expect(readTool.description).toContain("Do NOT use limit: -1 (read_all)");
+		expect(readTool.description).toContain("Glob");
+		expect(readTool.description).toContain("Grep");
+
+		const zodSchema = zodToJsonSchema(readTool.parameters);
+		const zodProperties = zodSchema.properties as Record<string, { description?: string }>;
+		expect(zodProperties.offset.description).toContain("1-based");
+		expect(zodProperties.limit.description).toContain("small positive value");
+		expect(zodProperties.limit.description).toContain("do not use it for routine inspection");
+
+		const rawSchema = resolveToolJsonSchema(readTool);
+		const rawProperties = rawSchema.properties as Record<string, { description?: string }>;
+		expect(rawProperties.offset.description).toContain("1-based");
+		expect(rawProperties.limit.description).toContain("small positive value");
+		expect(rawProperties.limit.description).toContain("read_all");
+	});
+
 	test("limit=-1 bypasses the default large-file line cap", async () => {
 		const target = join(TEST_DIR, "read-force-full.txt");
 		// 3000 short lines — more than the 2000-line default auto-limit, but well

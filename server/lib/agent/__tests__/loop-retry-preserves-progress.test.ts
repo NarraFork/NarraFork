@@ -20,7 +20,9 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { z } from "zod/v4";
 import type { ParsedStreamEvent, ProviderAdapter } from "../provider";
+import { toolRegistry } from "../tool-registry";
 import { type AgentConfig, type AgentEvent, ApiError } from "../types";
 
 /** Scripted attempts: entry N is the event sequence for the Nth provider.chat() call. */
@@ -136,6 +138,113 @@ beforeEach(() => {
 });
 
 describe("重试不得丢弃已产生的工具进展", () => {
+	for (const failure of ["throw", "invalidState"] as const) {
+		for (const mode of ["allow", "mixed", "deny", "abortBefore", "abort", "softStop"] as const) {
+			test(`Browser deferred 在 ${failure}/${mode} 中正常结算且不重放`, async () => {
+				const originalChat = testProvider.chat;
+				const ac = new AbortController();
+				let calls = 0;
+				let browserExecutions = 0;
+				let readExecutions = 0;
+				let permissions = 0;
+				let streamFailed = false;
+				const completeTool = (name: string, toolUseId: string): ParsedStreamEvent[] => [
+					{ toolUseChunk: { toolUseId, name, stop: false } },
+					{ toolUseChunk: { toolUseId, name, input: '{"action":"fill"}', stop: false } },
+					{ toolUseChunk: { toolUseId, name, stop: true } },
+				];
+				toolRegistry.register({
+					name: "Browser",
+					description: "Mock browser; never accesses a real browser",
+					parameters: z.object({ action: z.string() }),
+					execute: async () => {
+						expect(streamFailed).toBe(true);
+						browserExecutions++;
+						if (mode === "abort") ac.abort();
+						return { output: "filled" };
+					},
+				});
+				toolRegistry.register({
+					name: "Read",
+					description: "Mock eager read",
+					parameters: z.object({ action: z.string() }),
+					execute: async () => {
+						readExecutions++;
+						return { output: "read" };
+					},
+				});
+				testProvider.chat = async function* (params) {
+					params.onRequestStart?.();
+					calls++;
+					if (calls > 1) throw new Error("Unexpected provider replay");
+					if (mode === "mixed") {
+						for (const event of completeTool("Read", "tu-eager")) yield event;
+					}
+					for (const event of completeTool("Browser", "tu-browser")) yield event;
+					expect(browserExecutions).toBe(0);
+					streamFailed = true;
+					if (failure === "throw") throw transientError();
+					yield {
+						invalidState: { reason: "overloaded_error", message: "upstream overloaded" },
+					};
+				};
+				try {
+					const events: AgentEvent[] = [];
+					for await (const event of agentLoop(
+						makeConfig(ac.signal, {
+							maxTransientRetries: 3,
+							shouldStop: () => mode === "softStop" && browserExecutions > 0,
+							permissionHandler: async (toolName) => {
+								if (toolName !== "Browser") return { behavior: "allow" };
+								permissions++;
+								if (mode === "deny") {
+									return { behavior: "deny", message: "not allowed" };
+								}
+								return { behavior: "allow" };
+							},
+						}),
+						"fill the input",
+						[],
+					)) {
+						events.push(event);
+						if (mode === "abortBefore" && event.type === "assistant_message") ac.abort();
+					}
+					expect(calls).toBe(1);
+					expect(permissions).toBe(mode === "abortBefore" ? 0 : 1);
+					expect(browserExecutions).toBe(mode === "deny" || mode === "abortBefore" ? 0 : 1);
+					expect(readExecutions).toBe(mode === "mixed" ? 1 : 0);
+					const results = events.filter((event) => event.type === "tool_result");
+					expect(results).toHaveLength(mode === "abortBefore" ? 0 : mode === "mixed" ? 2 : 1);
+					if (mode !== "abortBefore") {
+						expect(results.find((event) => event.toolName === "Browser")).toMatchObject({
+							isError: mode === "deny",
+						});
+					}
+					expect(events.at(-1)).toMatchObject(
+						mode === "abort" || mode === "abortBefore"
+							? { type: "error", message: "Aborted" }
+							: { type: mode === "softStop" ? "turn_complete" : "resumable_error" },
+					);
+					expect(
+						events.some(
+							(event) =>
+								event.type === "retrying" ||
+								event.type === "attempt_discarded" ||
+								event.type === "done",
+						),
+					).toBe(false);
+					for (const result of results) {
+						expect(events.indexOf(result)).toBeLessThan(events.length - 1);
+					}
+				} finally {
+					testProvider.chat = originalChat;
+					toolRegistry.unregister("Browser");
+					toolRegistry.unregister("Read");
+				}
+			});
+		}
+	}
+
 	test("工具已执行后瞬态失败不得原地重放，必须把结果交回调用方", async () => {
 		// The scripted-array provider cannot throw mid-sequence, and that is exactly the
 		// shape under test: the tool call must LAND before the stream dies. Swap in a

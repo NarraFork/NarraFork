@@ -80,7 +80,7 @@ export const knowledgeSearchTool: ToolDefinition = {
 			const principal = await principalOf(ctx);
 			// Draft-shadow view is the default; only enabled when we have an identified user.
 			const draftUserId = useDraft !== false && principal.userId ? principal.userId : undefined;
-			const results = knowledgeService.search({
+			const results = await knowledgeService.search({
 				q: query,
 				tag,
 				collectionId,

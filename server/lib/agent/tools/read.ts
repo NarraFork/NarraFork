@@ -63,36 +63,38 @@ export const readTool: ToolDefinition = {
 		"expensive way to answer a question StructView answers directly. Read remains the right " +
 		"tool for small files, config, data, logs, images and PDFs, and whenever you genuinely " +
 		"need the complete contents.\n\n" +
+		"Use targeted, bounded reads by default so only the relevant lines enter the context window.\n\n" +
 		"Usage:\n" +
-		"- The file_path parameter must be an absolute local path, or a spec:// URI for Dynamic Spec virtual files\n" +
+		"- The file_path parameter may be an absolute path, a path relative to the current working directory, or a spec:// URI for Dynamic Spec virtual files.\n" +
+		"- When you do not already know the relevant lines, use Glob to locate files and Grep to locate symbols or text before reading.\n" +
+		"- For routine inspection, provide both offset and a positive limit. offset is a 1-based starting line and limit is the smallest number of lines that gives enough context (for example, offset: 120, limit: 80).\n" +
+		"- Continue paging with offset = previous offset + previous limit when more context is needed; do not reread the whole file as a safety measure.\n" +
+		"- Do NOT use limit: -1 (read_all) for routine inspection, exploration, or because the complete file might be useful. Use it only when the user explicitly requests the complete file, or a complete parse/rewrite truly requires it and the file is small enough; page through large files instead.\n" +
+		"- Omitting offset and limit reads from the beginning; large files may be automatically limited, so do not rely on omitted parameters for complete content.\n" +
 		"- Dynamic Spec examples: spec://tasks.json, spec://index.md, spec://behavior_fence. spec:// paths are virtual and do not need to be absolute.\n" +
-		"- By default, it reads the entire file from the beginning\n" +
-		"- You can optionally specify a line offset and limit (especially handy for long files)\n" +
-		"- Set limit to -1 to force reading from the offset (or start) to EOF, bypassing output truncation (up to ~100k chars)\n" +
-		"- Any lines longer than 2000 characters will be truncated\n" +
-		"- Results are returned using cat -n format, with line numbers starting at 1\n" +
+		"- Any lines longer than 2000 characters will be truncated. Results use cat -n format, with line numbers starting at 1.\n" +
 		"- This tool allows Claude Code to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as Claude Code is a multimodal LLM.\n" +
 		'- This tool can read PDF files (.pdf). For large PDFs (more than 10 pages), you MUST provide the pages parameter to read specific page ranges (e.g., pages: "1-5"). Reading a large PDF without the pages parameter will fail. Maximum 20 pages per request.\n' +
 		"- This tool can read Jupyter notebooks (.ipynb files) and returns all cells with their outputs, combining code, text, and visualizations.\n" +
 		"- This tool can only read files, not directories. To read a directory, use an ls command via the Bash tool.\n" +
-		"- You can call multiple tools in a single response. It is always better to speculatively read multiple potentially useful files in parallel.\n" +
-		"- You will regularly be asked to read screenshots. If the user provides a path to a screenshot, ALWAYS use this tool to view the file at the path. This tool will work with all temporary file paths.\n" +
+		"- If the user provides a path to a screenshot, ALWAYS use this tool to view the file at the path.\n" +
 		"- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.",
 	rawJsonSchema: {
 		type: "object",
 		properties: {
 			file_path: {
-				description: "The absolute local path or spec:// Dynamic Spec URI to read",
+				description:
+					"Absolute or current-working-directory-relative path, or a spec:// Dynamic Spec URI, to read",
 				type: "string",
 			},
 			offset: {
 				description:
-					"The line number to start reading from. Only provide if the file is too large to read at once",
+					"1-based line number to start reading from. For targeted reads, pair with a positive limit and start near the relevant lines; do not omit the range just to read extra context.",
 				type: "number",
 			},
 			limit: {
 				description:
-					"The number of lines to read. Set limit to -1 to read from the offset (or start) to EOF while bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
+					"Number of lines to read. Prefer a small positive value that covers only the needed context. -1 means read_all (from offset to EOF) and is restricted to explicit complete-file needs; do not use it for routine inspection or exploration.",
 				type: "number",
 			},
 			pages: {
@@ -108,12 +110,16 @@ export const readTool: ToolDefinition = {
 		return withDeviceParam(readTool.rawJsonSchema as Record<string, unknown>, config);
 	},
 	parameters: z.object({
-		file_path: z.string().describe("The absolute local path or spec:// Dynamic Spec URI to read"),
+		file_path: z
+			.string()
+			.describe(
+				"Absolute or current-working-directory-relative path, or a spec:// Dynamic Spec URI, to read",
+			),
 		offset: looseNumber(
-			"The line number to start reading from. Only provide if the file is too large to read at once",
+			"1-based line number to start reading from. For targeted reads, pair with a positive limit and start near the relevant lines; do not omit the range just to read extra context.",
 		),
 		limit: looseNumber(
-			"The number of lines to read. Set limit to -1 to read from the offset (or start) to EOF while bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
+			"Number of lines to read. Prefer a small positive value that covers only the needed context. -1 means read_all (from offset to EOF) and is restricted to explicit complete-file needs; do not use it for routine inspection or exploration.",
 		),
 		pages: z
 			.string()

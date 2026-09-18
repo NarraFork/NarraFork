@@ -89,9 +89,10 @@ export function truncateOutput(
 
 	const hint =
 		`⚠️ OUTPUT TRUNCATED — only the last ${kept.length} of ${lines.length} lines shown (earlier output omitted). Full output saved to: ${outputPath}\n` +
-		"⚠️ You MUST use Read (path: the file above) to retrieve the full content before proceeding. " +
+		"⚠️ You MUST use Read (path: the file above) to retrieve the needed content before proceeding. " +
 		"Do NOT re-run the command or pipe to a file — the output is already saved. " +
-		"Use Read with offset/limit for paging, or limit=-1 to read the entire file (up to ~100k chars), or Grep to search it.";
+		"Prefer Grep to locate relevant lines, then use Read with a small offset/limit range to page through them. " +
+		"Use limit=-1 (read_all) only when the complete file is explicitly required and its size is manageable.";
 
 	const content = `...${omitted} ${unit} truncated...\n\n${preview}\n\n${hint}`;
 

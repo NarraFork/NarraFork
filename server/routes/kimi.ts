@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import {
 	getAllKimiCachedUsages,
+	KIMI_USAGES_STALE_MS,
 	type KimiUsageCache,
 	refreshAllKimiUsages,
 	refreshStaleKimiUsages,
@@ -30,7 +31,7 @@ import { requireAdmin } from "../middleware/auth";
  * and reaches out to kimi.com on demand.
  */
 
-const STALE_MS = 60_000;
+const STALE_MS = KIMI_USAGES_STALE_MS;
 
 export const kimiRoutes = new Hono();
 

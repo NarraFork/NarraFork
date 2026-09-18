@@ -323,6 +323,23 @@ function isFollowSummaryModelValue(model: string): boolean {
 }
 
 /**
+ * The model reference reasoning translation should use, or `undefined` when it
+ * follows `agent.summaryModel`.
+ *
+ * `undefined` rather than a resolved concrete model on purpose: callers pass it
+ * as `summaryGenerate`'s `modelOverride`, and an override pins the value at call
+ * time. Returning the summary model here would freeze that binding, defeating
+ * the "follow the summary model dynamically" contract of the `__summary__`
+ * sentinel. Aggregations and `__default__` pass through untouched —
+ * `resolveEffectiveModel` inside the generate path resolves them.
+ */
+export function resolveTranslationModelOverride(): string | undefined {
+	const configured = s().agent.translationModel?.trim();
+	if (!configured || isFollowSummaryModelValue(configured)) return undefined;
+	return configured;
+}
+
+/**
  * Normalize a resolved candidate. Returns null when the candidate is empty or
  * still self-referential — callers decide whether that is fatal, so a broken
  * value never silently becomes a concrete model nobody selected.

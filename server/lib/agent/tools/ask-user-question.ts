@@ -1,7 +1,5 @@
 import {
 	assertRuntimeCanAskQuestion,
-	CHILD_QUESTION_MAX_COUNT,
-	CHILD_QUESTION_MAX_WITHDRAW,
 	runtimePolicyForContext,
 } from "@server/services/agent-runtime/policy";
 import type { AsyncQuestionDefinition } from "@server/services/narrator-question-service";
@@ -47,36 +45,34 @@ export function isWithdrawOnlyAskRequest(input: unknown): boolean {
 
 export const askUserQuestionTool: ToolDefinition = {
 	name: "AskUserQuestion",
-	description: (config) =>
-		runtimePolicyForContext(config).capabilities.askUserQuestion === "async-only"
-			? "Ask the user asynchronously with async: true (required). Submit 1-4 related questions, continue with a sensible default, and receive the answer later in this child session. Synchronous questioning and plan approval are unavailable. If the answer becomes necessary, use Await({type: 'question', id}) for your own question only. Withdraw irrelevant own questions with AskUserQuestion({async: true, withdraw: [id]}); task completion does not withdraw pending questions. Never supply answers or claim the user deferred a question. Each call is limited to 4 questions, 4 options per question, 100 withdrawal ids, and 64 KiB of question/withdrawal text."
-			: "Use this tool when you need to ask the user questions during execution. This allows you to:\n" +
-				"1. Gather user preferences or requirements\n" +
-				"2. Clarify ambiguous instructions\n" +
-				"3. Get decisions on implementation choices as you work\n" +
-				"4. Offer choices to the user about what direction to take.\n\n" +
-				"Usage notes:\n" +
-				'- Users will always be able to select "Other" to provide custom text input\n' +
-				"- Use multiSelect: true to allow multiple answers to be selected for a question\n" +
-				'- If you recommend a specific option, make that the first option in the list and add "(Recommended)" at the end of the label\n\n' +
-				'Plan mode note: In plan mode, use this tool to clarify requirements or choose between approaches BEFORE finalizing your plan. Do NOT use this tool to ask "Is my plan ready?" or "Should I proceed?" - use ExitPlanMode for plan approval. IMPORTANT: Do not reference "the plan" in your questions (e.g., "Do you have feedback about the plan?", "Does the plan look good?") because the user cannot see the plan in the UI until you call ExitPlanMode. If you need plan approval, use ExitPlanMode instead.\n\n' +
-				"Preview feature:\n" +
-				"Use the optional `preview` field on options when presenting concrete artifacts that users need to visually compare:\n" +
-				"- ASCII mockups of UI layouts or components\n" +
-				"- Code snippets showing different implementations\n" +
-				"- Diagram variations\n" +
-				"- Configuration examples\n\n" +
-				"Preview content is rendered as markdown in a monospace box. Multi-line text with newlines is supported. When any option has a preview, the UI switches to a side-by-side layout with a vertical option list on the left and preview on the right. Do not use previews for simple preference questions where labels and descriptions suffice. Note: previews are only supported for single-select questions (not multiSelect).\n\n" +
-				"Asynchronous mode (`async: true`):\n" +
-				"By default this tool BLOCKS until the user answers. Set `async: true` to submit the question without stopping: you get an immediate acknowledgement, keep working with a sensible default, and the user's answer arrives later as a message in the conversation — at which point you adjust.\n" +
-				"Use async when ALL of these hold:\n" +
-				"- The answer refines the work but does not decide your next action\n" +
-				"- There is a reasonable default you can proceed with right now\n" +
-				"- Waiting would stall a long task for a small decision\n" +
-				"Use the normal blocking mode when the answer changes what you should do next (which architecture, whether to proceed, which file to modify) — guessing there wastes far more work than waiting does.\n" +
-				"Batch related questions into ONE async call (up to 4) rather than making several; each call becomes a separate item in the user's inbox.\n" +
-				'If you later reach a point where you genuinely cannot proceed without the answer, block on it with `Await({ type: "question", id: "<question id>" })`. That notifies the user that you are now stalled on them, so only do it when a default really will not do — and do it instead of re-asking the same question synchronously.\n' +
-				'When an async question stops mattering (you found the answer, the plan changed), withdraw it via `withdraw: ["<id>"]` so the user is not asked something that no longer matters. Do not re-ask a question you already submitted asynchronously.',
+	description:
+		"Use this tool when you need to ask the user questions during execution. This allows you to:\n" +
+		"1. Gather user preferences or requirements\n" +
+		"2. Clarify ambiguous instructions\n" +
+		"3. Get decisions on implementation choices as you work\n" +
+		"4. Offer choices to the user about what direction to take.\n\n" +
+		"Usage notes:\n" +
+		'- Users will always be able to select "Other" to provide custom text input\n' +
+		"- Use multiSelect: true to allow multiple answers to be selected for a question\n" +
+		'- If you recommend a specific option, make that the first option in the list and add "(Recommended)" at the end of the label\n\n' +
+		'Plan mode note: In plan mode, use this tool to clarify requirements or choose between approaches BEFORE finalizing your plan. Do NOT use this tool to ask "Is my plan ready?" or "Should I proceed?" - use ExitPlanMode for plan approval. IMPORTANT: Do not reference "the plan" in your questions (e.g., "Do you have feedback about the plan?", "Does the plan look good?") because the user cannot see the plan in the UI until you call ExitPlanMode. If you need plan approval, use ExitPlanMode instead.\n\n' +
+		"Preview feature:\n" +
+		"Use the optional `preview` field on options when presenting concrete artifacts that users need to visually compare:\n" +
+		"- ASCII mockups of UI layouts or components\n" +
+		"- Code snippets showing different implementations\n" +
+		"- Diagram variations\n" +
+		"- Configuration examples\n\n" +
+		"Preview content is rendered as markdown in a monospace box. Multi-line text with newlines is supported. When any option has a preview, the UI switches to a side-by-side layout with a vertical option list on the left and preview on the right. Do not use previews for simple preference questions where labels and descriptions suffice. Note: previews are only supported for single-select questions (not multiSelect).\n\n" +
+		"Asynchronous mode (`async: true`):\n" +
+		"By default this tool BLOCKS until the user answers. Set `async: true` to submit the question without stopping: you get an immediate acknowledgement, keep working with a sensible default, and the user's answer arrives later as a message in the conversation — at which point you adjust.\n" +
+		"Use async when ALL of these hold:\n" +
+		"- The answer refines the work but does not decide your next action\n" +
+		"- There is a reasonable default you can proceed with right now\n" +
+		"- Waiting would stall a long task for a small decision\n" +
+		"Use the normal blocking mode when the answer changes what you should do next (which architecture, whether to proceed, which file to modify) — guessing there wastes far more work than waiting does.\n" +
+		"Batch related questions into ONE async call (up to 4) rather than making several; each call becomes a separate item in the user's inbox.\n" +
+		'If you later reach a point where you genuinely cannot proceed without the answer, block on it with `Await({ type: "question", id: "<question id>" })`. That notifies the user that you are now stalled on them, so only do it when a default really will not do — and do it instead of re-asking the same question synchronously.\n' +
+		'When an async question stops mattering (you found the answer, the plan changed), withdraw it via `withdraw: ["<id>"]` so the user is not asked something that no longer matters. Do not re-ask a question you already submitted asynchronously.',
 	rawJsonSchema: {
 		type: "object",
 		properties: {
@@ -201,35 +197,6 @@ export const askUserQuestionTool: ToolDefinition = {
 		required: ["questions"],
 		additionalProperties: false,
 	},
-	getRawJsonSchema(config) {
-		const schema = this.rawJsonSchema as Record<string, unknown>;
-		const mode = runtimePolicyForContext(config).capabilities.askUserQuestion;
-		if (mode !== "async-only") return schema;
-		const properties = { ...(schema.properties as Record<string, unknown>) };
-		delete properties.answers;
-		delete properties.annotations;
-		return {
-			...schema,
-			properties: {
-				...properties,
-				questions: {
-					...(properties.questions as Record<string, unknown>),
-					maxItems: CHILD_QUESTION_MAX_COUNT,
-				},
-				withdraw: {
-					...(properties.withdraw as Record<string, unknown>),
-					maxItems: CHILD_QUESTION_MAX_WITHDRAW,
-				},
-				async: {
-					type: "boolean",
-					const: true,
-					description: "Required: subagents may only submit or withdraw asynchronously.",
-				},
-			},
-			required: ["async"],
-			anyOf: [{ required: ["questions"] }, { required: ["withdraw"] }],
-		};
-	},
 	parameters: z
 		.object({
 			questions: z
@@ -276,11 +243,11 @@ export const askUserQuestionTool: ToolDefinition = {
 	async execute(args, ctx): Promise<ToolResult> {
 		const input = args as Record<string, unknown>;
 		try {
-			assertRuntimeCanAskQuestion(runtimePolicyForContext(ctx), input);
+			assertRuntimeCanAskQuestion(runtimePolicyForContext(ctx));
 			const { assertNarratorCanAskQuestion } = await import(
 				"@server/services/narrator-question-service"
 			);
-			await assertNarratorCanAskQuestion(ctx.narratorId, input);
+			await assertNarratorCanAskQuestion(ctx.narratorId);
 		} catch (error) {
 			return {
 				output: `AskUserQuestion error: ${error instanceof Error ? error.message : String(error)}`,
@@ -383,20 +350,8 @@ async function submitAsyncQuestions(
 	input: Record<string, unknown>,
 	ctx: ToolContext,
 ): Promise<string> {
-	const { resolveNarratorQuestionPolicy } = await import(
-		"@server/services/narrator-question-service"
-	);
-	const asyncOnly =
-		(await resolveNarratorQuestionPolicy(ctx.narratorId)).capabilities.askUserQuestion ===
-		"async-only";
-	if (asyncOnly && !ctx.toolCallBinding)
-		throw new Error("Missing exact tool execution binding for child question submission.");
 	const toolUseId = ctx.currentToolUseId;
 	if (!toolUseId) {
-		if (asyncOnly)
-			throw new Error(
-				"No tool call identity available; retry asynchronously after the tool call is recorded.",
-			);
 		// No tool_use id → no way to anchor the row idempotently. Fall back to the
 		// blocking semantics' message rather than recording something unrecoverable.
 		return "Could not submit asynchronously (no tool call identity available). Ask again without `async` if you need an answer.";
@@ -436,10 +391,6 @@ async function submitAsyncQuestions(
 			columns: { id: true },
 		});
 		if (!call) {
-			if (asyncOnly)
-				throw new Error(
-					"The exact question tool call was not found; retry asynchronously after the tool call is recorded.",
-				);
 			return "Could not submit asynchronously (tool call not found). Ask again without `async` if you need an answer.";
 		}
 
@@ -471,16 +422,15 @@ async function submitAsyncQuestions(
 					`Question submitted asynchronously (id: ${record.id}). Continue working with a sensible default — do NOT wait and do NOT ask this again.`,
 					"The user's answer will arrive as a message in this conversation; adjust your work then.",
 					`If you later reach a point where the answer decides your next step, wait with Await({ type: "question", id: "${record.id}" }).`,
-					`If it stops mattering, withdraw it: AskUserQuestion({ ${asyncOnly ? "async: true, " : ""}withdraw: ["${record.id}"] }).`,
+					`If it stops mattering, withdraw it: AskUserQuestion({ withdraw: ["${record.id}"] }).`,
 				];
 		if (openCount >= service.ASYNC_QUESTION_SOFT_LIMIT) {
 			lines.push(
-				`Note: ${openCount} questions are now waiting for this session. Decide remaining small points yourself${asyncOnly ? "; use Await(question) on an existing own question only when necessary." : ", or ask synchronously when you genuinely need an answer."}`,
+				`Note: ${openCount} questions are now waiting for this session. Decide remaining small points yourself, or ask synchronously when you genuinely need an answer.`,
 			);
 		}
 		return lines.join("\n");
 	} catch (err) {
-		if (asyncOnly) throw err;
 		return `Failed to submit the question asynchronously: ${err instanceof Error ? err.message : String(err)}. Ask again without \`async\` if you need an answer.`;
 	}
 }

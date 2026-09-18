@@ -1,5 +1,10 @@
 import { mkdir, open, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import {
+	normalizeToolRoutineMode,
+	normalizeToolRoutineModeOverride,
+	type RoutineModeConfig,
+} from "@shared/routine-modes";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
@@ -16,6 +21,8 @@ import {
 	getGlobalRoutineStatuses,
 	getProjectRoutineStatusesWithOverride,
 	resetRoutineForProject,
+	setToolRoutineModeForProject,
+	setToolRoutineModeGlobal,
 } from "../services/routine-service";
 
 export const routineRoutes = new Hono();
@@ -43,6 +50,24 @@ routineRoutes.post("/:id/toggle", async (c) => {
 	return c.json({ ok: true });
 });
 
+/**
+ * Set the global three-position mode for an optional tool routine.
+ *
+ * Tool routines only: command and skill routines have no mode, and answering
+ * "ok" for them would silently do nothing.
+ */
+routineRoutes.post("/:id/mode", async (c) => {
+	const routineId = c.req.param("id");
+	const body = await c.req.json<{ mode?: unknown }>();
+	const mode = normalizeToolRoutineMode(body.mode);
+	if (!mode) {
+		throw new ValidationError("mode must be 'manual', 'auto', or 'resident'");
+	}
+
+	await setToolRoutineModeGlobal(routineId, mode);
+	return c.json({ ok: true, mode });
+});
+
 /** List all built-in routines with project-level status. */
 routineRoutes.get("/project/:projectId", async (c) => {
 	await requireProjectAccess(c, c.req.param("projectId"), "read");
@@ -53,7 +78,7 @@ routineRoutes.get("/project/:projectId", async (c) => {
 	});
 	if (!project) throw new NotFoundError("Project", projectId);
 
-	let routinesConf: { disabledRoutines?: string[]; enabledRoutines?: string[] } | undefined;
+	let routinesConf: RoutineModeConfig | undefined;
 	try {
 		const cs =
 			typeof project.chapterSettings === "string"
@@ -92,6 +117,26 @@ routineRoutes.post("/project/:projectId/:id/toggle", async (c) => {
 	}
 
 	return c.json({ ok: true });
+});
+
+/**
+ * Set (or clear) the project-level mode for an optional tool routine.
+ *
+ * `"global"` clears the project's opinion. Same "manage" gate as `toggle`:
+ * changing this affects every narrator working in the project.
+ */
+routineRoutes.post("/project/:projectId/:id/mode", async (c) => {
+	await requireProjectAccess(c, c.req.param("projectId"), "manage");
+	const projectId = c.req.param("projectId");
+	const routineId = c.req.param("id");
+	const body = await c.req.json<{ mode?: unknown }>();
+	const mode = normalizeToolRoutineModeOverride(body.mode);
+	if (!mode) {
+		throw new ValidationError("mode must be 'global', 'manual', 'auto', or 'resident'");
+	}
+
+	await setToolRoutineModeForProject(routineId, projectId, mode);
+	return c.json({ ok: true, mode });
 });
 
 // ── Global Prompt (AGENTS.md / CLAUDE.md) ──
