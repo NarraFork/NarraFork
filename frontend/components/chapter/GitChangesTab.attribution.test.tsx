@@ -24,6 +24,7 @@ import type {
 	CurrentDiffView,
 	FileModificationGroup,
 	GitStatusSummary,
+	ModificationEventSummary,
 	WorkspaceModificationView,
 } from "../../hooks/useGit";
 import { __resetGitFolderPrefsCache } from "../../hooks/useGitFolderPrefs";
@@ -168,12 +169,6 @@ const EXTERNAL_ACTOR: AttributionActor = {
 	deleted: false,
 	identityKnown: false,
 };
-const UNKNOWN_NARRATOR: AttributionActor = {
-	...EXTERNAL_ACTOR,
-	kind: "narrator_unknown",
-	deleted: null,
-};
-
 function narrator(overrides: Partial<AttributionActor> = {}): AttributionActor {
 	return {
 		kind: "primary",
@@ -199,6 +194,7 @@ function group(overrides: Partial<FileModificationGroup> = {}): FileModification
 		lastAction: "external",
 		lastActor,
 		actors,
+		recentEvents: [],
 		hasExternalChange: false,
 		hasImpreciseAttribution: true,
 		hasDeletedActor: false,
@@ -211,6 +207,20 @@ function group(overrides: Partial<FileModificationGroup> = {}): FileModification
 		},
 		evidence: "legacy",
 		attributionGrade: "observed_ambiguous",
+		...overrides,
+	};
+}
+
+function event(
+	actor: AttributionActor,
+	overrides: Partial<ModificationEventSummary> = {},
+): ModificationEventSummary {
+	return {
+		id: "event-1",
+		changedAt: "2026-01-01T12:34:00.000Z",
+		action: "edit",
+		actor,
+		evidence: "legacy",
 		...overrides,
 	};
 }
@@ -322,29 +332,35 @@ async function renderBadge(
 	return container;
 }
 
-/** The attribution badge is the row element that carries a tooltip's text. */
-function badgeText(container: HTMLElement, path = "src/one.ts"): string {
+/** The row keeps only the porcelain status badge; attribution is behind its hover target. */
+function rowFor(container: HTMLElement, path = "src/one.ts"): HTMLElement {
 	const row = container.querySelector(`[role="button"][aria-label="View diff of ${path}"]`);
 	if (!(row instanceof HTMLElement)) throw new Error(`Row not found: ${path}`);
-	// Badges in the row: [0] is the porcelain status letter, [1] the attribution badge.
-	const badges = Array.from(row.querySelectorAll(".mantine-Badge-root"));
-	const badge = badges.at(1);
-	if (!(badge instanceof HTMLElement)) throw new Error("Attribution badge not rendered");
-	return badge.textContent ?? "";
+	return row;
 }
 
-/** Mantine puts the tooltip label on the trigger's aria-describedby target or title. */
-function tooltipText(container: HTMLElement, path = "src/one.ts"): string {
-	const row = container.querySelector(`[role="button"][aria-label="View diff of ${path}"]`);
-	if (!(row instanceof HTMLElement)) throw new Error(`Row not found: ${path}`);
-	const badge = Array.from(row.querySelectorAll(".mantine-Badge-root")).at(1);
-	if (!(badge instanceof HTMLElement)) throw new Error("Attribution badge not rendered");
-	// A closed Mantine Tooltip does not mount its label, so the badge also carries the
-	// text as `aria-label` — which is where a screen reader reads it from too.
-	return badge.getAttribute("aria-label") ?? "";
+function statusBadge(container: HTMLElement, path = "src/one.ts"): HTMLElement {
+	const badge = rowFor(container, path).querySelector(".mantine-Badge-root");
+	if (!(badge instanceof HTMLElement)) throw new Error("Git status badge not rendered");
+	return badge;
 }
 
-describe("GitChangesTab attribution badge", () => {
+function attributionTarget(container: HTMLElement): HTMLElement {
+	const target = container.querySelector('[data-attribution-hover-target="true"]');
+	if (!(target instanceof HTMLElement)) throw new Error("Attribution hover target not rendered");
+	return target;
+}
+
+async function hoverAttribution(container: HTMLElement): Promise<string> {
+	const target = attributionTarget(container);
+	target.dispatchEvent(new Event("mouseenter", { bubbles: true }));
+	target.dispatchEvent(new Event("mouseover", { bubbles: true }));
+	await new Promise((resolve) => setTimeout(resolve, 180));
+	await flushRender();
+	return document.body.textContent ?? "";
+}
+
+describe("GitChangesTab attribution hover card", () => {
 	beforeEach(async () => {
 		installDom();
 		__resetGitFolderPrefsCache();
@@ -358,187 +374,89 @@ describe("GitChangesTab attribution badge", () => {
 		root = undefined;
 	});
 
-	test("a lone external contributor is not counted twice", async () => {
-		// One contributor, one name, no "+1". The badge used to add the external flag on
-		// top of the label already derived from it.
+	test("keeps attribution out of the file row and uses the Git status badge as target", async () => {
+		const last = narrator();
 		const container = await renderBadge(
-			"chapter-attr-external-only",
-			view([group({ hasExternalChange: true })]),
-		);
-
-		expect(badgeText(container)).toBe("External · incomplete");
-		expect(badgeText(container)).not.toContain("+");
-	});
-
-	test("a lone deleted session is not counted twice", async () => {
-		// Same shape via the other flag: a tool change whose narrator row is gone.
-		const container = await renderBadge(
-			"chapter-attr-deleted-only",
+			"chapter-attr-hover-target",
 			view([
 				group({
-					lastActor: UNKNOWN_NARRATOR,
-					lastAction: "write",
-					actors: [UNKNOWN_NARRATOR],
-					hasDeletedActor: null,
+					lastActor: last,
+					actors: [last],
+					recentEvents: [event(last)],
 				}),
 			]),
 		);
+		const row = rowFor(container);
 
-		expect(badgeText(container)).toBe("Unknown session (identity missing or deleted) · incomplete");
-		expect(badgeText(container)).not.toContain("+");
+		expect(row.querySelectorAll(".mantine-Badge-root")).toHaveLength(1);
+		expect(statusBadge(container).textContent).toBe("M");
+		expect(row.textContent).not.toContain("Refactor auth");
+		expect(attributionTarget(container).getAttribute("title")).toBeNull();
 	});
 
-	test("a deleted lastActor is not also listed as an extra contributor", async () => {
-		// `exists: false` on the last actor is the deleted-session case seen from a row
-		// that still carries the id. The tooltip used to name it, then append "Also
-		// modified by Deleted session" about the very same actor.
-		const deleted = narrator({ narratorId: "gone", title: null, exists: false, deleted: true });
-		const container = await renderBadge(
-			"chapter-attr-deleted-lastactor",
-			view([group({ lastActor: deleted, actors: [deleted], hasDeletedActor: true })]),
-		);
-
-		expect(badgeText(container)).toBe("Deleted session");
-		expect(badgeText(container)).not.toContain("+");
-		expect(tooltipText(container)).toContain("Latest observed actor: Deleted session");
-		expect(tooltipText(container)).not.toContain("Previously observed participant:");
-	});
-
-	test("external then deleted narrator uses the last event, not historical flags", async () => {
-		const container = await renderBadge(
-			"chapter-attr-external-and-deleted",
-			view([
+	test("shows current evidence and a compact timeline only on hover", async () => {
+		const currentActor = narrator();
+		const external = { ...EXTERNAL_ACTOR };
+		const container = await renderBadge("chapter-attr-hover-timeline", {
+			...view([
 				group({
-					lastActor: UNKNOWN_NARRATOR,
-					lastAction: "edit",
-					actors: [UNKNOWN_NARRATOR, EXTERNAL_ACTOR],
-					hasExternalChange: true,
-					hasDeletedActor: null,
+					lastActor: currentActor,
+					actors: [currentActor, external],
+					recentEvents: [
+						event(currentActor, { id: "event-current", action: "write" }),
+						event(external, { id: "event-external", action: "external" }),
+					],
 				}),
 			]),
-		);
-		expect(badgeText(container)).toBe("Unknown session (identity missing or deleted) · incomplete");
-		const tooltip = tooltipText(container);
-		expect(tooltip).toContain("Latest observed actor: Unknown session");
-		expect(tooltip).toContain("Latest observed action: Edit");
-		expect(tooltip).toContain("Previously observed participant: External");
-		expect(tooltip).not.toContain("Latest observed actor: External");
+			currentDiff: currentView(
+				currentTarget({ actor: currentActor }),
+				currentTarget({ actor: currentActor }),
+			),
+		});
+		const row = rowFor(container);
+		expect(row.textContent).not.toContain("Refactor auth");
+
+		const hoverText = await hoverAttribution(container);
+		expect(hoverText).toContain("Current diff evidence");
+		expect(hoverText).toContain("Refactor auth");
+		expect(hoverText).toContain("Recent changes");
+		expect(hoverText).toContain("External");
+		expect(hoverText).not.toContain(gitLocale.attributionCurrentExplanation);
 	});
 
-	test("multiple narrator contributors are counted, excluding the one named", async () => {
-		const last = narrator({ narratorId: "n1", title: "Refactor auth" });
-		const other = narrator({ narratorId: "n2", title: "Fix tests" });
-		const third = narrator({ narratorId: "n3", title: "Docs pass", subagentType: "general" });
-		const container = await renderBadge(
-			"chapter-attr-many-narrators",
-			view([group({ lastActor: last, actors: [last, other, third], changeCount: 3 })]),
-		);
-
-		expect(badgeText(container)).toBe("Refactor auth +2");
-		const tooltip = tooltipText(container);
-		expect(tooltip).toContain("Latest observed actor: Refactor auth");
-		expect(tooltip).toContain("Previously observed participant: Fix tests");
-		expect(tooltip).toContain("Previously observed participant: Docs pass (general subagent)");
-	});
-
-	test("an external observation is shown without inventing a distinct extra identity", async () => {
-		const last = narrator();
-		const container = await renderBadge(
-			"chapter-attr-narrator-plus-external",
-			view([group({ lastActor: last, actors: [last, EXTERNAL_ACTOR], hasExternalChange: true })]),
-		);
-		expect(badgeText(container)).toBe("Refactor auth · incomplete");
-		expect(tooltipText(container)).toContain("Previously observed participant: External");
-		expect(tooltipText(container)).toContain(gitLocale.attributionCountsLowerBound);
-	});
-
-	test("a file with no recorded contributor renders no badge", async () => {
-		// An absent path has no observation to label. This is not evidence that no one
-		// changed the file; the panel explains the distinction instead of inventing an actor.
-		const container = await renderBadge("chapter-attr-none", view([]));
-
-		expect(() => badgeText(container)).toThrow("Attribution badge not rendered");
-	});
-
-	test("an exhausted row window says so instead of implying nobody wrote the files", async () => {
-		// `hasMore` with nothing in the rollup means the cap was spent entirely on rows
-		// outside the per-file boundary — a missing badge here proves nothing.
-		const container = await renderBadge("chapter-attr-truncated", {
-			...view([]),
-			hasMore: true,
-			windowCount: 0,
+	test("unknown attribution shows one short reason instead of a text dump", async () => {
+		const unknown = currentTarget({ status: "unknown", actor: null, reason: "state_mismatch" });
+		const container = await renderBadge("chapter-attr-hover-unknown", {
+			...view([group({ recentEvents: [event(EXTERNAL_ACTOR)] })]),
+			currentDiff: currentView(unknown, unknown),
 		});
 
-		expect(container.textContent).toContain(gitLocale.attributionWindowTruncated);
+		const hoverText = await hoverAttribution(container);
+		expect(hoverText).toContain("Current diff evidence");
+		expect(hoverText).toContain("Unknown");
+		expect(hoverText).toContain("Current bytes do not match the record");
+		expect(hoverText).not.toContain(gitLocale.attributionContinuityUnknown);
+		expect(hoverText).not.toContain(gitLocale.attributionNotCurrentOwnership);
 	});
 
-	test("a nonempty capped window still reports incomplete contributors", async () => {
-		const last = narrator();
-		const container = await renderBadge("chapter-attr-partial-nonempty", {
-			...view([group({ lastActor: last, actors: [last] })]),
-			hasMore: true,
-			windowCount: 1,
+	test("a clean target removes the attribution hover target", async () => {
+		const clean = currentTarget({ status: "clean", actor: null });
+		const container = await renderBadge("chapter-attr-hover-clean", {
+			...view([group({ lastActor: narrator() })]),
+			currentDiff: currentView(clean, clean, { clean: true }),
 		});
 
-		expect(badgeText(container)).toBe("Refactor auth");
-		expect(container.textContent).toContain(gitLocale.attributionWindowTruncated);
+		expect(rowFor(container).querySelectorAll(".mantine-Badge-root")).toHaveLength(1);
+		expect(() => attributionTarget(container)).toThrow("Attribution hover target not rendered");
 	});
 
-	test("a complete nonempty window does not show the truncation warning", async () => {
-		const container = await renderBadge(
-			"chapter-attr-complete-nonempty",
-			view([group({ hasExternalChange: true })]),
-		);
-
-		expect(badgeText(container)).toBe("External · incomplete");
-		expect(container.textContent).not.toContain(gitLocale.attributionWindowTruncated);
-	});
-
-	test("the incomplete-window warning has the same meaning in Chinese", async () => {
-		await i18n.changeLanguage("zh-CN");
-		const container = await renderBadge(
-			"chapter-attr-partial-zh",
-			{ ...view([]), hasMore: true, windowCount: 4 },
-			"one.ts",
-		);
-
-		expect(container.textContent).toContain(zhGitLocale.attributionWindowTruncated);
-		expect(container.textContent).not.toContain(gitLocale.attributionWindowTruncated);
-	});
-
-	test("human saves name the real users and do not collapse null narratorIds", async () => {
-		const alice = narrator({ kind: "human", narratorId: null, userId: "u1", title: "Alice" });
-		const bob = narrator({ kind: "human", narratorId: null, userId: "u2", title: "Bob" });
-		const container = await renderBadge(
-			"chapter-human-users",
-			view([group({ lastActor: bob, lastAction: "human", actors: [bob, alice] })]),
-		);
-		expect(badgeText(container)).toBe("User: Bob +1");
-		expect(tooltipText(container)).toContain("Previously observed participant: User: Alice");
-		expect(tooltipText(container)).toContain("Latest observed action: User save");
-	});
-
-	test("a deleted user's lost identity is explicitly unknown, never external", async () => {
-		const missingUser = { ...EXTERNAL_ACTOR, kind: "human" as const, deleted: null };
-		const container = await renderBadge(
-			"chapter-human-unknown",
-			view([group({ lastActor: missingUser, lastAction: "human", actors: [missingUser] })]),
-		);
-		expect(badgeText(container)).toBe("Unknown user (identity missing or deleted) · incomplete");
-		expect(tooltipText(container)).not.toContain("Latest observed actor: External");
-	});
-
-	test("a ten-row slice renders lower-bound counts and unknown flags in its badge", async () => {
+	test("partial history is one short warning in the hover card", async () => {
 		const last = narrator();
-		const other = narrator({ narratorId: "n2", title: "Earlier" });
-		const container = await renderBadge("chapter-file-truncated", {
+		const container = await renderBadge("chapter-attr-hover-partial", {
 			...view([
 				group({
 					lastActor: last,
-					actors: [last, other],
-					changeCount: 10,
-					hasExternalChange: null,
-					hasDeletedActor: null,
+					recentEvents: [event(last)],
 					completeness: {
 						fileHistoryComplete: false,
 						contributorsTruncated: true,
@@ -548,95 +466,15 @@ describe("GitChangesTab attribution badge", () => {
 					},
 				}),
 			]),
-			hasMore: true,
 		});
-		expect(badgeText(container)).toBe("Refactor auth +≥1 · incomplete");
-		expect(tooltipText(container)).toContain(gitLocale.attributionHistoryTruncated);
-		expect(tooltipText(container)).toContain(gitLocale.attributionFlagsUnknown);
-		expect(tooltipText(container)).toContain(gitLocale.attributionCountsLowerBound);
-		expect(container.textContent).toContain(gitLocale.attributionWindowTruncated);
+
+		const hoverText = await hoverAttribution(container);
+		expect(hoverText).toContain("History is incomplete");
+		expect(hoverText).not.toContain(gitLocale.attributionHistoryTruncated);
 	});
 
-	test("complete Write history still distinguishes observations from the current net diff", async () => {
-		const last = narrator();
-		const container = await renderBadge(
-			"chapter-legacy-observation",
-			view([group({ lastActor: last, lastAction: "write", actors: [last] })]),
-		);
-		expect(container.textContent).toContain(gitLocale.attributionObservationOnly);
-		expect(tooltipText(container)).toContain(gitLocale.attributionHistoryComplete);
-		expect(tooltipText(container)).toContain(gitLocale.attributionLegacyObserved);
-		expect(tooltipText(container)).toContain(gitLocale.attributionNotCurrentOwnership);
-		expect(container.textContent).not.toContain(gitLocale.attributionWindowTruncated);
-	});
-
-	test("current index and worktree rows display their own evidence rather than history counts", async () => {
-		const ai = narrator();
-		const person = narrator({ kind: "human", narratorId: null, userId: "human", title: "Alice" });
-		const status = makeStatus();
-		status.staged = 1;
-		status.files[0].status = "MM";
-		status.files[0].stagedLinesAdded = 1;
-		const current = currentView(
-			currentTarget({ target: "index", modeScope: "git_executable_bit", actor: ai }),
-			currentTarget({ actor: person }),
-		);
-		const container = await renderBadge(
-			"chapter-current-split",
-			{ ...view([group({ lastActor: ai, actors: [ai, person] })]), currentDiff: current },
-			"src/one.ts",
-			status,
-		);
-		const rows = Array.from(
-			container.querySelectorAll('[role="button"][aria-label="View diff of src/one.ts"]'),
-		);
-		expect(rows).toHaveLength(2);
-		const captions = rows.map((row) => row.querySelectorAll(".mantine-Badge-root")[1]?.textContent);
-		expect(captions).toEqual(["Evidence: Refactor auth", "Evidence: User: Alice"]);
-		expect(container.textContent).toContain(gitLocale.attributionCurrentExplanation);
-		expect(tooltipText(container)).toContain(gitLocale.attributionContinuityUnknown);
-		expect(tooltipText(container)).toContain("Baseline version: aaaaaaaaaaaa");
-	});
-
-	test("a clean live workspace suppresses historical badges even if the status cache is old", async () => {
-		const clean = currentTarget({ status: "clean", actor: null });
-		const container = await renderBadge("chapter-current-clean", {
-			...view([group({ lastActor: narrator() })]),
-			currentDiff: currentView(clean, clean, { clean: true }),
-		});
-		expect(() => badgeText(container)).toThrow("Attribution badge not rendered");
-	});
-
-	test("stale and unknown current baselines never show the historic actor as current", async () => {
-		const matching = currentTarget();
-		const container = await renderBadge("chapter-current-stale", {
-			...view([group({ lastActor: narrator() })]),
-			currentDiff: currentView(matching, matching, {
-				baselineStatus: "stale",
-				version: null,
-				complete: false,
-			}),
-		});
-		expect(badgeText(container)).toBe("Attribution unknown · incomplete");
-		expect(tooltipText(container)).toContain(gitLocale.attributionCurrentUnknown);
-		expect(tooltipText(container)).toContain(gitLocale.attributionHistorySection);
-	});
-
-	test("matching evidence retains deleted human type without inventing a name", async () => {
-		const person = narrator({
-			kind: "human",
-			narratorId: null,
-			userId: "gone",
-			title: null,
-			exists: false,
-			deleted: true,
-		});
-		const current = currentTarget({ actor: person });
-		const container = await renderBadge("chapter-current-deleted-human", {
-			...view([]),
-			currentDiff: currentView(currentTarget({ status: "clean", actor: null }), current),
-		});
-		expect(badgeText(container)).toBe("Evidence: Deleted user (name unknown)");
-		expect(tooltipText(container)).toContain(gitLocale.attributionContinuityUnknown);
+	test("the compact hover labels have Chinese translations", () => {
+		expect(zhGitLocale.attributionHistoryShort).toBe("最近修改");
+		expect(zhGitLocale.attributionCurrentUnknownShort).toBe("未知");
 	});
 });

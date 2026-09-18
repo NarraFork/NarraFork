@@ -453,6 +453,9 @@ export function QueuedMessageRow({
 					</Badge>
 				)}
 				<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
+					<Text size="xs" truncate style={{ overflowWrap: "anywhere" }}>
+						{msg.text}
+					</Text>
 					<Badge
 						size="xs"
 						variant="light"

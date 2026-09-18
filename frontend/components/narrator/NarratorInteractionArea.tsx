@@ -124,18 +124,22 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 
 	return (
 		<Box style={{ position: "relative", flexShrink: 0 }}>
-			{/* Drag handle — top edge of the whole interaction area lets the user
-			    resize the bottom spacing (see useResizableBottomSpacing). */}
+			{/* Thin resize line at the Git boundary; the line itself is the drag target. */}
 			<Box
-				onMouseDown={startBottomSpacingResize}
+				onPointerDown={startBottomSpacingResize}
+				role="separator"
+				aria-orientation="horizontal"
+				aria-label={t("resizeBottomSpacing")}
 				style={{
 					position: "absolute",
-					top: -3,
+					top: -1,
 					left: 0,
 					right: 0,
-					height: 6,
+					height: 3,
 					cursor: "ns-resize",
+					touchAction: "none",
 					zIndex: 100,
+					borderTop: "1px solid var(--mantine-color-default-border)",
 				}}
 			/>
 
@@ -173,10 +177,12 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 
 			{/* Standalone narrators have no chapter bar; offer the git workspace strip instead. */}
 			{!props.chapterId && props.onOpenGitPanel && (
-				<NarratorGitBar
-					narratorId={props.common.narratorId}
-					onOpenGitPanel={props.onOpenGitPanel}
-				/>
+				<Box style={{ borderBottom: "1px solid var(--mantine-color-default-border)" }}>
+					<NarratorGitBar
+						narratorId={props.common.narratorId}
+						onOpenGitPanel={props.onOpenGitPanel}
+					/>
+				</Box>
 			)}
 
 			{/* Status bar */}

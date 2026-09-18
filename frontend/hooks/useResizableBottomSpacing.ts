@@ -9,8 +9,8 @@
 import { useSyncExternalStore } from "react";
 
 const STORAGE_KEY = "narrafork_narrator_bottom_spacing";
-const DEFAULT_SPACING = 40;
-const MIN_SPACING = 10; // Match var(--mantine-spacing-xs) for visual consistency
+const DEFAULT_SPACING = 0;
+const MIN_SPACING = 0;
 const MAX_SPACING = 200;
 
 /**
@@ -20,7 +20,7 @@ function readStoredSpacing(): number {
 	try {
 		if (typeof localStorage === "undefined") return DEFAULT_SPACING;
 		const saved = localStorage.getItem(STORAGE_KEY);
-		if (saved) {
+		if (saved !== null) {
 			const n = Number(saved);
 			if (n >= MIN_SPACING && n <= MAX_SPACING) return n;
 		}
@@ -79,28 +79,38 @@ function writeSpacing(next: number): void {
 interface DragState {
 	startY: number;
 	startSpacing: number;
+	pointerId: number;
 }
 
 let drag: DragState | null = null;
 
-function onMouseMove(event: MouseEvent): void {
-	if (!drag) return;
-	// Dragging UP (negative delta) increases spacing, DOWN decreases
+function onPointerMove(event: PointerEvent): void {
+	if (!drag || event.pointerId !== drag.pointerId) return;
+	// Dragging UP (negative delta) increases spacing, DOWN decreases.
 	const raw = drag.startSpacing + (drag.startY - event.clientY);
 	const clamped = Math.min(MAX_SPACING, Math.max(MIN_SPACING, raw));
 	writeSpacing(clamped);
 }
 
-function endDrag(): void {
-	if (!drag) return;
+function removeDragListeners(): void {
+	if (typeof window !== "undefined") {
+		window.removeEventListener("pointermove", onPointerMove);
+		window.removeEventListener("pointerup", endDrag);
+		window.removeEventListener("pointercancel", endDrag);
+		window.removeEventListener("blur", onWindowBlur);
+	}
+	if (typeof document !== "undefined") {
+		document.removeEventListener("visibilitychange", onVisibilityChange);
+		document.body.style.cursor = "";
+		document.body.style.userSelect = "";
+	}
+}
+
+function endDrag(event?: PointerEvent): void {
+	if (!drag || (event && event.pointerId !== drag.pointerId)) return;
 	drag = null;
-	document.body.style.cursor = "";
-	document.body.style.userSelect = "";
-	window.removeEventListener("mousemove", onMouseMove);
-	window.removeEventListener("mouseup", endDrag);
-	window.removeEventListener("blur", endDrag);
-	window.removeEventListener("pointercancel", endDrag);
-	document.removeEventListener("visibilitychange", onVisibilityChange);
+	removeDragListeners();
+	for (const listener of listeners) listener();
 
 	persist(getSpacing());
 }
@@ -109,23 +119,31 @@ function onVisibilityChange(): void {
 	if (document.visibilityState === "hidden") endDrag();
 }
 
-/** Begin a resize drag. Stable identity. */
+function onWindowBlur(): void {
+	endDrag();
+}
+
+/** Begin a resize drag. Stable identity and pointer-enabled for touch/pen. */
 export function startBottomSpacingResize(event: {
 	clientY: number;
+	pointerId: number;
 	preventDefault: () => void;
 }): void {
 	event.preventDefault();
+	if (drag) endDrag();
 	drag = {
 		startY: event.clientY,
 		startSpacing: getSpacing(),
+		pointerId: event.pointerId,
 	};
 	document.body.style.cursor = "ns-resize";
 	document.body.style.userSelect = "none";
-	window.addEventListener("mousemove", onMouseMove);
-	window.addEventListener("mouseup", endDrag);
-	window.addEventListener("blur", endDrag);
+	window.addEventListener("pointermove", onPointerMove);
+	window.addEventListener("pointerup", endDrag);
 	window.addEventListener("pointercancel", endDrag);
+	window.addEventListener("blur", onWindowBlur);
 	document.addEventListener("visibilitychange", onVisibilityChange);
+	for (const listener of listeners) listener();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -139,9 +157,21 @@ export function useBottomSpacing(): number {
 	return useSyncExternalStore(subscribe, getSpacing, getSpacing);
 }
 
+/** Whether the resize handle is currently being dragged. */
+export function useBottomSpacingDragging(): boolean {
+	return useSyncExternalStore(
+		subscribe,
+		() => drag !== null,
+		() => false,
+	);
+}
+
 /** Test seam: reset the module store. */
 export function resetBottomSpacingStoreForTest(spacing = DEFAULT_SPACING): void {
-	drag = null;
+	if (drag) {
+		drag = null;
+		removeDragListeners();
+	}
 	currentSpacing = spacing;
 	emit();
 }

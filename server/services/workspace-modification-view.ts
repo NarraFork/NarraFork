@@ -34,6 +34,8 @@ const DEFAULT_EVENT_LIMIT = 500;
 const MAX_EVENT_LIMIT = 2000;
 /** Display budget, NOT sufficient to prove a complete contributor list or absent flags. */
 const PER_PATH_EVENT_LIMIT = 10;
+/** Hover cards need a useful history, not the entire per-file observation window. */
+const FILE_TIMELINE_EVENT_LIMIT = 5;
 const PATHS_PER_SHARD = 50;
 /** 400 paths; each of at most three canonical/legacy workspace spellings gets 10+1
  * indexed rows. Merge those bounded slices before returning at most ten per path. */
@@ -58,6 +60,15 @@ export interface ModificationEvent {
 	attributionGrade: FileChangeAttributionGrade;
 }
 
+/** Small per-file history projection for hover cards; newest first and always bounded. */
+export interface ModificationEventSummary {
+	id: string;
+	changedAt: string;
+	action: ModificationAction;
+	actor: ModificationActor;
+	evidence: "legacy" | "v2";
+}
+
 export interface FileModificationGroup {
 	filePath: string;
 	/** Observed count; see completeness.countsLowerBound before treating it as a total. */
@@ -68,6 +79,8 @@ export interface FileModificationGroup {
 	lastAction: ModificationAction;
 	/** Known subjects plus unknown identity buckets, newest first; not current diff owners. */
 	actors: ModificationActor[];
+	/** Bounded event summaries for the file-row hover card, newest first. */
+	recentEvents: ModificationEventSummary[];
 	/** True = observed, false = absent from a complete window, null = unknown. */
 	hasExternalChange: boolean | null;
 	hasImpreciseAttribution: boolean | null;
@@ -517,6 +530,7 @@ export async function getWorkspaceModificationView(
 				lastActor: actor,
 				lastAction: action,
 				actors: [],
+				recentEvents: [],
 				hasExternalChange: complete ? false : null,
 				hasImpreciseAttribution: true,
 				hasDeletedActor: complete ? false : null,
@@ -535,6 +549,15 @@ export async function getWorkspaceModificationView(
 			!group.actors.some((existing) => attributionActorKey(existing) === attributionActorKey(actor))
 		) {
 			group.actors.push(actor);
+		}
+		if (group.recentEvents.length < FILE_TIMELINE_EVENT_LIMIT) {
+			group.recentEvents.push({
+				id: row.id,
+				changedAt: row.changedAt,
+				action,
+				actor,
+				evidence,
+			});
 		}
 	}
 	for (const group of byFile.values()) {

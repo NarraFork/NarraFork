@@ -177,9 +177,25 @@ describe("unified workspace modification view", () => {
 		const group = view.byFile.find((g) => g.filePath === "shared.ts");
 		expect(group?.changeCount).toBe(3);
 		expect(group?.actors).toHaveLength(3);
+		expect(group?.recentEvents).toHaveLength(3);
+		expect(group?.recentEvents.map((event) => event.action)).toEqual(["external", "edit", "write"]);
 		expect(group?.hasExternalChange).toBe(true);
 		// External changes are never precisely attributable.
 		expect(group?.hasImpreciseAttribution).toBe(true);
+	});
+
+	test("bounds per-file hover history to the newest five observations", async () => {
+		const ws = makeWorkspace("nf-view-timeline-cap-");
+		const narratorId = await createNarrator("Solo", ws);
+		for (let index = 0; index < 7; index++) {
+			await record({ workspacePath: ws, filePath: "shared.ts", narratorId, action: "edit" });
+		}
+
+		const view = await getWorkspaceModificationView(ws);
+		const group = view.byFile.find((item) => item.filePath === "shared.ts");
+		expect(group?.changeCount).toBe(7);
+		expect(group?.recentEvents).toHaveLength(5);
+		expect(group?.recentEvents.every((event) => event.action === "edit")).toBe(true);
 	});
 
 	test("never upgrades legacy write/edit observations to measured attribution", async () => {
@@ -386,9 +402,9 @@ describe("per-path windowing", () => {
 });
 
 describe("projections", () => {
-	test("byFile omits the timeline, the half nobody renders", async () => {
-		// The Git panel refetches every 30 s and reads only `byFile`; the timeline carries an
-		// id, tool-use id, tree hash and full actor per change.
+	test("byFile omits the full timeline but keeps bounded per-file summaries", async () => {
+		// The Git panel reads `byFile`; the full timeline carries an id, tool-use id, tree hash
+		// and full actor per change, while the hover card only needs the bounded summaries.
 		const ws = makeWorkspace("nf-view-projection-");
 		const narratorId = await createNarrator("Solo", ws);
 		await record({ workspacePath: ws, filePath: "a.ts", narratorId, action: "write" });

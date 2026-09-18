@@ -77,6 +77,14 @@ export interface AttributionActor {
 	subjectKey?: string;
 }
 
+export interface ModificationEventSummary {
+	id: string;
+	changedAt: string;
+	action: AttributionAction;
+	actor: AttributionActor;
+	evidence: "legacy" | "v2";
+}
+
 export interface FileModificationGroup {
 	filePath: string;
 	changeCount: number;
@@ -86,6 +94,8 @@ export interface FileModificationGroup {
 	lastAction: AttributionAction;
 	/** Known subjects and anonymous buckets seen in the returned row window. */
 	actors: AttributionActor[];
+	/** Bounded newest-first history for the status-badge hover card. */
+	recentEvents: ModificationEventSummary[];
 	/** False requires a complete scan; null means absence is unverified. */
 	hasExternalChange: boolean | null;
 	hasImpreciseAttribution: boolean | null;

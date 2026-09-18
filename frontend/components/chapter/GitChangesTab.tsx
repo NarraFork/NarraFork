@@ -5,17 +5,23 @@ import {
 	Box,
 	Button,
 	Group,
+	HoverCard,
 	Loader,
+	Menu,
 	ScrollArea,
 	Stack,
 	Text,
 	TextInput,
+	Timeline,
 	Tooltip,
 } from "@mantine/core";
+
 import {
 	IconCheck,
 	IconChevronDown,
 	IconChevronRight,
+	IconCopy,
+	IconDotsVertical,
 	IconFilter,
 	IconFilterOff,
 	IconFolder,
@@ -23,11 +29,13 @@ import {
 	IconHelpCircle,
 	IconMinus,
 	IconPlus,
+	IconRefresh,
 	IconSparkles,
 	IconTrash,
 } from "@tabler/icons-react";
-import { useMemo, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useClipboard } from "../../hooks/useClipboard";
 import {
 	type CurrentDiffFile,
 	type CurrentDiffTarget,
@@ -43,12 +51,20 @@ import {
 } from "../../hooks/useGit";
 import { useGitFolderPrefs } from "../../hooks/useGitFolderPrefs";
 import { useGitStatusFilter } from "../../hooks/useGitStatusFilter";
+import { useGitViewMode } from "../../hooks/useGitViewMode";
 import { type GitTarget, gitCanWrite, gitTargetKey } from "../../lib/api/git";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
-import { buildAttributionBadge, buildCurrentAttributionBadge } from "./attribution-label";
+import { buildAttributionLabels } from "./attribution-label";
 import { GitFileDiff } from "./GitFileDiff";
 import { type GitFileSection, gitFileBadgeChar } from "./git-file-status";
 import { buildGitFileTree, compactGitFileTree, type GitFileTreeNode } from "./git-file-tree";
+import {
+	formatGitSectionCount,
+	gitSectionCount,
+	gitTotalFileCount,
+	gitUniqueFileCount,
+	hiddenGitSectionRows,
+} from "./git-status-counts";
 import {
 	countBadgeChars,
 	filterFilesByStatus,
@@ -123,9 +139,13 @@ function collectFiles(node: GitFileTreeNode<DisplayFile>): DisplayFile[] {
 export function GitChangesTab({
 	chapterId,
 	target = chapterId ?? "",
+	onRefresh,
+	onOpenSecondaryView,
 }: {
 	chapterId?: string;
 	target?: GitTarget;
+	onRefresh?: () => void;
+	onOpenSecondaryView?: (view: "commits" | "stash") => void;
 }) {
 	const canWrite = gitCanWrite(target);
 	const preferenceKey = gitTargetKey(target) ?? "";
@@ -139,22 +159,16 @@ export function GitChangesTab({
 	const commit = useGitCommit(target);
 	const discard = useGitDiscard(target);
 	const aiMsg = useGitAiCommitMessage(target);
+	const clipboard = useClipboard({ timeout: 1500 });
+	const { mode: viewMode, setMode: setViewMode } = useGitViewMode(preferenceKey);
 
 	const [message, setMessage] = useState("");
 	const [diffFile, setDiffFile] = useState<string | null>(null);
 	const [diffStaged, setDiffStaged] = useState(false);
-	// Which status letters the user wants to see. Empty = unfiltered; see
-	// `git-status-filter.ts` for why that is the empty representation.
 	const statusFilter = useGitStatusFilter(preferenceKey, legacyChapterId);
-	// Folders start COLLAPSED and remember what the user opened across reloads.
-	// Keyed per device/worktree and section, because `src/` under Staged and under
-	// Changes are independent rows.
 	const stagedFolders = useGitFolderPrefs(preferenceKey, "staged", legacyChapterId);
 	const unstagedFolders = useGitFolderPrefs(preferenceKey, "unstaged", legacyChapterId);
 
-	// path → historical observations for this path. An absent group proves neither no
-	// writer nor no current changes; the current net diff comes from git status, not
-	// these observations. Memoized because every rendered file row consults it.
 	const attrByPath = useMemo(
 		() => new Map((modifications?.byFile ?? []).map((g) => [g.filePath, g])),
 		[modifications?.byFile],
@@ -163,29 +177,17 @@ export function GitChangesTab({
 		() => new Map((modifications?.currentDiff?.byFile ?? []).map((file) => [file.filePath, file])),
 		[modifications?.currentDiff?.byFile],
 	);
-	// Any truncated row window is incomplete, even when some contributors were found.
-	// Neither a missing badge nor the displayed contributors prove the full history.
 	const attributionTruncated =
 		!!modifications?.hasMore || modifications?.completeness?.fileHistoryComplete === false;
 
-	if (isLoading) {
-		return <Loader size="sm" />;
-	}
-
+	if (isLoading) return <Loader size="sm" />;
 	if (error)
 		return (
-			<Text c="red" size="sm">
+			<Text c="red" size="sm" p="xs">
 				{error.message}
 			</Text>
 		);
-
-	if (!status?.hasChanges) {
-		return (
-			<Text size="sm" c="dimmed" py="md" ta="center">
-				{t("noChanges")}
-			</Text>
-		);
-	}
+	if (!status) return null;
 
 	const stagedFiles: DisplayFile[] = status.files
 		.filter((f) => !f.status.startsWith("?") && isStagedFile(f.status))
@@ -203,59 +205,45 @@ export function GitChangesTab({
 			displayLinesAdded: f.unstagedLinesAdded,
 			displayLinesRemoved: f.unstagedLinesRemoved,
 		}));
-
-	// Chip counts come from the UNFILTERED lists, so an unselected chip still says
-	// how many rows it would reveal instead of collapsing to zero the moment any
-	// filter is on.
 	const badgeCounts = countBadgeChars([
 		{ section: "staged", files: stagedFiles },
 		{ section: "unstaged", files: unstagedFiles },
 	]);
 	const filterChars = visibleFilterChars(badgeCounts, statusFilter.selected);
-
-	// Filter BEFORE the row cap: capping first would spend the 80-row budget on
-	// rows the filter then removes, so a filter on a large change set could show
-	// nothing while claiming "+N more".
 	const matchedStaged = filterFilesByStatus(stagedFiles, "staged", statusFilter.selected);
 	const matchedUnstaged = filterFilesByStatus(unstagedFiles, "unstaged", statusFilter.selected);
-
-	// Cap displayed files to avoid rendering thousands of rows
 	const displayStaged = matchedStaged.slice(0, MAX_DISPLAY_FILES);
 	const displayUnstaged = matchedUnstaged.slice(0, MAX_DISPLAY_FILES);
-	const hiddenStaged = matchedStaged.length - displayStaged.length;
-	const hiddenUnstaged = matchedUnstaged.length - displayUnstaged.length;
-	// Server may have capped the files array too
-	const totalFiles = status.totalFiles ?? status.files.length;
-	const serverCapped = totalFiles > status.files.length;
+	const hiddenStaged = hiddenGitSectionRows(matchedStaged.length, displayStaged.length);
+	const hiddenUnstaged = hiddenGitSectionRows(matchedUnstaged.length, displayUnstaged.length);
+	const totalFiles = gitTotalFileCount(status);
+	const serverCapped = totalFiles > gitUniqueFileCount(status.files);
+	const totalFilesLabel = formatGitSectionCount(totalFiles, !!status.truncated);
+	const stagedCountLabel = formatGitSectionCount(
+		gitSectionCount(status, "staged"),
+		!!status.truncated,
+	);
+	const unstagedCountLabel = formatGitSectionCount(
+		gitSectionCount(status, "unstaged"),
+		!!status.truncated,
+	);
 	const filterActive = statusFilter.selected.size > 0;
-	// A filter that matches nothing must say so. Both sections would otherwise
-	// simply not render, leaving a panel that reads as "working tree clean" while
-	// there are uncommitted changes.
 	const filterHidesEverything =
 		filterActive && matchedStaged.length === 0 && matchedUnstaged.length === 0;
 
-	const stagedTree = compactGitFileTree(buildGitFileTree(displayStaged));
-	const unstagedTree = compactGitFileTree(buildGitFileTree(displayUnstaged));
-
-	/** Porcelain status XY: X is index status, Y is worktree status.
-	 *  A file is staged if X is one of M/A/D/R/C (not space or ?). */
 	function isStagedFile(s: string): boolean {
 		const x = s[0];
 		return x !== " " && x !== "?" && /[MADRC]/.test(x);
 	}
 
-	/** A file has unstaged changes if Y (second char) is not space,
-	 *  or it's untracked (??) */
 	function isUnstagedFile(s: string): boolean {
 		const y = s[1];
 		return y !== " " || s.startsWith("?");
 	}
 
 	function handleCommit() {
-		if (!canWrite || !message.trim()) return;
-		commit.mutate(message.trim(), {
-			onSuccess: () => setMessage(""),
-		});
+		if (!canWrite || !message.trim() || status?.staged === 0) return;
+		commit.mutate(message.trim(), { onSuccess: () => setMessage("") });
 	}
 
 	function handleAiGenerate() {
@@ -266,15 +254,6 @@ export function GitChangesTab({
 		});
 	}
 
-	/**
-	 * Discard, scoped to whatever the filter currently shows.
-	 *
-	 * This is the one action where the filter scope is a correctness requirement
-	 * rather than a nicety: `all: true` runs `checkout HEAD -- .` plus `clean -fd`,
-	 * which would destroy uncommitted work the filter had hidden from view. The
-	 * confirmation text names the scope for the same reason — "all uncommitted
-	 * changes" is a false statement once a filter is on.
-	 */
 	async function handleDiscardAll() {
 		const files = filterActive ? matchedUnstaged.map((f) => f.path) : null;
 		const confirmMessage = files
@@ -291,31 +270,198 @@ export function GitChangesTab({
 		discard.mutate({ all: true });
 	}
 
+	function contextFor(
+		section: GitFileSection,
+		action: "stage" | "unstage",
+		folders: { expanded: Set<string>; toggle: (path: string) => void },
+		keyPrefix: string,
+	): TreeContext {
+		return {
+			canWrite,
+			keyPrefix,
+			action,
+			section,
+			expandedFolders: folders.expanded,
+			onToggle: folders.toggle,
+			onAction: (paths) =>
+				action === "stage" ? stage.mutate({ files: paths }) : unstage.mutate({ files: paths }),
+			onOpenFile: (path) => {
+				setDiffFile(path);
+				setDiffStaged(section === "staged");
+			},
+			onDiscard:
+				section === "unstaged"
+					? async (file) => {
+							if (!canWrite) return;
+							const scope =
+								typeof target === "string"
+									? ""
+									: `\n${t("workspace.scope", { root: target.rootPath })}`;
+							if (await confirm({ message: t("discardFileConfirm", { file }) + scope }))
+								discard.mutate({ files: [file] });
+						}
+					: undefined,
+			attrByPath,
+			currentByPath,
+			currentDiff: modifications?.currentDiff,
+			t,
+		};
+	}
+
+	function renderRows(
+		section: GitFileSection,
+		action: "stage" | "unstage",
+		files: readonly DisplayFile[],
+		folders: { expanded: Set<string>; toggle: (path: string) => void },
+		keyPrefix: string,
+	) {
+		const context = contextFor(section, action, folders, keyPrefix);
+		if (viewMode === "flat") {
+			return files.map((file) => (
+				<FileRow key={`${keyPrefix}f-${file.path}`} file={file} depth={0} ctx={context}>
+					{file.path}
+				</FileRow>
+			));
+		}
+		const tree = compactGitFileTree(buildGitFileTree(files));
+		return <TreeNodes nodes={tree} depth={0} ctx={context} />;
+	}
+
 	return (
 		<Box style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
 			{(stage.error || unstage.error || commit.error || discard.error || aiMsg.error) && (
-				<Text c="red" size="xs">
+				<Text c="red" size="xs" px="xs" pt={4}>
 					{(stage.error || unstage.error || commit.error || discard.error || aiMsg.error)?.message}
 				</Text>
 			)}
 			{(stage.error || unstage.error || commit.error || discard.error) && (
-				<Text c="dimmed" size="xs">
+				<Text c="dimmed" size="xs" px="xs">
 					{t("workspace.writeFailureHint")}
 				</Text>
 			)}
-			{/*
-			 * Only the file list scrolls. The commit box lives outside it so it stays
-			 * reachable no matter how many files changed — inside the scroller it sat
-			 * below hundreds of rows and looked missing.
-			 */}
-			{/*
-			 * Filter chips sit ABOVE the scroller, like the commit box sits below it: a
-			 * control that decides what the list contains must stay reachable when the
-			 * list is long, and inside the scroller it would scroll away exactly when
-			 * the user needs it most.
-			 */}
+
+			<Stack gap={4} px="xs" pt="xs" style={{ flexShrink: 0 }}>
+				<TextInput
+					placeholder={t("commitMessage")}
+					value={message}
+					onChange={(e) => setMessage(e.currentTarget.value)}
+					onKeyDown={(e) => {
+						if (e.key === "Enter" && !e.shiftKey) handleCommit();
+					}}
+					rightSection={
+						<Tooltip label={t("aiGenerate")}>
+							<ActionIcon
+								aria-label={t("aiGenerate")}
+								variant="subtle"
+								size="sm"
+								onClick={handleAiGenerate}
+								disabled={!canWrite}
+								loading={aiMsg.isPending}
+							>
+								<IconSparkles size={14} />
+							</ActionIcon>
+						</Tooltip>
+					}
+					size="sm"
+				/>
+				<Button
+					fullWidth
+					size="sm"
+					leftSection={<IconCheck size={15} />}
+					onClick={handleCommit}
+					loading={commit.isPending}
+					disabled={!canWrite || !message.trim() || status.staged === 0}
+				>
+					{t("commitButton")}
+					{status.staged > 0 ? ` (${status.staged})` : ""}
+				</Button>
+			</Stack>
+
+			<Group
+				gap={6}
+				px="xs"
+				py={6}
+				wrap="nowrap"
+				style={{ flexShrink: 0, borderBottom: "1px solid var(--mantine-color-default-border)" }}
+			>
+				<Text size="sm" fw={600} style={{ flex: 1, minWidth: 0 }}>
+					{t("panel.changes")}
+					<Text span c="dimmed" fw={400}>
+						{` (${totalFilesLabel})`}
+					</Text>
+				</Text>
+				{status.branch && (
+					<Group gap={2} wrap="nowrap" style={{ minWidth: 0, maxWidth: "34%" }}>
+						<Text
+							size="xs"
+							c="dimmed"
+							ff="monospace"
+							truncate
+							title={status.branch}
+							style={{ minWidth: 0, userSelect: "text" }}
+						>
+							{status.branch}
+						</Text>
+						<Tooltip label={clipboard.copied ? t("panel.branchCopied") : t("panel.copyBranch")}>
+							<ActionIcon
+								variant="subtle"
+								color={clipboard.copied ? "green" : "gray"}
+								size="sm"
+								aria-label={t("panel.copyBranch")}
+								onClick={() => clipboard.copy(status.branch)}
+							>
+								{clipboard.copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+							</ActionIcon>
+						</Tooltip>
+					</Group>
+				)}
+				<Button.Group>
+					<Button
+						size="compact-xs"
+						variant={viewMode === "tree" ? "filled" : "subtle"}
+						aria-pressed={viewMode === "tree"}
+						onClick={() => setViewMode("tree")}
+					>
+						{t("view.tree")}
+					</Button>
+					<Button
+						size="compact-xs"
+						variant={viewMode === "flat" ? "filled" : "subtle"}
+						aria-pressed={viewMode === "flat"}
+						onClick={() => setViewMode("flat")}
+					>
+						{t("view.flat")}
+					</Button>
+				</Button.Group>
+				<Tooltip label={t("workspace.retry")}>
+					<ActionIcon
+						size="sm"
+						variant="subtle"
+						aria-label={t("workspace.retry")}
+						onClick={onRefresh}
+					>
+						<IconRefresh size={15} />
+					</ActionIcon>
+				</Tooltip>
+				{onOpenSecondaryView && (
+					<Menu withinPortal position="bottom-end">
+						<Menu.Target>
+							<ActionIcon size="sm" variant="subtle" aria-label={t("panel.moreActions")}>
+								<IconDotsVertical size={15} />
+							</ActionIcon>
+						</Menu.Target>
+						<Menu.Dropdown>
+							<Menu.Item onClick={() => onOpenSecondaryView("commits")}>
+								{t("panel.commits")}
+							</Menu.Item>
+							<Menu.Item onClick={() => onOpenSecondaryView("stash")}>{t("panel.stash")}</Menu.Item>
+						</Menu.Dropdown>
+					</Menu>
+				)}
+			</Group>
+
 			{status.truncated && (
-				<Text size="xs" c="yellow">
+				<Text size="xs" c="yellow" px="xs" pt={4}>
 					{t("workspace.statusTruncated")}
 				</Text>
 			)}
@@ -329,7 +475,7 @@ export function GitChangesTab({
 			/>
 
 			<ScrollArea style={{ flex: 1, minHeight: 0 }}>
-				<Stack gap="xs" pb="xs">
+				<Stack gap={4} px={4} pb="xs">
 					{(modifications || attributionTruncated) && (
 						<Group gap={4} justify="flex-end">
 							{modifications && (
@@ -360,12 +506,6 @@ export function GitChangesTab({
 							)}
 						</Group>
 					)}
-
-					{/*
-					 * An active filter that matches nothing has to be named. Without this the
-					 * two sections just do not render, and the panel reads as a clean working
-					 * tree while uncommitted changes are merely hidden.
-					 */}
 					{filterHidesEverything && (
 						<Stack gap={4} py="md" align="center">
 							<Text size="sm" c="dimmed">
@@ -377,20 +517,17 @@ export function GitChangesTab({
 						</Stack>
 					)}
 
-					{/* Staged section */}
-					{matchedStaged.length > 0 && (
-						<Stack gap={4}>
-							<Group gap="xs" justify="space-between">
+					{(matchedStaged.length > 0 ||
+						(!filterActive && status.truncated && gitSectionCount(status, "staged") > 0)) && (
+						<Stack gap={2}>
+							<Group gap="xs" justify="space-between" px={4}>
 								<Text size="xs" fw={600}>
 									{t("staged")} (
-									{filterActive ? `${matchedStaged.length}/${stagedFiles.length}` : status.staged})
+									{filterActive
+										? `${matchedStaged.length}/${stagedFiles.length}`
+										: stagedCountLabel}
+									)
 								</Text>
-								{/*
-								 * Scoped to what the filter shows. "All" while a filter hides rows would
-								 * act on files the user cannot see — harmless for unstage, but the same
-								 * shape as Discard below, where it destroys work that was filtered out.
-								 * The label changes with the scope so the button never lies about it.
-								 */}
 								<Button
 									size="compact-xs"
 									variant="subtle"
@@ -405,44 +542,27 @@ export function GitChangesTab({
 									{filterActive ? t("filter.unstageMatched") : t("unstageAll")}
 								</Button>
 							</Group>
-							<TreeNodes
-								nodes={stagedTree}
-								depth={0}
-								ctx={{
-									canWrite,
-									keyPrefix: "s",
-									action: "unstage",
-									section: "staged",
-									expandedFolders: stagedFolders.expanded,
-									onToggle: stagedFolders.toggle,
-									onAction: (files) => unstage.mutate({ files }),
-									onOpenFile: (path) => {
-										setDiffFile(path);
-										setDiffStaged(true);
-									},
-									attrByPath,
-									currentByPath,
-									currentDiff: modifications?.currentDiff,
-									t,
-								}}
-							/>
-							{hiddenStaged > 0 && (
+							{renderRows("staged", "unstage", displayStaged, stagedFolders, "s")}
+							{(hiddenStaged > 0 || status.truncated) && (
 								<Text size="xs" c="dimmed" ta="center">
-									+{hiddenStaged} more
+									{hiddenStaged > 0 ? `+${hiddenStaged} more` : null}
+									{status.truncated
+										? ` ${t("workspace.sectionTruncated", { section: t("staged") })}`
+										: null}
 								</Text>
 							)}
 						</Stack>
 					)}
 
-					{/* Unstaged / untracked section */}
-					{matchedUnstaged.length > 0 && (
-						<Stack gap={4}>
-							<Group gap="xs" justify="space-between">
+					{(matchedUnstaged.length > 0 ||
+						(!filterActive && status.truncated && gitSectionCount(status, "unstaged") > 0)) && (
+						<Stack gap={2}>
+							<Group gap="xs" justify="space-between" px={4}>
 								<Text size="xs" fw={600}>
 									{t("unstaged")} (
 									{filterActive
 										? `${matchedUnstaged.length}/${unstagedFiles.length}`
-										: status.unstaged + status.untracked}
+										: unstagedCountLabel}
 									)
 								</Text>
 								<Group gap={4}>
@@ -471,89 +591,26 @@ export function GitChangesTab({
 									</Button>
 								</Group>
 							</Group>
-							<TreeNodes
-								nodes={unstagedTree}
-								depth={0}
-								ctx={{
-									canWrite,
-									keyPrefix: "u",
-									action: "stage",
-									section: "unstaged",
-									expandedFolders: unstagedFolders.expanded,
-									onToggle: unstagedFolders.toggle,
-									onAction: (files) => stage.mutate({ files }),
-									onDiscard: async (file) => {
-										if (!canWrite) return;
-										const scope =
-											typeof target === "string"
-												? ""
-												: `\n${t("workspace.scope", { root: target.rootPath })}`;
-										if (await confirm({ message: t("discardFileConfirm", { file }) + scope }))
-											discard.mutate({ files: [file] });
-									},
-									onOpenFile: (path) => {
-										setDiffFile(path);
-										setDiffStaged(false);
-									},
-									attrByPath,
-									currentByPath,
-									currentDiff: modifications?.currentDiff,
-									t,
-								}}
-							/>
-							{(hiddenUnstaged > 0 || serverCapped) && (
+							{renderRows("unstaged", "stage", displayUnstaged, unstagedFolders, "u")}
+							{(hiddenUnstaged > 0 || serverCapped || status.truncated) && (
 								<Text size="xs" c="dimmed" ta="center">
-									+{serverCapped ? totalFiles - status.files.length : hiddenUnstaged} more
+									{hiddenUnstaged > 0 ? `+${hiddenUnstaged} more` : null}
+									{serverCapped ? ` ${t("workspace.serverFilesTruncated")}` : null}
+									{status.truncated
+										? ` ${t("workspace.sectionTruncated", { section: t("unstaged") })}`
+										: null}
 								</Text>
 							)}
 						</Stack>
 					)}
+
+					{!status.hasChanges && (
+						<Text size="sm" c="dimmed" py="md" ta="center">
+							{t("noChanges")}
+						</Text>
+					)}
 				</Stack>
 			</ScrollArea>
-
-			{/* Commit area — pinned below the scroller. */}
-			<Group
-				gap="xs"
-				align="flex-end"
-				wrap="nowrap"
-				pt="xs"
-				style={{
-					flexShrink: 0,
-					borderTop: "1px solid var(--mantine-color-default-border)",
-				}}
-			>
-				<TextInput
-					placeholder={t("commitMessage")}
-					value={message}
-					onChange={(e) => setMessage(e.currentTarget.value)}
-					onKeyDown={(e) => {
-						if (e.key === "Enter" && !e.shiftKey) handleCommit();
-					}}
-					size="xs"
-					style={{ flex: 1 }}
-				/>
-				<Tooltip label={t("aiGenerate")}>
-					<ActionIcon
-						aria-label={t("aiGenerate")}
-						variant="subtle"
-						size="sm"
-						onClick={handleAiGenerate}
-						disabled={!canWrite}
-						loading={aiMsg.isPending}
-					>
-						<IconSparkles size={14} />
-					</ActionIcon>
-				</Tooltip>
-				<Button
-					size="compact-xs"
-					leftSection={<IconCheck size={14} />}
-					onClick={handleCommit}
-					loading={commit.isPending}
-					disabled={!canWrite || !message.trim() || status.staged === 0}
-				>
-					{t("commitButton")}
-				</Button>
-			</Group>
 
 			<GitFileDiff
 				target={target}
@@ -633,6 +690,7 @@ function StatusFilterBar({
 						// and it is also the only way a test (or a screen reader) can read the
 						// selection without inspecting Mantine's variant classes.
 						aria-pressed={on}
+						data-git-status-filter={char}
 						aria-label={t("filter.toggle", { name, count })}
 						onClick={() => onToggle(char)}
 						style={{ cursor: "pointer", textTransform: "none" }}
@@ -858,6 +916,7 @@ function FileRow({
 						reason: ctx.currentDiff?.baselineStatus === "stale" ? "stale" : "unavailable",
 					}
 				: undefined;
+	const history = ctx.attrByPath.get(file.path);
 
 	return (
 		<TreeRow
@@ -865,15 +924,17 @@ function FileRow({
 			label={ctx.t("viewDiffOf", { path: file.path })}
 			onActivate={() => ctx.onOpenFile(file.path)}
 		>
-			<Badge
-				size="xs"
-				color={color}
-				variant="filled"
-				w={STATUS_BADGE_WIDTH}
-				style={{ flexShrink: 0 }}
-			>
-				{statusChar}
-			</Badge>
+			<AttributionHoverCard current={currentTarget} history={history} t={ctx.t}>
+				<Badge
+					size="xs"
+					color={color}
+					variant="filled"
+					w={STATUS_BADGE_WIDTH}
+					style={{ flexShrink: 0 }}
+				>
+					{statusChar}
+				</Badge>
+			</AttributionHoverCard>
 			<Text
 				size="xs"
 				lineClamp={1}
@@ -883,14 +944,6 @@ function FileRow({
 			>
 				{clampGitFilePath(children)}
 			</Text>
-			{!ctx.currentDiff?.clean && (
-				<AttributionBadge
-					attribution={ctx.attrByPath.get(file.path)}
-					currentMode={!!ctx.currentDiff}
-					current={currentTarget}
-					t={ctx.t}
-				/>
-			)}
 			<LineStats added={file.displayLinesAdded} removed={file.displayLinesRemoved} />
 			{ctx.onDiscard && (
 				<Tooltip label={ctx.t("discardFile")}>
@@ -932,48 +985,106 @@ function FileRow({
  * diff: v1 timestamp hints have no verified baseline fingerprint or workspace epoch.
  * Missing observations render no badge, not a claim that no one changed the file.
  */
-function AttributionBadge({
-	attribution,
+function formatAttributionTime(value: string): string {
+	try {
+		return new Intl.DateTimeFormat(undefined, {
+			month: "short",
+			day: "numeric",
+			hour: "numeric",
+			minute: "2-digit",
+		}).format(new Date(value));
+	} catch {
+		return value;
+	}
+}
+
+function AttributionHoverCard({
 	current,
-	currentMode,
+	history,
 	t,
+	children,
 }: {
-	attribution?: FileModificationGroup;
 	current?: CurrentDiffTarget;
-	currentMode: boolean;
+	history?: FileModificationGroup;
 	t: Translate;
+	children: ReactNode;
 }) {
-	const badge = currentMode
-		? buildCurrentAttributionBadge(current, attribution, t)
-		: attribution
-			? buildAttributionBadge(attribution, t)
+	if (current?.status === "clean") return <>{children}</>;
+	const hasCurrentEvidence =
+		current?.status === "matching_evidence" &&
+		current.actor &&
+		!!current.baselineVersion &&
+		!current.reason;
+	const hasContent = !!current || !!history;
+	if (!hasContent) return <>{children}</>;
+
+	const currentLabel = hasCurrentEvidence
+		? buildAttributionLabels(current.actor, t).detail
+		: t("attributionCurrentUnknownShort");
+	const currentTitle = current
+		? t("attributionCurrentEvidenceShort")
+		: t("attributionLastObservedShort");
+	const reason = current?.reason ? t(`attributionCurrentReasonShort.${current.reason}`) : null;
+	const recentEvents = history?.recentEvents ?? [];
+	const historyWarning =
+		history && (!history.completeness.fileHistoryComplete || history.completeness.countsLowerBound)
+			? t("attributionHistoryPartialShort")
 			: null;
-	if (!badge) return null;
-	const tooltip = badge.tooltipLines.join("\n");
 
 	return (
-		<Tooltip label={tooltip} multiline withinPortal>
-			<Badge
-				size="xs"
-				variant="light"
-				color={badge.hasNarrator ? "indigo" : "gray"}
-				// The tooltip is hover-only, so its contributor list would otherwise be
-				// unreachable by a screen reader — and by a test — while closed.
-				aria-label={tooltip}
-				// Uncertainty is carried by an icon rather than by colour alone, which
-				// would not survive a colour-blind or high-contrast viewer.
-				leftSection={<IconHelpCircle size={10} />}
-				style={{ flexShrink: 0, maxWidth: 110, cursor: "default", textTransform: "none" }}
-				onClick={(e) => e.stopPropagation()}
-			>
-				<Text size="xs" lineClamp={1} component="span">
-					{badge.label}
-					{badge.extraCount > 0
-						? ` +${badge.extraCountIsLowerBound ? "≥" : ""}${badge.extraCount}`
-						: ""}
-					{badge.incomplete ? ` · ${t("attributionPartial")}` : ""}
-				</Text>
-			</Badge>
-		</Tooltip>
+		<HoverCard width={320} shadow="md" withArrow openDelay={120} closeDelay={120} withinPortal>
+			<HoverCard.Target>
+				<span
+					data-attribution-hover-target="true"
+					style={{ display: "inline-flex", flexShrink: 0, cursor: "help" }}
+				>
+					{children}
+				</span>
+			</HoverCard.Target>
+			<HoverCard.Dropdown p="xs">
+				<Stack gap={6}>
+					<div>
+						<Text size="xs" c="dimmed">
+							{currentTitle}
+						</Text>
+						<Text size="sm" fw={600} lineClamp={1} title={currentLabel}>
+							{currentLabel}
+						</Text>
+						{reason && (
+							<Text size="xs" c="dimmed" lineClamp={2}>
+								{reason}
+							</Text>
+						)}
+					</div>
+
+					{recentEvents.length > 0 && (
+						<div>
+							<Text size="xs" c="dimmed" mb={4}>
+								{t("attributionHistoryShort")}
+							</Text>
+							<Timeline bulletSize={12} lineWidth={1}>
+								{recentEvents.map((event) => {
+									const labels = buildAttributionLabels(event.actor, t);
+									return (
+										<Timeline.Item key={event.id} title={labels.detail}>
+											<Text size="xs" c="dimmed">
+												{t(`attributionAction.${event.action}`)} ·{" "}
+												{formatAttributionTime(event.changedAt)}
+											</Text>
+										</Timeline.Item>
+									);
+								})}
+							</Timeline>
+						</div>
+					)}
+
+					{historyWarning && (
+						<Text size="xs" c="orange">
+							{historyWarning}
+						</Text>
+					)}
+				</Stack>
+			</HoverCard.Dropdown>
+		</HoverCard>
 	);
 }

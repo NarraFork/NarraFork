@@ -57,6 +57,7 @@ function group(overrides: Partial<FileModificationGroup> = {}): FileModification
 		lastAction: "external",
 		lastActor,
 		actors,
+		recentEvents: [],
 		hasExternalChange: false,
 		hasImpreciseAttribution: true,
 		hasDeletedActor: false,

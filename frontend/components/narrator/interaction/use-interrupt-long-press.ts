@@ -66,7 +66,7 @@ export function useInterruptLongPress(
 				interruptFiredRef.current = true;
 				if (interruptTimerRef.current != null) clearInterval(interruptTimerRef.current);
 				interruptTimerRef.current = null;
-				interruptMutationRef.current.mutate(narratorIdRef.current);
+				interruptMutationRef.current.mutate({ id: narratorIdRef.current });
 			}
 		}, 16);
 	}, []);
@@ -90,7 +90,7 @@ export function useInterruptLongPress(
 					interruptFiredRef.current = true;
 					if (interruptTimerRef.current != null) clearInterval(interruptTimerRef.current);
 					interruptTimerRef.current = null;
-					interruptMutationRef.current.mutate(narratorIdRef.current);
+					interruptMutationRef.current.mutate({ id: narratorIdRef.current });
 				}
 			}, 16);
 		};

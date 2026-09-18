@@ -7,6 +7,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { type GitStatusSummary, invalidateWorkspaceQueries } from "../../hooks/useGit";
 import { __resetGitFolderPrefsCache } from "../../hooks/useGitFolderPrefs";
+import { __resetGitViewModeCache } from "../../hooks/useGitViewMode";
 import { api } from "../../lib/api";
 import { type GitTarget, type GitWorkspace, gitTargetKey } from "../../lib/api/git";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
@@ -308,10 +309,10 @@ function flushRender() {
 describe("GitPanel", () => {
 	beforeEach(async () => {
 		installDom();
-		// The folder-prefs snapshot is memoized at module scope; installDom() hands
-		// out a FRESH Map-backed sessionStorage each test, so a stale parse would leak
-		// one test's expanded folders into the next.
+		// Preference snapshots are memoized at module scope; installDom() hands out
+		// fresh storage maps each test, so every cache must be reset between cases.
 		__resetGitFolderPrefsCache();
+		__resetGitViewModeCache();
 		await initTestI18n();
 	});
 
@@ -863,17 +864,21 @@ describe("GitPanel", () => {
 
 	test("standalone narrator with context project exposes the full workspace panel", async () => {
 		const { container, queryClient, calls } = await renderNarratorWorkspace(readyWorkspace());
-		expect(container.textContent).toContain("Git root: /repo");
-		expect(container.textContent).toContain("Working directory: /repo/sub");
-		expect(container.textContent).toContain("entire shared working tree");
+		// The compact SCM layout no longer spends permanent vertical space on device,
+		// cwd and repository-path diagnostics; those remain available from workspace
+		// errors and the existing backend scope used by destructive confirmations.
+		expect(container.textContent).not.toContain("Git root: /repo");
+		expect(container.textContent).not.toContain("Working directory: /repo/sub");
+		expect(container.textContent).toContain("Changes");
+		expect(container.textContent).toContain("Tree");
+		expect(container.textContent).toContain("List");
 		buttonByText(container, "Stage All").click();
 		await flushRender();
 		expect(calls[0]?.target).toMatchObject({
 			narratorId: "standalone-workspace",
 			workspaceKey: "local:/repo",
 		});
-		expect(container.textContent).toContain("Commits");
-		expect(container.textContent).toContain("Stash");
+		expect(container.textContent).not.toContain("Git root:");
 		queryClient.clear();
 	});
 
@@ -910,7 +915,7 @@ describe("GitPanel", () => {
 			expect(buttonByText(container, label).hasAttribute("disabled")).toBe(true);
 		expect(
 			Array.from(container.querySelectorAll("button"))
-				.find((button) => button.textContent === "Commit")
+				.find((button) => button.textContent?.startsWith("Commit"))
 				?.hasAttribute("disabled"),
 		).toBe(true);
 		expect(buttonByLabel(container, "AI Generate").hasAttribute("disabled")).toBe(true);
@@ -1075,7 +1080,7 @@ describe("GitPanel", () => {
 	 * This covers the Clipboard API branch (secure context). The plain-http fallback
 	 * is a separate path and gets its own test below.
 	 */
-	test("shows the branch in a header and copies the full name on click", async () => {
+	test("shows the branch in the changes toolbar and copies the full name on click", async () => {
 		const copied: string[] = [];
 		// A SECURE context has to be stated, not assumed: sibling clipboard suites
 		// pin `isSecureContext: false` onto linkedom's shared prototypes, and
@@ -1100,8 +1105,9 @@ describe("GitPanel", () => {
 		);
 
 		expect(container.textContent).toContain(LONG_BRANCH);
-		// Short HEAD sha, so the header identifies the commit as well as the branch.
-		expect(container.textContent).toContain("abc1234");
+		// The compact header keeps the branch identity but removes the permanent HEAD
+		// hash from the narrow panel.
+		expect(container.textContent).not.toContain("abc1234");
 
 		buttonByLabel(container, "Copy branch name").dispatchEvent(
 			new Event("click", { bubbles: true }),
@@ -1140,6 +1146,73 @@ describe("GitPanel", () => {
 		// the document on every click.
 		expect(document.querySelectorAll('input[aria-hidden="true"]').length).toBe(0);
 
+		queryClient.clear();
+	});
+
+	test("switches between the compact tree and flat file list", async () => {
+		const chapterId = "chapter-git-view-mode";
+		const queryClient = new QueryClient({
+			defaultOptions: {
+				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
+				mutations: { retry: false },
+			},
+		});
+		queryClient.setQueryData(["gitStatus", chapterId], makeStatus());
+
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+		root.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider>
+					<QueryClientProvider client={queryClient}>
+						<ConfirmDialogProvider>
+							<GitPanel chapterId={chapterId} />
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+		await flushRender();
+
+		expect(rowLabels(container)).toEqual(["Expand folder src", "Expand folder src"]);
+		buttonByText(container, "List").click();
+		await flushRender();
+		expect(rowLabels(container)).toEqual([
+			"View diff of src/staged.ts",
+			"View diff of src/unstaged.ts",
+			"View diff of src/new-file.ts",
+		]);
+		expect(JSON.parse(localStorage.getItem("narrafork_git_view_mode") ?? "{}")[chapterId]).toBe(
+			"flat",
+		);
+
+		root?.unmount();
+		root = undefined;
+		const remountedContainer = document.createElement("div");
+		document.body.appendChild(remountedContainer);
+		root = createRoot(remountedContainer);
+		root.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider>
+					<QueryClientProvider client={queryClient}>
+						<ConfirmDialogProvider>
+							<GitPanel chapterId={chapterId} />
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+		await flushRender();
+		expect(rowLabels(remountedContainer)).toEqual([
+			"View diff of src/staged.ts",
+			"View diff of src/unstaged.ts",
+			"View diff of src/new-file.ts",
+		]);
+
+		buttonByText(remountedContainer, "Tree").click();
+		await flushRender();
+		expect(rowLabels(remountedContainer)).toEqual(["Expand folder src", "Expand folder src"]);
 		queryClient.clear();
 	});
 });

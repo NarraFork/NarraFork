@@ -7,6 +7,7 @@ import { type ApiError, api } from "@frontend/lib/api";
 import { CHAPTER_ROLE_ICONS, statusRegistry } from "@frontend/lib/constants";
 import { ActionIcon, Badge, Collapse, Group, Menu, Text, Tooltip } from "@mantine/core";
 import {
+	IconGitBranch,
 	IconGitCommit,
 	IconGitFork,
 	IconGitMerge,
@@ -52,7 +53,15 @@ const PodmanInstallModal = lazy(() =>
 	})),
 );
 
-/** Always reachable, including unavailable targets, so discovery failures can be retried. */
+/**
+ * Git strip for standalone narrators (no chapter worktree).
+ *
+ * Non-git working directories render nothing: a row that only says "not a Git
+ * tree" is pure vertical noise. Pending probe is also hidden so a non-git cwd
+ * does not flash a loading line before vanishing. Discovery failures and other
+ * unusable-environment states stay visible so they can still be retried from
+ * the panel.
+ */
 export function NarratorGitBar({
 	narratorId,
 	onOpenGitPanel,
@@ -64,34 +73,56 @@ export function NarratorGitBar({
 	const workspace = useGitWorkspace(narratorId);
 	const target = !workspace.isError ? gitWorkspaceTarget(narratorId, workspace.data) : null;
 	const status = useGitStatus(target);
+	const workspaceState = workspace.data?.state;
+	if (!workspace.isError && (workspace.isPending || workspaceState === "not_git")) {
+		return null;
+	}
 	return (
-		<Group px="md" py={4} gap={6} wrap="nowrap" style={{ flexShrink: 0 }}>
-			<Text
-				size="xs"
-				role="button"
-				tabIndex={0}
-				style={{ cursor: "pointer", userSelect: "text" }}
-				onClick={() => {
-					if (!isTextSelectionGesture(window.getSelection())) onOpenGitPanel();
-				}}
-				onKeyDown={(event) => {
-					if (isActivationKey(event.key)) {
-						event.preventDefault();
-						onOpenGitPanel();
-					}
-				}}
-			>
-				{t("panel.title")} ·{" "}
-				{target
-					? status.data?.branch || t("workspace.ready")
-					: t(
-							`workspace.${workspace.isPending ? "loading" : workspace.isError ? "error" : (workspace.data?.state ?? "error")}`,
-						)}
-			</Text>
+		<Group
+			px="md"
+			py={4}
+			gap={6}
+			wrap="nowrap"
+			role="button"
+			tabIndex={0}
+			aria-label={t("panel.title")}
+			style={{ flexShrink: 0, cursor: "pointer", userSelect: "text" }}
+			onClick={() => {
+				if (!isTextSelectionGesture(window.getSelection())) onOpenGitPanel();
+			}}
+			onKeyDown={(event) => {
+				if (isActivationKey(event.key)) {
+					event.preventDefault();
+					onOpenGitPanel();
+				}
+			}}
+		>
+			<Group gap={6} wrap="nowrap">
+				<IconGitBranch size={14} color="var(--mantine-color-dimmed)" aria-hidden="true" />
+				<Text size="xs" c="dimmed" ff="monospace" truncate>
+					{target
+						? status.data?.branch || t("workspace.ready")
+						: t(
+								`workspace.${workspace.isPending ? "loading" : workspace.isError ? "error" : (workspace.data?.state ?? "error")}`,
+							)}
+				</Text>
+			</Group>
 			{status.data && (
-				<Badge size="xs" variant="light">
-					{status.data.staged + status.data.unstaged + status.data.untracked}
-				</Badge>
+				<Tooltip label={t("panel.changes")}>
+					<Badge size="xs" variant="light">
+						<Group gap={5} wrap="nowrap">
+							<Text span size="xs" fw={600}>
+								{status.data.totalFiles}
+							</Text>
+							<Text span size="xs" c="green" fw={600}>
+								+{status.data.linesAdded}
+							</Text>
+							<Text span size="xs" c="red" fw={600}>
+								-{status.data.linesRemoved}
+							</Text>
+						</Group>
+					</Badge>
+				</Tooltip>
 			)}
 			{target && !workspace.data?.capabilities.write && (
 				<Text size="xs" c="dimmed">

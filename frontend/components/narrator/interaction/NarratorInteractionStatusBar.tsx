@@ -101,6 +101,8 @@ export interface NarratorInteractionStatusBarProps {
 		compactingMarkerMessageId: string | null;
 		compactFailure: CompactFailureInfo | null;
 		compactProgressFragment: string;
+		/** Label for a quota wait, including reset instant when the server reported one. */
+		quotaWaitText: string;
 		turnElapsedText: string | null;
 		turnStartedAtLabel: string | null;
 		onOpenSpecTool: () => void;
@@ -327,6 +329,8 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 				return `${t("compacting")} · ${workIndicator.compactProgressFragment}`;
 			case "model_unavailable":
 				return t("status_model_unavailable");
+			case "quota_exhausted":
+				return workIndicator.quotaWaitText;
 			case "spec_task":
 				return workIndicator.currentSpecTask?.text ?? t("thinking");
 			case "waiting":
@@ -341,6 +345,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 	}, [
 		workIndicator.plan.primary,
 		workIndicator.compactProgressFragment,
+		workIndicator.quotaWaitText,
 		workIndicator.currentSpecTask,
 		retryCountdown,
 		retryInfo,

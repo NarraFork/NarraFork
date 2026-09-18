@@ -107,9 +107,9 @@ export const gitModificationsQuerySchema = z.object({
 	narratorId: z.union([z.literal("external"), z.string().trim().min(1).max(64)]).optional(),
 	scope: z.literal("uncommitted").optional(),
 	/**
-	 * Which projections to build. `byFile` omits the timeline, which is the heavier half of
-	 * the response and unread by the Git panel. Absent means "everything", so an older
-	 * client is unaffected.
+	 * Which projections to build. `byFile` omits the full timeline but includes a bounded
+	 * per-file event summary for the Git status hover card. Absent means "everything", so
+	 * an older client is unaffected.
 	 */
 	projection: z.enum(["all", "byFile"]).optional(),
 });

@@ -274,7 +274,7 @@ async function confirmDialogButton(text: string): Promise<HTMLButtonElement> {
 /** The filter chips, as `letter → pressed?`. */
 function chips(container: HTMLElement): Record<string, boolean> {
 	const result: Record<string, boolean> = {};
-	for (const chip of Array.from(container.querySelectorAll("[aria-pressed]"))) {
+	for (const chip of Array.from(container.querySelectorAll("[data-git-status-filter]"))) {
 		// The chip's own text is `letter count`, e.g. "M 2".
 		const letter = (chip.textContent ?? "").trim().split(/\s+/)[0] ?? "";
 		result[letter] = chip.getAttribute("aria-pressed") === "true";
@@ -283,13 +283,13 @@ function chips(container: HTMLElement): Record<string, boolean> {
 }
 
 function chipText(container: HTMLElement): string[] {
-	return Array.from(container.querySelectorAll("[aria-pressed]")).map((chip) =>
+	return Array.from(container.querySelectorAll("[data-git-status-filter]")).map((chip) =>
 		(chip.textContent ?? "").replace(/\s+/g, " ").trim(),
 	);
 }
 
 function chipByLetter(container: HTMLElement, letter: string): Element {
-	const chip = Array.from(container.querySelectorAll("[aria-pressed]")).find(
+	const chip = Array.from(container.querySelectorAll("[data-git-status-filter]")).find(
 		(candidate) => (candidate.textContent ?? "").trim().split(/\s+/)[0] === letter,
 	);
 	if (!chip) throw new Error(`Filter chip not found: ${letter}`);
@@ -426,7 +426,63 @@ describe("GitChangesTab status filter", () => {
 		// Only the staged half survives — that is the row whose badge says `A`.
 		expect(fileRowPaths(container)).toEqual(["src/fresh.ts"]);
 		expect(container.textContent).toContain("Staged (1/1)");
-		expect(container.textContent).not.toContain("Changes (");
+		expect(container.textContent).not.toContain("Changes (1/1)");
+
+		client.clear();
+	});
+
+	test("MM contributes one row to each section and keeps the shared badge count", async () => {
+		const chapterId = "chapter-filter-mm";
+		const client = makeClient();
+		client.setQueryData(["gitStatus", chapterId], {
+			hasChanges: true,
+			staged: 2,
+			unstaged: 1,
+			untracked: 0,
+			files: [file("MM", "src/shared.ts"), file("A ", "src/added.ts")],
+			totalFiles: 2,
+			headSha: "abc1234",
+			branch: "main",
+			linesAdded: 2,
+			linesRemoved: 0,
+		} satisfies GitStatusSummary);
+		const container = renderTab(chapterId, client);
+		await flushRender();
+
+		expect(chipText(container)).toEqual(["A 1", "M 2"]);
+		// The header counts unique files, while the section labels count actionable rows:
+		// the MM path appears in both sections but is one changed file overall.
+		expect(container.textContent).toContain("Changes (2)");
+		expect(container.textContent).toContain("Staged (2)");
+		expect(container.textContent).toContain("Changes (1)");
+
+		client.clear();
+	});
+
+	test("truncated status shows lower-bound counts for both sections", async () => {
+		const chapterId = "chapter-filter-truncated";
+		const client = makeClient();
+		client.setQueryData(["gitStatus", chapterId], {
+			hasChanges: true,
+			truncated: true,
+			staged: 3,
+			unstaged: 2,
+			untracked: 1,
+			files: [file("M ", "src/staged.ts"), file(" M", "src/worktree.ts")],
+			totalFiles: 2,
+			headSha: "abc1234",
+			branch: "main",
+			linesAdded: 2,
+			linesRemoved: 0,
+		} satisfies GitStatusSummary);
+		const container = renderTab(chapterId, client);
+		await flushRender();
+
+		expect(container.textContent).toContain("Changes (2+)");
+		expect(container.textContent).toContain("Staged (3+)");
+		expect(container.textContent).toContain("Changes (3+)");
+		expect(container.textContent).toContain("Staged count is a lower bound");
+		expect(container.textContent).toContain("Changes count is a lower bound");
 
 		client.clear();
 	});

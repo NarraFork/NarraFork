@@ -10,6 +10,7 @@ import { trimFileReferenceInput } from "../composer/file-reference-input";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 import { revokeContentBlockPreviewUrls } from "../narrator-message-helpers";
 import type { ContentBlock } from "../narrator-panel-types";
+import { interruptAndInsert } from "./interrupt-and-insert";
 import type { BooleanOverride, DangerReflectionOverride } from "./reflection-types";
 
 /** Subset of a send response that indicates a buffered (queued) message. */
@@ -89,7 +90,9 @@ export interface UseNarratorSendOptions {
 	createNarrator: {
 		mutateAsync: (input: Record<string, unknown>) => Promise<{ id: string }>;
 	};
-	interruptNarrator: { mutateAsync: (narratorId: string) => Promise<unknown> };
+	interruptNarrator: {
+		mutateAsync: (input: { id: string; waitForIdle?: boolean }) => Promise<unknown>;
+	};
 	registerSubmitToNarrator: ((fn: (text: string) => void) => (() => void) | undefined) | undefined;
 	setNarratorWorking: () => void;
 	navigateToNarrator: (narratorId: string) => void;
@@ -533,19 +536,16 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				} else if (mode === "tool") {
 					await doSendBuffered(msg, true, abortController.signal);
 				} else {
-					// "interrupt": insert at the front (await success), then interrupt so
-					// the loop's auto-resume immediately consumes the queued message.
-					// Only interrupt when the message was actually buffered — if the
-					// backend fell through to a direct send (narrator went idle between
-					// the status check and this request), interrupting would abort the
-					// message we just sent.
-					const buffered = await doSendBuffered(msg, true, abortController.signal);
-					if (buffered) {
-						// The queued message must be durably accepted before interrupting. Using
-						// `mutate` here fired-and-forgot the interrupt request; its cancellation
-						// could race the queue write/auto-resume and leave the message stuck in
-						// the "next request" state.
-						await interruptNarrator.mutateAsync(narratorId);
+					// "interrupt": stop the old loop and wait for its finalizer before
+					// accepting the replacement message. A 409/settled:false response is
+					// a bounded failure of that ordering, not an invitation to send the
+					// same message through the queue as a second attempt.
+					const inserted = await interruptAndInsert(
+						() => interruptNarrator.mutateAsync({ id: narratorId, waitForIdle: true }),
+						() => doSendBuffered(msg, false, abortController.signal).then(() => true),
+					);
+					if (inserted === undefined) {
+						notifications.show({ message: t("interruptNotSettled"), color: "yellow" });
 					}
 				}
 				return;
