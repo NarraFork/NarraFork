@@ -7,7 +7,7 @@ import {
 	sanitizeDiagnosticUrl,
 	serializeDiagnosticError,
 } from "../diagnostic-fetch";
-import { isConnectionClosedError } from "../error-handling";
+import { isConnectionClosedError, isRetryableError } from "../error-handling";
 import { createUrlCapture } from "../request-url-tracker";
 
 const closers: Array<() => void | Promise<void>> = [];
@@ -164,7 +164,7 @@ describe("diagnostic fetch", () => {
 		expect(quietCapture.requests[0]?.verbose).toBe(false);
 	});
 
-	test("does not transparently replay POST and captures actionable transport metadata", async () => {
+	test("does not replay POST at the transport layer and exposes a transient error", async () => {
 		const { url, connections } = await startResetServer();
 		const capture = createUrlCapture();
 		let thrown: unknown;
@@ -192,6 +192,7 @@ describe("diagnostic fetch", () => {
 		expect(networkError.message).not.toContain("secret-token");
 		expect(networkError.message).not.toContain("verbose: true");
 		expect(isConnectionClosedError(networkError)).toBe(true);
+		expect(isRetryableError(networkError)).toBe(true);
 		expect(serializeDiagnosticError(networkError)).toMatchObject({
 			category: "connection_reset",
 			code: networkError.code,
@@ -219,7 +220,9 @@ describe("diagnostic fetch", () => {
 	test("retries one pre-response connection error for an idempotent GET", async () => {
 		const { url, connections } = await startResetServer();
 
-		await expect(fetchWithNetworkDiagnostics(url)).rejects.toBeInstanceOf(NetworkRequestError);
+		await expect(
+			fetchWithNetworkDiagnostics(url, undefined, { retryPolicy: "idempotent-only" }),
+		).rejects.toBeInstanceOf(NetworkRequestError);
 		expect(connections()).toBe(2);
 	});
 

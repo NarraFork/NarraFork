@@ -16,6 +16,7 @@ import {
 	nugModelRefreshCoordinator,
 } from "../lib/nug-model-refresh-coordinator";
 import { applyNugModelCatalogUpdate } from "../lib/nug-model-sync";
+import { getNugRelayStatus } from "../lib/nug-relay/manager";
 import {
 	type NUGProviderConfig,
 	nugProviderPrefix,
@@ -682,6 +683,25 @@ function nugUsagePeriod(range: string | undefined): string {
 
 nugRoutes.get("/models", (c) => {
 	return c.json({ models: getActiveNugCachedModels(), fromCache: true });
+});
+
+// Client-egress relay status per provider (docs/CODEX_CLIENT_RELAY.md). The
+// settings page polls this to show whether a provider's local egress channel
+// is actually online; "disabled" means the provider uses NUG-direct egress.
+nugRoutes.get("/relay-status", (c) => {
+	const providers = settings.nugProviders ?? [];
+	const result: Record<
+		string,
+		{ status: "disabled" | "offline" | "connecting" | "online"; egressMode: string }
+	> = {};
+	for (const p of providers) {
+		const egressMode = p.egressMode ?? "nug";
+		result[p.id] = {
+			egressMode,
+			status: egressMode === "nug" ? "disabled" : getNugRelayStatus(p.id),
+		};
+	}
+	return c.json(result);
 });
 
 nugRoutes.post("/models/refresh", async (c) => {

@@ -261,92 +261,117 @@ interface PendingOAuth {
 
 let oauthServer: ReturnType<typeof Bun.serve> | undefined;
 let pendingOAuth: PendingOAuth | undefined;
+/** Last known state of the callback listener, for surfacing in the browser-auth state endpoint. */
+let oauthServerRunning = false;
 
 const CALLBACK_PORT = 1455;
 
-async function ensureOAuthServer(): Promise<{ port: number; redirectUri: string }> {
+async function ensureOAuthServer(): Promise<{
+	port: number;
+	redirectUri: string;
+	/** False when the local listener could not be started (e.g. port already in use). */
+	running: boolean;
+}> {
 	if (oauthServer) {
 		const port = oauthServer.port ?? CALLBACK_PORT;
-		return { port, redirectUri: `http://localhost:${port}/auth/callback` };
+		return { port, redirectUri: `http://localhost:${port}/auth/callback`, running: true };
 	}
 
 	// Use fixed port 1455 to match Go's RedirectURI.
 	// The server is kept alive across multiple OAuth flows to avoid port-release
 	// race conditions when Bun.serve is stopped and immediately restarted.
-	oauthServer = Bun.serve({
-		port: CALLBACK_PORT,
-		reusePort: true,
-		fetch(req) {
-			const url = new URL(req.url);
+	try {
+		oauthServer = Bun.serve({
+			port: CALLBACK_PORT,
+			reusePort: true,
+			fetch(req) {
+				const url = new URL(req.url);
 
-			if (url.pathname === "/auth/callback") {
-				const code = url.searchParams.get("code");
-				const state = url.searchParams.get("state");
-				const error = url.searchParams.get("error");
-				const errorDescription = url.searchParams.get("error_description");
+				if (url.pathname === "/auth/callback") {
+					const code = url.searchParams.get("code");
+					const state = url.searchParams.get("state");
+					const error = url.searchParams.get("error");
+					const errorDescription = url.searchParams.get("error_description");
 
-				if (error) {
-					const errorMsg = errorDescription || error;
-					pendingOAuth?.reject(new Error(errorMsg));
+					if (error) {
+						const errorMsg = errorDescription || error;
+						pendingOAuth?.reject(new Error(errorMsg));
+						pendingOAuth = undefined;
+						return new Response(HTML_ERROR(errorMsg), {
+							headers: { "Content-Type": "text/html" },
+						});
+					}
+
+					if (!code) {
+						const errorMsg = "Missing authorization code";
+						pendingOAuth?.reject(new Error(errorMsg));
+						pendingOAuth = undefined;
+						return new Response(HTML_ERROR(errorMsg), {
+							status: 400,
+							headers: { "Content-Type": "text/html" },
+						});
+					}
+
+					if (!pendingOAuth || state !== pendingOAuth.state) {
+						const errorMsg = pendingOAuth
+							? "Invalid state - potential CSRF attack"
+							: "No pending OAuth flow (expired or already completed)";
+						pendingOAuth?.reject(new Error(errorMsg));
+						pendingOAuth = undefined;
+						return new Response(HTML_ERROR(errorMsg), {
+							status: 400,
+							headers: { "Content-Type": "text/html" },
+						});
+					}
+
+					const current = pendingOAuth;
 					pendingOAuth = undefined;
-					return new Response(HTML_ERROR(errorMsg), {
+
+					exchangeCodeForTokens(code, current.redirectUri, current.pkce, current.proxy)
+						.then((tokens) => current.resolve(tokens))
+						.catch((err) => {
+							// Enhance error message when proxy is not configured
+							if (!current.proxy && isNetworkError(err)) {
+								current.reject(
+									new Error(
+										`Token exchange failed (no proxy configured): ${err.message}. ` +
+											`If you are behind a firewall, configure the Codex proxy first.`,
+									),
+								);
+							} else {
+								current.reject(err);
+							}
+						});
+
+					return new Response(HTML_SUCCESS, {
 						headers: { "Content-Type": "text/html" },
 					});
 				}
 
-				if (!code) {
-					const errorMsg = "Missing authorization code";
-					pendingOAuth?.reject(new Error(errorMsg));
-					pendingOAuth = undefined;
-					return new Response(HTML_ERROR(errorMsg), {
-						status: 400,
-						headers: { "Content-Type": "text/html" },
-					});
-				}
+				return new Response("Not found", { status: 404 });
+			},
+		});
+	} catch (err) {
+		// Port busy or otherwise unavailable: do NOT block the flow and do NOT fall
+		// back to another port — the redirect_uri must stay on 1455 to match the
+		// registered callback. The user can finish by pasting the callback URL.
+		oauthServer = undefined;
+		oauthServerRunning = false;
+		logger.warn("Codex OAuth callback server failed to start; continuing without it", {
+			port: CALLBACK_PORT,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return {
+			port: CALLBACK_PORT,
+			redirectUri: `http://localhost:${CALLBACK_PORT}/auth/callback`,
+			running: false,
+		};
+	}
 
-				if (!pendingOAuth || state !== pendingOAuth.state) {
-					const errorMsg = pendingOAuth
-						? "Invalid state - potential CSRF attack"
-						: "No pending OAuth flow (expired or already completed)";
-					pendingOAuth?.reject(new Error(errorMsg));
-					pendingOAuth = undefined;
-					return new Response(HTML_ERROR(errorMsg), {
-						status: 400,
-						headers: { "Content-Type": "text/html" },
-					});
-				}
-
-				const current = pendingOAuth;
-				pendingOAuth = undefined;
-
-				exchangeCodeForTokens(code, current.redirectUri, current.pkce, current.proxy)
-					.then((tokens) => current.resolve(tokens))
-					.catch((err) => {
-						// Enhance error message when proxy is not configured
-						if (!current.proxy && isNetworkError(err)) {
-							current.reject(
-								new Error(
-									`Token exchange failed (no proxy configured): ${err.message}. ` +
-										`If you are behind a firewall, configure the Codex proxy first.`,
-								),
-							);
-						} else {
-							current.reject(err);
-						}
-					});
-
-				return new Response(HTML_SUCCESS, {
-					headers: { "Content-Type": "text/html" },
-				});
-			}
-
-			return new Response("Not found", { status: 404 });
-		},
-	});
-
-	const port = oauthServer.port ?? 0;
+	const port = oauthServer.port ?? CALLBACK_PORT;
+	oauthServerRunning = true;
 	logger.info("Codex OAuth callback server started (persistent)", { port });
-	return { port, redirectUri: `http://localhost:${port}/auth/callback` };
+	return { port, redirectUri: `http://localhost:${port}/auth/callback`, running: true };
 }
 
 /** Heuristic: treat fetch/connection errors as network issues. */
@@ -375,8 +400,14 @@ function isNetworkError(err: unknown): boolean {
 export async function startBrowserOAuth(proxy?: string): Promise<{
 	authorizeUrl: string;
 	tokenPromise: Promise<CodexTokens>;
+	/**
+	 * False when the local callback listener failed to start (port busy, etc.).
+	 * The flow still works: the browser will land on a dead localhost URL and the
+	 * user finishes by pasting it via `completeBrowserOAuthFromCallbackUrl`.
+	 */
+	localCallbackServer: boolean;
 }> {
-	const { redirectUri } = await ensureOAuthServer();
+	const { redirectUri, running } = await ensureOAuthServer();
 	const pkce = generatePKCE();
 	const state = generateState();
 
@@ -435,7 +466,7 @@ export async function startBrowserOAuth(proxy?: string): Promise<{
 		};
 	});
 
-	return { authorizeUrl, tokenPromise };
+	return { authorizeUrl, tokenPromise, localCallbackServer: running };
 }
 
 // === Device code flow ===
@@ -692,6 +723,11 @@ export function getBrowserOAuthRedirectUri(): string {
 /** Whether a browser OAuth flow is currently awaiting its callback. */
 export function hasPendingBrowserOAuth(): boolean {
 	return !!pendingOAuth;
+}
+
+/** Whether the local callback listener is up (false = manual paste is required). */
+export function isBrowserOAuthServerRunning(): boolean {
+	return oauthServerRunning;
 }
 
 /**

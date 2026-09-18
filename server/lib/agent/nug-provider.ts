@@ -6,6 +6,7 @@ import {
 	setNugCachedCapabilities,
 } from "../nug-model-cache";
 import { applyNugModelCatalogUpdate } from "../nug-model-sync";
+import { ensureNugRelayClient, getNugRelayChannelId, usesLocalEgress } from "../nug-relay/manager";
 import { shouldUseNativeSearch } from "../search/native";
 import type { NUGProviderConfig } from "../settings";
 
@@ -33,6 +34,7 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
+import { parseJsonResponseWithBody } from "./response-body";
 
 import {
 	type AgentToolUse,
@@ -164,6 +166,10 @@ export class NugProvider implements ProviderAdapter {
 
 	constructor(config: NUGProviderConfig) {
 		this.config = config;
+		// Client-egress relay lifecycle follows provider construction: with
+		// egressMode local-* a relay channel to the gateway is established (or
+		// reused); reverting to "nug" tears it down. Idempotent per provider id.
+		ensureNugRelayClient(config);
 	}
 
 	/**
@@ -236,6 +242,18 @@ export class NugProvider implements ProviderAdapter {
 							: meta.channelType === "responses"
 								? "responses"
 								: "completions",
+					// Client-egress relay: only the codex channel honors the relay
+					// channel id; the value rotates on reconnect, so it must be read
+					// per request via dynamicHeaders rather than baked into
+					// extraHeaders.
+					...(usesLocalEgress(this.config) && meta.channelType === "codex"
+						? {
+								dynamicHeaders: (): Record<string, string> => {
+									const channelId = getNugRelayChannelId(this.config.id);
+									return channelId ? { "X-NUG-Relay-Channel": channelId } : {};
+								},
+							}
+						: {}),
 					...(meta.channelType === "codex"
 						? {
 								codexWebSocket: false,
@@ -403,6 +421,21 @@ export class NugProvider implements ProviderAdapter {
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		const meta = this.resolveMeta(params.model);
+		// Client-egress relay: with local egress selected, sending a codex
+		// request while the relay channel is down would silently switch the
+		// egress IP back to NUG-direct. Fail loudly instead unless the user
+		// explicitly opted into the fallback.
+		if (
+			usesLocalEgress(this.config) &&
+			meta.channelType === "codex" &&
+			!getNugRelayChannelId(this.config.id) &&
+			!this.config.egressAllowDirectFallback
+		) {
+			throw new Error(
+				`Local egress is selected for NUG provider "${this.config.name}" but the relay channel is not online. ` +
+					"Check the local network/proxy (clash) and the NUG connection, or enable egressAllowDirectFallback.",
+			);
+		}
 		const delegate = this.createDelegate(meta);
 		this.activeMeta = meta;
 		this.activeDelegate = delegate;
@@ -627,7 +660,10 @@ export class NugProvider implements ProviderAdapter {
 			const errText = await response.text().catch(() => "");
 			throw httpError(`NUG channels/health error ${response.status}: ${errText}`, response.status);
 		}
-		return (await response.json()) as { channels: NugChannelHealthStatus[] };
+		return parseJsonResponseWithBody<{ channels: NugChannelHealthStatus[] }>(
+			response,
+			"NUG channels/health",
+		);
 	}
 
 	async getQuota(): Promise<NugQuota> {
@@ -638,7 +674,7 @@ export class NugProvider implements ProviderAdapter {
 			const errText = await response.text().catch(() => "");
 			throw httpError(`NUG quota error ${response.status}: ${errText}`, response.status);
 		}
-		return (await response.json()) as NugQuota;
+		return parseJsonResponseWithBody<NugQuota>(response, "NUG quota");
 	}
 
 	async getBillingConfig(): Promise<NugBillingConfig> {
@@ -649,7 +685,7 @@ export class NugProvider implements ProviderAdapter {
 			const errText = await response.text().catch(() => "");
 			throw httpError(`NUG billing config error ${response.status}: ${errText}`, response.status);
 		}
-		return (await response.json()) as NugBillingConfig;
+		return parseJsonResponseWithBody<NugBillingConfig>(response, "NUG billing config");
 	}
 
 	async createBillingOrder(body: {
@@ -673,7 +709,7 @@ export class NugProvider implements ProviderAdapter {
 				response.status,
 			);
 		}
-		return (await response.json()) as NugBillingOrderResponse;
+		return parseJsonResponseWithBody<NugBillingOrderResponse>(response, "NUG billing order create");
 	}
 
 	async getBillingOrder(orderId: string): Promise<NugBillingOrderResponse> {
@@ -687,7 +723,7 @@ export class NugProvider implements ProviderAdapter {
 			const errText = await response.text().catch(() => "");
 			throw httpError(`NUG billing order error ${response.status}: ${errText}`, response.status);
 		}
-		return (await response.json()) as NugBillingOrderResponse;
+		return parseJsonResponseWithBody<NugBillingOrderResponse>(response, "NUG billing order");
 	}
 
 	async repayBillingOrder(orderId: string): Promise<NugBillingOrderResponse> {
@@ -705,7 +741,7 @@ export class NugProvider implements ProviderAdapter {
 				response.status,
 			);
 		}
-		return (await response.json()) as NugBillingOrderResponse;
+		return parseJsonResponseWithBody<NugBillingOrderResponse>(response, "NUG billing order repay");
 	}
 
 	async getUsage(
@@ -724,7 +760,10 @@ export class NugProvider implements ProviderAdapter {
 			const errText = await response.text().catch(() => "");
 			throw httpError(`NUG usage error ${response.status}: ${errText}`, response.status);
 		}
-		return (await response.json()) as { events: NugUsageEvent[]; total: number };
+		return parseJsonResponseWithBody<{ events: NugUsageEvent[]; total: number }>(
+			response,
+			"NUG usage",
+		);
 	}
 
 	async getUsageSummary(period?: string): Promise<NugUsageSummary> {
@@ -737,7 +776,7 @@ export class NugProvider implements ProviderAdapter {
 			const errText = await response.text().catch(() => "");
 			throw httpError(`NUG usage/summary error ${response.status}: ${errText}`, response.status);
 		}
-		return (await response.json()) as NugUsageSummary;
+		return parseJsonResponseWithBody<NugUsageSummary>(response, "NUG usage/summary");
 	}
 
 	/**
@@ -762,13 +801,13 @@ export class NugProvider implements ProviderAdapter {
 			const errText = await response.text().catch(() => "");
 			throw httpError(`NUG models error ${response.status}: ${errText}`, response.status);
 		}
-		const data = (await response.json()) as {
+		const data = await parseJsonResponseWithBody<{
 			models?: Array<Record<string, unknown>>;
 			modelHash?: string;
 			hash?: string;
 			usdRate?: number;
 			capabilities?: unknown;
-		};
+		}>(response, "NUG models");
 		const headerHash = response.headers.get("X-NUG-Model-Hash")?.trim();
 		if (!data.modelHash && headerHash) {
 			data.modelHash = headerHash;

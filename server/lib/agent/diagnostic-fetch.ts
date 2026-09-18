@@ -30,7 +30,7 @@ export interface DiagnosticFetchOptions {
 	tls?: {
 		rejectUnauthorized?: boolean;
 	};
-	/** Default is idempotent-only; use always only when the request body is safe to replay. */
+	/** No transport-layer replay by default; callers may opt into a specific replay policy. */
 	retryPolicy?: OutboundFetchRetryPolicy;
 }
 
@@ -99,8 +99,19 @@ export function serializeDiagnosticError(
 	const address = readScalar(value, "address");
 	const port = readScalar(value, "port");
 	const hostname = readScalar(value, "hostname");
-	const status = readScalar(value, "status") ?? readScalar(value, "statusCode");
+	// `httpStatus` wins because NonJsonResponseError reports `status` as a
+	// synthetic 502 (to reuse the 5xx retry heuristics) while `httpStatus` holds
+	// what the upstream actually answered — usually 200, which is the surprising
+	// part worth showing.
+	const status =
+		readScalar(value, "httpStatus") ??
+		readScalar(value, "status") ??
+		readScalar(value, "statusCode");
 	const reason = readScalar(value, "reason");
+	const contentType = readScalar(value, "contentType");
+	const bodyPreview = readScalar(value, "bodyPreview");
+	const bodyTruncated = value.bodyTruncated;
+	const responseUrl = readScalar(value, "url");
 	const category = readScalar(value, "category");
 	const path = readScalar(value, "path");
 
@@ -119,6 +130,12 @@ export function serializeDiagnosticError(
 	if (typeof status === "number") details.status = status;
 	if (reason !== undefined) details.reason = sanitizeDiagnosticText(String(reason));
 	if (path !== undefined) details.path = sanitizeDiagnosticUrl(String(path));
+	if (contentType !== undefined) details.contentType = String(contentType);
+	// Already redacted at construction; re-running redaction is cheap and covers
+	// body previews that reached us from any other producer.
+	if (bodyPreview !== undefined) details.bodyPreview = sanitizeDiagnosticText(String(bodyPreview));
+	if (typeof bodyTruncated === "boolean") details.bodyTruncated = bodyTruncated;
+	if (responseUrl !== undefined) details.responseUrl = sanitizeDiagnosticUrl(String(responseUrl));
 
 	const nested = value.cause ?? (value.error instanceof Error ? value.error : undefined);
 	if (nested !== undefined && nested !== error) {
@@ -326,22 +343,27 @@ export async function fetchWithNetworkDiagnostics(
 		const response = await outboundFetch(input, init, {
 			proxyUrl: options.proxy,
 			tlsRejectUnauthorized: options.tls?.rejectUnauthorized,
-			retryPolicy: options.retryPolicy ?? "idempotent-only",
+			retryPolicy: options.retryPolicy ?? "never",
 		});
 
 		const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
 		const responseHeaders = selectSafeDiagnosticHeaders(response.headers);
+		// Only when it differs from the requested URL: an equal value is noise,
+		// while a different one means a redirect took us somewhere else.
+		const finalUrl = response.url ? sanitizeDiagnosticUrl(response.url) : undefined;
 		finishCapture?.({
 			outcome: response.ok ? "success" : "http_error",
 			category: response.ok ? undefined : "http",
 			durationMs,
 			status: response.status,
 			statusText: sanitizeDiagnosticText(response.statusText),
+			...(finalUrl && finalUrl !== url && { responseUrl: finalUrl }),
 			responseHeaders,
 		});
 		if (verbose) {
 			writeSafeVerboseBlock([
 				`< HTTP ${response.status} ${sanitizeDiagnosticText(response.statusText)}`,
+				...(finalUrl && finalUrl !== url ? [`< (redirected to ${finalUrl})`] : []),
 				...Object.entries(responseHeaders ?? {}).map(([name, value]) => `< ${name}: ${value}`),
 			]);
 		}

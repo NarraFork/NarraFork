@@ -16,7 +16,9 @@ import {
 	completeBrowserOAuthFromCallbackUrl,
 	getBrowserOAuthRedirectUri,
 	hasPendingBrowserOAuth,
+	isBrowserOAuthServerRunning,
 	parseCallbackParams,
+	startBrowserOAuth,
 } from "../../../server/lib/codex-auth";
 
 describe("parseCallbackParams", () => {
@@ -106,5 +108,55 @@ describe("getBrowserOAuthRedirectUri", () => {
 		// Starting the real callback server would bind a port, so this only asserts
 		// the default the UI shows when no flow has run yet.
 		expect(getBrowserOAuthRedirectUri()).toBe("http://localhost:1455/auth/callback");
+	});
+});
+
+describe("startBrowserOAuth with the callback port occupied", () => {
+	it("continues the flow without the local server instead of failing", async () => {
+		// A listener WITHOUT reusePort makes the reusePort bind in ensureOAuthServer
+		// fail with EADDRINUSE — the real-world case is another app holding 1455.
+		const blocker = Bun.serve({ port: 1455, fetch: () => new Response("occupied") });
+		try {
+			const flow = await startBrowserOAuth();
+			// The pending flow must still be cancelled so its rejection is observed.
+			flow.tokenPromise.catch(() => {});
+			try {
+				expect(flow.localCallbackServer).toBe(false);
+				expect(isBrowserOAuthServerRunning()).toBe(false);
+				// The redirect_uri must stay on the fixed port — never a substitute port.
+				expect(flow.authorizeUrl).toContain(
+					`redirect_uri=${encodeURIComponent("http://localhost:1455/auth/callback")}`,
+				);
+				// The flow is pending, so the manual paste path stays available.
+				expect(hasPendingBrowserOAuth()).toBe(true);
+			} finally {
+				cancelBrowserOAuth();
+			}
+		} finally {
+			blocker.stop(true);
+		}
+	});
+});
+
+describe("completeBrowserOAuthFromCallbackUrl with the callback server running", () => {
+	it("still services pasted callbacks while the local listener is up", async () => {
+		// Must run AFTER the port-occupied suite: that one leaves no listener
+		// behind, so this flow binds 1455 for real.
+		const flow = await startBrowserOAuth();
+		// The pending flow must be cancelled so its rejection is observed.
+		flow.tokenPromise.catch(() => {});
+		try {
+			expect(flow.localCallbackServer).toBe(true);
+			expect(isBrowserOAuthServerRunning()).toBe(true);
+			// A wrong state proves the paste reached the pending flow — the guard
+			// fires before any network exchange, and the flow stays pending so the
+			// user can fix the input and retry.
+			await expect(
+				completeBrowserOAuthFromCallbackUrl("?code=abc&state=definitely-wrong"),
+			).rejects.toThrow("Callback state does not match");
+			expect(hasPendingBrowserOAuth()).toBe(true);
+		} finally {
+			cancelBrowserOAuth();
+		}
 	});
 });

@@ -216,9 +216,9 @@ codexRoutes.get("/status", (c) => {
 codexRoutes.post("/auth/browser", async (c) => {
 	try {
 		const manager = getCodexManager();
-		const { authorizeUrl, redirectUri } = await manager.startBrowserAuth();
+		const { authorizeUrl, redirectUri, localCallbackServer } = await manager.startBrowserAuth();
 
-		return c.json({ authorizeUrl, redirectUri });
+		return c.json({ authorizeUrl, redirectUri, localCallbackServer });
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		logger.error("Failed to start Codex browser OAuth", { error: msg });
@@ -233,7 +233,7 @@ codexRoutes.post("/auth/browser", async (c) => {
 codexRoutes.post("/auth/browser/wait", async (c) => {
 	try {
 		const manager = getCodexManager();
-		const { authorizeUrl } = await manager.startBrowserAuth();
+		const { authorizeUrl, localCallbackServer } = await manager.startBrowserAuth();
 
 		// Wait a short time for completion (front-end will poll /status)
 		await Bun.sleep(1000);
@@ -241,6 +241,7 @@ codexRoutes.post("/auth/browser/wait", async (c) => {
 		const pending = manager.getPendingDeviceFlow();
 		return c.json({
 			authorizeUrl,
+			localCallbackServer,
 			success: !pending,
 			message: pending ? "Waiting for browser authorization..." : "Authorization started",
 		});

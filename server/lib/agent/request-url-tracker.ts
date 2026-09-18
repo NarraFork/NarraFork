@@ -24,6 +24,22 @@ export interface CapturedErrorDetails {
 	hostname?: string;
 	status?: number;
 	reason?: string;
+	/**
+	 * Response body fields, populated when an upstream answered with something
+	 * other than the JSON we required (typically an HTML error/challenge page
+	 * behind a 2xx). Without these the diagnostic can name the URL and
+	 * content-type but not what the page said, which is the one thing that
+	 * identifies the sender.
+	 */
+	contentType?: string;
+	bodyPreview?: string;
+	bodyTruncated?: boolean;
+	/**
+	 * Final URL the response body came from, after any redirects. Distinct from
+	 * the attempt's requested `url`: a captive portal or SSO gateway answers by
+	 * redirecting, so these two differing is itself the diagnosis.
+	 */
+	responseUrl?: string;
 	cause?: CapturedErrorDetails;
 }
 
@@ -41,6 +57,12 @@ export interface CapturedRequest {
 	category?: NetworkErrorCategory;
 	status?: number;
 	statusText?: string;
+	/**
+	 * Final URL the response came from, recorded only when it differs from the
+	 * requested `url`. Equal values are omitted so the presence of this field
+	 * always means "you were redirected".
+	 */
+	responseUrl?: string;
 	responseHeaders?: Record<string, string>;
 	error?: CapturedErrorDetails;
 }

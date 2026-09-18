@@ -18,6 +18,7 @@ import {
 	extractCodexTokenInfo,
 	getBrowserOAuthRedirectUri,
 	hasPendingBrowserOAuth,
+	isBrowserOAuthServerRunning,
 	pollDeviceCodeFlow,
 	refreshCodexToken,
 	startBrowserOAuth,
@@ -1708,11 +1709,16 @@ export class CodexManager {
 
 	// ==================== OAuth Flows ====================
 
-	async startBrowserAuth(): Promise<{ authorizeUrl: string; redirectUri: string }> {
+	async startBrowserAuth(): Promise<{
+		authorizeUrl: string;
+		redirectUri: string;
+		/** False when the local callback listener failed to start; the user must paste the callback URL. */
+		localCallbackServer: boolean;
+	}> {
 		const { resolveOverride } = await import("./net/proxy");
 		const { settings } = await import("./settings");
 		const proxy = resolveOverride(settings.codex?.proxy);
-		const { authorizeUrl, tokenPromise } = await startBrowserOAuth(proxy);
+		const { authorizeUrl, tokenPromise, localCallbackServer } = await startBrowserOAuth(proxy);
 
 		// Clear previous error when a new flow starts
 		this._lastBrowserAuthError = undefined;
@@ -1729,7 +1735,7 @@ export class CodexManager {
 				logger.warn("Codex browser auth failed", { error: this._lastBrowserAuthError });
 			});
 
-		return { authorizeUrl, redirectUri: getBrowserOAuthRedirectUri() };
+		return { authorizeUrl, redirectUri: getBrowserOAuthRedirectUri(), localCallbackServer };
 	}
 
 	/**
@@ -1752,8 +1758,12 @@ export class CodexManager {
 		return { accountId: tokens.accountId, email: tokens.email };
 	}
 
-	getBrowserAuthState(): { pending: boolean; redirectUri: string } {
-		return { pending: hasPendingBrowserOAuth(), redirectUri: getBrowserOAuthRedirectUri() };
+	getBrowserAuthState(): { pending: boolean; redirectUri: string; localCallbackServer: boolean } {
+		return {
+			pending: hasPendingBrowserOAuth(),
+			redirectUri: getBrowserOAuthRedirectUri(),
+			localCallbackServer: isBrowserOAuthServerRunning(),
+		};
 	}
 
 	async startDeviceAuth(): Promise<{

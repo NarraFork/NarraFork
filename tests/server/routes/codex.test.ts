@@ -90,6 +90,7 @@ mock.module("../../../server/lib/codex-manager", () => ({
 		startBrowserAuth: async () => ({
 			authorizeUrl: "https://auth.openai.com/oauth/authorize?state=s1",
 			redirectUri: "http://localhost:1455/auth/callback",
+			localCallbackServer: true,
 		}),
 		completeBrowserAuthFromCallbackUrl: async (callbackUrl: string) => {
 			browserCallbackUrls.push(callbackUrl);
@@ -99,6 +100,7 @@ mock.module("../../../server/lib/codex-manager", () => ({
 		getBrowserAuthState: () => ({
 			pending: true,
 			redirectUri: "http://localhost:1455/auth/callback",
+			localCallbackServer: true,
 		}),
 		getPublicQuotaOverview: () => ({
 			generatedAt: "2026-05-01T00:00:00.000Z",
@@ -404,6 +406,7 @@ describe("codex browser OAuth manual callback", () => {
 		expect(await res.json()).toEqual({
 			authorizeUrl: "https://auth.openai.com/oauth/authorize?state=s1",
 			redirectUri: "http://localhost:1455/auth/callback",
+			localCallbackServer: true,
 		});
 	});
 
@@ -454,6 +457,7 @@ describe("codex browser OAuth manual callback", () => {
 		expect(await res.json()).toEqual({
 			pending: true,
 			redirectUri: "http://localhost:1455/auth/callback",
+			localCallbackServer: true,
 		});
 	});
 });
