@@ -488,7 +488,9 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				 * narrator needs permission", and the PWA body text says so too).
 				 * The panel keeps a persistent in-app notice explaining the wait.
 				 */
-				const isWaitingForModel = event.substatus?.includes("model_unavailable");
+				const isWaitingForModel =
+					event.substatus?.includes("model_unavailable") ||
+					event.substatus?.includes("quota_exhausted");
 				const shouldNotify =
 					!isReflecting &&
 					!isWaitingForModel &&

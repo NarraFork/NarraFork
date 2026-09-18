@@ -48,6 +48,7 @@ import { useTranslation } from "react-i18next";
 import { CopyButton } from "../../components/common/CopyButton";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
 import { useCurrentUser } from "../../hooks/useAuth";
+import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
 import { type ApiError, api, type OAuthApp } from "../../lib/api";
 import {
 	createDefaultOAuthAppPolicy,
@@ -307,6 +308,11 @@ function SettingsOAuthAppsPage() {
 	const [exportedManifest, setExportedManifest] = useState<OAuthAppManifest | null>(null);
 	const [createdApp, setCreatedApp] = useState<OAuthApp | null>(null);
 	const [editingApp, setEditingApp] = useState<OAuthApp | null>(null);
+	useMobileDrawerHistory(importOpen, () => setImportOpen(false));
+	useMobileDrawerHistory(exportedManifest !== null, () => setExportedManifest(null));
+	useMobileDrawerHistory(createOpen, () => setCreateOpen(false));
+	useMobileDrawerHistory(editingApp !== null, () => setEditingApp(null));
+	useMobileDrawerHistory(createdApp !== null, () => setCreatedApp(null));
 	const [editName, setEditName] = useState("");
 	const [editRedirectUrisText, setEditRedirectUrisText] = useState("");
 	const [editScopes, setEditScopes] = useState<string[]>([]);

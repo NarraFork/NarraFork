@@ -56,6 +56,20 @@ export interface StorageScanTablesResult {
 		diskBytes: number;
 		indexBytes: number;
 		totalBytes: number;
+		/**
+		 * True when this table could not be measured (typically SQLITE_BUSY against an exclusive
+		 * writer). The accompanying zeroes then mean UNKNOWN, not empty.
+		 *
+		 * Declared here because the worker has always sent it and the main thread has always read
+		 * it, while the wire type stayed silent — `storage-scan-runner.ts` had to recover it through
+		 * a defensive cast, which this declaration replaced. An undeclared field both sides depend
+		 * on is one refactor away from being dropped as dead weight, and dropping it turns "could
+		 * not read" back into "weighs nothing".
+		 *
+		 * Optional rather than always-present: absent means "measured fine", so only a literal
+		 * `true` marks the numbers as unknown.
+		 */
+		readFailed?: boolean;
 	}>;
 }
 

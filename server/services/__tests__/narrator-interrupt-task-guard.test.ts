@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { narratorMessages, narrators } from "../../db/schema";
+import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
 
@@ -101,7 +101,9 @@ mock.module("../../lib/agent/provider", () => ({
 }));
 
 const { writeSpecFile } = await import("../spec-vfs-service");
-const { closeNarrator, interruptNarrator, sendMessage } = await import("../narrator-session");
+const { closeNarrator, interruptAndWaitForIdle, interruptNarrator, sendMessage } = await import(
+	"../narrator-session"
+);
 
 async function waitFor(
 	predicate: () => boolean | Promise<boolean>,
@@ -230,6 +232,61 @@ describe("interrupt task guard", () => {
 		await sendMessage(narratorId, "changed my mind", undefined, "en");
 		await waitFor(async () => (await narratorStatus(narratorId)) === "idle", 15_000);
 		expect(await specContinuationCount(narratorId)).toBe(0);
+
+		closeNarrator(narratorId);
+	}, 15_000);
+
+	test("a waited interrupt places the guard before the replacement turn and starts a new loop", async () => {
+		const narratorId = "interrupt-guard-replacement-order";
+		await insertIdleNarrator(narratorId);
+		await writeSpecFile(
+			narratorId,
+			"spec://tasks.json",
+			`${JSON.stringify({ tasks: [{ text: "Keep the task visible", status: "doing" }] }, null, "\t")}\n`,
+			{ actor: "agent", createdBy: "assistant" },
+		);
+
+		releaseChat = () => {};
+		const firstSend = sendMessage(narratorId, "start work", undefined, "en");
+		await waitFor(() => providerCalls.length === 1);
+
+		expect(await interruptAndWaitForIdle(narratorId, { timeoutMs: 5_000 })).toBe(true);
+		await firstSend;
+		releaseChat = null;
+		await waitFor(async () => (await narratorStatus(narratorId)) === "idle");
+
+		const replacement = sendMessage(narratorId, "replacement turn", undefined, "en");
+		await waitFor(() => providerCalls.length === 2);
+		await replacement;
+		await waitFor(async () => (await narratorStatus(narratorId)) === "idle");
+
+		const refs = await db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, narratorId))
+			.orderBy(asc(narratorMessageRefs.seq));
+		const messages = await db.query.narratorMessages.findMany({
+			where: eq(narratorMessages.narratorId, narratorId),
+		});
+		const guardId = messages.find((message) => {
+			const blocks: unknown =
+				typeof message.contentJson === "string"
+					? JSON.parse(message.contentJson)
+					: message.contentJson;
+			return (blocks as Array<{ type?: string; source?: string }>).some(
+				(block) => block.type === "system_injection" && block.source === "interrupt_task_guard",
+			);
+		})?.id;
+		const replacementId = messages.find(
+			(message) => message.contentText === "replacement turn",
+		)?.id;
+
+		expect(guardId).toBeDefined();
+		expect(replacementId).toBeDefined();
+		expect(refs.find((ref) => ref.messageId === guardId)?.seq).toBeLessThan(
+			refs.find((ref) => ref.messageId === replacementId)?.seq ?? Number.POSITIVE_INFINITY,
+		);
+		expect(providerCalls).toHaveLength(2);
 
 		closeNarrator(narratorId);
 	}, 15_000);

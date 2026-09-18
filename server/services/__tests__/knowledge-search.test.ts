@@ -27,30 +27,30 @@ beforeAll(async () => {
 });
 
 describe("knowledge search", () => {
-	test("3+ char CJK query matches via FTS", () => {
-		const results = knowledgeService.search({ q: "三阶段", collectionId });
+	test("3+ char CJK query matches via FTS", async () => {
+		const results = await knowledgeService.search({ q: "三阶段", collectionId });
 		expect(results.some((r) => r.title === "充电故障处理")).toBe(true);
 	});
 
-	test("2-character CJK query finds body match via bounded LIKE fallback", () => {
+	test("2-character CJK query finds body match via bounded LIKE fallback", async () => {
 		// "充电" (2 chars) can't use trigram FTS; the fallback still matches title+body.
-		const results = knowledgeService.search({ q: "充电", collectionId });
+		const results = await knowledgeService.search({ q: "充电", collectionId });
 		expect(results.some((r) => r.title.includes("充电"))).toBe(true);
 	});
 
-	test("2-character CJK body-only term is found via fallback", () => {
+	test("2-character CJK body-only term is found via fallback", async () => {
 		// "电池" appears only in the body, not any title.
-		const results = knowledgeService.search({ q: "电池", collectionId });
+		const results = await knowledgeService.search({ q: "电池", collectionId });
 		expect(results.some((r) => r.title === "充电故障处理")).toBe(true);
 	});
 
-	test("respects the result limit", () => {
-		const results = knowledgeService.search({ q: "网络", collectionId, limit: 1 });
+	test("respects the result limit", async () => {
+		const results = await knowledgeService.search({ q: "网络", collectionId, limit: 1 });
 		expect(results.length).toBeLessThanOrEqual(1);
 	});
 
-	test("empty query lists recent entries (bounded)", () => {
-		const results = knowledgeService.search({ q: "", collectionId, limit: 10 });
+	test("empty query lists recent entries (bounded)", async () => {
+		const results = await knowledgeService.search({ q: "", collectionId, limit: 10 });
 		expect(results.length).toBeLessThanOrEqual(10);
 		expect(results.length).toBeGreaterThanOrEqual(1);
 	});
@@ -113,7 +113,7 @@ describe("project isolation (H3)", () => {
 		});
 
 		// Search scoped to project A: should see Alpha (A) + Gamma (global), NOT Beta (B).
-		const scoped = knowledgeService.search({ q: "协议规范", projectId: projA });
+		const scoped = await knowledgeService.search({ q: "协议规范", projectId: projA });
 		const titles = scoped.map((r) => r.title);
 		expect(titles).toContain(`Alpha协议${tag}`);
 		expect(titles).toContain(`Gamma协议${tag}`);

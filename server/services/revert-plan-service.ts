@@ -1176,3 +1176,46 @@ function equal(a: unknown, b: unknown): boolean {
 function fail(code: string, message: string) {
 	return new RevertPlanError(code, message);
 }
+
+/**
+ * The dialect-free core of the plan service, exported for the PostgreSQL sibling
+ * (`pg-revert-plan-store.ts`) — and nothing else.
+ *
+ * Everything here is pure normalization, hashing, budgeting or row mapping: no SQL
+ * fragment, no drizzle object, no driver shape. The pieces that DO carry a dialect
+ * (the `IS` null-safe comparison idiom, `json_extract`, the sync `.get()/.run()`
+ * chaining) stay private above; the PG store rewrites those against its own schema.
+ * Exporting the pure half is what lets the two backends share the section CONTENT
+ * — the same validations in the same order — rather than diverging copies of it.
+ */
+export const revertPlanInternals = {
+	normalizeOwner,
+	normalizeHeader,
+	normalizeProof,
+	normalizeRef,
+	normalizeState,
+	normalizeFile,
+	fileValues,
+	assertFileValues,
+	assertPlanned,
+	assertSameRevision,
+	selectFiles,
+	fileCursor,
+	stateRef,
+	stateBytes,
+	refBytes,
+	boundedPage,
+	pageLimit,
+	nullableId,
+	text,
+	integer,
+	sha256,
+	keys,
+	metadata,
+	evidenceBudget,
+	digest,
+	equal,
+	planHash,
+	headerFromRow,
+	fail,
+};

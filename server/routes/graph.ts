@@ -1,16 +1,15 @@
-import { and, eq, inArray, ne } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { chapterEdges, chapters, containerInstances } from "../db/schema";
+import { chapters } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
-import { narratorPrincipalOf } from "../lib/narrator-access";
 import { parseSubstatus } from "../lib/narrator-utils";
-import { requireProjectAccess } from "../lib/project-access";
+import { projectPrincipalOf, requireProjectAccess } from "../lib/project-access";
 import { updateGraphPositionsSchema } from "../lib/validators";
 import { commitSyncService } from "../services/commit-sync-service";
 import { gitService } from "../services/git-service";
-import { narratorReadableWhere } from "../services/narrator-acl";
+import { projectReadAdapter, projectReadBackend } from "../services/read";
 
 export interface GraphNode {
 	id: string;
@@ -183,47 +182,80 @@ graphRoutes.get("/:id/graph", async (c) => {
 	// same read access as the project itself.
 	await requireProjectAccess(c, c.req.param("id"), "read");
 	const projectId = c.req.param("id");
+	// The backend actually serving reads, not the configured intent: in production
+	// PostgreSQL mode the legacy NF_READ_BACKEND selector must be absent, so asking it
+	// would always answer "sqlite" and the SQLite commit refresh below would run against
+	// a database that serves nothing. `projectReadBackend` reads the composed adapter.
+	const readBackend = projectReadBackend();
+	const readGraph = (await projectReadAdapter().getGraph(projectId, projectPrincipalOf(c))) as {
+		chapters: Array<{
+			id: string;
+			title: string;
+			status: string;
+			branch: string;
+			role: string;
+			color: string | null;
+			groupLabel: string | null;
+			explorationGroupId: string | null;
+			isRoot: number | null;
+			graphX: number | null;
+			graphY: number | null;
+			commitCount: number | null;
+			headCommitSha: string | null;
+			worktreePath: string | null;
+			panelExpanded: number | null;
+			panelWidth: number | null;
+			panelHeight: number | null;
+			reviewSourceChapterId: string | null;
+			reviewStatus: string | null;
+		}>;
+		edges: Array<{
+			id: string;
+			sourceId: string;
+			targetId: string;
+			type: string;
+			metadata: unknown;
+		}>;
+		/** Absent unless the read was bounded; see `GraphReadResult`. */
+		truncated?: true;
+		truncatedChapters?: true;
+		truncatedEdges?: true;
+	};
+	if (readGraph.chapters.length === 0)
+		return c.json({ nodes: [], edges: [], detachedPanels: [], degraded: false, fallbacks: [] });
 
-	const projectChapters = await db.query.chapters.findMany({
-		where: eq(chapters.projectId, projectId),
-		columns: {
-			id: true,
-			title: true,
-			status: true,
-			branch: true,
-			role: true,
-			color: true,
-			groupLabel: true,
-			explorationGroupId: true,
-			isRoot: true,
-			// Classic-only coordinates. The ruler columns (anchorCommitSha/axisOffset/
-			// crossOffset) are intentionally NOT selected: this endpoint feeds the
-			// classic canvas, and ruler reads its own positions via /api/ruler.
-			graphX: true,
-			graphY: true,
-			createdAt: true,
-			commitCount: true,
-			headCommitSha: true,
-			worktreePath: true,
-			panelExpanded: true,
-			panelWidth: true,
-			panelHeight: true,
-			reviewSourceChapterId: true,
-			reviewStatus: true,
-		},
-	});
+	const projectChapters = readGraph.chapters;
 
 	// Degradation is reported per feature, not per chapter: a repo-wide problem (git
 	// missing, worktrees gone after a disk move) fails every active chapter at once,
 	// and a few hundred identical entries would blow up a response the frontend
 	// renders as a single alert. `failedChapters` carries the scale instead.
 	const fallbacks: GraphFallback[] = [];
+
+	// A bounded read must not be served as a complete graph. The adapters cap chapters and
+	// edges (an unbounded graph query is the "every request hangs" failure mode), and a
+	// canvas that quietly drops chapters also drops every edge attached to them — which
+	// reads as "those branches were deleted" rather than "we did not send them".
+	if (readGraph.truncatedChapters || readGraph.truncatedEdges) {
+		logger.warn("Graph response truncated", {
+			projectId,
+			chapters: readGraph.chapters.length,
+			edges: readGraph.edges.length,
+			truncatedChapters: readGraph.truncatedChapters,
+			truncatedEdges: readGraph.truncatedEdges,
+		});
+		fallbacks.push({
+			feature: "graph.size",
+			reason: readGraph.truncatedChapters ? "graph_chapters_truncated" : "graph_edges_truncated",
+			failedChapters: readGraph.chapters.length,
+		});
+	}
 	let commitSyncFailures = 0;
 	let firstCommitSyncError: string | undefined;
 
 	// Refresh git info for active chapters with worktrees (lightweight, with concurrency limit)
 	const activeChapters = projectChapters.filter((ch) => ch.status === "active" && ch.worktreePath);
-	if (activeChapters.length > 0) {
+	if (readBackend.backend === "sqlite" && activeChapters.length > 0) {
 		const MAX_CONCURRENT = 3;
 		const refreshResults: PromiseSettledResult<void>[] = [];
 		for (let i = 0; i < activeChapters.length; i += MAX_CONCURRENT) {
@@ -297,53 +329,29 @@ graphRoutes.get("/:id/graph", async (c) => {
 
 	// Get graph metadata once chapter IDs are known.
 	const chapterIds = projectChapters.map((ch) => ch.id);
-	const [allNarrators, allContainers, edgeRows, detachedPanelRows] = await Promise.all([
-		chapterIds.length
-			? db.query.narrators.findMany({
-					// Restricted to the narrators this user may read, so the graph never
-					// offers a node that opens into a 404. Chapter nodes themselves are
-					// unaffected — only the narrator badge/id attached to them.
-					where: (n, { inArray, and }) =>
-						and(inArray(n.chapterId, chapterIds), narratorReadableWhere(narratorPrincipalOf(c))),
-					columns: {
-						id: true,
-						chapterId: true,
-						status: true,
-						substatus: true,
-						ownerUserId: true,
-						visibility: true,
-					},
-				})
-			: Promise.resolve([]),
-		chapterIds.length
-			? db
-					.select({ chapterId: containerInstances.chapterId })
-					.from(containerInstances)
-					.where(
-						and(
-							inArray(containerInstances.chapterId, chapterIds),
-							ne(containerInstances.status, "removed"),
-						),
-					)
-					.groupBy(containerInstances.chapterId)
-					.all()
-			: Promise.resolve([]),
-		db.select().from(chapterEdges).where(eq(chapterEdges.projectId, projectId)).all(),
-		// Panels torn out of chapter docks onto the canvas. Fetched here because the
-		// canvas renders every chapter's detached panels at once — a per-chapter
-		// endpoint would mean one request per node.
-		//
-		// Reads ONLY this column and only rows that actually have one, so the graph
-		// response does not grow for the (common) case of a project with none. The
-		// chapter query's own column whitelist above still excludes it.
-		chapterIds.length
-			? db.query.chapters.findMany({
-					where: (ch, { and, inArray, isNotNull }) =>
-						and(inArray(ch.id, chapterIds), isNotNull(ch.detachedPanelsJson)),
-					columns: { id: true, detachedPanelsJson: true },
-				})
-			: Promise.resolve([]),
-	]);
+	const auxiliary = await projectReadAdapter().getGraphAuxiliaryData(
+		projectId,
+		chapterIds,
+		projectPrincipalOf(c),
+	);
+	const allNarrators = auxiliary.narrators;
+	const allContainers = auxiliary.containers;
+	const detachedPanelRows = auxiliary.detachedPanels;
+	const edgeRows = readGraph.edges;
+	// Every auxiliary read (narrator badges, container presence, detached panels) belongs to
+	// the adapter, including their ACL predicates — the narrator list in particular must stay
+	// filtered by narrator readability, so a badge on the canvas cannot open into a 404 and a
+	// teammate's private session cannot appear just because the project is readable. Issuing
+	// any of these here would query SQLite even when PostgreSQL served the graph, mixing two
+	// data sources inside one response.
+	if (auxiliary.truncated) {
+		logger.warn("Graph auxiliary data truncated", { projectId, chapters: chapterIds.length });
+		fallbacks.push({
+			feature: "graph.auxiliary",
+			reason: "graph_auxiliary_truncated",
+			failedChapters: chapterIds.length,
+		});
+	}
 
 	const narratorCounts = new Map<string, number>();
 	const narratorIds = new Map<string, string>();

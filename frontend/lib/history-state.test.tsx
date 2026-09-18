@@ -12,6 +12,7 @@ import {
 import { parseHTML } from "linkedom";
 import { act, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { useMobileDrawerHistory } from "../hooks/useMobileDrawerHistory";
 import { AppShellMainScrollStore } from "./app-shell-scroll";
 import {
 	createAppHistoryEntryKey,
@@ -289,6 +290,64 @@ async function runReactLinkSentinelScenario(closeDuringLinkClick: boolean) {
 	container.remove();
 	dom.cleanup();
 	return result;
+}
+
+async function runMobileDrawerHookScenario() {
+	const dom = installReactDom();
+	const browser = new BrowserHistoryHarness("/");
+	const cleanupWindow = installGlobals({ window: browser.window });
+	browser.window.matchMedia = (() => ({
+		matches: true,
+		media: "(max-width: 767px)",
+		addEventListener() {},
+		removeEventListener() {},
+	})) as unknown as typeof browser.window.matchMedia;
+	const history = createBrowserHistory({ window: browser.window });
+	let closeCount = 0;
+
+	function DrawerLayout() {
+		const [opened, setOpened] = useState(true);
+		useMobileDrawerHistory(opened, () => {
+			closeCount++;
+			setOpened(false);
+		});
+		return <span data-drawer-opened={opened ? "true" : "false"} />;
+	}
+
+	const rootRoute = createRootRoute({ component: DrawerLayout });
+	const indexRoute = createRoute({
+		getParentRoute: () => rootRoute,
+		path: "/",
+		component: () => <div data-route="home" />,
+	});
+	const router = createRouter({
+		history,
+		routeTree: rootRoute.addChildren([indexRoute]),
+	});
+	const container = dom.document.createElement("div") as HTMLDivElement;
+	dom.document.body.appendChild(container);
+	const reactRoot = createRoot(container);
+
+	await router.load();
+	await act(async () => {
+		reactRoot.render(<RouterProvider router={router} />);
+		await flushHistoryWork();
+	});
+	expect(browser.entries).toHaveLength(2);
+	expect(container.querySelector("[data-drawer-opened='true']")).not.toBeNull();
+
+	await act(async () => {
+		history.back();
+		await flushHistoryWork();
+	});
+	expect(closeCount).toBe(1);
+	expect(container.querySelector("[data-drawer-opened='true']")).toBeNull();
+	expect(router.state.location.pathname).toBe("/");
+	await act(async () => reactRoot.unmount());
+	history.destroy();
+	container.remove();
+	cleanupWindow();
+	dom.cleanup();
 }
 
 describe("app-owned history entry state", () => {
@@ -628,6 +687,10 @@ describe("mobile Back sentinel entries", () => {
 		});
 	});
 
+	test("the mobile drawer hook closes the drawer before route navigation", async () => {
+		await runMobileDrawerHookScenario();
+	});
+
 	test("a real React Link onClick cleanup race cannot consume the sentinel twice", async () => {
 		const result = await runReactLinkSentinelScenario(true);
 		expect(result.backCalls).toBe(1);
@@ -649,10 +712,11 @@ describe("mobile Back sentinel entries", () => {
 				"../components/AppRootLayout.tsx",
 				"../routes/narrators/$narratorId.tsx",
 				"../components/narrator/content/ContentViewer.tsx",
+				"../hooks/useMobileDrawerHistory.ts",
 			].map((path) => Bun.file(new URL(path, import.meta.url)).text()),
 		);
 
-		// All three known call sites must be found, so a renamed/removed guard cannot make
+		// All known call sites must be found, so a renamed/removed guard cannot make
 		// the loop below pass by iterating over nothing.
 		let guardedCallSites = 0;
 		for (const source of sources) {
@@ -662,6 +726,6 @@ describe("mobile Back sentinel entries", () => {
 				guardedCallSites++;
 			}
 		}
-		expect(guardedCallSites).toBe(3);
+		expect(guardedCallSites).toBe(4);
 	});
 });

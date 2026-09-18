@@ -32,6 +32,7 @@ const WORK_INDICATOR_FLAGS = [
 	"isBlockingCompacting",
 	"isBackgroundCompacting",
 	"isWaitingForModel",
+	"isWaitingForQuota",
 	"hasSpecTask",
 	"isWaiting",
 	"isPlanning",
@@ -44,6 +45,7 @@ function workIndicatorInput(overrides: Partial<WorkIndicatorInput> = {}): WorkIn
 		isBlockingCompacting: false,
 		isBackgroundCompacting: false,
 		isWaitingForModel: false,
+		isWaitingForQuota: false,
 		hasSpecTask: false,
 		isWaiting: false,
 		isPlanning: false,
@@ -52,7 +54,7 @@ function workIndicatorInput(overrides: Partial<WorkIndicatorInput> = {}): WorkIn
 	};
 }
 
-/** Every combination of the eight booleans (2^8 = 256). */
+/** Every combination of the nine booleans (2^9 = 512). */
 function allWorkIndicatorInputs(): WorkIndicatorInput[] {
 	const inputs: WorkIndicatorInput[] = [];
 	for (let mask = 0; mask < 1 << WORK_INDICATOR_FLAGS.length; mask++) {
@@ -154,6 +156,11 @@ describe("planNarratorWorkIndicator", () => {
 			// "Waiting for the model" must beat the plain waiting label it shares a
 			// status with, and beat a current spec task.
 			[{ isWaitingForModel: true, hasSpecTask: true, isWaiting: true }, "model_unavailable"],
+			// An exhausted quota window is the same kind of wait and ranks the same
+			// way, right below the model outage.
+			[{ isWaitingForModel: true, isWaitingForQuota: true }, "model_unavailable"],
+			[{ isWaitingForQuota: true, hasSpecTask: true, isWaiting: true }, "quota_exhausted"],
+			[{ isBlockingCompacting: true, isWaitingForQuota: true }, "blocking_compact"],
 			[{ hasSpecTask: true, isWaiting: true, isPlanning: true }, "spec_task"],
 			[{ isWaiting: true, isPlanning: true }, "waiting"],
 			[{ isPlanning: true, isBackgroundCompacting: true }, "planning"],
@@ -228,7 +235,6 @@ describe("status bar layout contract (NarratorInteractionStatusBar)", () => {
 			"((queue.positionValue != null && queue.positionValue > 0) || queue.messageValue) && (",
 		);
 	});
-
 	test("idle background work reuses the live count and opens the correct task host", async () => {
 		const source = await statusBar();
 		// Keep preview/pushed-subagent views from opening a different narrator's tasks.
@@ -259,11 +265,14 @@ describe("status bar layout contract (NarratorInteractionStatusBar)", () => {
 		);
 		expect(source).toContain("text={quota.balance}");
 
-		// TurnElapsedTime has two shapes: with a start-time popover the full elapsed
 		// text is repeated inside the dropdown; without one it falls back to TruncatedText.
 		const elapsed = await turnElapsed();
-		expect(elapsed).toContain("<TruncatedText");
-		expect(elapsed).toMatch(/Popover\.Dropdown[\s\S]*\{text\}[\s\S]*\{startedAtLabel\}/);
+		const body = elapsed.slice(
+			elapsed.indexOf("TurnElapsedTime({"),
+			elapsed.indexOf("RetryCountdownText"),
+		);
+		expect(body).toContain("<TruncatedText");
+		expect(body).toMatch(/Popover\.Dropdown[\s\S]*\{text\}[\s\S]*\{startedAtLabel\}/);
 	});
 
 	test("icon-only status actions expose stable accessible names", async () => {

@@ -211,6 +211,20 @@ console.log(
 	`✓ Generated ${relative(ROOT, GENERATED_MIGRATIONS_DATA_FILE)} (${sqlFiles.length} migrations)`,
 );
 
+// Step 4b: PostgreSQL has its own generated journal and SQL bundle. Never merge
+// this into the legacy SQLite exports above. Missing PG inputs block the build.
+{
+	const { collectPostgresMigrationData, renderPostgresMigrationData } = await import(
+		"../server/db/run-migrations"
+	);
+	const postgresData = collectPostgresMigrationData(join(ROOT, "drizzle-postgres"));
+	const postgresOutput = join(ROOT, "server", "generated", "embedded-postgres-migrations-data.ts");
+	writeFileSync(postgresOutput, renderPostgresMigrationData(postgresData));
+	console.log(
+		`Generated ${relative(ROOT, postgresOutput)} (${postgresData.embeddedPostgresMigrationSqlFiles.length} PostgreSQL migrations)`,
+	);
+}
+
 // Step 5: Generate build info (placeholder, will be overwritten per-platform in loop)
 let commitHash = "";
 try {
@@ -420,7 +434,11 @@ function runPostProcessWorker(
 				if (msg.type === "log") {
 					console.log(`  [${platform.platformId}] ${msg.message}`);
 				} else if (msg.type === "done") {
-					resolve({ latestYml: msg.latestYml!, metadata: msg.metadata });
+					if (!msg.latestYml) {
+						reject(new Error(`Worker for ${platform.platformId} completed without latest.yml data`));
+						return;
+					}
+					resolve({ latestYml: msg.latestYml, metadata: msg.metadata });
 				}
 			},
 		);

@@ -23,6 +23,11 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import { pickLocalizedValue } from "@shared/i18n-locales";
 import {
+	normalizeToolRoutineMode,
+	TOOL_ROUTINE_MODES,
+	type ToolRoutineMode,
+} from "@shared/routine-modes";
+import {
 	IconChevronDown,
 	IconChevronRight,
 	IconPlug,
@@ -73,7 +78,7 @@ import { useProjects } from "../../hooks/useProjects";
 import {
 	useGlobalPrompt,
 	useRoutines,
-	useToggleRoutine,
+	useSetRoutineMode,
 	useUpdateGlobalPrompt,
 } from "../../hooks/useRoutines";
 import {
@@ -222,10 +227,13 @@ function RoutinesPage() {
 
 // === Tab: Optional Tools ===
 
+/** Switch positions in escalating order: manual → auto → resident. */
+const TOOL_MODE_OPTIONS = TOOL_ROUTINE_MODES;
+
 function OptionalToolsTab() {
 	const { t, i18n } = useTranslation("routines");
 	const { data } = useRoutines();
-	const toggleMutation = useToggleRoutine();
+	const setMode = useSetRoutineMode();
 	const locale = i18n.resolvedLanguage ?? i18n.language;
 
 	const toolRoutines = data?.routines?.filter((r) => r.type === "tool") ?? [];
@@ -240,41 +248,59 @@ function OptionalToolsTab() {
 					{t("noOptionalTools")}
 				</Text>
 			)}
-			{toolRoutines.map((routine) => (
-				<Paper key={routine.id} withBorder p="sm">
-					<Group justify="space-between" wrap="nowrap">
-						<div style={{ flex: 1, minWidth: 0 }}>
-							<Group gap="xs">
-								<Text size="sm" fw={600}>
-									{routine.name}
+			{toolRoutines.map((routine) => {
+				// Older responses have no `mode`; derive it from `enabled` so the control
+				// still shows a truthful position instead of defaulting to manual.
+				const mode: ToolRoutineMode = routine.mode ?? (routine.enabled ? "resident" : "manual");
+				return (
+					<Paper key={routine.id} withBorder p="sm">
+						<Group justify="space-between" wrap="nowrap" align="flex-start">
+							<div style={{ flex: 1, minWidth: 0 }}>
+								<Group gap="xs">
+									<Text size="sm" fw={600}>
+										{routine.name}
+									</Text>
+									<Badge size="xs" variant="light" color="yellow">
+										/load {routine.id}
+									</Badge>
+								</Group>
+								<Text size="xs" c="dimmed">
+									{formatRoutineTextPreview(
+										pickLocalizedValue(
+											{ en: routine.descriptionEn, "zh-CN": routine.descriptionZh },
+											locale,
+										),
+										MAX_ROUTINE_LIST_TEXT_PREVIEW_CHARS,
+									)}
 								</Text>
-								<Badge size="xs" variant="light" color="yellow">
-									/load {routine.id}
-								</Badge>
-							</Group>
-							<Text size="xs" c="dimmed">
-								{formatRoutineTextPreview(
-									pickLocalizedValue(
-										{ en: routine.descriptionEn, "zh-CN": routine.descriptionZh },
-										locale,
-									),
-									MAX_ROUTINE_LIST_TEXT_PREVIEW_CHARS,
+								{mode === "auto" && (
+									<Text size="xs" c="yellow.6" mt={4}>
+										{t("toolModeAutoPending")}
+									</Text>
 								)}
-							</Text>
-						</div>
-						<Switch
-							checked={routine.enabled}
-							onChange={(e) =>
-								toggleMutation.mutate({
-									id: routine.id,
-									enabled: e.currentTarget.checked,
-								})
-							}
-							size="sm"
-						/>
-					</Group>
-				</Paper>
-			))}
+							</div>
+							<Stack gap={4} align="flex-end">
+								<SegmentedControl
+									size="xs"
+									value={mode}
+									onChange={(val) => {
+										const next = normalizeToolRoutineMode(val);
+										if (!next || next === mode) return;
+										setMode.mutate({ id: routine.id, mode: next });
+									}}
+									data={TOOL_MODE_OPTIONS.map((value) => ({
+										value,
+										label: t(`toolMode.${value}`),
+									}))}
+								/>
+								<Text size="xs" c="dimmed" ta="right" maw={220}>
+									{t(`toolModeHint.${mode}`)}
+								</Text>
+							</Stack>
+						</Group>
+					</Paper>
+				);
+			})}
 		</Stack>
 	);
 }

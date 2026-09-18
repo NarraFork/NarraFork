@@ -64,7 +64,8 @@ export type WorkspaceWriteCoordinatorErrorCode =
 	| "capacity_exceeded"
 	| "wait_timeout"
 	| "aborted"
-	| "persistence_failed";
+	| "persistence_failed"
+	| "recovery_conflict";
 
 export class WorkspaceWriteCoordinatorError extends Error {
 	constructor(
@@ -550,6 +551,64 @@ export class WorkspaceWriteCoordinator {
 		return summary;
 	}
 
+	/** The live coordination epoch; recovery decisions compare durable lease epochs against it. */
+	ownerEpoch(): string {
+		return this.state.ownerEpoch;
+	}
+
+	/**
+	 * External recovery entry point: a human has re-observed the physical state
+	 * (see workspace-scope-recovery) and already closed the evidence books. This
+	 * clears ONLY the durable barrier. It never settles evidence itself, never
+	 * resumes IO, and refuses a lease owned by the current live epoch. Bumping
+	 * the fence keeps every stale backend of the old generation fenced out.
+	 */
+	recoverScopeBarrier(scopeInput: Readonly<FileChangeScopeIdentity>): {
+		revision: number;
+		fencingToken: number;
+	} {
+		const scope = copyScope(scopeInput);
+		for (const record of this.state.leases.values()) {
+			if (sameScope(record.scope, scope)) {
+				throw fail("recovery_conflict", "A live in-memory lease still owns this scope");
+			}
+		}
+		for (const record of this.state.activities.values()) {
+			if (sameScope(record.scope, scope)) {
+				throw fail("recovery_conflict", "A live in-memory activity still covers this scope");
+			}
+		}
+		const row = this.transaction((tx) => {
+			const current = this.requireScope(tx, scope);
+			const leaseBarrier = current.activeLeaseId !== null;
+			if (current.status !== "needs_verification" && !leaseBarrier) {
+				throw fail("invalid_input", "Scope has no durable recovery barrier");
+			}
+			if (leaseBarrier && current.activeLeaseEpoch === this.state.ownerEpoch) {
+				// A lease owned by THIS live process may still be running; never clear it.
+				throw fail("recovery_conflict", "The durable lease belongs to the live coordination epoch");
+			}
+			return tx
+				.update(scopes)
+				.set({
+					status: "active",
+					activeLeaseId: null,
+					activeLeaseEpoch: null,
+					activeLeaseStartedAt: null,
+					activeMutationCount: 0,
+					revision: next(current.revision),
+					fencingToken: next(current.fencingToken),
+					updatedAt: now(),
+				})
+				.where(eq(scopes.id, scope.id))
+				.returning({ revision: scopes.revision, fencingToken: scopes.fencingToken })
+				.get();
+		});
+		this.changed();
+		this.pump();
+		return row;
+	}
+
 	/**
 	 * Retry ONLY a failed quarantine write after the execution body has ended.
 	 * This cannot resume IO, clear needs_verification, or reuse an old fence.
@@ -829,9 +888,13 @@ export class WorkspaceWriteCoordinator {
 				current.activeLeaseStartedAt !== null ||
 				current.activeMutationCount !== 0
 			) {
-				throw fail("needs_verification", "An unfinished durable lease must be recovered first");
+				throw fail(
+					"needs_verification",
+					`Scope "${current.canonicalRoot}" has an unfinished durable lease from a previous ` +
+						"run. An admin can recover it in Settings → Storage → Workspace write barriers.",
+				);
 			}
-			this.requireNoQuarantine(tx, request.scope);
+			this.requireNoQuarantine(tx, request.scope, undefined, kind === "write" ? "write" : "strict");
 			return tx
 				.update(scopes)
 				.set({
@@ -871,7 +934,11 @@ export class WorkspaceWriteCoordinator {
 					row.activeLeaseStartedAt !== null ||
 					row.activeMutationCount !== 0
 				) {
-					throw fail("needs_verification", "An unfinished durable batch member needs recovery");
+					throw fail(
+						"needs_verification",
+						`Scope "${row.canonicalRoot}" has an unfinished durable lease from a previous ` +
+							"run. An admin can recover it in Settings → Storage → Workspace write barriers.",
+					);
 				}
 				return row;
 			});
@@ -882,6 +949,7 @@ export class WorkspaceWriteCoordinator {
 				targets.map((target) => target.scope),
 				undefined,
 				true,
+				kind === "write" ? "write" : "strict",
 			);
 			return targets.map((target, index) => {
 				const leaseId = generateId();
@@ -966,7 +1034,12 @@ export class WorkspaceWriteCoordinator {
 				}
 				if (record.uncertain) throw fail("needs_verification", "Lease has an uncertain outcome");
 				this.requireLeaseRow(this.db, record);
-				this.requireNoQuarantine(this.db, record.scope, record);
+				this.requireNoQuarantine(
+					this.db,
+					record.scope,
+					record,
+					record.kind === "write" ? "write" : "strict",
+				);
 			},
 			registerMutation: (id: string) => this.registerMutation(record, id),
 			assertMutationPending: (id: string) => {
@@ -1105,8 +1178,9 @@ export class WorkspaceWriteCoordinator {
 		tx: QueryDb,
 		scope: Readonly<FileChangeScopeIdentity>,
 		owner?: LeaseRecord,
+		mode: RecoveryBarrierMode = "strict",
 	): void {
-		this.requireNoQuarantineMany(tx, [scope], owner);
+		this.requireNoQuarantineMany(tx, [scope], owner, false, mode);
 	}
 
 	private requireNoQuarantineMany(
@@ -1114,12 +1188,14 @@ export class WorkspaceWriteCoordinator {
 		targets: readonly Readonly<FileChangeScopeIdentity>[],
 		owner?: LeaseRecord,
 		admitting = false,
+		mode: RecoveryBarrierMode = "strict",
 	): void {
 		// One bounded global indexed status read; one bounded lease read per device.
 		// No broad ancestor, source filter, cross-device Cartesian lock or unbounded
 		// inventory scan. Over-budget recovery fails closed, including unrelated rows.
 		const blockers = tx
 			.select({
+				id: scopes.id,
 				deviceId: scopes.deviceId,
 				pathFlavor: scopes.pathFlavor,
 				canonicalRoot: scopes.canonicalRoot,
@@ -1133,8 +1209,13 @@ export class WorkspaceWriteCoordinator {
 		}
 		for (const blocker of blockers) {
 			// Real uncertainty is NEVER exempted, even for a sibling in this group.
-			if (targets.some((target) => overlaps(target, blocker))) {
-				throw fail("needs_verification", "An overlapping physical scope needs verification");
+			if (targets.some((target) => barrierBlocks(target, blocker, mode))) {
+				throw fail(
+					"needs_verification",
+					`An overlapping physical scope needs verification: "${blocker.canonicalRoot}" ` +
+						`(scope ${blocker.id}). An admin can recover it in ` +
+						"Settings → Storage → Workspace write barriers.",
+				);
 			}
 		}
 		for (const deviceId of new Set(targets.map((target) => target.deviceId))) {
@@ -1160,7 +1241,7 @@ export class WorkspaceWriteCoordinator {
 				throw fail("verification_backlog", "Durable lease inventory exceeds the admission budget");
 			}
 			for (const blocker of leased) {
-				if (!targets.some((target) => overlaps(target, blocker))) continue;
+				if (!targets.some((target) => barrierBlocks(target, blocker, mode))) continue;
 				// An exemption is capability-based: a live REAL token in this state,
 				// matching durable ownership/identity, and the exact same group object.
 				// IDs supplied by callers or a new process cannot construct this proof.
@@ -1176,7 +1257,12 @@ export class WorkspaceWriteCoordinator {
 						sameScope(member.scope, blocker),
 				);
 				if (!owned) {
-					throw fail("needs_verification", "An overlapping physical scope has an unfinished lease");
+					throw fail(
+						"needs_verification",
+						`An overlapping physical scope has an unfinished lease: "${blocker.canonicalRoot}" ` +
+							`(scope ${blocker.id}). An admin can recover it in ` +
+							"Settings → Storage → Workspace write barriers.",
+					);
 				}
 			}
 		}
@@ -1381,16 +1467,43 @@ function pathKey(scope: Pick<PhysicalScope, "pathFlavor" | "canonicalRoot">): st
 	return key;
 }
 
-function overlaps(left: PhysicalScope, right: PhysicalScope): boolean {
-	if (left.deviceId !== right.deviceId || left.pathFlavor !== right.pathFlavor) return false;
-	const a = pathKey(left);
-	const b = pathKey(right);
-	const separator = left.pathFlavor === "windows" ? "\\" : "/";
+function containsScope(parent: PhysicalScope, child: PhysicalScope): boolean {
+	if (parent.deviceId !== child.deviceId || parent.pathFlavor !== child.pathFlavor) return false;
+	const a = pathKey(parent);
+	const b = pathKey(child);
+	const separator = parent.pathFlavor === "windows" ? "\\" : "/";
 	// Keys are absolute, normalized and trailing-separator-free except at roots.
 	// Component boundaries preserve both POSIX backslashes and names like ..cache.
-	const contains = (parent: string, child: string) =>
-		parent === child || child.startsWith(parent.endsWith(separator) ? parent : parent + separator);
-	return contains(a, b) || contains(b, a);
+	return a === b || b.startsWith(a.endsWith(separator) ? a : a + separator);
+}
+
+function overlaps(left: PhysicalScope, right: PhysicalScope): boolean {
+	return containsScope(left, right) || containsScope(right, left);
+}
+
+/**
+ * Durable recovery barriers guard a physical region, not a whole path namespace.
+ * A scope root is always the nearest EXISTING parent directory of the actual
+ * target file, so while a quarantined root Q still exists on disk, every file
+ * under Q resolves to a root inside (or equal to) Q. A write-kind lease rooted
+ * at an ANCESTOR of Q therefore touches exactly one file outside Q and can be
+ * admitted; only `containsScope(blocker, target)` must block it. Rollback-kind
+ * leases rewrite whole subtrees and observations read unverified state, so
+ * callers pass "strict" to keep the bidirectional check for them.
+ * Residual hole, accepted and documented: if Q itself was deleted, a new file
+ * created under Q's old path resolves to an ancestor root and is admitted. That
+ * file is self-contained new content; recovery re-observes the barrier's own
+ * effect files, which new siblings never alter. Unmeasured writers (Bash) are
+ * outside this barrier by design (see the class doc: NOT physical exclusion).
+ */
+type RecoveryBarrierMode = "write" | "strict";
+
+function barrierBlocks(
+	target: PhysicalScope,
+	blocker: PhysicalScope,
+	mode: RecoveryBarrierMode,
+): boolean {
+	return mode === "strict" ? overlaps(target, blocker) : containsScope(blocker, target);
 }
 
 function sameScope(
@@ -1481,3 +1594,31 @@ function fail(code: WorkspaceWriteCoordinatorErrorCode, message: string, cause?:
 function now(): string {
 	return new Date().toISOString();
 }
+
+/**
+ * The dialect-free core of the coordinator's durable sections, exported for the
+ * PostgreSQL sibling (`postgres-workspace-lease-store.ts`) — and nothing else.
+ *
+ * Everything here is pure identity, range, barrier, validation or counter logic:
+ * no SQL fragment, no drizzle object, no driver shape. The pieces that DO carry a
+ * dialect (`behavior: "immediate"`, the sync `.get()/.run()/.all()` chaining) stay
+ * private above; the PG store rewrites those against its own schema. The
+ * in-process scheduler itself is NOT ported — see the sibling's header for why
+ * its durable sections are the portable unit.
+ */
+export const workspaceLeaseInternals = {
+	copyScope,
+	sameScope,
+	sameRuntime,
+	barrierBlocks,
+	overlaps,
+	pendingCount,
+	assertRuntime,
+	assertString,
+	assertInteger,
+	assertWaitTimeout,
+	next,
+	scopeStatusError,
+	fail,
+	now,
+};

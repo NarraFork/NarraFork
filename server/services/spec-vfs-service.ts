@@ -1,15 +1,12 @@
 import { createHash } from "node:crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import {
-	specFileRevisions,
-	specNamespaceFiles,
-	specNamespaces,
-	specProtectedTasks,
-} from "../db/schema";
+import { specFileRevisions, specNamespaceFiles, type specNamespaces } from "../db/schema";
 import { AsyncMutex } from "../lib/async-mutex";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
+import { knowledgeWriteStore } from "./knowledge/store";
+import type { SpecProtectedMutation } from "./knowledge/write-store";
 import {
 	analyzeSpecTasksCandidate,
 	compileSpecTasks,
@@ -28,7 +25,10 @@ const MAX_SPEC_PATH_CHARS = 240;
 
 const specWriteLock = new AsyncMutex();
 
-type DbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+/** The lock-row type the protected-mutation detector declares (the full table row).
+ *  The store projects rows to the fields the detector actually reads, so the write
+ *  path widens the projection back at exactly one point — see writeSpecFile. */
+type TaskLockRows = Parameters<typeof detectProtectedMutations>[0];
 
 const DEFAULT_INDEX = `# Work Spec
 
@@ -147,105 +147,23 @@ function hashContent(content: string): string {
 	return createHash("sha256").update(content).digest("hex");
 }
 
-function formatProtectedMutationError(
-	mutations: Awaited<ReturnType<typeof analyzeSpecTasksCandidate>>["protectedMutations"],
-): string {
+function formatProtectedMutationError(mutations: readonly SpecProtectedMutation[]): string {
 	const details = mutations
 		.map((mutation) => `- ${mutation.kind}: ${mutation.text} (${mutation.details})`)
 		.join("\n");
 	return `This change affects protected task(s) and requires taskReflection before it can be applied.\n${details}`;
 }
 
-function syncProtectedLocksInTransaction(
-	tx: DbTransaction,
-	namespaceId: string,
-	document: SpecTasksDocument,
-	revisionId: string,
-): void {
-	const now = new Date().toISOString();
-	const protectedTasksInDoc = document.tasks.filter((task) => task.protected);
-	for (const task of protectedTasksInDoc) {
-		const hash = taskTextHash(task.text);
-		const existing = tx.query.specProtectedTasks
-			.findFirst({
-				where: and(
-					eq(specProtectedTasks.namespaceId, namespaceId),
-					eq(specProtectedTasks.textHash, hash),
-				),
-			})
-			.sync();
-		if (!existing) {
-			tx.insert(specProtectedTasks)
-				.values({
-					id: generateId(),
-					namespaceId,
-					textHash: hash,
-					text: task.text,
-					status: task.status,
-					firstRevisionId: revisionId,
-					lastRevisionId: revisionId,
-					createdAt: now,
-					updatedAt: now,
-					completedAt: task.status === "done" ? now : null,
-				})
-				.run();
-			continue;
-		}
-		tx.update(specProtectedTasks)
-			.set({
-				status: task.status,
-				lastRevisionId: revisionId,
-				updatedAt: now,
-				...(task.status === "done" && !existing.completedAt ? { completedAt: now } : {}),
-			})
-			.where(eq(specProtectedTasks.id, existing.id))
-			.run();
-	}
-
-	const hashesInDoc = protectedTasksInDoc.map((task) => taskTextHash(task.text));
-	const openLocks = tx.query.specProtectedTasks
-		.findMany({
-			where: and(
-				eq(specProtectedTasks.namespaceId, namespaceId),
-				inArray(specProtectedTasks.status, ["todo", "doing", "blocked"]),
-			),
-		})
-		.sync();
-	for (const lock of openLocks) {
-		if (hashesInDoc.includes(lock.textHash)) continue;
-		tx.update(specProtectedTasks)
-			.set({
-				status: "deleted",
-				deletedAt: now,
-				updatedAt: now,
-				lastRevisionId: revisionId,
-			})
-			.where(eq(specProtectedTasks.id, lock.id))
-			.run();
-	}
-}
-
-async function getNamespace(narratorId: string) {
-	return db.query.specNamespaces.findFirst({ where: eq(specNamespaces.narratorId, narratorId) });
-}
-
 export async function ensureNamespace(
 	narratorId: string,
 ): Promise<typeof specNamespaces.$inferSelect> {
-	const existing = await getNamespace(narratorId);
-	if (existing) return existing;
-	const now = new Date().toISOString();
-	try {
-		const [created] = await db
-			.insert(specNamespaces)
-			.values({ id: generateId(), narratorId, createdAt: now, updatedAt: now })
-			.returning();
-		return created;
-	} catch (err) {
-		const raced = await getNamespace(narratorId);
-		if (raced) return raced;
-		throw err;
-	}
+	// The store owns the get-or-create: a lost create race returns the winner's row
+	// (re-read after the conflict), never an error.
+	return knowledgeWriteStore.ensureSpecNamespace({
+		namespaceId: generateId(),
+		narratorId,
+		now: new Date().toISOString(),
+	});
 }
 
 async function getCurrentFile(namespaceId: string, path: string) {
@@ -346,70 +264,46 @@ export async function writeSpecFile(
 	const tasksDocument = path === SPEC_TASKS_PATH ? parseSpecTasksDocument(content) : null;
 
 	return specWriteLock.acquire(`${namespace.id}:${path}`, async () => {
-		db.transaction((tx) => {
-			const now = new Date().toISOString();
-			const current = tx.query.specNamespaceFiles
-				.findFirst({
-					where: and(
-						eq(specNamespaceFiles.namespaceId, namespace.id),
-						eq(specNamespaceFiles.path, path),
-					),
-				})
-				.sync();
-
-			if (tasksDocument) {
-				const locks = tx.query.specProtectedTasks
-					.findMany({ where: eq(specProtectedTasks.namespaceId, namespace.id) })
-					.sync();
-				const protectedMutations = detectProtectedMutations(locks, tasksDocument);
-				if (protectedMutations.length > 0 && !options.allowProtectedTaskMutation) {
-					throw new Error(formatProtectedMutationError(protectedMutations));
-				}
-			}
-
-			const revisionId = generateId();
-			tx.insert(specFileRevisions)
-				.values({
-					id: revisionId,
-					namespaceId: namespace.id,
-					path,
-					content,
-					contentHash: hashContent(content),
-					parentRevisionId: current?.revisionId ?? null,
-					sourceToolUseId: options.sourceToolUseId ?? null,
-					sourceMessageId: options.sourceMessageId ?? null,
-					createdBy: options.createdBy ?? "assistant",
-					createdAt: now,
-				})
-				.run();
-
-			if (current) {
-				tx.update(specNamespaceFiles)
-					.set({ revisionId, deleted: false, updatedAt: now })
-					.where(eq(specNamespaceFiles.id, current.id))
-					.run();
-			} else {
-				tx.insert(specNamespaceFiles)
-					.values({
-						id: generateId(),
-						namespaceId: namespace.id,
-						path,
-						revisionId,
-						deleted: false,
-						updatedAt: now,
-					})
-					.run();
-			}
-
-			tx.update(specNamespaces)
-				.set({ updatedAt: now })
-				.where(eq(specNamespaces.id, namespace.id))
-				.run();
-
-			if (tasksDocument) {
-				syncProtectedLocksInTransaction(tx, namespace.id, tasksDocument, revisionId);
-			}
+		// The store owns the whole section: revision insert + file pointer switch +
+		// namespace touch + protected-lock enforcement. For tasks.json the detector
+		// runs INSIDE the section over the locks the section just read; the service
+		// keeps ownership of the detection logic (injected, dialect-free) and the
+		// error wording.
+		const result = await knowledgeWriteStore.writeSpecFileRevision({
+			namespaceId: namespace.id,
+			path,
+			content,
+			contentHash: hashContent(content),
+			revisionId: generateId(),
+			fileIdForCreate: generateId(),
+			sourceToolUseId: options.sourceToolUseId ?? null,
+			sourceMessageId: options.sourceMessageId ?? null,
+			createdBy: options.createdBy ?? "assistant",
+			now: new Date().toISOString(),
+			...(tasksDocument
+				? {
+						specTasks: {
+							tasks: tasksDocument.tasks.map((task) => ({
+								text: task.text,
+								status: task.status,
+								protected: task.protected === true,
+								textHash: taskTextHash(task.text),
+							})),
+							// The store projects the lock rows to exactly the fields the
+							// detector reads (status / textHash / text); the detector's
+							// declared parameter is the full table row, so the projection is
+							// widened back here — the one cast on this path, and load-bearing:
+							// it is why the port never imports the SQLite-bound task service.
+							detectProtectedMutations: (locks) =>
+								detectProtectedMutations(locks as unknown as TaskLockRows, tasksDocument),
+							allowProtectedTaskMutation: options.allowProtectedTaskMutation === true,
+						},
+					}
+				: {}),
 		});
+		if (!result.ok) {
+			throw new Error(formatProtectedMutationError(result.protectedMutations));
+		}
 
 		const written = await readSpecFile(narratorId, toSpecUri(path));
 		eventBus.emit({
@@ -433,10 +327,10 @@ export async function deleteSpecFile(narratorId: string, uri: string): Promise<v
 	const namespace = await ensureNamespace(narratorId);
 	const current = await getCurrentFile(namespace.id, path);
 	if (!current) return;
-	await db
-		.update(specNamespaceFiles)
-		.set({ deleted: true, updatedAt: new Date().toISOString() })
-		.where(eq(specNamespaceFiles.id, current.id));
+	await knowledgeWriteStore.markSpecFileDeleted({
+		fileId: current.id,
+		now: new Date().toISOString(),
+	});
 }
 
 export async function listSpecFiles(narratorId: string): Promise<SpecResolvedFile[]> {
@@ -485,55 +379,15 @@ export async function forkSpecNamespace(
 	childNarratorId: string,
 ): Promise<void> {
 	const parent = await ensureNamespace(parentNarratorId);
-	const existingChild = await getNamespace(childNarratorId);
-	if (existingChild) return;
-	const now = new Date().toISOString();
-	const childNamespaceId = generateId();
-	await db.insert(specNamespaces).values({
-		id: childNamespaceId,
-		narratorId: childNarratorId,
-		forkedFromNamespaceId: parent.id,
-		createdAt: now,
-		updatedAt: now,
+	// The store owns the whole fork: the existing-child check, the child namespace,
+	// the live file pointers and the protected-task locks — one atomic section, so a
+	// fork can never materialize half a namespace.
+	await knowledgeWriteStore.forkSpecNamespace({
+		parentNamespaceId: parent.id,
+		childNamespaceId: generateId(),
+		childNarratorId,
+		now: new Date().toISOString(),
 	});
-	const parentFiles = await db.query.specNamespaceFiles.findMany({
-		where: and(
-			eq(specNamespaceFiles.namespaceId, parent.id),
-			eq(specNamespaceFiles.deleted, false),
-		),
-	});
-	if (parentFiles.length > 0) {
-		await db.insert(specNamespaceFiles).values(
-			parentFiles.map((file) => ({
-				id: generateId(),
-				namespaceId: childNamespaceId,
-				path: file.path,
-				revisionId: file.revisionId,
-				deleted: false,
-				updatedAt: now,
-			})),
-		);
-	}
-	const parentProtectedTasks = await db.query.specProtectedTasks.findMany({
-		where: eq(specProtectedTasks.namespaceId, parent.id),
-	});
-	if (parentProtectedTasks.length > 0) {
-		await db.insert(specProtectedTasks).values(
-			parentProtectedTasks.map((task) => ({
-				id: generateId(),
-				namespaceId: childNamespaceId,
-				textHash: task.textHash,
-				text: task.text,
-				status: task.status,
-				firstRevisionId: task.firstRevisionId,
-				lastRevisionId: task.lastRevisionId,
-				createdAt: now,
-				updatedAt: now,
-				completedAt: task.completedAt,
-				deletedAt: task.deletedAt,
-			})),
-		);
-	}
 }
 
 export async function readTasksFileForNarrator(narratorId: string): Promise<SpecResolvedFile> {
@@ -660,30 +514,13 @@ export async function clearSpecTasks(narratorId: string): Promise<SpecResolvedFi
  */
 export async function resetSpecNamespace(narratorId: string): Promise<void> {
 	const namespace = await ensureNamespace(narratorId);
-	const now = new Date().toISOString();
-	db.transaction((tx) => {
-		// Drop all tracked files. Built-in paths (index.md / tasks.json /
-		// behavior_fence) revert to their BUILTIN_FILES defaults because
-		// readSpecFile falls back when there is no namespace-file row; custom
-		// *.md notes simply cease to exist.
-		tx.delete(specNamespaceFiles).where(eq(specNamespaceFiles.namespaceId, namespace.id)).run();
-
-		// Release every open protected-task lock so a future tasks.json write is
-		// not blocked by a stale commitment from before the reset.
-		tx.update(specProtectedTasks)
-			.set({ status: "deleted", deletedAt: now, updatedAt: now })
-			.where(
-				and(
-					eq(specProtectedTasks.namespaceId, namespace.id),
-					inArray(specProtectedTasks.status, ["todo", "doing", "blocked"]),
-				),
-			)
-			.run();
-
-		tx.update(specNamespaces)
-			.set({ updatedAt: now })
-			.where(eq(specNamespaces.id, namespace.id))
-			.run();
+	// The store owns the reset section: drop all tracked files (built-in paths revert
+	// to their defaults because readSpecFile falls back when there is no row), release
+	// every open protected-task lock so a future tasks.json write is not blocked by a
+	// stale commitment, and touch the namespace.
+	await knowledgeWriteStore.resetSpecNamespace({
+		namespaceId: namespace.id,
+		now: new Date().toISOString(),
 	});
 }
 

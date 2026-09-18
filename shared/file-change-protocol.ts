@@ -156,6 +156,30 @@ export type FileChangeSettlement =
 	| "applying"
 	| "settled"
 	| "reconcile_required";
+
+/**
+ * Verdict from re-observing an unsettled effect's physical file during external
+ * scope recovery. "applied"/"not_applied" compare actual bytes against the
+ * durable intent; "not_dispatched" means the effect never reached IO;
+ * "foreign" means neither before nor intended matches (a human must look);
+ * "unobservable" means the object could not be read within evidence limits.
+ */
+export type FileChangeRecoveryVerdict =
+	| "applied"
+	| "not_applied"
+	| "not_dispatched"
+	| "foreign"
+	| "unobservable";
+
+/** One acknowledged per-effect decision inside a scope recovery audit row. */
+export interface FileChangeRecoveryDecision {
+	effectId: string;
+	canonicalPath: string;
+	verdict: FileChangeRecoveryVerdict;
+	/** Digest/size of the physical object at decision time; null when absent. */
+	observedDigest: string | null;
+	observedSizeBytes: number | null;
+}
 export type FileChangeAttributionGrade = "measured" | "observed_ambiguous" | "unknown";
 export type FileChangeMutationPhase = "apply" | "compensate";
 

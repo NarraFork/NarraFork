@@ -7,7 +7,6 @@
  * unknown coverage before any filesystem work. M1–M3 supply the v2 planner.
  */
 import { isAbsolute, relative } from "node:path";
-import { NON_OPERATION_ROLES } from "@shared/file-change-protocol";
 import { and, asc, eq, gte, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narratorToolCalls } from "../db/schema";
@@ -19,7 +18,6 @@ import {
 	unavailableSnapshotRevert,
 } from "./snapshot-revert";
 import { specVfsService } from "./spec-vfs-service";
-import { FILE_MUTATING_TOOLS } from "./tree-snapshot-loop-hooks";
 
 /** Legacy observations retained for read-only consumers, never execution evidence. */
 export interface BoundaryPair {
@@ -67,15 +65,8 @@ const MAX_OPERATION_ROWS = 1_000;
 // Avoid parsing megabytes of legacy Write content on the SQLite request thread.
 // Larger inputs remain unknown unless frozen execution metadata identifies them.
 const MAX_INPUT_METADATA_BYTES = 16 * 1024;
-/** Unknown/plugin tools are not silently classified as having no disk effects. */
-const READ_ONLY_TOOLS = new Set([
-	"Read",
-	"Glob",
-	"Grep",
-	"StructView",
-	"WebSearch",
-	"WebFetch",
-]);
+/** Only tools with explicit file-journal semantics participate in file rollback. */
+const REVERTABLE_FILE_TOOLS = new Set(["Write", "Edit", "StructSed"]);
 type WindowCoverage =
 	| { kind: "empty" }
 	| { kind: "too_large" }
@@ -83,8 +74,9 @@ type WindowCoverage =
 	| { kind: "incomplete_coverage" };
 
 /**
- * Seq/message leftover cards: join roles in SQL and stay inside the operation-row budget.
- * An empty leftover set is a no-op; an assistant without calls still refuses the window.
+ * Seq/message leftover cards: stay inside the operation-row budget.
+ * The query already excludes every message with a persisted tool row, so any
+ * existing message role is content-only and cannot own a disk mutation.
  */
 async function classifyWindowWithoutOperations(
 	narratorId: string,
@@ -115,7 +107,7 @@ async function classifyWindowWithoutOperations(
 		)
 		.limit(MAX_OPERATION_ROWS + 1);
 	if (rows.length > MAX_OPERATION_ROWS) return { kind: "too_large" };
-	if (rows.some((row) => row.role == null || !NON_OPERATION_ROLES.has(row.role))) {
+	if (rows.some((row) => row.role == null)) {
 		return { kind: "incomplete_coverage" };
 	}
 	if ("messageIds" in scope) {
@@ -128,7 +120,7 @@ async function classifyWindowWithoutOperations(
 				.from(narratorMessages)
 				.where(inArray(narratorMessages.id, missing));
 			if (extra.length !== missing.length) return { kind: "incomplete_coverage" };
-			if (extra.some((row) => !NON_OPERATION_ROLES.has(row.role))) {
+			if (extra.some((row) => row.role == null)) {
 				return { kind: "incomplete_coverage" };
 			}
 			return { kind: "nothing_owned" };
@@ -237,9 +229,9 @@ async function selectPairs(
 			return { pairs: [], unavailable: "incomplete_coverage" };
 		}
 	} else {
-		// Mixed windows still have leftover cards (task-guard, continuation,
-		// user turns). Those roles never own disk mutations; an assistant row
-		// without calls still can and must keep refusing the whole window.
+		// Mixed windows still have leftover content cards (task-guard,
+		// continuation, user turns or provider-specific injections). Since these
+		// rows have no persisted tool calls, they cannot own disk mutations.
 		const leftover = await classifyWindowWithoutOperations(
 			narratorId,
 			scope,
@@ -254,10 +246,7 @@ async function selectPairs(
 	const reasons = new Set<ScopedRevertUnavailableReason>();
 	const pairs: BoundaryPair[] = [];
 	for (const row of rows) {
-		if (!FILE_MUTATING_TOOLS.has(row.toolName)) {
-			if (!READ_ONLY_TOOLS.has(row.toolName)) reasons.add("incomplete_coverage");
-			continue;
-		}
+		if (!REVERTABLE_FILE_TOOLS.has(row.toolName)) continue;
 		const paths = [row.resolvedFilePath, row.canonicalFilePath, row.inputFilePath].filter(
 			(path): path is string => typeof path === "string" && path.length > 0,
 		);
@@ -273,12 +262,7 @@ async function selectPairs(
 		if (
 			(row.executionDeviceId && row.executionDeviceId !== LOCAL_DEVICE_ID) ||
 			(typeof row.inputDevice === "string" && row.inputDevice !== LOCAL_DEVICE_ID) ||
-			(worktreePath && paths.some((path) => outsideWorkspace(worktreePath, path))) ||
-			(row.toolName === "Bash" &&
-				worktreePath &&
-				row.executionCwd &&
-				outsideWorkspace(worktreePath, row.executionCwd) &&
-				row.executionCwd !== worktreePath)
+			(worktreePath && paths.some((path) => outsideWorkspace(worktreePath, path)))
 		) {
 			reasons.add("unsupported_target");
 		}

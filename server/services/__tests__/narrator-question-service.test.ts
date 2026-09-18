@@ -196,7 +196,9 @@ describe("own question wait capability", () => {
 		});
 		expect(answer.ok).toBe(true);
 		const filter = resolveToolFilter("general");
-		expect(filter?.({ ...awaitTool, name: "AskUserQuestion" })).toBe(true);
+		// Asking is gone for subagents, but waiting on a question that already exists
+		// (e.g. filed by the primary before delegation) stays available.
+		expect(filter?.({ ...awaitTool, name: "AskUserQuestion" })).toBe(false);
 		expect(filter?.(awaitTool)).toBe(true);
 		const context = {
 			narratorId: NARRATOR_ID,

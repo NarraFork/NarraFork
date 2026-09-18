@@ -73,11 +73,24 @@ describe("reconcileCodexBrowserAuthState", () => {
 		// Page reload, or authorization kicked off from another tab.
 		expect(
 			reconcileCodexBrowserAuthState({
-				serverState: { pending: true, redirectUri: REDIRECT_URI },
+				serverState: { pending: true, redirectUri: REDIRECT_URI, localCallbackServer: true },
 				knownRedirectUri: null,
 				submitting: false,
 			}),
-		).toEqual({ pending: true, redirectUri: REDIRECT_URI });
+		).toEqual({ pending: true, redirectUri: REDIRECT_URI, localCallbackServer: true });
+	});
+
+	it("surfaces a missing local callback server so the UI can demand a manual paste", () => {
+		// The server could not bind its listener (port busy): the flow is still
+		// pending, but the browser redirect goes nowhere and only the paste box
+		// can finish it.
+		expect(
+			reconcileCodexBrowserAuthState({
+				serverState: { pending: true, redirectUri: REDIRECT_URI, localCallbackServer: false },
+				knownRedirectUri: null,
+				submitting: false,
+			}),
+		).toEqual({ pending: true, redirectUri: REDIRECT_URI, localCallbackServer: false });
 	});
 
 	it("keeps the redirect URI this tab captured when the flow started", () => {

@@ -732,11 +732,25 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 				container.removeEventListener("touchstart", onLongPressStart);
 				container.removeEventListener("touchmove", onLongPressMove);
 				container.removeEventListener("touchend", onLongPressEnd);
-				if (pinchResizeTimerRef.current) clearTimeout(pinchResizeTimerRef.current);
-				if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
-				term.dispose();
-				termRef.current = null;
-				fitAddonRef.current = null;
+				if (pinchResizeTimerRef.current) {
+					clearTimeout(pinchResizeTimerRef.current);
+					pinchResizeTimerRef.current = null;
+				}
+				if (longPressTimerRef.current) {
+					clearTimeout(longPressTimerRef.current);
+					longPressTimerRef.current = null;
+				}
+
+				// xterm 5.5 schedules Viewport.syncScrollArea() with setTimeout during
+				// open(). React StrictMode can run this cleanup immediately and dispose
+				// the renderer before that callback runs, causing xterm to read
+				// `dimensions` from an already-disposed renderer. Let xterm finish its
+				// queued initialization before disposing this effect's own instance.
+				setTimeout(() => {
+					term.dispose();
+					if (termRef.current === term) termRef.current = null;
+					if (fitAddonRef.current === fitAddon) fitAddonRef.current = null;
+				}, 0);
 			};
 		}, [write, runFit, scheduleFit, handleSelectionChange]);
 

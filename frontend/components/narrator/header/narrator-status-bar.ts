@@ -29,6 +29,8 @@ const STATUS_BAR_SUBSTATUS_PRIORITY = [
 	// Without this the label falls back to the base status ("Waiting"), which
 	// reads as "waiting for you" instead of "waiting for the model".
 	"model_unavailable",
+	// Same argument: an exhausted quota window is also the machine waiting.
+	"quota_exhausted",
 	"interrupted",
 	"suspended",
 	"manual_override",
@@ -66,6 +68,7 @@ export type NarratorWorkIndicatorPrimary =
 	| "retrying"
 	| "blocking_compact"
 	| "model_unavailable"
+	| "quota_exhausted"
 	| "spec_task"
 	| "waiting"
 	| "planning"
@@ -107,6 +110,8 @@ export function planNarratorWorkIndicator(input: {
 	isBlockingCompacting: boolean;
 	isBackgroundCompacting: boolean;
 	isWaitingForModel: boolean;
+	/** Waiting for an exhausted quota window to reset. Same "machine is waiting" slot. */
+	isWaitingForQuota: boolean;
 	hasSpecTask: boolean;
 	isWaiting: boolean;
 	isPlanning: boolean;
@@ -119,15 +124,17 @@ export function planNarratorWorkIndicator(input: {
 			? "blocking_compact"
 			: input.isWaitingForModel
 				? "model_unavailable"
-				: input.hasSpecTask
-					? "spec_task"
-					: input.isWaiting
-						? "waiting"
-						: input.isPlanning
-							? "planning"
-							: input.isBackgroundCompacting
-								? "background_compact"
-								: "thinking";
+				: input.isWaitingForQuota
+					? "quota_exhausted"
+					: input.hasSpecTask
+						? "spec_task"
+						: input.isWaiting
+							? "waiting"
+							: input.isPlanning
+								? "planning"
+								: input.isBackgroundCompacting
+									? "background_compact"
+									: "thinking";
 	return {
 		primary,
 		showBackgroundCompactSuffix:

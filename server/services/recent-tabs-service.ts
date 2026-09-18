@@ -25,6 +25,7 @@ import {
 	userRecentTabs,
 	userRecentTabsMeta,
 	users,
+	workspacePanels,
 	workspaces,
 } from "../db/schema";
 import { userPreferencesLock } from "../lib/async-mutex";
@@ -44,6 +45,24 @@ const ATTENTION_SUBSTATUS = new Set(["unread", "error"]);
 
 type RecentTabRow = typeof userRecentTabs.$inferSelect;
 type RecentTabInsert = typeof userRecentTabs.$inferInsert;
+type WorkspacePanelInsert = typeof workspacePanels.$inferInsert;
+
+/**
+ * The only caller-supplied write allowed inside the tab-projection transaction,
+ * expressed as DATA rather than as a callback.
+ *
+ * This used to be `inTransaction: (tx) => void`, and that shape cannot keep an
+ * async callback out: TypeScript's return-value-ignoring rule makes any async
+ * function assignable to `=> void`, and on `bun:sqlite` the driver commits when
+ * the callback RETURNS, so a smuggled-in async callback would run everything
+ * after its first `await` in autocommit while looking committed (the exact
+ * hazard `server/db/transaction-atomicity-contract.test.ts` gates). Taking the
+ * operation as a plain value makes async work inexpressible at the type level
+ * and keeps every `tx` touch inside this module, where the gate can resolve it.
+ */
+export type WorkspacePanelMembershipWrite =
+	| { action: "insert"; row: WorkspacePanelInsert }
+	| { action: "remove"; panelId: string };
 
 interface UndoEntry {
 	token: string;
@@ -67,7 +86,8 @@ interface MutationOptions {
 	workspaceIdsToDelete?: string[];
 	deferredWorkspaceIds?: string[];
 	/**
-	 * Extra work to run INSIDE the same transaction that persists the tab rows.
+	 * A workspace-panel membership write to apply INSIDE the same transaction that
+	 * persists the tab rows.
 	 *
 	 * This exists so workspace membership and its sidebar projection commit
 	 * together. Writing them as two requests is what allowed a persisted sidebar
@@ -78,9 +98,12 @@ interface MutationOptions {
 	 * already matches" is a normal outcome (re-adding a panel for a narrator whose
 	 * tab is already attached), and skipping the membership write in that case
 	 * would drop the caller's actual work.
+	 *
+	 * Deliberately declarative (see `WorkspacePanelMembershipWrite`): a callback
+	 * here could be async without the type system objecting, which is the SQLite
+	 * early-commit hazard the transaction-atomicity gate exists to stop.
 	 */
-	// biome-ignore lint/suspicious/noExplicitAny: Drizzle transaction type is private to the driver.
-	inTransaction?: (tx: any) => void;
+	panelMembership?: WorkspacePanelMembershipWrite;
 }
 
 interface MutationState {
@@ -689,6 +712,26 @@ function writeLegacyShadowInTransaction(
 		.run();
 }
 
+/**
+ * Apply a caller-declared workspace-panel membership write.
+ *
+ * Declared locally — never received as a callback — so its synchronous body is
+ * visible to the transaction-atomicity gate. Both shapes are single statements;
+ * a throw here (e.g. the workspace/narrator unique index) aborts the enclosing
+ * transaction and rolls the tab rows and revision bump back with it.
+ */
+function applyPanelMembershipInTransaction(
+	// biome-ignore lint/suspicious/noExplicitAny: Drizzle transaction type is private to the driver.
+	tx: any,
+	write: WorkspacePanelMembershipWrite,
+): void {
+	if (write.action === "insert") {
+		tx.insert(workspacePanels).values(write.row).run();
+		return;
+	}
+	tx.delete(workspacePanels).where(eq(workspacePanels.id, write.panelId)).run();
+}
+
 function ensureMigratedLocked(userId: string): number {
 	const existingRevision = readRevision(userId);
 	if (existingRevision != null) return existingRevision;
@@ -830,14 +873,14 @@ function persistMutationLocked(
 	options: MutationOptions = {},
 ): RecentTabsMutationResult {
 	if (tabsEqual(before, after)) {
-		// The tab rows need no change, but `inTransaction` work still has to run and
+		// The tab rows need no change, but the membership write still has to run and
 		// still has to be atomic — see the field's note. Without this branch, adding a
 		// panel for a narrator whose sidebar tab was already attached would silently
 		// perform no membership write at all.
-		if (options.inTransaction) {
-			const runInTransaction = options.inTransaction;
+		if (options.panelMembership) {
+			const write = options.panelMembership;
 			db.transaction((tx) => {
-				runInTransaction(tx);
+				applyPanelMembershipInTransaction(tx, write);
 			});
 		}
 		return {
@@ -853,9 +896,9 @@ function persistMutationLocked(
 	const now = new Date().toISOString();
 	db.transaction((tx) => {
 		applyRowDiffInTransaction(tx, userId, after, oldRows, now);
-		// Before the meta/revision write so a throw from the caller's work aborts the
-		// whole thing, leaving neither the membership change nor a bumped revision.
-		options.inTransaction?.(tx);
+		// Before the meta/revision write so a throw from the membership write aborts
+		// the whole thing, leaving neither the membership change nor a bumped revision.
+		if (options.panelMembership) applyPanelMembershipInTransaction(tx, options.panelMembership);
 		tx.update(userRecentTabsMeta)
 			.set({ revision, updatedAt: now })
 			.where(eq(userRecentTabsMeta.userId, userId))
@@ -1090,8 +1133,8 @@ export async function upsertRecentTab(
 }
 
 /**
- * Attach or detach one narrator's sidebar tab from a workspace group, running
- * the caller's own membership write in the SAME transaction.
+ * Attach or detach one narrator's sidebar tab from a workspace group, applying
+ * the caller-declared membership write in the SAME transaction.
  *
  * This is the only way `workspace_panels` and `user_recent_tabs.workspace_id`
  * are allowed to change together. The membership row is the authority; this
@@ -1110,8 +1153,12 @@ export async function applyWorkspaceMembershipProjection(
 		narratorId: string;
 		/** Target workspace, or null to release the tab back to the top level. */
 		workspaceId: string | null;
-		// biome-ignore lint/suspicious/noExplicitAny: Drizzle transaction type is private to the driver.
-		inTransaction: (tx: any) => void;
+		/**
+		 * The membership-row write to commit with the projection, as DATA — never a
+		 * callback (see `WorkspacePanelMembershipWrite` for why a callback here is
+		 * the SQLite early-commit hazard).
+		 */
+		panelMembership: WorkspacePanelMembershipWrite;
 	},
 ): Promise<RecentTabsMutationResult> {
 	return userPreferencesLock.acquire(userId, async () => {
@@ -1130,7 +1177,7 @@ export async function applyWorkspaceMembershipProjection(
 		// lands in the right group without this function knowing the ordering rules.
 		const normalized = normalizeAndLimitTabs(after);
 		return persistMutationLocked(userId, oldRows, before, normalized.tabs, baseRevision, {
-			inTransaction: input.inTransaction,
+			panelMembership: input.panelMembership,
 		});
 	});
 }

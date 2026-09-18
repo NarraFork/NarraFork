@@ -1,6 +1,8 @@
 import { ApiError } from "@frontend/lib/api/client";
 import { describeApiError } from "@frontend/lib/api-error";
+import { formatFullLocaleDateTime } from "@frontend/lib/format";
 import { extractPolicyViolationCode } from "@shared/agent-protocol/policy-violation";
+import { KIMI_QUOTA_EXHAUSTED } from "@shared/agent-protocol/quota-exhausted";
 import { ERROR_CATALOG } from "@shared/error-catalog";
 import type { TFunction } from "i18next";
 
@@ -96,6 +98,21 @@ export function localizeNarratorError(
 	const payload = parseErrorMessagePayload(errorMessage);
 	if (errorCode === "payment_required" || payload?.type === "payment_required") {
 		return t("recharge.paymentRequired");
+	}
+
+	// A quota allowance that is spent and was NOT waited out (the reset is beyond the
+	// wait budget, or this run already suspended on quota too often). The server put
+	// the reset instant in the payload precisely so this can name it: without that,
+	// the user gets an opaque upstream 403 and no idea when the model comes back —
+	// which is what this branch exists to fix. Read from the payload, not from
+	// `diagnostics`, because only `errorMessage` survives a page reload.
+	if (payload?.type === KIMI_QUOTA_EXHAUSTED) {
+		const resetAt = payload.quotaResetAt;
+		return typeof resetAt === "number" && Number.isFinite(resetAt)
+			? t("quotaExhaustedWaitNotPossible", {
+					resetAt: formatFullLocaleDateTime(new Date(resetAt)),
+				})
+			: t("quotaExhaustedWaitNotPossibleNoReset");
 	}
 
 	const contextKey = errorCode ? CONTEXT_KEYS[errorCode] : undefined;

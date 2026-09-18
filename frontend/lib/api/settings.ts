@@ -60,6 +60,13 @@ export interface ModelTestErrorDetails {
 	hostname?: string;
 	status?: number;
 	reason?: string;
+	/** Response content-type, present when the upstream body was not the expected JSON. */
+	contentType?: string;
+	/** Final URL the body came from, after redirects. */
+	responseUrl?: string;
+	/** Redacted, bounded excerpt of a non-JSON response body (often an HTML error page). */
+	bodyPreview?: string;
+	bodyTruncated?: boolean;
 	cause?: ModelTestErrorDetails;
 }
 
@@ -76,6 +83,8 @@ export interface ModelTestRequestAttempt {
 	category?: ModelTestNetworkErrorCategory;
 	status?: number;
 	statusText?: string;
+	/** Present only when a redirect took the request somewhere other than `url`. */
+	responseUrl?: string;
 	responseHeaders?: Record<string, string>;
 	error?: ModelTestErrorDetails;
 }

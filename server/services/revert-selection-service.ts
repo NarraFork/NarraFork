@@ -1,3 +1,28 @@
+/**
+ * CAPABILITY BOUNDARY: this module is SQLite-only by design, and that is a
+ * deliberate capability decision, not unfinished porting.
+ *
+ * Everything it does is built on connection-scoped SQLite facts a second backend
+ * cannot reproduce as the same capability:
+ *
+ *   - the conservative connection stamp (`total_changes()` + `PRAGMA data_version`)
+ *     that rejects ANY intervening write — PostgreSQL has no per-connection
+ *     "anything changed since" counter; the equivalent guarantee there is a
+ *     transaction-isolation property, not a stamp;
+ *   - `INDEXED BY` + `rowid` keyset scans, which pin both the index choice and a
+ *     physical row order PostgreSQL does not expose;
+ *   - raw `bun:sqlite` prepared statements against the root handle, including the
+ *     worker-side collector.
+ *
+ * THE PG ALTERNATIVE (for whoever ports history selection): do not translate the
+ * scans. Re-express the collector as set-oriented, keyset-paged SELECTs on the
+ * PG schema (the same indexes exist; ordering is by the columns themselves, not
+ * `rowid`), and replace the stamp with `REPEATABLE READ` — one snapshot for the
+ * whole collection, which is the stronger form of "no intervening write" the
+ * stamp approximates. The plan/journal/evidence write paths that CONSUME this
+ * selection already have their PG counterparts (`postgres-revert-plan-store.ts`,
+ * `postgres-revert-journal-store.ts`, `postgres-file-change-evidence-store.ts`).
+ */
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
@@ -164,6 +189,7 @@ export interface RevertSelectionResult {
 			| "spec"
 			| "no_dispatch"
 			| "delegated"
+			| "pending"
 			| "non_file_change"
 			| "outside_selected_call";
 	}[];
@@ -699,18 +725,21 @@ export class RevertSelectionService {
 			});
 			return;
 		}
-		const isFileTool = ["Write", "Edit"].includes(tool.toolName);
-		const canSkipMissingJournal =
-			tool.toolName === "Bash" ||
-			(!isFileTool &&
-				!READ_ONLY_TOOLS.has(tool.toolName) &&
-				!["Agent", "Task"].includes(tool.toolName));
-		let nonFileSkip = false;
-		if (!["success", "fail"].includes(tool.status)) {
-			if (!canSkipMissingJournal)
-				this.issue(state, { code: "TOOL_ACTIVE_OR_UNKNOWN", toolCallId: tool.id });
-			else nonFileSkip = true;
+		const isFileTool = ["Write", "Edit", "StructSed"].includes(tool.toolName);
+		const isDelegationTool = ["Agent", "Task"].includes(tool.toolName);
+		if (!isFileTool && !isDelegationTool) {
+			this.add(state, state.result.noDiskTools, {
+				toolCallId: tool.id,
+				reason: READ_ONLY_TOOLS.has(tool.toolName) ? "read_only" : "non_file_change",
+			});
+			return;
 		}
+		if (isFileTool && (!["success", "fail"].includes(tool.status) || Boolean(tool.isBackground))) {
+			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "pending" });
+			return;
+		}
+		if (!["success", "fail"].includes(tool.status))
+			this.issue(state, { code: "TOOL_ACTIVE_OR_UNKNOWN", toolCallId: tool.id });
 		const origin = tool.executionOriginToolCallId ?? tool.id;
 		const task = this.one<{
 			id: string;
@@ -723,42 +752,33 @@ export class RevertSelectionService {
 			"SELECT id, status, type, parent_narrator_id AS parentNarratorId, subagent_narrator_id AS subagentNarratorId FROM background_tasks INDEXED BY idx_bg_tasks_tool_attempt WHERE tool_call_id = ? AND execution_attempt = ? LIMIT 1",
 			[origin, tool.executionAttempt],
 		);
-		if (task && task.parentNarratorId !== tool.narratorId) {
-			if (canSkipMissingJournal) nonFileSkip = true;
-			else this.issue(state, { code: "BACKGROUND_BINDING_MISMATCH", toolCallId: tool.id });
-		}
-		if ((task && ["running", "paused"].includes(task.status)) || (tool.isBackground && !task)) {
-			if (canSkipMissingJournal) nonFileSkip = true;
-			else this.issue(state, { code: "BACKGROUND_UNRESOLVED", toolCallId: tool.id });
-		}
+		if (task && task.parentNarratorId !== tool.narratorId)
+			this.issue(state, { code: "BACKGROUND_BINDING_MISMATCH", toolCallId: tool.id });
+		if ((task && ["running", "paused"].includes(task.status)) || (tool.isBackground && !task))
+			this.issue(state, { code: "BACKGROUND_UNRESOLVED", toolCallId: tool.id });
 		let delegated = false;
-		if (["Agent", "Task"].includes(tool.toolName))
-			delegated = await this.children(state, tool, owningNarratorId);
+		if (isDelegationTool) delegated = await this.children(state, tool, owningNarratorId);
 		else await this.rejectUnboundChildren(state, tool, new Set([owningNarratorId]));
+		if (delegated) {
+			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "delegated" });
+			return;
+		}
+		if (!isFileTool) {
+			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "non_file_change" });
+			return;
+		}
 		if (tool.fileChangeOperationId) {
 			await this.operation(state, tool);
 			return;
 		}
-		if (READ_ONLY_TOOLS.has(tool.toolName)) {
-			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "read_only" });
-			return;
-		}
 		if (
-			["Write", "Edit"].includes(tool.toolName) &&
+			isFileTool &&
 			tool.executionIdentityVersion === 1 &&
 			tool.executionPathFlavor === "spec" &&
 			tool.resolvedFilePath?.startsWith("spec://") &&
 			(!tool.canonicalFilePath || tool.canonicalFilePath.startsWith("spec://"))
 		) {
 			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "spec" });
-			return;
-		}
-		if (delegated) {
-			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "delegated" });
-			return;
-		}
-		if (nonFileSkip || !isFileTool) {
-			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "non_file_change" });
 			return;
 		}
 		this.issue(state, { code: "FILE_JOURNAL_MISSING", toolCallId: tool.id });
@@ -1113,14 +1133,7 @@ export class RevertSelectionService {
 	}
 }
 
-const READ_ONLY_TOOLS = new Set([
-	"Read",
-	"Glob",
-	"Grep",
-	"StructView",
-	"WebSearch",
-	"WebFetch",
-]);
+const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "StructView", "WebSearch", "WebFetch"]);
 const REF_SELECT = `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrator_id AS narratorId, r.seq,
  coalesce(m.role,'assistant') AS role, r.segment_compact_id AS segmentCompactId, octet_length(m.content_json) AS contentBytes,
  octet_length(m.content_json) + coalesce(octet_length(m.content_text),0) + coalesce(octet_length(m.original_content_json),0) AS copyBytes,

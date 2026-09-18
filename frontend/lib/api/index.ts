@@ -247,4 +247,9 @@ export type {
 	TreeMessage,
 	WhitelistCmd,
 	WhitelistDir,
+	WorkspaceBarrier,
+	WorkspaceBarrierObservation,
+	WorkspaceBarrierObservationResult,
+	WorkspaceBarrierRecoveryResult,
+	WorkspaceBarrierVerdict,
 } from "./types";

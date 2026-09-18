@@ -1,9 +1,18 @@
 import { Alert, Badge, Group, Modal, SegmentedControl, Stack, Text } from "@mantine/core";
 import { pickLocalizedValue } from "@shared/i18n-locales";
+import {
+	normalizeToolRoutineModeOverride,
+	TOOL_ROUTINE_MODES,
+	type ToolRoutineMode,
+} from "@shared/routine-modes";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { useContentCapability } from "../../hooks/usePlatform";
-import { useProjectRoutines, useToggleProjectRoutine } from "../../hooks/useRoutines";
+import {
+	useProjectRoutines,
+	useSetProjectRoutineMode,
+	useToggleProjectRoutine,
+} from "../../hooks/useRoutines";
 
 function routineOverrideToAction(value: string): "enable" | "disable" | "reset" | null {
 	switch (value) {
@@ -17,6 +26,9 @@ function routineOverrideToAction(value: string): "enable" | "disable" | "reset" 
 			return null;
 	}
 }
+
+/** Project-level positions for a tool routine: follow global, then the three modes. */
+const PROJECT_TOOL_MODE_VALUES = ["global", ...TOOL_ROUTINE_MODES] as const;
 
 interface ProjectRoutinesModalProps {
 	projectId: string;
@@ -39,6 +51,7 @@ export function ProjectRoutinesModal({ projectId, opened, onClose }: ProjectRout
 		opened && routinesCapability.supported ? projectId : undefined,
 	);
 	const toggle = useToggleProjectRoutine(projectId);
+	const setToolMode = useSetProjectRoutineMode(projectId);
 
 	const routineGroups = useMemo(() => {
 		const groups = new Map<string, NonNullable<typeof data>["routines"]>();
@@ -71,51 +84,98 @@ export function ProjectRoutinesModal({ projectId, opened, onClose }: ProjectRout
 						<Text size="sm" fw={600} c="dimmed" tt="uppercase">
 							{ts(`routineCategory.${category}`, category)}
 						</Text>
-						{routines.map((routine) => (
-							<Group key={routine.id} justify="space-between" wrap="nowrap" gap="sm">
-								<Stack gap={2} style={{ minWidth: 0, flex: 1 }}>
-									<Group gap="xs" wrap="nowrap">
-										<Badge
-											size="xs"
-											variant="light"
-											color={routine.type === "command" ? "indigo" : "teal"}
-										>
-											{ts(`routineType.${routine.type}`)}
-										</Badge>
-										<Text size="sm" fw={500} truncate>
-											{routine.type === "command" ? `/${routine.name}` : routine.name}
-										</Text>
-										{!routine.globalEnabled && routine.override === "global" && (
-											<Badge size="xs" variant="outline" color="gray">
-												{ts("routineGlobalOff")}
+						{routines.map((routine) => {
+							// Tool routines get the three-position mode plus "follow global"; command
+							// and skill routines keep the original tri-state on/off.
+							const isTool = routine.type === "tool";
+							const modeOverride =
+								routine.modeOverride ??
+								(routine.override === "global"
+									? "global"
+									: routine.override === "enabled"
+										? "resident"
+										: "manual");
+							const globalMode: ToolRoutineMode =
+								routine.globalMode ?? (routine.globalEnabled ? "resident" : "manual");
+							return (
+								<Group key={routine.id} justify="space-between" wrap="nowrap" gap="sm">
+									<Stack gap={2} style={{ minWidth: 0, flex: 1 }}>
+										<Group gap="xs" wrap="nowrap">
+											<Badge
+												size="xs"
+												variant="light"
+												color={routine.type === "command" ? "indigo" : "teal"}
+											>
+												{ts(`routineType.${routine.type}`)}
 											</Badge>
+											<Text size="sm" fw={500} truncate>
+												{routine.type === "command" ? `/${routine.name}` : routine.name}
+											</Text>
+											{isTool && modeOverride === "global" ? (
+												<Badge size="xs" variant="outline" color="gray">
+													{ts("routineGlobalMode", {
+														mode: ts(`toolMode.${globalMode}`),
+													})}
+												</Badge>
+											) : (
+												!routine.globalEnabled &&
+												routine.override === "global" && (
+													<Badge size="xs" variant="outline" color="gray">
+														{ts("routineGlobalOff")}
+													</Badge>
+												)
+											)}
+										</Group>
+										<Text size="xs" c="dimmed" truncate>
+											{pickLocalizedValue(
+												{ en: routine.descriptionEn, "zh-CN": routine.descriptionZh },
+												locale,
+											)}
+										</Text>
+										{isTool && routine.mode === "auto" && (
+											<Text size="xs" c="yellow.6">
+												{ts("toolModeAutoPending")}
+											</Text>
 										)}
-									</Group>
-									<Text size="xs" c="dimmed" truncate>
-										{pickLocalizedValue(
-											{ en: routine.descriptionEn, "zh-CN": routine.descriptionZh },
-											locale,
-										)}
-									</Text>
-								</Stack>
-								<SegmentedControl
-									size="xs"
-									value={routine.override}
-									disabled={!routinesCapability.supported}
-									onChange={(val) => {
-										if (!routinesCapability.supported) return;
-										const action = routineOverrideToAction(val);
-										if (!action) return;
-										toggle.mutate({ id: routine.id, action });
-									}}
-									data={[
-										{ label: t("routineFollowGlobal"), value: "global" },
-										{ label: ts("routineEnabled"), value: "enabled" },
-										{ label: ts("routineDisabled"), value: "disabled" },
-									]}
-								/>
-							</Group>
-						))}
+									</Stack>
+									{isTool ? (
+										<SegmentedControl
+											size="xs"
+											value={modeOverride}
+											disabled={!routinesCapability.supported}
+											onChange={(val) => {
+												if (!routinesCapability.supported) return;
+												const next = normalizeToolRoutineModeOverride(val);
+												if (!next || next === modeOverride) return;
+												setToolMode.mutate({ id: routine.id, mode: next });
+											}}
+											data={PROJECT_TOOL_MODE_VALUES.map((value) => ({
+												value,
+												label:
+													value === "global" ? t("routineFollowGlobal") : ts(`toolMode.${value}`),
+											}))}
+										/>
+									) : (
+										<SegmentedControl
+											size="xs"
+											value={routine.override}
+											disabled={!routinesCapability.supported}
+											onChange={(val) => {
+												if (!routinesCapability.supported) return;
+												const action = routineOverrideToAction(val);
+												if (!action) return;
+												toggle.mutate({ id: routine.id, action });
+											}}
+											data={[
+												{ label: t("routineFollowGlobal"), value: "global" },
+												{ label: ts("routineEnabled"), value: "enabled" },
+												{ label: ts("routineDisabled"), value: "disabled" },
+											]}
+										/>
+									)}
+								</Group>
+							);
+						})}
 					</Stack>
 				))}
 			</Stack>

@@ -70,4 +70,55 @@ describe("db read worker module boundary", () => {
 			expect(bundled).not.toContain(symbol);
 		}
 	}, 60_000);
+
+	/**
+	 * The storage-scan port is a MAIN-THREAD abstraction, and it must stay on that side.
+	 *
+	 * Its SQLite adapter reaches `database-cleanup-service`, which imports `@server/db` — so the
+	 * moment the worker's graph touches the port it inherits the whole bootstrap the tests above
+	 * exist to keep out. The symbol checks would eventually catch that, but only as a confusing
+	 * failure about `ensureFts`; naming the port here makes the actual mistake ("the worker imported
+	 * the orchestration layer") legible at the point it is made.
+	 */
+	test("worker entry does not bundle the storage port or the cleanup service", async () => {
+		const build = await Bun.build({ entrypoints: [WORKER_ENTRY], target: "bun" });
+		expect(build.success).toBe(true);
+		const bundled = await build.outputs[0].text();
+
+		for (const symbol of [
+			"databaseStoragePort",
+			"sqliteDatabaseStoragePort",
+			"enforceReportLimits",
+			"runWithScanBudget",
+			"databaseCleanupService",
+			"scanDatabaseBreakdown",
+		]) {
+			expect(bundled, `worker entry must not bundle ${symbol}`).not.toContain(symbol);
+		}
+	}, 60_000);
+
+	/**
+	 * The port is dialect-free, so it must also be bootstrap-free.
+	 *
+	 * Asserted on the PORT rather than only on the adapter because the port is what a future
+	 * PostgreSQL implementation imports: if the contract module itself dragged in the SQLite
+	 * bootstrap, every backend would inherit it no matter how careful its own adapter was.
+	 */
+	test("the storage port carries neither the db bootstrap nor a driver", async () => {
+		const build = await Bun.build({
+			entrypoints: [join(ROOT, "server/services/storage/database-storage-port.ts")],
+			target: "bun",
+		});
+		expect(build.success).toBe(true);
+		const bundled = await build.outputs[0].text();
+
+		for (const symbol of FORBIDDEN_SYMBOLS) {
+			expect(bundled, `the port must not reach ${symbol}`).not.toContain(symbol);
+		}
+		expect(bundled).not.toContain("bun:sqlite");
+		expect(bundled).not.toContain("drizzle-orm");
+		// Guard against a vacuous pass: the bundle must actually contain the port's own code.
+		expect(bundled).toContain("enforceReportLimits");
+		expect(bundled).toContain("runWithScanBudget");
+	}, 60_000);
 });

@@ -32,6 +32,7 @@
  */
 
 import { isCommunicationTool } from "@shared/communication-tool";
+import { isPreferOpenTool } from "@shared/prefer-open-tool";
 import type { RenderSegment, ToolRunItem } from "../message/message-segments";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
 import { isReasoningBlock } from "./reasoning-segments";
@@ -142,6 +143,10 @@ export function isLatestSpecTasksToolItem(
  * out of the fold exactly like an active tool: it stays a standalone full card at
  * its original position. Omitted by the chunked path, which folds every completed
  * call as before.
+ *
+ * Prefer-open tools (AskUserQuestion) stay standalone at every LOD: their
+ * options/form is operational content the reader must see or answer, not activity
+ * noise to re-open via a drill-down.
  */
 export function groupToolRunItemsForLod(
 	items: ToolRunItem[],
@@ -163,6 +168,7 @@ export function groupToolRunItemsForLod(
 			isCommunicationTool(item.tc) ||
 			item.isSubagent ||
 			isActiveToolItem(item) ||
+			isPreferOpenTool(item.tc) ||
 			isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)
 		) {
 			flushFolded();
@@ -244,12 +250,19 @@ function splitMessageSegmentForActivity(
  *  - subagent calls, whose task details stay visible at every LOD;
  *  - a tool blocked on a permission decision (its approve/deny form has nowhere
  *    else to live — see `isPermissionAwaitingToolItem`);
+ *  - prefer-open tools (AskUserQuestion), whose options/form must stay on screen
+ *    at low LOD and default-expand without a drill-down;
  *  - the most recent spec://tasks.json call, when the caller passes its tool-use
  *    id via `keepToolUseIds` (the vlist pins that card expanded at every LOD —
  *    the task board is the narrator's live working state).
  */
 function isKeptToolItem(item: ToolRunItem, keepToolUseIds?: ReadonlySet<string>): boolean {
-	if (item.isSubagent || isCommunicationTool(item.tc) || isPermissionAwaitingToolItem(item)) {
+	if (
+		item.isSubagent ||
+		isCommunicationTool(item.tc) ||
+		isPermissionAwaitingToolItem(item) ||
+		isPreferOpenTool(item.tc)
+	) {
 		return true;
 	}
 	const toolUseId = item.tc.toolUseId;

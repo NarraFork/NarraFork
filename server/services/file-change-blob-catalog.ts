@@ -781,3 +781,34 @@ function generationMismatch(): FileChangeBlobCatalogError {
 function fail(code: FileChangeBlobCatalogErrorCode, message: string): FileChangeBlobCatalogError {
 	return new FileChangeBlobCatalogError(code, message);
 }
+
+/**
+ * The dialect-free core of the blob catalog, exported for the PostgreSQL sibling
+ * (`postgres-file-change-blob-catalog.ts`) — and nothing else.
+ *
+ * Everything here is pure validation, key construction or counter arithmetic: no
+ * SQL fragment, no drizzle object, no driver shape. The pieces that DO carry a
+ * dialect (`PRAGMA busy_timeout`, the sync `.get()/.run()/.all()` chaining, the
+ * `immediate` transaction behavior) stay private above; the PG store rewrites
+ * those against its own schema. Exporting the pure half is what lets the two
+ * backends share the section CONTENT rather than diverging copies of it.
+ */
+export const blobCatalogInternals = {
+	blobValues,
+	checkBlob,
+	checkAdoptable,
+	checkOutcome,
+	validateRelease,
+	validateRef,
+	assertPlainFields,
+	sameRelease,
+	storageKey,
+	validateToken,
+	checkSignal,
+	assertKey,
+	assertNumber,
+	nextGeneration,
+	now,
+	generationMismatch,
+	fail,
+};

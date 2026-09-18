@@ -342,6 +342,9 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				oauthClientSecret: p.oauthClientSecret,
 				oauthDeviceId: p.oauthDeviceId,
 				proxy: p.proxy,
+				egressMode: p.egressMode,
+				egressProxyUrl: p.egressProxyUrl,
+				egressAllowDirectFallback: p.egressAllowDirectFallback,
 			}));
 
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

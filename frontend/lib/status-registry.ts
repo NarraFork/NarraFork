@@ -157,7 +157,8 @@ export type NarratorSubstatus =
 	| "planning"
 	| "retrying"
 	| "queued"
-	| "model_unavailable";
+	| "model_unavailable"
+	| "quota_exhausted";
 
 const narratorSubstatusMap: StatusMap<NarratorSubstatus> = {
 	/**
@@ -224,6 +225,20 @@ const narratorSubstatusMap: StatusMap<NarratorSubstatus> = {
 		accentShade: 5,
 		solidAccent: true,
 	},
+	/*
+	 * Parked until an exhausted Kimi quota window resets. Same reasoning as
+	 * `model_unavailable` above — the machine is waiting, the user has nothing to
+	 * unblock — and deliberately the same palette, because the two are one situation
+	 * (a self-recovering block) seen from two causes. Only the label differs, so a
+	 * reader can tell "the model is out" from "the allowance is spent".
+	 */
+	quota_exhausted: {
+		color: "slate",
+		icon: "◉",
+		i18nKey: "status.narratorQuotaExhausted",
+		accentShade: 5,
+		solidAccent: true,
+	},
 };
 
 /**
@@ -243,8 +258,11 @@ export function getEffectiveNarratorDisplay(status: string, substatus?: string[]
 			"retrying",
 			// The actual reason the turn is stalled, so it outranks secondary
 			// bookkeeping tags (compacting/queued) but yields to error/retrying,
-			// which describe a more specific failure.
+			// which describe a more specific failure. `quota_exhausted` sits beside
+			// `model_unavailable` for the same reason: both name why the turn cannot
+			// proceed.
 			"model_unavailable",
+			"quota_exhausted",
 			"compacting",
 			"background_compacting",
 			"suspended",

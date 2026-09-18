@@ -407,14 +407,16 @@ async function services(signal: AbortSignal) {
 	return cached;
 }
 
-/** Authenticated entrypoints only. No route accepts a caller-provided owner, project,
- * manifest proof or raw digest, and even metadata GETs recheck write authorization. */
+async function prepareLocalRevertPlanCore(request: RevertPlannerRequest & { signal: AbortSignal }) {
+	const { planner } = await services(request.signal);
+	return planner.prepare({ ...request, signal: request.signal });
+}
+
 export async function prepareLocalRevertPlan(request: RevertPlannerRequest) {
 	const signal = request.signal ?? AbortSignal.timeout(FILE_CHANGE_LIMITS.planLifetimeMs);
 	try {
 		await access.owner(request.principal, request.narratorId, signal);
-		const { planner } = await services(signal);
-		return await planner.prepare({ ...request, signal });
+		return await prepareLocalRevertPlanCore({ ...request, signal });
 	} catch (error) {
 		if (signal.aborted)
 			throw new AppError(
@@ -478,6 +480,8 @@ export async function prepareLocalRevertAction(
 ) {
 	await access.owner(principal, narratorId, signal);
 	try {
+		const { assertBashActivityProtectionReady } = await import("../lib/agent/tools/bash");
+		assertBashActivityProtectionReady();
 		const narrator = db
 			.select({ type: narrators.type, messageVersion: narrators.messageVersion })
 			.from(narrators)
@@ -489,8 +493,6 @@ export async function prepareLocalRevertAction(
 				"UNSUPPORTED_TARGET",
 				"This action requires a local POSIX primary narrator",
 			);
-		const { assertBashActivityProtectionReady } = await import("../lib/agent/tools/bash");
-		assertBashActivityProtectionReady();
 		let selector: RevertPlannerRequest["selector"];
 		let kind: RevertPlannerRequest["kind"];
 		if (input.action === "revert_files") {
@@ -572,7 +574,7 @@ export async function prepareLocalRevertAction(
 				selector = { kind: "tool_calls", toolCallIds: [tools[0].id] };
 			}
 		}
-		const result = await prepareLocalRevertPlan({
+		const result = await prepareLocalRevertPlanCore({
 			principal,
 			narratorId,
 			expectedMessageVersion: narrator.messageVersion,
@@ -622,20 +624,27 @@ export async function applyLocalRevertPlan(
 		throw new RevertPlannerError("ACTION_MISMATCH", "Confirmed plan changed");
 	if (plan.status === "prepared" && plan.expired)
 		throw new RevertPlannerError("EXPIRED", "Confirmed plan expired; load a fresh preview");
-	await transactions.validateHttpAction({ principal, narratorId, planId, ...input, signal });
-	const admissionPlan = plans.getSummary(owner, planId);
-	if (admissionPlan.status === "prepared" && admissionPlan.expired)
-		throw new RevertPlannerError("EXPIRED", "Confirmed plan expired; load a fresh preview");
+	const expectedKind = {
+		revert_files: "revert",
+		rollback_to_block: "rollback_to_block",
+		delete_tool_block: "history_delete",
+	}[input.action];
+	if (plan.kind !== expectedKind)
+		throw new RevertPlannerError(
+			"ACTION_MISMATCH",
+			"Confirmed action does not match the prepared plan",
+		);
 	const { acquireNarratorRevertAdmission } = await import("./narrator-session");
 	const release =
-		admissionPlan.status === "prepared"
-			? await acquireNarratorRevertAdmission(narratorId, {
-					signal,
-					interrupt: input.action !== "revert_files",
-				})
+		plan.status === "prepared"
+			? await acquireNarratorRevertAdmission(narratorId, { signal, interrupt: true })
 			: () => {};
 	let execution: ReturnType<RevertTransactionService["execute"]>;
 	try {
+		await transactions.validateHttpAction({ principal, narratorId, planId, ...input, signal });
+		const admissionPlan = plans.getSummary(owner, planId);
+		if (admissionPlan.status === "prepared" && admissionPlan.expired)
+			throw new RevertPlannerError("EXPIRED", "Confirmed plan expired; load a fresh preview");
 		execution = transactions.execute({ principal, narratorId, planId, ...input, signal });
 	} catch (error) {
 		release();

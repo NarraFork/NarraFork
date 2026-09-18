@@ -10,6 +10,7 @@ import {
 	PasswordInput,
 	Progress,
 	SegmentedControl,
+	Select,
 	SimpleGrid,
 	Stack,
 	Switch,
@@ -30,7 +31,7 @@ import {
 	IconTrash,
 	IconUser,
 } from "@tabler/icons-react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -65,6 +66,10 @@ export interface NUGProviderState {
 	oauthClientSecret?: string;
 	oauthDeviceId?: string;
 	proxy?: ProxyOverride;
+	/** Client-egress relay mode (docs/CODEX_CLIENT_RELAY.md). */
+	egressMode?: "nug" | "local-direct" | "local-proxy";
+	egressProxyUrl?: string;
+	egressAllowDirectFallback?: boolean;
 }
 
 type ProvidersUpdater = NUGProviderState[] | ((prev: NUGProviderState[]) => NUGProviderState[]);
@@ -857,6 +862,18 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 	const [refreshingProvider, setRefreshingProvider] = useState<string | null>(null);
 	const [loginModalProvider, setLoginModalProvider] = useState<string | null>(null);
 
+	// Client-egress relay status, polled while any provider uses a local egress
+	// mode (docs/CODEX_CLIENT_RELAY.md).
+	const anyLocalEgress = providers.some(
+		(p) => p.egressMode === "local-direct" || p.egressMode === "local-proxy",
+	);
+	const relayStatusQuery = useQuery({
+		queryKey: ["nug-relay-status"],
+		queryFn: () => api.nugGetRelayStatus(),
+		enabled: anyLocalEgress,
+		refetchInterval: 5000,
+	});
+
 	const handleRemoveProvider = useCallback(
 		(id: string) => {
 			onProvidersChange((prev) => prev.filter((p) => p.id !== id));
@@ -1093,6 +1110,63 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 								value={p.proxy}
 								onChange={(next) => updateProvider(p.id, { proxy: next })}
 							/>
+							{/* Client-egress relay (docs/CODEX_CLIENT_RELAY.md) */}
+							<Select
+								size="xs"
+								label={t("nugEgressMode")}
+								description={t("nugEgressModeDesc")}
+								data={[
+									{ value: "nug", label: t("nugEgressNug") },
+									{ value: "local-direct", label: t("nugEgressLocalDirect") },
+									{ value: "local-proxy", label: t("nugEgressLocalProxy") },
+								]}
+								value={p.egressMode ?? "nug"}
+								onChange={(v) =>
+									updateProvider(p.id, {
+										egressMode: (v ?? "nug") as NUGProviderState["egressMode"],
+									})
+								}
+							/>
+							{p.egressMode === "local-proxy" && (
+								<TextInput
+									size="xs"
+									label={t("nugEgressProxyUrl")}
+									placeholder={t("nugEgressProxyUrlPlaceholder")}
+									value={p.egressProxyUrl ?? ""}
+									onChange={(e) => updateProvider(p.id, { egressProxyUrl: e.currentTarget.value })}
+								/>
+							)}
+							{(p.egressMode === "local-direct" || p.egressMode === "local-proxy") && (
+								<Group gap="xs" justify="space-between">
+									<Switch
+										size="xs"
+										label={t("nugEgressAllowFallback")}
+										checked={p.egressAllowDirectFallback ?? false}
+										onChange={(e) =>
+											updateProvider(p.id, {
+												egressAllowDirectFallback: e.currentTarget.checked,
+											})
+										}
+									/>
+									{(() => {
+										const status = relayStatusQuery.data?.[p.id]?.status;
+										if (!status || status === "disabled") return null;
+										const color =
+											status === "online" ? "green" : status === "connecting" ? "yellow" : "red";
+										const labelKey =
+											status === "online"
+												? "nugEgressStatusOnline"
+												: status === "connecting"
+													? "nugEgressStatusConnecting"
+													: "nugEgressStatusOffline";
+										return (
+											<Badge size="xs" variant="light" color={color}>
+												{t(labelKey)}
+											</Badge>
+										);
+									})()}
+								</Group>
+							)}
 							<Group gap="xs" align="flex-end">
 								<PasswordInput
 									size="xs"

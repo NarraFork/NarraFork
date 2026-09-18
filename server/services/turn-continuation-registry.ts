@@ -190,7 +190,8 @@ export const CONTINUATION_SOURCES: readonly ContinuationSource[] = [
 	},
 	{
 		id: "model-unavailable",
-		summary: "The NUG model's credential pool is disabled; park on the availability poller.",
+		summary:
+			"The provider is blocked but self-recovering: NUG credential pool disabled, or Kimi quota exhausted. Park on the availability poller or the published reset instant.",
 		outcome: "suspend",
 		mutexGroup: "request-refused",
 		dispositions: {

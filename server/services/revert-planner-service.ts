@@ -1,3 +1,20 @@
+/**
+ * CAPABILITY BOUNDARY: this module is SQLite-only by design, and that is a
+ * deliberate capability decision, not unfinished porting.
+ *
+ * The planner's publication is fenced by the same connection-scoped stamp family
+ * (`total_changes()` + `PRAGMA data_version`) that rejects any interleaved write
+ * between the bounded scans and the durable plan pin, and it drives the raw
+ * `$client` handle for them.
+ *
+ * THE PG ALTERNATIVE (for whoever ports planning): the stores it publishes INTO
+ * already have PG counterparts (`postgres-revert-plan-store.ts` for the plan pin,
+ * `postgres-file-change-blob-catalog.ts` for the blob publication,
+ * `postgres-file-change-evidence-store.ts` for evidence). A PG planner runs its
+ * scans under `REPEATABLE READ` — the stronger form of the stamp's "no
+ * intervening write" — and pins through those stores; the stamp idiom itself
+ * must not be translated.
+ */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";

@@ -226,7 +226,15 @@ describe("M0 complete operation coverage", () => {
 				capture: "before",
 			},
 		);
-		await expectRefused(f, "incomplete_coverage");
+		expect(await previewNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
+			available: true,
+			reason: "nothing_owned",
+		});
+		expect(await revertNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
+			reverted: false,
+			fileCount: 0,
+			failures: [],
+		});
 		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("partial\n");
 	});
 
@@ -238,7 +246,15 @@ describe("M0 complete operation coverage", () => {
 			isBackground: true,
 		});
 		writeFileSync(join(f.repo, "a.txt"), "written after tool result\n");
-		await expectRefused(f, "incomplete_coverage");
+		expect(await previewNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
+			available: true,
+			reason: "nothing_owned",
+		});
+		expect(await revertNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
+			reverted: false,
+			fileCount: 0,
+			failures: [],
+		});
 		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("written after tool result\n");
 	});
 
@@ -418,33 +434,45 @@ describe("M0 complete operation coverage", () => {
 		await expectRefused(f, "window_too_large");
 	});
 
-	test("a leftover assistant without tool calls still refuses a mixed window", async () => {
+	test("content-only assistant and provider-specific injection cards do not add coverage blockers", async () => {
 		const f = await fixture();
 		writeFileSync(join(f.repo, "a.txt"), "base\n");
 		const write = await call(f, () => writeFileSync(join(f.repo, "a.txt"), "changed\n"));
 		const now = new Date().toISOString();
-		await db.insert(narratorMessages).values({
-			id: "assistant-gap",
-			narratorId: f.narratorId,
-			role: "assistant",
-			contentJson: [{ type: "text", text: "no recorded calls" }],
-			createdAt: now,
-		});
-		await db.insert(narratorMessageRefs).values({
-			id: generateId(),
-			narratorId: f.narratorId,
-			messageId: "assistant-gap",
-			seq: 2,
-		});
-		await expectRefused(f, "incomplete_coverage");
+		await db.insert(narratorMessages).values([
+			{
+				id: "assistant-gap",
+				narratorId: f.narratorId,
+				role: "assistant",
+				contentJson: [{ type: "text", text: "no recorded calls" }],
+				createdAt: now,
+			},
+			{
+				id: "future-injection",
+				narratorId: f.narratorId,
+				role: "assistant",
+				contentJson: [{ type: "system_injection", source: "future-provider" }],
+				createdAt: now,
+			},
+		]);
+		await db.insert(narratorMessageRefs).values([
+			{ id: generateId(), narratorId: f.narratorId, messageId: "assistant-gap", seq: 2 },
+			{ id: generateId(), narratorId: f.narratorId, messageId: "future-injection", seq: 3 },
+		]);
+		await expectRefused(f, "legacy_unverified");
 		expect(
-			(await revertNarratorScopedForMessages(f.narratorId, [write.messageId, "assistant-gap"]))
-				.failures[0]?.message,
-		).toContain("incomplete_coverage");
+			(
+				await revertNarratorScopedForMessages(f.narratorId, [
+					write.messageId,
+					"assistant-gap",
+					"future-injection",
+				])
+			).failures[0]?.message,
+		).toContain("legacy_unverified");
 		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("changed\n");
 	});
 
-	test("an assistant row without tool calls is still unknown coverage", async () => {
+	test("a content-only assistant row is an empty rollback window", async () => {
 		const f = await fixture();
 		const now = new Date().toISOString();
 		await db.insert(narratorMessages).values({
@@ -460,7 +488,15 @@ describe("M0 complete operation coverage", () => {
 			messageId: "a1",
 			seq: 1,
 		});
-		await expectRefused(f, "incomplete_coverage");
+		expect(await previewNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
+			available: true,
+			reason: "nothing_owned",
+		});
+		expect(await revertNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
+			reverted: false,
+			fileCount: 0,
+			failures: [],
+		});
 	});
 
 	test("the operation cap includes unsuccessful calls with no hashes", async () => {
@@ -666,13 +702,21 @@ describe("M0 selector and history safety", () => {
 		expect(result.failures[0]?.message).toContain("incomplete_coverage");
 	});
 
-	test("an unknown plugin call is not proof of no disk mutations", async () => {
+	test("an unknown plugin call is ignored by file rollback coverage", async () => {
 		const f = await fixture();
 		await call(f, () => writeFileSync(join(f.repo, "a.txt"), "plugin\n"), {
 			toolName: "plugin-write",
 			capture: "none",
 		});
-		await expectRefused(f, "incomplete_coverage");
+		expect(await previewNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
+			available: true,
+			reason: "nothing_owned",
+		});
+		expect(await revertNarratorScopedFromSeq(f.narratorId, 1)).toMatchObject({
+			reverted: false,
+			fileCount: 0,
+			failures: [],
+		});
 		expect(readFileSync(join(f.repo, "a.txt"), "utf8")).toBe("plugin\n");
 	});
 

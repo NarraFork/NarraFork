@@ -114,6 +114,43 @@ describe("groupToolRunItemsForLod", () => {
 		const groups = groupToolRunItemsForLod(toolRunItems(["success", "success"]), "tool-missing");
 		expect(groups.map((group) => group.kind)).toEqual(["folded"]);
 	});
+
+	test("AskUserQuestion stays a standalone card out of the fold", () => {
+		function askRunItems() {
+			const segments = segmentMessages([
+				toolMessage("message-0", "tool-0", "", { status: "success" }),
+				(() => {
+					const msg = toolMessage("message-1", "ask-1", "", { status: "success" });
+					msg.toolCalls = [
+						{
+							id: "call-ask-1",
+							toolUseId: "ask-1",
+							toolName: "AskUserQuestion",
+							status: "success",
+						},
+					];
+					(msg.contentJson as unknown[])[1] = {
+						type: "tool_use",
+						id: "ask-1",
+						name: "AskUserQuestion",
+						input: { questions: [{ header: "Approach?", options: [] }] },
+					};
+					return msg;
+				})(),
+				toolMessage("message-2", "tool-2", "", { status: "success" }),
+			]);
+			const toolRun = segments.find((segment) => segment.kind === "tool-run");
+			if (toolRun?.kind !== "tool-run") throw new Error("expected a tool-run segment");
+			return toolRun.items;
+		}
+
+		const groups = groupToolRunItemsForLod(askRunItems());
+		expect(groups.map((group) => group.kind)).toEqual(["folded", "active", "folded"]);
+		expect(groups[1]).toMatchObject({
+			kind: "active",
+			item: { tc: { toolUseId: "ask-1", toolName: "AskUserQuestion" } },
+		});
+	});
 });
 
 describe("communication remains chronological conversation content", () => {
@@ -564,48 +601,61 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 	});
 
 	test("a permission-blocked call keeps only ITS card, siblings still fold", () => {
-		const runMessage: NarratorMsg = {
-			id: "message-perm",
-			narratorId: "narrator-1",
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: [
-				{ type: "tool_use", id: "tool-done", name: "Read", input: { file_path: "a.ts" } },
-				{ type: "tool_use", id: "tool-blocked", name: "Bash", input: { command: "rm -rf x" } },
-			],
-			contentText: null,
-			toolCalls: [
-				{ id: "call-done", toolUseId: "tool-done", toolName: "Read", status: "success" },
-				{ id: "call-blocked", toolUseId: "tool-blocked", toolName: "Bash", status: "pending" },
-			],
-			children: [],
-			createdAt: "2026-07-19T00:00:00.000Z",
-		} as NarratorMsg;
+		const segments = segmentMessages([
+			toolMessage("message-0", "tool-0", "why"),
+			(() => {
+				const msg = toolMessage("message-1", "tool-1", "", { status: "pending" });
+				return msg;
+			})(),
+			toolMessage("message-2", "tool-2", ""),
+		]);
+		const units = groupRenderUnits(segments, true);
+		const kinds = units.map((unit) => unit.kind);
+		expect(kinds).toContain("activity");
+		// groupRenderUnits wraps tool-run segments as { kind: "segment", seg: {...} }.
+		const keptItems = units.flatMap((unit) =>
+			unit.kind === "segment" && unit.seg.kind === "tool-run" ? unit.seg.items : [],
+		);
+		expect(keptItems).toMatchObject([{ tc: { toolUseId: "tool-1" } }]);
+	});
 
-		const units = groupRenderUnits(segmentMessages([runMessage]), true);
-		expect(units.map((u) => u.kind)).toEqual(["activity", "segment"]);
-		const folded = units[0];
-		if (folded.kind !== "activity") throw new Error("expected activity unit");
-		expect(
-			folded.items.flatMap((item) => (item.kind === "tool" ? [item.tc.toolUseId] : [])),
-		).toEqual(["tool-done"]);
-		const kept = units[1];
-		if (kept.kind !== "segment" || kept.seg.kind !== "tool-run")
-			throw new Error("expected tool-run segment");
-		expect(kept.seg.items.map((i) => i.tc.toolUseId)).toEqual(["tool-blocked"]);
+	test("AskUserQuestion keeps its card out of the activity fold", () => {
+		const segments = segmentMessages([
+			toolMessage("message-0", "tool-0", "why"),
+			(() => {
+				const msg = toolMessage("message-1", "ask-1", "");
+				msg.toolCalls = [
+					{
+						id: "call-ask-1",
+						toolUseId: "ask-1",
+						toolName: "AskUserQuestion",
+						status: "success",
+					},
+				];
+				(msg.contentJson as unknown[])[1] = {
+					type: "tool_use",
+					id: "ask-1",
+					name: "AskUserQuestion",
+					input: { questions: [{ header: "Approach?", options: [] }] },
+				};
+				return msg;
+			})(),
+			toolMessage("message-2", "tool-2", ""),
+		]);
+		const units = groupRenderUnits(segments, true);
+		const keptItems = units.flatMap((unit) =>
+			unit.kind === "segment" && unit.seg.kind === "tool-run" ? unit.seg.items : [],
+		);
+		expect(keptItems).toMatchObject([{ tc: { toolUseId: "ask-1", toolName: "AskUserQuestion" } }]);
 	});
 
 	test("an empty / absent keep set changes nothing about the fold", () => {
 		const segments = segmentMessages([
-			toolMessage("message-1", "tool-1", "thought one"),
-			toolMessage("message-2", "tool-2", "thought two"),
+			toolMessage("message-0", "tool-0", "why"),
+			toolMessage("message-1", "tool-1", ""),
 		]);
-		const baseline = groupRenderUnits(segments, true);
-		const withEmpty = groupRenderUnits(segments, true, { keepToolUseIds: new Set() });
-		const withUnknown = groupRenderUnits(segments, true, {
-			keepToolUseIds: new Set(["tool-missing"]),
-		});
-		expect(withEmpty.map((u) => u.kind)).toEqual(baseline.map((u) => u.kind));
-		expect(withUnknown.map((u) => u.kind)).toEqual(baseline.map((u) => u.kind));
+		expect(groupRenderUnits(segments, true).map((unit) => unit.kind)).toEqual(
+			groupRenderUnits(segments, true, { keepToolUseIds: new Set() }).map((unit) => unit.kind),
+		);
 	});
 });

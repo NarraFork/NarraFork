@@ -100,29 +100,29 @@ afterEach(() => {
 });
 
 describe("searchNarratorMessages", () => {
-	it("returns only messages on the given narrator's timeline", () => {
+	it("returns only messages on the given narrator's timeline", async () => {
 		seedNarrator("n1");
 		seedNarrator("n2");
 		insertMessage({ id: "m1", narratorId: "n1", seq: 1, contentText: "alpha banana result" });
 		insertMessage({ id: "m2", narratorId: "n2", seq: 1, contentText: "alpha banana elsewhere" });
 
-		const results = searchService.searchNarratorMessages("n1", "banana");
+		const results = await searchService.searchNarratorMessages("n1", "banana");
 		expect(results.map((r) => r.messageId)).toEqual(["m1"]);
 		expect(results[0].seq).toBe(1);
 	});
 
-	it("orders results newest-first by seq and carries the jump seq", () => {
+	it("orders results newest-first by seq and carries the jump seq", async () => {
 		seedNarrator("n1");
 		insertMessage({ id: "m1", narratorId: "n1", seq: 1, contentText: "citrus early hit" });
 		insertMessage({ id: "m2", narratorId: "n1", seq: 5, contentText: "citrus later hit" });
 		insertMessage({ id: "m3", narratorId: "n1", seq: 3, contentText: "citrus middle hit" });
 
-		const results = searchService.searchNarratorMessages("n1", "citrus");
+		const results = await searchService.searchNarratorMessages("n1", "citrus");
 		expect(results.map((r) => r.seq)).toEqual([5, 3, 1]);
 		expect(results.map((r) => r.messageId)).toEqual(["m2", "m3", "m1"]);
 	});
 
-	it("excludes segment-compacted (hidden) refs", () => {
+	it("excludes segment-compacted (hidden) refs", async () => {
 		seedNarrator("n1");
 		insertMessage({ id: "m1", narratorId: "n1", seq: 1, contentText: "durian visible hit" });
 		insertMessage({
@@ -133,31 +133,31 @@ describe("searchNarratorMessages", () => {
 			segmentCompactId: "compact-1",
 		});
 
-		const results = searchService.searchNarratorMessages("n1", "durian");
+		const results = await searchService.searchNarratorMessages("n1", "durian");
 		expect(results.map((r) => r.messageId)).toEqual(["m1"]);
 	});
 
-	it("supports short (2-char) queries via the LIKE fallback path", () => {
+	it("supports short (2-char) queries via the LIKE fallback path", async () => {
 		seedNarrator("n1");
 		insertMessage({ id: "m1", narratorId: "n1", seq: 1, contentText: "the QA note" });
 		insertMessage({ id: "m2", narratorId: "n1", seq: 2, contentText: "unrelated text" });
 
-		const results = searchService.searchNarratorMessages("n1", "QA");
+		const results = await searchService.searchNarratorMessages("n1", "QA");
 		expect(results.map((r) => r.messageId)).toEqual(["m1"]);
 	});
 
-	it("returns empty for a blank query", () => {
+	it("returns empty for a blank query", async () => {
 		seedNarrator("n1");
 		insertMessage({ id: "m1", narratorId: "n1", seq: 1, contentText: "anything" });
-		expect(searchService.searchNarratorMessages("n1", "   ")).toEqual([]);
+		expect(await searchService.searchNarratorMessages("n1", "   ")).toEqual([]);
 	});
 
-	it("caps the result count at the hard limit", () => {
+	it("caps the result count at the hard limit", async () => {
 		seedNarrator("n1");
 		for (let i = 0; i < 10; i++) {
 			insertMessage({ id: `m${i}`, narratorId: "n1", seq: i + 1, contentText: `elderberry ${i}` });
 		}
-		const results = searchService.searchNarratorMessages("n1", "elderberry", 3);
+		const results = await searchService.searchNarratorMessages("n1", "elderberry", 3);
 		expect(results.length).toBe(3);
 		// Newest-first: seq 10, 9, 8.
 		expect(results.map((r) => r.seq)).toEqual([10, 9, 8]);
@@ -172,7 +172,7 @@ describe("searchNarratorMessages", () => {
  * diverged belongs to a different timeline.
  */
 describe("searchNarratorMessages across a lazy fork's ancestry", () => {
-	it("finds ancestor history the child has not materialized", () => {
+	it("finds ancestor history the child has not materialized", async () => {
 		seedNarrator("parent");
 		seedNarrator("child");
 		insertMessage({
@@ -184,16 +184,16 @@ describe("searchNarratorMessages across a lazy fork's ancestry", () => {
 		// The child inherited from seq 5 onward; seq 1 lives only in the parent.
 		insertMessage({ id: "new", narratorId: "child", seq: 5, contentText: "kumquat recent" });
 
-		const withoutLineage = searchService.searchNarratorMessages("child", "kumquat");
+		const withoutLineage = await searchService.searchNarratorMessages("child", "kumquat");
 		expect(withoutLineage.map((r) => r.messageId)).toEqual(["new"]);
 
-		const withLineage = searchService.searchNarratorMessages("child", "kumquat", 60, [
+		const withLineage = await searchService.searchNarratorMessages("child", "kumquat", 60, [
 			{ narratorId: "parent", upperBoundSeq: 5 },
 		]);
 		expect(withLineage.map((r) => r.messageId).sort()).toEqual(["new", "old"]);
 	});
 
-	it("excludes ancestor messages at or after the inherited bound", () => {
+	it("excludes ancestor messages at or after the inherited bound", async () => {
 		seedNarrator("parent");
 		seedNarrator("child");
 		insertMessage({ id: "old", narratorId: "parent", seq: 1, contentText: "lychee before fork" });
@@ -206,7 +206,7 @@ describe("searchNarratorMessages across a lazy fork's ancestry", () => {
 		});
 		insertMessage({ id: "own", narratorId: "child", seq: 5, contentText: "lychee own" });
 
-		const results = searchService.searchNarratorMessages("child", "lychee", 60, [
+		const results = await searchService.searchNarratorMessages("child", "lychee", 60, [
 			{ narratorId: "parent", upperBoundSeq: 5 },
 		]);
 		const ids = results.map((r) => r.messageId);
@@ -215,13 +215,13 @@ describe("searchNarratorMessages across a lazy fork's ancestry", () => {
 		expect(ids).not.toContain("divergent");
 	});
 
-	it("ignores a scope whose seq bound is not a finite number", () => {
+	it("ignores a scope whose seq bound is not a finite number", async () => {
 		seedNarrator("parent");
 		seedNarrator("child");
 		insertMessage({ id: "old", narratorId: "parent", seq: 1, contentText: "papaya old" });
 		insertMessage({ id: "own", narratorId: "child", seq: 5, contentText: "papaya own" });
 
-		const results = searchService.searchNarratorMessages("child", "papaya", 60, [
+		const results = await searchService.searchNarratorMessages("child", "papaya", 60, [
 			{ narratorId: "parent", upperBoundSeq: Number.POSITIVE_INFINITY },
 		]);
 		// A non-finite bound is dropped rather than interpolated, so the search can only

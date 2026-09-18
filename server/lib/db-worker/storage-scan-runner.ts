@@ -104,9 +104,11 @@ export function shardTableNames(tableNames: string[], shardCount: number): strin
 function toTableSummary(
 	row: StorageScanTablesResult["tables"][number],
 ): DatabaseStorageTableSummary {
-	// `readFailed` is produced by measureTable in the worker and survives structured clone, but the
-	// wire type in protocol.ts does not declare it yet, so read it defensively.
-	const readFailed = (row as { readFailed?: boolean }).readFailed === true;
+	// `readFailed` is now part of the wire type (see protocol.ts), so it is read directly rather
+	// than through a cast. Kept as an explicit `=== true` comparison because the field is optional
+	// on the wire: absent means "measured fine", and only a literal `true` means the accompanying
+	// zeroes are UNKNOWNs rather than an empty table.
+	const readFailed = row.readFailed === true;
 	return {
 		name: row.name,
 		category: row.category as DatabaseStorageCategoryKey,

@@ -58,9 +58,9 @@ const messages: Messages = {
 			"注意：工具结果里的 TODO 提醒块是临时信息。请忽略消息历史中的 <todo_reminder> 块；只有在待办状态相关时，才使用下面的最新 TODO 列表。",
 	},
 	"tool.compactContextOverflowHint": {
-		en: "EMERGENCY NOTICE: the context window overflowed and had to be force-compacted. Avoid using the Read tool's read-all mode (limit=-1) or reading very large files/outputs unless strictly necessary — otherwise the context window may fill up again quickly.",
+		en: "EMERGENCY NOTICE: the context window overflowed and had to be force-compacted. Do not use the Read tool's read-all mode (limit=-1) for routine inspection. Prefer Grep plus small offset/limit pages; use read-all only when the user explicitly requires the complete file and its size is manageable.",
 		"zh-CN":
-			"紧急提示：上下文窗口已溢出并被强制压缩。请勿在非必要的时候使用 read_all（Read 工具 limit=-1 全量读取模式）或读取超大文件/输出，否则上下文窗口可能会再次快速占满。",
+			"紧急提示：上下文窗口已溢出并被强制压缩。请勿用 read_all（Read 工具 limit=-1 全量读取模式）做常规检查。优先使用 Grep 定位，再用较小的 offset/limit 分页；只有用户明确要求完整文件且文件大小可控时才使用全量模式。",
 	},
 	"tool.compactCurrentTodos": {
 		en: `<current_todos>

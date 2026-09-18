@@ -60,6 +60,52 @@ describe("substatus priority around model_unavailable", () => {
 	});
 });
 
+/**
+ * An exhausted quota window is the same situation as an unavailable model — the
+ * MACHINE is waiting, nothing is actionable — so it reuses the palette and the
+ * priority slot but must keep its own LABEL. One shared entry would render both
+ * causes as "waiting for model", which is wrong about what is being waited for.
+ */
+describe("quota_exhausted is a labelled sibling of model_unavailable", () => {
+	test("it names its own state", () => {
+		const display = getEffectiveNarratorDisplay("waiting", ["quota_exhausted"]);
+		expect(display.i18nKey).toBe("status.narratorQuotaExhausted");
+		expect(display.i18nKey).not.toBe(
+			getEffectiveNarratorDisplay("waiting", ["model_unavailable"]).i18nKey,
+		);
+	});
+
+	test("it reads as the same kind of wait (neutral, filled, no alert shape)", () => {
+		const display = getEffectiveNarratorDisplay("waiting", ["quota_exhausted"]);
+		const modelUnavailable = getEffectiveNarratorDisplay("waiting", ["model_unavailable"]);
+		expect(display.color).toBe(modelUnavailable.color);
+		expect(display.accentShade).toBe(modelUnavailable.accentShade);
+		expect(display.solidAccent).toBe(true);
+		expect(display.shape).toBeUndefined();
+		expect(display.color).not.toBe("yellow");
+	});
+
+	test("failures outrank it and secondary tags do not", () => {
+		expect(getEffectiveNarratorDisplay("waiting", ["quota_exhausted", "error"]).color).toBe("red");
+		expect(getEffectiveNarratorDisplay("waiting", ["quota_exhausted", "retrying"]).i18nKey).toBe(
+			"status.narratorRetrying",
+		);
+		for (const secondary of ["compacting", "background_compacting", "queued", "unread"]) {
+			expect(getEffectiveNarratorDisplay("waiting", [secondary, "quota_exhausted"]).i18nKey).toBe(
+				"status.narratorQuotaExhausted",
+			);
+		}
+	});
+
+	test("a model outage named alongside it wins, so the two can never disagree", () => {
+		// Both tags are written by the same suspension, so seeing them together means a
+		// stale tag survived; the outage is the earlier condition and stays on top.
+		expect(
+			getEffectiveNarratorDisplay("waiting", ["model_unavailable", "quota_exhausted"]).i18nKey,
+		).toBe("status.narratorModelUnavailable");
+	});
+});
+
 describe("accent helpers", () => {
 	test("a pinned accent shade produces Mantine shade shorthand", () => {
 		const display = getEffectiveNarratorDisplay("waiting", ["model_unavailable"]);
@@ -256,10 +302,11 @@ describe("status shapes separate states colour no longer can", () => {
 	});
 
 	test("states the user cannot act on carry NO shape", () => {
-		// `retrying` / `queued` / `model_unavailable` are all waiting-ish, but on the
-		// MACHINE. Drawing an alert on them would cry for attention that cannot be given —
-		// the same reasoning that already excludes them from the favicon and notifications.
-		for (const tag of ["retrying", "queued", "model_unavailable"]) {
+		// `retrying` / `queued` / `model_unavailable` / `quota_exhausted` are all
+		// waiting-ish, but on the MACHINE. Drawing an alert on them would cry for
+		// attention that cannot be given — the same reasoning that already excludes
+		// them from the favicon and notifications.
+		for (const tag of ["retrying", "queued", "model_unavailable", "quota_exhausted"]) {
 			expect(getEffectiveNarratorDisplay("waiting", [tag]).shape).toBeUndefined();
 		}
 		expect(getEffectiveNarratorDisplay("working").shape).toBeUndefined();

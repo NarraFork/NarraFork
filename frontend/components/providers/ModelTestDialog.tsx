@@ -110,6 +110,8 @@ function errorLines(error: ModelTestErrorDetails): string[] {
 		["code", error.code],
 		["errno", error.errno],
 		["status", error.status],
+		["url", error.responseUrl],
+		["content-type", error.contentType],
 		["reason", error.reason],
 		["syscall", error.syscall],
 		["hostname", error.hostname],
@@ -152,6 +154,25 @@ function ErrorDetailsView({
 				<Code block style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
 					{errorLines(error).join("\n")}
 				</Code>
+				{error.bodyPreview && (
+					<Stack gap={4}>
+						<Text size="xs" fw={500}>
+							{t("modelTestResponseBody")}
+						</Text>
+						{error.bodyTruncated && (
+							<Text size="xs" c="yellow">
+								{t("modelTestResponseBodyTruncated")}
+							</Text>
+						)}
+						{/* Rendered as monospace text, never as markup: an HTML error page is
+						    evidence to read, not a document to display. */}
+						<ScrollArea.Autosize mah={240}>
+							<Code block style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+								{error.bodyPreview}
+							</Code>
+						</ScrollArea.Autosize>
+					</Stack>
+				)}
 				{error.cause && depth < 3 && (
 					<ErrorDetailsView error={error.cause} t={t} depth={depth + 1} />
 				)}
@@ -198,6 +219,16 @@ function RequestAttemptView({ attempt, t }: { attempt: ModelTestRequestAttempt; 
 				<Code block style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
 					{attempt.url}
 				</Code>
+				{attempt.responseUrl && (
+					<Stack gap={2}>
+						<Text size="xs" c="yellow">
+							{t("modelTestRedirectedTo")}
+						</Text>
+						<Code block style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+							{attempt.responseUrl}
+						</Code>
+					</Stack>
+				)}
 				<Group gap="md" wrap="wrap">
 					<Text size="xs" c="dimmed">
 						{t("modelTestRoute")}: {t(`modelTestRoute_${attempt.route ?? "direct"}`)}

@@ -2186,3 +2186,138 @@ describe("exact pending mutation capability", () => {
 		});
 	});
 });
+
+describe("recovery barrier directionality", () => {
+	function addTree() {
+		const parent = addScope({ canonicalRoot: "/workspace" });
+		const child = addScope({ canonicalRoot: "/workspace/repo" });
+		const grandchild = addScope({ canonicalRoot: "/workspace/repo/sub" });
+		return { parent, child, grandchild };
+	}
+
+	test("write admission ignores a quarantined DESCENDANT scope but rollback still blocks", async () => {
+		const { parent, child } = addTree();
+		update({ status: "needs_verification" }, child);
+		// A single-file write rooted at the ancestor cannot touch the quarantined
+		// child's contents (roots are nearest existing parents), so it is admitted.
+		await coordinator.withWrite(request(parent), () => undefined);
+		expect(row(parent)?.status).toBe("active");
+		// Rollback rewrites whole subtrees and stays bidirectional.
+		await expect(coordinator.withRollback(request(parent), () => undefined)).rejects.toThrow(
+			errorCode("needs_verification"),
+		);
+		// Writes inside (or equal to) the quarantined root stay blocked.
+		const { grandchild } = { grandchild: addScope({ canonicalRoot: "/workspace/repo/sub" }) };
+		await expect(coordinator.withWrite(request(grandchild), () => undefined)).rejects.toThrow(
+			errorCode("needs_verification"),
+		);
+		await expect(coordinator.withWrite(request(child), () => undefined)).rejects.toThrow(
+			errorCode("needs_verification"),
+		);
+	});
+
+	test("observation stays bidirectional even for an ancestor scope", async () => {
+		const { parent, child } = addTree();
+		update({ status: "needs_verification" }, child);
+		expectCode(
+			() => coordinator.assertObservationCurrent(observation(parent)),
+			"needs_verification",
+		);
+	});
+
+	test("write admission ignores a descendant scope's unfinished durable lease", async () => {
+		const { parent, child } = addTree();
+		update(
+			{
+				activeLeaseId: "dead-lease",
+				activeLeaseEpoch: "dead-epoch",
+				activeLeaseStartedAt: "2026-09-07T00:00:00.000Z",
+				activeMutationCount: 1,
+			},
+			child,
+		);
+		await coordinator.withWrite(request(parent), () => undefined);
+		await expect(coordinator.withRollback(request(parent), () => undefined)).rejects.toThrow(
+			errorCode("needs_verification"),
+		);
+	});
+
+	test("quarantine error names the blocking scope root", async () => {
+		const { parent, child } = addTree();
+		update({ status: "needs_verification" }, child);
+		await expect(coordinator.withRollback(request(parent), () => undefined)).rejects.toThrow(
+			/\/workspace\/repo.*Settings → Storage/s,
+		);
+	});
+});
+
+describe("external scope barrier recovery", () => {
+	test("clears a quarantined scope with a dead lease, bumping fence and revision", () => {
+		update({
+			status: "needs_verification",
+			activeLeaseId: "dead-lease",
+			activeLeaseEpoch: "dead-epoch",
+			activeLeaseStartedAt: "2026-09-07T00:00:00.000Z",
+			activeMutationCount: 1,
+		});
+		const before = row();
+		const cleared = coordinator.recoverScopeBarrier(scope);
+		expect(cleared).toEqual({
+			revision: (before?.revision ?? 0) + 1,
+			fencingToken: (before?.fencingToken ?? 0) + 1,
+		});
+		expect(row()).toMatchObject({
+			status: "active",
+			activeLeaseId: null,
+			activeLeaseEpoch: null,
+			activeLeaseStartedAt: null,
+			activeMutationCount: 0,
+		});
+	});
+
+	test("clears a dead-epoch lease even when the crash left the status active", () => {
+		update({
+			activeLeaseId: "dead-lease",
+			activeLeaseEpoch: "dead-epoch",
+			activeLeaseStartedAt: "2026-09-07T00:00:00.000Z",
+			activeMutationCount: 1,
+		});
+		coordinator.recoverScopeBarrier(scope);
+		expect(row()).toMatchObject({ status: "active", activeLeaseId: null });
+	});
+
+	test("refuses a scope without a barrier and a lease of the live epoch", () => {
+		expectCode(() => coordinator.recoverScopeBarrier(scope), "invalid_input");
+		update({
+			activeLeaseId: "live-lease",
+			activeLeaseEpoch: coordinator.ownerEpoch(),
+			activeLeaseStartedAt: "2026-09-07T00:00:00.000Z",
+			activeMutationCount: 1,
+		});
+		expectCode(() => coordinator.recoverScopeBarrier(scope), "recovery_conflict");
+		expect(row()).toMatchObject({ activeLeaseId: "live-lease" });
+	});
+
+	test("refuses while an in-memory lease or activity covers the scope", async () => {
+		const held = await hold();
+		expectCode(() => coordinator.recoverScopeBarrier(scope), "recovery_conflict");
+		held.release();
+		await held.done;
+		const activity = coordinator.registerActivity(request());
+		expectCode(() => coordinator.recoverScopeBarrier(scope), "recovery_conflict");
+		coordinator.endActivity(activity);
+	});
+
+	test("a waiting writer is admitted after recovery clears the barrier", async () => {
+		update({
+			status: "needs_verification",
+			activeLeaseId: "dead-lease",
+			activeLeaseEpoch: "dead-epoch",
+			activeLeaseStartedAt: "2026-09-07T00:00:00.000Z",
+			activeMutationCount: 1,
+		});
+		coordinator.recoverScopeBarrier(scope);
+		await coordinator.withWrite(request(), () => undefined);
+		expect(row()?.status).toBe("active");
+	});
+});

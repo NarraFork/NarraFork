@@ -966,6 +966,33 @@ describe("action apply reauthorization and immutable admission", () => {
 		expect(history()).toBe(before);
 		expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
 	});
+	test("action preview does not interrupt live narrator work before confirmation", async () => {
+		const { path } = await fixture();
+		const active = startLiveWorkAfterPreview();
+		const plan = await actionPrepared("revert_files");
+		expect(active.abortController.signal.aborted).toBe(false);
+		expect(active.alive).toBe(true);
+		expect(plan.expectedFileCount).toBe(1);
+		expect(await readFile(path, "utf8")).toBe("new\n");
+	});
+	test("generic plan preview does not interrupt live narrator work before confirmation", async () => {
+		const { path } = await fixture();
+		const active = startLiveWorkAfterPreview();
+		const plan = await prepared();
+		expect(active.abortController.signal.aborted).toBe(false);
+		expect(active.alive).toBe(true);
+		expect(plan.expectedFileCount).toBe(1);
+		expect(await readFile(path, "utf8")).toBe("new\n");
+	});
+	test("valid apply interrupts live narrator work before executing the prepared plan", async () => {
+		const { path } = await fixture();
+		const plan = await actionPrepared("revert_files");
+		const active = startLiveWorkAfterPreview();
+		await committed(plan, "revert_files");
+		expect(active.abortController.signal.aborted).toBe(true);
+		expect(active.alive).toBe(false);
+		expect(await readFile(path, "utf8")).toBe("old\n");
+	});
 	test("hot-upgrade refusal is preserved by preview and cannot interrupt or apply a prepared plan", async () => {
 		const { path, call } = await fixture();
 		const plan = await actionPrepared("delete_tool_block", call.messageId, { blockIndex: 1 });
@@ -1126,7 +1153,6 @@ describe("action apply reauthorization and immutable admission", () => {
 
 describe("action unavailable evidence, actual failure outcomes and bounded requests", () => {
 	test.each([
-		["Bash", "local"],
 		["Write", "local"],
 		["Write", "unsupported-remote"],
 	] as const)("unjournaled %s on %s is unavailable without legacy or local fallback", async (name, device) => {
@@ -1144,6 +1170,16 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 			);
 		}
 		expect(await readFile(path, "utf8")).toBe("new\n");
+		expect(history()).toBe(before);
+	});
+	test("an unmeasured Bash in a rollback range does not block other file effects", async () => {
+		const { path } = await fixture();
+		unjournaledTool(path, "Bash");
+		const before = history();
+		const plan = await actionPrepared("revert_files");
+		expect(plan.expectedFileCount).toBe(1);
+		await committed(plan, "revert_files");
+		expect(await readFile(path, "utf8")).toBe("old\n");
 		expect(history()).toBe(before);
 	});
 	test("oversized message boundary is unavailable before parsing or returning its tool payload", async () => {

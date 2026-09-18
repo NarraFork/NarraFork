@@ -280,10 +280,16 @@ describe("read failures are not reported as empty tables", () => {
 		if (!table) throw new Error("fixture table missing");
 
 		// Baseline: an uncontended read reports real numbers and no failure flag.
+		//
+		// Asserted on `totalBytes`, not `approxContentBytes`: the latter is the APPROXIMATE mode's
+		// output and is legitimately 0 when the SQLite build provides `dbstat` (that path skips the
+		// extra `SUM(length(...))` scan because dbstat already has exact page sizes). dbstat presence
+		// is a property of the build — compiled in on Bun 1.4.2, absent from earlier ones — so a
+		// mode-specific assertion here pinned the runtime instead of the behaviour under test.
 		const healthy = measureTable(reader, table, context);
 		expect(healthy.readFailed).toBeUndefined();
 		expect(healthy.rowCount).toBe(50);
-		expect(healthy.approxContentBytes).toBeGreaterThan(0);
+		expect(healthy.totalBytes).toBeGreaterThan(0);
 
 		writer.run("BEGIN EXCLUSIVE");
 		writer.prepare("INSERT INTO narrator_messages VALUES (?, ?)").run("locking", "row");
@@ -364,7 +370,10 @@ describe("read failures are not reported as empty tables", () => {
 		const measured = measureTable(flaky, table, context);
 		expect(measured.readFailed).toBeUndefined();
 		expect(measured.rowCount).toBe(1);
-		expect(measured.approxContentBytes).toBeGreaterThan(0);
+		// `totalBytes` rather than `approxContentBytes`, for the same build-dependent reason as above:
+		// the approximate field is 0 by design in dbstat mode. The claim being made is "the retried
+		// read produced a real measurement", which the total carries in either mode.
+		expect(measured.totalBytes).toBeGreaterThan(0);
 		reader.close();
 	}, 30_000);
 
@@ -414,8 +423,12 @@ describe("read failures are not reported as empty tables", () => {
 		const startedAt = Date.now();
 		const measured = measureTable(broken, table, context);
 		expect(measured.readFailed).toBe(true);
-		// One attempt per query (count + bytes), with no backoff sleeping.
-		expect(attempts).toBe(2);
+		// One attempt per measurement query, with no backoff sleeping. HOW MANY queries there are is
+		// mode-dependent: the approximate path runs count + `SUM(length(...))`, while the dbstat path
+		// runs only the count (page sizes come from dbstat, so the content scan is skipped). Hard-coding
+		// 2 asserted the approximate mode rather than the no-retry rule, and broke on a Bun whose
+		// bundled SQLite gained dbstat. The rule itself is "attempted exactly once each, no sleeping".
+		expect(attempts).toBe(context.dbstat.supported ? 1 : 2);
 		expect(Date.now() - startedAt).toBeLessThan(200);
 		reader.close();
 	}, 30_000);

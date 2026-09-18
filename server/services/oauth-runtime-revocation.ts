@@ -38,7 +38,7 @@ export async function stopOAuthNarratorForAuthorizationLoss(
 					columns: { id: true, userId: true, oauthClientId: true },
 				})
 			: null;
-	clearBufferedMessages(narratorId);
+	await clearBufferedMessages(narratorId);
 	interruptManualBash(narratorId);
 	const interrupted = interruptNarrator(narratorId);
 	await backgroundTaskService.cancelRunningByParent(narratorId);

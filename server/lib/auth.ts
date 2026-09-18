@@ -4,11 +4,9 @@ import {
 	SESSION_TOKEN_TTL_SECONDS,
 	SESSION_VERSION_CLAIM,
 } from "@shared/session-auth";
-import { count, eq, sql } from "drizzle-orm";
 import { sign, verify } from "hono/jwt";
-import { db } from "../db";
-import { userPreferences, users } from "../db/schema";
-import { registrationCodeService } from "../services/registration-code-service";
+import { authSessionStore } from "../services/auth/store";
+import { registrationAccountStore as accountStore } from "../services/registration/store";
 import { authAttemptLimiter, fingerprintAuthIdentifier } from "./auth-attempt-limiter";
 import { randomAvatarColor } from "./avatar-colors";
 import { AppError, RateLimitError } from "./errors";
@@ -98,15 +96,12 @@ async function signSessionToken(
  *
  * Returns the new value so a caller that is also issuing a replacement token
  * (a self-service password change, say) can sign it against the bumped counter
- * instead of locking itself out.
+ * instead of locking itself out. The increment itself is one atomic statement
+ * owned by the session store — this layer holds no transaction handle and
+ * names no table, so a second backend implements the same capability.
  */
 export async function revokeUserSessions(userId: string): Promise<number> {
-	const [row] = await db
-		.update(users)
-		.set({ tokenVersion: sql`${users.tokenVersion} + 1` })
-		.where(eq(users.id, userId))
-		.returning({ tokenVersion: users.tokenVersion });
-	return row?.tokenVersion ?? 0;
+	return await authSessionStore.bumpTokenVersion(userId);
 }
 
 /**
@@ -175,82 +170,50 @@ export interface RegisterUserInput {
 export async function registerUser(input: RegisterUserInput) {
 	const { username, password, language } = input;
 	const code = input.code?.trim() || undefined;
-	const [{ value: userCount }] = await db.select({ value: count() }).from(users);
-	const isFirstUser = userCount === 0;
+	const isFirstUser = (await accountStore.countAccounts()) === 0;
 
 	if (!isFirstUser && !code && !settings.auth.registrationOpen) {
 		throw new AppError("Registration is closed", 403, "REGISTRATION_CLOSED");
 	}
 
-	const existing = await db.query.users.findFirst({
-		where: eq(users.username, username),
-	});
-	if (existing) {
+	if (await accountStore.isUsernameTaken(username)) {
 		throw new AppError("Username already taken", 409, "USERNAME_TAKEN");
 	}
 
-	const id = generateId();
+	// Hashing is deliberately outside the atomic section: it is ~100ms of CPU, and holding a
+	// transaction open across it would serialize unrelated writes for no benefit.
 	const passwordHash = await Bun.password.hash(password, {
 		algorithm: "bcrypt",
 		cost: 10,
 	});
-	const now = new Date().toISOString();
-
-	const avatarColor = randomAvatarColor();
 	const resolvedLang = normalizeLocale(language);
 
-	// The code is redeemed in the SAME transaction that inserts the account. Split
-	// across two writes it would either burn an invitation on a signup that then
-	// failed, or create the account while leaving the code reusable.
+	// One indivisible business fact: validate the invitation, create the account, burn the
+	// invitation. Split across writes it would either spend an invitation on a signup that
+	// then failed, or create the account while leaving the code reusable. `accountStore`
+	// guarantees the all-or-nothing property and owns how — this layer holds no transaction
+	// handle and names no table, so a second backend implements the same capability rather
+	// than reproducing SQLite's transaction shape.
 	//
-	// The first user is always an administrator regardless of any code: the
-	// bootstrap account has to be able to administer the instance.
-	const [user] = db.transaction((tx) => {
-		const usableCode =
-			!isFirstUser && code
-				? registrationCodeService.resolveUsableCodeInTransaction(tx, {
-						code,
-						username,
-						nowIso: now,
-					})
-				: null;
-		const role: "admin" | "user" = isFirstUser ? "admin" : (usableCode?.role ?? "user");
-
-		const created = tx
-			.insert(users)
-			.values({ id, username, passwordHash, role, avatarColor, createdAt: now })
-			.returning({
-				id: users.id,
-				username: users.username,
-				role: users.role,
-				avatarColor: users.avatarColor,
-				avatarImageId: users.avatarImageId,
-				createdAt: users.createdAt,
-			})
-			.all();
-
-		tx.insert(userPreferences)
-			.values({
-				id: generateId(),
-				userId: created[0].id,
-				language: resolvedLang,
-				createdAt: new Date().toISOString(),
-				updatedAt: new Date().toISOString(),
-			})
-			.run();
-
-		// After the insert: `registration_codes.used_by_user_id` references `users`,
-		// and SQLite enforces that the moment the row is written.
-		if (usableCode) {
-			registrationCodeService.claimCodeInTransaction(tx, {
-				codeId: usableCode.id,
-				userId: created[0].id,
-				nowIso: now,
-			});
-		}
-
-		return created;
-	});
+	// The first user is always an administrator regardless of any code (the bootstrap account
+	// must be able to administer the instance), which is why `invitationCode` is dropped in
+	// that case instead of being resolved and overridden.
+	let user: RegisteredAccountShape;
+	try {
+		const created = await accountStore.createAccount({
+			userId: generateId(),
+			username,
+			passwordHash,
+			avatarColor: randomAvatarColor(),
+			language: resolvedLang,
+			defaultRole: isFirstUser ? "admin" : "user",
+			invitationCode: isFirstUser ? undefined : code,
+			nowIso: new Date().toISOString(),
+		});
+		user = created.account;
+	} catch (error) {
+		throw await mapAccountCreationFailure(error, username);
+	}
 
 	// The first account is the instance administrator, created through an
 	// unauthenticated endpoint that has to stay open while no user exists. Once it
@@ -263,6 +226,39 @@ export async function registerUser(input: RegisterUserInput) {
 
 	const token = await createToken(user.id, user.role);
 	return { user, token, language: resolvedLang };
+}
+
+/** The account shape `registerUser` returns, taken from the store contract. */
+type RegisteredAccountShape = Awaited<ReturnType<typeof accountStore.createAccount>>["account"];
+
+/**
+ * Give a failed account creation its domain error identity.
+ *
+ * The pre-check above (`isUsernameTaken`) and the account insert are not one atomic
+ * observation: two concurrent registrations of the SAME username can both pass the
+ * check, and then exactly one of them wins the insert — on PostgreSQL the loser
+ * surfaces as a uniqueness conflict from inside the atomic section (a
+ * `WriteConflictError` in port vocabulary), on SQLite as the engine's own constraint
+ * error. Either way the domain fact is the same one the pre-check reports, so it gets
+ * the same answer: `USERNAME_TAKEN` (409), on both backends, never a raw 500.
+ *
+ * The decision is made by RE-READING the domain state (`isUsernameTaken`) rather than
+ * by recognizing driver error text — this layer holds no dialect. A failure whose
+ * cause is not a lost username race (the invitation rejection codes, storage faults)
+ * propagates unchanged, which is what keeps a storage failure from being reshaped
+ * into a policy error. If the re-read itself fails, the original error wins: it is
+ * the better evidence.
+ */
+async function mapAccountCreationFailure(error: unknown, username: string): Promise<unknown> {
+	if (error instanceof AppError) return error;
+	try {
+		if (await accountStore.isUsernameTaken(username)) {
+			return new AppError("Username already taken", 409, "USERNAME_TAKEN");
+		}
+	} catch {
+		// The re-read failed too; the original rejection is the one to surface.
+	}
+	return error;
 }
 
 /**
@@ -309,30 +305,15 @@ export interface MfaChallenge {
  * verify step (after the second factor is proven).
  */
 export async function buildSessionResult(userId: string): Promise<LoginSuccess> {
-	const row = await db.query.users.findFirst({
-		where: eq(users.id, userId),
-		columns: {
-			id: true,
-			username: true,
-			role: true,
-			avatarColor: true,
-			avatarImageId: true,
-			createdAt: true,
-			tokenVersion: true,
-		},
-	});
-	if (!row) {
+	const profile = await authSessionStore.findSessionProfile(userId);
+	if (!profile) {
 		throw new AppError("User not found", 404, "NOT_FOUND");
 	}
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, row.id),
-		columns: { language: true },
-	});
 	// tokenVersion stays out of the returned user object: it is an internal revocation
 	// counter, not profile data the frontend has any use for.
-	const { tokenVersion, ...user } = row;
+	const { tokenVersion, language: preferredLanguage, gitUsername, gitEmail, ...user } = profile;
 	const token = await createToken(user.id, user.role, tokenVersion);
-	return { user, token, language: normalizeLocale(pref?.language) };
+	return { user, token, language: normalizeLocale(preferredLanguage) };
 }
 
 /**
@@ -354,10 +335,7 @@ export async function loginUser(
 
 	let attemptCompleted = false;
 	try {
-		const user = await db.query.users.findFirst({
-			where: eq(users.username, username),
-			columns: { id: true, passwordHash: true, mfaEnabled: true },
-		});
+		const user = await authSessionStore.findLoginCredential(username);
 		const valid = await Bun.password.verify(
 			password,
 			user?.passwordHash ?? INVALID_LOGIN_PADDING_HASH,
@@ -386,15 +364,12 @@ export async function loginUser(
 		// does NOT force a second step — `users.mfaEnabled` is the explicit switch.
 		// The available methods still depend on which factors are actually enrolled.
 		if (user.mfaEnabled) {
-			// Lazy imports: MFA/passkey services pull in otpauth/webauthn packages,
-			// which must not load for plain JWT verify/create consumers.
-			const [{ mfaService }, { passkeyService }] = await Promise.all([
-				import("../services/mfa-service"),
-				import("../services/passkey-service"),
-			]);
+			// Lazy import: the MFA service pulls in otpauth, which must not load for
+			// plain JWT verify/create consumers.
+			const { mfaService } = await import("../services/mfa-service");
 			const [totpActive, hasPasskey] = await Promise.all([
 				mfaService.isTotpActive(user.id),
-				passkeyService.hasAny(user.id),
+				mfaService.hasAnyPasskey(user.id),
 			]);
 			const methods: MfaChallenge["methods"] = [];
 			if (totpActive) methods.push("totp", "backup_code");

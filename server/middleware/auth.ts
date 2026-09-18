@@ -7,11 +7,8 @@ import {
 	SESSION_VERSION_CLAIM,
 	shouldRenewSessionToken,
 } from "@shared/session-auth";
-import { eq } from "drizzle-orm";
 import type { Context, Next } from "hono";
 import { JwtTokenExpired } from "hono/utils/jwt/types";
-import { db } from "../db";
-import { users } from "../db/schema";
 import {
 	isAuthenticSessionTokenIgnoringExpiry,
 	type JwtPayload,
@@ -24,6 +21,7 @@ import {
 import { AppError, catalogError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { validateAccessToken } from "../lib/oauth-provider";
+import { authSessionStore } from "../services/auth/store";
 
 /** OAuth grant metadata attached to requests authenticated by an access token. */
 export interface OAuthAuthContext {
@@ -236,10 +234,7 @@ async function maybeRenewSessionToken(c: Context, payload: JwtPayload): Promise<
 
 	// Re-read the live role. Outside the try/catch below so a vanished user
 	// surfaces as a 401 instead of being silently treated as "renewal failed".
-	const row = await db.query.users.findFirst({
-		where: eq(users.id, payload.sub),
-		columns: { id: true, role: true, tokenVersion: true },
-	});
+	const row = await authSessionStore.findSessionState(payload.sub);
 	if (!row) {
 		invalidateUserCache(payload.sub);
 		throw catalogError("USER_GONE");
@@ -292,10 +287,7 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 		}
 		// OAuth access tokens are short-lived and revocable, so always resolve the
 		// live user row instead of using the session-JWT existence cache.
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, oauthGrant.userId),
-			columns: { id: true, role: true },
-		});
+		const row = await authSessionStore.findSessionState(oauthGrant.userId);
 		if (!row) {
 			throw catalogError("USER_GONE");
 		}
@@ -323,10 +315,7 @@ async function authenticateRequest(c: Context): Promise<AuthPrincipal> {
 	// the entry (see invalidateUserCache).
 	let verified = getVerifiedUser(payload.sub);
 	if (!verified) {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, payload.sub),
-			columns: { id: true, tokenVersion: true },
-		});
+		const row = await authSessionStore.findSessionState(payload.sub);
 		if (!row) {
 			throw catalogError("USER_GONE");
 		}

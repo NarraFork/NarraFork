@@ -28,6 +28,7 @@ import { logger } from "../lib/logger";
 import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getLanAddresses } from "../lib/net/lan-addresses";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
+import { reconcileNugRelayClients } from "../lib/nug-relay/manager";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
 import { executeSearch, listSearchChannels } from "../lib/search/router";
@@ -234,6 +235,9 @@ const nugProviderSchema = z.object({
 	oauthDeviceId: z.string().optional(),
 	oauthCallbackUrl: z.string().optional(),
 	proxy: proxyOverrideSchema,
+	egressMode: z.enum(["nug", "local-direct", "local-proxy"]).optional(),
+	egressProxyUrl: z.string().optional(),
+	egressAllowDirectFallback: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -646,6 +650,7 @@ export const updateSettingsSchema = z
 			.object({
 				disabledRoutines: z.array(z.string()),
 				enabledRoutines: z.array(z.string()),
+				toolModes: z.record(z.string(), z.enum(["manual", "auto", "resident"])),
 			})
 			.partial()
 			.optional(),
@@ -1614,6 +1619,10 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 		} else {
 			saveSettings(merged);
 		}
+		// Reconcile client-egress relay channels with the saved NUG provider
+		// configs: new local-egress providers connect immediately, removed or
+		// reverted providers are torn down (docs/CODEX_CLIENT_RELAY.md).
+		reconcileNugRelayClients(merged.nugProviders ?? []);
 		if (oauthExternalWebSocketChanged) {
 			clearOAuthWsTickets();
 			closeAllExternalNarratorConnections(1001, "external WebSocket settings changed");

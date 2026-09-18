@@ -267,3 +267,50 @@ describe("localizeNarratorError 既有行为保持不变", () => {
 		expect(localizeNarratorError("", t)).toBe("");
 	});
 });
+
+/**
+ * A Kimi quota wall that was understood but not waited on (the reset is beyond the
+ * wait budget, or this run already suspended on quota too often).
+ *
+ * The information the user needs — when the allowance returns — is carried in the
+ * `errorMessage` PAYLOAD rather than in `diagnostics`, because `errorMessage` is the
+ * only failure carrier that survives a page reload. These cases pin that split: a
+ * payload read from `diagnostics` would pass a live-session check and fail after a
+ * refresh, which is the silent half of the original defect.
+ */
+describe("localizeNarratorError Kimi 额度墙", () => {
+	const resetAt = Date.UTC(2026, 8, 17, 11, 22, 1);
+	const payload = JSON.stringify({
+		type: "kimi_quota_exhausted",
+		reason: "reset-beyond-budget",
+		model: "kimi-2:kimi-k2",
+		quotaResetAt: resetAt,
+	});
+
+	test("报出重置时刻，而不是转发上游 403 原文", () => {
+		const result = localizeNarratorError(payload, t);
+		expect(result).toStartWith("quotaExhaustedWaitNotPossible(resetAt=");
+		// A real, formatted instant rather than a raw epoch or an empty value.
+		expect(result).not.toContain(String(resetAt));
+		expect(result).not.toContain("resetAt=undefined");
+	});
+
+	test("刷新后仍可本地化：不依赖 diagnostics", () => {
+		// No errorCode and no diagnostics — exactly what a reloaded narrator row has.
+		expect(localizeNarratorError(payload, t)).toStartWith("quotaExhaustedWaitNotPossible(");
+	});
+
+	test("重置时刻缺失时退化为不含时刻的文案，而不是报 undefined", () => {
+		const result = localizeNarratorError(
+			JSON.stringify({ type: "kimi_quota_exhausted", reason: "wait-budget-spent" }),
+			t,
+		);
+		expect(result).toBe("quotaExhaustedWaitNotPossibleNoReset");
+	});
+
+	test("英文原文本身不被误判为该 payload", () => {
+		const upstream =
+			"Anthropic API error 403: You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends.";
+		expect(localizeNarratorError(upstream, t)).toBe(upstream);
+	});
+});

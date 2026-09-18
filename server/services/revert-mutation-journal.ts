@@ -1210,3 +1210,47 @@ function equal(a: unknown, b: unknown) {
 function fail(code: string, message: string) {
 	return new RevertMutationJournalError(code, message);
 }
+
+/**
+ * The dialect-free core of the mutation journal, exported for the PostgreSQL
+ * sibling (`postgres-revert-journal-store.ts`) — and nothing else.
+ *
+ * Everything here is pure normalization, hashing, budgeting, receipt/journal
+ * decoding or verdict logic: no SQL fragment, no drizzle object, no driver shape.
+ * The pieces that DO carry a dialect (the `IS` null-safe idiom, `json_extract`,
+ * the sync `.get()/.run()` chaining) stay private above; the PG store rewrites
+ * those against its own schema. Exporting the pure half is what lets the two
+ * backends share the section CONTENT — the same validations in the same order —
+ * rather than diverging copies of it.
+ */
+export const revertJournalInternals = {
+	normalizeContext,
+	normalizeOwner,
+	assertRevision,
+	assertFile,
+	assertFixedMetadata,
+	readJournal,
+	assertBoundReceipt,
+	verifiesApply,
+	compensationEligible,
+	verifiesCompensation,
+	normalizeReceipt,
+	normalizeBinding,
+	normalizeState,
+	stateRef,
+	fileBytes,
+	phaseId,
+	phaseDigest,
+	selectFiles,
+	page,
+	pageLimit,
+	metadata,
+	evidenceBudget,
+	text,
+	sha256,
+	integer,
+	keys,
+	digest,
+	equal,
+	fail,
+};

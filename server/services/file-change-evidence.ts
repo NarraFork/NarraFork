@@ -9,6 +9,7 @@ import {
 	type FileChangeExecutionReceipt,
 	type FileChangeIdentity,
 	type FileChangeMutationPhase,
+	type FileChangeRecoveryVerdict,
 	type FileChangeSettlement,
 	type FileChangeState,
 	fileChangeStatesEqual,
@@ -19,6 +20,7 @@ import {
 	fileChangeBlobs,
 	fileChangeEffects,
 	fileChangeOperations,
+	fileChangeScopeRecoveries,
 	fileChangeScopes,
 	fileChangeStorageBudgets,
 	fileHistoryClock,
@@ -250,6 +252,148 @@ export class FileChangeEvidenceService {
 					.returning()
 					.get(),
 			);
+		});
+	}
+
+	/**
+	 * Closes the evidence books of ONE scope after human-driven external recovery.
+	 * The caller (workspace-scope-recovery) owns physical re-observation and the
+	 * coordinator barrier; this method only finalizes bookkeeping. Frozen
+	 * execution receipts and observed states are NEVER rewritten: recovery marks
+	 * each unsettled effect settled with the acknowledged verdict's outcome, so
+	 * downstream readers (revert, diff view) keep seeing "we do not know what the
+	 * original IO did" wherever the receipt said so. One audit row is inserted
+	 * per call; replaying the same recovery is a harmless no-op plus audit row.
+	 */
+	closeBooksForRecovery(input: {
+		scopeId: string;
+		recoveredByUserId: string;
+		decisions: {
+			effectId: string;
+			canonicalPath: string;
+			verdict: FileChangeRecoveryVerdict;
+			observedDigest: string | null;
+			observedSizeBytes: number | null;
+		}[];
+	}): { settledEffectCount: number } {
+		assertString(input.scopeId, "scopeId");
+		assertString(input.recoveredByUserId, "recoveredByUserId");
+		if (!Array.isArray(input.decisions) || input.decisions.length > FILE_CHANGE_LIMITS.revertFiles)
+			throw fail("INVALID_INPUT", "Invalid recovery decision list");
+		for (const decision of input.decisions) {
+			assertString(decision.effectId, "decision effectId");
+			assertString(
+				decision.canonicalPath,
+				"decision canonicalPath",
+				FILE_CHANGE_LIMITS.metadataBytes,
+			);
+			if (
+				!["applied", "not_applied", "not_dispatched", "foreign", "unobservable"].includes(
+					decision.verdict,
+				)
+			)
+				throw fail("INVALID_INPUT", "Invalid recovery verdict");
+			if (decision.observedDigest !== null) assertDigest(decision.observedDigest);
+			if (decision.observedSizeBytes !== null)
+				assertInteger(decision.observedSizeBytes, "observedSizeBytes", 0);
+		}
+		assertMetadata(input.decisions);
+		return this.transaction((tx) => {
+			const scope = requireScope(tx, input.scopeId);
+			const unsettled = tx
+				.select()
+				.from(fileChangeEffects)
+				.where(
+					and(eq(fileChangeEffects.scopeId, scope.id), ne(fileChangeEffects.settlement, "settled")),
+				)
+				.all();
+			const byEffectId = new Map(input.decisions.map((decision) => [decision.effectId, decision]));
+			if (byEffectId.size !== input.decisions.length || byEffectId.size !== unsettled.length) {
+				throw fail(
+					"INVALID_INPUT",
+					"Recovery decisions must cover every unsettled effect exactly once",
+				);
+			}
+			const timestamp = this.now();
+			for (const effect of unsettled) {
+				const decision = byEffectId.get(effect.id);
+				if (!decision) {
+					throw fail("INVALID_INPUT", `Missing recovery decision for effect ${effect.id}`);
+				}
+				if (decision.canonicalPath !== effect.identityJson.canonicalPath) {
+					throw fail("INVALID_INPUT", "Recovery decision path does not match the effect identity");
+				}
+				const dispatched =
+					effect.settlement === "applying" || effect.settlement === "reconcile_required";
+				if (!dispatched && decision.verdict !== "not_dispatched") {
+					throw fail("INVALID_INPUT", "An undispatched effect cannot receive an IO verdict");
+				}
+				if (dispatched && decision.verdict === "not_dispatched") {
+					throw fail("INVALID_INPUT", "A dispatched effect cannot be marked not_dispatched");
+				}
+				const outcome =
+					decision.verdict === "foreign" || decision.verdict === "unobservable"
+						? ("unknown" as const)
+						: decision.verdict === "applied"
+							? fileChangeStatesEqual(effect.beforeStateJson, effect.intendedAfterStateJson)
+								? ("no_change" as const)
+								: ("changed" as const)
+							: ("no_change" as const);
+				tx.update(fileChangeEffects)
+					.set({ outcome, settlement: "settled", updatedAt: timestamp })
+					.where(eq(fileChangeEffects.id, effect.id))
+					.run();
+			}
+			for (const operationId of new Set(unsettled.map((effect) => effect.operationId))) {
+				const operation = requireOperation(tx, operationId);
+				const effects = selectEffects(
+					tx,
+					operationId,
+					undefined,
+					FILE_CHANGE_LIMITS.revertFiles + 1,
+				);
+				const remaining = effects.filter((effect) => effect.settlement !== "settled").length;
+				if (remaining > 0) {
+					// Another scope of the same operation is still barred; only refresh counts.
+					tx.update(fileChangeOperations)
+						.set({
+							settledEffectCount: effects.length - remaining,
+							unresolvedEffectCount: remaining,
+							updatedAt: timestamp,
+						})
+						.where(eq(fileChangeOperations.id, operationId))
+						.run();
+					continue;
+				}
+				const anyUnknown = effects.some((effect) => effect.outcome === "unknown");
+				const anyChanged = effects.some((effect) => effect.outcome === "changed");
+				tx.update(fileChangeOperations)
+					.set({
+						settlement: "settled",
+						effectOutcome: anyUnknown ? "unknown" : anyChanged ? "changed" : "no_change",
+						settledEffectCount: effects.length,
+						unresolvedEffectCount: 0,
+						finishedAt: operation.finishedAt ?? timestamp,
+						updatedAt: timestamp,
+					})
+					.where(eq(fileChangeOperations.id, operationId))
+					.run();
+			}
+			tx.insert(fileChangeScopeRecoveries)
+				.values({
+					id: generateId(),
+					scopeId: scope.id,
+					deviceId: scope.deviceId,
+					canonicalRoot: scope.canonicalRoot,
+					pathFlavor: scope.pathFlavor,
+					recoveredByUserId: input.recoveredByUserId,
+					effectDecisionsJson: input.decisions,
+					scopeRevisionBefore: scope.revision,
+					fencingTokenBefore: scope.fencingToken,
+					createdAt: timestamp,
+				})
+				.run();
+			return { settledEffectCount: unsettled.length };
 		});
 	}
 
@@ -1603,3 +1747,57 @@ function digest(value: unknown): string {
 function fail(code: string, message: string) {
 	return new FileChangeEvidenceError(code, message);
 }
+
+/**
+ * Exported DIRECTLY (not through the internals namespace) because TypeScript only
+ * honors assertion functions when the call target names the declaration itself.
+ * The PostgreSQL sibling calls this under the alias `assertEvidenceJournal`.
+ */
+export { assertJournal };
+
+/**
+ * The dialect-free core of the evidence service, exported for the PostgreSQL
+ * sibling (`postgres-file-change-evidence-store.ts`) — and nothing else.
+ *
+ * Everything here is pure normalization, hashing, budgeting, verdict or aggregate
+ * logic: no SQL fragment, no drizzle object, no driver shape. The pieces that DO
+ * carry a dialect (the sync `.get()/.run()/.all()` chaining and the
+ * `$client.inTransaction` boundary check) stay private above; the PG store
+ * rewrites those against its own schema. Exporting the pure half is what lets the
+ * two backends share the section CONTENT — the same validations in the same
+ * order — rather than diverging copies of it.
+ */
+export const evidenceInternals = {
+	normalizeScope,
+	normalizeOperation,
+	normalizeActor,
+	normalizeBinding,
+	normalizeEffect,
+	normalizeReceipt,
+	normalizeState,
+	assertKnownPreparedStates,
+	settlementAttributionCeiling,
+	operationAggregate,
+	mutationKey,
+	stateBlob,
+	stateBytes,
+	unknownAfter,
+	nullableId,
+	nullableLines,
+	pageLimit,
+	assertEvidenceBudget,
+	assertString,
+	assertInteger,
+	assertDigest,
+	assertMetadata,
+	boundedRecord,
+	assertKeys,
+	stableJson,
+	jsonEqual,
+	digest,
+	boundedPage,
+	validateSelector,
+	validateEffectCursor,
+	effectCursor,
+	fail,
+};

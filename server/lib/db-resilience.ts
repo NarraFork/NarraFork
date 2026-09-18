@@ -273,15 +273,24 @@ export function optimizeDatabase(sqlite: Database): void {
 	}
 }
 
+/** How often the periodic WAL/statistics upkeep runs. */
+export const WAL_UPKEEP_INTERVAL_MS = 5 * 60 * 1000;
+
 /**
- * Periodic WAL checkpoint to prevent WAL file from growing unbounded.
+ * One tick of the periodic upkeep: checkpoint the WAL so it cannot grow unbounded, and refresh
+ * planner statistics every sixth tick (~30 min).
+ *
+ * Split out from {@link startWalCheckpointInterval} so the SQLite lifecycle adapter can hand the
+ * tick body to the caller that owns the timer. That ownership matters: the timer must live in
+ * hot-reload-safe state (`hotTimer`), otherwise every Bun `--hot` cycle leaves the previous
+ * interval running against the same connection.
+ *
+ * Never throws — a failed checkpoint is a hardening step, not a correctness requirement, and an
+ * unhandled throw inside a timer callback would take the process down.
  */
-export function startWalCheckpointInterval(
-	sqlite: Database,
-	intervalMs = 5 * 60 * 1000,
-): ReturnType<typeof setInterval> {
+export function createWalUpkeepTick(sqlite: Database): () => void {
 	let ticks = 0;
-	return setInterval(() => {
+	return () => {
 		try {
 			sqlite.run("PRAGMA wal_checkpoint(PASSIVE)");
 		} catch (err) {
@@ -292,7 +301,20 @@ export function startWalCheckpointInterval(
 		if (ticks % 6 === 0) {
 			optimizeDatabase(sqlite);
 		}
-	}, intervalMs);
+	};
+}
+
+/**
+ * Periodic WAL checkpoint to prevent WAL file from growing unbounded.
+ *
+ * Kept as the standalone entry point for callers that own a plain interval; the startup path goes
+ * through the lifecycle port instead, which registers the same tick under hot-reload-safe state.
+ */
+export function startWalCheckpointInterval(
+	sqlite: Database,
+	intervalMs = WAL_UPKEEP_INTERVAL_MS,
+): ReturnType<typeof setInterval> {
+	return setInterval(createWalUpkeepTick(sqlite), intervalMs);
 }
 
 function sleep(ms: number): Promise<void> {

@@ -1145,6 +1145,98 @@ describe("classifyDanger", () => {
 		expect(shouldTriggerDangerReflection(result, "strict")).toBe(true);
 	});
 
+	test("shell write confined to /tmp downgrades to medium so the light level skips it", () => {
+		const analysis = makeBashAnalysis({
+			commands: [
+				{
+					tokens: ["echo", "hi"],
+					text: "echo hi > /tmp/scratch.txt",
+					fullText: "echo hi > /tmp/scratch.txt",
+				},
+			],
+			filePaths: ["/tmp/scratch.txt"],
+			hasWriteOperation: true,
+		});
+
+		const result = classifyDanger(
+			"Bash",
+			{ command: "echo hi > /tmp/scratch.txt" },
+			CWD,
+			analysis,
+			[],
+			[],
+			false,
+		);
+
+		expect(result?.summary).toContain("outside the current working directory");
+		expect(result?.severity).toBe("medium");
+		if (!result) throw new Error("Expected medium-severity danger");
+		expect(shouldTriggerDangerReflection(result, "light")).toBe(false);
+		expect(shouldTriggerDangerReflection(result, "standard")).toBe(true);
+	});
+
+	test("shell write mixing /tmp and a user path stays high for every level", () => {
+		const analysis = makeBashAnalysis({
+			commands: [
+				{
+					tokens: ["sh", "-c", "cat /tmp/scratch.txt"],
+					text: "cp /tmp/scratch.txt /home/user/project/../notes.txt",
+					fullText: "cp /tmp/scratch.txt /home/user/project/../notes.txt",
+				},
+			],
+			filePaths: ["/tmp/scratch.txt", "/home/user/notes.txt"],
+			hasWriteOperation: true,
+		});
+
+		const result = classifyDanger(
+			"Bash",
+			{ command: "cp /tmp/scratch.txt /home/user/notes.txt" },
+			CWD,
+			analysis,
+			[],
+			[],
+			false,
+		);
+
+		expect(result?.severity).toBe("high");
+		if (!result) throw new Error("Expected high-severity danger");
+		expect(shouldTriggerDangerReflection(result, "light")).toBe(true);
+	});
+
+	test("Write tool targeting /tmp downgrades to medium for the light level", () => {
+		const result = classifyDanger(
+			"Write",
+			{ file_path: "/tmp/narrafork-scratch.json", content: "{}" },
+			CWD,
+			undefined,
+			[],
+			[],
+			false,
+		);
+
+		expect(result?.summary).toContain("outside the current working directory");
+		expect(result?.severity).toBe("medium");
+		if (!result) throw new Error("Expected medium-severity danger");
+		expect(shouldTriggerDangerReflection(result, "light")).toBe(false);
+		expect(shouldTriggerDangerReflection(result, "standard")).toBe(true);
+	});
+
+	test("Write tool targeting an external user path stays high", () => {
+		const result = classifyDanger(
+			"Write",
+			{ file_path: "/home/user/important.txt", content: "hi" },
+			CWD,
+			undefined,
+			[],
+			[],
+			false,
+		);
+
+		expect(result?.severity).toBe("high");
+		if (!result) throw new Error("Expected high-severity danger");
+		expect(shouldTriggerDangerReflection(result, "light")).toBe(true);
+	});
+
 	test("danger reflection levels map severity thresholds", () => {
 		const lowDanger = {
 			severity: "low" as const,

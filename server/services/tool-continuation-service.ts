@@ -14,6 +14,7 @@ import { db } from "../db";
 import { narratorMessages, narratorToolCalls, narratorToolContinuations } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { runAtomicWrite } from "./agent-runtime/runtime-write";
 
 export type ToolContinuationRecord = typeof narratorToolContinuations.$inferSelect;
 export type ToolContinuationKind = ToolContinuationRecord["kind"];
@@ -366,7 +367,7 @@ export const toolContinuationService = {
 		const timestamp = isoNow();
 		const payloadJson = normalizePayload(input.payloadJson);
 		const deadlineAt = input.deadlineAt ? normalizeTimestamp(input.deadlineAt, "deadlineAt") : null;
-		return db.transaction((tx) => {
+		return runAtomicWrite(db, "tool-continuation.checkpointSendAwait", (tx) => {
 			const toolCall = tx
 				.select({ status: narratorToolCalls.status, completedAt: narratorToolCalls.completedAt })
 				.from(narratorToolCalls)

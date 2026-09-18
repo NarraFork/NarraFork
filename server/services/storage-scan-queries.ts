@@ -287,10 +287,12 @@ export interface DbstatObjectBytes {
 /**
  * Per-object byte sizes from the `dbstat` virtual table.
  *
- * NOTE: Bun's bundled SQLite is built WITHOUT the dbstat extension, so in practice this returns
- * `supported: false` and the scan falls back to the `approximate` mode (a `SUM(length(...))` scan
- * per table). Kept because a future Bun build — or a custom SQLite — may provide it, and the
- * approximate path is strictly a fallback, not an equivalent.
+ * NOTE: dbstat is a COMPILE-TIME option, so availability is a property of the SQLite build and must
+ * be probed, never assumed. It is compiled into Bun 1.4.2's bundled SQLite (verified by querying
+ * it), and was absent from earlier builds — which is why both branches below are live: `supported:
+ * false` sends the scan down the `approximate` mode (a `SUM(length(...))` scan per table) for older
+ * runtimes and custom builds. The approximate path is strictly a fallback, not an equivalent, and
+ * `scanMode` in the report is what tells a reader which one produced the numbers.
  */
 export function loadDbstatObjectBytes(sqlite: Database): DbstatObjectBytes {
 	const readRows = (sql: string): Map<string, number> => {

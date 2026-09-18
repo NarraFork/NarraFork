@@ -398,7 +398,7 @@ export async function addWorkspacePanel(
 	// wider (it still carries the retired `"plugin"`), and letting inference widen here
 	// would silently allow a non-membership kind to be written.
 	const kind: WorkspacePanelKind = input.kind;
-	const row = {
+	const row: typeof workspacePanels.$inferInsert = {
 		id,
 		workspaceId,
 		kind,
@@ -409,26 +409,22 @@ export async function addWorkspacePanel(
 		updatedAt: now,
 	};
 
-	const insert = (tx: { insert: typeof db.insert }) => {
-		tx.insert(workspacePanels).values(row).run();
-	};
-
 	if (input.kind === "narrator") {
 		// Membership row + sidebar projection in ONE transaction.
 		await applyWorkspaceMembershipProjection(userId, {
 			narratorId: input.narratorId,
 			workspaceId,
-			inTransaction: insert,
+			panelMembership: { action: "insert", row },
 		});
 	} else {
-		db.transaction((tx) => insert(tx as unknown as { insert: typeof db.insert }));
+		db.insert(workspacePanels).values(row).run();
 	}
 
 	return {
 		panel: {
 			id,
 			kind,
-			narratorId: row.narratorId,
+			narratorId: row.narratorId ?? null,
 			config: parseConfig(configJson),
 			sortOrder,
 		},
@@ -455,19 +451,15 @@ export async function removeWorkspacePanel(
 		.get();
 	if (!row) throw new NotFoundError("Workspace panel", panelId);
 
-	const remove = (tx: { delete: typeof db.delete }) => {
-		tx.delete(workspacePanels).where(eq(workspacePanels.id, panelId)).run();
-	};
-
 	if (row.kind === "narrator" && row.narratorId) {
 		await applyWorkspaceMembershipProjection(userId, {
 			narratorId: row.narratorId,
 			workspaceId: null,
-			inTransaction: remove,
+			panelMembership: { action: "remove", panelId: row.id },
 		});
 		return;
 	}
-	db.transaction((tx) => remove(tx as unknown as { delete: typeof db.delete }));
+	db.delete(workspacePanels).where(eq(workspacePanels.id, panelId)).run();
 }
 
 /** Rejection code for a layout save that raced another client. */

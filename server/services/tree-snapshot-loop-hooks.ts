@@ -47,6 +47,7 @@ import {
 	recordTreeSnapshotBefore,
 	type TreeSnapshotSession,
 } from "./narrator-tree-snapshot-hooks";
+import { specVfsService } from "./spec-vfs-service";
 
 /**
  * Tools that may modify files on disk, i.e. the ones worth a boundary pair.
@@ -94,6 +95,25 @@ export function buildTreeSnapshotEventHooks(opts: {
 			const defaultDeviceId = session._defaultDeviceId ?? LOCAL_DEVICE_ID;
 			const requestedDevice = args?.device;
 			const workdir = args?.workdir;
+			const fileTargets = [args?.file_path, args?.to_file].filter(
+				(value): value is string => typeof value === "string" && value.length > 0,
+			);
+			const isVirtualSpecTarget =
+				toolName !== SHELL_TOOL_NAME &&
+				fileTargets.length > 0 &&
+				fileTargets.every((value) => specVfsService.isSpecUri(value));
+			if (isVirtualSpecTarget) {
+				// Spec files are persisted by the virtual filesystem, not the worktree. They
+				// intentionally have no tree boundary and should not look like an unverified
+				// local target in the server log.
+				abandonTreeSnapshot(session, narratorId, toolUseId);
+				logger.debug("Tree snapshot skipped for virtual Spec target", {
+					narratorId,
+					toolUseId,
+					toolName,
+				});
+				return;
+			}
 			if (
 				defaultDeviceId !== LOCAL_DEVICE_ID ||
 				(requestedDevice !== undefined && requestedDevice !== LOCAL_DEVICE_ID) ||

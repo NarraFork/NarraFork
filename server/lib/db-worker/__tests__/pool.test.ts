@@ -231,9 +231,17 @@ describe("worker pool", () => {
 		});
 		expect(context.pageSize).toBeGreaterThan(0);
 		expect(context.tables.map((table) => table.name)).toContain("narrator_messages");
-		// Bun's bundled SQLite ships without the dbstat extension, so real deployments always take
-		// the approximate path. Assert we report that honestly rather than claiming dbstat.
-		expect(context.dbstatSupported).toBe(false);
+		// `dbstat` availability is a property of the SQLite BUILD, not a constant: it is compiled in
+		// on Bun 1.4.2 and was absent from earlier ones. Asserting a fixed `false` here pinned the
+		// runtime rather than the code and started failing on a Bun upgrade that changed nothing
+		// about this worker. What the worker owes the caller is a truthful flag, so assert that the
+		// flag matches what the very same probe reports on the main thread.
+		const probe = new Database(dbPath, { readonly: true });
+		try {
+			expect(context.dbstatSupported).toBe(loadScanContext(probe).dbstat.supported);
+		} finally {
+			probe.close();
+		}
 	}, 60_000);
 
 	test("measures a table shard in a worker", async () => {
@@ -247,8 +255,13 @@ describe("worker pool", () => {
 		]);
 		const messages = result.tables.find((table) => table.name === "narrator_messages");
 		expect(messages?.rowCount).toBe(200);
-		expect(messages?.approxContentBytes).toBeGreaterThan(0);
 		expect(messages?.category).toBe("sessions");
+		// `approxContentBytes` is the APPROXIMATE mode's output and is deliberately 0 when `dbstat`
+		// is available (that path skips the extra `SUM(length(...))` full-table scan, since dbstat
+		// already gives exact page-level sizes). The mode-independent claim is that the table was
+		// measured to be non-empty, so assert on the total instead of on one mode's field.
+		expect(messages?.totalBytes).toBeGreaterThan(0);
+		expect(messages?.readFailed).toBeUndefined();
 	}, 60_000);
 
 	test("worker results match a direct main-thread measurement", async () => {

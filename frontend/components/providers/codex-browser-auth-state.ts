@@ -13,6 +13,12 @@
 export interface CodexBrowserAuthServerState {
 	pending: boolean;
 	redirectUri: string;
+	/**
+	 * False when the server could not start its local callback listener
+	 * (port busy, etc.). The flow is still pending — the user must finish it
+	 * by pasting the callback URL, so the UI should say so explicitly.
+	 */
+	localCallbackServer?: boolean;
 }
 
 export interface CodexBrowserAuthReconcileInput {
@@ -44,6 +50,8 @@ export interface CodexBrowserAuthReconcileResult {
 	pending?: boolean;
 	/** Redirect URI to display, or undefined to keep the current value. */
 	redirectUri?: string;
+	/** Whether the local callback listener is up, or undefined to keep the current value. */
+	localCallbackServer?: boolean;
 }
 
 /**
@@ -64,6 +72,7 @@ export function reconcileCodexBrowserAuthState(
 			// A locally captured redirect URI is the one actually used for this flow;
 			// only fall back to the server's view when this tab has none.
 			redirectUri: knownRedirectUri ?? serverState.redirectUri,
+			localCallbackServer: serverState.localCallbackServer,
 		};
 	}
 

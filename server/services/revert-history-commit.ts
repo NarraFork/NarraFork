@@ -1,3 +1,33 @@
+/**
+ * CAPABILITY BOUNDARY: this module is SQLite-only by design, and that is a
+ * deliberate capability decision, not unfinished porting.
+ *
+ * Its guarantees are built on connection-scoped SQLite facts:
+ *
+ *   - the preparation stamp (`total_changes()` + `PRAGMA data_version` +
+ *     `PRAGMA schema_version` + `PRAGMA foreign_keys` + `PRAGMA busy_timeout`),
+ *     which conservatively rejects EVERY intervening write — PostgreSQL has no
+ *     per-connection counters for these;
+ *   - `INDEXED BY` + `rowid` keyset scans and `SELECT changes()` per statement;
+ *   - the `INDEX_TRIGGERS` whitelist over `sqlite_schema`, which fail-closes on
+ *     any trigger other than the reviewed FTS maintenance ones before a single
+ *     row moves.
+ *
+ * THE PG DECISION ON TRIGGERS (定案, batch E): a PostgreSQL history revert
+ * applies the same row-level UPDATE/DELETE/INSERT program — it does NOT rebuild
+ * content tables (nothing in this module does either), and it does NOT detach,
+ * re-create or otherwise manage triggers. The FTS shadow tables on PG are owned
+ * by the `ensurePgFts` catalog (`server/db/pg-fts.ts`), whose triggers maintain
+ * the shadows automatically for ordinary DML; that automatic maintenance is
+ * exactly the behavior the SQLite whitelist exists to protect. The whitelist's
+ * fail-closed rule carries over unchanged in spirit: a PG implementation must
+ * refuse to run when any NON-catalog trigger exists on the mutated tables
+ * (`narrator_messages`, `narrator_tool_calls`, `narrator_message_refs`,
+ * `narrators`), because an unreviewed trigger can mutate rows outside the fixed
+ * manifest. The mechanism this decision rests on — catalog triggers keep the
+ * shadow in sync across revert-shaped DML with zero management — is pinned by
+ * `tests/server/services/pg-revert-trigger-policy.test.ts`.
+ */
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { Worker } from "node:worker_threads";

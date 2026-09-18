@@ -457,6 +457,9 @@ export const CodexSection = React.memo(function CodexSection({
 	const [browserAuthLoading, setBrowserAuthLoading] = useState(false);
 	const [browserCallbackUrl, setBrowserCallbackUrl] = useState("");
 	const [browserRedirectUri, setBrowserRedirectUri] = useState<string | null>(null);
+	// True when the server reported it could not start the local callback
+	// listener (port busy): the flow still works via manual callback paste.
+	const [browserAuthServerDown, setBrowserAuthServerDown] = useState(false);
 	const [deviceAuthModal, setDeviceAuthModal] = useState(false);
 	const [deviceAuthData, setDeviceAuthData] = useState<{
 		userCode: string;
@@ -663,10 +666,14 @@ export const CodexSection = React.memo(function CodexSection({
 		if (next.redirectUri !== undefined && next.redirectUri !== browserRedirectUri) {
 			setBrowserRedirectUri(next.redirectUri);
 		}
+		if (next.localCallbackServer !== undefined) {
+			setBrowserAuthServerDown(next.localCallbackServer === false);
+		}
 		if (next.pending === true) setBrowserAuthPending(true);
 		if (next.pending === false) {
 			setBrowserAuthPending(false);
 			setBrowserAuthLoading(false);
+			setBrowserAuthServerDown(false);
 			browserAuthStartedAtRef.current = null;
 		}
 	}, [browserAuthState, browserAuthStateAt, browserRedirectUri]);
@@ -686,6 +693,7 @@ export const CodexSection = React.memo(function CodexSection({
 			browserAuthStartedAtRef.current = null;
 			setBrowserAuthPending(false);
 			setBrowserAuthLoading(false);
+			setBrowserAuthServerDown(false);
 			notifications.show({
 				message: lastBrowserAuthError,
 				color: "red",
@@ -910,6 +918,7 @@ export const CodexSection = React.memo(function CodexSection({
 		try {
 			const result = await api.codexBrowserAuth();
 			setBrowserRedirectUri(result.redirectUri ?? null);
+			setBrowserAuthServerDown(result.localCallbackServer === false);
 			setBrowserCallbackUrl("");
 			// The cached browser-auth-state predates this flow, so it still says
 			// `pending: false` — and the reconcile effect would read that as "no flow"
@@ -956,6 +965,7 @@ export const CodexSection = React.memo(function CodexSection({
 					browserAuthStartedAtRef.current = null;
 					setBrowserAuthPending(false);
 					setBrowserAuthLoading(false);
+					setBrowserAuthServerDown(false);
 					setBrowserCallbackUrl("");
 					notifications.show({
 						message: t("codexAuthSuccess"),
@@ -967,6 +977,7 @@ export const CodexSection = React.memo(function CodexSection({
 			browserAuthStartedAtRef.current = null;
 			setBrowserAuthPending(false);
 			setBrowserAuthLoading(false);
+			setBrowserAuthServerDown(false);
 			notifications.show({
 				message: err instanceof Error ? err.message : String(err),
 				color: "red",
@@ -981,6 +992,7 @@ export const CodexSection = React.memo(function CodexSection({
 			browserAuthStartedAtRef.current = null;
 			setBrowserAuthPending(false);
 			setBrowserAuthLoading(false);
+			setBrowserAuthServerDown(false);
 			setBrowserCallbackUrl("");
 			qc.invalidateQueries({ queryKey: ["codex", "browser-auth-state"] });
 		} catch (err) {
@@ -1009,6 +1021,7 @@ export const CodexSection = React.memo(function CodexSection({
 			}
 			setBrowserAuthPending(false);
 			setBrowserAuthLoading(false);
+			setBrowserAuthServerDown(false);
 			setBrowserCallbackUrl("");
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
 			qc.invalidateQueries({ queryKey: ["codex", "browser-auth-state"] });
@@ -1381,7 +1394,14 @@ export const CodexSection = React.memo(function CodexSection({
 											</Text>
 										</Group>
 										{/* Manual callback URL: the redirect targets localhost on the
-							    user's machine, which never reaches a remote NarraFork host. */}
+						    user's machine, which never reaches a remote NarraFork host. */}
+										{browserAuthServerDown && (
+											<Text size="xs" c="orange" fw={500}>
+												{t("codexBrowserCallbackServerDown", {
+													redirectUri: browserRedirectUri ?? "http://localhost:1455/auth/callback",
+												})}
+											</Text>
+										)}
 										<Text size="xs" c="dimmed">
 											{t("codexBrowserCallbackDesc", {
 												redirectUri: browserRedirectUri ?? "http://localhost:1455/auth/callback",

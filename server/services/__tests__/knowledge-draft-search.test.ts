@@ -60,7 +60,7 @@ describe("draft-shadow search", () => {
 			content: `original ${BODY_ONLY_TERM} ${DRAFT_NEW_TERM}`,
 		});
 
-		const withDraft = knowledgeService.search({
+		const withDraft = await knowledgeService.search({
 			q: DRAFT_NEW_TERM,
 			collectionId,
 			draftUserId: userId,
@@ -69,7 +69,7 @@ describe("draft-shadow search", () => {
 		// The matched row should be flagged as coming from the draft.
 		expect(withDraft.find((r) => r.id === entry.id)?.fromDraft).toBe(true);
 
-		const withoutDraft = knowledgeService.search({ q: DRAFT_NEW_TERM, collectionId });
+		const withoutDraft = await knowledgeService.search({ q: DRAFT_NEW_TERM, collectionId });
 		expect(withoutDraft.some((r) => r.id === entry.id)).toBe(false);
 	});
 
@@ -87,7 +87,7 @@ describe("draft-shadow search", () => {
 		});
 
 		// With draft shadow: the entry is represented by the draft, which no longer has the term.
-		const withDraft = knowledgeService.search({
+		const withDraft = await knowledgeService.search({
 			q: removeTerm,
 			collectionId,
 			draftUserId: userId,
@@ -95,7 +95,7 @@ describe("draft-shadow search", () => {
 		expect(withDraft.some((r) => r.id === entry.id)).toBe(false);
 
 		// Without draft shadow: the committed main version still has it.
-		const withoutDraft = knowledgeService.search({ q: removeTerm, collectionId });
+		const withoutDraft = await knowledgeService.search({ q: removeTerm, collectionId });
 		expect(withoutDraft.some((r) => r.id === entry.id)).toBe(true);
 	});
 
@@ -112,7 +112,7 @@ describe("draft-shadow search", () => {
 		await knowledgeBranchService.updateDraft(principal, draft.id, { content: "" });
 
 		// The body term is gone from the draft → should NOT match.
-		const byBody = knowledgeService.search({
+		const byBody = await knowledgeService.search({
 			q: bodyTerm,
 			collectionId,
 			draftUserId: userId,
@@ -120,7 +120,7 @@ describe("draft-shadow search", () => {
 		expect(byBody.some((r) => r.id === entry.id)).toBe(false);
 
 		// The title term must STILL match (de-normalized title in the draft FTS index).
-		const byTitle = knowledgeService.search({
+		const byTitle = await knowledgeService.search({
 			q: titleTerm,
 			collectionId,
 			draftUserId: userId,
@@ -136,7 +136,7 @@ describe("draft-shadow search", () => {
 			title: `Delta ${TAG}`,
 			content: `content ${term}`,
 		});
-		const res = knowledgeService.search({ q: term, collectionId, draftUserId: userId });
+		const res = await knowledgeService.search({ q: term, collectionId, draftUserId: userId });
 		const hit = res.find((r) => r.id === entry.id);
 		expect(hit).toBeDefined();
 		expect(hit?.fromDraft).toBe(false);
@@ -174,7 +174,7 @@ describe("passive injection matches author-declared keywords only", () => {
 		expect(hits.some((h) => h.entryId === entry.id)).toBe(false);
 
 		// Sanity: the entry IS still findable via the explicit full-text search path.
-		const found = knowledgeService.search({ q: bodyTerm, collectionId });
+		const found = await knowledgeService.search({ q: bodyTerm, collectionId });
 		expect(found.some((r) => r.id === entry.id)).toBe(true);
 	});
 

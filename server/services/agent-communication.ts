@@ -1130,7 +1130,7 @@ async function deliverSubagentMessageToParent(
 		input.displayMessage ?? input.message,
 		input.toolCallBinding,
 	);
-	const accepted = enqueueInboxAgent(delivery, input.message, { channel: "parent" });
+	const accepted = await enqueueInboxAgent(delivery, input.message, { channel: "parent" });
 	if (accepted.delivery.state === "cancelled" || accepted.delivery.state === "failed")
 		throw new Error(`Previous delivery is ${accepted.delivery.state}; explicit retry is required`);
 
@@ -1382,7 +1382,7 @@ async function sendSubagentMessageDetailedWithRun(
 				continue;
 			}
 
-			const accepted = enqueueInboxAgent(delivery, deliveredMessage, {
+			const accepted = await enqueueInboxAgent(delivery, deliveredMessage, {
 				createdBy: input.userId ?? null,
 			});
 			deliveryMessageId = delivery.recipientMessageId;

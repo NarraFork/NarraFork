@@ -6,6 +6,7 @@ import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { registrationCodes, userPreferences, users } from "../../db/schema";
+import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 
 const { db, sqlite } = getTestDb();
@@ -174,6 +175,68 @@ describe("redemption", () => {
 
 		const aliceId = await seedRedeemer("alice");
 		expect(redeem(code, "alice", aliceId).role).toBe("user");
+	});
+});
+
+describe("the redemption rules are shared, not re-derived here", () => {
+	test("the SQLite lookup answers exactly as the dialect-free rules do", async () => {
+		// `resolveUsableCodeInTransaction` must be a LOOKUP plus the shared decision. If it
+		// grows its own copy of the precedence (revoked before used before expired), a second
+		// backend reusing `assertInvitationRedeemable` would start disagreeing with this one
+		// while both still "work" — the kind of divergence no single-backend test would show.
+		const { assertInvitationRedeemable } = await import("../registration/invitation-rules");
+		const { code, summary } = await registrationCodeService.createCode({
+			createdByUserId: adminId,
+			role: "admin",
+			expiresInHours: 1,
+		});
+		await registrationCodeService.revokeCode(summary.id);
+		const row = await db.query.registrationCodes.findFirst({
+			where: eq(registrationCodes.id, summary.id),
+		});
+		if (!row) throw new Error("the issued code should exist");
+
+		const twoHoursLater = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+		const params = { username: "alice", nowIso: twoHoursLater };
+		// Revoked AND expired at once: both paths must name the revocation.
+		const direct = (() => {
+			try {
+				return assertInvitationRedeemable(row, params);
+			} catch (error) {
+				return error instanceof AppError ? error.code : "UNKNOWN";
+			}
+		})();
+		const viaLookup = (() => {
+			try {
+				return db.transaction((tx) =>
+					registrationCodeService.resolveUsableCodeInTransaction(tx, { code, ...params }),
+				);
+			} catch (error) {
+				return error instanceof AppError ? error.code : "UNKNOWN";
+			}
+		})();
+
+		expect(direct).toBe("CODE_REVOKED");
+		expect(viaLookup).toBe(direct);
+	});
+
+	test("a usable code resolves to the same accepted shape through both paths", async () => {
+		const { assertInvitationRedeemable } = await import("../registration/invitation-rules");
+		const { code, summary } = await registrationCodeService.createCode({
+			createdByUserId: adminId,
+			role: "admin",
+		});
+		const row = await db.query.registrationCodes.findFirst({
+			where: eq(registrationCodes.id, summary.id),
+		});
+		if (!row) throw new Error("the issued code should exist");
+
+		const params = { username: "alice", nowIso: new Date().toISOString() };
+		const viaLookup = db.transaction((tx) =>
+			registrationCodeService.resolveUsableCodeInTransaction(tx, { code, ...params }),
+		);
+		expect(viaLookup).toEqual(assertInvitationRedeemable(row, params));
+		expect(viaLookup).toEqual({ id: summary.id, role: "admin" });
 	});
 });
 

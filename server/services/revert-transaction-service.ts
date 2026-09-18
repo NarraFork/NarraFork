@@ -1,3 +1,23 @@
+/**
+ * CAPABILITY BOUNDARY: this module is SQLite-only by design, and that is a
+ * deliberate capability decision, not unfinished porting.
+ *
+ * It orchestrates the file/history revert end to end over connection-scoped
+ * SQLite facts: `total_changes()`/`PRAGMA data_version` stamps that fence the
+ * prepared plan against ANY intervening write, the synchronous same-root
+ * transaction the history commit must run inside, and the raw `$client` handle
+ * the journal's durability boundary checks against.
+ *
+ * THE PG ALTERNATIVE (for whoever ports the orchestration): the atomic sections
+ * it sequences already have PG counterparts — the plan store, the mutation
+ * journal (including `commit`, whose history callback runs inside the journal's
+ * own PG transaction), the evidence store, the blob catalog and the durable
+ * lease store (`postgres-revert-plan-store.ts`, `postgres-revert-journal-store.ts`,
+ * `postgres-file-change-evidence-store.ts`, `postgres-file-change-blob-catalog.ts`,
+ * `postgres-workspace-lease-store.ts`). What remains to port is the sequencing
+ * itself, against `REPEATABLE READ` snapshots in place of the stamps; see the
+ * capability headers in those modules.
+ */
 import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";

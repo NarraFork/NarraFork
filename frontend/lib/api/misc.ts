@@ -3,6 +3,7 @@ import type {
 	CredentialUsageTotalsDetail,
 } from "@frontend/types/usage-history";
 import type { ResolvedBranding } from "@shared/branding";
+import type { ToolRoutineMode, ToolRoutineModeOverride } from "@shared/routine-modes";
 import type { WorkspacePanel, WorkspacePanelInput } from "@shared/workspace-panels";
 import type { PreparedUpdateStatus, UpdateCoordinationPhase } from "../update-state";
 import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./client";
@@ -33,6 +34,10 @@ import type {
 	SearchResponse,
 	StorageScanJobState,
 	StorageScanResult,
+	WorkspaceBarrier,
+	WorkspaceBarrierObservationResult,
+	WorkspaceBarrierRecoveryResult,
+	WorkspaceBarrierVerdict,
 } from "./types";
 
 /**
@@ -432,9 +437,12 @@ export const miscApi = {
 		}>(`/codex/status${suffix}`);
 	},
 	codexBrowserAuth: () =>
-		request<{ authorizeUrl: string; redirectUri?: string }>("/codex/auth/browser", {
-			method: "POST",
-		}),
+		request<{ authorizeUrl: string; redirectUri?: string; localCallbackServer?: boolean }>(
+			"/codex/auth/browser",
+			{
+				method: "POST",
+			},
+		),
 	codexBrowserAuthCancel: () =>
 		request<{ ok: boolean }>("/codex/auth/browser/cancel", { method: "POST" }),
 	codexBrowserAuthCallback: (callbackUrl: string) =>
@@ -443,7 +451,9 @@ export const miscApi = {
 			body: JSON.stringify({ callbackUrl }),
 		}),
 	codexBrowserAuthState: () =>
-		request<{ pending: boolean; redirectUri: string }>("/codex/auth/browser/state"),
+		request<{ pending: boolean; redirectUri: string; localCallbackServer?: boolean }>(
+			"/codex/auth/browser/state",
+		),
 	codexDeviceAuthStart: () =>
 		request<{
 			deviceAuthId: string;
@@ -631,6 +641,14 @@ export const miscApi = {
 				}
 			>
 		>("/nug/quotas"),
+	// Client-egress relay status per provider (docs/CODEX_CLIENT_RELAY.md).
+	nugGetRelayStatus: () =>
+		request<
+			Record<
+				string,
+				{ status: "disabled" | "offline" | "connecting" | "online"; egressMode: string }
+			>
+		>("/nug/relay-status"),
 
 	// Kimi (kimi.com / kimi.ai) usage quotas — per-provider server-side cache
 	kimiGetUsages: () => request<Record<string, KimiUsageCache>>("/kimi/usages"),
@@ -1011,13 +1029,21 @@ export const miscApi = {
 				name: string;
 				descriptionEn: string;
 				descriptionZh: string;
+				/** Projection of `mode === "resident"` for tool routines. */
 				enabled: boolean;
+				/** Three-position mode. Only present for tool routines. */
+				mode?: ToolRoutineMode;
 			}>;
 		}>("/routines"),
 	toggleRoutine: (id: string, enabled: boolean) =>
 		request<{ ok: boolean }>(`/routines/${id}/toggle`, {
 			method: "POST",
 			body: JSON.stringify({ enabled }),
+		}),
+	setRoutineMode: (id: string, mode: ToolRoutineMode) =>
+		request<{ ok: boolean; mode: ToolRoutineMode }>(`/routines/${id}/mode`, {
+			method: "POST",
+			body: JSON.stringify({ mode }),
 		}),
 	getProjectRoutines: (projectId: string) =>
 		request<{
@@ -1031,6 +1057,12 @@ export const miscApi = {
 				enabled: boolean;
 				override: "global" | "enabled" | "disabled";
 				globalEnabled: boolean;
+				/** Effective mode for this project. Only present for tool routines. */
+				mode?: ToolRoutineMode;
+				/** Project override, or "global" when it follows global. Tool routines only. */
+				modeOverride?: ToolRoutineModeOverride;
+				/** The global mode this routine would follow. Tool routines only. */
+				globalMode?: ToolRoutineMode;
 			}>;
 		}>(`/routines/project/${projectId}`),
 	toggleProjectRoutine: (projectId: string, id: string, action: "enable" | "disable" | "reset") =>
@@ -1038,6 +1070,11 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify({ action }),
 		}),
+	setProjectRoutineMode: (projectId: string, id: string, mode: ToolRoutineModeOverride) =>
+		request<{ ok: boolean; mode: ToolRoutineModeOverride }>(
+			`/routines/project/${projectId}/${id}/mode`,
+			{ method: "POST", body: JSON.stringify({ mode }) },
+		),
 	getGlobalPrompt: () =>
 		request<{
 			content: string | null;
@@ -1238,6 +1275,25 @@ export const miscApi = {
 		request<DatabaseVacuumResult>("/storage/database/vacuum", {
 			method: "POST",
 		}),
+
+	// Workspace write barriers (human-driven external recovery, admin only)
+	getWorkspaceBarriers: () => request<{ items: WorkspaceBarrier[] }>("/storage/workspace-barriers"),
+	observeWorkspaceBarrier: (scopeId: string) =>
+		request<WorkspaceBarrierObservationResult>(
+			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/observe`,
+			{ method: "POST" },
+		),
+	recoverWorkspaceBarrier: (
+		scopeId: string,
+		data: {
+			acknowledgements: { effectId: string; verdict: WorkspaceBarrierVerdict }[];
+			acknowledgeInspected?: boolean;
+		},
+	) =>
+		request<WorkspaceBarrierRecoveryResult>(
+			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/recover`,
+			{ method: "POST", body: JSON.stringify(data) },
+		),
 
 	// Runtime Resources
 	scanRuntime: () => request<RuntimeScanResult>("/runtime/scan"),

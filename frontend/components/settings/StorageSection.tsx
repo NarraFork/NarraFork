@@ -56,6 +56,7 @@ import {
 } from "../../lib/api";
 import { formatLocaleDateTime, formatLocaleTime } from "../../lib/intl-format";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
+import { WorkspaceBarriersCard } from "./WorkspaceBarriersCard";
 
 function formatBytes(bytes: number): string {
 	if (bytes === 0) return "0 B";
@@ -1225,6 +1226,8 @@ export function StorageSection() {
 						})}
 					</Stack>
 				)}
+
+				<WorkspaceBarriersCard />
 			</Stack>
 
 			<Modal

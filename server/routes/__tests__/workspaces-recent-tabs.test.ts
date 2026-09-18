@@ -11,6 +11,7 @@ import {
 	workspacePanels,
 	workspaces,
 } from "../../db/schema";
+import type { WorkspacePanelMembershipWrite } from "../../services/recent-tabs-service";
 
 const { db, sqlite } = getTestDb();
 const broadcasts: Array<{ userId: string; event: Record<string, unknown> }> = [];
@@ -27,6 +28,7 @@ mock.module("../../websocket/narrator-ws", () => ({
 const { dissolveOrphanWorkspaces, workspaceRoutes } = await import("../workspaces");
 const { WORKSPACE_TREE_MAX_BYTES } = await import("../../lib/validators/workspaces");
 const { buildAppErrorResponse } = await import("../../lib/app-error-response");
+const { applyWorkspaceMembershipProjection } = await import("../../services/recent-tabs-service");
 const NOW = "2026-07-19T00:00:00.000Z";
 const app = new Hono();
 app.use("*", async (c, next) => {
@@ -405,6 +407,180 @@ describe("membership routes", () => {
 
 		const response = await app.request("/workspaces/other-ws/panels");
 		expect(response.status).toBe(404);
+	});
+});
+
+describe("membership write atomicity", () => {
+	function seedNarrator(id: string): void {
+		db.insert(narrators).values({ id, title: id, createdAt: NOW, updatedAt: NOW }).run();
+	}
+
+	function panelRow(id: string, workspaceId: string, narratorId: string, sortOrder = 1000) {
+		return {
+			id,
+			workspaceId,
+			kind: "narrator" as const,
+			narratorId,
+			configJson: null,
+			sortOrder,
+			createdAt: new Date(NOW),
+			updatedAt: new Date(NOW),
+		};
+	}
+
+	function readRevision(): number | undefined {
+		return db
+			.select({ revision: userRecentTabsMeta.revision })
+			.from(userRecentTabsMeta)
+			.where(eq(userRecentTabsMeta.userId, "workspace-user"))
+			.get()?.revision;
+	}
+
+	// The projection already matches (the tab is attached), so no tab row changes —
+	// the membership write must STILL land, in its own transaction.
+	it("lands the membership row when the tab projection is already in place", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		seedNarrator("n1");
+		// The workspace header tab must exist, or `regroupWorkspaces` treats the
+		// child as an orphan and detaches it — which would be a CHANGE, not the
+		// no-op branch this test is about.
+		seedTab({
+			id: "tab-ws",
+			tabKey: "workspace:ws",
+			type: "workspace",
+			entityId: "ws",
+			title: "ws",
+			sortOrder: 0,
+		});
+		seedTab({
+			id: "tab-n1",
+			tabKey: "narrator:n1",
+			type: "narrator",
+			entityId: "n1",
+			title: "n1",
+			sortOrder: 1,
+			workspaceId: "ws",
+			representedNarratorId: "n1",
+		});
+
+		const result = await applyWorkspaceMembershipProjection("workspace-user", {
+			narratorId: "n1",
+			workspaceId: "ws",
+			panelMembership: { action: "insert", row: panelRow("panel-n1", "ws", "n1") },
+		});
+
+		expect(result.changed).toBe(false);
+		expect(
+			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
+		).toHaveLength(1);
+		// A no-op projection bumps no revision and broadcasts nothing.
+		expect(readRevision()).toBe(7);
+		expect(broadcasts.some(({ event }) => event.type === "user:recent_tabs_delta")).toBe(false);
+	});
+
+	// A failure inside the declared write (here: the (workspace, narrator) unique
+	// index) must roll the WHOLE transaction back — tab rows, revision bump and
+	// broadcast included — not just skip the panel row.
+	it("rolls back the tab projection, revision and broadcast when the membership write fails", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		seedNarrator("n1");
+		seedTab({
+			id: "tab-ws",
+			tabKey: "workspace:ws",
+			type: "workspace",
+			entityId: "ws",
+			title: "ws",
+			sortOrder: 0,
+		});
+		// The tab is NOT attached, so the projection would change rows this time.
+		seedTab({
+			id: "tab-n1",
+			tabKey: "narrator:n1",
+			type: "narrator",
+			entityId: "n1",
+			title: "n1",
+			sortOrder: 1,
+			representedNarratorId: "n1",
+		});
+		// A pre-existing row makes the declared insert violate the unique index
+		// mid-transaction, after the tab diff has already been applied.
+		db.insert(workspacePanels)
+			.values(panelRow("panel-existing", "ws", "n1"))
+			.run();
+
+		await expect(
+			applyWorkspaceMembershipProjection("workspace-user", {
+				narratorId: "n1",
+				workspaceId: "ws",
+				panelMembership: { action: "insert", row: panelRow("panel-dupe", "ws", "n1", 2000) },
+			}),
+		).rejects.toThrow();
+
+		expect(
+			db
+				.select({ workspaceId: userRecentTabs.workspaceId })
+				.from(userRecentTabs)
+				.where(eq(userRecentTabs.tabKey, "narrator:n1"))
+				.get()?.workspaceId,
+		).toBe(null);
+		expect(readRevision()).toBe(7);
+		expect(
+			db.select().from(workspacePanels).where(eq(workspacePanels.workspaceId, "ws")).all(),
+		).toHaveLength(1);
+		expect(broadcasts.some(({ event }) => event.type === "user:recent_tabs_delta")).toBe(false);
+	});
+
+	// Removing a panel whose row is already gone is a no-op write, not an error:
+	// the tab release is the intent and is idempotent.
+	it("releases the tab even when the membership row is already gone", async () => {
+		seedUser();
+		seedWorkspace("ws");
+		seedNarrator("n1");
+		seedTab({
+			id: "tab-ws",
+			tabKey: "workspace:ws",
+			type: "workspace",
+			entityId: "ws",
+			title: "ws",
+			sortOrder: 0,
+		});
+		seedTab({
+			id: "tab-n1",
+			tabKey: "narrator:n1",
+			type: "narrator",
+			entityId: "n1",
+			title: "n1",
+			sortOrder: 1,
+			workspaceId: "ws",
+			representedNarratorId: "n1",
+		});
+
+		const result = await applyWorkspaceMembershipProjection("workspace-user", {
+			narratorId: "n1",
+			workspaceId: null,
+			panelMembership: { action: "remove", panelId: "panel-never-existed" },
+		});
+
+		expect(result.changed).toBe(true);
+		expect(
+			db
+				.select({ workspaceId: userRecentTabs.workspaceId })
+				.from(userRecentTabs)
+				.where(eq(userRecentTabs.tabKey, "narrator:n1"))
+				.get()?.workspaceId,
+		).toBe(null);
+	});
+
+	// Compile-time negative test, enforced by `tsgo --noEmit`: the membership port
+	// takes DATA, so no function — sync or async — can be supplied as the write.
+	// This is what keeps the SQLite early-commit hazard inexpressible rather than
+	// merely unidiomatic.
+	it("statically refuses callback-shaped work", () => {
+		// @ts-expect-error — a callback is not a declarative membership write
+		const notAWrite: WorkspacePanelMembershipWrite = async () => {};
+		void notAWrite;
 	});
 });
 

@@ -580,16 +580,29 @@ interface NarratorWSCallbacks {
 		required?: number;
 		resumeAction: "retry" | "continue";
 	}) => void;
-	/** The narrator is suspended waiting for a NUG model to recover (credential pool exhausted). */
+	/**
+	 * The narrator is parked on a self-recovering block: a NUG model to recover
+	 * (credential pool exhausted), or a Kimi quota window to reset.
+	 */
 	onModelUnavailableWaiting?: (info: {
 		message: string;
 		model: string;
 		providerId?: string;
 		providerPrefix?: string;
 		nugModelId?: string;
+		waitKind?: "credentials" | "quota";
+		/** Epoch ms the quota window resets at (`quota` waits only). */
+		resumeAt?: number;
 	}) => void;
-	/** A suspended narrator's NUG model recovered; it is resuming. */
-	onModelUnavailableRecovered?: (info: { model: string; nugModelId?: string }) => void;
+	/**
+	 * A parked narrator's block cleared; it is resuming. `waitKind` matches the wait
+	 * it was parked on, so the notice can be worded consistently.
+	 */
+	onModelUnavailableRecovered?: (info: {
+		model: string;
+		nugModelId?: string;
+		waitKind?: "credentials" | "quota";
+	}) => void;
 	onQueueStatus?: (position?: number, queueDepth?: number, queueMessage?: string) => void;
 	onWebSearch?: (
 		id: string,
@@ -1330,12 +1343,15 @@ export function useNarratorWS(
 							providerId: data.providerId as string | undefined,
 							providerPrefix: data.providerPrefix as string | undefined,
 							nugModelId: data.nugModelId as string | undefined,
+							waitKind: data.waitKind as "credentials" | "quota" | undefined,
+							resumeAt: data.resumeAt as number | undefined,
 						});
 						break;
 					case "model_unavailable_recovered":
 						callbackOwner.callbacks.onModelUnavailableRecovered?.({
 							model: data.model as string,
 							nugModelId: data.nugModelId as string | undefined,
+							waitKind: data.waitKind as "credentials" | "quota" | undefined,
 						});
 						break;
 					case "queue_status":

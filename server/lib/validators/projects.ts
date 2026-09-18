@@ -33,6 +33,8 @@ export const projectChapterSettingsSchema = z.object({
 		.object({
 			disabledRoutines: z.array(z.string()).optional(),
 			enabledRoutines: z.array(z.string()).optional(),
+			/** Three-position mode per optional tool routine. See lib/routine-modes.ts. */
+			toolModes: z.record(z.string(), z.enum(["manual", "auto", "resident"])).optional(),
 		})
 		.optional(),
 	whitelistDirs: z.array(whitelistDirEntrySchema).max(50).optional(),

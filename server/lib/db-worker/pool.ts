@@ -744,6 +744,22 @@ export function setDbWorkerSpecifiersForTest(specifiers: string[] | null): void 
 	state().testSpecifiers = specifiers;
 }
 
+/**
+ * Whether the pool can currently take work, and why not when it cannot.
+ *
+ * Exists so a caller can report its own capabilities honestly WITHOUT reading pool internals or
+ * having to attempt a task first. `getDbWorkerPoolStats` already exposes `disabledReason`, but it
+ * also exposes worker counts and queue depth — diagnostics that a capability check has no business
+ * depending on, and which would make every such caller re-derive the same `reason === null` rule.
+ *
+ * Deliberately does NOT spawn anything: a capability query that started a thread would make merely
+ * rendering the storage page pay for a worker.
+ */
+export function getDbWorkerAvailability(): { available: boolean; reason: string | null } {
+	const reason = workersDisabled();
+	return { available: reason === null, reason };
+}
+
 export function getDbWorkerPoolStats(): {
 	workers: number;
 	busy: number;
