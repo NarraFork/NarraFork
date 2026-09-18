@@ -26,6 +26,8 @@ import { fileURLToPath } from "node:url";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
+import type { DatabaseVerificationPort } from "./backend/lifecycle-port";
+import { sqliteVerificationPort } from "./backend/sqlite-verification";
 import { getDbPath } from "./connection";
 import {
 	DB_INTEGRITY_MODE_ENV,
@@ -218,6 +220,13 @@ export interface BackgroundIntegrityCheckOptions {
 	/** Skip on Bun --hot reloads: the same process already verified (or skipped) this database. */
 	isHotReload: boolean;
 	delayMs?: number;
+	/**
+	 * Which backend's verification capability to consult. Defaults to SQLite, the only wired backend.
+	 *
+	 * Injectable so the "this engine cannot be probed out of band" branch is testable without a
+	 * second backend existing — an untested branch is a branch nobody can trust when it first fires.
+	 */
+	verification?: DatabaseVerificationPort;
 	/** test-only: replace the subprocess probe so the decision/bookkeeping paths need no spawn. */
 	probe?: (mode: IntegrityProbeMode) => Promise<IntegrityProbeReport>;
 	/** test-only: called once the probe result has been fully handled. */
@@ -231,7 +240,9 @@ export type BackgroundIntegrityDecision =
 	| "disabled_by_env"
 	| "hot_reload"
 	| "repair_pending"
-	| "clean_shutdown";
+	| "clean_shutdown"
+	/** The backend has no out-of-band verification concept — not a failure, and not a silent "ok". */
+	| "unsupported_by_backend";
 
 /**
  * Verify the database in the background, after the server is already serving.
@@ -243,6 +254,30 @@ export function scheduleBackgroundIntegrityCheck(
 	options: BackgroundIntegrityCheckOptions,
 ): BackgroundIntegrityDecision {
 	if (probeState.scheduled) return "already_scheduled";
+
+	// Gate on the backend's capability BEFORE reading env or markers: a backend with no out-of-band
+	// verification has nothing for any of those knobs to configure. Note what this must never become:
+	// a probe that returns "ok" for an engine it cannot inspect. That would retire the whole
+	// corruption-detection path while every log line kept saying the database is healthy.
+	const verification = options.verification ?? sqliteVerificationPort;
+	const probeCapability = verification.outOfBandProbe();
+	if (!probeCapability.supported) {
+		logger.info("Background database verification not applicable for this backend", {
+			backendId: verification.backendId,
+			code: probeCapability.code,
+			reason: probeCapability.reason,
+		});
+		return "unsupported_by_backend";
+	}
+	if (!probeCapability.value.readOnly) {
+		// A verification pass that can write would contend with live sessions for the write lock and
+		// could mutate the very state it is judging. Refuse rather than schedule it.
+		logger.error("Refusing to schedule a verification probe that is not read-only", {
+			backendId: verification.backendId,
+			description: probeCapability.value.description,
+		});
+		return "unsupported_by_backend";
+	}
 
 	const explicitMode = process.env.NARRAFORK_DB_INTEGRITY_CHECK?.trim();
 	// NARRAFORK_DB_INTEGRITY_CHECK:
@@ -279,6 +314,8 @@ export function scheduleBackgroundIntegrityCheck(
 			logger.info("Background database integrity check started", {
 				mode,
 				reason: options.wasClean ? "forced" : "unclean_shutdown",
+				backendId: verification.backendId,
+				probe: probeCapability.value.description,
 			});
 			const report = await (options.probe ?? runIntegrityProbe)(mode);
 			if (probeState.cancelled) return;

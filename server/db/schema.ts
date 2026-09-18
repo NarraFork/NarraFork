@@ -3,6 +3,7 @@ import type {
 	FileChangeExecutionBinding,
 	FileChangeExecutionReceipt,
 	FileChangeIdentity,
+	FileChangeRecoveryDecision,
 	FileChangeRevertMutationJournal,
 	FileChangeState,
 } from "@shared/file-change-protocol";
@@ -457,6 +458,13 @@ export const narrators = sqliteTable(
 		logicalRunId: text("logical_run_id"),
 		/** Mailbox arrival counter; capacity reservations never increment it. */
 		inboxSequence: integer("inbox_sequence").notNull().default(0),
+		/**
+		 * Allocation counter for narrator_message_refs.seq: the next claimable seq, claimed by
+		 * `next_seq = next_seq + 1 … RETURNING` (which doubles as the per-narrator row lock).
+		 * Before startup completes, data-backfills.ts raises existing counters to at least
+		 * MAX(refs.seq)+1 (or 0), without lowering previously claimed values.
+		 */
+		nextSeq: integer("next_seq").notNull().default(0),
 		// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages
 		forkMessageId: text("fork_message_id").references((): any => narratorMessages.id),
 		type: text("type", { enum: ["primary", "subagent"] })
@@ -3698,6 +3706,32 @@ export const fileChangeScopes = sqliteTable(
 		index("idx_fc_scope_status").on(table.status, table.updatedAt),
 		index("idx_fc_scope_active_lease").on(table.deviceId, table.activeLeaseId, table.canonicalRoot),
 	],
+);
+
+// Human-driven external recovery of a quarantined scope: one row per recovery,
+// recording WHO accepted WHICH re-observed physical state to close the books.
+// Audit only; it never rewrites the frozen execution receipts it refers to.
+export const fileChangeScopeRecoveries = sqliteTable(
+	"file_change_scope_recoveries",
+	{
+		id: text("id").primaryKey(),
+		scopeId: text("scope_id")
+			.notNull()
+			.references(() => fileChangeScopes.id),
+		deviceId: text("device_id").notNull(),
+		canonicalRoot: text("canonical_root").notNull(),
+		pathFlavor: text("path_flavor", { enum: ["posix", "windows"] }).notNull(),
+		recoveredByUserId: text("recovered_by_user_id").references(() => users.id, {
+			onDelete: "set null",
+		}),
+		effectDecisionsJson: text("effect_decisions_json", { mode: "json" })
+			.$type<FileChangeRecoveryDecision[]>()
+			.notNull(),
+		scopeRevisionBefore: integer("scope_revision_before").notNull(),
+		fencingTokenBefore: integer("fencing_token_before").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [index("idx_fc_scope_recovery_scope").on(table.scopeId, table.createdAt)],
 );
 
 // Metadata only. Raw bodies live in file-change-blobs; expired rows remain as
