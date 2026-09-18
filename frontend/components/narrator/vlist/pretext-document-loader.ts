@@ -3,7 +3,15 @@ import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/t
 
 export type PretextDocumentFetchPage = (
 	narratorId: string,
-	opts: { afterSeq?: number; beforeSeq?: number; limit: number; messageVersion?: number },
+	opts: {
+		afterSeq?: number;
+		beforeSeq?: number;
+		limit: number;
+		messageVersion?: number;
+		signal?: AbortSignal;
+		maxResponseBytes?: number;
+		onResponseBytes?: (bytes: number) => void;
+	},
 ) => Promise<PretextDocumentPageResult>;
 
 export interface PretextDocumentLoadOptions {
@@ -19,6 +27,11 @@ export interface PretextDocumentLoadOptions {
 	/** Hard safety bound for one exact-layout build. */
 	maxMessages?: number;
 	fetchPage?: PretextDocumentFetchPage;
+	locateMessage?: (
+		narratorId: string,
+		messageId: string,
+		signal?: AbortSignal,
+	) => Promise<{ seq: number }>;
 	onProgress?: (loadedMessages: number) => void;
 }
 
@@ -108,6 +121,76 @@ export async function loadPretextDocumentTail(
 		oldestLoadedSeq: oldestSeqOf(page.messages),
 		hasPrev: page.hasPrev,
 	};
+}
+
+/**
+ * Re-read the current window by stable first-message ID, not its shifted seq.
+ * Budget follows the loaded window (+100 mutation slots), capped at 10,000 rows,
+ * 100 pages, 32 MiB of wire JSON and a shared 10s cancellation budget. This covers
+ * the normal 800–1200 row trim window AND several thousand browsed history rows.
+ * No tail jump or unbounded history walk; a partial window is never committed.
+ */
+export async function refreshPretextDocumentWindow(
+	narratorId: string,
+	previous: PretextDocumentInput,
+	options: PretextDocumentLoadOptions = {},
+): Promise<PretextDocumentInput | undefined> {
+	const firstId = previous.messages[0]?.id;
+	if (!firstId || previous.messages.length > 10_000) return undefined;
+	const pageBudget = Math.min(100, Math.max(5, Math.ceil((previous.messages.length + 100) / 100)));
+	let remainingBytes = 32 * 1024 * 1024;
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 10_000);
+	try {
+		const locate = options.locateMessage ?? narratorsApi.getMessageLocation;
+		const location = await locate(narratorId, firstId, controller.signal);
+		const fetchPage = resolveFetchPage(options.fetchPage);
+		let afterSeq = location.seq - 1;
+		let version: number | undefined;
+		let hasPrev = false;
+		const messages: TreeMessage[] = [];
+		for (let pageIndex = 0; pageIndex < pageBudget; pageIndex++) {
+			if (controller.signal.aborted || remainingBytes <= 0) return undefined;
+			let reportedBytes: number | undefined;
+			const page = await fetchPage(narratorId, {
+				afterSeq,
+				limit: 100,
+				messageVersion: version,
+				signal: controller.signal,
+				maxResponseBytes: remainingBytes,
+				onResponseBytes: (bytes) => {
+					reportedBytes = bytes;
+				},
+			});
+			// Production reports actual streamed bytes before JSON parsing. Custom
+			// fetchers used by embedders/tests still pay the serialized-payload budget.
+			const pageBytes = reportedBytes ?? new TextEncoder().encode(JSON.stringify(page)).byteLength;
+			remainingBytes -= pageBytes;
+			if (remainingBytes < 0 || controller.signal.aborted) return undefined;
+			assertValidMessageVersion(page.messageVersion);
+			if (version != null && version !== page.messageVersion) return undefined;
+			version = page.messageVersion;
+			if (pageIndex === 0) {
+				// A concurrent insertion between locate and fetch can shift the boundary.
+				if (page.messages[0]?.id !== firstId) return undefined;
+				hasPrev = page.hasPrev;
+			}
+			if (page.messages.length > 100) return undefined;
+			messages.push(...page.messages);
+			if (!page.hasNext)
+				return {
+					messages,
+					messageVersion: version,
+					oldestLoadedSeq: oldestSeqOf(messages),
+					hasPrev,
+				};
+			if (page.maxSeq == null || page.maxSeq <= afterSeq) return undefined;
+			afterSeq = page.maxSeq;
+		}
+		return undefined;
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 /**

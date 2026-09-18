@@ -955,7 +955,9 @@ function InlineBlockView({
  *
  * The box is width-pinned and `overflow:hidden` so a font-loading hiccup or a
  * KaTeX version drift can never push the surrounding text around — the geometry
- * the height model committed to always wins (zero-DOM contract).
+ * the height model committed to always wins (zero-DOM contract). The geometry
+ * model includes KaTeX's class-only `boxpad` padding, so `\boxed` remains inside
+ * the reserved width instead of relying on visible overflow.
  *
  * `fontSize` is load-bearing, not cosmetic: KaTeX sizes its root box RELATIVELY
  * (`.katex { font: normal 1.21em … }`), so without an explicit base it inherits

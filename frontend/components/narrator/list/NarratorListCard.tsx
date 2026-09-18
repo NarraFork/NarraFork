@@ -31,6 +31,7 @@ import { NarratorAvatar } from "../header/NarratorAvatar";
 const ATTENTION_TAG_PRIORITY = [
 	"error",
 	"model_unavailable",
+	"quota_exhausted",
 	"compacting",
 	"background_compacting",
 	"suspended",

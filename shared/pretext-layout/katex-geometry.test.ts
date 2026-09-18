@@ -134,6 +134,14 @@ describe("measureKatex — basic geometry", () => {
 });
 
 describe("measureKatex — special boxes", () => {
+	it("reserves width for boxed formula borders", () => {
+		const plain = measure("21");
+		const boxed = measure("\\boxed{21}");
+		console.log({ plainWidth: plain.width, boxedWidth: boxed.width, boxedHeight: boxed.height });
+		const borderPx = BASE_PX * KATEX_FONT_SCALE * 0.04 * 2;
+		expect(boxed.width - plain.width).toBeGreaterThanOrEqual(borderPx - 0.01);
+	});
+
 	it("counts the sqrt radical's min-width and content padding", () => {
 		// The radical's own box comes from CSS `min-width` on `.hide-tail`, and the
 		// radicand is shifted by `padding-left: 0.833em`. Dropping either rule made

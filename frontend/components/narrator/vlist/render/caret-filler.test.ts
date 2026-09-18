@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
+import { shellSource } from "../guard-source";
 import { shouldFillCaretStrip } from "./caret-filler";
 
 describe("shouldFillCaretStrip", () => {
@@ -47,7 +48,7 @@ describe("caret filler wiring (drag-selection regression)", () => {
 	});
 
 	it("fills the extended part of a row's hit box in the list shell", () => {
-		const source = readFileSync(`${import.meta.dir}/../PretextExactMessageList.tsx`, "utf8");
+		const source = shellSource();
 		expect(source).toContain("<CaretFiller top={height} height={hitHeight - height}");
 	});
 

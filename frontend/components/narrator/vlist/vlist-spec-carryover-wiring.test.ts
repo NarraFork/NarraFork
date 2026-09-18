@@ -21,11 +21,12 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { shellSource } from "./guard-source";
 import type { VListItem } from "./vlist-pipeline";
 import { isSpecCarryoverItem, resolveSpecCarryoverActions } from "./vlist-spec-carryover-actions";
 
 const DIR = import.meta.dir;
-const SHELL = readFileSync(join(DIR, "PretextExactMessageList.tsx"), "utf8");
+const SHELL = shellSource();
 const DISPATCH = readFileSync(join(DIR, "render-registry.tsx"), "utf8");
 const CARD = readFileSync(join(DIR, "render", "RenderSystemText.tsx"), "utf8");
 const ACTIONS = readFileSync(join(DIR, "vlist-spec-carryover-actions.ts"), "utf8");

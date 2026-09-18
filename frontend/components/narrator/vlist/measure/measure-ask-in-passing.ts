@@ -3,11 +3,11 @@
  *
  * Two sub-cards, both authored by AskInPassingCard.tsx:
  *
- *   ┌ pending (AskInPassingPendingCard) — FIXED 77px ────────────────────────────┐
+ *   ┌ pending (AskInPassingPendingCard) — FIXED 79px (border-box) ──────────────┐
  *   │  <Box px="md" py="xs" radius=md dashed-border>                             │
  *   │    row1: <Group gap=6 mb=4> icon(14) + <Text xs dimmed hint>  → 17 + mb 4  │
  *   │    row2: <Group> TextInput sm(36) flex=1 + Button sm(36) + Button sm(36)   │
- *   │  height = py(10)×2 + (17 + 4) + 36 = 77                                    │
+ *   │  height = border(1)×2 + py(10)×2 + (17 + 4) + 36 = 79                    │
  *   └────────────────────────────────────────────────────────────────────────────┘
  *   ┌ resolved (AskInPassingResolvedCard) — 57~77px (lineClamp=2 caps it) ────────┐
  *   │  <Paper px="sm" py="xs" borderLeft:3px>                                    │
@@ -72,7 +72,7 @@ export const XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** sm body line box height: round(14 × 1.45) = 20. */
 export const SM_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm); // 20
 
-// ── pending: fixed 77px ──────────────────────────────────────────────────────
+// ── pending: fixed 79px (including borders) ──────────────────────────────────────────────────────
 
 /** Box py="xs" inner padding (top & bottom). */
 export const PENDING_PADDING_Y = SPACING.xs; // 10
@@ -84,9 +84,15 @@ export const PENDING_HINT_ROW = Math.max(14, XS_LINE_HEIGHT); // 17
 export const PENDING_HINT_MARGIN = 4;
 /** Input row: TextInput size="sm" + Button size="sm" are all 36px tall. */
 export const PENDING_INPUT_ROW = 36;
-/** Full pending card height. ≈77px. */
+/** Dashed border on every side participates in the border-box height. */
+export const PENDING_BORDER = 1;
+/** Full pending card border-box height: 79px. */
 export const PENDING_CARD_HEIGHT =
-	PENDING_PADDING_Y * 2 + (PENDING_HINT_ROW + PENDING_HINT_MARGIN) + PENDING_INPUT_ROW; // 77
+	PENDING_BORDER * 2 +
+	PENDING_PADDING_Y * 2 +
+	PENDING_HINT_ROW +
+	PENDING_HINT_MARGIN +
+	PENDING_INPUT_ROW;
 
 // ── resolved: 57~77px (question line count clamped to [1, 2]) ─────────────────
 
@@ -191,7 +197,7 @@ export function measureAskInPassing(
 		: measureResolved(data as AskInPassingResolvedData, contentWidth);
 }
 
-// ── pending: single fixed block, 77px ────────────────────────────────────────
+// ── pending: single fixed block, 79px ────────────────────────────────────────
 function measurePending(data: AskInPassingPendingData, contentWidth: number): MeasuredElement {
 	const block: PreparedFixedBlock = {
 		...baseBlockFields(),

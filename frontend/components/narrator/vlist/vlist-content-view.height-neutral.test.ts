@@ -20,6 +20,7 @@ import { afterAll, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
+import { shellSource } from "./guard-source";
 import { DETAIL_TOP_MARGIN, measureToolBody, measureToolDetail } from "./measure/measure-tool-call";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { sliceBracketedRegion } from "./source-slice";
@@ -100,7 +101,7 @@ describe("wrap / source toggles stay out of the measure path", () => {
 	});
 
 	it("never reach the layout options the document is built from", () => {
-		const src = read("PretextExactMessageList.tsx");
+		const src = shellSource();
 		// Brace-matched: a hardcoded `"\n\t});"` end sentinel assumed one tab of
 		// indentation and broke when the shell was re-indented (see source-slice.ts).
 		const options = sliceBracketedRegion(src, "usePretextDocument(narratorId, {");
@@ -114,7 +115,7 @@ describe("wrap / source toggles stay out of the measure path", () => {
 		const hook = read("useVListContentView.ts");
 		expect(hook).toContain("viewStateSig(");
 		// And the shell consumes it in exactly one place: the row's interaction sig.
-		const shell = read("PretextExactMessageList.tsx");
+		const shell = shellSource();
 		const consumers = shell.split("\n").filter((line) => line.includes("contentView.rowSig("));
 		expect(consumers).toHaveLength(1);
 		expect(consumers[0]).toContain("interactionSig");
@@ -155,7 +156,7 @@ describe("a plain row's source view cannot resize the row", () => {
 	});
 
 	it("wires the row's source state without touching the layout inputs", () => {
-		const shell = read("PretextExactMessageList.tsx");
+		const shell = shellSource();
 		// The toggle is read from the viewer controls (pure render state) and handed to
 		// the renderer through `extra` — the same channel every other render-only prop
 		// uses. `resolveItemViewTargets` decides ELIGIBILITY from the measured form.

@@ -13,11 +13,24 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { shellModule } from "./guard-source";
 
 const SHELL = join(import.meta.dir, "PretextExactMessageList.tsx");
 
 function shell(): string {
 	return readFileSync(SHELL, "utf8");
+}
+
+/**
+ * The row component's own module, which owns the memo comparator asserted on below.
+ *
+ * Read separately from the shell (rather than through the concatenated module set)
+ * because the comparator is located by cutting from `const ExactRow = memo(` to the
+ * next `\n);` — sentinels that a concatenated source could satisfy from a different
+ * module, silently moving the window off its subject.
+ */
+function row(): string {
+	return shellModule("ExactRow.tsx");
 }
 
 /**
@@ -142,7 +155,7 @@ describe("ExactRow memo identity", () => {
 	}
 
 	it("compares measured + spec identity rather than the item wrapper", () => {
-		const cmp = comparator(shell());
+		const cmp = comparator(row());
 		expect(cmp).toContain("prev.item.measured === next.item.measured");
 		expect(cmp).toContain("prev.item.spec.key === next.item.spec.key");
 		expect(cmp).toContain("prev.item.spec.kind === next.item.spec.kind");
@@ -153,7 +166,7 @@ describe("ExactRow memo identity", () => {
 	// Everything the row paints from `spec` must be compared, or a change would not
 	// reach the DOM. Today that is `key` and `unitId` (`data-nf-unit`).
 	it("compares every spec field the row renders", () => {
-		const source = shell();
+		const source = row();
 		const rowBody = source.slice(
 			source.indexOf("const ExactRow = memo("),
 			source.indexOf("\t(prev, next) =>"),

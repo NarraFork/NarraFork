@@ -109,20 +109,16 @@ export function frameKeyframes(motion: FoldFrameMotion): Keyframe[] {
 }
 
 /**
- * Keyframes for a nested row BLOCK that changed size: close (or open) the block itself.
+ * Keyframes for a nested row BLOCK transition.
  *
- * This is what makes a drill-down CLOSE instead of vanish. A drilled row's block IS the
- * card (`blockHeight === card.height`), so React commits the 18.8px summary height in the
- * first frame and the card — header included — disappears instantly, while the rows below
- * slide up from outside the already-short box and appear to emerge from a clip line.
- * Animating the block's height fixes both at once: the card visibly closes, and the rows
- * below stay glued to its bottom edge because they travel exactly the height it lost, over
- * the same duration and easing.
+ * Expand uses `clip-path` on the block's already-committed final height, so the card content
+ * is revealed from the summary height without a stale CSS height clip. Collapse uses `height`
+ * on the retained card block, progressively shrinking its `overflow:hidden` clip.
  *
- * `height` is a layout property, and animating it here is the documented exemption (see
- * `FoldNestedRowResize`): the block is absolutely positioned inside its trace with no
- * in-flow siblings, every sibling row is placed by the pure layout's own `top`, and
- * nothing reads this box back. `scaleY` is NOT usable — it would squash the card's text.
+ * The collapse height write is the documented layout exception (see `FoldNestedRowResize`):
+ * the block is absolutely positioned inside its trace with no in-flow siblings, every sibling
+ * row is placed by the pure layout's own `top`, and nothing reads this box back. `scaleY` is
+ * NOT usable — it would squash the card's text.
  */
 export function nestedResizeKeyframes(fromHeight: number, toHeight: number): Keyframe[] {
 	return [

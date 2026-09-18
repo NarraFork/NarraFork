@@ -475,13 +475,32 @@ describe("planFoldNestedRowMotion", () => {
 		const shifts = planFoldNestedRowMotion({ before, after });
 		// Only the closed row's block resizes; the still-drilled one keeps its height.
 		expect(resizes).toEqual([
-			{ traceKey: "act1", rowKey: "row-0", fromHeight: 41.0, toHeight: 18.8 },
+			{
+				traceKey: "act1",
+				rowKey: "row-0",
+				kind: "resize",
+				fromHeight: 41.0,
+				toHeight: 18.8,
+			},
 		]);
-		const lost = resizes.reduce((a, r) => a + (r.fromHeight - r.toHeight), 0);
+		const lost = 41.0 - 18.8;
 		for (const shift of shifts) {
 			expect(Math.round(shift.fromOffset * 10)).toBe(Math.round(lost * 10));
 		}
 		expect(shifts.length).toBe(3);
+	});
+
+	it("reveals an expanded nested block inside its final height", () => {
+		const before = nested([["act1", [["row-0", 22.8, 18.8]]]]);
+		const after = nested([["act1", [["row-0", 22.8, 41.0]]]]);
+		expect(planFoldNestedRowResize({ before, after })).toEqual([
+			{
+				traceKey: "act1",
+				rowKey: "row-0",
+				kind: "reveal",
+				fromInsetBottom: 22.2,
+			},
+		]);
 	});
 
 	it("disqualifies the WHOLE trace when any one row moved too far to read", () => {

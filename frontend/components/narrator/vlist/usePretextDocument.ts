@@ -186,6 +186,8 @@ export interface UsePretextDocumentResult {
 
 	error?: Error;
 	reload: () => void;
+	/** Bounded canonical refresh of the current window; never jumps to an ask source. */
+	refreshAskInPassing: () => Promise<boolean>;
 	/** Extend the loaded window upward by one older page (reverse infinite scroll). */
 	loadOlder: () => void;
 	/**
@@ -719,6 +721,18 @@ export function usePretextDocument(
 			}) ?? false,
 		[coordinator, options.getCurrentView, options.isSubagent],
 	);
+	const refreshAskInPassing = useCallback(
+		() =>
+			coordinator?.refreshAskInPassing(() => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			}) ?? Promise.resolve(false),
+		[coordinator, options.getCurrentView],
+	);
 	const insertMessage = useCallback(
 		(message: TreeMessage) =>
 			coordinator?.insertMessage(message, () => {
@@ -813,6 +827,7 @@ export function usePretextDocument(
 
 		error: snapshot.error,
 		reload,
+		refreshAskInPassing,
 		loadOlder,
 		loadOlderAsync,
 		applyCompactProgress,

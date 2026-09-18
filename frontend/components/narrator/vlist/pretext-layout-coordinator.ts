@@ -39,7 +39,9 @@ import {
 	loadPretextDocumentTail,
 	type PretextDocumentInput,
 	type PretextDocumentLoadOptions,
+	refreshPretextDocumentWindow,
 } from "./pretext-document-loader";
+import { askInPassingBlock, syncAskInPassingMessage } from "./vlist-ask-in-passing-sync";
 import { trimClockNow, trimLoadedHead } from "./vlist-head-trim";
 import { appendLoadedMessage, upsertLoadedMessage } from "./vlist-message-append";
 import { insertLoadedMessage } from "./vlist-message-insert";
@@ -146,6 +148,12 @@ export function captureCoordinatorAnchor(
 export class PretextLayoutCoordinator {
 	private generation = 0;
 	private input: PretextDocumentInput | undefined;
+	private deletedMessageIds = new Set<string>();
+	/** Seq projection version, separate from the layout cache's messageVersion. */
+	private structureVersion: number | undefined;
+	private pendingAskRefresh: Promise<boolean> | undefined;
+	/** Includes declined canonical events, which do not advance layout generation. */
+	private askMutationEpoch = 0;
 	private current: PretextLayoutCoordinatorSnapshot = { status: "idle" };
 	private readonly listeners = new Set<() => void>();
 	/** Retained so loadOlder can fetch subsequent pages without re-plumbing them. */
@@ -274,6 +282,7 @@ export class PretextLayoutCoordinator {
 				await this.prepareKatex(input);
 				if (generation !== this.generation) return this.current;
 				this.input = input;
+				this.structureVersion = input.messageVersion;
 				// Commit with the LATEST params (a resize during the fetch updates them).
 				return this.commitLayout(
 					input,
@@ -349,6 +358,7 @@ export class PretextLayoutCoordinator {
 			if (generation !== this.generation) return 0;
 			const added = next.messages.length - previous.messages.length;
 			this.input = next;
+			this.structureVersion = undefined;
 			if (added <= 0) {
 				// Nothing prepended (server reported no older rows); just refresh flags.
 				this.current = { ...this.current, input: next, hasPrev: next.hasPrev };
@@ -519,6 +529,7 @@ export class PretextLayoutCoordinator {
 		if (!this.input || !this.lastBuildOptions) return false;
 		const result = appendLoadedMessage(this.input.messages, message, isSubagent);
 		if (!result.appended) return false;
+		this.structureVersion = undefined;
 		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
 		// The persisted form of a streamed answer arrives here, so it is the second
 		// place a document's first formula can appear with no fetch to await.
@@ -546,9 +557,21 @@ export class PretextLayoutCoordinator {
 	 * creating a second bubble; genuinely new tail rows use the append path's geometry.
 	 */
 	upsertMessage(message: TreeMessage, isSubagent: boolean, getView?: () => PrependView): boolean {
+		const ask = askInPassingBlock(message);
+		if (ask) this.askMutationEpoch++;
 		if (!this.input || !this.lastBuildOptions) return false;
-		const result = upsertLoadedMessage(this.input.messages, message, isSubagent);
-		if (!result.changed) return false;
+		if (ask && this.deletedMessageIds.has(message.id)) return true;
+		const existed = this.input.messages.some((row) => row.id === message.id);
+		const askResult = ask
+			? syncAskInPassingMessage(this.input.messages, message, this.structureVersion)
+			: undefined;
+		// A declined ask is structurally ambiguous: never fall through to a generic
+		// append just because its stale seq happens to exceed our tail.
+		if (ask && !askResult) return false;
+		const result = askResult ?? upsertLoadedMessage(this.input.messages, message, isSubagent);
+		if (askResult && !existed) this.structureVersion = message.askInsertVersion;
+		else if (result.changed && !ask) this.structureVersion = undefined;
+		if (!result.changed) return !!askResult;
 		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
 		this.scheduleKatexForSyncPath([message], getView);
 		const view = getView?.();
@@ -564,6 +587,56 @@ export class PretextLayoutCoordinator {
 			result.appended,
 		);
 		return true;
+	}
+
+	/**
+	 * Resolve ambiguous ask insertion without moving the reader to its source.
+	 * Captures the LIVE viewport only after fetching. Concurrent document changes
+	 * invalidate the result; callers can retry on the next canonical event.
+	 */
+	refreshAskInPassing(getView: () => PrependView): Promise<boolean> {
+		if (this.pendingAskRefresh) return this.pendingAskRefresh;
+		const input = this.input;
+		const narratorId = this.narratorId;
+		const generation = this.generation;
+		const askMutationEpoch = this.askMutationEpoch;
+		if (!input || !narratorId || !this.lastBuildOptions) return Promise.resolve(false);
+		const run = async () => {
+			try {
+				const next = await refreshPretextDocumentWindow(narratorId, input, this.loadOptions);
+				if (
+					!next ||
+					askMutationEpoch !== this.askMutationEpoch ||
+					generation !== this.generation ||
+					!this.current.index ||
+					!this.lastBuildOptions
+				)
+					return false;
+				await this.prepareKatex(next);
+				if (generation !== this.generation || askMutationEpoch !== this.askMutationEpoch)
+					return false;
+				const view = getView();
+				const anchor = captureCoordinatorAnchor(this.current.index, view);
+				this.input = next;
+				this.structureVersion = next.messageVersion;
+				this.commitLayout(
+					next,
+					this.lastBuildOptions,
+					anchor,
+					view.viewportHeight,
+					++this.generation,
+				);
+				return true;
+			} catch {
+				// A 409 means the canonical page moved during this bounded read; leave
+				// the visible document intact rather than committing a mixed snapshot.
+				return false;
+			} finally {
+				this.pendingAskRefresh = undefined;
+			}
+		};
+		this.pendingAskRefresh = run();
+		return this.pendingAskRefresh;
 	}
 
 	/**
@@ -606,6 +679,7 @@ export class PretextLayoutCoordinator {
 		}
 		const result = insertLoadedMessage(this.input.messages, message);
 		if (!result.inserted) return false;
+		this.structureVersion = undefined;
 		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
 		// A mid-window marker (a compact summary) can carry math of its own.
 		this.scheduleKatexForSyncPath([message], getView);
@@ -644,9 +718,27 @@ export class PretextLayoutCoordinator {
 	 * Returns false when nothing was removed, so the caller can decide to reload.
 	 */
 	removeMessages(deletedIds: readonly string[], getView?: () => PrependView): boolean {
+		const alreadyDeleted =
+			deletedIds.length > 0 && deletedIds.every((id) => this.deletedMessageIds.has(id));
+		for (const id of deletedIds) this.deletedMessageIds.add(id);
+		// Bound replay protection to this document's recent mutations.
+		while (this.deletedMessageIds.size > 2048) {
+			const oldest = this.deletedMessageIds.values().next().value;
+			if (oldest === undefined) break;
+			this.deletedMessageIds.delete(oldest);
+		}
 		if (!this.input || !this.lastBuildOptions) return false;
 		const result = removeLoadedMessages(this.input.messages, deletedIds);
-		if (!result.removed) return false;
+		// Preserve the legacy full-history deletion reload contract. Only cancelling
+		// an all-ask window may empty the document in this narrow live channel.
+		if (
+			result.removed &&
+			result.messages.length === 0 &&
+			this.input.messages.some((row) => !askInPassingBlock(row))
+		)
+			return false;
+		if (!result.removed) return alreadyDeleted;
+		this.structureVersion = undefined;
 		// `oldestLoadedSeq` and `hasPrev` are deliberately NOT recomputed. They
 		// describe the upper bound of what has been FETCHED ("I hold seq >= this"),
 		// not the oldest message currently held, and their only consumer is
@@ -928,6 +1020,9 @@ export class PretextLayoutCoordinator {
 		this.loadingOlder = false;
 		this.streamingMessage = null;
 		this.input = cached;
+		// Cached input can contain version-neutral live mutations: its measure-cache
+		// version is not proof of the current seq projection version.
+		this.structureVersion = undefined;
 		try {
 			// No anchor: a restore establishes the document rather than perturbing an
 			// existing one, and the shell opens pinned to the bottom (see

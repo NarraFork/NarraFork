@@ -546,8 +546,9 @@ describe("interruption: keyframes builders receive the outgoing progress", () =>
 		expect(node.animations[0]?.cancelled).toBe(true);
 	});
 
-	it("clamps a sampled progress into 0..1", () => {
-		// `currentTime` can exceed the duration on a finished-but-uncleaned animation.
+	it("does not resume a finished-but-uncleaned animation", () => {
+		// `currentTime` can exceed the duration before the finish callback removes the stale
+		// interruption source; it must not make the next morph resume from its endpoint.
 		const scheduler = createMotionScheduler();
 		const node = progressNode(500, 200);
 		scheduler.begin();
@@ -566,7 +567,7 @@ describe("interruption: keyframes builders receive the outgoing progress", () =>
 			},
 		]);
 		scheduler.flush();
-		expect(seen[0]?.progress).toBe(1);
+		expect(seen).toEqual([null]);
 	});
 
 	it("falls back to null where the environment exposes no timing", () => {

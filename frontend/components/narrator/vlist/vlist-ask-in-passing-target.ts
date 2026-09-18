@@ -6,8 +6,8 @@
  * (MessageBubble's ask_in_passing branch): a `pending` block mounts the real input
  * form bound to (narratorId, messageId), any other status renders the resolved card
  * which navigates to `block.targetNarratorId`. The vlist draws both as zero-DOM
- * copies, so the same decision has to happen in the SHELL and be handed to the
- * renderer as a slot / callback.
+ * layouts, so the same decision happens in the SHELL and is handed to the
+ * renderer as controlled state / callbacks.
  *
  * `targetNarratorId` is deliberately NOT in the measured layout payload (it cannot
  * affect height), so it is read back from the row's own message blocks here — the
@@ -43,11 +43,8 @@ interface SourceMessage {
 /**
  * True for a row that hosts the PENDING question form.
  *
- * Split out from `resolveVListAskInPassingTarget` because the shell needs this
- * answer EARLIER than it has the manifest source ids: the set of rows whose height
- * is measured after paint (`dynamicRowKeys`) is derived before the layout, and the
- * live form is one of those rows. Depends only on the layout spec, so both stages
- * agree by construction.
+ * Depends only on the layout spec. Pending forms have deterministic geometry;
+ * this predicate must never be used to opt them into post-paint height reporting.
  */
 export function isVListAskInPassingPending(kind: VListElementKind, data: unknown): boolean {
 	if (kind !== "ask-in-passing") return false;

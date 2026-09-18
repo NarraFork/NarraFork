@@ -40,11 +40,12 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
+import React, { createContext, useContext, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invalidateAvatarCache } from "../../../hooks/useAvatarBlobUrl";
 import { useBrowserSessions } from "../../../hooks/useBrowserSessions";
 import { useChapter } from "../../../hooks/useChapters";
+import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
 import {
 	useBlacklistDirs,
 	useClearBlockedSkills,
@@ -89,12 +90,14 @@ import {
 } from "../../../lib/safe-area";
 import { DirectoryPicker } from "../../common/DirectoryPicker";
 import { UserAvatar } from "../../UserAvatar";
+import {
+	DetailsPanelContentLifetime,
+	useDetailsDraft,
+	useDetailsPanelLifecycle,
+} from "../details-panel-lifecycle";
 import { localizeNarratorError } from "../error-localization";
 import { NarratorAvatar } from "../header/NarratorAvatar";
-import {
-	SubagentModelPoolEditor,
-	useSubagentModelPoolDraft,
-} from "../model/SubagentModelPoolEditor";
+import { SubagentModelPoolEditor } from "../model/SubagentModelPoolEditor";
 import type { ViewerInfo } from "../useNarratorPanelWS";
 import {
 	type AdvancedRowInput,
@@ -365,7 +368,10 @@ function RuleList({
 	return <Stack gap="xs">{items.map((item, index) => renderItem(item, index))}</Stack>;
 }
 
-export function NarratorDetailsPanel({
+const EMPTY_POOLS: SubagentModelPools = {};
+const EMPTY_SELECTION: string[] = [];
+
+function NarratorDetailsContent({
 	opened,
 	onClose,
 	narratorId,
@@ -375,10 +381,7 @@ export function NarratorDetailsPanel({
 	planReflectionAutoApproveGlobal = false,
 	dangerReflectionGlobal = true,
 	dangerReflectionGlobalLevel,
-	displayMode = "drawer",
-	chromeless = false,
 }: NarratorDetailsPanelProps) {
-	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const navigate = useNavigate();
 	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
@@ -453,13 +456,11 @@ export function NarratorDetailsPanel({
 		dangerReflectionOverride,
 		resolvedDangerReflectionGlobalLevel,
 	);
-	const [cwdValue, setCwdValue] = useState(String(narrator?.cwd ?? ""));
-	const [cwdDirty, setCwdDirty] = useState(false);
+	const cwdDraft = useDetailsDraft(String(narrator?.cwd ?? ""));
+	const { value: cwdValue, setValue: setCwdValue, dirty: cwdDirty } = cwdDraft;
 	const { data: customTraits } = useNarratorCustomTraits(narratorId, opened);
-	const modelPoolDraft = useSubagentModelPoolDraft(
-		customTraits?.subagentModelRestriction?.pools,
-		customTraits !== undefined,
-		narratorId,
+	const modelPoolDraft = useDetailsDraft(
+		customTraits?.subagentModelRestriction?.pools ?? EMPTY_POOLS,
 	);
 	const updateSubagentModelsMutation = useUpdateSubagentModelRestriction();
 	const clearSubagentModelsMutation = useClearSubagentModelRestriction();
@@ -497,9 +498,12 @@ export function NarratorDetailsPanel({
 		},
 	});
 	const updateCwdMutation = useUpdateCwd();
-	const [disabledToolSelection, setDisabledToolSelection] = useState<string[]>([]);
-	const [blockAllSkills, setBlockAllSkills] = useState(false);
-	const [blockedSkillSelection, setBlockedSkillSelection] = useState<string[]>([]);
+	const disabledToolsDraft = useDetailsDraft(customTraits?.disabledTools?.tools ?? EMPTY_SELECTION);
+	const { value: disabledToolSelection, setValue: setDisabledToolSelection } = disabledToolsDraft;
+	const blockAllDraft = useDetailsDraft(customTraits?.blockedSkills?.all ?? false);
+	const { value: blockAllSkills, setValue: setBlockAllSkills } = blockAllDraft;
+	const blockedSkillsDraft = useDetailsDraft(customTraits?.blockedSkills?.names ?? EMPTY_SELECTION);
+	const { value: blockedSkillSelection, setValue: setBlockedSkillSelection } = blockedSkillsDraft;
 	const [exportFormat, setExportFormat] = useState<"markdown" | "json">("markdown");
 	const [exportIncludeToolIO, setExportIncludeToolIO] = useState(true);
 	// Unchecked by default: the export matches what the panel currently shows. The
@@ -529,12 +533,6 @@ export function NarratorDetailsPanel({
 		return set;
 	}, [customTraits?.blockedSkills?.names]);
 	const allSkillsBlocked = customTraits?.blockedSkills?.all ?? false;
-
-	useEffect(() => {
-		setDisabledToolSelection(customTraits?.disabledTools?.tools ?? []);
-		setBlockAllSkills(customTraits?.blockedSkills?.all ?? false);
-		setBlockedSkillSelection(customTraits?.blockedSkills?.names ?? []);
-	}, [customTraits]);
 
 	const formatDateTime = (value?: string | null) => {
 		if (!value) return t("details.notAvailable");
@@ -617,11 +615,6 @@ export function NarratorDetailsPanel({
 		return "violet";
 	};
 
-	useEffect(() => {
-		setCwdValue(String(narrator?.cwd ?? ""));
-		setCwdDirty(false);
-	}, [narrator?.cwd]);
-
 	const openChapter = () => {
 		if (!chapterId) return;
 		onClose();
@@ -648,7 +641,7 @@ export function NarratorDetailsPanel({
 		}
 		try {
 			const result = await updateCwdMutation.mutateAsync({ id: narratorId, cwd: nextCwd });
-			setCwdDirty(false);
+			cwdDraft.reset(nextCwd);
 			notifications.show({
 				title: t("details.cwdUpdatedTitle"),
 				message: result.changed ? t("details.cwdUpdated") : t("details.cwdUnchanged"),
@@ -720,7 +713,8 @@ export function NarratorDetailsPanel({
 
 	const handleSaveSubagentModels = async (pools: SubagentModelPools) => {
 		if (!customTraits) return;
-		await updateSubagentModelsMutation.mutateAsync({ id: narratorId, pools });
+		const result = await updateSubagentModelsMutation.mutateAsync({ id: narratorId, pools });
+		modelPoolDraft.reset(result.customTraits.subagentModelRestriction?.pools ?? EMPTY_POOLS);
 		notifications.show({
 			title: t("details.customTraitsSaved"),
 			message: t("details.customTraitsSaved"),
@@ -729,7 +723,8 @@ export function NarratorDetailsPanel({
 	};
 
 	const handleClearSubagentModels = async () => {
-		await clearSubagentModelsMutation.mutateAsync(narratorId);
+		const result = await clearSubagentModelsMutation.mutateAsync(narratorId);
+		modelPoolDraft.reset(result.customTraits.subagentModelRestriction?.pools ?? EMPTY_POOLS);
 		notifications.show({
 			title: t("details.customTraitsCleared"),
 			message: t("details.customTraitsCleared"),
@@ -739,6 +734,7 @@ export function NarratorDetailsPanel({
 
 	const handleSaveDisabledTools = async () => {
 		await updateDisabledToolsMutation.mutateAsync({ id: narratorId, tools: disabledToolSelection });
+		disabledToolsDraft.reset(disabledToolSelection);
 		notifications.show({
 			title: t("details.customTraitsSaved"),
 			message: t("details.customTraitsSaved"),
@@ -748,6 +744,7 @@ export function NarratorDetailsPanel({
 
 	const handleClearDisabledTools = async () => {
 		await clearDisabledToolsMutation.mutateAsync(narratorId);
+		disabledToolsDraft.reset(EMPTY_SELECTION);
 		notifications.show({
 			title: t("details.customTraitsCleared"),
 			message: t("details.customTraitsCleared"),
@@ -761,6 +758,8 @@ export function NarratorDetailsPanel({
 			all: blockAllSkills,
 			names: blockedSkillSelection,
 		});
+		blockAllDraft.reset(blockAllSkills);
+		blockedSkillsDraft.reset(blockedSkillSelection);
 		notifications.show({
 			title: t("details.customTraitsSaved"),
 			message: t("details.customTraitsSaved"),
@@ -770,6 +769,8 @@ export function NarratorDetailsPanel({
 
 	const handleClearBlockedSkills = async () => {
 		await clearBlockedSkillsMutation.mutateAsync(narratorId);
+		blockAllDraft.reset(false);
+		blockedSkillsDraft.reset(EMPTY_SELECTION);
 		notifications.show({
 			title: t("details.customTraitsCleared"),
 			message: t("details.customTraitsCleared"),
@@ -1083,10 +1084,7 @@ export function NarratorDetailsPanel({
 						</Group>
 						<DirectoryPicker
 							value={cwdValue}
-							onChange={(value) => {
-								setCwdValue(value);
-								setCwdDirty(value.trim() !== String(narrator?.cwd ?? "").trim());
-							}}
+							onChange={setCwdValue}
 							placeholder={t("details.cwdPlaceholder")}
 							description={t("details.cwdDescription")}
 							disabled={updateCwdMutation.isPending}
@@ -1097,8 +1095,7 @@ export function NarratorDetailsPanel({
 								size="xs"
 								disabled={!cwdDirty || updateCwdMutation.isPending}
 								onClick={() => {
-									setCwdValue(String(narrator?.cwd ?? ""));
-									setCwdDirty(false);
+									cwdDraft.reset(String(narrator?.cwd ?? ""));
 								}}
 							>
 								{t("cancel")}
@@ -1534,7 +1531,8 @@ export function NarratorDetailsPanel({
 					<Stack gap="md">
 						<SubagentModelPoolEditor
 							key={narratorId}
-							{...modelPoolDraft}
+							pools={modelPoolDraft.value}
+							setPools={modelPoolDraft.setValue}
 							availableModels={customTraits?.availableModels}
 							loaded={customTraits !== undefined}
 							saving={updateSubagentModelsMutation.isPending}
@@ -1955,6 +1953,35 @@ export function NarratorDetailsPanel({
 		</DetailsFilterCtx.Provider>
 	);
 
+	return content;
+}
+
+/** Reset retained state when switching narrator, but not when merely closing the panel. */
+export function NarratorDetailsPanel(props: NarratorDetailsPanelProps) {
+	return <NarratorDetailsShell key={props.narratorId} {...props} />;
+}
+
+function NarratorDetailsShell(props: NarratorDetailsPanelProps) {
+	const { opened, onClose, narrator, displayMode = "drawer", chromeless = false } = props;
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
+	useMobileDrawerHistory(opened, onClose);
+	const { t } = useTranslation("narrator");
+	const drawer = displayMode === "drawer" || isMobile;
+	const lifetime = useDetailsPanelLifecycle(opened, drawer);
+	const content = (
+		<DetailsPanelContentLifetime opened={opened} {...lifetime}>
+			<NarratorDetailsContent {...props} />
+		</DetailsPanelContentLifetime>
+	);
+	const status = narrator?.status;
+	const statusKey = `status_${status}`;
+	const translatedStatus = t(statusKey);
+	const statusLabel = !status
+		? t("details.notAvailable")
+		: translatedStatus === statusKey
+			? status
+			: translatedStatus;
+
 	// Drawer header: title + status badge, with the standard right-side × close
 	// (consistent with the terminal / spec mobile drawers). No left-arrow back.
 	// Header metrics match the narrator header: py=8 px=16, size="sm" controls,
@@ -1966,14 +1993,16 @@ export function NarratorDetailsPanel({
 				{t("details.title")}
 			</Text>
 			<Badge size="xs" color={NARRATOR_STATUS_COLORS[narrator?.status] ?? "gray"} variant="light">
-				{formatStatus(narrator?.status)}
+				{statusLabel}
 			</Badge>
 		</Group>
 	);
 
-	if (displayMode === "drawer" || isMobile) {
+	if (drawer) {
 		return (
 			<Drawer
+				keepMounted
+				onExitTransitionEnd={lifetime.onExitTransitionEnd}
 				opened={opened}
 				onClose={onClose}
 				position="right"
@@ -2011,7 +2040,7 @@ export function NarratorDetailsPanel({
 				// In the dock the ToolPanelShell owns the chrome (border, header);
 				// only draw our own border/background as a standalone sidebar.
 				borderLeft: chromeless ? undefined : "1px solid var(--mantine-color-default-border)",
-				display: "flex",
+				display: opened ? "flex" : "none",
 				flexDirection: "column",
 				overflow: "hidden",
 				background: chromeless ? undefined : "var(--mantine-color-body)",
@@ -2037,7 +2066,7 @@ export function NarratorDetailsPanel({
 						color={NARRATOR_STATUS_COLORS[narrator?.status] ?? "gray"}
 						variant="light"
 					>
-						{formatStatus(narrator?.status)}
+						{statusLabel}
 					</Badge>
 					<CloseButton size="sm" onClick={onClose} />
 				</Group>

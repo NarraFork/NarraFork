@@ -201,10 +201,12 @@ GFM 表格**不渲染真 `<table>`**。CSS `table-layout: auto` 的列宽算法�
   - 无论普通 capped 正文（`cappedBodyHeight`）还是 markdown 正文（`measureMarkdownDetail`），只要正文是服务端前缀就把盒高钉在 `cap`，**不测前缀**。测前缀会让高度取决于服务端预算切在哪里（更宽的布局把前缀折成更少行 → 盒子变矮，剩余可滚内容无处安放）；cap 永不裁切，因为盒子本身 `overflow:auto`。
   - **没有"内容已截断"提示行**：完整 payload 由读者在正文盒内滚过一半时自动取（`VListContentViewHost` 的 capture 阶段 scroll 监听），或打开全屏查看器时取。两条路都经同一个 `fullPayloadRequested` 门控，所以仍是用户动作；又因为盒高已钉在 cap，落地的完整正文测得 `min(exact, cap)` —— 对任何溢出盒子的正文（每个服务端前缀都溢出）逐像素相同。
   - `truncatedLeafCount` / `truncatedTotalBytes` 因此是**纯 payload 完整性信号**，不带几何：shell 用它判断哪些行可以取数、哪些请求在飞，measure cache 用它做 `|tp:` revision（payload 落地时唯一会动的字段）。
-- **effectiveOpened**：lodExempt(running/streaming/pendingPermission)恒展开；**最近一次 `spec://tasks.json` 调用的卡（latestSpecTasksToolUseId）恒展开**（`opts.forceExpanded`，由 adapter 从 shell 注入的 `resolveLatestSpecTasksToolUseId` 派生，任务板是叙述者的实时工作状态）；**L5 默认展开，但读者显式折叠（`userCollapsed`）时折叠**；L4 近卡随 opened、旧卡折叠；L3 全折叠 header；L1/L2 上游 gate 处理。
+- **effectiveOpened**：lodExempt(running/streaming/pendingPermission)恒展开；**最近一次 `spec://tasks.json` 调用的卡（latestSpecTasksToolUseId）恒展开**（`opts.forceExpanded`，由 adapter 从 shell 注入的 `resolveLatestSpecTasksToolUseId` 派生，任务板是叙述者的实时工作状态）；**preferOpen（AskUserQuestion 等操作型卡）在所有 LOD 默认展开，但读者显式折叠（`userCollapsed`）时仍可收起**；**L5 默认展开，但读者显式折叠（`userCollapsed`）时折叠**；L4 近卡随 opened、旧卡折叠；L3 全折叠 header；L1/L2 上游 gate 处理。
   - **⚠️ L5 不是"恒展开"**：早先这里 `return true`，于是 L5 的表头 chevron 是**死的**——shell 的 toggle 把 `!effectiveOpened` 写进 `expanded`，而该分支从不读这个通道，点击存进了没人读的状态，卡片高度毫无变化且没有任何反馈。最难受的正是最需要折叠的卡：被拒的 ExitPlanMode 实测 ~1200px（`0.85×视口`的 plan 正文 + 反思通知），超过一屏却收不起来。
   - **`userCollapsed` 必须与"派生出的 `opened === false`"区分**。后者来自 `computeDefaultOpen`，不代表读者的意图；在 L5 读它会把所有非自动展开类别的卡全部折叠。因此只有 shell 存有该 key 的偏好时才算显式折叠。
   - **`lodExempt` 优先于显式折叠**：待审批的卡折叠后权限表单无处可去。`resolveSubagentExpanded` 同一套语义（同样的缺陷、同样的修法）。
+  - **`preferOpen` ≠ `lodExempt`/`forceExpanded`**：AskUserQuestion 的选项/表单、ExitPlanMode 的 plan 正文是操作内容，低 LOD 也必须默认可见；但读者应能点 chevron 收起。因此 preferOpen 只改默认（`userCollapsed !== true` 时展开），且 adapter 把这类卡的 `collapsesByLod` 设为 false——header toggle 走 `expanded` 通道（可写 false），而不是 `lodUserOverride`（只会强制展开，点不下去）。L1/L2 activity fold 同步豁免 prefer-open 工具：`isKeptToolItem` / `groupToolItemsForLod` / `groupToolRunItemsForLod` 都把它们当 active 留下完整卡。
+  - **prefer-open 按工具名，不按 category `"plan"`**：`EnterPlanMode` 与 `ExitPlanMode` 共享 category `plan`，但前者几乎没有可审阅的 plan body。判定单源在 `shared/prefer-open-tool.ts`（`AskUserQuestion` + `ExitPlanMode`）；measure 的 category 兜底只认 `"ask"`，adapter 用 `isPreferOpenTool(toolName)` 写 `opts.preferOpen`。
 - **分组卡**：Paper p=xs + header(+×N badge) + 展开体(子 ToolCallCard 累加)。折叠 default=false。
 
 ### tool-run 折叠形态（全部基于 CollapsibleTrace，行高固定）

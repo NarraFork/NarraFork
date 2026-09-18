@@ -1,42 +1,22 @@
 /**
- * vlist-ask-in-passing-bridge.tsx — "Ask in passing" interactions for the exact vlist.
+ * vlist-ask-in-passing-bridge.tsx — list-scoped ask-in-passing controller.
  *
- * The pretext vlist paints every row as a zero-DOM copy, so the ask-in-passing
- * card had no component of its own that could own state, a mutation or routing:
- *
- *   - PENDING: `RenderAskInPassing`'s pending form is a VISUAL copy — a `readOnly`
- *     TextInput and two buttons with no handlers. The reader could type nothing and
- *     submit nothing, which is exactly the reported bug ("顺便提问功能无法使用").
- *   - RESOLVED: the measured payload carried only the question text, so the card
- *     painted its arrow but had no target narrator to navigate to.
- *
- * Both halves are restored here, mirroring how `vlist-compact-bridge` restores the
- * compact marker's interactions:
- *
- *   - pending  → mounts the REAL `AskInPassingPendingCard` from the chunked path as
- *     a row SLOT (like the permission bridge does for permission forms), so the
- *     input state, the fork+send mutation, the cancel DELETE and the navigation are
- *     literally the same component. Its row becomes a dynamic (post-paint measured)
- *     row, so a slightly different real height cannot clip the form.
- *   - resolved → binds an `onOpen` callback that opens the target narrator,
- *     resolved from the row's own message payload (the layout spec drops it).
- *     "Opens" goes through the same `useOpenAskInPassingNarrator` the cards use,
- *     so a docked surface gets a panel beside the chat and only an off-dock one
- *     navigates away.
- *
- * Lives in vlist/ (so the isolation guard allows importing outer app modules) and
- * is only ever used by PretextExactMessageList.
+ * Rows own neither drafts nor requests: the controller survives virtual row
+ * unmounts, while RenderAskInPassing remains the fixed-geometry renderer.
  */
-
-import { type ReactNode, useMemo } from "react";
-import { AskInPassingPendingCard, useOpenAskInPassingNarrator } from "../question/AskInPassingCard";
+import { useAskInPassing, useCancelAskInPassing } from "@frontend/hooks/useNarrator";
+import { subscribeAskInPassingEvents } from "@frontend/lib/ask-in-passing-events";
+import { notifications } from "@mantine/notifications";
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
+import { useOpenAskInPassingNarrator } from "../question/AskInPassingCard";
+import type { AskInPassingPendingInteraction } from "./render/RenderAskInPassing";
+import { type AskInPassingDraft, AskInPassingDraftStore } from "./vlist-ask-in-passing-state";
 import {
 	resolveVListAskInPassingTarget,
 	type VListAskInPassingTarget,
 } from "./vlist-ask-in-passing-target";
 import type { VListItem } from "./vlist-pipeline";
 
-/** The minimal message shape this bridge reads (raw loaded document messages). */
 export interface AskInPassingSourceMessage {
 	id?: unknown;
 	contentJson?: unknown;
@@ -45,46 +25,54 @@ export interface AskInPassingSourceMessage {
 export interface UseVListAskInPassingArgs {
 	narratorId: string;
 	renderItems: readonly VListItem[];
-	/** `spec.key → manifest source message ids` (system cards carry no id in the key). */
 	sourceIdsByKey: ReadonlyMap<string, readonly string[]>;
-	/** Loaded document messages — the resolved card's target id lives in their blocks. */
 	messages: readonly AskInPassingSourceMessage[];
 }
 
 export interface VListAskInPassingActions {
-	/**
-	 * `spec.key → live pending form node`. Present only for PENDING cards; those
-	 * rows must also be treated as dynamic-height rows by the shell.
-	 */
-	pendingSlots: ReadonlyMap<string, ReactNode>;
-	/** `spec.key → navigate-to-target callback`, for RESOLVED cards only. */
+	pendingByKey: ReadonlyMap<string, AskInPassingPendingInteraction>;
 	openByKey: ReadonlyMap<string, () => void>;
+	requestFocus: (messageId: string) => void;
+	forget: (messageId: string) => void;
 }
 
-const EMPTY_SLOTS: ReadonlyMap<string, ReactNode> = new Map();
-const EMPTY_OPENS: ReadonlyMap<string, () => void> = new Map();
-
-/**
- * Build the per-row ask-in-passing wiring for the currently rendered items.
- *
- * Both maps are rebuilt only when the rendered items / source ids / messages
- * change (never on scroll), so each row's slot and callback stay referentially
- * stable inside one document revision and the `ExactRow` memo keeps skipping
- * unchanged rows.
- */
 export function useVListAskInPassing({
 	narratorId,
 	renderItems,
 	sourceIdsByKey,
 	messages,
 }: UseVListAskInPassingArgs): VListAskInPassingActions {
-	// Shared with the chunked path's cards, so both open the answer in the same
-	// host: a panel beside the conversation when this surface has a dock, a route
-	// only when it does not.
 	const openAnswer = useOpenAskInPassingNarrator();
+	const { mutateAsync: resolve } = useAskInPassing();
+	const { mutateAsync: cancel } = useCancelAskInPassing();
+	// A new narrator is a new ownership scope, even when the shell is reused.
+	const scope = useMemo(() => ({ narratorId, store: new AskInPassingDraftStore() }), [narratorId]);
+	const currentScope = useRef<typeof scope | null>(scope);
+	currentScope.current = scope;
+	useEffect(() => {
+		currentScope.current = scope;
+		return () => {
+			currentScope.current = null;
+		};
+	}, [scope]);
+	const revision = useSyncExternalStore(
+		scope.store.subscribe,
+		scope.store.getSnapshot,
+		scope.store.getSnapshot,
+	);
+	useEffect(() => {
+		scope.store.reconcile(messages);
+	}, [scope, messages]);
+	useEffect(
+		() =>
+			subscribeAskInPassingEvents((event) => {
+				if (event.narratorId !== narratorId) return;
+				if (event.kind === "start") scope.store.requestFocus(event.message.id);
+				else scope.store.forget(event.kind === "deleted" ? event.messageId : event.message.id);
+			}),
+		[scope, narratorId],
+	);
 
-	// Targets first (pure): which rows are ask-in-passing cards, in which state,
-	// and where a resolved one points. Keeps the React work below trivial.
 	const targets = useMemo(() => {
 		const map = new Map<string, VListAskInPassingTarget>();
 		for (const item of renderItems) {
@@ -100,28 +88,123 @@ export function useVListAskInPassing({
 		return map;
 	}, [renderItems, sourceIdsByKey, messages]);
 
-	const pendingSlots = useMemo(() => {
-		const map = new Map<string, ReactNode>();
+	const submit = useCallback(
+		async (messageId: string) => {
+			const draft = scope.store.begin(messageId, "submitting");
+			if (!draft) return;
+			try {
+				const answer = await resolve({
+					narratorId,
+					pendingMessageId: messageId,
+					question: draft.value.trim(),
+				});
+				scope.store.forget(messageId);
+				// WS may already have unmounted the pending row; the LIST still owns this continuation.
+				if (currentScope.current === scope) openAnswer(answer.id);
+			} catch (error) {
+				scope.store.fail(messageId);
+				if (currentScope.current === scope)
+					notifications.show({
+						message: error instanceof Error ? error.message : String(error),
+						color: "red",
+						autoClose: 5000,
+					});
+			}
+		},
+		[scope, narratorId, resolve, openAnswer],
+	);
+	const dismiss = useCallback(
+		async (messageId: string) => {
+			if (!scope.store.begin(messageId, "cancelling")) return;
+			try {
+				await cancel({ narratorId, messageId });
+				scope.store.forget(messageId);
+			} catch (error) {
+				scope.store.fail(messageId);
+				if (currentScope.current === scope)
+					notifications.show({
+						message: error instanceof Error ? error.message : String(error),
+						color: "red",
+						autoClose: 5000,
+					});
+			}
+		},
+		[scope, narratorId, cancel],
+	);
+
+	const pendingCache = useRef(
+		new Map<
+			string,
+			{
+				draft: AskInPassingDraft;
+				terminal: boolean;
+				submit: typeof submit;
+				dismiss: typeof dismiss;
+				props: AskInPassingPendingInteraction;
+			}
+		>(),
+	);
+	const pendingByKey = useMemo(() => {
+		void revision;
+		const cache = new Map<
+			string,
+			{
+				draft: AskInPassingDraft;
+				terminal: boolean;
+				submit: typeof submit;
+				dismiss: typeof dismiss;
+				props: AskInPassingPendingInteraction;
+			}
+		>();
+		const map = new Map<string, AskInPassingPendingInteraction>();
 		for (const [key, target] of targets) {
 			if (target.kind !== "pending") continue;
-			map.set(
-				key,
-				<AskInPassingPendingCard messageId={target.messageId} narratorId={narratorId} />,
-			);
+			const id = target.messageId;
+			const draft = scope.store.get(id);
+			const terminal = scope.store.isTerminal(id);
+			const previous = pendingCache.current.get(key);
+			if (
+				previous?.draft === draft &&
+				previous.terminal === terminal &&
+				previous.submit === submit &&
+				previous.dismiss === dismiss
+			) {
+				map.set(key, previous.props);
+				cache.set(key, previous);
+				continue;
+			}
+			const props: AskInPassingPendingInteraction = {
+				value: draft.value,
+				// Canonical resolution/deletion may beat the list rebuild. Keep the stale
+				// pending shell inert instead of presenting an input that cannot be saved.
+				busy: terminal || draft.phase !== "editing",
+				operation: draft.phase === "editing" ? undefined : draft.phase,
+				onChange: (value) => scope.store.setValue(id, value),
+				onConfirm: () => {
+					void submit(id);
+				},
+				onCancel: () => {
+					void dismiss(id);
+				},
+				focusRequest: draft.focusRequested ? 1 : null,
+				onFocusConsumed: () => scope.store.consumeFocus(id),
+			};
+			map.set(key, props);
+			cache.set(key, { draft, terminal, submit, dismiss, props });
 		}
-		return map.size > 0 ? map : EMPTY_SLOTS;
-	}, [targets, narratorId]);
-
+		pendingCache.current = cache;
+		return map;
+	}, [scope, targets, revision, submit, dismiss]);
 	const openByKey = useMemo(() => {
 		const map = new Map<string, () => void>();
 		for (const [key, target] of targets) {
-			if (target.kind !== "resolved") continue;
-			const targetNarratorId = target.targetNarratorId;
-			if (!targetNarratorId) continue;
-			map.set(key, () => openAnswer(targetNarratorId));
+			if (target.kind !== "resolved" || !target.targetNarratorId) continue;
+			const id = target.targetNarratorId;
+			map.set(key, () => openAnswer(id));
 		}
-		return map.size > 0 ? map : EMPTY_OPENS;
+		return map;
 	}, [targets, openAnswer]);
-
-	return { pendingSlots, openByKey };
+	const requestFocus = useCallback((id: string) => scope.store.requestFocus(id), [scope]);
+	const forget = useCallback((id: string) => scope.store.forget(id), [scope]);
+	return { pendingByKey, openByKey, requestFocus, forget };
 }

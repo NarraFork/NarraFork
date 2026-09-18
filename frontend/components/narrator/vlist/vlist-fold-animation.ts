@@ -376,41 +376,37 @@ export interface FoldNestedRowMotion {
 }
 
 /**
- * The visual instruction for one nested row's own BLOCK, which changed size.
- *
- * ## Why a nested row needs a height animation and a top-level card does not
+ * The visual instruction for one nested row's own BLOCK transition.
  *
  * A drilled-in row's block IS the card: the measure layer reserves
  * `blockHeight === card.height` and `RenderToolRun` paints the box at exactly that
- * height. So un-drilling does not merely unmount a body inside a stable frame (what a
- * top-level card fold does) — it replaces a 200px block with an 18.8px one. React
- * commits the short height in the very first frame, so:
+ * height. The two directions intentionally use different CSS properties:
  *
- *  - the card, its header included, VANISHES instantly rather than closing;
- *  - the rows below start their slide from outside the now-short box and appear to
- *    emerge from a clip line, never catching up to the content above them.
+ *  - EXPAND: React commits the final card height immediately, so the block uses a
+ *    `clip-path` reveal from the summary height. This keeps the card's content box at
+ *    its final geometry instead of letting an old `height` clip it for the first frames.
+ *  - COLLAPSE: the card is retained while React commits the short height, so the block
+ *    uses `height` from the card size to the summary size. Its `overflow:hidden` clips the
+ *    retained card progressively while rows below move by the lost height.
  *
- * Both symptoms are one cause, and the cure is to animate the block's `height` from the
- * card's to the row's. Then the card visibly closes, and the rows below — which travel
- * by exactly the height that was lost, over the same duration and easing — stay glued to
- * its bottom edge for the whole transition.
- *
- * ## Why animating `height` here is allowed
- *
- * CONTRACT §0 rule 2 forbids a `height` write that could feed back into the measured
- * model. This one cannot: the block is `position: absolute` inside its trace, so it has
- * no in-flow siblings; every sibling row is positioned by the pure layout's own `top`,
- * not by this box's size; and nothing reads the box back (the layout derives all of it
- * arithmetically). It is the same exemption the decorative tool-run frame already has,
- * for the same reason — and unlike a frame, `scaleY` is not an option here because it
- * would squash the card's text.
+ * `height` remains a documented exception only for collapse: the block is absolute inside
+ * its trace, has no in-flow siblings, and nothing reads the animated box back. `scaleY` is
+ * not an option because it would squash the card's text.
  */
-export interface FoldNestedRowResize {
-	readonly traceKey: string;
-	readonly rowKey: string;
-	readonly fromHeight: number;
-	readonly toHeight: number;
-}
+export type FoldNestedRowResize =
+	| {
+			readonly traceKey: string;
+			readonly rowKey: string;
+			readonly kind: "reveal";
+			readonly fromInsetBottom: number;
+	  }
+	| {
+			readonly traceKey: string;
+			readonly rowKey: string;
+			readonly kind: "resize";
+			readonly fromHeight: number;
+			readonly toHeight: number;
+	  };
 
 /** One trace's nested rows at a committed frame, keyed by the trace's spec key. */
 export interface FoldNestedRowsSnapshot {
@@ -498,18 +494,16 @@ export function planFoldNestedRowMotion(input: {
 }
 
 /**
- * Plan the height change of nested row BLOCKS whose size moved (see
- * `FoldNestedRowResize`).
+ * Plan the nested row BLOCK transition whose size moved (see `FoldNestedRowResize`).
  *
- * This is the half that makes a drill-down close instead of vanish. Drilling a row open
- * or shut swaps an 18.8px summary block for a full card block (or back), and React
- * commits the new height immediately — so without this the card disappeared in one frame
- * while the rows below slid up from outside the shortened box.
+ * EXPAND emits a reveal inset: React has already committed the final card height, so the
+ * block must not animate height from the old summary size. COLLAPSE emits a height resize:
+ * the retained card would otherwise be cropped to the short height in the first frame.
  *
  * Bounded by the same readable-distance rule as everything else, and admitted per ROW
- * rather than per trace: a resize is confined to its own block (it moves no sibling — the
- * layout positions those by their own `top`, which `planFoldNestedRowMotion` handles), so
- * one row declining to animate cannot tear a group apart the way a dropped SHIFT does.
+ * rather than per trace: the transition is confined to its own block (it moves no sibling —
+ * the layout positions those by their own `top`, which `planFoldNestedRowMotion` handles),
+ * so one row declining to animate cannot tear a group apart the way a dropped SHIFT does.
  */
 export function planFoldNestedRowResize(input: {
 	readonly before: ReadonlyMap<string, FoldNestedRowsSnapshot>;
@@ -522,9 +516,24 @@ export function planFoldNestedRowResize(input: {
 		for (const [rowKey, next] of afterTrace.rows) {
 			const prev = beforeTrace.rows.get(rowKey);
 			if (prev === undefined) continue;
-			const delta = prev.height - next.height;
+			const delta = next.height - prev.height;
 			if (!isAnimatableShift(delta)) continue;
-			out.push({ traceKey, rowKey, fromHeight: prev.height, toHeight: next.height });
+			if (delta > 0) {
+				// The expanded card is already committed at its final height. Reveal it inside
+				// that final box instead of animating height from the old summary size, which
+				// would make the CSS overflow clip lag behind the card content.
+				out.push({ traceKey, rowKey, kind: "reveal", fromInsetBottom: delta });
+			} else {
+				// The closing card is retained after React commits the short row height. Resize
+				// the clip box so its content closes progressively rather than vanishing.
+				out.push({
+					traceKey,
+					rowKey,
+					kind: "resize",
+					fromHeight: prev.height,
+					toHeight: next.height,
+				});
+			}
 		}
 	}
 	return out;

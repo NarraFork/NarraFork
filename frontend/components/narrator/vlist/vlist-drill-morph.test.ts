@@ -81,18 +81,88 @@ describe("diffDrillSnapshots", () => {
 		expect(plan.durationMs).toBe(HEADER_MORPH_DURATION_MS);
 	});
 
-	it("plans a collapse morph that is the pixel-symmetric reverse", () => {
-		const expand = diffDrillSnapshots(
-			buildDrillSnapshots([folded], 0),
-			buildDrillSnapshots([drilled], 0),
-		)[0]!;
+	it("keeps collapse header travel local when pinned-bottom scrollTop changes", () => {
 		const collapse = diffDrillSnapshots(
-			buildDrillSnapshots([drilled], 0),
-			buildDrillSnapshots([folded], 0),
+			buildDrillSnapshots(
+				[
+					trace("t", 100, [
+						{ key: "r0", top: 24.8, drilled: true, blockHeight: 400, drillHeader: HEADER },
+					]),
+				],
+				1000,
+			),
+			buildDrillSnapshots(
+				[
+					trace("t", 100, [
+						{
+							key: "r0",
+							top: 24.8,
+							drilled: false,
+							blockHeight: DRILL_ROW_HEIGHT,
+							drillHeader: null,
+						},
+					]),
+				],
+				600,
+			),
 		)[0]!;
 		expect(collapse.kind).toBe("collapse");
-		expect(collapse.driftY).toBeCloseTo(-expand.driftY, 5);
-		expect(collapse.driftY).toBeLessThan(0);
+		// The viewport moved by 400px, but the header morph remains the local
+		// card-header → summary delta, so it stays inside the shrinking clip.
+		expect(collapse.driftY).toBeCloseTo(-11.1, 5);
+	});
+
+	it("drops expand travel when the old summary is outside the after block clip", () => {
+		const before = buildDrillSnapshots(
+			[
+				trace("t", 100, [
+					{
+						key: "r0",
+						top: 24.8,
+						drilled: false,
+						blockHeight: DRILL_ROW_HEIGHT,
+						drillHeader: null,
+					},
+				]),
+			],
+			0,
+		);
+		const after = buildDrillSnapshots(
+			[
+				trace("t", 100, [
+					{ key: "r0", top: 24.8, drilled: true, blockHeight: 400, drillHeader: HEADER },
+				]),
+			],
+			500,
+		);
+		expect(diffDrillSnapshots(before, after)[0]).toMatchObject({ kind: "expand", driftY: 0 });
+	});
+
+	it("keeps expand travel when the old summary still overlaps the after block", () => {
+		const before = buildDrillSnapshots(
+			[
+				trace("t", 100, [
+					{
+						key: "r0",
+						top: 24.8,
+						drilled: false,
+						blockHeight: DRILL_ROW_HEIGHT,
+						drillHeader: null,
+					},
+				]),
+			],
+			0,
+		);
+		const after = buildDrillSnapshots(
+			[
+				trace("t", 100, [
+					{ key: "r0", top: 24.8, drilled: true, blockHeight: 400, drillHeader: HEADER },
+				]),
+			],
+			100,
+		);
+		const plan = diffDrillSnapshots(before, after)[0]!;
+		expect(plan.driftY).not.toBe(0);
 	});
 
 	it("plans one morph PER flipped row — stacked activity is native", () => {

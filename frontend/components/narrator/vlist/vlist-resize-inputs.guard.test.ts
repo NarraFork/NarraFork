@@ -20,6 +20,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { shellSource } from "./guard-source";
 import { sliceBracketedRegion } from "./source-slice";
 
 const VLIST_DIR = import.meta.dir;
@@ -208,8 +209,13 @@ describe("resize inputs cannot reach the layout at pixel resolution", () => {
 		}
 	});
 
-	it("keeps no cost-tracking refs in the shell", () => {
-		const source = read("PretextExactMessageList.tsx");
+	// Read across the shell's WHOLE module set, not just its entry file. A negative
+	// assertion scoped to one file stops guarding the moment the thing it forbids can
+	// live next door: a cost-tracking ref in an extracted sibling would satisfy this
+	// rule while reintroducing exactly the predictor it exists to keep out — and
+	// nothing would go red, which is worse than having no guard at all.
+	it("keeps no cost-tracking refs anywhere in the shell", () => {
+		const source = shellSource();
 		expect(source).not.toContain("lastBuildMsRef");
 		expect(source).not.toContain("mountedRowCountRef");
 	});

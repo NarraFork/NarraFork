@@ -38,6 +38,7 @@ const NarratorPanel = lazy(() =>
 import { NarratorDock } from "../../components/narrator/dock/NarratorDock";
 import { NarratorDockProvider } from "../../components/narrator/dock/NarratorDockContext";
 import { useChapter } from "../../hooks/useChapters";
+import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
 import { useNarrator } from "../../hooks/useNarrator";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import {
@@ -244,6 +245,7 @@ function NarratorDetailPage() {
 		return pushHistorySentinel(router.history, APP_HISTORY_SENTINEL.terminalDrawer, closeDrawer)
 			.dispose;
 	}, [drawerOpened, isMobile, closeDrawer, router.history]);
+	useMobileDrawerHistory(specDrawerOpened, closeSpecDrawer);
 
 	// Mobile: open drawer and auto-create terminal if none running
 	const openDrawerWithTerminal = useCallback(() => {

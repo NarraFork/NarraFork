@@ -93,7 +93,8 @@ describe("drillMorphKeyframes", () => {
 	});
 
 	it("keeps expand and collapse mirror images of each other", () => {
-		// Same two endpoints, opposite directions: expand arrives, collapse departs.
+		// The planner supplies a LOCAL collapse delta, so the two directions remain symmetric
+		// without importing the viewport's pinned-bottom scroll correction.
 		const expand = drillMorphKeyframes(plan("t::r0", "expand", 11.1));
 		const collapse = drillMorphKeyframes(plan("t::r0", "collapse", -11.1));
 		expect(expand[0]?.transform).toBe(collapse.at(-1)?.transform);

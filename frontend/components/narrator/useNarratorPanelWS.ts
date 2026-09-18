@@ -8,19 +8,20 @@ import { invalidateWorkspaceQueries } from "../../hooks/useGit";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { api, type BufferMessageSummary } from "../../lib/api";
+import { formatFullLocaleDateTime } from "../../lib/format";
 import { statusRegistry } from "../../lib/status-registry";
 import { localizeNarratorError } from "./error-localization";
 import { withQueueSubstatus } from "./header/narrator-status-bar";
-import {
-	isActiveReflectionPermissionLike,
-	isReflectionPermissionLike,
-} from "./narrator-message-helpers";
 import type {
 	ContentBlock,
 	NarratorMsg,
 	PendingPermission,
 	PermissionCallbacks,
 } from "./narrator-panel-types";
+import {
+	reconcilePendingPermissions,
+	upsertPendingPermissionMap,
+} from "./pending-permissions-reconcile";
 import {
 	clearAllReflectionProgress,
 	clearReflectionProgress,
@@ -73,6 +74,17 @@ export interface RetryInfo {
 	maxRetries: number;
 	/** Timestamp (ms) when the retry delay expires */
 	retryAt: number;
+}
+
+/**
+ * A narrator parked on an exhausted Kimi quota window.
+ *
+ * Only the reset instant is needed: the label is `status_quota_exhausted` and the
+ * reset time is appended to it. Null when the server knew the wall but not the
+ * clock, so the label stays generic rather than inventing a time.
+ */
+export interface QuotaWaitInfo {
+	resumeAt: number | null;
 }
 
 export interface PaymentRequiredInfo {
@@ -232,6 +244,13 @@ export interface UseNarratorPanelWSReturn {
 	browserVisualChange: { sessionId: string; seq: number } | null;
 	// Retry
 	retryInfo: RetryInfo | null;
+	/**
+	 * Set while the narrator is parked on an exhausted Kimi quota window. Outlives
+	 * hours of waiting, so it is cleared when the WAIT ends (recovered frame, a
+	 * non-waiting status, or a narrator switch) rather than on every stream delta,
+	 * which is what `retryInfo` above does.
+	 */
+	quotaWaitInfo: QuotaWaitInfo | null;
 	paymentRequired: PaymentRequiredInfo | null;
 	setPaymentRequired: React.Dispatch<React.SetStateAction<PaymentRequiredInfo | null>>;
 	leakedToolEvent: LeakedToolEvent | null;
@@ -320,7 +339,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		onDraftChanged,
 		onQueuedNewNarratorCreated,
 	} = opts;
-	const { t } = useTranslation("narrator");
+	const { t, i18n } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const permissionDecisionsSupported =
@@ -354,11 +373,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		(permission: PendingPermission) => {
 			if (resolvedPermissionIdsRef.current.has(permission.id)) return;
 			bumpPermissionGeneration();
-			setPendingPermsByRequestId((prev) => {
-				const next = new Map(prev);
-				next.set(permission.id, permission);
-				return next;
-			});
+			// Even a duplicate WS event invalidates older REST snapshots.
+			setPendingPermsByRequestId((prev) => upsertPendingPermissionMap(prev, permission));
 		},
 		[bumpPermissionGeneration],
 	);
@@ -385,18 +401,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			) {
 				return false;
 			}
-			const next = new Map<string, PendingPermission>();
-			for (const permission of perms) {
-				if (resolvedPermissionIdsRef.current.has(permission.id)) continue;
+			setPendingPermsByRequestId((prev) => {
+				// React may apply a queued update after a WS event or narrator switch.
 				if (
-					isReflectionPermissionLike(permission) &&
-					!isActiveReflectionPermissionLike(permission)
+					permissionGenerationRef.current !== generation ||
+					permissionLifecycleRef.current !== lifecycle
 				) {
-					continue;
+					return prev;
 				}
-				next.set(permission.id, permission);
-			}
-			setPendingPermsByRequestId(next);
+				return reconcilePendingPermissions(prev, perms, resolvedPermissionIdsRef.current);
+			});
 			return true;
 		},
 		[],
@@ -525,6 +539,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		setPaymentRequired(null);
 	}, [narratorId, quotaProviderKey, initialQuotaBalance, initialDetailedQuotaBalance]);
 	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
+	const [quotaWaitInfo, setQuotaWaitInfo] = useState<QuotaWaitInfo | null>(null);
 	const [paymentRequired, setPaymentRequired] = useState<PaymentRequiredInfo | null>(null);
 	const [leakedToolEvent, setLeakedToolEvent] = useState<LeakedToolEvent | null>(null);
 	const retryInfoRef = useRef<RetryInfo | null>(null);
@@ -534,6 +549,23 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			setRetryInfo(null);
 		}
 	}, []);
+	const quotaWaitInfoRef = useRef<QuotaWaitInfo | null>(null);
+	const clearQuotaWaitIfActive = useCallback(() => {
+		if (quotaWaitInfoRef.current) {
+			quotaWaitInfoRef.current = null;
+			setQuotaWaitInfo(null);
+		}
+	}, []);
+	/** Set both the state and its ref: the clearing paths read the ref to stay cheap. */
+	const applyQuotaWaitInfo = useCallback((info: QuotaWaitInfo | null) => {
+		quotaWaitInfoRef.current = info;
+		setQuotaWaitInfo(info);
+	}, []);
+	// A panel switch must not inherit the previous narrator's wait.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId is the reset trigger.
+	useEffect(() => {
+		applyQuotaWaitInfo(null);
+	}, [narratorId, applyQuotaWaitInfo]);
 	const [unreadCount, setUnreadCount] = useState(0);
 
 	// --- Viewers ---
@@ -1005,6 +1037,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onStatusChange: (status, turnStartedAt, eventSubstatus) => {
 				clearRetryIfActive();
+				// A self-recovering wait is only meaningful while the narrator is still
+				// parked on it. Leaving `waiting` is the single signal that it ended —
+				// whether it recovered, was interrupted, or was reported as a wall — and
+				// unlike `retryInfo` it outlives hours, so it must not survive the wait
+				// that produced it. The persistent notice goes with it: leaving it up
+				// would keep describing a wait that is over.
+				if (status !== "waiting") {
+					clearQuotaWaitIfActive();
+					notifications.hide(`model-unavailable-${narratorId}`);
+				}
 				const isNotWorking = status !== "working" && status !== "waiting";
 				const patch: Partial<StatusState> = {};
 				if (eventSubstatus !== undefined) {
@@ -1179,30 +1221,43 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setPaymentRequired(info);
 			},
 			onModelUnavailableWaiting: (info) => {
-				// The narrator is suspended waiting for a NUG model to recover. Reflect
-				// the waiting status locally and surface a dismissible notice.
-				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-					old ? { ...old, status: "waiting", substatus: ["model_unavailable"] } : old,
-				);
+				// The narrator is parked on a self-recovering block: a NUG credential
+				// pool coming back, or a Kimi quota window resetting. Reflect the
+				// waiting status locally and surface a dismissible notice that says
+				// which of the two it is.
+				const isQuota = info.waitKind === "quota";
+				const substatus = isQuota ? "quota_exhausted" : "model_unavailable";
+				applyQuotaWaitInfo(isQuota ? { resumeAt: info.resumeAt ?? null } : null);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				notifications.show({
 					id: `model-unavailable-${narratorId}`,
-					title: t("modelUnavailableWaitingTitle"),
-					message: t("modelUnavailableWaitingDesc", { model: info.model }),
+					title: t(isQuota ? "quotaExhaustedWaitingTitle" : "modelUnavailableWaitingTitle"),
+					message: isQuota
+						? t("quotaExhaustedWaitingDesc", {
+								model: info.model,
+								resetAt: info.resumeAt
+									? formatFullLocaleDateTime(new Date(info.resumeAt), i18n.language)
+									: t("quotaExhaustedResetUnknown"),
+							})
+						: t("modelUnavailableWaitingDesc", { model: info.model }),
 					// Blue-toned neutral, not yellow: nothing here is actionable.
-					color: statusRegistry.accentColor(statusRegistry.narratorSubstatus("model_unavailable")),
+					color: statusRegistry.accentColor(statusRegistry.narratorSubstatus(substatus)),
 					autoClose: false,
 				});
 			},
 			onModelUnavailableRecovered: (info) => {
+				const isQuota = info.waitKind === "quota";
 				notifications.hide(`model-unavailable-${narratorId}`);
+				clearQuotaWaitIfActive();
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, status: "working", substatus: [] } : old,
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				notifications.show({
-					title: t("modelUnavailableRecoveredTitle"),
-					message: t("modelUnavailableRecoveredDesc", { model: info.model }),
+					title: t(isQuota ? "quotaExhaustedRecoveredTitle" : "modelUnavailableRecoveredTitle"),
+					message: t(isQuota ? "quotaExhaustedRecoveredDesc" : "modelUnavailableRecoveredDesc", {
+						model: info.model,
+					}),
 					color: "green",
 					autoClose: 4000,
 				});
@@ -1564,6 +1619,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			browserSessionCount,
 			browserVisualChange,
 			retryInfo,
+			quotaWaitInfo,
 			paymentRequired,
 			setPaymentRequired,
 			leakedToolEvent,
@@ -1599,6 +1655,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			browserSessionCount,
 			browserVisualChange,
 			retryInfo,
+			quotaWaitInfo,
 			paymentRequired,
 			leakedToolEvent,
 			unreadCount,

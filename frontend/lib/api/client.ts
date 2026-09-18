@@ -312,8 +312,13 @@ export async function readFetchErrorMessage(
 
 export async function request<T>(
 	path: string,
-	options?: RequestInit & { signal?: AbortSignal },
+	options?: RequestInit & {
+		signal?: AbortSignal;
+		maxResponseBytes?: number;
+		onResponseBytes?: (bytes: number) => void;
+	},
 ): Promise<T> {
+	const { maxResponseBytes, onResponseBytes, ...fetchOptions } = options ?? {};
 	const headers: Record<string, string> = { ...(options?.headers as Record<string, string>) };
 	if (options?.body) {
 		headers["Content-Type"] = "application/json";
@@ -322,7 +327,7 @@ export async function request<T>(
 	if (token) {
 		headers.Authorization = `Bearer ${token}`;
 	}
-	const response = await fetch(apiUrl(path), { ...options, headers });
+	const response = await fetch(apiUrl(path), { ...fetchOptions, headers });
 	absorbRenewedToken(response, token);
 	if (response.status === 401) {
 		const error = await readErrorData(response, "Unauthorized");
@@ -332,6 +337,39 @@ export async function request<T>(
 	if (!response.ok) {
 		const error = await readErrorData(response, response.statusText || "Request failed");
 		throw new ApiError(getErrorMessage(error, "Request failed"), response.status, error);
+	}
+	if (maxResponseBytes != null) {
+		const limit = Math.max(0, Math.trunc(maxResponseBytes));
+		const tooLarge = () =>
+			new ApiError("Response exceeds byte budget", 413, { code: "RESPONSE_TOO_LARGE" });
+		if (Number(response.headers.get("content-length")) > limit) {
+			void response.body?.cancel().catch(() => {});
+			throw tooLarge();
+		}
+		const reader = response.body?.getReader();
+		if (!reader) throw new ApiError("Invalid response", response.status);
+		const decoder = new TextDecoder();
+		let bytes = 0;
+		let text = "";
+		try {
+			while (true) {
+				const chunk = await reader.read();
+				if (chunk.done) break;
+				bytes += chunk.value.byteLength;
+				if (bytes > limit) {
+					void reader.cancel().catch(() => {});
+					throw tooLarge();
+				}
+				text += decoder.decode(chunk.value, { stream: true });
+			}
+			text += decoder.decode();
+		} finally {
+			reader.releaseLock();
+		}
+		onResponseBytes?.(bytes);
+		const parsed = tryParseJson(text);
+		if (parsed !== null) return parsed as T;
+		throw new ApiError("Invalid response", response.status);
 	}
 	if (isJsonResponse(response)) {
 		const parsed = await response.json().catch(() => null);

@@ -20,6 +20,7 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { NarratorMsg } from "../narrator-panel-types";
+import { shellModule } from "./guard-source";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { buildPretextDocumentLayout } from "./pretext-document-layout";
 import { sliceBracketedRegion } from "./source-slice";
@@ -32,6 +33,23 @@ function read(relativePath: string): string {
 }
 
 const SHELL = read("PretextExactMessageList.tsx");
+/**
+ * The frame-run geometry helper, which lives beside the shell rather than in it.
+ *
+ * Read as its OWN module, not through the concatenated shell source: this guard cuts a
+ * function body out with `indexOf("\n}")`, and in a concatenated string that sentinel
+ * could first match a later module's closing brace — the over-running slice
+ * `source-slice.ts` exists to prevent.
+ */
+const LAYOUT = shellModule("vlist-exact-layout.ts");
+/**
+ * The row component, which owns the attributes the fold controller addresses rows BY.
+ *
+ * Read as its own module for the same reason as `LAYOUT`: the height-neutrality checks
+ * below cut a window from an attribute to the next `style={{`, and in a concatenated
+ * source that window could close on a different module's markup.
+ */
+const ROW = shellModule("ExactRow.tsx");
 
 beforeAll(() => {
 	installCanvasStub();
@@ -263,7 +281,7 @@ describe("fold transition: play happens before paint", () => {
 	});
 
 	it("resolves a planned row by its spec-key attribute", () => {
-		expect(SHELL).toContain("data-nf-row-key={item.spec.key}");
+		expect(ROW).toContain("data-nf-row-key={item.spec.key}");
 		// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the shell's selector source verbatim
 		expect(SHELL).toContain('[data-nf-row-key="${cssAttrEscape(motion.key)}"]');
 	});
@@ -281,7 +299,7 @@ describe("fold transition: play happens before paint", () => {
 	 * flashes a sliver of the body at the wrong moment.
 	 */
 	it("plays the reveal clip on the row's INNER body box, not the padded hit box", () => {
-		expect(SHELL).toContain("data-nf-row-body={item.spec.key}");
+		expect(ROW).toContain("data-nf-row-body={item.spec.key}");
 		const body = playEffect();
 		// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the shell's selector source verbatim
 		expect(body).toContain('[data-nf-row-body="${cssAttrEscape(motion.key)}"]');
@@ -319,8 +337,8 @@ describe("fold transition: play happens before paint", () => {
 		// An index is not an identity: a fold earlier in the document renumbers every
 		// run after it, so an index-keyed frame would be paired with a DIFFERENT run's
 		// geometry across the very rebuild this transition diffs.
-		const start = SHELL.indexOf("export function computeToolRunFrames(");
-		const body = SHELL.slice(start, SHELL.indexOf("\n}", start));
+		const start = LAYOUT.indexOf("export function computeToolRunFrames(");
+		const body = LAYOUT.slice(start, LAYOUT.indexOf("\n}", start));
 		expect(start).toBeGreaterThan(0);
 		expect(body).toContain("items[i]?.spec.key");
 	});
@@ -400,6 +418,13 @@ describe("fold transition: play happens before paint", () => {
 			// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the shell's scope expression verbatim
 			"`${rowScope(nestedMotion.traceKey)}:nested:${nestedMotion.rowKey}`",
 		);
+	});
+
+	it("reveals nested expansion with clip-path and resizes only collapse", () => {
+		const effect = playEffect();
+		expect(effect).toContain('resize.kind === "reveal"');
+		expect(effect).toContain("revealKeyframes(resize.fromInsetBottom)");
+		expect(effect).toContain("nestedResizeKeyframes(resize.fromHeight, resize.toHeight)");
 	});
 
 	it("captures row and frame geometry in one snapshot", () => {
@@ -504,21 +529,21 @@ describe("fold transition: stays out of the height model", () => {
 	it("keeps the row-BODY attribute height-neutral too", () => {
 		// Same rule as data-nf-row-key: a data attribute cannot affect layout, and it
 		// must NOT be threaded through spec.opts (the measure cache key).
-		const at = SHELL.indexOf("data-nf-row-body={item.spec.key}");
+		const at = ROW.indexOf("data-nf-row-body={item.spec.key}");
 		expect(at).toBeGreaterThan(0);
-		const style = SHELL.indexOf("style={{", at);
-		expect(SHELL.slice(at, style)).not.toContain("spec.opts");
+		const style = ROW.indexOf("style={{", at);
+		expect(ROW.slice(at, style)).not.toContain("spec.opts");
 	});
 
 	it("keeps the row-key attribute height-neutral", () => {
 		// It rides on the same element as data-nf-unit — a data attribute, so it cannot
 		// affect layout, and it must NOT be threaded through spec.opts (the measure
 		// cache key).
-		const rowStart = SHELL.indexOf("data-nf-row-key={item.spec.key}");
-		const style = SHELL.indexOf("style={{", rowStart);
+		const rowStart = ROW.indexOf("data-nf-row-key={item.spec.key}");
+		const style = ROW.indexOf("style={{", rowStart);
 		expect(rowStart).toBeGreaterThan(0);
 		expect(style).toBeGreaterThan(rowStart);
-		expect(SHELL.slice(rowStart, style)).not.toContain("height");
+		expect(ROW.slice(rowStart, style)).not.toContain("height");
 	});
 
 	it("does not add the fold to the dynamic (post-paint measured) row path", () => {

@@ -3,6 +3,7 @@ import { ActionIcon, Box, Drawer, Group, Tabs, Text } from "@mantine/core";
 import { IconFileCode, IconX } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
 import { useNarratorPermissionsCapability } from "../../../hooks/usePlatform";
 import {
 	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
@@ -167,6 +168,7 @@ export function FileModificationsDrawer({
 	...rest
 }: FileModificationsDrawerProps) {
 	const { t } = useTranslation("narrator");
+	useMobileDrawerHistory(opened, onClose);
 
 	return (
 		<Drawer

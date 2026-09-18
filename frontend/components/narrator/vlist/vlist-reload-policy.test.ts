@@ -11,6 +11,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { shellSource } from "./guard-source";
 import {
 	EXACT_RELOAD_COALESCE_MS,
 	EXACT_RELOAD_MAX_DELAY_MS,
@@ -160,7 +161,9 @@ describe("EXACT_RELOAD_MAX_DELAY_MS", () => {
  * pieces they name is covered above and in vlist-live-wiring.test.ts.
  */
 describe("reload policy wiring", () => {
-	const SHELL = readFileSync(join(import.meta.dir, "PretextExactMessageList.tsx"), "utf8");
+	// Whole module set: the negative rule below forbids the old constant-count
+	// expression anywhere in the shell, not merely in its entry file.
+	const SHELL = shellSource();
 
 	it("routes the shell's structural reload through the bounded coalescing window", () => {
 		expect(SHELL).toContain("resolveExactReloadDecision({");

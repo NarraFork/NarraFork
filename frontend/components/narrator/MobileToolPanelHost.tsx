@@ -22,6 +22,7 @@
 import { Box, Center, Drawer, Loader, Text } from "@mantine/core";
 import { lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
+import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
 import {
 	SAFE_AREA_DRAWER_BODY_STYLE,
 	safeAreaDrawerBodyHeight,
@@ -116,6 +117,7 @@ export function MobileToolPanelHost({
 	const { t } = useTranslation("narrator");
 	const { t: tGit } = useTranslation("git");
 	const { t: tChat } = useTranslation("chat");
+	useMobileDrawerHistory(kind !== null, onClose);
 
 	const title =
 		kind === "git"

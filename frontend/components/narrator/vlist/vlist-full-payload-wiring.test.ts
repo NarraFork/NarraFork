@@ -24,10 +24,11 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { shellSource } from "./guard-source";
 import { sliceBracketedRegion } from "./source-slice";
 
 const read = (file: string) => readFileSync(join(import.meta.dir, file), "utf8");
-const SHELL = read("PretextExactMessageList.tsx");
+const SHELL = shellSource();
 
 describe("full-payload request wiring (inline auto-load + fullscreen)", () => {
 	it("keeps communication input.message viewer and payload fetching explicit", () => {

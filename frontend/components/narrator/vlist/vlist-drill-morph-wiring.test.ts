@@ -22,11 +22,15 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { shellSource } from "./guard-source";
 
-const DIR = import.meta.dir;
-const SHELL = readFileSync(join(DIR, "PretextExactMessageList.tsx"), "utf8");
+/**
+ * The shell's whole module set. These rules are "this pattern exists NOWHERE in the
+ * shell", so they must see every module it was split into — a forbidden ref that moved
+ * to a sibling would otherwise satisfy the rule while reintroducing the very split
+ * lifetime this consolidation removed, and nothing would go red.
+ */
+const SHELL = shellSource();
 
 /** The body of the shell's drill-morph layout effect. */
 function morphEffect(): string {

@@ -9,20 +9,20 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
-describe("measureAskInPassing — pending (fixed 77px)", () => {
-	it("pending height is a fixed 77px (py×2 + hint row 21 + input row 36)", async () => {
+describe("measureAskInPassing — pending (fixed 79px including borders)", () => {
+	it("pending height includes py×2, hint 21, input 36 and borders 2", async () => {
 		const { measureAskInPassing, PENDING_CARD_HEIGHT } = await import("./measure-ask-in-passing");
-		expect(PENDING_CARD_HEIGHT).toBe(77);
+		expect(PENDING_CARD_HEIGHT).toBe(79);
 		const r = measureAskInPassing("pending", {}, 800);
-		expect(r.height).toBe(77);
+		expect(r.height).toBe(79);
 	});
 
 	it("pending height ignores contentWidth", async () => {
 		const { measureAskInPassing } = await import("./measure-ask-in-passing");
 		const wide = measureAskInPassing("pending", {}, 2000);
 		const narrow = measureAskInPassing("pending", {}, 120);
-		expect(wide.height).toBe(77);
-		expect(narrow.height).toBe(77);
+		expect(wide.height).toBe(79);
+		expect(narrow.height).toBe(79);
 	});
 
 	it("pending height ignores LOD", async () => {
@@ -31,7 +31,7 @@ describe("measureAskInPassing — pending (fixed 77px)", () => {
 			(lod) => measureAskInPassing("pending", {}, 800, lod).height,
 		);
 		expect(new Set(heights).size).toBe(1);
-		expect(heights[0]).toBe(77);
+		expect(heights[0]).toBe(79);
 	});
 
 	it("pending produces exactly one fixed block tagged ask_in_passing_pending", async () => {
@@ -42,7 +42,7 @@ describe("measureAskInPassing — pending (fixed 77px)", () => {
 		expect(block?.kind).toBe("fixed");
 		if (block?.kind === "fixed") {
 			expect(block.tag).toBe("ask_in_passing_pending");
-			expect(block.height).toBe(77);
+			expect(block.height).toBe(79);
 			expect(block.data).toMatchObject({ messageId: "m1", narratorId: "n1" });
 		}
 	});

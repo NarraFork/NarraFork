@@ -25,6 +25,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { sliceBracketedRegion } from "./source-slice";
 
 const VLIST_DIR = import.meta.dir;
 
@@ -78,10 +79,13 @@ describe("viewportHeight / contentWidth are document-build inputs", () => {
 
 	it("both reach usePretextDocument's build options", () => {
 		const src = read("PretextExactMessageList.tsx");
-		const call = src.slice(
-			src.indexOf("const pretextDocument = usePretextDocument("),
-			src.indexOf("\n\t});", src.indexOf("const pretextDocument = usePretextDocument(")),
-		);
+		// Brace-matched rather than cut at a literal `"\n\t});"`. That sentinel assumed
+		// the call sits at one tab of indentation; it does not (the component is nested
+		// inside `forwardRef`), so `indexOf` returned -1, `slice(start, -1)` kept almost
+		// the whole file, and both assertions below passed on unrelated code — a guard
+		// that certified a wiring rule it had stopped reading. See source-slice.ts.
+		const call = sliceBracketedRegion(src, "usePretextDocument(narratorId, {");
+		if (call === null) throw new Error("usePretextDocument(narratorId, { … }) call not found");
 		expect(call).toContain("contentWidth");
 		expect(call).toContain("viewportHeight");
 	});

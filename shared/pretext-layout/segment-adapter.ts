@@ -28,6 +28,7 @@ import {
 	isNativeModelContextBlock,
 } from "../native-injection";
 import { hasUsablePlanBody } from "../plan-reference";
+import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
 import {
 	escapeMarkdown,
@@ -1265,7 +1266,7 @@ function adaptContextBlocks(
 	for (let index = 0; index < blocks.length; index++) {
 		const block = blocks[index];
 		if (!block || owned.has(index) || block.type !== "text" || !block.text?.trim()) continue;
-		specs.push({ kind: "markdown", key: `${idBase}-b${index}`, data: { text: block.text } });
+		specs.push({ kind: "markdown", key: `${idBase}-b${index}`, data: block.text });
 	}
 	return specs;
 }
@@ -3120,7 +3121,8 @@ function isLatestSpecTasksToolItem(
 /** Split a tool run into chronological groups: active items stay standalone,
  * completed items fold in contiguous batches. Mirrors groupToolRunItemsForLod —
  * including its second argument: the latest tasks.json call keeps its full card
- * out of the fold at every LOD. */
+ * out of the fold at every LOD. Prefer-open tools (AskUserQuestion) stay
+ * standalone too: their options/form is operational content, not activity noise. */
 export function groupToolItemsForLod(
 	items: AdapterToolItem[],
 	latestSpecTasksToolUseId?: string | null,
@@ -3140,6 +3142,7 @@ export function groupToolItemsForLod(
 			isCommunicationTool(item.tc) ||
 			item.isSubagent ||
 			isActiveToolItem(item) ||
+			isPreferOpenTool(item.tc) ||
 			isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)
 		) {
 			flush();
@@ -3349,6 +3352,12 @@ function adaptToolItemFull(
 		item,
 		ctx.resolveLatestSpecTasksToolUseId?.(),
 	);
+	// Prefer-open (AskUserQuestion): default-expand at every LOD, but the reader may
+	// still fold. Not `forceExpanded` — that would make the chevron dead, which is
+	// exactly the L5 bug `userCollapsed` was introduced to fix. `collapsesByLod`
+	// must stay false so the header toggle writes `expanded` rather than
+	// `lodUserOverride` (the override channel FORCE-expands and cannot fold).
+	const preferOpen = isPreferOpenTool(item.tc);
 	const opts = {
 		isRecent: isRecentToolItem(item, ctx),
 		...(defaultOpened === undefined ? {} : { opened: defaultOpened }),
@@ -3362,8 +3371,10 @@ function adaptToolItemFull(
 		// Same contract for the pinned tasks card: it never collapses to a header,
 		// even at L3 or as an older card at L4.
 		...(isPinnedSpecTasks ? { forceExpanded: true } : {}),
+		...(preferOpen ? { preferOpen: true } : {}),
 		collapsesByLod:
 			!hasPendingPermission &&
+			!preferOpen &&
 			!isActiveToolItem(item) &&
 			(item.isSubagent
 				? ctx.lod === 1

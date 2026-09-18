@@ -13,6 +13,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { shellSource } from "./guard-source";
 import {
 	INTERRUPT_TASK_GUARD_SOURCE,
 	isInterruptGuardItem,
@@ -21,7 +22,7 @@ import {
 import type { VListItem } from "./vlist-pipeline";
 
 const DIR = import.meta.dir;
-const SHELL = readFileSync(join(DIR, "PretextExactMessageList.tsx"), "utf8");
+const SHELL = shellSource();
 const DISPATCH = readFileSync(join(DIR, "render-registry.tsx"), "utf8");
 const CARD = readFileSync(join(DIR, "render", "RenderSystemText.tsx"), "utf8");
 const ACTIONS = readFileSync(join(DIR, "vlist-injection-guard-actions.ts"), "utf8");

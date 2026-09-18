@@ -24,6 +24,112 @@ describe("narrators API", () => {
 		}
 	});
 
+	test("bounded document reads enforce streamed bytes without relying on Content-Length", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		Object.defineProperty(g, "fetch", {
+			value: async () =>
+				new Response(JSON.stringify({ messages: [{ text: "x".repeat(100) }] }), {
+					headers: { "content-type": "application/json" },
+				}),
+			configurable: true,
+		});
+		await expect(api.getPretextDocumentPage("n", { maxResponseBytes: 32 })).rejects.toThrow(
+			"Response exceeds byte budget",
+		);
+		let bytes = 0;
+		await api.getPretextDocumentPage("n", {
+			maxResponseBytes: 1024,
+			onResponseBytes: (count) => {
+				bytes = count;
+			},
+		});
+		expect(bytes).toBeGreaterThan(100);
+	});
+
+	test("oversized Content-Length cancels the body before reading and cannot block a retry", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		let cancelled = false;
+		Object.defineProperty(g, "fetch", {
+			value: async () =>
+				new Response(
+					new ReadableStream({
+						cancel: () => {
+							cancelled = true;
+						},
+					}),
+					{ headers: { "content-type": "application/json", "content-length": "999999" } },
+				),
+			configurable: true,
+		});
+		await expect(api.getPretextDocumentPage("n", { maxResponseBytes: 32 })).rejects.toThrow(
+			"Response exceeds byte budget",
+		);
+		expect(cancelled).toBe(true);
+		Object.defineProperty(g, "fetch", {
+			value: async () => Response.json({ messages: [] }),
+			configurable: true,
+		});
+		expect((await api.getPretextDocumentPage("n", { maxResponseBytes: 32 })).messages).toEqual([]);
+	});
+
+	test("ask acknowledgements retain legacy fields and expose canonical messages", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const message = {
+			id: "ask",
+			seq: 3,
+			contentJson: [{ type: "ask_in_passing", status: "pending" }],
+		};
+		Object.defineProperty(g, "fetch", {
+			value: async () => Response.json({ messageId: "ask", message }),
+			configurable: true,
+		});
+		const started = await api.startAskInPassing("n", { sourceMessageId: "source" });
+		expect(started.messageId).toBe("ask");
+		expect(started.message?.id).toBe(message.id);
+		expect(started.message?.seq).toBe(message.seq);
+		Object.defineProperty(g, "fetch", {
+			value: async () => Response.json({ id: "target", message }),
+			configurable: true,
+		});
+		const resolved = await api.askInPassing("n", { question: "why", pendingMessageId: "ask" });
+		expect(resolved.id).toBe("target");
+		expect(resolved.message).toEqual(message);
+	});
+
+	test("interrupt can wait for the old loop to finish before replacement input", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const urls: URL[] = [];
+		Object.defineProperty(g, "fetch", {
+			value: async (url: string) => {
+				urls.push(new URL(url, "https://test.invalid"));
+				return Response.json({ interrupted: true, settled: true });
+			},
+			configurable: true,
+		});
+
+		expect(await api.interruptNarrator("narrator-1")).toEqual({ interrupted: true, settled: true });
+		expect(urls[0]?.pathname).toBe("/api/narrators/narrator-1/interrupt");
+		expect(urls[0]?.search).toBe("");
+
+		expect(await api.interruptNarrator("narrator-1", true)).toEqual({
+			interrupted: true,
+			settled: true,
+		});
+		expect(urls[1]?.search).toBe("?waitForIdle=1");
+	});
+
 	test("encodes raw tool row refs without treating the provider ID as a PK", async () => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },

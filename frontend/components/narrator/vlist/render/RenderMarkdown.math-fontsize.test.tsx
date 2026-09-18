@@ -127,6 +127,17 @@ describe("inline math font size (virtual list)", () => {
 		view.unmount();
 	});
 
+	it("keeps the boxed formula inside its reserved width", async () => {
+		const view = await renderMarkdownBody("答案是 $\\boxed{21}$。");
+		const host = inlineMathHost(view.container);
+		expect(host).not.toBeNull();
+		// The geometry model includes KaTeX's `.boxpad` class-only padding, so the
+		// host can safely clip at its reserved edge without overlapping the next text.
+		expect(host?.style.overflow).toBe("hidden");
+		expect(Number.parseFloat(host?.style.width ?? "0")).toBeGreaterThan(20);
+		view.unmount();
+	});
+
 	it("keeps the measured width pinned on the host box", async () => {
 		// The width the parser reserved in the pretext flow must be the width the
 		// host paints at, otherwise the surrounding text is pushed or the formula

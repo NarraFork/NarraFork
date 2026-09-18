@@ -16,16 +16,16 @@
  *
  * ## How a morph reads
  *
- * The INCOMING line — the card header on expand, the remounted summary row on
- * collapse — starts from the OUTGOING line's screen position and slides + fades home:
+ * The card header on expand starts from the outgoing summary line's screen position and
+ * slides home. On collapse the retained card header morphs toward the summary line using
+ * the row block's local Y delta, while the block shrinks around it. The local coordinate
+ * keeps the header inside the shrinking `overflow:hidden` block even when the viewport is
+ * corrected to the bottom.
  *
- *   translateY(-driftY) → translateY(0),   opacity 0 → 1
- *
- * It touches ONLY that incoming node, which React owns and which is already at its
- * committed geometry. There is no detached ghost to re-home, nothing to remove, and
- * nothing to measure — the failure modes of the earlier capture-based design (a
- * fixed-position ghost covering the rows above, a `getBoundingClientRect` read against
- * the wrong coordinate frame) are designed out.
+ * It touches ONLY the node React owns and which is already at its committed geometry. There
+ * is no detached ghost to re-home, nothing to remove, and nothing to measure — the failure
+ * modes of the earlier capture-based design (a fixed-position ghost covering the rows above,
+ * a `getBoundingClientRect` read against the wrong coordinate frame) are designed out.
  *
  * The scheduler runs every animation with `fill: "none"` on a node that stays mounted,
  * so a cancelled or finished morph reads the committed style and there is no cleanup
@@ -35,17 +35,17 @@
 import { DRILL_MORPH_X_OFFSET, type DrillMorphPlan } from "./vlist-drill-morph";
 
 /**
- * Keyframes for the INCOMING line: appear at the OUTGOING line's screen position
- * (`-driftY`) and slide home. A collapse's negative `driftY` becomes a positive start
- * offset, so the card header sinks down into the remounted summary row — the exact
- * reverse of the expand.
+ * Keyframes for the incoming card header on expand: appear at the outgoing line's screen
+ * position (`-driftY`) and slide home. Collapse uses the planner's LOCAL header delta, so
+ * the retained card travels toward the summary line without inheriting the viewport's
+ * pinned-bottom scroll correction.
  *
  * ⚠️ NO OPACITY. An earlier version cross-faded (`opacity: 0 → 1`) and that was a bug:
  * a reader watching frame by frame sees the incoming line "blur in", which is exactly
  * the artifact §4.7's rule prohibits — a cross-fade masks a COMPONENT SWAP, and this is
  * not one the reader needs masked. The summary row and the card header carry the same
  * `Name · summary` text at the same place; the transition the reader wants here is a
- * seamless replacement plus travel, not a dissolve. Fading also fights the height
+ * seamless replacement plus lane travel, not a dissolve. Fading also fights the height
  * animation the row block plays underneath it, so the two read as one blurry event
  * instead of one solid movement.
  *

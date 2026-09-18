@@ -188,6 +188,16 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// Collect height-affecting primitives that can change for the same spec.key.
 	let rev = "";
 	if ("status" in d && d.status != null) rev += `s:${d.status}`;
+	// Ask-in-passing's adapter uses `kind`, not `status`, while preserving its
+	// stable row key. Both the variant and question affect the cached blocks;
+	// hash text rather than length so equal-length edits also repaint.
+	if (d.kind === "pending" || d.kind === "resolved") {
+		rev += `|aip:${d.kind}`;
+		if (typeof d.question === "string") rev += `|aq:${textSignature(d.question)}`;
+		// The adapter currently resolves navigation separately. Also invalidate if
+		// a caller supplies the measure payload's optional navigation target.
+		if (typeof d.targetNarratorId === "string") rev += `|at:${textSignature(d.targetNarratorId)}`;
+	}
 	if ("isStreaming" in d && d.isStreaming) rev += "|st:1";
 	if ("isActive" in d && d.isActive) rev += "|ac:1";
 	if ("isTerminal" in d && d.isTerminal) rev += "|te:1";

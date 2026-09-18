@@ -76,6 +76,12 @@ export interface DrillRowSnapshot {
 	readonly rowUid: string;
 	readonly drilled: boolean;
 	readonly headerViewportTop: number;
+	/** Header centre relative to its own row block, independent of scroll correction. */
+	readonly headerLocalTop: number;
+	/** Height of the incoming header line, used to test its start box against the after clip. */
+	readonly headerHeight: number;
+	/** The row block's viewport clip, when the measured block height is available. */
+	readonly clip: { readonly top: number; readonly bottom: number } | null;
 }
 
 /** The minimal shape the snapshot builder needs from a measured trace row. */
@@ -83,6 +89,8 @@ export interface DrillMeasuredRow {
 	readonly key: string;
 	readonly top: number;
 	readonly drilled: boolean;
+	/** Measured height of the row's whole painted block. */
+	readonly blockHeight?: number;
 	/** Card header rect within the row block (drilled rows only), else null. */
 	readonly drillHeader: { readonly top: number; readonly height: number } | null;
 }
@@ -100,9 +108,9 @@ export interface DrillMorphPlan {
 	readonly rowUid: string;
 	readonly kind: DrillMorphKind;
 	/**
-	 * Vertical distance the incoming line travels, in px. Positive drifts DOWN
-	 * (expand: summary → card header); negative drifts UP (collapse). The DOM edge
-	 * starts the incoming line at `translateY(-driftY)` and settles it at 0.
+	 * Vertical distance the line travels, in px. Expand uses viewport travel from summary to
+	 * card header; collapse uses the local card-header → summary delta. The DOM edge applies
+	 * the direction appropriate to the morph kind.
 	 */
 	readonly driftY: number;
 	readonly durationMs: number;
@@ -123,16 +131,33 @@ export function buildDrillSnapshots(
 	for (const trace of traces) {
 		for (const row of trace.rows) {
 			const rowBlockTop = trace.top + row.top;
-			const headerViewportTop = row.drilled
+			const headerHeight = row.drilled
+				? (row.drillHeader?.height ?? DRILL_ROW_HEIGHT)
+				: DRILL_ROW_HEIGHT;
+			const headerLocalTop = row.drilled
 				? // Drilled: the card header's centre is the perceived title line. The card
 					// fills the row block from its top, so the header sits at drillHeader.top.
-					rowBlockTop + (row.drillHeader?.top ?? 0) + (row.drillHeader?.height ?? 0) / 2
+					(row.drillHeader?.top ?? 0) + headerHeight / 2
 				: // Folded: the summary line's own centre.
-					rowBlockTop + DRILL_ROW_HEIGHT / 2;
+					DRILL_ROW_HEIGHT / 2;
+			const headerViewportTop = rowBlockTop + headerLocalTop - scrollTop;
+			const blockHeight =
+				typeof row.blockHeight === "number" && Number.isFinite(row.blockHeight)
+					? row.blockHeight
+					: null;
 			out.set(`${trace.traceKey}::${row.key}`, {
 				rowUid: `${trace.traceKey}::${row.key}`,
 				drilled: row.drilled,
-				headerViewportTop: headerViewportTop - scrollTop,
+				headerViewportTop,
+				headerLocalTop,
+				headerHeight,
+				clip:
+					blockHeight === null
+						? null
+						: {
+								top: rowBlockTop - scrollTop,
+								bottom: rowBlockTop + blockHeight - scrollTop,
+							},
 			});
 		}
 	}
@@ -151,10 +176,15 @@ export function buildDrillSnapshots(
  *   - folded-centre  = the row's own summary line;
  *   - drilled-centre = the card header.
  * Expand's incoming line (the card header) starts at the folded centre and travels
- * DOWN to its committed spot; collapse's incoming line (the summary row) starts at
- * the drilled centre and travels UP. Because both snapshots store viewport tops,
- * `driftY` is just the difference of the two perceived title lines.
+ * DOWN to its committed spot. Collapse keeps the retained card header as the animated
+ * node and uses the LOCAL card-header → summary delta, so pinned-bottom scroll correction
+ * cannot become part of the header morph.
  */
+function overlapsClip(clip: DrillRowSnapshot["clip"], top: number, height: number): boolean {
+	if (!clip) return true;
+	return top < clip.bottom && top + height > clip.top;
+}
+
 export function diffDrillSnapshots(
 	prev: ReadonlyMap<string, DrillRowSnapshot>,
 	next: ReadonlyMap<string, DrillRowSnapshot>,
@@ -169,7 +199,28 @@ export function diffDrillSnapshots(
 		// is. Expand: incoming = card header (after), outgoing = summary (before).
 		// Collapse: incoming = summary (after), outgoing = card header (before).
 		const driftY = after.headerViewportTop - before.headerViewportTop;
-		out.push({ rowUid, kind, driftY, durationMs: HEADER_MORPH_DURATION_MS });
+		/**
+		 * Collapse stays a real morph, but its vertical delta must be LOCAL to the row block.
+		 * The viewport delta includes the pinned-bottom scroll correction, which can be hundreds
+		 * of pixels and would send the retained header through the shrinking clip into the next
+		 * block. The local header centres preserve the intended card-header → summary movement.
+		 *
+		 * On expand the NEW card header is clipped by the after row block. A pinned-bottom
+		 * rebuild can move that block upward by the newly revealed card height, leaving the
+		 * old summary position wholly below the block. Translating the header from there
+		 * would make it invisible for the whole morph, so keep the committed header in place
+		 * and let the fold/scroll correction carry the structural movement.
+		 */
+		const collapseDriftY = after.headerLocalTop - before.headerLocalTop;
+		const startTop = before.headerViewportTop - after.headerHeight / 2;
+		const visibleStart =
+			kind !== "expand" || overlapsClip(after.clip, startTop, after.headerHeight);
+		out.push({
+			rowUid,
+			kind,
+			driftY: !visibleStart ? 0 : kind === "collapse" ? collapseDriftY : driftY,
+			durationMs: HEADER_MORPH_DURATION_MS,
+		});
 	}
 	return out;
 }

@@ -26,6 +26,7 @@ import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segmen
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
+import { shellSource } from "./guard-source";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
 import { renderElement, resolveRenderExtra } from "./render-registry";
@@ -330,7 +331,7 @@ describe("compact marker row — the injected callbacks actually fire", () => {
 });
 
 describe("shell wiring — the compact callbacks reach the row", () => {
-	const SHELL = Bun.file(new URL("./PretextExactMessageList.tsx", import.meta.url).pathname).text();
+	const SHELL = Promise.resolve(shellSource());
 	const DISPATCH = Bun.file(new URL("./render-registry.tsx", import.meta.url).pathname).text();
 
 	it("ExactRow forwards the per-row compact actions into the render extra", async () => {

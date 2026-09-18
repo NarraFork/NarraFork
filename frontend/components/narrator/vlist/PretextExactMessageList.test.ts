@@ -1,25 +1,27 @@
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
 import { buildPretextLayoutIndex, type PretextLayoutManifest } from "@shared/pretext-layout";
 import { NarratorWSManager } from "../../../lib/narrator-ws-manager";
-import {
-	applyExactScrollCorrection,
-	buildExactCatchUpCursor,
-	buildExactListLayout,
-	buildExactMessageSnapshot,
-	computeToolRunFrames,
-	hasRenderableExactLayout,
-	isCompactMarkerMessage,
-	isFramedRunItem,
-	resolveExactCatchUpRevisionDelta,
-	resolveRowHitHeight,
-	shouldReloadExactDocument,
-} from "./PretextExactMessageList";
+import { shellSource } from "./guard-source";
 import {
 	resolvePretextDocumentView,
 	resolveRebuildView,
 	shouldForcePretextDocumentLoad,
 } from "./usePretextDocument";
+import {
+	buildExactCatchUpCursor,
+	buildExactMessageSnapshot,
+	hasRenderableExactLayout,
+	isCompactMarkerMessage,
+	resolveExactCatchUpRevisionDelta,
+	shouldReloadExactDocument,
+} from "./vlist-exact-document";
+import {
+	buildExactListLayout,
+	computeToolRunFrames,
+	isFramedRunItem,
+	resolveRowHitHeight,
+} from "./vlist-exact-layout";
+import { applyExactScrollCorrection } from "./vlist-exact-scroll";
 import type { VListItem } from "./vlist-pipeline";
 
 function makeManifest(): PretextLayoutManifest {
@@ -252,7 +254,7 @@ describe("PretextExactMessageList", () => {
 	});
 
 	it("keeps the experimental shell independent from band geometry", () => {
-		const source = readFileSync(`${import.meta.dir}/PretextExactMessageList.tsx`, "utf8");
+		const source = shellSource();
 		expect(source).toContain("pretextDocument.index");
 		expect(source).toContain('position: "absolute"');
 		expect(source).toContain('overflow: "hidden"');

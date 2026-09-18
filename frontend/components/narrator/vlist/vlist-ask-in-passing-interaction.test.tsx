@@ -15,8 +15,8 @@
  *      a resolved one points) — `resolveVListAskInPassingTarget`;
  *   2. the adapter's question field (server writes `question`, not `text`);
  *   3. the render chain adapter → measure → render → DOM, so a dropped prop in the
- *      dispatch fails here: the injected form must replace the readOnly copy, and a
- *      resolved card's click must reach the navigation callback.
+ *      dispatch fails here: controlled pending props must reach the fixed form,
+ *      and a resolved card's click must reach the navigation callback.
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
@@ -27,6 +27,7 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
+import type { AskInPassingPendingInteraction } from "./render/RenderAskInPassing";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import {
 	isVListAskInPassingPending,
@@ -97,17 +98,17 @@ interface RenderedCard {
 
 /**
  * Drive one ask_in_passing block through adapter → measure → render into a live
- * DOM with the injected slot / callback, exactly as the shell's ExactRow does.
+ * DOM with controlled props / callback, exactly as the shell's ExactRow does.
  */
 function renderCard(
 	block: Record<string, unknown>,
-	injected: { formSlot?: React.ReactNode; onOpen?: () => void } = {},
+	injected: { pending?: AskInPassingPendingInteraction; onOpen?: () => void } = {},
 ): RenderedCard {
 	const spec = adaptAskInPassing(block);
 	expect(spec.kind).toBe("ask-in-passing");
 	const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, CONTENT_WIDTH, 5, spec.opts);
 	const extra = resolveRenderExtra(spec);
-	if (injected.formSlot !== undefined) extra.askInPassingFormSlot = injected.formSlot;
+	if (injected.pending) extra.askInPassingPending = injected.pending;
 	if (injected.onOpen) extra.onOpenAskInPassingTarget = injected.onOpen;
 
 	const container = document.createElement("div");
@@ -201,7 +202,7 @@ describe("resolveVListAskInPassingTarget — which rows get which wiring", () =>
 		expect(readAskInPassingTargetNarratorId(messages, "other")).toBe("nar-answer");
 	});
 
-	it("isVListAskInPassingPending marks exactly the rows the shell must measure after paint", () => {
+	it("isVListAskInPassingPending identifies the rows requiring pending interaction", () => {
 		// The shell needs this decision BEFORE it has the manifest source ids, so it
 		// must agree with the full resolver on the spec data alone.
 		expect(isVListAskInPassingPending("ask-in-passing", { kind: "pending" })).toBe(true);
@@ -227,22 +228,104 @@ describe("adapter — the resolved question comes from the block's `question` fi
 	});
 });
 
-describe("ask-in-passing row — the injected slot / callback actually work", () => {
-	it("the pending row mounts the LIVE form and drops the inert copy", () => {
+describe("ask-in-passing row — controlled interaction and fixed geometry", () => {
+	it("passes controlled value and button callbacks through the registry", () => {
+		let confirmed = 0;
+		let cancelled = 0;
 		const card = renderCard(PENDING_BLOCK, {
-			formSlot: <input data-testid="live-form" placeholder="live" />,
+			pending: {
+				value: "Question?",
+				busy: false,
+				onChange: () => {},
+				onConfirm: () => confirmed++,
+				onCancel: () => cancelled++,
+			},
 		});
-		const live = card.root.querySelector("[data-testid='live-form']");
-		expect(live).not.toBeNull();
-		// The copy must be GONE, not merely accompanied: two inputs would leave the
-		// reader typing into the readOnly one that submits nothing (the reported
-		// symptom). The copy is identified by its own placeholder.
 		expect(card.root.querySelectorAll("input")).toHaveLength(1);
-		expect(copyPlaceholderCount(card.root)).toBe(0);
+		expect((card.root.querySelector("input") as HTMLInputElement).value).toBe("Question?");
+		const buttons = card.root.querySelectorAll("button");
+		act(() => {
+			(buttons[0] as HTMLElement).click();
+			(buttons[1] as HTMLElement).click();
+		});
+		expect(confirmed).toBe(1);
+		expect(cancelled).toBe(1);
+		expect(card.height).toBe(79);
 		card.unmount();
 	});
 
-	it("without a slot only the inert copy is drawn (harness / no bridge)", () => {
+	it("Enter confirms and Escape cancels, but IME key events do neither", () => {
+		let confirmed = 0;
+		let cancelled = 0;
+		const card = renderCard(PENDING_BLOCK, {
+			pending: {
+				value: "question",
+				busy: false,
+				onChange: () => {},
+				onConfirm: () => confirmed++,
+				onCancel: () => cancelled++,
+			},
+		});
+		const input = card.root.querySelector("input");
+		for (const key of ["Enter", "Escape"]) {
+			for (const composing of [true, false]) {
+				const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+				Object.defineProperty(event, "isComposing", { value: composing });
+				act(() => {
+					input?.dispatchEvent(event);
+				});
+			}
+		}
+		expect(confirmed).toBe(1);
+		expect(cancelled).toBe(1);
+		card.unmount();
+	});
+
+	it("busy and blank pending forms disable submission", () => {
+		for (const state of [
+			{ value: "  ", busy: false },
+			{ value: "Question?", busy: true },
+		]) {
+			const card = renderCard(PENDING_BLOCK, {
+				pending: { ...state, onChange: () => {}, onConfirm: () => {}, onCancel: () => {} },
+			});
+			expect(card.root.querySelector("button")?.hasAttribute("disabled")).toBe(true);
+			card.unmount();
+		}
+	});
+
+	it("claims focus externally once and never scrolls on remount", () => {
+		let available = true;
+		const calls: unknown[] = [];
+		const original = HTMLElement.prototype.focus;
+		HTMLElement.prototype.focus = (options) => {
+			calls.push(options);
+		};
+		try {
+			const pending: AskInPassingPendingInteraction = {
+				value: "draft",
+				busy: false,
+				onChange: () => {},
+				onConfirm: () => {},
+				onCancel: () => {},
+				focusRequest: 1,
+				onFocusConsumed: () => {
+					const claimed = available;
+					available = false;
+					return claimed;
+				},
+			};
+			const first = renderCard(PENDING_BLOCK, { pending });
+			first.unmount();
+			const second = renderCard(PENDING_BLOCK, { pending });
+			second.unmount();
+			expect(calls).toEqual([{ preventScroll: true }]);
+		} finally {
+			HTMLElement.prototype.focus = original;
+		}
+	});
+
+	it("without a controller the fixed form is disabled (harness / no bridge)", () => {
 		const card = renderCard(PENDING_BLOCK);
 		expect(card.root.querySelectorAll("input")).toHaveLength(1);
 		expect(copyPlaceholderCount(card.root)).toBe(1);

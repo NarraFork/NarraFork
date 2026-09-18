@@ -26,7 +26,7 @@ beforeAll(() => {
 
 describe("isSuppressedScrollEcho — telling our own write from the reader", () => {
 	it("treats a scroll event matching our written value as our own echo", async () => {
-		const { isSuppressedScrollEcho } = await import("./PretextExactMessageList");
+		const { isSuppressedScrollEcho } = await import("./vlist-exact-scroll");
 		expect(isSuppressedScrollEcho(true, 1000, 1000)).toBe(true);
 		// The browser may settle a programmatic write a fraction of a pixel away.
 		expect(isSuppressedScrollEcho(true, 1000, 1000.4)).toBe(true);
@@ -34,7 +34,7 @@ describe("isSuppressedScrollEcho — telling our own write from the reader", () 
 	});
 
 	it("honours the reader from ANY input source that moved the position", async () => {
-		const { isSuppressedScrollEcho } = await import("./PretextExactMessageList");
+		const { isSuppressedScrollEcho } = await import("./vlist-exact-scroll");
 		// This is what makes the fix cover keyboard and scrollbar dragging too: the
 		// list does not need a listener per gesture, only to notice the position is not
 		// the one it wrote. (Only wheel/touch ever had explicit detach handlers.)
@@ -44,13 +44,13 @@ describe("isSuppressedScrollEcho — telling our own write from the reader", () 
 	});
 
 	it("is inert when no write is being suppressed", async () => {
-		const { isSuppressedScrollEcho } = await import("./PretextExactMessageList");
+		const { isSuppressedScrollEcho } = await import("./vlist-exact-scroll");
 		expect(isSuppressedScrollEcho(false, 1000, 1000)).toBe(false);
 		expect(isSuppressedScrollEcho(false, null, 42)).toBe(false);
 	});
 
 	it("stays conservative when the written value is unknown", async () => {
-		const { isSuppressedScrollEcho } = await import("./PretextExactMessageList");
+		const { isSuppressedScrollEcho } = await import("./vlist-exact-scroll");
 		expect(isSuppressedScrollEcho(true, null, 123)).toBe(true);
 	});
 });
@@ -67,7 +67,7 @@ describe("upward scroll intent loads older history without a wheel event", () =>
 	};
 
 	it("loads when a scrollbar drag or keyboard scroll reaches the top", async () => {
-		const { isUpwardHistoryScroll } = await import("./PretextExactMessageList");
+		const { isUpwardHistoryScroll } = await import("./vlist-exact-scroll");
 		for (const previousTop of [4000, 600, 3]) {
 			const intentAt = isUpwardHistoryScroll(previousTop, 0, false) ? baseInput.now : null;
 			expect(resolveOlderHistoryAutoLoad({ ...baseInput, intentAt })).toEqual({
@@ -78,7 +78,7 @@ describe("upward scroll intent loads older history without a wheel event", () =>
 	});
 
 	it("refreshes intent during a drag longer than the gesture timeout", async () => {
-		const { isUpwardHistoryScroll } = await import("./PretextExactMessageList");
+		const { isUpwardHistoryScroll } = await import("./vlist-exact-scroll");
 		const travelling = resolveOlderHistoryAutoLoad({
 			...baseInput,
 			scrollTop: 500,
@@ -96,7 +96,7 @@ describe("upward scroll intent loads older history without a wheel event", () =>
 	});
 
 	it("ignores programmatic echoes, unchanged positions, downward scrolls and pixel jitter", async () => {
-		const { isUpwardHistoryScroll } = await import("./PretextExactMessageList");
+		const { isUpwardHistoryScroll } = await import("./vlist-exact-scroll");
 		expect(isUpwardHistoryScroll(1000, 0, true)).toBe(false);
 		// writeScrollTop updates the live ref, so even a delayed echo after the
 		// suppression window closes cannot renew an already-consumed intent.
@@ -107,14 +107,12 @@ describe("upward scroll intent loads older history without a wheel event", () =>
 	});
 
 	it("recognizes a drag even while a different programmatic position is suppressed", async () => {
-		const { isSuppressedScrollEcho, isUpwardHistoryScroll } = await import(
-			"./PretextExactMessageList"
-		);
+		const { isSuppressedScrollEcho, isUpwardHistoryScroll } = await import("./vlist-exact-scroll");
 		expect(isUpwardHistoryScroll(1000, 0, isSuppressedScrollEcho(true, 1000, 0))).toBe(true);
 	});
 
 	it("preserves manual mode, the loading lock and the end-of-history guard", async () => {
-		const { isUpwardHistoryScroll } = await import("./PretextExactMessageList");
+		const { isUpwardHistoryScroll } = await import("./vlist-exact-scroll");
 		const intentAt = isUpwardHistoryScroll(1000, 0, false) ? baseInput.now : null;
 		for (const guard of [{ autoLoadEnabled: false }, { expanding: true }, { hasOlder: false }]) {
 			expect(resolveOlderHistoryAutoLoad({ ...baseInput, intentAt, ...guard }).shouldLoad).toBe(
@@ -124,7 +122,7 @@ describe("upward scroll intent loads older history without a wheel event", () =>
 	});
 
 	it("consumes intent once and does not re-arm from a prepend correction or an idle top", async () => {
-		const { isUpwardHistoryScroll } = await import("./PretextExactMessageList");
+		const { isUpwardHistoryScroll } = await import("./vlist-exact-scroll");
 		const loaded = resolveOlderHistoryAutoLoad({ ...baseInput, intentAt: baseInput.now });
 		expect(loaded).toEqual({ shouldLoad: true, nextIntentAt: null });
 		for (const [previousTop, nextTop, isEcho] of [
@@ -178,7 +176,7 @@ describe("isBottomLostToContentGrowth — a row growing beneath a pinned reader"
 	 * effect is gated on `pinnedToBottom`, so every later message landed off-screen.
 	 */
 	it("keeps the pin when the bottom moved but scrollTop did not", async () => {
-		const { isBottomLostToContentGrowth } = await import("./PretextExactMessageList");
+		const { isBottomLostToContentGrowth } = await import("./vlist-exact-scroll");
 		// The permission form grew 120px below the viewport: same scrollTop, new bottom.
 		expect(isBottomLostToContentGrowth(true, 4000, 4000)).toBe(true);
 		// Sub-pixel settling of a programmatic write is not an upward gesture.
@@ -188,7 +186,7 @@ describe("isBottomLostToContentGrowth — a row growing beneath a pinned reader"
 	});
 
 	it("releases the pin as soon as the reader actually travels upward", async () => {
-		const { isBottomLostToContentGrowth } = await import("./PretextExactMessageList");
+		const { isBottomLostToContentGrowth } = await import("./vlist-exact-scroll");
 		// Every gesture toward earlier content LOWERS scrollTop, which is the whole
 		// discriminator — no per-gesture listener needed.
 		expect(isBottomLostToContentGrowth(true, 4000, 3800)).toBe(false); // wheel / drag
@@ -197,7 +195,7 @@ describe("isBottomLostToContentGrowth — a row growing beneath a pinned reader"
 	});
 
 	it("never re-pins a reader who had already left the bottom", async () => {
-		const { isBottomLostToContentGrowth } = await import("./PretextExactMessageList");
+		const { isBottomLostToContentGrowth } = await import("./vlist-exact-scroll");
 		// Reading history while output streams: growth below must not drag them back.
 		expect(isBottomLostToContentGrowth(false, 1000, 1000)).toBe(false);
 		expect(isBottomLostToContentGrowth(false, 1000, 1200)).toBe(false);

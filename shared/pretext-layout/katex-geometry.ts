@@ -199,6 +199,8 @@ export const KATEX_FONT_SCALE = 1.21;
 export const KATEX_LINE_HEIGHT = 1.2;
 /** `.katex .vlist-s { width: 2px }` — an absolute px strut, not em. */
 const VLIST_S_WIDTH_PX = 2;
+/** `.katex .boxpad { padding: 0 0.3em }` — horizontal fbox separation. */
+const BOXPAD_HORIZONTAL_EM = 0.3;
 /** `.katex .vlist-t2 { margin-right: -2px }` — cancels the vlist-s strut. */
 const VLIST_T2_MARGIN_PX = -2;
 /** `.katex .nulldelimiter { width: 0.12em }`. */
@@ -479,6 +481,10 @@ function nodeWidth(node: KatexNode, ctx: WalkContext): Width {
 		const value = parseEm(style[key]);
 		if (value) width.em += value * scale;
 	}
+	// `.boxpad` carries the horizontal \\fboxsep padding from KaTeX's stylesheet;
+	// unlike most layout chrome, it is declared only by class rather than inline
+	// style, so it must be added explicitly to the measured subtree width.
+	if (classes.includes("boxpad")) width.em += BOXPAD_HORIZONTAL_EM * 2 * scale;
 	return width;
 }
 

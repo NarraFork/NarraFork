@@ -17,7 +17,10 @@ import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
 import type { VListElementKind } from "./registry";
-import { RenderAskInPassing } from "./render/RenderAskInPassing";
+import {
+	type AskInPassingPendingInteraction,
+	RenderAskInPassing,
+} from "./render/RenderAskInPassing";
 import { RenderCommunicationBubble } from "./render/RenderCommunicationBubble";
 import { RenderInjectionBubble } from "./render/RenderInjectionBubble";
 import { RenderMarkdown } from "./render/RenderMarkdown";
@@ -387,11 +390,7 @@ export function renderElement(
 					kind={(extra.kind as "pending" | "resolved") ?? "pending"}
 					measured={m}
 					labels={extra.labels as never}
-					// The pending form's real interactive component (state + fork/send
-					// mutation + cancel) is mounted as a slot; the resolved card's arrow
-					// needs the route to its answer narrator. Without these the card
-					// painted correctly but could neither be typed into nor opened.
-					formSlot={extra.askInPassingFormSlot as React.ReactNode}
+					pending={extra.askInPassingPending as AskInPassingPendingInteraction | undefined}
 					onOpen={extra.onOpenAskInPassingTarget as (() => void) | undefined}
 				/>
 			);

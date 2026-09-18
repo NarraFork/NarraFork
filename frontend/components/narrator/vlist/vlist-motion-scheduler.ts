@@ -255,6 +255,10 @@ function sampleProgress(animation: unknown): MotionSample | null {
 		if (elapsed === null || !Number.isFinite(elapsed)) return null;
 		const duration = anim.effect?.getTiming?.().duration;
 		if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0) return null;
+		// A naturally finished animation can remain in `active` until its finish callback
+		// is delivered. It is no longer an interruption source: treating it as progress 1
+		// makes a replacement resume from its endpoint and appear to skip the next morph.
+		if (elapsed >= duration) return null;
 		const progress = elapsed / duration;
 		return { progress: progress < 0 ? 0 : progress > 1 ? 1 : progress };
 	} catch {

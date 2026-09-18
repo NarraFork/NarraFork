@@ -39,6 +39,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
 import { useNarratorSubagentsCapability } from "../../../hooks/usePlatform";
 import { api } from "../../../lib/api";
 import {
@@ -629,6 +630,7 @@ export function BackgroundTasksDrawerHost({
 }) {
 	const { t } = useTranslation("narrator");
 	const { runningCount } = useBackgroundTasksButton(narratorId, opened);
+	useMobileDrawerHistory(opened, onClose);
 
 	return (
 		<Drawer
@@ -672,6 +674,7 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 	const { t } = useTranslation("narrator");
 	const [opened, { open, close }] = useDisclosure(false);
 	const { supported, runningCount } = useBackgroundTasksButton(narratorId);
+	useMobileDrawerHistory(opened, close);
 
 	if (!supported) return null;
 

@@ -1,3 +1,4 @@
+import { publishAskInPassingEvent } from "@frontend/lib/ask-in-passing-events";
 import { notifications } from "@mantine/notifications";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import type { SubagentModelPools } from "@shared/subagent-model-policy";
@@ -650,7 +651,10 @@ export function useStartAskInPassing() {
 			sourceMessageId: string;
 			sourceMessageUuid?: string;
 		}) => api.startAskInPassing(narratorId, { sourceMessageId, sourceMessageUuid }),
-		onSuccess: (_data, { narratorId }) => {
+		onSuccess: (data, { narratorId }) => {
+			if (data.message) {
+				publishAskInPassingEvent({ kind: "start", narratorId, message: data.message, focus: true });
+			}
 			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "messages"] });
 		},
 	});
@@ -673,7 +677,10 @@ export function useAskInPassing() {
 		// open session's messages/tool-calls/preview caches — including the panel the
 		// answer opens in, which then refetches its history from scratch. Mirrors the
 		// predicate `useForkNarrator` already uses for the same reason.
-		onSuccess: () => {
+		onSuccess: (data, { narratorId }) => {
+			if (data.message) {
+				publishAskInPassingEvent({ kind: "resolved", narratorId, message: data.message });
+			}
 			qc.invalidateQueries({
 				predicate: (query) => {
 					const key = query.queryKey;
@@ -691,6 +698,9 @@ export function useCancelAskInPassing() {
 	return useMutation({
 		mutationFn: ({ narratorId, messageId }: { narratorId: string; messageId: string }) =>
 			api.cancelAskInPassing(narratorId, messageId),
+		onSuccess: (_data, { narratorId, messageId }) => {
+			publishAskInPassingEvent({ kind: "deleted", narratorId, messageId });
+		},
 	});
 }
 
@@ -863,7 +873,8 @@ export function useDeleteNarrator() {
 
 export function useInterruptNarrator() {
 	return useMutation({
-		mutationFn: (id: string) => api.interruptNarrator(id),
+		mutationFn: ({ id, waitForIdle = false }: { id: string; waitForIdle?: boolean }) =>
+			api.interruptNarrator(id, waitForIdle),
 	});
 }
 
@@ -1211,7 +1222,11 @@ export function useUpdateModel() {
 	return useMutation({
 		mutationFn: ({ id, model }: { id: string; model: string }) =>
 			api.updateNarratorModel(id, model),
-		onSuccess: () => {
+		onSuccess: (_data, vars) => {
+			// Changing the model abandons the unavailable model's wait condition, so
+			// dismiss its persistent notification even if the server does not emit a
+			// recovery event for the old model.
+			notifications.hide(`model-unavailable-${vars.id}`);
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},
 	});

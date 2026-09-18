@@ -20,8 +20,9 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { shellSource } from "./guard-source";
 
-const SHELL = readFileSync(join(import.meta.dir, "PretextExactMessageList.tsx"), "utf8");
+const SHELL = shellSource();
 const ROW_INTERACTION = readFileSync(join(import.meta.dir, "VListRowInteraction.tsx"), "utf8");
 
 describe("vlist inline editing wiring", () => {

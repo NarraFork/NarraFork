@@ -19,9 +19,10 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { shellSource } from "./guard-source";
 
 const DIR = import.meta.dir;
-const SHELL = readFileSync(join(DIR, "PretextExactMessageList.tsx"), "utf8");
+const SHELL = shellSource();
 const TRACE_ROW = readFileSync(join(DIR, "..", "trace", "TraceRowInteraction.tsx"), "utf8");
 const TOOL_META = readFileSync(join(DIR, "vlist-tool-meta.ts"), "utf8");
 

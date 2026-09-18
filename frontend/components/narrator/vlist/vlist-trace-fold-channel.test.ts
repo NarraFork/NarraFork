@@ -132,9 +132,7 @@ describe("the shell routes the row toggle by kind", () => {
 		// full mount to exercise, and the failure mode is a silent no-op, so the guard
 		// is that the dispatcher is derived from `traceRowFoldChannel` rather than
 		// handing every trace the key-passing handler.
-		const src = await Bun.file(
-			new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
-		).text();
+		const src = await Bun.file(new URL("./ExactRow.tsx", import.meta.url).pathname).text();
 		const block = src.slice(src.indexOf("if (TRACE_KINDS.has(kind)) {"));
 		expect(block).toContain('traceRowFoldChannel(kind) === "key"');
 		// The index-addressed branch must DROP the key, not forward it.

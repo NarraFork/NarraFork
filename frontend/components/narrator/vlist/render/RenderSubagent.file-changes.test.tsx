@@ -167,6 +167,15 @@ describe("subagent file-change rendering", () => {
 		expectHeightParity(root, measured.fileChangesHeight);
 	});
 
+	it("does not render the legacy warning for exact or mixed current-run evidence", () => {
+		for (const attributionScope of ["exact_attempt", "mixed"] as const) {
+			const { root, measured } = render(changes({ attributionScope }));
+			expect(root.querySelector('[data-testid="subagent-file-changes-legacy"]')).toBeNull();
+			expect(root.querySelector('[data-testid="subagent-file-changes-window"]')).toBeNull();
+			expectHeightParity(root, measured.fileChangesHeight);
+		}
+	});
+
 	it("shows the requested scope without upgrading it to exact attempt/net evidence", () => {
 		const scope = { sourceToolUseId: "parent-call", startedAt: null, completedAt: null };
 		const { root, measured } = render(changes({ scope }));

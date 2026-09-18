@@ -962,6 +962,28 @@ describe("adaptSegment — user-role system notices", () => {
 	});
 });
 
+describe("adaptSegment — native context markdown", () => {
+	it("passes standalone context text to markdown measurement as a string", () => {
+		const specs = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "ctx-markdown",
+					role: "system",
+					contentJson: [
+						{ type: "system_injection", source: "bg_agent", modelText: "model context" },
+						{ type: "text", text: "follow-up **markdown**" },
+					],
+				},
+			},
+			CTX,
+		);
+		const markdown = specs.find((spec) => spec.kind === "markdown");
+		expect(markdown?.data).toBe("follow-up **markdown**");
+		expect(() => VLIST_REGISTRY.markdown.measure(markdown?.data, 600, 5)).not.toThrow();
+	});
+});
+
 describe("adaptSegment — assistant message", () => {
 	it("dispatches each visible block to its kind", () => {
 		const seg: AdapterSegment = {
@@ -1951,6 +1973,25 @@ describe("groupToolItemsForLod / isActiveToolItem", () => {
 		const groups = groupToolItemsForLod(items);
 		expect(groups.map((g) => g.kind)).toEqual(["folded", "active", "folded"]);
 	});
+
+	it("keeps AskUserQuestion standalone out of the fold", async () => {
+		const { groupToolItemsForLod } = await import("./segment-adapter");
+		const items = [
+			{ blockIndex: 0, isSubagent: false, tc: { toolName: "Bash", status: "completed" } },
+			{
+				blockIndex: 1,
+				isSubagent: false,
+				tc: { toolName: "AskUserQuestion", status: "completed" },
+			},
+			{ blockIndex: 2, isSubagent: false, tc: { toolName: "Read", status: "completed" } },
+		];
+		const groups = groupToolItemsForLod(items);
+		expect(groups.map((g) => g.kind)).toEqual(["folded", "active", "folded"]);
+		expect(groups[1]).toMatchObject({
+			kind: "active",
+			item: { tc: { toolName: "AskUserQuestion" } },
+		});
+	});
 });
 
 describe("adaptActivityUnit", () => {
@@ -2757,6 +2798,89 @@ describe("adaptSegment — pending permission injection", () => {
 		for (const spec of specs) {
 			expect("hasPendingPermission" in (spec.opts ?? {})).toBe(false);
 		}
+	});
+});
+
+describe("adaptSegment — prefer-open AskUserQuestion", () => {
+	const askSeg: AdapterSegment = {
+		kind: "tool-run",
+		sourceMessages: [],
+		items: [
+			{ blockIndex: 0, isSubagent: false, tc: { toolName: "Bash", toolUseId: "tu-bash" } },
+			{
+				blockIndex: 1,
+				isSubagent: false,
+				tc: { toolName: "AskUserQuestion", toolUseId: "tu-ask" },
+			},
+		],
+	};
+
+	it("writes preferOpen and keeps collapsesByLod false so click can fold", () => {
+		const specs = adaptSegment(askSeg, { lod: 3 });
+		const askSpec = specs.find((s) => s.key === "tool-tu-ask");
+		const bashSpec = specs.find((s) => s.key === "tool-tu-bash");
+		expect((askSpec?.opts as { preferOpen?: boolean })?.preferOpen).toBe(true);
+		expect((askSpec?.opts as { collapsesByLod?: boolean })?.collapsesByLod).toBe(false);
+		// A sibling completed tool still collapses at L3.
+		expect((bashSpec?.opts as { collapsesByLod?: boolean })?.collapsesByLod).toBe(true);
+	});
+
+	it("does not forceExpanded (chevron must stay able to fold)", () => {
+		const specs = adaptSegment(askSeg, { lod: 4 });
+		const askSpec = specs.find((s) => s.key === "tool-tu-ask");
+		expect(askSpec?.opts?.forceExpanded).toBeUndefined();
+	});
+
+	it("keeps AskUserQuestion as a full card at L2 (not tool-run-count)", () => {
+		const specs = adaptSegment(askSeg, { lod: 2 });
+		expect(specs.some((s) => s.key === "tool-tu-ask")).toBe(true);
+		expect(specs.some((s) => s.kind === "tool-run-count")).toBe(true);
+	});
+
+	it("ExitPlanMode is preferOpen; EnterPlanMode is not", () => {
+		const planSeg: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: { toolName: "EnterPlanMode", toolUseId: "tu-enter" },
+				},
+				{
+					blockIndex: 1,
+					isSubagent: false,
+					tc: { toolName: "ExitPlanMode", toolUseId: "tu-exit" },
+				},
+			],
+		};
+		const specs = adaptSegment(planSeg, { lod: 3 });
+		const enter = specs.find((s) => s.key === "tool-tu-enter");
+		const exit = specs.find((s) => s.key === "tool-tu-exit");
+		expect((exit?.opts as { preferOpen?: boolean })?.preferOpen).toBe(true);
+		expect((exit?.opts as { collapsesByLod?: boolean })?.collapsesByLod).toBe(false);
+		expect((enter?.opts as { preferOpen?: boolean })?.preferOpen).toBeUndefined();
+		expect((enter?.opts as { collapsesByLod?: boolean })?.collapsesByLod).toBe(true);
+	});
+
+	it("keeps ExitPlanMode as a full card at L2", () => {
+		const specs = adaptSegment(
+			{
+				kind: "tool-run",
+				sourceMessages: [],
+				items: [
+					{ blockIndex: 0, isSubagent: false, tc: { toolName: "Bash", toolUseId: "tu-b" } },
+					{
+						blockIndex: 1,
+						isSubagent: false,
+						tc: { toolName: "ExitPlanMode", toolUseId: "tu-exit" },
+					},
+				],
+			},
+			{ lod: 2 },
+		);
+		expect(specs.some((s) => s.key === "tool-tu-exit")).toBe(true);
+		expect(specs.some((s) => s.kind === "tool-run-count")).toBe(true);
 	});
 });
 

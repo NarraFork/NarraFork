@@ -671,10 +671,10 @@ describe("measureSubagent — file changes", () => {
 		);
 		expect(measured.fileChangeRowCount).toBe(0);
 		expect(measured.hasFileChangeOverflowRow).toBe(true);
-		expect(measured.fileChangeNoticeRowCount).toBe(1);
-		// Title + legacy notice + summary, and NO seam between nonexistent files.
+		expect(measured.fileChangeNoticeRowCount).toBe(0);
+		// Title + summary, and NO seam between nonexistent files.
 		expect(measured.fileChangesHeight).toBeCloseTo(
-			3 * measured.fileChangeRowHeight + BLOCK_PADDING_BOTTOM,
+			2 * measured.fileChangeRowHeight + BLOCK_PADDING_BOTTOM,
 			5,
 		);
 	});

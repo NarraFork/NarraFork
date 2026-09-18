@@ -1,7 +1,6 @@
 import { formatLocaleNumber } from "@frontend/lib/intl-format";
 import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
-import type { AsyncQuestion } from "@frontend/types/narrator";
 import {
 	ActionIcon,
 	Badge,
@@ -26,7 +25,6 @@ import type {
 	FileReferenceContext,
 	FileReferenceEditorSelection,
 } from "@shared/file-reference";
-
 import {
 	IconArrowDown,
 	IconArrowLeft,
@@ -44,11 +42,6 @@ import { useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
-import {
-	useAnswerAsyncQuestion,
-	useAsyncQuestions,
-	useDismissAsyncQuestion,
-} from "../../hooks/useAsyncQuestions";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
@@ -56,6 +49,7 @@ import { useGitWorkspace } from "../../hooks/useGit";
 import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
+import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
 import { useModelCardIndex } from "../../hooks/useModelCards";
 import { useAllModels } from "../../hooks/useModels";
 import {
@@ -100,7 +94,6 @@ import {
 	formatColonDuration,
 	formatFullLocaleDateTime,
 } from "../../lib/format";
-
 import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
 import { formatRevertWarnings } from "../../lib/revert-warnings";
 import {
@@ -179,11 +172,10 @@ import { useNugQuota } from "./model/use-nug-quota";
 import { NarratorInteractionArea } from "./NarratorInteractionArea";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
-import type { AsyncQuestionSlot, NarratorPanelProps } from "./narrator-panel-types";
+import type { NarratorPanelProps } from "./narrator-panel-types";
 import { LeakedToolCallModal } from "./permission/LeakedToolCallModal";
 import { RevertActionConfirmModal } from "./permission/RevertScopeConfirmModal";
 import { compactProgressLabel } from "./progress-label";
-import { toBannerQuestions } from "./question/async-question-questions";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
 import { type SwipeAnchorInfo, setGlobalOnSwipeAnchorInfo } from "./scroll/swipeState";
@@ -195,6 +187,7 @@ import {
 	LatestTodosToolUseIdCtx,
 	PermEnterHintCtx,
 } from "./tool-call/tool-call-contexts";
+import { useNarratorAsyncQuestionSlots } from "./useNarratorAsyncQuestionSlots";
 import { useNarratorPanelWS } from "./useNarratorPanelWS";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
@@ -240,14 +233,6 @@ export function shouldRenderFileModificationsDrawer(
 ): boolean {
 	return opened || hasBeenOpened;
 }
-
-/**
- * Stable empty list for the async-question inbox.
- *
- * A fresh `[]` per render would give the slot memo a new dependency every time and
- * rebuild the map (and with it every mounted question form) on unrelated renders.
- */
-const EMPTY_ASYNC_QUESTIONS: AsyncQuestion[] = [];
 
 type CompactingMarkerKind = "context" | "segment";
 
@@ -1148,6 +1133,7 @@ export function NarratorPanel({
 		quotaBalance,
 		detailedQuotaBalance,
 		retryInfo,
+		quotaWaitInfo,
 		paymentRequired,
 		setPaymentRequired,
 		leakedToolEvent,
@@ -1493,41 +1479,7 @@ export function NarratorPanel({
 	// above the composer reads the cross-session query instead (it has to be able to say
 	// "2 waiting elsewhere"), and both are kept in step by invalidating the narrator
 	// and global inbox queries on every decision.
-	const { data: asyncQuestionData } = useAsyncQuestions(narratorId, !isWorkspacePreview);
-	const answerAsyncQuestion = useAnswerAsyncQuestion(narratorId);
-	const dismissAsyncQuestion = useDismissAsyncQuestion(narratorId);
-	const [busyAsyncQuestionId, setBusyAsyncQuestionId] = useState<string | null>(null);
-	const openAsyncQuestions = asyncQuestionData?.items ?? EMPTY_ASYNC_QUESTIONS;
-	const asyncQuestionSlots = useMemo(() => {
-		const map = new Map<string, AsyncQuestionSlot>();
-		for (const question of openAsyncQuestions) {
-			if (!question.toolUseId) continue;
-			map.set(question.toolUseId, {
-				id: question.id,
-				draftId: question.toolCallId,
-				questions: toBannerQuestions(question.questions),
-				busy: busyAsyncQuestionId === question.id,
-				denyLabel: t("asyncQuestionDismiss"),
-				awaited: question.awaited,
-				awaitedLabel: t("asyncQuestionAwaitedNotice"),
-				onSubmit: (questionId, answers) => {
-					setBusyAsyncQuestionId(questionId);
-					answerAsyncQuestion.mutate(
-						{ questionId, answers },
-						{ onSettled: () => setBusyAsyncQuestionId(null) },
-					);
-				},
-				onDismiss: (questionId) => {
-					setBusyAsyncQuestionId(questionId);
-					dismissAsyncQuestion.mutate(
-						{ questionId },
-						{ onSettled: () => setBusyAsyncQuestionId(null) },
-					);
-				},
-			});
-		}
-		return map;
-	}, [openAsyncQuestions, busyAsyncQuestionId, answerAsyncQuestion, dismissAsyncQuestion, t]);
+	const asyncQuestionSlots = useNarratorAsyncQuestionSlots(narratorId, !isWorkspacePreview);
 	const permCbWithAsyncQuestions = useMemo(
 		() => ({ ...renderPermCb, asyncQuestions: asyncQuestionSlots }),
 		[renderPermCb, asyncQuestionSlots],
@@ -1643,9 +1595,16 @@ export function NarratorPanel({
 	 * attention-colored (yellow) treatment off a wait the user cannot resolve.
 	 */
 	const isWaitingForModel = substatus.includes("model_unavailable");
+	/**
+	 * Parked until an exhausted Kimi quota window resets. A sibling of the model
+	 * outage above — also a wait on the machine — kept separate because the label
+	 * and the notice have to say which of the two is happening.
+	 */
+	const isWaitingForQuota = substatus.includes("quota_exhausted");
+	const isWaitingForRecovery = isWaitingForModel || isWaitingForQuota;
 	/** Registry-owned accent for that state, so the shade lives in one place. */
 	const modelUnavailableColor = statusRegistry.accentColor(
-		statusRegistry.narratorSubstatus("model_unavailable"),
+		statusRegistry.narratorSubstatus(isWaitingForQuota ? "quota_exhausted" : "model_unavailable"),
 	);
 	// Derive compacting flags from substatus. "compacting" is blocking; background compact
 	// can run alongside an active turn or after the turn has become idle.
@@ -1678,15 +1637,15 @@ export function NarratorPanel({
 	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting || isRetrying);
 	/*
 	 * Single source for the work-indicator accent, shared by the spinner and its
-	 * label so the two can never drift. `model_unavailable` uses the blue-toned
-	 * neutral from the status registry so it reads as "the system is waiting", not
-	 * "you need to do something".
+	 * label so the two can never drift. `model_unavailable` / `quota_exhausted` use
+	 * the blue-toned neutral from the status registry so they read as "the system is
+	 * waiting", not "you need to do something".
 	 */
 	const workIndicatorColor = isRetrying
 		? "yellow"
 		: isBlockingCompacting || (isBackgroundCompacting && !isWorking)
 			? "orange"
-			: isWaitingForModel
+			: isWaitingForRecovery
 				? modelUnavailableColor
 				: isWaiting
 					? "yellow"
@@ -1695,6 +1654,7 @@ export function NarratorPanel({
 						: "blue";
 
 	// --- Turn elapsed timer ---
+	// Hooks must stay above the `if (!narrator) return` early exit below.
 	const turnStartedAt = narrator?.turnStartedAt as string | null | undefined;
 	const narratorUpdatedAt = narrator?.updatedAt as string | null | undefined;
 	const [turnElapsed, setTurnElapsed] = useState<number | null>(null);
@@ -1719,9 +1679,9 @@ export function NarratorPanel({
 	);
 	const turnStartedAtLabel = useMemo(() => {
 		if (!turnStartedAt) return null;
-		const time = formatFullLocaleDateTime(turnStartedAt);
+		const time = formatFullLocaleDateTime(turnStartedAt, i18n.language);
 		return time ? t("toolStartedAt", { time }) : null;
-	}, [turnStartedAt, t]);
+	}, [turnStartedAt, i18n.language, t]);
 
 	const todosCtxValue = useMemo(
 		() => ({
@@ -1882,6 +1842,7 @@ export function NarratorPanel({
 	const [mobileToolPanel, setMobileToolPanel] = useState<MobileToolPanelKind | null>(null);
 	/** Off-dock host state for the background-tasks drawer. */
 	const [mobileTasksOpen, setMobileTasksOpen] = useState(false);
+	useMobileDrawerHistory(useInternalSpec && internalSpecOpen, () => setInternalSpecOpen(false));
 
 	// File opening (dock file panel when hosted in a dock, else an off-dock right
 	// Drawer). Kept lifted here: its handlers feed the fileReferenceScope memo
@@ -1894,6 +1855,7 @@ export function NarratorPanel({
 		handleOpenReferencedFile,
 		canOpenReferencedFile,
 	} = useInternalFileViewer({ narratorId, isWorkspacePreview, t });
+	useMobileDrawerHistory(!!internalFileViewerPath, () => setInternalFileViewerPath(null));
 	const [localFileSelection, setLocalFileSelection] = useState<FileReferenceEditorSelection | null>(
 		null,
 	);
@@ -2107,6 +2069,43 @@ export function NarratorPanel({
 			handleOpenKnowledgeEntry,
 			handleOpenSpecFile,
 			handleOpenChapter,
+		],
+	);
+
+	// Memoized so it does not defeat the message list's memo boundary: inline JSX
+	// is a new object on every panel render even when the footer never shows.
+	const updateSubagentConclusion = updateConclusionMutation.mutate;
+	const conclusionUpdatePending = updateConclusionMutation.isPending;
+	const messageListTailFooter = useMemo(
+		() =>
+			isSubagent &&
+			narrator &&
+			narrator.status === "idle" &&
+			!isTakenOver &&
+			substatus.includes("manual_override") &&
+			!isActive ? (
+				<Box ta="center" py="sm">
+					<Button
+						size="compact-sm"
+						variant="light"
+						color="indigo"
+						onClick={() => updateSubagentConclusion(narratorId)}
+						loading={conclusionUpdatePending}
+					>
+						{t("updateConclusion")}
+					</Button>
+				</Box>
+			) : null,
+		[
+			isSubagent,
+			narrator,
+			isTakenOver,
+			substatus,
+			isActive,
+			updateSubagentConclusion,
+			narratorId,
+			conclusionUpdatePending,
+			t,
 		],
 	);
 
@@ -2577,6 +2576,7 @@ export function NarratorPanel({
 		isBlockingCompacting,
 		isBackgroundCompacting,
 		isWaitingForModel,
+		isWaitingForQuota,
 		hasSpecTask: !!currentSpecTask,
 		isWaiting,
 		isPlanning,
@@ -2585,6 +2585,20 @@ export function NarratorPanel({
 	// `compactProgressText` is non-null whenever either compact flag is set; the
 	// fallback only keeps the template from interpolating "null".
 	const compactProgressFragment = compactProgressText ?? "";
+
+	/**
+	 * Label for a quota wait, with the reset instant when the server reported one.
+	 *
+	 * Gated on `isWaitingForQuota` so a stale clock can never survive the wait it
+	 * belongs to: the substatus is the authoritative "still parked" signal and
+	 * `quotaWaitInfo` only supplies the time.
+	 */
+	const quotaWaitText = (() => {
+		const label = t("status_quota_exhausted");
+		const resumeAt = quotaWaitInfo?.resumeAt;
+		if (!isWaitingForQuota || !resumeAt) return label;
+		return `${label} · ${formatFullLocaleDateTime(new Date(resumeAt), i18n.language)}`;
+	})();
 
 	const hasContextData = contextPercent != null;
 	const contextIndicatorPercent = hasContextData ? Math.min(contextPercent, 100) : 0;
@@ -2944,7 +2958,7 @@ export function NarratorPanel({
 									color="orange"
 									onClick={async () => {
 										if (isActive && retryRecoveryAllowsInterrupt) {
-											await interruptMutation.mutateAsync(narratorId);
+											await interruptMutation.mutateAsync({ id: narratorId });
 										}
 
 										archiveMutation.mutate(narratorId);
@@ -3053,26 +3067,7 @@ export function NarratorPanel({
 																hasChapter={hasChapter}
 																highlightMessageId={highlightMessageId}
 																highlightRequestId={highlightRequestId}
-																tailFooter={
-																	isSubagent &&
-																	narrator &&
-																	narrator.status === "idle" &&
-																	!isTakenOver &&
-																	substatus.includes("manual_override") &&
-																	!isActive ? (
-																		<Box ta="center" py="sm">
-																			<Button
-																				size="compact-sm"
-																				variant="light"
-																				color="indigo"
-																				onClick={() => updateConclusionMutation.mutate(narratorId)}
-																				loading={updateConclusionMutation.isPending}
-																			>
-																				{t("updateConclusion")}
-																			</Button>
-																		</Box>
-																	) : null
-																}
+																tailFooter={messageListTailFooter}
 															/>
 														</Suspense>
 													</RenderLodCtx.Provider>
@@ -3266,6 +3261,7 @@ export function NarratorPanel({
 								compactingMarkerMessageId,
 								compactFailure,
 								compactProgressFragment,
+								quotaWaitText,
 								turnElapsedText,
 								turnStartedAtLabel,
 								onOpenSpecTool: openSpecTool,

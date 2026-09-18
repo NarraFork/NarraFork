@@ -22,9 +22,15 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { shellSource } from "./guard-source";
 
 const DIR = import.meta.dir;
-const SHELL = readFileSync(join(DIR, "PretextExactMessageList.tsx"), "utf8");
+/**
+ * The shell's whole module set: the negative rules below forbid a per-feature morph
+ * controller ANYWHERE in the shell, and a rule scoped to one file stops guarding as
+ * soon as the thing it forbids can live next door.
+ */
+const SHELL = shellSource();
 
 /**
  * The body of the shell's LOD-morph layout effect.

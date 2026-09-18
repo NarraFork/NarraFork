@@ -30,10 +30,9 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { shellModule, shellSource } from "./guard-source";
 
-const SHELL = readFileSync(join(import.meta.dir, "PretextExactMessageList.tsx"), "utf8");
+const SHELL = shellSource();
 
 /**
  * Offset of a hook call's dependency array, given the offset of its declaration.
@@ -129,7 +128,13 @@ describe("the per-row interaction payload is reused when nothing changed", () =>
 	});
 
 	it("compares content field-wise, never by closure identity", () => {
-		const comparator = hookBody("export function sameRowInteraction(");
+		// A plain function, not a hook: read from its own module and cut at its closing
+		// brace rather than through `hookBody`, whose dependency-array scan would run on
+		// into the next declaration and assert against unrelated code.
+		const rowState = shellModule("vlist-exact-row-state.ts");
+		const start = rowState.indexOf("export function sameRowInteraction(");
+		expect(start).toBeGreaterThan(0);
+		const comparator = rowState.slice(start, rowState.indexOf("\n}", start));
 		// Every field the row paints or dispatches from.
 		for (const field of ["blockId", "messageId", "blockIndex", "copyText", "toolUseId"]) {
 			expect(comparator).toContain(field);

@@ -190,8 +190,8 @@ export interface SubagentFileChangesData {
 	totalUnmeasured: number;
 	bashTouchedCount: number;
 	countsTruncated: boolean;
-	/** Old payloads without this field are also legacy/unscoped, never exact attempts. */
-	attributionScope?: "legacy_unscoped";
+	/** Exact only when the current execution segment has complete v2 evidence. */
+	attributionScope?: "exact_attempt" | "mixed" | "legacy_unscoped";
 	/** Requested filter boundary, NOT evidence linking changes to an execution attempt. */
 	scope?: {
 		sourceToolUseId: string | null;
@@ -665,8 +665,13 @@ export function measureSubagentCard(
 		data.fileChanges?.countsTruncated === true;
 	const hasFileChanges = fileChangeRowCount > 0 || hasFileChangeOverflowRow;
 	const fileChangeRowHeight = bareRowMetrics().height;
-	// Even old payloads without attributionScope are legacy, not verified attempts.
-	const fileChangeNoticeRowCount = hasFileChanges ? 1 + (data.fileChanges?.scope ? 1 : 0) : 0;
+	// Only legacy-only file rows need the long attribution warning. Exact v2 and
+	// mixed/Bash-best-effort cards should not reserve a warning row by default.
+	const hasLegacyFileNotice =
+		hasFileChanges &&
+		(data.fileChanges?.attributionScope ?? "legacy_unscoped") === "legacy_unscoped" &&
+		fileChangeTotal > 0;
+	const fileChangeNoticeRowCount = hasLegacyFileNotice ? 1 + (data.fileChanges?.scope ? 1 : 0) : 0;
 	let fileChangesHeight = 0;
 
 	// ── Recent Calls (always shown when there are activity calls) ───────────────

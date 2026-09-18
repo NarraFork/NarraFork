@@ -40,6 +40,9 @@ await i18n.init({
 	lng: "en",
 	fallbackLng: "en",
 	initImmediate: false,
+	// Mirror frontend/lib/i18n.ts: React already escapes, so the app does not.
+	// Escaping here would make interpolated paths (`/remote/original`) unmatchable.
+	interpolation: { escapeValue: false },
 	resources: { en: { narrator: narratorEn, dashboard: dashboardEn, common: commonEn } },
 });
 
@@ -277,7 +280,7 @@ describe("human attention global listener and pagination", () => {
 			narratorWSManager.dispatchLocalFrame({ type: "human_attention_changed" }),
 		);
 		await settle();
-		expect(document.querySelector("button")?.textContent).toContain("1 decision");
+		expect(document.querySelector("button")?.textContent).toContain("1 pending");
 		expect(list.mock.calls.length).toBe(before + 1);
 		await act(async () =>
 			narratorWSManager.dispatchLocalFrame({
@@ -305,6 +308,32 @@ describe("human attention global listener and pagination", () => {
 		expect(document.querySelector("button")).toBeNull();
 		await render(null);
 		expect(remove).toHaveBeenCalledTimes(1);
+	});
+
+	test("omits the zero-valued current-session count", async () => {
+		listPage = { items: [item("outside")], nextCursor: null };
+		await render(<HumanAttentionInboxButton currentNarratorId="parent" />);
+		const text = document.querySelector("button")?.textContent ?? "";
+		expect(text).toContain("Other sessions 1");
+		expect(text).not.toContain("Current session");
+	});
+
+	test("omits the zero-valued other-session count", async () => {
+		listPage = { items: [item("inside", { narratorId: "parent" })], nextCursor: null };
+		await render(<HumanAttentionInboxButton currentNarratorId="parent" />);
+		const text = document.querySelector("button")?.textContent ?? "";
+		expect(text).toContain("Current session 1");
+		expect(text).not.toContain("Other sessions");
+	});
+
+	test("shows both non-zero session counts without extra separators", async () => {
+		listPage = {
+			items: [item("inside", { narratorId: "parent" }), item("outside")],
+			nextCursor: null,
+		};
+		await render(<HumanAttentionInboxButton currentNarratorId="parent" />);
+		const text = document.querySelector("button")?.textContent ?? "";
+		expect(text).toContain("Current session 1 · Other sessions 1");
 	});
 
 	test("groups background children by root without losing distinct question/permission identities; lazy loads pages and details", async () => {
@@ -401,8 +430,8 @@ describe("child async questions from the parent attention entry", () => {
 			narratorWSManager.dispatchLocalFrame({ type: "human_attention_changed" }),
 		);
 		await settle();
-		expect(document.body.textContent).toContain("1 decision");
-		await click("decision(s)");
+		expect(document.body.textContent).toContain("1 pending");
+		await click("pending");
 		expect(row(child.id).closest('[data-attention-scope="current"]')).not.toBeNull();
 		await click(narratorEn.humanAttentionOpenSession, row(child.id));
 		expect(router.navigate).toHaveBeenCalledWith({
@@ -446,7 +475,7 @@ describe("child async questions from the parent attention entry", () => {
 		const answer = track(spyOn(api, "answerAsyncQuestion"));
 		const dismiss = track(spyOn(api, "dismissAsyncQuestion"));
 		await render(<HumanAttentionInboxButton currentNarratorId="parent" />);
-		await click("decision(s)");
+		await click("pending");
 		await click("Review decision", row(child.id));
 		expect(row(child.id).textContent).toContain("do not have permission");
 		expect(row(child.id).querySelector("textarea")).toBeNull();
@@ -502,6 +531,45 @@ describe("human attention decisions", () => {
 		}
 	});
 
+	test("a plan body renders as markdown, while a command stays literal bytes", async () => {
+		const plan = item("md-plan", { toolName: "ExitPlanMode", kind: "plan_approval" });
+		const command = item("md-command");
+		addPermission(plan, {
+			plan: [
+				"# 违规请求原文留存",
+				"",
+				"- **预览 + 下载**：点行弹详情",
+				"- 放在异常事件页 ([a.tsx](frontend/a.tsx))",
+				"",
+				"| 字段 | 说明 |",
+				"| --- | --- |",
+				"| id | 主键 |",
+			].join("\n"),
+		});
+		// A command is the literal bytes about to run: `**` is a glob and `#` starts a
+		// comment, so markdown here would misrepresent what is being approved.
+		addPermission(command, { command: "rm -rf **/*.tmp # cleanup" });
+		await openDrawer();
+		await click("Review decision", row(plan.id));
+		await click("Review decision", row(command.id));
+		const planRow = row(plan.id);
+		expect(planRow.querySelector("[data-md-body]")).not.toBeNull();
+		expect(planRow.querySelector("h1")?.textContent).toContain("违规请求原文留存");
+		expect(planRow.querySelector("strong")?.textContent).toBe("预览 + 下载");
+		expect(planRow.querySelectorAll("li").length).toBe(2);
+		expect(planRow.querySelector("table")).not.toBeNull();
+		// Raw markdown syntax must be gone, not merely rendered alongside.
+		expect(planRow.textContent).not.toContain("**预览");
+		expect(planRow.textContent).not.toContain("# 违规");
+		// No workspace here, so a relative file destination must not become a route.
+		const fileLink = [...planRow.querySelectorAll("a")].find((node) =>
+			node.textContent?.includes("a.tsx"),
+		);
+		expect(fileLink).toBeUndefined();
+		expect(row(command.id).querySelector("[data-md-body]")).toBeNull();
+		expect(row(command.id).textContent).toContain("rm -rf **/*.tmp # cleanup");
+	});
+
 	test("each item stays independently busy and denial preserves feedback and frozen remote target", async () => {
 		const one = item("one");
 		const two = item("two");
@@ -516,7 +584,11 @@ describe("human attention decisions", () => {
 					type: "danger_reflection",
 					status: "awaiting_user",
 					reason: "Needs confirmation",
-					danger: { consequences: ["Deletes originals"], saferAlternatives: ["Backup first"] },
+					danger: {
+						severity: "high",
+						consequences: ["Deletes originals"],
+						saferAlternatives: ["Backup first"],
+					},
 				},
 			];
 		}
@@ -542,8 +614,22 @@ describe("human attention decisions", () => {
 		expect(row(one.id).querySelector("fieldset")?.hasAttribute("disabled")).toBe(true);
 		expect(row(two.id).querySelector("fieldset")?.hasAttribute("disabled")).toBe(false);
 		expect(row(two.id).textContent).toContain("frozen-remote");
+		expect(row(two.id).textContent).toContain("/remote/original");
+		expect(row(two.id).textContent).toContain(narratorEn.humanAttentionDangerConsequences);
 		expect(row(two.id).textContent).toContain("Deletes originals");
+		expect(row(two.id).textContent).toContain(narratorEn.humanAttentionDangerAlternatives);
 		expect(row(two.id).textContent).toContain("Backup first");
+		expect(row(two.id).textContent).toContain(narratorEn.humanAttentionSeverity_high);
+		// Labelled rows only: a serialized payload is unreadable exactly when a human
+		// is deciding, so no branch may fall back to JSON.stringify.
+		expect(row(two.id).textContent).not.toContain("saferAlternatives");
+		expect(row(two.id).textContent).not.toContain("danger_reflection");
+		// The mounted form owns the target block; the review context must not draw a
+		// second identical one, which would read as two different routings.
+		expect(row(two.id).textContent?.match(/frozen-remote/g)).toHaveLength(1);
+		// No captured device → no target block at all, rather than a wall of nulls.
+		expect(row(one.id).textContent).not.toContain(narratorEn.executionTarget);
+		expect(row(one.id).textContent).not.toContain("executionDeviceId");
 		await click(commonEn.deny, row(two.id));
 		expect(deny).toHaveBeenCalledWith("two", { feedbackText: "Do not delete" });
 		expect(row(two.id).textContent).toContain("offline");
@@ -597,7 +683,10 @@ describe("human attention decisions", () => {
 		expect(row(edit.id).textContent).toContain("old task");
 		expect(row(edit.id).textContent).toContain("new task");
 		expect(row(edit.id).textContent).toContain("Missing completion evidence");
+		expect(row(edit.id).textContent).toContain(narratorEn.humanAttentionTaskChanges);
 		expect(row(edit.id).textContent).toContain("Remove protected task");
+		expect(row(edit.id).textContent).not.toContain("task_reflection");
+		expect(row(edit.id).textContent).not.toContain("awaiting_user");
 		expect(actions).toHaveLength(0);
 		await click(narratorEn.fileMod_viewInPanel, row(write.id));
 		expect(router.navigate).toHaveBeenCalledWith({
@@ -637,7 +726,15 @@ describe("human attention decisions", () => {
 			toolName: "AskUserQuestion",
 			blocking: false,
 		});
-		addPermission(blocking, { questions: question(blocking).questions });
+		addPermission(blocking, {
+			questions: [
+				{
+					question: "notes",
+					header: "Notes?",
+					options: [{ label: "Ship it", description: "Commit the current result" }],
+				},
+			],
+		});
 		const asyncQuestion = {
 			...question(asyncRow),
 			annotations: { notes: { preview: "Existing preview", notes: "Existing annotation" } },
@@ -657,6 +754,13 @@ describe("human attention decisions", () => {
 		await click("Review decision", row(blocking.id));
 		await click("Review decision", row(asyncRow.id));
 		expect(row(asyncRow.id).querySelector("textarea")?.value).toBe("Keep this answer");
+		// The banner below IS the questions input. Echoing it as JSON above the real
+		// form showed every label/description twice and leaked the wire shape.
+		expect(row(blocking.id).textContent?.match(/Ship it/g)).toHaveLength(1);
+		expect(row(blocking.id).textContent).not.toContain('"options"');
+		expect(row(blocking.id).textContent).not.toContain('"header"');
+		// A question routes nowhere, so no execution target is claimed for it.
+		expect(row(blocking.id).textContent).not.toContain(narratorEn.executionTarget);
 		await click(narratorEn.deferQuestion, row(blocking.id));
 		expect(defer).toHaveBeenCalledWith("block");
 		expect(readSession("ask-draft", blocking.toolCallId)).not.toBeNull();
@@ -729,7 +833,7 @@ test("an empty scanned page with a next cursor stays loadable, rather than claim
 	);
 	await render(<HumanAttentionInboxButton />);
 	expect(document.body.textContent).toContain("0+");
-	await click("decision(s)");
+	await click("pending");
 	expect(document.body.textContent).not.toContain("Nothing waiting for a human decision");
 	await click("Load more");
 	expect(row(next.id)).toBeDefined();
