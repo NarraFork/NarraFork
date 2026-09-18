@@ -43,10 +43,14 @@ import { parseSubstatus } from "../lib/narrator-utils";
 import { escapeLikeNeedle } from "../lib/sql-like";
 import type { RuntimeTx } from "./agent-runtime/mailbox-types";
 import {
+	getRuntimePublicationService,
+	type PublicationEvent,
 	publicationEvent,
 	runtimePublication,
 	taskPublicationRun,
 } from "./agent-runtime/publication";
+import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
+import { runAtomicWrite } from "./agent-runtime/runtime-write";
 import { TRANSFER_RESTART_PAUSE_NOTICE } from "./device-transfer-task-store";
 
 // === Types ===
@@ -549,6 +553,65 @@ class BackgroundTaskService {
 
 	// ── Create ──────────────────────────────────────────────────────────
 
+	/**
+	 * Validate a background bash binding against `narratorToolCalls`. Shared by
+	 * the SQLite transaction path and the PG pre-flight path.
+	 */
+	private validateBashBinding(
+		opts: {
+			parentNarratorId: string;
+			toolUseId?: string;
+			executionTarget?: ToolExecutionTarget;
+		},
+		binding: ToolCallBinding,
+	): void {
+		const source = db
+			.select({
+				narratorId: narratorToolCalls.narratorId,
+				toolName: narratorToolCalls.toolName,
+				toolUseId: narratorToolCalls.toolUseId,
+				status: narratorToolCalls.status,
+				executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
+				executionOriginToolCallId: narratorToolCalls.executionOriginToolCallId,
+				isFileHistoryCheckpoint: narratorToolCalls.isFileHistoryCheckpoint,
+				executionAttempt: narratorToolCalls.executionAttempt,
+				executionStartedAt: narratorToolCalls.executionStartedAt,
+				executionDeviceId: narratorToolCalls.executionDeviceId,
+				executionCwd: narratorToolCalls.executionCwd,
+				executionPathFlavor: narratorToolCalls.executionPathFlavor,
+				runtimeGeneration: narratorToolCalls.runtimeGeneration,
+			})
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, binding.toolCallId))
+			.limit(1)
+			.get();
+		if (
+			!source ||
+			source.narratorId !== opts.parentNarratorId ||
+			source.toolName !== BASH_TOOL_NAME ||
+			source.executionIdentityVersion !== 1 ||
+			source.executionOriginToolCallId !== null ||
+			source.isFileHistoryCheckpoint ||
+			source.status !== "running" ||
+			!source.executionStartedAt ||
+			source.executionAttempt !== binding.attempt ||
+			(opts.toolUseId !== undefined && source.toolUseId !== opts.toolUseId)
+		) {
+			throw new ValidationError("Background Bash binding is not an actual running attempt");
+		}
+		const target = opts.executionTarget;
+		if (
+			target &&
+			(source.executionDeviceId !== target.deviceId ||
+				source.executionCwd !== target.cwd ||
+				source.executionPathFlavor !== (target.pathFlavor ?? null) ||
+				source.runtimeGeneration !== (target.runtimeGeneration ?? null) ||
+				target.backendKind !== (target.deviceId === "local" ? "local" : "remote"))
+		) {
+			throw new ValidationError("Background Bash execution target does not match its binding");
+		}
+	}
+
 	async createBashTask(opts: {
 		id: string;
 		parentNarratorId: string;
@@ -571,6 +634,44 @@ class BackgroundTaskService {
 			throw new ValidationError("Invalid background Bash execution binding");
 		}
 		const now = new Date().toISOString();
+
+		// PG path: async facade atomically creates task row + reserves publication slots.
+		if (resolveRuntimeQueueBackend() === "postgres") {
+			if (binding) this.validateBashBinding(opts, binding);
+			const taskRow: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId"> = {
+				id: opts.id,
+				parentNarratorId: opts.parentNarratorId,
+				type: "bash",
+				status: "running",
+				command: opts.command,
+				toolUseId: opts.toolUseId ?? null,
+				toolCallId: binding?.toolCallId ?? null,
+				executionAttempt: binding?.attempt ?? null,
+				alias: opts.alias ?? null,
+				title: opts.title ?? null,
+				output: null,
+				outputBytes: 0,
+				outputTruncated: false,
+				notified: false,
+				startedAt: now,
+				createdAt: now,
+				updatedAt: now,
+			};
+			const pub = getRuntimePublicationService();
+			const run = await pub.startBashRun({
+				taskId: opts.id,
+				recipientId: opts.parentNarratorId,
+				taskRow,
+			});
+			void run; // logicalRunId now persisted by the PG composite
+			this.outputChunks.set(opts.id, []);
+			this.parentNarratorCache.set(opts.id, opts.parentNarratorId);
+			this.queueTaskUpsert(opts.parentNarratorId, opts.id);
+			this.maybeCleanup();
+			return taskRow as BackgroundTaskRecord;
+		}
+
+		// SQLite path: existing synchronous transaction.
 		const publicationRun = runtimePublication.newBashRun(opts.id, opts.parentNarratorId);
 		const row: typeof backgroundTasks.$inferInsert = {
 			id: opts.id,
@@ -597,56 +698,9 @@ class BackgroundTaskService {
 		// A short synchronous transaction keeps validation and insertion together.
 		// This records provenance only: it cannot claim/replay a call, prove the
 		// process exited, or authorize writes after cancellation/restart.
-		db.transaction((tx) => {
+		runAtomicWrite(db, "background-task.create", (tx) => {
 			runtimePublication.reserve(publicationRun, tx);
-			if (binding) {
-				// One primary-key lookup of metadata, never input/output/target-plan JSON.
-				const source = tx
-					.select({
-						narratorId: narratorToolCalls.narratorId,
-						toolName: narratorToolCalls.toolName,
-						toolUseId: narratorToolCalls.toolUseId,
-						status: narratorToolCalls.status,
-						executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
-						executionOriginToolCallId: narratorToolCalls.executionOriginToolCallId,
-						isFileHistoryCheckpoint: narratorToolCalls.isFileHistoryCheckpoint,
-						executionAttempt: narratorToolCalls.executionAttempt,
-						executionStartedAt: narratorToolCalls.executionStartedAt,
-						executionDeviceId: narratorToolCalls.executionDeviceId,
-						executionCwd: narratorToolCalls.executionCwd,
-						executionPathFlavor: narratorToolCalls.executionPathFlavor,
-						runtimeGeneration: narratorToolCalls.runtimeGeneration,
-					})
-					.from(narratorToolCalls)
-					.where(eq(narratorToolCalls.id, binding.toolCallId))
-					.limit(1)
-					.get();
-				if (
-					!source ||
-					source.narratorId !== opts.parentNarratorId ||
-					source.toolName !== BASH_TOOL_NAME ||
-					source.executionIdentityVersion !== 1 ||
-					source.executionOriginToolCallId !== null ||
-					source.isFileHistoryCheckpoint ||
-					source.status !== "running" ||
-					!source.executionStartedAt ||
-					source.executionAttempt !== binding.attempt ||
-					(opts.toolUseId !== undefined && source.toolUseId !== opts.toolUseId)
-				) {
-					throw new ValidationError("Background Bash binding is not an actual running attempt");
-				}
-				const target = opts.executionTarget;
-				if (
-					target &&
-					(source.executionDeviceId !== target.deviceId ||
-						source.executionCwd !== target.cwd ||
-						source.executionPathFlavor !== (target.pathFlavor ?? null) ||
-						source.runtimeGeneration !== (target.runtimeGeneration ?? null) ||
-						target.backendKind !== (target.deviceId === "local" ? "local" : "remote"))
-				) {
-					throw new ValidationError("Background Bash execution target does not match its binding");
-				}
-			}
+			if (binding) this.validateBashBinding(opts, binding);
 			const inserted = tx
 				.insert(backgroundTasks)
 				.values(row)
@@ -680,18 +734,22 @@ class BackgroundTaskService {
 		title?: string;
 	}): Promise<BackgroundTaskRecord> {
 		const now = new Date().toISOString();
-		const source = db
-			.select({ logicalRunId: narrators.logicalRunId })
-			.from(narrators)
-			.where(eq(narrators.id, opts.subagentNarratorId))
-			.get();
-		const publicationRun = source?.logicalRunId
-			? runtimePublication.getAgentRun(opts.subagentNarratorId, opts.parentNarratorId)
-			: runtimePublication.startAgentRun({
-					narratorId: opts.subagentNarratorId,
-					parentNarratorId: opts.parentNarratorId,
-				});
-		const existing = await this.getById(opts.id);
+		const pub = getRuntimePublicationService();
+
+		// ── Existing task: restart path ──────────────────────────────────
+		// Check existence BEFORE any publication call to avoid creating a run
+		// for a task that will be restarted (which needs the existing run, not
+		// a new one). Use the named readBackgroundTask on PG to avoid the
+		// SQLite-only getById.
+		const existingRaw =
+			pub.backend === "postgres"
+				? await pub.readBackgroundTask(opts.id)
+				: await this.getById(opts.id);
+		// On PG, readBackgroundTask returns a bounded subset; cast to the
+		// full record type — the restart branch only reads type/status/
+		// parentNarratorId/subagentNarratorId and the "already running"
+		// early return just needs the same identity fields.
+		const existing = existingRaw as BackgroundTaskRecord | null;
 		if (existing) {
 			const existingSubagentId = existing.subagentNarratorId ?? existing.id;
 			if (
@@ -705,28 +763,21 @@ class BackgroundTaskService {
 			this.parentNarratorCache.set(opts.id, opts.parentNarratorId);
 			if (existing.status === "running") return existing;
 
-			const [restarted] = await db
-				.update(backgroundTasks)
-				.set({
-					status: "running",
-					logicalRunId: publicationRun.logicalRunId,
-					command: null,
-					exitCode: null,
-					subagentNarratorId: opts.subagentNarratorId,
-					subagentType: opts.subagentType,
-					toolUseId: opts.toolUseId ?? null,
-					alias: opts.alias ?? null,
-					title: opts.title ?? null,
-					output: null,
-					outputBytes: 0,
-					outputTruncated: false,
-					notified: false,
-					startedAt: now,
-					completedAt: null,
-					updatedAt: now,
-				})
-				.where(and(eq(backgroundTasks.id, opts.id), eq(backgroundTasks.status, existing.status)))
-				.returning();
+			// Restart: get the EXISTING run (getAgentRun reads narrators through
+			// the queue adapter on PG; on SQLite it's a sync read), then CAS the
+			// task row back to "running" via the named restartAgentTask composite.
+			const publicationRun = await pub.getAgentRun(opts.subagentNarratorId, opts.parentNarratorId);
+			const restarted = await pub.restartAgentTask({
+				taskId: opts.id,
+				logicalRunId: publicationRun.logicalRunId,
+				subagentNarratorId: opts.subagentNarratorId,
+				subagentType: opts.subagentType,
+				toolUseId: opts.toolUseId,
+				alias: opts.alias,
+				title: opts.title,
+				expectedStatus: existing.status,
+				now,
+			});
 
 			if (restarted) {
 				this.outputChunks.delete(opts.id);
@@ -738,7 +789,21 @@ class BackgroundTaskService {
 				}
 				this.queueTaskUpsert(opts.parentNarratorId, opts.id);
 				this.maybeCleanup();
-				return restarted;
+				return {
+					...existing,
+					...opts,
+					status: "running",
+					logicalRunId: publicationRun.logicalRunId,
+					command: null,
+					exitCode: null,
+					output: null,
+					outputBytes: 0,
+					outputTruncated: false,
+					notified: false,
+					startedAt: now,
+					completedAt: null,
+					updatedAt: now,
+				} as BackgroundTaskRecord;
 			}
 
 			const current = await this.getById(opts.id);
@@ -746,12 +811,20 @@ class BackgroundTaskService {
 			throw new Error(`Background task "${opts.id}" changed while restarting`);
 		}
 
-		const row: typeof backgroundTasks.$inferInsert = {
+		// ── New task: atomic run + task projection ───────────────────────
+		// startAgentRun handles BOTH cases internally: if the narrator already
+		// has a logicalRunId it reuses it; otherwise it creates a new run.
+		// With taskRow, the background_tasks INSERT is in the SAME section as
+		// the slot reservation — no double logical-run creation.
+		// On PG: one withPgRetry composite transaction.
+		// On SQLite: startAgentRun wraps runAtomicWrite; taskRow is accepted
+		// but the SQLite wrapper ignores it (callers insert via their own
+		// runAtomicWrite for backward compat with the sync path).
+		const taskRow: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId"> = {
 			id: opts.id,
 			parentNarratorId: opts.parentNarratorId,
 			type: "agent",
 			status: "running",
-			logicalRunId: publicationRun.logicalRunId,
 			subagentNarratorId: opts.subagentNarratorId,
 			subagentType: opts.subagentType,
 			toolUseId: opts.toolUseId ?? null,
@@ -765,11 +838,24 @@ class BackgroundTaskService {
 			createdAt: now,
 			updatedAt: now,
 		};
-		await db.insert(backgroundTasks).values(row);
+		const publicationRun = await pub.startAgentRun({
+			narratorId: opts.subagentNarratorId,
+			parentNarratorId: opts.parentNarratorId,
+			taskRow,
+		});
+		// On SQLite, startAgentRun ignores taskRow — insert the task row
+		// in the legacy sync path.
+		if (pub.backend === "sqlite") {
+			runAtomicWrite(db, "background-task.createAgentTask", (tx) => {
+				tx.insert(backgroundTasks)
+					.values({ ...taskRow, logicalRunId: publicationRun.logicalRunId })
+					.run();
+			});
+		}
 		this.parentNarratorCache.set(opts.id, opts.parentNarratorId);
 		this.queueTaskUpsert(opts.parentNarratorId, opts.id);
 		this.maybeCleanup();
-		return row as BackgroundTaskRecord;
+		return { ...taskRow, logicalRunId: publicationRun.logicalRunId } as BackgroundTaskRecord;
 	}
 
 	/**
@@ -928,14 +1014,67 @@ class BackgroundTaskService {
 
 	// ── Status updates ──────────────────────────────────────────────────
 
-	/** The terminal CAS and its durable notification must succeed or roll back together. */
+	/**
+	 * Unified terminal-task transition: routes between SQLite (sync tx) and PG
+	 * (async CAS + terminal commit composite). The `setFields` are the Drizzle
+	 * column values for the CAS update; the `fullOutput` is the uncapped text
+	 * for the publication result snapshot.
+	 */
+	private async transitionTerminalTask(
+		taskId: string,
+		setFields: Record<string, unknown>,
+		fullOutput?: string | null,
+		deferPublication = false,
+	): Promise<BackgroundTaskRecord | undefined> {
+		if (resolveRuntimeQueueBackend() === "postgres") {
+			// B4 fix: use the named PG composite — CAS update + publication commit
+			// in one withPgRetry transaction. No two-phase read-update gap.
+			const pub = getRuntimePublicationService();
+			const eventKind = publicationEvent(
+				(setFields.status as string) ?? "completed",
+			) as PublicationEvent;
+			const text = fullOutput ?? "(no output)";
+			const taskType = (setFields.type as string) ?? "task";
+			const taskAlias = (setFields.alias as string | null) ?? null;
+			const taskTitle = (setFields.title as string | null) ?? null;
+			const summary = `[System] Background ${taskType} "${taskTitle ?? taskAlias ?? taskId}" (ID: ${taskAlias ?? taskId}) ${setFields.status}. Use Await({ type: "${taskType}", id: "${taskAlias ?? taskId}" }) to read the stored result.`;
+			const task = await pub.commitTerminalTransition({
+				taskId,
+				setFields,
+				fullOutput: text,
+				summary,
+				eventKind: eventKind as Exclude<PublicationEvent, "started">,
+				deferPublication,
+			});
+			// The composite returns partial fields; cast to BackgroundTaskRecord
+			// (callers access parentNarratorId, type, title, alias, toolUseId, id).
+			return task as BackgroundTaskRecord | undefined;
+		}
+		return this.commitTerminalTask(
+			taskId,
+			(tx) =>
+				tx
+					.update(backgroundTasks)
+					.set(setFields)
+					.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
+					.returning()
+					.get(),
+			fullOutput,
+			deferPublication,
+		);
+	}
+
+	/**
+	 * The terminal CAS and its durable notification must succeed or roll back together.
+	 * SQLite-only: the `write` callback receives a sync transaction handle.
+	 */
 	private commitTerminalTask(
 		taskId: string,
 		write: (tx: RuntimeTx) => BackgroundTaskRecord | undefined,
 		fullOutput?: string | null,
 		deferPublication = false,
 	) {
-		const task = db.transaction((tx) => {
+		const task = runAtomicWrite(db, "background-task.commitTerminalTask", (tx) => {
 			const before = tx
 				.select({
 					id: backgroundTasks.id,
@@ -993,23 +1132,17 @@ class BackgroundTaskService {
 		const truncated = outputBytes > MAX_OUTPUT_BYTES;
 		const storedOutput = truncated ? truncateToBytes(output, MAX_OUTPUT_BYTES) : output;
 
-		const task = this.commitTerminalTask(
+		const task = await this.transitionTerminalTask(
 			taskId,
-			(tx) =>
-				tx
-					.update(backgroundTasks)
-					.set({
-						status: "completed",
-						output: storedOutput,
-						outputBytes,
-						outputTruncated: truncated,
-						exitCode: exitCode ?? null,
-						completedAt: now,
-						updatedAt: now,
-					})
-					.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
-					.returning()
-					.get(),
+			{
+				status: "completed",
+				output: storedOutput,
+				outputBytes,
+				outputTruncated: truncated,
+				exitCode: exitCode ?? null,
+				completedAt: now,
+				updatedAt: now,
+			},
 			output,
 			publicationOptions?.deferPublication,
 		);
@@ -1062,23 +1195,17 @@ class BackgroundTaskService {
 		const truncated = errorBytes > MAX_OUTPUT_BYTES;
 		const storedError = truncated ? truncateToBytes(error, MAX_OUTPUT_BYTES) : error;
 
-		const task = this.commitTerminalTask(
+		const task = await this.transitionTerminalTask(
 			taskId,
-			(tx) =>
-				tx
-					.update(backgroundTasks)
-					.set({
-						status: "failed",
-						output: storedError,
-						outputBytes: errorBytes,
-						outputTruncated: truncated,
-						exitCode: exitCode ?? null,
-						completedAt: now,
-						updatedAt: now,
-					})
-					.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
-					.returning()
-					.get(),
+			{
+				status: "failed",
+				output: storedError,
+				outputBytes: errorBytes,
+				outputTruncated: truncated,
+				exitCode: exitCode ?? null,
+				completedAt: now,
+				updatedAt: now,
+			},
 			error,
 			publicationOptions?.deferPublication,
 		);
@@ -1131,23 +1258,17 @@ class BackgroundTaskService {
 		const truncated = errorBytes > MAX_OUTPUT_BYTES;
 		const storedError = truncated ? truncateToBytes(error, MAX_OUTPUT_BYTES) : error;
 
-		const task = this.commitTerminalTask(
+		const task = await this.transitionTerminalTask(
 			taskId,
-			(tx) =>
-				tx
-					.update(backgroundTasks)
-					.set({
-						status: "timeout",
-						output: storedError,
-						outputBytes: errorBytes,
-						outputTruncated: truncated,
-						exitCode: exitCode ?? null,
-						completedAt: now,
-						updatedAt: now,
-					})
-					.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
-					.returning()
-					.get(),
+			{
+				status: "timeout",
+				output: storedError,
+				outputBytes: errorBytes,
+				outputTruncated: truncated,
+				exitCode: exitCode ?? null,
+				completedAt: now,
+				updatedAt: now,
+			},
 			error,
 			publicationOptions?.deferPublication,
 		);
@@ -1198,21 +1319,49 @@ class BackgroundTaskService {
 				: output
 			: null;
 
-		const task = this.commitTerminalTask(taskId, (tx) =>
-			tx
-				.update(backgroundTasks)
-				.set({
-					status: "cancelled",
-					...(storedOutput !== null
-						? { output: storedOutput, outputBytes, outputTruncated: truncated }
-						: {}),
-					completedAt: now,
-					updatedAt: now,
-				})
-				.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
-				.returning()
-				.get(),
-		);
+		if (resolveRuntimeQueueBackend() === "postgres") {
+			// PG path: named cancel composite — CAS + publication intent in one section.
+			const pub = getRuntimePublicationService();
+			const task = await pub.cancelTask({
+				taskId,
+				capturedOutput: storedOutput,
+				capturedOutputBytes: outputBytes,
+				capturedTruncated: truncated,
+				now,
+			});
+			if (!task) {
+				this.cleanupRuntime(taskId, expectedAbortController);
+				return false;
+			}
+			// In-memory side effects after the composite commits.
+			eventBus.emit({
+				type: "background_task:cancelled",
+				taskId,
+				parentNarratorId: task.parentNarratorId,
+				taskType: task.type as BackgroundTaskType,
+			});
+			this.broadcastStatus(
+				task.parentNarratorId,
+				taskId,
+				"cancelled",
+				storedOutput,
+				task.toolUseId,
+			);
+			this.cleanupRuntime(taskId, expectedAbortController);
+			return true;
+		}
+
+		const setFields: Record<string, unknown> = {
+			status: "cancelled",
+			completedAt: now,
+			updatedAt: now,
+		};
+		if (storedOutput !== null) {
+			setFields.output = storedOutput;
+			setFields.outputBytes = outputBytes;
+			setFields.outputTruncated = truncated;
+		}
+		const task = await this.transitionTerminalTask(taskId, setFields);
 
 		if (!task) {
 			this.cleanupRuntime(taskId, expectedAbortController);
@@ -1360,6 +1509,11 @@ class BackgroundTaskService {
 	// ── Query ───────────────────────────────────────────────────────────
 
 	async getById(taskId: string): Promise<BackgroundTaskRecord | null> {
+		if (resolveRuntimeQueueBackend() === "postgres") {
+			// PG path: route through the named bounded read in the publication facade.
+			// Avoids the SQLite-only synchronous `.get()` on the fail-closed PG handle.
+			return getRuntimePublicationService().readBackgroundTask(taskId);
+		}
 		const row = await db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)).get();
 		return row ?? null;
 	}
@@ -2320,6 +2474,68 @@ class BackgroundTaskService {
 	}
 
 	async cancelRunningByParent(parentNarratorId: string): Promise<number> {
+		if (resolveRuntimeQueueBackend() === "postgres") {
+			// PG path: named bounded read of running tasks, then cancel each through
+			// the cancelTask composite (which handles CAS + publication atomically).
+			const pub = getRuntimePublicationService();
+			let cancelled = 0;
+			let afterId: string | undefined;
+			for (;;) {
+				const page = await pub.readRunningStaleTasks(afterId);
+				if (page.length === 0) break;
+				const running = page.filter(
+					(t) => t.parentNarratorId === parentNarratorId && t.type !== "transfer",
+				);
+				afterId = page.at(-1)?.id;
+				for (const task of running) {
+					const now = new Date().toISOString();
+					const result = await pub.cancelTask({
+						taskId: task.id,
+						capturedOutput: null,
+						capturedOutputBytes: 0,
+						capturedTruncated: false,
+						now,
+					});
+					if (result) {
+						cancelled++;
+						if (result.type === "agent") {
+							await pub.cancelAgentNarrator({
+								narratorId: task.subagentNarratorId ?? task.id,
+								now,
+							});
+						}
+						const ctrl = this.abortControllers.get(task.id);
+						if (ctrl) {
+							try {
+								ctrl.abort();
+							} catch {
+								/* already aborted */
+							}
+						}
+						const killHandler = this.killHandlers.get(task.id);
+						if (killHandler) {
+							try {
+								killHandler();
+							} catch (err) {
+								logger.warn("Kill handler error during cancel", {
+									taskId: task.id,
+									error: err instanceof Error ? err.message : String(err),
+								});
+							}
+						}
+						eventBus.emit({
+							type: "background_task:cancelled",
+							taskId: task.id,
+							parentNarratorId: result.parentNarratorId,
+							taskType: result.type as BackgroundTaskType,
+						});
+						this.cleanupRuntime(task.id);
+					}
+				}
+				if (running.length < 100) break;
+			}
+			return cancelled;
+		}
 		let cancelled = 0;
 		for (;;) {
 			const running = await db
@@ -2367,15 +2583,12 @@ class BackgroundTaskService {
 	async markTakenOver(taskId: string, expectedAbortController?: AbortController): Promise<void> {
 		if (!this.ownsAbortController(taskId, expectedAbortController)) return;
 		const now = new Date().toISOString();
-		const [updated] = await db
-			.update(backgroundTasks)
-			.set({ status: "cancelled", completedAt: now, updatedAt: now })
-			.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
-			.returning({ parentNarratorId: backgroundTasks.parentNarratorId });
+		// Named bounded composite on both backends: PG uses withPgRetry, SQLite
+		// uses runAtomicWrite. Takeover intentionally emits no cancellation event.
+		const pub = getRuntimePublicationService();
+		const updated = await pub.markTakenOver({ taskId, now });
 		this.cleanupRuntime(taskId, expectedAbortController);
-		// No cancellation frame here (takeover is not a cancellation the user asked
-		// for), but the LIST still changed: the row left `running`. Without this the
-		// panel keeps showing a running task the user is now driving by hand.
+		// The LIST still changed: the row left `running`.
 		if (updated) this.queueTaskUpsert(updated.parentNarratorId, taskId);
 	}
 
@@ -2394,27 +2607,10 @@ class BackgroundTaskService {
 	 */
 	async finalizeTakenOver(taskId: string, hasError: boolean, output: string): Promise<void> {
 		const now = new Date().toISOString();
-		const outputBytes = Buffer.byteLength(output, "utf-8");
-		const truncated = outputBytes > MAX_OUTPUT_BYTES;
-		const storedOutput = truncated ? truncateToBytes(output, MAX_OUTPUT_BYTES) : output;
-		const updated = this.commitTerminalTask(
-			taskId,
-			(tx) =>
-				tx
-					.update(backgroundTasks)
-					.set({
-						status: hasError ? "failed" : "completed",
-						output: storedOutput,
-						outputBytes,
-						outputTruncated: truncated,
-						completedAt: now,
-						updatedAt: now,
-					})
-					.where(eq(backgroundTasks.id, taskId))
-					.returning()
-					.get(),
-			output,
-		);
+		// Named bounded composite on both backends: CAS cancelled → terminal,
+		// durable result publication, and retry/transaction semantics stay aligned.
+		const pub = getRuntimePublicationService();
+		const updated = await pub.finalizeTakeover({ taskId, hasError, output, now });
 		this.cleanupRuntime(taskId);
 		if (updated) this.queueTaskUpsert(updated.parentNarratorId, taskId);
 	}
@@ -2812,26 +3008,31 @@ class BackgroundTaskService {
 		protectedTaskIds: ReadonlySet<string> = new Set(),
 		afterId?: string,
 	): Promise<number> {
-		const page = await db
-			.select({
-				id: backgroundTasks.id,
-				type: backgroundTasks.type,
-				parentNarratorId: backgroundTasks.parentNarratorId,
-				subagentNarratorId: backgroundTasks.subagentNarratorId,
-				logicalRunId: backgroundTasks.logicalRunId,
-				toolCallId: backgroundTasks.toolCallId,
-				executionAttempt: backgroundTasks.executionAttempt,
-			})
-			.from(backgroundTasks)
-			.where(
-				and(
-					eq(backgroundTasks.status, "running"),
-					afterId ? gt(backgroundTasks.id, afterId) : undefined,
-				),
-			)
-			.orderBy(asc(backgroundTasks.id))
-			.limit(101)
-			.all();
+		// PG path: named bounded read through the publication facade.
+		// SQLite path: direct synchronous select (preserves existing behavior).
+		const page =
+			resolveRuntimeQueueBackend() === "postgres"
+				? await getRuntimePublicationService().readRunningStaleTasks(afterId)
+				: await db
+						.select({
+							id: backgroundTasks.id,
+							type: backgroundTasks.type,
+							parentNarratorId: backgroundTasks.parentNarratorId,
+							subagentNarratorId: backgroundTasks.subagentNarratorId,
+							logicalRunId: backgroundTasks.logicalRunId,
+							toolCallId: backgroundTasks.toolCallId,
+							executionAttempt: backgroundTasks.executionAttempt,
+						})
+						.from(backgroundTasks)
+						.where(
+							and(
+								eq(backgroundTasks.status, "running"),
+								afterId ? gt(backgroundTasks.id, afterId) : undefined,
+							),
+						)
+						.orderBy(asc(backgroundTasks.id))
+						.limit(101)
+						.all();
 		const scanned = page.slice(0, 100);
 		const nextPage = async () => {
 			if (page.length <= 100) return 0;
@@ -2855,24 +3056,55 @@ class BackgroundTaskService {
 		const endedIds = staleTasks.filter((t) => t.type !== "transfer").map((t) => t.id);
 
 		if (transferIds.length > 0) {
-			await db
-				.update(backgroundTasks)
-				.set({
-					status: "paused",
-					// No completedAt: the task has not completed, and stamping one would
-					// make `cleanupCompleted`'s age filter eligible to reap a live transfer.
-					updatedAt: now,
-					output: TRANSFER_RESTART_PAUSE_NOTICE,
-				})
-				.where(
-					and(inArray(backgroundTasks.id, transferIds), eq(backgroundTasks.status, "running")),
-				);
+			if (resolveRuntimeQueueBackend() === "postgres") {
+				const pub = getRuntimePublicationService();
+				for (const taskId of transferIds)
+					await pub.pauseStaleTransfer({
+						taskId,
+						now,
+						notice: TRANSFER_RESTART_PAUSE_NOTICE,
+					});
+			} else {
+				await db
+					.update(backgroundTasks)
+					.set({
+						status: "paused",
+						// No completedAt: the task has not completed, and stamping one would
+						// make `cleanupCompleted`'s age filter eligible to reap a live transfer.
+						updatedAt: now,
+						output: TRANSFER_RESTART_PAUSE_NOTICE,
+					})
+					.where(
+						and(inArray(backgroundTasks.id, transferIds), eq(backgroundTasks.status, "running")),
+					);
+			}
 		}
 		if (endedIds.length > 0) {
 			for (const task of staleTasks) {
 				if (task.type === "transfer") continue;
-				const producerKind = task.type;
-				db.transaction((tx) => {
+				const text =
+					task.type === "bash"
+						? "Execution outcome unknown after restart; the command was not rerun."
+						: "Background task was interrupted by a server restart.";
+				const eventKind = (task.type === "bash" ? "failed" : "cancelled") as "failed" | "cancelled";
+
+				// PG path: one named terminal-transition composite owns the CAS and intent.
+				// Never touch the SQLite Drizzle handle on this branch: a successful task update
+				// followed by a failed publication would otherwise leave a non-atomic terminal.
+				if (resolveRuntimeQueueBackend() === "postgres") {
+					const pub = getRuntimePublicationService();
+					await pub.recoverStaleTask({
+						taskId: task.id,
+						text,
+						eventKind,
+						now,
+					});
+					continue;
+				}
+
+				// SQLite path: existing synchronous transaction.
+				const producerKind = task.type as "agent" | "bash";
+				runAtomicWrite(db, "background-task.recoverStaleTask", (tx) => {
 					const source = {
 						producerKind,
 						taskId: task.id,
@@ -2888,10 +3120,6 @@ class BackgroundTaskService {
 									{},
 									tx,
 								);
-					const text =
-						task.type === "bash"
-							? "Execution outcome unknown after restart; the command was not rerun."
-							: "Background task was interrupted by a server restart.";
 					tx.update(backgroundTasks)
 						.set({
 							status: task.type === "bash" ? "failed" : "cancelled",
@@ -2905,7 +3133,7 @@ class BackgroundTaskService {
 					runtimePublication.commit(
 						{
 							...run,
-							eventKind: task.type === "bash" ? "failed" : "cancelled",
+							eventKind,
 							resultRef: runtimePublication.persistResult(run, text, tx),
 							summary: text,
 						},
@@ -2913,7 +3141,8 @@ class BackgroundTaskService {
 					);
 				});
 			}
-			runtimePublication.schedule();
+			if (resolveRuntimeQueueBackend() === "postgres") getRuntimePublicationService().schedule();
+			else runtimePublication.schedule();
 		}
 
 		// Only agent tasks carry a subagent narrator whose background fields describe the
@@ -2925,7 +3154,7 @@ class BackgroundTaskService {
 					.map((task) => task.subagentNarratorId ?? task.id),
 			),
 		];
-		if (narratorIds.length > 0) {
+		if (narratorIds.length > 0 && resolveRuntimeQueueBackend() !== "postgres") {
 			await db
 				.update(narrators)
 				.set({
@@ -2960,7 +3189,7 @@ class BackgroundTaskService {
 				type: "background_task:cancelled",
 				taskId: task.id,
 				parentNarratorId: task.parentNarratorId,
-				taskType: task.type,
+				taskType: task.type as BackgroundTaskType,
 			});
 		}
 		// One invalidate per parent rather than per-row upserts: recovery rewrites a
@@ -2998,9 +3227,36 @@ class BackgroundTaskService {
 	/**
 	 * Delete completed/failed/cancelled tasks older than the given retention period.
 	 * Uses a single SQL query with WHERE conditions — no N+1.
+	 *
+	 * B6 fix: on the PostgreSQL backend, the entire select + publication filter +
+	 * delete runs inside a named composite (one withPgRetry transaction). On SQLite,
+	 * the original sync path is preserved.
 	 */
 	async cleanupCompleted(olderThanMs: number = CLEANUP_RETENTION_MS): Promise<number> {
 		const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+
+		if (resolveRuntimeQueueBackend() === "postgres") {
+			// B6 fix: use the named PG composite. The activeAgentContinuations
+			// filter is applied post-composite (it's in-memory state, not a DB
+			// predicate).
+			const pub = getRuntimePublicationService();
+			const results = await pub.cleanupTasks({
+				cutoff,
+				limit: 100,
+				excludedStatuses: ["running", "paused"],
+				excludedNarratorStatuses: ["working", "waiting"],
+				subagentPath: "subagentNarratorId",
+			});
+			const filtered = results.filter((r) => !this.activeAgentContinuations.has(r.id));
+			if (filtered.length === 0) return 0;
+			for (const row of filtered) this.cleanupRuntime(row.id);
+			this.broadcastCleanupDelta(filtered);
+			logger.debug("Cleaned up completed background tasks (PG)", {
+				deleted: filtered.length,
+			});
+			return filtered.length;
+		}
+
 		// A bounded source-retention pass. Pending outbox/mailbox pointers keep their result alive.
 		const rows = await db
 			.select({
@@ -3043,13 +3299,21 @@ class BackgroundTaskService {
 			)
 			.limit(100)
 			.all();
-		const deletable = rows.filter(
-			(row) =>
-				!this.activeAgentContinuations.has(row.id) &&
-				(!row.logicalRunId ||
-					row.type === "transfer" ||
-					!runtimePublication.hasPendingSource(taskPublicationRun(row))),
-		);
+		// SQLite path: sync hasPendingSource.
+		const pub = getRuntimePublicationService();
+		const deletable: typeof rows = [];
+		for (const row of rows) {
+			if (this.activeAgentContinuations.has(row.id)) continue;
+			if (!row.logicalRunId || row.type === "transfer") {
+				deletable.push(row);
+				continue;
+			}
+			const pending =
+				pub.backend === "sqlite"
+					? runtimePublication.hasPendingSource(taskPublicationRun(row))
+					: await pub.hasPendingSource(taskPublicationRun(row));
+			if (!pending) deletable.push(row);
+		}
 
 		if (deletable.length === 0) return 0;
 
@@ -3113,6 +3377,29 @@ class BackgroundTaskService {
 		return deletableIds.length;
 	}
 
+	/** Broadcast cleanup deltas to affected parent narrators (shared by PG and SQLite paths). */
+	private broadcastCleanupDelta(
+		rows: ReadonlyArray<{ id: string; parentNarratorId: string; type: string }>,
+	): void {
+		const byParent = new Map<string, string[]>();
+		for (const row of rows) {
+			const ids = byParent.get(row.parentNarratorId);
+			if (ids) ids.push(row.id);
+			else byParent.set(row.parentNarratorId, [row.id]);
+		}
+		const fallbackParents = new Set(
+			rows.filter((row) => row.type === "agent").map((row) => row.parentNarratorId),
+		);
+		for (const [parentNarratorId, ids] of byParent) {
+			void this.broadcastListDelta(
+				parentNarratorId,
+				fallbackParents.has(parentNarratorId) || ids.length > BACKGROUND_TASK_DELTA_MAX_REMOVE_IDS
+					? { invalidate: true }
+					: { removeIds: ids },
+			).catch(() => {});
+		}
+	}
+
 	/** Trigger cleanup if enough time has passed since the last run. */
 	private maybeCleanup(): void {
 		const now = Date.now();
@@ -3170,19 +3457,15 @@ class BackgroundTaskService {
 	private async markAgentNarratorCancelled(task: BackgroundTaskRecord): Promise<void> {
 		const subagentNarratorId = task.subagentNarratorId ?? task.id;
 		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({
-				backgroundStatus: "cancelled",
-				backgroundCompletedAt: now,
-				updatedAt: now,
-			})
-			.where(eq(narrators.id, subagentNarratorId));
-		const { narratorService } = await import("./narrator-service");
-		await narratorService.updateStatus(subagentNarratorId, "idle", {
-			substatus: ["interrupted"],
-			skipErrorMessage: true,
-		});
+		const pub = getRuntimePublicationService();
+		await pub.cancelAgentNarrator({ narratorId: subagentNarratorId, now });
+		if (pub.backend === "sqlite") {
+			const { narratorService } = await import("./narrator-service");
+			await narratorService.updateStatus(subagentNarratorId, "idle", {
+				substatus: ["interrupted"],
+				skipErrorMessage: true,
+			});
+		}
 
 		eventBus.emit({
 			type: "narrator:background_task_cancelled",

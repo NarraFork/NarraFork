@@ -19,7 +19,16 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { fileAttributions, narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
+import {
+	fileAttributions,
+	fileChangeEffects,
+	fileChangeExecutionSegments,
+	fileChangeOperations,
+	fileChangeScopes,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+} from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
 // The real module is captured and restored in `afterAll`: `mock.module` is
@@ -91,6 +100,125 @@ async function attribute(over: {
 		linesRemoved:
 			over.linesRemoved === undefined ? (over.linesAdded == null ? null : 0) : over.linesRemoved,
 		changedAt: over.changedAt ?? new Date().toISOString(),
+	});
+}
+
+async function parentExecutionCall(executionSegmentId: string) {
+	const now = new Date().toISOString();
+	await db.insert(narratorMessages).values({
+		id: `parent-message-${executionSegmentId}`,
+		narratorId: PARENT,
+		role: "assistant",
+		contentJson: [],
+		createdAt: now,
+	});
+	await db.insert(narratorToolCalls).values({
+		id: "parent-call",
+		narratorId: PARENT,
+		messageId: `parent-message-${executionSegmentId}`,
+		toolUseId: "parent-tool-use",
+		toolName: "Agent",
+		status: "success",
+		executionIdentityVersion: 1,
+		executionAttempt: 1,
+		executionSegmentId,
+		createdAt: now,
+	});
+}
+
+async function exactEffect(over: {
+	segmentId: string;
+	operationId: string;
+	filePath?: string;
+	linesAdded?: number;
+	linesRemoved?: number;
+}) {
+	const now = new Date().toISOString();
+	const filePath = over.filePath ?? "src/current.ts";
+	await db.insert(fileChangeExecutionSegments).values({
+		id: over.segmentId,
+		narratorId: "sub-a",
+		sourceInputId: `input-${over.segmentId}`,
+		createdAt: now,
+	});
+	await db.insert(fileChangeScopes).values({
+		id: `scope-${over.segmentId}`,
+		sourceInstanceId: `runtime-${over.segmentId}`,
+		deviceId: "local",
+		workspaceInstanceId: `workspace-${over.segmentId}`,
+		canonicalRoot: WORKSPACE,
+		displayRoot: WORKSPACE,
+		pathFlavor: "posix",
+		status: "active",
+		revision: 0,
+		fencingToken: 0,
+		createdAt: now,
+		updatedAt: now,
+	});
+	await db.insert(fileChangeOperations).values({
+		id: over.operationId,
+		executionSegmentId: over.segmentId,
+		evidenceVersion: 2,
+		sourceInstanceId: `runtime-${over.segmentId}`,
+		sourceKind: "tool",
+		sourceId: `source-${over.operationId}`,
+		attempt: 1,
+		requestDigest: "a".repeat(64),
+		expectedEffectCount: 1,
+		preparedEffectCount: 1,
+		settledEffectCount: 1,
+		unresolvedEffectCount: 0,
+		actorSubjectKey: "narrator:sub-a",
+		actorJson: {
+			kind: "subagent",
+			subjectKey: "narrator:sub-a",
+			narratorId: "sub-a",
+			userId: null,
+			label: "sub-a",
+			deleted: false,
+			parentSubjectKey: "narrator:parent-1",
+		},
+		narratorId: "sub-a",
+		executionOutcome: "succeeded",
+		effectOutcome: "changed",
+		settlement: "settled",
+		attributionGrade: "measured",
+		coverage: "complete",
+		startedAt: now,
+		finishedAt: now,
+		updatedAt: now,
+	});
+	await db.insert(fileChangeEffects).values({
+		id: `effect-${over.operationId}`,
+		operationId: over.operationId,
+		scopeId: `scope-${over.segmentId}`,
+		fileKey: `file-${over.operationId}`,
+		identityJson: {
+			sourceInstanceId: `runtime-${over.segmentId}`,
+			deviceId: "local",
+			workspaceInstanceId: `workspace-${over.segmentId}`,
+			scopeId: `scope-${over.segmentId}`,
+			pathFlavor: "posix",
+			objectRole: "referent",
+			canonicalPath: `${WORKSPACE}/${filePath}`,
+			lexicalPath: `${WORKSPACE}/${filePath}`,
+			displayPath: filePath,
+		},
+		scopeRevision: 0,
+		mutationId: `mutation-${over.operationId}`,
+		requestDigest: "a".repeat(64),
+		phase: "apply",
+		beforeStateJson: { kind: "absent" },
+		intendedAfterStateJson: { kind: "absent" },
+		observedAfterStateJson: { kind: "absent" },
+		outcome: "changed",
+		settlement: "settled",
+		attributionGrade: "measured",
+		executionConfirmed: true,
+		linesAdded: over.linesAdded ?? 4,
+		linesRemoved: over.linesRemoved ?? 1,
+		createdAt: now,
+		updatedAt: now,
 	});
 }
 
@@ -296,6 +424,55 @@ describe("getFileChangesBySubagent — the card projection", () => {
 		// Distinct paths, not attribution rows.
 		expect(entry?.bashTouchedCount).toBe(2);
 		expect(entry?.files).toEqual([]);
+	});
+
+	test("uses only the current execution segment for exact v2 attribution", async () => {
+		await exactEffect({
+			segmentId: "segment-old",
+			operationId: "operation-old",
+			linesAdded: 99,
+			linesRemoved: 9,
+		});
+		await exactEffect({
+			segmentId: "segment-current",
+			operationId: "operation-current",
+			linesAdded: 4,
+			linesRemoved: 1,
+		});
+		await parentExecutionCall("segment-current");
+
+		const entry = (
+			await getFileChangesBySubagent(["sub-a"], {
+				executionBoundariesBySubagent: new Map([
+					[
+						"sub-a",
+						{
+							sourceToolCallId: "parent-call",
+							executionAttempt: 1,
+							executionIdentityVersion: 1,
+							executionSegmentId: "segment-current",
+						},
+					],
+				]),
+			})
+		).get("sub-a");
+
+		expect(entry?.attributionScope).toBe("exact_attempt");
+		expect(entry?.files).toHaveLength(1);
+		expect(entry?.files[0]).toMatchObject({
+			filePath: "src/current.ts",
+			linesAdded: 4,
+			linesRemoved: 1,
+			editCount: 1,
+		});
+	});
+
+	test("downgrades exact attribution when the execution boundary is missing", async () => {
+		await exactEffect({ segmentId: "segment-no-boundary", operationId: "operation-no-boundary" });
+		await attribute({ narratorId: "sub-a", filePath: "legacy.ts", linesAdded: 2 });
+		const entry = (await getFileChangesBySubagent(["sub-a"])).get("sub-a");
+		expect(entry?.attributionScope).toBe("legacy_unscoped");
+		expect(entry?.files.map((file) => file.filePath)).toEqual(["legacy.ts"]);
 	});
 
 	test("does not mark an unaffected subagent's counts as truncated", async () => {

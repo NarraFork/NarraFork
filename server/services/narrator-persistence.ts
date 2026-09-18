@@ -9,7 +9,7 @@ import {
 } from "@shared/compact-message";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
-import { and, desc, eq, gte, inArray, isNull, like, type SQL, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, like, type SQL, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	narratorBufferedMessages,
@@ -45,7 +45,16 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { getExecutionOwner } from "./agent-runtime/ownership";
+import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
 import { createFileChangeExecutionSegmentsService } from "./file-change-execution-segments";
+import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
+import { type PgNarratorRefsTx, persistPgMessageWithRef } from "./narrator-refs/postgres-store";
+import {
+	claimNextRefSeq,
+	claimShiftInsertSlot,
+	initializeRefSeqFloor,
+} from "./narrator-refs/seq-store";
+import { assertSqliteNarratorOperation, getNarratorMessageRefsPort } from "./narrator-refs/store";
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
 import { preserveTakenOverSubstatus } from "./subagent-takeover";
 
@@ -566,14 +575,14 @@ async function insertMessageRef(
 	seq: number,
 	isCompact = 0,
 ): Promise<void> {
+	assertSqliteNarratorOperation("insertMessageRef");
 	await withDbRetry(
-		() =>
-			db.insert(narratorMessageRefs).values({
-				id: generateId(),
-				narratorId,
-				messageId,
-				seq,
-				isCompact,
+		async () =>
+			db.transaction((tx) => {
+				tx.insert(narratorMessageRefs)
+					.values({ id: generateId(), narratorId, messageId, seq, isCompact })
+					.run();
+				initializeRefSeqFloor(tx, narratorId);
 			}),
 		{ label: "insertMessageRef", maxRetries: 5 },
 	);
@@ -592,12 +601,8 @@ function appendMessageRefSync(
 	messageId: string,
 	isCompact = 0,
 ): number {
-	const result = tx
-		.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
-		.from(narratorMessageRefs)
-		.where(eq(narratorMessageRefs.narratorId, narratorId))
-		.all();
-	const seq = (result[0]?.maxSeq ?? -1) + 1;
+	// The shared next_seq authority; the synchronous counter claim rolls back with this ref.
+	const seq = claimNextRefSeq(tx, narratorId);
 
 	tx.insert(narratorMessageRefs)
 		.values({
@@ -634,6 +639,7 @@ async function appendMessageRef(
 	messageId: string,
 	isCompact = 0,
 ): Promise<number> {
+	assertSqliteNarratorOperation("appendMessageRef");
 	return withDbRetry(
 		async () => db.transaction((tx) => appendMessageRefSync(tx, narratorId, messageId, isCompact)),
 		{ label: "appendMessageRef", maxRetries: 5 },
@@ -951,9 +957,99 @@ function persistPlacement(
 	placement.onPersist?.(tx, messageId, ref.id);
 }
 
+// ── PostgreSQL placement seam ──────────────────────────────────────────────
+//
+// The SQLite path above commits message + ref + mailbox materialization in ONE
+// synchronous transaction (`persistPlacement` inside `db.transaction`). The
+// PostgreSQL counterpart cannot ride this module's entry points: the mailbox
+// row lives behind the PG runtime queue, and the queue — not the caller —
+// owns the materialize transaction (`mailbox.materialize`, which validates the
+// claim, then runs the materializer, then flips the mailbox row, all inside one
+// `withPgRetry`-wrapped section).
+//
+// THE SEAM: the caller that holds a PG mailbox claim builds its message row
+// exactly as it would for `persistUserMessage`/`persistSystemMessage` — with
+// `id` set to the claim's reserved `recipientMessageId` — and hands it to
+//
+//   queue.materialize(claim, createPgPlacedMessageMaterializer(message, hooks))
+//
+// `createPgPlacedMessageMaterializer` is the ONLY PG placement operation this
+// module exposes: inside the queue's transaction it delegates the
+// lock/claim-seq/insert/version-bump sequence to the named refs helper
+// (`persistPgMessageWithRef`) and then runs the PG `onPersist` hook in the
+// same transaction, so message, ref, hook effects and the mailbox flip commit
+// or roll back together. Caller migration to this seam is a separate phase;
+// until then the public entry points below stay fail-closed (see
+// `assertPgPlacement`).
+
+/** Transaction handle the PG `onPersist` hook receives — the queue's live section. */
+export type PgPlacementTx = PgNarratorRefsTx;
+
+export interface PgMessagePlacementHooks {
+	/**
+	 * PG counterpart of {@link MessagePlacementOptions.onPersist}: commits related
+	 * state in the SAME transaction as the message, ref and mailbox materialization.
+	 * Unlike the SQLite hook it MAY await (a networked driver inside the transaction
+	 * is safe), and a throw rolls the whole materialize section back.
+	 */
+	onPersist?: (tx: PgPlacementTx, messageId: string, refId: string) => void | Promise<void>;
+}
+
+/**
+ * Build the queue-compatible materializer for one placed message. The reserved
+ * identity is enforced twice — here against the claimed row and again by the
+ * queue's materialize section — and the recipient is pinned to the claim's
+ * narrator, so a materializer built for one delivery can never write into
+ * another narrator's history.
+ */
+export function createPgPlacedMessageMaterializer(
+	message: RefMessageInput,
+	hooks?: PgMessagePlacementHooks,
+): PgMaterializer {
+	return async (tx, row) => {
+		if (row.narratorId !== message.narratorId) throw new Error("Mailbox recipient mismatch");
+		if (!row.recipientMessageId)
+			throw new Error("Mailbox claim has no reserved recipient identity");
+		if (message.id !== row.recipientMessageId)
+			throw new Error("Placed message must use the reserved recipient identity");
+		const persisted = await persistPgMessageWithRef(tx, message);
+		await hooks?.onPersist?.(tx, persisted.messageId, persisted.refId);
+		return { messageId: persisted.messageId, refId: persisted.refId };
+	};
+}
+
 // ── narratorPersistence object ─────────────────────────────────────────────
 
-export const narratorPersistence = {
+async function appendPersistedMessage(message: RefMessageInput): Promise<RefMessage> {
+	const pg = getNarratorMessageRefsPort();
+	if (pg) return pg.append(message);
+	return withDbRetry(
+		async () =>
+			db.transaction((tx) => {
+				const created = tx.insert(narratorMessages).values(message).returning().get();
+				const seq = appendMessageRefSync(tx, message.narratorId, message.id);
+				return { ...created, seq };
+			}),
+		{ label: "appendPersistedMessage", maxRetries: 5 },
+	);
+}
+
+/**
+ * Production placement calls stay FAIL-CLOSED on PostgreSQL this phase: the
+ * callers still pass `mailboxClaim`/`onPersist` to these entry points instead of
+ * driving `queue.materialize(claim, createPgPlacedMessageMaterializer(...))`,
+ * and silently dropping the placement would lose the mailbox receipt. The error
+ * names the seam so the migration target is unambiguous.
+ */
+function assertPgPlacement(placement?: MessagePlacementOptions): void {
+	if (placement?.mailboxClaim || placement?.onPersist)
+		throw new Error(
+			"PostgreSQL narrator mailbox/onPersist placement unavailable on this entry point; " +
+				"use queue.materialize(claim, createPgPlacedMessageMaterializer(message, hooks))",
+		);
+}
+
+const sqliteNarratorPersistence = {
 	/**
 	 * Persist a `role: "user"` message.
 	 *
@@ -978,6 +1074,28 @@ export const narratorPersistence = {
 		placement?: MessagePlacementOptions,
 	) {
 		const parentToolUseId = placement?.parentToolUseId ?? null;
+		const pg = getNarratorMessageRefsPort();
+		if (pg) {
+			assertPgPlacement(placement);
+			const msg = await pg.append({
+				id: placement?.messageId ?? generateId(),
+				narratorId,
+				parentToolUseId,
+				role: "user",
+				contentJson: contentBlocks ?? [{ type: "text", text }],
+				contentText: text,
+				commandText: commandText ?? null,
+				createdBy: createdBy ?? null,
+				origin: origin?.origin ?? "user",
+				originLabel: origin?.originLabel ?? null,
+				createdAt: new Date().toISOString(),
+			});
+			const creator =
+				createdBy && !(placement?.messageId && origin?.origin === "assistant")
+					? await pg.creator(createdBy).catch(() => null)
+					: null;
+			return { ...msg, creator };
+		}
 		const msgWithSeq = await withDbRetry(
 			async () => {
 				const id = placementMessageId(placement);
@@ -1073,6 +1191,25 @@ export const narratorPersistence = {
 		placement?: MessagePlacementOptions,
 	) {
 		const parentToolUseId = placement?.parentToolUseId ?? null;
+		const pg = getNarratorMessageRefsPort();
+		if (pg) {
+			assertPgPlacement(placement);
+			const provided = contentBlocks ?? [];
+			const native = provided.some(isNativeModelContextBlock);
+			const blocks = native ? provided : [{ type: "text", text }, ...provided];
+			return pg.append({
+				id: placement?.messageId ?? generateId(),
+				narratorId,
+				parentToolUseId,
+				role: "sys",
+				contentJson: blocks,
+				contentText: native ? modelTextFromContentBlocks(blocks) || text : text,
+				createdBy: createdBy ?? null,
+				origin: origin?.origin ?? "system",
+				originLabel: origin?.originLabel ?? null,
+				createdAt: new Date().toISOString(),
+			});
+		}
 		const msg = await withDbRetry(
 			async () =>
 				db.transaction((tx) => {
@@ -1131,31 +1268,16 @@ export const narratorPersistence = {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		contentBlocks?: any[],
 	) {
-		const { msg, seq } = await withDbRetry(
-			async () =>
-				db.transaction((tx) => {
-					const id = generateId();
-					const now = new Date().toISOString();
-					const msg = tx
-						.insert(narratorMessages)
-						.values({
-							id,
-							narratorId,
-							role: "disp",
-							contentJson: contentBlocks ?? [{ type: "info", message: text }],
-							// Preserve the legacy `[Info] …` contentText for the default info
-							// card (a documented parity contract); custom-block callers pass
-							// their own already-formatted text.
-							contentText: contentBlocks ? text : `[Info] ${text}`,
-							createdAt: now,
-						})
-						.returning()
-						.get();
-					const seq = appendMessageRefSync(tx, narratorId, id);
-					return { msg, seq };
-				}),
-			{ label: "persistDisplayMessage", maxRetries: 5 },
-		);
+		const msg = await appendPersistedMessage({
+			id: generateId(),
+			narratorId,
+			role: "disp",
+			contentJson: contentBlocks ?? [{ type: "info", message: text }],
+			// Custom-block callers supply already-formatted text; preserve legacy default.
+			contentText: contentBlocks ? text : `[Info] ${text}`,
+			createdAt: new Date().toISOString(),
+		});
+		const seq = msg.seq;
 		broadcastToNarrator(narratorId, {
 			type: "message",
 			narratorId,
@@ -1215,22 +1337,10 @@ export const narratorPersistence = {
 							.sync();
 						if (!targetRef) throw new NotFoundError("Message", beforeMessageId);
 						seq = targetRef.seq;
-						tx.update(narratorMessageRefs)
-							.set({ seq: sql`${narratorMessageRefs.seq} + 1` })
-							.where(
-								and(
-									eq(narratorMessageRefs.narratorId, narratorId),
-									gte(narratorMessageRefs.seq, seq),
-								),
-							)
-							.run();
+						// Reserve a counter slot before shifting so appends cannot reuse it.
+						claimShiftInsertSlot(tx, narratorId, seq);
 					} else {
-						const result = tx
-							.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
-							.from(narratorMessageRefs)
-							.where(eq(narratorMessageRefs.narratorId, narratorId))
-							.all();
-						seq = (result[0]?.maxSeq ?? -1) + 1;
+						seq = claimNextRefSeq(tx, narratorId);
 					}
 
 					const msg = tx
@@ -1368,12 +1478,7 @@ export const narratorPersistence = {
 				.returning()
 				.get();
 
-			const result = tx
-				.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
-				.from(narratorMessageRefs)
-				.where(eq(narratorMessageRefs.narratorId, narratorId))
-				.all();
-			const seq = (result[0]?.maxSeq ?? -1) + 1;
+			const seq = claimNextRefSeq(tx, narratorId);
 			tx.insert(narratorMessageRefs)
 				.values({
 					id: generateId(),
@@ -1416,12 +1521,7 @@ export const narratorPersistence = {
 				.returning()
 				.get();
 
-			const result = tx
-				.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
-				.from(narratorMessageRefs)
-				.where(eq(narratorMessageRefs.narratorId, narratorId))
-				.all();
-			const seq = (result[0]?.maxSeq ?? -1) + 1;
+			const seq = claimNextRefSeq(tx, narratorId);
 			tx.insert(narratorMessageRefs)
 				.values({
 					id: generateId(),
@@ -1480,15 +1580,7 @@ export const narratorPersistence = {
 				.returning()
 				.get();
 
-			tx.update(narratorMessageRefs)
-				.set({ seq: sql`${narratorMessageRefs.seq} + 1` })
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						gte(narratorMessageRefs.seq, targetRef.seq),
-					),
-				)
-				.run();
+			claimShiftInsertSlot(tx, narratorId, targetRef.seq);
 			tx.insert(narratorMessageRefs)
 				.values({
 					id: generateId(),
@@ -1699,37 +1791,37 @@ export const narratorPersistence = {
 			.join("\n");
 
 		const usage = sdkMessage.message.usage;
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				messageUuid: sdkMessage.uuid,
-				parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
-				role: "assistant",
-				contentJson: content,
-				contentText: contentText || null,
-				tokensIn: usage?.input_tokens,
-				provider: sdkMessage.provider ?? null,
-				credentialId: sdkMessage.credentialId ?? null,
-				model: sdkMessage.model ?? null,
-				outputTokens: sdkMessage.outputTokens ?? null,
-				cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
-				cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
-				cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
-				cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
-				reasoningTokens: sdkMessage.reasoningTokens ?? null,
-				ttftMs: sdkMessage.ttftMs ?? null,
-				durationMs: sdkMessage.durationMs ?? null,
-				contextPercent: sdkMessage.contextPercent ?? null,
-				meterUsage: sdkMessage.meterUsage ?? null,
-				meterUnit: sdkMessage.meterUnit ?? null,
-				createdAt: now,
-			})
-			.returning();
+		const pg = getNarratorMessageRefsPort();
+		if (pg && content.some((block) => block.type === "tool_use"))
+			throw new Error("PostgreSQL assistant tool-call persistence unavailable");
+		const msg = await appendPersistedMessage({
+			id,
+			narratorId,
+			messageUuid: sdkMessage.uuid,
+			parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
+			role: "assistant",
+			contentJson: content,
+			contentText: contentText || null,
+			tokensIn: usage?.input_tokens,
+			provider: sdkMessage.provider ?? null,
+			credentialId: sdkMessage.credentialId ?? null,
+			model: sdkMessage.model ?? null,
+			outputTokens: sdkMessage.outputTokens ?? null,
+			cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
+			cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
+			cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
+			cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
+			reasoningTokens: sdkMessage.reasoningTokens ?? null,
+			ttftMs: sdkMessage.ttftMs ?? null,
+			durationMs: sdkMessage.durationMs ?? null,
+			contextPercent: sdkMessage.contextPercent ?? null,
+			meterUsage: sdkMessage.meterUsage ?? null,
+			meterUnit: sdkMessage.meterUnit ?? null,
+			createdAt: now,
+		});
 
-		const seq = await appendMessageRef(narratorId, id);
-		await bumpParentNarratorMessageVersion(sdkMessage.parent_tool_use_id);
+		const seq = msg.seq;
+		if (!pg) await bumpParentNarratorMessageVersion(sdkMessage.parent_tool_use_id);
 
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const toolUseBlocks = content.filter((b: any) => b.type === "tool_use");
@@ -1800,39 +1892,37 @@ export const narratorPersistence = {
 	) {
 		const id = generateId();
 		const now = new Date().toISOString();
+		const pg = getNarratorMessageRefsPort();
 
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				messageUuid: sdkMessage.uuid,
-				parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
-				role: "assistant",
-				contentJson: [],
-				contentText: null,
-				tokensIn: sdkMessage.tokensIn ?? null,
-				turnUsageJson: sdkMessage.turnUsage ?? null,
-				provider: sdkMessage.provider ?? null,
-				credentialId: sdkMessage.credentialId ?? null,
-				model: sdkMessage.model ?? null,
-				outputTokens: sdkMessage.outputTokens ?? null,
-				cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
-				cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
-				cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
-				cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
-				reasoningTokens: sdkMessage.reasoningTokens ?? null,
-				ttftMs: sdkMessage.ttftMs ?? null,
-				durationMs: sdkMessage.durationMs ?? null,
-				contextPercent: sdkMessage.contextPercent ?? null,
-				meterUsage: sdkMessage.meterUsage ?? null,
-				meterUnit: sdkMessage.meterUnit ?? null,
-				createdAt: now,
-			})
-			.returning();
+		const msg = await appendPersistedMessage({
+			id,
+			narratorId,
+			messageUuid: sdkMessage.uuid,
+			parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
+			role: "assistant",
+			contentJson: [],
+			contentText: null,
+			tokensIn: sdkMessage.tokensIn ?? null,
+			turnUsageJson: sdkMessage.turnUsage ?? null,
+			provider: sdkMessage.provider ?? null,
+			credentialId: sdkMessage.credentialId ?? null,
+			model: sdkMessage.model ?? null,
+			outputTokens: sdkMessage.outputTokens ?? null,
+			cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
+			cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
+			cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
+			cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
+			reasoningTokens: sdkMessage.reasoningTokens ?? null,
+			ttftMs: sdkMessage.ttftMs ?? null,
+			durationMs: sdkMessage.durationMs ?? null,
+			contextPercent: sdkMessage.contextPercent ?? null,
+			meterUsage: sdkMessage.meterUsage ?? null,
+			meterUnit: sdkMessage.meterUnit ?? null,
+			createdAt: now,
+		});
 
-		const seq = await appendMessageRef(narratorId, id);
-		await bumpParentNarratorMessageVersion(sdkMessage.parent_tool_use_id);
+		const seq = msg.seq;
+		if (!pg) await bumpParentNarratorMessageVersion(sdkMessage.parent_tool_use_id);
 		return { ...msg, seq };
 	},
 
@@ -2373,7 +2463,7 @@ export const narratorPersistence = {
 					const contentJson = [{ type: "error", message: errText }];
 					const contentText = `[Error] ${errText}`;
 					// Insert the message and its ref atomically. We MUST use a
-					// synchronous native sqlite transaction here: bun:sqlite +
+					// SYNCHRONOUS transaction here: bun:sqlite +
 					// Drizzle's `db.transaction(async (tx) => …)` only wraps the
 					// synchronous prefix before the first `await` in BEGIN/COMMIT,
 					// so awaited statements (the ref insert) run OUTSIDE the
@@ -2381,36 +2471,39 @@ export const narratorPersistence = {
 					// the ref insert hit a lock/error — the card showed up in the
 					// frontend (via the broadcast below) but `dismissErrorMessage`
 					// could not find the ref → "Message not found". A sync
-					// transaction commits both rows atomically.
+					// transaction commits both rows atomically. (This used to drop to
+					// the raw `sqlite` handle for the same guarantee; Drizzle's sync
+					// `db.transaction((tx) => …)` IS the same native synchronous
+					// transaction, and going through it lets the seq claim share the
+					// single authority in narrator-refs/seq-store.ts.)
 					await withDbRetry(
-						async () => {
-							const insertAtomic = sqlite.transaction(() => {
-								sqlite
-									.prepare(
-										`INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_at)
-										 VALUES (?, ?, 'system', ?, ?, ?)`,
-									)
-									.run(msgId, narratorId, JSON.stringify(contentJson), contentText, now);
-								const maxSeqRow = sqlite
-									.prepare(
-										"SELECT MAX(seq) AS maxSeq FROM narrator_message_refs WHERE narrator_id = ?",
-									)
-									.get(narratorId) as { maxSeq: number | null } | undefined;
-								const seq = (maxSeqRow?.maxSeq ?? -1) + 1;
-								sqlite
-									.prepare(
-										`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact)
-										 VALUES (?, ?, ?, ?, 0)`,
-									)
-									.run(generateId(), narratorId, msgId, seq);
-								sqlite
-									.prepare(
-										"UPDATE narrators SET message_version = message_version + 1 WHERE id = ?",
-									)
-									.run(narratorId);
-							});
-							insertAtomic();
-						},
+						async () =>
+							db.transaction((tx) => {
+								tx.insert(narratorMessages)
+									.values({
+										id: msgId,
+										narratorId,
+										role: "system",
+										contentJson,
+										contentText,
+										createdAt: now,
+									})
+									.run();
+								const seq = claimNextRefSeq(tx, narratorId);
+								tx.insert(narratorMessageRefs)
+									.values({
+										id: generateId(),
+										narratorId,
+										messageId: msgId,
+										seq,
+										isCompact: 0,
+									})
+									.run();
+								tx.update(narrators)
+									.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
+									.where(eq(narrators.id, narratorId))
+									.run();
+							}),
 						{ label: "persistErrorSystemMessage", maxRetries: 5 },
 					);
 					// Broadcast only after the transaction has committed, so a
@@ -3534,34 +3627,33 @@ export const narratorPersistence = {
 		const id = generateId();
 		const now = new Date().toISOString();
 
-		const refs = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					inArray(narratorMessageRefs.messageId, messageIds),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
-
-		if (refs.length === 0) throw new ValidationError("No matching messages found");
-
-		const insertSeq = refs[0].seq;
-
-		db.transaction((tx) => {
-			tx.update(narratorMessageRefs)
-				.set({ seq: sql`${narratorMessageRefs.seq} + 1` })
+		// The refs read MUST live inside the same transaction as the shift+insert:
+		// read outside, `insertSeq` is a stale snapshot of where the marker belongs —
+		// a concurrent shift/append between the read and the write could move the very
+		// rows this marker then hides. Inside the (synchronous) write transaction the
+		// read, the shift and the insert observe one consistent seq space.
+		const { refs, insertSeq } = db.transaction((tx) => {
+			const refs = tx
+				.select({
+					messageId: narratorMessageRefs.messageId,
+					seq: narratorMessageRefs.seq,
+				})
+				.from(narratorMessageRefs)
 				.where(
 					and(
 						eq(narratorMessageRefs.narratorId, narratorId),
-						gte(narratorMessageRefs.seq, insertSeq),
+						inArray(narratorMessageRefs.messageId, messageIds),
 					),
 				)
-				.run();
+				.orderBy(narratorMessageRefs.seq)
+				.all();
+
+			if (refs.length === 0) throw new ValidationError("No matching messages found");
+
+			const insertSeq = refs[0].seq;
+
+			// Shift consumes one top-of-history slot — see narrator-refs/seq-store.ts.
+			claimShiftInsertSlot(tx, narratorId, insertSeq);
 
 			tx.insert(narratorMessages)
 				.values({
@@ -3608,6 +3700,8 @@ export const narratorPersistence = {
 				})
 				.where(eq(narrators.id, narratorId))
 				.run();
+
+			return { refs, insertSeq };
 		});
 
 		const [msg] = await db.select().from(narratorMessages).where(eq(narratorMessages.id, id));
@@ -3855,3 +3949,53 @@ export const narratorPersistence = {
 		});
 	},
 };
+
+/** Explicit partial migration: unsupported API calls must not fall through to SQLite on PG. */
+const PG_MESSAGE_METHODS = new Set<PropertyKey>([
+	"persistUserMessage",
+	"persistSystemMessage",
+	"persistDisplayMessage",
+	"persistAssistantMessage",
+	"createPartialAssistantMessage",
+]);
+
+/**
+ * One guard wrapper per method, installed as a plain own data property.
+ *
+ * The guard still runs at INVOCATION time (narrator-service captures bound aliases
+ * before PG composition binds), and the wrapper is a plain function so
+ * `spyOn(narratorPersistence, method)` keeps working: bun's spyOn does not penetrate
+ * ANY Proxy — not even a trapless forwarding one (no set/defineProperty trap is ever
+ * invoked), which is why the earlier get-trap Proxy here silently swallowed every
+ * spy/mock installed by tests. Own writable properties on a plain object are the
+ * only shape both the guard and the test doubles can share.
+ */
+function guardSqliteOnlyPersistenceMethod(
+	key: string,
+	method: (...args: never[]) => unknown,
+): (...args: never[]) => unknown {
+	return function guardedPersistenceMethod(this: unknown, ...args: never[]) {
+		try {
+			assertSqliteNarratorOperation(key);
+		} catch (error) {
+			// These methods are awaited; a synchronous throw would escape `.catch` chains.
+			return Promise.reject(error);
+		}
+		return Reflect.apply(method, this, args);
+	};
+}
+
+export const narratorPersistence: typeof sqliteNarratorPersistence = (() => {
+	const wrapped: Record<PropertyKey, unknown> = {};
+	for (const key of Reflect.ownKeys(sqliteNarratorPersistence)) {
+		const descriptor = Object.getOwnPropertyDescriptor(sqliteNarratorPersistence, key);
+		if (!descriptor) continue;
+		if (typeof descriptor.value === "function" && !PG_MESSAGE_METHODS.has(key))
+			wrapped[key] = guardSqliteOnlyPersistenceMethod(
+				String(key),
+				descriptor.value as (...args: never[]) => unknown,
+			);
+		else Object.defineProperty(wrapped, key, descriptor);
+	}
+	return wrapped as typeof sqliteNarratorPersistence;
+})();

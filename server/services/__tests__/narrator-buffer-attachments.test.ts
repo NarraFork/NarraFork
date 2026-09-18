@@ -27,12 +27,14 @@
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { getTestDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narrators } from "../../db/schema";
+import type { PostgresRuntimeQueue } from "../agent-runtime/postgres-runtime-queue";
+import { bindRuntimeQueue } from "../agent-runtime/runtime-queue-port";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -53,6 +55,7 @@ process.env.NARRAFORK_HOME = HOME;
 // beforeEach re-import here.
 const {
 	cleanupBufferedTextFiles,
+	cleanupBufferedTextFilesAsync,
 	enqueueBufferedMessage,
 	projectMailboxUserMessage,
 	releaseBufferedMessage,
@@ -64,6 +67,7 @@ const {
 	pushBufferedMessage,
 	removeBufferedMessage,
 	retryBufferedMessage,
+	reconcileBufferedStaging,
 	toBufferSummary,
 	updateBufferedMessage,
 } = await import("../narrator-buffer");
@@ -139,6 +143,7 @@ async function readTextFilePathsJson(
 }
 
 afterEach(() => {
+	bindRuntimeQueue(undefined);
 	activeNarrators.clear();
 	clearSubagentBufferedMessages(SUBAGENT_ID);
 	sqlite.run("DELETE FROM narrator_buffered_messages");
@@ -362,7 +367,7 @@ describe("queue teardown must not delete uploaded images", () => {
 		const imagePath = getImagePath(NARRATOR_ID, image.imageId);
 		expect(imagePath).not.toBeNull();
 
-		dbClearAllBuffered(NARRATOR_ID);
+		await dbClearAllBuffered(NARRATOR_ID);
 
 		expect(existsSync(imagePath as string)).toBe(true);
 	});
@@ -373,7 +378,7 @@ describe("queue teardown must not delete uploaded images", () => {
 		const pushed = await pushBufferedMessage(NARRATOR_ID, "cancel me", [image]);
 		const imagePath = getImagePath(NARRATOR_ID, image.imageId);
 
-		expect(removeBufferedMessage(NARRATOR_ID, pushed.id)).toBe(true);
+		expect(await removeBufferedMessage(NARRATOR_ID, pushed.id)).toBe(true);
 
 		// Image orphan collection on cancel is deliberately out of scope here: only
 		// the edit path, where exclusivity is certain, deletes uploads.
@@ -388,7 +393,7 @@ describe("queue teardown must not delete uploaded images", () => {
 		const [savedFile] = getBufferedMessages(NARRATOR_ID)[0]._savedFiles ?? [];
 		expect(existsSync(savedFile.path)).toBe(true);
 
-		dbClearAllBuffered(NARRATOR_ID);
+		await dbClearAllBuffered(NARRATOR_ID);
 
 		// Unlike images, these live in a queue-owned scratch directory and are
 		// copied into the worktree on consumption, so nothing else references them.
@@ -421,8 +426,8 @@ describe("failed user recovery", () => {
 		expect(store.claimBatch(NARRATOR_ID, { token: "blocked", epoch: "blocked" })).toHaveLength(0);
 		expect(await updateBufferedMessage(NARRATOR_ID, accepted.id, "fixed")).toBe(true);
 		expect(getBufferedMessages(NARRATOR_ID)[0].state).toBe("failed");
-		expect(retryBufferedMessage(NARRATOR_ID, accepted.id)).toBe(true);
-		expect(retryBufferedMessage(NARRATOR_ID, accepted.id)).toBe(false);
+		expect(await retryBufferedMessage(NARRATOR_ID, accepted.id)).toBe(true);
+		expect(await retryBufferedMessage(NARRATOR_ID, accepted.id)).toBe(false);
 		const [row] = store.claimBatch(NARRATOR_ID, { token: "new-owner", epoch: "new-epoch" });
 		const claim = projectMailboxUserMessage(row)._mailboxClaim;
 		if (!claim || !oldClaim) throw new Error("missing claim");
@@ -467,9 +472,9 @@ describe("failed user recovery", () => {
 		const saved = message._savedFiles?.[0];
 		if (!saved) throw new Error("missing saved file");
 		rmSync(saved.path);
-		expect(() => retryBufferedMessage(NARRATOR_ID, pushed.id)).toThrow("missing");
+		await expect(retryBufferedMessage(NARRATOR_ID, pushed.id)).rejects.toThrow("missing");
 		expect(getBufferedMessages(NARRATOR_ID)[0].state).toBe("failed");
-		expect(removeBufferedMessage(NARRATOR_ID, pushed.id)).toBe(true);
+		expect(await removeBufferedMessage(NARRATOR_ID, pushed.id)).toBe(true);
 		expect(existsSync(getImagePath(NARRATOR_ID, image.imageId) as string)).toBe(true);
 		expect(existsSync(join(HOME, "buffered-files", message._stagingId as string))).toBe(false);
 	});
@@ -497,15 +502,15 @@ describe("persistent staging ownership", () => {
 			normal.id,
 			later.id,
 		]);
-		expect(peekInbox(NARRATOR_ID)?.id).toBe(priority.id);
+		expect((await peekInbox(NARRATOR_ID))?.id).toBe(priority.id);
 		const desired = [normal.id, priority.id, later.id];
-		expect(reorderBufferedMessages(NARRATOR_ID, desired)).toBe(true);
+		expect(await reorderBufferedMessages(NARRATOR_ID, desired)).toBe(true);
 		expect(getBufferedMessages(NARRATOR_ID).map((row) => row.id)).toEqual(desired);
 		expect(toBufferSummary(getBufferedMessages(NARRATOR_ID)).every((row) => !row.priority)).toBe(
 			true,
 		);
 		for (const id of desired) {
-			expect(peekInbox(NARRATOR_ID)?.id).toBe(id);
+			expect((await peekInbox(NARRATOR_ID))?.id).toBe(id);
 			const [claimed] = store.claimBatch(
 				NARRATOR_ID,
 				{ token: "sort", epoch: "sort" },
@@ -518,7 +523,7 @@ describe("persistent staging ownership", () => {
 		const { createMailboxStore } = await import("../agent-runtime/mailbox");
 		const store = createMailboxStore(db);
 		const old = await enqueueBufferedMessage(NARRATOR_ID, "old");
-		removeBufferedMessage(NARRATOR_ID, old.id);
+		await removeBufferedMessage(NARRATOR_ID, old.id);
 		store.enqueue({
 			narratorId: NARRATOR_ID,
 			kind: "task_notice",
@@ -564,9 +569,9 @@ describe("persistent staging ownership", () => {
 		});
 		expect(notice.status).toBe("accepted");
 		const removed = await enqueueBufferedMessage(NARRATOR_ID, "removed");
-		removeBufferedMessage(NARRATOR_ID, removed.id);
+		await removeBufferedMessage(NARRATOR_ID, removed.id);
 		await enqueueBufferedMessage(NARRATOR_ID, "pending");
-		dbClearAllBuffered(NARRATOR_ID);
+		await dbClearAllBuffered(NARRATOR_ID);
 		const rows = db
 			.select()
 			.from(narratorBufferedMessages)
@@ -587,9 +592,18 @@ describe("persistent staging ownership", () => {
 		expect(message._stagingId).not.toBe(message.id);
 		const path = message._savedFiles?.[0].path as string;
 		expect(await message.textFiles?.[0].text()).toBe("durable");
+		// SQLite's synchronous ownership lookup must still find the row by staging id
+		// when the marker is missing, and must retain a pending payload.
+		rmSync(join(HOME, "buffered-files", message._stagingId as string, ".mailbox-owner.json"), {
+			force: true,
+		});
 		cleanupBufferedTextFiles(message._stagingId as string);
 		expect(existsSync(path)).toBe(true);
-		expect(removeBufferedMessage(NARRATOR_ID, pushed.id)).toBe(true);
+		writeFileSync(
+			join(HOME, "buffered-files", message._stagingId as string, ".mailbox-owner.json"),
+			JSON.stringify({ rowId: message.id }),
+		);
+		expect(await removeBufferedMessage(NARRATOR_ID, pushed.id)).toBe(true);
 		expect(existsSync(path)).toBe(false);
 		const row = db
 			.select()
@@ -597,6 +611,196 @@ describe("persistent staging ownership", () => {
 			.where(eq(narratorBufferedMessages.id, pushed.id))
 			.get();
 		expect(row?.state).toBe("cancelled");
+	});
+
+	test("PG admission rollback removes staging only after DB confirms no row", async () => {
+		rmSync(join(HOME, "buffered-files"), { recursive: true, force: true });
+		mkdirSync(join(HOME, "buffered-files"), { recursive: true });
+		const queue = {
+			mailbox: {
+				admitUserBuffered: async () => {
+					throw new Error("transaction rolled back");
+				},
+				getByStagingId: async () => undefined,
+			},
+		} as unknown as PostgresRuntimeQueue;
+		bindRuntimeQueue({ backend: "postgres", queue });
+
+		await expect(
+			enqueueBufferedMessage(NARRATOR_ID, "rollback", undefined, null, null, null, [
+				textFile("rollback.md", "discard me"),
+			]),
+		).rejects.toThrow("transaction rolled back");
+		expect(readdirSync(join(HOME, "buffered-files"))).toEqual([]);
+	});
+
+	test("PG admission connection uncertainty retains null-owner staging for repeatable reconciliation", async () => {
+		rmSync(join(HOME, "buffered-files"), { recursive: true, force: true });
+		mkdirSync(join(HOME, "buffered-files"), { recursive: true });
+		let lookupAvailable = false;
+		let stagingId = "";
+		const queue = {
+			mailbox: {
+				admitUserBuffered: async (input: { metadata?: Record<string, unknown> }) => {
+					stagingId = String(input.metadata?.stagingId);
+					throw new Error("connection reset");
+				},
+				getByStagingId: async () => {
+					if (!lookupAvailable) throw new Error("connection reset");
+					return undefined;
+				},
+			},
+		} as unknown as PostgresRuntimeQueue;
+		bindRuntimeQueue({ backend: "postgres", queue });
+
+		await expect(
+			enqueueBufferedMessage(NARRATOR_ID, "uncertain", undefined, null, null, null, [
+				textFile("uncertain.md", "retain me"),
+			]),
+		).rejects.toThrow("connection reset");
+		const stagingPath = join(HOME, "buffered-files", stagingId);
+		expect(existsSync(stagingPath)).toBe(true);
+		expect(JSON.parse(await Bun.file(join(stagingPath, ".mailbox-owner.json")).text())).toEqual({
+			rowId: null,
+		});
+
+		lookupAvailable = true;
+		expect(await reconcileBufferedStaging(NARRATOR_ID, stagingId)).toBe("removed");
+		expect(existsSync(stagingPath)).toBe(false);
+	});
+
+	test("post-commit marker failure repairs ownership without deleting committed payload", async () => {
+		rmSync(join(HOME, "buffered-files"), { recursive: true, force: true });
+		mkdirSync(join(HOME, "buffered-files"), { recursive: true });
+		let row: Record<string, unknown> | undefined;
+		let stagingId = "";
+		const queue = {
+			mailbox: {
+				admitUserBuffered: async (input: { metadata?: Record<string, unknown> }) => {
+					stagingId = String(input.metadata?.stagingId);
+					row = {
+						id: "pg-committed-row",
+						kind: "user_input",
+						state: "queued",
+						metadataJson: JSON.stringify(input.metadata),
+					};
+					const marker = join(HOME, "buffered-files", stagingId, ".mailbox-owner.json");
+					rmSync(marker, { force: true });
+					mkdirSync(marker);
+					return { status: "accepted", delivery: row };
+				},
+				getById: async (id: string) => (id === row?.id ? row : undefined),
+				getByStagingId: async () => row,
+			},
+		} as unknown as PostgresRuntimeQueue;
+		bindRuntimeQueue({ backend: "postgres", queue });
+
+		await expect(
+			enqueueBufferedMessage(NARRATOR_ID, "marker failure", undefined, null, null, null, [
+				textFile("marker.md", "keep me"),
+			]),
+		).rejects.toThrow();
+		const stagingPath = join(HOME, "buffered-files", stagingId);
+		expect(existsSync(stagingPath)).toBe(true);
+
+		rmSync(join(stagingPath, ".mailbox-owner.json"), { recursive: true, force: true });
+		expect(await reconcileBufferedStaging(NARRATOR_ID, stagingId, "stale-owner-id")).toBe("owned");
+		expect(JSON.parse(await Bun.file(join(stagingPath, ".mailbox-owner.json")).text())).toEqual({
+			rowId: "pg-committed-row",
+		});
+	});
+
+	test("reconcile retains queued, claimed, and failed payloads after repairing the marker", async () => {
+		const rows = new Map<string, Record<string, unknown>>();
+		const queue = {
+			mailbox: {
+				getByStagingId: async (_narratorId: string, stagingId: string) =>
+					(rows.get(stagingId) as never) ?? undefined,
+				getById: async (id: string) =>
+					[...rows.values()].find((candidate) => candidate.id === id) as never,
+			},
+		} as unknown as PostgresRuntimeQueue;
+		bindRuntimeQueue({ backend: "postgres", queue });
+
+		for (const state of ["queued", "claimed", "failed"] as const) {
+			const stagingId = `retain-${state}`;
+			const rowId = `retain-row-${state}`;
+			const directory = join(HOME, "buffered-files", stagingId);
+			mkdirSync(directory, { recursive: true });
+			writeFileSync(join(directory, ".mailbox-owner.json"), JSON.stringify({ rowId: null }));
+			rows.set(stagingId, {
+				id: rowId,
+				narratorId: NARRATOR_ID,
+				kind: "user_input",
+				state,
+				metadataJson: JSON.stringify({ stagingId }),
+			});
+
+			expect(await reconcileBufferedStaging(NARRATOR_ID, stagingId)).toBe("owned");
+			expect(existsSync(directory)).toBe(true);
+			expect(JSON.parse(await Bun.file(join(directory, ".mailbox-owner.json")).text())).toEqual({
+				rowId,
+			});
+		}
+	});
+
+	test("async cleanup uses the PostgreSQL queue port after mailbox consumption", async () => {
+		const pushed = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"pg cleanup",
+			undefined,
+			null,
+			null,
+			null,
+			[textFile("pg.md", "durable")],
+		);
+		const [message] = getBufferedMessages(NARRATOR_ID);
+		const stagingId = message._stagingId as string;
+		const savedPath = message._savedFiles?.[0]?.path as string;
+		const calls: string[] = [];
+		const queue = {
+			mailbox: {
+				getById: async (id: string) => {
+					calls.push(id);
+					if (id === stagingId) return undefined;
+					if (id === pushed.id)
+						return {
+							id: pushed.id,
+							state: "materialized",
+							kind: "user_input",
+							metadataJson: JSON.stringify({ stagingId }),
+						} as never;
+					return undefined;
+				},
+			},
+		} as unknown as PostgresRuntimeQueue;
+		bindRuntimeQueue({ backend: "postgres", queue });
+
+		await cleanupBufferedTextFilesAsync(stagingId);
+
+		expect(calls).toEqual([stagingId, pushed.id]);
+		expect(existsSync(savedPath)).toBe(false);
+	});
+
+	test("explicit PostgreSQL without a queue binding fails closed instead of using SQLite cleanup", async () => {
+		await enqueueBufferedMessage(NARRATOR_ID, "pg poison", undefined, null, null, null, [
+			textFile("poison.md", "retained"),
+		]);
+		const [message] = getBufferedMessages(NARRATOR_ID);
+		const stagingId = message._stagingId as string;
+		const oldWrite = process.env.NF_WRITE_BACKEND;
+		const oldRead = process.env.NF_READ_BACKEND;
+		process.env.NF_WRITE_BACKEND = "postgres";
+		process.env.NF_READ_BACKEND = "postgres";
+		try {
+			await expect(cleanupBufferedTextFilesAsync(stagingId)).rejects.toThrow("unavailable");
+			expect(existsSync(message._savedFiles?.[0]?.path as string)).toBe(true);
+		} finally {
+			if (oldWrite === undefined) delete process.env.NF_WRITE_BACKEND;
+			else process.env.NF_WRITE_BACKEND = oldWrite;
+			if (oldRead === undefined) delete process.env.NF_READ_BACKEND;
+			else process.env.NF_READ_BACKEND = oldRead;
+		}
 	});
 
 	test("claim leases survive UI clear and cleanup; failed delivery returns the same files", async () => {
@@ -608,16 +812,16 @@ describe("persistent staging ownership", () => {
 		const [row] = store.claimBatch(NARRATOR_ID, { token: "owner", epoch: "epoch-1" }, { count: 1 });
 		const message = projectMailboxUserMessage(row);
 		const saved = message._savedFiles?.[0] as NonNullable<typeof message._savedFiles>[number];
-		dbClearAllBuffered(NARRATOR_ID);
+		await dbClearAllBuffered(NARRATOR_ID);
 		cleanupBufferedTextFiles(message._stagingId as string);
 		deleteBufferedTextFile(saved);
 		expect(existsSync(saved.path)).toBe(true);
-		expect(removeBufferedMessage(NARRATOR_ID, row.id)).toBe(false);
+		expect(await removeBufferedMessage(NARRATOR_ID, row.id)).toBe(false);
 		expect(getBufferedMessages(NARRATOR_ID)).toHaveLength(0);
-		releaseBufferedMessage(message, "retry preparation");
+		await releaseBufferedMessage(message, "retry preparation");
 		expect(getBufferedMessages(NARRATOR_ID)[0].id).toBe(row.id);
 		expect(await getBufferedMessages(NARRATOR_ID)[0].textFiles?.[0].text()).toBe("leased");
-		expect(removeBufferedMessage(NARRATOR_ID, row.id)).toBe(true);
+		expect(await removeBufferedMessage(NARRATOR_ID, row.id)).toBe(true);
 		expect(existsSync(saved.path)).toBe(false);
 	});
 
@@ -660,7 +864,7 @@ describe("persistent staging ownership", () => {
 			snapshot.snapshotText,
 		);
 		const staging = getBufferedMessages(NARRATOR_ID)[0]._stagingId as string;
-		removeBufferedMessage(NARRATOR_ID, pushed.id);
+		await removeBufferedMessage(NARRATOR_ID, pushed.id);
 		expect(existsSync(join(HOME, "buffered-files", staging))).toBe(false);
 	});
 
@@ -690,7 +894,7 @@ describe("persistent staging ownership", () => {
 		await updateBufferedMessage(NARRATOR_ID, pushed.id, "edited display");
 		expect(getBufferedMessages(NARRATOR_ID)[0].commandText).toBe(command);
 		expect(getBufferedMessages(NARRATOR_ID)[0].bashCommand).toBe(bash);
-		removeBufferedMessage(NARRATOR_ID, pushed.id);
+		await removeBufferedMessage(NARRATOR_ID, pushed.id);
 	});
 
 	test("legacy rows initialize on removal and preserve saved files on cold read", async () => {
@@ -708,7 +912,7 @@ describe("persistent staging ownership", () => {
 			})
 			.run();
 		expect(await getBufferedMessages(NARRATOR_ID)[0].textFiles?.[0].text()).toBe("legacy");
-		expect(removeBufferedMessage(NARRATOR_ID, id)).toBe(true);
+		expect(await removeBufferedMessage(NARRATOR_ID, id)).toBe(true);
 		expect(existsSync(files[0].path)).toBe(false);
 	});
 
@@ -760,9 +964,9 @@ describe("persistent staging ownership", () => {
 	test("reorder rejects duplicate identities without changing durable order", async () => {
 		const a = await enqueueBufferedMessage(NARRATOR_ID, "a");
 		const b = await enqueueBufferedMessage(NARRATOR_ID, "b");
-		expect(reorderBufferedMessages(NARRATOR_ID, [a.id, a.id])).toBe(false);
+		expect(await reorderBufferedMessages(NARRATOR_ID, [a.id, a.id])).toBe(false);
 		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.id)).toEqual([a.id, b.id]);
-		expect(reorderBufferedMessages(NARRATOR_ID, [b.id, a.id])).toBe(true);
+		expect(await reorderBufferedMessages(NARRATOR_ID, [b.id, a.id])).toBe(true);
 		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.id)).toEqual([b.id, a.id]);
 	});
 });

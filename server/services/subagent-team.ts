@@ -13,7 +13,8 @@ import {
 	listInboxRows,
 	wakeInboxIfEligible,
 } from "./agent-runtime/inbox";
-import type { MailboxClaim, MailboxRow } from "./agent-runtime/mailbox-types";
+import type { MailboxClaim } from "./agent-runtime/mailbox-types";
+import type { RuntimeMailboxRow } from "./agent-runtime/runtime-queue-port";
 import { normalizeWorkspacePath } from "./git-workspace";
 import { subagentFileIdentityKey } from "./subagent-file-changes";
 
@@ -144,11 +145,11 @@ export interface TeamMessage {
 }
 
 /** Deliver a message to a subagent's team inbox, emit event, and broadcast to WebSocket. */
-export function deliverTeamMessage(
+export async function deliverTeamMessage(
 	targetId: string,
 	message: TeamMessage,
 	parentNarratorId?: string,
-): string | undefined {
+): Promise<string | undefined> {
 	// Reserve independently per recipient, even when the caller broadcasts one object.
 	if (message.fromToolUseId) {
 		message = {
@@ -171,7 +172,7 @@ export function deliverTeamMessage(
 	if (!message.delivery) throw new Error("Team message requires exact tool execution receipt");
 	if (message.delivery.recipientNarratorId !== targetId)
 		throw new Error("Mailbox recipient mismatch");
-	const accepted = enqueueInboxAgent(message.delivery, message.text, {
+	const accepted = await enqueueInboxAgent(message.delivery, message.text, {
 		channel: "team",
 		isBroadcast: message.isBroadcast,
 		fromMessageId: message.fromMessageId,
@@ -200,10 +201,10 @@ export function deliverTeamMessage(
 }
 
 /** Inspection never acknowledges delivery; the loop must claim and persist the row. */
-export function drainTeamInbox(subagentId: string): TeamMessage[] {
-	return listInboxRows(subagentId, ["agent_message"]).map(projectTeamMessage);
+export async function drainTeamInbox(subagentId: string): Promise<TeamMessage[]> {
+	return (await listInboxRows(subagentId, ["agent_message"])).map(projectTeamMessage);
 }
-export function projectTeamMessage(row: MailboxRow): TeamMessage {
+export function projectTeamMessage(row: RuntimeMailboxRow): TeamMessage {
 	const delivery = inboxDelivery(row);
 	const metadata = inboxMetadata<InboxAgentMetadata>(row);
 	return {
@@ -220,7 +221,7 @@ export function projectTeamMessage(row: MailboxRow): TeamMessage {
 		isBroadcast: metadata.isBroadcast ?? false,
 	};
 }
-export function hasTeamMessages(subagentId: string): boolean {
+export async function hasTeamMessages(subagentId: string): Promise<boolean> {
 	return hasInboxKind(subagentId, ["agent_message", "task_notice"]);
 }
 /** Terminal cleanup must not discard accepted messages arriving in the finalizer window. */

@@ -5,6 +5,7 @@ import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
+	narratorQuestions,
 	narrators,
 	narratorToolCalls,
 	users,
@@ -152,17 +153,37 @@ const cases = [
 	},
 ] as const;
 
+/**
+ * Rows are inserted directly rather than through `createAsyncQuestion`.
+ *
+ * Subagents can no longer FILE a question (the capability is disabled), but rows filed
+ * before that change still exist and must stay answerable — and answering one is
+ * exactly the path whose principal handling is under test here. Going through the
+ * creation API would only re-assert the new refusal and lose this coverage.
+ */
+async function seedChildQuestion(principal: string | null): Promise<{ record: { id: string } }> {
+	const id = `principal-question-${Math.random().toString(36).slice(2, 10)}`;
+	db.insert(narratorQuestions)
+		.values({
+			id,
+			narratorId: CHILD,
+			toolCallId: "ask-row",
+			toolUseId: "ask-use",
+			questionsJson: [{ question: "q", header: "Choice" }],
+			executionPrincipalJson: { version: 1, userId: principal },
+			status: "open",
+			origin: "agent_async",
+			createdAt: new Date().toISOString(),
+		})
+		.run();
+	return { record: { id } };
+}
+
 describe("late async answers retain their durable execution principal", () => {
 	for (const scenario of cases)
 		test(scenario.name, async () => {
 			activeNarrators.set(PARENT, parentActive(A));
-			const question = await questions.createAsyncQuestion({
-				narratorId: CHILD,
-				toolCallId: "ask-row",
-				toolUseId: "ask-use",
-				questions: [{ question: "q", header: "Choice" }],
-				executionPrincipal: { version: 1, userId: scenario.principal },
-			});
+			const question = await seedChildQuestion(scenario.principal);
 			// The child is truly terminal: no retained ActiveNarrator or execution owner.
 			expect(activeNarrators.has(CHILD)).toBe(false);
 			expect(getExecutionOwner(CHILD)).toBeUndefined();
@@ -239,12 +260,20 @@ describe("late async answers retain their durable execution principal", () => {
 
 	test("legacy unknown execution principal persists C's answer but never auto-starts", async () => {
 		activeNarrators.set(PARENT, parentActive(B));
-		const question = await questions.createAsyncQuestion({
-			narratorId: CHILD,
-			toolCallId: "ask-row",
-			toolUseId: "ask-use",
-			questions: [{ question: "q", header: "Choice" }],
-		});
+		const id = "principal-question-legacy";
+		db.insert(narratorQuestions)
+			.values({
+				id,
+				narratorId: CHILD,
+				toolCallId: "ask-row",
+				toolUseId: "ask-use",
+				questionsJson: [{ question: "q", header: "Choice" }],
+				status: "open",
+				origin: "agent_async",
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+		const question = { record: { id } };
 		const execute = spyOn(executor, "executeAgentLoop");
 		const answer = await questions.answerAsyncQuestion(question.record.id, {
 			answers: { q: "ANSWER_FROM_C" },

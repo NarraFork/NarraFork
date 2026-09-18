@@ -7,10 +7,20 @@ export interface RuntimeRecoveryState {
 	overflowRetries: number;
 	transientRetries: number;
 	interruptionRetries: number;
+	/**
+	 * Quota suspensions already spent on this run.
+	 *
+	 * Its own counter rather than a reuse of `transientRetries`: a quota wait is not
+	 * a failed attempt, and the two have different budgets — every suspension costs
+	 * a full history re-upload, so a reset instant that keeps resolving to
+	 * "shortly" must be bounded here (`MAX_QUOTA_WAITS_PER_RUN`) without consuming
+	 * (or being reset by) the transient-retry budget.
+	 */
+	quotaWaits: number;
 }
 
 export function createRuntimeRecoveryState(): RuntimeRecoveryState {
-	return { overflowRetries: 0, transientRetries: 0, interruptionRetries: 0 };
+	return { overflowRetries: 0, transientRetries: 0, interruptionRetries: 0, quotaWaits: 0 };
 }
 
 export interface RecoveryObservation {

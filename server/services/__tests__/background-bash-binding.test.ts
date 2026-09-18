@@ -284,7 +284,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 		await flush();
 		for (const id of [PARENT, OTHER]) {
 			aliases.clearAliasRegistry(id);
-			drainPendingInjections(id);
+			await drainPendingInjections(id);
 		}
 		cleanDb(sqlite);
 	});
@@ -636,7 +636,7 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 					.get(),
 			).toEqual({ status: "running", attempt: 1 });
 			expect(execCommand).not.toHaveBeenCalled();
-			expect(drainPendingInjections(PARENT)).toEqual([]);
+			expect(await drainPendingInjections(PARENT)).toEqual([]);
 		});
 	});
 }

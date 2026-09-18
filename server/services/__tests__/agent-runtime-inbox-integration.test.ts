@@ -41,6 +41,7 @@ const {
 	updateSubagentBufferedMessage,
 } = await import("../subagent-executor");
 const { enqueueBufferedMessage, clearBufferedMessages } = await import("../narrator-buffer");
+const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { createPublicationOutbox } = await import("../agent-runtime/publication-outbox");
 const time = "2026-09-09T00:00:00.000Z";
 let serial = 0;
@@ -115,9 +116,44 @@ function childMessages() {
 	return db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, "child")).all();
 }
 
+test("idle injection claim stops at an earlier user input", async () => {
+	const store = createMailboxStore(db);
+	const earlier = store.enqueue({
+		kind: "user_input",
+		narratorId: "parent",
+		text: "earlier user input",
+		projectedByteSize: 20,
+	});
+	const later = store.enqueue({
+		kind: "task_notice",
+		noticeKind: "agent",
+		narratorId: "parent",
+		sourceKey: "later-cancelled-notice",
+		text: "cancelled task",
+		projectedByteSize: 16,
+		metadata: {
+			producerKind: "agent",
+			taskId: "cancelled-task",
+			logicalRunId: "cancelled-run",
+			eventKind: "cancelled",
+		},
+	});
+	if (!("delivery" in earlier) || !("delivery" in later)) throw new Error("failed to seed mailbox");
+	const owner = tryClaimExecution("parent", "tool-replay");
+	if (!owner) throw new Error("missing execution owner");
+	try {
+		expect(
+			await inbox.claimInboxHead("parent", (candidate) => candidate.kind !== "user_input"),
+		).toBeUndefined();
+		expect(state(later.delivery.id)?.state).toBe("queued");
+	} finally {
+		owner.release();
+	}
+});
+
 test("parent/team/child producers persist into the same mailbox, read projections do not consume", async () => {
 	const parent = delivery("parent");
-	pushParentInboundMessage("parent", {
+	await pushParentInboundMessage("parent", {
 		delivery: parent,
 		fromId: "sender",
 		fromTitle: "Sender",
@@ -126,10 +162,10 @@ test("parent/team/child producers persist into the same mailbox, read projection
 		text: parent.text,
 		timestamp: time,
 	});
-	expect(drainPendingInjections("parent")).toHaveLength(1);
-	expect(drainPendingInjections("parent")).toHaveLength(1);
+	expect(await drainPendingInjections("parent")).toHaveLength(1);
+	expect(await drainPendingInjections("parent")).toHaveLength(1);
 	const team = delivery();
-	deliverTeamMessage(
+	await deliverTeamMessage(
 		"child",
 		{
 			delivery: team,
@@ -145,27 +181,27 @@ test("parent/team/child producers persist into the same mailbox, read projection
 	const buffered = await pushSubagentBufferedMessage("child", "[sender] next", {
 		delivery: delivery("child", "next"),
 	});
-	expect(drainTeamInbox("child")).toHaveLength(2);
+	expect(await drainTeamInbox("child")).toHaveLength(2);
 	clearTeamInbox("child");
-	expect(inbox.listInboxRows("child")).toHaveLength(2);
+	expect(await inbox.listInboxRows("child")).toHaveLength(2);
 	expect(state(buffered.id)?.kind).toBe("agent_message");
 	expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(3);
 });
 
-test("source receipt is mandatory; exact retry returns original navigation and negative tombstone", () => {
+test("source receipt is mandatory; exact retry returns original navigation and negative tombstone", async () => {
 	const d = delivery();
-	const accepted = inbox.enqueueInboxAgent(d, `[prefix] ${d.text}`);
+	const accepted = await inbox.enqueueInboxAgent(d, `[prefix] ${d.text}`);
 	inbox.runtimeInbox.cancel(accepted.delivery.deliveryId as string, "cancelled");
 	db.delete(narratorToolCalls)
 		.where(eq(narratorToolCalls.id, required(d.senderToolCallBinding).toolCallId))
 		.run();
 	const retry = { ...d, recipientMessageId: "discarded-new-id", text: "x".repeat(300_000) };
-	expect(inbox.enqueueInboxAgent(retry, retry.text).status).toBe("duplicate");
+	expect((await inbox.enqueueInboxAgent(retry, retry.text)).status).toBe("duplicate");
 	expect(retry.recipientMessageId).toBe(d.recipientMessageId);
 	expect(inbox.runtimeInbox.list("child")).toHaveLength(1);
-	expect(() => inbox.enqueueInboxAgent({ ...d, senderToolCallBinding: undefined }, d.text)).toThrow(
-		"receipt",
-	);
+	await expect(
+		inbox.enqueueInboxAgent({ ...d, senderToolCallBinding: undefined }, d.text),
+	).rejects.toThrow("receipt");
 });
 
 test("user barrier and editing are shared; agent messages cannot be edited through user UI", async () => {
@@ -182,20 +218,22 @@ test("user barrier and editing are shared; agent messages cannot be edited throu
 	const d = delivery();
 	const agentInput = await pushSubagentBufferedMessage("child", d.text, { delivery: d });
 	const owner = tryClaimExecution("child", "subagent");
-	expect(inbox.claimInboxHead("child", (row) => row.kind === "agent_message")).toBeUndefined();
+	expect(
+		await inbox.claimInboxHead("child", (row) => row.kind === "agent_message"),
+	).toBeUndefined();
 	expect(await updateSubagentBufferedMessage("child", agentInput.id, "forged user")).toBe(false);
 	expect(getSubagentBufferedMessages("child").map((m) => m.id)).toEqual([user.id]);
 	clearBufferedMessages("child");
 	expect(state(user.id)?.state).toBe("cancelled");
 	expect(state(agentInput.id)?.state).toBe("queued");
-	expect(inbox.claimInboxHead("child", () => true)?.claimEpoch).toBe(owner?.epoch);
+	expect((await inbox.claimInboxHead("child", () => true))?.claimEpoch).toBe(owner?.epoch);
 });
 
 test("parent real delivery commits history/ref/materialization together and keeps unadopted receipt", async () => {
 	const d = delivery("parent");
-	inbox.enqueueInboxAgent(d, d.text, { channel: "parent" });
+	await inbox.enqueueInboxAgent(d, d.text, { channel: "parent" });
 	await inbox.withInboxOwner("parent", async () => {
-		const row = required(inbox.claimInboxHead("parent", () => true));
+		const row = required(await inbox.claimInboxHead("parent", () => true));
 		await deliverPendingInjection("parent", "en", "busy", "onNextTurn", {
 			...projectPendingInjection(row),
 			mailboxClaim: inbox.inboxClaim(row),
@@ -291,7 +329,7 @@ test("completion outbox notices share the ordered consumer and restore only boun
 		resultRef: "message:notice-result",
 	});
 	store.transferNext("child", "agent");
-	const rows = inbox.listInboxRows("child");
+	const rows = await inbox.listInboxRows("child");
 	expect(rows.map((r) => r.kind)).toEqual(["agent_message", "task_notice"]);
 	const notice = projectPendingInjection(required(rows[1]));
 	if (notice.kind !== "bg_agent") throw new Error("wrong notice projection");
@@ -300,14 +338,14 @@ test("completion outbox notices share the ordered consumer and restore only boun
 	await consume();
 	await consume();
 	expect(childMessages()).toHaveLength(2);
-	expect(inbox.listInboxRows("child")).toHaveLength(0);
+	expect(await inbox.listInboxRows("child")).toHaveLength(0);
 	expect(childMessages()[1]?.parentToolUseId).toBe("origin");
 });
 
-test("accepted maximum Send body is stored once and a new clone provenance cannot send", () => {
+test("accepted maximum Send body is stored once and a new clone provenance cannot send", async () => {
 	const text = "x".repeat(256 * 1024);
 	const d = delivery("child", text);
-	const accepted = inbox.enqueueInboxAgent(d, `[sender] ${text}`);
+	const accepted = await inbox.enqueueInboxAgent(d, `[sender] ${text}`);
 	expect(accepted.delivery.text.length).toBe(text.length);
 	expect(accepted.delivery.metadataJson?.length).toBeLessThan(4096);
 	const clone = delivery();
@@ -315,17 +353,17 @@ test("accepted maximum Send body is stored once and a new clone provenance canno
 		.set({ executionOriginToolCallId: d.senderToolCallBinding?.toolCallId })
 		.where(eq(narratorToolCalls.id, required(clone.senderToolCallBinding).toolCallId))
 		.run();
-	expect(() => inbox.enqueueInboxAgent(clone, clone.text)).toThrow("receipt");
+	await expect(inbox.enqueueInboxAgent(clone, clone.text)).rejects.toThrow("receipt");
 });
 
 test("failed agent payloads still fill their quota without preventing user acceptance", async () => {
-	for (let index = 0; index < 50; index++) inbox.enqueueInboxAgent(delivery(), "same words");
+	for (let index = 0; index < 50; index++) await inbox.enqueueInboxAgent(delivery(), "same words");
 	const owner = tryClaimExecution("child", "subagent");
 	for (let attempt = 0; attempt < 3; attempt++) {
-		const row = required(inbox.claimInboxHead("child", () => true));
-		inbox.releaseInboxClaim(row, "preparation failed");
+		const row = required(await inbox.claimInboxHead("child", () => true));
+		await inbox.releaseInboxClaim(row, "preparation failed");
 	}
-	expect(() => inbox.enqueueInboxAgent(delivery(), "same words")).toThrow("full");
+	await expect(inbox.enqueueInboxAgent(delivery(), "same words")).rejects.toThrow("full");
 	expect((await enqueueBufferedMessage("child", "user quota remains available")).ok).toBe(true);
 	owner?.release();
 });
@@ -346,7 +384,7 @@ test("real parent after-tools notice callback is the adoption boundary, includin
 		resultRef: "narrator:sender:adoption-notice",
 	});
 	store.transferNext("parent", "agent");
-	const row = required(inbox.listInboxRows("parent")[0]);
+	const row = required((await inbox.listInboxRows("parent"))[0]);
 	failBroadcast = true;
 	const projected = await drainInjectionsIntoHistory(
 		{
@@ -366,7 +404,7 @@ test("real parent after-tools notice callback is the adoption boundary, includin
 	expect(state(row.id)?.adoptedRevision).toBe(1);
 });
 
-test("immutable bounded notice snapshot ignores later edits and never parses oversized originals", () => {
+test("immutable bounded notice snapshot ignores later edits and never parses oversized originals", async () => {
 	const store = createPublicationOutbox(db);
 	const run = {
 		producerKind: "agent" as const,
@@ -393,7 +431,7 @@ test("immutable bounded notice snapshot ignores later edits and never parses ove
 		resultRef: "message-original:bounded-snapshot",
 	});
 	store.transferNext("parent", "agent");
-	const row = inbox.listInboxRows("parent")[0];
+	const row = (await inbox.listInboxRows("parent"))[0];
 	if (!row) throw new Error("missing notice");
 	let projected = projectPendingInjection(row);
 	if (projected.kind !== "bg_agent") throw new Error("wrong kind");
@@ -410,9 +448,9 @@ test("immutable bounded notice snapshot ignores later edits and never parses ove
 
 test("late claim callback cannot materialize after shared owner replacement", async () => {
 	const d = delivery("parent");
-	inbox.enqueueInboxAgent(d, d.text, { channel: "parent" });
+	await inbox.enqueueInboxAgent(d, d.text, { channel: "parent" });
 	const oldOwner = tryClaimExecution("parent", "primary");
-	const row = inbox.claimInboxHead("parent", () => true);
+	const row = await inbox.claimInboxHead("parent", () => true);
 	if (!row || !oldOwner) throw new Error("missing fixture claim");
 	oldOwner.release();
 	tryClaimExecution("parent", "primary");

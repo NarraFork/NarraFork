@@ -246,7 +246,7 @@ describe("approval feedback for a subagent permission request", () => {
 		// And the loop is asked to stop at its next post-tool boundary so the text is
 		// taken up promptly instead of at the end of an arbitrarily long run. This is
 		// the pair `shouldStop` reads; without the queue entry it returns false.
-		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
+		expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
 
 		// The primary-narrator mechanism is NOT also used: a double delivery would
 		// replay the same feedback into whichever primary loop later owns this id.
@@ -325,7 +325,7 @@ describe("approval feedback for a subagent permission request", () => {
 		await permission;
 
 		expect(getSubagentBufferedMessages(SUBAGENT_ID)).toEqual([]);
-		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
+		expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
 		expect(pendingFeedback.has(SUBAGENT_ID)).toBe(false);
 	});
 });

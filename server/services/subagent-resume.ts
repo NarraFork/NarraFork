@@ -15,6 +15,7 @@ import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { resolveEffectiveModel, resolveProvider } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { classifyRuntimeWriteError, runAtomicWrite } from "./agent-runtime/runtime-write";
 import { narratorService } from "./narrator-service";
 import {
 	withNarratorMutationAdmission,
@@ -323,7 +324,7 @@ async function deliverCompletedResume(
 						throw new ValidationError("Standalone worker creation binding has changed");
 					}
 					if (announcement)
-						db.transaction((tx) =>
+						runAtomicWrite(db, "subagent-resume.commitStandaloneAnnouncement", (tx) =>
 							commitResumedBackgroundTaskAnnouncement(announcement, completionOutput, tx),
 						);
 					active.delivered = true;
@@ -373,6 +374,15 @@ async function deliverCompletedResume(
 			});
 			return;
 		} catch (error) {
+			// Recovery-write error classification (agent-runtime/runtime-write.ts):
+			// a uniqueness conflict (PG 23505 / SQLite UNIQUE) surfaces as the domain
+			// vocabulary and is never replayed — the fact already exists, so retrying
+			// would conflict forever; a recognized non-retryable PostgreSQL verdict
+			// cannot be helped by a replay either. Retryable SQLSTATEs (40001/40P01)
+			// and ordinary SQLite errors keep today's whole-attempt replay.
+			const verdict = classifyRuntimeWriteError(error, "subagent-resume.deliverCompletedResume");
+			if (verdict.kind === "conflict") throw verdict.error;
+			if (verdict.kind === "fatal") throw error;
 			lastError = error;
 			if (attempt < 3) {
 				await new Promise((resolve) => setTimeout(resolve, attempt * 50));
@@ -700,7 +710,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 							const active = activeResumeRuns.get(input.subagentId);
 							if (active?.token === token && active.runId === started.runId) {
 								if (announcement)
-									db.transaction((tx) =>
+									runAtomicWrite(db, "subagent-resume.commitSkippedAnnouncement", (tx) =>
 										commitResumedBackgroundTaskAnnouncement(announcement, output, tx),
 									);
 								activeResumeRuns.delete(input.subagentId);

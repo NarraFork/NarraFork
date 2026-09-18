@@ -91,7 +91,11 @@ import {
 } from "./snapshot-revert";
 // Pure in-memory state module (no imports of its own), so importing it here
 // cannot widen this file's already-delicate import cycle with narrator-service.
-import { getFileChangesBySubagent, type SubagentFileChanges } from "./subagent-file-changes";
+import {
+	getFileChangesBySubagent,
+	type SubagentExecutionBoundary,
+	type SubagentFileChanges,
+} from "./subagent-file-changes";
 import { isTakenOverForDisplay, listDisplayTakenOverSubagents } from "./subagent-takeover";
 import { toolEditPreviewColumns } from "./tool-edit-preview";
 
@@ -2114,6 +2118,7 @@ interface SubagentActivityOwner {
 	subagentNarratorId: string;
 	model: string | null;
 	reasoningEffort: string | null;
+	executionBoundary: SubagentExecutionBoundary;
 }
 
 /**
@@ -2257,9 +2262,14 @@ async function buildSubagentActivities(
 	}
 	const narratorIds = [...new Set(owners.map((owner) => owner.subagentNarratorId))];
 	const toolCallsByNarrator = await loadLatestSubagentToolCalls(narratorIds);
+	const executionBoundariesBySubagent = new Map(
+		owners.map((owner) => [owner.subagentNarratorId, owner.executionBoundary] as const),
+	);
 	// One aggregate for EVERY card on the page. A per-card query here would turn
 	// opening a session with a dozen Agent calls into a query storm on a list path.
-	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds);
+	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, {
+		executionBoundariesBySubagent,
+	});
 	for (const owner of owners) {
 		const effectiveReasoningEffort =
 			owner.reasoningEffort ??
@@ -2316,6 +2326,8 @@ function resolveAggregateScopeTx(tx: MessageTx, narratorId: string, toolUseIds: 
 					.select({
 						...historyToolMetadataColumns,
 						executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
+						executionAttempt: narratorToolCalls.executionAttempt,
+						executionSegmentId: narratorToolCalls.executionSegmentId,
 						callerSeq: sql<
 							number | null
 						>`(SELECT aggregate_ref.seq FROM narrator_message_refs aggregate_ref
@@ -2488,11 +2500,19 @@ function resolveAggregateScopeTx(tx: MessageTx, narratorId: string, toolUseIds: 
 		const parentToolUseId = row.originToolCallId && parentByOrigin.get(row.originToolCallId);
 		if (!parentToolUseId || !row.parentNarratorId || !isSubagentVariant(row.variant)) continue;
 		const group = ownerGroups.get(parentToolUseId) ?? new Map<string, SubagentActivityOwner>();
+		const parent = parents.get(parentToolUseId);
+		if (!parent) continue;
 		group.set(row.id, {
 			parentToolUseId,
 			subagentNarratorId: row.id,
 			model: row.model,
 			reasoningEffort: row.reasoningEffort,
+			executionBoundary: {
+				sourceToolCallId: parent.id,
+				executionAttempt: parent.executionAttempt ?? null,
+				executionIdentityVersion: parent.executionIdentityVersion ?? null,
+				executionSegmentId: parent.executionSegmentId ?? null,
+			},
 		});
 		ownerGroups.set(parentToolUseId, group);
 	}

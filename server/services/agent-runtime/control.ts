@@ -109,7 +109,7 @@ export async function applyForegroundControl(
 		// never observe a gap and start a second owner.
 		// Team reports and notices do not authorize releasing user control.
 		const queued =
-			peekInbox(id)?.kind === "user_input"
+			(await peekInbox(id))?.kind === "user_input"
 				? await consumeQueued().catch((error) => {
 						logger.warn("Failed to materialize user input for suspended runtime", {
 							narratorId: id,

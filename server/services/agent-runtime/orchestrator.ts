@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { KIMI_QUOTA_EXHAUSTED } from "@shared/agent-protocol/quota-exhausted";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import { formatOriginLabel } from "@shared/message-origin";
@@ -28,6 +29,7 @@ import {
 import { withDbRetry } from "../../lib/db-resilience";
 import { resolveInjectedDevices } from "../../lib/device-injection-trait";
 import { resolveFastModeForUser } from "../../lib/fast-mode";
+import { MAX_QUOTA_WAITS_PER_RUN, waitForKimiQuotaReset } from "../../lib/kimi-quota-wait";
 import { logger } from "../../lib/logger";
 import {
 	formatSubagentModelRestrictionDescription,
@@ -68,16 +70,22 @@ import {
 } from "../../lib/uploads";
 import { broadcastToNarrator } from "../../websocket/narrator-ws";
 import { consumeAgentMessageHistory } from "../agent-message-delivery";
-import { claimInboxHead, hasInboxKind, releaseInboxClaim } from "../agent-runtime/inbox";
+import {
+	claimInboxHead,
+	hasInboxKind,
+	persistClaimedUserInput,
+	releaseInboxClaim,
+} from "../agent-runtime/inbox";
 import type { ExecutionOwner } from "../agent-runtime/ownership";
+import { getRuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
 import { getAgentFileReferenceContext } from "../file-reference-context";
 import { gitService } from "../git-service";
 import { getStatusSummaryCached, invalidateStatus } from "../git-status-cache";
 import { knowledgeInjection } from "../knowledge-injection";
-import { knowledgeService } from "../knowledge-service";
+import { knowledgeInjectionReads, knowledgeService } from "../knowledge-service";
 import {
-	cleanupBufferedTextFiles,
-	getBufferedMessages,
+	cleanupBufferedTextFilesAsync,
+	getBufferedMessagesAsync,
 	projectMailboxUserMessage,
 	restoreBufferedMessage,
 	toBufferSummary,
@@ -171,7 +179,7 @@ import { reviewService } from "../review-service";
 import {
 	consumeNextBufferedSubagentMessage,
 	readSubagentSpecContinuationState,
-	shouldStopSubagentForBufferedMessage,
+	shouldStopSubagentForBufferedMessageSync,
 } from "../subagent-executor";
 import {
 	getConclusionWatcher,
@@ -253,6 +261,12 @@ export async function executeRuntimeRetry(
 	return shouldRetry
 		? { kind: "replay", keptPartial, resetUpstreamSession: true }
 		: { kind: "failed", error: transition.error };
+}
+
+function hasPostgresRuntime(): boolean {
+	// The selector is fail-closed: explicit PostgreSQL without a bound queue throws
+	// instead of allowing any SQLite proxy query below to run.
+	return getRuntimeQueuePort() !== undefined;
 }
 
 export async function runAgentLoopUnlocked(
@@ -438,11 +452,17 @@ export async function runAgentLoopUnlocked(
 			// context, so clear the set to allow re-injecting relevant entries into the new cycle.
 			const cycleSeq = baselineCompactSeq ?? -1;
 			if (cycleSeq !== knowledgeCycleState.seq) {
-				knowledgeCycleState.seq = cycleSeq;
+				// Read first: a rejected PG read must leave the old cycle intact so the
+				// same compact boundary is retried on the next pass.
+				const persistedIds = await knowledgeInjectionReads.listInjectedEntryIds(
+					narratorId,
+					cycleSeq,
+				);
 				knowledgeInjectedIds.clear();
-				for (const id of knowledgeService.listInjectedEntryIds(narratorId, cycleSeq)) {
+				for (const id of persistedIds) {
 					knowledgeInjectedIds.add(id);
 				}
+				knowledgeCycleState.seq = cycleSeq;
 			}
 			// Always use getModelHistorySinceLastCompact: if no compact marker exists it
 			// returns all messages; after a compact it only returns post-compact messages
@@ -687,6 +707,14 @@ export async function runAgentLoopUnlocked(
 
 			const hooks: EventHooks = {
 				onTitleCheck: async (_savedId) => {
+					if (hasPostgresRuntime()) {
+						// There is no backend-neutral title read port yet. Do not let a normal
+						// PostgreSQL turn fall through to the SQLite Drizzle proxy.
+						logger.warn("Skipping title check: PostgreSQL title read port is unavailable", {
+							narratorId,
+						});
+						return { titleUpdate: false };
+					}
 					const n = await db.query.narrators.findFirst({
 						where: eq(narrators.id, narratorId),
 						columns: { title: true },
@@ -1275,7 +1303,7 @@ export async function runAgentLoopUnlocked(
 					);
 				},
 				shouldStop: () => {
-					if (profile.kind === "subagent" && shouldStopSubagentForBufferedMessage(narratorId)) {
+					if (profile.kind === "subagent" && shouldStopSubagentForBufferedMessageSync(narratorId)) {
 						active._bufferSoftStopTaken = true;
 						return true;
 					}
@@ -1397,20 +1425,28 @@ export async function runAgentLoopUnlocked(
 			}
 
 			/**
-			 * Suspend this turn until a NUG model becomes available again, then
-			 * report whether the loop may continue.
+			 * Suspend this turn until the blocking condition clears, then report
+			 * whether the loop may continue.
 			 *
-			 * Shared by the two entry points that need identical behaviour: the
-			 * pre-flight check below (the catalog already recorded an outage) and the
-			 * post-request `modelUnavailable` branch (the gateway just refused). Both
-			 * park on the shared availability poller, which only fetches the
-			 * lightweight `/v1/models` list rather than replaying the conversation.
+			 * Shared by the entry points that need identical behaviour: the pre-flight
+			 * check below (the NUG catalog already recorded an outage) and the
+			 * post-request `modelUnavailable` branch (the provider just refused). Both
+			 * park on a condition they cannot influence, and both must NOT replay the
+			 * request while waiting — a replay re-uploads the whole history, which is
+			 * exactly why the wait exists.
 			 *
-			 * @returns true when the model recovered and the caller should `continue`
+			 * The two wait kinds differ only in how recovery is observed:
+			 *  - `credentials` (NUG): the credential pool comes back at an unknown time,
+			 *    so the shared availability poller checks the lightweight `/v1/models`
+			 *    list until the model reports available.
+			 *  - `quota` (Kimi): the reset instant is published (`resumeAt`), so this
+			 *    sleeps to it. No polling and no request during the wait.
+			 *
+			 * @returns true when recovery happened and the caller should `continue`
 			 * to rebuild history from the DB; false when the caller must `break`
 			 * (interrupted, or the narrator went away while waiting).
 			 */
-			const suspendUntilNugModelAvailable = async (
+			const suspendUntilModelRecovered = async (
 				mu: Omit<NonNullable<ExecuteLoopResult["modelUnavailable"]>, "provider">,
 			): Promise<boolean> => {
 				// Finalize or clean up the partial message from the failed turn.
@@ -1423,9 +1459,17 @@ export async function runAgentLoopUnlocked(
 					keptPartial = await finalizeOrCleanupPartialMessage(partialId, narratorId);
 				}
 
+				// The reset clock is what this wait is about, so the status carries the
+				// instant the user is waiting for as well as the tag that says why.
+				const quotaResumeAt =
+					mu.waitKind === "quota" && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
+				const waitingSubstatus = quotaResumeAt ? "quota_exhausted" : "model_unavailable";
 				await narratorService.updateStatus(narratorId, "waiting", {
-					substatus: ["model_unavailable"],
-					errorMessage: JSON.stringify({ type: "model_unavailable", ...mu }),
+					substatus: [waitingSubstatus],
+					errorMessage: JSON.stringify({
+						type: quotaResumeAt ? "quota_exhausted" : "model_unavailable",
+						...mu,
+					}),
 				});
 				broadcastToNarrator(narratorId, {
 					type: "model_unavailable_waiting",
@@ -1436,6 +1480,8 @@ export async function runAgentLoopUnlocked(
 					providerPrefix: mu.providerPrefix,
 					nugModelId: mu.nugModelId,
 					diagnostics: mu.diagnostics,
+					waitKind: mu.waitKind,
+					resumeAt: quotaResumeAt,
 				});
 				if (subagentPlacement)
 					broadcastToNarrator(subagentPlacement.parentNarratorId, {
@@ -1446,6 +1492,8 @@ export async function runAgentLoopUnlocked(
 						model: mu.model,
 						nugModelId: mu.nugModelId,
 						diagnostics: mu.diagnostics,
+						waitKind: mu.waitKind,
+						resumeAt: quotaResumeAt,
 					});
 
 				const outcome = await waitForModelAvailabilityOrChange({
@@ -1458,13 +1506,15 @@ export async function runAgentLoopUnlocked(
 							resolveEffectiveModel(turnModelRef, active.provider) !== turnEffectiveModel),
 					subscribe: subscribeSettingsChanges,
 					wait: (signal) =>
-						mu.providerId && mu.nugModelId
-							? nugAvailabilityPoller.waitForModelAvailable({
-									providerId: mu.providerId,
-									nugModelId: mu.nugModelId,
-									signal,
-								})
-							: Promise.resolve("aborted"),
+						quotaResumeAt
+							? waitForKimiQuotaReset(quotaResumeAt, signal)
+							: mu.providerId && mu.nugModelId
+								? nugAvailabilityPoller.waitForModelAvailable({
+										providerId: mu.providerId,
+										nugModelId: mu.nugModelId,
+										signal,
+									})
+								: Promise.resolve("aborted"),
 				});
 
 				if (!active.alive || !owner.isCurrent()) return false;
@@ -1475,7 +1525,7 @@ export async function runAgentLoopUnlocked(
 				}
 				if (!active.alive) return false;
 
-				// Model recovered — resume by replaying the same turn. Rebuilt history
+				// Recovery reached — resume by replaying the same turn. Rebuilt history
 				// from the DB happens at the top of the loop (as with transient retry),
 				// so this is the only point where a full request is issued again.
 				broadcastToNarrator(narratorId, {
@@ -1483,6 +1533,7 @@ export async function runAgentLoopUnlocked(
 					narratorId,
 					model: mu.model,
 					nugModelId: mu.nugModelId,
+					waitKind: mu.waitKind,
 				});
 				if (subagentPlacement)
 					broadcastToNarrator(subagentPlacement.parentNarratorId, {
@@ -1491,6 +1542,7 @@ export async function runAgentLoopUnlocked(
 						subagentNarratorId: narratorId,
 						model: mu.model,
 						nugModelId: mu.nugModelId,
+						waitKind: mu.waitKind,
 					});
 				await narratorService.updateStatus(narratorId, "working");
 				if (keptPartial) {
@@ -1517,7 +1569,7 @@ export async function runAgentLoopUnlocked(
 			{
 				const known = resolveKnownUnavailableNugModel(resolved.model, resolved.provider);
 				if (known && active.alive) {
-					const resumed = await suspendUntilNugModelAvailable({
+					const resumed = await suspendUntilModelRecovered({
 						message: `Model ${known.model} is recorded as temporarily unavailable; waiting for it to recover before sending the request.`,
 						model: known.model,
 						providerId: known.providerId,
@@ -1659,16 +1711,80 @@ export async function runAgentLoopUnlocked(
 				break;
 			}
 
-			// --- Model temporarily unavailable: suspend and wait for recovery ---
-			// The NUG model's whole credential pool is disabled (recoverable
-			// exhaustion). Instead of retrying the full request (re-uploading the
-			// entire history) over and over, suspend the narrator and register with
-			// the shared instance-level availability poller, which only fetches the
-			// lightweight `/v1/models` list. When the model recovers, resume by
+			// --- Blocked, but recoverable: suspend and wait for recovery ---
+			// Either a NUG model whose credential pool is disabled, or an exhausted
+			// Kimi coding-plan allowance. Instead of replaying the full request
+			// (re-uploading the entire history) over and over, suspend the narrator and
+			// wait on whatever tells us recovery happened — the availability poller for
+			// credentials, the published reset instant for quota. Then resume by
 			// rebuilding history from the DB and issuing one fresh request.
 			// [continuation-source: model-unavailable]
 			if (recovery.kind === "model-unavailable" && result.modelUnavailable && active.alive) {
 				const mu = result.modelUnavailable;
+				const isQuota = mu.waitKind === "quota";
+				const quotaResetAt =
+					isQuota && typeof mu.quotaResetAt === "number" ? mu.quotaResetAt : undefined;
+				const quotaResumeAt = isQuota && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
+				/**
+				 * Why this quota wall is being reported instead of parked on.
+				 *
+				 * Two causes, one exit. `reset-beyond-budget` is the loop's verdict (the
+				 * reset is published but further out than the wait budget allows).
+				 * `wait-budget-spent` is this run's (every suspension costs a full history
+				 * re-upload, so a reset that keeps resolving to "soon" must not become a
+				 * replay loop).
+				 *
+				 * Both produce the same user-facing outcome, so they share a branch and
+				 * differ only by the reason code — a divergence here would mean one of them
+				 * silently loses the reset instant that makes the error actionable.
+				 */
+				const quotaRefusalReason = !isQuota
+					? undefined
+					: quotaResumeAt === undefined
+						? "reset-beyond-budget"
+						: runState.recovery.quotaWaits >= MAX_QUOTA_WAITS_PER_RUN
+							? "wait-budget-spent"
+							: undefined;
+				if (quotaRefusalReason) {
+					// Serialized as a payload rather than left as the raw upstream text, on
+					// the `payment_required` pattern: `errorMessage` is the only failure
+					// carrier that survives to the next page load, so the reset instant has
+					// to ride in it for the panel to explain the wall in the user's language
+					// after a refresh. `reason` lets the two non-waiting causes stay
+					// distinguishable in logs without changing what the user is told.
+					await narratorService.updateStatus(narratorId, "idle", {
+						substatus: ["error"],
+						errorCode: KIMI_QUOTA_EXHAUSTED,
+						errorMessage: JSON.stringify({
+							type: KIMI_QUOTA_EXHAUSTED,
+							reason: quotaRefusalReason,
+							model: mu.model,
+							provider: mu.provider,
+							providerPrefix: mu.providerPrefix,
+							quotaResetAt,
+						}),
+						diagnostics: mu.diagnostics,
+					});
+					active.events.emit("event", {
+						type: "error",
+						data: { message: mu.message, diagnostics: mu.diagnostics },
+					});
+					// Deliberately NOT broadcasting `model_unavailable_recovered`: it tells
+					// the client the block cleared and it is resuming, which is false here and
+					// would flash a green "quota restored" notice over the error. The client
+					// drops its waiting notice from the status change this write produces.
+					logger.warn("Kimi quota wall reported instead of waited on", {
+						narratorId,
+						providerId: mu.providerId,
+						model: mu.model,
+						reason: quotaRefusalReason,
+						quotaResetAt,
+						quotaWaits: runState.recovery.quotaWaits,
+					});
+					runState.finalText = mu.message;
+					runState.hadError = true;
+					break;
+				}
 				// The gateway just refused this model, which is first-hand proof it
 				// cannot serve right now. Record that in the model cache before
 				// waiting: the poller decides recovery from the cache, and a
@@ -1677,7 +1793,8 @@ export async function runAgentLoopUnlocked(
 				if (mu.providerId && mu.nugModelId) {
 					markNugCachedModelUnavailable(mu.providerId, mu.nugModelId);
 				}
-				const resumed = await suspendUntilNugModelAvailable(mu);
+				if (quotaResumeAt) runState.recovery.quotaWaits += 1;
+				const resumed = await suspendUntilModelRecovered(mu);
 				if (!resumed) break;
 				runState.recovery.transientRetries = 0;
 				continue;
@@ -2159,7 +2276,7 @@ export async function runAgentLoopUnlocked(
 				!runState.hadError &&
 				!isNarratorRevertAdmissionBlocked(narratorId)
 			) {
-				const bufferedRow = claimInboxHead(
+				const bufferedRow = await claimInboxHead(
 					narratorId,
 					(candidate) => candidate.kind === "user_input",
 				);
@@ -2167,10 +2284,12 @@ export async function runAgentLoopUnlocked(
 				try {
 					buffered = bufferedRow ? projectMailboxUserMessage(bufferedRow) : undefined;
 				} catch (error) {
-					if (bufferedRow) releaseInboxClaim(bufferedRow, error);
+					if (bufferedRow) await releaseInboxClaim(bufferedRow, error);
 					throw error;
 				}
 				if (buffered) {
+					const bufferedClaim = buffered._mailboxClaim;
+					if (!bufferedClaim) throw new Error("Claimed buffered input missing mailbox claim");
 					active._bufferSoftStopTaken = false;
 					// Keep accepted snapshots and uploaded files recoverable until the
 					// ordinary user message commits, just like the interrupt drain path.
@@ -2179,19 +2298,19 @@ export async function runAgentLoopUnlocked(
 						parseQueuedGoalCommand(buffered.text, buffered.commandText);
 					pendingBufferedDelivery = buffered;
 					if (terminalCommand && parseQueuedNewCommand(buffered.text, buffered.commandText)) {
-						await messageWriters.persistUserMessage(
+						await persistClaimedUserInput({
+							claim: bufferedClaim,
+							reservedMessageId: bufferedRow?.recipientMessageId,
 							narratorId,
-							buffered.text,
-							[{ type: "text", text: buffered.text }],
-							buffered.commandText,
-							buffered.createdBy,
-							undefined,
-							{ mailboxClaim: buffered._mailboxClaim },
-						);
+							text: buffered.text,
+							contentBlocks: [{ type: "text", text: buffered.text }],
+							commandText: buffered.commandText,
+							createdBy: buffered.createdBy,
+						});
 						pendingBufferedDelivery = undefined;
 					}
 					// Broadcast which message was consumed + remaining queue snapshot
-					const remaining = toBufferSummary(getBufferedMessages(narratorId));
+					const remaining = toBufferSummary(await getBufferedMessagesAsync(narratorId));
 					broadcastToNarrator(narratorId, {
 						type: "buffer_consumed",
 						narratorId,
@@ -2212,7 +2331,7 @@ export async function runAgentLoopUnlocked(
 							messageId: buffered.id,
 							newNarratorId,
 						});
-						if ((getBufferedMessages(narratorId)?.length ?? 0) > 0) {
+						if ((await getBufferedMessagesAsync(narratorId)).length > 0) {
 							runState.wasInterrupted = true;
 						} else {
 							await narratorService.compareAndSetStatus(
@@ -2245,7 +2364,7 @@ export async function runAgentLoopUnlocked(
 							runState.input.images = undefined;
 							continue;
 						}
-						if ((getBufferedMessages(narratorId)?.length ?? 0) > 0) {
+						if ((await getBufferedMessagesAsync(narratorId)).length > 0) {
 							runState.wasInterrupted = true;
 						} else {
 							await narratorService.compareAndSetStatus(
@@ -2301,17 +2420,17 @@ export async function runAgentLoopUnlocked(
 						type: "text",
 						text: buffered.text,
 					});
-					const userMsg = await messageWriters.persistUserMessage(
+					const userMsg = await persistClaimedUserInput({
+						claim: bufferedClaim,
+						reservedMessageId: bufferedRow?.recipientMessageId,
 						narratorId,
-						effectiveBufferedText,
-						persistBlocks,
-						buffered.commandText,
-						buffered.createdBy,
-						undefined,
-						{ mailboxClaim: buffered._mailboxClaim },
-					);
+						text: effectiveBufferedText,
+						contentBlocks: persistBlocks,
+						commandText: buffered.commandText,
+						createdBy: buffered.createdBy,
+					});
 					pendingBufferedDelivery = undefined;
-					cleanupBufferedTextFiles(buffered._stagingId ?? buffered.id);
+					await cleanupBufferedTextFilesAsync(buffered._stagingId ?? buffered.id);
 					broadcastToNarrator(narratorId, {
 						type: "user_message",
 						narratorId,
@@ -2439,7 +2558,7 @@ export async function runAgentLoopUnlocked(
 	} catch (err) {
 		if (pendingBufferedDelivery) {
 			try {
-				restoreBufferedMessage(narratorId, pendingBufferedDelivery);
+				await restoreBufferedMessage(narratorId, pendingBufferedDelivery);
 			} catch (restoreError) {
 				logger.error("Failed to restore undelivered buffered message", {
 					narratorId,
@@ -2507,12 +2626,8 @@ export async function runAgentLoopUnlocked(
 			if (saParentNarratorId === undefined) {
 				await (async () => {
 					try {
-						const narr = await db.query.narrators.findFirst({
-							where: eq(narrators.id, narratorId),
-							columns: { variant: true },
-						});
-						if (narr && isSubagentVariant(narr.variant)) return;
-
+						// This branch is only entered for primary profiles, so querying the
+						// narrator variant is redundant and would be SQLite-only on PG.
 						const stopReason = runState.hadError
 							? "error"
 							: runState.wasInterrupted
@@ -2550,10 +2665,22 @@ export async function runAgentLoopUnlocked(
 			// there's a conclusion watcher registered for post-completion updates.
 			let pendingStopHandoff = false;
 			try {
-				const narr = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { variant: true, parentNarratorId: true },
-				});
+				// This finalizer can run with a primary runtime profile while the persisted
+				// narrator is a subagent. Keep the SQLite read only behind an explicit PG gate.
+				const pgRuntime = hasPostgresRuntime();
+				if (pgRuntime)
+					logger.warn(
+						"Skipping persisted subagent handoff: PostgreSQL narrator port is unavailable",
+						{
+							narratorId,
+						},
+					);
+				const narr = pgRuntime
+					? undefined
+					: await db.query.narrators.findFirst({
+							where: eq(narrators.id, narratorId),
+							columns: { variant: true, parentNarratorId: true },
+						});
 				if (narr && isSubagentVariant(narr.variant)) {
 					const lastFinalText = await getSubagentFinalText(narratorId);
 
@@ -2657,33 +2784,40 @@ export async function runAgentLoopUnlocked(
 			}
 
 			// Restore model after temporary override (slash command with modelOverride.mode="temporary")
-			// Read from DB so this survives server restarts.
-			try {
-				const fresh = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { pendingModelRestore: true },
+			// Read from DB so this survives server restarts. There is no backend-neutral
+			// pending-restore port yet; PG must skip this SQLite-only fallback explicitly.
+			if (hasPostgresRuntime()) {
+				logger.warn("Skipping pending model restore: PostgreSQL narrator port is unavailable", {
+					narratorId,
 				});
-				if (fresh?.pendingModelRestore) {
-					const restoreModel = fresh.pendingModelRestore;
-					await db
-						.update(narrators)
-						.set({
+			} else {
+				try {
+					const fresh = await db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { pendingModelRestore: true },
+					});
+					if (fresh?.pendingModelRestore) {
+						const restoreModel = fresh.pendingModelRestore;
+						await db
+							.update(narrators)
+							.set({
+								model: restoreModel,
+								pendingModelRestore: null,
+								updatedAt: new Date().toISOString(),
+							})
+							.where(eq(narrators.id, narratorId));
+						broadcastToNarrator(narratorId, {
+							type: "model_changed",
+							narratorId,
 							model: restoreModel,
-							pendingModelRestore: null,
-							updatedAt: new Date().toISOString(),
-						})
-						.where(eq(narrators.id, narratorId));
-					broadcastToNarrator(narratorId, {
-						type: "model_changed",
+						});
+					}
+				} catch (err) {
+					logger.error("Failed to restore model after temporary override", {
 						narratorId,
-						model: restoreModel,
+						error: String(err),
 					});
 				}
-			} catch (err) {
-				logger.error("Failed to restore model after temporary override", {
-					narratorId,
-					error: String(err),
-				});
 			}
 
 			if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
@@ -2747,13 +2881,13 @@ export async function runAgentLoopUnlocked(
 			// DB rows are kept in sync:
 			// - error/interrupted-with-queue: rows stay (recovered on next startup or consumed on retry)
 			// - normal: rows are deleted (queue fully consumed)
-			const hasBuffered = (getBufferedMessages(narratorId)?.length ?? 0) > 0;
+			const hasBuffered = (await getBufferedMessagesAsync(narratorId)).length > 0;
 			if (runState.hadError || (runState.wasInterrupted && hasBuffered)) {
 				// Only broadcast buffer_preserved on error — when interrupted the
 				// auto-resume below will immediately consume the first message, so
 				// showing a "preserved" notification would be misleading.
 				if (runState.hadError) {
-					const preserved = getBufferedMessages(narratorId);
+					const preserved = await getBufferedMessagesAsync(narratorId);
 					if (preserved?.length) {
 						broadcastToNarrator(narratorId, {
 							type: "buffer_preserved",
@@ -2766,7 +2900,7 @@ export async function runAgentLoopUnlocked(
 			// No terminal queue clear: messages accepted after the last read belong to the next run.
 			if (
 				!runState.hadError &&
-				hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"])
+				(await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"]))
 			)
 				active._resumeBufferedAfterLoop = true;
 
@@ -2783,23 +2917,32 @@ export async function runAgentLoopUnlocked(
 			for (const staleTag of ["reflecting", "reasoning"] as const) {
 				if (active._substatus.has(staleTag)) active._substatus.delete(staleTag);
 			}
-			try {
-				const leftover = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { substatus: true },
-				});
-				const tags = parseSubstatus(leftover?.substatus);
-				if (tags.includes("reflecting") || tags.includes("reasoning")) {
-					await narratorService.updateSubstatus(
+			if (hasPostgresRuntime()) {
+				logger.warn(
+					"Skipping persisted transient substatus cleanup: PostgreSQL narrator port is unavailable",
+					{
 						narratorId,
-						tags.filter((t) => t !== "reflecting" && t !== "reasoning"),
-					);
+					},
+				);
+			} else {
+				try {
+					const leftover = await db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { substatus: true },
+					});
+					const tags = parseSubstatus(leftover?.substatus);
+					if (tags.includes("reflecting") || tags.includes("reasoning")) {
+						await narratorService.updateSubstatus(
+							narratorId,
+							tags.filter((t) => t !== "reflecting" && t !== "reasoning"),
+						);
+					}
+				} catch (err) {
+					logger.warn("Failed to clear stale transient substatus after narrator loop", {
+						narratorId,
+						error: err instanceof Error ? err.message : String(err),
+					});
 				}
-			} catch (err) {
-				logger.warn("Failed to clear stale transient substatus after narrator loop", {
-					narratorId,
-					error: err instanceof Error ? err.message : String(err),
-				});
 			}
 
 			if (shouldUpdateTitle) {

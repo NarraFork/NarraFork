@@ -7,6 +7,12 @@ import {
 } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { MAILBOX_LIMITS as L } from "./limits";
+// The dialect-neutral kernel lives in mailbox-shared.ts so the PostgreSQL adapter never
+// runtime-imports this SQLite module. The re-export below keeps existing call sites stable.
+import { boundedError, boundedJson, mailboxDedupeKey, pointer } from "./mailbox-shared";
+
+export { boundedError, boundedJson, mailboxDedupeKey };
+
 import type {
 	EligibleMailboxHead,
 	EnqueueResult,
@@ -21,6 +27,7 @@ import type {
 	RuntimeStoreDb,
 	RuntimeTx,
 } from "./mailbox-types";
+import { runAtomicWrite } from "./runtime-write";
 
 const pendingStates = ["queued", "claimed", "failed"] as const;
 const now = () => new Date().toISOString();
@@ -37,42 +44,20 @@ const releasedPayload = {
 	byteSize: 0,
 	projectedByteSize: 0,
 } as const;
-export function boundedJson(value: unknown, limit: number): string {
-	const json = JSON.stringify(value);
-	if (Buffer.byteLength(json) > limit) throw new Error(`Metadata exceeds ${limit} bytes`);
-	return json;
-}
-export function boundedError(error: string): string {
-	return Buffer.from(error.slice(0, L.errorBytes)).subarray(0, L.errorBytes).toString("utf8");
-}
-function pointer(value: string): string {
-	if (typeof value !== "string" || !value || Buffer.byteLength(value) > 512)
-		throw new Error("Invalid identity pointer");
-	return value;
-}
-export function mailboxDedupeKey(input: MailboxInput): string {
-	pointer(input.narratorId);
-	if (input.kind === "agent_message") {
-		if (input.recipientMessageId !== undefined) pointer(input.recipientMessageId);
-		if (!Number.isSafeInteger(input.sourceAttempt) || input.sourceAttempt < 1)
-			throw new Error("Exact execution attempt required");
-		return JSON.stringify([
-			"send",
-			pointer(input.sourceNarratorId),
-			pointer(input.sourceToolCallId),
-			input.sourceAttempt,
-			pointer(input.sourceKey),
-			pointer(input.narratorId),
-		]);
-	}
-	if (input.kind === "task_notice") {
-		if (input.noticeKind !== "agent" && input.noticeKind !== "bash")
-			throw new Error("Invalid notice producer identity");
-		return pointer(input.sourceKey);
-	}
-	if (input.kind !== "user_input") throw new Error("Invalid mailbox input kind");
-	return JSON.stringify(["user", pointer(input.requestKey ?? generateId())]);
-}
+/**
+ * Claim the next arrival sequence for a narrator's mailbox.
+ *
+ * Single-statement counter claim — `UPDATE … SET inbox_sequence = inbox_sequence + 1
+ * … RETURNING` — which is also the per-narrator serialization point: on PostgreSQL
+ * the narrators row lock makes concurrent claimants queue on this statement, so two
+ * connections can never observe the same value (verified against a real PostgreSQL
+ * 17 in tests/server/services/agent-runtime/pg-runtime-queue.test.ts). The claimed
+ * value doubles as the row lock for the whole enqueue section that follows.
+ *
+ * PG contract, locked by that suite: gapless unique allocation per narrator under
+ * concurrency; a rolled-back claim is re-issued (the bump rolls back with the
+ * transaction); a claim against a missing narrator fails loudly (no row returned).
+ */
 export function allocateArrivalSequence(tx: RuntimeStoreDb, narratorId: string): number {
 	const row = tx
 		.update(narrators)
@@ -192,7 +177,7 @@ export function createMailboxStore(db: RuntimeDb) {
 		return tx.select().from(mailbox).where(eq(mailbox.deliveryId, deliveryId)).get();
 	}
 	function enqueue(input: MailboxInput, tx?: RuntimeTx): EnqueueResult {
-		if (!tx) return db.transaction((inner) => enqueue(input, inner));
+		if (!tx) return runAtomicWrite(db, "mailbox.enqueue", (inner) => enqueue(input, inner));
 		const dedupeKey = mailboxDedupeKey(input);
 		const existing = tx
 			.select()
@@ -348,7 +333,7 @@ export function createMailboxStore(db: RuntimeDb) {
 	) {
 		if (!Number.isSafeInteger(revision) || revision < 1 || !Number.isFinite(Date.parse(at)))
 			return false;
-		return db.transaction((tx) => {
+		return runAtomicWrite(db, "mailbox.ackCurrentRevision", (tx) => {
 			const row = getByDelivery(deliveryId, tx);
 			if (
 				!row ||
@@ -449,7 +434,7 @@ export function createMailboxStore(db: RuntimeDb) {
 	): MailboxRow | undefined {
 		pointer(owner.token);
 		pointer(owner.epoch);
-		return db.transaction((tx) => {
+		return runAtomicWrite(db, "mailbox.claimEligibleHead", (tx) => {
 			if (!initializeLegacyMailbox(tx, narratorId)) return undefined;
 			const head = eligibleHeads(tx, narratorId, 1)[0];
 			if (!head || accepts(head) !== true) return undefined;
@@ -489,7 +474,7 @@ export function createMailboxStore(db: RuntimeDb) {
 		if (!/^[A-Za-z0-9_-]+$/.test(currentProcessId)) throw new Error("Invalid process identity");
 		const prefix = `process:${currentProcessId}:`;
 		const limit = Math.min(Math.max(options.limit ?? L.pageSize, 1), L.pageSize);
-		return db.transaction((tx) => {
+		return runAtomicWrite(db, "mailbox.recoverForeignProcessClaims", (tx) => {
 			const page = tx
 				.select({
 					id: mailbox.id,
@@ -577,7 +562,9 @@ export function createMailboxStore(db: RuntimeDb) {
 				.get();
 		},
 		initializeLegacy(narratorId: string) {
-			return db.transaction((tx) => initializeLegacyMailbox(tx, narratorId));
+			return runAtomicWrite(db, "mailbox.initializeLegacy", (tx) =>
+				initializeLegacyMailbox(tx, narratorId),
+			);
 		},
 		/** Body/attachment columns are deliberately absent. */
 		list(
@@ -622,7 +609,7 @@ export function createMailboxStore(db: RuntimeDb) {
 		) {
 			pointer(owner.token);
 			pointer(owner.epoch);
-			return db.transaction((tx) => {
+			return runAtomicWrite(db, "mailbox.claimBatch", (tx) => {
 				if (!initializeLegacyMailbox(tx, narratorId)) return [];
 				const rows = eligibleHeads(
 					tx,
@@ -664,7 +651,7 @@ export function createMailboxStore(db: RuntimeDb) {
 			});
 		},
 		materialize(claim: MailboxClaim, materializer: Materializer) {
-			return db.transaction((tx) => {
+			return runAtomicWrite(db, "mailbox.materialize", (tx) => {
 				const row = requireClaim(tx, claim);
 				const binding = materializer(tx, row);
 				if (binding && typeof (binding as unknown as { then?: unknown }).then === "function")
@@ -673,7 +660,7 @@ export function createMailboxStore(db: RuntimeDb) {
 			});
 		},
 		failClaim(claim: MailboxClaim, error: string) {
-			return db.transaction((tx) => {
+			return runAtomicWrite(db, "mailbox.failClaim", (tx) => {
 				const row = requireClaim(tx, claim);
 				return (
 					tx
@@ -695,7 +682,7 @@ export function createMailboxStore(db: RuntimeDb) {
 		recoverClaims(narratorId: string, terminatedEpoch: string, proof: { ownerTerminated: true }) {
 			if (proof.ownerTerminated !== true)
 				throw new Error("Owner termination proof required; elapsed time is insufficient");
-			return db.transaction((tx) => {
+			return runAtomicWrite(db, "mailbox.recoverClaims", (tx) => {
 				const rows = tx
 					.select({ id: mailbox.id })
 					.from(mailbox)
@@ -762,7 +749,7 @@ export function createMailboxStore(db: RuntimeDb) {
 		},
 		/** Revert/cancel owner uses its exact claim; arbitrary UI cancellation cannot release another owner's payload. */
 		cancelClaim(claim: MailboxClaim, reason: string) {
-			return db.transaction((tx) => {
+			return runAtomicWrite(db, "mailbox.cancelClaim", (tx) => {
 				requireClaim(tx, claim);
 				return (
 					tx
@@ -784,7 +771,7 @@ export function createMailboxStore(db: RuntimeDb) {
 		},
 		/** Legacy clear is a user-only projection, not DELETE WHERE narrator_id. Each call handles one page. */
 		cancelUserPage(narratorId: string, reason: string) {
-			return db.transaction((tx) => {
+			return runAtomicWrite(db, "mailbox.cancelUserPage", (tx) => {
 				const rows = tx
 					.select({ id: mailbox.id })
 					.from(mailbox)
@@ -915,7 +902,7 @@ export function createMailboxStore(db: RuntimeDb) {
 			revision: number,
 			at = now(),
 		) {
-			return db.transaction((tx) => {
+			return runAtomicWrite(db, "mailbox.ackAdopted", (tx) => {
 				const row = getByDelivery(deliveryId, tx);
 				if (
 					!row ||
@@ -979,7 +966,7 @@ export function createMailboxStore(db: RuntimeDb) {
 				tx: RuntimeTx,
 			) => boolean,
 		) {
-			return db.transaction((tx) => {
+			return runAtomicWrite(db, "mailbox.collectTombstones", (tx) => {
 				let deleted = 0;
 				for (const id of ids.slice(0, L.pageSize)) {
 					const row = tx

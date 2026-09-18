@@ -46,7 +46,7 @@ test("cold bootstrap releases only previous-process or proven legacy claims, nev
 	const current = enqueue("live");
 	const owner = tryClaimExecution("live", "primary");
 	if (!owner) throw new Error("owner missing");
-	inbox.claimInboxHead("live", () => true);
+	await inbox.claimInboxHead("live", () => true);
 	const legacyLive = enqueue("legacy-live");
 	const legacyOwner = tryClaimExecution("legacy-live", "primary");
 	if (!legacyOwner) throw new Error("owner missing");
@@ -62,7 +62,7 @@ test("cold bootstrap releases only previous-process or proven legacy claims, nev
 	expect(state(current.id)?.state).toBe("claimed");
 });
 
-test("predicate runs against publication-eligible head, never claims a different row than checked", () => {
+test("predicate runs against publication-eligible head, never claims a different row than checked", async () => {
 	const early = store.enqueue({
 		kind: "agent_message",
 		narratorId: "barrier",
@@ -94,15 +94,15 @@ test("predicate runs against publication-eligible head, never claims a different
 	});
 	if (!("delivery" in user)) throw new Error("full");
 	tryClaimExecution("barrier", "primary");
-	expect(inbox.peekInbox("barrier")?.id).toBe(user.delivery.id);
+	expect((await inbox.peekInbox("barrier"))?.id).toBe(user.delivery.id);
 	expect(
-		inbox.claimInboxHead(
+		await inbox.claimInboxHead(
 			"barrier",
 			(row) => row.id === user.delivery.id && row.kind === "user_input",
 		),
 	).toBeUndefined();
 	expect(state(early.delivery.id)?.state).toBe("queued");
-	const exact = inbox.claimInboxHead("barrier", (row) => row.id === early.delivery.id);
+	const exact = await inbox.claimInboxHead("barrier", (row) => row.id === early.delivery.id);
 	expect(exact?.id).toBe(early.delivery.id);
 	expect(state(user.delivery.id)?.state).toBe("queued");
 });

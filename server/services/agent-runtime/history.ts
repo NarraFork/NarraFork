@@ -90,7 +90,7 @@ export async function buildRuntimeHistory(
 	);
 	// The WeakMap key MUST stay the builder's actual history array. A copied array loses
 	// the exact sourceHistory/adoption boundary, including edited currentRevision candidates.
-	trackAgentMessageHistory(
+	await trackAgentMessageHistory(
 		options.narratorId,
 		built.history,
 		modelMessages,

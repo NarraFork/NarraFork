@@ -10,57 +10,110 @@
  *
  * So the property under test is not "each kind is ordered" (it always was) but
  * "order is preserved ACROSS kinds", which is only true if it is established at enqueue.
+ *
+ * MODERN PRODUCER CONTRACT (rewritten for the mailbox runtime): a subagent_message is
+ * admitted only with its exact tool execution receipt (`pushPendingInjection`), and
+ * background completions arrive as task_notice mailbox rows (publication outbox —
+ * produced here through the shared mailbox store with the transfer's metadata shape).
+ * The drain is a READ-ONLY projection: consuming is the claim/materialize path's job.
+ * The mailbox REJECTS at per-kind capacity instead of evicting — the old in-memory
+ * eviction tests pinned a policy the durable queue deliberately does not have.
  */
 
-import { beforeEach, describe, expect, test } from "bun:test";
-import type { CompletedNotification } from "../background-task-service";
-import type { CompletedBgSubagentNotification } from "../bg-completion-queue";
-import {
-	formatParentInboundMessages,
-	type ParentInboundMessage,
-	pushParentInboundMessage,
-} from "../parent-inbound-queue";
-import {
-	drainPendingInjections,
-	hasPendingInjections,
-	type PendingInjection,
-	pushPendingInjection,
-	runItems,
-} from "../parent-injection-queue";
+import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { cleanDb, getTestDb } from "../../../tests/setup";
+import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
+
+const { db, sqlite } = getTestDb();
+mock.module("../../db", () => ({ db, sqlite }));
+
+import type { ParentInboundMessage } from "../parent-inbound-queue";
+import type { PendingInjection } from "../parent-injection-queue";
+
+const { createAgentMessageDelivery } = await import("../agent-message-delivery");
+const { createMailboxStore } = await import("../agent-runtime/mailbox");
+const { formatParentInboundMessages, pushParentInboundMessage } = await import(
+	"../parent-inbound-queue"
+);
+const { drainPendingInjections, hasPendingInjections, pushPendingInjection } = await import(
+	"../parent-injection-queue"
+);
 
 const P = "parent-1";
+const TIME = "2026-09-09T00:00:00.000Z";
+const mailboxStore = createMailboxStore(db);
+let serial = 0;
 
-function msg(text: string): PendingInjection {
+/** A subagent_message entry with the exact persisted execution receipt it needs. */
+function msg(
+	text: string,
+	toolUseId?: string,
+): Extract<PendingInjection, { kind: "subagent_message" }> {
+	const sender = `sender-${++serial}`;
+	db.insert(narrators)
+		.values({
+			id: sender,
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId: P,
+			createdAt: TIME,
+			updatedAt: TIME,
+		})
+		.run();
+	db.insert(narratorMessages)
+		.values({
+			id: `${sender}-msg`,
+			narratorId: sender,
+			role: "assistant",
+			contentJson: [],
+			createdAt: TIME,
+		})
+		.run();
+	db.insert(narratorToolCalls)
+		.values({
+			id: `${sender}-tool`,
+			narratorId: sender,
+			messageId: `${sender}-msg`,
+			toolUseId: toolUseId ?? `${sender}-use`,
+			toolName: "Send",
+			executionAttempt: 1,
+			executionIdentityVersion: 1,
+			status: "running",
+			createdAt: TIME,
+		})
+		.run();
+	const delivery = createAgentMessageDelivery(
+		P,
+		{ id: sender, title: text, label: sender, type: "general", isParent: false },
+		toolUseId ?? `${sender}-use`,
+		text,
+		{ toolCallId: `${sender}-tool`, attempt: 1 },
+	);
 	const message: ParentInboundMessage = {
-		fromId: `sub-${text}`,
+		delivery,
+		fromId: sender,
 		fromTitle: text,
 		fromType: "general",
+		fromToolUseId: delivery.fromToolUseId,
 		text,
-		timestamp: new Date().toISOString(),
+		timestamp: TIME,
 	};
 	return { kind: "subagent_message", message };
 }
 
-function agent(id: string): PendingInjection {
-	const task: CompletedBgSubagentNotification = {
-		id,
-		title: id,
-		status: "completed",
-		resultPreview: "done",
-	};
-	return { kind: "bg_agent", task };
-}
-
-function bash(id: string): PendingInjection {
-	const task: CompletedNotification = {
-		id,
-		type: "bash",
-		title: id,
-		alias: id,
-		status: "completed",
-		outputPreview: "ok",
-	};
-	return { kind: "bg_bash", task };
+/** A background completion as it actually arrives: a task_notice mailbox row. */
+function notice(producerKind: "agent" | "bash", taskId: string) {
+	const result = mailboxStore.enqueue({
+		kind: "task_notice",
+		noticeKind: producerKind,
+		narratorId: P,
+		text: `[System] Background ${producerKind} "${taskId}" completed.`,
+		projectedByteSize: 128,
+		sourceKey: `test-notice:${producerKind}:${taskId}:${++serial}`,
+		metadata: { producerKind, taskId, logicalRunId: `run-${taskId}`, eventKind: "completed" },
+	});
+	if (result.status !== "accepted") throw new Error(`notice enqueue rejected: ${result.status}`);
+	return result.delivery;
 }
 
 /** Identity of each entry, for order assertions. */
@@ -71,23 +124,21 @@ function ids(entries: readonly PendingInjection[]): string[] {
 }
 
 beforeEach(() => {
-	// The queue is globalThis-pinned (hot-reload safe), so it survives between tests.
-	drainPendingInjections(P);
-	drainPendingInjections("other");
+	cleanDb(sqlite);
+	for (const id of [P, "other"])
+		db.insert(narrators)
+			.values({ id, type: "primary", variant: "primary", createdAt: TIME, updatedAt: TIME })
+			.run();
+});
+afterAll(() => {
+	sqlite.close();
 });
 
 describe("parent injection queue — order across kinds", () => {
-	test("preserves the exact Send invocation without leaking it into model text", () => {
-		const message: ParentInboundMessage = {
-			fromId: "child",
-			fromTitle: "worker",
-			fromType: "general",
-			fromToolUseId: "send-tool-secret",
-			text: "progress report",
-			timestamp: new Date().toISOString(),
-		};
-		pushParentInboundMessage(P, message);
-		const entry = drainPendingInjections(P)[0];
+	test("preserves the exact Send invocation without leaking it into model text", async () => {
+		const entry0 = msg("progress report", "send-tool-secret");
+		await pushParentInboundMessage(P, entry0.message);
+		const entry = (await drainPendingInjections(P))[0];
 		expect(entry?.kind).toBe("subagent_message");
 		if (entry?.kind !== "subagent_message") throw new Error("missing delivery");
 		expect(entry.message.fromToolUseId).toBe("send-tool-secret");
@@ -97,102 +148,98 @@ describe("parent injection queue — order across kinds", () => {
 	test("Send producer and persisted injection keep the invocation coordinate", async () => {
 		const producer = await Bun.file(new URL("../agent-communication.ts", import.meta.url)).text();
 		const delivery = await Bun.file(new URL("../narrator-session.ts", import.meta.url)).text();
-		expect(producer).toContain("fromToolUseId: input.toolUseId");
+		expect(producer).toContain("input.toolCallBinding");
+		expect(producer).toContain("input.toolUseId");
 		expect(producer).not.toContain("getSubagentResultMessageId");
 		expect(delivery).toContain("{ fromToolUseId: message.fromToolUseId }");
 	});
 
-	test("preserves arrival order when kinds interleave", () => {
+	test("preserves arrival order when kinds interleave", async () => {
 		// The exact shape of the reported bug: Send happens first, completion second.
-		pushPendingInjection(P, msg("ready"));
-		pushPendingInjection(P, agent("t1"));
-		expect(ids(drainPendingInjections(P))).toEqual(["msg:ready", "bg_agent:t1"]);
+		await pushPendingInjection(P, msg("ready"));
+		notice("agent", "t1");
+		expect(ids(await drainPendingInjections(P))).toEqual(["msg:ready", "bg_agent:t1"]);
 	});
 
-	test("does NOT group by kind — a message between two completions keeps its slot", () => {
-		pushPendingInjection(P, agent("t1"));
-		pushPendingInjection(P, msg("mid"));
-		pushPendingInjection(P, bash("b1"));
-		expect(ids(drainPendingInjections(P))).toEqual(["bg_agent:t1", "msg:mid", "bg_bash:b1"]);
+	test("does NOT group by kind — a message between two completions keeps its slot", async () => {
+		notice("agent", "t1");
+		await pushPendingInjection(P, msg("mid"));
+		notice("bash", "b1");
+		expect(ids(await drainPendingInjections(P))).toEqual(["bg_agent:t1", "msg:mid", "bg_bash:b1"]);
 	});
 
-	test("order does not depend on which kind was enqueued first", () => {
-		// A fixed drain sequence would make one of these two come out reordered; both
-		// must come out exactly as pushed.
-		pushPendingInjection(P, agent("a"));
-		pushPendingInjection(P, msg("m"));
-		const completionFirst = ids(drainPendingInjections(P));
+	test("order does not depend on which kind was enqueued first", async () => {
+		notice("agent", "a");
+		await pushPendingInjection(P, msg("m"));
+		const completionFirst = ids(await drainPendingInjections(P));
 
-		pushPendingInjection(P, msg("m"));
-		pushPendingInjection(P, agent("a"));
-		const messageFirst = ids(drainPendingInjections(P));
+		cleanDb(sqlite);
+		db.insert(narrators)
+			.values({ id: P, type: "primary", variant: "primary", createdAt: TIME, updatedAt: TIME })
+			.run();
+
+		await pushPendingInjection(P, msg("m"));
+		notice("agent", "a");
+		const messageFirst = ids(await drainPendingInjections(P));
 
 		expect(completionFirst).toEqual(["bg_agent:a", "msg:m"]);
 		expect(messageFirst).toEqual(["msg:m", "bg_agent:a"]);
 	});
 
-	test("keeps buckets separate per parent narrator", () => {
-		pushPendingInjection(P, msg("mine"));
-		pushPendingInjection("other", msg("theirs"));
-		expect(ids(drainPendingInjections(P))).toEqual(["msg:mine"]);
-		expect(ids(drainPendingInjections("other"))).toEqual(["msg:theirs"]);
+	test("keeps buckets separate per parent narrator", async () => {
+		await pushPendingInjection(P, msg("mine"));
+		const other = msg("theirs");
+		if (!other.message.delivery) throw new Error("missing fixture delivery");
+		other.message.delivery.recipientNarratorId = "other";
+		await pushPendingInjection("other", other);
+		expect(ids(await drainPendingInjections(P))).toEqual(["msg:mine"]);
+		expect(ids(await drainPendingInjections("other"))).toEqual(["msg:theirs"]);
 	});
 });
 
-describe("parent injection queue — draining", () => {
-	test("empties the bucket, so a second drain yields nothing", () => {
-		pushPendingInjection(P, msg("once"));
-		expect(drainPendingInjections(P)).toHaveLength(1);
-		expect(drainPendingInjections(P)).toEqual([]);
+describe("parent injection queue — read-only drain", () => {
+	test("draining is a projection: a second drain sees the same rows", async () => {
+		await pushPendingInjection(P, msg("once"));
+		expect(await drainPendingInjections(P)).toHaveLength(1);
+		expect(await drainPendingInjections(P)).toHaveLength(1);
 	});
 
-	test("hasPendingInjections reports without consuming", () => {
+	test("hasPendingInjections reports without consuming", async () => {
 		// The wake predicates call this and may DECLINE (e.g. a plan-mode narrator); the
 		// entries must survive that so the next drain still delivers them.
-		expect(hasPendingInjections(P)).toBe(false);
-		pushPendingInjection(P, msg("keep"));
-		expect(hasPendingInjections(P)).toBe(true);
-		expect(hasPendingInjections(P)).toBe(true);
-		expect(drainPendingInjections(P)).toHaveLength(1);
-		expect(hasPendingInjections(P)).toBe(false);
+		expect(await hasPendingInjections(P)).toBe(false);
+		await pushPendingInjection(P, msg("keep"));
+		expect(await hasPendingInjections(P)).toBe(true);
+		expect(await hasPendingInjections(P)).toBe(true);
+		expect(await drainPendingInjections(P)).toHaveLength(1);
+		expect(await hasPendingInjections(P)).toBe(true);
 	});
 });
 
-describe("parent injection queue — per-kind caps", () => {
-	test("a flood of completions cannot evict queued messages", () => {
-		// The reason caps are per kind: the three queues were independent before, and
-		// merging them for ORDER must not merge their eviction pressure.
-		pushPendingInjection(P, msg("precious"));
-		for (let i = 0; i < 250; i++) pushPendingInjection(P, bash(`b${i}`));
-
-		const drained = drainPendingInjections(P);
-		const messages = runItems(drained, "subagent_message");
-		expect(messages).toHaveLength(1);
-		expect(messages[0]?.message.text).toBe("precious");
-		// And the message keeps its position at the front.
-		expect(drained[0]?.kind).toBe("subagent_message");
+describe("parent injection queue — admission contract", () => {
+	test("completions are rejected: they require the durable publication outbox", async () => {
+		const completion = {
+			kind: "bg_agent" as const,
+			task: { id: "t1", title: "t1", status: "completed" as const, resultPreview: "done" },
+		};
+		await expect(pushPendingInjection(P, completion)).rejects.toThrow("publication outbox");
+		expect(await hasPendingInjections(P)).toBe(false);
 	});
 
-	test("evicts the OLDEST of its own kind, keeping the newest 20 messages", () => {
-		for (let i = 0; i < 25; i++) pushPendingInjection(P, msg(`m${i}`));
-		const drained = runItems(drainPendingInjections(P), "subagent_message");
-		expect(drained).toHaveLength(20);
-		// Newest kept, oldest dropped — matches MAX_PARENT_INBOUND_MESSAGES' behaviour.
-		expect(drained[0]?.message.text).toBe("m5");
-		expect(drained[19]?.message.text).toBe("m24");
+	test("a message without its execution receipt is rejected", async () => {
+		const entry = msg("no receipt");
+		delete entry.message.delivery;
+		await expect(pushPendingInjection(P, entry)).rejects.toThrow("exact delivery receipt");
+		expect(await hasPendingInjections(P)).toBe(false);
 	});
 
-	test("each kind has its own budget", () => {
-		for (let i = 0; i < 25; i++) {
-			pushPendingInjection(P, msg(`m${i}`));
-			pushPendingInjection(P, agent(`a${i}`));
-			pushPendingInjection(P, bash(`b${i}`));
-		}
-		const drained = drainPendingInjections(P);
-		expect(runItems(drained, "subagent_message")).toHaveLength(20);
-		// Completions are under their (much larger) bound, so none were dropped.
-		expect(runItems(drained, "bg_agent")).toHaveLength(25);
-		expect(runItems(drained, "bg_bash")).toHaveLength(25);
+	test("the mailbox rejects at per-kind capacity instead of evicting", async () => {
+		// agentPending is 50: the 51st Send to the same recipient is refused loudly.
+		for (let index = 0; index < 50; index++) await pushPendingInjection(P, msg(`m${index}`));
+		await expect(pushPendingInjection(P, msg("overflow"))).rejects.toThrow("queue is full");
+		// … while a different kind keeps its own budget.
+		notice("bash", "still-fits");
+		expect(await hasPendingInjections(P)).toBe(true);
 	});
 });
 
@@ -213,14 +260,14 @@ describe("parent injection queue — per-kind caps", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("regression: Send before completion stays before completion", () => {
-	test("two subagents reporting then finishing keeps report → completion order", () => {
+	test("two subagents reporting then finishing keeps report → completion order", async () => {
 		// Exactly the reported interleaving: alpha reports, beta reports, then both finish.
-		pushPendingInjection(P, msg("alpha ready"));
-		pushPendingInjection(P, msg("beta ready"));
-		pushPendingInjection(P, agent("alpha"));
-		pushPendingInjection(P, agent("beta"));
+		await pushPendingInjection(P, msg("alpha ready"));
+		await pushPendingInjection(P, msg("beta ready"));
+		notice("agent", "alpha");
+		notice("agent", "beta");
 
-		const drained = drainPendingInjections(P);
+		const drained = await drainPendingInjections(P);
 		expect(ids(drained)).toEqual([
 			"msg:alpha ready",
 			"msg:beta ready",
@@ -237,50 +284,48 @@ describe("regression: Send before completion stays before completion", () => {
 		]);
 	});
 
-	test("a subagent that finishes BEFORE it is heard from keeps that order too", () => {
+	test("a subagent that finishes BEFORE it is heard from keeps that order too", async () => {
 		// The mirror case must not be "fixed" into the other order: whichever really
 		// happened first is what shows first.
-		pushPendingInjection(P, agent("solo"));
-		pushPendingInjection(P, msg("late word"));
-		expect(ids(drainPendingInjections(P))).toEqual(["bg_agent:solo", "msg:late word"]);
+		notice("agent", "solo");
+		await pushPendingInjection(P, msg("late word"));
+		expect(ids(await drainPendingInjections(P))).toEqual(["bg_agent:solo", "msg:late word"]);
 	});
 
-	test("per-subagent report→completion pairs interleave without reordering", () => {
+	test("per-subagent report→completion pairs interleave without reordering", async () => {
 		// alpha finishes while beta is still reporting. The old fixed sequence would hoist
 		// alpha's completion past beta's message; arrival order must survive instead.
-		pushPendingInjection(P, msg("alpha ready"));
-		pushPendingInjection(P, agent("alpha"));
-		pushPendingInjection(P, msg("beta ready"));
-		pushPendingInjection(P, agent("beta"));
+		await pushPendingInjection(P, msg("alpha ready"));
+		notice("agent", "alpha");
+		await pushPendingInjection(P, msg("beta ready"));
+		notice("agent", "beta");
 
-		const drained = drainPendingInjections(P);
+		const drained = await drainPendingInjections(P);
 		expect(ids(drained)).toEqual([
 			"msg:alpha ready",
 			"bg_agent:alpha",
 			"msg:beta ready",
 			"bg_agent:beta",
 		]);
-		// Four entries, each its own injection row — the price of telling the truth about
-		// ordering, and the reason each row is its own bubble.
 		expect(drained).toHaveLength(4);
 	});
 
-	test("ONE consumer sees every kind, so a wake cannot drop the other kinds", () => {
+	test("ONE consumer sees every kind, so a wake cannot drop the other kinds", async () => {
 		// The hazard introduced by merging the queues: each idle path used to drain only
 		// its own kind. Against a shared queue that silently discards the rest, so both
 		// paths now go through one consumer. This pins the queue half of that contract —
 		// a single drain returns all three kinds.
-		pushPendingInjection(P, msg("m"));
-		pushPendingInjection(P, agent("a"));
-		pushPendingInjection(P, bash("b"));
+		await pushPendingInjection(P, msg("m"));
+		notice("agent", "a");
+		notice("bash", "b");
 
-		const drained = drainPendingInjections(P);
+		const drained = await drainPendingInjections(P);
 		expect(drained).toHaveLength(3);
 		expect(new Set(drained.map((e) => e.kind))).toEqual(
 			new Set(["subagent_message", "bg_agent", "bg_bash"]),
 		);
-		// Nothing is left behind for a second consumer to find.
-		expect(hasPendingInjections(P)).toBe(false);
+		// The drain is read-only: entries stay queued for the claiming consumer.
+		expect(await hasPendingInjections(P)).toBe(true);
 	});
 });
 
@@ -298,7 +343,7 @@ describe("formatParentInboundMessages names the sender readably", () => {
 			fromTitle: null,
 			fromType: "explore",
 			text: "found it",
-			timestamp: new Date().toISOString(),
+			timestamp: TIME,
 			...over,
 		};
 	}

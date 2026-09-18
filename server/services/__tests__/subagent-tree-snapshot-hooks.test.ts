@@ -30,6 +30,7 @@ import {
 	worktreeTreeSnapshots,
 } from "../../db/schema";
 import { generateId } from "../../lib/id";
+import { logger } from "../../lib/logger";
 import { normalizePathForComparison } from "../../lib/platform-path";
 import { settings } from "../../lib/settings";
 import { safeSpawn } from "../../lib/spawn";
@@ -211,6 +212,31 @@ describe("subagent snapshot hooks record boundaries", () => {
 		});
 		expect(hooks.onSnapshotBefore).toBeUndefined();
 		expect(hooks.onSnapshotAfter).toBeUndefined();
+	});
+
+	test("a virtual Spec write skips tree capture without an unverified-target warning", async () => {
+		const repo = await createRepo("nf-sa-snap-spec-");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		const hooks = buildTreeSnapshotEventHooks({ session, narratorId, isInGitRepo: true });
+		const { toolUseId } = await seedToolCall(narratorId, "Write", 1);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await hooks.onSnapshotBefore?.(toolUseId, "Write", {
+				file_path: "spec://tasks.json",
+				content: "{}",
+			});
+			await hooks.onSnapshotAfter?.(toolUseId, "Write");
+			expect(warn).not.toHaveBeenCalledWith(
+				"Tree snapshot skipped: tool target is not verified inside the local workspace",
+				expect.anything(),
+			);
+		} finally {
+			warn.mockRestore();
+		}
+		const row = await readToolCallBoundaries(toolUseId);
+		expect(row?.treeHashBefore).toBeNull();
+		expect(row?.treeHashAfter).toBeNull();
 	});
 
 	test("a remote-targeted subagent records null boundaries", async () => {

@@ -1,3 +1,4 @@
+import { modelTextFromContentBlocks } from "@shared/native-injection";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db as historyReceiptDb } from "../db";
@@ -13,6 +14,7 @@ import { logger } from "../lib/logger";
 import type { AgentMessageSender } from "./agent-message-origin";
 import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
+import { getRuntimeQueuePort } from "./agent-runtime/runtime-queue-port";
 
 /** An exact delivery, never inferred from model text or a text hash. */
 export interface AgentMessageDelivery {
@@ -203,6 +205,8 @@ async function persistAgentMessageConsumption(
 ): Promise<boolean> {
 	for (let attempt = 0; attempt < 3; attempt++) {
 		try {
+			const queuePort = getRuntimeQueuePort();
+			if (queuePort) return await persistConsumptionPostgres(queuePort, delivery, consumedAt);
 			const { db } = await import("../db");
 			const candidateRef = db
 				.select({ id: narratorMessageRefs.id })
@@ -421,7 +425,64 @@ async function persistAgentMessageConsumption(
 	return false;
 }
 
-// A history identity represents exactly one build's source rows, not all rows that happen
+/**
+ * PostgreSQL consumption: ONE named composite operation
+ * (`mailbox.recordDeliveryConsumption`) owns every guard and write — the mailbox ack,
+ * the recipient ref's consumption timestamp and the sender's message-version
+ * invalidation commit atomically, so no PG await ever lands inside a SQLite
+ * transaction. Only the post-commit WS broadcast runs here. The legacy refs-only
+ * fallback (no delivery identity) has no PG path and is reported missing.
+ */
+async function persistConsumptionPostgres(
+	port: NonNullable<ReturnType<typeof getRuntimeQueuePort>>,
+	delivery: AgentMessageConsumption,
+	consumedAt: Date,
+): Promise<boolean> {
+	if (!delivery.deliveryId) {
+		logger.warn("Agent consumption without delivery identity is unsupported on PostgreSQL", {
+			recipientNarratorId: delivery.recipientNarratorId,
+		});
+		return false;
+	}
+	const result = await port.mailbox.recordDeliveryConsumption(
+		{
+			deliveryId: delivery.deliveryId,
+			recipientNarratorId: delivery.recipientNarratorId,
+			...(delivery.recipientRefId ? { recipientRefId: delivery.recipientRefId } : {}),
+			...(delivery.revision != null ? { revision: delivery.revision } : {}),
+			...(delivery.currentRevisionOnly ? { currentRevisionOnly: true } : {}),
+			...(delivery.mailboxOnly ? { mailboxOnly: true } : {}),
+			...(delivery.senderNarratorId ? { senderNarratorId: delivery.senderNarratorId } : {}),
+			...(delivery.senderToolCallBinding
+				? {
+						senderToolCallId: delivery.senderToolCallBinding.toolCallId,
+						sourceAttempt: delivery.senderToolCallBinding.attempt,
+					}
+				: {}),
+		},
+		consumedAt.toISOString(),
+	);
+	if (result.status !== "recorded") return false;
+	if (result.senderId && result.senderToolUseId) {
+		const { broadcastSendDeliveryResolved } = await import("./send-delivery-resolution");
+		await broadcastSendDeliveryResolved(
+			result.senderId,
+			result.senderToolUseId,
+			[
+				{
+					id: delivery.recipientNarratorId,
+					deliveryMessageId: result.recipientMessageId ?? delivery.recipientMessageId,
+					deliveryId: delivery.deliveryId,
+					...(result.recipientRefId ? { recipientRefId: result.recipientRefId } : {}),
+					...(result.revision != null ? { revision: result.revision } : {}),
+					injectionConsumedAt: consumedAt.toISOString(),
+				},
+			],
+			delivery.senderToolCallBinding,
+		);
+	}
+	return true;
+}
 // to exist by the time a request starts. Weak keys cannot retain completed conversations.
 const historyConsumptions = new WeakMap<
 	unknown[],
@@ -429,7 +490,7 @@ const historyConsumptions = new WeakMap<
 >();
 
 /** Register candidates only. Loading/compacting/preparing history is NOT consumption. */
-export function trackAgentMessageHistory(
+export async function trackAgentMessageHistory(
 	narratorId: string,
 	history: unknown[],
 	messages: readonly {
@@ -441,7 +502,7 @@ export function trackAgentMessageHistory(
 		contentJson: unknown;
 	}[],
 	trailingUserText?: string,
-): void {
+): Promise<void> {
 	const deliveries: Array<AgentMessageConsumption & { currentInputText?: string }> = [];
 	const modelMessages = messages.filter(
 		(message) =>
@@ -462,11 +523,7 @@ export function trackAgentMessageHistory(
 			(block) => block?.type === "system_injection" && block.body?.kind === "messages",
 		);
 		if (!injectionBlocks.length) continue;
-		const modelText = message.contentJson
-			.filter((block) => block?.type === "text" && typeof block.text === "string")
-			.map((block) => block.text)
-			.join("\n")
-			.trim();
+		const modelText = modelTextFromContentBlocks(message.contentJson).trim();
 		if (!modelText) continue;
 		const requiresCurrentInput =
 			message === poppedUser || (message.role === "sys" && !!trailingUserText?.includes(modelText));
@@ -500,39 +557,45 @@ export function trackAgentMessageHistory(
 	// This is essential after a crash between materialization and adoption of a task notice/user input.
 	const candidates = modelMessages.filter((message) => !message.injectionConsumedAt);
 	try {
+		const queuePort = getRuntimeQueuePort();
 		for (let start = 0; start < candidates.length; start += 100) {
 			const page = candidates.slice(start, start + 100);
-			const rows = historyReceiptDb
-				.select({
-					messageId: narratorMessageRefs.messageId,
-					refId: narratorMessageRefs.id,
-					deliveryId: narratorBufferedMessages.deliveryId,
-					revision: narratorBufferedMessages.contentRevision,
-					currentRevision: narratorBufferedMessages.currentRevision,
-					disposition: narratorBufferedMessages.receiptDisposition,
-					kind: narratorBufferedMessages.kind,
-				})
-				.from(narratorMessageRefs)
-				.innerJoin(
-					narratorBufferedMessages,
-					and(
-						eq(narratorBufferedMessages.narratorId, narratorId),
-						eq(narratorBufferedMessages.recipientRefId, narratorMessageRefs.id),
-					),
-				)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						inArray(
-							narratorMessageRefs.messageId,
-							page.map((message) => message.id),
-						),
-						eq(narratorBufferedMessages.state, "materialized"),
-						inArray(narratorBufferedMessages.receiptDisposition, ["active", "superseded"]),
-					),
-				)
-				.limit(100)
-				.all();
+			const rows = queuePort
+				? await queuePort.mailbox.listMaterializedReceipts(
+						narratorId,
+						page.map((message) => message.id),
+					)
+				: historyReceiptDb
+						.select({
+							messageId: narratorMessageRefs.messageId,
+							refId: narratorMessageRefs.id,
+							deliveryId: narratorBufferedMessages.deliveryId,
+							revision: narratorBufferedMessages.contentRevision,
+							currentRevision: narratorBufferedMessages.currentRevision,
+							disposition: narratorBufferedMessages.receiptDisposition,
+							kind: narratorBufferedMessages.kind,
+						})
+						.from(narratorMessageRefs)
+						.innerJoin(
+							narratorBufferedMessages,
+							and(
+								eq(narratorBufferedMessages.narratorId, narratorId),
+								eq(narratorBufferedMessages.recipientRefId, narratorMessageRefs.id),
+							),
+						)
+						.where(
+							and(
+								eq(narratorMessageRefs.narratorId, narratorId),
+								inArray(
+									narratorMessageRefs.messageId,
+									page.map((message) => message.id),
+								),
+								eq(narratorBufferedMessages.state, "materialized"),
+								inArray(narratorBufferedMessages.receiptDisposition, ["active", "superseded"]),
+							),
+						)
+						.limit(100)
+						.all();
 			for (const row of rows) {
 				// Agent-message envelopes above retain their exact sender/attempt and WS receipt protocol.
 				if (
@@ -544,11 +607,7 @@ export function trackAgentMessageHistory(
 					continue;
 				const message = page.find((message) => message.id === row.messageId);
 				if (!message || !Array.isArray(message.contentJson)) continue;
-				const text = message.contentJson
-					.filter((block) => block?.type === "text" && typeof block.text === "string")
-					.map((block) => block.text)
-					.join("\n")
-					.trim();
+				const text = modelTextFromContentBlocks(message.contentJson).trim();
 				if (!text) continue;
 				const requiresInput =
 					message === poppedUser || (message.role === "sys" && !!trailingUserText?.includes(text));

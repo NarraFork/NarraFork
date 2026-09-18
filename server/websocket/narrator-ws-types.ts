@@ -278,7 +278,10 @@ export type NarratorServerMessage =
 			resumeAction: "retry" | "continue";
 	  }
 	| {
-			/** The narrator is suspended waiting for a NUG model to recover (credential pool exhausted). */
+			/**
+			 * The narrator is suspended on a self-recovering block: a NUG model to
+			 * recover (credential pool exhausted), or a Kimi quota window to reset.
+			 */
 			type: "model_unavailable_waiting";
 			narratorId: string;
 			message: string;
@@ -286,14 +289,23 @@ export type NarratorServerMessage =
 			providerId?: string;
 			providerPrefix?: string;
 			nugModelId?: string;
+			/** `credentials` when omitted. `quota` waits carry `resumeAt`. */
+			waitKind?: "credentials" | "quota";
+			/** Epoch ms the blocked window resets at. `quota` waits only. */
+			resumeAt?: number;
 			diagnostics?: ApiRequestDiagnostics;
 	  }
 	| {
-			/** A previously-unavailable NUG model recovered; the suspended narrator is resuming. */
+			/**
+			 * The suspended narrator's block cleared; it is resuming. `waitKind`
+			 * distinguishes a recovered model from a reset quota window, so the
+			 * client can word the recovery notice to match the wait it showed.
+			 */
 			type: "model_unavailable_recovered";
 			narratorId: string;
 			model: string;
 			nugModelId?: string;
+			waitKind?: "credentials" | "quota";
 	  }
 	| {
 			type: "queued_new_narrator_created";
@@ -983,22 +995,25 @@ export type NarratorServerMessage =
 			diagnostics?: ApiRequestDiagnostics;
 	  }
 	| {
-			/** A subagent is suspended waiting for a NUG model to recover. */
+			/** A subagent is suspended on a self-recovering block (credential pool or quota). */
 			type: "subagent_model_unavailable_waiting";
 			narratorId: string;
 			subagentNarratorId: string;
 			message: string;
 			model: string;
 			nugModelId?: string;
+			waitKind?: "credentials" | "quota";
+			resumeAt?: number;
 			diagnostics?: ApiRequestDiagnostics;
 	  }
 	| {
-			/** A suspended subagent's NUG model recovered; it is resuming. */
+			/** A suspended subagent's block cleared; it is resuming. */
 			type: "subagent_model_unavailable_recovered";
 			narratorId: string;
 			subagentNarratorId: string;
 			model: string;
 			nugModelId?: string;
+			waitKind?: "credentials" | "quota";
 	  }
 	| {
 			type: "subagent_conclusion_updated";

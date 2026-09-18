@@ -25,7 +25,7 @@ import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
-	getBufferedMessages,
+	getBufferedMessagesAsync,
 	pushBufferedMessage,
 	toBufferSummary,
 	updateBufferedMessage,
@@ -126,11 +126,11 @@ async function resolveCreator(userId: string | null): Promise<BufferCreator | nu
 }
 
 /** Broadcast the queue snapshot so the narrator panel updates. */
-function broadcastBufferSnapshot(narratorId: string): void {
+async function broadcastBufferSnapshot(narratorId: string): Promise<void> {
 	broadcastToNarrator(narratorId, {
 		type: "buffer_set",
 		narratorId,
-		messages: toBufferSummary(getBufferedMessages(narratorId)),
+		messages: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
 	});
 }
 
@@ -166,10 +166,13 @@ export async function interjectFileEditAsUserMessage(
 	// so the user's repeated Ctrl+S produces one message, not a reversed stack.
 	const trackKey = interjectKey(narratorId, notification.filePath);
 	const trackedId = fileEditInterjectIds.get(trackKey);
-	if (trackedId && getBufferedMessages(narratorId).some((msg) => msg.id === trackedId)) {
+	if (
+		trackedId &&
+		(await getBufferedMessagesAsync(narratorId)).some((msg) => msg.id === trackedId)
+	) {
 		if (await updateBufferedMessage(narratorId, trackedId, text)) {
 			requestBufferedMessageSoftStop(narratorId);
-			broadcastBufferSnapshot(narratorId);
+			await broadcastBufferSnapshot(narratorId);
 			return { delivered: "interjected" };
 		}
 	}
@@ -202,6 +205,6 @@ export async function interjectFileEditAsUserMessage(
 
 	fileEditInterjectIds.set(trackKey, result.id);
 	requestBufferedMessageSoftStop(narratorId);
-	broadcastBufferSnapshot(narratorId);
+	await broadcastBufferSnapshot(narratorId);
 	return { delivered: "interjected" };
 }

@@ -1,7 +1,10 @@
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
-import { flushRuntimePublications, runtimePublication } from "./agent-runtime/publication";
+import {
+	flushRuntimePublications,
+	getRuntimePublicationService,
+} from "./agent-runtime/publication";
 
 function readAgentLogicalRunId(narratorId: string): string | undefined {
 	return (
@@ -951,10 +954,7 @@ async function restoreAgent(
 	const resumeLogicalRunId =
 		payloadString(record.payloadJson, "logicalRunId") ??
 		readAgentLogicalRunId(subagentId) ??
-		runtimePublication.store.registerLegacyRunningRunSlots(
-			{ producerKind: "agent", taskId: subagentId, recipientId: record.narratorId },
-			{ kind: "checkpoint", checkpointId: record.id, updateEpoch: record.updateEpoch },
-		).logicalRunId;
+		(await getRuntimePublicationService().getAgentRun(subagentId, record.narratorId)).logicalRunId;
 	const resumed = await resumeSubagent({
 		subagentId,
 		intent: "continue_tool_results",

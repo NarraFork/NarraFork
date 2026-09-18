@@ -1,4 +1,4 @@
-import { desc, eq, sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
 import { hotSafe } from "../lib/hot-safe";
@@ -19,6 +19,7 @@ import {
 import type { LegacyCompletionAdmission } from "./agent-runtime/publication-outbox";
 import type { CompletedNotification } from "./background-task-service";
 import type { CompletedBgSubagentNotification } from "./bg-completion-queue";
+import { claimNextRefSeq } from "./narrator-refs/seq-store";
 import type { ParentInboundMessage } from "./parent-inbound-queue";
 
 export type PendingInjection = (
@@ -103,29 +104,24 @@ function persistUnboundLegacyAgentMessage(
 				createdAt: new Date().toISOString(),
 			})
 			.run();
-		const last = tx
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.narratorId, narratorId))
-			.orderBy(desc(narratorMessageRefs.seq))
-			.limit(1)
-			.get();
+		// Single seq authority (narrator-refs/seq-store.ts); base 0 for an empty
+		// narrator — previously this site alone started at 1.
 		tx.insert(narratorMessageRefs)
-			.values({ id: generateId(), narratorId, messageId, seq: (last?.seq ?? 0) + 1 })
+			.values({ id: generateId(), narratorId, messageId, seq: claimNextRefSeq(tx, narratorId) })
 			.run();
 	});
 }
 
 /** Compatibility transfer is one-shot: remove only after its durable acceptance succeeds. */
-export function migrateLegacyParentInjections(narratorId: string): void {
+export async function migrateLegacyParentInjections(narratorId: string): Promise<void> {
 	const entries = legacyQueue.get(narratorId);
 	if (!entries?.length) return;
 	for (const entry of entries.slice(0, 100)) {
 		if (entry.kind === "subagent_message") {
 			if (!entry.message.delivery?.senderToolCallBinding)
 				persistUnboundLegacyAgentMessage(narratorId, entry);
-			else pushPendingInjection(narratorId, entry);
-		} else migrateLegacyTaskNotice(narratorId, entry);
+			else await pushPendingInjection(narratorId, entry);
+		} else await migrateLegacyTaskNotice(narratorId, entry);
 		entries.shift();
 		const snapshots = legacyCompletions.get(narratorId);
 		if (snapshots) {
@@ -139,25 +135,27 @@ export function migrateLegacyParentInjections(narratorId: string): void {
 }
 
 /** Completion producers use publication-outbox; this facade accepts ordinary agent messages only. */
-export function pushPendingInjection(narratorId: string, entry: PendingInjection): void {
+export async function pushPendingInjection(narratorId: string, entry: PendingInjection) {
 	if (entry.kind !== "subagent_message")
 		throw new Error("Completion notices require durable publication outbox");
 	if (!entry.message.delivery) throw new Error("Agent message requires exact delivery receipt");
 	if (entry.message.delivery.recipientNarratorId !== narratorId)
 		throw new Error("Mailbox recipient mismatch");
-	enqueueInboxAgent(entry.message.delivery, entry.message.text, {
+	await enqueueInboxAgent(entry.message.delivery, entry.message.text, {
 		channel: "parent",
 		fromMessageId: entry.message.fromMessageId,
 	});
 }
 
 /** Read-only compatibility projection. Real consumers claim/commit through agent-runtime/inbox. */
-export function drainPendingInjections(narratorId: string): PendingInjection[] {
-	migrateLegacyParentInjections(narratorId);
-	return listInboxRows(narratorId, ["agent_message", "task_notice"]).map(projectPendingInjection);
+export async function drainPendingInjections(narratorId: string): Promise<PendingInjection[]> {
+	await migrateLegacyParentInjections(narratorId);
+	return (await listInboxRows(narratorId, ["agent_message", "task_notice"])).map(
+		projectPendingInjection,
+	);
 }
 export function projectPendingInjection(
-	row: import("./agent-runtime/mailbox-types").MailboxRow,
+	row: import("./agent-runtime/runtime-queue-port").RuntimeMailboxRow,
 ): PendingInjection {
 	if (row.kind === "task_notice") {
 		const metadata = inboxMetadata<{
@@ -242,8 +240,8 @@ export function projectPendingInjection(
 		},
 	};
 }
-export function hasPendingInjections(narratorId: string): boolean {
-	migrateLegacyParentInjections(narratorId);
+export async function hasPendingInjections(narratorId: string): Promise<boolean> {
+	await migrateLegacyParentInjections(narratorId);
 	return hasInboxKind(narratorId, ["agent_message", "task_notice"]);
 }
 export function runItems<K extends PendingInjectionKind>(

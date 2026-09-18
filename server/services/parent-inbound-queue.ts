@@ -57,8 +57,8 @@ export interface ParentInboundMessage {
 export function pushParentInboundMessage(
 	parentNarratorId: string,
 	message: ParentInboundMessage,
-): void {
-	pushPendingInjection(parentNarratorId, { kind: "subagent_message", message });
+): Promise<void> {
+	return pushPendingInjection(parentNarratorId, { kind: "subagent_message", message });
 }
 
 function senderLabel(message: ParentInboundMessage, isZh: boolean): string {

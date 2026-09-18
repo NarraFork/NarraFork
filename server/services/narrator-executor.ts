@@ -42,9 +42,12 @@ export interface ExecuteLoopResult {
 		resumeAction: "retry" | "continue";
 	};
 	/**
-	 * Set when the requested NUG model is temporarily unavailable (its whole
-	 * credential pool is disabled). The caller should suspend the turn and wait
-	 * for the model to recover via the shared availability poller, then resume.
+	 * Set when the turn is blocked by a condition that clears on its own, so the
+	 * caller should suspend the turn and wait for recovery, then resume. Two causes
+	 * share this field: a NUG model whose credential pool is disabled
+	 * (`waitKind: "credentials"`, waited for via the availability poller) and an
+	 * exhausted Kimi coding-plan allowance (`waitKind: "quota"`, waited for until
+	 * the published `resumeAt`).
 	 */
 	modelUnavailable?: {
 		message: string;
@@ -53,6 +56,11 @@ export interface ExecuteLoopResult {
 		providerId?: string;
 		providerPrefix?: string;
 		nugModelId?: string;
+		waitKind?: "credentials" | "quota";
+		/** Epoch ms the turn may be replayed at. Absent for a too-far-out quota wall. */
+		resumeAt?: number;
+		/** Epoch ms the quota window resets at, whenever upstream published one. */
+		quotaResetAt?: number;
 		diagnostics?: ApiRequestDiagnostics;
 	};
 	/** Retry without applying the normal transient retry limit (e.g. Codex account failover). */
@@ -253,6 +261,9 @@ export async function executeAgentLoop(
 				providerId: event.providerId,
 				providerPrefix: event.providerPrefix,
 				nugModelId: event.nugModelId,
+				waitKind: event.waitKind,
+				resumeAt: event.resumeAt,
+				quotaResetAt: event.quotaResetAt,
 				diagnostics: event.diagnostics,
 			};
 			break;

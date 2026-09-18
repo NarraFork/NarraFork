@@ -78,8 +78,8 @@ afterAll(() => {
 	sqlite.close();
 });
 
-test("unbound legacy terminal diagnostic is durable before removal and valid next entry migrates once", () => {
-	migrateLegacyParentInjections("recipient");
+test("unbound legacy terminal diagnostic is durable before removal and valid next entry migrates once", async () => {
+	await migrateLegacyParentInjections("recipient");
 	expect(legacy.get("recipient")).toBeUndefined();
 	const diagnostics = db
 		.select()
@@ -102,9 +102,9 @@ test("unbound legacy terminal diagnostic is durable before removal and valid nex
 		.all();
 	expect(rows).toHaveLength(1);
 	expect(JSON.parse(rows[0]?.metadataJson ?? "{}").taskId).toBe("legacy-terminal");
-	migrateLegacyParentInjections("recipient");
-	drainPendingInjections("recipient");
-	drainPendingInjections("recipient");
+	await migrateLegacyParentInjections("recipient");
+	await drainPendingInjections("recipient");
+	await drainPendingInjections("recipient");
 	expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(1);
 	expect(
 		db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, "recipient")).all(),

@@ -59,7 +59,7 @@ import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { sideCarBodyWithText } from "../lib/sidecar-templates";
 import { knowledgeInjection } from "./knowledge-injection";
-import { knowledgeService } from "./knowledge-service";
+import { knowledgeInjectionReads } from "./knowledge-service";
 import { narratorService } from "./narrator-service";
 import { activeNarrators } from "./narrator-session-state";
 
@@ -147,12 +147,15 @@ export async function syncSubagentKnowledgeCycle(
 		return Number.isNaN(cycle.seq) ? -1 : cycle.seq;
 	}
 	if (seq === cycle.seq) return seq;
-	cycle.seq = seq;
-	cycle.ids.clear();
 	try {
-		for (const id of knowledgeService.listInjectedEntryIds(narratorId, seq)) {
+		// Preserve both cached fields until the whole read succeeds. A failure must
+		// not mark this compact boundary synced and suppress the next retry.
+		const persistedIds = await knowledgeInjectionReads.listInjectedEntryIds(narratorId, seq);
+		cycle.ids.clear();
+		for (const id of persistedIds) {
 			cycle.ids.add(id);
 		}
+		cycle.seq = seq;
 	} catch (err) {
 		logger.warn("Failed to reload injected knowledge ids for subagent", {
 			narratorId,

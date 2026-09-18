@@ -103,13 +103,15 @@ describe("shared capability projections", () => {
 			if (child) {
 				expect(sendGuard).toThrow(SUBAGENT_SEND_ASYNC_ONLY_ERROR);
 				expect(awaitGuard).toThrow(SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR);
-				expect(policy.capabilities.askUserQuestion).toBe("async-only");
-				expect(filter?.({ ...sendTool, name: "AskUserQuestion" })).toBe(true);
+				// Subagents cannot ask the user at all — even a custom definition that
+				// explicitly lists AskUserQuestion (the last profile) is gated off.
+				expect(policy.capabilities.askUserQuestion).toBe("disabled");
+				expect(filter?.({ ...sendTool, name: "AskUserQuestion" })).toBe(false);
 				expect(policy.capabilities.spawnAgent).toBe(false);
 				expect(policy.capabilities.planApproval).toBe(false);
 				expect(policy.capabilities.stopHooks).toBe(false);
-				expect(runtimeInteractionHint(policy, "en")).toContain("async: true");
-				expect(runtimeInteractionHint(policy, "zh-CN")).toContain("仅可等待自己的问题");
+				expect(runtimeInteractionHint(policy, "en")).toContain("AskUserQuestion is unavailable");
+				expect(runtimeInteractionHint(policy, "zh-CN")).toContain("不可调用 AskUserQuestion");
 			} else {
 				expect(sendGuard).not.toThrow();
 				expect(awaitGuard).not.toThrow();

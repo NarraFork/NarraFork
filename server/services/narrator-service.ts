@@ -115,6 +115,7 @@ import {
 	deleteRecipientMessageRefs,
 	narratorPersistence,
 } from "./narrator-persistence";
+import { claimNextRefSeq, initializeRefSeqFloor } from "./narrator-refs/seq-store";
 import { materializeChildrenOf } from "./narrator-refs-backfill";
 import { specVfsService } from "./spec-vfs-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
@@ -2101,8 +2102,9 @@ export const narratorService = {
 				isCompact: 0,
 			}));
 			insertRefsBatched(tx, dupRefValues);
+			const nextSeq = initializeRefSeqFloor(tx, id);
 
-			return created;
+			return { ...created, nextSeq };
 		});
 
 		await specVfsService.forkSpecNamespace(parentNarratorId, newNarrator.id);
@@ -2428,6 +2430,10 @@ export const narratorService = {
 					ORDER BY refs.seq
 				`);
 
+				// Reserve copied seqs in the child's monotone counter in this transaction.
+				// Subsequent lazy backfills can only raise, never lower, this floor.
+				initializeRefSeqFloor(tx, id);
+
 				// Record the lazy-fork boundary whenever the parent still holds refs below
 				// the window we copied — whether they were skipped by the compact boundary
 				// or dropped by the MAX_INHERITED_FULL_FORK_REFS cap. Previously the capped
@@ -2467,12 +2473,9 @@ export const narratorService = {
 						createdAt: compactNow,
 					})
 					.run();
-				const maxSeqResult = tx
-					.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
-					.from(narratorMessageRefs)
-					.where(eq(narratorMessageRefs.narratorId, id))
-					.all();
-				const compactSeq = (maxSeqResult[0]?.maxSeq ?? -1) + 1;
+				// Same single seq authority as every other refs writer — the child's
+				// copied prefix is already in place, so this claims max(prefix)+1.
+				const compactSeq = claimNextRefSeq(tx, id);
 				tx.insert(narratorMessageRefs)
 					.values({
 						id: generateId(),

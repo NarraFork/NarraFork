@@ -5,31 +5,44 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators } from "../db/schema";
 import { projectFileReferenceText } from "../lib/agent/file-reference-projection";
-import { AppError } from "../lib/errors";
+import { buildAttachedFilesHint } from "../lib/attached-files";
+import { AppError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { resolveEffectiveModel, resolveProvider } from "../lib/settings";
-import { type ImageRef, saveTextFileToWorktree, type TextFileRef } from "../lib/uploads";
+import {
+	type ImageRef,
+	imageRefToContentBlock,
+	saveTextFileToWorktree,
+	type TextFileRef,
+} from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import type { MailboxDeliveryConsumption } from "./agent-message-delivery";
+import {
+	agentMessageDeliveryBody,
+	type MailboxDeliveryConsumption,
+} from "./agent-message-delivery";
+import { buildAgentMessageOrigin } from "./agent-message-origin";
 import { createRuntimeEventContext } from "./agent-runtime/context";
 import { buildRuntimeHistory } from "./agent-runtime/history";
 import {
 	claimInboxHead,
 	enqueueInboxAgent,
+	hasQueuedInboxRowSync,
 	type InboxAgentMetadata,
 	inboxAgentText,
 	inboxClaim,
 	inboxConsumption,
 	inboxDelivery,
 	inboxMetadata,
+	type MaterializedInboxUserMessage,
+	materializeClaimedInboxUserMessage,
 	peekInbox,
 	releaseInboxClaim,
 	withInboxOwner,
 } from "./agent-runtime/inbox";
 import type { RuntimeForegroundControl } from "./agent-runtime/input";
-import type { MailboxClaim, MailboxRow } from "./agent-runtime/mailbox-types";
+import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { runAgentLoopUnlocked } from "./agent-runtime/orchestrator";
 import {
 	claimExecutionPass,
@@ -39,14 +52,16 @@ import {
 	requestRuntimeBufferSoftStop,
 	tryClaimExecution,
 } from "./agent-runtime/ownership";
+import { getRuntimeQueuePort, type RuntimeMailboxRow } from "./agent-runtime/runtime-queue-port";
 import type { CustomSubagentDef } from "./custom-subagent-service";
 import { knowledgeService } from "./knowledge-service";
 import {
-	cleanupBufferedTextFiles,
+	cleanupBufferedTextFilesAsync,
 	clearBufferedMessages,
 	deleteBufferedTextFile,
 	enqueueBufferedMessage,
 	getBufferedMessages,
+	getBufferedMessagesAsync,
 	persistAdditionalBufferedTextFiles,
 	projectMailboxUserMessage,
 	removeBufferedMessage,
@@ -55,7 +70,8 @@ import {
 } from "./narrator-buffer";
 import type { EventHandlerContext } from "./narrator-event-handler";
 import type { ExecuteLoopResult } from "./narrator-executor";
-import { deliverInjection } from "./narrator-injection";
+import { buildSystemInjectionBlock, deliverInjection } from "./narrator-injection";
+import { getNarratorMessageRefsPort } from "./narrator-refs/store";
 import { narratorService } from "./narrator-service";
 import { toBufferSummary } from "./narrator-session";
 import {
@@ -145,7 +161,7 @@ export interface SubagentExecOptions {
 // where a stale dynamic-import resolution can reference the module binding
 // before the const initializer has executed.
 
-function projectSubagentInboxMessage(row: MailboxRow): SubagentBufferedMessage {
+function projectSubagentInboxMessage(row: RuntimeMailboxRow): SubagentBufferedMessage {
 	if (row.kind === "user_input") {
 		const user = projectMailboxUserMessage(row);
 		return {
@@ -163,14 +179,18 @@ function projectSubagentInboxMessage(row: MailboxRow): SubagentBufferedMessage {
 		...(row.state === "claimed" ? { _mailboxClaim: inboxClaim(row) } : {}),
 	};
 }
-function acceptsBufferedSubagentInput(row: Pick<MailboxRow, "kind" | "metadataJson">): boolean {
+function acceptsBufferedSubagentInput(
+	row: Pick<RuntimeMailboxRow, "kind" | "metadataJson">,
+): boolean {
 	return (
 		row.kind === "user_input" ||
 		(row.kind === "agent_message" && inboxMetadata<InboxAgentMetadata>(row).channel === "buffer")
 	);
 }
-function peekSubagentBufferedMessage(narratorId: string): SubagentBufferedMessage | undefined {
-	const row = peekInbox(narratorId);
+async function peekSubagentBufferedMessage(
+	narratorId: string,
+): Promise<SubagentBufferedMessage | undefined> {
+	const row = await peekInbox(narratorId);
 	return row && acceptsBufferedSubagentInput(row) ? projectSubagentInboxMessage(row) : undefined;
 }
 /** Read-only legacy inspection; this object owns no queue or mutable arrays. */
@@ -187,8 +207,21 @@ export function requestSubagentBufferedMessageSoftStop(subagentId: string): void
 }
 
 /** Whether a queued user message should stop this loop at its next safe boundary. */
-export function shouldStopSubagentForBufferedMessage(subagentId: string): boolean {
-	return hasRuntimeBufferSoftStop(subagentId) && !!peekInbox(subagentId);
+export async function shouldStopSubagentForBufferedMessage(subagentId: string): Promise<boolean> {
+	return hasRuntimeBufferSoftStop(subagentId) && !!(await peekInbox(subagentId));
+}
+
+/**
+ * The synchronous loop-boundary form of {@link shouldStopSubagentForBufferedMessage}.
+ * The agent loop's `shouldStop` callback cannot await; on SQLite the queue re-check
+ * reads the mailbox synchronously. On PostgreSQL the subagent loop is not wired this
+ * phase, so the in-memory soft-stop flag — set by the queue producer itself — is the
+ * whole answer (there is no running loop to stop).
+ */
+export function shouldStopSubagentForBufferedMessageSync(subagentId: string): boolean {
+	if (!hasRuntimeBufferSoftStop(subagentId)) return false;
+	if (getRuntimeQueuePort()) return true;
+	return hasQueuedInboxRowSync(subagentId);
 }
 
 export const MAX_SUBAGENT_INTERRUPTION_RETRIES = 3;
@@ -458,7 +491,9 @@ export async function pushSubagentBufferedMessage(
 	options?: SubagentBufferedMessageOptions,
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean; duplicate?: boolean }> {
 	if (options?.delivery) {
-		const result = enqueueInboxAgent(options.delivery, text, { createdBy: options.createdBy });
+		const result = await enqueueInboxAgent(options.delivery, text, {
+			createdBy: options.createdBy,
+		});
 		if (result.delivery.state === "cancelled" || result.delivery.state === "failed")
 			throw new Error(`Previous delivery is ${result.delivery.state}; explicit retry is required`);
 		return {
@@ -502,14 +537,23 @@ export async function bufferSubagentUserMessage(
 }
 
 /** Clear the entire subagent buffer queue and any pending post-tool stop. */
-export function clearSubagentBufferedMessages(subagentId: string): void {
-	clearBufferedMessages(subagentId);
+export async function clearSubagentBufferedMessages(subagentId: string): Promise<void> {
+	await clearBufferedMessages(subagentId);
 	clearRuntimeBufferSoftStop(subagentId);
 }
 
 /** Get the full subagent buffer queue (for REST hydration). */
 export function getSubagentBufferedMessages(subagentId: string): SubagentBufferedMessage[] {
 	return getBufferedMessages(subagentId).map((message) => ({
+		...message,
+		prePromptBashCommand: message.bashCommand ?? undefined,
+	}));
+}
+
+export async function getSubagentBufferedMessagesAsync(
+	subagentId: string,
+): Promise<SubagentBufferedMessage[]> {
+	return (await getBufferedMessagesAsync(subagentId)).map((message) => ({
 		...message,
 		prePromptBashCommand: message.bashCommand ?? undefined,
 	}));
@@ -526,7 +570,8 @@ export async function updateSubagentBufferedMessage(
 	text: string,
 	opts?: { images?: ImageRef[]; textFiles?: File[]; fileReferences?: FileReferenceSnapshot[] },
 ): Promise<boolean> {
-	if (!getBufferedMessages(subagentId).some((message) => message.id === messageId)) return false;
+	if (!(await getBufferedMessagesAsync(subagentId)).some((message) => message.id === messageId))
+		return false;
 	const savedFiles =
 		opts?.textFiles === undefined
 			? undefined
@@ -545,14 +590,20 @@ export async function updateSubagentBufferedMessage(
  * post-tool soft stop is dropped too, otherwise the running turn would stop at
  * the next tool boundary with nothing left to resume.
  */
-export function removeSubagentBufferedMessage(subagentId: string, messageId: string): boolean {
-	const removed = removeBufferedMessage(subagentId, messageId);
-	if (!peekInbox(subagentId)) clearRuntimeBufferSoftStop(subagentId);
+export async function removeSubagentBufferedMessage(
+	subagentId: string,
+	messageId: string,
+): Promise<boolean> {
+	const removed = await removeBufferedMessage(subagentId, messageId);
+	if (!(await peekInbox(subagentId))) clearRuntimeBufferSoftStop(subagentId);
 	return removed;
 }
 
 /** Reorder the subagent buffer queue by an exact list of its message ids. */
-export function reorderSubagentBufferedMessages(subagentId: string, orderedIds: string[]): boolean {
+export async function reorderSubagentBufferedMessages(
+	subagentId: string,
+	orderedIds: string[],
+): Promise<boolean> {
 	return reorderBufferedMessages(subagentId, orderedIds);
 }
 
@@ -680,10 +731,12 @@ async function persistNextBufferedSubagentMessage(opts: {
 	cwd: string;
 }): Promise<{
 	buffered: SubagentBufferedMessage;
-	userMsg: Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>;
+	userMsg:
+		| Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>
+		| MaterializedInboxUserMessage;
 } | null> {
 	const { narratorId, parentNarratorId, toolUseId } = opts;
-	const row = claimInboxHead(
+	const row = await claimInboxHead(
 		narratorId,
 		(head) =>
 			acceptsBufferedSubagentInput(head) &&
@@ -694,29 +747,72 @@ async function persistNextBufferedSubagentMessage(opts: {
 	try {
 		buffered = projectSubagentInboxMessage(row);
 	} catch (error) {
-		releaseInboxClaim(row, error);
+		await releaseInboxClaim(row, error);
 		throw error;
 	}
-	const hadSoftStop = shouldStopSubagentForBufferedMessage(narratorId);
-	let userMsg: Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>;
+	const hadSoftStop = await shouldStopSubagentForBufferedMessage(narratorId);
+	let userMsg:
+		| Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>
+		| MaterializedInboxUserMessage;
 	try {
 		const textFiles = await saveBufferedTextFiles(opts.cwd, buffered.textFiles);
-		userMsg = await narratorService.persistSubagentUserMessage(
-			narratorId,
-			buffered.text,
-			toolUseId,
-			{
-				mailboxClaim: inboxClaim(row),
-				images: buffered.images,
-				textFiles,
-				fileReferences: buffered.fileReferences,
-				delivery: buffered.delivery,
+		if (getNarratorMessageRefsPort()) {
+			// PostgreSQL: the queue's materialize section commits message + ref + mailbox flip
+			// atomically. The block assembly mirrors narratorService.persistSubagentUserMessage
+			// exactly — the SQLite placement path below stays the reference implementation.
+			const delivery = buffered.delivery;
+			if (delivery && delivery.recipientNarratorId !== narratorId)
+				throw new ValidationError("Agent delivery recipient does not match message recipient");
+			const origin = delivery ? buildAgentMessageOrigin(delivery.sender) : undefined;
+			const contentJson: unknown[] = [
+				...(buffered.images ?? []).map((image) => imageRefToContentBlock(image)),
+				...textFiles.map((file) => ({
+					type: "text_file" as const,
+					filename: file.filename,
+					size: file.size,
+					filePath: file.filePath,
+				})),
+				...(buffered.fileReferences ?? []),
+				{ type: "text", text: buffered.text },
+				...(delivery
+					? [buildSystemInjectionBlock("subagent_message", agentMessageDeliveryBody(delivery))]
+					: []),
+			];
+			const effectiveText =
+				(!buffered.text.trim() && (buffered.images?.length ?? 0) > 0
+					? "[user sent image(s)]"
+					: buffered.text) + buildAttachedFilesHint(textFiles);
+			const persisted = await materializeClaimedInboxUserMessage({
+				claim: inboxClaim(row),
+				reservedMessageId: delivery?.recipientMessageId ?? row.recipientMessageId,
+				narratorId,
+				text: effectiveText,
+				contentBlocks: contentJson,
 				commandText: buffered.commandText,
 				createdBy: buffered.createdBy,
-			},
-		);
+				origin,
+				parentToolUseId: toolUseId,
+			});
+			// Withhold the creator for machine-authored text, as persistSubagentUserMessage does.
+			userMsg = (origin?.origin ?? "user") === "user" ? persisted : { ...persisted, creator: null };
+		} else {
+			userMsg = await narratorService.persistSubagentUserMessage(
+				narratorId,
+				buffered.text,
+				toolUseId,
+				{
+					mailboxClaim: inboxClaim(row),
+					images: buffered.images,
+					textFiles,
+					fileReferences: buffered.fileReferences,
+					delivery: buffered.delivery,
+					commandText: buffered.commandText,
+					createdBy: buffered.createdBy,
+				},
+			);
+		}
 	} catch (error) {
-		releaseInboxClaim(row, error);
+		await releaseInboxClaim(row, error);
 		if (hadSoftStop) requestSubagentBufferedMessageSoftStop(narratorId);
 		throw error;
 	}
@@ -731,9 +827,10 @@ async function persistNextBufferedSubagentMessage(opts: {
 			narratorId,
 			message: fileReferenceMessageForDisplay({ ...userMsg, parentToolUseId: null }),
 		});
-		if (buffered._stagingId) cleanupBufferedTextFiles(buffered._stagingId);
-		if (!getBufferedMessages(narratorId).length) clearRuntimeBufferSoftStop(narratorId);
-		const remaining = toBufferSummary(getSubagentBufferedMessages(narratorId));
+		if (buffered._stagingId) await cleanupBufferedTextFilesAsync(buffered._stagingId);
+		if (!(await getBufferedMessagesAsync(narratorId)).length)
+			clearRuntimeBufferSoftStop(narratorId);
+		const remaining = toBufferSummary(await getSubagentBufferedMessagesAsync(narratorId));
 		broadcastToNarrator(parentNarratorId, {
 			type: "buffer_consumed",
 			narratorId: parentNarratorId,
@@ -763,10 +860,10 @@ export async function consumeBufferedSubagentMessageInPass(opts: {
 	cwd: string;
 	currentUserId?: string | null;
 }): Promise<{ buffered: SubagentBufferedMessage; text: string } | null> {
-	const buffered = peekSubagentBufferedMessage(opts.narratorId);
+	const buffered = await peekSubagentBufferedMessage(opts.narratorId);
 	if (
 		!buffered ||
-		shouldStopSubagentForBufferedMessage(opts.narratorId) ||
+		(await shouldStopSubagentForBufferedMessage(opts.narratorId)) ||
 		!canDeliverBufferedMessageInPass(buffered, opts.currentUserId)
 	)
 		return null;
@@ -815,9 +912,12 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 	prePromptBashCommand?: string;
 } | null> {
 	return withInboxOwner(opts.narratorId, async () => {
-		const head = peekInbox(opts.narratorId);
+		const head = await peekInbox(opts.narratorId);
 		if (head && !acceptsBufferedSubagentInput(head)) {
-			const row = claimInboxHead(opts.narratorId, (candidate) => candidate.kind !== "user_input");
+			const row = await claimInboxHead(
+				opts.narratorId,
+				(candidate) => candidate.kind !== "user_input",
+			);
 			if (!row) return null;
 			try {
 				const { deliverPendingInjection } = await import("./narrator-session");
@@ -848,7 +948,7 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 					preservePrincipal: true,
 				};
 			} catch (error) {
-				releaseInboxClaim(row, error);
+				await releaseInboxClaim(row, error);
 				throw error;
 			}
 		}

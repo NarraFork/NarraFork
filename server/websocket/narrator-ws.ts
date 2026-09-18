@@ -59,7 +59,7 @@ import {
 import {
 	clearBufferedMessageSoftStopIfIdle,
 	clearBufferedMessages,
-	getBufferedMessages,
+	getBufferedMessagesAsync,
 	pushBufferedMessage,
 	resolveDecisionNarratorId,
 	resolvePermissionOrDangerReflection,
@@ -393,7 +393,7 @@ function safeSend(ws: NarratorWS, message: Record<string, unknown>): boolean {
 
 /** Both actor types expose the same persistent user mailbox projection. */
 async function broadcastBufferQueueForNarrator(narratorId: string): Promise<void> {
-	const messages = toBufferSummary(getBufferedMessages(narratorId));
+	const messages = toBufferSummary(await getBufferedMessagesAsync(narratorId));
 	broadcastToNarrator(narratorId, { type: "buffer_set", narratorId, messages });
 }
 
@@ -1738,10 +1738,12 @@ export const handleNarratorWS = {
 				if (bufResult.ok) {
 					let messages: ReturnType<typeof toBufferSummary>;
 					if (usedSubagent) {
-						const { getSubagentBufferedMessages } = await import("../services/narrator-subagent");
-						messages = toBufferSummary(getSubagentBufferedMessages(msg.narratorId));
+						const { getSubagentBufferedMessagesAsync } = await import(
+							"../services/subagent-executor"
+						);
+						messages = toBufferSummary(await getSubagentBufferedMessagesAsync(msg.narratorId));
 					} else {
-						messages = toBufferSummary(getBufferedMessages(msg.narratorId));
+						messages = toBufferSummary(await getBufferedMessagesAsync(msg.narratorId));
 					}
 					broadcastToNarrator(msg.narratorId, {
 						type: "buffer_set",
@@ -1757,14 +1759,14 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "cancel_buffer": {
-				clearBufferedMessages(msg.narratorId);
+				await clearBufferedMessages(msg.narratorId);
 				// Cancelling queued input must also drop a pending post-tool soft stop,
 				// otherwise the running turn ends at the next tool boundary with nothing
 				// to resume (clearSubagentBufferedMessages does this for subagents).
 				clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 				try {
 					const { clearSubagentBufferedMessages } = await import("../services/narrator-subagent");
-					clearSubagentBufferedMessages(msg.narratorId);
+					await clearSubagentBufferedMessages(msg.narratorId);
 				} catch {
 					// ignore
 				}
@@ -1782,7 +1784,7 @@ export const handleNarratorWS = {
 			}
 			case "remove_buffer": {
 				const { removeSubagentBufferedMessage } = await import("../services/narrator-subagent");
-				const ok = removeSubagentBufferedMessage(msg.narratorId, msg.messageId);
+				const ok = await removeSubagentBufferedMessage(msg.narratorId, msg.messageId);
 				if (ok) {
 					clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 					await broadcastBufferQueueForNarrator(msg.narratorId);

@@ -43,8 +43,14 @@ import {
 	tryClaimExecution,
 } from "./agent-runtime/ownership";
 import { resolveRuntimePolicy } from "./agent-runtime/policy";
-import { publicationEvent, runtimePublication } from "./agent-runtime/publication";
+import {
+	getRuntimePublicationService,
+	publicationEvent,
+	runtimePublication,
+} from "./agent-runtime/publication";
 import type { PublicationRun } from "./agent-runtime/publication-outbox";
+import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
+import { runAtomicWrite } from "./agent-runtime/runtime-write";
 import { backgroundTaskService, getBackgroundTaskTerminalVersion } from "./background-task-service";
 import { pushBgCompletionNotification } from "./bg-completion-queue";
 import { customSubagentService } from "./custom-subagent-service";
@@ -295,30 +301,45 @@ async function finalizeBackgroundCompletion(
 	}
 
 	const now = new Date().toISOString();
-	db.transaction((tx) => {
-		tx.update(narrators)
-			.set({
-				backgroundStatus: outcome === "completed" ? "completed" : "failed",
-				backgroundResult: storedText,
-				backgroundCompletedAt: now,
-				updatedAt: now,
-			})
-			.where(eq(narrators.id, narratorId))
-			.run();
-		// Old detached runners may have no task projection. They still publish atomically.
-		if (!task && !deferPublication) {
-			const run = runtimePublication.getAgentRun(narratorId, parentNarratorId, tx);
-			runtimePublication.commit(
-				{
-					...run,
-					eventKind: publicationEvent(outcome),
-					resultRef: runtimePublication.persistResult(run, storedText, tx),
-					summary: `[System] Background agent (ID: ${narratorId}) ${outcome}. Use Await({ type: "agent", id: "${narratorId}" }) to read its stored result.`,
-				},
-				tx,
-			);
-		}
-	});
+	if (resolveRuntimeQueueBackend() === "postgres") {
+		// B5 fix: use the named PG composite — narrator update + publication
+		// commit in one withPgRetry transaction. No direct db.update(narrators).
+		const pub = getRuntimePublicationService();
+		await pub.updateNarratorBackground({
+			narratorId,
+			parentNarratorId,
+			backgroundStatus: outcome === "completed" ? "completed" : "failed",
+			backgroundResult: storedText,
+			backgroundCompletedAt: now,
+			updatedAt: now,
+			deferPublication: !!task || deferPublication,
+		});
+		if (!task && !deferPublication) pub.schedule();
+	} else {
+		runAtomicWrite(db, "subagent-runner.finalizeBackgroundCompletion", (tx) => {
+			tx.update(narrators)
+				.set({
+					backgroundStatus: outcome === "completed" ? "completed" : "failed",
+					backgroundResult: storedText,
+					backgroundCompletedAt: now,
+					updatedAt: now,
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
+			if (!task && !deferPublication) {
+				const run = runtimePublication.getAgentRun(narratorId, parentNarratorId, tx);
+				runtimePublication.commit(
+					{
+						...run,
+						eventKind: publicationEvent(outcome),
+						resultRef: runtimePublication.persistResult(run, storedText, tx),
+						summary: `[System] Background agent (ID: ${narratorId}) ${outcome}. Use Await({ type: "agent", id: "${narratorId}" }) to read its stored result.`,
+					},
+					tx,
+				);
+			}
+		});
+	}
 
 	const subNarrator = await narratorService.getById(narratorId).catch(() => null);
 	const title = subNarrator?.title ?? narratorId;
@@ -424,6 +445,9 @@ export interface ResumedBackgroundTaskAnnouncement {
 	status: ResumedBackgroundTaskNoticePlan["status"];
 	wakeParent: boolean;
 	locale: Locale;
+	/** B2 fix: narrator fields carried from construction site to avoid PG SQLite read. */
+	subagentTraits?: string[] | null;
+	subagentTitle?: string | null;
 }
 
 /**
@@ -524,19 +548,31 @@ async function notifyParentOfResumedBackgroundTask(
 				`它先前的结果已经作废；请用 Await({ type: "agent", id: "${alias}" }) 获取新的结果。`
 			: `[System] Background agent "${title}" (ID: ${alias}) has been restarted and is running again. ` +
 				`Its earlier result is superseded; use Await({ type: "agent", id: "${alias}" }) for the new one.`;
-		const run = runtimePublication.getAgentRun(subagentId, parentNarratorId);
-		db.transaction((tx) =>
-			runtimePublication.commit(
-				{
-					...run,
-					eventKind: "started",
-					resultRef: `narrator:${subagentId}:${run.logicalRunId}`,
-					summary: content,
-				},
-				tx,
-			),
-		);
-		runtimePublication.schedule();
+		if (resolveRuntimeQueueBackend() === "postgres") {
+			const pub = getRuntimePublicationService();
+			const run = await pub.getAgentRun(subagentId, parentNarratorId);
+			await pub.commit({
+				...run,
+				eventKind: "started",
+				resultRef: `narrator:${subagentId}:${run.logicalRunId}`,
+				summary: content,
+			});
+			pub.schedule();
+		} else {
+			const run = runtimePublication.getAgentRun(subagentId, parentNarratorId);
+			runAtomicWrite(db, "subagent-runner.notifyResumedBackgroundTask", (tx) =>
+				runtimePublication.commit(
+					{
+						...run,
+						eventKind: "started",
+						resultRef: `narrator:${subagentId}:${run.logicalRunId}`,
+						summary: content,
+					},
+					tx,
+				),
+			);
+			runtimePublication.schedule();
+		}
 	}
 }
 
@@ -575,11 +611,42 @@ export async function announceResumedBackgroundTask(
 	}
 }
 
-export function commitResumedBackgroundTaskAnnouncement(
+export async function commitResumedBackgroundTaskAnnouncement(
 	notice: ResumedBackgroundTaskAnnouncement,
 	finalText: string,
 	tx: import("./agent-runtime/mailbox-types").RuntimeTx,
-): void {
+): Promise<void> {
+	if (resolveRuntimeQueueBackend() === "postgres") {
+		const pub = getRuntimePublicationService();
+		const run = await pub.getAgentRun(notice.subagentId, notice.parentNarratorId);
+		if (notice.logicalRunId && notice.logicalRunId !== run.logicalRunId) {
+			throw new ValidationError("Stale resumed task publication");
+		}
+		// B2 fix: use carried narrator fields instead of direct db.select(narrators).
+		// The fields were captured at announcement construction time from the narrator
+		// that was already loaded, so no SQLite touch is needed on the PG path.
+		const source =
+			notice.subagentTraits !== undefined
+				? { id: notice.subagentId, traits: notice.subagentTraits, title: notice.subagentTitle }
+				: undefined;
+		const alias = source
+			? agentLabelFromNarrator(source, notice.parentNarratorId)
+			: notice.subagentId;
+		const title = source?.title?.slice(0, 80) ?? alias;
+		const eventKind = publicationEvent(notice.status) as
+			| "completed"
+			| "failed"
+			| "timed_out"
+			| "cancelled";
+		await pub.commitAgentTerminal({
+			run,
+			eventKind,
+			text: finalText,
+			summary: `[System] Agent "${title}" (ID: ${alias}) ${notice.status}. Its restarted run has ended; use Await({ type: "agent", id: "${alias}" }) for the stored result.`,
+		});
+		return;
+	}
+	// SQLite path: use the caller's sync tx.
 	const run = runtimePublication.getAgentRun(notice.subagentId, notice.parentNarratorId, tx);
 	if (notice.logicalRunId && notice.logicalRunId !== run.logicalRunId) {
 		throw new ValidationError("Stale resumed task publication");
@@ -635,28 +702,44 @@ async function finalizeTakenOverBackgroundSubagentUnlocked(
 	locale: Locale = "en",
 ): Promise<void> {
 	const now = new Date().toISOString();
-	db.transaction((tx) => {
-		tx.update(narrators)
-			.set({
-				isBackground: true,
-				backgroundStatus: hasError ? "failed" : "completed",
-				backgroundResult: finalText || "(no output)",
-				backgroundCompletedAt: now,
-				updatedAt: now,
-			})
-			.where(eq(narrators.id, narratorId))
-			.run();
-		const run = runtimePublication.getAgentRun(narratorId, parentNarratorId, tx);
-		runtimePublication.commit(
-			{
-				...run,
-				eventKind: hasError ? "failed" : "completed",
-				resultRef: runtimePublication.persistResult(run, finalText || "(no output)", tx),
-				summary: `[System] Background agent (ID: ${narratorId}) ${hasError ? "failed" : "completed"}. Use Await({ type: "agent", id: "${narratorId}" }) to read the stored result.`,
-			},
-			tx,
-		);
-	});
+	if (resolveRuntimeQueueBackend() === "postgres") {
+		// B3 fix: use the named PG composite — narrator update + publication
+		// commit in one withPgRetry transaction. No direct db.update(narrators).
+		const pub = getRuntimePublicationService();
+		await pub.updateNarratorBackground({
+			narratorId,
+			parentNarratorId,
+			backgroundStatus: hasError ? "failed" : "completed",
+			backgroundResult: finalText || "(no output)",
+			backgroundCompletedAt: now,
+			updatedAt: now,
+			isBackground: true,
+		});
+		pub.schedule();
+	} else {
+		runAtomicWrite(db, "subagent-runner.finalizeTakenOverBackgroundSubagent", (tx) => {
+			tx.update(narrators)
+				.set({
+					isBackground: true,
+					backgroundStatus: hasError ? "failed" : "completed",
+					backgroundResult: finalText || "(no output)",
+					backgroundCompletedAt: now,
+					updatedAt: now,
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
+			const run = runtimePublication.getAgentRun(narratorId, parentNarratorId, tx);
+			runtimePublication.commit(
+				{
+					...run,
+					eventKind: hasError ? "failed" : "completed",
+					resultRef: runtimePublication.persistResult(run, finalText || "(no output)", tx),
+					summary: `[System] Background agent (ID: ${narratorId}) ${hasError ? "failed" : "completed"}. Use Await({ type: "agent", id: "${narratorId}" }) to read the stored result.`,
+				},
+				tx,
+			);
+		});
+	}
 
 	// Restore the background task row (set to "cancelled" during takeover) to its
 	// real terminal result so the parent's Await path returns the actual output
@@ -884,7 +967,8 @@ async function executeBackgroundTaskUnlocked(
 	wakePolicy: { allowInboxWake: boolean },
 ): Promise<void> {
 	const { narratorId, parentNarratorId, toolUseId, locale, updateLease } = opts;
-	const publicationRun = runtimePublication.getAgentRun(narratorId, parentNarratorId);
+	const pub = getRuntimePublicationService();
+	const publicationRun = await pub.getAgentRun(narratorId, parentNarratorId);
 	const backgroundAbortController = getBackgroundAbortControllers().get(narratorId);
 	const executionStartedAt = Date.now();
 	const {
@@ -1307,10 +1391,16 @@ function startForegroundRunUnlocked(
 ): ForegroundRunHandle {
 	const publicationRun =
 		input.publicationRun ??
-		runtimePublication.startAgentRun({
-			narratorId: input.subagentId,
-			parentNarratorId: input.parentNarratorId,
-		});
+		(resolveRuntimeQueueBackend() === "postgres"
+			? (() => {
+					throw new Error(
+						"PG backend requires callers to provide publicationRun via async startAgentRun",
+					);
+				})()
+			: runtimePublication.startAgentRun({
+					narratorId: input.subagentId,
+					parentNarratorId: input.parentNarratorId,
+				}));
 	const {
 		subagentId,
 		parentNarratorId,
@@ -1400,17 +1490,25 @@ function startForegroundRunUnlocked(
 		resolveForeground({ kind: "handoff", runId, output });
 		return true;
 	};
-	const publishTerminal = (
+	const publishTerminal = async (
 		terminal: Omit<ForegroundRunTerminal, "runId" | "allowInboxWake">,
-	): boolean => {
+	): Promise<boolean> => {
 		if (terminalPublished) return false;
 		terminalPublished = true;
 		// All async cleanup/publication above has settled; detach handoffs never release.
 		// A continued runner has an additional publication chain that owns the release.
 		if (releaseOnTerminal) {
-			// A foreground run reserved capacity in case it detached. A normal foreground
-			// return needs no extra notice; pending terminal intents are never removed here.
-			runtimePublication.store.releaseUnusedRunSlots(publicationRun);
+			// A foreground run reserved capacity in case it detached. Await the backend-neutral,
+			// idempotent release before resolving terminal publication; PG release is a real
+			// transaction and fire-and-forget here leaks slots until the next cleanup pass.
+			try {
+				await getRuntimePublicationService().releaseUnusedRunSlots(publicationRun);
+			} catch (error) {
+				logger.warn("Failed to release unused subagent publication slots", {
+					subagentId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 			releaseSubagentPublicationOwner(owner, allowInboxWake);
 		}
 		const publication: ForegroundRunTerminal = { runId, allowInboxWake, ...terminal };
@@ -1645,7 +1743,7 @@ function startForegroundRunUnlocked(
 				rejectTerminal(publicationCommitError);
 				if (!foregroundPublished) rejectForeground(publicationCommitError);
 			} else
-				publishTerminal({
+				await publishTerminal({
 					output: await appendSubagentFileChanges(
 						{
 							parentNarratorId,
@@ -1679,7 +1777,7 @@ function startForegroundRunUnlocked(
 			return;
 		}
 		const finalText = `Subagent error: ${err instanceof Error ? err.message : String(err)}`;
-		publishTerminal({
+		await publishTerminal({
 			// The CRASH outlet needs the file summary most: a subagent that died partway
 			// has very likely already written some of its files, and this is precisely the
 			// moment the parent would otherwise carry on against a stale view of the disk.
@@ -2290,7 +2388,7 @@ async function startContinuedSubagentUnlocked(
 	};
 	try {
 		executionOwner = claimSubagentExecution(subagentId);
-		publicationRun = runtimePublication.startAgentRun({
+		publicationRun = await getRuntimePublicationService().startAgentRun({
 			narratorId: subagentId,
 			parentNarratorId,
 			resumeRunId: input.resumeLogicalRunId,
@@ -2442,7 +2540,14 @@ async function startContinuedSubagentUnlocked(
 			// Until startForegroundRun returns, this scope owns the reservations.
 			// Release only unused slots: persisted publication events must survive.
 			if (!leaseTransferred && publicationRun)
-				runtimePublication.store.releaseUnusedRunSlots(publicationRun);
+				try {
+					await getRuntimePublicationService().releaseUnusedRunSlots(publicationRun);
+				} catch (error) {
+					logger.warn("Failed to release unused resumed publication slots", {
+						subagentId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
 		} finally {
 			executionOwner?.release();
 		}
@@ -2513,14 +2618,24 @@ async function startContinuedSubagentUnlocked(
 					status: plan.status,
 					wakeParent: plan.wakeParent,
 					locale: locale as Locale,
+					// B2 fix: carry narrator fields to avoid PG direct SQLite read.
+					subagentTraits: original.traits,
+					subagentTitle: original.title,
 				};
 			}
 			return terminal.output;
 		})
-		.finally(() => {
+		.finally(async () => {
 			try {
 				if (input.skipConclusionDelivery && !input.preserveBackground)
-					runtimePublication.store.releaseUnusedRunSlots(publicationRun);
+					try {
+						await getRuntimePublicationService().releaseUnusedRunSlots(publicationRun);
+					} catch (error) {
+						logger.warn("Failed to release unused continuation publication slots", {
+							subagentId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
 				unregisterBackgroundAbort();
 				if (!input.deferPublicationRelease && priorTaskVersion && executionOwner?.isCurrent())
 					backgroundTaskService.endAgentContinuation(subagentId);

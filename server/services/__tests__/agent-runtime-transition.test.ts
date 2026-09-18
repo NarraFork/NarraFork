@@ -46,7 +46,12 @@ describe("shared runtime transition decisions", () => {
 		).toMatchObject({ kind: "backoff", retryCount: 2, source: "silent-disconnect" });
 	});
 	test("progress resets overflow baseline, not the interrupted response budget", () => {
-		const state = { overflowRetries: 2, transientRetries: 1, interruptionRetries: 2 };
+		const state = {
+			overflowRetries: 2,
+			transientRetries: 1,
+			interruptionRetries: 2,
+			quotaWaits: 0,
+		};
 		expect(
 			selectRuntimeRecovery(state, {
 				...observation,

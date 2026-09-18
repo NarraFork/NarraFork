@@ -674,4 +674,23 @@ describe("real shared orchestrator profile contract", () => {
 			await run;
 		}
 	});
+
+	test("PG finalizer/consumption contract has no SQLite cleanup fallthrough", async () => {
+		const source = await Bun.file(
+			new URL("../agent-runtime/orchestrator.ts", import.meta.url),
+		).text();
+		expect(source).toContain("cleanupBufferedTextFilesAsync");
+		expect(source).not.toContain("cleanupBufferedTextFiles(");
+		expect(source).toContain("function hasPostgresRuntime()");
+		expect(source).toContain("Skipping pending model restore");
+		expect(source).toContain("Skipping persisted transient substatus cleanup");
+		expect(source).toContain("Skipping persisted subagent handoff");
+		expect(source).toContain("const narr = pgRuntime");
+		expect(source).not.toContain("const narr = await db.query.narrators.findFirst");
+		const subagentSource = await Bun.file(
+			new URL("../subagent-executor.ts", import.meta.url),
+		).text();
+		expect(subagentSource).toContain("cleanupBufferedTextFilesAsync");
+		expect(subagentSource).not.toContain("cleanupBufferedTextFiles(");
+	});
 });

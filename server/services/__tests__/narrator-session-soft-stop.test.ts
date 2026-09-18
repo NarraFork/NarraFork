@@ -220,7 +220,7 @@ describe("clearBufferedMessageSoftStopIfIdle", () => {
 
 		// One of several queued messages was cancelled; the rest still need the boundary.
 		await queueMessage("queued-b");
-		expect(removeBufferedMessage(NARRATOR_ID, first)).toBe(true);
+		expect(await removeBufferedMessage(NARRATOR_ID, first)).toBe(true);
 		expect(getBufferedMessages(NARRATOR_ID).map((message) => message.text)).toEqual(["queued-b"]);
 		clearBufferedMessageSoftStopIfIdle(NARRATOR_ID);
 

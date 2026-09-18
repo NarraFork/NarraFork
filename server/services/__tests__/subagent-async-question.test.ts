@@ -4,6 +4,7 @@ import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
+	narratorQuestions,
 	narrators,
 	narratorToolCalls,
 	users,
@@ -24,6 +25,8 @@ const { activeNarrators } = await import("../narrator-session-state");
 const { resolveToolFilter } = await import("../subagent-tools");
 
 const PARENT = "p5-parent";
+/** A second primary narrator — the "not yours" counterpart for ownership assertions. */
+const OTHER = "p5-other-primary";
 const CHILD = "p5-child";
 const SIBLING = "p5-sibling";
 const USER = "p5-user";
@@ -85,6 +88,7 @@ beforeEach(async () => {
 		.values({ id: USER, username: "p5-user", passwordHash: "unused", createdAt: now });
 	await db.insert(narrators).values([
 		{ id: PARENT, variant: "primary", createdAt: now, updatedAt: now },
+		{ id: OTHER, variant: "primary", createdAt: now, updatedAt: now },
 		{
 			id: CHILD,
 			variant: "subagent:general",
@@ -110,7 +114,7 @@ afterAll(() => {
 });
 
 async function seedCall(
-	narratorId = CHILD,
+	narratorId = PARENT,
 	input: Record<string, unknown> = { async: true, questions: QUESTIONS },
 ): Promise<
 	ToolContext & {
@@ -148,7 +152,7 @@ async function seedCall(
 	});
 	return {
 		narratorId,
-		parentNarratorId: narratorId === PARENT ? undefined : PARENT,
+		parentNarratorId: narratorId === CHILD || narratorId === SIBLING ? PARENT : undefined,
 		userId: USER,
 		currentToolUseId: toolUseId,
 		toolCallBinding: { toolCallId, attempt: 1 },
@@ -170,7 +174,7 @@ async function submit(ctx: ToolContext) {
 	return record;
 }
 
-describe("child async-only question integration", () => {
+describe("asynchronous question integration", () => {
 	test("principal snapshots distinguish unknown legacy identity from explicit anonymity", () => {
 		expect(questionService.parseQuestionExecutionPrincipal(null)).toBeNull();
 		expect(questionService.parseQuestionExecutionPrincipal(undefined)).toBeNull();
@@ -186,49 +190,42 @@ describe("child async-only question integration", () => {
 		});
 	});
 
-	for (const parentState of ["switched-user", "released"] as const) {
-		for (const originalUserId of [USER, null]) {
-			test(`late answer keeps original ${originalUserId ?? "anonymous"} principal when parent is ${parentState}`, async () => {
-				const now = new Date().toISOString();
-				await db.insert(users).values([
-					{ id: "p5-user-B", username: "p5-user-B", passwordHash: "unused", createdAt: now },
-					{ id: "p5-answer-C", username: "p5-answer-C", passwordHash: "unused", createdAt: now },
-				]);
-				const ctx = { ...(await seedCall()), userId: originalUserId };
-				const record = await submit(ctx);
-				await db
-					.update(narratorToolCalls)
-					.set({ status: "success" })
-					.where(eq(narratorToolCalls.id, ctx.toolCallBinding.toolCallId));
-				if (parentState === "switched-user")
-					activeNarrators.set(PARENT, {
-						narratorId: PARENT,
-						_currentUserId: "p5-user-B",
-					} as import("../narrator-session-state").ActiveNarrator);
-				else activeNarrators.delete(PARENT);
-				const answer = await questionService.answerAsyncQuestion(record.id, {
-					answers: { cache: "Disk" },
-					userId: "p5-answer-C",
-					locale: "en",
-				});
-				expect(answer.ok).toBe(true);
-				if (!answer.ok || !answer.record.answerMessageId)
-					throw new Error("late answer was not persisted");
-				expect(principals).toEqual([{ version: 1, userId: originalUserId }]);
-				expect(wakes).toEqual([CHILD]);
-				expect(await questionService.getAsyncQuestionExecutionPrincipal(record.id, CHILD)).toEqual({
-					version: 1,
-					userId: originalUserId,
-				});
-				expect(
-					await questionService.getAsyncQuestionExecutionPrincipal(record.id, SIBLING),
-				).toBeNull();
-				const message = await db.query.narratorMessages.findFirst({
-					where: eq(narratorMessages.id, answer.record.answerMessageId),
-				});
-				expect(message?.createdBy).toBe("p5-answer-C");
+	for (const originalUserId of [USER, null]) {
+		test(`late answer keeps the original ${originalUserId ?? "anonymous"} principal, not the answering actor`, async () => {
+			const now = new Date().toISOString();
+			await db.insert(users).values({
+				id: "p5-answer-C",
+				username: "p5-answer-C",
+				passwordHash: "unused",
+				createdAt: now,
 			});
-		}
+			const ctx = { ...(await seedCall()), userId: originalUserId };
+			const record = await submit(ctx);
+			await db
+				.update(narratorToolCalls)
+				.set({ status: "success" })
+				.where(eq(narratorToolCalls.id, ctx.toolCallBinding.toolCallId));
+			const answer = await questionService.answerAsyncQuestion(record.id, {
+				answers: { cache: "Disk" },
+				userId: "p5-answer-C",
+				locale: "en",
+			});
+			expect(answer.ok).toBe(true);
+			if (!answer.ok || !answer.record.answerMessageId)
+				throw new Error("late answer was not persisted");
+			expect(principals).toEqual([{ version: 1, userId: originalUserId }]);
+			expect(wakes).toEqual([PARENT]);
+			expect(await questionService.getAsyncQuestionExecutionPrincipal(record.id, PARENT)).toEqual({
+				version: 1,
+				userId: originalUserId,
+			});
+			// Ownership is exact: another session cannot read this question's principal.
+			expect(await questionService.getAsyncQuestionExecutionPrincipal(record.id, OTHER)).toBeNull();
+			const message = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, answer.record.answerMessageId),
+			});
+			expect(message?.createdBy).toBe("p5-answer-C");
+		});
 	}
 
 	test("model input cannot forge the execution principal captured from ToolContext", async () => {
@@ -244,9 +241,9 @@ describe("child async-only question integration", () => {
 			ctx,
 		);
 		expect(result.isError).not.toBe(true);
-		const record = (await questionService.listAsyncQuestions({ narratorId: CHILD })).items[0];
+		const record = (await questionService.listAsyncQuestions({ narratorId: PARENT })).items[0];
 		if (!record) throw new Error("question not stored");
-		expect(await questionService.getAsyncQuestionExecutionPrincipal(record.id, CHILD)).toEqual({
+		expect(await questionService.getAsyncQuestionExecutionPrincipal(record.id, PARENT)).toEqual({
 			version: 1,
 			userId: USER,
 		});
@@ -256,27 +253,38 @@ describe("child async-only question integration", () => {
 		const ctx = await seedCall();
 		const record = await submit(ctx);
 		await questionService.createAsyncQuestion({
-			narratorId: CHILD,
+			narratorId: PARENT,
 			toolCallId: ctx.toolCallBinding.toolCallId,
 			toolUseId: ctx.currentToolUseId,
 			questions: QUESTIONS,
 			executionPrincipal: { version: 1, userId: "different-actor" },
 		});
-		expect(await questionService.getAsyncQuestionExecutionPrincipal(record.id, CHILD)).toEqual({
+		expect(await questionService.getAsyncQuestionExecutionPrincipal(record.id, PARENT)).toEqual({
 			version: 1,
 			userId: USER,
 		});
 	});
 
-	test("unknown legacy principal preserves the late answer but never guesses a wake actor", async () => {
-		const ctx = await seedCall();
-		const { record } = await questionService.createAsyncQuestion({
+	/**
+	 * Legacy subagent rows are inserted directly: subagents can no longer FILE a
+	 * question, but rows created before that change still exist and must remain
+	 * answerable. The guard under test is that an unknown principal never lets the
+	 * server guess an actor to resume a child with.
+	 */
+	test("a legacy subagent row preserves the late answer but never guesses a wake actor", async () => {
+		const ctx = await seedCall(CHILD);
+		const now = new Date().toISOString();
+		await db.insert(narratorQuestions).values({
+			id: "p5-legacy-question",
 			narratorId: CHILD,
 			toolCallId: ctx.toolCallBinding.toolCallId,
 			toolUseId: ctx.currentToolUseId,
-			questions: QUESTIONS,
+			questionsJson: QUESTIONS,
+			status: "open",
+			origin: "agent_async",
+			createdAt: now,
 		});
-		const answer = await questionService.answerAsyncQuestion(record.id, {
+		const answer = await questionService.answerAsyncQuestion("p5-legacy-question", {
 			answers: { cache: "Disk" },
 			userId: USER,
 			locale: "en",
@@ -284,39 +292,42 @@ describe("child async-only question integration", () => {
 		expect(answer.ok).toBe(true);
 		if (!answer.ok) throw new Error("legacy answer lost");
 		expect(answer.record.answerMessageId).not.toBeNull();
-		expect(await questionService.getAsyncQuestionExecutionPrincipal(record.id, CHILD)).toBeNull();
+		expect(
+			await questionService.getAsyncQuestionExecutionPrincipal("p5-legacy-question", CHILD),
+		).toBeNull();
 		expect(wakes).toEqual([]);
 		expect(stops).toEqual([]);
 	});
 
-	test("policy exposes async only without widening readOnly, nesting or approval", () => {
+	/**
+	 * Subagents have no question capability at all. The schema assertion is a
+	 * regression guard for a concrete outage: the child-only schema variant carried a
+	 * top-level `anyOf`, which Anthropic rejects outright
+	 * (`input_schema does not support oneOf, allOf, or anyOf at the top level`),
+	 * failing EVERY turn of every subagent rather than just the question call.
+	 */
+	test("subagents cannot ask, and the advertised schema has no top-level combinator", () => {
 		for (const type of ["general", "explore", "plan", "review", "search", "missing-custom"]) {
 			const policy = resolveRuntimePolicy({ variant: "subagent", subagentType: type });
-			expect(policy.capabilities.askUserQuestion).toBe("async-only");
+			expect(policy.capabilities.askUserQuestion).toBe("disabled");
+			// Waiting on a question that already exists is a separate capability.
+			expect(policy.capabilities.awaitOwnQuestion).toBe(true);
 			const filter = resolveToolFilter(type);
-			expect(filter?.(askUserQuestionTool)).toBe(true);
-			for (const name of ["Agent", "ForkNarrator", "EnterPlanMode", "ExitPlanMode"])
-				expect(filter?.({ ...askUserQuestionTool, name })).toBe(false);
-			if (type !== "general")
-				expect(filter?.({ ...askUserQuestionTool, name: "Write" })).toBe(false);
+			expect(filter?.(askUserQuestionTool)).toBe(false);
+			expect(filter?.(awaitTool)).toBe(true);
 		}
-		const config = { parentNarratorId: PARENT } as AgentConfig;
-		const schema = askUserQuestionTool.getRawJsonSchema?.(config) as {
-			properties: { async: { const?: boolean } };
-			required: string[];
-			anyOf: unknown[];
-		};
-		expect(schema.properties.async.const).toBe(true);
-		expect(schema.required).toContain("async");
-		expect(schema.anyOf).toEqual([{ required: ["questions"] }, { required: ["withdraw"] }]);
-		const primary = askUserQuestionTool.getRawJsonSchema?.({} as AgentConfig) as {
-			required: string[];
-		};
-		expect(primary.required).not.toContain("async");
+		for (const config of [{ parentNarratorId: PARENT } as AgentConfig, {} as AgentConfig]) {
+			const schema = (askUserQuestionTool.getRawJsonSchema?.(config) ??
+				askUserQuestionTool.rawJsonSchema) as Record<string, unknown>;
+			for (const key of ["anyOf", "oneOf", "allOf"]) expect(schema[key]).toBeUndefined();
+		}
 	});
 
-	test("explicit custom allowlist can disable asking without revoking own question waits", () => {
-		const customDefinition = { toolAccess: "custom" as const, customTools: ["Read", "Await"] };
+	test("an explicit custom allowlist cannot re-enable asking", async () => {
+		const customDefinition = {
+			toolAccess: "custom" as const,
+			customTools: ["Read", "Await", "AskUserQuestion"],
+		};
 		const policy = resolveRuntimePolicy({
 			variant: "subagent",
 			subagentType: "custom",
@@ -336,6 +347,41 @@ describe("child async-only question integration", () => {
 		expect(filter?.(awaitTool)).toBe(true);
 	});
 
+	test("a subagent question is refused at the tool, the permission gate and the service", async () => {
+		const ctx = await seedCall(CHILD);
+		for (const input of [
+			{ questions: QUESTIONS },
+			{ async: true, questions: QUESTIONS },
+			{ async: true, withdraw: ["p5-nothing"] },
+		]) {
+			const result = await askUserQuestionTool.execute(input, ctx);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("not available under this runtime policy");
+			const decision = await handlePermission(
+				CHILD,
+				ctx.signal,
+				"AskUserQuestion",
+				input,
+				ctx.currentToolUseId,
+				ctx.cwd,
+				"en",
+				PARENT,
+				{ toolCallBinding: ctx.toolCallBinding },
+			);
+			expect(decision.behavior).toBe("deny");
+		}
+		await expect(
+			questionService.createAsyncQuestion({
+				narratorId: CHILD,
+				toolCallId: ctx.toolCallBinding.toolCallId,
+				toolUseId: ctx.currentToolUseId,
+				questions: QUESTIONS,
+			}),
+		).rejects.toThrow("not available under this runtime policy");
+		expect(await questionService.countOpenAsyncQuestions(CHILD)).toBe(0);
+		expect(events).toEqual([]);
+	});
+
 	test("primary tool retains synchronous answers and optional asynchronous submission", async () => {
 		const ctx = await seedCall(PARENT);
 		const result = await askUserQuestionTool.execute(
@@ -352,14 +398,14 @@ describe("child async-only question integration", () => {
 	test("permission allows async immediately; submission returns while question is still open", async () => {
 		const ctx = await seedCall();
 		const decision = await handlePermission(
-			CHILD,
+			PARENT,
 			ctx.signal,
 			"AskUserQuestion",
 			{ async: true, questions: QUESTIONS },
 			ctx.currentToolUseId,
 			ctx.cwd,
 			"en",
-			PARENT,
+			undefined,
 			{ toolCallBinding: ctx.toolCallBinding },
 		);
 		expect(decision.behavior).toBe("allow");
@@ -368,31 +414,30 @@ describe("child async-only question integration", () => {
 		expect(record.decidedBy).toBeNull();
 		expect(record.origin).toBe("agent_async");
 		expect(wakes).toEqual([]);
-		expect(events.map((event) => event.target)).toEqual([CHILD, PARENT]);
+		expect(events.map((event) => event.target)).toEqual([PARENT]);
 		for (const { event } of events)
 			expect(event).toMatchObject({
-				narratorId: CHILD,
-				question: { narratorId: CHILD, decidedBy: null },
+				narratorId: PARENT,
+				question: { narratorId: PARENT, decidedBy: null },
 			});
 	});
 
-	test("real executeTool carries the resolved policy through permission and durable child submission", async () => {
+	test("real executeTool carries the resolved policy through permission and durable submission", async () => {
 		const { executeTool } = await import("../../lib/agent/tool-executor");
 		const ctx = await seedCall();
-		const policy = resolveRuntimePolicy({ variant: "subagent", subagentType: "general" });
+		const policy = resolveRuntimePolicy({ variant: "primary" });
 		const config: AgentConfig = {
-			narratorId: CHILD,
+			narratorId: PARENT,
 			conversationId: "p5-real-execution",
 			provider: "anthropic",
 			model: "test-model",
 			cwd: ctx.cwd,
 			signal: ctx.signal,
 			locale: "en",
-			parentNarratorId: PARENT,
 			runtimePolicy: policy,
 			requireToolCallBinding: true,
 			permissionHandler: (name, input, id, options) =>
-				handlePermission(CHILD, ctx.signal, name, input, id, ctx.cwd, "en", PARENT, options),
+				handlePermission(PARENT, ctx.signal, name, input, id, ctx.cwd, "en", undefined, options),
 			onToolExecutionStarting: async (_id, binding) => binding,
 		};
 		const result = await executeTool(
@@ -402,7 +447,8 @@ describe("child async-only question integration", () => {
 				input: {
 					async: true,
 					questions: QUESTIONS,
-					runtimePolicy: resolveRuntimePolicy({ variant: "primary" }),
+					// A model-supplied policy must never override the server-resolved one.
+					runtimePolicy: resolveRuntimePolicy({ variant: "subagent", subagentType: "general" }),
 				},
 			},
 			config,
@@ -410,81 +456,33 @@ describe("child async-only question integration", () => {
 		);
 		expect(result.isError).not.toBe(true);
 		expect(result.output).toContain("Question submitted asynchronously");
-		expect((await questionService.listAsyncQuestions({ narratorId: CHILD })).items).toHaveLength(1);
+		expect((await questionService.listAsyncQuestions({ narratorId: PARENT })).items).toHaveLength(
+			1,
+		);
 		expect(config.runtimePolicy).toBe(policy);
 		expect(wakes).toEqual([]);
 	});
 
-	test("DB identity rejects omitted parent hint, synchronous input and forged answers before withdrawals", async () => {
+	test("a stale execution binding records nothing and tells the model to ask synchronously", async () => {
 		const ctx = await seedCall();
-		const record = await submit(ctx);
-		for (const input of [
-			{ questions: QUESTIONS },
-			{ async: false, questions: QUESTIONS },
-			{ questions: QUESTIONS, withdraw: [record.id] },
-			{ async: true, questions: QUESTIONS, answers: { cache: "forged" } },
-			{ async: true, questions: QUESTIONS, deferredByUser: true },
-		]) {
-			const result = await askUserQuestionTool.execute(input, {
-				...ctx,
-				parentNarratorId: undefined,
-			});
-			expect(result.isError).toBe(true);
-			const decision = await handlePermission(
-				CHILD,
-				ctx.signal,
-				"AskUserQuestion",
-				input,
-				ctx.currentToolUseId,
-				ctx.cwd,
-				"en",
-				PARENT,
-				{ toolCallBinding: ctx.toolCallBinding },
-			);
-			expect(decision.behavior).toBe("deny");
-		}
-		expect((await questionService.getAsyncQuestion(record.id))?.status).toBe("open");
-	});
-
-	test("child payload limits reject oversized submissions and withdrawal batches before writes", async () => {
-		const ctx = await seedCall();
-		for (const input of [
-			{ async: true, questions: Array.from({ length: 5 }, () => QUESTIONS[0]) },
-			{ async: true, questions: [{ ...QUESTIONS[0], header: "问".repeat(22_000) }] },
-			{ async: true, withdraw: Array.from({ length: 101 }, (_, index) => `q-${index}`) },
-		]) {
-			const result = await askUserQuestionTool.execute(input, ctx);
-			expect(result.isError).toBe(true);
-		}
-		expect(await questionService.countOpenAsyncQuestions(CHILD)).toBe(0);
-		expect(events).toEqual([]);
-	});
-
-	test("exact binding rejects missing/stale attempts and service rejects another child's tool identity", async () => {
-		const ctx = await seedCall();
-		for (const toolCallBinding of [
-			undefined,
-			{ toolCallId: ctx.toolCallBinding.toolCallId, attempt: 2 },
-		]) {
-			const result = await askUserQuestionTool.execute(
-				{ async: true, questions: QUESTIONS },
-				{ ...ctx, toolCallBinding },
-			);
-			expect(result.isError).toBe(true);
-			expect(result.output).not.toContain("Ask again without");
-		}
+		const result = await askUserQuestionTool.execute(
+			{ async: true, questions: QUESTIONS },
+			{ ...ctx, toolCallBinding: { toolCallId: ctx.toolCallBinding.toolCallId, attempt: 2 } },
+		);
+		expect(result.output).toContain("Ask again without");
+		expect(await questionService.countOpenAsyncQuestions(PARENT)).toBe(0);
 		await expect(
 			questionService.createAsyncQuestion({
-				narratorId: SIBLING,
+				narratorId: OTHER,
 				toolCallId: ctx.toolCallBinding.toolCallId,
 				toolUseId: ctx.currentToolUseId,
 				questions: QUESTIONS,
 			}),
 		).rejects.toThrow("does not belong");
-		expect(await questionService.countOpenAsyncQuestions(CHILD)).toBe(0);
+		expect(await questionService.countOpenAsyncQuestions(OTHER)).toBe(0);
 	});
 
-	test("answer persists only into child history with actual user attribution, then wakes the same child", async () => {
+	test("answer persists into the asking session's history with actual user attribution", async () => {
 		const ctx = await seedCall();
 		const record = await submit(ctx);
 		const answer = await questionService.answerAsyncQuestion(record.id, {
@@ -499,18 +497,18 @@ describe("child async-only question integration", () => {
 			where: eq(narratorMessages.id, answer.record.answerMessageId),
 		});
 		if (!message) throw new Error("missing persisted message");
-		expect(message).toMatchObject({ narratorId: CHILD, role: "user", createdBy: USER });
+		expect(message).toMatchObject({ narratorId: PARENT, role: "user", createdBy: USER });
 		expect(message?.contentText).toContain("Disk");
 		const refs = await db
 			.select()
 			.from(narratorMessageRefs)
 			.where(eq(narratorMessageRefs.messageId, message.id));
-		expect(refs.map((row) => row.narratorId)).toEqual([CHILD]);
-		expect(wakes).toEqual([CHILD]);
+		expect(refs.map((row) => row.narratorId)).toEqual([PARENT]);
+		expect(wakes).toEqual([PARENT]);
 		const own = await awaitTool.execute({ type: "question", id: record.id }, ctx);
 		expect(own.isError).not.toBe(true);
 		expect(own.output).toContain("Disk");
-		for (const narratorId of [SIBLING, PARENT]) {
+		for (const narratorId of [OTHER, CHILD]) {
 			const foreign = await awaitTool.execute(
 				{ type: "question", id: record.id },
 				{ ...ctx, narratorId },
@@ -519,7 +517,7 @@ describe("child async-only question integration", () => {
 		}
 	});
 
-	test("running child is interjected, not independently woken", async () => {
+	test("a running session is interjected, not independently woken", async () => {
 		const record = await submit(await seedCall());
 		running = true;
 		await questionService.answerAsyncQuestion(record.id, {
@@ -527,18 +525,15 @@ describe("child async-only question integration", () => {
 			userId: USER,
 			locale: "en",
 		});
-		expect(stops).toEqual([CHILD]);
+		expect(stops).toEqual([PARENT]);
 		expect(wakes).toEqual([]);
 	});
 
 	test("withdraw is own-only and a late answer is stale without history mutation", async () => {
 		const ctx = await seedCall();
 		const own = await submit(ctx);
-		const other = await submit(await seedCall(SIBLING));
-		const result = await askUserQuestionTool.execute(
-			{ async: true, withdraw: [own.id, other.id] },
-			ctx,
-		);
+		const other = await submit(await seedCall(OTHER));
+		const result = await askUserQuestionTool.execute({ withdraw: [own.id, other.id] }, ctx);
 		expect(result.output).toContain("Withdrew 1");
 		expect(result.output).toContain("Could not withdraw 1");
 		expect((await questionService.getAsyncQuestion(other.id))?.status).toBe("open");
@@ -551,24 +546,24 @@ describe("child async-only question integration", () => {
 		expect(wakes).toEqual([]);
 	});
 
-	test("wait timeout does not expire the question; answer after child task completion is still durable", async () => {
+	test("wait timeout does not expire the question; a later answer is still durable", async () => {
 		const ctx = await seedCall();
 		const record = await submit(ctx);
 		const timeout = new AbortController();
 		timeout.abort();
 		const result = await questionService.awaitAsyncQuestion({
-			narratorId: CHILD,
+			narratorId: PARENT,
 			questionId: record.id,
 			timeoutMs: 0,
 			timeoutSignal: timeout.signal,
 		});
 		expect(result.status).toBe("timeout");
-		// Completing the task is not consent to discard an unanswered question.
+		// Completing the turn is not consent to discard an unanswered question.
 		await db
 			.update(narratorToolCalls)
 			.set({ status: "success" })
 			.where(eq(narratorToolCalls.id, ctx.toolCallBinding.toolCallId));
-		await db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, CHILD));
+		await db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, PARENT));
 		expect((await questionService.getAsyncQuestion(record.id))?.status).toBe("open");
 		const answer = await questionService.answerAsyncQuestion(record.id, {
 			answers: { cache: "Disk" },
@@ -578,6 +573,6 @@ describe("child async-only question integration", () => {
 		expect(answer.ok).toBe(true);
 		if (!answer.ok) throw new Error("late answer lost");
 		expect(answer.record.answerMessageId).not.toBeNull();
-		expect(wakes).toEqual([CHILD]);
+		expect(wakes).toEqual([PARENT]);
 	});
 });

@@ -72,8 +72,8 @@ const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/
 afterEach(() => {
 	for (const id of ["parent", "child", "sibling"]) getExecutionOwner(id)?.release();
 });
-function agentQueued(id = "child") {
-	return listInboxRows(id, ["agent_message"]).map((row) => ({
+async function agentQueued(id = "child") {
+	return (await listInboxRows(id, ["agent_message"])).map((row) => ({
 		id: row.id,
 		delivery: inboxDelivery(row),
 		text: inboxAgentText(row),
@@ -219,7 +219,7 @@ describe("Send exact delivery receipts", () => {
 		const binding = { toolCallId: "send-attempt-id", attempt: 3 };
 		const sent = await send("parent", "child", { toolCallBinding: binding });
 		const id = sent.targets[0].deliveryMessageId as string;
-		expect(agentQueued()[0].delivery?.senderToolCallBinding).toEqual(binding);
+		expect((await agentQueued())[0].delivery?.senderToolCallBinding).toEqual(binding);
 		const prepared = await consume();
 		const saved = row(id);
 		expect(JSON.parse(saved?.content_json ?? "[]")[1].body.items[0].fromToolCallBinding).toEqual(
@@ -565,7 +565,7 @@ describe("Send exact delivery receipts", () => {
 		expect(result.targets[0].status).toBe("queued");
 		expect(id).toBeString();
 		expect(row(id)).toBeNull();
-		const envelope = agentQueued()[0].delivery;
+		const envelope = (await agentQueued())[0].delivery;
 		expect(notifications).toEqual([
 			expect.objectContaining({
 				id: "child",
@@ -600,7 +600,7 @@ describe("Send exact delivery receipts", () => {
 		const second = await send("sibling", "child", { toolUseId: "sibling-send" });
 		const ids = [first.targets[0].deliveryMessageId, second.targets[0].deliveryMessageId];
 		expect(ids[0]).not.toBe(ids[1]);
-		reorderSubagentBufferedMessages(
+		await reorderSubagentBufferedMessages(
 			"child",
 			getSubagentBufferedMessages("child")
 				.map((item) => item.id)
@@ -616,7 +616,7 @@ describe("Send exact delivery receipts", () => {
 		const result = await send();
 		const reserved = result.targets[0].deliveryMessageId;
 		clearSubagentBufferedMessages("child");
-		expect(agentQueued()).toHaveLength(1);
+		expect(await agentQueued()).toHaveLength(1);
 		await pushSubagentBufferedMessage("child", "[Message from the parent narrator]\nsame words");
 		await consume();
 		await consume();
@@ -632,7 +632,7 @@ describe("Send exact delivery receipts", () => {
 
 	test("human buffer editing cannot rewrite an accepted agent message or its attribution", async () => {
 		const result = await send();
-		const queued = agentQueued()[0];
+		const queued = (await agentQueued())[0];
 		expect(await updateSubagentBufferedMessage("child", queued.id, "human correction")).toBe(false);
 		await consume();
 		expect(row(result.targets[0].deliveryMessageId)?.content_text).toContain("same words");
@@ -672,7 +672,7 @@ describe("Send exact delivery receipts", () => {
 		resumeFails = true;
 		const result = await send();
 		expect(result.targets[0].status).toBe("queued");
-		expect(agentQueued()).toHaveLength(1);
+		expect(await agentQueued()).toHaveLength(1);
 		const human = await narratorService.persistSubagentUserMessage(
 			"child",
 			"[Message from the parent narrator]\nsame words",
@@ -686,7 +686,7 @@ describe("Send exact delivery receipts", () => {
 		const id = result.targets[0].deliveryMessageId;
 		expect(row(id)).toBeNull();
 		expect(tryClaimExecution("parent", "primary")).not.toBeNull();
-		const claimed = claimInboxHead("parent", (row) => row.kind === "agent_message");
+		const claimed = await claimInboxHead("parent", (row) => row.kind === "agent_message");
 		if (!claimed) throw new Error("Expected parent mailbox claim");
 		const [{ message }] = runItems([projectPendingInjection(claimed)], "subagent_message");
 		expect(message.delivery?.recipientMessageId).toBe(id);
@@ -706,6 +706,9 @@ describe("Send exact delivery receipts", () => {
 		});
 		expect(injected.messageId).toBe(id ?? null);
 		expect(row(id)?.role).toBe("sys");
+		const nativeBlocks = JSON.parse(row(id)?.content_json ?? "[]");
+		expect(nativeBlocks).toHaveLength(1);
+		expect(nativeBlocks[0].modelText).toBe(injected.turnText);
 		expect(consumedAt(id, "parent")).toBeNull();
 		const source = row(id);
 		const history: unknown[] = [];
@@ -754,8 +757,8 @@ describe("Send exact delivery receipts", () => {
 				revision: 1,
 			},
 		]);
-		expect(agentQueued()[0].delivery?.text).toBe("same words");
-		expect(agentQueued()[0].text).toContain("[Reply requested");
+		expect((await agentQueued())[0].delivery?.text).toBe("same words");
+		expect((await agentQueued())[0].text).toContain("[Reply requested");
 	});
 
 	test("explicit replies point to the existing waiting Send row without another inbox message", async () => {
@@ -780,7 +783,7 @@ describe("Send exact delivery receipts", () => {
 		const result = await send("child", "parent", { replyTo: wait.requestId });
 		expect(result.targets[0].deliveryMessageId).toBe("wait-message");
 		expect(await wait.promise).toMatchObject({ status: "replied", message: "same words" });
-		expect(drainPendingInjections("parent")).toHaveLength(0);
+		expect(await drainPendingInjections("parent")).toHaveLength(0);
 		expect(
 			sqlite.prepare("SELECT id FROM narrator_messages WHERE id NOT LIKE 'source-message-%'").all(),
 		).toHaveLength(1);
@@ -838,7 +841,7 @@ describe("Send exact delivery receipts", () => {
 			.run(now);
 		const result = await send("parent", "child", { userId: "editor" });
 		runtimeInbox.cancel(
-			agentQueued()[0].delivery.deliveryId as string,
+			(await agentQueued())[0].delivery.deliveryId as string,
 			"explicit test cancellation",
 		);
 		await pushSubagentBufferedMessage("child", "draft", { createdBy: "editor" });
@@ -921,7 +924,7 @@ describe("Send exact delivery receipts", () => {
 	test("edited human input rolls back message/ref/version and requeues on a real transaction failure", async () => {
 		const result = await send();
 		runtimeInbox.cancel(
-			agentQueued()[0].delivery.deliveryId as string,
+			(await agentQueued())[0].delivery.deliveryId as string,
 			"explicit test cancellation",
 		);
 		await pushSubagentBufferedMessage("child", "draft");
@@ -1014,7 +1017,7 @@ describe("Send exact delivery receipts", () => {
 					failure.mockRestore();
 				}
 				persistedAtFirstBoundary = row(reserved) !== null;
-				queuedAfterFailure = agentQueued().length;
+				queuedAfterFailure = (await agentQueued()).length;
 				const prepared = await input.config.getAfterToolsInjections?.();
 				secondText = injectionText(prepared);
 				expect(consumedAt(reserved)).toBeNull();
@@ -1100,7 +1103,7 @@ describe("Send exact delivery receipts", () => {
 			},
 		]);
 		expect(stale).toEqual([]);
-		expect(drainPendingInjections("parent")).toHaveLength(0);
+		expect(await drainPendingInjections("parent")).toHaveLength(0);
 		expect(
 			sqlite.prepare("SELECT id FROM narrator_messages WHERE id NOT LIKE 'source-message-%'").all(),
 		).toHaveLength(2);
@@ -1119,17 +1122,17 @@ describe("Send exact delivery receipts", () => {
 			isBroadcast: true,
 		};
 		sourceBinding("parent", "team-send", message.fromToolCallBinding);
-		const first = deliverTeamMessage("child", message, "parent");
-		const second = deliverTeamMessage("sibling", message, "parent");
+		const first = await deliverTeamMessage("child", message, "parent");
+		const second = await deliverTeamMessage("sibling", message, "parent");
 		expect(first).toBeString();
 		expect(first).not.toBe(second);
 		expect(tryClaimExecution("child", "subagent")).not.toBeNull();
-		const claimed = claimInboxHead("child", (row) => row.kind === "agent_message");
+		const claimed = await claimInboxHead("child", (row) => row.kind === "agent_message");
 		if (!claimed) throw new Error("Expected team mailbox claim");
 		const childMessage = projectTeamMessage(claimed);
 		expect(childMessage.delivery?.recipientMessageId).toBe(first);
 		expect(childMessage.delivery?.senderToolCallBinding).toEqual(message.fromToolCallBinding);
-		expect(drainTeamInbox("sibling")[0].delivery?.recipientMessageId).toBe(second);
+		expect((await drainTeamInbox("sibling"))[0].delivery?.recipientMessageId).toBe(second);
 		expect(row(first)).toBeNull();
 		expect(getSubagentBufferedMessages("child")).toHaveLength(0);
 		const injection = await deliverInjection("child", {
@@ -1149,6 +1152,9 @@ describe("Send exact delivery receipts", () => {
 			schedule: "onNextTurn",
 		});
 		expect(consumedAt(first)).toBeNull();
+		const teamBlocks = JSON.parse(row(first)?.content_json ?? "[]");
+		expect(teamBlocks).toHaveLength(1);
+		expect(teamBlocks[0].modelText).toBe(injection.turnText);
 		const history: unknown[] = [];
 		trackAgentMessageHistory(
 			"child",

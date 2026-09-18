@@ -29,7 +29,12 @@ import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
-import { DEFAULT_CONTEXT_THRESHOLDS, LARGE_CONTEXT_BOUNDARY, settings } from "../lib/settings";
+import {
+	DEFAULT_CONTEXT_THRESHOLDS,
+	LARGE_CONTEXT_BOUNDARY,
+	resolveTranslationModelOverride,
+	settings,
+} from "../lib/settings";
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
@@ -813,9 +818,20 @@ export function isSameReasoningBlock(block: unknown, reasoningText: string): boo
 }
 
 /**
- * Translate a reasoning block's text via the summary model, then patch the
- * message in DB and broadcast the updated message to connected clients.
+ * Translate a reasoning block's text via `agent.translationModel`, then patch
+ * the message in DB and broadcast the updated message to connected clients.
  * Runs as fire-and-forget — errors are logged but never propagate.
+ *
+ * The model comes from `resolveTranslationModelOverride()`, which returns
+ * `undefined` while the setting follows the summary model. That is the only
+ * reason translation ever runs on the summary model: it must be the *fallback*,
+ * not the hardcoded target. Passing no override at all — as this did before —
+ * makes the user's translation-model setting silently inert.
+ *
+ * `reportSummaryModelErrors` is false because a failure here belongs to the
+ * translation model, and the summary-model picker modal it would otherwise open
+ * saves to `agent.summaryModel` — pointing the user at the wrong setting and
+ * changing a model that was working.
  */
 function translateReasoningBlock(
 	messageId: string,
@@ -840,6 +856,11 @@ function translateReasoningBlock(
 				reasoningText,
 				`You are a translator. Translate the following AI reasoning/thinking content into ${langName}. Preserve the original meaning, technical terms, and markdown formatting. Output ONLY the translation, no explanations.`,
 				{ narratorId, kind: "reasoning_translation" },
+				undefined,
+				undefined,
+				resolveTranslationModelOverride(),
+				undefined,
+				false,
 			);
 			const translated = result.text?.trim();
 			if (!translated) return;

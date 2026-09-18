@@ -234,7 +234,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 				"first",
 				"second",
 			]);
-			expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
+			expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
 		});
 
 		test("taken-over user messages can queue without requesting soft-stop", async () => {
@@ -243,7 +243,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			expect(getSubagentBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
 				"manual",
 			]);
-			expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
+			expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
 		});
 
 		test("buffer soft-stop remains active while queued messages remain", async () => {
@@ -251,8 +251,8 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			await pushSubagentBufferedMessage(SUBAGENT_ID, "second");
 			requestSubagentBufferedMessageSoftStop(SUBAGENT_ID);
 
-			expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
-			expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
+			expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
+			expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
 		});
 
 		test("clearing the subagent buffer also clears its soft-stop request", async () => {
@@ -261,7 +261,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 
 			clearSubagentBufferedMessages(SUBAGENT_ID);
 
-			expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
+			expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
 		});
 	});
 
@@ -324,11 +324,11 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			const queued = await pushSubagentBufferedMessage(SUBAGENT_ID, "only");
 			requestSubagentBufferedMessageSoftStop(SUBAGENT_ID);
 
-			expect(removeSubagentBufferedMessage(SUBAGENT_ID, queued.id)).toBe(true);
+			expect(await removeSubagentBufferedMessage(SUBAGENT_ID, queued.id)).toBe(true);
 
 			expect(getSubagentBufferedMessages(SUBAGENT_ID)).toEqual([]);
 			// A stale soft stop would end the next turn with nothing left to resume.
-			expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
+			expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
 		});
 
 		test("removing one of several messages keeps the rest and the soft stop", async () => {
@@ -336,18 +336,18 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			await pushSubagentBufferedMessage(SUBAGENT_ID, "second");
 			requestSubagentBufferedMessageSoftStop(SUBAGENT_ID);
 
-			expect(removeSubagentBufferedMessage(SUBAGENT_ID, first.id)).toBe(true);
+			expect(await removeSubagentBufferedMessage(SUBAGENT_ID, first.id)).toBe(true);
 
 			expect(getSubagentBufferedMessages(SUBAGENT_ID).map((m) => m.text)).toEqual(["second"]);
-			expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
+			expect(await shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(true);
 		});
 
 		test("unknown ids report a miss so the caller can fall back to the primary queue", async () => {
 			await pushSubagentBufferedMessage(SUBAGENT_ID, "queued");
 
-			expect(removeSubagentBufferedMessage(SUBAGENT_ID, "no-such-id")).toBe(false);
+			expect(await removeSubagentBufferedMessage(SUBAGENT_ID, "no-such-id")).toBe(false);
 			expect(await updateSubagentBufferedMessage(SUBAGENT_ID, "no-such-id", "edited")).toBe(false);
-			expect(removeSubagentBufferedMessage("no-such-subagent", "no-such-id")).toBe(false);
+			expect(await removeSubagentBufferedMessage("no-such-subagent", "no-such-id")).toBe(false);
 		});
 
 		test("editing a queued message replaces its text", async () => {
@@ -362,15 +362,17 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			const first = await pushSubagentBufferedMessage(SUBAGENT_ID, "first");
 			const second = await pushSubagentBufferedMessage(SUBAGENT_ID, "second");
 
-			expect(reorderSubagentBufferedMessages(SUBAGENT_ID, [second.id, first.id])).toBe(true);
+			expect(await reorderSubagentBufferedMessages(SUBAGENT_ID, [second.id, first.id])).toBe(true);
 			expect(getSubagentBufferedMessages(SUBAGENT_ID).map((m) => m.text)).toEqual([
 				"second",
 				"first",
 			]);
 
 			// A partial or foreign id list must leave the queue untouched.
-			expect(reorderSubagentBufferedMessages(SUBAGENT_ID, [first.id])).toBe(false);
-			expect(reorderSubagentBufferedMessages(SUBAGENT_ID, [second.id, "foreign"])).toBe(false);
+			expect(await reorderSubagentBufferedMessages(SUBAGENT_ID, [first.id])).toBe(false);
+			expect(await reorderSubagentBufferedMessages(SUBAGENT_ID, [second.id, "foreign"])).toBe(
+				false,
+			);
 			expect(getSubagentBufferedMessages(SUBAGENT_ID).map((m) => m.text)).toEqual([
 				"second",
 				"first",

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq } from "drizzle-orm";
@@ -2178,6 +2179,12 @@ function classifyShellDanger(
 		context,
 	);
 	if (externalPaths.length > 0) {
+		// Scratch writes confined to system temp directories keep their visibility but
+		// drop from "high" to "medium": the light reflection level only pauses on high,
+		// so `… > /tmp/x` no longer triggers a full reflection round there, while
+		// standard/strict (threshold medium and below) still do.
+		const tempDowngrade =
+			bashAnalysis.hasWriteOperation && allExternalPathsAreSystemTemp(externalPaths);
 		return danger(
 			"Shell command accesses paths outside the current working directory.",
 			[
@@ -2189,7 +2196,7 @@ function classifyShellDanger(
 				"Use a narrower command scoped to explicit paths.",
 			],
 			[`External paths: ${externalPaths.join(", ")}`],
-			bashAnalysis.hasWriteOperation ? "high" : "low",
+			tempDowngrade ? "medium" : bashAnalysis.hasWriteOperation ? "high" : "low",
 		);
 	}
 	return null;
@@ -2335,6 +2342,9 @@ export function classifyDanger(
 	const toolPaths = getToolPolicyPaths(toolName, input, cwd, bashAnalysis, executionContext);
 	const externalPaths = describeExternalPaths(cwd, toolPaths, policy, "write", executionContext);
 	if (externalPaths.length > 0) {
+		// Same temp-dir downgrade as the shell branch: a Write tool scratch file under
+		// /tmp stays visible to standard/strict but does not pause the light level.
+		const tempDowngrade = allExternalPathsAreSystemTemp(externalPaths);
 		return danger(
 			`${toolName} targets paths outside the current working directory.`,
 			[
@@ -2346,11 +2356,34 @@ export function classifyDanger(
 				"Use explicit user approval for external files.",
 			],
 			[`External paths: ${externalPaths.join(", ")}`],
-			"high",
+			tempDowngrade ? "medium" : "high",
 		);
 	}
 
 	return null;
+}
+
+/**
+ * System temp directories, for the danger-reflection severity downgrade only.
+ *
+ * Writes into `/tmp` (and the OS tmpdir) are disposable scratch work, not worktree
+ * content: they are outside project git history either way, but they are also outside
+ * every user asset. Pausing the whole session to reflect on `echo hi > /tmp/x` — which
+ * the light level does, because the external-path write classifies as "high" — turned
+ * throwaway shell plumbing into a full reflection round. Downgraded to "medium", the
+ * light level (threshold = high) skips it while standard and strict still pause.
+ *
+ * Only used by classifyDanger; the permission decision path keeps its own checks, so a
+ * directory blacklist targeting /tmp still denies those writes before any of this runs.
+ */
+function isSystemTempDirPath(path: string): boolean {
+	const normalized = resolvePath(path);
+	if (normalized === "/tmp") return true;
+	return isInsidePath(tmpdir(), normalized);
+}
+
+function allExternalPathsAreSystemTemp(paths: string[]): boolean {
+	return paths.length > 0 && paths.every(isSystemTempDirPath);
 }
 
 function dangerSeverityRank(severity: DangerSeverity): number {
@@ -3769,7 +3802,7 @@ export async function handlePermission(
 	if (toolName === "AskUserQuestion") {
 		try {
 			const { assertNarratorCanAskQuestion } = await import("./narrator-question-service");
-			await assertNarratorCanAskQuestion(narratorId, effectiveInput);
+			await assertNarratorCanAskQuestion(narratorId);
 		} catch (error) {
 			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
 		}

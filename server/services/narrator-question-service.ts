@@ -332,12 +332,9 @@ export async function resolveNarratorQuestionPolicy(narratorId: string): Promise
 	});
 }
 
-export async function assertNarratorCanAskQuestion(
-	narratorId: string,
-	input: unknown,
-): Promise<RuntimePolicy> {
+export async function assertNarratorCanAskQuestion(narratorId: string): Promise<RuntimePolicy> {
 	const policy = await resolveNarratorQuestionPolicy(narratorId);
-	assertRuntimeCanAskQuestion(policy, input);
+	assertRuntimeCanAskQuestion(policy);
 	return policy;
 }
 
@@ -374,11 +371,7 @@ export interface CreateAsyncQuestionArgs {
 export async function createAsyncQuestion(
 	args: CreateAsyncQuestionArgs,
 ): Promise<{ record: AsyncQuestionRecord; created: boolean }> {
-	await assertNarratorCanAskQuestion(args.narratorId, {
-		async: true,
-		questions: args.questions,
-		...(args.origin === "user_deferred" ? { deferredByUser: true } : {}),
-	});
+	await assertNarratorCanAskQuestion(args.narratorId);
 	const call = await db.query.narratorToolCalls.findFirst({
 		where: and(
 			eq(narratorToolCalls.id, args.toolCallId),

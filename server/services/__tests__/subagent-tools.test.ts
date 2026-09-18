@@ -99,7 +99,7 @@ describe("resolveToolFilter", () => {
 			expect(filter(contextAskTool)).toBe(true);
 			expect(filter(makeTool("Write"))).toBe(false);
 			expect(filter(makeTool("Edit"))).toBe(false);
-			expect(filter(askUserQuestionTool)).toBe(true);
+			expect(filter(askUserQuestionTool)).toBe(false);
 			expect(filter(mcpWriteTool)).toBe(false);
 			expect(filter(mcpAskTool)).toBe(false);
 			expect(filter(mcpDeniedTool)).toBe(false);
@@ -132,7 +132,7 @@ describe("resolveToolFilter", () => {
 		expect(filter(makeTool("Edit"))).toBe(true);
 		expect(filter(mcpReadTool)).toBe(true);
 		expect(filter(contextAskTool)).toBe(true);
-		expect(filter(askUserQuestionTool)).toBe(true);
+		expect(filter(askUserQuestionTool)).toBe(false);
 		expect(filter(mcpWriteTool)).toBe(true);
 		expect(filter(mcpAskTool)).toBe(true);
 		expect(filter(mcpUnsetTool)).toBe(true);
@@ -160,7 +160,8 @@ describe("resolveToolFilter", () => {
 		expect(filter(readTool)).toBe(true);
 		expect(filter(grepTool)).toBe(false);
 		expect(filter(contextAskTool)).toBe(false);
-		expect(filter(askUserQuestionTool)).toBe(true);
+		// The capability gate overrides an explicit customTools listing.
+		expect(filter(askUserQuestionTool)).toBe(false);
 		expect(filter(mcpWriteTool)).toBe(true);
 		expect(filter(mcpUnsetTool)).toBe(true);
 		expect(filter(mcpAskTool)).toBe(false);
