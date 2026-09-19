@@ -33,7 +33,9 @@ const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const provider = await import("../../lib/agent/provider");
 const executor = await import("../narrator-executor");
-const { runAgentLoopUnlocked } = await import("../agent-runtime/orchestrator");
+const { isGitCommandToolResult, runAgentLoopUnlocked } = await import(
+	"../agent-runtime/orchestrator"
+);
 const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");
 const { activeNarrators } = await import("../narrator-session-state");
 const { settings } = await import("../../lib/settings");
@@ -172,6 +174,21 @@ function fixture(
 		run: (text = "same input") => runAgentLoopUnlocked(session, owner, text, undefined, profile),
 	};
 }
+
+describe("Bash Git command detection for status refresh", () => {
+	test("uses parsed command nodes instead of matching argument text", async () => {
+		expect(await isGitCommandToolResult("Bash", { command: "git status" }, "/tmp")).toBe(true);
+		expect(await isGitCommandToolResult("Bash", { command: "git commit -m fix" }, "/tmp")).toBe(
+			true,
+		);
+		expect(await isGitCommandToolResult("Bash", { command: "echo ok && git status" }, "/tmp")).toBe(
+			true,
+		);
+		expect(await isGitCommandToolResult("Bash", { command: "echo git" }, "/tmp")).toBe(false);
+		expect(await isGitCommandToolResult("Bash", { command: "printf git" }, "/tmp")).toBe(false);
+		expect(await isGitCommandToolResult("Write", { command: "git status" }, "/tmp")).toBe(false);
+	});
+});
 
 describe("real shared orchestrator profile contract", () => {
 	for (const kind of ["references", "bash"] as const) {

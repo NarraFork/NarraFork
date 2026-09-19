@@ -2863,7 +2863,7 @@ describe("adaptSegment — prefer-open AskUserQuestion", () => {
 		expect((enter?.opts as { collapsesByLod?: boolean })?.collapsesByLod).toBe(true);
 	});
 
-	it("keeps ExitPlanMode as a full card at L2", () => {
+	it("keeps a denied ExitPlanMode as a full card at L2", () => {
 		const specs = adaptSegment(
 			{
 				kind: "tool-run",
@@ -2873,13 +2873,21 @@ describe("adaptSegment — prefer-open AskUserQuestion", () => {
 					{
 						blockIndex: 1,
 						isSubagent: false,
-						tc: { toolName: "ExitPlanMode", toolUseId: "tu-exit" },
+						tc: {
+							toolName: "ExitPlanMode",
+							toolUseId: "tu-exit",
+							status: "fail",
+							permissionDenyMessage: "please split step two",
+						},
 					},
 				],
 			},
 			{ lod: 2 },
 		);
-		expect(specs.some((s) => s.key === "tool-tu-exit")).toBe(true);
+		const exit = specs.find((s) => s.key === "tool-tu-exit");
+		expect(exit).toBeDefined();
+		expect((exit?.opts as { preferOpen?: boolean })?.preferOpen).toBe(true);
+		expect((exit?.opts as { collapsesByLod?: boolean })?.collapsesByLod).toBe(false);
 		expect(specs.some((s) => s.kind === "tool-run-count")).toBe(true);
 	});
 });

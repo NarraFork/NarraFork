@@ -103,6 +103,7 @@ spec:/
 # `artifacts/` also holds hand-captured screenshots that are the user's own files.
 artifacts/dual-database-regression/
 artifacts/git-expand-review/
+artifacts/*.png
 
 # VS Code extension: build output and packaged artifacts. The SOURCES are tracked;
 # only the compiled `out/` and the .vsix are derived. `node_modules` is separate from

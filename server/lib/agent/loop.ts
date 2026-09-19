@@ -3137,6 +3137,7 @@ export async function* agentLoop(
 						toolCallBinding: executionBindings.get(tu),
 						toolUseId: tu.toolUseId,
 						toolName: tu.name,
+						input: settled.updatedInput ?? tu.input,
 						output: baseOutput,
 						isError: settled.isError ?? false,
 						durationMs: settled.durationMs,
@@ -4470,6 +4471,7 @@ export async function* agentLoop(
 												toolCallBinding: executionBindings.get(prevTu),
 												toolUseId: prevTu.toolUseId,
 												toolName: prevTu.name,
+												input: sr.updatedInput ?? prevTu.input,
 												output: baseOutput,
 												isError: sr.isError ?? false,
 												durationMs: sr.durationMs,
@@ -6259,6 +6261,7 @@ export async function* agentLoop(
 					toolCallBinding: executionBindings.get(tu),
 					toolUseId: tu.toolUseId,
 					toolName: tu.name,
+					input: sr.updatedInput ?? tu.input,
 					output: baseOutput,
 					isError: sr.isError ?? false,
 					durationMs: sr.durationMs,
@@ -6442,6 +6445,7 @@ export async function* agentLoop(
 							toolCallBinding: executionBindings.get(tu),
 							toolUseId: tu.toolUseId,
 							toolName: tu.name,
+							input: result.updatedInput ?? tu.input,
 							output: result.broken
 								? getToolMessage("brokenToolCallResult", locale)
 								: result.output,
@@ -6530,6 +6534,7 @@ export async function* agentLoop(
 								toolCallBinding: executionBindings.get(tu),
 								toolUseId: tu.toolUseId,
 								toolName: tu.name,
+								input: effectiveResult.updatedInput ?? tu.input,
 								output: effectiveResult.broken
 									? getToolMessage("brokenToolCallResult", locale)
 									: effectiveResult.output,
@@ -6604,6 +6609,7 @@ export async function* agentLoop(
 									toolCallBinding: executionBindings.get(remainingTool),
 									toolUseId: remainingTool.toolUseId,
 									toolName: remainingTool.name,
+									input: remainingTool.input,
 									output: skippedOutput,
 									isError: true,
 									durationMs: 0,
@@ -6638,6 +6644,7 @@ export async function* agentLoop(
 								toolCallBinding: executionBindings.get(remainingTool),
 								toolUseId: remainingTool.toolUseId,
 								toolName: remainingTool.name,
+								input: result.updatedInput ?? remainingTool.input,
 								output: result.broken
 									? getToolMessage("brokenToolCallResult", locale)
 									: result.output,

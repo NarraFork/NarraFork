@@ -151,6 +151,39 @@ describe("groupToolRunItemsForLod", () => {
 			item: { tc: { toolUseId: "ask-1", toolName: "AskUserQuestion" } },
 		});
 	});
+
+	test("a denied ExitPlanMode stays a standalone card out of the fold", () => {
+		const deniedPlan = toolMessage("message-plan", "plan-1", "", { status: "fail" });
+		deniedPlan.toolCalls = [
+			{
+				id: "call-plan-1",
+				toolUseId: "plan-1",
+				toolName: "ExitPlanMode",
+				status: "fail",
+				permissionDenyMessage: "please split step two",
+			},
+		];
+		(deniedPlan.contentJson as unknown[])[1] = {
+			type: "tool_use",
+			id: "plan-1",
+			name: "ExitPlanMode",
+			input: { plan: "# Plan\\n\\nThe plan was rejected." },
+		};
+		const units = groupRenderUnits(
+			segmentMessages([
+				toolMessage("message-0", "tool-0", "", { status: "success" }),
+				deniedPlan,
+				toolMessage("message-2", "tool-2", "", { status: "success" }),
+			]),
+			true,
+		);
+		const keptItems = units.flatMap((unit) =>
+			unit.kind === "segment" && unit.seg.kind === "tool-run" ? unit.seg.items : [],
+		);
+		expect(keptItems).toMatchObject([
+			{ tc: { toolUseId: "plan-1", toolName: "ExitPlanMode", status: "fail" } },
+		]);
+	});
 });
 
 describe("communication remains chronological conversation content", () => {

@@ -409,6 +409,8 @@ export type AgentEvent =
 			toolCallBinding?: ToolCallBinding;
 			toolUseId: string;
 			toolName: string;
+			/** Actual input used by the completed tool attempt, after any permission redirect. */
+			input?: Record<string, unknown>;
 			output: string;
 			isError: boolean;
 			durationMs?: number;

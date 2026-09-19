@@ -1,16 +1,56 @@
 import { Popover, Stack, Text, UnstyledButton } from "@mantine/core";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import {
+	calculateEffectiveTurnElapsedMs,
+	formatColonDuration,
+	formatFullLocaleDateTime,
+} from "../../../lib/format";
 import { TruncatedText } from "../../common/TruncatedText";
+import type { RetryInfo } from "../useNarratorPanelWS";
 
-export function TurnElapsedTime({
-	text,
-	startedAtLabel,
-	isMobile,
-}: {
-	text: string;
-	startedAtLabel: string | null;
+/** A clock must update its small display, never the narrator shell or message list. */
+function useDisplayClock(enabled: boolean) {
+	const [, tick] = useReducer((value: number) => value + 1, 0);
+	useEffect(() => {
+		if (!enabled) return;
+		const timer = setInterval(tick, 1000);
+		return () => clearInterval(timer);
+	}, [enabled]);
+}
+
+export interface TurnElapsedTimeProps {
+	turnStartedAt?: string | null | undefined;
+	endAt?: string | null | undefined;
+	running?: boolean;
+	substatus?: readonly string[];
+	text?: string | null;
+	startedAtLabel?: string | null;
 	isMobile: boolean;
-}) {
+}
+
+export const TurnElapsedTime = memo(function TurnElapsedTime({
+	turnStartedAt,
+	endAt,
+	running,
+	substatus,
+	text: propText,
+	startedAtLabel: propStartedAtLabel,
+	isMobile,
+}: TurnElapsedTimeProps) {
+	const { t, i18n } = useTranslation("narrator");
+	// Derive from current props during render: switching narrator/turn or stopping
+	// must not display the previous turn's cached elapsed value for one commit.
+	const elapsedMs =
+		turnStartedAt != null
+			? calculateEffectiveTurnElapsedMs({
+					turnStartedAt,
+					endAt: running ? undefined : endAt,
+					nowMs: Date.now(),
+					substatus,
+				})
+			: null;
+	useDisplayClock(running === true && elapsedMs != null);
 	const [opened, setOpened] = useState(false);
 	const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const cancelClose = useCallback(() => {
@@ -28,18 +68,23 @@ export function TurnElapsedTime({
 	}, [cancelClose]);
 	useEffect(() => () => cancelClose(), [cancelClose]);
 
-	// Without a popover the row has nothing else to reveal the clipped tail, so
-	// the text carries its own overflow tooltip. With a popover the full string
-	// goes into the dropdown instead — nesting a tooltip inside a popover target
-	// would open two overlapping bubbles for the same gesture.
+	let text: string;
+	let startedAtLabel: string | null;
+
+	if (propText != null) {
+		text = propText;
+		startedAtLabel = propStartedAtLabel ?? null;
+	} else {
+		if (elapsedMs == null) return null;
+		const duration = formatColonDuration(elapsedMs / 1000);
+		text = running ? duration : `· ${t("lastTurnDuration", { duration })}`;
+		const startedAt = turnStartedAt ? formatFullLocaleDateTime(turnStartedAt, i18n.language) : null;
+		startedAtLabel = startedAt ? t("toolStartedAt", { time: startedAt }) : null;
+	}
+
+	// Without a popover, TruncatedText supplies the overflow reveal affordance.
 	if (!startedAtLabel)
 		return <TruncatedText size="xs" c="dimmed" text={text} style={{ maxWidth: "100%" }} />;
-
-	const elapsedText = (
-		<Text size="xs" c="dimmed" truncate style={{ minWidth: 0, maxWidth: "100%" }}>
-			{text}
-		</Text>
-	);
 
 	return (
 		<Popover opened={opened} onChange={setOpened} position="top" withArrow withinPortal shadow="md">
@@ -49,7 +94,7 @@ export function TurnElapsedTime({
 					onClick={(event) => {
 						event.stopPropagation();
 						cancelClose();
-						setOpened((opened) => !opened);
+						setOpened((value) => !value);
 					}}
 					onPointerDown={(event) => event.stopPropagation()}
 					onPointerEnter={() => {
@@ -64,7 +109,9 @@ export function TurnElapsedTime({
 					aria-label={`${text}, ${startedAtLabel}`}
 					style={{ display: "inline-flex", minWidth: 0, maxWidth: "100%", cursor: "pointer" }}
 				>
-					{elapsedText}
+					<Text size="xs" c="dimmed" truncate style={{ minWidth: 0, maxWidth: "100%" }}>
+						{text}
+					</Text>
 				</UnstyledButton>
 			</Popover.Target>
 			<Popover.Dropdown
@@ -75,8 +122,6 @@ export function TurnElapsedTime({
 					if (!isMobile) scheduleClose();
 				}}
 			>
-				{/* The inline label is the part the row clips, so repeat it in full here:
-				    the popover is the only reveal affordance this control has. */}
 				<Stack gap={2}>
 					<Text size="xs" style={{ overflowWrap: "anywhere" }}>
 						{text}
@@ -88,4 +133,26 @@ export function TurnElapsedTime({
 			</Popover.Dropdown>
 		</Popover>
 	);
-}
+});
+
+/** Countdown and overflow tooltip share the same live string. */
+export const RetryCountdownText = memo(function RetryCountdownText({
+	retryInfo,
+	color,
+}: {
+	retryInfo: RetryInfo | null;
+	color: string;
+}) {
+	const { t } = useTranslation("narrator");
+	const remaining = retryInfo ? Math.max(0, Math.ceil((retryInfo.retryAt - Date.now()) / 1000)) : 0;
+	useDisplayClock(remaining > 0);
+	const params = {
+		count: retryInfo?.retryCount,
+		max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
+	};
+	const text =
+		remaining > 0
+			? t("retryingCountdown", { ...params, seconds: remaining })
+			: t("retryingNow", params);
+	return <TruncatedText size="xs" c={color} text={text} />;
+});

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import { KIMI_QUOTA_EXHAUSTED } from "@shared/agent-protocol/quota-exhausted";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
@@ -7,11 +8,13 @@ import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators } from "../../db/schema";
 import { resolveProviderAndModel } from "../../lib/agent";
+import { analyzeShellCommand } from "../../lib/agent/bash-analyze";
 import { projectFileReferenceText } from "../../lib/agent/file-reference-projection";
 import {
 	acknowledgePipelineExitConfirmation,
 	clearPipelineStateIfActive,
 } from "../../lib/agent/pipeline-state";
+import { detectShell } from "../../lib/agent/shell";
 import { getMissingWorkingDirectoryRecovery, SHELL_TOOL_NAME } from "../../lib/agent/tools/bash";
 import { clearBehaviorFenceEditGrant } from "../../lib/agent/tools/behavior-fence-grant";
 import {
@@ -216,6 +219,19 @@ import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
 import { resolveRuntimePolicy } from "./policy";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
 import { selectRuntimeInterruption, selectRuntimeRecovery } from "./transition";
+
+/** Return whether a completed Bash input contains a parsed Git command. */
+export async function isGitCommandToolResult(
+	toolName: string,
+	input: Record<string, unknown> | undefined,
+	cwd: string,
+): Promise<boolean> {
+	if (toolName !== SHELL_TOOL_NAME || !input) return false;
+	const command = typeof input.command === "string" ? input.command : "";
+	if (!command || !/\bgit\b/.test(command)) return false;
+	const analysis = await analyzeShellCommand(command, cwd, detectShell().type, true);
+	return analysis.commands.some((item) => item.tokens[0] === "git");
+}
 
 export interface RetryEffectContext {
 	narratorId: string;
@@ -851,54 +867,75 @@ export async function runAgentLoopUnlocked(
 				},
 				onGitTrack:
 					active._worktreePath && active._chapterId
-						? (toolName, toolUseId) => {
+						? (toolName, toolUseId, input) => {
 								if (!FILE_MUTATING_TOOLS.has(toolName)) return;
 								const chapterId = active._chapterId as string;
 								const worktreePath = active._worktreePath as string;
 								const baseBranch = active._baseBranch as string | undefined;
+								const scheduleRefresh = (delayMs: number) => {
+									// Collapse rapid successive calls into one trailing query. Git commands
+									// use delay 0 so branch/commit-only changes are visible immediately.
+									if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
+									active._gitTrackTimer = setTimeout(() => {
+										active._gitTrackTimer = undefined;
+										// File changes just happened → invalidate then read through
+										// the shared cache so co-located narrators reuse one query.
+										invalidateStatus(worktreePath);
+										Promise.all([
+											getStatusSummaryCached(worktreePath, { ttlMs: 0 }),
+											baseBranch
+												? gitService.getCommitsAhead(worktreePath, baseBranch)
+												: Promise.resolve({ count: 0, baseBranch: "" }),
+										]).then(
+											([gitStatus, ahead]) => {
+												// Strip files array from WS broadcast to avoid
+												// sending huge payloads when many files are changed.
+												// The Git panel fetches the full list via API.
+												const { files: _files, ...statusWithoutFiles } = gitStatus;
+												broadcastToNarrator(narratorId, {
+													type: "git_status",
+													narratorId,
+													chapterId,
+													toolUseId,
+													status: statusWithoutFiles as typeof gitStatus,
+													commitsAhead: ahead.count,
+													baseBranch: ahead.baseBranch,
+													linesAdded: gitStatus.linesAdded,
+													linesRemoved: gitStatus.linesRemoved,
+												});
+											},
+											(err) => {
+												logger.debug("Git status tracking failed", {
+													narratorId,
+													error: String(err),
+												});
+											},
+										);
+									}, delayMs);
+								};
 
-								// Throttle: collapse rapid successive calls into one trailing query.
-								// Store the latest toolUseId so the broadcast references the most
-								// recent tool, and clear any pending timer.
-								if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
-								active._gitTrackTimer = setTimeout(() => {
-									active._gitTrackTimer = undefined;
-									// File changes just happened → invalidate then read through
-									// the shared cache so co-located narrators reuse one query.
-									invalidateStatus(worktreePath);
-									Promise.all([
-										getStatusSummaryCached(worktreePath, { ttlMs: 0 }),
-										baseBranch
-											? gitService.getCommitsAhead(worktreePath, baseBranch)
-											: Promise.resolve({ count: 0, baseBranch: "" }),
-									]).then(
-										([gitStatus, ahead]) => {
-											// Strip files array from WS broadcast to avoid
-											// sending huge payloads when many files are changed.
-											// The Git panel fetches the full list via API.
-											const { files: _files, ...statusWithoutFiles } = gitStatus;
-											broadcastToNarrator(narratorId, {
-												type: "git_status",
-												narratorId,
-												chapterId,
-												toolUseId,
-												status: statusWithoutFiles as typeof gitStatus,
-												commitsAhead: ahead.count,
-												baseBranch: ahead.baseBranch,
-												linesAdded: gitStatus.linesAdded,
-												linesRemoved: gitStatus.linesRemoved,
-											});
-										},
-										(err) => {
-											logger.debug("Git status tracking failed", {
-												narratorId,
-												error: String(err),
-											});
-										},
-									);
-								}, 800);
+								if (toolName !== SHELL_TOOL_NAME) {
+									scheduleRefresh(800);
+									return;
+								}
+
+								const shellCwd =
+									typeof input?.workdir === "string"
+										? resolve(active.cwd, input.workdir)
+										: active.cwd;
+								void isGitCommandToolResult(toolName, input, shellCwd).then(
+									(hasGitCommand) => scheduleRefresh(hasGitCommand ? 0 : 800),
+									(error) => {
+										logger.debug("Git command detection failed; using normal status tracking", {
+											narratorId,
+											error: String(error),
+										});
+										scheduleRefresh(800);
+									},
+								);
 							}
 						: undefined,
+
 				// Workspace tree boundaries around every file-mutating tool. Shared with
 				// the subagent loop (see tree-snapshot-loop-hooks) because ONE rollback
 				// path reads these hashes back and cannot tell which loop wrote them.

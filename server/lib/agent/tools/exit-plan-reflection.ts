@@ -3,6 +3,7 @@ import type { ProgressSnapshot } from "@shared/progress-phase";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import type { ToolDefinition } from "../types";
+import { describeReflectionOnlyTool } from "./reflection-description";
 
 export const EXIT_PLAN_CONFIRM_TOOL_NAME = "ExitPlanConfirm";
 export const EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME = "ExitPlanConfirmAndCompact";
@@ -352,9 +353,13 @@ export function cleanupExitPlanReflection(requestId: string): void {
 export const exitPlanConfirmTool: ToolDefinition = {
 	name: EXIT_PLAN_CONFIRM_TOOL_NAME,
 	reflectionOnly: true,
-	description:
+	description: describeReflectionOnlyTool(
 		"Confirm that the ExitPlanMode plan is ready to present to the user for approval. " +
-		"Use this only after checking that the plan is concrete, actionable, and has no obvious gaps.",
+			"This is only for an active ExitPlanMode plan reflection, not the ordinary plan-mode turn. " +
+			"In the ordinary plan-mode turn, call ExitPlanMode to submit the plan; do not call this " +
+			"reflection decision tool. Use it only after checking that the plan is concrete, actionable, " +
+			"and has no obvious gaps.",
+	),
 	parameters: z.object({
 		confirm: z.literal(true).describe("Must be true to confirm the ExitPlanMode plan."),
 		reflection: z
@@ -386,9 +391,13 @@ export const exitPlanConfirmTool: ToolDefinition = {
 export const exitPlanConfirmAndCompactTool: ToolDefinition = {
 	name: EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME,
 	reflectionOnly: true,
-	description:
+	description: describeReflectionOnlyTool(
 		"Confirm that the ExitPlanMode plan is ready and should be approved with a context reset. " +
-		"Use this only when the plan contains enough detail to continue safely after clearing prior conversation context.",
+			"This is only for an active ExitPlanMode plan reflection, not the ordinary plan-mode turn. " +
+			"In the ordinary plan-mode turn, call ExitPlanMode to submit the plan; do not call this " +
+			"reflection decision tool. Use it only when the plan contains enough detail to continue safely " +
+			"after clearing prior conversation context.",
+	),
 	parameters: z.object({
 		confirm: z.literal(true).describe("Must be true to confirm and reset context."),
 		reflection: z
@@ -422,9 +431,12 @@ export const exitPlanConfirmAndCompactTool: ToolDefinition = {
 export const exitPlanReviseTool: ToolDefinition = {
 	name: EXIT_PLAN_REVISE_TOOL_NAME,
 	reflectionOnly: true,
-	description:
-		"Reject the current ExitPlanMode plan before it reaches the user. Use this when the plan " +
-		"needs more detail, has unresolved decisions, or should be revised first.",
+	description: describeReflectionOnlyTool(
+		"Reject the current ExitPlanMode plan before it reaches the user. This is only for an active " +
+			"ExitPlanMode plan reflection, not the ordinary plan-mode turn. In the ordinary plan-mode turn, " +
+			"call ExitPlanMode to submit the plan; do not call this reflection decision tool. Use it when the " +
+			"plan needs more detail, has unresolved decisions, or should be revised first.",
+	),
 	parameters: z.object({
 		confirm: z.literal(true).describe("Must be true to request plan revision."),
 		feedback: z

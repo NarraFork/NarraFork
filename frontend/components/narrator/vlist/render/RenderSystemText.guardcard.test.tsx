@@ -84,8 +84,16 @@ function renderGuardCard(actions?: InjectionGuardActions): {
 			id: "guard-msg",
 			role: "system",
 			contentJson: [
-				{ type: "text", text: GUARD_TEXT },
-				{ type: "system_injection", source: "interrupt_task_guard" },
+				{
+					type: "system_injection",
+					source: "interrupt_task_guard",
+					modelText: GUARD_TEXT,
+					body: {
+						kind: "tasks",
+						variant: "current",
+						tasks: [{ role: "doing", text: "修复中断任务提醒" }],
+					},
+				},
 			] as never,
 		},
 	};
@@ -156,6 +164,13 @@ describe("interrupt guard card — the close button invokes the injected action"
 		// dismiss affordance; the slot's absence must not paint inert chrome.
 		const { buttons, unmount } = renderGuardCard();
 		expect(buttons).toHaveLength(0);
+		unmount();
+	});
+
+	it("renders the structured task body instead of an empty card", () => {
+		const { container, measured, unmount } = renderGuardCard();
+		expect(measured.height).toBeGreaterThan(MEASURE_SYSTEM_TEXT_CONSTANTS.CARD_PADDING * 2);
+		expect(container.textContent).toContain("修复中断任务提醒");
 		unmount();
 	});
 

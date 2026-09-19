@@ -3032,12 +3032,15 @@ function adaptSystemTextData(
 			// Falls back to that text only when a producer supplied no body.
 			const body = readSideCarBody(block);
 			const source = typeof block.source === "string" ? block.source : "";
+			// Native self-contained injections keep their model-facing projection on
+			// `modelText`; legacy rows may still provide a sibling `text` block.
+			const modelFacingText = block.modelText ?? block.text ?? contentText;
 			const markdown = body
 				? sideCarBodyToMarkdown(source, body, ctx.labels)
-				: rawSideCarToMarkdown(block.text ?? contentText);
+				: rawSideCarToMarkdown(modelFacingText);
 			return {
 				kind: "origin_notice",
-				text: markdown || rawSideCarToMarkdown(block.text ?? contentText),
+				text: markdown || rawSideCarToMarkdown(modelFacingText),
 				title: injectionHeadingLabel(ctx, source),
 				timeLabel: formatOriginNoticeTime(createdAt),
 				origin: "system",
@@ -3046,7 +3049,7 @@ function adaptSystemTextData(
 				// (instruction boilerplate stripped), while this is what the agent actually
 				// received. The context-menu inspector shows this so the reader can see
 				// exactly what the model saw.
-				modelFacing: block.text ?? contentText,
+				modelFacing: modelFacingText,
 			};
 		}
 		case "spec_goal_added": {

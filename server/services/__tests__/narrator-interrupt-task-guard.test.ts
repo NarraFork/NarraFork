@@ -186,7 +186,7 @@ describe("interrupt task guard", () => {
 		await writeSpecFile(
 			narratorId,
 			"spec://tasks.json",
-			`${JSON.stringify({ tasks: [{ text: "Old stale task", status: "doing" }] }, null, "\t")}\n`,
+			`${JSON.stringify({ tasks: [{ text: "Old stale task", status: "doing", protected: true }] }, null, "\t")}\n`,
 			{ actor: "agent", createdBy: "assistant" },
 		);
 
@@ -226,6 +226,44 @@ describe("interrupt task guard", () => {
 				);
 			});
 		}, 15_000);
+
+		const guardMessage = (
+			await db.query.narratorMessages.findMany({
+				where: eq(narratorMessages.narratorId, narratorId),
+			})
+		).find((message) => {
+			const blocks: unknown =
+				typeof message.contentJson === "string"
+					? JSON.parse(message.contentJson)
+					: message.contentJson;
+			return (blocks as Array<{ type?: string; source?: string }>).some(
+				(block) => block.type === "system_injection" && block.source === "interrupt_task_guard",
+			);
+		});
+		expect(guardMessage).toBeDefined();
+		const guardBlocks = (
+			typeof guardMessage?.contentJson === "string"
+				? JSON.parse(guardMessage.contentJson)
+				: guardMessage?.contentJson
+		) as Array<{
+			type?: string;
+			source?: string;
+			modelText?: string;
+			body?: {
+				kind?: string;
+				variant?: string;
+				tasks?: Array<{ role?: string; text?: string; protected?: boolean }>;
+			};
+		}>;
+		const guardBlock = guardBlocks.find(
+			(block) => block.type === "system_injection" && block.source === "interrupt_task_guard",
+		);
+		expect(guardBlock?.modelText).toContain("Old stale task");
+		expect(guardBlock?.body).toMatchObject({
+			kind: "tasks",
+			variant: "current",
+			tasks: [{ role: "doing", text: "Old stale task", protected: true }],
+		});
 
 		// The next user turn must NOT be followed by a spec auto-continuation for
 		// the stale task — the one-shot suppression consumes exactly that turn.

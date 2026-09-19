@@ -1441,11 +1441,26 @@ async function maybeDeliverInterruptTaskGuard(
 		const content = isZh
 			? `刚才的运行被用户中断，这通常意味着方向有变化。当前 spec://tasks.json 中仍有以下开放任务：\n\n${taskLines}\n\n这些任务可能已经过期或与用户最新意图不一致。回复用户的下一条消息时，以用户消息为准；如需调整计划，先更新/删除过期任务（protected 任务变更会触发 taskReflection），再继续执行。不要无视用户新指令而直接恢复旧任务。`
 			: `The run was just interrupted by the user, which usually means the direction changed. spec://tasks.json still has these open tasks:\n\n${taskLines}\n\nThey may be stale or no longer match the user's latest intent. When the user's next message arrives, treat it as the source of truth; update or remove outdated tasks first if the plan changed (protected task changes trigger taskReflection), then continue. Do not resume an old task over the user's new instruction.`;
+		const body = {
+			kind: "tasks" as const,
+			variant: "current" as const,
+			tasks: openTasks.slice(0, 8).map((task) => ({
+				role:
+					task.status === "doing"
+						? ("doing" as const)
+						: task.status === "blocked"
+							? ("blocked" as const)
+							: ("todo" as const),
+				text: task.text,
+				...(task.protected ? { protected: true as const } : {}),
+			})),
+		};
 
 		// deliverInjection is statically imported at module top; the circularity with
 		// narrator-injection is already handled by that module's lazy scheduler seam.
 		await deliverInjection(narratorId, {
 			content,
+			body,
 			source: "interrupt_task_guard",
 			// Persisted as a plain row; the next user turn reads it from history.
 			schedule: "none",

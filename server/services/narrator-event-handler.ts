@@ -208,8 +208,8 @@ export interface EventHooks {
 	onExitPlanMode?: (toolUseId: string) => Promise<void>;
 	/** Clear compact summary after first response */
 	onClearCompactSummary?: () => Promise<void>;
-	/** Git status tracking after file-mutating tools */
-	onGitTrack?: (toolName: string, toolUseId: string) => void;
+	/** Git status tracking after file-mutating tools and completed Bash commands */
+	onGitTrack?: (toolName: string, toolUseId: string, input?: Record<string, unknown>) => void;
 	/**
 	 * Snapshot: record the workspace tree hash before a file-mutating tool executes.
 	 *
@@ -1941,7 +1941,7 @@ export async function processEvent(
 
 			// Main narrator: git tracking
 			if (hooks?.onGitTrack) {
-				hooks.onGitTrack(event.toolName, event.toolUseId);
+				hooks.onGitTrack(event.toolName, event.toolUseId, event.input);
 			}
 
 			// Snapshot: capture tree state after the tool completed. Awaited so the

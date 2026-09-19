@@ -129,6 +129,41 @@ describe("system_injection — routing", () => {
 		expect(specs[0]?.kind).toBe("system-text");
 	});
 
+	it("uses modelText as the fallback body for a native injection without body", () => {
+		const specs = adaptSegment(
+			injectionSegment(
+				{
+					type: "system_injection",
+					source: "interrupt_task_guard",
+					modelText: MODEL_TEXT,
+				},
+				{ native: true },
+			),
+			CTX,
+		);
+		expect(specs).toHaveLength(1);
+		expect(specs[0]?.kind).toBe("system-text");
+		expect((specs[0]?.data as { text?: string }).text).toContain(MODEL_TEXT);
+	});
+
+	it("prefers the reader-facing body over modelText when both are present", () => {
+		const specs = adaptSegment(
+			injectionSegment(
+				{
+					type: "system_injection",
+					source: CARD_SOURCE,
+					modelText: MODEL_TEXT,
+					body: TASKS_BODY,
+				},
+				{ native: true },
+			),
+			CTX,
+		);
+		const text = (specs[0]?.data as { text?: string }).text ?? "";
+		expect(text).toContain("migrate the queues");
+		expect(text).not.toContain("Update spec://tasks.json");
+	});
+
 	it("the kind it routes to is registered, so it can actually be measured", () => {
 		// Guards the failure mode that a new kind would introduce: an adapter emitting
 		// something with no registry entry measures to nothing and paints blank.

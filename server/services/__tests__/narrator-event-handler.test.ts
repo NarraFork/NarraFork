@@ -497,6 +497,33 @@ describe("narrator event handler streaming snapshot", () => {
 	});
 });
 
+describe("完成工具输入传递", () => {
+	test("onGitTrack 收到 tool_result 携带的实际完成输入", async () => {
+		const ctx = makeSubagentContext();
+		const calls: Array<[string, string, Record<string, unknown> | undefined]> = [];
+		const hooks = {
+			onGitTrack: (toolName: string, toolUseId: string, input?: Record<string, unknown>) => {
+				calls.push([toolName, toolUseId, input]);
+			},
+		};
+
+		await processEvent(
+			{
+				type: "tool_result",
+				toolUseId: "bash-completed",
+				toolName: "Bash",
+				input: { command: "git status" },
+				output: "",
+				isError: false,
+			},
+			ctx,
+			hooks,
+		);
+
+		expect(calls).toEqual([["Bash", "bash-completed", { command: "git status" }]]);
+	});
+});
+
 // The parent page renders a subagent's calls as one-line rows, and its copy of every
 // tool event deliberately omits `input` (Write/Edit can carry a whole file). These
 // tests pin the fix for the resulting bug — the row showed a bare tool name until the

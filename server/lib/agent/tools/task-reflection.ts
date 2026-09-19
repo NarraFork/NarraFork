@@ -3,6 +3,7 @@ import type { ProgressSnapshot } from "@shared/progress-phase";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import type { ToolDefinition } from "../types";
+import { describeReflectionOnlyTool } from "./reflection-description";
 
 export const TASK_REFLECT_CONFIRM_TOOL_NAME = "TaskReflectConfirm";
 export const TASK_REFLECT_REVISE_TOOL_NAME = "TaskReflectRevise";
@@ -434,8 +435,14 @@ export function isTaskReflectionWaitingForUser(requestId: string): boolean {
 export const taskReflectConfirmTool: ToolDefinition = {
 	name: TASK_REFLECT_CONFIRM_TOOL_NAME,
 	reflectionOnly: true,
-	description:
-		"Confirm that a protected task change does not betray what the user asked for: their real requirement is satisfied, or the change repairs an entry with no decidable completion condition while keeping that requirement enforced. Do not withhold confirmation merely because a more exhaustive acceptance is imaginable.",
+	description: describeReflectionOnlyTool(
+		"Confirm that a protected task change does not betray what the user asked for: their real " +
+			"requirement is satisfied, or the change repairs an entry with no decidable completion condition " +
+			"while keeping that requirement enforced. This is only for an active taskReflection. In an " +
+			"ordinary task/tool turn, do not call it; perform the requested work with ordinary tools and let " +
+			"the task system start taskReflection when a protected-task change needs review. Do not withhold " +
+			"confirmation merely because a more exhaustive acceptance is imaginable.",
+	),
 	parameters: z.object({
 		confirm: z.literal(true).describe("Must be true to confirm the protected task change."),
 		evidence: z
@@ -471,8 +478,15 @@ export const taskReflectConfirmTool: ToolDefinition = {
 export const taskReflectReviseTool: ToolDefinition = {
 	name: TASK_REFLECT_REVISE_TOOL_NAME,
 	reflectionOnly: true,
-	description:
-		"Reject a protected task change only when it would betray what the user asked for — work they demanded be guaranteed would be dropped, watered down, or passed off as finished. Not for 'one more thing could still be proven': that bar produces a loop no change can pass. nextSteps must name a concrete action that would let the change pass; if none exists, require the entry to be rewritten as a finite task instead.",
+	description: describeReflectionOnlyTool(
+		"Reject a protected task change only when it would betray what the user asked for — work they " +
+			"demanded be guaranteed would be dropped, watered down, or passed off as finished. This is only " +
+			"for an active taskReflection. In an ordinary task/tool turn, do not call it; perform the requested " +
+			"work with ordinary tools and let the task system start taskReflection when a protected-task change " +
+			"needs review. Not for 'one more thing could still be proven': that bar produces a loop no change " +
+			"can pass. nextSteps must name a concrete action that would let the change pass; if none exists, " +
+			"require the entry to be rewritten as a finite task instead.",
+	),
 	parameters: z.object({
 		confirm: z.literal(true).describe("Must be true to reject the protected task change."),
 		feedback: z.string().min(1).describe("Why the protected task change cannot proceed."),

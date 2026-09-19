@@ -163,4 +163,41 @@ describe("preferOpen — ask cards default-expand at low LOD, fold still wins", 
 		expect(measured.effectiveOpened).toBe(false);
 		expect(measured.height).toBe(measured.collapsedHeight);
 	});
+
+	test("a denied ExitPlanMode stays expandable at every LOD", () => {
+		const plan = {
+			kind: "sections" as const,
+			sections: [
+				{
+					key: "input.plan",
+					body: {
+						kind: "capped" as const,
+						id: "input.plan",
+						source: "input.plan" as const,
+						format: "markdown" as const,
+						live: false,
+						cap: "plan" as const,
+						followTarget: { kind: "end" as const },
+						text: "# Plan\\n\\nThe rejected plan remains readable.",
+					},
+				},
+			],
+		};
+		for (const lod of [1, 2, 3, 4, 5] as const) {
+			const measured = measureToolCall(
+				{
+					toolName: "ExitPlanMode",
+					summary: "Plan rejected",
+					category: "plan",
+					status: "fail",
+					detail: plan,
+				},
+				600,
+				lod,
+				{ preferOpen: true, viewportHeight: 900 },
+			);
+			expect(measured.effectiveOpened).toBe(true);
+			expect(measured.height).toBeGreaterThan(measured.collapsedHeight);
+		}
+	});
 });
