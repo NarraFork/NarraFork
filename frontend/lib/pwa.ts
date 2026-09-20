@@ -19,7 +19,7 @@ export interface WaitForUpdatedServerOptions {
 }
 
 function normalizeVersion(version: string | undefined): string | undefined {
-	return version?.replace(/^v/, "");
+	return typeof version === "string" && version.trim() ? version.replace(/^v/, "") : undefined;
 }
 
 /**
@@ -96,8 +96,8 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
-async function fetchServerHealth(
-	timeoutMs: number,
+export async function fetchServerHealth(
+	timeoutMs = 3000,
 	signal?: AbortSignal,
 ): Promise<ServerHealth | null> {
 	if (signal?.aborted) return null;
@@ -114,7 +114,17 @@ async function fetchServerHealth(
 		});
 		// The backend intentionally returns HTTP 503 with a JSON health payload when startup
 		// recovery failed. Preserve that payload so polling can stop and surface the real error.
-		return (await response.json()) as ServerHealth;
+		const health: unknown = await response.json();
+		if (
+			!health ||
+			typeof health !== "object" ||
+			!("version" in health) ||
+			typeof health.version !== "string" ||
+			!health.version.trim()
+		) {
+			return null;
+		}
+		return health as ServerHealth;
 	} catch {
 		return null;
 	} finally {
@@ -128,7 +138,8 @@ async function fetchServerHealth(
  * Used when applying updates to ensure fresh assets are loaded.
  */
 export async function clearPwaCache(): Promise<void> {
-	try {
+	// Independent tasks: a broken/hung SW API must not prevent Cache Storage cleanup.
+	const unregister = async () => {
 		// Unregister all service workers controlling this origin.
 		if ("serviceWorker" in navigator) {
 			const registrations =
@@ -139,31 +150,65 @@ export async function clearPwaCache(): Promise<void> {
 						);
 
 			if (registrations.length > 0) {
-				await Promise.allSettled(registrations.map((reg) => reg.unregister()));
+				await Promise.allSettled(
+					registrations.map((reg) => Promise.resolve().then(() => reg.unregister())),
+				);
 				console.log(`[PWA] Unregistered ${registrations.length} service workers`);
 			}
 		}
-
+	};
+	const clearCaches = async () => {
 		// Clear all Cache Storage entries.
 		if ("caches" in window) {
 			const keys = await caches.keys();
 			if (keys.length > 0) {
-				await Promise.allSettled(keys.map((k) => caches.delete(k)));
+				await Promise.allSettled(keys.map((k) => Promise.resolve().then(() => caches.delete(k))));
 				console.log(`[PWA] Cleared ${keys.length} caches`);
 			}
 		}
-	} catch (err) {
-		console.warn("[PWA] Failed to clear cache:", err);
-		// Continue anyway - the reload will still work
+	};
+	const cleanup = Promise.all([
+		unregister().catch((error) => console.warn("[PWA] Failed to unregister workers:", error)),
+		clearCaches().catch((error) => console.warn("[PWA] Failed to clear caches:", error)),
+	]);
+	let timeout: number | undefined;
+	try {
+		await Promise.race([
+			cleanup,
+			new Promise<void>((resolve) => {
+				timeout = window.setTimeout(resolve, 3000);
+			}),
+		]);
+	} finally {
+		window.clearTimeout(timeout);
 	}
 }
 
+let reloadPromise: Promise<void> | undefined;
+
 /**
- * Clear PWA cache and reload the page.
+ * Coalesce concurrent refresh attempts, but allow retry if the page stays alive
+ * (e.g. the user cancels beforeunload). Automatic version checks keep their own
+ * loop guard in version-refresh.ts; a completed attempt must not block manual retry.
+ * A unique URL avoids HTTP HTML cache reuse, but cannot force a still-controlling old SW
+ * to use the network (it may ignore search). Unregistration is best effort and does not
+ * detach the current document; SW navigation handling must also be network-first.
  */
-export async function clearPwaCacheAndReload(): Promise<void> {
-	await clearPwaCache();
-	window.location.reload();
+export function clearPwaCacheAndReload(): Promise<void> {
+	reloadPromise ??= Promise.resolve()
+		.then(async () => {
+			await clearPwaCache();
+			const destination = new URL(window.location.href);
+			destination.searchParams.set(
+				"_nf_reload",
+				`${Date.now()}-${Math.random().toString(16).slice(2)}`,
+			);
+			window.location.replace(destination.href);
+		})
+		.finally(() => {
+			reloadPromise = undefined;
+		});
+	return reloadPromise;
 }
 
 /**

@@ -34,6 +34,7 @@ import { useUpdateScheduleStatus } from "../hooks/useUpdateSchedule";
 import { api } from "../lib/api";
 import { normalizeLanguage } from "../lib/i18n";
 import { formatLocaleDate } from "../lib/intl-format";
+import { clearPwaCache, waitForUpdatedServerAndReload } from "../lib/pwa";
 import {
 	resolveUpdateCoordinationCounts,
 	shouldAssumeLocalSchedule,
@@ -191,7 +192,6 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		restartWaitRef.current = { targetVersion: version, controller };
 		setRestartWaitError(null);
 		try {
-			const { waitForUpdatedServerAndReload } = await import("@frontend/lib/pwa");
 			await waitForUpdatedServerAndReload({
 				targetVersion: version,
 				requestTimeoutMs: 3000,
@@ -214,7 +214,6 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		setScheduleAbandonedLocally(false);
 		setServerConfirmedSchedule(false);
 		setScheduleClaimedAt(null);
-		const { clearPwaCache } = await import("@frontend/lib/pwa");
 		const applyResponse = await apply(targetVersion);
 		if (!applyResponse.success) return;
 		if ("scheduled" in applyResponse && applyResponse.scheduled) {

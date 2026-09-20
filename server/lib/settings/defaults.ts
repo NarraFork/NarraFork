@@ -523,11 +523,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 	"agent.requestDumpEnabled": {
-		desc: "启用后为每次模型/API 请求持久化原始请求与响应 dump，可在管理员请求历史中查看完整原始数据。",
+		desc: "启用后为每次模型/API 请求持久化原始请求与响应 dump，可在管理员请求历史中查看完整原始数据。保存后对当前会话的后续请求立即生效，无需重启叙述者。",
 		type: "boolean",
 	},
 	"agent.requestDumpErrorsOnly": {
-		desc: "启用后仅为报错的模型/API 请求持久化原始请求与响应 dump，成功请求不会保存 dump。",
+		desc: "启用后仅为报错的模型/API 请求持久化原始请求与响应 dump，成功请求不会保存 dump。保存后同样对后续请求立即生效。",
 		type: "boolean",
 	},
 	"agent.requestDumpMaxSize": {

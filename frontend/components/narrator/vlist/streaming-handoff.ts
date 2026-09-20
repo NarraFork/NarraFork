@@ -125,16 +125,22 @@ export interface StreamingHandoffInput {
 /**
  * Whether the streaming row is now redundant with the committed document.
  *
- * Two independent signals, because a turn can persist in either shape:
+ * Only ONE whole-row signal remains: a **text-only** live row whose content has
+ * demonstrably been stored (trailing top-level assistant with renderable body,
+ * and nothing new streamed since that commit).
  *
- * - **Tool identity.** Once the streaming row has produced tool calls, the
- *   persisted message carrying any of those ids IS this row. This is the precise
- *   signal and it is immune to text still trickling in.
- * - **Trailing assistant message.** A text-only streaming row has no ids to match
- *   on. It is superseded as soon as a top-level assistant message with real content
- *   is the document's last message: the server persists the turn's message only
- *   after the stream for it completed, so a trailing assistant row means this
- *   stream's content is now stored.
+ * Tool-bearing rows are NEVER retired here.
+ *
+ * A persisted `tool_use` id is not proof that this live row's reasoning / answer
+ * text / later tools are already on screen. Progressive persistence writes the
+ * first tool of a turn into the same partial assistant message while the live row
+ * still owns the rest (`reasoning → text → tool1 → tool2`); clearing the whole row
+ * on `tool1`'s id wiped reasoning and text together with the still-running tool2,
+ * and they only reappeared after the next tool finished and something reloaded the
+ * DB row. Per-tool and per-block hand-offs already retire exactly what the document
+ * demonstrably contains (`dropPersistedStreamingTools`,
+ * `dropSupersededStreamingBlocks`) — that is the structural replacement for a
+ * whole-row clear on tool identity.
  *
  * A row still streaming its FIRST tokens (empty content) is never retired — there
  * would be nothing to show in its place.
@@ -143,17 +149,9 @@ export function isStreamingMessageSuperseded(input: StreamingHandoffInput): bool
 	const streaming = input.streamingMessage;
 	if (!streaming) return false;
 
-	const streamingToolIds = new Set(toolUseIds(streaming));
-	if (streamingToolIds.size > 0) {
-		for (const message of input.committedMessages) {
-			if (message.id === STREAMING_MESSAGE_ID) continue;
-			for (const id of toolUseIds(message)) {
-				if (streamingToolIds.has(id)) return true;
-			}
-		}
-		// Tool ids exist but none is persisted yet → the row is still the only view.
-		return false;
-	}
+	// Tool-bearing live rows stay until their individual blocks/tools are superseded
+	// or the session leaves working/waiting. See the module comment above.
+	if (toolUseIds(streaming).length > 0) return false;
 
 	// Text-only rows have no ids to match on, so the only available signal is the
 	// document's last persisted message — plus whether this row has produced anything

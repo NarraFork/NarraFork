@@ -1587,11 +1587,11 @@ export async function runAgentLoopUnlocked(
 					runState.input.images = undefined;
 				}
 				// Stateful providers (codex) reuse an upstream session keyed by
-				// narratorId; force a fresh conversation + session reset so the
-				// rebuilt history is sent from a clean upstream state (mirrors the
-				// transient-retry path).
+				// narratorId. Keep `conversationId` stable so prompt_cache_key /
+				// session-id retain cache affinity; only reset the upstream session
+				// chain so rebuilt history is not chained to a stale
+				// previous_response_id.
 				if (usesStatefulModel(resolved.provider, resolved.model)) {
-					active.conversationId = randomUUID();
 					active._resetUpstreamSessionOnNextRequest = true;
 				}
 				return true;
@@ -1866,13 +1866,12 @@ export async function runAgentLoopUnlocked(
 				runState.recovery.overflowRetries = overflow.overflowRetries;
 
 				if (overflow.action === "retry_compacted") {
-					active.conversationId = overflow.newConversationId;
+					// Keep conversationId stable for prompt-cache affinity. Compact may
+					// already have reset the upstream session via resetActiveUpstreamSession;
+					// still set the flag so a non-compact ride-on cannot chain a stale
+					// previous_response_id. Do not null _persistedConversationId here —
+					// the id did not change on this path.
 					active._resetUpstreamSessionOnNextRequest = true;
-					// Whichever compact this rode on already nulled the persisted id, so
-					// move the teardown CAS baseline with it — otherwise the baseline
-					// still names the pre-compact session, the CAS loses, and this fresh
-					// id is never persisted (costing the next activation a cold session).
-					active._persistedConversationId = null;
 					runState.recovery.transientRetries = 0;
 					continue;
 				}
@@ -1923,7 +1922,8 @@ export async function runAgentLoopUnlocked(
 						runState.input.text = "";
 						runState.input.images = undefined;
 					}
-					active.conversationId = randomUUID();
+					// Keep conversationId stable across transient replay so the next
+					// request reuses the same prompt_cache_key / session-id.
 					active._resetUpstreamSessionOnNextRequest = outcome.resetUpstreamSession;
 					continue;
 				}

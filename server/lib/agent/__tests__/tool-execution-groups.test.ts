@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
 	groupToolExecutions,
 	isAgentDependentToolExecutionGroup,
+	isBashParallelOptIn,
+	isParallelSafeToolExecution,
 	isStrictSerialToolExecution,
 	settleToolExecutionResult,
 } from "../tool-execution-groups";
@@ -50,6 +52,73 @@ describe("tool execution grouping", () => {
 			groupToolExecutions(recoveryItems).map((group) => group.map((item) => item.toolName)),
 		).toEqual([["Read", "Agent"], ["Await"], ["Bash"], ["Agent"]]);
 		expect(isStrictSerialToolExecution(recoveryItems[3])).toBe(true);
+	});
+
+	describe("Bash defaults to serial", () => {
+		test("consecutive default Bash calls do not join a parallel group", () => {
+			expect(
+				groupToolExecutions([
+					tool("Bash", { command: "make build" }),
+					tool("Bash", { command: "curl health" }),
+				]).map((group) => group.map(({ input }) => input.command)),
+			).toEqual([["make build"], ["curl health"]]);
+		});
+
+		test("default Bash does not join neighboring parallel-safe reads", () => {
+			expect(
+				groupToolExecutions([
+					tool("Bash", { command: "make build" }),
+					tool("Read"),
+					tool("Glob"),
+				]).map((group) => group.map(({ name }) => name)),
+			).toEqual([["Bash"], ["Read", "Glob"]]);
+		});
+
+		test("explicit parallel:true Bash joins a parallel batch with siblings", () => {
+			expect(
+				groupToolExecutions([
+					tool("Bash", { command: "git status", parallel: true }),
+					tool("Bash", { command: "git log", parallel: true }),
+					tool("Read"),
+				]).map((group) => group.map(({ name }) => name)),
+			).toEqual([["Bash", "Bash", "Read"]]);
+		});
+
+		test("parallel:true Bash does not drag a later default Bash into the batch", () => {
+			expect(
+				groupToolExecutions([
+					tool("Bash", { command: "git status", parallel: true }),
+					tool("Bash", { command: "make build" }),
+					tool("Bash", { command: "curl health", parallel: true }),
+				]).map((group) => group.map(({ input }) => input.command)),
+			).toEqual([["git status"], ["make build"], ["curl health"]]);
+		});
+
+		test("strict_serial wins over parallel:true", () => {
+			const item = tool("Bash", { parallel: true, strict_serial: true });
+			expect(isStrictSerialToolExecution(item)).toBe(true);
+			expect(isParallelSafeToolExecution(item)).toBe(false);
+			expect(isBashParallelOptIn(item)).toBe(false);
+			expect(
+				groupToolExecutions([tool("Read"), item, tool("Grep")]).map((group) =>
+					group.map(({ name }) => name),
+				),
+			).toEqual([["Read"], ["Bash"], ["Grep"]]);
+		});
+
+		test("default Bash is strict-serial and not parallel-safe", () => {
+			const item = tool("Bash", { command: "true" });
+			expect(isStrictSerialToolExecution(item)).toBe(true);
+			expect(isParallelSafeToolExecution(item)).toBe(false);
+			expect(isBashParallelOptIn(item)).toBe(false);
+		});
+
+		test("parallel:true Bash is parallel-safe", () => {
+			const item = tool("Bash", { command: "true", parallel: true });
+			expect(isStrictSerialToolExecution(item)).toBe(false);
+			expect(isParallelSafeToolExecution(item)).toBe(true);
+			expect(isBashParallelOptIn(item)).toBe(true);
+		});
 	});
 
 	describe("Agent barrier for Await/Send", () => {
@@ -163,6 +232,7 @@ describe("settleToolExecutionResult", () => {
 		await expect(settleToolExecutionResult(run)).resolves.toMatchObject({
 			isError: true,
 			output: "Tool error: late failure",
+			durationMs: 0,
 		});
 	});
 });

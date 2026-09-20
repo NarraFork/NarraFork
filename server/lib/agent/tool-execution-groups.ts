@@ -1,6 +1,11 @@
 import type { ToolExecResult } from "./tool-executor";
 import { SHELL_TOOL_NAME } from "./tools/bash";
 
+/**
+ * Tools that may share a parallel execution group by default.
+ * Bash is intentionally absent: consecutive Bash calls are serial unless each
+ * call opts in with `parallel: true`.
+ */
 const PARALLEL_SAFE_TOOL_NAMES = new Set([
 	"Agent",
 	"Read",
@@ -11,7 +16,6 @@ const PARALLEL_SAFE_TOOL_NAMES = new Set([
 	"WebFetch",
 	"Await",
 	"Send",
-	SHELL_TOOL_NAME,
 ]);
 
 const ALWAYS_STRICT_SERIAL_TOOL_NAMES = new Set([
@@ -54,18 +58,40 @@ export function isAgentDependentToolExecutionGroup<T extends ToolExecutionGroupI
 	);
 }
 
-/** Whether a tool must form a serial execution barrier. */
-export function isStrictSerialToolExecution(item: ToolExecutionGroupItem): boolean {
-	const toolName = getToolName(item);
+/**
+ * Bash opt-in to parallel grouping. Default Bash is serial; only an explicit
+ * `parallel: true` (without `strict_serial`) may join a parallel batch.
+ */
+export function isBashParallelOptIn(item: ToolExecutionGroupItem): boolean {
 	return (
-		(toolName === SHELL_TOOL_NAME && item.input.strict_serial === true) ||
-		ALWAYS_STRICT_SERIAL_TOOL_NAMES.has(toolName)
+		getToolName(item) === SHELL_TOOL_NAME &&
+		item.input.parallel === true &&
+		item.input.strict_serial !== true
 	);
 }
 
 /**
+ * Whether a tool must form a serial execution barrier.
+ * Bash defaults to serial — only `parallel: true` opts out; `strict_serial` always wins.
+ */
+export function isStrictSerialToolExecution(item: ToolExecutionGroupItem): boolean {
+	const toolName = getToolName(item);
+	if (toolName === SHELL_TOOL_NAME) {
+		return item.input.strict_serial === true || item.input.parallel !== true;
+	}
+	return ALWAYS_STRICT_SERIAL_TOOL_NAMES.has(toolName);
+}
+
+/** Whether this tool call may join a parallel group with its neighbors. */
+export function isParallelSafeToolExecution(item: ToolExecutionGroupItem): boolean {
+	if (isStrictSerialToolExecution(item)) return false;
+	return PARALLEL_SAFE_TOOL_NAMES.has(getToolName(item)) || isBashParallelOptIn(item);
+}
+
+/**
  * Preserve provider tool_use order while grouping consecutive parallel-safe calls.
- * Non-parallel and strict-serial tools each form their own group.
+ * Non-parallel and strict-serial tools each form their own group. Bash is serial
+ * unless the call sets `parallel: true`.
  *
  * Additionally, an Agent already present in the current parallel batch forms a
  * deterministic barrier for a subsequent Await/Send: those open a new group so the
@@ -75,14 +101,11 @@ export function isStrictSerialToolExecution(item: ToolExecutionGroupItem): boole
 export function groupToolExecutions<T extends ToolExecutionGroupItem>(items: readonly T[]): T[][] {
 	const groups: T[][] = [];
 	for (const item of items) {
-		const toolName = getToolName(item);
-		const isParallel = PARALLEL_SAFE_TOOL_NAMES.has(toolName) && !isStrictSerialToolExecution(item);
+		const isParallel = isParallelSafeToolExecution(item);
 		const lastGroup = groups[groups.length - 1];
 		const firstInLastGroup = lastGroup?.[0];
 		const lastGroupIsParallel =
-			firstInLastGroup !== undefined &&
-			PARALLEL_SAFE_TOOL_NAMES.has(getToolName(firstInLastGroup)) &&
-			!isStrictSerialToolExecution(firstInLastGroup);
+			firstInLastGroup !== undefined && isParallelSafeToolExecution(firstInLastGroup);
 		const crossesAgentBarrier = isAgentDependentToolExecutionGroup(lastGroup, [item]);
 		if (isParallel && lastGroupIsParallel && !crossesAgentBarrier) {
 			lastGroup.push(item);

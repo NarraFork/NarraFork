@@ -1,70 +1,52 @@
-import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
-import { api } from "../lib/api";
+import { clearPwaCacheAndReload } from "../lib/pwa";
+import { createVersionRefreshMonitor } from "../lib/version-refresh";
+import { hasDisconnected, onWSStatusChange } from "../lib/ws-status";
 
-function normalizeVersion(version: string | undefined): string | undefined {
-	return version?.replace(/^v/, "");
-}
-
-/**
- * Periodically checks the backend version against the frontend build version.
- * Returns `updateAvailable: true` when they differ, plus a `refresh()` helper
- * that clears the service worker cache and reloads the page.
- *
- * Also listens for VERSION_MISMATCH messages from the service worker,
- * which performs its own version check on activation.
- */
-export function useVersionCheck(intervalMs = 5 * 60_000) {
+/** Confirm the live server version before automatically replacing a stale frontend. */
+export function useVersionCheck(intervalMs = 60_000) {
 	const [dismissed, setDismissed] = useState(false);
-	const [swServerVersion, setSwServerVersion] = useState<string | undefined>();
+	const [serverVersion, setServerVersion] = useState<string>();
+	const appVersion = __APP_VERSION__.replace(/^v/, "");
+	const updateAvailable = !dismissed && !!serverVersion && serverVersion !== appVersion;
 
-	const { data } = useQuery({
-		queryKey: ["health"],
-		queryFn: () => api.health(),
-		refetchInterval: intervalMs,
-		staleTime: intervalMs,
-	});
-
-	const appVersion = normalizeVersion(__APP_VERSION__);
-	const healthVersion = normalizeVersion(data?.version);
-	const serverVersion =
-		healthVersion === appVersion ? data?.version : (swServerVersion ?? data?.version);
-	const updateAvailable =
-		!dismissed &&
-		!!normalizeVersion(serverVersion) &&
-		normalizeVersion(serverVersion) !== appVersion;
-
-	// Listen for VERSION_MISMATCH from service worker. The message only provides
-	// another source of the backend version; the banner is still gated by comparing
-	// the backend version to the current frontend build version.
 	useEffect(() => {
-		const handler = (event: MessageEvent) => {
-			if (event.data?.type === "VERSION_MISMATCH") {
-				setSwServerVersion(event.data.serverVersion);
-			}
+		const monitor = createVersionRefreshMonitor(appVersion, setServerVersion);
+		const check = () => void monitor.check();
+		const onVisible = () => {
+			if (document.visibilityState === "visible") check();
 		};
-		navigator.serviceWorker?.addEventListener("message", handler);
-		return () => navigator.serviceWorker?.removeEventListener("message", handler);
-	}, []);
+		const onMessage = (event: MessageEvent) => {
+			// A stale worker is only a hint; always confirm with the live server.
+			if (event.data?.type === "VERSION_MISMATCH") check();
+		};
+		let disconnected = hasDisconnected();
+		const unsubscribe = onWSStatusChange(() => {
+			const next = hasDisconnected();
+			if (disconnected && !next) check();
+			disconnected = next;
+		});
+		const timer = window.setInterval(check, intervalMs);
+		window.addEventListener("online", check);
+		window.addEventListener("pageshow", onVisible);
+		document.addEventListener("visibilitychange", onVisible);
+		navigator.serviceWorker?.addEventListener("message", onMessage);
+		check();
+		return () => {
+			monitor.stop();
+			unsubscribe();
+			window.clearInterval(timer);
+			window.removeEventListener("online", check);
+			window.removeEventListener("pageshow", onVisible);
+			document.removeEventListener("visibilitychange", onVisible);
+			navigator.serviceWorker?.removeEventListener("message", onMessage);
+		};
+	}, [appVersion, intervalMs]);
 
-	useEffect(() => {
-		if (healthVersion === appVersion) {
-			setSwServerVersion(undefined);
-		}
-	}, [appVersion, healthVersion]);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: reset dismissal for each server build
+	useEffect(() => setDismissed(false), [serverVersion]);
 
-	// Auto-reset dismissed flag when version changes again
-	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally re-run when serverVersion changes
-	useEffect(() => {
-		setDismissed(false);
-	}, [serverVersion]);
-
-	const refresh = useCallback(async () => {
-		const { clearPwaCacheAndReload } = await import("../lib/pwa");
-		await clearPwaCacheAndReload();
-	}, []);
-
+	const refresh = useCallback(() => clearPwaCacheAndReload(), []);
 	const dismiss = useCallback(() => setDismissed(true), []);
-
 	return { updateAvailable, serverVersion, refresh, dismiss };
 }

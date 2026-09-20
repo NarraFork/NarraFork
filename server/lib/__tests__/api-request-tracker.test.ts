@@ -12,8 +12,10 @@ import { DEFAULTS, settings } from "@server/lib/settings";
 import {
 	type ApiRequestFinishOptions,
 	FORCED_DUMP_HARD_MAX_BYTES,
+	isRequestDumpEnabled,
 	serializeRawDump,
 	serializeRawDumpWithSpill,
+	shouldCollectRequestDump,
 	shouldPersistRawDump,
 	spillThresholdBytes,
 } from "../api-request-tracker";
@@ -44,6 +46,33 @@ afterEach(async () => {
 	settings.agent.requestDumpMaxSize = original.maxSize;
 	clearRememberedSpills();
 	await rm(spillDir, { recursive: true, force: true }).catch(() => {});
+});
+
+describe("live dump settings helpers", () => {
+	test("isRequestDumpEnabled / shouldCollectRequestDump follow the singleton", () => {
+		settings.agent.requestDumpEnabled = false;
+		expect(isRequestDumpEnabled()).toBe(false);
+		expect(shouldCollectRequestDump()).toBe(false);
+		expect(shouldCollectRequestDump(true)).toBe(true);
+
+		settings.agent.requestDumpEnabled = true;
+		expect(isRequestDumpEnabled()).toBe(true);
+		expect(shouldCollectRequestDump()).toBe(true);
+		expect(shouldCollectRequestDump(false)).toBe(true);
+	});
+
+	test("persist gate re-reads settings at finish (mid-request enable still persists)", () => {
+		// Collector already ran (e.g. leak detection or a request that started after a
+		// toggle); master switch flipped on before finish → must persist.
+		settings.agent.requestDumpEnabled = false;
+		settings.agent.requestDumpErrorsOnly = false;
+		expect(shouldPersistRawDump({ rawDump: { a: 1 } })).toBe(false);
+		settings.agent.requestDumpEnabled = true;
+		expect(shouldPersistRawDump({ rawDump: { a: 1 } })).toBe(true);
+		// And flipping off before finish discards a collected dump.
+		settings.agent.requestDumpEnabled = false;
+		expect(shouldPersistRawDump({ rawDump: { a: 1 } })).toBe(false);
+	});
 });
 
 describe("shouldPersistRawDump", () => {

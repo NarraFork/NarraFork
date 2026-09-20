@@ -13,8 +13,13 @@ let scenario:
 	| "parallel_reject_middle"
 	| "serial_reject"
 	| "await_send_not_eager"
-	| "parallel_all_reject" = "parallel_reject_middle";
+	| "parallel_all_reject"
+	| "bash_barrier" = "parallel_reject_middle";
 let providerAttempts = 0;
+let bashInput: Record<string, unknown> = {};
+let streamBashInput = true;
+let executionBeforeInputComplete: string[] = [];
+let executionBeforeStreamEnd: string[] = [];
 
 const PARALLEL_TOOL_NAMES = ["Read", "Glob", "Grep"] as const;
 
@@ -31,9 +36,43 @@ const testProvider: ProviderAdapter = {
 			providerAttempts > 1 &&
 			(scenario === "parallel_reject_middle" ||
 				scenario === "parallel_all_reject" ||
-				scenario === "serial_reject")
+				scenario === "serial_reject" ||
+				scenario === "bash_barrier")
 		) {
 			yield { text: "done" };
+			return;
+		}
+		if (scenario === "bash_barrier") {
+			if (streamBashInput) {
+				yield {
+					toolUseChunk: { toolUseId: "tu_bash", name: "Bash", outputIndex: 0 },
+				};
+				yield {
+					toolUses: [
+						{ toolUseId: "tu_pending", name: "Read", input: { value: "pending" }, outputIndex: 1 },
+					],
+				};
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				executionBeforeInputComplete = [...executionOrder];
+				yield {
+					toolUseChunk: {
+						toolUseId: "tu_bash",
+						input: JSON.stringify(bashInput),
+						stop: true,
+					},
+				};
+			} else {
+				yield {
+					toolUses: [{ toolUseId: "tu_bash", name: "Bash", input: bashInput, outputIndex: 0 }],
+				};
+			}
+			yield {
+				toolUses: [
+					{ toolUseId: "tu_after", name: "Read", input: { value: "after" }, outputIndex: 2 },
+				],
+			};
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			executionBeforeStreamEnd = [...executionOrder];
 			return;
 		}
 		if (scenario === "parallel_reject_middle") {
@@ -126,6 +165,16 @@ for (const name of PARALLEL_TOOL_NAMES) {
 }
 
 toolRegistry.register({
+	name: "Bash",
+	description: "Test Bash tool for streaming serial barriers",
+	parameters: z.object({ parallel: z.boolean().optional(), strict_serial: z.boolean().optional() }),
+	execute: async () => {
+		executionOrder.push("Bash");
+		return { output: "bash-done" };
+	},
+});
+
+toolRegistry.register({
 	name: "Write",
 	description: "Test override for a production serial tool",
 	parameters: z.object({ value: z.string() }),
@@ -157,7 +206,7 @@ toolRegistry.register({
 
 afterAll(() => {
 	mock.module("../provider", () => realProviderModule);
-	for (const name of [...PARALLEL_TOOL_NAMES, "Write", "Await", "Send"]) {
+	for (const name of [...PARALLEL_TOOL_NAMES, "Bash", "Write", "Await", "Send"]) {
 		toolRegistry.unregister(name);
 	}
 	mock.restore();
@@ -181,6 +230,42 @@ function toolResults(events: AgentEvent[]): Extract<AgentEvent, { type: "tool_re
 		(event): event is Extract<AgentEvent, { type: "tool_result" }> => event.type === "tool_result",
 	);
 }
+
+describe("Bash streaming barriers", () => {
+	for (const streamed of [true, false]) {
+		for (const [label, input, eager] of [
+			["parallel opt-in", { parallel: true }, true],
+			["default serial", {}, false],
+			["explicit strict serial", { parallel: true, strict_serial: true }, false],
+		] as const) {
+			test(`${streamed ? "chunked" : "complete"} ${label} uses completed input for subsequent Read`, async () => {
+				scenario = "bash_barrier";
+				providerAttempts = 0;
+				executionOrder.length = 0;
+				modelResultOrder.length = 0;
+				executionBeforeInputComplete = [];
+				executionBeforeStreamEnd = [];
+				bashInput = input;
+				streamBashInput = streamed;
+				const events: AgentEvent[] = [];
+				for await (const event of agentLoop(
+					makeConfig(new AbortController().signal),
+					"run Bash then Read",
+					[],
+				)) {
+					events.push(event);
+				}
+				expect(executionBeforeInputComplete).toEqual([]);
+				expect(executionBeforeStreamEnd.includes("Read:after")).toBe(eager);
+				if (!eager) expect(executionBeforeStreamEnd).toEqual([]);
+				expect(executionOrder).toContain("Bash");
+				expect(executionOrder).toContain("Read:after");
+				if (streamed) expect(executionOrder).toContain("Read:pending");
+				expect(events.some((event) => event.type === "error")).toBe(false);
+			});
+		}
+	}
+});
 
 describe("agent loop tool-result settlement", () => {
 	test("a rejecting parallel tool becomes isError while siblings keep yielding, model order preserved", async () => {

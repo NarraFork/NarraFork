@@ -13,6 +13,13 @@ import { API_WS_PREFIXES, isApiOrWsRelativePath } from "./lib/app-path-classify"
 
 declare let self: ServiceWorkerGlobalScope;
 
+// Update recovery must bypass even the precached shell while an unregistered
+// worker still controls a tab (or unregister failed). Register BEFORE precaching.
+registerRoute(
+	({ request, url }) => request.mode === "navigate" && url.searchParams.has("_nf_reload"),
+	({ request }) => fetch(new Request(request, { cache: "no-store" })),
+);
+
 // Injected by vite-plugin-pwa at build time
 precacheAndRoute(self.__WB_MANIFEST);
 cleanupOutdatedCaches();

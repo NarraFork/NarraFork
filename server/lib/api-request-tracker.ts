@@ -100,6 +100,34 @@ function normalizedDiagnostics(
 	return normalizeApiRequestDiagnostics(options.diagnostics ?? undefined);
 }
 
+/**
+ * Live master switch for request dumps.
+ *
+ * Always read from the settings singleton at call time — never snapshot at narrator
+ * session start. Saving `agent.requestDumpEnabled` must affect the next provider
+ * request in an already-running session without interrupt/restart.
+ */
+export function isRequestDumpEnabled(): boolean {
+	return settings.agent.requestDumpEnabled === true;
+}
+
+/** Live errors-only persist gate. Meaningless when the master switch is off. */
+export function isRequestDumpErrorsOnly(): boolean {
+	return settings.agent.requestDumpErrorsOnly === true;
+}
+
+/**
+ * Whether a provider attempt should attach an {@link ApiRequestDumpCollector}.
+ *
+ * Evaluated at attempt start so a toggle saved mid-session (during tools, between
+ * turns, or mid-retry) is picked up by the next `provider.chat()` without rebuilding
+ * the narrator session. Providers write through the *WithLimit helpers, so collection
+ * stays bounded even when force-enabled for leak detection.
+ */
+export function shouldCollectRequestDump(providerMayLeakXmlToolCalls?: boolean): boolean {
+	return isRequestDumpEnabled() || providerMayLeakXmlToolCalls === true;
+}
+
 function allowsFullRawDump(options: ApiRequestFinishOptions): boolean {
 	if (options.rawDump == null) return false;
 	// Leak detection forces persistence ahead of every gate: the raw SSE must stay
@@ -108,8 +136,10 @@ function allowsFullRawDump(options: ApiRequestFinishOptions): boolean {
 	if (options.forceDumpPersist) return true;
 	// Master switch — never silently persist full dumps unless an admin explicitly enabled
 	// them. Diagnostics are handled separately and remain bounded even when this is false.
-	if (!settings.agent.requestDumpEnabled) return false;
-	if (!settings.agent.requestDumpErrorsOnly) return true;
+	// Re-read live: enabling dump mid-request still persists a collector that already ran
+	// (e.g. leak-detection collection, or a request that started after a mid-turn toggle).
+	if (!isRequestDumpEnabled()) return false;
+	if (!isRequestDumpErrorsOnly()) return true;
 	return hasErrorMessage(options.errorMessage);
 }
 

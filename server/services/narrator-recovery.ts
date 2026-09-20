@@ -6,7 +6,6 @@
  * narrators already enjoy.
  */
 
-import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
@@ -75,9 +74,12 @@ interface OverflowResultBase {
 }
 
 interface OverflowCompacted extends OverflowResultBase {
+	/**
+	 * History was compacted (or a compact already completed) and the caller
+	 * should retry. Does NOT carry a new conversationId: recovery keeps the
+	 * existing id so prompt-cache / sticky-session affinity survives.
+	 */
 	action: "retry_compacted";
-	/** Fresh conversation ID to use after compact. */
-	newConversationId: ReturnType<typeof randomUUID>;
 }
 
 export type ContextOverflowFailureReason =
@@ -124,7 +126,7 @@ export function getContextOverflowFailureError(reason: ContextOverflowFailureRea
 /**
  * Handle a context-length-exceeded situation with emergency compact.
  * Returns a discriminated union so the caller can read the
- * recovery payload (newConversationId) directly from
+ * recovery payload (retry_compacted, no conversationId rotation) directly from
  * the result — no callbacks needed.
  *
  * @param onBroadcast  Optional hook to push events to the frontend (main
@@ -165,14 +167,13 @@ export async function handleContextOverflow(opts: {
 	const baselineCompactSeq = opts.baselineCompactSeq ?? -1;
 	const latestCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
 	if (latestCompactSeq != null && latestCompactSeq > baselineCompactSeq) {
-		const newConversationId = randomUUID();
 		onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
 		logger.info("A completed compact already supersedes the failed request, retrying", {
 			narratorId,
 			baselineCompactSeq: opts.baselineCompactSeq ?? null,
 			latestCompactSeq,
 		});
-		return { action: "retry_compacted", newConversationId, overflowRetries };
+		return { action: "retry_compacted", overflowRetries };
 	}
 
 	// If auto-compact was already triggered while the failed request was in flight,
@@ -208,13 +209,12 @@ export async function handleContextOverflow(opts: {
 				hasPendingHistoryCompact(narratorId) ||
 				(seqAfterInflight != null && seqAfterInflight > baselineCompactSeq)
 			) {
-				const newConversationId = randomUUID();
 				onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
 				logger.info("Existing history compact finished after context overflow, retrying", {
 					narratorId,
 					kind: existingCompact.kind,
 				});
-				return { action: "retry_compacted", newConversationId, overflowRetries };
+				return { action: "retry_compacted", overflowRetries };
 			}
 			logger.info("Existing compact did not satisfy overflow recovery, continuing", {
 				narratorId,
@@ -244,24 +244,22 @@ export async function handleContextOverflow(opts: {
 	// starting a redundant compact (which would report compact_noop) or giving
 	// up with max_retries_exceeded while a perfectly good summary sits in the DB.
 	if (hasPendingHistoryCompact(narratorId)) {
-		const newConversationId = randomUUID();
 		onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
 		logger.info("History compact completed but not yet applied to active history, retrying", {
 			narratorId,
 			attempt: overflowRetries,
 		});
-		return { action: "retry_compacted", newConversationId, overflowRetries };
+		return { action: "retry_compacted", overflowRetries };
 	}
 	const latestCompactSeqAfterWait = await narratorService.getLatestCompactSeq(narratorId);
 	if (latestCompactSeqAfterWait != null && latestCompactSeqAfterWait > baselineCompactSeq) {
-		const newConversationId = randomUUID();
 		onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
 		logger.info("A compact completed while overflow recovery was running, retrying", {
 			narratorId,
 			baselineCompactSeq,
 			latestCompactSeq: latestCompactSeqAfterWait,
 		});
-		return { action: "retry_compacted", newConversationId, overflowRetries };
+		return { action: "retry_compacted", overflowRetries };
 	}
 
 	// ── Phase B: no compact to ride on — this is a real recovery attempt ──
@@ -315,13 +313,12 @@ export async function handleContextOverflow(opts: {
 				: {}),
 		});
 		if (compacted) {
-			const newConversationId = randomUUID();
 			onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
 			logger.info("Emergency compact succeeded, retrying", {
 				narratorId,
 				usedEmergencyBoundary,
 			});
-			return { action: "retry_compacted", newConversationId, overflowRetries };
+			return { action: "retry_compacted", overflowRetries };
 		}
 		logger.warn("Emergency compact completed without compacting", {
 			narratorId,

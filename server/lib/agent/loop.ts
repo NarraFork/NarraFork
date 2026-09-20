@@ -5,7 +5,12 @@ import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-inj
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
 import { beginNarratorResponseActivity } from "../../services/update-coordinator";
-import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
+import {
+	type ApiRequestHandle,
+	finishApiRequest,
+	shouldCollectRequestDump,
+	startApiRequest,
+} from "../api-request-tracker";
 import {
 	type BooleanOverride,
 	type DangerReflectionLevel,
@@ -2976,18 +2981,18 @@ export async function* agentLoop(
 			};
 			const registerToolOrderIdentity = (
 				tool: { toolUseId: string; name?: string; outputIndex?: number },
-				strictSerial = false,
+				strictSerial?: boolean,
 			): ToolOrderIdentity => {
 				const existing = toolOrderIdentities.get(tool.toolUseId);
 				if (existing) {
 					if (tool.outputIndex != null) existing.outputIndex = tool.outputIndex;
 					if (tool.name) existing.name = tool.name;
-					if (
-						strictSerial ||
-						(tool.name && isStrictSerialToolExecution({ name: tool.name, input: {} }))
-					) {
-						existing.strictSerial = true;
-					}
+					// Completed input is authoritative, including an explicit false for
+					// parallel Bash. Partial chunks keep the conservative barrier.
+					existing.strictSerial =
+						strictSerial ??
+						(existing.strictSerial ||
+							!!(tool.name && isStrictSerialToolExecution({ name: tool.name, input: {} })));
 					return existing;
 				}
 				const identity: ToolOrderIdentity = {
@@ -2996,7 +3001,7 @@ export async function* agentLoop(
 					outputIndex: tool.outputIndex,
 					name: tool.name,
 					strictSerial:
-						strictSerial ||
+						strictSerial ??
 						(tool.name ? isStrictSerialToolExecution({ name: tool.name, input: {} }) : false),
 				};
 				toolOrderIdentities.set(tool.toolUseId, identity);
@@ -3834,17 +3839,18 @@ export async function* agentLoop(
 				requestMeterUnit = undefined;
 				requestDiagnostics = undefined;
 
-				// Initialize request dump collector when explicitly enabled, OR when the provider
-				// may leak XML tool calls (NUG) so leaked-tool diagnostics always have a
-				// bounded raw dump to persist on detection. Providers write bodyText/events through
-				// the *WithLimit helpers, so collection stays bounded even when force-enabled here.
-				requestDump =
-					settings.agent.requestDumpEnabled || provider.mayLeakXmlToolCalls
-						? new ApiRequestDumpCollector({
-								provider: effectiveProvider,
-								model: effectiveModel,
-							})
-						: undefined;
+				// Collection decision is live (not session-start): saving dump settings must
+				// affect the next provider.chat() in this already-running narrator without
+				// interrupt/restart. Also force-enabled when the provider may leak XML tool
+				// calls so leaked-tool diagnostics always have a bounded raw dump.
+				// Providers write bodyText/events through the *WithLimit helpers, so collection
+				// stays bounded even when force-enabled here.
+				requestDump = shouldCollectRequestDump(provider.mayLeakXmlToolCalls)
+					? new ApiRequestDumpCollector({
+							provider: effectiveProvider,
+							model: effectiveModel,
+						})
+					: undefined;
 
 				const attemptAbort = new AbortController();
 				let firstTokenTimeoutTriggered = false;

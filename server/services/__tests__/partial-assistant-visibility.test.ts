@@ -211,6 +211,7 @@ describe("partial assistant visibility", () => {
 			input,
 		});
 		expect(toolCallId).toBeTruthy();
+		if (!toolCallId) throw new Error("tool_use append must produce a tool-call row id");
 
 		await narratorPersistence.updateToolCallResult(
 			toolUseId,

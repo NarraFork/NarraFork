@@ -171,7 +171,8 @@ describe("provider retry policy is identical through the real primary and child 
 				for (const call of calls)
 					expect(call.packet.match(/CONTINUATION_CONTEXT/g)).toHaveLength(1);
 				if (mode === "responses") {
-					expect(calls[1].conversation).not.toBe(calls[0].conversation);
+					// Recovery must keep conversationId so prompt_cache_key stays stable.
+					expect(calls[1].conversation).toBe(calls[0].conversation);
 					expect(calls[1].reset).toBe(true);
 					expect(outcome.finalText).toBe("finished");
 				} else {

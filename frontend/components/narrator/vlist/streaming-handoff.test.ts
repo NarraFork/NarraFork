@@ -73,17 +73,58 @@ describe("isStreamingMessageSuperseded", () => {
 		).toBe(true);
 	});
 
-	it("retires a tool-bearing row as soon as its tool id is persisted", () => {
+	it("does NOT whole-row retire a tool-bearing live row when its tool id is persisted", () => {
+		// Per-tool hand-off drops the synthetic tool card; reasoning / text / later
+		// tools must stay until their own blocks are demonstrably in the document.
+		// Whole-row clear on tool id was the bug: tool1 persisted → clearBlocks wiped
+		// reasoning+content+tool2 until the next tool finished and reloaded the DB row.
 		expect(
 			isStreamingMessageSuperseded({
 				streamingMessage: streamingWithTool("tool-42"),
 				committedMessages: [user("u1", "问题"), toolMessage("a1", "tool-42")],
 			}),
-		).toBe(true);
+		).toBe(false);
+	});
+
+	it("keeps the live reasoning/content/tool2 row after tool1 has been persisted", () => {
+		// Reported shape: reasoning → content → tool1 → tool2. tool1 landing in the
+		// partial must not retire the live row that still owns reasoning, content and
+		// the in-flight tool2.
+		const live: HandoffMessage = {
+			id: STREAMING_MESSAGE_ID,
+			role: "assistant",
+			parentToolUseId: null,
+			contentJson: [
+				{ type: "reasoning", text: "**分析**\n\n先确认现状。" },
+				{ type: "text", text: "我先定位这段逻辑。" },
+				{ type: "tool_use", id: "tool-1" },
+				{ type: "tool_use", id: "tool-2" },
+			],
+			toolCalls: [
+				{ toolUseId: "tool-1", toolName: "Read", status: "success" },
+				{ toolUseId: "tool-2", toolName: "Bash", status: "running" },
+			],
+		};
+		const committedPartial: HandoffMessage = {
+			id: "a1",
+			role: "assistant",
+			parentToolUseId: null,
+			contentJson: [
+				{ type: "reasoning", text: "**分析**\n\n先确认现状。" },
+				{ type: "text", text: "我先定位这段逻辑。" },
+				{ type: "tool_use", id: "tool-1" },
+			],
+			toolCalls: [{ toolUseId: "tool-1", toolName: "Read", status: "success" }],
+		};
+		expect(
+			isStreamingMessageSuperseded({
+				streamingMessage: live,
+				committedMessages: [user("u1", "问题"), committedPartial],
+			}),
+		).toBe(false);
 	});
 
 	it("keeps a tool-bearing row when only a DIFFERENT tool is persisted", () => {
-		// Mid-turn: an earlier tool of the same turn is stored, but the live one is not.
 		expect(
 			isStreamingMessageSuperseded({
 				streamingMessage: streamingWithTool("tool-99"),
@@ -92,7 +133,7 @@ describe("isStreamingMessageSuperseded", () => {
 		).toBe(false);
 	});
 
-	it("matches a tool id carried only in contentJson (no toolCalls array)", () => {
+	it("does not whole-row retire on a tool id carried only in contentJson", () => {
 		const persisted: HandoffMessage = {
 			id: "a1",
 			role: "assistant",
@@ -104,7 +145,7 @@ describe("isStreamingMessageSuperseded", () => {
 				streamingMessage: streamingWithTool("tool-7"),
 				committedMessages: [persisted],
 			}),
-		).toBe(true);
+		).toBe(false);
 	});
 
 	it("ignores the streaming row itself when scanning the document", () => {
@@ -215,15 +256,15 @@ describe("isStreamingMessageSuperseded", () => {
 		).toBe(true);
 	});
 
-	it("retires a tool-bearing row on id match regardless of later text", () => {
-		// Tool identity is exact, so it does not need the char heuristic.
+	it("does not whole-row retire a tool-bearing row even when text arrived after the commit", () => {
+		// Tool cards retire individually; the row stays for reasoning/text/tool2.
 		expect(
 			isStreamingMessageSuperseded({
 				streamingMessage: streamingWithTool("tool-42"),
 				committedMessages: [toolMessage("a1", "tool-42")],
 				charsSinceLastCommit: 120,
 			}),
-		).toBe(true);
+		).toBe(false);
 	});
 });
 
