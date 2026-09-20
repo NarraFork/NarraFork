@@ -349,6 +349,8 @@ export function renderElement(
 					onOpenCompact={extra.onOpenCompact as (() => void) | undefined}
 					onCancelCompact={extra.onCancelCompact as (() => void) | undefined}
 					cancelCompactTitle={extra.cancelCompactTitle as string | undefined}
+					compactProgressMessageId={extra.compactProgressMessageId as string | undefined}
+					compactProgressIsSegment={extra.compactProgressIsSegment as boolean | undefined}
 				/>
 			);
 		case "system-text":

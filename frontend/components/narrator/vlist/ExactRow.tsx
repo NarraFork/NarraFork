@@ -421,6 +421,13 @@ export const ExactRow = memo(
 		if (kind === "reasoning") {
 			extra.onToggleTranslation = toggles.onToggleTranslation;
 		}
+		if (kind === "system-simple") {
+			const simpleBlock = item.measured.blocks[0] as { tag?: string } | undefined;
+			if (simpleBlock?.tag === "compact" || simpleBlock?.tag === "segment_compact") {
+				extra.compactProgressMessageId = sourceIds[0];
+				extra.compactProgressIsSegment = simpleBlock.tag === "segment_compact";
+			}
+		}
 		if (TRACE_KINDS.has(kind)) {
 			extra.onToggleItems = toggles.onToggleItems;
 			extra.onToggleEarlier = toggles.onToggleEarlier;

@@ -17,7 +17,7 @@
  *      in the render dispatch or a handler bound to the wrong branch fails here.
  *
  * Also asserted: the interaction never changes the marker's measured height (the
- * constant-height invariant `applyCompactProgress` relies on to skip anchoring).
+ * fixed-height invariant that lets live progress repaint without layout work).
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
@@ -26,6 +26,11 @@ import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segmen
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
+import {
+	clearAllCompactProgress,
+	getCompactProgress,
+	setCompactProgress,
+} from "./compact-progress-store";
 import { shellSource } from "./guard-source";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
@@ -40,6 +45,9 @@ const LABELS = {
 	compacted: "Context compacted",
 	compactFailed: "Compact failed",
 	compactOutputChars: "{count} chars",
+	compactThinking: "thinking",
+	compactThinkingChars: "{count} chars",
+	compactRetrying: "retry #{count}",
 	segmentCompacting: "Segment compacting…",
 	segmentCompacted: "Segment compacted ({count} messages)",
 };
@@ -118,6 +126,7 @@ interface RenderedMarker {
 function renderMarker(
 	block: Record<string, unknown>,
 	callbacks: { onOpenCompact?: () => void; onCancelCompact?: () => void } = {},
+	progressBinding?: { compactProgressMessageId?: string; compactProgressIsSegment?: boolean },
 ): RenderedMarker {
 	const spec = adaptCompactBlock(block);
 	expect(spec.kind).toBe("system-simple");
@@ -127,6 +136,12 @@ function renderMarker(
 	if (callbacks.onCancelCompact) {
 		extra.onCancelCompact = callbacks.onCancelCompact;
 		extra.cancelCompactTitle = CANCEL_TITLE;
+	}
+	// Mirror ExactRow: system-simple compact markers receive the owning message id
+	// so CompactRow can subscribe to the live progress store.
+	if (progressBinding?.compactProgressMessageId) {
+		extra.compactProgressMessageId = progressBinding.compactProgressMessageId;
+		extra.compactProgressIsSegment = progressBinding.compactProgressIsSegment ?? false;
 	}
 
 	const container = document.createElement("div");
@@ -268,6 +283,52 @@ describe("compact marker row — the injected callbacks actually fire", () => {
 		marker.unmount();
 	});
 
+	it("repaints from the compact progress store when a message id is bound", () => {
+		clearAllCompactProgress();
+		// Document fallback text is composed from the (unpersisted) block fields —
+		// deliberately different from the live store entry the shell will write.
+		setCompactProgress("compact-msg", false, {
+			phase: "output",
+			thinkingChars: 0,
+			outputChars: 999,
+			retryCount: 0,
+		});
+		const marker = renderMarker(
+			{ type: "compact", status: "compacting", outputChars: 0 },
+			{},
+			{ compactProgressMessageId: "compact-msg", compactProgressIsSegment: false },
+		);
+		const text = marker.root.textContent ?? "";
+		expect(text).toContain("999 chars");
+		expect(text).not.toContain("0 chars");
+		expect(getCompactProgress("compact-msg", false)?.outputChars).toBe(999);
+		marker.unmount();
+		clearAllCompactProgress();
+	});
+
+	it("ignores store progress after the marker settles or when no id is bound", () => {
+		clearAllCompactProgress();
+		setCompactProgress("compact-msg", false, {
+			phase: "output",
+			thinkingChars: 0,
+			outputChars: 999,
+			retryCount: 0,
+		});
+		const settled = renderMarker(
+			{ type: "compact", status: "compacted" },
+			{},
+			{ compactProgressMessageId: "compact-msg", compactProgressIsSegment: false },
+		);
+		expect(settled.root.textContent ?? "").not.toContain("999");
+		settled.unmount();
+
+		const unbound = renderMarker({ type: "compact", status: "compacting", outputChars: 7 });
+		expect(unbound.root.textContent ?? "").toContain("7 chars");
+		expect(unbound.root.textContent ?? "").not.toContain("999");
+		unbound.unmount();
+		clearAllCompactProgress();
+	});
+
 	it("a segment marker opens through the same slot", () => {
 		let opened = 0;
 		const marker = renderMarker(
@@ -314,8 +375,7 @@ describe("compact marker row — the injected callbacks actually fire", () => {
 	});
 
 	it("interaction never changes the marker's measured height", () => {
-		// applyCompactProgress skips anchoring precisely because this height is
-		// constant across the whole lifecycle — including the cancel ✕ glyph.
+		// Live progress never changes this height, including when the cancel ✕ glyph is present.
 		const compacted = renderMarker({ type: "compact", status: "compacted" });
 		const compacting = renderMarker(
 			{ type: "compact", status: "compacting", outputChars: 999999 },
@@ -357,5 +417,17 @@ describe("shell wiring — the compact callbacks reach the row", () => {
 		expect(dispatch).toContain(
 			"onCancelCompact={extra.onCancelCompact as (() => void) | undefined}",
 		);
+		expect(dispatch).toContain(
+			"compactProgressMessageId={extra.compactProgressMessageId as string | undefined}",
+		);
+		expect(dispatch).toContain(
+			"compactProgressIsSegment={extra.compactProgressIsSegment as boolean | undefined}",
+		);
+	});
+
+	it("ExactRow binds the compact progress identity from the owning source message", async () => {
+		const exactRow = await Bun.file(new URL("./ExactRow.tsx", import.meta.url).pathname).text();
+		expect(exactRow).toContain("extra.compactProgressMessageId = sourceIds[0]");
+		expect(exactRow).toContain('simpleBlock?.tag === "segment_compact"');
 	});
 });

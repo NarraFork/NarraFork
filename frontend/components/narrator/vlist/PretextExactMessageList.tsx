@@ -79,6 +79,12 @@ import {
 } from "../tool-call/tool-display";
 import { recentRunSegmentMessageIds } from "../trace/run-segments";
 import { TraceRowInteraction } from "../trace/TraceRowInteraction";
+import {
+	clearAllCompactProgress,
+	clearCompactProgress,
+	clearCompactProgressAliases,
+	setCompactProgress,
+} from "./compact-progress-store";
 import { ExactRow } from "./ExactRow";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
 import type { MeasuredToolCall } from "./measure/measure-tool-call";
@@ -558,6 +564,13 @@ export const PretextExactMessageList = memo(
 			 * navigating away) and stop scrolling instead of fighting the new target.
 			 */
 			const jumpTokenRef = useRef(0);
+			/**
+			 * Compact-progress keys this panel has written into the module store.
+			 * `compact_done` often carries no marker id (non-retry path), so cleanup
+			 * cannot rely on the event payload alone — clear what we observed, plus
+			 * every COW alias when the event does name replacement identities.
+			 */
+			const compactProgressKeysRef = useRef<Map<string, boolean>>(new Map());
 			const pinnedToBottomRef = useRef(true);
 			const suppressScrollStateRef = useRef(false);
 			/**
@@ -1933,13 +1946,50 @@ export const PretextExactMessageList = memo(
 					// `segmentCompactId` (server-side), so a full-history compact leaves every
 					// older message readable and a segment compact's hidden rows are already
 					// gone via `onSegmentCompactHide` above.
-					onCompactDone: () => bumpMessageRevision(),
-					onFullReload: bumpMessageRevision,
-					// Live compact-progress ticks patch the loaded compact marker in place
-					// (no refetch, no messageVersion bump) so the "…compacting · N chars"
-					// label counts up smoothly during a blocking/background compaction.
-					onCompactProgress: ({ messageId, isSegment, ...progress }) => {
-						pretextDocument.applyCompactProgress(messageId, progress, !!isSegment);
+					onCompactDone: (_contextPercentAfter, isSegment, _mode, replacement) => {
+						// COW retries may name old and/or new marker ids; the non-retry
+						// path often names none. Always clear aliases when present, then
+						// every key this panel wrote (progress is keyed by the id that
+						// `compact_progress` broadcast, which is not always on the done
+						// payload). Do not clearAll here — another narrator may still be
+						// compacting.
+						clearCompactProgressAliases(replacement, isSegment);
+						const observed = compactProgressKeysRef.current;
+						for (const [messageId, wasSegment] of observed) {
+							if (isSegment != null && wasSegment !== isSegment) continue;
+							clearCompactProgress(messageId, wasSegment);
+							observed.delete(messageId);
+						}
+						bumpMessageRevision();
+					},
+					onCompactFailed: (_error, _mode, messageId) => {
+						clearCompactProgress(messageId);
+						if (messageId) compactProgressKeysRef.current.delete(messageId);
+					},
+					onFullReload: () => {
+						clearAllCompactProgress();
+						compactProgressKeysRef.current.clear();
+						bumpMessageRevision();
+					},
+					// Live compact-progress ticks repaint only the mounted fixed-height marker.
+					// They never enter the pretext document or its measurement cache.
+					onCompactProgress: ({
+						messageId,
+						isSegment,
+						phase,
+						thinkingChars,
+						outputChars,
+						retryCount,
+					}) => {
+						if (!messageId) return;
+						const segment = !!isSegment;
+						setCompactProgress(messageId, segment, {
+							phase,
+							thinkingChars,
+							outputChars,
+							retryCount,
+						});
+						compactProgressKeysRef.current.set(messageId, segment);
 					},
 					onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
 						const initialSync = initialRevisionSyncRef.current;

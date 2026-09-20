@@ -149,7 +149,10 @@ export interface AdapterContentBlock {
 	thinkingChars?: number | null;
 	/**
 	 * compact / segment_compact: 1-based ordinal of the summary retry now in
-	 * flight (transient, patched by applyCompactProgress; absent = not retrying).
+	 * flight. Transient render-state: the vlist paints live ticks from
+	 * `compact-progress-store` (not this field); the server does not re-persist
+	 * it. Absent = not retrying. Still read here when composing the initial
+	 * `data.text` fallback for a marker loaded mid-run.
 	 */
 	retryCount?: number | null;
 	/** segment_compact: number of messages folded into the segment summary. */
@@ -1825,6 +1828,18 @@ function sysLabel(ctx: AdapterContext, key: string): string {
 	return ctx.labels?.[key] ?? SYSTEM_LABEL_FALLBACKS[key] ?? key;
 }
 
+/** Stable compact labels carried to the renderer for fixed-height live repainting. */
+function compactProgressLabels(ctx: AdapterContext): Record<string, string> {
+	return {
+		compacting: sysLabel(ctx, "compacting"),
+		segmentCompacting: sysLabel(ctx, "segmentCompacting"),
+		outputChars: sysLabel(ctx, "compactOutputChars"),
+		thinking: sysLabel(ctx, "compactThinking"),
+		thinkingChars: sysLabel(ctx, "compactThinkingChars"),
+		retrying: sysLabel(ctx, "compactRetrying"),
+	};
+}
+
 /**
  * Format an origin_notice timestamp: today → `HH:mm`, otherwise `MM/DD HH:mm`.
  *
@@ -2128,40 +2143,6 @@ function composeCompactText(
 		return sysLabel(ctx, "segmentCompacted").replace(/\{count\}/g, String(count));
 	}
 	return sysLabel(ctx, "compacted");
-}
-
-/**
- * While a compact marker is `compacting`, its live `outputChars` changes the
- * one-line label text but NOT its height (single clamped line). The measure
- * cache keys on (spec.key, kind, width, lod, opts, dataRevision) and the compact
- * block's dataRevision only tracks `status` — which stays "compacting" for the
- * whole run — so a bare rebuild would return the stale cached text. Folding the
- * live count into `opts.progress` makes the opts digest (and therefore the cache
- * key) change on each progress tick, forcing a re-measure that re-composes the
- * label. The measure fn ignores `progress` (height is constant), so this only
- * affects cache identity, never layout geometry. Returns `{}` when not
- * compacting so completed/failed markers keep a stable, cacheable key.
- */
-function compactProgressOpts(
-	status: "compacting" | "compacted" | "failed",
-	outputChars?: number | null,
-	phase?: ProgressPhase | null,
-	thinkingChars?: number | null,
-	retryCount?: number | null,
-): { opts?: Record<string, unknown> } {
-	if (status !== "compacting") return {};
-	// The phase and the thinking count belong in the digest for the same reason
-	// the output count does: they change the composed label while the height (a
-	// single clamped line) never moves. `retry` too: entering/leaving a retry
-	// swaps the whole label text.
-	return {
-		opts: {
-			progress: typeof outputChars === "number" ? outputChars : 0,
-			phase: phase === "thinking" ? "thinking" : "output",
-			thinking: typeof thinkingChars === "number" ? thinkingChars : 0,
-			retry: typeof retryCount === "number" ? retryCount : 0,
-		},
-	};
 }
 
 /**
@@ -2875,15 +2856,8 @@ function adaptSystemBlock(
 					retryCount: block.retryCount,
 				}),
 				status: segStatus,
-				...(typeof block.outputChars === "number" ? { outputChars: block.outputChars } : {}),
+				compactLabels: compactProgressLabels(ctx),
 			},
-			...compactProgressOpts(
-				segStatus,
-				block.outputChars,
-				block.progressPhase,
-				block.thinkingChars,
-				block.retryCount,
-			),
 		};
 	}
 
@@ -2892,15 +2866,6 @@ function adaptSystemBlock(
 			kind: "system-simple",
 			key: `${keyBase}-sys`,
 			data: adaptSystemSimpleData(blockType, block, ctx),
-			...(blockType === "compact" && block.status === "compacting"
-				? compactProgressOpts(
-						"compacting",
-						block.outputChars,
-						block.progressPhase,
-						block.thinkingChars,
-						block.retryCount,
-					)
-				: {}),
 		};
 	}
 	if (SYSTEM_TEXT_SUBTYPES.has(blockType)) {
@@ -2947,7 +2912,7 @@ function adaptSystemSimpleData(
 					retryCount: block.retryCount,
 				}),
 				status: compactStatus,
-				...(typeof block.outputChars === "number" ? { outputChars: block.outputChars } : {}),
+				compactLabels: compactProgressLabels(ctx),
 			};
 		}
 		case "merge_summary":

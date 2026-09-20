@@ -19,8 +19,8 @@
  * rebuild is the cheap part once the data is in hand.
  *
  * INVARIANT THIS RELIES ON: `PretextDocumentInput` is copy-on-write. Every
- * coordinator mutation path (`applyCompactProgress`, `applyLivePatch`,
- * `appendMessage`, `loadOlder`) rebuilds `{...input, messages: [...]}` and
+ * coordinator mutation path (`applyLivePatch`, `appendMessage`, `loadOlder`)
+ * rebuilds `{...input, messages: [...]}` and
  * replaces message objects wholesale rather than mutating them in place, which is
  * what makes storing references safe here: no deep clone is needed. If that ever
  * changes, this cache must clone.

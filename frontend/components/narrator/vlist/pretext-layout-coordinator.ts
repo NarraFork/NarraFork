@@ -8,7 +8,6 @@ import {
 } from "@shared/pretext-layout";
 import { resetPreparedMarkdownCache } from "@shared/pretext-layout/prepared-markdown-cache";
 import { getTypographyRevision } from "@shared/pretext-layout/typography";
-import type { ProgressSnapshot } from "@shared/progress-phase";
 import type { NarratorMsg } from "../narrator-panel-types";
 import {
 	ensureKatexLoaded,
@@ -413,44 +412,6 @@ export class PretextLayoutCoordinator {
 	}
 
 	/**
-	 * Apply a live compact-progress tick (from the `compact_progress` WS event) to
-	 * the loaded document without a network refetch. The server streams the
-	 * summary char count but does NOT persist it or re-broadcast the message, so —
-	 * mirroring the chunk path's `applyCompactProgressByMessageId` — we patch the
-	 * compact block's progress fields in the already-loaded input in place and
-	 * rebuild. The compact indicator's height is constant, so this only re-composes
-	 * its one-line label (the adapter folds the phase and both counts into the
-	 * measure cache key so the new text is not served stale). No-ops when the
-	 * target message is not loaded, its progress is unchanged, or no prior build
-	 * options exist yet.
-	 */
-	applyCompactProgress(
-		messageId: string,
-		progress: CompactProgressPatch,
-		isSegment: boolean,
-	): void {
-		if (!this.input || !this.lastBuildOptions) return;
-		const expectedType = isSegment ? "segment_compact" : "compact";
-		const patched = patchCompactProgress(this.input.messages, messageId, progress, expectedType);
-		if (!patched.changed) return;
-		// No anchor: the compact indicator's height is CONSTANT, so the rebuild
-		// cannot move anything. (applyLivePatch below must anchor, because a tool
-		// status change does resize its card.)
-		// Keep the same messageVersion/length (this is an in-place field patch, not
-		// a structural change) so the anchor-preserving rebuild reuses every other
-		// item's cached measurement; only the compacting card re-measures.
-		this.input = { ...this.input, messages: patched.messages };
-		const generation = ++this.generation;
-		this.commitLayout(
-			this.input,
-			this.lastBuildOptions,
-			undefined,
-			this.lastViewportHeight,
-			generation,
-		);
-	}
-
-	/**
 	 * Apply a LIVE LIFECYCLE patch to the loaded document without a refetch.
 	 *
 	 * This is the update channel for events that mutate an already-loaded message
@@ -460,13 +421,12 @@ export class PretextLayoutCoordinator {
 	 * bump `messageVersion`), so without this path the card renders its stale
 	 * "running" / "reflecting" state until an unrelated structural reload happens.
 	 *
-	 * Like applyCompactProgress this keeps `messageVersion` and the message COUNT
-	 * unchanged — it is a field patch, not a structural change — so the rebuild
-	 * reuses every untouched item's cached measurement and only the patched card is
-	 * re-measured.
+	 * This keeps `messageVersion` and the message COUNT unchanged — it is a field
+	 * patch, not a structural change — so the rebuild reuses every untouched item's
+	 * cached measurement and only the patched card is re-measured.
 	 *
-	 * Unlike applyCompactProgress it MUST anchor. A status transition changes the
-	 * card's height (a detail body appears, a status row changes), and the exact
+	 * It MUST anchor. A status transition changes the card's height (a detail body
+	 * appears, a status row changes), and the exact
 	 * list's protected invariant is that a committed row never visually jumps
 	 * without a user action. Capturing the anchor before the rebuild and restoring
 	 * scrollTop after keeps the viewport content pinned across the resize; the
@@ -1348,83 +1308,4 @@ export class PretextLayoutCoordinator {
 	private emit(): void {
 		for (const listener of this.listeners) listener();
 	}
-}
-
-/**
- * Whether a compact block already shows exactly this progress.
- *
- * A block loaded from the server carries no progress fields at all, and an older
- * server sends no `phase` — both normalize to `output` with a 0 thinking count,
- * the same rule `coerceProgressSnapshot` applies. Without that normalization a
- * duplicate output-phase tick would look like a change and force a pointless
- * rebuild on every event.
- */
-function sameCompactProgress(block: unknown, progress: CompactProgressPatch): boolean {
-	const fields = (block ?? {}) as {
-		outputChars?: unknown;
-		thinkingChars?: unknown;
-		progressPhase?: unknown;
-		retryCount?: unknown;
-	};
-	const phase = fields.progressPhase === "thinking" ? "thinking" : "output";
-	const thinkingChars = typeof fields.thinkingChars === "number" ? fields.thinkingChars : 0;
-	const retryCount = typeof fields.retryCount === "number" ? fields.retryCount : 0;
-	return (
-		fields.outputChars === progress.outputChars &&
-		thinkingChars === progress.thinkingChars &&
-		phase === progress.phase &&
-		retryCount === (progress.retryCount ?? 0)
-	);
-}
-
-/**
- * A live compact-progress tick. `retryCount` rides along on the immediate
- * broadcast emitted when a failed summary attempt is scheduled for retry;
- * ordinary throttled ticks omit it, which the patch normalizes to 0 so the
- * label leaves "retry #N" as soon as fresh output streams again.
- */
-export type CompactProgressPatch = ProgressSnapshot & { retryCount?: number };
-
-/**
- * Immutably patch the two-phase progress of the running compact block on the
- * message with `messageId` (searching the top level and any child trees). Only
- * rewrites a block whose `type` matches `expectedType` and whose `status` is
- * still `compacting`, and only when a label-affecting field actually changes —
- * so a duplicate or late tick is a cheap no-op. Mirrors the chunk path's
- * `updateCompactProgressInMessages` but scoped to the vlist coordinator.
- */
-function patchCompactProgress(
-	messages: readonly TreeMessage[],
-	messageId: string,
-	progress: CompactProgressPatch,
-	expectedType: "compact" | "segment_compact",
-): { messages: TreeMessage[]; changed: boolean } {
-	let changed = false;
-	const next = messages.map((message) => {
-		if (message.id === messageId) {
-			const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
-			let blockChanged = false;
-			const contentJson = blocks.map((block) => {
-				if (block.type !== expectedType || block.status !== "compacting") return block;
-				if (sameCompactProgress(block, progress)) return block;
-				blockChanged = true;
-				return {
-					...block,
-					outputChars: progress.outputChars,
-					thinkingChars: progress.thinkingChars,
-					progressPhase: progress.phase,
-					retryCount: progress.retryCount ?? 0,
-				};
-			});
-			if (!blockChanged) return message;
-			changed = true;
-			return { ...message, contentJson };
-		}
-		if (!message.children?.length) return message;
-		const childResult = patchCompactProgress(message.children, messageId, progress, expectedType);
-		if (!childResult.changed) return message;
-		changed = true;
-		return { ...message, children: childResult.messages };
-	});
-	return changed ? { messages: next, changed: true } : { messages: [...messages], changed: false };
 }

@@ -19,7 +19,6 @@ import { onFontRevisionChange } from "./katex-runtime";
 import type { RenderLod } from "./prepared-block";
 import type { PretextDocumentLoadOptions } from "./pretext-document-loader";
 import {
-	type CompactProgressPatch,
 	captureCoordinatorAnchor,
 	type PretextLayoutBuildOptions,
 	PretextLayoutCoordinator,
@@ -205,12 +204,6 @@ export interface UsePretextDocumentResult {
 	 * fails, so the jump loop aborts instead of looping on an unchanged window.
 	 */
 	loadOlderAsync: () => Promise<number>;
-	/** Apply a live compact-progress tick to the loaded document (no refetch). */
-	applyCompactProgress: (
-		messageId: string,
-		progress: CompactProgressPatch,
-		isSegment: boolean,
-	) => void;
 	/**
 	 * Apply a live tool / reflection / subagent lifecycle patch to the loaded
 	 * document (no refetch, anchor-preserving). Returns true when it changed
@@ -666,12 +659,6 @@ export function usePretextDocument(
 			// Reported through the snapshot's retained error; paging stays available.
 		});
 	}, [coordinator, loadOlderAsync]);
-	const applyCompactProgress = useCallback(
-		(messageId: string, progress: CompactProgressPatch, isSegment: boolean) => {
-			coordinator?.applyCompactProgress(messageId, progress, isSegment);
-		},
-		[coordinator],
-	);
 	// The view is read LIVE at patch time (same contract as loadOlder) so a scroll
 	// in flight cannot desync the captured anchor from the applied correction.
 	const applyLivePatch = useCallback<UsePretextDocumentResult["applyLivePatch"]>(
@@ -830,7 +817,6 @@ export function usePretextDocument(
 		refreshAskInPassing,
 		loadOlder,
 		loadOlderAsync,
-		applyCompactProgress,
 		applyLivePatch,
 		setStreamingMessage,
 		appendMessage,

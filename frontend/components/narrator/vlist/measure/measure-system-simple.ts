@@ -55,6 +55,15 @@ export type SystemSimpleKind = "compact" | "segment_compact" | "merge_summary";
 export interface SystemSimpleData {
 	/** The single line of display text (pre-composed by the caller). */
 	text: string;
+	/** Live compact labels used to repaint the fixed-height marker without relayout. */
+	compactLabels?: {
+		compacting: string;
+		segmentCompacting: string;
+		outputChars: string;
+		thinking: string;
+		thinkingChars: string;
+		retrying: string;
+	};
 	/** Mantine colour name for icon/text/background (e.g. orange/teal/indigo). */
 	color?: string;
 	/** compact / segment_compact status → chooses loader vs minimize vs alert. */
