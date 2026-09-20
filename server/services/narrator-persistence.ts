@@ -41,12 +41,14 @@ import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { forcesRelaxedPlan, type PermissionMode } from "../lib/permission-modes";
 import { settings } from "../lib/settings";
+import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { getExecutionOwner } from "./agent-runtime/ownership";
 import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
 import { createFileChangeExecutionSegmentsService } from "./file-change-execution-segments";
+import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
 import { type PgNarratorRefsTx, persistPgMessageWithRef } from "./narrator-refs/postgres-store";
 import {
@@ -600,6 +602,17 @@ function appendMessageRefSync(
 	narratorId: string,
 	messageId: string,
 	isCompact = 0,
+	/**
+	 * Whether this insertion is visible to sync clients.
+	 *
+	 * `createPartialAssistantMessage` allocates a ref/seq for an EMPTY assistant
+	 * shell before any `block_complete` lands. Announcing that shell would bump
+	 * `messageVersion` without broadcastable content, deliver an empty row into
+	 * the document, and let live-row hand-off retire streaming reasoning/text
+	 * while the committed copy is still blank. The shell stays internal until
+	 * `appendBlockToMessage` publishes real blocks.
+	 */
+	bumpMessageVersion = true,
 ): number {
 	// The shared next_seq authority; the synchronous counter claim rolls back with this ref.
 	const seq = claimNextRefSeq(tx, narratorId);
@@ -614,17 +627,16 @@ function appendMessageRefSync(
 		})
 		.run();
 
-	// messageCount rides along with the messageVersion bump this row already gets:
-	// same row, same transaction, so the added cost is nil (72ms → 83ms per 20k
-	// refs). It must be an increment, not a recompute — recounting on every insert
-	// is O(n²) over a conversation and measured 8.3s for the same 20k refs.
+	// messageCount is an insert-count upper bound, not sync authority — it still
+	// advances for an unannounced partial. messageVersion is the sync token and
+	// only moves when clients are meant to observe a change.
 	//
 	// Deletions are handled by the read path instead of by matching decrements: refs
 	// are removed from ~30 scattered call sites, so the counter is treated as a fast
 	// upper bound that self-corrects when read. See narrator-message-count.ts.
 	tx.update(narrators)
 		.set({
-			messageVersion: sql`${narrators.messageVersion} + 1`,
+			...(bumpMessageVersion ? { messageVersion: sql`${narrators.messageVersion} + 1` } : {}),
 			messageCount: sql`COALESCE(${narrators.messageCount}, 0) + 1`,
 		})
 		.where(eq(narrators.id, narratorId))
@@ -1020,14 +1032,18 @@ export function createPgPlacedMessageMaterializer(
 
 // ── narratorPersistence object ─────────────────────────────────────────────
 
-async function appendPersistedMessage(message: RefMessageInput): Promise<RefMessage> {
+async function appendPersistedMessage(
+	message: RefMessageInput,
+	options?: { bumpMessageVersion?: boolean },
+): Promise<RefMessage> {
+	const bumpMessageVersion = options?.bumpMessageVersion !== false;
 	const pg = getNarratorMessageRefsPort();
-	if (pg) return pg.append(message);
+	if (pg) return pg.append(message, { bumpMessageVersion });
 	return withDbRetry(
 		async () =>
 			db.transaction((tx) => {
 				const created = tx.insert(narratorMessages).values(message).returning().get();
-				const seq = appendMessageRefSync(tx, message.narratorId, message.id);
+				const seq = appendMessageRefSync(tx, message.narratorId, message.id, 0, bumpMessageVersion);
 				return { ...created, seq };
 			}),
 		{ label: "appendPersistedMessage", maxRetries: 5 },
@@ -1892,38 +1908,43 @@ const sqliteNarratorPersistence = {
 	) {
 		const id = generateId();
 		const now = new Date().toISOString();
-		const pg = getNarratorMessageRefsPort();
 
-		const msg = await appendPersistedMessage({
-			id,
-			narratorId,
-			messageUuid: sdkMessage.uuid,
-			parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
-			role: "assistant",
-			contentJson: [],
-			contentText: null,
-			tokensIn: sdkMessage.tokensIn ?? null,
-			turnUsageJson: sdkMessage.turnUsage ?? null,
-			provider: sdkMessage.provider ?? null,
-			credentialId: sdkMessage.credentialId ?? null,
-			model: sdkMessage.model ?? null,
-			outputTokens: sdkMessage.outputTokens ?? null,
-			cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
-			cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
-			cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
-			cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
-			reasoningTokens: sdkMessage.reasoningTokens ?? null,
-			ttftMs: sdkMessage.ttftMs ?? null,
-			durationMs: sdkMessage.durationMs ?? null,
-			contextPercent: sdkMessage.contextPercent ?? null,
-			meterUsage: sdkMessage.meterUsage ?? null,
-			meterUnit: sdkMessage.meterUnit ?? null,
-			createdAt: now,
-		});
+		// Empty shell: allocate id + ref/seq so `appendBlockToMessage` has a stable
+		// target, but do NOT bump messageVersion. Announcing an empty assistant row
+		// makes clients render a blank committed message and lets live-row hand-off
+		// drop streaming reasoning/text before any content is visible. Visibility
+		// starts when `appendBlockToMessage` publishes real blocks.
+		const msg = await appendPersistedMessage(
+			{
+				id,
+				narratorId,
+				messageUuid: sdkMessage.uuid,
+				parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
+				role: "assistant",
+				contentJson: [],
+				contentText: null,
+				tokensIn: sdkMessage.tokensIn ?? null,
+				turnUsageJson: sdkMessage.turnUsage ?? null,
+				provider: sdkMessage.provider ?? null,
+				credentialId: sdkMessage.credentialId ?? null,
+				model: sdkMessage.model ?? null,
+				outputTokens: sdkMessage.outputTokens ?? null,
+				cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
+				cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
+				cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
+				cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
+				reasoningTokens: sdkMessage.reasoningTokens ?? null,
+				ttftMs: sdkMessage.ttftMs ?? null,
+				durationMs: sdkMessage.durationMs ?? null,
+				contextPercent: sdkMessage.contextPercent ?? null,
+				meterUsage: sdkMessage.meterUsage ?? null,
+				meterUnit: sdkMessage.meterUnit ?? null,
+				createdAt: now,
+			},
+			{ bumpMessageVersion: false },
+		);
 
-		const seq = msg.seq;
-		if (!pg) await bumpParentNarratorMessageVersion(sdkMessage.parent_tool_use_id);
-		return { ...msg, seq };
+		return { ...msg, seq: msg.seq };
 	},
 
 	async appendBlockToMessage(
@@ -2052,6 +2073,54 @@ const sqliteNarratorPersistence = {
 			.set({ contentJson: content, contentText: contentText || null })
 			.where(eq(narratorMessages.id, messageId));
 
+		/**
+		 * Publish the partial now that it holds real content.
+		 *
+		 * Completed blocks are removed from the reconnect streaming snapshot at
+		 * `block_complete`, so without this announce a reconnecting client would see
+		 * neither the live row nor the committed copy — reasoning and assistant text
+		 * vanish until some later reload. Matches the `messageVersion` contract: a
+		 * bump always ships with a broadcast of the current message body.
+		 */
+		const publishPartial = async () => {
+			const owner = existing.parentToolUseId
+				? await db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { parentNarratorId: true },
+					})
+				: undefined;
+			const broadcastTargetId = owner?.parentNarratorId ?? narratorId;
+			// The parent embeds this child's messages, so its reconnect version must
+			// change at the same boundary as the child's (never for the empty shell).
+			await bumpNarratorMessageVersions([narratorId, broadcastTargetId]);
+			const published = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				with: { toolCalls: true },
+			});
+			if (!published) return;
+			const ref = await db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+				columns: { seq: true },
+			});
+			const projected = enrichToolUseBlocks(truncateToolIO([{ ...published, seq: ref?.seq }]))[0];
+			if (!projected) return;
+			dualBroadcastToNarrator(
+				{
+					narratorId,
+					broadcastTargetId,
+					parentToolUseId: existing.parentToolUseId,
+				},
+				{
+					type: "message_updated",
+					narratorId,
+					message: projected,
+				},
+			);
+		};
+
 		if (block.type === "tool_use") {
 			const now = new Date().toISOString();
 			const parentToolCall = await findExecutionSegmentParent(narratorId, existing.parentToolUseId);
@@ -2086,8 +2155,10 @@ const sqliteNarratorPersistence = {
 						: null,
 				createdAt: now,
 			});
+			await publishPartial();
 			return toolCallId;
 		}
+		await publishPartial();
 		return undefined;
 	},
 

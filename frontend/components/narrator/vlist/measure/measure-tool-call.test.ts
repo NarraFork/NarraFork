@@ -1,5 +1,6 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { BARE_ROW_CHEVRON, BARE_ROW_GAP, BARE_ROW_ICON } from "@shared/pretext-layout/row-metrics";
+import { resetTypographyForTest, setTypography } from "@shared/pretext-layout/typography";
 import { installCanvasStub } from "./test-canvas-stub";
 
 // Install the deterministic canvas stub BEFORE importing any pretext-backed
@@ -7,6 +8,10 @@ import { installCanvasStub } from "./test-canvas-stub";
 // kinds + reuses measure-permission, all of which call pretext at prepare time).
 beforeAll(() => {
 	installCanvasStub();
+});
+
+afterEach(() => {
+	resetTypographyForTest();
 });
 
 // ── Shared builders ──────────────────────────────────────────────────────────
@@ -41,6 +46,9 @@ describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () =>
 		// at both sizes. This is what let the icon be unified without touching any
 		// measured height.
 		expect(m.HEADER_ROW_HEIGHT).toBe(19);
+		// The LIVE accessor must agree at neutral typography, and must be what
+		// `measureToolCall` actually reserves (frozen constants are documentation).
+		expect(m.headerRowHeight()).toBe(m.HEADER_ROW_HEIGHT);
 	});
 
 	/**
@@ -66,17 +74,38 @@ describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () =>
 			m.CARD_BORDER + m.CARD_PADDING + m.HEADER_CATEGORY_ICON + m.HEADER_CELL_GAP;
 		const iconShift = BARE_ROW_CHEVRON + BARE_ROW_GAP - (m.CARD_BORDER + m.CARD_PADDING);
 		expect(rowTextLeft - cardTextLeft).toBe(iconShift);
-		// The 19px text line is taller than the 16px icon lane.
-		expect(m.HEADER_ROW_HEIGHT).toBe(19);
+		// The 19px text line is taller than the 14px icon lane at neutral typography.
+		expect(m.headerRowHeight()).toBe(19);
 	});
 
 	it("standalone collapsed card ≈ 41px (10*2 padding + 1*2 border + 19 header)", async () => {
 		const m = await mod();
-		const expected = m.CARD_PADDING * 2 + m.CARD_BORDER * 2 + m.HEADER_ROW_HEIGHT;
+		const expected = m.CARD_PADDING * 2 + m.CARD_BORDER * 2 + m.headerRowHeight();
 		expect(expected).toBe(41);
 		// Within the 40-42px target from CONTRACT §4.
 		expect(expected).toBeGreaterThanOrEqual(40);
 		expect(expected).toBeLessThanOrEqual(42);
+	});
+
+	it("header / group-header geometry scales with the reader's typography", async () => {
+		const m = await mod();
+		resetTypographyForTest();
+		const neutralCard = m.measureToolCall(baseCard(), 600, 4, { opened: false });
+		const neutralGroup = m.measureToolCallGroup([baseCard()], 600, 4, { expanded: false });
+		expect(neutralCard.headerHeight).toBeCloseTo(m.headerRowHeight(), 5);
+		expect(m.headerRowHeight()).toBe(19);
+		expect(neutralGroup.headerHeight).toBeCloseTo(m.groupHeaderRowHeight(), 5);
+
+		setTypography({ fontScalePercent: 150, lineHeightScalePercent: 150 });
+		// xs × base line-height at 150% font and 150% leading: clearly above the frozen 19.
+		expect(m.headerRowHeight()).toBeGreaterThan(m.HEADER_ROW_HEIGHT);
+		expect(m.groupHeaderRowHeight()).toBeGreaterThan(m.GROUP_HEADER_ROW);
+		const scaledCard = m.measureToolCall(baseCard(), 600, 4, { opened: false });
+		const scaledGroup = m.measureToolCallGroup([baseCard()], 600, 4, { expanded: false });
+		expect(scaledCard.headerHeight).toBeCloseTo(m.headerRowHeight(), 5);
+		expect(scaledCard.height).toBeGreaterThan(neutralCard.height);
+		expect(scaledGroup.headerHeight).toBeCloseTo(m.groupHeaderRowHeight(), 5);
+		expect(scaledGroup.height).toBeGreaterThan(neutralGroup.height);
 	});
 
 	// The measure layer counts INTEGER line boxes, so the render layer has to
@@ -152,12 +181,12 @@ describe("measureToolCall — collapsed = header only", () => {
 	});
 
 	it("in-run card drops the border but adds a 1px divider unless last", async () => {
-		const { measureToolCall, CARD_PADDING, HEADER_ROW_HEIGHT, CARD_DIVIDER } = await mod();
+		const { measureToolCall, CARD_PADDING, headerRowHeight, CARD_DIVIDER } = await mod();
 		const notLast = measureToolCall(baseCard({ inRun: true, isLast: false }), 600, 3);
 		const last = measureToolCall(baseCard({ inRun: true, isLast: true }), 600, 3);
 		expect(notLast.hasBorder).toBe(false);
 		// in-run chrome = padding only (no border) + divider when not last.
-		expect(last.height).toBe(CARD_PADDING * 2 + HEADER_ROW_HEIGHT);
+		expect(last.height).toBe(CARD_PADDING * 2 + headerRowHeight());
 		expect(notLast.height).toBe(last.height + CARD_DIVIDER);
 	});
 });

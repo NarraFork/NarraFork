@@ -151,7 +151,7 @@ export interface PgPersistedMessageRef {
 export async function persistPgMessageWithRef(
 	tx: PgNarratorRefsTx,
 	message: RefMessageInput,
-	options: { beforeMessageId?: string } = {},
+	options: { beforeMessageId?: string; bumpMessageVersion?: boolean } = {},
 ): Promise<PgPersistedMessageRef> {
 	validateMessage(message);
 	const [parent] = message.parentToolUseId
@@ -180,17 +180,18 @@ export async function persistPgMessageWithRef(
 	await tx
 		.insert(refs)
 		.values({ id: refId, narratorId: message.narratorId, messageId: created.id, seq });
+	const bumpMessageVersion = options.bumpMessageVersion !== false;
 	await tx
 		.update(narrators)
 		.set({
-			messageVersion: sql`${narrators.messageVersion} + 1`,
+			...(bumpMessageVersion ? { messageVersion: sql`${narrators.messageVersion} + 1` } : {}),
 			messageCount: sql`coalesce(${narrators.messageCount}, 0) + 1`,
 			...(options.beforeMessageId === undefined
 				? {}
 				: { messageStructureVersion: sql`${narrators.messageStructureVersion} + 1` }),
 		})
 		.where(eq(narrators.id, message.narratorId));
-	if (parent)
+	if (parent && bumpMessageVersion)
 		await tx
 			.update(narrators)
 			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
@@ -238,6 +239,7 @@ export function createPostgresNarratorMessageRefsPort(db: BunSQLDatabase): Narra
 		return atomic("narratorRefs.insert", options, async (tx) => {
 			const persisted = await persistPgMessageWithRef(tx, message, {
 				...(beforeMessageId === undefined ? {} : { beforeMessageId }),
+				bumpMessageVersion: options?.bumpMessageVersion !== false,
 			});
 			return persisted.message;
 		});

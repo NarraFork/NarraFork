@@ -67,11 +67,20 @@ export const REASONING_CHEVRON_SIZE = 12;
 export const REASONING_XS_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs);
 
 /**
- * Fixed single-row height shared by the streaming / count / collapsed forms and
- * the header of the expanded form: py*2 + max(icon lane, xs text line).
+ * Single-row height shared by the streaming / count / collapsed forms and the header
+ * of the expanded form: py*2 + max(icon lane, xs text line).
+ *
+ * At NEUTRAL typography this is a module-level snapshot. Measurement and paint must
+ * call {@link reasoningHeaderRowHeight} so the row follows a later appearance change —
+ * calling `typographyMetrics()` at import time freezes whatever the bundle loaded with.
  */
 export const REASONING_HEADER_ROW_HEIGHT =
 	REASONING_ROW_PADDING_Y * 2 + Math.max(REASONING_ICON_SIZE, typographyMetrics().line.xs);
+
+/** Reasoning header/count row height at the reader's current typography. */
+export function reasoningHeaderRowHeight(): number {
+	return REASONING_ROW_PADDING_Y * 2 + Math.max(REASONING_ICON_SIZE, typographyMetrics().line.xs);
+}
 
 /** ReasoningCountLine row height (identical structure to the header row). */
 export const REASONING_COUNT_LINE_HEIGHT = REASONING_HEADER_ROW_HEIGHT;
@@ -89,8 +98,14 @@ export const REASONING_BODY_BORDER_LEFT = 2;
  * mt(4) + one xs line.
  */
 export const REASONING_TRANSLATION_TOGGLE_MARGIN_TOP = 4;
+/** Baseline snapshot; measure reads {@link reasoningTranslationToggleHeight}. */
 export const REASONING_TRANSLATION_TOGGLE_HEIGHT =
 	REASONING_TRANSLATION_TOGGLE_MARGIN_TOP + typographyMetrics().line.xs;
+
+/** Translation-toggle row height at the reader's current typography. */
+export function reasoningTranslationToggleHeight(): number {
+	return REASONING_TRANSLATION_TOGGLE_MARGIN_TOP + typographyMetrics().line.xs;
+}
 
 /** The four visual forms of a reasoning block. */
 export type ReasoningForm = "streaming" | "count" | "collapsed" | "expanded";
@@ -240,16 +255,17 @@ export function measureReasoning(
 	const form = resolveReasoningForm(data, lod, expandState);
 
 	// Non-expanded forms are a single fixed row; no markdown body is rendered.
+	const headerH = reasoningHeaderRowHeight();
 	if (form !== "expanded") {
 		return {
-			height: REASONING_HEADER_ROW_HEIGHT,
+			height: headerH,
 			blocks: [],
 			frame: { ...EMPTY_FRAME, blocks: [] },
 			contentWidth,
 			usedWidth: contentWidth,
 			form,
-			headerHeight: REASONING_HEADER_ROW_HEIGHT,
-			bodyTop: REASONING_HEADER_ROW_HEIGHT,
+			headerHeight: headerH,
+			bodyTop: headerH,
 			bodyLeft: 0,
 			displayText,
 			charCount,
@@ -266,15 +282,11 @@ export function measureReasoning(
 		...(expandState.preparedBlocks ? { preparedBlocks: expandState.preparedBlocks } : {}),
 	});
 	const withToggle = hasTranslation(data);
-	const toggleHeight = withToggle ? REASONING_TRANSLATION_TOGGLE_HEIGHT : 0;
+	const toggleHeight = withToggle ? reasoningTranslationToggleHeight() : 0;
 
-	const bodyTop = REASONING_HEADER_ROW_HEIGHT;
+	const bodyTop = headerH;
 	const bodyLeft = REASONING_BODY_PADDING_LEFT + REASONING_BODY_BORDER_LEFT;
-	const height =
-		REASONING_HEADER_ROW_HEIGHT +
-		REASONING_BODY_PADDING_Y * 2 +
-		md.frame.contentHeight +
-		toggleHeight;
+	const height = headerH + REASONING_BODY_PADDING_Y * 2 + md.frame.contentHeight + toggleHeight;
 
 	return {
 		height,
@@ -286,7 +298,7 @@ export function measureReasoning(
 		contentWidth: innerWidth,
 		usedWidth: contentWidth,
 		form,
-		headerHeight: REASONING_HEADER_ROW_HEIGHT,
+		headerHeight: headerH,
 		bodyTop,
 		bodyLeft,
 		displayText,

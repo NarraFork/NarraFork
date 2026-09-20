@@ -27,11 +27,11 @@ import {
 	REASONING_BODY_PADDING_LEFT,
 	REASONING_BODY_PADDING_Y,
 	REASONING_CHEVRON_SIZE,
-	REASONING_HEADER_ROW_HEIGHT,
 	REASONING_ICON_SIZE,
 	REASONING_ROW_PADDING_Y,
 	REASONING_TRANSLATION_TOGGLE_HEIGHT,
 	REASONING_TRANSLATION_TOGGLE_MARGIN_TOP,
+	reasoningHeaderRowHeight,
 } from "../measure/measure-reasoning";
 import type { MeasuredElement } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
@@ -135,7 +135,7 @@ function StreamingRow({ labels }: { labels: ReasoningLabels }) {
 			gap={6}
 			py={REASONING_ROW_PADDING_Y}
 			wrap="nowrap"
-			style={{ height: REASONING_HEADER_ROW_HEIGHT, opacity: 0.7 }}
+			style={{ height: reasoningHeaderRowHeight(), opacity: 0.7 }}
 		>
 			<IconChevronRight size={REASONING_CHEVRON_SIZE} style={{ flexShrink: 0, opacity: 0.5 }} />
 			<BrainBadge />
@@ -167,7 +167,7 @@ function CountLine({
 			gap={6}
 			py={REASONING_ROW_PADDING_Y}
 			wrap="nowrap"
-			style={{ height: REASONING_HEADER_ROW_HEIGHT, cursor: onExpand ? "pointer" : undefined }}
+			style={{ height: reasoningHeaderRowHeight(), cursor: onExpand ? "pointer" : undefined }}
 			// A modified click selects the block; only a plain click expands.
 			onClick={onExpand ? swallowSelectionClick(onExpand) : undefined}
 		>
@@ -223,7 +223,7 @@ function ReasoningHeaderRow({
 			py={REASONING_ROW_PADDING_Y}
 			wrap="nowrap"
 			style={{
-				height: REASONING_HEADER_ROW_HEIGHT,
+				height: reasoningHeaderRowHeight(),
 				cursor: onToggle ? "pointer" : undefined,
 			}}
 			// A modified click selects the block; only a plain click toggles.

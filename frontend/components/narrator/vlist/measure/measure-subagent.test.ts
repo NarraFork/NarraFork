@@ -137,7 +137,7 @@ describe("measureSubagentCard — collapsed header (55-75px)", () => {
 		expect(r.effectiveExpanded).toBe(false);
 		// header = pad*2 + badge row + descMt + xs line ; + border*2 (not inRun).
 		const expectedHeader =
-			c.CARD_PADDING * 2 + c.BADGE_ROW_HEIGHT + c.DESC_MARGIN_TOP + c.XS_LINE_HEIGHT;
+			c.CARD_PADDING * 2 + c.badgeRowHeight() + c.DESC_MARGIN_TOP + c.XS_LINE_HEIGHT;
 		expect(r.headerHeight).toBe(expectedHeader);
 		expect(r.headerHeight).toBe(56);
 		expect(r.hasResultPreview).toBe(false);
@@ -159,7 +159,7 @@ describe("measureSubagentCard — collapsed header (55-75px)", () => {
 		expect(r.hasResultPreview).toBe(true);
 		const expectedHeader =
 			c.CARD_PADDING * 2 +
-			c.BADGE_ROW_HEIGHT +
+			c.badgeRowHeight() +
 			c.DESC_MARGIN_TOP +
 			c.XS_LINE_HEIGHT +
 			(c.RESULT_PREVIEW_MARGIN_TOP + c.XS_LINE_HEIGHT);

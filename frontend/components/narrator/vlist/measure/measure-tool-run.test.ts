@@ -773,7 +773,7 @@ describe("trace row drill-down", () => {
 
 	it("exposes the card header rect for the drill-down header morph", async () => {
 		const { measureCollapsibleTrace, TRACE_ROW_HEIGHT } = await import("./measure-tool-run");
-		const { CARD_BORDER, CARD_PADDING, HEADER_ROW_HEIGHT } = await import("./measure-tool-call");
+		const { CARD_BORDER, CARD_PADDING, headerRowHeight } = await import("./measure-tool-call");
 		const r = measureCollapsibleTrace({ items: drillRows(2, [0]), maxVisible: 10 }, 600, {
 			expandedIndices: [0],
 		});
@@ -783,7 +783,7 @@ describe("trace row drill-down", () => {
 		expect(row?.drillHeader).not.toBeNull();
 		expect(row?.drillHeader?.top).toBeCloseTo(CARD_BORDER + CARD_PADDING, 5);
 		expect(row?.drillHeader?.left).toBeCloseTo(CARD_BORDER + CARD_PADDING, 5);
-		expect(row?.drillHeader?.height).toBeCloseTo(HEADER_ROW_HEIGHT, 5);
+		expect(row?.drillHeader?.height).toBeCloseTo(headerRowHeight(), 5);
 		expect(row?.drillHeader?.width).toBeCloseTo(600 - 2 * (CARD_BORDER + CARD_PADDING), 5);
 		// A folded row has no card and therefore no morph target.
 		expect(r.rows[1]?.drillHeader).toBeNull();
@@ -975,7 +975,7 @@ describe("trace row drill-down — subagent card", () => {
 		// than that text. Pure arithmetic over the subagent card's own chrome.
 		const { measureActivityTrace } = await import("./measure-tool-run");
 		const {
-			BADGE_ROW_HEIGHT,
+			badgeRowHeight,
 			CARD_BORDER,
 			CARD_PADDING,
 			DESC_LEFT,
@@ -986,7 +986,7 @@ describe("trace row drill-down — subagent card", () => {
 		const drill = r.rows[0]?.drillHeader;
 		expect(drill).not.toBeNull();
 		expect(drill?.top).toBeCloseTo(
-			CARD_BORDER + CARD_PADDING + BADGE_ROW_HEIGHT + DESC_MARGIN_TOP,
+			CARD_BORDER + CARD_PADDING + badgeRowHeight() + DESC_MARGIN_TOP,
 			5,
 		);
 		expect(drill?.left).toBeCloseTo(CARD_BORDER + CARD_PADDING + DESC_LEFT, 5);

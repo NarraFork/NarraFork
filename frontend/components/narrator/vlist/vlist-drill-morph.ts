@@ -24,8 +24,8 @@
  * no React state. The committed DOM is the truth; the snapshot is pure data.
  */
 
-import { BARE_ROW_CHEVRON, BARE_ROW_GAP } from "@shared/pretext-layout/row-metrics";
-import { CARD_BORDER, CARD_PADDING } from "./measure/measure-tool-call";
+import { BARE_ROW_CHEVRON, BARE_ROW_GAP, bareRowMetrics } from "@shared/pretext-layout/row-metrics";
+import { CARD_BORDER, CARD_PADDING, headerRowHeight } from "./measure/measure-tool-call";
 import { FOLD_DURATION_MS } from "./vlist-fold-animation";
 
 /** How long a header morph lasts. Matches the fold transition (Mantine Collapse). */
@@ -52,8 +52,21 @@ export const HEADER_MORPH_DURATION_MS = FOLD_DURATION_MS;
  */
 export const DRILL_MORPH_X_OFFSET = BARE_ROW_CHEVRON + BARE_ROW_GAP - (CARD_BORDER + CARD_PADDING);
 
-/** The folded summary row's height (the morph's collapsed-state line). */
+/**
+ * The folded summary row's height at NEUTRAL typography (the morph's collapsed-state line).
+ *
+ * Baseline only. Measurement and morph planning must call {@link drillRowHeight}, because
+ * a folded row's painted height follows the reader's font scale / line-height scale via
+ * `bareRowMetrics()`. Capturing this literal put every expand/collapse endpoint at the
+ * default geometry after the appearance panel moved — the animation "worked" but started
+ * and finished several pixels off the line the reader was actually looking at.
+ */
 export const DRILL_ROW_HEIGHT = 18.8;
+
+/** Folded summary-row height at the reader's current typography. */
+export function drillRowHeight(): number {
+	return bareRowMetrics().height;
+}
 
 /** Which way one row's morph runs. */
 export type DrillMorphKind = "expand" | "collapse";
@@ -89,6 +102,12 @@ export interface DrillMeasuredRow {
 	readonly key: string;
 	readonly top: number;
 	readonly drilled: boolean;
+	/**
+	 * Measured height of the folded summary row at the current typography.
+	 * Preferred over {@link drillRowHeight} so the shell can pass the same number
+	 * the layout reserved for that row.
+	 */
+	readonly rowHeight?: number;
 	/** Measured height of the row's whole painted block. */
 	readonly blockHeight?: number;
 	/** Card header rect within the row block (drilled rows only), else null. */
@@ -131,15 +150,21 @@ export function buildDrillSnapshots(
 	for (const trace of traces) {
 		for (const row of trace.rows) {
 			const rowBlockTop = trace.top + row.top;
+			// Prefer the layout's own folded-row height; fall back to the live bare-row
+			// metrics so a source that omitted it still tracks typography.
+			const foldedHeight =
+				typeof row.rowHeight === "number" && Number.isFinite(row.rowHeight) && row.rowHeight > 0
+					? row.rowHeight
+					: drillRowHeight();
 			const headerHeight = row.drilled
-				? (row.drillHeader?.height ?? DRILL_ROW_HEIGHT)
-				: DRILL_ROW_HEIGHT;
+				? (row.drillHeader?.height ?? headerRowHeight())
+				: foldedHeight;
 			const headerLocalTop = row.drilled
 				? // Drilled: the card header's centre is the perceived title line. The card
 					// fills the row block from its top, so the header sits at drillHeader.top.
 					(row.drillHeader?.top ?? 0) + headerHeight / 2
 				: // Folded: the summary line's own centre.
-					DRILL_ROW_HEIGHT / 2;
+					foldedHeight / 2;
 			const headerViewportTop = rowBlockTop + headerLocalTop - scrollTop;
 			const blockHeight =
 				typeof row.blockHeight === "number" && Number.isFinite(row.blockHeight)

@@ -102,7 +102,7 @@ import {
 	GROUP_BODY_PADDING_LEFT,
 	HEADER_CATEGORY_ICON,
 	HEADER_CELL_GAP,
-	HEADER_ROW_HEIGHT,
+	headerRowHeight,
 	isRunningStatus,
 	type MeasuredToolBody,
 	type MeasuredToolCall,
@@ -493,12 +493,12 @@ function ToolHeaderRow({
 			// matters most for a DRILLED-IN trace row: its summary line (which did carry
 			// these attributes) is not painted, so this header is the ONLY control that
 			// can close the card again. ATTRIBUTES ONLY — the measured header height is
-			// `HEADER_ROW_HEIGHT` either way.
+			// `headerRowHeight()` either way.
 			role={onToggle ? "button" : undefined}
 			tabIndex={onToggle ? 0 : undefined}
 			aria-expanded={onToggle ? opened : undefined}
 			style={{
-				height: HEADER_ROW_HEIGHT,
+				height: headerRowHeight(),
 				cursor: onToggle ? "pointer" : "default",
 				userSelect: "none",
 			}}
@@ -528,8 +528,14 @@ function ToolHeaderRow({
 			</span>
 			<span
 				style={{
-					fontSize: "var(--mantine-font-size-xs)",
-					lineHeight: "var(--mantine-line-height)",
+					// Live typography, not CSS vars: the height model measures this line as
+					// `headerRowHeight()` / `typographyMetrics().line.xsBase`, so paint must
+					// emit the same size and leading. `var(--mantine-*)` stays at the app
+					// default and would leave the card header unscaled after an appearance
+					// change while the folded row beside it grew.
+					fontSize: `${typographyMetrics().size.xs}px`,
+					lineHeight: `${typographyMetrics().line.xsBase}px`,
+					letterSpacing: typographyMetrics().letterSpacing.xs || undefined,
 					fontFamily: "var(--mantine-font-family-monospace)",
 					fontWeight: 600,
 					color: "var(--mantine-color-dimmed)",
@@ -553,8 +559,9 @@ function ToolHeaderRow({
 					// handles the difference itself (see `DRILL_MORPH_TAIL_*`).
 					flex: 1,
 					minWidth: 0,
-					fontSize: "var(--mantine-font-size-xs)",
-					lineHeight: "var(--mantine-line-height)",
+					fontSize: `${typographyMetrics().size.xs}px`,
+					lineHeight: `${typographyMetrics().line.xsBase}px`,
+					letterSpacing: typographyMetrics().letterSpacing.xs || undefined,
 					fontFamily: "var(--mantine-font-family-monospace)",
 					color: "var(--mantine-color-dimmed)",
 					overflow: "hidden",
@@ -2361,6 +2368,7 @@ export function RenderToolCallGroup({
 
 export const RENDER_TOOL_CALL_CHROME = {
 	CARD_PADDING,
-	HEADER_ROW_HEIGHT,
+	/** Live accessor — the baseline constant freezes at import time. */
+	headerRowHeight,
 	DETAIL_TOP_MARGIN,
 } as const;

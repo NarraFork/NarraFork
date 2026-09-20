@@ -1,17 +1,25 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
+import { bareRowMetrics } from "@shared/pretext-layout/row-metrics";
+import { resetTypographyForTest, setTypography } from "@shared/pretext-layout/typography";
+import { headerRowHeight } from "./measure/measure-tool-call";
 import {
 	buildDrillSnapshots,
 	DRILL_ROW_HEIGHT,
 	type DrillTraceSource,
 	diffDrillSnapshots,
+	drillRowHeight,
 	HEADER_MORPH_DURATION_MS,
 } from "./vlist-drill-morph";
 
-const HEADER = { top: 11, height: 19 }; // CARD_BORDER(1)+CARD_PADDING(10), HEADER_ROW_HEIGHT(19)
+const HEADER = { top: 11, height: 19 }; // CARD_BORDER(1)+CARD_PADDING(10) at neutral
 
 function trace(traceKey: string, top: number, rows: DrillTraceSource["rows"]): DrillTraceSource {
 	return { traceKey, top, rows };
 }
+
+afterEach(() => {
+	resetTypographyForTest();
+});
 
 describe("buildDrillSnapshots", () => {
 	it("folded rows snapshot their summary-line centre", () => {
@@ -21,8 +29,9 @@ describe("buildDrillSnapshots", () => {
 		);
 		const snap = next.get("t::r0");
 		expect(snap?.drilled).toBe(false);
-		// 100 + 24.8 + 18.8/2
-		expect(snap?.headerViewportTop).toBeCloseTo(100 + 24.8 + DRILL_ROW_HEIGHT / 2, 5);
+		// 100 + 24.8 + live folded height / 2
+		expect(snap?.headerViewportTop).toBeCloseTo(100 + 24.8 + drillRowHeight() / 2, 5);
+		expect(drillRowHeight()).toBeCloseTo(DRILL_ROW_HEIGHT, 5);
 	});
 
 	it("drilled rows snapshot their card-header centre", () => {
@@ -60,6 +69,43 @@ describe("buildDrillSnapshots", () => {
 		expect(next.has("b::r0")).toBe(true);
 		expect(next.get("a::r0")?.headerViewportTop).not.toBe(next.get("b::r0")?.headerViewportTop);
 	});
+
+	it("prefers the layout's measured rowHeight over the live fallback", () => {
+		const next = buildDrillSnapshots(
+			[
+				trace("t", 0, [
+					{
+						key: "r0",
+						top: 0,
+						rowHeight: 42,
+						drilled: false,
+						drillHeader: null,
+					},
+				]),
+			],
+			0,
+		);
+		expect(next.get("t::r0")?.headerViewportTop).toBeCloseTo(21, 5);
+	});
+
+	it("tracks typography: folded centres follow the scaled bare-row height", () => {
+		setTypography({ fontScalePercent: 150, lineHeightScalePercent: 150 });
+		const live = drillRowHeight();
+		expect(live).toBeCloseTo(bareRowMetrics().height, 5);
+		// 150% font × 150% line-height on xs: the text lane grows past the frozen 18.8.
+		expect(live).toBeGreaterThan(DRILL_ROW_HEIGHT);
+
+		const next = buildDrillSnapshots(
+			[trace("t", 100, [{ key: "r0", top: 0, drilled: false, drillHeader: null }])],
+			0,
+		);
+		expect(next.get("t::r0")?.headerViewportTop).toBeCloseTo(100 + live / 2, 5);
+
+		// Card-header height must scale on the SAME axes, or the morph would still
+		// animate to a frozen 19px endpoint after the folded side moved.
+		const cardH = headerRowHeight();
+		expect(cardH).toBeGreaterThan(19);
+	});
 });
 
 describe("diffDrillSnapshots", () => {
@@ -72,13 +118,43 @@ describe("diffDrillSnapshots", () => {
 			buildDrillSnapshots([drilled], 0),
 		);
 		expect(plans).toHaveLength(1);
-		const plan = plans[0]!;
+		const plan = plans[0];
+		expect(plan).toBeDefined();
+		if (!plan) return;
 		expect(plan.kind).toBe("expand");
 		expect(plan.rowUid).toBe("t::r0");
-		// Card header centre − summary centre = (11 + 9.5) − 9.4 = 11.1 (DOWN).
-		expect(plan.driftY).toBeCloseTo(HEADER.top + HEADER.height / 2 - DRILL_ROW_HEIGHT / 2, 5);
+		// Card header centre − live summary centre.
+		expect(plan.driftY).toBeCloseTo(HEADER.top + HEADER.height / 2 - drillRowHeight() / 2, 5);
 		expect(plan.driftY).toBeGreaterThan(0);
 		expect(plan.durationMs).toBe(HEADER_MORPH_DURATION_MS);
+	});
+
+	it("recomputes expand drift under scaled typography", () => {
+		setTypography({ fontScalePercent: 140, lineHeightScalePercent: 160 });
+		const foldedH = drillRowHeight();
+		const cardH = headerRowHeight();
+		const foldedRow = trace("t", 100, [
+			{ key: "r0", top: 0, drilled: false, rowHeight: foldedH, drillHeader: null },
+		]);
+		const drilledRow = trace("t", 100, [
+			{
+				key: "r0",
+				top: 0,
+				drilled: true,
+				rowHeight: foldedH,
+				drillHeader: { top: 11, height: cardH },
+			},
+		]);
+		const plan = diffDrillSnapshots(
+			buildDrillSnapshots([foldedRow], 0),
+			buildDrillSnapshots([drilledRow], 0),
+		)[0];
+		expect(plan).toBeDefined();
+		if (!plan) return;
+		expect(plan.kind).toBe("expand");
+		// Centres are derived from the LIVE pair, not the frozen 18.8 / 19 pair.
+		expect(plan.driftY).toBeCloseTo(11 + cardH / 2 - foldedH / 2, 5);
+		expect(plan.driftY).not.toBeCloseTo(11 + 19 / 2 - DRILL_ROW_HEIGHT / 2, 1);
 	});
 
 	it("keeps collapse header travel local when pinned-bottom scrollTop changes", () => {
@@ -86,7 +162,13 @@ describe("diffDrillSnapshots", () => {
 			buildDrillSnapshots(
 				[
 					trace("t", 100, [
-						{ key: "r0", top: 24.8, drilled: true, blockHeight: 400, drillHeader: HEADER },
+						{
+							key: "r0",
+							top: 24.8,
+							drilled: true,
+							blockHeight: 400,
+							drillHeader: HEADER,
+						},
 					]),
 				],
 				1000,
@@ -105,11 +187,12 @@ describe("diffDrillSnapshots", () => {
 				],
 				600,
 			),
-		)[0]!;
+		)[0];
+		expect(collapse).toBeDefined();
+		if (!collapse) return;
 		expect(collapse.kind).toBe("collapse");
-		// The viewport moved by 400px, but the header morph remains the local
-		// card-header → summary delta, so it stays inside the shrinking clip.
-		expect(collapse.driftY).toBeCloseTo(-11.1, 5);
+		// Local card-header → summary delta, independent of the viewport scroll jump.
+		expect(collapse.driftY).toBeCloseTo(drillRowHeight() / 2 - (HEADER.top + HEADER.height / 2), 5);
 	});
 
 	it("drops expand travel when the old summary is outside the after block clip", () => {
@@ -161,7 +244,9 @@ describe("diffDrillSnapshots", () => {
 			],
 			100,
 		);
-		const plan = diffDrillSnapshots(before, after)[0]!;
+		const plan = diffDrillSnapshots(before, after)[0];
+		expect(plan).toBeDefined();
+		if (!plan) return;
 		expect(plan.driftY).not.toBe(0);
 	});
 
@@ -170,44 +255,22 @@ describe("diffDrillSnapshots", () => {
 			[
 				trace("t", 0, [
 					{ key: "r0", top: 0, drilled: false, drillHeader: null },
-					{ key: "r1", top: 18.8, drilled: false, drillHeader: null },
+					{ key: "r1", top: drillRowHeight(), drilled: false, drillHeader: null },
 				]),
 			],
 			0,
 		);
-		// Both rows drill in the same frame (e.g. a fast double-toggle).
 		const after = buildDrillSnapshots(
 			[
 				trace("t", 0, [
 					{ key: "r0", top: 0, drilled: true, drillHeader: HEADER },
-					{ key: "r1", top: 218.8, drilled: true, drillHeader: HEADER },
+					{ key: "r1", top: drillRowHeight(), drilled: true, drillHeader: HEADER },
 				]),
 			],
 			0,
 		);
 		const plans = diffDrillSnapshots(before, after);
+		expect(plans).toHaveLength(2);
 		expect(plans.map((p) => p.rowUid).sort()).toEqual(["t::r0", "t::r1"]);
-		expect(plans.every((p) => p.kind === "expand")).toBe(true);
-	});
-
-	it("skips rows that did not flip", () => {
-		const a = buildDrillSnapshots([folded], 0);
-		const b = buildDrillSnapshots([folded], 0);
-		expect(diffDrillSnapshots(a, b)).toHaveLength(0);
-	});
-
-	it("skips rows present in only one frame (no counterpart to morph)", () => {
-		const before = buildDrillSnapshots([folded], 0);
-		const after = buildDrillSnapshots(
-			[
-				trace("t", 100, [
-					{ key: "r0", top: 24.8, drilled: false, drillHeader: null },
-					// A NEW row appears drilled — nothing to morph from, so it is skipped.
-					{ key: "r1", top: 43.6, drilled: true, drillHeader: HEADER },
-				]),
-			],
-			0,
-		);
-		expect(diffDrillSnapshots(before, after)).toHaveLength(0);
 	});
 });

@@ -39,19 +39,25 @@ describe("resolveReasoningDisplayText / resolveReasoningForm", () => {
 
 describe("measureReasoning — non-expanded forms are a single fixed row", () => {
 	it("streaming (no text) is a single fixed header row with no body blocks", async () => {
-		const { measureReasoning, REASONING_HEADER_ROW_HEIGHT } = await import("./measure-reasoning");
+		const { measureReasoning, reasoningHeaderRowHeight } = await import("./measure-reasoning");
 		const r = measureReasoning({ isStreaming: true, text: "" }, 600, 5);
 		expect(r.form).toBe("streaming");
-		expect(r.height).toBe(REASONING_HEADER_ROW_HEIGHT);
+		expect(r.height).toBe(reasoningHeaderRowHeight());
 		expect(r.blocks).toHaveLength(0);
 	});
 
 	it("L2 low-LOD collapses to the count line (fixed 20.8→21px row)", async () => {
-		const { measureReasoning, REASONING_COUNT_LINE_HEIGHT, MEASURE_REASONING_CONSTANTS } =
-			await import("./measure-reasoning");
+		const {
+			measureReasoning,
+			reasoningHeaderRowHeight,
+			REASONING_COUNT_LINE_HEIGHT,
+			MEASURE_REASONING_CONSTANTS,
+		} = await import("./measure-reasoning");
 		const r = measureReasoning({ text: "long reasoning body", stepCount: 4 }, 600, 2);
 		expect(r.form).toBe("count");
-		expect(r.height).toBe(REASONING_COUNT_LINE_HEIGHT);
+		expect(r.height).toBe(reasoningHeaderRowHeight());
+		// The frozen baseline export remains the neutral documentation value.
+		expect(REASONING_COUNT_LINE_HEIGHT).toBe(reasoningHeaderRowHeight());
 		expect(r.stepCount).toBe(4);
 		// Row = py*2 + max(icon 16, xs line 17) = 4 + 17 = 21.
 		const c = MEASURE_REASONING_CONSTANTS;
@@ -62,10 +68,10 @@ describe("measureReasoning — non-expanded forms are a single fixed row", () =>
 	});
 
 	it("collapsed (mid/high LOD) is the header-only single row", async () => {
-		const { measureReasoning, REASONING_HEADER_ROW_HEIGHT } = await import("./measure-reasoning");
+		const { measureReasoning, reasoningHeaderRowHeight } = await import("./measure-reasoning");
 		const r = measureReasoning({ text: "some reasoning text here" }, 600, 5);
 		expect(r.form).toBe("collapsed");
-		expect(r.height).toBe(REASONING_HEADER_ROW_HEIGHT);
+		expect(r.height).toBe(reasoningHeaderRowHeight());
 		expect(r.charCount).toBe("some reasoning text here".length);
 		expect(r.blocks).toHaveLength(0);
 	});
@@ -73,8 +79,9 @@ describe("measureReasoning — non-expanded forms are a single fixed row", () =>
 
 describe("measureReasoning — expanded form = header + markdown body", () => {
 	it("expanded height = header + body padding + markdown height", async () => {
-		const { measureReasoning, REASONING_HEADER_ROW_HEIGHT, REASONING_BODY_PADDING_Y } =
-			await import("./measure-reasoning");
+		const { measureReasoning, reasoningHeaderRowHeight, REASONING_BODY_PADDING_Y } = await import(
+			"./measure-reasoning"
+		);
 		const { measureMarkdown } = await import("./measure-markdown");
 		const { reasoningBodyInnerWidth } = await import("./measure-reasoning");
 
@@ -85,14 +92,14 @@ describe("measureReasoning — expanded form = header + markdown body", () => {
 		const inner = reasoningBodyInnerWidth(600);
 		const md = measureMarkdown(text, inner);
 		expect(r.height).toBe(
-			REASONING_HEADER_ROW_HEIGHT + REASONING_BODY_PADDING_Y * 2 + md.frame.contentHeight,
+			reasoningHeaderRowHeight() + REASONING_BODY_PADDING_Y * 2 + md.frame.contentHeight,
 		);
 		// Body markdown blocks flow through to the renderer.
 		expect(r.blocks.length).toBeGreaterThan(0);
 		expect(r.blocks[0]?.kind).toBe("inline");
 		// contentWidth is the inner body width (renderer re-materializes here).
 		expect(r.contentWidth).toBe(inner);
-		expect(r.bodyTop).toBe(REASONING_HEADER_ROW_HEIGHT);
+		expect(r.bodyTop).toBe(reasoningHeaderRowHeight());
 	});
 
 	it("expanded body grows with more markdown lines", async () => {
@@ -196,7 +203,7 @@ describe("measureReasoning — the translation toggle flips the measured body", 
 
 describe("measureReasoning — LOD / expand toggles change the form and height", () => {
 	it("switching LOD changes the height model (count vs collapsed vs expanded)", async () => {
-		const { measureReasoning, REASONING_HEADER_ROW_HEIGHT } = await import("./measure-reasoning");
+		const { measureReasoning, reasoningHeaderRowHeight } = await import("./measure-reasoning");
 		// A body long enough that the expanded form is clearly taller than a row.
 		const text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu";
 
@@ -207,8 +214,8 @@ describe("measureReasoning — LOD / expand toggles change the form and height",
 		// Count + collapsed are both single fixed rows (same height model).
 		expect(count.form).toBe("count");
 		expect(collapsed.form).toBe("collapsed");
-		expect(count.height).toBe(REASONING_HEADER_ROW_HEIGHT);
-		expect(collapsed.height).toBe(REASONING_HEADER_ROW_HEIGHT);
+		expect(count.height).toBe(reasoningHeaderRowHeight());
+		expect(collapsed.height).toBe(reasoningHeaderRowHeight());
 
 		// Expanding reveals the markdown body → strictly taller.
 		expect(expanded.form).toBe("expanded");
@@ -216,7 +223,7 @@ describe("measureReasoning — LOD / expand toggles change the form and height",
 	});
 
 	it("prepareReasoningMeasurer parses once and re-measures across widths/LODs", async () => {
-		const { prepareReasoningMeasurer, REASONING_HEADER_ROW_HEIGHT } = await import(
+		const { prepareReasoningMeasurer, reasoningHeaderRowHeight } = await import(
 			"./measure-reasoning"
 		);
 		const measure = prepareReasoningMeasurer({
@@ -225,7 +232,7 @@ describe("measureReasoning — LOD / expand toggles change the form and height",
 		const collapsed = measure(300, 5);
 		const wide = measure(2000, 5, { expanded: true });
 		const narrow = measure(120, 5, { expanded: true });
-		expect(collapsed.height).toBe(REASONING_HEADER_ROW_HEIGHT);
+		expect(collapsed.height).toBe(reasoningHeaderRowHeight());
 		expect(narrow.height).toBeGreaterThan(wide.height);
 	});
 });

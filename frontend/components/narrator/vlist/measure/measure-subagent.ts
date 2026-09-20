@@ -111,7 +111,10 @@ export const BADGE_XS_HEIGHT = 16;
 export const CHEVRON_SIZE = 12;
 /** StatusIcon / Loader size={12}. */
 export const STATUS_ICON_SIZE = 12;
-/** Badge row = tallest inline element (xs text line dominates icons/badges). */
+/**
+ * Badge row at NEUTRAL typography — tallest inline element (xs text line dominates icons/badges).
+ * Baseline only; measurement/paint read {@link badgeRowHeight}.
+ */
 export const BADGE_ROW_HEIGHT = Math.max(
 	THEME_ICON_SIZE,
 	BADGE_XS_HEIGHT,
@@ -119,6 +122,17 @@ export const BADGE_ROW_HEIGHT = Math.max(
 	CHEVRON_SIZE,
 	STATUS_ICON_SIZE,
 ); // 17
+
+/** Badge-row height at the reader's current typography (only the xs line scales). */
+export function badgeRowHeight(): number {
+	return Math.max(
+		THEME_ICON_SIZE,
+		BADGE_XS_HEIGHT,
+		typographyMetrics().line.xs,
+		CHEVRON_SIZE,
+		STATUS_ICON_SIZE,
+	);
+}
 
 /** description Text mt={2}. */
 export const DESC_MARGIN_TOP = 2;
@@ -641,7 +655,7 @@ export function measureSubagentCard(
 
 	const headerHeight =
 		CARD_PADDING * 2 +
-		BADGE_ROW_HEIGHT +
+		badgeRowHeight() +
 		DESC_MARGIN_TOP +
 		descriptionHeight +
 		(hasResultPreview ? RESULT_PREVIEW_MARGIN_TOP + typographyMetrics().line.xs : 0);

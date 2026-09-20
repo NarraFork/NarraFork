@@ -22,7 +22,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { shellSource } from "./guard-source";
+import { shellModule, shellSource } from "./guard-source";
 
 /**
  * The shell's whole module set. These rules are "this pattern exists NOWHERE in the
@@ -34,19 +34,21 @@ const SHELL = shellSource();
 
 /** The body of the shell's drill-morph layout effect. */
 function morphEffect(): string {
-	// Find the useLayoutEffect that contains the snapshot build, and end at the push
-	// of its ops into the shared motion scheduler (which replaced the per-feature
-	// controller — see vlist-motion-scheduler.ts).
-	const buildIdx = SHELL.indexOf("buildDrillSnapshots(");
+	// Slice from the SHELL ENTRY module, not the concatenated source: the LOD morph
+	// effect further down the same file also uses `drillScope` / `motionRef.flush`,
+	// and a two-tab closer never matches this effect's three-tab indent — so the
+	// old `indexOf("\n\t\t});"` ran on into that later effect and made every negative
+	// assertion fail on code that is not part of the drill morph path.
+	const entry = shellModule("PretextExactMessageList.tsx");
+	const buildIdx = entry.indexOf("buildDrillSnapshots(");
 	expect(buildIdx).toBeGreaterThan(0);
-	const end = SHELL.indexOf("drillScope(", buildIdx);
+	const end = entry.indexOf("drillScope(", buildIdx);
 	expect(end).toBeGreaterThan(buildIdx);
-	// End at the effect's CLOSING brace, not the first `\t});` — the effect makes more than
-	// one `push` (the header's travel, then the tail and border fades), and stopping at the
-	// first one silently hid the later ops from every assertion here.
-	const close = SHELL.indexOf("\n\t\t});", end);
+	// End at the NEXT effect's banner comment (LOD morph), which sits immediately
+	// after this effect's closing brace — more stable than counting indent tabs.
+	const close = entry.indexOf("Play LOD-switch morphs", end);
 	expect(close).toBeGreaterThan(end);
-	return SHELL.slice(buildIdx, close);
+	return entry.slice(buildIdx, close);
 }
 
 describe("drill morph: diff-driven, not a click capture", () => {

@@ -274,12 +274,32 @@ export const HEADER_CELL_GAP = BARE_ROW_GAP;
  */
 export const CARD_HEADER_INNER_ICON = 9;
 /**
- * Header text line box. `.headerText` uses `line-height: var(--mantine-line-
+ * Header text line box at NEUTRAL typography. `.headerText` uses `line-height: var(--mantine-line-
  * height)` (the BASE 1.55, NOT xs 1.4), at font-size xs (12): 12×1.55 = 18.6 → 19.
+ *
+ * Baseline only — measurement and paint must call {@link headerRowHeight}.
  */
 export const HEADER_TEXT_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, BASE_LINE_HEIGHT); // 19
-/** Header row height: the taller of the icon lane (16) vs the text line (19). */
+/**
+ * Header row height at NEUTRAL typography: the taller of the icon lane (14) vs the text line (19).
+ *
+ * Baseline only. The live geometry is {@link headerRowHeight}, which scales the xs×base
+ * line with the reader's font scale and line-height scale. Freezing this number made the
+ * card header stay 19px while folded trace rows grew under the same appearance change —
+ * and the drill morph then animated between two geometries that no longer described the
+ * same line.
+ */
 export const HEADER_ROW_HEIGHT = Math.max(HEADER_CATEGORY_ICON, HEADER_TEXT_LINE_HEIGHT); // 19
+
+/**
+ * Card-header row height at the reader's current typography.
+ *
+ * Same `max(icon lane, xs × base line-height)` shape as the baseline constant; only the
+ * text line scales. The icon lane stays fixed chrome.
+ */
+export function headerRowHeight(): number {
+	return Math.max(HEADER_CATEGORY_ICON, typographyMetrics().line.xsBase);
+}
 
 /** Detail wrapper `<Box mt="xs">` — the gap between the header and the detail. */
 export const DETAIL_TOP_MARGIN = SPACING.xs; // 10
@@ -466,12 +486,20 @@ export const ENTRY_SNIPPET_MAX_LINES = 3;
  */
 
 // ── Grouped-card chrome ──────────────────────────────────────────────────────
-/** Group header text line box (Mantine `<Text size="xs">` → xs 1.4 = 17). */
+/** Group header text line box at NEUTRAL typography (Mantine `<Text size="xs">` → xs 1.4 = 17). */
 export const GROUP_HEADER_TEXT_LINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** Group header ThemeIcon size={16}. */
 export const GROUP_HEADER_ICON = 16;
-/** Group header row: max(icon 16, badge 16, xs text 17, chevron 12) = 17. */
+/**
+ * Group header row at NEUTRAL typography: max(icon 16, badge 16, xs text 17, chevron 12) = 17.
+ * Baseline only — measure/paint read {@link groupHeaderRowHeight}.
+ */
 export const GROUP_HEADER_ROW = Math.max(GROUP_HEADER_ICON, GROUP_HEADER_TEXT_LINE); // 17
+
+/** Group-header row height at the reader's current typography (xs line scales; icons do not). */
+export function groupHeaderRowHeight(): number {
+	return Math.max(GROUP_HEADER_ICON, typographyMetrics().line.xs);
+}
 /** Group body `<Box mt={4}>`. */
 export const GROUP_BODY_MARGIN_TOP = 4;
 /** Group body `pl={4}`. */
@@ -1891,9 +1919,10 @@ export function measureToolCall(
 	// ── Fixed chrome ─────────────────────────────────────────────────────────
 	const chromeY = CARD_PADDING * 2 + (hasBorder ? CARD_BORDER * 2 : 0);
 	const dividerExtra = inRun && !isLast ? CARD_DIVIDER : 0;
+	const headerH = headerRowHeight();
 
 	// ── Header block (always present, single row) ──────────────────────────────
-	const headerBlock = makeFixed(HEADER_ROW_HEIGHT, "tool-header", 0, {
+	const headerBlock = makeFixed(headerH, "tool-header", 0, {
 		toolName: data.toolName,
 		category: data.category,
 		status: data.status,
@@ -1909,17 +1938,17 @@ export function measureToolCall(
 	// side-car is appended to the END of the tool's OUTPUT text, so on a folded card
 	// (which shows no output at all) it is a footnote with nothing to be a footnote
 	// to. The count marker in the header row says it exists; that costs no height.
-	const collapsedHeight = chromeY + HEADER_ROW_HEIGHT + dividerExtra;
+	const collapsedHeight = chromeY + headerH + dividerExtra;
 
 	// ── Expanded regions ───────────────────────────────────────────────────────
 	let detail: MeasuredToolDetail | null = null;
 	let permission: MeasuredInlinePermission | null = null;
 	let reflection: MeasuredReflectionNotice | null = null;
-	let innerContentH = HEADER_ROW_HEIGHT;
+	let innerContentH = headerH;
 
-	const detailTop = HEADER_ROW_HEIGHT;
-	let permissionTop = HEADER_ROW_HEIGHT;
-	let reflectionTop = HEADER_ROW_HEIGHT;
+	const detailTop = headerH;
+	let permissionTop = headerH;
+	let reflectionTop = headerH;
 
 	// A still-truncated payload costs NO geometry: a prefix body already reserves
 	// its full cap (see `cappedBodyHeight`), and the rest is fetched when the reader
@@ -1930,7 +1959,7 @@ export function measureToolCall(
 			detail = measureToolDetail(data.detail, innerWidth, opts.viewportHeight);
 			innerContentH += detail.height;
 		}
-		const belowDetail = HEADER_ROW_HEIGHT + (detail?.height ?? 0);
+		const belowDetail = headerH + (detail?.height ?? 0);
 		permissionTop = belowDetail;
 		reflectionTop = belowDetail;
 		// A reflection notice REPLACES the permission form, mirroring the chunked
@@ -1965,7 +1994,7 @@ export function measureToolCall(
 		isLast,
 		hasBorder,
 		chromeY,
-		headerHeight: HEADER_ROW_HEIGHT,
+		headerHeight: headerH,
 		headerTop: 0,
 		collapsedHeight,
 		detail,
@@ -2062,16 +2091,17 @@ export function measureToolCallGroup(
 
 	const chromeY = CARD_PADDING * 2 + CARD_BORDER * 2;
 	const innerWidth = Math.max(1, contentWidth - CARD_PADDING * 2 - CARD_BORDER * 2);
+	const groupHeaderH = groupHeaderRowHeight();
 
-	const headerBlock = makeFixed(GROUP_HEADER_ROW, "group-header", 0, { childCount });
+	const headerBlock = makeFixed(groupHeaderH, "group-header", 0, { childCount });
 	const blocks: PreparedBlock[] = [headerBlock];
 	const frame = accumulateFrame(blocks, innerWidth, RESOLVER);
 
-	const collapsedHeight = chromeY + GROUP_HEADER_ROW;
+	const collapsedHeight = chromeY + groupHeaderH;
 	const bodyLeft = GROUP_BODY_PADDING_LEFT + GROUP_BODY_BORDER_LEFT;
 
 	let children: MeasuredToolCall[] = [];
-	let innerContentH = GROUP_HEADER_ROW;
+	let innerContentH = groupHeaderH;
 	if (expanded) {
 		const bodyInner = toolGroupBodyInnerWidth(contentWidth);
 		children = toolCalls.map((tc) =>
@@ -2113,12 +2143,12 @@ export function measureToolCallGroup(
 		contentWidth: innerWidth,
 		usedWidth: contentWidth,
 		expanded,
-		headerHeight: GROUP_HEADER_ROW,
+		headerHeight: groupHeaderH,
 		collapsedHeight,
 		chromeY,
 		childCount,
 		children,
-		bodyTop: GROUP_HEADER_ROW,
+		bodyTop: groupHeaderH,
 		bodyLeft,
 		totalDurationMs,
 		earliestStartMs,

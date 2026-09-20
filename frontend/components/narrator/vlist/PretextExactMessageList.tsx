@@ -2687,6 +2687,7 @@ export const PretextExactMessageList = memo(
 						key: string;
 						top: number;
 						drilled: boolean;
+						rowHeight?: number;
 						blockHeight?: number;
 						drillHeader: { top: number; height: number } | null;
 					}[];
@@ -2700,6 +2701,7 @@ export const PretextExactMessageList = memo(
 								rows?: {
 									key: string;
 									top: number;
+									rowHeight?: number;
 									blockHeight: number;
 									cardMeasured: unknown | null;
 									drillHeader: { top: number; height: number } | null;
@@ -2713,6 +2715,7 @@ export const PretextExactMessageList = memo(
 						rows: measured.rows.map((r) => ({
 							key: r.key,
 							top: r.top,
+							rowHeight: r.rowHeight,
 							blockHeight: r.blockHeight,
 							drilled: r.cardMeasured != null,
 							drillHeader: r.drillHeader,

@@ -74,6 +74,7 @@ import {
 	type TraceVariant,
 	traceMetrics,
 } from "../measure/measure-tool-run";
+import { typographyMetrics } from "../pretext-fonts";
 import { categoryIcon } from "./category-icons";
 import { DiffStatsText } from "./diff-stats-text";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
@@ -501,20 +502,25 @@ function useTraceRowShimmerKind(row: MeasuredTraceRow): ToolShimmerKind | null {
  */
 function TraceRowTitle({ row, shimmerClass }: { row: MeasuredTraceRow; shimmerClass?: string }) {
 	const split = splitTraceRowTitle(row.title, row.toolName);
+	const typo = typographyMetrics();
 	return (
 		<Text
-			size="xs"
+			// Keep Mantine's dimmed colour, but paint the LINE BOX from the live
+			// typography snapshot — the same numbers `bareRowMetrics()` reserved.
+			// A bare `size="xs"` stays at 12/1.4 after the appearance panel moved,
+			// so the folded row grew while its title stayed neutral-sized.
 			c="dimmed"
 			truncate
 			className={shimmerClass}
 			style={{
 				flex: "0 1 auto",
 				minWidth: 0,
+				fontSize: `${typo.size.xs}px`,
+				lineHeight: `${typo.line.xs}px`,
+				letterSpacing: typo.letterSpacing.xs || undefined,
 				// Monospace, matching the card header's own title span. The two are the SAME
 				// line in two forms, so a font change between them cannot be masked by the
-				// morph's translate — the glyphs simply re-shape mid-flight. Height-neutral:
-				// the row's line box is `max(glyphs, xs line)` and both families share the xs
-				// size, so `measure-tool-run` is unaffected.
+				// morph's translate — the glyphs simply re-shape mid-flight.
 				fontFamily: "var(--mantine-font-family-monospace)",
 			}}
 		>

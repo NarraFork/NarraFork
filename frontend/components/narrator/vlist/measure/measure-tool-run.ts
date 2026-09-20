@@ -99,7 +99,7 @@ import { measureMarkdown } from "./measure-markdown";
 // `@shared/pretext-layout/row-metrics` directly, so this edge is the only one
 // between the two modules.
 import {
-	BADGE_ROW_HEIGHT,
+	badgeRowHeight,
 	DESC_LEFT,
 	DESC_MARGIN_TOP,
 	type MeasuredSubagent,
@@ -113,7 +113,7 @@ import {
 import {
 	CARD_BORDER,
 	CARD_PADDING,
-	HEADER_ROW_HEIGHT,
+	headerRowHeight,
 	type MeasuredToolCall,
 	measureToolCall,
 	resolveToolTimingStamps,
@@ -820,7 +820,9 @@ export function measureCollapsibleTrace(
 				const border =
 					(cardMeasured as MeasuredSubagent).borderHeight > 0 ? SUBAGENT_CARD_BORDER : 0;
 				drillHeader = {
-					top: border + SUBAGENT_CARD_PADDING + BADGE_ROW_HEIGHT + DESC_MARGIN_TOP,
+					// Badge row + description gap, at the reader's typography — the same
+					// numbers `measureSubagentCard` reserves for the header stack.
+					top: border + SUBAGENT_CARD_PADDING + badgeRowHeight() + DESC_MARGIN_TOP,
 					left: border + SUBAGENT_CARD_PADDING + DESC_LEFT,
 					width: Math.max(1, contentWidth - 2 * (border + SUBAGENT_CARD_PADDING) - DESC_LEFT),
 					height: typographyMetrics().line.xs,
@@ -831,7 +833,7 @@ export function measureCollapsibleTrace(
 					top: drillBorder + CARD_PADDING,
 					left: drillBorder + CARD_PADDING,
 					width: Math.max(1, contentWidth - 2 * (drillBorder + CARD_PADDING)),
-					height: HEADER_ROW_HEIGHT,
+					height: headerRowHeight(),
 				};
 			}
 		}

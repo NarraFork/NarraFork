@@ -48,9 +48,9 @@ import {
 } from "@tabler/icons-react";
 import type { CSSProperties, ReactNode } from "react";
 import {
-	BADGE_ROW_HEIGHT,
 	BLOCK_PADDING_BOTTOM,
 	BLOCK_PADDING_X,
+	badgeRowHeight,
 	CARD_PADDING,
 	CHEVRON_SIZE,
 	DESC_LEFT,
@@ -518,7 +518,7 @@ function SubagentInner({
 				cursor: "pointer",
 			}}
 		>
-			<Group gap={5} wrap="nowrap" style={{ height: BADGE_ROW_HEIGHT }}>
+			<Group gap={5} wrap="nowrap" style={{ height: badgeRowHeight() }}>
 				<ThemeIcon size={THEME_ICON_SIZE} variant="light" color={agentBadgeColor} radius="sm">
 					<IconRobot size={10} />
 				</ThemeIcon>

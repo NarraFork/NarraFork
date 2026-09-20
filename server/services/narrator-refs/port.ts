@@ -10,6 +10,12 @@ export type RefCopyCursor = RefCursor & {
 };
 export interface RefOperationOptions {
 	signal?: AbortSignal;
+	/**
+	 * Default true. False allocates the message + ref/seq without bumping
+	 * `messageVersion` — used by empty partial-assistant shells that must not
+	 * enter the client document until real content is appended.
+	 */
+	bumpMessageVersion?: boolean;
 }
 
 /** Networked domain port. All results are Promises; no SQLite transaction handles cross it. */
