@@ -7,7 +7,7 @@
  * The two workspace facade methods that compose a whole write lifecycle
  * (`runCleanWrite` / `runUncertainWrite`) mirror what the SQLite coordinator's
  * `withWrite` finalizer does — admit → register → settle → release, and admit →
- * register → mark-uncertain → quarantine-with-lease-retained — because the PG
+ * register → end-quarantined → detach-scope-guard (lease ranges retained) — because the PG
  * store exposes the durable SECTIONS while the coordinator exposes the composed
  * lifecycle. That composition is the wrapper's equivalence claim for this domain.
  */
@@ -18,6 +18,7 @@ import {
 	fileChangeStorageBudgets,
 	revertOperationFiles,
 	revertOperations,
+	workspaceWriteLeases,
 } from "../../../../server/db/postgres-schema";
 import { generateId } from "../../../../server/lib/id";
 import { FILE_CHANGE_BLOB_BUDGET_ID } from "../../../../server/services/file-change-blob-catalog";
@@ -81,12 +82,13 @@ export function makePostgresKit(pgDb: BunSQLDatabase): EquivalenceKit {
 	};
 
 	const workspace: WorkspaceLeaseFacade = {
-		runCleanWrite: async (scope) => {
+		runCleanWrite: async (scope, ranges) => {
 			const leaseId = `clean-${generateId(6)}`;
 			const claim = await leaseStore.admitLease({
 				scope,
 				runtime: RUNTIME,
 				leaseId,
+				ranges,
 				kind: "write",
 			});
 			const lease = {
@@ -101,34 +103,31 @@ export function makePostgresKit(pgDb: BunSQLDatabase): EquivalenceKit {
 				revision: claim.revision,
 				pendingMutations: 0,
 			};
-			await leaseStore.registerMutation(lease);
+			await leaseStore.registerMutation(lease, "mutation-1");
 			const counterDuringWrite = (await scopeRow(scope)).activeMutationCount;
-			await leaseStore.settleMutation({ ...lease, pendingMutations: 1 });
+			await leaseStore.settleMutation({ ...lease, pendingMutations: 1 }, "mutation-1");
 			await leaseStore.clearLease({ ...lease, pendingMutations: 0 });
 			return { counterDuringWrite };
 		},
-		runUncertainWrite: async (scope) => {
+		runUncertainWrite: async (scope, ranges) => {
 			const leaseId = `uncertain-${generateId(6)}`;
 			const claim = await leaseStore.admitLease({
 				scope,
 				runtime: RUNTIME,
 				leaseId,
+				ranges,
 				kind: "write",
 			});
-			await leaseStore.registerMutation({
+			const lease = {
 				scope,
-				binding: {
-					deviceId: scope.deviceId,
-					runtimeEpoch: RUNTIME.runtimeEpoch,
-					runtimeGeneration: RUNTIME.runtimeGeneration,
-					fencingToken: claim.fencingToken,
-				},
+				binding: { deviceId: scope.deviceId, ...RUNTIME, fencingToken: claim.fencingToken },
 				leaseId,
 				revision: claim.revision,
 				pendingMutations: 0,
-			});
-			// The uncertain finalizer: quarantine, durable lease RETAINED.
-			await leaseStore.persistUncertainScope(scope);
+			};
+			await leaseStore.registerMutation(lease, "mutation-uncertain");
+			// The finalizer retains A's ranges but releases the scope's active pointer.
+			await leaseStore.quarantineLease({ ...lease, pendingMutations: 1 });
 		},
 		admitLease: async (scope) => {
 			await leaseStore.admitLease({
@@ -138,14 +137,8 @@ export function makePostgresKit(pgDb: BunSQLDatabase): EquivalenceKit {
 				kind: "write",
 			});
 		},
-		recoverSameEpoch: async (scope) => leaseStore.recoverScopeBarrier(scope),
-		recoverForeignEpoch: async (scope) => {
-			const foreign = createPostgresWorkspaceLeaseStore(pgDb, {
-				ownerEpoch: "sqlite-epoch-foreign",
-				readRuntime: () => RUNTIME,
-			});
-			return foreign.recoverScopeBarrier(scope);
-		},
+		readLeases: async (scope) =>
+			pgDb.select().from(workspaceWriteLeases).where(eq(workspaceWriteLeases.scopeId, scope.id)),
 		readScope: scopeRow,
 	};
 

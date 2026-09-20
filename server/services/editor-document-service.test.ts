@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
+	chmod,
+	lstat,
 	mkdir,
 	mkdtemp,
 	open,
@@ -37,6 +39,7 @@ import {
 	EditorDocumentError,
 	EditorDocumentService,
 } from "./editor-document-service";
+import type { EditorWorkerRequest } from "./editor-document-worker";
 import { type FileChangeLocalIo, fileChangeLocalIo } from "./file-change-local-io";
 import { LocalFileChangeRuntime } from "./file-change-runtime";
 
@@ -65,7 +68,7 @@ beforeEach(async () => {
 		...fileChangeLocalIo,
 		async apply(input) {
 			dispatches++;
-			await fileChangeLocalIo.apply(input);
+			return fileChangeLocalIo.apply(input);
 		},
 	};
 	runtime = new LocalFileChangeRuntime({ db, privateRoot: testEnvironment.narraforkHome, io });
@@ -241,6 +244,159 @@ describe("large editor objects and real durable pipeline", () => {
 		expect((await service.operation(actor, result.operationId)).status).toBe("saved");
 		expect((await bodies()).length).toBe(1);
 	});
+	test("corrupt existing blob retries editor preparation and saves exactly once", async () => {
+		await service.dispose();
+		// Keep the database's existing instance identity when running after other saves.
+		const privateRoot = testEnvironment.narraforkHome;
+		const namespace = await runtime.initialize();
+		const before = await readFile(target);
+		const blob = await namespace.store.putBytes(before, { expectedSize: before.byteLength });
+		await writeFile(
+			join(privateRoot, "file-change-blobs", "sha256", blob.digest.slice(0, 2), blob.digest),
+			"corrupt",
+		);
+		let preparations = 0;
+		let recoveryBody: string | undefined;
+		service = new EditorDocumentService({
+			root: join(root, "transfers"),
+			execute: (request) =>
+				runtime.executeEditor({
+					...request,
+					construct: async (observation) => {
+						preparations++;
+						const prepared = await request.construct(observation);
+						const body = await readFile(
+							join(root, "transfers", `ed-${request.requestId}.json`),
+							"utf8",
+						);
+						if (recoveryBody !== undefined) expect(body).toBe(recoveryBody);
+						recoveryBody = body;
+						return prepared;
+					},
+				}),
+		});
+		const doc = await create();
+		const id = await upload(doc, "after\n中文🙂\n");
+		const saved = await service.commit(actor, doc.docId, id, {});
+		expect(saved).toMatchObject({
+			status: "saved",
+			hash: hash("after\r\n中文🙂\r\n"),
+			snapshotRevision: 7,
+		});
+		expect(preparations).toBe(2);
+		expect(dispatches).toBe(1);
+		expect(await readFile(target, "utf8")).toBe("after\r\n中文🙂\r\n");
+		expect(operations()).toHaveLength(1);
+		expect(operations()[0]).toMatchObject({
+			sourceId: saved.operationId,
+			settlement: "settled",
+			executionOutcome: "succeeded",
+		});
+		expect(await service.commit(actor, doc.docId, id, {})).toEqual(saved);
+		expect(dispatches).toBe(1);
+		expect(await bodies()).toHaveLength(1);
+	});
+	test("different recovery content prevents editor dispatch and is never overwritten", async () => {
+		const doc = await create();
+		const id = await upload(doc, "mine");
+		const { operationId } = await service.uploadStatus(actor, doc.docId, id);
+		const path = join(root, "transfers", `ed-${operationId}.json`);
+		const original = JSON.stringify({
+			version: 1,
+			operationId,
+			userId: actor.userId,
+			narratorId: actor.narratorId,
+			snapshotRevision: 7,
+			hash: hash("else"),
+			rawDigest: hash("else"),
+			bytes: 4,
+			createdAt: Date.now(),
+		});
+		await writeFile(path, original);
+		const error = await failure(() => service.commit(actor, doc.docId, id, {}));
+		expect(error.message).toContain("Recovery metadata does not match this preparation");
+		expect(dispatches).toBe(0);
+		expect(operations()).toHaveLength(0);
+		expect(await readFile(target, "utf8")).toBe("before\r\n中文🙂\r\n");
+		expect(await readFile(path, "utf8")).toBe(original);
+		expect(await bodies()).toHaveLength(1);
+	});
+	test("worker reuses only identical recovery content and preserves its original timestamp", async () => {
+		const jobs = new EditorDocumentJobs();
+		const operationId = randomUUID();
+		const path = join(root, `ed-${operationId}.json`);
+		const uploadPath = join(root, "uploaded");
+		await writeFile(uploadPath, "same");
+		const request: Extract<EditorWorkerRequest, { action: "prepare" }> = {
+			action: "prepare",
+			before: null,
+			baseHash: null,
+			encoding: "utf-8",
+			digest: hash("same"),
+			uploadPath,
+			conflictPath: join(root, "conflict"),
+			recovery: {
+				path,
+				operationId,
+				userId: actor.userId,
+				narratorId: actor.narratorId,
+				snapshotRevision: 7,
+			},
+		};
+		const first = await jobs.run(actor.userId, request);
+		expect(first.kind).toBe("prepared");
+		const original = await readFile(path, "utf8");
+		expect(await jobs.run(actor.userId, request)).toEqual(first);
+		expect(await readFile(path, "utf8")).toBe(original);
+		await writeFile(uploadPath, "different");
+		await expect(jobs.run(actor.userId, { ...request, digest: hash("different") })).rejects.toThrow(
+			"Recovery metadata does not match this preparation",
+		);
+		expect(await readFile(path, "utf8")).toBe(original);
+		expect(await Bun.file(join(root, `ed-${operationId}`)).exists()).toBe(false);
+	});
+	test("worker refuses recovery records with mismatched identity, revision or content fields", async () => {
+		const jobs = new EditorDocumentJobs();
+		const operationId = randomUUID();
+		const path = join(root, `ed-${operationId}.json`);
+		const uploadPath = join(root, "uploaded");
+		await writeFile(uploadPath, "same");
+		const request: Extract<EditorWorkerRequest, { action: "prepare" }> = {
+			action: "prepare",
+			before: null,
+			baseHash: null,
+			encoding: "utf-8",
+			digest: hash("same"),
+			uploadPath,
+			conflictPath: join(root, "conflict"),
+			recovery: {
+				path,
+				operationId,
+				userId: actor.userId,
+				narratorId: actor.narratorId,
+				snapshotRevision: 7,
+			},
+		};
+		await jobs.run(actor.userId, request);
+		const metadata = JSON.parse(await readFile(path, "utf8"));
+		for (const mismatch of [
+			{ operationId: randomUUID() },
+			{ userId: "other-user" },
+			{ narratorId: "other-narrator" },
+			{ snapshotRevision: 8 },
+			{ hash: hash("other") },
+			{ rawDigest: hash("other") },
+			{ bytes: 5 },
+		]) {
+			const body = JSON.stringify({ ...metadata, ...mismatch });
+			await writeFile(path, body);
+			await expect(jobs.run(actor.userId, request)).rejects.toThrow(
+				"Recovery metadata does not match this preparation",
+			);
+			expect(await readFile(path, "utf8")).toBe(body);
+			expect(await Bun.file(join(root, `ed-${operationId}`)).exists()).toBe(false);
+		}
+	});
 	test("confirmation does not consume sealed upload or create a durable operation", async () => {
 		outside = true;
 		const doc = await create(),
@@ -290,7 +446,7 @@ describe("large editor objects and real durable pipeline", () => {
 			dispatches++;
 			entered.resolve();
 			await release.promise;
-			await fileChangeLocalIo.apply(input);
+			return fileChangeLocalIo.apply(input);
 		};
 		const doc = await create(),
 			id = await upload(doc, "after");
@@ -758,7 +914,7 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 			id = await upload(doc, "mine");
 		io.apply = async (input) => {
 			await writeFile(target, "external during evidence publication");
-			await fileChangeLocalIo.apply(input);
+			return fileChangeLocalIo.apply(input);
 		};
 		await expect(service.commit(actor, doc.docId, id, {})).rejects.toThrow();
 		expect(await readFile(target, "utf8")).toBe("external during evidence publication");
@@ -787,4 +943,108 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		await create();
 		expect(await bodies()).toHaveLength(1);
 	});
+});
+
+describe("editor temporary directory auto-repair", () => {
+	const makeService = (store: string) =>
+		new EditorDocumentService({
+			root: store,
+			execute: (request) => runtime.executeEditor(request),
+		});
+	const openDoc = (svc: EditorDocumentService) =>
+		svc.create(actor, { path: target, deviceId: "local", origin: "legacy" });
+
+	test.skipIf(process.platform === "win32")(
+		"repairs a loose-mode transfer directory instead of failing the session",
+		async () => {
+			const store = join(root, "loose-mode-store");
+			await mkdir(store, { mode: 0o700 });
+			await chmod(store, 0o755);
+			const svc = makeService(store);
+			try {
+				const doc = await openDoc(svc);
+				expect(doc.docId).toBeTruthy();
+				const stat = await lstat(store);
+				expect(stat.isDirectory()).toBe(true);
+				expect(stat.isSymbolicLink()).toBe(false);
+				expect(stat.mode & 0o077).toBe(0);
+			} finally {
+				await svc.dispose();
+			}
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"replaces a symlink at the transfer root without following its target",
+		async () => {
+			const store = join(root, "symlink-store");
+			const elsewhere = join(root, "symlink-target");
+			await mkdir(elsewhere, { mode: 0o700 });
+			await writeFile(join(elsewhere, "keep-me"), "preserved");
+			await symlink(elsewhere, store);
+			const svc = makeService(store);
+			try {
+				const doc = await openDoc(svc);
+				expect(doc.docId).toBeTruthy();
+				const stat = await lstat(store);
+				expect(stat.isSymbolicLink()).toBe(false);
+				expect(stat.isDirectory()).toBe(true);
+				expect(stat.mode & 0o077).toBe(0);
+				expect(await readFile(join(elsewhere, "keep-me"), "utf8")).toBe("preserved");
+			} finally {
+				await svc.dispose();
+			}
+		},
+	);
+
+	test("replaces a non-directory placeholder at the transfer root", async () => {
+		const store = join(root, "file-store");
+		await writeFile(store, "not a directory");
+		const svc = makeService(store);
+		try {
+			const doc = await openDoc(svc);
+			expect(doc.docId).toBeTruthy();
+			const stat = await lstat(store);
+			expect(stat.isDirectory()).toBe(true);
+			expect(stat.isSymbolicLink()).toBe(false);
+		} finally {
+			await svc.dispose();
+		}
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"heals the store when permissions are loosened mid-session",
+		async () => {
+			const store = join(root, "mid-session-store");
+			const svc = makeService(store);
+			try {
+				const first = await openDoc(svc);
+				expect(first.docId).toBeTruthy();
+				await chmod(store, 0o755);
+				const second = await openDoc(svc);
+				expect(second.docId).toBeTruthy();
+				const stat = await lstat(store);
+				expect(stat.mode & 0o077).toBe(0);
+			} finally {
+				await svc.dispose();
+			}
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"creates a missing transfer directory as a private owned path",
+		async () => {
+			const store = join(root, "missing-store");
+			const svc = makeService(store);
+			try {
+				const doc = await openDoc(svc);
+				expect(doc.docId).toBeTruthy();
+				const stat = await lstat(store);
+				expect(stat.isDirectory()).toBe(true);
+				expect(stat.mode & 0o077).toBe(0);
+			} finally {
+				await svc.dispose();
+			}
+		},
+	);
 });

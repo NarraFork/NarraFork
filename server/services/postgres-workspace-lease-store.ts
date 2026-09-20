@@ -7,8 +7,8 @@
  * The coordinator is TWO things: an in-process range scheduler (AsyncLocalStorage
  * contexts, symbol tokens, waiter queues — a single event loop's vocabulary, with
  * nothing for a second backend to implement) and a set of short DURABLE sections
- * that pin the lease, the fence and the mutation counters into
- * `file_change_scopes`. Only the second kind is portable, and only that kind is
+ * that pin the lease ranges/manifest in `workspace_write_leases` and the current
+ * fence/mutation counters in `file_change_scopes`. Only the second kind is portable, and only that kind is
  * here: the durable lease store a coordinator implementation runs its sections
  * against. The SQLite coordinator runs them as strictly synchronous `behavior:
  * "immediate"` transactions because its lease API is synchronous
@@ -46,10 +46,13 @@
  */
 import { createHash } from "node:crypto";
 import { withPgRetry } from "@server/db/pg-retry";
-import { fileChangeScopes as scopes } from "@server/db/postgres-schema";
+import {
+	workspaceWriteLeases as leases,
+	fileChangeScopes as scopes,
+} from "@server/db/postgres-schema";
 import { generateId } from "@server/lib/id";
 import type { FileChangeExecutionBinding } from "@shared/file-change-protocol";
-import { and, eq, isNotNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import type { FileChangeScopeIdentity } from "./file-change-identity";
 import { fileChangeExecutionBindingMatches } from "./file-change-identity";
@@ -60,12 +63,55 @@ import {
 	WorkspaceWriteCoordinatorError,
 } from "./workspace-write-coordinator";
 
+import {
+	WORKSPACE_LEASE_LIMITS,
+	type WorkspaceLeaseRow,
+	type WorkspaceMutationManifest,
+} from "./workspace-write-lease-store";
+import {
+	freezeWorkspaceRanges,
+	readWorkspaceRanges,
+	type WorkspaceWriteRange,
+	workspaceRangesIntersect,
+} from "./workspace-write-ranges";
+
+/** PG JSON columns are unknown at the generated schema boundary; validate before narrowing. */
+export function parsePostgresWorkspaceMutationManifest(
+	value: unknown,
+): WorkspaceLeaseRow["mutationManifestJson"] {
+	if (
+		!value ||
+		typeof value !== "object" ||
+		!("version" in value) ||
+		value.version !== 1 ||
+		!("mutations" in value) ||
+		!Array.isArray(value.mutations) ||
+		Buffer.byteLength(JSON.stringify(value)) > WORKSPACE_LEASE_LIMITS.manifestBytes
+	)
+		throw W.fail("needs_verification", "Invalid durable mutation manifest");
+	const ids = new Set<string>();
+	for (const mutation of value.mutations) {
+		if (
+			!mutation ||
+			typeof mutation !== "object" ||
+			!["pending", "applied", "not_applied", "unknown"].includes(mutation.outcome)
+		)
+			throw W.fail("needs_verification", "Invalid durable mutation manifest");
+		W.assertString(mutation.mutationId, "mutationId", 256);
+		if (ids.has(mutation.mutationId))
+			throw W.fail("needs_verification", "Duplicate durable mutation identity");
+		ids.add(mutation.mutationId);
+		for (const id of [mutation.effectId, mutation.operationId])
+			if (id !== undefined) W.assertString(id, "manifest identity", 256);
+	}
+	return value as WorkspaceLeaseRow["mutationManifestJson"];
+}
+
 /** Transaction handle as produced by `db.transaction(async (tx) => …`. PG-side only. */
 type Tx = Parameters<Parameters<BunSQLDatabase["transaction"]>[0]>[0];
 /** The root handle, seen through the transaction's query interface. */
 type RootQueryable = Tx;
 
-type RecoveryBarrierMode = "write" | "strict";
 type ScopeStatus = "active" | "needs_verification" | "retired";
 
 /** The hot-read scope projection the sections guard on (root identity excluded). */
@@ -92,6 +138,7 @@ export interface LeaseClaim {
 	/** Caller-supplied so a whole-section replay reclaims the SAME lease identity. */
 	leaseId: string;
 	kind: "write" | "rollback";
+	ranges?: readonly WorkspaceWriteRange[];
 	signal?: AbortSignal;
 }
 
@@ -100,6 +147,7 @@ export interface BatchLeaseClaim {
 	targets: readonly {
 		scope: Readonly<FileChangeScopeIdentity>;
 		runtime: WorkspaceRuntimeBinding;
+		ranges?: readonly WorkspaceWriteRange[];
 	}[];
 	leaseIds: readonly string[];
 	kind: "write" | "rollback";
@@ -222,8 +270,61 @@ export class PostgresWorkspaceLeaseStore {
 		tx: Tx,
 		targets: readonly Readonly<FileChangeScopeIdentity>[],
 		admitting: boolean,
-		mode: RecoveryBarrierMode,
+		requestedRanges: ReadonlyMap<string, readonly WorkspaceWriteRange[]>,
 	): Promise<void> {
+		const targetRanges = (target: Readonly<FileChangeScopeIdentity>) =>
+			requestedRanges.get(target.id) ?? freezeWorkspaceRanges(target);
+		const trackedIds = new Set<string>();
+		for (const deviceId of new Set(targets.map((target) => target.deviceId))) {
+			const durable = await tx
+				.select({
+					leaseId: leases.leaseId,
+					deviceId: leases.deviceId,
+					pathFlavor: leases.pathFlavor,
+					rangesJson: leases.rangesJson,
+				})
+				.from(leases)
+				.where(
+					and(eq(leases.deviceId, deviceId), inArray(leases.status, ["executing", "quarantined"])),
+				)
+				.limit(WORKSPACE_WRITE_COORDINATOR_LIMITS.activeLeases + 1);
+			const additions = admitting
+				? targets.filter((target) => target.deviceId === deviceId).length
+				: 0;
+			if (durable.length + additions > WORKSPACE_WRITE_COORDINATOR_LIMITS.activeLeases) {
+				throw W.fail(
+					"verification_backlog",
+					"Durable lease inventory exceeds the admission budget",
+				);
+			}
+			for (const blocker of durable) {
+				if (blocker.pathFlavor !== "posix" && blocker.pathFlavor !== "windows")
+					throw W.fail("needs_verification", "Invalid durable path flavor");
+				const identity: Pick<FileChangeScopeIdentity, "deviceId" | "pathFlavor"> = {
+					deviceId: blocker.deviceId,
+					pathFlavor: blocker.pathFlavor,
+				};
+				trackedIds.add(blocker.leaseId);
+				let ranges: readonly WorkspaceWriteRange[];
+				try {
+					ranges = readWorkspaceRanges(identity, blocker.rangesJson);
+				} catch {
+					throw W.fail("needs_verification", "Persisted workspace ranges are invalid");
+				}
+				if (
+					targets.some((target) =>
+						workspaceRangesIntersect(target, targetRanges(target), identity, ranges),
+					)
+				) {
+					throw W.fail(
+						"needs_verification",
+						"An intersecting durable lease requires settlement or recovery",
+					);
+				}
+			}
+		}
+		// Legacy scope barriers remain conservative whole-root barriers. No epoch
+		// or missing in-process token is evidence that an old executor has stopped.
 		// One bounded global indexed status read; one bounded lease read per device.
 		const blockers = (await tx
 			.select({
@@ -245,7 +346,12 @@ export class PostgresWorkspaceLeaseStore {
 			// Real uncertainty is NEVER exempted, even for a sibling in this group.
 			if (
 				targets.some((target) =>
-					W.barrierBlocks(target, blocker as unknown as FileChangeScopeIdentity, mode),
+					workspaceRangesIntersect(
+						target,
+						targetRanges(target),
+						blocker as FileChangeScopeIdentity,
+						[{ kind: "subtree", canonicalPath: blocker.canonicalRoot }],
+					),
 				)
 			) {
 				throw W.fail(
@@ -291,9 +397,15 @@ export class PostgresWorkspaceLeaseStore {
 				);
 			}
 			for (const blocker of leased) {
+				if (blocker.activeLeaseId && trackedIds.has(blocker.activeLeaseId)) continue;
 				if (
 					targets.some((target) =>
-						W.barrierBlocks(target, blocker as unknown as FileChangeScopeIdentity, mode),
+						workspaceRangesIntersect(
+							target,
+							targetRanges(target),
+							blocker as FileChangeScopeIdentity,
+							[{ kind: "subtree", canonicalPath: blocker.canonicalRoot }],
+						),
 					)
 				) {
 					// No in-memory exemption here: the durable store cannot prove a live
@@ -319,8 +431,11 @@ export class PostgresWorkspaceLeaseStore {
 	 */
 	async admitLease(claim: LeaseClaim): Promise<{ fencingToken: number; revision: number }> {
 		const scope = W.copyScope(claim.scope);
+		const ranges = freezeWorkspaceRanges(scope, claim.ranges);
+		W.assertString(claim.leaseId, "leaseId", 256);
 		return withPgRetry(
-			() => this.database.transaction((tx) => this.admitLeaseSection(tx, { ...claim, scope })),
+			() =>
+				this.database.transaction((tx) => this.admitLeaseSection(tx, { ...claim, scope, ranges })),
 			{ label: "workspaceLease.admit" },
 		);
 	}
@@ -349,8 +464,8 @@ export class PostgresWorkspaceLeaseStore {
 		await this.requireNoQuarantineMany(
 			tx,
 			[claim.scope],
-			false,
-			claim.kind === "write" ? "write" : "strict",
+			true,
+			new Map([[claim.scope.id, freezeWorkspaceRanges(claim.scope, claim.ranges)]]),
 		);
 		const updated = await tx
 			.update(scopes)
@@ -367,7 +482,51 @@ export class PostgresWorkspaceLeaseStore {
 			.returning({ fencingToken: scopes.fencingToken, revision: scopes.revision });
 		const row = updated[0];
 		if (!row) throw W.fail("scope_not_found", "Unknown file-change scope");
+		await this.persistAdmission(tx, claim, row);
 		return row;
+	}
+
+	private async persistAdmission(
+		tx: Tx,
+		claim: LeaseClaim,
+		row: { revision: number; fencingToken: number },
+	): Promise<void> {
+		await tx.insert(leases).values({
+			leaseId: claim.leaseId,
+			scopeId: claim.scope.id,
+			deviceId: claim.scope.deviceId,
+			ownerEpoch: this.options.ownerEpoch,
+			runtimeEpoch: claim.runtime.runtimeEpoch,
+			runtimeGeneration: claim.runtime.runtimeGeneration,
+			fencingToken: row.fencingToken,
+			scopeRevision: row.revision,
+			pathFlavor: claim.scope.pathFlavor,
+			status: "executing",
+			rangesJson: { version: 1, ranges: freezeWorkspaceRanges(claim.scope, claim.ranges) },
+			mutationManifestJson: { version: 1, mutations: [] },
+			executionEndedAt: null,
+			createdAt: W.now(),
+			updatedAt: W.now(),
+		});
+		for (const status of ["settled", "recovered"] as const) {
+			const expired = await tx
+				.select({ leaseId: leases.leaseId })
+				.from(leases)
+				.where(eq(leases.status, status))
+				.orderBy(desc(leases.updatedAt), desc(leases.leaseId))
+				.offset(WORKSPACE_LEASE_LIMITS.retainedTerminal)
+				.limit(WORKSPACE_LEASE_LIMITS.cleanupBatch);
+			if (expired.length)
+				await tx.delete(leases).where(
+					and(
+						eq(leases.status, status),
+						inArray(
+							leases.leaseId,
+							expired.map((item) => item.leaseId),
+						),
+					),
+				);
+		}
 	}
 
 	/** The `grantMany` section: every member checked BEFORE the first guard lands. */
@@ -377,7 +536,17 @@ export class PostgresWorkspaceLeaseStore {
 		const targets = claim.targets.map((target) => ({
 			...target,
 			scope: W.copyScope(target.scope),
+			ranges: freezeWorkspaceRanges(target.scope, target.ranges),
 		}));
+		if (
+			!targets.length ||
+			new Set(targets.map((target) => target.scope.id)).size !== targets.length ||
+			new Set(claim.leaseIds).size !== targets.length ||
+			claim.leaseIds.length !== targets.length
+		) {
+			throw W.fail("invalid_input", "Batch members and lease ids must be unique");
+		}
+		for (const leaseId of claim.leaseIds) W.assertString(leaseId, "leaseId", 256);
 		return withPgRetry(
 			() =>
 				this.database.transaction((tx) => this.admitLeaseBatchSection(tx, { ...claim, targets })),
@@ -419,7 +588,12 @@ export class PostgresWorkspaceLeaseStore {
 			tx,
 			claim.targets.map((target) => target.scope),
 			true,
-			claim.kind === "write" ? "write" : "strict",
+			new Map(
+				claim.targets.map((target) => [
+					target.scope.id,
+					freezeWorkspaceRanges(target.scope, target.ranges),
+				]),
+			),
 		);
 		const rows: { fencingToken: number; revision: number }[] = [];
 		for (const [index, target] of claim.targets.entries()) {
@@ -440,6 +614,7 @@ export class PostgresWorkspaceLeaseStore {
 				.returning({ fencingToken: scopes.fencingToken, revision: scopes.revision });
 			const row = updated[0];
 			if (!row) throw W.fail("stale_lease", "A batch member disappeared during admission");
+			await this.persistAdmission(tx, { ...target, leaseId, kind: claim.kind }, row);
 			rows.push(row);
 		}
 		return rows;
@@ -468,21 +643,81 @@ export class PostgresWorkspaceLeaseStore {
 				"Scope fence, lease owner, revision or mutation count has changed",
 			);
 		}
+		const durable = await this.requireDurableLease(tx, lease);
+		if (durable.status !== "executing" || durable.executionEndedAt !== null) {
+			throw W.fail("stale_lease", "Durable lease execution has ended");
+		}
 		return row;
 	}
 
+	private async requireDurableLease(tx: Tx, lease: DurableLease) {
+		const [row] = await tx
+			.select()
+			.from(leases)
+			.where(eq(leases.leaseId, lease.leaseId))
+			.for("update");
+		if (
+			!row ||
+			row.scopeId !== lease.scope.id ||
+			row.deviceId !== lease.scope.deviceId ||
+			row.ownerEpoch !== this.options.ownerEpoch ||
+			row.runtimeEpoch !== lease.binding.runtimeEpoch ||
+			row.runtimeGeneration !== lease.binding.runtimeGeneration ||
+			row.fencingToken !== lease.binding.fencingToken ||
+			row.scopeRevision !== lease.revision
+		) {
+			throw W.fail("stale_lease", "Durable lease ownership changed");
+		}
+		return {
+			...row,
+			mutationManifestJson: parsePostgresWorkspaceMutationManifest(row.mutationManifestJson),
+		};
+	}
+
 	/** The `registerMutation` section: ownership re-check + counter increment. */
-	async registerMutation(lease: DurableLease): Promise<void> {
+	async registerMutation(
+		lease: DurableLease,
+		mutationId: string,
+		manifest: WorkspaceMutationManifest = {},
+	): Promise<void> {
 		W.assertString(lease.leaseId, "leaseId", 256);
+		W.assertString(mutationId, "mutationId", 256);
+		for (const value of [manifest.effectId, manifest.operationId])
+			if (value !== undefined) W.assertString(value, "manifest identity", 256);
+		const frozenManifest = { operationId: manifest.operationId, effectId: manifest.effectId };
 		await withPgRetry(
-			() => this.database.transaction((tx) => this.registerMutationSection(tx, lease)),
+			() =>
+				this.database.transaction((tx) =>
+					this.registerMutationSection(tx, lease, mutationId, frozenManifest),
+				),
 			{ label: "workspaceLease.registerMutation" },
 		);
 	}
 
-	private async registerMutationSection(tx: Tx, lease: DurableLease): Promise<void> {
+	private async registerMutationSection(
+		tx: Tx,
+		lease: DurableLease,
+		mutationId: string,
+		manifest: WorkspaceMutationManifest,
+	): Promise<void> {
 		await this.lockScopes(tx, [lease.scope]);
 		await this.requireLeaseRow(tx, lease, true);
+		const row = await this.requireDurableLease(tx, lease);
+		if (row.mutationManifestJson.mutations.some((mutation) => mutation.mutationId === mutationId))
+			throw W.fail("invalid_input", "Mutation id already registered");
+		const next = {
+			version: 1 as const,
+			mutations: [
+				...row.mutationManifestJson.mutations,
+				{ mutationId, ...manifest, outcome: "pending" as const },
+			],
+		};
+		if (Buffer.byteLength(JSON.stringify(next)) > WORKSPACE_LEASE_LIMITS.manifestBytes)
+			throw W.fail("invalid_input", "Mutation manifest exceeds byte budget");
+		await tx
+			.update(leases)
+			.set({ mutationManifestJson: next, updatedAt: W.now() })
+			.where(eq(leases.leaseId, lease.leaseId));
 		await tx
 			.update(scopes)
 			.set({ activeMutationCount: lease.pendingMutations + 1, updatedAt: W.now() })
@@ -490,16 +725,51 @@ export class PostgresWorkspaceLeaseStore {
 	}
 
 	/** The `settle` section: ownership re-check + counter decrement. */
-	async settleMutation(lease: DurableLease): Promise<void> {
+	async settleMutation(
+		lease: DurableLease,
+		mutationId: string,
+		outcome: "applied" | "not_applied" | "unknown" = "applied",
+	): Promise<void> {
+		W.assertString(mutationId, "mutationId", 256);
+		if (!["applied", "not_applied", "unknown"].includes(outcome))
+			throw W.fail("invalid_input", "Invalid mutation outcome");
 		await withPgRetry(
-			() => this.database.transaction((tx) => this.settleMutationSection(tx, lease)),
+			() =>
+				this.database.transaction((tx) =>
+					this.settleMutationSection(tx, lease, mutationId, outcome),
+				),
 			{ label: "workspaceLease.settleMutation" },
 		);
 	}
 
-	private async settleMutationSection(tx: Tx, lease: DurableLease): Promise<void> {
+	private async settleMutationSection(
+		tx: Tx,
+		lease: DurableLease,
+		mutationId: string,
+		outcome: "applied" | "not_applied" | "unknown",
+	): Promise<void> {
 		await this.lockScopes(tx, [lease.scope]);
 		await this.requireLeaseRow(tx, lease, true);
+		const row = await this.requireDurableLease(tx, lease);
+		if (
+			lease.pendingMutations < 1 ||
+			!row.mutationManifestJson.mutations.some(
+				(mutation) => mutation.mutationId === mutationId && mutation.outcome === "pending",
+			)
+		)
+			throw W.fail("invalid_input", "Pending durable mutation not found");
+		await tx
+			.update(leases)
+			.set({
+				mutationManifestJson: {
+					version: 1,
+					mutations: row.mutationManifestJson.mutations.map((mutation) =>
+						mutation.mutationId === mutationId ? { ...mutation, outcome } : mutation,
+					),
+				},
+				updatedAt: W.now(),
+			})
+			.where(eq(leases.leaseId, lease.leaseId));
 		await tx
 			.update(scopes)
 			.set({ activeMutationCount: lease.pendingMutations - 1, updatedAt: W.now() })
@@ -507,7 +777,8 @@ export class PostgresWorkspaceLeaseStore {
 	}
 
 	/**
-	 * The `persistUncertainScope` section: quarantine the scope, idempotently.
+	 * Legacy whole-scope uncertainty only. This never certifies execution ended.
+	 * New lease finalizers use quarantineLease so A cannot poison unrelated B.
 	 * No runtime/fence requirement — lost authority must still quarantine.
 	 */
 	async persistUncertainScope(scopeInput: Readonly<FileChangeScopeIdentity>): Promise<number> {
@@ -549,17 +820,67 @@ export class PostgresWorkspaceLeaseStore {
 	private async clearLeaseSection(tx: Tx, lease: DurableLease): Promise<void> {
 		await this.lockScopes(tx, [lease.scope]);
 		await this.requireLeaseRow(tx, lease, false);
+		await this.finishLeaseSection(tx, lease, false);
+	}
+
+	/** Caller invokes ONLY after the executor promise has finished. No scheduler is implied. */
+	async quarantineLease(lease: DurableLease): Promise<void> {
+		await withPgRetry(
+			() => this.database.transaction((tx) => this.quarantineLeaseSection(tx, lease)),
+			{ label: "workspaceLease.quarantine" },
+		);
+	}
+
+	private async quarantineLeaseSection(tx: Tx, lease: DurableLease): Promise<void> {
+		await this.lockScopes(tx, [lease.scope]);
+		await this.finishLeaseSection(tx, lease, true);
+	}
+
+	private async finishLeaseSection(
+		tx: Tx,
+		lease: DurableLease,
+		forceQuarantine: boolean,
+	): Promise<void> {
+		const scope = await this.requireScope(tx, lease.scope);
+		const row = await this.requireDurableLease(tx, lease);
+		if (row.status !== "executing" || row.executionEndedAt !== null)
+			throw W.fail("stale_lease", "Lease already ended");
+		const uncertain =
+			forceQuarantine ||
+			row.mutationManifestJson.mutations.some(
+				(mutation) => mutation.outcome === "unknown" || mutation.outcome === "pending",
+			);
 		await tx
-			.update(scopes)
+			.update(leases)
 			.set({
-				activeLeaseId: null,
-				activeLeaseEpoch: null,
-				activeLeaseStartedAt: null,
-				activeMutationCount: 0,
-				revision: W.next(lease.revision),
+				status: uncertain ? "quarantined" : "settled",
+				executionEndedAt: W.now(),
 				updatedAt: W.now(),
 			})
-			.where(eq(scopes.id, lease.scope.id));
+			.where(eq(leases.leaseId, lease.leaseId));
+		// An ended A must never clear the guard or counters belonging to B.
+		if (
+			scope.activeLeaseId === lease.leaseId &&
+			scope.activeLeaseEpoch === this.options.ownerEpoch
+		) {
+			await tx
+				.update(scopes)
+				.set({
+					activeLeaseId: null,
+					activeLeaseEpoch: null,
+					activeLeaseStartedAt: null,
+					activeMutationCount: 0,
+					revision: W.next(scope.revision),
+					updatedAt: W.now(),
+				})
+				.where(
+					and(
+						eq(scopes.id, scope.id),
+						eq(scopes.activeLeaseId, lease.leaseId),
+						eq(scopes.activeLeaseEpoch, this.options.ownerEpoch),
+					),
+				);
+		}
 	}
 
 	/**
@@ -585,32 +906,15 @@ export class PostgresWorkspaceLeaseStore {
 			members.map((member) => member.lease.scope),
 		);
 		for (const member of members) {
-			if (member.uncertain) {
-				await this.persistUncertainSectionBody(tx, member.lease.scope);
-			} else {
-				await this.requireLeaseRow(tx, member.lease, false);
-				await tx
-					.update(scopes)
-					.set({
-						activeLeaseId: null,
-						activeLeaseEpoch: null,
-						activeLeaseStartedAt: null,
-						activeMutationCount: 0,
-						revision: W.next(member.lease.revision),
-						updatedAt: W.now(),
-					})
-					.where(eq(scopes.id, member.lease.scope.id));
-			}
+			if (!member.uncertain) await this.requireLeaseRow(tx, member.lease, false);
+			await this.finishLeaseSection(tx, member.lease, member.uncertain);
 		}
 	}
 
 	/**
-	 * The `recoverScopeBarrier` section: clear ONLY the durable barrier after
-	 * human-driven external recovery, bumping fence AND revision so every stale
-	 * backend of the old generation stays fenced out. The in-memory lease/activity
-	 * checks are the coordinator's (they need the process registry); this store
-	 * enforces the durable half, including never clearing a lease owned by the
-	 * CALLER's own live epoch.
+	 * Compatibility entry point: standalone barrier clearing is intentionally
+	 * refused. Recovery must settle effects, audit and the ended lease together
+	 * through PostgresFileChangeEvidenceStore.closeBooksForRecovery.
 	 */
 	async recoverScopeBarrier(
 		scopeInput: Readonly<FileChangeScopeIdentity>,
@@ -628,31 +932,22 @@ export class PostgresWorkspaceLeaseStore {
 	): Promise<{ revision: number; fencingToken: number }> {
 		await this.lockScopes(tx, [scope]);
 		const current = await this.requireScope(tx, scope);
-		const leaseBarrier = current.activeLeaseId !== null;
-		if (current.status !== "needs_verification" && !leaseBarrier) {
+		const [durable] = await tx
+			.select({ leaseId: leases.leaseId })
+			.from(leases)
+			.where(
+				and(eq(leases.scopeId, scope.id), inArray(leases.status, ["executing", "quarantined"])),
+			)
+			.limit(1);
+		if (current.status !== "needs_verification" && current.activeLeaseId === null && !durable) {
 			throw W.fail("invalid_input", "Scope has no durable recovery barrier");
 		}
-		if (leaseBarrier && current.activeLeaseEpoch === this.options.ownerEpoch) {
-			// A lease owned by THIS live process may still be running; never clear it.
-			throw W.fail("recovery_conflict", "The durable lease belongs to the live coordination epoch");
-		}
-		const updated = await tx
-			.update(scopes)
-			.set({
-				status: "active",
-				activeLeaseId: null,
-				activeLeaseEpoch: null,
-				activeLeaseStartedAt: null,
-				activeMutationCount: 0,
-				revision: W.next(current.revision),
-				fencingToken: W.next(current.fencingToken),
-				updatedAt: W.now(),
-			})
-			.where(eq(scopes.id, scope.id))
-			.returning({ revision: scopes.revision, fencingToken: scopes.fencingToken });
-		const row = updated[0];
-		if (!row) throw W.fail("scope_not_found", "Unknown file-change scope");
-		return row;
+		// A different epoch is NOT a stopped-executor proof. This low-level store
+		// cannot manufacture one, or atomically settle effects through this old API.
+		throw W.fail(
+			"recovery_conflict",
+			"Use atomic evidence recovery for an ended quarantined lease; legacy executor liveness is unproven",
+		);
 	}
 
 	/** The hot-read scope projection, exposed for capture summaries. */

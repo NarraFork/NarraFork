@@ -2,6 +2,7 @@ import { createReadStream } from "node:fs";
 import { extname } from "node:path";
 import { z } from "zod/v4";
 import { specVfsService } from "../../../services/spec-vfs-service";
+import { toolSpecPathError } from "../../spec-uri";
 import { imageBytesToBase64, imageToBase64, sanitizeParsedDimensions } from "../../uploads";
 import type { ExecutionBackend } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
@@ -129,6 +130,8 @@ export const readTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
+		const specError = toolSpecPathError("Read", args);
+		if (specError) return { output: specError, isError: true };
 		const { file_path } = args as {
 			file_path: string;
 			offset?: number;

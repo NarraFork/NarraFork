@@ -498,7 +498,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 				apply: async (input) => {
 					applying();
 					await gate;
-					await fileChangeLocalIo.apply(input);
+					return fileChangeLocalIo.apply(input);
 				},
 			},
 		});

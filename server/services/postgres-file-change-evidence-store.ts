@@ -39,6 +39,8 @@
  *   same section that would have to be replayed, and the replay re-runs the
  *   existence check first).
  */
+
+import { createHash } from "node:crypto";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { withPgRetry } from "@server/db/pg-retry";
 import {
@@ -50,6 +52,7 @@ import {
 	fileChangeStorageBudgets,
 	fileHistoryClock,
 	narratorToolCalls,
+	workspaceWriteLeases,
 } from "@server/db/postgres-schema";
 import { generateId } from "@server/lib/id";
 import {
@@ -62,7 +65,7 @@ import {
 	type FileChangeState,
 	fileChangeStatesEqual,
 } from "@shared/file-change-protocol";
-import { and, asc, eq, isNull, ne, type SQL, sql } from "drizzle-orm";
+import { and, asc, eq, isNull, ne, or, type SQL, sql } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { targetPathSemantics } from "../lib/agent/execution/path-semantics";
 import { FILE_CHANGE_BLOB_BUDGET_ID } from "./file-change-blob-catalog";
@@ -88,6 +91,7 @@ import {
 	createFileChangeIdentity,
 	fileChangeExecutionBindingMatches,
 } from "./file-change-identity";
+import { parsePostgresWorkspaceMutationManifest } from "./postgres-workspace-lease-store";
 
 /** Transaction handle as produced by `db.transaction(async (tx) => …`. PG-side only. */
 type Tx = Parameters<Parameters<BunSQLDatabase["transaction"]>[0]>[0];
@@ -359,11 +363,17 @@ export class PostgresFileChangeEvidenceStore {
 	}
 
 	/**
-	 * Closes the evidence books of ONE scope after human-driven external recovery.
+	 * Durable recovery section for ONE ended lease, not the scope's newest owner.
+	 * Effects, audit and quarantine clearance commit together; no filesystem I/O.
+	 * The caller must orchestrate external observation; this is not a PG scheduler
+	 * or a recovery reservation. Legacy records lack stopped-executor proof here.
 	 * Frozen execution receipts and observed states are NEVER rewritten.
 	 */
 	async closeBooksForRecovery(input: {
 		scopeId: string;
+		workspaceLeaseId?: string | null;
+		effectIds?: readonly string[];
+		operationIds?: readonly string[];
 		recoveredByUserId: string;
 		decisions: {
 			effectId: string;
@@ -374,6 +384,24 @@ export class PostgresFileChangeEvidenceStore {
 		}[];
 	}): Promise<{ settledEffectCount: number }> {
 		E.assertString(input.scopeId, "scopeId");
+		// This store has no scheduler capable of proving a legacy executor stopped.
+		// Epoch inequality, age and an empty process registry are never such proof.
+		if (!input.workspaceLeaseId)
+			throw E.fail("INVALID_INPUT", "PG recovery requires an ended durable lease");
+		E.assertString(input.workspaceLeaseId, "workspaceLeaseId");
+		for (const ids of [input.effectIds, input.operationIds]) {
+			if (
+				ids !== undefined &&
+				(!Array.isArray(ids) ||
+					ids.length > FILE_CHANGE_LIMITS.revertFiles ||
+					new Set(ids).size !== ids.length)
+			)
+				throw E.fail(
+					"INVALID_INPUT",
+					"Recovery manifest exceeds its budget or contains duplicates",
+				);
+			for (const id of ids ?? []) E.assertString(id, "manifest id");
+		}
 		E.assertString(input.recoveredByUserId, "recoveredByUserId");
 		if (
 			!Array.isArray(input.decisions) ||
@@ -400,7 +428,8 @@ export class PostgresFileChangeEvidenceStore {
 				E.assertInteger(decision.observedSizeBytes, "observedSizeBytes", 0);
 			}
 		}
-		E.assertMetadata(input.decisions);
+		if (Buffer.byteLength(JSON.stringify(input.decisions)) > FILE_CHANGE_LIMITS.summaryBytes)
+			throw E.fail("RECOVERY_LIMIT", "Recovery audit exceeds the byte limit");
 		return withPgRetry(() => this.database.transaction((tx) => this.closeBooksSection(tx, input)), {
 			label: "evidence.closeBooksForRecovery",
 		});
@@ -410,6 +439,9 @@ export class PostgresFileChangeEvidenceStore {
 		tx: Tx,
 		input: {
 			scopeId: string;
+			workspaceLeaseId?: string | null;
+			effectIds?: readonly string[];
+			operationIds?: readonly string[];
 			recoveredByUserId: string;
 			decisions: {
 				effectId: string;
@@ -420,19 +452,104 @@ export class PostgresFileChangeEvidenceStore {
 			}[];
 		},
 	): Promise<{ settledEffectCount: number }> {
+		// First read only identifies the lock domain. Re-read all authority after
+		// the advisory lock wait, then scope row, then lease row (same as admission).
+		const identity = await this.requireScope(tx, input.scopeId);
+		await tx.execute(sql`set local lock_timeout = '2s'`);
+		await tx.execute(sql`set local statement_timeout = '5s'`);
+		const key = createHash("sha256")
+			.update(JSON.stringify(["narrafork.workspace-lease.device.v1", identity.deviceId]))
+			.digest()
+			.readBigInt64BE();
+		await tx.execute(sql`select pg_advisory_xact_lock(${key.toString()}::bigint)`);
+		await tx
+			.select({ id: fileChangeScopes.id })
+			.from(fileChangeScopes)
+			.where(eq(fileChangeScopes.id, input.scopeId))
+			.for("update");
 		const scope = await this.requireScope(tx, input.scopeId);
-		const unsettled = (await tx
+		if (scope.deviceId !== identity.deviceId)
+			throw E.fail("INVALID_INPUT", "Recovery lock identity changed");
+		const [lease] = await tx
 			.select()
-			.from(fileChangeEffects)
-			.where(
-				and(eq(fileChangeEffects.scopeId, scope.id), ne(fileChangeEffects.settlement, "settled")),
-			)) as FileChangeEffectRecord[];
+			.from(workspaceWriteLeases)
+			.where(eq(workspaceWriteLeases.leaseId, input.workspaceLeaseId ?? ""))
+			.for("update");
+		if (
+			!lease ||
+			lease.scopeId !== scope.id ||
+			lease.deviceId !== scope.deviceId ||
+			lease.status !== "quarantined" ||
+			lease.executionEndedAt === null ||
+			scope.activeLeaseId === lease.leaseId
+		) {
+			throw E.fail("INVALID_INPUT", "Recovery requires a detached, ended quarantined lease");
+		}
+		const manifest = parsePostgresWorkspaceMutationManifest(lease.mutationManifestJson);
+		if (manifest.mutations.length > FILE_CHANGE_LIMITS.revertFiles)
+			throw E.fail("INVALID_INPUT", "Invalid durable recovery manifest");
+		const operationIds = [
+			...new Set(
+				manifest.mutations.flatMap((mutation) =>
+					mutation.operationId ? [mutation.operationId] : [],
+				),
+			),
+		];
+		if (
+			input.operationIds &&
+			(input.operationIds.length !== operationIds.length ||
+				input.operationIds.some((id) => !operationIds.includes(id)))
+		)
+			throw E.fail("INVALID_INPUT", "Recovery operation ids do not match the durable manifest");
+		const selectors = manifest.mutations.flatMap((mutation) =>
+			mutation.effectId
+				? [eq(fileChangeEffects.id, mutation.effectId)]
+				: mutation.operationId
+					? [eq(fileChangeEffects.operationId, mutation.operationId)]
+					: [],
+		);
+		const selected = selectors.length
+			? ((await tx
+					.select()
+					.from(fileChangeEffects)
+					.where(and(eq(fileChangeEffects.scopeId, scope.id), or(...selectors)))
+					.limit(FILE_CHANGE_LIMITS.revertFiles + 1)
+					.for("update")) as FileChangeEffectRecord[])
+			: [];
+		if (selected.length > FILE_CHANGE_LIMITS.revertFiles)
+			throw E.fail("INVALID_INPUT", "Recovery effect inventory exceeds budget");
+		for (const mutation of manifest.mutations) {
+			if (
+				mutation.effectId &&
+				!selected.some(
+					(effect) =>
+						effect.id === mutation.effectId &&
+						(!mutation.operationId || effect.operationId === mutation.operationId) &&
+						effect.mutationId === mutation.mutationId,
+				)
+			)
+				throw E.fail(
+					"INVALID_INPUT",
+					"Recovery effect is missing or does not match its durable mutation identity",
+				);
+		}
+		if (
+			input.effectIds &&
+			(input.effectIds.length !== selected.length ||
+				input.effectIds.some((id) => !selected.some((effect) => effect.id === id)))
+		)
+			throw E.fail("INVALID_INPUT", "Recovery effect ids do not match the durable manifest");
+		const unsettled = selected.filter((effect) => effect.settlement !== "settled");
 		const byEffectId = new Map(input.decisions.map((decision) => [decision.effectId, decision]));
-		if (byEffectId.size !== input.decisions.length || byEffectId.size !== unsettled.length) {
+		if (byEffectId.size !== input.decisions.length || byEffectId.size !== selected.length) {
 			throw E.fail(
 				"INVALID_INPUT",
 				"Recovery decisions must cover every unsettled effect exactly once",
 			);
+		}
+		for (const effect of selected) {
+			if (byEffectId.get(effect.id)?.canonicalPath !== effect.identityJson.canonicalPath)
+				throw E.fail("INVALID_INPUT", "Recovery audit contains an unrelated effect");
 		}
 		const timestamp = this.now();
 		for (const effect of unsettled) {
@@ -464,7 +581,16 @@ export class PostgresFileChangeEvidenceStore {
 				.set({ outcome, settlement: "settled", updatedAt: timestamp })
 				.where(eq(fileChangeEffects.id, effect.id));
 		}
-		for (const operationId of new Set(unsettled.map((effect) => effect.operationId))) {
+		for (const operationId of [
+			...new Set([...selected.map((effect) => effect.operationId), ...operationIds]),
+		].sort()) {
+			// Independent devices can recover different effects of the same operation.
+			// Serialize its aggregate and re-read effects AFTER this lock wait.
+			await tx
+				.select({ id: fileChangeOperations.id })
+				.from(fileChangeOperations)
+				.where(eq(fileChangeOperations.id, operationId))
+				.for("update");
 			const operation = await this.requireOperation(tx, operationId);
 			const effects = await this.selectEffects(
 				tx,
@@ -472,6 +598,8 @@ export class PostgresFileChangeEvidenceStore {
 				undefined,
 				FILE_CHANGE_LIMITS.revertFiles + 1,
 			);
+			if (effects.length > FILE_CHANGE_LIMITS.revertFiles)
+				throw E.fail("INVALID_INPUT", "Operation effect inventory exceeds recovery budget");
 			const remaining = effects.filter((effect) => effect.settlement !== "settled").length;
 			if (remaining > 0) {
 				// Another scope of the same operation is still barred; only refresh counts.
@@ -502,6 +630,7 @@ export class PostgresFileChangeEvidenceStore {
 		await tx.insert(fileChangeScopeRecoveries).values({
 			id: generateId(),
 			scopeId: scope.id,
+			workspaceLeaseId: lease.leaseId,
 			deviceId: scope.deviceId,
 			canonicalRoot: scope.canonicalRoot,
 			pathFlavor: scope.pathFlavor,
@@ -511,6 +640,16 @@ export class PostgresFileChangeEvidenceStore {
 			fencingTokenBefore: scope.fencingToken,
 			createdAt: timestamp,
 		});
+		await tx
+			.update(workspaceWriteLeases)
+			.set({ status: "recovered", updatedAt: timestamp })
+			.where(
+				and(
+					eq(workspaceWriteLeases.leaseId, lease.leaseId),
+					eq(workspaceWriteLeases.status, "quarantined"),
+				),
+			);
+		// Deliberately no scope update: a newer B may own its fence/count/lease.
 		return { settledEffectCount: unsettled.length };
 	}
 

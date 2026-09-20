@@ -1,6 +1,16 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink } from "node:fs/promises";
+import {
+	chmod,
+	mkdir,
+	mkdtemp,
+	readFile,
+	realpath,
+	rename,
+	rm,
+	symlink,
+	writeFile,
+} from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,7 +33,7 @@ if (migrationScenario) {
 		expect(process.env.NARRAFORK_HOME).toBe(testEnvironment.narraforkHome);
 		expect(testEnvironment.narraforkHome).not.toBe(testEnvironment.realNarraforkHome);
 		const { db, sqlite } = getTestDb();
-		mock.module("@server/db", () => ({ db, sqlite }));
+		mock.module("@server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 		const registryKey = Symbol.for("narrafork:runningBashProcesses");
 		const migrationKey = Symbol.for("narrafork:bashActivityMigration:v1");
 		const state = (key: symbol): unknown => Object.getOwnPropertyDescriptor(globalThis, key)?.value;
@@ -146,7 +156,7 @@ if (migrationScenario) {
 		throw new Error("Isolated Bun preload is required");
 	const { db, sqlite } = getTestDb();
 	sqlite.exec("PRAGMA busy_timeout = 0;");
-	mock.module("@server/db", () => ({ db, sqlite }));
+	mock.module("@server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 	const { backgroundTaskService } = await import("@server/services/background-task-service");
 	const { bashTool, updateBashTimeout } = await import("../bash");
 	const { writeTool } = await import("../write");
@@ -259,6 +269,7 @@ if (migrationScenario) {
 			if (task.status === "running") await backgroundTaskService.waitForCompletion(task.id, 5_000);
 		}
 		for (const gate of gates) await gate.server.stop(true);
+		await runtime.initialize().catch(() => {});
 		mock.restore();
 		await rm(root, { recursive: true, force: true });
 	});
@@ -724,15 +735,37 @@ await Bun.write("bash.txt", "finished");`;
 			expect(await rollback(scope)).toBe("granted");
 		});
 
-		test("namespace permission/catalog failures reject before dispatch", async () => {
-			await runtime.initialize();
+		for (const damage of ["missing", "corrupt"] as const) {
+			test(`real Bash preserves coordination with ${damage} source identity`, async () => {
+				const scope = await scopeFromWrite();
+				const identityPath = join(privateRoot, "file-change-source.json");
+				if (damage === "missing") await rm(identityPath);
+				else await writeFile(identityPath, "{broken");
+				const registration = spyOn(runtime.coordinator, "registerActivity");
+				expect((await run("printf first > bash.txt")).isError).not.toBe(true);
+				await finished();
+				expect((await run("printf second > bash.txt")).isError).not.toBe(true);
+				await finished();
+				expect(dispatched).toHaveLength(2);
+				expect(registration).toHaveBeenCalledTimes(2);
+				for (const [input] of registration.mock.calls) expect(input.scope.id).toBe(scope.id);
+				expect(await readFile(join(workspace, "bash.txt"), "utf8")).toBe("second");
+				await expect(runtime.verifyNamespace()).rejects.toThrow();
+				await runtime.initialize().catch(() => {});
+			});
+		}
+
+		test("blob permission/catalog failures do not prevent shell dispatch", async () => {
+			const namespace = await runtime.initialize();
 			await chmod(join(privateRoot, "file-change-blobs"), 0o755);
-			expect((await run("printf bad > bash.txt")).isError).toBe(true);
+			expect((await run("printf first > bash.txt")).isError).not.toBe(true);
+			await finished();
 			await chmod(join(privateRoot, "file-change-blobs"), 0o700);
-			const namespace = await runtime.verifyNamespace();
 			namespace.catalog.beginReconciliation({ expectedGeneration: namespace.generation });
-			expect((await run("printf bad > bash.txt")).isError).toBe(true);
-			expect(dispatched).toHaveLength(0);
+			expect((await run("printf second > bash.txt")).isError).not.toBe(true);
+			await finished();
+			expect(dispatched).toHaveLength(2);
+			expect(await readFile(join(workspace, "bash.txt"), "utf8")).toBe("second");
 		});
 
 		test("remote and Windows targets never initialize a local evidence namespace", async () => {

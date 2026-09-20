@@ -99,6 +99,13 @@ export interface AdapterContentBlock {
 	text?: string | null;
 	/** Native system injection's exact model-facing projection. */
 	modelText?: string | null;
+	/** Immutable UI-only publication receipt, shared by SQLite and PostgreSQL. */
+	publicationResult?: {
+		logicalRunId: string;
+		truncated: boolean;
+		originalBytes: number;
+		sourceResultRef: string;
+	};
 	thinking?: string | null;
 	translatedText?: string | null;
 	query?: string | null;
@@ -1477,6 +1484,41 @@ function adaptMessage(
 					: {}),
 			},
 		];
+	}
+
+	// Publication receipts are immutable display snapshots, not system prose.
+	if (msg.role === "disp") {
+		const snapshotIndex = blocks.findIndex((block) => {
+			const meta = block.publicationResult;
+			return (
+				block.type === "text" &&
+				typeof block.text === "string" &&
+				meta != null &&
+				typeof meta.logicalRunId === "string" &&
+				meta.logicalRunId.length > 0 &&
+				typeof meta.sourceResultRef === "string" &&
+				meta.sourceResultRef.length > 0 &&
+				typeof meta.truncated === "boolean" &&
+				Number.isFinite(meta.originalBytes) &&
+				meta.originalBytes >= 0
+			);
+		});
+		if (snapshotIndex >= 0) {
+			const snapshot = blocks[snapshotIndex];
+			return [
+				{
+					kind: "system-simple",
+					key: `${idBase}-b${snapshotIndex}`,
+					data: {
+						kind: "publication_result",
+						text: "",
+						snapshotText: snapshot.text,
+						publicationResult: snapshot.publicationResult,
+						messageId: msg.id,
+					},
+				},
+			];
+		}
 	}
 
 	// system messages: SCAN for the recognized system block (mirrors

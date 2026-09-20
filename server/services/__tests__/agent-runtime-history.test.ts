@@ -6,7 +6,8 @@ import { settings } from "../../lib/settings";
 import type { RuntimeHistoryMessage } from "../agent-runtime/history";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const { buildRuntimeHistory } = await import("../agent-runtime/history");
 const { narratorPersistence } = await import("../narrator-persistence");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
@@ -81,6 +82,44 @@ test.each([
 		expect(prepared.trailingUserText).toContain("fresh injection");
 		expect(prepared.currentText).toContain("fresh injection");
 	}
+});
+
+test.each([
+	"primary",
+	"subagent",
+] as const)("%s excludes publication receipts before provider projection", async (profile) => {
+	const receipt = message("publication-result:run", "disp", "private snapshot preview");
+	receipt.contentJson = [
+		{
+			type: "text",
+			text: receipt.contentText,
+			publicationResult: {
+				logicalRunId: "run",
+				truncated: true,
+				originalBytes: 100000,
+				sourceResultRef: "message:answer",
+			},
+		},
+	];
+	const tool = message("parent-tool", "assistant", "");
+	tool.contentJson = [{ type: "tool_use", id: "agent", name: "Agent", input: {} }];
+	tool.toolCalls = [
+		{
+			toolUseId: "agent",
+			toolName: "Agent",
+			inputJson: {},
+			outputJson: "parent result survives",
+			status: "success",
+		},
+	];
+	const prepared = await buildRuntimeHistory({
+		...options(profile),
+		sourceMessages: [tool, receipt],
+	});
+	expect(prepared.sourceMessages).toContain(receipt);
+	expect(prepared.modelMessages.map((row) => row.id)).toEqual(["parent-tool"]);
+	expect(JSON.stringify(prepared.history)).not.toContain("private snapshot preview");
+	expect(JSON.stringify(prepared.trailingToolResults)).toContain("parent result survives");
 });
 
 test("child placement is projected while complete tools and reasoning metadata are retained", async () => {

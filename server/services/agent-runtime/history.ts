@@ -69,16 +69,18 @@ export async function buildRuntimeHistory(
 		).narratorService.getModelHistorySinceLastCompact(options.narratorId));
 	// Detach mutable row arrays and block metadata, not huge text payloads,
 	// so shared/COW source rows remain unchanged during provider projection.
-	const modelMessages = sourceMessages.map((message) => ({
-		...message,
-		...(options.profile === "subagent" ? { parentToolUseId: null } : {}),
-		contentJson: Array.isArray(message.contentJson)
-			? message.contentJson.map((block) =>
-					block && typeof block === "object" ? { ...block } : block,
-				)
-			: message.contentJson,
-		toolCalls: message.toolCalls?.map((call) => ({ ...call })),
-	}));
+	const modelMessages = sourceMessages
+		.filter((message) => message.role !== "disp")
+		.map((message) => ({
+			...message,
+			...(options.profile === "subagent" ? { parentToolUseId: null } : {}),
+			contentJson: Array.isArray(message.contentJson)
+				? message.contentJson.map((block) =>
+						block && typeof block === "object" ? { ...block } : block,
+					)
+				: message.contentJson,
+			toolCalls: message.toolCalls?.map((call) => ({ ...call })),
+		}));
 	const built = await buildHistory(
 		modelMessages,
 		options.model,

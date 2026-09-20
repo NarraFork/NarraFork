@@ -31,6 +31,7 @@ import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages, narratorToolCalls } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import type { ToolCallBinding } from "../lib/agent/types";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
@@ -330,7 +331,7 @@ export async function recordTreeSnapshotAfter(
 	session: TreeSnapshotSession,
 	narratorId: string,
 	toolUseId: string,
-	opts?: { unavailable: true },
+	opts?: { unavailable?: true; binding?: ToolCallBinding },
 ): Promise<TreeSnapshotAfterResult> {
 	const before = opts?.unavailable ? null : (session._treeHashBefore?.get(toolUseId) ?? null);
 	session._treeHashBefore?.delete(toolUseId);
@@ -406,6 +407,12 @@ export async function recordTreeSnapshotAfter(
 				and(
 					eq(narratorToolCalls.narratorId, narratorId),
 					eq(narratorToolCalls.toolUseId, toolUseId),
+					...(opts?.binding
+						? [
+								eq(narratorToolCalls.id, opts.binding.toolCallId),
+								eq(narratorToolCalls.executionAttempt, opts.binding.attempt),
+							]
+						: []),
 				),
 			)
 			.returning({ messageId: narratorToolCalls.messageId });

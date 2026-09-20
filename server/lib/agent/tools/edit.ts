@@ -4,6 +4,7 @@ import { executeLocalFileChange } from "../../../services/file-change-runtime";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
+import { toolSpecPathError } from "../../spec-uri";
 import { readCompleteFileBytes } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
@@ -501,6 +502,8 @@ export const editTool: ToolDefinition = {
 			.describe("Replace all occurrences of old_string (default false)"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
+		const specError = toolSpecPathError("Edit", args);
+		if (specError) return { output: specError, isError: true };
 		const { file_path, old_string, new_string, replace_all } = args as {
 			file_path: string;
 			old_string: string;

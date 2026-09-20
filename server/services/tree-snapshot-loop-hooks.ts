@@ -1,5 +1,5 @@
 /**
- * The `onSnapshotBefore` / `onSnapshotAfter` pair every agent loop installs.
+ * Execution-owned tree boundaries shared by primary, subagent and recovery runners.
  *
  * ## Why this is shared rather than written per loop
  *
@@ -21,21 +21,27 @@
  *
  * - Pass a session object that lives as long as the loop: staged `before` hashes
  *   are stored ON it, so a fresh object per pass loses the boundary pairing.
- * - Until actual execution-target receipts are available, only an unambiguous
- *   local session/call target is measured. Remote overrides and out-of-workspace
+ * - Only an unambiguous local session/call target is measured; execution runners
+ *   additionally check the frozen target. Remote overrides and out-of-workspace
  *   paths have missing evidence, not equal local hashes proving a no-op.
  * - `isInGitRepo: false` means "return no hooks at all" rather than "hooks that
  *   do nothing", so the loop never awaits a call that cannot produce anything.
  * - The hooks never throw. A capture failure degrades that boundary to null;
  *   snapshotting must not break a turn.
  * - Capture runs through `tryCaptureHot`, so an over-budget scan returns null
- *   and continues in the background instead of stalling the event consumer that
- *   awaits these hooks (see `worktree-tree-snapshot.tryCaptureHot`). The
+ *   and continues in the background instead of stalling tool execution indefinitely
+ *   (see `worktree-tree-snapshot.tryCaptureHot`). The
  *   `chapters.treeSnapshotsEnabled` escape hatch is honoured inside
  *   `captureSessionTree`, so it applies to every caller of this module.
  */
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
+import type {
+	AgentConfig,
+	AgentToolUse,
+	ToolCallBinding,
+	ToolExecutionTarget,
+} from "../lib/agent/types";
 import { logger } from "../lib/logger";
 import type { EventHooks } from "./narrator-event-handler";
 import {
@@ -65,13 +71,20 @@ export const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", "StructSed", SHELL_
  * Returns `{}` when the workspace cannot be snapshotted at all (not a git repo),
  * which callers can spread into their `EventHooks` unconditionally.
  */
-export function buildTreeSnapshotEventHooks(opts: {
+interface TreeSnapshotHookOptions {
 	/** Mutable per-loop session state; must outlive a single tool call. */
 	session: TreeSnapshotSession;
 	narratorId: string;
 	/** False for a cwd outside any git repository — no shadow repo is possible. */
 	isInGitRepo: boolean;
-}): Pick<EventHooks, "onSnapshotBefore" | "onSnapshotAfter"> {
+	binding?: ToolCallBinding;
+	executionTarget?: ToolExecutionTarget;
+}
+
+/** Legacy direct-call adapter. Runtime events no longer invoke these callbacks. */
+export function buildTreeSnapshotEventHooks(
+	opts: TreeSnapshotHookOptions,
+): Pick<EventHooks, "onSnapshotBefore" | "onSnapshotAfter"> {
 	const { session, narratorId, isInGitRepo } = opts;
 	if (!isInGitRepo) return {};
 	// Keep the accepted scope per attempt without mutating the session's default
@@ -114,7 +127,15 @@ export function buildTreeSnapshotEventHooks(opts: {
 				});
 				return;
 			}
+			const target = opts.executionTarget;
 			if (
+				(target !== undefined &&
+					(target.deviceId !== LOCAL_DEVICE_ID ||
+						target.backendKind !== "local" ||
+						target.cwd !== session.cwd ||
+						(target.canonicalPath !== undefined &&
+							declaredWorktreePaths(session.cwd, { file_path: target.canonicalPath })?.length ===
+								0))) ||
 				defaultDeviceId !== LOCAL_DEVICE_ID ||
 				(requestedDevice !== undefined && requestedDevice !== LOCAL_DEVICE_ID) ||
 				(toolName === SHELL_TOOL_NAME && workdir !== undefined && workdir !== session.cwd) ||
@@ -160,7 +181,10 @@ export function buildTreeSnapshotEventHooks(opts: {
 				(bashWindow === undefined || !bashWindow.eligible || bashWindow.wasOverlapped())
 			) {
 				abandonTreeSnapshot(session, narratorId, toolUseId);
-				await recordTreeSnapshotAfter(session, narratorId, toolUseId, { unavailable: true });
+				await recordTreeSnapshotAfter(session, narratorId, toolUseId, {
+					unavailable: true,
+					binding: opts.binding,
+				});
 				return;
 			}
 			if (
@@ -168,10 +192,15 @@ export function buildTreeSnapshotEventHooks(opts: {
 				(session._defaultDeviceId ?? LOCAL_DEVICE_ID) !== LOCAL_DEVICE_ID
 			) {
 				abandonTreeSnapshot(session, narratorId, toolUseId);
-				await recordTreeSnapshotAfter(session, narratorId, toolUseId, { unavailable: true });
+				await recordTreeSnapshotAfter(session, narratorId, toolUseId, {
+					unavailable: true,
+					binding: opts.binding,
+				});
 				return;
 			}
-			const { changedFiles } = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+			const { changedFiles } = await recordTreeSnapshotAfter(session, narratorId, toolUseId, {
+				binding: opts.binding,
+			});
 			if (toolName !== SHELL_TOOL_NAME || changedFiles.length === 0) return;
 			try {
 				const { recordAttributions } = await import("./file-attribution-service");
@@ -192,6 +221,45 @@ export function buildTreeSnapshotEventHooks(opts: {
 					toolUseId,
 					error: String(err),
 				});
+			}
+		},
+	};
+}
+
+/**
+ * Execution-owned boundaries: UI events are allowed to run independently of captures.
+ * Each admitted invocation keeps its own hooks and persisted identity, including re-runs.
+ * The executor pairs after with before even when capture or tool execution throws/aborts.
+ */
+export function buildTreeSnapshotExecutionHooks(
+	opts: TreeSnapshotHookOptions,
+): Pick<AgentConfig, "onToolExecutionBefore" | "onToolExecutionAfter"> {
+	if (!opts.isInGitRepo) return {};
+	const calls = new WeakMap<AgentToolUse, ReturnType<typeof buildTreeSnapshotEventHooks>>();
+	return {
+		onToolExecutionBefore: async (context) => {
+			if (!FILE_MUTATING_TOOLS.has(context.toolUse.name)) return;
+			const hooks = buildTreeSnapshotEventHooks({
+				...opts,
+				binding: context.binding,
+				executionTarget: context.executionTarget,
+			});
+			calls.set(context.toolUse, hooks);
+			await hooks.onSnapshotBefore?.(
+				context.toolUse.toolUseId,
+				context.toolUse.name,
+				context.effectiveInput,
+			);
+		},
+		onToolExecutionAfter: async (context) => {
+			const hooks = calls.get(context.toolUse);
+			calls.delete(context.toolUse);
+			if (!hooks) return;
+			try {
+				await hooks.onSnapshotAfter?.(context.toolUse.toolUseId, context.toolUse.name);
+			} catch (error) {
+				abandonTreeSnapshot(opts.session, opts.narratorId, context.toolUse.toolUseId);
+				throw error;
 			}
 		},
 	};

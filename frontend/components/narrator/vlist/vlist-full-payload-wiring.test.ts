@@ -54,7 +54,9 @@ describe("full-payload request wiring (inline auto-load + fullscreen)", () => {
 	it("wires inspector refs from card/trace data independently of selection aliases", () => {
 		expect(SHELL).toContain("toolDetailRef={interaction.toolDetailRef}");
 		expect(SHELL).toContain("? toolDetailRequestFromData(toolUseId, item.spec.data)");
-		expect(SHELL).toContain("toolDetailRef={row.identity?.toolDetailRef}");
+		const traceBindings = read("useVListTraceBindings.tsx");
+		expect(traceBindings).toContain("adapterIdentity?.toolDetailRef");
+		expect(traceBindings).toContain("toolDetailRef={toolDetailRef}");
 		for (const field of ["toolUseId", "toolCallId", "messageId", "executionAttempt"]) {
 			expect(SHELL).toContain(`a.toolDetailRef?.${field} === b.toolDetailRef?.${field}`);
 		}

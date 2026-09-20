@@ -33,7 +33,7 @@ async function seedMessage(params: {
 	id: string;
 	narratorId: string;
 	seq: number;
-	role: "user" | "assistant" | "system";
+	role: "user" | "assistant" | "system" | "disp" | "sys";
 	contentText?: string;
 	contentJson?: unknown;
 	isCompact?: boolean;
@@ -70,6 +70,44 @@ afterAll(() => {
 });
 
 describe("narrator model history projection", () => {
+	test("model and compact input exclude persisted display receipts but retain sys", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "injection",
+			narratorId: "n1",
+			seq: 1,
+			role: "sys",
+			contentText: "keep injection",
+		});
+		await seedMessage({
+			id: "publication-result:run",
+			narratorId: "n1",
+			seq: 2,
+			role: "disp",
+			contentText: "snapshot preview",
+			contentJson: [
+				{
+					type: "text",
+					text: "snapshot preview",
+					publicationResult: {
+						logicalRunId: "run",
+						truncated: false,
+						originalBytes: 16,
+						sourceResultRef: "message:answer",
+					},
+				},
+			],
+		});
+		expect(
+			(await narratorService.getModelHistorySinceLastCompact("n1")).map((row) => row.id),
+		).toEqual(["injection"]);
+		expect(
+			(await narratorService.getMessagesSinceLastCompact("n1")).map((row) => row.id),
+		).toContain("publication-result:run");
+		expect(
+			sqlite.query("SELECT id FROM narrator_messages WHERE id = ?").get("publication-result:run"),
+		).toBeTruthy();
+	});
 	test("loads post-compact history with narrow fields", async () => {
 		await seedNarrator();
 		await seedMessage({

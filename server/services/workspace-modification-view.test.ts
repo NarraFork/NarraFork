@@ -69,45 +69,47 @@ async function record(params: {
 	narratorId: string | null;
 	userId?: string;
 	subagentType?: string;
-	action: "write" | "edit" | "bash" | "external" | "human";
-	toolName?: string | null;
-	treeHashAfter?: string;
-}): Promise<void> {
-	let toolUseId: string | undefined;
-	if (params.narratorId && params.treeHashAfter) {
-		toolUseId = generateId();
-		const messageId = generateId();
-		const now = new Date().toISOString();
-		// narrator_tool_calls.messageId is a real FK, so the owning message must exist.
-		await db.insert(narratorMessages).values({
-			id: messageId,
+		action: "write" | "edit" | "bash" | "external" | "human";
+		toolName?: string | null;
+		treeHashAfter?: string;
+		lineStats?: { added: number; removed: number } | null;
+	}): Promise<void> {
+		let toolUseId: string | undefined;
+		if (params.narratorId && params.treeHashAfter) {
+			toolUseId = generateId();
+			const messageId = generateId();
+			const now = new Date().toISOString();
+			// narrator_tool_calls.messageId is a real FK, so the owning message must exist.
+			await db.insert(narratorMessages).values({
+				id: messageId,
+				narratorId: params.narratorId,
+				role: "assistant",
+				contentJson: [],
+				createdAt: now,
+			});
+			await db.insert(narratorToolCalls).values({
+				id: generateId(),
+				narratorId: params.narratorId,
+				messageId,
+				toolUseId,
+				toolName: params.toolName ?? "Write",
+				status: "success",
+				treeHashAfter: params.treeHashAfter,
+				createdAt: now,
+			});
+		}
+		await recordAttribution({
+			deviceId: "local",
+			workspacePath: params.workspacePath,
+			filePath: params.filePath,
 			narratorId: params.narratorId,
-			role: "assistant",
-			contentJson: [],
-			createdAt: now,
+			userId: params.userId,
+			subagentType: params.subagentType,
+			action: params.action,
+			toolName: params.toolName ?? null,
+			toolUseId: toolUseId ?? null,
+			lineStats: params.lineStats ?? null,
 		});
-		await db.insert(narratorToolCalls).values({
-			id: generateId(),
-			narratorId: params.narratorId,
-			messageId,
-			toolUseId,
-			toolName: params.toolName ?? "Write",
-			status: "success",
-			treeHashAfter: params.treeHashAfter,
-			createdAt: now,
-		});
-	}
-	await recordAttribution({
-		deviceId: "local",
-		workspacePath: params.workspacePath,
-		filePath: params.filePath,
-		narratorId: params.narratorId,
-		userId: params.userId,
-		subagentType: params.subagentType,
-		action: params.action,
-		toolName: params.toolName ?? null,
-		toolUseId: toolUseId ?? null,
-	});
 	// Timestamps are ISO strings at millisecond resolution; separate the rows so the
 	// newest-first ordering is deterministic.
 	await new Promise((r) => setTimeout(r, 2));
@@ -179,6 +181,8 @@ describe("unified workspace modification view", () => {
 		expect(group?.actors).toHaveLength(3);
 		expect(group?.recentEvents).toHaveLength(3);
 		expect(group?.recentEvents.map((event) => event.action)).toEqual(["external", "edit", "write"]);
+		// NULL means unmeasured (legacy rows / bash); these fixture rows never set lineStats.
+		expect(group?.recentEvents.every((event) => event.linesAdded == null)).toBe(true);
 		expect(group?.hasExternalChange).toBe(true);
 		// External changes are never precisely attributable.
 		expect(group?.hasImpreciseAttribution).toBe(true);
@@ -196,6 +200,42 @@ describe("unified workspace modification view", () => {
 		expect(group?.changeCount).toBe(7);
 		expect(group?.recentEvents).toHaveLength(5);
 		expect(group?.recentEvents.every((event) => event.action === "edit")).toBe(true);
+	});
+
+	test("carries measured line counts into hover-card recent events", async () => {
+		const ws = makeWorkspace("nf-view-lines-");
+		const narratorId = await createNarrator("Solo", ws);
+		await record({
+			workspacePath: ws,
+			filePath: "measured.ts",
+			narratorId,
+			action: "edit",
+			lineStats: { added: 12, removed: 3 },
+		});
+		await record({
+			workspacePath: ws,
+			filePath: "measured.ts",
+			narratorId,
+			action: "edit",
+			lineStats: { added: 0, removed: 0 },
+		});
+		await record({
+			workspacePath: ws,
+			filePath: "measured.ts",
+			narratorId,
+			action: "edit",
+		});
+
+		const view = await getWorkspaceModificationView(ws);
+		const group = view.byFile.find((item) => item.filePath === "measured.ts");
+		expect(group?.recentEvents.map((event) => [event.linesAdded, event.linesRemoved])).toEqual([
+			[null, null],
+			[0, 0],
+			[12, 3],
+		]);
+		const newest = timelineOf(view).find((event) => event.filePath === "measured.ts");
+		expect(newest?.linesAdded).toBeNull();
+		expect(newest?.linesRemoved).toBeNull();
 	});
 
 	test("never upgrades legacy write/edit observations to measured attribution", async () => {

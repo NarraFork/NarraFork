@@ -36,9 +36,19 @@ import { eq } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import type { PostgresClient } from "../../../../server/db/postgres-client";
 import { createPostgresClient } from "../../../../server/db/postgres-client";
-import { fileChangeScopes } from "../../../../server/db/postgres-schema";
+import {
+	fileChangeScopeRecoveries,
+	fileChangeScopes,
+	users,
+	workspaceWriteLeases,
+} from "../../../../server/db/postgres-schema";
 import { logger } from "../../../../server/lib/logger";
-import type { FileChangeScopeIdentity } from "../../../../server/services/file-change-identity";
+import {
+	createFileChangeIdentity,
+	type FileChangeScopeIdentity,
+} from "../../../../server/services/file-change-identity";
+import { createPostgresFileChangeBlobCatalog } from "../../../../server/services/postgres-file-change-blob-catalog";
+import { createPostgresFileChangeEvidenceStore } from "../../../../server/services/postgres-file-change-evidence-store";
 import { withPostgres } from "../../../db/pg-test-harness";
 import { getTestDb } from "../../../setup";
 import { migrationSql } from "../read/pg-parity-matrix";
@@ -145,6 +155,63 @@ function leaseOf(
 		revision: grant.revision,
 		pendingMutations,
 	};
+}
+
+async function seedApplyingEffect(pgDb: BunSQLDatabase, lease: DurableLease, name: string) {
+	const evidence = createPostgresFileChangeEvidenceStore(pgDb);
+	const requestDigest = createHash("sha256").update(name).digest("hex");
+	const operation = await evidence.beginOperation({
+		sourceInstanceId: lease.scope.sourceInstanceId,
+		sourceKind: "tool",
+		sourceId: name,
+		attempt: 1,
+		requestDigest,
+		expectedEffectCount: 1,
+		actor: {
+			kind: "primary",
+			subjectKey: `narrator:${name}`,
+			narratorId: null,
+			userId: null,
+			label: null,
+			deleted: false,
+			parentSubjectKey: null,
+		},
+		executionBinding: lease.binding,
+		toolCallId: null,
+		toolUseId: null,
+		narratorId: null,
+		projectId: null,
+		ownerUserId: null,
+		initiatorSubjectKey: null,
+		parentOperationId: null,
+		executionSegmentId: null,
+	});
+	const canonicalPath = `${lease.scope.canonicalRoot}/${name}.txt`;
+	const identity = createFileChangeIdentity(lease.scope, {
+		deviceId: lease.scope.deviceId,
+		pathFlavor: lease.scope.pathFlavor,
+		lexicalPath: canonicalPath,
+		canonicalPath,
+		objectRole: "entry",
+	});
+	const [effect] = await evidence.prepareEffects(operation.id, [
+		{
+			identity,
+			scopeRevision: lease.revision,
+			requestDigest,
+			before: { kind: "absent" },
+			intendedAfter: { kind: "absent" },
+		},
+	]);
+	if (!effect) throw new Error("effect not created");
+	await evidence.finalizePreparation(operation.id);
+	await evidence.markApplying({
+		operationId: operation.id,
+		mutationId: effect.mutationId,
+		requestDigest,
+		executionBinding: lease.binding,
+	});
+	return { evidence, operation, effect, canonicalPath, requestDigest };
 }
 
 function codeOf(error: unknown): string {
@@ -577,7 +644,7 @@ describe("PostgresWorkspaceLeaseStore concurrency (real PostgreSQL 17)", () => {
 				// The old generation is fenced out by BOTH the stale fence and the
 				// cleared owner — no mutation may land on the new lease's row.
 				const oldMutation = await settle(
-					storeA.registerMutation(leaseOf(scope, grantA, "lease-old", 0)),
+					storeA.registerMutation(leaseOf(scope, grantA, "lease-old", 0), "old-mutation"),
 				);
 				expect(oldMutation.ok).toBe(false);
 				expect(oldMutation.code).toBe("stale_lease");
@@ -589,7 +656,315 @@ describe("PostgresWorkspaceLeaseStore concurrency (real PostgreSQL 17)", () => {
 	);
 
 	it(
-		"settle and recovery race: the fence moves exactly once, old lease stays stale",
+		"range intersection is symmetric, path-aware, and independent of scope roots",
+		() =>
+			withPg(async ({ pgDb }) => {
+				const parent = makeScope("range-parent", {
+					canonicalRoot: "/range",
+					deviceId: "range-device",
+				});
+				const child = makeScope("range-child", {
+					canonicalRoot: "/range/child",
+					deviceId: parent.deviceId,
+				});
+				await seedScope(pgDb, parent);
+				await seedScope(pgDb, child);
+				const store = makeStore(pgDb, "range-owner");
+				const grant = await store.admitLease({
+					...claimOf(child, "range-A"),
+					ranges: [{ kind: "file", canonicalPath: "/range/child/A.txt" }],
+				});
+				await store.quarantineLease(leaseOf(child, grant, "range-A", 0));
+				// Child quarantine blocks a parent subtree (the historical asymmetric hole).
+				expect((await settle(store.admitLease(claimOf(parent, "parent-blocked")))).code).toBe(
+					"needs_verification",
+				);
+				const sibling = await store.admitLease({
+					...claimOf(parent, "sibling-B"),
+					ranges: [{ kind: "file", canonicalPath: "/range/child/B.txt" }],
+				});
+				await store.clearLease(leaseOf(parent, sibling, "sibling-B", 0));
+				expect(
+					(
+						await settle(
+							store.admitLease({
+								...claimOf(parent, "file-blocked"),
+								ranges: [{ kind: "file", canonicalPath: "/range/child/A.txt" }],
+							}),
+						)
+					).code,
+				).toBe("needs_verification");
+				// Segment boundaries: child2 is not a child of child; root defaults remain conservative.
+				const separate = await store.admitLease({
+					...claimOf(parent, "sibling-tree"),
+					ranges: [{ kind: "subtree", canonicalPath: "/range/child2" }],
+				});
+				await store.clearLease(leaseOf(parent, separate, "sibling-tree", 0));
+				const win = makeScope("range-windows", {
+					canonicalRoot: "C:\\Work",
+					pathFlavor: "windows",
+					deviceId: "win-device",
+				});
+				await seedScope(pgDb, win);
+				const winGrant = await store.admitLease({
+					...claimOf(win, "win-A"),
+					ranges: [{ kind: "file", canonicalPath: "C:\\Work\\A.txt" }],
+				});
+				await store.quarantineLease(leaseOf(win, winGrant, "win-A", 0));
+				expect(
+					(
+						await settle(
+							store.admitLease({
+								...claimOf(win, "win-blocked"),
+								ranges: [{ kind: "file", canonicalPath: "c:/work/a.TXT" }],
+							}),
+						)
+					).code,
+				).toBe("needs_verification");
+			}),
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"atomic A recovery preserves live B and rolls effects back when audit insertion fails",
+		() =>
+			withPg(async ({ pgDb, barrierClient, race }) => {
+				const scope = makeScope("atomic-recovery");
+				await seedScope(pgDb, scope);
+				const catalog = createPostgresFileChangeBlobCatalog({
+					db: pgDb,
+					namespaceKey: "atomic-recovery",
+				});
+				await catalog.initializeNamespace({ expectedGeneration: null, quotaBytes: 1_000_000 });
+				await catalog.beginReconciliation({ expectedGeneration: 0 });
+				await catalog.completeReconciliation({
+					expectedGeneration: 1,
+					verifiedUsedBytes: 0,
+					verification: {
+						namespaceIdentityVerified: true,
+						writersQuiescent: true,
+						physicalInventoryComplete: true,
+						catalogMatchesInventory: true,
+					},
+				});
+				const store = makeStore(pgDb, "atomic-owner");
+				const grantA = await store.admitLease({
+					...claimOf(scope, "atomic-A"),
+					ranges: [{ kind: "file", canonicalPath: `${scope.canonicalRoot}/A.txt` }],
+				});
+				const leaseA = leaseOf(scope, grantA, "atomic-A", 0);
+				const a = await seedApplyingEffect(pgDb, leaseA, "A");
+				await store.registerMutation(leaseA, a.effect.mutationId, {
+					operationId: a.operation.id,
+					effectId: a.effect.id,
+				});
+				const receipt = {
+					receiptId: "uncertain-A",
+					mutationId: a.effect.mutationId,
+					requestDigest: a.requestDigest,
+					executionBinding: leaseA.binding,
+					confirmed: false,
+					observedAfter: { kind: "absent" as const },
+					outcome: "unknown" as const,
+					localIo: {
+						version: 1 as const,
+						outcome: "target_mutation_unknown" as const,
+						createdParentCount: 0,
+						uncertainParentCount: 0,
+					},
+				};
+				await a.evidence.settleEffect({
+					operationId: a.operation.id,
+					mutationId: a.effect.mutationId,
+					requestDigest: a.requestDigest,
+					receipt,
+				});
+				await a.evidence.finishOperation(a.operation.id, "failed");
+				await store.settleMutation(
+					{ ...leaseA, pendingMutations: 1 },
+					a.effect.mutationId,
+					"unknown",
+				);
+				await store.clearLease(leaseA);
+				const [endedA] = await pgDb
+					.select()
+					.from(workspaceWriteLeases)
+					.where(eq(workspaceWriteLeases.leaseId, "atomic-A"));
+				expect(endedA?.status).toBe("quarantined");
+				expect(endedA?.executionEndedAt).not.toBeNull();
+				const grantB = await store.admitLease({
+					...claimOf(scope, "atomic-B"),
+					ranges: [{ kind: "file", canonicalPath: `${scope.canonicalRoot}/B.txt` }],
+				});
+				const leaseB = leaseOf(scope, grantB, "atomic-B", 0);
+				const b = await seedApplyingEffect(pgDb, leaseB, "B");
+				await store.registerMutation(leaseB, b.effect.mutationId, {
+					operationId: b.operation.id,
+					effectId: b.effect.id,
+				});
+				const scopeBefore = await readRow(pgDb, scope);
+				const [durableBBefore] = await pgDb
+					.select()
+					.from(workspaceWriteLeases)
+					.where(eq(workspaceWriteLeases.leaseId, "atomic-B"));
+				const beforeA = await a.evidence.getEffect(a.operation.id, a.effect.mutationId);
+				const beforeB = await b.evidence.getEffect(b.operation.id, b.effect.mutationId);
+				expect(beforeA?.executionReceiptJson).toEqual(receipt);
+				const input = {
+					scopeId: scope.id,
+					workspaceLeaseId: "atomic-A",
+					recoveredByUserId: "recovery-user",
+					decisions: [
+						{
+							effectId: a.effect.id,
+							canonicalPath: a.canonicalPath,
+							verdict: "not_applied" as const,
+							observedDigest: null,
+							observedSizeBytes: null,
+						},
+					],
+				};
+				// Missing actor FK fails at audit insertion AFTER effects were updated.
+				expect((await settle(a.evidence.closeBooksForRecovery(input))).ok).toBe(false);
+				expect(await a.evidence.getEffect(a.operation.id, a.effect.mutationId)).toEqual(beforeA);
+				expect(await readRow(pgDb, scope)).toEqual(scopeBefore);
+				expect(
+					(
+						await pgDb
+							.select()
+							.from(workspaceWriteLeases)
+							.where(eq(workspaceWriteLeases.leaseId, "atomic-A"))
+					)[0]?.status,
+				).toBe("quarantined");
+				expect(await pgDb.select().from(fileChangeScopeRecoveries)).toHaveLength(0);
+				await pgDb.insert(users).values({
+					id: "recovery-user",
+					username: "recovery-user",
+					passwordHash: "test-only",
+					createdAt: new Date().toISOString(),
+				});
+				// A caller cannot substitute B's effects or a scope-wide manifest.
+				expect(
+					(await settle(a.evidence.closeBooksForRecovery({ ...input, effectIds: [b.effect.id] })))
+						.ok,
+				).toBe(false);
+				const barrier = await holdDevice(barrierClient, scope.deviceId);
+				const first = await race("recover-A-first", (db) =>
+					createPostgresFileChangeEvidenceStore(db).closeBooksForRecovery(input),
+				);
+				const second = await race("recover-A-second", (db) =>
+					createPostgresFileChangeEvidenceStore(db).closeBooksForRecovery(input),
+				);
+				await waitForWaiter(pgDb, scope.deviceId, first);
+				await waitForWaiter(pgDb, scope.deviceId, second);
+				barrier.release();
+				const recovered = await Promise.all([first.outcome, second.outcome]);
+				await barrier.done;
+				expect(recovered.filter((result) => result.ok)).toHaveLength(1);
+				expect(recovered.find((result) => result.ok)?.value).toEqual({ settledEffectCount: 1 });
+				expect(await readRow(pgDb, scope)).toEqual(scopeBefore);
+				expect(await b.evidence.getEffect(b.operation.id, b.effect.mutationId)).toEqual(beforeB);
+				expect(
+					(
+						await pgDb
+							.select()
+							.from(workspaceWriteLeases)
+							.where(eq(workspaceWriteLeases.leaseId, "atomic-B"))
+					)[0],
+				).toEqual(durableBBefore);
+				const afterA = await a.evidence.getEffect(a.operation.id, a.effect.mutationId);
+				expect(afterA?.settlement).toBe("settled");
+				expect(afterA?.executionReceiptJson).toEqual(beforeA?.executionReceiptJson);
+				expect(afterA?.executionReceiptDigest).toBe(beforeA?.executionReceiptDigest);
+				expect((await a.evidence.getOperation(a.operation.id))?.executionOutcome).toBe("failed");
+				expect(
+					(
+						await pgDb
+							.select()
+							.from(workspaceWriteLeases)
+							.where(eq(workspaceWriteLeases.leaseId, "atomic-A"))
+					)[0]?.status,
+				).toBe("recovered");
+				const audits = await pgDb.select().from(fileChangeScopeRecoveries);
+				expect(audits).toHaveLength(1);
+				expect(audits[0]?.workspaceLeaseId).toBe("atomic-A");
+				expect(audits[0]?.effectDecisionsJson).toEqual(input.decisions);
+				await store.settleMutation(
+					{ ...leaseB, pendingMutations: 1 },
+					b.effect.mutationId,
+					"not_applied",
+				);
+				await store.clearLease(leaseB);
+				// Runtime's bootstrap registration may use operation.id before effect ids exist.
+				const grantC = await store.admitLease({
+					...claimOf(scope, "atomic-C"),
+					ranges: [{ kind: "file", canonicalPath: `${scope.canonicalRoot}/C.txt` }],
+				});
+				const leaseC = leaseOf(scope, grantC, "atomic-C", 0);
+				const c = await seedApplyingEffect(pgDb, leaseC, "C");
+				await store.registerMutation(leaseC, c.operation.id, { operationId: c.operation.id });
+				await store.quarantineLease({ ...leaseC, pendingMutations: 1 });
+				expect(
+					await c.evidence.closeBooksForRecovery({
+						scopeId: scope.id,
+						workspaceLeaseId: "atomic-C",
+						effectIds: [c.effect.id],
+						operationIds: [c.operation.id],
+						recoveredByUserId: "recovery-user",
+						decisions: [
+							{
+								effectId: c.effect.id,
+								canonicalPath: c.canonicalPath,
+								verdict: "not_applied",
+								observedDigest: null,
+								observedSizeBytes: null,
+							},
+						],
+					}),
+				).toEqual({ settledEffectCount: 1 });
+				expect((await c.evidence.getOperation(c.operation.id))?.settlement).toBe("settled");
+			}),
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"legacy foreign epoch never proves an executor dead",
+		() =>
+			withPg(async ({ pgDb }) => {
+				const scope = makeScope("legacy-owner");
+				await seedScope(pgDb, scope);
+				await pgDb
+					.update(fileChangeScopes)
+					.set({
+						activeLeaseId: "legacy-lease",
+						activeLeaseEpoch: "foreign-old",
+						activeLeaseStartedAt: "2000-01-01T00:00:00Z",
+						activeMutationCount: 1,
+						status: "needs_verification",
+					})
+					.where(eq(fileChangeScopes.id, scope.id));
+				const before = await readRow(pgDb, scope);
+				expect((await settle(makeStore(pgDb, "fresh-owner").recoverScopeBarrier(scope))).code).toBe(
+					"recovery_conflict",
+				);
+				expect(
+					(
+						await settle(
+							createPostgresFileChangeEvidenceStore(pgDb).closeBooksForRecovery({
+								scopeId: scope.id,
+								recoveredByUserId: "irrelevant",
+								decisions: [],
+							}),
+						)
+					).ok,
+				).toBe(false);
+				expect(await readRow(pgDb, scope)).toEqual(before);
+			}),
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"foreign recovery cannot steal an executing lease racing with settlement",
 		() =>
 			withPg(async ({ pgDb, barrierClient, race }) => {
 				const scope = makeScope("settle-recover");
@@ -597,12 +972,15 @@ describe("PostgresWorkspaceLeaseStore concurrency (real PostgreSQL 17)", () => {
 				const storeA = makeStore(pgDb, "conc-A");
 
 				const grantA = await storeA.admitLease(claimOf(scope, "lease-live"));
-				await storeA.registerMutation(leaseOf(scope, grantA, "lease-live", 0));
+				await storeA.registerMutation(leaseOf(scope, grantA, "lease-live", 0), "live-mutation");
 				expect((await readRow(pgDb, scope)).activeMutationCount).toBe(1);
 
 				const barrier = await holdDevice(barrierClient, scope.deviceId);
 				const settleRace = await race("settle", (db) =>
-					makeStore(db, "conc-A").settleMutation(leaseOf(scope, grantA, "lease-live", 1)),
+					makeStore(db, "conc-A").settleMutation(
+						leaseOf(scope, grantA, "lease-live", 1),
+						"live-mutation",
+					),
 				);
 				const recoverRace = await race("recover", (db) =>
 					makeStore(db, "conc-recoverer").recoverScopeBarrier(scope),
@@ -614,19 +992,19 @@ describe("PostgresWorkspaceLeaseStore concurrency (real PostgreSQL 17)", () => {
 				await barrier.done;
 
 				expect(settled.ok).toBe(true);
-				// Recovery serializes after the settle, then clears the foreign-epoch
-				// barrier exactly once. Revision: admit 1, settle keeps it, recovery
-				// bumps it once — the FENCE moves on recovery, which is the durable
-				// signal fencing the old generation out.
-				expect(recovered.ok).toBe(true);
-				expect(recovered.value).toEqual({ revision: 2, fencingToken: 2 });
+				// Neither the foreign epoch nor zero pending mutations proves that the
+				// executor ended. Only its finalizer can detach its current guard.
+				expect(recovered.ok).toBe(false);
+				expect(recovered.code).toBe("recovery_conflict");
 				const row = await readRow(pgDb, scope);
 				expect(row.status).toBe("active");
-				expect(row.activeLeaseId).toBeNull();
+				expect(row.activeLeaseId).toBe("lease-live");
+				expect(row.fencingToken).toBe(1);
+				expect(row.revision).toBe(1);
 				expect(row.activeMutationCount).toBe(0);
-				// The pre-recovery lease stays fenced out for every later section.
+				// A stale counter still prevents duplicate settlement.
 				const lateSettle = await settle(
-					storeA.settleMutation(leaseOf(scope, grantA, "lease-live", 1)),
+					storeA.settleMutation(leaseOf(scope, grantA, "lease-live", 1), "live-mutation"),
 				);
 				expect(lateSettle.ok).toBe(false);
 				expect(lateSettle.code).toBe("stale_lease");

@@ -54,6 +54,7 @@ import { detectShell } from "./shell";
 import {
 	groupToolExecutions,
 	isStrictSerialToolExecution,
+	selectStreamingToolExecutions,
 	settleToolExecutionResult,
 } from "./tool-execution-groups";
 import {
@@ -761,7 +762,6 @@ function normalizeSilentToolCallThreshold(value: number | undefined): number {
 const ABORT_EAGER_TOOL_DRAIN_TIMEOUT_MS = 100;
 
 const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
-	SHELL_TOOL_NAME,
 	"Execute",
 	"Agent",
 	// Await/Send coordinate with spawned agents. Executing them eagerly mid-stream would
@@ -769,8 +769,6 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	// registered/running state. Defer them to the ordered post-stream tool phase.
 	"Await",
 	"Send",
-	"Write",
-	"Edit",
 	"Browser",
 	"Terminal",
 	"ShareFile",
@@ -793,6 +791,19 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 
 function shouldEagerExecuteTool(tu: AgentToolUse): boolean {
 	if (EAGER_EXECUTION_DISABLED_TOOLS.has(tu.name)) return false;
+	// Ordinary Bash is ordered, not necessarily deferred until the response ends.
+	// Pipeline/plan transitions still need the complete assistant message.
+	if (isStrictSerial(tu) && tu.name !== SHELL_TOOL_NAME) return false;
+	// Virtual task writes can enter a reflection loop. Keep that decision after
+	// request finalization rather than reflecting against an incomplete response.
+	if (
+		(tu.name === "Write" || tu.name === "Edit") &&
+		typeof tu.input.file_path === "string" &&
+		tu.input.file_path.startsWith("spec://")
+	)
+		return false;
+	// A stopped but malformed argument stream is not executable input.
+	if ("_raw" in tu.input) return false;
 	// Reflection decision tools (TaskReflectConfirm/Revise, ExitPlanConfirm/Revise,
 	// DangerConfirm/Cancel, …) settle a pending decision whose resolution aborts the
 	// reflection loop's own AbortController. Executing them eagerly mid-stream aborts the
@@ -2408,13 +2419,16 @@ export async function* agentLoop(
 	// Permission checks must be serialized even when tools themselves are parallel-safe.
 	// This prevents concurrent permission prompts / danger reflection loops from racing each other.
 	const originalPermissionHandler = config.permissionHandler;
+	// A streamed tool may request reflection before the provider's current user
+	// turn has been appended to history. Supply that turn on a separate array.
+	let getPermissionHistory = (): unknown[] => history;
 	let permissionTail: Promise<void> = Promise.resolve();
 	config.permissionHandler = async (toolName, input, toolUseId, options) => {
 		const run = permissionTail.then(async () => {
 			const result = await originalPermissionHandler(toolName, input, toolUseId, options);
 			if (result.behavior !== "dangerReflection") return result;
 
-			return resolveDangerReflectionDecision(config, history, result, {
+			return resolveDangerReflectionDecision(config, getPermissionHistory(), result, {
 				toolUseId,
 				name: toolName,
 				input: result.input,
@@ -2935,6 +2949,17 @@ export async function* agentLoop(
 
 			const content = isFirstTurn ? userText : nextTurnContent;
 			nextTurnContent = ""; // consume once
+			getPermissionHistory = () => {
+				const reflectionHistory = [...history];
+				provider.pushUserTurn(
+					reflectionHistory,
+					content,
+					effectiveModel,
+					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					isFirstTurn ? images : undefined,
+				);
+				return reflectionHistory;
+			};
 
 			// Call provider and collect the response
 			let assistantText = "";
@@ -3014,19 +3039,6 @@ export async function* agentLoop(
 				}
 				return identity;
 			};
-			const hasPriorStrictSerialBarrier = (tu: AgentToolUse): boolean => {
-				const current = markCompletedToolUse(tu);
-				for (const identity of toolOrderIdentities.values()) {
-					if (
-						identity.toolUseId !== tu.toolUseId &&
-						identity.strictSerial &&
-						compareToolOrder(identity, current) < 0
-					) {
-						return true;
-					}
-				}
-				return false;
-			};
 			const sortToolUsesByOutputOrder = (): void => {
 				for (const toolUse of toolUses) markCompletedToolUse(toolUse);
 				toolUses.sort((a, b) => {
@@ -3064,6 +3076,48 @@ export async function* agentLoop(
 			const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
 			// Synchronously queryable map of settled early-exec results (populated via .then())
 			const settledResults = new Map<string, ToolExecResult>();
+			// Only fully persisted AND announced calls are candidates. A preceding input
+			// still streaming remains an ordering barrier even if a later call is ready.
+			const streamReadyTools = new Set<string>();
+			let streamExecutionOpen = false;
+			const pumpStreamingTools = (): void => {
+				if (
+					!streamExecutionOpen ||
+					config.signal.aborted ||
+					config.deferEagerToolsForSafeStop === true ||
+					observeSoftStopForTurn()
+				)
+					return;
+				const completed = new Map(toolUses.map((tu) => [tu.toolUseId, tu]));
+				const candidates = selectStreamingToolExecutions(
+					[...toolOrderIdentities.values()].sort(compareToolOrder).map((identity) => {
+						const tool = completed.get(identity.toolUseId);
+						const result = settledResults.get(identity.toolUseId);
+						return {
+							tool,
+							ready: streamReadyTools.has(identity.toolUseId),
+							started: earlyExecMap.has(identity.toolUseId),
+							settled: result !== undefined,
+							fatal: result?.fatal,
+							allowed: tool !== undefined && shouldEagerExecuteTool(tool),
+						};
+					}),
+				);
+				for (const tu of candidates) {
+					// Register only actual starts, never promises for queued tools: the
+					// cut-in/abort paths must distinguish running work from skippable work.
+					const execution = settleToolExecutionResult(
+						executeToolAfterReflections(tu, config, history, locale),
+					);
+					earlyExecMap.set(tu.toolUseId, execution);
+					void execution.then((result) => {
+						settledResults.set(tu.toolUseId, result);
+						// Includes the after-snapshot boundary, so a dependent write can
+						// start safely even while the provider is waiting for another token.
+						pumpStreamingTools();
+					});
+				}
+			};
 			// Track which tool_results have already been yielded during streaming
 			const yieldedToolResults = new Set<string>();
 			// Track tool calls whose input was broken (output cut off mid-stream)
@@ -3123,6 +3177,31 @@ export async function* agentLoop(
 			let lastStopReason: string | undefined;
 			const namelessToolUseIds = new Set<string>();
 
+			function earlyToolResultEvent(
+				tu: AgentToolUse,
+				settled: ToolExecResult,
+			): Extract<AgentEvent, { type: "tool_result" }> {
+				const brokenOverride = settled.broken
+					? sanitizeBrokenInput(tu.name, settled.updatedInput ?? tu.input, locale)
+					: undefined;
+				return {
+					type: "tool_result",
+					toolCallBinding: executionBindings.get(tu),
+					toolUseId: tu.toolUseId,
+					toolName: tu.name,
+					input: settled.updatedInput ?? tu.input,
+					output: settled.broken ? getToolMessage("brokenToolCallResult", locale) : settled.output,
+					isError: settled.isError ?? false,
+					durationMs: settled.durationMs,
+					permissionStartedAt: settled.permissionStartedAt,
+					executionStartedAt: settled.executionStartedAt,
+					completedAt: settled.completedAt,
+					brokenInputOverride: brokenOverride,
+					updatedInput: brokenOverride ?? settled.updatedInput,
+					metadata: settled.metadata,
+				};
+			}
+
 			async function* drainSettledEarlyToolResults(): AsyncGenerator<AgentEvent> {
 				for (const tu of toolUses) {
 					const settled = settledResults.get(tu.toolUseId);
@@ -3130,29 +3209,37 @@ export async function* agentLoop(
 					yieldedToolResults.add(tu.toolUseId);
 					if (settled.broken) brokenToolUseIds.add(tu.toolUseId);
 					if (settled.updatedInput) tu.input = settled.updatedInput;
-					const brokenOverride = settled.broken
-						? sanitizeBrokenInput(tu.name, tu.input, locale)
-						: undefined;
 					await processToolResultInjections(tu, settled);
-					const baseOutput = settled.broken
-						? getToolMessage("brokenToolCallResult", locale)
-						: settled.output;
-					yield {
-						type: "tool_result",
-						toolCallBinding: executionBindings.get(tu),
-						toolUseId: tu.toolUseId,
-						toolName: tu.name,
-						input: settled.updatedInput ?? tu.input,
-						output: baseOutput,
-						isError: settled.isError ?? false,
-						durationMs: settled.durationMs,
-						permissionStartedAt: settled.permissionStartedAt,
-						executionStartedAt: settled.executionStartedAt,
-						completedAt: settled.completedAt,
-						brokenInputOverride: brokenOverride,
-						updatedInput: brokenOverride ?? settled.updatedInput,
-						metadata: settled.metadata,
-					};
+					yield earlyToolResultEvent(tu, settled);
+				}
+			}
+
+			const detachedToolResults = new Set<string>();
+			function detachStartedEarlyToolResults(): void {
+				const persist = config.onDetachedToolResult;
+				if (!persist) return;
+				for (const tu of toolUses) {
+					const execution = earlyExecMap.get(tu.toolUseId);
+					if (
+						!execution ||
+						yieldedToolResults.has(tu.toolUseId) ||
+						detachedToolResults.has(tu.toolUseId)
+					)
+						continue;
+					detachedToolResults.add(tu.toolUseId);
+					// The executor still owns its IO, leases and after snapshot. Keep its
+					// final result alive without holding up interruption or emitting into
+					// a stream that may already belong to the narrator's next run.
+					void execution
+						.then((settled) => persist(earlyToolResultEvent(tu, settled)))
+						.catch((error) => {
+							logger.error("Failed to persist detached tool result", {
+								narratorId: config.narratorId,
+								toolUseId: tu.toolUseId,
+								toolCallId: executionBindings.get(tu)?.toolCallId,
+								error: String(error),
+							});
+						});
 				}
 			}
 
@@ -3182,6 +3269,7 @@ export async function* agentLoop(
 					]);
 				}
 				yield* drainSettledEarlyToolResults();
+				detachStartedEarlyToolResults();
 			}
 
 			function hasStartedEarlyToolExecution(): boolean {
@@ -3366,6 +3454,7 @@ export async function* agentLoop(
 			}
 
 			function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
+				streamExecutionOpen = false;
 				if (!requestStarted) return;
 				// Retract the live tool cards this request published but never completed.
 				//
@@ -3794,6 +3883,8 @@ export async function* agentLoop(
 				credentialId = undefined;
 				earlyExecMap.clear();
 				settledResults.clear();
+				streamReadyTools.clear();
+				streamExecutionOpen = false;
 				// Leak-detection dump flag is per successful attempt; clear stale state so a
 				// retry that no longer leaks does not force-persist the previous attempt's dump.
 				forceDumpPersist = false;
@@ -3927,7 +4018,26 @@ export async function* agentLoop(
 						...(isFirstTurn && images?.length ? { images } : {}),
 					});
 
+					streamExecutionOpen = true;
 					for await (const parsed of stream) {
+						// Stop dispatch before yielding/awaiting error publication. A finishing
+						// tool must not release more queued work while failure handling runs.
+						if (parsed.invalidState || parsed.silentDisconnect) streamExecutionOpen = false;
+						// Make every identity in this provider event visible before ANY yield.
+						// Completed calls and an earlier unfinished chunk may arrive together.
+						for (const tu of parsed.toolUses ?? []) {
+							tu.name = canonicalizeToolName(tu.name);
+							markCompletedToolUse(tu);
+						}
+						if (parsed.toolUseChunk?.toolUseId) {
+							registerToolOrderIdentity({
+								toolUseId: parsed.toolUseChunk.toolUseId,
+								name: parsed.toolUseChunk.name
+									? canonicalizeToolName(parsed.toolUseChunk.name)
+									: undefined,
+								outputIndex: parsed.toolUseChunk.outputIndex,
+							});
+						}
 						yield* flushRequestStart();
 						const hasMeaningfulEvent = isMeaningfulStreamEvent(parsed);
 						// Evidence for the empty-response guard: count every event and note
@@ -3994,9 +4104,6 @@ export async function* agentLoop(
 							citationAccum.add(parsed.textCitations, textItemBaseOffsets.get(key) ?? 0);
 						}
 						if (parsed.toolUses) {
-							// Legacy alias → canonical name, before anything keys off the name
-							// (order identity, TOOL_FIELD_CONFIG, registry lookup, persistence).
-							for (const tu of parsed.toolUses) tu.name = canonicalizeToolName(tu.name);
 							// ── Tool use dedup ──
 							// Some providers (notably NUG) may emit the same tool call
 							// via BOTH the non-streaming `parsed.toolUses` array AND the streaming
@@ -4057,34 +4164,14 @@ export async function* agentLoop(
 									} satisfies ContentBlock,
 								};
 
-								// Start eager execution (same as the streaming stop path).
-								// Skip after a strict-serial barrier — those tools must execute
-								// in final group order after preceding tools complete.
-								if (
-									config.deferEagerToolsForSafeStop !== true &&
-									!observeSoftStopForTurn() &&
-									!earlyExecMap.has(tu.toolUseId) &&
-									!isStrictSerial(tu) &&
-									!hasPriorStrictSerialBarrier(tu) &&
-									shouldEagerExecuteTool(tu)
-								) {
-									const execPromise = executeTool(tu, config).catch(
-										(err): ToolExecResult => ({
-											output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
-											isError: true,
-											durationMs: 0,
-										}),
-									);
-									execPromise.then((r) => settledResults.set(tu.toolUseId, r));
-									earlyExecMap.set(tu.toolUseId, execPromise);
-								}
-
 								yield {
 									type: "tool_call",
 									toolUseId: tu.toolUseId,
 									toolName: tu.name,
 									input: tu.input,
 								};
+								streamReadyTools.add(tu.toolUseId);
+								pumpStreamingTools();
 							}
 						}
 
@@ -4414,38 +4501,6 @@ export async function* agentLoop(
 											} satisfies ContentBlock,
 										};
 
-										// Start tool execution eagerly (don't await — collect later).
-										// Wrap with .catch() so a rejected permissionHandler doesn't
-										// create an unhandled rejection; the error surfaces as isError.
-										// The .then() populates settledResults synchronously so the
-										// streaming loop can drain completed results without awaiting.
-										// Skip after a strict-serial barrier — those tools must execute
-										// in final group order after preceding tools complete.
-										//
-										// A pending soft stop also suppresses the eager start: the
-										// queued cut-in is meant to be answered after the tool that
-										// was running when it arrived, and an eagerly started tool is
-										// awaited (not skipped) by the execution phase below. Without
-										// this gate every remaining tool of the turn still runs, which
-										// is what made a cut-in look like it landed a request late.
-										if (
-											config.deferEagerToolsForSafeStop !== true &&
-											!observeSoftStopForTurn() &&
-											!isStrictSerial(tu) &&
-											!hasPriorStrictSerialBarrier(tu) &&
-											shouldEagerExecuteTool(tu)
-										) {
-											const execPromise = executeTool(tu, config).catch(
-												(err): ToolExecResult => ({
-													output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
-													isError: true,
-													durationMs: 0,
-												}),
-											);
-											execPromise.then((r) => settledResults.set(id, r));
-											earlyExecMap.set(id, execPromise);
-										}
-
 										// Notify frontend the tool has started
 										yield {
 											type: "tool_call",
@@ -4455,6 +4510,8 @@ export async function* agentLoop(
 											streamStartedAt: acc.startedAt,
 											streamCompletedAt: acc.streamCompletedAt,
 										};
+										streamReadyTools.add(id);
+										pumpStreamingTools();
 
 										// Drain any tool results that settled during streaming.
 										// This lets fast tools (Read, Glob, etc.) report completion
@@ -4500,6 +4557,7 @@ export async function* agentLoop(
 						}
 
 						if (parsed.silentDisconnect) {
+							yield* drainStartedEarlyToolResults();
 							yield* finishRequest("Silent disconnect");
 							yield { type: "silent_disconnect" };
 							return;
@@ -5130,6 +5188,7 @@ export async function* agentLoop(
 							// error surfaces to the user instead of being masked by the
 							// downstream empty-response check (which would retry and eventually
 							// report a misleading "Provider returned an empty response" message).
+							yield* drainStartedEarlyToolResults();
 							sawErrorEvent = true;
 							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 							yield* finishRequest(message);
@@ -5142,8 +5201,10 @@ export async function* agentLoop(
 							return;
 						}
 					}
+					streamExecutionOpen = false;
 					yield* flushRequestStart();
 				} catch (err) {
+					streamExecutionOpen = false;
 					if (config.signal.aborted) {
 						// Let already-fulfilled eager tool promises publish into `settledResults`,
 						// then persist their completed results before surfacing the abort.  Without
@@ -5151,8 +5212,8 @@ export async function* agentLoop(
 						// already finished execution stuck as running/interrupted in history.
 						await Promise.resolve();
 						yield* drainEarlyToolResultsAfterAbort();
-						// Do not await still-running eager tools beyond the bounded abort drain. Their
-						// execution cleanup is handled by the tool executor.
+						// Do not await still-running eager tools beyond the bounded abort drain. The
+						// executor finishes cleanup; the detached callback preserves the exact result.
 						// Even on abort, yield block_complete for accumulated content so it can be persisted
 						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 						yield* finishRequest("Aborted");
@@ -5598,12 +5659,15 @@ export async function* agentLoop(
 						yield { type: "retryable_error", message: msg, diagnostics: requestDiagnostics };
 						return;
 					}
-					// Non-retryable error — persist partial content and signal caller
+					// Non-retryable error — retain already-started side effects, but never
+					// dispatch queued calls merely to finish a failed response.
+					yield* drainStartedEarlyToolResults();
 					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 					yield* finishRequest(msg);
 					yield { type: "error", message: msg, diagnostics: requestDiagnostics };
 					return;
 				} finally {
+					streamExecutionOpen = false;
 					clearFirstTokenTimer();
 					config.signal.removeEventListener("abort", onParentAbort);
 					startFirstTokenTimerForAttempt = undefined;
@@ -6350,6 +6414,10 @@ export async function* agentLoop(
 				provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
 			}
 
+			// The current input now lives in history; pending permissions must not
+			// append it a second time when they resolve after stream completion.
+			getPermissionHistory = () => history;
+
 			// Execute each tool call
 			pendingToolResults = [];
 			// Nudge threshold: append a wrap-up reminder when ≥80% of maxTurns used
@@ -6382,6 +6450,17 @@ export async function* agentLoop(
 					// Serial execution (single tool)
 					const tu = group[0];
 					const earlyPromise = earlyExecMap.get(tu.toolUseId);
+					if (!streamReadyTools.has(tu.toolUseId)) {
+						yield {
+							type: "tool_call",
+							toolUseId: tu.toolUseId,
+							toolName: tu.name,
+							input: tu.input,
+							streamStartedAt: tu.streamStartedAt,
+							streamCompletedAt: tu.streamCompletedAt,
+						};
+						streamReadyTools.add(tu.toolUseId);
+					}
 					// settleToolExecutionResult converts a genuine rejection into a formal
 					// isError ToolExecResult so a throwing serial tool never aborts the loop.
 					const result = await settleToolExecutionResult(
@@ -6419,17 +6498,6 @@ export async function* agentLoop(
 							return;
 						}
 					} else {
-						// Only yield tool_call if not already yielded during streaming
-						if (!earlyPromise) {
-							yield {
-								type: "tool_call",
-								toolUseId: tu.toolUseId,
-								toolName: tu.name,
-								input: tu.input,
-								streamStartedAt: tu.streamStartedAt,
-							};
-						}
-
 						// For tools with streamStartedAt, compute display duration as
 						// total elapsed minus time spent executing preceding tools.
 						let durationMs = result.durationMs;
@@ -6446,6 +6514,7 @@ export async function* agentLoop(
 							? sanitizeBrokenInput(tu.name, tu.input, locale)
 							: undefined;
 
+						yieldedToolResults.add(tu.toolUseId);
 						yield {
 							type: "tool_result",
 							toolCallBinding: executionBindings.get(tu),
@@ -6457,6 +6526,9 @@ export async function* agentLoop(
 								: result.output,
 							isError: result.isError ?? false,
 							durationMs,
+							permissionStartedAt: result.permissionStartedAt,
+							executionStartedAt: result.executionStartedAt,
+							completedAt: result.completedAt,
 							brokenInputOverride,
 							updatedInput: brokenInputOverride ?? result.updatedInput,
 							metadata:
@@ -6475,7 +6547,7 @@ export async function* agentLoop(
 					// Parallel execution (multiple Task calls)
 					// Yield tool_call events for tools not already started during streaming
 					for (const tu of group) {
-						if (!earlyExecMap.has(tu.toolUseId) && !yieldedToolResults.has(tu.toolUseId)) {
+						if (!streamReadyTools.has(tu.toolUseId) && !yieldedToolResults.has(tu.toolUseId)) {
 							yield {
 								type: "tool_call",
 								toolUseId: tu.toolUseId,

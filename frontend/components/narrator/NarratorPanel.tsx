@@ -1374,11 +1374,11 @@ export function NarratorPanel({
 	// Open (not toggle) the spec panel — used by the current-task status bar so a
 	// click always reveals the task list rather than closing an open panel.
 	const openSpecTool = useCallback(() => {
-		if (useDockSpec) dock.openToolPanel("spec");
+		if (useDockSpec) dockOpenToolPanel?.("spec");
 		else if (onToggleSpecPanel) {
 			if (!specToolOpened) onToggleSpecPanel();
 		} else setInternalSpecOpen(true);
-	}, [useDockSpec, dock, onToggleSpecPanel, specToolOpened]);
+	}, [useDockSpec, dockOpenToolPanel, onToggleSpecPanel, specToolOpened]);
 	// Stable handle so the viewport `spec-open-tasks` listener can call the latest
 	// openSpecTool without re-subscribing on every dependency change.
 	const openSpecToolRef = useRef(openSpecTool);

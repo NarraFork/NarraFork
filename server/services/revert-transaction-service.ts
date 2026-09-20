@@ -296,13 +296,15 @@ export class RevertTransactionService {
 		const started = performance.now();
 		let responseTimer: ReturnType<typeof setTimeout> | undefined;
 		let stopResponse: () => void = () => {};
-		const body = this.run(run).finally(() => {
-			this.active--;
-			clearTimeout(deadline);
-			if (responseTimer) clearTimeout(responseTimer);
-			controller.signal.removeEventListener("abort", stopResponse);
-			input.signal?.removeEventListener("abort", abort);
-		});
+		const body = this.options.runtime
+			.withNamespaceAccess(() => this.run(run))
+			.finally(() => {
+				this.active--;
+				clearTimeout(deadline);
+				if (responseTimer) clearTimeout(responseTimer);
+				controller.signal.removeEventListener("abort", stopResponse);
+				input.signal?.removeEventListener("abort", abort);
+			});
 		const limited = new Promise<RevertTransactionOutcome>((resolve, reject) => {
 			stopResponse = () => {
 				responseTimer = setTimeout(() => {

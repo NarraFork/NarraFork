@@ -102,6 +102,30 @@ export interface VListRowHandlers {
 }
 
 /**
+ * Only callbacks captured by row actions invalidate every bound row. The wrapper
+ * object, document indices and queued resolver are not captured: their per-row
+ * results are compared in the interaction payload instead.
+ */
+export function rowActionHandlerDependencies(
+	handlers: VListRowHandlers | undefined,
+): readonly unknown[] {
+	return [
+		handlers?.onForkFromMessage,
+		handlers?.onAskInPassing,
+		handlers?.onCompactBeforeMessage,
+		handlers?.onClearContextBefore,
+		handlers?.onManualSummarize,
+		handlers?.onDeleteBlock,
+		handlers?.onRollbackToBlock,
+		handlers?.onEditMessage,
+		handlers?.onViewSubagentSession,
+		handlers?.onDetachSubagent,
+		handlers?.onCancelBackgroundTask,
+		handlers?.onOpenFilePanel,
+	];
+}
+
+/**
  * The card-specific (command-style) actions a row's menu may offer, already
  * bound to that row's tool. Unlike MessageContextMenuActions these are NOT
  * message-level: they act on the row's tool call / child narrator, mirroring the

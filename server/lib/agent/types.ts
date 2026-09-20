@@ -79,6 +79,14 @@ export interface ToolCallBinding {
 	readonly executionSegmentId?: string;
 }
 
+/** Awaited execution boundary, after authorization and final admission (not UI events). */
+export interface ToolExecutionLifecycleContext {
+	toolUse: AgentToolUse;
+	effectiveInput: Record<string, unknown>;
+	executionTarget?: ToolExecutionTarget;
+	binding?: ToolCallBinding;
+}
+
 export interface ToolContext {
 	/** Eval-only audited Read bridge; never exposes the runner configuration. */
 	executeRead?: (input: Record<string, unknown>, signal: AbortSignal) => Promise<ToolResult>;
@@ -964,6 +972,18 @@ export interface AgentConfig {
 		binding: ToolCallBinding,
 		result: ToolResult & { durationMs?: number },
 	) => Promise<void>;
+	/** Fail-open observation after authorization/final admission, before the durable start claim. */
+	onToolExecutionBefore?: (context: ToolExecutionLifecycleContext) => Promise<void> | void;
+	/** Paired cleanup, including thrown/aborted execution; awaited before executeTool settles. */
+	onToolExecutionAfter?: (
+		context: ToolExecutionLifecycleContext & { result?: ToolResult; error?: unknown },
+	) => Promise<void> | void;
+	/**
+	 * Persist an already-started tool's final result after the bounded abort drain
+	 * closed its event consumer. Never routes through a newer run's streaming state
+	 * or runs model/context hooks. The host must fence writes by toolCallBinding.
+	 */
+	onDetachedToolResult?: (event: Extract<AgentEvent, { type: "tool_result" }>) => Promise<void>;
 	/** Durable single-start claim immediately before tool.execute, after authorization. */
 	onToolExecutionStarting?: (
 		toolUseId: string,

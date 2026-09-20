@@ -14,6 +14,7 @@
  */
 import { extname } from "node:path";
 import { z } from "zod/v4";
+import { toolSpecPathError } from "../../../spec-uri";
 import { withDeviceParam } from "../../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../../execution/path-resolve";
 import { getToolBackend } from "../../execution/tool-backend";
@@ -195,6 +196,8 @@ export const structViewTool: ToolDefinition = {
 	metadata: { readOnly: true },
 
 	async execute(args, ctx): Promise<ToolResult> {
+		const specError = toolSpecPathError("StructView", args);
+		if (specError) return { output: specError, isError: true };
 		const filePath = typeof args.file_path === "string" ? args.file_path : "";
 		const mode: Mode = MODES.includes(args.mode as Mode) ? (args.mode as Mode) : "outline";
 

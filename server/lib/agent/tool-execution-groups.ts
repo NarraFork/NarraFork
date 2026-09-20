@@ -117,6 +117,40 @@ export function groupToolExecutions<T extends ToolExecutionGroupItem>(items: rea
 }
 
 /**
+ * Select work from the first unfinished group in provider order. Callers must retain
+ * every observed identity (including incomplete calls) and mark selections started
+ * before selecting again. This function does not mutate its inputs.
+ *
+ * Incomplete, deferred, and fatal calls stop the eligible prefix, even inside a
+ * parallel group. Complete members before that boundary may still start. Running
+ * parallel groups can accept new siblings, but later groups wait for all members
+ * to settle. A settled nonfatal call is no longer deferred, regardless of allowed.
+ */
+export function selectStreamingToolExecutions<T extends ToolExecutionGroupItem>(
+	items: readonly {
+		tool?: T;
+		ready: boolean;
+		started: boolean;
+		settled: boolean;
+		fatal?: boolean;
+		allowed: boolean;
+	}[],
+): T[] {
+	const prefix = [];
+	for (const item of items) {
+		const { tool } = item;
+		if (!tool || !item.ready || item.fatal || (!item.allowed && !item.settled)) break;
+		prefix.push({ toolName: getToolName(tool), input: tool.input, tool, state: item });
+	}
+
+	for (const group of groupToolExecutions(prefix)) {
+		if (group.every(({ state }) => state.settled)) continue;
+		return group.filter(({ state }) => !state.started && !state.settled).map(({ tool }) => tool);
+	}
+	return [];
+}
+
+/**
  * Resolve a tool execution promise into a settled ToolExecResult, guaranteeing it never
  * rejects. A genuine rejection thrown from executeTool/executeToolAfterReflections becomes
  * a formal isError result so parallel siblings keep yielding/persisting and the model still

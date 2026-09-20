@@ -45,7 +45,11 @@ import {
  * verdict plus a findings list, and one clamped line could show neither those findings
  * nor the action button the card needs.
  */
-export type SystemSimpleKind = "compact" | "segment_compact" | "merge_summary";
+export type SystemSimpleKind =
+	| "compact"
+	| "segment_compact"
+	| "merge_summary"
+	| "publication_result";
 
 /**
  * Render payload carried on the prepared block. Height is fully determined by
@@ -55,6 +59,9 @@ export type SystemSimpleKind = "compact" | "segment_compact" | "merge_summary";
 export interface SystemSimpleData {
 	/** The single line of display text (pre-composed by the caller). */
 	text: string;
+	snapshotText?: string;
+	messageId?: string;
+	publicationResult?: { truncated: boolean };
 	/** Live compact labels used to repaint the fixed-height marker without relayout. */
 	compactLabels?: {
 		compacting: string;
@@ -122,6 +129,7 @@ export const MERGE_SUMMARY_CARD_HEIGHT = CARD_PADDING * 2 + CARD_ROW_CONTENT; //
  * A frozen record, so measurement must NOT read it — see {@link systemSimpleCardHeight}.
  */
 export const SYSTEM_SIMPLE_CARD_HEIGHTS: Record<SystemSimpleKind, number> = {
+	publication_result: COMPACT_CARD_HEIGHT,
 	compact: COMPACT_CARD_HEIGHT,
 	segment_compact: SEGMENT_COMPACT_CARD_HEIGHT,
 	merge_summary: MERGE_SUMMARY_CARD_HEIGHT,
@@ -138,6 +146,7 @@ export const SYSTEM_SIMPLE_CARD_HEIGHTS: Record<SystemSimpleKind, number> = {
 export function systemSimpleCardHeight(kind: SystemSimpleKind): number {
 	switch (kind) {
 		case "compact":
+		case "publication_result":
 			return compactCardHeight();
 		case "segment_compact":
 			return segmentCompactCardHeight();

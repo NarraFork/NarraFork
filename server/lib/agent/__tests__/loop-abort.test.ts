@@ -36,6 +36,20 @@ let readStartedBeforeEnterPlanStop = false;
 let releasePendingTool: (() => void) | undefined;
 const parallelAbortResolvers: Array<() => void> = [];
 
+function createGate() {
+	let resolve!: () => void;
+	const promise = new Promise<void>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
+
+let serialToolsCompleted: ReturnType<typeof createGate> | undefined;
+let parallelToolsStarted = createGate();
+let writeExecutionGate:
+	| { started: ReturnType<typeof createGate>; release: ReturnType<typeof createGate> }
+	| undefined;
+
 function releasePendingToolIfAny(): void {
 	const release = releasePendingTool;
 	if (release) release();
@@ -122,7 +136,7 @@ const testProvider: ProviderAdapter = {
 						name: "Edit",
 						input: { file_path: "first.txt", old_string: "first", new_string: "changed" },
 					},
-					{ toolUseId: "tu_read_started", name: "Read", input: { file_path: "started.txt" } },
+					{ toolUseId: "tu_read_must_skip", name: "Read", input: { file_path: "must-skip.txt" } },
 				],
 			};
 			return;
@@ -230,6 +244,11 @@ const testProvider: ProviderAdapter = {
 				{ toolUseId: "tu_done_2", name: TEST_TOOL_NAME, input: { value: "two" } },
 			],
 		};
+		// These interruption fixtures require BOTH serial calls to have actually run.
+		// Receiving toolUses is not evidence that a later execution group has started.
+		if (providerScenario === "abort" || providerScenario === "codex_rebuild_after_tool") {
+			await serialToolsCompleted?.promise;
+		}
 		if (providerScenario === "codex_rebuild_after_tool") {
 			throw new CodexRebuildHistoryRetryError("The usage limit has been reached", {
 				previousCredentialId: "cred-a",
@@ -293,6 +312,8 @@ toolRegistry.register({
 				releasePendingTool = () => resolve({ output: `completed:${args.value}` });
 			});
 		}
+		completedToolValues.push(`serial:${args.value}`);
+		if (args.value === "two") serialToolsCompleted?.resolve();
 		return { output: `completed:${args.value}` };
 	},
 });
@@ -327,7 +348,10 @@ toolRegistry.register({
 			providerScenario === "parallel_then_serial_abort" &&
 			(args.file_path === "parallel-1.txt" || args.file_path === "parallel-2.txt")
 		) {
-			await new Promise<void>((resolve) => parallelAbortResolvers.push(resolve));
+			await new Promise<void>((resolve) => {
+				parallelAbortResolvers.push(resolve);
+				if (parallelAbortResolvers.length === 2) parallelToolsStarted.resolve();
+			});
 		}
 		completedToolValues.push(`read:${args.file_path}`);
 		return { output: `read:${args.file_path}` };
@@ -340,6 +364,11 @@ toolRegistry.register({
 	parameters: z.object({ file_path: z.string(), content: z.string() }),
 	execute: async (args) => {
 		executedToolValues.push(`write:${args.file_path}`);
+		if (writeExecutionGate) {
+			writeExecutionGate.started.resolve();
+			await writeExecutionGate.release.promise;
+		}
+		completedToolValues.push(`write:${args.file_path}`);
 		return { output: `write:${args.file_path}` };
 	},
 });
@@ -383,16 +412,21 @@ describe("agentLoop abort result draining", () => {
 	test("保留中断前已完成 eager tool call 的成功状态", async () => {
 		providerScenario = "abort";
 		providerAttempts = 0;
+		executedToolValues.length = 0;
+		completedToolValues.length = 0;
+		serialToolsCompleted = createGate();
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
 		for await (const event of agentLoop(makeConfig(ac.signal), "run tools then answer", [])) {
 			events.push(event);
 			if (event.type === "stream_text") {
-				await Promise.resolve();
+				expect(executedToolValues).toEqual(["serial:one", "serial:two"]);
+				expect(completedToolValues).toEqual(["serial:one", "serial:two"]);
 				ac.abort();
 			}
 		}
+		serialToolsCompleted = undefined;
 
 		const toolResults = events.filter((event) => event.type === "tool_result");
 		expect(toolResults).toHaveLength(2);
@@ -550,7 +584,7 @@ describe("agentLoop abort result draining", () => {
 		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
 
-	test("soft-stop 只等待已 eager 启动的工具并跳过夹在中间的副作用工具", async () => {
+	test("soft-stop 等待已 eager 启动的 Write 并跳过后续 Edit 和 Read", async () => {
 		providerScenario = "soft_stop_interleaved";
 		providerAttempts = 0;
 		executedToolValues.length = 0;
@@ -559,13 +593,20 @@ describe("agentLoop abort result draining", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		// Only the trailing Read is eager-eligible here (Write/Edit are excluded from
-		// eager execution), so the stop is armed once that Read has actually started.
-		// That is the state this test exists for: one tool already running, a
-		// side-effect tool sandwiched before it that must never run.
+		// Request stop while Write is genuinely running, before allowing it to finish.
+		// Later groups must not overtake that write or acquire side effects after stop.
+		const gate = { started: createGate(), release: createGate() };
+		writeExecutionGate = gate;
+		let stopRequested = false;
+		let completedWhenStopRequested: string[] = [];
+		const requestStop = gate.started.promise.then(() => {
+			completedWhenStopRequested = [...completedToolValues];
+			stopRequested = true;
+			gate.release.resolve();
+		});
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, {
-				shouldStop: () => executedToolValues.includes("read:started.txt"),
+				shouldStop: () => stopRequested,
 			}),
 			"stop without running an unstarted edit",
 			[],
@@ -573,9 +614,11 @@ describe("agentLoop abort result draining", () => {
 			events.push(event);
 		}
 
-		expect(executedToolValues).toContain("write:first.txt");
-		expect(executedToolValues).toContain("read:started.txt");
-		expect(executedToolValues).not.toContain("edit:first.txt");
+		await requestStop;
+		writeExecutionGate = undefined;
+		expect(completedWhenStopRequested).toEqual([]);
+		expect(executedToolValues).toEqual(["write:first.txt"]);
+		expect(completedToolValues).toEqual(["write:first.txt"]);
 		const toolResults = events.filter(
 			(event): event is Extract<AgentEvent, { type: "tool_result" }> =>
 				event.type === "tool_result",
@@ -584,7 +627,17 @@ describe("agentLoop abort result draining", () => {
 			isError: true,
 			metadata: { skippedForSoftStop: true },
 		});
-		expect(toolResults.find((event) => event.toolUseId === "tu_read_started")?.isError).toBe(false);
+		expect(toolResults.map((event) => event.toolUseId)).toEqual([
+			"tu_write_before_stop",
+			"tu_edit_must_skip",
+			"tu_read_must_skip",
+		]);
+		expect(toolResults[0]).toMatchObject({ isError: false, output: "write:first.txt" });
+		expect(toolResults[0]?.metadata?.skippedForSoftStop).toBeUndefined();
+		expect(toolResults[2]).toMatchObject({
+			isError: true,
+			metadata: { skippedForSoftStop: true },
+		});
 		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
 
@@ -620,14 +673,15 @@ describe("agentLoop abort result draining", () => {
 		providerAttempts = 0;
 		executedToolValues.length = 0;
 		completedToolValues.length = 0;
+		parallelToolsStarted = createGate();
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
+		// assistant_message can precede execute(): release only after both reads
+		// installed their resolvers, without blocking the event consumer itself.
+		const releaseReads = parallelToolsStarted.promise.then(releaseParallelAbortTools);
 
 		for await (const event of agentLoop(makeConfig(ac.signal), "abort between tool groups", [])) {
 			events.push(event);
-			if (event.type === "assistant_message") {
-				releaseParallelAbortTools();
-			}
 			if (
 				event.type === "tool_result" &&
 				(event.toolUseId === "tu_parallel_abort_1" || event.toolUseId === "tu_parallel_abort_2")
@@ -642,6 +696,9 @@ describe("agentLoop abort result draining", () => {
 					event.type === "tool_result",
 			)
 			.map((event) => event.toolUseId);
+		await releaseReads;
+		expect(executedToolValues).toEqual(["read:parallel-1.txt", "read:parallel-2.txt"]);
+		expect(completedToolValues).toEqual(["read:parallel-1.txt", "read:parallel-2.txt"]);
 		expect(toolResultIds).toEqual(["tu_parallel_abort_1", "tu_parallel_abort_2"]);
 		expect(new Set(toolResultIds).size).toBe(toolResultIds.length);
 		expect(executedToolValues).not.toContain("write:after-parallel.txt");
@@ -955,13 +1012,19 @@ describe("agentLoop abort result draining", () => {
 	test("Codex 切号重试前保留已启动工具结果并要求外层重建 history", async () => {
 		providerScenario = "codex_rebuild_after_tool";
 		providerAttempts = 0;
+		executedToolValues.length = 0;
+		completedToolValues.length = 0;
+		serialToolsCompleted = createGate();
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
 		for await (const event of agentLoop(makeConfig(ac.signal), "tool then quota", [])) {
 			events.push(event);
 		}
+		serialToolsCompleted = undefined;
 
+		expect(executedToolValues).toEqual(["serial:one", "serial:two"]);
+		expect(completedToolValues).toEqual(["serial:one", "serial:two"]);
 		expect(providerAttempts).toBe(1);
 		const toolResults = events.filter((event) => event.type === "tool_result");
 		expect(toolResults).toHaveLength(2);

@@ -1,6 +1,6 @@
 import { notifications } from "@mantine/notifications";
 import type { useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api } from "../../../lib/api";
 import { handleRegistry } from "../content/ContentViewer";
 import {
@@ -41,7 +41,7 @@ export interface UseMessageSelectionOptions {
 
 /**
  * Message multi-select machinery extracted from NarratorPanel: selection state
- * (mode / selected block ids / anchor / chunk resolver), the desktop toggle &
+ * (mode / selected block ids / anchor), the event-only chunk resolver, desktop toggle &
  * shift-range handlers, the swipe-menu global-registry bridges, the floating
  * toolbar position clamp, and the batch copy/delete/fork/segment-compact actions.
  *
@@ -71,10 +71,40 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 	const [selectionMode, setSelectionMode] = useState(false);
 	const [selectedBlockIds, setSelectedBlockIds] = useState<Set<string>>(new Set());
 	const [anchorBlockId, setAnchorBlockId] = useState<string | null>(null);
-	const [chunkSelectionResolver, setChunkSelectionResolver] =
-		useState<MessageSelectionResolver | null>(null);
+	// The resolver is an event-time query interface, not selection/render state.
+	// A fresh owner also distinguishes A -> B -> A from a late registration for A.
+	const resolverOwner = useMemo(
+		() => ({ narratorId, resolver: null as MessageSelectionResolver | null, rangeGeneration: 0 }),
+		[narratorId],
+	);
+	const activeResolverOwnerRef = useRef<typeof resolverOwner | null>(null);
+	useLayoutEffect(() => {
+		// Commit ownership before the list publishes from its passive effect. Do not
+		// mutate the current owner's ref during a possibly abandoned render.
+		activeResolverOwnerRef.current = resolverOwner;
+		return () => {
+			resolverOwner.resolver = null;
+			resolverOwner.rangeGeneration++;
+			if (activeResolverOwnerRef.current === resolverOwner) activeResolverOwnerRef.current = null;
+		};
+	}, [resolverOwner]);
+	const isCurrentResolverOwner = useCallback(
+		() => activeResolverOwnerRef.current === resolverOwner,
+		[resolverOwner],
+	);
+	const setChunkSelectionResolver = useCallback(
+		(resolver: MessageSelectionResolver | null) => {
+			if (!isCurrentResolverOwner()) return;
+			resolverOwner.resolver = resolver;
+			// Index refreshes (including cleanup + republish) are not a new selection
+			// intent: a range may itself load data and cause such a refresh while pending.
+		},
+		[isCurrentResolverOwner, resolverOwner],
+	);
 
 	const exitSelection = useCallback(() => {
+		if (!isCurrentResolverOwner()) return;
+		resolverOwner.rangeGeneration++;
 		setSelectionMode(false);
 		setSelectedBlockIds(new Set());
 		setAnchorBlockId(null);
@@ -82,24 +112,31 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 		// Close any open swipe
 		const closeFn = getGlobalCloseSwipe();
 		if (closeFn) closeFn();
-	}, []);
+	}, [isCurrentResolverOwner, resolverOwner]);
 
-	const deselectBlock = useCallback((blockId: string) => {
-		setSelectedBlockIds((prev) => {
-			const next = new Set(prev);
-			next.delete(blockId);
-			if (next.size === 0) {
-				setSelectionMode(false);
-				setAnchorBlockId(null);
-				setGlobalSwipeAnchor(null);
-			}
-			return next;
-		});
-	}, []);
+	const deselectBlock = useCallback(
+		(blockId: string) => {
+			if (!isCurrentResolverOwner()) return;
+			resolverOwner.rangeGeneration++;
+			setSelectedBlockIds((prev) => {
+				const next = new Set(prev);
+				next.delete(blockId);
+				if (next.size === 0) {
+					setSelectionMode(false);
+					setAnchorBlockId(null);
+					setGlobalSwipeAnchor(null);
+				}
+				return next;
+			});
+		},
+		[isCurrentResolverOwner, resolverOwner],
+	);
 
 	// Desktop: Ctrl/Cmd+Click toggles a single block
 	const toggleBlock = useCallback(
 		(blockId: string) => {
+			if (!isCurrentResolverOwner()) return;
+			resolverOwner.rangeGeneration++;
 			setSelectedBlockIds((prev) => {
 				const next = new Set(prev);
 				if (next.has(blockId)) {
@@ -118,12 +155,17 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 				return next;
 			});
 		},
-		[chunkListRef],
+		[chunkListRef, isCurrentResolverOwner, resolverOwner],
 	);
 
 	const applyRangeSelection = useCallback(
 		(anchor: string, target: string, updateAnchor = false) => {
+			if (!isCurrentResolverOwner()) return;
+			const generation = ++resolverOwner.rangeGeneration;
+			const canApply = () =>
+				isCurrentResolverOwner() && resolverOwner.rangeGeneration === generation;
 			const applyDomFallback = () => {
+				if (!canApply()) return;
 				const container = contentRef.current;
 				if (!container) return;
 				const range = resolveBlockRange(container, anchor, target);
@@ -134,7 +176,7 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 				if (updateAnchor) setAnchorBlockId(anchor);
 			};
 
-			const resolver = chunkSelectionResolver;
+			const resolver = resolverOwner.resolver;
 			const resolved = resolver?.resolveRange?.(anchor, target);
 			if (!resolved) {
 				applyDomFallback();
@@ -142,6 +184,7 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 			}
 			Promise.resolve(resolved)
 				.then((range) => {
+					if (!canApply()) return;
 					if (!range) {
 						applyDomFallback();
 						return;
@@ -153,15 +196,17 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 				})
 				.catch(applyDomFallback);
 		},
-		[chunkSelectionResolver, contentRef, chunkListRef],
+		[isCurrentResolverOwner, resolverOwner, contentRef, chunkListRef],
 	);
 
 	// Desktop: Shift+Click range-selects from anchor to target
 	const rangeSelectTo = useCallback(
 		(blockId: string) => {
+			if (!isCurrentResolverOwner()) return;
 			const anchor = anchorBlockId;
 			if (!anchor) {
 				// No anchor yet — treat as single toggle
+				resolverOwner.rangeGeneration++;
 				chunkListRef.current?.detachFromBottom();
 				setSelectionMode(true);
 				setSelectedBlockIds(new Set([blockId]));
@@ -170,7 +215,7 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 			}
 			applyRangeSelection(anchor, blockId);
 		},
-		[anchorBlockId, applyRangeSelection, chunkListRef],
+		[anchorBlockId, applyRangeSelection, chunkListRef, isCurrentResolverOwner, resolverOwner],
 	);
 
 	// Register the global range-selection callback so useSwipeMenu instances
@@ -267,7 +312,8 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 
 	// --- Batch copy ---
 	const handleBatchCopy = useCallback(async () => {
-		if (selectedBlockIds.size === 0) return;
+		if (!isCurrentResolverOwner() || selectedBlockIds.size === 0) return;
+		const chunkSelectionResolver = resolverOwner.resolver;
 		let selectedText = chunkSelectionResolver?.collectSelectedText
 			? chunkSelectionResolver.collectSelectedText(selectedBlockIds)
 			: contentRef.current
@@ -289,11 +335,12 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 			notifications.show({ message: t("batchCopyFailed"), color: "red" });
 		}
 		exitSelection();
-	}, [selectedBlockIds, chunkSelectionResolver, exitSelection, contentRef, t]);
+	}, [selectedBlockIds, isCurrentResolverOwner, resolverOwner, exitSelection, contentRef, t]);
 
 	// --- Batch delete ---
 	const handleBatchDelete = useCallback(async () => {
-		if (selectedBlockIds.size === 0) return;
+		if (!isCurrentResolverOwner() || selectedBlockIds.size === 0) return;
+		const chunkSelectionResolver = resolverOwner.resolver;
 		let metas = chunkSelectionResolver?.resolveSelectedMeta
 			? chunkSelectionResolver.resolveSelectedMeta(selectedBlockIds)
 			: contentRef.current
@@ -324,7 +371,8 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 		}
 	}, [
 		selectedBlockIds,
-		chunkSelectionResolver,
+		isCurrentResolverOwner,
+		resolverOwner,
 		exitSelection,
 		narratorId,
 		t,
@@ -335,7 +383,8 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 
 	// --- Batch fork ---
 	const handleBatchFork = useCallback(async () => {
-		if (selectedBlockIds.size === 0) return;
+		if (!isCurrentResolverOwner() || selectedBlockIds.size === 0) return;
+		const chunkSelectionResolver = resolverOwner.resolver;
 		let messageIds = chunkSelectionResolver?.resolveSelectedMessageIds
 			? chunkSelectionResolver.resolveSelectedMessageIds(selectedBlockIds)
 			: contentRef.current
@@ -358,7 +407,8 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 		}
 	}, [
 		selectedBlockIds,
-		chunkSelectionResolver,
+		isCurrentResolverOwner,
+		resolverOwner,
 		exitSelection,
 		narratorId,
 		navigate,
@@ -368,6 +418,7 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 
 	// --- Segment compact ---
 	const handleSegmentCompact = useCallback(async () => {
+		if (!isCurrentResolverOwner()) return;
 		if (!compactSupported) {
 			notifications.show({
 				title: t("compactUnsupportedTitle"),
@@ -377,6 +428,7 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 			return;
 		}
 		if (selectedBlockIds.size === 0) return;
+		const chunkSelectionResolver = resolverOwner.resolver;
 		let messageIds = chunkSelectionResolver?.resolveSelectedMessageIds
 			? chunkSelectionResolver.resolveSelectedMessageIds(selectedBlockIds)
 			: contentRef.current
@@ -406,7 +458,8 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 	}, [
 		selectedBlockIds,
 		exitSelection,
-		chunkSelectionResolver,
+		isCurrentResolverOwner,
+		resolverOwner,
 		narratorId,
 		t,
 		confirm,

@@ -19,6 +19,7 @@ import {
 	fileChangeStorageBudgets,
 	revertOperationFiles,
 	revertOperations,
+	workspaceWriteLeases,
 } from "../../../../server/db/schema";
 import { generateId } from "../../../../server/lib/id";
 import {
@@ -87,17 +88,17 @@ export function makeSqliteKit(db: typeof appDb): EquivalenceKit {
 	};
 
 	const workspace: WorkspaceLeaseFacade = {
-		runCleanWrite: async (scope) => {
+		runCleanWrite: async (scope, ranges) => {
 			let counterDuringWrite: unknown;
-			await coordinator.withWrite({ scope, runtime: RUNTIME }, async (lease) => {
+			await coordinator.withWrite({ scope, runtime: RUNTIME, ranges }, async (lease) => {
 				lease.registerMutation("mutation-1");
 				counterDuringWrite = (await scopeRow(scope)).activeMutationCount;
 				lease.settle("mutation-1", "applied");
 			});
 			return { counterDuringWrite };
 		},
-		runUncertainWrite: async (scope) => {
-			await coordinator.withWrite({ scope, runtime: RUNTIME }, async (lease) => {
+		runUncertainWrite: async (scope, ranges) => {
+			await coordinator.withWrite({ scope, runtime: RUNTIME, ranges }, async (lease) => {
 				lease.registerMutation("mutation-uncertain");
 				lease.markUncertain();
 			});
@@ -105,17 +106,12 @@ export function makeSqliteKit(db: typeof appDb): EquivalenceKit {
 		admitLease: async (scope) => {
 			await coordinator.withWrite({ scope, runtime: RUNTIME, waitTimeoutMs: 0 }, async () => {});
 		},
-		recoverSameEpoch: async (scope) => coordinator.recoverScopeBarrier(scope),
-		recoverForeignEpoch: async (scope) => {
-			// A fresh state is a fresh owner epoch — the crash-recovery shape. (Without
-			// an explicit state the coordinator SHARES the process-wide one.)
-			const foreign = new WorkspaceWriteCoordinator({
-				db,
-				state: createWorkspaceWriteCoordinatorState(),
-				readRuntime: () => RUNTIME,
-			});
-			return foreign.recoverScopeBarrier(scope);
-		},
+		readLeases: async (scope) =>
+			db
+				.select()
+				.from(workspaceWriteLeases)
+				.where(eq(workspaceWriteLeases.scopeId, scope.id))
+				.all(),
 		readScope: scopeRow,
 	};
 

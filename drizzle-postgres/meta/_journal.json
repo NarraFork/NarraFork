@@ -15,6 +15,13 @@
       "when": 1789629158402,
       "tag": "0001_seq_counters",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789913068559,
+      "tag": "0002_slippery_masked_marvel",
+      "breakpoints": true
     }
   ]
 }

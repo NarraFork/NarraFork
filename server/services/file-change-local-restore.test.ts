@@ -74,6 +74,8 @@ async function request(
 	const events: string[] = ["intent_durable"];
 	const lease: WorkspaceWriteLease = {
 		token: { id: Symbol("fixture-lease") },
+		leaseId: "fixture-lease",
+		ranges: [{ kind: "subtree", canonicalPath: root }],
 		kind: "rollback",
 		scope,
 		scopeRevision: 1,

@@ -11,11 +11,13 @@ import {
 	fileChangeEffects,
 	fileChangeOperations,
 	fileChangeRollups,
+	fileChangeScopeRecoveries,
 	fileChangeScopes,
 	narrators,
 	revertOperationFiles,
 	revertOperations,
 	snapshotCaptures,
+	workspaceWriteLeases,
 } from "../db/schema";
 import { generateId } from "../lib/id";
 
@@ -77,6 +79,8 @@ afterEach(async () => {
 	await db.delete(snapshotCaptures).where(eq(snapshotCaptures.scopeId, scopeId));
 	await db.delete(fileChangeEffects).where(eq(fileChangeEffects.operationId, operationId));
 	await db.delete(fileChangeOperations).where(eq(fileChangeOperations.id, operationId));
+	await db.delete(fileChangeScopeRecoveries).where(eq(fileChangeScopeRecoveries.scopeId, scopeId));
+	await db.delete(workspaceWriteLeases).where(eq(workspaceWriteLeases.scopeId, scopeId));
 	await db.delete(fileChangeScopes).where(eq(fileChangeScopes.id, scopeId));
 	await db.delete(fileChangeBlobs).where(eq(fileChangeBlobs.id, blobId));
 	await db.delete(narrators).where(eq(narrators.id, narratorId));
@@ -137,6 +141,8 @@ describe("file change evidence schema migration", () => {
 		expect(process.env.NARRAFORK_TEST).toBe("1");
 		const names = [
 			"file_change_scopes",
+			"workspace_write_leases",
+			"file_change_scope_recoveries",
 			"file_change_blobs",
 			"file_change_operations",
 			"file_change_effects",
@@ -155,6 +161,73 @@ describe("file change evidence schema migration", () => {
 		expect(rows).toHaveLength(names.length);
 	});
 
+	test("durable range quarantine and legacy audit remain independently representable", () => {
+		const leaseId = generateId();
+		db.insert(workspaceWriteLeases)
+			.values({
+				leaseId,
+				scopeId,
+				deviceId: "local",
+				ownerEpoch: "ended-owner",
+				runtimeEpoch: "local-runtime",
+				runtimeGeneration: 0,
+				fencingToken: 7,
+				scopeRevision: 3,
+				pathFlavor: "posix",
+				status: "quarantined",
+				rangesJson: { version: 1, ranges: [{ kind: "file", canonicalPath: "/repo/a.txt" }] },
+				mutationManifestJson: {
+					version: 1,
+					mutations: [{ mutationId: "unknown-write", operationId, outcome: "unknown" }],
+				},
+				executionEndedAt: now(),
+				createdAt: now(),
+				updatedAt: now(),
+			})
+			.run();
+		const baseAudit = {
+			scopeId,
+			deviceId: "local",
+			canonicalRoot: "/repo",
+			pathFlavor: "posix" as const,
+			effectDecisionsJson: [],
+			scopeRevisionBefore: 3,
+			fencingTokenBefore: 7,
+			createdAt: now(),
+		};
+		const legacyId = generateId();
+		const recoveryId = generateId();
+		db.insert(fileChangeScopeRecoveries)
+			.values({ ...baseAudit, id: legacyId })
+			.run();
+		db.insert(fileChangeScopeRecoveries)
+			.values({ ...baseAudit, id: recoveryId, workspaceLeaseId: leaseId })
+			.run();
+		expect(
+			db
+				.select()
+				.from(fileChangeScopeRecoveries)
+				.where(eq(fileChangeScopeRecoveries.id, legacyId))
+				.get()?.workspaceLeaseId,
+		).toBeNull();
+		expect(
+			db.select().from(workspaceWriteLeases).where(eq(workspaceWriteLeases.leaseId, leaseId)).get()
+				?.rangesJson,
+		).toEqual({ version: 1, ranges: [{ kind: "file", canonicalPath: "/repo/a.txt" }] });
+		// Retention may drop a terminal lease, never the immutable recovery audit.
+		db.update(workspaceWriteLeases)
+			.set({ status: "recovered" })
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		db.delete(workspaceWriteLeases).where(eq(workspaceWriteLeases.leaseId, leaseId)).run();
+		expect(
+			db
+				.select()
+				.from(fileChangeScopeRecoveries)
+				.where(eq(fileChangeScopeRecoveries.id, recoveryId))
+				.get()?.workspaceLeaseId,
+		).toBe(leaseId);
+	});
 	test("scope, operation and blob defaults never imply verified evidence", async () => {
 		await insertBlob();
 		const scope = await db.query.fileChangeScopes.findFirst({

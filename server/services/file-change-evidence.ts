@@ -14,7 +14,7 @@ import {
 	type FileChangeState,
 	fileChangeStatesEqual,
 } from "@shared/file-change-protocol";
-import { and, asc, eq, isNull, ne, type SQL, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
 import type { db } from "../db";
 import {
 	fileChangeBlobs,
@@ -36,6 +36,7 @@ import {
 	fileChangeExecutionBindingMatches,
 	fileChangeIdentityKey,
 } from "./file-change-identity";
+import { normalizeLocalIoEvidence } from "./file-change-local-io-evidence";
 
 /** Scheduling/transaction granularity, not permission to truncate a larger operation. */
 export const FILE_CHANGE_PREPARE_BATCH_ITEMS = 32;
@@ -207,11 +208,14 @@ export class FileChangeEvidenceService {
 	}
 
 	/** Records verification already performed by an authorized backend; does not perform it. */
-	recordScopeVerification(input: {
-		scopeId: string;
-		canonicalRoot: string;
-		rootIdentity: Record<string, string>;
-	}): FileChangeScopeRecord {
+	recordScopeVerification(
+		input: {
+			scopeId: string;
+			canonicalRoot: string;
+			rootIdentity: Record<string, string>;
+		},
+		recoveryTx?: Executor,
+	): FileChangeScopeRecord {
 		assertString(input.scopeId, "scopeId");
 		assertString(input.canonicalRoot, "canonicalRoot", FILE_CHANGE_LIMITS.metadataBytes);
 		const entries = Object.entries(input.rootIdentity);
@@ -222,7 +226,9 @@ export class FileChangeEvidenceService {
 			assertString(value, "root identity value");
 		}
 		assertMetadata(input);
-		return this.transaction((tx) => {
+		if (recoveryTx && !this.database.$client.inTransaction)
+			throw fail("DURABILITY_BOUNDARY", "Recovery requires an active coordinator transaction");
+		const verify = (tx: Executor) => {
 			const scope = requireScope(tx, input.scopeId);
 			if (
 				scope.activeLeaseId !== null ||
@@ -252,7 +258,8 @@ export class FileChangeEvidenceService {
 					.returning()
 					.get(),
 			);
-		});
+		};
+		return recoveryTx ? verify(recoveryTx) : this.transaction(verify);
 	}
 
 	/**
@@ -265,18 +272,38 @@ export class FileChangeEvidenceService {
 	 * original IO did" wherever the receipt said so. One audit row is inserted
 	 * per call; replaying the same recovery is a harmless no-op plus audit row.
 	 */
-	closeBooksForRecovery(input: {
-		scopeId: string;
-		recoveredByUserId: string;
-		decisions: {
-			effectId: string;
-			canonicalPath: string;
-			verdict: FileChangeRecoveryVerdict;
-			observedDigest: string | null;
-			observedSizeBytes: number | null;
-		}[];
-	}): { settledEffectCount: number } {
+	closeBooksForRecovery(
+		input: {
+			scopeId: string;
+			/** Null is reserved for legacy scope-level barriers. */
+			workspaceLeaseId?: string | null;
+			/** Fixed durable lease manifest; never inferred from the scope's current owner. */
+			effectIds?: readonly string[];
+			operationIds?: readonly string[];
+			recoveredByUserId: string;
+			decisions: {
+				effectId: string;
+				canonicalPath: string;
+				verdict: FileChangeRecoveryVerdict;
+				observedDigest: string | null;
+				observedSizeBytes: number | null;
+			}[];
+		},
+		recoveryTx?: Executor,
+	): { settledEffectCount: number } {
 		assertString(input.scopeId, "scopeId");
+		if (input.workspaceLeaseId) {
+			assertString(input.workspaceLeaseId, "workspaceLeaseId");
+			if (!input.effectIds || input.effectIds.length > FILE_CHANGE_LIMITS.revertFiles)
+				throw fail("INVALID_INPUT", "Recovery requires a bounded durable effect manifest");
+		}
+		if ((input.operationIds?.length ?? 0) > FILE_CHANGE_LIMITS.revertFiles)
+			throw fail("INVALID_INPUT", "Recovery operation manifest exceeds the limit");
+		// Only the coordinator's short synchronous recovery transaction may compose
+		// journal settlement with barrier release. Normal execution keeps the strict
+		// root-connection durability boundary in transaction().
+		if (recoveryTx && !this.database.$client.inTransaction)
+			throw fail("DURABILITY_BOUNDARY", "Recovery requires an active coordinator transaction");
 		assertString(input.recoveredByUserId, "recoveredByUserId");
 		if (!Array.isArray(input.decisions) || input.decisions.length > FILE_CHANGE_LIMITS.revertFiles)
 			throw fail("INVALID_INPUT", "Invalid recovery decision list");
@@ -297,22 +324,63 @@ export class FileChangeEvidenceService {
 			if (decision.observedSizeBytes !== null)
 				assertInteger(decision.observedSizeBytes, "observedSizeBytes", 0);
 		}
-		assertMetadata(input.decisions);
-		return this.transaction((tx) => {
+		if (Buffer.byteLength(JSON.stringify(input.decisions)) > FILE_CHANGE_LIMITS.summaryBytes)
+			throw fail("RECOVERY_LIMIT", "Recovery audit exceeds the byte limit");
+		const settle = (tx: Executor) => {
 			const scope = requireScope(tx, input.scopeId);
 			const unsettled = tx
-				.select()
+				.select({
+					id: fileChangeEffects.id,
+					operationId: fileChangeEffects.operationId,
+					identityJson: fileChangeEffects.identityJson,
+					settlement: fileChangeEffects.settlement,
+					beforeStateJson: fileChangeEffects.beforeStateJson,
+					intendedAfterStateJson: fileChangeEffects.intendedAfterStateJson,
+				})
 				.from(fileChangeEffects)
 				.where(
-					and(eq(fileChangeEffects.scopeId, scope.id), ne(fileChangeEffects.settlement, "settled")),
+					and(
+						eq(fileChangeEffects.scopeId, scope.id),
+						ne(fileChangeEffects.settlement, "settled"),
+						input.workspaceLeaseId
+							? inArray(fileChangeEffects.id, [...(input.effectIds ?? [])])
+							: undefined,
+					),
 				)
+				.limit(FILE_CHANGE_LIMITS.revertFiles + 1)
 				.all();
+			if (unsettled.length > FILE_CHANGE_LIMITS.revertFiles)
+				throw fail("RECOVERY_LIMIT", "Recovery exceeds the effect limit");
 			const byEffectId = new Map(input.decisions.map((decision) => [decision.effectId, decision]));
-			if (byEffectId.size !== input.decisions.length || byEffectId.size !== unsettled.length) {
+			if (
+				byEffectId.size !== input.decisions.length ||
+				unsettled.some((effect) => !byEffectId.has(effect.id))
+			) {
 				throw fail(
 					"INVALID_INPUT",
 					"Recovery decisions must cover every unsettled effect exactly once",
 				);
+			}
+			const unsettledIds = new Set(unsettled.map((effect) => effect.id));
+			for (const decision of input.decisions) {
+				if (unsettledIds.has(decision.effectId)) continue;
+				const prior = tx
+					.select({
+						scopeId: fileChangeEffects.scopeId,
+						identity: fileChangeEffects.identityJson,
+						settlement: fileChangeEffects.settlement,
+					})
+					.from(fileChangeEffects)
+					.where(eq(fileChangeEffects.id, decision.effectId))
+					.get();
+				if (
+					!prior ||
+					prior.scopeId !== scope.id ||
+					prior.settlement !== "settled" ||
+					prior.identity.canonicalPath !== decision.canonicalPath ||
+					(input.effectIds && !input.effectIds.includes(decision.effectId))
+				)
+					throw fail("INVALID_INPUT", "Recovery audit contains an unrelated effect");
 			}
 			const timestamp = this.now();
 			for (const effect of unsettled) {
@@ -344,14 +412,21 @@ export class FileChangeEvidenceService {
 					.where(eq(fileChangeEffects.id, effect.id))
 					.run();
 			}
-			for (const operationId of new Set(unsettled.map((effect) => effect.operationId))) {
+			let operationEffectBudget = FILE_CHANGE_LIMITS.revertFiles;
+			for (const operationId of new Set([
+				...unsettled.map((effect) => effect.operationId),
+				...(input.operationIds ?? []),
+			])) {
 				const operation = requireOperation(tx, operationId);
-				const effects = selectEffects(
-					tx,
-					operationId,
-					undefined,
-					FILE_CHANGE_LIMITS.revertFiles + 1,
-				);
+				const effects = tx
+					.select({ outcome: fileChangeEffects.outcome, settlement: fileChangeEffects.settlement })
+					.from(fileChangeEffects)
+					.where(eq(fileChangeEffects.operationId, operationId))
+					.limit(operationEffectBudget + 1)
+					.all();
+				if (effects.length > operationEffectBudget)
+					throw fail("RECOVERY_LIMIT", "Operations exceed the cumulative recovery effect limit");
+				operationEffectBudget -= effects.length;
 				const remaining = effects.filter((effect) => effect.settlement !== "settled").length;
 				if (remaining > 0) {
 					// Another scope of the same operation is still barred; only refresh counts.
@@ -383,6 +458,7 @@ export class FileChangeEvidenceService {
 				.values({
 					id: generateId(),
 					scopeId: scope.id,
+					workspaceLeaseId: input.workspaceLeaseId ?? null,
 					deviceId: scope.deviceId,
 					canonicalRoot: scope.canonicalRoot,
 					pathFlavor: scope.pathFlavor,
@@ -394,7 +470,8 @@ export class FileChangeEvidenceService {
 				})
 				.run();
 			return { settledEffectCount: unsettled.length };
-		});
+		};
+		return recoveryTx ? settle(recoveryTx) : this.transaction(settle);
 	}
 
 	/**
@@ -1366,6 +1443,7 @@ function normalizeReceipt(receipt: FileChangeExecutionReceipt): FileChangeExecut
 		"confirmed",
 		"observedAfter",
 		"outcome",
+		"localIo",
 	]);
 	assertString(receipt.receiptId, "receiptId");
 	assertString(receipt.mutationId, "receipt mutationId");
@@ -1383,6 +1461,9 @@ function normalizeReceipt(receipt: FileChangeExecutionReceipt): FileChangeExecut
 		confirmed: receipt.confirmed,
 		observedAfter: normalizeState(receipt.observedAfter),
 		outcome: receipt.outcome,
+		...(receipt.localIo === undefined
+			? {}
+			: { localIo: normalizeLocalIoEvidence(receipt.localIo) }),
 	};
 	assertMetadata(normalized);
 	return normalized;

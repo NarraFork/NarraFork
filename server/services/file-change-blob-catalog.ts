@@ -231,6 +231,37 @@ export class FileChangeBlobCatalog {
 		});
 	}
 
+	/** Reset coordinator has isolated the old directory and invalidated all old refs.
+	 * Empty catalog/reservations are checked here without inventory or byte scans. */
+	completeNamespaceReset(input: { expectedGeneration: number }): FileChangeBlobBudgetMetadata {
+		assertNumber(input.expectedGeneration, "generation");
+		return this.transaction((tx) => {
+			const current = tx
+				.select()
+				.from(budgets)
+				.where(eq(budgets.id, FILE_CHANGE_BLOB_BUDGET_ID))
+				.get();
+			if (
+				!current ||
+				current.generation !== input.expectedGeneration ||
+				current.status !== "unverified"
+			)
+				throw generationMismatch();
+			if (
+				tx.select({ id: blobs.id }).from(blobs).limit(1).get() ||
+				tx.select({ id: reservations.id }).from(reservations).limit(1).get()
+			)
+				throw fail("reconciliation_required", "Reset metadata cleanup is incomplete");
+			return this.updateBudget(tx, {
+				namespaceKey: this.namespaceKey,
+				status: "ready",
+				usedBytes: 0,
+				reservedBytes: 0,
+				reconciledAt: now(),
+			});
+		});
+	}
+
 	/** Capture a fence once. Every reserve/release checks it again in its transaction. */
 	admission(input: { expectedGeneration: number; ownerEpoch: string }): FileChangeBlobAdmission {
 		assertNumber(input.expectedGeneration, "generation");

@@ -25,6 +25,7 @@ const DIR = import.meta.dir;
 const SHELL = shellSource();
 const TRACE_ROW = readFileSync(join(DIR, "..", "trace", "TraceRowInteraction.tsx"), "utf8");
 const TOOL_META = readFileSync(join(DIR, "vlist-tool-meta.ts"), "utf8");
+const TRACE_BINDINGS = readFileSync(join(DIR, "useVListTraceBindings.tsx"), "utf8");
 
 /** The body of the shell's `resolveTraceRowIdentity`. */
 function resolveIdentityBody(): string {
@@ -35,13 +36,13 @@ function resolveIdentityBody(): string {
 	return SHELL.slice(start, end);
 }
 
-/** The body of the shell's shared trace-row interaction slot. */
+/** The current owner of the trace-row interaction forwarding boundary. */
 function rowInteractionSlotBody(): string {
-	const start = SHELL.indexOf("const traceRowInteractionSlot = useMemo<");
+	const start = TRACE_BINDINGS.indexOf("function bindGroup(");
 	expect(start).toBeGreaterThan(0);
-	const end = SHELL.indexOf("}, [selectionIndex, rowHandlers", start);
+	const end = TRACE_BINDINGS.indexOf("\n}", start);
 	expect(end).toBeGreaterThan(start);
-	return SHELL.slice(start, end);
+	return TRACE_BINDINGS.slice(start, end);
 }
 
 describe("folded trace row: file-panel identity", () => {

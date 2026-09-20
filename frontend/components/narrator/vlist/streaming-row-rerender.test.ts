@@ -1,32 +1,9 @@
 /**
- * streaming-row-rerender.test.ts — End-to-end guard: a streaming delta must not
- * change the props the ExactRow memo compares for rows it did not touch.
- *
- * ── Why this exists ALONGSIDE vlist-row-payload-reuse.test.ts ──────────────────
- *
- * That file proves the reuse primitive works. This one proves the SHELL is wired to
- * it, which is a separate fact and the one that actually regressed: the primitive
- * can be perfect while a builder keeps `renderItems` in the memo deps that mints its
- * objects, or while a new per-row prop is introduced with a fresh identity per frame.
- * Both failures are invisible in a rendering test — the rows look right, they just
- * re-render on every frame of a live turn and the folded row's CSS shimmer stutters
- * under the reconciliation.
- *
- * The assertions are on the SHELL SOURCE because the failure mode is silent and
- * has no runtime representation to observe without mounting the whole panel (which
- * needs a router, a query client, a WS manager and a narrator). What is pinned is
- * narrow and behavioural in intent:
- *
- *   1. `rowInteraction` comes from a resolver whose memo does NOT depend on
- *      `renderItems` — that dependency is exactly what made the slot churn.
- *   2. The `interaction` payload map goes through the reuse cache (begin + reuse +
- *      commit), so an untouched row keeps its object.
- *   3. The memo comparator still compares both props, i.e. the stability above is
- *      load-bearing rather than incidental.
- *
- * Sibling coverage, deliberately not duplicated here: `live-tail-crosses-row-memo`
- * proves the LIVE row still repaints (the tail must cross the memo), so this file
- * cannot be satisfied by freezing everything.
+ * Shell wiring guards complement the real React cache tests in
+ * ordinary-row-cache.test.tsx and useVListTraceBindings.test.tsx.
+ * A per-item map is safe when unchanged bindings are reused; forbidding the map
+ * itself masked the real problem (global index identity invalidating every row).
+ * Keep the shell-to-binding wiring and ExactRow's invalidation checks protected.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -65,14 +42,6 @@ function depsRange(start: number): { open: number; close: number } {
 	return { open, close };
 }
 
-/** The dependency array of the hook declared at `from`. */
-function depsAfter(from: string): string {
-	const start = SHELL.indexOf(from);
-	expect(start).toBeGreaterThan(0);
-	const { open, close } = depsRange(start);
-	return SHELL.slice(open, close + 1);
-}
-
 /** Source of one hook body, from its declaration up to its dependency array. */
 function hookBody(declaration: string): string {
 	const start = SHELL.indexOf(declaration);
@@ -80,30 +49,19 @@ function hookBody(declaration: string): string {
 	return SHELL.slice(start, depsRange(start).open);
 }
 
-describe("the trace row-interaction slot does not churn per frame", () => {
-	it("is built by a memo that does NOT depend on renderItems", () => {
-		// THE REGRESSION: this memo used to build a per-key MAP from `renderItems`,
-		// which is a fresh array on every commit — so every mounted trace row got a
-		// new `rowInteraction` prop on every streaming delta.
-		const deps = depsAfter("const traceRowInteractionSlot = useMemo<");
-		expect(deps).not.toContain("renderItems");
-		// It legitimately depends on these (the closure captures them).
-		expect(deps).toContain("selectionIndex");
-		expect(deps).toContain("rowHandlers");
+describe("the trace row-interaction slot uses per-group semantic bindings", () => {
+	it("feeds live indices into the tested binding hook", () => {
+		expect(SHELL).toContain("const traceBindingsByKey = useVListTraceBindings({");
 	});
 
-	it("is resolved per row by KIND, allocating no per-frame map", () => {
-		const body = hookBody("const resolveRowInteraction = useCallback(");
-		expect(body).toContain("TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind)");
-		expect(body).toContain("traceRowInteractionSlot");
-		// A resolver rebuilt from the items would reintroduce the churn.
-		expect(depsAfter("const resolveRowInteraction = useCallback(")).not.toContain("renderItems");
+	it("resolves the current group's binding by the complete item key", () => {
+		expect(SHELL).toContain("const traceBinding = traceBindingsByKey.get(item.spec.key)");
+		expect(SHELL).toContain("rowInteraction={traceBinding?.rowInteraction}");
 	});
 
-	it("is what the row actually receives", () => {
-		// Guards against the resolver existing but the row still reading a stale map.
-		expect(SHELL).toContain("rowInteraction={resolveRowInteraction(item)}");
-		expect(SHELL).not.toContain("rowInteractionByKey");
+	it("does not give ordinary rows a global tool-action resolver", () => {
+		expect(SHELL).toContain("resolveRowToolActions={traceBinding?.resolveRowToolActions}");
+		expect(SHELL).not.toContain("resolveRowToolActions={resolveRowToolActions}");
 	});
 });
 

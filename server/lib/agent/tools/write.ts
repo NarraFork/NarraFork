@@ -3,6 +3,7 @@ import { executeLocalFileChange } from "../../../services/file-change-runtime";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
+import { toolSpecPathError } from "../../spec-uri";
 import { readCompleteFileBytes } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
 import { backendDirname, resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
@@ -94,6 +95,8 @@ export const writeTool: ToolDefinition = {
 		content: z.string().describe("The content to write to the file"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
+		const specError = toolSpecPathError("Write", args);
+		if (specError) return { output: specError, isError: true };
 		const { file_path, content } = args as { file_path: string; content: string };
 		if (specVfsService.isSpecUri(file_path)) {
 			try {

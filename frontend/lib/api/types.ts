@@ -421,6 +421,10 @@ export interface WorkspaceBarrierOperation {
 
 export interface WorkspaceBarrier {
 	scope: WorkspaceBarrierScope;
+	leaseId: string | null;
+	ranges: { kind: string; canonicalPath: string }[];
+	executionEnded: boolean;
+	blockedReason: string | null;
 	kind: "quarantined" | "unverified_root";
 	local: boolean;
 	operations: WorkspaceBarrierOperation[];
@@ -433,12 +437,25 @@ export interface WorkspaceBarrierObservation {
 	displayPath: string;
 	verdict: WorkspaceBarrierVerdict;
 	actualKind: "absent" | "regular" | "unobservable";
+	alreadySettled: boolean;
 	observedDigest: string | null;
 	observedSizeBytes: number | null;
+	observedMode: number | null;
 }
 
 export interface WorkspaceBarrierObservationResult {
 	scope: WorkspaceBarrierScope;
+	leaseId: string | null;
+	confirmationToken: string;
+	rangeObservations: {
+		canonicalPath: string;
+		kind: string;
+		actualKind: string;
+		identity: string | null;
+		observedDigest: string | null;
+		observedSizeBytes: number | null;
+		observedMode: number | null;
+	}[];
 	observations: WorkspaceBarrierObservation[];
 }
 

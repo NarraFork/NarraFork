@@ -25,6 +25,7 @@ import { db, sqlite } from "../db";
 import * as schema from "../db/schema";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { editTool } from "../lib/agent/tools/edit";
+import { structSedTool } from "../lib/agent/tools/struct-sed";
 import { writeTool } from "../lib/agent/tools/write";
 import type { ToolContext, ToolExecutionTarget } from "../lib/agent/types";
 import { createToken } from "../lib/auth";
@@ -186,7 +187,7 @@ function messageVersion() {
 		.get()?.version;
 }
 async function toolContext(
-	name: "Write" | "Edit",
+	name: "Write" | "Edit" | "StructSed",
 	path: string,
 	input: Record<string, unknown>,
 	existingMessageId?: string,
@@ -607,6 +608,63 @@ function failCommit(plan: RevertPlanSummary, receipt = false) {
 }
 
 describe("action-bound HTTP preview and real local execution", () => {
+	test.each([
+		"Write",
+		"Edit",
+		"StructSed",
+	] as const)("namespace reset: triggering %s and later edits retain real rollback", async (tool) => {
+		const { path, call: oldCall } = await fixture();
+		const oldPlan = await actionPrepared("revert_files", oldCall.messageId);
+		const oldNamespace = await runtime.verifyNamespace();
+		const blobs = join(getNarraforkHome(), "file-change-blobs");
+		await rm(blobs, { recursive: true, force: true });
+		// The triggering mutation, not a sacrificial request, must acquire fresh evidence.
+		let current: { messageId: string };
+		if (tool === "Write") current = await write(path, "after-reset\n");
+		else if (tool === "Edit") current = await edit(path, "new", "after-reset");
+		else {
+			const input = {
+				file_path: path,
+				command: "replace",
+				address: "1",
+				content: "after-reset",
+				dry_run: false,
+			};
+			const call = await toolContext("StructSed", path, input);
+			const result = await structSedTool.execute(input, call.ctx);
+			expect(result.isError, String(result.output)).not.toBe(true);
+			expect(result.metadata?.fileChangeEvidence).toBeDefined();
+			db.update(schema.narratorToolCalls)
+				.set({ status: "success" })
+				.where(eq(schema.narratorToolCalls.id, call.toolCallId))
+				.run();
+			current = call;
+		}
+		const recovered = await runtime.verifyNamespace();
+		expect(recovered.sourceInstanceId).toBe(oldNamespace.sourceInstanceId);
+		expect(recovered.generation).toBeGreaterThan(oldNamespace.generation);
+		const rejected = await prepare({ idempotencyKey: "old-evidence" });
+		expect(rejected.status).toBe(409);
+		expect(
+			db
+				.select()
+				.from(schema.revertOperations)
+				.where(eq(schema.revertOperations.id, oldPlan.id))
+				.get()?.status,
+		).toBe("expired");
+		const plan = await actionPrepared("revert_files", current.messageId, {
+			idempotencyKey: "reset-current",
+		});
+		await committed(plan, "revert_files");
+		expect(await readFile(path, "utf8")).toBe("new\n");
+		const later = await edit(path, "new", "later");
+		const laterPlan = await actionPrepared("revert_files", later.messageId, {
+			idempotencyKey: "reset-later",
+		});
+		await committed(laterPlan, "revert_files");
+		expect(await readFile(path, "utf8")).toBe("new\n");
+	});
+
 	test("real Write/Edit action preview -> apply restores bytes without deleting file-only history", async () => {
 		const path = join(workspace, "exact.txt");
 		const created = join(workspace, "created.txt");

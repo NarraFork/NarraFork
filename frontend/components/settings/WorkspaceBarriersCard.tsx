@@ -1,8 +1,8 @@
 import { Alert, Badge, Button, Checkbox, Divider, Group, Paper, Stack, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconAlertTriangle, IconEyeSearch, IconShieldCheck } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	api,
@@ -22,13 +22,16 @@ import { useConfirmDialog } from "../common/confirm-dialog-context";
 export function WorkspaceBarriersCard() {
 	const { t } = useTranslation("settings");
 	const queryClient = useQueryClient();
-	const { data, isLoading } = useQuery({
-		queryKey: ["workspace-barriers"],
-		queryFn: api.getWorkspaceBarriers,
-		refetchInterval: 30_000,
-	});
+	const { data, isLoading, error, hasNextPage, fetchNextPage, isFetchingNextPage } =
+		useInfiniteQuery({
+			queryKey: ["workspace-barriers"],
+			initialPageParam: undefined as string | undefined,
+			queryFn: ({ pageParam }) => api.getWorkspaceBarriers(pageParam),
+			getNextPageParam: (page) => page.nextCursor ?? undefined,
+			refetchInterval: 30_000,
+		});
 	const invalidate = () => queryClient.invalidateQueries({ queryKey: ["workspace-barriers"] });
-	const items = data?.items ?? [];
+	const items = data?.pages.flatMap((page) => page.items) ?? [];
 	return (
 		<Paper p="sm" radius="sm" withBorder>
 			<Stack gap="sm">
@@ -46,6 +49,7 @@ export function WorkspaceBarriersCard() {
 				<Text size="xs" c="dimmed">
 					{t("workspaceBarriersDescription")}
 				</Text>
+				{error && <Alert color="red">{error.message}</Alert>}
 				{isLoading ? (
 					<Text size="sm" c="dimmed">
 						{t("workspaceBarriersLoading")}
@@ -57,9 +61,23 @@ export function WorkspaceBarriersCard() {
 				) : (
 					<Stack gap="sm">
 						{items.map((barrier) => (
-							<BarrierRow key={barrier.scope.id} barrier={barrier} onRecovered={invalidate} />
+							<BarrierRow
+								key={barrier.leaseId ?? barrier.scope.id}
+								barrier={barrier}
+								onRecovered={invalidate}
+							/>
 						))}
 					</Stack>
+				)}
+				{hasNextPage && (
+					<Button
+						size="xs"
+						variant="subtle"
+						loading={isFetchingNextPage}
+						onClick={() => fetchNextPage()}
+					>
+						{t("workspaceBarriersLoadMore")}
+					</Button>
 				)}
 			</Stack>
 		</Paper>
@@ -86,9 +104,20 @@ function BarrierRow({
 	const [observation, setObservation] = useState<WorkspaceBarrierObservationResult | null>(null);
 	const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
 	const [inspected, setInspected] = useState(false);
+	const observeController = useRef<AbortController | null>(null);
+	useEffect(() => () => observeController.current?.abort(), []);
 
 	const observeMutation = useMutation({
-		mutationFn: () => api.observeWorkspaceBarrier(barrier.scope.id),
+		mutationFn: () => {
+			observeController.current?.abort();
+			observeController.current = new AbortController();
+			setObservation(null);
+			return api.observeWorkspaceBarrier(
+				barrier.scope.id,
+				barrier.leaseId,
+				observeController.current.signal,
+			);
+		},
 		onSuccess: (result) => {
 			setObservation(result);
 			setChecked(new Set());
@@ -105,6 +134,8 @@ function BarrierRow({
 	const recoverMutation = useMutation({
 		mutationFn: () =>
 			api.recoverWorkspaceBarrier(barrier.scope.id, {
+				leaseId: barrier.leaseId ?? undefined,
+				confirmationToken: observation?.confirmationToken ?? "",
 				acknowledgements: (observation?.observations ?? [])
 					.filter((entry) => checked.has(entry.effectId))
 					.map((entry) => ({ effectId: entry.effectId, verdict: entry.verdict })),
@@ -135,11 +166,13 @@ function BarrierRow({
 	const hasForeign = observations.some((entry) => entry.verdict === "foreign");
 	const noEffects = barrier.effects.length === 0;
 	const isRootVerification = barrier.kind === "unverified_root";
-	const recoverReady = isRootVerification
-		? true
-		: noEffects
-			? inspected
-			: observation !== null && allChecked;
+	const needsInspection =
+		!isRootVerification && (noEffects || (observation?.rangeObservations.length ?? 0) > 0);
+	const recoverReady =
+		observation !== null &&
+		!barrier.blockedReason &&
+		(isRootVerification || noEffects || allChecked) &&
+		(!needsInspection || inspected);
 
 	const handleRecover = async () => {
 		const ok = await confirm({
@@ -179,6 +212,30 @@ function BarrierRow({
 								</Text>
 							)}
 						</Group>
+						<Text size="xs" c={barrier.executionEnded ? "dimmed" : "orange"}>
+							{t(
+								barrier.executionEnded
+									? "workspaceBarriersExecutionEnded"
+									: "workspaceBarriersExecutionUnknown",
+							)}
+						</Text>
+						{barrier.ranges.map((range) => (
+							<Text
+								key={`${range.kind}:${range.canonicalPath}`}
+								size="xs"
+								style={{ wordBreak: "break-all" }}
+							>
+								{t("workspaceBarriersRange", {
+									kind: t(`workspaceBarriersRange_${range.kind}`),
+									path: range.canonicalPath,
+								})}
+							</Text>
+						))}
+						{barrier.blockedReason && (
+							<Alert color="orange" mt="xs">
+								{t("workspaceBarriersBlocked", { reason: barrier.blockedReason })}
+							</Alert>
+						)}
 						{barrier.operations.map((operation) => (
 							<Text key={operation.operationId} size="xs" c="dimmed" mt={2}>
 								{t("workspaceBarriersOperation", {
@@ -189,17 +246,20 @@ function BarrierRow({
 						))}
 					</div>
 					<Group gap="xs" wrap="nowrap">
-						{!isRootVerification && !noEffects && (
-							<Button
-								size="xs"
-								variant="light"
-								leftSection={<IconEyeSearch size={14} />}
-								onClick={() => observeMutation.mutate()}
-								loading={observeMutation.isPending}
-								disabled={!barrier.local || recoverMutation.isPending}
-								title={!barrier.local ? t("workspaceBarriersRemoteUnsupported") : undefined}
-							>
-								{t("workspaceBarriersObserve")}
+						<Button
+							size="xs"
+							variant="light"
+							leftSection={<IconEyeSearch size={14} />}
+							onClick={() => observeMutation.mutate()}
+							loading={observeMutation.isPending}
+							disabled={!barrier.local || !!barrier.blockedReason || recoverMutation.isPending}
+							title={!barrier.local ? t("workspaceBarriersRemoteUnsupported") : undefined}
+						>
+							{t("workspaceBarriersObserve")}
+						</Button>
+						{observeMutation.isPending && (
+							<Button size="xs" variant="subtle" onClick={() => observeController.current?.abort()}>
+								{t("workspaceBarriersCancel")}
 							</Button>
 						)}
 						<Button
@@ -249,6 +309,11 @@ function BarrierRow({
 										<Text size="xs" style={{ wordBreak: "break-all" }}>
 											{entry.displayPath}
 										</Text>
+										{entry.alreadySettled && (
+											<Text size="xs" c="dimmed">
+												{t("workspaceBarriersAlreadySettled")}
+											</Text>
+										)}
 										<Text size="xs" c="dimmed">
 											{t("workspaceBarriersVerdictExplanation", {
 												verdict: t(`workspaceBarriersVerdict_${entry.verdict}`),
@@ -264,7 +329,20 @@ function BarrierRow({
 					</>
 				)}
 
-				{!isRootVerification && noEffects && (
+				{observation && (
+					<Text size="xs" c="dimmed" style={{ wordBreak: "break-all" }}>
+						{t("workspaceBarriersToken", { token: observation.confirmationToken })}
+					</Text>
+				)}
+				{observation?.rangeObservations.map((range) => (
+					<Text key={range.canonicalPath} size="xs">
+						{t("workspaceBarriersRangeObservation", {
+							path: range.canonicalPath,
+							state: range.actualKind,
+						})}
+					</Text>
+				))}
+				{needsInspection && (
 					<Checkbox
 						size="xs"
 						checked={inspected}

@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { toolSpecPathError } from "../../spec-uri";
 import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
@@ -60,6 +61,8 @@ export const globTool: ToolDefinition = {
 			.describe("Match hidden files/directories (paths starting with '.'). Defaults to false"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
+		const specError = toolSpecPathError("Glob", args);
+		if (specError) return { output: specError, isError: true };
 		const {
 			pattern,
 			path: pathArg,

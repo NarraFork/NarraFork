@@ -45,12 +45,7 @@ export const FILE_CHANGE_LIMITS = Object.freeze({
  * Message roles that never persist tool calls or disk operations.
  * Leftover sys/user/disp cards after an interrupt must not veto file coverage.
  */
-export const NON_OPERATION_ROLES: ReadonlySet<string> = new Set([
-	"sys",
-	"disp",
-	"system",
-	"user",
-]);
+export const NON_OPERATION_ROLES: ReadonlySet<string> = new Set(["sys", "disp", "system", "user"]);
 
 /** spec:// is deliberately not a disk-path flavor. */
 export type FileChangePathFlavor = "posix" | "windows";
@@ -183,6 +178,14 @@ export interface FileChangeRecoveryDecision {
 export type FileChangeAttributionGrade = "measured" | "observed_ambiguous" | "unknown";
 export type FileChangeMutationPhase = "apply" | "compensate";
 
+/** Bounded diagnostics, not a substitute for a granted physical range or IO proof. */
+export interface FileChangeLocalIoEvidence {
+	version: 1;
+	outcome: "not_applied" | "parent_only" | "target_mutation_unknown" | "applied";
+	createdParentCount: number;
+	uncertainParentCount: number;
+}
+
 /** Durable backend acknowledgement; never reconstructed from matching current bytes. */
 export interface FileChangeExecutionReceipt {
 	receiptId: string;
@@ -193,6 +196,8 @@ export interface FileChangeExecutionReceipt {
 	observedAfter: FileChangeState;
 	/** Whether this specific mutation reached disk, not the enclosing tool's exit status. */
 	outcome: "applied" | "not_applied" | "unknown";
+	/** Present only for stage-aware local execution; old receipts remain unchanged. */
+	localIo?: FileChangeLocalIoEvidence;
 }
 
 /** A revert phase binds its actual granted lease before dispatch. A missing

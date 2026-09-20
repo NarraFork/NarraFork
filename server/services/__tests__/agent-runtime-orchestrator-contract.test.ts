@@ -271,6 +271,60 @@ describe("real shared orchestrator profile contract", () => {
 		});
 	}
 	for (const profile of profiles) {
+		test(`${profile.kind}: production detached callback persists after the loop has returned`, async () => {
+			const h = fixture(profile, [finished]);
+			await h.run();
+			const callback = h.calls[0].config.onDetachedToolResult;
+			expect(callback).toBeFunction();
+			if (!callback) throw new Error("Missing production detached callback");
+			const narratorId = h.session.narratorId;
+			const now = new Date().toISOString();
+			await db.insert(narratorMessages).values({
+				id: "detached-message",
+				narratorId,
+				role: "assistant",
+				parentToolUseId: profile.kind === "subagent" ? profile.parentToolUseId : null,
+				contentJson: [{ type: "tool_use", id: "detached-call", name: "Write", input: {} }],
+				createdAt: now,
+			});
+			await db.insert(narratorMessageRefs).values({
+				id: "detached-ref",
+				narratorId,
+				messageId: "detached-message",
+				seq: 100,
+			});
+			await db.insert(narratorToolCalls).values({
+				id: "detached-row",
+				narratorId,
+				messageId: "detached-message",
+				toolUseId: "detached-call",
+				toolName: "Write",
+				inputJson: {},
+				executionAttempt: 1,
+				executionIdentityVersion: 1,
+				status: "fail",
+				errorMessage: "Narrator interrupted by user",
+				createdAt: now,
+			});
+			await callback({
+				type: "tool_result",
+				toolUseId: "detached-call",
+				toolName: "Write",
+				toolCallBinding: { toolCallId: "detached-row", attempt: 1 },
+				output: "actual post-abort output",
+				isError: false,
+			});
+			expect(
+				await db.query.narratorToolCalls.findFirst({
+					where: eq(narratorToolCalls.id, "detached-row"),
+				}),
+			).toMatchObject({
+				status: "success",
+				errorMessage: null,
+				outputJson: "actual post-abort output",
+			});
+		});
+
 		test(`${profile.kind}: one completed pass retains model input and profile event identity`, async () => {
 			const h = fixture(profile, [finished]);
 			const result = await h.run();

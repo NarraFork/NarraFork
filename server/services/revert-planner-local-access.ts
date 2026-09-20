@@ -376,6 +376,7 @@ const access = new RevertPlannerLocalAccess();
 let cached:
 	| {
 			runtime: LocalFileChangeRuntime;
+			namespace: Awaited<ReturnType<LocalFileChangeRuntime["verifyNamespace"]>>;
 			planner: RevertPlannerService;
 			plans: RevertPlanService;
 			transactions: RevertTransactionService;
@@ -383,11 +384,12 @@ let cached:
 	| undefined;
 async function services(signal: AbortSignal) {
 	const { runtime, namespace } = await verifiedNamespace(signal);
-	if (!cached || cached.runtime !== runtime) {
+	if (!cached || cached.runtime !== runtime || cached.namespace !== namespace) {
 		const namespaceKey = namespace.catalog.getBudget()?.namespaceKey;
 		if (!namespaceKey) throw stale("Evidence namespace metadata is missing");
 		cached = {
 			runtime,
+			namespace,
 			planner: new RevertPlannerService(db, {
 				access,
 				blobStore: namespace.store,
@@ -408,8 +410,11 @@ async function services(signal: AbortSignal) {
 }
 
 async function prepareLocalRevertPlanCore(request: RevertPlannerRequest & { signal: AbortSignal }) {
-	const { planner } = await services(request.signal);
-	return planner.prepare({ ...request, signal: request.signal });
+	const runtime = await getDefaultLocalFileChangeRuntime();
+	return runtime.withNamespaceAccess(async () => {
+		const { planner } = await services(request.signal);
+		return planner.prepare({ ...request, signal: request.signal });
+	});
 }
 
 export async function prepareLocalRevertPlan(request: RevertPlannerRequest) {

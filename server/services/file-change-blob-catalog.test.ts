@@ -131,6 +131,38 @@ function restartReconciliation(): void {
 	generation = catalog.beginReconciliation({ expectedGeneration: generation }).generation;
 }
 
+describe("empty namespace reset admission", () => {
+	test("rebinds only an unverified empty catalog and fences old handles", () => {
+		ready(71);
+		const oldGeneration = generation;
+		generation = catalog.initializeNamespace({ expectedGeneration: generation }).generation;
+		const next = new FileChangeBlobCatalog({ db, namespaceKey: "new-cache" });
+		expectCode(
+			() => next.completeNamespaceReset({ expectedGeneration: oldGeneration }),
+			"generation_mismatch",
+		);
+		expect(next.completeNamespaceReset({ expectedGeneration: generation })).toMatchObject({
+			namespaceKey: "new-cache",
+			generation,
+			usedBytes: 0,
+			reservedBytes: 0,
+			quotaBytes: 71,
+			status: "ready",
+		});
+		expectCode(() => catalog.getBudget(), "namespace_mismatch");
+	});
+
+	test("never admits a reset until associated cache metadata is cleared", () => {
+		ready();
+		reserve(0);
+		generation = catalog.initializeNamespace({ expectedGeneration: generation }).generation;
+		expectCode(
+			() => catalog.completeNamespaceReset({ expectedGeneration: generation }),
+			"reconciliation_required",
+		);
+	});
+});
+
 describe("blob catalog namespace and admission", () => {
 	test("new and reinitialized namespaces are unverified; no implicit worker exists", () => {
 		expect(catalog.getBudget()).toBeNull();

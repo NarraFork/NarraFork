@@ -1,5 +1,8 @@
 {
 	"you": "You",
+	"publicationResultOpen": "Result snapshot · Click to view",
+	"publicationResultTitle": "Result snapshot",
+	"publicationResultTruncated": "Only a preview was saved in this snapshot; this is not the complete result.",
 	"queuedFailed": "Message failed",
 	"queuedFailureUnknown": "No failure reason was provided.",
 	"queuedRetry": "Retry",

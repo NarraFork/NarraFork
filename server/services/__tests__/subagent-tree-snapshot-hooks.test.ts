@@ -35,8 +35,12 @@ import { normalizePathForComparison } from "../../lib/platform-path";
 import { settings } from "../../lib/settings";
 import { safeSpawn } from "../../lib/spawn";
 import type { TreeSnapshotSession } from "../narrator-tree-snapshot-hooks";
-import { buildTreeSnapshotEventHooks } from "../tree-snapshot-loop-hooks";
+import {
+	buildTreeSnapshotEventHooks,
+	buildTreeSnapshotExecutionHooks,
+} from "../tree-snapshot-loop-hooks";
 import { resetHotPathCaptureStateForTests, worktreeTreeSnapshot } from "../worktree-tree-snapshot";
+import { peekClaim } from "../worktree-write-claims";
 
 const createdNarrators: string[] = [];
 const tempDirs: string[] = [];
@@ -117,6 +121,88 @@ afterEach(async () => {
 			.where(eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(dir)));
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+describe("execution-owned snapshot boundaries", () => {
+	test("uses redirected inputs and updates only the bound row among repeated provider ids", async () => {
+		const repo = await createRepo("nf-lifecycle-binding-");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		const hooks = buildTreeSnapshotExecutionHooks({ session, narratorId, isInGitRepo: true });
+		const current = await seedToolCall(narratorId, "Write", 1);
+		const other = await seedToolCall(narratorId, "Write", 2);
+		const currentRow = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.messageId, current.messageId),
+		});
+		if (!currentRow) throw new Error("missing fixture tool row");
+		await db
+			.update(narratorToolCalls)
+			.set({ executionAttempt: 1 })
+			.where(eq(narratorToolCalls.id, currentRow.id));
+		await db
+			.update(narratorToolCalls)
+			.set({ toolUseId: current.toolUseId })
+			.where(eq(narratorToolCalls.messageId, other.messageId));
+		writeFileSync(join(repo, "actual.txt"), "before");
+		const context = {
+			toolUse: {
+				name: "Write",
+				toolUseId: current.toolUseId,
+				input: { file_path: join(repo, "original.txt") },
+			},
+			effectiveInput: { file_path: join(repo, "actual.txt") },
+			binding: { toolCallId: currentRow.id, attempt: 1 },
+			executionTarget: {
+				deviceId: "local",
+				backendKind: "local" as const,
+				cwd: repo,
+				selectionSource: "local_default" as const,
+			},
+		};
+		await hooks.onToolExecutionBefore?.(context);
+		writeFileSync(join(repo, "actual.txt"), "after");
+		await hooks.onToolExecutionAfter?.({ ...context, result: { output: "ok" } });
+		const updated = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, currentRow.id),
+		});
+		expect(updated?.treeHashBefore).toMatch(/^[0-9a-f]{40}$/);
+		expect(updated?.treeHashAfter).toMatch(/^[0-9a-f]{40}$/);
+		expect(updated?.ownedPathsJson).toEqual(["actual.txt"]);
+		const untouched = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.messageId, other.messageId),
+		});
+		expect(untouched?.treeHashBefore).toBeNull();
+		expect(untouched?.treeHashAfter).toBeNull();
+		expect(session._treeHashBefore?.size).toBe(0);
+	});
+
+	test("stale execution attempts cannot overwrite a newer row's boundaries", async () => {
+		const repo = await createRepo("nf-lifecycle-stale-");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		const hooks = buildTreeSnapshotExecutionHooks({ session, narratorId, isInGitRepo: true });
+		const { toolUseId } = await seedToolCall(narratorId, "Write", 1);
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, toolUseId),
+		});
+		if (!row) throw new Error("missing fixture tool row");
+		await db
+			.update(narratorToolCalls)
+			.set({ executionAttempt: 2 })
+			.where(eq(narratorToolCalls.id, row.id));
+		writeFileSync(join(repo, "a.txt"), "before");
+		const context = {
+			toolUse: { name: "Write", toolUseId, input: {} },
+			effectiveInput: { file_path: join(repo, "a.txt") },
+			binding: { toolCallId: row.id, attempt: 1 },
+		};
+		await hooks.onToolExecutionBefore?.(context);
+		writeFileSync(join(repo, "a.txt"), "after");
+		await hooks.onToolExecutionAfter?.({ ...context, error: new Error("partially failed write") });
+		expect((await readToolCallBoundaries(toolUseId))?.treeHashAfter).toBeNull();
+		expect(session._treeHashBefore?.size).toBe(0);
+		expect(peekClaim(repo, toolUseId)?.to).toBeNumber();
+	});
 });
 
 describe("subagent snapshot hooks record boundaries", () => {

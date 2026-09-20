@@ -30,7 +30,6 @@ import { RenderAskUserQuestion, RenderInlinePermission } from "./render/RenderPe
 import { RenderPlanCard } from "./render/RenderPlanCard";
 import { RenderReasoning } from "./render/RenderReasoning";
 import { RenderReviewCard } from "./render/RenderReviewCard";
-
 import { RenderSubagent } from "./render/RenderSubagent";
 import { RenderSubagentRecovery } from "./render/RenderSubagentRecovery";
 import { RenderSystemList } from "./render/RenderSystemList";
@@ -46,6 +45,8 @@ import {
 } from "./render/RenderToolRun";
 import { RenderTurnUsage } from "./render/RenderTurnUsage";
 import { RenderWebSearch } from "./render/RenderWebSearch";
+import type { VListViewControls } from "./VListContentViewHost";
+import type { VListViewOwner } from "./vlist-content-view-target";
 
 /**
  * Per-kind extra props supplied by the integration layer. Kept as an open record
@@ -346,6 +347,8 @@ export function renderElement(
 				<RenderSystemSimple
 					measured={m}
 					avatarSlot={extra.avatarSlot as React.ReactNode}
+					viewControls={extra.viewControls as VListViewControls | undefined}
+					viewOwner={extra.viewOwner as VListViewOwner | undefined}
 					onOpenCompact={extra.onOpenCompact as (() => void) | undefined}
 					onCancelCompact={extra.onCancelCompact as (() => void) | undefined}
 					cancelCompactTitle={extra.cancelCompactTitle as string | undefined}

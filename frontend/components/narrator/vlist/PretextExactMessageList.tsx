@@ -63,7 +63,6 @@ import {
 	resolveOlderHistoryAutoLoadEnabled,
 } from "../history/older-history-auto-load";
 import { useRenderLod } from "../lod/RenderLodCtx";
-import { MessageContextMenuCtx } from "../message/MessageContextMenuCtx";
 import { type MessageSelectionResolver, useMessageSelection } from "../message/MessageSelectionCtx";
 import { resolveEditorInitialText } from "../message/message-edit-text";
 import type { MessageListHandle, MessageListTailMeta } from "../message/message-list-handle";
@@ -78,7 +77,6 @@ import {
 	subagentRecentCallSummary,
 } from "../tool-call/tool-display";
 import { recentRunSegmentMessageIds } from "../trace/run-segments";
-import { TraceRowInteraction } from "../trace/TraceRowInteraction";
 import {
 	clearAllCompactProgress,
 	clearCompactProgress,
@@ -90,7 +88,6 @@ import type { MeasuredSubagent } from "./measure/measure-subagent";
 import type { MeasuredToolCall } from "./measure/measure-tool-call";
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
-import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { resolveRenderExtra } from "./render-registry";
 import { isStreamingMessageSuperseded } from "./streaming-handoff";
 import { type UsePretextDocumentResult, usePretextDocument } from "./usePretextDocument";
@@ -104,6 +101,7 @@ import {
 	useVListToolDetails,
 	type VListToolDetailRequest,
 } from "./useVListToolDetails";
+import { useVListTraceBindings } from "./useVListTraceBindings";
 import { VListContentViewModal } from "./VListContentViewModal";
 import { VListUserMarkers } from "./VListUserMarkers";
 import { useVListAskInPassing } from "./vlist-ask-in-passing-bridge";
@@ -153,7 +151,6 @@ import {
 	resolveItemViewTargets,
 	resolveRowOpenState,
 	resolveTraceRowCardData,
-	resolveTraceRowIdentity,
 	resolveTraceRowViewTargets,
 	rowInteractionSig,
 	rowSelectionBlockIds,
@@ -280,8 +277,8 @@ import {
 import {
 	buildRowCtxActions,
 	buildRowToolActions,
+	rowActionHandlerDependencies,
 	type VListRowHandlers,
-	type VListRowToolActions,
 } from "./vlist-row-actions";
 import {
 	beginRowPayloadFrame,
@@ -4320,9 +4317,9 @@ export const PretextExactMessageList = memo(
 			// drilled-in card's action bindings.
 			const interactionReuseRef = useRef<RowPayloadReuseState<RowInteraction> | null>(null);
 			const interactionsByKey = useMemo(() => {
-				// The closures below capture these; a change must rebuild every payload
-				// rather than reuse one wired to stale handlers (see the module's note).
-				const generation = [selectionIndex, rowHandlers, openEditor, messagesById] as const;
+				// Indices are inputs to the per-row projection, not captured by its actions.
+				// Rebuilding them for one message must not evict every historical payload.
+				const generation = [narratorId, openEditor, ...rowActionHandlerDependencies(rowHandlers)];
 				const previous = beginRowPayloadFrame(interactionReuseRef.current, generation);
 				const map = new Map<string, RowInteraction>();
 				if (!selectionIndex) {
@@ -4416,6 +4413,8 @@ export const PretextExactMessageList = memo(
 						blockIndices,
 						copyText,
 						actions,
+						editRole: editTarget?.role,
+						queuedActions: queued ? { ...queued } : undefined,
 						toolUseId,
 						toolDetailRef: toolUseId
 							? toolDetailRequestFromData(toolUseId, item.spec.data)
@@ -4436,6 +4435,7 @@ export const PretextExactMessageList = memo(
 				// read through `rowToolMetaIndex`, which is memoized on that same array —
 				// so it already re-keys this memo when the document changes.
 			}, [
+				narratorId,
 				selectionIndex,
 				renderItems,
 				manifestItems,
@@ -4483,94 +4483,15 @@ export const PretextExactMessageList = memo(
 				[narratorId, upsertOrReload, removeOrReload],
 			);
 
-			// Per-key ROW interaction slots for the folded traces (activity-trace /
-			// tool-run-summary). This is a second, finer tier than `interactionsByKey`:
-			// that one gives a whole list element its menu, this one gives each row INSIDE
-			// a collapsed trace its own. Built in a memo that does NOT depend on scroll
-			// state, so each slot stays referentially stable and the ExactRow memo keeps
-			// skipping unchanged rows while scrolling.
-			//
-			// `rowBody` is the row's ENTIRE painted block, drill-down included — a revealed
-			// card is the same tool call the row summarizes, so both live inside one
-			// interactive block (one menu, one swipe, one selection outline).
-			//
-			// ⚠️ ONE shared slot for every trace row, memoized WITHOUT `renderItems`.
-			//
-			// The closure captures nothing per-item — it resolves everything from the `row`
-			// it is handed — so a per-key function was never more than N copies of one
-			// behaviour. That distinction is load-bearing rather than cosmetic: `renderItems`
-			// is a fresh array on every layout commit, including the one each streaming delta
-			// produces, so minting the slots inside a memo that depends on it gave every
-			// mounted trace row a new `rowInteraction` prop per frame. The ExactRow memo
-			// compares that prop by identity, so the whole window re-rendered ~per frame for
-			// the duration of a live turn, and the folded row's CSS shimmer stuttered under
-			// the reconciliation (see vlist-row-payload-reuse.ts for the same problem on the
-			// `interaction` payload, which does carry per-row data and so needs a cache).
-			const traceRowInteractionSlot = useMemo<TraceRowInteractionSlot | undefined>(() => {
-				if (!selectionIndex) return undefined;
-				const toolMetaIndex = rowToolMetaIndex;
-				const handlers = rowHandlers ?? {};
-				return (row, rowBody) => {
-					const identity = resolveTraceRowIdentity(row, selectionIndex, toolMetaIndex);
-					if (!identity) return null;
-					const actions = buildRowCtxActions(
-						{
-							messageId: identity.messageId,
-							blockIndex: identity.blockIndex,
-							blockIndices: identity.blockIndices,
-						},
-						handlers,
-					);
-					return (
-						<MessageContextMenuCtx.Provider value={actions}>
-							<TraceRowInteraction
-								identity={identity}
-								actions={actions}
-								narratorId={narratorId}
-								toolDetailRef={row.identity?.toolDetailRef}
-								onViewSubagentSession={handlers.onViewSubagentSession}
-								onDetachSubagent={handlers.onDetachSubagent}
-								onCancelBackgroundTask={handlers.onCancelBackgroundTask}
-								onOpenFilePanel={handlers.onOpenFilePanel}
-							>
-								{rowBody}
-							</TraceRowInteraction>
-						</MessageContextMenuCtx.Provider>
-					);
-				};
-			}, [selectionIndex, rowHandlers, rowToolMetaIndex, narratorId]);
-
-			/**
-			 * The card-specific actions for a DRILLED-IN trace row's tool call (the
-			 * subagent card's "open full session" button, the lifecycle items). A trace
-			 * element carries no per-row interaction payload, so the drilled-in card
-			 * binds its own from the same meta index the row menus use.
-			 *
-			 * Referentially stable (memo deps are the shared index + the handlers), so
-			 * the ExactRow memo is unaffected.
-			 */
-			const resolveRowToolActions = useCallback(
-				(toolUseId: string): VListRowToolActions | undefined => {
-					const meta = rowToolMetaIndex.get(toolUseId);
-					if (!meta) return undefined;
-					return buildRowToolActions(meta, rowHandlers ?? {});
-				},
-				[rowToolMetaIndex, rowHandlers],
-			);
-
-			/**
-			 * Resolve the row-interaction slot for one list element.
-			 *
-			 * Kept a FUNCTION of the item rather than a prebuilt map so the lookup needs no
-			 * per-frame allocation at all: the answer is "the shared slot, if this kind folds
-			 * rows". A map keyed by `spec.key` would have to be rebuilt from `renderItems`
-			 * each commit, which is the churn this shape removes.
-			 */
-			const resolveRowInteraction = useCallback(
-				(item: VListItem): TraceRowInteractionSlot | undefined =>
-					TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind) ? traceRowInteractionSlot : undefined,
-				[traceRowInteractionSlot],
-			);
+			// Each trace group owns only its projected row bindings. Rebuilding a
+			// document index must not replace callbacks belonging to unchanged groups.
+			const traceBindingsByKey = useVListTraceBindings({
+				narratorId,
+				renderItems,
+				selectionIndex,
+				rowToolMetaIndex,
+				rowHandlers,
+			});
 
 			// Item index of the row being edited, so it can be pinned into the mounted
 			// window. -1 → not in the loaded document (nothing to pin).
@@ -4822,6 +4743,7 @@ export const PretextExactMessageList = memo(
 									if (!item || !geometry || !manifestItem) return null;
 									const sourceIds = sourceIdsForItem(item, manifestItem);
 									const itemId = domIdForItem(item, sourceIds);
+									const traceBinding = traceBindingsByKey.get(item.spec.key);
 									const permissionSlot = permissionSlotByKey.get(item.spec.key);
 									const editorSlot =
 										editingRow?.key === item.spec.key ? renderEditorSlot(editingRow) : undefined;
@@ -4864,7 +4786,7 @@ export const PretextExactMessageList = memo(
 											toggles={getRowToggles(item.spec.key)}
 											renderLabels={renderLabels}
 											interaction={interactionsByKey.get(item.spec.key)}
-											rowInteraction={resolveRowInteraction(item)}
+											rowInteraction={traceBinding?.rowInteraction}
 											closingRowKeys={closingRows.get(item.spec.key)}
 											narratorId={narratorId}
 											onOpenFilePanel={rowHandlers?.onOpenFilePanel}
@@ -4885,7 +4807,7 @@ export const PretextExactMessageList = memo(
 											// the card, not the trace) and the session/lifecycle actions a trace
 											// element has no interaction payload for. Both stable.
 											onTogglePromptForKey={togglePromptForKey}
-											resolveRowToolActions={resolveRowToolActions}
+											resolveRowToolActions={traceBinding?.resolveRowToolActions}
 											onUnknownHeight={
 												isDynamicRow ? getUnknownHeightReporter(item.spec.key) : undefined
 											}

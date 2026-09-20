@@ -41,9 +41,10 @@ import {
 	type VListViewOwner,
 	type VListViewTarget,
 } from "./vlist-content-view-target";
+import type { VListEditRole } from "./vlist-edit-target";
 import type { VListInteractionState } from "./vlist-interaction-state";
 import type { VListItem } from "./vlist-pipeline";
-import type { VListRowToolActions } from "./vlist-row-actions";
+import type { VListRowActionTarget, VListRowToolActions } from "./vlist-row-actions";
 import { sameBoundActionKeys, sameNumberList } from "./vlist-row-payload-reuse";
 import type { SelectionIndex } from "./vlist-selection";
 import type { VListToolMeta } from "./vlist-tool-meta";
@@ -415,6 +416,11 @@ export function sameRowInteraction(a: RowInteraction, b: RowInteraction): boolea
 		a.blockIndex === b.blockIndex &&
 		sameNumberList(a.blockIndices, b.blockIndices) &&
 		a.copyText === b.copyText &&
+		// These were previously protected only by replacing the whole document cache.
+		a.editRole === b.editRole &&
+		a.queuedActions?.onEdit === b.queuedActions?.onEdit &&
+		a.queuedActions?.onCancel === b.queuedActions?.onCancel &&
+		a.queuedActions?.onRetry === b.queuedActions?.onRetry &&
 		a.toolUseId === b.toolUseId &&
 		a.toolDetailRef?.toolUseId === b.toolDetailRef?.toolUseId &&
 		a.toolDetailRef?.toolCallId === b.toolDetailRef?.toolCallId &&
@@ -444,7 +450,7 @@ export function sameRowInteraction(a: RowInteraction, b: RowInteraction): boolea
 }
 
 /** Field-wise comparison of the tool facts a row payload carries. */
-function sameToolMeta(a: VListToolMeta | undefined, b: VListToolMeta | undefined): boolean {
+export function sameToolMeta(a: VListToolMeta | undefined, b: VListToolMeta | undefined): boolean {
 	if (a === b) return true;
 	if (!a || !b) return false;
 	return (
@@ -453,6 +459,8 @@ function sameToolMeta(a: VListToolMeta | undefined, b: VListToolMeta | undefined
 		a.isFileTool === b.isFileTool &&
 		a.isReadTool === b.isReadTool &&
 		a.subagentNarratorId === b.subagentNarratorId &&
+		a.awaitQuestionId === b.awaitQuestionId &&
+		a.awaitQuestionSeq === b.awaitQuestionSeq &&
 		a.awaitAgentTargetId === b.awaitAgentTargetId &&
 		a.awaitAgentNarratorId === b.awaitAgentNarratorId &&
 		a.sendTargetNarratorId === b.sendTargetNarratorId &&
@@ -499,6 +507,10 @@ export interface RowInteraction {
 	blockIndices?: readonly number[];
 	copyText?: string;
 	actions: MessageContextMenuActions;
+	/** Editor mode captured by the bound edit action, not just action presence. */
+	editRole?: VListEditRole;
+	/** Queued controls may change behind a stable resolver; compare the bound callbacks. */
+	queuedActions?: VListRowActionTarget["queued"];
 	/** Tool-call id for tc-/sa- rows (drives the inspector item). */
 	toolUseId?: string;
 	/** Exact request identity from the card, not the selection alias. */

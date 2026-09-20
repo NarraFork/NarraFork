@@ -1,5 +1,5 @@
 import { type BigIntStats, constants } from "node:fs";
-import { type FileHandle, lstat, mkdir, open } from "node:fs/promises";
+import { lstat, mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
@@ -45,7 +45,37 @@ function regular(stat: BigIntStats): void {
 		throw new LocalFileValidationError("File exceeds the 32 MiB evidence limit");
 }
 
-async function readHandle(file: FileHandle, signal?: AbortSignal): Promise<LocalFileObservation> {
+/** Only the descriptor operations used here; injectable without global FS mocks. */
+export interface LocalFileHandle {
+	stat(options: { bigint: true }): Promise<BigIntStats>;
+	read(
+		buffer: Uint8Array,
+		offset: number,
+		length: number,
+		position: number,
+	): Promise<{ bytesRead: number }>;
+	write(
+		buffer: Uint8Array,
+		offset: number,
+		length: number,
+		position: number,
+	): Promise<{ bytesWritten: number }>;
+	truncate(length: number): Promise<void>;
+	sync(): Promise<void>;
+	close(): Promise<void>;
+}
+
+export interface LocalFileSyscalls {
+	lstat(path: string, options: { bigint: true }): Promise<BigIntStats>;
+	/** Deliberately non-recursive: one call can affect only this directory entry. */
+	mkdir(path: string): Promise<void>;
+	open(path: string, flags: number, mode?: number): Promise<LocalFileHandle>;
+}
+
+async function readHandle(
+	file: LocalFileHandle,
+	signal?: AbortSignal,
+): Promise<LocalFileObservation> {
 	signal?.throwIfAborted();
 	const initial = await file.stat({ bigint: true });
 	regular(initial);
@@ -80,13 +110,38 @@ export interface LocalFileApplyInput {
 	signal: AbortSignal;
 	/** Includes the frozen runtime, workspace incarnation and coordinator fence. */
 	assertTarget(): Promise<void>;
-	/** Called synchronously immediately before the first mutating syscall. */
+	/** Registration only, immediately before the first potentially mutating syscall. */
 	onDispatch(): void;
 }
 
+export const LOCAL_FILE_PARENT_DEPTH_LIMIT = 128;
+
+export interface LocalFileParentEffects {
+	/** Successful, single-entry mkdir calls, in creation order; at most 128 paths. */
+	createdPaths: string[];
+	/** At most one uncertain mkdir entry (never a recursive subtree); not safe to dismiss. */
+	possiblePaths: string[];
+}
+
+/**
+ * not_applied: no target mutation and both parent lists empty.
+ * parent_only: target untouched; runtime must evaluate BOTH parent lists against
+ * its admitted scope before treating this as safely releasable.
+ * target_mutation_unknown: target mutation started or its completion is uncertain.
+ * applied: all writes, sync, validation and close completed successfully.
+ */
+export type LocalFileApplyResult =
+	| {
+			kind: "not_applied" | "parent_only" | "target_mutation_unknown";
+			error: unknown;
+			parentEffects: LocalFileParentEffects;
+	  }
+	| { kind: "applied"; error: null; parentEffects: LocalFileParentEffects };
+
 export interface FileChangeLocalIo {
 	read(path: string, signal?: AbortSignal): Promise<LocalFileObservation>;
-	apply(input: LocalFileApplyInput): Promise<void>;
+	/** Failures are returned, not swallowed. The caller must throw result.error. */
+	apply(input: LocalFileApplyInput): Promise<LocalFileApplyResult>;
 }
 
 function equal(left: LocalFileObservation, right: LocalFileObservation): boolean {
@@ -99,118 +154,230 @@ function equal(left: LocalFileObservation, right: LocalFileObservation): boolean
 	);
 }
 
+function codeOf(error: unknown): string | undefined {
+	return error !== null && typeof error === "object" && "code" in error
+		? String(error.code)
+		: undefined;
+}
+
+/**
+ * Used ONLY at the controlled nonrecursive mkdir / O_EXCL open call boundary.
+ * These errors reject creation before changing the entry. Other failures (EIO,
+ * cancellation-shaped exceptions, adapter bugs, etc.) retain uncertain effects.
+ * Never apply this whitelist to truncate/write/sync/close or caller exceptions.
+ */
+function creationDefinitelyRejected(error: unknown): boolean {
+	return ["EACCES", "EPERM", "EEXIST", "ENOENT", "ENOTDIR", "EROFS", "ELOOP"].includes(
+		codeOf(error) ?? "",
+	);
+}
+
+function directory(stat: BigIntStats): void {
+	if (!stat.isDirectory() || stat.isSymbolicLink())
+		throw new LocalFileValidationError("Canonical parent is not a directory");
+}
+
 /**
  * A bounded, descriptor-based local writer. It does NOT promise filesystem CAS or
  * OS atomicity: an external writer may race any check. Such observed mismatches
  * are quarantined by the runtime; no old state is automatically written back.
  */
-export const fileChangeLocalIo: FileChangeLocalIo = {
-	async read(path, signal) {
-		signal?.throwIfAborted();
-		let entry: BigIntStats;
-		try {
-			entry = await lstat(path, { bigint: true });
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT")
-				return { bytes: null, mode: null, identity: null };
-			throw error;
-		}
-		regular(entry);
-		const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-		try {
-			const observed = await readHandle(file, signal);
-			const current = await lstat(path, { bigint: true });
-			regular(current);
-			if (
-				observed.identity !== localObjectIdentity(entry) ||
-				observed.identity !== localObjectIdentity(current)
-			)
-				throw new LocalFileValidationError("Canonical file object changed during read");
+export function createFileChangeLocalIo(
+	syscalls: LocalFileSyscalls = { lstat, mkdir, open },
+): FileChangeLocalIo {
+	return {
+		async read(path, signal) {
+			signal?.throwIfAborted();
+			let entry: BigIntStats;
+			try {
+				entry = await syscalls.lstat(path, { bigint: true });
+			} catch (error) {
+				if (codeOf(error) === "ENOENT") return { bytes: null, mode: null, identity: null };
+				throw error;
+			}
+			regular(entry);
+			const file = await syscalls.open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+			let observed: LocalFileObservation;
+			try {
+				observed = await readHandle(file, signal);
+				const current = await syscalls.lstat(path, { bigint: true });
+				regular(current);
+				if (
+					observed.identity !== localObjectIdentity(entry) ||
+					observed.identity !== localObjectIdentity(current)
+				)
+					throw new LocalFileValidationError("Canonical file object changed during read");
+			} catch (error) {
+				try {
+					await file.close();
+				} catch {
+					// Keep the primary read/validation error rather than cleanup's error.
+				}
+				throw error;
+			}
+			await file.close();
 			return observed;
-		} finally {
-			await file.close();
-		}
-	},
-	async apply(input) {
-		const { before, canonicalPath, nextBytes, signal } = input;
-		signal.throwIfAborted();
-		if (nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
-			throw new LocalFileValidationError("Output exceeds the 32 MiB evidence limit");
-		await input.assertTarget();
-		if (!equal(before, await this.read(canonicalPath, signal)))
-			throw new LocalFileValidationError("Content/object changed before dispatch");
-		let file: FileHandle;
-		if (before.bytes === null) {
-			// Directory creation is also a dispatch: a later failure must not claim
-			// no filesystem calls ran. Never compensate these parents recursively.
-			signal.throwIfAborted();
-			input.onDispatch();
-			signal.throwIfAborted();
-			await mkdir(dirname(canonicalPath), { recursive: true });
-			await input.assertTarget();
-			signal.throwIfAborted();
-			file = await open(
-				canonicalPath,
-				constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
-				0o666,
-			);
-		} else {
-			if (before.mode !== null && (before.mode & 0o222) === 0)
-				throw new LocalFileValidationError("File is read-only");
-			// Opening an existing descriptor does not truncate or otherwise mutate it.
-			file = await open(canonicalPath, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0));
-		}
-		try {
-			if (before.bytes !== null && !equal(before, await readHandle(file, signal)))
-				throw new LocalFileValidationError("Opened content/object changed before dispatch");
-			// O_EXCL already mutated a new target. Its runtime/path guards ran just
-			// before open: do not let a cancelled lease leave that file empty now.
-			if (before.bytes !== null) await input.assertTarget();
-			// assertTarget awaits canonical/runtime guards. Recheck the descriptor
-			// against the directory entry AFTER those awaits: a rename-and-replace
-			// must not make us truncate the now-moved original object. This narrows
-			// the observed race window; it is not an OS-level CAS guarantee.
-			const [openedBeforeDispatch, pathBeforeDispatch] = await Promise.all([
-				file.stat({ bigint: true }),
-				lstat(canonicalPath, { bigint: true }),
-			]);
-			regular(openedBeforeDispatch);
-			regular(pathBeforeDispatch);
-			if (localObjectIdentity(openedBeforeDispatch) !== localObjectIdentity(pathBeforeDispatch))
-				throw new LocalFileValidationError(
-					"Opened object no longer matches the target before dispatch",
-				);
-			if (before.bytes !== null) {
+		},
+		async apply(input) {
+			const { before, canonicalPath, nextBytes, signal } = input;
+			const parentEffects: LocalFileParentEffects = { createdPaths: [], possiblePaths: [] };
+			let targetMutation = false;
+			let file: LocalFileHandle | undefined;
+			let failed = false;
+			let failure: unknown;
+			let registered = false;
+			const beforeMutation = () => {
 				signal.throwIfAborted();
-				input.onDispatch();
+				if (!registered) {
+					input.onDispatch();
+					registered = true;
+				}
 				signal.throwIfAborted();
-				await file.truncate(0);
+			};
+			try {
+				signal.throwIfAborted();
+				if (nextBytes.byteLength > FILE_CHANGE_LIMITS.blobBytes)
+					throw new LocalFileValidationError("Output exceeds the 32 MiB evidence limit");
+				await input.assertTarget();
+				signal.throwIfAborted();
+				if (!equal(before, await this.read(canonicalPath, signal)))
+					throw new LocalFileValidationError("Content/object changed before dispatch");
+				if (before.bytes === null) {
+					// Bound the whole ancestor chain before any mutation, then discover
+					// missing entries without recursive mkdir's opaque partial effects.
+					const ancestors: string[] = [];
+					let path = dirname(canonicalPath);
+					while (dirname(path) !== path) {
+						if (ancestors.length >= LOCAL_FILE_PARENT_DEPTH_LIMIT)
+							throw new LocalFileValidationError("Parent directory depth exceeds 128");
+						ancestors.push(path);
+						path = dirname(path);
+					}
+					const missing: string[] = [];
+					for (const ancestor of ancestors) {
+						signal.throwIfAborted();
+						try {
+							directory(await syscalls.lstat(ancestor, { bigint: true }));
+							break;
+						} catch (error) {
+							if (codeOf(error) !== "ENOENT") throw error;
+							missing.push(ancestor);
+						}
+					}
+					for (const parent of missing.reverse()) {
+						// Discovery awaits can observe a deleted/replaced admission
+						// anchor. Revalidate before EACH mkdir, not after creating it.
+						await input.assertTarget();
+						beforeMutation();
+						try {
+							await syscalls.mkdir(parent);
+							parentEffects.createdPaths.push(parent);
+						} catch (error) {
+							if (!creationDefinitelyRejected(error)) parentEffects.possiblePaths.push(parent);
+							if (codeOf(error) !== "EEXIST") throw error;
+							// Another actor may have made the directory. EEXIST itself
+							// proves nothing about its type, and is not our side effect.
+							directory(await syscalls.lstat(parent, { bigint: true }));
+						}
+					}
+					signal.throwIfAborted();
+					await input.assertTarget();
+					beforeMutation();
+					targetMutation = true;
+					try {
+						file = await syscalls.open(
+							canonicalPath,
+							constants.O_WRONLY |
+								constants.O_CREAT |
+								constants.O_EXCL |
+								(constants.O_NOFOLLOW ?? 0),
+							0o666,
+						);
+					} catch (error) {
+						if (creationDefinitelyRejected(error)) targetMutation = false;
+						throw error;
+					}
+				} else {
+					if (before.mode !== null && (before.mode & 0o222) === 0)
+						throw new LocalFileValidationError("File is read-only");
+					signal.throwIfAborted();
+					// No O_TRUNC/O_CREAT: even a failed open cannot mutate the target.
+					file = await syscalls.open(canonicalPath, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0));
+				}
+				if (before.bytes !== null && !equal(before, await readHandle(file, signal)))
+					throw new LocalFileValidationError("Opened content/object changed before dispatch");
+				// After exclusive creation, complete persistence despite cancellation.
+				if (before.bytes !== null) await input.assertTarget();
+				// Recheck the descriptor after asynchronous guards. This narrows the
+				// rename-and-replace race window; it is not an OS-level CAS guarantee.
+				const openedBeforeDispatch = await file.stat({ bigint: true });
+				const pathBeforeDispatch = await syscalls.lstat(canonicalPath, { bigint: true });
+				regular(openedBeforeDispatch);
+				regular(pathBeforeDispatch);
+				if (localObjectIdentity(openedBeforeDispatch) !== localObjectIdentity(pathBeforeDispatch))
+					throw new LocalFileValidationError(
+						"Opened object no longer matches the target before dispatch",
+					);
+				if (before.bytes !== null) {
+					beforeMutation();
+					targetMutation = true;
+					await file.truncate(0);
+				}
+				// Never race IO with cancellation: await the entire bounded write,
+				// sync and close, even if cancellation happens after mutation starts.
+				let offset = 0;
+				while (offset < nextBytes.byteLength) {
+					const written = await file.write(
+						nextBytes,
+						offset,
+						Math.min(64 * 1024, nextBytes.byteLength - offset),
+						offset,
+					);
+					if (!written.bytesWritten) throw new Error("Local file write made no progress");
+					offset += written.bytesWritten;
+				}
+				await file.sync();
+				await input.assertTarget();
+				signal.throwIfAborted();
+				const written = await file.stat({ bigint: true });
+				const current = await syscalls.lstat(canonicalPath, { bigint: true });
+				regular(current);
+				if (localObjectIdentity(written) !== localObjectIdentity(current))
+					throw new LocalFileValidationError("Written object was replaced before verification");
+			} catch (error) {
+				failed = true;
+				failure = error;
+			} finally {
+				if (file) {
+					try {
+						await file.close();
+					} catch (error) {
+						// A failed close is not successful completion. Keep the primary
+						// error if an earlier stage failed; do not mask it with cleanup.
+						// Closing an existing nontruncating descriptor does not itself
+						// modify content: retain the actual mutation stage, not a guess.
+						if (!failed) failure = error;
+						failed = true;
+					}
+				}
 			}
-			// Once truncate/O_EXCL starts, finish the bounded write and sync even
-			// after cooperative cancellation. IO errors still propagate; this is
-			// not atomicity and must never trigger a rollback over external edits.
-			let offset = 0;
-			while (offset < nextBytes.byteLength) {
-				const written = await file.write(
-					nextBytes,
-					offset,
-					Math.min(64 * 1024, nextBytes.byteLength - offset),
-					offset,
-				);
-				if (!written.bytesWritten) throw new Error("Local file write made no progress");
-				offset += written.bytesWritten;
+			// Cancellation while awaiting close must not be reported as a clean apply.
+			if (!failed && signal.aborted) {
+				failed = true;
+				failure = signal.reason;
 			}
-			await file.sync();
-			await input.assertTarget();
-			const [written, current] = await Promise.all([
-				file.stat({ bigint: true }),
-				lstat(canonicalPath, { bigint: true }),
-			]);
-			regular(current);
-			if (localObjectIdentity(written) !== localObjectIdentity(current))
-				throw new LocalFileValidationError("Written object was replaced before verification");
-		} finally {
-			await file.close();
-		}
-	},
-};
+			if (!failed) return { kind: "applied", error: null, parentEffects };
+			return {
+				kind: targetMutation
+					? "target_mutation_unknown"
+					: parentEffects.createdPaths.length || parentEffects.possiblePaths.length
+						? "parent_only"
+						: "not_applied",
+				error: failure,
+				parentEffects,
+			};
+		},
+	};
+}
+
+export const fileChangeLocalIo: FileChangeLocalIo = createFileChangeLocalIo();

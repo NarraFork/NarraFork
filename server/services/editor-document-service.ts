@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import type { Stats } from "node:fs";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, unlink } from "node:fs/promises";
+import { chmod, chown, lstat, mkdir, open, readdir, rm, rmdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	type CreateEditorDocumentInput,
@@ -129,6 +130,89 @@ const expired = () =>
 	);
 const invalid = (message: string) => new EditorDocumentError("EDITOR_INVALID_STATE", message);
 
+function storageUnavailable(message: string): AppError {
+	return new AppError(message, 503, "EDITOR_STORAGE_UNAVAILABLE");
+}
+
+function tempDirectoryIdentity(stat: Stats): string {
+	return `${stat.dev}:${stat.ino}`;
+}
+
+function isPrivateOwnedTempDirectory(stat: Stats): boolean {
+	if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
+	if (process.platform === "win32") return true;
+	const euid = process.geteuid?.();
+	return (stat.mode & 0o077) === 0 && (euid === undefined || stat.uid === euid);
+}
+
+/**
+ * Ensure `root` is a private, process-owned, non-symlink directory.
+ *
+ * The path holds disposable editor transfer objects. Operational faults — loose
+ * permissions after a home-directory chmod, a leftover symlink/file from a
+ * migration, a missing directory after a partial restore — are repaired in place
+ * instead of surfacing as session errors. Only shapes we cannot safely fix
+ * (foreign-owned non-empty directory we cannot chown, chmod failures) throw.
+ *
+ * Symlink/non-directory replacement unlinks the path node itself; it never
+ * follows the link or deletes the link target's contents.
+ */
+async function ensureEditorTempDirectory(root: string): Promise<string> {
+	let lastError: unknown;
+	for (let attempt = 0; attempt < 4; attempt++) {
+		try {
+			await mkdir(root, { recursive: true, mode: 0o700 });
+		} catch (error) {
+			lastError = error;
+		}
+		let stat: Stats;
+		try {
+			stat = await lstat(root);
+		} catch (error) {
+			lastError = error;
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		if (isPrivateOwnedTempDirectory(stat)) return tempDirectoryIdentity(stat);
+		try {
+			if (stat.isSymbolicLink() || !stat.isDirectory()) {
+				await rm(root, { recursive: true, force: true });
+				continue;
+			}
+			if (process.platform !== "win32") {
+				const euid = process.geteuid?.();
+				if (euid !== undefined && stat.uid !== euid) {
+					try {
+						await chown(root, euid, process.getegid?.() ?? -1);
+						continue;
+					} catch (error) {
+						lastError = error;
+					}
+					const entries = await readdir(root).catch(() => null);
+					if (entries && entries.length === 0) {
+						await rmdir(root);
+						continue;
+					}
+					throw storageUnavailable(
+						"Editor temporary directory is owned by another account and cannot be repaired automatically",
+					);
+				}
+				await chmod(root, 0o700);
+			}
+		} catch (error) {
+			if (error instanceof AppError) throw error;
+			lastError = error;
+		}
+	}
+	const detail =
+		lastError instanceof Error && lastError.message
+			? lastError.message.slice(0, 160)
+			: "unrecoverable filesystem shape";
+	throw storageUnavailable(
+		`Editor temporary directory must be owned, private and non-symlink; automatic repair failed: ${detail}`,
+	);
+}
+
 /** All state is bounded metadata. Text exists only in worker memory and private temporary objects. */
 export class EditorDocumentService {
 	private sessions = new Map<string, Session>();
@@ -136,60 +220,70 @@ export class EditorDocumentService {
 	private readonly jobs: EditorDocumentJobs;
 	private ready?: Promise<void>;
 	private rootIdentity?: string;
+	private heal?: Promise<void>;
 	private timer?: ReturnType<typeof setInterval>;
 	constructor(private readonly deps: EditorDocumentDependencies) {
 		this.jobs = deps.jobs ?? new EditorDocumentJobs();
 	}
 	private initialize(): Promise<void> {
-		this.ready ??= (async () => {
-			await mkdir(this.deps.root, { recursive: true, mode: 0o700 });
-			const stat = await lstat(this.deps.root);
-			if (
-				!stat.isDirectory() ||
-				stat.isSymbolicLink() ||
-				(process.platform !== "win32" &&
-					((stat.mode & 0o077) !== 0 || stat.uid !== process.geteuid?.()))
-			)
-				throw new AppError(
-					"Editor temporary directory must be owned, private and non-symlink",
-					503,
-					"EDITOR_STORAGE_UNAVAILABLE",
-				);
-			this.rootIdentity = `${stat.dev}:${stat.ino}`;
-			const cleaned = await this.jobs.run("startup-cleanup", {
-				action: "cleanup",
-				root: this.deps.root,
-			});
-			if (cleaned.kind !== "cleaned") throw invalid("Unexpected recovery worker response");
-			for (const recovery of cleaned.operations)
-				this.operations.set(recovery.operationId, {
-					userId: recovery.userId,
-					narratorId: recovery.narratorId,
-					recovery,
-					value: { status: "uncertain", operationId: recovery.operationId },
-					expires: recovery.createdAt + EDITOR_SESSION_IDLE_MS,
-				});
-			this.timer = setInterval(() => {
-				void this.sweep();
-			}, 30_000);
-			this.timer.unref();
-		})();
+		this.ready ??= this.bootstrap().catch((error) => {
+			// Allow the next editor open to retry after a transient FS failure.
+			this.ready = undefined;
+			throw error;
+		});
 		return this.ready;
 	}
+	private async bootstrap(): Promise<void> {
+		this.rootIdentity = await ensureEditorTempDirectory(this.deps.root);
+		const cleaned = await this.jobs.run("startup-cleanup", {
+			action: "cleanup",
+			root: this.deps.root,
+		});
+		if (cleaned.kind !== "cleaned") throw invalid("Unexpected recovery worker response");
+		for (const recovery of cleaned.operations)
+			this.operations.set(recovery.operationId, {
+				userId: recovery.userId,
+				narratorId: recovery.narratorId,
+				recovery,
+				value: { status: "uncertain", operationId: recovery.operationId },
+				expires: recovery.createdAt + EDITOR_SESSION_IDLE_MS,
+			});
+		this.timer = setInterval(() => {
+			void this.sweep();
+		}, 30_000);
+		this.timer.unref();
+	}
+	private async healRoot(): Promise<void> {
+		this.heal ??= (async () => {
+			const identity = await ensureEditorTempDirectory(this.deps.root);
+			const previous = this.rootIdentity;
+			this.rootIdentity = identity;
+			if (previous !== identity)
+				logger.warn("Repaired editor temporary directory", {
+					path: this.deps.root,
+					previousIdentity: previous ?? null,
+					identity,
+				});
+		})().finally(() => {
+			this.heal = undefined;
+		});
+		await this.heal;
+	}
 	private async assertStore() {
-		const stat = await lstat(this.deps.root);
+		const stat = await lstat(this.deps.root).catch(() => null);
 		if (
-			stat.isSymbolicLink() ||
-			!stat.isDirectory() ||
-			`${stat.dev}:${stat.ino}` !== this.rootIdentity ||
-			(process.platform !== "win32" &&
-				((stat.mode & 0o077) !== 0 || stat.uid !== process.geteuid?.()))
+			stat &&
+			isPrivateOwnedTempDirectory(stat) &&
+			tempDirectoryIdentity(stat) === this.rootIdentity
 		)
-			throw new EditorDocumentError(
-				"EDITOR_STORAGE_UNAVAILABLE",
-				"Editor temporary directory changed",
-				503,
-			);
+			return;
+		try {
+			await this.healRoot();
+		} catch (error) {
+			if (error instanceof AppError)
+				throw new EditorDocumentError("EDITOR_STORAGE_UNAVAILABLE", error.message, 503);
+			throw error;
+		}
 	}
 	private path() {
 		return join(this.deps.root, `ed-${randomUUID()}`);

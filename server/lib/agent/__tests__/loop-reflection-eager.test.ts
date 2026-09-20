@@ -10,7 +10,8 @@ const NORMAL_TOOL_NAME = "TestReflectNormalTool";
 /** Records the order in which each tool's execute() started. */
 const executionOrder: string[] = [];
 
-let scenario: "reflection" | "normal" = "reflection";
+let scenario: "reflection" | "normal" | "reflection_then_normal" = "reflection";
+let onNormalStarted: (() => void) | undefined;
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
@@ -18,11 +19,16 @@ const testProvider: ProviderAdapter = {
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
-		const toolName = scenario === "reflection" ? REFLECTION_TOOL_NAME : NORMAL_TOOL_NAME;
-		// Emit the decision tool call, then keep streaming trailing text so there is a
-		// window during which an eager execution (if any) would have already started.
+		// The ordinary eager baseline has no preceding reflection barrier. A separate
+		// scenario verifies that ordinary work cannot overtake such a barrier.
+		const toolName = scenario === "normal" ? NORMAL_TOOL_NAME : REFLECTION_TOOL_NAME;
 		yield {
-			toolUses: [{ toolUseId: "tu_decision", name: toolName, input: { value: "x" } }],
+			toolUses: [
+				{ toolUseId: "tu_decision", name: toolName, input: { value: "x" } },
+				...(scenario === "reflection_then_normal"
+					? [{ toolUseId: "tu_after_reflection", name: NORMAL_TOOL_NAME, input: { value: "y" } }]
+					: []),
+			],
 		};
 		yield { text: "trailing text after tool call" };
 		// Hang until the caller aborts mid-stream (mirrors a real provider stream that is
@@ -73,6 +79,7 @@ toolRegistry.register({
 	parameters: z.object({ value: z.string() }),
 	execute: async (args) => {
 		executionOrder.push(NORMAL_TOOL_NAME);
+		onNormalStarted?.();
 		return { output: `normal:${args.value}` };
 	},
 });
@@ -99,15 +106,21 @@ function makeConfig(signal: AbortSignal): AgentConfig {
 async function runUntilAbortMidStream(): Promise<AgentEvent[]> {
 	const ac = new AbortController();
 	const events: AgentEvent[] = [];
+	const normalStarted = new Promise<void>((resolve) => {
+		onNormalStarted = resolve;
+	});
 	for await (const event of agentLoop(makeConfig(ac.signal), "decide", [])) {
 		events.push(event);
 		// Abort while the provider stream is still open (trailing text just arrived),
 		// mirroring the reflection abort race that produced spurious "Aborted" records.
 		if (event.type === "stream_text") {
-			await Promise.resolve();
+			// A tool_call announcement alone does not imply execute() has started.
+			// Wait for real execution only in the independent, barrier-free baseline.
+			if (scenario === "normal") await normalStarted;
 			ac.abort();
 		}
 	}
+	onNormalStarted = undefined;
 	return events;
 }
 
@@ -127,15 +140,31 @@ describe("reflection-only tools are not eager-executed mid-stream", () => {
 		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
 	});
 
+	test("ordinary tools after a reflection barrier do not execute mid-stream", async () => {
+		scenario = "reflection_then_normal";
+		executionOrder.length = 0;
+
+		const events = await runUntilAbortMidStream();
+
+		expect(executionOrder).toEqual([]);
+		expect(events.some((event) => event.type === "tool_result")).toBe(false);
+		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
+	});
+
 	test("a normal eager-eligible tool still executes during streaming", async () => {
 		scenario = "normal";
 		executionOrder.length = 0;
 
-		await runUntilAbortMidStream();
+		const events = await runUntilAbortMidStream();
 
 		// Baseline: a non-reflection tool IS eager-executed, so its execute() starts during
 		// streaming even though the stream is aborted mid-flight. This guards against the fix
 		// over-broadly disabling eager execution for ordinary tools.
-		expect(executionOrder).toContain(NORMAL_TOOL_NAME);
+		expect(executionOrder).toEqual([NORMAL_TOOL_NAME]);
+		expect(events.some((event) => event.type === "assistant_message")).toBe(false);
+		expect(events.filter((event) => event.type === "tool_result")).toMatchObject([
+			{ toolUseId: "tu_decision", output: "normal:x", isError: false },
+		]);
+		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
 	});
 });

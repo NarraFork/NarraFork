@@ -245,10 +245,10 @@ export interface ExactRowProps {
 	/**
 	 * Bind the card-specific actions (open session / detach / cancel) for a
 	 * DRILLED-IN row's tool call. A trace element carries no per-row interaction
-	 * payload, so a drilled-in subagent card resolves its own through the shared
-	 * tool meta index.
+	 * payload, so a drilled-in subagent card resolves its own through its group's
+	 * binding. The row key includes retry suffixes; a tool-use id is not unique.
 	 */
-	resolveRowToolActions?: (toolUseId: string) => VListRowToolActions | undefined;
+	resolveRowToolActions?: (rowKey: string) => VListRowToolActions | undefined;
 	/** Submit the subagent-recovery card's selection (mutation lives outside vlist/). */
 	onResumeSubagentRecovery?: (messageId: string, specKey: string, mode: "notify" | "await") => void;
 	/**
@@ -488,10 +488,9 @@ export const ExactRow = memo(
 						subExtra.onTogglePrompt = () => onTogglePromptForKey(item.spec.key, promptKey);
 					}
 					// "Open full session": the standalone card gets this from its element
-					// interaction; a trace element has none, so bind it per row from the
-					// shared tool meta index.
-					const subToolUseId = row.identity?.toolUseId;
-					const subToolActions = subToolUseId ? resolveRowToolActions?.(subToolUseId) : undefined;
+					// interaction; a trace element has none, so bind it using this row's
+					// exact render key (including any retry suffix).
+					const subToolActions = resolveRowToolActions?.(row.key);
 					if (subToolActions?.onViewSubagentSession) {
 						subExtra.onOpenSession = subToolActions.onViewSubagentSession;
 					}
@@ -721,6 +720,11 @@ export const ExactRow = memo(
 		// hover action bar (copy / wrap / source / fullscreen) — the affordances the
 		// chunked path gets from ContentViewer. Purely additive: without controls the
 		// render layer draws exactly what it drew before.
+		// Result snapshots open in the list-owned modal, not inside an evictable row.
+		if (kind === "system-simple" && viewControls) {
+			extra.viewControls = viewControls;
+			extra.viewOwner = { specKey: item.spec.key };
+		}
 		const viewTargets = viewControls
 			? resolveItemViewTargets(item, renderLabels, extra)
 			: undefined;

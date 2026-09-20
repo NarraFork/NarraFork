@@ -4097,6 +4097,77 @@ describe("reasoning steps: one identity across the L2/L3 boundary", () => {
 describe("adaptSegment — a concluded review", () => {
 	const CTX: AdapterContext = { lod: 5 };
 
+	describe("publication result receipts", () => {
+		const publicationResult = {
+			logicalRunId: "run",
+			truncated: true,
+			originalBytes: 90000,
+			sourceResultRef: "message:answer",
+		};
+		it.each([
+			1, 5,
+		] as const)("keeps snapshot identity and fixed single-line geometry at L%s", (lod) => {
+			const specs = adaptSegment(
+				{
+					kind: "message",
+					msg: {
+						id: "publication-result:run",
+						role: "disp",
+						contentJson: [{ type: "text", text: "large result".repeat(1000), publicationResult }],
+					},
+				},
+				{ lod },
+			);
+			expect(specs).toHaveLength(1);
+			expect(specs[0]).toMatchObject({
+				kind: "system-simple",
+				key: "publication-result:run-b0",
+				data: {
+					kind: "publication_result",
+					text: "",
+					messageId: "publication-result:run",
+					publicationResult,
+				},
+			});
+			const measured = VLIST_REGISTRY[specs[0].kind].measure(specs[0].data, 320, lod);
+			expect(measured.height).toBe(25);
+		});
+		it.each(["sys", "system", "assistant"])("does not collapse %s messages", (role) => {
+			const specs = adaptSegment(
+				{
+					kind: "message",
+					msg: {
+						id: "ordinary",
+						role,
+						contentJson: [{ type: "text", text: "ordinary", publicationResult }],
+					},
+				},
+				CTX,
+			);
+			expect(
+				specs.some((spec) => (spec.data as { kind?: string }).kind === "publication_result"),
+			).toBe(false);
+		});
+		it("does not collapse ordinary or malformed display messages", () => {
+			for (const meta of [undefined, { ...publicationResult, logicalRunId: "" }]) {
+				const specs = adaptSegment(
+					{
+						kind: "message",
+						msg: {
+							id: "ordinary",
+							role: "disp",
+							contentJson: [{ type: "text", text: "ordinary", publicationResult: meta }],
+						},
+					},
+					CTX,
+				);
+				expect(
+					specs.some((spec) => (spec.data as { kind?: string }).kind === "publication_result"),
+				).toBe(false);
+			}
+		});
+	});
+
 	/** The row production writes: role=user (a request) with origin=system (a reviewer). */
 	const conclusionRow = (
 		blocks: Array<{ type: string; [key: string]: unknown }>,

@@ -6,7 +6,7 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FILE_CHANGE_LIMITS, type FileChangeState } from "@shared/file-change-protocol";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import iconv from "iconv-lite";
 import { sqlite as isolatedTemplate } from "../db";
@@ -759,12 +759,58 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		expect(coordinatorState.leases.size).toBe(0);
 		for (const [index, scope] of targets.entries()) {
 			const live = runtime.evidence.getScope(scope.id);
-			expect(live?.status).toBe("needs_verification");
-			expect(live?.activeLeaseId).toBe(retained[index]?.activeLeaseId);
-			expect(runtime.coordinator.capture(scope).active.retainedRecoveryHolds).toBe(0);
-			await expect(
-				runtime.coordinator.withWrite({ scope, runtime: binding }, () => {}),
-			).rejects.toThrow("verification");
+			expect(live).toMatchObject({
+				status: "active",
+				activeLeaseId: null,
+				activeMutationCount: 0,
+			});
+			const leaseId = retained[index]?.activeLeaseId;
+			if (!leaseId) throw new Error("Missing retained durable lease");
+			const lease = db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.where(eq(schema.workspaceWriteLeases.leaseId, leaseId))
+				.get();
+			expect(lease).toMatchObject({
+				leaseId,
+				scopeId: scope.id,
+				status: "quarantined",
+				rangesJson: {
+					version: 1,
+					ranges: [{ kind: "subtree", canonicalPath: scope.canonicalRoot }],
+				},
+				mutationManifestJson: {
+					version: 1,
+					mutations: terminalFiles
+						.filter((file) => file.scopeId === scope.id)
+						.flatMap((file) =>
+							(terminal === "committed"
+								? [file.applyMutationId]
+								: [file.applyMutationId, file.compensateMutationId]
+							).map((mutationId) => ({ mutationId, outcome: "applied" })),
+						),
+				},
+			});
+			expect(lease?.executionEndedAt).toBeString();
+			expect(runtime.coordinator.capture(scope)).toMatchObject({
+				status: "needs_verification",
+				quarantinedLeaseCount: 1,
+				active: { retainedRecoveryHolds: 0 },
+			});
+			// A rollback owns the whole subtree, not merely the changed file.
+			for (const name of ["file.txt", "untouched-sibling.txt"])
+				await expect(
+					runtime.coordinator.withWrite(
+						{
+							scope,
+							runtime: binding,
+							ranges: [{ kind: "file", canonicalPath: join(scope.canonicalRoot, name) }],
+						},
+						() => {
+							throw new Error("Quarantined subtree must not admit writes");
+						},
+					),
+				).rejects.toThrow("verification");
 		}
 		expect(history()).toBe(terminalHistory);
 		expect(journalFiles(plan)).toEqual(terminalFiles);
@@ -902,13 +948,59 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const row = journalFiles(plan)[0];
 		expect(row.observedAfterBlobDigest).toBe(hash("original"));
 		expect(row.compensationAfterBlobDigest).toBe(hash(sameBytes ? "original" : "third-party"));
-		expect(
-			db
-				.select()
-				.from(schema.fileChangeScopes)
-				.where(eq(schema.fileChangeScopes.id, row.scopeId))
-				.get()?.status,
-		).toBe("needs_verification");
+		const scope = runtime.evidence.getScope(row.scopeId);
+		if (!scope) throw new Error("Missing rollback scope");
+		expect(scope).toMatchObject({
+			status: "active",
+			activeLeaseId: null,
+			activeMutationCount: 0,
+		});
+		const leases = db
+			.select()
+			.from(schema.workspaceWriteLeases)
+			.where(
+				and(
+					eq(schema.workspaceWriteLeases.scopeId, row.scopeId),
+					eq(schema.workspaceWriteLeases.status, "quarantined"),
+				),
+			)
+			.limit(10)
+			.all();
+		expect(leases).toHaveLength(1);
+		expect(leases[0]).toMatchObject({
+			scopeId: row.scopeId,
+			status: "quarantined",
+			rangesJson: {
+				version: 1,
+				ranges: [{ kind: "subtree", canonicalPath: scope.canonicalRoot }],
+			},
+			mutationManifestJson: {
+				version: 1,
+				mutations: expect.arrayContaining([
+					{ mutationId: row.applyMutationId, outcome: "applied" },
+					{ mutationId: row.compensateMutationId, outcome: "not_applied" },
+				]),
+			},
+		});
+		expect(leases[0].executionEndedAt).toBeString();
+		expect(runtime.coordinator.capture(scope)).toMatchObject({
+			status: "needs_verification",
+			quarantinedLeaseCount: 1,
+			active: { retainedRecoveryHolds: 0 },
+		});
+		const binding = localFileChangeRuntimeBinding("local");
+		if (!binding) throw new Error("Missing local runtime");
+		for (const path of [a, join(scope.canonicalRoot, "untouched-sibling.txt")])
+			await expect(
+				runtime.coordinator.withWrite(
+					{ scope, runtime: binding, ranges: [{ kind: "file", canonicalPath: path }] },
+					() => {
+						throw new Error("Quarantined subtree must not admit writes");
+					},
+				),
+			).rejects.toThrow("verification");
+		expect(await fs.readFile(a, "utf8")).toBe(sameBytes ? "original" : "third-party");
+		expect(history()).toBe(before);
 	});
 	test("receipt SQL fault retains applying intent/quarantine; reopened DB never repeats IO", async () => {
 		const { a, plan } = await twoFiles();

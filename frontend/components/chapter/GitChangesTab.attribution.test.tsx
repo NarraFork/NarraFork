@@ -417,12 +417,11 @@ describe("GitChangesTab attribution hover card", () => {
 		expect(row.textContent).not.toContain("Refactor auth");
 
 		const hoverText = await hoverAttribution(container);
-		expect(hoverText).toContain("Current diff evidence");
-		expect(hoverText).toContain("Refactor auth");
-		expect(hoverText).toContain("Recent changes");
-		expect(hoverText).toContain("External");
-		expect(hoverText).not.toContain(gitLocale.attributionCurrentExplanation);
-	});
+			expect(hoverText).toContain("Current diff evidence");
+			expect(hoverText).toContain("Refactor auth");
+			expect(hoverText).toContain("Recent changes");
+			expect(hoverText).toContain("External");
+		});
 
 	test("unknown attribution shows one short reason instead of a text dump", async () => {
 		const unknown = currentTarget({ status: "unknown", actor: null, reason: "state_mismatch" });
@@ -450,7 +449,7 @@ describe("GitChangesTab attribution hover card", () => {
 		expect(() => attributionTarget(container)).toThrow("Attribution hover target not rendered");
 	});
 
-	test("partial history is one short warning in the hover card", async () => {
+	test("history incompleteness is treated as the norm and not nagged in the hover card", async () => {
 		const last = narrator();
 		const container = await renderBadge("chapter-attr-hover-partial", {
 			...view([
@@ -469,8 +468,65 @@ describe("GitChangesTab attribution hover card", () => {
 		});
 
 		const hoverText = await hoverAttribution(container);
-		expect(hoverText).toContain("History is incomplete");
+		expect(hoverText).toContain("Recent changes");
+		expect(hoverText).not.toContain(gitLocale.attributionHistoryPartialShort);
 		expect(hoverText).not.toContain(gitLocale.attributionHistoryTruncated);
+		expect(hoverText).not.toContain("History is incomplete");
+	});
+
+	test("unknown current attribution does not dump history_incomplete caveats", async () => {
+		const unknown = currentTarget({
+			status: "unknown",
+			actor: null,
+			reason: "history_incomplete",
+		});
+		const container = await renderBadge("chapter-attr-hover-history-incomplete", {
+			...view([group({ recentEvents: [event(EXTERNAL_ACTOR)] })]),
+			currentDiff: currentView(unknown, unknown),
+		});
+
+		const hoverText = await hoverAttribution(container);
+		expect(hoverText).toContain("Unknown");
+		expect(hoverText).not.toContain(gitLocale["attributionCurrentReasonShort.history_incomplete"]);
+		expect(hoverText).not.toContain(gitLocale.attributionHistoryPartialShort);
+	});
+
+	test("timeline shows measured +/- line counts and hides unmeasured rows", async () => {
+		const last = narrator();
+		const container = await renderBadge("chapter-attr-hover-line-stats", {
+			...view([
+				group({
+					lastActor: last,
+					recentEvents: [
+						event(last, {
+							id: "event-measured",
+							action: "edit",
+							linesAdded: 12,
+							linesRemoved: 3,
+						}),
+						event(last, {
+							id: "event-zero",
+							action: "edit",
+							linesAdded: 0,
+							linesRemoved: 0,
+						}),
+						event(last, {
+							id: "event-unmeasured",
+							action: "bash",
+							linesAdded: null,
+							linesRemoved: null,
+						}),
+					],
+				}),
+			]),
+		});
+
+		const hoverText = await hoverAttribution(container);
+		expect(hoverText).toContain("+12");
+		expect(hoverText).toContain("-3");
+		// Real zero / unmeasured rows stay quiet instead of shouting +0 -0.
+		expect(hoverText).not.toContain("+0");
+		expect(hoverText).not.toContain("-0");
 	});
 
 	test("the compact hover labels have Chinese translations", () => {

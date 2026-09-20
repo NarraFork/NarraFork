@@ -2103,10 +2103,39 @@ export const fileChangeScopes = pgTable(
 	],
 );
 
+export const workspaceWriteLeases = pgTable(
+	"workspace_write_leases",
+	{
+		leaseId: text("lease_id").primaryKey().notNull(),
+		scopeId: text("scope_id")
+			.notNull()
+			.references((): PgColumn => fileChangeScopes.id, {}),
+		deviceId: text("device_id").notNull(),
+		ownerEpoch: text("owner_epoch").notNull(),
+		runtimeEpoch: text("runtime_epoch").notNull(),
+		runtimeGeneration: integer("runtime_generation").notNull(),
+		fencingToken: integer("fencing_token").notNull(),
+		scopeRevision: integer("scope_revision").notNull(),
+		pathFlavor: text("path_flavor").notNull(),
+		status: text("status").notNull(),
+		rangesJson: jsonText("ranges_json").notNull(),
+		mutationManifestJson: jsonText("mutation_manifest_json").notNull(),
+		executionEndedAt: text("execution_ended_at"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_workspace_lease_device_status").on(table.deviceId, table.status, table.leaseId),
+		index("idx_workspace_lease_scope").on(table.scopeId, table.status, table.leaseId),
+		index("idx_workspace_lease_cleanup").on(table.status, table.updatedAt, table.leaseId),
+	],
+);
+
 export const fileChangeScopeRecoveries = pgTable(
 	"file_change_scope_recoveries",
 	{
 		id: text("id").primaryKey().notNull(),
+		workspaceLeaseId: text("workspace_lease_id"),
 		scopeId: text("scope_id")
 			.notNull()
 			.references((): PgColumn => fileChangeScopes.id, {}),
@@ -3363,8 +3392,8 @@ export const oauthAccessTokens = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 107,
-  "columnCount": 1540,
+  "tableCount": 108,
+  "columnCount": 1556,
   "tables": [
     {
       "exportName": "projects",
@@ -16423,6 +16452,189 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
+      "exportName": "workspaceWriteLeases",
+      "name": "workspace_write_leases",
+      "columns": [
+        {
+          "property": "leaseId",
+          "name": "lease_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "scopeId",
+          "name": "scope_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "fileChangeScopes",
+            "column": "id",
+            "constraintName": "workspace_write_leases_scope_id_file_change_scopes_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "ownerEpoch",
+          "name": "owner_epoch",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "runtimeEpoch",
+          "name": "runtime_epoch",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "runtimeGeneration",
+          "name": "runtime_generation",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "fencingToken",
+          "name": "fencing_token",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "scopeRevision",
+          "name": "scope_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "pathFlavor",
+          "name": "path_flavor",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "status",
+          "name": "status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "rangesJson",
+          "name": "ranges_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "mutationManifestJson",
+          "name": "mutation_manifest_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "executionEndedAt",
+          "name": "execution_ended_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_workspace_lease_device_status",
+          "columns": [
+            "deviceId",
+            "status",
+            "leaseId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_workspace_lease_scope",
+          "columns": [
+            "scopeId",
+            "status",
+            "leaseId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_workspace_lease_cleanup",
+          "columns": [
+            "status",
+            "updatedAt",
+            "leaseId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
       "exportName": "fileChangeScopeRecoveries",
       "name": "file_change_scope_recoveries",
       "columns": [
@@ -16433,6 +16645,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "pgType": "text",
           "notNull": true,
           "primary": true,
+          "unique": false
+        },
+        {
+          "property": "workspaceLeaseId",
+          "name": "workspace_lease_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
           "unique": false
         },
         {

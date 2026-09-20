@@ -33,20 +33,26 @@ export function useNarratorForkActions(
 	const { narratorId, chapterId, onForkFromMessage, navigateToNarrator } = options;
 
 	const forkNarratorMutation = useForkNarrator();
+	const forkNarratorMutationRef = useRef(forkNarratorMutation);
+	forkNarratorMutationRef.current = forkNarratorMutation;
+	const navigateToNarratorRef = useRef(navigateToNarrator);
+	navigateToNarratorRef.current = navigateToNarrator;
 
+	// Keep row actions stable across inline navigation callbacks, but use the
+	// latest mutation at click time and latest navigation when the fork completes.
 	// Standalone narrators: fork narrator directly (no git involved)
 	const handleStandaloneFork = useCallback(
 		(messageId: string) => {
-			forkNarratorMutation.mutate(
+			forkNarratorMutationRef.current.mutate(
 				{ narratorId, forkMessageId: messageId },
 				{
 					onSuccess: (newNarrator: { id: string }) => {
-						navigateToNarrator(newNarrator.id);
+						navigateToNarratorRef.current(newNarrator.id);
 					},
 				},
 			);
 		},
-		[narratorId, forkNarratorMutation.mutate, navigateToNarrator],
+		[narratorId],
 	);
 	// Chapter-bound: use onForkFromMessage (direct fork with auto-generated name)
 	// Standalone: use handleStandaloneFork (direct narrator fork)

@@ -497,6 +497,48 @@ describe("narrator event handler streaming snapshot", () => {
 	});
 });
 
+describe("工具展示事件与执行快照解耦", () => {
+	test("tool_call/tool_result 不再触发旧快照回调", async () => {
+		const ctx = makeSubagentContext();
+		const before = mock(() => {
+			throw new Error("UI event must not capture before");
+		});
+		const after = mock(() => {
+			throw new Error("UI event must not capture after");
+		});
+		const hooks = { onSnapshotBefore: before, onSnapshotAfter: after };
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: "snapshot-free",
+				toolName: "Write",
+				input: { file_path: "/tmp/example.ts" },
+			},
+			ctx,
+			hooks,
+		);
+		await processEvent(
+			{
+				type: "tool_result",
+				toolUseId: "snapshot-free",
+				toolName: "Write",
+				output: "ok",
+				isError: false,
+			},
+			ctx,
+			hooks,
+		);
+		expect(before).not.toHaveBeenCalled();
+		expect(after).not.toHaveBeenCalled();
+		expect(broadcastMessages).toContainEqual(
+			expect.objectContaining({ type: "tool_started", toolUseId: "snapshot-free" }),
+		);
+		expect(broadcastMessages).toContainEqual(
+			expect.objectContaining({ type: "tool_completed", toolUseId: "snapshot-free" }),
+		);
+	});
+});
+
 describe("完成工具输入传递", () => {
 	test("onGitTrack 收到 tool_result 携带的实际完成输入", async () => {
 		const ctx = makeSubagentContext();

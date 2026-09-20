@@ -83,6 +83,9 @@ export interface ModificationEventSummary {
 	action: AttributionAction;
 	actor: AttributionActor;
 	evidence: "legacy" | "v2";
+	/** NULL means unmeasured, never zero. */
+	linesAdded?: number | null;
+	linesRemoved?: number | null;
 }
 
 export interface FileModificationGroup {

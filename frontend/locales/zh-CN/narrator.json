@@ -1,5 +1,8 @@
 {
 	"you": "你",
+	"publicationResultOpen": "结果快照 · 点击查看",
+	"publicationResultTitle": "结果快照",
+	"publicationResultTruncated": "此快照仅保存了预览，并非完整结果。",
 	"queuedFailed": "消息处理失败",
 	"queuedFailureUnknown": "未提供失败原因。",
 	"queuedRetry": "重试",

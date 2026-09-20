@@ -5,6 +5,7 @@ import { specFileRevisions, specNamespaceFiles, type specNamespaces } from "../d
 import { AsyncMutex } from "../lib/async-mutex";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
+import { isSpecUri, normalizeSpecPath, SPEC_URI_PREFIX } from "../lib/spec-uri";
 import { knowledgeWriteStore } from "./knowledge/store";
 import type { SpecProtectedMutation } from "./knowledge/write-store";
 import {
@@ -18,10 +19,9 @@ import {
 	taskTextHash,
 } from "./spec-task-service";
 
-export const SPEC_URI_PREFIX = "spec://";
+export { isSpecUri, normalizeSpecPath, SPEC_URI_PREFIX };
 
 const MAX_SPEC_FILE_CHARS = 200_000;
-const MAX_SPEC_PATH_CHARS = 240;
 
 const specWriteLock = new AsyncMutex();
 
@@ -111,36 +111,8 @@ export interface SpecCandidateAnalysis {
 	protectedMutations: Awaited<ReturnType<typeof analyzeSpecTasksCandidate>>["protectedMutations"];
 }
 
-export function isSpecUri(value: unknown): value is string {
-	return typeof value === "string" && value.startsWith(SPEC_URI_PREFIX);
-}
-
 export function toSpecUri(path: string): string {
 	return `${SPEC_URI_PREFIX}${normalizeSpecPath(path)}`;
-}
-
-export function normalizeSpecPath(input: string): string {
-	let path = input.trim();
-	if (path.startsWith(SPEC_URI_PREFIX)) path = path.slice(SPEC_URI_PREFIX.length);
-	path = path.replace(/^\/+/, "");
-	try {
-		path = decodeURIComponent(path);
-	} catch {
-		// Keep raw path if it is not URI-encoded.
-	}
-	path = path.replace(/\\/g, "/");
-	if (!path) throw new Error("spec:// path must not be empty");
-	if (path.length > MAX_SPEC_PATH_CHARS) {
-		throw new Error(`spec:// path must be at most ${MAX_SPEC_PATH_CHARS} characters`);
-	}
-	const parts = path.split("/");
-	if (parts.some((part) => !part || part === "." || part === "..")) {
-		throw new Error("spec:// path must not contain empty, '.', or '..' segments");
-	}
-	if (!parts.every((part) => /^[A-Za-z0-9._-]+$/.test(part))) {
-		throw new Error("spec:// path segments may only contain letters, numbers, '.', '_', and '-'");
-	}
-	return parts.join("/");
 }
 
 function hashContent(content: string): string {

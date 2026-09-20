@@ -384,7 +384,7 @@ describe("GitChangesTab status filter", () => {
 		// Section headers report matched/total so the hidden rows are accounted for
 		// rather than silently missing.
 		expect(container.textContent).toContain("Staged (1/2)");
-		expect(container.textContent).toContain("Changes (1/3)");
+		expect(container.textContent).toContain("Unstaged (1/3)");
 
 		// A second letter is a union, not a replacement.
 		await click(chipByLetter(container, "A"));
@@ -426,7 +426,7 @@ describe("GitChangesTab status filter", () => {
 		// Only the staged half survives — that is the row whose badge says `A`.
 		expect(fileRowPaths(container)).toEqual(["src/fresh.ts"]);
 		expect(container.textContent).toContain("Staged (1/1)");
-		expect(container.textContent).not.toContain("Changes (1/1)");
+		expect(container.textContent).not.toContain("Unstaged (1/1)");
 
 		client.clear();
 	});
@@ -450,11 +450,11 @@ describe("GitChangesTab status filter", () => {
 		await flushRender();
 
 		expect(chipText(container)).toEqual(["A 1", "M 2"]);
-		// The header counts unique files, while the section labels count actionable rows:
-		// the MM path appears in both sections but is one changed file overall.
-		expect(container.textContent).toContain("Changes (2)");
+		// Section headers own the counts; the toolbar title no longer repeats them.
+		// MM appears in both sections but is one changed file overall.
+		expect(container.textContent).toContain("Changes");
 		expect(container.textContent).toContain("Staged (2)");
-		expect(container.textContent).toContain("Changes (1)");
+		expect(container.textContent).toContain("Unstaged (1)");
 
 		client.clear();
 	});
@@ -478,11 +478,11 @@ describe("GitChangesTab status filter", () => {
 		const container = renderTab(chapterId, client);
 		await flushRender();
 
-		expect(container.textContent).toContain("Changes (2+)");
+		// Unstaged row count includes untracked files (2 + 1 → 3+).
 		expect(container.textContent).toContain("Staged (3+)");
-		expect(container.textContent).toContain("Changes (3+)");
+		expect(container.textContent).toContain("Unstaged (3+)");
 		expect(container.textContent).toContain("Staged count is a lower bound");
-		expect(container.textContent).toContain("Changes count is a lower bound");
+		expect(container.textContent).toContain("Unstaged count is a lower bound");
 
 		client.clear();
 	});

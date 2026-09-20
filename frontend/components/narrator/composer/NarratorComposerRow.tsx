@@ -2,6 +2,7 @@ import { ActionIcon, Box, Button, Group, Tooltip } from "@mantine/core";
 import { IconPaperclip } from "@tabler/icons-react";
 import type { RefObject } from "react";
 import { useTranslation } from "react-i18next";
+import { resolveComposerActionSlot } from "./composer-action-slot";
 import { NarratorComposer, type NarratorComposerHandle } from "./NarratorComposer";
 import { type QueueMode, SendOptionsSplitButton } from "./SendOptionsSplitButton";
 
@@ -278,30 +279,21 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 		);
 	};
 
-	// Takeover button (shown when subagent is running and not yet taken over)
-	if (props.canTakeover && !hasInput && !hasAttachments && !props.editingMessageState) {
-		return (
-			<Box
-				px="md"
-				style={{
-					paddingBottom: "var(--mantine-spacing-xs)",
-					flexShrink: 0,
-				}}
-			>
-				<Group gap="xs" align="end" wrap="nowrap" style={{ justifyContent: "flex-end" }}>
-					<Button
-						key="takeover"
-						color="grape"
-						variant="light"
-						onClick={props.onTakeover}
-						loading={props.takeoverMutationPending}
-					>
-						{t("takeover")}
-					</Button>
-				</Group>
-			</Box>
-		);
-	}
+	/**
+	 * Action cluster only — NEVER the whole row.
+	 *
+	 * A running subagent that is not yet taken over must keep the textarea so
+	 * the user can still queue/cut-in a message (docs + `use-narrator-send`).
+	 * Only the right-hand button swaps to「接管」while the composer is empty;
+	 * typing flips the slot back to `primary`.
+	 */
+	const actionSlot = resolveComposerActionSlot({
+		canTakeover: props.canTakeover,
+		isTakenOver: props.isTakenOver,
+		hasInput,
+		hasAttachments,
+		editing: !!props.editingMessageState,
+	});
 
 	return (
 		<Box
@@ -329,6 +321,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 						<IconPaperclip size={18} />
 					</ActionIcon>
 				</Tooltip>
+				{/* Always mounted, including canTakeover — see actionSlot comment. */}
 				<NarratorComposer
 					ref={props.composerRef}
 					narratorId={props.narratorId}
@@ -342,7 +335,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 					onTextFlagsChange={props.setComposerHasText}
 					onPasteImages={props.onComposerPasteImages}
 				/>
-				{props.isTakenOver ? (
+				{actionSlot === "taken-over" ? (
 					<Group gap="xs" align="end" wrap="nowrap">
 						{renderPrimaryActionButton()}
 						<Tooltip label={t("stopTakeoverHint")} position="top">
@@ -357,6 +350,16 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 							</Button>
 						</Tooltip>
 					</Group>
+				) : actionSlot === "takeover" ? (
+					<Button
+						key="takeover"
+						color="grape"
+						variant="light"
+						onClick={props.onTakeover}
+						loading={props.takeoverMutationPending}
+					>
+						{t("takeover")}
+					</Button>
 				) : (
 					renderPrimaryActionButton()
 				)}

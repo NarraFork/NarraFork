@@ -1,3 +1,4 @@
+import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import { z } from "zod/v4";
 
 /**
@@ -7,6 +8,8 @@ import { z } from "zod/v4";
  * close the books against a stale preview.
  */
 export const recoverWorkspaceBarrierSchema = z.object({
+	leaseId: z.string().min(1).max(256).optional(),
+	confirmationToken: z.string().regex(/^[a-f0-9]{64}$/),
 	acknowledgements: z
 		.array(
 			z.object({
@@ -14,7 +17,7 @@ export const recoverWorkspaceBarrierSchema = z.object({
 				verdict: z.enum(["applied", "not_applied", "not_dispatched", "foreign", "unobservable"]),
 			}),
 		)
-		.max(1024),
+		.max(FILE_CHANGE_LIMITS.revertFiles),
 	acknowledgeInspected: z.boolean().optional(),
 });
 

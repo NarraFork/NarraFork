@@ -1,6 +1,9 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { fileChangeScopes as scopes } from "@server/db/schema";
+import {
+	workspaceWriteLeases as durableLeases,
+	fileChangeScopes as scopes,
+} from "@server/db/schema";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
@@ -20,6 +23,7 @@ import {
 	type WorkspaceWriteManyRequest,
 	type WorkspaceWriteRequest,
 } from "./workspace-write-coordinator";
+import { WORKSPACE_WRITE_LEASE_TEST_DDL } from "./workspace-write-lease-store";
 
 // No application DB import, production FS, execution backend, Bash, or real locks.
 const DDL = `
@@ -57,6 +61,7 @@ beforeEach(() => {
 	sqlite = new Database(":memory:");
 	sqlite.exec("PRAGMA busy_timeout = 0;");
 	sqlite.exec(DDL);
+	sqlite.exec(WORKSPACE_WRITE_LEASE_TEST_DDL);
 	queries = [];
 	db = drizzle(sqlite, { logger: { logQuery: (query) => queries.push(query) } });
 	state = createWorkspaceWriteCoordinatorState();
@@ -124,6 +129,25 @@ function request(
 
 function row(target = scope) {
 	return db.select().from(scopes).where(eq(scopes.id, target.id)).get();
+}
+
+function quarantined(target = scope) {
+	return db
+		.select()
+		.from(durableLeases)
+		.where(eq(durableLeases.scopeId, target.id))
+		.all()
+		.filter((lease) => lease.status === "quarantined");
+}
+
+function expectQuarantined(target = scope) {
+	expect(row(target)).toMatchObject({
+		status: "active",
+		activeLeaseId: null,
+		activeMutationCount: 0,
+	});
+	expect(quarantined(target)).toHaveLength(1);
+	expect(quarantined(target)[0].executionEndedAt).toBeString();
 }
 
 function update(values: Partial<typeof scopes.$inferInsert>, target = scope): void {
@@ -320,8 +344,13 @@ describe("scope admission and execution fencing", () => {
 		runtimes.set(scope.deviceId, { ...runtime, runtimeGeneration: 8 });
 		expectCode(() => first.lease.settle("before-disconnect", "not_applied"), "runtime_mismatch");
 		first.release();
-		await first.done;
-		expect(row()).toMatchObject({ status: "needs_verification", fencingToken: 10 });
+		await expect(first.done).rejects.toThrow(errorCode("persistence_failed"));
+		expect(state.leases.size).toBe(1);
+		expect(row()?.fencingToken).toBe(10);
+		// Explicitly repair injected corruption, then persist the retained ended hold.
+		update({ fencingToken: first.lease.executionBinding.fencingToken });
+		coordinator.retryUncertainPersistence(first.lease.token);
+		expectQuarantined();
 	});
 });
 
@@ -885,7 +914,7 @@ describe("durable mutation guards and fail-closed settlement", () => {
 				}
 			});
 			expect(state.leases.size).toBe(0);
-			expect(row()?.status).toBe("needs_verification");
+			expectQuarantined();
 			const restarted = makeCoordinator({ state: createWorkspaceWriteCoordinatorState() });
 			const alias = addScope({
 				sourceInstanceId: "new-source",
@@ -936,8 +965,11 @@ describe("durable mutation guards and fail-closed settlement", () => {
 		);
 		first.release();
 		await first.done;
-		expect(row()).toMatchObject({ status: "needs_verification", activeMutationCount: 1 });
-		expect(row()?.activeLeaseId).toBeString();
+		expectQuarantined();
+		expect(quarantined()[0].mutationManifestJson.mutations[0]).toMatchObject({
+			mutationId: "in-flight",
+			outcome: "pending",
+		});
 		// Re-verifying just the root is not enough to forgive unfinished execution.
 		update({ status: "active" });
 		await expect(restarted.withWrite(request(), () => undefined)).rejects.toThrow(
@@ -961,7 +993,8 @@ describe("durable mutation guards and fail-closed settlement", () => {
 		finish.open();
 		await expect(writer).rejects.toThrow("writer failed");
 		await expect(next).rejects.toThrow(errorCode("needs_verification"));
-		expect(row()).toMatchObject({ fencingToken: 1, status: "needs_verification" });
+		expect(row()?.fencingToken).toBe(1);
+		expectQuarantined();
 	});
 
 	test("preparation/read-only failures and definitely not-applied mutations do not seal a scope", async () => {
@@ -993,8 +1026,8 @@ describe("durable mutation guards and fail-closed settlement", () => {
 	});
 
 	test("failed uncertainty persistence retains its range until an explicit successful retry", async () => {
-		sqlite.exec(`CREATE TRIGGER reject_guard BEFORE UPDATE OF status ON file_change_scopes
-			WHEN NEW.status = 'needs_verification' BEGIN SELECT RAISE(ABORT, 'guard-failure'); END;`);
+		sqlite.exec(`CREATE TRIGGER reject_guard BEFORE UPDATE OF status ON workspace_write_leases
+			WHEN NEW.status = 'quarantined' BEGIN SELECT RAISE(ABORT, 'guard-failure'); END;`);
 		let lease!: WorkspaceWriteLease;
 		await expect(
 			coordinator.withWrite(request(), (value) => {
@@ -1014,7 +1047,7 @@ describe("durable mutation guards and fail-closed settlement", () => {
 		sqlite.exec("DROP TRIGGER reject_guard;");
 		coordinator.retryUncertainPersistence(lease.token);
 		expect(state.leases.size).toBe(0);
-		expect(row()?.status).toBe("needs_verification");
+		expectQuarantined();
 		await expect(coordinator.withWrite(request(alias), () => undefined)).rejects.toThrow(
 			errorCode("needs_verification"),
 		);
@@ -1088,7 +1121,11 @@ describe("batch atomic admission and exact physical ranges", () => {
 			expired = batch.leases;
 			expect(sqlite.inTransaction).toBe(false);
 			expect(transactions.mock.calls).toHaveLength(1);
-			expect(queries.filter((query) => /where .*"status" = .*limit/i.test(query))).toHaveLength(1);
+			expect(
+				queries.filter((query) =>
+					/from "file_change_scopes" where .*"status" = .*limit/i.test(query),
+				),
+			).toHaveLength(1);
 			expect(batch.leases.map((lease) => lease.scope.id)).toEqual([a.id, b.id]);
 			expect(new Set(batch.leases.map((lease) => lease.token)).size).toBe(2);
 			expect(new Set([row(a)?.activeLeaseId, row(b)?.activeLeaseId]).size).toBe(2);
@@ -1393,10 +1430,18 @@ describe("batch hard budgets", () => {
 		const lease = held.batch.leases[0];
 		const revision = lease.scopeRevision;
 		const guardId = row(a)?.activeLeaseId;
+		const mutationId = (phase: string, index: number) => `${phase}-${index}`.padEnd(64, "a");
+		// The real executor awaits IO per file. This metadata-only stress fixture
+		// yields explicitly so 4,000 short transactions never monopolize one turn.
+		const yieldIo = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 		expect(FILE_CHANGE_LIMITS.revertFiles).toBe(1_000);
 		for (const phase of ["apply", "compensate"] as const) {
 			for (let index = 0; index < FILE_CHANGE_LIMITS.revertFiles; index++) {
-				lease.registerMutation(`${phase}-${index}`);
+				lease.registerMutation(mutationId(phase, index), {
+					operationId: "o".repeat(21),
+					effectId: `${phase}-${index}`.padEnd(21, "e"),
+				});
+				if (index % 32 === 31) await yieldIo();
 			}
 			expect(lease.pendingMutationCount).toBe(1_000);
 			expect(row(a)).toMatchObject({
@@ -1405,9 +1450,10 @@ describe("batch hard budgets", () => {
 				revision,
 			});
 			expect(lease.scopeRevision).toBe(revision);
-			lease.assertMutationPending(`${phase}-999`);
+			lease.assertMutationPending(mutationId(phase, 999));
 			for (let index = 0; index < FILE_CHANGE_LIMITS.revertFiles; index++) {
-				lease.settle(`${phase}-${index}`, "applied");
+				lease.settle(mutationId(phase, index), "applied");
+				if (index % 32 === 31) await yieldIo();
 			}
 			expect(lease.pendingMutationCount).toBe(0);
 			expect(row(a)).toMatchObject({ activeMutationCount: 0, revision });
@@ -1426,7 +1472,7 @@ describe("batch hard budgets", () => {
 		const beforeRejected = row(a);
 		const stamp = state.revision;
 		expectCode(() => lease.registerMutation("mutation-2001"), "capacity_exceeded");
-		expectCode(() => lease.registerMutation("apply-0"), "mutation_conflict");
+		expectCode(() => lease.registerMutation(mutationId("apply", 0)), "mutation_conflict");
 		expect(row(a)).toEqual(beforeRejected);
 		expect(state.revision).toBe(stamp);
 		expect(state.leases.size).toBe(2);
@@ -1446,7 +1492,7 @@ describe("batch hard budgets", () => {
 			activeMutationCount: 0,
 			revision: revision + 1,
 		});
-	});
+	}, 15_000); // Realistic manifests + 4,000 durable transactions, not an IO deadline.
 
 	test("32 distinct scopes are admitted together; 33 inputs are rejected, never chunked", async () => {
 		const targets = Array.from(
@@ -1715,8 +1761,7 @@ describe("batch persistence and fail-closed group recovery", () => {
 		).rejects.toThrow(errorCode("wait_timeout"));
 		held.release();
 		await held.done;
-		expect(row(a)).toMatchObject({ status: "needs_verification", activeMutationCount: 1 });
-		expect(row(a)?.activeLeaseId).toBeString();
+		expectQuarantined(a);
 		expect(row(b)).toMatchObject({ status: "active", activeLeaseId: null });
 		await coordinator.withWrite(request(b), () => undefined);
 		await expect(coordinator.withWrite(request(a), () => undefined)).rejects.toThrow(
@@ -1732,7 +1777,7 @@ describe("batch persistence and fail-closed group recovery", () => {
 			expectCode(() => batch.leases[1].assertCurrent(), "needs_verification");
 			expectCode(() => batch.leases[1].registerMutation("no-dispatch"), "needs_verification");
 		});
-		expect(row(a)?.status).toBe("needs_verification");
+		expectQuarantined(a);
 		expect(row(b)?.activeLeaseId).toBeNull();
 		await expect(coordinator.withWrite(request(b), () => undefined)).rejects.toThrow(
 			errorCode("needs_verification"),
@@ -1849,8 +1894,9 @@ describe("batch persistence and fail-closed group recovery", () => {
 		).rejects.toThrow(errorCode("invalid_nesting"));
 		const firstWaiting = track(coordinator.withWrite(request(a), () => undefined));
 		const secondWaiting = track(coordinator.withWrite(request(b), () => undefined));
-		sqlite.exec(`CREATE TRIGGER reject_batch_retry BEFORE UPDATE OF status ON file_change_scopes
-			WHEN NEW.id = '${b.id}' AND NEW.status = 'needs_verification'
+		sqlite.exec(`DROP TRIGGER reject_batch_finish;
+			CREATE TRIGGER reject_batch_retry BEFORE UPDATE OF status ON workspace_write_leases
+			WHEN NEW.scope_id = '${b.id}' AND NEW.status = 'quarantined'
 			BEGIN SELECT RAISE(ABORT, 'second-retry-failed'); END;`);
 		expect(() => coordinator.retryUncertainPersistence(held.batch.leases[0].token)).toThrow(
 			"second-retry-failed",
@@ -1858,12 +1904,11 @@ describe("batch persistence and fail-closed group recovery", () => {
 		expect(state.leases.size).toBe(2);
 		expect(row(a)?.status).toBe("active");
 		expect(row(b)?.status).toBe("active");
-		sqlite.exec("DROP TRIGGER reject_batch_retry; DROP TRIGGER reject_batch_finish;");
+		sqlite.exec("DROP TRIGGER reject_batch_retry;");
 		makeCoordinator({ db: drizzle(sqlite) }).retryUncertainPersistence(held.batch.leases[1].token);
 		expect(state.leases.size).toBe(0);
 		for (const target of [a, b]) {
-			expect(row(target)?.status).toBe("needs_verification");
-			expect(row(target)?.activeLeaseId).toBeString();
+			expectQuarantined(target);
 		}
 		await expect(firstWaiting).rejects.toThrow(errorCode("needs_verification"));
 		await expect(secondWaiting).rejects.toThrow(errorCode("needs_verification"));
@@ -1876,8 +1921,8 @@ describe("batch persistence and fail-closed group recovery", () => {
 	test("failed uncertainty persistence retains clean siblings and runtime drift never permits stale dispatch", async () => {
 		const [a, b] = batchPair();
 		let lease!: WorkspaceWriteLease;
-		sqlite.exec(`CREATE TRIGGER reject_batch_uncertain BEFORE UPDATE OF status ON file_change_scopes
-			WHEN NEW.id = '${b.id}' AND NEW.status = 'needs_verification'
+		sqlite.exec(`CREATE TRIGGER reject_batch_uncertain BEFORE UPDATE OF status ON workspace_write_leases
+			WHEN NEW.scope_id = '${b.id}' AND NEW.status = 'quarantined'
 			BEGIN SELECT RAISE(ABORT, 'uncertain-write-failed'); END;`);
 		await expect(
 			coordinator.withRollbackMany(batchRequest([a, b]), (batch) => {
@@ -1894,8 +1939,8 @@ describe("batch persistence and fail-closed group recovery", () => {
 		expect(state.leases.size).toBe(2);
 		sqlite.exec("DROP TRIGGER reject_batch_uncertain;");
 		coordinator.retryUncertainPersistence(lease.token);
-		expect(row(a)?.status).toBe("needs_verification");
-		expect(row(b)?.status).toBe("needs_verification");
+		expectQuarantined(a);
+		expectQuarantined(b);
 	});
 });
 
@@ -2026,7 +2071,7 @@ describe("batch explicit helpers and whole-group lifetime", () => {
 		finish.open();
 		await expect(parent).rejects.toThrow("parent-failed");
 		expect(row(a)?.activeLeaseId).toBeNull();
-		expect(row(b)?.status).toBe("needs_verification");
+		expectQuarantined(b);
 	});
 
 	test("a still-running failed child is surfaced after every member finishes", async () => {
@@ -2195,12 +2240,16 @@ describe("recovery barrier directionality", () => {
 		return { parent, child, grandchild };
 	}
 
-	test("write admission ignores a quarantined DESCENDANT scope but rollback still blocks", async () => {
+	test("bidirectional barriers block ancestor writes unless actual file ranges are disjoint", async () => {
 		const { parent, child } = addTree();
 		update({ status: "needs_verification" }, child);
-		// A single-file write rooted at the ancestor cannot touch the quarantined
-		// child's contents (roots are nearest existing parents), so it is admitted.
-		await coordinator.withWrite(request(parent), () => undefined);
+		await expect(coordinator.withWrite(request(parent), () => undefined)).rejects.toThrow(
+			errorCode("needs_verification"),
+		);
+		await coordinator.withWrite(
+			request(parent, { ranges: [{ kind: "file", canonicalPath: "/workspace/sibling.txt" }] }),
+			() => undefined,
+		);
 		expect(row(parent)?.status).toBe("active");
 		// Rollback rewrites whole subtrees and stays bidirectional.
 		await expect(coordinator.withRollback(request(parent), () => undefined)).rejects.toThrow(
@@ -2225,7 +2274,7 @@ describe("recovery barrier directionality", () => {
 		);
 	});
 
-	test("write admission ignores a descendant scope's unfinished durable lease", async () => {
+	test("legacy descendant unfinished lease blocks ancestor write without exact disjoint ranges", async () => {
 		const { parent, child } = addTree();
 		update(
 			{
@@ -2236,7 +2285,13 @@ describe("recovery barrier directionality", () => {
 			},
 			child,
 		);
-		await coordinator.withWrite(request(parent), () => undefined);
+		await expect(coordinator.withWrite(request(parent), () => undefined)).rejects.toThrow(
+			errorCode("needs_verification"),
+		);
+		await coordinator.withWrite(
+			request(parent, { ranges: [{ kind: "file", canonicalPath: "/workspace/sibling.txt" }] }),
+			() => undefined,
+		);
 		await expect(coordinator.withRollback(request(parent), () => undefined)).rejects.toThrow(
 			errorCode("needs_verification"),
 		);
@@ -2252,11 +2307,11 @@ describe("recovery barrier directionality", () => {
 });
 
 describe("external scope barrier recovery", () => {
-	test("clears a quarantined scope with a dead lease, bumping fence and revision", () => {
+	test("clears an ended same-epoch legacy lease, bumping fence and revision", () => {
 		update({
 			status: "needs_verification",
 			activeLeaseId: "dead-lease",
-			activeLeaseEpoch: "dead-epoch",
+			activeLeaseEpoch: coordinator.ownerEpoch(),
 			activeLeaseStartedAt: "2026-09-07T00:00:00.000Z",
 			activeMutationCount: 1,
 		});
@@ -2275,18 +2330,18 @@ describe("external scope barrier recovery", () => {
 		});
 	});
 
-	test("clears a dead-epoch lease even when the crash left the status active", () => {
+	test("does not infer foreign-epoch execution end even when the status is active", () => {
 		update({
 			activeLeaseId: "dead-lease",
 			activeLeaseEpoch: "dead-epoch",
 			activeLeaseStartedAt: "2026-09-07T00:00:00.000Z",
 			activeMutationCount: 1,
 		});
-		coordinator.recoverScopeBarrier(scope);
-		expect(row()).toMatchObject({ status: "active", activeLeaseId: null });
+		expectCode(() => coordinator.recoverScopeBarrier(scope), "recovery_conflict");
+		expect(row()).toMatchObject({ status: "active", activeLeaseId: "dead-lease" });
 	});
 
-	test("refuses a scope without a barrier and a lease of the live epoch", () => {
+	test("refuses an absent barrier but permits ended same-epoch legacy execution", () => {
 		expectCode(() => coordinator.recoverScopeBarrier(scope), "invalid_input");
 		update({
 			activeLeaseId: "live-lease",
@@ -2294,8 +2349,8 @@ describe("external scope barrier recovery", () => {
 			activeLeaseStartedAt: "2026-09-07T00:00:00.000Z",
 			activeMutationCount: 1,
 		});
-		expectCode(() => coordinator.recoverScopeBarrier(scope), "recovery_conflict");
-		expect(row()).toMatchObject({ activeLeaseId: "live-lease" });
+		coordinator.recoverScopeBarrier(scope);
+		expect(row()?.activeLeaseId).toBeNull();
 	});
 
 	test("refuses while an in-memory lease or activity covers the scope", async () => {
@@ -2312,12 +2367,394 @@ describe("external scope barrier recovery", () => {
 		update({
 			status: "needs_verification",
 			activeLeaseId: "dead-lease",
-			activeLeaseEpoch: "dead-epoch",
+			activeLeaseEpoch: coordinator.ownerEpoch(),
 			activeLeaseStartedAt: "2026-09-07T00:00:00.000Z",
 			activeMutationCount: 1,
 		});
 		coordinator.recoverScopeBarrier(scope);
 		await coordinator.withWrite(request(), () => undefined);
 		expect(row()?.status).toBe("active");
+	});
+});
+
+describe("persistent exact-range leases", () => {
+	const fileRanges = (path: string) => [{ kind: "file" as const, canonicalPath: path }];
+	const aRanges = () => fileRanges(`${scope.canonicalRoot}/A.txt`);
+	const bRanges = () => fileRanges(`${scope.canonicalRoot}/B.txt`);
+	async function quarantineA() {
+		let id = "";
+		await coordinator.withWrite(request(scope, { ranges: aRanges() }), (lease) => {
+			id = lease.leaseId;
+			lease.registerMutation("mutation-A", { effectId: "effect-A", operationId: "operation-A" });
+			lease.settle("mutation-A", "unknown");
+		});
+		return id;
+	}
+
+	test("unknown A detaches only after execution end and B remains writable across restart", async () => {
+		const id = await quarantineA();
+		expectQuarantined();
+		expect(quarantined()[0]).toMatchObject({
+			leaseId: id,
+			rangesJson: { version: 1, ranges: aRanges() },
+			mutationManifestJson: {
+				version: 1,
+				mutations: [
+					{
+						mutationId: "mutation-A",
+						effectId: "effect-A",
+						operationId: "operation-A",
+						outcome: "unknown",
+					},
+				],
+			},
+		});
+		for (const owner of [
+			coordinator,
+			makeCoordinator({ state: createWorkspaceWriteCoordinatorState() }),
+		]) {
+			await owner.withWrite(request(scope, { ranges: bRanges() }), (lease) => {
+				lease.assertCurrent();
+				lease.registerMutation("B");
+				lease.settle("B", "applied");
+			});
+			await expect(
+				owner.withWrite(request(scope, { ranges: aRanges() }), () => undefined),
+			).rejects.toThrow(errorCode("needs_verification"));
+			await expect(owner.withRollback(request(), () => undefined)).rejects.toThrow(
+				errorCode("needs_verification"),
+			);
+			expect(owner.capture(scope).quarantinedLeaseCount).toBe(1);
+		}
+	});
+
+	test("live same-scope files remain serialized and cannot recover before children finish", async () => {
+		const held = await hold(scope, "write", coordinator, { ranges: aRanges() });
+		held.lease.registerMutation("A");
+		held.lease.settle("A", "unknown");
+		expectCode(
+			() => coordinator.inspectRecovery({ scope, leaseId: held.lease.leaseId }),
+			"recovery_conflict",
+		);
+		await expect(
+			coordinator.withWrite(
+				request(scope, { ranges: bRanges(), waitTimeoutMs: 0 }),
+				() => undefined,
+			),
+		).rejects.toThrow(errorCode("wait_timeout"));
+		expect(
+			db.select().from(durableLeases).where(eq(durableLeases.leaseId, held.lease.leaseId)).get(),
+		).toMatchObject({ status: "executing", executionEndedAt: null });
+		held.release();
+		await held.done;
+		expect(coordinator.inspectRecovery({ scope, leaseId: held.lease.leaseId }).executionEnded).toBe(
+			true,
+		);
+	});
+
+	test("recovering A while B executes leaves B lease, fence, revision and pending count untouched", async () => {
+		const id = await quarantineA();
+		const held = await hold(scope, "write", coordinator, { ranges: bRanges() });
+		held.lease.registerMutation("B");
+		const before = row();
+		const reservation = coordinator.reserveRecovery({ scope, leaseId: id });
+		const value = reservation.complete((tx) => {
+			expect(sqlite.inTransaction).toBe(true);
+			expect(
+				tx.select().from(durableLeases).where(eq(durableLeases.leaseId, id)).get()?.status,
+			).toBe("quarantined");
+			return "audited";
+		});
+		expect(value).toBe("audited");
+		expect(row()).toEqual(before);
+		held.lease.assertCurrent();
+		held.lease.settle("B", "applied");
+		held.release();
+		await held.done;
+		expect(db.select().from(durableLeases).where(eq(durableLeases.leaseId, id)).get()?.status).toBe(
+			"recovered",
+		);
+		await coordinator.withWrite(request(scope, { ranges: aRanges() }), () => undefined);
+	});
+
+	test("recovery callback and barrier CAS fail atomically and never pump before commit", async () => {
+		const id = await quarantineA();
+		const reservation = coordinator.reserveRecovery({ scope, leaseId: id });
+		let ran = false;
+		const waiting = track(
+			coordinator.withWrite(request(scope, { ranges: aRanges() }), () => {
+				ran = true;
+				expect(sqlite.inTransaction).toBe(false);
+			}),
+		);
+		const previous = row()?.displayRoot;
+		expect(() =>
+			reservation.complete((tx) => {
+				tx.update(scopes)
+					.set({ displayRoot: "must-roll-back" })
+					.where(eq(scopes.id, scope.id))
+					.run();
+				throw new Error("audit-failure");
+			}),
+		).toThrow("audit-failure");
+		expect(row()?.displayRoot).toBe(previous);
+		expect(ran).toBe(false);
+		expect(quarantined()).toHaveLength(1);
+		sqlite.exec(
+			"CREATE TRIGGER reject_recovery BEFORE UPDATE OF status ON workspace_write_leases WHEN NEW.status = 'recovered' BEGIN SELECT RAISE(ABORT, 'clear-failure'); END;",
+		);
+		expect(() =>
+			reservation.complete((tx) => {
+				tx.update(scopes)
+					.set({ displayRoot: "must-roll-back" })
+					.where(eq(scopes.id, scope.id))
+					.run();
+			}),
+		).toThrow("clear-failure");
+		expect(row()?.displayRoot).toBe(previous);
+		expect(ran).toBe(false);
+		sqlite.exec("DROP TRIGGER reject_recovery;");
+		reservation.complete(() => {
+			expect(ran).toBe(false);
+		});
+		await waiting;
+		expect(ran).toBe(true);
+	});
+
+	test("an ambient outer transaction cannot release recovery at a savepoint", async () => {
+		const id = await quarantineA();
+		const reservation = coordinator.reserveRecovery({ scope, leaseId: id });
+		db.transaction(() => {
+			expect(() => reservation.complete(() => undefined)).toThrow(errorCode("recovery_conflict"));
+			expect(state.recoveries?.size).toBe(1);
+			expect(quarantined()).toHaveLength(1);
+		});
+		reservation.complete(() => undefined);
+		expect(state.recoveries?.size).toBe(0);
+	});
+
+	test("recovery reservation only excludes actual A and never admits new activity on A", async () => {
+		const id = await quarantineA();
+		const reservation = coordinator.reserveRecovery({ scope, leaseId: id });
+		await coordinator.withWrite(request(scope, { ranges: bRanges() }), (lease) =>
+			lease.assertCurrent(),
+		);
+		await expect(
+			coordinator.withWrite(
+				request(scope, { ranges: aRanges(), waitTimeoutMs: 0 }),
+				() => undefined,
+			),
+		).rejects.toThrow(errorCode("wait_timeout"));
+		expectCode(() => coordinator.registerActivity(request()), "recovery_conflict");
+		reservation.release();
+		expectCode(() => reservation.complete(() => undefined), "recovery_conflict");
+	});
+
+	test("frozen admission ranges cannot be changed or expanded by nested execution", async () => {
+		const ranges = aRanges();
+		const entered = gate();
+		const finish = gate();
+		const execution = track(
+			coordinator.withWrite(request(scope, { ranges }), async (lease) => {
+				entered.open();
+				await finish.promise;
+				expect(lease.ranges).toEqual(aRanges());
+				await expect(
+					coordinator.withWrite(
+						request(scope, { leaseToken: lease.token, ranges: bRanges() }),
+						() => undefined,
+					),
+				).rejects.toThrow(errorCode("invalid_nesting"));
+				await expect(
+					coordinator.withWrite(request(scope, { leaseToken: lease.token }), () => undefined),
+				).rejects.toThrow(errorCode("invalid_nesting"));
+				await coordinator.withWrite(
+					request(scope, { leaseToken: lease.token, ranges: aRanges() }),
+					() => undefined,
+				);
+			}),
+		);
+		await entered.promise;
+		ranges[0].canonicalPath = `${scope.canonicalRoot}/B.txt`;
+		finish.open();
+		await execution;
+		for (const invalid of [
+			[],
+			fileRanges("/outside"),
+			fileRanges("relative"),
+			Array.from({ length: 257 }, () => aRanges()[0]),
+		]) {
+			await expect(
+				coordinator.withWrite(request(scope, { ranges: invalid }), () => undefined),
+			).rejects.toThrow(errorCode("invalid_input"));
+		}
+	});
+
+	test("immutable mutation manifest is persisted before dispatch and rolls back on counter failure", async () => {
+		await coordinator.withWrite(request(scope, { ranges: aRanges() }), (lease) => {
+			sqlite.exec(
+				"CREATE TRIGGER reject_manifest_count BEFORE UPDATE OF active_mutation_count ON file_change_scopes WHEN NEW.active_mutation_count > OLD.active_mutation_count BEGIN SELECT RAISE(ABORT, 'counter-failure'); END;",
+			);
+			expect(() =>
+				lease.registerMutation("never-dispatched", { effectId: "E", operationId: "O" }),
+			).toThrow("counter-failure");
+			expect(
+				db.select().from(durableLeases).where(eq(durableLeases.leaseId, lease.leaseId)).get()
+					?.mutationManifestJson.mutations,
+			).toHaveLength(0);
+			expect(lease.pendingMutationCount).toBe(0);
+			sqlite.exec("DROP TRIGGER reject_manifest_count;");
+			lease.registerMutation("persisted", { effectId: "E", operationId: "O" });
+			expect(
+				db.select().from(durableLeases).where(eq(durableLeases.leaseId, lease.leaseId)).get()
+					?.mutationManifestJson.mutations,
+			).toEqual([{ mutationId: "persisted", effectId: "E", operationId: "O", outcome: "pending" }]);
+			lease.settle("persisted", "not_applied");
+		});
+	});
+
+	test("indexed settlement checks exact durable ID/outcome and never reads manifest bodies into JS", async () => {
+		await coordinator.withWrite(request(scope, { ranges: aRanges() }), (lease) => {
+			queries.length = 0;
+			lease.registerMutation("first", { effectId: "e1" });
+			lease.registerMutation("second", { effectId: "e2" });
+			lease.settle("second", "not_applied");
+			expect(queries.some((query) => /^select "mutation_manifest_json" /i.test(query))).toBe(false);
+			const original = db
+				.select()
+				.from(durableLeases)
+				.where(eq(durableLeases.leaseId, lease.leaseId))
+				.get()?.mutationManifestJson;
+			if (!original) throw new Error("Missing test manifest");
+			db.update(durableLeases)
+				.set({ mutationManifestJson: { version: 1, mutations: [...original.mutations].reverse() } })
+				.where(eq(durableLeases.leaseId, lease.leaseId))
+				.run();
+			expect(() => lease.settle("first", "applied")).toThrow("Pending durable mutation missing");
+			expect(lease.pendingMutationCount).toBe(1);
+			db.update(durableLeases)
+				.set({ mutationManifestJson: original })
+				.where(eq(durableLeases.leaseId, lease.leaseId))
+				.run();
+			lease.settle("first", "applied");
+		});
+	});
+
+	test("quarantine/recovery does not wash away unrelated root or unknown activity uncertainty", async () => {
+		const held = await hold(scope, "write", coordinator, { ranges: aRanges() });
+		const activity = coordinator.registerActivity(request());
+		held.lease.registerMutation("A");
+		coordinator.endActivity(activity, "unknown");
+		held.release();
+		await held.done;
+		expect(row()?.status).toBe("needs_verification");
+		const reservation = coordinator.reserveRecovery({ scope, leaseId: held.lease.leaseId });
+		reservation.complete(() => undefined);
+		expect(row()?.status).toBe("needs_verification");
+		await expect(
+			coordinator.withWrite(request(scope, { ranges: bRanges() }), () => undefined),
+		).rejects.toThrow(errorCode("needs_verification"));
+	});
+
+	test("terminal cleanup is bounded and never prunes quarantined evidence", async () => {
+		const id = await quarantineA();
+		const template = quarantined()[0];
+		db.insert(durableLeases)
+			.values(
+				Array.from({ length: 540 }, (_, index) => ({
+					...template,
+					leaseId: `terminal-${index}`,
+					status: "settled" as const,
+					createdAt: "2000-01-01",
+					updatedAt: "2000-01-01",
+				})),
+			)
+			.run();
+		await coordinator.withWrite(request(scope, { ranges: bRanges() }), () => undefined);
+		expect(
+			db.select().from(durableLeases).where(eq(durableLeases.status, "settled")).all(),
+		).toHaveLength(525);
+		await coordinator.withWrite(request(scope, { ranges: bRanges() }), () => undefined);
+		expect(
+			db.select().from(durableLeases).where(eq(durableLeases.status, "settled")).all(),
+		).toHaveLength(513);
+		expect(quarantined()[0].leaseId).toBe(id);
+	});
+
+	test("malformed and over-byte-budget inventories fail closed before decoding arbitrary JSON", async () => {
+		await quarantineA();
+		const template = quarantined()[0];
+		const hugeRanges = {
+			version: 1 as const,
+			ranges: Array.from({ length: 6 }, (_, index) => ({
+				kind: "file" as const,
+				canonicalPath: `${scope.canonicalRoot}/${"x".repeat(15000)}${index}`,
+			})),
+		};
+		db.insert(durableLeases)
+			.values(
+				Array.from({ length: 6 }, (_, index) => ({
+					...template,
+					leaseId: `large-${index}`,
+					rangesJson: hugeRanges,
+				})),
+			)
+			.run();
+		await expect(
+			coordinator.withWrite(request(scope, { ranges: bRanges() }), () => undefined),
+		).rejects.toThrow(errorCode("verification_backlog"));
+		expectCode(() => coordinator.capture(scope), "verification_backlog");
+	});
+
+	test("first root verification requires empty durable history and explicit root proof in the atomic callback", () => {
+		update({ status: "needs_verification", rootIdentityJson: null });
+		const info = coordinator.inspectRecovery({ scope });
+		expect(info.initialRootVerification).toBe(true);
+		const reservation = coordinator.reserveRecovery({ scope });
+		expect(() => reservation.complete(() => undefined)).toThrow(errorCode("recovery_conflict"));
+		expect(row()?.status).toBe("needs_verification");
+		reservation.complete((tx) => {
+			tx.update(scopes)
+				.set({ status: "active", rootIdentityJson: { device: "verified" } })
+				.where(eq(scopes.id, scope.id))
+				.run();
+		});
+		expect(row()?.status).toBe("active");
+		update({ status: "needs_verification" });
+		expectCode(() => coordinator.inspectRecovery({ scope }), "recovery_conflict");
+	});
+
+	test("first root exception cannot erase a detached exact-range quarantine", async () => {
+		await quarantineA();
+		update({ status: "needs_verification", rootIdentityJson: null });
+		expectCode(() => coordinator.inspectRecovery({ scope }), "recovery_conflict");
+	});
+
+	test("old process state requires cold maintenance upgrade and rejects known owners without changing epoch", async () => {
+		const held = await hold();
+		const originalEpoch = state.ownerEpoch;
+		delete (state as { persistentLeaseVersion?: 1 }).persistentLeaseVersion;
+		expect(() => makeCoordinator()).toThrow(/maintenance restart/);
+		expect(state.ownerEpoch).toBe(originalEpoch);
+		expect(state.upgradeBlocked).toBe(true);
+		await expect(coordinator.withWrite(request(), () => undefined)).rejects.toThrow(
+			errorCode("recovery_conflict"),
+		);
+		expectCode(() => coordinator.registerActivity(request()), "recovery_conflict");
+		held.release();
+		await held.done;
+		expect(state.leases.size).toBe(0);
+	});
+
+	test("range barrier identity survives root ancestry aliases and deleted-directory spellings", async () => {
+		const id = await quarantineA();
+		const ancestor = addScope({ canonicalRoot: "/workspace" });
+		await expect(
+			coordinator.withWrite(request(ancestor, { ranges: aRanges() }), () => undefined),
+		).rejects.toThrow(errorCode("needs_verification"));
+		await coordinator.withWrite(request(ancestor, { ranges: bRanges() }), () => undefined);
+		const fresh = makeCoordinator({ state: createWorkspaceWriteCoordinatorState() });
+		expect(fresh.inspectRecovery({ scope, leaseId: id }).executionEnded).toBe(true);
+		fresh.reserveRecovery({ scope, leaseId: id }).complete(() => undefined);
 	});
 });

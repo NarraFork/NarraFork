@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -19,6 +19,7 @@ import {
 	fileChangeScopes,
 	fileChangeStorageBudgets,
 	users,
+	workspaceWriteLeases,
 } from "../db/schema";
 import { generateId } from "../lib/id";
 import { FILE_CHANGE_BLOB_BUDGET_ID } from "./file-change-blob-catalog";
@@ -33,6 +34,7 @@ import { fileChangeLocalIo } from "./file-change-local-io";
 import { createWorkspaceScopeRecovery } from "./workspace-scope-recovery";
 import {
 	createWorkspaceWriteCoordinatorState,
+	WORKSPACE_WRITE_COORDINATOR_LIMITS,
 	WorkspaceWriteCoordinator,
 } from "./workspace-write-coordinator";
 
@@ -65,7 +67,7 @@ beforeEach(async () => {
 	coordinator = new WorkspaceWriteCoordinator({
 		db,
 		state: createWorkspaceWriteCoordinatorState(),
-		readRuntime: () => null,
+		readRuntime: () => binding,
 	});
 	recovery = createWorkspaceScopeRecovery({
 		database: db,
@@ -147,6 +149,7 @@ afterEach(async () => {
 			.run();
 	}
 	db.delete(fileChangeOperations).where(eq(fileChangeOperations.sourceInstanceId, source)).run();
+	db.delete(workspaceWriteLeases).where(inArray(workspaceWriteLeases.scopeId, scopeIds())).run();
 	db.delete(fileChangeScopes).where(eq(fileChangeScopes.sourceInstanceId, source)).run();
 	if (blobIds.length) db.delete(fileChangeBlobs).where(inArray(fileChangeBlobs.id, blobIds)).run();
 	if (oldBudget) {
@@ -220,7 +223,7 @@ function quarantine(target = scope) {
 		.set({
 			status: "needs_verification",
 			activeLeaseId: "dead-lease",
-			activeLeaseEpoch: "dead-epoch",
+			activeLeaseEpoch: coordinator.ownerEpoch(),
 			activeLeaseStartedAt: "2026-09-07T00:00:00.000Z",
 			activeMutationCount: 1,
 		})
@@ -277,7 +280,23 @@ async function dispatchedEffect(name: string, before: FileChangeState, after: Fi
 		requestDigest: effect.requestDigest,
 		executionBinding: binding,
 	});
+	quarantine();
 	return { operation, effect };
+}
+
+async function recover(
+	input: Omit<Parameters<typeof recovery.recoverWorkspaceBarrier>[0], "confirmationToken"> & {
+		confirmationToken?: string;
+	},
+) {
+	const preview = input.confirmationToken
+		? null
+		: await recovery.observeWorkspaceBarrier(input.scopeId, input.signal, input.leaseId);
+	return recovery.recoverWorkspaceBarrier({
+		...input,
+		acknowledgeInspected: input.acknowledgeInspected ?? input.acknowledgements.length > 0,
+		confirmationToken: input.confirmationToken ?? preview?.confirmationToken ?? "",
+	});
 }
 
 function scopeRow(id = scope.id) {
@@ -298,6 +317,76 @@ function auditRows(scopeId = scope.id) {
 		.from(fileChangeScopeRecoveries)
 		.where(eq(fileChangeScopeRecoveries.scopeId, scopeId))
 		.all();
+}
+
+function durableBarrier(
+	effect?: NonNullable<ReturnType<typeof effectRow>>,
+	ranges?: { kind: "file" | "subtree"; canonicalPath: string }[],
+) {
+	const leaseId = generateId();
+	const timestamp = new Date(clock++).toISOString();
+	db.insert(workspaceWriteLeases)
+		.values({
+			leaseId,
+			scopeId: scope.id,
+			deviceId: scope.deviceId,
+			pathFlavor: scope.pathFlavor,
+			ownerEpoch: coordinator.ownerEpoch(),
+			runtimeEpoch: binding.runtimeEpoch,
+			runtimeGeneration: binding.runtimeGeneration,
+			fencingToken: scope.fencingToken,
+			scopeRevision: scope.revision,
+			status: "quarantined",
+			executionEndedAt: timestamp,
+			rangesJson: {
+				version: 1,
+				ranges: ranges ?? [
+					{
+						kind: "file",
+						canonicalPath: effect?.identityJson.canonicalPath ?? join(root, "unknown.txt"),
+					},
+				],
+			},
+			mutationManifestJson: {
+				version: 1,
+				mutations: effect
+					? [
+							{
+								mutationId: effect.mutationId,
+								effectId: effect.id,
+								operationId: effect.operationId,
+								outcome: "unknown",
+							},
+						]
+					: [],
+			},
+			createdAt: timestamp,
+			updatedAt: timestamp,
+		})
+		.run();
+	db.update(fileChangeScopes)
+		.set({
+			status: "active",
+			activeLeaseId: null,
+			activeLeaseEpoch: null,
+			activeLeaseStartedAt: null,
+			activeMutationCount: 0,
+		})
+		.where(eq(fileChangeScopes.id, scope.id))
+		.run();
+	return leaseId;
+}
+
+async function confirmedLeaseRecovery(leaseId: string) {
+	const preview = await recovery.observeWorkspaceBarrier(scope.id, undefined, leaseId);
+	return recovery.recoverWorkspaceBarrier({
+		scopeId: scope.id,
+		leaseId,
+		recoveredByUserId: USER_ID,
+		confirmationToken: preview.confirmationToken,
+		acknowledgements: preview.observations.map(({ effectId, verdict }) => ({ effectId, verdict })),
+		acknowledgeInspected: true,
+	});
 }
 
 describe("workspace barrier observation", () => {
@@ -341,6 +430,7 @@ describe("workspace barrier observation", () => {
 		]);
 		if (!effect) throw new Error("Missing prepared fixture");
 		await service.finalizePreparation(operation.id);
+		quarantine();
 		const { observations } = await recovery.observeWorkspaceBarrier(scope.id);
 		expect(observations[0]).toMatchObject({ verdict: "not_dispatched" });
 	});
@@ -366,7 +456,7 @@ describe("workspace barrier recovery", () => {
 		quarantine();
 		const before = scopeRow();
 		const { observations } = await recovery.observeWorkspaceBarrier(scope.id);
-		const result = await recovery.recoverWorkspaceBarrier({
+		const result = await recover({
 			scopeId: scope.id,
 			recoveredByUserId: USER_ID,
 			acknowledgements: observations.map((entry) => ({
@@ -431,7 +521,7 @@ describe("workspace barrier recovery", () => {
 		quarantine();
 		const { observations } = await recovery.observeWorkspaceBarrier(scope.id);
 		expect(observations.map((entry) => entry.verdict).sort()).toEqual(["applied", "foreign"]);
-		await recovery.recoverWorkspaceBarrier({
+		await recover({
 			scopeId: scope.id,
 			recoveredByUserId: USER_ID,
 			acknowledgements: observations.map((entry) => ({
@@ -458,19 +548,19 @@ describe("workspace barrier recovery", () => {
 		const { effect } = await dispatchedEffect("a.txt", ABSENT, intended);
 		quarantine();
 		await expect(
-			recovery.recoverWorkspaceBarrier({
+			recover({
 				scopeId: scope.id,
 				recoveredByUserId: USER_ID,
 				acknowledgements: [],
 			}),
 		).rejects.toThrow(expect.objectContaining({ code: "ACK_REQUIRED" }));
 		await expect(
-			recovery.recoverWorkspaceBarrier({
+			recover({
 				scopeId: scope.id,
 				recoveredByUserId: USER_ID,
 				acknowledgements: [{ effectId: effect.id, verdict: "applied" }],
 			}),
-		).rejects.toThrow(expect.objectContaining({ code: "OBSERVATION_CHANGED" }));
+		).rejects.toThrow(expect.objectContaining({ code: "ACK_REQUIRED" }));
 		// Nothing was settled and the barrier still stands.
 		expect(effectRow(effect.id)?.settlement).toBe("applying");
 		expect(scopeRow()?.status).toBe("needs_verification");
@@ -480,13 +570,13 @@ describe("workspace barrier recovery", () => {
 		activate();
 		quarantine();
 		await expect(
-			recovery.recoverWorkspaceBarrier({
+			recover({
 				scopeId: scope.id,
 				recoveredByUserId: USER_ID,
 				acknowledgements: [],
 			}),
 		).rejects.toThrow(expect.objectContaining({ code: "ACK_REQUIRED" }));
-		const result = await recovery.recoverWorkspaceBarrier({
+		const result = await recover({
 			scopeId: scope.id,
 			recoveredByUserId: USER_ID,
 			acknowledgements: [],
@@ -500,7 +590,7 @@ describe("workspace barrier recovery", () => {
 	test("an unverified root is re-measured instead of closing books", async () => {
 		// prepareScope leaves needs_verification + null root identity: the barrier
 		// kind that a crash between preparation and verification would leave.
-		const result = await recovery.recoverWorkspaceBarrier({
+		const result = await recover({
 			scopeId: scope.id,
 			recoveredByUserId: USER_ID,
 			acknowledgements: [],
@@ -510,7 +600,7 @@ describe("workspace barrier recovery", () => {
 		expect(scopeRow()?.rootIdentityJson).not.toBeNull();
 	});
 
-	test("a recovered scope leaves the barrier list; live-epoch leases never enter it", async () => {
+	test("a recovered scope leaves the list; same-epoch completed registry leases remain recoverable", async () => {
 		const intended = blobState(hash("intended"), 8);
 		await dispatchedEffect("a.txt", ABSENT, intended);
 		quarantine();
@@ -540,14 +630,14 @@ describe("workspace barrier recovery", () => {
 		const listed = await recovery.listWorkspaceBarriers();
 		const ids = listed.items.map((item) => item.scope.id);
 		expect(ids).toContain(scope.id);
-		expect(ids).not.toContain(alive.id);
+		expect(ids).toContain(alive.id);
 		const barrier = listed.items.find((item) => item.scope.id === scope.id);
 		expect(barrier).toMatchObject({ kind: "quarantined", local: true });
 		expect(barrier?.effects).toHaveLength(1);
 		expect(barrier?.operations[0]).toMatchObject({ sourceKind: "tool" });
 
 		const { observations } = await recovery.observeWorkspaceBarrier(scope.id);
-		await recovery.recoverWorkspaceBarrier({
+		await recover({
 			scopeId: scope.id,
 			recoveredByUserId: USER_ID,
 			acknowledgements: observations.map((entry) => ({
@@ -557,5 +647,487 @@ describe("workspace barrier recovery", () => {
 		});
 		const after = await recovery.listWorkspaceBarriers();
 		expect(after.items.map((item) => item.scope.id)).not.toContain(scope.id);
+	});
+});
+
+describe("atomic lease recovery", () => {
+	test("a final lease CAS failure rolls back effects, operations, audit and quarantine together", async () => {
+		const { effect, operation } = await dispatchedEffect(
+			"atomic.txt",
+			ABSENT,
+			blobState(hash("x"), 1),
+		);
+		const leaseId = durableBarrier(effect);
+		const beforeEffect = effectRow(effect.id);
+		const beforeOperation = operationRow(operation.id);
+		const beforeScope = scopeRow();
+		db.$client.run(
+			`CREATE TEMP TRIGGER fail_recovery BEFORE UPDATE OF status ON workspace_write_leases WHEN NEW.lease_id = '${leaseId}' AND NEW.status = 'recovered' BEGIN SELECT RAISE(ABORT, 'injected recovery CAS failure'); END`,
+		);
+		try {
+			await expect(confirmedLeaseRecovery(leaseId)).rejects.toThrow(
+				"injected recovery CAS failure",
+			);
+		} finally {
+			db.$client.run("DROP TRIGGER fail_recovery");
+		}
+		expect(effectRow(effect.id)).toEqual(beforeEffect);
+		expect(operationRow(operation.id)).toEqual(beforeOperation);
+		expect(scopeRow()).toEqual(beforeScope);
+		expect(auditRows()).toEqual([]);
+		expect(
+			db.select().from(workspaceWriteLeases).where(eq(workspaceWriteLeases.leaseId, leaseId)).get()
+				?.status,
+		).toBe("quarantined");
+		await confirmedLeaseRecovery(leaseId);
+		expect(auditRows()[0]?.workspaceLeaseId).toBe(leaseId);
+	});
+
+	test("same-epoch completed registry ownership is recoverable without an ended timestamp", async () => {
+		const { effect } = await dispatchedEffect("ended.txt", ABSENT, blobState(hash("x"), 1));
+		const leaseId = durableBarrier(effect);
+		db.update(workspaceWriteLeases)
+			.set({ executionEndedAt: null })
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		await confirmedLeaseRecovery(leaseId);
+		expect(effectRow(effect.id)?.settlement).toBe("settled");
+	});
+
+	test("unknown owner epoch is rejected before any observation or evidence mutation", async () => {
+		const { effect } = await dispatchedEffect("unknown.txt", ABSENT, blobState(hash("x"), 1));
+		const leaseId = durableBarrier(effect);
+		db.update(workspaceWriteLeases)
+			.set({ executionEndedAt: null, ownerEpoch: "unknown-owner" })
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		const before = effectRow(effect.id);
+		await expect(confirmedLeaseRecovery(leaseId)).rejects.toMatchObject({ statusCode: 409 });
+		expect(effectRow(effect.id)).toEqual(before);
+		expect(auditRows()).toEqual([]);
+	});
+
+	test("active execution rejects recovery without changing evidence", async () => {
+		const { effect } = await dispatchedEffect("active.txt", ABSENT, blobState(hash("x"), 1));
+		db.update(fileChangeScopes)
+			.set({
+				status: "active",
+				activeLeaseId: null,
+				activeLeaseEpoch: null,
+				activeLeaseStartedAt: null,
+				activeMutationCount: 0,
+			})
+			.where(eq(fileChangeScopes.id, scope.id))
+			.run();
+		const before = effectRow(effect.id);
+		await coordinator.withWrite(
+			{
+				scope,
+				runtime: binding,
+				ranges: [{ kind: "file", canonicalPath: join(root, "active.txt") }],
+			},
+			async (lease) => {
+				await expect(
+					recovery.observeWorkspaceBarrier(scope.id, undefined, lease.leaseId),
+				).rejects.toMatchObject({ statusCode: 409 });
+				expect(effectRow(effect.id)).toEqual(before);
+				expect(auditRows()).toEqual([]);
+			},
+		);
+	});
+
+	test("recovering detached A never changes running B's lease, fence, count or evidence", async () => {
+		const { effect } = await dispatchedEffect("a.txt", ABSENT, blobState(hash("x"), 1));
+		const leaseId = durableBarrier(effect);
+		await coordinator.withWrite(
+			{ scope, runtime: binding, ranges: [{ kind: "file", canonicalPath: join(root, "b.txt") }] },
+			async (leaseB) => {
+				leaseB.registerMutation("running-b");
+				const scopeBefore = scopeRow();
+				const bBefore = db
+					.select()
+					.from(workspaceWriteLeases)
+					.where(eq(workspaceWriteLeases.leaseId, leaseB.leaseId))
+					.get();
+				await confirmedLeaseRecovery(leaseId);
+				expect(scopeRow()).toEqual(scopeBefore);
+				expect(
+					db
+						.select()
+						.from(workspaceWriteLeases)
+						.where(eq(workspaceWriteLeases.leaseId, leaseB.leaseId))
+						.get(),
+				).toEqual(bBefore);
+				leaseB.settle("running-b", "not_applied");
+			},
+		);
+		expect(effectRow(effect.id)?.settlement).toBe("settled");
+	});
+
+	test("foreign-to-foreign byte drift invalidates the preview token", async () => {
+		const path = join(root, "foreign-drift.txt");
+		await writeFile(path, "foreign-one");
+		const { effect } = await dispatchedEffect(
+			"foreign-drift.txt",
+			ABSENT,
+			blobState(hash("expected"), 8),
+		);
+		const leaseId = durableBarrier(effect);
+		const preview = await recovery.observeWorkspaceBarrier(scope.id, undefined, leaseId);
+		expect(preview.observations[0]?.verdict).toBe("foreign");
+		await writeFile(path, "foreign-two");
+		await expect(
+			recovery.recoverWorkspaceBarrier({
+				scopeId: scope.id,
+				leaseId,
+				recoveredByUserId: USER_ID,
+				confirmationToken: preview.confirmationToken,
+				acknowledgements: [{ effectId: effect.id, verdict: "foreign" }],
+			}),
+		).rejects.toMatchObject({ code: "OBSERVATION_CHANGED" });
+		expect(effectRow(effect.id)?.settlement).toBe("applying");
+		expect(auditRows()).toEqual([]);
+	});
+
+	test("mode-only drift and lease generation drift both invalidate confirmation", async () => {
+		const path = join(root, "mode.txt");
+		await writeFile(path, "foreign");
+		await chmod(path, 0o644);
+		const { effect } = await dispatchedEffect("mode.txt", ABSENT, blobState(hash("expected"), 8));
+		const leaseId = durableBarrier(effect);
+		const preview = await recovery.observeWorkspaceBarrier(scope.id, undefined, leaseId);
+		await chmod(path, 0o600);
+		await expect(
+			recovery.recoverWorkspaceBarrier({
+				scopeId: scope.id,
+				leaseId,
+				recoveredByUserId: USER_ID,
+				confirmationToken: preview.confirmationToken,
+				acknowledgements: preview.observations,
+			}),
+		).rejects.toMatchObject({ code: "OBSERVATION_CHANGED" });
+		const next = await recovery.observeWorkspaceBarrier(scope.id, undefined, leaseId);
+		db.update(workspaceWriteLeases)
+			.set({ runtimeGeneration: binding.runtimeGeneration + 1 })
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		await expect(
+			recovery.recoverWorkspaceBarrier({
+				scopeId: scope.id,
+				leaseId,
+				recoveredByUserId: USER_ID,
+				confirmationToken: next.confirmationToken,
+				acknowledgements: next.observations,
+			}),
+		).rejects.toMatchObject({ code: "OBSERVATION_CHANGED" });
+		expect(auditRows()).toEqual([]);
+	});
+
+	test("scope compatibility resolves the durable manifest instead of settling unrelated effects", async () => {
+		activate();
+		const operation = service.beginOperation(operationInput({ expectedEffectCount: 2 }));
+		const effects = service.prepareEffects(operation.id, [
+			effectInput("a.txt", ABSENT, blobState(hash("a"), 1)),
+			effectInput("b.txt", ABSENT, blobState(hash("b"), 1)),
+		]);
+		await service.finalizePreparation(operation.id);
+		for (const effect of effects)
+			service.markApplying({
+				operationId: effect.operationId,
+				mutationId: effect.mutationId,
+				requestDigest: effect.requestDigest,
+				executionBinding: binding,
+			});
+		const first = effects[0];
+		const second = effects[1];
+		if (!first || !second) throw new Error("Missing effects");
+		const leaseId = durableBarrier(first);
+		db.update(fileChangeScopes)
+			.set({
+				activeLeaseId: leaseId,
+				activeLeaseEpoch: coordinator.ownerEpoch(),
+				activeMutationCount: 1,
+			})
+			.where(eq(fileChangeScopes.id, scope.id))
+			.run();
+		const preview = await recovery.observeWorkspaceBarrier(scope.id);
+		expect(preview.leaseId).toBe(leaseId);
+		expect(preview.observations.map((entry) => entry.effectId)).toEqual([first.id]);
+		await recovery.recoverWorkspaceBarrier({
+			scopeId: scope.id,
+			recoveredByUserId: USER_ID,
+			confirmationToken: preview.confirmationToken,
+			acknowledgements: preview.observations,
+		});
+		expect(effectRow(first.id)?.settlement).toBe("settled");
+		expect(effectRow(second.id)?.settlement).toBe("applying");
+		expect(auditRows()[0]?.workspaceLeaseId).toBe(leaseId);
+	});
+
+	test("legacy half-recovery re-observes matching audit effects even after their books closed", async () => {
+		const path = join(root, "legacy.txt");
+		await writeFile(path, "old-foreign");
+		const { effect } = await dispatchedEffect("legacy.txt", ABSENT, blobState(hash("expected"), 8));
+		const first = await recovery.observeWorkspaceBarrier(scope.id);
+		service.closeBooksForRecovery({
+			scopeId: scope.id,
+			recoveredByUserId: USER_ID,
+			decisions: first.observations.map(
+				({ effectId, canonicalPath, verdict, observedDigest, observedSizeBytes }) => ({
+					effectId,
+					canonicalPath,
+					verdict,
+					observedDigest,
+					observedSizeBytes,
+				}),
+			),
+		});
+		expect(effectRow(effect.id)?.settlement).toBe("settled");
+		// Old releases retried settlement after unlock failed and appended empty audits.
+		service.closeBooksForRecovery({ scopeId: scope.id, recoveredByUserId: USER_ID, decisions: [] });
+		service.closeBooksForRecovery({ scopeId: scope.id, recoveredByUserId: USER_ID, decisions: [] });
+		expect(auditRows()).toHaveLength(3);
+		const second = await recovery.observeWorkspaceBarrier(scope.id);
+		expect(second.observations).toHaveLength(1);
+		await writeFile(path, "new-foreign");
+		await expect(
+			recovery.recoverWorkspaceBarrier({
+				scopeId: scope.id,
+				recoveredByUserId: USER_ID,
+				confirmationToken: second.confirmationToken,
+				acknowledgements: [{ effectId: effect.id, verdict: "foreign" }],
+				acknowledgeInspected: true,
+			}),
+		).rejects.toMatchObject({ code: "OBSERVATION_CHANGED" });
+		expect(scopeRow()?.status).toBe("needs_verification");
+		expect(auditRows()).toHaveLength(3);
+	});
+
+	test("settled target effects remain observable when only a parent range was quarantined", async () => {
+		const { effect } = await dispatchedEffect("parent-only.txt", ABSENT, blobState(hash("x"), 1));
+		const leaseId = durableBarrier(effect, [{ kind: "subtree", canonicalPath: root }]);
+		db.update(fileChangeEffects)
+			.set({ settlement: "settled", outcome: "no_change" })
+			.where(eq(fileChangeEffects.id, effect.id))
+			.run();
+		const preview = await recovery.observeWorkspaceBarrier(scope.id, undefined, leaseId);
+		expect(preview.observations).toHaveLength(1);
+		expect(preview.rangeObservations[0]).toMatchObject({
+			canonicalPath: root,
+			actualKind: "directory",
+		});
+		await expect(
+			recovery.recoverWorkspaceBarrier({
+				scopeId: scope.id,
+				leaseId,
+				recoveredByUserId: USER_ID,
+				confirmationToken: preview.confirmationToken,
+				acknowledgements: preview.observations,
+			}),
+		).rejects.toMatchObject({ code: "ACK_REQUIRED" });
+		await confirmedLeaseRecovery(leaseId);
+		expect(auditRows()[0]?.effectDecisionsJson).toHaveLength(1);
+	});
+
+	test("verified root without a lease remains an unknown activity barrier", async () => {
+		activate();
+		db.update(fileChangeScopes)
+			.set({ status: "needs_verification" })
+			.where(eq(fileChangeScopes.id, scope.id))
+			.run();
+		const page = await recovery.listWorkspaceBarriers();
+		expect(page.items.find((item) => item.scope.id === scope.id)).toMatchObject({
+			kind: "quarantined",
+			executionEnded: false,
+		});
+		await expect(recovery.observeWorkspaceBarrier(scope.id)).rejects.toMatchObject({
+			statusCode: 409,
+		});
+		expect(scopeRow()?.rootIdentityJson).not.toBeNull();
+	});
+});
+
+describe("recovery observation budgets", () => {
+	test("inventory cursors cover durable leases and legacy scopes without offsets or skipped dash IDs", async () => {
+		activate();
+		const ids = Array.from({ length: 28 }, () => durableBarrier());
+		const legacy = service.prepareScope({
+			id: `-${generateId()}`,
+			sourceInstanceId: source,
+			deviceId: "local",
+			workspaceInstanceId: generateId(),
+			canonicalRoot: join(root, "legacy-root"),
+			pathFlavor: "posix",
+		});
+		const seen: string[] = [];
+		let cursor: string | undefined;
+		for (let count = 0; count < 5; count++) {
+			const page = await recovery.listWorkspaceBarriers(cursor);
+			expect(page.items.length).toBeLessThanOrEqual(25);
+			seen.push(...page.items.map((item) => item.leaseId ?? item.scope.id));
+			if (!page.nextCursor) break;
+			cursor = page.nextCursor;
+		}
+		expect(new Set(seen).size).toBe(seen.length);
+		expect(seen.sort()).toEqual([...ids, legacy.id].sort());
+		await expect(recovery.listWorkspaceBarriers("invalid-cursor")).rejects.toMatchObject({
+			code: "INVALID_CURSOR",
+		});
+	});
+
+	test.each([
+		"manifest-only",
+		"repeated-effect",
+	] as const)("a legal 2000-mutation %s manifest stays observable and recoverable without leaking its payload", async (mode) => {
+		const effect =
+			mode === "repeated-effect"
+				? (await dispatchedEffect("repeat.txt", ABSENT, blobState(hash("x"), 1))).effect
+				: undefined;
+		if (!effect) activate();
+		const leaseId = durableBarrier(effect);
+		const manifest = {
+			version: 1 as const,
+			mutations: Array.from(
+				{ length: WORKSPACE_WRITE_COORDINATOR_LIMITS.mutationsPerLease },
+				(_, index) => ({
+					mutationId: hash(`real-mutation-${index}`),
+					outcome: "unknown" as const,
+					...(effect ? { effectId: effect.id, operationId: effect.operationId } : {}),
+				}),
+			),
+		};
+		expect(manifest.mutations).toHaveLength(2000);
+		expect(Buffer.byteLength(JSON.stringify(manifest))).toBeGreaterThan(128 * 1024);
+		db.update(workspaceWriteLeases)
+			.set({ mutationManifestJson: manifest })
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		const preview = await recovery.observeWorkspaceBarrier(scope.id, undefined, leaseId);
+		expect(preview.observations).toHaveLength(effect ? 1 : 0);
+		const page = await recovery.listWorkspaceBarriers();
+		const item = page.items.find((entry) => entry.leaseId === leaseId);
+		expect(item?.blockedReason).toBeNull();
+		expect(Buffer.byteLength(JSON.stringify(item))).toBeLessThan(8 * 1024);
+		expect(JSON.stringify(item)).not.toContain(manifest.mutations[0]?.mutationId ?? "missing");
+		const result = await recovery.recoverWorkspaceBarrier({
+			scopeId: scope.id,
+			leaseId,
+			recoveredByUserId: USER_ID,
+			confirmationToken: preview.confirmationToken,
+			acknowledgements: preview.observations,
+			acknowledgeInspected: true,
+		});
+		expect(result.settledEffectCount).toBe(effect ? 1 : 0);
+		expect(
+			db.select().from(workspaceWriteLeases).where(eq(workspaceWriteLeases.leaseId, leaseId)).get()
+				?.status,
+		).toBe("recovered");
+	});
+
+	test("oversized manifest is rejected instead of observing a truncated file set", async () => {
+		const { effect } = await dispatchedEffect("manifest.txt", ABSENT, blobState(hash("x"), 1));
+		const leaseId = durableBarrier(effect);
+		db.update(workspaceWriteLeases)
+			.set({
+				mutationManifestJson: {
+					version: 1,
+					mutations: Array.from(
+						{ length: WORKSPACE_WRITE_COORDINATOR_LIMITS.mutationsPerLease + 1 },
+						(_, index) => ({
+							mutationId: `entry-${index}`,
+							outcome: "unknown" as const,
+						}),
+					),
+				},
+			})
+			.where(eq(workspaceWriteLeases.leaseId, leaseId))
+			.run();
+		await expect(
+			recovery.observeWorkspaceBarrier(scope.id, undefined, leaseId),
+		).rejects.toMatchObject({ code: "RECOVERY_MUTATION_LIMIT" });
+		expect(effectRow(effect.id)?.settlement).toBe("applying");
+		expect(auditRows()).toEqual([]);
+	});
+	test("too many matching legacy audits refuse recovery instead of dropping older decisions", async () => {
+		activate();
+		quarantine();
+		for (let index = 0; index < 65; index++)
+			service.closeBooksForRecovery({
+				scopeId: scope.id,
+				recoveredByUserId: USER_ID,
+				decisions: [],
+			});
+		await expect(recovery.observeWorkspaceBarrier(scope.id)).rejects.toMatchObject({
+			code: "RECOVERY_AUDIT_LIMIT",
+		});
+		expect(scopeRow()?.status).toBe("needs_verification");
+		expect(auditRows()).toHaveLength(65);
+	});
+
+	test("an aborted observation is not converted into an unobservable verdict", async () => {
+		const { effect } = await dispatchedEffect("cancel.txt", ABSENT, blobState(hash("x"), 1));
+		const controller = new AbortController();
+		controller.abort();
+		await expect(
+			recovery.observeWorkspaceBarrier(scope.id, controller.signal),
+		).rejects.toMatchObject({ code: "RECOVERY_CANCELLED" });
+		expect(effectRow(effect.id)?.settlement).toBe("applying");
+	});
+
+	test("single-file and cumulative byte caps stop observation without closing evidence", async () => {
+		await writeFile(join(root, "large.txt"), "12345678");
+		const { effect } = await dispatchedEffect("large.txt", ABSENT, blobState(hash("expected"), 8));
+		const limited = createWorkspaceScopeRecovery({
+			database: db,
+			getRuntime: async () => ({ coordinator, evidence: service }),
+			observationLimits: { fileBytes: 4 },
+		});
+		await expect(limited.observeWorkspaceBarrier(scope.id)).rejects.toMatchObject({
+			code: "RECOVERY_BYTE_LIMIT",
+		});
+		// One effect plus one manifest-only file exercises the SHARED cumulative budget.
+		await writeFile(join(root, "extra.txt"), "12345678");
+		const leaseId = durableBarrier(effect, [
+			{ kind: "file", canonicalPath: join(root, "large.txt") },
+			{ kind: "file", canonicalPath: join(root, "extra.txt") },
+		]);
+		const cumulative = createWorkspaceScopeRecovery({
+			database: db,
+			getRuntime: async () => ({ coordinator, evidence: service }),
+			observationLimits: { totalBytes: 12 },
+		});
+		await expect(
+			cumulative.observeWorkspaceBarrier(scope.id, undefined, leaseId),
+		).rejects.toMatchObject({ code: "RECOVERY_BYTE_LIMIT" });
+		expect(effectRow(effect.id)?.settlement).toBe("applying");
+	});
+
+	test("cancellation during IO and deadlines are surfaced, not swallowed", async () => {
+		await writeFile(join(root, "slow.txt"), "x");
+		await dispatchedEffect("slow.txt", ABSENT, blobState(hash("y"), 1));
+		const read = spyOn(fileChangeLocalIo, "read").mockImplementation(async (_path, signal) => {
+			await new Promise<void>((_resolve, reject) => {
+				if (signal?.aborted) reject(signal.reason);
+				else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+			});
+			throw new Error("unreachable");
+		});
+		try {
+			const limited = createWorkspaceScopeRecovery({
+				database: db,
+				getRuntime: async () => ({ coordinator, evidence: service }),
+				observationLimits: { durationMs: 5 },
+			});
+			await expect(limited.observeWorkspaceBarrier(scope.id)).rejects.toMatchObject({
+				code: "RECOVERY_TIMEOUT",
+			});
+			const controller = new AbortController();
+			const pending = recovery.observeWorkspaceBarrier(scope.id, controller.signal);
+			setTimeout(() => controller.abort(), 5);
+			await expect(pending).rejects.toMatchObject({ code: "RECOVERY_CANCELLED" });
+		} finally {
+			read.mockRestore();
+		}
+		expect(auditRows()).toEqual([]);
 	});
 });

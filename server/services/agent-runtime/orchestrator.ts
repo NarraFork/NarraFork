@@ -98,6 +98,7 @@ import {
 	clearStreamingSnapshot,
 	type EventHandlerContext,
 	type EventHooks,
+	persistDetachedToolResult,
 	processEvent,
 } from "../narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "../narrator-executor";
@@ -199,7 +200,7 @@ import {
 } from "../subagent-takeover";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
 import { resolveEffectiveTraits } from "../trait-layer-service";
-import { buildTreeSnapshotEventHooks, FILE_MUTATING_TOOLS } from "../tree-snapshot-loop-hooks";
+import { buildTreeSnapshotExecutionHooks, FILE_MUTATING_TOOLS } from "../tree-snapshot-loop-hooks";
 import {
 	buildSubagentContinuationPrompt,
 	computeContinuationStallState,
@@ -936,23 +937,11 @@ export async function runAgentLoopUnlocked(
 							}
 						: undefined,
 
-				// Workspace tree boundaries around every file-mutating tool. Shared with
-				// the subagent loop (see tree-snapshot-loop-hooks) because ONE rollback
-				// path reads these hashes back and cannot tell which loop wrote them.
-				...buildTreeSnapshotEventHooks({
-					session: active,
-					narratorId,
-					isInGitRepo: active._isInGitRepo === true,
-				}),
 				onContextUsage: ctxMgmt.onContextUsage,
 				onErrorCleanup: async (message, diagnostics) => {
-					// Every abort path in the agent loop ends by yielding error("Aborted"), so
-					// this is the one place that sees a turn stop without its remaining tools
-					// reporting results. Write/Edit/Bash never execute eagerly, which is
-					// exactly the set whose pre-execution hook has already opened a write
-					// claim by then — and an unclosed claim is read as extending to now, so it
-					// would go on subtracting its declared paths from every other narrator's
-					// shell call in this worktree, making their real writes unrevertable.
+					// Execution-owned finally callbacks normally close write claims, including
+					// aborts. Keep the turn-level fallback for interrupted legacy sessions and
+					// errors outside execution; unclosed claims would overlap later writers.
 					// Sealed first: it must not be skipped by an early return below.
 					if (active._isInGitRepo) abandonSessionTreeSnapshots(active, narratorId);
 					// Prepared EnterPlanMode state is ephemeral and must never survive an error/abort.
@@ -1121,6 +1110,12 @@ export async function runAgentLoopUnlocked(
 							return true;
 						}
 					: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
+				// Both primary and subagent captures follow execution, never event delivery.
+				...buildTreeSnapshotExecutionHooks({
+					session: active,
+					narratorId,
+					isInGitRepo: active._isInGitRepo === true,
+				}),
 				requireToolCallBinding: true,
 				onInternalReadAuthorization: async (toolUseId, binding) => {
 					await narratorPersistence.validateToolCallBinding(narratorId, toolUseId, binding);
@@ -1354,6 +1349,9 @@ export async function runAgentLoopUnlocked(
 					if (decision.softStopTaken) active._bufferSoftStopTaken = true;
 					return decision.stop;
 				},
+				// Both primary and child loops can outlive the abort drain. Never reuse
+				// eventContext/hooks here: a new turn may already own their mutable state.
+				onDetachedToolResult: (event) => persistDetachedToolResult(narratorId, event),
 				// onEvent receives only side-channel events (tool_output, tool_progress)
 				// from executeTool — NOT yielded events like tool_result or assistant_message.
 				onEvent: (event) => {

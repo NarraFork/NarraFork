@@ -3708,6 +3708,53 @@ export const fileChangeScopes = sqliteTable(
 	],
 );
 
+// A scope is stable identity; each execution retains its own immutable physical ranges.
+// No TTL can release executing/quarantined work. Settled records are pruned in bounded batches.
+export const workspaceWriteLeases = sqliteTable(
+	"workspace_write_leases",
+	{
+		leaseId: text("lease_id").primaryKey(),
+		scopeId: text("scope_id")
+			.notNull()
+			.references(() => fileChangeScopes.id),
+		deviceId: text("device_id").notNull(),
+		ownerEpoch: text("owner_epoch").notNull(),
+		runtimeEpoch: text("runtime_epoch").notNull(),
+		runtimeGeneration: integer("runtime_generation").notNull(),
+		fencingToken: integer("fencing_token").notNull(),
+		scopeRevision: integer("scope_revision").notNull(),
+		pathFlavor: text("path_flavor", { enum: ["posix", "windows"] }).notNull(),
+		status: text("status", {
+			enum: ["executing", "quarantined", "settled", "recovered"],
+		}).notNull(),
+		rangesJson: text("ranges_json", { mode: "json" })
+			.$type<{
+				version: 1;
+				ranges: readonly { kind: "file" | "subtree"; canonicalPath: string }[];
+			}>()
+			.notNull(),
+		mutationManifestJson: text("mutation_manifest_json", { mode: "json" })
+			.$type<{
+				version: 1;
+				mutations: readonly {
+					mutationId: string;
+					effectId?: string;
+					operationId?: string;
+					outcome: "pending" | "applied" | "not_applied" | "unknown";
+				}[];
+			}>()
+			.notNull(),
+		executionEndedAt: text("execution_ended_at"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_workspace_lease_device_status").on(table.deviceId, table.status, table.leaseId),
+		index("idx_workspace_lease_scope").on(table.scopeId, table.status, table.leaseId),
+		index("idx_workspace_lease_cleanup").on(table.status, table.updatedAt, table.leaseId),
+	],
+);
+
 // Human-driven external recovery of a quarantined scope: one row per recovery,
 // recording WHO accepted WHICH re-observed physical state to close the books.
 // Audit only; it never rewrites the frozen execution receipts it refers to.
@@ -3715,6 +3762,8 @@ export const fileChangeScopeRecoveries = sqliteTable(
 	"file_change_scope_recoveries",
 	{
 		id: text("id").primaryKey(),
+		/** Immutable audit reference; terminal lease pruning must not delete the audit. */
+		workspaceLeaseId: text("workspace_lease_id"),
 		scopeId: text("scope_id")
 			.notNull()
 			.references(() => fileChangeScopes.id),

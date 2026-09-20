@@ -27,6 +27,7 @@ import {
 	fileChangeExecutionBindingMatches,
 	fileChangeIdentityKey,
 } from "./file-change-identity";
+import { normalizeLocalIoEvidence } from "./file-change-local-io-evidence";
 import {
 	type RevertPlanFileMetadata,
 	type RevertPlanManifestProof,
@@ -989,6 +990,7 @@ function normalizeReceipt(receipt: FileChangeExecutionReceipt): FileChangeExecut
 		"confirmed",
 		"observedAfter",
 		"outcome",
+		"localIo",
 	]);
 	text(receipt.receiptId);
 	sha256(receipt.mutationId);
@@ -1006,6 +1008,9 @@ function normalizeReceipt(receipt: FileChangeExecutionReceipt): FileChangeExecut
 		confirmed: receipt.confirmed,
 		observedAfter: normalizeState(receipt.observedAfter),
 		outcome: receipt.outcome,
+		...(receipt.localIo === undefined
+			? {}
+			: { localIo: normalizeLocalIoEvidence(receipt.localIo) }),
 	};
 	metadata(result);
 	return result;

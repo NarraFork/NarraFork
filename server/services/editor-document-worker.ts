@@ -289,7 +289,30 @@ export async function runEditorWorker(request: EditorWorkerRequest): Promise<Edi
 			await file.writeFile(body);
 			await file.sync();
 			await file.close();
-			await link(temporary, path); // Exclusive atomic publication; never replace a recovery record.
+			try {
+				await link(temporary, path); // Exclusive atomic publication; never replace a recovery record.
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				// The runtime may recapture/reconstruct before dispatch after losing blob history.
+				// Reuse only the same operation and exact output; keep the original creation time.
+				const existing = editorOperationMetadataSchema.parse(
+					JSON.parse(
+						new TextDecoder("utf-8", { fatal: true }).decode(
+							await boundedRead(path, EDITOR_METADATA_MAX_BYTES),
+						),
+					),
+				);
+				if (
+					existing.operationId !== metadata.operationId ||
+					existing.userId !== metadata.userId ||
+					existing.narratorId !== metadata.narratorId ||
+					existing.snapshotRevision !== metadata.snapshotRevision ||
+					existing.hash !== metadata.hash ||
+					existing.rawDigest !== metadata.rawDigest ||
+					existing.bytes !== metadata.bytes
+				)
+					fail("Recovery metadata does not match this preparation");
+			}
 		} finally {
 			await file.close();
 			await unlink(temporary);

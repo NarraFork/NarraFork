@@ -20,6 +20,20 @@ let bashInput: Record<string, unknown> = {};
 let streamBashInput = true;
 let executionBeforeInputComplete: string[] = [];
 let executionBeforeStreamEnd: string[] = [];
+let executionWhileBashPending: string[] = [];
+
+function gate() {
+	let resolve!: () => void;
+	const promise = new Promise<void>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
+
+let bashStarted = gate();
+let releaseBash = gate();
+let readAfterStarted = gate();
+const nextTick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 const PARALLEL_TOOL_NAMES = ["Read", "Glob", "Grep"] as const;
 
@@ -52,7 +66,7 @@ const testProvider: ProviderAdapter = {
 						{ toolUseId: "tu_pending", name: "Read", input: { value: "pending" }, outputIndex: 1 },
 					],
 				};
-				await new Promise((resolve) => setTimeout(resolve, 10));
+				await nextTick();
 				executionBeforeInputComplete = [...executionOrder];
 				yield {
 					toolUseChunk: {
@@ -71,7 +85,11 @@ const testProvider: ProviderAdapter = {
 					{ toolUseId: "tu_after", name: "Read", input: { value: "after" }, outputIndex: 2 },
 				],
 			};
-			await new Promise((resolve) => setTimeout(resolve, 10));
+			await bashStarted.promise;
+			await nextTick();
+			executionWhileBashPending = [...executionOrder];
+			releaseBash.resolve();
+			await readAfterStarted.promise;
 			executionBeforeStreamEnd = [...executionOrder];
 			return;
 		}
@@ -155,6 +173,7 @@ for (const name of PARALLEL_TOOL_NAMES) {
 		parameters: z.object({ value: z.string() }),
 		execute: async (args) => {
 			executionOrder.push(`${name}:${args.value}`);
+			if (scenario === "bash_barrier" && args.value === "after") readAfterStarted.resolve();
 			if (scenario === "parallel_all_reject" || name === "Glob") {
 				throw new Error(`boom:${args.value}`);
 			}
@@ -170,6 +189,8 @@ toolRegistry.register({
 	parameters: z.object({ parallel: z.boolean().optional(), strict_serial: z.boolean().optional() }),
 	execute: async () => {
 		executionOrder.push("Bash");
+		bashStarted.resolve();
+		await releaseBash.promise;
 		return { output: "bash-done" };
 	},
 });
@@ -245,6 +266,10 @@ describe("Bash streaming barriers", () => {
 				modelResultOrder.length = 0;
 				executionBeforeInputComplete = [];
 				executionBeforeStreamEnd = [];
+				executionWhileBashPending = [];
+				bashStarted = gate();
+				releaseBash = gate();
+				readAfterStarted = gate();
 				bashInput = input;
 				streamBashInput = streamed;
 				const events: AgentEvent[] = [];
@@ -256,8 +281,10 @@ describe("Bash streaming barriers", () => {
 					events.push(event);
 				}
 				expect(executionBeforeInputComplete).toEqual([]);
-				expect(executionBeforeStreamEnd.includes("Read:after")).toBe(eager);
-				if (!eager) expect(executionBeforeStreamEnd).toEqual([]);
+				expect(executionWhileBashPending.includes("Read:after")).toBe(eager);
+				if (!eager) expect(executionWhileBashPending).toEqual(["Bash"]);
+				expect(executionBeforeStreamEnd).toContain("Read:after");
+				expect(executionBeforeStreamEnd[0]).toBe("Bash");
 				expect(executionOrder).toContain("Bash");
 				expect(executionOrder).toContain("Read:after");
 				if (streamed) expect(executionOrder).toContain("Read:pending");

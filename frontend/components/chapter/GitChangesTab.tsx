@@ -26,7 +26,6 @@ import {
 	IconFilterOff,
 	IconFolder,
 	IconFolderOpen,
-	IconHelpCircle,
 	IconMinus,
 	IconPlus,
 	IconRefresh,
@@ -177,8 +176,6 @@ export function GitChangesTab({
 		() => new Map((modifications?.currentDiff?.byFile ?? []).map((file) => [file.filePath, file])),
 		[modifications?.currentDiff?.byFile],
 	);
-	const attributionTruncated =
-		!!modifications?.hasMore || modifications?.completeness?.fileHistoryComplete === false;
 
 	if (isLoading) return <Loader size="sm" />;
 	if (error)
@@ -218,7 +215,6 @@ export function GitChangesTab({
 	const hiddenUnstaged = hiddenGitSectionRows(matchedUnstaged.length, displayUnstaged.length);
 	const totalFiles = gitTotalFileCount(status);
 	const serverCapped = totalFiles > gitUniqueFileCount(status.files);
-	const totalFilesLabel = formatGitSectionCount(totalFiles, !!status.truncated);
 	const stagedCountLabel = formatGitSectionCount(
 		gitSectionCount(status, "staged"),
 		!!status.truncated,
@@ -384,11 +380,9 @@ export function GitChangesTab({
 				wrap="nowrap"
 				style={{ flexShrink: 0, borderBottom: "1px solid var(--mantine-color-default-border)" }}
 			>
+				{/* Counts live on the section headers below; this title is just the panel name. */}
 				<Text size="sm" fw={600} style={{ flex: 1, minWidth: 0 }}>
 					{t("panel.changes")}
-					<Text span c="dimmed" fw={400}>
-						{` (${totalFilesLabel})`}
-					</Text>
 				</Text>
 				{status.branch && (
 					<Group gap={2} wrap="nowrap" style={{ minWidth: 0, maxWidth: "34%" }}>
@@ -476,36 +470,6 @@ export function GitChangesTab({
 
 			<ScrollArea style={{ flex: 1, minHeight: 0 }}>
 				<Stack gap={4} px={4} pb="xs">
-					{(modifications || attributionTruncated) && (
-						<Group gap={4} justify="flex-end">
-							{modifications && (
-								<Tooltip
-									label={t(
-										modifications.currentDiff
-											? "attributionCurrentExplanation"
-											: "attributionObservationOnly",
-									)}
-									multiline
-									withinPortal
-								>
-									<ActionIcon
-										size="xs"
-										variant="subtle"
-										aria-label={t("attributionExplanationLabel")}
-									>
-										<IconHelpCircle size={13} />
-									</ActionIcon>
-								</Tooltip>
-							)}
-							{attributionTruncated && (
-								<Tooltip label={t("attributionWindowTruncated")} multiline withinPortal>
-									<Text size="xs" c="orange" aria-label={t("attributionIncompleteLabel")}>
-										{t("attributionIncompleteShort")}
-									</Text>
-								</Tooltip>
-							)}
-						</Group>
-					)}
 					{filterHidesEverything && (
 						<Stack gap={4} py="md" align="center">
 							<Text size="sm" c="dimmed">
@@ -1024,12 +988,12 @@ function AttributionHoverCard({
 	const currentTitle = current
 		? t("attributionCurrentEvidenceShort")
 		: t("attributionLastObservedShort");
-	const reason = current?.reason ? t(`attributionCurrentReasonShort.${current.reason}`) : null;
-	const recentEvents = history?.recentEvents ?? [];
-	const historyWarning =
-		history && (!history.completeness.fileHistoryComplete || history.completeness.countsLowerBound)
-			? t("attributionHistoryPartialShort")
+	// History is treated as always incomplete; only surface actionable current-diff reasons.
+	const reason =
+		current?.reason && current.reason !== "history_incomplete"
+			? t(`attributionCurrentReasonShort.${current.reason}`)
 			: null;
+	const recentEvents = history?.recentEvents ?? [];
 
 	return (
 		<HoverCard width={320} shadow="md" withArrow openDelay={120} closeDelay={120} withinPortal>
@@ -1059,29 +1023,60 @@ function AttributionHoverCard({
 
 					{recentEvents.length > 0 && (
 						<div>
-							<Text size="xs" c="dimmed" mb={4}>
+							<Text size="xs" c="dimmed" mb={2}>
 								{t("attributionHistoryShort")}
 							</Text>
-							<Timeline bulletSize={12} lineWidth={1}>
+							{/* Mantine default item gap is spacing-xl; hover history wants a dense list. */}
+							<Timeline
+								bulletSize={8}
+								lineWidth={1}
+								styles={{
+									item: { marginTop: 4, paddingTop: 0, paddingBottom: 0 },
+									itemTitle: { marginBottom: 0, lineHeight: 1.3 },
+									itemBody: { paddingTop: 0, paddingBottom: 0 },
+								}}
+							>
 								{recentEvents.map((event) => {
 									const labels = buildAttributionLabels(event.actor, t);
+									const added = event.linesAdded;
+									const removed = event.linesRemoved;
+									const hasLineStats = typeof added === "number" || typeof removed === "number";
+									const showLineStats =
+										hasLineStats && !((added ?? 0) === 0 && (removed ?? 0) === 0);
 									return (
-										<Timeline.Item key={event.id} title={labels.detail}>
-											<Text size="xs" c="dimmed">
-												{t(`attributionAction.${event.action}`)} ·{" "}
-												{formatAttributionTime(event.changedAt)}
-											</Text>
+										<Timeline.Item
+											key={event.id}
+											title={
+												<Text size="xs" fw={500} lineClamp={1} title={labels.detail}>
+													{labels.detail}
+												</Text>
+											}
+										>
+											<Group gap={6} wrap="nowrap" justify="space-between">
+												<Text size="xs" c="dimmed" lineClamp={1}>
+													{t(`attributionAction.${event.action}`)} ·{" "}
+													{formatAttributionTime(event.changedAt)}
+												</Text>
+												{showLineStats && (
+													<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+														{typeof added === "number" && added > 0 && (
+															<Text size="xs" c="green" ff="monospace">
+																+{added}
+															</Text>
+														)}
+														{typeof removed === "number" && removed > 0 && (
+															<Text size="xs" c="red" ff="monospace">
+																-{removed}
+															</Text>
+														)}
+													</Group>
+												)}
+											</Group>
 										</Timeline.Item>
 									);
 								})}
 							</Timeline>
 						</div>
-					)}
-
-					{historyWarning && (
-						<Text size="xs" c="orange">
-							{historyWarning}
-						</Text>
 					)}
 				</Stack>
 			</HoverCard.Dropdown>

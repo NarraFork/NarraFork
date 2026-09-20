@@ -170,7 +170,7 @@ storageRoutes.post("/database/vacuum", requireAdmin, async (c) => {
  * leases from crashed runs (admin only).
  */
 storageRoutes.get("/workspace-barriers", requireAdmin, async (c) => {
-	return c.json(await listWorkspaceBarriers());
+	return c.json(await listWorkspaceBarriers(c.req.query("cursor")));
 });
 
 /**
@@ -181,13 +181,17 @@ storageRoutes.get("/workspace-barriers", requireAdmin, async (c) => {
 storageRoutes.post("/workspace-barriers/:scopeId/observe", requireAdmin, async (c) => {
 	const scopeId = c.req.param("scopeId");
 	if (!scopeId) return c.json({ error: "Missing scopeId" }, 400);
-	return c.json(await observeWorkspaceBarrier(scopeId, c.req.raw.signal));
+	const leaseId = c.req.query("leaseId");
+	if (leaseId !== undefined && (!leaseId || leaseId.length > 256))
+		return c.json({ error: "Invalid leaseId" }, 400);
+	return c.json(await observeWorkspaceBarrier(scopeId, c.req.raw.signal, leaseId));
 });
 
 /**
  * POST /api/storage/workspace-barriers/:scopeId/recover — Human-confirmed
- * recovery: re-observes (TOCTOU guard), closes the evidence books, then clears
- * the durable barrier. Never writes to the physical workspace (admin only).
+ * recovery: re-observes outside the transaction, checks the preview token, then
+ * atomically settles the target lease's evidence and releases its barrier.
+ * The scope URL remains compatible with legacy barriers (admin only).
  */
 storageRoutes.post("/workspace-barriers/:scopeId/recover", requireAdmin, async (c) => {
 	const scopeId = c.req.param("scopeId");
@@ -200,6 +204,8 @@ storageRoutes.post("/workspace-barriers/:scopeId/recover", requireAdmin, async (
 	return c.json(
 		await recoverWorkspaceBarrier({
 			scopeId,
+			leaseId: parsed.data.leaseId,
+			confirmationToken: parsed.data.confirmationToken,
 			recoveredByUserId: c.get("user").sub,
 			acknowledgements: parsed.data.acknowledgements,
 			acknowledgeInspected: parsed.data.acknowledgeInspected,

@@ -1277,15 +1277,20 @@ export const miscApi = {
 		}),
 
 	// Workspace write barriers (human-driven external recovery, admin only)
-	getWorkspaceBarriers: () => request<{ items: WorkspaceBarrier[] }>("/storage/workspace-barriers"),
-	observeWorkspaceBarrier: (scopeId: string) =>
+	getWorkspaceBarriers: (cursor?: string) =>
+		request<{ items: WorkspaceBarrier[]; nextCursor: string | null }>(
+			`/storage/workspace-barriers${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+		),
+	observeWorkspaceBarrier: (scopeId: string, leaseId?: string | null, signal?: AbortSignal) =>
 		request<WorkspaceBarrierObservationResult>(
-			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/observe`,
-			{ method: "POST" },
+			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/observe${leaseId ? `?leaseId=${encodeURIComponent(leaseId)}` : ""}`,
+			{ method: "POST", signal },
 		),
 	recoverWorkspaceBarrier: (
 		scopeId: string,
 		data: {
+			leaseId?: string;
+			confirmationToken: string;
 			acknowledgements: { effectId: string; verdict: WorkspaceBarrierVerdict }[];
 			acknowledgeInspected?: boolean;
 		},

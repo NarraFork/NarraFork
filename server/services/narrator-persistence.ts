@@ -3335,29 +3335,49 @@ const sqliteNarratorPersistence = {
 			resultMessageId?: string;
 			bumpMessageVersion?: boolean;
 			preserveTiming?: boolean;
+			/** Detached completions must atomically match their original execution authority. */
+			expectedBinding?: ToolCallBinding & { narratorId: string };
+			/** Persist a permission redirect/sanitized input in the same CAS as the result. */
+			input?: Record<string, unknown>;
 			/** Commit publication intent with the exact tool result, synchronously. */
 			onPersist?: (tx: DbTx) => void;
 		},
 		messageId?: string,
 		toolCallId?: string,
 	) {
-		const exactId = await resolveToolCallWriteId(toolUseId, { toolCallId, messageId });
+		const expected = result.expectedBinding;
+		if (
+			expected &&
+			(!expected.toolCallId || !Number.isInteger(expected.attempt) || expected.attempt < 1)
+		) {
+			throw new ValidationError("Tool result requires a valid execution binding");
+		}
+		if (expected && toolCallId && expected.toolCallId !== toolCallId) {
+			throw new ValidationError("Tool result binding does not match its target row");
+		}
+		const exactId =
+			expected?.toolCallId ?? (await resolveToolCallWriteId(toolUseId, { toolCallId, messageId }));
 		if (!exactId) return;
 		const conditions = [eq(narratorToolCalls.id, exactId)];
-		const affectedToolCalls = await db
-			.select({
-				narratorId: narratorToolCalls.narratorId,
-				messageId: narratorToolCalls.messageId,
-				toolUseId: narratorToolCalls.toolUseId,
-				toolName: narratorToolCalls.toolName,
-				executionDeviceId: narratorToolCalls.executionDeviceId,
-			})
-			.from(narratorToolCalls)
-			.where(and(...conditions));
-		db.transaction((tx) => {
-			tx.update(narratorToolCalls)
+		if (expected) {
+			// Do not validate then await before writing: retries, COW and history edits may
+			// retire the receipt while an old tool is finishing. The write itself is the CAS.
+			conditions.push(
+				eq(narratorToolCalls.narratorId, expected.narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+				eq(narratorToolCalls.executionAttempt, expected.attempt),
+				eq(narratorToolCalls.executionIdentityVersion, 1),
+				isNull(narratorToolCalls.executionOriginToolCallId),
+				sql`exists (select 1 from ${narratorMessageRefs} where ${narratorMessageRefs.narratorId} = ${expected.narratorId} and ${narratorMessageRefs.messageId} = ${narratorToolCalls.messageId})`,
+			);
+			if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
+		}
+		const affectedToolCalls = db.transaction((tx) => {
+			const updated = tx
+				.update(narratorToolCalls)
 				.set({
 					outputJson: result.output ?? null,
+					...(result.input !== undefined ? { inputJson: result.input } : {}),
 					status: result.status,
 					errorMessage: result.errorMessage ?? null,
 					permissionStartedAt:
@@ -3380,8 +3400,19 @@ const sqliteNarratorPersistence = {
 					...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
 				})
 				.where(and(...conditions))
-				.run();
+				.returning({
+					narratorId: narratorToolCalls.narratorId,
+					messageId: narratorToolCalls.messageId,
+					toolUseId: narratorToolCalls.toolUseId,
+					toolName: narratorToolCalls.toolName,
+					executionDeviceId: narratorToolCalls.executionDeviceId,
+				})
+				.all();
+			if (expected && updated.length !== 1) {
+				throw new ValidationError("Tool execution binding is stale or belongs to another narrator");
+			}
 			result.onPersist?.(tx);
+			return updated;
 		});
 
 		// Announce the terminal state with bounded metadata only. External clients need to see
@@ -3405,7 +3436,16 @@ const sqliteNarratorPersistence = {
 		const affectedMessageIds = [
 			...new Set(affectedToolCalls.map((tc) => tc.messageId).filter((id): id is string => !!id)),
 		];
-		if (affectedMessageIds.length > 0) {
+		if (expected) {
+			// Detached results must not infer a parent from a provider-local tool-use id.
+			const owner = await db.query.narrators.findFirst({
+				where: eq(narrators.id, expected.narratorId),
+				columns: { type: true, parentNarratorId: true },
+			});
+			if (owner?.type === "subagent" && owner.parentNarratorId) {
+				affectedNarratorIds.push(owner.parentNarratorId);
+			}
+		} else if (affectedMessageIds.length > 0) {
 			const affectedMessages = await db.query.narratorMessages.findMany({
 				where: inArray(narratorMessages.id, affectedMessageIds),
 				columns: { parentToolUseId: true },
@@ -3426,6 +3466,7 @@ const sqliteNarratorPersistence = {
 		if (result.bumpMessageVersion !== false) {
 			await bumpNarratorMessageVersions(affectedNarratorIds);
 		}
+		return affectedToolCalls[0];
 	},
 
 	/**

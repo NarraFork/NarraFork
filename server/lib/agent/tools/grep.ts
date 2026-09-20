@@ -2,6 +2,7 @@ import { z } from "zod/v4";
 import { specVfsService } from "../../../services/spec-vfs-service";
 import { isRgAvailable, RG_FALLBACK_NOTE, RG_INSTALL_HINT } from "../../ripgrep";
 import { settings } from "../../settings";
+import { toolSpecPathError } from "../../spec-uri";
 import { vfsGrep } from "../../vfs-grep";
 import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
@@ -203,6 +204,8 @@ export const grepTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
+		const specError = toolSpecPathError("Grep", args);
+		if (specError) return { output: specError, isError: true };
 		const {
 			pattern,
 			path: searchPathArg,

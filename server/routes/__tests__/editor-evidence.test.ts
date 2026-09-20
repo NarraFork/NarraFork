@@ -21,6 +21,7 @@ import {
 	narratorToolCalls,
 	projects,
 	users,
+	workspaceWriteLeases,
 } from "../../db/schema";
 import { localBackend } from "../../lib/agent/execution/local-backend";
 import { writeTool } from "../../lib/agent/tools/write";
@@ -81,7 +82,7 @@ beforeEach(async () => {
 		...fileChangeLocalIo,
 		async apply(input) {
 			applyCalls++;
-			await fileChangeLocalIo.apply(input);
+			return fileChangeLocalIo.apply(input);
 		},
 	};
 	runtime = new LocalFileChangeRuntime({ db, privateRoot: getNarraforkHome(), io });
@@ -169,6 +170,45 @@ function scope() {
 		.get();
 	if (!value) throw new Error("Expected real coordinator scope");
 	return value;
+}
+function expectQuarantinedFile(path: string, outcome: "pending" | "unknown") {
+	const currentScope = scope();
+	const effect = effects()[0];
+	expect(currentScope).toMatchObject({
+		status: "active",
+		activeLeaseId: null,
+		activeMutationCount: 0,
+	});
+	const quarantined = db
+		.select()
+		.from(workspaceWriteLeases)
+		.where(eq(workspaceWriteLeases.scopeId, currentScope.id))
+		.limit(20)
+		.all()
+		.filter((lease) => lease.status === "quarantined");
+	expect(quarantined).toHaveLength(1);
+	expect(quarantined[0]).toMatchObject({
+		scopeId: currentScope.id,
+		status: "quarantined",
+		rangesJson: { version: 1, ranges: [{ kind: "file", canonicalPath: path }] },
+		mutationManifestJson: {
+			version: 1,
+			mutations: [
+				{
+					mutationId: effect.mutationId,
+					effectId: effect.id,
+					operationId: effect.operationId,
+					outcome,
+				},
+			],
+		},
+	});
+	expect(quarantined[0].executionEndedAt).toBeString();
+	expect(runtime.coordinator.capture(currentScope)).toMatchObject({
+		status: "needs_verification",
+		quarantinedLeaseCount: 1,
+		active: { retainedRecoveryHolds: 0 },
+	});
 }
 async function toolContext(path: string): Promise<ToolContext> {
 	const identity = await localBackend.resolvePathIdentity(path);
@@ -436,16 +476,18 @@ describe("editor/tool shared lease and authorization boundaries", () => {
 		const release = deferred();
 		const queued = deferred();
 		const originalApply = io.apply;
+		let ioAttempts = 0;
 		io.apply = async (input) => {
+			ioAttempts++;
 			entered.resolve();
 			await release.promise;
-			await originalApply(input);
+			return originalApply(input);
 		};
-		const withWrite = runtime.coordinator.withWrite.bind(runtime.coordinator);
-		let admissions = 0;
-		const spy = spyOn(runtime.coordinator, "withWrite").mockImplementation((request, body) => {
-			if (++admissions === 2) queued.resolve();
-			return withWrite(request, body);
+		const executeEditor = runtime.executeEditor.bind(runtime);
+		const spy = spyOn(runtime, "executeEditor").mockImplementation((request) => {
+			const result = executeEditor(request);
+			queued.resolve();
+			return result;
 		});
 		restorers.push(() => spy.mockRestore());
 		const context = await toolContext(path);
@@ -453,11 +495,25 @@ describe("editor/tool shared lease and authorization boundaries", () => {
 			writeTool.execute({ file_path: path, content: "tool\n" }, context),
 		);
 		await entered.promise;
-		const editor = save({ path, content: "human\n", baseHash: hash("baseline\n") });
+		let editorSettled = false;
+		const editor = save({ path, content: "human\n", baseHash: hash("baseline\n") }).then(
+			(response) => {
+				editorSettled = true;
+				return response;
+			},
+		);
 		try {
+			// The dirty namespace may serialize before coordinator admission. Observe
+			// the real editor entry instead; do not require a particular lock layer.
 			await queued.promise;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(editorSettled).toBe(false);
+			expect(ioAttempts).toBe(1);
+			expect(applyCalls).toBe(0);
+			expect(await readFile(path, "utf8")).toBe("baseline\n");
 		} finally {
 			release.resolve();
+			await Promise.allSettled([tool, editor]);
 		}
 		expect((await tool).isError).toBeUndefined();
 		expect(await editor).toMatchObject({
@@ -465,6 +521,8 @@ describe("editor/tool shared lease and authorization boundaries", () => {
 			json: { code: "STALE_WRITE", currentContent: "tool\n" },
 		});
 		expect(await readFile(path, "utf8")).toBe("tool\n");
+		expect(ioAttempts).toBe(1);
+		expect(applyCalls).toBe(1);
 		expect(operations()).toHaveLength(1);
 		expect(operations()[0].sourceKind).toBe("tool");
 	});
@@ -650,7 +708,7 @@ describe("editor evidence failures and immutable human projection", () => {
 		expect(effects()).toHaveLength(0);
 	});
 
-	test("after-settlement DB failure retains intent, pending scope and no blind retry", async () => {
+	test("after-settlement DB failure retains intent, quarantined file lease and no blind retry", async () => {
 		const path = join(workspace, "settle-db.txt");
 		await writeFile(path, "old");
 		failSql(
@@ -667,7 +725,7 @@ describe("editor evidence failures and immutable human projection", () => {
 		});
 		expect(effects()[0]).toMatchObject({ settlement: "applying", executionReceiptJson: null });
 		expect(await bytes(effects()[0].intendedAfterStateJson)).toEqual(Buffer.from("written"));
-		expect(scope().status).toBe("needs_verification");
+		expectQuarantinedFile(path, "pending");
 		expect((await save({ path, content: "written", baseHash: hash("written") })).status).toBe(500);
 		expect(applyCalls).toBe(1);
 	});
@@ -692,7 +750,7 @@ describe("editor evidence failures and immutable human projection", () => {
 			linesRemoved: 1,
 		});
 		expect(operations()[0].settlement).not.toBe("settled");
-		expect(scope().status).toBe("needs_verification");
+		expectQuarantinedFile(path, "pending");
 		expect((await save({ path, content: "retry\n", baseHash: hash("written\n") })).status).toBe(
 			500,
 		);
@@ -716,8 +774,9 @@ describe("editor evidence failures and immutable human projection", () => {
 		await writeFile(path, "old");
 		const apply = io.apply;
 		io.apply = async (input) => {
-			await apply(input);
+			const result = await apply(input);
 			await writeFile(path, "foreign after");
+			return result;
 		};
 		expect(await save({ path, content: "human", baseHash: hash("old") })).toMatchObject({
 			status: 500,
@@ -737,7 +796,16 @@ describe("editor evidence failures and immutable human projection", () => {
 			linesAdded: null,
 			linesRemoved: null,
 		});
-		expect(scope().status).toBe("needs_verification");
+		expectQuarantinedFile(path, "unknown");
+		const frozenEffect = effects()[0];
+		const frozenProjection = projections()[0];
+		expect((await save({ path, content: "retry", baseHash: hash("foreign after") })).status).toBe(
+			500,
+		);
+		expect(applyCalls).toBe(1);
+		expect(await readFile(path, "utf8")).toBe("foreign after");
+		expect(effects()).toEqual([frozenEffect]);
+		expect(projections()).toEqual([frozenProjection]);
 	});
 
 	test("late metadata activity does not downgrade the frozen human grade/counts", async () => {

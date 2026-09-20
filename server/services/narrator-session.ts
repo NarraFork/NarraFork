@@ -27,7 +27,6 @@ import {
 import type { ReasoningEffort } from "../lib/agent";
 import { diagnosticsFromError } from "../lib/agent/error-diagnostics";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
-import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import {
 	clearBehaviorFenceEditGrant,
 	grantBehaviorFenceEdit,
@@ -130,6 +129,7 @@ import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import {
 	clearStreamingSnapshot,
 	type EventHooks,
+	persistDetachedToolResult,
 	type TokenUsageSnapshot,
 } from "./narrator-event-handler";
 import { deliverInjection } from "./narrator-injection";
@@ -145,12 +145,6 @@ import {
 	truncateToolIO,
 } from "./narrator-service";
 import { generateQuickTitle, setProvisionalTitleFromUserMessage } from "./narrator-title";
-import {
-	abandonTreeSnapshot,
-	declaredWorktreePaths,
-	recordTreeSnapshotAfter,
-	recordTreeSnapshotBefore,
-} from "./narrator-tree-snapshot-hooks";
 import { resolveContinueTurnTiming } from "./narrator-turn-timing";
 import {
 	assertOAuthNarratorRuntimeActive,
@@ -344,7 +338,7 @@ import { ensureNarratorPlanFileId } from "./narrator-plan-mode";
 import type { RevertScope, RevertWarning } from "./snapshot-revert";
 // Tools that may modify files on disk — git status is tracked after these complete.
 // Defined next to the snapshot hooks so both loops agree on the set.
-import { FILE_MUTATING_TOOLS } from "./tree-snapshot-loop-hooks";
+import { buildTreeSnapshotExecutionHooks } from "./tree-snapshot-loop-hooks";
 import {
 	type ContinuationStallState,
 	computeContinuationStallState,
@@ -4736,6 +4730,11 @@ async function reExecuteDeniedToolCallUnlocked(
 						all: active._blockedSkills.all,
 						names: [...active._blockedSkills.names],
 					},
+					...buildTreeSnapshotExecutionHooks({
+						session: active,
+						narratorId,
+						isInGitRepo: active._isInGitRepo === true,
+					}),
 					requireToolCallBinding: true,
 					onInternalReadAuthorization: async (toolUseId, binding) => {
 						await narratorPersistence.validateToolCallBinding(narratorId, toolUseId, binding);
@@ -4790,6 +4789,7 @@ async function reExecuteDeniedToolCallUnlocked(
 								: undefined,
 							config.reviewReadOnlyBash,
 						),
+					onDetachedToolResult: (event) => persistDetachedToolResult(narratorId, event),
 					onEvent: (event) => {
 						if (event.type === "tool_output") {
 							broadcastToNarrator(narratorId, {
@@ -4822,37 +4822,6 @@ async function reExecuteDeniedToolCallUnlocked(
 						}
 					},
 				};
-
-				// A re-run mutates files just like the original pass, so it must record the same
-				// content-addressed boundaries the loop's onSnapshotBefore/After hooks record.
-				const isShellTool = toolName === SHELL_TOOL_NAME;
-				const requestedDevice =
-					typeof toolInput.device === "string"
-						? toolInput.device
-						: (active._defaultDeviceId ?? LOCAL_DEVICE_ID);
-				const canSnapshotRerun =
-					active._isInGitRepo &&
-					FILE_MUTATING_TOOLS.has(toolName) &&
-					requestedDevice === LOCAL_DEVICE_ID;
-				if (canSnapshotRerun) {
-					// A re-run starts from whatever is on disk now, so the cached hash from the
-					// original pass must not be reused as this run's baseline.
-					active._lastTreeHash = undefined;
-					// Same declaration rule as the loop hook: only a re-run that can name its
-					// target up front gets its delta attributed by declaration.
-					await recordTreeSnapshotBefore(
-						active,
-						narratorId,
-						toolUseId,
-						isShellTool ? null : declaredWorktreePaths(active.cwd, toolInput),
-					);
-				} else if (isShellTool && requestedDevice !== LOCAL_DEVICE_ID) {
-					logger.debug("Skipping Bash rerun snapshot for remote execution target", {
-						narratorId,
-						toolUseId,
-						deviceId: requestedDevice,
-					});
-				}
 
 				// Reproduce the exact execution identity frozen on the original pass. It pins the
 				// audit-only selectionSource (a local tool frozen as "local_default" would otherwise be
@@ -4917,52 +4886,8 @@ async function reExecuteDeniedToolCallUnlocked(
 						...(result.updatedInput ? { updatedInput: result.updatedInput } : {}),
 						...(result.metadata ? { metadata: result.metadata } : {}),
 					});
-
-					// Record the re-run's own boundaries. Remote targets have no shadow repository
-					// yet, so they are skipped rather than treated as if they were local.
-					const executionTarget = result.metadata?.executionTarget as
-						| { deviceId?: string; cwd?: string }
-						| undefined;
-					if (canSnapshotRerun && executionTarget?.deviceId !== LOCAL_DEVICE_ID) {
-						// The before-hook already opened a write claim, and nothing here will close
-						// it: a claim left in flight is read as extending to now, so its declared
-						// paths would be subtracted from every other narrator's shell call in this
-						// worktree from now on — turning their real writes into unrevertable ones.
-						abandonTreeSnapshot(active, narratorId, toolUseId);
-					}
-					if (canSnapshotRerun && executionTarget?.deviceId === LOCAL_DEVICE_ID) {
-						try {
-							const { changedFiles } = await recordTreeSnapshotAfter(active, narratorId, toolUseId);
-							if (isShellTool && changedFiles.length > 0) {
-								const { recordAttributions } = await import("./file-attribution-service");
-								await recordAttributions(
-									{
-										deviceId: LOCAL_DEVICE_ID,
-										workspacePath: active.cwd,
-										narratorId,
-										action: "bash",
-										toolName: SHELL_TOOL_NAME,
-										toolUseId,
-									},
-									changedFiles,
-								);
-							}
-						} catch (err) {
-							// The after-hook closes the claim before it can fail, but a failure here
-							// leaves that unproven, and a claim left in flight overlaps every later
-							// window. Sealing is a no-op once it is already closed.
-							abandonTreeSnapshot(active, narratorId, toolUseId);
-							logger.debug("Bash rerun after-snapshot failed", {
-								narratorId,
-								toolUseId,
-								error: String(err),
-							});
-						}
-					}
 				} catch (err) {
-					// executeTool threw, so the after-hook above is skipped entirely. The claim the
-					// before-hook opened has to be sealed here or it stays "in flight" forever.
-					if (canSnapshotRerun) abandonTreeSnapshot(active, narratorId, toolUseId);
+					// executeTool has already awaited the paired snapshot cleanup, even on failure.
 					const message = err instanceof Error ? err.message : String(err);
 					logger.error("Failed to re-execute denied tool call", {
 						narratorId,

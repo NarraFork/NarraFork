@@ -17,6 +17,7 @@
 
 import { Group, Loader, Paper, Text } from "@mantine/core";
 import { IconAlertTriangle, IconArrowsMinimize, IconGitMerge, IconX } from "@tabler/icons-react";
+import { useTranslation } from "react-i18next";
 import {
 	type CompactProgressLabels,
 	formatCompactProgressText,
@@ -28,6 +29,9 @@ import {
 	type SystemSimpleData,
 } from "../measure/measure-system-simple";
 import type { MeasuredElement, PreparedFixedBlock } from "../prepared-block";
+import type { VListViewControls } from "../VListContentViewHost";
+import type { VListViewOwner } from "../vlist-content-view-target";
+import { activateOnKey, swallowSelectionClick } from "./key-activate";
 
 /** The single-line kinds this renderer knows how to draw. */
 export type SystemSimpleKind = PreparedFixedBlock["tag"];
@@ -39,6 +43,9 @@ interface RenderSystemSimpleProps {
 	 * vlist/, so callers may inject it; otherwise a neutral placeholder is drawn).
 	 */
 	avatarSlot?: React.ReactNode;
+	/** Fullscreen snapshots belong to the list, which outlives virtual rows. */
+	viewControls?: VListViewControls;
+	viewOwner?: VListViewOwner;
 	/**
 	 * Open the compact / segment-compact summary for this marker. Injected by the
 	 * integration layer (the modal + API live outside vlist/); absent → the row is
@@ -74,6 +81,8 @@ function cssLight(color: string): string {
 export function RenderSystemSimple({
 	measured,
 	avatarSlot,
+	viewControls,
+	viewOwner,
 	onOpenCompact,
 	onCancelCompact,
 	cancelCompactTitle,
@@ -87,6 +96,15 @@ export function RenderSystemSimple({
 	const height = measured.height;
 
 	switch (kind) {
+		case "publication_result":
+			return (
+				<PublicationResultRow
+					data={data}
+					height={height}
+					viewControls={viewControls}
+					viewOwner={viewOwner}
+				/>
+			);
 		case "compact":
 			return (
 				<CompactRow
@@ -116,6 +134,59 @@ export function RenderSystemSimple({
 		default:
 			return null;
 	}
+}
+
+function PublicationResultRow({
+	data,
+	height,
+	viewControls,
+	viewOwner,
+}: {
+	data: SystemSimpleData;
+	height: number;
+	viewControls?: VListViewControls;
+	viewOwner?: VListViewOwner;
+}) {
+	const { t } = useTranslation("narrator");
+	const open = () =>
+		viewControls?.openFullscreen({
+			id: data.messageId ?? "publication-result",
+			slot: "body",
+			owner: viewOwner ?? { specKey: data.messageId ?? "publication-result" },
+			kind: "markdown",
+			title: t("publicationResultTitle"),
+			// Receipt truncation is permanent, not a lazy payload-fetch signal.
+			text: data.publicationResult?.truncated
+				? `${t("publicationResultTruncated")}\n\n${data.snapshotText ?? ""}`
+				: (data.snapshotText ?? ""),
+		});
+	return (
+		<button
+			type="button"
+			disabled={!viewControls}
+			onClick={swallowSelectionClick(open)}
+			onKeyDown={activateOnKey(open)}
+			style={{
+				height,
+				width: "100%",
+				display: "block",
+				boxSizing: "border-box",
+				padding: "4px 8px",
+				border: 0,
+				borderRadius: 4,
+				background: "var(--mantine-color-default)",
+				color: "var(--mantine-color-dimmed)",
+				font: "inherit",
+				fontSize: "var(--mantine-font-size-xs)",
+				whiteSpace: "nowrap",
+				overflow: "hidden",
+				textOverflow: "ellipsis",
+				cursor: "pointer",
+			}}
+		>
+			{t("publicationResultOpen")}
+		</button>
+	);
 }
 
 // ── compact / segment_compact: centered single line, py={4} ──────────────────

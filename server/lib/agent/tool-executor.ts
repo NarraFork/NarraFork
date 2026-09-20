@@ -11,6 +11,7 @@ import {
 import { logger } from "../logger";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
+import { assertSpecPath, assertToolSpecPaths, toolSpecPathError } from "../spec-uri";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
 import { targetPathSemantics, toolBaseCwd } from "./execution/path-resolve";
@@ -38,6 +39,7 @@ import type {
 	ToolExecutionEndpointRequest,
 	ToolExecutionPlan,
 	ToolExecutionTarget,
+	ToolResult,
 } from "./types";
 
 const PROGRESS_INTERVAL_MS = 5_000;
@@ -220,12 +222,12 @@ async function resolveEndpoint(
 	return { backend, request, target };
 }
 
-async function resolveFrozenExecutionTarget(
+function validatedExecutionRequests(
 	tu: AgentToolUse,
 	config: AgentConfig,
 	input: Record<string, unknown>,
-	previous?: FrozenExecutionTarget,
-): Promise<FrozenExecutionTarget | undefined> {
+) {
+	assertToolSpecPaths(tu.name, input);
 	const routing = toolRegistry.get(tu.name)?.executionRouting;
 	if (!routing) return undefined;
 	let requests: ToolExecutionEndpointRequest[];
@@ -241,6 +243,26 @@ async function resolveFrozenExecutionTarget(
 		requests = resolved.endpoints;
 		primaryKey = resolved.primaryKey;
 	}
+	// Validate EVERY raw endpoint before resolving even the first backend/path identity.
+	for (const request of requests) {
+		assertSpecPath(request.path, {
+			supported: request.pathFlavor === "spec",
+			allowRoot: tu.name === "Grep",
+		});
+		assertSpecPath(request.workdir);
+	}
+	return { routing, requests, primaryKey };
+}
+
+async function resolveFrozenExecutionTarget(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	input: Record<string, unknown>,
+	previous?: FrozenExecutionTarget,
+): Promise<FrozenExecutionTarget | undefined> {
+	const resolved = validatedExecutionRequests(tu, config, input);
+	if (!resolved) return undefined;
+	const { routing, requests, primaryKey } = resolved;
 	const frozenEndpoints: FrozenExecutionEndpoint[] = [];
 	for (const request of requests) {
 		const previousEndpoint = previous?.endpoints.find(
@@ -269,6 +291,7 @@ async function resolveAndPersistFrozenExecutionTarget(
 	input: Record<string, unknown>,
 	previous?: FrozenExecutionTarget,
 ): Promise<FrozenExecutionTarget | undefined> {
+	assertToolSpecPaths(tu.name, input);
 	// Unrouted tools must not pay for the resolver's async hops. Eager (mid-stream) execution
 	// has to reach tool.execute before the streaming loop emits assistant_message, so every
 	// avoidable microtask before execution changes observable tool ordering.
@@ -658,6 +681,11 @@ export async function executeTool(
 	config: AgentConfig,
 	options: ExecuteToolOptions = {},
 ): Promise<ToolExecResult> {
+	const specError = toolSpecPathError(tu.name, tu.input);
+	if (specError) {
+		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
+		return { output: specError, isError: true, durationMs: 0 };
+	}
 	const locale = (config.locale as Locale) ?? "en";
 	const admissionState = options.admissionState ?? {};
 	const toolCallBinding = requireToolCallBinding(
@@ -800,6 +828,8 @@ export async function executeTool(
 		try {
 			const approvedTarget =
 				options.preFrozenTarget && isRoutedTool(tu) ? options.preFrozenTarget : undefined;
+			// Rehydration can resolve a remote backend too: reject all raw endpoints first.
+			if (approvedTarget) validatedExecutionRequests(tu, config, tu.input);
 			const seedPrevious = approvedTarget ? rehydrateFrozenTarget(approvedTarget) : undefined;
 			// A pre-granted re-run carries an approval for one specific execution identity
 			// (a restored deferred tool whose permission was already granted, or a user
@@ -950,6 +980,10 @@ export async function executeTool(
 		let executionStartedAt = start;
 
 		const effectiveInput = permission.updatedInput ?? tu.input;
+		const updatedSpecError = toolSpecPathError(tu.name, effectiveInput);
+		if (updatedSpecError) {
+			return { output: updatedSpecError, isError: true, durationMs: 0 };
+		}
 		const permissionNotice = permission.notice;
 		// Track whether the permission handler redirected the input (e.g. plan-mode file path)
 		const redirectedInput =
@@ -1196,32 +1230,6 @@ export async function executeTool(
 			},
 		};
 		ctx.updateExecutionLease = updateExecutionLease;
-		try {
-			if (toolCallBinding) {
-				const startedBinding = await config.onToolExecutionStarting?.(
-					tu.toolUseId,
-					toolCallBinding,
-					executionStartedAt,
-				);
-				if (config.requireToolCallBinding && (!startedBinding || startedBinding.attempt < 1)) {
-					throw new Error("Tool execution attempt was not durably allocated");
-				}
-				if (startedBinding) {
-					if (
-						startedBinding.toolCallId !== toolCallBinding.toolCallId ||
-						startedBinding.attempt !== toolCallBinding.attempt
-					)
-						throw new Error("Tool start cannot change the persisted attempt");
-					ctx.toolCallBinding = startedBinding;
-					admissionState.toolCallBinding = startedBinding;
-					config.toolExecutionBindings?.set(tu, startedBinding);
-				}
-			}
-		} catch (error) {
-			updateExecutionLease.release();
-			throw error;
-		}
-
 		if (
 			tu.name === "Eval" &&
 			ctx.toolCallBinding &&
@@ -1316,28 +1324,81 @@ export async function executeTool(
 			};
 		}
 
-		// Progress starts only after final admission; a deferred tool remains visually pending.
 		let progressTimer: ReturnType<typeof setInterval> | undefined;
-		if (config.onEvent) {
-			const onEvent = config.onEvent;
-			// The ONE moment that proves execution has begun: permission granted, final
-			// admission acquired, `tool.execute` not yet called. Everything upstream of here
-			// (input parsing, the approval prompt, a reflection gate, the admission wait) is
-			// preparation the UI must not paint as work in progress.
-			//
-			// `executionStartedAt` rather than `Date.now()`: a tool resumed after a
-			// transparent update wait re-stamps it above, so this matches the value the
-			// eventual `tool_result` reports and the two cannot disagree.
-			onEvent({ type: "tool_executing", toolUseId: tu.toolUseId, executionStartedAt });
-			let elapsed = 0;
-			progressTimer = setInterval(() => {
-				elapsed += PROGRESS_INTERVAL_MS / 1000;
-				onEvent({ type: "tool_progress", toolUseId: tu.toolUseId, elapsed });
-			}, PROGRESS_INTERVAL_MS);
-		}
+		let claimingExecution = false;
 
 		try {
-			const result = await tool.execute(effectiveInput, ctx);
+			config.signal.throwIfAborted();
+			const lifecycle = {
+				toolUse: tu,
+				effectiveInput,
+				executionTarget: frozenExecution?.target,
+				binding: ctx.toolCallBinding,
+			};
+			let result: ToolResult | undefined;
+			let executionError: unknown;
+			try {
+				try {
+					await config.onToolExecutionBefore?.(lifecycle);
+				} catch (error) {
+					// Snapshot/observation failures must not prevent the actual tool from running.
+					logger.warn("Tool before-execution observer failed", {
+						toolUseId: tu.toolUseId,
+						error: String(error),
+					});
+				}
+				// Capture may await its hot-path budget; an interrupt during it must not write.
+				config.signal.throwIfAborted();
+				start = Date.now();
+				executionStartedAt = start;
+				if (toolCallBinding) {
+					claimingExecution = true;
+					const startedBinding = await config.onToolExecutionStarting?.(
+						tu.toolUseId,
+						toolCallBinding,
+						executionStartedAt,
+					);
+					if (config.requireToolCallBinding && (!startedBinding || startedBinding.attempt < 1)) {
+						throw new Error("Tool execution attempt was not durably allocated");
+					}
+					if (startedBinding) {
+						if (
+							startedBinding.toolCallId !== toolCallBinding.toolCallId ||
+							startedBinding.attempt !== toolCallBinding.attempt
+						)
+							throw new Error("Tool start cannot change the persisted attempt");
+						ctx.toolCallBinding = startedBinding;
+						lifecycle.binding = startedBinding;
+						admissionState.toolCallBinding = startedBinding;
+						config.toolExecutionBindings?.set(tu, startedBinding);
+					}
+					claimingExecution = false;
+				}
+				config.signal.throwIfAborted();
+				// Only actual execution is painted as running; captures are preparation.
+				if (config.onEvent) {
+					const onEvent = config.onEvent;
+					onEvent({ type: "tool_executing", toolUseId: tu.toolUseId, executionStartedAt });
+					let elapsed = 0;
+					progressTimer = setInterval(() => {
+						elapsed += PROGRESS_INTERVAL_MS / 1000;
+						onEvent({ type: "tool_progress", toolUseId: tu.toolUseId, elapsed });
+					}, PROGRESS_INTERVAL_MS);
+				}
+				result = await tool.execute(effectiveInput, ctx);
+			} catch (error) {
+				executionError = error;
+				throw error;
+			} finally {
+				try {
+					await config.onToolExecutionAfter?.({ ...lifecycle, result, error: executionError });
+				} catch (error) {
+					logger.warn("Tool after-execution observer failed", {
+						toolUseId: tu.toolUseId,
+						error: String(error),
+					});
+				}
+			}
 
 			// Append permission notice (for example, a plan-mode file redirect) to successful output.
 			const appendNotice = permissionNotice && !result.isError ? `\n\n${permissionNotice}` : "";
@@ -1429,6 +1490,8 @@ export async function executeTool(
 				pipelineExitConfirmationStateId,
 			};
 		} catch (err) {
+			// A failed durable claim must still reject (not become a normal tool result).
+			if (claimingExecution) throw err;
 			return {
 				output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,

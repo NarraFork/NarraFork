@@ -68,6 +68,7 @@ import {
 import { isInsidePath, normalizePathForOS, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
+import { assertToolSpecPaths, toolSpecPathError } from "../lib/spec-uri";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 
 export {
@@ -470,6 +471,11 @@ export function resolvePermissionDecision(
 		executionContext,
 		reviewReadOnlyBash = false,
 	} = opts;
+	const specError = toolSpecPathError(toolName, input);
+	if (specError) {
+		if (meta) meta.blacklistReason = specError;
+		return "deny";
+	}
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
 	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
@@ -3338,6 +3344,7 @@ async function freezePermissionExecutionContext(input: {
 	deviceClass?: DeviceAccessGroup | null;
 	refinePrimaryPath?: boolean;
 }): Promise<ExecutionTargetContext> {
+	assertToolSpecPaths(input.toolName, input.toolInput);
 	const paths =
 		input.target.pathFlavor === "spec" || input.target.cwd.startsWith("spec://")
 			? specPathSemantics
@@ -3569,6 +3576,8 @@ export async function handlePermission(
 	runtimeConstraint?: RuntimePermissionConstraint,
 	reviewReadOnlyBash = false,
 ): Promise<PermissionResult> {
+	const specError = toolSpecPathError(toolName, input);
+	if (specError) return { behavior: "deny", message: specError };
 	const binding = options?.toolCallBinding;
 	if (binding) {
 		try {

@@ -27,6 +27,7 @@
 import { z } from "zod";
 import { LocalFileValidationError } from "../../../../services/file-change-local-io";
 import { executeLocalFileChange } from "../../../../services/file-change-runtime";
+import { toolSpecPathError } from "../../../spec-uri";
 import { withDeviceParam } from "../../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../../execution/path-resolve";
 import { getToolBackend } from "../../execution/tool-backend";
@@ -280,6 +281,8 @@ export const structSedTool: ToolDefinition = {
 	}),
 
 	async execute(args, ctx): Promise<ToolResult> {
+		const specError = toolSpecPathError("StructSed", args);
+		if (specError) return { output: specError, isError: true };
 		const filePath = typeof args.file_path === "string" ? args.file_path : "";
 		if (!filePath) return { output: "file_path is required.", isError: true };
 

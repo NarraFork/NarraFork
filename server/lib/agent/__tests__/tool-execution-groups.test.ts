@@ -5,6 +5,7 @@ import {
 	isBashParallelOptIn,
 	isParallelSafeToolExecution,
 	isStrictSerialToolExecution,
+	selectStreamingToolExecutions,
 	settleToolExecutionResult,
 } from "../tool-execution-groups";
 import type { ToolExecResult } from "../tool-executor";
@@ -196,6 +197,182 @@ describe("tool execution grouping", () => {
 			expect(isAgentDependentToolExecutionGroup(groups[0], groups[1] ?? [])).toBe(true);
 			expect(isAgentDependentToolExecutionGroup(groups[1], groups[0] ?? [])).toBe(false);
 		});
+	});
+});
+
+describe("selectStreamingToolExecutions", () => {
+	function entry(
+		item: ReturnType<typeof tool> | undefined,
+		state: Partial<{
+			ready: boolean;
+			started: boolean;
+			settled: boolean;
+			fatal: boolean;
+			allowed: boolean;
+		}> = {},
+	) {
+		return { tool: item, ready: true, started: false, settled: false, allowed: true, ...state };
+	}
+
+	test("empty and fully settled queues select nothing", () => {
+		expect(selectStreamingToolExecutions([])).toEqual([]);
+		expect(
+			selectStreamingToolExecutions([
+				entry(tool("Write"), { started: true, settled: true }),
+				entry(tool("Read"), { started: true, settled: true }),
+			]),
+		).toEqual([]);
+	});
+
+	test("incomplete earlier identities block later calls even when they became ready first", () => {
+		const earlier = tool("Write");
+		const later = tool("Read");
+		// The upstream supplies provider order, not parameter-completion order.
+		const items = [entry(undefined, { ready: false }), entry(later)];
+		expect(selectStreamingToolExecutions(items)).toEqual([]);
+		items[0] = entry(earlier, { ready: false });
+		expect(selectStreamingToolExecutions(items)).toEqual([]);
+		items[0].ready = true;
+		expect(selectStreamingToolExecutions(items)).toEqual([earlier]);
+	});
+
+	test("missing descriptors remain barriers even when marked ready", () => {
+		expect(selectStreamingToolExecutions([entry(undefined), entry(tool("Read"))])).toEqual([]);
+	});
+
+	test("complete parallel prefix can start before an incomplete call", () => {
+		const read = tool("Read");
+		const grep = tool("Grep");
+		const later = tool("Read");
+		const items = [entry(read), entry(grep), entry(undefined), entry(later)];
+		expect(selectStreamingToolExecutions(items)).toEqual([read, grep]);
+		items[0].started = items[0].settled = true;
+		items[1].started = items[1].settled = true;
+		expect(selectStreamingToolExecutions(items)).toEqual([]);
+	});
+
+	test("Write, Edit, and default Bash remain serial until their predecessors settle", () => {
+		const tools = [tool("Write"), tool("Edit"), tool("Bash"), tool("Bash"), tool("Read")];
+		const items = tools.map((item) => entry(item));
+		for (let index = 0; index < items.length; index++) {
+			expect(selectStreamingToolExecutions(items)).toEqual([tools[index]]);
+			items[index].started = true;
+			expect(selectStreamingToolExecutions(items)).toEqual([]);
+			items[index].settled = true;
+		}
+		expect(selectStreamingToolExecutions(items)).toEqual([]);
+	});
+
+	test("explicitly parallel Bash joins Read but strict_serial still wins", () => {
+		const read = tool("Read");
+		const bash = tool("Bash", { parallel: true });
+		const strict = tool("Bash", { parallel: true, strict_serial: true });
+		const later = tool("Read");
+		const items = [entry(read), entry(bash), entry(strict), entry(later)];
+		expect(selectStreamingToolExecutions(items)).toEqual([read, bash]);
+		items[0].started = items[0].settled = true;
+		items[1].started = items[1].settled = true;
+		expect(selectStreamingToolExecutions(items)).toEqual([strict]);
+	});
+
+	test("running parallel groups accept new siblings without releasing the next Write", () => {
+		const read = tool("Read");
+		const bash = tool("Bash", { parallel: true });
+		const write = tool("Write");
+		const items = [entry(read)];
+		expect(selectStreamingToolExecutions(items)).toEqual([read]);
+		items[0].started = true;
+		items.push(entry(bash), entry(write));
+		expect(selectStreamingToolExecutions(items)).toEqual([bash]);
+		items[1].started = true;
+		expect(selectStreamingToolExecutions(items)).toEqual([]);
+		// Completion order does not alter provider-order barriers.
+		items[1].settled = true;
+		expect(selectStreamingToolExecutions(items)).toEqual([]);
+		items[0].settled = true;
+		expect(selectStreamingToolExecutions(items)).toEqual([write]);
+	});
+
+	test("a settled parallel prefix can receive a late sibling without restarting old members", () => {
+		const read = tool("Read");
+		const grep = tool("Grep");
+		const items = [entry(read, { started: true, settled: true }), entry(grep)];
+		expect(selectStreamingToolExecutions(items)).toEqual([grep]);
+		items[1].started = true;
+		expect(selectStreamingToolExecutions(items)).toEqual([]);
+	});
+
+	test("disabled members block even later members of the same parallel group", () => {
+		const read = tool("Read");
+		const disabled = tool("Agent");
+		const items = [
+			entry(read),
+			entry(disabled, { allowed: false }),
+			entry(tool("Read")),
+			entry(tool("Write")),
+		];
+		expect(selectStreamingToolExecutions(items)).toEqual([read]);
+		items[0].started = items[0].settled = true;
+		expect(selectStreamingToolExecutions(items)).toEqual([]);
+	});
+
+	test("deferred Agent blocks Await and Send until it is allowed and settled", () => {
+		const agent = tool("Agent");
+		const awaitTool = tool("Await");
+		const send = tool("Send");
+		const items = [entry(agent, { allowed: false }), entry(awaitTool), entry(send)];
+		expect(selectStreamingToolExecutions(items)).toEqual([]);
+		items[0].allowed = true;
+		expect(selectStreamingToolExecutions(items)).toEqual([agent]);
+		items[0].started = true;
+		expect(selectStreamingToolExecutions(items)).toEqual([]);
+		items[0].settled = true;
+		expect(selectStreamingToolExecutions(items)).toEqual([awaitTool, send]);
+	});
+
+	test("settled nonfatal deferred calls no longer block later groups", () => {
+		const read = tool("Read");
+		expect(
+			selectStreamingToolExecutions([
+				entry(tool("ExitPlanMode"), { started: true, settled: true, allowed: false }),
+				entry(read),
+			]),
+		).toEqual([read]);
+	});
+
+	test("settled fatal calls cannot be skipped like successful groups", () => {
+		expect(
+			selectStreamingToolExecutions([
+				entry(tool("Write"), { started: true, settled: true }),
+				entry(tool("Bash"), { started: true, settled: true, fatal: true }),
+				entry(tool("Read")),
+			]),
+		).toEqual([]);
+	});
+
+	test("fatal parallel members also prevent later siblings from starting", () => {
+		expect(
+			selectStreamingToolExecutions([
+				entry(tool("Read"), { started: true }),
+				entry(tool("Grep"), { started: true, settled: true, fatal: true }),
+				entry(tool("Read")),
+				entry(tool("Write")),
+			]),
+		).toEqual([]);
+	});
+
+	test("preserves generic tool descriptors and does not mutate the input", () => {
+		const first = Object.freeze({ toolName: "Read", input: {}, id: "first" });
+		const second = Object.freeze({ toolName: "Read", input: {}, id: "second" });
+		const items = Object.freeze([
+			Object.freeze({ tool: first, ready: true, started: true, settled: false, allowed: true }),
+			Object.freeze({ tool: second, ready: true, started: false, settled: false, allowed: true }),
+		]);
+		const selected = selectStreamingToolExecutions<typeof first | typeof second>(items);
+		expect(selected).toEqual([second]);
+		expect(selected[0]).toBe(second);
+		expect(selected[0].id).toBe("second");
+		expect(items[1].started).toBe(false);
 	});
 });
 

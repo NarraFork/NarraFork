@@ -12,6 +12,7 @@ import {
 	apiRequests,
 	narratorMessageRefs,
 	narratorMessages,
+	narrators,
 	narratorToolCalls,
 } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
@@ -26,6 +27,7 @@ import {
 	startApiRequest,
 } from "../lib/api-request-tracker";
 import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
+import { withDbRetry } from "../lib/db-resilience";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
@@ -48,6 +50,65 @@ import {
 	truncateToolIO,
 } from "./narrator-service";
 import { recordOutputChunk } from "./output-stats";
+
+/**
+ * Finish an already-started tool after its loop has drained/aborted. This intentionally
+ * takes no EventHandlerContext: a newer turn may own the streaming snapshot and hooks.
+ * Only the original execution receipt can update history; never recover it by provider id.
+ */
+export async function persistDetachedToolResult(
+	narratorId: string,
+	event: Extract<AgentEvent, { type: "tool_result" }>,
+): Promise<void> {
+	const binding = event.toolCallBinding;
+	if (!binding) {
+		throw new CriticalEventPersistenceError("Detached tool result has no execution receipt");
+	}
+	// The generator is already gone, so a transient lock cannot rely on its normal
+	// tool_result retry path. Retry asynchronously and retain the same CAS authority.
+	const affected = await withDbRetry(
+		() =>
+			narratorPersistence.updateToolCallResult(event.toolUseId, {
+				expectedBinding: { ...binding, narratorId },
+				output: event.metadata ? { _text: event.output, _metadata: event.metadata } : event.output,
+				input: event.brokenInputOverride ?? event.updatedInput ?? event.input,
+				status: event.isError ? "fail" : "success",
+				errorMessage: event.isError ? event.output : undefined,
+				durationMs: event.durationMs,
+				permissionStartedAt: event.permissionStartedAt,
+				executionStartedAt: event.executionStartedAt,
+				completedAt: event.completedAt,
+			}),
+		{ label: "persistDetachedToolResult", maxRetries: 3 },
+	);
+	if (!affected) return;
+
+	// Refresh persisted history, not tool_completed (which mutates live streaming
+	// state by toolUseId). Project the current row so a newer attempt remains visible.
+	const message = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, affected.messageId),
+		with: { toolCalls: true },
+	});
+	const ref = await db.query.narratorMessageRefs.findFirst({
+		where: and(
+			eq(narratorMessageRefs.narratorId, narratorId),
+			eq(narratorMessageRefs.messageId, affected.messageId),
+		),
+		columns: { seq: true },
+	});
+	if (!message || !ref) return;
+	const owner = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { type: true, parentNarratorId: true },
+	});
+	const broadcastTargetId =
+		owner?.type === "subagent" ? (owner.parentNarratorId ?? narratorId) : narratorId;
+	const projected = enrichToolUseBlocks(truncateToolIO([{ ...message, seq: ref.seq }]))[0];
+	dualBroadcastToNarrator(
+		{ narratorId, broadcastTargetId, parentToolUseId: message.parentToolUseId },
+		{ type: "message_updated", narratorId: broadcastTargetId, message: projected },
+	);
+}
 
 // === Context types ===
 
@@ -210,18 +271,7 @@ export interface EventHooks {
 	onClearCompactSummary?: () => Promise<void>;
 	/** Git status tracking after file-mutating tools and completed Bash commands */
 	onGitTrack?: (toolName: string, toolUseId: string, input?: Record<string, unknown>) => void;
-	/**
-	 * Snapshot: record the workspace tree hash before a file-mutating tool executes.
-	 *
-	 * Awaited, because the captured state must predate the tool's writes. All
-	 * file-mutating tools are excluded from the loop's eager execution, so the tool
-	 * has not started when this runs.
-	 *
-	 * `input` is passed because a shared worktree makes the tree hash alone
-	 * ambiguous: it captures every actor's writes in the window, so the tool's own
-	 * declaration of what it will write (Write/Edit's `file_path`) is needed to
-	 * attribute the resulting delta. It is complete at this point in the event.
-	 */
+	/** Legacy direct-call adapter only; processEvent never triggers workspace captures. */
 	onSnapshotBefore?: (toolUseId: string, toolName: string, input: unknown) => Promise<void> | void;
 	/** Snapshot: record the workspace tree hash after a file-mutating tool completes */
 	onSnapshotAfter?: (toolUseId: string, toolName: string) => Promise<void> | void;
@@ -1006,11 +1056,7 @@ export async function processEvent(
 		}
 
 		case "tool_call": {
-			// Snapshot: capture tree state before the tool modifies files. Awaited so
-			// the snapshot cannot race the tool's own writes.
-			if (hooks?.onSnapshotBefore) {
-				await hooks.onSnapshotBefore(event.toolUseId, event.toolName, event.input);
-			}
+			// Workspace captures belong to executeTool's awaited lifecycle, not UI events.
 			const routing = subagentToolRouting(ctx, event.toolUseId);
 			// The child row's label. Computed once and reused by both the snapshot and
 			// the reduced parent frame — `input` is complete here, so this is the
@@ -1942,12 +1988,6 @@ export async function processEvent(
 			// Main narrator: git tracking
 			if (hooks?.onGitTrack) {
 				hooks.onGitTrack(event.toolName, event.toolUseId, event.input);
-			}
-
-			// Snapshot: capture tree state after the tool completed. Awaited so the
-			// recorded hash reflects this tool's writes and not a later tool's.
-			if (hooks?.onSnapshotAfter) {
-				await hooks.onSnapshotAfter(event.toolUseId, event.toolName);
 			}
 
 			// Main narrator: ExitPlanMode

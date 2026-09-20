@@ -287,7 +287,14 @@ export function NarratorDockProvider({
 			const params = panel.params as NarratorDockPanelParams | undefined;
 			if (params && isNarratorToolPanelType(params.panelType)) next.add(params.panelType);
 		}
-		setOpenToolTypes(next);
+		// Layout events also fire for moves/resizes; only publish changed membership.
+		setOpenToolTypes((previous) => {
+			if (previous.size !== next.size) return next;
+			for (const type of next) {
+				if (!previous.has(type)) return next;
+			}
+			return previous;
+		});
 	}, []);
 
 	const openToolPanel = useCallback(

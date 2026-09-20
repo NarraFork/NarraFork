@@ -58,6 +58,9 @@ export interface ModificationEvent {
 	preciseAttribution: boolean;
 	evidence: "legacy" | "v2" | "mixed";
 	attributionGrade: FileChangeAttributionGrade;
+	/** NULL means unmeasured, never zero. */
+	linesAdded?: number | null;
+	linesRemoved?: number | null;
 }
 
 /** Small per-file history projection for hover cards; newest first and always bounded. */
@@ -67,6 +70,9 @@ export interface ModificationEventSummary {
 	action: ModificationAction;
 	actor: ModificationActor;
 	evidence: "legacy" | "v2";
+	/** NULL means unmeasured, never zero. */
+	linesAdded?: number | null;
+	linesRemoved?: number | null;
 }
 
 export interface FileModificationGroup {
@@ -225,6 +231,8 @@ const EVENT_COLUMNS = {
 	toolName: fileAttributions.toolName,
 	toolUseId: fileAttributions.toolUseId,
 	changedAt: fileAttributions.changedAt,
+	linesAdded: fileAttributions.linesAdded,
+	linesRemoved: fileAttributions.linesRemoved,
 };
 
 type EventRow = {
@@ -240,6 +248,8 @@ type EventRow = {
 	toolName: string | null;
 	toolUseId: string | null;
 	changedAt: string;
+	linesAdded: number | null;
+	linesRemoved: number | null;
 };
 
 /**
@@ -312,7 +322,9 @@ async function selectPerPathRows(
 						${fileAttributions.action} as "action",
 						${fileAttributions.toolName} as "toolName",
 						${fileAttributions.toolUseId} as "toolUseId",
-						${fileAttributions.changedAt} as "changedAt"
+						${fileAttributions.changedAt} as "changedAt",
+						${fileAttributions.linesAdded} as "linesAdded",
+						${fileAttributions.linesRemoved} as "linesRemoved"
 					from ${fileAttributions}
 					where ${and(...baseConditions, eq(fileAttributions.workspacePath, workspaceKey), eq(fileAttributions.filePath, recordedScopePath(filePath, scopes.get(workspaceKey))))}
 					order by ${fileAttributions.changedAt} desc, ${EVENT_ROW_ID} desc
@@ -515,6 +527,8 @@ export async function getWorkspaceModificationView(
 				preciseAttribution: false,
 				evidence,
 				attributionGrade: grade,
+				linesAdded: row.linesAdded ?? null,
+				linesRemoved: row.linesRemoved ?? null,
 			});
 		}
 		actors.set(attributionActorKey(actor), actor);
@@ -557,6 +571,8 @@ export async function getWorkspaceModificationView(
 				action,
 				actor,
 				evidence,
+				linesAdded: row.linesAdded ?? null,
+				linesRemoved: row.linesRemoved ?? null,
 			});
 		}
 	}

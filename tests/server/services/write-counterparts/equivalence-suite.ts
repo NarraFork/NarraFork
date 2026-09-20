@@ -49,6 +49,7 @@ import {
 	revertPlanHeaderDigest,
 } from "../../../../server/services/revert-plan-service";
 import type { WorkspaceWriteLease } from "../../../../server/services/workspace-write-coordinator";
+import type { WorkspaceWriteRange } from "../../../../server/services/workspace-write-ranges";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Facades (one per domain, uniform async shape over both backends)
@@ -98,19 +99,18 @@ export interface WorkspaceLeaseFacade {
 	 * A complete clean write: admit, register one mutation, settle it, release.
 	 * The probe reads the durable mutation counter while the write is in flight.
 	 */
-	runCleanWrite(scope: Readonly<FileChangeScopeIdentity>): Promise<{ counterDuringWrite: unknown }>;
+	runCleanWrite(
+		scope: Readonly<FileChangeScopeIdentity>,
+		ranges?: readonly WorkspaceWriteRange[],
+	): Promise<{ counterDuringWrite: unknown }>;
 	/** A write that marks its outcome uncertain: quarantine, durable lease retained. */
-	runUncertainWrite(scope: Readonly<FileChangeScopeIdentity>): Promise<void>;
+	runUncertainWrite(
+		scope: Readonly<FileChangeScopeIdentity>,
+		ranges?: readonly WorkspaceWriteRange[],
+	): Promise<void>;
 	/** Admit on the scope, surfacing the domain error code. */
 	admitLease(scope: Readonly<FileChangeScopeIdentity>): Promise<unknown>;
-	/** Recover through the store's OWN epoch (must refuse a live lease). */
-	recoverSameEpoch(
-		scope: Readonly<FileChangeScopeIdentity>,
-	): Promise<{ revision: number; fencingToken: number }>;
-	/** Recover through a DIFFERENT epoch (the foreign-recovery path). */
-	recoverForeignEpoch(
-		scope: Readonly<FileChangeScopeIdentity>,
-	): Promise<{ revision: number; fencingToken: number }>;
+	readLeases(scope: Readonly<FileChangeScopeIdentity>): Promise<Record<string, unknown>[]>;
 	readScope(scope: Readonly<FileChangeScopeIdentity>): Promise<Record<string, unknown>>;
 }
 
@@ -289,6 +289,8 @@ function fakeRollbackLease(
 	return {
 		token: Object.freeze({ id: Symbol("equivalence-lease") }),
 		kind: "rollback",
+		leaseId: "equivalence-rollback-fixture",
+		ranges: [{ kind: "subtree", canonicalPath: scope.canonicalRoot }],
 		scope,
 		scopeRevision,
 		executionBinding: binding,
@@ -500,30 +502,34 @@ export async function workspaceLeaseScenario(kit: EquivalenceKit): Promise<unkno
 	expect(row.revision).toBe(2);
 	expect(row.status).toBe("active");
 
-	// An uncertain write quarantines: status flips, the durable lease is RETAINED
-	// (a crash-shaped barrier), and every later admission is refused with the same
-	// domain code on both backends.
-	await workspace.runUncertainWrite(scope);
-	row = await workspace.readScope(scope);
-	expect(row.status).toBe("needs_verification");
-	expect(row.activeLeaseId).not.toBeNull();
-	projection.admitOnBarrier = await captureError(() => workspace.admitLease(scope));
-	projection.recoverSameEpoch = await captureError(() => workspace.recoverSameEpoch(scope));
-
-	// Foreign recovery (a different owner epoch, the crash-recovery shape): the
-	// barrier clears and BOTH the fence and the revision advance, so every stale
-	// backend of the old generation stays fenced out.
-	const fenceBefore = row.fencingToken as number;
-	const revisionBefore = row.revision as number;
-	const recovered = await workspace.recoverForeignEpoch(scope);
-	expect(recovered.fencingToken).toBe(fenceBefore + 1);
-	expect(recovered.revision).toBe(revisionBefore + 1);
+	// Ended A keeps only its physical file barrier, not the scope-wide owner.
+	const rangesA = [{ kind: "file" as const, canonicalPath: `${scope.canonicalRoot}/A.txt` }];
+	await workspace.runUncertainWrite(scope, rangesA);
 	row = await workspace.readScope(scope);
 	expect(row.status).toBe("active");
 	expect(row.activeLeaseId).toBeNull();
 	expect(row.activeMutationCount).toBe(0);
-
-	projection.recoverWithoutBarrier = await captureError(() => workspace.recoverForeignEpoch(scope));
+	projection.admitOnBarrier = await captureError(() => workspace.admitLease(scope));
+	const quarantined = (await workspace.readLeases(scope)).filter(
+		(lease) => lease.status === "quarantined",
+	);
+	expect(quarantined).toHaveLength(1);
+	expect(quarantined[0]?.executionEndedAt).not.toBeNull();
+	expect(quarantined[0]?.rangesJson).toEqual({ version: 1, ranges: rangesA });
+	projection.quarantineRanges = quarantined[0]?.rangesJson;
+	// Sibling B in the SAME scope can complete without recovering A first.
+	await workspace.runCleanWrite(scope, [
+		{ kind: "file", canonicalPath: `${scope.canonicalRoot}/B.txt` },
+	]);
+	row = await workspace.readScope(scope);
+	expect(row.status).toBe("active");
+	expect(row.activeLeaseId).toBeNull();
+	expect(row.activeMutationCount).toBe(0);
+	expect(row.fencingToken).toBe(3);
+	expect(row.revision).toBe(6);
+	projection.admitAfterSibling = await captureError(() => workspace.admitLease(scope));
+	// Recovery equivalence is NOT claimed here: PG exposes durable sections,
+	// not SQLite's scheduler/reservation or external observation orchestration.
 	projection.finalScope = {
 		status: row.status,
 		revision: row.revision,

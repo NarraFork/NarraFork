@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
 	chmod,
+	cp,
 	lstat,
 	mkdir,
 	mkdtemp,
@@ -26,15 +27,21 @@ import * as schema from "../db/schema";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { editTool } from "../lib/agent/tools/edit";
 import { decodeFileBytes } from "../lib/agent/tools/encoding";
+import { structSedTool } from "../lib/agent/tools/struct-sed";
 import { MAX_BATCH_OPERATIONS } from "../lib/agent/tools/struct-sed/commands";
 import { writeTool } from "../lib/agent/tools/write";
 import { withBashWriteLock, withWorkspaceWriteLock } from "../lib/agent/tools/write-serialization";
 import type { ToolContext, ToolExecutionTarget } from "../lib/agent/types";
 import { worktreeWriteLock } from "../lib/async-mutex";
+import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { settings } from "../lib/settings";
 import { FileChangeEvidenceService } from "./file-change-evidence";
-import { type FileChangeLocalIo, fileChangeLocalIo } from "./file-change-local-io";
+import {
+	createFileChangeLocalIo,
+	type FileChangeLocalIo,
+	fileChangeLocalIo,
+} from "./file-change-local-io";
 import {
 	FileChangeReversalCalculator,
 	type FileChangeReversalEffect,
@@ -93,6 +100,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	await runtime.initialize().catch(() => {});
 	sqlite.close();
 	await rm(root, { recursive: true, force: true });
 });
@@ -109,7 +117,7 @@ function makeRuntime(options: Partial<LocalFileChangeRuntimeOptions> = {}) {
 }
 
 async function callContext(
-	tool: "Write" | "Edit",
+	tool: "Write" | "Edit" | "StructSed",
 	path: string,
 	cwd = workspace,
 ): Promise<ToolContext> {
@@ -741,8 +749,9 @@ describe("fail closed before writes and after uncertain IO", () => {
 		const path = join(workspace, "after.txt");
 		await writeFile(path, "old");
 		io.apply = async (input) => {
-			await fileChangeLocalIo.apply(input);
+			const result = await fileChangeLocalIo.apply(input);
 			await writeFile(path, "external-after");
+			return result;
 		};
 		const result = await write(path, "new");
 		expect(result.isError).toBe(true);
@@ -753,7 +762,14 @@ describe("fail closed before writes and after uncertain IO", () => {
 			executionReceiptJson: { confirmed: true, outcome: "applied" },
 		});
 		expect(operations()[0].executionOutcome).toBe("failed");
-		expect(pendingScope()?.status).toBe("needs_verification");
+		expect(pendingScope()).toMatchObject({ status: "active", activeLeaseId: null });
+		expect(
+			db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.where(eq(schema.workspaceWriteLeases.status, "quarantined"))
+				.all(),
+		).toHaveLength(1);
 	});
 
 	test("settlement DB failure keeps pending evidence/quarantine and never retries written IO", async () => {
@@ -767,7 +783,30 @@ describe("fail closed before writes and after uncertain IO", () => {
 		expect((await write(path, "new", ctx)).isError).toBe(true);
 		expect(await readFile(path, "utf8")).toBe("new");
 		expect(effects()[0]).toMatchObject({ settlement: "applying", executionReceiptJson: null });
-		expect(pendingScope()).toMatchObject({ status: "needs_verification", activeMutationCount: 1 });
+		expect(pendingScope()).toMatchObject({
+			status: "active",
+			activeMutationCount: 0,
+			activeLeaseId: null,
+		});
+		expect(
+			db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.where(eq(schema.workspaceWriteLeases.status, "quarantined"))
+				.get(),
+		).toMatchObject({
+			mutationManifestJson: {
+				version: 1,
+				mutations: [
+					{
+						mutationId: effects()[0].mutationId,
+						operationId: operations()[0].id,
+						effectId: effects()[0].id,
+						outcome: "pending",
+					},
+				],
+			},
+		});
 		expect((await write(path, "new", ctx)).isError).toBe(true);
 		expect(apply).toHaveBeenCalledTimes(1);
 	});
@@ -789,7 +828,30 @@ describe("fail closed before writes and after uncertain IO", () => {
 			executionReceiptJson: { confirmed: true, outcome: "applied" },
 		});
 		expect(operations()[0].executionOutcome).toBe("running");
-		expect(pendingScope()).toMatchObject({ status: "needs_verification", activeMutationCount: 1 });
+		expect(pendingScope()).toMatchObject({
+			status: "active",
+			activeMutationCount: 0,
+			activeLeaseId: null,
+		});
+		expect(
+			db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.where(eq(schema.workspaceWriteLeases.status, "quarantined"))
+				.get(),
+		).toMatchObject({
+			mutationManifestJson: {
+				version: 1,
+				mutations: [
+					{
+						mutationId: effects()[0].mutationId,
+						operationId: operations()[0].id,
+						effectId: effects()[0].id,
+						outcome: "pending",
+					},
+				],
+			},
+		});
 	});
 
 	test("wrong PK, legacy version, COW origin and target mismatch cannot enter v2", async () => {
@@ -890,17 +952,392 @@ describe("application data directory compatibility", () => {
 		},
 	);
 
-	test("replacing a cached blob directory does not silently initialize a new namespace", async () => {
+	for (const damage of ["missing", "corrupt"] as const) {
+		test(`real Write survives ${damage} identity with stable coordination and rejects old history`, async () => {
+			await write(join(workspace, "old.txt"), "old evidence");
+			const oldScope = db.select().from(schema.fileChangeScopes).get();
+			const identityPath = join(privateRoot, "file-change-source.json");
+			if (damage === "missing") await rm(identityPath);
+			else await writeFile(identityPath, "{broken");
+			// A new DB wrapper simulates losing runtime caches while retaining durable scopes.
+			db = database(sqlite);
+			runtime = makeRuntime();
+			const apply = spyOn(io, "apply");
+			const path = join(workspace, "after-damage.txt");
+			const ctx = await callContext("Write", path);
+			const result = await write(path, "still written", ctx);
+			expect(result.isError).not.toBe(true);
+			expect(result.metadata?.fileChangeHistoryUnavailable).toBe(true);
+			expect(result.metadata?.fileChangeEvidence).toBeUndefined();
+			expect(await readFile(path, "utf8")).toBe("still written");
+			expect((await write(path, "no replay", ctx)).isError).toBe(true);
+			expect(apply).toHaveBeenCalledTimes(1);
+			const scopes = db.select().from(schema.fileChangeScopes).all();
+			expect(scopes).toHaveLength(1);
+			expect(scopes[0]).toMatchObject({
+				id: oldScope?.id,
+				sourceInstanceId: oldScope?.sourceInstanceId,
+				workspaceInstanceId: oldScope?.workspaceInstanceId,
+			});
+			await expect(runtime.verifyNamespace()).rejects.toThrow();
+			await runtime.initialize().catch(() => {});
+			await runtime.initialize().catch(() => {});
+			expect(effects()).toHaveLength(1);
+		});
+	}
+
+	test("cold empty-history fallback keeps one durable coordination identity across runtimes", async () => {
 		await runtime.initialize();
+		await rm(join(privateRoot, "file-change-source.json"));
+		db = database(sqlite);
+		runtime = makeRuntime();
+		const first = await write(join(workspace, "first-fallback.txt"), "first");
+		expect(first.isError).not.toBe(true);
+		expect(first.metadata?.fileChangeHistoryUnavailable).toBe(true);
+		await runtime.initialize().catch(() => {});
+		await runtime.initialize().catch(() => {});
+		const firstScope = db.select().from(schema.fileChangeScopes).get();
+		if (!firstScope) throw new Error("Expected durable fallback scope");
+		db = database(sqlite);
+		runtime = makeRuntime();
+		const second = await write(join(workspace, "second-fallback.txt"), "second");
+		expect(second.isError).not.toBe(true);
+		expect(second.metadata?.fileChangeHistoryUnavailable).toBe(true);
+		const scopes = db.select().from(schema.fileChangeScopes).all();
+		expect(scopes).toHaveLength(1);
+		expect(scopes[0]?.id).toBe(firstScope.id);
+		expect(scopes[0]?.sourceInstanceId).toBe(firstScope.sourceInstanceId);
+		await expect(runtime.verifyNamespace()).rejects.toThrow();
+		await runtime.initialize().catch(() => {});
+		await runtime.initialize().catch(() => {});
+	});
+
+	test("directory replaced after io.read resets before dispatch and records this operation", async () => {
+		await write(join(workspace, "old.txt"), "retained evidence");
+		const budget = db.select().from(schema.fileChangeStorageBudgets).get();
+		const blobs = join(privateRoot, "file-change-blobs");
+		let replaced = false;
+		io.read = async (...args) => {
+			const observed = await fileChangeLocalIo.read(...args);
+			if (!replaced) {
+				replaced = true;
+				await rename(blobs, join(privateRoot, "retained-blobs"));
+				await mkdir(blobs, { mode: 0o700 });
+			}
+			return observed;
+		};
+		const apply = spyOn(io, "apply");
+		const path = join(workspace, "replaced-after-read.txt");
+		const ctx = await callContext("Write", path);
+		const result = await write(path, "one dispatch", ctx);
+		expect(result.isError).not.toBe(true);
+		expect(result.metadata?.fileChangeEvidence).toBeDefined();
+		expect(await readFile(path, "utf8")).toBe("one dispatch");
+		expect(apply).toHaveBeenCalledTimes(1);
+		expect((await write(path, "no replay", ctx)).isError).toBe(true);
+		expect(apply).toHaveBeenCalledTimes(1);
+		await runtime.initialize().catch(() => {});
+		await runtime.initialize().catch(() => {});
+		expect(db.select().from(schema.fileChangeStorageBudgets).get()?.namespaceKey).not.toBe(
+			budget?.namespaceKey,
+		);
+		expect(db.select().from(schema.fileChangeStorageBudgets).get()?.status).toBe("ready");
+		expect(effects()).toHaveLength(2);
+		expect(operations()).toHaveLength(2);
+	});
+
+	test("missing old blobs allow writes without silently trusting old history", async () => {
+		await write(join(workspace, "old.txt"), "retained history");
+		const budget = db.select().from(schema.fileChangeStorageBudgets).get();
 		const blobs = join(privateRoot, "file-change-blobs");
 		await rename(blobs, join(privateRoot, "retained-blobs"));
 		await mkdir(blobs, { mode: 0o700 });
 		const path = join(workspace, "changed-namespace.txt");
-		const result = await write(path, "must not write");
+		const ctx = await callContext("Write", path);
+		const apply = spyOn(io, "apply");
+		const result = await write(path, "tool still works", ctx);
+		expect(result.isError).not.toBe(true);
+		expect(result.metadata?.fileChangeHistoryUnavailable).toBeUndefined();
+		expect(result.metadata?.fileChangeEvidence).toBeDefined();
+		expect(await readFile(path, "utf8")).toBe("tool still works");
+		await runtime.initialize().catch(() => {});
+		await runtime.initialize().catch(() => {});
+		expect((await write(path, "do not redispatch", ctx)).isError).toBe(true);
+		expect(apply).toHaveBeenCalledTimes(1);
+		await runtime.verifyNamespace();
+		const after = db.select().from(schema.fileChangeStorageBudgets).get();
+		expect(after?.namespaceKey).not.toBe(budget?.namespaceKey);
+		expect(after?.status).toBe("ready");
+		expect(effects()).toHaveLength(2);
+		expect(effects()[0].observedAfterStateJson).toEqual({ kind: "unknown", reason: "expired" });
+		expect(operations()).toHaveLength(2);
+	});
+
+	test("concurrent initialization resets a copied namespace once and invalidates old refs", async () => {
+		await write(join(workspace, "original.txt"), "original bytes");
+		const original = await runtime.initialize();
+		const budget = original.catalog.getBudget();
+		const copied = join(root, "copied-private");
+		await cp(privateRoot, copied, { recursive: true });
+		runtime = makeRuntime({ privateRoot: copied });
+		const initialize = Array.from({ length: 8 }, () => runtime.initialize().catch(() => {}));
+		await Promise.all(initialize);
+		await runtime.initialize().catch(() => {});
+		const recovered = await runtime.verifyNamespace();
+		expect(recovered.sourceInstanceId).toBe(original.sourceInstanceId);
+		const after = recovered.catalog.getBudget();
+		expect(after?.namespaceKey).not.toBe(budget?.namespaceKey);
+		expect(after?.generation).toBe((budget?.generation ?? 0) + 1);
+		expect(after?.status).toBe("ready");
+		expect(after?.usedBytes).toBe(0);
+		expect(after?.reservedBytes).toBe(budget?.reservedBytes);
+		expect(after?.quotaBytes).toBe(budget?.quotaBytes);
+		expect(db.select().from(schema.fileChangeBlobReservations).all()).toEqual([]);
+		expect(effects()).toHaveLength(1);
+		expect(() => original.catalog.getBudget()).toThrow();
+		expect(
+			(await write(join(workspace, "new.txt"), "new bytes")).metadata?.fileChangeEvidence,
+		).toBeDefined();
+	});
+
+	test("corrupt copied content is discarded without inventory hashing and Edit records new evidence", async () => {
+		const path = join(workspace, "editable.txt");
+		await write(path, "before");
+		const copied = join(root, "corrupt-copy");
+		await cp(privateRoot, copied, { recursive: true });
+		const blob = db.select().from(schema.fileChangeBlobs).get();
+		if (!blob) throw new Error("Expected published blob");
+		await writeFile(join(copied, "file-change-blobs", blob.storageKey), "broken");
+		runtime = makeRuntime({ privateRoot: copied });
+		const apply = spyOn(io, "apply");
+		const result = await edit(path, "before", "after");
+		expect(result.isError).not.toBe(true);
+		expect(result.metadata?.fileChangeEvidence).toBeDefined();
+		expect(await readFile(path, "utf8")).toBe("after");
+		expect(apply).toHaveBeenCalledTimes(1);
+		expect((await runtime.verifyNamespace()).catalog.getBudget()?.status).toBe("ready");
+		const old = effects()[0];
+		expect(old.observedAfterStateJson).toEqual({ kind: "unknown", reason: "expired" });
+		// Publishing the identical digest again must not resurrect the old reference.
+		expect((await edit(path, "after", "before")).isError).not.toBe(true);
+		expect(effects()[0].observedAfterStateJson).toEqual({ kind: "unknown", reason: "expired" });
+	});
+
+	test("namespace reset discards old reservations without stopping coordinated Bash", async () => {
+		const namespace = await runtime.initialize();
+		namespace.catalog.reserve({
+			expectedGeneration: namespace.generation,
+			ownerEpoch: "old-owner",
+			expectedSize: 17,
+			signal: new AbortController().signal,
+		});
+		const copied = join(root, "reserved-copy");
+		await cp(privateRoot, copied, { recursive: true });
+		runtime = makeRuntime({ privateRoot: copied });
+		const activity = await runtime.registerBashActivity({
+			backend: localBackend,
+			cwd: workspace,
+			signal: new AbortController().signal,
+		});
+		expect(runtime.coordinator.capture(activity.scope).active.uncoordinatedActivities).toBe(1);
+		const binding = localFileChangeRuntimeBinding();
+		if (!binding) throw new Error("Expected local runtime");
+		await expect(
+			runtime.coordinator.withRollback(
+				{
+					scope: activity.scope,
+					runtime: binding,
+					signal: new AbortController().signal,
+					waitTimeoutMs: 20,
+				},
+				async () => {},
+			),
+		).rejects.toThrow();
+		activity.end("finished");
+		await runtime.initialize().catch(() => {});
+		await runtime.initialize().catch(() => {});
+		expect(db.select().from(schema.fileChangeBlobReservations).all()).toEqual([]);
+		expect(db.select().from(schema.fileChangeStorageBudgets).get()?.reservedBytes).toBe(0);
+		await expect(
+			runtime.coordinator.withRollback(
+				{
+					scope: activity.scope,
+					runtime: binding,
+					signal: new AbortController().signal,
+				},
+				async () => "allowed",
+			),
+		).resolves.toBe("allowed");
+	});
+
+	test("StructSed still applies a single guarded mutation with missing blob history", async () => {
+		const path = join(workspace, "struct.txt");
+		await write(path, "first\nsecond\n");
+		const blobs = join(privateRoot, "file-change-blobs");
+		await rename(blobs, join(privateRoot, "struct-retained-blobs"));
+		await mkdir(blobs, { mode: 0o700 });
+		const ctx = await callContext("StructSed", path);
+		const apply = spyOn(io, "apply");
+		const result = await withLocalFileChangeRuntime(runtime, () =>
+			structSedTool.execute(
+				{
+					file_path: path,
+					command: "replace",
+					address: "2",
+					content: "changed",
+					dry_run: false,
+				},
+				ctx,
+			),
+		);
+		expect(result.isError).not.toBe(true);
+		expect(result.metadata?.fileChangeEvidence).toBeDefined();
+		expect(apply).toHaveBeenCalledTimes(1);
+		expect(await readFile(path, "utf8")).toBe("first\nchanged\n");
+		await runtime.initialize().catch(() => {});
+		await runtime.initialize().catch(() => {});
+	});
+
+	test("namespace fence at publication falls back only before IO", async () => {
+		const namespace = await runtime.initialize();
+		const read = io.read;
+		let fenced = false;
+		io.read = async (...args) => {
+			const value = await read(...args);
+			if (!fenced) {
+				fenced = true;
+				namespace.catalog.beginReconciliation({ expectedGeneration: namespace.generation });
+			}
+			return value;
+		};
+		const apply = spyOn(io, "apply");
+		const path = join(workspace, "fenced-before.txt");
+		const result = await write(path, "once");
+		expect(result.isError).not.toBe(true);
+		expect(result.metadata?.fileChangeEvidence).toBeDefined();
+		expect(apply).toHaveBeenCalledTimes(1);
+		expect(await readFile(path, "utf8")).toBe("once");
+		await runtime.initialize().catch(() => {});
+		await runtime.initialize().catch(() => {});
+	});
+
+	test("namespace loss after target dispatch never retries the actual write", async () => {
+		const apply = io.apply.bind(io);
+		let calls = 0;
+		io.apply = async (...args) => {
+			calls++;
+			const execution = await apply(...args);
+			const blobs = join(privateRoot, "file-change-blobs");
+			await rename(blobs, join(privateRoot, "after-dispatch-blobs"));
+			await mkdir(blobs, { mode: 0o700 });
+			return execution;
+		};
+		const path = join(workspace, "lost-after.txt");
+		const result = await write(path, "only once");
 		expect(result.isError).toBe(true);
-		expect(result.output).toContain("Blob directory identity changed");
-		await expect(lstat(path)).rejects.toMatchObject({ code: "ENOENT" });
-		expect(operations()).toHaveLength(0);
+		expect(calls).toBe(1);
+		expect(await readFile(path, "utf8")).toBe("only once");
+		expect(operations()).toHaveLength(1);
+		expect(effects()).toHaveLength(1);
+	});
+
+	test("interrupted cache metadata reset stays fenced and retries without losing new evidence", async () => {
+		const path = join(workspace, "retry-reset.txt");
+		await write(path, "before");
+		await rm(join(privateRoot, "file-change-blobs"), { recursive: true, force: true });
+		sqlite.exec(
+			"CREATE TRIGGER fail_reset BEFORE UPDATE ON file_change_effects BEGIN SELECT RAISE(ABORT, 'interrupted reset'); END",
+		);
+		runtime = makeRuntime();
+		await expect(runtime.initialize()).rejects.toThrow("UPDATE file_change_effects");
+		expect(db.select().from(schema.fileChangeStorageBudgets).get()?.status).toBe("unverified");
+		sqlite.exec("DROP TRIGGER fail_reset");
+		const result = await edit(path, "before", "after");
+		expect(result.metadata?.fileChangeEvidence).toBeDefined();
+		expect(effects()[0].observedAfterStateJson).toEqual({ kind: "unknown", reason: "expired" });
+		expect(effects()[1].beforeStateJson.kind).toBe("regular");
+		expect((await runtime.verifyNamespace()).catalog.getBudget()?.status).toBe("ready");
+	});
+
+	test("concurrent first writes after directory removal share one reset and keep every receipt", async () => {
+		await write(join(workspace, "old.txt"), "old");
+		const generation = (await runtime.initialize()).generation;
+		await rm(join(privateRoot, "file-change-blobs"), { recursive: true, force: true });
+		const results = await Promise.all(
+			Array.from({ length: 4 }, (_, i) => write(join(workspace, `parallel-${i}.txt`), `body-${i}`)),
+		);
+		for (const result of results) expect(result.metadata?.fileChangeEvidence).toBeDefined();
+		expect((await runtime.verifyNamespace()).generation).toBe(generation + 1);
+		expect(effects()).toHaveLength(5);
+		for (const effect of effects().slice(1))
+			expect(effect.observedAfterStateJson.kind).toBe("regular");
+	});
+
+	test("namespace reset waits until the entire in-flight cache consumer settles", async () => {
+		await write(join(workspace, "old.txt"), "old");
+		let release!: () => void;
+		let entered!: () => void;
+		const gate = new Promise<void>((done) => {
+			release = done;
+		});
+		const started = new Promise<void>((done) => {
+			entered = done;
+		});
+		const active = runtime.withNamespaceAccess(async () => {
+			entered();
+			await gate;
+		});
+		await started;
+		await rm(join(privateRoot, "file-change-blobs"), { recursive: true, force: true });
+		let resetFinished = false;
+		const fresh = makeRuntime();
+		const reset = fresh.initialize().then(() => {
+			resetFinished = true;
+		});
+		await Bun.sleep(15);
+		expect(resetFinished).toBe(false);
+		release();
+		await active;
+		await reset;
+		expect(resetFinished).toBe(true);
+	});
+
+	test("hot reload drains and retires the old verifier before resetting", async () => {
+		await write(join(workspace, "old.txt"), "old");
+		await rm(join(privateRoot, "file-change-blobs"), { recursive: true, force: true });
+		const jobs = hotSafe(
+			"narrafork.file-change-namespace-recovery.v1",
+			() => new WeakMap<object, { pending?: Promise<void>; retryAfter: number }>(),
+		);
+		let release!: () => void;
+		const pending = new Promise<void>((done) => {
+			release = done;
+		});
+		const state = { pending, retryAfter: 0 };
+		jobs.set(db, state);
+		let ready = false;
+		const fresh = makeRuntime();
+		const reset = fresh.initialize().then(() => {
+			ready = true;
+		});
+		await Bun.sleep(15);
+		expect(ready).toBe(false);
+		release();
+		await reset;
+		expect(ready).toBe(true);
+		expect(state.retryAfter).toBe(Number.POSITIVE_INFINITY);
+	});
+
+	test("loss of new cache bytes does not block a future mutation", async () => {
+		const path = join(workspace, "lost-new-bytes.txt");
+		await write(path, "old");
+		await rm(join(privateRoot, "file-change-blobs"), { recursive: true, force: true });
+		expect((await edit(path, "old", "new")).metadata?.fileChangeEvidence).toBeDefined();
+		const ns = await runtime.verifyNamespace();
+		await rm(join(privateRoot, "file-change-blobs"), { recursive: true, force: true });
+		expect((await edit(path, "new", "later")).metadata?.fileChangeEvidence).toBeDefined();
+		expect((await runtime.verifyNamespace()).generation).toBeGreaterThan(ns.generation);
+		expect(await readFile(path, "utf8")).toBe("later");
 	});
 
 	test("source and catalog identity survive a fresh service under the same appdata", async () => {
@@ -998,8 +1435,13 @@ describe("legacy workspace lock interoperability", () => {
 			io.apply = async (input) => {
 				entered.resolve();
 				await gate.promise;
-				if (outcome === "error") throw new Error("injected pre-dispatch error");
-				await fileChangeLocalIo.apply(input);
+				if (outcome === "error")
+					return {
+						kind: "not_applied",
+						error: new Error("injected pre-dispatch error"),
+						parentEffects: { createdPaths: [], possiblePaths: [] },
+					};
+				return fileChangeLocalIo.apply(input);
 			};
 			const ctx = await callContext("Write", path);
 			const controller = new AbortController();
@@ -1143,7 +1585,7 @@ describe("legacy workspace lock interoperability", () => {
 			const nested = await write(path, "nested");
 			expect(nested.isError).toBe(true);
 			expect(nested.output).toContain("Nested");
-			await fileChangeLocalIo.apply(input);
+			return fileChangeLocalIo.apply(input);
 		};
 		expect((await write(path, "outer")).isError).toBeUndefined();
 		expect(await readFile(path, "utf8")).toBe("outer");
@@ -1190,7 +1632,7 @@ describe("lazy namespace, coordination and cancellation", () => {
 				entered.resolve();
 				await gate.promise;
 			}
-			await fileChangeLocalIo.apply(input);
+			return fileChangeLocalIo.apply(input);
 		};
 		const first = write(path, "two");
 		await entered.promise;
@@ -1212,8 +1654,9 @@ describe("lazy namespace, coordination and cancellation", () => {
 				scope,
 				runtime: processRuntime(),
 			});
-			await fileChangeLocalIo.apply(input);
+			const result = await fileChangeLocalIo.apply(input);
 			runtime.coordinator.endActivity(activity);
+			return result;
 		};
 		const result = await write(path, "two");
 		expect(result.isError).toBeUndefined();
@@ -1266,7 +1709,7 @@ describe("lazy namespace, coordination and cancellation", () => {
 			input.onDispatch();
 			await writeFile(path, "new");
 			controller.abort(new Error("cancel-after-dispatch"));
-			input.signal.throwIfAborted();
+			throw controller.signal.reason;
 		};
 		expect((await write(path, "new", context)).isError).toBe(true);
 		expect(await readFile(path, "utf8")).toBe("new");
@@ -1277,7 +1720,14 @@ describe("lazy namespace, coordination and cancellation", () => {
 			linesAdded: null,
 		});
 		expect(operations()[0].executionOutcome).toBe("interrupted");
-		expect(pendingScope()?.status).toBe("needs_verification");
+		expect(pendingScope()).toMatchObject({ status: "active", activeLeaseId: null });
+		expect(
+			db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.where(eq(schema.workspaceWriteLeases.status, "quarantined"))
+				.all(),
+		).toHaveLength(1);
 		expect((await write(path, "new", context)).isError).toBe(true);
 		expect(count).toBe(1);
 	});
@@ -1291,7 +1741,7 @@ describe("lazy namespace, coordination and cancellation", () => {
 		});
 		io.apply = async (input) => {
 			generation++;
-			await fileChangeLocalIo.apply(input);
+			return fileChangeLocalIo.apply(input);
 		};
 		expect((await write(path, "new")).isError).toBe(true);
 		expect(await readFile(path, "utf8")).toBe("old");
@@ -1309,7 +1759,7 @@ describe("lazy namespace, coordination and cancellation", () => {
 		io.apply = async (input) => {
 			entered.resolve();
 			await gate.promise;
-			await fileChangeLocalIo.apply(input);
+			return fileChangeLocalIo.apply(input);
 		};
 		const first = write(path, "two");
 		await entered.promise;
@@ -1323,5 +1773,132 @@ describe("lazy namespace, coordination and cancellation", () => {
 		expect((await second).isError).toBe(true);
 		expect(await readFile(path, "utf8")).toBe("two");
 		expect(effects()).toHaveLength(1);
+	});
+});
+
+describe("stage-aware failures and durable narrow quarantine", () => {
+	for (const withoutBlobs of [false, true]) {
+		test(`first mkdir refusal does not quarantine unrelated writes (${withoutBlobs ? "no blobs" : "journal"})`, async () => {
+			await runtime.initialize();
+			if (withoutBlobs) {
+				await rm(join(privateRoot, "file-change-source.json"), { force: true });
+				db = database(sqlite);
+				runtime = makeRuntime();
+			}
+			const parent = join(workspace, "refused");
+			const path = join(parent, "tasks.json");
+			const controlled = createFileChangeLocalIo({
+				lstat,
+				open,
+				async mkdir(current) {
+					if (current === parent)
+						throw Object.assign(new Error("mkdir denied"), { code: "EACCES" });
+					return mkdir(current);
+				},
+			});
+			io.apply = (input) => controlled.apply(input);
+			const result = await write(path, "not written");
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("mkdir denied");
+			await expect(lstat(parent)).rejects.toMatchObject({ code: "ENOENT" });
+			expect(
+				db
+					.select()
+					.from(schema.workspaceWriteLeases)
+					.where(eq(schema.workspaceWriteLeases.status, "quarantined"))
+					.all(),
+			).toHaveLength(0);
+			const unrelated = await write(join(workspace, "unrelated.txt"), "works");
+			expect(unrelated.isError).toBeUndefined();
+			if (withoutBlobs) {
+				expect(unrelated.metadata?.fileChangeHistoryUnavailable).toBe(true);
+				expect(effects()).toHaveLength(0);
+			}
+			if (!withoutBlobs)
+				expect(effects()[0].executionReceiptJson).toMatchObject({
+					confirmed: true,
+					outcome: "not_applied",
+					localIo: {
+						version: 1,
+						outcome: "not_applied",
+						createdParentCount: 0,
+						uncertainParentCount: 0,
+					},
+				});
+		});
+	}
+
+	test("a settled unknown file blocks only itself across coordinator recreation", async () => {
+		const path = join(workspace, "uncertain.txt");
+		await writeFile(path, "before");
+		io.apply = async (input) => {
+			await fileChangeLocalIo.apply(input);
+			throw new Error("acknowledgement lost after write");
+		};
+		expect((await write(path, "after")).isError).toBe(true);
+		const barrier = db
+			.select()
+			.from(schema.workspaceWriteLeases)
+			.where(eq(schema.workspaceWriteLeases.status, "quarantined"))
+			.get();
+		expect(barrier).toMatchObject({
+			rangesJson: { version: 1, ranges: [{ kind: "file", canonicalPath: path }] },
+			mutationManifestJson: {
+				version: 1,
+				mutations: [
+					{
+						mutationId: effects()[0].mutationId,
+						operationId: operations()[0].id,
+						effectId: effects()[0].id,
+						outcome: "unknown",
+					},
+				],
+			},
+		});
+		expect(barrier?.executionEndedAt).toBeTruthy();
+		io.apply = (input) => fileChangeLocalIo.apply(input);
+		expect((await write(join(workspace, "sibling.txt"), "usable")).isError).toBeUndefined();
+		expect((await write(path, "blocked")).isError).toBe(true);
+		runtime = makeRuntime();
+		expect((await write(join(workspace, "after-restart.txt"), "usable")).isError).toBeUndefined();
+		expect((await write(path, "still blocked")).isError).toBe(true);
+		expect(await readFile(path, "utf8")).toBe("after");
+	});
+
+	test("uncertain parent creation quarantines its missing subtree, not the existing ancestor", async () => {
+		const parent = join(workspace, "maybe-created");
+		const path = join(parent, "file.txt");
+		const controlled = createFileChangeLocalIo({
+			lstat,
+			open,
+			async mkdir(current) {
+				if (current === parent)
+					throw Object.assign(new Error("mkdir IO uncertain"), { code: "EIO" });
+				return mkdir(current);
+			},
+		});
+		io.apply = (input) => controlled.apply(input);
+		expect((await write(path, "not written")).isError).toBe(true);
+		expect(effects()[0]).toMatchObject({
+			settlement: "settled",
+			outcome: "no_change",
+			executionReceiptJson: {
+				confirmed: true,
+				outcome: "not_applied",
+				localIo: { outcome: "parent_only", uncertainParentCount: 1 },
+			},
+		});
+		expect(
+			db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.where(eq(schema.workspaceWriteLeases.status, "quarantined"))
+				.get(),
+		).toMatchObject({
+			rangesJson: { version: 1, ranges: [{ kind: "subtree", canonicalPath: parent }] },
+		});
+		io.apply = (input) => fileChangeLocalIo.apply(input);
+		expect((await write(join(workspace, "outside.txt"), "usable")).isError).toBeUndefined();
+		expect((await write(join(parent, "another.txt"), "blocked")).isError).toBe(true);
 	});
 });

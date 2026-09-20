@@ -36,13 +36,13 @@
  * values they close over changed, reusing the old object would leave the row
  * wired to stale handlers.
  *
- * The generation resolves that. It is the builder's own dependency list MINUS the
- * per-frame content arrays, i.e. exactly the inputs the closures capture
- * (`rowHandlers`, `selectionIndex`, the editor opener, …). A change there clears
- * the cache, so every payload is rebuilt; within one generation the closures are
- * behaviourally identical and only the compared CONTENT fields can differ. Those
- * inputs are referentially stable across streaming frames (the live row travels
- * outside `input.messages`), which is what makes the cache effective at all.
+ * The generation resolves that. It contains the owner and actual operation
+ * callbacks captured by the closures, not the document's index/map containers.
+ * Per-row captured values (including editor mode and queued controls) belong in
+ * the payload comparison. A callback change clears the cache; a message update
+ * merely recomputes the projection and reuses rows whose captured values did not
+ * change. Depending on whole document indices here would evict every row on each
+ * persisted-message update, even when the measurement cache remains a hit.
  *
  * ⚠️ Every field a row paints must stay in the comparison.
  * `vlist-row-payload-reuse.test.ts` pins both directions: a changed field must
