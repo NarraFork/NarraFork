@@ -1836,11 +1836,14 @@ async function deliverPendingInjectionsInOrder(
 	adoptedDeliveries?: AgentMessageDelivery[],
 	adoptedMailbox?: MailboxDeliveryConsumption[],
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
+	active?: ActiveNarrator,
 ): Promise<string | null> {
 	return withInboxOwner(narratorId, async () => {
 		await migrateLegacyParentInjections(narratorId);
 		const schedule = mode === "busy" ? "onNextTurn" : "none";
 		const parts: string[] = [];
+		const { pendingInjectionUserId } = await import("./parent-injection-queue");
+		let principalSet = false;
 
 		// One injection row PER entry. The queue's global arrival order is the truth, so we
 		// walk `pending` directly rather than grouping consecutive same-kind entries into a
@@ -1876,6 +1879,13 @@ async function deliverPendingInjectionsInOrder(
 					mailboxClaim: inboxClaim(row),
 					recipientMessageId: row.recipientMessageId ?? undefined,
 				};
+				if (active && !principalSet) {
+					const entryUser = pendingInjectionUserId(entry);
+					if (entryUser !== null && entryUser !== undefined) {
+						active._currentUserId = entryUser;
+						principalSet = true;
+					}
+				}
 				const text = await deliverPendingInjection(
 					narratorId,
 					locale,
@@ -2100,6 +2110,7 @@ export async function drainAndPersistPendingInjections(
 		undefined,
 		undefined,
 		subagent,
+		active,
 	);
 }
 
@@ -2207,6 +2218,7 @@ export async function drainInjectionsIntoHistory(
 		adoptedDeliveries,
 		adoptedMailbox,
 		subagent,
+		active,
 	);
 	if (eventText) parts.push(eventText);
 	if (subagent) {

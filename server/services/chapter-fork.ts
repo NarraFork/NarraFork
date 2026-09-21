@@ -33,6 +33,7 @@ import {
 } from "./worktree-tree-snapshot";
 
 export interface ForkChapterInput {
+	userId?: string | null;
 	title?: string;
 	description?: string;
 	inheritMode?: "full" | "compressed" | "fresh";
@@ -674,6 +675,7 @@ export const chapterFork = {
 					title,
 					newChapterId: id,
 					inheritMode,
+					userId: input.userId,
 					locale: input.locale,
 					forkMessageId: forkMessage?.id,
 				});

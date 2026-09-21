@@ -2129,6 +2129,7 @@ export const narratorService = {
 			title?: string;
 			newChapterId?: string;
 			inheritMode?: "full" | "compressed" | "fresh";
+			userId?: string | null;
 			locale?: string;
 			forkMessageId?: string;
 			/** Allow forking a chapter-bound narrator into a standalone narrator (no chapter). */
@@ -2172,7 +2173,9 @@ export const narratorService = {
 		if (inheritMode === "compressed") {
 			const { narratorContext } = await import("./narrator-context");
 			const locale = (opts?.locale ?? "en") as import("../lib/prompt-i18n").Locale;
-			contextSummary = await narratorContext.generateContextSummary(parentNarratorId, locale);
+			contextSummary = await narratorContext.generateContextSummary(parentNarratorId, locale, {
+				userId: opts?.userId,
+			});
 			if (contextSummary && parent.systemPrompt) {
 				systemPrompt = `${parent.systemPrompt}\n\n## Previous Context Summary\n\nThis session continues from a previous conversation. Here is a summary of the prior context:\n\n${contextSummary}`;
 			}
@@ -2705,6 +2708,7 @@ export const narratorService = {
 		opts?: {
 			title?: string;
 			inheritMode?: "full" | "compressed";
+			userId?: string | null;
 			model?: string;
 			locale?: string;
 		},
@@ -2775,6 +2779,7 @@ export const narratorService = {
 		return this.forkNarrator(parentNarratorId, latestMsgUuid, {
 			title: opts?.title,
 			inheritMode: opts?.inheritMode ?? "full",
+			userId: opts?.userId ?? null,
 			locale: opts?.locale,
 		});
 	},

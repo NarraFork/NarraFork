@@ -1235,6 +1235,7 @@ settingsRoutes.post("/test-model", requireAdmin, async (c) => {
 		const result = await capture.run(() =>
 			agentGenerateWithMetaResolved(prompt, resolved, undefined, undefined, {
 				kind: "settings_test",
+				userId: c.get("user").sub,
 			}),
 		);
 		const diagnostics = buildModelTestDiagnostics({

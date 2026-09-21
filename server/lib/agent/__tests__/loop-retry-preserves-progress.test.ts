@@ -137,6 +137,31 @@ beforeEach(() => {
 	sentRequests = [];
 });
 
+describe("请求发起用户快照", () => {
+	test.each(["primary", "subagent"])("%s 的延迟 start 事件使用请求开始时的用户", async (kind) => {
+		const config = makeConfig(new AbortController().signal, {
+			userId: "alice",
+			...(kind === "subagent" ? { parentNarratorId: "parent" } : {}),
+		});
+		const original = testProvider.chat;
+		testProvider.chat = async function* (params) {
+			params.onRequestStart?.();
+			config.userId = "bob";
+			yield { text: "done" };
+		};
+		try {
+			const starts: AgentEvent[] = [];
+			for await (const event of agentLoop(config, "hello", [])) {
+				if (event.type === "api_request_start") starts.push(event);
+			}
+			expect(starts).toHaveLength(1);
+			expect(starts[0]).toMatchObject({ userId: "alice" });
+		} finally {
+			testProvider.chat = original;
+		}
+	});
+});
+
 describe("重试不得丢弃已产生的工具进展", () => {
 	for (const failure of ["throw", "invalidState"] as const) {
 		for (const mode of ["allow", "mixed", "deny", "abortBefore", "abort", "softStop"] as const) {

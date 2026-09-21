@@ -145,6 +145,8 @@ export async function pushPendingInjection(narratorId: string, entry: PendingInj
 	await enqueueInboxAgent(entry.message.delivery, entry.message.text, {
 		channel: "parent",
 		fromMessageId: entry.message.fromMessageId,
+		userId: entry.message.userId ?? null,
+		createdBy: entry.message.userId ?? null,
 	});
 }
 
@@ -165,6 +167,7 @@ export function projectPendingInjection(
 			logicalRunId: string;
 			eventKind: string;
 			resultRef?: string;
+			userId?: string | null;
 		}>(row);
 		if (!metadata.taskId || !metadata.eventKind) throw new Error("Invalid task notice metadata");
 		const task = db
@@ -183,6 +186,7 @@ export function projectPendingInjection(
 					alias: task?.alias ?? null,
 					status,
 					outputPreview: row.text,
+					userId: metadata.userId ?? peekTaskNoticeUser(metadata.taskId),
 				},
 			};
 		const narrator = db
@@ -221,6 +225,7 @@ export function projectPendingInjection(
 				result: result?.slice(0, 12000),
 				resultTruncated: !!result && result.length > 12000,
 				resultMessageId,
+				userId: metadata.userId ?? peekTaskNoticeUser(metadata.taskId),
 			},
 		};
 	}
@@ -230,6 +235,7 @@ export function projectPendingInjection(
 		kind: "subagent_message",
 		message: {
 			delivery,
+			userId: metadata.userId ?? row.createdBy ?? null,
 			fromId: delivery.sender.id,
 			fromTitle: delivery.sender.title ?? null,
 			fromLabel: delivery.sender.label,
@@ -241,6 +247,49 @@ export function projectPendingInjection(
 		},
 	};
 }
+
+/** Attribution ledger for durable task notices that outlived in-memory completion payloads. */
+const taskNoticeUsers = hotSafe(
+	"narrafork:parent-injection-task-notice-user",
+	() => new Map<string, string | null>(),
+);
+
+export function recordTaskNoticeUser(taskId: string, userId: string | null | undefined): void {
+	taskNoticeUsers.set(taskId, userId ?? null);
+}
+
+function peekTaskNoticeUser(taskId: string): string | null {
+	return taskNoticeUsers.get(taskId) ?? null;
+}
+
+/** Keep unattributed legacy/system entries null rather than charging the parent user. */
+export function pendingInjectionUserId(entry: PendingInjection): string | null {
+	if (entry.kind === "subagent_message") return entry.message.userId ?? null;
+	const task = entry.task as { userId?: string | null; id: string };
+	return task.userId ?? peekTaskNoticeUser(task.id);
+}
+
+/**
+ * Contiguous same-user prefix over the durable projection.
+ * Explicit user restricts delivery to that principal; omitted means oldest entry's owner.
+ * Never skip an entry: FIFO holds across users and producer kinds alike.
+ */
+export async function takePendingInjectionBatch(
+	parentNarratorId: string,
+	userId?: string | null,
+): Promise<{ userId: string | null; entries: PendingInjection[] } | null> {
+	const list = await drainPendingInjections(parentNarratorId);
+	if (!list.length) return null;
+	const owner = userId === undefined ? pendingInjectionUserId(list[0]) : userId;
+	const entries: PendingInjection[] = [];
+	for (const entry of list) {
+		if (pendingInjectionUserId(entry) !== owner) break;
+		entries.push(entry);
+	}
+	if (!entries.length) return null;
+	return { userId: owner, entries };
+}
+
 export async function hasPendingInjections(narratorId: string): Promise<boolean> {
 	await migrateLegacyParentInjections(narratorId);
 	return hasInboxKind(narratorId, ["agent_message", "task_notice"]);

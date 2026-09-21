@@ -620,6 +620,7 @@ export function buildSubagentEventContext(
 	subagentModel: string,
 	provider = resolveProvider(subagentModel),
 	locale: string = "en",
+	userId: string | null = null,
 ): EventHandlerContext {
 	return createRuntimeEventContext({
 		narratorId: subagentId,
@@ -630,6 +631,7 @@ export function buildSubagentEventContext(
 		model: subagentModel,
 		provider,
 		locale,
+		userId,
 	});
 }
 
@@ -1132,6 +1134,7 @@ async function executeSubagentOwned(
 	finalText: string;
 	hasError: boolean;
 	allowInboxWake: boolean;
+	finalUserId: string | null;
 	contextLengthExceeded?: boolean;
 	aborted?: boolean;
 }> {
@@ -1161,6 +1164,7 @@ async function runSubagentRuntime(
 	finalText: string;
 	hasError: boolean;
 	allowInboxWake: boolean;
+	finalUserId: string | null;
 	contextLengthExceeded?: boolean;
 	aborted?: boolean;
 }> {
@@ -1236,6 +1240,8 @@ async function runSubagentRuntime(
 			finalText: result.finalText ?? "",
 			hasError: result.hasError ?? false,
 			allowInboxWake: result.allowInboxWake === true,
+			// Executor may consume another user's message internally. Null is authoritative.
+			finalUserId: active._currentUserId ?? null,
 			contextLengthExceeded: result.contextLengthExceeded,
 			aborted:
 				result.aborted || (opts.control ? opts.control.proxy.signal.aborted : opts.signal.aborted),

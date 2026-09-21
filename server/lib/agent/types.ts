@@ -731,6 +731,7 @@ export type AgentEvent =
 	| {
 			type: "api_request_start";
 			requestId: string;
+			userId?: string | null;
 			provider: string;
 			model: string;
 			credentialId?: string;

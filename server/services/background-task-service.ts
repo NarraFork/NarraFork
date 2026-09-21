@@ -149,6 +149,8 @@ export interface CompletedNotification {
 	alias: string | null;
 	status: string;
 	outputPreview: string;
+	/** Initiating user of the completed execution, never inferred from its parent. */
+	userId?: string | null;
 }
 
 // === Constants ===

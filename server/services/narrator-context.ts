@@ -162,7 +162,7 @@ export const narratorContext = {
 	async generateContextSummary(
 		narratorId: string,
 		locale: Locale = "en",
-		options?: { throwOnFailure?: boolean },
+		options?: { throwOnFailure?: boolean; userId?: string | null },
 	): Promise<string> {
 		const narrator = await narratorService.getById(narratorId);
 		const messages = await narratorService.getModelHistorySinceLastCompact(
@@ -193,6 +193,7 @@ export const narratorContext = {
 			const result = await summaryGenerate(summaryUserText, summaryPrompt, {
 				narratorId,
 				kind: "fork_summary",
+				userId: options?.userId,
 			});
 
 			return result.text || "Failed to generate summary.";
@@ -228,6 +229,7 @@ export const narratorContext = {
 		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
 		onProgress?: CompactSummaryProgressHandler,
 		onRetryScheduled?: CompactSummaryRetryHandler,
+		userId?: string | null,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const messages =
 			providedMessages ?? (await narratorService.getModelHistorySinceLastCompact(narratorId));
@@ -305,6 +307,7 @@ export const narratorContext = {
 			onReasoningDelta,
 			onProgress,
 			onRetryScheduled,
+			userId,
 		);
 	},
 
@@ -323,6 +326,7 @@ export const narratorContext = {
 		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
 		onProgress?: CompactSummaryProgressHandler,
 		onRetryScheduled?: CompactSummaryRetryHandler,
+		userId?: string | null,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		let rollingSummary = initialSummary;
 		let lastContextPercent: number | undefined;
@@ -356,6 +360,7 @@ export const narratorContext = {
 				onReasoningDelta,
 				onProgress,
 				onRetryScheduled,
+				userId,
 			);
 
 			onProgress?.();
@@ -390,6 +395,7 @@ export const narratorContext = {
 		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
 		onProgress?: CompactSummaryProgressHandler,
 		onRetryScheduled?: CompactSummaryRetryHandler,
+		userId?: string | null,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		try {
 			return await this._summarizeChunk(
@@ -406,6 +412,7 @@ export const narratorContext = {
 				onReasoningDelta,
 				onProgress,
 				onRetryScheduled,
+				userId,
 			);
 		} catch (err) {
 			if (!isCompactContextOverflowError(err) || depth >= COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH) {
@@ -443,6 +450,7 @@ export const narratorContext = {
 				onReasoningDelta,
 				onProgress,
 				onRetryScheduled,
+				userId,
 			);
 		}
 	},
@@ -465,6 +473,7 @@ export const narratorContext = {
 		onReasoningDelta?: CompactSummaryReasoningDeltaHandler,
 		onProgress?: CompactSummaryProgressHandler,
 		onRetryScheduled?: CompactSummaryRetryHandler,
+		userId?: string | null,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const previousSummaryPrefix = previousSummary
 			? `[Previous context summary]:\n${previousSummary}\n\n---\n\n`
@@ -508,6 +517,7 @@ export const narratorContext = {
 					{
 						narratorId,
 						kind: "compact",
+						userId,
 					},
 					signal,
 					onTextDelta,

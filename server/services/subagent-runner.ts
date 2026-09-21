@@ -261,9 +261,12 @@ async function finalizeBackgroundCompletion(
 	timeoutMs?: number,
 	expectedAbortController?: AbortController,
 	deferPublication = false,
+	finalUserId: string | null = null,
 ): Promise<void> {
 	// Await/event waiters are part of terminal publication too. Keep the task running
 	// until the outer exact-origin transaction commits, not only its mailbox notice.
+	const { recordTaskNoticeUser } = await import("./parent-injection-queue");
+	recordTaskNoticeUser(narratorId, finalUserId);
 	if (deferPublication) return;
 	const timeoutText = timeoutMs
 		? `Background task timed out after ${timeoutMs}ms`
@@ -381,6 +384,7 @@ async function finalizeBackgroundCompletion(
 			resultPreview,
 			result: storedText,
 			resultMessageId,
+			userId: finalUserId,
 		});
 	} else {
 		eventBus.emit({
@@ -408,6 +412,7 @@ async function finalizeBackgroundCompletion(
 			resultPreview,
 			result: storedText,
 			resultMessageId,
+			userId: finalUserId,
 		});
 	}
 
@@ -445,6 +450,8 @@ export interface ResumedBackgroundTaskAnnouncement {
 	status: ResumedBackgroundTaskNoticePlan["status"];
 	wakeParent: boolean;
 	locale: Locale;
+	/** Initiating user of the completed execution, never inferred from its parent. */
+	userId?: string | null;
 	/** B2 fix: narrator fields carried from construction site to avoid PG SQLite read. */
 	subagentTraits?: string[] | null;
 	subagentTitle?: string | null;
@@ -601,6 +608,8 @@ export async function announceResumedBackgroundTask(
 	notice: ResumedBackgroundTaskAnnouncement,
 ): Promise<void> {
 	// Both task status/control waiters and the content notice follow the same commit.
+	const { recordTaskNoticeUser } = await import("./parent-injection-queue");
+	recordTaskNoticeUser(notice.subagentId, notice.userId ?? null);
 	try {
 		await backgroundTaskService.announcePersistedAgentTerminal(
 			notice.subagentId,
@@ -700,7 +709,10 @@ async function finalizeTakenOverBackgroundSubagentUnlocked(
 	hasError: boolean,
 	finalText: string,
 	locale: Locale = "en",
+	userId: string | null = null,
 ): Promise<void> {
+	const { recordTaskNoticeUser } = await import("./parent-injection-queue");
+	recordTaskNoticeUser(narratorId, userId ?? null);
 	const now = new Date().toISOString();
 	if (resolveRuntimeQueueBackend() === "postgres") {
 		// B3 fix: use the named PG composite — narrator update + publication
@@ -1008,6 +1020,7 @@ async function executeBackgroundTaskUnlocked(
 	};
 	executionTimeout?.signal.addEventListener("abort", onTimeout, { once: true });
 	if (executionTimeout?.signal.aborted) onTimeout();
+	let finalUserId: string | null = opts.userId ?? null;
 
 	try {
 		const result = await executeSubagent(
@@ -1017,6 +1030,7 @@ async function executeBackgroundTaskUnlocked(
 			},
 			owner,
 		);
+		finalUserId = result.finalUserId ?? null;
 
 		wakePolicy.allowInboxWake = result.allowInboxWake;
 		const timeoutText = timeoutLabelMs
@@ -1086,6 +1100,8 @@ async function executeBackgroundTaskUnlocked(
 			locale as Locale,
 			timeoutLabelMs ?? undefined,
 			backgroundAbortController,
+			false,
+			finalUserId,
 		);
 	} catch (err) {
 		wakePolicy.allowInboxWake = false;
@@ -1133,6 +1149,8 @@ async function executeBackgroundTaskUnlocked(
 			locale as Locale,
 			timeoutLabelMs ?? undefined,
 			backgroundAbortController,
+			false,
+			finalUserId,
 		);
 	} finally {
 		executionTimeout?.signal.removeEventListener("abort", onTimeout);
@@ -1338,6 +1356,8 @@ export interface ForegroundRunTerminal {
 	hasError: boolean;
 	interrupted: boolean;
 	timedOut: boolean;
+	/** Principal that produced the terminal result; null is authoritative unattributed. */
+	finalUserId: string | null;
 }
 
 export type ForegroundRunPublication =
@@ -1427,7 +1447,7 @@ function startForegroundRunUnlocked(
 	const currentPrePromptBashCommand = input.prePromptBashCommand;
 	const currentHistory: unknown[] = input.initialHistory;
 	const currentTrailingToolResults: unknown[] | undefined = input.initialTrailingToolResults;
-	const currentUserId = input.userId ?? null;
+	let currentUserId = input.userId ?? null;
 	const currentModel = model;
 	const currentProvider = provider;
 	const currentSystemPrompt = systemPrompt;
@@ -1587,6 +1607,8 @@ function startForegroundRunUnlocked(
 				owner,
 			);
 			allowInboxWake = result.allowInboxWake;
+			// Null is authoritative too: never fall back to the dispatch user.
+			currentUserId = result.finalUserId ?? currentUserId;
 			finalText = result.contextLengthExceeded
 				? "Error: context length exceeded"
 				: result.finalText;
@@ -1700,6 +1722,7 @@ function startForegroundRunUnlocked(
 										timeoutLabelMs ?? undefined,
 										detachedAbortController,
 										input.deferCompletionPublication,
+										currentUserId,
 									),
 								{ label: "detached_task_publication", maxRetries: 3 },
 							);
@@ -1761,6 +1784,7 @@ function startForegroundRunUnlocked(
 					hasError,
 					interrupted: wasInterrupted,
 					timedOut,
+					finalUserId: currentUserId,
 				});
 		}
 	};
@@ -1799,6 +1823,7 @@ function startForegroundRunUnlocked(
 			hasError: true,
 			interrupted: false,
 			timedOut: false,
+			finalUserId: currentUserId,
 		});
 	});
 
@@ -2578,6 +2603,7 @@ async function startContinuedSubagentUnlocked(
 					input.executionTimeoutMs ?? undefined,
 					backgroundAbortController,
 					input.skipConclusionDelivery !== true,
+					terminal.finalUserId ?? input.userId ?? null,
 				);
 			}
 			// Notification ownership is independent of the optional task projection:
@@ -2618,6 +2644,7 @@ async function startContinuedSubagentUnlocked(
 					status: plan.status,
 					wakeParent: plan.wakeParent,
 					locale: locale as Locale,
+					userId: terminal.finalUserId ?? input.userId ?? null,
 					// B2 fix: carry narrator fields to avoid PG direct SQLite read.
 					subagentTraits: original.traits,
 					subagentTitle: original.title,

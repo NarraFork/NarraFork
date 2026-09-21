@@ -323,7 +323,7 @@ chapterRoutes.post("/:id/fork", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
-	const chapter = await chapterFork.fork(id, { ...parsed.data, locale });
+	const chapter = await chapterFork.fork(id, { ...parsed.data, locale, userId });
 	return c.json(chapter, 201);
 });
 

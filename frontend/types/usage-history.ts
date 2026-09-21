@@ -56,6 +56,8 @@ export interface UsageHistoryRawDump {
 
 export interface UsageHistoryRecord {
 	id: string;
+	userId?: string | null;
+	username?: string | null;
 	narratorId: string | null;
 	/** 外部 Agent 写入时自带的叙述者文本（无 narrator 关联时用于占位显示）。 */
 	agentLabel?: string | null;
@@ -137,6 +139,8 @@ export interface UsageHistoryTimeSeriesResponse {
 }
 
 export interface UsageHistoryFilters {
+	/** '__unattributed__' selects requests without known ownership. */
+	userId?: string;
 	narratorId?: string;
 	chapterId?: string;
 	projectId?: string;
@@ -215,7 +219,29 @@ export interface UsageHistoryProvidersResponse {
 	providers: string[];
 }
 
-export type UsageBreakdownDimension = "provider" | "model" | "kind";
+export interface UserUsageTotals {
+	userId: string;
+	username: string | null;
+	requestCount: number;
+	inputTokens: number;
+	outputTokens: number;
+	cachedInputTokens: number;
+	cacheCreationTokens: number;
+	reasoningTokens: number;
+	costUsd: number;
+	unpricedRequestCount: number;
+	firstUsedAt: string;
+	lastUsedAt: string;
+}
+
+export interface UserUsageTotalsResponse {
+	records: UserUsageTotals[];
+	hasMore: boolean;
+	nextCursor: string | null;
+	limit: number;
+}
+
+export type UsageBreakdownDimension = "provider" | "model" | "kind" | "user";
 export type UsageBreakdownMetric =
 	| "requests"
 	| "tokens"

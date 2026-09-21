@@ -83,7 +83,9 @@ describe("narrator compact summary", () => {
 			},
 		];
 
-		narratorContext._summarizeChunk = async (_narratorId, chunkEntries, previousSummary) => {
+		narratorContext._summarizeChunk = async (...args) => {
+			const [, chunkEntries, previousSummary] = args;
+			expect(args[13]).toBe("compact-user");
 			summaryCalls.push(chunkEntries.length);
 			if (chunkEntries.length > 1) throw new Error("maximum context length exceeded");
 
@@ -105,6 +107,13 @@ describe("narrator compact summary", () => {
 			0,
 			40_000,
 			0,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			"compact-user",
 		);
 
 		expect(summaryCalls).toEqual([2, 1, 1]);

@@ -24,6 +24,15 @@ describe("usage history cursor window", () => {
 		expect(advanceUsageHistoryCursor(["cursor-2"], "cursor-2")).toEqual(["cursor-2"]);
 	});
 
+	test("isolates users and unattributed requests in the cursor cache", () => {
+		const alice = usageHistoryListQueryKey({ userId: "alice" }, 50, undefined);
+		expect(alice).not.toEqual(usageHistoryListQueryKey({ userId: "bob" }, 50, undefined));
+		expect(alice).not.toEqual(
+			usageHistoryListQueryKey({ userId: "__unattributed__" }, 50, undefined),
+		);
+		expect(alice).not.toEqual(usageHistoryListQueryKey({}, 50, undefined));
+	});
+
 	test("isolates cached pages by filters, page size, and current cursor", () => {
 		expect(usageHistoryListQueryKey({ provider: "openai" }, 50, "cursor-2")).not.toEqual(
 			usageHistoryListQueryKey({ provider: "anthropic" }, 50, "cursor-2"),

@@ -134,6 +134,7 @@ export function getContextOverflowFailureError(reason: ContextOverflowFailureRea
  */
 export async function handleContextOverflow(opts: {
 	narratorId: string;
+	userId?: string | null;
 	locale: Locale;
 	provider: string;
 	model: string;
@@ -308,6 +309,7 @@ export async function handleContextOverflow(opts: {
 		const compacted = await runCustomCompact(narratorId, locale, boundaryMessageId, {
 			appendHint,
 			trigger: "context_overflow",
+			userId: opts.userId,
 			...(opts.contextPercentBefore != null
 				? { contextPercentBefore: opts.contextPercentBefore }
 				: {}),

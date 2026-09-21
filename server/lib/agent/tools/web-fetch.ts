@@ -181,7 +181,10 @@ export const webFetchTool: ToolDefinition = {
 					}
 					case "smart": {
 						const { fetchSmart } = await import("../../web-fetch/smart");
-						const result = await fetchSmart(url, max_length, purpose);
+						const result = await fetchSmart(url, max_length, purpose, {
+							userId: ctx?.userId,
+							narratorId: ctx?.narratorId,
+						});
 						return {
 							output: result.summary,
 							title: result.title || url,

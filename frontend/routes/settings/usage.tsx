@@ -3,14 +3,19 @@ import { UsageHistoryChart } from "@frontend/components/usage-history/UsageHisto
 import { UsageHistoryTable } from "@frontend/components/usage-history/UsageHistoryTable";
 import { UsageStackedChart } from "@frontend/components/usage-history/UsageStackedChart";
 import { UsageStatsSummary } from "@frontend/components/usage-history/UsageStatsSummary";
+import { UserUsageIdFilter } from "@frontend/components/usage-history/UserUsageIdFilter";
+import { UserUsageTotalsSection } from "@frontend/components/usage-history/UserUsageTotalsSection";
+import { api } from "@frontend/lib/api";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
+import { usageHistoryCsv } from "@frontend/lib/usage-history-csv";
 import {
 	advanceUsageHistoryCursor,
 	currentUsageHistoryCursor,
 	retreatUsageHistoryCursor,
 	usageHistoryListQueryKey,
 } from "@frontend/lib/usage-history-cursor-window";
+import { usageUserOptions } from "@frontend/lib/usage-history-user";
 import type {
 	UsageHistoryFilters,
 	UsageHistoryGranularity,
@@ -94,51 +99,12 @@ function getDatePreset(preset: string): { start: string; end: string } {
 
 // --- CSV export ---
 
-function exportRecordsToCsv(records: UsageHistoryRecord[], fileName: string) {
-	const headers = [
-		"Time",
-		"Narrator",
-		"Chapter",
-		"Kind",
-		"Provider",
-		"Model",
-		"Input Tokens",
-		"Output Tokens",
-		"Cached Tokens",
-		"Reasoning Tokens",
-		"TTFT (ms)",
-		"Duration (ms)",
-		"Cost (USD)",
-		"Error",
-	];
-	const rows = records.map((r) => [
-		r.createdAt,
-		r.narratorTitle ?? r.narratorId ?? "",
-		r.chapterTitle ?? "",
-		r.kind,
-		r.provider ?? "",
-		r.model ?? "",
-		r.inputTokens,
-		r.outputTokens,
-		r.cachedInputTokens,
-		r.reasoningTokens,
-		r.ttftMs ?? "",
-		r.durationMs ?? "",
-		r.costUsd ?? "",
-		r.errorMessage ?? "",
-	]);
-
-	const escapeCsv = (v: unknown) => {
-		const s = String(v ?? "");
-		return s.includes(",") || s.includes('"') || s.includes("\n")
-			? `"${s.replace(/"/g, '""')}"`
-			: s;
-	};
-
-	const csv = [
-		headers.map(escapeCsv).join(","),
-		...rows.map((row) => row.map(escapeCsv).join(",")),
-	].join("\n");
+function exportRecordsToCsv(
+	records: UsageHistoryRecord[],
+	fileName: string,
+	unattributedLabel: string,
+) {
+	const csv = usageHistoryCsv(records, unattributedLabel);
 
 	const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
 	const url = URL.createObjectURL(blob);
@@ -240,6 +206,21 @@ function SettingsUsagePage() {
 		gcTime: USAGE_HISTORY_QUERY_GC_TIME_MS,
 	});
 
+	const { data: users, isError: usersLoadFailed } = useQuery({
+		queryKey: ["admin", "users"],
+		queryFn: api.listUsers,
+		gcTime: USAGE_HISTORY_QUERY_GC_TIME_MS,
+	});
+	const userOptions = useMemo(
+		() => usageUserOptions(users ?? [], tempFilters.userId, t("usageHistoryUnattributed")),
+		[users, tempFilters.userId, t],
+	);
+	const applyUserFilter = (userId: string | undefined) => {
+		setCursorStack([]);
+		setTempFilters((prev) => ({ ...prev, userId }));
+		setFilters((prev) => ({ ...prev, userId }));
+	};
+
 	const kindOptions = useMemo(
 		() =>
 			[
@@ -264,6 +245,7 @@ function SettingsUsagePage() {
 	const applyFilters = useCallback(() => {
 		setCursorStack([]);
 		setFilters({
+			userId: tempFilters.userId,
 			provider: tempFilters.provider?.trim() || undefined,
 			model: tempFilters.model?.trim() || undefined,
 			kind: tempFilters.kind || undefined,
@@ -288,6 +270,7 @@ function SettingsUsagePage() {
 		setActivePreset(preset);
 		setCursorStack([]);
 		setFilters({
+			userId: tempFilters.userId,
 			provider: tempFilters.provider?.trim() || undefined,
 			model: tempFilters.model?.trim() || undefined,
 			kind: tempFilters.kind || undefined,
@@ -300,10 +283,11 @@ function SettingsUsagePage() {
 		const records = listData?.records ?? [];
 		if (records.length === 0) return;
 		const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-		exportRecordsToCsv(records, `usage-history-${ts}.csv`);
+		exportRecordsToCsv(records, `usage-history-${ts}.csv`, t("usageHistoryUnattributed"));
 	};
 
 	const hasActiveFilters =
+		!!filters.userId ||
 		!!filters.provider ||
 		!!filters.model ||
 		!!filters.kind ||
@@ -364,6 +348,23 @@ function SettingsUsagePage() {
 					</Group>
 
 					<Group gap={isMobile ? "xs" : "sm"} wrap="wrap" align="flex-end">
+						<Select
+							size="xs"
+							label={t("usageHistoryUser")}
+							placeholder={t("usageHistoryAllUsers")}
+							data={userOptions}
+							value={tempFilters.userId ?? null}
+							searchable
+							clearable
+							w={isMobile ? "100%" : 160}
+							error={usersLoadFailed ? t("usageHistoryUsersLoadFailed") : undefined}
+							onChange={(value) => applyUserFilter(value || undefined)}
+						/>
+						<UserUsageIdFilter
+							value={tempFilters.userId}
+							onChange={applyUserFilter}
+							isMobile={isMobile}
+						/>
 						<Autocomplete
 							size="xs"
 							label={t("usageHistoryProvider")}
@@ -551,6 +552,8 @@ function SettingsUsagePage() {
 						</Stack>
 					</Tabs.Panel>
 				</Tabs>
+
+				<UserUsageTotalsSection />
 			</Stack>
 		</div>
 	);

@@ -1391,6 +1391,7 @@ export async function runReflectionLoop(
 					event.requestId,
 					startApiRequest({
 						narratorId: parentConfig.narratorId,
+						userId: parentConfig.userId,
 						provider: event.provider,
 						model: event.model,
 						credentialId: event.credentialId,
@@ -3318,6 +3319,7 @@ export async function* agentLoop(
 			 * gets a pointer, so no attempt looks like a failure without evidence.
 			 */
 			let malformedSpillReuseToken: string | undefined;
+			const requestUserId = config.userId ?? null;
 			let requestStarted = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
@@ -3339,6 +3341,7 @@ export async function* agentLoop(
 				yield {
 					type: "api_request_start",
 					requestId,
+					userId: requestUserId,
 					provider: effectiveProvider,
 					model: effectiveModel,
 					credentialId,

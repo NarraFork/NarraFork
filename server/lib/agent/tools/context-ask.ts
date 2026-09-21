@@ -83,6 +83,7 @@ export const contextAskTool: ToolDefinition = {
 				targetNarratorId: target.id,
 				questions,
 				locale: ctx.locale,
+				userId: ctx.userId,
 				signal: ctx.signal,
 				...(emitOutput
 					? { onProgress: (totalOutputChars: number) => emitOutput(String(totalOutputChars)) }

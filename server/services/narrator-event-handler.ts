@@ -134,6 +134,8 @@ export interface TokenUsageSnapshot {
 }
 
 export interface EventHandlerContext {
+	/** Initiating user captured for this pass, including background translations. */
+	userId?: string | null;
 	/** Production runners require durable receipts; standalone display adapters may omit them. */
 	requireToolCallBinding?: boolean;
 	/** Narrator ID that owns the messages (subagent's own ID) */
@@ -1002,7 +1004,7 @@ function translateReasoningBlock(
 			const result = await summaryGenerate(
 				reasoningText,
 				`You are a translator. Translate the following AI reasoning/thinking content into ${langName}. Preserve the original meaning, technical terms, and markdown formatting. Output ONLY the translation, no explanations.`,
-				{ narratorId, kind: "reasoning_translation" },
+				{ narratorId, userId: ctx.userId ?? null, kind: "reasoning_translation" },
 				undefined,
 				undefined,
 				resolveTranslationModelOverride(),
@@ -2787,6 +2789,7 @@ export async function processEvent(
 				event.requestId,
 				startApiRequest({
 					narratorId,
+					userId: event.userId ?? ctx.userId ?? null,
 					provider: event.provider,
 					model: event.model,
 					credentialId: event.credentialId,

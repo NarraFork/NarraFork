@@ -38,6 +38,8 @@ export interface InboxAgentMetadata {
 	channel: "buffer" | "parent" | "team";
 	isBroadcast?: boolean;
 	fromMessageId?: string | null;
+	/** Initiating user for the producing pass; null/undefined means unattributed. */
+	userId?: string | null;
 }
 
 export function inboxMetadata<T>(row: Pick<RuntimeMailboxRow, "metadataJson">): T {
@@ -108,6 +110,7 @@ export async function enqueueInboxAgent(
 	options: {
 		channel?: InboxAgentMetadata["channel"];
 		createdBy?: string | null;
+		userId?: string | null;
 		isBroadcast?: boolean;
 		fromMessageId?: string | null;
 	} = {},
@@ -125,6 +128,7 @@ function enqueueInboxAgentSqlite(
 	options: {
 		channel?: InboxAgentMetadata["channel"];
 		createdBy?: string | null;
+		userId?: string | null;
 		isBroadcast?: boolean;
 		fromMessageId?: string | null;
 	},
@@ -200,6 +204,7 @@ function enqueueInboxAgentSqlite(
 			channel: options.channel ?? "buffer",
 			isBroadcast: options.isBroadcast,
 			fromMessageId: options.fromMessageId,
+			userId: options.userId ?? options.createdBy ?? null,
 		},
 	});
 	if (!("delivery" in result)) throw new Error("Target message queue is full");
@@ -221,6 +226,7 @@ async function enqueueInboxAgentPg(
 	options: {
 		channel?: InboxAgentMetadata["channel"];
 		createdBy?: string | null;
+		userId?: string | null;
 		isBroadcast?: boolean;
 		fromMessageId?: string | null;
 	},
@@ -252,6 +258,7 @@ async function enqueueInboxAgentPg(
 			channel: options.channel ?? "buffer",
 			isBroadcast: options.isBroadcast,
 			fromMessageId: options.fromMessageId,
+			userId: options.userId ?? options.createdBy ?? null,
 		},
 	};
 	const result = await port.mailbox.admitAgentMessage(input, {

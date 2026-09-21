@@ -12,6 +12,7 @@ import type {
 	UsageHistoryStats,
 	UsageHistoryTimeSeriesResponse,
 	UsageStackedTimeSeriesResponse,
+	UserUsageTotalsResponse,
 } from "@frontend/types/usage-history";
 
 import { ApiError, authorizedFetch, readFetchError } from "./api/client";
@@ -27,6 +28,7 @@ async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
 }
 
 function appendUsageHistoryFilters(params: URLSearchParams, filters: UsageHistoryFilters): void {
+	if (filters.userId) params.append("userId", filters.userId);
 	if (filters.narratorId) params.append("narratorId", filters.narratorId);
 	if (filters.chapterId) params.append("chapterId", filters.chapterId);
 	if (filters.projectId) params.append("projectId", filters.projectId);
@@ -39,6 +41,15 @@ function appendUsageHistoryFilters(params: URLSearchParams, filters: UsageHistor
 }
 
 export const usageHistoryApi = {
+	/** Durable user totals: deliberately independent of history filters. */
+	async getUserTotals(
+		options: { cursor?: string; limit?: number; signal?: AbortSignal } = {},
+	): Promise<UserUsageTotalsResponse> {
+		const params = new URLSearchParams({ limit: String(options.limit ?? 50) });
+		if (options.cursor) params.append("cursor", options.cursor);
+		return fetchJson(`/api/usage-history/user-totals?${params.toString()}`, options.signal);
+	},
+
 	/**
 	 * 获取使用历史记录列表
 	 */

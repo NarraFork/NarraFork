@@ -19,6 +19,8 @@ import { pushPendingInjection } from "./parent-injection-queue";
 
 export interface ParentInboundMessage {
 	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
+	/** User responsible for the sending pass, independent of the parent's current user. */
+	userId?: string | null;
 	/** Subagent narrator id that sent the message. */
 	fromId: string;
 	/** Subagent title (may be null when untitled). */

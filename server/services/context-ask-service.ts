@@ -17,6 +17,7 @@ const CONTEXT_ASK_TRUNCATION_MARKER = "\n... [ContextAsk content truncated] ...\
 
 export interface ContextAskInput {
 	callerNarratorId: string;
+	userId?: string | null;
 	targetNarratorId: string;
 	questions?: string[];
 	locale?: string;
@@ -261,7 +262,7 @@ export const contextAskService = {
 			const result = await this._generate(
 				JSON.stringify(payload),
 				systemPrompt,
-				{ narratorId: input.callerNarratorId, kind: "context_ask" },
+				{ narratorId: input.callerNarratorId, userId: input.userId, kind: "context_ask" },
 				input.signal,
 				onTextDelta,
 				undefined,

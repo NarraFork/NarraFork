@@ -109,7 +109,11 @@ export async function syncTitleToNarrator(chapterId: string, title: string): Pro
 /**
  * Generate a title for a narrator session using the summary model.
  */
-export async function generateTitle(narratorId: string, locale: Locale = "en"): Promise<string> {
+export async function generateTitle(
+	narratorId: string,
+	locale: Locale = "en",
+	userId?: string | null,
+): Promise<string> {
 	const HEAD_COUNT = 1;
 	const TAIL_COUNT = 6;
 
@@ -151,7 +155,7 @@ export async function generateTitle(narratorId: string, locale: Locale = "en"): 
 		titlePrompt.replace(/<conversation>\s*$/, "").trim(),
 		`<conversation>\n${conversationText}\n</conversation>`,
 		locale,
-		{ narratorId, kind: "title" },
+		{ narratorId, userId, kind: "title" },
 	);
 
 	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
@@ -214,6 +218,7 @@ export async function generateQuickTitle(
 	narratorId: string,
 	userMessage: string,
 	locale: Locale = "en",
+	userId?: string | null,
 ): Promise<void> {
 	try {
 		const truncated = userMessage.length > 500 ? `${userMessage.slice(0, 500)}...` : userMessage;
@@ -230,7 +235,7 @@ export async function generateQuickTitle(
 			titlePrompt.replace(/<user_message>\s*$/, "").trim(),
 			`<user_message>\n${truncated}\n</user_message>`,
 			locale,
-			{ narratorId, kind: "title" },
+			{ narratorId, userId, kind: "title" },
 		);
 
 		let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
@@ -271,9 +276,10 @@ export async function generateQuickTitle(
 export async function generateAndSetTitle(
 	narratorId: string,
 	locale: Locale = "en",
+	userId?: string | null,
 ): Promise<void> {
 	try {
-		const title = await generateTitle(narratorId, locale);
+		const title = await generateTitle(narratorId, locale, userId);
 		await persistTitle(narratorId, title);
 
 		logger.info("Narrator title auto-generated", { narratorId, title });

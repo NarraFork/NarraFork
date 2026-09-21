@@ -246,6 +246,7 @@ export const mergeSummaryService = {
 			const result = await summaryGenerate(userText, systemPrompt, {
 				narratorId: primaryNarrator.id,
 				kind: "merge_summary",
+				userId: input.userId,
 			});
 
 			const summary = result.text?.trim();

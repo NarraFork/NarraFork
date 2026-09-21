@@ -1,5 +1,6 @@
 import { formatCompactNumber } from "@frontend/lib/compact-number";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
+import { usageDimensionLabel } from "@frontend/lib/usage-history-user";
 import type {
 	UsageBreakdownDimension,
 	UsageBreakdownMetric,
@@ -94,6 +95,7 @@ export function UsageBreakdownChart({ filters }: UsageBreakdownChartProps) {
 			{ value: "provider", label: t("usageBreakdownDimProvider") },
 			{ value: "model", label: t("usageBreakdownDimModel") },
 			{ value: "kind", label: t("usageBreakdownDimKind") },
+			{ value: "user", label: t("usageBreakdownDimUser") },
 		],
 		[t],
 	);
@@ -225,7 +227,13 @@ export function UsageBreakdownChart({ filters }: UsageBreakdownChartProps) {
 									fontSize={12}
 									fill="var(--mantine-color-dimmed)"
 								>
-									{hoveredEntry ? hoveredEntry.label : t("usageBreakdownTotal")}
+									{hoveredEntry
+										? usageDimensionLabel(
+												hoveredEntry.label,
+												dimension,
+												t("usageHistoryUnattributed"),
+											)
+										: t("usageBreakdownTotal")}
 								</text>
 								<text
 									x={CENTER}
@@ -267,7 +275,7 @@ export function UsageBreakdownChart({ filters }: UsageBreakdownChartProps) {
 										}}
 									/>
 									<Text size="xs" style={{ flex: 1 }} lineClamp={1}>
-										{entry.label}
+										{usageDimensionLabel(entry.label, dimension, t("usageHistoryUnattributed"))}
 									</Text>
 									<Text size="xs" fw={500} style={{ flexShrink: 0 }}>
 										{formatMetricDisplay(metric, entry.value)}

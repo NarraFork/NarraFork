@@ -39,6 +39,35 @@ type EventHandlerContext = import("../narrator-event-handler").EventHandlerConte
 const PARENT_NARRATOR_ID = "parent-narrator";
 const PARENT_TOOL_USE_ID = "parent-tool-use";
 
+describe("request attribution", () => {
+	test("subagent request keeps its event owner rather than the later pass owner", async () => {
+		const ctx = makeSubagentContext();
+		ctx.userId = "later-user";
+		await processEvent(
+			{
+				type: "api_request_start",
+				requestId: "request-alice",
+				provider: "test",
+				model: "test",
+				userId: "alice",
+			},
+			ctx,
+		);
+		ctx.userId = "bob";
+		expect(ctx.apiRequestsMap?.get("request-alice")?.userId).toBe("alice");
+		await processEvent(
+			{
+				type: "api_request_start",
+				requestId: "request-unknown",
+				provider: "test",
+				model: "test",
+			},
+			ctx,
+		);
+		expect(ctx.apiRequestsMap?.get("request-unknown")?.userId).toBeNull();
+	});
+});
+
 function makeSubagentContext(): EventHandlerContext {
 	return {
 		narratorId: "subagent-narrator",

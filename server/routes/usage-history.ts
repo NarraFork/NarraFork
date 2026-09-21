@@ -18,6 +18,7 @@ import {
 	type UsageHistoryService,
 	usageHistoryService,
 } from "@server/services/usage-history-service";
+import { listUserUsageTotals } from "@server/services/user-usage-totals";
 import { Hono } from "hono";
 import { z } from "zod";
 
@@ -38,10 +39,12 @@ interface UsageHistoryRouteOptions {
 	requireAuth?: typeof requireAuth;
 	requireAdmin?: typeof requireAdmin;
 	service?: UsageHistoryRouteService;
+	listUserUsageTotals?: typeof listUserUsageTotals;
 }
 
 // 查询参数 schema
 const listFilterShape = {
+	userId: z.string().trim().max(128).optional(),
 	narratorId: z.string().optional(),
 	chapterId: z.string().optional(),
 	projectId: z.string().optional(),
@@ -68,6 +71,7 @@ const cursorListQuerySchema = z.object({
 });
 
 const statsQuerySchema = z.object({
+	userId: z.string().trim().max(128).optional(),
 	narratorId: z.string().optional(),
 	chapterId: z.string().optional(),
 	projectId: z.string().optional(),
@@ -83,13 +87,18 @@ const timeSeriesQuerySchema = statsQuerySchema.extend({
 	granularity: z.enum(["hour", "day", "month"]).default("day"),
 });
 
+const userTotalsQuerySchema = z.object({
+	limit: z.coerce.number().int().positive().max(100).default(50),
+	cursor: z.string().trim().min(1).max(128).optional(),
+});
+
 const credentialTotalsQuerySchema = z.object({
 	provider: z.string().min(1),
 	limit: z.coerce.number().int().positive().max(1000).default(200),
 });
 
 const breakdownQuerySchema = statsQuerySchema.extend({
-	dimension: z.enum(["provider", "model", "kind"]),
+	dimension: z.enum(["provider", "model", "kind", "user"]),
 	metric: z.enum(["requests", "tokens", "cost", "inputTokens", "outputTokens", "reasoningTokens"]),
 	cluster: z
 		.enum(["true", "false", "1", "0"])
@@ -98,7 +107,7 @@ const breakdownQuerySchema = statsQuerySchema.extend({
 });
 
 const stackedTimeSeriesQuerySchema = statsQuerySchema.extend({
-	dimension: z.enum(["provider", "model", "kind"]),
+	dimension: z.enum(["provider", "model", "kind", "user"]),
 	metric: z.enum(["requests", "tokens", "cost", "inputTokens", "outputTokens", "reasoningTokens"]),
 	granularity: z.enum(["hour", "day", "month"]).default("day"),
 	topN: z.coerce.number().int().positive().max(10).default(5),
@@ -185,6 +194,12 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 
 	routes.use("*", authMiddleware, adminMiddleware);
 
+	// Lifetime totals are independent of the date-filtered, removable history.
+	routes.get("/user-totals", (c) => {
+		const { limit, cursor } = userTotalsQuerySchema.parse(c.req.query());
+		return c.json((options.listUserUsageTotals ?? listUserUsageTotals)(limit, cursor));
+	});
+
 	/**
 	 * GET /api/usage-history
 	 * 获取使用历史记录列表（兼容 page 与 cursor 两种分页模式）
@@ -220,7 +235,9 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 
 		const query = pageListQuerySchema.parse(rawQuery);
 		const { pagination: _pagination, page, pageSize, ...filters } = query;
-		const result = await service.listUsageHistory(filters, page, pageSize);
+		const result = await service.listUsageHistory(filters, page, pageSize, {
+			signal: c.req.raw.signal,
+		});
 
 		return c.json({
 			records: result.records,
@@ -236,7 +253,7 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 	 * 获取历史中出现过的 provider 列表
 	 */
 	routes.get("/providers", async (c) => {
-		const providers = await service.listProviders();
+		const providers = await service.listProviders({ signal: c.req.raw.signal });
 		return c.json({ providers });
 	});
 
@@ -246,7 +263,7 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 	 */
 	routes.get("/stats", async (c) => {
 		const filters = statsQuerySchema.parse(c.req.query());
-		const stats = await service.getUsageStats(filters);
+		const stats = await service.getUsageStats(filters, { signal: c.req.raw.signal });
 		return c.json(stats);
 	});
 
@@ -257,7 +274,11 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 	routes.get("/timeseries", async (c) => {
 		const query = timeSeriesQuerySchema.parse(c.req.query());
 		const { granularity, ...filters } = query;
-		const result = await service.getUsageTimeSeries(filters, { granularity });
+		const result = await service.getUsageTimeSeries(
+			filters,
+			{ granularity },
+			{ signal: c.req.raw.signal },
+		);
 		return c.json(result);
 	});
 
@@ -285,7 +306,11 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 	routes.get("/breakdown", async (c) => {
 		const query = breakdownQuerySchema.parse(c.req.query());
 		const { dimension, metric, cluster, ...filters } = query;
-		const result = await service.getUsageBreakdown(filters, { dimension, metric, cluster });
+		const result = await service.getUsageBreakdown(
+			filters,
+			{ dimension, metric, cluster },
+			{ signal: c.req.raw.signal },
+		);
 		return c.json(result);
 	});
 
@@ -296,13 +321,17 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 	routes.get("/timeseries-stacked", async (c) => {
 		const query = stackedTimeSeriesQuerySchema.parse(c.req.query());
 		const { dimension, metric, granularity, topN, cluster, ...filters } = query;
-		const result = await service.getUsageTimeSeriesStacked(filters, {
-			dimension,
-			metric,
-			granularity,
-			topN,
-			cluster,
-		});
+		const result = await service.getUsageTimeSeriesStacked(
+			filters,
+			{
+				dimension,
+				metric,
+				granularity,
+				topN,
+				cluster,
+			},
+			{ signal: c.req.raw.signal },
+		);
 		return c.json(result);
 	});
 

@@ -28,6 +28,8 @@ import type {
 	StorageScanTablesResult,
 } from "./protocol";
 
+import { runUsageHistoryQuery } from "./usage-history-query";
+
 declare const self: Worker;
 
 /** Cached read-only connections, keyed by path. A worker usually only ever sees one path. */
@@ -118,9 +120,11 @@ self.onmessage = (event: MessageEvent<DbWorkerInbound>) => {
 	const startedAt = Date.now();
 	try {
 		const result =
-			message.params.kind === "storageScanContext"
-				? runStorageScanContext(message.dbPath)
-				: runStorageScanTables(message.dbPath, message.requestId, message.params.tableNames);
+			message.params.kind === "usageHistoryQuery"
+				? runUsageHistoryQuery(getConnection(message.dbPath), message.params)
+				: message.params.kind === "storageScanContext"
+					? runStorageScanContext(message.dbPath)
+					: runStorageScanTables(message.dbPath, message.requestId, message.params.tableNames);
 		post({
 			type: "result",
 			requestId: message.requestId,

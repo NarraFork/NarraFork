@@ -8,6 +8,10 @@ import { runtimePublication } from "./agent-runtime/publication";
 const MAX_BACKGROUND_RESULT_CHARS = 12_000;
 
 export interface CompletedBgSubagentNotification {
+	/** Initiating user of the completed execution, never inferred from its parent. */
+	userId?: string | null;
+	/** Pointer-only notice for a resumed run whose result is already in its tool call. */
+	noticeText?: string;
 	/** Real subagent narrator id (also the background task row id). */
 	id: string;
 	/**

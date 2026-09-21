@@ -64,6 +64,146 @@ function encodeRawCursor(createdAt: string): string {
 	return Buffer.from(JSON.stringify({ v: 1, createdAt, id: "request-1" })).toString("base64url");
 }
 
+describe("usage history user filters and authorization", () => {
+	test("lifetime user totals are bounded and cursor-paginated", async () => {
+		const totals = mock(() => ({ records: [], hasMore: false, nextCursor: null, limit: 2 }));
+		const routes = createUsageHistoryRoutes({
+			requireAuth: async (_c, next) => {
+				await next();
+			},
+			requireAdmin: async (_c, next) => {
+				await next();
+			},
+			service,
+			listUserUsageTotals: totals,
+		});
+		const response = await routes.request("/user-totals?limit=2&cursor=alice");
+		expect(response.status).toBe(200);
+		expect(totals).toHaveBeenCalledWith(2, "alice");
+		expect(await response.json()).toEqual({
+			records: [],
+			hasMore: false,
+			nextCursor: null,
+			limit: 2,
+		});
+		totals.mockClear();
+		const guarded = new Hono();
+		guarded.onError((_error, c) => c.json({ error: "invalid query" }, 400));
+		guarded.route("/", routes);
+		for (const path of [
+			"/user-totals?limit=101",
+			"/user-totals?limit=0",
+			"/user-totals?cursor=",
+			`/user-totals?cursor=${"a".repeat(129)}`,
+		])
+			expect((await guarded.request(path)).status).toBe(400);
+		expect(totals).not.toHaveBeenCalled();
+	});
+	test("passes userId through both list modes", async () => {
+		await app.request("/?pagination=cursor&userId=alice-id");
+		expect(listUsageHistoryCursor).toHaveBeenCalledWith({ userId: "alice-id" }, 50, undefined);
+		await app.request("/?userId=__unattributed__");
+		expect(listUsageHistory).toHaveBeenCalledWith(
+			{ userId: "__unattributed__" },
+			1,
+			50,
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
+		);
+	});
+
+	test("passes user filtering and user dimension through every aggregate route", async () => {
+		const calls: Array<{ filters: unknown; options: unknown }> = [];
+		const capture = async (filters: unknown, options: unknown) => {
+			calls.push({ filters, options });
+			return {} as never;
+		};
+		const routes = createUsageHistoryRoutes({
+			requireAuth: async (_c, next) => {
+				await next();
+			},
+			requireAdmin: async (_c, next) => {
+				await next();
+			},
+			service: {
+				...service,
+				getUsageStats: capture,
+				getUsageTimeSeries: capture,
+				getUsageBreakdown: capture,
+				getUsageTimeSeriesStacked: capture,
+			},
+		});
+		for (const path of [
+			"/stats",
+			"/timeseries",
+			"/breakdown?dimension=user&metric=requests",
+			"/timeseries-stacked?dimension=user&metric=cost",
+		]) {
+			const response = await routes.request(
+				`${path}${path.includes("?") ? "&" : "?"}userId=__unattributed__`,
+			);
+			expect(response.status).toBe(200);
+		}
+		expect(calls).toHaveLength(4);
+		for (const call of calls) expect(call.filters).toEqual({ userId: "__unattributed__" });
+		expect(calls[2].options).toMatchObject({ dimension: "user" });
+		expect(calls[3].options).toMatchObject({ dimension: "user" });
+	});
+
+	test("real admin middleware blocks ordinary users from all usage and dump routes", async () => {
+		const guarded = new Hono();
+		guarded.onError((error, c) =>
+			c.json(
+				{ error: error.message },
+				(error as { statusCode?: number }).statusCode === 401 ? 401 : 403,
+			),
+		);
+		guarded.route(
+			"/",
+			createUsageHistoryRoutes({
+				requireAuth: async (c, next) => {
+					c.set("user", { sub: "ordinary", role: "user", iat: 0, exp: 4_102_444_800 });
+					await next();
+				},
+				service,
+			}),
+		);
+		for (const path of [
+			"/?userId=ordinary",
+			"/user-totals",
+			"/stats",
+			"/timeseries",
+			"/breakdown?dimension=user&metric=cost",
+			"/timeseries-stacked?dimension=user&metric=cost",
+			"/providers",
+			"/request-id",
+			"/request-id/raw-dump",
+		]) {
+			expect((await guarded.request(path)).status).toBe(403);
+		}
+		expect(listUsageHistoryCursor).not.toHaveBeenCalled();
+		expect(listUsageHistory).not.toHaveBeenCalled();
+	});
+
+	test("default authentication rejects requests without a session", async () => {
+		const guarded = new Hono();
+		guarded.onError((_error, c) => c.json({ error: "unauthorized" }, 401));
+		guarded.route("/", createUsageHistoryRoutes({ service }));
+		expect((await guarded.request("/?userId=alice-id")).status).toBe(401);
+		expect((await guarded.request("/request-id/raw-dump")).status).toBe(401);
+	});
+
+	test("real admin middleware permits administrator queries", async () => {
+		const guarded = createUsageHistoryRoutes({
+			requireAuth: async (c, next) => {
+				c.set("user", { sub: "administrator", role: "admin", iat: 0, exp: 4_102_444_800 });
+				await next();
+			},
+			service,
+		});
+		expect((await guarded.request("/?pagination=cursor&userId=alice-id")).status).toBe(200);
+	});
+});
+
 describe("usage history pagination route", () => {
 	test("rejects malformed cursor before calling the service", async () => {
 		const response = await app.request("/?pagination=cursor&cursor=bad&limit=2");

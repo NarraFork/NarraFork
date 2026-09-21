@@ -26,7 +26,7 @@ function assertGitAvailableForMcp(): void {
 	);
 }
 
-function createMcpServer(): McpServer {
+function createMcpServer(userId?: string | null): McpServer {
 	const server = new McpServer({
 		name: "narrafork",
 		version: "0.1.0",
@@ -232,7 +232,7 @@ function createMcpServer(): McpServer {
 		async ({ narratorId }) => {
 			try {
 				const narrator = await narratorService.getById(narratorId);
-				const summary = await narratorContext.generateContextSummary(narratorId);
+				const summary = await narratorContext.generateContextSummary(narratorId, "en", { userId });
 				const messageCount = await countNarratorMessageRefs(narratorId);
 
 				return {
@@ -262,7 +262,7 @@ function createMcpServer(): McpServer {
 export const mcpRoutes = new Hono();
 
 mcpRoutes.post("/", async (c) => {
-	const server = createMcpServer();
+	const server = createMcpServer(c.get("user")?.sub);
 	const transport = new WebStandardStreamableHTTPServerTransport({
 		sessionIdGenerator: undefined,
 	});

@@ -618,6 +618,7 @@ export async function runAgentLoopUnlocked(
 				getFileReferenceContext: () => getAgentFileReferenceContext(config),
 				narratorId,
 				broadcastTargetId: saParentNarratorId ?? narratorId,
+				userId: active._currentUserId ?? null,
 				sseEmitter: active.events,
 				conversationId: active.conversationId,
 				locale: active.locale,

@@ -368,3 +368,31 @@ describe("formatParentInboundMessages names the sender readably", () => {
 		expect(text).not.toContain(NANOID);
 	});
 });
+
+describe("parent injection attribution", () => {
+	test("task notices project the ledger user and batch by same-user prefix", async () => {
+		const queue = await import("../parent-injection-queue");
+		queue.recordTaskNoticeUser("tA", "A");
+		notice("agent", "tA");
+		const drained = await queue.drainPendingInjections(P);
+		expect(drained).toHaveLength(1);
+		expect(queue.pendingInjectionUserId(drained[0]!)).toBe("A");
+		const first = await queue.takePendingInjectionBatch(P);
+		expect(first?.userId).toBe("A");
+		expect(first?.entries).toHaveLength(1);
+		// Explicit principal filter
+		expect(await queue.takePendingInjectionBatch(P, "B")).toBeNull();
+		expect((await queue.takePendingInjectionBatch(P, "A"))?.userId).toBe("A");
+	});
+
+	test("agent messages keep the producing pass user through inbox metadata", async () => {
+		const entry = msg("with-user");
+		entry.message.userId = "A";
+		await pushPendingInjection(P, entry);
+		const { takePendingInjectionBatch } = await import("../parent-injection-queue");
+		const batch = await takePendingInjectionBatch(P, "B");
+		expect(batch).toBeNull();
+		const owned = await takePendingInjectionBatch(P);
+		expect(owned?.userId).toBe("A");
+	});
+});

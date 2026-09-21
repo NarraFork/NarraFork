@@ -165,6 +165,7 @@ export const forkNarratorTool: ToolDefinition = {
 				const newChapter = await chapterFork.fork(parent.chapterId, {
 					title,
 					inheritMode: chapterInherit,
+					userId: ctx.userId ?? null,
 					worktreeSource,
 					startCommitSha: commitSha,
 					forkAtMessageUuid: commitSha ? undefined : forkAtMessageUuid,
@@ -202,6 +203,7 @@ export const forkNarratorTool: ToolDefinition = {
 				const newNarrator = await narratorService.forkStandaloneFromTool(ctx.narratorId, mode, {
 					title,
 					inheritMode,
+					userId: ctx.userId ?? null,
 					model,
 					locale: ctx.locale,
 				});
@@ -213,10 +215,21 @@ export const forkNarratorTool: ToolDefinition = {
 			// Fire-and-forget: send the initial message to the new narrator.
 			// The prompt was written by the forking AI, not by a human.
 			const { logger } = await import("@server/lib/logger");
-			sendMessage(newNarratorId, message, undefined, locale, false, null, null, undefined, null, {
-				origin: "assistant",
-				originLabel: formatOriginLabel("forkNarrator"),
-			}).catch((err) => {
+			sendMessage(
+				newNarratorId,
+				message,
+				undefined,
+				locale,
+				false,
+				null,
+				ctx.userId ?? null,
+				undefined,
+				null,
+				{
+					origin: "assistant",
+					originLabel: formatOriginLabel("forkNarrator"),
+				},
+			).catch((err) => {
 				logger.error("ForkNarrator: failed to send initial message", {
 					narratorId: newNarratorId,
 					error: err instanceof Error ? err.message : String(err),

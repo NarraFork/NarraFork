@@ -84,6 +84,7 @@ describe("contextAskService", () => {
 			callerNarratorId: "parent-1",
 			targetNarratorId: "child-1",
 			questions: ["Which files changed?", "What is blocked?"],
+			userId: "caller-user",
 			locale: "en",
 		});
 
@@ -104,7 +105,11 @@ describe("contextAskService", () => {
 			total: 1,
 			messages: [expect.stringContaining("Changed server/a.ts")],
 		});
-		expect(calls[0].tracking).toEqual({ narratorId: "parent-1", kind: "context_ask" });
+		expect(calls[0].tracking).toEqual({
+			narratorId: "parent-1",
+			userId: "caller-user",
+			kind: "context_ask",
+		});
 		expect(calls[0].maxOutputTokens).toBe(64_000);
 	});
 

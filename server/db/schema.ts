@@ -3103,6 +3103,9 @@ export const apiRequests = sqliteTable(
 	"api_requests",
 	{
 		id: text("id").primaryKey(),
+		/** Request initiator, frozen at start; null for unknown legacy/system usage.
+		 * No FK: removing a user must not rewrite the accounting identity. */
+		userId: text("user_id"),
 		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
 		// 外部 Agent 写入时可自带的叙述者文本（无 narrator 关联时用于占位显示）
 		agentLabel: text("agent_label"),
@@ -3145,10 +3148,29 @@ export const apiRequests = sqliteTable(
 		index("idx_api_requests_provider").on(table.provider, table.createdAt),
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
+		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
 		// Per-credential filtering would otherwise scan the whole table.
 		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
 	],
 );
+
+// === user_usage_totals ===
+// One bounded lifetime rollup per user, independent of request/narrator cleanup.
+// No user FK: deletion keeps the original accounting ID; labels resolve at read time.
+// Legacy requests are deliberately not backfilled: their initiator is unknown.
+export const userUsageTotals = sqliteTable("user_usage_totals", {
+	userId: text("user_id").primaryKey(),
+	requestCount: integer("request_count").notNull().default(0),
+	inputTokens: integer("input_tokens").notNull().default(0),
+	outputTokens: integer("output_tokens").notNull().default(0),
+	cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
+	cacheCreationTokens: integer("cache_creation_tokens").notNull().default(0),
+	reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+	costUsd: real("cost_usd").notNull().default(0),
+	unpricedRequestCount: integer("unpriced_request_count").notNull().default(0),
+	firstUsedAt: text("first_used_at").notNull(),
+	lastUsedAt: text("last_used_at").notNull(),
+});
 
 // === credential_usage_totals ===
 // Lifetime token/cost rollup per (provider, credential, model).

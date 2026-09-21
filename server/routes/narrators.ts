@@ -3471,7 +3471,13 @@ narratorRoutes.post("/:id/compact/:messageId/retry", async (c) => {
 	}
 	const body = retryFailedCompactSchema.parse(await c.req.json().catch(() => ({})));
 	const locale = await getUserLanguage(c.get("user").sub);
-	const result = await retryFailedCompact(narratorId, locale, messageId, body.model);
+	const result = await retryFailedCompact(
+		narratorId,
+		locale,
+		messageId,
+		body.model,
+		c.get("user").sub,
+	);
 	result.promise.catch((err) => {
 		logger.error("Failed compact retry failed", {
 			narratorId,
@@ -3732,9 +3738,11 @@ narratorRoutes.post("/:id/compact", async (c) => {
 
 	// Fire-and-forget — compact may take a while (AI summary generation).
 	// compact_done / compact_failed are broadcast from doRunCustomCompact itself.
-	runCustomCompact(narratorId, locale, beforeMessageId).catch((err) => {
-		logger.error("Manual compact failed", { narratorId, err: String(err) });
-	});
+	runCustomCompact(narratorId, locale, beforeMessageId, { userId: c.get("user").sub }).catch(
+		(err) => {
+			logger.error("Manual compact failed", { narratorId, err: String(err) });
+		},
+	);
 	return c.json({ ok: true });
 });
 
@@ -3802,7 +3810,7 @@ narratorRoutes.post("/:id/segment-compact", async (c) => {
 		return c.json({ ok: false, reason: "compact_in_progress" }, 409);
 	}
 
-	runSegmentCompact(narratorId, locale, messageIds).catch((err) => {
+	runSegmentCompact(narratorId, locale, messageIds, c.get("user").sub).catch((err) => {
 		logger.error("Segment compact failed", { narratorId, err: String(err) });
 	});
 	return c.json({ ok: true });
@@ -4132,6 +4140,7 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 				hasError,
 				finalText,
 				locale,
+				userId,
 			);
 			await broadcastReleased();
 			return c.json({ stopped: true, deferred: false });
@@ -4925,7 +4934,7 @@ narratorRoutes.post("/:id/generate-title", async (c) => {
 	await narratorService.getById(id);
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
-	const title = await generateTitle(id, locale);
+	const title = await generateTitle(id, locale, userId);
 	await persistTitle(id, title);
 	return c.json({ title });
 });
@@ -5010,6 +5019,7 @@ narratorRoutes.post("/:id/fork", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const newNarrator = await narratorService.forkNarrator(id, parsed.data.forkMessageUuid ?? null, {
 		title: parsed.data.title,
+		userId: c.get("user").sub,
 		inheritMode: parsed.data.inheritMode ?? "full",
 		forkMessageId: parsed.data.forkMessageId,
 	});

@@ -352,6 +352,7 @@ export function createCompactProgressReporter(options: {
 }
 
 export interface CustomCompactOptions {
+	userId?: string | null;
 	mode?: CompactMode;
 	appendHint?: string;
 	signal?: AbortSignal;
@@ -634,6 +635,7 @@ export function triggerMidTurnCompact(
 	onCompactDone?: () => void,
 	mode: CompactMode = "background",
 	contextPercentBefore?: number,
+	userId?: string | null,
 ): void {
 	if (compactLocks.has(narratorId)) {
 		logger.debug("Compact already in progress, skipping mid-turn trigger", { narratorId });
@@ -667,6 +669,7 @@ export function triggerMidTurnCompact(
 		});
 		const compacted = await runCustomCompact(narratorId, locale, boundaryMessageId, {
 			mode: effectiveMode,
+			userId,
 			trigger: "background",
 			...(contextPercentBefore != null ? { contextPercentBefore } : {}),
 		});
@@ -854,6 +857,7 @@ async function retryFailedCompactUnlocked(
 	locale: Locale,
 	messageId: string,
 	model?: string,
+	userId?: string | null,
 ) {
 	if (compactLocks.has(narratorId)) {
 		throw new AppError("Compact already in progress", 409, "COMPACT_IN_PROGRESS");
@@ -896,6 +900,7 @@ async function retryFailedCompactUnlocked(
 		const promise = runCustomCompact(narratorId, locale, prepared.id, {
 			mode: "blocking",
 			trigger: "retry",
+			userId,
 			model: prepared.model,
 			reuseFailedMessageId: prepared.id,
 			preparedRetryMessage: prepared,
@@ -1045,6 +1050,7 @@ async function doRunCustomCompact({
 				retryCount += 1;
 				compactProgress.reportRetry(retryCount, info.error);
 			},
+			options?.userId,
 		);
 		compactProgress.finish();
 		// Providers should honor the signal, but enforce cancellation at the
@@ -1328,6 +1334,7 @@ async function runSegmentCompactUnlocked(
 	narratorId: string,
 	locale: Locale,
 	messageIds: string[],
+	userId?: string | null,
 ): Promise<void> {
 	const existing = compactLocks.get(narratorId);
 	if (existing) {
@@ -1352,6 +1359,7 @@ async function runSegmentCompactUnlocked(
 		narratorId,
 		locale,
 		messageIds,
+		userId,
 		signal: abortController.signal,
 		hooks: { beat: watchdog.beat, timeoutReason: watchdog.firedReason },
 	}).then(
@@ -1391,12 +1399,14 @@ async function doRunSegmentCompact({
 	narratorId,
 	locale,
 	messageIds,
+	userId,
 	signal,
 	hooks,
 }: {
 	narratorId: string;
 	locale: Locale;
 	messageIds: string[];
+	userId?: string | null;
 	signal?: AbortSignal;
 	hooks?: CompactRunHooks;
 }): Promise<boolean> {
@@ -1455,6 +1465,7 @@ async function doRunSegmentCompact({
 				segmentRetryCount += 1;
 				compactProgress.reportRetry(segmentRetryCount, info.error);
 			},
+			userId,
 		);
 		compactProgress.finish();
 		// Enforce cancellation at the persistence boundary too, so a summary that

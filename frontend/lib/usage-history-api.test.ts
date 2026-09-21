@@ -87,7 +87,12 @@ describe("usageHistoryApi", () => {
 
 		const controller = new AbortController();
 		await usageHistoryApi.listCursor(
-			{ provider: "openai", kind: "narrator", startDate: "2026-07-01T00:00:00.000Z" },
+			{
+				userId: "user-1",
+				provider: "openai",
+				kind: "narrator",
+				startDate: "2026-07-01T00:00:00.000Z",
+			},
 			{ cursor: "cursor-1", limit: 50, signal: controller.signal },
 		);
 
@@ -96,8 +101,68 @@ describe("usageHistoryApi", () => {
 		expect(params.get("cursor")).toBe("cursor-1");
 		expect(params.get("limit")).toBe("50");
 		expect(params.get("provider")).toBe("openai");
+		expect(params.get("userId")).toBe("user-1");
 		expect(params.get("kind")).toBe("narrator");
 		expect(params.get("startDate")).toBe("2026-07-01T00:00:00.000Z");
 		expect(requestedSignal).toBe(controller.signal);
+	});
+
+	test("passes unattributed user filters to lists, stats, and every chart", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => "token-1" },
+			configurable: true,
+		});
+		const urls: URL[] = [];
+		Object.defineProperty(g, "fetch", {
+			value: async (input: RequestInfo | URL) => {
+				urls.push(new URL(String(input), "http://localhost"));
+				return Response.json({});
+			},
+			configurable: true,
+		});
+		const filters = { userId: "__unattributed__", provider: "openai" };
+		await usageHistoryApi.list(filters);
+		await usageHistoryApi.listCursor(filters);
+		await usageHistoryApi.getStats(filters);
+		await usageHistoryApi.getTimeSeries(filters);
+		await usageHistoryApi.getBreakdown(filters, { dimension: "user", metric: "requests" });
+		await usageHistoryApi.getTimeSeriesStacked(filters, { dimension: "user", metric: "cost" });
+		expect(urls).toHaveLength(6);
+		for (const url of urls) {
+			expect(url.searchParams.get("userId")).toBe("__unattributed__");
+			expect(url.searchParams.get("provider")).toBe("openai");
+		}
+		expect(urls[4].searchParams.get("dimension")).toBe("user");
+		expect(urls[5].searchParams.get("dimension")).toBe("user");
+	});
+
+	test("fetches bounded durable totals with a user cursor and cancellation, without history filters", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => "token-1" },
+			configurable: true,
+		});
+		const requests: { url: URL; signal: AbortSignal | null | undefined }[] = [];
+		const response = { records: [], hasMore: false, nextCursor: null, limit: 50 };
+		Object.defineProperty(g, "fetch", {
+			value: async (input: RequestInfo | URL, init?: RequestInit) => {
+				requests.push({ url: new URL(String(input), "http://localhost"), signal: init?.signal });
+				return Response.json(response);
+			},
+			configurable: true,
+		});
+		expect(await usageHistoryApi.getUserTotals()).toEqual(response);
+		const controller = new AbortController();
+		await usageHistoryApi.getUserTotals({
+			cursor: "deleted-user+id",
+			limit: 25,
+			signal: controller.signal,
+		});
+		expect(requests[0].url.pathname).toBe("/api/usage-history/user-totals");
+		expect([...requests[0].url.searchParams]).toEqual([["limit", "50"]]);
+		expect([...requests[1].url.searchParams]).toEqual([
+			["limit", "25"],
+			["cursor", "deleted-user+id"],
+		]);
+		expect(requests[1].signal).toBe(controller.signal);
 	});
 });

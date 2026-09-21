@@ -69,11 +69,29 @@ mock.module("../subagent-resume", () => ({
 	},
 }));
 
-const { startInjectionContinuationIfPossible } = await import("../narrator-session");
+const { startInjectionContinuationIfPossible, drainAndPersistPendingInjections } = await import(
+	"../narrator-session"
+);
+const { pushParentInboundMessage } = await import("../parent-inbound-queue");
+const { pushBgCompletionNotification } = await import("../bg-completion-queue");
+const { sendSubagentMessageDetailed } = await import("../agent-communication");
+const { announceResumedBackgroundTask } = await import("../subagent-runner");
 
 const now = "2026-07-28T10:00:00.000Z";
 const PARENT_ID = "wake-parent";
 const SUB_ID = "wake-sub";
+
+beforeEach(() => {
+	cleanDb(sqlite);
+	resumeCalls.length = 0;
+	resumePrincipals.length = 0;
+	activeResumeRuns.clear();
+	resumeStarted = true;
+	resumeThrows = null;
+});
+afterEach(() => {
+	cleanDb(sqlite);
+});
 
 function seedNarrator(
 	id: string,
@@ -95,24 +113,85 @@ function seedNarrator(
 		);
 }
 
-beforeEach(() => {
-	cleanDb(sqlite);
-	resumeCalls.length = 0;
-	resumePrincipals.length = 0;
-	resumeStarted = true;
-	resumeThrows = null;
-	activeResumeRuns = new Set();
+describe("parent injection initiating user", () => {
+	test("pending injection userId comes from the producing pass metadata", async () => {
+		const { recordTaskNoticeUser, takePendingInjectionBatch } = await import(
+			"../parent-injection-queue"
+		);
+		const { createMailboxStore } = await import("../agent-runtime/mailbox");
+		const { announceResumedBackgroundTask } = await import("../subagent-runner");
+		seedNarrator(PARENT_ID, { status: "working" });
+		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID });
+		await announceResumedBackgroundTask({
+			subagentId: SUB_ID,
+			parentNarratorId: PARENT_ID,
+			userId: "A",
+			status: "completed",
+			wakeParent: true,
+			locale: "en",
+		});
+		const store = createMailboxStore(db);
+		store.enqueue({
+			kind: "task_notice",
+			noticeKind: "agent",
+			narratorId: PARENT_ID,
+			text: "[System] pointer to original Agent tool result",
+			projectedByteSize: 128,
+			sourceKey: `wake-notice:${SUB_ID}:completed`,
+			metadata: {
+				producerKind: "agent",
+				taskId: SUB_ID,
+				logicalRunId: "wake-run",
+				eventKind: "completed",
+			},
+		});
+		expect(await takePendingInjectionBatch(PARENT_ID, "B")).toBeNull();
+		const batch = await takePendingInjectionBatch(PARENT_ID);
+		expect(batch?.userId).toBe("A");
+		recordTaskNoticeUser(SUB_ID, null);
+	});
+
+	test("Send(parent) metadata carries the sending pass user", async () => {
+		const { pushParentInboundMessage } = await import("../parent-inbound-queue");
+		const { takePendingInjectionBatch } = await import("../parent-injection-queue");
+		const { createAgentMessageDelivery } = await import("../agent-message-delivery");
+		seedNarrator(PARENT_ID, { status: "working" });
+		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID });
+		const toolCallId = `${SUB_ID}-send-tool`;
+		const messageId = `${SUB_ID}-send-msg`;
+		sqlite
+			.prepare(
+				`INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at) VALUES (?, ?, 'assistant', '[]', ?)`,
+			)
+			.run(messageId, SUB_ID, now);
+		sqlite
+			.prepare(
+				`INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, execution_attempt, execution_identity_version, status, created_at)
+				 VALUES (?, ?, ?, 'send', 'Send', 1, 1, 'running', ?)`,
+			)
+			.run(toolCallId, SUB_ID, messageId, now);
+		const delivery = createAgentMessageDelivery(
+			PARENT_ID,
+			{ id: SUB_ID, title: null, label: "child", type: "general", isParent: false },
+			"send",
+			"A report",
+			{ toolCallId, attempt: 1 },
+		);
+		await pushParentInboundMessage(PARENT_ID, {
+			delivery,
+			userId: "A",
+			fromId: SUB_ID,
+			fromTitle: null,
+			fromType: "general",
+			fromToolUseId: "send",
+			text: "A report",
+			timestamp: now,
+		});
+		expect(await takePendingInjectionBatch(PARENT_ID, "B")).toBeNull();
+		expect((await takePendingInjectionBatch(PARENT_ID))?.userId).toBe("A");
+	});
 });
 
-afterEach(() => {
-	cleanDb(sqlite);
-});
-
-afterAll(() => {
-	mock.module("../../db", () => realDbModule);
-	mock.module("../../websocket/narrator-ws", () => realNarratorWs);
-	mock.module("../subagent-resume", () => realSubagentResume);
-});
 
 describe("an idle SUBAGENT recipient", () => {
 	test("an async question answer persists to the child before dispatching its original resume path", async () => {

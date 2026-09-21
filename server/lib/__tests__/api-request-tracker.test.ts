@@ -1,6 +1,7 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { apiRequests, userUsageTotals } from "@server/db/schema";
 import {
 	clearRememberedSpills,
 	RAW_DUMP_INLINE_MAX_BYTES,
@@ -9,18 +10,31 @@ import {
 } from "@server/lib/api-request-dump-store";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { DEFAULTS, settings } from "@server/lib/settings";
+import { eq } from "drizzle-orm";
+import { cleanDb, getTestDb } from "../../../tests/setup";
+
+const { db, sqlite } = getTestDb();
+const realDbModule = { ...(await import("@server/db")) };
+mock.module("@server/db", () => ({ ...realDbModule, db, sqlite }));
+
 import {
 	type ApiRequestFinishOptions,
 	FORCED_DUMP_HARD_MAX_BYTES,
+	finishApiRequest,
 	isRequestDumpEnabled,
 	serializeRawDump,
 	serializeRawDumpWithSpill,
 	shouldCollectRequestDump,
 	shouldPersistRawDump,
 	spillThresholdBytes,
+	startApiRequest,
 } from "../api-request-tracker";
 
 const spillDir = getNarraforkPath(REQUEST_DUMP_SPILL_DIR);
+
+afterEach(() => {
+	cleanDb(sqlite);
+});
 
 // Snapshot the three dump-related agent settings so each test can toggle them freely
 // without leaking state into sibling tests (settings is a mutable singleton).
@@ -607,3 +621,48 @@ function readSpill(row: string | null): { filePath?: string } | undefined {
 	if (!row) return undefined;
 	return (JSON.parse(row) as { spill?: { filePath?: string } }).spill;
 }
+
+describe("request user attribution", () => {
+	test("completion persists frozen user and rolls up once, including unknown-cost failures", async () => {
+		const userId = "tracker-user-rollup-test";
+		const handle = startApiRequest({ provider: "test", model: "unknown", userId });
+		try {
+			await finishApiRequest(handle, { usage: { inputTokens: 100, outputTokens: 20 } });
+			await finishApiRequest(handle, { usage: { inputTokens: 100, outputTokens: 20 } });
+			expect(db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get()?.userId).toBe(
+				userId,
+			);
+			expect(
+				db.select().from(userUsageTotals).where(eq(userUsageTotals.userId, userId)).get(),
+			).toMatchObject({
+				requestCount: 1,
+				inputTokens: 100,
+				outputTokens: 20,
+				unpricedRequestCount: 1,
+			});
+			const failed = startApiRequest({ provider: "test", model: "unknown", userId });
+			await finishApiRequest(failed, { errorMessage: "upstream rejected" });
+			expect(
+				db.select().from(userUsageTotals).where(eq(userUsageTotals.userId, userId)).get(),
+			).toMatchObject({ requestCount: 2, inputTokens: 100, unpricedRequestCount: 2 });
+		} finally {
+			db.delete(apiRequests).where(eq(apiRequests.userId, userId)).run();
+			db.delete(userUsageTotals).where(eq(userUsageTotals.userId, userId)).run();
+		}
+	});
+	test("captures the initiating user before shared options change", () => {
+		const options = { provider: "test", model: "test", userId: "alice" };
+		const first = startApiRequest(options);
+		options.userId = "bob";
+		const second = startApiRequest(options);
+		expect(first.userId).toBe("alice");
+		expect(second.userId).toBe("bob");
+	});
+
+	test("unknown initiators stay null even with a narrator", () => {
+		expect(
+			startApiRequest({ provider: "test", model: "test", narratorId: "shared" }).userId,
+		).toBeNull();
+		expect(startApiRequest({ provider: "test", model: "test", userId: null }).userId).toBeNull();
+	});
+});

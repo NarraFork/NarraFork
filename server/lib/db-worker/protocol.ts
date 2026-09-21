@@ -22,7 +22,17 @@ export const DB_WORKER_READY_TIMEOUT_MS = 10_000;
 export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 
 /** Task names the worker can execute. Read-only by contract. */
-export type DbReadTaskName = "storageScanContext" | "storageScanTables";
+export type DbReadTaskName = "storageScanContext" | "storageScanTables" | "usageHistoryQuery";
+
+/** Internal, server-built SELECT only. Never accepts SQL from an HTTP caller. */
+export interface UsageHistoryQueryParams {
+	kind: "usageHistoryQuery";
+	sql: string;
+	params: Array<string | number | null>;
+	/** Selected field names in Drizzle selection order. */
+	columns: string[];
+	maxRows: number;
+}
 
 export interface StorageScanContextParams {
 	kind: "storageScanContext";
@@ -73,7 +83,10 @@ export interface StorageScanTablesResult {
 	}>;
 }
 
-export type DbReadTaskParams = StorageScanContextParams | StorageScanTablesParams;
+export type DbReadTaskParams =
+	| StorageScanContextParams
+	| StorageScanTablesParams
+	| UsageHistoryQueryParams;
 
 export interface DbWorkerRequest {
 	type: "task";

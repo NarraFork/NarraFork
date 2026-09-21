@@ -442,6 +442,8 @@ export async function summaryGenerate(
 	onRetryScheduled?: (info: SummaryRetryInfo) => void,
 ): Promise<import("./provider").GenerateMetaResult> {
 	const model = modelOverride?.trim() || settings.agent.summaryModel;
+	// Retries belong to the original invocation, even if the caller reuses its options.
+	const requestTracking = tracking ? { ...tracking, userId: tracking.userId ?? null } : undefined;
 	const generateOptions: GenerateOptions = {
 		...SUMMARY_GENERATE_OPTIONS,
 		...(signal ? { signal } : {}),
@@ -450,7 +452,7 @@ export async function summaryGenerate(
 		...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
 	};
 	return withSummaryRetry(
-		() => agentGenerateWithMeta(text, model, systemInstruction, generateOptions, tracking),
+		() => agentGenerateWithMeta(text, model, systemInstruction, generateOptions, requestTracking),
 		signal,
 		model,
 		reportSummaryModelErrors,
@@ -472,16 +474,17 @@ export async function summaryGenerateWithHistory(
 	options?: Pick<GenerateOptions, "signal" | "onTextDelta" | "onReasoningDelta">,
 ): Promise<string> {
 	const generateOptions: GenerateOptions = { ...SUMMARY_GENERATE_OPTIONS, ...options };
+	const requestTracking = tracking ? { ...tracking, userId: tracking.userId ?? null } : undefined;
 	const model = settings.agent.summaryModel;
 	const generate = () =>
 		agentGenerateWithHistoryWithMeta(systemInstruction, content, model, locale, generateOptions);
 	const result = await withSummaryRetry(
 		async () => {
-			if (!tracking) return generate();
+			if (!requestTracking) return generate();
 			const resolved = resolveProviderAndModel(model);
 			return trackApiRequest(
 				{
-					...tracking,
+					...requestTracking,
 					provider: resolved.provider,
 					model: resolved.model,
 				},

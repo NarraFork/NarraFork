@@ -1,6 +1,7 @@
 import { formatCompactNumber } from "@frontend/lib/compact-number";
 import { formatLocaleDate, formatLocaleDateTime } from "@frontend/lib/intl-format";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
+import { usageDimensionLabel } from "@frontend/lib/usage-history-user";
 import type {
 	UsageBreakdownDimension,
 	UsageBreakdownMetric,
@@ -92,6 +93,7 @@ export function UsageStackedChart({ filters }: UsageStackedChartProps) {
 			{ value: "provider", label: t("usageBreakdownDimProvider") },
 			{ value: "model", label: t("usageBreakdownDimModel") },
 			{ value: "kind", label: t("usageBreakdownDimKind") },
+			{ value: "user", label: t("usageBreakdownDimUser") },
 		],
 		[t],
 	);
@@ -376,7 +378,11 @@ export function UsageStackedChart({ filters }: UsageStackedChartProps) {
 														}}
 													/>
 													<Text size="xs" c="dimmed" lineClamp={1}>
-														{series.label}
+														{usageDimensionLabel(
+															series.label,
+															dimension,
+															t("usageHistoryUnattributed"),
+														)}
 													</Text>
 												</Group>
 												<Text size="xs" fw={600}>
@@ -402,7 +408,9 @@ export function UsageStackedChart({ filters }: UsageStackedChartProps) {
 												backgroundColor: series.color,
 											}}
 										/>
-										<Text size="xs">{series.label}</Text>
+										<Text size="xs">
+											{usageDimensionLabel(series.label, dimension, t("usageHistoryUnattributed"))}
+										</Text>
 									</Group>
 								))}
 							</Group>
