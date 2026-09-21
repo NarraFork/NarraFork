@@ -270,6 +270,115 @@ export interface SubstituteOptions {
 	timeoutMs?: number;
 }
 
+/**
+ * How many capture groups a pattern declares, and the names of the named ones.
+ *
+ * Derived by compiling `(?:pattern)|` and matching its empty alternative: the result
+ * array has one slot per group and `.groups` carries every declared name. That works for
+ * backreferences and lookaround without re-implementing a regex parser — counting `(` in
+ * the source text would have to reason about escapes, character classes and the whole
+ * `(?:` / `(?=` / `(?<=` family, and would eventually get one of them wrong.
+ *
+ * Returns null when the probe itself will not compile. Group checking is then skipped
+ * rather than the substitution refused: this is a best-effort reading of the pattern, and
+ * rejecting a pattern that compiles perfectly well on its own would be the worse error.
+ */
+function describeCaptureGroups(pattern: string): { count: number; names: Set<string> } | null {
+	try {
+		const probe = new RegExp(`(?:${pattern})|`).exec("");
+		if (!probe) return null;
+		return { count: probe.length - 1, names: new Set(Object.keys(probe.groups ?? {})) };
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Reject a replacement template that references a capture group the pattern does not have.
+ *
+ * Both ways this can go wrong are silent, and they corrupt in OPPOSITE directions — which
+ * is why "it behaves like sed" is not a safe assumption to carry over:
+ *
+ *   - `"foo".replace(/foo/, "[$1]")` → `"[$1]"`. With no group to resolve, JS writes the
+ *     reference through as LITERAL TEXT. A typo becomes `$1` sitting in the source file.
+ *   - `"foo".replace(/(?<a>f)/, "[$<b>]")` → `"[]oo"`. A group that exists but was not
+ *     matched, or an unknown NAME among known names, expands to the EMPTY STRING — the
+ *     edit quietly deletes a span instead.
+ *
+ * Neither raises anything, so without this check the only evidence is the damaged file.
+ *
+ * What is deliberately NOT rejected, because it is well-defined in JS and someone may
+ * mean it: a trailing lone `$` (a literal dollar sign — unlike some engines, this is not
+ * an error here), `$&` / `` $` `` / `$'`, and `$10` against a one-group pattern, which the
+ * spec resolves as group 1 followed by a literal `0`.
+ */
+export function validateReplacementTemplate(pattern: string, replacement: string): void {
+	const groups = describeCaptureGroups(pattern);
+	if (!groups) return;
+
+	for (let i = 0; i < replacement.length; i++) {
+		if (replacement[i] !== "$") continue;
+		const next = replacement[i + 1];
+		// A lone `$` at the very end is a literal dollar sign.
+		if (next === undefined) break;
+		if (next === "$" || next === "&" || next === "`" || next === "'") {
+			i++;
+			continue;
+		}
+
+		if (next === "<") {
+			// `$<…>` is only a group reference when the pattern declares named groups at
+			// all; otherwise the spec makes the whole thing literal text.
+			if (groups.names.size === 0) {
+				throw new EditOpError(
+					`Replacement references \`$<…>\` but the pattern declares no named groups, ` +
+						`so JS would write \`$<…>\` into the file as literal text. ` +
+						`Use \`$1\` for a positional group, or declare \`(?<name>…)\` in the pattern.`,
+				);
+			}
+			const close = replacement.indexOf(">", i + 2);
+			if (close === -1) {
+				throw new EditOpError("Replacement has an unterminated `$<` group reference.");
+			}
+			const name = replacement.slice(i + 2, close);
+			if (!groups.names.has(name)) {
+				throw new EditOpError(
+					`Replacement references the named group \`$<${name}>\`, which the pattern does ` +
+						`not declare. JS expands an unknown name to the EMPTY STRING, so this would ` +
+						`silently delete that span. Declared names: ${[...groups.names].join(", ")}.`,
+				);
+			}
+			i = close;
+			continue;
+		}
+
+		if (next >= "0" && next <= "9") {
+			// The spec prefers the two-digit reading, then falls back to one digit; only
+			// when neither names a real group is the text written through literally.
+			const pair = replacement.slice(i + 1, i + 3);
+			const two = /^\d\d$/.test(pair) ? Number(pair) : Number.NaN;
+			if (two >= 1 && two <= groups.count) {
+				i += 2;
+				continue;
+			}
+			const one = Number(next);
+			if (one >= 1 && one <= groups.count) {
+				i += 1;
+				continue;
+			}
+			throw new EditOpError(
+				groups.count === 0
+					? `Replacement references \`$${next}\` but the pattern declares no capture ` +
+						`groups, so JS would write \`$${next}\` into the file as literal text. ` +
+						`Use \`$&\` for the whole match, or add a group to the pattern.`
+					: `Replacement references \`$${next}\` but the pattern declares only ` +
+						`${groups.count} capture group(s), so JS would write it into the file as ` +
+						`literal text.`,
+			);
+		}
+	}
+}
+
 export interface SubstituteResult {
 	text: string;
 	/** How many replacements were made, for the tool's report. */
@@ -281,7 +390,15 @@ export interface SubstituteResult {
  *
  * Applied line by line rather than to the joined block, for two reasons: a `g` flag then
  * means "every match on every line in range" (what sed means by it), and a pathological
- * pattern is bounded per line instead of against the whole block.
+ * pattern is bounded per line instead of against the whole block. A useful side effect is
+ * that `^` and `$` anchor to each line for free, with no `m` flag involved.
+ *
+ * ── Either the whole range is substituted, or not one byte changes ──────────────────
+ * The scan runs to completion BEFORE anything is rewritten. Every reason to refuse —
+ * the match cap, the timeout, a zero-width pattern, a bad replacement template — is
+ * therefore raised while the original text is still intact, and the caller gets an error
+ * instead of a file that was half-processed. A half-substituted file is worse than an
+ * untouched one: it looks finished, and the reader has no way to tell which half is which.
  *
  * The timeout is checked between lines. It cannot interrupt a single catastrophic match —
  * that would need a separate process — but it does stop a pattern that is merely slow
@@ -303,46 +420,99 @@ export function substituteInRange(
 	const unsupported = rawFlags.replace(/[gi]/g, "");
 	if (unsupported) {
 		throw new EditOpError(
-			`Unsupported substitute flags: "${unsupported}". Only "g" and "i" are supported.`,
+			`Unsupported substitute flags: "${unsupported}". Only "g" and "i" are supported. ` +
+				`"m" and "s" are not missing features: the substitution already runs one line at a ` +
+				`time, so "^" and "$" anchor per line, and no pattern here can span a line break.`,
 		);
 	}
 	const global = rawFlags.includes("g");
+	const flags = global ? (rawFlags.includes("i") ? "gi" : "g") : rawFlags;
 
 	let regex: RegExp;
 	try {
 		// A fresh regex per line would be wasteful, but a shared `g` regex carries
-		// `lastIndex` between lines; `String.replace` resets it, so sharing is safe here.
-		regex = new RegExp(pattern, global ? `g${rawFlags.includes("i") ? "i" : ""}` : rawFlags);
+		// `lastIndex` between lines; `String.match`/`String.replace` reset it, so sharing
+		// is safe here.
+		regex = new RegExp(pattern, flags);
 	} catch (error) {
 		throw new EditOpError(
-			`Invalid substitute pattern: ${error instanceof Error ? error.message : String(error)}`,
+			`Invalid substitute pattern: ${error instanceof Error ? error.message : String(error)}. ` +
+				`This is the JS engine, so backreferences (\\1) and lookaround ((?=) (?!) (?<=) ` +
+				`(?<!)) ARE available; what it does not have is a linear-time guarantee, so deeply ` +
+				`nested quantifiers can backtrack catastrophically and hit the timeout below.`,
 		);
 	}
 
+	// Raised before the scan: this one is a property of the two inputs alone.
+	validateReplacementTemplate(pattern, replacement);
+
 	const started = Date.now();
 	const end = Math.min(range.endLine, lines.length);
-	const next = [...lines];
-	let replacements = 0;
 
+	// ── Pass 1: scan. Nothing is rewritten here. ─────────────────────────────────────
+	const hits: number[] = [];
+	let replacements = 0;
 	for (let i = range.startLine - 1; i < end; i++) {
 		if (Date.now() - started > timeoutMs) {
 			throw new EditOpError(
-				`Substitute exceeded ${timeoutMs}ms; narrow the range or simplify the pattern.`,
+				`Substitute exceeded ${timeoutMs}ms and was abandoned; no lines were changed. ` +
+					`Narrow the range, or simplify a pattern whose nested quantifiers are backtracking.`,
 			);
 		}
-		const line = next[i];
+		const line = lines[i];
 		if (line === undefined) continue;
-		// Count first, so the cap is enforced before mutating anything.
 		const matches = line.match(regex);
-		const found = matches ? (global ? matches.length : 1) : 0;
-		if (found === 0) continue;
+		if (!matches) continue;
+		const found = global ? matches.length : 1;
+
+		// Zero-width matches are the one failure that looks like success. `/x*/g` and
+		// `/\b/g` match BETWEEN characters, so `replace` inserts the replacement text at
+		// every such position: "abc" becomes "|a|b|c|".
+		//
+		// Two things make this worth a dedicated check rather than a note in the docs:
+		//
+		//   - Asking whether the pattern can match the empty string is NOT sufficient.
+		//     `/\b/.test("")` is FALSE — an empty string contains no word boundary — yet
+		//     `\b` produces four zero-width hits on "ab cd". Only looking at the matches
+		//     actually found answers the question.
+		//   - More than one zero-width hit on a single line is the discriminator. Exactly
+		//     one is what a deliberate `s/^/prefix/` or `s/$/;/` produces, and those are
+		//     ordinary sed idioms worth keeping; a second one on the same line means the
+		//     text is being injected into the middle of it.
+		const zeroWidth = global
+			? matches.reduce((n, m) => (m === "" ? n + 1 : n), 0)
+			: matches[0] === ""
+				? 1
+				: 0;
+		if (zeroWidth > 1) {
+			throw new EditOpError(
+				`Pattern /${pattern}/ produces ZERO-WIDTH matches (it can match between two ` +
+					`characters — "x*", "\\b", "(?:)" and friends), ${zeroWidth} of them on line ` +
+					`${i + 1} alone. Replacing them would insert the replacement text between ` +
+					`characters and scramble the line, so nothing was changed. Rewrite it to match ` +
+					`at least one character (e.g. "\\w+" instead of "\\w*", or the real characters ` +
+					`around a "\\b").`,
+			);
+		}
+
 		if (replacements + found > maxMatches) {
 			throw new EditOpError(
-				`Substitute would exceed ${maxMatches} replacements; narrow the range.`,
+				`Substitute would exceed ${maxMatches} replacements; nothing was changed. ` +
+					`Narrow the range.`,
 			);
 		}
-		next[i] = line.replace(regex, replacement);
+		hits.push(i);
 		replacements += found;
+	}
+
+	if (hits.length === 0) return { text, replacements: 0 };
+
+	// ── Pass 2: apply. Every reason to refuse has already been raised. ───────────────
+	const next = [...lines];
+	for (const i of hits) {
+		const line = next[i];
+		if (line === undefined) continue;
+		next[i] = line.replace(regex, replacement);
 	}
 
 	return { text: joinLines(next, trailingNewline), replacements };
