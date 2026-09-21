@@ -40,17 +40,52 @@ export interface RichOutlineNode extends OutlineNode {
 
 const MAX_SIGNATURE_CHARS = 120;
 
+/**
+ * Hard cap on nodes VISITED, as opposed to nodes emitted.
+ *
+ * `maxNodes` bounds the output, and for a file full of declarations the two are close
+ * enough that it looks like it also bounds the work. It does not: `emitted` only grows
+ * when a row is produced, so a file with NO declarations can never trip it no matter how
+ * much tree the walk chews through — and that is precisely the dangerous input.
+ *
+ * Measured on this grammar set: a 140 KB generated-config file (`const cfg = { a: { a:
+ * … } }` nested 20 000 deep) parses in 64 ms and then walks 20 266 nodes at `emitted: 0`
+ * before the recursion dies. Bounding visits is what makes the walk's cost a function of
+ * the budget rather than of how pathological the file is.
+ */
+export const MAX_VISITED_NODES = 400_000;
+
+/**
+ * Hard cap on TRAVERSAL depth, which is not the same thing as `maxDepth`.
+ *
+ * `maxDepth` limits how deep the OUTLINE nests, and only the branches that emit a row
+ * increment it. Containers (`object`, `statement_block`), transparent wrappers and
+ * non-structural `pair`s all recurse with `ctx.depth` deliberately unchanged, so an
+ * arbitrarily deep tree can be traversed at outline depth 0 forever. With `maxDepth`
+ * defaulting to Infinity, nothing bounded that recursion at all.
+ *
+ * The failure mode in this runtime is a `RangeError: Maximum call stack size exceeded`
+ * rather than a hard crash — JS can catch it — but it is still the wrong answer twice
+ * over: the caller gets an engine error instead of "this file is too deep to outline",
+ * and the work happened on the Bun main thread, where every other request was waiting.
+ * `references.ts` already uses an explicit stack for the same reason; this is the cheaper
+ * fix for a walk whose shape genuinely wants recursion.
+ */
+export const MAX_TRAVERSAL_DEPTH = 512;
+
 export interface BuildOutlineOptions {
 	/** Stop descending past this depth. 0 = top level only. */
 	maxDepth?: number;
 	/** Hard cap on emitted nodes, to bound output for generated files. */
 	maxNodes?: number;
+	/** Hard cap on visited nodes. Bounds the WORK; `maxNodes` bounds the OUTPUT. */
+	maxVisited?: number;
 	signal?: AbortSignal;
 }
 
 export interface BuildOutlineResult {
 	nodes: RichOutlineNode[];
-	/** True when `maxNodes` cut the walk short. */
+	/** True when `maxNodes`, `maxVisited` or the traversal-depth cap cut the walk short. */
 	truncated: boolean;
 }
 
@@ -65,10 +100,20 @@ export function buildOutline(
 
 	const maxDepth = options.maxDepth ?? Number.POSITIVE_INFINITY;
 	const maxNodes = options.maxNodes ?? 5000;
-	const state: WalkState = { spec, emitted: 0, maxNodes, maxDepth, truncated: false };
+	const maxVisited = options.maxVisited ?? MAX_VISITED_NODES;
+	const state: WalkState = {
+		spec,
+		emitted: 0,
+		visited: 0,
+		maxNodes,
+		maxVisited,
+		maxDepth,
+		truncated: false,
+	};
 
 	const nodes = walkChildren(root, state, {
 		depth: 0,
+		frame: 0,
 		exported: false,
 		symbolPrefix: "",
 		signal: options.signal,
@@ -80,13 +125,23 @@ export function buildOutline(
 interface WalkState {
 	spec: LanguageSpec;
 	emitted: number;
+	/** Nodes seen, whether or not they produced a row. */
+	visited: number;
 	maxNodes: number;
+	maxVisited: number;
 	maxDepth: number;
 	truncated: boolean;
 }
 
 interface WalkContext {
 	depth: number;
+	/**
+	 * Recursion depth of the walk itself.
+	 *
+	 * Distinct from `depth`, which only counts outline nesting: this one increments on
+	 * EVERY descent, including the ones that deliberately keep `depth` fixed.
+	 */
+	frame: number;
 	/** Inherited from an `export` wrapper or an enclosing exported declaration. */
 	exported: boolean;
 	symbolPrefix: string;
@@ -106,14 +161,21 @@ interface WalkContext {
 function walkChildren(node: SyntaxNode, state: WalkState, ctx: WalkContext): RichOutlineNode[] {
 	const results: RichOutlineNode[] = [];
 	if (ctx.signal?.aborted) return results;
+	// Checked on the way IN, so no descent can start past the cap — the recursive calls
+	// below all raise `frame`, and several of them keep `depth` fixed on purpose.
+	if (ctx.frame > MAX_TRAVERSAL_DEPTH) {
+		state.truncated = true;
+		return results;
+	}
 
 	for (let i = 0; i < node.childCount; i++) {
-		if (state.emitted >= state.maxNodes) {
+		if (state.emitted >= state.maxNodes || state.visited >= state.maxVisited) {
 			state.truncated = true;
 			break;
 		}
 		const child = node.child(i);
 		if (!child?.isNamed) continue;
+		state.visited++;
 		results.push(...visit(child, state, ctx));
 	}
 	return results;
@@ -129,6 +191,7 @@ function visit(node: SyntaxNode, state: WalkState, ctx: WalkContext): RichOutlin
 	if (rule?.transparent) {
 		const produced = walkChildren(node, state, {
 			...ctx,
+			frame: ctx.frame + 1,
 			exported: ctx.exported || rule.marksExported === true,
 			wrapper: node,
 		});
@@ -170,6 +233,7 @@ function visit(node: SyntaxNode, state: WalkState, ctx: WalkContext): RichOutlin
 				const children = walkChildren(asCall.callbackBody, state, {
 					...ctx,
 					depth: ctx.depth + 1,
+					frame: ctx.frame + 1,
 					exported: false,
 					symbolPrefix: symbolPath,
 				});
@@ -184,7 +248,7 @@ function visit(node: SyntaxNode, state: WalkState, ctx: WalkContext): RichOutlin
 			// A container is not a wrapper: `lexical_declaration` inside
 			// `export_statement` must not shadow the export node whose siblings hold
 			// the doc comment, so the wrapper is passed through untouched.
-			return walkChildren(node, state, ctx);
+			return walkChildren(node, state, { ...ctx, frame: ctx.frame + 1 });
 		}
 		return [];
 	}
@@ -194,14 +258,14 @@ function visit(node: SyntaxNode, state: WalkState, ctx: WalkContext): RichOutlin
 	// were things like `rawJsonSchema.properties.file_path.description`, which nobody
 	// wants in an outline, and it pushed the report's top-level section to 50 rows.
 	if (node.type === "pair" && !isStructuralPair(node)) {
-		return walkChildren(node, state, ctx);
+		return walkChildren(node, state, { ...ctx, frame: ctx.frame + 1 });
 	}
 
 	const name = readName(node, rule.nameField ?? "name", rule.nameFallback);
 	// An unnamed declaration is real in some grammars (Rust `impl`), so it gets a
 	// synthesized label rather than being dropped.
 	const label = name ?? synthesizeName(node, state.spec);
-	if (!label) return walkChildren(node, state, ctx);
+	if (!label) return walkChildren(node, state, { ...ctx, frame: ctx.frame + 1 });
 
 	const kind = refineKind(node, rule.kind, state.spec);
 	const exported = ctx.exported || isExported(node, label, state.spec);
@@ -239,6 +303,7 @@ function visit(node: SyntaxNode, state: WalkState, ctx: WalkContext): RichOutlin
 			const children = walkChildren(body, state, {
 				...ctx,
 				depth: ctx.depth + 1,
+				frame: ctx.frame + 1,
 				// Membership does not imply visibility: a public class can hold private
 				// methods, so nested nodes re-derive their own export status instead of
 				// inheriting `exported`. Only the syntactic `export` wrapper propagates.
