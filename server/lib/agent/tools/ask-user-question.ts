@@ -2,17 +2,12 @@ import {
 	assertRuntimeCanAskQuestion,
 	runtimePolicyForContext,
 } from "@server/services/agent-runtime/policy";
+import { coerceAskQuestions } from "@server/services/ask-user-question-coerce";
 import type { AsyncQuestionDefinition } from "@server/services/narrator-question-service";
 import { z } from "zod/v4";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
 
-const INVALID_QUESTION_KEYS = new Set(["undefined", "null"]);
-
 const nonEmptyText = z.string().trim().min(1);
-const questionKey = nonEmptyText.refine(
-	(value) => !INVALID_QUESTION_KEYS.has(value.toLowerCase()),
-	"Question key must be meaningful",
-);
 
 /** Read the `withdraw` list off a raw tool input, ignoring malformed entries. */
 export function readWithdrawIds(input: unknown): string[] {
@@ -51,10 +46,14 @@ export const askUserQuestionTool: ToolDefinition = {
 		"2. Clarify ambiguous instructions\n" +
 		"3. Get decisions on implementation choices as you work\n" +
 		"4. Offer choices to the user about what direction to take.\n\n" +
+		"IMPORTANT — use ONLY these two field names on questions and options:\n" +
+		"- `header`: SHORT title (about 1-8 words). Same role on questions and options.\n" +
+		"- `description`: The longer text. On a question this is the FULL prompt the user must read (background, constraints, and the actual question). On an option it is what that choice means. Both are displayed.\n" +
+		"Do not invent other field names (`id`, `question`, `content`, `label`, ...). Do not cram the long prompt into `header`.\n\n" +
 		"Usage notes:\n" +
 		'- Users will always be able to select "Other" to provide custom text input\n' +
 		"- Use multiSelect: true to allow multiple answers to be selected for a question\n" +
-		'- If you recommend a specific option, make that the first option in the list and add "(Recommended)" at the end of the label\n\n' +
+		'- If you recommend a specific option, make that the first option in the list and add "(Recommended)" at the end of the header\n\n' +
 		'Plan mode note: In plan mode, use this tool to clarify requirements or choose between approaches BEFORE finalizing your plan. Do NOT use this tool to ask "Is my plan ready?" or "Should I proceed?" - use ExitPlanMode for plan approval. IMPORTANT: Do not reference "the plan" in your questions (e.g., "Do you have feedback about the plan?", "Does the plan look good?") because the user cannot see the plan in the UI until you call ExitPlanMode. If you need plan approval, use ExitPlanMode instead.\n\n' +
 		"Preview feature:\n" +
 		"Use the optional `preview` field on options when presenting concrete artifacts that users need to visually compare:\n" +
@@ -62,7 +61,7 @@ export const askUserQuestionTool: ToolDefinition = {
 		"- Code snippets showing different implementations\n" +
 		"- Diagram variations\n" +
 		"- Configuration examples\n\n" +
-		"Preview content is rendered as markdown in a monospace box. Multi-line text with newlines is supported. When any option has a preview, the UI switches to a side-by-side layout with a vertical option list on the left and preview on the right. Do not use previews for simple preference questions where labels and descriptions suffice. Note: previews are only supported for single-select questions (not multiSelect).\n\n" +
+		"Preview content is rendered as markdown in a monospace box. Multi-line text with newlines is supported. When any option has a preview, the UI switches to a side-by-side layout with a vertical option list on the left and preview on the right. Do not use previews for simple preference questions where headers and descriptions suffice. Note: previews are only supported for single-select questions (not multiSelect).\n\n" +
 		"Asynchronous mode (`async: true`):\n" +
 		"By default this tool BLOCKS until the user answers. Set `async: true` to submit the question without stopping: you get an immediate acknowledgement, keep working with a sensible default, and the user's answer arrives later as a message in the conversation — at which point you adjust.\n" +
 		"Use async when ALL of these hold:\n" +
@@ -84,17 +83,16 @@ export const askUserQuestionTool: ToolDefinition = {
 				items: {
 					type: "object",
 					properties: {
-						question: {
+						header: {
 							description:
-								'A stable, meaningful answer key for this question. Use a short unique identifier, not "undefined" or "null". Examples: "auth-method", "library-choice", "approach".',
+								"SHORT title for this question (about 1-8 words), shown as the heading. Do not put the long prompt here.",
 							type: "string",
 							minLength: 1,
 						},
-						header: {
+						description: {
 							description:
-								"The question text displayed to the user. It should be clear, specific, and end with a question mark when appropriate.",
+								"The FULL question text the user reads — background, constraints, and the actual question. Displayed under the header. Put the long prompt here.",
 							type: "string",
-							minLength: 1,
 						},
 						options: {
 							description:
@@ -105,24 +103,24 @@ export const askUserQuestionTool: ToolDefinition = {
 							items: {
 								type: "object",
 								properties: {
-									label: {
+									header: {
 										description:
-											"The display text for this option that the user will see and select. Should be concise (1-5 words) and clearly describe the choice.",
+											'Short title for this option that the user will see and select. Concise (1-5 words). End with "(Recommended)" on the first option if you recommend it.',
 										type: "string",
 										minLength: 1,
 									},
 									description: {
 										description:
-											"Explanation of what this option means or what will happen if chosen. Useful for providing context about trade-offs or implications.",
+											"Explanation of what this option means or what will happen if chosen.",
 										type: "string",
 									},
 									preview: {
 										description:
-											"Optional preview content rendered when this option is focused. Use for mockups, code snippets, or visual comparisons that help users compare options. See the tool description for the expected content format.",
+											"Optional preview content rendered when this option is focused. See the tool description for the expected content format.",
 										type: "string",
 									},
 								},
-								required: ["label", "description"],
+								required: ["header"],
 								additionalProperties: false,
 							},
 						},
@@ -133,19 +131,20 @@ export const askUserQuestionTool: ToolDefinition = {
 							type: "boolean",
 						},
 					},
-					required: ["question", "header", "options"],
+					required: ["header", "options"],
 					additionalProperties: false,
 				},
 			},
 			answers: {
-				description: "User answers collected by the permission component",
+				description:
+					"User answers collected by the permission component, keyed by the question header (uniquified when titles collide)",
 				type: "object",
 				propertyNames: { type: "string" },
 				additionalProperties: { type: "string" },
 			},
 			annotations: {
 				description:
-					"Optional per-question annotations from the user (e.g., notes on preview selections). Keyed by question text.",
+					"Optional per-question annotations from the user (e.g., notes on preview selections). Keyed by question header.",
 				type: "object",
 				propertyNames: { type: "string" },
 				additionalProperties: {
@@ -191,9 +190,8 @@ export const askUserQuestionTool: ToolDefinition = {
 			},
 		},
 		// `questions` stays required in the ADVERTISED schema: asking is what this tool
-		// is for, and making it optional would invite calls that do nothing. A
-		// withdraw-only call is a maintenance action the description explains, and the
-		// Zod schema below accepts it.
+		// is for. A withdraw-only call is a maintenance action the description explains,
+		// and the Zod schema below accepts it.
 		required: ["questions"],
 		additionalProperties: false,
 	},
@@ -202,13 +200,19 @@ export const askUserQuestionTool: ToolDefinition = {
 			questions: z
 				.array(
 					z.object({
-						question: questionKey.describe("A unique identifier / short key for this question"),
-						header: nonEmptyText.describe("The question text displayed to the user"),
+						header: nonEmptyText.describe("SHORT title for this question (about 1-8 words)"),
+						description: z
+							.string()
+							.optional()
+							.describe("The FULL question text the user reads — put the long prompt here"),
 						options: z
 							.array(
 								z.object({
-									label: nonEmptyText.describe("Short label for the option"),
-									description: z.string().describe("Longer description shown below the label"),
+									header: nonEmptyText.describe("Short option title shown to the user"),
+									description: z
+										.string()
+										.optional()
+										.describe("Explanation of what this option means"),
 									preview: z.string().optional(),
 								}),
 							)
@@ -398,7 +402,9 @@ async function submitAsyncQuestions(
 			narratorId: ctx.narratorId,
 			toolCallId: call.id,
 			toolUseId,
-			questions: (input.questions as AsyncQuestionDefinition[]) ?? [],
+			// Normalize before persisting so the inbox and answer path share one shape
+			// even when a provider still sends legacy field names.
+			questions: coerceAskQuestions(input.questions) as AsyncQuestionDefinition[],
 			// ToolContext.userId is server-owned; the answerer's identity must never replace it.
 			executionPrincipal: { version: 1, userId: ctx.userId ?? null },
 			// `deferredByUser` is set by the permission gate when the user pressed "answer

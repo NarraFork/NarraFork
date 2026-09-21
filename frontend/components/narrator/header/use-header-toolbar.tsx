@@ -1,15 +1,12 @@
-import { MOBILE_TOOLBAR_VISIBLE_LIMIT } from "@shared/narrator-toolbar";
 import {
 	type Dispatch,
 	type ReactNode,
-	type RefObject,
 	type SetStateAction,
 	useCallback,
 	useMemo,
 	useState,
 } from "react";
 import type { NarratorToolbarEntry } from "../../../hooks/narrator-toolbar-layout";
-import { useNarratorHeaderToolbarCapacity } from "../../../hooks/useNarratorHeaderToolbarCapacity";
 import { useNarratorToolbarLayout } from "../../../hooks/useNarratorToolbarLayout";
 import {
 	PluginContributionOptions,
@@ -21,10 +18,6 @@ import { NarratorLodOptions } from "../lod/NarratorLodMenu";
 import type { RenderLod } from "../lod/RenderLodCtx";
 import type { MobileToolPanelKind } from "../MobileToolPanelHost";
 import { ExecutionDeviceOptions } from "../model/ExecutionDeviceMenu";
-import {
-	HEADER_TITLE_MIN_WIDTH_PX,
-	selectHeaderToolbarEntries,
-} from "./narrator-header-toolbar-capacity";
 import type {
 	NarratorToolbarHost,
 	NarratorToolbarId,
@@ -83,9 +76,9 @@ export interface UseHeaderToolbarOptions {
 
 export interface UseHeaderToolbarResult {
 	toolbarEntries: readonly NarratorToolbarEntry[];
-	/** Header candidates before width measurement; HeaderToolbar applies capacity locally. */
+	/** Entries the reader placed in the header zone (rendered on the row). */
 	toolbarSurfacedDefs: readonly NarratorToolbarItemDef[];
-	/** Menu-zone entries (not bottom); HeaderToolbar merges width-collapsed entries. */
+	/** Menu-zone entries (not bottom). */
 	toolbarTuckedDefs: readonly NarratorToolbarItemDef[];
 	toolbarBottomDefs: readonly NarratorToolbarItemDef[];
 	toolbarOverlays: ReactNode;
@@ -96,75 +89,11 @@ export interface UseHeaderToolbarResult {
 }
 
 /**
- * Width-capacity partition for the header row only. Kept OUT of the panel-level
- * controller: capacity changes when icons collapse/expand, and that state must
- * re-render HeaderToolbar — not the whole NarratorPanel (message list, dock, WS).
- */
-export function useHeaderToolbarCapacityPartition({
-	surfacedDefs,
-	tuckedDefs,
-	headerRowRef,
-	headerToolbarRef,
-	headerLeadingRef,
-	hostOwnsTitle,
-	isWorkspacePreview,
-	isMobileViewport,
-}: {
-	surfacedDefs: readonly NarratorToolbarItemDef[];
-	tuckedDefs: readonly NarratorToolbarItemDef[];
-	headerRowRef: RefObject<HTMLDivElement | null>;
-	headerToolbarRef: RefObject<HTMLDivElement | null>;
-	headerLeadingRef: RefObject<HTMLDivElement | null>;
-	hostOwnsTitle: boolean;
-	isWorkspacePreview: boolean;
-	isMobileViewport: boolean;
-}): {
-	toolbarVisibleDefs: readonly NarratorToolbarItemDef[];
-	toolbarHiddenDefs: readonly NarratorToolbarItemDef[];
-	toolbarNoRoomIds: readonly string[];
-} {
-	const headerTitleSlotMinWidth = useMemo(() => {
-		if (hostOwnsTitle || isWorkspacePreview) return 0;
-		return HEADER_TITLE_MIN_WIDTH_PX + 2 * 18 + 2 * 4;
-	}, [hostOwnsTitle, isWorkspacePreview]);
-
-	const headerCapacity = useNarratorHeaderToolbarCapacity({
-		rowRef: headerRowRef,
-		toolbarRef: headerToolbarRef,
-		leadingRef: headerLeadingRef,
-		titleSlotMinWidth: headerTitleSlotMinWidth,
-		maxWidthFraction: null,
-		itemCount: surfacedDefs.length,
-		maxCapacity: isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null,
-		enabled: !isWorkspacePreview,
-	});
-
-	const headerVisibleLimit =
-		headerCapacity ?? (isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null);
-	const headerSelection = useMemo(
-		() => selectHeaderToolbarEntries(surfacedDefs, headerVisibleLimit),
-		[surfacedDefs, headerVisibleLimit],
-	);
-	const toolbarHiddenDefs = useMemo(
-		() => [...headerSelection.hidden, ...tuckedDefs],
-		[headerSelection.hidden, tuckedDefs],
-	);
-	const toolbarNoRoomIds = useMemo(
-		() => headerSelection.hidden.map((def) => def.id as string),
-		[headerSelection.hidden],
-	);
-
-	return {
-		toolbarVisibleDefs: headerSelection.visible,
-		toolbarHiddenDefs,
-		toolbarNoRoomIds,
-	};
-}
-
-/**
- * Shared controller for header/bottom activation and saved layout. Capacity is
- * NOT here — see {@link useHeaderToolbarCapacityPartition}. Dialogs opened from
- * menus live in `toolbarOverlays`, mounted outside those menus.
+ * Shared controller for header/bottom activation and saved layout.
+ *
+ * Header title width is pretext-measured in `header-title-width.ts`; the tool
+ * row is simply the reader's surfaced zone. No DOM capacity partition.
+ * Dialogs opened from menus live in `toolbarOverlays`, mounted outside those menus.
  */
 export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToolbarResult {
 	const {
@@ -368,10 +297,11 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 	 *
 	 * These three render their own Menu in the header, so there is nothing for
 	 * `activateToolbarEntry` to toggle. Before this, the menu listed them as a dead
-	 * row labelled "header only" — and on a phone the header keeps two icons while
-	 * everything else lives in that menu, so the detail level and the execution
-	 * device had NO reachable entry point at all. Returning the same option rows the
-	 * header's dropdown uses keeps the two surfaces in step by construction.
+	 * row labelled "header only" — and on a narrow row the header may keep only a
+	 * couple of icons while everything else lives in that menu, so the detail level
+	 * and the execution device had NO reachable entry point at all. Returning the
+	 * same option rows the header's dropdown uses keeps the two surfaces in step by
+	 * construction.
 	 *
 	 * Every id whose registry entry is `selfContained` must be handled here; an
 	 * unhandled one silently reverts to the informational row.

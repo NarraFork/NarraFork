@@ -29,12 +29,12 @@ function question(id = "question-1", overrides: Partial<AsyncQuestion> = {}): As
 		toolCallId: `call-${id}`,
 		toolUseId: `use-${id}`,
 		questions: [
-			{ question: "Notes?", header: "Notes" },
+			{ id: "notes", header: "Notes?" },
 			{
-				question: "Choice?",
-				header: "Choice",
+				id: "choice",
+				header: "Choice?",
 				multiSelect: true,
-				options: [{ label: "A", preview: "preview" }],
+				options: [{ header: "A", preview: "preview" }],
 			},
 		],
 		answers: null,
@@ -191,37 +191,37 @@ describe("useNarratorAsyncQuestionSlots", () => {
 		await setQuestions([question(), question("hidden", { toolUseId: "" })]);
 		expect(slots).not.toBe(empty);
 		expect(slots.size).toBe(1);
-		expect(slot()).toEqual({
-			id: "question-1",
-			draftId: "call-question-1",
-			questions: [
-				{ question: "Notes?", header: "Notes", options: [] },
-				{
-					question: "Choice?",
-					header: "Choice",
-					multiSelect: true,
-					options: [{ label: "A", description: "", preview: "preview" }],
-				},
-			],
-			busy: false,
-			denyLabel: narratorEn.asyncQuestionDismiss,
-			awaited: false,
-			awaitedLabel: narratorEn.asyncQuestionAwaitedNotice,
-			onSubmit: expect.any(Function),
-			onDismiss: expect.any(Function),
-		});
+		const slotValue = slot();
+		expect(slotValue.id).toBe("question-1");
+		expect(slotValue.draftId).toBe("call-question-1");
+		expect(slotValue.questions).toEqual([
+			{ id: "notes", header: "Notes?", options: [] },
+			{
+				id: "choice",
+				header: "Choice?",
+				multiSelect: true,
+				// coerce omits empty option descriptions
+				options: [{ header: "A", preview: "preview" }],
+			},
+		]);
+		expect(slotValue.busy).toBe(false);
+		expect(slotValue.denyLabel).toBe(narratorEn.asyncQuestionDismiss);
+		expect(slotValue.awaited).toBe(false);
+		expect(slotValue.awaitedLabel).toBe(narratorEn.asyncQuestionAwaitedNotice);
+		expect(typeof slotValue.onSubmit).toBe("function");
+		expect(typeof slotValue.onDismiss).toBe("function");
 		const added = slots;
 		await render(1);
 		expect(slots).toBe(added);
 		await setQuestions([
 			question("question-1", {
 				awaited: true,
-				questions: [{ question: "Updated?", header: "Update" }],
+				questions: [{ id: "updated", header: "Update?" }],
 			}),
 		]);
 		expect(slots).not.toBe(added);
 		expect(slot().awaited).toBe(true);
-		expect(slot().questions[0]?.question).toBe("Updated?");
+		expect(slot().questions[0]?.header).toBe("Update?");
 		const updated = slots;
 		await setQuestions([]);
 		expect(slots).not.toBe(updated);

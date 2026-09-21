@@ -16,11 +16,12 @@
  *
  * Self-contained entries (the detail-level and execution-device pickers, the
  * plugin picker) expand INLINE here via `renderInlineOptions`. They used to render
- * as a dead row labelled "header only", which on a phone meant no reachable entry
- * point at all: the header keeps two icons at that width and everything else lives
- * in this menu. The expansion is a `Collapse` rather than `Menu.Sub` because
- * Mantine's submenu opens on hover or ArrowRight only — neither exists on touch,
- * which is the platform this fixes (same reasoning as CompactMenuSub).
+ * as a dead row labelled "header only", which on a narrow row meant no reachable
+ * entry point at all: after the title floor only a couple of icons fit, and
+ * everything else lives in this menu. The expansion is a `Collapse` rather than
+ * `Menu.Sub` because Mantine's submenu opens on hover or ArrowRight only — neither
+ * exists on touch, which is the platform this fixes (same reasoning as
+ * CompactMenuSub).
  */
 
 import {

@@ -76,10 +76,10 @@ export interface NarratorToolbarItemDef {
 	 * "activated" through the panel-toggle switch.
 	 *
 	 * In the overflow menu such a row expands its options INLINE instead
-	 * (`renderInlineOptions`), because a phone keeps only two icons in the header
-	 * and everything else lives in that menu — the row used to be a dead
-	 * "header only" hint, which left these controls with no reachable entry point
-	 * at all on mobile.
+	 * (`renderInlineOptions`), because a narrow row may keep only a couple of icons
+	 * in the header after the title floor and everything else lives in that menu —
+	 * the row used to be a dead "header only" hint, which left these controls with
+	 * no reachable entry point at all on mobile.
 	 */
 	selfContained?: boolean;
 }

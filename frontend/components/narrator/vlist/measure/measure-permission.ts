@@ -235,15 +235,17 @@ export function permButtonBarHeight(rows: number): number {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface AskQuestionOptionData {
-	/** Option label text (wraps). */
-	label: string;
-	/** Optional description text under the label (wraps). */
+	/** Option title text (wraps). */
+	header: string;
+	/** Optional description text under the header (wraps). */
 	description?: string;
 }
 
 export interface AskQuestionData {
-	/** Question header text (Text sm/500, wraps). */
+	/** Full question text (Text sm/500, wraps). */
 	header: string;
+	/** Optional extra context under the header (Text sm, wraps). */
+	description?: string;
 	/** Selectable options (Checkbox when multiSelect, else Radio). */
 	options: AskQuestionOptionData[];
 	/** multiSelect → Checkbox squares; otherwise → Radio circles. */
@@ -308,6 +310,7 @@ export interface InlinePermissionData {
 
 export type AskBlockRole =
 	| "header"
+	| "description"
 	| "option-label"
 	| "option-desc"
 	| "custom-answer"
@@ -459,11 +462,26 @@ export function measureAskUserQuestion(
 			ALERT_STACK_GAP,
 		);
 
+		// Optional question description under the header (Text size="sm" dimmed).
+		if (q.description?.trim()) {
+			push(
+				makeInline(
+					q.description,
+					typographyMetrics().font.body,
+					scaledLineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm),
+					0,
+					"vlist-ask-description",
+				),
+				{ role: "description", questionIndex: qi },
+				QUESTION_STACK_GAP,
+			);
+		}
+
 		// Options (Checkbox / Radio rows).
 		if (q.options.length > 0) {
 			const control: "checkbox" | "radio" = q.multiSelect ? "checkbox" : "radio";
 			q.options.forEach((opt, oi) => {
-				// First option is separated from the header by the question Stack gap;
+				// First option is separated from the header/description by the question Stack gap;
 				// subsequent options by the tighter options Stack gap.
 				const labelMt = oi === 0 ? QUESTION_STACK_GAP : OPTIONS_GAP;
 				// Live typography, like the header above. These read frozen baseline
@@ -473,7 +491,7 @@ export function measureAskUserQuestion(
 				// `block.lineHeight`, so measure is the only authority and this is the fix.
 				push(
 					makeInline(
-						opt.label,
+						opt.header,
 						typographyMetrics().font.body,
 						scaledLineBoxHeight(FONT_SIZE.sm, LINE_HEIGHT.sm),
 						OPTION_INDENT,

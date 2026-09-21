@@ -32,11 +32,11 @@ const SIBLING = "p5-sibling";
 const USER = "p5-user";
 const QUESTIONS = [
 	{
-		question: "cache",
+		id: "cache",
 		header: "Which cache?",
 		options: [
-			{ label: "Memory", description: "Local" },
-			{ label: "Disk", description: "Persistent" },
+			{ header: "Memory", description: "Local" },
+			{ header: "Disk", description: "Persistent" },
 		],
 	},
 ];

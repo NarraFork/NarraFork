@@ -215,6 +215,7 @@ import {
 import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
 import { requireAdmin } from "../middleware/auth";
 import { isExecutionSuspended } from "../services/agent-runtime/ownership";
+import { coerceAskQuestions } from "../services/ask-user-question-coerce";
 import { generateAskUserQuestionAnswers } from "../services/ask-user-question-reflection";
 import {
 	hasBrokenModelMigrationUndo,
@@ -5603,7 +5604,8 @@ narratorRoutes.post("/:id/suggest-answers", async (c) => {
 	const body = await c.req.json();
 	const parsed = suggestAnswersSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const { questions } = parsed.data;
+	// Normalize legacy/advertised shapes before reflection; answers are keyed by header.
+	const questions = coerceAskQuestions(parsed.data.questions);
 	const answers = await generateAskUserQuestionAnswers(id, questions, {
 		locale,
 		model: narrator.model,

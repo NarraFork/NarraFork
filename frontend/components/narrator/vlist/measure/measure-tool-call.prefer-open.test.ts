@@ -75,7 +75,7 @@ describe("preferOpen — ask cards default-expand at low LOD, fold still wins", 
 									{
 										header: "Approach?",
 										omitHeader: false,
-										options: [{ label: "Alpha", description: "First", selected: true }],
+										options: [{ header: "Alpha", description: "First", selected: true }],
 									},
 								],
 							},

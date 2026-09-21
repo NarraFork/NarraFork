@@ -35,7 +35,7 @@ export function useNarratorToolbarLayout({
 	/**
 	 * `null` = no cap: `visible` holds every surfaced entry. The narrator header
 	 * passes `null` and applies its own MEASURED capacity afterwards
-	 * (`useNarratorHeaderToolbarCapacity`), which needs the uncapped count as its
+	 * (title-first arithmetic in `header-title-width.ts`), which needs the uncapped count as its
 	 * input.
 	 */
 	visibleLimit: number | null;

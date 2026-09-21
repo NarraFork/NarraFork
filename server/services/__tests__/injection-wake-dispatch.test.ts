@@ -50,7 +50,7 @@ const resumeCalls: ResumeCall[] = [];
 const resumePrincipals: unknown[] = [];
 let resumeStarted = true;
 let resumeThrows: Error | null = null;
-let activeResumeRuns = new Set<string>();
+const activeResumeRuns = new Set<string>();
 const realSubagentResume = { ...(await import("../subagent-resume")) };
 mock.module("../subagent-resume", () => ({
 	...realSubagentResume,
@@ -192,7 +192,6 @@ describe("parent injection initiating user", () => {
 	});
 });
 
-
 describe("an idle SUBAGENT recipient", () => {
 	test("an async question answer persists to the child before dispatching its original resume path", async () => {
 		seedNarrator(PARENT_ID);
@@ -228,15 +227,26 @@ describe("an idle SUBAGENT recipient", () => {
 			status: "success",
 			createdAt: now,
 		});
-		const { record } = await questions.createAsyncQuestion({
+		// Seed the open question row directly: this suite is about WAKE DISPATCH after
+		// an answer, not about whether a subagent may call AskUserQuestion (runtime
+		// policy currently disables that capability for subagents).
+		const { narratorQuestions } = await import("../../db/schema");
+		const questionId = "wake-q-record";
+		await db.insert(narratorQuestions).values({
+			id: questionId,
 			narratorId: SUB_ID,
 			toolCallId: "wake-q-call",
 			toolUseId: "wake-q-use",
-			executionPrincipal: { version: 1, userId: "wake-original-user" },
-			questions: [{ question: "direction", header: "Which direction?", options: [] }],
+			// Stored shape is the coerced advertised form; answers are keyed by header.
+			questionsJson: [{ id: "direction", header: "Which direction?", options: [] }],
+			executionPrincipalJson: { version: 1, userId: "wake-original-user" },
+			status: "open",
+			origin: "agent_async",
+			createdAt: now,
 		});
-		const answer = await questions.answerAsyncQuestion(record.id, {
-			answers: { direction: "keep compatibility" },
+		const answer = await questions.answerAsyncQuestion(questionId, {
+			// Model-facing answers are keyed by question header.
+			answers: { "Which direction?": "keep compatibility" },
 			userId: "wake-answer-user",
 			locale: "en",
 		});

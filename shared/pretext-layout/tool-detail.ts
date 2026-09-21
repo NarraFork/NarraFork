@@ -241,9 +241,9 @@ export const ASK_OPTIONS_MAX = 8;
 
 /** One option of a read-only AskUserQuestion replay. */
 export interface ToolAskOption {
-	/** Option label (wraps). */
-	label: string;
-	/** Option description under the label (wraps). */
+	/** Option title (wraps). */
+	header: string;
+	/** Option description under the header (wraps). */
 	description?: string;
 	/** Whether the submitted answer selected this option (multi-select aware). */
 	selected?: boolean;
@@ -251,8 +251,10 @@ export interface ToolAskOption {
 
 /** One question of a read-only AskUserQuestion replay. */
 export interface ToolAskQuestion {
-	/** Question header (wraps). */
+	/** Full question text (wraps). */
 	header: string;
+	/** Optional extra context under the header. */
+	description?: string;
 	/**
 	 * True when the card's own header summary already shows this exact text (the
 	 * single-question case), so the detail region must not repeat it.
@@ -2062,7 +2064,11 @@ function classifySend(
 
 interface AskQuestion {
 	header?: string;
+	description?: string;
+	/** Legacy fields kept only so history still renders. */
 	question?: string;
+	content?: string;
+	id?: string;
 	options?: unknown[];
 	multiSelect?: boolean;
 }
@@ -2093,6 +2099,15 @@ function nonEmptyString(value: unknown): string | undefined {
 	return value.trim().length > 0 ? value : undefined;
 }
 
+/** True when a legacy string looks like a machine key rather than display text. */
+function isAskKeyLike(value: string): boolean {
+	const trimmed = value.trim();
+	if (!trimmed || trimmed === "undefined" || trimmed === "null") return false;
+	if (trimmed.length > 40) return false;
+	if (/[？?！!：:\n]/.test(trimmed)) return false;
+	return /^[A-Za-z0-9][\w.-]*$/.test(trimmed) || trimmed.length <= 24;
+}
+
 /**
  * Split a multi-select answer (`"Alpha, Beta"`) into its parts. Mirrors
  * `splitAnswerParts` in frontend/components/narrator/question/ask-user-question-utils.ts
@@ -2118,10 +2133,9 @@ function askOptionSelected(answer: string | undefined, optionLabel: string): boo
  * Resolve the submitted answer for one question.
  *
  * Mirrors `resolveSavedAnswer` in ask-user-question-utils.ts: the answers map is
- * keyed by the tool's `question` field, but providers occasionally omit it (the
- * UI then falls back to `header`), and a single-question call whose key drifted
- * still has exactly one answer to show. Reading only `answers[question]` — the
- * previous behaviour — rendered those cases as unanswered.
+ * keyed by the question `header` (the only field the advertised schema guarantees).
+ * Legacy keys (`id`, old `question`) and a single-question fallback still work so
+ * older stored calls do not render as unanswered.
  */
 function resolveAskAnswer(
 	q: AskQuestion,
@@ -2129,11 +2143,12 @@ function resolveAskAnswer(
 	answers: Record<string, unknown>,
 	allowSingleAnswerFallback: boolean,
 ): string | undefined {
-	const byQuestion =
-		typeof q.question === "string" ? nonEmptyString(answers[q.question]) : undefined;
-	if (byQuestion) return byQuestion;
 	const byHeader = nonEmptyString(answers[header]);
 	if (byHeader) return byHeader;
+	const byId = typeof q.id === "string" ? nonEmptyString(answers[q.id]) : undefined;
+	if (byId) return byId;
+	const byLegacy = typeof q.question === "string" ? nonEmptyString(answers[q.question]) : undefined;
+	if (byLegacy) return byLegacy;
 	if (allowSingleAnswerFallback) {
 		const values = Object.values(answers)
 			.map(nonEmptyString)
@@ -2168,23 +2183,40 @@ function classifyAsk(
 
 	const questions: ToolAskQuestion[] = [];
 	for (const q of rawQuestions.slice(0, ASK_QUESTIONS_MAX)) {
-		const headerText = readLeafText(q.header);
-		const header = headerText?.trim() ? headerText : "Question";
+		// Advertised shape: short header + full description. Legacy bodies may sit in
+		// content/question; keep the short title as header when both exist.
+		const rawHeader = readLeafText(q.header);
+		const rawDescription = readLeafText(q.description);
+		const rawContent = readLeafText(q.content);
+		const rawLegacyBody =
+			typeof q.question === "string" && !isAskKeyLike(q.question) ? q.question : undefined;
+		const body = rawDescription || rawContent || rawLegacyBody;
+		const header = rawHeader?.trim() ? rawHeader : (body?.split("\n")[0] ?? "Question");
+		const description =
+			body && body !== header
+				? body
+				: rawDescription && rawDescription !== header
+					? rawDescription
+					: undefined;
 		const answer = resolveAskAnswer(q, header, answers, omitHeader);
 		const rawOptions = Array.isArray(q.options) ? q.options : [];
 		const options: ToolAskOption[] = [];
 		const optionLabels: string[] = [];
 		for (const opt of rawOptions.slice(0, ASK_OPTIONS_MAX)) {
 			const o = asObject(opt);
-			const label = (o ? readLeafText(o.label) : undefined) ?? "";
+			const optionHeader =
+				(o ? readLeafText(o.header) : undefined) ??
+				(o ? readLeafText(o.label) : undefined) ??
+				(o ? readLeafText(o.title) : undefined) ??
+				"";
 			// The option DESCRIPTION is half the information in the banner; carrying
-			// only the label dropped it entirely.
-			const description = (o ? readLeafText(o.description) : undefined) ?? "";
-			if (label) optionLabels.push(label);
+			// only the header dropped it entirely.
+			const descriptionText = (o ? readLeafText(o.description) : undefined) ?? "";
+			if (optionHeader) optionLabels.push(optionHeader);
 			options.push({
-				label,
-				...(description ? { description } : {}),
-				...(askOptionSelected(answer, label) ? { selected: true } : {}),
+				header: optionHeader,
+				...(descriptionText ? { description: descriptionText } : {}),
+				...(askOptionSelected(answer, optionHeader) ? { selected: true } : {}),
 			});
 		}
 		// An answer matching no option (or no combination of options) is free text.
@@ -2197,6 +2229,7 @@ function classifyAsk(
 			);
 		questions.push({
 			header,
+			...(description && description !== header ? { description } : {}),
 			...(omitHeader ? { omitHeader: true } : {}),
 			...(q.multiSelect === true ? { multiSelect: true } : {}),
 			options,

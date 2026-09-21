@@ -5,6 +5,7 @@ import {
 	getCustomSavedAnswer,
 	getSelectedOptionValue,
 	isSavedOptionSelected,
+	resolveSavedAnswer,
 } from "./ask-user-question-utils";
 
 describe("formatHMS", () => {
@@ -23,83 +24,95 @@ describe("formatHMS", () => {
 });
 
 describe("ask-user-question-utils", () => {
-	test("replaces missing or placeholder question keys with stable non-empty keys", () => {
+	test("coerces advertised short-header + description shape", () => {
 		const questions = coerceQuestions([
 			{
-				question: "undefined",
 				header: "测试策略",
-				options: [{ label: "坚持全修", description: "修复全部测试" }],
-				multiSelect: false,
-			},
-			{
-				header: "测试策略",
-				options: [{ label: "另立 spec", description: "拆出规格" }],
-				multiSelect: false,
+				description: "是否坚持全修全部测试？",
+				options: [{ header: "坚持全修", description: "修复全部测试" }],
 			},
 		]);
 
-		expect(questions.map((q) => q.question)).toEqual(["测试策略", "测试策略 (2)"]);
-		expect(questions.every((q) => q.question !== "undefined")).toBe(true);
+		expect(questions[0]?.header).toBe("测试策略");
+		expect(questions[0]?.description).toBe("是否坚持全修全部测试？");
+		expect(questions[0]?.options[0]?.header).toBe("坚持全修");
 	});
 
-	test("parses stringified questions and normalizes option labels", () => {
+	test("maps legacy short header + long question body into title/description", () => {
+		const body = "背景很长……最终怎么选？";
+		const questions = coerceQuestions([
+			{
+				question: body,
+				header: "短标题",
+				options: [{ label: "A", description: "desc" }],
+			},
+		]);
+
+		expect(questions[0]?.header).toBe("短标题");
+		expect(questions[0]?.description).toBe(body);
+		expect(questions[0]?.options[0]?.header).toBe("A");
+	});
+
+	test("parses stringified questions and normalizes option headers", () => {
 		const questions = coerceQuestions(
 			JSON.stringify([
 				{
-					question: " approach ",
 					header: "  Approach  ",
-					options: [{ label: " 坚持全修 ", description: "desc", preview: "preview" }],
+					description: " Which implementation approach? ",
+					options: [{ header: " 坚持全修 ", description: "desc", preview: "preview" }],
 				},
 			]),
 		);
 
-		expect(questions).toEqual([
-			{
-				question: "approach",
-				header: "Approach",
-				options: [{ label: "坚持全修", description: "desc", preview: "preview" }],
-				multiSelect: false,
-			},
-		]);
+		expect(questions[0]?.header).toBe("Approach");
+		expect(questions[0]?.description).toBe("Which implementation approach?");
+		expect(questions[0]?.options[0]).toEqual({
+			header: "坚持全修",
+			description: "desc",
+			preview: "preview",
+		});
 	});
 
-	test("matches read-only answers by normalized option parts", () => {
+	test("uniquifies colliding headers so answer keys stay unique", () => {
+		const questions = coerceQuestions([
+			{ header: "Approach", options: [{ header: "A" }] },
+			{ header: "Approach", options: [{ header: "B" }] },
+		]);
+		expect(questions.map((q) => q.header)).toEqual(["Approach", "Approach (2)"]);
+	});
+
+	test("matches read-only answers by header first", () => {
 		const [question] = coerceQuestions([
 			{
-				question: "strategy",
 				header: "测试策略",
-				options: [
-					{ label: "修有价值那几类", description: "" },
-					{ label: "坚持全修", description: "" },
-				],
+				options: [{ header: "修有价值那几类" }, { header: "坚持全修" }],
 			},
 		]);
 
-		expect(getSelectedOptionValue(question, { strategy: " 坚持全修 " })).toBe("坚持全修");
+		expect(getSelectedOptionValue(question, { 测试策略: " 坚持全修 " })).toBe("坚持全修");
 		expect(
-			isSavedOptionSelected(question, "坚持全修", { strategy: "修有价值那几类, 坚持全修" }),
+			isSavedOptionSelected(question, "坚持全修", { 测试策略: "修有价值那几类, 坚持全修" }),
 		).toBe(true);
-		expect(getCustomSavedAnswer(question, { strategy: "使用其它方案" })).toBe("使用其它方案");
+		expect(getCustomSavedAnswer(question, { 测试策略: "使用其它方案" })).toBe("使用其它方案");
 	});
 
-	test("matches read-only option labels that contain commas", () => {
+	test("matches read-only option headers that contain commas", () => {
 		const [question] = coerceQuestions([
 			{
-				question: "strategy",
 				header: "Strategy",
-				options: [{ label: "Fix parser, then tests", description: "" }],
+				options: [{ header: "Fix parser, then tests" }],
 			},
 		]);
 
-		expect(getSelectedOptionValue(question, { strategy: "Fix parser, then tests" })).toBe(
+		expect(getSelectedOptionValue(question, { Strategy: "Fix parser, then tests" })).toBe(
 			"Fix parser, then tests",
 		);
 		expect(
 			isSavedOptionSelected(question, "Fix parser, then tests", {
-				strategy: "Fix parser, then tests",
+				Strategy: "Fix parser, then tests",
 			}),
 		).toBe(true);
-		expect(getCustomSavedAnswer(question, { strategy: "Fix parser, then tests" })).toBeUndefined();
+		expect(getCustomSavedAnswer(question, { Strategy: "Fix parser, then tests" })).toBeUndefined();
 	});
 
 	test("uses a single legacy answer value when the original answer key was malformed", () => {
@@ -107,7 +120,7 @@ describe("ask-user-question-utils", () => {
 			{
 				question: "undefined",
 				header: "测试策略",
-				options: [{ label: "坚持全修", description: "" }],
+				options: [{ header: "坚持全修" }],
 			},
 		]);
 
@@ -118,5 +131,6 @@ describe("ask-user-question-utils", () => {
 				{ allowSingleAnswerFallback: true },
 			),
 		).toBe("坚持全修");
+		expect(resolveSavedAnswer(question, { [question.header]: "坚持全修" })).toBe("坚持全修");
 	});
 });

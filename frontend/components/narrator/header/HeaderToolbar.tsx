@@ -1,40 +1,36 @@
 import { ActionIcon, Group, Tooltip } from "@mantine/core";
 import { IconFlask, IconX } from "@tabler/icons-react";
-import { memo, type RefObject } from "react";
+import { memo, useMemo } from "react";
 import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
 import { NarratorToolbarItem, type NarratorToolbarItemProps } from "./NarratorToolbarItem";
 import { NarratorToolbarOverflowMenu } from "./NarratorToolbarOverflowMenu";
-import { HEADER_TOOLBAR_FIXED_ATTR } from "./narrator-header-toolbar-capacity";
+import {
+	HEADER_TOOLBAR_FIXED_ATTR,
+	selectHeaderToolbarEntries,
+} from "./narrator-header-toolbar-capacity";
 import type { NarratorToolbarHost } from "./narrator-toolbar-items";
-import { useHeaderToolbarCapacityPartition } from "./use-header-toolbar";
 
 export interface HeaderToolbarProps extends Omit<NarratorToolbarItemProps, "def" | "mode"> {
-	headerRowRef: RefObject<HTMLDivElement | null>;
-	headerToolbarRef: RefObject<HTMLDivElement | null>;
-	headerLeadingRef: RefObject<HTMLDivElement | null>;
-	hostOwnsTitle: boolean;
-	isWorkspacePreview: boolean;
-	isMobileViewport: boolean;
 	headerHostCapabilities: readonly NarratorToolbarHost[];
 	openArchiveConfirm: () => void;
 	archiveMutation: { isPending: boolean };
 	dock: NarratorDockContextValue | null;
 	mockStreamEnabled: boolean;
 	onClose?: () => void;
+	/**
+	 * How many surfaced tools fit AFTER the full pretext-measured title reserved
+	 * its width (`resolveHeaderLayoutAfterTitle`). Not a flex result.
+	 */
+	visibleToolCount: number;
 }
 
 /**
- * Header tool row. Width capacity lives HERE so icon collapse/expand re-renders
- * this row (and its overflow menu), not the whole NarratorPanel.
+ * Tool row on the right. Visible slice comes from precise title-first
+ * arithmetic; the remainder stays in the overflow menu. No flex fight with
+ * the title.
  */
 export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarProps) {
 	const {
-		headerRowRef,
-		headerToolbarRef,
-		headerLeadingRef,
-		hostOwnsTitle,
-		isWorkspacePreview,
-		isMobileViewport,
 		headerHostCapabilities,
 		toolbarBadgeCounts,
 		openArchiveConfirm,
@@ -44,30 +40,38 @@ export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarPro
 		onClose,
 		t,
 		controller,
+		visibleToolCount,
 	} = props;
-	const { toolbarVisibleDefs, toolbarHiddenDefs, toolbarNoRoomIds } =
-		useHeaderToolbarCapacityPartition({
-			surfacedDefs: controller.toolbarSurfacedDefs,
-			tuckedDefs: controller.toolbarTuckedDefs,
-			headerRowRef,
-			headerToolbarRef,
-			headerLeadingRef,
-			hostOwnsTitle,
-			isWorkspacePreview,
-			isMobileViewport,
-		});
 	const { toolbarEntries, saveToolbarLayout, activateToolbarEntry, renderToolbarInlineOptions } =
 		controller;
+	const surfaced = controller.toolbarSurfacedDefs;
+	// Keep the tested partition helper on the production path: visible = first N
+	// surfaced entries after title-first arithmetic; the rest join tucked defs.
+	const selection = useMemo(
+		() => selectHeaderToolbarEntries(surfaced, visibleToolCount),
+		[surfaced, visibleToolCount],
+	);
+	const visibleDefs = selection.visible;
+	const noRoomDefs = selection.hidden;
+	const hiddenDefs = useMemo(
+		() => [...noRoomDefs, ...controller.toolbarTuckedDefs],
+		[noRoomDefs, controller.toolbarTuckedDefs],
+	);
+	const noRoomIds = useMemo(() => noRoomDefs.map((d) => d.id as string), [noRoomDefs]);
+
 	return (
-		<Group ref={headerToolbarRef} gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
-			{toolbarVisibleDefs.map((def) => (
+		<Group
+			gap="xs"
+			wrap="nowrap"
+			style={{ flex: "0 0 auto", marginLeft: "auto" }}
+			{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
+		>
+			{visibleDefs.map((def) => (
 				<NarratorToolbarItem key={def.id} {...props} def={def} />
 			))}
-			{/* Debug-only entry intentionally stays outside the persisted registry. */}
 			{dock && mockStreamEnabled && (
 				<Tooltip label="Mock stream (debug)">
 					<ActionIcon
-						{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
 						size="sm"
 						variant={dock.openToolTypes.has("mock") ? "light" : "subtle"}
 						color={dock.openToolTypes.has("mock") ? "indigo" : "gray"}
@@ -79,8 +83,8 @@ export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarPro
 			)}
 			<NarratorToolbarOverflowMenu
 				entries={toolbarEntries}
-				hiddenDefs={toolbarHiddenDefs}
-				noRoomIds={toolbarNoRoomIds}
+				hiddenDefs={hiddenDefs}
+				noRoomIds={noRoomIds}
 				onSaveLayout={saveToolbarLayout}
 				hostCapabilities={headerHostCapabilities}
 				badgeCounts={toolbarBadgeCounts}

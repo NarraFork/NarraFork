@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test";
 import {
-	MOBILE_TOOLBAR_VISIBLE_LIMIT,
 	NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID,
 	NARRATOR_TOOLBAR_DIVIDER_ID,
 	NARRATOR_TOOLBAR_IDS,
@@ -226,13 +225,13 @@ describe("partitionToolbar", () => {
 		expect(overflow).toHaveLength(0);
 	});
 
-	it("caps the mobile host and pushes the remainder into the overflow menu", () => {
+	it("caps the host when a caller passes a numeric limit and pushes the rest to overflow", () => {
 		const { visible, overflow } = partitionToolbar({
 			entries: all,
 			hostCapabilities: ["drawer", "inline"],
-			visibleLimit: MOBILE_TOOLBAR_VISIBLE_LIMIT,
+			visibleLimit: 2,
 		});
-		expect(visible).toHaveLength(MOBILE_TOOLBAR_VISIBLE_LIMIT);
+		expect(visible).toHaveLength(2);
 		expect(overflow.length).toBeGreaterThan(0);
 	});
 
@@ -266,10 +265,11 @@ describe("partitionToolbar", () => {
 	it("offers git/search/browser/userchat on a mobile (drawer) host", () => {
 		// The regression this whole change exists for: these four had no mobile
 		// entry point at all, because the header gated them behind `dock`.
+		// Uncapped: the header measures width separately; availability is the point.
 		const { visible, overflow } = partitionToolbar({
 			entries: all,
 			hostCapabilities: ["drawer", "inline"],
-			visibleLimit: MOBILE_TOOLBAR_VISIBLE_LIMIT,
+			visibleLimit: null,
 		});
 		const reachable = [...visible, ...overflow].map((d) => d.id as string);
 		for (const id of ["git", "search", "browser", "userchat"]) {
@@ -400,13 +400,13 @@ describe("partitionToolbar", () => {
 			const capped = partitionToolbar({
 				entries: all,
 				hostCapabilities: ["drawer", "inline"],
-				visibleLimit: MOBILE_TOOLBAR_VISIBLE_LIMIT,
+				visibleLimit: 2,
 				entryEnabled: () => true,
 			});
 			const uncapped = partitionToolbar({
 				entries: all,
 				hostCapabilities: ["drawer", "inline"],
-				visibleLimit: MOBILE_TOOLBAR_VISIBLE_LIMIT,
+				visibleLimit: 2,
 			});
 			expect(capped.visible.map((d) => d.id)).toEqual(uncapped.visible.map((d) => d.id));
 			expect(capped.overflow.map((d) => d.id)).toEqual(uncapped.overflow.map((d) => d.id));

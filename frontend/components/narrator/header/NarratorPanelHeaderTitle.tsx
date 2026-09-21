@@ -1,4 +1,4 @@
-import { ActionIcon, Group, Text, TextInput } from "@mantine/core";
+import { ActionIcon, Text, TextInput } from "@mantine/core";
 import { IconPencil, IconSparkles } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { HEADER_TITLE_SLOT_ATTR } from "./narrator-header-toolbar-capacity";
@@ -6,26 +6,28 @@ import { useTitleEditing } from "./use-title-editing";
 
 export interface NarratorPanelHeaderTitleProps {
 	narratorId: string;
-	/** Current narrator (read for the existing title); may be undefined while loading. */
 	narrator: { title?: string | null } | undefined;
-	/** When a host (e.g. a chapter node) already renders the title + edit controls. */
 	hostOwnsTitle: boolean;
 	isWorkspacePreview: boolean;
+	/**
+	 * COMPLETE title width from pretext (`headerTitleLayoutWidth(fullTitle)`).
+	 * The title box is FIXED to this value — tools are fitted around it in
+	 * `resolveHeaderLayoutAfterTitle`, never the reverse.
+	 */
+	titleFullWidth: number;
 }
 
 /**
- * The header's title slot: inline-editable title + edit/generate buttons. Owns
- * its own `useTitleEditing` hook rather than receiving its nine outputs as props,
- * since none of them are read anywhere outside this slot.
- *
- * `HEADER_TITLE_SLOT_ATTR` marks the wrapping Group so the toolbar capacity
- * measurement budgets the slot by policy (see narrator-header-toolbar-capacity).
+ * Title box with a FIXED pretext-measured width. `flex: 0 0 auto` — buttons
+ * cannot shrink it via flex. Ellipsis applies when the host floored
+ * `titleFullWidth` below the true text width (pathological narrow row).
  */
 export function NarratorPanelHeaderTitle({
 	narratorId,
 	narrator,
 	hostOwnsTitle,
 	isWorkspacePreview,
+	titleFullWidth,
 }: NarratorPanelHeaderTitleProps) {
 	const { t } = useTranslation("narrator");
 	const {
@@ -40,13 +42,22 @@ export function NarratorPanelHeaderTitle({
 		handleTitleKeyDown,
 	} = useTitleEditing({ narratorId, narrator, t });
 	const displayTitle = narrator?.title || t("untitled");
+	const ownsTitleChrome = hostOwnsTitle || isWorkspacePreview;
+	const boxWidth = ownsTitleChrome ? 0 : titleFullWidth;
 
 	return (
-		<Group
+		<div
 			{...{ [HEADER_TITLE_SLOT_ATTR]: "" }}
-			gap={4}
-			style={{ flex: 1, minWidth: 0 }}
-			wrap="nowrap"
+			data-header-title-width={boxWidth}
+			style={{
+				display: "flex",
+				alignItems: "center",
+				gap: 4,
+				flexWrap: "nowrap",
+				// Shrink-to-fit: total = fixed title box + action icons. Tools never
+				// flex this down — they are omitted by resolveHeaderLayoutAfterTitle.
+				flex: "0 0 auto",
+			}}
 		>
 			{hostOwnsTitle ? null : editingTitle && !isWorkspacePreview ? (
 				<TextInput
@@ -56,7 +67,7 @@ export function NarratorPanelHeaderTitle({
 					onKeyDown={handleTitleKeyDown}
 					onBlur={saveTitle}
 					size="xs"
-					style={{ flex: 1, maxWidth: 500 }}
+					style={{ flex: "0 0 auto", width: Math.max(boxWidth, 120) }}
 				/>
 			) : (
 				<Text
@@ -64,11 +75,14 @@ export function NarratorPanelHeaderTitle({
 					fw={500}
 					onDoubleClick={isWorkspacePreview ? undefined : startEditingTitle}
 					style={{
-						cursor: isWorkspacePreview ? "default" : "pointer",
+						// FIXED full-title width from pretext — not flex:auto.
+						flex: "0 0 auto",
+						width: boxWidth,
+						maxWidth: boxWidth,
 						overflow: "hidden",
 						textOverflow: "ellipsis",
 						whiteSpace: "nowrap",
-						maxWidth: 500,
+						cursor: isWorkspacePreview ? "default" : "pointer",
 					}}
 					title={displayTitle}
 				>
@@ -77,7 +91,13 @@ export function NarratorPanelHeaderTitle({
 			)}
 			{!isWorkspacePreview && !hostOwnsTitle && (
 				<>
-					<ActionIcon size="xs" variant="subtle" onClick={startEditingTitle} title={t("editTitle")}>
+					<ActionIcon
+						size="xs"
+						variant="subtle"
+						onClick={startEditingTitle}
+						title={t("editTitle")}
+						style={{ flex: "0 0 auto" }}
+					>
 						<IconPencil size={12} />
 					</ActionIcon>
 					<ActionIcon
@@ -86,11 +106,12 @@ export function NarratorPanelHeaderTitle({
 						onClick={handleGenerateTitle}
 						loading={generatingTitle}
 						title={t("generateTitle")}
+						style={{ flex: "0 0 auto" }}
 					>
 						<IconSparkles size={12} />
 					</ActionIcon>
 				</>
 			)}
-		</Group>
+		</div>
 	);
 }

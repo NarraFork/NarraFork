@@ -72,7 +72,7 @@ function question(row: HumanAttentionItem): AsyncQuestion {
 		narratorId: row.narratorId,
 		toolCallId: row.toolCallId,
 		toolUseId: `use-${row.requestId}`,
-		questions: [{ question: "notes", header: "Notes?", options: [] }],
+		questions: [{ id: "notes", header: "Notes?", options: [] }],
 		answers: null,
 		status: "open",
 		origin: "user_deferred",

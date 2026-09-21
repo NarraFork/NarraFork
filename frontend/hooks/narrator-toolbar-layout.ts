@@ -1,7 +1,6 @@
 /** Pure normalization, serialization and partition rules for the three toolbar zones. */
 import {
 	isNarratorToolbarId,
-	MOBILE_TOOLBAR_VISIBLE_LIMIT,
 	NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID,
 	NARRATOR_TOOLBAR_DIVIDER_ID,
 	type NarratorToolbarId,
@@ -14,11 +13,7 @@ import {
 	narratorToolbarItem,
 } from "../components/narrator/header/narrator-toolbar-items";
 
-export {
-	MOBILE_TOOLBAR_VISIBLE_LIMIT,
-	NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID,
-	NARRATOR_TOOLBAR_DIVIDER_ID,
-};
+export { NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID, NARRATOR_TOOLBAR_DIVIDER_ID };
 
 export type NarratorToolbarEntry =
 	| { kind: "item"; id: NarratorToolbarId }

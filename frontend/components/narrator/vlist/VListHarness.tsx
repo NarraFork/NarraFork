@@ -299,8 +299,11 @@ const ASK_QUESTION_DATA: AskUserQuestionData = {
 		{
 			header: "Which flow mode should be the default for new projects?",
 			options: [
-				{ label: "Classic canvas", description: "Interactive React Flow story-network graph." },
-				{ label: "Ruler timeline", description: "Linear chronological view of chapters." },
+				{
+					header: "Classic canvas",
+					description: "Interactive React Flow story-network graph.",
+				},
+				{ header: "Ruler timeline", description: "Linear chronological view of chapters." },
 			],
 			multiSelect: false,
 		},
@@ -312,8 +315,11 @@ const ASK_QUESTION_READONLY: AskUserQuestionData = {
 		{
 			header: "Which flow mode should be the default for new projects?",
 			options: [
-				{ label: "Classic canvas", description: "Interactive React Flow story-network graph." },
-				{ label: "Ruler timeline", description: "Linear chronological view of chapters." },
+				{
+					header: "Classic canvas",
+					description: "Interactive React Flow story-network graph.",
+				},
+				{ header: "Ruler timeline", description: "Linear chronological view of chapters." },
 			],
 			multiSelect: false,
 			savedCustomAnswer: "Classic canvas felt more intuitive for branching work.",
@@ -394,12 +400,12 @@ const TOOL_CALL_ASK: ToolCallData = {
 							omitHeader: true,
 							options: [
 								{
-									label: "Classic canvas",
+									header: "Classic canvas",
 									description:
 										"Interactive React Flow story-network graph with drag, context menus.",
 								},
 								{
-									label: "Ruler timeline",
+									header: "Ruler timeline",
 									description: "Linear chronological view of chapters.",
 									selected: true,
 								},

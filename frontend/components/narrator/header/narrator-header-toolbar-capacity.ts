@@ -151,9 +151,10 @@ export interface HeaderToolbarSelection<T> {
  * level, execution device, plugin picker) on the row LONGEST, because the overflow
  * menu could only list them as a dead "header only" row. The menu now expands their
  * options inline, so the exception lost its premise — and it was actively harmful:
- * those three sit at the END of the default order, so on a phone (capacity 2) the
- * header showed exactly them while background tasks, terminal, git and search were
- * all collapsed. The two least-reached controls occupied the entire row.
+ * those three sit at the END of the default order, so whenever measurement left
+ * only two slots (narrow phone after the title floor) the header showed exactly
+ * them while background tasks, terminal, git and search were all collapsed. The
+ * two least-reached controls occupied the entire row.
  */
 export function selectHeaderToolbarEntries<T extends HeaderToolbarCandidate>(
 	defs: readonly T[],

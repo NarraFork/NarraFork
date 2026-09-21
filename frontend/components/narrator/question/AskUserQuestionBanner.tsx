@@ -259,35 +259,40 @@ export function AskUserQuestionBanner({
 		if (draftKey !== requestId) removeSession("ask-draft", requestId);
 	}, [readOnly, draftKey, requestId, selections, customInputs]);
 
-	// Custom input takes priority when non-empty
-	const getAnswer = (question: string) => {
-		const custom = customInputs[question]?.trim();
-		return custom || selections[question] || "";
+	// Custom input takes priority when non-empty. Drafts are keyed by internal `id`;
+	// model-facing answers are keyed by `header`.
+	const getAnswer = (draftId: string) => {
+		const custom = customInputs[draftId]?.trim();
+		return custom || selections[draftId] || "";
 	};
-	const handleRadioChange = (question: string, value: string) => {
+	const handleRadioChange = (draftId: string, value: string) => {
 		disarmReflection();
-		setSelections((prev) => ({ ...prev, [question]: value }));
+		setSelections((prev) => ({ ...prev, [draftId]: value }));
 	};
 
-	const handleCheckboxChange = (question: string, label: string, checked: boolean) => {
+	const handleCheckboxChange = (draftId: string, optionHeader: string, checked: boolean) => {
 		disarmReflection();
-		const current = selections[question] ? selections[question].split(", ") : [];
-		const updated = checked ? [...current, label] : current.filter((v) => v !== label);
-		setSelections((prev) => ({ ...prev, [question]: updated.join(", ") }));
+		const current = selections[draftId] ? selections[draftId].split(", ") : [];
+		const updated = checked
+			? [...current, optionHeader]
+			: current.filter((v) => v !== optionHeader);
+		setSelections((prev) => ({ ...prev, [draftId]: updated.join(", ") }));
 	};
 
-	const handleCustomInput = (question: string, value: string) => {
+	const handleCustomInput = (draftId: string, value: string) => {
 		disarmReflection();
-		setCustomInputs((prev) => ({ ...prev, [question]: value }));
+		setCustomInputs((prev) => ({ ...prev, [draftId]: value }));
 	};
 
-	const allAnswered = questions.every((q) => getAnswer(q.question));
+	const allAnswered = questions.every((q) => getAnswer(q.id));
 
 	const handleSubmit = () => {
 		if (!allAnswered) return;
 		const answers: Record<string, string> = {};
 		for (const q of questions) {
-			answers[q.question] = getAnswer(q.question);
+			// Models only see header + description; key answers by the uniquified header.
+			// Coerce guarantees headers do not collide, so this cannot overwrite.
+			answers[q.header] = getAnswer(q.id);
 		}
 		removeSession("ask-draft", draftKey);
 		onSubmit?.(requestId, answers);
@@ -312,44 +317,45 @@ export function AskUserQuestionBanner({
 				<Stack gap="md">
 					{questions.map((q, questionIndex) => {
 						const allowSingleAnswerFallback = questions.length === 1;
-						const hasCustom = readOnly ? false : !!customInputs[q.question]?.trim();
+						const hasCustom = readOnly ? false : !!customInputs[q.id]?.trim();
 						const savedAnswer = readOnly
 							? resolveSavedAnswer(q, savedAnswers, { allowSingleAnswerFallback })
 							: undefined;
 						const customAnswer = readOnly
 							? getCustomSavedAnswer(q, savedAnswers, { allowSingleAnswerFallback })
 							: undefined;
-						const questionKey = `${q.question}-${questionIndex}`;
+						const questionKey = `${q.id}-${questionIndex}`;
 						return (
 							<Stack key={questionKey} gap="xs">
-								<Text size="sm" fw={500}>
+								<Text size="sm" fw={500} style={{ whiteSpace: "pre-wrap" }}>
 									{q.header}
 								</Text>
+								{q.description ? (
+									<Text size="sm" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
+										{q.description}
+									</Text>
+								) : null}
 								{q.options.length > 0 &&
 									(q.multiSelect ? (
 										<Stack gap={4}>
 											{q.options.map((opt) => (
 												<Checkbox
-													key={opt.label}
-													label={opt.label}
+													key={opt.header}
+													label={opt.header}
 													description={opt.description}
 													disabled={readOnly || hasCustom}
 													checked={
 														readOnly
-															? isSavedOptionSelected(q, opt.label, savedAnswers, {
+															? isSavedOptionSelected(q, opt.header, savedAnswers, {
 																	allowSingleAnswerFallback,
 																})
-															: (selections[q.question]?.split(", ").includes(opt.label) ?? false)
+															: (selections[q.id]?.split(", ").includes(opt.header) ?? false)
 													}
 													onChange={
 														readOnly
 															? undefined
 															: (e) =>
-																	handleCheckboxChange(
-																		q.question,
-																		opt.label,
-																		e.currentTarget.checked,
-																	)
+																	handleCheckboxChange(q.id, opt.header, e.currentTarget.checked)
 													}
 												/>
 											))}
@@ -362,16 +368,16 @@ export function AskUserQuestionBanner({
 													? getSelectedOptionValue(q, savedAnswers, { allowSingleAnswerFallback })
 													: hasCustom
 														? ""
-														: (selections[q.question] ?? "")
+														: (selections[q.id] ?? "")
 											}
-											onChange={readOnly ? () => {} : (val) => handleRadioChange(q.question, val)}
+											onChange={readOnly ? () => {} : (val) => handleRadioChange(q.id, val)}
 										>
 											<Stack gap={4}>
 												{q.options.map((opt) => (
 													<Radio
-														key={opt.label}
-														value={opt.label}
-														label={opt.label}
+														key={opt.header}
+														value={opt.header}
+														label={opt.header}
 														description={opt.description}
 														disabled={readOnly || hasCustom}
 													/>
@@ -389,8 +395,8 @@ export function AskUserQuestionBanner({
 									<Textarea
 										size="xs"
 										placeholder={t("typeCustomAnswer")}
-										value={customInputs[q.question] ?? ""}
-										onChange={(e) => handleCustomInput(q.question, e.currentTarget.value)}
+										value={customInputs[q.id] ?? ""}
+										onChange={(e) => handleCustomInput(q.id, e.currentTarget.value)}
 										autosize
 										minRows={1}
 										maxRows={3}

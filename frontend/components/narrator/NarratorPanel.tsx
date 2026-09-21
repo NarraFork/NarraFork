@@ -39,7 +39,16 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+	lazy,
+	Suspense,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
@@ -129,6 +138,12 @@ import {
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { HeaderToolbar } from "./header/HeaderToolbar";
+import {
+	HEADER_LEADING_GAP_PX,
+	HEADER_ROW_PADDING_PX,
+	headerTitleLayoutWidth,
+	resolveHeaderLayoutAfterTitle,
+} from "./header/header-title-width";
 import { NarratorPanelHeaderTitle } from "./header/NarratorPanelHeaderTitle";
 import { buildBottomToolbarActions } from "./header/NarratorToolbarItem";
 import {
@@ -660,13 +675,32 @@ export function NarratorPanel({
 	const hostOwnsTitle = dock?.hostOwnsTitle === true;
 
 	/*
-	 * Header geometry for the tool-row capacity measurement. The ROW is the budget
-	 * source: its width does not depend on how many entries are inline, which is
-	 * what keeps the decision from cascading (see narrator-header-toolbar-capacity).
+	 * Title-first header arithmetic (no flex fight):
+	 *   1. W = pretext measure of the COMPLETE title string
+	 *   2. Title box = W (fixed)
+	 *   3. Tools = resolveHeaderLayoutAfterTitle(rowWidth, W, …) → how many fit
 	 */
 	const headerRowRef = useRef<HTMLDivElement>(null);
-	const headerLeadingRef = useRef<HTMLDivElement>(null);
-	const headerToolbarRef = useRef<HTMLDivElement>(null);
+	const [headerRowWidth, setHeaderRowWidth] = useState(0);
+	useLayoutEffect(() => {
+		const el = headerRowRef.current;
+		if (!el) return;
+		const read = () => setHeaderRowWidth(el.getBoundingClientRect().width);
+		read();
+		if (typeof ResizeObserver === "undefined") {
+			window.addEventListener("resize", read);
+			return () => window.removeEventListener("resize", read);
+		}
+		const ro = new ResizeObserver(read);
+		ro.observe(el);
+		return () => ro.disconnect();
+	}, []);
+
+	const headerDisplayTitle = narrator?.title || t("untitled");
+	const headerTitleFullWidth = useMemo(() => {
+		if (hostOwnsTitle || isWorkspacePreview) return 0;
+		return headerTitleLayoutWidth(headerDisplayTitle);
+	}, [hostOwnsTitle, isWorkspacePreview, headerDisplayTitle]);
 
 	// Resolve the effective model: when following default, use the actual default
 	// model value; when using a model aggregation, resolve to a representative
@@ -2622,6 +2656,28 @@ export function NarratorPanel({
 		openPluginPanel,
 		t,
 	});
+
+	/** Title-first: full pretext W fixed, then tools packed into the remainder. */
+	const headerLayout = useMemo(
+		() =>
+			resolveHeaderLayoutAfterTitle({
+				rowWidth: headerRowWidth,
+				titleFullWidth: headerTitleFullWidth,
+				showBack: !isWorkspacePreview,
+				showTitleActions: !hostOwnsTitle && !isWorkspacePreview,
+				surfacedToolCount: toolbarController.toolbarSurfacedDefs.length,
+				showClose: !!onClose,
+			}),
+		[
+			headerRowWidth,
+			headerTitleFullWidth,
+			isWorkspacePreview,
+			hostOwnsTitle,
+			toolbarController.toolbarSurfacedDefs.length,
+			onClose,
+		],
+	);
+
 	// Memoized so header capacity changes do not rebuild bottom actions on every
 	// incidental panel render; capacity itself lives inside HeaderToolbar.
 	const toolbarInlineControls = useMemo(
@@ -2888,16 +2944,21 @@ export function NarratorPanel({
 					/>
 					{/* Drop overlay */}
 					<DropOverlay visible={isDragging} />
-					{/* Header */}
-					<Group
+					{/* Header — title-first arithmetic, single flex row, no flex fight:
+					    fixed title @ pretext W, then only tools that fit after it. */}
+					<div
 						ref={headerRowRef}
-						justify="space-between"
-						py="xs"
-						px="md"
 						className={onHeaderPointerDown ? "nf-panel-header" : undefined}
 						style={{
+							display: "flex",
+							alignItems: "center",
+							flexWrap: "nowrap",
+							// Must match HEADER_ROW_GAP_PX / HEADER_LEADING_GAP_PX in header-title-width.
+							gap: HEADER_LEADING_GAP_PX,
+							padding: `8px ${HEADER_ROW_PADDING_PX / 2}px`,
 							borderBottom: "1px solid var(--mantine-color-default-border)",
 							flexShrink: 0,
+							overflow: "hidden",
 							cursor: onHeaderPointerDown ? "grab" : undefined,
 						}}
 						onPointerDown={
@@ -2911,7 +2972,19 @@ export function NarratorPanel({
 								: undefined
 						}
 					>
-						<Group ref={headerLeadingRef} gap="xs" style={{ flex: 1, minWidth: 0 }}>
+						{/* Leading: fixed chrome + title; does not flex-shrink the title away. */}
+						<div
+							style={{
+								display: "flex",
+								alignItems: "center",
+								gap: HEADER_LEADING_GAP_PX,
+								flexWrap: "nowrap",
+								flex: "0 0 auto",
+								minWidth: 0,
+								maxWidth: "100%",
+								overflow: "hidden",
+							}}
+						>
 							{!isWorkspacePreview &&
 								(onMinimize ? (
 									<Tooltip label={t("backToGraph")} position="right">
@@ -2977,28 +3050,23 @@ export function NarratorPanel({
 								narrator={narrator}
 								hostOwnsTitle={hostOwnsTitle}
 								isWorkspacePreview={isWorkspacePreview}
+								titleFullWidth={headerLayout.titleWidth}
 							/>
 							{disconnected && !isWorkspacePreview && (
 								<Badge
 									size="xs"
 									variant="dot"
 									color="red"
-									style={{ cursor: "pointer" }}
+									style={{ cursor: "pointer", flex: "0 0 auto" }}
 									onClick={reconnect}
 									title={t("reconnect")}
 								>
 									{t("disconnected")}
 								</Badge>
 							)}
-						</Group>
+						</div>
 						{!isWorkspacePreview && (
 							<HeaderToolbar
-								headerRowRef={headerRowRef}
-								headerToolbarRef={headerToolbarRef}
-								headerLeadingRef={headerLeadingRef}
-								hostOwnsTitle={hostOwnsTitle}
-								isWorkspacePreview={isWorkspacePreview}
-								isMobileViewport={isMobileViewport}
 								narratorId={narratorId}
 								controller={toolbarController}
 								inlineControls={toolbarInlineControls}
@@ -3009,10 +3077,11 @@ export function NarratorPanel({
 								dock={dock}
 								mockStreamEnabled={mockStreamEnabled}
 								onClose={onClose}
+								visibleToolCount={headerLayout.visibleToolCount}
 								t={t}
 							/>
 						)}
-					</Group>
+					</div>
 
 					<LeakedToolCallModal
 						narratorId={narratorId}
