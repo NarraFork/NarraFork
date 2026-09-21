@@ -75,6 +75,10 @@ export const treeSitterProvider: StructureProvider = {
 		return result.nodes;
 	},
 
+	async isOutlineTruncated(doc: StructDocument): Promise<boolean> {
+		return (await parseOutline(doc)).truncated;
+	},
+
 	async locate(doc: StructDocument, selector: StructSelector): Promise<LocatedNode[]> {
 		const { nodes } = await parseOutline(doc);
 		return locateInOutline(nodes, selector);

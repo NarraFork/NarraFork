@@ -301,6 +301,18 @@ export const structViewTool: ToolDefinition = {
 					: "Result is approximate.",
 			);
 		}
+		// Calls and JSX trees do not consume the outline. All other structural modes
+		// must disclose missing declarations, even when the parser itself is exact.
+		if (
+			mode !== "calls" &&
+			mode !== "tree" &&
+			(await resolved.provider.isOutlineTruncated?.(doc))
+		) {
+			notes.push(
+				"Outline truncated by a traversal/output budget; declarations may be missing. " +
+					"Symbol-based edits/stashes are disabled; use explicit line ranges instead.",
+			);
+		}
 		if (truncatedRead) {
 			notes.push(
 				`File exceeds ${MAX_FILE_BYTES / 1024 / 1024} MB and was truncated before parsing; ` +
