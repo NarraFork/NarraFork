@@ -12,6 +12,7 @@ import type {
 	ToolCallRecord,
 	TreeMessage,
 } from "@frontend/lib/api";
+import { mergeToolLifecycleRecord } from "@shared/tool-row-status";
 
 interface ToolCall {
 	toolUseId: string;
@@ -220,12 +221,17 @@ function hasToolUseInMessage(msg: TreeMessage, toolUseId: string | null | undefi
  * Merge fields while preserving a persisted tool input when the incoming input
  * only contains streaming progress markers. Started/permission updates still
  * replace the full input object as before.
+ *
+ * Status is phase-ranked: a late snapshot must not move a tool BACKWARDS
+ * (`running` over a live-patched `success`). That regression is exactly how a
+ * finished call keeps its spinner until the next structural reload.
  */
-function mergeToolFields<T extends { inputJson?: unknown; outputJson?: unknown }>(
+function mergeToolFields<T extends { inputJson?: unknown; outputJson?: unknown; status?: unknown }>(
 	existing: T,
 	fields: Record<string, unknown>,
 ): T & Record<string, unknown> {
-	const merged = { ...existing, ...fields } as T & Record<string, unknown>;
+	const lifecycle = mergeToolLifecycleRecord(existing, fields);
+	const merged = { ...existing, ...fields, ...lifecycle } as T & Record<string, unknown>;
 	const incomingInput = fields.inputJson;
 	if (
 		isRecord(incomingInput) &&

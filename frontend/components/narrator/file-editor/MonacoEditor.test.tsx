@@ -140,10 +140,13 @@ function flushFrames(): void {
 	}
 }
 
+let windowMouseUp: (() => void) | null = null;
+
 beforeEach(() => {
 	frames = new Map();
 	frameSequence = 0;
 	themeColors = null;
+	windowMouseUp = null;
 	const { window } = parseHTML("<html><body></body></html>");
 	Object.defineProperty(window, "getComputedStyle", {
 		configurable: true,
@@ -156,6 +159,17 @@ beforeEach(() => {
 		configurable: true,
 		value: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
 	});
+	const originalAdd = window.addEventListener.bind(window);
+	const originalRemove = window.removeEventListener.bind(window);
+	window.addEventListener = ((type: string, listener: EventListenerOrEventListenerObject) => {
+		if (type === "mouseup" && typeof listener === "function")
+			windowMouseUp = () => listener(new Event("mouseup"));
+		return originalAdd(type as keyof WindowEventMap, listener as EventListener);
+	}) as typeof window.addEventListener;
+	window.removeEventListener = ((type: string, listener: EventListenerOrEventListenerObject) => {
+		if (type === "mouseup") windowMouseUp = null;
+		return originalRemove(type as keyof WindowEventMap, listener as EventListener);
+	}) as typeof window.removeEventListener;
 	for (const [key, value] of Object.entries({
 		window,
 		document: window.document,
@@ -515,6 +529,28 @@ test("document-only cursor recovery does not acquire ownership, keyboard selecti
 	expect(selectionChange).toHaveBeenLastCalledWith(selected, false);
 	views[0].cursor.emit({ selection: selected, reason: 3 } as editor.ICursorSelectionChangedEvent);
 	expect(selectionChange).toHaveBeenLastCalledWith(selected, true);
+});
+
+test("mouse drag-select coalesces cursor events until pointer end", async () => {
+	await render();
+	const view = views[0];
+	const mid = { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 3 };
+	const final = { startLineNumber: 1, startColumn: 1, endLineNumber: 2, endColumn: 3 };
+	view.mouse.emit({
+		event: { leftButton: true },
+		target: { type: api.editor.MouseTargetType.CONTENT_TEXT },
+	} as editor.IEditorMouseEvent);
+	await act(async () => {});
+	selectionChange.mockClear();
+	view.selection = mid;
+	view.cursor.emit({ selection: mid, reason: 3 } as editor.ICursorSelectionChangedEvent);
+	view.selection = final;
+	view.cursor.emit({ selection: final, reason: 3 } as editor.ICursorSelectionChangedEvent);
+	expect(selectionChange).not.toHaveBeenCalled();
+	expect(windowMouseUp).toBeTruthy();
+	windowMouseUp?.();
+	expect(selectionChange).toHaveBeenCalledTimes(1);
+	expect(selectionChange).toHaveBeenLastCalledWith(final, true);
 });
 
 test("shortcuts use latest callbacks and readonly blocks toolbar history commands", async () => {

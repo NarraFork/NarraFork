@@ -33,6 +33,11 @@ import {
 } from "@shared/communication-tool";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import {
+	isLiveToolStatusRegression,
+	LIVE_TOOL_PHASE_RANK,
+	mergeToolLifecycleRecord,
+} from "@shared/tool-row-status";
+import {
 	completeStreamingFieldRanges,
 	foldStreamingToolFields,
 	getToolOutputPreview,
@@ -182,54 +187,15 @@ export interface ToolStartedEvent {
 }
 
 /**
- * Lifecycle phases a live tool entry can be in, ordered. Used ONLY to stop a late
- * event from moving a tool BACKWARDS (see `resolveLiveToolStatus`).
+ * Lifecycle rank + regression guard live in `@shared/tool-row-status` so the
+ * streaming store, document upserts and live patches share ONE rule.
  *
- * `pending` deliberately shares rank 1 with `initializing`: it is a sibling outcome
- * of the permission gate ("waiting on a human"), not a later phase, and the events
- * that set it are authoritative in their own right.
+ * ⚠️ `tool_started` can arrive AFTER `tool_executing` (eager execution), and a
+ * message upsert can carry a snapshot older than a live-patched completion.
+ * Both would otherwise move a tool BACKWARDS — `initializing` over `running`,
+ * or `running` over `success` — which is exactly "status lags by one call".
  */
-const LIVE_TOOL_PHASE_RANK: Readonly<Record<string, number>> = {
-	streaming: 0,
-	initializing: 1,
-	pending: 1,
-	running: 2,
-	// Anything terminal outranks everything: a completed tool must never reopen.
-	success: 3,
-	completed: 3,
-	fail: 3,
-	failed: 3,
-	error: 3,
-	cancelled: 3,
-	canceled: 3,
-	aborted: 3,
-	denied: 3,
-	timeout: 3,
-};
-
-/**
- * Whether moving from `existing` to `incoming` would take a tool BACKWARDS.
- *
- * ⚠️ This exists because the server does NOT guarantee event order. `loop.ts` starts
- * eager execution BEFORE it yields `tool_call` (:3514-3538), so for the majority of
- * tools `tool_executing` reaches the client first and `tool_started` lands after it.
- * Without this guard, `tool_started`'s `initializing` would overwrite `running` and a
- * tool that is demonstrably executing would fall back to the neutral shimmer.
- *
- * Unknown statuses never count as a regression, because refusing an unrecognised
- * status would silently freeze a card on a state this frontend does understand — the
- * worse failure of the two.
- *
- * Exported so the persisted-document channel (`vlist-live-patch`) applies the SAME
- * rule as the live store; two copies of an ordering rule is how they drift.
- */
-export function isLiveToolStatusRegression(existing: unknown, incoming: unknown): boolean {
-	if (typeof existing !== "string" || typeof incoming !== "string") return false;
-	const existingRank = LIVE_TOOL_PHASE_RANK[existing];
-	const incomingRank = LIVE_TOOL_PHASE_RANK[incoming];
-	if (existingRank === undefined || incomingRank === undefined) return false;
-	return existingRank > incomingRank;
-}
+export { isLiveToolStatusRegression, LIVE_TOOL_PHASE_RANK, mergeToolLifecycleRecord };
 
 /** The status a live entry should keep when an event carrying `incoming` arrives. */
 function resolveLiveToolStatus(existing: string | undefined, incoming: string): string {

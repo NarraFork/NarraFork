@@ -142,6 +142,9 @@ function FileEditorDocument({
 	tRef.current = t;
 	const scope = useFileReferenceScope();
 	const publishSelection = onFileReferenceSelectionChange ?? scope.setSelection;
+	// Session callbacks outlive renders; always invoke the latest publisher.
+	const publishSelectionRef = useRef(publishSelection);
+	publishSelectionRef.current = publishSelection;
 	const origin = useRef(referenceOrigin);
 	origin.current = referenceOrigin;
 	const editorRef = useRef<MonacoEditorHandle | null>(null);
@@ -152,7 +155,9 @@ function FileEditorDocument({
 	const [state, setState] = useState<EditorSessionState | null>(null);
 	const [history, setHistory] = useState<MonacoDocumentStatus | null>(null);
 	const [editorError, setEditorError] = useState<string | null>(null);
-	const [editorSelection, setEditorSelection] = useState<FileSelection | null>(null);
+	// Selection is high-frequency during drag-select. Keep it in a ref so intermediate
+	// cursor moves never re-render this panel (or the dock context built from it).
+	const editorSelectionRef = useRef<FileSelection | null>(null);
 	const [lineWrapping, setLineWrapping] = useState(false);
 	const [searchOpen, setSearchOpen] = useState(false);
 	const readOnly = deviceId !== "local" || !narratorId;
@@ -201,7 +206,10 @@ function FileEditorDocument({
 				translate: (key, defaultValue) => tRef.current(`fileEditor.${key}`, { defaultValue }),
 				applyContent: (text, document) => {
 					const model = editorRef.current?.getModel();
-					setEditorSelection(null);
+					// Document identity changed: drop selection ownership without a React
+					// render storm. Non-explicit Monaco callbacks only clear the ref.
+					editorSelectionRef.current = null;
+					publishSelectionRef.current?.(null);
 					if (modeRef.current === "raw") {
 						setPreviewText(null);
 						setPreviewError(null);
@@ -312,7 +320,11 @@ function FileEditorDocument({
 	}, []);
 	const handleSelection = useCallback(
 		(next: FileSelection | null, explicit: boolean) => {
-			if (explicit)
+			const previous = editorSelectionRef.current;
+			editorSelectionRef.current = next;
+			// MonacoEditor already coalesces pointer-drag cursor events; this callback
+			// only runs for ownership-relevant moments (mouseup / keyboard / focus).
+			if (explicit) {
 				publishSelection?.(
 					session.state.baseHash && next
 						? {
@@ -324,14 +336,11 @@ function FileEditorDocument({
 						: null,
 					true,
 				);
-			setEditorSelection((old) =>
-				old?.startLineNumber === next?.startLineNumber &&
-				old?.startColumn === next?.startColumn &&
-				old?.endLineNumber === next?.endLineNumber &&
-				old?.endColumn === next?.endColumn
-					? old
-					: next,
-			);
+				return;
+			}
+			// Document flush / navigation reset clears the live selection without claiming
+			// ownership. Drop this panel's published selection if it owned one.
+			if (next === null && previous !== null) publishSelection?.(null, false);
 		},
 		[deviceId, filePath, publishSelection, session],
 	);
@@ -355,18 +364,23 @@ function FileEditorDocument({
 			controller.abort();
 		};
 	}, [dirty, phase, readOnly, session, revision, baseHash]);
+	// Metadata refresh for the panel's CURRENT selection when dirty/hash identity
+	// changes. Selection itself is not a dependency — drag-select must not re-enter
+	// this path. Identity publish remains explicit (handleSelection).
 	useEffect(() => {
+		if (!baseHash) return;
+		const next = editorSelectionRef.current;
 		publishSelection?.(
-			baseHash && editorSelection
+			next
 				? {
-						target: { deviceId, path: filePath, selection: editorSelection },
+						target: { deviceId, path: filePath, selection: next },
 						label: filePanelBaseName(filePath),
 						expectedHash: baseHash,
 						dirty,
 					}
 				: null,
 		);
-	}, [baseHash, deviceId, dirty, editorSelection, filePath, publishSelection]);
+	}, [baseHash, deviceId, dirty, filePath, publishSelection]);
 	useEffect(() => () => publishSelection?.(null), [publishSelection]);
 	useEffect(() => {
 		onDirtyChange?.(exitBlocked);

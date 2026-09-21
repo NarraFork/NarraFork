@@ -12,6 +12,7 @@ import {
 import { gitTargetKey } from "../../lib/api/git";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
 import { GitChangesTab } from "./GitChangesTab";
+import { GitCommitGraph } from "./GitCommitGraph";
 import { GitCommitsTab } from "./GitCommitsTab";
 import { GitStashTab } from "./GitStashTab";
 
@@ -106,7 +107,10 @@ function GitPanelContent({
 				</Alert>
 			)}
 			{view === "changes" ? (
-				<GitChangesTab target={target} onRefresh={refresh} onOpenSecondaryView={setView} />
+				<Box style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+					<GitChangesTab target={target} onRefresh={refresh} onOpenSecondaryView={setView} />
+					<GitCommitGraph target={target} />
+				</Box>
 			) : (
 				<Stack gap={0} style={{ flex: 1, minHeight: 0 }}>
 					<Group

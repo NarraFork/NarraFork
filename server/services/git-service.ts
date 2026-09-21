@@ -1977,13 +1977,15 @@ export const gitService = {
 			message: string;
 			author: string;
 			date: string;
+			/** git %P：父提交完整 SHA 数组；根提交为 []。 */
+			parents: string[];
 		}>
 	> {
 		const args = [
 			"log",
 			`--max-count=${opts.limit ?? 50}`,
 			`--skip=${opts.skip ?? 0}`,
-			"--format=%H%x00%h%x00%s%x00%an%x00%aI",
+			"--format=%H%x00%h%x00%s%x00%an%x00%aI%x00%P",
 		];
 		if (opts.branch) args.push(opts.branch);
 		const result = await execRead(args, worktreePath, true);
@@ -1998,13 +2000,14 @@ export const gitService = {
 			.trim()
 			.split("\n")
 			.map((line) => {
-				const [sha, shortSha, message, author, date] = line.split("\0");
+				const [sha, shortSha, message, author, date, parentsRaw] = line.split("\0");
 				return {
 					sha: sha ?? "",
 					shortSha: shortSha ?? "",
 					message: message ?? "",
 					author: author ?? "",
 					date: date ?? "",
+					parents: (parentsRaw ?? "").trim().split(/\s+/).filter(Boolean),
 				};
 			});
 	},

@@ -114,6 +114,7 @@
 		"streaming": "正在接收输入",
 		"reflecting": "正在审查",
 		"running": "正在执行",
+		"queued": "等待前面的工具完成",
 		"success": "已成功",
 		"failed": "已失败"
 	},
@@ -389,6 +390,9 @@
 	"modelGroupAggregations": "聚合",
 	"editDefaultModel": "修改默认模型",
 	"editSummaryModel": "修改摘要模型",
+	"modelActions": "模型操作",
+	"setAsDefaultModel": "设置为默认模型",
+	"setAsSummaryModel": "设置为摘要模型",
 	"defaultModelUpdated": "默认模型已更新",
 	"summaryModelUpdated": "摘要模型已更新",
 	"perm_default": "逐项询问",

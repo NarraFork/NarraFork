@@ -191,6 +191,7 @@ describe("runner publication waits for the exact parent tool transaction", () =>
 					finalText: "NEW RESULT",
 					hasError: false,
 					allowInboxWake: true,
+					finalUserId: null,
 				});
 				const originalConclusion = session.updateToolCallConclusion;
 				const conclusion = spyOn(session, "updateToolCallConclusion").mockImplementation(

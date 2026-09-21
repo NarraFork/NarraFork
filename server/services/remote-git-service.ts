@@ -208,8 +208,17 @@ export function createRemoteGitService(
 				.split("\n")
 				.filter(Boolean)
 				.map((line) => {
-					const [sha = "", shortSha = "", message = "", author = "", date = ""] = line.split("\0");
-					return { sha, shortSha, message, author, date };
+					const [sha = "", shortSha = "", message = "", author = "", date = "", parentsRaw] =
+						line.split("\0");
+					return {
+						sha,
+						shortSha,
+						message,
+						author,
+						date,
+						// 旧 executor 无 %P 时第 6 段不存在，解析为 []（字段存在但空）。
+						parents: (parentsRaw ?? "").trim().split(/\s+/).filter(Boolean),
+					};
 				});
 		},
 		stash: (cwd: string, message?: string, identity?: GitCommitIdentity) =>

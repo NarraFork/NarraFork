@@ -114,6 +114,24 @@ func TestGitWorkspaceLifecycle(t *testing.T) {
 	if !strings.HasPrefix(log, first) {
 		t.Fatalf("history pagination: %q", log)
 	}
+	// Format must stay in lockstep with server getLog: %H%x00%h%x00%s%x00%an%x00%aI%x00%P
+	// skip=1 is the root commit "initial" → parents segment present but empty.
+	rootFields := strings.Split(strings.SplitN(log, "\n", 2)[0], "\x00")
+	if len(rootFields) < 6 {
+		t.Fatalf("log format missing parents segment (want 6 fields, got %d): %q", len(rootFields), rootFields)
+	}
+	if rootFields[5] != "" {
+		t.Fatalf("root commit parents field: got %q want empty", rootFields[5])
+	}
+	// Newest commit has exactly one parent: the first commit.
+	headLog := gitCall(t, h, root, "log", map[string]any{"limit": 1, "skip": 0})["stdout"].(string)
+	headFields := strings.Split(strings.SplitN(headLog, "\n", 2)[0], "\x00")
+	if len(headFields) < 6 {
+		t.Fatalf("head log format missing parents segment: %q", headFields)
+	}
+	if headFields[5] != first {
+		t.Fatalf("head log parents field: got %q want %q", headFields[5], first)
+	}
 	gitCall(t, h, root, "reset", map[string]any{"mode": "soft", "target": first})
 	gitCall(t, h, root, "reset", map[string]any{"mode": "hard", "target": first})
 	if got := gitTestRun(t, root, "status", "--porcelain"); got != "" {

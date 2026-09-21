@@ -171,6 +171,7 @@ describe("git APIs", () => {
 							message: "base",
 							author: "Test User",
 							date: "2026-06-09T00:00:00Z",
+							parents: ["1111111111111111111111111111111111111111"],
 						},
 					];
 				} else if (url.endsWith("/git/ai-commit-message")) {
@@ -195,7 +196,9 @@ describe("git APIs", () => {
 		expect((await api.getGitDiff(chapterId, "src/file one.txt", true)).truncated).toBe(false);
 		expect((await api.getGitStashList(chapterId))[0]?.message).toBe("stash change");
 		expect((await api.gitStash(chapterId, { action: "apply", index: 0 })).hasConflicts).toBe(false);
-		expect((await api.getGitLog(chapterId, 5, 1))[0]?.shortSha).toBe("abcdef1");
+		const logEntry = (await api.getGitLog(chapterId, 5, 1))[0];
+		expect(logEntry?.shortSha).toBe("abcdef1");
+		expect(logEntry?.parents).toEqual(["1111111111111111111111111111111111111111"]);
 		expect((await api.gitReset(chapterId, "HEAD~1", "soft")).branch).toBe("main");
 		expect((await api.gitAiCommitMessage(chapterId)).message).toBe("fix: update file");
 

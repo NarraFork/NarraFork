@@ -603,7 +603,7 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 		if limit < 1 || limit > 200 || skip < 0 || skip > 1000000 {
 			return nil, fmt.Errorf("invalid Git history pagination")
 		}
-		args := []string{"log", fmt.Sprintf("--max-count=%d", limit), fmt.Sprintf("--skip=%d", skip), "--format=%H%x00%h%x00%s%x00%an%x00%aI"}
+		args := []string{"log", fmt.Sprintf("--max-count=%d", limit), fmt.Sprintf("--skip=%d", skip), "--format=%H%x00%h%x00%s%x00%an%x00%aI%x00%P"}
 		if branch := stringParam(params, "branch"); branch != "" {
 			if !validGitRevision(branch) {
 				return nil, fmt.Errorf("invalid Git revision")

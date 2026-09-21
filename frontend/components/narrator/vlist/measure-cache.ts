@@ -258,6 +258,10 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// rebuild serves the pre-takeover payload and the header stays silent about why
 	// the session stopped.
 	if (d.isTakenOver === true) rev += "|tv:1";
+	// Queued-behind-upstream shimmer. Height-neutral (a class name / aria label),
+	// keyed because an earlier sibling finishing is the ONLY event that clears it
+	// while this call's own status stays `initializing`.
+	if (d.queuedBehindUpstream === true) rev += "|tq:1";
 	// `+N -N` line counts. Height-neutral (a nowrap span in the fixed header row),
 	// keyed for the same reason `timeoutMs` and `isTakenOver` are: it is PAINTED from
 	// the cached payload and can APPEAR while nothing else in the key moves. Two such
@@ -405,6 +409,8 @@ function traceRevision(d: Record<string, unknown>): string {
 		// a gate resolving does not necessarily move the tool's own status, and a stale
 		// entry would keep a settled row purple.
 		if (typeof r.reflectionStatus === "string") rev += `|trs:${r.reflectionStatus}`;
+		// Same reason as the card-level `|tq:1` above: painted from the cached payload.
+		if (r.queuedBehindUpstream === true) rev += "|trq:1";
 		// Per-row `+N -N`, keyed for the same reason the card-level one above is.
 		rev += diffStatsRevision(r.diffStats);
 		// The row's duration is height-neutral but PAINTED from the cached payload, so

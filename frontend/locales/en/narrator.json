@@ -114,6 +114,7 @@
 		"streaming": "receiving input",
 		"reflecting": "under review",
 		"running": "running",
+		"queued": "waiting for earlier tools",
 		"success": "succeeded",
 		"failed": "failed"
 	},
@@ -390,6 +391,9 @@
 	"modelGroupAggregations": "Aggregations",
 	"editDefaultModel": "Change default model",
 	"editSummaryModel": "Change summary model",
+	"modelActions": "Model actions",
+	"setAsDefaultModel": "Set as default model",
+	"setAsSummaryModel": "Set as summary model",
 	"defaultModelUpdated": "Default model updated",
 	"summaryModelUpdated": "Summary model updated",
 	"perm_default": "Default",

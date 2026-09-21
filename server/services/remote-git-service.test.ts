@@ -115,6 +115,41 @@ test("remote patches retain truncation and structured lists reject partial recor
 	expect(await git.stashPop("/repo")).toEqual({ hasConflicts: true });
 });
 
+test("remote getLog parses parents from %P and tolerates old 5-field executor lines", async () => {
+	const f = backendFixture();
+	const git = createRemoteGitService(f.backend);
+	const mergeSha = "a".repeat(40);
+	const left = "b".repeat(40);
+	const right = "c".repeat(40);
+	const rootSha = "d".repeat(40);
+	// New executor: 6 fields, %P last. Old executor: 5 fields, no parents segment.
+	// Use \x00 (not \0): \0 followed by a digit would be parsed as an octal escape.
+	const sep = "\x00";
+	f.respond({
+		stdout: [
+			`${mergeSha}${sep}abc${sep}M${sep}Test${sep}2020-01-05T00:00:00Z${sep}${left} ${right}`,
+			`${rootSha}${sep}def${sep}seed${sep}Test${sep}2020-01-01T00:00:00Z${sep}`,
+			`${rootSha}${sep}def${sep}seed${sep}Test${sep}2020-01-01T00:00:00Z`,
+		].join("\n"),
+	});
+	const log = await git.getLog("/repo");
+	expect(log).toHaveLength(3);
+	expect(log[0]).toMatchObject({
+		sha: mergeSha,
+		shortSha: "abc",
+		message: "M",
+		parents: [left, right],
+	});
+	expect(log[1]?.parents).toEqual([]);
+	// Missing 6th field (old executor) still yields an empty parents array, not undefined.
+	expect(log[2]?.parents).toEqual([]);
+	for (const entry of log) {
+		expect(Array.isArray(entry.parents)).toBe(true);
+	}
+	f.respond({ stdout: "" });
+	expect(await git.getLog("/repo")).toEqual([]);
+});
+
 test("truncated remote status is incomplete rather than falsely clean", () => {
 	const emptyPrefix = parseRemoteGitStatus({ outputs: { status: "" }, truncated: true });
 	expect(emptyPrefix).toMatchObject({

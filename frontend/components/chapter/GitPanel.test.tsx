@@ -7,6 +7,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { type GitStatusSummary, invalidateWorkspaceQueries } from "../../hooks/useGit";
 import { __resetGitFolderPrefsCache } from "../../hooks/useGitFolderPrefs";
+import { __resetGitGraphCollapsedCache } from "../../hooks/useGitGraphCollapsed";
 import { __resetGitViewModeCache } from "../../hooks/useGitViewMode";
 import { api } from "../../lib/api";
 import { type GitTarget, type GitWorkspace, gitTargetKey } from "../../lib/api/git";
@@ -197,10 +198,23 @@ function makeDeepStatus(): GitStatusSummary {
 function stubInteractiveGitApi(calls: Array<{ name: string; body?: unknown }>) {
 	const original = {
 		getGitStatus: api.getGitStatus,
+		getGitLog: api.getGitLog,
 		gitStage: api.gitStage,
 		gitAiCommitMessage: api.gitAiCommitMessage,
 	};
 	api.getGitStatus = async () => makeStatus();
+	// GitCommitGraph fetches log via api.getGitLog (not React Query); without a
+	// non-empty stub the expanded graph hangs on the real HTTP timeout.
+	api.getGitLog = async () => [
+		{
+			sha: "abc1234",
+			shortSha: "abc1234",
+			message: "feat: seed commit for graph strip",
+			author: "tester",
+			date: "2026-01-01T00:00:00.000Z",
+			parents: [],
+		},
+	];
 	api.gitStage = async (_chapterId, body) => {
 		calls.push({ name: "stage", body });
 		return makeStatus();
@@ -313,6 +327,24 @@ describe("GitPanel", () => {
 		// fresh storage maps each test, so every cache must be reset between cases.
 		__resetGitFolderPrefsCache();
 		__resetGitViewModeCache();
+		__resetGitGraphCollapsedCache();
+		// Default stubs so GitCommitGraph never hits the real log endpoint.
+		const original = {
+			getGitStatus: api.getGitStatus,
+			getGitLog: api.getGitLog,
+		};
+		api.getGitStatus = async () => makeStatus();
+		api.getGitLog = async () => [
+			{
+				sha: "abc1234",
+				shortSha: "abc1234",
+				message: "feat: seed commit for graph strip",
+				author: "tester",
+				date: "2026-01-01T00:00:00.000Z",
+				parents: [],
+			},
+		];
+		restoreGitApi = () => Object.assign(api, original);
 		await initTestI18n();
 	});
 
@@ -350,10 +382,19 @@ describe("GitPanel", () => {
 			</I18nextProvider>,
 		);
 		await new Promise((resolve) => setTimeout(resolve, 0));
+		// GitCommitGraph fetches via api.getGitLog after mount; poll for the strip.
+		const deadline = Date.now() + 2000;
+		while (!container.textContent?.includes("feat: seed commit for graph strip")) {
+			if (Date.now() >= deadline) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
 
 		expect(container.textContent).toContain("Changes");
 		expect(container.textContent).toContain("Staged");
 		expect(container.textContent).toContain("Commit");
+		// Stage 3: collapsible commit graph sits under the changes list.
+		expect(container.textContent).toContain("Graph");
+		expect(container.textContent).toContain("feat: seed commit for graph strip");
 
 		// Nothing is expanded on a first visit: a repo with changes across many
 		// folders would otherwise open as one long undifferentiated file list, and

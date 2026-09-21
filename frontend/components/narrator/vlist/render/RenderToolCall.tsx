@@ -2016,6 +2016,7 @@ function useToolCardShimmerClass(
 	isStreaming: boolean,
 	hasPermission: boolean,
 	reflectionStatus: string | null,
+	queuedBehindUpstream?: boolean,
 ): string | undefined {
 	const prevStatusRef = useRef<ToolCallStatus | null>(null);
 	const [flash, setFlash] = useState<ToolShimmerFlash | null>(null);
@@ -2046,6 +2047,9 @@ function useToolCardShimmerClass(
 		status,
 		reflectionStatus,
 		hasPendingPermission: hasPermission,
+		// The adapter already walked the real provider-order prefix; this is its verdict,
+		// not a peer list. See `ToolShimmerPhaseInput.queuedBehindUpstream`.
+		queuedBehindUpstream,
 	});
 	if (phase) return CARD_SHIMMER_CLASS[phase];
 	if (flash) return CARD_SHIMMER_CLASS[flash];
@@ -2080,6 +2084,7 @@ export function RenderToolCall({
 		inRun,
 		isLast,
 		isStreaming,
+		queuedBehindUpstream,
 		category,
 		status,
 	} = measured;
@@ -2092,6 +2097,7 @@ export function RenderToolCall({
 		isStreaming,
 		permission != null,
 		reflection?.status ?? null,
+		queuedBehindUpstream,
 	);
 	const borderColor =
 		permission != null

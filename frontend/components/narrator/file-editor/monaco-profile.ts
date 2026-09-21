@@ -54,7 +54,8 @@ export function monacoEditorOptions(
 		scrollbar: { alwaysConsumeMouseWheel: true, useShadows: false },
 		overviewRulerLanes: 0,
 		overviewRulerBorder: false,
-		contextmenu: false,
+		// Built-in context menu; follows Monaco theme base (vs / vs-dark).
+		contextmenu: true,
 		automaticLayout: false,
 		padding: { top: 8, bottom: 8 },
 	};

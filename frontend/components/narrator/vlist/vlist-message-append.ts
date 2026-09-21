@@ -27,6 +27,7 @@
  * Pure: no React, no DOM, no network.
  */
 
+import { mergeToolLifecycleRecord } from "@shared/tool-row-status";
 import { contentBlockIdentity } from "../streaming/streaming-block-supersede";
 
 /** The subset of a message this module reads. */
@@ -179,14 +180,45 @@ export function upsertLoadedMessage<T extends AppendCandidate>(
 					return identity ? [[identity.id, { block, revision: identity.revision }] as const] : [];
 				}),
 			);
+			const previousTools = new Map(
+				previous.contentJson.flatMap((block) => {
+					const candidate = block as { type?: unknown; id?: unknown } | null;
+					if (candidate?.type !== "tool_use" || typeof candidate.id !== "string") return [];
+					return [[candidate.id, block] as const];
+				}),
+			);
 			contentJson = contentJson.map((block) => {
 				const identity = block && typeof block === "object" ? contentBlockIdentity(block) : null;
 				const existing = identity ? revisions.get(identity.id) : undefined;
-				return existing && identity && existing.revision > identity.revision
-					? existing.block
-					: block;
+				if (existing && identity && existing.revision > identity.revision) return existing.block;
+				// tool_use blocks have no stream revision identity. An upsert snapshot can
+				// still carry the pre-completion status; merge by toolUseId so a live-patched
+				// `success` is not overwritten by a stale `running`.
+				const candidate = block as { type?: unknown; id?: unknown } | null;
+				if (candidate?.type === "tool_use" && typeof candidate.id === "string") {
+					const prior = previousTools.get(candidate.id);
+					if (prior) {
+						return mergeToolLifecycleRecord(prior, block);
+					}
+				}
+				return block;
 			});
 		}
+		const previousToolCalls = new Map(
+			(Array.isArray(previous.toolCalls) ? previous.toolCalls : []).map((call) => {
+				const id = (call as { toolUseId?: unknown } | null)?.toolUseId;
+				return [typeof id === "string" ? id : "", call] as const;
+			}),
+		);
+		const incomingToolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
+		const toolCalls = incomingToolCalls.length
+			? incomingToolCalls.map((call) => {
+					const id = (call as { toolUseId?: unknown } | null)?.toolUseId;
+					const prior = typeof id === "string" ? previousToolCalls.get(id) : undefined;
+					if (!prior) return call;
+					return mergeToolLifecycleRecord(prior, call);
+				})
+			: previous.toolCalls;
 		const messages = [...loaded];
 		messages[sameId] = {
 			...previous,
@@ -197,7 +229,7 @@ export function upsertLoadedMessage<T extends AppendCandidate>(
 			// Projection broadcasts intentionally omit aggregate children/tool calls; retain
 			// the already-loaded rich tree while still applying canonical body/state fields.
 			children: message.children?.length ? message.children : previous.children,
-			toolCalls: message.toolCalls?.length ? message.toolCalls : previous.toolCalls,
+			toolCalls,
 		} as T;
 		return { messages, changed: true, appended: false };
 	}

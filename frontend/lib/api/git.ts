@@ -4,6 +4,17 @@ import type { ApiEntity } from "./types";
 
 export type { GitWorkspace } from "@shared/git-workspace";
 
+/** A single `git log` row. `parents` comes from git `%P` (full parent SHAs; root = []). */
+export interface GitLogEntry {
+	sha: string;
+	shortSha: string;
+	message: string;
+	author: string;
+	date: string;
+	/** git %P：父提交完整 SHA 数组；根提交为 []。旧远程可能缺失。 */
+	parents?: string[];
+}
+
 /** Strings remain the legacy chapter adapter; new callers carry a resolved workspace. */
 export type GitTarget =
 	| string
@@ -119,7 +130,7 @@ export const gitApi = {
 			body: writeBody(target, body),
 		}),
 	getGitLog: (target: GitTarget, limit = 50, skip = 0, signal?: AbortSignal) =>
-		gitRequest<ApiEntity[]>(gitReadPath(target, `/log?limit=${limit}&skip=${skip}`), { signal }),
+		gitRequest<GitLogEntry[]>(gitReadPath(target, `/log?limit=${limit}&skip=${skip}`), { signal }),
 	gitReset: (target: GitTarget, commit: string, mode: "soft" | "hard") =>
 		gitRequest<ApiEntity>(`${gitBasePath(target)}/reset`, {
 			method: "POST",

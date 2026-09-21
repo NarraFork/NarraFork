@@ -3364,10 +3364,13 @@ export function NarratorPanel({
 								aggregations,
 								providerLabels,
 								defaultModelValue,
+								summaryModelValue,
 								refreshProps: modelMenuRefreshProps,
 								mutation: modelMutation,
 								onEditDefaultModel: () => setGlobalModelEditTarget("default"),
 								onEditSummaryModel: () => setGlobalModelEditTarget("summary"),
+								onSetAsDefaultModel: handleSetDefaultModel,
+								onSetAsSummaryModel: handleSetSummaryModel,
 							},
 							quota: {
 								balance: quotaBalance,

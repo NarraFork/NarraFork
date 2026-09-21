@@ -81,6 +81,7 @@ interface RowInput {
 	shimmer?: boolean;
 	title?: string;
 	reflectionStatus?: string;
+	queuedBehindUpstream?: boolean;
 }
 
 function traceOf(rows: RowInput[]) {
@@ -139,6 +140,33 @@ describe("a folded trace row paints its shimmer state", () => {
 		expect(shimmerClasses(trace([{ status: "initializing" }]))).toEqual([
 			TRACE_SHIMMER_CLASS.streaming,
 		]);
+	});
+
+	it("parks QUEUED behind an earlier same-turn tool instead of streaming", () => {
+		// The three-way distinction: streaming (args arriving) vs running (executing)
+		// vs queued (args ready, blocked by an earlier call). Without
+		// `queuedBehindUpstream`, initializing still looks like streaming.
+		expect(
+			shimmerClasses(
+				trace([{ status: "running" }, { status: "initializing", queuedBehindUpstream: true }]),
+			),
+		).toEqual([TRACE_SHIMMER_CLASS.running, TRACE_SHIMMER_CLASS.queued]);
+		expect(
+			shimmerClasses(trace([{ status: "initializing", queuedBehindUpstream: false }])),
+		).toEqual([TRACE_SHIMMER_CLASS.streaming]);
+	});
+
+	it("names the queued state for readers who cannot use colour", () => {
+		const html = renderToStaticMarkup(
+			<MantineProvider defaultColorScheme="dark">
+				<RenderToolRun
+					measured={traceOf([{ status: "initializing", queuedBehindUpstream: true }])}
+					labels={{ shimmerState: { queued: "等待前面的工具完成" } }}
+				/>
+			</MantineProvider>,
+		);
+		expect(html).toContain("等待前面的工具完成");
+		expect(html).toContain(TRACE_SHIMMER_CLASS.queued);
 	});
 
 	it("goes SILENT when the row is waiting on the user", () => {

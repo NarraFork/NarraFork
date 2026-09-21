@@ -26,6 +26,8 @@ let frames: Map<number, FrameRequestCallback>;
 let nextFrame: number;
 let selected: string[];
 let refreshed: number;
+let setAsDefault: string[];
+let setAsSummary: string[];
 const previousGlobals = new Map<string, PropertyDescriptor | undefined>();
 
 beforeEach(async () => {
@@ -34,6 +36,8 @@ beforeEach(async () => {
 	nextFrame = 0;
 	selected = [];
 	refreshed = 0;
+	setAsDefault = [];
+	setAsSummary = [];
 	const globals = {
 		window,
 		document: window.document,
@@ -83,7 +87,13 @@ async function render(
 	allModels = models,
 	mounted = true,
 	opened = true,
+	options?: {
+		withGlobalRoleActions?: boolean;
+		defaultModelValue?: string | null;
+		summaryModelValue?: string | null;
+	},
 ) {
+	const withGlobalRoleActions = options?.withGlobalRoleActions ?? false;
 	await act(async () => {
 		root.render(
 			<MantineProvider env="test">
@@ -102,6 +112,14 @@ async function render(
 									onPickerOpened={() => {
 										refreshed++;
 									}}
+									defaultModelValue={options?.defaultModelValue}
+									summaryModelValue={options?.summaryModelValue}
+									{...(withGlobalRoleActions
+										? {
+												onSetAsDefaultModel: (value: string) => setAsDefault.push(value),
+												onSetAsSummaryModel: (value: string) => setAsSummary.push(value),
+											}
+										: {})}
 								/>
 							)}
 						</div>
@@ -143,6 +161,50 @@ async function flushFrames() {
 		for (const callback of callbacks) callback(0);
 	});
 }
+
+describe("per-model global role actions", () => {
+	test("hides the three-dot control when handlers are not provided", async () => {
+		await render("a:one");
+		expect(host.querySelector("[aria-label='Model actions']")).toBeNull();
+	});
+	test("expands set-as actions for concrete models and assigns the row value", async () => {
+		await render("a:one", models, true, true, {
+			withGlobalRoleActions: true,
+			defaultModelValue: "a:one",
+			summaryModelValue: null,
+		});
+		const toggles = host.querySelectorAll("[aria-label='Model actions']");
+		// Follow-default has no toggle; aggregation + two concrete models do.
+		expect(toggles.length).toBe(3);
+		// toggles[1] sits on the "One" row (aggregation is first).
+		await act(async () => {
+			toggles[1]?.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		const defaultAction = Array.from(host.querySelectorAll("[data-menu-item]")).find(
+			(item) => item.textContent === narratorLocale.setAsDefaultModel,
+		);
+		const summaryAction = Array.from(host.querySelectorAll("[data-menu-item]")).find(
+			(item) => item.textContent === narratorLocale.setAsSummaryModel,
+		);
+		if (!defaultAction || !summaryAction) throw new Error("Missing role action items");
+		await act(async () =>
+			defaultAction.dispatchEvent(new window.Event("click", { bubbles: true })),
+		);
+		expect(setAsDefault).toEqual(["a:one"]);
+		expect(setAsSummary).toEqual([]);
+	});
+	test("does not offer global roles on follow-default / follow-summary sentinels", async () => {
+		const withSentinels: ModelOption[] = [
+			{ value: "__default__", label: "Follow default", provider: "__default__" },
+			{ value: "__summary__", label: "Follow summary", provider: "__summary__" },
+			{ value: "a:one", label: "One", provider: "a" },
+		];
+		await render("a:one", withSentinels, true, true, { withGlobalRoleActions: true });
+		const toggles = host.querySelectorAll("[aria-label='Model actions']");
+		expect(toggles.length).toBe(1);
+		expect(host.textContent).toContain("One");
+	});
+});
 
 describe("aggregation choices inside model menu", () => {
 	test("exposes automatic routing and distinguishable provider members; preserves model values", async () => {

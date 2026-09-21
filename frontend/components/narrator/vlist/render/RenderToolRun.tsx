@@ -144,11 +144,12 @@ export interface TraceRenderLabels {
 	shimmerState?: Partial<Record<ToolShimmerKind, string>>;
 }
 
-/** English names for the five shimmer states, used when no labels are injected. */
+/** English names for the shimmer states, used when no labels are injected. */
 const DEFAULT_SHIMMER_STATE_LABELS: Readonly<Record<ToolShimmerKind, string>> = {
 	streaming: "receiving input",
 	reflecting: "under review",
 	running: "running",
+	queued: "waiting for earlier tools",
 	success: "succeeded",
 	failed: "failed",
 };
@@ -484,6 +485,10 @@ function useTraceRowShimmerKind(row: MeasuredTraceRow): ToolShimmerKind | null {
 		// The row's only disambiguation for a `pending` tool: without it a deliberating
 		// gate would fall silent instead of turning purple.
 		reflectionStatus: row.reflectionStatus ?? null,
+		// Parked slate mark when an earlier same-turn call still owns the slot. The
+		// adapter resolved this from the real sibling prefix; a folded row cannot see
+		// its peers, so it passes the verdict rather than a synthesized peer list.
+		queuedBehindUpstream: row.queuedBehindUpstream,
 	});
 	// A live phase outranks a pending flash (a retry that resumed inside the window).
 	if (phase) return phase;

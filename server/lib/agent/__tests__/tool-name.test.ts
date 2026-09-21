@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { PARALLEL_GROUP_SHELL_TOOL_NAME } from "@shared/tool-parallel-groups";
 import {
 	BASH_TOOL_NAME,
 	canonicalizeToolName,
@@ -9,6 +10,17 @@ import {
 	sanitizeToolNameSegment,
 	TOOL_NAME_PATTERN,
 } from "../tool-name";
+
+/**
+ * `@shared/tool-parallel-groups` spells the shell tool's name itself rather than
+ * importing it: the grouping predicates are shared with the frontend, and this
+ * module is server-side (provider wire alphabets, length caps). Nothing in the
+ * type system ties the two spellings together, and a divergence would be silent —
+ * Bash would quietly stop being treated as a serial barrier on one side.
+ */
+test("the shared parallel-group predicates spell the shell tool the same way", () => {
+	expect(PARALLEL_GROUP_SHELL_TOOL_NAME).toBe(BASH_TOOL_NAME);
+});
 
 describe("isValidToolName", () => {
 	test("accepts the built-in tool names unchanged", () => {

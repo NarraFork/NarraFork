@@ -7,7 +7,7 @@ import type {
 	FileChangeProjectionCompleteness,
 } from "../../shared/file-change-protocol";
 import { type ApiError, api } from "../lib/api";
-import { type GitTarget, type GitWorkspace, gitTargetKey } from "../lib/api/git";
+import { type GitLogEntry, type GitTarget, type GitWorkspace, gitTargetKey } from "../lib/api/git";
 import { type ListenerHandle, narratorWSManager } from "../lib/narrator-ws-manager";
 import { useNarrator } from "./useNarrator";
 
@@ -16,7 +16,7 @@ export type {
 	CurrentDiffTarget,
 	CurrentDiffView,
 } from "../../server/services/git-current-diff-view";
-export type { GitTarget, GitWorkspace } from "../lib/api/git";
+export type { GitLogEntry, GitTarget, GitWorkspace } from "../lib/api/git";
 
 // Types
 export interface GitStatusSummary {
@@ -43,14 +43,6 @@ export interface GitStatusSummary {
 	branch: string;
 	linesAdded: number;
 	linesRemoved: number;
-}
-
-export interface GitLogEntry {
-	sha: string;
-	shortSha: string;
-	message: string;
-	author: string;
-	date: string;
 }
 
 export interface GitStashEntry {

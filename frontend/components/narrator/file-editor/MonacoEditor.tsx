@@ -301,10 +301,46 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				}
 				layout();
 			};
+			// Drag-select fires onDidChangeCursorSelection on every pointer move. Publishing
+			// each frame into React re-renders the dock/NarratorPanel tree and blocks the
+			// main thread, so Monaco's own hit-testing starves — that is the production
+			// jank. Coalesce to one publication per mouse gesture (mouseup / blur).
+			let mouseSelecting = false;
+			let dragPending: { selection: FileSelection | null; explicit: boolean } | null = null;
+			const emitSelection = (selection: FileSelection | null, explicit: boolean) => {
+				if (mouseSelecting) {
+					dragPending = {
+						selection,
+						explicit: explicit || !!dragPending?.explicit,
+					};
+					return;
+				}
+				latest.current.onSelectionChange?.(selection, explicit);
+			};
+			const flushDragSelection = () => {
+				if (!mouseSelecting) return;
+				mouseSelecting = false;
+				const pending = dragPending ?? {
+					selection: monacoFileSelection(view.getSelection()),
+					explicit: true,
+				};
+				dragPending = null;
+				if (!cancelled) latest.current.onSelectionChange?.(pending.selection, pending.explicit);
+			};
+			const endPointerSelection = () => flushDragSelection();
+			const win = host.ownerDocument.defaultView;
+			win?.addEventListener("mouseup", endPointerSelection, true);
+			win?.addEventListener("pointercancel", endPointerSelection, true);
+			const blurSubscription =
+				typeof view.onDidBlurEditorText === "function"
+					? view.onDidBlurEditorText(() => flushDragSelection())
+					: null;
 			const subscriptions = [
-				view.onDidFocusEditorText(() =>
-					latest.current.onSelectionChange?.(monacoFileSelection(view.getSelection()), true),
-				),
+				view.onDidFocusEditorText(() => {
+					// A focus steal mid-drag must still settle the gesture once.
+					flushDragSelection();
+					latest.current.onSelectionChange?.(monacoFileSelection(view.getSelection()), true);
+				}),
 				view.onMouseDown((event) => {
 					if (
 						event.target.type !== api.editor.MouseTargetType.CONTENT_TEXT &&
@@ -312,9 +348,19 @@ export function MonacoEditor(props: MonacoEditorProps) {
 						event.target.type !== api.editor.MouseTargetType.GUTTER_LINE_NUMBERS
 					)
 						return;
+					// Ownership for this gesture is decided on pointer end, not every move.
+					mouseSelecting = true;
+					dragPending = null;
 					queueMicrotask(() => {
-						if (!cancelled)
-							latest.current.onSelectionChange?.(monacoFileSelection(view.getSelection()), true);
+						if (cancelled) return;
+						if (mouseSelecting) {
+							dragPending ??= {
+								selection: monacoFileSelection(view.getSelection()),
+								explicit: true,
+							};
+							return;
+						}
+						latest.current.onSelectionChange?.(monacoFileSelection(view.getSelection()), true);
 					});
 				}),
 				model.onDidChangeContent((event) => {
@@ -338,8 +384,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 						queueMicrotask(() => {
 							metadataQueued = false;
 							emit();
-							if (!cancelled)
-								latest.current.onSelectionChange?.(monacoFileSelection(view.getSelection()), false);
+							if (!cancelled) emitSelection(monacoFileSelection(view.getSelection()), false);
 						});
 					}
 				}),
@@ -348,7 +393,9 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					const explicit =
 						event.reason !== api.editor.CursorChangeReason.ContentFlush &&
 						event.reason !== api.editor.CursorChangeReason.RecoverFromMarkers;
-					latest.current.onSelectionChange?.(monacoFileSelection(event.selection), explicit);
+					// During a pointer gesture the live selection stays in Monaco; React is
+					// notified once on pointer end so drag-select does not re-render the panel tree.
+					emitSelection(monacoFileSelection(event.selection), explicit);
 				}),
 			];
 			view.addCommand(api.KeyMod.CtrlCmd | api.KeyCode.KeyF, () => {
@@ -369,10 +416,13 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				});
 			dispose = () => {
 				if (frame) cancelAnimationFrame(frame);
+				win?.removeEventListener("mouseup", endPointerSelection, true);
+				win?.removeEventListener("pointercancel", endPointerSelection, true);
 				observer.disconnect();
 				visibilityObserver.disconnect();
 				removeBoundary();
 				for (const subscription of subscriptions) subscription.dispose();
+				blurSubscription?.dispose();
 				navigation.dispose();
 				runtime.current = null;
 				view.dispose();

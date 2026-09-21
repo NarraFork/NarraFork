@@ -2,9 +2,14 @@ import { describe, expect, test } from "bun:test";
 import {
 	buildAggModelValue,
 	FOLLOW_DEFAULT_MODEL,
+	FOLLOW_SUMMARY_MODEL,
 	type ModelAggregation,
 } from "../../../lib/constants";
-import { centerModelMenuSelection, modelMenuSelection } from "./model-menu-selection";
+import {
+	canAssignGlobalModelRole,
+	centerModelMenuSelection,
+	modelMenuSelection,
+} from "./model-menu-selection";
 
 const aggregations: ModelAggregation[] = [
 	{ id: "group", name: "Group", models: ["a:model", "b:model:variant"], routingMode: "priority" },
@@ -38,6 +43,20 @@ describe("model menu selection", () => {
 			"__agg__:group",
 		);
 		expect(modelMenuSelection("__agg__:group:a:model", []).targetValue).toBe("__agg__:group");
+	});
+});
+
+describe("global model role assignment", () => {
+	test("rejects empty values and meta sentinels", () => {
+		expect(canAssignGlobalModelRole(null)).toBe(false);
+		expect(canAssignGlobalModelRole(undefined)).toBe(false);
+		expect(canAssignGlobalModelRole("")).toBe(false);
+		expect(canAssignGlobalModelRole(FOLLOW_DEFAULT_MODEL)).toBe(false);
+		expect(canAssignGlobalModelRole(FOLLOW_SUMMARY_MODEL)).toBe(false);
+	});
+	test("allows concrete models and aggregation roots", () => {
+		expect(canAssignGlobalModelRole("xiaomi:mimo-x-pro-preview")).toBe(true);
+		expect(canAssignGlobalModelRole(buildAggModelValue("group"))).toBe(true);
 	});
 });
 

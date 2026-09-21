@@ -200,4 +200,29 @@ describe("findCommitLogIndex", () => {
 			await gitService.findCommitLogIndex(dir, deep, { branch: "main", searchLimit: 2 }),
 		).toBeNull();
 	});
+
+	test("getLog returns parents from git %P: merge has 2, root has 0", async () => {
+		const dir = await createMergedHistory();
+		const all = await gitService.getLog(dir, { limit: 100, skip: 0, branch: "main" });
+		// git log main (date order): M, A, S2, S, seed
+		const byMessage = Object.fromEntries(all.map((c) => [c.message, c]));
+		const merge = byMessage.M;
+		const root = byMessage.seed;
+		if (!merge || !root) throw new Error("expected merge M and root seed in log");
+
+		expect(merge.parents).toHaveLength(2);
+		// parents are full SHAs of the two first-parent and side tips at merge time
+		for (const parent of merge.parents) {
+			expect(parent).toMatch(/^[0-9a-f]{40}$/);
+		}
+		const parentShas = new Set(merge.parents);
+		expect(parentShas.has(byMessage.A?.sha ?? "")).toBe(true);
+		expect(parentShas.has(byMessage.S2?.sha ?? "")).toBe(true);
+
+		expect(root.parents).toEqual([]);
+		// Every entry always exposes a parents array (never undefined) on the local path.
+		for (const entry of all) {
+			expect(Array.isArray(entry.parents)).toBe(true);
+		}
+	});
 });

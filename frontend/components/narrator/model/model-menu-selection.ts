@@ -1,9 +1,25 @@
 import {
 	buildAggModelValue,
 	FOLLOW_DEFAULT_MODEL,
+	FOLLOW_SUMMARY_MODEL,
 	type ModelAggregation,
 	parseAggModelValue,
 } from "../../../lib/constants";
+
+/**
+ * Whether a model-menu entry may be written into the instance-wide default or
+ * summary model slots. Meta sentinels are excluded: assigning "follow default"
+ * as the default model (or "follow summary" as either slot) creates a circular
+ * definition the resolver cannot break.
+ *
+ * Concretely selectable models and aggregation roots are allowed; indented
+ * aggregation members are not menu entries with their own roles — selecting one
+ * pins that member on the narrator session instead.
+ */
+export function canAssignGlobalModelRole(value: string | null | undefined): boolean {
+	if (!value) return false;
+	return value !== FOLLOW_DEFAULT_MODEL && value !== FOLLOW_SUMMARY_MODEL;
+}
 
 export function modelMenuSelection(
 	currentModel: string | null | undefined,

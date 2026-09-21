@@ -580,6 +580,11 @@ export interface ToolCallData {
 	/** True while the tool input is still streaming (lodExempt, no fold). */
 	isStreaming?: boolean;
 	/**
+	 * Height-neutral: an earlier same-turn tool still owns the execution slot.
+	 * See `@shared/tool-shimmer`.
+	 */
+	queuedBehindUpstream?: boolean;
+	/**
 	 * Added / removed line counts for a settled Write/Edit (`+12 -3`).
 	 *
 	 * HEIGHT-NEUTRAL: one nowrap span inside the already-fixed header row, exactly
@@ -807,6 +812,8 @@ export interface MeasuredToolCall extends MeasuredElement {
 	lodExempt: boolean;
 	/** Mirrors data.isStreaming. */
 	isStreaming: boolean;
+	/** Mirrors data.queuedBehindUpstream (renderer; height-neutral). */
+	queuedBehindUpstream?: boolean;
 	/** Rendered inside a run (no border + divider). */
 	inRun: boolean;
 	/** In-run last-row flag (no divider). */
@@ -1990,6 +1997,7 @@ export function measureToolCall(
 		effectiveOpened,
 		lodExempt,
 		isStreaming,
+		queuedBehindUpstream: data.queuedBehindUpstream === true ? true : undefined,
 		inRun,
 		isLast,
 		hasBorder,

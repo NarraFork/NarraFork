@@ -564,6 +564,7 @@ export function useVListLabels(): VListLabels {
 					streaming: t("traceRowState.streaming"),
 					reflecting: t("traceRowState.reflecting"),
 					running: t("traceRowState.running"),
+					queued: t("traceRowState.queued"),
 					success: t("traceRowState.success"),
 					failed: t("traceRowState.failed"),
 				},

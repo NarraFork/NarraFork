@@ -291,6 +291,11 @@ export interface TraceItemData {
 	 */
 	status?: string | null;
 	/**
+	 * Height-neutral: an earlier same-turn tool still owns the execution slot.
+	 * See `@shared/tool-shimmer`.
+	 */
+	queuedBehindUpstream?: boolean;
+	/**
 	 * Lifecycle stamps for the row's trailing timing text (renderer only).
 	 *
 	 * HEIGHT-NEUTRAL for the same reason the tool card's header timing is: an
@@ -455,6 +460,8 @@ export interface MeasuredTraceRow {
 	category?: string;
 	/** Streaming shimmer flag (renderer). */
 	shimmer: boolean;
+	/** Height-neutral: earlier same-turn tool still owns the slot (renderer). */
+	queuedBehindUpstream?: boolean;
 	/** Live reflection-gate status for the shimmer colour (renderer; height-neutral). */
 	reflectionStatus?: string;
 	/** Whether this row has an expandable body. */
@@ -853,6 +860,7 @@ export function measureCollapsibleTrace(
 			timing: item.timing ? resolveToolTimingStamps(item.timing) : null,
 			diffStats: item.diffStats ?? null,
 			shimmer: !!item.shimmer,
+			queuedBehindUpstream: item.queuedBehindUpstream === true ? true : undefined,
 			reflectionStatus: item.reflectionStatus,
 			expandable,
 			expanded,

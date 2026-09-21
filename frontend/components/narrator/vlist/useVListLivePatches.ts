@@ -111,6 +111,16 @@ export function useVListLivePatches(
 	const { enabled, isSubagent, applyLivePatch, onUnappliedToolCompletion } = options;
 	const applyRef = useRef(applyLivePatch);
 	applyRef.current = applyLivePatch;
+	/**
+	 * Completions that arrived before their tool_use was loaded.
+	 *
+	 * A `tool_completed` patch is a pure merge by toolUseId; when the assistant
+	 * message has not landed yet the patch reports no-change and would otherwise
+	 * be dropped. The spinner then stays on that call until the NEXT tool's
+	 * structural reload — the "status lags by one tool call" symptom. Replay them
+	 * when a message event indicates the document may now own the tool.
+	 */
+	const pendingCompletionsRef = useRef(new Map<string, LivePatch>());
 	// Read fresh on every enqueue AND every flush: the queue rejects a batch whose
 	// narrator changed between the two (see LivePatchQueue for why the effect
 	// cleanup alone cannot cover that window).
@@ -137,12 +147,43 @@ export function useVListLivePatches(
 		queueRef.current?.enqueue(patch, onMiss);
 	}, []);
 
+	/** Enqueue a completion, remembering it when the tool is not loaded yet. */
+	const enqueueCompletion = useCallback(
+		(toolUseId: string, patch: LivePatch) => {
+			enqueue((messages) => {
+				const result = patch(messages);
+				if (!result.changed) {
+					pendingCompletionsRef.current.set(toolUseId, patch);
+					return result;
+				}
+				pendingCompletionsRef.current.delete(toolUseId);
+				return result;
+			}, onUnappliedToolCompletion);
+		},
+		[enqueue, onUnappliedToolCompletion],
+	);
+
+	/** Replay completions that missed while their tool_use was still unloaded. */
+	const replayPendingCompletions = useCallback(() => {
+		if (pendingCompletionsRef.current.size === 0) return;
+		for (const [toolUseId, patch] of pendingCompletionsRef.current) {
+			enqueue((messages) => {
+				const result = patch(messages);
+				if (result.changed) pendingCompletionsRef.current.delete(toolUseId);
+				return result;
+			});
+		}
+	}, [enqueue]);
+
 	// Drop anything still queued on unmount / narrator switch: those patches target
 	// a document this hook no longer owns. narratorId/enabled are cleanup TRIGGERS
 	// (not values the effect reads), so they must stay in the dependency list.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset triggers
 	useEffect(() => {
-		return () => queueRef.current?.dispose();
+		return () => {
+			pendingCompletionsRef.current.clear();
+			queueRef.current?.dispose();
+		};
 	}, [narratorId, enabled]);
 
 	/**
@@ -299,7 +340,8 @@ export function useVListLivePatches(
 					);
 					return;
 				}
-				enqueue(
+				enqueueCompletion(
+					toolUseId,
 					toolCompletedPatch({
 						toolUseId,
 						status,
@@ -308,7 +350,6 @@ export function useVListLivePatches(
 						...(updatedInput ? { updatedInput } : {}),
 						...(metadata ? { metadata } : {}),
 					}),
-					onUnappliedToolCompletion,
 				);
 			},
 
@@ -460,9 +501,17 @@ export function useVListLivePatches(
 			// The shell's own onCatchUp only decides whether to reload structurally;
 			// the activity summaries it carries would otherwise be dropped.
 			onCatchUp: (_orphanChildren, _topLevel, subagentActivities) => {
+				// A catch-up reload may finally load the tool_use a completion missed.
+				replayPendingCompletions();
 				if (subagentActivities.length === 0) return;
 				const snapshots = subagentActivities as SubagentActivityCatchUp[];
 				enqueue((messages) => patchSubagentActivitySnapshots(messages, snapshots));
+			},
+			// A landed / updated message can introduce the tool_use a completion
+			// previously could not find. Replay before other patches so the spinner
+			// clears in the same frame the card appears.
+			onMessage: () => {
+				replayPendingCompletions();
 			},
 		},
 		undefined,

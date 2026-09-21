@@ -57,9 +57,13 @@ function makeApi(
 			const owner = Object.values(panels).find((p) => p.groupId === id);
 			return new Array(owner?.groupPanelCount ?? 1).fill({ id: "x" });
 		},
-		// Minimal group api with a boundingBox so swapPanels can derive sides.
-		// Lay groups out left→right, 500px wide each.
-		api: { boundingBox: { left: i * 500, top: 0, width: 500, height: 800 } },
+		// Minimal group api: boundingBox lets swapPanels derive sides and restore
+		// pre-swap slot proportions; setSize is a no-op recorder so content-only
+		// swap does not throw when it writes widths back.
+		api: {
+			boundingBox: { left: i * 500, top: 0, width: 500, height: 800 },
+			setSize: () => {},
+		},
 	}));
 	const groupById = (id: string) => groupObjs.find((g) => g.id === id);
 

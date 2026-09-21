@@ -137,6 +137,11 @@ export interface NarratorInteractionStatusBarProps {
 		mutation: any;
 		onEditDefaultModel: () => void;
 		onEditSummaryModel: () => void;
+		/** Promote a concrete model from the menu into the instance default/summary slots. */
+		onSetAsDefaultModel?: (model: string) => void;
+		onSetAsSummaryModel?: (model: string) => void;
+		/** Current global slots, so the three-dot menu can mark the active assignment. */
+		summaryModelValue?: string;
 	};
 
 	reasoning: {
@@ -608,6 +613,10 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																providerLabels={model.providerLabels}
 																onEditDefaultModel={model.onEditDefaultModel}
 																onEditSummaryModel={model.onEditSummaryModel}
+																onSetAsDefaultModel={model.onSetAsDefaultModel}
+																onSetAsSummaryModel={model.onSetAsSummaryModel}
+																defaultModelValue={model.defaultModelValue}
+																summaryModelValue={model.summaryModelValue}
 																{...model.refreshProps}
 															/>
 														</Menu.Dropdown>
@@ -882,6 +891,10 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															providerLabels={model.providerLabels}
 															onEditDefaultModel={model.onEditDefaultModel}
 															onEditSummaryModel={model.onEditSummaryModel}
+															onSetAsDefaultModel={model.onSetAsDefaultModel}
+															onSetAsSummaryModel={model.onSetAsSummaryModel}
+															defaultModelValue={model.defaultModelValue}
+															summaryModelValue={model.summaryModelValue}
 															{...model.refreshProps}
 														/>
 													</Menu.Dropdown>
