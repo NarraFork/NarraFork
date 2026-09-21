@@ -38,7 +38,7 @@ import {
 	type NotificationPersistentStatus,
 	type NotificationUnreadCounts,
 } from "@shared/notification-center";
-import { eq, type SQL, sql } from "drizzle-orm";
+import { and, eq, inArray, type SQL, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chatRoomMembers, chatRooms, narrators, narratorToolCalls, users } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
@@ -450,6 +450,163 @@ async function resolveDisplayStatus(
 	return { ...base, displayStatus: dbStatus };
 }
 
+/**
+ * Derive display status for a whole list page with bounded batch lookups.
+ *
+ * Review M3: a page of up to 50 rows used to issue 2–4 point queries each.
+ * We preload tool calls / narrators / chat rooms / DM memberships for the
+ * unique ids on the page, then derive in memory. ACL still goes through
+ * `canReadNarrator` per unique narrator (same authorization code path).
+ * Falls back to per-row resolution if a batch query fails.
+ */
+async function resolveDisplayStatusBatch(
+	bases: NotificationListItem[],
+	principal: { userId: string; isAdmin: boolean },
+): Promise<NotificationListItem[]> {
+	if (bases.length === 0) return [];
+
+	try {
+		const toolIds = [
+			...new Set(bases.filter((b) => b.kind === "permission_request").map((b) => b.sourceKey)),
+		];
+		const toolById = new Map<
+			string,
+			{
+				id: string;
+				narratorId: string;
+				status: string;
+				permissionDecidedBy: string | null;
+			}
+		>();
+		if (toolIds.length > 0) {
+			const found = await db
+				.select({
+					id: narratorToolCalls.id,
+					narratorId: narratorToolCalls.narratorId,
+					status: narratorToolCalls.status,
+					permissionDecidedBy: narratorToolCalls.permissionDecidedBy,
+				})
+				.from(narratorToolCalls)
+				.where(inArray(narratorToolCalls.id, toolIds));
+			for (const row of found) toolById.set(row.id, row);
+		}
+
+		const roomIds = new Set<string>();
+		for (const base of bases) {
+			if (base.kind === "chat_message" && base.link.type === "chat_room" && base.link.roomId) {
+				roomIds.add(base.link.roomId);
+			}
+		}
+
+		const roomById = new Map<string, { id: string; kind: string; narratorId: string | null }>();
+		const narratorIdSet = new Set<string>();
+		for (const base of bases) {
+			if (base.narratorId) narratorIdSet.add(base.narratorId);
+		}
+		for (const tool of toolById.values()) {
+			if (tool.narratorId) narratorIdSet.add(tool.narratorId);
+		}
+		if (roomIds.size > 0) {
+			const rooms = await db
+				.select({
+					id: chatRooms.id,
+					kind: chatRooms.kind,
+					narratorId: chatRooms.narratorId,
+				})
+				.from(chatRooms)
+				.where(inArray(chatRooms.id, [...roomIds]));
+			for (const room of rooms) {
+				roomById.set(room.id, room);
+				if (room.narratorId) narratorIdSet.add(room.narratorId);
+			}
+		}
+
+		const narratorById = new Map<string, Parameters<typeof canReadNarrator>[0]>();
+		if (narratorIdSet.size > 0) {
+			const rows = await db
+				.select()
+				.from(narrators)
+				.where(inArray(narrators.id, [...narratorIdSet]));
+			for (const row of rows) narratorById.set(row.id, row);
+		}
+
+		const readableNarrator = new Map<string, boolean>();
+		for (const [id, row] of narratorById) {
+			try {
+				readableNarrator.set(id, await canReadNarrator(row, principal));
+			} catch {
+				readableNarrator.set(id, false);
+			}
+		}
+
+		const memberRoomIds = new Set<string>();
+		if (roomIds.size > 0) {
+			const memberships = await db
+				.select({ roomId: chatRoomMembers.roomId })
+				.from(chatRoomMembers)
+				.where(
+					and(
+						eq(chatRoomMembers.userId, principal.userId),
+						inArray(chatRoomMembers.roomId, [...roomIds]),
+					),
+				);
+			for (const m of memberships) memberRoomIds.add(m.roomId);
+		}
+
+		const isNarratorReadable = (narratorId: string | null | undefined): boolean => {
+			if (!narratorId) return false;
+			return readableNarrator.get(narratorId) ?? false;
+		};
+
+		return bases.map((base) => {
+			if (base.kind === "permission_request") {
+				const tool = toolById.get(base.sourceKey);
+				if (!tool) {
+					return { ...base, displayStatus: "gone" as const, sourceAlive: false };
+				}
+				const narratorId = base.narratorId ?? tool.narratorId;
+				if (!isNarratorReadable(narratorId)) {
+					return { ...base, displayStatus: "gone" as const, sourceAlive: false };
+				}
+				const stillPending = tool.status === "pending" && !tool.permissionDecidedBy;
+				if (!stillPending) {
+					return { ...base, displayStatus: "resolved" as const, sourceAlive: true };
+				}
+				return { ...base, displayStatus: base.status, sourceAlive: true };
+			}
+
+			const roomId = base.link.type === "chat_room" && base.link.roomId ? base.link.roomId : null;
+			if (!roomId) {
+				return { ...base, displayStatus: "gone" as const, sourceAlive: false };
+			}
+			const room = roomById.get(roomId);
+			if (!room) {
+				return { ...base, displayStatus: "gone" as const, sourceAlive: false };
+			}
+			if (room.kind === "dm") {
+				if (!memberRoomIds.has(roomId)) {
+					return { ...base, displayStatus: "gone" as const, sourceAlive: false };
+				}
+			} else {
+				if (!room.narratorId || !isNarratorReadable(room.narratorId)) {
+					return { ...base, displayStatus: "gone" as const, sourceAlive: false };
+				}
+			}
+			return { ...base, displayStatus: base.status };
+		});
+	} catch (err) {
+		logger.warn("notification-center: batch displayStatus failed, falling back", {
+			error: err instanceof Error ? err.message : String(err),
+			size: bases.length,
+		});
+		const out: NotificationListItem[] = [];
+		for (const base of bases) {
+			out.push(await resolveDisplayStatus(base, principal));
+		}
+		return out;
+	}
+}
+
 // ─── listNotifications ──────────────────────────────────────────────────────
 
 export async function listNotifications(params: {
@@ -500,11 +657,8 @@ export async function listNotifications(params: {
 	const pageRows = hasMore ? rows.slice(0, limit) : rows;
 
 	const principal = await resolvePrincipalFor(userId);
-	const items: NotificationListItem[] = [];
-	for (const row of pageRows) {
-		const base = rowToListBase(row);
-		items.push(await resolveDisplayStatus(base, principal));
-	}
+	const bases = pageRows.map((row) => rowToListBase(row));
+	const items = await resolveDisplayStatusBatch(bases, principal);
 
 	const last = pageRows[pageRows.length - 1];
 	const nextCursor =

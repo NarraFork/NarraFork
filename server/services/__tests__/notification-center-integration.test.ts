@@ -15,7 +15,13 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
-import { chatRoomMembers, users } from "../../db/schema";
+import {
+	chatRoomMembers,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	users,
+} from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { postMessage, resolveDmRoom } from "../chat-service";
 import {
@@ -27,7 +33,11 @@ import {
 	onNotificationCenterChanged,
 	recordNotifications,
 } from "../notification-center-service";
-import { fanoutChatMessageNotifications, setRecordNotifications } from "../notification-fanout";
+import {
+	fanoutChatMessageNotifications,
+	fanoutPermissionRequestNotifications,
+	setRecordNotifications,
+} from "../notification-fanout";
 
 // Same handle as production modules (preload temp home).
 const { db: rawDb } = await import("../../db");
@@ -211,5 +221,108 @@ describe("DM fan-out → recordNotifications → listNotifications (real service
 
 		const outsiderPage = await listNotifications({ userId: outsider, status: "all" });
 		expect(outsiderPage.items[0].status).toBe("unread");
+	});
+});
+
+describe("permission fan-out → recordNotifications → listNotifications (real service)", () => {
+	async function seedNarrator(opts: {
+		id: string;
+		ownerUserId: string | null;
+		visibility: "private" | "public" | "project";
+		title?: string;
+	}): Promise<void> {
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: opts.id,
+			title: opts.title ?? `Narrator ${opts.id.slice(0, 6)}`,
+			ownerUserId: opts.ownerUserId,
+			visibility: opts.visibility,
+			writeAudience: "owner",
+			type: "primary",
+			aclRootNarratorId: null,
+			createdAt: now,
+			updatedAt: now,
+		});
+	}
+
+	async function seedPendingToolCall(opts: {
+		id: string;
+		narratorId: string;
+		toolName?: string;
+		path?: string | null;
+		status?: "pending" | "success";
+		decidedAt?: string | null;
+	}): Promise<void> {
+		const now = new Date().toISOString();
+		const messageId = generateId();
+		await db.insert(narratorMessages).values({
+			id: messageId,
+			narratorId: opts.narratorId,
+			role: "assistant",
+			contentJson: [{ type: "text", text: "asking" }],
+			createdAt: now,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: opts.id,
+			narratorId: opts.narratorId,
+			messageId,
+			toolUseId: generateId(12),
+			toolName: opts.toolName ?? "Bash",
+			status: opts.status ?? "pending",
+			canonicalFilePath: opts.path ?? null,
+			permissionDecidedAt: opts.decidedAt ?? null,
+			createdAt: now,
+		});
+	}
+
+	test("owner sees durable row; stranger does not; replay dedupes; decided skips", async () => {
+		const owner = await makeUser("int-perm-owner");
+		const stranger = await makeUser("int-perm-stranger");
+		const narratorId = generateId();
+		await seedNarrator({ id: narratorId, ownerUserId: owner, visibility: "private" });
+		const toolCallId = generateId();
+		await seedPendingToolCall({
+			id: toolCallId,
+			narratorId,
+			toolName: "Write",
+			path: "/repo/src/feature.ts",
+		});
+
+		const event = { narratorId, requestId: toolCallId };
+		await fanoutPermissionRequestNotifications(event);
+		await fanoutPermissionRequestNotifications(event);
+
+		const ownerPage = await listNotifications({ userId: owner, status: "all" });
+		expect(ownerPage.items).toHaveLength(1);
+		const row = ownerPage.items[0];
+		expect(row.kind).toBe("permission_request");
+		expect(row.sourceKey).toBe(toolCallId);
+		expect(row.link).toEqual({ type: "narrator", narratorId });
+		expect(row.preview).toContain("Write");
+		expect(row.preview).toContain("feature.ts");
+		expect(row.status).toBe("unread");
+		// M1: still pending → sourceAlive true for navigation.
+		expect(row.displayStatus).toBe("unread");
+		expect(row.sourceAlive).toBe(true);
+
+		const strangerPage = await listNotifications({ userId: stranger, status: "all" });
+		expect(strangerPage.items).toHaveLength(0);
+
+		// Decided offer must not resurrect or re-project through the real writer.
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "success", permissionDecidedAt: new Date().toISOString() })
+			.where(eq(narratorToolCalls.id, toolCallId));
+		await fanoutPermissionRequestNotifications(event);
+		const after = await listNotifications({ userId: owner, status: "all" });
+		expect(after.items).toHaveLength(1);
+
+		// List derivation: decided tool → resolved but still navigable (M1).
+		const derived = after.items[0];
+		expect(derived.displayStatus).toBe("resolved");
+		expect(derived.sourceAlive).toBe(true);
+
+		const counts = await getUnreadCounts(owner);
+		expect(counts.permission_request).toBe(1);
 	});
 });
