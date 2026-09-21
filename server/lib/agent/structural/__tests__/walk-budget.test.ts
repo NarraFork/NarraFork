@@ -19,6 +19,7 @@
  * no grammar is installed — exactly the case where the grammar-backed suites skip.
  */
 import { describe, expect, test } from "bun:test";
+import { buildGenericOutline } from "@server/lib/agent/structural/generic-language";
 import {
 	buildOutline,
 	MAX_TRAVERSAL_DEPTH,
@@ -78,6 +79,22 @@ describe("outline traversal budget", () => {
 	test("a chain within the cap is not marked truncated", () => {
 		const result = buildOutline(containerChain(10), "typescript");
 		expect(result.truncated).toBe(false);
+	});
+
+	test("the raised depth budget permits traversals beyond the old 512-frame cap", () => {
+		const root = containerChain(700);
+		expect(buildOutline(root, "typescript").truncated).toBe(false);
+	});
+
+	test("generic outlines share the raised depth guard", () => {
+		// Generic traversal skips statement bodies, so use unnamed wrapper nodes.
+		const chain = (depth: number) => {
+			let node = fakeNode("wrapper");
+			for (let i = 0; i < depth; i++) node = fakeNode("wrapper", [node]);
+			return fakeNode("root", [node]);
+		};
+		expect(buildGenericOutline(chain(700)).truncated).toBe(false);
+		expect(buildGenericOutline(chain(MAX_TRAVERSAL_DEPTH + 50)).truncated).toBe(true);
 	});
 
 	test("the visited cap bounds a wide tree that emits nothing", () => {

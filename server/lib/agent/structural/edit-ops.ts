@@ -369,11 +369,11 @@ export function validateReplacementTemplate(pattern: string, replacement: string
 			throw new EditOpError(
 				groups.count === 0
 					? `Replacement references \`$${next}\` but the pattern declares no capture ` +
-						`groups, so JS would write \`$${next}\` into the file as literal text. ` +
-						`Use \`$&\` for the whole match, or add a group to the pattern.`
+							`groups, so JS would write \`$${next}\` into the file as literal text. ` +
+							`Use \`$&\` for the whole match, or add a group to the pattern.`
 					: `Replacement references \`$${next}\` but the pattern declares only ` +
-						`${groups.count} capture group(s), so JS would write it into the file as ` +
-						`literal text.`,
+							`${groups.count} capture group(s), so JS would write it into the file as ` +
+							`literal text.`,
 			);
 		}
 	}

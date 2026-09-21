@@ -53,7 +53,7 @@ const MAX_SIGNATURE_CHARS = 120;
  * before the recursion dies. Bounding visits is what makes the walk's cost a function of
  * the budget rather than of how pathological the file is.
  */
-export const MAX_VISITED_NODES = 400_000;
+export const MAX_VISITED_NODES = 1_000_000;
 
 /**
  * Hard cap on TRAVERSAL depth, which is not the same thing as `maxDepth`.
@@ -71,7 +71,7 @@ export const MAX_VISITED_NODES = 400_000;
  * `references.ts` already uses an explicit stack for the same reason; this is the cheaper
  * fix for a walk whose shape genuinely wants recursion.
  */
-export const MAX_TRAVERSAL_DEPTH = 512;
+export const MAX_TRAVERSAL_DEPTH = 1024;
 
 export interface BuildOutlineOptions {
 	/** Stop descending past this depth. 0 = top level only. */

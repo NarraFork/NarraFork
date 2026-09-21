@@ -139,6 +139,16 @@ export async function runStash(
 				title: filePath,
 			};
 		}
+		if (await resolved.provider.isOutlineTruncated?.(doc)) {
+			return {
+				output:
+					`The outline of ${filePath} was truncated by a traversal/output budget. ` +
+					"Cannot safely stash by symbol: omitted declarations may make it ambiguous. " +
+					"Use an explicit line range in `address` instead.",
+				isError: true,
+				title: filePath,
+			};
+		}
 		const parsed = parseSymbolSelector(rawSymbol);
 		const matches = await resolved.provider.locate(doc, {
 			symbol: parsed.symbol,

@@ -47,9 +47,9 @@ describe("zero-width matches", () => {
 		).toThrow(EditOpError);
 		// Line 1 on its own is accepted, which is what makes the refusal above meaningful:
 		// the scan covered the whole range before anything was applied.
-		expect(substituteInRange(text, { startLine: 1, endLine: 1 }, "q*", "Z", { flags: "g" }).text).toBe(
-			"ZZ\nabc\n",
-		);
+		expect(
+			substituteInRange(text, { startLine: 1, endLine: 1 }, "q*", "Z", { flags: "g" }).text,
+		).toBe("ZZ\nabc\n");
 	});
 
 	test("a single zero-width hit per line is a legitimate anchor", () => {
@@ -80,9 +80,7 @@ describe("replacement template references", () => {
 	});
 
 	test("$<…> against a pattern with no named groups is refused", () => {
-		expect(() => substituteInRange("foo\n", WHOLE, "foo", "[$<n>]")).toThrow(
-			/no named groups/,
-		);
+		expect(() => substituteInRange("foo\n", WHOLE, "foo", "[$<n>]")).toThrow(/no named groups/);
 	});
 
 	test("valid references pass", () => {

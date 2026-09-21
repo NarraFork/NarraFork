@@ -15,8 +15,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureGrammarFixture } from "../../structural/__tests__/grammar-fixture";
+import { MAX_TRAVERSAL_DEPTH } from "../../structural/outline";
+import { treeSitterProvider } from "../../structural/tree-sitter-provider";
 import type { ToolContext } from "../../types";
 import { structSedTool } from "../struct-sed";
+import { structViewTool } from "../struct-view";
 
 const TS_SOURCE = `export class PaymentService {
 	/** Charge one order. */
@@ -392,6 +395,111 @@ describe("structural addressing", () => {
 	});
 });
 
+describe("truncated outlines never authorize symbol-based edits", () => {
+	let filePath: string;
+	let source: string;
+
+	beforeAll(() => {
+		filePath = join(workDir, "truncated.ts");
+		// Only two target declarations; the intervening data exhausts the VISITED
+		// budget, not the 5000-declaration limit. The file remains below 2 MB.
+		source = `class A { target() {} }\nconst cfg = {${"a:0,".repeat(350_000)}};\nclass B { target() {} }\n`;
+		writeFileSync(filePath, source, "utf8");
+	});
+
+	test("the raised budget fully covers the former 600 KB reproducer", async () => {
+		if (!hasGrammar) return;
+		const text = `class A { target() {} }\nconst cfg = {${"a:0,".repeat(150_000)}};\nclass B { target() {} }\n`;
+		const doc = { filePath: join(workDir, "within-budget.ts"), text, languageId: "typescript" };
+		expect(await treeSitterProvider.isOutlineTruncated?.(doc)).toBe(false);
+		expect((await treeSitterProvider.locate(doc, { symbol: "target" })).length).toBe(2);
+	});
+
+	test("refuses bare, qualified and numbered selectors, even on the cached outline", async () => {
+		if (!hasGrammar) return;
+		for (const symbol of ["target", "A.target", "target#1"]) {
+			const result = await run({ file_path: filePath, command: "delete", symbol });
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("truncated");
+			expect(result.output).toContain("`address`");
+		}
+		expect(readFileSync(filePath, "utf8")).toBe(source);
+	});
+
+	test("refuses a symbolic copy/move destination and batch operation", async () => {
+		if (!hasGrammar) return;
+		for (const command of ["copy", "move"]) {
+			const result = await run({ file_path: filePath, command, address: "3", to_symbol: "target" });
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("truncated");
+			expect(result.output).toContain("`to_address`");
+		}
+		const batch = await run({
+			file_path: filePath,
+			operations: [{ command: "delete", symbol: "target" }],
+		});
+		expect(batch.isError).toBe(true);
+		expect(batch.output).toContain("truncated");
+		expect(readFileSync(filePath, "utf8")).toBe(source);
+	});
+
+	test("explicit line addresses remain usable", async () => {
+		if (!hasGrammar) return;
+		const result = await run({ file_path: filePath, command: "delete", address: "3" });
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("DRY RUN");
+		expect(result.metadata?.startLine).toBe(3);
+		expect(readFileSync(filePath, "utf8")).toBe(source);
+	});
+
+	test("read modes warn about partial results, and symbol stashes refuse them", async () => {
+		if (!hasGrammar) return;
+		for (const mode of ["outline", "api", "extract", "find"]) {
+			const result = await structViewTool.execute(
+				{ file_path: filePath, mode, symbol: "target" },
+				makeCtx(),
+			);
+			expect(result.isError).toBeFalsy();
+			expect(result.output).toContain("Outline truncated");
+		}
+		const missingDeclaration = await structViewTool.execute(
+			{ mode: "find", symbol: "B" },
+			makeCtx(),
+		);
+		expect(missingDeclaration.metadata?.declarations).toBe(0);
+		expect(missingDeclaration.metadata?.truncatedOutlines).toBe(1);
+		expect(missingDeclaration.output).toContain("Outline truncated");
+		const missing = await structViewTool.execute(
+			{ file_path: filePath, mode: "extract", symbol: "B.target" },
+			makeCtx(),
+		);
+		expect(missing.isError).toBe(true);
+		expect(missing.output).toContain("Outline truncated");
+		const stash = await structViewTool.execute(
+			{ file_path: filePath, mode: "stash", symbol: "target" },
+			makeCtx(),
+		);
+		expect(stash.isError).toBe(true);
+		expect(stash.output).toContain("truncated");
+		const addressed = await structViewTool.execute(
+			{ file_path: filePath, mode: "stash", address: "3" },
+			makeCtx(),
+		);
+		expect(addressed.isError).toBeFalsy();
+	});
+
+	test("the depth budget also blocks edits when very few nodes are visited", async () => {
+		if (!hasGrammar) return;
+		const deepFile = join(workDir, "deep.ts");
+		const depth = MAX_TRAVERSAL_DEPTH + 20;
+		const text = `class A { target() {} }\nconst cfg = ${"{a:".repeat(depth)}0${"}".repeat(depth)};\nclass B { target() {} }\n`;
+		writeFileSync(deepFile, text, "utf8");
+		const result = await run({ file_path: deepFile, command: "delete", symbol: "target" });
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("truncated");
+		expect(readFileSync(deepFile, "utf8")).toBe(text);
+	});
+});
 describe("cleanup", () => {
 	test("removes the temp workspace", () => {
 		rmSync(workDir, { recursive: true, force: true });

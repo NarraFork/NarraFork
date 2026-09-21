@@ -77,6 +77,18 @@ export async function resolveToRange(input: {
 				},
 			};
 		}
+		if (await resolved.provider.isOutlineTruncated?.(doc)) {
+			return {
+				error: {
+					output:
+						`The outline of ${filePath} was truncated by a traversal/output budget. ` +
+						`Cannot safely resolve \`${field}\` "${symbol}": omitted declarations may ` +
+						`make this selection ambiguous. Use an explicit line range in \`${addressField}\` instead.`,
+					isError: true,
+					title: filePath,
+				},
+			};
+		}
 		const parsed = parseSymbolSelector(symbol);
 		const kinds = parseKinds(input.kind);
 		const matches = await resolved.provider.locate(doc, {
