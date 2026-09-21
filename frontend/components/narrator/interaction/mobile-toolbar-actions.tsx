@@ -2,9 +2,9 @@ import { ActionIcon, Button, Menu, Tooltip } from "@mantine/core";
 import { IconGitBranch, IconLock, IconLockOpen } from "@tabler/icons-react";
 import type { UseMutationResult } from "@tanstack/react-query";
 import type { NarratorStatusToolbarAction } from "../header/NarratorStatusToolbar";
-import { PathRulesPopover } from "./PathRulesPopover";
 
 export interface BuildMobileToolbarActionsOptions {
+	bottomActions: NarratorStatusToolbarAction[];
 	narratorId: string;
 	t: (key: string) => string;
 	hasPlanTrait: boolean;
@@ -20,14 +20,11 @@ export interface BuildMobileToolbarActionsOptions {
 }
 
 /**
- * The mobile status-row action set: path rules, relaxed-plan toggle, and promote.
- * These are session CONFIGURATION controls (they modify the state shown beside
- * them) rather than panel-opening tool entries — tool entries live in the header
- * registry (narrator-toolbar-items). Extracted from NarratorPanel to keep the
- * ~110-line array out of the panel body; still built per render (the toolbar
- * derives its measurement identity from the action keys, not array identity).
+ * Fixed session controls followed by the registry-driven bottom tools.
+ * The toolbar derives its measurement identity from action keys, not array identity.
  */
 export function buildMobileToolbarActions({
+	bottomActions,
 	narratorId,
 	t,
 	hasPlanTrait,
@@ -40,21 +37,6 @@ export function buildMobileToolbarActions({
 	handlePromote,
 }: BuildMobileToolbarActionsOptions): NarratorStatusToolbarAction[] {
 	return [
-		{
-			key: "path-rules",
-			collapsePriority: 10,
-			// Inline reserve only. A vertical reserve cannot protect this badge: it is
-			// painted inside the ActionIcon, which clips its own overflow, so padding
-			// on the wrapper would only push the button off the row's centre line.
-			visualOverflow: { inlineEnd: 4 },
-			render: (mode) => (
-				<PathRulesPopover
-					narratorId={narratorId}
-					t={t}
-					triggerMode={mode === "menu" ? "menu" : "icon"}
-				/>
-			),
-		},
 		...(hasPlanTrait
 			? ([
 					{
@@ -136,18 +118,6 @@ export function buildMobileToolbarActions({
 					},
 				] satisfies NarratorStatusToolbarAction[])
 			: []),
-		/*
-		 * The terminal entry deliberately does NOT appear here any more.
-		 *
-		 * It is a tool entry, so it belongs to the registry-driven header row
-		 * (`narrator-toolbar-items.tsx`) together with git / search / browser / the
-		 * rest. Keeping a copy here would put the same control in two places at once
-		 * on mobile — the header AND this status row — which is precisely the split
-		 * that made the old mobile layout confusing to navigate.
-		 *
-		 * What stays in this row is session CONFIGURATION (path rules, relaxed plan,
-		 * promote), which modifies the state shown beside it rather than opening a
-		 * panel.
-		 */
+		...bottomActions,
 	];
 }

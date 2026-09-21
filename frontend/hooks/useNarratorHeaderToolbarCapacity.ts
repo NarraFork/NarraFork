@@ -28,6 +28,8 @@ export interface UseNarratorHeaderToolbarCapacityOptions {
 	leadingRef: RefObject<HTMLDivElement | null>;
 	/** Width reserved for the title; 0 when the host draws the title itself. */
 	titleSlotMinWidth?: number;
+	/** Optional hard share for the toolbar; null = title floor first, then remaining width. */
+	maxWidthFraction?: number | null;
 	/** Number of candidate entries. */
 	itemCount: number;
 	/**
@@ -50,6 +52,7 @@ export function useNarratorHeaderToolbarCapacity({
 	toolbarRef,
 	leadingRef,
 	titleSlotMinWidth = HEADER_TITLE_MIN_WIDTH_PX,
+	maxWidthFraction = null,
 	itemCount,
 	maxCapacity = null,
 	enabled = true,
@@ -67,6 +70,16 @@ export function useNarratorHeaderToolbarCapacity({
 	 */
 	const baselineItemCountRef = useRef<number | null>(null);
 	const frameRef = useRef<number | null>(null);
+	/**
+	 * Whether the measured DOM anchors have been observed at least once.
+	 *
+	 * The panel-level controller runs above the skeleton early-return, so the first
+	 * effect pass sees `rowRef.current === null`. If the candidate set does not
+	 * change when the real header mounts, no effect dependency changes and the
+	 * observer would never register — capacity stays null forever. Tracking the
+	 * null→non-null transition gives the effect a reason to re-run.
+	 */
+	const [refsReady, setRefsReady] = useState(false);
 
 	const measure = useCallback(() => {
 		if (!enabled) return;
@@ -80,11 +93,11 @@ export function useNarratorHeaderToolbarCapacity({
 			toolbar,
 			leading,
 			titleSlotMinWidth,
+			maxWidthFraction,
 		});
-		// A zero budget means the row has not been laid out yet. Reporting 0 would
-		// empty the toolbar for a frame; keeping the previous answer (or null) lets
-		// the next observation decide.
-		if (budgetWidth <= 0) return;
+		// Only an unmeasured row should retain the previous answer. A measured row
+		// can legitimately have zero budget: all entries must then collapse.
+		if (row.getBoundingClientRect().width <= 0) return;
 
 		const next = resolveHeaderToolbarCapacity({
 			budgetWidth,
@@ -96,7 +109,7 @@ export function useNarratorHeaderToolbarCapacity({
 			capacityRef.current = next;
 			setCapacity(next);
 		}
-	}, [enabled, rowRef, toolbarRef, leadingRef, titleSlotMinWidth, itemCount]);
+	}, [enabled, rowRef, toolbarRef, leadingRef, titleSlotMinWidth, maxWidthFraction, itemCount]);
 
 	const scheduleMeasure = useCallback(() => {
 		if (frameRef.current != null) return;
@@ -120,13 +133,24 @@ export function useNarratorHeaderToolbarCapacity({
 		[],
 	);
 
-	// Re-measure on every committed layout, before paint.
-	useLayoutEffect(() => {
-		measure();
-	}, [measure]);
-
+	// Detect the skeleton→header transition: the controller runs above the early
+	// return, so refs start null and only become valid after the real DOM mounts.
+	// Without this gate the effects below would run once with null refs, see no
+	// dependency change when the header appears, and never measure or observe.
 	useLayoutEffect(() => {
 		if (!enabled) return;
+		if (rowRef.current && !refsReady) setRefsReady(true);
+	}, [enabled, rowRef, refsReady]);
+
+	// Re-measure on every committed layout, before paint — but only once the DOM
+	// anchors actually exist.
+	useLayoutEffect(() => {
+		if (!refsReady) return;
+		measure();
+	}, [refsReady, measure]);
+
+	useLayoutEffect(() => {
+		if (!enabled || !refsReady) return;
 		const row = rowRef.current;
 		const leading = leadingRef.current;
 		if (!row) return;
@@ -139,7 +163,7 @@ export function useNarratorHeaderToolbarCapacity({
 			observer?.disconnect();
 			if (typeof window !== "undefined") window.removeEventListener("resize", scheduleMeasure);
 		};
-	}, [enabled, rowRef, leadingRef, scheduleMeasure]);
+	}, [enabled, refsReady, rowRef, leadingRef, scheduleMeasure]);
 
 	if (capacity == null) return null;
 	return maxCapacity == null ? capacity : Math.min(maxCapacity, capacity);

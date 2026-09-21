@@ -425,9 +425,24 @@ export class GeminiProvider implements ProviderAdapter {
 			outputIndex?: number;
 		}>,
 		textOutputIndex?: number,
+		_redactedThinkingBlocks?: Parameters<ProviderAdapter["pushAssistantTurn"]>[8],
+		orderedContent?: readonly import("./types").ContentBlock[],
 	): void {
 		const ordered: Array<{ index: number; sequence: number; part: GeminiPart }> = [];
 		let sequence = 0;
+		if (orderedContent) {
+			// Gemini's wire parts carry no outputIndex; use encounter positions only
+			// for assembly and retain opaque signatures on their entire native part.
+			reasoningBlocks = [];
+			toolUses = [];
+			text = "";
+			for (const [index, block] of orderedContent.entries()) {
+				if (block.type === "text" && block.text)
+					ordered.push({ index, sequence: sequence++, part: { text: block.text } });
+				else if (block.type === "reasoning") reasoningBlocks.push({ ...block, outputIndex: index });
+				else if (block.type === "tool_use") toolUses.push({ ...block, outputIndex: index });
+			}
+		}
 		const currentSource = this.getActiveReasoningSource();
 		for (const block of reasoningBlocks ?? []) {
 			if (!block.text) continue;
@@ -769,6 +784,7 @@ export class GeminiProvider implements ProviderAdapter {
 		const decoder = new TextDecoder();
 		const reader = body.getReader();
 		const toolUses: AgentToolUse[] = [];
+		const lane: GeminiGenerateLane = { nextIndex: 0 };
 		const streamBudget = new StreamByteBudget(
 			GEMINI_GENERATE_MAX_STREAM_BYTES,
 			"Gemini SSE stream",
@@ -786,6 +802,7 @@ export class GeminiProvider implements ProviderAdapter {
 				this.getActiveReasoningSource(),
 				(text) => textBudget.add(byteLength(text)),
 				(args) => argumentBudget.add(byteLength(args)),
+				lane,
 			);
 
 		try {
@@ -831,12 +848,20 @@ export class GeminiProvider implements ProviderAdapter {
 	}
 }
 
+interface GeminiGenerateLane {
+	nextIndex: number;
+	kind?: "text" | "reasoning" | "tool";
+	candidateIndex?: number;
+	outputIndex?: number;
+}
+
 function* parseGenerateSseEvent(
 	rawEvent: string,
 	toolUses: AgentToolUse[],
 	signatureSource: string | undefined,
 	countText: (text: string) => void,
 	countArguments: (args: string) => void,
+	lane: GeminiGenerateLane,
 ): Generator<ParsedStreamEvent> {
 	if (byteLength(rawEvent) > GEMINI_GENERATE_MAX_SSE_EVENT_BYTES) {
 		throw new ApiError(413, "Gemini SSE event exceeded hard limit");
@@ -875,8 +900,33 @@ function* parseGenerateSseEvent(
 	if (chunk.usageMetadata) yield { usage: mapUsageStream(chunk.usageMetadata) };
 
 	const candidate = chunk.candidates?.[0];
-	const outputIndex = candidate?.index;
-	for (const part of candidate?.content?.parts ?? []) {
+	const candidateIndex = candidate?.index ?? 0;
+	for (const [partIndex, part] of (candidate?.content?.parts ?? []).entries()) {
+		const kind = part.functionCall
+			? "tool"
+			: part.thought
+				? "reasoning"
+				: part.text != null
+					? "text"
+					: part.thoughtSignature
+						? lane.kind
+						: undefined;
+		if (!kind) continue;
+		// candidate.index selects an alternative response, NOT a content part.
+		// Single-part same-kind chunks are increments of one lane. Multiple parts
+		// in a frame, kind switches, and tool calls establish real new positions.
+		if (
+			lane.kind !== kind ||
+			lane.candidateIndex !== candidateIndex ||
+			partIndex > 0 ||
+			kind === "tool"
+		) {
+			lane.outputIndex = lane.nextIndex++;
+			lane.kind = kind;
+			lane.candidateIndex = candidateIndex;
+		}
+		const outputIndex = lane.outputIndex;
+		const blockId = `gemini:${candidateIndex}:part:${outputIndex}`;
 		if (part.functionCall) {
 			const toolUseId = generateGeminiToolId();
 			const input = JSON.stringify(part.functionCall.args ?? {});
@@ -905,10 +955,11 @@ function* parseGenerateSseEvent(
 					}),
 				},
 			};
-		} else if (part.thought && part.text) {
-			countText(part.text);
+		} else if (kind === "reasoning" && (part.text || part.thoughtSignature)) {
+			if (part.text) countText(part.text);
 			yield {
 				reasoning: part.text,
+				reasoningBlockId: blockId,
 				reasoningOutputIndex: outputIndex,
 				...(part.thoughtSignature && {
 					reasoningMetadata: { gemini: { thoughtSignature: part.thoughtSignature } },
@@ -916,7 +967,7 @@ function* parseGenerateSseEvent(
 			};
 		} else if (part.text) {
 			countText(part.text);
-			yield { text: part.text, textOutputIndex: outputIndex };
+			yield { text: part.text, textOutputIndex: outputIndex, textBlockId: blockId };
 		}
 	}
 	if (!candidate?.finishReason) return;

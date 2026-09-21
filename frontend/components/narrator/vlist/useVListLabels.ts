@@ -571,8 +571,6 @@ export function useVListLabels(): VListLabels {
 			subagent: {
 				recentCalls: t("subagentRecentCalls"),
 				openSession: t("openFullSubagentSession"),
-				backgroundNotice: t("subagentBackgroundNotice"),
-				openInPanel: t("subagentOpenInPanel"),
 				prompt: t("subagentPrompt"),
 				pendingTitle: t("subagentWaitingPermissionTitle"),
 				resolveOverride: t("resolveOverride"),

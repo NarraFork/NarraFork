@@ -67,6 +67,24 @@ function streamingMessage(text: string) {
 	};
 }
 
+/**
+ * Checkpoint projection: a real persisted message whose live revision is being
+ * projected back into the document while the same block ID continues streaming.
+ * Must take the same incremental parse path as the synthetic streaming row.
+ */
+function checkpointProjectionMessage(text: string) {
+	return {
+		id: "msg-checkpoint-1",
+		seq: 100,
+		role: "assistant",
+		contentJson: [{ type: "reasoning", id: "r-1", revision: 2, text }],
+		toolCalls: [],
+		children: [],
+		liveBlockIndex: 0,
+		liveContentProjection: true,
+	};
+}
+
 const HISTORY = Array.from({ length: 12 }, (_, i) => finishedTool(i));
 
 /**
@@ -155,6 +173,45 @@ describe("low-LOD live turn: per-frame cost stays flat as the reply grows", () =
 		// across a comparable range; with the incremental titles-only parser the frame
 		// measured 0.196ms → 0.149ms, i.e. flat.
 		expect(late).toBeLessThan(Math.max(early, 0.05) * 3);
+	});
+
+	it("checkpoint projection takes the same incremental path as synthetic streaming", async () => {
+		const { parseStreamingReasoningTitles, resetStreamingReasoningCache } = await import(
+			"@shared/pretext-layout/reasoning-segments-cache"
+		);
+		const { segmentMessages } = await import("../message/message-segments");
+		const { groupRenderUnits } = await import("../trace/render-units");
+		const { adaptRenderUnits } = await import("./segment-adapter");
+
+		// Count full parses by spying on the resolver the adapter falls through to
+		// when it does NOT recognise a streaming item.
+		let fullParses = 0;
+		const ctx = {
+			lod: 2 as const,
+			resolveReasoningSegments: (text: string) => {
+				fullParses++;
+				return [{ title: null, body: text, isEmpty: false }];
+			},
+		};
+
+		const scaffold = STEP.repeat(20);
+		const longText = scaffold + GROWTH.repeat(200);
+		longText.charCodeAt(0);
+
+		// Warm the incremental cache under a key the adapter will derive.
+		resetStreamingReasoningCache("checkpoint-proj");
+		parseStreamingReasoningTitles("checkpoint-proj", longText);
+
+		// Drive the REAL adapter path with a checkpoint projection message.
+		const messages = [...HISTORY, checkpointProjectionMessage(longText)] as never[];
+		const units = groupRenderUnits(segmentMessages(messages), true);
+		adaptRenderUnits(units as never, ctx);
+
+		// The checkpoint projection must NOT fall through to the full parser.
+		// `isStreamingReasoningItem` now recognises `liveContentProjection`, so the
+		// adapter uses `parseStreamingReasoningTitles` (incremental) instead of
+		// `resolveReasoningSegments` (full re-parse every frame).
+		expect(fullParses).toBe(0);
 	});
 
 	it("holds the LIVE reasoning parse flat on a single-title body", async () => {

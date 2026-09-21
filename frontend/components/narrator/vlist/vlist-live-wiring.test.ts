@@ -387,21 +387,22 @@ describe("live patches vs the structural reload", () => {
 		expect(snap.scrollTop).toBeGreaterThanOrEqual(0);
 	});
 
-	// A patch rebuilds `input.messages` into a NEW array to change a field in place.
-	// The streaming row's "text since the last commit" counter must not read that as
-	// the document having grown: it is the signal that keeps a multi-step turn's live
-	// step alive (see streaming-handoff.ts), and zeroing it lets an already-stored
-	// EARLIER step retire output that was never persisted. Driving the real coordinator
-	// is what makes this a regression guard — the array identity really does change.
+	// A tool lifecycle patch changes the messages array, not content block ownership.
 	it("a lifecycle patch is not mistaken for document growth by the streaming row", async () => {
 		const { PretextLayoutCoordinator } = await import("./pretext-layout-coordinator");
 		const { toolCompletedPatch } = await import("./vlist-live-events");
-		const { commitGrowthSignature } = await import("./streaming-handoff");
+		const { projectStreamingMessage } = await import("./streaming-handoff");
 		const coordinator = new PretextLayoutCoordinator();
 		await coordinator.load("n1", BUILD_OPTIONS, { fetchPage: async () => runningToolPage() });
 
 		const before = coordinator.getSnapshot().input?.messages ?? [];
-		const beforeSignature = commitGrowthSignature(before);
+		const live = {
+			id: "__streaming__",
+			role: "assistant",
+			contentJson: [{ type: "text", id: "new", revision: 1, text: "NEW" }],
+			toolCalls: [],
+		} as unknown as Msg;
+		expect(projectStreamingMessage(live, before)).toBe(live);
 		expect(
 			coordinator.applyLivePatch(toolCompletedPatch({ toolUseId: "tu-1", status: "success" })),
 		).toBe(true);
@@ -409,15 +410,20 @@ describe("live patches vs the structural reload", () => {
 
 		// The identity DID change — that is exactly why watching it was wrong.
 		expect(after).not.toBe(before);
-		expect(commitGrowthSignature(after)).toBe(beforeSignature);
+		expect(projectStreamingMessage(live, after)).toBe(live);
 	});
 
-	it("still sees growth when a message is appended", async () => {
+	it("an unrelated appended message cannot retire the new live block", async () => {
 		const { PretextLayoutCoordinator } = await import("./pretext-layout-coordinator");
-		const { commitGrowthSignature } = await import("./streaming-handoff");
+		const { projectStreamingMessage } = await import("./streaming-handoff");
 		const coordinator = new PretextLayoutCoordinator();
 		await coordinator.load("n1", BUILD_OPTIONS, { fetchPage: async () => runningToolPage() });
-		const beforeSignature = commitGrowthSignature(coordinator.getSnapshot().input?.messages ?? []);
+		const live = {
+			id: "__streaming__",
+			role: "assistant",
+			contentJson: [{ type: "text", id: "new", revision: 1, text: "NEW" }],
+			toolCalls: [],
+		} as unknown as Msg;
 
 		expect(
 			coordinator.appendMessage(
@@ -436,8 +442,8 @@ describe("live patches vs the structural reload", () => {
 				false,
 			),
 		).toBe(true);
-		expect(commitGrowthSignature(coordinator.getSnapshot().input?.messages ?? [])).not.toBe(
-			beforeSignature,
+		expect(projectStreamingMessage(live, coordinator.getSnapshot().input?.messages ?? [])).toBe(
+			live,
 		);
 	});
 

@@ -84,23 +84,23 @@ const testProvider: ProviderAdapter = {
 			// Two text items. The annotation belongs to item 1 and its indices are
 			// RELATIVE TO THAT ITEM ("second" → end index 6), not to the joined text.
 			yield { text: "first ", textOutputIndex: 0 };
-			yield { textItemDone: true, textOutputIndex: 0 };
+			yield { contentBoundary: { kind: "text", phase: "complete", outputIndex: 0 } };
 			yield { text: "second", textOutputIndex: 1 };
 			yield {
 				textCitations: [
 					{ startIndex: 0, endIndex: 6, url: "https://example.test/c", outputIndex: 1 },
 				],
 			};
-			yield { textItemDone: true, textOutputIndex: 1 };
+			yield { contentBoundary: { kind: "text", phase: "complete", outputIndex: 1 } };
 			return;
 		}
 		if (scenario === "item_boundary") {
 			// A literal partial opener at item 0's end must be released BEFORE item 1.
 			// Flushing only at response end would reorder the stream as "AB<partial>".
 			yield { text: `A${PUA_START}ci`, textOutputIndex: 0 };
-			yield { textItemDone: true, textOutputIndex: 0 };
+			yield { contentBoundary: { kind: "text", phase: "complete", outputIndex: 0 } };
 			yield { text: "B", textOutputIndex: 1 };
-			yield { textItemDone: true, textOutputIndex: 1 };
+			yield { contentBoundary: { kind: "text", phase: "complete", outputIndex: 1 } };
 			return;
 		}
 		yield { text: "plain answer" };
@@ -228,13 +228,17 @@ describe("inline marker stripping", () => {
 		}
 	});
 
-	test("text from several output items joins in arrival order", async () => {
+	test("text items persist separately without losing or reordering literal fragments", async () => {
 		const events = await runTurn("item_boundary");
 
-		// No per-item buffering means no reordering risk: whatever the provider sent
-		// is what the client receives, and the persisted block matches it.
 		expect(streamedText(events)).toBe(`A${PUA_START}ciB`);
-		expect(textBlocks(events)[0].text).toBe(`A${PUA_START}ciB`);
+		const blocks = textBlocks(events);
+		expect(blocks.map((block) => [block.text, block.outputIndex])).toEqual([
+			[`A${PUA_START}ci`, 0],
+			["B", 1],
+		]);
+		expect(blocks[0].id).not.toBe(blocks[1].id);
+		expect(blocks.map((block) => block.text).join("")).toBe(streamedText(events));
 	});
 
 	test("the next turn's model history receives the cleaned text", async () => {
@@ -271,11 +275,16 @@ describe("structured annotations", () => {
 	test("a second output item's annotation anchors by item-relative index", async () => {
 		const events = await runTurn("two_items_annotation");
 
-		const block = textBlocks(events)[0];
-		expect(block.text).toBe("first second");
-		// Item-relative [0,6) inside item 1 → [6,12) in the joined text. Without the
-		// per-item base offset this would anchor at [0,6) and cite "first ".
-		expect(block.citations).toEqual([
+		const blocks = textBlocks(events);
+		expect(blocks.map((block) => block.text)).toEqual(["first ", "second"]);
+		expect(blocks[0].citations).toBeUndefined();
+		// Persisted blocks keep item-local coordinates. The aggregate compatibility
+		// text still needs the rebased [6,12) range, never a citation on "first ".
+		expect(blocks[1].citations).toEqual([
+			{ startIndex: 0, endIndex: 6, sources: [{ url: "https://example.test/c" }] },
+		]);
+		expect(assistantMessages(events)[0].text).toBe("first second");
+		expect(assistantMessages(events)[0].citations).toEqual([
 			{ startIndex: 6, endIndex: 12, sources: [{ url: "https://example.test/c" }] },
 		]);
 	});

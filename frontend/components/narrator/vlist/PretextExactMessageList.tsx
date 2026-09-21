@@ -89,7 +89,6 @@ import type { MeasuredToolCall } from "./measure/measure-tool-call";
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
 import { resolveRenderExtra } from "./render-registry";
-import { isStreamingMessageSuperseded } from "./streaming-handoff";
 import { type UsePretextDocumentResult, usePretextDocument } from "./usePretextDocument";
 import { useVListContentView } from "./useVListContentView";
 import { useVListLabels } from "./useVListLabels";
@@ -3241,7 +3240,6 @@ export const PretextExactMessageList = memo(
 			//
 			// Hand-off is structural: the row retires when the committed document already
 			// contains its content, so no timer can drop it while its replacement is missing.
-			const [streamingCharsSinceCommit, setStreamingCharsSinceCommit] = useState(0);
 			/**
 			 * Generation of THIS mount of the live row, for the streaming fade's store scope.
 			 *
@@ -3261,21 +3259,10 @@ export const PretextExactMessageList = memo(
 			useEffect(() => {
 				setStreamAnimMountEpoch(nextStreamAnimEpoch());
 			}, [narratorId]);
-			const streamingSuperseded = useMemo(
-				() =>
-					isStreamingMessageSuperseded({
-						streamingMessage: pretextDocument.streamingMessage,
-						committedMessages: pretextDocument.messages,
-						charsSinceLastCommit: streamingCharsSinceCommit,
-					}),
-				[pretextDocument.streamingMessage, pretextDocument.messages, streamingCharsSinceCommit],
-			);
 			const streamingMsg = useVListStreamingMessage(narratorId, {
 				enabled: isActive,
 				isSubagent,
-				superseded: streamingSuperseded,
 				committedMessages: pretextDocument.messages,
-				onCharsSinceCommitChange: setStreamingCharsSinceCommit,
 			});
 			const publishStreamingMessage = pretextDocument.setStreamingMessage;
 			useEffect(() => {
@@ -3283,25 +3270,9 @@ export const PretextExactMessageList = memo(
 			}, [publishStreamingMessage, streamingMsg]);
 			// --- Head trim: bound the loaded window in a long session ---
 			//
-			// Evaluated at the edge where the live row CLEARS, i.e. a turn just finished and
-			// the session is momentarily idle. Deliberately not after an append: an append
-			// happens mid-stream, and trimming then can destroy un-persisted output — the
-			// head removal moves `commitGrowthSignature` (`${length}:${newestId}`) without a
-			// message having landed, the hand-off reads that as growth, resets
-			// `charsSinceLastCommit`, and an already-stored earlier step then retires the live
-			// row. `resolveHeadTrim` also hard-rejects while streaming, so this is belt and
-			// braces; the timing is what makes a trim USEFUL (a turn's worth of new messages
-			// has just landed) rather than merely safe.
-			//
-			// "The live row cleared" is only a PROXY for "the turn ended", and it stopped
-			// being an exact one: the per-block hand-off (streaming-block-supersede.ts) also
-			// empties the row, mid-turn, the moment a catch-up delivers the partial message
-			// carrying blocks the row still held. That edge lands while the model is between
-			// steps — `resolveHeadTrim` sees `hasStreamingRow: false`, a pinned reader and a
-			// long window, so nothing else would decline it — and a trim there resets
-			// `charsSinceLastCommit` exactly as described above, endangering the output of the
-			// step that follows. So the intent is now stated directly instead of inferred:
-			// only trim while the narrator is NOT active.
+			// A checkpoint can empty the live projection mid-turn. Keep the existing
+			// active-session protection: trim only after the narrator becomes idle,
+			// never infer turn completion from an empty synthetic row.
 			const hadStreamingRowRef = useRef(false);
 			const trimHead = pretextDocument.trimHead;
 			// Latest-value refs: the effect must not re-run when these change (they change

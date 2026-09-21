@@ -160,6 +160,7 @@ interface GeminiActiveStep {
 	index: number;
 	signature?: string;
 	argumentsSeen?: boolean;
+	textLength?: number;
 }
 
 function byteLength(text: string): number {
@@ -408,9 +409,26 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			outputIndex?: number;
 		}>,
 		textOutputIndex?: number,
+		_redactedThinkingBlocks?: Parameters<ProviderAdapter["pushAssistantTurn"]>[8],
+		orderedContent?: readonly import("./types").ContentBlock[],
 	): void {
 		const ordered: Array<{ index: number; sequence: number; step: GeminiInteractionStep }> = [];
 		let sequence = 0;
+		if (orderedContent) {
+			reasoningBlocks = [];
+			toolUses = [];
+			text = "";
+			for (const [index, block] of orderedContent.entries()) {
+				if (block.type === "text" && block.text)
+					ordered.push({
+						index,
+						sequence: sequence++,
+						step: { type: "model_output", content: block.text },
+					});
+				else if (block.type === "reasoning") reasoningBlocks.push({ ...block, outputIndex: index });
+				else if (block.type === "tool_use") toolUses.push({ ...block, outputIndex: index });
+			}
+		}
 		const currentSource = this.getActiveReasoningSource();
 
 		for (const block of reasoningBlocks ?? []) {
@@ -954,14 +972,16 @@ function* parseGeminiSseEvent(
 	}
 
 	const index = envelope.index ?? 0;
+	const stepId = envelope.step && "id" in envelope.step ? envelope.step.id : undefined;
+	const blockId = `gemini:step:${eventType === "step.start" ? (stepId ?? index) : (activeSteps.get(index)?.id ?? stepId ?? index)}`;
 	if (eventType === "step.start" && envelope.step) {
 		const step = envelope.step;
 		if (step.type === "model_output") {
-			activeSteps.set(index, { type: step.type, id: step.id, index });
 			const text = textFromModelOutput(step);
+			activeSteps.set(index, { type: step.type, id: step.id, index, textLength: text.length });
 			if (text) {
 				countText(text);
-				yield { text, textOutputIndex: index };
+				yield { text, textOutputIndex: index, textBlockId: blockId };
 			}
 		} else if (step.type === "thought") {
 			activeSteps.set(index, {
@@ -969,11 +989,17 @@ function* parseGeminiSseEvent(
 				id: step.id,
 				index,
 				signature: step.signature,
+				textLength: extractThoughtTexts(step.summary).join("").length,
 			});
 			const metadata = thoughtMetadata(step.id, index, step.signature);
 			for (const summary of extractThoughtTexts(step.summary)) {
 				countText(summary);
-				yield { reasoning: summary, reasoningMetadata: metadata, reasoningOutputIndex: index };
+				yield {
+					reasoning: summary,
+					reasoningMetadata: metadata,
+					reasoningOutputIndex: index,
+					reasoningBlockId: blockId,
+				};
 			}
 		} else if (step.type === "function_call") {
 			const callId = step.id;
@@ -1012,8 +1038,8 @@ function* parseGeminiSseEvent(
 				yield {
 					reasoningMetadata: thoughtMetadata(active.id, index, signature),
 					reasoningOutputIndex: index,
+					reasoningBlockId: blockId,
 				};
-				return;
 			}
 		}
 		if (active.type === "function_call" && active.callId) {
@@ -1033,14 +1059,16 @@ function* parseGeminiSseEvent(
 			const text = extractTextDelta(delta);
 			if (!text) return;
 			countText(text);
+			active.textLength = (active.textLength ?? 0) + text.length;
 			if (active.type === "thought") {
 				yield {
 					reasoning: text,
+					reasoningBlockId: blockId,
 					reasoningMetadata: thoughtMetadata(active.id, index, active.signature),
 					reasoningOutputIndex: index,
 				};
 			} else {
-				yield { text, textOutputIndex: index };
+				yield { text, textOutputIndex: index, textBlockId: blockId };
 			}
 		}
 		return;
@@ -1049,6 +1077,24 @@ function* parseGeminiSseEvent(
 	if (eventType === "step.stop") {
 		const active = activeSteps.get(index);
 		const step = envelope.step;
+		const finalText =
+			step?.type === "model_output"
+				? textFromModelOutput(step)
+				: step?.type === "thought"
+					? extractThoughtTexts(step.summary).join("")
+					: "";
+		const suffix = finalText.slice(active?.textLength ?? 0);
+		if (suffix && (active?.type === "thought" || active?.type === "model_output")) {
+			countText(suffix);
+			if (active.type === "thought")
+				yield {
+					reasoning: suffix,
+					reasoningBlockId: blockId,
+					reasoningOutputIndex: index,
+					reasoningMetadata: thoughtMetadata(active.id, index, active.signature),
+				};
+			else yield { text: suffix, textBlockId: blockId, textOutputIndex: index };
+		}
 		if (active?.type === "function_call" && active.callId) {
 			yield {
 				toolUseChunk: {
@@ -1064,6 +1110,17 @@ function* parseGeminiSseEvent(
 			yield {
 				reasoningMetadata: thoughtMetadata(active.id, index, signature),
 				reasoningOutputIndex: index,
+				reasoningBlockId: blockId,
+			};
+		}
+		if (active?.type === "thought" || active?.type === "model_output") {
+			yield {
+				contentBoundary: {
+					kind: active.type === "thought" ? "reasoning" : "text",
+					phase: "complete",
+					blockId: blockId,
+					outputIndex: index,
+				},
 			};
 		}
 		activeSteps.delete(index);

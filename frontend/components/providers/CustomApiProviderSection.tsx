@@ -31,6 +31,7 @@ import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
 import type { CustomApiProtocol, CustomApiProviderState, OpenAIProviderState } from "./types";
+import { defaultUserAgentModeForProtocol } from "./types";
 
 type ProvidersUpdater =
 	| CustomApiProviderState[]
@@ -482,6 +483,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 						customUserAgent: provider.customUserAgent,
 						extraHeaders: provider.extraHeaders,
 					}}
+					defaultMode={defaultUserAgentModeForProtocol(provider.protocol)}
 					onChange={(next) => {
 						if (next.userAgentMode !== undefined)
 							updateProvider("userAgentMode", next.userAgentMode);

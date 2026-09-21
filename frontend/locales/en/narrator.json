@@ -814,8 +814,6 @@
 	"segmentCompactConfirm": "Compact {{count}} selected message(s)? The original messages will be hidden and replaced with a summary.",
 	"viewSubagentSession": "View session",
 	"openFullSubagentSession": "Open full session",
-	"subagentBackgroundNotice": "Started in the background. View progress and results in the panel.",
-	"subagentOpenInPanel": "Open in panel",
 	"backgroundTaskStarted": "Started in the background; see Background tasks for progress.",
 	"injectionTarget": {
 		"openKnowledge": "Open knowledge entry",
@@ -1534,8 +1532,9 @@
 		"more": "More tools",
 		"sectionVisible": "Shown in header",
 		"sectionTucked": "In this menu",
+		"sectionBottom": "Bottom function icons",
 		"expandOptions": "Show options",
-		"someHiddenNoRoom": "Dimmed entries did not fit the header"
+		"someHiddenNoRoom": "Collapsed to fit the header"
 	},
 	"spec": {
 		"title": "Outline",

@@ -302,7 +302,20 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			outputIndex?: number;
 			signatureSource?: string;
 		}>,
+		orderedContent?: readonly import("./types").ContentBlock[],
 	): void {
+		if (orderedContent) {
+			const content = orderedContent
+				.map((block) => canonicalizeContentBlock(block, this.activeReasoningSource))
+				.filter(isProviderContentBlock);
+			if (content.length)
+				(history as ProviderMessage[]).push({
+					role: "assistant",
+					content,
+					...(messageId ? { messageId } : {}),
+				});
+			return;
+		}
 		const blocks: Array<{ block: ProviderContentBlock; outputIndex?: number; order: number }> = [];
 		let order = 0;
 		if (text)
@@ -639,15 +652,28 @@ function mapStreamEvent(
 	},
 ): ParsedStreamEvent | typeof CANCELLED | undefined {
 	switch (event.type) {
+		case "content.boundary":
+			return {
+				contentBoundary: {
+					kind: event.kind,
+					phase: event.phase,
+					blockId: event.blockId,
+					outputIndex: event.outputIndex,
+				},
+			};
 		case "text.delta":
-			return { text: event.text, textOutputIndex: event.outputIndex };
+			return { text: event.text, textOutputIndex: event.outputIndex, textBlockId: event.blockId };
 		case "text.citation":
 			// Schema-level bounds already applied; the loop normalizes and drops
 			// anything that does not resolve against the cleaned text.
-			return { textCitations: event.citations.map((citation) => ({ ...citation })) };
+			return {
+				textCitations: event.citations.map((citation) => ({ ...citation })),
+				textBlockId: event.blockId,
+			};
 		case "reasoning.delta":
 			return {
 				reasoning: event.text,
+				reasoningBlockId: event.blockId,
 				reasoningOutputIndex: event.outputIndex,
 				...(event.metadata
 					? { reasoningMetadata: mapReasoningMetadata(event.metadata, context) }
@@ -655,6 +681,7 @@ function mapStreamEvent(
 			};
 		case "reasoning.metadata":
 			return {
+				reasoningBlockId: event.blockId,
 				reasoningOutputIndex: event.outputIndex,
 				reasoningMetadata: mapReasoningMetadata(event.metadata, context),
 			};
@@ -1012,8 +1039,8 @@ function canonicalizeContentBlock(
 		typeof (record.text ?? record.thinking) === "string"
 	) {
 		const text = String(record.text ?? record.thinking);
-		if (!text) return undefined;
 		const continuation = continuationFromStoredBlock(record, reasoningSource);
+		if (!text && !continuation) return undefined;
 		return withOptionalIndex(
 			{ type: "reasoning", text, ...(continuation ? { continuation } : {}) },
 			optionalIndex(record.outputIndex),
@@ -1056,13 +1083,20 @@ function canonicalizeContentBlock(
 			(typeof record.id === "string" && record.id);
 		const name = typeof record.name === "string" ? record.name : undefined;
 		if (!toolUseId || !name) return undefined;
+		const continuation =
+			typeof record.thoughtSignature === "string" &&
+			record.thoughtSignatureSource === reasoningSource
+				? { source: reasoningSource, format: "tool-continuation", data: record.thoughtSignature }
+				: isJsonValue(record.continuation)
+					? record.continuation
+					: undefined;
 		return withOptionalIndex(
 			{
 				type: "tool_call",
 				toolUseId,
 				name,
 				input: parseJsonObject(record.input),
-				...(isJsonValue(record.continuation) ? { continuation: record.continuation } : {}),
+				...(continuation ? { continuation } : {}),
 			},
 			optionalIndex(record.outputIndex),
 		);
@@ -1084,6 +1118,7 @@ function canonicalizeContentBlock(
 			{
 				type: "image_generation",
 				id: record.id,
+				...(typeof record.result === "string" ? { result: record.result } : {}),
 				...(typeof record.revisedPrompt === "string"
 					? { revisedPrompt: record.revisedPrompt }
 					: {}),

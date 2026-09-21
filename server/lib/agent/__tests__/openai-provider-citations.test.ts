@@ -156,13 +156,23 @@ describe("final output_item.done fallback", () => {
 		expect(events.flatMap((event) => event.textCitations ?? [])).toHaveLength(2);
 	});
 
-	test("an assistant item without annotations behaves exactly as before", () => {
+	test("an assistant item without annotations still emits identity and completion", () => {
 		const events = parse({
 			type: "response.output_item.done",
 			item: { type: "message", role: "assistant", id: "msg_3", content: [{ type: "output_text" }] },
 		});
 
-		expect(events).toEqual([{ messageId: "msg_3" }]);
+		expect(events).toEqual([
+			{ messageId: "msg_3" },
+			{
+				contentBoundary: {
+					kind: "text",
+					phase: "complete",
+					blockId: "responses:msg_3:text:0",
+					outputIndex: undefined,
+				},
+			},
+		]);
 	});
 });
 
@@ -174,6 +184,8 @@ describe("unrelated events are unaffected", () => {
 			output_index: 0,
 		});
 
-		expect(events).toEqual([{ text: "hello", textOutputIndex: 0 }]);
+		expect(events).toEqual([
+			{ text: "hello", textOutputIndex: 0, textBlockId: "responses:0:text:0" },
+		]);
 	});
 });

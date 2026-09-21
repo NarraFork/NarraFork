@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import {
 	type CompactMessageMode,
 	type CompactMessageTrigger,
@@ -22,6 +23,7 @@ import {
 import { isModelPlanReference } from "../lib/agent/strip-plan-body";
 import type {
 	ApiRequestDiagnostics,
+	ReasoningProviderMetadata,
 	ToolCallBinding,
 	ToolExecutionPlan,
 	ToolExecutionTarget,
@@ -1065,6 +1067,28 @@ function assertPgPlacement(placement?: MessagePlacementOptions): void {
 		);
 }
 
+/** A late signature/cipher frame augments provider replay data; absent keys are not deletions. */
+function mergeReasoningMetadata(
+	previous: ReasoningProviderMetadata | undefined,
+	incoming: ReasoningProviderMetadata,
+): ReasoningProviderMetadata {
+	const merged = {
+		...previous,
+		...Object.fromEntries(Object.entries(incoming).filter(([, value]) => value !== undefined)),
+	};
+	for (const provider of ["openai", "anthropic", "gemini"] as const) {
+		if (incoming[provider]) {
+			merged[provider] = {
+				...previous?.[provider],
+				...Object.fromEntries(
+					Object.entries(incoming[provider]).filter(([, value]) => value !== undefined),
+				),
+			};
+		}
+	}
+	return merged;
+}
+
 const sqliteNarratorPersistence = {
 	/**
 	 * Persist a `role: "user"` message.
@@ -1958,10 +1982,15 @@ const sqliteNarratorPersistence = {
 					citations?: import("@shared/citations").TextCitation[];
 					fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
 					id?: string;
+					revision?: number;
+					rawTextLength?: number;
 			  }
 			| {
 					type: "reasoning";
 					text: string;
+					id?: string;
+					revision?: number;
+					rawTextLength?: number;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
@@ -1994,12 +2023,17 @@ const sqliteNarratorPersistence = {
 					width?: number;
 					height?: number;
 			  },
+		options?: { republishUnchanged?: boolean },
 	) {
-		const existing = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { contentJson: true, parentToolUseId: true },
-		});
-		if (!existing) return;
+		// No await between reading and replacing the JSON body: a concurrent checkpoint
+		// or translation must not overwrite a newer revision read by another consumer.
+		const existing = db.query.narratorMessages
+			.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				columns: { contentJson: true, parentToolUseId: true },
+			})
+			.sync();
+		if (!existing) throw new NotFoundError("Assistant message", messageId);
 
 		type StoredAssistantBlock =
 			| {
@@ -2009,10 +2043,15 @@ const sqliteNarratorPersistence = {
 					citations?: import("@shared/citations").TextCitation[];
 					fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
 					id?: string;
+					revision?: number;
+					rawTextLength?: number;
 			  }
 			| {
 					type: "reasoning";
 					text: string;
+					id?: string;
+					revision?: number;
+					rawTextLength?: number;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
@@ -2040,7 +2079,35 @@ const sqliteNarratorPersistence = {
 			Array.isArray(existing.contentJson) ? existing.contentJson : []
 		) as StoredAssistantBlock[];
 		let content: StoredAssistantBlock[];
-		if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
+		const matchingIndex =
+			(block.type === "text" || block.type === "reasoning") && block.id
+				? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
+				: -1;
+		if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
+			const previous = current[matchingIndex] as Record<string, unknown>;
+			const stale =
+				typeof previous.revision === "number" &&
+				(block.revision == null || block.revision < previous.revision);
+			const next: Record<string, unknown> = {
+				...previous,
+				...Object.fromEntries(Object.entries(block).filter(([, value]) => value !== undefined)),
+			};
+			if (block.type === "reasoning" && block.providerMetadata) {
+				next.providerMetadata = mergeReasoningMetadata(
+					previous.providerMetadata as ReasoningProviderMetadata | undefined,
+					block.providerMetadata,
+				);
+			}
+			if (previous.text !== block.text) delete next.translatedText;
+			if (stale || isDeepStrictEqual(previous, next)) {
+				content = current;
+			} else {
+				// A checkpoint updates the original chronological slot, even when its
+				// metadata arrives after a tool has already been committed.
+				content = [...current];
+				content[matchingIndex] = next as StoredAssistantBlock;
+			}
+		} else if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
 			const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
 				const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
 				return typeof outputIndex === "number" ? outputIndex : undefined;
@@ -2053,25 +2120,21 @@ const sqliteNarratorPersistence = {
 				return aOrder === bOrder ? a.index - b.index : aOrder - bOrder;
 			});
 			content = indexed.map(({ entry }) => entry);
-		} else if (block.type === "reasoning") {
-			const idx = current.findIndex((b) => b.type !== "reasoning");
-			content =
-				idx === -1 ? [...current, block] : [...current.slice(0, idx), block, ...current.slice(idx)];
-		} else if (block.type === "text") {
-			const idx = current.findIndex((b) => b.type === "tool_use");
-			content =
-				idx === -1 ? [...current, block] : [...current.slice(0, idx), block, ...current.slice(idx)];
 		} else {
+			// Unindexed providers/checkpoints already arrive in occurrence order. Do not
+			// pull later reasoning in front of text/tools that were actually seen first.
 			content = [...current, block];
 		}
-		const contentText = content
-			.flatMap((b) => (b.type === "text" && typeof b.text === "string" ? [b.text] : []))
-			.join("\n");
-
-		await db
-			.update(narratorMessages)
-			.set({ contentJson: content, contentText: contentText || null })
-			.where(eq(narratorMessages.id, messageId));
+		if (content === current && !options?.republishUnchanged) return undefined;
+		if (content !== current) {
+			const contentText = content
+				.flatMap((b) => (b.type === "text" && typeof b.text === "string" ? [b.text] : []))
+				.join("\n");
+			db.update(narratorMessages)
+				.set({ contentJson: content, contentText: contentText || null })
+				.where(eq(narratorMessages.id, messageId))
+				.run();
+		}
 
 		/**
 		 * Publish the partial now that it holds real content.
@@ -2097,7 +2160,7 @@ const sqliteNarratorPersistence = {
 				where: eq(narratorMessages.id, messageId),
 				with: { toolCalls: true },
 			});
-			if (!published) return;
+			if (!published) throw new NotFoundError("Assistant message", messageId);
 			const ref = await db.query.narratorMessageRefs.findFirst({
 				where: and(
 					eq(narratorMessageRefs.narratorId, narratorId),
@@ -2106,7 +2169,7 @@ const sqliteNarratorPersistence = {
 				columns: { seq: true },
 			});
 			const projected = enrichToolUseBlocks(truncateToolIO([{ ...published, seq: ref?.seq }]))[0];
-			if (!projected) return;
+			if (!projected) throw new Error(`Cannot publish assistant message ${messageId}`);
 			dualBroadcastToNarrator(
 				{
 					narratorId,
@@ -2166,23 +2229,31 @@ const sqliteNarratorPersistence = {
 		messageId: string,
 		reasoningIndex: number,
 		translatedText: string,
+		expected?: { id?: string; text: string },
 	) {
-		const existing = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { contentJson: true },
-		});
-		if (!existing) return;
+		const existing = db.query.narratorMessages
+			.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				columns: { contentJson: true },
+			})
+			.sync();
+		if (!existing) return false;
 
 		const content = Array.isArray(existing.contentJson) ? [...existing.contentJson] : [];
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON content blocks
-		const block = content[reasoningIndex] as any;
-		if (!block || block.type !== "reasoning") return;
+		const index = expected?.id
+			? content.findIndex((entry) => entry?.type === "reasoning" && entry.id === expected.id)
+			: reasoningIndex;
+		const block = content[index] as Record<string, unknown> | undefined;
+		if (!block || block.type !== "reasoning") return false;
+		if (expected && block.text !== expected.text) return false;
+		if (block.translatedText === translatedText) return false;
 
 		block.translatedText = translatedText;
-		await db
-			.update(narratorMessages)
+		db.update(narratorMessages)
 			.set({ contentJson: content })
-			.where(eq(narratorMessages.id, messageId));
+			.where(eq(narratorMessages.id, messageId))
+			.run();
+		return true;
 	},
 
 	/**

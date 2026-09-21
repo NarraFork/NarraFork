@@ -51,6 +51,8 @@ export interface LiveBlockLike {
 export interface LiveBlocksMessageLike {
 	contentJson?: unknown;
 	liveBlockIndex?: number | null;
+	/** Frontend-only: a real checkpoint row currently projects a newer live block. */
+	liveContentProjection?: boolean;
 }
 
 /**
@@ -100,9 +102,12 @@ export function resolveLiveBlockIndex(
 	isStreamingMessage: boolean,
 	msg: LiveBlocksMessageLike | null | undefined,
 ): number {
-	if (!isStreamingMessage || !msg) return -1;
+	if (!msg || (!isStreamingMessage && !msg.liveContentProjection)) return -1;
+	// A checkpointed real message can temporarily project a newer live revision.
+	// Only that local projection carries a stamp; persisted messages never do.
 	const stamped = msg.liveBlockIndex;
 	if (typeof stamped === "number") return stamped;
+	if (!isStreamingMessage) return -1;
 	const blocks = msg.contentJson;
 	if (!Array.isArray(blocks) || blocks.length === 0) return -1;
 	return positionalLiveBlockIndex(blocks as readonly LiveBlockLike[]);

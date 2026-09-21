@@ -2,8 +2,10 @@ import { describe, expect, it, test } from "bun:test";
 import { deriveCodexWindowId } from "../agent/codex-request";
 import {
 	buildCodexEmulationHeaders,
+	getHttpCodexUserAgent,
 	getHttpUserAgent,
 	mergeExtraHeaders,
+	ORIGINATOR,
 	ORIGINATOR_CODEX,
 	RESPONSES_LITE_HEADER,
 	resolveClientFingerprint,
@@ -16,6 +18,33 @@ describe("buildCodexEmulationHeaders", () => {
 		const headers = buildCodexEmulationHeaders({ installationId: INSTALLATION_ID });
 		expect(headers.originator).toBe(ORIGINATOR_CODEX);
 		expect(headers["x-codex-installation-id"]).toBe(INSTALLATION_ID);
+	});
+
+	/**
+	 * User-reported: Codex provider UA set to NarraFork still showed codex-tui
+	 * on the wire. The User-Agent mode alone was never enough — originator is
+	 * what dumps and relays read first, so it must follow the explicit choice.
+	 */
+	test("originator follows an explicit NarraFork UA mode", () => {
+		const headers = buildCodexEmulationHeaders({
+			installationId: INSTALLATION_ID,
+			userAgentMode: "narrafork",
+		});
+		expect(headers.originator).toBe(ORIGINATOR);
+		expect(headers["x-codex-installation-id"]).toBe(INSTALLATION_ID);
+	});
+
+	test.each([
+		["codex"],
+		["claude-code"],
+		["custom"],
+		[undefined],
+	] as const)("originator stays codex-tui for mode=%s", (mode) => {
+		const headers = buildCodexEmulationHeaders({
+			installationId: INSTALLATION_ID,
+			userAgentMode: mode,
+		});
+		expect(headers.originator).toBe(ORIGINATOR_CODEX);
 	});
 
 	/**
@@ -95,6 +124,22 @@ describe("resolveClientFingerprint", () => {
 			fallback: getHttpUserAgent(),
 		});
 		expect(headers["x-codex-installation-id"]).toBeUndefined();
+	});
+
+	/**
+	 * Locks the full identity pair the operator sees in a request dump when they
+	 * pick NarraFork on a Codex surface: both the User-Agent and originator.
+	 */
+	test("NarraFork UA mode presents NarraFork on both User-Agent and originator", () => {
+		const { userAgent, headers } = resolveClientFingerprint({
+			mode: "narrafork",
+			fallback: getHttpCodexUserAgent(),
+			installationId: INSTALLATION_ID,
+			conversationId: "conv-1",
+		});
+		expect(userAgent).toBe(getHttpUserAgent());
+		expect(headers.originator).toBe(ORIGINATOR);
+		expect(headers["x-codex-installation-id"]).toBe(INSTALLATION_ID);
 	});
 
 	test("user extra headers override emitted codex headers", () => {

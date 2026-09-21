@@ -219,6 +219,8 @@ export interface ProviderAdapter {
 			outputIndex?: number;
 			signatureSource?: string;
 		}>,
+		/** Authoritative encounter order; reasoning entries contain whole native items, not checkpoints. */
+		orderedContent?: readonly import("./types").ContentBlock[],
 	): void;
 
 	/** Simple text generation — no tools, no loop. Returns generated text. */

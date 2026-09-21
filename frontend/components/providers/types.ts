@@ -11,6 +11,27 @@ export type CustomApiProtocol =
 /** Per-provider User-Agent selection mode. */
 export type UserAgentMode = "narrafork" | "claude-code" | "codex" | "custom";
 
+/**
+ * Default client identity for a custom-API protocol when the operator has not
+ * chosen a User-Agent mode.
+ *
+ * Relay defaults follow the protocol the traffic actually speaks:
+ * - Codex 中转 → Codex
+ * - Claude Code 中转（official / compatible）→ Claude Code
+ * - Everything else presents as NarraFork
+ */
+export function defaultUserAgentModeForProtocol(protocol: CustomApiProtocol): UserAgentMode {
+	switch (protocol) {
+		case "codex-native":
+			return "codex";
+		case "anthropic-official":
+		case "anthropic-compatible":
+			return "claude-code";
+		default:
+			return "narrafork";
+	}
+}
+
 export interface CustomApiProviderState {
 	id: string;
 	name: string;

@@ -198,6 +198,17 @@ export interface ProviderTextCitation {
 
 export interface ParsedStreamEvent {
 	text?: string;
+	/** Provider-native lane identity, including the content part within an output item. */
+	textBlockId?: string;
+	/** Provider-native reasoning item identity (not an individual summary fragment). */
+	reasoningBlockId?: string;
+	/** Native content lifecycle. Checkpoints never finalize credentials or split replay items. */
+	contentBoundary?: {
+		kind: "text" | "reasoning";
+		phase: "start" | "checkpoint" | "complete";
+		blockId?: string;
+		outputIndex?: number;
+	};
 	/** Provider-native content block index for the text block (e.g. Anthropic SSE event.index). */
 	textOutputIndex?: number;
 	toolUses?: AgentToolUse[];

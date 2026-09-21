@@ -53,6 +53,27 @@ export function isGeminiCustomApiProtocol(protocol: CustomApiProtocol): boolean 
 	return protocol === "gemini-compatible";
 }
 
+/**
+ * Default User-Agent mode when an operator has not chosen one for this protocol.
+ *
+ * Relay defaults follow the protocol the traffic speaks: Codex 中转 presents as
+ * Codex; Claude Code 中转 (official and compatible Anthropic) presents as Claude
+ * Code. Other protocols present as NarraFork.
+ */
+export function defaultUserAgentModeForProtocol(
+	protocol: CustomApiProtocol,
+): NonNullable<CustomApiProviderConfig["userAgentMode"]> {
+	switch (protocol) {
+		case "codex-native":
+			return "codex";
+		case "anthropic-official":
+		case "anthropic-compatible":
+			return "claude-code";
+		default:
+			return "narrafork";
+	}
+}
+
 export function customApiProtocolToOpenAIApiMode(
 	protocol: CustomApiProtocol,
 ): OpenAIProviderConfig["apiMode"] | undefined {
@@ -260,11 +281,12 @@ export function customApiProvidersToGemini(
 export function normalizeCustomApiProvider(
 	provider: CustomApiProviderConfig,
 ): CustomApiProviderConfig {
+	const protocol = provider.protocol ?? "responses-compatible";
 	return {
 		...provider,
-		protocol: provider.protocol ?? "responses-compatible",
+		protocol,
 		geminiTransport:
-			provider.protocol === "gemini-compatible"
+			protocol === "gemini-compatible"
 				? (provider.geminiTransport ?? "generate-content")
 				: provider.geminiTransport,
 		defaultReasoningEffort: provider.defaultReasoningEffort ?? undefined,
@@ -273,6 +295,9 @@ export function normalizeCustomApiProvider(
 		codexWebSearch: provider.codexWebSearch ?? true,
 		codexImageGeneration: provider.codexImageGeneration ?? true,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
+		// Materialize the protocol default so UI display, storage, and the wire
+		// all agree when the operator never touched the fingerprint control.
+		userAgentMode: provider.userAgentMode ?? defaultUserAgentModeForProtocol(protocol),
 	};
 }
 

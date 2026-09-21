@@ -199,6 +199,8 @@ export interface AdapterMessage {
 	 * back to a positional rule when this is absent.
 	 */
 	liveBlockIndex?: number;
+	/** Frontend projection only; never written back into stored messages. */
+	liveContentProjection?: boolean;
 	creator?: {
 		id?: string;
 		username: string;
@@ -1651,7 +1653,15 @@ function adaptMessage(
 					kind,
 					key,
 					data,
-					opts: { expanded: ctx.isExpanded?.(key), showOriginal },
+					opts: {
+						expanded: ctx.isExpanded?.(key),
+						showOriginal,
+						// A live reasoning body (synthetic streaming row or checkpoint
+						// projection) must go through the incremental prepared-block path
+						// in the measure registry — the same flag markdown already carries.
+						// Without it every delta re-runs the full reasoning measure.
+						...(streaming ? { streamingContent: true } : {}),
+					},
 				});
 			}
 			position = nextPosition - 1;
@@ -1666,7 +1676,19 @@ function adaptMessage(
 					data: markdownData(block),
 					// Missing provenance retains the legacy shape. The render boundary maps
 					// it to explicit null, never inheriting the live narrator's current cwd.
-					...(fileReferenceContext ? { opts: { fileReferenceContext } } : {}),
+					...(fileReferenceContext || typeof block.revision === "number"
+						? {
+								opts: {
+									...(fileReferenceContext ? { fileReferenceContext } : {}),
+									...(typeof block.revision === "number"
+										? { contentRevision: block.revision }
+										: {}),
+									...(isLiveStreamingBlock(streamingMessage, msg, bi)
+										? { streamingContent: true }
+										: {}),
+								},
+							}
+						: {}),
 				});
 				break;
 			}
@@ -4293,19 +4315,22 @@ export function reasoningStepUnitId(
 }
 
 /**
- * True for a reasoning row belonging to the synthetic (un-persisted) streaming row.
+ * True for a reasoning row belonging to a live-streaming message — either the
+ * synthetic `__streaming__` row or a checkpointed real message currently
+ * projecting a newer live revision (`liveContentProjection`).
  *
  * This is the PARSER question, not the "is it still being written" question. The
  * whole live message is re-adapted on every delta, so any reasoning inside it must go
  * through the incremental parser — including a run that has already finished, since
  * re-parsing its accumulated body every frame is the O(len²)-per-turn shape
- * `reasoning-segments-cache.ts` exists to remove. For the visual live state see
- * `isLiveReasoningItem`.
+ * `reasoning-segments-cache.ts` exists to remove. The same applies to a checkpoint
+ * projection: the real message ID is re-adapted every frame while the projection
+ * is active. For the visual live state see `isLiveReasoningItem`.
  */
 function isStreamingReasoningItem(
 	item: Extract<AdapterActivityInput, { kind: "reasoning" }>,
 ): boolean {
-	return item.msg?.id === STREAMING_MESSAGE_ID;
+	return item.msg?.id === STREAMING_MESSAGE_ID || item.msg?.liveContentProjection === true;
 }
 
 /**

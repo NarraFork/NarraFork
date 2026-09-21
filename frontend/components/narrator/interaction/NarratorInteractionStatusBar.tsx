@@ -4,7 +4,6 @@ import {
 	Box,
 	Button,
 	Group,
-	Indicator,
 	Loader,
 	Menu,
 	NativeSelect,
@@ -14,7 +13,7 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import { IconLock, IconLockOpen, IconShield, IconTerminal } from "@tabler/icons-react";
+import { IconLock, IconLockOpen, IconShield } from "@tabler/icons-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SpecTaskItem } from "../../../lib/api/spec";
@@ -43,7 +42,6 @@ import { ModelPriceModal } from "../model/ModelPriceModal";
 import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
 import type { RetryInfo } from "../useNarratorPanelWS";
 import { InlineOverrideActions } from "./InlineOverrideActions";
-import { PathRulesPopover } from "./PathRulesPopover";
 import { PermissionMenuContent } from "./PermissionMenuContent";
 import { ReasoningEffortMenuItems } from "./ReasoningEffortMenuItems";
 import type {
@@ -224,6 +222,7 @@ export interface NarratorInteractionStatusBarProps {
 
 	mobile: {
 		actions: NarratorStatusToolbarAction[];
+		bottomActions?: NarratorStatusToolbarAction[];
 		measurementKey: string;
 	};
 
@@ -250,14 +249,12 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 		codexControls,
 		quota,
 		relaxedPlan,
-		terminal,
 		promote,
 		viewers,
 		currentUser,
 		mobile,
 		contextIndicator,
 		t,
-		tt,
 	} = props;
 
 	// Model price popup state. Kept here (a stable ancestor rendered outside the
@@ -536,286 +533,277 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 							)}
 							{/* Desktop selects */}
 							{!compact && (
-								<Group gap={6} wrap="nowrap" visibleFrom="sm">
-									<Tooltip label={t("modelTooltip")}>
-										<Menu
-											position="top-end"
-											opened={menuOpenDesktop}
-											onChange={(o) => {
-												// Don't let the price popup's outside-click close the menu.
-												if (!o && priceModel != null) return;
-												setMenuOpenDesktop(o);
-											}}
-										>
-											<Menu.Target>
-												<NativeSelect
-													size="xs"
-													// The menu renders the full catalog; the trigger only needs
-													// the selected option so native sizing ignores longer models.
-													data={model.allModels
-														.filter((m) => {
-															const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
-															const agg = parseAggModelValue(raw);
-															return m.value === (agg ? `${AGG_MODEL_PREFIX}${agg.aggId}` : raw);
-														})
-														.map((m) => ({
-															value: m.value,
-															label:
-																m.value === FOLLOW_DEFAULT_MODEL
-																	? t("followDefault", { model: model.defaultModelValue })
-																	: m.provider === "__agg__"
-																		? `⚡ ${m.label}`
-																		: m.provider
-																			? `${m.provider}:${m.label}`
-																			: m.label,
-														}))}
-													value={(() => {
-														const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
-														const agg = parseAggModelValue(raw);
-														// For pinned aggregation, map back to the base agg value
-														if (agg) return `${AGG_MODEL_PREFIX}${agg.aggId}`;
-														return raw;
-													})()}
-													onChange={() => {}}
-													onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-													style={{ pointerEvents: "auto" }}
-												/>
-											</Menu.Target>
-											<Menu.Dropdown
-												data-model-menu-scroll
-												style={{ maxHeight: "60vh", overflowY: "auto" }}
-											>
-												<ModelMenuItems
-													opened={menuOpenDesktop}
-													aggregations={model.aggregations}
-													allModels={model.allModels}
-													currentModel={narrator.model}
-													totalCostUsd={narrator.totalCostUsd}
-													onSelect={(v) => model.mutation.mutate({ id: narratorId, model: v })}
-													onShowPrice={setPriceModel}
-													providerLabels={model.providerLabels}
-													onEditDefaultModel={model.onEditDefaultModel}
-													onEditSummaryModel={model.onEditSummaryModel}
-													{...model.refreshProps}
-												/>
-											</Menu.Dropdown>
-										</Menu>
-									</Tooltip>
+								<Box visibleFrom="sm" style={{ minWidth: 0 }}>
+									<NarratorStatusToolbar
+										leading={
+											<Group gap={6} wrap="nowrap">
+												<Tooltip label={t("modelTooltip")}>
+													<Menu
+														position="top-end"
+														opened={menuOpenDesktop}
+														onChange={(o) => {
+															// Don't let the price popup's outside-click close the menu.
+															if (!o && priceModel != null) return;
+															setMenuOpenDesktop(o);
+														}}
+													>
+														<Menu.Target>
+															<NativeSelect
+																size="xs"
+																// The menu renders the full catalog; the trigger only needs
+																// the selected option so native sizing ignores longer models.
+																data={model.allModels
+																	.filter((m) => {
+																		const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
+																		const agg = parseAggModelValue(raw);
+																		return (
+																			m.value === (agg ? `${AGG_MODEL_PREFIX}${agg.aggId}` : raw)
+																		);
+																	})
+																	.map((m) => ({
+																		value: m.value,
+																		label:
+																			m.value === FOLLOW_DEFAULT_MODEL
+																				? t("followDefault", { model: model.defaultModelValue })
+																				: m.provider === "__agg__"
+																					? `⚡ ${m.label}`
+																					: m.provider
+																						? `${m.provider}:${m.label}`
+																						: m.label,
+																	}))}
+																value={(() => {
+																	const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
+																	const agg = parseAggModelValue(raw);
+																	// For pinned aggregation, map back to the base agg value
+																	if (agg) return `${AGG_MODEL_PREFIX}${agg.aggId}`;
+																	return raw;
+																})()}
+																onChange={() => {}}
+																onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+																style={{ pointerEvents: "auto" }}
+															/>
+														</Menu.Target>
+														<Menu.Dropdown
+															data-model-menu-scroll
+															style={{ maxHeight: "60vh", overflowY: "auto" }}
+														>
+															<ModelMenuItems
+																opened={menuOpenDesktop}
+																aggregations={model.aggregations}
+																allModels={model.allModels}
+																currentModel={narrator.model}
+																totalCostUsd={narrator.totalCostUsd}
+																onSelect={(v) =>
+																	model.mutation.mutate({ id: narratorId, model: v })
+																}
+																onShowPrice={setPriceModel}
+																providerLabels={model.providerLabels}
+																onEditDefaultModel={model.onEditDefaultModel}
+																onEditSummaryModel={model.onEditSummaryModel}
+																{...model.refreshProps}
+															/>
+														</Menu.Dropdown>
+													</Menu>
+												</Tooltip>
 
-									{/* Reasoning Effort (Codex + Anthropic providers) */}
-									{reasoning.supported && (
-										<Menu position="top-end">
-											<Menu.Target>
-												<NativeSelect
-													size="xs"
-													data={[
-														{
-															value: reasoning.displayed,
-															label: t(`reasoning_${reasoning.displayed}`),
-														},
-													]}
-													value={reasoning.displayed}
-													onChange={() => {}}
-													onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-													style={{ pointerEvents: "auto" }}
-												/>
-											</Menu.Target>
-											<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-												<ReasoningEffortMenuItems
-													currentEffort={reasoning.displayed}
-													options={reasoning.options}
-													onSelect={(e) =>
-														reasoning.mutation.mutate({ id: narratorId, reasoningEffort: e })
-													}
-													t={t}
-												/>
-												{!reasoning.followsDefault && (
-													<Box px="sm" py={4} onClick={(event) => event.stopPropagation()}>
-														<InlineOverrideActions
-															visible
-															disabled={reasoning.mutation.isPending}
-															onFollowDefault={reasoning.onFollowDefault}
-															onSetAsDefault={reasoning.onSetAsDefault}
-															t={t}
-														/>
-													</Box>
+												{/* Reasoning Effort (Codex + Anthropic providers) */}
+												{reasoning.supported && (
+													<Menu position="top-end">
+														<Menu.Target>
+															<NativeSelect
+																size="xs"
+																data={[
+																	{
+																		value: reasoning.displayed,
+																		label: t(`reasoning_${reasoning.displayed}`),
+																	},
+																]}
+																value={reasoning.displayed}
+																onChange={() => {}}
+																onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+																style={{ pointerEvents: "auto" }}
+															/>
+														</Menu.Target>
+														<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+															<ReasoningEffortMenuItems
+																currentEffort={reasoning.displayed}
+																options={reasoning.options}
+																onSelect={(e) =>
+																	reasoning.mutation.mutate({ id: narratorId, reasoningEffort: e })
+																}
+																t={t}
+															/>
+															{!reasoning.followsDefault && (
+																<Box px="sm" py={4} onClick={(event) => event.stopPropagation()}>
+																	<InlineOverrideActions
+																		visible
+																		disabled={reasoning.mutation.isPending}
+																		onFollowDefault={reasoning.onFollowDefault}
+																		onSetAsDefault={reasoning.onSetAsDefault}
+																		t={t}
+																	/>
+																</Box>
+															)}
+														</Menu.Dropdown>
+													</Menu>
 												)}
-											</Menu.Dropdown>
-										</Menu>
-									)}
-									{/* Fast Mode toggle (only for Codex-mode providers) */}
-									{codexControls.supportsCodexControls &&
-										!isMobileViewport &&
-										codexControls.renderFastModeControl("top-end")}
-									<Tooltip
-										label={
-											narrator.isAskInPassing ? t("askInPassing_readOnlyHint") : t("permissionMode")
-										}
-									>
-										{narrator.isAskInPassing ? (
-											<NativeSelect
-												size="xs"
-												leftSection={PERM_MODE_ICONS.readOnly ?? <IconShield size={14} />}
-												data={[{ value: "readOnly", label: t("perm_readOnly") }]}
-												value="readOnly"
-												onChange={() => {}}
-												disabled
-												style={{ pointerEvents: "auto", opacity: 0.6 }}
-											/>
-										) : (
-											<Menu position="top-end">
-												<Menu.Target>
-													<NativeSelect
-														size="xs"
-														leftSection={
-															PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
-																<IconShield size={14} />
-															)
-														}
-														data={PERM_MODE_DATA.map((d) => ({
-															value: d.value,
-															label: t(d.label),
-														}))}
-														value={narrator.permissionMode ?? "default"}
-														onChange={() => {}}
-														onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-														style={{ pointerEvents: "auto" }}
-													/>
-												</Menu.Target>
-												<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-													<PermissionMenuContent
-														currentMode={narrator.permissionMode ?? "default"}
-														availablePermissionModes={permission.availableModes}
-														permissionModesUnavailableReason={permission.unavailableReason}
-														onSelectPermissionMode={(m) =>
-															permission.mutation.mutate({ id: narratorId, permissionMode: m })
-														}
-														t={t}
-														hasPlanTrait={permission.hasPlanTrait}
-														onTogglePlanMode={permission.togglePlanMode}
-														planModePending={permission.planModePending}
-														planModeSupported={permission.planModeSupported}
-														planModeUnsupportedReason={permission.planModeUnsupportedReason}
-														showPlanReflectionAutoApproveToggle={
-															permission.planReflection.supported &&
-															((narrator.permissionMode ?? "default") === "acceptEdits" ||
-																(narrator.permissionMode ?? "default") === "bypassPermissions")
-														}
-														planReflectionAutoApproveOverride={permission.planReflection.override}
-														planReflectionAutoApproveEffective={permission.planReflection.effective}
-														planReflectionAutoApproveGlobal={permission.planReflection.global}
-														onPlanReflectionAutoApproveChange={permission.planReflection.onChange}
-														onFollowDefaultPlanReflection={
-															permission.planReflection.onFollowDefault
-														}
-														onSetPlanReflectionAsDefault={permission.planReflection.onSetAsDefault}
-														showDangerReflectionToggle={permission.dangerReflection.supported}
-														dangerReflectionOverride={permission.dangerReflection.override}
-														dangerReflectionEffectiveLevel={
-															permission.dangerReflection.effectiveLevel
-														}
-														dangerReflectionGlobalLevel={permission.dangerReflection.globalLevel}
-														onDangerReflectionChange={permission.dangerReflection.onChange}
-														onFollowDefaultDangerReflection={
-															permission.dangerReflection.onFollowDefault
-														}
-														onSetDangerReflectionAsDefault={
-															permission.dangerReflection.onSetAsDefault
-														}
-														reflectionSettingsDisabled={permission.reflectionSettingsDisabled}
-													/>
-												</Menu.Dropdown>
-											</Menu>
-										)}
-									</Tooltip>
-									{promote.show && (
-										<Tooltip
-											label={
-												narrator.chapterId
-													? t("promote_chapter_hint")
-													: t("promote_standalone_hint")
-											}
-										>
-											<Button
-												size="xs"
-												variant="light"
-												color="teal"
-												loading={promote.pending}
-												onClick={promote.onPromote}
-											>
-												{t("promote")}
-											</Button>
-										</Tooltip>
-									)}
-									<PathRulesPopover narratorId={narratorId} t={t} />
-									{/* Relaxed Plan toggle (only visible in plan mode) */}
-									{permission.hasPlanTrait && (
-										<Tooltip
-											label={
-												relaxedPlan.forced
-													? t("relaxed_plan_forced_tooltip")
-													: t("relaxed_plan_tooltip")
-											}
-										>
-											<ActionIcon
-												variant="subtle"
-												color={relaxedPlan.enabled ? "teal" : "gray"}
-												size="sm"
-												aria-label={t("relaxed_plan")}
-												disabled={relaxedPlan.forced || relaxedPlan.mutation.isPending}
-												onClick={() =>
-													relaxedPlan.mutation.mutate({
-														id: narratorId,
-														relaxedPlan: !relaxedPlan.enabled,
-													})
-												}
-											>
-												{relaxedPlan.enabled ? <IconLockOpen size={16} /> : <IconLock size={16} />}
-											</ActionIcon>
-										</Tooltip>
-									)}
-									{(terminal.toolAvailable || terminal.onOpenPanel) && (
-										<Tooltip
-											label={
-												terminal.onOpenPanel
-													? tt("openTerminal")
-													: terminal.toolOpened
-														? tt("closeTerminal")
-														: tt("openTerminal")
-											}
-										>
-											<Indicator
-												inline
-												label={terminal.activeCount}
-												size={14}
-												disabled={terminal.activeCount === 0}
-												offset={2}
-												color="blue"
-												style={{
-													height: "var(--ai-size-sm)",
-													display: "flex",
-													alignItems: "center",
-												}}
-											>
-												<ActionIcon
-													variant="subtle"
-													color={terminal.toolOpened ? "blue" : "gray"}
-													size="sm"
-													aria-label={
-														terminal.onOpenPanel
-															? tt("openTerminal")
-															: terminal.toolOpened
-																? tt("closeTerminal")
-																: tt("openTerminal")
+												{/* Fast Mode toggle (only for Codex-mode providers) */}
+												{codexControls.supportsCodexControls &&
+													!isMobileViewport &&
+													codexControls.renderFastModeControl("top-end")}
+												<Tooltip
+													label={
+														narrator.isAskInPassing
+															? t("askInPassing_readOnlyHint")
+															: t("permissionMode")
 													}
-													onClick={terminal.onOpenPanel ?? terminal.onToggle}
 												>
-													<IconTerminal size={16} />
-												</ActionIcon>
-											</Indicator>
-										</Tooltip>
-									)}
-								</Group>
+													{narrator.isAskInPassing ? (
+														<NativeSelect
+															size="xs"
+															leftSection={PERM_MODE_ICONS.readOnly ?? <IconShield size={14} />}
+															data={[{ value: "readOnly", label: t("perm_readOnly") }]}
+															value="readOnly"
+															onChange={() => {}}
+															disabled
+															style={{ pointerEvents: "auto", opacity: 0.6 }}
+														/>
+													) : (
+														<Menu position="top-end">
+															<Menu.Target>
+																<NativeSelect
+																	size="xs"
+																	leftSection={
+																		PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
+																			<IconShield size={14} />
+																		)
+																	}
+																	data={PERM_MODE_DATA.map((d) => ({
+																		value: d.value,
+																		label: t(d.label),
+																	}))}
+																	value={narrator.permissionMode ?? "default"}
+																	onChange={() => {}}
+																	onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+																	style={{ pointerEvents: "auto" }}
+																/>
+															</Menu.Target>
+															<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+																<PermissionMenuContent
+																	currentMode={narrator.permissionMode ?? "default"}
+																	availablePermissionModes={permission.availableModes}
+																	permissionModesUnavailableReason={permission.unavailableReason}
+																	onSelectPermissionMode={(m) =>
+																		permission.mutation.mutate({
+																			id: narratorId,
+																			permissionMode: m,
+																		})
+																	}
+																	t={t}
+																	hasPlanTrait={permission.hasPlanTrait}
+																	onTogglePlanMode={permission.togglePlanMode}
+																	planModePending={permission.planModePending}
+																	planModeSupported={permission.planModeSupported}
+																	planModeUnsupportedReason={permission.planModeUnsupportedReason}
+																	showPlanReflectionAutoApproveToggle={
+																		permission.planReflection.supported &&
+																		((narrator.permissionMode ?? "default") === "acceptEdits" ||
+																			(narrator.permissionMode ?? "default") ===
+																				"bypassPermissions")
+																	}
+																	planReflectionAutoApproveOverride={
+																		permission.planReflection.override
+																	}
+																	planReflectionAutoApproveEffective={
+																		permission.planReflection.effective
+																	}
+																	planReflectionAutoApproveGlobal={permission.planReflection.global}
+																	onPlanReflectionAutoApproveChange={
+																		permission.planReflection.onChange
+																	}
+																	onFollowDefaultPlanReflection={
+																		permission.planReflection.onFollowDefault
+																	}
+																	onSetPlanReflectionAsDefault={
+																		permission.planReflection.onSetAsDefault
+																	}
+																	showDangerReflectionToggle={permission.dangerReflection.supported}
+																	dangerReflectionOverride={permission.dangerReflection.override}
+																	dangerReflectionEffectiveLevel={
+																		permission.dangerReflection.effectiveLevel
+																	}
+																	dangerReflectionGlobalLevel={
+																		permission.dangerReflection.globalLevel
+																	}
+																	onDangerReflectionChange={permission.dangerReflection.onChange}
+																	onFollowDefaultDangerReflection={
+																		permission.dangerReflection.onFollowDefault
+																	}
+																	onSetDangerReflectionAsDefault={
+																		permission.dangerReflection.onSetAsDefault
+																	}
+																	reflectionSettingsDisabled={permission.reflectionSettingsDisabled}
+																/>
+															</Menu.Dropdown>
+														</Menu>
+													)}
+												</Tooltip>
+												{promote.show && (
+													<Tooltip
+														label={
+															narrator.chapterId
+																? t("promote_chapter_hint")
+																: t("promote_standalone_hint")
+														}
+													>
+														<Button
+															size="xs"
+															variant="light"
+															color="teal"
+															loading={promote.pending}
+															onClick={promote.onPromote}
+														>
+															{t("promote")}
+														</Button>
+													</Tooltip>
+												)}
+												{/* Relaxed Plan toggle (only visible in plan mode) */}
+												{permission.hasPlanTrait && (
+													<Tooltip
+														label={
+															relaxedPlan.forced
+																? t("relaxed_plan_forced_tooltip")
+																: t("relaxed_plan_tooltip")
+														}
+													>
+														<ActionIcon
+															variant="subtle"
+															color={relaxedPlan.enabled ? "teal" : "gray"}
+															size="sm"
+															aria-label={t("relaxed_plan")}
+															disabled={relaxedPlan.forced || relaxedPlan.mutation.isPending}
+															onClick={() =>
+																relaxedPlan.mutation.mutate({
+																	id: narratorId,
+																	relaxedPlan: !relaxedPlan.enabled,
+																})
+															}
+														>
+															{relaxedPlan.enabled ? (
+																<IconLockOpen size={16} />
+															) : (
+																<IconLock size={16} />
+															)}
+														</ActionIcon>
+													</Tooltip>
+												)}
+											</Group>
+										}
+										actions={mobile.bottomActions ?? []}
+										moreLabel={t("moreActions")}
+										measurementKey={mobile.measurementKey}
+									/>
+								</Box>
 							)}
 							{/* Mobile: model & permission */}
 							<Box

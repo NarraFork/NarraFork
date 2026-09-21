@@ -69,7 +69,7 @@ function renderCard(opts: { onOpenSession?: () => void; hasButton?: boolean }): 
 	);
 }
 
-it("shows a compact background notice and panel button without protocol output", () => {
+it("hides background protocol output without a notice row", () => {
 	const measured = measureSubagentCard(
 		{
 			agentType: "general",
@@ -90,26 +90,21 @@ it("shows a compact background notice and panel button without protocol output",
 		5,
 		{ opened: true },
 	);
-	for (const available of [true, false]) {
-		const root = parse(
-			renderToStaticMarkup(
-				<MantineProvider>
-					<RenderSubagent
-						measured={measured}
-						description="Background work"
-						isBackground
-						onOpenSession={available ? () => {} : undefined}
-					/>
-				</MantineProvider>,
-			),
-		);
-		const notice = root.querySelector('[data-testid="subagent-background-notice"]');
-		expect(notice?.textContent).toContain("Started in the background.");
-		expect(notice?.querySelector("button")?.textContent).toBe("Open in panel");
-		expect(notice?.querySelector("button")?.hasAttribute("disabled")).toBe(!available);
-		expect(root.textContent).not.toContain("background_task_id");
-		expect(root.textContent).not.toContain("Use Await");
-	}
+	const root = parse(
+		renderToStaticMarkup(
+			<MantineProvider>
+				<RenderSubagent
+					measured={measured}
+					description="Background work"
+					isBackground
+					onOpenSession={() => {}}
+				/>
+			</MantineProvider>,
+		),
+	);
+	expect(root.querySelector('[data-testid="subagent-background-notice"]')).toBeNull();
+	expect(root.textContent).not.toContain("background_task_id");
+	expect(root.textContent).not.toContain("Use Await");
 });
 
 const activityRows = (root: Element) =>

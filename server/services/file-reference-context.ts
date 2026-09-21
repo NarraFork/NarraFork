@@ -31,6 +31,9 @@ export function getAgentFileReferenceContext(
 export class FileReferenceContextTracker {
 	private readonly contexts = new Map<number | undefined, FileReferenceContext | null>();
 	private readonly blockIds = new Map<number | undefined, string>();
+	// Loop IDs survive checkpoints. Provider lane indices can be reused by a later
+	// block/attempt and must never inherit the previous block's device.
+	private readonly identifiedContexts = new Map<string, FileReferenceContext | null>();
 
 	/** A new round may reuse the provider index before the UI retires the old lane. */
 	blockId(outputIndex: number | undefined): string | undefined {
@@ -40,18 +43,23 @@ export class FileReferenceContextTracker {
 	capture(
 		outputIndex: number | undefined,
 		getContext?: () => FileReferenceContext | null | undefined,
+		blockId?: string,
 	) {
-		if (!this.contexts.has(outputIndex)) {
+		const contexts: Map<string | number | undefined, FileReferenceContext | null> = blockId
+			? this.identifiedContexts
+			: this.contexts;
+		const key = blockId ?? outputIndex;
+		if (!contexts.has(key)) {
 			let context: FileReferenceContext | null = null;
 			try {
 				context = normalizeFileReferenceContext(getContext?.());
 			} catch {
 				// Location metadata is optional; an unavailable source must not lose tokens.
 			}
-			this.contexts.set(outputIndex, context ? Object.freeze(context) : null);
-			this.blockIds.set(outputIndex, randomUUID());
+			contexts.set(key, context ? Object.freeze(context) : null);
+			if (!blockId) this.blockIds.set(outputIndex, randomUUID());
 		}
-		return this.contexts.get(outputIndex) ?? null;
+		return contexts.get(key) ?? null;
 	}
 
 	/** A provider can emit several output items which the loop later combines. */
@@ -63,6 +71,13 @@ export class FileReferenceContextTracker {
 		return false;
 	}
 
+	/** Read without retiring a legacy lane before its durable publication succeeds. */
+	peek(outputIndex: number | undefined, blockId?: string): FileReferenceContext | null {
+		return blockId
+			? (this.identifiedContexts.get(blockId) ?? null)
+			: (this.contexts.get(outputIndex) ?? null);
+	}
+
 	complete(outputIndex: number | undefined): FileReferenceContext | null {
 		const context = this.contexts.get(outputIndex) ?? null;
 		this.contexts.delete(outputIndex);
@@ -72,11 +87,15 @@ export class FileReferenceContextTracker {
 
 	/** Non-streaming/fallback messages cannot safely reconstruct a context at turn end. */
 	fallback(): FileReferenceContext | null {
-		return this.contexts.size === 1 ? (this.contexts.values().next().value ?? null) : null;
+		if (this.contexts.size + this.identifiedContexts.size !== 1) return null;
+		return (
+			this.contexts.values().next().value ?? this.identifiedContexts.values().next().value ?? null
+		);
 	}
 
 	clear(): void {
 		this.contexts.clear();
 		this.blockIds.clear();
+		this.identifiedContexts.clear();
 	}
 }

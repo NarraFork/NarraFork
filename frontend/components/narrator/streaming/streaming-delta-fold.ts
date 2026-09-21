@@ -1,25 +1,5 @@
-/**
- * streaming-delta-fold.ts — The ONE text/reasoning delta fold, shared by both
- * message lists.
- *
- * Why it lives here rather than in vlist/
- * --------------------------------------
- * This started as a deliberately narrow copy inside `vlist/`, next to the exact
- * shell that needed it, while `useNarratorChunksWS` kept its own inline copy. Two
- * copies of the same fold is exactly how the two lists drift: the live-lane stamp
- * (`blockIndex`, see @shared/pretext-layout/streaming-live-blocks) has to be derived
- * identically on both paths or the same turn settles its reasoning at different
- * moments depending on which list the reader has enabled.
- *
- * It cannot live in `vlist/` for the shared version: the always-on chunked path may
- * not statically import vlist (`vlist-isolation.guard.test.ts` — the OFF path must
- * never even fetch vlist code). vlist importing OUTWARD is fine, so the fold sits
- * here and `vlist/exact-streaming-accumulator.ts` re-exports it.
- *
- * Pure: mutates the passed `blocks` array and returns what changed. No WS, no React,
- * no DOM.
- */
-
+/** Shared, bounded raw text/reasoning accumulation. Content ids identify lanes;
+ * outputIndex only orders them. Legacy frames retain their coordinate fallback. */
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import {
 	findStreamingInsertIndex,
@@ -29,7 +9,6 @@ import {
 } from "../message/message-segments";
 import { appendStreamingTextPreview } from "../narrator-message-helpers";
 
-/** A decoded `content_block_delta` stream event (the shape onStreamEvent passes). */
 export interface StreamDeltaEvent {
 	type?: unknown;
 	subagentToolUseId?: unknown;
@@ -39,142 +18,96 @@ export interface StreamDeltaEvent {
 		type?: unknown;
 		text?: unknown;
 		id?: unknown;
+		revision?: unknown;
+		/** Raw character offset before this delta (not citation-cleaned text). */
+		textOffset?: unknown;
 		outputIndex?: unknown;
 	};
 }
-
-/**
- * What a delta did, including WHERE it landed.
- *
- * The index is what lets the caller stamp the row with the lane still being written.
- * Array position cannot be derived later: `buildStreamingMsg` appends the live tool
- * cards after the text lanes whatever order the provider used, so a reasoning block
- * the model reopened after a tool call sits in the middle of the published row.
- */
 export interface StreamDeltaResult {
-	/** True when a text or reasoning delta was applied (bump the render version). */
 	applied: boolean;
-	/**
-	 * Index in `blocks` the delta landed in, or -1 when nothing was applied.
-	 *
-	 * ⚠️ VALID ONLY FOR THE ARRAY AS IT STANDS AFTER THIS FOLD. A later delta with a
-	 * lower `outputIndex` splices a block in ahead of this one, and every index from
-	 * the insertion point onwards then names a different block. So this must be
-	 * consumed (or re-stamped) immediately; it is not a durable handle.
-	 *
-	 * Both callers satisfy that by overwriting their `liveBlockIndexRef` after every
-	 * applied delta, which is a property of their call order rather than of this
-	 * type — hence the warning.
-	 */
+	/** Valid immediately after this fold; later native-block insertion can shift it. */
 	blockIndex: number;
 }
-
 const NOT_APPLIED: StreamDeltaResult = { applied: false, blockIndex: -1 };
+function nonNegativeInteger(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
 
-/**
- * Fold a single content_block_delta into `blocks`.
- *
- * `isSubagent` mirrors the legacy guard: on a top-level page, deltas that still
- * carry a subagentToolUseId belong to a child stream and are ignored.
- */
 export function applyStreamingDelta(
 	blocks: StreamingBlock[],
 	event: StreamDeltaEvent | undefined,
 	isSubagent: boolean,
 ): StreamDeltaResult {
-	if (!event || event.type !== "content_block_delta") return NOT_APPLIED;
-	if (!isSubagent && event.subagentToolUseId) return NOT_APPLIED;
+	if (!event || event.type !== "content_block_delta" || (!isSubagent && event.subagentToolUseId))
+		return NOT_APPLIED;
 	const delta = event.delta;
-	const deltaText = typeof delta?.text === "string" ? delta.text : "";
-	if (!delta || !deltaText) return NOT_APPLIED;
-
-	if (delta.type === "text_delta") {
-		const outputIndex = typeof event.outputIndex === "number" ? event.outputIndex : undefined;
-		const textBlockId = typeof delta.id === "string" && delta.id ? delta.id : undefined;
-		const existingIdx = textBlockId
-			? blocks.findIndex((b) => b.type === "text" && b.id === textBlockId)
-			: outputIndex != null
-				? blocks.findIndex((b) => b.type === "text" && b.outputIndex === outputIndex)
-				: -1;
-		if (existingIdx !== -1) {
-			const existing = blocks[existingIdx];
-			if (existing.type === "text") {
-				existing.text = appendStreamingTextPreview(existing.text, deltaText);
+	if (
+		!delta ||
+		(delta.type !== "text_delta" && delta.type !== "reasoning_delta") ||
+		typeof delta.text !== "string" ||
+		!delta.text
+	)
+		return NOT_APPLIED;
+	const type = delta.type === "text_delta" ? "text" : "reasoning";
+	const id = typeof delta.id === "string" && delta.id ? delta.id : undefined;
+	const revision = nonNegativeInteger(delta.revision);
+	const textOffset = nonNegativeInteger(delta.textOffset);
+	const outputIndex = nonNegativeInteger(
+		type === "text"
+			? (event.outputIndex ?? delta.outputIndex)
+			: (delta.outputIndex ?? event.outputIndex),
+	);
+	const index = blocks.findIndex((block) => {
+		if (block.type !== type) return false;
+		if (id) return block.id === id;
+		if (block.id) return false;
+		return getStreamingBlockOutputIndex(block) === outputIndex;
+	});
+	if (index !== -1) {
+		const block = blocks[index];
+		if (block.type !== "text" && block.type !== "reasoning") return NOT_APPLIED;
+		if (revision != null && block.revision != null && revision <= block.revision)
+			return NOT_APPLIED;
+		if (textOffset != null && block.textOffset != null) {
+			const end = block.textOffset + block.text.length;
+			if (textOffset >= block.textOffset && textOffset <= end) {
+				const added = delta.text.slice(Math.max(0, end - textOffset));
+				block.text = appendStreamingTextPreview(block.text, added);
+				block.textOffset = Math.max(end, textOffset + delta.text.length) - block.text.length;
+			} else {
+				// Missing raw baseline on reconnect. The snapshot joins these raw windows;
+				// never manufacture a prefix from a cleaned committed display body.
+				block.text = appendStreamingTextPreview("", delta.text);
+				block.textOffset = textOffset + delta.text.length - block.text.length;
 			}
-			return { applied: true, blockIndex: existingIdx };
+		} else {
+			block.text = appendStreamingTextPreview(block.text, delta.text);
+			if (textOffset != null)
+				block.textOffset = Math.max(0, textOffset + delta.text.length - block.text.length);
 		}
-		if (outputIndex == null && !textBlockId) {
-			// An UN-INDEXED delta belongs to the un-indexed text lane, so match on that
-			// rather than on "the array happens to end with a text block".
-			//
-			// The positional version merged across lanes: `findStreamingInsertIndex` keeps
-			// indexed blocks in index order and appends un-indexed ones at the end, so in a
-			// mixed stream — provider emits `text(0)`, then a compatibility relay emits a
-			// bare `text_delta.text` (see anthropic-provider's note on relays that stream a
-			// block with no index) — the array's last block IS the indexed one, and two
-			// different outputs were concatenated into a single block.
-			//
-			// Symmetric with the reasoning branch's `!b.id && b.outputIndex == null`.
-			const bareIdx = blocks.findIndex(
-				(b) => b.type === "text" && getStreamingBlockOutputIndex(b) == null,
-			);
-			if (bareIdx !== -1) {
-				const bare = blocks[bareIdx];
-				if (bare.type === "text") {
-					bare.text = appendStreamingTextPreview(bare.text, deltaText);
-				}
-				return { applied: true, blockIndex: bareIdx };
-			}
-		}
-		const insertAt = findStreamingInsertIndex(blocks, outputIndex);
-		blocks.splice(insertAt, 0, {
-			type: "text",
-			...(textBlockId ? { id: textBlockId } : {}),
-			text: appendStreamingTextPreview("", deltaText),
-			...(event.fileReferenceContext !== undefined
-				? { fileReferenceContext: normalizeFileReferenceContext(event.fileReferenceContext) }
-				: {}),
-			...(outputIndex != null ? { outputIndex } : {}),
-		});
-		return { applied: true, blockIndex: insertAt };
+		if (revision != null) block.revision = revision;
+		return { applied: true, blockIndex: index };
 	}
-
-	if (delta.type === "reasoning_delta") {
-		const reasoningId = typeof delta.id === "string" && delta.id.length > 0 ? delta.id : undefined;
-		const outputIndex = typeof delta.outputIndex === "number" ? delta.outputIndex : undefined;
-		const existingIdx = blocks.findIndex((b) => {
-			if (b.type !== "reasoning") return false;
-			if (reasoningId) return b.id === reasoningId;
-			if (outputIndex != null) return b.outputIndex === outputIndex;
-			return !b.id && b.outputIndex == null;
-		});
-		if (existingIdx !== -1) {
-			const existing = blocks[existingIdx];
-			if (existing.type === "reasoning") {
-				existing.text = appendStreamingTextPreview(existing.text, deltaText);
-				if (reasoningId) existing.id = reasoningId;
-				if (outputIndex != null) existing.outputIndex = outputIndex;
-			}
-			return { applied: true, blockIndex: existingIdx };
-		}
-		const insertAt = findStreamingInsertIndex(blocks, outputIndex);
-		blocks.splice(insertAt, 0, {
-			type: "reasoning",
-			text: appendStreamingTextPreview("", deltaText),
-			...(reasoningId ? { id: reasoningId } : {}),
-			...(outputIndex != null ? { outputIndex } : {}),
-		});
-		return { applied: true, blockIndex: insertAt };
-	}
-
-	return NOT_APPLIED;
+	const insertAt = findStreamingInsertIndex(blocks, outputIndex);
+	const text = appendStreamingTextPreview("", delta.text);
+	blocks.splice(insertAt, 0, {
+		type,
+		text,
+		...(id ? { id } : {}),
+		...(revision != null ? { revision } : {}),
+		...(textOffset != null ? { textOffset: textOffset + delta.text.length - text.length } : {}),
+		...(outputIndex != null ? { outputIndex } : {}),
+		...(type === "text" && event.fileReferenceContext !== undefined
+			? { fileReferenceContext: normalizeFileReferenceContext(event.fileReferenceContext) }
+			: {}),
+	});
+	return { applied: true, blockIndex: insertAt };
 }
 
-/** Merge a reconnect snapshot into `blocks`; returns true when anything changed. */
 export function applyStreamingSnapshotBlocks(
 	blocks: StreamingBlock[],
 	snapshotBlocks: StreamingBlock[],
 ): boolean {
-	if (snapshotBlocks.length === 0) return false;
-	return mergeStreamingSnapshotBlocks(blocks, snapshotBlocks);
+	return snapshotBlocks.length > 0 && mergeStreamingSnapshotBlocks(blocks, snapshotBlocks);
 }

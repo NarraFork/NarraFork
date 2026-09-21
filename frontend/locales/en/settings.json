@@ -491,7 +491,7 @@
 	"fingerprintTitle": "Client Fingerprint",
 	"fingerprintDesc": "Control how requests identify themselves to the provider: the User-Agent, extra headers, and Codex CLI header emulation.",
 	"fingerprintUserAgent": "User-Agent",
-	"fingerprintUserAgentDesc": "Which User-Agent to present on outbound requests.",
+	"fingerprintUserAgentDesc": "Which User-Agent to present on outbound requests. Selecting NarraFork also sets the Codex originator header to narrafork.",
 	"fingerprintUaNarrafork": "NarraFork",
 	"fingerprintUaClaudeCode": "Claude Code",
 	"fingerprintUaCodex": "Codex",

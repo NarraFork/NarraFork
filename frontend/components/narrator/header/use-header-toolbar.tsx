@@ -6,6 +6,7 @@ import {
 	type SetStateAction,
 	useCallback,
 	useMemo,
+	useState,
 } from "react";
 import type { NarratorToolbarEntry } from "../../../hooks/narrator-toolbar-layout";
 import { useNarratorHeaderToolbarCapacity } from "../../../hooks/useNarratorHeaderToolbarCapacity";
@@ -15,6 +16,7 @@ import {
 	type PluginContributionPick,
 } from "../../plugins/PluginContributionPicker";
 import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
+import { PathRulesPopover } from "../interaction/PathRulesPopover";
 import { NarratorLodOptions } from "../lod/NarratorLodMenu";
 import type { RenderLod } from "../lod/RenderLodCtx";
 import type { MobileToolPanelKind } from "../MobileToolPanelHost";
@@ -35,15 +37,8 @@ type QueryLike = any;
 type MutationLike = any;
 
 export interface UseHeaderToolbarOptions {
-	// Layout measurement anchors.
-	headerRowRef: RefObject<HTMLDivElement | null>;
-	headerToolbarRef: RefObject<HTMLDivElement | null>;
-	headerLeadingRef: RefObject<HTMLDivElement | null>;
+	narratorId: string;
 	headerHostCapabilities: readonly NarratorToolbarHost[];
-	hostOwnsTitle: boolean;
-	isWorkspacePreview: boolean;
-	isMobileViewport: boolean;
-
 	// Per-entry availability inputs.
 	dock: NarratorDockContextValue | null;
 	/**
@@ -88,9 +83,12 @@ export interface UseHeaderToolbarOptions {
 
 export interface UseHeaderToolbarResult {
 	toolbarEntries: readonly NarratorToolbarEntry[];
-	toolbarVisibleDefs: readonly NarratorToolbarItemDef[];
-	toolbarHiddenDefs: readonly NarratorToolbarItemDef[];
-	toolbarNoRoomIds: readonly string[];
+	/** Header candidates before width measurement; HeaderToolbar applies capacity locally. */
+	toolbarSurfacedDefs: readonly NarratorToolbarItemDef[];
+	/** Menu-zone entries (not bottom); HeaderToolbar merges width-collapsed entries. */
+	toolbarTuckedDefs: readonly NarratorToolbarItemDef[];
+	toolbarBottomDefs: readonly NarratorToolbarItemDef[];
+	toolbarOverlays: ReactNode;
 	saveToolbarLayout: (entries: NarratorToolbarEntry[]) => void;
 	toolbarEntryActive: (id: NarratorToolbarId) => boolean;
 	activateToolbarEntry: (id: string) => void;
@@ -98,25 +96,80 @@ export interface UseHeaderToolbarResult {
 }
 
 /**
- * The header tool row's logic, co-located with {@link HeaderToolbar}: which
- * registry entries are available for this narrator, the width-measured
- * layout/capacity partition (surfaced vs overflow), whether each entry's panel is
- * open, how activating an entry routes (dock panel vs mobile drawer fallback), and
- * the inline options the overflow menu expands for the self-contained entries.
- *
- * Extracted verbatim from NarratorPanel and now driven from HeaderToolbar; the
- * panel passes only the raw capability / active-state / action inputs instead of
- * the pre-computed toolbar props.
+ * Width-capacity partition for the header row only. Kept OUT of the panel-level
+ * controller: capacity changes when icons collapse/expand, and that state must
+ * re-render HeaderToolbar — not the whole NarratorPanel (message list, dock, WS).
+ */
+export function useHeaderToolbarCapacityPartition({
+	surfacedDefs,
+	tuckedDefs,
+	headerRowRef,
+	headerToolbarRef,
+	headerLeadingRef,
+	hostOwnsTitle,
+	isWorkspacePreview,
+	isMobileViewport,
+}: {
+	surfacedDefs: readonly NarratorToolbarItemDef[];
+	tuckedDefs: readonly NarratorToolbarItemDef[];
+	headerRowRef: RefObject<HTMLDivElement | null>;
+	headerToolbarRef: RefObject<HTMLDivElement | null>;
+	headerLeadingRef: RefObject<HTMLDivElement | null>;
+	hostOwnsTitle: boolean;
+	isWorkspacePreview: boolean;
+	isMobileViewport: boolean;
+}): {
+	toolbarVisibleDefs: readonly NarratorToolbarItemDef[];
+	toolbarHiddenDefs: readonly NarratorToolbarItemDef[];
+	toolbarNoRoomIds: readonly string[];
+} {
+	const headerTitleSlotMinWidth = useMemo(() => {
+		if (hostOwnsTitle || isWorkspacePreview) return 0;
+		return HEADER_TITLE_MIN_WIDTH_PX + 2 * 18 + 2 * 4;
+	}, [hostOwnsTitle, isWorkspacePreview]);
+
+	const headerCapacity = useNarratorHeaderToolbarCapacity({
+		rowRef: headerRowRef,
+		toolbarRef: headerToolbarRef,
+		leadingRef: headerLeadingRef,
+		titleSlotMinWidth: headerTitleSlotMinWidth,
+		maxWidthFraction: null,
+		itemCount: surfacedDefs.length,
+		maxCapacity: isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null,
+		enabled: !isWorkspacePreview,
+	});
+
+	const headerVisibleLimit =
+		headerCapacity ?? (isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null);
+	const headerSelection = useMemo(
+		() => selectHeaderToolbarEntries(surfacedDefs, headerVisibleLimit),
+		[surfacedDefs, headerVisibleLimit],
+	);
+	const toolbarHiddenDefs = useMemo(
+		() => [...headerSelection.hidden, ...tuckedDefs],
+		[headerSelection.hidden, tuckedDefs],
+	);
+	const toolbarNoRoomIds = useMemo(
+		() => headerSelection.hidden.map((def) => def.id as string),
+		[headerSelection.hidden],
+	);
+
+	return {
+		toolbarVisibleDefs: headerSelection.visible,
+		toolbarHiddenDefs,
+		toolbarNoRoomIds,
+	};
+}
+
+/**
+ * Shared controller for header/bottom activation and saved layout. Capacity is
+ * NOT here — see {@link useHeaderToolbarCapacityPartition}. Dialogs opened from
+ * menus live in `toolbarOverlays`, mounted outside those menus.
  */
 export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToolbarResult {
 	const {
-		headerRowRef,
-		headerToolbarRef,
-		headerLeadingRef,
+		narratorId,
 		headerHostCapabilities,
-		hostOwnsTitle,
-		isWorkspacePreview,
-		isMobileViewport,
 		dock,
 		gitWorkspaceAvailable,
 		tasksSupported,
@@ -146,6 +199,9 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		openPluginPanel,
 		t,
 	} = options;
+
+	const [pathRulesOpened, setPathRulesOpened] = useState(false);
+	const closePathRules = useCallback(() => setPathRulesOpened(false), []);
 
 	const toolbarEntryEnabled = useCallback(
 		(id: NarratorToolbarId): boolean => {
@@ -191,6 +247,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		entries: toolbarEntries,
 		visible: toolbarSurfacedDefs,
 		overflow: toolbarTuckedDefs,
+		bottom: toolbarBottomDefs,
 		saveLayout: saveToolbarLayout,
 	} = useNarratorToolbarLayout({
 		// Uncapped on purpose: the cap depends on how many entries are SURFACEABLE,
@@ -203,60 +260,6 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		// buttons than the cap allows.
 		entryEnabled: toolbarEntryEnabled,
 	});
-
-	/**
-	 * Width the title keeps before any entry collapses. Zero when the host draws
-	 * the title itself (a graph node), so the entries may claim that space —
-	 * previously the only way to stop the icon row from crushing the title was to
-	 * hide the title entirely, which is what `hostOwnsTitle` was doing.
-	 */
-	const headerTitleSlotMinWidth = useMemo(() => {
-		if (hostOwnsTitle || isWorkspacePreview) return 0;
-		// Plus the pencil / sparkles pair beside the title (ActionIcon size="xs" =
-		// 18px each, gap 4).
-		return HEADER_TITLE_MIN_WIDTH_PX + 2 * 18 + 2 * 4;
-	}, [hostOwnsTitle, isWorkspacePreview]);
-
-	const headerCapacity = useNarratorHeaderToolbarCapacity({
-		rowRef: headerRowRef,
-		toolbarRef: headerToolbarRef,
-		leadingRef: headerLeadingRef,
-		titleSlotMinWidth: headerTitleSlotMinWidth,
-		itemCount: toolbarSurfacedDefs.length,
-		// The measurement may not save a phone from itself: at ~360px a readable
-		// title plus two entries is the honest maximum, whatever the arithmetic says.
-		maxCapacity: isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null,
-		enabled: !isWorkspacePreview,
-	});
-
-	/**
-	 * `null` capacity = no successful measurement yet (first frame, no
-	 * ResizeObserver). Falling back to the mobile cap / "show everything" keeps the
-	 * previous behaviour rather than briefly emptying the row.
-	 */
-	const headerVisibleLimit =
-		headerCapacity ?? (isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null);
-	const headerSelection = useMemo(
-		() => selectHeaderToolbarEntries(toolbarSurfacedDefs, headerVisibleLimit),
-		[toolbarSurfacedDefs, headerVisibleLimit],
-	);
-	const toolbarVisibleDefs = headerSelection.visible;
-	/**
-	 * Everything not on the row: entries collapsed for width, plus the ones the
-	 * reader tucked away. Layout order is preserved so the menu reads as a
-	 * continuation of the row. This is also what the overflow button's aggregate
-	 * badge counts — without it, an entry collapsed for width would take its unread
-	 * count off screen with no trace.
-	 */
-	const toolbarHiddenDefs = useMemo(
-		() => [...headerSelection.hidden, ...toolbarTuckedDefs],
-		[headerSelection.hidden, toolbarTuckedDefs],
-	);
-	/** Ids collapsed for width — the menu marks these so "shown in header" stays honest. */
-	const toolbarNoRoomIds = useMemo(
-		() => headerSelection.hidden.map((def) => def.id as string),
-		[headerSelection.hidden],
-	);
 
 	/** Whether an entry's panel is currently open (drives the active styling). */
 	const toolbarEntryActive = useCallback(
@@ -307,6 +310,9 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 	const activateToolbarEntry = useCallback(
 		(id: string) => {
 			switch (id) {
+				case "path-rules":
+					setPathRulesOpened(true);
+					return;
 				case "tasks":
 					if (dock) dock.toggleToolPanel("tasks");
 					else setMobileTasksOpen((v) => !v);
@@ -429,14 +435,37 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		],
 	);
 
-	return {
-		toolbarEntries,
-		toolbarVisibleDefs,
-		toolbarHiddenDefs,
-		toolbarNoRoomIds,
-		saveToolbarLayout,
-		toolbarEntryActive,
-		activateToolbarEntry,
-		renderToolbarInlineOptions,
-	};
+	return useMemo(
+		() => ({
+			toolbarEntries,
+			toolbarSurfacedDefs,
+			toolbarTuckedDefs,
+			toolbarBottomDefs,
+			toolbarOverlays: (
+				<PathRulesPopover
+					narratorId={narratorId}
+					t={t}
+					controlled={{ opened: pathRulesOpened, onClose: closePathRules }}
+				/>
+			),
+			saveToolbarLayout,
+			toolbarEntryActive,
+			activateToolbarEntry,
+			renderToolbarInlineOptions,
+		}),
+		[
+			toolbarEntries,
+			toolbarSurfacedDefs,
+			toolbarTuckedDefs,
+			toolbarBottomDefs,
+			narratorId,
+			t,
+			pathRulesOpened,
+			closePathRules,
+			saveToolbarLayout,
+			toolbarEntryActive,
+			activateToolbarEntry,
+			renderToolbarInlineOptions,
+		],
+	);
 }

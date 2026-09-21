@@ -8,13 +8,16 @@
  * Locks the outbound HTTP chat request against the shared stable contract.
  */
 import { describe, expect, test } from "bun:test";
-import { ORIGINATOR_CODEX } from "../../user-agent";
+import { ORIGINATOR, ORIGINATOR_CODEX } from "../../user-agent";
 import { OpenAIProvider } from "../openai-provider";
 
 type Captured = { url: string; headers: Record<string, string>; body: Record<string, unknown> };
 
 async function captureChat(
-	overrides: { reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" } = {},
+	overrides: {
+		reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
+		userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
+	} = {},
 ): Promise<Captured> {
 	const provider = new OpenAIProvider({
 		id: "codex",
@@ -25,7 +28,7 @@ async function captureChat(
 		defaultModel: "gpt-5.3-codex",
 		apiMode: "codex",
 		// Match codexFingerprintConfig() used by the built-in CodexProvider.
-		userAgentMode: "codex",
+		userAgentMode: overrides.userAgentMode ?? "codex",
 		// biome-ignore lint/suspicious/noExplicitAny: test config subset
 	} as any);
 
@@ -86,6 +89,21 @@ describe("codex HTTP chat request parity", () => {
 		expect(req.headers["user-agent"]).toMatch(new RegExp(`^${ORIGINATOR_CODEX}/[^ ]+ `));
 		// The Codex Responses transport is always streamed.
 		expect(req.headers.accept).toBe("text/event-stream");
+	});
+
+	/**
+	 * User-reported bug lock: selecting NarraFork UA on the Codex provider must
+	 * change both identity headers, not just User-Agent. originator is what
+	 * request dumps and relays surface first.
+	 */
+	test("NarraFork UA mode presents NarraFork on User-Agent and originator", async () => {
+		const req = await captureChat({ userAgentMode: "narrafork" });
+
+		expect(req.headers.originator).toBe(ORIGINATOR);
+		expect(req.headers["user-agent"]).toMatch(new RegExp(`^${ORIGINATOR}/[^ ]+ `));
+		expect(req.headers["user-agent"]).not.toMatch(/^codex-tui\//);
+		// Protocol identity fields still travel; only the presented client name changes.
+		expect(req.headers["x-codex-installation-id"]).toBeTruthy();
 	});
 
 	/**

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ProviderStreamEvent } from "@server/lib/plugins/protocol";
+import { type ProviderStreamEvent, providerStreamEventSchema } from "@server/lib/plugins/protocol";
 import {
 	type ProviderOperation,
 	type ProviderOperationKind,
@@ -372,6 +372,122 @@ describe("RemoteProviderAdapter", () => {
 			{ toolUses: [{ toolUseId: "call-2", name: "Write", input: { path: "b" }, outputIndex: 1 }] },
 			{ stopReason: "tool_use" },
 		]);
+	});
+
+	test("optional content boundaries retain text/reasoning lane identities after metadata", async () => {
+		const input: ProviderStreamEvent[] = [
+			providerStreamEventSchema.parse({ type: "text.delta", text: "legacy" }),
+			providerStreamEventSchema.parse({
+				type: "text.delta",
+				text: "new",
+				blockId: "text-1",
+				outputIndex: 0,
+			}),
+			providerStreamEventSchema.parse({
+				type: "text.citation",
+				blockId: "text-1",
+				citations: [{ endIndex: 3, url: "https://example.test", outputIndex: 0 }],
+			}),
+			providerStreamEventSchema.parse({
+				type: "content.boundary",
+				kind: "text",
+				phase: "complete",
+				blockId: "text-1",
+				outputIndex: 0,
+			}),
+			providerStreamEventSchema.parse({
+				type: "reasoning.delta",
+				blockId: "reason-1",
+				text: "first",
+			}),
+			providerStreamEventSchema.parse({
+				type: "reasoning.delta",
+				blockId: "reason-2",
+				text: "second",
+			}),
+			providerStreamEventSchema.parse({
+				type: "reasoning.metadata",
+				blockId: "reason-1",
+				metadata: { source: "plugin:source", format: "opaque", data: "final" },
+			}),
+			providerStreamEventSchema.parse({
+				type: "content.boundary",
+				kind: "reasoning",
+				phase: "complete",
+				blockId: "reason-1",
+			}),
+			event("done", { status: "completed", stopReason: "end_turn" }),
+		];
+		const events = await collect(makeAdapter(makeRpc(input)).chat(chatParams()));
+		expect(events[0]).toMatchObject({ text: "legacy" });
+		expect(events[0].textBlockId).toBeUndefined();
+		expect(events[1].textBlockId).toBe("text-1");
+		expect(events[2].textBlockId).toBe("text-1");
+		expect(events[3].contentBoundary).toEqual({
+			kind: "text",
+			phase: "complete",
+			blockId: "text-1",
+			outputIndex: 0,
+		});
+		expect(events[4].reasoningBlockId).toBe("reason-1");
+		expect(events[5].reasoningBlockId).toBe("reason-2");
+		expect(events[6].reasoningBlockId).toBe("reason-1");
+		expect(events[7].contentBoundary?.phase).toBe("complete");
+	});
+
+	test("ordered replay preserves text-tool-text and opaque reasoning/native items", async () => {
+		const adapter = makeAdapter(makeRpc());
+		const source = adapter.getActiveReasoningSource();
+		const rpc = makeRpc([
+			event("reasoning.metadata", {
+				blockId: "reason-1",
+				metadata: { source, format: "opaque", data: "final-secret" },
+			}),
+			event("done", { status: "completed", stopReason: "end_turn" }),
+		]);
+		const metadata = (await collect(makeAdapter(rpc).chat(chatParams())))[0].reasoningMetadata;
+		const history: unknown[] = [];
+		adapter.pushAssistantTurn(
+			history,
+			"ignored",
+			[],
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			[
+				{ type: "reasoning", text: "", providerMetadata: metadata },
+				{ type: "text", text: "before", outputIndex: 9 },
+				{
+					type: "tool_use",
+					toolUseId: "call-1",
+					name: "Read",
+					input: {},
+					outputIndex: 0,
+					thoughtSignature: "tool-signature",
+					thoughtSignatureSource: source,
+				},
+				{ type: "text", text: "after", outputIndex: 1 },
+				{ type: "image_generation", id: "image-1", result: "base64-image" },
+			],
+		);
+		const content = (history[0] as { content: Array<Record<string, unknown>> }).content;
+		expect(content.map((block) => block.type)).toEqual([
+			"reasoning",
+			"text",
+			"tool_call",
+			"text",
+			"image_generation",
+		]);
+		expect(content[0].continuation).toEqual({ source, format: "opaque", data: "final-secret" });
+		expect(content[2].continuation).toEqual({
+			source,
+			format: "tool-continuation",
+			data: "tool-signature",
+		});
+		expect(content[4].result).toBe("base64-image");
 	});
 
 	test("chat preserves plugin reasoning metadata and metadata-only events", async () => {

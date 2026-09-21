@@ -99,9 +99,8 @@ export function trimClockNow(): number {
  * A trim at that point is the failure mode {@link TrimRejection} `"streaming"` guards
  * against, except invisible to it: by then the row is already gone, so
  * `hasStreamingRow` is false, and with a pinned reader and a long window nothing else
- * declines. The head removal moves `commitGrowthSignature`, the hand-off reads that as
- * document growth and resets `charsSinceLastCommit`, and the output of the step that
- * follows loses its protection.
+ * declines. Keep the active turn's loaded evidence and scroll anchors stable instead
+ * of treating a checkpoint as an idle maintenance window.
  *
  * So the intent ("the turn ended") is stated directly via `isActive` instead of being
  * inferred from the row. The pending edge is DEFERRED rather than consumed: a session
@@ -125,16 +124,7 @@ export function resolveStreamingClearedTrimEdge(input: {
 export type TrimRejection =
 	/** The reader has scrolled up; rows above the viewport are being read. */
 	| "not-pinned"
-	/**
-	 * A live streaming row is published.
-	 *
-	 * Trimming now can DESTROY un-persisted output. `commitGrowthSignature` is
-	 * `${length}:${newestId}`, so removing head messages changes it without any
-	 * message having landed; the hand-off reads that as "the document grew", resets
-	 * `charsSinceLastCommit` to 0, and `isStreamingMessageSuperseded` then lets an
-	 * already-stored EARLIER step retire the live row whose text was never stored.
-	 * See streaming-handoff.ts's own warning about this failure mode.
-	 */
+	/** A live streaming row is published; defer head maintenance until idle. */
 	| "streaming"
 	/** Not enough messages, or not enough canvas, to trim safely. */
 	| "below-threshold"

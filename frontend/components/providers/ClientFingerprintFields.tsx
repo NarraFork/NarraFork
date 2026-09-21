@@ -21,6 +21,15 @@ interface ClientFingerprintFieldsProps {
 	onRegenerateInstallationId?: () => void;
 	regenerating?: boolean;
 	disabled?: boolean;
+	/**
+	 * Mode shown when `value.userAgentMode` is unset.
+	 *
+	 * Must match the server's wire default for this surface. Built-in Codex and
+	 * codex-native custom providers default to "codex"; other custom protocols
+	 * default to "narrafork". Displaying NarraFork while the wire still sends
+	 * codex-tui made "I selected NarraFork" look like a no-op.
+	 */
+	defaultMode?: UserAgentMode;
 }
 
 /** Convert edited rows back into a record, keeping only non-empty keys. */
@@ -53,6 +62,7 @@ export function ClientFingerprintFields({
 	onRegenerateInstallationId,
 	regenerating,
 	disabled,
+	defaultMode = "narrafork",
 }: ClientFingerprintFieldsProps) {
 	const { t } = useTranslation("settings");
 
@@ -121,8 +131,8 @@ export function ClientFingerprintFields({
 					{ value: "codex", label: t("fingerprintUaCodex") },
 					{ value: "custom", label: t("fingerprintUaCustom") },
 				]}
-				value={value.userAgentMode ?? "narrafork"}
-				onChange={(v) => onChange({ userAgentMode: (v as UserAgentMode | null) ?? "narrafork" })}
+				value={value.userAgentMode ?? defaultMode}
+				onChange={(v) => onChange({ userAgentMode: (v as UserAgentMode | null) ?? defaultMode })}
 			/>
 			{value.userAgentMode === "custom" && (
 				<TextInput

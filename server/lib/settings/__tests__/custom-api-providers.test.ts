@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	customApiProtocolFromOpenAI,
 	customApiProviderToGemini,
+	defaultUserAgentModeForProtocol,
 	deriveCustomApiProvidersFromLegacy,
 	geminiProviderToCustomApi,
 	getProviderPrefixChanges,
@@ -62,6 +63,45 @@ describe("custom API provider migration", () => {
 				protocol: "gemini-compatible",
 			}),
 		]);
+	});
+
+	test("protocol default User-Agent modes: Codex relay → codex, Claude Code relay → claude-code", () => {
+		expect(defaultUserAgentModeForProtocol("codex-native")).toBe("codex");
+		expect(defaultUserAgentModeForProtocol("anthropic-official")).toBe("claude-code");
+		expect(defaultUserAgentModeForProtocol("anthropic-compatible")).toBe("claude-code");
+		expect(defaultUserAgentModeForProtocol("responses-compatible")).toBe("narrafork");
+		expect(defaultUserAgentModeForProtocol("completions-compatible")).toBe("narrafork");
+		expect(defaultUserAgentModeForProtocol("gemini-compatible")).toBe("narrafork");
+	});
+
+	test("normalize materializes the protocol default UA mode when unset", () => {
+		const base = {
+			id: "p1",
+			name: "P",
+			prefix: "p",
+			apiKey: "k",
+			baseUrl: "https://example.com",
+			defaultModel: "m",
+			codexAccountId: "",
+		};
+
+		expect(normalizeCustomApiProvider({ ...base, protocol: "codex-native" }).userAgentMode).toBe(
+			"codex",
+		);
+		expect(
+			normalizeCustomApiProvider({ ...base, protocol: "anthropic-official" }).userAgentMode,
+		).toBe("claude-code");
+		expect(
+			normalizeCustomApiProvider({ ...base, protocol: "anthropic-compatible" }).userAgentMode,
+		).toBe("claude-code");
+		// An explicit operator choice is preserved.
+		expect(
+			normalizeCustomApiProvider({
+				...base,
+				protocol: "codex-native",
+				userAgentMode: "narrafork",
+			}).userAgentMode,
+		).toBe("narrafork");
 	});
 
 	test("Gemini legacy, unified, and normalized conversions preserve transport with safe defaults", () => {

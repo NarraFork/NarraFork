@@ -27,6 +27,8 @@
  * Pure: no React, no DOM, no network.
  */
 
+import { contentBlockIdentity } from "../streaming/streaming-block-supersede";
+
 /** The subset of a message this module reads. */
 export interface AppendCandidate {
 	id?: unknown;
@@ -169,10 +171,29 @@ export function upsertLoadedMessage<T extends AppendCandidate>(
 	if (sameId >= 0) {
 		if (loaded[sameId] === message) return { messages: loaded, changed: false, appended: false };
 		const previous = loaded[sameId];
+		let contentJson = message.contentJson;
+		if (Array.isArray(contentJson) && Array.isArray(previous.contentJson)) {
+			const revisions = new Map(
+				previous.contentJson.flatMap((block) => {
+					const identity = block && typeof block === "object" ? contentBlockIdentity(block) : null;
+					return identity ? [[identity.id, { block, revision: identity.revision }] as const] : [];
+				}),
+			);
+			contentJson = contentJson.map((block) => {
+				const identity = block && typeof block === "object" ? contentBlockIdentity(block) : null;
+				const existing = identity ? revisions.get(identity.id) : undefined;
+				return existing && identity && existing.revision > identity.revision
+					? existing.block
+					: block;
+			});
+		}
 		const messages = [...loaded];
 		messages[sameId] = {
 			...previous,
 			...message,
+			// Same-block replay cannot roll an acknowledged revision backwards. Missing
+			// blocks still follow the incoming snapshot (explicit rollback/edit semantics).
+			contentJson,
 			// Projection broadcasts intentionally omit aggregate children/tool calls; retain
 			// the already-loaded rich tree while still applying canonical body/state fields.
 			children: message.children?.length ? message.children : previous.children,

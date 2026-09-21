@@ -491,7 +491,7 @@
 	"fingerprintTitle": "客户端指纹",
 	"fingerprintDesc": "控制请求向服务商呈现的客户端身份：User-Agent、额外请求头，以及 Codex CLI 请求头仿真。",
 	"fingerprintUserAgent": "User-Agent",
-	"fingerprintUserAgentDesc": "出站请求呈现的 User-Agent。",
+	"fingerprintUserAgentDesc": "出站请求呈现的 User-Agent。选择 NarraFork 时，Codex 的 originator 请求头也会改为 narrafork。",
 	"fingerprintUaNarrafork": "NarraFork",
 	"fingerprintUaClaudeCode": "Claude Code",
 	"fingerprintUaCodex": "Codex",

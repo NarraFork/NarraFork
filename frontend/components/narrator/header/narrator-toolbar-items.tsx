@@ -25,6 +25,7 @@ import {
 	IconDeviceDesktop,
 	IconFileCode,
 	IconFolder,
+	IconFolderPlus,
 	IconGitBranch,
 	IconInfoCircle,
 	IconMessages,
@@ -115,6 +116,11 @@ const TOOLBAR_ITEM_DETAILS: Record<NarratorToolbarId, Omit<NarratorToolbarItemDe
 		labelKey: "details.title",
 		icon: IconInfoCircle,
 		hosts: ["dock", "drawer"],
+	},
+	"path-rules": {
+		labelKey: "path_rules",
+		icon: IconFolderPlus,
+		hosts: ["inline"],
 	},
 	terminal: {
 		labelKey: "openTerminal",

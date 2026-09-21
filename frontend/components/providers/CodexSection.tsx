@@ -1357,6 +1357,7 @@ export const CodexSection = React.memo(function CodexSection({
 								value={fingerprint}
 								showInstallationId
 								installationId={fingerprintData?.installationId}
+								defaultMode="codex"
 								disabled={!canSetFingerprint}
 								regenerating={regenerateInstallationIdMut.isPending}
 								onRegenerateInstallationId={() => regenerateInstallationIdMut.mutate()}

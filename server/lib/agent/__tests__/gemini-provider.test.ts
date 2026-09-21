@@ -205,7 +205,11 @@ describe("Gemini transport selection", () => {
 		const events = await collect(
 			provider.chat(baseChatParams({ model: "factory-default:gemini-2.5-flash" }) as never),
 		);
-		expect(events).toContainEqual({ text: "ok", textOutputIndex: undefined });
+		expect(events).toContainEqual({
+			text: "ok",
+			textOutputIndex: 0,
+			textBlockId: "gemini:0:part:0",
+		});
 		expect(urls).toEqual([
 			"https://gemini.example.test/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
 		]);
@@ -622,6 +626,7 @@ describe("Gemini Interactions API provider", () => {
 		expect(events[0]).toEqual({ messageId: "int_1" });
 		expect(events).toContainEqual({
 			reasoning: "considering",
+			reasoningBlockId: "gemini:step:thought_1",
 			reasoningMetadata: { gemini: { stepId: "thought_1", stepIndex: 0 } },
 			reasoningOutputIndex: 0,
 		});
@@ -629,9 +634,22 @@ describe("Gemini Interactions API provider", () => {
 			reasoningMetadata: {
 				gemini: { stepId: "thought_1", stepIndex: 0, thoughtSignature: "sig_1" },
 			},
+			reasoningBlockId: "gemini:step:thought_1",
 			reasoningOutputIndex: 0,
 		});
-		expect(events).toContainEqual({ text: "I'll read it.", textOutputIndex: 1 });
+		expect(events).toContainEqual({
+			contentBoundary: {
+				kind: "reasoning",
+				phase: "complete",
+				blockId: "gemini:step:thought_1",
+				outputIndex: 0,
+			},
+		});
+		expect(events).toContainEqual({
+			text: "I'll read it.",
+			textOutputIndex: 1,
+			textBlockId: "gemini:step:1",
+		});
 		expect(events).toContainEqual({
 			toolUseChunk: { toolUseId: "call_1", name: "Read", input: "", outputIndex: 2 },
 		});

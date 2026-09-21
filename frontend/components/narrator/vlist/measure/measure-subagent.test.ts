@@ -779,7 +779,7 @@ describe("background launch notice", () => {
 			expect(measured.hasBackgroundNotice).toBe(expected);
 		}
 	});
-	it("replaces protocol output with one fixed row and suppresses collapsed preview", async () => {
+	it("hides protocol output and reserves no result height", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
 		const data = {
 			...BASE,
@@ -792,10 +792,7 @@ describe("background launch notice", () => {
 		const expanded = measureSubagentCard(data, WIDTH, 5, { opened: true });
 		expect(expanded.hasBackgroundNotice).toBe(true);
 		expect(expanded.resultMeasured).toBeNull();
-		expect(expanded.resultBlockHeight).toBeGreaterThan(0);
-		expect(measureSubagentCard(data, 240, 5, { opened: true }).resultBlockHeight).toBe(
-			expanded.resultBlockHeight,
-		);
+		expect(expanded.resultBlockHeight).toBe(0);
 		const collapsed = measureSubagentCard(data, WIDTH, 5, { opened: false });
 		expect(collapsed.hasResultPreview).toBe(false);
 		expect(collapsed.resultBlockHeight).toBe(0);

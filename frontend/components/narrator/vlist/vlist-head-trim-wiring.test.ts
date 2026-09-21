@@ -282,24 +282,12 @@ describe("trimHead — the fill loop cannot be re-triggered by a trim", () => {
 });
 
 describe("trimHead — streaming output is never destroyed", () => {
-	/**
-	 * The concrete mechanism, pinned as an executable fact rather than a comment.
-	 *
-	 * `commitGrowthSignature` is `${length}:${newestId}`. A head trim changes the
-	 * length while the newest id stays put, so the signature MOVES even though no
-	 * message landed. The hand-off treats a signature change as "the document grew"
-	 * and resets `charsSinceLastCommit` to 0 — which is precisely what stops
-	 * `isStreamingMessageSuperseded` from protecting a live row. If this assertion
-	 * ever fails, the reason trimming must avoid streaming has changed and the
-	 * decision rule should be revisited.
-	 */
-	it("head-trimming moves commitGrowthSignature although nothing was appended", async () => {
+	it("head trimming does not change the identity evidence for live output", async () => {
 		const mod = await load();
 		const full = [...history];
-		const trimmed = full.slice(10);
-		expect(mod.commitGrowthSignature(trimmed)).not.toBe(mod.commitGrowthSignature(full));
-		// ...and the newest id is unchanged, so the move is purely the length.
-		expect(trimmed[trimmed.length - 1]?.id).toBe(full[full.length - 1]?.id);
+		const live = streamingRow(301);
+		expect(mod.projectStreamingMessage(live, full)).toBe(live);
+		expect(mod.projectStreamingMessage(live, full.slice(10))).toBe(live);
 	});
 
 	it("refuses to trim while a live row is published", async () => {
@@ -322,32 +310,12 @@ describe("trimHead — streaming output is never destroyed", () => {
 		expect(decision.reason).toBe("streaming");
 	});
 
-	/**
-	 * The dangerous shape spelled out: a text-only live row whose content is NOT yet
-	 * persisted, with a renderable assistant message at the tail. With
-	 * `charsSinceLastCommit` reset to 0 the hand-off retires the live row — so the
-	 * only thing standing between this state and lost output is not trimming here.
-	 */
-	it("shows the live row would be retired if a trim reset the char counter", async () => {
+	it("an older trailing assistant cannot retire a new short block", async () => {
 		const mod = await load();
 		const committed = [...history, message(140, "assistant", "已存储的回复")];
-		const live = streamingRow(300);
-		// While the counter is intact the row is safe...
-		expect(
-			mod.isStreamingMessageSuperseded({
-				streamingMessage: live,
-				committedMessages: committed,
-				charsSinceLastCommit: 300,
-			}),
-		).toBe(false);
-		// ...and once a trim-induced signature change zeroes it, it is retired.
-		expect(
-			mod.isStreamingMessageSuperseded({
-				streamingMessage: live,
-				committedMessages: committed,
-				charsSinceLastCommit: 0,
-			}),
-		).toBe(true);
+		const live = streamingRow(3);
+		expect(mod.projectStreamingMessage(live, committed)).toBe(live);
+		expect(mod.projectStreamingMessage(live, committed.slice(10))).toBe(live);
 	});
 
 	it("trims normally once the live row has cleared", async () => {

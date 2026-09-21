@@ -568,6 +568,7 @@ export class NugProvider implements ProviderAdapter {
 			outputIndex?: number;
 			signatureSource?: string;
 		}>,
+		orderedContent?: readonly import("./types").ContentBlock[],
 	): void {
 		if (this.activeDelegate) {
 			this.activeDelegate.pushAssistantTurn(
@@ -580,6 +581,7 @@ export class NugProvider implements ProviderAdapter {
 				imageGenerations,
 				textOutputIndex,
 				redactedThinkingBlocks,
+				orderedContent,
 			);
 		}
 	}

@@ -1628,7 +1628,14 @@ export function useNarratorWS(
 					case "streaming_snapshot":
 						callbackOwner.callbacks.onStreamingSnapshot?.({
 							streamingBlocks: (data.streamingBlocks ?? []) as Array<
-								| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
+								| {
+										type: "reasoning";
+										id?: string;
+										revision?: number;
+										textOffset?: number;
+										outputIndex?: number;
+										text: string;
+								  }
 								| {
 										type: "web_search";
 										id: string;
@@ -1645,7 +1652,14 @@ export function useNarratorWS(
 										result?: string;
 										outputIndex?: number;
 								  }
-								| { type: "text"; text: string; outputIndex?: number }
+								| {
+										type: "text";
+										id?: string;
+										revision?: number;
+										textOffset?: number;
+										text: string;
+										outputIndex?: number;
+								  }
 							>,
 							toolChunks: (data.toolChunks ?? []) as Array<{
 								toolUseId: string;

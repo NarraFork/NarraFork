@@ -299,7 +299,7 @@ export function measureElementCached(
 	// O(len)/frame, i.e. O(len²) per turn. Text-bearing streaming rows therefore go
 	// through the incremental prepared-block path, which freezes completed markdown
 	// blocks and only re-parses the still-open trailing one.
-	if (!specKey || isStreamingKey(specKey)) {
+	if (!specKey || isStreamingKey(specKey) || opts?.streamingContent === true) {
 		const streamed = measureStreamingElement(kind, data, contentWidth, lod, opts, specKey);
 		if (streamed !== undefined) return streamed;
 		return VLIST_REGISTRY[kind].measure(data, contentWidth, lod, opts);

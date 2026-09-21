@@ -8,6 +8,7 @@ import { mergeSendDeliveryTargetCount, mergeSendDeliveryTargets } from "@shared/
 import type { FileReferenceContext } from "@shared/file-reference";
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import { isEmptyReasoningBlock } from "@shared/reasoning-content";
+import { appendStreamingTextPreview } from "../narrator-message-helpers";
 import type { ContentBlock, NarratorMsg, ToolCallRow } from "../narrator-panel-types";
 import type { ToolCallData } from "../tool-call/tool-call-data";
 
@@ -425,7 +426,14 @@ export function clearToolBlockCache(): void {
 
 /** A streaming block tracked in temporal order (by event arrival / provider output order). */
 export type StreamingBlock =
-	| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
+	| {
+			type: "reasoning";
+			id?: string;
+			revision?: number;
+			textOffset?: number;
+			outputIndex?: number;
+			text: string;
+	  }
 	| {
 			type: "web_search";
 			id: string;
@@ -451,6 +459,8 @@ export type StreamingBlock =
 			type: "text";
 			text: string;
 			id?: string;
+			revision?: number;
+			textOffset?: number;
 			outputIndex?: number;
 			fileReferenceContext?: FileReferenceContext | null;
 	  };
@@ -620,9 +630,18 @@ export function mergeStreamingSnapshotBlocks(
 	for (const incoming of snapshotBlocks) {
 		const idx = findMatchingStreamingBlockIndex(blocks, incoming);
 		if (idx === -1) {
-			blocks.splice(findStreamingInsertIndex(blocks, getStreamingBlockOutputIndex(incoming)), 0, {
-				...incoming,
-			});
+			const next = { ...incoming };
+			if (next.type === "text" || next.type === "reasoning") {
+				const rawLength = next.text.length;
+				next.text = appendStreamingTextPreview("", next.text);
+				if (next.textOffset != null || rawLength !== next.text.length)
+					next.textOffset = (next.textOffset ?? 0) + rawLength - next.text.length;
+			}
+			blocks.splice(
+				findStreamingInsertIndex(blocks, getStreamingBlockOutputIndex(incoming)),
+				0,
+				next,
+			);
 			changed = true;
 			continue;
 		}
@@ -644,7 +663,39 @@ export function mergeStreamingSnapshotBlocks(
 				);
 				changed = true;
 			}
-			// Keep whichever text is longer so a late snapshot cannot truncate live text.
+			// Modern snapshots are exact versions, including shorter corrected bodies.
+			if (incoming.id && incoming.revision != null && existing.revision != null) {
+				if (incoming.revision <= existing.revision) {
+					// A delta may precede its reconnect snapshot. Revision guards the
+					// suffix; raw offsets let an older snapshot restore its missing prefix.
+					const start = incoming.textOffset;
+					const currentStart = existing.textOffset;
+					if (
+						start != null &&
+						currentStart != null &&
+						start < currentStart &&
+						start + incoming.text.length >= currentStart
+					) {
+						const end = currentStart + existing.text.length;
+						const prefix = incoming.text.slice(0, currentStart - start);
+						const text = appendStreamingTextPreview(prefix, existing.text);
+						if (text !== existing.text) {
+							existing.text = text;
+							existing.textOffset = end - text.length;
+							changed = true;
+						}
+					}
+					continue;
+				}
+				existing.text = appendStreamingTextPreview("", incoming.text);
+				existing.textOffset =
+					(incoming.textOffset ?? 0) + incoming.text.length - existing.text.length;
+				existing.revision = incoming.revision;
+				changed = true;
+				continue;
+			}
+			if (incoming.revision != null) existing.revision = incoming.revision;
+			// Legacy snapshots have no version; retain their conservative longer preview.
 			if (incoming.text.length > existing.text.length) {
 				existing.text = incoming.text;
 				if (incoming.type === "reasoning" && existing.type === "reasoning" && incoming.id) {
@@ -697,6 +748,9 @@ export function buildStreamingMsg(opts: {
 							? `streaming:reasoning:${sb.outputIndex}`
 							: `streaming:reasoning:${index}`),
 					text: sb.text,
+					outputIndex: sb.outputIndex,
+					...(sb.revision != null ? { revision: sb.revision } : {}),
+					...(sb.textOffset != null ? { textOffset: sb.textOffset } : {}),
 				} as ContentBlock);
 			} else if (sb.type === "web_search") {
 				blocks.push({
@@ -724,6 +778,8 @@ export function buildStreamingMsg(opts: {
 					type: "text",
 					id: sb.id ?? `streaming:text:${index}`,
 					text: sb.text,
+					...(sb.revision != null ? { revision: sb.revision } : {}),
+					...(sb.textOffset != null ? { textOffset: sb.textOffset } : {}),
 					outputIndex: sb.outputIndex,
 					...(sb.fileReferenceContext !== undefined
 						? { fileReferenceContext: normalizeFileReferenceContext(sb.fileReferenceContext) }

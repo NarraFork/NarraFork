@@ -774,6 +774,72 @@ describe("NarratorStatusToolbar", () => {
 		expect(document.querySelector('[data-testid="narrator-status-more"]')).not.toBeNull();
 	});
 
+	test("desktop tools fold behind fixed selects while reserving status text and context ring", async () => {
+		const activate = mock((_index: number) => {});
+		const actions: NarratorStatusToolbarAction[] = Array.from({ length: 12 }, (_, index) => ({
+			key: `tool-${index}`,
+			collapsePriority: 52 - index,
+			render: (mode) =>
+				mode === "menu" ? (
+					<Menu.Item onClick={() => activate(index)}>Tool {index}</Menu.Item>
+				) : (
+					<button type="button" data-measure-width="28">
+						Tool {index}
+					</button>
+				),
+		}));
+		const renderDesktop = async (width: number) => {
+			await act(async () => {
+				root?.render(
+					<MantineProvider env="test">
+						<div data-row-width={width}>
+							<NarratorStatusBar>
+								<div data-measure-width="240" style={{ flex: 1, minWidth: 0 }}>
+									Status text
+								</div>
+								<div style={{ minWidth: 0 }}>
+									<NarratorStatusToolbar
+										leading={
+											<div data-measure-width="240">Model, reasoning and permission selects</div>
+										}
+										actions={actions}
+										moreLabel="More actions"
+										measurementKey="desktop"
+									/>
+								</div>
+								<div data-measure-width="40" style={{ flexShrink: 0 }}>
+									Context ring
+								</div>
+							</NarratorStatusBar>
+						</div>
+					</MantineProvider>,
+				);
+			});
+			await triggerResize();
+		};
+		await renderDesktop(1000);
+		expect(document.querySelector('[data-testid="narrator-status-more"]')).toBeNull();
+		expect(document.querySelectorAll("[data-toolbar-action]").length).toBe(12);
+		await renderDesktop(600);
+		expect(document.querySelector('[data-testid="narrator-status-more"]')).not.toBeNull();
+		const visibleCount = document.querySelectorAll("[data-toolbar-action]").length;
+		expect(visibleCount).toBeGreaterThan(0);
+		expect(visibleCount).toBeLessThan(12);
+		expect(
+			240 +
+				visibleCount * 28 +
+				(visibleCount + 1) * 4 +
+				22 +
+				40 +
+				NARRATOR_STATUS_RESERVED_TEXT_WIDTH_PX,
+		).toBeLessThanOrEqual(600);
+		await triggerResize();
+		expect(document.querySelectorAll("[data-toolbar-action]").length).toBe(visibleCount);
+		await renderDesktop(1000);
+		expect(document.querySelectorAll("[data-toolbar-action]").length).toBe(12);
+		expect(document.querySelector('[data-testid="narrator-status-more"]')).toBeNull();
+	});
+
 	test("a display-none row cannot collapse, because zero widths are rejected", async () => {
 		// This is what keeps the desktop breakpoint intact. The mobile row is `hiddenFrom="sm"`
 		// there, and a `display: none` subtree reports 0 for every rect, so its measurements

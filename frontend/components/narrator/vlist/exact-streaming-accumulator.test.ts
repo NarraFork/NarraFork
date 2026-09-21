@@ -226,3 +226,67 @@ describe("blockIndex — where the delta landed", () => {
 		expect(isLiveStreamingBlock(true, reopenedMsg, blocks.length - 1)).toBe(false);
 	});
 });
+
+describe("versioned raw windows", () => {
+	const delta = (
+		id: string,
+		text: string,
+		revision: number,
+		textOffset: number,
+	): StreamDeltaEvent => ({
+		type: "content_block_delta",
+		outputIndex: 0,
+		delta: { type: "text_delta", id, text, revision, textOffset },
+	});
+	it("attempt ids stay distinct even when the outputIndex restarts at zero", () => {
+		const blocks: StreamingBlock[] = [];
+		applyExactStreamDelta(blocks, delta("attempt-a", "old", 1, 0), false);
+		applyExactStreamDelta(blocks, delta("attempt-b", "NEW", 1, 0), false);
+		expect(blocks).toHaveLength(2);
+		expect(blocks.map((b) => b.id)).toEqual(["attempt-a", "attempt-b"]);
+	});
+	it("deduplicates deltas already covered by a snapshot", () => {
+		const blocks: StreamingBlock[] = [];
+		applyExactStreamingSnapshot(blocks, [
+			{ type: "text", id: "b", revision: 5, textOffset: 0, text: "hello" },
+		]);
+		expect(applyExactStreamDelta(blocks, delta("b", "lo", 5, 3), false).applied).toBe(false);
+		applyExactStreamDelta(blocks, delta("b", "!", 6, 5), false);
+		expect(blocks[0]).toMatchObject({ text: "hello!", revision: 6, textOffset: 0 });
+	});
+	it("an older raw snapshot joins an overlapping delta without repeating its overlap", () => {
+		const blocks: StreamingBlock[] = [];
+		applyExactStreamDelta(blocks, delta("b", "CDEF", 5, 2), false);
+		applyExactStreamingSnapshot(blocks, [
+			{ type: "text", id: "b", revision: 3, textOffset: 0, text: "ABCD" },
+		]);
+		expect(blocks[0]).toMatchObject({ text: "ABCDEF", revision: 5, textOffset: 0 });
+	});
+	it("the revision, not string length, decides which versioned snapshot wins", () => {
+		const blocks: StreamingBlock[] = [];
+		applyExactStreamingSnapshot(blocks, [
+			{ type: "text", id: "b", revision: 3, textOffset: 0, text: "long old text" },
+		]);
+		applyExactStreamingSnapshot(blocks, [
+			{ type: "text", id: "b", revision: 4, textOffset: 0, text: "NEW" },
+		]);
+		applyExactStreamingSnapshot(blocks, [
+			{ type: "text", id: "b", revision: 3, textOffset: 0, text: "long old text" },
+		]);
+		expect(blocks[0]).toMatchObject({ text: "NEW", revision: 4 });
+	});
+	it("caps both live and reconnect raw windows with their correct offsets", () => {
+		for (const snapshot of [false, true]) {
+			const blocks: StreamingBlock[] = [];
+			const text = "x".repeat(130_000);
+			if (snapshot)
+				applyExactStreamingSnapshot(blocks, [
+					{ type: "text", id: "b", revision: 1, textOffset: 0, text },
+				]);
+			else applyExactStreamDelta(blocks, delta("b", text, 1, 0), false);
+			expect(blocks[0]).toMatchObject({ text: "x".repeat(120_000), textOffset: 10_000 });
+			applyExactStreamDelta(blocks, delta("b", "END", 2, 130_000), false);
+			expect(blocks[0]).toMatchObject({ text: `${"x".repeat(119_997)}END`, textOffset: 10_003 });
+		}
+	});
+});

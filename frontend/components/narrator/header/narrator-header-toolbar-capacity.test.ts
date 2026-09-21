@@ -233,8 +233,31 @@ describe("resolveHeaderToolbarBudget", () => {
 			titleSlotMinWidth: HEADER_TITLE_MIN_WIDTH_PX,
 		});
 
-		// 1000 − rowGap 10 − back 28 − title 140 − leadingGap 10 − 2 × (22 + 10)
+		// Title-first: fixed trailing controls and gaps are subtracted from what remains.
 		expect(budget).toBe(1000 - GAP - 28 - HEADER_TITLE_MIN_WIDTH_PX - GAP - 2 * (22 + GAP));
+	});
+
+	test("spare width after the title reserve keeps tools instead of enforcing a percentage share", () => {
+		const built = buildRow(ROW_HTML(390, 10, 1));
+		const titleSlotMinWidth = HEADER_TITLE_MIN_WIDTH_PX + 44;
+		const budget = resolveHeaderToolbarBudget({ ...built, titleSlotMinWidth });
+		const sharedBudget = resolveHeaderToolbarBudget({
+			...built,
+			titleSlotMinWidth,
+			maxWidthFraction: 0.2,
+		});
+		expect(resolveHeaderToolbarCapacity({ budgetWidth: budget, itemCount: 2 })).toBe(2);
+		expect(resolveHeaderToolbarCapacity({ budgetWidth: sharedBudget, itemCount: 2 })).toBe(1);
+		expect(budget).toBe(390 - GAP - 28 - titleSlotMinWidth - GAP - (22 + GAP));
+	});
+
+	test("tools still collapse when the title and fixed controls need the room", () => {
+		const built = buildRow(ROW_HTML(340, 10, 2));
+		const budgetWidth = resolveHeaderToolbarBudget({
+			...built,
+			titleSlotMinWidth: HEADER_TITLE_MIN_WIDTH_PX + 44,
+		});
+		expect(resolveHeaderToolbarCapacity({ budgetWidth, itemCount: 2 })).toBe(1);
 	});
 
 	test("a host that owns the title hands that width to the entries", () => {
@@ -245,7 +268,20 @@ describe("resolveHeaderToolbarBudget", () => {
 		});
 		const hostOwnsTitle = resolveHeaderToolbarBudget({ ...built, titleSlotMinWidth: 0 });
 
+		// Title-first on every host; an owned title hands its floor to the entries.
+		expect(withTitle).toBe(1000 - GAP - 28 - HEADER_TITLE_MIN_WIDTH_PX - GAP - (22 + GAP));
 		expect(hostOwnsTitle - withTitle).toBe(HEADER_TITLE_MIN_WIDTH_PX);
+	});
+
+	test("tools collapse when the title and fixed controls leave no usable room", () => {
+		const built = buildRow(ROW_HTML(300, 10, 2));
+		const budgetWidth = resolveHeaderToolbarBudget({
+			...built,
+			titleSlotMinWidth: HEADER_TITLE_MIN_WIDTH_PX + 44,
+		});
+		// 4px remains after the title floor + fixed controls — not one entry.
+		expect(budgetWidth).toBe(4);
+		expect(resolveHeaderToolbarCapacity({ budgetWidth, itemCount: 12 })).toBe(0);
 	});
 
 	test("an unmeasured row yields no budget rather than a negative one", () => {

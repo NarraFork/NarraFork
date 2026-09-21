@@ -4,8 +4,9 @@
  *
  * Structurally a copy of `components/nav/NavOverflowMenu.tsx` — one flat sortable
  * list where the "tucked away" heading is itself a (non-draggable) drop target,
- * so moving an entry across the boundary is a plain `arrayMove` with no separate
- * zone bookkeeping. Keeping the two menus isomorphic is deliberate: a reader who
+ * so moving an entry crosses section boundaries without separate visibility flags.
+ * Reordering uses the full saved list to preserve tools unavailable on this host.
+ * Keeping the two menus isomorphic is deliberate: a reader who
  * has customized the sidebar already knows how this works.
  *
  * Archive is appended below a separator and is NOT part of the sortable list. It
@@ -30,12 +31,7 @@ import {
 	useSensor,
 	useSensors,
 } from "@dnd-kit/core";
-import {
-	arrayMove,
-	SortableContext,
-	useSortable,
-	verticalListSortingStrategy,
-} from "@dnd-kit/sortable";
+import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
 	ActionIcon,
@@ -55,9 +51,11 @@ import {
 	IconDotsVertical,
 	IconGripVertical,
 } from "@tabler/icons-react";
-import { type ReactNode, useCallback, useMemo, useState } from "react";
+import { Fragment, type ReactNode, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+	moveToolbarEntry,
+	NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID,
 	NARRATOR_TOOLBAR_DIVIDER_ID,
 	type NarratorToolbarEntry,
 } from "../../../hooks/narrator-toolbar-layout";
@@ -75,7 +73,9 @@ import {
 } from "./narrator-toolbar-items";
 
 function entryId(entry: NarratorToolbarEntry): string {
-	return entry.kind === "divider" ? NARRATOR_TOOLBAR_DIVIDER_ID : entry.id;
+	if (entry.kind === "divider") return NARRATOR_TOOLBAR_DIVIDER_ID;
+	if (entry.kind === "bottom-divider") return NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID;
+	return entry.id;
 }
 
 /** Max height of an inline expansion before it scrolls (device / plugin lists can be long). */
@@ -83,7 +83,6 @@ const INLINE_OPTIONS_MAX_HEIGHT_PX = 260;
 
 function SortableRow({
 	id,
-	tucked,
 	label,
 	badgeLabel,
 	badgeProcessing,
@@ -94,8 +93,6 @@ function SortableRow({
 	expandLabel,
 }: {
 	id: string;
-	/** Not on the header row (tucked away, or collapsed for width) — rendered dimmed. */
-	tucked: boolean;
 	label: string;
 	badgeLabel?: string;
 	badgeProcessing?: boolean;
@@ -157,11 +154,6 @@ function SortableRow({
 						flex: 1,
 						minWidth: 0,
 						cursor: onActivate ? "pointer" : "default",
-						// Dimming the whole label is the entire "not on the header row"
-						// signal. It used to be a per-row "No room" caption, but when the
-						// row fits only two entries EVERY other row carried it, and a
-						// caption repeated nine times is noise rather than information.
-						color: tucked ? "var(--mantine-color-dimmed)" : undefined,
 					}}
 					onClick={onActivate}
 				>
@@ -224,10 +216,10 @@ function SortableRow({
 }
 
 /** The zone boundary. Not draggable, but a valid drop target. */
-function SortableDivider({ label }: { label: string }) {
+function SortableDivider({ id, label }: { id: string; label: string }) {
 	const { setNodeRef, transform, transition, isOver } = useSortable({
-		id: NARRATOR_TOOLBAR_DIVIDER_ID,
-		disabled: true,
+		id,
+		disabled: { draggable: true, droppable: false },
 	});
 	return (
 		<div ref={setNodeRef} style={{ transform: CSS.Transform.toString(transform), transition }}>
@@ -250,7 +242,7 @@ function SortableDivider({ label }: { label: string }) {
 }
 
 export interface NarratorToolbarOverflowMenuProps {
-	/** Full flat layout (both zones) — the drag list operates on this. */
+	/** Full flat layout (header, menu and bottom zones) — the drag list operates on this. */
 	entries: readonly NarratorToolbarEntry[];
 	/**
 	 * Entries NOT on the header row right now, whether the reader tucked them away
@@ -324,7 +316,7 @@ export function NarratorToolbarOverflowMenu({
 	const listedEntries = useMemo(
 		() =>
 			entries.filter((entry) => {
-				if (entry.kind === "divider") return true;
+				if (entry.kind !== "item") return true;
 				const def = narratorToolbarItem(entry.id);
 				return !!def && isNarratorToolbarItemAvailable(def, hostCapabilities);
 			}),
@@ -351,55 +343,32 @@ export function NarratorToolbarOverflowMenu({
 	const handleDragEnd = useCallback(
 		(event: DragEndEvent) => {
 			const { active, over } = event;
-			if (!over || active.id === over.id || active.id === NARRATOR_TOOLBAR_DIVIDER_ID) return;
-
-			const oldIndex = flatIds.indexOf(String(active.id));
-			const newIndex = flatIds.indexOf(String(over.id));
-			if (oldIndex === -1 || newIndex === -1) return;
-
-			const nextIds = arrayMove(flatIds, oldIndex, newIndex);
-			const byId = new Map(listedEntries.map((entry) => [entryId(entry), entry]));
-			const reordered = nextIds
-				.map((id) => byId.get(id))
-				.filter((entry): entry is NarratorToolbarEntry => entry != null);
-
-			/*
-			 * Entries hidden from this host were excluded above, so they must be
-			 * re-attached rather than dropped: saving only the visible ones would
-			 * silently delete a desktop-only entry the moment a phone reordered the
-			 * list, and the layout is shared across devices. They are appended after
-			 * the divider, which is where an unavailable entry belongs until its host
-			 * comes back.
-			 */
-			const kept = new Set(nextIds);
-			const hidden = entries.filter((entry) => entry.kind === "item" && !kept.has(entry.id));
-			onSaveLayout([...reordered, ...hidden]);
+			if (!over || active.id === over.id) return;
+			// Move within the FULL saved list. Entries unavailable on this host keep
+			// their original zone and order rather than being relocated on every drag.
+			onSaveLayout(moveToolbarEntry(entries, String(active.id), String(over.id)));
 		},
-		[flatIds, listedEntries, entries, onSaveLayout],
+		[entries, onSaveLayout],
 	);
 
 	/**
-	 * Fallback for a caller that does not pass `hiddenDefs`: the entries below the
-	 * divider. Correct only when nothing was collapsed for width.
+	 * Fallback for a caller that does not pass `hiddenDefs`: menu-zone entries only.
+	 * Bottom icons are visible elsewhere. Correct only when nothing collapsed for width.
 	 */
 	const tuckedDefs = useMemo(() => {
 		if (dividerIndex < 0) return [];
+		const bottomIndex = listedEntries.findIndex((entry) => entry.kind === "bottom-divider");
 		return listedEntries
-			.slice(dividerIndex + 1)
+			.slice(dividerIndex + 1, bottomIndex < 0 ? undefined : bottomIndex)
 			.flatMap((entry) => (entry.kind === "item" ? [narratorToolbarItem(entry.id)] : []))
 			.filter((def): def is NonNullable<typeof def> => def != null);
 	}, [listedEntries, dividerIndex]);
 	const aggregate = aggregateOverflowBadge(hiddenDefs ?? tuckedDefs, badgeCounts);
 	const noRoomIdSet = useMemo(() => new Set(noRoomIds ?? []), [noRoomIds]);
-	/**
-	 * Whether ANY entry the reader surfaced failed to fit. Drives one note under the
-	 * "shown in header" heading rather than a caption per row: the note is about the
-	 * row's width, which is one fact about the whole section, not a property each
-	 * entry carries.
-	 */
-	const anyNoRoom = useMemo(
+	// A visual boundary only; it must not participate in the persisted drag order.
+	const firstNoRoomIndex = useMemo(
 		() =>
-			listedEntries.some(
+			listedEntries.findIndex(
 				(entry, index) =>
 					entry.kind === "item" &&
 					!(dividerIndex >= 0 && index > dividerIndex) &&
@@ -466,26 +435,18 @@ export function NarratorToolbarOverflowMenu({
 							<Text size="xs" c="dimmed" fw={600}>
 								{t("toolbar.sectionVisible")}
 							</Text>
-							{/*
-							 * The heading claims these are in the header, which a narrow row
-							 * makes false for most of them. Saying so ONCE here replaces the
-							 * per-row "No room" caption: at the mobile cap of two entries every
-							 * remaining row carried that caption, which made it noise and
-							 * pushed the dimmed styling — the actual signal — into the
-							 * background.
-							 */}
-							{anyNoRoom ? (
-								<Text size="xs" c="dimmed" fs="italic">
-									{t("toolbar.someHiddenNoRoom")}
-								</Text>
-							) : null}
 						</Box>
 						{listedEntries.map((entry, index) => {
-							if (entry.kind === "divider") {
+							if (entry.kind !== "item") {
 								return (
 									<SortableDivider
-										key={NARRATOR_TOOLBAR_DIVIDER_ID}
-										label={t("toolbar.sectionTucked")}
+										key={entryId(entry)}
+										id={entryId(entry)}
+										label={t(
+											entry.kind === "bottom-divider"
+												? "toolbar.sectionBottom"
+												: "toolbar.sectionTucked",
+										)}
 									/>
 								);
 							}
@@ -499,33 +460,35 @@ export function NarratorToolbarOverflowMenu({
 							const inlineOptions = activatable
 								? undefined
 								: renderInlineOptions?.(entry.id, closeMenu);
-							const tucked = dividerIndex >= 0 && index > dividerIndex;
-							// "No room" only makes sense above the divider; below it, the entry is
-							// in this menu because the reader put it here.
-							const noRoom = !tucked && noRoomIdSet.has(entry.id);
 							return (
-								<SortableRow
-									key={entry.id}
-									id={entry.id}
-									tucked={tucked || noRoom}
-									label={t(def.labelKey, { ns: def.namespace ?? "narrator" })}
-									badgeLabel={badge.label || undefined}
-									badgeProcessing={badge.processing}
-									onActivate={
-										activatable
-											? () => {
-													closeMenu();
-													onActivate(entry.id);
-												}
-											: undefined
-									}
-									inlineOptions={inlineOptions ?? undefined}
-									expanded={expandedId === entry.id}
-									onToggleExpanded={() =>
-										setExpandedId((current) => (current === entry.id ? null : entry.id))
-									}
-									expandLabel={t("toolbar.expandOptions")}
-								/>
+								<Fragment key={entry.id}>
+									{index === firstNoRoomIndex ? (
+										<>
+											<Menu.Divider />
+											<Menu.Label>{t("toolbar.someHiddenNoRoom")}</Menu.Label>
+										</>
+									) : null}
+									<SortableRow
+										id={entry.id}
+										label={t(def.labelKey, { ns: def.namespace ?? "narrator" })}
+										badgeLabel={badge.label || undefined}
+										badgeProcessing={badge.processing}
+										onActivate={
+											activatable
+												? () => {
+														closeMenu();
+														onActivate(entry.id);
+													}
+												: undefined
+										}
+										inlineOptions={inlineOptions ?? undefined}
+										expanded={expandedId === entry.id}
+										onToggleExpanded={() =>
+											setExpandedId((current) => (current === entry.id ? null : entry.id))
+										}
+										expandLabel={t("toolbar.expandOptions")}
+									/>
+								</Fragment>
 							);
 						})}
 					</SortableContext>

@@ -994,7 +994,15 @@ describe("agentLoop abort result draining", () => {
 		}
 
 		expect(providerAttempts).toBe(1);
-		expect(events).toContainEqual({ type: "stream_text", text: "partial codex output" });
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				type: "stream_text",
+				text: "partial codex output",
+				blockId: expect.any(String),
+				blockRevision: 1,
+				blockTextOffset: 0,
+			}),
+		);
 		const textBlock = events.find(
 			(event): event is Extract<AgentEvent, { type: "block_complete" }> =>
 				event.type === "block_complete" && event.block.type === "text",

@@ -129,12 +129,14 @@ import {
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { HeaderToolbar } from "./header/HeaderToolbar";
 import { NarratorPanelHeaderTitle } from "./header/NarratorPanelHeaderTitle";
+import { buildBottomToolbarActions } from "./header/NarratorToolbarItem";
 import {
 	getNarratorStatusBarDisplay,
 	planNarratorWorkIndicator,
 } from "./header/narrator-status-bar";
 import type { NarratorToolbarBadgeCounts } from "./header/narrator-toolbar-badges";
 import type { NarratorToolbarHost } from "./header/narrator-toolbar-items";
+import { useHeaderToolbar } from "./header/use-header-toolbar";
 import { DropOverlay } from "./interaction/DropOverlay";
 import { buildMobileToolbarActions } from "./interaction/mobile-toolbar-actions";
 import {
@@ -2558,6 +2560,76 @@ export function NarratorPanel({
 		[tasksRunningCount, wsState.browserSessionCount, userChatUnread, activeTerminalCount],
 	);
 
+	const toolbarController = useHeaderToolbar({
+		narratorId,
+		headerHostCapabilities,
+		dock,
+		gitWorkspaceAvailable:
+			!gitWorkspaceQuery.isError &&
+			gitWorkspaceQuery.data?.state === "ready" &&
+			gitWorkspaceQuery.data.capabilities.read,
+		tasksSupported,
+		tasksButtonEnabled,
+		specToolAvailable,
+		terminalToolAvailable,
+		onOpenTerminalPanel,
+		browserSessionsSupported: browserSessionsCapability.supported,
+		executionDevicesQuery,
+		mobileTasksOpen,
+		mobileToolPanel,
+		fileModDrawerOpened,
+		detailsOpened,
+		terminalToolOpened,
+		specToolOpened,
+		setMobileTasksOpen,
+		setMobileToolPanel,
+		setFileModDrawerOpened,
+		toggleDetails,
+		toggleTerminalTool,
+		toggleSpecTool,
+		updateExecutionDeviceMutation,
+		renderLod,
+		renderLodIsDefault,
+		handleSelectLod,
+		setAsDefault,
+		openPluginPanel,
+		t,
+	});
+	// Memoized so header capacity changes do not rebuild bottom actions on every
+	// incidental panel render; capacity itself lives inside HeaderToolbar.
+	const toolbarInlineControls = useMemo(
+		() => ({
+			executionDevicesQuery,
+			updateExecutionDeviceMutation,
+			renderLod,
+			renderLodIsDefault,
+			handleSelectLod,
+			setAsDefault,
+			openPluginPanel,
+		}),
+		[
+			executionDevicesQuery,
+			updateExecutionDeviceMutation,
+			renderLod,
+			renderLodIsDefault,
+			handleSelectLod,
+			setAsDefault,
+			openPluginPanel,
+		],
+	);
+	const bottomToolbarActions = useMemo(
+		() =>
+			buildBottomToolbarActions({
+				inlineControls: toolbarInlineControls,
+				defs: toolbarController.toolbarBottomDefs,
+				narratorId,
+				controller: toolbarController,
+				toolbarBadgeCounts,
+				t,
+			}),
+		[toolbarInlineControls, toolbarController, narratorId, toolbarBadgeCounts, t],
+	);
+
 	if (!narrator) return <NarratorPanelSkeleton />;
 
 	const statusBarDisplay = getNarratorStatusBarDisplay({
@@ -2737,10 +2809,9 @@ export function NarratorPanel({
 		</Menu>
 	);
 
-	// Mobile status-row actions (path rules / relaxed plan / promote) live in
-	// useMobileToolbarActions. The terminal entry deliberately is NOT here — it is
-	// a tool entry owned by the header registry (narrator-toolbar-items).
+	// Configuration controls stay fixed; movable tools follow the saved bottom order.
 	const mobileToolbarActions = buildMobileToolbarActions({
+		bottomActions: bottomToolbarActions,
 		narratorId,
 		t,
 		hasPlanTrait,
@@ -2756,7 +2827,14 @@ export function NarratorPanel({
 	// leading controls (model, reasoning effort, fast mode, permission mode) are
 	// re-measured every pass, so including them would needlessly drop the cache
 	// and repaint every action inline for a frame.
-	const mobileToolbarMeasurementKey = [i18n.resolvedLanguage, activeTerminalCount].join(":");
+	const mobileToolbarMeasurementKey = [
+		i18n.resolvedLanguage,
+		toolbarBadgeCounts.backgroundTasks,
+		toolbarBadgeCounts.browserSessions,
+		toolbarBadgeCounts.userChatUnread,
+		toolbarBadgeCounts.terminals,
+		renderLod,
+	].join(":");
 
 	return (
 		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>
@@ -2771,6 +2849,7 @@ export function NarratorPanel({
 					style={{ overflow: "hidden", position: "relative" }}
 					{...dropZoneProps}
 				>
+					{toolbarController.toolbarOverlays}
 					<NugRechargeDialog
 						opened={nugRechargeOpened}
 						narratorId={narratorId}
@@ -2887,47 +2966,19 @@ export function NarratorPanel({
 						</Group>
 						{!isWorkspacePreview && (
 							<HeaderToolbar
-								headerToolbarRef={headerToolbarRef}
 								headerRowRef={headerRowRef}
+								headerToolbarRef={headerToolbarRef}
 								headerLeadingRef={headerLeadingRef}
 								hostOwnsTitle={hostOwnsTitle}
 								isWorkspacePreview={isWorkspacePreview}
 								isMobileViewport={isMobileViewport}
+								narratorId={narratorId}
+								controller={toolbarController}
+								inlineControls={toolbarInlineControls}
 								toolbarBadgeCounts={toolbarBadgeCounts}
 								headerHostCapabilities={headerHostCapabilities}
-								chapterId={chapterId}
-								gitWorkspaceAvailable={
-									!gitWorkspaceQuery.isError &&
-									gitWorkspaceQuery.data?.state === "ready" &&
-									gitWorkspaceQuery.data.capabilities.read
-								}
-								tasksSupported={tasksSupported}
-								tasksButtonEnabled={tasksButtonEnabled}
-								specToolAvailable={specToolAvailable}
-								terminalToolAvailable={terminalToolAvailable}
-								onOpenTerminalPanel={onOpenTerminalPanel}
-								browserSessionsSupported={browserSessionsCapability.supported}
-								mobileTasksOpen={mobileTasksOpen}
-								mobileToolPanel={mobileToolPanel}
-								fileModDrawerOpened={fileModDrawerOpened}
-								detailsOpened={detailsOpened}
-								terminalToolOpened={terminalToolOpened}
-								specToolOpened={specToolOpened}
-								setMobileTasksOpen={setMobileTasksOpen}
-								setMobileToolPanel={setMobileToolPanel}
-								setFileModDrawerOpened={setFileModDrawerOpened}
-								toggleDetails={toggleDetails}
-								toggleTerminalTool={toggleTerminalTool}
-								toggleSpecTool={toggleSpecTool}
 								openArchiveConfirm={openArchiveConfirm}
 								archiveMutation={archiveMutation}
-								executionDevicesQuery={executionDevicesQuery}
-								updateExecutionDeviceMutation={updateExecutionDeviceMutation}
-								renderLod={renderLod}
-								renderLodIsDefault={renderLodIsDefault}
-								handleSelectLod={handleSelectLod}
-								setAsDefault={setAsDefault}
-								openPluginPanel={openPluginPanel}
 								dock={dock}
 								mockStreamEnabled={mockStreamEnabled}
 								onClose={onClose}
@@ -3318,6 +3369,7 @@ export function NarratorPanel({
 							},
 							mobile: {
 								actions: mobileToolbarActions,
+								bottomActions: bottomToolbarActions,
 								measurementKey: mobileToolbarMeasurementKey,
 							},
 							// Inputs for the control sub-objects assembled by useStatusBarProps.

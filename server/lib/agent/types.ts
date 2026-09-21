@@ -403,7 +403,16 @@ export type AgentEvent =
 			/** Source citations for `text`, when the provider reported any. */
 			citations?: import("@shared/citations").TextCitation[];
 	  }
-	| { type: "stream_text"; text: string; outputIndex?: number }
+	| {
+			type: "stream_text";
+			text: string;
+			outputIndex?: number;
+			/** Attempt-scoped identity and revision shared with persisted content. */
+			blockId?: string;
+			blockRevision?: number;
+			/** Raw text characters preceding this delta (metadata may also advance revision). */
+			blockTextOffset?: number;
+	  }
 	| {
 			type: "tool_call";
 			toolUseId: string;
@@ -661,6 +670,10 @@ export type AgentEvent =
 			text: string;
 			providerMetadata?: ReasoningProviderMetadata;
 			outputIndex?: number;
+			blockId?: string;
+			blockRevision?: number;
+			/** Raw text characters preceding this delta (metadata may also advance revision). */
+			blockTextOffset?: number;
 	  }
 	| {
 			type: "context_usage";
@@ -762,6 +775,11 @@ export type ContentBlock =
 			type: "text";
 			text: string;
 			outputIndex?: number;
+			/** Display/persistence identity, never an upstream replay credential. */
+			id?: string;
+			revision?: number;
+			/** Raw stream length before citation-marker cleanup. */
+			rawTextLength?: number;
 			/**
 			 * Source citations for this text, indexed against `text`.
 			 * Present only when the provider reported sources (native search).
@@ -774,6 +792,10 @@ export type ContentBlock =
 			translatedText?: string;
 			providerMetadata?: ReasoningProviderMetadata;
 			outputIndex?: number;
+			id?: string;
+			revision?: number;
+			/** Raw stream length before citation-marker cleanup. */
+			rawTextLength?: number;
 	  }
 	| { type: "redacted_thinking"; data: string; outputIndex?: number; signatureSource?: string }
 	| {

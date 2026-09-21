@@ -504,6 +504,8 @@ interface OAIDelta {
 
 interface OAIStreamChunk {
 	id?: string;
+	/** Native Responses output position when a gateway uses the legacy envelope. */
+	output_index?: number;
 	choices?: Array<{ index: number; delta: OAIDelta; finish_reason?: string | null }>;
 	usage?: {
 		prompt_tokens?: number;
@@ -1039,8 +1041,49 @@ export class OpenAIProvider implements ProviderAdapter {
 			outputIndex?: number;
 		}>,
 		textOutputIndex?: number,
+		_redactedThinkingBlocks?: Parameters<ProviderAdapter["pushAssistantTurn"]>[8],
+		orderedContent?: readonly import("./types").ContentBlock[],
 	): void {
 		const h = history as OAIMessage[];
+		if (orderedContent && this.responsesFormat) {
+			// Reuse history replay's source validation and native-item serialization,
+			// but never sort the accumulator's encounter order or split a reasoning item.
+			const orderedTools = orderedContent.filter((block) => block.type === "tool_use");
+			h.push(
+				...buildResponsesAssistantItemsFromStoredContent(
+					{
+						id: "",
+						role: "assistant",
+						contentText: null,
+						parentToolUseId: null,
+						messageUuid: messageId ?? null,
+						contentJson: orderedContent.map((block) =>
+							block.type === "tool_use" ? { ...block, id: block.toolUseId } : block,
+						),
+						toolCalls: orderedTools.map((tool) => ({
+							toolUseId: tool.toolUseId,
+							toolName: tool.name,
+							inputJson: tool.input,
+							outputJson: null,
+							status: "success",
+						})),
+					},
+					{ strict: this.isCredentialStrict(), currentSource: this.getActiveReasoningSource() },
+					true,
+				),
+			);
+			return;
+		}
+		if (orderedContent) {
+			// Chat Completions has no interleaved-content wire representation. Keep
+			// every text/reasoning fragment in encounter order inside its native lane.
+			text = orderedContent
+				.filter((block) => block.type === "text")
+				.map((block) => block.text)
+				.join("");
+			reasoningBlocks = orderedContent.filter((block) => block.type === "reasoning");
+			toolUses = orderedContent.filter((block) => block.type === "tool_use");
+		}
 		if (this.responsesFormat) {
 			const items = buildResponsesAssistantTurnItems(
 				text,
@@ -1412,6 +1455,8 @@ export class OpenAIProvider implements ProviderAdapter {
 		return resolveClientFingerprint({
 			mode: this.config.userAgentMode,
 			custom: this.config.customUserAgent,
+			// Codex 中转 defaults to the Codex CLI identity; other OpenAI-shaped
+			// protocols present as NarraFork unless the operator chose otherwise.
 			fallback: this.apiMode === "codex" ? getHttpCodexUserAgent() : getHttpUserAgent(),
 			extraHeaders: this.config.extraHeaders,
 			installationId: this.apiMode === "codex" ? getInstallationId() : undefined,
@@ -1912,7 +1957,14 @@ async function* _parseResponsesAPIStream(
 		for (const [, acc] of toolAccum) {
 			if (!acc.emitted) {
 				acc.emitted = true;
-				yield { toolUseChunk: { toolUseId: acc.callId, name: acc.name, stop: true } };
+				yield {
+					toolUseChunk: {
+						toolUseId: acc.callId,
+						name: acc.name,
+						stop: true,
+						outputIndex: acc.outputIndex,
+					},
+				};
 			}
 		}
 	} finally {
@@ -1924,6 +1976,8 @@ export interface ResponsesAPIChunk {
 	type?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
 	item?: any;
+	// biome-ignore lint/suspicious/noExplicitAny: provider-native content part
+	part?: any;
 	/** Present on delta/done events to identify the item */
 	item_id?: string;
 	delta?: string;
@@ -1931,6 +1985,8 @@ export interface ResponsesAPIChunk {
 	text?: string;
 	output_index?: number;
 	content_index?: number;
+	/** Internal alias resolved from item_id/output_index for this stream. */
+	_contentItemKey?: string | number;
 	/** Present on reasoning_summary_text.delta / reasoning_summary_part.added */
 	summary_index?: number;
 	/** Present on response.image_generation_call.partial_image events. */
@@ -2001,6 +2057,7 @@ function collectAssistantItemCitations(
 
 /** Accumulator for a single Responses API tool call, keyed by output_index. */
 export interface ResponsesToolAccum {
+	outputIndex?: number;
 	callId: string;
 	name: string;
 	args: string;
@@ -2023,6 +2080,31 @@ export interface ResponsesReasoningAccum {
 	 * whole reasoning every frame while streaming).
 	 */
 	lastSummaryIndex?: number;
+	/** Track each summary separately: a later done-only part must not be dropped. */
+	emittedParts?: Set<string>;
+	completed?: boolean;
+}
+
+interface ResponsesTextLane {
+	outputIndex?: number;
+	length: number;
+	completed?: boolean;
+}
+
+// Keyed by the caller-owned, per-response accumulator (also used by Codex WS).
+// Weak ownership keeps legacy parser callers compatible without leaking streams.
+const responsesContentState = new WeakMap<
+	Map<number, ResponsesToolAccum>,
+	{
+		textLanes: Map<string, ResponsesTextLane>;
+		items: Map<string, { key: string | number; outputIndex?: number }>;
+	}
+>();
+
+function responsesBlockId(chunk: ResponsesAPIChunk, kind: "text" | "reasoning"): string {
+	const item =
+		chunk._contentItemKey ?? chunk.output_index ?? chunk.item_id ?? chunk.item?.id ?? "unknown";
+	return `responses:${item}:${kind}${kind === "text" ? `:${chunk.content_index ?? 0}` : ""}`;
 }
 
 function resolveReasoningAccum(
@@ -2030,7 +2112,7 @@ function resolveReasoningAccum(
 	reasoningAccum: Map<number, ResponsesReasoningAccum>,
 ): ResponsesReasoningAccum | undefined {
 	const idx = chunk.output_index;
-	if (idx != null) return reasoningAccum.get(idx);
+	if (idx != null && reasoningAccum.has(idx)) return reasoningAccum.get(idx);
 	if (chunk.item_id) return findReasoningAccumByItemId(reasoningAccum, chunk.item_id);
 	return findActiveReasoningAccum(reasoningAccum);
 }
@@ -2042,8 +2124,15 @@ function pushReasoningTextEvent(
 	text: string,
 	options: { appendToAccumulator?: boolean; emitOnlyIfAccumulatorEmpty?: boolean } = {},
 ): void {
-	const acc = resolveReasoningAccum(chunk, reasoningAccum);
-	if (acc && options.emitOnlyIfAccumulatorEmpty && (acc.emittedText?.length ?? 0) > 0) return;
+	let acc = resolveReasoningAccum(chunk, reasoningAccum);
+	if (!acc) {
+		acc = { itemId: chunk.item_id ?? "", emittedText: "" };
+		reasoningAccum.set(chunk.output_index ?? -(reasoningAccum.size + 1), acc);
+	}
+	const partKey = `${chunk.summary_index == null ? "content" : "summary"}:${chunk.summary_index ?? chunk.content_index ?? 0}`;
+	if (options.emitOnlyIfAccumulatorEmpty && acc.emittedParts?.has(partKey)) return;
+	acc.emittedParts ??= new Set();
+	acc.emittedParts.add(partKey);
 
 	// Summary-part boundary: a single reasoning item streams several summary
 	// parts (each carries a `summary_index`). When the index advances we prepend
@@ -2062,12 +2151,13 @@ function pushReasoningTextEvent(
 		acc.lastSummaryIndex = chunk.summary_index;
 	}
 
-	if (acc && options.appendToAccumulator) {
+	if (options.appendToAccumulator || options.emitOnlyIfAccumulatorEmpty) {
 		acc.emittedText = `${acc.emittedText ?? ""}${emitText}`;
 	}
 	if (acc) {
 		results.push({
 			reasoning: emitText,
+			reasoningBlockId: responsesBlockId(chunk, "reasoning"),
 			reasoningMetadata: {
 				openai: {
 					itemId: acc.itemId,
@@ -2209,9 +2299,67 @@ export function parseResponsesAPIEvent(
 		return results;
 	}
 
+	let contentState = responsesContentState.get(toolAccum);
+	if (!contentState) {
+		contentState = { textLanes: new Map(), items: new Map() };
+		responsesContentState.set(toolAccum, contentState);
+	}
+	const { textLanes, items } = contentState;
+	const itemId = chunk.item_id ?? chunk.item?.id;
+	const indexAlias = chunk.output_index == null ? undefined : `index:${chunk.output_index}`;
+	const idAlias = typeof itemId === "string" ? `id:${itemId}` : undefined;
+	const identity = (idAlias ? items.get(idAlias) : undefined) ??
+		(indexAlias ? items.get(indexAlias) : undefined) ?? {
+			key: chunk.output_index ?? itemId ?? "unknown",
+			outputIndex: chunk.output_index,
+		};
+	if (chunk.output_index != null) identity.outputIndex = chunk.output_index;
+	if (indexAlias) items.set(indexAlias, identity);
+	if (idAlias) items.set(idAlias, identity);
+	chunk = {
+		...chunk,
+		_contentItemKey: identity.key,
+		output_index: chunk.output_index ?? identity.outputIndex,
+	};
+	const emitText = (partChunk: ResponsesAPIChunk, text: string, delta: boolean) => {
+		const blockId = responsesBlockId(partChunk, "text");
+		const lane = textLanes.get(blockId) ?? { outputIndex: partChunk.output_index, length: 0 };
+		textLanes.set(blockId, lane);
+		const suffix = delta ? text : text.slice(lane.length);
+		if (suffix && !lane.completed) {
+			lane.length += suffix.length;
+			results.push({ text: suffix, textOutputIndex: partChunk.output_index, textBlockId: blockId });
+		}
+	};
+	const textBoundary = (partChunk: ResponsesAPIChunk, phase: "checkpoint" | "complete") => {
+		const blockId = responsesBlockId(partChunk, "text");
+		const lane = textLanes.get(blockId) ?? { outputIndex: partChunk.output_index, length: 0 };
+		if (lane.completed) return;
+		textLanes.set(blockId, lane);
+		if (phase === "complete") lane.completed = true;
+		results.push({
+			contentBoundary: { kind: "text", phase, blockId, outputIndex: partChunk.output_index },
+		});
+	};
+
 	// ── Text streaming ──
 	if (type === "response.output_text.delta" && typeof chunk.delta === "string") {
-		results.push({ text: chunk.delta, textOutputIndex: chunk.output_index });
+		emitText(chunk, chunk.delta, true);
+		return results;
+	}
+	if (type === "response.output_text.done" || type === "response.content_part.done") {
+		if (type === "response.content_part.done" && chunk.part?.type !== "output_text") return results;
+		const text = chunk.text ?? chunk.part?.text;
+		if (typeof text === "string") emitText(chunk, text, false);
+		const citations = collectAssistantItemCitations({ content: [chunk.part] }, chunk.output_index);
+		if (citations.length)
+			results.push({
+				textCitations: citations,
+				textBlockId: responsesBlockId(chunk, "text"),
+				textOutputIndex: chunk.output_index,
+			});
+		// output_item.done carries the final annotations: keep the native item open until then.
+		textBoundary(chunk, "checkpoint");
 		return results;
 	}
 
@@ -2221,7 +2369,12 @@ export function parseResponsesAPIEvent(
 	// markers out of the visible text.
 	if (type === "response.output_text.annotation.added") {
 		const citation = parseResponsesAnnotation(chunk.annotation, chunk.output_index);
-		if (citation) results.push({ textCitations: [citation] });
+		if (citation)
+			results.push({
+				textCitations: [citation],
+				textBlockId: responsesBlockId(chunk, "text"),
+				textOutputIndex: chunk.output_index,
+			});
 		return results;
 	}
 
@@ -2231,17 +2384,45 @@ export function parseResponsesAPIEvent(
 	// message item id instead of synthesizing a local UUID.
 	if (
 		(type === "response.output_item.added" || type === "response.output_item.done") &&
-		chunk.item?.type === "message" &&
-		chunk.item.role === "assistant" &&
-		chunk.item.id
+		((chunk.item?.type === "message" && chunk.item.role === "assistant") ||
+			chunk.item?.type === "output_text" ||
+			chunk.item?.type === "text")
 	) {
-		results.push({ messageId: chunk.item.id });
-		// The finalized item also carries the authoritative annotation list. Emit
-		// it as a fallback for gateways that never send the incremental events —
-		// the loop dedupes, so emitting both is safe.
+		if (chunk.item.type === "message" && chunk.item.id) results.push({ messageId: chunk.item.id });
 		if (type === "response.output_item.done") {
-			const citations = collectAssistantItemCitations(chunk.item, chunk.output_index);
-			if (citations.length > 0) results.push({ textCitations: citations });
+			const parts = chunk.item.type === "message" ? (chunk.item.content ?? []) : [chunk.item];
+			for (const [contentIndex, part] of parts.entries()) {
+				if (part?.type !== "output_text" && part?.type !== "text") continue;
+				const partChunk = { ...chunk, content_index: contentIndex };
+				if (textLanes.get(responsesBlockId(partChunk, "text"))?.completed) continue;
+				if (typeof part.text === "string") emitText(partChunk, part.text, false);
+				const citations = collectAssistantItemCitations({ content: [part] }, chunk.output_index);
+				if (citations.length)
+					results.push({
+						textCitations: citations,
+						textBlockId: responsesBlockId(partChunk, "text"),
+						textOutputIndex: chunk.output_index,
+					});
+				textBoundary(partChunk, "complete");
+			}
+			// Some relays omit content on item.done; finalize already-observed lanes too.
+			for (const [blockId, lane] of textLanes) {
+				if (
+					!lane.completed &&
+					chunk.output_index != null &&
+					lane.outputIndex === chunk.output_index
+				) {
+					lane.completed = true;
+					results.push({
+						contentBoundary: {
+							kind: "text",
+							phase: "complete",
+							blockId,
+							outputIndex: lane.outputIndex,
+						},
+					});
+				}
+			}
 		}
 		return results;
 	}
@@ -2375,19 +2556,20 @@ export function parseResponsesAPIEvent(
 	// ── Reasoning: output_item.added (type=reasoning) ──
 	// Track the reasoning item's id and encrypted_content for continuation.
 	if (type === "response.output_item.added" && chunk.item?.type === "reasoning") {
-		const idx = chunk.output_index;
-		if (idx != null) {
-			reasoningAccum.set(idx, {
-				itemId: chunk.item.id ?? "",
-				encryptedContent: chunk.item.encrypted_content ?? null,
-				emittedText: "",
-			});
-			logger.debug("Responses API reasoning item started", {
-				outputIndex: idx,
-				itemId: chunk.item.id,
-				hasEncryptedContent: !!chunk.item.encrypted_content,
-			});
-		}
+		const idx = chunk.output_index ?? -(reasoningAccum.size + 1);
+		reasoningAccum.set(idx, {
+			itemId: chunk.item.id ?? "",
+			encryptedContent: chunk.item.encrypted_content ?? null,
+			emittedText: "",
+		});
+		results.push({
+			contentBoundary: {
+				kind: "reasoning",
+				phase: "start",
+				blockId: responsesBlockId(chunk, "reasoning"),
+				outputIndex: chunk.output_index,
+			},
+		});
 		return results;
 	}
 
@@ -2395,25 +2577,43 @@ export function parseResponsesAPIEvent(
 	// Update encrypted_content with the final value from the done event and
 	// emit a metadata-only event so the loop can persist the final value.
 	if (type === "response.output_item.done" && chunk.item?.type === "reasoning") {
-		const idx = chunk.output_index;
-		if (idx != null) {
-			const acc = reasoningAccum.get(idx);
-			if (acc) {
-				const finalEncrypted = chunk.item.encrypted_content ?? acc.encryptedContent;
-				acc.encryptedContent = finalEncrypted;
-				// Emit a metadata-only event (no reasoning text) so the loop captures
-				// the final encrypted_content for persistence / continuation.
-				results.push({
-					reasoningMetadata: {
-						openai: {
-							itemId: acc.itemId,
-							reasoningEncryptedContent: finalEncrypted,
-						},
-					},
-					reasoningOutputIndex: idx,
-				});
+		const itemChunk = { ...chunk, item_id: chunk.item.id ?? chunk.item_id };
+		let acc = resolveReasoningAccum(itemChunk, reasoningAccum);
+		if (acc?.completed) return results;
+		if (!acc) {
+			acc = { itemId: chunk.item.id ?? "", emittedText: "" };
+			reasoningAccum.set(chunk.output_index ?? -(reasoningAccum.size + 1), acc);
+		}
+		// A done-only item is legal on relays. Recover each summary independently.
+		for (const [summaryIndex, part] of (chunk.item.summary ?? []).entries()) {
+			if (typeof part?.text === "string" && part.text) {
+				pushReasoningTextEvent(
+					results,
+					{ ...itemChunk, summary_index: summaryIndex },
+					reasoningAccum,
+					part.text,
+					{ emitOnlyIfAccumulatorEmpty: true },
+				);
 			}
 		}
+		const finalEncrypted = chunk.item.encrypted_content ?? acc.encryptedContent;
+		acc.encryptedContent = finalEncrypted;
+		acc.completed = true;
+		results.push({
+			reasoningMetadata: {
+				openai: { itemId: chunk.item.id ?? acc?.itemId, reasoningEncryptedContent: finalEncrypted },
+			},
+			reasoningBlockId: responsesBlockId(itemChunk, "reasoning"),
+			reasoningOutputIndex: chunk.output_index,
+		});
+		results.push({
+			contentBoundary: {
+				kind: "reasoning",
+				phase: "complete",
+				blockId: responsesBlockId(itemChunk, "reasoning"),
+				outputIndex: chunk.output_index,
+			},
+		});
 		return results;
 	}
 
@@ -2434,12 +2634,25 @@ export function parseResponsesAPIEvent(
 	}
 
 	if (
-		(type === "response.reasoning_summary_text.done" || type === "response.reasoning_text.done") &&
-		typeof chunk.text === "string" &&
-		chunk.text.length > 0
+		type === "response.reasoning_summary_text.done" ||
+		type === "response.reasoning_text.done" ||
+		type === "response.reasoning_summary_part.done"
 	) {
-		pushReasoningTextEvent(results, chunk, reasoningAccum, chunk.text, {
-			emitOnlyIfAccumulatorEmpty: true,
+		const text = chunk.text ?? chunk.part?.text;
+		if (typeof text === "string" && text) {
+			pushReasoningTextEvent(results, chunk, reasoningAccum, text, {
+				emitOnlyIfAccumulatorEmpty: true,
+			});
+		}
+		// A summary is not an independently replayable reasoning item. Final
+		// encrypted_content arrives only on output_item.done.
+		results.push({
+			contentBoundary: {
+				kind: "reasoning",
+				phase: "checkpoint",
+				blockId: responsesBlockId(chunk, "reasoning"),
+				outputIndex: chunk.output_index,
+			},
 		});
 		return results;
 	}
@@ -2468,10 +2681,10 @@ export function parseResponsesAPIEvent(
 					toolName: name,
 				});
 			}
-			toolAccum.set(idx, { callId, name, args: "", emitted: false });
+			toolAccum.set(idx, { callId, name, args: "", emitted: false, outputIndex: idx });
 			logger.debug("Responses API tool call started", { outputIndex: idx, callId, toolName: name });
 			results.push({
-				toolUseChunk: { toolUseId: callId, name, input: undefined, stop: false },
+				toolUseChunk: { toolUseId: callId, name, input: undefined, stop: false, outputIndex: idx },
 				_responsesApi: true,
 			});
 			return results;
@@ -2492,12 +2705,18 @@ export function parseResponsesAPIEvent(
 					name: acc.name,
 					input: chunk.delta,
 					stop: false,
+					outputIndex: idx,
 				},
 			});
 			// Early completion if args form valid JSON
 			if (isParsableJson(acc.args)) {
 				results.push({
-					toolUseChunk: { toolUseId: acc.callId, name: acc.name, stop: true },
+					toolUseChunk: {
+						toolUseId: acc.callId,
+						name: acc.name,
+						stop: true,
+						outputIndex: acc.outputIndex,
+					},
 				});
 				acc.emitted = true;
 			}
@@ -2515,7 +2734,14 @@ export function parseResponsesAPIEvent(
 				acc.args = chunk.item.arguments;
 			}
 			acc.emitted = true;
-			results.push({ toolUseChunk: { toolUseId: acc.callId, name: acc.name, stop: true } });
+			results.push({
+				toolUseChunk: {
+					toolUseId: acc.callId,
+					name: acc.name,
+					stop: true,
+					outputIndex: acc.outputIndex,
+				},
+			});
 			return results;
 		}
 	}
@@ -2530,16 +2756,58 @@ export function parseResponsesAPIEvent(
 				acc.args = chunk.item.arguments;
 			}
 			acc.emitted = true;
-			results.push({ toolUseChunk: { toolUseId: acc.callId, name: acc.name, stop: true } });
+			results.push({
+				toolUseChunk: {
+					toolUseId: acc.callId,
+					name: acc.name,
+					stop: true,
+					outputIndex: acc.outputIndex,
+				},
+			});
 			return results;
 		}
 	}
 
 	// ── Response completed ──
 	if (type === "response.completed") {
+		// Some relays only attach final annotations/credentials to response.output.
+		// Recover those before completing any still-open lanes. Item completion is
+		// idempotent, so a normal stream's already-finalized content is not replayed.
+		if (Array.isArray(chunk.response?.output)) {
+			for (const [outputIndex, item] of chunk.response.output.entries()) {
+				results.push(
+					...parseResponsesAPIEvent(
+						{ type: "response.output_item.done", output_index: outputIndex, item },
+						toolAccum,
+						reasoningAccum,
+					),
+				);
+			}
+		}
+		// Legacy relays may omit output_item.done but still send text.done.
+		for (const [blockId, lane] of textLanes) {
+			if (!lane.completed) {
+				lane.completed = true;
+				results.push({
+					contentBoundary: {
+						kind: "text",
+						phase: "complete",
+						blockId,
+						outputIndex: lane.outputIndex,
+					},
+				});
+			}
+		}
 		for (const [, acc] of toolAccum) {
 			if (!acc.emitted) {
-				results.push({ toolUseChunk: { toolUseId: acc.callId, name: acc.name, stop: true } });
+				results.push({
+					toolUseChunk: {
+						toolUseId: acc.callId,
+						name: acc.name,
+						stop: true,
+						outputIndex: acc.outputIndex,
+					},
+				});
 				acc.emitted = true;
 			}
 		}
@@ -2558,6 +2826,7 @@ export function parseResponsesAPIEvent(
  * yielded for this tool call (via the isParsableJson early-emit path).
  */
 interface ToolAccumEntry {
+	outputIndex?: number;
 	id: string;
 	name: string;
 	args: string;
@@ -2645,6 +2914,7 @@ function flushToolAccum(toolAccum: Map<number, ToolAccumEntry>): ParsedStreamEve
 			toolUseId: acc.id,
 			name: acc.name,
 			input,
+			outputIndex: acc.outputIndex,
 		});
 	}
 	toolAccum.clear();
@@ -2748,11 +3018,23 @@ function parseSSELine(
 		// Use a fixed index slot (keyed by call_id hash) since Responses API doesn't use index
 		const idx = responsesApiSlot(id, toolAccum);
 		if (!toolAccum.has(idx)) {
-			toolAccum.set(idx, { id, name, args: chunk.item.arguments ?? "", emitted: false });
+			toolAccum.set(idx, {
+				id,
+				name,
+				args: chunk.item.arguments ?? "",
+				emitted: false,
+				outputIndex: chunk.output_index,
+			});
 			logger.debug("OpenAI Responses API tool call started", { callId: id, toolName: name });
 			return [
 				{
-					toolUseChunk: { toolUseId: id, name, input: undefined, stop: false },
+					toolUseChunk: {
+						toolUseId: id,
+						name,
+						input: undefined,
+						stop: false,
+						outputIndex: chunk.output_index,
+					},
 					_responsesApi: true,
 				},
 			];
@@ -2774,12 +3056,18 @@ function parseSSELine(
 						name: acc.name,
 						input: chunk.delta,
 						stop: false,
+						outputIndex: acc.outputIndex,
 					},
 				},
 			];
 			if (isParsableJson(acc.args)) {
 				results.push({
-					toolUseChunk: { toolUseId: acc.id, name: acc.name, stop: true },
+					toolUseChunk: {
+						toolUseId: acc.id,
+						name: acc.name,
+						stop: true,
+						outputIndex: acc.outputIndex,
+					},
 				});
 				acc.emitted = true;
 			}
@@ -2793,7 +3081,16 @@ function parseSSELine(
 		const acc = findAccByCallId(toolAccum, chunk.item.call_id);
 		if (acc && !acc.emitted) {
 			acc.emitted = true;
-			return [{ toolUseChunk: { toolUseId: acc.id, name: acc.name, stop: true } }];
+			return [
+				{
+					toolUseChunk: {
+						toolUseId: acc.id,
+						name: acc.name,
+						stop: true,
+						outputIndex: acc.outputIndex,
+					},
+				},
+			];
 		}
 		return [];
 	}
@@ -2804,7 +3101,14 @@ function parseSSELine(
 		const results: ParsedStreamEvent[] = [];
 		for (const [, acc] of toolAccum) {
 			if (!acc.emitted) {
-				results.push({ toolUseChunk: { toolUseId: acc.id, name: acc.name, stop: true } });
+				results.push({
+					toolUseChunk: {
+						toolUseId: acc.id,
+						name: acc.name,
+						stop: true,
+						outputIndex: acc.outputIndex,
+					},
+				});
 				acc.emitted = true;
 			}
 		}
@@ -2820,17 +3124,12 @@ function parseSSELine(
 	const results: ParsedStreamEvent[] = [];
 	const result: ParsedStreamEvent = {};
 
-	// Text content
-	if (delta.content) {
-		result.text = delta.content;
-	}
-
-	// Reasoning content (extended thinking / reasoning_content)
+	// A chunk may contain all three lanes. Publish content before any tool can
+	// start executing, and keep reasoning before visible text within the chunk.
 	// biome-ignore lint/suspicious/noExplicitAny: gateway-specific field
 	const reasoning = (delta as any).reasoning_content;
-	if (typeof reasoning === "string" && reasoning) {
-		result.reasoning = reasoning;
-	}
+	if (typeof reasoning === "string" && reasoning) results.push({ reasoning });
+	if (delta.content) results.push({ text: delta.content });
 
 	// Tool call deltas — emit as toolUseChunk for early execution support
 	if (delta.tool_calls) {
@@ -2845,7 +3144,13 @@ function parseSSELine(
 				logger.debug("OpenAI tool call started", { toolCallId: id, toolName: name, index: idx });
 				// Emit initial chunk so the loop knows the tool name early
 				results.push({
-					toolUseChunk: { toolUseId: id, name, input: undefined, stop: false },
+					toolUseChunk: {
+						toolUseId: id,
+						name,
+						input: undefined,
+						stop: false,
+						outputIndex: chunk.output_index,
+					},
 				});
 			}
 
@@ -2868,7 +3173,12 @@ function parseSSELine(
 					// the rest of the stream (other tool calls / text) is still arriving.
 					if (isParsableJson(acc.args)) {
 						results.push({
-							toolUseChunk: { toolUseId: acc.id, name: acc.name, stop: true },
+							toolUseChunk: {
+								toolUseId: acc.id,
+								name: acc.name,
+								stop: true,
+								outputIndex: acc.outputIndex,
+							},
 						});
 						acc.emitted = true;
 					}
@@ -2887,7 +3197,12 @@ function parseSSELine(
 		for (const [, acc] of toolAccum) {
 			if (!acc.emitted) {
 				results.push({
-					toolUseChunk: { toolUseId: acc.id, name: acc.name, stop: true },
+					toolUseChunk: {
+						toolUseId: acc.id,
+						name: acc.name,
+						stop: true,
+						outputIndex: acc.outputIndex,
+					},
 				});
 				acc.emitted = true;
 			}
@@ -3315,6 +3630,7 @@ interface ReasoningReplayOptions {
 function buildResponsesAssistantItemsFromStoredContent(
 	msg: DbMessage,
 	options: ReasoningReplayOptions,
+	preserveTextBlocks = false,
 ): OAIMessage[] {
 	type StoredAssistantBlock =
 		| { type: "text"; text?: string; outputIndex?: number }
@@ -3369,6 +3685,7 @@ function buildResponsesAssistantItemsFromStoredContent(
 		if (block.type === "text") {
 			if (typeof block.text === "string" && block.text.length > 0) {
 				textBuffer.push(block.text);
+				if (preserveTextBlocks) flushTextBuffer();
 			}
 			continue;
 		}

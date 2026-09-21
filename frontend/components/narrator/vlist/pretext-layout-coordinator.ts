@@ -40,6 +40,7 @@ import {
 	type PretextDocumentLoadOptions,
 	refreshPretextDocumentWindow,
 } from "./pretext-document-loader";
+import { projectStreamingDocument } from "./streaming-handoff";
 import { askInPassingBlock, syncAskInPassingMessage } from "./vlist-ask-in-passing-sync";
 import { trimClockNow, trimLoadedHead } from "./vlist-head-trim";
 import { appendLoadedMessage, upsertLoadedMessage } from "./vlist-message-append";
@@ -1045,8 +1046,7 @@ export class PretextLayoutCoordinator {
 	 * pagination and version checks only ever see persisted content.
 	 */
 	private layoutMessages(input: PretextDocumentInput): readonly TreeMessage[] {
-		if (!this.streamingMessage) return input.messages;
-		return [...input.messages, this.streamingMessage];
+		return projectStreamingDocument(input.messages, this.streamingMessage);
 	}
 
 	/**

@@ -536,6 +536,17 @@ export const providerStreamEventSchema = z.discriminatedUnion("type", [
 		.object({
 			type: z.literal("text.delta"),
 			text: z.string().min(1).max(MAX_JSON_STRING_LENGTH),
+			blockId: nonEmptyIdSchema.optional(),
+			outputIndex: outputIndexSchema,
+		})
+		.strict(),
+	// Optional lifecycle events; legacy plugins may keep sending deltas only.
+	z
+		.object({
+			type: z.literal("content.boundary"),
+			kind: z.enum(["text", "reasoning"]),
+			phase: z.enum(["start", "checkpoint", "complete"]),
+			blockId: nonEmptyIdSchema.optional(),
 			outputIndex: outputIndexSchema,
 		})
 		.strict(),
@@ -545,6 +556,7 @@ export const providerStreamEventSchema = z.discriminatedUnion("type", [
 	z
 		.object({
 			type: z.literal("text.citation"),
+			blockId: nonEmptyIdSchema.optional(),
 			citations: z
 				.array(
 					z

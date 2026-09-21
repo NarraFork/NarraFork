@@ -158,155 +158,161 @@ export async function executeAgentLoop(
 	let completedNaturally = false;
 	const taskReflectionDenialFingerprints = new Set<string>();
 
-	for await (const event of eventSource) {
-		const drainingAfterAbort = config.signal.aborted;
-		// When aborted, still drain the following events so:
-		// - tool_result: status is persisted to the DB (running → success/fail)
-		// - block_complete: the agent loop flushes accumulated text/reasoning as
-		//   block_complete on abort (see loop.ts flushPartialContent). Text blocks
-		//   are NOT persisted incrementally during streaming — they only live in
-		//   memory until flushed at turn end — so dropping this event would lose any
-		//   completed text/reasoning when the user interrupts mid-tool-call.
-		// - error("Aborted"): onErrorCleanup is called to clean up orphaned tool calls
-		// If we stop after the first post-abort event, pending-permission aborts and
-		// long-running tools can leave the narrator stuck in thinking/waiting.
-		if (
-			drainingAfterAbort &&
-			event.type !== "tool_result" &&
-			event.type !== "block_complete" &&
-			event.type !== "error"
-		) {
-			continue;
-		}
-
-		try {
-			const result = await processEventFn(event, eventContext, hooks);
-			if (result?.titleUpdate !== undefined) {
-				shouldUpdateTitle = result.titleUpdate;
-			}
-		} catch (err) {
-			logger.error("Event processing error", {
-				narratorId: config.narratorId,
-				eventType: event.type,
-				error: String(err),
-			});
-			if (err instanceof CriticalEventPersistenceError) throw err;
+	try {
+		for await (const event of eventSource) {
+			const drainingAfterAbort = config.signal.aborted;
+			// When aborted, still drain the following events so:
+			// - tool_result: status is persisted to the DB (running → success/fail)
+			// - block_complete: the agent loop flushes accumulated text/reasoning as
+			//   block_complete on abort (see loop.ts flushPartialContent). Text blocks
+			//   are NOT persisted incrementally during streaming — they only live in
+			//   memory until flushed at turn end — so dropping this event would lose any
+			//   completed text/reasoning when the user interrupts mid-tool-call.
+			// - error("Aborted"): onErrorCleanup is called to clean up orphaned tool calls
+			// If we stop after the first post-abort event, pending-permission aborts and
+			// long-running tools can leave the narrator stuck in thinking/waiting.
 			if (
-				(event.type === "block_complete" && event.block.type === "tool_use") ||
-				(event.type === "assistant_message" && event.toolUses.length > 0)
+				drainingAfterAbort &&
+				event.type !== "tool_result" &&
+				event.type !== "block_complete" &&
+				event.type !== "error"
 			) {
-				throw new CriticalEventPersistenceError("Tool execution persistence barrier failed", {
-					cause: err,
-				});
+				continue;
 			}
-			// For critical events, notify frontend about persistence issues
-			if (event.type === "block_complete" || event.type === "tool_result") {
-				broadcastToNarrator(config.narratorId, {
-					type: "warning",
-					narratorId: config.narratorId,
-					message: `Failed to persist ${event.type}: ${String(err)}`,
-				});
-			}
-		}
 
-		if (event.type === "assistant_message") {
-			sawAssistantMessage = true;
-			finalText = event.text || "";
-			lastAssistantHadToolUses = event.toolUses.length > 0;
-			hadToolUses = hadToolUses || event.toolUses.length > 0;
-		}
-		if (event.type === "tool_result") {
-			const taskReflection = event.metadata?.taskReflection;
-			if (taskReflection && typeof taskReflection === "object") {
-				const decision = (taskReflection as { decision?: unknown }).decision;
-				const fingerprint = (taskReflection as { fingerprint?: unknown }).fingerprint;
-				if (decision === "revise" && typeof fingerprint === "string" && fingerprint) {
-					taskReflectionDenialFingerprints.add(fingerprint);
+			try {
+				const result = await processEventFn(event, eventContext, hooks);
+				if (result?.titleUpdate !== undefined) {
+					shouldUpdateTitle = result.titleUpdate;
+				}
+			} catch (err) {
+				logger.error("Event processing error", {
+					narratorId: config.narratorId,
+					eventType: event.type,
+					error: String(err),
+				});
+				if (err instanceof CriticalEventPersistenceError) throw err;
+				if (event.type === "block_complete" || event.type === "assistant_message") {
+					// The generator cannot advance into a tool until preceding content is
+					// durable and published. Warning-and-continuing loses the only recoverable
+					// copy of reasoning/text and admits side effects past a failed checkpoint.
+					throw new CriticalEventPersistenceError("Assistant content persistence barrier failed", {
+						cause: err,
+					});
+				}
+				// For tool-result events, notify frontend about persistence issues.
+				if (event.type === "tool_result") {
+					broadcastToNarrator(config.narratorId, {
+						type: "warning",
+						narratorId: config.narratorId,
+						message: `Failed to persist ${event.type}: ${String(err)}`,
+					});
 				}
 			}
-		}
-		if (event.type === "done") {
-			// The loop emits `done` only when a turn produced no tool calls, i.e. the
-			// model has nothing left to do. Recorded rather than `break`-ing so the
-			// remaining events of this pass are still drained normally.
-			completedNaturally = true;
-		}
-		if (event.type === "context_length_exceeded") {
-			contextLengthExceeded = true;
-			break;
-		}
-		if (event.type === "retryable_error") {
-			retryableError = event.message;
-			retryableErrorCode = event.code;
-			retryableDiagnostics = event.diagnostics;
-			bypassRetryLimit = event.bypassRetryLimit === true;
-			break;
-		}
-		if (event.type === "payment_required") {
-			paymentRequired = {
-				message: event.message,
-				providerId: event.providerId,
-				providerPrefix: event.providerPrefix,
-				balance: event.balance,
-				required: event.required,
-				resumeAction: event.resumeAction,
-			};
-			break;
-		}
-		if (event.type === "model_unavailable") {
-			modelUnavailable = {
-				message: event.message,
-				provider: event.provider,
-				model: event.model,
-				providerId: event.providerId,
-				providerPrefix: event.providerPrefix,
-				nugModelId: event.nugModelId,
-				waitKind: event.waitKind,
-				resumeAt: event.resumeAt,
-				quotaResetAt: event.quotaResetAt,
-				diagnostics: event.diagnostics,
-			};
-			break;
-		}
-		if (event.type === "output_truncated") {
-			interrupted = true;
-			interruptedReason = "completion_limit";
-		}
-		if (event.type === "resumable_error") {
-			// The loop already flushed the partial output via block_complete and
-			// finalized the api_request record — this pass ends normally (like
-			// output_truncated) so the caller can append a continuation turn.
-			interrupted = true;
-			interruptedReason = "resumable_error";
-			break;
-		}
-		if (event.type === "max_turns_exceeded") {
-			maxTurnsExceeded = true;
-			finalText = `Error: Max turns (${event.maxTurns}) exceeded`;
-			hasError = true;
-			break;
-		}
-		if (event.type === "silent_disconnect") {
-			silentDisconnect = true;
-			break;
-		}
-		if (event.type === "error") {
-			if (event.message === "Aborted") {
-				aborted = true;
-			} else {
+
+			if (event.type === "assistant_message") {
+				sawAssistantMessage = true;
+				finalText = event.text || "";
+				lastAssistantHadToolUses = event.toolUses.length > 0;
+				hadToolUses = hadToolUses || event.toolUses.length > 0;
+			}
+			if (event.type === "tool_result") {
+				const taskReflection = event.metadata?.taskReflection;
+				if (taskReflection && typeof taskReflection === "object") {
+					const decision = (taskReflection as { decision?: unknown }).decision;
+					const fingerprint = (taskReflection as { fingerprint?: unknown }).fingerprint;
+					if (decision === "revise" && typeof fingerprint === "string" && fingerprint) {
+						taskReflectionDenialFingerprints.add(fingerprint);
+					}
+				}
+			}
+			if (event.type === "done") {
+				// The loop emits `done` only when a turn produced no tool calls, i.e. the
+				// model has nothing left to do. Recorded rather than `break`-ing so the
+				// remaining events of this pass are still drained normally.
+				completedNaturally = true;
+			}
+			if (event.type === "context_length_exceeded") {
+				contextLengthExceeded = true;
+				break;
+			}
+			if (event.type === "retryable_error") {
+				retryableError = event.message;
+				retryableErrorCode = event.code;
+				retryableDiagnostics = event.diagnostics;
+				bypassRetryLimit = event.bypassRetryLimit === true;
+				break;
+			}
+			if (event.type === "payment_required") {
+				paymentRequired = {
+					message: event.message,
+					providerId: event.providerId,
+					providerPrefix: event.providerPrefix,
+					balance: event.balance,
+					required: event.required,
+					resumeAction: event.resumeAction,
+				};
+				break;
+			}
+			if (event.type === "model_unavailable") {
+				modelUnavailable = {
+					message: event.message,
+					provider: event.provider,
+					model: event.model,
+					providerId: event.providerId,
+					providerPrefix: event.providerPrefix,
+					nugModelId: event.nugModelId,
+					waitKind: event.waitKind,
+					resumeAt: event.resumeAt,
+					quotaResetAt: event.quotaResetAt,
+					diagnostics: event.diagnostics,
+				};
+				break;
+			}
+			if (event.type === "output_truncated") {
+				interrupted = true;
+				interruptedReason = "completion_limit";
+			}
+			if (event.type === "resumable_error") {
+				// The loop already flushed the partial output via block_complete and
+				// finalized the api_request record — this pass ends normally (like
+				// output_truncated) so the caller can append a continuation turn.
+				interrupted = true;
+				interruptedReason = "resumable_error";
+				break;
+			}
+			if (event.type === "max_turns_exceeded") {
+				maxTurnsExceeded = true;
+				finalText = `Error: Max turns (${event.maxTurns}) exceeded`;
+				hasError = true;
+				break;
+			}
+			if (event.type === "silent_disconnect") {
+				silentDisconnect = true;
+				break;
+			}
+			if (event.type === "error") {
+				if (event.message === "Aborted") {
+					aborted = true;
+				} else {
+					finalText = `Error: ${event.message}`;
+					hasError = true;
+					errorDiagnostics = event.diagnostics;
+				}
+				break;
+			}
+			if (event.type === "invalid_state") {
 				finalText = `Error: ${event.message}`;
 				hasError = true;
+				errorCode = event.reason;
 				errorDiagnostics = event.diagnostics;
+				break;
 			}
-			break;
 		}
-		if (event.type === "invalid_state") {
-			finalText = `Error: ${event.message}`;
-			hasError = true;
-			errorCode = event.reason;
-			errorDiagnostics = event.diagnostics;
-			break;
-		}
+	} finally {
+		// Raw prefixes are only useful within this pass. Keep the reconnect snapshot
+		// itself on persistence failure, but do not retain already committed bodies.
+		eventContext.committedContentSnapshots?.clear();
 	}
 
 	// If the stream ended while the abort signal was set, surface that to the caller

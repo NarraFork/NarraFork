@@ -107,6 +107,12 @@ describe("isLiveStreamingRun", () => {
 		expect(isLiveStreamingRun(true, msg, [0, 1])).toBe(false);
 	});
 
+	it("a checkpoint row can explicitly project one newer live block", () => {
+		const msg = { contentJson: [REASONING, TEXT], liveBlockIndex: 0, liveContentProjection: true };
+		expect(isLiveStreamingRun(false, msg, [0])).toBe(true);
+		expect(isLiveStreamingBlock(false, msg, 1)).toBe(false);
+	});
+
 	it("is never live for a persisted message or an empty run", () => {
 		const msg = { contentJson: [REASONING], liveBlockIndex: 0 };
 		expect(isLiveStreamingRun(false, msg, [0])).toBe(false);

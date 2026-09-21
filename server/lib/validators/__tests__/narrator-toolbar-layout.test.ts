@@ -11,7 +11,11 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { NARRATOR_TOOLBAR_DIVIDER_ID, NARRATOR_TOOLBAR_IDS } from "@shared/narrator-toolbar";
+import {
+	NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID,
+	NARRATOR_TOOLBAR_DIVIDER_ID,
+	NARRATOR_TOOLBAR_IDS,
+} from "@shared/narrator-toolbar";
 import { updateUserPreferencesSchema } from "../settings";
 
 describe("narratorToolbarLayout id whitelist", () => {
@@ -19,6 +23,7 @@ describe("narratorToolbarLayout id whitelist", () => {
 		const items = [
 			...NARRATOR_TOOLBAR_IDS.map((id) => ({ id })),
 			{ id: NARRATOR_TOOLBAR_DIVIDER_ID },
+			{ id: NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID },
 		];
 		const parsed = updateUserPreferencesSchema.parse({
 			narratorToolbarLayout: { items },

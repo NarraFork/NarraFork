@@ -96,5 +96,7 @@ export function useNarratorToolbarLayout({
 		[queryClient, updatePrefs],
 	);
 
+	// `overflow` excludes bottom controls; consumers needing combined badges can
+	// explicitly aggregate both lists without rendering bottom entries twice.
 	return { entries, ...partition, saveLayout };
 }

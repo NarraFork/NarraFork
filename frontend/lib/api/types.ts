@@ -596,6 +596,12 @@ export interface BaseContentBlock {
 	translatedText?: string;
 	name?: string;
 	id?: string;
+	/** Monotonic revision of this globally identified text/reasoning content block. */
+	revision?: number;
+	/** Raw provider-body length at the committed checkpoint, before citation cleanup. */
+	rawTextLength?: number;
+	/** Raw window start on a live projection only. */
+	textOffset?: number;
 	input?: Record<string, unknown>;
 	inputJson?: unknown;
 	outputJson?: unknown;

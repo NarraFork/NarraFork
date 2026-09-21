@@ -283,10 +283,11 @@ describe("status bar layout contract (NarratorInteractionStatusBar)", () => {
 	});
 
 	test("registry-driven header entries are never nameless icons", async () => {
-		// Header tool entries render from HeaderToolbar's registry loop, so their
-		// accessible name is the resolved registry label.
-		const headerToolbar = await Bun.file(new URL("./HeaderToolbar.tsx", import.meta.url)).text();
-		expect(headerToolbar).toContain("aria-label={label}");
+		// Header and bottom tools share the registry item renderer and accessible label.
+		const toolbarItem = await Bun.file(
+			new URL("./NarratorToolbarItem.tsx", import.meta.url),
+		).text();
+		expect(toolbarItem).toContain("aria-label={label}");
 		// The overflow trigger owns its own name (it is not a registry entry).
 		const overflow = await Bun.file(
 			new URL("./NarratorToolbarOverflowMenu.tsx", import.meta.url),

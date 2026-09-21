@@ -180,6 +180,13 @@ export interface ResolveHeaderToolbarBudgetOptions {
 	 * itself (`hostOwnsTitle`), so the entries may claim that space.
 	 */
 	titleSlotMinWidth: number;
+	/**
+	 * Optional hard fraction of the content box for the whole toolbar. The normal
+	 * policy is null: title first (floor below), then icons claim whatever remains.
+	 * A positive fraction is only for hosts that must never trade title width for
+	 * icons even when the title is short.
+	 */
+	maxWidthFraction?: number | null;
 	gap?: number;
 }
 
@@ -196,6 +203,7 @@ export function resolveHeaderToolbarBudget({
 	toolbar,
 	leading,
 	titleSlotMinWidth,
+	maxWidthFraction = null,
 	gap = HEADER_TOOLBAR_GAP_PX,
 }: ResolveHeaderToolbarBudgetOptions): number {
 	const rowWidth = widthOf(row);
@@ -203,7 +211,8 @@ export function resolveHeaderToolbarBudget({
 
 	const rowGap = inlineGapOf(row, gap);
 	// The row lays out leading + toolbar, so one gap sits between them.
-	let budget = rowWidth - paddingInlineOf(row) - rowGap;
+	const contentWidth = rowWidth - paddingInlineOf(row);
+	let budget = contentWidth - rowGap;
 
 	const leadingGap = inlineGapOf(leading, gap);
 	const leadingChildren = [...leading.children];
@@ -214,6 +223,14 @@ export function resolveHeaderToolbarBudget({
 	}
 	budget -= Math.max(0, leadingChildren.length - 1) * leadingGap;
 	budget -= paddingInlineOf(leading);
+
+	// Title-first on every host: reserve the readable title floor above, then let
+	// icons use whatever remains. A positive maxWidthFraction is an optional hard
+	// cap; the default null leaves unused header space available to the toolbar
+	// instead of collapsing icons just to enforce a percentage.
+	if (titleSlotMinWidth > 0 && maxWidthFraction != null) {
+		budget = Math.min(budget, contentWidth * maxWidthFraction);
+	}
 
 	const toolbarGap = inlineGapOf(toolbar, gap);
 	for (const child of toolbar.children) {

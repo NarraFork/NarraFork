@@ -23,7 +23,9 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
 - 握手头（`buildHandshakeHeaders`，按实际发送顺序）：
   - `Authorization: Bearer ...`（`authorization` 选项优先，否则用 `apiKey`）
   - `User-Agent`：调用方传入的 `userAgent`，缺省为 `codex-tui/{managed-version} (...)`
-  - `originator: codex-tui`（可被 `extraHeaders` 覆盖）
+  - `originator`：默认 `codex-tui`；当 `userAgentMode` 为 `narrafork` 时由
+    `resolveClientFingerprint` 写成 `narrafork`，并经 `extraHeaders` 覆盖握手默认值。
+    其他模式（`codex` / `claude-code` / `custom` / 未设置）保持 `codex-tui`。
   - `Origin`：官方域名下为 `https://chatgpt.com`，否则为 `baseUrl`
   - `OpenAI-Beta: responses_websockets=2026-02-06`
   - `session-id` / `thread-id`：同取 `conversationId`
@@ -47,11 +49,12 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
   从而静默退化成全量重发并丢失 prompt cache。codex-rs 的
   `responses_request_properties_match` 划的是同一条线：input 单独比较、metadata 直接忽略
 
-两条调用路径都呈现托管 Codex 客户端身份：`openai-provider.ts` 的 codex 通道传
-`userAgent` + `extraHeaders`（由 `resolveClientFingerprint` 解析，含 `originator`、
-`x-codex-installation-id`、`session-id`/`thread-id`、`x-codex-window-id`）；内置 Codex
-adapter（`codex-provider.ts`）不传 `extraHeaders`，因此走 `buildHandshakeHeaders` 的
-缺省值——同样是 codex-tui UA 与 `originator: codex-tui`。
+两条调用路径都通过 `resolveClientFingerprint` 解析 `userAgent` + `extraHeaders`
+（含 `originator`、`x-codex-installation-id`、`session-id`/`thread-id`、
+`x-codex-window-id`）。`openai-provider.ts` 的 codex 通道与内置 Codex adapter
+（`codex-provider.ts`）均如此；默认 `userAgentMode` 为 `codex` 时呈现
+`codex-tui` UA 与 `originator: codex-tui`，显式选 NarraFork 时两者都变为
+`narrafork`。
 
 ## 已实现能力
 

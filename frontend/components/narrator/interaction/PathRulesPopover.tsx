@@ -42,15 +42,20 @@ export function PathRulesPopover({
 	narratorId,
 	t,
 	triggerMode = "icon",
+	controlled,
 }: {
 	narratorId: string;
 	t: (key: string) => string;
 	triggerMode?: "icon" | "menu";
+	/** An independently mounted dialog survives closing the toolbar menu that opened it. */
+	controlled?: { opened: boolean; onClose: () => void };
 }) {
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const platform = usePlatform();
 	const serverPathFlavor: PathFlavor = platform === "windows" ? "windows" : "posix";
-	const [opened, { toggle, close }] = useDisclosure(false);
+	const [localOpened, { toggle, close: closeLocal }] = useDisclosure(false);
+	const opened = controlled?.opened ?? localOpened;
+	const close = controlled?.onClose ?? closeLocal;
 	const dropdownRef = useRef<HTMLDivElement>(null);
 
 	// Only fetch rules when the popover is open — avoids 4 API calls on every page load.
@@ -91,7 +96,7 @@ export function PathRulesPopover({
 	// Popover has no built-in outside-click handling here (closeOnClickOutside is
 	// off so nested overlays can't dismiss it), so it is emulated below. The Modal
 	// branch has its own overlay dismissal and must not run this.
-	const usesPopover = !isMobile && triggerMode !== "menu";
+	const usesPopover = !controlled && !isMobile && triggerMode !== "menu";
 
 	useEffect(() => {
 		if (!opened || !usesPopover) return;
@@ -294,10 +299,10 @@ export function PathRulesPopover({
 		</Stack>
 	);
 
-	if (isMobile || triggerMode === "menu") {
+	if (controlled || isMobile || triggerMode === "menu") {
 		return (
 			<>
-				{trigger}
+				{!controlled && trigger}
 				<Modal
 					opened={opened}
 					onClose={close}

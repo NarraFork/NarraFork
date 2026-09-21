@@ -121,25 +121,29 @@ describe("live streaming output survives a deferred reload", () => {
 		const snapshot = coordinator.getSnapshot();
 		expect(streamingRowCount(snapshot.items ?? [])).toBeGreaterThan(0);
 		expect(
-			mod.isStreamingMessageSuperseded({
-				streamingMessage: snapshot.streamingMessage,
-				committedMessages: snapshot.input?.messages ?? [],
-			}),
-		).toBe(false);
+			mod.projectStreamingMessage(
+				snapshot.streamingMessage ?? null,
+				snapshot.input?.messages ?? [],
+			),
+		).toBe(snapshot.streamingMessage ?? null);
 	});
 
 	it("is only superseded once the replacement is actually in the document", async () => {
 		const mod = await load();
-		const withReply = [...history, message(20, "user", "请解释"), message(21, "assistant", "回答")];
+		const row = streamingRow(300);
+		row.contentJson = [{ type: "text", id: "block-1", revision: 1, text: "词".repeat(300) }];
+		const reply = { ...message(21, "assistant", "回答"), contentJson: row.contentJson };
+		const withReply = [...history, message(20, "user", "请解释"), reply];
 		const coordinator = await loadedCoordinator(mod, withReply, 8);
-		coordinator.setStreamingMessage(streamingRow(300), atBottom);
+		coordinator.setStreamingMessage(row, atBottom);
 		const snapshot = coordinator.getSnapshot();
 		expect(
-			mod.isStreamingMessageSuperseded({
-				streamingMessage: snapshot.streamingMessage,
-				committedMessages: snapshot.input?.messages ?? [],
-			}),
-		).toBe(true);
+			mod.projectStreamingMessage(
+				snapshot.streamingMessage ?? null,
+				snapshot.input?.messages ?? [],
+			),
+		).toBeNull();
+		expect(streamingRowCount(snapshot.items ?? [])).toBe(0);
 		// Retiring it now cannot open a blank window: the replacement is already laid out.
 		coordinator.setStreamingMessage(null, atBottom);
 		const after = coordinator.getSnapshot();

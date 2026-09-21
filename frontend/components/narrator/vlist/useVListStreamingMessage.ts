@@ -31,14 +31,17 @@ import {
 } from "../message/message-segments";
 import { buildTopLevelStreamingChunksMsg } from "../narrator-message-helpers";
 import type { NarratorMsg } from "../narrator-panel-types";
-import { dropSupersededStreamingBlocks } from "../streaming/streaming-block-supersede";
+import {
+	contentBlockIdentity,
+	dropSupersededStreamingBlocks,
+} from "../streaming/streaming-block-supersede";
 import {
 	applyExactStreamDelta,
 	applyExactStreamingSnapshot,
 	type StreamDeltaEvent,
 } from "./exact-streaming-accumulator";
 import { resetStreamingBlockCache } from "./streaming-block-cache";
-import { commitGrowthSignature, type HandoffMessage } from "./streaming-handoff";
+import { type HandoffMessage, projectStreamingMessage } from "./streaming-handoff";
 import {
 	applyStreamingSendDelivery,
 	applyStreamingToolChunk,
@@ -62,27 +65,8 @@ export interface UseVListStreamingMessageOptions {
 	enabled: boolean;
 	/** A subagent page treats its own (parent-pointing) deltas as top-level. */
 	isSubagent?: boolean;
-	/**
-	 * True once the committed document already contains this row's content.
-	 *
-	 * Resolved by the shell from the loaded document (streaming-handoff.ts). It is a
-	 * STRUCTURAL fact, so unlike the old timeout it can never drop live output while
-	 * the replacement is missing.
-	 */
-	superseded?: boolean;
-	/**
-	 * Committed messages, used for the PER-TOOL hand-off.
-	 *
-	 * A turn persists its tools one message at a time, so individual synthetic cards
-	 * retire independently of the row as a whole: each is dropped exactly when a
-	 * persisted message carrying its tool-use id appears.
-	 */
+	/** Actual loaded document: the sole evidence that a block is visible elsewhere. */
 	committedMessages?: readonly HandoffMessage[];
-	/**
-	 * Report how much text has arrived since the document last grew, so the shell can
-	 * feed it to the hand-off decision (see streaming-handoff.ts).
-	 */
-	onCharsSinceCommitChange?: (chars: number) => void;
 }
 
 /**
@@ -101,16 +85,12 @@ export function useVListStreamingMessage(
 	narratorId: string | undefined,
 	options: UseVListStreamingMessageOptions,
 ): NarratorMsg | null {
-	const {
-		enabled,
-		isSubagent = false,
-		superseded = false,
-		committedMessages = EMPTY_MESSAGES,
-		onCharsSinceCommitChange,
-	} = options;
-	const reportCharsRef = useRef(onCharsSinceCommitChange);
-	reportCharsRef.current = onCharsSinceCommitChange;
+	const { enabled, isSubagent = false, committedMessages = EMPTY_MESSAGES } = options;
+	// Raw text never takes a committed (citation-cleaned) value as its seed. A
+	// checkpoint only removes the display copy; later deltas still append here.
 	const blocksRef = useRef<StreamingBlock[]>([]);
+	const ownerRef = useRef(narratorId);
+	const finalizedRef = useRef(new Map<string, number>());
 	const toolStoreRef = useRef(createStreamingToolStore());
 	/** Pending output throttle state per tool (latest preview + its timer). */
 	const outputThrottleRef = useRef<
@@ -120,41 +100,9 @@ export function useVListStreamingMessage(
 		>
 	>(new Map());
 	const rafRef = useRef(0);
-	/**
-	 * Which text/reasoning lane last received a delta, or -1 when the model has moved
-	 * on to tool calls. Stamped onto the published row so renderers can tell a
-	 * FINISHED reasoning run from the one still being written — array position cannot,
-	 * because the tool cards are appended after the text lanes whatever order the
-	 * provider used (see @shared/pretext-layout/streaming-live-blocks).
-	 */
-	const liveBlockIndexRef = useRef(-1);
-	/**
-	 * The block currently being written, held BY REFERENCE.
-	 *
-	 * Separate from `liveBlockIndexRef` on purpose, and not derivable from it. That ref
-	 * is an array INDEX, valid only for the array as it stood after the fold that set it
-	 * (see StreamDeltaResult.blockIndex): `upsertStreaming*Block` splices native
-	 * web_search / image_generation blocks in by `outputIndex` and does NOT update it, so
-	 * in a stream that mixes native blocks with text the index can name a neighbour.
-	 *
-	 * That staleness is harmless for its existing consumer — `buildStreamingMsg` uses it
-	 * to mark which lane is "still writing", so at worst a highlight lands one row off.
-	 * It is NOT harmless for `dropSupersededStreamingBlocks`, which uses this ref as a
-	 * deletion guard: protecting the wrong block would leave the lane that is actually
-	 * growing unprotected, and its short first delta can spuriously match an earlier
-	 * step's persisted text. So the block is captured at the moment the index is fresh
-	 * and compared by identity afterwards. References stay valid across splices because
-	 * text/reasoning blocks are mutated in place.
-	 */
+	/** The current lane by reference: native-block insertion may shift array indices. */
 	const liveBlockRef = useRef<StreamingBlock | null>(null);
 	const [version, setVersion] = useState(0);
-	/**
-	 * Total characters this row has accumulated, and the value at the moment the
-	 * document last grew. Their difference is the hand-off's "has the model produced
-	 * anything NEW since the last message was stored" signal.
-	 */
-	const accumulatedCharsRef = useRef(0);
-	const charsAtLastCommitRef = useRef(0);
 
 	const flush = useCallback(() => {
 		if (rafRef.current) return;
@@ -177,9 +125,7 @@ export function useVListStreamingMessage(
 			rafRef.current = 0;
 		}
 		clearOutputTimers();
-		accumulatedCharsRef.current = 0;
-		charsAtLastCommitRef.current = 0;
-		liveBlockIndexRef.current = -1;
+		finalizedRef.current.clear();
 		liveBlockRef.current = null;
 		const hadContent = blocksRef.current.length > 0 || toolStoreRef.current.size > 0;
 		if (hadContent) {
@@ -189,59 +135,16 @@ export function useVListStreamingMessage(
 		}
 	}, [clearOutputTimers]);
 
-	/** Total characters currently held across the accumulated text/reasoning blocks. */
-	const currentCharCount = useCallback(() => {
-		let total = 0;
-		for (const block of blocksRef.current) {
-			if (block.type === "text" || block.type === "reasoning") total += block.text.length;
-		}
-		return total;
-	}, []);
-
 	// Reset accumulation whenever the target narrator changes or streaming is
 	// disabled (the narrator left the active state, or unmount).
 	useEffect(() => {
 		if (!enabled) clearBlocks();
 		return () => clearBlocks();
 	}, [enabled, clearBlocks]);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId reset is intentional
 	useEffect(() => {
+		ownerRef.current = narratorId;
 		clearBlocks();
 	}, [narratorId, clearBlocks]);
-
-	// Drop the row once the document owns its content. Deliberately a PASSIVE
-	// effect: the committed message and the streaming row are both already in the
-	// same document, and they measure to the same height, so a frame showing the row
-	// one commit longer is visually identical — there is nothing to race, and no
-	// blank window is possible either way.
-	useEffect(() => {
-		if (superseded) clearBlocks();
-	}, [superseded, clearBlocks]);
-
-	// Reset the "text since the last commit" counter whenever the document GROWS, so
-	// the hand-off can tell a stored reply from a NEW paragraph the model started after
-	// an earlier step of the same turn was stored (see streaming-handoff.ts).
-	//
-	// Keyed on the growth SIGNATURE, never on the messages array identity: a live
-	// lifecycle patch (tool finished, permission decided, reflection advanced) rebuilds
-	// that array several times per turn without adding a message, and resetting on
-	// those would let an already-stored earlier step retire the live step that follows
-	// it — output that was never persisted, silently gone. See commitGrowthSignature.
-	const commitSignature = commitGrowthSignature(committedMessages);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: reset on document growth only
-	useEffect(() => {
-		charsAtLastCommitRef.current = accumulatedCharsRef.current;
-		reportCharsRef.current?.(0);
-	}, [commitSignature]);
-
-	// Publish the delta on each render version bump (rAF-coalesced, so at most once
-	// per frame).
-	useEffect(() => {
-		void version;
-		reportCharsRef.current?.(
-			Math.max(0, accumulatedCharsRef.current - charsAtLastCommitRef.current),
-		);
-	}, [version]);
 
 	// Release the incremental markdown prefixes tied to this narrator's streaming
 	// rows, so a long session does not retain prepared blocks per turn.
@@ -264,23 +167,35 @@ export function useVListStreamingMessage(
 		}
 	}, [persistedToolUseIds]);
 
-	// Per-BLOCK hand-off, the text/reasoning counterpart of the per-tool one above.
-	//
-	// The server archives each finished block into the partial assistant message as it
-	// streams, but that row is invisible to clients until something delivers it — and
-	// when a reconnect catch-up finally does, the live row is still holding the same
-	// blocks, so the paragraph renders twice (see streaming-block-supersede.ts).
-	//
-	// Keyed on `committedMessages` for the same reason as the tool half: the trigger is
-	// "the document now contains it", a structural fact, not the arrival of some frame.
-	// `liveBlockRef` is read through the ref rather than declared as a dependency — it
-	// changes on every delta, and its only role is naming which block must not be
-	// touched during THIS evaluation.
+	// Final message events seal ids, but only the actual document may release their
+	// raw bodies. A late final/checkpoint cannot clear a newer revision or NEW id.
 	useEffect(() => {
-		if (dropSupersededStreamingBlocks(blocksRef.current, committedMessages, liveBlockRef.current)) {
-			flush();
+		void version; // A final WS frame may seal ids after the loaded array last changed.
+		// Unversioned providers retain the old conservative per-block contraction;
+		// only modern ids can reopen the same raw accumulator after a checkpoint.
+		const legacy = blocksRef.current.filter((block) => !contentBlockIdentity(block));
+		dropSupersededStreamingBlocks(legacy, committedMessages, liveBlockRef.current);
+		const retainedLegacy = new Set(legacy);
+		const acknowledged = new Map<string, number>();
+		for (const message of committedMessages) {
+			if (!Array.isArray(message.contentJson)) continue;
+			for (const block of message.contentJson) {
+				const identity = contentBlockIdentity(block);
+				if (identity)
+					acknowledged.set(
+						identity.id,
+						Math.max(acknowledged.get(identity.id) ?? -1, identity.revision),
+					);
+			}
 		}
-	}, [committedMessages, flush]);
+		blocksRef.current = blocksRef.current.filter((block) => {
+			const identity = contentBlockIdentity(block);
+			return identity
+				? (finalizedRef.current.get(identity.id) ?? -1) < identity.revision ||
+						(acknowledged.get(identity.id) ?? -1) < identity.revision
+				: retainedLegacy.has(block);
+		});
+	}, [committedMessages, version]);
 
 	/**
 	 * Record streaming stdout, rate-limited per tool.
@@ -331,7 +246,38 @@ export function useVListStreamingMessage(
 	useNarratorWS(
 		subscriptionId,
 		{
+			onMessage: (data) => {
+				const message = data.message as NarratorMsg | undefined;
+				if (
+					message?.role !== "assistant" ||
+					(!isSubagent && message.parentToolUseId) ||
+					!Array.isArray(message.contentJson)
+				)
+					return;
+				for (const block of message.contentJson) {
+					const identity = contentBlockIdentity(block);
+					if (identity)
+						finalizedRef.current.set(
+							identity.id,
+							Math.max(finalizedRef.current.get(identity.id) ?? -1, identity.revision),
+						);
+				}
+				// Tombstones contain ids/revisions only, and never retain historical text.
+				while (finalizedRef.current.size > 2048) {
+					const oldest = finalizedRef.current.keys().next().value;
+					if (oldest === undefined) break;
+					finalizedRef.current.delete(oldest);
+				}
+				flush();
+			},
 			onStreamEvent: (wsData: { event?: Record<string, unknown>; [key: string]: unknown }) => {
+				const delta = (wsData.event as StreamDeltaEvent | undefined)?.delta;
+				if (
+					typeof delta?.id === "string" &&
+					typeof delta.revision === "number" &&
+					(finalizedRef.current.get(delta.id) ?? -1) >= delta.revision
+				)
+					return;
 				const result = applyExactStreamDelta(
 					blocksRef.current,
 					wsData.event as StreamDeltaEvent,
@@ -341,11 +287,9 @@ export function useVListStreamingMessage(
 					// The lane this delta landed in is now the live one. A reasoning delta
 					// arriving after a tool call legitimately REOPENS the text lane, which is
 					// why this is set on every delta rather than only advanced forward.
-					liveBlockIndexRef.current = result.blockIndex;
 					// Capture the block ITSELF while the index is still fresh. See
 					// liveBlockRef's declaration for why the index cannot be resolved later.
 					liveBlockRef.current = blocksRef.current[result.blockIndex] ?? null;
-					accumulatedCharsRef.current = currentCharCount();
 					flush();
 				}
 			},
@@ -353,10 +297,15 @@ export function useVListStreamingMessage(
 				if (
 					applyExactStreamingSnapshot(
 						blocksRef.current,
-						snapshot.streamingBlocks as StreamingBlock[],
+						snapshot.streamingBlocks.filter((block) => {
+							const identity = contentBlockIdentity(block);
+							return !identity || (finalizedRef.current.get(identity.id) ?? -1) < identity.revision;
+						}) as StreamingBlock[],
 					)
-				)
+				) {
+					liveBlockRef.current = blocksRef.current.at(-1) ?? null;
 					flush();
+				}
 			},
 			onStreamingReset: (parentToolUseId) => {
 				// The owning page receives the reset without a parentToolUseId; the
@@ -458,7 +407,6 @@ export function useVListStreamingMessage(
 				// The model is writing tool arguments, so no text lane is open: whatever
 				// reasoning or text preceded this is finished and must settle now instead of
 				// waiting for the turn to persist.
-				liveBlockIndexRef.current = -1;
 				liveBlockRef.current = null;
 				if (
 					applyStreamingToolChunk(toolStoreRef.current, {
@@ -554,7 +502,7 @@ export function useVListStreamingMessage(
 
 	return useMemo<NarratorMsg | null>(() => {
 		void version; // re-read the mutable refs on each version bump
-		if (!enabled || !narratorId) return null;
+		if (!enabled || !narratorId || ownerRef.current !== narratorId) return null;
 		const chunks = streamingToolChunks(toolStoreRef.current);
 		if (blocksRef.current.length === 0 && chunks.length === 0) return null;
 		// Both halves go through the chunked path's own builders, so the two lists
@@ -562,11 +510,15 @@ export function useVListStreamingMessage(
 		// come first, then the live tool cards — the order the model produced them.
 		const toolChunksMsg =
 			chunks.length > 0 ? buildTopLevelStreamingChunksMsg(chunks, narratorId, null) : null;
-		return buildStreamingMsg({
-			streamingBlocks: blocksRef.current,
-			toolChunksMsg,
-			narratorId,
-			liveBlockIndex: liveBlockIndexRef.current,
-		});
-	}, [enabled, narratorId, version]);
+		return projectStreamingMessage(
+			buildStreamingMsg({
+				streamingBlocks: blocksRef.current,
+				toolChunksMsg,
+				narratorId,
+				liveBlockIndex: liveBlockRef.current ? blocksRef.current.indexOf(liveBlockRef.current) : -1,
+			}),
+			committedMessages,
+			isSubagent,
+		);
+	}, [enabled, narratorId, version, committedMessages, isSubagent]);
 }

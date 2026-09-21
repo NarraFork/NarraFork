@@ -10,8 +10,8 @@
  * applies here.
  *
  * The order below is the DEFAULT order for fresh installs, roughly "how often a
- * reader reaches for it". It is NOT a visibility list — every id starts before
- * the divider (i.e. eligible to be surfaced) and the *host* decides how many
+ * reader reaches for it". It is NOT a visibility list — the layout assigns ids
+ * to header/menu/bottom zones and the *host* decides how many
  * actually fit: the desktop header MEASURES its available width and collapses
  * the rest into the overflow menu (see
  * `frontend/components/narrator/header/narrator-header-toolbar-capacity.ts`), while the
@@ -22,7 +22,7 @@
  * Two classes of control are deliberately absent:
  *
  *  - Session configuration (model, reasoning effort, fast mode, permission mode,
- *    path rules, relaxed plan, promote). Those belong to the *status bar* below
+ *    relaxed plan, promote). Those belong to the *status bar* below
  *    the conversation, next to the state they modify, not to the tool-entry row.
  *  - Destructive or window-level actions (archive, close panel). Archive is
  *    pinned to the bottom of the overflow menu and must never be draggable into
@@ -49,13 +49,14 @@ export const NARRATOR_TOOLBAR_IDS = [
 	"lodlevel",
 	"device",
 	"plugins",
+	"path-rules",
 ] as const;
 
 export type NarratorToolbarId = (typeof NARRATOR_TOOLBAR_IDS)[number];
 
 /**
- * Boundary marker inside the flat persisted layout list: every id after it is
- * tucked into the overflow menu regardless of how much room the header has.
+ * Boundary marker inside the flat persisted layout list: ids after it and before
+ * the bottom marker stay in the overflow menu regardless of header width.
  *
  * Same sentinel shape as the nav layout's divider, and for the same reason —
  * visibility is derived from position, never stored as a separate flag that can
@@ -63,10 +64,14 @@ export type NarratorToolbarId = (typeof NARRATOR_TOOLBAR_IDS)[number];
  */
 export const NARRATOR_TOOLBAR_DIVIDER_ID = "__divider__";
 
-/** Every id accepted in the persisted layout, including the divider marker. */
+/** Starts the bottom toolbar zone; the preceding divider starts the menu zone. */
+export const NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID = "__bottom__";
+
+/** Every id accepted in the persisted layout, including both boundary markers. */
 export const PERSISTED_NARRATOR_TOOLBAR_IDS = [
 	...NARRATOR_TOOLBAR_IDS,
 	NARRATOR_TOOLBAR_DIVIDER_ID,
+	NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID,
 ] as const;
 
 const TOOLBAR_ID_SET: ReadonlySet<string> = new Set<string>(NARRATOR_TOOLBAR_IDS);

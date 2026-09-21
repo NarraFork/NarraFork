@@ -496,7 +496,7 @@ export interface MeasuredSubagent extends MeasuredElement {
 	resultMeasured: MeasuredToolBody<ToolCappedDetail> | null;
 	/** Result block height (min(content,300) + padding); 0 when absent. */
 	resultBlockHeight: number;
-	/** Replace a background launch acknowledgement with a compact panel shortcut. */
+	/** Background launch protocol text is suppressed; no notice row is drawn. */
 	hasBackgroundNotice: boolean;
 	/** File-changes block height (title + attribution notices + rows + overflow). */
 	fileChangesHeight: number;
@@ -776,9 +776,8 @@ export function measureSubagentCard(
 		}
 
 		if (hasBackgroundNotice) {
-			resultBlockHeight =
-				Math.max(typographyMetrics().line.xs, BUTTON_COMPACT_XS) + BLOCK_PADDING_BOTTOM;
-			expandedHeight += resultBlockHeight;
+			// Protocol text is hidden; no notice row occupies the result slot.
+			resultBlockHeight = 0;
 		} else if (data.resultBody) {
 			resultMeasured = measureToolBody(
 				data.resultBody,

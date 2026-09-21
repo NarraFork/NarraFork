@@ -47,6 +47,8 @@ import {
 	getHttpClaudeCliUserAgent,
 	getHttpCodexUserAgent,
 	getHttpUserAgent,
+	ORIGINATOR,
+	ORIGINATOR_CODEX,
 } from "../../user-agent";
 import { AnthropicProvider } from "../anthropic-provider";
 import {
@@ -207,9 +209,9 @@ describe("UA option reaches the wire — OpenAIProvider HTTP", () => {
 
 describe("UA option reaches the wire — AnthropicProvider HTTP", () => {
 	/**
-	 * `officialApi: true` is the Claude Code relay case: its fallback is the Claude
-	 * CLI UA, and replacing that is exactly what an operator asking for a NarraFork
-	 * identity needs. `false` is an ordinary third-party relay.
+	 * Anthropic-shaped traffic defaults to Claude CLI whether the endpoint is the
+	 * official Claude Code API (`officialApi: true`) or a third-party Claude Code
+	 * relay (`false`). Explicit modes still win.
 	 */
 	test.each([
 		[true, undefined, getHttpClaudeCliUserAgent()],
@@ -217,7 +219,7 @@ describe("UA option reaches the wire — AnthropicProvider HTTP", () => {
 		[true, "claude-code", getHttpClaudeCliUserAgent()],
 		[true, "codex", getHttpCodexUserAgent()],
 		[true, "custom", CUSTOM_UA],
-		[false, undefined, getHttpUserAgent()],
+		[false, undefined, getHttpClaudeCliUserAgent()],
 		[false, "narrafork", getHttpUserAgent()],
 		[false, "claude-code", getHttpClaudeCliUserAgent()],
 		[false, "custom", CUSTOM_UA],
@@ -300,6 +302,30 @@ describe("UA option reaches the wire — Codex WebSocket handshake", () => {
 			extraHeaders: { originator: "codex-tui", "x-codex-installation-id": "inst-1" },
 		});
 		expect(soleUserAgent(headers)).toBe(CUSTOM_UA);
+	});
+
+	/**
+	 * User-reported: Codex UA set to NarraFork still went out as codex-tui.
+	 * The handshake hardcodes originator to codex-tui as its default; the
+	 * resolved fingerprint must overwrite it when the operator chose NarraFork,
+	 * or dumps still look like the managed Codex client.
+	 */
+	test("NarraFork fingerprint headers replace the handshake originator default", () => {
+		const headers = wsHandshakeHeaders({
+			userAgent: getHttpUserAgent(),
+			extraHeaders: { originator: ORIGINATOR, "x-codex-installation-id": "inst-1" },
+		});
+		expect(soleUserAgent(headers)).toBe(getHttpUserAgent());
+		expect(headers.originator).toBe(ORIGINATOR);
+	});
+
+	test("Codex-mode fingerprint keeps originator as codex-tui", () => {
+		const headers = wsHandshakeHeaders({
+			userAgent: getHttpCodexUserAgent(),
+			extraHeaders: { originator: ORIGINATOR_CODEX, "x-codex-installation-id": "inst-1" },
+		});
+		expect(soleUserAgent(headers)).toBe(getHttpCodexUserAgent());
+		expect(headers.originator).toBe(ORIGINATOR_CODEX);
 	});
 });
 

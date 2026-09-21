@@ -813,8 +813,6 @@
 	"segmentCompactConfirm": "压缩选中的 {{count}} 条消息？原始消息将被隐藏并替换为摘要。",
 	"viewSubagentSession": "查看会话",
 	"openFullSubagentSession": "打开完整会话",
-	"subagentBackgroundNotice": "子代理已在后台启动，进度与结果可在面板中查看。",
-	"subagentOpenInPanel": "在面板中打开",
 	"backgroundTaskStarted": "已在后台启动，可在后台任务中查看进度。",
 	"injectionTarget": {
 		"openKnowledge": "打开知识库条目",
@@ -1533,8 +1531,9 @@
 		"more": "更多工具",
 		"sectionVisible": "显示在标题栏",
 		"sectionTucked": "收纳在此菜单",
+		"sectionBottom": "底部功能图标",
 		"expandOptions": "展开选项",
-		"someHiddenNoRoom": "灰色项标题栏放不下"
+		"someHiddenNoRoom": "空间不足，自动收起"
 	},
 	"spec": {
 		"title": "大纲",

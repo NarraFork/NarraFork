@@ -27,7 +27,6 @@ import { extractAnthropicUsage } from "../usage-tracking";
 import {
 	CLAUDE_CLI_VERSION,
 	getHttpClaudeCliUserAgent,
-	getHttpUserAgent,
 	mergeExtraHeaders,
 	resolveHttpUserAgent,
 } from "../user-agent";
@@ -724,6 +723,7 @@ interface AnthropicStreamEvent {
 // === Tool call accumulator ===
 
 interface ToolAccumEntry {
+	outputIndex?: number;
 	id: string;
 	name: string;
 	args: string;
@@ -747,6 +747,8 @@ interface AnthropicUsageAccum {
 	cacheCreationInputTokens: number;
 	cacheCreation5mTokens: number;
 	cacheCreation1hTokens: number;
+	/** Text lanes tracked alongside the per-response usage state. */
+	textBlocks?: Set<number>;
 }
 
 function createAnthropicUsageAccum(): AnthropicUsageAccum {
@@ -1267,15 +1269,17 @@ export class AnthropicProvider implements ProviderAdapter {
 	}
 
 	/**
-	 * Resolve the User-Agent for this provider. Defaults follow the previous
-	 * behaviour (Claude CLI UA for official API, narrafork UA otherwise) and can
-	 * be overridden per provider via userAgentMode/customUserAgent.
+	 * Resolve the User-Agent for this provider.
+	 *
+	 * Anthropic traffic — official Claude Code API and third-party Claude Code
+	 * relays alike — defaults to the Claude CLI identity. Operators can still
+	 * override per provider via userAgentMode/customUserAgent.
 	 */
-	private resolveUserAgent(isOfficial: boolean): string {
+	private resolveUserAgent(_isOfficial: boolean): string {
 		return resolveHttpUserAgent({
 			mode: this.config.userAgentMode,
 			custom: this.config.customUserAgent,
-			fallback: isOfficial ? getHttpClaudeCliUserAgent() : getHttpUserAgent(),
+			fallback: getHttpClaudeCliUserAgent(),
 		});
 	}
 
@@ -1974,8 +1978,37 @@ export class AnthropicProvider implements ProviderAdapter {
 			outputIndex?: number;
 			signatureSource?: string;
 		}>,
+		orderedContent?: readonly import("./types").ContentBlock[],
 	): void {
 		const h = history as AnthropicMessage[];
+		if (orderedContent) {
+			const parts: AnthropicContentPart[] = [];
+			for (const block of orderedContent) {
+				if (block.type === "text" && block.text.trim()) {
+					parts.push({ type: "text", text: block.text });
+				} else if (block.type === "reasoning" && block.text.trim()) {
+					parts.push({
+						type: "thinking",
+						thinking: block.text,
+						signature: block.providerMetadata?.anthropic?.signature ?? "",
+					});
+				} else if (block.type === "redacted_thinking") {
+					parts.push({ type: "redacted_thinking", data: block.data });
+				} else if (block.type === "tool_use") {
+					parts.push({
+						type: "tool_use",
+						id: block.toolUseId,
+						name: block.name,
+						input: block.input,
+					});
+				}
+			}
+			if (parts.length) {
+				ensureTextOrToolBlock(parts);
+				h.push({ role: "assistant", content: parts });
+			}
+			return;
+		}
 
 		// Collect all blocks with their outputIndex and sort by position.
 		// When no block has an explicit outputIndex (legacy messages), fall back
@@ -2529,7 +2562,14 @@ export async function* parseAnthropicSSEStream(
 		for (const [, acc] of toolAccum) {
 			if (!acc.emitted) {
 				acc.emitted = true;
-				yield { toolUseChunk: { toolUseId: acc.id, name: acc.name, stop: true } };
+				yield {
+					toolUseChunk: {
+						toolUseId: acc.id,
+						name: acc.name,
+						stop: true,
+						outputIndex: acc.outputIndex,
+					},
+				};
 			}
 		}
 	} finally {
@@ -2646,8 +2686,32 @@ export function parseAnthropicEvent(
 		const idx = event.index ?? 0;
 		const block = event.content_block;
 
+		if (block.type === "text") {
+			usageAccum.textBlocks ??= new Set();
+			usageAccum.textBlocks.add(idx);
+			return [
+				{
+					...(block.text ? { text: block.text } : {}),
+					textBlockId: `anthropic:${idx}`,
+					textOutputIndex: idx,
+					contentBoundary: {
+						kind: "text",
+						phase: "start",
+						blockId: `anthropic:${idx}`,
+						outputIndex: idx,
+					},
+				},
+			];
+		}
+
 		if (block.type === "tool_use" && block.id && block.name) {
-			toolAccum.set(idx, { id: block.id, name: block.name, args: "", emitted: false });
+			toolAccum.set(idx, {
+				id: block.id,
+				name: block.name,
+				args: "",
+				emitted: false,
+				outputIndex: idx,
+			});
 			logger.debug("Anthropic tool call started", {
 				index: idx,
 				toolUseId: block.id,
@@ -2701,18 +2765,28 @@ export function parseAnthropicEvent(
 		// reasoning so it is persisted and replayed as a thinking block on the
 		// next request.
 		if (block.type === "thinking") {
-			thinkingAccum.set(idx, { signature: "", blockIndex: idx });
+			thinkingAccum.set(idx, { signature: block.signature ?? "", blockIndex: idx });
 			const initialThinking = block.thinking ?? block.reasoning_content ?? block.text;
 			if (initialThinking) {
 				return [
 					{
 						reasoning: initialThinking,
+						reasoningBlockId: `anthropic:${idx}`,
 						reasoningMetadata: { anthropic: { blockIndex: idx } },
 						reasoningOutputIndex: idx,
 					},
 				];
 			}
-			return [];
+			return [
+				{
+					contentBoundary: {
+						kind: "reasoning",
+						phase: "start",
+						blockId: `anthropic:${idx}`,
+						outputIndex: idx,
+					},
+				},
+			];
 		}
 		// Redacted thinking arrives as a complete content block. Match Claude Code's
 		// contentBlocks[index] flow by waiting for content_block_stop before emitting
@@ -2737,9 +2811,11 @@ export function parseAnthropicEvent(
 		const isThinkingBlockDelta = event.delta.type === "thinking_delta" || thinkingAccum.has(idx);
 		const thinkingDelta = event.delta.thinking ?? event.delta.reasoning_content ?? event.delta.text;
 		if (isThinkingBlockDelta && thinkingDelta != null) {
+			if (!thinkingAccum.has(idx)) thinkingAccum.set(idx, { signature: "", blockIndex: idx });
 			return [
 				{
 					reasoning: thinkingDelta,
+					reasoningBlockId: `anthropic:${idx}`,
 					reasoningMetadata: { anthropic: { blockIndex: idx } },
 					reasoningOutputIndex: idx,
 				},
@@ -2748,7 +2824,9 @@ export function parseAnthropicEvent(
 
 		// Text delta
 		if (event.delta.type === "text_delta" && event.delta.text != null) {
-			return [{ text: event.delta.text, textOutputIndex: idx }];
+			usageAccum.textBlocks ??= new Set();
+			usageAccum.textBlocks.add(idx);
+			return [{ text: event.delta.text, textOutputIndex: idx, textBlockId: `anthropic:${idx}` }];
 		}
 
 		// Signature delta — assign (Anthropic sends one per thinking block)
@@ -2790,13 +2868,19 @@ export function parseAnthropicEvent(
 							name: acc.name,
 							input: event.delta.partial_json,
 							stop: false,
+							outputIndex: idx,
 						},
 					},
 				];
 				// Early completion if args form valid JSON
 				if (isParsableJson(acc.args)) {
 					results.push({
-						toolUseChunk: { toolUseId: acc.id, name: acc.name, stop: true },
+						toolUseChunk: {
+							toolUseId: acc.id,
+							name: acc.name,
+							stop: true,
+							outputIndex: acc.outputIndex,
+						},
 					});
 					acc.emitted = true;
 				}
@@ -2817,22 +2901,52 @@ export function parseAnthropicEvent(
 		const acc = toolAccum.get(idx);
 		if (acc && !acc.emitted) {
 			acc.emitted = true;
-			return [{ toolUseChunk: { toolUseId: acc.id, name: acc.name, stop: true } }];
+			return [
+				{
+					toolUseChunk: {
+						toolUseId: acc.id,
+						name: acc.name,
+						stop: true,
+						outputIndex: acc.outputIndex,
+					},
+				},
+			];
 		}
 		// Thinking block stop — emit signature as reasoning metadata
 		const thinkAcc = thinkingAccum.get(idx);
 		if (thinkAcc) {
 			thinkingAccum.delete(idx);
+			const results: ParsedStreamEvent[] = [];
 			if (thinkAcc.signature) {
-				return [
-					{
-						reasoningMetadata: {
-							anthropic: { blockIndex: thinkAcc.blockIndex, signature: thinkAcc.signature },
-						},
-						reasoningOutputIndex: thinkAcc.blockIndex,
+				results.push({
+					reasoningMetadata: {
+						anthropic: { blockIndex: thinkAcc.blockIndex, signature: thinkAcc.signature },
 					},
-				];
+					reasoningBlockId: `anthropic:${idx}`,
+					reasoningOutputIndex: thinkAcc.blockIndex,
+				});
 			}
+			results.push({
+				contentBoundary: {
+					kind: "reasoning",
+					phase: "complete",
+					blockId: `anthropic:${idx}`,
+					outputIndex: idx,
+				},
+			});
+			return results;
+		}
+		if (usageAccum.textBlocks?.delete(idx)) {
+			return [
+				{
+					contentBoundary: {
+						kind: "text",
+						phase: "complete",
+						blockId: `anthropic:${idx}`,
+						outputIndex: idx,
+					},
+				},
+			];
 		}
 
 		const redactedData = redactedThinkingAccum.get(idx);
@@ -2850,7 +2964,14 @@ export function parseAnthropicEvent(
 		// Flush un-emitted tool calls
 		for (const [, acc] of toolAccum) {
 			if (!acc.emitted) {
-				results.push({ toolUseChunk: { toolUseId: acc.id, name: acc.name, stop: true } });
+				results.push({
+					toolUseChunk: {
+						toolUseId: acc.id,
+						name: acc.name,
+						stop: true,
+						outputIndex: acc.outputIndex,
+					},
+				});
 				acc.emitted = true;
 			}
 		}

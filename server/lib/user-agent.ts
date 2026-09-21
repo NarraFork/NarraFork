@@ -2,7 +2,7 @@ import os from "node:os";
 import { deriveCodexWindowId } from "./agent/codex-request";
 import { APP_VERSION } from "./version";
 
-const ORIGINATOR = "narrafork";
+export const ORIGINATOR = "narrafork";
 /**
  * Claude Code CLI version mimicked by the "claude-code" User-Agent mode.
  *
@@ -303,7 +303,11 @@ export function getHttpCodexUserAgent(): string {
  * than here (see buildHandshakeHeaders).
  *
  * Included:
- * - originator: codex-tui
+ * - originator: follows the operator's User-Agent mode — "narrafork" when they
+ *   chose NarraFork identity, otherwise the managed Codex CLI value. Selecting
+ *   NarraFork and still shipping `originator: codex-tui` is exactly the bug
+ *   users reported: dumps and relays key off originator first, so a UA-only
+ *   override still looked like codex-tui on the wire.
  * - x-codex-installation-id: <persisted UUID>
  * - session-id / thread-id: one stable conversation id
  * - x-codex-window-id: window UUID derived from the conversation id
@@ -311,9 +315,11 @@ export function getHttpCodexUserAgent(): string {
 export function buildCodexEmulationHeaders(opts: {
 	installationId: string;
 	conversationId?: string;
+	/** When "narrafork", originator presents as NarraFork instead of codex-tui. */
+	userAgentMode?: UserAgentMode;
 }): Record<string, string> {
 	const headers: Record<string, string> = {
-		originator: ORIGINATOR_CODEX,
+		originator: originatorForUserAgentMode(opts.userAgentMode),
 		"x-codex-installation-id": opts.installationId,
 	};
 	if (opts.conversationId) {
@@ -326,6 +332,18 @@ export function buildCodexEmulationHeaders(opts: {
 
 /** Per-provider User-Agent selection mode. */
 export type UserAgentMode = "narrafork" | "claude-code" | "codex" | "custom";
+
+/**
+ * Resolve the Codex protocol `originator` header for a User-Agent mode.
+ *
+ * Only the explicit "narrafork" choice opts out of the managed Codex identity.
+ * "codex", "claude-code", "custom", and unset keep `codex-tui`: those modes
+ * either intend Codex presentation or leave protocol headers to extraHeaders,
+ * and inventing a third originator for them would match no real client.
+ */
+export function originatorForUserAgentMode(mode?: UserAgentMode): string {
+	return mode === "narrafork" ? ORIGINATOR : ORIGINATOR_CODEX;
+}
 
 /**
  * Resolve the effective HTTP User-Agent for a provider request.
@@ -392,6 +410,7 @@ export function resolveClientFingerprint(options: {
 			buildCodexEmulationHeaders({
 				installationId: options.installationId,
 				conversationId: options.conversationId,
+				userAgentMode: options.mode,
 			}),
 		);
 	}

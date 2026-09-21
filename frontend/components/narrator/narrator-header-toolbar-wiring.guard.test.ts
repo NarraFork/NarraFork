@@ -14,6 +14,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { NARRATOR_TOOLBAR_ITEMS } from "./header/narrator-toolbar-items";
 
 function read(name: string): Promise<string> {
 	return Bun.file(new URL(name, import.meta.url)).text();
@@ -60,24 +61,29 @@ describe("header capacity measurement is wired to the DOM", () => {
 		expect(menu).toContain("[HEADER_TOOLBAR_FIXED_ATTR]");
 	});
 
-	it("feeds the measured capacity into the visible limit", async () => {
-		const source = await headerToolbarHook();
-		expect(source).toContain("headerCapacity ?? (isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT");
-		// The partition must stay uncapped: capping there would make the item count
-		// fed to the measurement depend on the measurement's own answer.
-		expect(source).toContain("visibleLimit: null,");
+	it("keeps width capacity inside HeaderToolbar, not the panel controller", async () => {
+		const toolbar = await headerToolbar();
+		const hook = await headerToolbarHook();
+		// Capacity changes when icons collapse; that must not re-render NarratorPanel.
+		expect(toolbar).toContain("useHeaderToolbarCapacityPartition");
+		expect(hook).toContain("export function useHeaderToolbarCapacityPartition");
+		expect(hook).toContain("headerCapacity ?? (isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT");
+		// The saved-layout partition stays uncapped so measurement owns the cap.
+		expect(hook).toContain("visibleLimit: null,");
+		// Panel-level controller must not subscribe to capacity.
+		const controllerAt = hook.indexOf("export function useHeaderToolbar(");
+		const controllerBody = hook.slice(controllerAt);
+		expect(controllerBody).not.toContain("useNarratorHeaderToolbarCapacity");
 	});
 
 	it("keeps every registry entry at the width the constant assumes", async () => {
-		const source = await headerToolbar();
-		// HEADER_TOOLBAR_ITEM_WIDTH_PX is `ActionIcon size="sm"`. The registry loop
-		// renders one button per entry plus three special-cased controls; each must
-		// stay size="sm" or the arithmetic silently drifts.
-		const loopStart = source.indexOf("{toolbarVisibleDefs.map((def) => {");
-		const loopEnd = source.indexOf("TEMPORARY mock-stream harness", loopStart);
-		expect(loopStart).toBeGreaterThan(-1);
-		expect(loopEnd).toBeGreaterThan(loopStart);
-		const buttons = source.slice(loopStart, loopEnd).split("<ActionIcon").slice(1);
+		const toolbar = await headerToolbar();
+		expect(toolbar).toContain("toolbarVisibleDefs.map((def)");
+		expect(toolbar).toContain("<NarratorToolbarItem");
+		// The shared item renderer owns header and bottom icons. Keep the width
+		// invariant at its new host rather than scanning the former inline loop.
+		const source = await read("./header/NarratorToolbarItem.tsx");
+		const buttons = source.split("<ActionIcon").slice(1);
 		expect(buttons.length).toBeGreaterThan(0);
 		for (const button of buttons) {
 			expect(button.slice(0, 200)).toContain('size="sm"');
@@ -107,6 +113,37 @@ describe("header capacity measurement is wired to the DOM", () => {
 	});
 });
 
+describe("the overflow menu has three movable zones", () => {
+	it("keeps both boundaries droppable but never draggable", async () => {
+		const menu = await overflowMenu();
+		expect(menu).toContain('entry.kind === "bottom-divider"');
+		expect(menu).toContain("return NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID");
+		expect(menu).toContain("disabled: { draggable: true, droppable: false }");
+		expect(menu).toContain("id={entryId(entry)}");
+		expect(menu.indexOf('"toolbar.sectionBottom"')).toBeLessThan(menu.indexOf("{onArchive ?"));
+	});
+
+	it("passes the full layout to the tested reorder helper so hidden entries stay in their zones", async () => {
+		const menu = await overflowMenu();
+		expect(menu).toContain(
+			"onSaveLayout(moveToolbarEntry(entries, String(active.id), String(over.id)))",
+		);
+	});
+
+	it("excludes bottom icons from the fallback menu badge", async () => {
+		const menu = await overflowMenu();
+		expect(menu).toContain(".slice(dividerIndex + 1, bottomIndex < 0 ? undefined : bottomIndex)");
+	});
+
+	it("names the bottom section in both locales", async () => {
+		for (const locale of ["en", "zh-CN"]) {
+			const json = JSON.parse(await read(`../../locales/${locale}/narrator.json`));
+			expect(json.toolbar.sectionBottom).toBeTruthy();
+			if (locale === "zh-CN") expect(json.toolbar.sectionBottom).toBe("底部功能图标");
+		}
+	});
+});
+
 describe("entries collapsed for width stay accounted for", () => {
 	it("the overflow menu takes the hidden list from the header, not the divider", async () => {
 		const toolbar = await headerToolbar();
@@ -119,33 +156,21 @@ describe("entries collapsed for width stay accounted for", () => {
 		expect(menu).toContain("aggregateOverflowBadge(hiddenDefs ?? tuckedDefs, badgeCounts)");
 	});
 
-	/**
-	 * The width shortfall is stated ONCE under the section heading, not per row.
-	 * A per-row caption was the first attempt and it read badly: the header fits two
-	 * entries on a phone, so all nine remaining rows carried the same words, which
-	 * turned the caption into noise and buried the dimming that actually carries the
-	 * meaning. A future edit that re-adds a per-row hint would regress that quietly,
-	 * since nothing about it errors.
-	 */
-	it("states the width shortfall once per section, not once per row", async () => {
+	it("separates width-collapsed entries once without adding a sortable item", async () => {
 		const menu = await overflowMenu();
-		expect(menu).toContain('t("toolbar.someHiddenNoRoom")');
-		expect(menu).toContain("{anyNoRoom ?");
-		expect(menu).not.toContain("noRoomHint");
-
-		// The note is a property of the section, so it must be resolved from all
-		// surfaced entries rather than inside the row loop.
-		const noteAt = menu.indexOf('t("toolbar.someHiddenNoRoom")');
-		const loopAt = menu.indexOf("{listedEntries.map(");
-		expect(noteAt).toBeGreaterThan(-1);
-		expect(noteAt).toBeLessThan(loopAt);
+		expect(menu).toContain("listedEntries.findIndex(");
+		expect(menu).toContain("index === firstNoRoomIndex");
+		expect(menu).toContain('<Menu.Label>{t("toolbar.someHiddenNoRoom")}</Menu.Label>');
+		const boundaryAt = menu.indexOf("index === firstNoRoomIndex");
+		const rowAt = menu.indexOf("<SortableRow", boundaryAt);
+		expect(menu.slice(boundaryAt, rowAt)).toContain("<Menu.Divider />");
+		expect(menu).toContain("listedEntries.map(entryId)");
 	});
 
-	it("dimming is what marks a row as absent from the header", async () => {
+	it("keeps hidden entries normally colored rather than looking disabled", async () => {
 		const menu = await overflowMenu();
-		// With the caption gone this is the only per-row signal left, so losing it
-		// would make a collapsed entry indistinguishable from a surfaced one.
-		expect(menu).toContain('color: tucked ? "var(--mantine-color-dimmed)" : undefined');
+		expect(menu).not.toContain("color: tucked ?");
+		expect(menu).not.toContain("tucked={");
 	});
 
 	it("the section note exists in both locales", async () => {
@@ -199,8 +224,8 @@ describe("self-contained controls are reachable from the overflow menu", () => {
 		expect(start).toBeGreaterThan(-1);
 		const body = hook.slice(start);
 		// An unhandled id falls through to `null`, which silently restores the dead row.
-		for (const id of ["device", "lodlevel", "plugins"]) {
-			expect(body).toContain(`case "${id}":`);
+		for (const def of NARRATOR_TOOLBAR_ITEMS.filter((item) => item.selfContained)) {
+			expect(body).toContain(`case "${def.id}":`);
 		}
 	});
 
@@ -255,9 +280,20 @@ describe("the capacity hook observes only stable elements", () => {
 		const source = await capacityHook();
 		expect(source).toContain("requestAnimationFrame");
 		expect(source).toContain("useLayoutEffect");
-		// A zero budget means "not laid out yet". Reporting 0 would empty the row
-		// for a frame instead of waiting for the next observation.
-		expect(source).toContain("if (budgetWidth <= 0) return;");
+		// Only an unmeasured row waits; a measured row with zero icon budget collapses.
+		expect(source).toContain("if (row.getBoundingClientRect().width <= 0) return;");
+		expect(source).not.toContain("if (budgetWidth <= 0) return;");
+	});
+
+	it("re-measures and re-observes when the DOM mounts after the skeleton", async () => {
+		const source = await capacityHook();
+		// The panel-level controller runs above the skeleton early-return, so the
+		// first effect pass sees null refs. Without a readiness gate the observer
+		// never registers when the real header appears — capacity stays null forever.
+		expect(source).toContain("const [refsReady, setRefsReady] = useState(false)");
+		expect(source).toContain("if (rowRef.current && !refsReady) setRefsReady(true)");
+		expect(source).toContain("if (!refsReady) return;");
+		expect(source).toContain("[enabled, refsReady, rowRef, leadingRef, scheduleMeasure]");
 	});
 
 	it("drops the hysteresis baseline when the entry set changes", async () => {
