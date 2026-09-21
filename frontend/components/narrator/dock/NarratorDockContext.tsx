@@ -211,7 +211,18 @@ export interface NarratorDockContextValue {
 	openKnowledgePanel?: (entryId: string, scope?: KnowledgeEntryScope) => void;
 	/** Close a tool panel if present. */
 	closeToolPanel: (type: NarratorToolPanelType) => void;
-	/** Toggle a tool panel open/closed. */
+	/**
+	 * Toggle a tool panel from the header toolbar.
+	 *
+	 * - Closed → open.
+	 * - Open but not the active tab → focus it (bring that tab to the front).
+	 * - Open and already the active tab → close.
+	 *
+	 * The middle case is load-bearing: tool panels stack as tabs beside chat, so
+	 * "the panel is open" and "the reader is looking at it" are different states.
+	 * Closing on the first click whenever the panel merely exists would yank a
+	 * tab they were about to switch to.
+	 */
 	toggleToolPanel: (type: NarratorToolPanelType) => void;
 }
 
@@ -609,8 +620,17 @@ export function NarratorDockProvider({
 
 	const toggleToolPanel = useCallback(
 		(type: NarratorToolPanelType) => {
-			if (apiRef.current?.getPanel(dockPanelId(type))) closeToolPanel(type);
-			else openToolPanel(type);
+			const existing = apiRef.current?.getPanel(dockPanelId(type));
+			if (!existing) {
+				openToolPanel(type);
+				return;
+			}
+			// Open-but-not-front: reveal the existing tab instead of closing it.
+			if (!existing.api.isActive) {
+				existing.api.setActive();
+				return;
+			}
+			closeToolPanel(type);
 		},
 		[openToolPanel, closeToolPanel],
 	);

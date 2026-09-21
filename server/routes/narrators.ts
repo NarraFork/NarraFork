@@ -305,6 +305,7 @@ import {
 	listAllOpenAsyncQuestionsForPrincipal,
 	listAsyncQuestions,
 } from "../services/narrator-question-service";
+import { dbTransactionWithSeqFloor } from "../services/narrator-refs/seq-floor-tx";
 import { claimShiftInsertSlot } from "../services/narrator-refs/seq-store";
 import {
 	requireSqliteLazyRefsBackfill,
@@ -4932,8 +4933,23 @@ narratorRoutes.post("/:id/generate-title", async (c) => {
 // Archive narrator
 narratorRoutes.patch("/:id/archive", async (c) => {
 	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	if (narrator.type === "subagent" || narrator.variant?.startsWith("subagent:")) {
+		// Same retire path as Agent archive / history-delete card removal.
+		const { interruptAndArchiveSubagent } = await import("../services/subagent-lifecycle");
+		const result = await interruptAndArchiveSubagent(id);
+		if (!result.ok && result.error === "not_found") {
+			// Row vanished between getById and the lifecycle re-read (race delete).
+			throw new NotFoundError("Narrator", id);
+		}
+		if (!result.ok && result.error) {
+			// Fall through to the legacy path for non-subagent-shaped failures.
+			if (isNarratorActive(id)) closeNarrator(id);
+			await narratorService.updateStatus(id, "archived");
+		}
+		return c.json({ ok: true });
+	}
 	if (isNarratorActive(id)) closeNarrator(id);
-	await narratorService.getById(id);
 	await narratorService.updateStatus(id, "archived");
 	return c.json({ ok: true });
 });
@@ -5000,6 +5016,20 @@ narratorRoutes.post("/:id/fork", async (c) => {
 	return c.json(publicNarratorResponse(newNarrator), 201);
 });
 
+// Extract a subagent into an independent primary narrator (not fork — control-plane promotion)
+narratorRoutes.post("/:id/extract-primary", async (c) => {
+	const id = c.req.param("id");
+	const body = await c.req.json().catch(() => ({}));
+	const { extractPrimarySchema } = await import("../lib/validators");
+	const parsed = extractPrimarySchema.parse(body ?? {});
+	const newNarrator = await narratorService.extractSubagentToPrimary(id, {
+		title: parsed.title,
+		inheritMode: parsed.inheritMode ?? "full",
+		locale: parsed.locale ?? "en",
+	});
+	return c.json({ type: "extracted", narrator: publicNarratorResponse(newNarrator) }, 201);
+});
+
 // === Ask in passing ===
 
 type AskInPassingPendingBlock = {
@@ -5058,7 +5088,7 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 
 	const now = new Date().toISOString();
 	const msgId = generateId();
-	const msg = db.transaction((tx) => {
+	const msg = dbTransactionWithSeqFloor(id, (tx) => {
 		const insertedMsg = tx
 			.insert(narratorMessages)
 			.values({

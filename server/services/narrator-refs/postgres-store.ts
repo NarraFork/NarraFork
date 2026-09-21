@@ -11,6 +11,13 @@ import {
 } from "../../db/postgres-schema";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
+import { isNarratorSeqFloorHealed, markNarratorSeqFloorHealed } from "./seq-store";
+
+/** After a PG write section commits: mark this process as having raised the narrator floor. */
+export function markPgNarratorSeqFloorHealed(narratorId: string): void {
+	markNarratorSeqFloorHealed(narratorId);
+}
+
 import type {
 	NarratorMessageRefsPort,
 	RefMessage,
@@ -69,6 +76,11 @@ export async function lockPgNarratorRefs(tx: PgNarratorRefsTx, ids: string[]): P
 	}
 }
 
+/**
+ * Pure counter claim. Floor repair is the choke point's job: call
+ * `initializePgRefSeqFloor` in the same transaction when unhealed, and
+ * `markNarratorSeqFloorHealed` only after that transaction commits.
+ */
 export async function claimNextPgRefSeq(tx: PgNarratorRefsTx, narratorId: string): Promise<number> {
 	const [row] = await tx
 		.update(narrators)
@@ -79,12 +91,25 @@ export async function claimNextPgRefSeq(tx: PgNarratorRefsTx, narratorId: string
 	return row.nextSeq - 1;
 }
 
+/** In-tx floor raise for unhealed narrators (caller marks after commit). */
+export async function raisePgSeqFloorForClaim(
+	tx: PgNarratorRefsTx,
+	narratorId: string,
+): Promise<void> {
+	if (isNarratorSeqFloorHealed(narratorId)) return;
+	await initializePgRefSeqFloor(tx, narratorId);
+}
+
 export async function claimPgShiftInsertSlot(
 	tx: PgNarratorRefsTx,
 	narratorId: string,
 	fromSeq: number,
 ): Promise<void> {
 	seqValue(fromSeq);
+	// Floor first (same contract as SQLite claimShiftInsertSlot): shift + greatest
+	// next_seq/fromSeq alone does not guarantee next_seq > historical MAX(refs.seq).
+	// Callers that already raised in this section hit the healed/in-tx no-op path.
+	await raisePgSeqFloorForClaim(tx, narratorId);
 	await tx
 		.update(narrators)
 		.set({ nextSeq: sql`greatest(${narrators.nextSeq}, ${fromSeq})` })
@@ -123,6 +148,8 @@ export interface PgPersistedMessageRef {
 	refId: string;
 	seq: number;
 	message: RefMessage;
+	/** True when this section raised the narrator seq floor; mark healed after commit. */
+	needsSeqFloorMark?: boolean;
 }
 
 /**
@@ -162,6 +189,9 @@ export async function persistPgMessageWithRef(
 				.limit(1)
 		: [];
 	await lockPgNarratorRefs(tx, [message.narratorId, ...(parent ? [parent.narratorId] : [])]);
+	// First-write floor repair when the process has not healed this narrator yet.
+	const needsFloor = !isNarratorSeqFloorHealed(message.narratorId);
+	if (needsFloor) await initializePgRefSeqFloor(tx, message.narratorId);
 	let seq: number;
 	if (options.beforeMessageId !== undefined) {
 		const [target] = await tx
@@ -201,6 +231,8 @@ export async function persistPgMessageWithRef(
 		refId,
 		seq,
 		message: { ...created, role: message.role, origin: message.origin ?? null, seq },
+		/** Caller must mark healed only after this section's transaction commits. */
+		needsSeqFloorMark: needsFloor,
 	};
 }
 
@@ -241,6 +273,9 @@ export function createPostgresNarratorMessageRefsPort(db: BunSQLDatabase): Narra
 				...(beforeMessageId === undefined ? {} : { beforeMessageId }),
 				bumpMessageVersion: options?.bumpMessageVersion !== false,
 			});
+			return persisted;
+		}).then((persisted) => {
+			if (persisted.needsSeqFloorMark) markNarratorSeqFloorHealed(message.narratorId);
 			return persisted.message;
 		});
 	}
@@ -369,6 +404,7 @@ export function createPostgresNarratorMessageRefsPort(db: BunSQLDatabase): Narra
 				return {
 					copied,
 					nextSeq,
+					needsSeqFloorMark: true,
 					nextCursor:
 						rows.length > limit && last
 							? {
@@ -379,6 +415,9 @@ export function createPostgresNarratorMessageRefsPort(db: BunSQLDatabase): Narra
 								}
 							: null,
 				};
+			}).then((result) => {
+				if (result.needsSeqFloorMark) markNarratorSeqFloorHealed(input.targetId);
+				return result;
 			});
 		},
 		async page(narratorId, cursor, requestedLimit = 100, options) {

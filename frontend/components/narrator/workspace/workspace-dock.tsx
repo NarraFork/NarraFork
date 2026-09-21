@@ -668,16 +668,25 @@ export class WorkspaceDockStore {
 		this.apiRef.current?.getPanel(workspaceToolPanelId(narratorId, type))?.api.close();
 	}
 
+	/**
+	 * Same contract as `NarratorDockContext.toggleToolPanel`: open if closed,
+	 * focus an open-but-background tab, close only when it is already active.
+	 */
 	toggleToolPanel(
 		narratorId: string,
 		type: NarratorToolPanelType,
 		chapterId: string | null | undefined,
 	) {
-		if (this.apiRef.current?.getPanel(workspaceToolPanelId(narratorId, type))) {
-			this.closeToolPanel(narratorId, type);
-		} else {
+		const existing = this.apiRef.current?.getPanel(workspaceToolPanelId(narratorId, type));
+		if (!existing) {
 			this.openToolPanel(narratorId, type, chapterId);
+			return;
 		}
+		if (!existing.api.isActive) {
+			existing.api.setActive();
+			return;
+		}
+		this.closeToolPanel(narratorId, type);
 	}
 }
 

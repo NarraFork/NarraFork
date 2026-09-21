@@ -1,3 +1,13 @@
+/**
+ * Reserved selectors a subagent can use to address the narrator that launched
+ * it (its parent). Matched case-insensitively before sibling alias resolution.
+ */
+export const PARENT_SELECTORS = new Set(["parent", "main", "@parent", "@main"]);
+
+export function isParentSelector(selector: string): boolean {
+	return PARENT_SELECTORS.has(selector.trim().toLowerCase());
+}
+
 /** Communication is conversation content, never a foldable activity/tool row. */
 export function isCommunicationTool(tool: { toolName: string; inputJson?: unknown }): boolean {
 	if (tool.toolName === "Send") return true;

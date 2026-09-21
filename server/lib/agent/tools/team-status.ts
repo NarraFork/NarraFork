@@ -113,7 +113,7 @@ export const teamStatusTool: ToolDefinition = {
 		'- "list_agents": List sibling subagents only\n' +
 		'- "list_bash": List background bash tasks only\n' +
 		'- "file_changes": Show files modified by each subagent (or a specific one via target_id)\n' +
-		'- "broadcast": Send a message to ALL direct subagents\n' +
+		'- "broadcast": Send a message to ALL direct subagents (archived subagents are excluded — they are never woken by @all members)\n' +
 		'- "send": Send a message to a specific direct subagent (requires target_id)\n\n' +
 		"Notes:\n" +
 		"- The primary narrator is the team root; subagents use their parent's team scope.\n" +
@@ -333,21 +333,27 @@ export const teamStatusTool: ToolDefinition = {
 				const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
 				const sender = await narratorService.getById(ctx.narratorId);
 				const siblings = await narratorService.listSubagentsByParent(parentNarratorId);
-				const targets = siblings.filter(
+				const teamMembers = siblings.filter(
 					(s: { id: string; variant?: string | null }) =>
 						s.id !== ctx.narratorId && s.variant?.startsWith("subagent:") === true,
 				);
+				// Archived members are retired: @all members must not deliver to them or
+				// wake them. Direct Send is separately rejected in agent-communication.
+				const archived = teamMembers.filter((s: { status: string }) => s.status === "archived");
+				const targets = teamMembers.filter((s: { status: string }) => s.status !== "archived");
 				if (targets.length === 0) {
 					const targetKind = ctx.parentNarratorId ? "sibling subagents" : "child subagents";
+					const archivedNote =
+						archived.length > 0 ? ` ${archived.length} archived subagent(s) were excluded.` : "";
 					return {
-						output: `No ${targetKind} to broadcast to.`,
+						output: `No ${targetKind} to broadcast to.${archivedNote}`,
 						metadata: {
 							kind: "send",
 							broadcast: true,
 							await: false,
 							targets: [],
 							targetCount: 0,
-							warning: `No ${targetKind} to broadcast to.`,
+							warning: `No ${targetKind} to broadcast to.${archivedNote}`,
 						},
 					};
 				}
@@ -380,8 +386,22 @@ export const teamStatusTool: ToolDefinition = {
 				let output = `Broadcast sent to ${targets.length} ${targetKind}: ${targets
 					.map((t) => agentLabelFromNarrator(t, parentNarratorId))
 					.join(", ")}`;
+				if (archived.length > 0) {
+					output += `\n(${archived.length} archived subagent(s) excluded — broadcast does not wake archived members)`;
+				}
 				if (nonWorking.length > 0) {
 					output += `\n(warning: ${nonWorking.length} target(s) not currently working — messages may not be received)`;
+				}
+				const warningParts: string[] = [];
+				if (archived.length > 0) {
+					warningParts.push(
+						`${archived.length} archived subagent(s) excluded — broadcast does not wake archived members`,
+					);
+				}
+				if (nonWorking.length > 0) {
+					warningParts.push(
+						`${nonWorking.length} target(s) not currently working — messages may not be received`,
+					);
 				}
 				return {
 					output,
@@ -389,11 +409,7 @@ export const teamStatusTool: ToolDefinition = {
 						kind: "send",
 						broadcast: true,
 						await: false,
-						...(nonWorking.length > 0
-							? {
-									warning: `${nonWorking.length} target(s) not currently working — messages may not be received`,
-								}
-							: {}),
+						...(warningParts.length > 0 ? { warning: warningParts.join("; ") } : {}),
 						targetCount: targets.length,
 						targets: targets.map((target) => ({
 							id: target.id,

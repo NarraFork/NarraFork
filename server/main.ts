@@ -1462,6 +1462,18 @@ void startupReadiness.barrier.then((recovery) => {
 	}
 	if (!shouldStartGatedBackgroundWork(recovery)) return;
 	startScheduledTaskScheduler();
+	// Stale never-started tool rows (e.g. a subagent Send stuck pending for days)
+	// must not keep update checkpoint scans or UI recovery cards looking "busy".
+	import("./services/abandoned-tool-cleanup")
+		.then(({ cleanupAbandonedToolCalls }) => cleanupAbandonedToolCalls())
+		.then((result) => {
+			if (result.cleaned > 0) {
+				logger.info("Startup abandoned tool-call cleanup finished", result);
+			}
+		})
+		.catch((err) => {
+			logger.warn("Startup abandoned tool-call cleanup failed", { error: String(err) });
+		});
 });
 
 // Backfill legacy RecentTabs in bounded background batches. Membership consumers await this

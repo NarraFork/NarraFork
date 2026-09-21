@@ -333,6 +333,13 @@ function planDerivedHistoryCleanup(
 	const pending = seeds.map((seed) => ({ ...seed, depth: 0 }));
 	const seenCalls = new Set<string>();
 	const seenMessages = new Set(explicitMessageIds);
+	/**
+	 * Subagents whose origin Agent/Task tool call is part of this deletion.
+	 * Their card is disappearing from the parent timeline, so they must be
+	 * interrupted and archived after the history mutation commits — even when
+	 * their own messages are retained (shared_parent / referenced).
+	 */
+	const subagentNarratorIds: string[] = [];
 	const childNarratorsByParent = new Map<
 		string,
 		Array<{ id: string; type: string; variant: string; originToolCallId: string | null }>
@@ -408,6 +415,10 @@ function planDerivedHistoryCleanup(
 				continue;
 			}
 			if (child.originToolCallId !== call.id) continue;
+			// Proven ancestry: this card is being deleted, so retire the subagent.
+			// Collected before message retention checks — a referenced/shared child
+			// still must not keep waking from @all members after its card is gone.
+			if (!subagentNarratorIds.includes(child.id)) subagentNarratorIds.push(child.id);
 			if (depth >= 32)
 				throw new AppError(
 					"Derived history exceeds the nesting safety budget",
@@ -479,7 +490,7 @@ function planDerivedHistoryCleanup(
 			}
 		}
 	}
-	return { messageIds, toolCallIds, checkpoints, warnings, observations };
+	return { messageIds, toolCallIds, checkpoints, warnings, observations, subagentNarratorIds };
 }
 
 function assertNoRunningCompactMessagesTx(tx: MessageTx, messageIds: string[]) {
@@ -973,6 +984,13 @@ async function deleteBlockSelection(
 			deletedMessageIds,
 		});
 	}
+	// Card removal retires its subagent(s): interrupt running work and archive so
+	// TeamStatus broadcast (@all members) no longer wakes them. Best-effort after
+	// the history mutation — a lifecycle failure must not undo a committed delete.
+	if (planned.derived.subagentNarratorIds.length > 0) {
+		const { archiveRetiredSubagents } = await import("./subagent-lifecycle");
+		await archiveRetiredSubagents(planned.derived.subagentNarratorIds);
+	}
 	const results = planned.plans.flatMap(({ message, indices, remaining }) =>
 		indices.map((blockIndex) => ({
 			messageId: message.id,
@@ -986,6 +1004,9 @@ async function deleteBlockSelection(
 		results,
 		...(snapshotRevert?.warnings?.length ? { revertWarnings: snapshotRevert.warnings } : {}),
 		...(planned.derived.warnings.length ? { historyWarnings: planned.derived.warnings } : {}),
+		...(planned.derived.subagentNarratorIds.length
+			? { archivedSubagentIds: planned.derived.subagentNarratorIds }
+			: {}),
 	};
 }
 
@@ -1452,11 +1473,19 @@ async function deleteMessageRange(
 		);
 		revertWarnings = result.warnings ?? [];
 	}
+	// Same retire rule as block delete: a removed Agent/Task card archives its subagent.
+	if (planned.derived.subagentNarratorIds.length > 0) {
+		const { archiveRetiredSubagents } = await import("./subagent-lifecycle");
+		await archiveRetiredSubagents(planned.derived.subagentNarratorIds);
+	}
 	return {
 		deletedCount: planned.refs.length,
 		deletedMessageIds: messageIds,
 		revertWarnings,
 		...(planned.derived.warnings.length ? { historyWarnings: planned.derived.warnings } : {}),
+		...(planned.derived.subagentNarratorIds.length
+			? { archivedSubagentIds: planned.derived.subagentNarratorIds }
+			: {}),
 	};
 }
 
@@ -4249,6 +4278,7 @@ const narratorMessageQueriesUnlocked = {
 		return {
 			deletedCount: result.deletedCount,
 			...(result.historyWarnings ? { historyWarnings: result.historyWarnings } : {}),
+			...(result.archivedSubagentIds ? { archivedSubagentIds: result.archivedSubagentIds } : {}),
 		};
 	},
 
@@ -4635,6 +4665,7 @@ const narratorMessageQueriesUnlocked = {
 		return {
 			messageDeleted: result.results[0]?.messageDeleted ?? false,
 			...(result.historyWarnings ? { historyWarnings: result.historyWarnings } : {}),
+			...(result.archivedSubagentIds ? { archivedSubagentIds: result.archivedSubagentIds } : {}),
 		};
 	},
 

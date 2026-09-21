@@ -19,6 +19,7 @@ import {
 import type { LegacyCompletionAdmission } from "./agent-runtime/publication-outbox";
 import type { CompletedNotification } from "./background-task-service";
 import type { CompletedBgSubagentNotification } from "./bg-completion-queue";
+import { dbTransactionWithSeqFloor } from "./narrator-refs/seq-floor-tx";
 import { claimNextRefSeq } from "./narrator-refs/seq-store";
 import type { ParentInboundMessage } from "./parent-inbound-queue";
 
@@ -90,7 +91,7 @@ function persistUnboundLegacyAgentMessage(
 	narratorId: string,
 	entry: Extract<PendingInjection, { kind: "subagent_message" }>,
 ): void {
-	db.transaction((tx) => {
+	dbTransactionWithSeqFloor(narratorId, (tx) => {
 		const messageId = generateId();
 		const text = `旧代理消息无法绑定工具执行 / Legacy agent message has no exact execution receipt. It was not resent.\nSender: ${entry.message.fromId}\n${entry.message.text.slice(0, 8000)}`;
 		tx.insert(narratorMessages)

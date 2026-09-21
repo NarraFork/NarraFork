@@ -1807,6 +1807,18 @@ export const narratorsApi = {
 			`/narrators/${narratorId}/promote`,
 			{ method: "POST" },
 		),
+	/** Extract a subagent into an independent primary narrator (control-plane promotion). */
+	extractSubagentToPrimary: (
+		narratorId: string,
+		opts?: { title?: string; inheritMode?: "full" | "compressed"; locale?: "en" | "zh-CN" },
+	) =>
+		request<{ type: "extracted"; narrator: ApiEntity }>(
+			`/narrators/${narratorId}/extract-primary`,
+			{
+				method: "POST",
+				body: JSON.stringify(opts ?? {}),
+			},
+		),
 	forkFromMessages: (narratorId: string, messageIds: string[], title?: string) =>
 		request<ApiEntity>(`/narrators/${narratorId}/fork-messages`, {
 			method: "POST",

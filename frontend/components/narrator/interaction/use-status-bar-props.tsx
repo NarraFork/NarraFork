@@ -40,6 +40,7 @@ export interface UseStatusBarPropsOptions {
 	tasks: NarratorInteractionStatusBarProps["tasks"];
 	terminal: NarratorInteractionStatusBarProps["terminal"];
 	promote: NarratorInteractionStatusBarProps["promote"];
+	extractPrimary?: NarratorInteractionStatusBarProps["extractPrimary"];
 	relaxedPlan: NarratorInteractionStatusBarProps["relaxedPlan"];
 	mobile: NarratorInteractionStatusBarProps["mobile"];
 
@@ -206,6 +207,7 @@ export function useStatusBarProps(
 		relaxedPlan: options.relaxedPlan,
 		terminal: options.terminal,
 		promote: options.promote,
+		extractPrimary: options.extractPrimary,
 		mobile: options.mobile,
 	};
 }

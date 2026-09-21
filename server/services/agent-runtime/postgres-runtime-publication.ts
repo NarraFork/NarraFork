@@ -77,6 +77,7 @@ import { logger } from "../../lib/logger";
 import type { RefMessageInput } from "../narrator-refs/port";
 import {
 	lockPgNarratorRefs,
+	markPgNarratorSeqFloorHealed,
 	type PgPersistedMessageRef,
 	persistPgMessageWithRef,
 } from "../narrator-refs/postgres-store";
@@ -446,15 +447,25 @@ export function createPostgresRuntimePublication(
 	 * deterministic per run, so the post-lock pre-check skips the insert when a
 	 * previous composite already committed it, exactly mirroring the SQLite
 	 * `onConflictDoNothing` + conditional-ref shape.
+	 *
+	 * `needsSeqFloorMark` is true only when THIS section raised the narrator seq
+	 * floor via `persistPgMessageWithRef`. Early-returns (bash pointer, replay of an
+	 * already-committed snapshot) must not mark the process as healed — that would
+	 * skip repair on a lagging `next_seq` and hand out colliding seqs later.
 	 */
 	async function persistResultSection(
 		tx: PgRuntimeTx,
 		run: PublicationRun,
 		text: string,
-	): Promise<string> {
+	): Promise<{ resultRef: string; needsSeqFloorMark: boolean }> {
 		// Bash has one durable task per actual attempt; its output is already normalized
 		// to the existing 512 KiB budget. Never copy raw stdout into a message row.
-		if (run.producerKind === "bash") return `background_task:${run.taskId}:${run.logicalRunId}`;
+		if (run.producerKind === "bash") {
+			return {
+				resultRef: `background_task:${run.taskId}:${run.logicalRunId}`,
+				needsSeqFloorMark: false,
+			};
+		}
 		const messageId = `publication-result:${run.logicalRunId}`;
 		const narratorId = run.producerKind === "agent" ? run.taskId : run.recipientId;
 		// Lock before the existence pre-check: a concurrent same-run composite commits
@@ -465,7 +476,9 @@ export function createPostgresRuntimePublication(
 			.from(messages)
 			.where(eq(messages.id, messageId))
 			.limit(1);
-		if (existing[0]) return `message-original:${messageId}`;
+		if (existing[0]) {
+			return { resultRef: `message-original:${messageId}`, needsSeqFloorMark: false };
+		}
 		const source = await tx
 			.select({ resultRef: outbox.resultRef })
 			.from(outbox)
@@ -518,7 +531,10 @@ export function createPostgresRuntimePublication(
 		};
 		const persisted: PgPersistedMessageRef = await persistPgMessageWithRef(tx, message);
 		if (!persisted.messageId) throw new Error("Result snapshot persisted without a message id");
-		return `message-original:${messageId}`;
+		return {
+			resultRef: `message-original:${messageId}`,
+			needsSeqFloorMark: persisted.needsSeqFloorMark === true,
+		};
 	}
 
 	return {
@@ -676,7 +692,13 @@ export function createPostgresRuntimePublication(
 		/** The result snapshot as its own section (the composite terminals embed it). */
 		async persistResult(run: PublicationRun, text: string): Promise<string> {
 			if (run.producerKind === "bash") return `background_task:${run.taskId}:${run.logicalRunId}`;
-			return runComposite("publication.persistResult", (tx) => persistResultSection(tx, run, text));
+			const narratorId = run.producerKind === "agent" ? run.taskId : run.recipientId;
+			const section = await runComposite("publication.persistResult", (tx) =>
+				persistResultSection(tx, run, text),
+			);
+			// Commit-then-mark only when this composite actually raised the floor.
+			if (section.needsSeqFloorMark) markPgNarratorSeqFloorHealed(narratorId);
+			return section.resultRef;
 		},
 
 		/** A single intent commit (started events and caller-supplied resultRefs). */
@@ -690,15 +712,18 @@ export function createPostgresRuntimePublication(
 		async commitAgentTerminal(input: PgTerminalCommitInput): Promise<PgPublicationCommitResult> {
 			if (input.run.producerKind !== "agent")
 				throw new Error("Agent terminal commit requires an agent run");
-			return runComposite("publication.commitAgentTerminal", async (tx) => {
-				const resultRef = await persistResultSection(tx, input.run, input.text);
-				return primitives.commitIntent(tx, {
+			const composite = await runComposite("publication.commitAgentTerminal", async (tx) => {
+				const section = await persistResultSection(tx, input.run, input.text);
+				const commit = await primitives.commitIntent(tx, {
 					...input.run,
 					eventKind: input.eventKind,
-					resultRef,
+					resultRef: section.resultRef,
 					summary: summarize(input.summary),
 				});
+				return { commit, needsSeqFloorMark: section.needsSeqFloorMark };
 			});
+			if (composite.needsSeqFloorMark) markPgNarratorSeqFloorHealed(input.run.taskId);
+			return composite.commit;
 		},
 
 		/** Bash terminal: the pointer resultRef + terminal intent, atomically. */
@@ -706,11 +731,11 @@ export function createPostgresRuntimePublication(
 			if (input.run.producerKind !== "bash")
 				throw new Error("Bash terminal commit requires a bash run");
 			return runComposite("publication.commitBashTerminal", async (tx) => {
-				const resultRef = await persistResultSection(tx, input.run, input.text);
+				const section = await persistResultSection(tx, input.run, input.text);
 				return primitives.commitIntent(tx, {
 					...input.run,
 					eventKind: input.eventKind,
-					resultRef,
+					resultRef: section.resultRef,
 					summary: summarize(input.summary),
 				});
 			});
@@ -758,7 +783,11 @@ export function createPostgresRuntimePublication(
 									taskId: input.source.taskId,
 									reason: registration.reason,
 								});
-								return "diagnostic" as const;
+								return {
+									kind: "diagnostic" as const,
+									narratorId: input.recipientId,
+									needsSeqFloorMark: false,
+								};
 							}
 							const messageId = `legacy-publication-diagnostic:${input.recipientId}:${input.source.producerKind}:${input.source.taskId}`;
 							const existing = await tx
@@ -766,6 +795,7 @@ export function createPostgresRuntimePublication(
 								.from(messages)
 								.where(eq(messages.id, messageId))
 								.limit(1);
+							let needsSeqFloorMark = false;
 							if (!existing[0]) {
 								const text = summarize(
 									`Legacy task notification could not be migrated (${input.source.taskId}): ${registration.reason}. No task was rerun.`,
@@ -779,25 +809,39 @@ export function createPostgresRuntimePublication(
 									contentJson: [{ type: "text", text }],
 									createdAt: new Date().toISOString(),
 								};
-								await persistPgMessageWithRef(tx, message);
+								const persisted = await persistPgMessageWithRef(tx, message);
+								needsSeqFloorMark = persisted.needsSeqFloorMark === true;
 							}
-							return "diagnostic" as const;
+							return {
+								kind: "diagnostic" as const,
+								narratorId: input.recipientId,
+								needsSeqFloorMark,
+							};
 						}
-						const resultRef = await persistResultSection(tx, registration.run, input.resultText);
+						const section = await persistResultSection(tx, registration.run, input.resultText);
 						await primitives.commitIntent(tx, {
 							...registration.run,
 							eventKind: registration.eventKind,
-							resultRef,
+							resultRef: section.resultRef,
 							summary: summarize(input.summary),
 						});
-						return "migrated" as const;
+						return {
+							kind: "migrated" as const,
+							narratorId:
+								registration.run.producerKind === "agent"
+									? registration.run.taskId
+									: input.recipientId,
+							needsSeqFloorMark: section.needsSeqFloorMark,
+						};
 					},
 					{ legacyReplay: true },
 				);
 				// Post-commit evidence freeze, mirroring the queue's standalone operation:
 				// never inside the replayable section, only after it committed.
+				// Floor heal is also post-commit, and only when the section raised it.
+				if (status.needsSeqFloorMark) markPgNarratorSeqFloorHealed(status.narratorId);
 				if (input.admission) primitives.freezeLegacyCompletionEvidence(input.admission);
-				return status;
+				return status.kind;
 			} finally {
 				release();
 				if (token && completionMigrationLocks.get(token) === tail)
@@ -880,6 +924,7 @@ export function createPostgresRuntimePublication(
 		 * + terminal intent atomically.
 		 */
 		async updateNarratorBackground(input: PgUpdateNarratorBackgroundInput): Promise<void> {
+			const raisedFloorNarratorIds = new Set<string>();
 			await runComposite("publication.updateNarratorBackground", async (tx) => {
 				const [updated] = await tx
 					.update(narrators)
@@ -912,15 +957,19 @@ export function createPostgresRuntimePublication(
 								},
 							);
 					const eventKind = input.backgroundStatus === "completed" ? "completed" : "failed";
-					const resultRef = await persistResultSection(tx, run, input.backgroundResult);
+					const section = await persistResultSection(tx, run, input.backgroundResult);
+					if (section.needsSeqFloorMark) {
+						raisedFloorNarratorIds.add(run.taskId);
+					}
 					await primitives.commitIntent(tx, {
 						...run,
 						eventKind,
-						resultRef,
+						resultRef: section.resultRef,
 						summary: `[System] Background agent (ID: ${input.narratorId}) ${input.backgroundStatus}. Use Await({ type: "agent", id: "${input.narratorId}" }) to read its stored result.`,
 					});
 				}
 			});
+			for (const id of raisedFloorNarratorIds) markPgNarratorSeqFloorHealed(id);
 		},
 
 		/**
@@ -945,7 +994,8 @@ export function createPostgresRuntimePublication(
 			  }
 			| undefined
 		> {
-			return runComposite("publication.commitTerminalTransition", async (tx) => {
+			const raisedFloorNarratorIds = new Set<string>();
+			const result = await runComposite("publication.commitTerminalTransition", async (tx) => {
 				const [task] = await tx
 					.update(backgroundTasks)
 					.set(input.setFields)
@@ -975,15 +1025,20 @@ export function createPostgresRuntimePublication(
 					logicalRunId: task.logicalRunId,
 					recipientId: task.parentNarratorId,
 				};
-				const resultRef = await persistResultSection(tx, run, input.fullOutput);
+				const section = await persistResultSection(tx, run, input.fullOutput);
+				if (section.needsSeqFloorMark) {
+					raisedFloorNarratorIds.add(run.producerKind === "agent" ? run.taskId : run.recipientId);
+				}
 				await primitives.commitIntent(tx, {
 					...run,
 					eventKind: input.eventKind,
-					resultRef,
+					resultRef: section.resultRef,
 					summary: summarize(input.summary),
 				});
 				return task;
 			});
+			for (const id of raisedFloorNarratorIds) markPgNarratorSeqFloorHealed(id);
+			return result;
 		},
 
 		/**
@@ -993,7 +1048,8 @@ export function createPostgresRuntimePublication(
 		 * `runAtomicWrite` recovery block.
 		 */
 		async recoverStaleTask(input: PgRecoverStaleTaskInput) {
-			return runComposite("publication.recoverStaleTask", async (tx) => {
+			const raisedFloorNarratorIds = new Set<string>();
+			const result = await runComposite("publication.recoverStaleTask", async (tx) => {
 				const [task] = await tx
 					.update(backgroundTasks)
 					.set({
@@ -1048,15 +1104,20 @@ export function createPostgresRuntimePublication(
 								{ kind: "persisted_task" },
 								{},
 							);
-				const resultRef = await persistResultSection(tx, run, input.text);
+				const section = await persistResultSection(tx, run, input.text);
+				if (section.needsSeqFloorMark) {
+					raisedFloorNarratorIds.add(run.producerKind === "agent" ? run.taskId : run.recipientId);
+				}
 				await primitives.commitIntent(tx, {
 					...run,
 					eventKind: input.eventKind,
-					resultRef,
+					resultRef: section.resultRef,
 					summary: summarize(input.text),
 				});
 				return task;
 			});
+			for (const id of raisedFloorNarratorIds) markPgNarratorSeqFloorHealed(id);
+			return result;
 		},
 
 		/** Pause a stale transfer projection without touching the SQLite handle. */
@@ -1214,7 +1275,8 @@ export function createPostgresRuntimePublication(
 		 * The caller owns in-memory side effects (abort controller, event bus).
 		 */
 		async cancelTask(input: PgCancelTaskInput): Promise<PgCancelTaskResult | null> {
-			return runComposite("publication.cancelTask", async (tx) => {
+			const raisedFloorNarratorIds = new Set<string>();
+			const result = await runComposite("publication.cancelTask", async (tx) => {
 				const [existing] = await tx
 					.select({
 						id: backgroundTasks.id,
@@ -1276,15 +1338,18 @@ export function createPostgresRuntimePublication(
 						logicalRunId: existing.logicalRunId,
 						recipientId: existing.parentNarratorId,
 					};
-					const resultRef = await persistResultSection(
+					const section = await persistResultSection(
 						tx,
 						run,
 						input.capturedOutput ?? "(cancelled)",
 					);
+					if (section.needsSeqFloorMark) {
+						raisedFloorNarratorIds.add(run.producerKind === "agent" ? run.taskId : run.recipientId);
+					}
 					await primitives.commitIntent(tx, {
 						...run,
 						eventKind: "cancelled",
-						resultRef,
+						resultRef: section.resultRef,
 						summary: summarize(
 							`[System] Background ${existing.type} cancelled. Use Await({ type: "${existing.type}", id: "${existing.alias ?? existing.id}" }) to read the stored result.`,
 						),
@@ -1292,6 +1357,8 @@ export function createPostgresRuntimePublication(
 				}
 				return updated;
 			});
+			for (const id of raisedFloorNarratorIds) markPgNarratorSeqFloorHealed(id);
+			return result;
 		},
 
 		/**
@@ -1368,7 +1435,8 @@ export function createPostgresRuntimePublication(
 		async finalizeTakeover(
 			input: PgFinalizeTakeoverInput,
 		): Promise<{ parentNarratorId: string; id: string } | null> {
-			return runComposite("publication.finalizeTakeover", async (tx) => {
+			const raisedFloorNarratorIds = new Set<string>();
+			const result = await runComposite("publication.finalizeTakeover", async (tx) => {
 				const outputBytes = Buffer.byteLength(input.output, "utf-8");
 				const truncated = outputBytes > MAX_OUTPUT_BYTES;
 				const storedOutput = truncated
@@ -1412,17 +1480,22 @@ export function createPostgresRuntimePublication(
 									registrations.legacyReaders.get(admittedSource.producerKind)?.(admittedSource),
 							},
 						);
-				const resultRef = await persistResultSection(tx, run, input.output);
+				const section = await persistResultSection(tx, run, input.output);
+				if (section.needsSeqFloorMark) {
+					raisedFloorNarratorIds.add(run.producerKind === "agent" ? run.taskId : run.recipientId);
+				}
 				await primitives.commitIntent(tx, {
 					...run,
 					eventKind: input.hasError ? "failed" : "completed",
-					resultRef,
+					resultRef: section.resultRef,
 					summary: summarize(
 						`[System] Background agent "${updated.title ?? updated.alias ?? updated.id}" (ID: ${updated.alias ?? updated.id}) ${terminalStatus}. Use Await({ type: "agent", id: "${updated.alias ?? updated.id}" }) to read the stored result.`,
 					),
 				});
 				return { id: updated.id, parentNarratorId: updated.parentNarratorId };
 			});
+			for (const id of raisedFloorNarratorIds) markPgNarratorSeqFloorHealed(id);
+			return result;
 		},
 	};
 }

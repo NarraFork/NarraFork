@@ -53,10 +53,12 @@ import { createFileChangeExecutionSegmentsService } from "./file-change-executio
 import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
 import { type PgNarratorRefsTx, persistPgMessageWithRef } from "./narrator-refs/postgres-store";
+import { dbTransactionWithSeqFloor } from "./narrator-refs/seq-floor-tx";
 import {
 	claimNextRefSeq,
 	claimShiftInsertSlot,
 	initializeRefSeqFloor,
+	raiseSeqFloorForClaim,
 } from "./narrator-refs/seq-store";
 import { assertSqliteNarratorOperation, getNarratorMessageRefsPort } from "./narrator-refs/store";
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
@@ -582,7 +584,7 @@ async function insertMessageRef(
 	assertSqliteNarratorOperation("insertMessageRef");
 	await withDbRetry(
 		async () =>
-			db.transaction((tx) => {
+			dbTransactionWithSeqFloor(narratorId, (tx) => {
 				tx.insert(narratorMessageRefs)
 					.values({ id: generateId(), narratorId, messageId, seq, isCompact })
 					.run();
@@ -617,6 +619,7 @@ function appendMessageRefSync(
 	bumpMessageVersion = true,
 ): number {
 	// The shared next_seq authority; the synchronous counter claim rolls back with this ref.
+	raiseSeqFloorForClaim(tx, narratorId);
 	const seq = claimNextRefSeq(tx, narratorId);
 
 	tx.insert(narratorMessageRefs)
@@ -655,7 +658,10 @@ async function appendMessageRef(
 ): Promise<number> {
 	assertSqliteNarratorOperation("appendMessageRef");
 	return withDbRetry(
-		async () => db.transaction((tx) => appendMessageRefSync(tx, narratorId, messageId, isCompact)),
+		async () =>
+			dbTransactionWithSeqFloor(narratorId, (tx) =>
+				appendMessageRefSync(tx, narratorId, messageId, isCompact),
+			),
 		{ label: "appendMessageRef", maxRetries: 5 },
 	);
 }
@@ -1364,7 +1370,7 @@ const sqliteNarratorPersistence = {
 
 		return withDbRetry(
 			async () =>
-				db.transaction((tx) => {
+				dbTransactionWithSeqFloor(narratorId, (tx) => {
 					let seq: number;
 					if (beforeMessageId) {
 						const targetRef = tx.query.narratorMessageRefs
@@ -1502,7 +1508,7 @@ const sqliteNarratorPersistence = {
 		const id = generateId();
 		const now = new Date().toISOString();
 
-		const { msg, seq } = db.transaction((tx) => {
+		const { msg, seq } = dbTransactionWithSeqFloor(narratorId, (tx) => {
 			const msg = tx
 				.insert(narratorMessages)
 				.values({
@@ -1547,7 +1553,7 @@ const sqliteNarratorPersistence = {
 		const id = generateId();
 		const now = new Date().toISOString();
 
-		const { msg, seq } = db.transaction((tx) => {
+		const { msg, seq } = dbTransactionWithSeqFloor(narratorId, (tx) => {
 			const msg = tx
 				.insert(narratorMessages)
 				.values({
@@ -1596,7 +1602,7 @@ const sqliteNarratorPersistence = {
 		const id = generateId();
 		const now = new Date().toISOString();
 
-		const { msg, seq } = db.transaction((tx) => {
+		const { msg, seq } = dbTransactionWithSeqFloor(narratorId, (tx) => {
 			const targetRef = tx.query.narratorMessageRefs
 				.findFirst({
 					where: and(
@@ -2620,7 +2626,7 @@ const sqliteNarratorPersistence = {
 					// single authority in narrator-refs/seq-store.ts.)
 					await withDbRetry(
 						async () =>
-							db.transaction((tx) => {
+							dbTransactionWithSeqFloor(narratorId, (tx) => {
 								tx.insert(narratorMessages)
 									.values({
 										id: msgId,
@@ -3815,7 +3821,7 @@ const sqliteNarratorPersistence = {
 		// a concurrent shift/append between the read and the write could move the very
 		// rows this marker then hides. Inside the (synchronous) write transaction the
 		// read, the shift and the insert observe one consistent seq space.
-		const { refs, insertSeq } = db.transaction((tx) => {
+		const { refs, insertSeq } = dbTransactionWithSeqFloor(narratorId, (tx) => {
 			const refs = tx
 				.select({
 					messageId: narratorMessageRefs.messageId,

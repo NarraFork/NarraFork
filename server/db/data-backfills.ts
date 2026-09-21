@@ -16,10 +16,18 @@
  * search indexes are built from the rows these statements produce. Reordering either way fails
  * silently — the wrong content is simply indexed, and nothing throws.
  *
+ * NARRATORS.NEXT_SEQ IS NOT REPAIRED HERE
+ * ---------------------------------------
+ * A startup full-table scan of every narrator to raise `next_seq` to max(refs.seq)+1 made boot
+ * scale with narrator count (minutes on large libraries) and blocked readiness. Allocation safety
+ * is now the write path's job: process-lifetime first claim raises that narrator's floor inside
+ * the write transaction and marks it healed only after commit (see narrator-refs/seq-store.ts and
+ * seq-floor-tx.ts). Project import raises floors for imported narrator ids after the import
+ * commits. `claimNextRefSeq` stays a pure counter increment.
+ *
  * RULES EVERY BLOCK FOLLOWS
  * ------------------------
  *   - awaited before the port is bound; each SQLite transaction stays synchronous.
- *     Required seq-counter repair yields between bounded pages and fails startup on error.
  *   - safe to re-run. It executes on every startup, so a second run must be a no-op.
  *   - non-fatal, except where a failure is itself a correctness problem: the draft migration logs at
  *     ERROR because a persistent failure means a cross-account draft leak survives, while the rest
@@ -34,96 +42,14 @@ import type { Database } from "bun:sqlite";
 import { logger } from "../lib/logger";
 import { migrateLegacyNarratorDraftTraits } from "./migrate-narrator-drafts";
 
-const REF_SEQ_PAGE_SIZE = 64;
-const REF_SEQ_TRANSACTION_BUDGET_MS = 8;
-const REF_SEQ_BACKFILL_TIMEOUT_MS = 120_000;
-
 export interface SqliteDataBackfillOptions {
 	readonly signal?: AbortSignal;
 }
 
-/**
- * Required upgrade repair, before any writer can claim from next_seq. Each narrator's
- * top ref is a single reverse seek on idx_narrator_refs_seq, never a global aggregate.
- * Restart from the beginning after interruption: the one-way ratchet neither lowers
- * previously claimed counters nor needs a fragile completion flag beside the data.
- */
-async function backfillNarratorNextSeq(
-	sqlite: Database,
-	options: SqliteDataBackfillOptions,
-): Promise<void> {
-	const started = performance.now();
-	const firstPage = sqlite.prepare<{ id: string }, []>(
-		`SELECT id FROM narrators ORDER BY id LIMIT ${REF_SEQ_PAGE_SIZE}`,
-	);
-	const nextPage = sqlite.prepare<{ id: string }, [string]>(
-		`SELECT id FROM narrators WHERE id > ? ORDER BY id LIMIT ${REF_SEQ_PAGE_SIZE}`,
-	);
-	const repair = sqlite.prepare(`UPDATE narrators SET next_seq = max(next_seq, COALESCE((
-		SELECT seq + 1 FROM narrator_message_refs WHERE narrator_id = narrators.id
-		ORDER BY seq DESC LIMIT 1
-	), 0)) WHERE id = ? AND next_seq < COALESCE((
-		SELECT seq + 1 FROM narrator_message_refs WHERE narrator_id = narrators.id
-		ORDER BY seq DESC LIMIT 1
-	), 0)`);
-	let cursor: string | undefined;
-	let repaired = 0;
-	let scanned = 0;
-	const checkBudget = () => {
-		options.signal?.throwIfAborted();
-		if (performance.now() - started > REF_SEQ_BACKFILL_TIMEOUT_MS) {
-			throw new Error("Narrator next_seq startup backfill timed out; retry startup to resume");
-		}
-	};
-	try {
-		while (true) {
-			checkBudget();
-			const rows = cursor === undefined ? firstPage.all() : nextPage.all(cursor);
-			if (!rows.length) break;
-			const batchStarted = performance.now();
-			sqlite.transaction(() => {
-				for (const row of rows) {
-					checkBudget();
-					repaired += repair.run(row.id).changes;
-					cursor = row.id;
-					scanned++;
-					if (performance.now() - batchStarted >= REF_SEQ_TRANSACTION_BUDGET_MS) break;
-				}
-			})();
-			if (performance.now() - batchStarted > 50) {
-				logger.warn("Slow narrator next_seq backfill page", {
-					durationMs: performance.now() - batchStarted,
-				});
-			}
-			// No transaction survives this await. Timers/I/O can run before the next page.
-			await new Promise<void>((resolve) => setImmediate(resolve));
-		}
-	} catch (error) {
-		logger.error("Required narrator next_seq backfill failed; startup must stop", {
-			scanned,
-			repaired,
-			error: String(error),
-		});
-		throw error;
-	} finally {
-		firstPage.finalize();
-		nextPage.finalize();
-		repair.finalize();
-	}
-	if (repaired || performance.now() - started > 50) {
-		logger.info("Narrator next_seq startup backfill completed", {
-			scanned,
-			repaired,
-			durationMs: performance.now() - started,
-		});
-	}
-}
-
 export async function applySqliteDataBackfills(
 	sqlite: Database,
-	options: SqliteDataBackfillOptions = {},
+	_options: SqliteDataBackfillOptions = {},
 ): Promise<void> {
-	await backfillNarratorNextSeq(sqlite, options);
 	// Migrate old narrator status values to the status + substatus model.
 	{
 		const migrations: [string, string, string][] = [

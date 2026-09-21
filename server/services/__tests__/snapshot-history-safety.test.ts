@@ -291,7 +291,9 @@ describe("origin-bound derived history cleanup", () => {
 			expect(messageBlocks(first)).toBeDefined();
 			expect(messageBlocks(forkMessage)).toBeDefined();
 			expect(messageBlocks(legacyMessage)).toBeDefined();
+			// Earlier call's child is untouched; the selected card's child is retired.
 			expect(narratorState(firstChild)).toEqual(state);
+			expect(narratorState(selectedChild)?.status).toBe("archived");
 			expect(result.historyWarnings).toContainEqual({
 				code: "DERIVED_HISTORY_RETAINED",
 				reason: "legacy_origin_unverified",
@@ -340,7 +342,11 @@ describe("origin-bound derived history cleanup", () => {
 			expect(messageBlocks(kept)).toEqual([{ type: "text", text: "child has its own history" }]);
 			expect(messageRefs(kept)).toEqual(refs);
 			expect(messageBlocks(nestedMessage)).toBeDefined();
-			expect(narratorState(child)).toEqual(childState);
+			// The card is gone, so the subagent is retired even though its messages
+			// are retained for the shared fork. Nested agent behind retained history
+			// is not selected, so it stays unarchived.
+			expect(narratorState(child)?.status).toBe("archived");
+			expect(narratorState(nested)?.status).toBe(childState?.status ?? "idle");
 			expect(narratorState(fork)).toEqual(forkState);
 			expect(readFileSync(path, "utf8")).toBe("child's retained bytes\n");
 			expect(result.historyWarnings).toContainEqual({
@@ -349,6 +355,9 @@ describe("origin-bound derived history cleanup", () => {
 				toolCallId: origin,
 				messageId: kept,
 			});
+			expect((result as { archivedSubagentIds?: string[] }).archivedSubagentIds ?? []).toContain(
+				child,
+			);
 		});
 	}
 
@@ -411,6 +420,28 @@ describe("origin-bound derived history cleanup", () => {
 			.sync();
 		expect(checkpoints).toHaveLength(1);
 		expect(checkpoints[0].resolvedFilePath).toBe(path);
+		// Card removal retires the subagent(s) it owned, including nested ones.
+		expect(narratorState(child)?.status).toBe("archived");
+		expect(narratorState(nested)?.status).toBe("archived");
+	});
+
+	test("deleting a subagent card archives the subagent even when its messages are retained", async () => {
+		const { narratorId, cwd } = fixture();
+		const selected = addMessage(narratorId, [
+			{ type: "tool_use", id: "retained-card", name: "Agent" },
+		]);
+		const origin = addAgentCall(narratorId, selected, "retained-card");
+		const child = addChild(cwd, narratorId, origin);
+		// Referenced child history is retained, but the card is gone — still retire.
+		const kept = childMessage(child, "retained-card", "kept history", true);
+		const result = await narratorService.deleteMessageBlock(narratorId, selected, 0, {
+			skipRevert: true,
+		});
+		expect(messageBlocks(selected)).toBeUndefined();
+		expect(messageBlocks(kept)).toBeDefined();
+		expect(narratorState(child)?.status).toBe("archived");
+		expect(result.archivedSubagentIds).toContain(child);
+		expect(result.historyWarnings?.some((w) => w.reason === "referenced")).toBe(true);
 	});
 
 	test("a shared parent and its COW origin cannot strand an unreferenced child", async () => {
@@ -442,6 +473,9 @@ describe("origin-bound derived history cleanup", () => {
 			reason: "shared_parent",
 			toolCallId: origin,
 		});
+		// Shared/COW parent skips derived selection, so the subagent is not retired
+		// from this path — another history may still own the live card.
+		expect(narratorState(child)?.status).toBe("idle");
 	});
 
 	test("range and derived child row budgets reject before deleting any history", async () => {

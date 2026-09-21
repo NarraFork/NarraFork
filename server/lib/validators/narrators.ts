@@ -475,6 +475,16 @@ export const forkNarratorSchema = z
 		message: "forkMessageId or forkMessageUuid is required",
 	});
 
+/**
+ * Extract a subagent into an independent primary narrator (materialized history copy).
+ * Distinct from fork: the source stays a subagent; the product is a primary session.
+ */
+export const extractPrimarySchema = z.object({
+	title: z.string().min(1).max(200).optional(),
+	inheritMode: z.enum(["full", "compressed"]).optional(),
+	locale: z.enum(["en", "zh-CN"]).optional(),
+});
+
 export const askInPassingSchema = z.object({
 	question: z.string().min(1).max(10000),
 	pendingMessageId: z.string().min(1),

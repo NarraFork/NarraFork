@@ -621,6 +621,78 @@ describe("TeamStatus actions", () => {
 		});
 	});
 
+	// Archived members are retired: @all members must not deliver to them or wake them.
+	test("broadcast excludes archived subagents", async () => {
+		seed();
+		narrators.set("primary", {
+			id: "primary",
+			parentNarratorId: null,
+			variant: "primary",
+			status: "working",
+			title: "Main",
+		});
+		narrators.set("sub-live", {
+			id: "sub-live",
+			parentNarratorId: "primary",
+			variant: "subagent:general",
+			status: "working",
+			title: "Live Worker",
+		});
+		narrators.set("sub-archived", {
+			id: "sub-archived",
+			parentNarratorId: "primary",
+			variant: "subagent:general",
+			status: "archived",
+			title: "Retired Worker",
+		});
+
+		const result = await teamStatusTool.execute(
+			{ action: "broadcast", message: "Status check." },
+			makeCtx("primary"),
+		);
+
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("live-worker");
+		expect(result.output).toContain("archived");
+		expect(result.metadata).toMatchObject({
+			broadcast: true,
+			targetCount: 1,
+			targets: [{ id: "sub-live" }],
+		});
+		const meta = result.metadata as { targets: Array<{ id: string }> };
+		expect(meta.targets.map((t) => t.id)).toEqual(["sub-live"]);
+		expect(deliveredMessages).toHaveLength(1);
+		expect(deliveredMessages[0].targetId).toBe("sub-live");
+	});
+
+	test("broadcast with only archived members reports no targets and explains the exclusion", async () => {
+		seed();
+		narrators.set("primary", {
+			id: "primary",
+			parentNarratorId: null,
+			variant: "primary",
+			status: "working",
+			title: "Main",
+		});
+		narrators.set("sub-archived", {
+			id: "sub-archived",
+			parentNarratorId: "primary",
+			variant: "subagent:general",
+			status: "archived",
+			title: "Retired Worker",
+		});
+
+		const result = await teamStatusTool.execute(
+			{ action: "broadcast", message: "Anyone?" },
+			makeCtx("primary"),
+		);
+
+		expect(result.output).toContain("No child subagents to broadcast to");
+		expect(result.output).toContain("archived");
+		expect(result.metadata).toMatchObject({ targetCount: 0 });
+		expect(deliveredMessages).toHaveLength(0);
+	});
+
 	test("primary narrator can send only to a direct subagent", async () => {
 		seed();
 		narrators.set("primary", {

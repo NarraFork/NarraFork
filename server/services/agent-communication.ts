@@ -2,7 +2,7 @@ import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { getSubagentType, isSubagentVariant, parseSubstatus } from "@server/lib/narrator-utils";
 import type { Locale } from "@server/lib/prompt-i18n";
-import type { SendDeliveryTarget } from "@shared/communication-tool";
+import { isParentSelector, type SendDeliveryTarget } from "@shared/communication-tool";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorBufferedMessages, narratorToolCalls } from "../db/schema";
@@ -1040,15 +1040,7 @@ export async function awaitAgentResult(opts: AwaitAgentInput): Promise<string> {
 	return (await awaitAgentResultDetailed(opts)).formatted;
 }
 
-/**
- * Reserved selectors a subagent can use to address the narrator that launched
- * it (its parent). Matched case-insensitively before sibling alias resolution.
- */
-const PARENT_SELECTORS = new Set(["parent", "main", "@parent", "@main"]);
-
-function isParentSelector(selector: string): boolean {
-	return PARENT_SELECTORS.has(selector.trim().toLowerCase());
-}
+export { isParentSelector };
 
 function parentChildReplyScope(parentNarratorId: string, childNarratorId: string): AgentReplyScope {
 	return { type: "parent-child", id: `${parentNarratorId}\u0000${childNarratorId}` };

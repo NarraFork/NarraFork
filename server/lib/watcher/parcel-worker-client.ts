@@ -11,6 +11,17 @@ export interface WorkerSubscription {
 	unsubscribe(): Promise<void>;
 }
 
+/**
+ * Bun.spawn `stdin: "pipe"` returns a FileSink (write/flush/end), not a Web
+ * WritableStream. The WritableStream shape is the bug that left native watch
+ * commands undelivered (`getWriter is not a function`).
+ */
+export interface WorkerStdinSink {
+	write(chunk: Uint8Array): number | Promise<number>;
+	flush(): number | Promise<number>;
+	end(error?: Error): number | Promise<number>;
+}
+
 const ENABLE_NATIVE_WATCHER_ENV = "NARRAFORK_ENABLE_NATIVE_WATCHER";
 const WORKER_READY_TIMEOUT_MS = 3000;
 const WATCH_ACK_TIMEOUT_MS = 5000;
@@ -54,6 +65,62 @@ function cloneEnv(): Record<string, string> {
 	}
 	env.NARRAFORK_WATCHER_WORKER = "1";
 	return env;
+}
+
+export function isThenable(value: unknown): value is PromiseLike<number> {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		typeof (value as PromiseLike<number>).then === "function"
+	);
+}
+
+/** Encode one parent command as a JSONL line for worker stdin. */
+export function encodeWorkerCommand(message: WatcherParentMessage): Uint8Array {
+	return new TextEncoder().encode(`${JSON.stringify(message)}\n`);
+}
+
+/**
+ * Write one JSONL command through a Bun FileSink.
+ *
+ * FileSink.write/flush may return either a number or a Promise; both are
+ * accepted. Never call `getWriter()` — that is WritableStream, not FileSink.
+ */
+export async function writeFileSinkCommand(
+	stdin: WorkerStdinSink,
+	data: Uint8Array,
+): Promise<void> {
+	const written = stdin.write(data);
+	if (isThenable(written)) await written;
+	const flushed = stdin.flush();
+	if (isThenable(flushed)) await flushed;
+}
+
+/** End a FileSink without throwing if it is already closed. */
+export function endWorkerStdin(stdin: WorkerStdinSink): void {
+	if (typeof stdin.end !== "function") return;
+	try {
+		const result = stdin.end();
+		if (isThenable(result)) void Promise.resolve(result).catch(() => {});
+	} catch {
+		// already closed or broken
+	}
+}
+
+/**
+ * Accept only the FileSink shape. A WritableStream (or anything without
+ * write+flush) must not be used — that was the production failure mode.
+ */
+export function asWorkerStdinSink(stdin: unknown): WorkerStdinSink | undefined {
+	if (!stdin || typeof stdin !== "object") return undefined;
+	const candidate = stdin as Partial<WorkerStdinSink>;
+	if (typeof candidate.write !== "function" || typeof candidate.flush !== "function") {
+		return undefined;
+	}
+	if (typeof (stdin as { getWriter?: unknown }).getWriter === "function") {
+		return undefined;
+	}
+	return stdin as WorkerStdinSink;
 }
 
 interface PendingRequest {
@@ -119,10 +186,12 @@ export class ParcelWorkerClient {
 		if (!this.proc || this.shuttingDown) return;
 
 		const requestId = nextRequestId("unwatch");
-		const pending = this.createPending(requestId, UNWATCH_ACK_TIMEOUT_MS, `unwatch ${rootPath}`);
 		try {
-			await this.send({ type: "unwatch", requestId, id: rootPath });
-			await pending;
+			await this.request(
+				{ type: "unwatch", requestId, id: rootPath },
+				UNWATCH_ACK_TIMEOUT_MS,
+				`unwatch ${rootPath}`,
+			);
 		} catch (error) {
 			logger.debug("[ParcelWatcher] worker unwatch failed", {
 				path: rootPath,
@@ -134,11 +203,7 @@ export class ParcelWorkerClient {
 	async shutdown(): Promise<void> {
 		this.shuttingDown = true;
 		this.active.clear();
-		for (const [requestId, pending] of this.pending) {
-			clearTimeout(pending.timer);
-			pending.reject(new Error("watcher worker shutting down"));
-			this.pending.delete(requestId);
-		}
+		this.clearAllPending(new Error("watcher worker shutting down"));
 
 		if (this.proc) {
 			try {
@@ -146,23 +211,52 @@ export class ParcelWorkerClient {
 			} catch {
 				// ignored: worker may already be gone
 			}
+			this.closeStdin();
 			setTimeout(() => this.killWorker(), 500);
+		}
+	}
+
+	/**
+	 * Create an ACK pending, send the command, await the ACK.
+	 *
+	 * send() used to leave the pending entry behind when stdin write failed
+	 * immediately; the 5s timer then rejected with no listener. On any send
+	 * failure the pending is settled right away (timer cleared, promise
+	 * rejected) so nothing is left to fire later as an unhandled rejection.
+	 */
+	private async request(
+		message: Extract<WatcherParentMessage, { requestId: string }>,
+		timeoutMs: number,
+		description: string,
+	): Promise<WatcherWorkerMessage> {
+		const requestId = message.requestId;
+		const pending = this.createPending(requestId, timeoutMs, description);
+
+		try {
+			await this.send(message);
+		} catch (error) {
+			const sendError = error instanceof Error ? error : new Error(String(error));
+			this.rejectPending(requestId, sendError);
+			throw sendError;
+		}
+
+		try {
+			return await pending;
+		} catch (error) {
+			if (String(error).includes("timed out")) {
+				this.disableForSession(description);
+			}
+			throw error;
 		}
 	}
 
 	private async sendWatch(rootPath: string, ignore: string[], timeoutMs: number): Promise<void> {
 		const requestId = nextRequestId("watch");
-		const pending = this.createPending(requestId, timeoutMs, `watch ${rootPath}`);
-		try {
-			await this.send({ type: "watch", requestId, id: rootPath, path: rootPath, ignore });
-			await pending;
-		} catch (error) {
-			const msg = String(error);
-			if (msg.includes("timed out")) {
-				this.disableForSession(`watch request timed out for ${rootPath}`);
-			}
-			throw error;
-		}
+		await this.request(
+			{ type: "watch", requestId, id: rootPath, path: rootPath, ignore },
+			timeoutMs,
+			`watch ${rootPath}`,
+		);
 	}
 
 	private async ensureStarted(): Promise<void> {
@@ -334,13 +428,19 @@ export class ParcelWorkerClient {
 		timeoutMs: number,
 		description: string,
 	): Promise<WatcherWorkerMessage> {
-		return new Promise((resolve, reject) => {
+		const promise = new Promise<WatcherWorkerMessage>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(requestId);
 				reject(new Error(`${description} timed out after ${timeoutMs}ms`));
 			}, timeoutMs);
 			this.pending.set(requestId, { description, resolve, reject, timer });
 		});
+		// Mark handled immediately: abort/shutdown/timeout may reject before the
+		// caller awaits (send failed first). Callers still observe the rejection
+		// via their own await; this only prevents the global unhandled-rejection
+		// path that the orphaned ACK timers used to hit.
+		promise.catch(() => {});
+		return promise;
 	}
 
 	private resolvePending(requestId: string, message: WatcherWorkerMessage): void {
@@ -359,6 +459,14 @@ export class ParcelWorkerClient {
 		pending.reject(error);
 	}
 
+	private clearAllPending(error: Error): void {
+		for (const [requestId, pending] of this.pending) {
+			clearTimeout(pending.timer);
+			pending.reject(error);
+			this.pending.delete(requestId);
+		}
+	}
+
 	private resolveReady(): void {
 		const ready = this.readyWaiter;
 		if (!ready) return;
@@ -375,19 +483,24 @@ export class ParcelWorkerClient {
 		ready.reject(error);
 	}
 
+	private getFileSink(): WorkerStdinSink | undefined {
+		return asWorkerStdinSink(this.proc?.stdin);
+	}
+
+	private closeStdin(): void {
+		const stdin = this.getFileSink();
+		if (!stdin) return;
+		endWorkerStdin(stdin);
+	}
+
 	private async send(message: WatcherParentMessage): Promise<void> {
-		const data = new TextEncoder().encode(`${JSON.stringify(message)}\n`);
+		const data = encodeWorkerCommand(message);
 		const next = this.writeQueue
 			.catch(() => {})
 			.then(async () => {
-				const stdin = this.proc?.stdin as WritableStream<Uint8Array> | undefined;
+				const stdin = this.getFileSink();
 				if (!stdin) throw new Error("watcher worker stdin is not available");
-				const writer = stdin.getWriter();
-				try {
-					await writer.write(data);
-				} finally {
-					writer.releaseLock();
-				}
+				await writeFileSinkCommand(stdin, data);
 			});
 		this.writeQueue = next;
 		return next;
@@ -397,12 +510,9 @@ export class ParcelWorkerClient {
 		if (this.proc !== proc) return;
 		this.proc = undefined;
 		this.writeQueue = Promise.resolve();
+		this.closeStdin();
 		this.rejectReady(new Error(`watcher worker exited before ready with code ${code}`));
-		for (const [requestId, pending] of this.pending) {
-			clearTimeout(pending.timer);
-			pending.reject(new Error(`watcher worker exited during ${pending.description}`));
-			this.pending.delete(requestId);
-		}
+		this.clearAllPending(new Error(`watcher worker exited with code ${code}`));
 
 		if (this.shuttingDown) return;
 
@@ -448,6 +558,7 @@ export class ParcelWorkerClient {
 		if (this.disabledReason) return;
 		this.disabledReason = reason;
 		logger.warn("[ParcelWatcher] native worker disabled for this session", { reason });
+		this.clearAllPending(new Error(`native watcher disabled for this session: ${reason}`));
 		this.onUnavailable(reason);
 		this.killWorker();
 	}
@@ -455,6 +566,7 @@ export class ParcelWorkerClient {
 	private killWorker(): void {
 		const proc = this.proc;
 		if (!proc) return;
+		this.closeStdin();
 		try {
 			proc.kill();
 		} catch {

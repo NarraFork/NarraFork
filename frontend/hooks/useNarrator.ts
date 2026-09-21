@@ -756,6 +756,27 @@ export function usePromoteNarrator() {
 	});
 }
 
+export function useExtractSubagentToPrimary() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (vars: {
+			narratorId: string;
+			title?: string;
+			inheritMode?: "full" | "compressed";
+			locale?: "en" | "zh-CN";
+		}) =>
+			api.extractSubagentToPrimary(vars.narratorId, {
+				title: vars.title,
+				inheritMode: vars.inheritMode,
+				locale: vars.locale,
+			}),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators", vars.narratorId] });
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
 export function useNarrator(id: string) {
 	return useQuery({
 		queryKey: ["narrators", id],

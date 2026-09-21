@@ -156,6 +156,7 @@ export {
 	createWhitelistDirSchema,
 	editAndRegenerateJsonSchema,
 	editAssistantMessageSchema,
+	extractPrimarySchema,
 	forkFromMessagesSchema,
 	forkNarratorSchema,
 	humanAttentionListQuerySchema,

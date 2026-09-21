@@ -130,6 +130,21 @@ function buildParameters() {
 			.describe(
 				"Stop a running background agent task by its ID or alias. When provided, no new agent is launched.",
 			),
+		archive: z
+			.string()
+			.optional()
+			.describe(
+				"Archive a subagent by its ID or alias. When provided, no new agent is launched. " +
+					"Running work is stopped first. Archived subagents are excluded from TeamStatus " +
+					"broadcast (@all members) and will not be woken by broadcasts; direct Send to them is also rejected.",
+			),
+		unarchive: z
+			.string()
+			.optional()
+			.describe(
+				"Restore an archived subagent by its ID or alias so it can receive messages and " +
+					"broadcasts again. When provided, no new agent is launched.",
+			),
 	});
 }
 
@@ -187,6 +202,19 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 					"Stop a running background agent task by its ID or alias. When provided, no new agent is launched.",
 				type: "string",
 			},
+			archive: {
+				description:
+					"Archive a subagent by its ID or alias. When provided, no new agent is launched. " +
+					"Running work is stopped first. Archived subagents are excluded from TeamStatus " +
+					"broadcast (@all members) and will not be woken by broadcasts; direct Send to them is also rejected.",
+				type: "string",
+			},
+			unarchive: {
+				description:
+					"Restore an archived subagent by its ID or alias so it can receive messages and " +
+					"broadcasts again. When provided, no new agent is launched.",
+				type: "string",
+			},
 			prompt: {
 				description: "The task for the agent to perform (required when launching a new agent)",
 				type: "string",
@@ -195,6 +223,32 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 		required: [] as string[],
 		additionalProperties: false,
 	};
+}
+
+/**
+ * Resolve an Agent archive/unarchive selector to a narrator id.
+ *
+ * Order mirrors stop mode, then falls through to the shared Send/Await selector
+ * grammar so a title or slug printed by TeamStatus can be archived directly.
+ */
+async function resolveArchiveTargetId(callerNarratorId: string, selector: string): Promise<string> {
+	const trimmed = selector.trim();
+	const { resolveTaskAlias } = await import("@server/services/narrator-subagent");
+	const fromAlias = resolveTaskAlias(callerNarratorId, trimmed);
+	if (fromAlias !== trimmed) return fromAlias;
+
+	const { backgroundTaskService } = await import("@server/services/background-task-service");
+	const task = await backgroundTaskService.getByAlias(trimmed, callerNarratorId);
+	if (task?.subagentNarratorId) return task.subagentNarratorId;
+	if (task) return task.id;
+
+	const { resolveSubagentTargets } = await import("@server/services/agent-communication");
+	const targets = await resolveSubagentTargets({
+		callerNarratorId,
+		id: trimmed,
+	}).catch(() => []);
+	if (targets.length === 1) return targets[0].id;
+	return trimmed;
 }
 
 export const agentTool: ToolDefinition = {
@@ -226,9 +280,128 @@ export const agentTool: ToolDefinition = {
 			workdir?: string;
 			alias?: string;
 			stop?: string;
+			archive?: string;
+			unarchive?: string;
 			// Legacy parameter name (pre-rename compat)
 			background?: boolean;
 		};
+
+		// Lifecycle commands are mutually exclusive with each other and with launch.
+		const lifecycleModes = [raw.stop, raw.archive, raw.unarchive].filter(Boolean);
+		if (lifecycleModes.length > 1) {
+			return {
+				output:
+					"Agent tool error: stop, archive, and unarchive are mutually exclusive — provide only one.",
+				isError: true,
+			};
+		}
+
+		// --- Archive mode: retire a subagent so broadcasts stop waking it ---
+		if (raw.archive) {
+			try {
+				const targetId = await resolveArchiveTargetId(ctx.narratorId, raw.archive);
+				const { narratorService } = await import("@server/services/narrator-service");
+				const { isSubagentVariant } = await import("@server/lib/narrator-utils");
+				const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
+
+				const narrator = await narratorService.getById(targetId).catch(() => null);
+				if (!narrator) {
+					return {
+						output: `Agent archive error: no subagent found for "${raw.archive}".`,
+						isError: true,
+					};
+				}
+				if (!isSubagentVariant(narrator.variant)) {
+					return {
+						output: `Agent archive error: "${raw.archive}" is not a subagent.`,
+						isError: true,
+					};
+				}
+				if (narrator.parentNarratorId !== ctx.narratorId) {
+					return {
+						output: `Agent archive error: "${raw.archive}" is not a direct child subagent of this narrator.`,
+						isError: true,
+					};
+				}
+				const label = agentLabelFromNarrator(narrator, ctx.narratorId);
+				if (narrator.status === "archived") {
+					return {
+						output: `Agent ${label} (${narrator.id}) is already archived. It remains excluded from TeamStatus broadcast (@all members) until unarchived.`,
+					};
+				}
+
+				const { interruptAndArchiveSubagent } = await import("@server/services/subagent-lifecycle");
+				const archived = await interruptAndArchiveSubagent(narrator.id, {
+					parentNarratorId: ctx.narratorId,
+				});
+				if (!archived.ok) {
+					return {
+						output: `Agent archive error: failed to archive "${raw.archive}" (${archived.error ?? "unknown"}).`,
+						isError: true,
+					};
+				}
+
+				return {
+					output:
+						`Agent ${label} (${narrator.id}) has been archived.\n` +
+						"It will not receive TeamStatus broadcast (@all members) messages or wake-ups. " +
+						"Direct Send to an archived subagent is also rejected. " +
+						"Use unarchive to restore it, or a user page interaction (which auto-unarchives).",
+				};
+			} catch (err) {
+				return {
+					output: `Agent archive error: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+				};
+			}
+		}
+
+		// --- Unarchive mode: restore an archived subagent ---
+		if (raw.unarchive) {
+			try {
+				const targetId = await resolveArchiveTargetId(ctx.narratorId, raw.unarchive);
+				const { narratorService } = await import("@server/services/narrator-service");
+				const { isSubagentVariant } = await import("@server/lib/narrator-utils");
+				const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
+
+				const narrator = await narratorService.getById(targetId).catch(() => null);
+				if (!narrator) {
+					return {
+						output: `Agent unarchive error: no subagent found for "${raw.unarchive}".`,
+						isError: true,
+					};
+				}
+				if (!isSubagentVariant(narrator.variant)) {
+					return {
+						output: `Agent unarchive error: "${raw.unarchive}" is not a subagent.`,
+						isError: true,
+					};
+				}
+				if (narrator.parentNarratorId !== ctx.narratorId) {
+					return {
+						output: `Agent unarchive error: "${raw.unarchive}" is not a direct child subagent of this narrator.`,
+						isError: true,
+					};
+				}
+				const label = agentLabelFromNarrator(narrator, ctx.narratorId);
+				if (narrator.status !== "archived") {
+					return {
+						output: `Agent ${label} (${narrator.id}) is not archived (current status: ${narrator.status}).`,
+					};
+				}
+				await narratorService.updateStatus(narrator.id, "idle");
+				return {
+					output:
+						`Agent ${label} (${narrator.id}) has been unarchived. ` +
+						"It can receive messages and TeamStatus broadcast (@all members) again.",
+				};
+			} catch (err) {
+				return {
+					output: `Agent unarchive error: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+				};
+			}
+		}
 
 		// --- Stop mode: cancel a running background agent task ---
 		if (raw.stop) {

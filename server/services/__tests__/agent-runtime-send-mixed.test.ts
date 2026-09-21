@@ -9,7 +9,8 @@ import {
 } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
 const takeover = { ...(await import("../subagent-takeover")) };

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { isParentSelector } from "@shared/communication-tool";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
@@ -2492,6 +2493,16 @@ async function resolveSendAliasCandidate(
 	return selector;
 }
 
+/**
+ * Resolve Send destinations for permission auto-allow rank checks.
+ *
+ * Parent is a first-class destination for a subagent: progress reports and
+ * replyTo answers address the narrator that launched the child. Treating a
+ * primary parent as "not a valid target" made `shouldAutoAllowSendWithinScope`
+ * always fail for child→parent Send, so those reports sat in `pending` until a
+ * human approved them — often never, while the parent Agent/await held an
+ * update-blocking lease.
+ */
 async function resolveSendTargetsForPermission(
 	callerId: string,
 	caller: PermissionScopeNarrator,
@@ -2501,17 +2512,38 @@ async function resolveSendTargetsForPermission(
 	if (selectors.length === 0) return [];
 	const callerIsSubagent = !!caller.variant && isSubagentVariant(caller.variant);
 	const teamParentId = callerIsSubagent ? caller.parentNarratorId : callerId;
-	if (!teamParentId) return [];
+	if (typeof teamParentId !== "string" || teamParentId.length === 0) return [];
+	const parentId: string = teamParentId;
 
 	const resolved: PermissionScopeNarrator[] = [];
 	const seen = new Set<string>();
 	for (const selector of selectors) {
-		const aliasCandidate = await resolveSendAliasCandidate(selector, callerId, teamParentId);
+		const aliasCandidate = await resolveSendAliasCandidate(selector, callerId, parentId);
+		const addressesParent =
+			callerIsSubagent &&
+			(isParentSelector(aliasCandidate) ||
+				isParentSelector(selector) ||
+				aliasCandidate === parentId ||
+				selector === parentId);
+		// "parent"/"main" are reserved aliases, not narrator primary keys. Resolve the
+		// launching narrator by teamParentId so mixed target lists still work.
+		if (addressesParent) {
+			const parent = await narratorService.getById(parentId).catch(() => null);
+			if (!parent?.id || parent.id !== parentId || isSubagentVariant(parent.variant ?? "")) {
+				return [];
+			}
+			if (!seen.has(parent.id)) {
+				seen.add(parent.id);
+				resolved.push(parent);
+			}
+			continue;
+		}
 		const direct = await narratorService.getById(aliasCandidate).catch(() => null);
 		if (direct) {
 			if (
-				!isSubagentVariant(direct.variant) ||
-				direct.parentNarratorId !== teamParentId ||
+				!direct.id ||
+				!isSubagentVariant(direct.variant ?? "") ||
+				direct.parentNarratorId !== parentId ||
 				(callerIsSubagent && direct.id === callerId)
 			) {
 				return [];
@@ -2523,14 +2555,20 @@ async function resolveSendTargetsForPermission(
 			continue;
 		}
 
-		const siblings = await narratorService.listSubagentsByParent(teamParentId);
+		const siblings = await narratorService.listSubagentsByParent(parentId);
 		const candidates = siblings.filter((s) => {
 			if (callerIsSubagent && s.id === callerId) return false;
 			return subagentMatchesSelector(s, selector);
 		});
 		if (candidates.length !== 1) return [];
-		const target = await narratorService.getById(candidates[0].id);
-		if (!isSubagentVariant(target.variant) || target.parentNarratorId !== teamParentId) return [];
+		const target = await narratorService.getById(candidates[0].id).catch(() => null);
+		if (
+			!target?.id ||
+			!isSubagentVariant(target.variant ?? "") ||
+			target.parentNarratorId !== parentId
+		) {
+			return [];
+		}
 		if (!seen.has(target.id)) {
 			seen.add(target.id);
 			resolved.push(target);
@@ -2539,17 +2577,45 @@ async function resolveSendTargetsForPermission(
 	return resolved;
 }
 
-async function shouldAutoAllowSendWithinScope(
+/**
+ * Whether a Send may skip the permission prompt because every destination is
+ * within the caller's communication scope.
+ *
+ * Child → parent progress reports/replies are always in scope: the parent
+ * launched this subagent and is the intended consumer. Sibling/child targets
+ * still use the permission-mode rank comparison.
+ */
+export async function shouldAutoAllowSendWithinScope(
 	narratorId: string,
 	caller: PermissionScopeNarrator | null | undefined,
 	input: Record<string, unknown>,
 ): Promise<boolean> {
 	try {
 		if (!caller) return false;
+		const callerIsSubagent = !!caller.variant && isSubagentVariant(caller.variant);
+		const teamParentId = callerIsSubagent ? caller.parentNarratorId : null;
 		const targets = await resolveSendTargetsForPermission(narratorId, caller, input);
-		if (targets.length === 0) return false;
+		const selectors = sendSelectors(input);
+		const onlyAddressesParent =
+			callerIsSubagent &&
+			!!teamParentId &&
+			selectors.length > 0 &&
+			selectors.every((selector) => isParentSelector(selector) || selector === teamParentId);
+
+		if (targets.length === 0) {
+			// Parent-only Send that failed id lookup still auto-allows when every
+			// selector is a reserved parent alias or the exact team parent id.
+			return onlyAddressesParent;
+		}
+
+		const nonParentTargets = teamParentId
+			? targets.filter((target) => target.id !== teamParentId)
+			: targets;
+		// Parent destinations are always in-scope for the child that reports to them.
+		if (nonParentTargets.length === 0) return true;
+
 		const callerRank = permissionModeRank(caller);
-		return targets.every((target) => permissionModeRank(target) <= callerRank);
+		return nonParentTargets.every((target) => permissionModeRank(target) <= callerRank);
 	} catch {
 		return false;
 	}

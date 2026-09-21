@@ -575,7 +575,13 @@ export type NarratorServerMessage =
 			newMessageId?: string;
 			replacementMessageId?: string;
 	  }
-	| { type: "narrator_forked"; narratorId: string; parentNarratorId: string }
+	| {
+			type: "narrator_forked";
+			narratorId: string;
+			parentNarratorId: string;
+			/** Extract-to-primary: parentNarratorId is the source, not the DB parent. */
+			extracted?: boolean;
+	  }
 	| {
 			type: "narrator_error";
 			narratorId: string;

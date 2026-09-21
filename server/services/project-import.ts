@@ -39,6 +39,7 @@ import { db } from "../db";
 import { projects } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { initializeRefSeqFloor, markNarratorSeqFloorHealedMany } from "./narrator-refs/seq-store";
 import { ProjectArchiveFile } from "./project-archive/archive-file";
 import type { ArchiveBatch, ArchiveRow } from "./project-archive/main-store";
 import { ARCHIVE_TABLE_ORDER, type ArchiveTable } from "./project-archive/manifest";
@@ -248,6 +249,27 @@ export async function importProject(
 		// One indivisible change. On failure the main database is exactly as it was found — see
 		// the store's contract; nothing partial is left behind for the user to clean up.
 		await projectArchiveMainStore.importRows({ batches, conflictPolicy: "skip" });
+
+		// Archive narrators omit next_seq (defaults to 0) while refs keep historical seq.
+		// Raise floors now so the first claim after import cannot collide; mark healed only
+		// after each raise transaction commits.
+		const importedNarratorIds: string[] = [];
+		for (const batch of batches) {
+			if (batch.table !== "narrators") continue;
+			for (const row of batch.rows) {
+				const id = row.id;
+				if (typeof id === "string" && id) importedNarratorIds.push(id);
+			}
+		}
+		const uniqueNarratorIds = [...new Set(importedNarratorIds)];
+		const CHUNK = 400;
+		for (let i = 0; i < uniqueNarratorIds.length; i += CHUNK) {
+			const chunk = uniqueNarratorIds.slice(i, i + CHUNK);
+			db.transaction((tx) => {
+				for (const id of chunk) initializeRefSeqFloor(tx, id);
+			});
+			markNarratorSeqFloorHealedMany(chunk);
+		}
 
 		logger.info("Project imported from backup", { projectId, projectName, gitPath, counts });
 		return { projectId, projectName, tables: counts, skipped: false };

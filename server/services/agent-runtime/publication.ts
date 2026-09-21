@@ -16,6 +16,7 @@ import { logger } from "../../lib/logger";
 import {
 	claimNextRefSeq,
 	NARRATOR_REF_SEQ_EMPTY_TOP,
+	raiseSeqFloorForClaim,
 	readTopRefSeq,
 } from "../narrator-refs/seq-store";
 import { MAILBOX_LIMITS as L } from "./limits";
@@ -261,6 +262,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		if (inserted) {
 			// Single seq authority (narrator-refs/seq-store.ts); base 0 for an empty
 			// narrator, unified with every other refs writer.
+			raiseSeqFloorForClaim(tx, narratorId);
 			tx.insert(narratorMessageRefs)
 				.values({
 					id: generateId(),
@@ -443,6 +445,7 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 					if (inserted) {
 						// Single seq authority (narrator-refs/seq-store.ts); base 0 for an
 						// empty narrator, unified with every other refs writer.
+						raiseSeqFloorForClaim(tx, recipientId);
 						tx.insert(narratorMessageRefs)
 							.values({
 								id: generateId(),

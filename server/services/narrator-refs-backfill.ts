@@ -22,6 +22,7 @@ import { narratorMessageRefs, narrators } from "../db/schema";
 import { narratorRefsBackfillLock } from "../lib/async-mutex";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { dbTransactionWithSeqFloor } from "./narrator-refs/seq-floor-tx";
 import { initializeRefSeqFloor } from "./narrator-refs/seq-store";
 
 /**
@@ -170,7 +171,7 @@ function copyWindow(
 	fromSeq: number,
 	plannedUntilSeq: number,
 ): number {
-	return db.transaction((tx) => {
+	return dbTransactionWithSeqFloor(narratorId, (tx) => {
 		// Re-read the cursor inside the write transaction: another backfill may have
 		// advanced it since we planned this window.
 		const state = toActive(

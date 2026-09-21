@@ -115,7 +115,11 @@ import {
 	deleteRecipientMessageRefs,
 	narratorPersistence,
 } from "./narrator-persistence";
-import { claimNextRefSeq, initializeRefSeqFloor } from "./narrator-refs/seq-store";
+import {
+	claimNextRefSeq,
+	initializeRefSeqFloor,
+	withSeqFloorRaiseScope,
+} from "./narrator-refs/seq-store";
 import { materializeChildrenOf } from "./narrator-refs-backfill";
 import { specVfsService } from "./spec-vfs-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
@@ -2028,84 +2032,90 @@ export const narratorService = {
 			| "readOnly"
 			| "dontAsk";
 
-		const newNarrator = db.transaction((tx) => {
-			// Insert first so this transaction owns SQLite's write lock before it
-			// snapshots the parent's marker state.
-			const created = tx
-				.insert(narrators)
-				.values({
-					id,
-					chapterId: null,
-					type: "primary",
-					variant: "primary",
-					traits: ["standalone"],
-					model: storedModel,
-					systemPrompt: parent.systemPrompt,
-					permissionMode: resolvedPermMode,
-					reasoningEffort: parent.reasoningEffort ?? null,
-					fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
-					fastMode: legacyFastModeMirror(parent.fastModeOverride),
-					relaxedPlan: resolveInitialRelaxedPlan({
+		// Fork inserts the narrator row first, then initializeRefSeqFloor — do not pre-raise
+		// a not-yet-inserted id. withSeqFloorRaiseScope marks after the tx commits because
+		// initializeRefSeqFloor records into the active raise scope.
+		const newNarrator = withSeqFloorRaiseScope(() =>
+			db.transaction((tx) => {
+				// Insert first so this transaction owns SQLite's write lock before it
+				// snapshots the parent's marker state.
+				const created = tx
+					.insert(narrators)
+					.values({
+						id,
+						chapterId: null,
+						type: "primary",
+						variant: "primary",
+						traits: ["standalone"],
+						model: storedModel,
+						systemPrompt: parent.systemPrompt,
 						permissionMode: resolvedPermMode,
-						explicit: parent.relaxedPlan ?? undefined,
-						defaultRelaxedPlan: false,
-					}),
-					planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
-					dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
-					autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
-					behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
-					behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
-					parentNarratorId,
-					// A fork carries the parent's history, so it must not be reachable by a
-					// wider audience than the parent was. Both axes are copied, not delegated:
-					// a fork is an independent session (`type: "primary"`), and its owner must
-					// be able to re-share it without the origin's settings overriding them.
-					ownerUserId: parent.ownerUserId,
-					visibility: parent.visibility,
-					writeAudience: parent.writeAudience,
-					inheritMode: "full",
-					status: "idle",
-					title: opts?.title ?? null,
-					cwd: parent.cwd ?? null,
-					createdAt: now,
-					updatedAt: now,
-				})
-				.returning()
-				.get();
+						reasoningEffort: parent.reasoningEffort ?? null,
+						fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
+						fastMode: legacyFastModeMirror(parent.fastModeOverride),
+						relaxedPlan: resolveInitialRelaxedPlan({
+							permissionMode: resolvedPermMode,
+							explicit: parent.relaxedPlan ?? undefined,
+							defaultRelaxedPlan: false,
+						}),
+						planReflectionAutoApproveOverride:
+							parent.planReflectionAutoApproveOverride ?? "inherit",
+						dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+						autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
+						behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
+						behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
+						parentNarratorId,
+						// A fork carries the parent's history, so it must not be reachable by a
+						// wider audience than the parent was. Both axes are copied, not delegated:
+						// a fork is an independent session (`type: "primary"`), and its owner must
+						// be able to re-share it without the origin's settings overriding them.
+						ownerUserId: parent.ownerUserId,
+						visibility: parent.visibility,
+						writeAudience: parent.writeAudience,
+						inheritMode: "full",
+						status: "idle",
+						title: opts?.title ?? null,
+						cwd: parent.cwd ?? null,
+						createdAt: now,
+						updatedAt: now,
+					})
+					.returning()
+					.get();
 
-			// Re-read selected refs in this synchronous transaction. A compact can
-			// finalize after the request preflight; only the state visible here may be
-			// shared with the child.
-			const pendingCompactIds = selectPendingCompactMessageIds(tx);
-			const stableParentRefs = tx
-				.select({
-					messageId: narratorMessageRefs.messageId,
-					seq: narratorMessageRefs.seq,
-					isCompact: narratorMessageRefs.isCompact,
-				})
-				.from(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, parentNarratorId),
-						inArray(narratorMessageRefs.messageId, messageIds),
-						excludePendingCompactCondition(pendingCompactIds),
-					),
-				)
-				.orderBy(narratorMessageRefs.seq)
-				.all();
+				// Re-read selected refs in this synchronous transaction. A compact can
+				// finalize after the request preflight; only the state visible here may be
+				// shared with the child.
+				const pendingCompactIds = selectPendingCompactMessageIds(tx);
+				const stableParentRefs = tx
+					.select({
+						messageId: narratorMessageRefs.messageId,
+						seq: narratorMessageRefs.seq,
+						isCompact: narratorMessageRefs.isCompact,
+					})
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, parentNarratorId),
+							inArray(narratorMessageRefs.messageId, messageIds),
+							excludePendingCompactCondition(pendingCompactIds),
+						),
+					)
+					.orderBy(narratorMessageRefs.seq)
+					.all();
 
-			const dupRefValues = stableParentRefs.map((row, i) => ({
-				id: generateId(),
-				narratorId: id,
-				messageId: row.messageId,
-				seq: i + 1,
-				isCompact: 0,
-			}));
-			insertRefsBatched(tx, dupRefValues);
-			const nextSeq = initializeRefSeqFloor(tx, id);
+				const dupRefValues = stableParentRefs.map((row, i) => ({
+					id: generateId(),
+					narratorId: id,
+					messageId: row.messageId,
+					seq: i + 1,
+					isCompact: 0,
+				}));
+				insertRefsBatched(tx, dupRefValues);
+				const nextSeq = initializeRefSeqFloor(tx, id);
 
-			return { ...created, nextSeq };
-		});
+				return { ...created, nextSeq };
+			}),
+		);
 
 		await specVfsService.forkSpecNamespace(parentNarratorId, newNarrator.id);
 		await applySpecForkCarryover(newNarrator.id, "card");
@@ -2221,198 +2231,204 @@ export const narratorService = {
 
 		const forkTraits2: string[] = targetChapterId ? [] : ["standalone"];
 
-		const newNarrator = db.transaction((tx) => {
-			// Insert before reading parent refs so this transaction acquires the write
-			// lock first; a concurrent finalize then waits and cannot change the state
-			// between our final read and ref copy.
-			tx.insert(narrators)
-				.values({
-					id,
-					chapterId: targetChapterId,
-					type: "primary",
-					variant: "primary",
-					traits: forkTraits2,
-					model: storedModel,
-					systemPrompt,
-					permissionMode: resolvedPermMode,
-					reasoningEffort: resolvedReasoningEffort,
-					fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
-					fastMode: legacyFastModeMirror(parent.fastModeOverride),
-					relaxedPlan: resolveInitialRelaxedPlan({
+		// Same as forkFromMessages: insert first, initializeRefSeqFloor after refs land.
+		const newNarrator = withSeqFloorRaiseScope(() =>
+			db.transaction((tx) => {
+				// Insert before reading parent refs so this transaction acquires the write
+				// lock first; a concurrent finalize then waits and cannot change the state
+				// between our final read and ref copy.
+				tx.insert(narrators)
+					.values({
+						id,
+						chapterId: targetChapterId,
+						type: "primary",
+						variant: "primary",
+						traits: forkTraits2,
+						model: storedModel,
+						systemPrompt,
 						permissionMode: resolvedPermMode,
-						explicit: parent.relaxedPlan ?? undefined,
-						defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
-					}),
-					planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
-					dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
-					autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
-					behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
-					behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
-					parentNarratorId,
-					forkMessageId: null,
-					// Same rule as forkFromMessages: inherited history keeps the parent's
-					// audiences, both of them. When the fork lands in a chapter it is at least
-					// project-visible anyway, so inheriting can only narrow, never widen.
-					ownerUserId: parent.ownerUserId,
-					visibility: parent.visibility,
-					writeAudience: parent.writeAudience,
-					inheritMode,
-					apiConversationId,
-					contextSummary,
-					status: "idle",
-					title: opts?.title ?? null,
-					cwd: parent.cwd ?? null,
-					createdAt: now,
-					updatedAt: now,
-				})
-				.run();
-
-			// Resolve and copy refs in one synchronous transaction. This closes the
-			// finalize window: either the finalizer commits first (so its stable marker
-			// is copied) or the fork commits first (so an active marker is omitted).
-			//
-			// The in-flight compact markers are resolved once, up front, through the
-			// partial index — so none of the queries below has to join message bodies.
-			pendingCompactIds = selectPendingCompactMessageIds(tx);
-			const excludePending = excludePendingCompactCondition(pendingCompactIds);
-			if (requestedForkMessageId) {
-				const forkRef = tx.query.narratorMessageRefs
-					.findFirst({
-						where: and(
-							eq(narratorMessageRefs.narratorId, parentNarratorId),
-							eq(narratorMessageRefs.messageId, requestedForkMessageId),
-						),
-					})
-					.sync();
-				if (!forkRef) {
-					throw new ValidationError("Fork message not found in parent narrator's refs");
-				}
-				// Only the history the model still sees is materialized: everything up to
-				// and including the last stable compact at or before the fork point is
-				// left in the parent and backfilled on demand (see narrator-refs-backfill).
-				const lastCompact = tx
-					.select({ seq: narratorMessageRefs.seq })
-					.from(narratorMessageRefs)
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, parentNarratorId),
-							eq(narratorMessageRefs.isCompact, 1),
-							sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
-							excludePending,
-						),
-					)
-					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-					.limit(1)
-					.all();
-				forkCompactSeq = lastCompact[0]?.seq;
-				prefixRows = tx
-					.select({
-						messageId: narratorMessageRefs.messageId,
-						seq: narratorMessageRefs.seq,
-						isCompact: narratorMessageRefs.isCompact,
-						segmentCompactId: narratorMessageRefs.segmentCompactId,
-					})
-					.from(narratorMessageRefs)
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, parentNarratorId),
-							forkCompactSeq != null
-								? sql`${narratorMessageRefs.seq} > ${forkCompactSeq}`
-								: undefined,
-							sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
-							sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
-							excludePending,
-						),
-					)
-					.orderBy(narratorMessageRefs.seq)
-					.all();
-				resolvedForkMessageId = prefixRows.at(-1)?.messageId ?? null;
-			} else if (inheritMode === "full") {
-				const lastCompact = tx
-					.select({ seq: narratorMessageRefs.seq })
-					.from(narratorMessageRefs)
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, parentNarratorId),
-							eq(narratorMessageRefs.isCompact, 1),
-							excludePending,
-						),
-					)
-					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-					.limit(1)
-					.all();
-				forkCompactSeq = lastCompact[0]?.seq;
-				const rows = tx
-					.select({
-						messageId: narratorMessageRefs.messageId,
-						seq: narratorMessageRefs.seq,
-						isCompact: narratorMessageRefs.isCompact,
-						segmentCompactId: narratorMessageRefs.segmentCompactId,
-					})
-					.from(narratorMessageRefs)
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, parentNarratorId),
-							forkCompactSeq != null
-								? sql`${narratorMessageRefs.seq} > ${forkCompactSeq}`
-								: undefined,
-							sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
-							excludePending,
-						),
-					)
-					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-					.limit(MAX_INHERITED_FULL_FORK_REFS + 1)
-					.all();
-
-				if (rows.length > MAX_INHERITED_FULL_FORK_REFS) {
-					prefixRows = rows.slice(0, MAX_INHERITED_FULL_FORK_REFS).reverse();
-					logger.warn("Full narrator fork context truncated to safe ref limit", {
+						reasoningEffort: resolvedReasoningEffort,
+						fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
+						fastMode: legacyFastModeMirror(parent.fastModeOverride),
+						relaxedPlan: resolveInitialRelaxedPlan({
+							permissionMode: resolvedPermMode,
+							explicit: parent.relaxedPlan ?? undefined,
+							defaultRelaxedPlan: settings.agent.defaultRelaxedPlan,
+						}),
+						planReflectionAutoApproveOverride:
+							parent.planReflectionAutoApproveOverride ?? "inherit",
+						dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+						autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
+						behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
+						behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 						parentNarratorId,
-						newNarratorId: id,
-						limit: MAX_INHERITED_FULL_FORK_REFS,
-						copiedRefs: prefixRows.length,
-						hasCompactSummary: Boolean(parent.contextSummary),
-					});
-				} else {
-					prefixRows = rows.reverse();
+						forkMessageId: null,
+						// Same rule as forkFromMessages: inherited history keeps the parent's
+						// audiences, both of them. When the fork lands in a chapter it is at least
+						// project-visible anyway, so inheriting can only narrow, never widen.
+						ownerUserId: parent.ownerUserId,
+						visibility: parent.visibility,
+						writeAudience: parent.writeAudience,
+						inheritMode,
+						apiConversationId,
+						contextSummary,
+						status: "idle",
+						title: opts?.title ?? null,
+						cwd: parent.cwd ?? null,
+						createdAt: now,
+						updatedAt: now,
+					})
+					.run();
+
+				// Resolve and copy refs in one synchronous transaction. This closes the
+				// finalize window: either the finalizer commits first (so its stable marker
+				// is copied) or the fork commits first (so an active marker is omitted).
+				//
+				// The in-flight compact markers are resolved once, up front, through the
+				// partial index — so none of the queries below has to join message bodies.
+				pendingCompactIds = selectPendingCompactMessageIds(tx);
+				const excludePending = excludePendingCompactCondition(pendingCompactIds);
+				if (requestedForkMessageId) {
+					const forkRef = tx.query.narratorMessageRefs
+						.findFirst({
+							where: and(
+								eq(narratorMessageRefs.narratorId, parentNarratorId),
+								eq(narratorMessageRefs.messageId, requestedForkMessageId),
+							),
+						})
+						.sync();
+					if (!forkRef) {
+						throw new ValidationError("Fork message not found in parent narrator's refs");
+					}
+					// Only the history the model still sees is materialized: everything up to
+					// and including the last stable compact at or before the fork point is
+					// left in the parent and backfilled on demand (see narrator-refs-backfill).
+					const lastCompact = tx
+						.select({ seq: narratorMessageRefs.seq })
+						.from(narratorMessageRefs)
+						.where(
+							and(
+								eq(narratorMessageRefs.narratorId, parentNarratorId),
+								eq(narratorMessageRefs.isCompact, 1),
+								sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
+								excludePending,
+							),
+						)
+						.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+						.limit(1)
+						.all();
+					forkCompactSeq = lastCompact[0]?.seq;
+					prefixRows = tx
+						.select({
+							messageId: narratorMessageRefs.messageId,
+							seq: narratorMessageRefs.seq,
+							isCompact: narratorMessageRefs.isCompact,
+							segmentCompactId: narratorMessageRefs.segmentCompactId,
+						})
+						.from(narratorMessageRefs)
+						.where(
+							and(
+								eq(narratorMessageRefs.narratorId, parentNarratorId),
+								forkCompactSeq != null
+									? sql`${narratorMessageRefs.seq} > ${forkCompactSeq}`
+									: undefined,
+								sql`${narratorMessageRefs.seq} <= ${forkRef.seq}`,
+								sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
+								excludePending,
+							),
+						)
+						.orderBy(narratorMessageRefs.seq)
+						.all();
+					resolvedForkMessageId = prefixRows.at(-1)?.messageId ?? null;
+				} else if (inheritMode === "full") {
+					const lastCompact = tx
+						.select({ seq: narratorMessageRefs.seq })
+						.from(narratorMessageRefs)
+						.where(
+							and(
+								eq(narratorMessageRefs.narratorId, parentNarratorId),
+								eq(narratorMessageRefs.isCompact, 1),
+								excludePending,
+							),
+						)
+						.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+						.limit(1)
+						.all();
+					forkCompactSeq = lastCompact[0]?.seq;
+					const rows = tx
+						.select({
+							messageId: narratorMessageRefs.messageId,
+							seq: narratorMessageRefs.seq,
+							isCompact: narratorMessageRefs.isCompact,
+							segmentCompactId: narratorMessageRefs.segmentCompactId,
+						})
+						.from(narratorMessageRefs)
+						.where(
+							and(
+								eq(narratorMessageRefs.narratorId, parentNarratorId),
+								forkCompactSeq != null
+									? sql`${narratorMessageRefs.seq} > ${forkCompactSeq}`
+									: undefined,
+								sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
+								excludePending,
+							),
+						)
+						.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+						.limit(MAX_INHERITED_FULL_FORK_REFS + 1)
+						.all();
+
+					if (rows.length > MAX_INHERITED_FULL_FORK_REFS) {
+						prefixRows = rows.slice(0, MAX_INHERITED_FULL_FORK_REFS).reverse();
+						logger.warn("Full narrator fork context truncated to safe ref limit", {
+							parentNarratorId,
+							newNarratorId: id,
+							limit: MAX_INHERITED_FULL_FORK_REFS,
+							copiedRefs: prefixRows.length,
+							hasCompactSummary: Boolean(parent.contextSummary),
+						});
+					} else {
+						prefixRows = rows.reverse();
+					}
+					resolvedForkMessageId = prefixRows.at(-1)?.messageId ?? null;
 				}
-				resolvedForkMessageId = prefixRows.at(-1)?.messageId ?? null;
-			}
 
-			if (inheritMode === "full" && prefixRows.length === 0 && parent.apiConversationId) {
-				apiConversationId = null;
-				logger.warn("Full narrator fork has no local refs; remote conversation id not inherited", {
-					parentNarratorId,
-					newNarratorId: id,
-				});
-			}
+				if (inheritMode === "full" && prefixRows.length === 0 && parent.apiConversationId) {
+					apiConversationId = null;
+					logger.warn(
+						"Full narrator fork has no local refs; remote conversation id not inherited",
+						{
+							parentNarratorId,
+							newNarratorId: id,
+						},
+					);
+				}
 
-			tx.update(narrators)
-				.set({ forkMessageId: resolvedForkMessageId, apiConversationId })
-				.where(eq(narrators.id, id))
-				.run();
+				tx.update(narrators)
+					.set({ forkMessageId: resolvedForkMessageId, apiConversationId })
+					.where(eq(narrators.id, id))
+					.run();
 
-			if (prefixRows.length > 0) {
-				// 单条 INSERT...SELECT 复制 refs（替代应用层批量循环 + 逐行 nanoid）。
-				// id 用 hex(randomblob(16)) 生成 (32 字符十六进制), 与 nanoid 同样全局唯一。
-				//
-				// seq 刻意**沿用父叙述者的原值**，不再重编号为 0 起。惰性 fork 之后要能按 seq
-				// 区间从父叙述者补齐更早的历史；一旦重编号，父子 seq 就失去对应关系，补齐
-				// 只能插负数或整体位移。保留原值后，补齐就只是插入更多行（见
-				// narrator-refs-backfill.ts）。seq 因此从 forkCompactSeq+1 开始而非 0，
-				// 中间留有空洞——所有消费者都是游标/排序语义，不依赖 seq 密集。
-				//
-				// 注意: SQL 必须复现 prefixRows 的完整过滤条件（compact 边界、segment 排除、
-				// 进行中 compact 标记排除、上限截断），不能简化为 seq <= lastSeq，否则会错误
-				// 复制已 compact 掉的历史 refs。
-				//
-				// 这里刻意不 join narrator_messages: 进行中的 compact 标记已经在上面通过
-				// 部分索引解析成一个通常为空的 id 列表，join 消息表只会把整段历史的
-				// contentJson 拖进来（3 万条消息约 149 MB）。
-				const lastSeq = prefixRows[prefixRows.length - 1].seq;
-				const firstSeq = prefixRows[0].seq;
-				const excludePendingRaw = excludePendingCompactRawCondition(pendingCompactIds);
-				tx.run(sql`
+				if (prefixRows.length > 0) {
+					// 单条 INSERT...SELECT 复制 refs（替代应用层批量循环 + 逐行 nanoid）。
+					// id 用 hex(randomblob(16)) 生成 (32 字符十六进制), 与 nanoid 同样全局唯一。
+					//
+					// seq 刻意**沿用父叙述者的原值**，不再重编号为 0 起。惰性 fork 之后要能按 seq
+					// 区间从父叙述者补齐更早的历史；一旦重编号，父子 seq 就失去对应关系，补齐
+					// 只能插负数或整体位移。保留原值后，补齐就只是插入更多行（见
+					// narrator-refs-backfill.ts）。seq 因此从 forkCompactSeq+1 开始而非 0，
+					// 中间留有空洞——所有消费者都是游标/排序语义，不依赖 seq 密集。
+					//
+					// 注意: SQL 必须复现 prefixRows 的完整过滤条件（compact 边界、segment 排除、
+					// 进行中 compact 标记排除、上限截断），不能简化为 seq <= lastSeq，否则会错误
+					// 复制已 compact 掉的历史 refs。
+					//
+					// 这里刻意不 join narrator_messages: 进行中的 compact 标记已经在上面通过
+					// 部分索引解析成一个通常为空的 id 列表，join 消息表只会把整段历史的
+					// contentJson 拖进来（3 万条消息约 149 MB）。
+					const lastSeq = prefixRows[prefixRows.length - 1].seq;
+					const firstSeq = prefixRows[0].seq;
+					const excludePendingRaw = excludePendingCompactRawCondition(pendingCompactIds);
+					tx.run(sql`
 					INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact, segment_compact_id)
 					SELECT
 						lower(hex(randomblob(16))),
@@ -2430,160 +2446,161 @@ export const narratorService = {
 					ORDER BY refs.seq
 				`);
 
-				// Reserve copied seqs in the child's monotone counter in this transaction.
-				// Subsequent lazy backfills can only raise, never lower, this floor.
-				initializeRefSeqFloor(tx, id);
+					// Reserve copied seqs in the child's monotone counter in this transaction.
+					// Subsequent lazy backfills can only raise, never lower, this floor.
+					initializeRefSeqFloor(tx, id);
 
-				// Record the lazy-fork boundary whenever the parent still holds refs below
-				// the window we copied — whether they were skipped by the compact boundary
-				// or dropped by the MAX_INHERITED_FULL_FORK_REFS cap. Previously the capped
-				// history was simply unreachable; now it can be backfilled.
-				const parentHasOlder = tx
-					.select({ seq: narratorMessageRefs.seq })
-					.from(narratorMessageRefs)
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, parentNarratorId),
-							sql`${narratorMessageRefs.seq} < ${firstSeq}`,
-						),
-					)
-					.limit(1)
-					.all();
-				if (parentHasOlder.length > 0) {
-					tx.update(narrators)
-						.set({
-							refsInheritedFrom: parentNarratorId,
-							refsBackfillCursor: firstSeq,
+					// Record the lazy-fork boundary whenever the parent still holds refs below
+					// the window we copied — whether they were skipped by the compact boundary
+					// or dropped by the MAX_INHERITED_FULL_FORK_REFS cap. Previously the capped
+					// history was simply unreachable; now it can be backfilled.
+					const parentHasOlder = tx
+						.select({ seq: narratorMessageRefs.seq })
+						.from(narratorMessageRefs)
+						.where(
+							and(
+								eq(narratorMessageRefs.narratorId, parentNarratorId),
+								sql`${narratorMessageRefs.seq} < ${firstSeq}`,
+							),
+						)
+						.limit(1)
+						.all();
+					if (parentHasOlder.length > 0) {
+						tx.update(narrators)
+							.set({
+								refsInheritedFrom: parentNarratorId,
+								refsBackfillCursor: firstSeq,
+							})
+							.where(eq(narrators.id, id))
+							.run();
+					}
+				}
+
+				if (inheritMode === "compressed" && contextSummary) {
+					const compactMsgId = generateId();
+					const compactNow = new Date().toISOString();
+					tx.insert(narratorMessages)
+						.values({
+							id: compactMsgId,
+							narratorId: id,
+							role: "system",
+							contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
+							contentText: `[Compressed context from parent conversation]`,
+							createdAt: compactNow,
 						})
-						.where(eq(narrators.id, id))
+						.run();
+					// Same single seq authority as every other refs writer — the child's
+					// copied prefix is already in place, so this claims max(prefix)+1.
+					const compactSeq = claimNextRefSeq(tx, id);
+					tx.insert(narratorMessageRefs)
+						.values({
+							id: generateId(),
+							narratorId: id,
+							messageId: compactMsgId,
+							seq: compactSeq,
+							isCompact: 1,
+						})
 						.run();
 				}
-			}
 
-			if (inheritMode === "compressed" && contextSummary) {
-				const compactMsgId = generateId();
-				const compactNow = new Date().toISOString();
-				tx.insert(narratorMessages)
-					.values({
-						id: compactMsgId,
-						narratorId: id,
-						role: "system",
-						contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
-						contentText: `[Compressed context from parent conversation]`,
-						createdAt: compactNow,
-					})
-					.run();
-				// Same single seq authority as every other refs writer — the child's
-				// copied prefix is already in place, so this claims max(prefix)+1.
-				const compactSeq = claimNextRefSeq(tx, id);
-				tx.insert(narratorMessageRefs)
-					.values({
-						id: generateId(),
-						narratorId: id,
-						messageId: compactMsgId,
-						seq: compactSeq,
-						isCompact: 1,
-					})
-					.run();
-			}
+				// Copy all four per-narrator permission rule sets from the parent, preserving the
+				// canonical selector and its legacy mirror so every fork inherits one execution profile.
+				const parentWhitelistDirs = tx
+					.select()
+					.from(narratorWhitelistDirs)
+					.where(eq(narratorWhitelistDirs.narratorId, parentNarratorId))
+					.all();
+				if (parentWhitelistDirs.length > 0) {
+					tx.insert(narratorWhitelistDirs)
+						.values(
+							parentWhitelistDirs.map((dir) => ({
+								id: generateId(),
+								narratorId: id,
+								path: dir.path,
+								accessLevel: dir.accessLevel,
+								enabled: dir.enabled,
+								targetKind: dir.targetKind,
+								targetValue: dir.targetValue,
+								deviceScope: dir.deviceScope,
+								createdAt: now,
+							})),
+						)
+						.run();
+				}
 
-			// Copy all four per-narrator permission rule sets from the parent, preserving the
-			// canonical selector and its legacy mirror so every fork inherits one execution profile.
-			const parentWhitelistDirs = tx
-				.select()
-				.from(narratorWhitelistDirs)
-				.where(eq(narratorWhitelistDirs.narratorId, parentNarratorId))
-				.all();
-			if (parentWhitelistDirs.length > 0) {
-				tx.insert(narratorWhitelistDirs)
-					.values(
-						parentWhitelistDirs.map((dir) => ({
-							id: generateId(),
-							narratorId: id,
-							path: dir.path,
-							accessLevel: dir.accessLevel,
-							enabled: dir.enabled,
-							targetKind: dir.targetKind,
-							targetValue: dir.targetValue,
-							deviceScope: dir.deviceScope,
-							createdAt: now,
-						})),
-					)
-					.run();
-			}
+				const parentBlacklistDirs = tx
+					.select()
+					.from(narratorBlacklistDirs)
+					.where(eq(narratorBlacklistDirs.narratorId, parentNarratorId))
+					.all();
+				if (parentBlacklistDirs.length > 0) {
+					tx.insert(narratorBlacklistDirs)
+						.values(
+							parentBlacklistDirs.map((dir) => ({
+								id: generateId(),
+								narratorId: id,
+								path: dir.path,
+								denyLevel: dir.denyLevel,
+								enabled: dir.enabled,
+								targetKind: dir.targetKind,
+								targetValue: dir.targetValue,
+								deviceScope: dir.deviceScope,
+								createdAt: now,
+							})),
+						)
+						.run();
+				}
 
-			const parentBlacklistDirs = tx
-				.select()
-				.from(narratorBlacklistDirs)
-				.where(eq(narratorBlacklistDirs.narratorId, parentNarratorId))
-				.all();
-			if (parentBlacklistDirs.length > 0) {
-				tx.insert(narratorBlacklistDirs)
-					.values(
-						parentBlacklistDirs.map((dir) => ({
-							id: generateId(),
-							narratorId: id,
-							path: dir.path,
-							denyLevel: dir.denyLevel,
-							enabled: dir.enabled,
-							targetKind: dir.targetKind,
-							targetValue: dir.targetValue,
-							deviceScope: dir.deviceScope,
-							createdAt: now,
-						})),
-					)
-					.run();
-			}
+				const parentWhitelistCmds = tx
+					.select()
+					.from(narratorWhitelistCmds)
+					.where(eq(narratorWhitelistCmds.narratorId, parentNarratorId))
+					.all();
+				if (parentWhitelistCmds.length > 0) {
+					tx.insert(narratorWhitelistCmds)
+						.values(
+							parentWhitelistCmds.map((cmd) => ({
+								id: generateId(),
+								narratorId: id,
+								pattern: cmd.pattern,
+								enabled: cmd.enabled,
+								targetKind: cmd.targetKind,
+								targetValue: cmd.targetValue,
+								deviceScope: cmd.deviceScope,
+								createdAt: now,
+							})),
+						)
+						.run();
+				}
 
-			const parentWhitelistCmds = tx
-				.select()
-				.from(narratorWhitelistCmds)
-				.where(eq(narratorWhitelistCmds.narratorId, parentNarratorId))
-				.all();
-			if (parentWhitelistCmds.length > 0) {
-				tx.insert(narratorWhitelistCmds)
-					.values(
-						parentWhitelistCmds.map((cmd) => ({
-							id: generateId(),
-							narratorId: id,
-							pattern: cmd.pattern,
-							enabled: cmd.enabled,
-							targetKind: cmd.targetKind,
-							targetValue: cmd.targetValue,
-							deviceScope: cmd.deviceScope,
-							createdAt: now,
-						})),
-					)
-					.run();
-			}
+				const parentBlacklistCmds = tx
+					.select()
+					.from(narratorBlacklistCmds)
+					.where(eq(narratorBlacklistCmds.narratorId, parentNarratorId))
+					.all();
+				if (parentBlacklistCmds.length > 0) {
+					tx.insert(narratorBlacklistCmds)
+						.values(
+							parentBlacklistCmds.map((cmd) => ({
+								id: generateId(),
+								narratorId: id,
+								pattern: cmd.pattern,
+								denyPrompt: cmd.denyPrompt,
+								enabled: cmd.enabled,
+								targetKind: cmd.targetKind,
+								targetValue: cmd.targetValue,
+								deviceScope: cmd.deviceScope,
+								createdAt: now,
+							})),
+						)
+						.run();
+				}
 
-			const parentBlacklistCmds = tx
-				.select()
-				.from(narratorBlacklistCmds)
-				.where(eq(narratorBlacklistCmds.narratorId, parentNarratorId))
-				.all();
-			if (parentBlacklistCmds.length > 0) {
-				tx.insert(narratorBlacklistCmds)
-					.values(
-						parentBlacklistCmds.map((cmd) => ({
-							id: generateId(),
-							narratorId: id,
-							pattern: cmd.pattern,
-							denyPrompt: cmd.denyPrompt,
-							enabled: cmd.enabled,
-							targetKind: cmd.targetKind,
-							targetValue: cmd.targetValue,
-							deviceScope: cmd.deviceScope,
-							createdAt: now,
-						})),
-					)
-					.run();
-			}
-
-			const finalNarrator = tx.query.narrators.findFirst({ where: eq(narrators.id, id) }).sync();
-			if (!finalNarrator) throw new NotFoundError("Narrator", id);
-			return finalNarrator;
-		});
+				const finalNarrator = tx.query.narrators.findFirst({ where: eq(narrators.id, id) }).sync();
+				if (!finalNarrator) throw new NotFoundError("Narrator", id);
+				return finalNarrator;
+			}),
+		);
 
 		// fire-and-forget: spec fork 和 carryover 不阻塞 fork 响应
 		// fork 的成功不依赖这些副作用, 失败时记录到 narrators 表便于后续补偿
@@ -2663,6 +2680,23 @@ export const narratorService = {
 			columns: { messageUuid: true },
 		});
 		return msg?.messageUuid ?? null;
+	},
+
+	/**
+	 * Extract a subagent into an independent primary narrator.
+	 * Ordinary fork still refuses subagent sources; this is the dedicated control-plane
+	 * promotion path (AskUserQuestion etc. become available on the new session).
+	 */
+	async extractSubagentToPrimary(
+		sourceNarratorId: string,
+		opts?: {
+			title?: string;
+			inheritMode?: "full" | "compressed";
+			locale?: Locale;
+		},
+	) {
+		const { extractSubagentToPrimary } = await import("./subagent-extract");
+		return extractSubagentToPrimary(sourceNarratorId, opts);
 	},
 
 	async forkStandaloneFromTool(

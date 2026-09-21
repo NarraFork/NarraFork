@@ -217,6 +217,13 @@ export interface NarratorInteractionStatusBarProps {
 		onPromote: () => void;
 	};
 
+	/** Extract a subagent into an independent primary narrator. */
+	extractPrimary?: {
+		show: boolean;
+		pending: boolean;
+		onExtract: () => void;
+	};
+
 	viewers: ViewerInfo[];
 	currentUser: { role?: string | null } | null;
 
@@ -250,6 +257,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 		quota,
 		relaxedPlan,
 		promote,
+		extractPrimary,
 		viewers,
 		currentUser,
 		mobile,
@@ -764,6 +772,19 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 															onClick={promote.onPromote}
 														>
 															{t("promote")}
+														</Button>
+													</Tooltip>
+												)}
+												{extractPrimary?.show && (
+													<Tooltip label={t("extractToPrimaryHint")}>
+														<Button
+															size="xs"
+															variant="light"
+															color="indigo"
+															loading={extractPrimary.pending}
+															onClick={extractPrimary.onExtract}
+														>
+															{t("extractToPrimary")}
 														</Button>
 													</Tooltip>
 												)}

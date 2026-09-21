@@ -57,6 +57,7 @@ import {
 	useCreateNarrator,
 	useEnterPlanMode,
 	useExitPlanMode,
+	useExtractSubagentToPrimary,
 	useInterruptNarrator,
 	useNarrator,
 	usePromoteNarrator,
@@ -355,6 +356,7 @@ export function NarratorPanel({
 	const enterPlanModeMutation = useEnterPlanMode();
 	const exitPlanModeMutation = useExitPlanMode();
 	const promoteMutation = usePromoteNarrator();
+	const extractPrimaryMutation = useExtractSubagentToPrimary();
 	const reasoningEffortMutation = useUpdateReasoningEffort();
 	const fastModeMutation = useUpdateFastMode();
 	const relaxedPlanMutation = useUpdateRelaxedPlan();
@@ -619,6 +621,31 @@ export function NarratorPanel({
 			},
 		});
 	}, [promoteMutation, narratorId, t, navigate]);
+
+	const handleExtractToPrimary = useCallback(() => {
+		extractPrimaryMutation.mutate(
+			{ narratorId },
+			{
+				onSuccess: (data) => {
+					const newId = (data as { narrator?: { id?: string } })?.narrator?.id;
+					notifications.show({
+						message: t("extractToPrimarySuccess"),
+						color: "teal",
+					});
+					if (newId) {
+						navigate({ to: "/narrators/$narratorId", params: { narratorId: newId } });
+					}
+				},
+				onError: (error: Error) => {
+					notifications.show({
+						message: error.message || t("extractToPrimaryFailed"),
+						color: "red",
+						autoClose: 5000,
+					});
+				},
+			},
+		);
+	}, [extractPrimaryMutation, narratorId, t, navigate]);
 
 	/**
 	 * A chapter node's header already shows this title and owns the edit / generate
@@ -3366,6 +3393,11 @@ export function NarratorPanel({
 								show: !!narrator.isAskInPassing,
 								pending: promoteMutation.isPending,
 								onPromote: handlePromote,
+							},
+							extractPrimary: {
+								show: isSubagent,
+								pending: extractPrimaryMutation.isPending,
+								onExtract: handleExtractToPrimary,
 							},
 							mobile: {
 								actions: mobileToolbarActions,

@@ -209,8 +209,14 @@ export type NarraForkEvent =
 			detail?: string;
 	  }
 	| { type: "narrator:title_updated"; narratorId: string; title: string }
-	// Narrator fork
-	| { type: "narrator:forked"; narratorId: string; parentNarratorId: string }
+	// Narrator fork. `extracted: true` means extract-to-primary: parentNarratorId is
+	// the SOURCE subagent for provenance, not the new row's DB parent (which is null).
+	| {
+			type: "narrator:forked";
+			narratorId: string;
+			parentNarratorId: string;
+			extracted?: boolean;
+	  }
 	// Narrator subagent
 	| {
 			type: "narrator:subagent_started";

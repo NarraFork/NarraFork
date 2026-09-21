@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { DockviewApi, IDockviewPanel } from "dockview-react";
-import { WorkspaceDockStore, workspaceSubagentPanelId } from "../workspace/workspace-dock";
+import {
+	WorkspaceDockStore,
+	workspaceSubagentPanelId,
+	workspaceToolPanelId,
+} from "../workspace/workspace-dock";
 import { focusMessagePanel } from "./focus-message-panel";
 
 const originalFrame = globalThis.requestAnimationFrame;
@@ -80,6 +84,59 @@ describe("primary message panel navigation", () => {
 			expect(scroll).not.toHaveBeenCalled();
 		});
 	}
+});
+
+describe("workspace tool panel toggle", () => {
+	type ToolPanel = {
+		id: string;
+		params: { panelType: string; narratorId: string };
+		api: { isActive: boolean; setActive: () => void; close: () => void };
+	};
+
+	function bindToolPanel(
+		api: { getPanel: (id: string) => unknown },
+		options: { panelType?: string; narratorId?: string; isActive?: boolean } = {},
+	) {
+		const panelType = options.panelType ?? "filemod";
+		const narratorId = options.narratorId ?? "primary";
+		const id = workspaceToolPanelId(narratorId, panelType as "filemod");
+		const closed = { value: false };
+		const panel: ToolPanel = {
+			id,
+			params: { panelType, narratorId },
+			api: {
+				isActive: options.isActive ?? false,
+				setActive: mock(() => {
+					panel.api.isActive = true;
+				}),
+				close: mock(() => {
+					closed.value = true;
+				}),
+			},
+		};
+		const original = api.getPanel;
+		api.getPanel = (panelId: string) => (panelId === id ? panel : original(panelId));
+		return { panel, closed, id };
+	}
+
+	test("focuses an open background tool tab instead of closing it", () => {
+		const { api } = fixture();
+		const store = new WorkspaceDockStore({ current: api });
+		const { panel, closed } = bindToolPanel(api, { isActive: false });
+		store.toggleToolPanel("primary", "filemod", null);
+		expect(panel.api.setActive).toHaveBeenCalledTimes(1);
+		expect(closed.value).toBe(false);
+		expect(panel.api.isActive).toBe(true);
+	});
+
+	test("closes only the already-active tool tab", () => {
+		const { api } = fixture();
+		const store = new WorkspaceDockStore({ current: api });
+		const { panel, closed } = bindToolPanel(api, { isActive: true });
+		store.toggleToolPanel("primary", "filemod", null);
+		expect(panel.api.setActive).not.toHaveBeenCalled();
+		expect(closed.value).toBe(true);
+	});
 });
 
 describe("workspace primary reuse", () => {

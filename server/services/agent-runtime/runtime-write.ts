@@ -40,6 +40,7 @@
 
 import { WriteConflictError } from "../../db/backend/write-port";
 import { classifyPgError } from "../../db/pg-errors";
+import { withSeqFloorRaiseScope } from "../narrator-refs/seq-store";
 import type { RuntimeDb, RuntimeTx } from "./mailbox-types";
 
 /** bun:sqlite reports a uniqueness conflict only through this message shape. */
@@ -136,20 +137,25 @@ export function runAtomicWrite<T>(
 	section: (tx: RuntimeTx) => T,
 ): T {
 	try {
-		return database.transaction((tx) => {
-			const result = section(tx);
-			if (isThenable(result)) {
-				// Throwing INSIDE the callback rolls the section's writes back; returning the
-				// thenable would have committed whatever ran before its first await.
-				throw new Error(
-					`Atomic write section "${label}" returned a Promise: under bun:sqlite the ` +
-						"transaction commits when the callback returns, so an async section silently " +
-						"commits its prefix. Keep the section synchronous; the PostgreSQL adapter " +
-						"gets its own genuinely-async sibling.",
-				);
-			}
-			return result;
-		});
+		// Commit-then-mark for narrator seq floors: sections may claim/shift refs;
+		// `raiseSeqFloorForClaim` records into this scope, and marks apply only after
+		// the synchronous transaction returns (committed).
+		return withSeqFloorRaiseScope(() =>
+			database.transaction((tx) => {
+				const result = section(tx);
+				if (isThenable(result)) {
+					// Throwing INSIDE the callback rolls the section's writes back; returning the
+					// thenable would have committed whatever ran before its first await.
+					throw new Error(
+						`Atomic write section "${label}" returned a Promise: under bun:sqlite the ` +
+							"transaction commits when the callback returns, so an async section silently " +
+							"commits its prefix. Keep the section synchronous; the PostgreSQL adapter " +
+							"gets its own genuinely-async sibling.",
+					);
+				}
+				return result;
+			}),
+		);
 	} catch (error) {
 		throw translateWriteError(error, label);
 	}

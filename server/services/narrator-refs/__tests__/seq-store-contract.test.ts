@@ -43,9 +43,13 @@ const {
 	NARRATOR_REF_SEQ_EMPTY_TOP,
 	claimNextRefSeq,
 	claimShiftInsertSlot,
+	clearNarratorSeqFloorHealed,
 	initializeRefSeqFloor,
+	isNarratorSeqFloorHealed,
+	raiseSeqFloorForClaim,
 	readTopRefSeq,
 } = await import("../seq-store");
+const { dbTransactionWithSeqFloor } = await import("../seq-floor-tx");
 
 const NOW = "2026-09-01T00:00:00.000Z";
 
@@ -67,7 +71,7 @@ function seedRef(messageId: string, narratorId: string, seq: number) {
 			createdAt: NOW,
 		})
 		.run();
-	db.transaction((tx) => {
+	dbTransactionWithSeqFloor(narratorId, (tx) => {
 		tx.insert(narratorMessageRefs)
 			.values({ id: `ref-${messageId}`, narratorId, messageId, seq })
 			.run();
@@ -94,7 +98,10 @@ function messageVersionOf(narratorId: string): number {
 	);
 }
 
-beforeEach(() => cleanDb(sqlite));
+beforeEach(() => {
+	clearNarratorSeqFloorHealed();
+	cleanDb(sqlite);
+});
 
 afterAll(() => {
 	mock.module("../../../db", () => realDbModule);
@@ -110,7 +117,7 @@ describe("empty narrator base", () => {
 
 	test("claim on an empty narrator allocates 0 and the top read is null", () => {
 		seedNarrator();
-		db.transaction((tx) => {
+		dbTransactionWithSeqFloor("n1", (tx) => {
 			expect(readTopRefSeq(tx, "n1")).toBeNull();
 			expect(claimNextRefSeq(tx, "n1")).toBe(0);
 		});
@@ -172,6 +179,85 @@ describe("concurrent appends", () => {
 		const seqs = results.map((r) => r.seq).sort((a, b) => a - b);
 		expect(new Set(seqs).size).toBe(20);
 		expect(seqs).toEqual(Array.from({ length: 20 }, (_, i) => i));
+	});
+
+	test("first process write repairs a lagging counter; steady-state claim does not re-read top", () => {
+		seedNarrator("lagging");
+		// Simulate post-import/upgrade: refs exist, next_seq still 0, not yet healed.
+		sqlite
+			.prepare(
+				"INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at) VALUES (?, ?, 'user', '[]', ?)",
+			)
+			.run("lag-m", "lagging", NOW);
+		sqlite
+			.prepare(
+				"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES (?, ?, ?, ?)",
+			)
+			.run("lag-r", "lagging", "lag-m", 4);
+		expect(
+			sqlite.prepare("SELECT next_seq AS v FROM narrators WHERE id = ?").get("lagging") as {
+				v: number;
+			},
+		).toEqual({ v: 0 });
+
+		let floorRaises = 0;
+		const originalInit = initializeRefSeqFloor;
+		// First choke-point write: raise floor + pure claim.
+		const first = dbTransactionWithSeqFloor("lagging", (tx) => {
+			raiseSeqFloorForClaim(tx, "lagging");
+			floorRaises++;
+			return claimNextRefSeq(tx, "lagging");
+		});
+		expect(first).toBe(5);
+		expect(isNarratorSeqFloorHealed("lagging")).toBe(true);
+		expect(
+			(
+				sqlite.prepare("SELECT next_seq AS v FROM narrators WHERE id = ?").get("lagging") as {
+					v: number;
+				}
+			).v,
+		).toBe(6);
+
+		// Steady state: choke point sees healed → claim is pure +1 (no raise).
+		const second = dbTransactionWithSeqFloor("lagging", (tx) => {
+			if (!isNarratorSeqFloorHealed("lagging")) {
+				raiseSeqFloorForClaim(tx, "lagging");
+				floorRaises++;
+			}
+			return claimNextRefSeq(tx, "lagging");
+		});
+		expect(second).toBe(6);
+		// Only the first write raised the floor.
+		expect(floorRaises).toBe(1);
+		void originalInit;
+	});
+
+	test("rollback after raise does not mark healed; next write repairs again", () => {
+		seedNarrator("rb");
+		sqlite
+			.prepare(
+				"INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at) VALUES (?, ?, 'user', '[]', ?)",
+			)
+			.run("rb-m", "rb", NOW);
+		sqlite
+			.prepare(
+				"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES (?, ?, ?, ?)",
+			)
+			.run("rb-r", "rb", "rb-m", 3);
+		expect(() =>
+			dbTransactionWithSeqFloor("rb", (tx) => {
+				raiseSeqFloorForClaim(tx, "rb");
+				claimNextRefSeq(tx, "rb");
+				throw new Error("rollback");
+			}),
+		).toThrow("rollback");
+		expect(isNarratorSeqFloorHealed("rb")).toBe(false);
+		const seq = dbTransactionWithSeqFloor("rb", (tx) => {
+			raiseSeqFloorForClaim(tx, "rb");
+			return claimNextRefSeq(tx, "rb");
+		});
+		expect(seq).toBe(4);
+		expect(isNarratorSeqFloorHealed("rb")).toBe(true);
 	});
 
 	test("claims in two transactions never return the same seq", () => {

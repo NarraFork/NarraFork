@@ -461,8 +461,10 @@ export const narrators = sqliteTable(
 		/**
 		 * Allocation counter for narrator_message_refs.seq: the next claimable seq, claimed by
 		 * `next_seq = next_seq + 1 … RETURNING` (which doubles as the per-narrator row lock).
-		 * Before startup completes, data-backfills.ts raises existing counters to at least
-		 * MAX(refs.seq)+1 (or 0), without lowering previously claimed values.
+		 * Startup does NOT scan all narrators to repair this counter. On process-lifetime first
+		 * write, choke points raise the floor to at least MAX(refs.seq)+1 inside the write
+		 * transaction (one-way ratchet) and mark the narrator healed only after that transaction
+		 * commits. Project import raises floors for imported ids after import commits.
 		 */
 		nextSeq: integer("next_seq").notNull().default(0),
 		// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages

@@ -3,6 +3,7 @@ import type { DockviewApi } from "dockview-react";
 import { parseHTML } from "linkedom";
 import { act, memo } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { dockPanelId } from "./dock-panel-types";
 import {
 	type NarratorDockContextValue,
 	NarratorDockProvider,
@@ -139,5 +140,74 @@ describe("dock open tool types", () => {
 		await refresh("terminal");
 		expect(dock).toBe(current);
 		expect(renders).toEqual([2, 2]);
+	});
+});
+
+describe("dock tool panel toggle", () => {
+	type MockPanel = {
+		id: string;
+		params?: { panelType: string };
+		api: { isActive: boolean; setActive: () => void; close: () => void };
+	};
+
+	function mockToolPanel(type: string, isActive: boolean): MockPanel {
+		const panel: MockPanel = {
+			id: dockPanelId(type as Parameters<typeof dockPanelId>[0]),
+			params: { panelType: type },
+			api: {
+				isActive,
+				setActive: () => {
+					panel.api.isActive = true;
+				},
+				close: () => {
+					present.delete(panel.id);
+				},
+			},
+		};
+		return panel;
+	}
+
+	let present: Map<string, MockPanel>;
+	let opened: string[];
+
+	function bindApi(options: { existing?: MockPanel[] } = {}) {
+		present = new Map((options.existing ?? []).map((panel) => [panel.id, panel]));
+		opened = [];
+		dock.apiRef.current = {
+			get panels() {
+				return [...present.values()];
+			},
+			getPanel: (id: string) => present.get(id),
+			addPanel: (panel: { id: string; params?: { panelType: string } }) => {
+				opened.push(panel.id);
+				present.set(panel.id, mockToolPanel(panel.params?.panelType ?? "unknown", true));
+			},
+			width: 1200,
+		} as unknown as DockviewApi;
+	}
+
+	test("opens a closed panel", async () => {
+		bindApi();
+		await act(async () => dock.toggleToolPanel("filemod"));
+		expect(opened).toEqual([dockPanelId("filemod")]);
+		expect(present.has(dockPanelId("filemod"))).toBe(true);
+	});
+
+	test("focuses an open panel that is not the active tab instead of closing it", async () => {
+		const filemod = mockToolPanel("filemod", false);
+		const tasks = mockToolPanel("tasks", true);
+		bindApi({ existing: [filemod, tasks] });
+		await act(async () => dock.toggleToolPanel("filemod"));
+		expect(filemod.api.isActive).toBe(true);
+		expect(present.has(dockPanelId("filemod"))).toBe(true);
+		expect(opened).toEqual([]);
+	});
+
+	test("closes only when the panel is already the active tab", async () => {
+		const filemod = mockToolPanel("filemod", true);
+		bindApi({ existing: [filemod] });
+		await act(async () => dock.toggleToolPanel("filemod"));
+		expect(present.has(dockPanelId("filemod"))).toBe(false);
+		expect(opened).toEqual([]);
 	});
 });
