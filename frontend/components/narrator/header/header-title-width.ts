@@ -5,12 +5,10 @@
  *
  *   W_title = measureHeaderTitleTextWidth(fullTitle)   // complete text, never truncated
  *   title box = W_title (fixed, flex-shrink: 0)
- *   tools     = as many ActionIcons as fit in (row − chrome − W_title − overflow)
+ *   tools     = as many ActionIcons as fit in (row − chrome − W_title)
  *
- * Buttons never steal title width; if anything is dropped it is tools (into the
- * overflow menu). When even chrome + overflow + the title floor exceed the row
- * (pathological narrow host), the title box shrinks down to
- * {@link HEADER_TITLE_TEXT_MIN_PX} so CSS ellipsis can apply — tools stay at 0.
+ * Buttons never steal title width. When `rowWidth` is unknown (skeleton →
+ * header mount), show every surfaced tool and do NOT label them "空间不足".
  */
 
 import { SANS_FAMILY, typographyMetrics } from "@shared/pretext-layout/pretext-fonts";
@@ -22,31 +20,28 @@ const TITLE_WEIGHT_CSS = 500;
 export const HEADER_TITLE_TEXT_MAX_PX = 720;
 
 /**
- * Hard floor when chrome + full title cannot fit the row. Below this the host
- * clips; at this value CSS ellipsis still has room to signal truncation.
+ * Hard floor only when chrome + full title cannot fit a pathological row.
+ * Normal layouts keep the complete measured width.
  */
 export const HEADER_TITLE_TEXT_MIN_PX = 80;
 
 /** Fallback if canvas fails — still a real width, never 0 for non-empty text. */
 export const HEADER_TITLE_TEXT_FALLBACK_PX = 160;
 
-/** `ActionIcon size="sm"` — see narrator-header-toolbar-capacity / guard tests. */
+/** `ActionIcon size="sm"`. */
 export const HEADER_TOOL_ITEM_WIDTH_PX = 22;
-/** Leading block gap: back ↔ title slot ↔ badge. Matches NarratorPanel `gap: 8`. */
+/** Leading block gap (back ↔ title ↔ badge) — NarratorPanel `gap: 8`. */
 export const HEADER_LEADING_GAP_PX = 8;
-/** Row gap between the leading block and the toolbar. Matches NarratorPanel `gap: 8`. */
+/** Row gap between leading block and toolbar — NarratorPanel `gap: 8`. */
 export const HEADER_ROW_GAP_PX = 8;
-/** `Group gap="xs"` on the tool row (`--mantine-spacing-xs`). */
+/** Tool-row `Group gap="xs"` — `--mantine-spacing-xs`. */
 export const HEADER_TOOLBAR_GAP_PX = 10;
-/** Back / minimize control. */
 export const HEADER_BACK_WIDTH_PX = 22;
-/** Edit + generate (`ActionIcon size="xs"` ≈ 18px) + their 4px gaps inside the title slot. */
+/** Edit + generate (`size="xs"` ≈ 18px) + 4px gaps inside the title slot. */
 export const HEADER_TITLE_ACTIONS_PX = 18 * 2 + 4 * 2;
-/** Overflow menu trigger (always present in the toolbar). */
 export const HEADER_OVERFLOW_WIDTH_PX = 22;
-/** Close button when the host shows one (after overflow, toolbar gap). */
 export const HEADER_CLOSE_WIDTH_PX = 22;
-/** Header horizontal padding `px="md"` → 16×2. Matches `padding: "8px 16px"`. */
+/** Header `padding: "8px 16px"` → 16×2. */
 export const HEADER_ROW_PADDING_PX = 16 * 2;
 
 export function estimateTitleWidthFallback(text: string): number {
@@ -95,7 +90,7 @@ export function headerTitleFont(): string {
 }
 
 /**
- * Painted width of the COMPLETE `text` string in the header title font.
+ * Painted width of the COMPLETE `text` in the header title font.
  * Callers must pass the full title — never an already-truncated display string.
  */
 export function measureHeaderTitleTextWidth(text: string): number {
@@ -115,8 +110,7 @@ export function measureHeaderTitleTextWidth(text: string): number {
 
 /**
  * Fixed title box width from the COMPLETE title text.
- * This value is an INPUT to tool layout — tools are fitted around it, never
- * the other way around.
+ * INPUT to tool layout — tools are fitted around it, never the reverse.
  */
 export function headerTitleLayoutWidth(text: string): number {
 	if (!(text ?? "").trim()) return 0;
@@ -126,35 +120,41 @@ export function headerTitleLayoutWidth(text: string): number {
 }
 
 export interface HeaderAfterTitleInput {
-	/** Header row content-box width (including padding we subtract). 0 = not ready. */
+	/** Header row border-box width. 0 = not measured yet. */
 	rowWidth: number;
 	/** Complete title text width from {@link headerTitleLayoutWidth}. */
 	titleFullWidth: number;
-	/** Whether the back/minimize control is shown. */
 	showBack?: boolean;
-	/** Whether edit+generate sit beside the title. */
 	showTitleActions?: boolean;
-	/** How many tools the reader surfaced into the header zone. */
 	surfacedToolCount: number;
-	/** Host close button on the far right of the toolbar. */
 	showClose?: boolean;
 }
 
 export interface HeaderAfterTitleLayout {
-	/** Title box — full pretext width when the row can hold chrome; floored when not. */
+	/** Title box — COMPLETE `titleFullWidth` except pathological narrow rows. */
 	titleWidth: number;
-	/** How many surfaced tools fit AFTER the title reserved its width. */
 	visibleToolCount: number;
-	/** Surfaced tools that did not fit (overflow menu). */
 	overflowToolCount: number;
-	/** px left after title+chrome+overflow+visible tools (debug/UI). */
 	slackPx: number;
+	/**
+	 * `rowWidth` unknown: tools shown optimistically; MUST NOT say "空间不足".
+	 */
+	unmeasured: boolean;
 }
 
 /**
- * Precise single-row layout: reserve the pretext-measured title first,
- * then pack tool icons into whatever remains. Chrome constants must match the
- * DOM in NarratorPanel / HeaderToolbar (leading gap 8, toolbar gap 10, padding 16).
+ * Title-first single-row layout.
+ *
+ * DOM (NarratorPanel header row + NarratorPanelHeaderTitle + HeaderToolbar):
+ *
+ *   [pad 16][back?][gap 8][title text + actions][row-gap 8][tool… gap10 …overflow][gap10 close?][pad 16]
+ *
+ * `HEADER_TITLE_ACTIONS_PX` already includes the title-slot gaps after the text
+ * (edit + 4 + generate + 4). The leading↔toolbar gap is charged once as
+ * `HEADER_ROW_GAP_PX`. Overflow is in chrome without its preceding toolbar gap;
+ * packing therefore charges each visible tool `item + toolbar gap` — that gap is
+ * what sits between the tool and the next tool / overflow. Do NOT also subtract
+ * a row gap before the first tool (double-count).
  */
 export function resolveHeaderLayoutAfterTitle(
 	input: HeaderAfterTitleInput,
@@ -170,40 +170,36 @@ export function resolveHeaderLayoutAfterTitle(
 
 	const toolsTotal = Math.max(0, surfacedToolCount);
 
-	// Not measured yet: keep the full title width, show no tools until rowWidth lands
-	// (avoids a flash that steals title space then reflows).
+	// Skeleton → header mount: width not ready. Show all tools; title stays full.
+	// Do NOT invent a "no room" shortfall.
 	if (!(rowWidth > 0)) {
 		return {
 			titleWidth: titleFullWidth,
-			visibleToolCount: 0,
-			overflowToolCount: toolsTotal,
+			visibleToolCount: toolsTotal,
+			overflowToolCount: 0,
 			slackPx: 0,
+			unmeasured: true,
 		};
 	}
 
-	// Fixed chrome that is NOT collapsible tools. Mirrors the DOM:
-	//   [padding][leading: back? + title(+actions) + badge?][row-gap][toolbar: tools… + overflow + close?][padding]
 	let chrome = HEADER_ROW_PADDING_PX;
 	if (showBack) chrome += HEADER_BACK_WIDTH_PX + HEADER_LEADING_GAP_PX;
+	// Actions sit inside the title slot after the fixed text box; their constant
+	// already counts the slot's internal gaps. No extra leading gap here.
 	if (showTitleActions) chrome += HEADER_TITLE_ACTIONS_PX;
-	// Row gap between leading block and toolbar (always present once both exist).
 	chrome += HEADER_ROW_GAP_PX;
-	// Toolbar always ends with the overflow trigger; close sits after it.
 	chrome += HEADER_OVERFLOW_WIDTH_PX;
 	if (showClose) chrome += HEADER_TOOLBAR_GAP_PX + HEADER_CLOSE_WIDTH_PX;
 
-	// Title keeps its complete pretext-measured width whenever possible.
+	// Complete title first.
 	let titleWidth = titleFullWidth;
 	const titleBudget = rowWidth - chrome;
 	if (titleBudget < titleWidth) {
-		// Pathological narrow row: floor the title so CSS ellipsis can signal
-		// truncation instead of hard-clipping at an arbitrary overflow boundary.
-		titleWidth = Math.max(HEADER_TITLE_TEXT_MIN_PX, Math.min(titleWidth, titleBudget));
-		if (titleWidth < HEADER_TITLE_TEXT_MIN_PX) titleWidth = HEADER_TITLE_TEXT_MIN_PX;
+		titleWidth = Math.max(HEADER_TITLE_TEXT_MIN_PX, titleBudget);
 	}
 
-	// Tools sit in the toolbar Group: each visible tool plus its gap before the
-	// next item (overflow or the following tool) costs item + toolbar gap.
+	// Toolbar pack: every visible tool costs item + the gap that follows it
+	// (toward the next tool or the always-present overflow trigger).
 	let remaining = rowWidth - chrome - titleWidth;
 	let visibleToolCount = 0;
 	while (visibleToolCount < toolsTotal) {
@@ -218,5 +214,6 @@ export function resolveHeaderLayoutAfterTitle(
 		visibleToolCount,
 		overflowToolCount: toolsTotal - visibleToolCount,
 		slackPx: Math.max(0, remaining),
+		unmeasured: false,
 	};
 }

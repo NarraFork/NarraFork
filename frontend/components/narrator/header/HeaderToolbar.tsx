@@ -22,12 +22,16 @@ export interface HeaderToolbarProps extends Omit<NarratorToolbarItemProps, "def"
 	 * its width (`resolveHeaderLayoutAfterTitle`). Not a flex result.
 	 */
 	visibleToolCount: number;
+	/**
+	 * Row width not measured yet — tools must not be labelled 空间不足
+	 * (missing measurement ≠ shortfall).
+	 */
+	unmeasured?: boolean;
 }
 
 /**
- * Tool row on the right. Visible slice comes from precise title-first
- * arithmetic; the remainder stays in the overflow menu. No flex fight with
- * the title.
+ * Tool row on the right. Visible slice comes from title-first arithmetic;
+ * the remainder stays in the overflow menu. No flex fight with the title.
  */
 export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarProps) {
 	const {
@@ -41,15 +45,18 @@ export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarPro
 		t,
 		controller,
 		visibleToolCount,
+		unmeasured = false,
 	} = props;
 	const { toolbarEntries, saveToolbarLayout, activateToolbarEntry, renderToolbarInlineOptions } =
 		controller;
 	const surfaced = controller.toolbarSurfacedDefs;
-	// Keep the tested partition helper on the production path: visible = first N
-	// surfaced entries after title-first arithmetic; the rest join tucked defs.
+
+	// Keep the partition helper on the production path. `unmeasured` maps to
+	// capacity `null`, which shows every surfaced entry and labels none "no room"
+	// (missing measurement ≠ shortfall). A real shortfall passes visibleToolCount.
 	const selection = useMemo(
-		() => selectHeaderToolbarEntries(surfaced, visibleToolCount),
-		[surfaced, visibleToolCount],
+		() => selectHeaderToolbarEntries(surfaced, unmeasured ? null : Math.max(0, visibleToolCount)),
+		[surfaced, visibleToolCount, unmeasured],
 	);
 	const visibleDefs = selection.visible;
 	const noRoomDefs = selection.hidden;

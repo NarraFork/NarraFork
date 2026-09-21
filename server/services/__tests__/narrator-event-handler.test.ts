@@ -10,11 +10,22 @@ import {
 
 // Functional in-memory test db (not empty stubs): Bun's mock.module is global
 // and leaks across files, so `{}` stubs would break `db.*` in later real-db suites.
+// Do NOT import the real `../../db` first: that opens the runtime database and runs
+// drizzle migrations (journal may reference SQL files that are gitignored / absent).
 const { db, sqlite } = getTestDb();
-// Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
-const realDbModule = { ...(await import("../../db")) };
+const dbStub = {
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite" as const,
+	startupShutdownState: { canSkipVerification: true },
+	markDatabaseCleanShutdown: () => true,
+	releaseDatabaseInstanceLockOnly: () => {},
+};
+// Mock BEFORE any module that transitively imports the runtime DB
+// (narrator-ws → services → @server/db opens sqlite and runs drizzle migrations).
+mock.module("../../db", () => dbStub);
+mock.module("@server/db", () => dbStub);
 const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) };
-mock.module("../../db", () => ({ db, sqlite }));
 
 const broadcastMessages: unknown[] = [];
 const broadcastTargets: string[] = [];
@@ -95,7 +106,9 @@ afterEach(() => {
 });
 
 afterAll(() => {
-	mock.module("../../db", () => realDbModule);
+	// Leave the in-memory stub in place. Bun's mock.module is process-global and
+	// mock.restore() does not undo module mocks; re-pointing at a lazily imported
+	// real `../../db` would open the runtime database mid-suite.
 	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
 });
@@ -112,6 +125,84 @@ async function cleanupFileContextNarrator(id: string) {
 		sqlite.run("PRAGMA foreign_keys = ON");
 	}
 }
+
+describe("streaming snapshot author isolation", () => {
+	for (const event of [
+		{ type: "stream_reset" as const },
+		{ type: "error" as const, message: "Aborted" },
+		{ type: "attempt_discarded" as const, requestId: "discard-child" },
+		{ type: "assistant_message" as const, text: "child finished", toolUses: [] },
+	]) {
+		test(`child ${event.type} preserves the parent's text/reasoning prefix and sibling tools`, async () => {
+			const child = makeSubagentContext();
+			const parent = {
+				...makeSubagentContext(),
+				narratorId: PARENT_NARRATOR_ID,
+				parentToolUseId: undefined,
+			};
+			const now = new Date().toISOString();
+			await db.insert(narrators).values({
+				id: child.narratorId,
+				type: "subagent",
+				inheritMode: "fresh",
+				createdAt: now,
+				updatedAt: now,
+			});
+			try {
+				for (const type of ["stream_text", "stream_reasoning"] as const) {
+					await processEvent(
+						{ type, text: "PREFIX", blockId: type, blockRevision: 1, blockTextOffset: 0 },
+						parent,
+					);
+				}
+				await processEvent(
+					{
+						type: "stream_text",
+						text: "CHILD",
+						blockId: "child-text",
+						blockRevision: 1,
+						blockTextOffset: 0,
+					},
+					child,
+				);
+				for (const [toolUseId, ctx] of [
+					["parent-tool", parent],
+					["child-tool", child],
+					["sibling-tool", { ...child, narratorId: "sibling", parentToolUseId: "sibling-agent" }],
+				] as const) {
+					await processEvent(
+						{ type: "tool_use_chunk", toolUseId, toolName: "Write", inputCharsTotal: 0 },
+						ctx,
+					);
+				}
+				await processEvent(event, child);
+				expect(getStreamingSnapshot(child.narratorId)).toBeUndefined();
+				for (const type of ["stream_text", "stream_reasoning"] as const) {
+					await processEvent(
+						{ type, text: "+TAIL", blockId: type, blockRevision: 2, blockTextOffset: 6 },
+						parent,
+					);
+				}
+				// This is the source consumed by a fresh messages subscription after switching back.
+				const snapshot = getStreamingSnapshot(PARENT_NARRATOR_ID);
+				expect(snapshot?.streamingBlocks).toEqual([
+					expect.objectContaining({ type: "text", text: "PREFIX+TAIL", textOffset: 0 }),
+					expect.objectContaining({ type: "reasoning", text: "PREFIX+TAIL", textOffset: 0 }),
+				]);
+				expect([...(snapshot?.toolChunks.keys() ?? [])]).toEqual(["parent-tool", "sibling-tool"]);
+				// The inverse direction is scoped too: the parent finishing must not erase
+				// a child tool that is still streaming in the parent's activity summary.
+				await processEvent({ type: "stream_reset" }, parent);
+				expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.streamingBlocks).toEqual([]);
+				expect([...(getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.keys() ?? [])]).toEqual([
+					"sibling-tool",
+				]);
+			} finally {
+				await cleanupFileContextNarrator(child.narratorId);
+			}
+		});
+	}
+});
 
 describe("queue snapshot clear", () => {
 	for (const isSubagent of [false, true]) {

@@ -161,16 +161,18 @@
  * "waiting on you", and `pending` (a person) is silent entirely — queued is
  * neither.
  *
- * The left-anchored stripe + slow opacity pulse is the identity: a travelling
- * highlight would claim motion this call does not have.
+ * ⚠️ NO HARD EDGE. An earlier version clipped a 12% band and ended the gradient
+ * at a non-zero alpha, so the overlay stopped mid-card as a visible vertical
+ * seam — ugly on a tool card face, which is a large surface the eye scans.
+ * The wash now covers the full card and fades to TRANSPARENT well before the
+ * middle; the slow opacity pulse still says "parked", not "moving".
  */
 .nf-card-shimmer--queued::after {
-	inset: 0 auto 0 0;
-	width: 12%;
 	background-image: linear-gradient(
 		90deg,
-		light-dark(rgba(125, 149, 184, 0.22), rgba(125, 149, 184, 0.28)) 0%,
-		light-dark(rgba(125, 149, 184, 0.08), rgba(125, 149, 184, 0.12)) 100%
+		light-dark(rgba(125, 149, 184, 0.16), rgba(125, 149, 184, 0.22)) 0%,
+		light-dark(rgba(125, 149, 184, 0.05), rgba(125, 149, 184, 0.08)) 18%,
+		transparent 42%
 	);
 	animation: nf-card-queued-pulse 2.4s ease-in-out infinite;
 }

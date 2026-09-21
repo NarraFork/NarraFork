@@ -12,28 +12,44 @@
  * Everything runs against real git worktrees and real shadow repositories, because the
  * question in every case is whether the git-level pieces compose correctly.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { eq } from "drizzle-orm";
-import { db } from "../db";
+import { getTestDb } from "../../tests/setup";
 import { chapters, mergeSessions, projects } from "../db/schema";
 import { generateId } from "../lib/id";
 import { safeSpawn } from "../lib/spawn";
-import { chapterBatchMerge } from "./chapter-batch-merge";
-import { chapterCleanup } from "./chapter-cleanup";
-import { chapterMerge } from "./chapter-merge";
-import {
+
+// Exercise real Git worktrees and shadow repositories, but keep session metadata
+// in the standard isolated SQLite fixture. Importing the runtime database here
+// would couple filesystem safety tests to unrelated startup migrations.
+const { db, sqlite } = getTestDb();
+const database = {
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite" as const,
+	startupShutdownState: { canSkipVerification: true },
+	markDatabaseCleanShutdown: () => true,
+	releaseDatabaseInstanceLockOnly: () => {},
+};
+mock.module("../db", () => database);
+mock.module("@server/db", () => database);
+const { chapterBatchMerge } = await import("./chapter-batch-merge");
+const { chapterCleanup } = await import("./chapter-cleanup");
+const { chapterMerge } = await import("./chapter-merge");
+const {
 	abortSnapshotMerge,
 	detectRemainingConflicts,
 	materializeConflicts,
 	planSnapshotMerge,
 	restoreSourceSnapshot,
-} from "./chapter-merge-snapshot";
-import { ensureChapterSnapshot } from "./chapter-snapshot-ref";
-import { gitService } from "./git-service";
-import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
+} = await import("./chapter-merge-snapshot");
+const { ensureChapterSnapshot } = await import("./chapter-snapshot-ref");
+const { gitService } = await import("./git-service");
+const { worktreeTreeSnapshot } = await import("./worktree-tree-snapshot");
+afterAll(() => mock.restore());
 
 const tempDirs: string[] = [];
 const createdProjects: string[] = [];
@@ -41,8 +57,8 @@ const createdProjects: string[] = [];
  * Merge sessions created directly by the interactive-lifecycle cases.
  *
  * Removed in `afterEach` because `cleanupStaleSessions` scans the WHOLE table: a row
- * left behind here would be picked up by an unrelated suite's startup sweep and made
- * to restore a worktree that no longer exists.
+ * left behind here would be picked up by an unrelated suite's startup sweep.
+ * Startup may invalidate old sessions, but must never restore their worktrees.
  */
 const createdSessions: string[] = [];
 
@@ -56,6 +72,9 @@ function present<T>(value: T | null | undefined, what: string): T {
 
 async function git(args: string[], cwd: string): Promise<string> {
 	const result = await safeSpawn({ cmd: ["git", ...args], cwd, timeout: 15_000 });
+	if (result.exitCode !== 0 || result.stdoutTruncated || result.stderrTruncated) {
+		throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+	}
 	return result.stdout.trim();
 }
 
@@ -532,25 +551,81 @@ describe("interactive snapshot merge state lifecycle", () => {
 		return present(row, `merge session ${id}`);
 	}
 
-	test("a restart restores the worktree instead of stranding conflict markers", async () => {
+	async function workspaceState(env: Awaited<ReturnType<typeof createMergePair>>) {
+		const indexPath = await git(["rev-parse", "--git-path", "index"], env.target.worktree);
+		return {
+			tree: await worktreeTreeSnapshot.capture(env.target.worktree),
+			head: await git(["rev-parse", "HEAD"], env.target.worktree),
+			index: readFileSync(resolve(env.target.worktree, indexPath)),
+			chapterSnapshot: (await chapterRow(env.target.id)).snapshotCommitSha,
+		};
+	}
+
+	test("a restart preserves even an untouched conflicted worktree and its recovery evidence", async () => {
 		const env = await createMergePair();
-		const { sessionId } = await startConflictedSession(env);
-
-		// The startup sweep is the only thing that runs after a restart; before this fix
-		// it marked the row `error`, which made the recorded tree unreachable forever.
-		await chapterBatchMerge.cleanupStaleSessions();
-
-		const onDisk = readFileSync(join(env.target.worktree, BASE_FILE), "utf-8");
-		expect(onDisk).not.toContain("<<<<<<<");
-		expect(onDisk).toContain("l5-TRUNK");
-
+		const { sessionId, state } = await startConflictedSession(env);
+		const before = await workspaceState(env);
+		const materialize = spyOn(worktreeTreeSnapshot, "materializeTree");
+		const abort = spyOn(chapterMerge, "abortInteractiveSnapshotMerge");
+		const capture = spyOn(worktreeTreeSnapshot, "capture");
+		try {
+			await chapterBatchMerge.cleanupStaleSessions();
+			expect(materialize).not.toHaveBeenCalled();
+			expect(abort).not.toHaveBeenCalled();
+			expect(capture).not.toHaveBeenCalled();
+		} finally {
+			materialize.mockRestore();
+			abort.mockRestore();
+			capture.mockRestore();
+		}
+		expect(await workspaceState(env)).toEqual(before);
+		expect(readFileSync(join(env.target.worktree, BASE_FILE), "utf8")).toContain("<<<<<<<");
 		const row = await sessionRow(sessionId);
 		expect(row.status).toBe("error");
-		expect(row.error).toMatch(/restored to its pre-merge state/i);
-		// Cleared so nothing can replay this restore over later work.
-		expect(row.preMergeTree).toBeNull();
-		expect(row.preMergeTargetSnapshot).toBeNull();
-		expect(row.mergeSourceSnapshot).toBeNull();
+		expect(row.error).toMatch(/preserv|not.*restor/i);
+		expect(row.preMergeTree).toBe(state.preMergeTree);
+		expect(row.conflictTree).toBe(state.conflictTree);
+		expect(row.preMergeTargetSnapshot).toBe(state.targetSnapshot);
+		expect(row.mergeSourceSnapshot).toBe(state.sourceSnapshot);
+		await chapterBatchMerge.cleanupStaleSessions();
+		await chapterBatchMerge.resolveDecision(sessionId, "cancel");
+		await chapterBatchMerge.resolveDecision(sessionId, "continue");
+		expect(await sessionRow(sessionId)).toEqual(row);
+		expect(await workspaceState(env)).toEqual(before);
+	});
+
+	test.each([
+		"running",
+		"ai_resolving",
+		"waiting_decision",
+	] as const)("startup preserves later commits, index, WIP and new files for %s sessions", async (status) => {
+		const env = await createMergePair();
+		const { sessionId, state } = await startConflictedSession(env);
+		await db.update(mergeSessions).set({ status }).where(eq(mergeSessions.id, sessionId));
+		writeFileSync(join(env.target.worktree, BASE_FILE), "resolved and committed later\n");
+		writeFileSync(join(env.target.worktree, "later-commit.txt"), "new committed file\n");
+		await git(["add", "-A"], env.target.worktree);
+		await git(["commit", "-m", "work after interrupted merge"], env.target.worktree);
+		writeFileSync(join(env.target.worktree, BASE_FILE), "staged work\n");
+		await git(["add", BASE_FILE], env.target.worktree);
+		writeFileSync(join(env.target.worktree, BASE_FILE), "unstaged work after staging\n");
+		rmSync(join(env.target.worktree, "later-commit.txt"));
+		const binary = Buffer.from([0, 255, 128, 1, 13, 10]);
+		writeFileSync(join(env.target.worktree, "new-untracked.bin"), binary);
+		const before = await workspaceState(env);
+		await chapterBatchMerge.cleanupStaleSessions();
+		expect(await workspaceState(env)).toEqual(before);
+		expect(readFileSync(join(env.target.worktree, "new-untracked.bin"))).toEqual(binary);
+		expect(existsSync(join(env.target.worktree, "later-commit.txt"))).toBe(false);
+		const row = await sessionRow(sessionId);
+		expect(row.status).toBe("error");
+		expect(row.preMergeTree).toBe(state.preMergeTree);
+		expect(row.conflictTree).toBe(state.conflictTree);
+		await chapterBatchMerge.resolveDecision(sessionId, "cancel");
+		await chapterBatchMerge.resolveDecision(sessionId, "continue");
+		expect(await workspaceState(env)).toEqual(before);
+		expect(await sessionRow(sessionId)).toEqual(row);
+		expect((await chapterRow(env.source.id)).status).not.toBe("merged");
 	});
 
 	test("a second cancellation cannot overwrite work done after the first", async () => {
@@ -575,19 +650,223 @@ describe("interactive snapshot merge state lifecycle", () => {
 		expect((await sessionRow(sessionId)).preMergeTree).toBeNull();
 	});
 
-	test("a target with no worktree is reported, not thrown, so the sweep continues", async () => {
+	test("a target with no worktree retains evidence without requiring filesystem access", async () => {
 		const env = await createMergePair();
-		const { sessionId } = await startConflictedSession(env);
-		// The chapter went dormant (or was deleted) between the conflict and the restart,
-		// so there is nowhere to restore into. Startup must still finish cleanly.
+		const { sessionId, state } = await startConflictedSession(env);
+		const contents = readFileSync(join(env.target.worktree, BASE_FILE));
 		await db.update(chapters).set({ worktreePath: null }).where(eq(chapters.id, env.target.id));
-
 		await chapterBatchMerge.cleanupStaleSessions();
-
 		const row = await sessionRow(sessionId);
 		expect(row.status).toBe("error");
-		expect(row.error).toMatch(/may still contain conflict markers/i);
-		expect(row.preMergeTree).toBeNull();
+		expect(row.error).toMatch(/preserv|not.*restor/i);
+		expect(row.preMergeTree).toBe(state.preMergeTree);
+		expect(row.conflictTree).toBe(state.conflictTree);
+		expect(readFileSync(join(env.target.worktree, BASE_FILE))).toEqual(contents);
+	});
+
+	test("cleanup walks more than one batch without changing terminal sessions", async () => {
+		const env = await createMergePair();
+		const now = new Date().toISOString();
+		const statuses = ["running", "ai_resolving", "waiting_decision"] as const;
+		const entries = Array.from({ length: 205 }, (_, i) => ({
+			id: generateId(),
+			targetChapterId: env.target.id,
+			sourceChapterIds: [env.source.id],
+			status: statuses[i % statuses.length],
+			createdAt: now,
+			updatedAt: now,
+		}));
+		const terminal = (["error", "completed", "cancelled"] as const).map((status) => ({
+			id: generateId(),
+			targetChapterId: env.target.id,
+			sourceChapterIds: [env.source.id],
+			status,
+			error: "original diagnostic",
+			createdAt: now,
+			updatedAt: now,
+		}));
+		createdSessions.push(...entries.map((entry) => entry.id), ...terminal.map((entry) => entry.id));
+		await db.insert(mergeSessions).values([...entries, ...terminal]);
+		const before = await workspaceState(env);
+		const terminalBefore = await Promise.all(terminal.map((entry) => sessionRow(entry.id)));
+		await chapterBatchMerge.cleanupStaleSessions();
+		for (const entry of entries) {
+			const row = await sessionRow(entry.id);
+			expect(row.status).toBe("error");
+			expect(row.preMergeTree).toBeNull();
+		}
+		await chapterBatchMerge.cleanupStaleSessions();
+		for (const row of terminalBefore) {
+			await chapterBatchMerge.resolveDecision(row.id, "cancel");
+			await chapterBatchMerge.resolveDecision(row.id, "continue");
+			expect(await sessionRow(row.id)).toEqual(row);
+		}
+		expect(await workspaceState(env)).toEqual(before);
+	});
+
+	test("cancel refuses workspace drift and retains all recovery coordinates", async () => {
+		const env = await createMergePair();
+		const { sessionId } = await startConflictedSession(env);
+		const session = await sessionRow(sessionId);
+		writeFileSync(join(env.target.worktree, BASE_FILE), "partially resolved, do not discard\n");
+		writeFileSync(join(env.target.worktree, "new-user-file.bin"), Buffer.from([0, 1, 255]));
+		const before = await workspaceState(env);
+		await expect(chapterBatchMerge.resolveDecision(sessionId, "cancel")).rejects.toThrow();
+		expect(await workspaceState(env)).toEqual(before);
+		expect(await sessionRow(sessionId)).toEqual(session);
+	});
+
+	test("cancel refuses a moved HEAD even when the conflicted workspace tree is unchanged", async () => {
+		const env = await createMergePair();
+		const { sessionId } = await startConflictedSession(env);
+		const session = await sessionRow(sessionId);
+		// An empty commit advances HEAD without changing the index or workspace bytes.
+		await git(
+			["commit", "--allow-empty", "-m", "HEAD advanced independently"],
+			env.target.worktree,
+		);
+		const before = await workspaceState(env);
+		expect(before.tree).toBe(session.conflictTree as string);
+		await expect(chapterBatchMerge.resolveDecision(sessionId, "cancel")).rejects.toThrow();
+		expect(await workspaceState(env)).toEqual(before);
+		expect(await sessionRow(sessionId)).toEqual(session);
+	});
+
+	test("cancel refuses missing conflict coordinates instead of using an unguarded restore", async () => {
+		const env = await createMergePair();
+		const { sessionId } = await startConflictedSession(env);
+		await db
+			.update(mergeSessions)
+			.set({ conflictTree: null })
+			.where(eq(mergeSessions.id, sessionId));
+		const session = await sessionRow(sessionId);
+		const before = await workspaceState(env);
+		await expect(chapterBatchMerge.resolveDecision(sessionId, "cancel")).rejects.toThrow();
+		expect(await workspaceState(env)).toEqual(before);
+		expect(await sessionRow(sessionId)).toEqual(session);
+	});
+
+	test("cancel retains evidence when the target worktree is unavailable", async () => {
+		const env = await createMergePair();
+		const { sessionId } = await startConflictedSession(env);
+		await db.update(chapters).set({ worktreePath: null }).where(eq(chapters.id, env.target.id));
+		const session = await sessionRow(sessionId);
+		const before = readFileSync(join(env.target.worktree, BASE_FILE));
+		await expect(chapterBatchMerge.resolveDecision(sessionId, "cancel")).rejects.toThrow();
+		expect(await sessionRow(sessionId)).toEqual(session);
+		expect(readFileSync(join(env.target.worktree, BASE_FILE))).toEqual(before);
+	});
+
+	test("interactive cancel rejects malformed full HEAD IDs rather than truncating them", async () => {
+		const env = await createMergePair();
+		const { state } = await startConflictedSession(env);
+		const before = await workspaceState(env);
+		for (const expectedHeadSha of ["", `${before.head}invalid`, before.head.slice(0, 7)]) {
+			await expect(
+				chapterMerge.abortInteractiveSnapshotMerge(env.target.worktree, state.preMergeTree, {
+					expectedCurrentTree: state.conflictTree,
+					expectedHeadSha,
+				}),
+			).rejects.toThrow();
+		}
+		expect(await workspaceState(env)).toEqual(before);
+	});
+
+	test("interactive cancel supports a genuinely unborn HEAD with an explicit null guard", async () => {
+		const worktree = mkdtempSync(join(tmpdir(), "nf-empty-cancel-"));
+		tempDirs.push(worktree);
+		await git(["init"], worktree);
+		writeFileSync(join(worktree, "draft.txt"), "pre-merge draft\n");
+		const preMergeTree = await worktreeTreeSnapshot.capture(worktree);
+		writeFileSync(join(worktree, "draft.txt"), "conflict state\n");
+		const conflictTree = await worktreeTreeSnapshot.capture(worktree);
+		await chapterMerge.abortInteractiveSnapshotMerge(worktree, preMergeTree, {
+			expectedCurrentTree: conflictTree,
+			expectedHeadSha: null,
+		});
+		expect(readFileSync(join(worktree, "draft.txt"), "utf8")).toBe("pre-merge draft\n");
+	});
+
+	test("interactive cancel never treats an unreadable repository as an unborn HEAD", async () => {
+		const worktree = mkdtempSync(join(tmpdir(), "nf-not-git-cancel-"));
+		tempDirs.push(worktree);
+		writeFileSync(join(worktree, "draft.txt"), "must remain\n");
+		const materialize = spyOn(worktreeTreeSnapshot, "materializeTree");
+		try {
+			await expect(
+				chapterMerge.abortInteractiveSnapshotMerge(worktree, "a".repeat(40), {
+					expectedCurrentTree: "b".repeat(40),
+					expectedHeadSha: null,
+				}),
+			).rejects.toThrow();
+			expect(materialize).not.toHaveBeenCalled();
+		} finally {
+			materialize.mockRestore();
+		}
+		expect(readFileSync(join(worktree, "draft.txt"), "utf8")).toBe("must remain\n");
+	});
+
+	test("a failed cancel does not announce success or erase recovery evidence", async () => {
+		const env = await createMergePair();
+		const { sessionId } = await startConflictedSession(env);
+		const session = await sessionRow(sessionId);
+		const before = await workspaceState(env);
+		const failure = new Error("injected restore failure");
+		const abort = spyOn(chapterMerge, "abortInteractiveSnapshotMerge").mockRejectedValue(failure);
+		try {
+			await expect(chapterBatchMerge.resolveDecision(sessionId, "cancel")).rejects.toBe(failure);
+		} finally {
+			abort.mockRestore();
+		}
+		expect(await workspaceState(env)).toEqual(before);
+		expect(await sessionRow(sessionId)).toEqual(session);
+	});
+
+	test("simultaneous cancellations cannot both consume the old restore coordinates", async () => {
+		const env = await createMergePair();
+		const { sessionId } = await startConflictedSession(env);
+		const original = chapterMerge.abortInteractiveSnapshotMerge.bind(chapterMerge);
+		const abort = spyOn(chapterMerge, "abortInteractiveSnapshotMerge").mockImplementation(
+			async (...args) => {
+				await original(...args);
+				writeFileSync(
+					join(env.target.worktree, "after-first-cancel.txt"),
+					"keep this later work\n",
+				);
+			},
+		);
+		try {
+			await Promise.all([
+				chapterBatchMerge.resolveDecision(sessionId, "cancel"),
+				chapterBatchMerge.resolveDecision(sessionId, "cancel"),
+			]);
+			expect(abort).toHaveBeenCalledTimes(1);
+		} finally {
+			abort.mockRestore();
+		}
+		expect(readFileSync(join(env.target.worktree, "after-first-cancel.txt"), "utf8")).toBe(
+			"keep this later work\n",
+		);
+		expect((await sessionRow(sessionId)).status).toBe("cancelled");
+	});
+
+	test("a cancellation queued behind a successful continue cannot undo the resolved merge", async () => {
+		const env = await createMergePair();
+		const { sessionId } = await startConflictedSession(env);
+		writeFileSync(join(env.target.worktree, BASE_FILE), BASE_CONTENT.replace("l5", "l5-RESOLVED"));
+		const abort = spyOn(chapterMerge, "abortInteractiveSnapshotMerge");
+		try {
+			await Promise.all([
+				chapterBatchMerge.resolveDecision(sessionId, "continue"),
+				chapterBatchMerge.resolveDecision(sessionId, "cancel"),
+			]);
+			expect(abort).not.toHaveBeenCalled();
+		} finally {
+			abort.mockRestore();
+		}
+		expect(readFileSync(join(env.target.worktree, BASE_FILE), "utf8")).toContain("l5-RESOLVED");
+		expect((await chapterRow(env.source.id)).status).toBe("merged");
+		expect((await sessionRow(sessionId)).preMergeTree).toBeNull();
 	});
 
 	test("completion refuses a persisted conflict list with missing coverage", async () => {

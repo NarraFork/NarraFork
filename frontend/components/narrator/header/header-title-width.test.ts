@@ -57,6 +57,34 @@ describe("resolveHeaderLayoutAfterTitle — tools fit AFTER full title", () => {
 		expect(mid.overflowToolCount).toBe(10 - mid.visibleToolCount);
 	});
 
+	test("chrome arithmetic pins the DOM model (no double-counted row gap)", () => {
+		// chrome = pad32 + back22+gap8 + actions44 + rowGap8 + overflow22 = 136
+		// remaining = 520 − 136 − 200 = 184; each tool costs 22+10=32 → 5 tools, slack 24
+		const layout = resolveHeaderLayoutAfterTitle({
+			rowWidth: 520,
+			titleFullWidth,
+			showBack: true,
+			showTitleActions: true,
+			surfacedToolCount: 10,
+			showClose: false,
+		});
+		expect(layout.visibleToolCount).toBe(5);
+		expect(layout.overflowToolCount).toBe(5);
+		expect(layout.slackPx).toBe(24);
+
+		// With close: chrome += gap10 + close22 → 168; remaining=152 → 4 tools, slack 24
+		const withClose = resolveHeaderLayoutAfterTitle({
+			rowWidth: 520,
+			titleFullWidth,
+			showBack: true,
+			showTitleActions: true,
+			surfacedToolCount: 10,
+			showClose: true,
+		});
+		expect(withClose.visibleToolCount).toBe(4);
+		expect(withClose.slackPx).toBe(24);
+	});
+
 	test("narrow row still prioritizes title over tools", () => {
 		const narrow = resolveHeaderLayoutAfterTitle({
 			rowWidth: 320,
@@ -81,15 +109,16 @@ describe("resolveHeaderLayoutAfterTitle — tools fit AFTER full title", () => {
 		expect(HEADER_ROW_PADDING_PX).toBe(32);
 	});
 
-	test("rowWidth 0 (unmeasured) shows full title and defers tools", () => {
+	test("rowWidth 0 (unmeasured) shows all tools and is not a no-room shortfall", () => {
 		const pending = resolveHeaderLayoutAfterTitle({
 			rowWidth: 0,
 			titleFullWidth,
 			surfacedToolCount: 6,
 		});
 		expect(pending.titleWidth).toBe(titleFullWidth);
-		expect(pending.visibleToolCount).toBe(0);
-		expect(pending.overflowToolCount).toBe(6);
+		expect(pending.visibleToolCount).toBe(6);
+		expect(pending.overflowToolCount).toBe(0);
+		expect(pending.unmeasured).toBe(true);
 	});
 
 	test("zero surfaced tools still reserves the full title", () => {

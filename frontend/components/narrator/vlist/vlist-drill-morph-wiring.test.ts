@@ -66,12 +66,17 @@ describe("drill morph: diff-driven, not a click capture", () => {
 		expect(SHELL).not.toContain("planHeaderMorph(");
 	});
 
-	it("does NOT capture anything inside onToggleRow (state flip only)", () => {
+	it("does not capture drill morph snapshots inside onToggleRow", () => {
 		const start = SHELL.indexOf("onToggleRow: (rowIndex: number, rowKey?: string)");
 		expect(start).toBeGreaterThan(0);
 		const end = SHELL.indexOf("onToggleTranslation", start);
 		const block = SHELL.slice(start, end);
-		expect(block).not.toContain("Capture");
+		// Fold geometry is legitimately captured here; only the header morph must
+		// remain diff-driven. Retention may consult foldCaptureRef without taking
+		// a second, single-slot header snapshot.
+		expect(block).not.toContain("headerMorphCaptureRef");
+		expect(block).not.toContain("buildDrillSnapshots(");
+		expect(block).not.toContain("drillMorphPrevRef");
 		expect(block).not.toContain("drillHeader");
 	});
 });

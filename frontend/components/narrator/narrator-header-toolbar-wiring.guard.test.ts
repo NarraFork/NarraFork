@@ -42,11 +42,14 @@ describe("header layout: pretext title width + right-hand tools", () => {
 		expect(title).toContain("titleFullWidth");
 		const toolbar = await headerToolbar();
 		expect(toolbar).toContain("visibleToolCount");
+		expect(toolbar).toContain("unmeasured");
 		expect(toolbar).toContain("selectHeaderToolbarEntries");
+		expect(toolbar).toContain("unmeasured ? null");
 		const panel = await narratorPanel();
 		expect(panel).toContain("resolveHeaderLayoutAfterTitle");
 		expect(panel).toContain("visibleToolCount={headerLayout.visibleToolCount}");
 		expect(panel).toContain("titleFullWidth={headerLayout.titleWidth}");
+		expect(panel).toContain("unmeasured={headerLayout.unmeasured}");
 		expect(panel).toContain('flexWrap: "nowrap"');
 	});
 

@@ -66,7 +66,6 @@ import {
 	useCreateNarrator,
 	useEnterPlanMode,
 	useExitPlanMode,
-	useExtractSubagentToPrimary,
 	useInterruptNarrator,
 	useNarrator,
 	usePromoteNarrator,
@@ -371,7 +370,6 @@ export function NarratorPanel({
 	const enterPlanModeMutation = useEnterPlanMode();
 	const exitPlanModeMutation = useExitPlanMode();
 	const promoteMutation = usePromoteNarrator();
-	const extractPrimaryMutation = useExtractSubagentToPrimary();
 	const reasoningEffortMutation = useUpdateReasoningEffort();
 	const fastModeMutation = useUpdateFastMode();
 	const relaxedPlanMutation = useUpdateRelaxedPlan();
@@ -637,31 +635,6 @@ export function NarratorPanel({
 		});
 	}, [promoteMutation, narratorId, t, navigate]);
 
-	const handleExtractToPrimary = useCallback(() => {
-		extractPrimaryMutation.mutate(
-			{ narratorId },
-			{
-				onSuccess: (data) => {
-					const newId = (data as { narrator?: { id?: string } })?.narrator?.id;
-					notifications.show({
-						message: t("extractToPrimarySuccess"),
-						color: "teal",
-					});
-					if (newId) {
-						navigate({ to: "/narrators/$narratorId", params: { narratorId: newId } });
-					}
-				},
-				onError: (error: Error) => {
-					notifications.show({
-						message: error.message || t("extractToPrimaryFailed"),
-						color: "red",
-						autoClose: 5000,
-					});
-				},
-			},
-		);
-	}, [extractPrimaryMutation, narratorId, t, navigate]);
-
 	/**
 	 * A chapter node's header already shows this title and owns the edit / generate
 	 * actions, so drawing them again here is not just redundant — this header's dozen
@@ -682,10 +655,29 @@ export function NarratorPanel({
 	 */
 	const headerRowRef = useRef<HTMLDivElement>(null);
 	const [headerRowWidth, setHeaderRowWidth] = useState(0);
+	/*
+	 * Skeleton early-return (`if (!narrator)` at the bottom) runs AFTER hooks: the
+	 * first layout pass sees `headerRowRef.current === null`. A dep array of only
+	 * `[headerRowReady]` would run once on mount, miss that null ref, and never
+	 * re-arm when the real header mounts — width would stay 0 and `unmeasured`
+	 * forever. Re-check every commit instead; setState to the same value bails out.
+	 */
+	const [headerRowReady, setHeaderRowReady] = useState(false);
 	useLayoutEffect(() => {
+		if (headerRowRef.current) {
+			setHeaderRowReady(true);
+			return;
+		}
+		setHeaderRowReady(false);
+	});
+	useLayoutEffect(() => {
+		if (!headerRowReady) return;
 		const el = headerRowRef.current;
 		if (!el) return;
-		const read = () => setHeaderRowWidth(el.getBoundingClientRect().width);
+		const read = () => {
+			const w = el.getBoundingClientRect().width;
+			if (w > 0) setHeaderRowWidth(w);
+		};
 		read();
 		if (typeof ResizeObserver === "undefined") {
 			window.addEventListener("resize", read);
@@ -694,7 +686,7 @@ export function NarratorPanel({
 		const ro = new ResizeObserver(read);
 		ro.observe(el);
 		return () => ro.disconnect();
-	}, []);
+	}, [headerRowReady]);
 
 	const headerDisplayTitle = narrator?.title || t("untitled");
 	const headerTitleFullWidth = useMemo(() => {
@@ -3078,6 +3070,7 @@ export function NarratorPanel({
 								mockStreamEnabled={mockStreamEnabled}
 								onClose={onClose}
 								visibleToolCount={headerLayout.visibleToolCount}
+								unmeasured={headerLayout.unmeasured}
 								t={t}
 							/>
 						)}
@@ -3465,11 +3458,6 @@ export function NarratorPanel({
 								show: !!narrator.isAskInPassing,
 								pending: promoteMutation.isPending,
 								onPromote: handlePromote,
-							},
-							extractPrimary: {
-								show: isSubagent,
-								pending: extractPrimaryMutation.isPending,
-								onExtract: handleExtractToPrimary,
 							},
 							mobile: {
 								actions: mobileToolbarActions,

@@ -1,4 +1,18 @@
-import { beforeAll, describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, mock, test } from "bun:test";
+
+// anthropic-provider → usage-tracking → @server/db opens the runtime database and
+// runs migrations on import. This suite only exercises pure SSE/JSON parsers; stub
+// the DB so a missing local drizzle file cannot fail an unrelated unit test.
+mock.module("@server/db", () => ({
+	db: {},
+	sqlite: {},
+	activeDatabaseBackend: "sqlite" as const,
+}));
+mock.module("../../db", () => ({
+	db: {},
+	sqlite: {},
+	activeDatabaseBackend: "sqlite" as const,
+}));
 
 type ParsedEvent = {
 	invalidState?: { reason: string; message: string };
@@ -85,6 +99,35 @@ async function collect(gen: AsyncGenerator<ParsedEvent>): Promise<ParsedEvent[]>
 	for await (const evt of gen) out.push(evt);
 	return out;
 }
+
+describe("truthful Anthropic-compatible error messages", () => {
+	for (const reason of ["refusal", "max_tokens", "model_context_window_exceeded"]) {
+		test(`SSE reports only the actual stop_reason ${reason}`, () => {
+			const events = parseWithFreshState({ type: "message_delta", delta: { stop_reason: reason } });
+			const failure = events.find((event) => event.invalidState)?.invalidState;
+			expect(failure).toMatchObject({
+				reason,
+				message: `Upstream returned stop_reason=${reason} (no error message provided).`,
+			});
+		});
+	}
+	test("missing message preserves upstream error type without inventing a cause", () => {
+		expect(
+			extractAnthropicStreamError({ type: "error", error: { type: "custom_backend_error" } }),
+		).toMatchObject({
+			reason: "custom_backend_error",
+			message: "Upstream returned error custom_backend_error (no error message provided).",
+		});
+	});
+	test("actual error text wins even when a refusal stop reason is present", () => {
+		const events = parseWithFreshState({
+			type: "error",
+			error: { type: "backend_error", message: "Backend B cannot load the selected model." },
+			delta: { stop_reason: "refusal" },
+		});
+		expect(events[0]?.invalidState?.message).toBe("Backend B cannot load the selected model.");
+	});
+});
 
 describe("extractAnthropicStreamError", () => {
 	test("native Anthropic error envelope", () => {
