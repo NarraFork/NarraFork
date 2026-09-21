@@ -26,6 +26,7 @@ import { logger } from "@server/lib/logger";
 import { eq } from "drizzle-orm";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
 import { hydrateMessageForBroadcast, listRoomUnreadForFanout } from "./chat-service";
+import { fanoutChatMessageNotifications } from "./notification-fanout";
 
 /** Injectable so tests can assert routing without a live WebSocket server. */
 interface ChatNotifyChannel {
@@ -110,6 +111,19 @@ async function onMessageCreated(
 			unread,
 		});
 	}
+
+	// Notification-center projection (Phase 1 task package C). Orthogonal to the
+	// badge path above: viewers still get a history row, and mute/sender filters
+	// are reapplied inside the fan-out against membership watermarks. Failures
+	// must not undo the WS deliveries that already happened.
+	guard("chat:message_created:notification_center", () =>
+		fanoutChatMessageNotifications({
+			roomId: event.roomId,
+			messageId: event.messageId,
+			seq: event.seq,
+			senderUserId: event.senderUserId,
+		}),
+	);
 }
 
 async function onMessageDeleted(event: { roomId: string; messageId: string }): Promise<void> {

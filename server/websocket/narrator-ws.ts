@@ -27,7 +27,7 @@ import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { eventBus } from "../lib/event-bus";
-import { hotOnce } from "../lib/hot-safe";
+import { hotOnce, hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
@@ -66,6 +66,7 @@ import {
 	toBufferSummary,
 	updateBufferedMessage,
 } from "../services/narrator-session";
+import { onNotificationCenterChanged } from "../services/notification-center-service";
 import { addStatsSubscriber, removeStatsSubscriber } from "../services/output-stats";
 import { assertChapterProjectAccess, canReadProject } from "../services/project-acl";
 import {
@@ -967,6 +968,82 @@ if (hotOnce("narrafork.humanAttentionWs.listenersRegistered")) {
 	// decision service. The frame is emitted after the history change commits.
 	eventBus.on("narrator:message_broadcast", ({ message }) => {
 		if (message.type === "messages_deleted") scheduleHumanAttentionBroadcast();
+	});
+}
+
+/**
+ * Per-user coalescing for notification-center frames.
+ *
+ * Fan-out can insert many rows for one user in a burst (DM + permission offer).
+ * The client is required to treat the frame as "stale", not as data — so we
+ * collapse bursts to one wake-up per user per flush window instead of one frame
+ * per row.
+ */
+const NOTIFICATION_CENTER_FLUSH_MS = 50;
+const notificationCenterPending = hotSafe(
+	"narrafork.notificationCenterWs.pending",
+	() =>
+		new Map<
+			string,
+			{
+				kinds?: Set<"chat_message" | "permission_request">;
+				timer?: ReturnType<typeof setTimeout>;
+			}
+		>(),
+);
+
+function flushNotificationCenterBroadcast(userId: string): void {
+	const pending = notificationCenterPending.get(userId);
+	if (!pending) return;
+	notificationCenterPending.delete(userId);
+	if (pending.timer !== undefined) clearTimeout(pending.timer);
+	const frame: Extract<NarratorServerMessage, { type: "notification_center_changed" }> = {
+		type: "notification_center_changed",
+	};
+	if (pending.kinds && pending.kinds.size > 0) {
+		frame.kinds = [...pending.kinds];
+	}
+	broadcastToUser(userId, frame);
+}
+
+function scheduleNotificationCenterBroadcast(
+	userId: string,
+	kinds?: Array<"chat_message" | "permission_request">,
+): void {
+	if (!userId) return;
+	let pending = notificationCenterPending.get(userId);
+	if (!pending) {
+		pending = {};
+		notificationCenterPending.set(userId, pending);
+	}
+	if (kinds?.length) {
+		if (!pending.kinds) pending.kinds = new Set();
+		for (const kind of kinds) pending.kinds.add(kind);
+	}
+	if (pending.timer !== undefined) return;
+	pending.timer = setTimeout(() => {
+		flushNotificationCenterBroadcast(userId);
+	}, NOTIFICATION_CENTER_FLUSH_MS);
+}
+
+if (hotOnce("narrafork.notificationCenterWs.listenersRegistered")) {
+	eventBus.on("notification_center_changed", (event) => {
+		scheduleNotificationCenterBroadcast(event.userId, event.kinds);
+	});
+	/**
+	 * Bridge package B's service pub/sub onto the event bus.
+	 *
+	 * `notification-center-service` exposes `onNotificationCenterChanged` for
+	 * mark-read / delete / record success. The WS layer listens on eventBus only;
+	 * without this hop the service can mutate rows while clients never hear a
+	 * frame. Payload stays body-free (userId + optional kinds).
+	 */
+	onNotificationCenterChanged((event) => {
+		eventBus.emit({
+			type: "notification_center_changed",
+			userId: event.userId,
+			kinds: event.kinds,
+		});
 	});
 }
 

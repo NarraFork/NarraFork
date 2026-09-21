@@ -10,6 +10,7 @@ import { knowledgeApi } from "./knowledge";
 import { miscApi } from "./misc";
 import { modelCardsApi } from "./model-cards";
 import { narratorsApi } from "./narrators";
+import { notificationsApi } from "./notifications";
 import { oauthAppsApi } from "./oauth-apps";
 import { oauthGrantsApi } from "./oauth-grants";
 import { pluginsApi } from "./plugins";
@@ -30,6 +31,7 @@ export const api = {
 	...chaptersApi,
 	...chatApi,
 	...narratorsApi,
+	...notificationsApi,
 	...terminalsApi,
 	...settingsApi,
 	...gitApi,
@@ -137,6 +139,16 @@ export type {
 } from "./knowledge-types";
 export type { WorkspaceDetail } from "./misc";
 export { isWorkspaceLayoutConflict, WORKSPACE_LAYOUT_CONFLICT_CODE } from "./misc";
+export type {
+	NotificationDisplayStatus,
+	NotificationKind,
+	NotificationLink,
+	NotificationListItem,
+	NotificationListPage,
+	NotificationPersistentStatus,
+	NotificationUnreadCounts,
+} from "./notifications";
+export { notificationsApi } from "./notifications";
 export type {
 	CreateOAuthAppInput,
 	OAuthApp,

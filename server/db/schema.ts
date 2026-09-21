@@ -8,6 +8,7 @@ import type {
 	FileChangeState,
 } from "@shared/file-change-protocol";
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
+import type { NotificationLink } from "@shared/notification-center";
 import { sql } from "drizzle-orm";
 import {
 	type AnySQLiteColumn,
@@ -5399,5 +5400,43 @@ export const oauthAccessTokens = sqliteTable(
 		index("idx_oauth_access_tokens_user").on(table.userId),
 		// FK covering index for user deletion.
 		index("idx_oauth_access_tokens_revoked_by_user").on(table.revokedByUserId),
+	],
+);
+
+// === notifications ===
+// In-app notification center (Phase 1): event history + unread flag only.
+// Source systems stay authoritative for actionable state (chat unread watermark,
+// permission pending). `displayStatus` resolved/gone is derived at list time.
+// Dedup key: unique (user_id, kind, source_key) so reconnects/WS resubscribe
+// never create a second row for the same source event.
+export const notifications = sqliteTable(
+	"notifications",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		kind: text("kind", { enum: ["chat_message", "permission_request"] }).notNull(),
+		/** Best-effort denormalized filters; null when the source has no project/chapter. */
+		projectId: text("project_id"),
+		chapterId: text("chapter_id"),
+		/** Required for permission_request; chat_message may leave this null. */
+		narratorId: text("narrator_id"),
+		title: text("title").notNull(),
+		preview: text("preview").notNull().default(""),
+		/** Deep link snapshot; lists must not recompute it by joining source tables. */
+		linkJson: text("link_json", { mode: "json" }).$type<NotificationLink>().notNull(),
+		/** chat_message → chat_messages.id; permission_request → narrator_tool_calls.id */
+		sourceKey: text("source_key").notNull(),
+		status: text("status", { enum: ["unread", "read"] })
+			.notNull()
+			.default("unread"),
+		createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+		readAt: integer("read_at", { mode: "timestamp_ms" }),
+	},
+	(table) => [
+		uniqueIndex("idx_notifications_user_kind_source").on(table.userId, table.kind, table.sourceKey),
+		index("idx_notifications_user_created").on(table.userId, table.createdAt),
+		index("idx_notifications_user_status_created").on(table.userId, table.status, table.createdAt),
 	],
 );

@@ -187,9 +187,13 @@ export {
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
 	updateSegmentCompactSummarySchema,
-	updateWhitelistCmdSchema,
-	updateWhitelistDirSchema,
 } from "./narrators";
+export {
+	notificationIdParamSchema,
+	notificationKindSchema,
+	notificationListQuerySchema,
+	notificationMarkReadSchema,
+} from "./notifications";
 export {
 	createProjectSchema,
 	projectChapterSettingsSchema,

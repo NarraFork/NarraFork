@@ -58,6 +58,16 @@ export interface RecentTabsSnapshotMessage {
 export type NarratorServerMessage =
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
 	| { type: "human_attention_changed" }
+	/**
+	 * Per-user notification-center invalidation. Body-free by design (spec §6.1):
+	 * the client marks queries stale / refetches unread-count. String must stay
+	 * aligned with frontend `NOTIFICATION_CENTER_CHANGED_WS_TYPE` until package A
+	 * owns `@shared/notification-center`.
+	 */
+	| {
+			type: "notification_center_changed";
+			kinds?: Array<"chat_message" | "permission_request">;
+	  }
 	| RecentTabsDelta
 	| NarratorWsSubscriptionLimitError
 	| RecentTabsSnapshotMessage

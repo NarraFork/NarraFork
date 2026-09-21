@@ -93,6 +93,7 @@ import {
 	restorePendingModelOverrides,
 } from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
+import { initNotificationFanout } from "./services/notification-fanout";
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
 import { initChatNotify } from "./services/chat-notify";
@@ -1522,6 +1523,9 @@ initKnowledgeNotify();
 
 // Register chat notification bridge (room messages to viewers, unread badges to the rest)
 initChatNotify();
+
+// Notification-center fan-out for permission offers (chat DM fan-out hangs off chat-notify)
+initNotificationFanout();
 
 // Reconcile container states on startup (mark stale DB records as stopped)
 reconcileContainerStates().catch((err) => {

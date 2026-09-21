@@ -147,6 +147,18 @@ export type NarraForkEvent =
 	  }
 	/** Data-free invalidation after a human decision source changes. */
 	| { type: "human_attention:changed" }
+	/**
+	 * Notification-center projection changed for one user (insert/mark-read/delete).
+	 * Carries no titles/rows — clients refetch unread-count and, if open, the list.
+	 * `userId` is required: this is a per-user event; broadcasting it fleet-wide
+	 * would wake every client into a useless empty-list refetch.
+	 */
+	| {
+			type: "notification_center_changed";
+			userId: string;
+			/** Optional kind hints only; never titles/previews/ids of rows. */
+			kinds?: Array<"chat_message" | "permission_request">;
+	  }
 	// Narrator lifecycle
 	| { type: "narrator:message"; narratorId: string; role: string }
 	| { type: "narrator:status_changed"; narratorId: string; status: string; substatus?: string[] }

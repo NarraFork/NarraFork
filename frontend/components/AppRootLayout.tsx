@@ -111,6 +111,7 @@ import { RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
 // there breaks its Fast Refresh boundary and turns tab-list edits into page reloads.
 import { isTabActive } from "./nav/recent-tabs-logic";
 import { useNavBadges } from "./nav/use-nav-badges";
+import { NotificationBell } from "./notifications/NotificationBell";
 import { StartupRecoveryAlert } from "./StartupRecoveryAlert";
 import { BrokenModelMigrationHost } from "./settings/BrokenModelMigrationHost";
 import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
@@ -720,6 +721,7 @@ function AuthenticatedLayout() {
 					</Group>
 					<Group wrap="nowrap">
 						<OutputStatsBadge enabled={prefs?.showOutputStats ?? false} />
+						<NotificationBell />
 						<Tooltip label={t("feedback")} position="bottom" withArrow>
 							<ActionIcon
 								variant="subtle"
